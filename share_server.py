@@ -31,6 +31,7 @@ from openslide import OpenSlide
 from openslide.deepzoom import DeepZoomGenerator
 
 import share_store
+import slide_io
 
 app = Flask(__name__)
 
@@ -117,7 +118,7 @@ def _get_slide(name: str):
     if not path.is_file():
         abort(404, "切片不存在")
     try:
-        osr = OpenSlide(str(path))
+        osr = slide_io.open_slide(path)
     except Exception:
         abort(400, "无法打开切片文件")
 

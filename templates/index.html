@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SVS 病理图像查看器</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260731e" />
+  <link rel="stylesheet" href="/static/style.css?v=20260731f" />
   <!-- OpenSeadragon 5.0.1（已本地化） -->
   <script src="/static/openseadragon.min.js"></script>
 </head>
@@ -76,7 +76,7 @@
         <button id="upload-btn" class="btn primary block">上传切片</button>
         <button id="new-project-btn" class="btn secondary block">＋ 新建项目</button>
         <input id="file-input" type="file"
-               accept=".svs,.tif,.tiff,.ndpi,.mrxs,.vms,.vmu,.scn,.bif,.svslide"
+               accept=".svs,.tif,.tiff,.ndpi,.mrxs,.vms,.vmu,.scn,.bif,.svslide,.zip"
                hidden />
         <div id="progress-wrap" class="progress-wrap" style="display:none;">
           <div id="progress-bar" class="progress-bar"></div>
@@ -155,6 +155,10 @@
           </div>
         </div>
       </div>
+
+      <div class="sidebar-bottom">
+        <a id="logout-btn" class="logout-link" href="/logout" hidden>退出登录</a>
+      </div>
     </aside>
 
     <!-- 右侧查看器 -->
@@ -198,6 +202,6 @@
   <!-- toast 容器 -->
   <div id="toast-container"></div>
 
-  <script src="/static/app.js?v=20260731e"></script>
+  <script src="/static/app.js?v=20260731f"></script>
 </body>
 </html>

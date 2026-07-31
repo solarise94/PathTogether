@@ -16,6 +16,40 @@
     showAnno: false,      // 是否在画布层显示已保存标注
   };
 
+  // ---------- 401 认证处理 ----------
+  // fetch 包装：响应 401 且 body 含 auth_required 时跳登录页。
+  // 对现有调用透明——仍返回 Response，调用方照常 .json()/.ok 判断。
+  function apiFetch(url, opts) {
+    return fetch(url, opts).then(function (resp) {
+      if (resp.status === 401) {
+        // 尝试读 body 判断是否 auth_required（不消费主响应流：克隆一份）
+        return resp.clone().json().then(
+          function (body) {
+            if (body && body.error === "auth_required") {
+              location.href = "/login?next=" + encodeURIComponent(location.pathname);
+            }
+            return resp;
+          },
+          function () { return resp; }  // body 非 JSON，原样返回
+        );
+      }
+      return resp;
+    });
+  }
+
+  // 页面初始化时拉取认证状态：启用认证则显示退出登录（附用户名）
+  function initAuth() {
+    if (!els.logoutBtn) return;
+    apiFetch("/api/auth/info").then(function (r) { return r.json(); }).then(function (info) {
+      if (info && info.auth_enabled) {
+        var label = "退出登录";
+        if (info.username) { label += " (" + info.username + ")"; }
+        els.logoutBtn.textContent = label;
+        els.logoutBtn.hidden = false;
+      }
+    }).catch(function () { /* 忽略，不影响主功能 */ });
+  }
+
   // 缓存：全部切片、全部项目、全部分享
   var allSlides = [];      // [{name,width,height,mpp_x,...}]
   var allProjects = [];    // [{pid,name,note,slides,roi_count,...}]
@@ -64,6 +98,7 @@
     viewerWrap: $("viewer-wrap"),
     dropOverlay: $("drop-overlay"),
     toastContainer: $("toast-container"),
+    logoutBtn: $("logout-btn"),
     // 项目
     newProjectBtn: $("new-project-btn"),
     newProjectForm: $("new-project-form"),
@@ -166,7 +201,7 @@
   // 缓存 annotations_by_slide（从 /api/annotations 拉取全量后缓存）
   var allAnnotationsBySlide = null;
   function loadAnnotationsIndex() {
-    return fetch("/api/annotations")
+    return apiFetch("/api/annotations")
       .then(function (r) { return r.json(); })
       .then(function (data) {
         allAnnotationsBySlide = data.by_slide || {};
@@ -269,7 +304,7 @@
       els.annoArrowBtn.disabled = false;
       els.annoFreeBtn.disabled = false;
       // 拉取该切片标注
-      fetch("/api/annotations?slide=" + encodeURIComponent(state.slide.name))
+      apiFetch("/api/annotations?slide=" + encodeURIComponent(state.slide.name))
         .then(function (r) { return r.json(); })
         .then(function (data) {
           currentAnnotations = data;
@@ -345,7 +380,7 @@
     // 切换切片前移除旧底图
     clearBaseThumb();
     var url = "/api/slide/" + encodeURIComponent(name) + "/info";
-    fetch(url)
+    apiFetch(url)
       .then(function (r) { return r.json(); })
       .then(function (info) {
         if (info.error) { toast("打开失败: " + info.error, "error"); return; }
@@ -607,7 +642,7 @@
     var originalText = els.saveBtn.textContent;
     els.saveBtn.textContent = "导出中...";
     els.saveBtn.disabled = true;
-    fetch(url)
+    apiFetch(url)
       .then(function (res) {
         if (!res.ok) {
           return res.json().then(function (j) {
@@ -651,7 +686,7 @@
       shared: false,
     };
     els.saveAnnoBtn.disabled = true;
-    fetch("/api/annotation", {
+    apiFetch("/api/annotation", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -732,7 +767,7 @@
   }
 
   function reloadShares() {
-    return fetch("/api/share/list")
+    return apiFetch("/api/share/list")
       .then(function (r) { return r.json(); })
       .then(function (data) { renderShareList((data && data.shares) || []); });
   }
@@ -984,7 +1019,7 @@
     function commit() {
       var alias = aInput.value;
       var note = nInput.value;
-      fetch("/api/slide/" + encodeURIComponent(sname) + "/meta", {
+      apiFetch("/api/slide/" + encodeURIComponent(sname) + "/meta", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ alias: alias, note: note }),
@@ -1051,7 +1086,7 @@
     var name = (els.npName.value || "").trim();
     if (!name) { toast("请输入项目名称", "error"); els.npName.focus(); return; }
     var note = els.npNote.value || "";
-    fetch("/api/project/create", {
+    apiFetch("/api/project/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: name, note: note, slides: slides }),
@@ -1076,7 +1111,7 @@
     if (name == null) return;
     var note = prompt("备注", p.note || "");
     if (note == null) return;
-    fetch("/api/project/" + encodeURIComponent(p.pid), {
+    apiFetch("/api/project/" + encodeURIComponent(p.pid), {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: name.trim(), note: note }),
@@ -1092,7 +1127,7 @@
   // ---------- 删除项目 ----------
   function deleteProject(p) {
     if (!confirm("确认删除项目「" + (p.name || "") + "」？（仅删除项目，不删除切片文件）")) return;
-    fetch("/api/project/" + encodeURIComponent(p.pid), { method: "DELETE" })
+    apiFetch("/api/project/" + encodeURIComponent(p.pid), { method: "DELETE" })
       .then(function (r) {
         if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || "删除失败"); });
         return r.json();
@@ -1152,7 +1187,7 @@
     if (slides.length === 0) { toast("请至少选择一张切片", "error"); return; }
     var pid = pickerCtx.targetPid;
     if (!pid) return;
-    fetch("/api/project/" + encodeURIComponent(pid) + "/slides", {
+    apiFetch("/api/project/" + encodeURIComponent(pid) + "/slides", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ slides: slides }),
@@ -1209,7 +1244,7 @@
     var roiSizes = getShareRoiSizes();
     els.shareCreateBtn.disabled = true;
     els.shareCreateBtn.textContent = "生成中...";
-    fetch("/api/share/create", {
+    apiFetch("/api/share/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ slides: slides, expires_hours: hours, roi_sizes: roiSizes }),
@@ -1333,7 +1368,7 @@
 
   function revokeShare(token) {
     if (!confirm("确认撤销该分享？撤销后链接立即失效。")) return;
-    fetch("/api/share/revoke", {
+    apiFetch("/api/share/revoke", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: token }),
@@ -1649,7 +1684,7 @@
     if (!label) label = "管理员";
     var body = { slide: state.slide.name, type: geom.type, label: label };
     for (var k in geom) body[k] = geom[k];
-    fetch("/api/annotation", {
+    apiFetch("/api/annotation", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -1673,7 +1708,7 @@
   // 重新拉取当前切片标注并重绘
   function refreshCurrentAnnotations() {
     if (!state.slide) { redrawAnnoCanvas(); return; }
-    fetch("/api/annotations?slide=" + encodeURIComponent(state.slide.name))
+    apiFetch("/api/annotations?slide=" + encodeURIComponent(state.slide.name))
       .then(function (r) { return r.json(); })
       .then(function (data) {
         currentAnnotations = data;
@@ -1772,7 +1807,7 @@
   function resolveAnnoIndex(it) {
     var token = it.token;
     if (!token) return Promise.reject(new Error("缺少 token"));
-    return fetch("/api/share/rois")
+    return apiFetch("/api/share/rois")
       .then(function (r) { return r.json(); })
       .then(function (rois) {
         var cands = (rois || []).filter(function (r) { return r.token === token; });
@@ -1809,7 +1844,7 @@
     btnEl.disabled = true;
     resolveAnnoIndex(it)
       .then(function (index) {
-        return fetch("/api/annotation/" + encodeURIComponent(token) + "/" + index, {
+        return apiFetch("/api/annotation/" + encodeURIComponent(token) + "/" + index, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ shared: target }),
@@ -1877,7 +1912,7 @@
   // ---------- 删除切片 ----------
   function deleteSlide(name) {
     if (!confirm("确认删除切片 " + name + " ？")) return;
-    fetch("/api/slide/" + encodeURIComponent(name), { method: "DELETE" })
+    apiFetch("/api/slide/" + encodeURIComponent(name), { method: "DELETE" })
       .then(function (r) {
         if (!r.ok) return r.json().then(function (j) { throw new Error(j.error); });
         if (state.slide && state.slide.name === name) {
@@ -2028,6 +2063,7 @@
     initViewer();
     bindEvents();
     setupDragDrop();
+    initAuth();
     // 初始折叠区状态（默认展开）
     var unfiledSec = els.unfiledBody.closest(".section");
     var shareSec = els.shareMgrBody.closest(".section");

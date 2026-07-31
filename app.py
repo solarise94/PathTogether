@@ -5,10 +5,16 @@
 运行：.venv/bin/python app.py   监听 0.0.0.0:8000
 """
 
+import hmac
 import io
 import os
+import secrets
+import shutil
 import threading
+import time
+import zipfile
 from collections import OrderedDict
+from datetime import timedelta
 from pathlib import Path
 
 from flask import (
@@ -16,9 +22,11 @@ from flask import (
     Response,
     abort,
     jsonify,
+    redirect,
     render_template,
     request,
     send_file,
+    session,
 )
 from werkzeug.utils import secure_filename
 
@@ -27,6 +35,7 @@ from openslide import OpenSlide
 from openslide.deepzoom import DeepZoomGenerator
 
 import share_store
+import slide_io
 
 app = Flask(__name__)
 
@@ -38,11 +47,113 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 SUPPORTED_EXTS = {
     "svs", "tif", "tiff", "ndpi", "mrxs", "vms", "vmu", "scn", "bif", "svslide",
 }
+# 归档扩展名：zip 上传后解压（用于 MRXS 等需要伴侣数据目录的格式）
+ARCHIVE_EXTS = {"zip"}
 
 # 分享服务基础 URL（外部用户访问入口，生产部署用 env 覆盖，如 https://slides.example.com:18767）
 SHARE_BASE_URL = os.environ.get(
     "SHARE_BASE_URL", "http://localhost:38000"
 ).rstrip("/")
+
+# --------------------------------------------------------------------------- #
+# 管理员登录认证（外网门户，可选）
+# --------------------------------------------------------------------------- #
+# 只有 ADMIN_PASSWORD 非空时才启用认证；未设置时行为与内网完全一致（免登录）。
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME") or "admin"
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD") or ""
+AUTH_ENABLED = bool(ADMIN_PASSWORD)
+
+# session 有效期 7 天
+app.permanent_session_lifetime = timedelta(days=7)
+
+
+def _data_dir_for_secret() -> Path:
+    """复用 share_store 的数据目录（SHARE_DATA_DIR）存放持久化 secret 文件。
+
+    保证 Flask secret key 重启不失效；share_store.py 已保证该目录存在。
+    """
+    return Path(
+        os.environ.get("SHARE_DATA_DIR") or (Path.home() / "svs-viewer" / "share-data")
+    )
+
+
+def _load_or_create_secret_key() -> str:
+    """优先用 SECRET_KEY env；否则在数据目录下持久化随机 secret（0600）。"""
+    env_key = os.environ.get("SECRET_KEY")
+    if env_key:
+        return env_key
+    data_dir = _data_dir_for_secret()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    secret_file = data_dir / "flask_secret.key"
+    if secret_file.is_file():
+        try:
+            return secret_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+    key = secrets.token_hex(32)
+    # 0600 权限写入（先写再收紧权限）
+    secret_file.write_text(key, encoding="utf-8")
+    try:
+        os.chmod(secret_file, 0o600)
+    except OSError:
+        pass
+    return key
+
+
+app.secret_key = _load_or_create_secret_key()
+
+# 防爆破：内存 dict 按 IP 计数 {ip: {"fails": int, "locked_until": float}}
+_auth_attempts: dict = {}
+_AUTH_FAIL_LIMIT = 5
+_AUTH_LOCK_SECONDS = 60
+
+
+def _is_ip_locked(ip: str):
+    """返回该 IP 是否处于锁定期（含到期清理）。"""
+    rec = _auth_attempts.get(ip)
+    if not rec:
+        return False
+    if rec.get("locked_until", 0) and time.time() < rec["locked_until"]:
+        return True
+    # 锁定已过期：清零
+    if rec.get("locked_until", 0):
+        _auth_attempts.pop(ip, None)
+    return False
+
+
+def _record_auth_fail(ip: str):
+    """记录一次失败，达到阈值则锁定 60 秒。"""
+    rec = _auth_attempts.setdefault(ip, {"fails": 0, "locked_until": 0.0})
+    rec["fails"] += 1
+    if rec["fails"] >= _AUTH_FAIL_LIMIT:
+        rec["locked_until"] = time.time() + _AUTH_LOCK_SECONDS
+
+
+def _clear_auth_fails(ip: str):
+    """登录成功后清零该 IP 的失败计数。"""
+    _auth_attempts.pop(ip, None)
+
+
+@app.before_request
+def _require_auth():
+    """启用认证时拦截未登录请求。
+
+    放行 /login、/static/ 下文件；其余请求检查 session：
+    /api/ 开头返回 401 jsonify(error="auth_required")，页面 302 到 /login。
+    """
+    if not AUTH_ENABLED:
+        return None
+    # 已登录放行
+    if session.get("auth_user"):
+        return None
+    path = request.path
+    # 放行登录页与静态资源
+    if path == "/login" or path.startswith("/static/"):
+        return None
+    if path.startswith("/api/"):
+        return jsonify(error="auth_required"), 401
+    # 页面：跳登录，带 next（防开放跳转在 login 路由内校验）
+    return redirect("/login?next=" + path)
 
 # Deep Zoom 参数（512 瓦片降低公网请求数，渐进式 q82 JPEG 降体积并支持模糊→清晰预览）
 DZ_TILE_SIZE = 512
@@ -145,7 +256,7 @@ def _get_slide(name: str):
     safe = _safe_name(name)
     path = UPLOAD_DIR / safe
     try:
-        osr = OpenSlide(str(path))
+        osr = slide_io.open_slide(path)
     except Exception:
         abort(400, jsonify(error="无法打开切片文件"))
 
@@ -310,6 +421,65 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    """管理员登录页。GET 渲染；POST 校验并写 session。
+
+    用 hmac.compare_digest 比较用户名/密码；连续失败 5 次锁定 60 秒。
+    成功：session.permanent=True，session["auth_user"]=username，跳 next（校验
+    必须以 / 开头且不以 // 开头，防开放跳转）或 "/"。
+    """
+    if not AUTH_ENABLED:
+        # 未启用认证：直接回首页
+        return redirect("/")
+
+    next_url = request.args.get("next") or "/"
+
+    if request.method == "POST":
+        ip = request.remote_addr or ""
+        # 锁定期内拒绝
+        if _is_ip_locked(ip):
+            return render_template("login.html", error="尝试过于频繁，请稍后再试", next_url=next_url), 429
+
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        # POST 时 next 来自表单隐藏域（GET 渲染时已写入）
+        post_next = request.form.get("next") or "/"
+        user_ok = hmac.compare_digest(username, ADMIN_USERNAME)
+        pass_ok = hmac.compare_digest(password, ADMIN_PASSWORD)
+
+        if user_ok and pass_ok:
+            session.permanent = True
+            session["auth_user"] = ADMIN_USERNAME
+            _clear_auth_fails(ip)
+            # 校验 next：必须以 / 开头且不以 // 开头，防开放跳转
+            if not post_next.startswith("/") or post_next.startswith("//"):
+                post_next = "/"
+            return redirect(post_next)
+
+        # 失败
+        _record_auth_fail(ip)
+        return render_template("login.html", error="用户名或密码错误", next_url=next_url), 401
+
+    return render_template("login.html", error=None, next_url=next_url)
+
+
+@app.route("/logout")
+def logout():
+    """登出：清 session，跳登录页。"""
+    session.clear()
+    return redirect("/login")
+
+
+@app.route("/api/auth/info")
+def api_auth_info():
+    """返回认证状态与当前登录用户名。"""
+    return jsonify(
+        auth_enabled=AUTH_ENABLED,
+        username=session.get("auth_user"),
+    )
+
+
 @app.route("/api/slides")
 def api_slides():
     """列出所有切片的元数据。"""
@@ -342,9 +512,155 @@ def api_slides():
     return jsonify(items)
 
 
+def _validate_slide_file(path: Path):
+    """验证单个切片文件能否被 slide_io 打开（成功返回 True，否则 False）。"""
+    try:
+        osr = slide_io.open_slide(path)
+    except Exception:
+        return False
+    try:
+        osr.close()
+    except Exception:
+        pass
+    return True
+
+
+def _extract_zip_to_upload(src_zip: Path):
+    """把 zip 解压到 UPLOAD_DIR，返回 (主文件名, [解压出的相对路径...])。
+
+    流程：
+    1. 解压到 UPLOAD_DIR 下临时目录 .extracting-<随机>；
+    2. 防 zip-slip：拒绝绝对路径与含 .. 的 member，跳过 __MACOSX/隐藏文件；
+    3. 若临时目录仅含一个子目录（无文件）则剥掉包装层当根；
+    4. 把根下内容 move 到 UPLOAD_DIR；任何目标已存在 → 清理并返回 409 错误；
+    5. 找出 SUPPORTED_EXTS 切片文件逐个验证；一个都打不开 → 清理并返回 400。
+
+    失败时返回 (error_message, http_status)；成功返回 (main_name_or_None, moved_paths)。
+    """
+    tmp_dir = UPLOAD_DIR / (".extracting-" + secrets.token_hex(8))
+    try:
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+    except OSError as e:
+        return f"创建临时目录失败: {e}", 400
+
+    moved: list = []
+
+    def _cleanup_all():
+        # 清理临时目录与已 move 的文件/目录
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        for p in moved:
+            try:
+                p = UPLOAD_DIR / p
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    p.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    try:
+        with zipfile.ZipFile(src_zip, "r") as zf:
+            for info in zf.infolist():
+                raw = info.filename
+                if not raw:
+                    continue
+                # 规范化分隔符
+                norm = raw.replace("\\", "/")
+                # 跳过 macOS 元数据与隐藏文件
+                parts = norm.split("/")
+                if any(p == "__MACOSX" or p.startswith(".") for p in parts):
+                    continue
+                # 防 zip-slip：拒绝绝对路径与含 ..
+                if norm.startswith("/") or any(p == ".." for p in parts):
+                    _cleanup_all()
+                    return "压缩包含非法路径", 400
+                # member 路径各组件过 _sanitize_name
+                clean_parts = [_sanitize_name(p) for p in parts]
+                if any((not p and i < len(clean_parts) - 1) for i, p in enumerate(clean_parts)):
+                    # 中间组件净化为空（非法字符）→ 跳过该 member
+                    continue
+                clean_parts = [p for p in clean_parts if p]
+                if not clean_parts:
+                    continue
+                target = tmp_dir.joinpath(*clean_parts)
+                # 二次校验目标在 tmp_dir 内
+                try:
+                    target.resolve().relative_to(tmp_dir.resolve())
+                except ValueError:
+                    _cleanup_all()
+                    return "压缩包含非法路径", 400
+                if info.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+    except zipfile.BadZipFile as e:
+        _cleanup_all()
+        return f"无效的 zip 文件: {e}", 400
+    except Exception as e:
+        _cleanup_all()
+        return f"解压失败: {e}", 400
+
+    # 若仅含一个子目录且无文件，剥掉包装层
+    children = [p for p in tmp_dir.iterdir()] if tmp_dir.exists() else []
+    files_in_root = [p for p in children if p.is_file()]
+    dirs_in_root = [p for p in children if p.is_dir()]
+    root = tmp_dir
+    if not files_in_root and len(dirs_in_root) == 1:
+        root = dirs_in_root[0]
+
+    # 收集根下全部「文件」（不含目录，避免先移走父目录导致子文件找不到；
+    # 目标父目录按需创建）
+    entries = []
+    for p in root.rglob("*"):
+        if p.is_file():
+            entries.append((p, p.relative_to(root)))
+
+    # move 到 UPLOAD_DIR；任何目标已存在 → 409
+    for abs_p, rel in entries:
+        dest = UPLOAD_DIR / rel
+        if dest.exists():
+            _cleanup_all()
+            return f"文件已存在: {rel.as_posix()}", 409
+
+    for abs_p, rel in entries:
+        dest = UPLOAD_DIR / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.move(str(abs_p), str(dest))
+            moved.append(rel.as_posix())
+        except Exception as e:
+            _cleanup_all()
+            return f"移动文件失败: {e}", 400
+
+    # 找出其中支持的切片文件
+    slide_files = []
+    for rel in moved:
+        ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else ""
+        if ext in SUPPORTED_EXTS:
+            slide_files.append(rel)
+
+    # 逐个验证能否打开
+    valid = []
+    for sf in slide_files:
+        if _validate_slide_file(UPLOAD_DIR / sf):
+            valid.append(sf)
+
+    if not valid:
+        _cleanup_all()
+        return "压缩包内未找到可打开的有效切片文件", 400
+
+    # 主文件优先 .mrxs，其次第一个
+    main = next((v for v in valid if v.lower().endswith(".mrxs")), valid[0])
+    # 清理临时目录（已 move 的留下）
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return main, sorted(set(valid))
+
+
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
-    """流式上传切片文件。"""
+    """流式上传切片文件，或上传 zip 解压（用于 MRXS 等伴侣数据目录格式）。"""
     if "file" not in request.files:
         return jsonify(error="缺少 file 字段"), 400
 
@@ -353,7 +669,27 @@ def api_upload():
     safe = _sanitize_name(filename)
     if not safe:
         return jsonify(error="非法文件名"), 400
-    if safe.split(".")[-1].lower() not in SUPPORTED_EXTS:
+
+    ext = safe.rsplit(".", 1)[-1].lower() if "." in safe else ""
+
+    # zip 上传：解压分支
+    if ext in ARCHIVE_EXTS:
+        tmp_zip = UPLOAD_DIR / (".upload-" + secrets.token_hex(8) + ".zip")
+        try:
+            file.save(tmp_zip)
+        except Exception as e:
+            tmp_zip.unlink(missing_ok=True)
+            return jsonify(error=f"保存失败: {e}"), 400
+        result = _extract_zip_to_upload(tmp_zip)
+        tmp_zip.unlink(missing_ok=True)
+        # _extract_zip_to_upload 失败时返回 (error_msg, status)
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+            msg, status = result
+            return jsonify(error=msg), status
+        main_name, extracted = result
+        return jsonify(name=main_name, extracted=extracted)
+
+    if ext not in SUPPORTED_EXTS:
         return jsonify(error="不支持的文件类型"), 400
 
     dest = UPLOAD_DIR / safe
@@ -370,29 +706,41 @@ def api_upload():
             pass
         return jsonify(error=f"保存失败: {e}"), 400
 
-    # 验证能否打开
-    try:
-        osr = OpenSlide(str(dest))
-        osr.close()
-    except Exception as e:
+    # 验证能否打开（裸 .mrxs 通常缺少数据目录，给出针对性提示）
+    if not _validate_slide_file(dest):
         try:
             dest.unlink(missing_ok=True)
         except Exception:
             pass
-        return jsonify(error=f"无效的切片文件: {e}"), 400
+        hint = "MRXS 需连同数据目录打包为 zip 上传" if safe.lower().endswith(".mrxs") else "无效的切片文件"
+        return jsonify(error=hint), 400
 
     return jsonify(name=safe)
 
 
 @app.route("/api/slide/<name>", methods=["DELETE"])
 def api_slide_delete(name):
-    """关闭句柄并删除切片。"""
+    """关闭句柄并删除切片。
+
+    .mrxs 切片带有同名伴侣数据目录（去扩展名后的目录），一并删除。
+    """
     safe = _safe_name(name)
     _close_slide(safe)
     try:
         (UPLOAD_DIR / safe).unlink()
     except FileNotFoundError:
         pass
+    # MRXS：删除伴侣数据目录（先做安全检查确保在 UPLOAD_DIR 内）
+    if safe.lower().endswith(".mrxs"):
+        stem = safe[: -len(".mrxs")]
+        companion = UPLOAD_DIR / stem
+        try:
+            companion.resolve().relative_to(UPLOAD_DIR.resolve())
+        except ValueError:
+            pass
+        else:
+            if companion.is_dir():
+                shutil.rmtree(companion, ignore_errors=True)
     return jsonify(ok=True)
 
 
@@ -886,6 +1234,28 @@ def api_annotation_set_shared(token, index):
 
 
 if __name__ == "__main__":
+    # 可选 TLS 监听（外网门户）：当 ADMIN_TLS_PORT / ADMIN_TLS_CERT / ADMIN_TLS_KEY
+    # 三个 env 都存在时，起 daemon 线程以 TLS 运行，主线程保持原监听不变。
+    # 注意必须绑 0.0.0.0：rootless podman 的 PublishPort 从容器 IP 转发，
+    # 绑 127.0.0.1 会无法通过端口映射访问；宿主侧 PublishPort 已限定 127.0.0.1。
+    tls_port = os.environ.get("ADMIN_TLS_PORT")
+    tls_cert = os.environ.get("ADMIN_TLS_CERT")
+    tls_key = os.environ.get("ADMIN_TLS_KEY")
+    if tls_port and tls_cert and tls_key:
+        def _run_tls():
+            try:
+                app.run(
+                    host="0.0.0.0",
+                    port=int(tls_port),
+                    ssl_context=(tls_cert, tls_key),
+                    threaded=True,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"[app] TLS listener failed: {e}")
+
+        threading.Thread(target=_run_tls, daemon=True).start()
+        print(f"[app] TLS listener enabled on 127.0.0.1:{tls_port}")
+
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 8000)),

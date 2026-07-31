@@ -319,6 +319,24 @@ button {
   padding: 8px 8px 16px;
 }
 
+/* 侧栏底部：退出登录链接（低调次要文字） */
+.sidebar-bottom {
+  padding: 8px 12px 12px;
+  border-top: 0.5px solid var(--separator);
+}
+
+.logout-link {
+  display: inline-block;
+  font-size: 11px;
+  color: var(--text-2);
+  text-decoration: none;
+}
+
+.logout-link:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+
 /* 分区小标题 */
 .section-head {
   font-size: 11px;

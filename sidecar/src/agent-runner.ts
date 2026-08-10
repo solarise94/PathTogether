@@ -107,8 +107,17 @@ import {
 	buildRequestMetrics,
 	defaultMetricsSink,
 	type MetricsSink,
-	type PromptCacheMode,
 } from "./metrics.js";
+import {
+	buildCacheKeySamplingParams,
+	buildPromptCacheKey,
+	downgradeCacheKeyCapability,
+	isCacheFieldRejection,
+	mergeCacheKeyOptions,
+	resolvePromptCacheCapabilities,
+	stripCacheKeyOptions,
+	type PromptCacheCapabilities,
+} from "./prompt-cache.js";
 
 // =========================================================================== //
 // Public config / option types
@@ -992,6 +1001,17 @@ export class AgentRunner {
 			return finalMessages;
 		};
 
+		// Phase 3 (§8.1): resolve prompt-cache capabilities ONCE per run. The
+		// capabilities object is mutated in place by the retry wrapper when a
+		// provider rejects a cache field (§13 downgrade), so subsequent requests
+		// in the same run stop emitting the rejected field. Resolution does NOT
+		// infer capability from the upstream model name (§8.1); explicit mode is
+		// optimistic and runtime-validated.
+		const promptCacheCapabilities: PromptCacheCapabilities = resolvePromptCacheCapabilities(
+			config.prompt_cache_mode,
+			{ apiProtocol: config.api_protocol ?? "openai" },
+		);
+
 		// StreamFn with transient-error retry + context_length_exceeded fallback
 		// (ai_agent.py:582-608). The fallback force-compacts then retries once.
 		// transformContext is passed in so the in-wrapper retry (which bypasses
@@ -1003,6 +1023,11 @@ export class AgentRunner {
 		// call (reused on transient retry, released on force-compaction), and
 		// handles {@link StableContextUnavailableError} via the shared retry
 		// budget (§3.2/§13).
+		//
+		// Phase 3 (§13): the wrapper also injects the explicit prompt_cache_key
+		// via options.samplingParams, detects provider rejection of the cache
+		// field, and retries once WITHOUT the field (downgrade). This downgrade
+		// retry does NOT consume the transient 3-attempt budget.
 		const stepRef = { current: -1 };
 		const streamFn = this.makeRetryingStreamFn(
 			sessionId,
@@ -1013,6 +1038,7 @@ export class AgentRunner {
 			systemPrompt,
 			tools,
 			stableContextError,
+			promptCacheCapabilities,
 		);
 
 		// Run-state machine for event mapping.
@@ -1346,6 +1372,7 @@ export class AgentRunner {
 		systemPrompt: string,
 		tools: unknown[],
 		stableContextError: { value: StableContextUnavailableError | null },
+		promptCacheCapabilities: PromptCacheCapabilities,
 	): (model: unknown, context: unknown, options?: unknown) => AssistantMessageEventStream {
 		const realStreamFn = (this.overrides.streamFn ??
 			// Default: bind the openai-completions streamSimple for the built
@@ -1370,6 +1397,15 @@ export class AgentRunner {
 				// force-compaction (§8.2: "force-compaction 换代后释放旧对象").
 				let prepared: PreparedRequest | null = null;
 				let logicalCallId: string | null = null;
+				// Phase 3 (§13): one-shot cache-field downgrade guard. When the
+				// provider rejects the prompt_cache_key field, we strip it and
+				// retry once WITHOUT consuming the transient budget. This flag
+				// prevents a second downgrade retry in the same logical call.
+				let cacheDowngraded = false;
+				// Phase 3 (§8.1): the EFFECTIVE options for the current attempt.
+				// We layer the cache-key samplingParams fragment onto pi's
+				// supplied options for explicit mode, and strip it on downgrade.
+				let currentOptions = options as Record<string, unknown> | null;
 
 				/**
 				 * Build (or rebuild) the PreparedRequest from the current
@@ -1391,6 +1427,41 @@ export class AgentRunner {
 						messages,
 					});
 					logicalCallId = prepared.logicalCallId;
+				};
+
+				/**
+				 * Phase 3 (§8.1): resolve the cache-key options for the current
+				 * attempt. This is SEPARATE from {@link buildPrepared} so that a
+				 * hashing failure in PreparedRequest construction does NOT
+				 * suppress cache-key injection. In explicit mode we inject
+				 * `prompt_cache_key` via samplingParams; after a runtime
+				 * downgrade (§13) the field is dropped.
+				 *
+				 * Reads the checkpoint generation + slide fingerprint from the
+				 * session store (same snapshot buildPrepared uses). Best-effort:
+				 * a store read failure leaves currentOptions as the raw options.
+				 */
+				const applyCacheKeyOptions = async (): Promise<void> => {
+					if (promptCacheCapabilities.mode !== "explicit") return;
+					let cpGen = 0;
+					let slideFp = "";
+					try {
+						const snap = await self.store.readSession(sessionId);
+						cpGen = snap?.context_checkpoint?.generation ?? 0;
+						slideFp = snap?.context_checkpoint?.slide_fingerprint ?? "";
+					} catch {
+						// store read failure → no cache key (auto-equivalent).
+						return;
+					}
+					const cacheKey = buildPromptCacheKey({
+						sessionId,
+						slideFingerprint: slideFp,
+						generation: cpGen,
+					});
+					const cacheKeyParams = buildCacheKeySamplingParams(promptCacheCapabilities, cacheKey);
+					if (cacheKeyParams) {
+						currentOptions = mergeCacheKeyOptions(options as Record<string, unknown> | null, cacheKeyParams);
+					}
 				};
 
 				for (let attempt = 0; ; attempt++) {
@@ -1434,11 +1505,24 @@ export class AgentRunner {
 							prepared = null;
 						}
 					}
+					// Phase 3 (§8.1): inject the cache-key options for this
+					// attempt. Independent of buildPrepared so a hashing failure
+					// does not suppress cache-key injection. On the first
+					// attempt of explicit mode this adds prompt_cache_key; after
+					// a downgrade the capabilities flag is false so it is a no-op.
+					try {
+						await applyCacheKeyOptions();
+					} catch {
+						// best-effort; proceed with whatever options we have
+					}
 					let stream: AssistantMessageEventStream;
 					try {
 						// Await: the default streamFn is async (dynamic import of
 						// the ESM-only provider module), so this may be a Promise.
-						stream = await realStreamFn(model, currentContext, options);
+						// Phase 3: currentOptions carries the injected cache key
+						// (samplingParams) in explicit mode; it is rebuilt on
+						// downgrade to strip the field.
+						stream = await realStreamFn(model, currentContext, currentOptions);
 					} catch (e) {
 						// streamFn contract says it must not throw, but be defensive.
 						out.push({
@@ -1480,7 +1564,7 @@ export class AgentRunner {
 						// Phase 2b (§12): emit structured metrics for this request.
 						// Best-effort; never fails the request on a metrics error.
 						try {
-							self.emitRequestMetrics(sessionId, config, prepared, finalMessage, stableContextError.value);
+							self.emitRequestMetrics(sessionId, config, prepared, finalMessage, stableContextError.value, promptCacheCapabilities);
 						} catch {
 							// ignore metrics failures
 						}
@@ -1539,6 +1623,33 @@ export class AgentRunner {
 							// (ai_agent.py:594-596).
 							forwardTerminalError();
 							return;
+						}
+						// Phase 3 (§13): Provider rejected the cache field. Strip
+						// the field and retry once WITHOUT consuming the transient
+						// budget. This is a capability downgrade, not a transient
+						// error. Only fires when we actually sent the field (explicit
+						// mode, not yet downgraded). CPA-UNVERIFIED: the rejection
+						// matcher errs on the side of matching (false positive → one
+						// extra field-less retry that still succeeds; false negative
+						// → terminal error leaked to user).
+						if (!cacheDowngraded && isCacheFieldRejection(errMsg)) {
+							cacheDowngraded = true;
+							// Mutate the run-level capabilities so subsequent
+							// requests in this run stop sending the field.
+							const downgraded = downgradeCacheKeyCapability(promptCacheCapabilities);
+							(promptCacheCapabilities as PromptCacheCapabilities).supportsCacheKey = downgraded.supportsCacheKey;
+							(promptCacheCapabilities as PromptCacheCapabilities).mode = downgraded.mode;
+							console.warn(
+								`[prompt-cache] capability_downgrade for ${sessionId}: provider rejected cache field — ${errMsg.slice(0, 200)}`,
+							);
+							// Strip the field from the current options and retry
+							// immediately (no backoff). The for-loop increment
+							// would consume one transient-budget slot, so cancel
+							// it: the downgrade retry must NOT eat the §13
+							// 3-attempt transient budget.
+							currentOptions = stripCacheKeyOptions(currentOptions);
+							attempt -= 1;
+							continue;
 						}
 						if (isTransientError(errMsg) && attempt < maxTransient) {
 							const delay = 2 ** (attempt + 1); // 2/4/8s
@@ -1893,6 +2004,11 @@ export class AgentRunner {
 	 * {@link makeRetryingStreamFn} on the "done" event. Gathers assembler-side
 	 * fields (from the PreparedRequest + LRU counters) and provider-side fields
 	 * (from the assistant message usage). NO image content or API key.
+	 *
+	 * Phase 3 (§12): `promptCacheCapabilities` carries the EFFECTIVE mode after
+	 * any runtime downgrade (§13). The metrics record the mode that was actually
+	 * in effect for this request, not the configured value — so a run that
+	 * downgraded from explicit→auto on a provider rejection reports "auto".
 	 */
 	private emitRequestMetrics(
 		sessionId: string,
@@ -1900,9 +2016,11 @@ export class AgentRunner {
 		prepared: PreparedRequest | null,
 		finalMessage: AssistantMessage | null,
 		stableError: StableContextUnavailableError | null,
+		promptCacheCapabilities: PromptCacheCapabilities,
 	): void {
 		const usage = finalMessage?.usage as { input?: number; cacheRead?: number; cacheWrite?: number } | undefined;
-		const promptCacheMode = (config.prompt_cache_mode as PromptCacheMode | undefined) ?? "auto";
+		// Phase 3: record the EFFECTIVE mode (post-downgrade), not the config.
+		const promptCacheMode = promptCacheCapabilities.mode;
 		// Image byte counts: approximate from the PreparedRequest's image hashes
 		// (we do not retain the bytes here, so we count the hash list length and
 		// the estimated bytes already on the PreparedRequest).

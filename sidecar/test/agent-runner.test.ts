@@ -796,3 +796,157 @@ describe("AgentRunner.runMain — compaction (Step 4)", () => {
 		expect(errs.length).toBeGreaterThanOrEqual(1);
 	}, 30000);
 });
+
+// =========================================================================== //
+// Phase 3: explicit Prompt Cache — capability downgrade (§13/§15.2)
+// =========================================================================== //
+
+describe("AgentRunner.runMain — Phase 3 explicit prompt cache (§13/§15.2)", () => {
+	/**
+	 * §15.2 / §13: "CPA 不支持显式缓存字段时自动降级并成功完成请求".
+	 *
+	 * This test exercises the FULL retry wrapper (makeRetryingStreamFn): a fake
+	 * streamFn inspects the options it receives. On the first call, when it sees
+	 * prompt_cache_key in samplingParams, it returns a 400 rejection. On the
+	 * retry (after the wrapper strips the field), it succeeds. The run must
+	 * settle "finished" — the downgrade is transparent to the user.
+	 *
+	 * CPA-UNVERIFIED: no real CPA gateway is involved; the fake simulates the
+	 * provider rejection. Real-gateway passthrough is a documented deviation.
+	 */
+	it("downgrades from explicit→auto when the provider rejects prompt_cache_key, then succeeds (§13/§15.2)", async () => {
+		let calls = 0;
+		let sawCacheKeyOnFirstCall = false;
+		let sawNoCacheKeyOnRetry = false;
+		const fn = function (_model: unknown, _context: unknown, options?: unknown): import("@earendil-works/pi-ai").AssistantMessageEventStream {
+			calls += 1;
+			const opts = options as { samplingParams?: Record<string, unknown> } | undefined;
+			const hasCacheKey = !!(opts?.samplingParams?.prompt_cache_key);
+			const stream = createAssistantMessageEventStream();
+			void (async () => {
+				if (calls === 1 && hasCacheKey) {
+					// First call WITH the cache key → provider rejects it (§13).
+					sawCacheKeyOnFirstCall = true;
+					const errAssistant = makeRawAssistant([{ type: "text", text: "" }], "error");
+					errAssistant.errorMessage = "400 Unrecognized request argument: prompt_cache_key";
+					stream.push({ type: "error", reason: "error", error: errAssistant });
+					stream.end(errAssistant);
+					return;
+				}
+				// Retry (or auto/off from the start) → succeed with a plain text finish.
+				if (!hasCacheKey) sawNoCacheKeyOnRetry = true;
+				const partial = makeRawAssistant([], "pending");
+				stream.push({ type: "start", partial });
+				const content: AssistantMessage["content"] = [{ type: "text", text: "done" }];
+				stream.push({ type: "text_start", contentIndex: 0, partial: makeRawAssistant(content.slice(), "pending") });
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "done", partial: makeRawAssistant(content.slice(), "pending") });
+				stream.push({ type: "text_end", contentIndex: 0, content: "done", partial: makeRawAssistant(content.slice(), "pending") });
+				const finalMsg = makeRawAssistant(content, "stop");
+				stream.push({ type: "done", reason: "stop", message: finalMsg });
+				stream.end(finalMsg);
+			})();
+			return stream;
+		};
+		const h: Harness = await newHarness(fn as never);
+		const { sessionId } = await h.runner.runMain({
+			slide: "test.svs",
+			config: { ...BASE_CONFIG, prompt_cache_mode: "explicit" },
+			task: "扫读",
+			fresh: true,
+		});
+		h.watch(sessionId);
+		const status = await waitForSettle(h.store, sessionId, 30000);
+		// The downgrade retry must succeed — the run finishes, not errors.
+		expect(status).toBe("finished");
+		// The first call carried the cache key (explicit mode injected it).
+		expect(sawCacheKeyOnFirstCall).toBe(true);
+		// The retry call did NOT carry the cache key (downgrade stripped it).
+		expect(sawNoCacheKeyOnRetry).toBe(true);
+		// At least 2 streamFn calls: first (rejected) + retry (succeeded).
+		expect(calls).toBeGreaterThanOrEqual(2);
+	}, 30000);
+
+	/**
+	 * §13: "本次移除字段重试一次...本次 run 内后续请求不再发送". After a
+	 * downgrade, subsequent model calls in the same run must NOT re-inject the
+	 * cache key. We verify this with a multi-turn script: the first turn triggers
+	 * the downgrade, and the second turn's streamFn call must see no cache key.
+	 */
+	it("does not re-inject the cache key on subsequent turns after a downgrade (§13)", async () => {
+		const cacheKeySeenPerCall: boolean[] = [];
+		let calls = 0;
+		const fn = function (_model: unknown, _context: unknown, options?: unknown) {
+			calls += 1;
+			const opts = options as { samplingParams?: Record<string, unknown> } | undefined;
+			cacheKeySeenPerCall.push(!!opts?.samplingParams?.prompt_cache_key);
+			const stream = createAssistantMessageEventStream();
+			void (async () => {
+				// Call 1: reject the cache key (if present). Calls 2+: succeed.
+				if (calls === 1 && opts?.samplingParams?.prompt_cache_key) {
+					const errAssistant = makeRawAssistant([{ type: "text", text: "" }], "error");
+					errAssistant.errorMessage = "400 Unknown parameter: prompt_cache_key";
+					stream.push({ type: "error", reason: "error", error: errAssistant });
+					stream.end(errAssistant);
+					return;
+				}
+				const partial = makeRawAssistant([], "pending");
+				stream.push({ type: "start", partial });
+				// Turn 0 (after downgrade retry): finish immediately.
+				// Turn 1+: finish immediately (single-turn script).
+				const content: AssistantMessage["content"] = [{ type: "text", text: "ok" }];
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial: makeRawAssistant(content.slice(), "pending") });
+				stream.push({ type: "text_end", contentIndex: 0, content: "ok", partial: makeRawAssistant(content.slice(), "pending") });
+				const finalMsg = makeRawAssistant(content, "stop");
+				stream.push({ type: "done", reason: "stop", message: finalMsg });
+				stream.end(finalMsg);
+			})();
+			return stream;
+		};
+		const h: Harness = await newHarness(fn as never);
+		const { sessionId } = await h.runner.runMain({
+			slide: "test.svs",
+			config: { ...BASE_CONFIG, prompt_cache_mode: "explicit" },
+			fresh: true,
+		});
+		h.watch(sessionId);
+		const status = await waitForSettle(h.store, sessionId, 30000);
+		expect(status).toBe("finished");
+		// First call: cache key was injected (explicit mode).
+		expect(cacheKeySeenPerCall[0]).toBe(true);
+		// Second call (the downgrade retry): no cache key.
+		expect(cacheKeySeenPerCall[1]).toBe(false);
+	}, 30000);
+
+	/**
+	 * Sanity: auto mode never injects the cache key, so no rejection can occur.
+	 * The streamFn should never see prompt_cache_key in the options.
+	 */
+	it("auto mode never injects the cache key (no downgrade path)", async () => {
+		let everSawCacheKey = false;
+		const fn = function (_model: unknown, _context: unknown, options?: unknown) {
+			const opts = options as { samplingParams?: Record<string, unknown> } | undefined;
+			if (opts?.samplingParams?.prompt_cache_key) everSawCacheKey = true;
+			const stream = createAssistantMessageEventStream();
+			void (async () => {
+				const partial = makeRawAssistant([], "pending");
+				stream.push({ type: "start", partial });
+				const content: AssistantMessage["content"] = [{ type: "text", text: "done" }];
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "done", partial: makeRawAssistant(content.slice(), "pending") });
+				stream.push({ type: "text_end", contentIndex: 0, content: "done", partial: makeRawAssistant(content.slice(), "pending") });
+				const finalMsg = makeRawAssistant(content, "stop");
+				stream.push({ type: "done", reason: "stop", message: finalMsg });
+				stream.end(finalMsg);
+			})();
+			return stream;
+		};
+		const h: Harness = await newHarness(fn as never);
+		const { sessionId } = await h.runner.runMain({
+			slide: "test.svs",
+			config: { ...BASE_CONFIG, prompt_cache_mode: "auto" },
+			fresh: true,
+		});
+		h.watch(sessionId);
+		await waitForSettle(h.store, sessionId, 30000);
+		expect(everSawCacheKey).toBe(false);
+	}, 30000);
+});

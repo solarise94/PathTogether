@@ -67,8 +67,12 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt   # openslide-bin 自带动态库，无需系统安装
 
 mkdir -p uploads share-data
-python app.py                     # 管理端 http://localhost:8000
+python app.py                     # 管理端 http://localhost:8000（不含 AI sidecar）
 python share_server.py            # 分享端 http://localhost:38000（另开终端）
+
+# 需要 AI 读片助手时，改用一键脚本（同时起 Flask + Node sidecar）：
+#   cd sidecar && npm install --registry=https://registry.npmjs.org && cd ..
+#   ./dev_ai.sh                   # 管理端 :8000 + sidecar :8055；详见下文「本地开发」
 ```
 
 #### 方式二：Podman / Docker（推荐，含开机自启示例）

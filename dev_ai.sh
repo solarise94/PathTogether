@@ -13,8 +13,9 @@
 #
 # 行为：
 #   1. 在 sidecar/ 下 tsc 编译（dist/），除非已存在且未指定 --rebuild。
-#   2. 后台起 sidecar（node sidecar/dist/index.js）。
-#   3. 前台起 Flask（python3 app.py，threaded）。
+#   2. 若无 AI_INTERNAL_TOKEN / ai_internal.token，预生成 token（sidecar 先于 Flask）。
+#   3. 后台起 sidecar（node sidecar/dist/index.js），探活 /healthz 就绪后再起 Flask。
+#   4. 前台起 Flask（python3 app.py，threaded）。
 #   Ctrl-C 同时停掉两个进程。
 #
 # env（与容器入口一致）：
@@ -70,18 +71,35 @@ cleanup() {
 }
 trap cleanup TERM INT
 
+# --------------------------------------------------------------------------- #
+# 预生成 internal 回调共享 token（与 docker_entry.sh 同逻辑）。
+# 启动顺序是 sidecar 先于 Flask，但 token 文件由 Flask 首 boot 才创建——
+# sidecar 启动时读不到会直接 ENOENT 退出。这里在起 sidecar 前确保文件存在。
+# --------------------------------------------------------------------------- #
+SHARE_DATA_DIR="${SHARE_DATA_DIR:-$HOME/svs-viewer/share-data}"
+if [ -z "${AI_INTERNAL_TOKEN:-}" ]; then
+    TOKEN_FILE="$SHARE_DATA_DIR/ai_internal.token"
+    if [ ! -f "$TOKEN_FILE" ]; then
+        mkdir -p "$SHARE_DATA_DIR" 2>/dev/null || true
+        python3 -c 'import secrets; print(secrets.token_hex(32))' > "$TOKEN_FILE" \
+            && chmod 600 "$TOKEN_FILE" 2>/dev/null || true
+        echo "[dev_ai] generated ai_internal.token"
+    fi
+fi
+
 echo "[dev_ai] starting sidecar: node $SIDECAR_DIR/dist/index.js"
 node "$SIDECAR_DIR/dist/index.js" &
 SIDECAR_PID=$!
 
 # --------------------------------------------------------------------------- #
 # 等 sidecar /healthz 就绪（最多 ~15s），再起 Flask
+# env 必须作为命令前缀（写在 -e 脚本后面会变成 argv 而非环境变量，探活恒失败）。
 # --------------------------------------------------------------------------- #
 SIDECAR_PORT="${AI_SIDECAR_PORT:-8055}"
 i=0
 READY=0
 while [ "$i" -lt 30 ]; do
-    if node -e '
+    if SVS_HP="$SIDECAR_PORT" node -e '
         const http = require("http");
         const req = http.get(
             { hostname: "127.0.0.1", port: Number(process.env.SVS_HP), path: "/healthz", timeout: 1000 },
@@ -89,7 +107,7 @@ while [ "$i" -lt 30 ]; do
         );
         req.on("error", () => process.exit(1));
         req.on("timeout", () => { req.destroy(); process.exit(1); });
-    ' SVS_HP="$SIDECAR_PORT" 2>/dev/null; then
+    ' 2>/dev/null; then
         READY=1
         break
     fi

@@ -50,6 +50,7 @@ import {
 	compact as piCompact,
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
+	estimateTokens,
 	type CompactResult,
 	type CompactionPreparation,
 	type CompactionSettings,
@@ -66,11 +67,19 @@ import type { FlaskClient } from "./flask-client.js";
 import {
 	collectImageMeta,
 	dehydrateMessages,
+	isImageRefContent,
 	replaceMessagesPreservingSeq,
 	type PersistedAgentMessage,
 	type SessionData,
 	type SessionStore,
 } from "./session-store.js";
+import {
+	DEFAULT_DERIVATIVE_SPEC,
+	REQUEST_SCHEMA_VERSION,
+	buildStablePrefixObject,
+	stablePrefixHash,
+	type ContextCheckpoint,
+} from "./checkpoint.js";
 
 // =========================================================================== //
 // Public config
@@ -214,6 +223,84 @@ export interface PersistedCompactionEntry {
 // =========================================================================== //
 
 /**
+ * Visual token estimator (§9.1).
+ *
+ * Phase 2b has no provider image-token formula, so per §9.1 rule 3 we cannot
+ * reliably predict tokens for an arbitrary image set from aggregate usage. We
+ * approximate with a coarse pixel-based heuristic:
+ *
+ *   est_image_tokens = (long_edge * short_edge) / PIXELS_PER_TOKEN
+ *
+ * where PIXELS_PER_TOKEN is a calibratable constant (commented below). The
+ * estimator is deliberately conservative: it overestimates rather than
+ * underestimates, so compaction triggers slightly early rather than late. The
+ * visual_context_budget_tokens cap (§9.1) is enforced separately by the image
+ * selector.
+ *
+ * When the caller cannot supply per-image dimensions (e.g. the request has not
+ * been assembled yet), {@link estimateSelectedVisualTokens} returns the full
+ * `visual_context_budget_tokens` as a conservative reserve (§9.1 rule 3).
+ */
+
+/**
+ * Calibratable constant: pixels per visual token (§9.1). OpenAI's published
+ * vision formula is roughly 768px-tile based; we use a conservative 750 px/token
+ * so the estimate trends high. This is a CONSTANT — adjust via A/B (Phase 4),
+ * not at runtime.
+ */
+export const PIXELS_PER_VISUAL_TOKEN = 750;
+
+/**
+ * Default per-request visual token hard budget (§9.1, suggested 8000). Used as
+ * the conservative reserve when per-image dimensions are unavailable.
+ */
+export const DEFAULT_VISUAL_CONTEXT_BUDGET_TOKENS = 8000;
+
+/**
+ * Estimate the visual token cost of a single image_ref by its pixel dimensions
+ * (§9.1). Returns 0 for degenerate (zero-area) refs.
+ */
+export function estimateImageRefTokens(src: { w: number; h: number }, targetLongEdge: number): number {
+	const w = src.w;
+	const h = src.h;
+	if (w <= 0 || h <= 0 || targetLongEdge <= 0) return 0;
+	const longest = Math.max(w, h);
+	const scale = targetLongEdge / longest;
+	const le = Math.min(longest, targetLongEdge);
+	const se = Math.min(w, h) * scale;
+	return Math.ceil((le * se) / PIXELS_PER_VISUAL_TOKEN);
+}
+
+/**
+ * Estimate the visual token cost of the selected visual working set (§9.1).
+ *
+ * The caller passes the candidate selected image refs (after the Phase 1
+ * selection step). When no refs are selected, returns 0. When the caller
+ * cannot determine the selection, pass `estimateUnavailable: true` to reserve
+ * the full `visual_context_budget_tokens` (§9.1 rule 3).
+ */
+export function estimateSelectedVisualTokens(args: {
+	selectedRefs: Array<{ src: { w: number; h: number }; target_long_edge: number }>;
+	overviewPresent: boolean;
+	overviewLongEdge: number;
+	overviewPixels?: { w: number; h: number };
+	estimateUnavailable?: boolean;
+	visualContextBudgetTokens: number;
+}): number {
+	if (args.estimateUnavailable) {
+		return args.visualContextBudgetTokens;
+	}
+	let total = 0;
+	for (const r of args.selectedRefs) {
+		total += estimateImageRefTokens(r.src, r.target_long_edge);
+	}
+	if (args.overviewPresent && args.overviewPixels) {
+		total += estimateImageRefTokens(args.overviewPixels, args.overviewLongEdge);
+	}
+	return Math.min(total, args.visualContextBudgetTokens);
+}
+
+/**
  * Decide whether the current messages exceed the compaction threshold.
  *
  * Uses pi's `estimateContextTokens` (usage + trailing-tail estimate). This
@@ -222,11 +309,22 @@ export interface PersistedCompactionEntry {
  * it could not see tokens added by the just-completed turn until the next one
  * ran. pi's estimator adds an `estimateTokens(message)` walk over the messages
  * after the last usage block, so the threshold check is current.
+ *
+ * Phase 2b (§9.1): `tokens` now includes an estimate of the selected visual
+ * working set so the trigger sees image cost. Pass `visualTokens` to add a
+ * precomputed estimate; pass `visualContextBudgetReserve` to reserve the full
+ * budget when per-image estimation is unavailable (§9.1 rule 3).
  */
-export function checkShouldCompact(messages: AgentMessage[], settings: ResolvedCompactionSettings): { should: boolean; tokens: number } {
+export function checkShouldCompact(
+	messages: AgentMessage[],
+	settings: ResolvedCompactionSettings,
+	extra?: { visualTokens?: number; visualContextBudgetReserve?: number },
+): { should: boolean; tokens: number } {
 	const est = estimateContextTokens(messages);
-	const should = shouldCompact(est.tokens, settings.contextWindow, settings.settings);
-	return { should, tokens: est.tokens };
+	const visual = extra?.visualTokens ?? extra?.visualContextBudgetReserve ?? 0;
+	const combined = est.tokens + visual;
+	const should = shouldCompact(combined, settings.contextWindow, settings.settings);
+	return { should, tokens: combined };
 }
 
 // =========================================================================== //
@@ -284,18 +382,42 @@ export async function runCompaction(args: {
 	const summaryMsg = createCompactionSummaryMessage(result.summary, result.tokensBefore, Date.now()) as unknown as AgentMessage;
 	const newMessages: AgentMessage[] = [summaryMsg, ...result.retainedTail];
 
-	// tokensAfter: re-estimate on the new list (usage from retained assistant
-	// messages is stale post-compaction, so estimateContextTokens falls back to
-	// the char heuristic — fine for a rough "after" number for the event).
-	const after = estimateContextTokens(newMessages);
+	// §9.3: tokens_after must NOT reuse the retained assistant message's stale
+	// usage. Re-estimate by walking the NEW message list with estimateTokens
+	// (char heuristic) and add the §9.1 visual estimate for the image_refs that
+	// survive in the retained tail (treated as the selected working set at the
+	// working tier). Marked as estimate in the event by the caller.
+	const textAfter = newMessages.reduce((acc, m) => acc + estimateTokens(m), 0);
+	const visualAfter = estimateRetainedVisualTokens(newMessages);
+	const tokensAfter = textAfter + visualAfter;
 
 	return {
 		messages: newMessages,
 		tokensBefore: result.tokensBefore,
-		tokensAfter: after.tokens,
+		tokensAfter,
 		summary: result.summary,
 		retainedTail: result.retainedTail,
 	};
+}
+
+/**
+ * Estimate the visual token cost of the image_refs surviving in the retained
+ * tail (§9.3: "按 §9.1 估算的已选视觉工作集"). Uses the working-image long
+ * edge for non-overview refs; this is an upper bound since the assembler may
+ * later evict some. Marked as estimate.
+ */
+function estimateRetainedVisualTokens(messages: AgentMessage[]): number {
+	let total = 0;
+	for (const m of messages) {
+		const content = (m as { content?: unknown }).content;
+		if (!Array.isArray(content)) continue;
+		for (const part of content) {
+			if (part && isImageRefContent(part)) {
+				total += estimateImageRefTokens(part.src, DEFAULT_DERIVATIVE_SPEC.target_long_edge);
+			}
+		}
+	}
+	return total;
 }
 
 // =========================================================================== //
@@ -400,4 +522,98 @@ export async function persistCompaction(
  */
 export function prevCompactionInputs(data: SessionData): { summary?: string; retainedTail: AgentMessage[]; tokensBefore?: number } {
 	return readPrevCompaction(data);
+}
+
+// =========================================================================== //
+// Checkpoint rebuild after compaction (Phase 2b, §5.3/§9.3)
+// =========================================================================== //
+
+/**
+ * Build a candidate post-compaction {@link ContextCheckpoint} (§5.3: "force-
+ * compaction / 阈值 compaction 成功后重建 checkpoint"). The candidate is NOT
+ * committed; the caller commits via {@link SessionStore.commitCheckpoint} with
+ * the expected generation + fingerprint.
+ *
+ * The candidate:
+ *   - generation = prev.generation + 1 (atomic bump);
+ *   - summary = compaction outcome summary (replaces the stable-region text);
+ *   - annotation_index rebuilt from observations (the snapshot did not change);
+ *   - through_message_seq = the highest seq on the post-compaction message list;
+ *   - overview_derivative carried over from prev (the slide did not change);
+ *   - stable_prefix_hash recomputed over the new stable region (§5.3).
+ *
+ * Returns null when `prev` is null (no checkpoint to rebuild — the caller
+ * should ensureCheckpoint instead). The candidate's overview_derivative is
+ * verbatim from prev so the overview bytes stay byte-stable across the
+ * generation bump (§8.3: only the summary changes).
+ */
+export function buildPostCompactionCheckpoint(args: {
+	prev: ContextCheckpoint | null;
+	outcome: CompactionOutcome;
+	postMessages: PersistedAgentMessage[];
+	observations: { bbox?: { x?: number; y?: number; w?: number; h?: number }; note?: string; [k: string]: unknown }[];
+	systemPrompt: string;
+}): ContextCheckpoint | null {
+	const { prev, outcome, postMessages, observations, systemPrompt } = args;
+	if (!prev) return null;
+
+	// through_message_seq: the highest seq on the post-compaction list.
+	let throughSeq = 0;
+	for (const m of postMessages) {
+		const seq = (m as PersistedAgentMessage & { _context_meta?: { session_message_seq?: number } })._context_meta?.session_message_seq;
+		if (typeof seq === "number" && seq > throughSeq) throughSeq = seq;
+	}
+
+	// annotation_index rebuilt from observations.
+	const annotationIndex = buildAnnotationIndexFromObs(observations);
+
+	const stablePrefixObj = buildStablePrefixObject({
+		systemPrompt,
+		system_prompt_version: prev.system_prompt_version,
+		tool_schema_hash: prev.tool_schema_hash,
+		request_schema_version: REQUEST_SCHEMA_VERSION,
+		slide_fingerprint: prev.slide_fingerprint,
+		summary: outcome.summary,
+		annotation_index: annotationIndex,
+		overview_derivative: prev.overview_derivative,
+	});
+	const spHash = stablePrefixHash(stablePrefixObj);
+
+	return {
+		version: 1,
+		generation: prev.generation + 1,
+		created_at: Date.now(),
+		slide_fingerprint: prev.slide_fingerprint,
+		through_message_seq: throughSeq,
+		summary: outcome.summary,
+		annotation_index: annotationIndex,
+		overview_derivative: prev.overview_derivative,
+		system_prompt_version: prev.system_prompt_version,
+		tool_schema_hash: prev.tool_schema_hash,
+		request_schema_version: REQUEST_SCHEMA_VERSION,
+		stable_prefix_hash: spHash,
+	};
+}
+
+/**
+ * Build a text annotation index from observations (mirrors checkpoint.ts
+ * buildAnnotationIndex, kept local to avoid a runtime cycle).
+ */
+function buildAnnotationIndexFromObs(observations: { bbox?: { x?: number; y?: number; w?: number; h?: number }; note?: string; [k: string]: unknown }[]): string {
+	if (!observations || observations.length === 0) return "";
+	const lines: string[] = [];
+	for (let i = 0; i < observations.length; i++) {
+		const o = observations[i];
+		if (!o) continue;
+		const b = o.bbox;
+		const coord = b ? `(${fmtCoord(b.x)},${fmtCoord(b.y)},${fmtCoord(b.w)}×${fmtCoord(b.h)})` : "(无坐标)";
+		const note = o.note ? `：${o.note}` : "";
+		lines.push(`- 观察#${i + 1} ${coord}${note}`);
+	}
+	return lines.join("\n");
+}
+
+function fmtCoord(v: unknown): string {
+	const n = Number(v);
+	return Number.isFinite(n) ? String(Math.round(n)) : "?";
 }

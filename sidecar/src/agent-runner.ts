@@ -70,6 +70,45 @@ import {
 	makeTransformContext,
 	resolveTransformSettings,
 } from "./transform-context.js";
+import {
+	buildPostCompactionCheckpoint,
+	estimateSelectedVisualTokens,
+	DEFAULT_VISUAL_CONTEXT_BUDGET_TOKENS,
+} from "./compaction.js";
+import {
+	REQUEST_SCHEMA_VERSION,
+	buildOverviewDerivative,
+	buildStablePrefixObject,
+	checkpointStale,
+	computeSystemPromptVersion,
+	computeToolSchemaHash,
+	ensureCheckpoint,
+	selectOverviewRef,
+	stablePrefixHash,
+	type CheckpointEnv,
+	type ContextCheckpoint,
+} from "./checkpoint.js";
+import {
+	materializeDerivativeRaw,
+	overviewDerivativeSpec,
+	TRANSFORM_ENCODER_ID,
+	TRANSFORM_RESIZE_ALGORITHM,
+} from "./transform-context.js";
+import {
+	makeRequestAssembler,
+	type AssemblerSessionSnapshot,
+} from "./request-assembler.js";
+import {
+	buildPreparedRequest,
+	StableContextUnavailableError,
+	type PreparedRequest,
+} from "./prepared-request.js";
+import {
+	buildRequestMetrics,
+	defaultMetricsSink,
+	type MetricsSink,
+	type PromptCacheMode,
+} from "./metrics.js";
 
 // =========================================================================== //
 // Public config / option types
@@ -191,6 +230,11 @@ export interface AgentRunnerOverrides {
 	 * catalog (buildModel). Production never sets this.
 	 */
 	compactionModels?: { completeSimple: (model: unknown, context: unknown, options?: unknown) => Promise<unknown> };
+	/**
+	 * Override the §12 metrics sink (tests capture into an array). When unset,
+	 * the runner uses {@link defaultMetricsSink} (JSON line on console.info).
+	 */
+	metricsSink?: MetricsSink;
 }
 
 // =========================================================================== //
@@ -219,6 +263,8 @@ export class AgentRunner {
 	readonly bus: SessionEventBus;
 	readonly flask: FlaskClient;
 	private readonly overrides: AgentRunnerOverrides;
+	/** §12 metrics sink (defaults to console.info JSON line). */
+	private readonly metricsSink: MetricsSink;
 	/** Active agent per session, for cancel(). */
 	private readonly activeAgents = new Map<string, Agent>();
 
@@ -227,6 +273,7 @@ export class AgentRunner {
 		this.bus = bus;
 		this.flask = flask;
 		this.overrides = overrides;
+		this.metricsSink = overrides.metricsSink ?? defaultMetricsSink;
 	}
 
 	// ----------------------------------------------------------------------- //
@@ -748,11 +795,72 @@ export class AgentRunner {
 		};
 		const tools = kind === "fork" ? [] : createTools(toolCtx);
 
-		// transformContext hook: materialize image_ref + evict old images. Bound
-		// to this run's flask/slide/settings/first-snapshot id and pending id.
-		// The signal is supplied per-call by pi (agent.abort() triggers it); the
-		// hook signature (messages, signal?) threads it through to flask.region.
-		const transformContext = makeTransformContext({
+		// Phase 2b: capture the run config so helpers can resolve settings.
+		this.activeRunConfig = config;
+
+		// Phase 2b: build the checkpoint env + ensure a checkpoint exists (with
+		// overview back-fill). Runs once at the start of the loop. Best-effort:
+		// failures (e.g. concurrent run) are logged and the loop continues; the
+		// assembler falls back to the Phase 1 path when no checkpoint exists.
+		const checkpointEnv = this.buildCheckpointEnv(systemPrompt, tools, slideInfo);
+		try {
+			await this.ensureCheckpointRun({
+				sessionId,
+				slide,
+				slideInfo,
+				systemPrompt,
+				tools,
+				firstSnapshotToolCallIdRef,
+			});
+		} catch (e) {
+			console.warn(`[checkpoint] ensureCheckpointRun failed for ${sessionId}: ${(e as Error)?.message || e}`);
+		}
+
+		// Session snapshot getter for the assembler (§7.2: reads once per request
+		// OUTSIDE the session lock). The assembler calls this at the start of
+		// each transform.
+		const getSessionSnapshot = async (): Promise<AssemblerSessionSnapshot> => {
+			const d = await this.store.readSession(sessionId);
+			return {
+				checkpoint: (d?.context_checkpoint as ContextCheckpoint | undefined) ?? null,
+				observations: d?.observations || [],
+				pendingSnapshotId: pendingSnapshotIdRef.value,
+				messages: (d?.messages || []) as PersistedAgentMessage[],
+			};
+		};
+
+		// Overview src resolver: looks up the ref's bbox in the canonical
+		// messages so the assembler can materialize the stable overview.
+		const overviewSrcResolver = (refId: string): { x: number; y: number; w: number; h: number } | null => {
+			// Read from the latest snapshot (best-effort; the ref should be stable
+			// across the generation). We walk the live snapshot synchronously is
+			// not possible (async), so we cache the last-read messages in a ref.
+			const msgs = lastMessagesRef.value;
+			for (const m of msgs) {
+				const content = (m as { content?: unknown }).content;
+				if (!Array.isArray(content)) continue;
+				for (const part of content) {
+					if (part && typeof part === "object" && (part as { type?: string }).type === "image_ref" && (part as { ref_id?: string }).ref_id === refId) {
+						const s = (part as { src?: { x?: number; y?: number; w?: number; h?: number } }).src || {};
+						return { x: Number(s.x ?? 0), y: Number(s.y ?? 0), w: Number(s.w ?? 0), h: Number(s.h ?? 0) };
+					}
+				}
+			}
+			return null;
+		};
+		const lastMessagesRef = { value: <PersistedAgentMessage[]>[] };
+		// Wrap getSessionSnapshot to refresh lastMessagesRef on each read.
+		const getSessionSnapshotWithCache = async (): Promise<AssemblerSessionSnapshot> => {
+			const snap = await getSessionSnapshot();
+			lastMessagesRef.value = snap.messages;
+			return snap;
+		};
+
+		// Phase 2b assembler (replaces the Phase 1 transformContext hook when a
+		// checkpoint exists). The hook signature is identical so pi's agent loop
+		// is unaware of the change. Falls back to the Phase 1 hook when the
+		// session has no checkpoint yet.
+		const phase1Transform = makeTransformContext({
 			flask: this.flask,
 			slide,
 			slideInfo,
@@ -760,6 +868,48 @@ export class AgentRunner {
 			firstSnapshotToolCallIdRef,
 			pendingSnapshotIdRef,
 		});
+		const assemblerTransform = makeRequestAssembler({
+			flask: this.flask,
+			slide,
+			slideInfo,
+			settings: transformSettings,
+			systemPrompt,
+			toolSchemaHash: checkpointEnv.tool_schema_hash,
+			firstSnapshotToolCallIdRef,
+			checkpointEnv,
+			getSessionSnapshot: getSessionSnapshotWithCache,
+			overviewSrcResolver,
+		});
+
+		// Shared flag for §3.2/§13: the assembler cannot throw out of the
+		// transformContext hook (Phase 1 contract: MUST NOT throw). When it
+		// encounters StableContextUnavailableError, it captures a safe fallback
+		// and sets this flag; the streamFn wrapper detects it and applies the
+		// shared retry budget (§3.2: "与瞬时错误共用最多 3 次总重试预算").
+		const stableContextError = { value: null as StableContextUnavailableError | null };
+
+		const transformContext = async (messages: AgentMessage[], signal?: AbortSignal): Promise<AgentMessage[]> => {
+			// The assembler internally falls back to the Phase 1 path when no
+			// checkpoint exists, so this is a single unified entry point.
+			// However, to preserve exact Phase 1 semantics for sessions that
+			// never built a checkpoint (e.g. a fresh fork with no snapshot yet),
+			// we check the cached snapshot: no checkpoint → Phase 1.
+			const snap = await getSessionSnapshotWithCache();
+			if (!snap.checkpoint) {
+				return phase1Transform(messages, signal);
+			}
+			try {
+				return await assemblerTransform(messages, signal);
+			} catch (e) {
+				if (e instanceof StableContextUnavailableError) {
+					// Record for the streamFn wrapper; return a safe fallback
+					// so pi does not see a throw. The wrapper retries.
+					stableContextError.value = e;
+					return phase1Transform(messages, signal);
+				}
+				throw e;
+			}
+		};
 
 		/**
 		 * Run a compaction pass against the agent's current messages, apply the
@@ -802,6 +952,38 @@ export class AgentRunner {
 				await this.store.writeSession(sessionId, d);
 				return d;
 			});
+
+			// Phase 2b (§5.3): rebuild the checkpoint after a successful
+			// compaction. summary = compaction outcome summary, through_seq =
+			// highest seq on the post-compaction list, generation+1, overview
+			// carried over. CAS-committed atomically; concurrent bump / disk
+			// error leaves the prior generation intact (§5.3).
+			try {
+				const post = await this.store.readSession(sessionId);
+				const prevCp = (post?.context_checkpoint as ContextCheckpoint | undefined) ?? null;
+				if (prevCp) {
+					const candidate = buildPostCompactionCheckpoint({
+						prev: prevCp,
+						outcome,
+						postMessages: (post?.messages || []) as PersistedAgentMessage[],
+						observations: post?.observations || [],
+						systemPrompt,
+					});
+					if (candidate) {
+						await this.store.commitCheckpoint(
+							sessionId,
+							prevCp.generation,
+							prevCp.slide_fingerprint,
+							(d) => {
+								d.context_checkpoint = candidate;
+							},
+						);
+					}
+				}
+			} catch (e) {
+				console.warn(`[checkpoint] post-compaction rebuild failed for ${sessionId}: ${(e as Error)?.message || e}`);
+			}
+
 			await this.bus.emit(sessionId, "session_compacted", {
 				tokens_before: outcome.tokensBefore,
 				tokens_after: outcome.tokensAfter,
@@ -816,8 +998,22 @@ export class AgentRunner {
 		// pi's per-request transform) still strips image_ref blocks. The fatal
 		// "second context-exceeded" case is detected in the message_end handler
 		// (pi surfaces the streamFn's terminal error there), not here.
+		//
+		// Phase 2b: the wrapper also builds a {@link PreparedRequest} per logical
+		// call (reused on transient retry, released on force-compaction), and
+		// handles {@link StableContextUnavailableError} via the shared retry
+		// budget (§3.2/§13).
 		const stepRef = { current: -1 };
-		const streamFn = this.makeRetryingStreamFn(sessionId, config, stepRef, runCompactionPass, transformContext);
+		const streamFn = this.makeRetryingStreamFn(
+			sessionId,
+			config,
+			stepRef,
+			runCompactionPass,
+			transformContext,
+			systemPrompt,
+			tools,
+			stableContextError,
+		);
 
 		// Run-state machine for event mapping.
 		const runState: RunState = {
@@ -882,7 +1078,23 @@ export class AgentRunner {
 		 */
 		const maybeCompact = async (): Promise<void> => {
 			if (runState.finished || runState.paused || runState.errored || runState.hitMaxSteps) return;
-			const check = checkShouldCompact(agent.state.messages.slice(), compactionSettings);
+			// §9.1: include the estimated selected visual tokens in the trigger
+			// estimate. We do not have the exact post-selection image set at this
+			// point (selection happens inside transformContext), so we apply the
+			// conservative reserve = visual_context_budget_tokens (§9.1 rule 3)
+			// when image_refs are present in the messages. The working-set cap
+			// (visual_working_set_max) is enforced separately by the image selector.
+			const msgs = agent.state.messages.slice();
+			const hasImageRefs = msgs.some((m) => {
+				const c = (m as { content?: unknown }).content;
+				if (!Array.isArray(c)) return false;
+				return c.some((p) => p && typeof p === "object" && (p as { type?: string }).type === "image_ref");
+			});
+			const visualBudget = Number(config.visual_context_budget_tokens);
+			const visualReserve = hasImageRefs
+				? (Number.isFinite(visualBudget) && visualBudget > 0 ? visualBudget : DEFAULT_VISUAL_CONTEXT_BUDGET_TOKENS)
+				: 0;
+			const check = checkShouldCompact(msgs, compactionSettings, { visualContextBudgetReserve: visualReserve });
 			if (!check.should) return;
 			// Compact failure is non-fatal: log + continue with the un-compacted
 			// context (no session_compacted event emitted).
@@ -1131,6 +1343,9 @@ export class AgentRunner {
 		stepRef: { current: number },
 		forceCompact: (reason?: string) => Promise<AgentMessage[] | null>,
 		transformContext: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>,
+		systemPrompt: string,
+		tools: unknown[],
+		stableContextError: { value: StableContextUnavailableError | null },
 	): (model: unknown, context: unknown, options?: unknown) => AssistantMessageEventStream {
 		const realStreamFn = (this.overrides.streamFn ??
 			// Default: bind the openai-completions streamSimple for the built
@@ -1149,7 +1364,76 @@ export class AgentRunner {
 				const maxTransient = 3;
 				let compacted = false; // one-shot context-exceeded guard
 				let currentContext = context;
+				// Phase 2b: the PreparedRequest for THIS logical call. Built on
+				// the first attempt from the (already-transformed) context;
+				// reused on transient retry (§8.2); released + rebuilt on
+				// force-compaction (§8.2: "force-compaction 换代后释放旧对象").
+				let prepared: PreparedRequest | null = null;
+				let logicalCallId: string | null = null;
+
+				/**
+				 * Build (or rebuild) the PreparedRequest from the current
+				 * context. Called once per logical call, and once after a
+				 * force-compaction that changed the context.
+				 */
+				const buildPrepared = async (): Promise<void> => {
+					const ctxObj = currentContext as { messages?: AgentMessage[]; systemPrompt?: string; tools?: unknown[] };
+					const messages = (ctxObj?.messages || []) as AgentMessage[];
+					const snap = await self.store.readSession(sessionId);
+					const cpGen = snap?.context_checkpoint?.generation ?? 0;
+					const spHash = snap?.context_checkpoint?.stable_prefix_hash ?? "";
+					prepared = buildPreparedRequest({
+						logicalCallId: logicalCallId || `call-${sessionId}-${Date.now()}`,
+						checkpointGeneration: cpGen,
+						stablePrefixHash: spHash,
+						systemPrompt: ctxObj?.systemPrompt ?? systemPrompt,
+						tools: ctxObj?.tools ?? tools,
+						messages,
+					});
+					logicalCallId = prepared.logicalCallId;
+				};
+
 				for (let attempt = 0; ; attempt++) {
+					// Phase 2b: check the stable-context flag BEFORE attempting
+					// the stream. The transformContext hook sets it when the
+					// assembler raised StableContextUnavailableError; it shares
+					// the same 3-attempt budget as transient errors (§3.2/§13).
+					if (stableContextError.value && attempt < maxTransient) {
+						const sce = stableContextError.value;
+						stableContextError.value = null; // consume
+						const delay = 2 ** (attempt + 1); // 2/4/8s
+						await self.bus.emit(sessionId, "agent_retrying", {
+							step: stepRef.current,
+							attempt: attempt + 1,
+							max: maxTransient,
+							delay,
+							reason: `stable_context_unavailable ${attempt + 1}/${maxTransient} (${sce.reason})`,
+						});
+						await sleep(delay * 1000);
+						continue; // re-attempt; pi will re-call transformContext
+					}
+					if (stableContextError.value && attempt >= maxTransient) {
+						// Budget exhausted → terminal error (§3.2). Generation is
+						// NOT bumped here.
+						const sce = stableContextError.value;
+						stableContextError.value = null;
+						const err = makeErrorAssistant(`stable_context_unavailable: ${sce.reason}`);
+						out.push({ type: "error", reason: "error", error: err });
+						out.end(err);
+						return;
+					}
+
+					// Phase 2b: build the PreparedRequest on the first attempt
+					// of this logical call. It is reused on transient retry.
+					if (!prepared) {
+						try {
+							await buildPrepared();
+						} catch {
+							// Hashing failures are non-fatal; we proceed without
+							// a PreparedRequest (the request still goes out).
+							prepared = null;
+						}
+					}
 					let stream: AssistantMessageEventStream;
 					try {
 						// Await: the default streamFn is async (dynamic import of
@@ -1193,6 +1477,13 @@ export class AgentRunner {
 					}
 
 					if (eventType === "done") {
+						// Phase 2b (§12): emit structured metrics for this request.
+						// Best-effort; never fails the request on a metrics error.
+						try {
+							self.emitRequestMetrics(sessionId, config, prepared, finalMessage, stableContextError.value);
+						} catch {
+							// ignore metrics failures
+						}
 						// Forward the held-back done event, then end.
 						if (terminalEvent) out.push(terminalEvent);
 						out.end(finalMessage!);
@@ -1226,6 +1517,13 @@ export class AgentRunner {
 								// a text fallback before the LLM sees it).
 								const transformed = await transformContext(newMessages).catch(() => newMessages);
 								currentContext = { ...(currentContext as object), messages: transformed };
+								// Phase 2b (§8.2): force-compaction bumped the
+								// checkpoint generation → release the old
+								// PreparedRequest and build exactly one new one on
+								// the next iteration. logicalCallId is advanced so
+								// the new object gets a fresh id.
+								prepared = null;
+								logicalCallId = null;
 								attempt = -1; // next iteration → attempt 0 again
 								continue;
 							}
@@ -1372,6 +1670,264 @@ export class AgentRunner {
 			return d;
 		});
 		return msgs;
+	}
+
+	// =========================================================================== //
+	// Phase 2b: checkpoint ensure + overview back-fill + assembler wiring
+	// =========================================================================== //
+
+	/**
+	 * Build a {@link CheckpointEnv} for the current run (§10). The version fields
+	 * are derived from the system prompt + tool schema; the slide fingerprint
+	 * comes from the (cached) slide info. Used by both {@link ensureCheckpointRun}
+	 * and the assembler's staleness check.
+	 */
+	private buildCheckpointEnv(systemPrompt: string, tools: unknown[], slideInfo: SlideInfo): CheckpointEnv {
+		const settings = resolveTransformSettings(this.activeRunConfig ?? ({} as RunConfig));
+		return {
+			system_prompt_version: computeSystemPromptVersion(systemPrompt),
+			tool_schema_hash: computeToolSchemaHash(tools as Parameters<typeof computeToolSchemaHash>[0]),
+			request_schema_version: REQUEST_SCHEMA_VERSION,
+			slide_fingerprint: slideInfo.fingerprint || "",
+			overview_target_long_edge: settings.overviewLongEdge,
+			overview_jpeg_quality: settings.jpegQuality,
+			overview_overlay_version: settings.overlayVersion,
+			overview_resize_algorithm: TRANSFORM_RESIZE_ALGORITHM,
+			overview_encoder_id: TRANSFORM_ENCODER_ID,
+		};
+	}
+
+	/**
+	 * Lazily ensure a checkpoint exists for the session, and when the existing
+	 * generation-1 checkpoint has no overview derivative, attempt to back-fill
+	 * it (§3.2/§7.3): select the overview ref, materialize it once, compute the
+	 * content_sha256, and CAS-commit a generation-2 checkpoint with the full
+	 * overview_derivative.
+	 *
+	 * Materialization failure → keep the no-overview generation intact (§3.2:
+	 * "物化失败/读取失败不得提交 checkpoint"). This is an explicit degraded
+	 * path; the assembler still serves requests without an overview image.
+	 *
+	 * Stale check (§10): when version fields changed, rebuild a fresh generation
+	 * via {@link ensureCheckpoint} (no-overview) and let a later request
+	 * re-back-fill.
+	 */
+	private async ensureCheckpointRun(args: {
+		sessionId: string;
+		slide: string;
+		slideInfo: SlideInfo;
+		systemPrompt: string;
+		tools: unknown[];
+		firstSnapshotToolCallIdRef: { value: string | null };
+	}): Promise<void> {
+		const { sessionId, slide, slideInfo, systemPrompt, tools } = args;
+		const env = this.buildCheckpointEnv(systemPrompt, tools, slideInfo);
+		const settings = resolveTransformSettings(this.activeRunConfig ?? ({} as RunConfig));
+
+		// Read once outside the lock (§5.3: candidate computation runs outside).
+		const data = await this.store.readSession(sessionId);
+		if (!data) return;
+
+		// ensureCheckpoint mutates data in memory; we then commit via CAS.
+		const cp = ensureCheckpoint(data, {
+			system_prompt_version: env.system_prompt_version,
+			tool_schema_hash: env.tool_schema_hash,
+			slide_fingerprint: env.slide_fingerprint,
+		});
+
+		// Stale check (§10): version fields changed → rebuild from scratch. We
+		// drop the stale checkpoint and re-ensure, then CAS-commit. This bumps
+		// the generation.
+		const staleReason = checkpointStale(cp, env);
+		if (staleReason) {
+			// Force a fresh g1 (no overview). ensureCheckpoint returns the
+			// existing one when present, so we null it out first.
+			const freshData = { ...data, context_checkpoint: undefined } as SessionData;
+			const freshCp = ensureCheckpoint(freshData, {
+				system_prompt_version: env.system_prompt_version,
+				tool_schema_hash: env.tool_schema_hash,
+				slide_fingerprint: env.slide_fingerprint,
+			});
+			await this.store.commitCheckpoint(
+				sessionId,
+				cp.generation,
+				env.slide_fingerprint,
+				(d) => {
+					d.context_checkpoint = freshCp;
+				},
+			);
+			// Attempt overview back-fill for the fresh checkpoint below.
+			await this.backfillOverview({ sessionId, slide, slideInfo, cp: freshCp, env, settings, systemPrompt, tools, firstSnapshotToolCallIdRef: args.firstSnapshotToolCallIdRef });
+			return;
+		}
+
+		// Commit the g1 candidate if it is new (ensureCheckpoint may have created
+		// it in memory but it is not yet on disk). We detect "new" by reading
+		// the on-disk generation; when they differ, CAS-commit.
+		const onDisk = await this.store.readSession(sessionId);
+		const onDiskGen = onDisk?.context_checkpoint?.generation;
+		if (onDiskGen !== cp.generation) {
+			const res = await this.store.commitCheckpoint(
+				sessionId,
+				onDiskGen,
+				env.slide_fingerprint,
+				(d) => {
+					d.context_checkpoint = cp;
+				},
+			);
+			if (!res.ok) {
+				// Concurrent bump → another op established the checkpoint; we
+				// accept whatever is now on disk and proceed.
+				return;
+			}
+		}
+
+		// Overview back-fill (§3.2): g1 with no overview → try to build g2.
+		if (!cp.overview_derivative) {
+			await this.backfillOverview({ sessionId, slide, slideInfo, cp, env, settings, systemPrompt, tools, firstSnapshotToolCallIdRef: args.firstSnapshotToolCallIdRef });
+		}
+	}
+
+	/**
+	 * Attempt to back-fill the stable overview derivative (§3.2/§7.3). On
+	 * success, CAS-commit a generation+1 checkpoint carrying the full
+	 * overview_derivative (ref_id, encoding spec, content_sha256). On failure,
+	 * leave the existing no-overview generation intact.
+	 */
+	private async backfillOverview(args: {
+		sessionId: string;
+		slide: string;
+		slideInfo: SlideInfo;
+		cp: ContextCheckpoint;
+		env: CheckpointEnv;
+		settings: ReturnType<typeof resolveTransformSettings>;
+		systemPrompt: string;
+		tools: unknown[];
+		firstSnapshotToolCallIdRef: { value: string | null };
+	}): Promise<void> {
+		const { sessionId, slide, slideInfo, cp, env, settings } = args;
+		// Select the overview ref (§7.3): identity → first >90% coverage.
+		const ref = selectOverviewRef({
+			messages: (await this.store.readSession(sessionId))?.messages || [],
+			firstSnapshotToolCallId: args.firstSnapshotToolCallIdRef.value,
+			slideWidth: slideInfo.width,
+		});
+		if (!ref) return; // no overview candidate → stay no-overview
+
+		const spec = overviewDerivativeSpec({
+			slide,
+			fingerprint: slideInfo.fingerprint || "",
+			src: ref.src,
+			targetLongEdge: settings.overviewLongEdge,
+			jpegQuality: settings.jpegQuality,
+			overlayVersion: settings.overlayVersion,
+		});
+
+		let result;
+		try {
+			result = await materializeDerivativeRaw({
+				flask: this.flask,
+				slide,
+				slideInfo,
+				spec,
+				expectedFingerprint: slideInfo.fingerprint || undefined,
+			});
+		} catch {
+			// Materialization failed → keep the no-overview generation (§3.2).
+			return;
+		}
+		const encoderVersion = result.encoder?.version || "unknown";
+		const od = buildOverviewDerivative({
+			ref_id: ref.ref_id,
+			jpegBase64: result.data,
+			target_long_edge: settings.overviewLongEdge,
+			jpeg_quality: settings.jpegQuality,
+			overlay_version: settings.overlayVersion,
+			resize_algorithm: TRANSFORM_RESIZE_ALGORITHM,
+			encoder_id: TRANSFORM_ENCODER_ID,
+			encoder_version: encoderVersion,
+			mime_type: result.mime,
+		});
+
+		// Build the g+1 candidate with the overview.
+		const stablePrefixObj = buildStablePrefixObject({
+			systemPrompt: args.systemPrompt,
+			system_prompt_version: env.system_prompt_version,
+			tool_schema_hash: env.tool_schema_hash,
+			request_schema_version: REQUEST_SCHEMA_VERSION,
+			slide_fingerprint: env.slide_fingerprint,
+			summary: cp.summary,
+			annotation_index: cp.annotation_index,
+			overview_derivative: od.overview_derivative,
+		});
+		const nextCp: ContextCheckpoint = {
+			...cp,
+			generation: cp.generation + 1,
+			created_at: Date.now(),
+			overview_derivative: od.overview_derivative,
+			stable_prefix_hash: stablePrefixHash(stablePrefixObj),
+		};
+
+		// CAS-commit: expected = current generation, fingerprint must match.
+		await this.store.commitCheckpoint(
+			sessionId,
+			cp.generation,
+			env.slide_fingerprint,
+			(d) => {
+				d.context_checkpoint = nextCp;
+			},
+		);
+		// Commit failure (concurrent bump / disk error) → old generation intact,
+		// no-overview. Acceptable per §3.2.
+	}
+
+	/**
+	 * The RunConfig for the currently-active run, captured so helper methods
+	 * (buildCheckpointEnv) can resolve transform settings without threading it
+	 * through every call. Set at the start of {@link runAgentLoop}.
+	 */
+	private activeRunConfig: RunConfig | null = null;
+
+	/**
+	 * Emit one §12 metrics record for a completed model request. Called from
+	 * {@link makeRetryingStreamFn} on the "done" event. Gathers assembler-side
+	 * fields (from the PreparedRequest + LRU counters) and provider-side fields
+	 * (from the assistant message usage). NO image content or API key.
+	 */
+	private emitRequestMetrics(
+		sessionId: string,
+		config: RunConfig,
+		prepared: PreparedRequest | null,
+		finalMessage: AssistantMessage | null,
+		stableError: StableContextUnavailableError | null,
+	): void {
+		const usage = finalMessage?.usage as { input?: number; cacheRead?: number; cacheWrite?: number } | undefined;
+		const promptCacheMode = (config.prompt_cache_mode as PromptCacheMode | undefined) ?? "auto";
+		// Image byte counts: approximate from the PreparedRequest's image hashes
+		// (we do not retain the bytes here, so we count the hash list length and
+		// the estimated bytes already on the PreparedRequest).
+		const preparedBytes = prepared?.estimatedBytes ?? 0;
+		const selectedImages = prepared?.imageContentHashes.length ?? 0;
+		const metrics = buildRequestMetrics({
+			session_id: sessionId,
+			checkpoint_generation: prepared?.checkpointGeneration ?? 0,
+			stable_prefix_hash: prepared?.stablePrefixHash ?? "",
+			prompt_cache_mode: promptCacheMode,
+			transform_ms: 0, // populated by the assembler's metrics sink (per-request)
+			region_fetch_ms: 0,
+			selected_images: selectedImages,
+			materialized_images: selectedImages,
+			evicted_image_refs: [],
+			image_lru_hits: 0,
+			image_lru_misses: 0,
+			overview_image_bytes_sent: 0,
+			working_set_image_bytes_sent: 0,
+			prepared_request_bytes: preparedBytes,
+			compaction_reason: null,
+			checkpoint_rebuild_reason: stableError ? "stable_context_unavailable" : null,
+			usage,
+		});
+		this.metricsSink(metrics);
 	}
 
 	// =========================================================================== //

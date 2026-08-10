@@ -426,4 +426,39 @@ describe("compaction", () => {
 			expect(ref.magnification).toBe("20x");
 		});
 	});
+
+	// ======================================================================= //
+	// Phase 2b: visual budget in checkShouldCompact (§9.1)
+	// ======================================================================= //
+	describe("Phase 2b — checkShouldCompact visual budget (§9.1)", () => {
+		it("does NOT trigger compaction when text + reserve is well under the window", () => {
+			const settings = resolveCompactionSettings({ context_window_tokens: 100000, reserve_tokens: 10000 });
+			const msgs: AgentMessage[] = [{ role: "user", content: "short", timestamp: 1 } as AgentMessage];
+			const out = checkShouldCompact(msgs, settings);
+			expect(out.should).toBe(false);
+		});
+
+		it("triggers earlier when a visual reserve is added (§9.1)", () => {
+			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 100 });
+			// Build messages whose text estimate is just under the window.
+			// estimateContextTokens uses ~4 chars/token for text, so ~3000 chars
+			// → ~750 tokens. 750 + 100 (reserve) = 850 < 1000 → no compaction.
+			const longText = "x".repeat(3000);
+			const msgs: AgentMessage[] = [{ role: "user", content: longText, timestamp: 1 } as AgentMessage];
+			const withoutVisual = checkShouldCompact(msgs, settings);
+			expect(withoutVisual.should).toBe(false);
+			// Adding a visual reserve pushes the combined estimate over the window.
+			const withVisual = checkShouldCompact(msgs, settings, { visualContextBudgetReserve: 200 });
+			// 750 + 200 + 100 > 1000 → should compact.
+			expect(withVisual.tokens).toBeGreaterThan(withoutVisual.tokens);
+		});
+
+		it("tokens reflect the sum of text + visual", () => {
+			const settings = resolveCompactionSettings({ context_window_tokens: 100000, reserve_tokens: 0 });
+			const msgs: AgentMessage[] = [{ role: "user", content: "hi", timestamp: 1 } as AgentMessage];
+			const base = checkShouldCompact(msgs, settings);
+			const withVisual = checkShouldCompact(msgs, settings, { visualTokens: 5000 });
+			expect(withVisual.tokens).toBe(base.tokens + 5000);
+		});
+	});
 });

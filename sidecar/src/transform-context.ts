@@ -44,6 +44,8 @@ import { isImageContent, isImageRefContent, stripContextMeta, type ImageRefConte
 
 const PLACEHOLDER_TEXT = "（历史快照已省略，可用 goto+snapshot 重新查看）";
 const DEGRADE_TEXT = "该图因切片变更不可用。";
+/** Exposed for the assembler so it can fall back to the same degraded copy. */
+export { PLACEHOLDER_TEXT as LEGACY_PLACEHOLDER_TEXT, DEGRADE_TEXT };
 /** Default visual working set size when the new config field is absent. */
 const DEFAULT_VISUAL_WORKING_SET_MAX = 4;
 /** Default per-derivative target long edges (§6.1). */
@@ -185,6 +187,29 @@ let regionLruMaxBytes = DEFAULT_LRU_MAX_MB * MB_BYTES;
 /** Current TTL; updated by resolveTransformSettings per run. */
 let regionLruTtlMs = DEFAULT_LRU_TTL_MS;
 
+/**
+ * LRU hit/miss counters for §12 metrics. Reset by {@link resetLruCounters}.
+ * Phase 2b: the assembler / metrics sink read these after each request.
+ */
+let lruHitCount = 0;
+let lruMissCount = 0;
+
+/** Reset the LRU hit/miss counters (call at the start of a metrics window). */
+export function resetLruCounters(): void {
+	lruHitCount = 0;
+	lruMissCount = 0;
+}
+
+/** Current LRU hit count since the last {@link resetLruCounters} (§12). */
+export function lruHitCount_value(): number {
+	return lruHitCount;
+}
+
+/** Current LRU miss count since the last {@link resetLruCounters} (§12). */
+export function lruMissCount_value(): number {
+	return lruMissCount;
+}
+
 /** Test helper: reconfigure the LRU budget/TTL (mirrors run-time resolution). */
 export function configureRegionLru(maxBytes: number, ttlMs: number): void {
 	regionLruMaxBytes = Math.max(1, Math.floor(maxBytes));
@@ -208,17 +233,42 @@ function derivativeKey(spec: DerivativeSpec): string {
 	].join("|");
 }
 
-function regionLruGet(key: string, expectedFp: string): { data: string; mime: string } | undefined {
+function regionLruGet(key: string, expectedFp: string, countMiss = true): { data: string; mime: string } | undefined {
 	const hit = regionLru.get(key);
-	if (!hit) return undefined;
+	if (!hit) {
+		if (countMiss) lruMissCount += 1;
+		return undefined;
+	}
 	if (hit.fingerprint !== expectedFp || Date.now() - hit.cachedAt > regionLruTtlMs) {
 		regionLru.delete(key);
+		if (countMiss) lruMissCount += 1;
 		return undefined;
 	}
 	// Refresh recency (Map iteration order = insertion order).
 	regionLru.delete(key);
 	regionLru.set(key, hit);
+	lruHitCount += 1;
 	return { data: hit.data, mime: hit.mime };
+}
+
+/**
+ * Peek the LRU without touching recency or counters. Used by the assembler's
+ * overview content-hash verification (§10/§13): we need to know whether the
+ * derivative is cached so we can decide to repair or rebuild, without consuming
+ * a "hit" in the metrics.
+ */
+function regionLruPeek(key: string, expectedFp: string): { data: string; mime: string } | undefined {
+	const hit = regionLru.get(key);
+	if (!hit) return undefined;
+	if (hit.fingerprint !== expectedFp || Date.now() - hit.cachedAt > regionLruTtlMs) {
+		return undefined;
+	}
+	return { data: hit.data, mime: hit.mime };
+}
+
+/** Test/diagnostic helper: drop one derivative cache entry by key. */
+function regionLruDelete(key: string): void {
+	regionLru.delete(key);
 }
 
 function decodedBase64Bytes(b64: string): number {
@@ -797,6 +847,138 @@ async function materializeRef(
 // Test-visible helpers
 // =========================================================================== //
 
+/** Expose the encoder constants for the checkpoint spec (§6.3, Phase 2b). */
+export const TRANSFORM_ENCODER_ID = ENCODER_ID;
+export const TRANSFORM_RESIZE_ALGORITHM = RESIZE_ALGORITHM;
+
+/**
+ * Drop a single derivative cache entry that matches the given spec, when
+ * present. Used by the assembler's overview hash-repair flow (§10/§13): on a
+ * content_sha256 mismatch we delete the suspect cached entry before rebuilding
+ * it with the checkpoint's encoding parameters.
+ */
+export function dropDerivative(spec: DerivativeSpec): void {
+	regionLruDelete(derivativeKey(spec));
+}
+
+/**
+ * Peek (without counters or recency refresh) whether a derivative is cached and
+ * return its base64 + mime. Used by the assembler's overview verification.
+ */
+export function peekDerivative(spec: DerivativeSpec): { data: string; mime: string } | undefined {
+	return regionLruPeek(derivativeKey(spec), spec.fingerprint);
+}
+
+/**
+ * Insert (or overwrite) a derivative cache entry directly. Used by the
+ * assembler after rebuilding an overview whose hash matched on the second
+ * materialization (§10: "重建匹配→继续"), so subsequent requests hit the LRU.
+ */
+export function putDerivative(
+	spec: DerivativeSpec,
+	entry: { data: string; mime: string },
+): void {
+	regionLruSet(derivativeKey(spec), {
+		data: entry.data,
+		mime: entry.mime,
+		slide: normalizeSlideKey(spec.slide),
+		fingerprint: spec.fingerprint,
+	});
+}
+
+/**
+ * Materialize ONE derivative from a known src bbox + slide fingerprint, using
+ * the derivative LRU + in-flight coalescing (§6.3/§7.1). Used by:
+ *   - the overview back-fill (§10) to materialize the stable overview once and
+ *     compute its content_sha256;
+ *   - the assembler's overview hash-repair rebuild (§10/§13).
+ *
+ * Unlike {@link materializeRef}, this function THROWS on failure (the overview
+ * path must be able to detect a permanent failure and retire the checkpoint,
+ * §3.2). Transient errors are still swallowed into DEGRADE_TEXT only for the
+ * non-overview materializeRef path.
+ *
+ * @returns the base64 + mime + encoder info (when Flask returns it).
+ */
+export async function materializeDerivativeRaw(args: {
+	flask: FlaskClient;
+	slide: string;
+	slideInfo: SlideInfo;
+	spec: DerivativeSpec;
+	/** Pass the ref's slide_fingerprint so Flask can 409 on a mismatch. */
+	expectedFingerprint?: string;
+	signal?: AbortSignal;
+}): Promise<{ data: string; mime: string; encoder?: { id: string; version: string; resize: string; overlay_version: string; jpeg_quality: number } }> {
+	const { flask, slide, slideInfo, spec, signal } = args;
+	const cacheKey = derivativeKey(spec);
+	const fp = spec.fingerprint || "";
+
+	if (signal?.aborted) {
+		throw new Error("materializeDerivativeRaw aborted");
+	}
+	// Note: we do NOT consume a hit/miss counter here; the overview path uses
+	// peekDerivative for its own verification and only counts real region calls.
+	const cached = regionLruGet(cacheKey, fp, false);
+	if (cached) {
+		return { data: cached.data, mime: cached.mime };
+	}
+
+	const result = await subscribeDerivative(
+		cacheKey,
+		async (fetchSignal) => {
+			const r = await flask.region({
+				slide,
+				x: spec.x,
+				y: spec.y,
+				w: spec.w,
+				h: spec.h,
+				max_long_edge: spec.targetLongEdge,
+				jpeg_quality: spec.jpegQuality,
+				expected_fingerprint: args.expectedFingerprint || fp || undefined,
+				signal: fetchSignal,
+			});
+			return { data: r.image_base64, mime: r.mime, encoder: r.encoder };
+		},
+		signal,
+	);
+	const b64 = result.data || "";
+	if (!b64) {
+		throw new Error("materializeDerivativeRaw: empty payload");
+	}
+	const mime = result.mime || "image/jpeg";
+	regionLruSet(cacheKey, { data: b64, mime, slide: normalizeSlideKey(slide), fingerprint: fp });
+	const encoder = result.encoder as { id: string; version: string; resize: string; overlay_version: string; jpeg_quality: number } | undefined;
+	return { data: b64, mime, encoder };
+}
+
+/**
+ * Build a {@link DerivativeSpec} for the stable overview (§6.1: longest edge
+ * = overview_long_edge). Exported so the assembler and the checkpoint
+ * back-fill build the SAME spec / cache key from the same inputs.
+ */
+export function overviewDerivativeSpec(args: {
+	slide: string;
+	fingerprint: string;
+	src: { x: number; y: number; w: number; h: number };
+	targetLongEdge: number;
+	jpegQuality: number;
+	overlayVersion: string;
+}): DerivativeSpec {
+	return {
+		slide: args.slide,
+		fingerprint: args.fingerprint,
+		x: args.src.x,
+		y: args.src.y,
+		w: Math.max(1, args.src.w),
+		h: Math.max(1, args.src.h),
+		targetLongEdge: args.targetLongEdge,
+		jpegQuality: args.jpegQuality,
+		overlayVersion: args.overlayVersion,
+		resizeAlgorithm: RESIZE_ALGORITHM,
+		encoderId: ENCODER_ID,
+	};
+}
+
 /**
  * Count image blocks (materialized images, not refs) in a message array. Used
  * by tests to assert the eviction outcome.
@@ -826,4 +1008,105 @@ export function hasNoImageRefBlocks(messages: AgentMessage[] | PersistedAgentMes
 		}
 	}
 	return true;
+}
+
+// =========================================================================== //
+// Rich-text history (§7.2, Phase 2b)
+// =========================================================================== //
+
+/**
+ * One observation relevant to a given image ref (§7.2). Built by the assembler
+ * from `SessionData.observations` and matched to a ref by bbox overlap or an
+ * explicit snapshot-id link.
+ */
+export interface RichHistoryObservation {
+	summary: string;
+}
+
+/**
+ * Build the §7.2 rich-text history block for an evicted image_ref. Used by the
+ * assembler when a ref is dropped from the visual working set:
+ *
+ *   历史快照 ref={ref_id}：
+ *   - level-0 bbox=(x,y,w,h)
+ *   - 放大倍率={magnification}
+ *   - 观察摘要={summary 或“尚无结构化观察”}
+ *   - 如需复核，可 goto bbox 中心后重新 snapshot
+ *
+ * Per §7.2: "已经产生 observation 的图片必须携带 observation 文本；未产生
+ * observation 的图片不得伪造结论。" When `observations` is empty / no matching
+ * observation is found, the summary line is "尚无结构化观察" — NEVER fabricated.
+ */
+export function buildRichHistoryText(
+	ref: ImageRefContent,
+	observations: RichHistoryObservation[] = [],
+): string {
+	const s = ref.src || { x: 0, y: 0, w: 0, h: 0 };
+	// §7.2: 观察摘要 is the OBSERVATION summary, not the image_ref's own
+	// summary caption. When no observation exists, the line MUST say
+	// "尚无结构化观察" — never fabricate from the ref's caption.
+	const summaryText = observations.length > 0
+		? observations.map((o) => o.summary).filter(Boolean).join("；") || "尚无结构化观察"
+		: "尚无结构化观察";
+	const lines = [
+		`历史快照 ref=${ref.ref_id}：`,
+		`- level-0 bbox=(${s.x},${s.y},${s.w},${s.h})`,
+		`- 放大倍率=${ref.magnification || "未知"}`,
+		`- 观察摘要=${summaryText}`,
+		`- 如需复核，可 goto bbox 中心后重新 snapshot`,
+	];
+	return lines.join("\n");
+}
+
+/**
+ * Build the §7.2 rich-text block for an evicted image_ref, choosing between the
+ * rich form (with observations) and a short placeholder when no observations
+ * apply. The assembler passes the full observations list; this helper filters
+ * by bbox overlap (§7.2: "ref 的 bbox 与 observation bbox 匹配或 observation
+ * 携带 snapshot 关联时挂上").
+ *
+ * @param ref the evicted image_ref
+ * @param observations raw observations to filter (each may carry bbox + note)
+ * @param snapshotIdToObservations optional precomputed index of snapshot_id →
+ *   observations, when the observation carries an explicit snapshot link
+ *   (Phase 2b falls back to bbox overlap when this is absent).
+ */
+export function richHistoryForRef(
+	ref: ImageRefContent,
+	observations: { bbox?: { x?: number; y?: number; w?: number; h?: number }; note?: string; [k: string]: unknown }[] = [],
+	snapshotIdToObservations?: Map<string, RichHistoryObservation[]>,
+): string {
+	const refId = ref.ref_id || "";
+	// Explicit snapshot-id link wins (§7.2: "observation 携带 snapshot 关联").
+	const linked = snapshotIdToObservations?.get(refId);
+	if (linked && linked.length > 0) {
+		return buildRichHistoryText(ref, linked);
+	}
+	// Fallback: bbox overlap.
+	const rs = ref.src;
+	const matched: RichHistoryObservation[] = [];
+	if (rs && (rs.w > 0 || rs.h > 0)) {
+		for (const o of observations) {
+			const b = o.bbox;
+			if (!b) continue;
+			if (bboxOverlap(rs, b)) {
+				matched.push({ summary: o.note || "" });
+			}
+		}
+	}
+	return buildRichHistoryText(ref, matched);
+}
+
+/** Whether two bboxes overlap (closed-interval). */
+function bboxOverlap(
+	a: { x: number; y: number; w: number; h: number },
+	b: { x?: number; y?: number; w?: number; h?: number },
+): boolean {
+	const bx = Number(b.x ?? NaN);
+	const by = Number(b.y ?? NaN);
+	const bw = Number(b.w ?? NaN);
+	const bh = Number(b.h ?? NaN);
+	if (![bx, by, bw, bh].every(Number.isFinite)) return false;
+	const noOverlap = a.x + a.w <= bx || bx + bw <= a.x || a.y + a.h <= by || by + bh <= a.y;
+	return !noOverlap;
 }

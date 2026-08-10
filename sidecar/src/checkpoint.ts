@@ -504,3 +504,193 @@ export function generationMatches(
 	// undefined === undefined is the explicit "first commit" semantic (§5.3).
 	return current === expected;
 }
+
+// =========================================================================== //
+// Overview derivative back-fill + hash verification (Phase 2b, §3.2/§6.3/§10/§13)
+// =========================================================================== //
+
+/**
+ * The shape of an image_ref as it appears in canonical messages, narrowed for
+ * the overview-selection helper. Kept local to avoid a runtime import cycle
+ * with session-store.ts (we already type-only-import PersistedAgentMessage).
+ */
+type RefLike = {
+	ref_id: string;
+	src?: { x?: number; y?: number; w?: number; h?: number };
+	[k: string]: unknown;
+};
+
+/**
+ * Select the single stable overview ref for a session (§7.3):
+ *   - Prefer a recorded identity (the first snapshot's toolCallId, surfaced as
+ *     `ref_<id>`).
+ *   - Otherwise pick the FIRST canonical image_ref whose src covers >90% of the
+ *     slide width.
+ *   - Returns null when no suitable ref exists (the degraded no-overview path).
+ *
+ * The coverage-based fallback is ONLY for the lazy migration from a Phase 2a
+ * g1 checkpoint; once a checkpoint records `overview_derivative.ref_id`, the
+ * assembler uses that verbatim and never re-runs coverage guessing (§7.3).
+ */
+export function selectOverviewRef(args: {
+	messages: { role?: string; content?: unknown }[];
+	firstSnapshotToolCallId: string | null;
+	slideWidth: number;
+}): { ref_id: string; src: { x: number; y: number; w: number; h: number } } | null {
+	const identity = args.firstSnapshotToolCallId;
+	if (identity) {
+		const found = findRef(args.messages, (r) => r.ref_id === `ref_${identity}`);
+		if (found) return found;
+	}
+	// First >90% coverage image_ref (§7.3 lazy migration).
+	if (args.slideWidth > 0) {
+		const found = findRef(args.messages, (r) => {
+			const w = Number(r.src?.w ?? 0);
+			return w > 0 && (w / args.slideWidth) * 100 > 90;
+		});
+		if (found) return found;
+	}
+	return null;
+}
+
+function findRef(
+	messages: { role?: string; content?: unknown }[],
+	predicate: (r: RefLike) => boolean,
+): { ref_id: string; src: { x: number; y: number; w: number; h: number } } | null {
+	for (const m of messages) {
+		const content = (m as { content?: unknown }).content;
+		if (!Array.isArray(content)) continue;
+		for (const part of content) {
+			if (part && typeof part === "object" && (part as { type?: string }).type === "image_ref") {
+				const r = part as RefLike;
+				if (predicate(r)) {
+					const s = r.src || {};
+					return {
+						ref_id: String(r.ref_id || ""),
+						src: {
+							x: Number(s.x ?? 0),
+							y: Number(s.y ?? 0),
+							w: Number(s.w ?? 0),
+							h: Number(s.h ?? 0),
+						},
+					};
+				}
+			}
+		}
+	}
+	return null;
+}
+
+/**
+ * Outcome of an overview derivative materialization attempt. The caller maps
+ * this onto either a CAS commit (success) or a degraded-generation fallback
+ * (failure), per §3.2.
+ */
+export interface OverviewDerivativeResult {
+	/** The ref the overview was built from. */
+	ref_id: string;
+	/** Content hash of the decoded JPEG bytes (§6.3). */
+	content_sha256: string;
+	/** The full derivative spec recorded in the checkpoint. */
+	overview_derivative: NonNullable<ContextCheckpoint["overview_derivative"]>;
+}
+
+/**
+ * Build a complete {@link OverviewDerivativeResult} from materialized JPEG
+ * bytes + the encoding parameters. Computes the content_sha256 over the
+ * DECODED bytes (not the base64 string) so base64 padding/wrapping cannot
+ * perturb the hash (§6.3: "缓存最终 JPEG bytes").
+ *
+ * The encoder version comes from the region response (§6.3: `encoder_version`
+ * = region response `encoder.version`); the caller passes it in.
+ */
+export function buildOverviewDerivative(args: {
+	ref_id: string;
+	jpegBase64: string;
+	target_long_edge: number;
+	jpeg_quality: number;
+	overlay_version: string;
+	resize_algorithm: string;
+	encoder_id: string;
+	encoder_version: string;
+	mime_type: string;
+}): OverviewDerivativeResult {
+	// Hash the decoded raw bytes (§6.3). Buffer.from(base64) decodes.
+	const buf = Buffer.from(args.jpegBase64 || "", "base64");
+	const content_sha256 = createHash("sha256").update(buf).digest("hex");
+	return {
+		ref_id: args.ref_id,
+		content_sha256,
+		overview_derivative: {
+			ref_id: args.ref_id,
+			target_long_edge: args.target_long_edge,
+			jpeg_quality: args.jpeg_quality,
+			overlay_version: args.overlay_version,
+			resize_algorithm: args.resize_algorithm,
+			encoder_id: args.encoder_id,
+			encoder_version: args.encoder_version,
+			mime_type: args.mime_type,
+			content_sha256,
+		},
+	};
+}
+
+/**
+ * Compute the content_sha256 of an already-materialized JPEG (base64), used by
+ * the assembler's verification flow (§10/§13) to compare against the value
+ * recorded in the checkpoint. The hash is over decoded bytes (§6.3).
+ */
+export function computeDerivativeContentHash(jpegBase64: string): string {
+	const buf = Buffer.from(jpegBase64 || "", "base64");
+	return createHash("sha256").update(buf).digest("hex");
+}
+
+// =========================================================================== //
+// Stable prefix canonical form (Phase 2b)
+// =========================================================================== //
+
+/**
+ * Build the canonical stable-prefix object used to compute
+ * {@link ContextCheckpoint.stable_prefix_hash} (§10) and to verify byte-stable
+ * ordering across requests in the same generation (§8.3).
+ *
+ * The stable prefix is EXACTLY what the Provider receives in the stable region
+ * (§5.1):
+ *   systemPrompt + tools + summary + overview image descriptor + annotation index.
+ *
+ * Notes (§5.1):
+ *   - The system prompt is included as its version hash (the full text is sent
+ *     to the provider but the hash is what invalidates on edit; including both
+ *     would double-count). We include the full text here so two different
+ *     prompts with the same version hash (impossible by construction) cannot
+ *     collide, AND so changes to non-hash-affecting whitespace are still caught
+ *     by the stable-prefix hash. In practice version === sha256(prompt), so
+ *     including both is redundant but harmless.
+ *   - The overview is represented by its full derivative spec + content_sha256.
+ *     We do NOT include the base64 bytes (they would make the hash equivalent
+ *     to a payload hash and are already covered by content_sha256).
+ *   - Tools are included by their schema hash for the same reason.
+ *
+ * This object is canonical-serialized + sha256'd by {@link stablePrefixHash}.
+ */
+export function buildStablePrefixObject(args: {
+	systemPrompt: string;
+	system_prompt_version: string;
+	tool_schema_hash: string;
+	request_schema_version: number;
+	slide_fingerprint: string;
+	summary: string;
+	annotation_index: string;
+	overview_derivative: ContextCheckpoint["overview_derivative"];
+}): unknown {
+	return {
+		system_prompt: args.systemPrompt,
+		system_prompt_version: args.system_prompt_version,
+		tool_schema_hash: args.tool_schema_hash,
+		request_schema_version: args.request_schema_version,
+		slide_fingerprint: args.slide_fingerprint,
+		summary: args.summary,
+		annotation_index: args.annotation_index,
+		overview_derivative: args.overview_derivative,
+	};
+}

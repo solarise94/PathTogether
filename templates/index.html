@@ -280,13 +280,15 @@
             <label class="ai-field"><span data-i18n="ai.advanced.reserve">摘要预留 tokens</span>
               <input id="ai-reserve" type="number" min="0" placeholder="16000" /></label>
             <label class="ai-field"><span data-i18n="ai.advanced.safety">安全余量 tokens</span>
-              <input id="ai-safety-margin" type="number" min="0" placeholder="8192" /></label>
+              <input id="ai-safety-margin" type="number" min="0" placeholder="8192" class="ai-field-legacy" />
+              <small class="ai-field-note" data-i18n="ai.config.field.legacy">兼容字段，当前不生效</small></label>
             <label class="ai-field"><span data-i18n="ai.advanced.keep">压缩后保留 tokens</span>
               <input id="ai-keep-recent" type="number" min="1000" placeholder="20000" /></label>
             <label class="ai-field"><span data-i18n="ai.advanced.fork">批注活跃上限</span>
               <input id="ai-fork-limit" type="number" min="1" placeholder="20" /></label>
             <label class="ai-field"><span data-i18n="ai.advanced.lease">租约 TTL（秒）</span>
-              <input id="ai-lease-ttl" type="number" min="30" placeholder="150" /></label>
+              <input id="ai-lease-ttl" type="number" min="30" placeholder="150" class="ai-field-legacy" />
+              <small class="ai-field-note" data-i18n="ai.config.field.legacy">兼容字段，当前不生效</small></label>
           </details>
           <div class="ai-config-actions">
             <button id="ai-config-save" class="btn primary small" data-i18n="ai.config.save">保存配置</button>

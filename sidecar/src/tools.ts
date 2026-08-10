@@ -699,9 +699,15 @@ export function createTools(ctx: ToolContext): AgentTool<any, any>[] {
 				annotation_id: roi ? roi.annotation_id : null,
 			});
 
-			return okText(
-				`已落标注「${alabel}」于左上角 (${fmt0(ax)},${fmt0(ay)}) 边长 ${aside} 像素（中心 (${fmt0(ax + aside / 2.0)},${fmt0(ay + aside / 2.0)})）。`,
-			);
+			// details.annotation_id 持久化进 transcript（pi toolResult 顶层 details 字段
+			// 透传），供历史恢复时在标注卡片上挂 fork/branch 按钮（无 details 的旧会话
+			// 降级为无按钮，前端自动忽略）。
+			return {
+				content: [text(
+					`已落标注「${alabel}」于左上角 (${fmt0(ax)},${fmt0(ay)}) 边长 ${aside} 像素（中心 (${fmt0(ax + aside / 2.0)},${fmt0(ay + aside / 2.0)})）。`,
+				)],
+				details: { annotation_id: roi ? roi.annotation_id : null },
+			};
 		},
 	};
 

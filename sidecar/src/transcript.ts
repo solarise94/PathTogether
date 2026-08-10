@@ -164,7 +164,14 @@ function toToolResultMessage(m: ToolResultMessage): FrontendMessage {
 	} else {
 		outContent = concatText(content);
 	}
-	return { role: "tool", tool_call_id: m.toolCallId, content: outContent };
+	const out: FrontendMessage = { role: "tool", tool_call_id: m.toolCallId, content: outContent };
+	// 透传工具结果里的 annotation_id（create_annotation 经 details 持久化）。
+	// 旧会话无 details / annotation_id 时缺省，前端降级为不挂按钮，不报错。
+	const annotationId = (m.details as { annotation_id?: unknown } | undefined)?.annotation_id;
+	if (annotationId != null && annotationId !== "") {
+		out.annotation_id = String(annotationId);
+	}
+	return out;
 }
 
 // =========================================================================== //

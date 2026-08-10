@@ -9,6 +9,26 @@
     return window.HP_I18N ? window.HP_I18N.t(key, vars) : key;
   }
 
+  // 本轮新增的 i18n 文案（暂未落入 i18n.js 字典的兜底表）。优先取 i18n.js 的值；
+  // 缺失时按当前界面语言走本地兜底，避免回退成 key 本身。
+  var _EXTRA_I18N = {
+    "ai.fork.sending": { zh: "发送中…", en: "Sending…" },
+    "anno.fork.quick": { zh: "快速问答", en: "Quick Q&A" },
+    "anno.fork.quick.tip": { zh: "就此标注快速提问（轻量批注对话）", en: "Ask about this annotation (lightweight fork chat)" },
+    "anno.branch.deep": { zh: "从此处深读", en: "Deep dive" },
+    "anno.branch.deep.tip": { zh: "在 AI 面板从此标注开分支会话（全量工具深读）", en: "Open a branch session from here (full tools, deep read)" },
+    "anno.private.badge": { zh: "私有", en: "Private" },
+  };
+  function tt(key) {
+    try {
+      var s = window.HP_I18N && window.HP_I18N.t(key);
+      if (s && s !== key) return s;
+    } catch (e) {}
+    var lang = (window.HP_I18N && window.HP_I18N.getLang()) || "zh";
+    var e = _EXTRA_I18N[key];
+    return (e && (e[lang] || e.zh)) || key;
+  }
+
   // ---------- 全局状态 ----------
   var state = {
     slide: null,          // 当前切片 {name,width,height,mppX,mppY,mppSource}
@@ -1745,16 +1765,10 @@
         if (state.focusAnno && it !== state.focusAnno) return; // focus 模式只显示该条气泡
         if (dragging && it !== editItem) return; // 拖动中只画选中项气泡
         var note = String(it.note || "");
-        // §任务3：focus 项即使 note 为空也画气泡 —— 文本 fallback 用 label+尺寸。
-        // 非 focus 项保持原状（note 为空不画）。
-        var isFocused = (state.focusAnno === it);
-        if (!note) {
-          if (!isFocused) return;
-          var sizeStr = (it.size_mm != null && it.size_mm !== "")
-            ? (it.size_mm + "mm")
-            : ((it.type === "arrow" || it.type === "freehand") ? t("draw.kind.anno") : "");
-          note = (it.label || t("draw.kind.anno")) + (sizeStr ? ("（" + sizeStr + "）") : "");
-        }
+        // P2-8：note 为空时不画气泡。矩形边上的短标签（drawLabel 的"标签 · 尺寸"）
+        // 已展示 label+尺寸，旧实现为选中项额外生成"标签（尺寸）"气泡，内容重复。
+        // 现仅在 note 非空时画气泡，且气泡只展示 note 内容本身。
+        if (!note) return;
         var selected = (editItem === it);
         drawNoteBubble(it, note, selected);
       });
@@ -2507,9 +2521,13 @@
         if ((it.type || "rect") === "rect" && it.size_mm != null) sizeStr = " · " + it.size_mm + "mm";
         else if (it.type === "arrow") sizeStr = " · (" + it.x1 + "," + it.y1 + ")→(" + it.x2 + "," + it.y2 + ")";
         else if (it.type === "freehand") sizeStr = " · " + t("anno.free.points", { n: (it.points ? it.points.length : 0) });
+        // P1-7：私有标注用「私有」徽章表达，不再整行降透明度。
+        var privateBadge = (!it.shared)
+          ? '<span class="anno-private-badge">' + esc(t("anno.private.badge")) + "</span>"
+          : "";
         left.innerHTML =
           '<div class="ai-title"><span class="ai-type-icon">' + typIcon + "</span>" +
-          '<span class="ai-label">' + esc(grp.label) + "</span>" + sizeStr + "</div>" +
+          '<span class="ai-label">' + esc(grp.label) + "</span>" + privateBadge + sizeStr + "</div>" +
           '<div class="ai-sub">' + fmtTime(it.ts) +
           (it.token ? esc(t("anno.sub.source", { s: String(it.token).slice(0, 6) })) : "") +
           (it.visitor ? esc(t("anno.sub.visitor", { s: String(it.visitor).slice(0, 6) })) : "") + "</div>";
@@ -2527,34 +2545,12 @@
         });
         row.appendChild(sharedBtn);
 
-        // AI 落标（source=ai）：挂 💬 → 就地展开批注对话（§6 标注面板 fork）
-        if (it.source === "ai" && it.annotation_id) {
-          var forkBtn = document.createElement("button");
-          forkBtn.className = "ai-op ai-fork";
-          forkBtn.textContent = "💬";
-          forkBtn.title = t("anno.fork.title");
-          forkBtn.addEventListener("click", function (ev) {
-            ev.stopPropagation();
-            openForkChat(it.annotation_id, row);
-          });
-          row.appendChild(forkBtn);
-        }
-
-        // 任何带 annotation_id 的标注：挂 ⑂ → 在 AI 面板开/续分支会话（§任务2）。
-        // branch 是全量工具完整会话（与 fork 纯文本小框互补）。点击复用既有 branch，
-        // 无则 POST /api/ai/branch 新建并流式渲染进 AI 面板主对话区。
+        // AI 动作（P1-6）：所有带 annotation_id 的标注都挂 fork「快速问答」+ branch
+        // 「从此处深读」两个小按钮（图标+短文字），不再按 source 区分。fork 轻量就地
+        // 展开；branch 进 AI 面板开/续分支会话（复用既有或新建）。
         if (it.annotation_id) {
-          var branchBtn = document.createElement("button");
-          branchBtn.className = "ai-op ai-branch";
-          branchBtn.textContent = "⑂";
-          branchBtn.title = t("anno.branch.title");
-          // 闭包捕获 annotation_id（it 是分组副本，annotation_id 稳定）。
-          var branchAid = it.annotation_id;
-          branchBtn.addEventListener("click", function (ev) {
-            ev.stopPropagation();
-            openBranchFromAnno(branchAid);
-          });
-          row.appendChild(branchBtn);
+          var annoAid = it.annotation_id;
+          buildAnnoAiActions(row, annoAid, "op");
         }
 
         // 编辑钮：跳转到该标注并进入选中编辑态
@@ -2581,8 +2577,8 @@
 
         row.style.cursor = "pointer";
         row.addEventListener("click", function (ev) {
-          if (ev.target === sharedBtn || ev.target === editBtn || ev.target === delBtn ||
-              ev.target === forkBtn || ev.target === branchBtn) return;
+          // 点击落在操作按钮区（分享/AI 动作/编辑/删除）则交给按钮自身处理，不触发跳转
+          if (ev.target.closest(".ai-share, .ai-op, .ai-action-chip, .fork-chat")) return;
           // §任务3：点击=聚焦切换。若该行已是 focusAnno → 再点一次取消 focus（恢复全量）。
           // 注意：it 是面板分组副本，state.focusAnno 是 flatItems 中的另一副本，
           // 引用不等，需按 token+ts+type 判定"是否同一标注"。
@@ -2680,7 +2676,22 @@
         btnEl.textContent = target ? "🌐" : "👁";
         btnEl.title = target ? t("anno.shared.on.title")
                              : t("anno.shared.off.title");
-        if (rowEl) rowEl.classList.toggle("anno-private", !target);
+        if (rowEl) {
+          rowEl.classList.toggle("anno-private", !target);
+          // P1-7：同步「私有」徽章（增/删 DOM），避免切换后徽章残留/缺失。
+          var labelEl = rowEl.querySelector(".ai-title .ai-label");
+          if (labelEl) {
+            var old = labelEl.parentNode.querySelector(".anno-private-badge");
+            if (target) {
+              if (old) old.remove();
+            } else if (!old) {
+              var badge = document.createElement("span");
+              badge.className = "anno-private-badge";
+              badge.textContent = t("anno.private.badge");
+              labelEl.parentNode.insertBefore(badge, labelEl.nextSibling);
+            }
+          }
+        }
         toast(target ? t("anno.set.public") : t("anno.set.private"), "success");
       })
       .catch(function (e) { toast(t("anno.update.fail3", { e: e.message }), "error"); })
@@ -3190,7 +3201,10 @@
       }
       fillAiTuningFields();
     });
-    els.aiStartBtn.addEventListener("click", startAiRun);
+    // 发送按钮与 Enter 共用同一个 context-aware 提交入口（P0-1）：
+    // 根据 active session（main/branch）路由到对应发送函数，
+    // 避免分支会话里点发送按钮错误地新开全片主会话。
+    els.aiStartBtn.addEventListener("click", submitAiComposer);
     els.aiContinueBtn.addEventListener("click", continueAiRun);
     els.aiFreshBtn.addEventListener("click", freshAiRun);
     els.aiStopBtn.addEventListener("click", stopAiRun);
@@ -3204,20 +3218,11 @@
       autoGrowAiTask();
     });
     // iMessage 输入手感：回车直接发送（Shift+回车换行），输入框随内容长高
-    // 活跃=branch 时回车 → startBranchRun（resume 语义）；活跃=main → startAiRun。
+    // 回车与右侧发送按钮共用 submitAiComposer（P0-1）：按 active session 路由。
     els.aiTask.addEventListener("keydown", function (e) {
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
-        if (aiRunning) return;
-        if (activeAiSession && activeAiSession.kind === "branch" && activeAiSession.annotation_id) {
-          var q = (els.aiTask.value || "").trim();
-          if (!q) { toast(t("ai.branch.need.q"), "info"); return; }
-          els.aiTask.value = "";
-          autoGrowAiTask();
-          startBranchRun(activeAiSession.annotation_id, q);
-        } else {
-          startAiRun();
-        }
+        submitAiComposer();
       }
     });
     els.aiTask.addEventListener("input", autoGrowAiTask);
@@ -3291,10 +3296,11 @@
     var keyVal = els.aiApiKey.value;
     // 空串或与掩码同值都不传（后端按规则处理）；这里显式传让后端判断
     if (keyVal !== "") { payload.api_key = keyVal; }
-    // 步数上限（必填项）
+    // 步数上限（必填项）：1–500 整数（max 与 UI input 的 max="500" 对齐）
+    var MAX_STEPS = 500;
     var steps = parseInt(els.aiMaxSteps.value, 10);
-    if (isNaN(steps) || steps < 1) {
-      toast(t("ai.steps.invalid"), "error");
+    if (isNaN(steps) || steps < 1 || steps > MAX_STEPS || String(steps) !== els.aiMaxSteps.value.trim()) {
+      toast(t("ai.config.steps.range", { max: MAX_STEPS }), "error");
       els.aiMaxSteps.focus();
       return;
     }
@@ -3302,25 +3308,100 @@
     // 协议
     if (els.aiApiProtocol) { payload.api_protocol = els.aiApiProtocol.value || "openai"; }
     // 高级调优参数（填了才提交，后端校验数值）
+    // 字段语义：reserve/safety_margin 允许 0（nonneg）；lease_ttl 须为正整数（与
+    // 后端一致，0 不合法）；context_window/keep_recent 须为正；fork_limit 为正整数。
     var advFields = [
-      ["context_window_tokens", els.aiCtxWindow],
-      ["reserve_tokens", els.aiReserve],
-      ["safety_margin", els.aiSafetyMargin],
-      ["keep_recent_tokens", els.aiKeepRecent],
-      ["fork_active_limit", els.aiForkLimit],
-      ["lease_ttl", els.aiLeaseTtl],
+      ["context_window_tokens", els.aiCtxWindow, "pos"],
+      ["reserve_tokens", els.aiReserve, "nonneg"],
+      ["safety_margin", els.aiSafetyMargin, "nonneg"],
+      ["keep_recent_tokens", els.aiKeepRecent, "pos"],
+      ["fork_active_limit", els.aiForkLimit, "intpos"],
+      ["lease_ttl", els.aiLeaseTtl, "intpos"],
     ];
-    advFields.forEach(function (pair) {
-      var val = pair[1] ? pair[1].value.trim() : "";
-      if (val !== "") { payload[pair[0]] = Number(val); }
-    });
+    // 字段显示名（错误提示用，取自相邻 span 文本，缺失则回退字段名）
+    var fieldLabel = {};
+    function labelFor(key) {
+      if (fieldLabel[key]) return fieldLabel[key];
+      var el = { context_window_tokens: els.aiCtxWindow, reserve_tokens: els.aiReserve,
+                 safety_margin: els.aiSafetyMargin, keep_recent_tokens: els.aiKeepRecent,
+                 fork_active_limit: els.aiForkLimit, lease_ttl: els.aiLeaseTtl }[key];
+      if (el && el.parentElement) {
+        var sp = el.parentElement.querySelector("span");
+        if (sp && sp.textContent) { fieldLabel[key] = sp.textContent.trim(); return fieldLabel[key]; }
+      }
+      return key;
+    }
+    var parsed = {};
+    for (var ai = 0; ai < advFields.length; ai++) {
+      var entry = advFields[ai];
+      var fkey = entry[0], fel = entry[1], fkind = entry[2];
+      if (!fel) continue;
+      var raw = String(fel.value || "").trim();
+      if (raw === "") continue;
+      var num = Number(raw);
+      if (!isFinite(num)) {
+        toast(t("ai.config.num.invalid", { f: labelFor(fkey) }), "error");
+        fel.focus();
+        return;
+      }
+      if (fkind === "intpos") {
+        if (!/^\d+$/.test(raw) || num < 1) {
+          toast(t("ai.config.num.int", { f: labelFor(fkey) }), "error");
+          fel.focus();
+          return;
+        }
+      } else if (fkind === "pos") {
+        if (!(num > 0)) {
+          toast(t("ai.config.num.positive", { f: labelFor(fkey) }), "error");
+          fel.focus();
+          return;
+        }
+      } else if (fkind === "nonneg") {
+        if (!(num >= 0)) {
+          toast(t("ai.config.num.nonneg", { f: labelFor(fkey) }), "error");
+          fel.focus();
+          return;
+        }
+      }
+      parsed[fkey] = num;
+      payload[fkey] = num;
+    }
+    // 字段关系：reserve + keep_recent 需小于 context_window（三者都填时校验）
+    if (parsed.context_window_tokens != null &&
+        parsed.reserve_tokens != null && parsed.keep_recent_tokens != null) {
+      if (parsed.reserve_tokens + parsed.keep_recent_tokens >= parsed.context_window_tokens) {
+        toast(t("ai.config.ctx.insufficient"), "error");
+        els.aiCtxWindow.focus();
+        return;
+      }
+    }
     els.aiConfigHint.textContent = t("ai.config.saving");
     els.aiConfigSave.disabled = true;
     apiFetch("/api/ai/config", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
-    }).then(function (r) { return r.json(); }).then(function (cfg) {
+    }).then(function (r) {
+      // P1-5：必须先校验 r.ok，再解析。后端 400 时 body 是 {error}，
+      // 旧逻辑直接 r.json() 把 error 对象当配置写入并误报成功。
+      // 失败 → 抛出后端 error 文案，走 catch，不更新本地配置、不报成功。
+      if (!r.ok) {
+        return r.text().then(function (raw) {
+          var msg = "";
+          try {
+            var body = JSON.parse(raw || "");
+            if (body && body.error) msg = String(body.error);
+          } catch (e) {}
+          if (!msg) {
+            var title = (raw || "").match(/<title[^>]*>([^<]+)<\/title>/i);
+            if (title && title[1]) msg = "HTTP " + r.status + " " + title[1].replace(/^\d+\s*/, "");
+            else msg = "HTTP " + r.status;
+          }
+          throw new Error(msg);
+        });
+      }
+      return r.json();
+    }).then(function (cfg) {
       aiConfig = cfg;
       renderAiConfigState();
       els.aiApiKey.value = "";
@@ -3356,6 +3437,27 @@
       return { x: editItem.x, y: editItem.y, w: editItem.side_px, h: editItem.side_px };
     }
     return null;
+  }
+
+  // context-aware 提交入口（P0-1）：发送按钮与回车共用。
+  // - 活跃=branch 且带 annotation_id：按追问续聊（resume 语义，需内容）；
+  // - 其它（main / fork 视图未活跃）：作为全片主会话发送。
+  // 进行中（aiRunning）一律忽略，避免并发。
+  function submitAiComposer() {
+    if (aiRunning) { toast(t("ai.busy"), "info"); return; }
+    if (activeAiSession && activeAiSession.kind === "branch" && activeAiSession.annotation_id) {
+      var q = (els.aiTask.value || "").trim();
+      if (!q) { toast(t("ai.branch.need.q"), "info"); return; }
+      // 仅当 branch 真正发起（startBranchRun 返回 true）才清空草稿，避免配置缺失等
+      // 前置校验失败时草稿被误清（P2-6）。
+      var started = startBranchRun(activeAiSession.annotation_id, q);
+      if (started) {
+        els.aiTask.value = "";
+        autoGrowAiTask();
+      }
+    } else {
+      startAiRun();
+    }
   }
 
   // 开始 AI run（POST /api/ai/run，body.fresh=true，SSE）
@@ -3604,7 +3706,12 @@
     }
     if (!eventType) return;
     if (eventType === "session_ended") {
+      // 统一收尾：finishAiRun + 刷新。agent_finished/paused/error 不得提前
+      // finishAiRun（会清空 aiAbortCtrl → stillCurrent 取消流 → 永远读不到本事件）。
+      // 状态落盘发生在终态事件之后、session_ended 之前，此处刷新才能拿到最终 status。
+      // result.done 保留为缺少 session_ended 时的兜底收尾。
       finishAiRun();
+      refreshAiSessionSwitcher(slideName, epoch);
       return;
     }
     if (eventType === "event_reset") {
@@ -3670,10 +3777,18 @@
     var slideName = opts.slideName;
     var epoch = opts.epoch;
     var isMain = !(opts.emphasis === "fork");
+    // fork 版本号：fork 重新打开/被新一次加载取代时，旧请求结果直接丢弃，避免
+    // 异步历史清空覆盖用户刚发送的内容（P0-2）。
+    var forkGen = opts.forkGen;
+    var forkWrap = opts.forkWrap;
+    function forkStale() {
+      return !isMain && forkWrap && forkWrap._loadGen !== forkGen;
+    }
     return apiFetch("/api/ai/session/" + encodeURIComponent(sessionId))
       .then(function (r) { return r.json(); })
       .then(function (data) {
         if (isMain && slideName != null && !isCurrentAiSlide(slideName, epoch)) return;
+        if (forkStale()) return;  // 过期 fork 加载：不清空容器
         var s = data && data.session;
         var tx = (data && data.transcript) || [];
         // 清空容器里的旧内容（保留 fork 头部/输入框——只清 stream 区）
@@ -3694,10 +3809,18 @@
             mainAiCtx.lastSeq = Math.max(mainAiCtx.lastSeq || 0, seqN);
           }
         }
+        // fork 历史恢复完成：从 loading 恢复到 idle，解锁输入与发送（P0-2）。
+        if (!isMain && forkWrap && forkWrap._forkState === "loading") {
+          setForkState(forkWrap, "idle");
+        }
       })
       .catch(function () {
         if (isMain && slideName != null && !isCurrentAiSlide(slideName, epoch)) return;
+        if (forkStale()) return;
         appendStatusRow(container, "info", t("ai.history.fail"));
+        if (!isMain && forkWrap && forkWrap._forkState === "loading") {
+          setForkState(forkWrap, "idle");
+        }
       });
   }
 
@@ -3805,6 +3928,11 @@
   // 刷新切换器下拉：GET /api/ai/sessions?slide= → 只列 main+branch（fork 不进列表）。
   // 选中项 = 当前活跃会话；列表变化（新 branch、状态翻转）后调用。
   // slideName/epoch 可选：固定目标切片，过期响应不写 DOM。
+  // aiSessionRefreshGen：单调递增的请求版本号。同一切片同一 epoch 下可能并发多次
+  // 刷新（如拿 X-AI-Session-ID 后与 session_ended），isCurrentAiSlide 防不住；较早
+  // 发出的请求可能携带尚未落盘的 running 却最后返回、覆盖 finished。只允许最后
+  // 一次请求渲染，过期响应一律丢弃（P2 状态收敛）。
+  var aiSessionRefreshGen = 0;
   function refreshAiSessionSwitcher(slideName, epoch) {
     if (!els.aiSessionBar || !els.aiSessionSelect) return;
     if (!state.slide) {
@@ -3814,15 +3942,18 @@
     }
     if (slideName == null) slideName = state.slide.name;
     if (epoch == null) epoch = aiSlideEpoch;
+    var myGen = ++aiSessionRefreshGen;
     // 仅已配置时显示
     var configured = !!(aiConfig && aiConfig.base_url && aiConfig.api_key_set);
     apiFetch("/api/ai/sessions?slide=" + encodeURIComponent(slideName))
       .then(function (r) {
+        if (myGen !== aiSessionRefreshGen) return null; // 已有更新的刷新在途
         if (!isCurrentAiSlide(slideName, epoch)) return null;
         return r.json();
       })
       .then(function (data) {
-        if (!data || !isCurrentAiSlide(slideName, epoch)) return;
+        if (!data || myGen !== aiSessionRefreshGen) return;
+        if (!isCurrentAiSlide(slideName, epoch)) return;
         var sessions = (data && data.sessions) || [];
         var list = [];
         for (var i = 0; i < sessions.length; i++) {
@@ -3944,14 +4075,15 @@
   // X-AI-Session-ID 头捕获与 startAiRun 同（branch 同样走 _proxy_sse 注入该头）。
   // =========================================================================
   function startBranchRun(annotationId, question) {
-    if (!state.slide) { toast(t("roi.need.slide"), "info"); return; }
-    if (!annotationId) { toast(t("ai.no.fork.id"), "error"); return; }
-    if (aiRunning) { toast(t("ai.busy.stop"), "info"); return; }
+    // 返回 true=已发起（调用方可清空输入草稿），false=前置校验未过（保留草稿）。
+    if (!state.slide) { toast(t("roi.need.slide"), "info"); return false; }
+    if (!annotationId) { toast(t("ai.no.fork.id"), "error"); return false; }
+    if (aiRunning) { toast(t("ai.busy.stop"), "info"); return false; }
     if (!aiConfig || !aiConfig.base_url || !aiConfig.api_key_set) {
       toast(t("ai.need.config"), "error");
       els.aiConfigWrap.style.display = "block";
       els.aiConfigCollapsed.style.display = "none";
-      return;
+      return false;
     }
     // 切换前中止当前活跃会话事件流（不清切片），重置轨迹。
     abortActiveAiStream();
@@ -4007,6 +4139,7 @@
       appendStatusRow(els.aiTrace, "error", t("ai.branch.fail", { e: bem }));
       finishAiRun(runCtrl);
     });
+    return true;
   }
 
   // 批注条 ⑂ 按钮入口（§任务2）：确保 AI 面板打开 → 若该标注已有 branch 则复用（切换活跃，
@@ -4176,22 +4309,17 @@
       clearThinkingRow(ctx);
       // p.summary 为后端 SSE summary 文案（保留原文，不进 i18n）
       appendStatusRow(container, "paused", t("ai.paused.summary", { s: (p.summary || "") }));
-      if (!ctx.isFork) {
-        aiPaused = true;
-        finishAiRun();
-        refreshAiSessionSwitcher();
-      }
+      // 只记终态；finishAiRun + 列表刷新留给 session_ended（见 handleSseFrame）。
+      // 此处若清空 aiAbortCtrl，主 SSE 泵会判定流过期并取消，读不到 session_ended。
+      if (!ctx.isFork) aiPaused = true;
       return;
     }
     if (type === "agent_finished") {
       clearThinkingRow(ctx);
       // p.summary 为后端 SSE summary 文案（保留原文，不进 i18n）
       appendStatusRow(container, "finished", p.summary || t("ai.finished.fallback"));
-      if (!ctx.isFork) {
-        redrawAnnoCanvas();
-        finishAiRun();
-        refreshAiSessionSwitcher();
-      }
+      // 只渲染终态；finishAiRun + 刷新由 session_ended 统一执行（同上）。
+      if (!ctx.isFork) redrawAnnoCanvas();
       return;
     }
     if (type === "agent_retrying") {
@@ -4202,10 +4330,7 @@
       clearThinkingRow(ctx);
       // p.error 为后端 SSE 错误文案（保留原文，不进 i18n）
       appendStatusRow(container, "error", p.error || t("ai.error.fallback"));
-      if (!ctx.isFork) {
-        finishAiRun();
-        refreshAiSessionSwitcher();
-      }
+      // 只渲染终态；finishAiRun + 刷新由 session_ended 统一执行（同上）。
       return;
     }
   }
@@ -4254,11 +4379,16 @@
     opts = opts || {};
     // iMessage 顶部时间分隔（fork 小窗不插）
     if (opts.emphasis !== "fork") appendMsgTs(target, opts.ts);
+    var isForkRestore = (opts.emphasis === "fork");
     var toolResults = {};
+    // 工具结果附带的结构化字段（如 create_annotation 的 annotation_id，经 sidecar
+    // details 持久化、transcript 透传）。旧 transcript 无此字段则缺省。
+    var toolResultMeta = {};
     for (var ri = 0; ri < msgs.length; ri++) {
       var rm = msgs[ri] || {};
       if (rm.role === "tool" && rm.tool_call_id) {
         toolResults[rm.tool_call_id] = messageText(rm);
+        if (rm.annotation_id) toolResultMeta[rm.tool_call_id] = { annotation_id: rm.annotation_id };
       }
     }
     for (var i = 0; i < msgs.length; i++) {
@@ -4307,11 +4437,16 @@
               (args.reason ? " · " + args.reason : ""));
           } else if (nm === "create_annotation") {
             if (!tcOk) continue;
+            // 取持久化的 annotation_id（sidecar 经 details 存入 transcript，旧会话无则缺省）。
+            // fork 对话流内恢复出的卡片不挂任何动作按钮（showFork=false，避免嵌套 fork）；
+            // main/branch 恢复且拿到持久化 annotation_id 时，与实时路径一致挂 fork+branch。
+            var meta = toolResultMeta[tcId] || {};
             appendAnnotationCard({
               label: args.label || t("ai.anno.default.label"),
               note: args.note || "",
               x: args.x, y: args.y, side_px: args.side_px,
-            }, target, { showFork: false });
+              annotation_id: meta.annotation_id || null,
+            }, target, { showFork: !isForkRestore && !!meta.annotation_id });
           } else if (nm === "snapshot") {
             appendToolCall(target, "snapshot", t("ai.tool.snapshot"));
           } else if (nm === "finish") {
@@ -4880,21 +5015,73 @@
     redrawAnnoCanvas();
   }
 
-  // 📌 行挂 💬 按钮：以该标注 fork 批注对话
-  function attachForkBtn(row, annotationId) {
+  // 📌 行挂动作区：fork「快速问答」+ branch「从此处深读」（P1-6）
+  // 两处入口（标注面板行内、对话内标注卡片）都走同一个构建器，
+  // 所有带 annotation_id 的标注都显示这两个动作，不再按 source 隐藏。
+  function attachForkBtn(row, annotationId, opts) {
     if (!annotationId) return;
-    var btn = document.createElement("button");
-    btn.className = "ai-fork-btn";
-    btn.textContent = "💬";
-    btn.title = t("ai.fork.btn.title");
-    btn.addEventListener("click", function (e) {
+    opts = opts || {};
+    var style = opts.style || "chip";  // "chip"(对话内卡片 小按钮) | "op"(面板行 ai-op)
+    buildAnnoAiActions(row, annotationId, style);
+  }
+
+  // 构建标注的两个 AI 动作按钮（fork 快速问答 + branch 从此处深读）。
+  // style="op"：标注面板行内（与 ai-share/ai-edit 同尺寸）；"chip"：对话附件卡片内。
+  function buildAnnoAiActions(container, annotationId, style) {
+    if (!annotationId || !container) return;
+    var op = (style === "op");
+
+    // fork → 快速问答（轻量、就地展开）
+    var forkBtn = document.createElement("button");
+    forkBtn.type = "button";
+    forkBtn.className = op ? "ai-op ai-fork" : "ai-action-chip ai-fork";
+    forkBtn.title = tt("anno.fork.quick.tip");
+    forkBtn.innerHTML = '<span class="ai-act-ic">💬</span><span class="ai-act-tx">' +
+      esc(tt("anno.fork.quick")) + "</span>";
+    forkBtn.addEventListener("click", function (e) {
       e.stopPropagation();
-      openForkChat(annotationId, row);
+      openForkChat(annotationId, container);
     });
-    row.appendChild(btn);
+    container.appendChild(forkBtn);
+
+    // branch → 从此处深读（完整分支会话，进 AI 面板）
+    var branchBtn = document.createElement("button");
+    branchBtn.type = "button";
+    branchBtn.className = op ? "ai-op ai-branch" : "ai-action-chip ai-branch";
+    branchBtn.title = tt("anno.branch.deep.tip");
+    branchBtn.innerHTML = '<span class="ai-act-ic">⑂</span><span class="ai-act-tx">' +
+      esc(tt("anno.branch.deep")) + "</span>";
+    branchBtn.addEventListener("click", function (e) {
+      e.stopPropagation();
+      openBranchFromAnno(annotationId);
+    });
+    container.appendChild(branchBtn);
   }
 
   // 就地展开 fork 批注对话（标注面板内）
+  // fork 对话块状态机（P0-2/P0-3/P1-4）：loading(恢复历史) / sending(已发送等响应) /
+  // readonly(标注已删除归档) / idle。送/恢复期间禁用输入与按钮，防止竞争与并发。
+  // 类名统一为 fork-readonly（CSS 监听同名），不再混用 .readonly。
+  function setForkState(wrap, state) {
+    if (!wrap) return;
+    wrap._forkState = state;
+    var input = wrap.querySelector("input");
+    var send = wrap.querySelector(".fork-chat-input button");
+    if (state === "readonly") {
+      wrap.classList.add("fork-readonly");
+      if (input) input.disabled = true;
+      if (send) { send.disabled = true; send.textContent = t("ai.fork.send"); }
+      return;
+    }
+    wrap.classList.remove("fork-readonly");
+    var busy = (state === "loading" || state === "sending");
+    if (input) input.disabled = busy;
+    if (send) {
+      send.disabled = busy;
+      send.textContent = busy ? tt("ai.fork.sending") : t("ai.fork.send");
+    }
+  }
+
   function openForkChat(annotationId, anchorRow) {
     if (!state.slide) return;
     // 若已在标注面板内，就地展开；否则打开标注面板后滚动到该条
@@ -4945,17 +5132,22 @@
     } else {
       document.body.appendChild(wrap);
     }
-    input.focus();
-    // 恢复历史（#1）：若此标注已有 fork 会话，渲染完整 SMS 式对话记录
-    restoreForkTranscript(annotationId, stream);
+    // P0-2：恢复历史前进入 loading 态，禁用输入与发送，避免与用户首发竞争。
+    setForkState(wrap, "loading");
+    restoreForkTranscript(annotationId, stream, wrap);
   }
 
   // 查找该标注已有的 fork 会话并渲染历史 transcript（fork 打开时）
-  function restoreForkTranscript(annotationId, streamEl) {
+  // wrap 透传用于完成/过期时恢复输入态；恢复结果靠 _loadGen 版本号判过期。
+  function restoreForkTranscript(annotationId, streamEl, wrap) {
     if (!state.slide || !annotationId || !streamEl) return;
+    if (wrap) wrap._loadGen = (wrap._loadGen || 0) + 1;
+    var myGen = wrap ? wrap._loadGen : 0;
     apiFetch("/api/ai/sessions?slide=" + encodeURIComponent(state.slide.name))
       .then(function (r) { return r.json(); })
       .then(function (data) {
+        // 过期（已重新打开/被新一次加载取代）：直接丢弃，不清空容器。
+        if (wrap && wrap._loadGen !== myGen) return;
         var sessions = (data && data.sessions) || [];
         var fork = null;
         for (var i = 0; i < sessions.length; i++) {
@@ -4963,15 +5155,36 @@
             fork = sessions[i]; break;
           }
         }
-        if (!fork) return;  // 无历史，保留"就此标注提问…"
-        loadAndRenderTranscript(fork.id, streamEl, { emphasis: "fork" });
+        if (!fork) {
+          // 无历史：保留"就此标注提问…"占位，恢复输入。
+          if (wrap) setForkState(wrap, "idle");
+          return;
+        }
+        loadAndRenderTranscript(fork.id, streamEl, { emphasis: "fork", forkGen: myGen, forkWrap: wrap });
       })
-      .catch(function () { /* 静默：渲染失败不影响提问 */ });
+      .catch(function () {
+        // 渲染失败：恢复输入态，不影响提问（P0-2 不让用户卡在 loading）
+        if (wrap) setForkState(wrap, "idle");
+      });
   }
 
   function sendForkQuestion(annotationId, question, streamEl, wrapEl) {
+    // P0-3：明确 sending 状态——loading/sending/readonly 时一律忽略，防并发。
+    var st = wrapEl ? wrapEl._forkState : "idle";
+    if (st === "loading" || st === "sending") return;
+    if (st === "readonly") return;
     question = (question || "").trim();
     if (!question) return;
+    // 与 branch(openBranchFromAnno) 一致：未配置 AI 服务时给出配置引导提示，
+    // 阻止发送（不清空输入、不切 sending 态），避免发送后才报错。
+    if (!aiConfig || !aiConfig.base_url || !aiConfig.api_key_set) {
+      toast(t("ai.need.config"), "error");
+      openAiPanel();
+      els.aiConfigWrap.style.display = "block";
+      els.aiConfigCollapsed.style.display = "none";
+      return;
+    }
+    setForkState(wrapEl, "sending");
     appendChatBubble(streamEl, "user", question);
     var input = wrapEl ? wrapEl.querySelector("input") : null;
     if (input) input.value = "";
@@ -4985,17 +5198,29 @@
     }).then(function (resp) {
       if (resp.status === 410) {
         appendStatusRow(streamEl, "error", t("ai.fork.deleted"));
-        if (wrapEl) wrapEl.classList.add("fork-readonly");
+        if (wrapEl) setForkState(wrapEl, "readonly");
         throw new Error("gone");
       }
       if (!resp.ok || !resp.body) {
-        return resp.text().then(function (t) { throw new Error(t || ("HTTP " + resp.status)); });
+        // P2-7：后端错误体多为 {error:"..."} JSON，直接抛原文会显示原始 JSON。
+        // 先尝试解析取 body.error，失败再回退原文。
+        return resp.text().then(function (tt) {
+          var msg = "";
+          try {
+            var body = JSON.parse(tt || "");
+            if (body && body.error) msg = String(body.error);
+          } catch (e2) {}
+          throw new Error(msg || tt || ("HTTP " + resp.status));
+        });
       }
       // 流入 fork 对话流（显式 ctx，不碰主会话）
       return pumpForkSse(resp.body.getReader(), streamEl, wrapEl);
     }).catch(function (e) {
       if (e && e.message === "gone") return;
       appendStatusRow(streamEl, "error", t("ai.fork.send.fail", { e: (e && e.message ? e.message : e) }));
+    }).then(function () {
+      // 无论成功/失败/正常结束，恢复输入态（readonly 不覆盖）。
+      if (wrapEl && wrapEl._forkState !== "readonly") setForkState(wrapEl, "idle");
     });
   }
 

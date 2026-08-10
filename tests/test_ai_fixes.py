@@ -3,19 +3,34 @@
 
 运行：cd 项目根 && python3 tests/test_ai_fixes.py
 用独立临时 SHARE_DATA_DIR，避免污染真实数据。
+
+隔离策略（兼容 pytest 与脚本两种执行方式）：
+- 收集/导入阶段：只设置本模块的 SHARE_DATA_DIR 环境变量并 import share_store
+  （share_store 可能已被别的测试模块预导入，此时其模块常量 SHARE_DATA_DIR/
+  SHARE_FILE 指向别人的临时目录，这是正常的，不在收集阶段断言）。
+- pytest 运行：每个用例前的 autouse fixture 用 monkeypatch 把 share_store 的
+  SHARE_DATA_DIR/SHARE_FILE 重新指回本模块的临时目录，并断言落点在本目录内。
+  monkeypatch 自动还原，互不污染。绝不在收集阶段 importlib.reload —— reload 会
+  把共享的 share_store 模块对象改写到最后一个被收集模块的目录，制造顺序依赖。
+- 脚本运行（python3 tests/test_ai_fixes.py）：进程独占、无顺序问题，在 main 开头
+  直接 setattr 即可（没有 monkeypatch fixture 可用）。
 """
 import json
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import share_store  # noqa: E402
-
 TMP = tempfile.mkdtemp(prefix="svs-fixes-")
-os.environ["SHARE_DATA_DIR"] = os.path.join(TMP, "share-data")
-os.makedirs(os.environ["SHARE_DATA_DIR"], exist_ok=True)
+# SHARE_DATA_DIR 必须在 import share_store 之前设置（env 是 share_store 模块级
+# 常量的初值来源），但 importlib.reload 不再使用——见模块 docstring。
+SHARE_DATA_DIR = os.path.join(TMP, "share-data")
+os.environ["SHARE_DATA_DIR"] = SHARE_DATA_DIR
+os.makedirs(SHARE_DATA_DIR, exist_ok=True)
+
+import share_store  # noqa: E402
 
 # openslide 未安装时 stub（本测试只覆盖配置/迁移，不需真 OpenSlide）
 try:
@@ -36,6 +51,53 @@ try:
 except Exception:
     HAS_CRYPTO = False
 
+import pytest  # noqa: E402
+
+
+def _apply_isolation():
+    """把 share_store 的模块常量指回本模块的临时目录，并断言落点在其内。
+
+    防御性断言：所有写/unlink 目标必须落在本次测试的临时目录内，绝不触碰真实数据
+    文件。失败即立即中断，避免 reset_store() 误删真实数据。
+
+    被 pytest autouse fixture（每个用例前）与脚本模式 main 开头共同调用。
+    用 pathlib.Path 保持 share_store.SHARE_FILE 的类型（测试代码依赖
+    .write_text()/.read_text()/.unlink()）。
+    """
+    data_dir = Path(SHARE_DATA_DIR)
+    share_file = data_dir / "shares.json"
+    share_store.SHARE_DATA_DIR = data_dir
+    share_store.SHARE_FILE = share_file
+    data_dir.mkdir(parents=True, exist_ok=True)
+    assert str(share_store.SHARE_FILE).startswith(TMP), (
+        "SHARE_FILE 未隔离到临时目录！期望前缀 %r，实际 %r"
+        % (TMP, str(share_store.SHARE_FILE)))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_share_store(monkeypatch):
+    """每个用例前夺回 share_store 常量到本模块临时目录。
+
+    必要性：pytest 在收集阶段会 import 所有测试模块；其它模块（如
+    test_ai_config_validation）的隔离 fixture 会把 share_store.SHARE_FILE 改写到
+    它们自己的临时目录。若不在用例前夺回，本模块的 reset_store() 会写到别人的
+    目录里。monkeypatch 用例结束后自动还原，互不污染。
+    用 pathlib.Path 保持 share_store.SHARE_FILE 的类型（测试代码依赖
+    .write_text()/.read_text()/.unlink()）。
+    """
+    data_dir = Path(SHARE_DATA_DIR)
+    share_file = data_dir / "shares.json"
+    monkeypatch.setenv("SHARE_DATA_DIR", SHARE_DATA_DIR)
+    # 注意：用 monkeypatch.setattr 才能在用例结束后还原，避免反向污染别的模块。
+    monkeypatch.setattr(share_store, "SHARE_DATA_DIR", data_dir)
+    monkeypatch.setattr(share_store, "SHARE_FILE", share_file)
+    # 越界检查：目标必须在本模块临时目录内，否则 fail（绝不 unlink 真实文件）。
+    assert str(share_store.SHARE_FILE).startswith(TMP), (
+        "SHARE_FILE 未隔离到临时目录！期望前缀 %r，实际 %r"
+        % (TMP, str(share_store.SHARE_FILE)))
+    yield
+
+
 PASS = 0
 FAIL = 0
 
@@ -51,7 +113,10 @@ def check(name, cond, detail=""):
 
 
 def reset_store():
-    os.makedirs(os.environ["SHARE_DATA_DIR"], exist_ok=True)
+    # unlink 前再校验一次目标路径在临时目录内（多重防线，防 SHARE_FILE 被外部改回真实路径）
+    assert str(share_store.SHARE_FILE).startswith(TMP), (
+        "reset_store 目标路径越界！%r 不在临时目录 %r 内" % (str(share_store.SHARE_FILE), TMP))
+    os.makedirs(str(share_store.SHARE_DATA_DIR), exist_ok=True)
     share_store.SHARE_FILE.unlink(missing_ok=True)
 
 
@@ -219,6 +284,9 @@ def test_fork_render_condition():
 
 
 if __name__ == "__main__":
+    # 脚本模式：进程独占，无 pytest fixture，也无收集期顺序问题。直接 setattr
+    # 把 share_store 常量指回本模块临时目录（保证越界断言成立）。
+    _apply_isolation()
     test_roi_source_fix()
     test_api_key_encryption()
     test_api_protocol()

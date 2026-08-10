@@ -121,6 +121,14 @@ describe("AgentRunner.runMain — golden run flow", () => {
 		expect(imgRef!.src).toBeDefined();
 		expect(typeof imgRef!.magnification).toBe("string");
 
+		// The create_annotation tool result carries the persisted annotation_id
+		// (sidecar stores it in details; transcript passes it through so history
+		// restoration can mount fork/branch buttons on the annotation card).
+		const annResult = toolMsgs.find((m) => m.tool_call_id === "tc-ann") as
+			({ tool_call_id: string; content: unknown; annotation_id?: string } | undefined);
+		expect(annResult).toBeDefined();
+		expect(annResult!.annotation_id).toBeTruthy();
+
 		// Tool results pair with the tool_call ids above.
 		for (const tc of gotoAssistant.tool_calls!) {
 			expect(toolMsgs.some((m) => m.tool_call_id === tc.id)).toBe(true);

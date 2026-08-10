@@ -1155,6 +1155,143 @@ def _save_ai_config(cfg: dict) -> None:
     _save_ai_config_raw(out)
 
 
+# --------------------------------------------------------------------------- #
+# AI 会话调优参数权威校验（PUT /api/ai/config）
+# --------------------------------------------------------------------------- #
+# 语义依据（读自 sidecar/src + templates/index.html）：
+#   context_window_tokens  compaction.ts:92 numOr 要求 n>0（否则回退 272000）；
+#                          UI min=10000。→ 正整数。
+#   reserve_tokens         compaction.ts:88 numOr（>0 才用，否则默认 16384）；
+#                          UI min=0。→ 非负整数（0 允许）。
+#   keep_recent_tokens     compaction.ts:89 numOr（>0 才用，否则默认 20000）；
+#                          UI min=1000。→ 非负整数（0 允许，权威层不卡 UI 下限）。
+#   keep_recent_images     transform-context.ts:53-55（>0 才用，否则默认 6）。
+#                          无 UI 输入。→ 非负整数（0 允许）。
+#   safety_margin          agent-runner.ts:90-91 legacy 字段，sidecar 不再使用；
+#                          UI min=0。→ 非负整数（0 允许）。
+#   event_buffer           session-store.ts:304 ?? DEFAULT_EVENT_BUFFER(200)；
+#                          滚动事件窗口大小，0 会破坏窗口。→ 正整数。
+#   fork_active_limit      agent-runner.ts:270/353 Math.max(0,...)；
+#                          enforceForkLimit 1402 `if limit<=0 return`（0=不限速）。
+#                          任务明确要求拒绝 <=0（-4 即非法）。→ 正整数。
+#   lease_ttl              sidecar 不再用（仅 legacy ai_session.py）；UI min=30。
+#                          → 正整数。
+#   max_tokens             模型输出上限（基础字段，无 UI 输入）。→ 正整数。
+#   max_steps              agent-runner.ts:604 Math.max(1,...)；UI min=1 max=500。
+#                          → 正整数，且 <= 500（UI 声明上限；防止失控调用/费用）。
+# 字段关系：reserve_tokens + keep_recent_tokens 必须 < context_window_tokens
+# （压缩：context - reserve 是触发线，keep_recent 是保留尾；重叠即配置矛盾）。
+# 允许 0 的字段（reserve_tokens / keep_recent_tokens / keep_recent_images /
+# safety_margin）：0 不代表 sidecar 的"禁用"（numOr 会回退默认），但作为权威层
+# 下限更宽松、与 UI min=0 一致；负数一律拒绝。
+# 注意：所有校验失败返回中文明示 error 字符串；调用方负责在落盘前整体校验，
+# 任一字段失败都不应部分写入 cfg。
+_AI_TUNING_POSITIVE_INT = (
+    "context_window_tokens",
+    "event_buffer",
+    "fork_active_limit",
+    "lease_ttl",
+    "max_tokens",
+    "max_steps",
+)
+# 允许 0（非负整数）的字段
+_AI_TUNING_NONNEG_INT = (
+    "reserve_tokens",
+    "keep_recent_tokens",
+    "keep_recent_images",
+    "safety_margin",
+)
+# max_steps 上限：取自 templates/index.html 的 input max="500"（步数上限字段）。
+# 防止 max_steps=99999 之类失控（sidecar 运行循环只限下限，费用风险）。
+_MAX_STEPS_LIMIT = 500
+
+
+def _coerce_tuning_int(raw, field):
+    """把请求值转换为整数；失败返回 (None, 错误文案)。
+
+    接受 JSON number / 数字串；拒绝 None / 布尔 / 浮点小数（非整数）。
+    """
+    if isinstance(raw, bool) or raw is None:
+        return None, "{} 需为整数".format(field)
+    if isinstance(raw, float):
+        if not raw.is_integer():
+            return None, "{} 需为整数".format(field)
+        return int(raw), None
+    if isinstance(raw, int):
+        return raw, None
+    # 字符串：允许数字串，如 "16000"
+    try:
+        f = float(raw)
+    except (TypeError, ValueError):
+        return None, "{} 需为整数".format(field)
+    if not f.is_integer():
+        return None, "{} 需为整数".format(field)
+    return int(f), None
+
+
+def _validate_ai_tuning(body, cfg):
+    """权威校验调优参数（PUT /api/ai/config 的数字字段）。
+
+    参数：
+        body: 请求 JSON（原始、未转换）。
+        cfg:  当前已落盘配置（_load_ai_config 结果）。用于字段关系校验时取
+              "本次未提交"字段的既有值（保持向后兼容：未提交字段维持原值）。
+    返回：
+        (validated, None)  —— validated: {field: int} 本批次校验通过的值；
+        (None, err_msg)    —— 校验失败，err_msg 为中文错误说明。
+
+    校验顺序：单字段全部先过（任一失败立即返回），再做关系校验。所有失败均
+    在落盘前发生，保证不会产生部分写入。
+    """
+    validated = {}
+    # 1) 单字段校验
+    for field in _AI_TUNING_POSITIVE_INT:
+        if field not in body:
+            continue
+        iv, err = _coerce_tuning_int(body[field], field)
+        if err:
+            return None, err
+        if iv <= 0:
+            return None, "{} 需为正整数（> 0）".format(field)
+        validated[field] = iv
+    for field in _AI_TUNING_NONNEG_INT:
+        if field not in body:
+            continue
+        iv, err = _coerce_tuning_int(body[field], field)
+        if err:
+            return None, err
+        if iv < 0:
+            return None, "{} 不可为负数（>= 0）".format(field)
+        validated[field] = iv
+    # max_steps 上限（UI 声明 max=500）
+    if "max_steps" in validated and validated["max_steps"] > _MAX_STEPS_LIMIT:
+        return None, "max_steps 不可超过 {}（步数上限）".format(_MAX_STEPS_LIMIT)
+    # 2) 字段关系校验：reserve_tokens + keep_recent_tokens < context_window_tokens
+    #    未在本批次提交的字段用已落盘 cfg 的值（或缺省默认），保证语义一致。
+    #    仅当三者中至少一个在本批次出现时才校验（否则原值本应已合法）。
+    rel_keys = ("reserve_tokens", "keep_recent_tokens", "context_window_tokens")
+    if any(k in validated for k in rel_keys):
+        merged = dict(DEFAULT_CONFIG)
+        for k in rel_keys:
+            cur = cfg.get(k)
+            if cur is not None:
+                try:
+                    merged[k] = int(cur)
+                except (TypeError, ValueError):
+                    merged[k] = DEFAULT_CONFIG[k]
+            if k in validated:
+                merged[k] = validated[k]
+        reserve = merged["reserve_tokens"]
+        keep = merged["keep_recent_tokens"]
+        ctx = merged["context_window_tokens"]
+        if reserve + keep >= ctx:
+            return None, (
+                "reserve_tokens + keep_recent_tokens（{}）必须小于 "
+                "context_window_tokens（{}）".format(reserve + keep, ctx)
+            )
+    return validated, None
+
+
 @app.route("/api/slide/<name>/region", methods=["GET"])
 def api_slide_region(name):
     """裁剪 level-0 区域为 JPEG base64（非附件下载，供 AI/前端按需取图）。
@@ -1284,53 +1421,47 @@ def api_ai_config():
 
     body = request.get_json(silent=True) or {}
     cfg = _load_ai_config()
-    # base_url / model / max_tokens 直接覆盖（字符串/数字）
+    # ---- 第一阶段：校验（不落盘，保证任一失败都不产生部分写入）----
+    # base_url / model：字符串，去空白（无范围限制）
+    pending = {}
     if "base_url" in body:
-        cfg["base_url"] = str(body.get("base_url") or "").strip()
+        pending["base_url"] = str(body.get("base_url") or "").strip()
     if "model" in body:
-        cfg["model"] = str(body.get("model") or "").strip()
-    if "max_tokens" in body:
-        try:
-            cfg["max_tokens"] = int(body.get("max_tokens"))
-        except (TypeError, ValueError):
-            return jsonify(error="max_tokens 需为整数"), 400
+        pending["model"] = str(body.get("model") or "").strip()
     # api_protocol：openai | anthropic（默认 openai）
     if "api_protocol" in body:
         proto = str(body.get("api_protocol") or "").strip().lower()
         if proto not in ("openai", "anthropic"):
             return jsonify(error="api_protocol 仅支持 openai 或 anthropic"), 400
-        cfg["api_protocol"] = proto
-    # 会话调优参数（数字类型，§8.1）
-    for k in DEFAULT_CONFIG:
-        if k in body:
-            # keep_recent_images 必须是正整数（<=0 / 非法忽略并 400，
-            # 与其它字段的拒绝风格一致）。
-            if k == "keep_recent_images":
-                try:
-                    iv = int(body[k])
-                except (TypeError, ValueError):
-                    return jsonify(error="keep_recent_images 需为整数"), 400
-                if iv <= 0:
-                    return jsonify(error="keep_recent_images 需为正整数"), 400
-                cfg[k] = iv
-                continue
-            try:
-                cfg[k] = float(body[k]) if isinstance(body[k], float) else int(body[k])
-            except (TypeError, ValueError):
-                return jsonify(error="{} 需为数值".format(k)), 400
+        pending["api_protocol"] = proto
+    # 会话调优参数 + max_tokens：权威校验（正整数 / 非负整数 / 字段关系）
+    # max_tokens 与 DEFAULT_CONFIG 调优字段共用同一套校验（均为数值字段）。
+    tuning, err = _validate_ai_tuning(body, cfg)
+    if err:
+        return jsonify(error=err), 400
+    pending.update(tuning)
     # api_key：空串=清除；与掩码同值=不变；其他=覆盖（明文 → _save_ai_config 加密）
+    # 仅在校验全部通过后解析 key 动作（仍属"校验"阶段，未落盘）。
+    key_action = None  # ("set", new_plain) | ("clear",) | None=不动
     if "api_key" in body:
         new_key = body.get("api_key")
         if new_key is None:
-            pass  # 不传不动
+            key_action = None  # 不传不动
         else:
             new_key = str(new_key)
             if new_key == "":
-                cfg.pop("api_key", None)
+                key_action = ("clear",)
             elif new_key == _mask_api_key(cfg.get("api_key") or ""):
-                pass  # 与掩码同值，不变
+                key_action = None  # 与掩码同值，不变
             else:
-                cfg["api_key"] = new_key
+                key_action = ("set", new_key)
+    # ---- 第二阶段：落盘（全部校验通过，原子写入 cfg）----
+    cfg.update(pending)
+    if key_action is not None:
+        if key_action[0] == "clear":
+            cfg.pop("api_key", None)
+        else:  # "set"
+            cfg["api_key"] = key_action[1]
     _save_ai_config(cfg)
     # 回显脱敏
     key = cfg.get("api_key") or ""

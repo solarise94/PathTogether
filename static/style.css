@@ -1172,6 +1172,7 @@ button {
 .anno-item {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 7px 8px;
   border-radius: var(--r-row);
@@ -1179,7 +1180,7 @@ button {
   transition: background 0.12s ease;
 }
 .anno-item:hover { background: var(--hover); }
-.anno-item .ai-info { flex: 1; min-width: 0; }
+.anno-item .ai-info { flex: 1 1 150px; min-width: 0; }
 .anno-item .ai-title { font-size: 12px; font-weight: 500; color: var(--text); }
 .anno-item .ai-title .ai-label { color: var(--accent); font-weight: 600; }
 .anno-item .ai-title .ai-type-icon {
@@ -1195,8 +1196,23 @@ button {
 }
 .anno-item .ai-sub { font-size: 10px; color: var(--text-2); margin-top: 2px; word-break: break-all; }
 
-/* 未公开标注：降透明度提示（公开后恢复正常） */
-.anno-item.anno-private { opacity: 0.55; }
+/* 未公开标注（P1-7）：不再整行降透明度（会让操作按钮看起来像 disabled）。
+   只把名称文字调暗，并配「私有」小徽章表达私有状态；操作按钮保持正常不透明度。 */
+.anno-item.anno-private .ai-title .ai-label { color: var(--text-3); }
+.anno-private-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 2px 5px;
+  margin-left: 5px;
+  border-radius: 4px;
+  color: #9a6a00;
+  background: rgba(255, 170, 0, 0.16);
+  vertical-align: middle;
+  white-space: nowrap;
+}
 /* 「公开」切换钮：未公开灰色，公开(accent)高亮 */
 .anno-item .ai-share {
   flex: 0 0 auto;
@@ -1851,6 +1867,16 @@ button {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-fill);
 }
+/* 兼容/当前不生效字段：输入框置灰，附小字说明（不删除控件，保留兼容） */
+.ai-field input.ai-field-legacy {
+  background: rgba(127, 127, 127, 0.08);
+  opacity: 0.7;
+}
+.ai-field-note {
+  font-size: 10.5px;
+  color: var(--text-3);
+  opacity: 0.85;
+}
 .ai-field select {
   padding: 6px 8px;
   border: 0.5px solid var(--separator);
@@ -2504,23 +2530,43 @@ button {
 /* =========================================================================
    AI 批注式对话（fork）
    ========================================================================= */
-/* 标注面板行的 💬 按钮（与 ai-op 同尺寸，hover 高亮） */
-.anno-item .ai-op.ai-fork:hover { color: #7b5cff; background: rgba(123, 92, 255, 0.12); }
-/* 标注面板行的 ⑂ 分支按钮（与 ai-fork 同尺寸风格，hover 用青绿区分"深读分支"） */
-.anno-item .ai-op.ai-branch:hover { color: #0a9396; background: rgba(10, 147, 150, 0.12); }
-/* AI 轨迹流里的 📌 行 💬 按钮 */
-.ai-trace-row.annotation { display: flex; align-items: center; gap: 6px; }
-.ai-fork-btn {
-  flex: 0 0 auto;
-  border: none;
-  background: transparent;
-  cursor: pointer;
-  font-size: 12px;
-  opacity: 0.75;
-  padding: 0 2px;
-  line-height: 1;
+/* 标注面板行的 fork/branch 动作按钮（P1-6：图标+短文字小按钮，hover 高亮）
+   基类复用 .ai-op（26×26 圆角），文字模式放宽为自适应宽度。 */
+.anno-item .ai-op.ai-fork,
+.anno-item .ai-op.ai-branch {
+  width: auto;
+  min-width: 0;
+  padding: 0 8px;
+  gap: 3px;
+  font-size: 11px;
+  font-weight: 500;
 }
-.ai-fork-btn:hover { opacity: 1; transform: scale(1.15); }
+.ai-op .ai-act-ic { font-size: 12px; line-height: 1; }
+.ai-op .ai-act-tx { white-space: nowrap; }
+.anno-item .ai-op.ai-fork:hover { color: #7b5cff; background: rgba(123, 92, 255, 0.12); }
+.anno-item .ai-op.ai-branch:hover { color: #0a9396; background: rgba(10, 147, 150, 0.12); }
+
+/* AI 轨迹流里标注行的 fork/branch chip（对话内嵌卡片用） */
+.ai-trace-row.annotation { display: flex; align-items: center; gap: 6px; }
+.ai-action-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border: 0.5px solid var(--separator-strong);
+  border-radius: 12px;
+  background: #fff;
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  cursor: pointer;
+  line-height: 1.4;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.ai-action-chip .ai-act-ic { font-size: 12px; line-height: 1; }
+.ai-action-chip .ai-act-tx { white-space: nowrap; }
+.ai-action-chip.ai-fork:hover { color: #7b5cff; border-color: rgba(123, 92, 255, 0.45); background: rgba(123, 92, 255, 0.08); }
+.ai-action-chip.ai-branch:hover { color: #0a9396; border-color: rgba(10, 147, 150, 0.45); background: rgba(10, 147, 150, 0.08); }
 
 /* 就地展开的 fork 对话块（标注面板内） */
 .fork-chat {
@@ -2566,5 +2612,8 @@ button {
   padding: 4px 8px;
   font-size: 12px;
 }
-.fork-chat.readonly .fork-chat-input { display: none; }
-.fork-chat.readonly { opacity: 0.6; }
+/* 标注已删除/归档：fork 对话只读（P1-4：JS 与 CSS 类名统一为 fork-readonly）。
+   输入与发送钮隐藏；整块轻灰底提示归档态，但内容（历史）仍可读。 */
+.fork-chat.fork-readonly .fork-chat-input { display: none; }
+.fork-chat.fork-readonly { background: #f6f6f6; }
+.fork-chat.fork-readonly .fork-chat-head { color: var(--text-3); }

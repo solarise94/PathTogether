@@ -33,6 +33,20 @@ export interface RegionResult {
 	height: number;
 	src: { x: number; y: number; w: number; h: number };
 	magnification: number | null;
+	/** Derivative encoder info (§6.3), present on /internal/ai/region responses. */
+	encoder?: RegionEncoderInfo;
+}
+
+/**
+ * Derivative encoder descriptor returned by the region endpoint (§6.3). Used by
+ * the sidecar to record/validate the deterministic derivative spec.
+ */
+export interface RegionEncoderInfo {
+	id: string;
+	version: string;
+	resize: string;
+	overlay_version: string;
+	jpeg_quality: number;
 }
 
 /** ROI dict returned by share_store.add_roi (rect). */
@@ -150,7 +164,7 @@ export class FlaskClient {
 		}
 	}
 
-	private async request<T>(method: string, path: string, init?: { body?: unknown; query?: Record<string, string> }): Promise<T> {
+	private async request<T>(method: string, path: string, init?: { body?: unknown; query?: Record<string, string>; signal?: AbortSignal }): Promise<T> {
 		await this.ensureToken();
 		const url = new URL(this.baseUrl + path);
 		if (init?.query) {
@@ -158,8 +172,21 @@ export class FlaskClient {
 				url.searchParams.set(k, v);
 			}
 		}
+		// Merge the internal timeout controller with an optional external signal:
+		// abort the fetch as soon as EITHER fires (§13 user-cancel + timeout).
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+		const external = init?.signal;
+		const onExternalAbort = (): void => {
+			if (!controller.signal.aborted) controller.abort();
+		};
+		if (external) {
+			if (external.aborted) {
+				controller.abort();
+			} else {
+				external.addEventListener("abort", onExternalAbort);
+			}
+		}
 		let res: Response;
 		try {
 			res = await fetch(url, {
@@ -173,6 +200,7 @@ export class FlaskClient {
 			});
 		} finally {
 			clearTimeout(timer);
+			if (external) external.removeEventListener("abort", onExternalAbort);
 		}
 		const text = await res.text();
 		let parsed: unknown = undefined;
@@ -198,10 +226,22 @@ export class FlaskClient {
 		h: number;
 		out_w?: number;
 		out_h?: number;
+		/**
+		 * Server-side aspect-preserving longest-edge target (§6.1). When set, the
+		 * server computes out_w/out_h from the bbox aspect ratio and ignores
+		 * explicit out_w/out_h.
+		 */
+		max_long_edge?: number;
+		/** JPEG quality for the derivative (server default 85). */
+		jpeg_quality?: number;
 		/** Optional client-side fingerprint; Flask may reject on mismatch. */
 		expected_fingerprint?: string;
+		/** Optional external AbortSignal (merged with the internal timeout). */
+		signal?: AbortSignal;
 	}): Promise<RegionResult> {
-		return this.request<RegionResult>("POST", "/internal/ai/region", { body: args });
+		// Strip signal from the wire body; it is merged into the fetch controller.
+		const { signal, ...body } = args;
+		return this.request<RegionResult>("POST", "/internal/ai/region", { body, signal });
 	}
 
 	/** POST /internal/ai/annotate — drop a rect annotation (idempotent via effect_key). */

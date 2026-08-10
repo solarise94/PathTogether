@@ -90,12 +90,93 @@ export interface RunConfig extends AiEngineConfig {
 	keep_recent_tokens?: number;
 	/** Legacy field (ai_session.py safety_margin); accepted but unused. */
 	safety_margin?: number;
+	/** Phase 1 config fields (§11). */
+	visual_working_set_max?: number;
+	visual_context_budget_tokens?: number;
+	overview_long_edge?: number;
+	working_image_long_edge?: number;
+	detail_image_long_edge?: number;
+	image_jpeg_quality?: number;
+	image_overlay_version?: string;
+	region_materialize_concurrency?: number;
+	image_derivative_cache_max_mb?: number;
+	image_derivative_cache_ttl?: number;
+	prompt_cache_mode?: string;
 }
 
 /** Common run arguments. `config` is required. */
 export interface RunArgs {
 	slide: string;
 	config: RunConfig;
+}
+
+/**
+ * Run-boundary validation error (§9.2/§11). Thrown by {@link validateRunConfig};
+ * server.ts entry handlers map it to HTTP 400 (distinct from 500 internal
+ * errors and 409 session conflicts).
+ */
+export class ConfigError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "ConfigError";
+	}
+}
+
+/**
+ * Run-boundary validation (§9.2/§11). Mirrors the Flask `_validate_ai_tuning`
+ * checks so a config that bypassed the Flask API (e.g. hand-edited
+ * ai_config.json) cannot start a run with contradictory parameters.
+ *
+ * Throws {@link ConfigError} (Chinese message) on the first violation. Called
+ * by server.ts entry handlers before any run is started.
+ */
+export function validateRunConfig(config: RunConfig): void {
+	const num = (v: unknown): number => {
+		const n = Number(v);
+		return Number.isFinite(n) ? n : NaN;
+	};
+	// reserve_tokens + keep_recent_tokens < context_window_tokens (§9.2)
+	const reserve = num(config.reserve_tokens);
+	const keep = num(config.keep_recent_tokens);
+	const ctx = num(config.context_window_tokens);
+	if (Number.isFinite(reserve) && Number.isFinite(keep) && Number.isFinite(ctx)) {
+		if (reserve + keep >= ctx) {
+			throw new ConfigError(
+				`reserve_tokens + keep_recent_tokens（${reserve + keep}）必须小于 context_window_tokens（${ctx}）`,
+			);
+		}
+	}
+	// Positive-int range checks for the Phase 1 fields (§11). Only validate when
+	// present; defaults are applied by resolveTransformSettings/resolveCompactionSettings.
+	const positiveIntFields: Array<keyof RunConfig> = [
+		"visual_working_set_max",
+		"visual_context_budget_tokens",
+		"overview_long_edge",
+		"working_image_long_edge",
+		"detail_image_long_edge",
+		"image_jpeg_quality",
+		"region_materialize_concurrency",
+		"image_derivative_cache_max_mb",
+		"image_derivative_cache_ttl",
+	];
+	for (const field of positiveIntFields) {
+		const v = num((config as unknown as Record<string, unknown>)[field as string]);
+		if (!Number.isNaN(v) && (v <= 0 || !Number.isInteger(v))) {
+			throw new ConfigError(`${String(field)} 需为正整数（> 0）`);
+		}
+	}
+	// Long-edge upper bound (§6.1, ≤ 4096).
+	for (const field of ["overview_long_edge", "working_image_long_edge", "detail_image_long_edge"] as const) {
+		const v = num((config as unknown as Record<string, unknown>)[field]);
+		if (!Number.isNaN(v) && v > 4096) {
+			throw new ConfigError(`${field} 不可超过 4096（最长边上限）`);
+		}
+	}
+	// prompt_cache_mode enum (§8.1).
+	const pcm = config.prompt_cache_mode;
+	if (pcm !== undefined && pcm !== "off" && pcm !== "auto" && pcm !== "explicit") {
+		throw new ConfigError("prompt_cache_mode 仅支持 off/auto/explicit");
+	}
 }
 
 /** Inject a test streamFn into the runner (mock model). */
@@ -621,6 +702,10 @@ export class AgentRunner {
 		// transformContext to protect the whole-slide overview from eviction.
 		// Set when the first snapshot_captured event fires for this run.
 		const firstSnapshotToolCallIdRef = { value: <string | null>null };
+		// Session-level mutable: the current pending snapshot id, so transformContext
+		// can prioritize the pending snapshot over ordinary recent images (§15.1).
+		// Updated on snapshot_captured (set) and snapshot_reviewed (cleared).
+		const pendingSnapshotIdRef = { value: <string | null>null };
 
 		// Tools + tool context (tools.ts). emit routes domain events to the bus.
 		// fork (lite) registers NO tools — the model does pure text Q&A. main
@@ -637,9 +722,14 @@ export class AgentRunner {
 			emit: (type, payload) => {
 				// Fire-and-forget; emit is async but tools need not await each.
 				// Track the first snapshot so transformContext can protect it.
-				if (type === "snapshot_captured" && firstSnapshotToolCallIdRef.value === null) {
+				if (type === "snapshot_captured") {
 					const sid = (payload as { snapshot_id?: string } | undefined)?.snapshot_id;
-					if (sid) firstSnapshotToolCallIdRef.value = sid;
+					if (sid) {
+						if (firstSnapshotToolCallIdRef.value === null) firstSnapshotToolCallIdRef.value = sid;
+						pendingSnapshotIdRef.value = sid;
+					}
+				} else if (type === "snapshot_reviewed") {
+					pendingSnapshotIdRef.value = null;
 				}
 				void this.bus.emit(sessionId, type, payload);
 			},
@@ -651,13 +741,16 @@ export class AgentRunner {
 		const tools = kind === "fork" ? [] : createTools(toolCtx);
 
 		// transformContext hook: materialize image_ref + evict old images. Bound
-		// to this run's flask/slide/settings/first-snapshot id.
+		// to this run's flask/slide/settings/first-snapshot id and pending id.
+		// The signal is supplied per-call by pi (agent.abort() triggers it); the
+		// hook signature (messages, signal?) threads it through to flask.region.
 		const transformContext = makeTransformContext({
 			flask: this.flask,
 			slide,
 			slideInfo,
 			settings: transformSettings,
 			firstSnapshotToolCallIdRef,
+			pendingSnapshotIdRef,
 		});
 
 		/**
@@ -1357,8 +1450,9 @@ export class AgentRunner {
 				y: ey,
 				w: ew,
 				h: eh,
-				out_w: 1568,
-				out_h: 1568,
+				// Aspect-preserving longest edge (§6.1): fork/branch seed image is a
+				// small detail crop; use 1280 (detail tier) instead of fixed 1568².
+				max_long_edge: 1280,
 				expected_fingerprint: info.fingerprint || undefined,
 			});
 			b64 = r.image_base64 || "";

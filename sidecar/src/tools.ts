@@ -489,23 +489,35 @@ export function createTools(ctx: ToolContext): AgentTool<any, any>[] {
 		label: "抓快照",
 		description: "抓取当前视野的快照图像回喂给你。看清细节时调用。",
 		parameters: Type.Object({
-			out_w: Type.Optional(Type.Integer({ description: "输出宽度像素（建议 ≤1568）" })),
-			out_h: Type.Optional(Type.Integer({ description: "输出高度像素（建议 ≤1568）" })),
+			out_w: Type.Optional(Type.Integer({ description: "输出宽度像素（建议 ≤1568，与 out_h 同时给出时不保持宽高比）" })),
+			out_h: Type.Optional(Type.Integer({ description: "输出高度像素（建议 ≤1568，与 out_w 同时给出时不保持宽高比）" })),
+			max_long_edge: Type.Optional(Type.Integer({ description: "输出最长边像素（保持宽高比，1..4096）；优先于 out_w/out_h" })),
 		}),
 		async execute(toolCallId, params): Promise<AgentToolResult<any>> {
 			await ensureStateLoaded();
 			const st = stateHolder.st;
-			const args = params as { out_w?: number; out_h?: number };
+			const args = params as { out_w?: number; out_h?: number; max_long_edge?: number };
 
 			// Pending snapshot guard (ai_agent.py:817).
 			if (await getPending()) {
 				return okText("需先消化当前快照后再抓新快照。");
 			}
 
-			let ow = Number(args.out_w) || st.viewportPx;
-			let oh = Number(args.out_h) || st.viewportPx;
-			ow = Math.max(64, Math.min(ow, 4096));
-			oh = Math.max(64, Math.min(oh, 4096));
+			// Output sizing (§6.1): prefer max_long_edge (aspect-preserving). When
+			// the caller gives explicit out_w/out_h instead, use them (legacy path,
+			// does NOT preserve aspect ratio) — clamp to 64..4096 as before.
+			let maxLongEdge: number | undefined;
+			let ow: number | undefined;
+			let oh: number | undefined;
+			const mleRaw = Number(args.max_long_edge);
+			if (Number.isFinite(mleRaw) && mleRaw > 0) {
+				maxLongEdge = Math.max(1, Math.min(Math.floor(mleRaw), 4096));
+			} else {
+				ow = Number(args.out_w) || st.viewportPx;
+				oh = Number(args.out_h) || st.viewportPx;
+				ow = Math.max(64, Math.min(ow, 4096));
+				oh = Math.max(64, Math.min(oh, 4096));
+			}
 
 			const bb = st.viewportBbox(downsamples);
 			let r: RegionResult;
@@ -518,6 +530,7 @@ export function createTools(ctx: ToolContext): AgentTool<any, any>[] {
 					h: bb.h,
 					out_w: ow,
 					out_h: oh,
+					max_long_edge: maxLongEdge,
 					expected_fingerprint: slideInfo.fingerprint || undefined,
 				});
 			} catch (e) {

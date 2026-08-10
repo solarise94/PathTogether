@@ -223,6 +223,39 @@ describe("SidecarServer — POST /run 409 conflict", () => {
 	});
 });
 
+describe("SidecarServer — POST /run config validation (§9.2/§11)", () => {
+	it("rejects a run when reserve + keep_recent >= context_window", async () => {
+		const { fn } = makeFakeStreamFn([{ text: "done", stopReason: "stop" as const }]);
+		const h = await startServer(fn);
+		try {
+			const r = await post(h.baseUrl, "/run", {
+				slide: SLIDE,
+				config: { ...BASE_CONFIG, context_window_tokens: 10000, reserve_tokens: 6000, keep_recent_tokens: 5000 },
+				fresh: true,
+			});
+			expect(r.status).toBe(400);
+			expect(String((r.body as { error?: string }).error || "")).toContain("context_window_tokens");
+		} finally {
+			await h.server.stop();
+		}
+	});
+
+	it("rejects a run when a Phase 1 long_edge field exceeds 4096", async () => {
+		const { fn } = makeFakeStreamFn([{ text: "done", stopReason: "stop" as const }]);
+		const h = await startServer(fn);
+		try {
+			const r = await post(h.baseUrl, "/run", {
+				slide: SLIDE,
+				config: { ...BASE_CONFIG, overview_long_edge: 5000 },
+				fresh: true,
+			});
+			expect(r.status).toBe(400);
+		} finally {
+			await h.server.stop();
+		}
+	});
+});
+
 describe("SidecarServer — GET /sessions and /session/:id", () => {
 	it("lists sessions and returns a detail with a transcript", async () => {
 		const { fn } = makeFakeStreamFn([{ text: "done", stopReason: "stop" as const }]);

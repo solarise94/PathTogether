@@ -47,6 +47,20 @@ app = Flask(__name__)
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR") or (Path.home() / "svs-viewer" / "uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+# --------------------------------------------------------------------------- #
+# 图片派生图确定性规格常量（§6.3）
+#
+# 坐标刻度 overlay 的渲染版本号：overlay 像素变化时递增，使旧派生图缓存失效。
+# _overlay_coord_ticks 的画法带进 region 响应的 encoder 字段，供 sidecar 校验。
+# --------------------------------------------------------------------------- #
+OVERLAY_VERSION = "v1"
+# 派生图编码器标识：与 PIL.Image.LANCZOS resize + JPEG 编码耦合。Pillow 升级可能
+# 改变输出字节，故把 PIL.__version__ 一并随响应返回，sidecar 可据此判断是否需要
+# 重建缓存（Phase 1 仅记录，不强制失效；Phase 2 接入 content_sha256 修复流程）。
+DERIVATIVE_ENCODER_ID = "pillow"
+DERIVATIVE_RESIZE_ALGORITHM = "LANCZOS"
+DERIVATIVE_JPEG_QUALITY = 85
+
 # 支持的病理图像扩展名
 SUPPORTED_EXTS = {
     "svs", "tif", "tiff", "ndpi", "mrxs", "vms", "vmu", "scn", "bif", "svslide",
@@ -1067,6 +1081,25 @@ DEFAULT_CONFIG = {
     "lease_ttl": 150.0,
     "event_buffer": 200,
     "max_tokens": 2048,
+    # ---- Phase 1 图片管线降本（§11） ----
+    # 视觉工作集上限（不含稳定概览）；keep_recent_images 的后继字段。
+    "visual_working_set_max": 4,
+    # 每请求视觉 token 硬预算（含固定概览）。
+    "visual_context_budget_tokens": 8000,
+    # 自适应分辨率分档（§6.1/§6.2 最长边 px）。
+    "overview_long_edge": 1024,
+    "working_image_long_edge": 768,
+    "detail_image_long_edge": 1280,
+    # 确定性派生图编码参数（§6.3）。
+    "image_jpeg_quality": 85,
+    "image_overlay_version": "v1",
+    # region 物化并发上限（替代 sidecar 硬编码 3）。
+    "region_materialize_concurrency": 3,
+    # 图片派生图 LRU（§6.4）：总字节上限与 TTL。
+    "image_derivative_cache_max_mb": 64,
+    "image_derivative_cache_ttl": 1800,
+    # Prompt Cache 模式：off / auto / explicit（Phase 1 仅透传，Phase 3 启用）。
+    "prompt_cache_mode": "auto",
 }
 
 
@@ -1193,6 +1226,16 @@ _AI_TUNING_POSITIVE_INT = (
     "lease_ttl",
     "max_tokens",
     "max_steps",
+    # Phase 1 新增正整数字段（§11）
+    "visual_working_set_max",
+    "visual_context_budget_tokens",
+    "overview_long_edge",
+    "working_image_long_edge",
+    "detail_image_long_edge",
+    "image_jpeg_quality",
+    "region_materialize_concurrency",
+    "image_derivative_cache_max_mb",
+    "image_derivative_cache_ttl",
 )
 # 允许 0（非负整数）的字段
 _AI_TUNING_NONNEG_INT = (
@@ -1201,9 +1244,16 @@ _AI_TUNING_NONNEG_INT = (
     "keep_recent_images",
     "safety_margin",
 )
+# 字符串枚举字段（Phase 1）
+_AI_TUNING_ENUM = {
+    "prompt_cache_mode": ("off", "auto", "explicit"),
+    "image_overlay_version": None,  # 任意非空字符串（版本号自由格式）
+}
 # max_steps 上限：取自 templates/index.html 的 input max="500"（步数上限字段）。
 # 防止 max_steps=99999 之类失控（sidecar 运行循环只限下限，费用风险）。
 _MAX_STEPS_LIMIT = 500
+# 分辨率分档最长边上限（§6.1，最长边 ≤ 4096 与 region 端点一致）。
+_LONG_EDGE_LIMIT = 4096
 
 
 def _coerce_tuning_int(raw, field):
@@ -1263,6 +1313,23 @@ def _validate_ai_tuning(body, cfg):
         if iv < 0:
             return None, "{} 不可为负数（>= 0）".format(field)
         validated[field] = iv
+    # 3) 枚举 / 字符串字段（Phase 1：prompt_cache_mode / image_overlay_version）
+    for field, allowed in _AI_TUNING_ENUM.items():
+        if field not in body:
+            continue
+        raw = body[field]
+        if not isinstance(raw, str):
+            return None, "{} 需为字符串".format(field)
+        val = raw.strip()
+        if not val:
+            return None, "{} 不可为空".format(field)
+        if allowed is not None and val not in allowed:
+            return None, "{} 仅支持 {}".format(field, "/".join(allowed))
+        validated[field] = val
+    # 4) 分辨率分档上限（§6.1，最长边 ≤ 4096）
+    for field in ("overview_long_edge", "working_image_long_edge", "detail_image_long_edge"):
+        if field in validated and validated[field] > _LONG_EDGE_LIMIT:
+            return None, "{} 不可超过 {}（最长边上限）".format(field, _LONG_EDGE_LIMIT)
     # max_steps 上限（UI 声明 max=500）
     if "max_steps" in validated and validated["max_steps"] > _MAX_STEPS_LIMIT:
         return None, "max_steps 不可超过 {}（步数上限）".format(_MAX_STEPS_LIMIT)
@@ -1289,6 +1356,15 @@ def _validate_ai_tuning(body, cfg):
                 "reserve_tokens + keep_recent_tokens（{}）必须小于 "
                 "context_window_tokens（{}）".format(reserve + keep, ctx)
             )
+    # 3) 弃用字段映射：keep_recent_images → visual_working_set_max（§11）。
+    #    两者同时存在时以新字段为准，并记一次弃用告警；仅旧字段存在时映射过去。
+    #    safety_margin 同属弃用字段：接受、不展示、不写回（见 api_ai_config PUT）。
+    if "keep_recent_images" in validated and "visual_working_set_max" not in validated:
+        validated["visual_working_set_max"] = validated["keep_recent_images"]
+    if "keep_recent_images" in validated and "visual_working_set_max" in body:
+        app.logger.warning(
+            "keep_recent_images 已弃用，与 visual_working_set_max 同时存在时以新字段为准"
+        )
     return validated, None
 
 
@@ -1440,6 +1516,15 @@ def api_ai_config():
     if err:
         return jsonify(error=err), 400
     pending.update(tuning)
+    # 弃用字段处理（§11）：
+    #   safety_margin —— 仅读取旧配置时接受（校验已过），但记一次弃用告警，且
+    #     不写回、不展示（从 pending 剥离，既不落盘也不回显）。
+    #   keep_recent_images —— 已在 _validate_ai_tuning 映射为 visual_working_set_max；
+    #     单独存在时也映射过去，落盘走新字段。这里不剥离 keep_recent_images，让它
+    #     继续落盘以保持旧 sidecar 兼容（旧 sidecar 仍读 keep_recent_images）。
+    if "safety_margin" in pending:
+        app.logger.warning("safety_margin 已弃用：接受但不再写回或展示")
+        pending.pop("safety_margin", None)
     # api_key：空串=清除；与掩码同值=不变；其他=覆盖（明文 → _save_ai_config 加密）
     # 仅在校验全部通过后解析 key 动作（仍属"校验"阶段，未落盘）。
     key_action = None  # ("set", new_plain) | ("clear",) | None=不动
@@ -1601,8 +1686,31 @@ def _overlay_coord_ticks(img, x0, y0, w0, h0):
     return img
 
 
-def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp):
-    """实际读 region → JPEG base64（与 /region 端点逻辑一致，供 AI 进程内调用）。"""
+def _aspect_fit_size(w_src, h_src, max_long_edge):
+    """按原始宽高比计算输出尺寸：最长边 = max_long_edge，限制 [1, 4096]（§6.1）。
+
+    保持宽高比，禁止固定拉伸为正方形。max_long_edge 会被 clamp 到 [1, 4096]。
+    """
+    longest = max(int(w_src), int(h_src))
+    edge = max(1, min(int(max_long_edge), 4096))
+    if longest <= 0:
+        return edge, edge
+    scale = float(edge) / float(longest)
+    ow = max(1, min(4096, int(round(w_src * scale))))
+    oh = max(1, min(4096, int(round(h_src * scale))))
+    return ow, oh
+
+
+def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
+                     max_long_edge=None, jpeg_quality=DERIVATIVE_JPEG_QUALITY):
+    """实际读 region → JPEG base64（与 /region 端点逻辑一致，供 AI 进程内调用）。
+
+    输出尺寸规则（§6.1）：
+      - max_long_edge 非空时：按 bbox 原始宽高比计算 out_w/out_h，最长边 =
+        max_long_edge（保持比例，限制 [1,4096]），忽略显式 out_w/out_h。
+      - 否则：用显式 out_w/out_h（仍 clamp 到 [1,4096]），保持旧契约。
+    LANCZOS resize 保持不变；JPEG 质量 jpeg_quality 默认 DERIVATIVE_JPEG_QUALITY(85)。
+    """
     with slide_cache.borrow_pair(entry) as pair:
         osr = pair["osr"]
         width, height = osr.dimensions
@@ -1626,8 +1734,12 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp):
         region = osr.read_region((x2, y2), lvl, (rw, rh))
         if region.mode != "RGB":
             region = region.convert("RGB")
-        ow = max(1, min(out_w, 4096))
-        oh = max(1, min(out_h, 4096))
+        # 输出尺寸：max_long_edge 优先（保宽高比），否则用显式 out_w/out_h。
+        if max_long_edge is not None and int(max_long_edge) > 0:
+            ow, oh = _aspect_fit_size(w2, h2, max_long_edge)
+        else:
+            ow = max(1, min(out_w, 4096))
+            oh = max(1, min(out_h, 4096))
         if (ow, oh) != (w2, h2):
             region = region.resize((ow, oh), Image.LANCZOS)
         mag = None
@@ -1642,7 +1754,7 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp):
     # AI 快照图像画 level-0 坐标刻度尺（视觉尺子，失败不影响出图）
     _overlay_coord_ticks(region, x2, y2, w2, h2)
     buf = io.BytesIO()
-    region.save(buf, format="JPEG", quality=85)
+    region.save(buf, format="JPEG", quality=int(jpeg_quality))
     img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
     return {
         "image_base64": img_b64,
@@ -1650,6 +1762,24 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp):
         "width": ow, "height": oh,
         "src": {"x": x2, "y": y2, "w": w2, "h": h2},
         "magnification": mag,
+    }
+
+
+def _derivative_encoder_info(jpeg_quality=DERIVATIVE_JPEG_QUALITY):
+    """返回当前编码器环境信息（§6.3），随 region 响应回传供 sidecar 校验/记录。
+
+    jpeg_quality 必须传本次响应实际使用的质量，不能回传常量默认值。
+    """
+    try:
+        pil_version = Image.__version__
+    except Exception:  # noqa: BLE001
+        pil_version = "unknown"
+    return {
+        "id": DERIVATIVE_ENCODER_ID,
+        "version": pil_version,
+        "resize": DERIVATIVE_RESIZE_ALGORITHM,
+        "overlay_version": OVERLAY_VERSION,
+        "jpeg_quality": int(jpeg_quality),
     }
 
 
@@ -1665,10 +1795,17 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp):
 def internal_ai_region():
     """sidecar 取 level-0 区域图（含青色坐标刻度尺）。
 
-    body: {slide, x, y, w, h, out_w?, out_h?, expected_fingerprint?}（level-0 整数）。
+    body: {slide, x, y, w, h, out_w?, out_h?, max_long_edge?,
+           jpeg_quality?, expected_fingerprint?}（level-0 整数）。
     expected_fingerprint 为可选字符串：若非空且与当前切片指纹不一致，返回 409。
-    返回 {image_base64, mime, width, height, src, magnification}（与
-    /api/slide/<name>/region 响应同构）。
+
+    输出尺寸（§6.1）：
+      - max_long_edge（正整数，[1,4096]）：服务端按 bbox 原始宽高比计算 out_w/out_h
+        （最长边 = max_long_edge，保持比例）。与显式 out_w/out_h 同时给出时，以
+        max_long_edge 为准（保宽高比，避免固定拉伸）。
+      - 仅 out_w/out_h：旧契约，强制到精确尺寸（不保宽高比），保持向后兼容。
+    返回 {image_base64, mime, width, height, src, magnification, encoder}（encoder
+    含 id/version/resize/overlay_version/jpeg_quality，供 sidecar 校验派生规格 §6.3）。
     """
     auth = _require_internal()
     if auth:
@@ -1695,6 +1832,12 @@ def internal_ai_region():
         return jsonify(error="参数越界（0<=x,y，0<w,h）"), 400
     out_w = _parse_int("out_w")
     out_h = _parse_int("out_h")
+    max_long_edge = _parse_int("max_long_edge")
+    jpeg_quality = _parse_int("jpeg_quality")
+    if max_long_edge is not None and (max_long_edge < 1 or max_long_edge > 4096):
+        return jsonify(error="max_long_edge 需在 1..4096"), 400
+    if jpeg_quality is not None and (jpeg_quality < 1 or jpeg_quality > 100):
+        return jsonify(error="jpeg_quality 需在 1..100"), 400
 
     safe = _safe_name(slide)
     expected_fp = body.get("expected_fingerprint")
@@ -1707,11 +1850,14 @@ def internal_ai_region():
         osr = pair["osr"]
         meta = _read_metadata(osr, UPLOAD_DIR / safe)
         mpp = meta.get("mpp_x")
+    # 默认输出尺寸（max_long_edge 未给时用旧默认 1568×1568）
     if not out_w or out_w <= 0:
         out_w = 1568
     if not out_h or out_h <= 0:
         out_h = 1568
-    r = _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp)
+    q = jpeg_quality if (jpeg_quality and jpeg_quality > 0) else DERIVATIVE_JPEG_QUALITY
+    r = _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
+                         max_long_edge=max_long_edge, jpeg_quality=q)
     return jsonify({
         "image_base64": r["image_base64"],
         "mime": r["mime"],
@@ -1719,6 +1865,7 @@ def internal_ai_region():
         "height": r["height"],
         "src": r["src"],
         "magnification": r["magnification"],
+        "encoder": _derivative_encoder_info(q),
     })
 
 

@@ -34,7 +34,7 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
-import { AgentRunner, RunConfig, SessionConflict, RootAnnotationGone } from "./agent-runner.js";
+import { AgentRunner, RunConfig, SessionConflict, RootAnnotationGone, ConfigError, validateRunConfig } from "./agent-runner.js";
 import { SessionStore, SessionConflict as StoreConflict } from "./session-store.js";
 import { SessionEventBus, formatEventFrame, formatPingFrame, formatEventResetFrame, formatSessionEndedFrame } from "./events.js";
 import { buildTranscript } from "./transcript.js";
@@ -155,10 +155,12 @@ export class SidecarServer {
 			return this.sendJson(res, 400, { error: "AI 未配置：请先在面板里填写 base_url 与 api_key" });
 		}
 		try {
+			validateRunConfig(config);
 			const { sessionId } = await this.runner.runMain({ slide, config, task, fresh });
 			// SSE stream for the new session (Flask proxies this verbatim).
 			return this.startSseForNewSession(sessionId, res);
 		} catch (e) {
+			if (e instanceof ConfigError) return this.sendJson(res, 400, { error: e.message });
 			if (e instanceof SessionConflict || e instanceof StoreConflict) return this.sendJson(res, 409, { error: e.message });
 			return this.sendJson(res, 500, { error: (e as Error)?.message || String(e) });
 		}
@@ -174,9 +176,11 @@ export class SidecarServer {
 		if (!slide) return this.sendJson(res, 400, { error: "缺少 slide" });
 		if (!config) return this.sendJson(res, 400, { error: "缺少 config" });
 		try {
+			validateRunConfig(config);
 			const { sessionId } = await this.runner.continueMain({ slide, config });
 			return this.startSseForNewSession(sessionId, res);
 		} catch (e) {
+			if (e instanceof ConfigError) return this.sendJson(res, 400, { error: e.message });
 			if (e instanceof SessionConflict || e instanceof StoreConflict) {
 				// continueMain throws SessionConflict("没有可继续的主会话") → 404.
 				const msg = e.message || "";
@@ -200,9 +204,11 @@ export class SidecarServer {
 		if (!annotationId) return this.sendJson(res, 400, { error: "缺少 annotation_id" });
 		if (!config) return this.sendJson(res, 400, { error: "缺少 config" });
 		try {
+			validateRunConfig(config);
 			const { sessionId, streamFromSeq } = await this.runner.askFork({ slide, config, annotationId, question });
 			return this.startSseForNewSession(sessionId, res, streamFromSeq);
 		} catch (e) {
+			if (e instanceof ConfigError) return this.sendJson(res, 400, { error: e.message });
 			if (e instanceof RootAnnotationGone) return this.sendJson(res, 410, { error: e.message });
 			if (e instanceof SessionConflict || e instanceof StoreConflict) return this.sendJson(res, 409, { error: e.message });
 			return this.sendJson(res, 500, { error: (e as Error)?.message || String(e) });
@@ -222,9 +228,11 @@ export class SidecarServer {
 		if (!annotationId) return this.sendJson(res, 400, { error: "缺少 annotation_id" });
 		if (!config) return this.sendJson(res, 400, { error: "缺少 config" });
 		try {
+			validateRunConfig(config);
 			const { sessionId, streamFromSeq } = await this.runner.askBranch({ slide, config, annotationId, question });
 			return this.startSseForNewSession(sessionId, res, streamFromSeq);
 		} catch (e) {
+			if (e instanceof ConfigError) return this.sendJson(res, 400, { error: e.message });
 			if (e instanceof RootAnnotationGone) return this.sendJson(res, 410, { error: e.message });
 			if (e instanceof SessionConflict || e instanceof StoreConflict) return this.sendJson(res, 409, { error: e.message });
 			return this.sendJson(res, 500, { error: (e as Error)?.message || String(e) });

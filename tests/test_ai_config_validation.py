@@ -198,8 +198,7 @@ def test_positive_int_fields_reject_non_integer():
 # =========================================================================== #
 def test_nonneg_int_fields_allow_zero():
     print("== 非负整数类字段：0 → 200 落盘 ==")
-    for field in ("reserve_tokens", "keep_recent_tokens", "keep_recent_images",
-                  "safety_margin"):
+    for field in ("reserve_tokens", "keep_recent_tokens", "keep_recent_images"):
         # 单独 0 不触发关系校验（context_window 未变，默认 272000，0+0 < 272000）
         reset_config()
         code, j = put({field: 0})
@@ -209,10 +208,25 @@ def test_nonneg_int_fields_allow_zero():
                   "got %r" % j.get(field))
 
 
+def test_safety_margin_deprecated_not_persisted():
+    """safety_margin 已弃用（§11）：接受（校验通过）但不再写回或展示。"""
+    print("== safety_margin 弃用：接受但不落盘 ==")
+    reset_config()
+    code, j = put({"safety_margin": 4096})
+    check("safety_margin=4096 → 200（接受）", code == 200, "got %s %r" % (code, j))
+    # 不落盘：磁盘上不应出现 safety_margin=4096（保留默认或既有值）
+    raw = load_raw()
+    check("safety_margin 不落盘为 4096", raw.get("safety_margin") != 4096,
+          "got %r" % raw.get("safety_margin"))
+    # 负数仍应被校验拒绝（接受的前提是通过校验）
+    reset_config()
+    code, j = put({"safety_margin": -3})
+    check("safety_margin=-3 → 400（校验仍生效）", code == 400, "got %s %r" % (code, j))
+
+
 def test_nonneg_int_fields_reject_negative():
     print("== 非负整数类字段：负数 → 400 ==")
-    for field in ("reserve_tokens", "keep_recent_tokens", "keep_recent_images",
-                  "safety_margin"):
+    for field in ("reserve_tokens", "keep_recent_tokens", "keep_recent_images"):
         reset_config()
         code, j = put({field: -3})
         check("%s=-3 → 400" % field, code == 400, "got %s %r" % (code, j))
@@ -431,6 +445,7 @@ if __name__ == "__main__":
     test_positive_int_fields_reject_non_integer()
     test_nonneg_int_fields_allow_zero()
     test_nonneg_int_fields_reject_negative()
+    test_safety_margin_deprecated_not_persisted()
     test_max_steps_upper_bound()
     test_relationship_violation()
     test_relationship_uses_existing_values_when_partial()

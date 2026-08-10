@@ -37,7 +37,7 @@ const slideInfo = {
 
 /** In-memory FlaskClient mock: records calls, returns canned data. */
 interface MockFlask {
-	regionCalls: Array<{ x: number; y: number; w: number; h: number; out_w?: number; out_h?: number; expected_fingerprint?: string }>;
+	regionCalls: Array<{ x: number; y: number; w: number; h: number; out_w?: number; out_h?: number; max_long_edge?: number; expected_fingerprint?: string }>;
 	annotateCalls: Array<{ label: string; x: number; y: number; side_px: number; note?: string; effect_key?: string; session_id?: string }>;
 	annotateResult: RoiDict;
 	regionResult?: Partial<RegionResult>;
@@ -71,14 +71,23 @@ function makeMockFlask(): MockFlask & Pick<FlaskClient, "region" | "annotate" | 
 	// getter/setter on the shared `state`.
 	const obj = {
 		...state,
-		async region(args: { x: number; y: number; w: number; h: number; out_w?: number; out_h?: number; expected_fingerprint?: string }) {
+		async region(args: { x: number; y: number; w: number; h: number; out_w?: number; out_h?: number; max_long_edge?: number; expected_fingerprint?: string }) {
 			state.regionCalls.push({ ...args });
 			if (state.regionError) throw state.regionError;
+			// Echo width/height: aspect-preserving when max_long_edge is set.
+			let ow = state.regionResult?.width ?? args.out_w ?? 1024;
+			let oh = state.regionResult?.height ?? args.out_h ?? 1024;
+			if (args.max_long_edge && !state.regionResult?.width) {
+				const longest = Math.max(args.w, args.h);
+				const scale = args.max_long_edge / longest;
+				ow = Math.max(1, Math.round(args.w * scale));
+				oh = Math.max(1, Math.round(args.h * scale));
+			}
 			const r: RegionResult = {
 				image_base64: state.regionResult?.image_base64 ?? "AAAA",
 				mime: state.regionResult?.mime ?? "image/jpeg",
-				width: state.regionResult?.width ?? args.out_w ?? 1024,
-				height: state.regionResult?.height ?? args.out_h ?? 1024,
+				width: ow,
+				height: oh,
 				src: state.regionResult?.src ?? { x: args.x, y: args.y, w: args.w, h: args.h },
 				magnification: state.regionResult?.magnification ?? 20,
 			};
@@ -319,6 +328,24 @@ describe("snapshot (ai_agent.py L816-875)", () => {
 		await tool(h, "goto").execute("tc1", { x: 5000, y: 4000, level: 0 });
 		await tool(h, "snapshot").execute("snap1", {});
 		expect(h.mock.regionCalls[0]).toMatchObject({ expected_fingerprint: FINGERPRINT });
+	});
+
+	it("uses max_long_edge when provided (aspect-preserving, §6.1)", async () => {
+		const h = await makeHarness();
+		await tool(h, "goto").execute("tc1", { x: 5000, y: 4000, level: 0 });
+		await tool(h, "snapshot").execute("snap1", { max_long_edge: 1024 });
+		const call = h.mock.regionCalls[0]!;
+		expect(call.max_long_edge).toBe(1024);
+		// out_w/out_h should not be sent when max_long_edge is used.
+		expect(call.out_w).toBeUndefined();
+		expect(call.out_h).toBeUndefined();
+	});
+
+	it("clamps max_long_edge to 1..4096", async () => {
+		const h = await makeHarness();
+		await tool(h, "goto").execute("tc1", { x: 5000, y: 4000, level: 0 });
+		await tool(h, "snapshot").execute("snap1", { max_long_edge: 99999 });
+		expect(h.mock.regionCalls[0]?.max_long_edge).toBe(4096);
 	});
 
 	it("on 409 fingerprint mismatch clears caches via onFingerprintMismatch", async () => {

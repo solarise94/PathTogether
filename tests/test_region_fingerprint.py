@@ -37,6 +37,21 @@ from pathlib import Path as _Path  # noqa: E402
 app_mod.UPLOAD_DIR = _Path(os.environ["UPLOAD_DIR"])
 app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+# 固定内部 token：模块级 AI_INTERNAL_TOKEN 在 import 时解析，可能被其它测试
+# 模块的 import 顺序污染（见 test_ai_proxy 设置不同的 SHARE_DATA_DIR/token）。
+# 用 pytest autouse fixture 在每个用例前把模块级 token 夺回为固定值，保证
+# _headers() 与 _require_internal() 一致，不受收集顺序影响。
+import pytest  # noqa: E402
+
+_TOKEN = "test-internal-token-fp"
+
+
+@pytest.fixture(autouse=True)
+def _pin_internal_token(monkeypatch):
+    monkeypatch.setattr(app_mod, "AI_INTERNAL_TOKEN", _TOKEN)
+    monkeypatch.setattr(app_mod, "AUTH_ENABLED", False)
+    yield
+
 
 def _client():
     app_mod.app.config["TESTING"] = True
@@ -44,7 +59,7 @@ def _client():
 
 
 def _headers():
-    return {"X-AI-Internal-Token": "test-internal-token-fp", "Content-Type": "application/json"}
+    return {"X-AI-Internal-Token": _TOKEN, "Content-Type": "application/json"}
 
 
 def _touch_slide(name: str = "demo.svs") -> str:

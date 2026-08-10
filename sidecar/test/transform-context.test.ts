@@ -12,6 +12,9 @@ import {
 	countImageBlocks,
 	hasNoImageRefBlocks,
 	clearRegionLru,
+	regionLruSize,
+	configureRegionLru,
+	invalidateRegionLru,
 } from "../src/transform-context.js";
 import type { FlaskClient, RegionResult } from "../src/flask-client.js";
 import type { SlideInfo } from "../src/tools.js";
@@ -61,32 +64,75 @@ function toolResultMsg(toolCallId: string, blocks: unknown[], ts = Date.now()): 
 	} as unknown as AgentMessage;
 }
 
-/** A minimal flask mock whose region() returns a deterministic base64 per call. */
-function makeFlask(opts: { fail?: boolean; emptyB64?: boolean; b64ByRefId?: Record<string, string> } = {}): Pick<FlaskClient, "region"> & { calls: number; lastArgs: unknown[] } {
+/**
+ * A minimal flask mock whose region() returns a deterministic base64 per call.
+ *
+ * Supports:
+ *   - opts.fail: region() throws synchronously.
+ *   - opts.emptyB64: returns empty base64.
+ *   - opts.b64ByRefId: per-b64 override keyed by `x{x}y{y}`.
+ *   - opts.delayMs: resolves after a delay (for AbortSignal-in-flight tests).
+ *   - opts.blockUntil: a promise the call awaits before resolving (for abort-
+ *     timing tests where we need the fetch to be observable in-flight).
+ *
+ * Records every call's args (including max_long_edge / signal) on lastArgs.
+ */
+function makeFlask(
+	opts: { fail?: boolean; emptyB64?: boolean; b64ByRefId?: Record<string, string>; delayMs?: number; blockUntil?: Promise<void> } = {},
+): Pick<FlaskClient, "region"> & { calls: number; lastArgs: Array<Record<string, unknown>>; invocations: Array<{ args: Record<string, unknown>; startedAt: number; signal?: AbortSignal }> } {
 	const state = { calls: 0 };
-	const lastArgs: unknown[] = [];
-	const region = async (args: { slide: string; x: number; y: number; w: number; h: number; out_w?: number; out_h?: number }): Promise<RegionResult> => {
+	const lastArgs: Array<Record<string, unknown>> = [];
+	const invocations: Array<{ args: Record<string, unknown>; startedAt: number; signal?: AbortSignal }> = [];
+	const region = async (args: Record<string, unknown> & { x: number; y: number; w: number; h: number; out_w?: number; out_h?: number; max_long_edge?: number; signal?: AbortSignal }): Promise<RegionResult> => {
 		state.calls += 1;
 		lastArgs.push(args);
+		const sig = args.signal as AbortSignal | undefined;
+		invocations.push({ args, startedAt: Date.now(), signal: sig });
+		// Wait on a blocker if provided (lets tests observe in-flight state).
+		if (opts.blockUntil) {
+			await opts.blockUntil;
+		}
+		if (opts.delayMs) {
+			await new Promise<void>((resolve) => setTimeout(resolve, opts.delayMs));
+		}
 		if (opts.fail) throw new Error("region boom");
+		// If the signal aborted while we were "in flight", reject like fetch does.
+		if (sig?.aborted) {
+			const err = new Error("The operation was aborted");
+			err.name = "AbortError";
+			throw err;
+		}
 		const b64 = (opts.b64ByRefId && opts.b64ByRefId[`x${args.x}y${args.y}`]) || "QUFBQQ=="; // "AAAA"
+		// When max_long_edge is set, echo a width/height that preserves aspect.
+		let ow = (args.out_w as number | undefined) ?? 1024;
+		let oh = (args.out_h as number | undefined) ?? 1024;
+		if (args.max_long_edge) {
+			const longest = Math.max(args.w, args.h);
+			const scale = (args.max_long_edge as number) / longest;
+			ow = Math.max(1, Math.round(args.w * scale));
+			oh = Math.max(1, Math.round(args.h * scale));
+		}
 		return {
 			image_base64: opts.emptyB64 ? "" : b64,
 			mime: "image/jpeg",
-			width: args.out_w ?? 1024,
-			height: args.out_h ?? 1024,
+			width: ow,
+			height: oh,
 			src: { x: args.x, y: args.y, w: args.w, h: args.h },
 			magnification: 20,
+			encoder: { id: "pillow", version: "test", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
 		};
 	};
 	// Use getters so `calls` reflects the live closure counter.
-	const obj: Pick<FlaskClient, "region"> & { calls: number; lastArgs: unknown[] } = {
+	const obj: Pick<FlaskClient, "region"> & { calls: number; lastArgs: Array<Record<string, unknown>>; invocations: Array<{ args: Record<string, unknown>; startedAt: number; signal?: AbortSignal }> } = {
 		region: region as never,
 		get calls() {
 			return state.calls;
 		},
 		get lastArgs() {
 			return lastArgs;
+		},
+		get invocations() {
+			return invocations;
 		},
 	};
 	return obj;
@@ -98,16 +144,34 @@ function makeFlask(opts: { fail?: boolean; emptyB64?: boolean; b64ByRefId?: Reco
 
 describe("transform-context", () => {
 	describe("resolveTransformSettings", () => {
-		it("defaults to 6 when unset or invalid", () => {
-			expect(resolveTransformSettings({}).keepRecentImages).toBe(6);
-			expect(resolveTransformSettings({ keep_recent_images: 0 }).keepRecentImages).toBe(6);
-			expect(resolveTransformSettings({ keep_recent_images: -1 }).keepRecentImages).toBe(6);
-			expect(resolveTransformSettings({ keep_recent_images: NaN }).keepRecentImages).toBe(6);
-			expect(resolveTransformSettings({ keep_recent_images: "abc" as unknown as number }).keepRecentImages).toBe(6);
+		it("defaults to 4 (visual_working_set_max) when unset or invalid", () => {
+			expect(resolveTransformSettings({}).keepRecentImages).toBe(4);
+			expect(resolveTransformSettings({ keep_recent_images: -1 }).keepRecentImages).toBe(4);
+			expect(resolveTransformSettings({ keep_recent_images: NaN }).keepRecentImages).toBe(4);
+			expect(resolveTransformSettings({ keep_recent_images: "abc" as unknown as number }).keepRecentImages).toBe(4);
 		});
-		it("floors a positive number", () => {
-			expect(resolveTransformSettings({ keep_recent_images: 3 }).keepRecentImages).toBe(3);
+		it("maps legacy keep_recent_images when set", () => {
+			// legacy positive value is honored
+			expect(resolveTransformSettings({ keep_recent_images: 8 }).keepRecentImages).toBe(8);
+			// legacy 0 = "unset" historically → new default 4 (visual_working_set_max)
+			expect(resolveTransformSettings({ keep_recent_images: 0 }).keepRecentImages).toBe(4);
 			expect(resolveTransformSettings({ keep_recent_images: 4.9 }).keepRecentImages).toBe(4);
+		});
+		it("prefers visual_working_set_max over legacy keep_recent_images", () => {
+			expect(resolveTransformSettings({ visual_working_set_max: 3, keep_recent_images: 8 }).keepRecentImages).toBe(3);
+			// new field 0 is honored (means "keep zero non-overview")
+			expect(resolveTransformSettings({ visual_working_set_max: 0 }).keepRecentImages).toBe(0);
+		});
+		it("resolves Phase 1 long-edge / quality / LRU fields with defaults", () => {
+			const s = resolveTransformSettings({});
+			expect(s.overviewLongEdge).toBe(1024);
+			expect(s.workingImageLongEdge).toBe(768);
+			expect(s.detailImageLongEdge).toBe(1280);
+			expect(s.jpegQuality).toBe(85);
+			expect(s.overlayVersion).toBe("v1");
+			expect(s.regionConcurrency).toBe(3);
+			expect(s.lruMaxBytes).toBe(64 * 1024 * 1024);
+			expect(s.lruTtlMs).toBe(1800_000);
 		});
 	});
 
@@ -435,6 +499,396 @@ describe("transform-context", () => {
 			];
 			expect(countImageBlocks(msgs)).toBe(1);
 			expect(hasNoImageRefBlocks(msgs)).toBe(false);
+		});
+	});
+
+	// ------------------------------------------------------------------------- //
+	// Phase 1: aspect ratio / adaptive sizing (§6.1/§6.2)
+	// ------------------------------------------------------------------------- //
+	describe("aspect ratio + adaptive sizing (§6.1)", () => {
+		it("requests max_long_edge (not fixed 1568×1568) preserving aspect ratio", async () => {
+			const flask = makeFlask();
+			const transform = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ visual_working_set_max: 6 }),
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			// Horizontal bbox (w=1000, h=500). Most-recent ordinary → detail tier (1280).
+			await transform([userMsg([imgRef("ref_a", { x: 0, y: 0, w: 1000, h: 500 })])]);
+			expect(flask.calls).toBe(1);
+			const args = flask.lastArgs[0]!;
+			expect(args.max_long_edge).toBe(1280); // detail tier for newest ordinary
+			expect(args.out_w).toBeUndefined();
+			expect(args.out_h).toBeUndefined();
+			// Mock echoes aspect-preserving width/height: longest edge 1280 → 1280×640.
+			expect(args.jpeg_quality).toBe(85);
+		});
+
+		it("overview ref uses overview_long_edge tier (1024)", async () => {
+			const flask = makeFlask();
+			const transform = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ visual_working_set_max: 1 }),
+				firstSnapshotToolCallIdRef: { value: "snap-ov" },
+			});
+			// Overview (identity match) covers the whole slide.
+			const msgs: AgentMessage[] = [
+				toolResultMsg("snap-ov", [imgRef("ref_snap-ov", { x: 0, y: 0, w: 9500, h: 8000 })], 1),
+				toolResultMsg("s2", [imgRef("ref_s2", { x: 1, y: 1, w: 100, h: 100 })], 2),
+			];
+			await transform(msgs);
+			expect(flask.calls).toBe(2);
+			// Overview (first call) → 1024; newest ordinary (s2) → 1280 (detail).
+			const overviewArgs = flask.lastArgs.find((a) => (a.x as number) === 0);
+			const detailArgs = flask.lastArgs.find((a) => (a.x as number) === 1);
+			expect(overviewArgs?.max_long_edge).toBe(1024);
+			expect(detailArgs?.max_long_edge).toBe(1280);
+		});
+
+		it("configurable long edges flow into region request", async () => {
+			const flask = makeFlask();
+			const transform = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({
+					visual_working_set_max: 6,
+					overview_long_edge: 900,
+					working_image_long_edge: 600,
+					detail_image_long_edge: 1100,
+				}),
+				firstSnapshotToolCallIdRef: { value: "snap-ov" },
+			});
+			const msgs: AgentMessage[] = [
+				toolResultMsg("snap-ov", [imgRef("ref_snap-ov", { x: 0, y: 0, w: 9500, h: 8000 })], 1),
+				toolResultMsg("s2", [imgRef("ref_s2", { x: 1, y: 1, w: 100, h: 100 })], 2),
+				toolResultMsg("s3", [imgRef("ref_s3", { x: 2, y: 2, w: 100, h: 100 })], 3),
+			];
+			await transform(msgs);
+			// s3 is newest ordinary → detail(1100); s2 → working(600); ov → overview(900).
+			const ovArgs = flask.lastArgs.find((a) => (a.x as number) === 0);
+			const s2Args = flask.lastArgs.find((a) => (a.x as number) === 1);
+			const s3Args = flask.lastArgs.find((a) => (a.x as number) === 2);
+			expect(ovArgs?.max_long_edge).toBe(900);
+			expect(s2Args?.max_long_edge).toBe(600);
+			expect(s3Args?.max_long_edge).toBe(1100);
+		});
+	});
+
+	// ------------------------------------------------------------------------- //
+	// Phase 1: byte-budget LRU + deterministic derivative spec (§6.3/§6.4)
+	// ------------------------------------------------------------------------- //
+	describe("byte-budget LRU (§6.4)", () => {
+		/** A base64 string that decodes to ~`bytes` (ceil to a multiple of 3). */
+		function b64OfBytes(bytes: number): string {
+			const n = Math.max(3, Math.ceil(bytes / 3) * 3);
+			// "A"*k → b'\x00\x00...' of length n; base64 needs 4/3*n chars.
+			const chars = (n * 4) / 3;
+			return "A".repeat(chars);
+		}
+
+		it("evicts least-recently-used when total bytes exceed the budget", async () => {
+			// Each entry ~500 bytes; budget ~1300 bytes → 2 entries fit, 3rd evicts oldest.
+			const BIG = b64OfBytes(500);
+			clearRegionLru();
+			const flask = makeFlask({ b64ByRefId: {
+				[`x1y1`]: BIG, [`x2y2`]: BIG, [`x3y3`]: BIG,
+			} });
+			const transform = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ visual_working_set_max: 6, image_derivative_cache_max_mb: 1300 / (1024 * 1024) }),
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			await transform([userMsg([imgRef("ref_a", { x: 1, y: 1, w: 10, h: 10 })])]);
+			await transform([userMsg([imgRef("ref_b", { x: 2, y: 2, w: 10, h: 10 })])]);
+			await transform([userMsg([imgRef("ref_c", { x: 3, y: 3, w: 10, h: 10 })])]);
+			expect(regionLruSize()).toBeLessThanOrEqual(2);
+			// Re-fetching ref_a (evicted oldest) must call region again.
+			const callsBefore = flask.calls;
+			await transform([userMsg([imgRef("ref_a", { x: 1, y: 1, w: 10, h: 10 })])]);
+			expect(flask.calls).toBe(callsBefore + 1);
+		});
+
+		it("refreshes recency on hit (LRU position updated)", async () => {
+			const BIG = b64OfBytes(500);
+			// Budget fits exactly 2 entries (1000 bytes) but not 3 (1500).
+			clearRegionLru();
+			const flask = makeFlask({ b64ByRefId: {
+				[`x1y1`]: BIG, [`x2y2`]: BIG, [`x3y3`]: BIG,
+			} });
+			const transform = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ visual_working_set_max: 6, image_derivative_cache_max_mb: 1300 / (1024 * 1024) }),
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			await transform([userMsg([imgRef("ref_a", { x: 1, y: 1, w: 10, h: 10 })])]);
+			await transform([userMsg([imgRef("ref_b", { x: 2, y: 2, w: 10, h: 10 })])]);
+			// Touch ref_a (hit) → it becomes most-recent; ref_b is now least-recent.
+			await transform([userMsg([imgRef("ref_a", { x: 1, y: 1, w: 10, h: 10 })])]);
+			// Inserting ref_c should evict ref_b (least recent), keeping ref_a.
+			const callsBefore = flask.calls;
+			await transform([userMsg([imgRef("ref_c", { x: 3, y: 3, w: 10, h: 10 })])]);
+			// ref_a hit on next call → no region call (only ref_c caused one above).
+			await transform([userMsg([imgRef("ref_a", { x: 1, y: 1, w: 10, h: 10 })])]);
+			expect(flask.calls).toBe(callsBefore + 1); // only ref_c caused a call
+		});
+
+		it("same input produces same cache key (LRU hit, single region call)", async () => {
+			clearRegionLru();
+			const flask = makeFlask();
+			const transform = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ visual_working_set_max: 6 }),
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			const src = { x: 5, y: 5, w: 20, h: 20 };
+			await transform([userMsg([imgRef("ref_a", src)])]);
+			await transform([userMsg([imgRef("ref_a", src)])]);
+			await transform([userMsg([imgRef("ref_a", src)])]);
+			expect(flask.calls).toBe(1); // same spec → LRU hit on 2nd/3rd
+		});
+
+		it("TTL expiry triggers a re-fetch", async () => {
+			clearRegionLru();
+			const flask = makeFlask();
+			const transform = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ visual_working_set_max: 6, image_derivative_cache_ttl: 0.001 }),
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			await transform([userMsg([imgRef("ref_a", { x: 1, y: 1, w: 10, h: 10 })])]);
+			expect(flask.calls).toBe(1);
+			// Wait > TTL so the entry expires.
+			await new Promise<void>((r) => setTimeout(r, 20));
+			await transform([userMsg([imgRef("ref_a", { x: 1, y: 1, w: 10, h: 10 })])]);
+			expect(flask.calls).toBe(2);
+		});
+
+		it("invalidateRegionLru(slide) drops only that slide's entries", async () => {
+			clearRegionLru();
+			const flask = makeFlask();
+			const transformA = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: "a.svs",
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ visual_working_set_max: 6 }),
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			const transformB = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: "b.svs",
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ visual_working_set_max: 6 }),
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			await transformA([userMsg([imgRef("ref_a", { x: 1, y: 1, w: 10, h: 10 })])]);
+			await transformB([userMsg([imgRef("ref_b", { x: 1, y: 1, w: 10, h: 10 })])]);
+			expect(flask.calls).toBe(2);
+			invalidateRegionLru("a.svs");
+			await transformA([userMsg([imgRef("ref_a", { x: 1, y: 1, w: 10, h: 10 })])]);
+			expect(flask.calls).toBe(3); // a.svs miss
+			await transformB([userMsg([imgRef("ref_b", { x: 1, y: 1, w: 10, h: 10 })])]);
+			expect(flask.calls).toBe(3); // b.svs still cached
+		});
+	});
+
+	// ------------------------------------------------------------------------- //
+	// Phase 1: AbortSignal passthrough (§13) + in-flight coalescing (§12.1)
+	// ------------------------------------------------------------------------- //
+	describe("AbortSignal (§13)", () => {
+		it("does not start queued tasks once the signal is aborted", async () => {
+			const flask = makeFlask({ delayMs: 50 });
+			const transform = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ visual_working_set_max: 6, region_materialize_concurrency: 1 }),
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			// 3 refs, concurrency 1 → only 1 in flight; abort mid-way should stop the rest.
+			const ac = new AbortController();
+			const msgs: AgentMessage[] = [
+				userMsg([imgRef("ref_a", { x: 1, y: 1, w: 10, h: 10 })]),
+				userMsg([imgRef("ref_b", { x: 2, y: 2, w: 10, h: 10 })]),
+				userMsg([imgRef("ref_c", { x: 3, y: 3, w: 10, h: 10 })]),
+			];
+			const p = transform(msgs, ac.signal);
+			// Let the first task start, then abort.
+			await new Promise<void>((r) => setTimeout(r, 10));
+			ac.abort();
+			const out = await p;
+			// The first call started; the remaining queued tasks did NOT start.
+			expect(flask.calls).toBeLessThanOrEqual(1);
+			expect(hasNoImageRefBlocks(out)).toBe(true);
+			expect(countImageBlocks(out)).toBeLessThanOrEqual(1);
+		});
+
+		it("aborts an in-flight fetch when the signal fires", async () => {
+			// blockUntil lets us hold the fetch in-flight until we abort.
+			let unblock: () => void = () => {};
+			const blocker = new Promise<void>((r) => {
+				unblock = r;
+			});
+			const flask = makeFlask({ blockUntil: blocker });
+			const transform = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ visual_working_set_max: 6 }),
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			const ac = new AbortController();
+			const msgs: AgentMessage[] = [userMsg([imgRef("ref_a", { x: 1, y: 1, w: 10, h: 10 })])];
+			const p = transform(msgs, ac.signal);
+			// Wait for the region call to be in flight.
+			await new Promise<void>((r) => setTimeout(r, 10));
+			expect(flask.calls).toBe(1);
+			// The signal passed to flask.region is the in-flight controller's signal
+			// (external signal is merged into it via the flask client). Aborting the
+			// external signal must propagate: the merged controller becomes aborted.
+			const fetchSig = flask.invocations[0]?.signal;
+			expect(fetchSig?.aborted).toBe(false);
+			ac.abort();
+			// Unblock so the mock observes the abort and rejects.
+			unblock();
+			const out = await p;
+			// Aborted fetch → degrade text (not a throw).
+			expect(hasNoImageRefBlocks(out)).toBe(true);
+			expect(countImageBlocks(out)).toBe(0);
+		});
+
+		it("two subscribers: one cancels without aborting the other's fetch", async () => {
+			// Two concurrent transforms for the SAME spec coalesce to one fetch.
+			let unblock: () => void = () => {};
+			const blocker = new Promise<void>((r) => {
+				unblock = r;
+			});
+			const flask = makeFlask({ blockUntil: blocker });
+			const settings = resolveTransformSettings({ visual_working_set_max: 6 });
+			const tA = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings,
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			const tB = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings,
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			const acA = new AbortController();
+			const acB = new AbortController();
+			const src = { x: 1, y: 1, w: 10, h: 10 };
+			const msgsA: AgentMessage[] = [userMsg([imgRef("ref_a", src)])];
+			const msgsB: AgentMessage[] = [userMsg([imgRef("ref_b", src)])];
+			const pA = tA(msgsA, acA.signal);
+			const pB = tB(msgsB, acB.signal);
+			// Both subscribe to the same in-flight fetch.
+			await new Promise<void>((r) => setTimeout(r, 10));
+			expect(flask.calls).toBe(1); // coalesced into one fetch
+			// A cancels alone → B's fetch must continue.
+			acA.abort();
+			await new Promise<void>((r) => setTimeout(r, 10));
+			// Unblock so the shared fetch resolves.
+			unblock();
+			const [outA, outB] = await Promise.all([pA, pB]);
+			void outA;
+			// B should still have its image (fetch not aborted by A's cancel).
+			expect(countImageBlocks(outB)).toBe(1);
+		});
+
+		it("last subscriber canceling aborts the underlying fetch", async () => {
+			let unblock: () => void = () => {};
+			const blocker = new Promise<void>((r) => {
+				unblock = r;
+			});
+			const flask = makeFlask({ blockUntil: blocker });
+			const settings = resolveTransformSettings({ visual_working_set_max: 6 });
+			const tA = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings,
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			const acA = new AbortController();
+			const src = { x: 1, y: 1, w: 10, h: 10 };
+			const msgsA: AgentMessage[] = [userMsg([imgRef("ref_a", src)])];
+			const pA = tA(msgsA, acA.signal);
+			await new Promise<void>((r) => setTimeout(r, 10));
+			expect(flask.calls).toBe(1);
+			acA.abort(); // sole subscriber → underlying fetch aborts
+			unblock();
+			const outA = await pA;
+			expect(countImageBlocks(outA)).toBe(0); // degraded to text
+		});
+	});
+
+	// ------------------------------------------------------------------------- //
+	// Phase 1: pending snapshot priority (§15.1)
+	// ------------------------------------------------------------------------- //
+	describe("pending snapshot priority (§15.1)", () => {
+		it("keeps the pending snapshot even when it would be evicted by recency", async () => {
+			clearRegionLru();
+			const flask = makeFlask();
+			const transform = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ visual_working_set_max: 2 }),
+				firstSnapshotToolCallIdRef: { value: "snap-0" },
+				pendingSnapshotIdRef: { value: "snap-pending" },
+			});
+			// 4 ordinary snapshots + the pending one (snap-pending) is the OLDEST
+			// by message order. With keep_recent=2, snap-pending would be evicted
+			// by recency alone, but pending priority keeps it.
+			const msgs: AgentMessage[] = [
+				toolResultMsg("snap-pending", [imgRef("ref_snap-pending", { x: 1, y: 1, w: 10, h: 10 })], 1),
+				toolResultMsg("s2", [imgRef("ref_s2", { x: 2, y: 2, w: 10, h: 10 })], 2),
+				toolResultMsg("s3", [imgRef("ref_s3", { x: 3, y: 3, w: 10, h: 10 })], 3),
+				toolResultMsg("s4", [imgRef("ref_s4", { x: 4, y: 4, w: 10, h: 10 })], 4),
+			];
+			const out = await transform(msgs);
+			// pending (snap-pending) + last 2 ordinary (s3, s4) = 3 images.
+			expect(countImageBlocks(out)).toBe(3);
+			const first = out[0] as { content: Array<{ type: string }> };
+			expect(first.content.some((b) => b.type === "image")).toBe(true);
+		});
+
+		it("pending snapshot gets the detail tier (current high-power image)", async () => {
+			clearRegionLru();
+			const flask = makeFlask();
+			const transform = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ visual_working_set_max: 6 }),
+				firstSnapshotToolCallIdRef: { value: "snap-0" },
+				pendingSnapshotIdRef: { value: "snap-pending" },
+			});
+			const msgs: AgentMessage[] = [
+				toolResultMsg("snap-pending", [imgRef("ref_snap-pending", { x: 1, y: 1, w: 10, h: 10 })], 1),
+				toolResultMsg("s2", [imgRef("ref_s2", { x: 2, y: 2, w: 10, h: 10 })], 2),
+			];
+			await transform(msgs);
+			// s2 is newest ordinary → detail; snap-pending also detail.
+			const pendingArgs = flask.lastArgs.find((a) => (a.x as number) === 1);
+			expect(pendingArgs?.max_long_edge).toBe(1280);
 		});
 	});
 });

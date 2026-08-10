@@ -1665,7 +1665,8 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp):
 def internal_ai_region():
     """sidecar 取 level-0 区域图（含青色坐标刻度尺）。
 
-    body: {slide, x, y, w, h, out_w?, out_h?}（level-0 整数）。
+    body: {slide, x, y, w, h, out_w?, out_h?, expected_fingerprint?}（level-0 整数）。
+    expected_fingerprint 为可选字符串：若非空且与当前切片指纹不一致，返回 409。
     返回 {image_base64, mime, width, height, src, magnification}（与
     /api/slide/<name>/region 响应同构）。
     """
@@ -1696,6 +1697,11 @@ def internal_ai_region():
     out_h = _parse_int("out_h")
 
     safe = _safe_name(slide)
+    expected_fp = body.get("expected_fingerprint")
+    if isinstance(expected_fp, str) and expected_fp:
+        fp = _slide_fingerprint(safe)
+        if fp != expected_fp:
+            return jsonify(error="切片指纹不匹配（文件已变更）"), 409
     entry = _get_slide(safe)
     with slide_cache.borrow_pair(entry) as pair:
         osr = pair["osr"]

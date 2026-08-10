@@ -14,9 +14,10 @@
  * that:
  *   - presents each message as a `MessageEntry` (parent chain = linear), and
  *   - materializes the most recent previous compaction as a single
- *     `CompactionEntry` (with `summary` + `retainedTail`) at the front, so pi's
- *     `prepareCompaction` can (a) pick up `previousSummary` for incremental
- *     updates, and (b) virtually unroll the retained tail.
+ *     `CompactionEntry` (with `summary` + empty `retainedTail`) at the front,
+ *     so pi's `prepareCompaction` can pick up `previousSummary` for incremental
+ *     updates. The retained tail is left empty because those messages already
+ *     live in the flat `messages` list (re-injecting them would double-count).
  *
  * We chose the flat-linear adapter (Option A) over re-running pi's full
  * SessionManager because:
@@ -62,7 +63,13 @@ import type { Api, Model, Models } from "@earendil-works/pi-ai";
 import { createCompactionSummaryMessage } from "@earendil-works/pi-agent-core";
 
 import type { FlaskClient } from "./flask-client.js";
-import type { PersistedAgentMessage, SessionData, SessionStore } from "./session-store.js";
+import {
+	collectImageMeta,
+	dehydrateMessages,
+	type PersistedAgentMessage,
+	type SessionData,
+	type SessionStore,
+} from "./session-store.js";
 
 // =========================================================================== //
 // Public config
@@ -112,20 +119,20 @@ function nextEntryId(): string {
  * Build a flat-linear pi `Entry[]` from our message list, optionally prefixed
  * by a synthesized previous-compaction entry.
  *
- * The previous-compaction entry, when supplied, carries the last summary + the
- * retained-tail messages from that compaction. pi's `prepareCompaction` will
- * unroll the retained tail as virtual message entries and feed everything after
- * it to the summarizer, passing `summary` as `previousSummary` for an
- * incremental update.
+ * The previous-compaction entry, when supplied, carries the last summary (and
+ * `tokensBefore`) so pi's `prepareCompaction` can pass `summary` as
+ * `previousSummary` for an incremental update. Its `retainedTail` is always
+ * empty: after a compaction, `messages` is already
+ * `[compactionSummary, ...retainedTail, ...new]`, so re-injecting the prior
+ * retained tail onto the CompactionEntry would double-count those messages
+ * when prepareCompaction virtually unrolls them.
  *
  * @param prevSummary   summary text from the prior compaction (undefined if none)
- * @param prevRetained  retained-tail messages kept by the prior compaction
  * @param prevTokensBefore tokensBefore recorded for the prior compaction
  */
 export function toEntries(
 	messages: AgentMessage[],
 	prevSummary?: string,
-	prevRetained?: AgentMessage[],
 	prevTokensBefore?: number,
 ): Entry[] {
 	const entries: Entry[] = [];
@@ -139,7 +146,8 @@ export function toEntries(
 			seq: 0,
 			timestamp: Date.now(),
 			summary: prevSummary,
-			retainedTail: prevRetained ?? [],
+			// Empty on purpose: retained-tail messages are already in `messages`.
+			retainedTail: [],
 			tokensBefore: prevTokensBefore ?? 0,
 		};
 		entries.push(ce);
@@ -250,13 +258,12 @@ export async function runCompaction(args: {
 	models: Models;
 	model: Model<Api>;
 	prevSummary?: string;
-	prevRetainedTail?: AgentMessage[];
 	prevTokensBefore?: number;
 	signal?: AbortSignal;
 }): Promise<CompactionOutcome | null> {
 	const { messages, settings, models, model } = args;
 
-	const entries = toEntries(messages, args.prevSummary, args.prevRetainedTail, args.prevTokensBefore);
+	const entries = toEntries(messages, args.prevSummary, args.prevTokensBefore);
 	const preparationResult = prepareCompaction(entries, settings.settings);
 	const preparation: CompactionPreparation | undefined = preparationResult.ok ? preparationResult.value : undefined;
 	if (!preparation) return null;
@@ -354,6 +361,12 @@ export async function persistCompaction(
 ): Promise<void> {
 	await store.withLock(sessionId, async (d) => {
 		if (!d) return null;
+		// Dehydrate with real ImageMeta from toolResult.details (or existing
+		// image_ref), so retained_tail keeps recoverable src/fingerprint.
+		const imageMeta = collectImageMeta([
+			...(outcome.retainedTail as PersistedAgentMessage[]),
+			...(newMessages as PersistedAgentMessage[]),
+		]);
 		const entry: PersistedCompactionEntry = {
 			seq: (d.last_event_seq || 0) + 1,
 			tokens_before: outcome.tokensBefore,
@@ -363,10 +376,10 @@ export async function persistCompaction(
 			summary: outcome.summary,
 			// Persist the retained tail in dehydrated form. The summary message is
 			// already at the head of newMessages, so we only need the tail.
-			retained_tail: outcome.retainedTail as unknown as PersistedAgentMessage[],
+			retained_tail: dehydrateMessages(outcome.retainedTail, imageMeta),
 		};
 		d.compaction_entries = [...(d.compaction_entries || []), entry as unknown as (typeof d.compaction_entries)[number]];
-		d.messages = newMessages as unknown as PersistedAgentMessage[];
+		d.messages = dehydrateMessages(newMessages, imageMeta);
 		d.updated_at = Math.floor(Date.now() / 1000);
 		await store.writeSession(sessionId, d);
 		return d;

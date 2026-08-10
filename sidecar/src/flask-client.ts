@@ -198,6 +198,8 @@ export class FlaskClient {
 		h: number;
 		out_w?: number;
 		out_h?: number;
+		/** Optional client-side fingerprint; Flask may reject on mismatch. */
+		expected_fingerprint?: string;
 	}): Promise<RegionResult> {
 		return this.request<RegionResult>("POST", "/internal/ai/region", { body: args });
 	}

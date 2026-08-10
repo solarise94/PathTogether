@@ -44,15 +44,15 @@ import {
 } from "./tools.js";
 import {
 	SessionConflict,
+	collectImageMeta,
 	dehydrateMessages,
-	type ImageMeta,
 	type PersistedAgentMessage,
 	type SessionData,
 	type SessionStore,
 } from "./session-store.js";
 // Re-export so server.ts can catch it uniformly alongside RootAnnotationGone.
 export { SessionConflict };
-import type { FlaskClient, RegionResult, RoiDict } from "./flask-client.js";
+import { FlaskHttpError, type FlaskClient, type RegionResult, type RoiDict } from "./flask-client.js";
 import { SessionEventBus } from "./events.js";
 import {
 	buildSpotIndexMessage,
@@ -64,6 +64,7 @@ import {
 	type ResolvedCompactionSettings,
 } from "./compaction.js";
 import {
+	invalidateRegionLru,
 	makeTransformContext,
 	resolveTransformSettings,
 } from "./transform-context.js";
@@ -642,6 +643,9 @@ export class AgentRunner {
 				}
 				void this.bus.emit(sessionId, type, payload);
 			},
+			onFingerprintMismatch: () => {
+				this.invalidateSlideCaches(slide);
+			},
 			cfg: config as unknown as Record<string, unknown>,
 		};
 		const tools = kind === "fork" ? [] : createTools(toolCtx);
@@ -675,7 +679,6 @@ export class AgentRunner {
 				models: (this.overrides.compactionModels as never) ?? models,
 				model,
 				prevSummary: prev.summary,
-				prevRetainedTail: prev.retainedTail,
 				prevTokensBefore: prev.tokensBefore,
 			});
 			if (!outcome) return null;
@@ -959,7 +962,7 @@ export class AgentRunner {
 	private async settleRun(sessionId: string, runState: RunState, agent: Agent): Promise<void> {
 		// Persist the agent's transcript, dehydrating image blocks.
 		const msgs = agent.state.messages as unknown as PersistedAgentMessage[];
-		const imageMeta = this.collectImageMeta(msgs);
+		const imageMeta = collectImageMeta(msgs);
 		const dehydrated = dehydrateMessages(msgs, imageMeta);
 
 		let nextStatus: "finished" | "error" | "paused";
@@ -1000,29 +1003,6 @@ export class AgentRunner {
 	private async isSnapshotPending(sessionId: string): Promise<boolean> {
 		const d = await this.store.readSession(sessionId);
 		return !!d?.pending_snapshot_review;
-	}
-
-	/**
-	 * Build a dehydrate imageMeta map keyed by toolCallId so settleRun can
-	 * replace image blocks with image_ref placeholders. For tool results we
-	 * read the snapshot details the snapshot tool stored in result.details.
-	 */
-	private collectImageMeta(msgs: PersistedAgentMessage[]): Record<string, ImageMeta> {
-		const out: Record<string, ImageMeta> = {};
-		for (const m of msgs) {
-			if ((m as { role?: string }).role !== "toolResult") continue;
-			const tr = m as { toolCallId: string; details?: { src?: { x: number; y: number; w: number; h: number }; magnification?: string; slide_fingerprint?: string } };
-			if (tr.details && tr.details.src) {
-				out[tr.toolCallId] = {
-					toolCallId: tr.toolCallId,
-					slide_fingerprint: tr.details.slide_fingerprint || "",
-					src: tr.details.src,
-					magnification: tr.details.magnification || "",
-					summary: "(本次会话内抓取的快照)",
-				};
-			}
-		}
-		return out;
 	}
 
 	// =========================================================================== //
@@ -1293,11 +1273,21 @@ export class AgentRunner {
 	// Helpers: slide info, spot lookup, fork image, archive, fork limit
 	// =========================================================================== //
 
-	/** Cached slide info fetcher. */
-	private slideInfoCache = new Map<string, SlideInfo>();
+	/** Cached slide info fetcher (TTL 60s). */
+	private slideInfoCache = new Map<string, { info: SlideInfo; fetchedAt: number }>();
+	private static readonly SLIDE_INFO_TTL_MS = 60_000;
+
+	/** Drop cached slide geometry/fingerprint and region LRU for a slide. */
+	invalidateSlideCaches(slide: string): void {
+		this.slideInfoCache.delete(slide);
+		invalidateRegionLru(slide);
+	}
+
 	private async fetchSlideInfo(slide: string): Promise<SlideInfo> {
 		const cached = this.slideInfoCache.get(slide);
-		if (cached) return cached;
+		if (cached && Date.now() - cached.fetchedAt < AgentRunner.SLIDE_INFO_TTL_MS) {
+			return cached.info;
+		}
 		const r = await this.flask.slideInfo(slide);
 		const info: SlideInfo = {
 			width: r.width,
@@ -1306,7 +1296,11 @@ export class AgentRunner {
 			mpp: r.mpp == null ? null : r.mpp,
 			fingerprint: r.fingerprint || "",
 		};
-		this.slideInfoCache.set(slide, info);
+		const prev = this.slideInfoCache.get(slide);
+		if (prev && prev.info.fingerprint && prev.info.fingerprint !== info.fingerprint) {
+			invalidateRegionLru(slide);
+		}
+		this.slideInfoCache.set(slide, { info, fetchedAt: Date.now() });
 		return info;
 	}
 
@@ -1357,10 +1351,22 @@ export class AgentRunner {
 		let b64 = "";
 		let mag: string | null = null;
 		try {
-			const r: RegionResult = await this.flask.region({ slide, x: ex, y: ey, w: ew, h: eh, out_w: 1568, out_h: 1568 });
+			const r: RegionResult = await this.flask.region({
+				slide,
+				x: ex,
+				y: ey,
+				w: ew,
+				h: eh,
+				out_w: 1568,
+				out_h: 1568,
+				expected_fingerprint: info.fingerprint || undefined,
+			});
 			b64 = r.image_base64 || "";
 			mag = (r.magnification == null ? null : String(r.magnification)) || null;
-		} catch {
+		} catch (e) {
+			if (e instanceof FlaskHttpError && e.status === 409) {
+				this.invalidateSlideCaches(slide);
+			}
 			b64 = "";
 		}
 

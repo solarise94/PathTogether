@@ -37,10 +37,11 @@ const slideInfo = {
 
 /** In-memory FlaskClient mock: records calls, returns canned data. */
 interface MockFlask {
-	regionCalls: Array<{ x: number; y: number; w: number; h: number; out_w?: number; out_h?: number }>;
+	regionCalls: Array<{ x: number; y: number; w: number; h: number; out_w?: number; out_h?: number; expected_fingerprint?: string }>;
 	annotateCalls: Array<{ label: string; x: number; y: number; side_px: number; note?: string; effect_key?: string; session_id?: string }>;
 	annotateResult: RoiDict;
 	regionResult?: Partial<RegionResult>;
+	regionError?: Error;
 }
 function makeMockFlask(): MockFlask & Pick<FlaskClient, "region" | "annotate" | "spots" | "slideInfo"> {
 	const state: MockFlask = {
@@ -70,8 +71,9 @@ function makeMockFlask(): MockFlask & Pick<FlaskClient, "region" | "annotate" | 
 	// getter/setter on the shared `state`.
 	const obj = {
 		...state,
-		async region(args: { x: number; y: number; w: number; h: number; out_w?: number; out_h?: number }) {
+		async region(args: { x: number; y: number; w: number; h: number; out_w?: number; out_h?: number; expected_fingerprint?: string }) {
 			state.regionCalls.push({ ...args });
+			if (state.regionError) throw state.regionError;
 			const r: RegionResult = {
 				image_base64: state.regionResult?.image_base64 ?? "AAAA",
 				mime: state.regionResult?.mime ?? "image/jpeg",
@@ -100,6 +102,14 @@ function makeMockFlask(): MockFlask & Pick<FlaskClient, "region" | "annotate" | 
 		},
 		set(v: Partial<RegionResult> | undefined) {
 			state.regionResult = v;
+		},
+	});
+	Object.defineProperty(obj, "regionError", {
+		get() {
+			return state.regionError;
+		},
+		set(v: Error | undefined) {
+			state.regionError = v;
 		},
 	});
 	return obj as MockFlask & Pick<FlaskClient, "region" | "annotate" | "spots" | "slideInfo">;
@@ -302,6 +312,27 @@ describe("snapshot (ai_agent.py L816-875)", () => {
 		const snap2 = await tool(h, "snapshot").execute("snap2", {});
 		expect(h.mock.regionCalls[1]?.out_w).toBe(1024);
 		expect(h.mock.regionCalls[1]?.out_h).toBe(1024);
+	});
+
+	it("passes expected_fingerprint from slideInfo to flask.region", async () => {
+		const h = await makeHarness();
+		await tool(h, "goto").execute("tc1", { x: 5000, y: 4000, level: 0 });
+		await tool(h, "snapshot").execute("snap1", {});
+		expect(h.mock.regionCalls[0]).toMatchObject({ expected_fingerprint: FINGERPRINT });
+	});
+
+	it("on 409 fingerprint mismatch clears caches via onFingerprintMismatch", async () => {
+		const h = await makeHarness();
+		let cleared = 0;
+		h.ctx.onFingerprintMismatch = () => {
+			cleared += 1;
+		};
+		const { FlaskHttpError } = await import("../src/flask-client.js");
+		h.mock.regionError = new FlaskHttpError(409, { error: "切片指纹不匹配（文件已变更）" });
+		await tool(h, "goto").execute("tc1", { x: 5000, y: 4000, level: 0 });
+		const r = await tool(h, "snapshot").execute("snap1", {});
+		expect(resultText(r)).toContain("切片文件已变更");
+		expect(cleared).toBe(1);
 	});
 
 	it("emits snapshot_captured and sets pending_snapshot_review", async () => {

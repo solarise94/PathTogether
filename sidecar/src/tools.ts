@@ -21,7 +21,7 @@ import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 
 import type { SessionStore, SessionData, PendingSnapshotReview } from "./session-store.js";
-import type { FlaskClient, RegionResult, RoiDict } from "./flask-client.js";
+import { FlaskHttpError, type FlaskClient, type RegionResult, type RoiDict } from "./flask-client.js";
 
 // =========================================================================== //
 // Constants (ai_agent.py:33)
@@ -230,6 +230,11 @@ export interface ToolContext {
 	flask: FlaskClient;
 	/** Emit a trajectory event (tool_started, snapshot_captured, ...). */
 	emit: EmitFn;
+	/**
+	 * Called when Flask returns 409 (slide fingerprint mismatch). Clears
+	 * slideInfo / region LRU so the next fetch does not reuse stale geometry.
+	 */
+	onFingerprintMismatch?: () => void;
 	cfg: {
 		max_steps?: number;
 		[k: string]: unknown;
@@ -513,8 +518,13 @@ export function createTools(ctx: ToolContext): AgentTool<any, any>[] {
 					h: bb.h,
 					out_w: ow,
 					out_h: oh,
+					expected_fingerprint: slideInfo.fingerprint || undefined,
 				});
 			} catch (e) {
+				if (e instanceof FlaskHttpError && e.status === 409) {
+					ctx.onFingerprintMismatch?.();
+					return okText("切片文件已变更，请重新开始本次分析。");
+				}
 				return okText(`抓取快照失败：${(e as Error).message || e}`);
 			}
 
@@ -524,6 +534,7 @@ export function createTools(ctx: ToolContext): AgentTool<any, any>[] {
 
 			// Emit snapshot_captured (ai_agent.py:836).
 			await ctx.emit("snapshot_captured", {
+				snapshot_id: toolCallId,
 				bboxLevel0: src,
 				magnification: mag,
 				out_w: r.width,

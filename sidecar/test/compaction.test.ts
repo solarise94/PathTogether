@@ -133,11 +133,13 @@ describe("compaction", () => {
 
 		it("prefixes a synthesized CompactionEntry when prevSummary is given", () => {
 			const msgs = [userMsg("a")];
-			const entries = toEntries(msgs, "old summary", [userMsg("tail")], 500);
+			const entries = toEntries(msgs, "old summary", 500);
 			expect(entries.length).toBe(2);
 			expect(entries[0]!.type).toBe("compaction");
 			expect((entries[0] as { summary: string }).summary).toBe("old summary");
-			expect((entries[0] as { retainedTail: unknown[] }).retainedTail.length).toBe(1);
+			// retainedTail stays empty — messages already contain the prior tail.
+			expect((entries[0] as { retainedTail: unknown[] }).retainedTail.length).toBe(0);
+			expect((entries[0] as { tokensBefore: number }).tokensBefore).toBe(500);
 			// The message follows the compaction entry.
 			expect(entries[1]!.parentId).toBe(entries[0]!.id);
 		});
@@ -207,27 +209,34 @@ describe("compaction", () => {
 		it("passes previousSummary for an incremental update on the second compaction", async () => {
 			const calls = { count: 0 };
 			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 100, keep_recent_tokens: 20 });
-			const first: CompactionOutcome = {
-				messages: [],
-				tokensBefore: 100,
-				tokensAfter: 10,
+			// Realistic agent state after first compaction: summary + retained tail + new turns.
+			// toEntries must NOT re-inject retainedTail into CompactionEntry (would double-count).
+			const summaryMsg = {
+				role: "compactionSummary",
 				summary: "PREV-SUMMARY",
-				retainedTail: [userMsg("kept tail")],
-			};
+				tokensBefore: 100,
+				timestamp: 1,
+			} as unknown as AgentMessage;
+			const retained = [userMsg("kept tail", 2)];
 			const msgs: AgentMessage[] = [
+				summaryMsg,
+				...retained,
 				userMsg("new turn " + "y".repeat(800), 10),
 				assistantMsg("resp " + "z".repeat(800), usage(500, 100), 11),
 				userMsg("latest", 12),
 			];
-			// Capture the prompt the summarizer received to assert previousSummary
-			// was threaded into the prompt text.
+			// Adapter: CompactionEntry.retainedTail empty; messages carry the prior tail once.
+			const entries = toEntries(msgs, "PREV-SUMMARY", 100);
+			expect(entries[0]!.type).toBe("compaction");
+			expect((entries[0] as { retainedTail: unknown[] }).retainedTail.length).toBe(0);
+			const messageEntries = entries.filter((e) => e.type === "message");
+			expect(messageEntries.length).toBe(retained.length + 3); // no duplicated tail
+
 			let capturedPrompt = "";
 			const inspecting = {
 				completeSimple: async (_m: Model<Api>, ctx: { messages?: Array<{ content?: Array<{ type: string; text?: string }> }> }) => {
 					calls.count += 1;
 					const c = ctx.messages?.[0]?.content?.[0]?.text || "";
-					// Capture the prompt that carries <previous-summary>; ignore the
-					// turn-prefix summary call (a different prompt template).
 					if (c.includes("<previous-summary>")) capturedPrompt = c;
 					return {
 						role: "assistant",
@@ -246,17 +255,48 @@ describe("compaction", () => {
 				settings,
 				models: inspecting as never,
 				model: MODEL,
-				prevSummary: first.summary,
-				prevRetainedTail: first.retainedTail,
-				prevTokensBefore: first.tokensBefore,
+				prevSummary: "PREV-SUMMARY",
+				prevTokensBefore: 100,
 			});
 			expect(outcome).not.toBeNull();
-			// At least one summarizer call happened.
 			expect(calls.count).toBeGreaterThanOrEqual(1);
-			// The history-update prompt template references <previous-summary>
-			// and embeds the previous summary text.
 			expect(capturedPrompt).toContain("<previous-summary>");
 			expect(capturedPrompt).toContain("PREV-SUMMARY");
+		});
+
+		it("runs two consecutive compactions without duplicating retained tail in the adapter", async () => {
+			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 100, keep_recent_tokens: 20 });
+			const models1 = makeFakeModels({ summary: "SUMMARY-1" });
+			const firstMsgs: AgentMessage[] = [
+				userMsg("long history line " + "y".repeat(800), 1),
+				assistantMsg("response " + "z".repeat(800), usage(500, 100), 2),
+				userMsg("recent question", 3),
+			];
+			const first = await runCompaction({ messages: firstMsgs, settings, models: models1 as never, model: MODEL });
+			expect(first).not.toBeNull();
+			const f = first as CompactionOutcome;
+
+			// Grow past threshold again on top of post-compaction state.
+			const secondMsgs: AgentMessage[] = [
+				...f.messages,
+				userMsg("more history " + "y".repeat(800), 20),
+				assistantMsg("more resp " + "z".repeat(800), usage(500, 100), 21),
+				userMsg("newest", 22),
+			];
+			const entries = toEntries(secondMsgs, f.summary, f.tokensBefore);
+			expect((entries[0] as { retainedTail: unknown[] }).retainedTail.length).toBe(0);
+			const models2 = makeFakeModels({ summary: "SUMMARY-2" });
+			const second = await runCompaction({
+				messages: secondMsgs,
+				settings,
+				models: models2 as never,
+				model: MODEL,
+				prevSummary: f.summary,
+				prevTokensBefore: f.tokensBefore,
+			});
+			expect(second).not.toBeNull();
+			expect((second as CompactionOutcome).summary).toContain("SUMMARY-2");
+			expect(((second as CompactionOutcome).messages[0] as { role: string }).role).toBe("compactionSummary");
 		});
 
 		it("returns null when the summarizer fails (non-fatal; caller keeps going)", async () => {
@@ -338,6 +378,52 @@ describe("compaction", () => {
 			expect(prev.summary).toBe("THE-SUMMARY");
 			expect(prev.tokensBefore).toBe(1234);
 			expect(prev.retainedTail.length).toBe(1);
+		});
+
+		it("dehydrates image.data out of retained_tail and messages before write", async () => {
+			const store = await newStore();
+			await store.ensureDir();
+			const data = await store.createSession({ slide: "s", kind: "main" });
+			const sid = data.id;
+			const hotTail = [
+				{
+					role: "toolResult",
+					toolCallId: "tc_hot",
+					content: [{ type: "image", data: "QUJDREVGR0g=", mimeType: "image/jpeg" }],
+					details: {
+						src: { x: 10, y: 20, w: 100, h: 80 },
+						slide_fingerprint: "fp-hot",
+						magnification: "20x",
+					},
+					timestamp: 1,
+				} as unknown as AgentMessage,
+			];
+			const outcome: CompactionOutcome = {
+				messages: [],
+				tokensBefore: 10,
+				tokensAfter: 5,
+				summary: "S",
+				retainedTail: hotTail,
+			};
+			const newMessages = [
+				{ role: "compactionSummary", summary: "S", tokensBefore: 10, timestamp: 1 } as unknown as AgentMessage,
+				...hotTail,
+			];
+			await persistCompaction(store, sid, outcome, newMessages);
+			const after = await store.readSession(sid);
+			const storedTail = (after!.compaction_entries[0] as { retained_tail?: Array<{ content?: unknown[] }> }).retained_tail || [];
+			const raw = JSON.stringify(after);
+			expect(raw).not.toContain("QUJDREVGR0g=");
+			expect(storedTail[0]?.content?.some((b) => (b as { type?: string }).type === "image_ref")).toBe(true);
+			expect(storedTail[0]?.content?.some((b) => (b as { type?: string }).type === "image")).toBe(false);
+			const ref = storedTail[0]?.content?.find((b) => (b as { type?: string }).type === "image_ref") as {
+				slide_fingerprint?: string;
+				src?: { x: number; y: number; w: number; h: number };
+				magnification?: string;
+			};
+			expect(ref.slide_fingerprint).toBe("fp-hot");
+			expect(ref.src).toEqual({ x: 10, y: 20, w: 100, h: 80 });
+			expect(ref.magnification).toBe("20x");
 		});
 	});
 });

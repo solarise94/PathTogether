@@ -2,7 +2,7 @@
  * Tests for src/transform-context.ts (Step 4): image_ref materialization,
  * image eviction, fingerprint-mismatch degradation, and the no-throw contract.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, beforeEach } from "vitest";
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
@@ -11,6 +11,7 @@ import {
 	resolveTransformSettings,
 	countImageBlocks,
 	hasNoImageRefBlocks,
+	clearRegionLru,
 } from "../src/transform-context.js";
 import type { FlaskClient, RegionResult } from "../src/flask-client.js";
 import type { SlideInfo } from "../src/tools.js";
@@ -28,6 +29,10 @@ const SLIDE_INFO: SlideInfo = {
 	mpp: 0.5,
 	fingerprint: "fp-test",
 };
+
+beforeEach(() => {
+	clearRegionLru();
+});
 
 /** Build an image_ref block. */
 function imgRef(refId: string, src: { x: number; y: number; w: number; h: number }, fingerprint = "fp-test"): ImageRefContent {
@@ -200,6 +205,8 @@ describe("transform-context", () => {
 			const out = await transform(msgs);
 			// 6 images retained, 2 evicted to text placeholders.
 			expect(countImageBlocks(out)).toBe(6);
+			// Pre-evict: only KEEP refs call flask.region (not all 8).
+			expect(flask.calls).toBe(6);
 			// The 6 kept are the most recent (tc2..tc7); tc0, tc1 evicted.
 			const evictedTexts = (out as Array<{ content: Array<{ type: string; text?: string }> }>)
 				.flatMap((m) => m.content)
@@ -260,6 +267,27 @@ describe("transform-context", () => {
 			expect(first.content.some((b) => b.type === "image")).toBe(true);
 		});
 
+		it("protects only the FIRST >90% coverage image when firstSnapshotToolCallId is null", async () => {
+			const flask = makeFlask();
+			const transform = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ keep_recent_images: 1 }),
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			const msgs: AgentMessage[] = [
+				toolResultMsg("ov1", [imgRef("ref_ov1", { x: 0, y: 0, w: 9500, h: 8000 })], 1),
+				toolResultMsg("ov2", [imgRef("ref_ov2", { x: 0, y: 0, w: 9600, h: 8000 })], 2),
+				toolResultMsg("s3", [imgRef("ref_s3", { x: 2, y: 2, w: 100, h: 100 })], 3),
+			];
+			const out = await transform(msgs);
+			// First overview protected + last 1 non-overview (s3). Second wide image is NOT protected.
+			expect(countImageBlocks(out)).toBe(2);
+			const second = out[1] as { content: Array<{ type: string; text?: string }> };
+			expect(second.content.some((b) => b.type === "text" && b.text === "（历史快照已省略，可用 goto+snapshot 重新查看）")).toBe(true);
+		});
+
 		it("does not evict when under the cap", async () => {
 			const flask = makeFlask();
 			const transform = makeTransformContext({
@@ -278,11 +306,45 @@ describe("transform-context", () => {
 		});
 	});
 
+	describe("fingerprint", () => {
+		it("skips flask.region and degrades when slide_fingerprint mismatches slideInfo", async () => {
+			const flask = makeFlask();
+			const transform = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ keep_recent_images: 6 }),
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			const msgs: AgentMessage[] = [userMsg([imgRef("ref_a", { x: 1, y: 1, w: 10, h: 10 }, "fp-old")])];
+			const out = await transform(msgs);
+			expect(flask.calls).toBe(0);
+			expect(countImageBlocks(out)).toBe(0);
+			expect(hasNoImageRefBlocks(out)).toBe(true);
+			const c = (out[0] as { content: Array<{ type: string; text?: string }> }).content;
+			expect(c.some((b) => b.type === "text" && b.text === "该图因切片变更不可用。")).toBe(true);
+		});
+
+		it("passes expected_fingerprint to flask.region", async () => {
+			const flask = makeFlask();
+			const transform = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ keep_recent_images: 6 }),
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			await transform([userMsg([imgRef("ref_a", { x: 1, y: 1, w: 10, h: 10 })])]);
+			expect(flask.calls).toBe(1);
+			expect((flask.lastArgs[0] as { expected_fingerprint?: string }).expected_fingerprint).toBe("fp-test");
+		});
+	});
+
 	describe("contract", () => {
-		it("never rejects: returns original messages when the transform body throws", async () => {
+		it("never rejects: strips image_ref on throw instead of leaving originals", async () => {
 			// Force a top-level throw inside transformOnce by passing a slideInfo
 			// whose width getter throws — the overview-detection path touches
-			// slideInfo.width on every ref, so this throws inside the rebuild.
+			// slideInfo.width when firstSnapshotToolCallId is null.
 			const poisonInfo = {
 				get width(): number {
 					throw new Error("poison");
@@ -301,10 +363,11 @@ describe("transform-context", () => {
 				firstSnapshotToolCallIdRef: { value: null },
 			});
 			const msgs: AgentMessage[] = [userMsg([imgRef("ref_a", { x: 1, y: 1, w: 10, h: 10 })])];
-			// Must not reject; returns the original messages (total passthrough).
 			const out = await transform(msgs);
 			expect(Array.isArray(out)).toBe(true);
-			expect(out).toBe(msgs);
+			expect(hasNoImageRefBlocks(out)).toBe(true);
+			const c = (out[0] as { content: Array<{ type: string; text?: string }> }).content;
+			expect(c.some((b) => b.type === "text" && b.text === "该图因切片变更不可用。")).toBe(true);
 		});
 
 		it("is pure: does not mutate the input array", async () => {
@@ -335,6 +398,32 @@ describe("transform-context", () => {
 			const out = await transform(msgs);
 			expect((out[0] as { content: unknown }).content).toBe("plain text");
 			expect(flask.calls).toBe(0);
+		});
+
+		it("LRU keys include slide so identical bbox+fp on another slide re-fetches", async () => {
+			const flask = makeFlask();
+			const src = { x: 5, y: 5, w: 20, h: 20 };
+			const transformA = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: "a.svs",
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ keep_recent_images: 6 }),
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			const transformB = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: "b.svs",
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ keep_recent_images: 6 }),
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			await transformA([userMsg([imgRef("ref_a", src)])]);
+			expect(flask.calls).toBe(1);
+			await transformA([userMsg([imgRef("ref_a", src)])]);
+			expect(flask.calls).toBe(1); // LRU hit for a.svs
+			await transformB([userMsg([imgRef("ref_a", src)])]);
+			expect(flask.calls).toBe(2); // different slide → miss
+			expect((flask.lastArgs[1] as { slide: string }).slide).toBe("b.svs");
 		});
 	});
 

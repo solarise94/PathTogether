@@ -9,19 +9,18 @@
  * the agent state is built but BEFORE {@link AgentOptions.convertToLlm}
  * (agent-loop.ts:288-292). Our hook does two jobs there:
  *
- *   1. **Materialize (rehydrate)**: turn every persisted `image_ref` block back
- *      into a real pi `image` block by calling flask.region. Slide fingerprint
- *      mismatch or fetch failure → degrade to a text block
- *      `"该图因切片变更不可用。"` (ai_session.py:855).
- *   2. **Image eviction**: keep at most the last `keep_recent_images` (default
- *      6) materialized image blocks, PLUS the first whole-slide overview
- *      snapshot which is always retained. Older image blocks beyond the cap are
- *      replaced with the placeholder
- *      `"（历史快照已省略，可用 goto+snapshot 重新查看）"`.
+ *   1. **Pre-evict**: decide which image positions to KEEP (first overview +
+ *      last N non-overview). Evicted `image_ref`s become placeholder text
+ *      without calling flask.region.
+ *   2. **Materialize (rehydrate)**: turn KEEP `image_ref` blocks into real pi
+ *      `image` blocks via flask.region (concurrency capped at 3). Slide
+ *      fingerprint mismatch or fetch failure → degrade to
+ *      `"该图因切片变更不可用。"`.
  *
- * Contract (types.ts:183-200): the hook MUST NOT throw or reject — on any
- * error we return the original messages unchanged. It is also a pure read-only
- * transform: we never mutate `agent.state.messages` (pi semantics).
+ * Contract: the hook MUST NOT throw or reject. On any error we return a safe
+ * fallback that replaces every `image_ref` with degrade text (never leave
+ * `image_ref` in the output). Pure read-only transform: never mutate
+ * `agent.state.messages`.
  *
  * **All `image_ref` blocks are guaranteed removed from the output** — pi's
  * `defaultConvertToLlm` only filters by role, it does not rewrite content, so a
@@ -31,8 +30,18 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai";
 
 import type { FlaskClient } from "./flask-client.js";
+import { FlaskHttpError } from "./flask-client.js";
 import type { SlideInfo } from "./tools.js";
 import { isImageContent, isImageRefContent, type ImageRefContent, type PersistedAgentMessage } from "./session-store.js";
+
+const PLACEHOLDER_TEXT = "（历史快照已省略，可用 goto+snapshot 重新查看）";
+const DEGRADE_TEXT = "该图因切片变更不可用。";
+const REGION_OUT_W = 1568;
+const REGION_OUT_H = 1568;
+const REGION_FETCH_CONCURRENCY = 3;
+const REGION_LRU_MAX = 32;
+/** Soft TTL so a replaced slide cannot forever serve stale pixels via LRU. */
+const REGION_LRU_TTL_MS = 30_000;
 
 // =========================================================================== //
 // Public config
@@ -56,43 +65,175 @@ export function resolveTransformSettings(cfg: TransformContextConfig): Transform
 }
 
 // =========================================================================== //
-// Overview-image identification
+// Region LRU (module-level)
+// =========================================================================== //
+
+type RegionLruEntry = {
+	data: string;
+	mime: string;
+	cachedAt: number;
+	slide: string;
+	fingerprint: string;
+};
+
+/** Successful region fetches keyed by `slide|fingerprint|bbox|outputSize`. */
+const regionLru = new Map<string, RegionLruEntry>();
+
+function normalizeSlideKey(slide: string): string {
+	return String(slide || "").trim();
+}
+
+function regionLruKey(
+	slide: string,
+	fingerprint: string,
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	outW: number,
+	outH: number,
+): string {
+	return `${normalizeSlideKey(slide)}|${fingerprint}|${x},${y},${w},${h}|${outW}x${outH}`;
+}
+
+function regionLruGet(key: string, expectedFp: string): { data: string; mime: string } | undefined {
+	const hit = regionLru.get(key);
+	if (!hit) return undefined;
+	if (hit.fingerprint !== expectedFp || Date.now() - hit.cachedAt > REGION_LRU_TTL_MS) {
+		regionLru.delete(key);
+		return undefined;
+	}
+	// Refresh recency (Map iteration order = insertion order).
+	regionLru.delete(key);
+	regionLru.set(key, hit);
+	return { data: hit.data, mime: hit.mime };
+}
+
+function regionLruSet(
+	key: string,
+	entry: { data: string; mime: string; slide: string; fingerprint: string },
+): void {
+	if (regionLru.has(key)) regionLru.delete(key);
+	regionLru.set(key, { ...entry, cachedAt: Date.now() });
+	while (regionLru.size > REGION_LRU_MAX) {
+		const oldest = regionLru.keys().next().value;
+		if (oldest === undefined) break;
+		regionLru.delete(oldest);
+	}
+}
+
+/** Test helper: clear the materialized-region LRU. */
+export function clearRegionLru(): void {
+	regionLru.clear();
+}
+
+/**
+ * Drop LRU entries for one slide (or all when `slide` is omitted). Used when
+ * Flask reports fingerprint mismatch / slideInfo refreshes to a new fingerprint.
+ */
+export function invalidateRegionLru(slide?: string): void {
+	if (!slide) {
+		regionLru.clear();
+		return;
+	}
+	const prefix = `${normalizeSlideKey(slide)}|`;
+	for (const key of [...regionLru.keys()]) {
+		if (key.startsWith(prefix)) regionLru.delete(key);
+	}
+}
+
+// =========================================================================== //
+// Overview identification
 // =========================================================================== //
 
 /**
- * Heuristic for "this image is the whole-slide overview and must never be
- * evicted" (§3.3 first-snapshot semantics). Two signals, either suffices:
+ * Whether an image_ref is the protected first overview.
  *
- *   (a) the image's toolCallId matches the session-level first-snapshot id
- *       tracked by the agent-runner closure (most reliable — exact identity);
- *   (b) the bbox covers >90% of the slide width (mirrors the snapshot tool's
- *       own "全片概览级" hint threshold in tools.ts).
- *
- * (a) is authoritative when available; (b) is a fallback for sessions resumed
- * from disk where the first-snapshot id wasn't re-derived.
+ * Authoritative: `ref_id === "ref_${firstSnapshotToolCallId}"`.
+ * Coverage fallback (>90% of slide width): only the FIRST such image in
+ * message order when `firstSnapshotToolCallId` is null.
  */
-function isOverviewImage(
-	block: ImageContent | ImageRefContent,
+function isOverviewImageRef(
+	ref: ImageRefContent,
 	slideInfo: SlideInfo,
 	firstSnapshotToolCallId: string | null,
-): boolean {
-	// (a) identity match. For a materialized image we don't carry the toolCallId
-	// on the block; for an image_ref we have ref_id ("ref_<toolCallId>"). We
-	// also accept an overview tag carried in a sibling text block, but the
-	// primary path is the ref_id check done before materialization.
+	coverageOverviewClaimed: boolean,
+): { overview: boolean; claimCoverage: boolean } {
 	if (firstSnapshotToolCallId) {
-		const ref = block as { ref_id?: string };
-		if (typeof ref.ref_id === "string" && ref.ref_id === `ref_${firstSnapshotToolCallId}`) {
-			return true;
+		if (ref.ref_id === `ref_${firstSnapshotToolCallId}`) {
+			return { overview: true, claimCoverage: false };
 		}
+		return { overview: false, claimCoverage: false };
 	}
-	// (b) coverage fallback (only meaningful for image_ref, which carries src).
-	const src = (block as { src?: { w?: number; h?: number } }).src;
+	const src = ref.src;
 	if (src && typeof src.w === "number" && slideInfo.width > 0) {
 		const cov = (src.w / slideInfo.width) * 100;
-		if (cov > 90) return true;
+		if (cov > 90 && !coverageOverviewClaimed) {
+			return { overview: true, claimCoverage: true };
+		}
 	}
-	return false;
+	return { overview: false, claimCoverage: false };
+}
+
+/**
+ * Live `ImageContent` inside a toolResult is overview iff the parent message's
+ * toolCallId matches firstSnapshotToolCallId.
+ */
+function isOverviewLiveImage(
+	msg: AgentMessage,
+	firstSnapshotToolCallId: string | null,
+): boolean {
+	if (!firstSnapshotToolCallId) return false;
+	const role = (msg as { role?: string }).role;
+	if (role !== "toolResult") return false;
+	const toolCallId = (msg as { toolCallId?: string }).toolCallId;
+	return toolCallId === firstSnapshotToolCallId;
+}
+
+// =========================================================================== //
+// Safe fallback (no image_ref left)
+// =========================================================================== //
+
+/** Replace every image_ref with degrade text; leave other content alone. */
+function stripImageRefsToDegrade(messages: AgentMessage[]): AgentMessage[] {
+	return messages.map((m) => {
+		const role = (m as { role?: string }).role;
+		if (role !== "user" && role !== "assistant" && role !== "toolResult") {
+			return m;
+		}
+		const content = (m as { content?: unknown }).content;
+		if (!Array.isArray(content)) return m;
+		let touched = false;
+		const newContent = content.map((part): unknown => {
+			if (part && isImageRefContent(part)) {
+				touched = true;
+				return { type: "text", text: DEGRADE_TEXT };
+			}
+			return part;
+		});
+		return touched ? ({ ...(m as object), content: newContent } as AgentMessage) : m;
+	});
+}
+
+// =========================================================================== //
+// Concurrency pool
+// =========================================================================== //
+
+/** Run async tasks with a fixed concurrency limit; preserve result order. */
+async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+	const results: R[] = new Array(items.length);
+	let next = 0;
+	async function worker(): Promise<void> {
+		for (;;) {
+			const i = next++;
+			if (i >= items.length) return;
+			results[i] = await fn(items[i]!, i);
+		}
+	}
+	const n = Math.min(Math.max(1, concurrency), Math.max(1, items.length));
+	if (items.length === 0) return results;
+	await Promise.all(Array.from({ length: n }, () => worker()));
+	return results;
 }
 
 // =========================================================================== //
@@ -120,27 +261,28 @@ export function makeTransformContext(args: {
 		try {
 			return await transformOnce(messages, flask, slide, slideInfo, settings, firstSnapshotToolCallIdRef);
 		} catch {
-			// pi contract (types.ts:183-200): never throw — return originals.
-			return messages;
+			// Never leave image_ref in the output; never throw.
+			return stripImageRefsToDegrade(messages);
 		}
 	};
 }
 
+type ImgPos = {
+	msgIdx: number;
+	blkIdx: number;
+	overview: boolean;
+	kind: "ref" | "image";
+	ref?: ImageRefContent;
+};
+
 /**
- * One materialize-then-evict pass. Pure: returns a new array, leaves inputs
- * untouched.
+ * Pre-evict then materialize. Pure: returns a new array, leaves inputs untouched.
  *
- * Algorithm:
- *   1. Walk every message; for each `image_ref` block, attempt to materialize
- *      it into an `image` block (flask.region). Mismatch / failure → text
- *      fallback. Collect the *index path* (message i, block j) of every
- *      materialized image so step 2 can evict by position without re-scanning.
- *      image_ref blocks whose ref_id matches the first-snapshot id, or whose
- *      bbox covers the whole slide, are tagged as overview (protected).
- *   2. If the number of materialized images exceeds keepRecentImages, evict the
- *      oldest ones — except protected overview images — replacing them with the
- *      placeholder text. Keep the most recent `keepRecentImages` non-protected
- *      images.
+ *   1. Scan messages; collect image_ref + already-materialized image positions.
+ *   2. Mark overview (identity / first coverage fallback) and choose KEEP set
+ *      (overview + last N non-overview).
+ *   3. Materialize only KEEP image_refs (concurrency 3). Evicted refs →
+ *      placeholder text without flask.region.
  */
 async function transformOnce(
 	messages: AgentMessage[],
@@ -150,15 +292,11 @@ async function transformOnce(
 	settings: TransformContextSettings,
 	firstSnapshotToolCallIdRef: { value: string | null },
 ): Promise<AgentMessage[]> {
-	// Phase 1: materialize. First scan for all image_ref blocks and fetch them
-	// concurrently (one flask.region call each), recording each result by its
-	// (msgIdx, blkIdx) position. Then rebuild the message array with the
-	// materialized (or degraded) blocks substituted in.
-	type ImgPos = { msgIdx: number; blkIdx: number; overview: boolean };
-	const imgPositions: ImgPos[] = [];
+	const firstId = firstSnapshotToolCallIdRef.value;
+	const positions: ImgPos[] = [];
+	let coverageOverviewClaimed = false;
 
-	// Collect ref positions + kick off all fetches concurrently.
-	const refJobs: Array<{ msgIdx: number; blkIdx: number; overview: boolean; promise: ReturnType<typeof materializeRefSync> }> = [];
+	// Phase 1: scan.
 	for (let msgIdx = 0; msgIdx < messages.length; msgIdx++) {
 		const m = messages[msgIdx]!;
 		const role = (m as { role?: string }).role;
@@ -168,19 +306,44 @@ async function transformOnce(
 		for (let blkIdx = 0; blkIdx < content.length; blkIdx++) {
 			const part = content[blkIdx];
 			if (part && isImageRefContent(part)) {
-				const overview = isOverviewImage(part, slideInfo, firstSnapshotToolCallIdRef.value);
-				refJobs.push({ msgIdx, blkIdx, overview, promise: materializeRefSync(part, flask, slide) });
+				const { overview, claimCoverage } = isOverviewImageRef(part, slideInfo, firstId, coverageOverviewClaimed);
+				if (claimCoverage) coverageOverviewClaimed = true;
+				positions.push({ msgIdx, blkIdx, overview, kind: "ref", ref: part });
+			} else if (isImageContent(part)) {
+				positions.push({
+					msgIdx,
+					blkIdx,
+					overview: isOverviewLiveImage(m, firstId),
+					kind: "image",
+				});
 			}
 		}
 	}
-	const refResults = await Promise.all(refJobs.map(async (j) => ({ ...j, block: await j.promise })));
-	const refByKey = new Map<string, { block: ImageContent | { type: "text"; text: string }; overview: boolean }>();
-	for (const r of refResults) {
-		refByKey.set(`${r.msgIdx}:${r.blkIdx}`, { block: r.block, overview: r.overview });
+
+	// Phase 2: decide KEEP (overview always + last N non-overview).
+	const keepKeys = new Set<string>();
+	for (const p of positions) {
+		if (p.overview) keepKeys.add(posKey(p));
+	}
+	const evictable = positions
+		.filter((p) => !p.overview)
+		.sort((a, b) => rank(a) - rank(b)); // oldest first
+	const keepFrom = Math.max(0, evictable.length - settings.keepRecentImages);
+	for (const p of evictable.slice(keepFrom)) {
+		keepKeys.add(posKey(p));
 	}
 
-	// Rebuild messages, substituting refs + recording materialized image positions.
-	const out: AgentMessage[] = messages.map((m, msgIdx) => {
+	// Phase 3: materialize KEEP refs only (pool of 3).
+	const toMaterialize = positions.filter((p) => p.kind === "ref" && p.ref && keepKeys.has(posKey(p)));
+	const materialized = new Map<string, ImageContent | { type: "text"; text: string }>();
+	await mapPool(toMaterialize, REGION_FETCH_CONCURRENCY, async (p) => {
+		const block = await materializeRef(p.ref!, flask, slide, slideInfo);
+		materialized.set(posKey(p), block);
+		return block;
+	});
+
+	// Phase 4: rebuild messages.
+	return messages.map((m, msgIdx) => {
 		const role = (m as { role?: string }).role;
 		if (role !== "user" && role !== "assistant" && role !== "toolResult") {
 			return m;
@@ -192,112 +355,89 @@ async function transformOnce(
 		let touched = false;
 		const newContent = content.map((part, blkIdx): unknown => {
 			const key = `${msgIdx}:${blkIdx}`;
-			const ref = refByKey.get(key);
-			if (ref) {
+			if (part && isImageRefContent(part)) {
 				touched = true;
-				if (ref.block.type === "image") {
-					imgPositions.push({ msgIdx, blkIdx, overview: ref.overview });
+				if (!keepKeys.has(key)) {
+					return { type: "text", text: PLACEHOLDER_TEXT };
 				}
-				return ref.block;
+				return materialized.get(key) ?? { type: "text", text: DEGRADE_TEXT };
 			}
 			if (isImageContent(part)) {
-				// An already-materialized image (e.g. just produced this turn, not
-				// yet dehydrated). Treat it like a materialized one for eviction
-				// accounting. Pure image blocks carry no ref_id, so overview
-				// detection can't apply — these are always evictable.
-				imgPositions.push({ msgIdx, blkIdx, overview: false });
+				if (!keepKeys.has(key)) {
+					touched = true;
+					return { type: "text", text: PLACEHOLDER_TEXT };
+				}
 				return part;
 			}
 			return part;
 		});
 		return touched ? ({ ...(m as object), content: newContent } as AgentMessage) : m;
 	});
+}
 
-	// Phase 2: evict. Protected (overview) images never count against the cap.
-	// Among the rest, keep the most recent `keepRecentImages`; older ones become
-	// placeholders. "Recent" = highest (msgIdx, blkIdx) ordering.
-	const evictable = imgPositions
-		.filter((p) => !p.overview)
-		.sort((a, b) => rank(a) - rank(b)); // oldest first
-	const toEvictCount = Math.max(0, evictable.length - settings.keepRecentImages);
+function posKey(p: { msgIdx: number; blkIdx: number }): string {
+	return `${p.msgIdx}:${p.blkIdx}`;
+}
 
-	if (toEvictCount === 0) {
-		return out;
-	}
-
-	// Build a set of "msgIdx:blkIdx" keys to evict.
-	const evictKeys = new Set(evictable.slice(0, toEvictCount).map((p) => `${p.msgIdx}:${p.blkIdx}`));
-
-	// Apply evictions by walking messages again and replacing the targeted
-	// image blocks with the placeholder text.
-	const placeholderText = "（历史快照已省略，可用 goto+snapshot 重新查看）";
-	return out.map((m, msgIdx) => {
-		const role = (m as { role?: string }).role;
-		if (role !== "user" && role !== "assistant" && role !== "toolResult") {
-			return m;
-		}
-		const content = (m as { content?: unknown }).content;
-		if (typeof content === "string" || !Array.isArray(content)) {
-			return m;
-		}
-		let touched = false;
-		const newContent = content.map((part, blkIdx): unknown => {
-			if (isImageContent(part) && evictKeys.has(`${msgIdx}:${blkIdx}`)) {
-				touched = true;
-				return { type: "text", text: placeholderText };
-			}
-			return part;
-		});
-		return touched ? ({ ...(m as object), content: newContent } as AgentMessage) : m;
-	});
-
-	// Helper: lexicographic rank by (msgIdx, blkIdx); fine for our sizes.
-	function rank(p: ImgPos): number {
-		return p.msgIdx * 1_000_000 + p.blkIdx;
-	}
+function rank(p: { msgIdx: number; blkIdx: number }): number {
+	return p.msgIdx * 1_000_000 + p.blkIdx;
 }
 
 /**
- * Materialize one image_ref synchronously-ish (await flask.region). Returns
- * either an image block or a degraded text block. Never throws — callers rely
- * on the text fallback to keep the transform total.
- *
- * NOTE: despite the `Sync` name this is async; the name just signals it does
- * not coordinate across blocks (one ref → one call).
+ * Materialize one KEEP image_ref. Fingerprint mismatch / empty / failure →
+ * degrade text. Uses the module LRU; never throws.
  */
-async function materializeRefSync(
+async function materializeRef(
 	ref: ImageRefContent,
 	flask: FlaskClient,
 	slide: string,
+	slideInfo: SlideInfo,
 ): Promise<ImageContent | { type: "text"; text: string }> {
-	// Fingerprint guard (ai_session.py:1321): a mismatch means the slide file
-	// changed under us; the cached region would be wrong.
-	// We don't have the live fingerprint here (slideInfo was captured at run
-	// start), so flask.region itself enforces it server-side by reading the
-	// current file. A fetch failure is treated as "slide changed / unavailable".
+	const fp = ref.slide_fingerprint || "";
+	if (fp && fp !== (slideInfo.fingerprint || "")) {
+		return { type: "text", text: DEGRADE_TEXT };
+	}
+
 	const src = ref.src || { x: 0, y: 0, w: 0, h: 0 };
+	const x = src.x;
+	const y = src.y;
+	const w = Math.max(1, src.w);
+	const h = Math.max(1, src.h);
+	const effectiveFp = slideInfo.fingerprint || fp;
+	const cacheKey = regionLruKey(slide, effectiveFp, x, y, w, h, REGION_OUT_W, REGION_OUT_H);
+	const cached = regionLruGet(cacheKey, effectiveFp);
+	if (cached) {
+		return { type: "image", data: cached.data, mimeType: cached.mime };
+	}
+
 	try {
 		const r = await flask.region({
 			slide,
-			x: src.x,
-			y: src.y,
-			w: Math.max(1, src.w),
-			h: Math.max(1, src.h),
-			out_w: 1568,
-			out_h: 1568,
+			x,
+			y,
+			w,
+			h,
+			out_w: REGION_OUT_W,
+			out_h: REGION_OUT_H,
+			expected_fingerprint: fp || undefined,
 		});
 		const b64 = r.image_base64 || "";
 		if (!b64) {
-			return { type: "text", text: "该图因切片变更不可用。" };
+			return { type: "text", text: DEGRADE_TEXT };
 		}
-		return { type: "image", data: b64, mimeType: r.mime || "image/jpeg" };
-	} catch {
-		return { type: "text", text: "该图因切片变更不可用。" };
+		const mime = r.mime || "image/jpeg";
+		regionLruSet(cacheKey, { data: b64, mime, slide: normalizeSlideKey(slide), fingerprint: effectiveFp });
+		return { type: "image", data: b64, mimeType: mime };
+	} catch (e) {
+		if (e instanceof FlaskHttpError && e.status === 409) {
+			invalidateRegionLru(slide);
+		}
+		return { type: "text", text: DEGRADE_TEXT };
 	}
 }
 
 // =========================================================================== //
-// Test-visible helpers (not exported via the public surface)
+// Test-visible helpers
 // =========================================================================== //
 
 /**

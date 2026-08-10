@@ -993,6 +993,57 @@ export function isImageRefContent(c: unknown): c is ImageRefContent {
 	);
 }
 
+/**
+ * Build a dehydrate {@link ImageMeta} map from toolResult `details`
+ * (snapshot tool stores `src` / `slide_fingerprint` / `magnification`).
+ *
+ * Shared by settleRun and persistCompaction so retained_tail / messages do not
+ * fall back to empty fingerprint + `src={0,0,0,0}` when stripping base64.
+ */
+export function collectImageMeta(
+	msgs: AgentMessage[] | PersistedAgentMessage[],
+): Record<string, ImageMeta> {
+	const out: Record<string, ImageMeta> = {};
+	for (const m of msgs) {
+		if ((m as { role?: string }).role !== "toolResult") continue;
+		const tr = m as {
+			toolCallId: string;
+			details?: {
+				src?: { x: number; y: number; w: number; h: number };
+				magnification?: string;
+				slide_fingerprint?: string;
+			};
+			content?: unknown;
+		};
+		if (tr.details?.src) {
+			out[tr.toolCallId] = {
+				toolCallId: tr.toolCallId,
+				slide_fingerprint: tr.details.slide_fingerprint || "",
+				src: tr.details.src,
+				magnification: tr.details.magnification || "",
+				summary: "(本次会话内抓取的快照)",
+			};
+			continue;
+		}
+		// Already-dehydrated toolResult: recover meta from existing image_ref.
+		if (Array.isArray(tr.content)) {
+			for (const part of tr.content) {
+				if (isImageRefContent(part) && part.src && (part.src.w > 0 || part.src.h > 0)) {
+					out[tr.toolCallId] = {
+						toolCallId: tr.toolCallId,
+						slide_fingerprint: part.slide_fingerprint || "",
+						src: part.src,
+						magnification: part.magnification || "",
+						summary: part.summary || "(本次会话内抓取的快照)",
+					};
+					break;
+				}
+			}
+		}
+	}
+	return out;
+}
+
 function refIdFor(meta: ImageMeta, fallback: string): string {
 	// Mirror ai_session.py:1187 ref_<hex>. Prefer the tool call id so re-runs
 	// can re-attach metadata; fall back to a uuid prefix.

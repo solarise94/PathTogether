@@ -509,3 +509,187 @@ describe("makeRequestAssembler — live image eviction (Phase 1 parity)", () => 
 		expect(content.some((p) => p.type === "image")).toBe(true);
 	});
 });
+
+// =========================================================================== //
+// makeRequestAssembler — §9.1 visual budget (P2-3) + §12 eviction metric (P2-6)
+// =========================================================================== //
+
+describe("makeRequestAssembler — visual budget hard cap (§9.1, P2-3)", () => {
+	function refSnapMessages(count: number, w = 200, h = 200): PersistedAgentMessage[] {
+		const msgs: PersistedAgentMessage[] = [];
+		for (let i = 0; i < count; i++) {
+			msgs.push(assistantMsg([{ type: "toolCall", id: `tc-${i}`, name: "snapshot", arguments: {} }], i * 2 + 1));
+			msgs.push(toolResultMsg(`tc-${i}`, [imgRef(`ref_snap-${i}`, { x: i * 100, y: 0, w, h })], i * 2 + 2));
+		}
+		return msgs;
+	}
+
+	it("evicts ordinary recent images to fit a very small visual budget, keeping only non-evictable (pending) ones", async () => {
+		// Trivial checkpoint (no stable overview). Pending = tc-0 (oldest).
+		// A tiny budget forces eviction of every ordinary kept ref; pending must
+		// survive (§9.1: overview + pending are non-evictable).
+		const cp = makeTrivialCheckpoint(1);
+		const deps = makeDeps({
+			settings: resolveTransformSettings({
+				visual_working_set_max: 4,
+				// Tiny positive budget: overview (1024²/750≈1398) + pending detail
+				// (1280²/750≈2185) already exceeds this, so all ordinary refs are
+				// evicted; only pending survives.
+				visual_context_budget_tokens: 1,
+			}),
+			getSessionSnapshot: async () => ({
+				checkpoint: cp,
+				observations: [],
+				pendingSnapshotId: "snap-0",
+				messages: [],
+			}),
+		});
+		const assembler = makeRequestAssembler(deps);
+		const out = await assembler(refSnapMessages(4) as AgentMessage[]);
+		// Count surviving image blocks. Only the pending (ref_snap-0) image
+		// should remain; all ordinary refs (snap-1..3) are budget-evicted.
+		let images = 0;
+		for (const m of out) {
+			const content = (m as { content?: unknown }).content;
+			if (!Array.isArray(content)) continue;
+			for (const part of content) {
+				if ((part as { type?: string }).type === "image") images += 1;
+			}
+		}
+		expect(images).toBe(1);
+	});
+
+	it("does not evict when the budget is ample (behaviour unchanged)", async () => {
+		const cp = makeTrivialCheckpoint(1);
+		const deps = makeDeps({
+			settings: resolveTransformSettings({
+				visual_working_set_max: 4,
+				visual_context_budget_tokens: 1_000_000, // effectively unlimited
+			}),
+			getSessionSnapshot: async () => ({
+				checkpoint: cp,
+				observations: [],
+				pendingSnapshotId: null,
+				messages: [],
+			}),
+		});
+		const assembler = makeRequestAssembler(deps);
+		const out = await assembler(refSnapMessages(4) as AgentMessage[]);
+		let images = 0;
+		for (const m of out) {
+			const content = (m as { content?: unknown }).content;
+			if (!Array.isArray(content)) continue;
+			for (const part of content) {
+				if ((part as { type?: string }).type === "image") images += 1;
+			}
+		}
+		// All 4 ordinary refs fit (no pending, no overview).
+		expect(images).toBe(4);
+	});
+});
+
+describe("makeRequestAssembler — evicted_image_refs metric (§12, P2-6)", () => {
+	it("records exactly the evicted ref_ids (kept refs are NOT in the metric)", async () => {
+		// Trivial checkpoint (no overview). 6 ordinary refs, keepRecent=4 →
+		// the 2 oldest are evicted by recency. The metric must list exactly
+		// those 2; the 4 kept refs must NOT appear.
+		const cp = makeTrivialCheckpoint(1);
+		const recentMsgs: PersistedAgentMessage[] = [];
+		for (let i = 0; i < 6; i++) {
+			recentMsgs.push(assistantMsg([{ type: "toolCall", id: `tc-${i}`, name: "snapshot", arguments: {} }], i * 2 + 1));
+			recentMsgs.push(toolResultMsg(`tc-${i}`, [imgRef(`ref_snap-${i}`, { x: i * 100, y: 0, w: 200, h: 200 })], i * 2 + 2));
+		}
+		const captured: Array<{ evicted_image_refs: string[] }> = [];
+		const deps = makeDeps({
+			settings: resolveTransformSettings({ visual_working_set_max: 4, visual_context_budget_tokens: 1_000_000 }),
+			getSessionSnapshot: async () => ({
+				checkpoint: cp,
+				observations: [],
+				pendingSnapshotId: null,
+				messages: recentMsgs,
+			}),
+			metricsSink: (m) => captured.push({ evicted_image_refs: m.evicted_image_refs }),
+			overviewSrcResolver: () => null,
+		});
+		const assembler = makeRequestAssembler(deps);
+		await assembler(recentMsgs as AgentMessage[]);
+		expect(captured.length).toBe(1);
+		const evicted = captured[0]!.evicted_image_refs;
+		// The 2 oldest (snap-0, snap-1) are evicted; the 4 newest are kept.
+		expect(evicted).toEqual(expect.arrayContaining(["ref_snap-0", "ref_snap-1"]));
+		expect(evicted).toEqual(expect.not.arrayContaining(["ref_snap-2", "ref_snap-3", "ref_snap-4", "ref_snap-5"]));
+		expect(evicted.length).toBe(2);
+	});
+
+	it("includes budget-evicted refs in the metric (P2-3 + P2-6 interaction)", async () => {
+		// keepRecent=4 but a tiny budget evicts the ordinary refs on top of
+		// recency. The metric must reflect the budget evictions too.
+		const cp = makeTrivialCheckpoint(1);
+		const recentMsgs: PersistedAgentMessage[] = [];
+		for (let i = 0; i < 4; i++) {
+			recentMsgs.push(assistantMsg([{ type: "toolCall", id: `tc-${i}`, name: "snapshot", arguments: {} }], i * 2 + 1));
+			recentMsgs.push(toolResultMsg(`tc-${i}`, [imgRef(`ref_snap-${i}`, { x: i * 100, y: 0, w: 200, h: 200 })], i * 2 + 2));
+		}
+		const captured: Array<{ evicted_image_refs: string[] }> = [];
+		const deps = makeDeps({
+			settings: resolveTransformSettings({ visual_working_set_max: 4, visual_context_budget_tokens: 1 }),
+			getSessionSnapshot: async () => ({
+				checkpoint: cp,
+				observations: [],
+				pendingSnapshotId: null,
+				messages: recentMsgs,
+			}),
+			metricsSink: (m) => captured.push({ evicted_image_refs: m.evicted_image_refs }),
+			overviewSrcResolver: () => null,
+		});
+		const assembler = makeRequestAssembler(deps);
+		await assembler(recentMsgs as AgentMessage[]);
+		const evicted = captured[0]!.evicted_image_refs;
+		// All 4 ordinary refs budget-evicted (no pending/overview to protect any).
+		expect(evicted.length).toBe(4);
+		expect(evicted).toEqual(expect.arrayContaining(["ref_snap-0", "ref_snap-1", "ref_snap-2", "ref_snap-3"]));
+	});
+});
+
+describe("makeRequestAssembler — visual budget eviction direction (review fix)", () => {
+	it("budget eviction keeps the NEWEST ordinary refs and evicts the oldest", async () => {
+		// refSnapMessages(4) at 200x200, working tier 768 → ~205 tokens each.
+		// Budget 450 fits 2 (410) but not 3 (615). No overview/pending.
+		// The budget pass must evict the OLDEST two (ref_snap-0/1) and keep the
+		// NEWEST two (ref_snap-2/3).
+		const cp = makeTrivialCheckpoint(1);
+		const captured: { evicted?: string[] } = {};
+		const deps = makeDeps({
+			settings: resolveTransformSettings({
+				visual_working_set_max: 4,
+				visual_context_budget_tokens: 450,
+			}),
+			getSessionSnapshot: async () => ({
+				checkpoint: cp,
+				observations: [],
+				pendingSnapshotId: null,
+				messages: [],
+			}),
+			metricsSink: (m) => {
+				captured.evicted = m.evicted_image_refs;
+			},
+		});
+		const assembler = makeRequestAssembler(deps);
+		const msgs: PersistedAgentMessage[] = [];
+		for (let i = 0; i < 4; i++) {
+			msgs.push(assistantMsg([{ type: "toolCall", id: `tc-${i}`, name: "snapshot", arguments: {} }], i * 2 + 1));
+			msgs.push(toolResultMsg(`tc-${i}`, [imgRef(`ref_snap-${i}`, { x: i * 100, y: 0, w: 200, h: 200 })], i * 2 + 2));
+		}
+		const out = await assembler(msgs as AgentMessage[]);
+		const blockTypeOf = (toolCallId: string): string => {
+			const m = out.find((mm) => (mm as { toolCallId?: string }).toolCallId === toolCallId);
+			const content = (m as { content?: unknown[] }).content as { type: string }[];
+			return content[0]!.type;
+		};
+		expect(blockTypeOf("tc-0")).toBe("text"); // oldest evicted
+		expect(blockTypeOf("tc-1")).toBe("text");
+		expect(blockTypeOf("tc-2")).toBe("image"); // newest kept
+		expect(blockTypeOf("tc-3")).toBe("image");
+		expect(captured.evicted).toEqual(["ref_snap-0", "ref_snap-1"]);
+	});
+});

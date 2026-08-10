@@ -855,14 +855,64 @@ describe("transform-context", () => {
 			// Both subscribe to the same in-flight fetch.
 			await new Promise<void>((r) => setTimeout(r, 10));
 			expect(flask.calls).toBe(1); // coalesced into one fetch
-			// A cancels alone → B's fetch must continue.
+			// A cancels alone. P2-4: A's promise must reject its per-subscriber
+			// promise IMMEDIATELY (before the blocker resolves), so its transform
+			// settles to degraded text without waiting on the shared fetch.
 			acA.abort();
-			await new Promise<void>((r) => setTimeout(r, 10));
-			// Unblock so the shared fetch resolves.
+			// A's transform should settle to degrade text WITHOUT unblocking.
+			const outA = await pA;
+			expect(hasNoImageRefBlocks(outA)).toBe(true);
+			expect(countImageBlocks(outA)).toBe(0); // degraded — its image aborted
+			// B's fetch is still in flight (blocker not yet released).
+			expect(flask.calls).toBe(1);
+			// Unblock so the shared fetch resolves for B.
 			unblock();
-			const [outA, outB] = await Promise.all([pA, pB]);
-			void outA;
+			const outB = await pB;
 			// B should still have its image (fetch not aborted by A's cancel).
+			expect(countImageBlocks(outB)).toBe(1);
+		});
+
+		it("two subscribers: cancelling subscriber's promise rejects before the blocker releases (§16.2)", async () => {
+			// P2-4: per-subscriber independent promise. A subscribes to a shared
+			// in-flight fetch; aborting A's signal must reject A's underlying
+			// derivative promise IMMEDIATELY (before unblock), while B continues
+			// and resolves only after the fetch completes.
+			let unblock: () => void = () => {};
+			const blocker = new Promise<void>((r) => {
+				unblock = r;
+			});
+			const flask = makeFlask({ blockUntil: blocker });
+			const settings = resolveTransformSettings({ visual_working_set_max: 6 });
+			const tA = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings,
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			const tB = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings,
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			const acA = new AbortController();
+			const acB = new AbortController();
+			const src = { x: 1, y: 1, w: 10, h: 10 };
+			const pA = tA([userMsg([imgRef("ref_a", src)])], acA.signal);
+			const pB = tB([userMsg([imgRef("ref_b", src)])], acB.signal);
+			await new Promise<void>((r) => setTimeout(r, 10));
+			expect(flask.calls).toBe(1);
+			// A aborts — its transform resolves to degrade text WITHOUT unblock.
+			acA.abort();
+			const outA = await pA;
+			expect(countImageBlocks(outA)).toBe(0);
+			// The shared fetch is still in flight (blocker not released).
+			expect(flask.calls).toBe(1);
+			// B still resolves with the image once the fetch completes.
+			unblock();
+			const outB = await pB;
 			expect(countImageBlocks(outB)).toBe(1);
 		});
 
@@ -944,6 +994,72 @@ describe("transform-context", () => {
 			const pendingArgs = flask.lastArgs.find((a) => (a.x as number) === 1);
 			expect(pendingArgs?.max_long_edge).toBe(1280);
 		});
+	});
+});
+
+// =========================================================================== //
+// Phase 2b: §9.1 visual token budget hard cap (P2-3)
+// =========================================================================== //
+describe("Phase 2b — §9.1 visual budget hard cap (P2-3)", () => {
+	beforeEach(() => {
+		clearRegionLru();
+	});
+
+	it("resolveTransformSettings exposes visualContextBudgetTokens (default 8000)", () => {
+		const s = resolveTransformSettings({});
+		expect(s.visualContextBudgetTokens).toBe(8000);
+		const tiny = resolveTransformSettings({ visual_context_budget_tokens: 1 });
+		expect(tiny.visualContextBudgetTokens).toBe(1);
+		// Non-positive / invalid values fall back to the default.
+		const bad = resolveTransformSettings({ visual_context_budget_tokens: -5 });
+		expect(bad.visualContextBudgetTokens).toBe(8000);
+	});
+
+	it("evicts ordinary recent images to fit a tiny budget while keeping overview + pending", async () => {
+		const flask = makeFlask();
+		// firstSnapshotToolCallIdRef = "snap-0" → ref_snap-0 is overview.
+		// pendingSnapshotIdRef = "snap-pending" → ref_snap-pending is pending.
+		const transform = makeTransformContext({
+			flask: flask as unknown as FlaskClient,
+			slide: SLIDE,
+			slideInfo: SLIDE_INFO,
+			settings: resolveTransformSettings({
+				visual_working_set_max: 4,
+				visual_context_budget_tokens: 1, // tiny → evict everything evictable
+			}),
+			firstSnapshotToolCallIdRef: { value: "snap-0" },
+			pendingSnapshotIdRef: { value: "snap-pending" },
+		});
+		const msgs: AgentMessage[] = [
+			toolResultMsg("snap-0", [imgRef("ref_snap-0", { x: 0, y: 0, w: 9000, h: 8000 })], 1), // overview
+			toolResultMsg("snap-pending", [imgRef("ref_snap-pending", { x: 1, y: 1, w: 10, h: 10 })], 2), // pending (oldest ordinary)
+			toolResultMsg("s2", [imgRef("ref_s2", { x: 2, y: 2, w: 10, h: 10 })], 3),
+			toolResultMsg("s3", [imgRef("ref_s3", { x: 3, y: 3, w: 10, h: 10 })], 4),
+		];
+		const out = await transform(msgs);
+		// Overview + pending survive; ordinary s2/s3 are budget-evicted.
+		expect(countImageBlocks(out)).toBe(2);
+	});
+
+	it("does not evict when the budget is ample (recency behaviour unchanged)", async () => {
+		const flask = makeFlask();
+		const transform = makeTransformContext({
+			flask: flask as unknown as FlaskClient,
+			slide: SLIDE,
+			slideInfo: SLIDE_INFO,
+			settings: resolveTransformSettings({
+				visual_working_set_max: 4,
+				visual_context_budget_tokens: 1_000_000,
+			}),
+			firstSnapshotToolCallIdRef: { value: null },
+		});
+		const msgs: AgentMessage[] = [
+			toolResultMsg("s1", [imgRef("ref_s1", { x: 1, y: 1, w: 10, h: 10 })], 1),
+			toolResultMsg("s2", [imgRef("ref_s2", { x: 2, y: 2, w: 10, h: 10 })], 2),
+			toolResultMsg("s3", [imgRef("ref_s3", { x: 3, y: 3, w: 10, h: 10 })], 3),
+		];
+		const out = await transform(msgs);
+		expect(countImageBlocks(out)).toBe(3);
 	});
 });
 
@@ -1105,5 +1221,39 @@ describe("Phase 2b — §7.2 rich-text history", () => {
 		const observations = [{ bbox: { x: 0, y: 0, w: 10, h: 10 }, note: "elsewhere" }];
 		const text = richHistoryForRef(ref, observations);
 		expect(text).toContain("尚无结构化观察");
+	});
+});
+
+describe("Phase 2b — §9.1 visual budget eviction direction (review fix)", () => {
+	it("budget eviction keeps the NEWEST ordinary images, evicting the oldest", async () => {
+		const flask = makeFlask();
+		// 3 ordinary refs, each ~11 estimated tokens (10x10 @ working tier 768:
+		// ceil(10*768/750)=11). Budget 25 fits 2 (22) but not 3 (33).
+		// Recency KEEP keeps all 3 (visual_working_set_max=4); the budget pass
+		// must then evict the OLDEST (s1), keeping the two NEWEST (s2, s3).
+		const transform = makeTransformContext({
+			flask: flask as unknown as FlaskClient,
+			slide: SLIDE,
+			slideInfo: SLIDE_INFO,
+			settings: resolveTransformSettings({
+				visual_working_set_max: 4,
+				visual_context_budget_tokens: 25,
+			}),
+			firstSnapshotToolCallIdRef: { value: null },
+			pendingSnapshotIdRef: { value: null },
+		});
+		const msgs: AgentMessage[] = [
+			toolResultMsg("s1", [imgRef("ref_s1", { x: 1, y: 1, w: 10, h: 10 })], 1),
+			toolResultMsg("s2", [imgRef("ref_s2", { x: 2, y: 2, w: 10, h: 10 })], 2),
+			toolResultMsg("s3", [imgRef("ref_s3", { x: 3, y: 3, w: 10, h: 10 })], 3),
+		];
+		const out = await transform(msgs);
+		const blockType = (i: number): string => {
+			const content = (out[i] as { content?: unknown[] }).content as { type: string }[];
+			return content[0]!.type;
+		};
+		expect(blockType(0)).toBe("text"); // oldest evicted
+		expect(blockType(1)).toBe("image"); // newest kept
+		expect(blockType(2)).toBe("image");
 	});
 });

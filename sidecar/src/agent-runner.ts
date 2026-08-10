@@ -47,6 +47,8 @@ import {
 	appendMessages,
 	collectImageMeta,
 	dehydrateMessages,
+	isImageContent,
+	isImageRefContent,
 	replaceMessagesPreservingSeq,
 	type PersistedAgentMessage,
 	type SessionData,
@@ -896,8 +898,18 @@ export class AgentRunner {
 		// and sets this flag; the streamFn wrapper detects it and applies the
 		// shared retry budget (§3.2: "与瞬时错误共用最多 3 次总重试预算").
 		const stableContextError = { value: null as StableContextUnavailableError | null };
+		// P1-1: capture the most recent transformContext INPUT messages so the
+		// streamFn retry wrapper can RE-RUN the assembler on the same input when
+		// StableContextUnavailable fires. pi does NOT re-call transformContext
+		// inside the wrapper's retry loop (the wrapper short-circuits pi's
+		// transform→stream sequence), so without this the retry would re-send the
+		// already-degraded fallback instead of re-attempting the stable overview.
+		const lastTransformInput = { value: <AgentMessage[]>[] };
 
 		const transformContext = async (messages: AgentMessage[], signal?: AbortSignal): Promise<AgentMessage[]> => {
+			// Record the input so the retry wrapper can re-attempt assembly on
+			// StableContextUnavailable (P1-1).
+			lastTransformInput.value = messages;
 			// The assembler internally falls back to the Phase 1 path when no
 			// checkpoint exists, so this is a single unified entry point.
 			// However, to preserve exact Phase 1 semantics for sessions that
@@ -1038,6 +1050,7 @@ export class AgentRunner {
 			systemPrompt,
 			tools,
 			stableContextError,
+			lastTransformInput,
 			promptCacheCapabilities,
 		);
 
@@ -1111,10 +1124,15 @@ export class AgentRunner {
 			// when image_refs are present in the messages. The working-set cap
 			// (visual_working_set_max) is enforced separately by the image selector.
 			const msgs = agent.state.messages.slice();
+			// §9.1: reserve the visual budget when the request carries ANY image
+			// payload — both dehydrated image_ref blocks AND live `image` blocks
+			// (a snapshot taken mid-run is a live image until settle dehydrates
+			// it). P2-3: the original check only saw image_ref, so a run that
+			// only carried live images would under-reserve and miss compaction.
 			const hasImageRefs = msgs.some((m) => {
 				const c = (m as { content?: unknown }).content;
 				if (!Array.isArray(c)) return false;
-				return c.some((p) => p && typeof p === "object" && (p as { type?: string }).type === "image_ref");
+				return c.some((p) => p && (isImageRefContent(p) || isImageContent(p)));
 			});
 			const visualBudget = Number(config.visual_context_budget_tokens);
 			const visualReserve = hasImageRefs
@@ -1372,6 +1390,7 @@ export class AgentRunner {
 		systemPrompt: string,
 		tools: unknown[],
 		stableContextError: { value: StableContextUnavailableError | null },
+		lastTransformInput: { value: AgentMessage[] },
 		promptCacheCapabilities: PromptCacheCapabilities,
 	): (model: unknown, context: unknown, options?: unknown) => AssistantMessageEventStream {
 		const realStreamFn = (this.overrides.streamFn ??
@@ -1481,7 +1500,39 @@ export class AgentRunner {
 							reason: `stable_context_unavailable ${attempt + 1}/${maxTransient} (${sce.reason})`,
 						});
 						await sleep(delay * 1000);
-						continue; // re-attempt; pi will re-call transformContext
+						// P1-1: the wrapper short-circuits pi's transform→stream
+						// sequence, so pi does NOT re-call transformContext here.
+						// Re-run the assembler ourselves on the SAME input it was
+						// last given so the retry actually re-attempts the stable
+						// overview (instead of re-sending the degraded fallback).
+						// On success: replace currentContext.messages + drop the
+						// stale PreparedRequest so it is rebuilt from the fresh
+						// context. If the hook sets stableContextError again, the
+						// next loop iteration re-enters this branch (up to budget).
+						// A non-StableContext error is treated as terminal.
+						const inputMsgs = lastTransformInput.value;
+						if (inputMsgs.length > 0) {
+							try {
+								const transformed = await transformContext(inputMsgs);
+								// If the re-transform cleared the flag, apply the new
+								// context; otherwise leave currentContext as-is and
+								// let the loop retry (the degraded fallback stays in
+								// place until the budget is exhausted or the overview
+								// materializes).
+								if (!stableContextError.value) {
+									currentContext = { ...(currentContext as object), messages: transformed };
+									prepared = null; // rebuild PreparedRequest from the fresh context
+								}
+							} catch (reErr) {
+								// Non-StableContext error during re-transform → terminal.
+								const errMsg = `stable_context re-transform failed: ${(reErr as Error)?.message || String(reErr)}`;
+								const err = makeErrorAssistant(errMsg);
+								out.push({ type: "error", reason: "error", error: err });
+								out.end(err);
+								return;
+							}
+						}
+						continue; // re-attempt the stream with the re-assembled context
 					}
 					if (stableContextError.value && attempt >= maxTransient) {
 						// Budget exhausted → terminal error (§3.2). Generation is
@@ -1522,7 +1573,20 @@ export class AgentRunner {
 						// Phase 3: currentOptions carries the injected cache key
 						// (samplingParams) in explicit mode; it is rebuilt on
 						// downgrade to strip the field.
-						stream = await realStreamFn(model, currentContext, currentOptions);
+						//
+						// P2-5 (§8.2): when a PreparedRequest exists, send ITS
+						// already-canonicalized messages (a normalized copy with
+						// _context_meta stripped once at first-send time) so that
+						// transient retries hand the provider the SAME payload
+						// object — the "normalize once, reuse on retry" contract.
+						// force-compaction / stable-context re-assembly paths set
+						// prepared=null, so a freshly-built prepared always
+						// reflects the current context.
+						const preparedNow = prepared as PreparedRequest | null;
+						const sendContext = preparedNow
+							? { ...(currentContext as object), messages: preparedNow.context.messages }
+							: currentContext;
+						stream = await realStreamFn(model, sendContext, currentOptions);
 					} catch (e) {
 						// streamFn contract says it must not throw, but be defensive.
 						out.push({
@@ -1851,7 +1915,7 @@ export class AgentRunner {
 		// the generation.
 		const staleReason = checkpointStale(cp, env);
 		if (staleReason) {
-			// Force a fresh g1 (no overview). ensureCheckpoint returns the
+			// Force a fresh no-overview checkpoint. ensureCheckpoint returns the
 			// existing one when present, so we null it out first.
 			const freshData = { ...data, context_checkpoint: undefined } as SessionData;
 			const freshCp = ensureCheckpoint(freshData, {
@@ -1859,16 +1923,40 @@ export class AgentRunner {
 				tool_schema_hash: env.tool_schema_hash,
 				slide_fingerprint: env.slide_fingerprint,
 			});
-			await this.store.commitCheckpoint(
+			// P1-2 (§8/§10): keep the generation MONOTONIC — bump from the prior
+			// generation instead of resetting to 1 (ensureCheckpoint's default).
+			// Resetting to 1 would let a higher-generation checkpoint be replaced
+			// by a g1 candidate and could re-use a stale prompt-cache key.
+			freshCp.generation = cp.generation + 1;
+			// freshCp.slide_fingerprint is already env.slide_fingerprint (passed
+			// above); the stable_prefix_hash was computed by ensureCheckpoint
+			// from that fingerprint, so it stays consistent.
+			// P1-2 CAS semantics: the CAS asserts "the on-disk state matches
+			// what I read BEFORE the rebuild" — i.e. the OLD generation + OLD
+			// fingerprint (cp.*). Passing the new fingerprint would ALWAYS fail
+			// when the slide changed (stored still has the old one). expectedGen
+			// = cp.generation so a concurrent bump is detected.
+			const staleRes = await this.store.commitCheckpoint(
 				sessionId,
 				cp.generation,
-				env.slide_fingerprint,
+				cp.slide_fingerprint,
 				(d) => {
 					d.context_checkpoint = freshCp;
 				},
 			);
-			// Attempt overview back-fill for the fresh checkpoint below.
-			await this.backfillOverview({ sessionId, slide, slideInfo, cp: freshCp, env, settings, systemPrompt, tools, firstSnapshotToolCallIdRef: args.firstSnapshotToolCallIdRef });
+			if (!staleRes.ok) {
+				// CAS rejected (concurrent bump or the on-disk state already
+				// changed) → do NOT backfill against an un-committed in-memory
+				// candidate. Another op owns the checkpoint now (§5.3).
+				return;
+			}
+			// P1-2: backfill against the COMMITTED checkpoint (re-read; do not
+			// trust the in-memory freshCp, which may now be stale if another op
+			// touched the session — though commitCheckpoint held the lock, a
+			// re-read is the safe canonical form).
+			const committed = await this.store.readSession(sessionId);
+			const committedCp = committed?.context_checkpoint ?? freshCp;
+			await this.backfillOverview({ sessionId, slide, slideInfo, cp: committedCp, env, settings, systemPrompt, tools, firstSnapshotToolCallIdRef: args.firstSnapshotToolCallIdRef });
 			return;
 		}
 

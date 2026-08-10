@@ -497,3 +497,128 @@ describe("checkpointStale (§10 version invalidation)", () => {
 		expect(checkpointStale(cp, makeEnv({ overview_target_long_edge: 768 }))).toBeNull();
 	});
 });
+
+// =========================================================================== //
+// ensureCheckpointRun — stale rebuild CAS + monotonic generation (P1-2)
+// =========================================================================== //
+//
+// P1-2: the stale-rebuild path must (a) commit a generation N+1 (NOT reset to
+// 1), (b) pass the OLD fingerprint as the CAS expectedFingerprint so a slide
+// change does not always fail, (c) NOT backfill against an un-committed
+// candidate when the CAS is rejected, and (d) keep the committed checkpoint
+// intact on rejection.
+import { AgentRunner } from "../src/agent-runner.js";
+import { SessionEventBus } from "../src/events.js";
+import type { FlaskClient } from "../src/flask-client.js";
+import type { SlideInfo } from "../src/tools.js";
+
+const SLIDE_INFO_BASE: SlideInfo = { width: 10000, height: 8000, levelDownsamples: [1, 2, 4, 8], mpp: 0.5, fingerprint: FP };
+const SYSTEM_PROMPT_V1 = "system-v1";
+const SYSTEM_PROMPT_V2 = "system-v2";
+
+/** A no-op flask whose region() is never reached in these tests (no overview). */
+function noopFlask(): Pick<FlaskClient, "region"> {
+	return {
+		region: async () => {
+			throw new Error("region should not be called by ensureCheckpointRun in these tests");
+		},
+	} as Pick<FlaskClient, "region">;
+}
+
+describe("ensureCheckpointRun — stale rebuild CAS + monotonic generation (P1-2)", () => {
+	it("bumps generation to N+1 (NOT reset to 1) and commits the new slide fingerprint when the slide changes", async () => {
+		const store = new SessionStore({ sessionsDir: await newStoreDir() });
+		const s = await store.createSession({ slide: SLIDE, kind: "main" });
+		// Seed a generation-3 checkpoint at the OLD fingerprint.
+		const oldFp = "fp-old";
+		await store.commitCheckpoint(s.id, undefined, oldFp, (d) => {
+			d.context_checkpoint = { ...makeCp(3, oldFp), summary: "g3-old" };
+		});
+		const bus = new SessionEventBus(store);
+		const runner = new AgentRunner(store, bus, noopFlask() as FlaskClient);
+		// activeRunConfig is private; set it via cast so resolveTransformSettings works.
+		(runner as unknown as { activeRunConfig: unknown }).activeRunConfig = {};
+		const newFp = "fp-new";
+		const newSlideInfo: SlideInfo = { ...SLIDE_INFO_BASE, fingerprint: newFp };
+		await (runner as unknown as { ensureCheckpointRun: (a: unknown) => Promise<void> }).ensureCheckpointRun({
+			sessionId: s.id,
+			slide: SLIDE,
+			slideInfo: newSlideInfo,
+			systemPrompt: SYSTEM_PROMPT_V1,
+			tools: [],
+			firstSnapshotToolCallIdRef: { value: null },
+		});
+		const back = await store.readSession(s.id);
+		// P1-2: generation = 3 + 1 = 4 (monotonic), not 1.
+		expect(back?.context_checkpoint?.generation).toBe(4);
+		// P1-2: the new fingerprint is committed.
+		expect(back?.context_checkpoint?.slide_fingerprint).toBe(newFp);
+	});
+
+	it("bumps generation monotonically when the prompt version changes (no fingerprint change)", async () => {
+		const store = new SessionStore({ sessionsDir: await newStoreDir() });
+		const s = await store.createSession({ slide: SLIDE, kind: "main" });
+		// Seed a generation-5 checkpoint at the current fingerprint.
+		await store.commitCheckpoint(s.id, undefined, FP, (d) => {
+			d.context_checkpoint = { ...makeCp(5, FP), system_prompt_version: "spv-old" as never, summary: "g5" };
+		});
+		const bus = new SessionEventBus(store);
+		const runner = new AgentRunner(store, bus, noopFlask() as FlaskClient);
+		(runner as unknown as { activeRunConfig: unknown }).activeRunConfig = {};
+		// prompt version differs → stale; fingerprint unchanged.
+		await (runner as unknown as { ensureCheckpointRun: (a: unknown) => Promise<void> }).ensureCheckpointRun({
+			sessionId: s.id,
+			slide: SLIDE,
+			slideInfo: { ...SLIDE_INFO_BASE, fingerprint: FP },
+			systemPrompt: SYSTEM_PROMPT_V2, // different prompt → different version
+			tools: [],
+			firstSnapshotToolCallIdRef: { value: null },
+		});
+		const back = await store.readSession(s.id);
+		// P1-2: generation = 5 + 1 = 6 (monotonic +1, not reset to 1).
+		expect(back?.context_checkpoint?.generation).toBe(6);
+		expect(back?.context_checkpoint?.slide_fingerprint).toBe(FP);
+	});
+
+	it("does NOT backfill and keeps the old checkpoint intact when the CAS is rejected (concurrent bump)", async () => {
+		const store = new SessionStore({ sessionsDir: await newStoreDir() });
+		const s = await store.createSession({ slide: SLIDE, kind: "main" });
+		const oldFp = "fp-old";
+		await store.commitCheckpoint(s.id, undefined, oldFp, (d) => {
+			d.context_checkpoint = { ...makeCp(3, oldFp), summary: "g3" };
+		});
+		// Simulate a concurrent bump: between our read and our CAS, another op
+		// bumps the generation to 9 (so our CAS expecting generation 3 is rejected).
+		// We do this by patching store.commitCheckpoint to first bump then delegate.
+		const origCommit = store.commitCheckpoint.bind(store);
+		let injectedBump = false;
+		store.commitCheckpoint = (async (id: string, expectedGen: number | undefined, expectedFp: string, mutate: (d: SessionData) => void) => {
+			if (!injectedBump && expectedGen === 3) {
+				injectedBump = true;
+				// Concurrent op bumps to generation 9 with a different fingerprint.
+				await origCommit(id, 3, oldFp, (d) => {
+					d.context_checkpoint = { ...makeCp(9, "fp-concurrent"), summary: "g9-concurrent" };
+				});
+			}
+			return origCommit(id, expectedGen, expectedFp, mutate);
+		}) as typeof store.commitCheckpoint;
+
+		const bus = new SessionEventBus(store);
+		const runner = new AgentRunner(store, bus, noopFlask() as FlaskClient);
+		(runner as unknown as { activeRunConfig: unknown }).activeRunConfig = {};
+		await (runner as unknown as { ensureCheckpointRun: (a: unknown) => Promise<void> }).ensureCheckpointRun({
+			sessionId: s.id,
+			slide: SLIDE,
+			slideInfo: { ...SLIDE_INFO_BASE, fingerprint: "fp-new" },
+			systemPrompt: SYSTEM_PROMPT_V1,
+			tools: [],
+			firstSnapshotToolCallIdRef: { value: null },
+		});
+		const back = await store.readSession(s.id);
+		// P1-2: the CAS was rejected → the concurrent generation 9 is intact,
+		// and our stale candidate (generation 4) was NOT written.
+		expect(back?.context_checkpoint?.generation).toBe(9);
+		expect(back?.context_checkpoint?.summary).toBe("g9-concurrent");
+		expect(back?.context_checkpoint?.slide_fingerprint).toBe("fp-concurrent");
+	});
+});

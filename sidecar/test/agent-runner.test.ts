@@ -7,10 +7,12 @@
  * these tests exercise the actual event-translation paths in agent-runner.ts.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream } from "@earendil-works/pi-ai";
 
 import { BASE_CONFIG, DOWNSAMPLES, makeFakeStreamFn, newHarness, cleanupRootTmp, waitForSettle, type Harness } from "./helpers.js";
 import { buildTranscript } from "../src/transcript.js";
+import { buildOverviewDerivative, computeDerivativeContentHash } from "../src/checkpoint.js";
+import { clearRegionLru } from "../src/transform-context.js";
 
 /** Minimal AssistantMessage builder for the cancel test's handcrafted stream. */
 function makeRawAssistant(content: AssistantMessage["content"], stopReason: AssistantMessage["stopReason"]): AssistantMessage {
@@ -584,6 +586,244 @@ describe("AgentRunner.runMain — transient error retry", () => {
 		expect(retries.length).toBeGreaterThanOrEqual(1);
 		expect((retries[0]!.payload as { reason: string }).reason).toMatch(/reconnection 1\/3/);
 	}, 30000);
+
+	it("P2-5: transient retry sends the SAME prepared messages array reference, without _context_meta", async () => {
+		// Custom streamFn that records the context.messages array reference per
+		// call and returns a transient error on the first call, success on the 2nd.
+		const capturedContexts: Array<{ messagesRef: unknown[]; hasContextMeta: boolean }> = [];
+		let call = 0;
+		const fn = function (_model: unknown, context: unknown): AssistantMessageEventStream {
+			const ctx = context as { messages?: Array<Record<string, unknown>> };
+			const msgs = ctx.messages || [];
+			capturedContexts.push({
+				messagesRef: msgs,
+				hasContextMeta: msgs.some((m) => "_context_meta" in m),
+			});
+			const stream = createAssistantMessageEventStream();
+			void (async () => {
+				call += 1;
+				if (call === 1) {
+					// First call: transient error.
+					const err = makeRawAssistant([], "error");
+					(err as AssistantMessage & { errorMessage?: string }).errorMessage = "Connection reset by peer";
+					stream.push({ type: "error", reason: "error", error: err as AssistantMessage });
+					stream.end(err as AssistantMessage);
+					return;
+				}
+				// Second call: succeed with a finish.
+				const content: AssistantMessage["content"] = [{ type: "text", text: "ok" }];
+				const finalMsg = makeRawAssistant(content, "stop");
+				stream.push({ type: "start", partial: makeRawAssistant([], "pending") });
+				stream.push({ type: "done", reason: "stop", message: finalMsg });
+				stream.end(finalMsg);
+			})();
+			return stream;
+		};
+		const h: Harness = await newHarness(fn);
+		const { sessionId } = await h.runner.runMain({ slide: "test.svs", config: { ...BASE_CONFIG }, fresh: true });
+		h.watch(sessionId);
+		const status = await waitForSettle(h.store, sessionId, 30000);
+		expect(status).toBe("finished");
+		// At least two calls happened (error + success).
+		expect(capturedContexts.length).toBeGreaterThanOrEqual(2);
+		// P2-5: the messages array is the SAME reference across the transient
+		// retry (prepared.context.messages reused, §8.2).
+		expect(capturedContexts[1]!.messagesRef).toBe(capturedContexts[0]!.messagesRef);
+		// P2-5: the sent messages must NOT carry _context_meta (prepared is the
+		// canonical, meta-stripped copy; Provider boundary, §10).
+		expect(capturedContexts.every((c) => !c.hasContextMeta)).toBe(true);
+	}, 30000);
+});
+
+// =========================================================================== //
+// P1-1: stable_context_unavailable retry must RE-ASSEMBLE (not re-send the
+// degraded fallback). Integration test with a real AgentRunner.
+// =========================================================================== //
+describe("AgentRunner.runMain — stable_context_unavailable re-assembly (P1-1)", () => {
+	// A short golden script that takes one snapshot so an image_ref lands in the
+	// canonical transcript; the snapshot's toolCallId is "tc-snap".
+	const GOLDEN_WITH_SNAP = [
+		{ toolCalls: [{ id: "tc-goto", name: "goto", arguments: { x: 2000, y: 1500, level: 2 } }] },
+		{ toolCalls: [{ id: "tc-snap", name: "snapshot", arguments: {} }] },
+		{ toolCalls: [{ id: "tc-rev", name: "complete_snapshot_review", arguments: { disposition: "annotated", summary: "ok" } }] },
+		{ text: "读片完成。", toolCalls: [{ id: "tc-fin", name: "finish", arguments: { summary: "完成。" } }] },
+	];
+
+	/**
+	 * Build a mock flask whose region() FAILS the first `failFirst` calls, then
+	 * succeeds with `successB64`. Includes the full method set (region, annotate,
+	 * spots, slideInfo) so the runner can run end-to-end. Records total region
+	 * call count on `regionCalls`.
+	 */
+	function makeFlakyFlask(failFirst: number, successB64 = "QUFBQQ=="): {
+		region: (a: Record<string, unknown>) => Promise<unknown>;
+		annotate: (a: Record<string, unknown>) => Promise<unknown>;
+		spots: (s: string, n: number) => Promise<unknown>;
+		slideInfo: (s: string) => Promise<unknown>;
+		regionCalls: number;
+	} {
+		let calls = 0;
+		const region = async (_args: Record<string, unknown>) => {
+			calls += 1;
+			if (calls <= failFirst) throw new Error(`flaky region failure #${calls}`);
+			return {
+				image_base64: successB64,
+				mime: "image/jpeg",
+				width: 1024,
+				height: 1024,
+				src: { x: 0, y: 0, w: 100, h: 100 },
+				magnification: 20,
+				encoder: { id: "pillow", version: "test-v1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+			};
+		};
+		const annotate = async () => ({ annotation_id: "ann", change_seq: 1 });
+		const spots = async () => ({ changes: [], current_seq: 0 });
+		const slideInfo = async () => ({ width: 10000, height: 8000, level_downsamples: [1, 2, 4, 8], mpp: 0.5, fingerprint: "fp-test:abcd" });
+		return { region, annotate, spots, slideInfo, get regionCalls() { return calls; } } as never;
+	}
+
+	it("retries re-call the assembler (region calls >= 3), and the final sent context contains the stable overview", async () => {
+		// 1. Run a golden flow to establish a real session with a checkpoint that
+		//    has the correct version fields (built by the runner itself, so the
+		//    staleness check passes on the next run).
+		const { fn: fn1 } = makeFakeStreamFn(GOLDEN_WITH_SNAP);
+		const h: Harness = await newHarness(fn1);
+		const { sessionId } = await h.runner.runMain({ slide: "test.svs", config: { ...BASE_CONFIG }, task: "扫读", fresh: true });
+		h.watch(sessionId);
+		await waitForSettle(h.store, sessionId, 30000);
+
+		// 2. Inspect the post-run checkpoint + messages. The snapshot produced an
+		//    image_ref ref_id="ref_tc-snap" in the canonical transcript.
+		const data = await h.store.readSession(sessionId);
+		expect(data?.context_checkpoint).toBeDefined();
+		const cp = data!.context_checkpoint!;
+		// Build an overview_derivative pointing at the snapshot ref. Its
+		// content_sha256 is computed from the bytes the flaky flask will return
+		// once it succeeds, so the hash check passes on the successful attempt.
+		const successB64 = "QUFBQQ==";
+		const od = buildOverviewDerivative({
+			ref_id: "ref_tc-snap",
+			jpegBase64: successB64,
+			target_long_edge: 1024,
+			jpeg_quality: 85,
+			overlay_version: "v1",
+			resize_algorithm: "LANCZOS",
+			encoder_id: "pillow",
+			encoder_version: "test-v1",
+			mime_type: "image/jpeg",
+		});
+		// Commit the overview_derivative onto the existing checkpoint (same
+		// generation, same version fields → not stale).
+		await h.store.commitCheckpoint(sessionId, cp.generation, cp.slide_fingerprint, (d) => {
+			d.context_checkpoint = { ...cp, overview_derivative: od.overview_derivative };
+		});
+
+		// 3. Clear the LRU so the overview must be re-materialized via flask.
+		clearRegionLru();
+
+		// 4. Build a flaky flask that fails the first 2 region calls, then
+		//    succeeds. Use a NEW runner over the SAME store/bus with a custom
+		//    streamFn that captures the sent context.
+		const flakyFlask = makeFlakyFlask(2, successB64);
+		const captured: Array<{ messages: unknown[]; hasStableOverview: boolean }> = [];
+		const captureFn = function (_model: unknown, context: unknown): AssistantMessageEventStream {
+			const ctx = context as { messages?: Array<Record<string, unknown>> };
+			const msgs = ctx.messages || [];
+			// The stable overview is sent as an image block in an early user
+			// message carrying the "【稳定全片概览】" label.
+			const hasStableOverview = msgs.some((m) => {
+				const c = m.content;
+				if (!Array.isArray(c)) return false;
+				return c.some((p) => (p as { type?: string }).type === "image");
+			});
+			captured.push({ messages: msgs, hasStableOverview });
+			const stream = createAssistantMessageEventStream();
+			void (async () => {
+				const content: AssistantMessage["content"] = [{ type: "text", text: "done" }];
+				const finalMsg = makeRawAssistant(content, "stop");
+				stream.push({ type: "start", partial: makeRawAssistant([], "pending") });
+				stream.push({ type: "done", reason: "stop", message: finalMsg });
+				stream.end(finalMsg);
+			})();
+			return stream;
+		};
+		const { AgentRunner } = await import("../src/agent-runner.js");
+		const runner2 = new AgentRunner(h.store, h.bus, flakyFlask as never, { streamFn: captureFn as never });
+		const resumed = await runner2.continueMain({ slide: "test.svs", config: { ...BASE_CONFIG } });
+		expect(resumed.sessionId).toBe(sessionId);
+		await waitForSettle(h.store, sessionId, 30000);
+
+		// P1-1 (a): the assembler was re-called on each retry; with 2 injected
+		// failures the region was hit at least 3 times (2 failed + 1 success).
+		// (The overview backfill at run-start may also call region, but we cleared
+		// the LRU and the checkpoint already has an overview, so backfill is a
+		// no-op; the region calls come from the assembler's overview verify path.)
+		expect(flakyFlask.regionCalls).toBeGreaterThanOrEqual(3);
+
+		// P1-1 (b): the FINAL successfully-sent context includes the stable
+		// overview image (not just the degraded Phase-1 fallback).
+		expect(captured.length).toBeGreaterThanOrEqual(1);
+		expect(captured.some((c) => c.hasStableOverview)).toBe(true);
+	}, 45000);
+
+	it("budget-exhaustion path does NOT bump the checkpoint generation", async () => {
+		// Same setup, but the flask ALWAYS fails → the stable-context budget (3)
+		// is exhausted → terminal error. The checkpoint generation must be
+		// UNCHANGED after the failed run.
+		const { fn: fn1 } = makeFakeStreamFn(GOLDEN_WITH_SNAP);
+		const h: Harness = await newHarness(fn1);
+		const { sessionId } = await h.runner.runMain({ slide: "test.svs", config: { ...BASE_CONFIG }, task: "扫读", fresh: true });
+		h.watch(sessionId);
+		await waitForSettle(h.store, sessionId, 30000);
+
+		const data = await h.store.readSession(sessionId);
+		const cp = data!.context_checkpoint!;
+		const genBefore = cp.generation;
+		const successB64 = "QUFBQQ==";
+		const od = buildOverviewDerivative({
+			ref_id: "ref_tc-snap",
+			jpegBase64: successB64,
+			target_long_edge: 1024,
+			jpeg_quality: 85,
+			overlay_version: "v1",
+			resize_algorithm: "LANCZOS",
+			encoder_id: "pillow",
+			encoder_version: "test-v1",
+			mime_type: "image/jpeg",
+		});
+		await h.store.commitCheckpoint(sessionId, cp.generation, cp.slide_fingerprint, (d) => {
+			d.context_checkpoint = { ...cp, overview_derivative: od.overview_derivative };
+		});
+		clearRegionLru();
+
+		// Always-failing flask → budget exhausted → stable_context_unavailable.
+		const alwaysFailFlask = makeFlakyFlask(1_000_000, successB64);
+		const failFn = function (_model: unknown, _context: unknown): AssistantMessageEventStream {
+			const stream = createAssistantMessageEventStream();
+			void (async () => {
+				// This streamFn is reached only if the assembler DIDN'T raise
+				// StableContextUnavailable on that attempt. The budget exhaustion
+				// ends the run before any successful send, so we don't expect to
+				// emit done — but provide a fallback so the wrapper can still
+				// settle if the assembler ever succeeds.
+				const content: AssistantMessage["content"] = [{ type: "text", text: "unexpected success" }];
+				const finalMsg = makeRawAssistant(content, "stop");
+				stream.push({ type: "start", partial: makeRawAssistant([], "pending") });
+				stream.push({ type: "done", reason: "stop", message: finalMsg });
+				stream.end(finalMsg);
+			})();
+			return stream;
+		};
+		const { AgentRunner } = await import("../src/agent-runner.js");
+		const runner2 = new AgentRunner(h.store, h.bus, alwaysFailFlask as never, { streamFn: failFn as never });
+		await runner2.continueMain({ slide: "test.svs", config: { ...BASE_CONFIG } });
+		await waitForSettle(h.store, sessionId, 60000);
+
+		// P1-1 (c): the checkpoint generation is UNCHANGED (budget exhaustion
+		// does NOT bump generation, §3.2).
+		const after = await h.store.readSession(sessionId);
+		expect(after?.context_checkpoint?.generation).toBe(genBefore);
+	}, 90000);
 });
 
 // =========================================================================== //

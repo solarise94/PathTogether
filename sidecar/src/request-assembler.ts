@@ -72,6 +72,7 @@ import {
 	lruMissCount_value,
 	type TransformContextSettings,
 } from "./transform-context.js";
+import { estimateImageRefTokens } from "./compaction.js";
 import { StableContextUnavailableError } from "./prepared-request.js";
 
 // =========================================================================== //
@@ -188,7 +189,7 @@ export function makeRequestAssembler(deps: RequestAssemblerDeps): (messages: Age
 			// runner's ensureCheckpoint is responsible for creating one; if we
 			// get here we behave exactly like the old transformContext.
 			if (!cp) {
-				const out = await assembleWithoutCheckpoint(messages, deps, snap, signal, (ms) => {
+				const { out, evictedRefIds } = await assembleWithoutCheckpoint(messages, deps, snap, signal, (ms) => {
 					regionFetchMs += ms;
 				});
 				emitMetrics(deps, snap, cp, {
@@ -196,7 +197,8 @@ export function makeRequestAssembler(deps: RequestAssemblerDeps): (messages: Age
 					stable_prefix_hash_prefix: "",
 					selected_images: 0,
 					materialized_images: 0,
-					evicted_image_refs: [],
+					// P2-6: explicit eviction list from the selector.
+					evicted_image_refs: evictedRefIds,
 					image_lru_hits: lruHitCount_value(),
 					image_lru_misses: lruMissCount_value(),
 					overview_image_bytes_sent: 0,
@@ -247,7 +249,7 @@ export function makeRequestAssembler(deps: RequestAssemblerDeps): (messages: Age
 			// materialization + eviction). Evicted refs in the recent slice get
 			// the §7.2 rich-text form via the per-request observations index.
 			const observationsIndex = buildSnapshotObservationIndex(snap.observations, recentRaw);
-			const recentTransformed = await transformRecentSlice({
+			const recentSlice = await transformRecentSlice({
 				messages: recentRaw,
 				deps,
 				overviewRefId: overviewResult.overviewRefId,
@@ -259,6 +261,7 @@ export function makeRequestAssembler(deps: RequestAssemblerDeps): (messages: Age
 					regionFetchMs += ms;
 				},
 			});
+			const recentTransformed = recentSlice.messages;
 
 			// Final assembly: stable + breakpoint marker + recent. The breakpoint
 			// is a logical boundary for Phase 2b (Phase 3 materializes the
@@ -273,7 +276,9 @@ export function makeRequestAssembler(deps: RequestAssemblerDeps): (messages: Age
 			// Collect metrics.
 			const overviewBytes = overviewResult.imageBytes;
 			const workingBytes = countImageBytes(recentTransformed);
-			const evictedRefs = collectEvictedRefs(recentRaw, recentTransformed);
+			// P2-6: use the explicit eviction list from the selector (recency +
+			// budget + overview-covered), NOT a before/after diff.
+			const evictedRefs = recentSlice.evictedRefIds;
 			const selectedImages = countImageBlocks(recentTransformed);
 			const materializedImages = selectedImages; // all selected images are materialized
 
@@ -630,7 +635,15 @@ function messageSeq(m: PersistedAgentMessage | undefined): number | undefined {
  *     overview);
  *   - pending snapshot is always kept;
  *   - the last N non-overview refs are kept (N = settings.keepRecentImages);
+ *   - the §9.1 visual token budget is enforced as a HARD cap: after the recency
+ *     KEEP pass, the oldest ordinary kept image_refs are evicted until the
+ *     estimated selected visual tokens <= visualContextBudgetTokens. Overview
+ *     and pending positions are NOT budget-evictable (§9.1);
  *   - evicted refs use {@link richHistoryForRef} with the observations index.
+ *
+ * Returns both the rebuilt messages AND the explicit list of evicted ref_ids
+ * (P2-6: the KEEP stage knows exactly which refs were dropped; the caller uses
+ * this list for the §12 `evicted_image_refs` metric instead of diffing).
  */
 async function transformRecentSlice(args: {
 	messages: PersistedAgentMessage[];
@@ -641,7 +654,7 @@ async function transformRecentSlice(args: {
 	observationsIndex: Map<string, { summary: string }[]>;
 	signal?: AbortSignal;
 	onRegionFetchMs: (ms: number) => void;
-}): Promise<AgentMessage[]> {
+}): Promise<{ messages: AgentMessage[]; evictedRefIds: string[] }> {
 	const { messages, deps, overviewRefId, pendingSnapshotId, observations, observationsIndex, signal } = args;
 	const settings = deps.settings;
 	const slideInfo = deps.slideInfo;
@@ -713,9 +726,19 @@ async function transformRecentSlice(args: {
 		keepKeys.add(`${p.msgIdx}:${p.blkIdx}`);
 	}
 
+	// Phase 2b (§9.1 / P2-3): enforce the visual token budget as a HARD cap.
+	// The fixed overview (when present) counts toward the budget; ordinary
+	// recent images are evicted oldest-first until the estimate fits the budget
+	// or only non-evictable positions remain. Overview and pending positions are
+	// NEVER budget-evicted (§9.1). P2-6: every budget-evicted ref contributes to
+	// `evictedRefIds` so the §12 metric stays accurate.
+	const budgetEvictedKeys = enforceVisualBudget(keepKeys, positions, ordinary, keepFrom, settings, overviewRefId);
+
 	// Phase 3: materialize KEEP refs (concurrency cap, signal-aware). Reuse the
 	// exported derivative pipeline. Detail tier = newest kept ordinary + pending.
-	const keptOrdinary = ordinary.slice(keepFrom);
+	const keptOrdinary = ordinary
+		.slice(keepFrom)
+		.filter((p) => !budgetEvictedKeys.has(`${p.msgIdx}:${p.blkIdx}`));
 	const newestKeptOrdinaryKey = keptOrdinary.length > 0
 		? `${keptOrdinary[keptOrdinary.length - 1]!.msgIdx}:${keptOrdinary[keptOrdinary.length - 1]!.blkIdx}`
 		: null;
@@ -731,7 +754,11 @@ async function transformRecentSlice(args: {
 	args.onRegionFetchMs(Date.now() - tFetchStart);
 
 	// Phase 4: rebuild messages, converting evicted refs to §7.2 rich text.
-	return messages.map((m, msgIdx) => {
+	// Collect the explicit eviction list (P2-6): every image_ref whose position
+	// is NOT in keepKeys (recency + budget + overview-covered). This is the
+	// authoritative metric input — the caller must NOT diff before/after.
+	const evictedRefIds: string[] = [];
+	const rebuilt = messages.map((m, msgIdx) => {
 		const role = (m as { role?: string }).role;
 		if (role !== "user" && role !== "assistant" && role !== "toolResult") return m as AgentMessage;
 		const content = (m as { content?: unknown }).content;
@@ -744,7 +771,9 @@ async function transformRecentSlice(args: {
 				if (!keepKeys.has(key)) {
 					// Evicted → §7.2 rich text. Overview refs in the recent slice
 					// also land here (they are covered by the stable overview).
-					return { type: "text", text: richHistoryForRef(part as ImageRefContent, observations, observationsIndex) };
+					const ref = part as ImageRefContent;
+					if (ref.ref_id) evictedRefIds.push(ref.ref_id);
+					return { type: "text", text: richHistoryForRef(ref, observations, observationsIndex) };
 				}
 				return materialized.get(key) ?? { type: "text", text: DEGRADE_TEXT };
 			}
@@ -763,6 +792,100 @@ async function transformRecentSlice(args: {
 		});
 		return touched ? ({ ...(m as object), content: newContent } as AgentMessage) : (m as AgentMessage);
 	});
+	return { messages: rebuilt, evictedRefIds };
+}
+
+/**
+ * Enforce the §9.1 visual token budget by evicting the oldest ordinary kept
+ * image_refs until the estimate fits. Returns the set of `${msgIdx}:${blkIdx}`
+ * keys that were removed from `keepKeys` (mutated in place). Overview and
+ * pending positions are never evicted (§9.1).
+ *
+ * The estimate uses {@link estimateImageRefTokens} (§9.1 coarse formula). Live
+ * `image` blocks (no src on the block) are estimated as a square at their tier
+ * (detail/working); kept image_refs are estimated at their target tier. The
+ * stable overview (when the checkpoint has one, i.e. `overviewRefId != null`)
+ * counts at the overview tier and is non-evictable (it lives in the stable
+ * region, not the recent slice — we account for its cost so the budget is a
+ * true per-request ceiling per §9.1).
+ */
+function enforceVisualBudget(
+	keepKeys: Set<string>,
+	positions: Array<{ msgIdx: number; blkIdx: number; overview: boolean; pending: boolean; kind: "ref" | "image"; ref?: ImageRefContent }>,
+	ordinary: Array<{ msgIdx: number; blkIdx: number; kind: "ref" | "image"; ref?: ImageRefContent }>,
+	keepFrom: number,
+	settings: TransformContextSettings,
+	overviewRefId: string | null,
+): Set<string> {
+	const budget = settings.visualContextBudgetTokens;
+	if (!(Number.isFinite(budget) && budget > 0)) return new Set();
+
+	// Estimate the non-evictable baseline (overview + pending kept positions).
+	// Overview in the recent slice is always text-ified (not kept), so the only
+	// overview cost to account for is the stable-region overview image.
+	let total = 0;
+	if (overviewRefId !== null) {
+		total += estimateImageRefTokens({ w: settings.overviewLongEdge, h: settings.overviewLongEdge }, settings.overviewLongEdge);
+	}
+	// Walk all kept positions, summing their estimated cost; pending live images
+	// and pending refs are non-evictable and count toward the baseline.
+	for (const p of positions) {
+		const key = `${p.msgIdx}:${p.blkIdx}`;
+		if (!keepKeys.has(key)) continue;
+		if (p.pending) {
+			total += estimatePosTokens(p, settings);
+		}
+	}
+	// Ordinary kept refs/images, oldest first, are the budget-eviction order.
+	const evicted = new Set<string>();
+	const keptOrdinary = ordinary.slice(keepFrom);
+	// First add their cost; if over budget, evict oldest until it fits.
+	let running = total;
+	for (const p of keptOrdinary) {
+		running += estimatePosTokens(p, settings);
+	}
+	if (running <= budget) return evicted;
+	// Evict OLDEST-first so the NEWEST evidence images survive: walk from the
+	// newest kept image backwards, keeping while the budget fits; everything
+	// older than the cut-off is evicted (§7.1 recency semantics — the freshest
+	// images are the most relevant to the current reasoning).
+	running = total;
+	for (let i = keptOrdinary.length - 1; i >= 0; i--) {
+		const p = keptOrdinary[i]!;
+		const key = `${p.msgIdx}:${p.blkIdx}`;
+		const cost = estimatePosTokens(p, settings);
+		if (running + cost <= budget) {
+			running += cost;
+			continue;
+		}
+		keepKeys.delete(key);
+		evicted.add(key);
+	}
+	return evicted;
+}
+
+/**
+ * Estimate the visual token cost of one position at its target tier (§9.1).
+ *   - kept image_ref → its src bbox at the detail/working tier;
+ *   - live `image` block → no src available, estimate as a square at its tier
+ *     (detail/working).
+ */
+function estimatePosTokens(
+	p: { kind: "ref" | "image"; pending?: boolean; ref?: ImageRefContent },
+	settings: TransformContextSettings,
+): number {
+	// Detail tier: pending snapshots and the newest kept ordinary. We cannot see
+	// "newest" from here, so approximate: pending → detail, otherwise working.
+	// This is an upper bound good enough for budget eviction (over-estimate
+	// trends toward earlier eviction, which is safe per §9.1).
+	const isDetail = !!p.pending;
+	const targetLongEdge = isDetail ? settings.detailImageLongEdge : settings.workingImageLongEdge;
+	if (p.kind === "ref" && p.ref) {
+		const src = p.ref.src || { x: 0, y: 0, w: 0, h: 0 };
+		return estimateImageRefTokens({ w: src.w, h: src.h }, targetLongEdge);
+	}
+	// Live image: no src on the block → estimate a square at the target tier.
+	return estimateImageRefTokens({ w: targetLongEdge, h: targetLongEdge }, targetLongEdge);
 }
 
 /**
@@ -844,6 +967,9 @@ export function buildSnapshotObservationIndex(
  * Assemble without a checkpoint: pure Phase 1 transform behavior (no stable
  * region, no overview verification). Used when the session has no checkpoint
  * yet (the runner's ensureCheckpoint will build one on the next run).
+ *
+ * Returns the rebuilt messages AND the explicit eviction list (P2-6) so the
+ * caller can populate the §12 metric without diffing.
  */
 async function assembleWithoutCheckpoint(
 	messages: AgentMessage[],
@@ -851,14 +977,14 @@ async function assembleWithoutCheckpoint(
 	snap: AssemblerSessionSnapshot,
 	signal: AbortSignal | undefined,
 	onRegionFetchMs: (ms: number) => void,
-): Promise<AgentMessage[]> {
+): Promise<{ out: AgentMessage[]; evictedRefIds: string[] }> {
 	// Reuse the recent-slice transform with an empty observations index and no
 	// overview ref. The "recent slice" here is the full message list (no
 	// checkpoint boundary to cut at). Region-fetch time is reported via the
 	// onRegionFetchMs callback inside transformRecentSlice (do NOT also add it
 	// here — that would double-count).
 	const observationsIndex = buildSnapshotObservationIndex(snap.observations, snap.messages);
-	const out = await transformRecentSlice({
+	const res = await transformRecentSlice({
 		messages: messages as PersistedAgentMessage[],
 		deps,
 		overviewRefId: null,
@@ -868,7 +994,10 @@ async function assembleWithoutCheckpoint(
 		signal,
 		onRegionFetchMs,
 	});
-	return stripContextMeta(out as PersistedAgentMessage[]) as AgentMessage[];
+	return {
+		out: stripContextMeta(res.messages as PersistedAgentMessage[]) as AgentMessage[],
+		evictedRefIds: res.evictedRefIds,
+	};
 }
 
 // =========================================================================== //
@@ -912,10 +1041,12 @@ function countImageBytes(messages: AgentMessage[]): number {
 }
 
 function collectEvictedRefs(before: PersistedAgentMessage[], after: AgentMessage[]): string[] {
+	// P2-6: this heuristic ("all refs in `before` are evicted") is wrong — it
+	// ignores `after` entirely and over-reports evictions. The selectors now
+	// return the explicit eviction list via {@link transformRecentSlice}, so
+	// this helper is DEPRECATED and kept only for backwards-compat callers. It
+	// is no longer used on the production path.
 	const evicted: string[] = [];
-	// Walk before; any image_ref whose position is now text in `after` is evicted.
-	// Simple heuristic: collect refs from `before` that are not present as images
-	// in `after` (by ref_id). This is approximate but sufficient for metrics.
 	const beforeRefs = new Set<string>();
 	for (const m of before) {
 		const content = (m as { content?: unknown }).content;
@@ -924,6 +1055,7 @@ function collectEvictedRefs(before: PersistedAgentMessage[], after: AgentMessage
 			if (part && isImageRefContent(part)) beforeRefs.add(part.ref_id);
 		}
 	}
+	void after;
 	for (const ref of beforeRefs) evicted.push(ref);
 	return evicted;
 }

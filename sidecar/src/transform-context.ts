@@ -41,6 +41,7 @@ import type { FlaskClient } from "./flask-client.js";
 import { FlaskHttpError } from "./flask-client.js";
 import type { SlideInfo } from "./tools.js";
 import { isImageContent, isImageRefContent, stripContextMeta, type ImageRefContent, type PersistedAgentMessage } from "./session-store.js";
+import { estimateImageRefTokens } from "./compaction.js";
 
 const PLACEHOLDER_TEXT = "（历史快照已省略，可用 goto+snapshot 重新查看）";
 const DEGRADE_TEXT = "该图因切片变更不可用。";
@@ -63,6 +64,8 @@ const DEFAULT_REGION_CONCURRENCY = 3;
 const DEFAULT_LRU_MAX_MB = 64;
 const DEFAULT_LRU_TTL_MS = 1800_000;
 const MB_BYTES = 1024 * 1024;
+/** Default per-request visual token hard budget (§9.1/§11). */
+const DEFAULT_VISUAL_CONTEXT_BUDGET_TOKENS = 8000;
 
 // =========================================================================== //
 // Public config
@@ -109,6 +112,12 @@ export interface TransformContextSettings {
 	regionConcurrency: number;
 	lruMaxBytes: number;
 	lruTtlMs: number;
+	/**
+	 * Per-request visual token HARD budget (§9.1). The assembler and the Phase 1
+	 * selectors evict the oldest ordinary kept images until the estimated
+	 * selected visual tokens <= this value. Default 8000 (§11). P2-3.
+	 */
+	visualContextBudgetTokens: number;
 }
 
 function numOr(v: unknown, def: number): number {
@@ -144,6 +153,13 @@ export function resolveTransformSettings(cfg: TransformContextConfig): Transform
 		regionConcurrency: numOr(cfg.region_materialize_concurrency, DEFAULT_REGION_CONCURRENCY),
 		lruMaxBytes: Math.floor(lruMaxMb * MB_BYTES),
 		lruTtlMs: Math.floor(lruTtlS * 1000),
+		// P2-3 (§9.1): visual token hard budget. visual_context_budget_tokens <= 0
+		// disables the budget (treated as "no limit"); a positive value enforces
+		// the HARD cap in both selectors.
+		visualContextBudgetTokens: (() => {
+			const v = Number(cfg.visual_context_budget_tokens);
+			return Number.isFinite(v) && v > 0 ? v : DEFAULT_VISUAL_CONTEXT_BUDGET_TOKENS;
+		})(),
 	};
 }
 
@@ -341,11 +357,27 @@ export function invalidateRegionLru(slide?: string): void {
 
 /**
  * One in-flight derivative request. Subscribers each hold their own AbortSignal;
- * the underlying fetch is only aborted when there are NO subscribers left. The
- * promise resolves/rejects for all subscribers with the same result.
+ * the underlying fetch is only aborted when there are NO subscribers left (§12.1
+ * /§16.2).
+ *
+ * Each subscriber gets its OWN promise (§16.2: "用户取消后不再等待无关历史图片
+ * 请求完成"). The per-subscriber promise is wired to the shared underlying fetch
+ * via `entry.promise.then(resolve, reject)`; if the subscriber's own signal
+ * aborts, its promise rejects IMMEDIATELY with an AbortError and detaches from
+ * the entry — without waiting for the shared fetch to settle. The shared fetch
+ * itself is only aborted when the last subscriber leaves, so a cancelling
+ * subscriber never aborts another subscriber's in-flight image.
  */
 type Subscriber = {
 	signal: AbortSignal;
+	/**
+	 * Resolve/reject the per-subscriber promise. Tied to {@link InFlightEntry.promise}
+	 * via `.then`; detached on settle so we never double-settle.
+	 */
+	resolve: (v: { data: string; mime: string; encoder?: unknown }) => void;
+	reject: (e: unknown) => void;
+	/** Whether this subscriber has already settled (avoid double settle). */
+	settled: boolean;
 	/** Per-subscriber abort listener; detached on removal. */
 	detach: () => void;
 };
@@ -360,8 +392,10 @@ type InFlightEntry = {
 const inFlight = new Map<string, InFlightEntry>();
 
 /**
- * Detach a subscriber's abort listener, drop it from the entry, and abort the
- * underlying fetch when no subscribers remain.
+ * Detach a subscriber's abort listener and drop it from the entry. When no
+ * subscribers remain, abort the underlying fetch so we do not keep doing work
+ * nobody wants (§12.1: "只有同一 in-flight 派生请求已无订阅者时才中止底层
+ * region fetch").
  */
 function detachSubscriberKey(entry: InFlightEntry, sub: Subscriber): void {
 	sub.detach();
@@ -372,26 +406,72 @@ function detachSubscriberKey(entry: InFlightEntry, sub: Subscriber): void {
 }
 
 /**
- * Register a subscriber on an entry. The subscriber's abort listener detaches
- * it on abort (and aborts the shared fetch only when it was the last one).
+ * Build a fresh per-subscriber promise that resolves with the shared fetch's
+ * result, or rejects immediately when THIS subscriber's signal fires. The
+ * promise is settled exactly once; the listener is detached on settle to avoid
+ * leaks (§16.2).
  */
-function addSubscriber(entry: InFlightEntry, signal: AbortSignal): Subscriber {
-	const sub: Subscriber = { signal, detach: () => undefined };
-	const onAbort = (): void => detachSubscriberKey(entry, sub);
+function addSubscriber(entry: InFlightEntry, signal: AbortSignal): {
+	promise: Promise<{ data: string; mime: string; encoder?: unknown }>;
+	sub: Subscriber;
+} {
+	// Per-subscriber promise; settled either by the shared fetch (resolve/reject
+	// forwarded) or by this subscriber's own abort (immediate reject).
+	const sub: Subscriber = { signal, resolve: () => undefined, reject: () => undefined, settled: false, detach: () => undefined };
+	const promise = new Promise<{ data: string; mime: string; encoder?: unknown }>((resolve, reject) => {
+		sub.resolve = resolve;
+		sub.reject = reject;
+	});
+	// Forward the shared fetch's outcome to this subscriber exactly once.
+	const onSettle = (ok: boolean): (v: unknown, e?: unknown) => void => {
+		return ok
+			? (v: unknown): void => {
+					if (sub.settled) return;
+					sub.settled = true;
+					sub.detach();
+					entry.subscribers.delete(sub);
+					sub.resolve(v as { data: string; mime: string; encoder?: unknown });
+				}
+			: (_v: unknown, e: unknown): void => {
+					if (sub.settled) return;
+					sub.settled = true;
+					sub.detach();
+					entry.subscribers.delete(sub);
+					sub.reject(e);
+				};
+	};
+	const onFulfilled = onSettle(true);
+	const onRejected = (e: unknown): void => onSettle(false)(undefined, e);
+	entry.promise.then(onFulfilled, onRejected);
+	// Abort listener: reject this subscriber immediately and detach (the shared
+	// fetch continues for the remaining subscribers; the underlying fetch only
+	// aborts when detachSubscriberKey drops the last one).
+	const onAbort = (): void => {
+		if (sub.settled) return;
+		sub.settled = true;
+		// Detach + drop BEFORE rejecting so the bookkeeping is consistent even
+		// if the reject path throws synchronously into the caller.
+		detachSubscriberKey(entry, sub);
+		const err = typeof DOMException !== "undefined"
+			? new DOMException("The operation was aborted.", "AbortError")
+			: new Error("aborted");
+		sub.reject(err);
+	};
 	sub.detach = (): void => signal.removeEventListener("abort", onAbort);
 	entry.subscribers.add(sub);
 	if (signal.aborted) {
-		detachSubscriberKey(entry, sub);
+		onAbort();
 	} else {
 		signal.addEventListener("abort", onAbort, { once: true });
 	}
-	return sub;
+	return { promise, sub };
 }
 
 /**
  * Subscribe to (or start) an in-flight derivative fetch for `key`. Same-key
- * callers share one region call; each subscriber's signal only unsubscribes,
- * and the underlying fetch aborts only when the last subscriber leaves.
+ * callers share ONE region call; each subscriber receives its OWN promise that
+ * rejects immediately when ITS signal aborts (§16.2). The underlying fetch is
+ * only aborted when the last subscriber leaves (§12.1).
  */
 function subscribeDerivative(
 	key: string,
@@ -401,8 +481,8 @@ function subscribeDerivative(
 	const existing = inFlight.get(key);
 	const subSig = signal ?? new AbortController().signal;
 	if (existing) {
-		addSubscriber(existing, subSig);
-		return existing.promise;
+		const { promise } = addSubscriber(existing, subSig);
+		return promise;
 	}
 	const fetchController = new AbortController();
 	const subscribers = new Set<Subscriber>();
@@ -418,8 +498,8 @@ function subscribeDerivative(
 	});
 	entry.promise = promise;
 	inFlight.set(key, entry);
-	addSubscriber(entry, subSig);
-	return promise;
+	const { promise: subPromise } = addSubscriber(entry, subSig);
+	return subPromise;
 }
 
 // =========================================================================== //
@@ -672,6 +752,13 @@ async function transformOnce(
 		keepKeys.add(posKey(p));
 	}
 
+	// Phase 2b (§9.1 / P2-3): enforce the visual token budget as a HARD cap.
+	// Overview and pending positions are non-evictable; the oldest ordinary
+	// kept images are evicted until the estimate fits the budget. Phase 1 path
+	// has no stable-region overview (the overview is one of the kept positions),
+	// so the overview cost is counted directly from the kept overview position.
+	enforceTransformOnceBudget(keepKeys, positions, ordinary, keepFrom, settings);
+
 	// Phase 3: materialize KEEP refs only (concurrency cap, signal-aware).
 	// The newest kept *ordinary* (non-overview, non-pending) ref gets the detail
 	// tier (§6.1 current high-power evidence image); pending snapshots also get
@@ -733,6 +820,65 @@ function posKey(p: { msgIdx: number; blkIdx: number }): string {
 
 function rank(p: { msgIdx: number; blkIdx: number }): number {
 	return p.msgIdx * 1_000_000 + p.blkIdx;
+}
+
+/**
+ * Phase 2b (§9.1 / P2-3) budget enforcement for the Phase 1 {@link transformOnce}
+ * selector. Evicts the oldest ordinary kept image_refs/images until the estimated
+ * selected visual tokens <= {@link TransformContextSettings.visualContextBudgetTokens}.
+ *
+ * Overview and pending positions are NEVER evicted (§9.1). Mutates `keepKeys`
+ * in place (removed keys are evicted). The overview position (kept) is counted
+ * at the overview tier; pending at the detail tier; ordinary kept at the
+ * working/detail tier (approximated as working since "newest" is decided later).
+ */
+function enforceTransformOnceBudget(
+	keepKeys: Set<string>,
+	positions: ImgPos[],
+	ordinary: ImgPos[],
+	keepFrom: number,
+	settings: TransformContextSettings,
+): void {
+	const budget = settings.visualContextBudgetTokens;
+	if (!(Number.isFinite(budget) && budget > 0)) return;
+	// Sum non-evictable (overview + pending) cost first.
+	let baseline = 0;
+	for (const p of positions) {
+		const key = posKey(p);
+		if (!keepKeys.has(key)) continue;
+		if (p.overview) {
+			baseline += estimateImageRefTokens({ w: settings.overviewLongEdge, h: settings.overviewLongEdge }, settings.overviewLongEdge);
+		} else if (p.pending) {
+			baseline += estimateImageRefTokens({ w: settings.detailImageLongEdge, h: settings.detailImageLongEdge }, settings.detailImageLongEdge);
+		}
+	}
+	const keptOrdinary = ordinary.slice(keepFrom);
+	// If total fits, nothing to do.
+	const costOf = (p: ImgPos): number => {
+		const target = p.pending ? settings.detailImageLongEdge : settings.workingImageLongEdge;
+		if (p.kind === "ref" && p.ref) {
+			const src = p.ref.src || { x: 0, y: 0, w: 0, h: 0 };
+			return estimateImageRefTokens({ w: src.w, h: src.h }, target);
+		}
+		return estimateImageRefTokens({ w: target, h: target }, target);
+	};
+	let running = baseline;
+	for (const p of keptOrdinary) running += costOf(p);
+	if (running <= budget) return;
+	// Evict OLDEST-first so the NEWEST evidence images survive: walk from the
+	// newest kept image backwards, keeping while the budget fits; everything
+	// older than the cut-off is evicted (§7.1 recency semantics — the freshest
+	// images are the most relevant to the current reasoning).
+	running = baseline;
+	for (let i = keptOrdinary.length - 1; i >= 0; i--) {
+		const p = keptOrdinary[i]!;
+		const cost = costOf(p);
+		if (running + cost <= budget) {
+			running += cost;
+			continue;
+		}
+		keepKeys.delete(posKey(p));
+	}
 }
 
 /**

@@ -38,7 +38,7 @@ import type {
 	PersistedContent,
 	SessionData,
 } from "./session-store.js";
-import { isImageRefContent } from "./session-store.js";
+import { isImageRefContent, stripContextMetaMessage } from "./session-store.js";
 
 // =========================================================================== //
 // Frontend canonical types
@@ -182,6 +182,10 @@ function toToolResultMessage(m: ToolResultMessage): FrontendMessage {
  * Convert a single persisted pi message to the frontend canonical shape.
  * Returns null for messages that have no role (shouldn't happen for persisted
  * messages; defensive).
+ *
+ * `_context_meta` (§10) is never carried into the frontend payload: the
+ * per-role converters build fresh objects with only the known UI fields, and
+ * the unknown-role pass-through is stripped via {@link stripContextMetaMessage}.
  */
 export function toFrontendMessage(m: PersistedAgentMessage): FrontendMessage | null {
 	if (!isObject(m)) return null;
@@ -189,8 +193,9 @@ export function toFrontendMessage(m: PersistedAgentMessage): FrontendMessage | n
 	if (role === "user") return toUserMessage(m as UserMessage & Record<string, unknown>);
 	if (role === "assistant") return toAssistantMessage(m as unknown as AssistantMessage);
 	if (role === "toolResult") return toToolResultMessage(m as unknown as ToolResultMessage);
-	// system / custom / unknown: pass through (frontend handles system entries).
-	return m as unknown as FrontendMessage;
+	// system / custom / unknown: pass through (frontend handles system entries),
+	// but strip sidecar-only _context_meta first (§10 Provider/UI boundary).
+	return stripContextMetaMessage(m) as unknown as FrontendMessage;
 }
 
 /**

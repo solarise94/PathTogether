@@ -40,7 +40,7 @@ import type { ImageContent } from "@earendil-works/pi-ai";
 import type { FlaskClient } from "./flask-client.js";
 import { FlaskHttpError } from "./flask-client.js";
 import type { SlideInfo } from "./tools.js";
-import { isImageContent, isImageRefContent, type ImageRefContent, type PersistedAgentMessage } from "./session-store.js";
+import { isImageContent, isImageRefContent, stripContextMeta, type ImageRefContent, type PersistedAgentMessage } from "./session-store.js";
 
 const PLACEHOLDER_TEXT = "（历史快照已省略，可用 goto+snapshot 重新查看）";
 const DEGRADE_TEXT = "该图因切片变更不可用。";
@@ -517,7 +517,7 @@ export function makeTransformContext(args: {
 
 	return async (messages, signal): Promise<AgentMessage[]> => {
 		try {
-			return await transformOnce(
+			const out = await transformOnce(
 				messages,
 				flask,
 				slide,
@@ -527,9 +527,13 @@ export function makeTransformContext(args: {
 				pendingSnapshotIdRef ?? { value: null },
 				signal,
 			);
+			// Provider boundary (§10): strip sidecar-only _context_meta so the
+			// model payload never carries session_message_seq.
+			return stripContextMeta(out as PersistedAgentMessage[]) as AgentMessage[];
 		} catch {
-			// Never leave image_ref in the output; never throw.
-			return stripImageRefsToDegrade(messages);
+			// Never leave image_ref in the output; never throw. Also strip
+			// _context_meta on the fallback path (§10 Provider boundary).
+			return stripContextMeta(stripImageRefsToDegrade(messages) as PersistedAgentMessage[]) as AgentMessage[];
 		}
 	};
 }

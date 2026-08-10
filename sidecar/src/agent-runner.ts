@@ -44,8 +44,10 @@ import {
 } from "./tools.js";
 import {
 	SessionConflict,
+	appendMessages,
 	collectImageMeta,
 	dehydrateMessages,
+	replaceMessagesPreservingSeq,
 	type PersistedAgentMessage,
 	type SessionData,
 	type SessionStore,
@@ -326,7 +328,8 @@ export class AgentRunner {
 			// 重放会把旧工具轨迹重复渲染一遍。（create 路径从 0 起流。）
 			const streamFromSeq = data.last_event_seq || 0;
 			const qText = args.question || "请谈谈这个区域";
-			// Append the user question to the transcript (app.py:1720).
+			// Append the user question to the transcript (app.py:1720). Goes
+			// through the seq-allocating append path (§10).
 			const updated = await this.store.withLock(data.id, async (d) => {
 				if (!d) return null;
 				const msg: PersistedAgentMessage = {
@@ -335,7 +338,7 @@ export class AgentRunner {
 					display_text: qText,
 					timestamp: Date.now(),
 				} as PersistedAgentMessage;
-				d.messages = [...(d.messages || []), msg];
+				appendMessages(d, [msg]);
 				d.updated_at = Math.floor(Date.now() / 1000);
 				await this.store.writeSession(data.id, d);
 				return d;
@@ -409,6 +412,7 @@ export class AgentRunner {
 			const streamFromSeq = data.last_event_seq || 0;
 			const qText = args.question || "请谈谈这个区域";
 			// Append the user question to the transcript (mirrors fork resume).
+			// Goes through the seq-allocating append path (§10).
 			const updated = await this.store.withLock(data.id, async (d) => {
 				if (!d) return null;
 				const msg: PersistedAgentMessage = {
@@ -417,7 +421,7 @@ export class AgentRunner {
 					display_text: qText,
 					timestamp: Date.now(),
 				} as PersistedAgentMessage;
-				d.messages = [...(d.messages || []), msg];
+				appendMessages(d, [msg]);
 				d.updated_at = Math.floor(Date.now() / 1000);
 				await this.store.writeSession(data.id, d);
 				return d;
@@ -516,7 +520,9 @@ export class AgentRunner {
 				if (!d) return null;
 				// injectSpotChanges already appended spotMsgs to d.messages;
 				// rebuild as [userMsg, ...spotMsgs] (drop any prior residue).
-				d.messages = [...initialMessages];
+				// Preserved seqs (spotMsgs already stamped) are kept; userMsg gets
+				// a fresh seq via the replace-with-preserve path (§10).
+				replaceMessagesPreservingSeq(d, [...initialMessages]);
 				d.agent_state = st.toDict();
 				d.updated_at = Math.floor(Date.now() / 1000);
 				await this.store.writeSession(sessionId, d);
@@ -587,7 +593,8 @@ export class AgentRunner {
 			initialMessages = [userMsg];
 			await this.store.withLock(sessionId, async (d) => {
 				if (!d) return null;
-				d.messages = [...initialMessages];
+				// Fresh fork: seed the only message with a fresh seq (§10).
+				replaceMessagesPreservingSeq(d, [...initialMessages]);
 				d.updated_at = Math.floor(Date.now() / 1000);
 				await this.store.writeSession(sessionId, d);
 				return d;
@@ -649,7 +656,8 @@ export class AgentRunner {
 			initialMessages = [userMsg];
 			await this.store.withLock(sessionId, async (d) => {
 				if (!d) return null;
-				d.messages = [...initialMessages];
+				// Fresh branch: seed the only message with a fresh seq (§10).
+				replaceMessagesPreservingSeq(d, [...initialMessages]);
 				d.updated_at = Math.floor(Date.now() / 1000);
 				await this.store.writeSession(sessionId, d);
 				return d;
@@ -1073,7 +1081,10 @@ export class AgentRunner {
 
 		await this.store.withLock(sessionId, async (d) => {
 			if (!d) return null;
-			d.messages = dehydrated;
+			// Replace the full transcript. Live agent messages carry no
+			// _context_meta, so they get fresh monotonic seqs via the
+			// replace-with-preserve path (§10): monotonic + never reused.
+			replaceMessagesPreservingSeq(d, dehydrated);
 			d.updated_at = Math.floor(Date.now() / 1000);
 			await this.store.writeSession(sessionId, d);
 			return d;
@@ -1353,7 +1364,8 @@ export class AgentRunner {
 
 		await this.store.withLock(sessionId, async (d) => {
 			if (!d) return null;
-			d.messages = [...(d.messages || []), ...msgs];
+			// Append with seq allocation (§10).
+			appendMessages(d, msgs);
 			d.spot_cursor = result.current_seq || cursor;
 			d.updated_at = Math.floor(Date.now() / 1000);
 			await this.store.writeSession(sessionId, d);

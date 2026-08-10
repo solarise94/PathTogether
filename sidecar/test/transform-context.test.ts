@@ -502,6 +502,49 @@ describe("transform-context", () => {
 		});
 	});
 
+	describe("Provider boundary: _context_meta stripped (§10)", () => {
+		it("strips _context_meta from the transform output (happy path)", async () => {
+			const flask = makeFlask();
+			const transform = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ keep_recent_images: 6 }),
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			// Input messages carry sidecar-only _context_meta.
+			const msgs = [
+				{ role: "user", content: [{ type: "image_ref", ref_id: "ref_a", slide_fingerprint: "fp-test", src: { x: 100, y: 100, w: 500, h: 500 }, magnification: "20x", summary: "snap" }], timestamp: 1, _context_meta: { session_message_seq: 1 } },
+				{ role: "user", content: "plain text", timestamp: 2, _context_meta: { session_message_seq: 2 } },
+			] as unknown as AgentMessage[];
+			const out = await transform(msgs);
+			// Provider payload must have no _context_meta and no image_ref.
+			for (const m of out as unknown[]) {
+				expect("_context_meta" in (m as object)).toBe(false);
+			}
+			expect(hasNoImageRefBlocks(out)).toBe(true);
+		});
+
+		it("strips _context_meta on the fallback (degrade) path too", async () => {
+			const flask = makeFlask({ fail: true });
+			const transform = makeTransformContext({
+				flask: flask as unknown as FlaskClient,
+				slide: SLIDE,
+				slideInfo: SLIDE_INFO,
+				settings: resolveTransformSettings({ keep_recent_images: 6 }),
+				firstSnapshotToolCallIdRef: { value: null },
+			});
+			const msgs = [
+				{ role: "user", content: [{ type: "image_ref", ref_id: "ref_a", slide_fingerprint: "fp-test", src: { x: 100, y: 100, w: 500, h: 500 }, magnification: "20x", summary: "snap" }], timestamp: 1, _context_meta: { session_message_seq: 5 } },
+			] as unknown as AgentMessage[];
+			const out = await transform(msgs);
+			for (const m of out as unknown[]) {
+				expect("_context_meta" in (m as object)).toBe(false);
+			}
+			expect(hasNoImageRefBlocks(out)).toBe(true);
+		});
+	});
+
 	// ------------------------------------------------------------------------- //
 	// Phase 1: aspect ratio / adaptive sizing (§6.1/§6.2)
 	// ------------------------------------------------------------------------- //

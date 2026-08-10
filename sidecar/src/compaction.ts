@@ -66,6 +66,7 @@ import type { FlaskClient } from "./flask-client.js";
 import {
 	collectImageMeta,
 	dehydrateMessages,
+	replaceMessagesPreservingSeq,
 	type PersistedAgentMessage,
 	type SessionData,
 	type SessionStore,
@@ -367,6 +368,7 @@ export async function persistCompaction(
 			...(outcome.retainedTail as PersistedAgentMessage[]),
 			...(newMessages as PersistedAgentMessage[]),
 		]);
+		const dehydratedTail = dehydrateMessages(outcome.retainedTail, imageMeta);
 		const entry: PersistedCompactionEntry = {
 			seq: (d.last_event_seq || 0) + 1,
 			tokens_before: outcome.tokensBefore,
@@ -376,10 +378,16 @@ export async function persistCompaction(
 			summary: outcome.summary,
 			// Persist the retained tail in dehydrated form. The summary message is
 			// already at the head of newMessages, so we only need the tail.
-			retained_tail: dehydrateMessages(outcome.retainedTail, imageMeta),
+			retained_tail: dehydratedTail,
 		};
 		d.compaction_entries = [...(d.compaction_entries || []), entry as unknown as (typeof d.compaction_entries)[number]];
-		d.messages = dehydrateMessages(newMessages, imageMeta);
+		// Replace messages preserving seqs (§10): dehydrated retained-tail
+		// messages that already carry _context_meta keep their seq (retained tail
+		// is NOT renumbered); the new compactionSummary message and any spot-index
+		// message get fresh monotonic seqs. dehydrateMessages preserves existing
+		// _context_meta via object spread.
+		const dehydrated = dehydrateMessages(newMessages, imageMeta);
+		replaceMessagesPreservingSeq(d, dehydrated);
 		d.updated_at = Math.floor(Date.now() / 1000);
 		await store.writeSession(sessionId, d);
 		return d;

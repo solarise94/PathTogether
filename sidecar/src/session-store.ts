@@ -39,6 +39,13 @@ import type {
 	TextContent,
 	ToolResultMessage,
 } from "@earendil-works/pi-ai";
+// Type-only imports (no runtime cycle): checkpoint.ts also imports types
+// from here via `import type`. Both directions are erased at compile time.
+// commitCheckpoint's runtime helpers (generationMatches is type-only-safe as
+// a pure function; we import the result type + the predicate for the method
+// signature). The actual CAS logic lives in this store method.
+import type { CommitCheckpointResult, ContextCheckpoint, VisualWorkingSetEntry } from "./checkpoint.js";
+import { generationMatches } from "./checkpoint.js";
 
 // --------------------------------------------------------------------------- //
 // Types
@@ -114,18 +121,37 @@ export type PersistedContent =
 	| { type: "toolCall"; id: string; name: string; arguments: Record<string, unknown>; thoughtSignature?: string };
 
 /**
+ * Sidecar-only metadata attached to each persisted message (§10). The
+ * `session_message_seq` is a session-local, monotonically increasing, never
+ * reused number used by {@link ContextCheckpoint.through_message_seq} and the
+ * Phase 2b request assembler to describe the canonical boundary the stable
+ * region covers. It is NOT the array index and NOT the SSE event `seq`.
+ *
+ * This metadata is stripped at every Provider/UI boundary (see
+ * {@link stripContextMeta}); it must never reach a model payload or the
+ * frontend transcript.
+ */
+export interface PersistedMessageMeta {
+	/** From 1, monotonically increasing, never reused within one session. */
+	session_message_seq: number;
+}
+
+/**
  * A persisted AgentMessage. pi AgentMessage is a union of LLM Message types
  * plus app-defined custom messages; on disk we keep that exact shape, except
  * image content blocks are dehydrated to {@link ImageRefContent}. Because the
  * persisted form widens the content union, we type messages as a structural
  * superset (`PersistedAgentMessage`) rather than the narrower pi union.
+ *
+ * The optional `_context_meta` (§10) carries the session-local message
+ * sequence; it is sidecar-internal and stripped before Provider/UI payloads.
  */
 export type PersistedAgentMessage = (
 	| { role: "user"; content: string | PersistedContent[]; timestamp: number }
 	| (Omit<AssistantMessage, "content"> & { content: PersistedContent[] })
 	| (Omit<ToolResultMessage, "content"> & { content: PersistedContent[] })
 	| { role: string; content: unknown; timestamp?: number }
-);
+) & { _context_meta?: PersistedMessageMeta };
 
 /** Compaction bookkeeping entry (Step 4 fills this in; declared now). */
 export interface CompactionEntry {
@@ -195,6 +221,22 @@ export interface SessionData {
 	messages: PersistedAgentMessage[];
 	/** Compaction log; populated in Step 4. */
 	compaction_entries: CompactionEntry[];
+
+	// Phase 2a: stable context checkpoint + message sequencing (§10) ----------
+	/**
+	 * Next session_message_seq to assign (§10). From 1, monotonic, never
+	 * reused. Absent on legacy sessions until {@link assignMessageSeqs} runs
+	 * (lazy migration on first read/write).
+	 */
+	next_message_seq?: number;
+	/**
+	 * Stable context checkpoint (§3.2/§10). Absent on sessions that have not
+	 * yet built one; {@link ensureCheckpoint} (Phase 2a) lazily materializes a
+	 * generation-1 checkpoint from existing compaction/observations/overview.
+	 */
+	context_checkpoint?: ContextCheckpoint;
+	/** Visual working set entries (§3.3/§10). Optional; derived when absent. */
+	visual_working_set?: VisualWorkingSetEntry[];
 }
 
 /** A logged event line in `<id>.events.jsonl` (ai_session.py:333). */
@@ -276,9 +318,13 @@ export interface SessionStoreOptions {
 }
 
 /**
- * Per-session-store async mutex map. Keyed by store instance + session id so
- * independent stores (e.g. test temp dirs) don't share locks. Single Node
- * process means in-process serialization is sufficient; there are no
+ * Per-session async mutex (§12.1). A single chain of promises per session id
+ * serializes read-modify-write sections so two concurrent withLock callers for
+ * the *same* session never interleave. Different sessions get independent
+ * chains, so cross-session work runs concurrently (the old implementation
+ * shared one mutex for the whole store, serializing unrelated sessions).
+ *
+ * Single Node process: in-process serialization is sufficient; there are no
  * cross-process file locks.
  */
 class AsyncMutex {
@@ -297,11 +343,40 @@ class AsyncMutex {
 export class SessionStore {
 	readonly sessionsDir: string;
 	private readonly eventBuffer: number;
-	private readonly mutex = new AsyncMutex();
+	/**
+	 * Per-session locks (§12.1). Created lazily on first use; dropped on
+	 * {@link releaseLock} (called when a session is known to be gone, e.g. via
+	 * explicit cleanup). The map is bounded by the number of sessions this
+	 * process has ever touched, which is itself bounded by the on-disk session
+	 * count; long-running processes can prune by calling releaseLock during
+	 * session lifecycle events. Leaving entries in place is acceptable: each
+	 * entry is a tiny object and an already-settled promise chain.
+	 */
+	private readonly locks = new Map<string, AsyncMutex>();
 
 	constructor(opts: SessionStoreOptions = {}) {
 		this.sessionsDir = opts.sessionsDir ?? defaultSessionsDir();
 		this.eventBuffer = opts.eventBuffer ?? DEFAULT_EVENT_BUFFER;
+	}
+
+	/** Get (creating if absent) the mutex for one session id. */
+	private mutexFor(id: string): AsyncMutex {
+		let m = this.locks.get(id);
+		if (!m) {
+			m = new AsyncMutex();
+			this.locks.set(id, m);
+		}
+		return m;
+	}
+
+	/**
+	 * Drop the per-session lock for `id` (§12.1 memory management). Safe to
+	 * call when a session has been deleted or is known to no longer need
+	 * serialization. A subsequent {@link withLock} for the same id lazily
+	 * recreates the mutex. No-op if no lock exists.
+	 */
+	releaseLock(id: string): void {
+		this.locks.delete(id);
 	}
 
 	// ------------------------------------------------------------------ //
@@ -371,15 +446,23 @@ export class SessionStore {
 		try {
 			const raw = await fs.readFile(p, "utf8");
 			const data = JSON.parse(raw);
-			return isSessionData(data) ? data : null;
+			if (!isSessionData(data)) return null;
+			// Lazy migration (§10): assign session_message_seq 1..N to legacy
+			// messages that predate next_message_seq. In-memory only; persisted
+			// on the next writeSession. Idempotent: once next_message_seq is a
+			// positive number, subsequent reads skip this. Messages already
+			// carrying _context_meta but with no next_message_seq (mixed legacy)
+			// are left as-is and next_message_seq is set to max(existing)+1.
+			assignMessageSeqs(data);
+			return data;
 		} catch {
 			return null;
 		}
 	}
 
-	/** Read+write under the per-session mutex. */
+	/** Read+write under the per-session mutex (§12.1: per-session, not global). */
 	async withLock<T>(id: string, fn: (data: SessionData | null) => Promise<T>): Promise<T> {
-		return this.mutex.acquire(async () => {
+		return this.mutexFor(id).acquire(async () => {
 			const data = await this.readSession(id);
 			return fn(data);
 		});
@@ -411,6 +494,9 @@ export class SessionStore {
 			event_buffer_size: this.eventBuffer,
 			messages: [],
 			compaction_entries: [],
+			// Phase 2a: seq allocation starts at 1 (§10). next_message_seq is the
+			// next value to hand out; 0 would mean "uninitialized".
+			next_message_seq: 1,
 		};
 	}
 
@@ -496,6 +582,98 @@ export class SessionStore {
 			data.last_accessed_at = t;
 			await this.writeSession(id, data);
 			return data;
+		});
+	}
+
+	// ------------------------------------------------------------------ //
+	// Message append with seq allocation (§10)
+	// ------------------------------------------------------------------ //
+	/**
+	 * Append `newMsgs` to the session under the per-session lock, assigning each
+	 * a fresh monotonic {@link PersistedMessageMeta.session_message_seq}, then
+	 * persist atomically (§10). Returns the written session data, or null if
+	 * the session does not exist.
+	 *
+	 * This is the canonical append path: callers that previously did
+	 * `d.messages = [...d.messages, ...msgs]` inside `withLock` should use this
+	 * (or the module-level {@link appendMessages} helper inside an existing
+	 * locked section) so seqs stay monotonic and never reused.
+	 */
+	async appendMessages(id: string, newMsgs: PersistedAgentMessage[]): Promise<SessionData | null> {
+		return this.withLock(id, async (data) => {
+			if (data === null) return null;
+			appendMessages(data, newMsgs);
+			data.updated_at = nowSec();
+			await this.writeSession(id, data);
+			return data;
+		});
+	}
+
+	// ------------------------------------------------------------------ //
+	// Checkpoint compare-and-swap commit (§5.3)
+	// ------------------------------------------------------------------ //
+	/**
+	 * Atomically commit a checkpoint mutation under the per-session lock (§5.3).
+	 *
+	 * Enters {@link withLock}, re-reads the authoritative session snapshot, and
+	 * validates:
+	 *   1. `data.context_checkpoint?.generation === expectedGeneration`
+	 *      (undefined===undefined is the explicit "first commit" semantic).
+	 *   2. `data.context_checkpoint?.slide_fingerprint === expectedFingerprint`
+	 *      when a checkpoint exists (a fingerprint change must invalidate the
+	 *      candidate; pass the slide's current fingerprint).
+	 *
+	 * On validation failure returns `{ok:false, reason}` WITHOUT modifying the
+	 * session — the on-disk checkpoint is left intact (another operation may
+	 * have bumped the generation, or the slide changed). On success runs
+	 * `mutate(data)` (which typically sets `data.context_checkpoint` to the new
+	 * generation), then writes via the existing tmp+rename mechanism.
+	 *
+	 * If `writeSession` throws (disk error), the tmp file is abandoned and the
+	 * previous rename target is untouched, so the old generation survives; we
+	 * surface that as `{ok:false, reason}` rather than propagating.
+	 *
+	 * Candidate computation (summary, overview derivative) should run OUTSIDE
+	 * the lock; only the commit enters it (§5.3).
+	 */
+	async commitCheckpoint(
+		id: string,
+		expectedGeneration: number | undefined,
+		expectedFingerprint: string,
+		mutate: (data: SessionData) => void,
+	): Promise<CommitCheckpointResult> {
+		return this.withLock(id, async (data) => {
+			if (data === null) {
+				return { ok: false, reason: "session not found" } as CommitCheckpointResult;
+			}
+			const cp = data.context_checkpoint;
+			const currentGen = cp?.generation;
+			if (!generationMatches(currentGen, expectedGeneration)) {
+				return {
+					ok: false,
+					reason: `generation mismatch: expected ${expectedGeneration}, found ${currentGen}`,
+				} as CommitCheckpointResult;
+			}
+			// Fingerprint check: when a checkpoint exists, its fingerprint must
+			// still match the expected one. On a first commit (no cp) we accept
+			// any fingerprint — the caller is establishing the baseline.
+			if (cp && cp.slide_fingerprint !== expectedFingerprint) {
+				return {
+					ok: false,
+					reason: `slide fingerprint mismatch: expected ${expectedFingerprint}, checkpoint has ${cp.slide_fingerprint}`,
+				} as CommitCheckpointResult;
+			}
+			try {
+				mutate(data);
+				data.updated_at = nowSec();
+				await this.writeSession(id, data);
+				return { ok: true, data } as CommitCheckpointResult;
+			} catch (e) {
+				return {
+					ok: false,
+					reason: `write failed: ${(e as Error)?.message || String(e)}`,
+				} as CommitCheckpointResult;
+			}
 		});
 	}
 
@@ -913,6 +1091,153 @@ export class SessionStore {
 		const entry = await this.listBySlide(slide);
 		return entry.branches[annotationId] ?? null;
 	}
+}
+
+// --------------------------------------------------------------------------- //
+// Session message sequence (§10)
+// --------------------------------------------------------------------------- //
+
+/**
+ * Lazy migration + idempotent seq assignment (§10).
+ *
+ * If `next_message_seq` is already a positive number, this is a no-op. If it
+ * is absent/zero (legacy session predating Phase 2a) and there are messages,
+ * assign `session_message_seq` 1..N in canonical array order and set
+ * `next_message_seq = N+1`.
+ *
+ * Once a session is migrated, all future writes go through {@link appendMessages}
+ * / {@link replaceMessagesPreservingSeq}, which keep seqs monotonic, so the
+ * mixed-legacy case (some messages numbered, some not, no next_message_seq)
+ * never arises in practice. We still defend against it: if next_message_seq is
+ * unset but some messages already carry a seq, we set next_message_seq to
+ * max(existing)+1 and leave the unnumbered ones unnumbered (the next append
+ * will stamp them via the normal path). The pure-legacy path assigns 1..N.
+ *
+ * Mutates `data` in place; does NOT write to disk (the caller writes when it
+ * next persists). Safe to call repeatedly.
+ */
+export function assignMessageSeqs(data: SessionData): void {
+	if (typeof data.next_message_seq === "number" && data.next_message_seq > 0) {
+		return; // already migrated
+	}
+	const msgs = data.messages || [];
+	if (msgs.length === 0) {
+		data.next_message_seq = 1;
+		return;
+	}
+	// Check whether any message already carries a seq (mixed-legacy guard).
+	let maxExisting = 0;
+	let anyNumbered = false;
+	for (const m of msgs) {
+		const seq = (m as PersistedAgentMessage & { _context_meta?: PersistedMessageMeta })?._context_meta?.session_message_seq;
+		if (typeof seq === "number" && seq > 0) {
+			anyNumbered = true;
+			if (seq > maxExisting) maxExisting = seq;
+		}
+	}
+	if (anyNumbered) {
+		// Defensive: do not renumber existing seqs; just advance the cursor past
+		// the highest known one. Unnumbered messages stay unnumbered until the
+		// next write path stamps them (acceptable: they predate checkpointing).
+		data.next_message_seq = maxExisting + 1;
+		return;
+	}
+	// Pure-legacy path: assign 1..N by canonical array order.
+	for (let i = 0; i < msgs.length; i++) {
+		const m = msgs[i] as (PersistedAgentMessage & { _context_meta?: PersistedMessageMeta }) | null;
+		if (!m || typeof m !== "object") continue;
+		m._context_meta = { session_message_seq: i + 1 };
+	}
+	data.next_message_seq = msgs.length + 1;
+}
+
+/**
+ * Allocate the next {@link PersistedMessageMeta.session_message_seq} for one
+ * message, mutating `data.next_message_seq`. Returns the assigned seq. Used by
+ * {@link appendMessages} and any caller that needs to stamp a single new
+ * message inside a locked section.
+ */
+export function nextSeq(data: SessionData): number {
+	if (typeof data.next_message_seq !== "number" || data.next_message_seq <= 0) {
+		// Defensive: ensure migration ran. assignMessageSeqs is idempotent.
+		assignMessageSeqs(data);
+	}
+	const seq = data.next_message_seq ?? 1;
+	data.next_message_seq = seq + 1;
+	return seq;
+}
+
+/**
+ * Stamp one message with the next seq (mutates the message's `_context_meta`
+ * and advances `data.next_message_seq`). Returns the assigned seq.
+ */
+export function assignSeqToMessage(data: SessionData, msg: PersistedAgentMessage): number {
+	const seq = nextSeq(data);
+	(msg as PersistedAgentMessage & { _context_meta?: PersistedMessageMeta })._context_meta = { session_message_seq: seq };
+	return seq;
+}
+
+/**
+ * Append `newMsgs` to `data.messages`, assigning each a fresh monotonic seq,
+ * and advancing `data.next_message_seq`. Mutates `data` in place. The caller
+ * is responsible for being inside `withLock` and calling `writeSession`.
+ *
+ * Returns the appended messages (now carrying `_context_meta`).
+ */
+export function appendMessages(data: SessionData, newMsgs: PersistedAgentMessage[]): PersistedAgentMessage[] {
+	const out: PersistedAgentMessage[] = [];
+	for (const m of newMsgs) {
+		assignSeqToMessage(data, m);
+		out.push(m);
+	}
+	data.messages = [...(data.messages || []), ...out];
+	return out;
+}
+
+/**
+ * Replace `data.messages` with `replacement`, preserving the seq of any message
+ * that already carries `_context_meta` (e.g. retained-tail messages after a
+ * compaction), and assigning fresh seqs only to messages that lack one (e.g.
+ * the new compactionSummary message) (§10: retained tail is NOT renumbered;
+ * only genuinely new messages get new seqs).
+ *
+ * Mutates `data` in place. The caller is inside `withLock`.
+ */
+export function replaceMessagesPreservingSeq(data: SessionData, replacement: PersistedAgentMessage[]): PersistedAgentMessage[] {
+	const out: PersistedAgentMessage[] = [];
+	for (const m of replacement) {
+		const meta = (m as PersistedAgentMessage & { _context_meta?: PersistedMessageMeta })._context_meta;
+		if (meta && typeof meta.session_message_seq === "number" && meta.session_message_seq > 0) {
+			// Retained message: keep its seq verbatim.
+			out.push(m);
+		} else {
+			assignSeqToMessage(data, m);
+			out.push(m);
+		}
+	}
+	data.messages = out;
+	return out;
+}
+
+/**
+ * Strip `_context_meta` from a single message (returns a shallow copy when it
+ * had meta, else the original). Used at Provider/UI boundaries (§10).
+ */
+export function stripContextMetaMessage<T extends PersistedAgentMessage>(m: T): T {
+	if (!m || typeof m !== "object") return m;
+	if (!("_context_meta" in m)) return m;
+	const { _context_meta: _drop, ...rest } = m as T & { _context_meta?: unknown };
+	return rest as T;
+}
+
+/**
+ * Strip `_context_meta` from every message in the array (§10 Provider/UI
+ * boundary). Returns a new array; messages without meta are passed through by
+ * reference. The output is safe to send to a Provider or serialize into a UI
+ * transcript.
+ */
+export function stripContextMeta<T extends PersistedAgentMessage>(msgs: T[]): T[] {
+	return msgs.map((m) => stripContextMetaMessage(m));
 }
 
 // --------------------------------------------------------------------------- //

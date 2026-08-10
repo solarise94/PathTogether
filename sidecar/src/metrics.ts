@@ -46,6 +46,12 @@ export interface RequestMetrics {
 	compaction_reason: string | null;
 	derivative_hash_mismatch: number;
 	checkpoint_rebuild_reason: string | null;
+	/**
+	 * Visual-budget overflow tokens (§12, Phase 3.1): > 0 when protected-priority
+	 * semantics forced this request over the visual token budget. Best-effort
+	 * estimate from the shared selector.
+	 */
+	visual_budget_overflow_tokens: number;
 }
 
 /**
@@ -90,6 +96,7 @@ export function buildRequestMetrics(args: {
 	compaction_reason?: string | null;
 	checkpoint_rebuild_reason?: string | null;
 	derivative_hash_mismatch?: number;
+	visual_budget_overflow_tokens?: number;
 	usage?: {
 		input?: number;
 		cacheRead?: number;
@@ -118,5 +125,6 @@ export function buildRequestMetrics(args: {
 		compaction_reason: args.compaction_reason ?? null,
 		derivative_hash_mismatch: args.derivative_hash_mismatch ?? 0,
 		checkpoint_rebuild_reason: args.checkpoint_rebuild_reason ?? null,
+		visual_budget_overflow_tokens: args.visual_budget_overflow_tokens ?? 0,
 	};
 }

@@ -41,7 +41,7 @@ import type { FlaskClient } from "./flask-client.js";
 import { FlaskHttpError } from "./flask-client.js";
 import type { SlideInfo } from "./tools.js";
 import { isImageContent, isImageRefContent, stripContextMeta, type ImageRefContent, type PersistedAgentMessage } from "./session-store.js";
-import { estimateImageRefTokens } from "./compaction.js";
+import { estimateImageRefTokens, enforceVisualTokenBudget, resetVisualBudgetOverflow } from "./compaction.js";
 
 const PLACEHOLDER_TEXT = "（历史快照已省略，可用 goto+snapshot 重新查看）";
 const DEGRADE_TEXT = "该图因切片变更不可用。";
@@ -214,6 +214,8 @@ let lruMissCount = 0;
 export function resetLruCounters(): void {
 	lruHitCount = 0;
 	lruMissCount = 0;
+	// Phase 3.1: the budget-overflow counter (compaction.ts) is per-request too.
+	resetVisualBudgetOverflow();
 }
 
 /** Current LRU hit count since the last {@link resetLruCounters} (§12). */
@@ -824,13 +826,15 @@ function rank(p: { msgIdx: number; blkIdx: number }): number {
 
 /**
  * Phase 2b (§9.1 / P2-3) budget enforcement for the Phase 1 {@link transformOnce}
- * selector. Evicts the oldest ordinary kept image_refs/images until the estimated
- * selected visual tokens <= {@link TransformContextSettings.visualContextBudgetTokens}.
+ * selector. Thin adapter over the SHARED {@link enforceVisualTokenBudget}
+ * (compaction.ts) — Phase 3.1 review: the two selectors had diverged, and both
+ * charged the newest ordinary image at the working tier even though it is
+ * materialized at the detail tier (1280 vs 768 px, ~1398 tokens short for a
+ * square). The newest kept ordinary position is therefore charged at the
+ * detail tier here.
  *
  * Overview and pending positions are NEVER evicted (§9.1). Mutates `keepKeys`
- * in place (removed keys are evicted). The overview position (kept) is counted
- * at the overview tier; pending at the detail tier; ordinary kept at the
- * working/detail tier (approximated as working since "newest" is decided later).
+ * in place (removed keys are evicted).
  */
 function enforceTransformOnceBudget(
 	keepKeys: Set<string>,
@@ -852,33 +856,26 @@ function enforceTransformOnceBudget(
 			baseline += estimateImageRefTokens({ w: settings.detailImageLongEdge, h: settings.detailImageLongEdge }, settings.detailImageLongEdge);
 		}
 	}
-	const keptOrdinary = ordinary.slice(keepFrom);
-	// If total fits, nothing to do.
+	const keptOrdinary = ordinary.slice(keepFrom); // oldest → newest
+	const newestKey = keptOrdinary.length ? posKey(keptOrdinary[keptOrdinary.length - 1]!) : null;
+	// Cost each kept ordinary image at its FINAL materialization tier: the
+	// newest ordinary is materialized at the detail tier (chooseTargetLongEdge),
+	// so it must be charged at detail — not working (Phase 3.1 P1).
 	const costOf = (p: ImgPos): number => {
-		const target = p.pending ? settings.detailImageLongEdge : settings.workingImageLongEdge;
+		const isDetail = p.pending || posKey(p) === newestKey;
+		const target = isDetail ? settings.detailImageLongEdge : settings.workingImageLongEdge;
 		if (p.kind === "ref" && p.ref) {
 			const src = p.ref.src || { x: 0, y: 0, w: 0, h: 0 };
 			return estimateImageRefTokens({ w: src.w, h: src.h }, target);
 		}
 		return estimateImageRefTokens({ w: target, h: target }, target);
 	};
-	let running = baseline;
-	for (const p of keptOrdinary) running += costOf(p);
-	if (running <= budget) return;
-	// Evict OLDEST-first so the NEWEST evidence images survive: walk from the
-	// newest kept image backwards, keeping while the budget fits; everything
-	// older than the cut-off is evicted (§7.1 recency semantics — the freshest
-	// images are the most relevant to the current reasoning).
-	running = baseline;
-	for (let i = keptOrdinary.length - 1; i >= 0; i--) {
-		const p = keptOrdinary[i]!;
-		const cost = costOf(p);
-		if (running + cost <= budget) {
-			running += cost;
-			continue;
-		}
-		keepKeys.delete(posKey(p));
-	}
+	const sel = enforceVisualTokenBudget({
+		budgetTokens: budget,
+		baselineTokens: baseline,
+		ordinary: keptOrdinary.map((p) => ({ key: posKey(p), tokens: costOf(p) })),
+	});
+	for (const key of sel.evictedKeys) keepKeys.delete(key);
 }
 
 /**

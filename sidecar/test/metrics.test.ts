@@ -128,6 +128,7 @@ describe("defaultMetricsSink (§12)", () => {
 				compaction_reason: null,
 				derivative_hash_mismatch: 0,
 				checkpoint_rebuild_reason: null,
+				visual_budget_overflow_tokens: 0,
 			};
 			defaultMetricsSink(m);
 			expect(lines.length).toBe(1);

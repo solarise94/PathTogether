@@ -72,7 +72,7 @@ import {
 	lruMissCount_value,
 	type TransformContextSettings,
 } from "./transform-context.js";
-import { estimateImageRefTokens } from "./compaction.js";
+import { estimateImageRefTokens, enforceVisualTokenBudget, visualBudgetOverflowTokensValue } from "./compaction.js";
 import { StableContextUnavailableError } from "./prepared-request.js";
 
 // =========================================================================== //
@@ -147,6 +147,13 @@ export interface AssemblerMetrics {
 	derivative_hash_mismatch: number;
 	checkpoint_rebuild_reason: string | null;
 	overview_status: "stable" | "repaired" | "rebuild-mismatch" | "no-overview";
+	/**
+	 * Visual-budget overflow tokens (§12, Phase 3.1): > 0 when protected-priority
+	 * semantics (overview/pending never evicted, newest ordinary force-kept)
+	 * forced this request over {@link TransformContextSettings.visualContextBudgetTokens}.
+	 * Reset per request via resetLruCounters at assemble start.
+	 */
+	visual_budget_overflow_tokens: number;
 }
 
 // =========================================================================== //
@@ -208,6 +215,7 @@ export function makeRequestAssembler(deps: RequestAssemblerDeps): (messages: Age
 					derivative_hash_mismatch: 0,
 					checkpoint_rebuild_reason: null,
 					overview_status: "no-overview",
+					visual_budget_overflow_tokens: visualBudgetOverflowTokensValue(),
 				});
 				return out;
 			}
@@ -297,6 +305,7 @@ export function makeRequestAssembler(deps: RequestAssemblerDeps): (messages: Age
 				derivative_hash_mismatch: overviewResult.hashMismatchCount,
 				checkpoint_rebuild_reason: staleReason,
 				overview_status: overviewResult.status,
+				visual_budget_overflow_tokens: visualBudgetOverflowTokensValue(),
 			});
 
 			return clean;
@@ -796,18 +805,17 @@ async function transformRecentSlice(args: {
 }
 
 /**
- * Enforce the §9.1 visual token budget by evicting the oldest ordinary kept
- * image_refs until the estimate fits. Returns the set of `${msgIdx}:${blkIdx}`
- * keys that were removed from `keepKeys` (mutated in place). Overview and
- * pending positions are never evicted (§9.1).
+ * Enforce the §9.1 visual token budget via the SHARED
+ * {@link enforceVisualTokenBudget} (compaction.ts) — Phase 3.1 review: do not
+ * fork the eviction logic, and charge the NEWEST kept ordinary image at the
+ * detail tier (it is materialized at `detailImageLongEdge`, not
+ * `workingImageLongEdge` — charging it at working under-counts ~1398 tokens
+ * for a square image).
  *
- * The estimate uses {@link estimateImageRefTokens} (§9.1 coarse formula). Live
- * `image` blocks (no src on the block) are estimated as a square at their tier
- * (detail/working); kept image_refs are estimated at their target tier. The
- * stable overview (when the checkpoint has one, i.e. `overviewRefId != null`)
- * counts at the overview tier and is non-evictable (it lives in the stable
- * region, not the recent slice — we account for its cost so the budget is a
- * true per-request ceiling per §9.1).
+ * Returns the set of `${msgIdx}:${blkIdx}` keys that were removed from
+ * `keepKeys` (mutated in place). Overview and pending positions are never
+ * evicted (§9.1); any protected-priority overflow is recorded by the shared
+ * helper (§12 `visual_budget_overflow_tokens`).
  */
 function enforceVisualBudget(
 	keepKeys: Set<string>,
@@ -823,62 +831,46 @@ function enforceVisualBudget(
 	// Estimate the non-evictable baseline (overview + pending kept positions).
 	// Overview in the recent slice is always text-ified (not kept), so the only
 	// overview cost to account for is the stable-region overview image.
-	let total = 0;
+	let baseline = 0;
 	if (overviewRefId !== null) {
-		total += estimateImageRefTokens({ w: settings.overviewLongEdge, h: settings.overviewLongEdge }, settings.overviewLongEdge);
+		baseline += estimateImageRefTokens({ w: settings.overviewLongEdge, h: settings.overviewLongEdge }, settings.overviewLongEdge);
 	}
-	// Walk all kept positions, summing their estimated cost; pending live images
-	// and pending refs are non-evictable and count toward the baseline.
+	// Pending live images and pending refs are non-evictable and count toward
+	// the baseline at the DETAIL tier (they are materialized as detail).
 	for (const p of positions) {
 		const key = `${p.msgIdx}:${p.blkIdx}`;
 		if (!keepKeys.has(key)) continue;
 		if (p.pending) {
-			total += estimatePosTokens(p, settings);
+			baseline += estimatePosTokens(p, settings, true);
 		}
 	}
-	// Ordinary kept refs/images, oldest first, are the budget-eviction order.
-	const evicted = new Set<string>();
-	const keptOrdinary = ordinary.slice(keepFrom);
-	// First add their cost; if over budget, evict oldest until it fits.
-	let running = total;
-	for (const p of keptOrdinary) {
-		running += estimatePosTokens(p, settings);
-	}
-	if (running <= budget) return evicted;
-	// Evict OLDEST-first so the NEWEST evidence images survive: walk from the
-	// newest kept image backwards, keeping while the budget fits; everything
-	// older than the cut-off is evicted (§7.1 recency semantics — the freshest
-	// images are the most relevant to the current reasoning).
-	running = total;
-	for (let i = keptOrdinary.length - 1; i >= 0; i--) {
-		const p = keptOrdinary[i]!;
-		const key = `${p.msgIdx}:${p.blkIdx}`;
-		const cost = estimatePosTokens(p, settings);
-		if (running + cost <= budget) {
-			running += cost;
-			continue;
-		}
-		keepKeys.delete(key);
-		evicted.add(key);
-	}
-	return evicted;
+	const keptOrdinary = ordinary.slice(keepFrom); // oldest → newest
+	const newestKey = keptOrdinary.length ? `${keptOrdinary[keptOrdinary.length - 1]!.msgIdx}:${keptOrdinary[keptOrdinary.length - 1]!.blkIdx}` : null;
+	const sel = enforceVisualTokenBudget({
+		budgetTokens: budget,
+		baselineTokens: baseline,
+		ordinary: keptOrdinary.map((p) => {
+			const key = `${p.msgIdx}:${p.blkIdx}`;
+			return { key, tokens: estimatePosTokens(p, settings, key === newestKey) };
+		}),
+	});
+	for (const key of sel.evictedKeys) keepKeys.delete(key);
+	return sel.evictedKeys;
 }
 
 /**
- * Estimate the visual token cost of one position at its target tier (§9.1).
- *   - kept image_ref → its src bbox at the detail/working tier;
- *   - live `image` block → no src available, estimate as a square at its tier
- *     (detail/working).
+ * Estimate the visual token cost of one position at its FINAL materialization
+ * tier (§9.1).
+ *   - `isDetail` (pending snapshot OR the newest kept ordinary) → detail tier;
+ *   - otherwise → working tier;
+ *   - kept image_ref → its src bbox at that tier (server-upscale aware);
+ *   - live `image` block → no src available, estimate as a square at the tier.
  */
 function estimatePosTokens(
 	p: { kind: "ref" | "image"; pending?: boolean; ref?: ImageRefContent },
 	settings: TransformContextSettings,
+	isDetail: boolean,
 ): number {
-	// Detail tier: pending snapshots and the newest kept ordinary. We cannot see
-	// "newest" from here, so approximate: pending → detail, otherwise working.
-	// This is an upper bound good enough for budget eviction (over-estimate
-	// trends toward earlier eviction, which is safe per §9.1).
-	const isDetail = !!p.pending;
 	const targetLongEdge = isDetail ? settings.detailImageLongEdge : settings.workingImageLongEdge;
 	if (p.kind === "ref" && p.ref) {
 		const src = p.ref.src || { x: 0, y: 0, w: 0, h: 0 };

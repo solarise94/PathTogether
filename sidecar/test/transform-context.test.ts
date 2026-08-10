@@ -1037,8 +1037,12 @@ describe("Phase 2b — §9.1 visual budget hard cap (P2-3)", () => {
 			toolResultMsg("s3", [imgRef("ref_s3", { x: 3, y: 3, w: 10, h: 10 })], 4),
 		];
 		const out = await transform(msgs);
-		// Overview + pending survive; ordinary s2/s3 are budget-evicted.
-		expect(countImageBlocks(out)).toBe(2);
+		// Overview + pending survive (non-evictable). The OLDER ordinary s2 is
+		// budget-evicted. The NEWEST ordinary (s3) is FORCE-KEPT even though it
+		// blows the budget (§9.1 force-keep-newest floor: a request with zero
+		// current evidence is worse than an over-budget one; the excess is
+		// reported as overflow). So 3 images survive, not 2.
+		expect(countImageBlocks(out)).toBe(3);
 	});
 
 	it("does not evict when the budget is ample (recency behaviour unchanged)", async () => {
@@ -1227,17 +1231,21 @@ describe("Phase 2b — §7.2 rich-text history", () => {
 describe("Phase 2b — §9.1 visual budget eviction direction (review fix)", () => {
 	it("budget eviction keeps the NEWEST ordinary images, evicting the oldest", async () => {
 		const flask = makeFlask();
-		// 3 ordinary refs, each ~11 estimated tokens (10x10 @ working tier 768:
-		// ceil(10*768/750)=11). Budget 25 fits 2 (22) but not 3 (33).
-		// Recency KEEP keeps all 3 (visual_working_set_max=4); the budget pass
-		// must then evict the OLDEST (s1), keeping the two NEWEST (s2, s3).
+		// 3 ordinary square refs (10x10). With the new upscale-aware estimator a
+		// small bbox is UPSCALED to the target long edge, so a 10x10 ref costs the
+		// SAME as a full-edge square: working tier 768 → ceil(768*768/750)=787;
+		// the newest ordinary is charged at the detail tier 1280 →
+		// ceil(1280*1280/750)=2185. Budget 3000 fits the two newest
+		// (2185 + 787 = 2972 ≤ 3000) but not all three (2972 + 787 = 3759 > 3000),
+		// so the OLDEST (s1) is evicted and s2/s3 survive. Recency KEEP keeps all
+		// 3 (visual_working_set_max=4); the budget pass then evicts s1.
 		const transform = makeTransformContext({
 			flask: flask as unknown as FlaskClient,
 			slide: SLIDE,
 			slideInfo: SLIDE_INFO,
 			settings: resolveTransformSettings({
 				visual_working_set_max: 4,
-				visual_context_budget_tokens: 25,
+				visual_context_budget_tokens: 3000,
 			}),
 			firstSnapshotToolCallIdRef: { value: null },
 			pendingSnapshotIdRef: { value: null },

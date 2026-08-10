@@ -75,6 +75,7 @@ import {
 import {
 	buildPostCompactionCheckpoint,
 	estimateSelectedVisualTokens,
+	visualBudgetOverflowTokensValue,
 	DEFAULT_VISUAL_CONTEXT_BUDGET_TOKENS,
 } from "./compaction.js";
 import {
@@ -2131,6 +2132,7 @@ export class AgentRunner {
 			prepared_request_bytes: preparedBytes,
 			compaction_reason: null,
 			checkpoint_rebuild_reason: stableError ? "stable_context_unavailable" : null,
+			visual_budget_overflow_tokens: visualBudgetOverflowTokensValue(),
 			usage,
 		});
 		this.metricsSink(metrics);

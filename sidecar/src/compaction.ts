@@ -259,16 +259,26 @@ export const DEFAULT_VISUAL_CONTEXT_BUDGET_TOKENS = 8000;
 /**
  * Estimate the visual token cost of a single image_ref by its pixel dimensions
  * (§9.1). Returns 0 for degenerate (zero-area) refs.
+ *
+ * The estimate MUST mirror the server's actual output size (app.py
+ * `_aspect_fit_size`): the server scales the region so its longest edge equals
+ * `targetLongEdge` — including UPSCALING small bboxes. An earlier version of
+ * this estimator clamped the long edge to the source size
+ * (`le = min(longest, target)`), which severely under-counted small bboxes
+ * (e.g. 200×200 @768 was estimated at ~205 tokens while the server actually
+ * sends 768×768 ≈ 787 tokens). Keep this formula in lockstep with
+ * `_aspect_fit_size` (edge clamped to [1,4096], per-dim clamp to [1,4096]).
  */
 export function estimateImageRefTokens(src: { w: number; h: number }, targetLongEdge: number): number {
 	const w = src.w;
 	const h = src.h;
 	if (w <= 0 || h <= 0 || targetLongEdge <= 0) return 0;
 	const longest = Math.max(w, h);
-	const scale = targetLongEdge / longest;
-	const le = Math.min(longest, targetLongEdge);
-	const se = Math.min(w, h) * scale;
-	return Math.ceil((le * se) / PIXELS_PER_VISUAL_TOKEN);
+	const edge = Math.max(1, Math.min(targetLongEdge, 4096));
+	const scale = edge / longest;
+	const ow = Math.max(1, Math.min(4096, Math.round(w * scale)));
+	const oh = Math.max(1, Math.min(4096, Math.round(h * scale)));
+	return Math.ceil((ow * oh) / PIXELS_PER_VISUAL_TOKEN);
 }
 
 /**
@@ -298,6 +308,112 @@ export function estimateSelectedVisualTokens(args: {
 		total += estimateImageRefTokens(args.overviewPixels, args.overviewLongEdge);
 	}
 	return Math.min(total, args.visualContextBudgetTokens);
+}
+
+// =========================================================================== //
+// Shared visual budget enforcement (§9.1, Phase 3.1)
+// =========================================================================== //
+
+/**
+ * Result of {@link enforceVisualTokenBudget}.
+ *
+ *   - `evictedKeys`: position keys the caller must drop from its KEEP set.
+ *   - `selectedTokens`: final estimated visual tokens (baseline + kept ordinary).
+ *   - `overflowTokens`: > 0 when the budget could NOT be honored because only
+ *     protected images (overview/pending) and/or the single newest evidence
+ *     image remain — the "best-effort budget with protected priority" overflow
+ *     (§9.1 semantics: protected images are never evicted, so the budget can be
+ *     exceeded; the overflow MUST be observable, hence this field).
+ */
+export interface VisualBudgetSelection {
+	evictedKeys: Set<string>;
+	selectedTokens: number;
+	overflowTokens: number;
+}
+
+/**
+ * Enforce the §9.1 visual token budget on an already recency-selected KEEP set.
+ * SHARED implementation used by BOTH the Phase 1 selector (transform-context
+ * transformOnce) and the Phase 2b assembler selector (transformRecentSlice) —
+ * do not fork this logic (Phase 3.1 review: the two implementations had already
+ * diverged once).
+ *
+ * Semantics:
+ *   - `baselineTokens` covers protected, non-evictable images (overview +
+ *     pending) at their FINAL tiers;
+ *   - `ordinary` is the recency-kept ordinary images OLDEST → NEWEST, each
+ *     costed at its FINAL materialization tier (the newest ordinary image is
+ *     materialized at the detail tier, so it must be charged at the detail
+ *     tier — charging it at the working tier under-counts a 1280px image as
+ *     768px, ~1398 tokens short for a square);
+ *   - eviction walks NEWEST → OLDEST keeping while it fits, so the oldest
+ *     images are evicted first (§7.1 recency);
+ *   - if even the single newest ordinary image does not fit, it is STILL kept
+ *     (a request with zero current evidence is worse than an over-budget one)
+ *     and the excess is reported via `overflowTokens`;
+ *   - a baseline that alone exceeds the budget is likewise reported as
+ *     overflow (protected images are never evicted).
+ */
+export function enforceVisualTokenBudget(args: {
+	budgetTokens: number;
+	baselineTokens: number;
+	ordinary: Array<{ key: string; tokens: number }>;
+}): VisualBudgetSelection {
+	const { budgetTokens, baselineTokens, ordinary } = args;
+	const evictedKeys = new Set<string>();
+	if (!(Number.isFinite(budgetTokens) && budgetTokens > 0)) {
+		const selected = baselineTokens + ordinary.reduce((a, o) => a + o.tokens, 0);
+		return { evictedKeys, selectedTokens: selected, overflowTokens: 0 };
+	}
+
+	// Walk newest → oldest, keeping while the running total fits.
+	let running = baselineTokens;
+	const kept: string[] = [];
+	for (let i = ordinary.length - 1; i >= 0; i--) {
+		const o = ordinary[i]!;
+		if (running + o.tokens <= budgetTokens) {
+			running += o.tokens;
+			kept.push(o.key);
+			continue;
+		}
+		// If NOTHING ordinary has been kept yet, force-keep the single newest
+		// image anyway (current-evidence floor) and count the excess as overflow.
+		if (kept.length === 0 && i === ordinary.length - 1) {
+			running += o.tokens;
+			kept.push(o.key);
+			continue;
+		}
+		evictedKeys.add(o.key);
+	}
+
+	const overflow = Math.max(0, running - budgetTokens);
+	if (overflow > 0) recordVisualBudgetOverflow(overflow);
+	return { evictedKeys, selectedTokens: running, overflowTokens: overflow };
+}
+
+// --------------------------------------------------------------------------- //
+// Budget overflow observability (§12, Phase 3.1)
+// --------------------------------------------------------------------------- //
+
+/**
+ * Process-level counter of visual-budget overflow tokens (§12). Incremented by
+ * {@link enforceVisualTokenBudget} whenever the protected-priority semantics
+ * force a request over budget. Reset per request alongside the LRU counters
+ * (transform-context resetLruCounters). Best-effort: concurrent sessions share
+ * the counter (same accepted race as the LRU counters, §12.1).
+ */
+let visualBudgetOverflowTokens = 0;
+
+export function recordVisualBudgetOverflow(tokens: number): void {
+	if (tokens > 0) visualBudgetOverflowTokens += tokens;
+}
+
+export function visualBudgetOverflowTokensValue(): number {
+	return visualBudgetOverflowTokens;
+}
+
+export function resetVisualBudgetOverflow(): void {
+	visualBudgetOverflowTokens = 0;
 }
 
 /**

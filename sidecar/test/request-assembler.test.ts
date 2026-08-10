@@ -546,8 +546,11 @@ describe("makeRequestAssembler — visual budget hard cap (§9.1, P2-3)", () => 
 		});
 		const assembler = makeRequestAssembler(deps);
 		const out = await assembler(refSnapMessages(4) as AgentMessage[]);
-		// Count surviving image blocks. Only the pending (ref_snap-0) image
-		// should remain; all ordinary refs (snap-1..3) are budget-evicted.
+		// Count surviving image blocks. Pending (ref_snap-0) is non-evictable and
+		// survives. The ordinary OLDER refs (snap-1, snap-2) are budget-evicted.
+		// The NEWEST ordinary (snap-3) is FORCE-KEPT even though it blows the
+		// budget (§9.1 force-keep-newest floor; excess reported as overflow). So
+		// 2 images survive: pending + force-kept newest ordinary.
 		let images = 0;
 		for (const m of out) {
 			const content = (m as { content?: unknown }).content;
@@ -556,7 +559,7 @@ describe("makeRequestAssembler — visual budget hard cap (§9.1, P2-3)", () => 
 				if ((part as { type?: string }).type === "image") images += 1;
 			}
 		}
-		expect(images).toBe(1);
+		expect(images).toBe(2);
 	});
 
 	it("does not evict when the budget is ample (behaviour unchanged)", async () => {
@@ -645,24 +648,30 @@ describe("makeRequestAssembler — evicted_image_refs metric (§12, P2-6)", () =
 		const assembler = makeRequestAssembler(deps);
 		await assembler(recentMsgs as AgentMessage[]);
 		const evicted = captured[0]!.evicted_image_refs;
-		// All 4 ordinary refs budget-evicted (no pending/overview to protect any).
-		expect(evicted.length).toBe(4);
-		expect(evicted).toEqual(expect.arrayContaining(["ref_snap-0", "ref_snap-1", "ref_snap-2", "ref_snap-3"]));
+		// No pending/overview to protect any, but the §9.1 force-keep-newest floor
+		// still FORCE-KEEPS the single newest ordinary (ref_snap-3). So the 3 older
+		// ordinary refs are budget-evicted and reported; the newest is kept (over
+		// budget, counted as overflow).
+		expect(evicted.length).toBe(3);
+		expect(evicted).toEqual(expect.arrayContaining(["ref_snap-0", "ref_snap-1", "ref_snap-2"]));
+		expect(evicted).toEqual(expect.not.arrayContaining(["ref_snap-3"]));
 	});
 });
 
 describe("makeRequestAssembler — visual budget eviction direction (review fix)", () => {
 	it("budget eviction keeps the NEWEST ordinary refs and evicts the oldest", async () => {
-		// refSnapMessages(4) at 200x200, working tier 768 → ~205 tokens each.
-		// Budget 450 fits 2 (410) but not 3 (615). No overview/pending.
-		// The budget pass must evict the OLDEST two (ref_snap-0/1) and keep the
-		// NEWEST two (ref_snap-2/3).
+		// 4 ordinary square refs (200x200). Upscale-aware estimator: a square at
+		// the working tier 768 → ceil(768*768/750)=787; the newest ordinary is
+		// charged at the detail tier 1280 → ceil(1280*1280/750)=2185. Budget 3000
+		// fits the two newest (2185 + 787 = 2972 ≤ 3000) but not three (2972 + 787
+		// = 3759 > 3000). No overview/pending. The budget pass must evict the
+		// OLDEST two (ref_snap-0/1) and keep the NEWEST two (ref_snap-2/3).
 		const cp = makeTrivialCheckpoint(1);
 		const captured: { evicted?: string[] } = {};
 		const deps = makeDeps({
 			settings: resolveTransformSettings({
 				visual_working_set_max: 4,
-				visual_context_budget_tokens: 450,
+				visual_context_budget_tokens: 3000,
 			}),
 			getSessionSnapshot: async () => ({
 				checkpoint: cp,

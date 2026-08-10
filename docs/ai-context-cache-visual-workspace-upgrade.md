@@ -1,10 +1,11 @@
 # AI 上下文缓存与视觉工作区升级设计
 
-> 状态：Proposal
+> 状态：Phase 1–3 已实现（Phase 0 基线已固化；Phase 4 A/B 未开始）
 > 版本：v1.2
 > 日期：2026-08-10
 > 范围：AI 读片 sidecar 的请求上下文、图片物化、Prompt Cache、Compaction 与可观测性
 > 设计基线：base commit `ae46808`（fix(ai): Phase 1 基线——图片预淘汰、3路并发、LRU、指纹校验与唯一概览保护）
+> 实现提交：`ae46808`（基线）→ `18d173c`（Phase 1）→ `d1c7649`（Phase 2a）→ `f7d744b`（Phase 2b）→ `ac9ae0b`（Phase 3）
 
 ## 1. 背景
 
@@ -26,25 +27,34 @@
 
 ### 1.1 当前工作区实现基线
 
-本文档不是对干净 `HEAD` 的现状描述。撰写文档前，工作区已经存在一组未提交的 Phase 1/正确性修复。提交时应将代码与文档一起说明，或先提交代码并把上方“设计基线”替换成对应 commit，避免目标态与实现继续漂移。
+本文档不是对干净 `HEAD` 的现状描述。撰写文档前，工作区已经存在一组未提交的 Phase 1/正确性修复，已固化为 base commit `ae46808`。随后 Phase 1–3 已在 `18d173c`/`d1c7649`/`f7d744b`/`ac9ae0b` 落地，下表"后续工作"列为 Phase 4 及遗留项。
 
-| 能力 | 当前未提交工作区状态 | 后续工作 |
+| 能力 | 基线状态（ae46808） | 当前状态（ac9ae0b） |
 |---|---|---|
-| 淘汰前选择图片 | 已实现：只物化保留项 | 接入新的 visual working set 选择器 |
-| region 并发上限 | 已实现：固定 3 路 | 接入 AbortSignal 和配置项 |
-| region LRU | 已实现：32 项、30 秒 TTL、按指纹和 bbox 索引，缓存 Flask 返回的 JPEG bytes；尚未验证跨进程确定性 | 改为确定性派生图、按总字节上限管理，并补跨进程 hash 验证 |
-| 服务端指纹校验 | 已实现：传 `expected_fingerprint`，不符返回 409 | 与 checkpoint、slide info、派生图统一失效 |
-| 唯一概览保护 | 已实现过渡逻辑：每次 transform 仅首个 >90% 图可声明 | Phase 2 持久化 `overview_derivative.ref_id`，移除逐次猜测 |
-| `image_ref` 异常清理 | 已实现：顶层异常也不会把 ref 发给 Provider | 保持回归测试 |
+| 淘汰前选择图片 | 已实现：只物化保留项 | 已接入 assembler 的 visual working set 选择器（Phase 2b） |
+| region 并发上限 | 已实现：固定 3 路 | 已接入 AbortSignal 和配置项 `region_materialize_concurrency`（Phase 1） |
+| region LRU | 基线：32 项、30 秒 TTL、按指纹和 bbox 索引 | 已实现：64MB 总字节上限、1800s TTL、完整派生规格 cache key（质量/overlay版本/resize/encoder）；跨进程 hash 已验证进程内与 Flask 重启两层（本机 Pillow 12.3.0），跨部署环境未验证（§6.3 要求在验证前不得宣称跨部署可复现） |
+| 服务端指纹校验 | 已实现：传 `expected_fingerprint`，不符返回 409 | 与 checkpoint、slide info、派生图统一失效（Phase 2a/2b：fingerprint 变化 → checkpoint stale + LRU invalidate） |
+| 唯一概览保护 | 基线过渡逻辑：每次 transform 仅首个 >90% 图可声明 | Phase 2b 已持久化 `overview_derivative.ref_id`（identity → 覆盖率兜底只选一次）；旧会话惰性迁移 |
+| `image_ref` 异常清理 | 已实现：顶层异常也不会把 ref 发给 Provider | 保持回归测试；Provider 边界同时剥离 `_context_meta` |
 | 连续 compaction retained tail 去重 | 已实现 | 保持回归测试 |
 | compaction 落盘图片脱水 | 已实现 | 保持回归测试 |
-| AbortSignal 取消 region | 未实现：hook 的 `_signal` 被忽略 | Phase 1 实现 |
-| 保持宽高比和自适应尺寸 | 未实现：仍固定请求 1568×1568 | Phase 1 实现 |
-| 富文本历史图片摘要 | 未实现：目前只有固定占位文本 | Phase 2 由 assembler 关联 observations |
-| 持久化 context checkpoint | 未实现 | Phase 2 实现 |
-| 显式 cache key / breakpoint | 未实现 | Phase 3 实现并验证 CPA 透传 |
+| AbortSignal 取消 region | 基线未实现 | 已实现（Phase 1）：hook→mapPool→flask.region 全链路；按 cache key in-flight 合并，最后订阅者离开才中止底层 fetch（§12.1/§13） |
+| 保持宽高比和自适应尺寸 | 基线未实现：固定 1568×1568 | 已实现（Phase 1）：region 新增 `max_long_edge`/`jpeg_quality`，服务端按 bbox 比例计算输出尺寸；sidecar 按概览(1024)/详情(1280)/工作图(768) 分档 |
+| 富文本历史图片摘要 | 基线未实现：固定占位文本 | 已实现（Phase 2b）：assembler 建立 ref_id→observations 索引，输出 §7.2 格式（bbox/倍率/摘要/回访提示），无 observation 不伪造 |
+| 持久化 context checkpoint | 基线未实现 | 已实现（Phase 2a/2b）：`context_checkpoint` + `session_message_seq` + per-session lock + generation/fingerprint CAS 原子提交；compaction 后重建换代 |
+| PreparedRequest | 基线为隐式 currentContext 复用 | 已实现（Phase 2b）：显式对象（logicalCallId/generation/stablePrefixHash/canonicalPayloadHash/imageContentHashes），transient retry 复用，force-compaction 释放重建一次 |
+| 显式 cache key / breakpoint | 基线未实现 | 部分实现（Phase 3）：能力分级 off/auto/explicit；explicit 经 pi `samplingParams` 注入 `prompt_cache_key`，provider 拒绝时剥离重试一次（不耗 transient 预算）并 run 级降级；openai-completions 无显式 breakpoint（`supportsBreakpoints=false`）；**CPA 透传未经真实网关验证**（代码内以 `CPA-UNVERIFIED` 标注） |
+| 结构化指标（§12） | 基线仅有 last_usage | 已实现（Phase 2b/3）：每请求 JSON 行指标，含 generation/hash 前缀/LRU 命中/两类字节/transform_ms/region_fetch_ms；provider 缓存 usage 不可观测时为 `unknown` |
+| 视觉预算（§9.1） | 基线未实现 | 已实现（Phase 2b）：compaction 触发纳入视觉估算（无公式时全额预留 8000）；`tokens_after` 逐消息重估 + 视觉估算；`visual_working_set_max` 限制张数 |
 
-因此，下文出现“必须”“应当”的内容表示目标态；只有本表标记为“已实现”的能力才属于当前工作区基线。
+遗留与偏离（详见各 commit message 与代码注释）：
+- `safety_margin` 弃用仅到 API 层（接受不写回）；前端表单字段未剔除。
+- `_ai_slide_ctx` 的 legacy Python 进程内取图路径仍固定 1568×1568（sidecar 迁移后不走该路径）。
+- 确定性 hash 跨部署环境（不同 Pillow 版本）未验证；encoder_version 已随响应返回并记录。
+- LRU 命中/未命中计数器为进程级共享，多 session 并发时指标存在竞态（仅影响指标精度）。
+- assembler 侧指标与 runner 侧指标分两路记录，未完全合并。
+- 概览 `overviewSrcResolver` 依赖 run 内缓存的 canonical 快照；极端情况下（compaction 恰好移除概览 ref）会走 StableContextUnavailable → 无概览换代路径。
 
 ## 2. 目标与非目标
 
@@ -634,28 +644,28 @@ checkpoint_turn_lifetime
 
 ### 15.1 单元测试
 
-| 测试 | 当前状态 | 目标 |
+| 测试 | 基线状态（ae46808） | 当前状态（ac9ae0b，sidecar 347 + python 40 全绿） |
 |---|---|---|
-| 历史图片很多时 region 调用有界 | 已有 | 新 working set 默认 4 时，冷请求不超过临时图 4 张加概览 1 张 |
-| LRU 热请求不再次调用 region | 已有 | 改成字节上限 LRU 后继续成立 |
-| 图片选择顺序稳定 | 已有基础覆盖 | 补 checkpoint/working-set selector 覆盖 |
-| pending 快照不被淘汰 | 待补 | pending 优先级高于普通 recent 图 |
-| 只保护唯一概览 | 已有过渡逻辑覆盖 | 补持久化 `overview_derivative.ref_id` 迁移覆盖 |
-| 缩放保持宽高比 | 待补 | 覆盖横向、纵向、边界裁剪 |
-| 同样输入产生相同 JPEG hash | 待补 | 覆盖进程内和跨恢复重建 |
-| JPEG hash 跨部署环境稳定 | 待补 | 固定 fixture 覆盖受支持编码器版本；不稳定时验证版本进入 cache key |
-| 概览 hash 不匹配恢复 | 待补 | 首次清缓存重建，二次不匹配只换代一次且旧 generation 不被原地修改 |
+| 历史图片很多时 region 调用有界 | 已有 | 保持；working set 默认 4 + 概览 1 张上限由 assembler 层覆盖 |
+| LRU 热请求不再次调用 region | 已有 | 字节上限 LRU 下保持；补 recency 刷新/TTL/按 slide 失效 |
+| 图片选择顺序稳定 | 已有基础覆盖 | 补 assembler recent-slice 选择与稳定区字节一致性覆盖 |
+| pending 快照不被淘汰 | 待补 | 已有（ref 与 live image 两路，优先级高于普通 recent） |
+| 只保护唯一概览 | 已有过渡逻辑覆盖 | 已有持久化 `overview_derivative.ref_id` + selectOverviewRef 覆盖 |
+| 缩放保持宽高比 | 待补 | 已有（横向/纵向/边界裁剪，python `test_region_max_long_edge.py`） |
+| 同样输入产生相同 JPEG hash | 待补 | 已有进程内+Flask 重启两层（烟雾测试实录 hash 一致）；跨部署未验证 |
+| JPEG hash 跨部署环境稳定 | 待补 | 未覆盖：encoder_version 已入响应与 checkpoint，跨部署验证留 Phase 4 前置 |
+| 概览 hash 不匹配恢复 | 待补 | 已有（首次清缓存重建、二次不匹配 StableContextUnavailable 且旧 generation 不被原地修改） |
 | 指纹不匹配时不读取 region | 已有 | 保持 sidecar 预检和 Flask 409 两层覆盖 |
-| AbortSignal 终止排队/进行中请求 | 待补 | 分别验证未启动任务和 fetch abort |
-| 顶层异常后没有 `image_ref` 泄漏 | 已有 | 保持 |
+| AbortSignal 终止排队/进行中请求 | 待补 | 已有（排队不启动、fetch abort、两订阅者单方取消、最后订阅者才中止） |
+| 顶层异常后没有 `image_ref` 泄漏 | 已有 | 保持；补 Provider 边界 `_context_meta` 剥离 |
 | 连续两次 compaction 不重复 tail | 已有 | 保持 |
 | compaction 落盘不包含图片 base64 | 已有 | 保持 |
-| LRU 按总字节淘汰 | 待补 | 超限后淘汰最久未用派生图 |
-| message sequence 迁移与边界 | 待补 | 旧会话、compaction、分支后 `through_message_seq` 含义稳定且不复用 |
-| 配置与版本失效 | 待补 | prompt/tool/request/slide/encoding 任一版本变化创建新 generation |
-| checkpoint 原子提交 | 待补 | 写盘失败或并发换代时旧 generation 完整保留 |
+| LRU 按总字节淘汰 | 待补 | 已有（超限淘汰最久未用派生图） |
+| message sequence 迁移与边界 | 待补 | 已有（旧会话 1..N 迁移幂等、append 单调不复用、compaction retained 不重编号、UI 边界剥离） |
+| 配置与版本失效 | 待补 | 已有（prompt/tool/request/slide/encoding 任一变化 checkpointStale 判定并换代；cache key 随 generation/fingerprint 失效） |
+| checkpoint 原子提交 | 待补 | 已有（过期 generation/指纹变化/写盘失败时旧 generation 完整保留） |
 
-“已有”指当前未提交工作区中已有对应测试，不代表已进入 `HEAD`。
+“已有”指对应 commit 的工作区中已有测试并通过（sidecar `npx vitest run` 347、python `pytest tests/` 40）。
 
 ### 15.2 集成测试
 

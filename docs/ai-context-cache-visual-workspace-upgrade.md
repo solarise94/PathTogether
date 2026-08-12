@@ -423,6 +423,24 @@ should_compact
 - 先上线视觉压缩和缓存指标，再判断是否提高默认 Context。
 - Flask 配置 API 与 sidecar run 边界都必须验证 `reserve_tokens + keep_recent_tokens < context_window_tokens`；不能只依赖某一个入口的校验。
 
+### 9.2.1 窗口档位预设（产品决策，2026-08-13）
+
+产品拍板（取代 9.2 的"任意值"思路）：上下文窗口对用户呈现为**档位选择 + 可选自定义**，视觉预算不再让用户直接调绝对 token 数，而是按"窗口档位 → 预算百分比 + 图片压缩档"的预设推导：
+
+| 窗口档位 | 用户语义 | 视觉预算（窗口 %） | 图片档（overview / detail / working） |
+|---|---:|---|---|
+| **200k** | 极致节约上下文 | ~10% | 768 / 1024 / 640 |
+| **400k** | 宽松 | ~15% | 1024 / 1280 / 768（≈当前默认） |
+| **500k**（1M 模型默认） | 高性能 | ~20% | 1024 / 1536 / 1024 |
+| 自定义 | 用户填窗口值 | 按最接近档位插值 | 按最接近档位 |
+
+依据与约束：
+
+- 400k 以上模型注意力涣散严重——**1M 模型默认取 500k**，不鼓励直接用满 1M。
+- 图片预算是窗口的百分比，随档位自动伸缩；用户不再单独调 `visual_context_budget_tokens` 绝对值（保留自定义覆盖入口给高级用户）。
+- 各档位图片压缩比例的具体数值为草案，等 EXP-VISCTX-v1 Step 1/2 数据回来后按 token 成本与质量回归修正。
+- 实现时在 `resolveTransformSettings` 增加 `window_tier`（`saving | balanced | performance | custom`）推导逻辑；`context_window_tokens` 与 `visual_context_budget_tokens` 仍可显式覆盖（覆盖时以显式值为准）。
+
 ### 9.3 Compaction 正确性
 
 - 下一次增量压缩不得重复注入上一次 retained tail。

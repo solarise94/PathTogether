@@ -2,3 +2,10 @@ node_modules/
 dist/
 *.log
 .DS_Store
+# Phase 4: generated synthetic slides are NOT committed (§15.4). The versioned
+# manifest (fixtures/manifest.json) is committed only after fingerprint pinning
+# against a running Flask; until then manifest.example.json documents the shape.
+experiments/fixtures/slides/
+
+# Phase 4 A/B run outputs (regenerate via experiments/run-ab.ts)
+experiments/results/

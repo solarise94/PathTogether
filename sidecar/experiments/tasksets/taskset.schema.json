@@ -1,0 +1,138 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://svs-viewer/sidecar/experiments/tasksets/taskset.schema.json",
+  "title": "Phase 4 reading task set",
+  "description": "Quality-regression task set covering the §15.3 categories. Validated by sidecar/experiments/src/taskset.ts (hand-rolled, no ajv runtime dep).",
+  "type": "object",
+  "required": ["taskset_id", "schema_version", "manifest_version", "tasks"],
+  "additionalProperties": false,
+  "properties": {
+    "taskset_id": { "type": "string", "minLength": 1 },
+    "schema_version": { "type": "integer", "const": 1 },
+    "manifest_version": { "type": "integer", "const": 1 },
+    "description": { "type": "string" },
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/task" }
+    }
+  },
+  "$defs": {
+    "task": {
+      "type": "object",
+      "required": ["id", "category", "fixture_id", "user_turns", "model_script", "rubric"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "category": {
+          "type": "string",
+          "description": "One of the §15.3 categories (validated by the TS loader against the known list)."
+        },
+        "fixture_id": { "type": "string", "minLength": 1 },
+        "user_turns": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "model_script": {
+          "type": "array",
+          "description": "Scripted assistant turns for mechanism-validation mode; reuses the ScriptedTurn shape from sidecar/test/helpers.ts. One entry per model call (turn).",
+          "items": { "$ref": "#/$defs/scriptedTurn" }
+        },
+        "rubric": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/rubricAssertion" }
+        }
+      }
+    },
+    "scriptedTurn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "text": { "type": "string" },
+        "toolCalls": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "name", "arguments"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string", "minLength": 1 },
+              "name": { "type": "string", "minLength": 1 },
+              "arguments": { "type": "object" }
+            }
+          }
+        },
+        "stopReason": { "type": "string", "enum": ["stop", "length", "toolUse"] }
+      }
+    },
+    "rubricAssertion": {
+      "type": "object",
+      "required": ["type", "id"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "type": {
+          "type": "string",
+          "enum": [
+            "tool_call_sequence",
+            "tool_call_forbidden",
+            "bbox_revisit",
+            "min_snapshot_count",
+            "max_annotation_count",
+            "manual"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "tool_call_sequence" } } },
+          "then": {
+            "required": ["sequence"],
+            "properties": { "sequence": { "type": "array", "items": { "type": "string" }, "minItems": 1 } }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "tool_call_forbidden" } } },
+          "then": {
+            "required": ["tools"],
+            "properties": { "tools": { "type": "array", "items": { "type": "string" }, "minItems": 1 } }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "bbox_revisit" } } },
+          "then": {
+            "required": ["region_labels"],
+            "properties": {
+              "region_labels": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+              "tools": { "type": "array", "items": { "type": "string" } },
+              "min_hits": { "type": "integer", "minimum": 1 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "min_snapshot_count" } } },
+          "then": {
+            "required": ["min"],
+            "properties": { "min": { "type": "integer", "minimum": 0 } }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "max_annotation_count" } } },
+          "then": {
+            "required": ["max"],
+            "properties": { "max": { "type": "integer", "minimum": 0 } }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "manual" } } },
+          "then": {
+            "required": ["criteria"],
+            "properties": { "criteria": { "type": "string", "minLength": 1 } }
+          }
+        }
+      ]
+    }
+  }
+}

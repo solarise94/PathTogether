@@ -1,0 +1,10 @@
+{
+  "arm_id": "step2-window-272k",
+  "step": 2,
+  "description": "Step 2：context window 固定 272k（当前产品默认，pi-model.ts / compaction.ts 默认 272000）。图像策略由 --image-arm 指向 Step 1 胜出组（arms.ts 解析 image_strategy 占位符为显式值）。",
+  "overrides": {
+    "image_strategy": "${step1_winner}",
+    "context_window_tokens": 272000
+  },
+  "prompt_cache_mode": "auto"
+}

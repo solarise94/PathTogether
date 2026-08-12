@@ -1,0 +1,12 @@
+{
+  "arm_id": "step1-overview-none",
+  "step": 1,
+  "description": "Step 1 对照组：稳定区不携带低分概览图（§17 风险 2）。overview_enabled=false 是占位字段——当前 assembler/transform-context 尚无概览开关，Wave 2 运行器负责把它接到实际的稳定区概览抑制逻辑（本 Wave 不改动 agent-runner/assembler 源码）。working/detail 档位保持产品默认。",
+  "overrides": {
+    "overview_enabled": false,
+    "overview_long_edge": 1024,
+    "visual_context_budget_tokens": 8000,
+    "context_window_tokens": 272000
+  },
+  "prompt_cache_mode": "auto"
+}

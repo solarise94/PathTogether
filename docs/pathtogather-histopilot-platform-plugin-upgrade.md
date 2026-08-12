@@ -1,8 +1,8 @@
-# PathTogather 协作式病理读片平台与 HistoPilot AI 插件
+# PathTogether 协作式病理读片平台与 HistoPilot AI 插件
 
 ## 功能调整与升级方案
 
-> 文档版本：v0.3
+> 文档版本：v0.4
 > 状态：设计提案，尚未实施
 > 编写日期：2026-08-12
 > 设计基线：仓库 `HEAD 6dbab64` 及其之前已经提交的功能
@@ -19,7 +19,7 @@
 
 下一阶段建议将其明确调整为两个产品：
 
-- **PathTogather**：协作式病理读片平台，负责用户、组织、病例、切片、Viewer、标注、讨论、分享、权限、审计和插件运行环境。
+- **PathTogether**：协作式病理读片平台，负责用户、组织、病例、切片、Viewer、标注、讨论、分享、权限、审计和插件运行环境。
 - **HistoPilot**：可安装的 AI 读片插件，负责 Agent、模型接入、导航策略、提示词、AI 会话、图片预算、上下文压缩、Prompt Cache 和 AI 读片交互。
 
 本次升级的核心不是简单地把 Node sidecar 移到另一个仓库，而是建立稳定的产品边界：
@@ -28,7 +28,7 @@
 - 插件拥有 AI 运行状态；
 - 双方只通过版本化 Plugin Contract 通信；
 - 插件不能直接访问平台数据库、共享数据目录或 Viewer 全局变量；
-- 未安装或停用 HistoPilot 时，PathTogather 的人工读片和协作功能仍完整可用。
+- 未安装或停用 HistoPilot 时，PathTogether 的人工读片和协作功能仍完整可用。
 
 ### 1.1 建议决策
 
@@ -41,12 +41,12 @@
 | 切片身份 | 使用稳定 `slide_id + asset_revision`，文件名仅作为展示/导入属性 |
 | 图片传输 | 服务端间优先 JPEG 二进制流，兼容期保留现有 base64 JSON 适配器 |
 | 插件会话 | 由 HistoPilot 自己持久化，平台只保存安装关系和必要的审计引用 |
-| AI 标注 | 写入 PathTogather 标注库，并记录插件、run、模型和创建者来源 |
+| AI 标注 | 写入 PathTogether 标注库，并记录插件、run、模型和创建者来源 |
 | `EXP-VISCTX-v1` | 与拆分并行；先冻结实验契约，不在边界迁移中修改实验算法 |
 
 ### 1.2 命名待确认
 
-本文沿用用户提出的 **PathTogather** 拼写。进入包名、域名、数据库 schema 和公开 API 固化前，需要确认该拼写是否为有意品牌命名；若目标名称是 `PathTogether`，应在 Stage 0 完成统一，避免后续兼容成本。
+本文沿用用户提出的 **PathTogether** 拼写。进入包名、域名、数据库 schema 和公开 API 固化前，需要确认该拼写是否为有意品牌命名；若目标名称是 `PathTogether`，应在 Stage 0 完成统一，避免后续兼容成本。
 
 ---
 
@@ -100,7 +100,7 @@ Browser
 
 ## 3. 产品目标与非目标
 
-### 3.1 PathTogather 产品目标
+### 3.1 PathTogether 产品目标
 
 1. 支持一个组织内多位病理医生、技术人员和外部会诊者围绕病例协作。
 2. 提供稳定的 WSI 查看、导航、标注、评论和审核能力。
@@ -115,7 +115,7 @@ Browser
 2. 提供主会话、分支会话、标注追问和历史恢复。
 3. 在视觉质量、上下文成本、延迟和缓存命中之间做可配置权衡。
 4. 支持不同模型/provider，并对不支持的 Prompt Cache 能力安全降级。
-5. 通过稳定插件协议接入 PathTogather，而不依赖其内部语言、框架和存储结构。
+5. 通过稳定插件协议接入 PathTogether，而不依赖其内部语言、框架和存储结构。
 
 ### 3.3 本轮非目标
 
@@ -132,7 +132,7 @@ Browser
 
 ```text
 ┌──────────────────────────────────────────────────────────────┐
-│ PathTogather Web                                             │
+│ PathTogether Web                                             │
 │  Viewer / Cases / Annotations / Discussion / Plugin Host     │
 │                                   ┌──────────────────────┐   │
 │                                   │ HistoPilot Plugin UI │   │
@@ -142,7 +142,7 @@ Browser
                             │                  │ HostBridge
                             ▼                  ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ PathTogather API Gateway                                     │
+│ PathTogether API Gateway                                     │
 │ Auth / Tenant / Case / Slide / Annotation / Event / Plugin   │
 └───────────────┬──────────────────────────────┬───────────────┘
                 │                              │ scoped service token
@@ -185,7 +185,7 @@ Browser
 - 双方不通过同一 JSON 文件协作；
 - 双方不依赖同一个本地 token 文件；
 - HistoPilot 不直接访问 WSI 文件路径；
-- PathTogather 不读取或改写 HistoPilot canonical messages；
+- PathTogether 不读取或改写 HistoPilot canonical messages；
 - 插件 UI 不直接访问平台 DOM、全局变量或 OpenSeadragon 实例。
 
 ### 4.4 切片身份与资产版本
@@ -194,7 +194,7 @@ Browser
 
 | 标识 | 语义 | 生命周期 |
 |---|---|---|
-| `slide_id` | 平台中的逻辑切片身份 | 创建切片记录时由 PathTogather 分配，永久稳定，不因重命名或替换底层文件而变化 |
+| `slide_id` | 平台中的逻辑切片身份 | 创建切片记录时由 PathTogether 分配，永久稳定，不因重命名或替换底层文件而变化 |
 | `asset_revision` | 当前 WSI 文件内容版本 | 每次底层内容发生变化时生成新值；只改别名、note、病例归属时不变化 |
 | `Content-SHA256` | 某个 region 派生输出的字节哈希 | 由 bbox、asset revision、输出规格和编码器共同决定，不能替代 asset revision |
 
@@ -221,13 +221,13 @@ type SlideRef =
 
 - Stage 1–2 的 `LegacyFlaskPlatformAdapter` 接受 `legacy-filename`；
 - Stage 3b 导入旧数据时建立 `legacy filename → slide_id` 映射；
-- 新 PathTogather API 只接受 `slide-id`；
+- 新 PathTogether API 只接受 `slide-id`；
 - Stage 4 完成后，HistoPilot canonical session 不再创建新的 legacy ref；
 - 旧 session 恢复时先经映射服务解析，无法唯一映射则暂停并要求人工选择，禁止按同名猜测。
 
 ---
 
-## 5. PathTogather 功能调整
+## 5. PathTogether 功能调整
 
 ### 5.1 身份与组织
 
@@ -378,7 +378,7 @@ FlaskClient → Flask internal endpoints
 ```text
 PlatformClient interface
   ├─ LegacyFlaskPlatformAdapter（迁移期）
-  └─ PathTogatherHttpClient（目标实现）
+  └─ PathTogetherHttpClient（目标实现）
 ```
 
 Agent、tools、request assembler 和 transform context 只能依赖 `PlatformClient` 接口，不能导入 Flask 语义。
@@ -423,7 +423,7 @@ interface AnnotationTombstone {
 }
 ```
 
-`RegionResult` 从 Stage 1 起就是二进制原生类型。`LegacyFlaskPlatformAdapter` 负责把现有 Flask JSON 中的 `image_base64` 解码为 `Uint8Array`，并把 snake_case 字段归一化；Agent、tools、assembler 和缓存层不得看到 legacy base64 transport。目标 `PathTogatherHttpClient` 直接读取 `image/jpeg` 响应，因此替换 adapter 时下游类型不变。
+`RegionResult` 从 Stage 1 起就是二进制原生类型。`LegacyFlaskPlatformAdapter` 负责把现有 Flask JSON 中的 `image_base64` 解码为 `Uint8Array`，并把 snake_case 字段归一化；Agent、tools、assembler 和缓存层不得看到 legacy base64 transport。目标 `PathTogetherHttpClient` 直接读取 `image/jpeg` 响应，因此替换 adapter 时下游类型不变。
 
 迁移期 adapter 还负责补齐目标契约：`contentSha256` 由解码后的实际 JPEG bytes 计算；当前 `mtime:size` fingerprint 被封装为不透明的 `legacyAssetRevision`，只能用于 legacy CAS，不能写成目标 `ar_sha256_*`。Stage 3b 导入时生成真正的内容型 asset revision，并保留旧值到新值的恢复映射。
 
@@ -608,7 +608,7 @@ X-Overlay-Version: coordinate-ticks-v1
 X-JPEG-Quality: 85
 ```
 
-header 缺失、非法或与 bytes/hash 不一致时，`PathTogatherHttpClient` 将响应视为 `invalid_region_response`，不得把不完整结果放入 derivative cache。
+header 缺失、非法或与 bytes/hash 不一致时，`PathTogetherHttpClient` 将响应视为 `invalid_region_response`，不得把不完整结果放入 derivative cache。
 
 ### 7.4 事件流
 
@@ -721,10 +721,10 @@ Host 必须校验 `event.origin`、iframe window、plugin installation、协议�
 
 浏览器身份使用独立的 UI session 流程，不把 installation credential 或平台能力 access JWT 暴露给 iframe：
 
-1. 已登录用户点击打开插件时，PathTogather backend 根据平台 session、CSRF、病例权限和 installation 状态创建一次性 `plugin_launch_ticket`；
+1. 已登录用户点击打开插件时，PathTogether backend 根据平台 session、CSRF、病例权限和 installation 状态创建一次性 `plugin_launch_ticket`；
 2. ticket 绑定 user、organization、installation、case/slide、目标 iframe origin 和随机 nonce，60 秒过期且只能交换一次；
 3. Host 通过受校验的 HostBridge bootstrap event 把 ticket 交给 HistoPilot UI；不放进长期 URL、localStorage 或日志；
-4. UI 向同源插件网关/BFF 的 `/plugin/session/exchange` 交换一个短期 `plugin_ui_token`；该 token 只允许调用 HistoPilot 的 UI/session API，不能调用 PathTogather capability API；
+4. UI 向同源插件网关/BFF 的 `/plugin/session/exchange` 交换一个短期 `plugin_ui_token`；该 token 只允许调用 HistoPilot 的 UI/session API，不能调用 PathTogether capability API；
 5. `plugin_ui_token` 默认 5 分钟，保存在内存；续期时 UI 通过 HostBridge `auth.refresh` request 请求新的单次 ticket，再次交换；
 6. BFF/HistoPilot backend 根据 UI token 中的用户上下文创建 run；随后由 backend 按 §7.6 获取 run grant/access JWT 调用平台；
 7. iframe 被关闭、用户登出、病例权限撤销或插件停用时，UI token 和对应 launch/run grant 均失效；
@@ -767,7 +767,7 @@ SSE 已建立后不能改 HTTP 状态，使用 `event: error`，data 为同一 e
 
 ## 8. 数据与存储升级
 
-### 8.1 PathTogather 数据库
+### 8.1 PathTogether 数据库
 
 建议 PostgreSQL 表域：
 
@@ -917,7 +917,7 @@ Stage 4 即使尚未建设完整配额产品，也必须启用基础保护：
 
 工作项：
 
-- 确认 `PathTogather` 最终拼写；
+- 确认 `PathTogether` 最终拼写；
 - 为 `EXP-VISCTX-v1` 记录 engine/schema/contract version；
 - 冻结现有 `/internal/ai/*` 请求响应样本；
 - 建立拆分 ADR 和兼容原则；
@@ -1153,7 +1153,7 @@ visual_context_budget_tokens
 - compaction 与 checkpoint CAS；
 - 平台 annotation 409 后不错误 backfill。
 
-### 12.3 PathTogather 回归
+### 12.3 PathTogether 回归
 
 - 多租户权限；
 - 病例成员与外部分享；
@@ -1170,7 +1170,7 @@ visual_context_budget_tokens
 
 至少覆盖：
 
-1. 用户登录 PathTogather；
+1. 用户登录 PathTogether；
 2. 打开病例和切片；
 3. 启动 HistoPilot；
 4. AI 获取概览并导航；
@@ -1343,19 +1343,21 @@ COLLAB_DB_V2_ENABLED
 
 ---
 
-## 19. 待确认决策
+## 19. 已确认决策（2026-08-13 产品拍板）
 
-实施前需要产品层确认：
+以下 10 项已由产品负责人确认，取代此前的"待确认"状态。**与本表冲突的正文章节（§5.1/§5.4、Stage 3a/3c、Stage 2、Stage 4 凭据、§7.0 版本模型）以本表为准，待下一修订版本逐章同步。**
 
-1. 品牌最终拼写是 `PathTogather` 还是 `PathTogether`；
-2. 第一目标是单机构建可选插件，还是直接支持多组织 SaaS；
-3. HistoPilot 模型凭据由用户自带、组织统一配置，还是平台托管；
-4. 是否允许病理图发送给外部模型 provider；
-5. AI transcript 是否需要进入病例正式审计档案；
-6. 外部会诊用户是否需要实名账户，还是继续支持匿名链接；
-7. 首版实时协作范围是变更同步，还是包含多人光标和同时编辑；
-8. PostgreSQL 是首发依赖，还是先提供 SQLite 单机兼容版；
-9. 插件 UI 第一版是否直接启用 iframe 隔离；
-10. HistoPilot 是否计划独立商业化和单独版本发布。
+| # | 决策项 | 结论 | 对文档的影响 |
+|---|---|---|---|
+| 1 | 品牌拼写 | **PathTogether**（标准英文） | 全文已替换；包名/域名/schema 用 path-together 风格 |
+| 2 | 身份模型 | **不做机构（organization）管理**：用户 + 用户邀请的"游客" + 邮箱注册用户 + SDK（插件）用户 | Stage 3a 从"身份与组织边界"改为"身份与访问边界"：删 organization/membership/roles 矩阵，权限模型简化为 owner/guest/sdk-user 三级；默认租户/回填方案作废 |
+| 3 | 模型凭据 | **用户管理 + 平台 fallback**：平台给积分额度（如 x 积分/周期），用户自带 API key 用自己的配额；用平台 key 扣积分 | Stage 4 CredentialResolver 改为 UserKey 优先 + PlatformFallback（带积分扣减）；无组织级统一配置 |
+| 4 | 病理图外发 | **允许，保持现状**（经 CPA 网关等外部 provider） | §4.3/§15 维持现状表述；无需阻断或默认关闭机制 |
+| 5 | AI 审计 | **本产品不是病人管理软件，没有"病理审计档案"概念** | Stage 3c 的 audit 重新定义为**协作操作日志**（谁何时改了什么，服务于冲突解决与调试），不引入医疗审计语义；AI transcript 不进入任何正式档案，平台最多保存标注来源引用 |
+| 6 | 会诊身份 | **不搞实名认证体系，邮箱注册封顶** | §5.4 分享：匿名链接继续支持 + 邮箱注册用户；不做实名/KYC |
+| 7 | 实时协作 | **首版只做变更同步**（不做多人光标/同时编辑） | Stage 3c 范围收缩 |
+| 8 | 数据库 | **PostgreSQL 首发依赖 + SQLite 单机兼容版**（同一仓储层双实现） | Stage 3b 按文档建议执行 |
+| 9 | 插件 UI 隔离 | **直接 sandbox iframe**（跳过同源 bundle 过渡期） | Stage 2 改为直接 iframe；HostBridge 协议降级为 iframe 内 postMessage 通道，request/response/event 三类消息语义不变 |
+| 10 | 版本策略 | **同仓同版本发布**（HistoPilot 不独立版本化） | §7.0 版本模型简化：API/contract 仍版本化，但产品版本与平台共享；不设独立发布周期与兼容矩阵 |
 
-以上决策不会阻塞 `EXP-VISCTX-v1`，但会影响 Stage 2 之后的身份、配置、部署和插件授权设计。
+上述决策已全部落地为本表约束，Stage 2+ 设计不再有产品层阻塞项。

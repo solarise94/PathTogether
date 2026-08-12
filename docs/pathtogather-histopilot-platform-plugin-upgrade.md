@@ -2,7 +2,7 @@
 
 ## 功能调整与升级方案
 
-> 文档版本：v0.5
+> 文档版本：v0.6
 > 状态：设计提案，尚未实施
 > 编写日期：2026-08-12
 > 设计基线：仓库 `HEAD 6dbab64` 及其之前已经提交的功能
@@ -104,7 +104,11 @@ Browser
 
 > **这不是 SaaS，也不是病人管理软件。PathTogether 是一个简单的协作读片软件 + HistoPilot agent 导航插件。别搞复杂。**
 >
-> 规模假设：小团队（个位数到几十个用户）、单机/单部署为主。任何 SaaS 级机制——机构管理、多租户隔离、实名认证、医疗审计、插件商店、签名策略、运维配额——除非另行明确要求，一律不建设。Stages 的设计以"小组协作 + 可插拔 AI"为上限，逐项裁剪过度设计。
+> 部署模型：一个部署实例 + 多用户协作——部署者邀请注册用户与游客共同查看切片（不是单机单人，也不是多租户 SaaS）。
+>
+> 技术债与选型约束：尽量一次做好不留技术债；能用开源方案的不自己造轮子（PostgreSQL、现有 WSI/Agent 栈均复用，不写双仓储适配器）。
+>
+> 任何 SaaS 级机制——机构管理、多租户隔离、实名认证、医疗审计、插件商店、签名策略、运维配额——除非另行明确要求，一律不建设。Stages 的设计以"小组协作 + 可插拔 AI"为上限，逐项裁剪过度设计。
 
 ### 3.1 PathTogether 产品目标
 
@@ -1359,14 +1363,16 @@ COLLAB_DB_V2_ENABLED
 | # | 决策项 | 结论 | 对文档的影响 |
 |---|---|---|---|
 | 1 | 品牌拼写 | **PathTogether**（标准英文） | 全文已替换；包名/域名/schema 用 path-together 风格 |
-| 2 | 身份模型 | **不做机构（organization）管理**：用户 + 用户邀请的"游客" + 邮箱注册用户 + SDK（插件）用户 | Stage 3a 从"身份与组织边界"改为"身份与访问边界"：删 organization/membership/roles 矩阵，权限模型简化为 owner/guest/sdk-user 三级；默认租户/回填方案作废 |
-| 3 | 模型凭据 | **用户管理 + 平台 fallback**：平台给积分额度（如 x 积分/周期），用户自带 API key 用自己的配额；用平台 key 扣积分 | Stage 4 CredentialResolver 改为 UserKey 优先 + PlatformFallback（带积分扣减）；无组织级统一配置 |
+| 2 | 身份与部署模型 | **不做机构管理，非单机**：产品是"一个部署实例 + 多用户协作"——部署者（我）邀请注册用户与游客共同查看同一个切片；无 organization 概念，身份模型止于 owner（部署者）/ guest（游客，受邀链接进入）/ sdk-user（插件用户） | Stage 3a 改为"身份与访问边界"：扁平用户模型（owner/guest/sdk-user），无 roles 矩阵、无租户隔离、无默认租户回填 |
+| 3 | 模型凭据 | **注册用户可用平台配置的 API；游客必须自带 key**。平台由部署者配置一个官方托管 API（如 luna，便宜）作为 fallback；demo 场景给公开切片 + 平台 API 做简单读片，无需用户配 key | Stage 4 CredentialResolver：registered → PlatformKey 可用（可积分/免费额度）；guest → 必须 UserKey，无 key 则 AI 不可用但人工读片不受影响 |
 | 4 | 病理图外发 | **允许，保持现状**（经 CPA 网关等外部 provider） | §4.3/§15 维持现状表述；无需阻断或默认关闭机制 |
 | 5 | AI 审计 | **本产品不是病人管理软件，没有"病理审计档案"概念** | Stage 3c 的 audit 重新定义为**协作操作日志**（谁何时改了什么，服务于冲突解决与调试），不引入医疗审计语义；AI transcript 不进入任何正式档案，平台最多保存标注来源引用 |
 | 6 | 会诊身份 | **不搞实名认证体系，邮箱注册封顶** | §5.4 分享：匿名链接继续支持 + 邮箱注册用户；不做实名/KYC |
 | 7 | 实时协作 | **首版只做变更同步**（不做多人光标/同时编辑） | Stage 3c 范围收缩 |
-| 8 | 数据库 | **PostgreSQL 首发依赖 + SQLite 单机兼容版**（同一仓储层双实现） | Stage 3b 按文档建议执行 |
+| 8 | 数据库 | **PostgreSQL 唯一存储**（开源、单实例多用户并发写稳妥）。砍掉 SQLite 兼容层：双仓储实现是技术债，demo/正式部署统一走 PostgreSQL（Docker compose 一键起）；现有 shares.json 迁移 Postgres 而非保留双轨 | Stage 3b：只做 expand-and-contract 迁 PostgreSQL 单一实现，无 SQLite 适配器 |
 | 9 | 插件 UI 隔离 | **直接 sandbox iframe**（跳过同源 bundle 过渡期） | Stage 2 改为直接 iframe；HostBridge 协议降级为 iframe 内 postMessage 通道，request/response/event 三类消息语义不变 |
 | 10 | 版本策略 | **同仓同版本发布**（HistoPilot 不独立版本化） | §7.0 版本模型简化：API/contract 仍版本化，但产品版本与平台共享；不设独立发布周期与兼容矩阵 |
+
+| 11 | Demo 模式 | **公开切片集 + 官方托管 API**：部署者提供公开 demo 切片，游客/新用户用平台 API（luna 级低成本模型）做简单读片体验，不需要任何自备 key | 数据模型中需支持 slice visibility=public 与平台 fallback key；不计积分或低配额 |
 
 上述决策已全部落地为本表约束，Stage 2+ 设计不再有产品层阻塞项。

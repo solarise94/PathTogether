@@ -33,7 +33,7 @@ export interface AiEngineConfig {
 	/** Default 272000. */
 	context_window_tokens?: number;
 	/** Default "openai". */
-	api_protocol?: "openai" | "anthropic";
+	api_protocol?: "openai" | "anthropic" | "gemini";
 }
 
 /**
@@ -97,7 +97,8 @@ export function buildModel(cfg: AiEngineConfig): {
 	const maxTokens = cfg.max_tokens ?? 2048;
 	const contextWindow = cfg.context_window_tokens ?? 272000;
 
-	const api: Api = protocol === "anthropic" ? "anthropic-messages" : "openai-completions";
+	const api: Api =
+		protocol === "anthropic" ? "anthropic-messages" : protocol === "gemini" ? "google-generative-ai" : "openai-completions";
 
 	// Model shape per pi-ai/src/types.ts:785 (Model<TApi>). cost all zero
 	// (ModelCostRates, types.ts:767) — billing is handled upstream by CPA.

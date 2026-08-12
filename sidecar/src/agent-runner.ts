@@ -594,7 +594,7 @@ export class AgentRunner {
 				return d;
 			});
 
-			const bbox = st.viewportBbox(slideInfo.levelDownsamples);
+			const bbox = st.viewportBbox(slideInfo.levelDownsamples, { width: slideInfo.width, height: slideInfo.height });
 			await this.bus.emit(sessionId, "slide_opened", {
 				slide,
 				width: slideInfo.width,
@@ -1481,7 +1481,16 @@ export class AgentRunner {
 				 * a store read failure leaves currentOptions as the raw options.
 				 */
 				const applyCacheKeyOptions = async (): Promise<void> => {
-					if (promptCacheCapabilities.mode !== "explicit") return;
+						if (promptCacheCapabilities.mode !== "explicit") return;
+						// gemini protocol: explicit cache keying is not applicable —
+						// Gemini-side caching is IMPLICIT prefix caching observed via
+						// usageMetadata.cachedContentTokenCount (pi maps it to
+						// usage.cacheRead). Sending prompt_cache_key would just be an
+						// unknown body field; skip injection. (Phase 4 probe:
+						// CPA-forwarded gemini-3.6-flash-high reported
+						// cachedContentTokenCount=0 on repeated identical requests —
+						// CPA-UNVERIFIED for cache hits, the metric stays observable.)
+						if (config.api_protocol === "gemini") return;
 					let cpGen = 0;
 					let slideFp = "";
 					try {
@@ -1763,7 +1772,7 @@ export class AgentRunner {
 		};
 	}
 
-	/** Lazy-import the openai-completions streamSimple bound to the config. */
+	/** Lazy-import the protocol-matched streamSimple bound to the config. */
 	private defaultStreamFnForConfig(_config: RunConfig): (model: unknown, context: unknown, options?: unknown) => Promise<AssistantMessageEventStream> {
 		// Dynamic import keeps the provider module out of the test graph when a
 		// fake streamFn is supplied. The returned fn dispatches by model.api.
@@ -1773,9 +1782,27 @@ export class AgentRunner {
 			if (m?.api === "anthropic-messages") {
 				throw new Error("anthropic protocol not yet wired in sidecar streamFn");
 			}
+			if (m?.api === "google-generative-ai") {
+				// Phase 4: gemini protocol via pi-ai's google-generative-ai provider
+				// (@google/genai SDK; targets the CPA gateway's gemini-compatible
+				// /v1beta endpoint — baseUrl already includes the version path).
+				const mod = await this.loadGoogleStream();
+				return mod.streamSimple(model as never, context as never, options as never);
+			}
 			const mod = await this.loadOpenAiStream();
 			return mod.streamSimple(model as never, context as never, options as never);
 		};
+	}
+
+	private googleStreamCache: Promise<{ streamSimple: typeof import("@earendil-works/pi-ai/api/google-generative-ai").streamSimple }> | null = null;
+	private loadGoogleStream(): Promise<{ streamSimple: typeof import("@earendil-works/pi-ai/api/google-generative-ai").streamSimple }> {
+		if (!this.googleStreamCache) {
+			// Same ESM-only subpath constraint as the openai loader below.
+			this.googleStreamCache = import("@earendil-works/pi-ai/api/google-generative-ai") as Promise<{
+				streamSimple: typeof import("@earendil-works/pi-ai/api/google-generative-ai").streamSimple;
+			}>;
+		}
+		return this.googleStreamCache;
 	}
 
 	private openAiStreamCache: Promise<{ streamSimple: typeof import("@earendil-works/pi-ai/api/openai-completions").streamSimple }> | null = null;

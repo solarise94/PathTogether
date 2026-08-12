@@ -62,15 +62,28 @@ export class AgentState {
 	 * scales with pyramidLevel: ds = level_downsamples[level], covered side =
 	 * viewportPx * ds. Centered on centerX/centerY.
 	 */
-	viewportBbox(levelDownsamples: readonly number[]): { x: number; y: number; w: number; h: number } {
+	viewportBbox(levelDownsamples: readonly number[], slideDims?: { width: number; height: number }): { x: number; y: number; w: number; h: number } {
 		const lvl = this.effectiveLevel(levelDownsamples);
 		let ds = 1.0;
 		if (levelDownsamples.length) {
 			ds = Number(levelDownsamples[lvl]) || 1.0;
 		}
 		const side = Math.max(1, this.viewportPx * ds);
-		const x = this.centerX - side / 2.0;
-		const y = this.centerY - side / 2.0;
+		let x = this.centerX - side / 2.0;
+		let y = this.centerY - side / 2.0;
+		// Edge clamping: when slideDims is provided, shift the viewport back into
+		// bounds so the origin never goes negative and the box never extends past
+		// the far edge (server /internal/ai/region 400s on x<0 or y<0 — a viewport
+		// near the slide edge on a small slide would otherwise make every
+		// snapshot fail, e.g. center (1000,800) at level 1 on a 4000x3000 slide
+		// yields x=-24 without this clamp). On slides smaller than the covered
+		// side, cover the whole slide on that axis.
+		if (slideDims) {
+			const w = Math.max(0, slideDims.width);
+			const h = Math.max(0, slideDims.height);
+			x = Math.min(Math.max(0, x), Math.max(0, w - side));
+			y = Math.min(Math.max(0, y), Math.max(0, h - side));
+		}
 		return {
 			x: Math.round(x),
 			y: Math.round(y),
@@ -526,7 +539,7 @@ export function createTools(ctx: ToolContext): AgentTool<any, any>[] {
 				oh = Math.max(64, Math.min(oh, detailCap));
 			}
 
-			const bb = st.viewportBbox(downsamples);
+			const bb = st.viewportBbox(downsamples, { width: slideInfo.width, height: slideInfo.height });
 			let r: RegionResult;
 			try {
 				r = await ctx.flask.region({

@@ -146,3 +146,11 @@ experiments/results/<run-id>/
 - `real-model` 模式：仅当 `env.PHASE4_CPA_VERIFIED === "1"` 放行；否则抛 `DataCollectionGateError`，消息含 `CPA-UNVERIFIED`、`prompt_cache_key`、并引用 §14 Phase 3。
 
 解除条件：在真实 CPA 网关上验证 `prompt_cache_key`/breakpoint/usage 透传（§14 Phase 3），随后 `export PHASE4_CPA_VERIFIED=1`。报表（`report.ts`）在存在 `prompt_cache_mode != "off"` 数据时也会在顶部打出 NO-GO 横幅。
+
+## CPA gemini 冒烟（一次性验证脚本）
+
+`smoke-gemini.ts`：真实 Flask + 真实 AgentRunner + CPA 网关 gemini 兼容端点
+（`gemini-3.6-flash-high`）的端到端验证——goto/snapshot/标注审阅/finish 工具链、
+快照图片入请求（working_set_image_bytes_sent>0）、usage 指标落地。
+运行：`npx tsx experiments/smoke-gemini.ts`（需 CPA base_url/key 写在脚本顶部常量，
+或自行改为 env 读取）。验证实录见设计文档 §14 Phase 4 批注（2026-08-12）。

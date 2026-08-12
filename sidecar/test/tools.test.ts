@@ -189,6 +189,25 @@ describe("AgentState helpers (port from ai_agent.py)", () => {
 		expect(st.viewportBbox(DOWNSAMPLES)).toEqual({ x: -1048, y: -48, w: 4096, h: 4096 });
 	});
 
+	it("viewportBbox clamps the box into bounds when slideDims is given", () => {
+		// Center near the top-left on a small slide: without clamping the box
+		// origin goes negative and the server /internal/ai/region 400s, making
+		// every snapshot fail (Phase 4 gemini smoke: center (1000,800) at level 1
+		// on a 4000x3000 slide → x=-24,y=-224 without the clamp).
+		const dims = { width: 4000, height: 3000 };
+		const st = new AgentState(1000, 800, 1024, 1, MPP);
+		// level 1 ds=2 → side 2048; raw x=-24,y=-224 → clamped to x=0,y=0.
+		expect(st.viewportBbox(DOWNSAMPLES, dims)).toEqual({ x: 0, y: 0, w: 2048, h: 2048 });
+		// Center near the far edge: box shifted back so it ends at the slide edge.
+		const st2 = new AgentState(3900, 2900, 1024, 1, MPP);
+		expect(st2.viewportBbox(DOWNSAMPLES, dims)).toEqual({ x: 1952, y: 952, w: 2048, h: 2048 });
+		// Slide smaller than the covered side on an axis → cover the whole axis.
+		const st3 = new AgentState(500, 500, 1024, 2, MPP); // side 4096 > 4000/3000
+		expect(st3.viewportBbox(DOWNSAMPLES, dims)).toEqual({ x: 0, y: 0, w: 4096, h: 4096 });
+		// Without slideDims the legacy unclamped behaviour is preserved.
+		expect(st.viewportBbox(DOWNSAMPLES)).toEqual({ x: -24, y: -224, w: 2048, h: 2048 });
+	});
+
 	it("effectiveLevel clamps out-of-range levels", () => {
 		const st = new AgentState(0, 0, 1024, 99, MPP);
 		expect(st.effectiveLevel(DOWNSAMPLES)).toBe(3);

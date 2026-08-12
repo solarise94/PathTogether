@@ -645,6 +645,12 @@ checkpoint_turn_lifetime
 > - **Wave 2 执行 runner**（`src/run.ts` 库 + `run-ab.ts` CLI + `src/fake-stream.ts`/`src/manifest.ts`/`src/flask-process.ts`）：scripted 模式经真实 AgentRunner 跑通整套管线（fixture→spawn Flask→pin manifest→每 cell 跑→输出 metrics.jsonl/rubric.json/report.md）；real-model 模式 gate 放行后仍抛“Wave 2 未实现”，provider 接线随 CPA 验证落地。
 >
 > 在 §14 Phase 3 的 `prompt_cache_key` 真实 CPA 网关验证前，缓存命中率数字不作正式结论。
+>
+> **CPA gemini 兼容路径验证实录（2026-08-12，`sidecar/experiments/smoke-gemini.ts`）**：
+> - CPA 网关 gemini 兼容端点（`/v1beta`，模型 `gemini-3.6-flash-high`）文本与图片请求均正常，`usageMetadata` 完整透传（含 `thoughtsTokenCount`）。
+> - sidecar 新增 `api_protocol: "gemini"`（pi `google-generative-ai` provider）并端到端跑通真实 AgentRunner run：goto/snapshot/mark_observation/complete_snapshot_review/finish 工具链、快照图片经 assembler 物化进入请求（`working_set_image_bytes_sent` > 0）、usage 落指标。
+> - **缓存观测**：连续 3 次相同 1024px 图请求 `cachedContentTokenCount` 恒为 0——CPA 转发的 gemini 路径缓存命中**不可观测**（可能网关未透传缓存统计、或上游未命中隐式缓存）。gemini 协议无 `prompt_cache_key` 字段，explicit 模式在 gemini 下跳过 cache key 注入；`cachedContentTokenCount`（pi 映射为 `usage.cacheRead`）指标保留观测。openai 协议的 `prompt_cache_key` 透传仍为独立的未验证项。
+> - 因此 `PHASE4_CPA_VERIFIED` 门禁**维持 NO-GO**：gemini 路径已可正常使用，但缓存命中率结论仍待可观测性验证。
 
 - 对“稳定区无概览”、768px 概览、1024px 概览三组做同任务质量、token、缓存和 TTFT 对比；临时高倍图策略保持一致。
 - 在胜出概览组内再对 768/1024/1280px working/detail 策略做质量、token、延迟对比。

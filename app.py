@@ -1497,8 +1497,9 @@ def api_ai_config():
     PUT：空串=清除；与掩码同值=不变；其他=覆盖（明文进 → 加密落盘）。
     api_key 加密存盘（Fernet），旧明文配置自动迁移。api_key 不入日志。
     会话调优参数（§8.1）进 ai_config.json，缺省用文档默认。api_protocol 为
-    "openai"|"anthropic"（默认 openai）：anthropic 直连暂未支持，选了会在起跑
-    时给出明确报错（请用 OpenAI 兼容端点）。
+    "openai"|"anthropic"|"gemini"（默认 openai）：anthropic 直连暂未支持，
+    选了会在起跑时给出明确报错；gemini 走 pi google-generative-ai provider
+    （CPA 网关的 /v1beta gemini 兼容端点）。
     """
     if request.method == "GET":
         cfg = _load_ai_config()
@@ -1524,11 +1525,11 @@ def api_ai_config():
         pending["base_url"] = str(body.get("base_url") or "").strip()
     if "model" in body:
         pending["model"] = str(body.get("model") or "").strip()
-    # api_protocol：openai | anthropic（默认 openai）
+    # api_protocol：openai | anthropic | gemini（默认 openai）
     if "api_protocol" in body:
         proto = str(body.get("api_protocol") or "").strip().lower()
-        if proto not in ("openai", "anthropic"):
-            return jsonify(error="api_protocol 仅支持 openai 或 anthropic"), 400
+        if proto not in ("openai", "anthropic", "gemini"):
+            return jsonify(error="api_protocol 仅支持 openai、anthropic 或 gemini"), 400
         pending["api_protocol"] = proto
     # 会话调优参数 + max_tokens：权威校验（正整数 / 非负整数 / 字段关系）
     # max_tokens 与 DEFAULT_CONFIG 调优字段共用同一套校验（均为数值字段）。

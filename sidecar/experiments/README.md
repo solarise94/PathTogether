@@ -1,18 +1,14 @@
 # Phase 4 A/B 实验（Wave 1 数据面 + Wave 2 执行 runner）
 
-> 状态：**准备工作 GO，正式采数 NO-GO**。Wave 1 数据面（fixture / 任务集 / arm 定义 / rubric / 报表 / 门禁）与 Wave 2 **执行 runner**（`src/run.ts` + `run-ab.ts`，scripted 模式可用）均已交付。real-model 采数仍被 `gate.ts` 门禁拦截，直到 `prompt_cache_key` 在真实 CPA 网关上验证通过。
+> 状态：**scripted + real-model 均 GO（openai-protocol 缓存可观测）**。Wave 1 数据面（fixture / 任务集 / arm 定义 / rubric / 报表 / 门禁）与 Wave 2 **执行 runner**（`src/run.ts` + `run-ab.ts`，scripted 与 real-model 模式均已实现）均已交付。real-model 采数仍需 `PHASE4_CPA_VERIFIED=1` + `CPA_API_KEY` 显式 opt-in（门禁代码行为不变，但策略已解除：openai-protocol 路径在 CPA 网关上已验证缓存可观测）。
+>
+> **缓存结论范围（2026-08-12 验证）**：openai-protocol 路径（`gpt-5.6-luna`，`prompt_cache_key` probe 返回 `cached_tokens=3438`，≈99.9% prefix hit）缓存命中**可作为正式结论**。gemini 路径（`gemini-3.6-flash-high`）在 CPA 网关上**不报告缓存命中**（CPA antigravity bug #592，v7.2.129），其缓存列**不可作为结论**。
 >
 > 设计依据：`docs/ai-context-cache-visual-workspace-upgrade.md` §14 Phase 4、§15.3、§15.4、§16。
 
-## 为什么现在只做数据面
+## 为什么现在两个模式都 GO
 
-§14 Phase 3 要求显式 Prompt Cache 验证 `prompt_cache_key`/breakpoint/usage 透传。在真实 CPA 网关验证之前，缓存命中率数字不作为正式结论（CPA-UNVERIFIED）。因此本 Wave 只交付：
-
-- 可被 runner 消费的**数据格式**（taskset / arms / rubric transcript / metrics JSONL）；
-- **格式校验**与**报表聚合**；
-- 一个**硬门禁**（`gate.ts`），real-model 模式必须 `PHASE4_CPA_VERIFIED=1` 才放行。
-
-执行 runner（Wave 2）会用 `makeFakeStreamFn`（scripted 模式）跑通整套管线，并在门禁解除后切到真实模型。
+§14 Phase 3 要求显式 Prompt Cache 验证 `prompt_cache_key`/breakpoint/usage 透传。该验证现已完成（openai-protocol 路径）。real-model 模式把 taskset 的真实 `user_turns` 通过 runner 的真实 provider streamFn 驱动，`model_script` 在 real-model 下**被忽略**。门禁（`gate.ts`）仍要求 `PHASE4_CPA_VERIFIED=1`（保留显式 opt-in 的成本防线），同时 `CPA_API_KEY` 必须由环境变量提供（不内嵌任何回退 key）。
 
 ## 目录结构
 
@@ -39,7 +35,7 @@ sidecar/experiments/
     ├── arms.ts                   arm 加载 + 矩阵生成 + Step-2 image-arm 解析
     ├── rubric.ts                 rubric 检查器（纯函数）
     ├── report.ts                 metrics 聚合 + 确定性 markdown 报表
-    ├── gate.ts                   NO-GO 门禁（CPA-UNVERIFIED）
+    ├── gate.ts                   数据采集门禁（real-model 需 PHASE4_CPA_VERIFIED=1）
     ├── fake-stream.ts            scripted 模式 streamFn（回放 model_script；自包含副本，不依赖 test/）
     ├── manifest.ts               pinned manifest 加载 + 校验 + ground-truth 区域索引
     ├── flask-process.ts          spawn Flask（ephemeral port + 内部 token）+ 健康探测 + 清退
@@ -103,18 +99,56 @@ cd sidecar
 npx tsx experiments/run-ab.ts --step 2 --image-arm step1-overview-1024
 ```
 
-CLI 参数（`parseArgs`）：`--step 1|2`、`--image-arm <id>`（step 2 必填）、`--mode scripted|real-model`（默认 scripted）、`--taskset <path>`（默认 `experiments/tasksets/reading-v1.json`）、`--arms-dir`、`--fixtures-dir`、`--out experiments/results/<run-id>`（run-id 默认 `step{N}-{mode}-{utc时间戳}`）、`--keep-flask`（调试：run 后不清退 Flask）、`--help`。
+CLI 参数（`parseArgs`）：`--step 1|2`、`--image-arm <id>`（step 2 必填）、`--mode scripted|real-model`（默认 scripted）、`--taskset <path>`（默认 `experiments/tasksets/reading-v1.json`）、`--arms-dir`、`--fixtures-dir`、`--out experiments/results/<run-id>`（run-id 默认 `step{N}-{mode}-{utc时间戳}`）、`--keep-flask`（调试：run 后不清退 Flask）、`--dry-run`（只打印解析后的矩阵 + 配置，key 脱敏，不执行、不 spawn Flask）、`--max-cells <N>`（成本护栏：限制执行的 cell 总数）、`--settle-timeout-ms <ms>`（每轮 settle 超时；默认 scripted 30000、real-model 300000）、`--help`。
 
-### 单次 run 的执行管线（scripted 模式）
+### real-model 模式（真实 CPA 网关采数）
 
-1. `gate.ts` `assertDataCollectionAllowed(mode)` **最先**调用；real-model 除非 `PHASE4_CPA_VERIFIED=1` 否则抛错。real-model 即使放行也在 Wave 2 抛“未实现（provider 接线随 CPA 验证落地）”。
+real-model 模式把 taskset 的**真实 `user_turns`** 通过 runner 的**真实 provider streamFn** 驱动（`model_script` 被忽略——它仅用于 scripted 机制验证）。真实 streamFn 的获取方式：构造 `AgentRunner` 时**省略 `streamFn` override**，runner 的重试 wrapper（`agent-runner.ts makeRetryingStreamFn`）回退到其私有 `defaultStreamFnForConfig(config)`，后者动态 import 真实 pi-ai provider 模块（openai-completions / google-generative-ai）并返回其 `streamSimple`。real-model 下也**不传 `compactionModels` override**，使压缩使用真实模型（cat5 长会话语义得以验证）。
+
+**环境变量（real-model 必需/可选）**：
+
+| 变量 | 必需 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `PHASE4_CPA_VERIFIED=1` | 是 | — | 解除 gate（openai-protocol 路径已验证；保留为显式 opt-in 成本防线） |
+| `CPA_API_KEY` | 是 | — | CPA 网关 api key。**不内嵌回退 key**；缺失即报错退出（`CpaApiKeyMissingError`） |
+| `CPA_BASE_URL` | 否 | `http://198.51.100.10:46450/v1` | CPA 网关 openai-compatible 端点 |
+| `CPA_MODEL` | 否 | `gpt-5.6-luna` | 缓存实验默认模型（openai 路径已验证缓存可观测） |
+| `CPA_API_PROTOCOL` | 否 | `openai` | `openai` \| `anthropic` \| `gemini`。**gemini 路径缓存不可观测（#592）** |
+
+**real-model Step 1（先 dry-run 审查，再正式采数）**：
+
+```bash
+cd sidecar
+# 1) dry-run：打印解析后的矩阵 + CPA 配置（key 脱敏），不执行、不产生费用
+PHASE4_CPA_VERIFIED=1 CPA_API_KEY=sk-... \
+  npx tsx experiments/run-ab.ts --step 1 --mode real-model --dry-run
+
+# 2) 正式采数（成本护栏：先用 --max-cells 跑小样本）
+PHASE4_CPA_VERIFIED=1 CPA_API_KEY=sk-... \
+  npx tsx experiments/run-ab.ts --step 1 --mode real-model --max-cells 3
+
+# 3) 全量
+PHASE4_CPA_VERIFIED=1 CPA_API_KEY=sk-... \
+  npx tsx experiments/run-ab.ts --step 1 --mode real-model
+```
+
+> **成本警告**：real-model 每个 cell 的每轮都真实计费。先用 `--dry-run` 确认矩阵规模，再用 `--max-cells` 跑小样本验证管线，最后全量。run.json 记录 `cpa_model` / `cpa_base_url`（**绝不记录 api_key**）。
+
+### 单次 run 的执行管线
+
+1. `gate.ts` `assertDataCollectionAllowed(mode)` **最先**调用；real-model 除非 `PHASE4_CPA_VERIFIED=1` 否则抛 `DataCollectionGateError`（CPA-UNVERIFIED）。real-model 随后 `resolveRealModelConfig()` 解析 CPA 配置——`CPA_API_KEY` 缺失立即抛 `CpaApiKeyMissingError`（在 `acquireEnv` 之前，不产生费用）。
 2. 参数校验：step 2 必须带 `--image-arm`；加载 taskset + arms 目录，用 `arms.ts buildStepMatrix` 解析 `image_strategy` 占位符。
-3. `acquireEnv`：`ensureSlides`（slides/ 为空才 spawn `generate.py --out-dir`）→ `spawnFlask`（ephemeral port，slides 作 UPLOAD_DIR，随机内部 token；不设 ADMIN_PASSWORD 故 AUTH_ENABLED=False，`/api/slides` 公开做健康探测）→ `pinManifest`（`generate.py --pin`，token 经 env 透传，满足 `/internal/ai/slide_info` 鉴权）→ `loadManifest` → 真 `FlaskClient`（HTTP，非内存 mock）。
-4. taskset 的 `fixture_id` 与 manifest 交叉校验。
-5. 对每个 (arm, task)（arm-major，task 按 taskset 顺序）：**fresh SessionStore（独立 temp 目录）+ SessionEventBus + 共享 FlaskClient + AgentRunner**（`streamFn=makeFakeStreamFn(task.model_script)`、`metricsSink=采集 sink`、`compactionModels=scripted 假摘要`）；用 `runMain` 驱动 `user_turns[0]`，后续 turn append 用户消息后 `continueMain`；每请求收 `RequestMetrics`。
-6. transcript 扁平成 `RubricTranscriptEntry[]`（snapshot 的 viewport bbox 取自 `toolResult.details.src`），`checkRubric(rubric, transcript, manifestRegions)`。
-7. 输出（run 目录）：`metrics.jsonl`（每行一个 `ReportRow`）、`rubric.json`（每 task+arm 含每断言详情）、`transcripts.json`、`report.md`（`aggregateReport`+`renderReport`，确定性、**无时间戳**）、`run.json`（run 元数据，**可带时间戳**）。
-8. 清退：`handle.stop()`（除非 `--keep-flask`），删除每 cell 的 temp session 目录；slides/ 留存复用（gitignored）。
+3. `--dry-run`：打印解析后的矩阵 + 配置（key 脱敏）后直接返回，不 `acquireEnv`、不执行任何 cell。
+4. `acquireEnv`：`ensureSlides`（slides/ 为空才 spawn `generate.py --out-dir`）→ `spawnFlask`（ephemeral port，slides 作 UPLOAD_DIR，随机内部 token；不设 ADMIN_PASSWORD 故 AUTH_ENABLED=False，`/api/slides` 公开做健康探测）→ `pinManifest`（`generate.py --pin`，token 经 env 透传，满足 `/internal/ai/slide_info` 鉴权）→ `loadManifest` → 真 `FlaskClient`（HTTP，非内存 mock）。
+5. taskset 的 `fixture_id` 与 manifest 交叉校验。
+6. 对每个 (arm, task)（arm-major，task 按 taskset 顺序；`--max-cells` 超限则 SKIP）：**fresh SessionStore（独立 temp 目录）+ SessionEventBus + 共享 FlaskClient + AgentRunner**。
+   - **scripted**：`streamFn=makeFakeStreamFn(task.model_script)`、`metricsSink=采集 sink`、`compactionModels=scripted 假摘要`。
+   - **real-model**：省略 `streamFn` override（用 runner 默认真实 provider；测试经 `RunnerDeps.realStreamFnFactory` 注入桩）、`metricsSink=采集 sink`、**不传 `compactionModels`**（用真实模型压缩）。
+   - 用 `runMain` 驱动 `user_turns[0]`，后续 turn append 用户消息后 `continueMain`；每轮 `waitForSettle`（超时可配）。每请求收 `RequestMetrics`。
+   - **韧性**：real-model 下单个 cell 出错/超时被记录（rubric FAIL + `cell_errors` 详情写入 run.json），**不中断整个矩阵**。
+7. transcript 扁平成 `RubricTranscriptEntry[]`（snapshot 的 viewport bbox 取自 `toolResult.details.src`），`checkRubric(rubric, transcript, manifestRegions)`。
+8. 输出（run 目录）：`metrics.jsonl`（每行一个 `ReportRow`）、`rubric.json`（每 task+arm 含每断言详情）、`transcripts.json`、`report.md`（`aggregateReport`+`renderReport`，确定性、**无时间戳**）、`run.json`（run 元数据 + `cpa_model`/`cpa_base_url`/`cell_errors`，**可带时间戳**，**绝不记录 api_key**）。
+9. 清退：`handle.stop()`（除非 `--keep-flask`），删除每 cell 的 temp session 目录；slides/ 留存复用（gitignored）。
 
 > **RunConfig/transform 覆盖接线点**：`run.ts buildRunConfig(arm)` 把 arm 的 `resolvedOverrides`（snake_case）**直接展开**到 `RunConfig` 上。因为 `resolveTransformSettings(config)`（`agent-runner.ts runAgentLoop`）从 config 对象上直接读这些 snake_case 字段，所以 `overview_enabled` / `overview_long_edge` / `visual_*` / `image_*` / `context_window_tokens` 无需中间适配器就到达 assembler + 引擎；`prompt_cache_mode` 来自 arm 的独立字段。
 
@@ -128,24 +162,30 @@ experiments/results/<run-id>/
 ├── rubric.json        每 (task, arm) rubric 结果 + 每断言详情
 ├── transcripts.json   扁平 transcript（调试 / 复跑 rubric）
 ├── report.md          确定性 markdown 对比报表（无时间戳）
-└── run.json           run 元数据（step/mode/arm ids/taskset id/manifest sha/时间戳）
+└── run.json           run 元数据（step/mode/arm ids/taskset id/manifest sha/cpa_model/cpa_base_url/cell_errors/时间戳；绝不记录 api_key）
 ```
 
-### scripted 模式已知 caveats
+### 已知 caveats
 
-- **wall_ms 无意义**：度量的是 `makeFakeStreamFn` 回放，不是真实模型；仅在 real-model 模式下才有意义。
-- **cat5 compaction 不会真正 compact**：scripted 模式下没有真实模型摘要能力；runner 注入假 `compactionModels`（返回固定摘要），且 272k window 下短 script 几乎不触发压缩。cat5 的长会话语义需 real-model 模式验证。
+- **scripted wall_ms 无意义**：度量的是 `makeFakeStreamFn` 回放，不是真实模型；仅在 real-model 模式下才有意义。
+- **scripted cat5 compaction 不会真正 compact**：scripted 模式下没有真实模型摘要能力；runner 注入假 `compactionModels`（返回固定摘要），且 272k window 下短 script 几乎不触发压缩。cat5 的长会话语义需 real-model 模式验证。
 - **overview 命中依赖稳定区 checkpoint**：scripted run 起步时无 checkpoint，稳定概览在首请求后才可能 back-fill；概览字节数在 scripted 下偏低是预期的。
-- **real-model 未实现**：gate 通过后仍抛“Wave 2 未实现”，provider 接线随 CPA 验证落地。
+- **real-model 单 cell 韧性**：real-model 下单个 cell 出错/超时被记录（rubric FAIL + `cell_errors`）而不中断矩阵；全量 run 的部分 cell 可能 FAIL，需结合 `cell_errors` 审读。
+- **Flask 缓存跨 cell 残留**：Flask 侧缓存（slide handles 等）跨 cell 持续；scripted 下 JPEG 输出确定性可接受，real-model 数据采集时需注意（每个 cell 仅清 sidecar 侧 derivative LRU）。
 
-## NO-GO 门禁与如何解除
+## 数据采集门禁与缓存结论范围
 
 `src/gate.ts`：
 
 - `scripted` 模式：始终放行（用 fake streamFn，不产生真实缓存声明）。
-- `real-model` 模式：仅当 `env.PHASE4_CPA_VERIFIED === "1"` 放行；否则抛 `DataCollectionGateError`，消息含 `CPA-UNVERIFIED`、`prompt_cache_key`、并引用 §14 Phase 3。
+- `real-model` 模式：仅当 `env.PHASE4_CPA_VERIFIED === "1"` 放行；否则抛 `DataCollectionGateError`，消息含 `CPA-UNVERIFIED`、`prompt_cache_key`、并引用 §14 Phase 3。**门禁代码行为不变**——保留 `PHASE4_CPA_VERIFIED=1` 作为显式 opt-in 的成本防线。
 
-解除条件：在真实 CPA 网关上验证 `prompt_cache_key`/breakpoint/usage 透传（§14 Phase 3），随后 `export PHASE4_CPA_VERIFIED=1`。报表（`report.ts`）在存在 `prompt_cache_mode != "off"` 数据时也会在顶部打出 NO-GO 横幅。
+**缓存结论范围（2026-08-12 验证，门禁策略已解除）**：
+
+- **openai-protocol 路径 GO**：`gpt-5.6-luna` + `prompt_cache_key`，非流式 probe 重复请求返回 `cached_tokens=3438`（≈99.9% prefix hit）。openai-protocol arm 的缓存命中率**可作为正式结论**。
+- **gemini-protocol 路径 UNVERIFIED**：`gemini-3.6-flash-high` 在 CPA 网关上 `cachedContentTokenCount` 恒为 0（CPA antigravity bug #592，v7.2.129）。gemini-protocol arm 的缓存列**不可作为结论**。
+
+报表（`report.ts`）在存在 `prompt_cache_mode != "off"` 数据时仍会在顶部打出 CPA-UNVERIFIED 横幅（历史保留；openai-protocol 已验证后可按需调整）。
 
 ## CPA gemini 冒烟（一次性验证脚本）
 

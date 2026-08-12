@@ -9,9 +9,11 @@
  * Run (from the sidecar dir):
  *   npx tsx experiments/run-ab.ts --step 1
  *   npx tsx experiments/run-ab.ts --step 2 --image-arm step1-overview-1024
+ *   PHASE4_CPA_VERIFIED=1 CPA_API_KEY=sk-... npx tsx experiments/run-ab.ts --step 1 --mode real-model --dry-run
  *
- * Real-model mode is gated (gate.ts) and NOT implemented in Wave 2 (provider
- * wiring lands with CPA verification). See experiments/README.md.
+ * Real-model mode is gated (gate.ts): requires PHASE4_CPA_VERIFIED=1 AND
+ * CPA_API_KEY. Cache conclusions only apply to the openai-protocol path
+ * (gemini path is cache-unobservable, #592). See experiments/README.md.
  *
  * NOTE: experiment data plane only — NOT built into the shipped sidecar bundle.
  */
@@ -57,12 +59,15 @@ function help(): string {
 		"Options:",
 		"  --step <1|2>              Experiment step (required).",
 		"  --image-arm <id>          Step 2: Step-1 arm id whose image overrides are copied in (required for step 2).",
-		"  --mode <mode>             scripted | real-model (default scripted). real-model is gated + unimplemented in Wave 2.",
+		"  --mode <mode>             scripted | real-model (default scripted). real-model is gated (PHASE4_CPA_VERIFIED=1 + CPA_API_KEY).",
 		"  --taskset <path>          Taskset JSON (default experiments/tasksets/reading-v1.json).",
 		"  --arms-dir <path>         Arms directory (default experiments/arms).",
 		"  --fixtures-dir <path>     Fixtures directory (default experiments/fixtures).",
 		"  --out <dir>               Output directory (default experiments/results/<run-id>).",
 		"  --keep-flask              Leave Flask running after the run (debug).",
+		"  --dry-run                 Resolve + print the matrix + config (key redacted); do NOT execute or spawn Flask.",
+		"  --max-cells <N>           Cost guard: cap the number of (arm, task) cells executed.",
+		"  --settle-timeout-ms <ms>  Per-turn settle timeout (default: scripted 30000, real-model 300000).",
 		"  --help                    Show this help.",
 		"",
 	].join("\n");
@@ -79,6 +84,9 @@ async function main(): Promise<void> {
 			"fixtures-dir": { type: "string" },
 			out: { type: "string" },
 			"keep-flask": { type: "boolean", default: false },
+			"dry-run": { type: "boolean", default: false },
+			"max-cells": { type: "string" },
+			"settle-timeout-ms": { type: "string" },
 			help: { type: "boolean", default: false },
 		},
 		strict: true,
@@ -108,6 +116,17 @@ async function main(): Promise<void> {
 	const runId = `step${step}-${mode}-${utcStampForRunId()}`;
 	const outDir = resolve(values.out ?? join(EXperiments_DIR, "results", runId));
 
+	const maxCellsRaw = values["max-cells"];
+	const maxCells = maxCellsRaw != null && maxCellsRaw !== "" ? Number(maxCellsRaw) : undefined;
+	if (maxCells !== undefined && (!Number.isFinite(maxCells) || maxCells <= 0 || !Number.isInteger(maxCells))) {
+		throw new RunnerArgumentError("--max-cells must be a positive integer");
+	}
+	const settleTimeoutRaw = values["settle-timeout-ms"];
+	const settleTimeoutMs = settleTimeoutRaw != null && settleTimeoutRaw !== "" ? Number(settleTimeoutRaw) : undefined;
+	if (settleTimeoutMs !== undefined && (!Number.isFinite(settleTimeoutMs) || settleTimeoutMs <= 0 || !Number.isInteger(settleTimeoutMs))) {
+		throw new RunnerArgumentError("--settle-timeout-ms must be a positive integer");
+	}
+
 	const opts: RunOptions = {
 		mode,
 		step,
@@ -119,6 +138,9 @@ async function main(): Promise<void> {
 		repoRoot: REPO_ROOT,
 		fixturesDir,
 		keepFlask: !!values["keep-flask"],
+		dryRun: !!values["dry-run"],
+		maxCells,
+		settleTimeoutMs,
 	};
 
 	// Real acquireEnv: ensure slides → spawn Flask → pin manifest → FlaskClient.
@@ -156,10 +178,16 @@ async function main(): Promise<void> {
 	};
 
 	const result = await runExperiment(opts, { acquireEnv });
-	process.stdout.write(
-		`\n[done] run=${result.runId} arms=[${result.armIds.join(", ")}] ` +
-			`rows=${result.rows.length} rubric=${result.rubricOutcomes.length} → ${result.outDir}\n`,
-	);
+	if (opts.dryRun) {
+		process.stdout.write(`\n[dry-run] ${result.runId}: resolved ${result.armIds.length} arm(s); no execution performed.\n`);
+	} else {
+		process.stdout.write(
+			`\n[done] run=${result.runId} arms=[${result.armIds.join(", ")}] ` +
+				`rows=${result.rows.length} rubric=${result.rubricOutcomes.length}` +
+				(result.cellErrors.length ? ` cell_errors=${result.cellErrors.length}` : "") +
+				` → ${result.outDir}\n`,
+		);
+	}
 }
 
 main().catch((e) => {

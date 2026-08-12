@@ -2,14 +2,40 @@
  * Phase 4 A/B framework (Wave 2: execution runner) — experiment runner library.
  *
  * Drives a ResolvedArm × Task matrix through the REAL AgentRunner (pi agent-loop
- * + tools + Phase 2b assembler), playing back each task's `model_script` via a
- * fake streamFn (scripted mode), collecting per-request RequestMetrics + a
- * flattened rubric transcript, and writing the JSONL + rubric + report outputs.
+ * + tools + Phase 2b assembler). Two modes:
+ *
+ *   - **scripted** (default): plays back each task's `model_script` via a fake
+ *     streamFn (fake-stream.ts). Mechanism validation only; wall_ms / cached
+ *     tokens are NOT meaningful.
+ *   - **real-model**: drives the taskset's REAL `user_turns` through the runner's
+ *     REAL provider streamFn (the AgentRunner default — see "Real streamFn"
+ *     below). `model_script` is IGNORED in real-model mode. The CPA gateway
+ *     config (base_url / api_key / model) is resolved from env (see
+ *     {@link resolveRealModelConfig}). Cache-hit numbers are only meaningful for
+ *     openai-protocol arms (gemini path is cache-unobservable, #592).
+ *
+ * Both modes collect per-request RequestMetrics + a flattened rubric transcript,
+ * and write the JSONL + rubric + report outputs.
  *
  * Dependency injection: the Flask environment (FlaskClient + pinned manifest +
  * teardown) is provided by {@link RunnerDeps.acquireEnv}, so the vitest suite can
  * substitute the in-memory FlaskClient mock (helpers.ts) WITHOUT spawning real
  * Flask. The real CLI (run-ab.ts) wires acquireEnv to the spawn+pin pipeline.
+ * For real-model testability, {@link RunnerDeps.realStreamFnFactory} lets tests
+ * inject a stubbed "real" stream WITHOUT touching agent-runner.ts (production
+ * leaves it undefined so the AgentRunner uses its built-in default provider).
+ *
+ * ## Real streamFn (the exact mechanism)
+ *
+ * The sanctioned way to obtain the real streamFn is to OMIT the `streamFn`
+ * override when constructing `AgentRunner`. The runner's retry wrapper
+ * (`agent-runner.ts makeRetryingStreamFn`) falls back to its PRIVATE
+ * `defaultStreamFnForConfig(config)` — which dynamically imports the real
+ * pi-ai provider module (openai-completions / google-generative-ai) and returns
+ * its `streamSimple`, dispatched by `model.api`. So in real-model mode we simply
+ * pass NO `streamFn` override (and NO `compactionModels` override, so compaction
+ * uses the real model). The seam {@link RunnerDeps.realStreamFnFactory} exists
+ * purely so tests can substitute a fake "real" stream.
  *
  * Wiring point for arm overrides: {@link buildRunConfig} spreads the arm's
  * resolvedOverrides (snake_case) straight into the RunConfig. Because
@@ -26,7 +52,7 @@ import { spawn } from "node:child_process";
 import { mkdtemp } from "node:fs/promises";
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, AssistantMessageEventStream } from "@earendil-works/pi-ai";
 
 import { SessionStore } from "../../src/session-store.js";
 import { SessionEventBus } from "../../src/events.js";
@@ -37,7 +63,7 @@ import type { PersistedAgentMessage } from "../../src/session-store.js";
 import type { RequestMetrics } from "../../src/metrics.js";
 
 import { checkRubric, type RubricTranscriptEntry } from "./rubric.js";
-import { loadArmDir, buildStepMatrix, DEFAULT_CONTEXT_WINDOW_TOKENS, type Arm, type ArmStep, type ResolvedArm } from "./arms.js";
+import { loadArmDir, buildStepMatrix, DEFAULT_CONTEXT_WINDOW_TOKENS, type Arm, type ArmStep, type ResolvedArm, type ExperimentMatrix } from "./arms.js";
 import { loadTaskset, type Task, type Taskset } from "./taskset.js";
 import { aggregateReport, renderReport, type ReportRow } from "./report.js";
 import { assertDataCollectionAllowed, DataCollectionGateError, type DataCollectionMode } from "./gate.js";
@@ -56,6 +82,99 @@ export const RUNNER_BASE_CONFIG = {
 	max_tokens: 2048,
 	api_protocol: "openai" as const,
 };
+
+// =========================================================================== //
+// Real-model (CPA gateway) config
+// =========================================================================== //
+
+/** Default CPA gateway base url (openai-compatible /v1 endpoint). */
+export const CPA_DEFAULT_BASE_URL = "http://198.51.100.10:46450/v1";
+/**
+ * Default model for cache experiments. The openai-protocol path on this gateway
+ * reports cache hits (gpt-5.6-luna cached_tokens verified 2026-08-12). The
+ * gemini path does NOT (CPA antigravity bug #592).
+ */
+export const CPA_DEFAULT_MODEL = "gpt-5.6-luna";
+/** Default api protocol for real-model runs. */
+export const CPA_DEFAULT_API_PROTOCOL = "openai" as const;
+
+/** Env var holding the CPA gateway api key (REQUIRED for real-model mode). */
+export const CPA_API_KEY_ENV = "CPA_API_KEY";
+/** Env var overriding the CPA gateway base url (optional). */
+export const CPA_BASE_URL_ENV = "CPA_BASE_URL";
+/** Env var overriding the CPA model (optional). */
+export const CPA_MODEL_ENV = "CPA_MODEL";
+/** Env var overriding the CPA api protocol (optional). */
+export const CPA_API_PROTOCOL_ENV = "CPA_API_PROTOCOL";
+
+/**
+ * Resolved CPA gateway config for a real-model run. The api_key is held here at
+ * runtime (passed into the RunConfig → AgentRunner) but is NEVER serialized to
+ * run.json (only base_url + model are recorded). All four fields are overridable
+ * via env ({@link resolveRealModelConfig}).
+ */
+export interface RealModelConfig {
+	base_url: string;
+	api_key: string;
+	model: string;
+	api_protocol: "openai" | "anthropic" | "gemini";
+}
+
+/** Error thrown when real-model mode is requested without the CPA api key. */
+export class CpaApiKeyMissingError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "CpaApiKeyMissingError";
+	}
+}
+
+/**
+ * Resolve the CPA gateway config for a real-model run from the process env.
+ *
+ * - `CPA_API_KEY` is REQUIRED; a missing/empty key throws
+ *   {@link CpaApiKeyMissingError} loudly (NO embedded fallback key — operators
+ *   must export the key explicitly so it never leaks into committed source or
+ *   logs).
+ * - `CPA_BASE_URL` defaults to {@link CPA_DEFAULT_BASE_URL}.
+ * - `CPA_MODEL` defaults to {@link CPA_DEFAULT_MODEL}.
+ * - `CPA_API_PROTOCOL` defaults to {@link CPA_DEFAULT_API_PROTOCOL}.
+ *
+ * @param env the process env (defaults to process.env)
+ */
+export function resolveRealModelConfig(env: NodeJS.ProcessEnv = process.env): RealModelConfig {
+	const api_key = env[CPA_API_KEY_ENV];
+	if (!api_key || api_key.trim().length === 0) {
+		throw new CpaApiKeyMissingError(
+			`real-model 模式需要环境变量 ${CPA_API_KEY_ENV}（CPA 网关 api key）。` +
+				`为避免密钥泄漏到提交的源码/日志，runner 不内嵌任何回退 key。` +
+				`请 export ${CPA_API_KEY_ENV}=sk-... 后重试。` +
+				`base_url/model 可选经 ${CPA_BASE_URL_ENV}/${CPA_MODEL_ENV} 覆盖。`,
+		);
+	}
+	const protoRaw = (env[CPA_API_PROTOCOL_ENV] ?? CPA_DEFAULT_API_PROTOCOL) as string;
+	if (protoRaw !== "openai" && protoRaw !== "anthropic" && protoRaw !== "gemini") {
+		throw new CpaApiKeyMissingError(
+			`${CPA_API_PROTOCOL_ENV}="${protoRaw}" 非法；仅支持 openai|anthropic|gemini。`,
+		);
+	}
+	return {
+		base_url: env[CPA_BASE_URL_ENV] ?? CPA_DEFAULT_BASE_URL,
+		api_key,
+		model: env[CPA_MODEL_ENV] ?? CPA_DEFAULT_MODEL,
+		api_protocol: protoRaw,
+	};
+}
+
+/** Redact a key for display: keep the first 3 + last 2 chars, mask the middle. */
+export function redactKey(key: string): string {
+	if (key.length <= 6) return "***";
+	return `${key.slice(0, 3)}…${key.slice(-2)}(${key.length} chars)`;
+}
+
+/** Default per-turn settle timeout (ms) — scripted mode (fake stream is fast). */
+export const RUNNER_SETTLE_TIMEOUT_MS_SCRIPTED = 30_000;
+/** Default per-turn settle timeout (ms) — real-model mode (real turns are slow). */
+export const RUNNER_SETTLE_TIMEOUT_MS_REAL = 300_000;
 
 export interface RunOptions {
 	mode: DataCollectionMode;
@@ -76,6 +195,22 @@ export interface RunOptions {
 	fixturesDir: string;
 	/** Keep Flask alive after the run (debug). */
 	keepFlask?: boolean;
+	/**
+	 * Dry-run: resolve + print the matrix + config (key redacted) and return
+	 * WITHOUT acquiring the env or executing any cell. Useful for pre-run review.
+	 */
+	dryRun?: boolean;
+	/**
+	 * Cost guard: cap the total number of (arm, task) cells executed. Default:
+	 * the full matrix. Cells beyond the cap are skipped (not errored).
+	 */
+	maxCells?: number;
+	/**
+	 * Per-turn settle timeout in ms (waitForSettle). Defaults:
+	 * scripted {@link RUNNER_SETTLE_TIMEOUT_MS_SCRIPTED}, real-model
+	 * {@link RUNNER_SETTLE_TIMEOUT_MS_REAL}. Real-model turns are much slower.
+	 */
+	settleTimeoutMs?: number;
 }
 
 /**
@@ -91,6 +226,13 @@ export interface FixtureEnv {
 	teardown: () => Promise<void>;
 }
 
+/**
+ * A streamFn compatible with {@link AgentRunnerOverrides.streamFn}. Tests inject
+ * a fake "real" stream via {@link RunnerDeps.realStreamFnFactory}; production
+ * leaves it undefined so the AgentRunner uses its built-in default provider.
+ */
+export type StreamFn = (model: unknown, context: unknown, options?: unknown) => AssistantMessageEventStream;
+
 export interface RunnerDeps {
 	/**
 	 * Acquire the Flask + manifest environment for the run. Called once, after
@@ -98,6 +240,16 @@ export interface RunnerDeps {
 	 * in-memory FlaskClient mock + a fixed manifest + a no-op teardown.
 	 */
 	acquireEnv: (opts: RunOptions) => Promise<FixtureEnv>;
+	/**
+	 * TEST SEAM for real-model mode. When set, returns a streamFn that is passed
+	 * as the AgentRunner's `streamFn` override (a stubbed "real" stream). When
+	 * unset/returns undefined, real-model mode constructs the AgentRunner WITHOUT
+	 * a `streamFn` override, so the runner falls back to its built-in
+	 * `defaultStreamFnForConfig` — the REAL pi-ai provider. Production never sets
+	 * this. This seam exists so the vitest suite can exercise the real-model code
+	 * path WITHOUT hitting the real CPA gateway.
+	 */
+	realStreamFnFactory?: (config: RunConfig) => StreamFn | undefined;
 }
 
 /** Per-(task, arm) rubric outcome tagged with its coordinates. */
@@ -116,6 +268,14 @@ export interface TranscriptRow {
 	entries: RubricTranscriptEntry[];
 }
 
+/** One cell that errored or timed out (resilience: recorded, not fatal). */
+export interface CellError {
+	task_id: string;
+	arm_id: string;
+	step: ArmStep;
+	error: string;
+}
+
 export interface RunResult {
 	runId: string;
 	outDir: string;
@@ -125,8 +285,14 @@ export interface RunResult {
 	rows: ReportRow[];
 	rubricOutcomes: RubricOutcomeRow[];
 	transcripts: TranscriptRow[];
+	/** Cells that errored/timed out (real-model resilience). Empty for clean runs. */
+	cellErrors: CellError[];
 	manifest: Manifest;
 	reportMarkdown: string;
+	/** Real-model CPA model (null for scripted). */
+	cpaModel: string | null;
+	/** Real-model CPA base url, NO key (null for scripted). */
+	cpaBaseUrl: string | null;
 }
 
 // =========================================================================== //
@@ -146,17 +312,31 @@ export class RunnerArgumentError extends Error {
 
 /**
  * Build a RunConfig for one resolved arm by spreading the arm's resolved
- * snake_case overrides onto the scripted base config. Because
+ * snake_case overrides onto the base config. Because
  * `resolveTransformSettings(config)` (agent-runner.ts runAgentLoop) reads these
  * same snake_case fields directly off the config object, the overrides reach the
  * Phase 2b assembler + compaction engine with no intermediate adapter:
  *   - context_window_tokens → engine config (buildModel) + compaction;
  *   - overview_enabled / overview_long_edge / visual_* / image_* → transform settings;
  *   - prompt_cache_mode is set from the arm (separate field, not an override).
+ *
+ * In real-model mode, pass {@link realModelConfig} so the base_url / api_key /
+ * model / api_protocol are the REAL CPA gateway values (buildModel reads them to
+ * construct the provider). The arm overrides never touch those four fields
+ * (KNOWN_OVERRIDE_KEYS excludes them), so the CPA values are preserved.
  */
-export function buildRunConfig(arm: ResolvedArm): RunConfig {
+export function buildRunConfig(arm: ResolvedArm, realModelConfig?: RealModelConfig): RunConfig {
+	const base = realModelConfig
+		? {
+				...RUNNER_BASE_CONFIG,
+				base_url: realModelConfig.base_url,
+				api_key: realModelConfig.api_key,
+				model: realModelConfig.model,
+				api_protocol: realModelConfig.api_protocol,
+			}
+		: RUNNER_BASE_CONFIG;
 	const config: RunConfig = {
-		...RUNNER_BASE_CONFIG,
+		...base,
 		context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
 		// Spread the arm's resolved overrides (snake_case) straight in. These are
 		// a subset of RunConfig keys (validated by arms.ts KNOWN_OVERRIDE_KEYS).
@@ -284,16 +464,29 @@ interface CellResult {
  * AgentRunner sharing the run-wide FlaskClient. Drives the task's user_turns
  * through the runner's public runMain/continueMain API, collecting per-request
  * RequestMetrics and a flattened rubric transcript.
+ *
+ * Mode branching:
+ *   - scripted: fake streamFn playing task.model_script + fake compactionModels.
+ *   - real-model: REAL user_turns through the runner's REAL provider streamFn
+ *     (injected via realStreamFnFactory for tests; omitted in production so the
+ *     AgentRunner uses its default provider) + REAL compaction (no
+ *     compactionModels override). model_script is IGNORED in real-model mode.
  */
 async function runCell(args: {
 	arm: ResolvedArm;
 	task: Task;
 	fixture: ManifestFixture;
 	env: FixtureEnv;
+	mode: DataCollectionMode;
+	realModelConfig?: RealModelConfig;
+	realStreamFnFactory?: RunnerDeps["realStreamFnFactory"];
+	settleTimeoutMs: number;
 }): Promise<CellResult> {
-	const { arm, task, fixture, env } = args;
+	const { arm, task, fixture, env, mode, realModelConfig, realStreamFnFactory, settleTimeoutMs } = args;
 	const slide = fixture.file;
-	const config = buildRunConfig(arm);
+	const isReal = mode === "real-model";
+	// Real-model: pass the CPA config so buildModel wires the real provider.
+	const config = buildRunConfig(arm, isReal ? realModelConfig : undefined);
 
 	// A/B fairness: the derivative LRU (transform-context.ts) is MODULE-LEVEL, so
 	// without a reset, earlier cells warm the cache for later cells (later arms
@@ -308,30 +501,35 @@ async function runCell(args: {
 	const store = new SessionStore({ sessionsDir: cellDir });
 	const bus = new SessionEventBus(store);
 
-	// Fake streamFn playing the task's model_script, keyed by assistant count.
-	const { fn: streamFn } = makeFakeStreamFn(task.model_script);
-
 	// Collecting metrics sink + per-request wall timestamps.
 	const collected: Array<{ metrics: RequestMetrics; at: number }> = [];
 	const cellStart = Date.now();
-	let prevFire = cellStart;
 	const metricsSink = (metrics: RequestMetrics): void => {
-		const at = Date.now();
-		collected.push({ metrics, at });
-		void prevFire; // prevFire used below in row construction
-		prevFire = at;
+		collected.push({ metrics, at: Date.now() });
 	};
 
-	const runner = new AgentRunner(store, bus, env.flask, {
-		streamFn: streamFn as never,
-		metricsSink,
-		compactionModels: fakeCompactionModels("[scripted compaction summary]") as never,
-	});
+	// Build the AgentRunner overrides per mode.
+	const runnerOverrides: Record<string, unknown> = { metricsSink };
+	if (isReal) {
+		// Real-model: the streamFn is the runner's REAL provider default — we
+		// obtain it by OMITTING the streamFn override (the retry wrapper falls
+		// back to defaultStreamFnForConfig). The test seam injects a stub.
+		const injected = realStreamFnFactory?.(config);
+		if (injected) runnerOverrides.streamFn = injected as never;
+		// NOTE: no compactionModels override → compaction uses the REAL model.
+	} else {
+		// Scripted: fake streamFn playing task.model_script + fake compaction.
+		const { fn: streamFn } = makeFakeStreamFn(task.model_script);
+		runnerOverrides.streamFn = streamFn as never;
+		runnerOverrides.compactionModels = fakeCompactionModels("[scripted compaction summary]") as never;
+	}
+
+	const runner = new AgentRunner(store, bus, env.flask, runnerOverrides as never);
 
 	// Drive user_turns[0] via runMain (fresh main session).
 	const turn0 = task.user_turns[0] ?? "";
 	const { sessionId } = await runner.runMain({ slide, config, task: turn0, fresh: true });
-	await waitForSettle(store, sessionId);
+	await waitForSettle(store, sessionId, settleTimeoutMs);
 
 	// Drive subsequent user_turns by appending the user message then continuing.
 	for (let i = 1; i < task.user_turns.length; i++) {
@@ -350,11 +548,13 @@ async function runCell(args: {
 			return d;
 		});
 		await runner.continueMain({ slide, config });
-		await waitForSettle(store, sessionId);
+		await waitForSettle(store, sessionId, settleTimeoutMs);
 	}
 
 	// Build ReportRows: each collected RequestMetrics → ReportRow with wall_ms
 	// (delta from the previous fire; meaningless in scripted mode — documented).
+	// Real-model rows carry the CPA api protocol so report.ts can gate the
+	// NO-GO banner by protocol (openai verified; gemini #592; scripted omitted).
 	let prev = cellStart;
 	const rows: ReportRow[] = collected.map(({ metrics, at }) => {
 		const wall_ms = at - prev;
@@ -365,6 +565,7 @@ async function runCell(args: {
 			arm_id: arm.arm_id,
 			step: arm.step,
 			wall_ms,
+			...(realModelConfig ? { cpa_api_protocol: realModelConfig.api_protocol } : {}),
 		};
 	});
 
@@ -384,6 +585,27 @@ async function runCell(args: {
 		rows,
 		rubric: { task_id: task.id, arm_id: arm.arm_id, step: arm.step, outcome },
 		transcript: { task_id: task.id, arm_id: arm.arm_id, step: arm.step, entries: transcript },
+	};
+}
+
+/**
+ * Build a synthetic FAIL rubric outcome for a cell that errored or timed out
+ * (real-model resilience). Every machine assertion is marked fail with the error
+ * detail; the overall is FAIL. The cell contributes NO metrics rows.
+ */
+function errorRubricOutcome(task: Task, arm: ResolvedArm, error: unknown): RubricOutcomeRow {
+	const detail = `cell error: ${(error as Error)?.message || String(error)}`;
+	const results = task.rubric.map((a) => ({
+		assertionId: a.id,
+		type: a.type,
+		pass: false,
+		detail,
+	}));
+	return {
+		task_id: task.id,
+		arm_id: arm.arm_id,
+		step: arm.step,
+		outcome: { results, overall: "FAIL" as const },
 	};
 }
 
@@ -492,9 +714,75 @@ async function writeOutputs(opts: RunOptions, env: FixtureEnv, result: RunResult
 		manifest_sha: manifestSha,
 		image_arm_id: opts.imageArmId ?? null,
 		keep_flask: !!opts.keepFlask,
+		// Real-model CPA provenance (NO api_key ever serialized — only model +
+		// base_url so a run.json is safe to share). null for scripted mode.
+		cpa_model: result.cpaModel,
+		cpa_base_url: result.cpaBaseUrl,
+		// Per-cell errors (real-model resilience). Empty for a clean run.
+		cell_errors: result.cellErrors,
 		generated_at_utc: new Date().toISOString(),
 	};
 	await fs.writeFile(join(opts.outDir, "run.json"), JSON.stringify(runMeta, null, 2), "utf8");
+}
+
+// =========================================================================== //
+// Dry-run (resolved matrix + config preview, no execution)
+// =========================================================================== //
+
+/**
+ * Format the resolved matrix + config for `--dry-run` review. The api key is
+ * REDACTED (never printed in full). Deterministic given the inputs.
+ */
+export function formatDryRun(args: {
+	opts: RunOptions;
+	matrix: ExperimentMatrix;
+	taskset: Taskset;
+	realModelConfig?: RealModelConfig;
+}): string {
+	const { opts, matrix, taskset, realModelConfig } = args;
+	const lines: string[] = [];
+	lines.push("# Phase 4 A/B dry-run（不执行，仅打印解析结果）");
+	lines.push("");
+	lines.push(`- mode: ${opts.mode}`);
+	lines.push(`- step: ${opts.step}`);
+	lines.push(`- run_id: ${opts.runId}`);
+	lines.push(`- out_dir: ${opts.outDir}`);
+	lines.push(`- taskset: ${taskset.taskset_id} (${taskset.tasks.length} tasks)`);
+	lines.push(`- arms: ${matrix.arms.length}`);
+	lines.push(`- max_cells: ${opts.maxCells ?? "(full matrix)"}`);
+	const fullCells = matrix.arms.length * taskset.tasks.length;
+	const effectiveCells = opts.maxCells != null ? Math.min(opts.maxCells, fullCells) : fullCells;
+	lines.push(`- effective cells: ${effectiveCells}/${fullCells}`);
+	lines.push(`- settle_timeout_ms: ${opts.settleTimeoutMs ?? (opts.mode === "real-model" ? RUNNER_SETTLE_TIMEOUT_MS_REAL : RUNNER_SETTLE_TIMEOUT_MS_SCRIPTED)}`);
+	if (opts.imageArmId) lines.push(`- image_arm: ${opts.imageArmId}`);
+	if (opts.mode === "real-model" && realModelConfig) {
+		lines.push("");
+		lines.push("## real-model CPA config（key 已脱敏）");
+		lines.push(`- cpa_base_url: ${realModelConfig.base_url}`);
+		lines.push(`- cpa_model: ${realModelConfig.model}`);
+		lines.push(`- cpa_api_protocol: ${realModelConfig.api_protocol}`);
+		lines.push(`- cpa_api_key: ${redactKey(realModelConfig.api_key)}`);
+		if (realModelConfig.api_protocol === "gemini") {
+			lines.push("");
+			lines.push("> ⚠ gemini 协议路径在 CPA 网关上不报告缓存命中（#592）；缓存列不可作为结论。");
+		}
+	}
+	lines.push("");
+	lines.push("## resolved arms");
+	for (const arm of matrix.arms) {
+		lines.push(`- ${arm.arm_id} (step ${arm.step}, prompt_cache_mode=${arm.prompt_cache_mode})`);
+		const ov = Object.keys(arm.resolvedOverrides).length
+			? Object.entries(arm.resolvedOverrides).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(", ")
+			: "(no overrides)";
+		lines.push(`    overrides: ${ov}`);
+	}
+	lines.push("");
+	lines.push("## tasks");
+	for (const t of taskset.tasks) {
+		lines.push(`- ${t.id} [${t.category}] fixture=${t.fixture_id} user_turns=${t.user_turns.length}`);
+	}
+	lines.push("");
+	return lines.join("\n");
 }
 
 // =========================================================================== //
@@ -504,23 +792,16 @@ async function writeOutputs(opts: RunOptions, env: FixtureEnv, result: RunResult
 /**
  * Run one Phase 4 A/B experiment matrix.
  *
- * Order: gate + arg validation FIRST → acquire env → cross-check fixtures →
- * for each (arm, task) run a fresh cell (arm-major, tasks in taskset order) →
- * aggregate + write outputs → teardown.
+ * Order: gate + arg validation FIRST → (dry-run returns here) → resolve CPA
+ * config (real-model) → acquire env → cross-check fixtures → for each (arm,
+ * task) run a fresh cell (arm-major, tasks in taskset order; real-model cells
+ * are resilient — an error/timeout is recorded, not fatal) → aggregate + write
+ * outputs → teardown.
  */
 export async function runExperiment(opts: RunOptions, deps: RunnerDeps): Promise<RunResult> {
 	// 1. Gate FIRST (gate.ts). Scripted always passes; real-model requires
-	// PHASE4_CPA_VERIFIED=1.
+	// PHASE4_CPA_VERIFIED=1 (gate policy lifted for openai-protocol 2026-08-12).
 	assertDataCollectionAllowed(opts.mode);
-	// Belt-and-suspenders: real-model is not implemented in Wave 2 (provider
-	// wiring lands with CPA verification). The gate already blocks everyone
-	// without PHASE4_CPA_VERIFIED=1; this guards the day the gate is lifted.
-	if (opts.mode === "real-model") {
-		throw new Error(
-			"real-model 模式在 Wave 2 尚未实现——真实 provider 接线随 CPA 验证落地。" +
-				"当前仅支持 scripted 模式（makeFakeStreamFn 回放 model_script）。",
-		);
-	}
 
 	// 2. Arg validation: step 2 requires --image-arm.
 	if (opts.step === 2 && !opts.imageArmId) {
@@ -542,10 +823,38 @@ export async function runExperiment(opts: RunOptions, deps: RunnerDeps): Promise
 	// 4. Build the matrix.
 	const matrix = buildStepMatrix(arms, opts.step, imageArm ? { imageArm } : {});
 
-	// 5. Acquire the Flask environment (injectable).
+	// 5. Resolve real-model CPA config (real-model only). The api key is REQUIRED;
+	// a missing key throws loudly BEFORE any env acquisition / cost is incurred.
+	const isReal = opts.mode === "real-model";
+	const realModelConfig = isReal ? resolveRealModelConfig() : undefined;
+
+	// 6. Dry-run: print the resolved matrix + config (key redacted) and return
+	// WITHOUT acquiring the env or executing any cell.
+	if (opts.dryRun) {
+		const text = formatDryRun({ opts, matrix, taskset, realModelConfig });
+		// eslint-disable-next-line no-console
+		console.log(text);
+		return {
+			runId: opts.runId,
+			outDir: opts.outDir,
+			step: opts.step,
+			mode: opts.mode,
+			armIds: matrix.arms.map((a) => a.arm_id),
+			rows: [],
+			rubricOutcomes: [],
+			transcripts: [],
+			cellErrors: [],
+			manifest: { manifest_version: 1, generated_at: "", fixtures: [] },
+			reportMarkdown: text,
+			cpaModel: realModelConfig?.model ?? null,
+			cpaBaseUrl: realModelConfig?.base_url ?? null,
+		};
+	}
+
+	// 7. Acquire the Flask environment (injectable).
 	const env = await deps.acquireEnv(opts);
 
-	// 6. Cross-check taskset fixture_ids against the manifest.
+	// 8. Cross-check taskset fixture_ids against the manifest.
 	const fixtureById = new Map<string, ManifestFixture>();
 	for (const f of env.manifest.fixtures) fixtureById.set(f.fixture_id, f);
 	for (const task of taskset.tasks) {
@@ -554,23 +863,47 @@ export async function runExperiment(opts: RunOptions, deps: RunnerDeps): Promise
 		}
 	}
 
-	// 7. Run every (arm, task) cell: arm-major, tasks in taskset order.
+	// 9. Per-turn settle timeout (real-model turns are much slower).
+	const settleTimeoutMs = opts.settleTimeoutMs ?? (isReal ? RUNNER_SETTLE_TIMEOUT_MS_REAL : RUNNER_SETTLE_TIMEOUT_MS_SCRIPTED);
+
+	// 10. Run every (arm, task) cell: arm-major, tasks in taskset order. Real-model
+	// cells are resilient: an error/timeout is recorded (rubric FAIL + error detail
+	// in run.json) WITHOUT killing the whole matrix. --max-cells caps the count.
 	const allRows: ReportRow[] = [];
 	const rubricOutcomes: RubricOutcomeRow[] = [];
 	const transcripts: TranscriptRow[] = [];
+	const cellErrors: CellError[] = [];
+	const maxCells = opts.maxCells ?? Number.POSITIVE_INFINITY;
+	let cellsRun = 0;
 	for (const arm of matrix.arms) {
 		for (const task of taskset.tasks) {
+			if (cellsRun >= maxCells) {
+				// eslint-disable-next-line no-console
+				console.log(`[run] SKIP arm=${arm.arm_id} task=${task.id} (--max-cells ${opts.maxCells} reached)`);
+				continue;
+			}
+			cellsRun += 1;
 			const fixture = fixtureById.get(task.fixture_id)!;
 			// eslint-disable-next-line no-console
 			console.log(`[run] arm=${arm.arm_id} task=${task.id} fixture=${fixture.fixture_id}`);
-			const cell = await runCell({ arm, task, fixture, env });
-			allRows.push(...cell.rows);
-			rubricOutcomes.push(cell.rubric);
-			transcripts.push(cell.transcript);
+			try {
+				const cell = await runCell({ arm, task, fixture, env, mode: opts.mode, realModelConfig, realStreamFnFactory: deps.realStreamFnFactory, settleTimeoutMs });
+				allRows.push(...cell.rows);
+				rubricOutcomes.push(cell.rubric);
+				transcripts.push(cell.transcript);
+			} catch (e) {
+				// Resilience: record the cell error + a synthetic FAIL rubric, continue.
+				const msg = (e as Error)?.message || String(e);
+				// eslint-disable-next-line no-console
+				console.error(`[run] ERROR arm=${arm.arm_id} task=${task.id}: ${msg}`);
+				cellErrors.push({ task_id: task.id, arm_id: arm.arm_id, step: arm.step, error: msg });
+				rubricOutcomes.push(errorRubricOutcome(task, arm, e));
+				transcripts.push({ task_id: task.id, arm_id: arm.arm_id, step: arm.step, entries: [] });
+			}
 		}
 	}
 
-	// 8. Aggregate + render.
+	// 11. Aggregate + render.
 	const data = aggregateReport(allRows, rubricOutcomes.map((r) => ({ task_id: r.task_id, arm_id: r.arm_id, step: r.step, outcome: r.outcome })));
 	const reportMarkdown = renderReport(data);
 
@@ -583,16 +916,19 @@ export async function runExperiment(opts: RunOptions, deps: RunnerDeps): Promise
 		rows: allRows,
 		rubricOutcomes,
 		transcripts,
+		cellErrors,
 		manifest: env.manifest,
 		reportMarkdown,
+		cpaModel: realModelConfig?.model ?? null,
+		cpaBaseUrl: realModelConfig?.base_url ?? null,
 	};
 	(result as RunResult & { tasksetId?: string; tasksetSchema?: number }).tasksetId = taskset.taskset_id;
 	(result as RunResult & { tasksetSchema?: number }).tasksetSchema = taskset.schema_version;
 
-	// 9. Write outputs.
+	// 12. Write outputs.
 	await writeOutputs(opts, env, result);
 
-	// 10. Teardown (unless --keep-flask).
+	// 13. Teardown (unless --keep-flask).
 	if (!opts.keepFlask) {
 		await env.teardown().catch(() => undefined);
 	}
@@ -600,6 +936,6 @@ export async function runExperiment(opts: RunOptions, deps: RunnerDeps): Promise
 	return result;
 }
 
-/** Re-exports for the CLI + tests. */
+/** Re-exports for the CLI + tests (symbols imported into this module). */
 export { DataCollectionGateError, basename };
 export type { AgentMessage };

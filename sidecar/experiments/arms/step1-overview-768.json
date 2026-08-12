@@ -8,5 +8,5 @@
     "visual_context_budget_tokens": 8000,
     "context_window_tokens": 272000
   },
-  "prompt_cache_mode": "auto"
+  "prompt_cache_mode": "explicit"
 }

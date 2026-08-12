@@ -34,6 +34,13 @@ export interface ReportRow extends RequestMetrics {
 	arm_id: string;
 	step: 1 | 2;
 	wall_ms: number;
+	/**
+	 * CPA api protocol the row was collected under (real-model runs only;
+	 * scripted rows omit it). Cache-hit numbers are only a formal conclusion
+	 * for openai-protocol rows (prompt_cache_key passthrough verified
+	 * 2026-08-12); gemini-protocol rows are cache-unobservable (CPA #592).
+	 */
+	cpa_api_protocol?: "openai" | "anthropic" | "gemini";
 }
 
 /** One (task, arm) rubric outcome, pre-flattened for the per-task table. */
@@ -81,8 +88,18 @@ export interface ReportData {
 	armAggregates: ArmAggregate[];
 	/** Per-(task, arm) rubric rows, sorted by (step, arm_id, task_id). */
 	taskRubric: TaskRubricRow[];
-	/** True iff any row has prompt_cache_mode != "off" → NO-GO banner shows. */
-	hasNonOffCacheMode: boolean;
+	/**
+	 * True iff any row carries a cache claim that is NOT verified for the
+	 * protocol it was collected under → the NO-GO banner shows. Rules:
+	 *   - openai-protocol real-model rows: VERIFIED (gpt-5.6-luna
+	 *     prompt_cache_key passthrough + cached_tokens observed 2026-08-12) →
+	 *     no banner.
+	 *   - gemini-protocol rows: CPA antigravity #592 → cache hits unobservable →
+	 *     banner.
+	 *   - scripted rows (no cpa_api_protocol): mechanism validation only →
+	 *     banner (historical behavior preserved).
+	 */
+	hasUnverifiedCacheData: boolean;
 }
 
 // ------------------------------------------------------------------------- //
@@ -115,9 +132,12 @@ function mean(total: number, count: number): number {
 export function aggregateReport(rows: ReportRow[], rubricOutcomes: Array<{ task_id: string; arm_id: string; step: 1 | 2; outcome: RubricOutcome }> = []): ReportData {
 	// Group rows by arm_id.
 	const byArm = new Map<string, ReportRow[]>();
-	let hasNonOffCacheMode = false;
+	let hasUnverifiedCacheData = false;
 	for (const r of rows) {
-		if (r.prompt_cache_mode !== "off") hasNonOffCacheMode = true;
+		if (r.prompt_cache_mode !== "off") {
+			// Cache claim is verified ONLY for openai-protocol real-model rows.
+			if (r.cpa_api_protocol !== "openai") hasUnverifiedCacheData = true;
+		}
 		const list = byArm.get(r.arm_id);
 		if (list) list.push(r);
 		else byArm.set(r.arm_id, [r]);
@@ -181,7 +201,7 @@ export function aggregateReport(rows: ReportRow[], rubricOutcomes: Array<{ task_
 	for (const rows2 of rubricByArm.values()) taskRubric.push(...rows2);
 	taskRubric.sort((a, b) => a.step - b.step || a.arm_id.localeCompare(b.arm_id) || a.task_id.localeCompare(b.task_id));
 
-	return { armAggregates, taskRubric, hasNonOffCacheMode };
+	return { armAggregates, taskRubric, hasUnverifiedCacheData };
 }
 
 // ------------------------------------------------------------------------- //
@@ -198,9 +218,9 @@ export function renderReport(data: ReportData): string {
 	lines.push("# Phase 4 A/B 报告");
 	lines.push("");
 
-	if (data.hasNonOffCacheMode) {
-		lines.push("> **NO-GO（CPA-UNVERIFIED）**：缓存命中率数字在真实 CPA 网关验证 `prompt_cache_key` 透传前不作为正式结论。");
-		lines.push("> 依据：docs/ai-context-cache-visual-workspace-upgrade.md §14 Phase 3。仅当 `PHASE4_CPA_VERIFIED=1` 解除 gate 后，缓存列方可作为结论。");
+	if (data.hasUnverifiedCacheData) {
+		lines.push("> **NO-GO（缓存不可验证）**：本报告包含缓存声明未经验证的数据（gemini 协议路径在 CPA 网关上不报告缓存命中，CPA antigravity #592；scripted 数据为机制验证）。");
+		lines.push("> openai 协议路径的 `prompt_cache_key` 透传已在真实 CPA 网关验证（gpt-5.6-luna cached_tokens 观测 2026-08-12），该路径数据不受此横幅限制。");
 		lines.push("");
 	}
 

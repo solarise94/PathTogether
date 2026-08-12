@@ -6,5 +6,5 @@
     "image_strategy": "${step1_winner}",
     "context_window_tokens": 512000
   },
-  "prompt_cache_mode": "auto"
+  "prompt_cache_mode": "explicit"
 }

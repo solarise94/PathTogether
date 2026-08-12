@@ -50,9 +50,13 @@ describe("buildModel", () => {
 		expect(compat.supportsStrictMode).toBe(false);
 		// classic chat completions field name
 		expect(compat.maxTokensField).toBe("max_tokens");
-		// usage + finish_reason passthrough
+		// usage passthrough in the final streamed chunk
 		expect(compat.supportsUsageInStreaming).toBe(true);
-		expect(compat.supportsFinishReason).toBe(true);
+		// CPA (Responses→chat-completions translation) intermittently OMITS the
+		// trailing finish_reason chunk for larger tool-call requests; false makes
+		// pi synthesize a stop reason from the content instead of throwing "Stream
+		// ended without finish_reason" and discarding a valid toolCall.
+		expect(compat.supportsFinishReason).toBe(false);
 	});
 
 	it("uses anthropic-messages api when api_protocol=anthropic", () => {

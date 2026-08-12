@@ -1239,6 +1239,30 @@ export class AgentRunner {
 							});
 						}
 					}
+					// Generic terminal model error (non-context-exceeded). The
+					// retry streamFn already exhausted its transient/cache-field/
+					// force-compact recovery budget, so a stopReason "error"
+					// reaching here is terminal. Without this, agent_end would
+					// MASK it as agent_finished: a dropped finish_reason / a 4xx
+					// the gateway kept returning / a parsing failure would settle
+					// the session as "finished" with no error event and no usage
+					// — exactly the Phase 4 symptom that made this path look like
+					// a successful (but tool-truncated) run. Surface it as
+					// agent_error so the run settles "error" and the failure is
+					// observable. (Length/max_tokens is handled separately below.)
+					if (
+						msg.stopReason === "error" &&
+						!isContextExceeded(msg.errorMessage || "") &&
+						!runState.errored &&
+						!runState.finished &&
+						!runState.paused
+					) {
+						runState.errored = true;
+						await this.bus.emit(sessionId, "agent_error", {
+							error: `调用模型失败：${msg.errorMessage || "未知错误"}`,
+							step: stepRef.current,
+						});
+					}
 					// length → paused (ai_agent.py:637-646). pi already fails the
 					// (possibly truncated) tool calls; we just pause.
 					if (msg.stopReason === "length") {
@@ -2430,6 +2454,14 @@ function isTransientError(msg: string): boolean {
 	}
 	// HTTP status code hints in error text (429/5xx).
 	if (/\b(408|409|425|429|500|502|503|504)\b/.test(lower)) return true;
+	// Gateway/proxy hiccup: a non-2xx with an EMPTY body. pi's error-body.js
+	// formats these as `"<code> status code (no body)"`. A real upstream
+	// validation error (context too long, bad image, rejected field) always
+	// carries a body, so the no-body form means the proxy dropped/rejected the
+	// request without explanation — flaky, so retry. (Phase 4: the CPA gateway
+	// intermittently returned "400 status code (no body)" for valid image-
+	// bearing requests; the identical payload succeeded on retry.)
+	if (/\b\d{3} status code \(no body\)/.test(lower)) return true;
 	return false;
 }
 

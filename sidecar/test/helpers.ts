@@ -75,6 +75,12 @@ export function makeFakeStreamFn(script: ScriptedTurn[], opts: { injectError?: {
 	calls: number;
 } {
 	let calls = 0;
+	// Track whether the injected error has already fired. The retry wrapper
+	// retries the SAME logical call with the SAME context (so assistantCount is
+	// unchanged across attempts); without this guard the error would re-inject
+	// on every retry and the run could never recover, defeating the test's
+	// intent.
+	let errorInjected = false;
 	const fn = function (_model: unknown, context: unknown): AssistantMessageEventStream {
 		const turnIndex = calls;
 		calls += 1;
@@ -85,8 +91,9 @@ export function makeFakeStreamFn(script: ScriptedTurn[], opts: { injectError?: {
 			const ctx = context as { messages?: Array<{ role?: string; content?: unknown[] }> };
 			const assistantCount = (ctx.messages || []).filter((m) => m.role === "assistant").length;
 
-			// Error injection takes precedence over the script.
-			if (opts.injectError && assistantCount === opts.injectError.atTurn) {
+			// Error injection takes precedence over the script. Fires at most once.
+			if (!errorInjected && opts.injectError && assistantCount === opts.injectError.atTurn) {
+				errorInjected = true;
 				const errMsg = opts.injectError.message;
 				const errorAssistant = makeAssistant([], "error", errMsg);
 				stream.push({ type: "error", reason: "error", error: errorAssistant });

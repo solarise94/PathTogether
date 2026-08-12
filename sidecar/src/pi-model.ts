@@ -60,7 +60,17 @@ const CPA_COMPAT: OpenAICompletionsCompat = {
 	// CPA passes usage through in the final streamed chunk
 	// (:1498-1499 default true; kept explicit for clarity).
 	supportsUsageInStreaming: true,
-	supportsFinishReason: true,
+	// CPA (Responses→chat-completions translation) INTERMITTENTLY omits the
+	// final `finish_reason` chunk for larger tool-call requests — the SSE stream
+	// delivers the tool_call deltas and then closes without the trailing
+	// `{finish_reason:"tool_calls"}` chunk. With supportsFinishReason:true pi's
+	// parser throws "Stream ended without finish_reason" and DISCARDS the
+	// otherwise-valid assistant message (verified: Phase 4 probe showed a fully
+	// assembled goto toolCall discarded this way ~50% of runs). false makes pi
+	// tolerate the gap by synthesizing stopReason from the content
+	// (openai-completions.js: "toolUse" when toolCalls present, else "stop") —
+	// and when finish_reason IS present it is still used normally.
+	supportsFinishReason: false,
 };
 
 /**

@@ -633,6 +633,43 @@ describe("AgentRunner.runMain — transient error retry", () => {
 		// canonical, meta-stripped copy; Provider boundary, §10).
 		expect(capturedContexts.every((c) => !c.hasContextMeta)).toBe(true);
 	}, 30000);
+
+	it("a bodyless gateway 4xx ('400 status code (no body)') is retried as transient, then succeeds", async () => {
+		// Phase 4: the CPA gateway intermittently returns a 4xx with an EMPTY
+		// body (pi formats it as "<code> status code (no body)") for valid
+		// image-bearing requests. isTransientError must treat this as a flaky
+		// gateway hiccup so the retry wrapper retries it like a transient error.
+		const { fn } = makeFakeStreamFn(
+			[{ text: "recovered", stopReason: "stop" as const }],
+			{ injectError: { atTurn: 0, message: "400 status code (no body)", transient: true } },
+		);
+		const h: Harness = await newHarness(fn);
+		const { sessionId } = await h.runner.runMain({ slide: "test.svs", config: { ...BASE_CONFIG }, fresh: true });
+		h.watch(sessionId);
+		const status = await waitForSettle(h.store, sessionId, 30000);
+		expect(status).toBe("finished");
+		const retries = h.events.filter((e) => e.type === "agent_retrying");
+		expect(retries.length).toBeGreaterThanOrEqual(1);
+	}, 30000);
+
+	it("a terminal (non-transient, non-context) model error emits agent_error and settles 'error' — not masked as 'finished'", async () => {
+		// Phase 4 regression guard: before the fix, a generic stream error
+		// (stopReason "error" that exhausted recovery) fell through agent_end
+		// and settled as "finished" with "(无总结)", hiding the failure. Now it
+		// must surface as agent_error and settle "error".
+		const { fn } = makeFakeStreamFn(
+			[{ text: "done", stopReason: "stop" as const }],
+			{ injectError: { atTurn: 0, message: "400 Bad Request: invalid model id" } },
+		);
+		const h: Harness = await newHarness(fn);
+		const { sessionId } = await h.runner.runMain({ slide: "test.svs", config: { ...BASE_CONFIG }, fresh: true });
+		h.watch(sessionId);
+		const status = await waitForSettle(h.store, sessionId, 30000);
+		expect(status).toBe("error");
+		const errs = h.events.filter((e) => e.type === "agent_error");
+		expect(errs.length).toBe(1);
+		expect((errs[0]!.payload as { error: string }).error).toContain("调用模型失败");
+	}, 30000);
 });
 
 // =========================================================================== //

@@ -109,6 +109,13 @@ export interface TransformContextConfig {
 	image_derivative_cache_max_mb?: number;
 	/** Derivative LRU TTL in seconds (§6.4). */
 	image_derivative_cache_ttl?: number;
+	/**
+	 * §9.2.1 window-tier preset: derives context_window_tokens + visual budget
+	 * (as a % of the window) + image tiers in one shot. Explicit per-field
+	 * values ALWAYS win over the preset. When absent, legacy defaults apply
+	 * (272k window / 8000-token budget / current image tiers).
+	 */
+	window_tier?: WindowTier;
 }
 
 /** Resolved settings (all fields populated with defaults). */
@@ -140,7 +147,63 @@ function numOr(v: unknown, def: number): number {
 	return Number.isFinite(n) && n > 0 ? n : def;
 }
 
+// =========================================================================== //
+// §9.2.1 window-tier presets
+// =========================================================================== //
+
+export type WindowTier = "saving" | "balanced" | "performance";
+
+export interface WindowTierPreset {
+	/** Derived context window (tokens). */
+	contextWindowTokens: number;
+	/** Visual budget as a FRACTION of the window (e.g. 0.10 = 10%). */
+	visualBudgetFraction: number;
+	overviewLongEdge: number;
+	detailImageLongEdge: number;
+	workingImageLongEdge: number;
+}
+
+/**
+ * §9.2.1 preset table (product decision 2026-08-13). Draft values — image
+ * tiers are subject to revision once EXP-VISCTX-v1 Step 1/2 data lands.
+ * A 1M model defaults to the 500k "performance" tier (attention degrades
+ * hard beyond ~400k; never encourage using the full 1M).
+ */
+export const WINDOW_TIER_PRESETS: Record<WindowTier, WindowTierPreset> = {
+	saving: {
+		contextWindowTokens: 200_000,
+		visualBudgetFraction: 0.10,
+		overviewLongEdge: 768,
+		detailImageLongEdge: 1024,
+		workingImageLongEdge: 640,
+	},
+	balanced: {
+		contextWindowTokens: 400_000,
+		visualBudgetFraction: 0.15,
+		overviewLongEdge: 1024,
+		detailImageLongEdge: 1280,
+		workingImageLongEdge: 768,
+	},
+	performance: {
+		contextWindowTokens: 500_000,
+		visualBudgetFraction: 0.20,
+		overviewLongEdge: 1024,
+		detailImageLongEdge: 1536,
+		workingImageLongEdge: 1024,
+	},
+};
+
+/** Validate + normalize a config window_tier value; unknown → undefined. */
+export function normalizeWindowTier(v: unknown): WindowTier | undefined {
+	return v === "saving" || v === "balanced" || v === "performance" ? v : undefined;
+}
+
 export function resolveTransformSettings(cfg: TransformContextConfig): TransformContextSettings {
+	// §9.2.1: window-tier preset derives budget % + image tiers. Explicit
+	// per-field values always win over the preset (fall through to the
+	// numOr/legacy paths below when a field is absent).
+	const tier = normalizeWindowTier(cfg.window_tier);
+	const preset = tier ? WINDOW_TIER_PRESETS[tier] : undefined;
 	// visual_working_set_max takes precedence; fall back to legacy
 	// keep_recent_images; both absent → default.
 	const vwsmRaw = Number(cfg.visual_working_set_max);
@@ -156,13 +219,18 @@ export function resolveTransformSettings(cfg: TransformContextConfig): Transform
 	}
 	const lruMaxMb = numOr(cfg.image_derivative_cache_max_mb, DEFAULT_LRU_MAX_MB);
 	const lruTtlS = numOr(cfg.image_derivative_cache_ttl, DEFAULT_LRU_TTL_MS / 1000);
+	// Tier-derived budget (fraction of the tier's window), only when the budget
+	// was not set explicitly. ceil so a small fraction never rounds to 0.
+	const tierBudget = preset
+		? Math.ceil(preset.contextWindowTokens * preset.visualBudgetFraction)
+		: undefined;
 	return {
 		keepRecentImages,
 		// Phase 4 §17 risk 2: overview on/off product switch (default true).
 		overviewEnabled: cfg.overview_enabled !== false,
-		overviewLongEdge: numOr(cfg.overview_long_edge, DEFAULT_OVERVIEW_LONG_EDGE),
-		workingImageLongEdge: numOr(cfg.working_image_long_edge, DEFAULT_WORKING_IMAGE_LONG_EDGE),
-		detailImageLongEdge: numOr(cfg.detail_image_long_edge, DEFAULT_DETAIL_IMAGE_LONG_EDGE),
+		overviewLongEdge: numOr(cfg.overview_long_edge, preset?.overviewLongEdge ?? DEFAULT_OVERVIEW_LONG_EDGE),
+		workingImageLongEdge: numOr(cfg.working_image_long_edge, preset?.workingImageLongEdge ?? DEFAULT_WORKING_IMAGE_LONG_EDGE),
+		detailImageLongEdge: numOr(cfg.detail_image_long_edge, preset?.detailImageLongEdge ?? DEFAULT_DETAIL_IMAGE_LONG_EDGE),
 		jpegQuality: numOr(cfg.image_jpeg_quality, DEFAULT_JPEG_QUALITY),
 		overlayVersion: typeof cfg.image_overlay_version === "string" && cfg.image_overlay_version.trim()
 			? cfg.image_overlay_version.trim()
@@ -170,12 +238,16 @@ export function resolveTransformSettings(cfg: TransformContextConfig): Transform
 		regionConcurrency: numOr(cfg.region_materialize_concurrency, DEFAULT_REGION_CONCURRENCY),
 		lruMaxBytes: Math.floor(lruMaxMb * MB_BYTES),
 		lruTtlMs: Math.floor(lruTtlS * 1000),
-		// P2-3 (§9.1): visual token hard budget. visual_context_budget_tokens <= 0
-		// disables the budget (treated as "no limit"); a positive value enforces
-		// the HARD cap in both selectors.
+		// P2-3 (§9.1): visual token hard budget. Resolution order:
+		//   1. explicit visual_context_budget_tokens > 0 → use it;
+		//   2. §9.2.1 window-tier preset → fraction of the tier window;
+		//   3. legacy default (8000). Non-positive/absent values keep the
+		//      legacy behavior (default), preserving P2-3 compatibility.
 		visualContextBudgetTokens: (() => {
 			const v = Number(cfg.visual_context_budget_tokens);
-			return Number.isFinite(v) && v > 0 ? v : DEFAULT_VISUAL_CONTEXT_BUDGET_TOKENS;
+			if (Number.isFinite(v) && v > 0) return v;
+			if (tierBudget !== undefined) return tierBudget;
+			return DEFAULT_VISUAL_CONTEXT_BUDGET_TOKENS;
 		})(),
 	};
 }

@@ -1103,6 +1103,9 @@ DEFAULT_CONFIG = {
     # Phase 4 §17 风险 2：稳定区概览开关（默认 True）。False 时 Phase 2b
     # assembler 组装稳定区不带概览图（稳定文本块仍保留）。
     "overview_enabled": True,
+    # §9.2.1：窗口档位预设（None = 不启用，走 legacy 默认）。显式
+    # context_window_tokens/视觉预算/图片档覆盖时以显式值为准。
+    "window_tier": None,
 }
 
 
@@ -1258,6 +1261,10 @@ _AI_TUNING_ENUM = {
 _AI_TUNING_BOOL = (
     "overview_enabled",
 )
+# 枚举字符串字段（§9.2.1：window_tier 窗口档位预设）
+_AI_TUNING_ENUM = {
+    "window_tier": ("saving", "balanced", "performance"),
+}
 # max_steps 上限：取自 templates/index.html 的 input max="500"（步数上限字段）。
 # 防止 max_steps=99999 之类失控（sidecar 运行循环只限下限，费用风险）。
 _MAX_STEPS_LIMIT = 500
@@ -1313,6 +1320,17 @@ def _validate_ai_tuning(body, cfg):
         # 接受真正的 bool；拒绝 0/1/"true" 等隐式转换，保持权威层严格。
         if not isinstance(raw, bool):
             return None, "{} 需为布尔值（true/false）".format(field)
+        validated[field] = raw
+    # 1a2) 枚举字符串字段（§9.2.1 window_tier）
+    for field, allowed in _AI_TUNING_ENUM.items():
+        if field not in body:
+            continue
+        raw = body[field]
+        if raw is None:
+            validated[field] = None  # 显式清除预设
+            continue
+        if not isinstance(raw, str) or raw not in allowed:
+            return None, "{} 仅支持 {}".format(field, "/".join(allowed))
         validated[field] = raw
     # 1b) 正整数字段
     for field in _AI_TUNING_POSITIVE_INT:

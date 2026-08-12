@@ -71,6 +71,8 @@ import {
 	invalidateRegionLru,
 	makeTransformContext,
 	resolveTransformSettings,
+	normalizeWindowTier,
+	WINDOW_TIER_PRESETS,
 } from "./transform-context.js";
 import {
 	buildPostCompactionCheckpoint,
@@ -155,6 +157,13 @@ export interface RunConfig extends AiEngineConfig {
 	image_derivative_cache_max_mb?: number;
 	image_derivative_cache_ttl?: number;
 	prompt_cache_mode?: string;
+	/**
+	 * §9.2.1 window-tier preset (saving/balanced/performance): derives
+	 * context_window_tokens (engine) + visual budget fraction + image tiers
+	 * (transform) when those fields are not set explicitly. Explicit values
+	 * always win.
+	 */
+	window_tier?: "saving" | "balanced" | "performance";
 	/**
 	 * Phase 4 §17 risk 2 product switch (default true): when false, the Phase 2b
 	 * assembler omits the stable overview image. Whitelisted by app.py
@@ -757,7 +766,16 @@ export class AgentRunner {
 		_continued: boolean,
 		loopOptions: { systemPrompt?: string; kind?: "main" | "fork" | "branch" } = {},
 	): Promise<void> {
-		const { models, model } = buildModel(config);
+		// §9.2.1: window-tier preset derives the context window for the engine
+		// when context_window_tokens is not set explicitly. buildModel gets the
+		// derived value; the rest of the run keeps the original config (so
+		// metrics/checkpoint env record what the user actually configured).
+		const engineConfig: RunConfig = (() => {
+			const tier = normalizeWindowTier((config as { window_tier?: unknown }).window_tier);
+			if (!tier || Number(config.context_window_tokens) > 0) return config;
+			return { ...config, context_window_tokens: WINDOW_TIER_PRESETS[tier].contextWindowTokens };
+		})();
+		const { models, model } = buildModel(engineConfig);
 		const maxSteps = Math.max(1, Math.floor(config.max_steps ?? 50));
 
 		// Resolve the effective kind + system prompt for this run. Defaults

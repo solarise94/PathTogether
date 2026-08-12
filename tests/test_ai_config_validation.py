@@ -513,3 +513,21 @@ if __name__ == "__main__":
     test_overview_enabled_default_true_when_omitted()
     print("\nPASS=%d FAIL=%d" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)
+
+
+def test_window_tier_enum_validation():
+    """window_tier 只接受 saving/balanced/performance 或 null（§9.2.1）。"""
+    print("== window_tier 枚举校验 ==")
+    reset_config()
+    code, j = put({"window_tier": "balanced"})
+    check("window_tier=balanced → 200", code == 200, "got %s %r" % (code, j))
+    check("响应回显 window_tier=balanced", j.get("window_tier") == "balanced",
+          "got %r" % j.get("window_tier"))
+    for bad in ("bogus", 123, True, "saving "):
+        code, j = put({"window_tier": bad})
+        check("window_tier=%r → 400" % (bad,), code == 400, "got %s %r" % (code, j))
+    code, j = put({"window_tier": None})
+    check("window_tier=null（清除预设）→ 200", code == 200, "got %s %r" % (code, j))
+    merged = app_mod._merge_config(load_raw())
+    check("sidecar config 透传 window_tier=None", merged.get("window_tier") is None,
+          "got %r" % merged.get("window_tier"))

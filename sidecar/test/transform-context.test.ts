@@ -1283,3 +1283,45 @@ describe("Phase 2b — §9.1 visual budget eviction direction (review fix)", () 
 		expect(blockType(2)).toBe("image");
 	});
 });
+
+describe("§9.2.1 window-tier presets", () => {
+	it("saving tier derives 200k window budget 10% + compressed image tiers", () => {
+		const s = resolveTransformSettings({ window_tier: "saving" });
+		expect(s.visualContextBudgetTokens).toBe(20_000);
+		expect(s.overviewLongEdge).toBe(768);
+		expect(s.detailImageLongEdge).toBe(1024);
+		expect(s.workingImageLongEdge).toBe(640);
+	});
+	it("balanced tier derives 400k window budget 15% + current-default tiers", () => {
+		const s = resolveTransformSettings({ window_tier: "balanced" });
+		expect(s.visualContextBudgetTokens).toBe(60_000);
+		expect(s.overviewLongEdge).toBe(1024);
+		expect(s.detailImageLongEdge).toBe(1280);
+		expect(s.workingImageLongEdge).toBe(768);
+	});
+	it("performance tier derives 500k window budget 20% + high tiers", () => {
+		const s = resolveTransformSettings({ window_tier: "performance" });
+		expect(s.visualContextBudgetTokens).toBe(100_000);
+		expect(s.detailImageLongEdge).toBe(1536);
+		expect(s.workingImageLongEdge).toBe(1024);
+	});
+	it("explicit fields always win over the preset", () => {
+		const s = resolveTransformSettings({
+			window_tier: "saving",
+			visual_context_budget_tokens: 4321,
+			detail_image_long_edge: 999,
+		});
+		expect(s.visualContextBudgetTokens).toBe(4321);
+		expect(s.detailImageLongEdge).toBe(999);
+		expect(s.workingImageLongEdge).toBe(640); // tier-derived (not explicit)
+	});
+	it("non-positive visual_context_budget_tokens keeps legacy default even under a tier", () => {
+		const s = resolveTransformSettings({ window_tier: "saving", visual_context_budget_tokens: 0 });
+		expect(s.visualContextBudgetTokens).toBe(20_000); // tier-derived (legacy 0 → not explicit)
+	});
+	it("absent tier keeps legacy defaults", () => {
+		const s = resolveTransformSettings({});
+		expect(s.visualContextBudgetTokens).toBe(8000);
+		expect(s.workingImageLongEdge).toBe(768);
+	});
+});

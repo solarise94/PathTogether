@@ -41,7 +41,7 @@ import type { FlaskClient } from "./flask-client.js";
 import { FlaskHttpError } from "./flask-client.js";
 import type { SlideInfo } from "./tools.js";
 import { isImageContent, isImageRefContent, stripContextMeta, type ImageRefContent, type PersistedAgentMessage } from "./session-store.js";
-import { estimateImageRefTokens, enforceVisualTokenBudget, resetVisualBudgetOverflow } from "./compaction.js";
+import { estimateImageRefTokens, estimateImagePixelsTokens, enforceVisualTokenBudget } from "./compaction.js";
 
 const PLACEHOLDER_TEXT = "（历史快照已省略，可用 goto+snapshot 重新查看）";
 const DEGRADE_TEXT = "该图因切片变更不可用。";
@@ -79,6 +79,17 @@ const DEFAULT_VISUAL_CONTEXT_BUDGET_TOKENS = 8000;
 export interface TransformContextConfig {
 	/** Legacy: max materialized image blocks retained per request. */
 	keep_recent_images?: number;
+	/**
+	 * Phase 4 §17 risk 2 product switch: when false, the Phase 2b assembler
+	 * assembles the stable region WITHOUT the overview image (the stable TEXT
+	 * block is kept intact, the overview is never materialized). Default true.
+	 *
+	 * NOTE: the Phase 1 {@link makeTransformContext} fallback path IGNORES this
+	 * flag — Phase 1 has no stable region; the overview there is one of the
+	 * kept recency positions and is not suppressible via this switch. Only the
+	 * Phase 2b assembler honors it.
+	 */
+	overview_enabled?: boolean;
 	/** Max materialized non-overview images retained per request (§11). */
 	visual_working_set_max?: number;
 	/** Per-request visual token hard budget (§9.1, informational in Phase 1). */
@@ -104,6 +115,11 @@ export interface TransformContextConfig {
 /** Resolved settings (all fields populated with defaults). */
 export interface TransformContextSettings {
 	keepRecentImages: number;
+	/**
+	 * Phase 4 §17 risk 2: when false, the Phase 2b assembler omits the stable
+	 * overview image. Default true. (Phase 1 transformOnce ignores this.)
+	 */
+	overviewEnabled: boolean;
 	overviewLongEdge: number;
 	workingImageLongEdge: number;
 	detailImageLongEdge: number;
@@ -143,6 +159,8 @@ export function resolveTransformSettings(cfg: TransformContextConfig): Transform
 	const lruTtlS = numOr(cfg.image_derivative_cache_ttl, DEFAULT_LRU_TTL_MS / 1000);
 	return {
 		keepRecentImages,
+		// Phase 4 §17 risk 2: overview on/off product switch (default true).
+		overviewEnabled: cfg.overview_enabled !== false,
 		overviewLongEdge: numOr(cfg.overview_long_edge, DEFAULT_OVERVIEW_LONG_EDGE),
 		workingImageLongEdge: numOr(cfg.working_image_long_edge, DEFAULT_WORKING_IMAGE_LONG_EDGE),
 		detailImageLongEdge: numOr(cfg.detail_image_long_edge, DEFAULT_DETAIL_IMAGE_LONG_EDGE),
@@ -214,8 +232,6 @@ let lruMissCount = 0;
 export function resetLruCounters(): void {
 	lruHitCount = 0;
 	lruMissCount = 0;
-	// Phase 3.1: the budget-overflow counter (compaction.ts) is per-request too.
-	resetVisualBudgetOverflow();
 }
 
 /** Current LRU hit count since the last {@link resetLruCounters} (§12). */
@@ -552,6 +568,44 @@ function isOverviewLiveImage(
 	return toolCallId === firstSnapshotToolCallId;
 }
 
+/** Live image is pending iff the parent toolResult's toolCallId matches. */
+function isPendingLiveImage(msg: AgentMessage, pendingSnapshotId: string | null): boolean {
+	if (!pendingSnapshotId) return false;
+	const role = (msg as { role?: string }).role;
+	if (role !== "toolResult") return false;
+	const toolCallId = (msg as { toolCallId?: string }).toolCallId;
+	return toolCallId === pendingSnapshotId;
+}
+
+/**
+ * Pull src / rendered pixel size / fingerprint from a snapshot toolResult's
+ * `details` payload (tools.ts stores width/height/src there).
+ */
+function liveImageMetaFromMessage(msg: AgentMessage): {
+	src?: { x: number; y: number; w: number; h: number };
+	pixels?: { w: number; h: number };
+	fingerprint?: string;
+} | null {
+	const role = (msg as { role?: string }).role;
+	if (role !== "toolResult") return null;
+	const details = (msg as {
+		details?: {
+			src?: { x: number; y: number; w: number; h: number };
+			width?: number;
+			height?: number;
+			slide_fingerprint?: string;
+		};
+	}).details;
+	if (!details) return null;
+	const src = details.src && details.src.w > 0 && details.src.h > 0 ? details.src : undefined;
+	const w = Number(details.width);
+	const h = Number(details.height);
+	const pixels = Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0 ? { w: Math.floor(w), h: Math.floor(h) } : undefined;
+	const fingerprint = typeof details.slide_fingerprint === "string" ? details.slide_fingerprint : undefined;
+	if (!src && !pixels) return null;
+	return { src, pixels, fingerprint };
+}
+
 /**
  * Whether an image position corresponds to the current pending snapshot (highest
  * eviction priority, §15.1). A pending snapshot's image_ref carries
@@ -677,6 +731,12 @@ type ImgPos = {
 	pending: boolean;
 	kind: "ref" | "image";
 	ref?: ImageRefContent;
+	/** Live image: level-0 src from toolResult.details (for rematerialization). */
+	liveSrc?: { x: number; y: number; w: number; h: number };
+	/** Live image: already-rendered pixel size from toolResult.details. */
+	livePixels?: { w: number; h: number };
+	/** Live image: slide fingerprint from toolResult.details. */
+	liveFingerprint?: string;
 };
 
 /**
@@ -724,12 +784,16 @@ async function transformOnce(
 					ref: part,
 				});
 			} else if (isImageContent(part)) {
+				const liveMeta = liveImageMetaFromMessage(m);
 				positions.push({
 					msgIdx,
 					blkIdx,
 					overview: isOverviewLiveImage(m, firstId),
-					pending: false,
+					pending: isPendingLiveImage(m, pendingId),
 					kind: "image",
+					liveSrc: liveMeta?.src,
+					livePixels: liveMeta?.pixels,
+					liveFingerprint: liveMeta?.fingerprint,
 				});
 			}
 		}
@@ -755,30 +819,41 @@ async function transformOnce(
 	}
 
 	// Phase 2b (§9.1 / P2-3): enforce the visual token budget as a HARD cap.
-	// Overview and pending positions are non-evictable; the oldest ordinary
-	// kept images are evicted until the estimate fits the budget. Phase 1 path
-	// has no stable-region overview (the overview is one of the kept positions),
-	// so the overview cost is counted directly from the kept overview position.
+	// Overview and pending positions are non-evictable; ordinary images are
+	// reduced to a contiguous newest suffix until the estimate fits. Phase 1
+	// path has no stable-region overview (the overview is one of the kept
+	// positions), so the overview cost is counted from the kept overview position.
 	enforceTransformOnceBudget(keepKeys, positions, ordinary, keepFrom, settings);
 
-	// Phase 3: materialize KEEP refs only (concurrency cap, signal-aware).
-	// The newest kept *ordinary* (non-overview, non-pending) ref gets the detail
-	// tier (§6.1 current high-power evidence image); pending snapshots also get
-	// the detail tier (they are the "current" image under review).
+	// Phase 3: materialize KEEP refs + normalize oversized KEEP live images
+	// (concurrency cap, signal-aware). Newest kept ordinary → detail tier;
+	// pending → detail; other ordinary → working; overview → overview.
 	const keptOrdinary = positions
-		.filter((p) => !p.overview && !p.pending && p.kind === "ref" && keepKeys.has(posKey(p)))
+		.filter((p) => !p.overview && !p.pending && keepKeys.has(posKey(p)))
 		.sort((a, b) => rank(a) - rank(b));
 	const newestOrdinaryKey = keptOrdinary.length ? posKey(keptOrdinary[keptOrdinary.length - 1]!) : null;
-	const toMaterialize = positions.filter((p) => p.kind === "ref" && p.ref && keepKeys.has(posKey(p)));
+	const toMaterialize = positions.filter((p) => keepKeys.has(posKey(p)) && (p.kind === "ref" || p.kind === "image"));
 	const materialized = new Map<string, ImageContent | { type: "text"; text: string }>();
 	await mapPool(
 		toMaterialize,
 		settings.regionConcurrency,
 		async (p) => {
 			const isDetail = p.pending || posKey(p) === newestOrdinaryKey;
-			const block = await materializeRef(p.ref!, flask, slide, slideInfo, settings, p.overview, isDetail, signal);
-			materialized.set(posKey(p), block);
-			return block;
+			if (p.kind === "ref" && p.ref) {
+				const block = await materializeRef(p.ref, flask, slide, slideInfo, settings, p.overview, isDetail, signal);
+				materialized.set(posKey(p), block);
+				return block;
+			}
+			// Live image: rematerialize at the assigned tier when pixels exceed it
+			// (or when we have src and need a controlled derivative). Otherwise the
+			// rebuild step keeps the original block.
+			const target = chooseTargetLongEdge(settings, p.overview, isDetail);
+			const normalized = await normalizeLiveImage(p, flask, slide, slideInfo, settings, target, signal);
+			if (normalized) {
+				materialized.set(posKey(p), normalized);
+				return normalized;
+			}
+			return null;
 		},
 		signal,
 	);
@@ -807,6 +882,11 @@ async function transformOnce(
 				if (!keepKeys.has(key)) {
 					touched = true;
 					return { type: "text", text: PLACEHOLDER_TEXT };
+				}
+				const normalized = materialized.get(key);
+				if (normalized) {
+					touched = true;
+					return normalized;
 				}
 				return part;
 			}
@@ -851,9 +931,9 @@ function enforceTransformOnceBudget(
 		const key = posKey(p);
 		if (!keepKeys.has(key)) continue;
 		if (p.overview) {
-			baseline += estimateImageRefTokens({ w: settings.overviewLongEdge, h: settings.overviewLongEdge }, settings.overviewLongEdge);
+			baseline += estimatePosTokensForBudget(p, settings, true, true);
 		} else if (p.pending) {
-			baseline += estimateImageRefTokens({ w: settings.detailImageLongEdge, h: settings.detailImageLongEdge }, settings.detailImageLongEdge);
+			baseline += estimatePosTokensForBudget(p, settings, true, false);
 		}
 	}
 	const keptOrdinary = ordinary.slice(keepFrom); // oldest → newest
@@ -861,21 +941,113 @@ function enforceTransformOnceBudget(
 	// Cost each kept ordinary image at its FINAL materialization tier: the
 	// newest ordinary is materialized at the detail tier (chooseTargetLongEdge),
 	// so it must be charged at detail — not working (Phase 3.1 P1).
-	const costOf = (p: ImgPos): number => {
-		const isDetail = p.pending || posKey(p) === newestKey;
-		const target = isDetail ? settings.detailImageLongEdge : settings.workingImageLongEdge;
-		if (p.kind === "ref" && p.ref) {
-			const src = p.ref.src || { x: 0, y: 0, w: 0, h: 0 };
-			return estimateImageRefTokens({ w: src.w, h: src.h }, target);
-		}
-		return estimateImageRefTokens({ w: target, h: target }, target);
-	};
 	const sel = enforceVisualTokenBudget({
 		budgetTokens: budget,
 		baselineTokens: baseline,
-		ordinary: keptOrdinary.map((p) => ({ key: posKey(p), tokens: costOf(p) })),
+		ordinary: keptOrdinary.map((p) => ({
+			key: posKey(p),
+			tokens: estimatePosTokensForBudget(p, settings, posKey(p) === newestKey, false),
+		})),
 	});
 	for (const key of sel.evictedKeys) keepKeys.delete(key);
+}
+
+/**
+ * Estimate one position's FINAL visual-token cost after tier rematerialization.
+ * Live images with src bill like image_ref; in-tier pixel-only images bill
+ * as-sent; oversized-without-src or fully unknown size bill 0 (normalize
+ * text-degrades); never bill a target-tier square while sending arbitrary bytes.
+ */
+function estimatePosTokensForBudget(
+	p: ImgPos,
+	settings: TransformContextSettings,
+	isDetail: boolean,
+	isOverview: boolean,
+): number {
+	const target = chooseTargetLongEdge(settings, isOverview || p.overview, isDetail || p.pending);
+	if (p.kind === "ref" && p.ref) {
+		const src = p.ref.src || { x: 0, y: 0, w: 0, h: 0 };
+		return estimateImageRefTokens({ w: src.w, h: src.h }, target);
+	}
+	const hasSrc = !!(p.liveSrc && p.liveSrc.w > 0 && p.liveSrc.h > 0);
+	if (hasSrc) {
+		return estimateImageRefTokens({ w: p.liveSrc!.w, h: p.liveSrc!.h }, target);
+	}
+	if (p.livePixels) {
+		const le = Math.max(p.livePixels.w, p.livePixels.h);
+		if (le <= target) return estimateImagePixelsTokens(p.livePixels.w, p.livePixels.h);
+		// Oversized, no rematerialize src → text degrade (0 visual tokens).
+		return 0;
+	}
+	// No size metadata at all → text degrade (0 visual tokens).
+	return 0;
+}
+
+/**
+ * When a kept live image exceeds its assigned tier (or we have src and need a
+ * controlled derivative), rematerialize via the derivative pipeline so the
+ * bytes sent match the budget estimate.
+ *
+ * Returns:
+ *   - rematerialized {@link ImageContent} on success;
+ *   - {@link DEGRADE_TEXT} on fingerprint mismatch, rematerialize failure,
+ *     oversized-without-src, or fully unknown size (never silently keep
+ *     arbitrary bytes after the budget assumed a controlled tier);
+ *   - `null` when the original live bytes are already within the assigned tier
+ *     (and fingerprint matches) — rebuild keeps the original.
+ */
+async function normalizeLiveImage(
+	p: ImgPos,
+	flask: FlaskClient,
+	slide: string,
+	slideInfo: SlideInfo,
+	settings: TransformContextSettings,
+	targetLongEdge: number,
+	signal?: AbortSignal,
+): Promise<ImageContent | { type: "text"; text: string } | null> {
+	const liveFp = p.liveFingerprint || "";
+	const slideFp = slideInfo.fingerprint || "";
+	// Stale slide generation: degrade even when pixels already fit the tier
+	// (otherwise an old fingerprint's bytes would be sent as current evidence).
+	if (liveFp && liveFp !== slideFp) {
+		return { type: "text", text: DEGRADE_TEXT };
+	}
+	const pixels = p.livePixels;
+	const actualLe = pixels ? Math.max(pixels.w, pixels.h) : Number.POSITIVE_INFINITY;
+	const src = p.liveSrc;
+	const hasSrc = !!(src && src.w > 0 && src.h > 0);
+	if (!hasSrc) {
+		// No rematerialize bbox. Keep only when pixels are known AND within
+		// tier; unknown size (Infinity) or oversized → text degrade.
+		if (pixels && actualLe <= targetLongEdge) return null;
+		return { type: "text", text: DEGRADE_TEXT };
+	}
+	// Already within the assigned tier → keep the original live bytes.
+	if (Number.isFinite(actualLe) && actualLe <= targetLongEdge) return null;
+	const fp = liveFp || slideFp;
+	const spec = overviewDerivativeSpec({
+		slide,
+		fingerprint: fp,
+		src: src!,
+		targetLongEdge,
+		jpegQuality: settings.jpegQuality,
+		overlayVersion: settings.overlayVersion,
+	});
+	try {
+		const r = await materializeDerivativeRaw({
+			flask,
+			slide,
+			slideInfo,
+			spec,
+			expectedFingerprint: fp || undefined,
+			signal,
+		});
+		return { type: "image", data: r.data, mimeType: r.mime };
+	} catch {
+		// Budget already assumed the target tier; do not silently send the
+		// original oversized (or stale) live bytes.
+		return { type: "text", text: DEGRADE_TEXT };
+	}
 }
 
 /**
@@ -886,10 +1058,10 @@ function enforceTransformOnceBudget(
  *   - pending snapshot / most recent kept ordinary image → detail_image_long_edge;
  *   - other recent images → working_image_long_edge.
  *
- * `isMostRecent` marks the newest kept ordinary position so it gets the detail
- * tier (mirrors "current high-power evidence image").
+ * Exported so the Phase 2b assembler uses the SAME tier table as Phase 1
+ * (live overview must bill/rematerialize at overviewLongEdge, not working).
  */
-function chooseTargetLongEdge(
+export function chooseTargetLongEdge(
 	settings: TransformContextSettings,
 	overview: boolean,
 	isDetail: boolean,

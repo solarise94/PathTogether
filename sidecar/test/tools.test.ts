@@ -308,13 +308,13 @@ describe("snapshot (ai_agent.py L816-875)", () => {
 		expect(resultText(r)).toBe("需先消化当前快照后再抓新快照。");
 	});
 
-	it("clamps out_w/out_h to 64..4096 (default viewportPx)", async () => {
+	it("clamps out_w/out_h to 64..detail_image_long_edge (default 1280)", async () => {
 		const h = await makeHarness();
 		await tool(h, "goto").execute("tc1", { x: 5000, y: 4000, level: 0 });
 		const r = await tool(h, "snapshot").execute("snap1", { out_w: 8, out_h: 99999 });
 		expect(r.content).toHaveLength(2);
 		expect(h.mock.regionCalls[0]?.out_w).toBe(64);
-		expect(h.mock.regionCalls[0]?.out_h).toBe(4096);
+		expect(h.mock.regionCalls[0]?.out_h).toBe(1280); // detail-tier cap
 		// default when omitted is viewportPx (1024)
 		const r2 = await tool(h, "complete_snapshot_review").execute("csr1", { disposition: "no_annotation", no_annotation_reason: "导航确认" });
 		expect(resultText(r2)).toContain("已关闭快照");
@@ -341,11 +341,19 @@ describe("snapshot (ai_agent.py L816-875)", () => {
 		expect(call.out_h).toBeUndefined();
 	});
 
-	it("clamps max_long_edge to 1..4096", async () => {
+	it("clamps max_long_edge to the detail-tier cap (default 1280)", async () => {
 		const h = await makeHarness();
 		await tool(h, "goto").execute("tc1", { x: 5000, y: 4000, level: 0 });
 		await tool(h, "snapshot").execute("snap1", { max_long_edge: 99999 });
-		expect(h.mock.regionCalls[0]?.max_long_edge).toBe(4096);
+		expect(h.mock.regionCalls[0]?.max_long_edge).toBe(1280);
+	});
+
+	it("honors cfg.detail_image_long_edge as the snapshot output cap", async () => {
+		const h = await makeHarness();
+		h.ctx.cfg.detail_image_long_edge = 900;
+		await tool(h, "goto").execute("tc1", { x: 5000, y: 4000, level: 0 });
+		await tool(h, "snapshot").execute("snap1", { max_long_edge: 4096 });
+		expect(h.mock.regionCalls[0]?.max_long_edge).toBe(900);
 	});
 
 	it("on 409 fingerprint mismatch clears caches via onFingerprintMismatch", async () => {

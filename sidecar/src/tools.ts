@@ -489,9 +489,9 @@ export function createTools(ctx: ToolContext): AgentTool<any, any>[] {
 		label: "抓快照",
 		description: "抓取当前视野的快照图像回喂给你。看清细节时调用。",
 		parameters: Type.Object({
-			out_w: Type.Optional(Type.Integer({ description: "输出宽度像素（建议 ≤1568，与 out_h 同时给出时不保持宽高比）" })),
-			out_h: Type.Optional(Type.Integer({ description: "输出高度像素（建议 ≤1568，与 out_w 同时给出时不保持宽高比）" })),
-			max_long_edge: Type.Optional(Type.Integer({ description: "输出最长边像素（保持宽高比，1..4096）；优先于 out_w/out_h" })),
+			out_w: Type.Optional(Type.Integer({ description: "输出宽度像素（建议 ≤ detail 档，与 out_h 同时给出时不保持宽高比）" })),
+			out_h: Type.Optional(Type.Integer({ description: "输出高度像素（建议 ≤ detail 档，与 out_w 同时给出时不保持宽高比）" })),
+			max_long_edge: Type.Optional(Type.Integer({ description: "输出最长边像素（保持宽高比）；优先于 out_w/out_h，上限为当前 detail 档" })),
 		}),
 		async execute(toolCallId, params): Promise<AgentToolResult<any>> {
 			await ensureStateLoaded();
@@ -503,20 +503,27 @@ export function createTools(ctx: ToolContext): AgentTool<any, any>[] {
 				return okText("需先消化当前快照后再抓新快照。");
 			}
 
-			// Output sizing (§6.1): prefer max_long_edge (aspect-preserving). When
-			// the caller gives explicit out_w/out_h instead, use them (legacy path,
-			// does NOT preserve aspect ratio) — clamp to 64..4096 as before.
+			// Output sizing (§6.1 / Phase 3.1): prefer max_long_edge (aspect-
+			// preserving). Cap the output long edge at the current detail tier
+			// so live images entering the model context never exceed the budget
+			// estimator's detail-square assumption (4096px captures would
+			// otherwise under-count by ~10×). Explicit out_w/out_h still do NOT
+			// preserve aspect ratio, but each dim is clamped to the same cap.
+			const detailCap = (() => {
+				const n = Number(ctx.cfg.detail_image_long_edge);
+				return Number.isFinite(n) && n > 0 ? Math.min(4096, Math.floor(n)) : 1280;
+			})();
 			let maxLongEdge: number | undefined;
 			let ow: number | undefined;
 			let oh: number | undefined;
 			const mleRaw = Number(args.max_long_edge);
 			if (Number.isFinite(mleRaw) && mleRaw > 0) {
-				maxLongEdge = Math.max(1, Math.min(Math.floor(mleRaw), 4096));
+				maxLongEdge = Math.max(1, Math.min(Math.floor(mleRaw), detailCap));
 			} else {
 				ow = Number(args.out_w) || st.viewportPx;
 				oh = Number(args.out_h) || st.viewportPx;
-				ow = Math.max(64, Math.min(ow, 4096));
-				oh = Math.max(64, Math.min(oh, 4096));
+				ow = Math.max(64, Math.min(ow, detailCap));
+				oh = Math.max(64, Math.min(oh, detailCap));
 			}
 
 			const bb = st.viewportBbox(downsamples);

@@ -14,7 +14,10 @@
  *      same as a full-edge square (parity with app.py).
  *   3. The shared `enforceVisualTokenBudget` either keeps `selectedTokens <=
  *      budget` OR records the excess as `overflowTokens` (never silently drops
- *      below the force-keep-newest floor).
+ *      below the force-keep-newest floor). Overflow lives on the RETURN VALUE
+ *      (request-local) — there is no process-global overflow counter.
+ *   4. Eviction keeps a contiguous newest suffix (strict oldest-first / never
+ *      "cheap old + newest" with a middle gap).
  */
 import { describe, expect, it, beforeEach } from "vitest";
 
@@ -27,9 +30,8 @@ import {
 } from "../src/transform-context.js";
 import {
 	estimateImageRefTokens,
+	estimateImagePixelsTokens,
 	enforceVisualTokenBudget,
-	visualBudgetOverflowTokensValue,
-	resetVisualBudgetOverflow,
 	PIXELS_PER_VISUAL_TOKEN,
 } from "../src/compaction.js";
 import type { FlaskClient, RegionResult } from "../src/flask-client.js";
@@ -93,7 +95,6 @@ function makeFlask(): Pick<FlaskClient, "region"> {
 
 beforeEach(() => {
 	clearRegionLru();
-	resetVisualBudgetOverflow();
 });
 
 // =========================================================================== //
@@ -193,10 +194,15 @@ describe("Phase 3.1 invariant — small-bbox upscale parity (mirrors _aspect_fit
 		expect(estimateImageRefTokens({ w: 10, h: 10 }, 0)).toBe(0);
 		expect(estimateImageRefTokens({ w: -1, h: 10 }, 768)).toBe(0);
 	});
+
+	it("estimateImagePixelsTokens bills rendered pixels without upscaling", () => {
+		expect(estimateImagePixelsTokens(4096, 4096)).toBe(Math.ceil((4096 * 4096) / PIXELS_PER_VISUAL_TOKEN));
+		expect(estimateImagePixelsTokens(0, 10)).toBe(0);
+	});
 });
 
 // =========================================================================== //
-// Invariant 3: selectedTokens <= budget OR explicit overflow
+// Invariant 3: selectedTokens <= budget OR explicit overflow (return value)
 // =========================================================================== //
 describe("Phase 3.1 invariant — final selected <= budget OR explicit overflow", () => {
 	it("(a) everything fits → selectedTokens <= budget, overflowTokens = 0", () => {
@@ -212,7 +218,6 @@ describe("Phase 3.1 invariant — final selected <= budget OR explicit overflow"
 		expect(sel.evictedKeys.size).toBe(0);
 		expect(sel.selectedTokens).toBeLessThanOrEqual(10000);
 		expect(sel.overflowTokens).toBe(0);
-		expect(visualBudgetOverflowTokensValue()).toBe(0);
 	});
 
 	it("(b) only the newest ordinary fits → evict older, selectedTokens <= budget, overflow 0", () => {
@@ -230,14 +235,12 @@ describe("Phase 3.1 invariant — final selected <= budget OR explicit overflow"
 		expect(sel.evictedKeys.has("new")).toBe(false);
 		expect(sel.selectedTokens).toBeLessThanOrEqual(3000);
 		expect(sel.overflowTokens).toBe(0);
-		expect(visualBudgetOverflowTokensValue()).toBe(0);
 	});
 
 	it("(c) even the newest ordinary does not fit → force-keep newest, record overflow", () => {
 		// Budget 1000, baseline 0, single ordinary of 5000 → cannot fit even one.
 		// The newest is STILL force-kept (current-evidence floor); the excess is
-		// reported as overflow AND reflected in the process counter.
-		resetVisualBudgetOverflow();
+		// reported as overflow on the return value (request-local).
 		const sel = enforceVisualTokenBudget({
 			budgetTokens: 1000,
 			baselineTokens: 0,
@@ -248,13 +251,11 @@ describe("Phase 3.1 invariant — final selected <= budget OR explicit overflow"
 		const excess = 5000 - 1000;
 		expect(sel.overflowTokens).toBe(excess);
 		expect(sel.overflowTokens).toBeGreaterThan(0);
-		expect(visualBudgetOverflowTokensValue()).toBe(excess);
 	});
 
 	it("(c-variant) multiple ordinary, none fit → force-keep NEWEST, evict the rest, overflow = excess", () => {
 		// Budget 1000; the newest ordinary alone (5000) already overflows, so the
 		// older ones are evicted and the newest is force-kept.
-		resetVisualBudgetOverflow();
 		const sel = enforceVisualTokenBudget({
 			budgetTokens: 1000,
 			baselineTokens: 0,
@@ -271,14 +272,12 @@ describe("Phase 3.1 invariant — final selected <= budget OR explicit overflow"
 		// Overflow is the excess of the force-kept newest over the budget.
 		expect(sel.overflowTokens).toBe(5000 - 1000);
 		expect(sel.selectedTokens).toBe(5000);
-		expect(visualBudgetOverflowTokensValue()).toBe(5000 - 1000);
 	});
 
 	it("(d) baseline alone over budget → protected images force-kept, overflow recorded", () => {
 		// Protected images (baseline) alone exceed the budget. Protected images are
 		// NEVER evicted (§9.1), so the baseline excess is reported as overflow.
 		// With NO ordinary images, nothing else can be kept — overflow = baseline - budget.
-		resetVisualBudgetOverflow();
 		const sel = enforceVisualTokenBudget({
 			budgetTokens: 1000,
 			baselineTokens: 9000, // alone over budget
@@ -287,7 +286,6 @@ describe("Phase 3.1 invariant — final selected <= budget OR explicit overflow"
 		expect(sel.evictedKeys.size).toBe(0);
 		expect(sel.selectedTokens).toBe(9000); // baseline survives
 		expect(sel.overflowTokens).toBe(9000 - 1000);
-		expect(visualBudgetOverflowTokensValue()).toBe(9000 - 1000);
 	});
 
 	it("(d-variant) baseline over budget + ordinary → oldest ordinary evicted, newest force-kept, all excess overflow", () => {
@@ -296,7 +294,6 @@ describe("Phase 3.1 invariant — final selected <= budget OR explicit overflow"
 		// (current-evidence floor is absolute, §9.1) and the older ordinary images
 		// are evicted. The ENTIRE running total (baseline + newest) over budget is
 		// recorded as overflow — protected images never reduce the floor.
-		resetVisualBudgetOverflow();
 		const sel = enforceVisualTokenBudget({
 			budgetTokens: 1000,
 			baselineTokens: 9000, // already over budget
@@ -312,18 +309,258 @@ describe("Phase 3.1 invariant — final selected <= budget OR explicit overflow"
 		expect(sel.selectedTokens).toBe(9000 + 200);
 		// overflow = selectedTokens - budget.
 		expect(sel.overflowTokens).toBe(9000 + 200 - 1000);
-		expect(visualBudgetOverflowTokensValue()).toBe(9000 + 200 - 1000);
+	});
+});
+
+// =========================================================================== //
+// Invariant 4: strict contiguous newest slice (no middle-gap packing)
+// =========================================================================== //
+describe("Phase 3.1 invariant — contiguous newest slice (strict oldest-first)", () => {
+	it("does not keep an older cheap image after a newer expensive one fails", () => {
+		// Budget 2300, costs oldest→newest [100, 787, 2185].
+		// Packing that continues after the first failure would keep oldest(100) +
+		// newest(2185)=2285 and drop the middle — NOT a contiguous newest slice.
+		// Strict oldest-first: keep newest(2185), fail on 787 → evict 787 AND 100.
+		const sel = enforceVisualTokenBudget({
+			budgetTokens: 2300,
+			baselineTokens: 0,
+			ordinary: [
+				{ key: "old-cheap", tokens: 100 },
+				{ key: "mid", tokens: 787 },
+				{ key: "new-detail", tokens: 2185 },
+			],
+		});
+		expect(sel.evictedKeys.has("old-cheap")).toBe(true);
+		expect(sel.evictedKeys.has("mid")).toBe(true);
+		expect(sel.evictedKeys.has("new-detail")).toBe(false);
+		expect(sel.selectedTokens).toBe(2185);
+		expect(sel.overflowTokens).toBe(0);
 	});
 
-	it("resetVisualBudgetOverflow clears the process counter", () => {
-		resetVisualBudgetOverflow();
-		enforceVisualTokenBudget({
-			budgetTokens: 1,
+	it("keeps a contiguous newest suffix when several fit", () => {
+		// Budget 3100: newest 2185 + mid 787 = 2972 fits; old 200 would exceed.
+		const sel = enforceVisualTokenBudget({
+			budgetTokens: 3100,
 			baselineTokens: 0,
-			ordinary: [{ key: "x", tokens: 9999 }],
+			ordinary: [
+				{ key: "old", tokens: 200 },
+				{ key: "mid", tokens: 787 },
+				{ key: "new", tokens: 2185 },
+			],
 		});
-		expect(visualBudgetOverflowTokensValue()).toBe(9999 - 1);
-		resetVisualBudgetOverflow();
-		expect(visualBudgetOverflowTokensValue()).toBe(0);
+		expect(sel.evictedKeys.has("old")).toBe(true);
+		expect(sel.evictedKeys.has("mid")).toBe(false);
+		expect(sel.evictedKeys.has("new")).toBe(false);
+		expect(sel.selectedTokens).toBe(2185 + 787);
+	});
+});
+
+// =========================================================================== //
+// Invariant 5: oversized live images rematerialize at the assigned tier
+// =========================================================================== //
+describe("Phase 3.1 invariant — live image normalized to budget tier", () => {
+	it("rematerializes an oversized live image at the detail long edge", async () => {
+		// A live snapshot claiming 4096² would under-count if billed as a detail
+		// square (2185) while sending ~22370 tokens of pixels. With src+pixels on
+		// toolResult.details, the selector rematerializes at the detail tier.
+		const regionCalls: Array<{ max_long_edge?: number }> = [];
+		const flask: Pick<FlaskClient, "region"> = {
+			region: async (args) => {
+				regionCalls.push({ max_long_edge: args.max_long_edge });
+				const le = args.max_long_edge ?? 1280;
+				return {
+					image_base64: "QkFBQkE=", // distinct from the live payload
+					mime: "image/jpeg",
+					width: le,
+					height: le,
+					src: { x: args.x as number, y: args.y as number, w: args.w as number, h: args.h as number },
+					magnification: null,
+					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+				};
+			},
+		};
+		const settings = resolveTransformSettings({
+			visual_working_set_max: 4,
+			visual_context_budget_tokens: 8000,
+		});
+		const transform = makeTransformContext({
+			flask: flask as unknown as FlaskClient,
+			slide: SLIDE,
+			slideInfo: SLIDE_INFO,
+			settings,
+			firstSnapshotToolCallIdRef: { value: null },
+			pendingSnapshotIdRef: { value: null },
+		});
+		const live = { type: "image", data: "TElWRQ==", mimeType: "image/jpeg" };
+		const msg = {
+			role: "toolResult",
+			toolCallId: "snap-big",
+			content: [live],
+			timestamp: 1,
+			details: {
+				src: { x: 10, y: 10, w: 500, h: 500 },
+				width: 4096,
+				height: 4096,
+				slide_fingerprint: "fp-test",
+				magnification: "20x",
+			},
+		} as unknown as AgentMessage;
+		const out = await transform([msg]);
+		const content = (out[0] as { content?: Array<{ type: string; data?: string }> }).content!;
+		expect(content[0]!.type).toBe("image");
+		// Rematerialized bytes, not the original live payload.
+		expect(content[0]!.data).toBe("QkFBQkE=");
+		expect(regionCalls.some((c) => c.max_long_edge === settings.detailImageLongEdge)).toBe(true);
+	});
+
+	it("degrades to text when rematerialize fails (Phase 1 path)", async () => {
+		const flask: Pick<FlaskClient, "region"> = {
+			region: async () => {
+				throw new Error("region unavailable");
+			},
+		};
+		const settings = resolveTransformSettings({ visual_working_set_max: 4, visual_context_budget_tokens: 8000 });
+		const transform = makeTransformContext({
+			flask: flask as unknown as FlaskClient,
+			slide: SLIDE,
+			slideInfo: SLIDE_INFO,
+			settings,
+			firstSnapshotToolCallIdRef: { value: null },
+			pendingSnapshotIdRef: { value: null },
+		});
+		const msg = {
+			role: "toolResult",
+			toolCallId: "snap-big",
+			content: [{ type: "image", data: "TElWRQ==", mimeType: "image/jpeg" }],
+			timestamp: 1,
+			details: {
+				src: { x: 10, y: 10, w: 500, h: 500 },
+				width: 4096,
+				height: 4096,
+				slide_fingerprint: "fp-test",
+			},
+		} as unknown as AgentMessage;
+		const out = await transform([msg]);
+		const content = (out[0] as { content?: Array<{ type: string; text?: string }> }).content!;
+		expect(content[0]!.type).toBe("text");
+		expect(content[0]!.text).toBe("该图因切片变更不可用。");
+	});
+
+	it("degrades oversized live image with pixels but no src (Phase 1 path)", async () => {
+		const regionCalls: unknown[] = [];
+		const flask: Pick<FlaskClient, "region"> = {
+			region: async (args) => {
+				regionCalls.push(args);
+				return {
+					image_base64: "QkFBQkE=",
+					mime: "image/jpeg",
+					width: 100,
+					height: 100,
+					src: { x: 0, y: 0, w: 1, h: 1 },
+					magnification: null,
+					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+				};
+			},
+		};
+		const settings = resolveTransformSettings({ visual_working_set_max: 4, visual_context_budget_tokens: 8000 });
+		const transform = makeTransformContext({
+			flask: flask as unknown as FlaskClient,
+			slide: SLIDE,
+			slideInfo: SLIDE_INFO,
+			settings,
+			firstSnapshotToolCallIdRef: { value: null },
+			pendingSnapshotIdRef: { value: null },
+		});
+		const msg = {
+			role: "toolResult",
+			toolCallId: "snap-nosrc",
+			content: [{ type: "image", data: "T1JJR0lOQUw=", mimeType: "image/jpeg" }],
+			timestamp: 1,
+			details: {
+				width: 4096,
+				height: 4096,
+				slide_fingerprint: "fp-test",
+			},
+		} as unknown as AgentMessage;
+		const out = await transform([msg]);
+		const content = (out[0] as { content?: Array<{ type: string; text?: string }> }).content!;
+		expect(content[0]!.type).toBe("text");
+		expect(content[0]!.text).toBe("该图因切片变更不可用。");
+		expect(regionCalls.length).toBe(0);
+	});
+
+	it("degrades live image with no size metadata at all (Phase 1 path)", async () => {
+		const settings = resolveTransformSettings({ visual_working_set_max: 4, visual_context_budget_tokens: 100 });
+		const transform = makeTransformContext({
+			flask: { region: async () => { throw new Error("should not fetch"); } } as unknown as FlaskClient,
+			slide: SLIDE,
+			slideInfo: SLIDE_INFO,
+			settings,
+			firstSnapshotToolCallIdRef: { value: null },
+			pendingSnapshotIdRef: { value: null },
+		});
+		const msgs = [
+			{
+				role: "toolResult",
+				toolCallId: "snap-unknown",
+				content: [{ type: "image", data: "VU5LTk9XTg==", mimeType: "image/jpeg" }],
+				timestamp: 1,
+			} as unknown as AgentMessage,
+			{
+				role: "user",
+				content: [{ type: "image", data: "VVNFUg==", mimeType: "image/jpeg" }],
+				timestamp: 2,
+			} as unknown as AgentMessage,
+		];
+		const out = await transform(msgs);
+		for (const m of out) {
+			const content = (m as { content?: Array<{ type: string; text?: string }> }).content!;
+			expect(content[0]!.type).toBe("text");
+			expect(content[0]!.text).toBe("该图因切片变更不可用。");
+		}
+	});
+
+	it("degrades to text when live fingerprint mismatches even if pixels fit", async () => {
+		const regionCalls: unknown[] = [];
+		const flask: Pick<FlaskClient, "region"> = {
+			region: async (args) => {
+				regionCalls.push(args);
+				return {
+					image_base64: "QkFBQkE=",
+					mime: "image/jpeg",
+					width: 100,
+					height: 100,
+					src: { x: 0, y: 0, w: 1, h: 1 },
+					magnification: null,
+					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+				};
+			},
+		};
+		const settings = resolveTransformSettings({ visual_working_set_max: 4, visual_context_budget_tokens: 8000 });
+		const transform = makeTransformContext({
+			flask: flask as unknown as FlaskClient,
+			slide: SLIDE,
+			slideInfo: SLIDE_INFO,
+			settings,
+			firstSnapshotToolCallIdRef: { value: null },
+			pendingSnapshotIdRef: { value: null },
+		});
+		const msg = {
+			role: "toolResult",
+			toolCallId: "snap-stale",
+			content: [{ type: "image", data: "U1RBTEU=", mimeType: "image/jpeg" }],
+			timestamp: 1,
+			details: {
+				src: { x: 10, y: 10, w: 100, h: 100 },
+				width: 512,
+				height: 512,
+				slide_fingerprint: "fp-other",
+			},
+		} as unknown as AgentMessage;
+		const out = await transform([msg]);
+		const content = (out[0] as { content?: Array<{ type: string; text?: string }> }).content!;
+		expect(content[0]!.type).toBe("text");
+		expect(content[0]!.text).toBe("该图因切片变更不可用。");
+		expect(regionCalls.length).toBe(0);
 	});
 });

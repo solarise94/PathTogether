@@ -16,7 +16,8 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 import { makeRequestAssembler, sliceRecentMessages, buildSnapshotObservationIndex, type AssemblerSessionSnapshot, type RequestAssemblerDeps } from "../src/request-assembler.js";
 import { buildOverviewDerivative, REQUEST_SCHEMA_VERSION, type CheckpointEnv, type ContextCheckpoint } from "../src/checkpoint.js";
-import { clearRegionLru, configureRegionLru, resolveTransformSettings } from "../src/transform-context.js";
+import { clearRegionLru, configureRegionLru, resolveTransformSettings, DEGRADE_TEXT } from "../src/transform-context.js";
+import { estimateImageRefTokens, estimateImagePixelsTokens } from "../src/compaction.js";
 import type { FlaskClient, RegionResult } from "../src/flask-client.js";
 import type { SlideInfo } from "../src/tools.js";
 import type { ImageRefContent, Observation, PersistedAgentMessage } from "../src/session-store.js";
@@ -438,13 +439,27 @@ describe("makeRequestAssembler — StableContextUnavailableError (§13)", () => 
 // =========================================================================== //
 
 describe("makeRequestAssembler — live image eviction (Phase 1 parity)", () => {
-	const LIVE = { type: "image", data: "QUFBQQ==", mimeType: "image/jpeg" };
+	/** In-tier live bytes so eviction tests exercise keep/placeholder, not unknown-size degrade. */
+	function liveToolResult(toolCallId: string, ts: number): PersistedAgentMessage {
+		return {
+			role: "toolResult",
+			toolCallId,
+			content: [{ type: "image", data: "QUFBQQ==", mimeType: "image/jpeg" }],
+			timestamp: ts,
+			details: {
+				src: { x: 0, y: 0, w: 100, h: 100 },
+				width: 512,
+				height: 512,
+				slide_fingerprint: FINGERPRINT,
+			},
+		} as unknown as PersistedAgentMessage;
+	}
 
 	function liveSnapMessages(count: number): PersistedAgentMessage[] {
 		const msgs: PersistedAgentMessage[] = [];
 		for (let i = 0; i < count; i++) {
 			msgs.push(assistantMsg([{ type: "toolCall", id: `tc-${i}`, name: "snapshot", arguments: {} }], i * 2 + 1));
-			msgs.push(toolResultMsg(`tc-${i}`, [LIVE], i * 2 + 2));
+			msgs.push(liveToolResult(`tc-${i}`, i * 2 + 2));
 		}
 		return msgs;
 	}
@@ -700,5 +715,425 @@ describe("makeRequestAssembler — visual budget eviction direction (review fix)
 		expect(blockTypeOf("tc-2")).toBe("image"); // newest kept
 		expect(blockTypeOf("tc-3")).toBe("image");
 		expect(captured.evicted).toEqual(["ref_snap-0", "ref_snap-1"]);
+	});
+});
+
+// =========================================================================== //
+// makeRequestAssembler — live overview budget/tier + rematerialize degrade
+// =========================================================================== //
+
+describe("makeRequestAssembler — live overview budget tier + rematerialize degrade", () => {
+	function trivialSnap(overrides: Partial<AssemblerSessionSnapshot> = {}): AssemblerSessionSnapshot {
+		return { checkpoint: makeTrivialCheckpoint(), observations: [], pendingSnapshotId: null, messages: [], ...overrides };
+	}
+
+	function liveToolResult(
+		toolCallId: string,
+		opts: {
+			data?: string;
+			src?: { x: number; y: number; w: number; h: number } | null;
+			width?: number;
+			height?: number;
+			fingerprint?: string;
+			ts?: number;
+			omitDetails?: boolean;
+		} = {},
+	): PersistedAgentMessage {
+		const live = { type: "image", data: opts.data ?? "TElWRQ==", mimeType: "image/jpeg" };
+		if (opts.omitDetails) {
+			return {
+				role: "toolResult",
+				toolCallId,
+				content: [live],
+				timestamp: opts.ts ?? 1,
+			} as unknown as PersistedAgentMessage;
+		}
+		const details: Record<string, unknown> = {
+			width: opts.width ?? 4096,
+			height: opts.height ?? 4096,
+			slide_fingerprint: opts.fingerprint ?? FINGERPRINT,
+		};
+		if (opts.src !== null) {
+			details.src = opts.src ?? { x: 10, y: 10, w: 500, h: 500 };
+		}
+		return {
+			role: "toolResult",
+			toolCallId,
+			content: [live],
+			timestamp: opts.ts ?? 1,
+			details,
+		} as unknown as PersistedAgentMessage;
+	}
+
+	it("rematerializes kept live overview at overviewLongEdge (not working)", async () => {
+		const regionCalls: Array<{ max_long_edge?: number }> = [];
+		const flask: Pick<FlaskClient, "region"> = {
+			region: async (args) => {
+				regionCalls.push({ max_long_edge: args.max_long_edge });
+				const le = args.max_long_edge ?? 1024;
+				return {
+					image_base64: "QkFBQkE=",
+					mime: "image/jpeg",
+					width: le,
+					height: le,
+					src: { x: args.x as number, y: args.y as number, w: args.w as number, h: args.h as number },
+					magnification: null,
+					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+				};
+			},
+		};
+		const settings = resolveTransformSettings({ visual_working_set_max: 4, visual_context_budget_tokens: 8000 });
+		const deps = makeDeps({
+			flask: flask as FlaskClient,
+			settings,
+			firstSnapshotToolCallIdRef: { value: "tc-ov" },
+			getSessionSnapshot: async () => trivialSnap(),
+		});
+		const assembler = makeRequestAssembler(deps);
+		const msgs = [
+			assistantMsg([{ type: "toolCall", id: "tc-ov", name: "snapshot", arguments: {} }], 1),
+			liveToolResult("tc-ov", { ts: 2 }),
+		];
+		const out = await assembler(msgs as AgentMessage[]);
+		const first = out.find((m) => (m as { toolCallId?: string }).toolCallId === "tc-ov");
+		const content = (first as { content?: Array<{ type: string; data?: string }> }).content!;
+		expect(content[0]!.type).toBe("image");
+		expect(content[0]!.data).toBe("QkFBQkE=");
+		expect(regionCalls.some((c) => c.max_long_edge === settings.overviewLongEdge)).toBe(true);
+		expect(regionCalls.some((c) => c.max_long_edge === settings.workingImageLongEdge)).toBe(false);
+	});
+
+	it("charges kept live overview alone into baseline (exact overflow)", async () => {
+		// Discriminating case: ONLY the live overview — no ordinary force-keep.
+		// If overview were skipped in baseline, overflow would be 0.
+		const overviewLe = 1024;
+		const budget = 100;
+		const overviewTokens = estimateImagePixelsTokens(overviewLe, overviewLe);
+		const captured: { overflow?: number } = {};
+		const deps = makeDeps({
+			settings: resolveTransformSettings({
+				visual_working_set_max: 4,
+				visual_context_budget_tokens: budget,
+				overview_long_edge: overviewLe,
+			}),
+			firstSnapshotToolCallIdRef: { value: "tc-ov" },
+			getSessionSnapshot: async () => trivialSnap(),
+			metricsSink: (m) => {
+				captured.overflow = m.visual_budget_overflow_tokens;
+			},
+		});
+		const assembler = makeRequestAssembler(deps);
+		const msgs = [
+			assistantMsg([{ type: "toolCall", id: "tc-ov", name: "snapshot", arguments: {} }], 1),
+			liveToolResult("tc-ov", {
+				width: overviewLe,
+				height: overviewLe,
+				src: { x: 0, y: 0, w: overviewLe, h: overviewLe },
+				data: "T1ZFUlZFVw==",
+				ts: 2,
+			}),
+		];
+		const out = await assembler(msgs as AgentMessage[]);
+		const content = (out.find((m) => (m as { toolCallId?: string }).toolCallId === "tc-ov") as {
+			content?: Array<{ type: string }>;
+		}).content!;
+		expect(content[0]!.type).toBe("image");
+		expect(captured.overflow).toBe(overviewTokens - budget);
+	});
+
+	it("overview+pending coincidence bills and rematerializes at overview tier (detail < overview)", async () => {
+		// Default first unreviewed snapshot is BOTH overview and pending.
+		// detail < overview must NOT under-bill or rematerialize at detail.
+		const overviewLe = 900;
+		const detailLe = 500;
+		const budget = 200;
+		const src = { x: 10, y: 10, w: 2000, h: 2000 };
+		const overviewTokens = estimateImageRefTokens(src, overviewLe);
+		const detailTokens = estimateImageRefTokens(src, detailLe);
+		expect(overviewTokens).toBeGreaterThan(detailTokens);
+
+		const regionCalls: number[] = [];
+		const flask: Pick<FlaskClient, "region"> = {
+			region: async (args) => {
+				regionCalls.push(args.max_long_edge ?? 0);
+				const le = args.max_long_edge ?? overviewLe;
+				return {
+					image_base64: "QkFBQkE=",
+					mime: "image/jpeg",
+					width: le,
+					height: le,
+					src: { x: args.x as number, y: args.y as number, w: args.w as number, h: args.h as number },
+					magnification: null,
+					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+				};
+			},
+		};
+		const captured: { overflow?: number } = {};
+		const deps = makeDeps({
+			flask: flask as FlaskClient,
+			settings: resolveTransformSettings({
+				visual_working_set_max: 4,
+				visual_context_budget_tokens: budget,
+				overview_long_edge: overviewLe,
+				detail_image_long_edge: detailLe,
+			}),
+			firstSnapshotToolCallIdRef: { value: "tc-0" },
+			getSessionSnapshot: async () => trivialSnap({ pendingSnapshotId: "tc-0" }),
+			metricsSink: (m) => {
+				captured.overflow = m.visual_budget_overflow_tokens;
+			},
+		});
+		const assembler = makeRequestAssembler(deps);
+		const msgs = [
+			assistantMsg([{ type: "toolCall", id: "tc-0", name: "snapshot", arguments: {} }], 1),
+			liveToolResult("tc-0", { src, width: 4096, height: 4096, ts: 2 }),
+		];
+		const out = await assembler(msgs as AgentMessage[]);
+		const content = (out.find((m) => (m as { toolCallId?: string }).toolCallId === "tc-0") as {
+			content?: Array<{ type: string; data?: string }>;
+		}).content!;
+		expect(content[0]!.type).toBe("image");
+		expect(content[0]!.data).toBe("QkFBQkE=");
+		expect(regionCalls).toEqual([overviewLe]);
+		expect(captured.overflow).toBe(overviewTokens - budget);
+		// Prove we did NOT bill the (smaller) detail tier.
+		expect(captured.overflow).not.toBe(detailTokens - budget);
+	});
+
+	it("degrades oversized live image that has pixels but no rematerialize src", async () => {
+		const regionCalls: unknown[] = [];
+		const flask: Pick<FlaskClient, "region"> = {
+			region: async (args) => {
+				regionCalls.push(args);
+				return {
+					image_base64: "QkFBQkE=",
+					mime: "image/jpeg",
+					width: 100,
+					height: 100,
+					src: { x: 0, y: 0, w: 1, h: 1 },
+					magnification: null,
+					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+				};
+			},
+		};
+		const deps = makeDeps({
+			flask: flask as FlaskClient,
+			getSessionSnapshot: async () => trivialSnap(),
+		});
+		const assembler = makeRequestAssembler(deps);
+		const msgs = [
+			assistantMsg([{ type: "toolCall", id: "tc-1", name: "snapshot", arguments: {} }], 1),
+			liveToolResult("tc-1", { src: null, width: 4096, height: 4096, data: "T1JJR0lOQUw=", ts: 2 }),
+		];
+		const out = await assembler(msgs as AgentMessage[]);
+		const content = (out.find((m) => (m as { toolCallId?: string }).toolCallId === "tc-1") as {
+			content?: Array<{ type: string; text?: string; data?: string }>;
+		}).content!;
+		expect(content[0]!.type).toBe("text");
+		expect(content[0]!.text).toBe(DEGRADE_TEXT);
+		expect(regionCalls.length).toBe(0);
+	});
+
+	it("degrades live image with no src and no width/height (unknown size)", async () => {
+		const captured: { overflow?: number } = {};
+		const deps = makeDeps({
+			settings: resolveTransformSettings({ visual_context_budget_tokens: 100 }),
+			getSessionSnapshot: async () => trivialSnap(),
+			metricsSink: (m) => {
+				captured.overflow = m.visual_budget_overflow_tokens;
+			},
+		});
+		const assembler = makeRequestAssembler(deps);
+		const msgs = [
+			assistantMsg([{ type: "toolCall", id: "tc-1", name: "snapshot", arguments: {} }], 1),
+			liveToolResult("tc-1", { omitDetails: true, data: "VU5LTk9XTg==", ts: 2 }),
+			// Also cover user-role bare images (no toolResult.details path).
+			userMsg([{ type: "image", data: "VVNFUg==", mimeType: "image/jpeg" }], 3),
+		];
+		const out = await assembler(msgs as AgentMessage[]);
+		const toolContent = (out.find((m) => (m as { toolCallId?: string }).toolCallId === "tc-1") as {
+			content?: Array<{ type: string; text?: string }>;
+		}).content!;
+		expect(toolContent[0]!.type).toBe("text");
+		expect(toolContent[0]!.text).toBe(DEGRADE_TEXT);
+		const userContent = (out.find((m) => (m as { role?: string }).role === "user" && Array.isArray((m as { content?: unknown }).content)) as {
+			content?: Array<{ type: string; text?: string }>;
+		}).content!;
+		expect(userContent.some((p) => p.type === "text" && p.text === DEGRADE_TEXT)).toBe(true);
+		// Unknown-size images bill 0 → no visual overflow from the target-tier square path.
+		expect(captured.overflow ?? 0).toBe(0);
+	});
+
+	it("degrades to text when live rematerialize fails (does not keep oversized original)", async () => {
+		const flask: Pick<FlaskClient, "region"> = {
+			region: async () => {
+				throw new Error("region unavailable");
+			},
+		};
+		const deps = makeDeps({
+			flask: flask as FlaskClient,
+			firstSnapshotToolCallIdRef: { value: null },
+			getSessionSnapshot: async () => trivialSnap(),
+		});
+		const assembler = makeRequestAssembler(deps);
+		const msgs = [
+			assistantMsg([{ type: "toolCall", id: "tc-1", name: "snapshot", arguments: {} }], 1),
+			liveToolResult("tc-1", { data: "T1JJR0lOQUw=", width: 4096, height: 4096, ts: 2 }),
+		];
+		const out = await assembler(msgs as AgentMessage[]);
+		const content = (out.find((m) => (m as { toolCallId?: string }).toolCallId === "tc-1") as {
+			content?: Array<{ type: string; text?: string; data?: string }>;
+		}).content!;
+		expect(content[0]!.type).toBe("text");
+		expect(content[0]!.text).toBe(DEGRADE_TEXT);
+		expect(content[0]!.data).toBeUndefined();
+	});
+
+	it("degrades to text when live fingerprint mismatches even if pixels fit the tier", async () => {
+		const regionCalls: unknown[] = [];
+		const flask: Pick<FlaskClient, "region"> = {
+			region: async (args) => {
+				regionCalls.push(args);
+				return {
+					image_base64: "QkFBQkE=",
+					mime: "image/jpeg",
+					width: 100,
+					height: 100,
+					src: { x: 0, y: 0, w: 1, h: 1 },
+					magnification: null,
+					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+				};
+			},
+		};
+		const deps = makeDeps({
+			flask: flask as FlaskClient,
+			getSessionSnapshot: async () => trivialSnap(),
+		});
+		const assembler = makeRequestAssembler(deps);
+		const msgs = [
+			assistantMsg([{ type: "toolCall", id: "tc-1", name: "snapshot", arguments: {} }], 1),
+			// Within working tier (512 ≤ 768) — previously would keep stale bytes.
+			liveToolResult("tc-1", {
+				data: "U1RBTEU=",
+				width: 512,
+				height: 512,
+				fingerprint: "fp-stale-generation",
+				ts: 2,
+			}),
+		];
+		const out = await assembler(msgs as AgentMessage[]);
+		const content = (out.find((m) => (m as { toolCallId?: string }).toolCallId === "tc-1") as {
+			content?: Array<{ type: string; text?: string; data?: string }>;
+		}).content!;
+		expect(content[0]!.type).toBe("text");
+		expect(content[0]!.text).toBe(DEGRADE_TEXT);
+		expect(regionCalls.length).toBe(0);
+	});
+});
+
+// =========================================================================== //
+// makeRequestAssembler — overview_enabled product switch (Phase 4 §17 risk 2)
+// =========================================================================== //
+
+describe("makeRequestAssembler — overview_enabled=false (§17 risk 2)", () => {
+	/** Flask mock that records every region call (so we can prove the overview was never fetched). */
+	function makeRecordingFlask(): { flask: Pick<FlaskClient, "region">; calls: Array<{ x: number; y: number; w: number; h: number }> } {
+		const calls: Array<{ x: number; y: number; w: number; h: number }> = [];
+		const region = async (args: { x: number; y: number; w: number; h: number }): Promise<RegionResult> => {
+			calls.push({ x: args.x, y: args.y, w: args.w, h: args.h });
+			return {
+				image_base64: "QUFBQQ==",
+				mime: "image/jpeg",
+				width: 1024,
+				height: 1024,
+				src: { x: args.x, y: args.y, w: args.w, h: args.h },
+				magnification: 20,
+				encoder: { id: "pillow", version: "test-v1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+			};
+		};
+		return { flask: { region } as Pick<FlaskClient, "region">, calls };
+	}
+
+	function makeOverviewCheckpoint(throughSeq: number): ContextCheckpoint {
+		const od = buildOverviewDerivative({
+			ref_id: "ref_ov",
+			jpegBase64: "QUFBQQ==",
+			target_long_edge: 1024,
+			jpeg_quality: 85,
+			overlay_version: "v1",
+			resize_algorithm: "LANCZOS",
+			encoder_id: "pillow",
+			encoder_version: "test-v1",
+			mime_type: "image/jpeg",
+		});
+		return {
+			...makeContentCheckpoint(2, throughSeq),
+			overview_derivative: od.overview_derivative,
+		};
+	}
+
+	it("omits the stable overview image and does not fetch it when overview_enabled=false", async () => {
+		const { flask, calls } = makeRecordingFlask();
+		const cp = makeOverviewCheckpoint(0);
+		const deps = makeDeps({
+			flask: flask as FlaskClient,
+			// settings default to overviewEnabled=true; flip it off here.
+			settings: { ...resolveTransformSettings({}), overviewEnabled: false },
+			getSessionSnapshot: async () => ({
+				checkpoint: cp,
+				observations: [],
+				pendingSnapshotId: null,
+				messages: [],
+			}),
+			overviewSrcResolver: () => ({ x: 0, y: 0, w: 10000, h: 8000 }),
+		});
+		const assembler = makeRequestAssembler(deps);
+		const out = await assembler([userMsg(["请继续"]) as AgentMessage]);
+
+		// Stable TEXT block (summary) is still present.
+		const stableText = out.some((m) => {
+			const c = (m as { content?: unknown }).content;
+			if (!Array.isArray(c)) return false;
+			return c.some((p) => (p as { type?: string; text?: string }).type === "text" && String((p as { text?: string }).text).includes("会话长期记忆"));
+		});
+		expect(stableText).toBe(true);
+
+		// NO overview image block anywhere in the stable region.
+		const overviewLabel = out.some((m) => {
+			const c = (m as { content?: unknown }).content;
+			if (!Array.isArray(c)) return false;
+			return c.some((p) => (p as { type?: string; text?: string }).type === "text" && String((p as { text?: string }).text).includes("稳定全片概览"));
+		});
+		expect(overviewLabel).toBe(false);
+
+		// The overview was never materialized: zero region calls.
+		expect(calls.length).toBe(0);
+	});
+
+	it("still materializes the stable overview when overview_enabled=true (default)", async () => {
+		const { flask, calls } = makeRecordingFlask();
+		const cp = makeOverviewCheckpoint(0);
+		const deps = makeDeps({
+			flask: flask as FlaskClient,
+			settings: resolveTransformSettings({}), // overviewEnabled defaults to true
+			getSessionSnapshot: async () => ({
+				checkpoint: cp,
+				observations: [],
+				pendingSnapshotId: null,
+				messages: [],
+			}),
+			overviewSrcResolver: () => ({ x: 0, y: 0, w: 10000, h: 8000 }),
+		});
+		const assembler = makeRequestAssembler(deps);
+		const out = await assembler([userMsg(["请继续"]) as AgentMessage]);
+
+		// Overview image block present.
+		const hasOverview = out.some((m) => {
+			const c = (m as { content?: unknown }).content;
+			if (!Array.isArray(c)) return false;
+			return c.some((p) => (p as { type?: string }).type === "image");
+		});
+		expect(hasOverview).toBe(true);
+		expect(calls.length).toBe(1);
 	});
 });

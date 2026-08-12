@@ -117,6 +117,7 @@ describe("PreparedRequest (§8.2)", () => {
 			imageContentHashes: [],
 			canonicalPayloadHash: "x",
 			estimatedBytes: 0,
+			visualBudgetOverflowTokens: 0,
 		};
 		expect(hasNoImageRefs(req)).toBe(true);
 	});
@@ -138,6 +139,7 @@ describe("PreparedRequest (§8.2)", () => {
 			imageContentHashes: [],
 			canonicalPayloadHash: "x",
 			estimatedBytes: 0,
+			visualBudgetOverflowTokens: 0,
 		};
 		expect(hasNoImageRefs(req)).toBe(false);
 	});

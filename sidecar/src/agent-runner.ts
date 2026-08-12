@@ -75,7 +75,6 @@ import {
 import {
 	buildPostCompactionCheckpoint,
 	estimateSelectedVisualTokens,
-	visualBudgetOverflowTokensValue,
 	DEFAULT_VISUAL_CONTEXT_BUDGET_TOKENS,
 } from "./compaction.js";
 import {
@@ -99,6 +98,7 @@ import {
 } from "./transform-context.js";
 import {
 	makeRequestAssembler,
+	type AssemblerMetrics,
 	type AssemblerSessionSnapshot,
 } from "./request-assembler.js";
 import {
@@ -155,6 +155,12 @@ export interface RunConfig extends AiEngineConfig {
 	image_derivative_cache_max_mb?: number;
 	image_derivative_cache_ttl?: number;
 	prompt_cache_mode?: string;
+	/**
+	 * Phase 4 §17 risk 2 product switch (default true): when false, the Phase 2b
+	 * assembler omits the stable overview image. Whitelisted by app.py
+	 * `_validate_ai_tuning` and resolved by `resolveTransformSettings`.
+	 */
+	overview_enabled?: boolean;
 }
 
 /** Common run arguments. `config` is required. */
@@ -803,7 +809,12 @@ export class AgentRunner {
 			onFingerprintMismatch: () => {
 				this.invalidateSlideCaches(slide);
 			},
-			cfg: config as unknown as Record<string, unknown>,
+			cfg: {
+				...(config as unknown as Record<string, unknown>),
+				// Snapshot output is capped at the resolved detail tier so live
+				// images cannot exceed the budget estimator's detail square.
+				detail_image_long_edge: transformSettings.detailImageLongEdge,
+			},
 		};
 		const tools = kind === "fork" ? [] : createTools(toolCtx);
 
@@ -868,10 +879,14 @@ export class AgentRunner {
 			return snap;
 		};
 
-		// Phase 2b assembler (replaces the Phase 1 transformContext hook when a
-		// checkpoint exists). The hook signature is identical so pi's agent loop
-		// is unaware of the change. Falls back to the Phase 1 hook when the
-		// session has no checkpoint yet.
+		// Phase 2b assembler (replaces the Phase 1 transformContext hook). The
+		// hook signature is identical so pi's agent loop is unaware of the
+		// change. Internally falls back to the Phase 1 path when the session
+		// has no checkpoint yet — always go through the assembler so metrics
+		// (incl. request-local visual_budget_overflow_tokens) are captured.
+		const lastAssemblerMetrics = { value: null as AssemblerMetrics | null };
+		// Kept only as the StableContextUnavailable safe-fallback (Phase 1
+		// contract: the transform hook MUST NOT throw to pi).
 		const phase1Transform = makeTransformContext({
 			flask: this.flask,
 			slide,
@@ -891,6 +906,9 @@ export class AgentRunner {
 			checkpointEnv,
 			getSessionSnapshot: getSessionSnapshotWithCache,
 			overviewSrcResolver,
+			metricsSink: (m) => {
+				lastAssemblerMetrics.value = m;
+			},
 		});
 
 		// Shared flag for §3.2/§13: the assembler cannot throw out of the
@@ -908,18 +926,13 @@ export class AgentRunner {
 		const lastTransformInput = { value: <AgentMessage[]>[] };
 
 		const transformContext = async (messages: AgentMessage[], signal?: AbortSignal): Promise<AgentMessage[]> => {
+			// Clear request-local metrics before every assembly so a fallback
+			// path (assembler catch / stable-context retry exhausted) cannot
+			// inherit the previous request's overflow into PreparedRequest.
+			lastAssemblerMetrics.value = null;
 			// Record the input so the retry wrapper can re-attempt assembly on
 			// StableContextUnavailable (P1-1).
 			lastTransformInput.value = messages;
-			// The assembler internally falls back to the Phase 1 path when no
-			// checkpoint exists, so this is a single unified entry point.
-			// However, to preserve exact Phase 1 semantics for sessions that
-			// never built a checkpoint (e.g. a fresh fork with no snapshot yet),
-			// we check the cached snapshot: no checkpoint → Phase 1.
-			const snap = await getSessionSnapshotWithCache();
-			if (!snap.checkpoint) {
-				return phase1Transform(messages, signal);
-			}
 			try {
 				return await assemblerTransform(messages, signal);
 			} catch (e) {
@@ -1053,6 +1066,7 @@ export class AgentRunner {
 			stableContextError,
 			lastTransformInput,
 			promptCacheCapabilities,
+			lastAssemblerMetrics,
 		);
 
 		// Run-state machine for event mapping.
@@ -1393,6 +1407,7 @@ export class AgentRunner {
 		stableContextError: { value: StableContextUnavailableError | null },
 		lastTransformInput: { value: AgentMessage[] },
 		promptCacheCapabilities: PromptCacheCapabilities,
+		lastAssemblerMetrics: { value: AssemblerMetrics | null },
 	): (model: unknown, context: unknown, options?: unknown) => AssistantMessageEventStream {
 		const realStreamFn = (this.overrides.streamFn ??
 			// Default: bind the openai-completions streamSimple for the built
@@ -1445,6 +1460,10 @@ export class AgentRunner {
 						systemPrompt: ctxObj?.systemPrompt ?? systemPrompt,
 						tools: ctxObj?.tools ?? tools,
 						messages,
+						// Request-local overflow from the most recent assembly
+						// (never a process-global counter — concurrent sessions
+						// must not clobber each other).
+						visualBudgetOverflowTokens: lastAssemblerMetrics.value?.visual_budget_overflow_tokens ?? 0,
 					});
 					logicalCallId = prepared.logicalCallId;
 				};
@@ -1629,7 +1648,7 @@ export class AgentRunner {
 						// Phase 2b (§12): emit structured metrics for this request.
 						// Best-effort; never fails the request on a metrics error.
 						try {
-							self.emitRequestMetrics(sessionId, config, prepared, finalMessage, stableContextError.value, promptCacheCapabilities);
+							self.emitRequestMetrics(sessionId, config, prepared, finalMessage, stableContextError.value, promptCacheCapabilities, lastAssemblerMetrics.value);
 						} catch {
 							// ignore metrics failures
 						}
@@ -2106,33 +2125,39 @@ export class AgentRunner {
 		finalMessage: AssistantMessage | null,
 		stableError: StableContextUnavailableError | null,
 		promptCacheCapabilities: PromptCacheCapabilities,
+		assemblerMetrics: AssemblerMetrics | null,
 	): void {
 		const usage = finalMessage?.usage as { input?: number; cacheRead?: number; cacheWrite?: number } | undefined;
 		// Phase 3: record the EFFECTIVE mode (post-downgrade), not the config.
 		const promptCacheMode = promptCacheCapabilities.mode;
-		// Image byte counts: approximate from the PreparedRequest's image hashes
-		// (we do not retain the bytes here, so we count the hash list length and
-		// the estimated bytes already on the PreparedRequest).
+		// PreparedRequest byte estimate (retained on the prepared object itself).
 		const preparedBytes = prepared?.estimatedBytes ?? 0;
-		const selectedImages = prepared?.imageContentHashes.length ?? 0;
+		const preparedImages = prepared?.imageContentHashes.length ?? 0;
+		// Phase 4: merge the assembler's per-assembly metrics (image byte split,
+		// eviction list, LRU counters, transform/fetch latency). The assembler
+		// value is request-local (cleared at the start of every assembly), so it
+		// always describes THIS request's most recent assembly — never a stale
+		// or cross-session value. Falls back to the PreparedRequest counts when
+		// the assembler path did not run (e.g. stable-context safe fallback).
+		const asm = assemblerMetrics;
 		const metrics = buildRequestMetrics({
 			session_id: sessionId,
 			checkpoint_generation: prepared?.checkpointGeneration ?? 0,
 			stable_prefix_hash: prepared?.stablePrefixHash ?? "",
 			prompt_cache_mode: promptCacheMode,
-			transform_ms: 0, // populated by the assembler's metrics sink (per-request)
-			region_fetch_ms: 0,
-			selected_images: selectedImages,
-			materialized_images: selectedImages,
-			evicted_image_refs: [],
-			image_lru_hits: 0,
-			image_lru_misses: 0,
-			overview_image_bytes_sent: 0,
-			working_set_image_bytes_sent: 0,
+			transform_ms: asm?.transform_ms ?? 0,
+			region_fetch_ms: asm?.region_fetch_ms ?? 0,
+			selected_images: asm?.selected_images ?? preparedImages,
+			materialized_images: asm?.materialized_images ?? preparedImages,
+			evicted_image_refs: asm?.evicted_image_refs ?? [],
+			image_lru_hits: asm?.image_lru_hits ?? 0,
+			image_lru_misses: asm?.image_lru_misses ?? 0,
+			overview_image_bytes_sent: asm?.overview_image_bytes_sent ?? 0,
+			working_set_image_bytes_sent: asm?.working_set_image_bytes_sent ?? 0,
 			prepared_request_bytes: preparedBytes,
 			compaction_reason: null,
 			checkpoint_rebuild_reason: stableError ? "stable_context_unavailable" : null,
-			visual_budget_overflow_tokens: visualBudgetOverflowTokensValue(),
+			visual_budget_overflow_tokens: prepared?.visualBudgetOverflowTokens ?? 0,
 			usage,
 		});
 		this.metricsSink(metrics);

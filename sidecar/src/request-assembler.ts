@@ -61,6 +61,7 @@ import type { SlideInfo } from "./tools.js";
 import {
 	DEGRADE_TEXT,
 	LEGACY_PLACEHOLDER_TEXT,
+	chooseTargetLongEdge,
 	dropDerivative,
 	materializeDerivativeRaw,
 	overviewDerivativeSpec,
@@ -72,7 +73,7 @@ import {
 	lruMissCount_value,
 	type TransformContextSettings,
 } from "./transform-context.js";
-import { estimateImageRefTokens, enforceVisualTokenBudget, visualBudgetOverflowTokensValue } from "./compaction.js";
+import { estimateImageRefTokens, estimateImagePixelsTokens, enforceVisualTokenBudget } from "./compaction.js";
 import { StableContextUnavailableError } from "./prepared-request.js";
 
 // =========================================================================== //
@@ -151,7 +152,7 @@ export interface AssemblerMetrics {
 	 * Visual-budget overflow tokens (§12, Phase 3.1): > 0 when protected-priority
 	 * semantics (overview/pending never evicted, newest ordinary force-kept)
 	 * forced this request over {@link TransformContextSettings.visualContextBudgetTokens}.
-	 * Reset per request via resetLruCounters at assemble start.
+	 * Captured from the selection result for THIS assembly (request-local).
 	 */
 	visual_budget_overflow_tokens: number;
 }
@@ -196,7 +197,7 @@ export function makeRequestAssembler(deps: RequestAssemblerDeps): (messages: Age
 			// runner's ensureCheckpoint is responsible for creating one; if we
 			// get here we behave exactly like the old transformContext.
 			if (!cp) {
-				const { out, evictedRefIds } = await assembleWithoutCheckpoint(messages, deps, snap, signal, (ms) => {
+				const { out, evictedRefIds, overflowTokens } = await assembleWithoutCheckpoint(messages, deps, snap, signal, (ms) => {
 					regionFetchMs += ms;
 				});
 				emitMetrics(deps, snap, cp, {
@@ -215,7 +216,7 @@ export function makeRequestAssembler(deps: RequestAssemblerDeps): (messages: Age
 					derivative_hash_mismatch: 0,
 					checkpoint_rebuild_reason: null,
 					overview_status: "no-overview",
-					visual_budget_overflow_tokens: visualBudgetOverflowTokensValue(),
+					visual_budget_overflow_tokens: overflowTokens,
 				});
 				return out;
 			}
@@ -227,7 +228,17 @@ export function makeRequestAssembler(deps: RequestAssemblerDeps): (messages: Age
 			const staleReason = checkpointStale(cp, deps.checkpointEnv);
 
 			// Verify + materialize the stable overview (§10/§13).
-			const overviewResult = await materializeStableOverview(cp, deps, signal);
+			//
+			// Phase 4 §17 risk 2 product switch: when the resolved settings carry
+			// overviewEnabled=false, the stable region is assembled WITHOUT the
+			// overview image. We short-circuit to a no-overview result so NO region
+			// fetch happens for the overview (overview_image_bytes_sent stays 0) and
+			// overview_status is reported as "no-overview". The stable TEXT block
+			// (summary + annotation index) is still emitted intact below. The arm
+			// identity already records the effective flag, so no new metric field.
+			const overviewResult = deps.settings.overviewEnabled
+				? await materializeStableOverview(cp, deps, signal)
+				: { image: null, overviewRefId: null, imageBytes: 0, hashMismatchCount: 0, regionFetchMs: 0, status: "no-overview" as const };
 			regionFetchMs += overviewResult.regionFetchMs;
 
 			// A checkpoint "covers" a message when its session_message_seq <=
@@ -305,7 +316,7 @@ export function makeRequestAssembler(deps: RequestAssemblerDeps): (messages: Age
 				derivative_hash_mismatch: overviewResult.hashMismatchCount,
 				checkpoint_rebuild_reason: staleReason,
 				overview_status: overviewResult.status,
-				visual_budget_overflow_tokens: visualBudgetOverflowTokensValue(),
+				visual_budget_overflow_tokens: recentSlice.overflowTokens,
 			});
 
 			return clean;
@@ -645,9 +656,9 @@ function messageSeq(m: PersistedAgentMessage | undefined): number | undefined {
  *   - pending snapshot is always kept;
  *   - the last N non-overview refs are kept (N = settings.keepRecentImages);
  *   - the §9.1 visual token budget is enforced as a HARD cap: after the recency
- *     KEEP pass, the oldest ordinary kept image_refs are evicted until the
- *     estimated selected visual tokens <= visualContextBudgetTokens. Overview
- *     and pending positions are NOT budget-evictable (§9.1);
+ *     KEEP pass, ordinary kept images are reduced to a contiguous newest suffix
+ *     until the estimated selected visual tokens <= visualContextBudgetTokens.
+ *     Overview and pending positions are NOT budget-evictable (§9.1);
  *   - evicted refs use {@link richHistoryForRef} with the observations index.
  *
  * Returns both the rebuilt messages AND the explicit list of evicted ref_ids
@@ -663,7 +674,7 @@ async function transformRecentSlice(args: {
 	observationsIndex: Map<string, { summary: string }[]>;
 	signal?: AbortSignal;
 	onRegionFetchMs: (ms: number) => void;
-}): Promise<{ messages: AgentMessage[]; evictedRefIds: string[] }> {
+}): Promise<{ messages: AgentMessage[]; evictedRefIds: string[]; overflowTokens: number }> {
 	const { messages, deps, overviewRefId, pendingSnapshotId, observations, observationsIndex, signal } = args;
 	const settings = deps.settings;
 	const slideInfo = deps.slideInfo;
@@ -680,6 +691,9 @@ async function transformRecentSlice(args: {
 		pending: boolean;
 		kind: "ref" | "image";
 		ref?: ImageRefContent;
+		liveSrc?: { x: number; y: number; w: number; h: number };
+		livePixels?: { w: number; h: number };
+		liveFingerprint?: string;
 	};
 	const positions: Pos[] = [];
 	const firstId = deps.firstSnapshotToolCallIdRef.value;
@@ -701,7 +715,17 @@ async function transformRecentSlice(args: {
 				// toolResult's toolCallId (mirrors Phase 1 isOverviewLiveImage).
 				const isOverviewLive = role === "toolResult" && firstId !== null && toolCallId === firstId;
 				const isPendingLive = role === "toolResult" && pendingSnapshotId !== null && toolCallId === pendingSnapshotId;
-				positions.push({ msgIdx, blkIdx, overview: isOverviewLive, pending: isPendingLive, kind: "image" });
+				const liveMeta = liveImageMetaFromToolResult(m);
+				positions.push({
+					msgIdx,
+					blkIdx,
+					overview: isOverviewLive,
+					pending: isPendingLive,
+					kind: "image",
+					liveSrc: liveMeta?.src,
+					livePixels: liveMeta?.pixels,
+					liveFingerprint: liveMeta?.fingerprint,
+				});
 			}
 		}
 	}
@@ -736,29 +760,35 @@ async function transformRecentSlice(args: {
 	}
 
 	// Phase 2b (§9.1 / P2-3): enforce the visual token budget as a HARD cap.
-	// The fixed overview (when present) counts toward the budget; ordinary
-	// recent images are evicted oldest-first until the estimate fits the budget
-	// or only non-evictable positions remain. Overview and pending positions are
-	// NEVER budget-evicted (§9.1). P2-6: every budget-evicted ref contributes to
-	// `evictedRefIds` so the §12 metric stays accurate.
-	const budgetEvictedKeys = enforceVisualBudget(keepKeys, positions, ordinary, keepFrom, settings, overviewRefId);
+	// Ordinary recent images are reduced to a contiguous newest suffix until the
+	// estimate fits. Overview and pending positions are NEVER budget-evicted.
+	const budgetSel = enforceVisualBudget(keepKeys, positions, ordinary, keepFrom, settings, overviewRefId);
+	const budgetEvictedKeys = budgetSel.evictedKeys;
 
-	// Phase 3: materialize KEEP refs (concurrency cap, signal-aware). Reuse the
-	// exported derivative pipeline. Detail tier = newest kept ordinary + pending.
+	// Phase 3: materialize KEEP refs + normalize oversized KEEP live images.
+	// Detail tier = newest kept ordinary + pending.
 	const keptOrdinary = ordinary
 		.slice(keepFrom)
 		.filter((p) => !budgetEvictedKeys.has(`${p.msgIdx}:${p.blkIdx}`));
 	const newestKeptOrdinaryKey = keptOrdinary.length > 0
 		? `${keptOrdinary[keptOrdinary.length - 1]!.msgIdx}:${keptOrdinary[keptOrdinary.length - 1]!.blkIdx}`
 		: null;
-	const toMaterialize = positions.filter((p) => p.kind === "ref" && !p.overview && keepKeys.has(`${p.msgIdx}:${p.blkIdx}`));
+	const toMaterialize = positions.filter((p) => keepKeys.has(`${p.msgIdx}:${p.blkIdx}`) && (p.kind === "ref" || p.kind === "image"));
 	const materialized = new Map<string, ImageContent | { type: "text"; text: string }>();
 	const tFetchStart = Date.now();
 	await mapPool(toMaterialize, settings.regionConcurrency, async (p) => {
 		const key = `${p.msgIdx}:${p.blkIdx}`;
 		const isDetail = p.pending || key === newestKeptOrdinaryKey;
-		const block = await materializeRefRich(p.ref!, deps.flask, deps.slide, slideInfo, settings, isDetail, signal);
-		materialized.set(key, block);
+		if (p.kind === "ref" && p.ref) {
+			const block = await materializeRefRich(p.ref, deps.flask, deps.slide, slideInfo, settings, isDetail, signal);
+			materialized.set(key, block);
+			return;
+		}
+		// Overview / detail / working tiers must match budget charging below
+		// (kept live overview without a stable region uses overviewLongEdge).
+		const targetLongEdge = chooseTargetLongEdge(settings, p.overview, isDetail);
+		const normalized = await normalizeLiveImageBlock(p, deps.flask, deps.slide, slideInfo, settings, targetLongEdge, signal);
+		if (normalized) materialized.set(key, normalized);
 	}, signal);
 	args.onRegionFetchMs(Date.now() - tFetchStart);
 
@@ -795,13 +825,18 @@ async function transformRecentSlice(args: {
 					touched = true;
 					return { type: "text", text: LEGACY_PLACEHOLDER_TEXT };
 				}
+				const normalized = materialized.get(key);
+				if (normalized) {
+					touched = true;
+					return normalized;
+				}
 				return part;
 			}
 			return part;
 		});
 		return touched ? ({ ...(m as object), content: newContent } as AgentMessage) : (m as AgentMessage);
 	});
-	return { messages: rebuilt, evictedRefIds };
+	return { messages: rebuilt, evictedRefIds, overflowTokens: budgetSel.overflowTokens };
 }
 
 /**
@@ -813,35 +848,52 @@ async function transformRecentSlice(args: {
  * for a square image).
  *
  * Returns the set of `${msgIdx}:${blkIdx}` keys that were removed from
- * `keepKeys` (mutated in place). Overview and pending positions are never
- * evicted (§9.1); any protected-priority overflow is recorded by the shared
- * helper (§12 `visual_budget_overflow_tokens`).
+ * `keepKeys` (mutated in place) plus the request-local overflowTokens. Overview
+ * and pending positions are never evicted (§9.1).
  */
 function enforceVisualBudget(
 	keepKeys: Set<string>,
-	positions: Array<{ msgIdx: number; blkIdx: number; overview: boolean; pending: boolean; kind: "ref" | "image"; ref?: ImageRefContent }>,
-	ordinary: Array<{ msgIdx: number; blkIdx: number; kind: "ref" | "image"; ref?: ImageRefContent }>,
+	positions: Array<{
+		msgIdx: number;
+		blkIdx: number;
+		overview: boolean;
+		pending: boolean;
+		kind: "ref" | "image";
+		ref?: ImageRefContent;
+		liveSrc?: { x: number; y: number; w: number; h: number };
+		livePixels?: { w: number; h: number };
+	}>,
+	ordinary: Array<{
+		msgIdx: number;
+		blkIdx: number;
+		kind: "ref" | "image";
+		ref?: ImageRefContent;
+		liveSrc?: { x: number; y: number; w: number; h: number };
+		livePixels?: { w: number; h: number };
+	}>,
 	keepFrom: number,
 	settings: TransformContextSettings,
 	overviewRefId: string | null,
-): Set<string> {
+): { evictedKeys: Set<string>; overflowTokens: number } {
 	const budget = settings.visualContextBudgetTokens;
-	if (!(Number.isFinite(budget) && budget > 0)) return new Set();
+	if (!(Number.isFinite(budget) && budget > 0)) return { evictedKeys: new Set(), overflowTokens: 0 };
 
 	// Estimate the non-evictable baseline (overview + pending kept positions).
-	// Overview in the recent slice is always text-ified (not kept), so the only
-	// overview cost to account for is the stable-region overview image.
+	//   - stable-region overview (overviewRefId set) → charge overviewLongEdge;
+	//   - kept live overview when there is NO stable overview → overview tier;
+	//   - pending → detail tier;
+	//   - overview+pending (default first unreviewed snapshot) → overview wins,
+	//     matching chooseTargetLongEdge / materialization (Phase 1 parity).
 	let baseline = 0;
 	if (overviewRefId !== null) {
 		baseline += estimateImageRefTokens({ w: settings.overviewLongEdge, h: settings.overviewLongEdge }, settings.overviewLongEdge);
 	}
-	// Pending live images and pending refs are non-evictable and count toward
-	// the baseline at the DETAIL tier (they are materialized as detail).
 	for (const p of positions) {
 		const key = `${p.msgIdx}:${p.blkIdx}`;
 		if (!keepKeys.has(key)) continue;
-		if (p.pending) {
-			baseline += estimatePosTokens(p, settings, true);
+		const isLiveOverview = p.overview && overviewRefId === null;
+		if (isLiveOverview || p.pending) {
+			baseline += estimatePosTokens(p, settings, p.pending, isLiveOverview);
 		}
 	}
 	const keptOrdinary = ordinary.slice(keepFrom); // oldest → newest
@@ -855,29 +907,139 @@ function enforceVisualBudget(
 		}),
 	});
 	for (const key of sel.evictedKeys) keepKeys.delete(key);
-	return sel.evictedKeys;
+	return { evictedKeys: sel.evictedKeys, overflowTokens: sel.overflowTokens };
 }
 
 /**
  * Estimate the visual token cost of one position at its FINAL materialization
  * tier (§9.1).
+ *   - overview (kept live overview, no stable region) → overview tier
+ *     (wins over pending when both apply — same as chooseTargetLongEdge);
  *   - `isDetail` (pending snapshot OR the newest kept ordinary) → detail tier;
  *   - otherwise → working tier;
- *   - kept image_ref → its src bbox at that tier (server-upscale aware);
- *   - live `image` block → no src available, estimate as a square at the tier.
+ *   - kept image_ref / live with src → bbox at that tier (rematerialize path);
+ *   - live with only pixels within tier → as-sent pixels;
+ *   - live oversized without src → 0 (normalize will text-degrade; do NOT bill
+ *     a rematerialized size we cannot produce);
+ *   - live with neither src nor pixels → 0 (normalize text-degrades unknown
+ *     size; never bill a target-tier square while sending arbitrary bytes).
  */
 function estimatePosTokens(
-	p: { kind: "ref" | "image"; pending?: boolean; ref?: ImageRefContent },
+	p: {
+		kind: "ref" | "image";
+		pending?: boolean;
+		ref?: ImageRefContent;
+		liveSrc?: { x: number; y: number; w: number; h: number };
+		livePixels?: { w: number; h: number };
+	},
 	settings: TransformContextSettings,
 	isDetail: boolean,
+	isOverview = false,
 ): number {
-	const targetLongEdge = isDetail ? settings.detailImageLongEdge : settings.workingImageLongEdge;
+	const targetLongEdge = chooseTargetLongEdge(settings, isOverview, isDetail);
 	if (p.kind === "ref" && p.ref) {
 		const src = p.ref.src || { x: 0, y: 0, w: 0, h: 0 };
 		return estimateImageRefTokens({ w: src.w, h: src.h }, targetLongEdge);
 	}
-	// Live image: no src on the block → estimate a square at the target tier.
-	return estimateImageRefTokens({ w: targetLongEdge, h: targetLongEdge }, targetLongEdge);
+	const hasSrc = !!(p.liveSrc && p.liveSrc.w > 0 && p.liveSrc.h > 0);
+	if (hasSrc) {
+		return estimateImageRefTokens({ w: p.liveSrc!.w, h: p.liveSrc!.h }, targetLongEdge);
+	}
+	if (p.livePixels) {
+		const le = Math.max(p.livePixels.w, p.livePixels.h);
+		if (le <= targetLongEdge) return estimateImagePixelsTokens(p.livePixels.w, p.livePixels.h);
+		// Oversized, no rematerialize src → text degrade (0 visual tokens).
+		return 0;
+	}
+	// No size metadata at all → text degrade (0 visual tokens).
+	return 0;
+}
+
+function liveImageMetaFromToolResult(msg: unknown): {
+	src?: { x: number; y: number; w: number; h: number };
+	pixels?: { w: number; h: number };
+	fingerprint?: string;
+} | null {
+	const details = (msg as {
+		details?: {
+			src?: { x: number; y: number; w: number; h: number };
+			width?: number;
+			height?: number;
+			slide_fingerprint?: string;
+		};
+	}).details;
+	if (!details) return null;
+	const src = details.src && details.src.w > 0 && details.src.h > 0 ? details.src : undefined;
+	const w = Number(details.width);
+	const h = Number(details.height);
+	const pixels = Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0 ? { w: Math.floor(w), h: Math.floor(h) } : undefined;
+	const fingerprint = typeof details.slide_fingerprint === "string" ? details.slide_fingerprint : undefined;
+	if (!src && !pixels) return null;
+	return { src, pixels, fingerprint };
+}
+
+/**
+ * Normalize an oversized KEEP live image to `targetLongEdge`.
+ *
+ * Returns rematerialized image bytes, {@link DEGRADE_TEXT} on fingerprint
+ * mismatch / rematerialize failure / missing-or-oversized-without-src, or
+ * `null` when the original live bytes are already within tier (rebuild keeps
+ * them). Never silently retains unknown-size or oversized bytes after the
+ * budget assumed a controlled tier.
+ */
+async function normalizeLiveImageBlock(
+	p: {
+		liveSrc?: { x: number; y: number; w: number; h: number };
+		livePixels?: { w: number; h: number };
+		liveFingerprint?: string;
+	},
+	flask: FlaskClient,
+	slide: string,
+	slideInfo: SlideInfo,
+	settings: TransformContextSettings,
+	targetLongEdge: number,
+	signal?: AbortSignal,
+): Promise<ImageContent | { type: "text"; text: string } | null> {
+	const liveFp = p.liveFingerprint || "";
+	const slideFp = slideInfo.fingerprint || "";
+	if (liveFp && liveFp !== slideFp) {
+		return { type: "text", text: DEGRADE_TEXT };
+	}
+	const pixels = p.livePixels;
+	const actualLe = pixels ? Math.max(pixels.w, pixels.h) : Number.POSITIVE_INFINITY;
+	const src = p.liveSrc;
+	const hasSrc = !!(src && src.w > 0 && src.h > 0);
+	if (!hasSrc) {
+		// No rematerialize bbox. Keep only when pixels are known AND within
+		// tier; unknown size (Infinity) or oversized → text degrade. (Do not
+		// use Number.isFinite(actualLe): missing pixels yield Infinity and
+		// would otherwise fall through to keeping arbitrary bytes.)
+		if (pixels && actualLe <= targetLongEdge) return null;
+		return { type: "text", text: DEGRADE_TEXT };
+	}
+	if (Number.isFinite(actualLe) && actualLe <= targetLongEdge) return null;
+	const fp = liveFp || slideFp;
+	const spec = overviewDerivativeSpec({
+		slide,
+		fingerprint: fp,
+		src: src!,
+		targetLongEdge,
+		jpegQuality: settings.jpegQuality,
+		overlayVersion: settings.overlayVersion,
+	});
+	try {
+		const r = await materializeDerivativeRaw({
+			flask,
+			slide,
+			slideInfo,
+			spec,
+			expectedFingerprint: fp || undefined,
+			signal,
+		});
+		return { type: "image", data: r.data, mimeType: r.mime };
+	} catch {
+		return { type: "text", text: DEGRADE_TEXT };
+	}
 }
 
 /**
@@ -969,7 +1131,7 @@ async function assembleWithoutCheckpoint(
 	snap: AssemblerSessionSnapshot,
 	signal: AbortSignal | undefined,
 	onRegionFetchMs: (ms: number) => void,
-): Promise<{ out: AgentMessage[]; evictedRefIds: string[] }> {
+): Promise<{ out: AgentMessage[]; evictedRefIds: string[]; overflowTokens: number }> {
 	// Reuse the recent-slice transform with an empty observations index and no
 	// overview ref. The "recent slice" here is the full message list (no
 	// checkpoint boundary to cut at). Region-fetch time is reported via the
@@ -989,6 +1151,7 @@ async function assembleWithoutCheckpoint(
 	return {
 		out: stripContextMeta(res.messages as PersistedAgentMessage[]) as AgentMessage[],
 		evictedRefIds: res.evictedRefIds,
+		overflowTokens: res.overflowTokens,
 	};
 }
 

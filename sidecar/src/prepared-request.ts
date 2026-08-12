@@ -102,6 +102,12 @@ export interface PreparedRequest {
 	imageContentHashes: string[];
 	canonicalPayloadHash: string;
 	estimatedBytes: number;
+	/**
+	 * Visual-budget overflow tokens from the assembly that produced this
+	 * request (§12). Request-local: captured at assemble time so concurrent
+	 * sessions cannot clobber each other's overflow metric.
+	 */
+	visualBudgetOverflowTokens: number;
 }
 
 // =========================================================================== //
@@ -132,6 +138,8 @@ export function buildPreparedRequest(args: {
 	systemPrompt?: string;
 	tools?: unknown[];
 	messages: PersistedAgentMessage[] | AgentMessage[];
+	/** Overflow tokens from this assembly; defaults to 0 when omitted. */
+	visualBudgetOverflowTokens?: number;
 }): PreparedRequest {
 	const cleanMessages = stripContextMeta(args.messages as PersistedAgentMessage[]) as AgentMessage[];
 	const imageHashes = collectImageContentHashes(cleanMessages);
@@ -160,6 +168,7 @@ export function buildPreparedRequest(args: {
 		imageContentHashes: imageHashes,
 		canonicalPayloadHash,
 		estimatedBytes,
+		visualBudgetOverflowTokens: Math.max(0, Math.floor(args.visualBudgetOverflowTokens ?? 0)),
 	};
 }
 

@@ -282,6 +282,18 @@ export function estimateImageRefTokens(src: { w: number; h: number }, targetLong
 }
 
 /**
+ * Estimate visual tokens from already-rendered pixel dimensions (live images).
+ * Unlike {@link estimateImageRefTokens}, this does NOT upscale — it bills the
+ * bytes that will actually be sent if the image is not rematerialized.
+ */
+export function estimateImagePixelsTokens(w: number, h: number): number {
+	if (!(w > 0) || !(h > 0)) return 0;
+	const ow = Math.max(1, Math.min(4096, Math.floor(w)));
+	const oh = Math.max(1, Math.min(4096, Math.floor(h)));
+	return Math.ceil((ow * oh) / PIXELS_PER_VISUAL_TOKEN);
+}
+
+/**
  * Estimate the visual token cost of the selected visual working set (§9.1).
  *
  * The caller passes the candidate selected image refs (after the Phase 1
@@ -338,7 +350,7 @@ export interface VisualBudgetSelection {
  * do not fork this logic (Phase 3.1 review: the two implementations had already
  * diverged once).
  *
- * Semantics:
+ * Semantics (strict newest contiguous slice / oldest-first eviction):
  *   - `baselineTokens` covers protected, non-evictable images (overview +
  *     pending) at their FINAL tiers;
  *   - `ordinary` is the recency-kept ordinary images OLDEST → NEWEST, each
@@ -346,11 +358,15 @@ export interface VisualBudgetSelection {
  *     materialized at the detail tier, so it must be charged at the detail
  *     tier — charging it at the working tier under-counts a 1280px image as
  *     768px, ~1398 tokens short for a square);
- *   - eviction walks NEWEST → OLDEST keeping while it fits, so the oldest
- *     images are evicted first (§7.1 recency);
+ *   - walk NEWEST → OLDEST keeping while it fits; on the FIRST image that does
+ *     not fit, evict that image AND every older ordinary image. The survivors
+ *     are always a contiguous newest suffix (never "oldest cheap + newest" with
+ *     a middle gap);
  *   - if even the single newest ordinary image does not fit, it is STILL kept
  *     (a request with zero current evidence is worse than an over-budget one)
- *     and the excess is reported via `overflowTokens`;
+ *     and the excess is reported via `overflowTokens` on the RETURN VALUE
+ *     (callers must store this on PreparedRequest / request-local metrics —
+ *     there is no process-global overflow counter);
  *   - a baseline that alone exceeds the budget is likewise reported as
  *     overflow (protected images are never evicted).
  */
@@ -366,54 +382,34 @@ export function enforceVisualTokenBudget(args: {
 		return { evictedKeys, selectedTokens: selected, overflowTokens: 0 };
 	}
 
-	// Walk newest → oldest, keeping while the running total fits.
+	// Walk newest → oldest, keeping a contiguous newest suffix while it fits.
 	let running = baselineTokens;
-	const kept: string[] = [];
 	for (let i = ordinary.length - 1; i >= 0; i--) {
 		const o = ordinary[i]!;
 		if (running + o.tokens <= budgetTokens) {
 			running += o.tokens;
-			kept.push(o.key);
 			continue;
 		}
 		// If NOTHING ordinary has been kept yet, force-keep the single newest
 		// image anyway (current-evidence floor) and count the excess as overflow.
-		if (kept.length === 0 && i === ordinary.length - 1) {
+		if (i === ordinary.length - 1) {
 			running += o.tokens;
-			kept.push(o.key);
-			continue;
+			// Evict every older ordinary — the newest alone already overflows.
+			for (let j = i - 1; j >= 0; j--) {
+				evictedKeys.add(ordinary[j]!.key);
+			}
+			break;
 		}
-		evictedKeys.add(o.key);
+		// First non-fitting older image: drop it and the entire older prefix
+		// so the kept set stays a contiguous newest slice (§7.1 recency).
+		for (let j = i; j >= 0; j--) {
+			evictedKeys.add(ordinary[j]!.key);
+		}
+		break;
 	}
 
 	const overflow = Math.max(0, running - budgetTokens);
-	if (overflow > 0) recordVisualBudgetOverflow(overflow);
 	return { evictedKeys, selectedTokens: running, overflowTokens: overflow };
-}
-
-// --------------------------------------------------------------------------- //
-// Budget overflow observability (§12, Phase 3.1)
-// --------------------------------------------------------------------------- //
-
-/**
- * Process-level counter of visual-budget overflow tokens (§12). Incremented by
- * {@link enforceVisualTokenBudget} whenever the protected-priority semantics
- * force a request over budget. Reset per request alongside the LRU counters
- * (transform-context resetLruCounters). Best-effort: concurrent sessions share
- * the counter (same accepted race as the LRU counters, §12.1).
- */
-let visualBudgetOverflowTokens = 0;
-
-export function recordVisualBudgetOverflow(tokens: number): void {
-	if (tokens > 0) visualBudgetOverflowTokens += tokens;
-}
-
-export function visualBudgetOverflowTokensValue(): number {
-	return visualBudgetOverflowTokens;
-}
-
-export function resetVisualBudgetOverflow(): void {
-	visualBudgetOverflowTokens = 0;
 }
 
 /**

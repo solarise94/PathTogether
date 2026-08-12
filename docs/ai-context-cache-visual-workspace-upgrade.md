@@ -664,6 +664,16 @@ checkpoint_turn_lifetime
 >
 > 在 §14 Phase 3 的 `prompt_cache_key` 真实 CPA 网关验证前，缓存命中率数字不作正式结论。
 >
+> **EXP-VISCTX-v1 Step 1 初步结果（2026-08-13，gpt-5.6-luna + explicit cache，21 cells 全跑通、0 cell 错误）**：
+>
+> | arm | reqs | input μ/req | 概览字节∑ | 工作区字节/req | 机器 rubric |
+> | --- | ---: | ---: | ---: | ---: | --- |
+> | step1-overview-1024 | 89 | 2,549 | 1,625,712 | 786k | 3 FAIL / 4 PENDING |
+> | step1-overview-768 | 115 | 2,339 | 1,567,241 | 660k | 2 FAIL / 5 PENDING |
+> | step1-overview-none | 120 | 2,756 | 0 | 843k | 2 FAIL / 5 PENDING |
+>
+> 初步结论：**768 概览胜出**——input 均值最低、工作区字节/请求最低、机器 FAIL 最少；无概览对照组成本反而最高（失去概览后模型反复 snapshot 探索，input 与工作区字节双升），印证概览的语义价值。样本为单轮 21 cells（真实模型非确定性），列为初步结论；Step 2 以 `step1-overview-768` 为固定图像策略继续。
+>
 > **CPA gemini 兼容路径验证实录（2026-08-12，`sidecar/experiments/smoke-gemini.ts`）**：
 > - CPA 网关 gemini 兼容端点（`/v1beta`，模型 `gemini-3.6-flash-high`）文本与图片请求均正常，`usageMetadata` 完整透传（含 `thoughtsTokenCount`）。
 > - sidecar 新增 `api_protocol: "gemini"`（pi `google-generative-ai` provider）并端到端跑通真实 AgentRunner run：goto/snapshot/mark_observation/complete_snapshot_review/finish 工具链、快照图片经 assembler 物化进入请求（`working_set_image_bytes_sent` > 0）、usage 落指标。

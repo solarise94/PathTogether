@@ -28,9 +28,12 @@ import {
 	buildRunConfig,
 	flattenTranscript,
 	RunnerArgumentError,
+	CpaApiKeyMissingError,
 	type FixtureEnv,
 	type RunOptions,
+	type RunnerDeps,
 } from "../experiments/src/run.js";
+import { makeFakeStreamFn } from "../experiments/src/fake-stream.js";
 import { DataCollectionGateError } from "../experiments/src/gate.js";
 
 // ------------------------------------------------------------------------- //
@@ -193,12 +196,20 @@ function baseOpts(setup: Setup, overrides: Partial<RunOptions> = {}): RunOptions
 }
 
 beforeEach(() => {
-	// Ensure no stale gate env leaks between tests.
+	// Ensure no stale gate / CPA env leaks between tests.
 	delete process.env.PHASE4_CPA_VERIFIED;
+	delete process.env.CPA_API_KEY;
+	delete process.env.CPA_BASE_URL;
+	delete process.env.CPA_MODEL;
+	delete process.env.CPA_API_PROTOCOL;
 });
 
 afterEach(() => {
 	delete process.env.PHASE4_CPA_VERIFIED;
+	delete process.env.CPA_API_KEY;
+	delete process.env.CPA_BASE_URL;
+	delete process.env.CPA_MODEL;
+	delete process.env.CPA_API_PROTOCOL;
 });
 
 // =========================================================================== //
@@ -307,8 +318,8 @@ describe("experiments runner — gate + argument validation", () => {
 		).rejects.toBeInstanceOf(DataCollectionGateError);
 		expect(acquireCalled).toBe(false);
 
-		// With the env set, the gate passes but real-model is unimplemented →
-		// the Wave-2 not-implemented error fires (also before acquireEnv).
+		// With the gate env set BUT no CPA_API_KEY, real-model now fails loudly
+		// on the missing key (also before acquireEnv) — no embedded fallback key.
 		process.env.PHASE4_CPA_VERIFIED = "1";
 		let acquireCalled2 = false;
 		await expect(
@@ -318,7 +329,7 @@ describe("experiments runner — gate + argument validation", () => {
 					return mockAcquireEnv()({} as never);
 				},
 			}),
-		).rejects.toThrow(/Wave 2/);
+		).rejects.toBeInstanceOf(CpaApiKeyMissingError);
 		expect(acquireCalled2).toBe(false);
 	});
 
@@ -372,5 +383,157 @@ describe("experiments runner — arm overrides reach transform settings", () => 
 		for (const r of result.rows) {
 			expect(r.overview_image_bytes_sent).toBe(0);
 		}
+	}, 60_000);
+});
+
+// =========================================================================== //
+// Real-model mode (Wave 2: real provider data collection)
+// =========================================================================== //
+
+/**
+ * A stubbed "real" streamFn injected via RunnerDeps.realStreamFnFactory. In
+ * production this seam is unset and the AgentRunner uses its built-in default
+ * provider; here we substitute a fake that emits a finish tool call so the
+ * cell completes without hitting the real CPA gateway.
+ */
+function stubRealStreamDeps(scriptTask: Task): Pick<RunnerDeps, "realStreamFnFactory"> {
+	// The factory returns a fresh streamFn per cell; we feed the task's own
+	// model_script as a stand-in for the real model's turns.
+	return {
+		realStreamFnFactory: () => {
+			const { fn } = makeFakeStreamFn(scriptTask.model_script);
+			return fn as never;
+		},
+	};
+}
+
+describe("experiments runner — real-model mode", () => {
+	it("drives real user_turns through the injected real stream + records cpa_model/base_url (no key) in run.json", async () => {
+		process.env.PHASE4_CPA_VERIFIED = "1";
+		process.env.CPA_API_KEY = "sk-test-key-1234567890";
+		const setup_ = await setup([finishOnlyTask()], [step1Arm("s1-real")]);
+		// Fix the arm to use explicit cache mode (the cache experiment default).
+		const deps: RunnerDeps = {
+			acquireEnv: mockAcquireEnv(),
+			...stubRealStreamDeps(finishOnlyTask()),
+		};
+		const result = await runExperiment(baseOpts(setup_, { mode: "real-model" }), deps);
+		expect(result.mode).toBe("real-model");
+		expect(result.rows.length).toBeGreaterThanOrEqual(1);
+		expect(result.cpaModel).toBe("gpt-5.6-luna");
+		expect(result.cpaBaseUrl).toBe("http://198.51.100.10:46450/v1");
+		expect(result.cellErrors).toEqual([]);
+
+		// run.json carries cpa_model + cpa_base_url but NEVER the api key.
+		const runMeta = JSON.parse(await fs.readFile(join(setup_.outDir, "run.json"), "utf8")) as Record<string, unknown>;
+		expect(runMeta.cpa_model).toBe("gpt-5.6-luna");
+		expect(runMeta.cpa_base_url).toBe("http://198.51.100.10:46450/v1");
+		expect(runMeta.cell_errors).toEqual([]);
+		const runJsonText = await fs.readFile(join(setup_.outDir, "run.json"), "utf8");
+		expect(runJsonText).not.toContain("sk-test-key");
+	}, 60_000);
+
+	it("missing CPA_API_KEY throws CpaApiKeyMissingError before acquireEnv (no embedded fallback key)", async () => {
+		process.env.PHASE4_CPA_VERIFIED = "1";
+		delete process.env.CPA_API_KEY;
+		const setup_ = await setup([finishOnlyTask()], [step1Arm("s1-a")]);
+		let acquireCalled = false;
+		await expect(
+			runExperiment(baseOpts(setup_, { mode: "real-model" }), {
+				acquireEnv: async () => {
+					acquireCalled = true;
+					return mockAcquireEnv()({} as never);
+				},
+			}),
+		).rejects.toBeInstanceOf(CpaApiKeyMissingError);
+		expect(acquireCalled).toBe(false);
+	});
+
+	it("env overrides for CPA_BASE_URL / CPA_MODEL propagate into the run config", async () => {
+		process.env.PHASE4_CPA_VERIFIED = "1";
+		process.env.CPA_API_KEY = "sk-override-key-xxxxxxxx";
+		process.env.CPA_BASE_URL = "http://override.example/v1";
+		process.env.CPA_MODEL = "override-model-name";
+		const setup_ = await setup([finishOnlyTask()], [step1Arm("s1-real")]);
+		const deps: RunnerDeps = {
+			acquireEnv: mockAcquireEnv(),
+			...stubRealStreamDeps(finishOnlyTask()),
+		};
+		const result = await runExperiment(baseOpts(setup_, { mode: "real-model" }), deps);
+		expect(result.cpaModel).toBe("override-model-name");
+		expect(result.cpaBaseUrl).toBe("http://override.example/v1");
+		const runMeta = JSON.parse(await fs.readFile(join(setup_.outDir, "run.json"), "utf8")) as Record<string, unknown>;
+		expect(runMeta.cpa_model).toBe("override-model-name");
+		expect(runMeta.cpa_base_url).toBe("http://override.example/v1");
+	}, 60_000);
+});
+
+describe("experiments runner — dry-run", () => {
+	it("prints the resolved matrix + redacted config without executing or acquiring the env", async () => {
+		process.env.PHASE4_CPA_VERIFIED = "1";
+		process.env.CPA_API_KEY = "sk-secret-key-abcdef";
+		const setup_ = await setup([finishOnlyTask()], [step1Arm("s1-dry")]);
+
+		let acquireCalled = false;
+		const logSpy: string[] = [];
+		const origLog = console.log;
+		console.log = (...a: unknown[]) => { logSpy.push(a.map(String).join(" ")); };
+		try {
+			const result = await runExperiment(baseOpts(setup_, { mode: "real-model", dryRun: true }), {
+				acquireEnv: async () => {
+					acquireCalled = true;
+					return mockAcquireEnv()({} as never);
+				},
+			});
+			expect(acquireCalled).toBe(false);
+			expect(result.rows).toEqual([]);
+			expect(result.rubricOutcomes).toEqual([]);
+			expect(result.cpaModel).toBe("gpt-5.6-luna");
+		} finally {
+			console.log = origLog;
+		}
+
+		// The dry-run banner was printed and the key is REDACTED (never full).
+		const combined = logSpy.join("\n");
+		expect(combined).toContain("dry-run");
+		expect(combined).toContain("gpt-5.6-luna");
+		// The full secret must NEVER appear; redactKey keeps first 3 + last 2 chars
+		// plus the length, so "secret" (the middle) must be absent.
+		expect(combined).not.toContain("sk-secret-key-abcdef");
+		expect(combined).not.toContain("secret");
+		expect(combined).toContain("(20 chars)");
+
+		// No output files were written (dry-run returns before writeOutputs).
+		const files = await fs.readdir(setup_.outDir).catch(() => [] as string[]);
+		expect(files).toEqual([]);
+	}, 30_000);
+
+	it("dry-run in scripted mode prints the matrix without CPA config", async () => {
+		const setup_ = await setup([finishOnlyTask()], [step1Arm("s1-dry-scripted")]);
+		const logSpy: string[] = [];
+		const origLog = console.log;
+		console.log = (...a: unknown[]) => { logSpy.push(a.map(String).join(" ")); };
+		try {
+			await runExperiment(baseOpts(setup_, { dryRun: true }), { acquireEnv: mockAcquireEnv() });
+		} finally {
+			console.log = origLog;
+		}
+		const combined = logSpy.join("\n");
+		expect(combined).toContain("dry-run");
+		expect(combined).toContain("scripted");
+		expect(combined).not.toContain("cpa_api_key");
+	}, 30_000);
+});
+
+describe("experiments runner — cost guard (max-cells)", () => {
+	it("--max-cells caps the executed cells and skips the rest", async () => {
+		const setup_ = await setup(
+			[finishOnlyTask("t-a"), finishOnlyTask("t-b")],
+			[step1Arm("s1-a"), step1Arm("s1-b")],
+		);
+		const result = await runExperiment(baseOpts(setup_, { maxCells: 1 }), { acquireEnv: mockAcquireEnv() });
+		// 2 arms x 2 tasks = 4 cells; capped to 1 → only 1 cell's rows.
+		// Each finishOnlyTask cell produces >= 1 row from a single model call.
+		expect(result.rubricOutcomes.length).toBe(1);
 	}, 60_000);
 });

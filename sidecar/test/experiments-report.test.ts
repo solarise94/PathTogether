@@ -154,21 +154,41 @@ describe("renderReport", () => {
 		expect(r1.startsWith("# Phase 4 A/B 报告\n")).toBe(true);
 	});
 
-	it("emits the NO-GO banner when any row has prompt_cache_mode != 'off'", () => {
-		const rows = sampleRows(); // default cacheMode "auto"
+	it("emits the NO-GO banner for unverified cache data (scripted rows: no protocol)", () => {
+		const rows = sampleRows(); // default cacheMode "auto", no cpa_api_protocol
 		const data = aggregateReport(rows);
-		expect(data.hasNonOffCacheMode).toBe(true);
+		expect(data.hasUnverifiedCacheData).toBe(true);
 		const md = renderReport(data);
-		expect(md).toContain("NO-GO（CPA-UNVERIFIED）");
+		expect(md).toContain("NO-GO（缓存不可验证）");
 		expect(md).toContain("prompt_cache_key");
 	});
 
 	it("omits the NO-GO banner when every row is prompt_cache_mode 'off'", () => {
 		const rows = sampleRows().map((r) => ({ ...r, prompt_cache_mode: "off" as const }));
 		const data = aggregateReport(rows);
-		expect(data.hasNonOffCacheMode).toBe(false);
+		expect(data.hasUnverifiedCacheData).toBe(false);
 		const md = renderReport(data);
-		expect(md).not.toContain("CPA-UNVERIFIED");
+		expect(md).not.toContain("缓存不可验证");
+	});
+
+	it("omits the NO-GO banner for VERIFIED openai-protocol real-model rows (explicit cache)", () => {
+		// openai path prompt_cache_key passthrough verified 2026-08-12
+		// (gpt-5.6-luna cached_tokens observed) → cache columns are a formal
+		// conclusion; no banner.
+		const rows = sampleRows().map((r) => ({ ...r, prompt_cache_mode: "explicit" as const, cpa_api_protocol: "openai" as const }));
+		const data = aggregateReport(rows);
+		expect(data.hasUnverifiedCacheData).toBe(false);
+		const md = renderReport(data);
+		expect(md).not.toContain("缓存不可验证");
+	});
+
+	it("emits the NO-GO banner for gemini-protocol rows even in explicit mode (#592 cache-unobservable)", () => {
+		const rows = sampleRows().map((r) => ({ ...r, prompt_cache_mode: "explicit" as const, cpa_api_protocol: "gemini" as const }));
+		const data = aggregateReport(rows);
+		expect(data.hasUnverifiedCacheData).toBe(true);
+		const md = renderReport(data);
+		expect(md).toContain("NO-GO（缓存不可验证）");
+		expect(md).toContain("#592");
 	});
 
 	it("reports 概览固定成本 and 临时工作区成本 as separate columns", () => {

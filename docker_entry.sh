@@ -123,9 +123,11 @@ echo "[entry] sidecar ready, starting gunicorn" >&2
 
 # --------------------------------------------------------------------------- #
 # 3) 起 gunicorn（后台与 sidecar 并行）
+# PORT 尊重环境（demo 多实例并跑不打架；默认 8000 保持生产兼容）。
 # --------------------------------------------------------------------------- #
+GUNICORN_BIND_PORT="${PORT:-8000}"
 gunicorn app:app \
-    -b 0.0.0.0:8000 \
+    -b "0.0.0.0:${GUNICORN_BIND_PORT}" \
     -w "$GUNICORN_WORKERS" \
     --threads "$GUNICORN_THREADS" \
     --access-logfile - --error-logfile - &

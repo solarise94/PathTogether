@@ -2,7 +2,7 @@
 
 ## 功能调整与升级方案
 
-> 文档版本：v0.9
+> 文档版本：v1.3
 > 状态：设计提案，尚未实施
 > 编写日期：2026-08-12
 > 设计基线：仓库 `HEAD 6dbab64` 及其之前已经提交的功能
@@ -172,8 +172,7 @@ Browser
 
 ### 4.1 平台拥有的数据
 
-- organization / workspace；
-- user / membership / role；
+- user（owner/注册用户）与 invite token（guest 链接）；
 - case / project；
 - slide / slide asset / asset revision；
 - annotation / comment / thread；
@@ -281,28 +280,27 @@ AI 会话与标注历史：user 持久记录在名下；guest 的 AI 会话不�
 
 ### 5.2 项目升级为病例工作区
 
-现有 `project` 兼容迁移为 `case`：
+现有 `project` 兼容迁移为轻量 `case`（切片集合 + 讨论协作单元，无状态机）：
 
 ```text
 Case
   id
-  organization_id
-  case_number
   title
-  status: draft | in_review | finalized | archived
-  clinical_summary
-  assigned_users[]        # 只读投影视图，来源为 case_members
+  note
+  owner_user_id           # 创建者（user 或 owner）
+  visibility: private | shared | public
   slides[]
   created_at / updated_at
+  archived_at?            # 归档开关（只读保护），无 draft/in_review/finalized 状态机
 ```
 
-`case_members` 是病例授权和指派关系的唯一权威来源，至少保存 `case_id`、`user_id`、`assignment_role`（例如 primary_pathologist/reviewer/collaborator）、`assigned_at` 和 `revoked_at`。`assigned_users[]` 只是 API 为列表展示生成的只读投影，不单独落库，也不能作为第二套权限来源。权限矩阵中的“已分配病例”表示存在当前有效、且 `assignment_role` 满足该动作要求的 `case_members` 记录；组织 owner/admin 不要求病例指派。
+`case_grants` 是协作授权的唯一权威来源：`case_id`、`grantee_type`（user/guest）、`grantee_user_id?`、`invite_token_hash`（guest 链接）、`permissions`（view/annotate/comment）、`granted_at`、`revoked_at`。查看权限判定只认这张表 + `visibility`。
 
 兼容策略：
 
 - 旧项目生成新的 `case_id`；
 - 原项目名称和 note 原样迁移；
-- 未归类切片进入“待整理”系统病例或保持 workspace 级资产；
+- 未归类切片进入"待整理"系统 case 或保持图库级资产；
 - 旧 API 在迁移期返回 deprecation header。
 
 ### 5.3 协作式标注
@@ -312,7 +310,6 @@ Case
 ```text
 Annotation
   id
-  organization_id
   case_id
   slide_id
   geometry
@@ -333,37 +330,32 @@ Annotation
 新增功能：
 
 - 标注下评论线程；
-- `@成员` 与待办状态；
+- `@成员` 与待办状态（仅协作 case 内）；
 - 标注接受/驳回 AI 建议；
 - 标注修改历史；
 - 按作者、来源、标签和状态过滤；
 - 人工标注与 AI 建议使用可区分但一致的交互样式。
 
-删除采用同行 tombstone：原 annotation 行保留稳定 ID、最后 revision 和最小审计字段，并设置 `deleted_at`；默认列表不返回，增量 change stream 返回 `annotation.deleted`。不另建第二套“墓碑表”，也不再使用 `status=deleted`，避免业务状态与同步状态混淆。
+删除采用同行 tombstone：原 annotation 行保留稳定 ID、最后 revision 和最小日志字段，并设置 `deleted_at`；默认列表不返回，增量 change stream 返回 `annotation.deleted`。不另建"墓碑表"，也不使用 `status=deleted`，避免业务状态与同步状态混淆。
 
 ### 5.4 分享与外部会诊
 
-- 分享链接从“切片列表 token”升级为显式 access grant；
-- 可授权病例、单张切片或选定标注；
-- 权限拆分为查看、评论、创建标注、下载；
-- 支持到期、撤销、访问日志和可选的受邀邮箱；
-- 旧匿名分享链接保留兼容读取，禁止自动扩大权限。
+- 分享 = 对 case/单张切片生成受邀链接（guest 进入）或直接邀请注册用户；
+- 权限三档：查看 / 标注评论 / 下载开关；
+- 支持到期、撤销、访问日志；
+- 旧匿名分享链接保留兼容读取，禁止自动扩大权限；
+- 不做实名认证体系，邮箱注册封顶。
 
 ### 5.5 插件管理
 
 平台新增：
 
-- 插件安装、启用、禁用和升级；
+- 插件安装、启用、禁用和升级（owner 操作）；
 - manifest 校验；
-- 组织级权限授权；
 - 插件入口加载；
 - 插件健康状态；
-- 每次运行的用户授权上下文；
-- 插件操作审计。
-
-第一版只内置 HistoPilot，不建设公开市场，但协议不得写死 HistoPilot 名称。
-
----
+- 每次运行的用户授权上下文（sdk-user 代理）；
+- 插件操作日志（轻量操作日志，非医疗审计）。
 
 ## 6. HistoPilot 功能调整
 
@@ -453,15 +445,14 @@ HistoPilot 负责：
 
 禁止平台在普通业务请求中反复把明文 API Key 注入插件。
 
-凭据最终归属仍由 §19 的产品决策确定。实现必须先引入 `CredentialResolver`，支持 `user / organization / platform-managed` 三种来源和可配置覆盖策略；Agent 只接收 resolver 的结果及不含密钥的 `credential_source` 审计标识，不得把某一来源硬编码为永久优先级。
+凭据归属按 §19 决策 3：`CredentialResolver` 支持 `user / platform-managed` 两种来源——注册用户（owner/user）可用平台配置的官方 API 或自带 key；guest 必须自带 key。Agent 只接收 resolver 的结果及不含密钥的 `credential_source` 标识，不得把某一来源硬编码为永久优先级。
 
 ### 6.3 会话关联
 
 HistoPilot session 至少保存：
 
 ```text
-platform_instance_id?   # 多实例/SaaS 必填；单实例部署可省
-organization_id
+platform_instance_id?   # 单实例部署可省
 case_id
 slide_id
 slide_asset_revision
@@ -708,11 +699,11 @@ Host 必须校验 `event.origin`、iframe window、plugin installation、协议�
 目标方案：
 
 1. 安装 HistoPilot 时，平台为 installation 创建可撤销、可轮换的 service credential，只存于双方 secret store，不下发浏览器；
-2. 用户启动 run 时，平台创建有最大生命周期的 `run_grant`，记录 user、organization、installation、case/slide scope 和 permissions；
+2. 用户启动 run 时，平台创建有最大生命周期的 `run_grant`，记录 user、installation、case/slide scope 和 permissions；
 3. 平台签发短期 access JWT，默认 10 分钟，包含 `run_grant_id` 和上述授权快照；
 4. HistoPilot backend 使用 access JWT 调平台能力 API；浏览器插件 UI 只通过同源网关/BFF，不持有 installation service credential；
 5. JWT 即将过期时，HistoPilot backend 用 installation service credential + `run_grant_id` 调 `/api/plugin/v1/token/exchange` 换取新 access JWT；
-6. 即使用户离线，只要 run grant 未过期且权限未撤销，长任务仍可续期；run grant 默认最长 1 小时，组织可以收紧；
+6. 即使用户离线，只要 run grant 未过期且权限未撤销，长任务仍可续期；run grant 默认最长 1 小时；
 7. 成员、病例或插件权限撤销会使 exchange 失败，并通过 `permission.revoked` 通知在途任务停止；
 8. 每个能力 API 仍根据当前数据库状态做资源级鉴权，不能只相信旧 JWT 快照；
 9. service credential 定期轮换，泄露或卸载插件时立即撤销。
@@ -724,7 +715,7 @@ Host 必须校验 `event.origin`、iframe window、plugin installation、协议�
 浏览器身份使用独立的 UI session 流程，不把 installation credential 或平台能力 access JWT 暴露给 iframe：
 
 1. 已登录用户点击打开插件时，PathTogether backend 根据平台 session、CSRF、病例权限和 installation 状态创建一次性 `plugin_launch_ticket`；
-2. ticket 绑定 user、organization、installation、case/slide、目标 iframe origin 和随机 nonce，60 秒过期且只能交换一次；
+2. ticket 绑定 user、installation、case/slide、目标 iframe origin 和随机 nonce，60 秒过期且只能交换一次；
 3. Host 通过受校验的 HostBridge bootstrap event 把 ticket 交给 HistoPilot UI；不放进长期 URL、localStorage 或日志；
 4. UI 向同源插件网关/BFF 的 `/plugin/session/exchange` 交换一个短期 `plugin_ui_token`；该 token 只允许调用 HistoPilot 的 UI/session API，不能调用 PathTogether capability API；
 5. `plugin_ui_token` 默认 5 分钟，保存在内存；续期时 UI 通过 HostBridge `auth.refresh` request 请求新的单次 ticket，再次交换；
@@ -774,8 +765,8 @@ SSE 已建立后不能改 HTTP 状态，使用 `event: error`，data 为同一 e
 建议 PostgreSQL 表域：
 
 ```text
-identity: organizations, users, memberships
-cases: cases, case_members, case_slides
+identity: users, invite_tokens
+cases: cases, case_grants, case_slides
 slides: slides, slide_assets, slide_metadata
 annotations: annotations, annotation_revisions, comments
 sharing: access_grants, share_links, share_visits
@@ -903,7 +894,7 @@ object-storage       # 可选，切片/派生资产
 
 Stage 4 即使尚未建设完整配额产品，也必须启用基础保护：
 
-- 按 organization、plugin installation 和 user 限制并发 run；
+- 按 plugin installation 和 user 限制并发 run；
 - region endpoint 限制请求速率、并发解码数、`maxLongEdge` 和单位时间像素预算；
 - 超限返回 `429`、稳定错误码和 `Retry-After`；
 - cancel/断连释放排队配额；
@@ -972,23 +963,23 @@ Stage 4 即使尚未建设完整配额产品，也必须启用基础保护：
 - viewport 高频事件满足节流与 final flush 契约；
 - 主题、移动端和无障碍交互无明显回退。
 
-### Stage 3a：身份与组织边界
+### Stage 3a：身份与访问边界
 
-目标：先建立所有后续数据都依赖的租户边界，避免二次回填。
+目标：建立四级身份（owner/user/guest/sdk-user）与切片/病例级授权，替代现有的隐式单用户模型。
 
 工作项：
 
-- 引入 organization、user、membership 和角色；
-- 为现存数据建立默认 organization；
-- 给 project、slide metadata、ROI、share 和审计引用回填 organization ID；
-- 后端接入 §5.1.1 权限矩阵；
-- 增加跨租户拒绝测试。
+- 引入 user 账户（邮箱注册）、invite token（guest 链接）与 sdk-user 代理身份；
+- 为现存数据归属 owner（部署者）账户；
+- 给 case、slide、annotation、share 引用回填 owner_user_id；
+- 后端接入 §5.1.1 数据权限矩阵（owner/user/guest）与 §5.1.2 AI 凭据规则；
+- 增加越权拒绝测试（guest 上传切片、跨用户图库读取等）。
 
 验收：
 
-- 所有业务对象均可唯一归属 organization；
-- 无 organization 的新业务写入在应用/仓储边界被拒绝；Stage 3b 迁入 PostgreSQL 后再升级为数据库 `NOT NULL + FK` 约束；
-- 跨租户 ID 枚举、region 读取和标注写入均被拒绝；
+- 所有业务对象均可归属到 user 或 owner；
+- guest 上传/维护图库在应用/仓储边界被拒绝；
+- 越权 ID 枚举、region 读取和标注写入均被拒绝；
 - 仍使用旧存储时也保持原功能兼容。
 
 ### Stage 3b：切片/病例模型与 PostgreSQL
@@ -1164,8 +1155,8 @@ visual_context_budget_tokens
 - 插件安装、停用和权限撤销；
 - 插件故障时 Viewer 降级；
 - 旧项目、标注和分享数据迁移；
-- 角色 × case 状态权限矩阵；
-- `case_members` 权威授权与 `assigned_users[]` 投影一致性；
+- owner/user/guest/sdk-user 权限矩阵；
+- `case_grants` 权威授权与权限判定一致性；
 - HostBridge request/response/event、超时、origin 校验和 viewport final flush。
 
 ### 12.4 端到端烟雾测试
@@ -1193,7 +1184,6 @@ visual_context_budget_tokens
 
 ```text
 trace_id
-organization_id
 case_id
 slide_id
 asset_revision
@@ -1233,7 +1223,7 @@ user_id
 ## 14. 安全、隐私与审计
 
 1. 插件默认最小权限，安装时显式授权。
-2. 插件 token 短期有效，并绑定 organization 和 installation。
+2. 插件 token 短期有效，并绑定 user 授权和 installation。
 3. region 能力必须检查用户和病例权限，不能因为是服务端调用而跳过资源鉴权。
 4. 模型密钥使用 secret store 或 envelope encryption，不放入平台普通配置 JSON。
 5. 对发送给模型的图片和文本建立数据出境/provider 策略。

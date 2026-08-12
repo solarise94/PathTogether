@@ -217,6 +217,7 @@
     aiModel: $("ai-model"),
     aiMaxSteps: $("ai-max-steps"),
     aiApiProtocol: $("ai-api-protocol"),
+    aiWindowTier: $("ai-window-tier"),
     aiCtxWindow: $("ai-ctx-window"),
     aiReserve: $("ai-reserve"),
     aiSafetyMargin: $("ai-safety-margin"),
@@ -3279,6 +3280,7 @@
     if (els.aiApiProtocol) {
       els.aiApiProtocol.value = aiConfig.api_protocol || "openai";
     }
+    if (els.aiWindowTier) els.aiWindowTier.value = aiConfig.window_tier || "";
     if (els.aiCtxWindow) els.aiCtxWindow.value = aiConfig.context_window_tokens != null ? aiConfig.context_window_tokens : "";
     if (els.aiReserve) els.aiReserve.value = aiConfig.reserve_tokens != null ? aiConfig.reserve_tokens : "";
     if (els.aiSafetyMargin) els.aiSafetyMargin.value = aiConfig.safety_margin != null ? aiConfig.safety_margin : "";
@@ -3307,6 +3309,8 @@
     payload.max_steps = steps;
     // 协议
     if (els.aiApiProtocol) { payload.api_protocol = els.aiApiProtocol.value || "openai"; }
+    // §9.2.1 窗口档位预设：选了档位才提交；空 = 不启用/不改动
+    if (els.aiWindowTier && els.aiWindowTier.value) { payload.window_tier = els.aiWindowTier.value; }
     // 高级调优参数（填了才提交，后端校验数值）
     // 字段语义：reserve/safety_margin 允许 0（nonneg）；lease_ttl 须为正整数（与
     // 后端一致，0 不合法）；context_window/keep_recent 须为正；fork_limit 为正整数。

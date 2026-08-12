@@ -2,7 +2,7 @@
 
 ## 功能调整与升级方案
 
-> 文档版本：v0.8
+> 文档版本：v0.9
 > 状态：设计提案，尚未实施
 > 编写日期：2026-08-12
 > 设计基线：仓库 `HEAD 6dbab64` 及其之前已经提交的功能
@@ -274,7 +274,8 @@ type SlideRef =
 |---|---|---|---|
 | 使用平台配置的官方托管 API（如 luna） | ✓ | ✓ | — |
 | 自带 API key 运行 AI | ✓ | ✓ | ✓（必须自带） |
-| 无 key 时 | 平台 API 兜底 | 平台 API 兜底 | AI 不可用，人工读片不受影响 |
+
+平台配置的官方 API 就是注册用户（owner/user）的常规 AI 来源之一，与自带 key 并列——不存在额外的"兜底"机制：平台未配置官方 API 时，注册用户同样需要自带 key；guest 则始终必须自带 key，无 key 时 AI 不可用、人工读片不受影响。
 
 AI 会话与标注历史：user 持久记录在名下；guest 的 AI 会话不持久（会话结束即弃），人工标注若允许则按分享权限记录。
 
@@ -1352,7 +1353,7 @@ COLLAB_DB_V2_ENABLED
 |---|---|---|---|
 | 1 | 品牌拼写 | **PathTogether**（标准英文） | 全文已替换；包名/域名/schema 用 path-together 风格 |
 | 2 | 身份与部署模型 | **一个部署实例 + 多用户协作，四类身份**：① owner = 部署者（管理平台 API 配置、公开切片、邀请）；② **user = 平台注册用户**（邮箱注册的正式账户，有持久会话/标注历史，可用平台配置的 API，也可自带 key）；③ guest = 游客（受邀链接直接进入，无注册，AI 必须自带 key，标注/评论按分享权限）；④ sdk-user = 插件访问身份（非自然人，插件经某 user 授权后以其身份调用 PlatformClient） | Stage 3a "身份与访问边界"：扁平四级模型（owner/user/guest/sdk-user），无 organization、无 roles 矩阵、无租户隔离 |
-| 3 | 模型凭据 | **注册用户可用平台配置的 API；游客必须自带 key**。平台由部署者配置一个官方托管 API（如 luna，便宜）作为 fallback；demo 场景给公开切片 + 平台 API 做简单读片，无需用户配 key | Stage 4 CredentialResolver：registered → PlatformKey 可用（可积分/免费额度）；guest → 必须 UserKey，无 key 则 AI 不可用但人工读片不受影响 |
+| 3 | 模型凭据 | **注册用户可用平台配置的官方 API；游客必须自带 key**。平台配置的官方托管 API（如 luna，便宜）是注册用户的常规 AI 来源之一（与自带 key 并列），不是"兜底"——平台未配置时注册用户也需自带 key | Stage 4 CredentialResolver：registered → PlatformKey 或 UserKey；guest → 必须 UserKey，无 key 则 AI 不可用但人工读片不受影响 |
 | 4 | 病理图外发 | **允许，保持现状**（经 CPA 网关等外部 provider） | §4.3/§15 维持现状表述；无需阻断或默认关闭机制 |
 | 5 | AI 审计 | **本产品不是病人管理软件，没有"病理审计档案"概念** | Stage 3c 的 audit 重新定义为**协作操作日志**（谁何时改了什么，服务于冲突解决与调试），不引入医疗审计语义；AI transcript 不进入任何正式档案，平台最多保存标注来源引用 |
 | 6 | 会诊身份 | **不搞实名认证体系，邮箱注册封顶** | §5.4 分享：匿名链接继续支持 + 邮箱注册用户；不做实名/KYC |
@@ -1361,6 +1362,6 @@ COLLAB_DB_V2_ENABLED
 | 9 | 插件 UI 隔离 | **直接 sandbox iframe**（跳过同源 bundle 过渡期） | Stage 2 改为直接 iframe；HostBridge 协议降级为 iframe 内 postMessage 通道，request/response/event 三类消息语义不变 |
 | 10 | 版本策略 | **同仓同版本发布**（HistoPilot 不独立版本化） | §7.0 版本模型简化：API/contract 仍版本化，但产品版本与平台共享；不设独立发布周期与兼容矩阵 |
 
-| 11 | Demo 模式 | **公开切片集 + 官方托管 API**：部署者提供公开 demo 切片，游客/新用户用平台 API（luna 级低成本模型）做简单读片体验，不需要任何自备 key | 数据模型中需支持 slice visibility=public 与平台 fallback key；不计积分或低配额 |
+| 11 | Demo 模式 | **公开切片集 + 平台官方 API**：部署者提供公开 demo 切片；注册用户用平台官方 API 零配置体验读片；游客看 demo 切片仍需自带 key | 数据模型中需支持 slice visibility=public 与平台配置的官方 API key |
 
 上述决策已全部落地为本表约束，Stage 2+ 设计不再有产品层阻塞项。

@@ -1,6 +1,6 @@
 # AI 上下文缓存与视觉工作区升级设计
 
-> 状态：Phase 1–3 已实现（Phase 0 基线已固化；Phase 4 A/B 未开始）
+> 状态：Phase 1–3 已实现（Phase 0 基线已固化；Phase 4 A/B 准备中——Wave 1 数据面与 Wave 2 执行 runner（scripted 模式可用）已落地于 `sidecar/experiments/`，正式采数仍 NO-GO，见 §14）
 > 版本：v1.2
 > 日期：2026-08-10
 > 范围：AI 读片 sidecar 的请求上下文、图片物化、Prompt Cache、Compaction 与可观测性
@@ -635,6 +635,17 @@ checkpoint_turn_lifetime
 
 ### Phase 4：分辨率与窗口 A/B
 
+> 准备工作 GO，正式采数 NO-GO。数据面（fixture / 任务集 / arm / rubric / 报表 / 门禁）与**执行 runner（scripted 模式可用）**均已落地于 `sidecar/experiments/`（见 `sidecar/experiments/README.md`）：
+> - `fixtures/generate.py` + `manifest.schema.json`/`manifest.example.json`：合成去标识化切片 + 版本化 manifest（pin 需运行中的 Flask，Wave 2 smoke run 才提交 `manifest.json`）。
+> - `tasksets/reading-v1.json` + `src/taskset.ts`：覆盖 §15.3 全部 7 类的质量回归任务集 + 手写校验器。
+> - `arms/step1-*` / `arms/step2-*` + `src/arms.ts`：两步 A/B arm 定义 + 矩阵生成 + Step-2 `image_strategy: "${step1_winner}"` 占位符解析（`overview_enabled` 已在 Wave 2 接到稳定区概览抑制）。
+> - `src/rubric.ts`：rubric 检查器（纯函数）。
+> - `src/report.ts`：metrics 聚合 + 确定性 markdown 报表（含概览固定成本/临时工作区成本拆分与 NO-GO 横幅）。
+> - `src/gate.ts`：NO-GO 门禁，real-model 模式须 `PHASE4_CPA_VERIFIED=1` 才放行。
+> - **Wave 2 执行 runner**（`src/run.ts` 库 + `run-ab.ts` CLI + `src/fake-stream.ts`/`src/manifest.ts`/`src/flask-process.ts`）：scripted 模式经真实 AgentRunner 跑通整套管线（fixture→spawn Flask→pin manifest→每 cell 跑→输出 metrics.jsonl/rubric.json/report.md）；real-model 模式 gate 放行后仍抛“Wave 2 未实现”，provider 接线随 CPA 验证落地。
+>
+> 在 §14 Phase 3 的 `prompt_cache_key` 真实 CPA 网关验证前，缓存命中率数字不作正式结论。
+
 - 对“稳定区无概览”、768px 概览、1024px 概览三组做同任务质量、token、缓存和 TTFT 对比；临时高倍图策略保持一致。
 - 在胜出概览组内再对 768/1024/1280px working/detail 策略做质量、token、延迟对比。
 - 灰度测试 272k、400k、512k Context。
@@ -644,7 +655,7 @@ checkpoint_turn_lifetime
 
 ### 15.1 单元测试
 
-| 测试 | 基线状态（ae46808） | 当前状态（ac9ae0b，sidecar 347 + python 40 全绿） |
+| 测试 | 基线状态（ae46808） | 当前状态（ac9ae0b + Wave 1/2 实验，sidecar 448 + python 43 全绿） |
 |---|---|---|
 | 历史图片很多时 region 调用有界 | 已有 | 保持；working set 默认 4 + 概览 1 张上限由 assembler 层覆盖 |
 | LRU 热请求不再次调用 region | 已有 | 字节上限 LRU 下保持；补 recency 刷新/TTL/按 slide 失效 |
@@ -665,7 +676,7 @@ checkpoint_turn_lifetime
 | 配置与版本失效 | 待补 | 已有（prompt/tool/request/slide/encoding 任一变化 checkpointStale 判定并换代；cache key 随 generation/fingerprint 失效） |
 | checkpoint 原子提交 | 待补 | 已有（过期 generation/指纹变化/写盘失败时旧 generation 完整保留） |
 
-“已有”指对应 commit 的工作区中已有测试并通过（sidecar `npx vitest run` 347、python `pytest tests/` 40）。
+“已有”指对应 commit 的工作区中已有测试并通过（sidecar `npx vitest run` 448、python `pytest tests/` 43；含 Wave 2 实验 runner 的 `experiments-runner.test.ts` 与 `overview_enabled` 覆盖）。
 
 ### 15.2 集成测试
 
@@ -678,6 +689,7 @@ checkpoint_turn_lifetime
 - 替换同名切片后旧 checkpoint 和图片缓存全部失效。
 - 两个 session 同时请求同一派生图时只发起一次 region；单方取消不会中止另一方。
 - force-compaction 释放旧 `PreparedRequest`，只创建一个新 generation 和一个新请求对象。
+- Wave 2 实验 runner（`experiments-runner.test.ts`，注入内存 FlaskClient mock 不 spawn 真 Flask）：scripted 1-task/1-arm 矩阵产出 metrics.jsonl/rubric.json/report.md/run.json；transcript 扁平从 `toolResult.details.src` 还原 snapshot bbox；real-model 缺 `PHASE4_CPA_VERIFIED` 在任何工作前抛 gate 错；step 2 缺 `--image-arm` 抛错；arm 覆盖经 `buildRunConfig` 到达 transform 设置（`overview_enabled=false` → 全行 `overview_image_bytes_sent=0`）。
 
 ### 15.3 质量回归
 
@@ -695,7 +707,7 @@ checkpoint_turn_lifetime
 
 ### 15.4 回归数据与设计同步
 
-- 仓库只保存去标识化的小型裁剪 fixture 和版本化 manifest（fixture ID、slide fingerprint、期望 bbox/hash/任务标签），不提交原始大 WSI。
+- 仓库只保存去标识化的小型裁剪 fixture 和版本化 manifest（fixture ID、slide fingerprint、期望 bbox/hash/任务标签），不提交原始大 WSI。✅ 已具备：`sidecar/experiments/fixtures/generate.py`（合成 pyramidal TIFF + `--pin` 版本化 manifest）、`manifest.schema.json`、`manifest.example.json`（占位指纹，Wave 2 smoke run 才 pin 真实指纹）；生成切片 `slides/` 已 gitignore 不提交。
 - 完整 WSI 回归集放在权限受控的评测存储中；本地和 CI 通过 manifest 固定版本，缺失数据时明确 skip，不能悄悄换样本。
 - 每个 Phase 合并时必须更新 §1.1 的“已实现/后续工作”、测试状态和文档头 base commit；CI 增加配置 schema 与本文档配置名的一致性检查，并运行 `git diff --check`/Markdown 链接与代码块检查。
 - 实现 PR 在 checklist 中逐项链接对应设计条目和测试；改变请求 schema、checkpoint 字段或预算公式时，文档与迁移测试必须同 PR 更新。

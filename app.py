@@ -1100,6 +1100,9 @@ DEFAULT_CONFIG = {
     "image_derivative_cache_ttl": 1800,
     # Prompt Cache 模式：off / auto / explicit（Phase 1 仅透传，Phase 3 启用）。
     "prompt_cache_mode": "auto",
+    # Phase 4 §17 风险 2：稳定区概览开关（默认 True）。False 时 Phase 2b
+    # assembler 组装稳定区不带概览图（稳定文本块仍保留）。
+    "overview_enabled": True,
 }
 
 
@@ -1249,6 +1252,12 @@ _AI_TUNING_ENUM = {
     "prompt_cache_mode": ("off", "auto", "explicit"),
     "image_overlay_version": None,  # 任意非空字符串（版本号自由格式）
 }
+# 布尔字段（Phase 4 §17 风险 2：overview_enabled 产品开关，默认 True）
+# 注意：Python 中 isinstance(True, int) 为真，必须先排除 bool 再走整数校验，
+# 因此布尔字段单独一类、在整数校验之前处理。
+_AI_TUNING_BOOL = (
+    "overview_enabled",
+)
 # max_steps 上限：取自 templates/index.html 的 input max="500"（步数上限字段）。
 # 防止 max_steps=99999 之类失控（sidecar 运行循环只限下限，费用风险）。
 _MAX_STEPS_LIMIT = 500
@@ -1295,6 +1304,17 @@ def _validate_ai_tuning(body, cfg):
     """
     validated = {}
     # 1) 单字段校验
+    # 1a) 布尔字段（Phase 4 §17 风险 2）：必须在整数校验之前处理，
+    #     否则 isinstance(True, int) 会把 True 当成 1 通过。
+    for field in _AI_TUNING_BOOL:
+        if field not in body:
+            continue
+        raw = body[field]
+        # 接受真正的 bool；拒绝 0/1/"true" 等隐式转换，保持权威层严格。
+        if not isinstance(raw, bool):
+            return None, "{} 需为布尔值（true/false）".format(field)
+        validated[field] = raw
+    # 1b) 正整数字段
     for field in _AI_TUNING_POSITIVE_INT:
         if field not in body:
             continue

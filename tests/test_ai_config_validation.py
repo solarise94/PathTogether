@@ -439,6 +439,59 @@ def test_no_partial_write_on_relationship_failure():
           "got %r" % snap.get("context_window_tokens"))
 
 
+# ============================================================================ #
+# Phase 4 §17 风险 2：overview_enabled 布尔字段（默认 True）。
+# 必须先于整数校验处理，否则 isinstance(True, int) 会把 True 当成 1 通过。
+# ============================================================================ #
+def test_overview_enabled_boolean_accepted():
+    """overview_enabled=true/false 落盘 200，且出现在 sidecar config 合并结果里。"""
+    print("== overview_enabled 布尔字段接受 ==")
+    reset_config()
+    code, j = put({"overview_enabled": False})
+    check("overview_enabled=false → 200", code == 200, "got %s %r" % (code, j))
+    check("响应回显 overview_enabled=false", j.get("overview_enabled") is False,
+          "got %r" % j.get("overview_enabled"))
+    snap = load_raw()
+    check("磁盘落盘 overview_enabled=false", snap.get("overview_enabled") is False,
+          "got %r" % snap.get("overview_enabled"))
+    # sidecar config 合并：overview_enabled 在 DEFAULT_CONFIG 中，应被透传。
+    merged = app_mod._merge_config(snap)
+    check("sidecar config 透传 overview_enabled=false",
+          merged.get("overview_enabled") is False,
+          "got %r" % merged.get("overview_enabled"))
+
+    code, j = put({"overview_enabled": True})
+    check("overview_enabled=true → 200", code == 200, "got %s %r" % (code, j))
+    check("响应回显 overview_enabled=true", j.get("overview_enabled") is True,
+          "got %r" % j.get("overview_enabled"))
+
+
+def test_overview_enabled_rejects_non_bool():
+    """overview_enabled 拒绝 0/1/字符串（权威层只接受真正布尔，防隐式转换）。"""
+    print("== overview_enabled 非布尔 → 400 ==")
+    reset_config()
+    for bad in (0, 1, "true", "false", None):
+        code, j = put({"overview_enabled": bad})
+        check("overview_enabled=%r → 400" % (bad,), code == 400,
+              "got %s %r" % (code, j))
+    snap = load_raw()
+    check("非法值不落盘（磁盘无 overview_enabled 或保持默认）",
+          snap.get("overview_enabled", True) is True,
+          "got %r" % snap.get("overview_enabled"))
+
+
+def test_overview_enabled_default_true_when_omitted():
+    """未提交 overview_enabled 时，sidecar config 合并结果回填默认 True。"""
+    print("== overview_enabled 缺省 True ==")
+    reset_config()
+    code, j = put({"max_steps": 30})
+    check("仅提交 max_steps → 200", code == 200, "got %s %r" % (code, j))
+    merged = app_mod._merge_config(load_raw())
+    check("缺省时 sidecar config 回填 overview_enabled=true",
+          merged.get("overview_enabled") is True,
+          "got %r" % merged.get("overview_enabled"))
+
+
 if __name__ == "__main__":
     test_positive_int_fields_reject_negative()
     test_positive_int_fields_reject_zero()
@@ -455,5 +508,8 @@ if __name__ == "__main__":
     test_omitted_fields_keep_defaults()
     test_no_partial_write_on_failure()
     test_no_partial_write_on_relationship_failure()
+    test_overview_enabled_boolean_accepted()
+    test_overview_enabled_rejects_non_bool()
+    test_overview_enabled_default_true_when_omitted()
     print("\nPASS=%d FAIL=%d" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

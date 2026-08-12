@@ -59,6 +59,7 @@ import { SessionEventBus } from "../../src/events.js";
 import { AgentRunner, type RunConfig } from "../../src/agent-runner.js";
 import { clearRegionLru } from "../../src/transform-context.js";
 import type { FlaskClient } from "../../src/flask-client.js";
+import { LegacyFlaskPlatformAdapter } from "../../src/platform/legacy-flask-adapter.js";
 import type { PersistedAgentMessage } from "../../src/session-store.js";
 import type { RequestMetrics } from "../../src/metrics.js";
 
@@ -524,7 +525,7 @@ async function runCell(args: {
 		runnerOverrides.compactionModels = fakeCompactionModels("[scripted compaction summary]") as never;
 	}
 
-	const runner = new AgentRunner(store, bus, env.flask, runnerOverrides as never);
+	const runner = new AgentRunner(store, bus, new LegacyFlaskPlatformAdapter({ flask: env.flask }), runnerOverrides as never);
 
 	// Drive user_turns[0] via runMain (fresh main session).
 	const turn0 = task.user_turns[0] ?? "";

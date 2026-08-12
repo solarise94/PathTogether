@@ -19,6 +19,7 @@ import { SessionStore } from "../src/session-store.js";
 import { SessionEventBus } from "../src/events.js";
 import { AgentRunner } from "../src/agent-runner.js";
 import { FlaskClient } from "../src/flask-client.js";
+import { LegacyFlaskPlatformAdapter } from "../src/platform/legacy-flask-adapter.js";
 import type { RequestMetrics } from "../src/metrics.js";
 
 import { ensureSlides } from "./src/run.js";
@@ -65,7 +66,7 @@ async function main(): Promise<void> {
 			}
 		}) as never;
 		const collected: RequestMetrics[] = [];
-		const runner = new AgentRunner(store, bus, client, {
+		const runner = new AgentRunner(store, bus, new LegacyFlaskPlatformAdapter({ flask: client }), {
 			metricsSink: (m) => collected.push(m),
 			compactionModels: fakeCompactionModels("[smoke]") as never,
 		});

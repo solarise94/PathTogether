@@ -34,7 +34,7 @@ import {
 	enforceVisualTokenBudget,
 	PIXELS_PER_VISUAL_TOKEN,
 } from "../src/compaction.js";
-import type { FlaskClient, RegionResult } from "../src/flask-client.js";
+import type { PlatformClient, RegionRequest, RegionResult } from "../src/platform/contract.js";
 import type { SlideInfo } from "../src/tools.js";
 import type { ImageRefContent } from "../src/session-store.js";
 
@@ -72,22 +72,24 @@ function toolResultMsg(toolCallId: string, blocks: unknown[], ts = Date.now()): 
 }
 
 /** Minimal flask mock whose region() returns a deterministic base64 per call. */
-function makeFlask(): Pick<FlaskClient, "region"> {
-	const region = async (args: Record<string, unknown> & { signal?: AbortSignal }): Promise<RegionResult> => {
-		if (args.signal?.aborted) {
+function makeFlask(): Pick<PlatformClient, "region"> {
+	const region = async (request: RegionRequest, signal?: AbortSignal): Promise<RegionResult> => {
+		if (signal?.aborted) {
 			const err = new Error("aborted");
 			err.name = "AbortError";
 			throw err;
 		}
-		const le = (args.max_long_edge as number | undefined) ?? 768;
+		const le = request.maxLongEdge ?? 768;
 		return {
-			image_base64: "QUFBQQ==", // "AAAA"
-			mime: "image/jpeg",
+			bytes: Buffer.from("QUFBQQ==", "base64"), // "AAAA"
+			mimeType: "image/jpeg",
 			width: le,
 			height: le,
-			src: { x: args.x as number, y: args.y as number, w: args.w as number, h: args.h as number },
+			src: { x: request.bbox.x, y: request.bbox.y, w: request.bbox.w, h: request.bbox.h },
 			magnification: null,
-			encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+			contentSha256: "",
+			assetRevision: undefined,
+			encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlayVersion: "v1", jpegQuality: 85 },
 		};
 	};
 	return { region };
@@ -121,7 +123,7 @@ describe("Phase 3.1 invariant — newest ordinary charged at the detail tier", (
 		expect(settings.detailImageLongEdge).toBe(1280);
 		expect(settings.workingImageLongEdge).toBe(768);
 		const transform = makeTransformContext({
-			flask: makeFlask() as unknown as FlaskClient,
+			flask: makeFlask() as unknown as PlatformClient,
 			slide: SLIDE,
 			slideInfo: SLIDE_INFO,
 			settings,
@@ -363,19 +365,21 @@ describe("Phase 3.1 invariant — live image normalized to budget tier", () => {
 		// A live snapshot claiming 4096² would under-count if billed as a detail
 		// square (2185) while sending ~22370 tokens of pixels. With src+pixels on
 		// toolResult.details, the selector rematerializes at the detail tier.
-		const regionCalls: Array<{ max_long_edge?: number }> = [];
-		const flask: Pick<FlaskClient, "region"> = {
-			region: async (args) => {
-				regionCalls.push({ max_long_edge: args.max_long_edge });
-				const le = args.max_long_edge ?? 1280;
+		const regionCalls: Array<{ maxLongEdge?: number }> = [];
+		const flask: Pick<PlatformClient, "region"> = {
+			region: async (request) => {
+				regionCalls.push({ maxLongEdge: request.maxLongEdge });
+				const le = request.maxLongEdge ?? 1280;
 				return {
-					image_base64: "QkFBQkE=", // distinct from the live payload
-					mime: "image/jpeg",
+					bytes: Buffer.from("QkFBQkE=", "base64"), // distinct from the live payload
+					mimeType: "image/jpeg",
 					width: le,
 					height: le,
-					src: { x: args.x as number, y: args.y as number, w: args.w as number, h: args.h as number },
+					src: { x: request.bbox.x, y: request.bbox.y, w: request.bbox.w, h: request.bbox.h },
 					magnification: null,
-					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+					contentSha256: "",
+					assetRevision: undefined,
+					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlayVersion: "v1", jpegQuality: 85 },
 				};
 			},
 		};
@@ -384,7 +388,7 @@ describe("Phase 3.1 invariant — live image normalized to budget tier", () => {
 			visual_context_budget_tokens: 8000,
 		});
 		const transform = makeTransformContext({
-			flask: flask as unknown as FlaskClient,
+			flask: flask as unknown as PlatformClient,
 			slide: SLIDE,
 			slideInfo: SLIDE_INFO,
 			settings,
@@ -410,18 +414,18 @@ describe("Phase 3.1 invariant — live image normalized to budget tier", () => {
 		expect(content[0]!.type).toBe("image");
 		// Rematerialized bytes, not the original live payload.
 		expect(content[0]!.data).toBe("QkFBQkE=");
-		expect(regionCalls.some((c) => c.max_long_edge === settings.detailImageLongEdge)).toBe(true);
+		expect(regionCalls.some((c) => c.maxLongEdge === settings.detailImageLongEdge)).toBe(true);
 	});
 
 	it("degrades to text when rematerialize fails (Phase 1 path)", async () => {
-		const flask: Pick<FlaskClient, "region"> = {
+		const flask: Pick<PlatformClient, "region"> = {
 			region: async () => {
 				throw new Error("region unavailable");
 			},
 		};
 		const settings = resolveTransformSettings({ visual_working_set_max: 4, visual_context_budget_tokens: 8000 });
 		const transform = makeTransformContext({
-			flask: flask as unknown as FlaskClient,
+			flask: flask as unknown as PlatformClient,
 			slide: SLIDE,
 			slideInfo: SLIDE_INFO,
 			settings,
@@ -448,23 +452,25 @@ describe("Phase 3.1 invariant — live image normalized to budget tier", () => {
 
 	it("degrades oversized live image with pixels but no src (Phase 1 path)", async () => {
 		const regionCalls: unknown[] = [];
-		const flask: Pick<FlaskClient, "region"> = {
-			region: async (args) => {
-				regionCalls.push(args);
+		const flask: Pick<PlatformClient, "region"> = {
+			region: async (request) => {
+				regionCalls.push(request);
 				return {
-					image_base64: "QkFBQkE=",
-					mime: "image/jpeg",
+					bytes: Buffer.from("QkFBQkE=", "base64"),
+					mimeType: "image/jpeg",
 					width: 100,
 					height: 100,
 					src: { x: 0, y: 0, w: 1, h: 1 },
 					magnification: null,
-					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+					contentSha256: "",
+					assetRevision: undefined,
+					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlayVersion: "v1", jpegQuality: 85 },
 				};
 			},
 		};
 		const settings = resolveTransformSettings({ visual_working_set_max: 4, visual_context_budget_tokens: 8000 });
 		const transform = makeTransformContext({
-			flask: flask as unknown as FlaskClient,
+			flask: flask as unknown as PlatformClient,
 			slide: SLIDE,
 			slideInfo: SLIDE_INFO,
 			settings,
@@ -492,7 +498,7 @@ describe("Phase 3.1 invariant — live image normalized to budget tier", () => {
 	it("degrades live image with no size metadata at all (Phase 1 path)", async () => {
 		const settings = resolveTransformSettings({ visual_working_set_max: 4, visual_context_budget_tokens: 100 });
 		const transform = makeTransformContext({
-			flask: { region: async () => { throw new Error("should not fetch"); } } as unknown as FlaskClient,
+			flask: { region: async () => { throw new Error("should not fetch"); } } as unknown as PlatformClient,
 			slide: SLIDE,
 			slideInfo: SLIDE_INFO,
 			settings,
@@ -522,23 +528,25 @@ describe("Phase 3.1 invariant — live image normalized to budget tier", () => {
 
 	it("degrades to text when live fingerprint mismatches even if pixels fit", async () => {
 		const regionCalls: unknown[] = [];
-		const flask: Pick<FlaskClient, "region"> = {
-			region: async (args) => {
-				regionCalls.push(args);
+		const flask: Pick<PlatformClient, "region"> = {
+			region: async (request) => {
+				regionCalls.push(request);
 				return {
-					image_base64: "QkFBQkE=",
-					mime: "image/jpeg",
+					bytes: Buffer.from("QkFBQkE=", "base64"),
+					mimeType: "image/jpeg",
 					width: 100,
 					height: 100,
 					src: { x: 0, y: 0, w: 1, h: 1 },
 					magnification: null,
-					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+					contentSha256: "",
+					assetRevision: undefined,
+					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlayVersion: "v1", jpegQuality: 85 },
 				};
 			},
 		};
 		const settings = resolveTransformSettings({ visual_working_set_max: 4, visual_context_budget_tokens: 8000 });
 		const transform = makeTransformContext({
-			flask: flask as unknown as FlaskClient,
+			flask: flask as unknown as PlatformClient,
 			slide: SLIDE,
 			slideInfo: SLIDE_INFO,
 			settings,

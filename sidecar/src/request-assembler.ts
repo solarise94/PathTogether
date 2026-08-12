@@ -35,7 +35,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai";
 
-import type { FlaskClient } from "./flask-client.js";
+import type { PlatformClient } from "./platform/contract.js";
 import {
 	buildOverviewDerivative,
 	buildStablePrefixObject,
@@ -102,7 +102,7 @@ export interface AssemblerSessionSnapshot {
  * getter so the assembler never touches the session file directly (§7.2).
  */
 export interface RequestAssemblerDeps {
-	flask: FlaskClient;
+	flask: PlatformClient;
 	slide: string;
 	slideInfo: SlideInfo;
 	settings: TransformContextSettings;
@@ -993,7 +993,7 @@ async function normalizeLiveImageBlock(
 		livePixels?: { w: number; h: number };
 		liveFingerprint?: string;
 	},
-	flask: FlaskClient,
+	flask: PlatformClient,
 	slide: string,
 	slideInfo: SlideInfo,
 	settings: TransformContextSettings,
@@ -1049,7 +1049,7 @@ async function normalizeLiveImageBlock(
  */
 async function materializeRefRich(
 	ref: ImageRefContent,
-	flask: FlaskClient,
+	flask: PlatformClient,
 	slide: string,
 	slideInfo: SlideInfo,
 	settings: TransformContextSettings,

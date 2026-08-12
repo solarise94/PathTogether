@@ -509,20 +509,20 @@ describe("checkpointStale (§10 version invalidation)", () => {
 // intact on rejection.
 import { AgentRunner } from "../src/agent-runner.js";
 import { SessionEventBus } from "../src/events.js";
-import type { FlaskClient } from "../src/flask-client.js";
+import type { PlatformClient } from "../src/platform/contract.js";
 import type { SlideInfo } from "../src/tools.js";
 
 const SLIDE_INFO_BASE: SlideInfo = { width: 10000, height: 8000, levelDownsamples: [1, 2, 4, 8], mpp: 0.5, fingerprint: FP };
 const SYSTEM_PROMPT_V1 = "system-v1";
 const SYSTEM_PROMPT_V2 = "system-v2";
 
-/** A no-op flask whose region() is never reached in these tests (no overview). */
-function noopFlask(): Pick<FlaskClient, "region"> {
+/** A no-op platform client whose region() is never reached in these tests (no overview). */
+function noopFlask(): Pick<PlatformClient, "region"> {
 	return {
 		region: async () => {
 			throw new Error("region should not be called by ensureCheckpointRun in these tests");
 		},
-	} as Pick<FlaskClient, "region">;
+	} as Pick<PlatformClient, "region">;
 }
 
 describe("ensureCheckpointRun — stale rebuild CAS + monotonic generation (P1-2)", () => {
@@ -535,7 +535,7 @@ describe("ensureCheckpointRun — stale rebuild CAS + monotonic generation (P1-2
 			d.context_checkpoint = { ...makeCp(3, oldFp), summary: "g3-old" };
 		});
 		const bus = new SessionEventBus(store);
-		const runner = new AgentRunner(store, bus, noopFlask() as FlaskClient);
+		const runner = new AgentRunner(store, bus, noopFlask() as unknown as PlatformClient);
 		// activeRunConfig is private; set it via cast so resolveTransformSettings works.
 		(runner as unknown as { activeRunConfig: unknown }).activeRunConfig = {};
 		const newFp = "fp-new";
@@ -563,7 +563,7 @@ describe("ensureCheckpointRun — stale rebuild CAS + monotonic generation (P1-2
 			d.context_checkpoint = { ...makeCp(5, FP), system_prompt_version: "spv-old" as never, summary: "g5" };
 		});
 		const bus = new SessionEventBus(store);
-		const runner = new AgentRunner(store, bus, noopFlask() as FlaskClient);
+		const runner = new AgentRunner(store, bus, noopFlask() as unknown as PlatformClient);
 		(runner as unknown as { activeRunConfig: unknown }).activeRunConfig = {};
 		// prompt version differs → stale; fingerprint unchanged.
 		await (runner as unknown as { ensureCheckpointRun: (a: unknown) => Promise<void> }).ensureCheckpointRun({
@@ -604,7 +604,7 @@ describe("ensureCheckpointRun — stale rebuild CAS + monotonic generation (P1-2
 		}) as typeof store.commitCheckpoint;
 
 		const bus = new SessionEventBus(store);
-		const runner = new AgentRunner(store, bus, noopFlask() as FlaskClient);
+		const runner = new AgentRunner(store, bus, noopFlask() as unknown as PlatformClient);
 		(runner as unknown as { activeRunConfig: unknown }).activeRunConfig = {};
 		await (runner as unknown as { ensureCheckpointRun: (a: unknown) => Promise<void> }).ensureCheckpointRun({
 			sessionId: s.id,

@@ -21,7 +21,7 @@ import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 
 import type { SessionStore, SessionData, PendingSnapshotReview } from "./session-store.js";
-import { FlaskHttpError, type FlaskClient, type RegionResult, type RoiDict } from "./flask-client.js";
+import { ContractError, bytesToBase64, legacySlide, type PlatformClient, type RegionResult, type RoiDict } from "./platform/contract.js";
 
 // =========================================================================== //
 // Constants (ai_agent.py:33)
@@ -73,11 +73,11 @@ export class AgentState {
 		let y = this.centerY - side / 2.0;
 		// Edge clamping: when slideDims is provided, shift the viewport back into
 		// bounds so the origin never goes negative and the box never extends past
-		// the far edge (server /internal/ai/region 400s on x<0 or y<0 — a viewport
-		// near the slide edge on a small slide would otherwise make every
-		// snapshot fail, e.g. center (1000,800) at level 1 on a 4000x3000 slide
-		// yields x=-24 without this clamp). On slides smaller than the covered
-		// side, cover the whole slide on that axis.
+		// the far edge (the platform region capability 400s on x<0 or y<0 — a
+		// viewport near the slide edge on a small slide would otherwise make
+		// every snapshot fail, e.g. center (1000,800) at level 1 on a 4000x3000
+		// slide yields x=-24 without this clamp). On slides smaller than the
+		// covered side, cover the whole slide on that axis.
 		if (slideDims) {
 			const w = Math.max(0, slideDims.width);
 			const h = Math.max(0, slideDims.height);
@@ -208,7 +208,7 @@ function formatG(v: number): string {
 // ToolContext
 // =========================================================================== //
 
-/** Slide geometry/identity as fetched once via FlaskClient.slideInfo. */
+/** Slide geometry/identity as fetched once via the platform capability client. */
 export interface SlideInfo {
 	width: number;
 	height: number;
@@ -222,7 +222,7 @@ export type EmitFn = (type: string, payload: Record<string, unknown>) => void | 
 /**
  * Context shared by all tools in one session (the agent loop creates one
  * ToolContext per run). Holds the session store/id for persistence, the slide
- * info, the Flask callback client, and an emit() for trajectory events.
+ * info, the platform capability client, and an emit() for trajectory events.
  */
 export interface ToolContext {
 	sessionStore: SessionStore;
@@ -240,12 +240,18 @@ export interface ToolContext {
 	kind: "main" | "fork" | "branch";
 	slide: string;
 	slideInfo: SlideInfo;
-	flask: FlaskClient;
+	/**
+	 * Platform capability client (Stage 1 contract). Field name kept for
+	 * historical continuity; the type is the abstract {@link PlatformClient},
+	 * never the concrete Flask client.
+	 */
+	flask: PlatformClient;
 	/** Emit a trajectory event (tool_started, snapshot_captured, ...). */
 	emit: EmitFn;
 	/**
-	 * Called when Flask returns 409 (slide fingerprint mismatch). Clears
-	 * slideInfo / region LRU so the next fetch does not reuse stale geometry.
+	 * Called when the platform returns a slide-revision conflict (legacy
+	 * `mtime:size` fingerprint mismatch). Clears slideInfo / region LRU so the
+	 * next fetch does not reuse stale geometry.
 	 */
 	onFingerprintMismatch?: () => void;
 	cfg: {
@@ -543,25 +549,22 @@ export function createTools(ctx: ToolContext): AgentTool<any, any>[] {
 			let r: RegionResult;
 			try {
 				r = await ctx.flask.region({
-					slide: ctx.slide,
-					x: bb.x,
-					y: bb.y,
-					w: bb.w,
-					h: bb.h,
-					out_w: ow,
-					out_h: oh,
-					max_long_edge: maxLongEdge,
-					expected_fingerprint: slideInfo.fingerprint || undefined,
+					slide: legacySlide(ctx.slide),
+					bbox: { x: bb.x, y: bb.y, w: bb.w, h: bb.h },
+					outW: ow,
+					outH: oh,
+					maxLongEdge,
+					expectedAssetRevision: slideInfo.fingerprint || undefined,
 				});
 			} catch (e) {
-				if (e instanceof FlaskHttpError && e.status === 409) {
+				if (e instanceof ContractError && e.code === "slide_revision_conflict") {
 					ctx.onFingerprintMismatch?.();
 					return okText("切片文件已变更，请重新开始本次分析。");
 				}
 				return okText(`抓取快照失败：${(e as Error).message || e}`);
 			}
 
-			const imgB64 = r.image_base64 || "";
+			const imgB64 = bytesToBase64(r.bytes);
 			const src = (r.src as { x: number; y: number; w: number; h: number }) || bb;
 			const mag = st.magnificationLabel(downsamples);
 
@@ -608,7 +611,7 @@ export function createTools(ctx: ToolContext): AgentTool<any, any>[] {
 			toolText += `覆盖全片约 ${cov.toFixed(1)}%。${hint}`;
 
 			return {
-				content: [text(toolText), image(imgB64, r.mime || "image/jpeg")],
+				content: [text(toolText), image(imgB64, r.mimeType || "image/jpeg")],
 				details: {
 					snapshot_id: toolCallId,
 					src,
@@ -718,14 +721,14 @@ export function createTools(ctx: ToolContext): AgentTool<any, any>[] {
 			let roi: RoiDict | null = null;
 			try {
 				roi = await ctx.flask.annotate({
-					slide: ctx.slide,
+					slide: legacySlide(ctx.slide),
 					label: alabel,
 					x: ax,
 					y: ay,
-					side_px: aside,
+					sidePx: aside,
 					note: anote,
-					effect_key: effectKey,
-					session_id: ctx.sessionId,
+					effectKey,
+					sessionId: ctx.sessionId,
 				});
 			} catch (e) {
 				return okText(`落标注失败：${(e as Error).message || e}`);

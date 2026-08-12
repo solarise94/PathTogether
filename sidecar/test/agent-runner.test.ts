@@ -704,18 +704,20 @@ describe("AgentRunner.runMain — stable_context_unavailable re-assembly (P1-1)"
 			calls += 1;
 			if (calls <= failFirst) throw new Error(`flaky region failure #${calls}`);
 			return {
-				image_base64: successB64,
-				mime: "image/jpeg",
+				bytes: Buffer.from(successB64, "base64"),
+				mimeType: "image/jpeg",
 				width: 1024,
 				height: 1024,
 				src: { x: 0, y: 0, w: 100, h: 100 },
 				magnification: 20,
-				encoder: { id: "pillow", version: "test-v1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+				contentSha256: "",
+				assetRevision: undefined,
+				encoder: { id: "pillow", version: "test-v1", resize: "LANCZOS", overlayVersion: "v1", jpegQuality: 85 },
 			};
 		};
 		const annotate = async () => ({ annotation_id: "ann", change_seq: 1 });
-		const spots = async () => ({ changes: [], current_seq: 0 });
-		const slideInfo = async () => ({ width: 10000, height: 8000, level_downsamples: [1, 2, 4, 8], mpp: 0.5, fingerprint: "fp-test:abcd" });
+		const spots = async () => ({ changes: [], currentSeq: 0 });
+		const slideInfo = async () => ({ width: 10000, height: 8000, levelDownsamples: [1, 2, 4, 8], mpp: 0.5, assetRevision: "fp-test:abcd" });
 		return { region, annotate, spots, slideInfo, get regionCalls() { return calls; } } as never;
 	}
 

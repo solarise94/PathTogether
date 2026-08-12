@@ -26,6 +26,7 @@ import { SessionStore } from "../src/session-store.js";
 import { SessionEventBus } from "../src/events.js";
 import { AgentRunner, type RunConfig } from "../src/agent-runner.js";
 import { FlaskClient } from "../src/flask-client.js";
+import { LegacyFlaskPlatformAdapter } from "../src/platform/legacy-flask-adapter.js";
 import type { RequestMetrics } from "../src/metrics.js";
 import { ensureSlides, fakeCompactionModels } from "./src/run.js";
 import { spawnFlask } from "./src/flask-process.js";
@@ -105,8 +106,9 @@ async function runOnce(
 	const store = new SessionStore({ sessionsDir: dir });
 	const bus = new SessionEventBus(store);
 	const client = new FlaskClient({ baseUrl: flaskUrl, token: flaskToken });
+	const platform = new LegacyFlaskPlatformAdapter({ flask: client });
 	const collected: RequestMetrics[] = [];
-	const runner = new AgentRunner(store, bus, client, {
+	const runner = new AgentRunner(store, bus, platform, {
 		metricsSink: (m) => { collected.push(m); },
 		compactionModels: fakeCompactionModels("[smoke]") as never,
 	});

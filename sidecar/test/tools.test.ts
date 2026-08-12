@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import { SessionStore } from "../src/session-store.js";
 import { createTools, AgentState, magnificationGuide, type ToolContext } from "../src/tools.js";
-import type { FlaskClient, RegionResult, RoiDict, SlideInfoResult } from "../src/flask-client.js";
+import type { CreateAnnotationRequest, PlatformClient, RegionRequest, RegionResult, RoiDict, SlideDescriptor } from "../src/platform/contract.js";
 
 // --------------------------------------------------------------------------- //
 // Test fixtures
@@ -35,15 +35,15 @@ const slideInfo = {
 	fingerprint: FINGERPRINT,
 };
 
-/** In-memory FlaskClient mock: records calls, returns canned data. */
+/** In-memory PlatformClient mock: records calls, returns canned data. */
 interface MockFlask {
-	regionCalls: Array<{ x: number; y: number; w: number; h: number; out_w?: number; out_h?: number; max_long_edge?: number; expected_fingerprint?: string }>;
-	annotateCalls: Array<{ label: string; x: number; y: number; side_px: number; note?: string; effect_key?: string; session_id?: string }>;
+	regionCalls: Array<{ x: number; y: number; w: number; h: number; outW?: number; outH?: number; maxLongEdge?: number; expectedAssetRevision?: string }>;
+	annotateCalls: Array<{ label: string; x: number; y: number; sidePx: number; note?: string; effectKey?: string; sessionId?: string }>;
 	annotateResult: RoiDict;
 	regionResult?: Partial<RegionResult>;
 	regionError?: Error;
 }
-function makeMockFlask(): MockFlask & Pick<FlaskClient, "region" | "annotate" | "spots" | "slideInfo"> {
+function makeMockFlask(): MockFlask & Pick<PlatformClient, "region" | "annotate" | "spots" | "slideInfo"> {
 	const state: MockFlask = {
 		regionCalls: [],
 		annotateCalls: [],
@@ -71,37 +71,50 @@ function makeMockFlask(): MockFlask & Pick<FlaskClient, "region" | "annotate" | 
 	// getter/setter on the shared `state`.
 	const obj = {
 		...state,
-		async region(args: { x: number; y: number; w: number; h: number; out_w?: number; out_h?: number; max_long_edge?: number; expected_fingerprint?: string }) {
-			state.regionCalls.push({ ...args });
+		async region(request: RegionRequest) {
+			state.regionCalls.push({
+				x: request.bbox.x,
+				y: request.bbox.y,
+				w: request.bbox.w,
+				h: request.bbox.h,
+				outW: request.outW,
+				outH: request.outH,
+				maxLongEdge: request.maxLongEdge,
+				expectedAssetRevision: request.expectedAssetRevision,
+			});
 			if (state.regionError) throw state.regionError;
-			// Echo width/height: aspect-preserving when max_long_edge is set.
-			let ow = state.regionResult?.width ?? args.out_w ?? 1024;
-			let oh = state.regionResult?.height ?? args.out_h ?? 1024;
-			if (args.max_long_edge && !state.regionResult?.width) {
-				const longest = Math.max(args.w, args.h);
-				const scale = args.max_long_edge / longest;
-				ow = Math.max(1, Math.round(args.w * scale));
-				oh = Math.max(1, Math.round(args.h * scale));
+			// Echo width/height: aspect-preserving when maxLongEdge is set.
+			let ow = state.regionResult?.width ?? request.outW ?? 1024;
+			let oh = state.regionResult?.height ?? request.outH ?? 1024;
+			if (request.maxLongEdge && !state.regionResult?.width) {
+				const longest = Math.max(request.bbox.w, request.bbox.h);
+				const scale = request.maxLongEdge / longest;
+				ow = Math.max(1, Math.round(request.bbox.w * scale));
+				oh = Math.max(1, Math.round(request.bbox.h * scale));
 			}
+			const bytes: Uint8Array = state.regionResult?.bytes ?? Buffer.from("AAAA", "base64");
 			const r: RegionResult = {
-				image_base64: state.regionResult?.image_base64 ?? "AAAA",
-				mime: state.regionResult?.mime ?? "image/jpeg",
+				bytes,
+				mimeType: state.regionResult?.mimeType ?? "image/jpeg",
 				width: ow,
 				height: oh,
-				src: state.regionResult?.src ?? { x: args.x, y: args.y, w: args.w, h: args.h },
+				src: state.regionResult?.src ?? { x: request.bbox.x, y: request.bbox.y, w: request.bbox.w, h: request.bbox.h },
 				magnification: state.regionResult?.magnification ?? 20,
+				contentSha256: state.regionResult?.contentSha256 ?? "",
+				assetRevision: state.regionResult?.assetRevision,
+				encoder: state.regionResult?.encoder,
 			};
 			return r;
 		},
-		async annotate(args: { slide: string; label: string; x: number; y: number; side_px: number; note?: string; effect_key?: string; session_id?: string }) {
-			state.annotateCalls.push({ ...args });
-			return { ...state.annotateResult, label: args.label, x: args.x, y: args.y, side_px: args.side_px, note: args.note ?? "" };
+		async annotate(args: CreateAnnotationRequest) {
+			state.annotateCalls.push({ label: args.label, x: args.x, y: args.y, sidePx: args.sidePx, note: args.note, effectKey: args.effectKey, sessionId: args.sessionId });
+			return { ...state.annotateResult, label: args.label, x: args.x, y: args.y, side_px: args.sidePx, note: args.note ?? "" };
 		},
-		async spots(_slide: string, _afterSeq: number) {
-			return { changes: [], current_seq: 1 };
+		async spots(_ref: unknown, _afterSeq: number) {
+			return { changes: [], currentSeq: 1 };
 		},
-		async slideInfo(_slide: string): Promise<SlideInfoResult> {
-			return { ...slideInfo, level_downsamples: [...slideInfo.levelDownsamples] };
+		async slideInfo(_ref: unknown): Promise<SlideDescriptor> {
+			return { width: slideInfo.width, height: slideInfo.height, levelDownsamples: [...slideInfo.levelDownsamples], mpp: slideInfo.mpp, assetRevision: slideInfo.fingerprint };
 		},
 	};
 	// Route regionResult access through state so test overrides are visible.
@@ -121,7 +134,7 @@ function makeMockFlask(): MockFlask & Pick<FlaskClient, "region" | "annotate" | 
 			state.regionError = v;
 		},
 	});
-	return obj as MockFlask & Pick<FlaskClient, "region" | "annotate" | "spots" | "slideInfo">;
+	return obj as MockFlask & Pick<PlatformClient, "region" | "annotate" | "spots" | "slideInfo">;
 }
 
 async function newStore(): Promise<{ store: SessionStore; dir: string }> {
@@ -150,7 +163,7 @@ async function makeHarness(kind: "main" | "fork" = "main"): Promise<Harness> {
 		kind,
 		slide: SLIDE,
 		slideInfo,
-		flask: mock as unknown as FlaskClient,
+		flask: mock as unknown as PlatformClient,
 		emit: (type, payload) => {
 			events.push({ type, payload });
 		},
@@ -332,21 +345,21 @@ describe("snapshot (ai_agent.py L816-875)", () => {
 		await tool(h, "goto").execute("tc1", { x: 5000, y: 4000, level: 0 });
 		const r = await tool(h, "snapshot").execute("snap1", { out_w: 8, out_h: 99999 });
 		expect(r.content).toHaveLength(2);
-		expect(h.mock.regionCalls[0]?.out_w).toBe(64);
-		expect(h.mock.regionCalls[0]?.out_h).toBe(1280); // detail-tier cap
+		expect(h.mock.regionCalls[0]?.outW).toBe(64);
+		expect(h.mock.regionCalls[0]?.outH).toBe(1280); // detail-tier cap
 		// default when omitted is viewportPx (1024)
 		const r2 = await tool(h, "complete_snapshot_review").execute("csr1", { disposition: "no_annotation", no_annotation_reason: "导航确认" });
 		expect(resultText(r2)).toContain("已关闭快照");
 		const snap2 = await tool(h, "snapshot").execute("snap2", {});
-		expect(h.mock.regionCalls[1]?.out_w).toBe(1024);
-		expect(h.mock.regionCalls[1]?.out_h).toBe(1024);
+		expect(h.mock.regionCalls[1]?.outW).toBe(1024);
+		expect(h.mock.regionCalls[1]?.outH).toBe(1024);
 	});
 
 	it("passes expected_fingerprint from slideInfo to flask.region", async () => {
 		const h = await makeHarness();
 		await tool(h, "goto").execute("tc1", { x: 5000, y: 4000, level: 0 });
 		await tool(h, "snapshot").execute("snap1", {});
-		expect(h.mock.regionCalls[0]).toMatchObject({ expected_fingerprint: FINGERPRINT });
+		expect(h.mock.regionCalls[0]).toMatchObject({ expectedAssetRevision: FINGERPRINT });
 	});
 
 	it("uses max_long_edge when provided (aspect-preserving, §6.1)", async () => {
@@ -354,17 +367,17 @@ describe("snapshot (ai_agent.py L816-875)", () => {
 		await tool(h, "goto").execute("tc1", { x: 5000, y: 4000, level: 0 });
 		await tool(h, "snapshot").execute("snap1", { max_long_edge: 1024 });
 		const call = h.mock.regionCalls[0]!;
-		expect(call.max_long_edge).toBe(1024);
+		expect(call.maxLongEdge).toBe(1024);
 		// out_w/out_h should not be sent when max_long_edge is used.
-		expect(call.out_w).toBeUndefined();
-		expect(call.out_h).toBeUndefined();
+		expect(call.outW).toBeUndefined();
+		expect(call.outH).toBeUndefined();
 	});
 
 	it("clamps max_long_edge to the detail-tier cap (default 1280)", async () => {
 		const h = await makeHarness();
 		await tool(h, "goto").execute("tc1", { x: 5000, y: 4000, level: 0 });
 		await tool(h, "snapshot").execute("snap1", { max_long_edge: 99999 });
-		expect(h.mock.regionCalls[0]?.max_long_edge).toBe(1280);
+		expect(h.mock.regionCalls[0]?.maxLongEdge).toBe(1280);
 	});
 
 	it("honors cfg.detail_image_long_edge as the snapshot output cap", async () => {
@@ -372,7 +385,7 @@ describe("snapshot (ai_agent.py L816-875)", () => {
 		h.ctx.cfg.detail_image_long_edge = 900;
 		await tool(h, "goto").execute("tc1", { x: 5000, y: 4000, level: 0 });
 		await tool(h, "snapshot").execute("snap1", { max_long_edge: 4096 });
-		expect(h.mock.regionCalls[0]?.max_long_edge).toBe(900);
+		expect(h.mock.regionCalls[0]?.maxLongEdge).toBe(900);
 	});
 
 	it("on 409 fingerprint mismatch clears caches via onFingerprintMismatch", async () => {
@@ -381,8 +394,16 @@ describe("snapshot (ai_agent.py L816-875)", () => {
 		h.ctx.onFingerprintMismatch = () => {
 			cleared += 1;
 		};
-		const { FlaskHttpError } = await import("../src/flask-client.js");
-		h.mock.regionError = new FlaskHttpError(409, { error: "切片指纹不匹配（文件已变更）" });
+		// The platform surfaces a slide-revision conflict as a ContractError
+		// (§7.7). The legacy adapter maps Flask's 409 to this code; in tests the
+		// mock IS the platform, so it throws the contract error directly.
+		const { ContractError } = await import("../src/platform/contract.js");
+		h.mock.regionError = new ContractError({
+			code: "slide_revision_conflict",
+			message: "切片指纹不匹配（文件已变更）",
+			retryable: false,
+			httpStatus: 409,
+		});
 		await tool(h, "goto").execute("tc1", { x: 5000, y: 4000, level: 0 });
 		const r = await tool(h, "snapshot").execute("snap1", {});
 		expect(resultText(r)).toContain("切片文件已变更");
@@ -449,7 +470,7 @@ describe("create_annotation (ai_agent.py L906-934)", () => {
 			kind: "fork",
 			slide: SLIDE,
 			slideInfo,
-			flask: {} as FlaskClient,
+			flask: {} as unknown as PlatformClient,
 			emit: () => undefined,
 			cfg: {},
 		});
@@ -488,8 +509,8 @@ describe("create_annotation (ai_agent.py L906-934)", () => {
 		// effect_key shape: sessionId:seq:toolCallId
 		expect(h.mock.annotateCalls).toHaveLength(1);
 		const call = h.mock.annotateCalls[0]!;
-		expect(call.effect_key).toBe(`${h.sessionId}:1:ca1`);
-		expect(call.session_id).toBe(h.sessionId);
+		expect(call.effectKey).toBe(`${h.sessionId}:1:ca1`);
+		expect(call.sessionId).toBe(h.sessionId);
 		expect(call.label).toBe("肿瘤灶");
 		// event
 		const ev = h.events.find((e) => e.type === "annotation_created");
@@ -501,7 +522,7 @@ describe("create_annotation (ai_agent.py L906-934)", () => {
 		await tool(h, "goto").execute("tc1", { x: 0, y: 0, level: 0 });
 		await tool(h, "snapshot").execute("snap1", {});
 		await tool(h, "create_annotation").execute("ca1", { label: "L", x: 1, y: 2, side_px: 999999 });
-		expect(h.mock.annotateCalls[0]?.side_px).toBe(40000);
+		expect(h.mock.annotateCalls[0]?.sidePx).toBe(40000);
 	});
 });
 
@@ -571,7 +592,7 @@ describe("tool set composition (three-kind: main / branch / fork)", () => {
 			kind: "main",
 			slide: SLIDE,
 			slideInfo,
-			flask: {} as FlaskClient,
+			flask: {} as unknown as PlatformClient,
 			emit: () => undefined,
 			cfg: {},
 		});
@@ -593,7 +614,7 @@ describe("tool set composition (three-kind: main / branch / fork)", () => {
 			kind: "branch",
 			slide: SLIDE,
 			slideInfo,
-			flask: {} as FlaskClient,
+			flask: {} as unknown as PlatformClient,
 			emit: () => undefined,
 			cfg: {},
 		});
@@ -615,7 +636,7 @@ describe("tool set composition (three-kind: main / branch / fork)", () => {
 			kind: "fork",
 			slide: SLIDE,
 			slideInfo,
-			flask: {} as FlaskClient,
+			flask: {} as unknown as PlatformClient,
 			emit: () => undefined,
 			cfg: {},
 		});

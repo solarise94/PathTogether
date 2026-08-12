@@ -2,8 +2,8 @@
 
 ## 功能调整与升级方案
 
-> 文档版本：v1.4
-> 状态：设计提案，尚未实施
+> 文档版本：v1.5
+> 状态：Stage 1 已实施（后端边界抽取：PlatformClient + LegacyFlaskPlatformAdapter，见 §10）；Stage 2+ 待实施
 > 编写日期：2026-08-12
 > 设计基线：仓库 `HEAD 6dbab64` 及其之前已经提交的功能
 > 并行工作：`EXP-VISCTX-v1`（原“Phase 4”分辨率/上下文窗口 A/B）正在工作区中开发，不计入本文“已实现”状态

@@ -18,7 +18,7 @@ import { makeRequestAssembler, sliceRecentMessages, buildSnapshotObservationInde
 import { buildOverviewDerivative, REQUEST_SCHEMA_VERSION, type CheckpointEnv, type ContextCheckpoint } from "../src/checkpoint.js";
 import { clearRegionLru, configureRegionLru, resolveTransformSettings, DEGRADE_TEXT } from "../src/transform-context.js";
 import { estimateImageRefTokens, estimateImagePixelsTokens } from "../src/compaction.js";
-import type { FlaskClient, RegionResult } from "../src/flask-client.js";
+import type { PlatformClient, RegionRequest, RegionResult } from "../src/platform/contract.js";
 import type { SlideInfo } from "../src/tools.js";
 import type { ImageRefContent, Observation, PersistedAgentMessage } from "../src/session-store.js";
 import { StableContextUnavailableError } from "../src/prepared-request.js";
@@ -32,26 +32,28 @@ beforeEach(() => {
 	configureRegionLru(64 * 1024 * 1024, 1800_000);
 });
 
-/** Minimal flask mock returning a deterministic base64 keyed by bbox. */
-function makeFlask(opts: { b64?: string; encoderVersion?: string } = {}): Pick<FlaskClient, "region"> {
-	const region = async (args: { x: number; y: number; w: number; h: number; max_long_edge?: number; signal?: AbortSignal }): Promise<RegionResult> => {
+/** Minimal platform mock returning a deterministic payload keyed by bbox. */
+function makeFlask(opts: { b64?: string; encoderVersion?: string } = {}): Pick<PlatformClient, "region"> {
+	const region = async (request: RegionRequest): Promise<RegionResult> => {
 		return {
-			image_base64: opts.b64 ?? "QUFBQQ==",
-			mime: "image/jpeg",
+			bytes: Buffer.from(opts.b64 ?? "QUFBQQ==", "base64"),
+			mimeType: "image/jpeg",
 			width: 1024,
 			height: 1024,
-			src: { x: args.x, y: args.y, w: args.w, h: args.h },
+			src: { x: request.bbox.x, y: request.bbox.y, w: request.bbox.w, h: request.bbox.h },
 			magnification: 20,
+			contentSha256: "",
+			assetRevision: undefined,
 			encoder: {
 				id: "pillow",
 				version: opts.encoderVersion ?? "test-v1",
 				resize: "LANCZOS",
-				overlay_version: "v1",
-				jpeg_quality: 85,
+				overlayVersion: "v1",
+				jpegQuality: 85,
 			},
 		};
 	};
-	return { region } as Pick<FlaskClient, "region">;
+	return { region } as Pick<PlatformClient, "region">;
 }
 
 function imgRef(refId: string, src: { x: number; y: number; w: number; h: number }, fingerprint = FINGERPRINT): ImageRefContent {
@@ -113,7 +115,7 @@ function makeCheckpointEnv(): CheckpointEnv {
 
 function makeDeps(overrides: Partial<RequestAssemblerDeps> = {}): RequestAssemblerDeps {
 	return {
-		flask: makeFlask() as FlaskClient,
+		flask: makeFlask() as unknown as PlatformClient,
 		slide: SLIDE,
 		slideInfo: SLIDE_INFO,
 		settings: resolveTransformSettings({}),
@@ -766,25 +768,27 @@ describe("makeRequestAssembler — live overview budget tier + rematerialize deg
 	}
 
 	it("rematerializes kept live overview at overviewLongEdge (not working)", async () => {
-		const regionCalls: Array<{ max_long_edge?: number }> = [];
-		const flask: Pick<FlaskClient, "region"> = {
-			region: async (args) => {
-				regionCalls.push({ max_long_edge: args.max_long_edge });
-				const le = args.max_long_edge ?? 1024;
+		const regionCalls: Array<{ maxLongEdge?: number }> = [];
+		const flask: Pick<PlatformClient, "region"> = {
+			region: async (request) => {
+				regionCalls.push({ maxLongEdge: request.maxLongEdge });
+				const le = request.maxLongEdge ?? 1024;
 				return {
-					image_base64: "QkFBQkE=",
-					mime: "image/jpeg",
+					bytes: Buffer.from("QkFBQkE=", "base64"),
+					mimeType: "image/jpeg",
 					width: le,
 					height: le,
-					src: { x: args.x as number, y: args.y as number, w: args.w as number, h: args.h as number },
+					src: { x: request.bbox.x, y: request.bbox.y, w: request.bbox.w, h: request.bbox.h },
 					magnification: null,
-					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+					contentSha256: "",
+					assetRevision: undefined,
+					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlayVersion: "v1", jpegQuality: 85 },
 				};
 			},
 		};
 		const settings = resolveTransformSettings({ visual_working_set_max: 4, visual_context_budget_tokens: 8000 });
 		const deps = makeDeps({
-			flask: flask as FlaskClient,
+			flask: flask as unknown as PlatformClient,
 			settings,
 			firstSnapshotToolCallIdRef: { value: "tc-ov" },
 			getSessionSnapshot: async () => trivialSnap(),
@@ -799,8 +803,8 @@ describe("makeRequestAssembler — live overview budget tier + rematerialize deg
 		const content = (first as { content?: Array<{ type: string; data?: string }> }).content!;
 		expect(content[0]!.type).toBe("image");
 		expect(content[0]!.data).toBe("QkFBQkE=");
-		expect(regionCalls.some((c) => c.max_long_edge === settings.overviewLongEdge)).toBe(true);
-		expect(regionCalls.some((c) => c.max_long_edge === settings.workingImageLongEdge)).toBe(false);
+		expect(regionCalls.some((c) => c.maxLongEdge === settings.overviewLongEdge)).toBe(true);
+		expect(regionCalls.some((c) => c.maxLongEdge === settings.workingImageLongEdge)).toBe(false);
 	});
 
 	it("charges kept live overview alone into baseline (exact overflow)", async () => {
@@ -853,24 +857,26 @@ describe("makeRequestAssembler — live overview budget tier + rematerialize deg
 		expect(overviewTokens).toBeGreaterThan(detailTokens);
 
 		const regionCalls: number[] = [];
-		const flask: Pick<FlaskClient, "region"> = {
-			region: async (args) => {
-				regionCalls.push(args.max_long_edge ?? 0);
-				const le = args.max_long_edge ?? overviewLe;
+		const flask: Pick<PlatformClient, "region"> = {
+			region: async (request) => {
+				regionCalls.push(request.maxLongEdge ?? 0);
+				const le = request.maxLongEdge ?? overviewLe;
 				return {
-					image_base64: "QkFBQkE=",
-					mime: "image/jpeg",
+					bytes: Buffer.from("QkFBQkE=", "base64"),
+					mimeType: "image/jpeg",
 					width: le,
 					height: le,
-					src: { x: args.x as number, y: args.y as number, w: args.w as number, h: args.h as number },
+					src: { x: request.bbox.x, y: request.bbox.y, w: request.bbox.w, h: request.bbox.h },
 					magnification: null,
-					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+					contentSha256: "",
+					assetRevision: undefined,
+					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlayVersion: "v1", jpegQuality: 85 },
 				};
 			},
 		};
 		const captured: { overflow?: number } = {};
 		const deps = makeDeps({
-			flask: flask as FlaskClient,
+			flask: flask as unknown as PlatformClient,
 			settings: resolveTransformSettings({
 				visual_working_set_max: 4,
 				visual_context_budget_tokens: budget,
@@ -902,22 +908,24 @@ describe("makeRequestAssembler — live overview budget tier + rematerialize deg
 
 	it("degrades oversized live image that has pixels but no rematerialize src", async () => {
 		const regionCalls: unknown[] = [];
-		const flask: Pick<FlaskClient, "region"> = {
-			region: async (args) => {
-				regionCalls.push(args);
+		const flask: Pick<PlatformClient, "region"> = {
+			region: async (request) => {
+				regionCalls.push(request);
 				return {
-					image_base64: "QkFBQkE=",
-					mime: "image/jpeg",
+					bytes: Buffer.from("QkFBQkE=", "base64"),
+					mimeType: "image/jpeg",
 					width: 100,
 					height: 100,
 					src: { x: 0, y: 0, w: 1, h: 1 },
 					magnification: null,
-					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+					contentSha256: "",
+					assetRevision: undefined,
+					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlayVersion: "v1", jpegQuality: 85 },
 				};
 			},
 		};
 		const deps = makeDeps({
-			flask: flask as FlaskClient,
+			flask: flask as unknown as PlatformClient,
 			getSessionSnapshot: async () => trivialSnap(),
 		});
 		const assembler = makeRequestAssembler(deps);
@@ -965,13 +973,13 @@ describe("makeRequestAssembler — live overview budget tier + rematerialize deg
 	});
 
 	it("degrades to text when live rematerialize fails (does not keep oversized original)", async () => {
-		const flask: Pick<FlaskClient, "region"> = {
+		const flask: Pick<PlatformClient, "region"> = {
 			region: async () => {
 				throw new Error("region unavailable");
 			},
 		};
 		const deps = makeDeps({
-			flask: flask as FlaskClient,
+			flask: flask as unknown as PlatformClient,
 			firstSnapshotToolCallIdRef: { value: null },
 			getSessionSnapshot: async () => trivialSnap(),
 		});
@@ -991,22 +999,24 @@ describe("makeRequestAssembler — live overview budget tier + rematerialize deg
 
 	it("degrades to text when live fingerprint mismatches even if pixels fit the tier", async () => {
 		const regionCalls: unknown[] = [];
-		const flask: Pick<FlaskClient, "region"> = {
-			region: async (args) => {
-				regionCalls.push(args);
+		const flask: Pick<PlatformClient, "region"> = {
+			region: async (request) => {
+				regionCalls.push(request);
 				return {
-					image_base64: "QkFBQkE=",
-					mime: "image/jpeg",
+					bytes: Buffer.from("QkFBQkE=", "base64"),
+					mimeType: "image/jpeg",
 					width: 100,
 					height: 100,
 					src: { x: 0, y: 0, w: 1, h: 1 },
 					magnification: null,
-					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+					contentSha256: "",
+					assetRevision: undefined,
+					encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlayVersion: "v1", jpegQuality: 85 },
 				};
 			},
 		};
 		const deps = makeDeps({
-			flask: flask as FlaskClient,
+			flask: flask as unknown as PlatformClient,
 			getSessionSnapshot: async () => trivialSnap(),
 		});
 		const assembler = makeRequestAssembler(deps);
@@ -1037,21 +1047,23 @@ describe("makeRequestAssembler — live overview budget tier + rematerialize deg
 
 describe("makeRequestAssembler — overview_enabled=false (§17 risk 2)", () => {
 	/** Flask mock that records every region call (so we can prove the overview was never fetched). */
-	function makeRecordingFlask(): { flask: Pick<FlaskClient, "region">; calls: Array<{ x: number; y: number; w: number; h: number }> } {
+	function makeRecordingFlask(): { flask: Pick<PlatformClient, "region">; calls: Array<{ x: number; y: number; w: number; h: number }> } {
 		const calls: Array<{ x: number; y: number; w: number; h: number }> = [];
-		const region = async (args: { x: number; y: number; w: number; h: number }): Promise<RegionResult> => {
-			calls.push({ x: args.x, y: args.y, w: args.w, h: args.h });
+		const region = async (request: RegionRequest): Promise<RegionResult> => {
+			calls.push({ x: request.bbox.x, y: request.bbox.y, w: request.bbox.w, h: request.bbox.h });
 			return {
-				image_base64: "QUFBQQ==",
-				mime: "image/jpeg",
+				bytes: Buffer.from("QUFBQQ==", "base64"),
+				mimeType: "image/jpeg",
 				width: 1024,
 				height: 1024,
-				src: { x: args.x, y: args.y, w: args.w, h: args.h },
+				src: { x: request.bbox.x, y: request.bbox.y, w: request.bbox.w, h: request.bbox.h },
 				magnification: 20,
-				encoder: { id: "pillow", version: "test-v1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+				contentSha256: "",
+				assetRevision: undefined,
+				encoder: { id: "pillow", version: "test-v1", resize: "LANCZOS", overlayVersion: "v1", jpegQuality: 85 },
 			};
 		};
-		return { flask: { region } as Pick<FlaskClient, "region">, calls };
+		return { flask: { region } as Pick<PlatformClient, "region">, calls };
 	}
 
 	function makeOverviewCheckpoint(throughSeq: number): ContextCheckpoint {
@@ -1076,7 +1088,7 @@ describe("makeRequestAssembler — overview_enabled=false (§17 risk 2)", () => 
 		const { flask, calls } = makeRecordingFlask();
 		const cp = makeOverviewCheckpoint(0);
 		const deps = makeDeps({
-			flask: flask as FlaskClient,
+			flask: flask as unknown as PlatformClient,
 			// settings default to overviewEnabled=true; flip it off here.
 			settings: { ...resolveTransformSettings({}), overviewEnabled: false },
 			getSessionSnapshot: async () => ({
@@ -1114,7 +1126,7 @@ describe("makeRequestAssembler — overview_enabled=false (§17 risk 2)", () => 
 		const { flask, calls } = makeRecordingFlask();
 		const cp = makeOverviewCheckpoint(0);
 		const deps = makeDeps({
-			flask: flask as FlaskClient,
+			flask: flask as unknown as PlatformClient,
 			settings: resolveTransformSettings({}), // overviewEnabled defaults to true
 			getSessionSnapshot: async () => ({
 				checkpoint: cp,

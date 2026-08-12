@@ -56,7 +56,7 @@ import {
 } from "./session-store.js";
 // Re-export so server.ts can catch it uniformly alongside RootAnnotationGone.
 export { SessionConflict };
-import { FlaskHttpError, type FlaskClient, type RegionResult, type RoiDict } from "./flask-client.js";
+import { ContractError, bytesToBase64, legacySlide, type PlatformClient, type RegionResult, type RoiDict } from "./platform/contract.js";
 import { SessionEventBus } from "./events.js";
 import {
 	buildSpotIndexMessage,
@@ -273,20 +273,22 @@ export class RootAnnotationGone extends Error {
 
 /**
  * One per sidecar process. Owns the {@link SessionStore}, the live
- * {@link SessionEventBus}, and the {@link FlaskClient}. Run methods are
- * async-fire: they acquire + emit setup + kick off the loop, then return.
+ * {@link SessionEventBus}, and the {@link PlatformClient} (the platform
+ * capability surface; the concrete legacy adapter is wired in index.ts). Run
+ * methods are async-fire: they acquire + emit setup + kick off the loop, then
+ * return.
  */
 export class AgentRunner {
 	readonly store: SessionStore;
 	readonly bus: SessionEventBus;
-	readonly flask: FlaskClient;
+	readonly flask: PlatformClient;
 	private readonly overrides: AgentRunnerOverrides;
 	/** §12 metrics sink (defaults to console.info JSON line). */
 	private readonly metricsSink: MetricsSink;
 	/** Active agent per session, for cancel(). */
 	private readonly activeAgents = new Map<string, Agent>();
 
-	constructor(store: SessionStore, bus: SessionEventBus, flask: FlaskClient, overrides: AgentRunnerOverrides = {}) {
+	constructor(store: SessionStore, bus: SessionEventBus, flask: PlatformClient, overrides: AgentRunnerOverrides = {}) {
 		this.store = store;
 		this.bus = bus;
 		this.flask = flask;
@@ -425,8 +427,8 @@ export class AgentRunner {
 		// seed spot_cursor (app.py:1739).
 		await this.store.withLock(data.id, async (d) => {
 			if (!d) return null;
-			const spots = await this.flask.spots(slide, 0).catch(() => ({ changes: [], current_seq: 0 }));
-			d.spot_cursor = spots.current_seq || 0;
+			const spots = await this.flask.spots(legacySlide(slide), 0).catch(() => ({ changes: [], currentSeq: 0 }));
+			d.spot_cursor = spots.currentSeq || 0;
 			d.updated_at = Math.floor(Date.now() / 1000);
 			await this.store.writeSession(data.id, d);
 			return d;
@@ -509,8 +511,8 @@ export class AgentRunner {
 		// seed spot_cursor (same as fork).
 		await this.store.withLock(data.id, async (d) => {
 			if (!d) return null;
-			const spots = await this.flask.spots(slide, 0).catch(() => ({ changes: [], current_seq: 0 }));
-			d.spot_cursor = spots.current_seq || 0;
+			const spots = await this.flask.spots(legacySlide(slide), 0).catch(() => ({ changes: [], currentSeq: 0 }));
+			d.spot_cursor = spots.currentSeq || 0;
 			d.updated_at = Math.floor(Date.now() / 1000);
 			await this.store.writeSession(data.id, d);
 			return d;
@@ -1868,9 +1870,9 @@ export class AgentRunner {
 		const data = await this.store.readSession(sessionId);
 		if (!data) return [];
 		const cursor = Math.floor(data.spot_cursor || 0);
-		let result: { changes: Record<string, unknown>[]; current_seq: number };
+		let result: { changes: Record<string, unknown>[]; currentSeq: number };
 		try {
-			result = await this.flask.spots(slide, cursor);
+			result = await this.flask.spots(legacySlide(slide), cursor);
 		} catch {
 			return [];
 		}
@@ -1910,7 +1912,7 @@ export class AgentRunner {
 			if (!d) return null;
 			// Append with seq allocation (§10).
 			appendMessages(d, msgs);
-			d.spot_cursor = result.current_seq || cursor;
+			d.spot_cursor = result.currentSeq || cursor;
 			d.updated_at = Math.floor(Date.now() / 1000);
 			await this.store.writeSession(sessionId, d);
 			return d;
@@ -2233,13 +2235,13 @@ export class AgentRunner {
 		if (cached && Date.now() - cached.fetchedAt < AgentRunner.SLIDE_INFO_TTL_MS) {
 			return cached.info;
 		}
-		const r = await this.flask.slideInfo(slide);
+		const r = await this.flask.slideInfo(legacySlide(slide));
 		const info: SlideInfo = {
 			width: r.width,
 			height: r.height,
-			levelDownsamples: [...(r.level_downsamples || [1.0])],
+			levelDownsamples: [...(r.levelDownsamples || [1.0])],
 			mpp: r.mpp == null ? null : r.mpp,
-			fingerprint: r.fingerprint || "",
+			fingerprint: r.assetRevision || "",
 		};
 		const prev = this.slideInfoCache.get(slide);
 		if (prev && prev.info.fingerprint && prev.info.fingerprint !== info.fingerprint) {
@@ -2257,7 +2259,7 @@ export class AgentRunner {
 	private async findSpot(slide: string, annotationId: string): Promise<(RoiDict & { deleted?: boolean }) | null> {
 		let result;
 		try {
-			result = await this.flask.spots(slide, 0);
+			result = await this.flask.spots(legacySlide(slide), 0);
 		} catch {
 			return null;
 		}
@@ -2297,20 +2299,17 @@ export class AgentRunner {
 		let mag: string | null = null;
 		try {
 			const r: RegionResult = await this.flask.region({
-				slide,
-				x: ex,
-				y: ey,
-				w: ew,
-				h: eh,
+				slide: legacySlide(slide),
+				bbox: { x: ex, y: ey, w: ew, h: eh },
 				// Aspect-preserving longest edge (§6.1): fork/branch seed image is a
 				// small detail crop; use 1280 (detail tier) instead of fixed 1568².
-				max_long_edge: 1280,
-				expected_fingerprint: info.fingerprint || undefined,
+				maxLongEdge: 1280,
+				expectedAssetRevision: info.fingerprint || undefined,
 			});
-			b64 = r.image_base64 || "";
+			b64 = bytesToBase64(r.bytes);
 			mag = (r.magnification == null ? null : String(r.magnification)) || null;
 		} catch (e) {
-			if (e instanceof FlaskHttpError && e.status === 409) {
+			if (e instanceof ContractError && e.code === "slide_revision_conflict") {
 				this.invalidateSlideCaches(slide);
 			}
 			b64 = "";

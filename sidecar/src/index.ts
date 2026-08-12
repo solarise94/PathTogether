@@ -21,6 +21,7 @@ import { SessionEventBus } from "./events.js";
 import { AgentRunner } from "./agent-runner.js";
 import { SidecarServer } from "./server.js";
 import { createFlaskClient } from "./flask-client.js";
+import { LegacyFlaskPlatformAdapter } from "./platform/legacy-flask-adapter.js";
 
 async function main(): Promise<void> {
 	const store = new SessionStore();
@@ -42,7 +43,12 @@ async function main(): Promise<void> {
 	}
 
 	const bus = new SessionEventBus(store);
-	const flask = await createFlaskClient();
+	// Production wiring (§9.2): wrap the existing FlaskClient engine in the
+	// legacy PlatformClient adapter. HistoPilot core (AgentRunner / SidecarServer)
+	// sees only the PlatformClient surface; base64 decode + snake_case→camelCase
+	// normalization happen inside the adapter.
+	const flaskEngine = await createFlaskClient();
+	const flask = new LegacyFlaskPlatformAdapter({ flask: flaskEngine });
 	const runner = new AgentRunner(store, bus, flask);
 
 	const port = parseInt(process.env.AI_SIDECAR_PORT || "", 10) || 8055;

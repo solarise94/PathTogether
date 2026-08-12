@@ -26,7 +26,7 @@ import {
 	type CompactionOutcome,
 } from "../src/compaction.js";
 import { SessionStore } from "../src/session-store.js";
-import type { FlaskClient, SpotsResult } from "../src/flask-client.js";
+import type { ChangePage, PlatformClient } from "../src/platform/contract.js";
 
 // ------------------------------------------------------------------------- //
 // Fixtures
@@ -107,10 +107,10 @@ async function newStore(): Promise<SessionStore> {
 	return new SessionStore({ sessionsDir: dir });
 }
 
-/** A fake flask whose spots() returns a scripted change list. */
-function makeSpotsFlask(changes: Record<string, unknown>[] = [], currentSeq = 0): Pick<FlaskClient, "spots"> {
+/** A fake platform client whose spots() returns a scripted change list. */
+function makeSpotsFlask(changes: Record<string, unknown>[] = [], currentSeq = 0): Pick<PlatformClient, "spots"> {
 	return {
-		spots: async (_slide: string, _afterSeq: number): Promise<SpotsResult> => ({ changes, current_seq: currentSeq }),
+		spots: async (_ref: unknown, _afterSeq: number): Promise<ChangePage> => ({ changes: changes as ChangePage["changes"], currentSeq }),
 	};
 }
 
@@ -329,7 +329,7 @@ describe("compaction", () => {
 				],
 				7,
 			);
-			const r = await buildSpotIndexMessage(flask as unknown as FlaskClient, "slide");
+			const r = await buildSpotIndexMessage(flask as unknown as PlatformClient, "slide");
 			expect(r).not.toBeNull();
 			expect(r!.newCursor).toBe(7);
 			const text = (r!.message as { content: Array<{ type: string; text?: string }> }).content[0]!.text!;
@@ -342,13 +342,13 @@ describe("compaction", () => {
 
 		it("returns null when there are no visible spots", async () => {
 			const flask = makeSpotsFlask([], 0);
-			const r = await buildSpotIndexMessage(flask as unknown as FlaskClient, "slide");
+			const r = await buildSpotIndexMessage(flask as unknown as PlatformClient, "slide");
 			expect(r).toBeNull();
 		});
 
 		it("returns null when flask.spots throws", async () => {
 			const flask = { spots: async () => Promise.reject(new Error("boom")) };
-			const r = await buildSpotIndexMessage(flask as unknown as FlaskClient, "slide");
+			const r = await buildSpotIndexMessage(flask as unknown as PlatformClient, "slide");
 			expect(r).toBeNull();
 		});
 	});

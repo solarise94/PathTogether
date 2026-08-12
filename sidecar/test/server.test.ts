@@ -16,7 +16,7 @@ import { SessionStore } from "../src/session-store.js";
 import { SessionEventBus } from "../src/events.js";
 import { AgentRunner } from "../src/agent-runner.js";
 import { SidecarServer } from "../src/server.js";
-import type { FlaskClient } from "../src/flask-client.js";
+import type { PlatformClient } from "../src/platform/contract.js";
 
 /** Track created session dirs for cleanup. */
 const createdDirs: string[] = [];
@@ -41,8 +41,8 @@ async function startServer(fakeStreamFn: (model: unknown, context: unknown, opti
 	await store.ensureDir();
 	const bus = new SessionEventBus(store);
 	const mock = makeMockFlask();
-	const runner = new AgentRunner(store, bus, mock as unknown as FlaskClient, { streamFn: fakeStreamFn as never });
-	const server = new SidecarServer({ host: "127.0.0.1", port: 0, store, bus, flask: mock as unknown as FlaskClient, runner });
+	const runner = new AgentRunner(store, bus, mock as unknown as PlatformClient, { streamFn: fakeStreamFn as never });
+	const server = new SidecarServer({ host: "127.0.0.1", port: 0, store, bus, flask: mock as unknown as PlatformClient, runner });
 	await server.start();
 	const port = server.boundPort;
 	return { server, baseUrl: `http://127.0.0.1:${port}`, store, bus, mock };

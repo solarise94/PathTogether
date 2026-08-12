@@ -38,7 +38,7 @@ import { AgentRunner, RunConfig, SessionConflict, RootAnnotationGone, ConfigErro
 import { SessionStore, SessionConflict as StoreConflict } from "./session-store.js";
 import { SessionEventBus, formatEventFrame, formatPingFrame, formatEventResetFrame, formatSessionEndedFrame } from "./events.js";
 import { buildTranscript } from "./transcript.js";
-import type { FlaskClient } from "./flask-client.js";
+import type { PlatformClient } from "./platform/contract.js";
 
 // =========================================================================== //
 // Server options
@@ -49,11 +49,11 @@ export interface SidecarServerOptions {
 	host?: string;
 	/** Bind port (default env AI_SIDECAR_PORT or 8055). */
 	port?: number;
-	/** Override the runner/store/bus/flask (tests). */
+	/** Override the runner/store/bus/platform (tests). */
 	runner?: AgentRunner;
 	store?: SessionStore;
 	bus?: SessionEventBus;
-	flask?: FlaskClient;
+	flask?: PlatformClient;
 	/** Inject a fake streamFn into the runner (tests). */
 	streamFnOverride?: (model: unknown, context: unknown, options?: unknown) => unknown;
 }
@@ -68,7 +68,7 @@ export class SidecarServer {
 	readonly port: number;
 	readonly store: SessionStore;
 	readonly bus: SessionEventBus;
-	readonly flask: FlaskClient;
+	readonly flask: PlatformClient;
 	readonly runner: AgentRunner;
 	private server: Server | null = null;
 	/** The OS-assigned port after start() (equals {@link port} when non-zero). */
@@ -79,7 +79,7 @@ export class SidecarServer {
 		this.port = opts.port ?? defaultPort();
 		this.store = opts.store ?? new SessionStore();
 		this.bus = opts.bus ?? new SessionEventBus(this.store);
-		this.flask = opts.flask ?? (null as unknown as FlaskClient); // set via createSidecarServer in index.ts
+		this.flask = opts.flask ?? (null as unknown as PlatformClient); // set via createSidecarServer in index.ts
 		this.runner = opts.runner ?? new AgentRunner(this.store, this.bus, this.flask, opts.streamFnOverride ? { streamFn: opts.streamFnOverride as never } : {});
 	}
 

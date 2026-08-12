@@ -22,7 +22,7 @@ import type { Taskset, Task, RubricAssertion } from "../experiments/src/taskset.
 import type { Arm } from "../experiments/src/arms.js";
 import type { Manifest } from "../experiments/src/manifest.js";
 import type { FlaskClient } from "../src/flask-client.js";
-import { makeMockFlask, FINGERPRINT, SLIDE_W, SLIDE_H, DOWNSAMPLES, MPP } from "./helpers.js";
+import { makeLegacyFlaskMock, FINGERPRINT, SLIDE_W, SLIDE_H, DOWNSAMPLES, MPP } from "./helpers.js";
 import {
 	runExperiment,
 	buildRunConfig,
@@ -68,7 +68,7 @@ function stubManifest(): Manifest {
 /** Build an acquireEnv that returns the in-memory mock (no real Flask spawn). */
 function mockAcquireEnv(): (opts: RunOptions) => Promise<FixtureEnv> {
 	return async () => ({
-		flask: makeMockFlask() as unknown as FlaskClient,
+		flask: makeLegacyFlaskMock() as unknown as FlaskClient,
 		manifest: stubManifest(),
 		teardown: async () => {
 			// no-op: in-memory mock, no process to stop

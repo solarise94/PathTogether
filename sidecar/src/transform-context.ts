@@ -37,8 +37,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai";
 
-import type { FlaskClient } from "./flask-client.js";
-import { FlaskHttpError } from "./flask-client.js";
+import { ContractError, bytesToBase64, legacySlide, type PlatformClient, type RegionEncoder } from "./platform/contract.js";
 import type { SlideInfo } from "./tools.js";
 import { isImageContent, isImageRefContent, stripContextMeta, type ImageRefContent, type PersistedAgentMessage } from "./session-store.js";
 import { estimateImageRefTokens, estimateImagePixelsTokens, enforceVisualTokenBudget } from "./compaction.js";
@@ -690,7 +689,7 @@ async function mapPool<T, R>(
  *   images (§15.1). null when no snapshot is pending.
  */
 export function makeTransformContext(args: {
-	flask: FlaskClient;
+	flask: PlatformClient;
 	slide: string;
 	slideInfo: SlideInfo;
 	settings: TransformContextSettings;
@@ -750,7 +749,7 @@ type ImgPos = {
  */
 async function transformOnce(
 	messages: AgentMessage[],
-	flask: FlaskClient,
+	flask: PlatformClient,
 	slide: string,
 	slideInfo: SlideInfo,
 	settings: TransformContextSettings,
@@ -998,7 +997,7 @@ function estimatePosTokensForBudget(
  */
 async function normalizeLiveImage(
 	p: ImgPos,
-	flask: FlaskClient,
+	flask: PlatformClient,
 	slide: string,
 	slideInfo: SlideInfo,
 	settings: TransformContextSettings,
@@ -1080,7 +1079,7 @@ export function chooseTargetLongEdge(
  */
 async function materializeRef(
 	ref: ImageRefContent,
-	flask: FlaskClient,
+	flask: PlatformClient,
 	slide: string,
 	slideInfo: SlideInfo,
 	settings: TransformContextSettings,
@@ -1127,18 +1126,17 @@ async function materializeRef(
 		const result = await subscribeDerivative(
 			cacheKey,
 			async (fetchSignal) => {
-				const r = await flask.region({
-					slide,
-					x,
-					y,
-					w,
-					h,
-					max_long_edge: targetLongEdge,
-					jpeg_quality: settings.jpegQuality,
-					expected_fingerprint: fp || undefined,
-					signal: fetchSignal,
-				});
-				return { data: r.image_base64, mime: r.mime, encoder: r.encoder };
+				const r = await flask.region(
+					{
+						slide: legacySlide(slide),
+						bbox: { x, y, w, h },
+						maxLongEdge: targetLongEdge,
+						quality: settings.jpegQuality,
+						expectedAssetRevision: fp || undefined,
+					},
+					fetchSignal,
+				);
+				return { data: bytesToBase64(r.bytes), mime: r.mimeType, encoder: r.encoder };
 			},
 			signal,
 		);
@@ -1150,7 +1148,7 @@ async function materializeRef(
 		regionLruSet(cacheKey, { data: b64, mime, slide: normalizeSlideKey(slide), fingerprint: effectiveFp });
 		return { type: "image", data: b64, mimeType: mime };
 	} catch (e) {
-		if (e instanceof FlaskHttpError && e.status === 409) {
+		if (e instanceof ContractError && e.code === "slide_revision_conflict") {
 			invalidateRegionLru(slide);
 		}
 		// AbortError (user-cancel / last-subscriber-left) → degrade text, not a throw.
@@ -1216,14 +1214,14 @@ export function putDerivative(
  * @returns the base64 + mime + encoder info (when Flask returns it).
  */
 export async function materializeDerivativeRaw(args: {
-	flask: FlaskClient;
+	flask: PlatformClient;
 	slide: string;
 	slideInfo: SlideInfo;
 	spec: DerivativeSpec;
 	/** Pass the ref's slide_fingerprint so Flask can 409 on a mismatch. */
 	expectedFingerprint?: string;
 	signal?: AbortSignal;
-}): Promise<{ data: string; mime: string; encoder?: { id: string; version: string; resize: string; overlay_version: string; jpeg_quality: number } }> {
+}): Promise<{ data: string; mime: string; encoder?: RegionEncoder }> {
 	const { flask, slide, slideInfo, spec, signal } = args;
 	const cacheKey = derivativeKey(spec);
 	const fp = spec.fingerprint || "";
@@ -1241,18 +1239,17 @@ export async function materializeDerivativeRaw(args: {
 	const result = await subscribeDerivative(
 		cacheKey,
 		async (fetchSignal) => {
-			const r = await flask.region({
-				slide,
-				x: spec.x,
-				y: spec.y,
-				w: spec.w,
-				h: spec.h,
-				max_long_edge: spec.targetLongEdge,
-				jpeg_quality: spec.jpegQuality,
-				expected_fingerprint: args.expectedFingerprint || fp || undefined,
-				signal: fetchSignal,
-			});
-			return { data: r.image_base64, mime: r.mime, encoder: r.encoder };
+			const r = await flask.region(
+				{
+					slide: legacySlide(slide),
+					bbox: { x: spec.x, y: spec.y, w: spec.w, h: spec.h },
+					maxLongEdge: spec.targetLongEdge,
+					quality: spec.jpegQuality,
+					expectedAssetRevision: args.expectedFingerprint || fp || undefined,
+				},
+				fetchSignal,
+			);
+			return { data: bytesToBase64(r.bytes), mime: r.mimeType, encoder: r.encoder };
 		},
 		signal,
 	);
@@ -1262,7 +1259,9 @@ export async function materializeDerivativeRaw(args: {
 	}
 	const mime = result.mime || "image/jpeg";
 	regionLruSet(cacheKey, { data: b64, mime, slide: normalizeSlideKey(slide), fingerprint: fp });
-	const encoder = result.encoder as { id: string; version: string; resize: string; overlay_version: string; jpeg_quality: number } | undefined;
+	// subscribeDerivative types encoder as `unknown` (cache hits omit it); the
+	// callback above returns the contract RegionEncoder shape.
+	const encoder = result.encoder as RegionEncoder | undefined;
 	return { data: b64, mime, encoder };
 }
 

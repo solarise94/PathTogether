@@ -63,7 +63,7 @@ import {
 import type { Api, Model, Models } from "@earendil-works/pi-ai";
 import { createCompactionSummaryMessage } from "@earendil-works/pi-agent-core";
 
-import type { FlaskClient } from "./flask-client.js";
+import { legacySlide, type PlatformClient } from "./platform/contract.js";
 import {
 	collectImageMeta,
 	dehydrateMessages,
@@ -544,12 +544,12 @@ function estimateRetainedVisualTokens(messages: AgentMessage[]): number {
  * Returns null when there are no visible spots.
  */
 export async function buildSpotIndexMessage(
-	flask: FlaskClient,
+	platform: PlatformClient,
 	slide: string,
 ): Promise<{ message: AgentMessage; newCursor: number } | null> {
 	let result;
 	try {
-		result = await flask.spots(slide, 0);
+		result = await platform.spots(legacySlide(slide), 0);
 	} catch {
 		return null;
 	}
@@ -571,7 +571,7 @@ export async function buildSpotIndexMessage(
 		content: [{ type: "text", text: lines.join("\n") }],
 		timestamp: Date.now(),
 	} as AgentMessage;
-	return { message, newCursor: result.current_seq || 0 };
+	return { message, newCursor: result.currentSeq || 0 };
 }
 
 function fmt0(v: number): string {

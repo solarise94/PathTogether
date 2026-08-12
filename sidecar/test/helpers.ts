@@ -12,13 +12,15 @@
 import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 
 import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEvent, type AssistantMessageEventStream } from "@earendil-works/pi-ai";
 
 import { SessionStore } from "../src/session-store.js";
 import { SessionEventBus } from "../src/events.js";
 import { AgentRunner } from "../src/agent-runner.js";
-import type { FlaskClient, RegionResult, RoiDict, SlideInfoResult, SpotsResult } from "../src/flask-client.js";
+import type { CreateAnnotationRequest, PlatformClient, RegionResult, RegionRequest, RoiDict, SlideDescriptor } from "../src/platform/contract.js";
+import type { FlaskClient } from "../src/flask-client.js";
 
 // ------------------------------------------------------------------------- //
 // Slide fixture: a small pretend pyramid. mpp 0.5 → level-0 20x.
@@ -151,8 +153,8 @@ function makeAssistant(content: AssistantMessage["content"], stopReason: Assista
 // ------------------------------------------------------------------------- //
 
 export interface MockFlaskState {
-	regionCalls: Array<{ x: number; y: number; w: number; h: number; out_w?: number; out_h?: number }>;
-	annotateCalls: Array<{ label: string; x: number; y: number; side_px: number; note?: string; effect_key?: string; session_id?: string }>;
+	regionCalls: Array<{ x: number; y: number; w: number; h: number; outW?: number; outH?: number; maxLongEdge?: number; expectedAssetRevision?: string }>;
+	annotateCalls: Array<{ label: string; x: number; y: number; sidePx: number; note?: string; effectKey?: string; sessionId?: string }>;
 	/** Spot change log; the test mutates this to simulate annotation edits. */
 	spotChanges: Array<Record<string, unknown> & { annotation_id: string; deleted?: boolean; change_seq: number }>;
 	currentSeq: number;
@@ -163,7 +165,7 @@ export interface MockFlaskState {
 	regionError?: Error;
 }
 
-export function makeMockFlask(initialSpots: Array<Record<string, unknown> & { annotation_id: string; deleted?: boolean; change_seq: number }> = []): MockFlaskState & Pick<FlaskClient, "region" | "annotate" | "spots" | "slideInfo"> {
+export function makeMockFlask(initialSpots: Array<Record<string, unknown> & { annotation_id: string; deleted?: boolean; change_seq: number }> = []): MockFlaskState & Pick<PlatformClient, "region" | "annotate" | "spots" | "slideInfo"> {
 	// The returned object proxies mutable fields through getters/setters so
 	// test code mutating `mock.currentSeq` / `mock.spotChanges` is visible to
 	// the closure-based method implementations.
@@ -192,27 +194,52 @@ export function makeMockFlask(initialSpots: Array<Record<string, unknown> & { an
 		},
 	};
 	const obj = {
-		async region(args: { x: number; y: number; w: number; h: number; out_w?: number; out_h?: number }) {
-			state.regionCalls.push({ ...args });
+		async region(request: RegionRequest) {
+			state.regionCalls.push({
+				x: request.bbox.x,
+				y: request.bbox.y,
+				w: request.bbox.w,
+				h: request.bbox.h,
+				outW: request.outW,
+				outH: request.outH,
+				maxLongEdge: request.maxLongEdge,
+				expectedAssetRevision: request.expectedAssetRevision,
+			});
 			if (state.regionError) throw state.regionError;
-			return {
-				image_base64: state.regionResult?.image_base64 ?? "AAAA",
-				mime: state.regionResult?.mime ?? "image/jpeg",
-				width: state.regionResult?.width ?? args.out_w ?? 1024,
-				height: state.regionResult?.height ?? args.out_h ?? 1024,
-				src: state.regionResult?.src ?? { x: args.x, y: args.y, w: args.w, h: args.h },
-				magnification: state.regionResult?.magnification ?? 20,
-			} as RegionResult;
+			const ov = state.regionResult;
+			// Aspect-preserving width/height echo when maxLongEdge is set and no
+			// explicit override (mirrors the real Flask server behavior).
+			let ow = ov?.width ?? request.outW ?? 1024;
+			let oh = ov?.height ?? request.outH ?? 1024;
+			if (request.maxLongEdge && !ov?.width) {
+				const longest = Math.max(request.bbox.w, request.bbox.h);
+				const scale = request.maxLongEdge / longest;
+				ow = Math.max(1, Math.round(request.bbox.w * scale));
+				oh = Math.max(1, Math.round(request.bbox.h * scale));
+			}
+			const bytes: Uint8Array = ov?.bytes ?? Buffer.from("AAAA", "base64");
+			const r: RegionResult = {
+				bytes,
+				mimeType: ov?.mimeType ?? "image/jpeg",
+				width: ow,
+				height: oh,
+				src: ov?.src ?? { x: request.bbox.x, y: request.bbox.y, w: request.bbox.w, h: request.bbox.h },
+				magnification: ov?.magnification ?? 20,
+				contentSha256: ov?.contentSha256 ?? createHash("sha256").update(Buffer.from(bytes)).digest("hex"),
+				assetRevision: ov?.assetRevision,
+				encoder: ov?.encoder,
+			};
+			return r;
 		},
-		async annotate(args: { slide: string; label: string; x: number; y: number; side_px: number; note?: string; effect_key?: string; session_id?: string }) {
-			state.annotateCalls.push({ ...args });
+		async annotate(args: CreateAnnotationRequest) {
+			state.annotateCalls.push({ label: args.label, x: args.x, y: args.y, sidePx: args.sidePx, note: args.note, effectKey: args.effectKey, sessionId: args.sessionId });
 			state.currentSeq += 1;
 			const roi: RoiDict = {
 				...state.annotateResult,
 				label: args.label,
 				x: args.x,
 				y: args.y,
-				side_px: args.side_px,
+				side_px: args.sidePx,
 				note: args.note ?? "",
 				change_seq: state.currentSeq,
 			};
@@ -220,12 +247,12 @@ export function makeMockFlask(initialSpots: Array<Record<string, unknown> & { an
 			state.spotChanges.push({ ...roi, annotation_id: roi.annotation_id, deleted: false, change_seq: state.currentSeq });
 			return roi;
 		},
-		async spots(_slide: string, afterSeq: number): Promise<SpotsResult> {
+		async spots(_ref: unknown, afterSeq: number) {
 			const changes = state.spotChanges.filter((s) => (s.change_seq || 0) > afterSeq);
-			return { changes, current_seq: state.currentSeq };
+			return { changes, currentSeq: state.currentSeq };
 		},
-		async slideInfo(_slide: string): Promise<SlideInfoResult> {
-			return { width: SLIDE_W, height: SLIDE_H, level_downsamples: [...DOWNSAMPLES], mpp: MPP, fingerprint: FINGERPRINT };
+		async slideInfo(_ref: unknown): Promise<SlideDescriptor> {
+			return { width: SLIDE_W, height: SLIDE_H, levelDownsamples: [...DOWNSAMPLES], mpp: MPP, assetRevision: FINGERPRINT };
 		},
 	};
 	// Proxy mutable fields through getters/setters so test code mutating them
@@ -239,7 +266,36 @@ export function makeMockFlask(initialSpots: Array<Record<string, unknown> & { an
 		regionResult: { get: () => state.regionResult, set: (v) => { state.regionResult = v; }, enumerable: true, configurable: true },
 		regionError: { get: () => state.regionError, set: (v) => { state.regionError = v; }, enumerable: true, configurable: true },
 	});
-	return obj as unknown as MockFlaskState & Pick<FlaskClient, "region" | "annotate" | "spots" | "slideInfo">;
+	return obj as unknown as MockFlaskState & Pick<PlatformClient, "region" | "annotate" | "spots" | "slideInfo">;
+}
+
+/**
+ * A mock of the LEGACY {@link FlaskClient} engine (Flask `/internal/ai/*` wire
+ * shape: `image_base64`, `current_seq`, `level_downsamples`, `fingerprint`).
+ *
+ * Use this for code paths that wrap the engine in {@link LegacyFlaskPlatformAdapter}
+ * (the experiment runner in experiments/src/run.ts), where the mock stands in for
+ * the real Flask process. For code paths that take a {@link PlatformClient}
+ * directly (AgentRunner / tools / assembler tests), use {@link makeMockFlask}
+ * instead — it returns the decoded contract shape.
+ */
+export function makeLegacyFlaskMock(): Pick<FlaskClient, "region" | "annotate" | "spots" | "slideInfo"> {
+	const region = async (args: { x: number; y: number; w: number; h: number; out_w?: number; out_h?: number; max_long_edge?: number }) => ({
+		image_base64: "QUFBQQ==", // "AAAA"
+		mime: "image/jpeg",
+		width: args.out_w ?? 1024,
+		height: args.out_h ?? 1024,
+		src: { x: args.x, y: args.y, w: args.w, h: args.h },
+		magnification: 20,
+		encoder: { id: "pillow", version: "test", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+	});
+	const annotate = async () => ({
+		annotation_id: "ann-uuid-1", index: 0, token: "admin", slide: SLIDE, label: "", note: "", type: "rect",
+		x: 0, y: 0, side_px: 0, size_mm: 0, shared: false, source: "ai", created_by_session_id: "", change_seq: 1, revision: 1,
+	});
+	const spots = async (_slide: string, _afterSeq: number) => ({ changes: [], current_seq: 0 });
+	const slideInfo = async (_slide: string) => ({ width: SLIDE_W, height: SLIDE_H, level_downsamples: [...DOWNSAMPLES], mpp: MPP, fingerprint: FINGERPRINT });
+	return { region, annotate, spots, slideInfo } as unknown as Pick<FlaskClient, "region" | "annotate" | "spots" | "slideInfo">;
 }
 
 // ------------------------------------------------------------------------- //
@@ -271,7 +327,7 @@ export async function newHarness(
 	const store = new SessionStore({ sessionsDir: dir });
 	const bus = new SessionEventBus(store);
 	const mock = makeMockFlask();
-	const runner = new AgentRunner(store, bus, mock as unknown as FlaskClient, {
+	const runner = new AgentRunner(store, bus, mock as unknown as PlatformClient, {
 		streamFn: fakeStreamFn as never,
 		...(overrides.compactionModels ? { compactionModels: overrides.compactionModels } : {}),
 	});

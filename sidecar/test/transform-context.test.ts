@@ -27,7 +27,7 @@ import {
 	materializeDerivativeRaw,
 	type RichHistoryObservation,
 } from "../src/transform-context.js";
-import type { FlaskClient, RegionResult } from "../src/flask-client.js";
+import type { PlatformClient, RegionRequest, RegionResult } from "../src/platform/contract.js";
 import type { SlideInfo } from "../src/tools.js";
 import type { ImageRefContent, PersistedAgentMessage } from "../src/session-store.js";
 
@@ -86,18 +86,33 @@ function toolResultMsg(toolCallId: string, blocks: unknown[], ts = Date.now()): 
  *   - opts.blockUntil: a promise the call awaits before resolving (for abort-
  *     timing tests where we need the fetch to be observable in-flight).
  *
- * Records every call's args (including max_long_edge / signal) on lastArgs.
+ * Records every call's args (including maxLongEdge / signal) on lastArgs.
  */
 function makeFlask(
 	opts: { fail?: boolean; emptyB64?: boolean; b64ByRefId?: Record<string, string>; delayMs?: number; blockUntil?: Promise<void> } = {},
-): Pick<FlaskClient, "region"> & { calls: number; lastArgs: Array<Record<string, unknown>>; invocations: Array<{ args: Record<string, unknown>; startedAt: number; signal?: AbortSignal }> } {
+): Pick<PlatformClient, "region"> & { calls: number; lastArgs: Array<Record<string, unknown>>; invocations: Array<{ args: Record<string, unknown>; startedAt: number; signal?: AbortSignal }> } {
 	const state = { calls: 0 };
 	const lastArgs: Array<Record<string, unknown>> = [];
 	const invocations: Array<{ args: Record<string, unknown>; startedAt: number; signal?: AbortSignal }> = [];
-	const region = async (args: Record<string, unknown> & { x: number; y: number; w: number; h: number; out_w?: number; out_h?: number; max_long_edge?: number; signal?: AbortSignal }): Promise<RegionResult> => {
+	const region = async (request: RegionRequest, signal?: AbortSignal): Promise<RegionResult> => {
+		const x = request.bbox.x;
+		const y = request.bbox.y;
+		const w = request.bbox.w;
+		const h = request.bbox.h;
+		// Flatten the contract request into a record so assertions read the
+		// camelCase fields the consumer actually sent (maxLongEdge / outW / ...).
+		const args: Record<string, unknown> = {
+			x, y, w, h,
+			slide: request.slide,
+			outW: request.outW,
+			outH: request.outH,
+			maxLongEdge: request.maxLongEdge,
+			quality: request.quality,
+			expectedAssetRevision: request.expectedAssetRevision,
+		};
 		state.calls += 1;
 		lastArgs.push(args);
-		const sig = args.signal as AbortSignal | undefined;
+		const sig = signal;
 		invocations.push({ args, startedAt: Date.now(), signal: sig });
 		// Wait on a blocker if provided (lets tests observe in-flight state).
 		if (opts.blockUntil) {
@@ -113,28 +128,31 @@ function makeFlask(
 			err.name = "AbortError";
 			throw err;
 		}
-		const b64 = (opts.b64ByRefId && opts.b64ByRefId[`x${args.x}y${args.y}`]) || "QUFBQQ=="; // "AAAA"
-		// When max_long_edge is set, echo a width/height that preserves aspect.
-		let ow = (args.out_w as number | undefined) ?? 1024;
-		let oh = (args.out_h as number | undefined) ?? 1024;
-		if (args.max_long_edge) {
-			const longest = Math.max(args.w, args.h);
-			const scale = (args.max_long_edge as number) / longest;
-			ow = Math.max(1, Math.round(args.w * scale));
-			oh = Math.max(1, Math.round(args.h * scale));
+		const b64 = (opts.b64ByRefId && opts.b64ByRefId[`x${x}y${y}`]) || "QUFBQQ=="; // "AAAA"
+		// When maxLongEdge is set, echo a width/height that preserves aspect.
+		let ow = request.outW ?? 1024;
+		let oh = request.outH ?? 1024;
+		if (request.maxLongEdge) {
+			const longest = Math.max(w, h);
+			const scale = request.maxLongEdge / longest;
+			ow = Math.max(1, Math.round(w * scale));
+			oh = Math.max(1, Math.round(h * scale));
 		}
+		const bytes = Buffer.from(opts.emptyB64 ? "" : b64, "base64");
 		return {
-			image_base64: opts.emptyB64 ? "" : b64,
-			mime: "image/jpeg",
+			bytes,
+			mimeType: "image/jpeg",
 			width: ow,
 			height: oh,
-			src: { x: args.x, y: args.y, w: args.w, h: args.h },
+			src: { x, y, w, h },
 			magnification: 20,
-			encoder: { id: "pillow", version: "test", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+			contentSha256: "",
+			assetRevision: undefined,
+			encoder: { id: "pillow", version: "test", resize: "LANCZOS", overlayVersion: "v1", jpegQuality: 85 },
 		};
 	};
 	// Use getters so `calls` reflects the live closure counter.
-	const obj: Pick<FlaskClient, "region"> & { calls: number; lastArgs: Array<Record<string, unknown>>; invocations: Array<{ args: Record<string, unknown>; startedAt: number; signal?: AbortSignal }> } = {
+	const obj: Pick<PlatformClient, "region"> & { calls: number; lastArgs: Array<Record<string, unknown>>; invocations: Array<{ args: Record<string, unknown>; startedAt: number; signal?: AbortSignal }> } = {
 		region: region as never,
 		get calls() {
 			return state.calls;
@@ -190,7 +208,7 @@ describe("transform-context", () => {
 		it("turns an image_ref into an image block via flask.region", async () => {
 			const flask = makeFlask();
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ keep_recent_images: 6 }),
@@ -207,7 +225,7 @@ describe("transform-context", () => {
 		it("degrades to text when flask.region throws (fingerprint/availability)", async () => {
 			const flask = makeFlask({ fail: true });
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ keep_recent_images: 6 }),
@@ -225,7 +243,7 @@ describe("transform-context", () => {
 		it("degrades to text when region returns empty base64", async () => {
 			const flask = makeFlask({ emptyB64: true });
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ keep_recent_images: 6 }),
@@ -240,7 +258,7 @@ describe("transform-context", () => {
 		it("preserves sibling text blocks and non-content messages", async () => {
 			const flask = makeFlask();
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ keep_recent_images: 6 }),
@@ -266,7 +284,7 @@ describe("transform-context", () => {
 		it("keeps only the last N images, drops older ones to placeholder text", async () => {
 			const flask = makeFlask();
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ keep_recent_images: 6 }),
@@ -294,7 +312,7 @@ describe("transform-context", () => {
 			const flask = makeFlask();
 			const firstSnapshotRef = { value: "snap-overview-1" };
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ keep_recent_images: 2 }),
@@ -323,7 +341,7 @@ describe("transform-context", () => {
 			const flask = makeFlask();
 			// No identity ref set → coverage heuristic must catch the wide bbox.
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ keep_recent_images: 1 }),
@@ -345,7 +363,7 @@ describe("transform-context", () => {
 		it("protects only the FIRST >90% coverage image when firstSnapshotToolCallId is null", async () => {
 			const flask = makeFlask();
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ keep_recent_images: 1 }),
@@ -366,7 +384,7 @@ describe("transform-context", () => {
 		it("does not evict when under the cap", async () => {
 			const flask = makeFlask();
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ keep_recent_images: 6 }),
@@ -385,7 +403,7 @@ describe("transform-context", () => {
 		it("skips flask.region and degrades when slide_fingerprint mismatches slideInfo", async () => {
 			const flask = makeFlask();
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ keep_recent_images: 6 }),
@@ -403,7 +421,7 @@ describe("transform-context", () => {
 		it("passes expected_fingerprint to flask.region", async () => {
 			const flask = makeFlask();
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ keep_recent_images: 6 }),
@@ -411,7 +429,7 @@ describe("transform-context", () => {
 			});
 			await transform([userMsg([imgRef("ref_a", { x: 1, y: 1, w: 10, h: 10 })])]);
 			expect(flask.calls).toBe(1);
-			expect((flask.lastArgs[0] as { expected_fingerprint?: string }).expected_fingerprint).toBe("fp-test");
+			expect((flask.lastArgs[0] as { expectedAssetRevision?: string }).expectedAssetRevision).toBe("fp-test");
 		});
 	});
 
@@ -431,7 +449,7 @@ describe("transform-context", () => {
 			};
 			const flask = makeFlask();
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: poisonInfo as unknown as SlideInfo,
 				settings: resolveTransformSettings({ keep_recent_images: 6 }),
@@ -448,7 +466,7 @@ describe("transform-context", () => {
 		it("is pure: does not mutate the input array", async () => {
 			const flask = makeFlask();
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ keep_recent_images: 6 }),
@@ -463,7 +481,7 @@ describe("transform-context", () => {
 		it("handles string content (passthrough)", async () => {
 			const flask = makeFlask();
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ keep_recent_images: 6 }),
@@ -479,14 +497,14 @@ describe("transform-context", () => {
 			const flask = makeFlask();
 			const src = { x: 5, y: 5, w: 20, h: 20 };
 			const transformA = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: "a.svs",
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ keep_recent_images: 6 }),
 				firstSnapshotToolCallIdRef: { value: null },
 			});
 			const transformB = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: "b.svs",
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ keep_recent_images: 6 }),
@@ -498,7 +516,7 @@ describe("transform-context", () => {
 			expect(flask.calls).toBe(1); // LRU hit for a.svs
 			await transformB([userMsg([imgRef("ref_a", src)])]);
 			expect(flask.calls).toBe(2); // different slide → miss
-			expect((flask.lastArgs[1] as { slide: string }).slide).toBe("b.svs");
+			expect((flask.lastArgs[1] as { slide: { filename: string } }).slide.filename).toBe("b.svs");
 		});
 	});
 
@@ -517,7 +535,7 @@ describe("transform-context", () => {
 		it("strips _context_meta from the transform output (happy path)", async () => {
 			const flask = makeFlask();
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ keep_recent_images: 6 }),
@@ -539,7 +557,7 @@ describe("transform-context", () => {
 		it("strips _context_meta on the fallback (degrade) path too", async () => {
 			const flask = makeFlask({ fail: true });
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ keep_recent_images: 6 }),
@@ -563,7 +581,7 @@ describe("transform-context", () => {
 		it("requests max_long_edge (not fixed 1568×1568) preserving aspect ratio", async () => {
 			const flask = makeFlask();
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ visual_working_set_max: 6 }),
@@ -573,17 +591,17 @@ describe("transform-context", () => {
 			await transform([userMsg([imgRef("ref_a", { x: 0, y: 0, w: 1000, h: 500 })])]);
 			expect(flask.calls).toBe(1);
 			const args = flask.lastArgs[0]!;
-			expect(args.max_long_edge).toBe(1280); // detail tier for newest ordinary
-			expect(args.out_w).toBeUndefined();
-			expect(args.out_h).toBeUndefined();
+			expect(args.maxLongEdge).toBe(1280); // detail tier for newest ordinary
+			expect(args.outW).toBeUndefined();
+			expect(args.outH).toBeUndefined();
 			// Mock echoes aspect-preserving width/height: longest edge 1280 → 1280×640.
-			expect(args.jpeg_quality).toBe(85);
+			expect(args.quality).toBe(85);
 		});
 
 		it("overview ref uses overview_long_edge tier (1024)", async () => {
 			const flask = makeFlask();
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ visual_working_set_max: 1 }),
@@ -599,14 +617,14 @@ describe("transform-context", () => {
 			// Overview (first call) → 1024; newest ordinary (s2) → 1280 (detail).
 			const overviewArgs = flask.lastArgs.find((a) => (a.x as number) === 0);
 			const detailArgs = flask.lastArgs.find((a) => (a.x as number) === 1);
-			expect(overviewArgs?.max_long_edge).toBe(1024);
-			expect(detailArgs?.max_long_edge).toBe(1280);
+			expect(overviewArgs?.maxLongEdge).toBe(1024);
+			expect(detailArgs?.maxLongEdge).toBe(1280);
 		});
 
 		it("configurable long edges flow into region request", async () => {
 			const flask = makeFlask();
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({
@@ -627,9 +645,9 @@ describe("transform-context", () => {
 			const ovArgs = flask.lastArgs.find((a) => (a.x as number) === 0);
 			const s2Args = flask.lastArgs.find((a) => (a.x as number) === 1);
 			const s3Args = flask.lastArgs.find((a) => (a.x as number) === 2);
-			expect(ovArgs?.max_long_edge).toBe(900);
-			expect(s2Args?.max_long_edge).toBe(600);
-			expect(s3Args?.max_long_edge).toBe(1100);
+			expect(ovArgs?.maxLongEdge).toBe(900);
+			expect(s2Args?.maxLongEdge).toBe(600);
+			expect(s3Args?.maxLongEdge).toBe(1100);
 		});
 	});
 
@@ -653,7 +671,7 @@ describe("transform-context", () => {
 				[`x1y1`]: BIG, [`x2y2`]: BIG, [`x3y3`]: BIG,
 			} });
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ visual_working_set_max: 6, image_derivative_cache_max_mb: 1300 / (1024 * 1024) }),
@@ -677,7 +695,7 @@ describe("transform-context", () => {
 				[`x1y1`]: BIG, [`x2y2`]: BIG, [`x3y3`]: BIG,
 			} });
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ visual_working_set_max: 6, image_derivative_cache_max_mb: 1300 / (1024 * 1024) }),
@@ -699,7 +717,7 @@ describe("transform-context", () => {
 			clearRegionLru();
 			const flask = makeFlask();
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ visual_working_set_max: 6 }),
@@ -716,7 +734,7 @@ describe("transform-context", () => {
 			clearRegionLru();
 			const flask = makeFlask();
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ visual_working_set_max: 6, image_derivative_cache_ttl: 0.001 }),
@@ -734,14 +752,14 @@ describe("transform-context", () => {
 			clearRegionLru();
 			const flask = makeFlask();
 			const transformA = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: "a.svs",
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ visual_working_set_max: 6 }),
 				firstSnapshotToolCallIdRef: { value: null },
 			});
 			const transformB = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: "b.svs",
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ visual_working_set_max: 6 }),
@@ -765,7 +783,7 @@ describe("transform-context", () => {
 		it("does not start queued tasks once the signal is aborted", async () => {
 			const flask = makeFlask({ delayMs: 50 });
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ visual_working_set_max: 6, region_materialize_concurrency: 1 }),
@@ -797,7 +815,7 @@ describe("transform-context", () => {
 			});
 			const flask = makeFlask({ blockUntil: blocker });
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ visual_working_set_max: 6 }),
@@ -832,14 +850,14 @@ describe("transform-context", () => {
 			const flask = makeFlask({ blockUntil: blocker });
 			const settings = resolveTransformSettings({ visual_working_set_max: 6 });
 			const tA = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings,
 				firstSnapshotToolCallIdRef: { value: null },
 			});
 			const tB = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings,
@@ -884,14 +902,14 @@ describe("transform-context", () => {
 			const flask = makeFlask({ blockUntil: blocker });
 			const settings = resolveTransformSettings({ visual_working_set_max: 6 });
 			const tA = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings,
 				firstSnapshotToolCallIdRef: { value: null },
 			});
 			const tB = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings,
@@ -924,7 +942,7 @@ describe("transform-context", () => {
 			const flask = makeFlask({ blockUntil: blocker });
 			const settings = resolveTransformSettings({ visual_working_set_max: 6 });
 			const tA = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings,
@@ -951,7 +969,7 @@ describe("transform-context", () => {
 			clearRegionLru();
 			const flask = makeFlask();
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ visual_working_set_max: 2 }),
@@ -978,7 +996,7 @@ describe("transform-context", () => {
 			clearRegionLru();
 			const flask = makeFlask();
 			const transform = makeTransformContext({
-				flask: flask as unknown as FlaskClient,
+				flask: flask as unknown as PlatformClient,
 				slide: SLIDE,
 				slideInfo: SLIDE_INFO,
 				settings: resolveTransformSettings({ visual_working_set_max: 6 }),
@@ -992,7 +1010,7 @@ describe("transform-context", () => {
 			await transform(msgs);
 			// s2 is newest ordinary → detail; snap-pending also detail.
 			const pendingArgs = flask.lastArgs.find((a) => (a.x as number) === 1);
-			expect(pendingArgs?.max_long_edge).toBe(1280);
+			expect(pendingArgs?.maxLongEdge).toBe(1280);
 		});
 	});
 });
@@ -1020,7 +1038,7 @@ describe("Phase 2b — §9.1 visual budget hard cap (P2-3)", () => {
 		// firstSnapshotToolCallIdRef = "snap-0" → ref_snap-0 is overview.
 		// pendingSnapshotIdRef = "snap-pending" → ref_snap-pending is pending.
 		const transform = makeTransformContext({
-			flask: flask as unknown as FlaskClient,
+			flask: flask as unknown as PlatformClient,
 			slide: SLIDE,
 			slideInfo: SLIDE_INFO,
 			settings: resolveTransformSettings({
@@ -1048,7 +1066,7 @@ describe("Phase 2b — §9.1 visual budget hard cap (P2-3)", () => {
 	it("does not evict when the budget is ample (recency behaviour unchanged)", async () => {
 		const flask = makeFlask();
 		const transform = makeTransformContext({
-			flask: flask as unknown as FlaskClient,
+			flask: flask as unknown as PlatformClient,
 			slide: SLIDE,
 			slideInfo: SLIDE_INFO,
 			settings: resolveTransformSettings({
@@ -1086,7 +1104,7 @@ describe("Phase 2b — LRU hit/miss counters (§12)", () => {
 			jpegQuality: 85,
 			overlayVersion: "v1",
 		});
-		const r1 = await materializeDerivativeRaw({ flask: flask as unknown as FlaskClient, slide: SLIDE, slideInfo: SLIDE_INFO, spec });
+		const r1 = await materializeDerivativeRaw({ flask: flask as unknown as PlatformClient, slide: SLIDE, slideInfo: SLIDE_INFO, spec });
 		expect(r1.data).toBe("QUFBQQ==");
 		// The first call records a region call (miss path). Note:
 		// materializeDerivativeRaw uses regionLruGet with countMiss=false, so the
@@ -1106,7 +1124,7 @@ describe("Phase 2b — LRU hit/miss counters (§12)", () => {
 			jpegQuality: 85,
 			overlayVersion: "v1",
 		});
-		await materializeDerivativeRaw({ flask: flask as unknown as FlaskClient, slide: SLIDE, slideInfo: SLIDE_INFO, spec });
+		await materializeDerivativeRaw({ flask: flask as unknown as PlatformClient, slide: SLIDE, slideInfo: SLIDE_INFO, spec });
 		const peeked = peekDerivative(spec);
 		expect(peeked).toBeDefined();
 		expect(peeked?.data).toBe("QUFBQQ==");
@@ -1122,7 +1140,7 @@ describe("Phase 2b — LRU hit/miss counters (§12)", () => {
 			jpegQuality: 85,
 			overlayVersion: "v1",
 		});
-		await materializeDerivativeRaw({ flask: flask as unknown as FlaskClient, slide: SLIDE, slideInfo: SLIDE_INFO, spec });
+		await materializeDerivativeRaw({ flask: flask as unknown as PlatformClient, slide: SLIDE, slideInfo: SLIDE_INFO, spec });
 		expect(peekDerivative(spec)).toBeDefined();
 		dropDerivative(spec);
 		expect(peekDerivative(spec)).toBeUndefined();
@@ -1240,7 +1258,7 @@ describe("Phase 2b — §9.1 visual budget eviction direction (review fix)", () 
 		// so the OLDEST (s1) is evicted and s2/s3 survive. Recency KEEP keeps all
 		// 3 (visual_working_set_max=4); the budget pass then evicts s1.
 		const transform = makeTransformContext({
-			flask: flask as unknown as FlaskClient,
+			flask: flask as unknown as PlatformClient,
 			slide: SLIDE,
 			slideInfo: SLIDE_INFO,
 			settings: resolveTransformSettings({

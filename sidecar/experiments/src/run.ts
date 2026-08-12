@@ -197,6 +197,12 @@ export interface RunOptions {
 	/** Keep Flask alive after the run (debug). */
 	keepFlask?: boolean;
 	/**
+	 * Cooldown gap between cells (ms, default 0). Real-model runs against
+	 * rate-limited upstreams (ikuncode model_cooldown observed 2026-08-13)
+	 * need a gap so a 7-cell arm doesn't trip the provider's cooldown window.
+	 */
+	cellGapMs?: number;
+	/**
 	 * Dry-run: resolve + print the matrix + config (key redacted) and return
 	 * WITHOUT acquiring the env or executing any cell. Useful for pre-run review.
 	 */
@@ -882,6 +888,13 @@ export async function runExperiment(opts: RunOptions, deps: RunnerDeps): Promise
 				// eslint-disable-next-line no-console
 				console.log(`[run] SKIP arm=${arm.arm_id} task=${task.id} (--max-cells ${opts.maxCells} reached)`);
 				continue;
+			}
+			if (cellsRun > 0 && (opts.cellGapMs ?? 0) > 0) {
+				// Upstream cooldown protection: pause between cells (real-model
+				// rate limits). Only after the first cell; task/arm order kept.
+				// eslint-disable-next-line no-console
+				console.log(`[run] gap ${opts.cellGapMs}ms (upstream cooldown protection)`);
+				await new Promise((r) => setTimeout(r, opts.cellGapMs));
 			}
 			cellsRun += 1;
 			const fixture = fixtureById.get(task.fixture_id)!;

@@ -30,9 +30,14 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const SIDECAR_DIR = dirname(HERE);
 const REPO_ROOT = dirname(SIDECAR_DIR);
 
-const CPA_BASE_URL = "http://198.51.100.10:46450/v1beta";
-const CPA_KEY = "***REMOVED***";
+const CPA_BASE_URL = process.env.CPA_BASE_URL ?? "http://198.51.100.10:46450/v1beta";
+const CPA_KEY = process.env.CPA_API_KEY ?? "";
 const MODEL = "gemini-3.6-flash-high";
+
+if (!CPA_KEY) {
+	console.error("CPA_API_KEY env is required (never hardcode keys in the repo). Export it, then re-run.");
+	process.exit(2);
+}
 
 async function waitForSettle(store: SessionStore, sessionId: string, timeoutMs = 300_000): Promise<string> {
 	const deadline = Date.now() + timeoutMs;

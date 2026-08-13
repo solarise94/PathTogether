@@ -35,9 +35,14 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const SIDECAR = dirname(HERE);
 const REPO = dirname(SIDECAR);
 
-const CPA_URL = "http://198.51.100.10:46450/v1";
-const CPA_KEY = "***REMOVED***";
+const CPA_URL = process.env.CPA_BASE_URL ?? "http://198.51.100.10:46450/v1";
+const CPA_KEY = process.env.CPA_API_KEY ?? "";
 const MODEL = "gpt-5.6-luna";
+
+if (!CPA_KEY) {
+	console.error("CPA_API_KEY env is required (never hardcode keys in the repo). Export it, then re-run.");
+	process.exit(2);
+}
 const TASK = "把视野移到 (2000,1500) level 1，抓一张快照，一句话描述，然后 finish。";
 const MAX_ATTEMPTS = 3;
 

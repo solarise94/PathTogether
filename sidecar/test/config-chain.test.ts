@@ -99,7 +99,7 @@ function deriveEffectiveConfig(cfg: Record<string, unknown>): Record<string, unk
 
 /**
  * Flask PUT-equivalent: run `_validate_ai_tuning` on `body`, persist, then
- * dump `_build_sidecar_config()`. Used for the reserve/keep=0 chain so the
+ * dump `_build_sidecar_config()`. Used for the keep=0 chain so the
  * JSON sidecar actually sees is the same shape Flask would inject at run start.
  */
 const VALIDATE_AND_BUILD_SCRIPT = `
@@ -123,6 +123,32 @@ function flaskValidateAndBuild(body: Record<string, unknown>): Record<string, un
 	const tmpDir = mkdtempSync(join(tmpdir(), "svs-config-chain-"));
 	const stdout = execFileSync(PYTHON, ["-c", VALIDATE_AND_BUILD_SCRIPT, REPO_ROOT], {
 		env: { ...process.env, SHARE_DATA_DIR: tmpDir, SVS_BODY: JSON.stringify(body) },
+		encoding: "utf-8",
+		maxBuffer: 1 << 20,
+	});
+	return JSON.parse(stdout) as Record<string, unknown>;
+}
+
+/**
+ * Seed a raw ai_config.json (bypassing PUT validation) then dump
+ * `_build_sidecar_config()`. Covers the upgrade path: old versions persisted
+ * reserve=0, which the new run boundary would reject without migration.
+ */
+const SEED_AND_BUILD_SCRIPT = `
+import json, os, sys
+sys.path.insert(0, sys.argv[1])
+import app
+seed = json.loads(os.environ["SVS_SEED"])
+app._save_ai_config_raw(seed)
+out = app._build_sidecar_config()
+sys.stdout.write(json.dumps(out, ensure_ascii=False))
+`;
+
+function flaskSeedAndBuild(seed: Record<string, unknown>): Record<string, unknown> {
+	if (!PYTHON) throw new Error("no python available");
+	const tmpDir = mkdtempSync(join(tmpdir(), "svs-config-chain-"));
+	const stdout = execFileSync(PYTHON, ["-c", SEED_AND_BUILD_SCRIPT, REPO_ROOT], {
+		env: { ...process.env, SHARE_DATA_DIR: tmpDir, SVS_SEED: JSON.stringify(seed) },
 		encoding: "utf-8",
 		maxBuffer: 1 << 20,
 	});
@@ -189,25 +215,38 @@ function flaskValidateAndBuild(body: Record<string, unknown>): Record<string, un
 		);
 	});
 
-	it("preserves reserve/keep=0 through Flask validate → sidecar validate → compaction", () => {
-		// Reviewer P1: context=10000, reserve=0, keep=1 used to pass Flask and
-		// validateRunConfig, then numOr rewrote reserve to 16384 at runtime.
-		const flaskZero = flaskValidateAndBuild({
+	it("preserves keep_recent_tokens=0 through Flask validate → sidecar → compaction", () => {
+		const flaskKeepZero = flaskValidateAndBuild({
 			window_tier: null,
 			context_window_tokens: 10000,
-			reserve_tokens: 0,
-			keep_recent_tokens: 1,
+			reserve_tokens: 128,
+			keep_recent_tokens: 0,
 		});
-		expect(flaskZero.reserve_tokens).toBe(0);
-		expect(flaskZero.keep_recent_tokens).toBe(1);
-		expect(flaskZero.context_window_tokens).toBe(10000);
-		expect(() => validateRunConfig(flaskZero as unknown as RunConfig)).not.toThrow();
-		const effective = deriveEffectiveConfig(flaskZero);
+		expect(flaskKeepZero.reserve_tokens).toBe(128);
+		expect(flaskKeepZero.keep_recent_tokens).toBe(0);
+		expect(flaskKeepZero.context_window_tokens).toBe(10000);
+		expect(() => validateRunConfig(flaskKeepZero as unknown as RunConfig)).not.toThrow();
+		const effective = deriveEffectiveConfig(flaskKeepZero);
 		const comp = resolveCompactionSettings(effective as never);
-		expect(comp.settings.reserveTokens).toBe(0);
-		expect(comp.settings.keepRecentTokens).toBe(1);
+		expect(comp.settings.reserveTokens).toBe(128);
+		expect(comp.settings.keepRecentTokens).toBe(0);
 		expect(comp.contextWindow).toBe(10000);
 		expect(comp.settings.reserveTokens + comp.settings.keepRecentTokens).toBeLessThan(comp.contextWindow);
+	});
+
+	it("migrates seeded legacy reserve_tokens=0 so the run boundary accepts the config", () => {
+		const flaskMigrated = flaskSeedAndBuild({
+			window_tier: "balanced",
+			reserve_tokens: 0,
+			keep_recent_tokens: 20000,
+		});
+		expect(flaskMigrated.reserve_tokens).toBe(16000);
+		expect(flaskMigrated.keep_recent_tokens).toBe(20000);
+		expect(() => validateRunConfig(flaskMigrated as unknown as RunConfig)).not.toThrow();
+		const effective = deriveEffectiveConfig(flaskMigrated);
+		const comp = resolveCompactionSettings(effective as never);
+		expect(comp.settings.reserveTokens).toBe(16000);
+		expect(comp.settings.reserveTokens).toBeGreaterThanOrEqual(128);
 	});
 });
 

@@ -65,6 +65,7 @@ import {
 	prevCompactionInputs,
 	resolveCompactionSettings,
 	runCompaction,
+	RESERVE_TOKENS_MIN,
 	type ResolvedCompactionSettings,
 } from "./compaction.js";
 import {
@@ -125,6 +126,7 @@ import {
 
 /** compaction.ts / pi-model.ts 兼容默认：无显式窗口且无有效档位时的 272k。 */
 export const LEGACY_CONTEXT_WINDOW_TOKENS = 272000;
+export { RESERVE_TOKENS_MIN };
 
 // =========================================================================== //
 // Public config / option types
@@ -141,7 +143,7 @@ export interface RunConfig extends AiEngineConfig {
 	fork_active_limit?: number;
 	/** Max materialized images retained per request by transformContext (default 6). */
 	keep_recent_images?: number;
-	/** Tokens reserved for summary prompt + output in compaction (default 16384). */
+	/** Tokens reserved for summary prompt + output in compaction (default 16384, min {@link RESERVE_TOKENS_MIN}). */
 	reserve_tokens?: number;
 	/** Approximate recent-context tokens kept after compaction (default 20000). */
 	keep_recent_tokens?: number;
@@ -218,6 +220,11 @@ export function validateRunConfig(config: RunConfig): void {
 	// Manual mode (no ctx, no tier) no longer skips this check.
 	const reserve = num(config.reserve_tokens);
 	const keep = num(config.keep_recent_tokens);
+	if (Number.isFinite(reserve) && (!Number.isInteger(reserve) || reserve < RESERVE_TOKENS_MIN)) {
+		throw new ConfigError(
+			`reserve_tokens 不可低于 ${RESERVE_TOKENS_MIN}（最小可用摘要预算，保证约 ${Math.floor(RESERVE_TOKENS_MIN * 0.8)} 输出 tokens）`,
+		);
+	}
 	const ctx = resolveEffectiveContextWindow(config);
 	if (Number.isFinite(reserve) && Number.isFinite(keep) && reserve + keep >= ctx) {
 		throw new ConfigError(

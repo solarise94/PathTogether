@@ -3316,13 +3316,14 @@
     // 此前空档不提交会保留原档位（Bug 5）。
     if (els.aiWindowTier) { payload.window_tier = els.aiWindowTier.value !== "" ? els.aiWindowTier.value : null; }
     // 高级调优参数（填了才提交，后端校验数值）
-    // 字段语义：reserve/safety_margin 允许 0（nonneg）；lease_ttl 须为正整数（与
-    // 后端一致，0 不合法）；context_window/keep_recent 须为正；fork_limit 为正整数。
+    // 字段语义：reserve 须 ≥128（最小可用摘要预算，保证约 102 输出 tokens）；
+    // safety_margin 允许 0；lease_ttl 须为正整数；context_window 须为正；
+    // keep_recent 允许 0（不额外保留历史）；fork_limit 为正整数。
     var advFields = [
       ["context_window_tokens", els.aiCtxWindow, "pos"],
-      ["reserve_tokens", els.aiReserve, "nonneg"],
+      ["reserve_tokens", els.aiReserve, "reserve"],
       ["safety_margin", els.aiSafetyMargin, "nonneg"],
-      ["keep_recent_tokens", els.aiKeepRecent, "pos"],
+      ["keep_recent_tokens", els.aiKeepRecent, "nonneg"],
       ["fork_active_limit", els.aiForkLimit, "intpos"],
       ["lease_ttl", els.aiLeaseTtl, "intpos"],
     ];
@@ -3355,6 +3356,13 @@
       if (fkind === "intpos") {
         if (!/^\d+$/.test(raw) || num < 1) {
           toast(t("ai.config.num.int", { f: labelFor(fkey) }), "error");
+          fel.focus();
+          return;
+        }
+      } else if (fkind === "reserve") {
+        var RESERVE_MIN = 128;
+        if (!/^\d+$/.test(raw) || num < RESERVE_MIN) {
+          toast(t("ai.config.reserve.min", { min: RESERVE_MIN }), "error");
           fel.focus();
           return;
         }

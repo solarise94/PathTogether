@@ -23,6 +23,7 @@ import {
 	resolveCompactionSettings,
 	runCompaction,
 	toEntries,
+	RESERVE_TOKENS_MIN,
 	type CompactionOutcome,
 } from "../src/compaction.js";
 import { SessionStore } from "../src/session-store.js";
@@ -154,15 +155,25 @@ describe("compaction", () => {
 	});
 
 	describe("checkShouldCompact", () => {
-		it("preserves explicit 0 for reserve_tokens and keep_recent_tokens", () => {
-			const settings = resolveCompactionSettings({
+		it("preserves keep_recent_tokens=0 and falls back below RESERVE_TOKENS_MIN", () => {
+			const keepZero = resolveCompactionSettings({
 				context_window_tokens: 10000,
-				reserve_tokens: 0,
-				keep_recent_tokens: 1,
+				reserve_tokens: 128,
+				keep_recent_tokens: 0,
 			});
-			expect(settings.settings.reserveTokens).toBe(0);
-			expect(settings.settings.keepRecentTokens).toBe(1);
-			expect(settings.contextWindow).toBe(10000);
+			expect(keepZero.settings.reserveTokens).toBe(128);
+			expect(keepZero.settings.keepRecentTokens).toBe(0);
+			// 0 and 1–127 are not a valid summary budget; fall back rather than
+			// pass a sub-minimum through to pi.
+			for (const raw of [0, 1, RESERVE_TOKENS_MIN - 1]) {
+				const fallback = resolveCompactionSettings({
+					context_window_tokens: 10000,
+					reserve_tokens: raw,
+					keep_recent_tokens: 0,
+				});
+				expect(fallback.settings.reserveTokens).toBeGreaterThanOrEqual(RESERVE_TOKENS_MIN);
+				expect(fallback.settings.reserveTokens).not.toBe(raw);
+			}
 		});
 
 		it("returns false under the threshold", () => {
@@ -174,14 +185,14 @@ describe("compaction", () => {
 		});
 
 		it("returns true when usage+trailing exceeds window - reserve", () => {
-			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 100 });
-			// usage reports 950 input tokens → 950 > 1000-100=900 → should compact.
+			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 128 });
+			// usage reports 950 input tokens → 950 > 1000-128=872 → should compact.
 			const check = checkShouldCompact([assistantMsg("hi", usage(950, 10))], settings);
 			expect(check.should).toBe(true);
 		});
 
 		it("counts trailing tokens after the last usage block (fixes the one-turn lag)", () => {
-			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 100 });
+			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 128 });
 			// Last usage reports only 100 input tokens, but a big trailing user
 			// message pushes the estimate over the threshold.
 			const big = "x".repeat(4000); // ~1000 tokens at 4 chars/token
@@ -195,7 +206,7 @@ describe("compaction", () => {
 		it("summarizes history, keeps the retained tail, and rebuilds messages with a compactionSummary", async () => {
 			const calls = { count: 0 };
 			const models = makeFakeModels({ summary: "SUMMARY-1", calls });
-			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 100, keep_recent_tokens: 20 });
+			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 128, keep_recent_tokens: 20 });
 			// Build a conversation where the early part is large (to summarize)
 			// and the tail is small (to retain).
 			const msgs: AgentMessage[] = [
@@ -219,7 +230,7 @@ describe("compaction", () => {
 
 		it("passes previousSummary for an incremental update on the second compaction", async () => {
 			const calls = { count: 0 };
-			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 100, keep_recent_tokens: 20 });
+			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 128, keep_recent_tokens: 20 });
 			// Realistic agent state after first compaction: summary + retained tail + new turns.
 			// toEntries must NOT re-inject retainedTail into CompactionEntry (would double-count).
 			const summaryMsg = {
@@ -276,7 +287,7 @@ describe("compaction", () => {
 		});
 
 		it("runs two consecutive compactions without duplicating retained tail in the adapter", async () => {
-			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 100, keep_recent_tokens: 20 });
+			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 128, keep_recent_tokens: 20 });
 			const models1 = makeFakeModels({ summary: "SUMMARY-1" });
 			const firstMsgs: AgentMessage[] = [
 				userMsg("long history line " + "y".repeat(800), 1),
@@ -312,7 +323,7 @@ describe("compaction", () => {
 
 		it("returns null when the summarizer fails (non-fatal; caller keeps going)", async () => {
 			const models = makeFakeModels({ fail: true });
-			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 100, keep_recent_tokens: 20 });
+			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 128, keep_recent_tokens: 20 });
 			const msgs: AgentMessage[] = [
 				userMsg("history " + "y".repeat(800), 1),
 				assistantMsg("resp " + "z".repeat(800), usage(500, 100), 2),
@@ -324,7 +335,7 @@ describe("compaction", () => {
 
 		it("returns null when compaction is not applicable (no messages)", async () => {
 			const models = makeFakeModels({ summary: "X" });
-			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 100, keep_recent_tokens: 20000 });
+			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 128, keep_recent_tokens: 20000 });
 			// pi's prepareCompaction returns undefined for an empty entry list.
 			const outcome = await runCompaction({ messages: [], settings, models: models as never, model: MODEL });
 			expect(outcome).toBeNull();
@@ -450,17 +461,17 @@ describe("compaction", () => {
 		});
 
 		it("triggers earlier when a visual reserve is added (§9.1)", () => {
-			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 100 });
+			const settings = resolveCompactionSettings({ context_window_tokens: 1000, reserve_tokens: 128 });
 			// Build messages whose text estimate is just under the window.
 			// estimateContextTokens uses ~4 chars/token for text, so ~3000 chars
-			// → ~750 tokens. 750 + 100 (reserve) = 850 < 1000 → no compaction.
+			// → ~750 tokens. 750 + 128 (reserve) = 878 < 1000 → no compaction.
 			const longText = "x".repeat(3000);
 			const msgs: AgentMessage[] = [{ role: "user", content: longText, timestamp: 1 } as AgentMessage];
 			const withoutVisual = checkShouldCompact(msgs, settings);
 			expect(withoutVisual.should).toBe(false);
 			// Adding a visual reserve pushes the combined estimate over the window.
 			const withVisual = checkShouldCompact(msgs, settings, { visualContextBudgetReserve: 200 });
-			// 750 + 200 + 100 > 1000 → should compact.
+			// 750 + 200 + 128 > 1000 → should compact.
 			expect(withVisual.tokens).toBeGreaterThan(withoutVisual.tokens);
 		});
 

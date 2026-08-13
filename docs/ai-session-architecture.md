@@ -376,9 +376,9 @@ SSE 断开（页面刷新/网络断）**不暂停 run**：run 在 sidecar 后台
 |---|---|---|
 | `max_steps` | 50 | 单轮步数上限（到点 `agent_paused`，可继续） |
 | `context_window_tokens` | 272000 | compact 触发窗口（保守；gpt-5.6-luna 超 272k 进高价档） |
-| `reserve_tokens` | 16000 | 摘要 prompt+输出预留 |
+| `reserve_tokens` | 16000 | 摘要 prompt+输出预留（正整数，下限 128：产品规定的最小可用摘要预算，保证 floor(0.8×128)=102 tokens；旧版落盘的 <128 加载时迁移为 16000） |
 | `safety_margin` | 8192 | 防估算误差顶爆（legacy 字段，当前 compaction 未直接用） |
-| `keep_recent_tokens` | 20000 | compact 后保留原文 token |
+| `keep_recent_tokens` | 20000 | compact 后额外保留的原文 token。0=不额外保留历史，但仍保留算法要求的最小当前回合 |
 | `keep_recent_images` | 6 | 每次请求物化后保留的最近图数（正整数） |
 | `fork_active_limit` | 20 | 活跃 fork / branch 各自上限（共用此值，分别只统计 kind="fork" / kind="branch"；超出归档最旧非 running，不硬删） |
 | `lease_ttl` | 150.0 | （legacy 字段，保留兼容旧配置；新架构无租约） |

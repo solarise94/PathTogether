@@ -1180,6 +1180,35 @@ def _merge_config(cfg) -> dict:
     return out
 
 
+def _legacy_reserve_below_min(raw) -> bool:
+    """旧版允许落盘的 reserve_tokens（0 / 1–127）在新下限下非法。"""
+    if raw is None:
+        return False
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return False
+    return n < _RESERVE_TOKENS_MIN
+
+
+def _apply_legacy_reserve_migration(cfg, *, log=True) -> bool:
+    """原地把 legacy reserve < 128 换成默认 16000。返回是否改写。
+
+    旧版本允许 0 落盘；升级后 sidecar validateRunConfig 会拒绝 <128，
+    导致已有部署无法起跑。加载与 sidecar 构建都必须迁移，不能只拦 PUT。
+    """
+    if not isinstance(cfg, dict) or not _legacy_reserve_below_min(cfg.get("reserve_tokens")):
+        return False
+    old = cfg.get("reserve_tokens")
+    cfg["reserve_tokens"] = DEFAULT_CONFIG["reserve_tokens"]
+    if log:
+        app.logger.warning(
+            "legacy reserve_tokens=%s (< %s) migrated to %s",
+            old, _RESERVE_TOKENS_MIN, cfg["reserve_tokens"],
+        )
+    return True
+
+
 def _build_sidecar_config() -> dict:
     """组装 sidecar 请求所需的 config 字段（base_url/api_key 明文 + 全部调优字段）。
 
@@ -1193,6 +1222,8 @@ def _build_sidecar_config() -> dict:
     out["model"] = cfg.get("model") or ""
     # api_protocol 缺省 openai
     out["api_protocol"] = cfg.get("api_protocol") or "openai"
+    # 运行时再守一次：即使加载迁移未持久化，注入 sidecar 的值也不能 <128。
+    _apply_legacy_reserve_migration(out)
     return out
 
 
@@ -1201,7 +1232,9 @@ def _load_ai_config() -> dict:
 
     api_key 在磁盘上为加密密文（enc: 前缀），这里解密为明文返回，供调用方（agent、
     校验）直接用。检测到明文 api_key（旧配置）时自动加密重写落盘（无缝迁移）。
-    其他字段（base_url/model/max_tokens/调优参数/api_protocol）原样返回。
+    旧版 reserve_tokens < 128 同样在读取时迁移为默认 16000 并落盘，避免升级后
+    sidecar run 边界拒绝。其他字段（base_url/model/max_tokens/调优参数/
+    api_protocol）原样返回。
     """
     p = _ai_config_path()
     if not p.is_file():
@@ -1223,6 +1256,13 @@ def _load_ai_config() -> dict:
                 _save_ai_config_raw(data)
             except Exception:
                 pass
+    # 旧版允许 reserve=0/1–127 落盘；升级后 sidecar 会拒绝 <128。
+    # 在解密前改写并落盘，避免把明文 api_key 写回磁盘。
+    if _apply_legacy_reserve_migration(data):
+        try:
+            _save_ai_config_raw(data)
+        except Exception:
+            pass
     data["api_key"] = _decrypt_api_key(stored)
     return data
 
@@ -1259,10 +1299,14 @@ def _save_ai_config(cfg: dict) -> None:
 #                          UI min=10000。→ 正整数。未显式设置时由
 #                          _resolve_effective_context_window 按
 #                          显式值 > window_tier 预设 > legacy 272k 推导。
-#   reserve_tokens         compaction 接受 >=0（0=不预留）；缺省 16384。
+#   reserve_tokens         pi 用 floor(0.8 * reserve) 作为压缩摘要 maxTokens。
+#                          正整数且 ≥ _RESERVE_TOKENS_MIN（128）：这是产品规定
+#                          的最小可用摘要预算，保证 floor(0.8×128)=102 tokens。
+#                          缺省 16000。UI min=128。旧版落盘的 <128 在加载时迁
+#                          移为 16000（见 _apply_legacy_reserve_migration）。
+#   keep_recent_tokens     compaction 接受 >=0。0=不额外保留历史，但仍保留
+#                          pi findCutPoint 要求的最小当前回合。缺省 20000。
 #                          UI min=0。→ 非负整数（0 允许）。
-#   keep_recent_tokens     compaction 接受 >=0（0=不保留尾）；缺省 20000。
-#                          UI min=1000。→ 非负整数（0 允许，权威层不卡 UI 下限）。
 #   keep_recent_images     transform-context.ts:53-55（>0 才用，否则默认 6）。
 #                          无 UI 输入。→ 非负整数（0 允许）。
 #   safety_margin          agent-runner.ts:90-91 legacy 字段，sidecar 不再使用；
@@ -1279,9 +1323,10 @@ def _save_ai_config(cfg: dict) -> None:
 #                          → 正整数，且 <= 500（UI 声明上限；防止失控调用/费用）。
 # 字段关系：reserve_tokens + keep_recent_tokens 必须 < context_window_tokens
 # （压缩：context - reserve 是触发线，keep_recent 是保留尾；重叠即配置矛盾）。
-# 允许 0 的字段（reserve_tokens / keep_recent_tokens / keep_recent_images /
-# safety_margin）：0 表示禁用/不预留/不保留。sidecar compaction 对 reserve/keep
-# 接受真正的非负整数，校验与运行时按同一 0 值计算关系；负数一律拒绝。
+# 允许 0 的字段（keep_recent_tokens / keep_recent_images / safety_margin）：
+# keep_recent_tokens=0 表示不额外保留历史，但仍保留算法要求的最小当前回合；
+# 图片/safety_margin 的 0 仍为禁用或不生效。reserve_tokens 不允许 0。
+# 负数一律拒绝。
 # 注意：所有校验失败返回中文明示 error 字符串；调用方负责在落盘前整体校验，
 # 任一字段失败都不应部分写入 cfg。
 _AI_TUNING_POSITIVE_INT = (
@@ -1291,6 +1336,7 @@ _AI_TUNING_POSITIVE_INT = (
     "lease_ttl",
     "max_tokens",
     "max_steps",
+    "reserve_tokens",
     # Phase 1 新增正整数字段（§11）
     "visual_working_set_max",
     "visual_context_budget_tokens",
@@ -1304,7 +1350,6 @@ _AI_TUNING_POSITIVE_INT = (
 )
 # 允许 0（非负整数）的字段
 _AI_TUNING_NONNEG_INT = (
-    "reserve_tokens",
     "keep_recent_tokens",
     "keep_recent_images",
     "safety_margin",
@@ -1361,6 +1406,11 @@ def _resolve_effective_context_window(cfg):
 # max_steps 上限：取自 templates/index.html 的 input max="500"（步数上限字段）。
 # 防止 max_steps=99999 之类失控（sidecar 运行循环只限下限，费用风险）。
 _MAX_STEPS_LIMIT = 500
+# reserve_tokens 下限：产品规定的最小可用摘要预算。pi 用 floor(0.8 * reserve)
+# 作摘要 maxTokens；128 保证 ≥102 输出 tokens（127 仍有 101，但不是产品下限）。
+# 与 sidecar RESERVE_TOKENS_MIN 保持一致。
+_RESERVE_TOKENS_MIN = 128
+_RESERVE_TOKENS_SUMMARY_MAXTOKENS_MIN = (_RESERVE_TOKENS_MIN * 4) // 5  # 102
 # 分辨率分档最长边上限（§6.1，最长边 ≤ 4096 与 region 端点一致）。
 _LONG_EDGE_LIMIT = 4096
 
@@ -1467,6 +1517,12 @@ def _validate_ai_tuning(body, cfg):
     # max_steps 上限（UI 声明 max=500）
     if "max_steps" in validated and validated["max_steps"] > _MAX_STEPS_LIMIT:
         return None, "max_steps 不可超过 {}（步数上限）".format(_MAX_STEPS_LIMIT)
+    if "reserve_tokens" in validated and validated["reserve_tokens"] < _RESERVE_TOKENS_MIN:
+        return None, (
+            "reserve_tokens 不可低于 {}（最小可用摘要预算，保证约 {} 输出 tokens）".format(
+                _RESERVE_TOKENS_MIN, _RESERVE_TOKENS_SUMMARY_MAXTOKENS_MIN
+            )
+        )
     # 2) 字段关系校验：reserve + keep < effective context window
     #    （显式 context_window_tokens > window_tier 预设 > legacy 272k）。
     #    未提交字段取已落盘 cfg 或缺省默认。始终对合并后的完整候选校验，

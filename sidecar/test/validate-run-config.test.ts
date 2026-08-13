@@ -7,7 +7,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { validateRunConfig, ConfigError, type RunConfig } from "../src/agent-runner.js";
+import { validateRunConfig, RESERVE_TOKENS_MIN, type RunConfig } from "../src/agent-runner.js";
 
 function baseConfig(over: Partial<RunConfig> = {}): RunConfig {
 	return {
@@ -157,16 +157,15 @@ describe("validateRunConfig", () => {
 		).toThrow(/context_window_tokens/);
 	});
 
-	it("accepts reserve_tokens=0 / keep_recent_tokens=1 against a small explicit window", () => {
+	it("rejects reserve_tokens below the summary-budget minimum", () => {
 		expect(() =>
-			validateRunConfig(
-				baseConfig({
-					context_window_tokens: 10000,
-					reserve_tokens: 0,
-					keep_recent_tokens: 1,
-					window_tier: undefined,
-				}),
-			),
+			validateRunConfig(baseConfig({ reserve_tokens: 0 })),
+		).toThrow(new RegExp(String(RESERVE_TOKENS_MIN)));
+		expect(() =>
+			validateRunConfig(baseConfig({ reserve_tokens: RESERVE_TOKENS_MIN - 1 })),
+		).toThrow(new RegExp(String(RESERVE_TOKENS_MIN)));
+		expect(() =>
+			validateRunConfig(baseConfig({ reserve_tokens: RESERVE_TOKENS_MIN, keep_recent_tokens: 0 })),
 		).not.toThrow();
 	});
 });

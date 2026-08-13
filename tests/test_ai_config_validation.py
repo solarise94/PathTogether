@@ -153,6 +153,7 @@ def test_positive_int_fields_reject_negative():
         "lease_ttl": -5,
         "max_tokens": -1,
         "event_buffer": -1,
+        "reserve_tokens": -1,
     }
     for field, val in cases.items():
         reset_config()
@@ -169,7 +170,7 @@ def test_positive_int_fields_reject_negative():
 def test_positive_int_fields_reject_zero():
     print("== 正整数类字段：0 → 400（0 非合法）==")
     for field in ("context_window_tokens", "max_steps", "fork_active_limit",
-                  "lease_ttl", "max_tokens", "event_buffer"):
+                  "lease_ttl", "max_tokens", "event_buffer", "reserve_tokens"):
         reset_config()
         code, j = put({field: 0})
         check("%s=0 → 400" % field, code == 400, "got %s %r" % (code, j))
@@ -178,7 +179,7 @@ def test_positive_int_fields_reject_zero():
 def test_positive_int_fields_reject_non_integer():
     print("== 正整数类字段：非整数 → 400 ==")
     for field in ("context_window_tokens", "max_steps", "fork_active_limit",
-                  "lease_ttl", "max_tokens", "event_buffer"):
+                  "lease_ttl", "max_tokens", "event_buffer", "reserve_tokens"):
         reset_config()
         code, j = put({field: 12.5})
         check("%s=12.5 → 400" % field, code == 400, "got %s %r" % (code, j))
@@ -193,13 +194,13 @@ def test_positive_int_fields_reject_non_integer():
 
 
 # =========================================================================== #
-# 非负整数类字段（0 允许）：reserve_tokens / keep_recent_tokens /
+# 非负整数类字段（0 允许）：keep_recent_tokens /
 # keep_recent_images / safety_margin —— 允许 0，拒绝负数 / 非整数。
 # =========================================================================== #
 def test_nonneg_int_fields_allow_zero():
     print("== 非负整数类字段：0 → 200 落盘 ==")
-    for field in ("reserve_tokens", "keep_recent_tokens", "keep_recent_images"):
-        # 单独 0：effective window 为 balanced 400k（默认档），0+keep 或 reserve+0 仍 < 400k
+    for field in ("keep_recent_tokens", "keep_recent_images"):
+        # 单独 0：effective window 为 balanced 400k（默认档），reserve+0 仍 < 400k
         reset_config()
         code, j = put({field: 0})
         check("%s=0 → 200" % field, code == 200, "got %s %r" % (code, j))
@@ -208,20 +209,82 @@ def test_nonneg_int_fields_allow_zero():
                   "got %r" % j.get(field))
 
 
-def test_zero_reserve_keep_accepted_against_small_window():
-    """reserve=0 keep=1 ctx=10000 按字面 0 校验并通过（运行时不得再把 0 换成 16384）。"""
-    print("== reserve/keep=0 对小窗口按字面校验 ==")
+def test_reserve_tokens_rejects_zero_and_below_min():
+    """新提交的 reserve < 128 必须拒绝；128 是产品下限（保证约 102 输出 tokens）。"""
+    print("== reserve_tokens 下限 128 ==")
+    reset_config()
+    code, j = put({"reserve_tokens": 0})
+    check("reserve_tokens=0 → 400", code == 400, "got %s %r" % (code, j))
+    assert code == 400
+    reset_config()
+    code, j = put({"reserve_tokens": 127})
+    check("reserve_tokens=127 → 400", code == 400, "got %s %r" % (code, j))
+    assert code == 400
+    check("error 含下限", j and "128" in (j or {}).get("error", ""),
+          "error=%r" % (j or {}).get("error"))
+    reset_config()
+    code, j = put({"reserve_tokens": 128})
+    check("reserve_tokens=128 → 200", code == 200, "got %s %r" % (code, j))
+    assert code == 200
+
+
+def test_legacy_reserve_below_min_migrated_on_load():
+    """旧版落盘的 reserve=0/127 在加载/构建 sidecar config 时迁移为 16000。
+
+    回归：只拦 PUT 不够——已有 0 的部署升级后 validateRunConfig 会拒绝起跑。
+    """
+    print("== 旧 reserve < 128 自动迁移 ==")
+    default_reserve = app_mod.DEFAULT_CONFIG["reserve_tokens"]
+    reset_config()
+    seed_config(reserve_tokens=0, keep_recent_tokens=20000, window_tier="balanced")
+    check("seed 落盘仍为 0", load_raw().get("reserve_tokens") == 0,
+          "got %r" % load_raw().get("reserve_tokens"))
+    sc = app_mod._build_sidecar_config()
+    check("sidecar config reserve 迁为默认 16000", sc.get("reserve_tokens") == default_reserve,
+          "got %r" % sc.get("reserve_tokens"))
+    assert sc.get("reserve_tokens") == default_reserve
+    check("磁盘已重写为 16000", load_raw().get("reserve_tokens") == default_reserve,
+          "got %r" % load_raw().get("reserve_tokens"))
+    assert load_raw().get("reserve_tokens") == default_reserve
+    client = make_client()
+    r = client.get("/api/ai/config")
+    j = r.get_json()
+    check("GET 回显已迁移值", j and j.get("reserve_tokens") == default_reserve,
+          "got %r" % (j or {}).get("reserve_tokens"))
+
+    reset_config()
+    seed_config(reserve_tokens=127, keep_recent_tokens=20000)
+    sc = app_mod._build_sidecar_config()
+    check("127 同样迁为 16000", sc.get("reserve_tokens") == default_reserve,
+          "got %r" % sc.get("reserve_tokens"))
+    assert sc.get("reserve_tokens") == default_reserve
+    check("127 磁盘已重写", load_raw().get("reserve_tokens") == default_reserve,
+          "got %r" % load_raw().get("reserve_tokens"))
+    assert load_raw().get("reserve_tokens") == default_reserve
+
+    reset_config()
+    seed_config(reserve_tokens=128, keep_recent_tokens=20000)
+    sc = app_mod._build_sidecar_config()
+    check("合法 128 不迁移", sc.get("reserve_tokens") == 128,
+          "got %r" % sc.get("reserve_tokens"))
+    check("合法 128 磁盘不变", load_raw().get("reserve_tokens") == 128,
+          "got %r" % load_raw().get("reserve_tokens"))
+
+
+def test_keep_zero_accepted_with_valid_reserve():
+    """keep=0 仍允许；与合法 reserve 一起按字面贯穿。"""
+    print("== keep=0 + 合法 reserve 对小窗口校验 ==")
     reset_config()
     code, j = put({
         "window_tier": None,
         "context_window_tokens": 10000,
-        "reserve_tokens": 0,
-        "keep_recent_tokens": 1,
+        "reserve_tokens": 128,
+        "keep_recent_tokens": 0,
     })
-    check("ctx=10000 reserve=0 keep=1 → 200", code == 200, "got %s %r" % (code, j))
+    check("ctx=10000 reserve=128 keep=0 → 200", code == 200, "got %s %r" % (code, j))
     assert code == 200
-    check("reserve 落盘为 0", j.get("reserve_tokens") == 0, "got %r" % j.get("reserve_tokens"))
-    check("keep 落盘为 1", j.get("keep_recent_tokens") == 1, "got %r" % j.get("keep_recent_tokens"))
+    check("reserve 落盘为 128", j.get("reserve_tokens") == 128, "got %r" % j.get("reserve_tokens"))
+    check("keep 落盘为 0", j.get("keep_recent_tokens") == 0, "got %r" % j.get("keep_recent_tokens"))
 
 
 def test_safety_margin_deprecated_not_persisted():
@@ -242,7 +305,7 @@ def test_safety_margin_deprecated_not_persisted():
 
 def test_nonneg_int_fields_reject_negative():
     print("== 非负整数类字段：负数 → 400 ==")
-    for field in ("reserve_tokens", "keep_recent_tokens", "keep_recent_images"):
+    for field in ("keep_recent_tokens", "keep_recent_images"):
         reset_config()
         code, j = put({field: -3})
         check("%s=-3 → 400" % field, code == 400, "got %s %r" % (code, j))

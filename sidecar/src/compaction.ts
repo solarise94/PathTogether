@@ -81,15 +81,25 @@ import {
 	type ContextCheckpoint,
 } from "./checkpoint.js";
 
+/**
+ * Product minimum for reserve_tokens. pi uses floor(0.8 * reserveTokens) as
+ * the compaction summary maxTokens; 128 guarantees ≥102 output tokens.
+ * Must stay in sync with Flask `_RESERVE_TOKENS_MIN`.
+ */
+export const RESERVE_TOKENS_MIN = 128;
+
 // =========================================================================== //
 // Public config
 // =========================================================================== //
 
 /** Tuning knobs for compaction. */
 export interface CompactionConfig {
-	/** Tokens reserved for summary prompt + output (default 16384). */
+	/** Tokens reserved for summary prompt + output (default 16384, min {@link RESERVE_TOKENS_MIN}). */
 	reserve_tokens?: number;
-	/** Approximate recent-context tokens kept after compaction (default 20000). */
+	/**
+	 * Approximate extra recent-context tokens kept after compaction (default 20000).
+	 * 0 = no extra history; pi still retains the minimum current turn.
+	 */
 	keep_recent_tokens?: number;
 	/** Context window (inherited from engine config; default 272000). */
 	context_window_tokens?: number;
@@ -102,10 +112,11 @@ export interface ResolvedCompactionSettings {
 }
 
 export function resolveCompactionSettings(cfg: CompactionConfig): ResolvedCompactionSettings {
-	// reserve/keep: 0 is a real "disable / keep nothing" value (Flask and
-	// validateRunConfig accept >=0). Do not reuse numOr (n>0), which used to
-	// rewrite 0 into 16384/20000 and break the budget invariant at runtime.
-	const reserve = nonNegOr(cfg.reserve_tokens, DEFAULT_COMPACTION_SETTINGS.reserveTokens);
+	// reserve: product minimum is 128 (guarantees floor(0.8*128)=102 summary
+	// tokens). Unset / <128 / non-numeric fall back to the pi default so a
+	// bypassed validator cannot emit a sub-minimum budget. keep: 0 is valid
+	// ("no extra history"; pi still retains the minimum current turn).
+	const reserve = minOr(cfg.reserve_tokens, RESERVE_TOKENS_MIN, DEFAULT_COMPACTION_SETTINGS.reserveTokens);
 	const keepRecent = nonNegOr(cfg.keep_recent_tokens, DEFAULT_COMPACTION_SETTINGS.keepRecentTokens);
 	return {
 		settings: { enabled: true, reserveTokens: reserve, keepRecentTokens: keepRecent },
@@ -116,6 +127,13 @@ export function resolveCompactionSettings(cfg: CompactionConfig): ResolvedCompac
 function numOr(v: unknown, d: number): number {
 	const n = Number(v);
 	return Number.isFinite(n) && n > 0 ? Math.floor(n) : d;
+}
+
+/** Like numOr, but values below `min` also fall back to `d`. */
+function minOr(v: unknown, min: number, d: number): number {
+	if (v === null || v === undefined || v === "") return d;
+	const n = Number(v);
+	return Number.isFinite(n) && n >= min ? Math.floor(n) : d;
 }
 
 /** Like numOr, but 0 is kept (unset / NaN / negative still fall back to `d`). */

@@ -287,12 +287,14 @@
             <label class="ai-field"><span data-i18n="ai.advanced.ctx">上下文窗口 tokens</span>
               <input id="ai-ctx-window" type="number" min="10000" placeholder="400000" /></label>
             <label class="ai-field"><span data-i18n="ai.advanced.reserve">摘要预留 tokens</span>
-              <input id="ai-reserve" type="number" min="0" placeholder="16000" /></label>
+              <input id="ai-reserve" type="number" min="128" placeholder="16000" />
+              <small class="ai-field-note" data-i18n="ai.advanced.reserve.note">至少 128（最小可用摘要预算，保证约 102 输出 tokens）；压缩摘要用 0.8×该值作为 maxTokens</small></label>
             <label class="ai-field"><span data-i18n="ai.advanced.safety">安全余量 tokens</span>
               <input id="ai-safety-margin" type="number" min="0" placeholder="8192" class="ai-field-legacy" />
               <small class="ai-field-note" data-i18n="ai.config.field.legacy">兼容字段，当前不生效</small></label>
             <label class="ai-field"><span data-i18n="ai.advanced.keep">压缩后保留 tokens</span>
-              <input id="ai-keep-recent" type="number" min="1000" placeholder="20000" /></label>
+              <input id="ai-keep-recent" type="number" min="0" placeholder="20000" />
+              <small class="ai-field-note" data-i18n="ai.advanced.keep.note">0=不额外保留历史，但仍保留算法要求的最小当前回合</small></label>
             <label class="ai-field"><span data-i18n="ai.advanced.fork">批注活跃上限</span>
               <input id="ai-fork-limit" type="number" min="1" placeholder="20" /></label>
             <label class="ai-field"><span data-i18n="ai.advanced.lease">租约 TTL（秒）</span>

@@ -84,4 +84,67 @@ describe("validateRunConfig", () => {
 		// Omitting all Phase 1 fields is fine — they fall back to defaults.
 		expect(() => validateRunConfig(baseConfig())).not.toThrow();
 	});
+
+	// §9.2.1 P1 regression: Flask derives context_window_tokens /
+	// visual_context_budget_tokens from window_tier and intentionally sends
+	// null for those fields. The earlier num() did Number(null)===0, rejecting
+	// the public default config as an explicit non-positive value.
+	it("accepts null/undefined/'' as unset (tier-derived), not as explicit 0", () => {
+		for (const v of [null, undefined, ""] as unknown[]) {
+			expect(() =>
+				validateRunConfig(baseConfig({ context_window_tokens: v as number, visual_context_budget_tokens: v as number })),
+			).not.toThrow();
+		}
+	});
+
+	it("accepts the public default config (ctx=null, budget=null, tier=balanced)", () => {
+		expect(() =>
+			validateRunConfig(
+				baseConfig({
+					context_window_tokens: null as unknown as number,
+					visual_context_budget_tokens: null as unknown as number,
+					window_tier: "balanced",
+				}),
+			),
+		).not.toThrow();
+	});
+
+	it("derives ctx from window_tier for the relationship check when ctx is unset", () => {
+		// reserve + keep = 16000 + 20000 = 36000 < 200000 (saving) → ok.
+		expect(() =>
+			validateRunConfig(
+				baseConfig({
+					context_window_tokens: null as unknown as number,
+					reserve_tokens: 16000,
+					keep_recent_tokens: 20000,
+					window_tier: "saving",
+				}),
+			),
+		).not.toThrow();
+		// reserve + keep = 190000 + 20000 = 210000 > 200000 (saving) → reject.
+		expect(() =>
+			validateRunConfig(
+				baseConfig({
+					context_window_tokens: null as unknown as number,
+					reserve_tokens: 190000,
+					keep_recent_tokens: 20000,
+					window_tier: "saving",
+				}),
+			),
+		).toThrow(/context_window_tokens/);
+	});
+
+	it("skips the relationship check when neither ctx nor tier is set", () => {
+		// Legacy path: no ctx, no tier → no relationship check fires even with
+		// large reserve/keep (defaults applied downstream).
+		expect(() =>
+			validateRunConfig(
+				baseConfig({
+					context_window_tokens: null as unknown as number,
+					reserve_tokens: 999999,
+					keep_recent_tokens: 999999,
+				}),
+			),
+		).not.toThrow();
+	});
 });

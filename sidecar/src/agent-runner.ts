@@ -77,7 +77,6 @@ import {
 import {
 	buildPostCompactionCheckpoint,
 	estimateSelectedVisualTokens,
-	DEFAULT_VISUAL_CONTEXT_BUDGET_TOKENS,
 } from "./compaction.js";
 import {
 	REQUEST_SCHEMA_VERSION,
@@ -199,14 +198,31 @@ export class ConfigError extends Error {
  * by server.ts entry handlers before any run is started.
  */
 export function validateRunConfig(config: RunConfig): void {
+	// Treat null/undefined/"" as "unset" → NaN → skip the check. This mirrors
+	// Flask's _validate_ai_tuning, which derives §9.2.1 tier-preset values when
+	// a field is None. The earlier form used Number(v), but Number(null)===0
+	// and Number("")===0, so an intentionally-unset context_window_tokens /
+	// visual_context_budget_tokens (the public default, derived from window_tier)
+	// was wrongly rejected as an explicit non-positive value (P1 bug §9.2.1).
 	const num = (v: unknown): number => {
+		if (v === null || v === undefined || v === "") return NaN;
 		const n = Number(v);
 		return Number.isFinite(n) ? n : NaN;
 	};
-	// reserve_tokens + keep_recent_tokens < context_window_tokens (§9.2)
+	// reserve_tokens + keep_recent_tokens < context_window_tokens (§9.2). When
+	// context_window_tokens is unset but a valid window_tier is present, derive
+	// the tier's preset window for this relationship check (aligned with Flask
+	// _validate_ai_tuning: ctx=None → _resolve_tier_value). Only skip the
+	// relationship check when BOTH ctx and tier are absent (legacy path).
 	const reserve = num(config.reserve_tokens);
 	const keep = num(config.keep_recent_tokens);
-	const ctx = num(config.context_window_tokens);
+	const ctxRaw = num(config.context_window_tokens);
+	const ctxExplicit = Number.isFinite(ctxRaw) && ctxRaw > 0 ? ctxRaw : NaN;
+	let ctx = ctxExplicit;
+	if (!Number.isFinite(ctx)) {
+		const tier = normalizeWindowTier((config as { window_tier?: unknown }).window_tier);
+		if (tier) ctx = WINDOW_TIER_PRESETS[tier].contextWindowTokens;
+	}
 	if (Number.isFinite(reserve) && Number.isFinite(keep) && Number.isFinite(ctx)) {
 		if (reserve + keep >= ctx) {
 			throw new ConfigError(
@@ -245,6 +261,23 @@ export function validateRunConfig(config: RunConfig): void {
 	if (pcm !== undefined && pcm !== "off" && pcm !== "auto" && pcm !== "explicit") {
 		throw new ConfigError("prompt_cache_mode 仅支持 off/auto/explicit");
 	}
+}
+
+/**
+ * §9.2.1: derive the single effective run config — when a valid window_tier is
+ * set and context_window_tokens is not explicitly >0, fill in the tier preset
+ * window. Everything else is untouched. runAgentLoop builds this ONCE and
+ * threads it through every consumer (buildModel / compaction / transform /
+ * checkpoint / metrics) so a run never sees two competing budget sources.
+ * Exported so the config-chain tests exercise the production derivation
+ * instead of mirroring it.
+ */
+export function deriveEffectiveRunConfig(config: RunConfig): RunConfig {
+	const tier = normalizeWindowTier((config as { window_tier?: unknown }).window_tier);
+	// Number(null)===0 is not >0, so an intentionally-unset
+	// context_window_tokens is correctly treated as "derive from tier".
+	if (!tier || Number(config.context_window_tokens) > 0) return config;
+	return { ...config, context_window_tokens: WINDOW_TIER_PRESETS[tier].contextWindowTokens };
 }
 
 /** Inject a test streamFn into the runner (mock model). */
@@ -767,16 +800,21 @@ export class AgentRunner {
 		loopOptions: { systemPrompt?: string; kind?: "main" | "fork" | "branch" } = {},
 	): Promise<void> {
 		// §9.2.1: window-tier preset derives the context window for the engine
-		// when context_window_tokens is not set explicitly. buildModel gets the
-		// derived value; the rest of the run keeps the original config (so
-		// metrics/checkpoint env record what the user actually configured).
-		const engineConfig: RunConfig = (() => {
-			const tier = normalizeWindowTier((config as { window_tier?: unknown }).window_tier);
-			if (!tier || Number(config.context_window_tokens) > 0) return config;
-			return { ...config, context_window_tokens: WINDOW_TIER_PRESETS[tier].contextWindowTokens };
-		})();
-		const { models, model } = buildModel(engineConfig);
-		const maxSteps = Math.max(1, Math.floor(config.max_steps ?? 50));
+		// when context_window_tokens is not set explicitly. We build ONE
+		// effective config at the top of the run and thread it through EVERY
+		// downstream consumer (buildModel, resolveCompactionSettings,
+		// resolveTransformSettings, maxSteps, toolCtx.cfg,
+		// this.activeRunConfig/checkpoint/metrics, makeRetryingStreamFn, …) so a
+		// single run never sees two competing budget sources (P1 bug §9.2.1:
+		// previously only buildModel got the tier window, while compaction fell
+		// back to 272k and maybeCompact's visual reserve fell back to 8000 even
+		// as transform used the tier-derived 60000).
+		// Note: metrics/checkpoint records reflect the derived EFFECTIVE values
+		// (what the run actually used), not the raw user input — which is the
+		// observable contract callers rely on.
+		const effectiveConfig: RunConfig = deriveEffectiveRunConfig(config);
+		const { models, model } = buildModel(effectiveConfig);
+		const maxSteps = Math.max(1, Math.floor(effectiveConfig.max_steps ?? 50));
 
 		// Resolve the effective kind + system prompt for this run. Defaults
 		// mirror the legacy behavior (main / branch = full SYSTEM_PROMPT + full
@@ -787,9 +825,10 @@ export class AgentRunner {
 			loopOptions.kind ?? (sessionForKind?.kind === "fork" ? "fork" : sessionForKind?.kind === "branch" ? "branch" : "main");
 		const systemPrompt = loopOptions.systemPrompt ?? (kind === "fork" ? FORK_LITE_SYSTEM_PROMPT : SYSTEM_PROMPT);
 
-		// Compaction + transform settings, resolved once per run.
-		const compactionSettings = resolveCompactionSettings(config);
-		const transformSettings = resolveTransformSettings(config);
+		// Compaction + transform settings, resolved once per run from the SAME
+		// effective config so both share the tier-derived window/budget.
+		const compactionSettings = resolveCompactionSettings(effectiveConfig);
+		const transformSettings = resolveTransformSettings(effectiveConfig);
 
 		// Session-level mutable: the first snapshot's toolCallId, used by
 		// transformContext to protect the whole-slide overview from eviction.
@@ -830,7 +869,7 @@ export class AgentRunner {
 				this.invalidateSlideCaches(slide);
 			},
 			cfg: {
-				...(config as unknown as Record<string, unknown>),
+				...(effectiveConfig as unknown as Record<string, unknown>),
 				// Snapshot output is capped at the resolved detail tier so live
 				// images cannot exceed the budget estimator's detail square.
 				detail_image_long_edge: transformSettings.detailImageLongEdge,
@@ -838,8 +877,10 @@ export class AgentRunner {
 		};
 		const tools = kind === "fork" ? [] : createTools(toolCtx);
 
-		// Phase 2b: capture the run config so helpers can resolve settings.
-		this.activeRunConfig = config;
+		// Phase 2b: capture the EFFECTIVE run config (tier-derived window
+		// included) so checkpoint/metrics helpers resolve settings from the
+		// same single source as the rest of the run.
+		this.activeRunConfig = effectiveConfig;
 
 		// Phase 2b: build the checkpoint env + ensure a checkpoint exists (with
 		// overview back-fill). Runs once at the start of the loop. Best-effort:
@@ -1054,8 +1095,8 @@ export class AgentRunner {
 		// infer capability from the upstream model name (§8.1); explicit mode is
 		// optimistic and runtime-validated.
 		const promptCacheCapabilities: PromptCacheCapabilities = resolvePromptCacheCapabilities(
-			config.prompt_cache_mode,
-			{ apiProtocol: config.api_protocol ?? "openai" },
+			effectiveConfig.prompt_cache_mode,
+			{ apiProtocol: effectiveConfig.api_protocol ?? "openai" },
 		);
 
 		// StreamFn with transient-error retry + context_length_exceeded fallback
@@ -1077,7 +1118,7 @@ export class AgentRunner {
 		const stepRef = { current: -1 };
 		const streamFn = this.makeRetryingStreamFn(
 			sessionId,
-			config,
+			effectiveConfig,
 			stepRef,
 			runCompactionPass,
 			transformContext,
@@ -1115,7 +1156,7 @@ export class AgentRunner {
 		const agent = new Agent({
 			streamFn: streamFn as Agent["streamFunction"],
 			transformContext,
-			getApiKey: () => config.api_key,
+			getApiKey: () => effectiveConfig.api_key,
 			initialState: {
 				model: model as never,
 				systemPrompt,
@@ -1169,10 +1210,13 @@ export class AgentRunner {
 				if (!Array.isArray(c)) return false;
 				return c.some((p) => p && (isImageRefContent(p) || isImageContent(p)));
 			});
-			const visualBudget = Number(config.visual_context_budget_tokens);
-			const visualReserve = hasImageRefs
-				? (Number.isFinite(visualBudget) && visualBudget > 0 ? visualBudget : DEFAULT_VISUAL_CONTEXT_BUDGET_TOKENS)
-				: 0;
+			// §9.1: use the resolved transform budget (which already encodes the
+			// §9.2.1 tier derivation AND the explicit-override priority) so the
+			// compaction trigger reserve matches the budget the image selector
+			// actually enforced. Previously this read config.visual_context_budget_tokens
+			// directly, so a tier-derived run saw 8000 here while transform used
+			// 60000 — two competing budgets in one request (P1 bug §9.2.1).
+			const visualReserve = hasImageRefs ? transformSettings.visualContextBudgetTokens : 0;
 			const check = checkShouldCompact(msgs, compactionSettings, { visualContextBudgetReserve: visualReserve });
 			if (!check.should) return;
 			// Compact failure is non-fatal: log + continue with the un-compacted

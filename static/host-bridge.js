@@ -16,7 +16,10 @@
 (function () {
   "use strict";
   if (window.HostBridgeHost && window.HostBridgeHost._host) return; // 防重复加载
-  var PROTO = "1.0.0";
+  // 桥协议版本工具（Stage 5-1）：优先用共享模块 static/bridge-version.js（在
+  // index.html 中先于本文件加载）；未加载时用下方内联兜底，保证 host 不崩。
+  var BV = (typeof window.BridgeVersion !== "undefined") ? window.BridgeVersion : null;
+  var PROTO = BV ? BV.PROTOCOL_VERSION : "1.0.0";
   var PLUGIN_ID = "histopilot";
   var reqSeq = 0, evtSeq = 0;
   var pending = {}; // requestId -> {resolve, reject, timer}
@@ -27,8 +30,9 @@
     return !!(window.HistoPilot && typeof window.HistoPilot._onHostMessage === "function");
   }
 
-  // 主版本兼容校验（major 必须相等）
+  // 运行时主版本兼容校验（强制同 major）。优先走共享模块，缺失时内联兜底。
   function compat(v) {
+    if (BV) return BV.compat(v, PROTO);
     try { return String(v || "").split(".")[0] === PROTO.split(".")[0]; }
     catch (e) { return false; }
   }

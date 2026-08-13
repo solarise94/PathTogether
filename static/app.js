@@ -3520,6 +3520,21 @@
   function registerHostBridgeHandlers() {
     var host = window.HostBridgeHost;
     if (!host) return;
+    // Plugin→Host request：握手期桥协议版本协商（Stage 5-1）。
+    // 插件发 bridge.negotiate {protocolVersion} → host 调 BridgeVersion.negotiate；
+    // 兼容返回 {ok:true,protocolVersion}，不兼容 throw error → host 回 ok:false 信封
+    // （{code:"version_incompatible"}），不崩 host（_handlePluginRequest 统一兜底）。
+    host.onRequest("bridge.negotiate", function (p) {
+      var bv = window.BridgeVersion;
+      var remote = (p && (p.protocolVersion || p.bridgeProtocolVersion)) || null;
+      if (!bv) {
+        // 兜底（BridgeVersion 未加载）：按当前 PROTO 同 major 接受
+        return { ok: true, protocolVersion: "1.0.0" };
+      }
+      var res = bv.negotiate(remote);
+      if (!res.ok) throw res.error; // → host 回 ok:false, error={code:"version_incompatible",...}
+      return res; // {ok:true, protocolVersion}
+    });
     // Plugin→Host request
     host.onRequest("slide.getCurrent", function () {
       if (!state.slide) return null;

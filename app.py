@@ -46,6 +46,15 @@ import slide_cache
 import slide_io
 import user_store
 
+# Stage 5-1：插件 manifest 版本常量单一来源（plugins/sdk/manifest.py）。
+# plugins/ 与 plugins/sdk/ 各有 __init__.py（plugins/histopilot/ 不加，保持静态目录）。
+from plugins.sdk.manifest import (  # noqa: E402
+    PLUGIN_CONTRACT_VERSION,
+    BRIDGE_PROTOCOL_VERSION,
+    SUPPORTED_CONTRACT_MAJORS,
+    SUPPORTED_BRIDGE_MAJORS,
+)
+
 app = Flask(__name__)
 
 # 上传目录：默认 ~/svs-viewer/uploads，可用环境变量 UPLOAD_DIR 覆盖（容器内挂载）
@@ -3919,6 +3928,46 @@ def plugin_v1_run_grant_verify():
         return _plugin_error(400, "invalid_request", "grant_id 必填")
     valid, reason = _verify_run_grant(grant_id, slide, claims.get("sub") or "")
     return jsonify(valid=valid, reason=reason if not valid else "")
+
+
+# --------------------------------------------------------------------------- #
+# Stage 5-1：平台能力公告端点（§7.2）。
+#
+# 版本常量与支持 major 来自 plugins.sdk.manifest（单一来源）。capabilities 列表
+# 对齐现有 v1 端点实际能力：四项数据能力 + events:read + audit:write（v1 SSE /
+# audit 端点随事件流/审计节点引入；先以枚举公告，保持与 manifest permissions 同源）。
+# 鉴权走现有 plugin JWT（_require_plugin_token，不要求特定 scope——公告本身只读）。
+# --------------------------------------------------------------------------- #
+_PLUGIN_CAPABILITIES = [
+    "slide:metadata:read",   # GET /slides/{slide_id}
+    "slide:region:read",     # POST /slides/{slide_id}/regions
+    "annotation:read",       # GET /slides/{slide_id}/changes（增量读标注）
+    "annotation:write",      # POST /slides/{slide_id}/annotations（+X-Run-Grant）
+    "viewer:navigate",       # HostBridge viewer.navigate / selection.getBbox
+    "events:read",           # GET /events/stream（SSE，事件流节点）
+    "audit:write",           # POST /audit/plugin-events（审计节点）
+]
+
+
+@app.route("/api/plugin/v1/capabilities", methods=["GET"])
+def plugin_v1_capabilities():
+    """平台能力公告（§7.2）：contract/bridge 版本 + 支持 major + 能力列表。
+
+    插件加载/启动期据此完成版本协商（与 manifest.pluginContractVersion /
+    bridgeProtocolVersion 对齐）。返回 200 JSON：
+      ``{pluginContractVersion, supportedContractMajors, bridgeProtocolVersion,
+         supportedBridgeMajors, capabilities: [...]}``。
+    """
+    claims, err = _require_plugin_token()
+    if err is not None:
+        return err
+    return jsonify(
+        pluginContractVersion=PLUGIN_CONTRACT_VERSION,
+        supportedContractMajors=list(SUPPORTED_CONTRACT_MAJORS),
+        bridgeProtocolVersion=BRIDGE_PROTOCOL_VERSION,
+        supportedBridgeMajors=list(SUPPORTED_BRIDGE_MAJORS),
+        capabilities=_PLUGIN_CAPABILITIES,
+    )
 
 
 @app.route("/api/ai/run", methods=["POST"])

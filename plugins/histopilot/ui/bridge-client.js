@@ -18,14 +18,18 @@
 (function () {
   "use strict";
   if (window.HistoPilot && window.HistoPilot._bridge) return; // 防重复加载
-  var PROTO = "1.0.0";
+  // 桥协议版本工具（Stage 5-1）：优先用共享模块 static/bridge-version.js
+  // （在 index.html 中先于本文件加载）；未加载时用下方内联兜底，保证插件不崩。
+  var BV = (typeof window.BridgeVersion !== "undefined") ? window.BridgeVersion : null;
+  var PROTO = BV ? BV.PROTOCOL_VERSION : "1.0.0";
   var PLUGIN_ID = "histopilot";
   var HP = (window.HistoPilot = window.HistoPilot || {});
   // 共享状态对象：各脚本以 `var S = HP.s;` 捕获同一引用；main.js 在加载时填充字段。
   HP.s = HP.s || {};
 
-  // ---------- 主版本兼容校验（major 必须相等） ----------
+  // ---------- 运行时主版本兼容校验（major 必须相等） ----------
   function compat(v) {
+    if (BV) return BV.compat(v, PROTO);
     try {
       var maj = String(v || "").split(".")[0];
       return maj === PROTO.split(".")[0];

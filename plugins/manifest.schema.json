@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pathtogather.dev/plugin/manifest.schema.json",
+  "title": "Plugin Manifest",
+  "description": "HistoPilot 通用插件 manifest（docs §7.1）。四个版本字段相互独立：manifestSchemaVersion（manifest 文件结构）/ pluginContractVersion（capability API、领域类型、错误码）/ bridgeProtocolVersion（HostBridge 消息协议）/ pluginVersion（产品/镜像版本）。platforms/sdk/manifest.py 提供纯 stdlib 校验器（不依赖 jsonschema），本 schema 作为权威定义与工具链（IDE / 外部校验）参考。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifestSchemaVersion",
+    "id",
+    "name",
+    "pluginVersion",
+    "pluginContractVersion",
+    "bridgeProtocolVersion",
+    "ui",
+    "service",
+    "permissions"
+  ],
+  "properties": {
+    "manifestSchemaVersion": {
+      "description": "manifest 文件自身的字段结构版本（§7.0）。manifest 语法不兼容时 bump major。平台按 N/N-1 major 兼容加载。",
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)$"
+    },
+    "id": {
+      "description": "插件稳定标识（反向域名风格），跨安装不变。",
+      "type": "string",
+      "minLength": 1
+    },
+    "name": {
+      "description": "人类可读的插件显示名。",
+      "type": "string",
+      "minLength": 1
+    },
+    "pluginVersion": {
+      "description": "插件产品/镜像/bundle 版本（正常产品 SemVer；不自动改变其它三个版本）。",
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)$"
+    },
+    "pluginContractVersion": {
+      "description": "服务端 capability API、领域类型与错误码的契约版本（§7.2 / §7.7）。破坏 API/语义时 bump major；平台按 N/N-1 major 协商。",
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)$"
+    },
+    "bridgeProtocolVersion": {
+      "description": "iframe HostBridge 消息协议版本（§7.5）。消息不兼容时 bump major；平台按 N/N-1 major 协商，运行时消息强制同 major。",
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)$"
+    },
+    "ui": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entry", "slots"],
+      "properties": {
+        "entry": {
+          "description": "插件 UI 入口（相对插件 bundle 根的 HTML 路径）。",
+          "type": "string",
+          "minLength": 1
+        },
+        "slots": {
+          "description": "插件占用的 UI 插槽标识（字符串数组，至少一个）。",
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baseUrl", "health"],
+      "properties": {
+        "baseUrl": {
+          "description": "插件后端服务基地址（平台侧代理/健康探测用）。",
+          "type": "string",
+          "minLength": 1
+        },
+        "health": {
+          "description": "健康检查路径（相对 baseUrl）。",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "permissions": {
+      "description": "插件声明的能力权限枚举（与 capabilities 列表对齐）。未知值校验失败。",
+      "type": "array",
+      "items": {
+        "enum": [
+          "slide:metadata:read",
+          "slide:region:read",
+          "annotation:read",
+          "annotation:write",
+          "viewer:navigate"
+        ]
+      }
+    }
+  }
+}

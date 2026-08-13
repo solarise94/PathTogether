@@ -644,10 +644,13 @@ export class AgentRunner {
 	// --------------------------------------------------------------------------- //
 	private selfCheckRunGrant(config: RunConfig): void {
 		const grant = config.run_grant;
-		const verify = this.flask.verifyRunGrant;
-		if (!grant || !verify) return;
+		const client = this.flask;
+		// 注意：必须经 client 实例调用（client.verifyRunGrant(grant)），不能把方法
+		// 摘出来赋值再调——脱绑后 this 丢失，verifyRunGrant 内 this.request 会
+		// 抛 TypeError（demo 实测踩过）。
+		if (!grant || typeof client.verifyRunGrant !== "function") return;
 		// Fire-and-forget; log-only. Never await (must not delay the run start).
-		void verify(grant)
+		void client.verifyRunGrant(grant)
 			.then((r) => {
 				if (!r.valid) {
 					console.warn(`[run-grant] pre-run self-check invalid for ${grant.slide} (${grant.grant_id}): ${r.reason || "unknown"}`);

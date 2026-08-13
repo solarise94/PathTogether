@@ -1229,3 +1229,36 @@ describe("AgentRunner.runMain — Phase 3 explicit prompt cache (§13/§15.2)", 
 		expect(everSawCacheKey).toBe(false);
 	}, 30000);
 });
+
+describe("AgentRunner: run-grant self-check (Stage 4-1b review fix)", () => {
+	it("calls client.verifyRunGrant with the client as `this` (no detached-method TypeError)", async () => {
+		const { AgentRunner } = await import("../src/agent-runner.js");
+		const h: Harness = await newHarness(makeFakeStreamFn([{ text: "done" }]).fn);
+		// 一个要求正确 this 绑定的 verifyRunGrant：this.marker 不存在（脱绑）即抛
+		const calls: string[] = [];
+		const client = Object.create(h.mock);
+		client.marker = "bound";
+		client.verifyRunGrant = async function (this: { marker?: string }, g: { grant_id: string; slide: string }) {
+			if (!this || this.marker !== "bound") throw new TypeError("Cannot read properties of undefined (reading 'request')");
+			calls.push(g.grant_id);
+			return { valid: true, reason: "" };
+		};
+		const runner = new AgentRunner(h.store, h.bus, client as never, { streamFn: makeFakeStreamFn([{ text: "done" }]) as never });
+		void runner;
+		(runner as unknown as { selfCheckRunGrant(c: unknown): void }).selfCheckRunGrant({
+			...BASE_CONFIG,
+			run_grant: { grant_id: "rgr_t1", slide: "s.svs" },
+		});
+		await new Promise((r) => setTimeout(r, 10));
+		expect(calls).toEqual(["rgr_t1"]);
+	});
+
+	it("skips silently when no grant or client lacks verifyRunGrant", async () => {
+		const { AgentRunner } = await import("../src/agent-runner.js");
+		const h: Harness = await newHarness(makeFakeStreamFn([{ text: "done" }]).fn);
+		const runner = new AgentRunner(h.store, h.bus, h.mock as never, { streamFn: makeFakeStreamFn([{ text: "done" }]) as never });
+		const fn = (runner as unknown as { selfCheckRunGrant(c: unknown): void }).selfCheckRunGrant.bind(runner);
+		expect(() => fn({ ...BASE_CONFIG })).not.toThrow();
+		expect(() => fn({ ...BASE_CONFIG, run_grant: { grant_id: "rgr_x", slide: "s" } })).not.toThrow();
+	});
+});

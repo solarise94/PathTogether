@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 import secrets
 import shutil
@@ -17,7 +18,7 @@ import sys
 import threading
 import time
 import zipfile
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import timedelta
 from pathlib import Path
 
@@ -404,6 +405,45 @@ def _require_auth():
         return jsonify(error="auth_required"), 401
     # 页面：跳登录，带 next（防开放跳转在 login 路由内校验）
     return redirect("/login?next=" + path)
+
+
+@app.before_request
+def _plugin_v1_rate_limit():
+    """v1 能力端点统一速率限制（进程内 token bucket per installation_id）。
+
+    实现位置选择 before_request 钩子并严格限定 ``/api/plugin/v1/`` 前缀（注释
+    说明：不触碰 /internal/* 与主站 /api/slide/*，share_server 也不挂）。语义上
+    挂在鉴权 _require_plugin_token “之后”——installation_id 取自 JWT(sub)，故这里
+    轻量复算一次 token 校验（与视图内一致），**仅在 token 有效且安装 enabled 时**
+    才计入桶并拦截超限；无效/过期 token 不计入（交视图返回权威 401，避免用限流
+    头泄漏 token 有效性）。
+
+    - auth/token 换发端点不在此列（无 Bearer、走 secret 校验，属引导通道）；
+    - regions 端点也计入总桶（权重 1），其像素预算/并发闸在视图内单独再叠加。
+    超限 → 429 rate_limited(retryable=true) + Retry-After（§7.7）。
+    """
+    path = request.path
+    if not path.startswith("/api/plugin/v1/"):
+        return None
+    if path == "/api/plugin/v1/auth/token":
+        return None  # 引导换发端点：无 Bearer，交视图按 secret 校验
+    authz = request.headers.get("Authorization") or ""
+    if not authz.startswith("Bearer "):
+        return None  # 无 token → 交视图 401，不计入桶
+    payload, jerr = _plugin_jwt_decode(authz[len("Bearer "):].strip())
+    if jerr is not None:
+        return None  # 无效/过期 → 交视图返回权威 401（token_expired 等）
+    installation_id = payload.get("sub") or ""
+    installation = share_store.get_plugin_installation(installation_id)
+    if installation is None or not installation.get("enabled"):
+        return None  # 安装不存在/停用 → 交视图 401
+    ok, retry = _PLUGIN_RATE_LIMITER.consume(installation_id, weight=1)
+    if not ok:
+        return _plugin_rate_limited_response(
+            "请求过于频繁，已触发速率限制（每分钟 %d 次），请稍后重试"
+            % _PLUGIN_RATE_LIMIT_PER_MIN, retry,
+            details={"limit_per_min": _PLUGIN_RATE_LIMIT_PER_MIN, "reason": "rate_limit"})
+    return None
 
 # Deep Zoom 参数（512 瓦片降低公网请求数，渐进式 q82 JPEG 降体积并支持模糊→清晰预览）
 DZ_TILE_SIZE = 512
@@ -1811,6 +1851,124 @@ def _plugin_error(status: int, code: str, message: str, retryable=None, details=
     resp = jsonify(error=err)
     resp.status_code = status
     return resp
+
+
+def _plugin_rate_limited_response(message, retry_after, details=None):
+    """构造 429 rate_limited 信封 + Retry-After 头（像素预算/并发/速率限制共用）。
+
+    retry_after 取整数秒，至少 1（HTTP Retry-After 语义）。details 透传进信封
+    （sidecar 从 ContractError.details 读取，4-2 contract 已支持）。
+    """
+    merged = dict(details or {})
+    merged.setdefault("retry_after", int(max(1, retry_after)))
+    resp = _plugin_error(429, "rate_limited", message, details=merged)
+    resp.headers["Retry-After"] = str(int(max(1, retry_after)))
+    return resp
+
+
+# --------------------------------------------------------------------------- #
+# Stage 4-2：像素预算 + 速率限制 + 并发闸（进程内，仅保护 /api/plugin/v1 通道）
+#
+# 三道闸门（regions 端点叠加，其余 v1 能力端点只走速率桶）：
+#   1. 单请求像素上限（PLUGIN_REGION_MAX_PIXELS，4096²）——入口即拒，零磁盘；
+#   2. 滑窗像素预算（PLUGIN_REGION_PIXEL_BUDGET_PER_MIN，per installation_id，
+#      60s 滑动窗口）——regions 拿到并发槽后、读盘前计入；
+#   3. 并发闸（PLUGIN_REGION_MAX_CONCURRENT，进程级信号量）——regions 专用；
+#   外加 v1 全能力端点的统一速率桶（PLUGIN_RATE_LIMIT_PER_MIN，per installation_id
+#   token bucket；regions 也计入，权重 1）。
+# 全部进程内、demo 规模，重启即清零。share_server / 主站 /api/slide/* 与
+# /internal/* 不挂任何一道闸（本节点只保护插件通道）。
+# --------------------------------------------------------------------------- #
+_PLUGIN_REGION_MAX_PIXELS = int(os.environ.get("PLUGIN_REGION_MAX_PIXELS") or 16777216)  # 4096²
+_PLUGIN_REGION_PIXEL_BUDGET_PER_MIN = int(
+    os.environ.get("PLUGIN_REGION_PIXEL_BUDGET_PER_MIN") or 268435456)  # ≈16×4096²/分钟
+_PLUGIN_REGION_MAX_CONCURRENT = max(1, int(os.environ.get("PLUGIN_REGION_MAX_CONCURRENT") or 4))
+_PLUGIN_RATE_LIMIT_PER_MIN = int(os.environ.get("PLUGIN_RATE_LIMIT_PER_MIN") or 120)
+
+
+class _SlidingPixelWindow:
+    """per-installation 60s 滑动窗口像素预算计数器（进程内，线程安全）。
+
+    admit() 在像素能容纳时计入窗口并返回 (True, 0)；超限返回 (False, retry_after)，
+    retry_after 为“最早释放足量像素的时刻”距现在的秒数（≥1）。纯内存计数，
+    进程重启清零；同 installation_id 共享一个窗口。
+    """
+
+    def __init__(self, budget_per_min, window_sec=60):
+        self._budget = int(budget_per_min)
+        self._window = int(window_sec)
+        self._lock = threading.Lock()
+        self._buckets = {}  # installation_id -> deque[(ts, pixels)]
+
+    def _evict(self, dq, now):
+        cutoff = now - self._window
+        while dq and dq[0][0] <= cutoff:
+            dq.popleft()
+
+    def admit(self, installation_id, pixels, now=None):
+        """尝试计入 pixels 像素。返回 (allowed, retry_after_seconds)。"""
+        now = time.time() if now is None else now
+        with self._lock:
+            dq = self._buckets.setdefault(installation_id, deque())
+            self._evict(dq, now)
+            total = sum(p for _, p in dq)
+            if total + pixels <= self._budget:
+                dq.append((now, pixels))
+                return True, 0
+            return False, self._retry_after(dq, pixels, now)
+
+    def _retry_after(self, dq, pixels, now):
+        # 单请求本身超过整窗预算 → 淘汰全部也放不下，回窗口长度（保守上界）
+        if pixels > self._budget:
+            return self._window
+        current = sum(p for _, p in dq)
+        need = (current + pixels) - self._budget  # 需要释放的像素量
+        freed = 0
+        # deque 左侧最旧：逐条淘汰直到累计释放 ≥ need，取该条淘汰时刻
+        for ts, p in dq:
+            freed += p
+            if freed >= need:
+                return max(1, int(math.ceil((ts + self._window) - now)))
+        return self._window
+
+
+class _PluginRateLimiter:
+    """per-installation token bucket（进程内，线程安全）。
+
+    容量 = per_minute（即允许瞬时耗尽一分钟配额，之后按 per_minute/60 每秒回补）。
+    consume(weight) 成功扣减返回 (True, 0)；不足返回 (False, retry_after)，retry_after
+    为攒够 weight 个 token 所需秒数（≥1）。
+    """
+
+    def __init__(self, per_minute):
+        self._capacity = float(per_minute)
+        self._rate = float(per_minute) / 60.0  # tokens/sec
+        self._lock = threading.Lock()
+        self._state = {}  # installation_id -> [tokens, last_ts]
+
+    def consume(self, installation_id, weight=1, now=None):
+        now = time.time() if now is None else now
+        with self._lock:
+            st = self._state.get(installation_id)
+            if st is None:
+                tokens, last = self._capacity, now
+            else:
+                tokens, last = st
+                tokens = min(self._capacity, tokens + max(0.0, now - last) * self._rate)
+            if tokens >= weight:
+                tokens -= weight
+                self._state[installation_id] = [tokens, now]
+                return True, 0
+            deficit = weight - tokens
+            retry = max(1, int(math.ceil(deficit / self._rate))) if self._rate > 0 else 60
+            self._state[installation_id] = [tokens, now]  # 记录回补时刻
+            return False, retry
+
+
+# 进程级单例（demo 规模：单进程；测试可通过 monkeypatch 替换为小预算实例）
+_PLUGIN_REGION_CONCURRENCY_SEM = threading.BoundedSemaphore(_PLUGIN_REGION_MAX_CONCURRENT)
+_PLUGIN_PIXEL_WINDOW = _SlidingPixelWindow(_PLUGIN_REGION_PIXEL_BUDGET_PER_MIN)
+_PLUGIN_RATE_LIMITER = _PluginRateLimiter(_PLUGIN_RATE_LIMIT_PER_MIN)
 
 
 def _require_plugin_token(required_scope=None):
@@ -3408,8 +3566,17 @@ def plugin_v1_region(slide):
       - {x, y, w, h, ...}（legacy 平铺，与 internal 端点一致）
     可选：out_w/out_h、max_long_edge（优先，保宽高比）、jpeg_quality（1..100）、
     expected_fingerprint（不符 → 409 slide_revision_conflict 信封）。
-    本节点仍返回 base64 JSON（二进制 transport 是 4-2）；Content-SHA256 响应头
-    与 body content_sha256 都是对返回 JPEG bytes 的 sha256（hex）。
+
+    Stage 4-2：
+      - 内容协商——Accept: application/octet-stream（或 ?format=binary）→ 返回 raw
+        JPEG bytes（Content-Type: application/octet-stream），元数据全走响应头
+        （Content-SHA256/X-Asset-Revision/X-Region-Bbox/X-Region-Out/
+        X-Region-Magnification/X-Region-Encoder）。缺省（无 Accept）保持 JSON
+        base64 现状兼容。两条路径返回同一份 JPEG bytes（Content-SHA256 一致）。
+      - 像素预算——入口先算像素量（level0 w*h 与输出 outW*outH 取大者），超
+        PLUGIN_REGION_MAX_PIXELS 或滑窗预算 PLUGIN_REGION_PIXEL_BUDGET_PER_MIN
+        → 429 rate_limited（**必须在读盘/解码前拒绝**，slide_cache 零触碰）。
+      - 并发闸——PLUGIN_REGION_MAX_CONCURRENT 进程级信号量，超载 → 429。
     """
     claims, err = _require_plugin_token("region:read")
     if err is not None:
@@ -3452,40 +3619,93 @@ def plugin_v1_region(slide):
     if jpeg_quality is not None and (jpeg_quality < 1 or jpeg_quality > 100):
         return _plugin_error(400, "invalid_request", "jpeg_quality 需在 1..100")
 
+    # ---- 像素预算闸 1：单请求上限（纯算术，零磁盘；必须在读盘/解码前拒绝）---- #
+    # 像素量 = level0 bbox w*h 与输出 outW*outH 取大者。max_long_edge 给定时按
+    # 保宽高比估算输出；否则用显式 out_w/out_h（缺省 1568，clamp 4096）。
+    if max_long_edge is not None and max_long_edge > 0:
+        est_ow, est_oh = _aspect_fit_size(w, h, max_long_edge)
+    else:
+        est_ow = max(1, min(int(out_w or 1568), 4096))
+        est_oh = max(1, min(int(out_h or 1568), 4096))
+    pixels = max(int(w) * int(h), int(est_ow) * int(est_oh))
+    if pixels > _PLUGIN_REGION_MAX_PIXELS:
+        return _plugin_rate_limited_response(
+            "单次 region 请求像素量超限（%d > 上限 %d），请缩小区域或输出尺寸"
+            % (pixels, _PLUGIN_REGION_MAX_PIXELS), 1,
+            details={"pixels": pixels, "max_pixels": _PLUGIN_REGION_MAX_PIXELS,
+                     "reason": "single_request_pixels"})
+
+    # ---- 内容协商（缺省 JSON base64 兼容；octet-stream / format=binary 走二进制）---- #
+    accept = request.headers.get("Accept", "") or ""
+    want_binary = ("application/octet-stream" in accept
+                   or (request.args.get("format") or "") == "binary")
+
     expected_fp = body.get("expected_fingerprint") or body.get("expectedAssetRevision")
     if isinstance(expected_fp, str) and expected_fp:
         fp = _slide_fingerprint(safe)
         if fp != expected_fp:
             return _plugin_error(409, "slide_revision_conflict", "切片指纹不匹配（文件已变更）",
                                  details={"expected": expected_fp, "actual": fp})
-    entry = _get_slide(safe)
-    with slide_cache.borrow_pair(entry) as pair:
-        osr = pair["osr"]
-        meta = _read_metadata(osr, UPLOAD_DIR / safe)
-        mpp = meta.get("mpp_x")
-    if not out_w or out_w <= 0:
-        out_w = 1568
-    if not out_h or out_h <= 0:
-        out_h = 1568
-    q = jpeg_quality if (jpeg_quality and jpeg_quality > 0) else DERIVATIVE_JPEG_QUALITY
-    r = _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
-                         max_long_edge=max_long_edge, jpeg_quality=q)
-    # Content-SHA256：对实际返回的 JPEG bytes 计算（4-1b sidecar 缓存校验用）
-    jpeg_bytes = base64.b64decode(r["image_base64"])
-    content_sha = hashlib.sha256(jpeg_bytes).hexdigest()
-    resp = jsonify({
-        "image_base64": r["image_base64"],
-        "mime": r["mime"],
-        "width": r["width"],
-        "height": r["height"],
-        "src": r["src"],
-        "magnification": r["magnification"],
-        "encoder": _derivative_encoder_info(q),
-        "content_sha256": content_sha,
-        "asset_revision": _legacy_slide_revision(safe),
-    })
-    resp.headers["Content-SHA256"] = content_sha
-    return resp
+
+    # ---- 并发闸：进程级信号量（非阻塞；仅保护插件 region 通道）---- #
+    installation_id = claims.get("sub") or ""
+    acquired = _PLUGIN_REGION_CONCURRENCY_SEM.acquire(blocking=False)
+    if not acquired:
+        return _plugin_rate_limited_response(
+            "region 并发已达上限（%d），请稍后重试" % _PLUGIN_REGION_MAX_CONCURRENT, 1,
+            details={"max_concurrent": _PLUGIN_REGION_MAX_CONCURRENT,
+                     "reason": "concurrency"})
+    try:
+        # ---- 像素预算闸 2：滑窗预算（拿到并发槽后、读盘前计入；超限零磁盘）---- #
+        ok, retry = _PLUGIN_PIXEL_WINDOW.admit(installation_id, pixels)
+        if not ok:
+            return _plugin_rate_limited_response(
+                "region 像素预算耗尽（每分钟 %d 像素），请稍后重试"
+                % _PLUGIN_REGION_PIXEL_BUDGET_PER_MIN, retry,
+                details={"pixels": pixels, "budget_per_min": _PLUGIN_REGION_PIXEL_BUDGET_PER_MIN,
+                         "reason": "pixel_budget"})
+        entry = _get_slide(safe)
+        with slide_cache.borrow_pair(entry) as pair:
+            osr = pair["osr"]
+            meta = _read_metadata(osr, UPLOAD_DIR / safe)
+            mpp = meta.get("mpp_x")
+        if not out_w or out_w <= 0:
+            out_w = 1568
+        if not out_h or out_h <= 0:
+            out_h = 1568
+        q = jpeg_quality if (jpeg_quality and jpeg_quality > 0) else DERIVATIVE_JPEG_QUALITY
+        r = _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
+                             max_long_edge=max_long_edge, jpeg_quality=q)
+        # Content-SHA256：对实际返回的 JPEG bytes 计算（两条传输路径共用）
+        jpeg_bytes = base64.b64decode(r["image_base64"])
+        content_sha = hashlib.sha256(jpeg_bytes).hexdigest()
+        if want_binary:
+            # 二进制 transport：raw JPEG bytes + 元数据全走响应头（§7.3/4-2）
+            resp = Response(jpeg_bytes, mimetype="application/octet-stream")
+            resp.headers["Content-Type"] = "application/octet-stream"
+            resp.headers["Content-SHA256"] = content_sha
+            resp.headers["X-Asset-Revision"] = _legacy_slide_revision(safe)
+            resp.headers["X-Region-Bbox"] = json.dumps(r["src"])
+            resp.headers["X-Region-Out"] = json.dumps(
+                {"outW": int(r["width"]), "outH": int(r["height"])})
+            resp.headers["X-Region-Magnification"] = json.dumps(r["magnification"])
+            resp.headers["X-Region-Encoder"] = json.dumps(_derivative_encoder_info(q))
+            return resp
+        resp = jsonify({
+            "image_base64": r["image_base64"],
+            "mime": r["mime"],
+            "width": r["width"],
+            "height": r["height"],
+            "src": r["src"],
+            "magnification": r["magnification"],
+            "encoder": _derivative_encoder_info(q),
+            "content_sha256": content_sha,
+            "asset_revision": _legacy_slide_revision(safe),
+        })
+        resp.headers["Content-SHA256"] = content_sha
+        return resp
+    finally:
+        _PLUGIN_REGION_CONCURRENCY_SEM.release()
 
 
 @app.route("/api/plugin/v1/slides/<slide>/changes", methods=["GET"])

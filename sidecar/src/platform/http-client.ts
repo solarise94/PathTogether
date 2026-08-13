@@ -131,7 +131,7 @@ export class PathTogatherHttpClient implements PlatformClient {
 		if (!res.ok) {
 			// Wrong/rotated secret or disabled installation → the operator must fix
 			// the credential file/env; never auto-retry. Surface as `unauthorized`.
-			const err = mapEnvelope(res.status, body);
+			const err = mapEnvelope(res.status, body, res.headers);
 			throw new ContractError({
 				code: "unauthorized",
 				message: err?.message || `插件凭证换取失败（${res.status}）`,
@@ -179,7 +179,7 @@ export class PathTogatherHttpClient implements PlatformClient {
 	// Unified request (bearer + envelope + one-shot 401 token_expired replay)
 	// ========================================================================= //
 
-	private async request<T>(opts: {
+	private async request(opts: {
 		method: string;
 		path: string;
 		query?: Record<string, string>;
@@ -187,17 +187,28 @@ export class PathTogatherHttpClient implements PlatformClient {
 		extraHeaders?: Record<string, string>;
 		signal?: AbortSignal;
 	}): Promise<{ status: number; body: unknown; headers: Headers }> {
-		return this.requestOnce(opts, true);
+		const res = await this.requestRaw(opts, true);
+		const body = await readJson(res);
+		return { status: res.status, body, headers: res.headers };
 	}
 
-	private async requestOnce(opts: {
+	/**
+	 * Core transport: bearer + fetch + error-envelope handling + one-shot 401
+	 * token_expired replay. Returns the **unread** `Response` on success so the
+	 * caller consumes the body in the right shape (JSON for capabilities, raw
+	 * bytes for the binary region transport — Stage 4-2). On non-2xx the body is
+	 * always the JSON envelope — even for binary endpoints — and is read + mapped
+	 * here (the success body is never touched in that case, so the single-read
+	 * contract on `Response` is preserved).
+	 */
+	private async requestRaw(opts: {
 		method: string;
 		path: string;
 		query?: Record<string, string>;
 		body?: unknown;
 		extraHeaders?: Record<string, string>;
 		signal?: AbortSignal;
-	}, allowReplay: boolean): Promise<{ status: number; body: unknown; headers: Headers }> {
+	}, allowReplay: boolean): Promise<Response> {
 		const token = await this.getToken();
 		const url = new URL(`${this.baseUrl}/api/plugin/v1${opts.path}`);
 		if (opts.query) {
@@ -225,18 +236,18 @@ export class PathTogatherHttpClient implements PlatformClient {
 				httpStatus: 0,
 			});
 		}
-		const body = (await readJson(res)) as Record<string, unknown> | undefined;
 		if (!res.ok) {
-			const err = mapEnvelope(res.status, body);
+			const body = (await readJson(res)) as Record<string, unknown> | undefined;
+			const err = mapEnvelope(res.status, body, res.headers);
 			if (allowReplay && err?.code === "token_expired") {
 				// The cached token lapsed mid-flight; refresh exactly once and replay.
 				// `allowReplay=false` on the retry guarantees a single retry, never a loop.
 				this.invalidateToken();
-				return this.requestOnce(opts, false);
+				return this.requestRaw(opts, false);
 			}
 			throw err;
 		}
-		return { status: res.status, body, headers: res.headers };
+		return res;
 	}
 
 	// ========================================================================= //
@@ -271,36 +282,83 @@ export class PathTogatherHttpClient implements PlatformClient {
 		if (request.maxLongEdge !== undefined) body.max_long_edge = request.maxLongEdge;
 		if (request.quality !== undefined) body.jpeg_quality = request.quality;
 		if (request.expectedAssetRevision) body.expected_fingerprint = request.expectedAssetRevision;
-		const { body: rbody, headers } = await this.request({
+		// Stage 4-2: prefer the binary transport (raw JPEG bytes + metadata
+		// headers). The success body shape branches on Content-Type:
+		//   - application/octet-stream → bytes path (this node's default);
+		//   - application/json → legacy base64 path (older platforms that do not
+		//     implement binary negotiation).
+		// On error the body is ALWAYS the JSON envelope regardless of transport,
+		// and is consumed + mapped inside requestRaw (the success body is left
+		// unread there, so the single-read contract on Response holds).
+		const res = await this.requestRaw({
 			method: "POST",
 			path: `/slides/${enc(request.slide)}/regions`,
 			body,
+			extraHeaders: { Accept: "application/octet-stream" },
 			signal,
-		});
-		const r = rbody as Record<string, unknown>;
+		}, true);
+		const contentType = (res.headers.get("content-type") || "").toLowerCase();
+		if (contentType.includes("application/octet-stream")) {
+			return this.parseBinaryRegion(res, request);
+		}
+		const r = (await readJson(res)) as Record<string, unknown>;
+		return this.parseJsonRegion(r, request, res.headers);
+	}
+
+	/** Binary region transport (Stage 4-2): raw JPEG bytes + metadata from headers. */
+	private async parseBinaryRegion(res: Response, request: RegionRequest): Promise<RegionResult> {
+		const buf = Buffer.from(await res.arrayBuffer());
+		const localSha = createHash("sha256").update(buf).digest("hex");
+		// Content-SHA256 header is authoritative for the binary path (there is no
+		// body field to fall back to). Mismatch → integrity_error (non-retryable).
+		verifyRegionIntegrity(res.headers.get("content-sha256") || "", localSha);
+		const bbox = headerJson(res.headers, "x-region-bbox");
+		const out = headerJson(res.headers, "x-region-out");
+		const magRaw = res.headers.get("x-region-magnification");
+		return {
+			bytes: buf,
+			mimeType: "image/jpeg",
+			width: Number(out?.outW ?? 0),
+			height: Number(out?.outH ?? 0),
+			src: {
+				x: Number(bbox?.x ?? request.bbox.x),
+				y: Number(bbox?.y ?? request.bbox.y),
+				w: Number(bbox?.w ?? request.bbox.w),
+				h: Number(bbox?.h ?? request.bbox.h),
+			},
+			magnification: magRaw == null || magRaw === "null" ? null : Number(magRaw),
+			contentSha256: localSha,
+			assetRevision: res.headers.get("x-asset-revision") || undefined,
+			encoder: normalizeEncoder(headerJson(res.headers, "x-region-encoder")),
+		};
+	}
+
+	/** Legacy JSON base64 region path (older platforms without binary negotiation). */
+	private parseJsonRegion(
+		r: Record<string, unknown>,
+		request: RegionRequest,
+		headers: Headers,
+	): RegionResult {
 		const b64 = typeof r.image_base64 === "string" ? r.image_base64 : "";
 		const bytes = Buffer.from(b64, "base64");
 		const localSha = createHash("sha256").update(bytes).digest("hex");
-		// Integrity check: the Content-SHA256 header (platform 4-1a always sends
-		// it) is authoritative; fall back to the body `content_sha256` for older
-		// platforms. Any mismatch with the locally-computed digest → integrity_error.
-		const declaredSha = headers.get("content-sha256") || (typeof r.content_sha256 === "string" ? r.content_sha256 : "");
-		if (declaredSha && declaredSha.toLowerCase() !== localSha) {
-			throw new ContractError({
-				code: "integrity_error",
-				message: "region Content-SHA256 与返回字节不符",
-				retryable: false,
-				httpStatus: 0,
-				details: { expected: declaredSha, actual: localSha },
-			});
-		}
+		// Integrity check: the Content-SHA256 header is authoritative; fall back to
+		// the body `content_sha256` for older platforms. Mismatch → integrity_error.
+		const declaredSha = headers.get("content-sha256")
+			|| (typeof r.content_sha256 === "string" ? r.content_sha256 : "");
+		verifyRegionIntegrity(declaredSha, localSha);
 		const src = (r.src ?? {}) as Record<string, unknown>;
 		return {
 			bytes,
 			mimeType: "image/jpeg",
 			width: Number(r.width ?? 0),
 			height: Number(r.height ?? 0),
-			src: { x: Number(src.x ?? request.bbox.x), y: Number(src.y ?? request.bbox.y), w: Number(src.w ?? request.bbox.w), h: Number(src.h ?? request.bbox.h) },
+			src: {
+				x: Number(src.x ?? request.bbox.x),
+				y: Number(src.y ?? request.bbox.y),
+				w: Number(src.w ?? request.bbox.w),
+				h: Number(src.h ?? request.bbox.h),
+			},
 			magnification: r.magnification == null ? null : Number(r.magnification),
 			contentSha256: localSha,
 			assetRevision: typeof r.asset_revision === "string" ? r.asset_revision : undefined,
@@ -432,10 +490,21 @@ interface EnvelopeError {
  * envelope `{error:{code,message,retryable}}` (§7.7). When the envelope is
  * missing or malformed (platform too old / proxy stripped the JSON), fall back
  * to `unavailable` (retryable) — a defensive code, not an authoritative error.
+ *
+ * The HTTP `Retry-After` header (§7.7, sent on 429 rate_limited by the Stage 4-2
+ * pixel-budget / concurrency / rate-limit gates) is surfaced into
+ * `ContractError.details.retry_after` so callers backing off on retryable errors
+ * can read a concrete delay. Envelope `details` take precedence for any key it
+ * already sets.
  */
-function mapEnvelope(status: number, body: unknown): ContractError {
+function mapEnvelope(status: number, body: unknown, headers?: Headers): ContractError {
 	const error = (body as { error?: unknown } | undefined)?.error;
 	const env = (typeof error === "object" && error !== null ? error : {}) as Record<string, unknown>;
+	const details = mergeRetryAfter(
+		typeof env.details === "object" && env.details ? (env.details as Record<string, unknown>) : undefined,
+		headers,
+	);
+	const hasDetails = details !== undefined;
 	if (typeof env.code !== "string" || !env.code) {
 		// Missing/畸形 envelope → defensive retryable code (platform version skew).
 		return new ContractError({
@@ -443,6 +512,7 @@ function mapEnvelope(status: number, body: unknown): ContractError {
 			message: typeof error === "string" ? error : `插件端点返回 ${status}`,
 			retryable: true,
 			httpStatus: status,
+			details,
 		});
 	}
 	const retryable =
@@ -454,8 +524,62 @@ function mapEnvelope(status: number, body: unknown): ContractError {
 		message: typeof env.message === "string" ? env.message : `插件端点返回 ${status}`,
 		retryable,
 		httpStatus: status,
-		details: typeof env.details === "object" && env.details ? (env.details as Record<string, unknown>) : undefined,
+		// Keep details literally `undefined` when empty so existing assertions that
+		// do not check details are unaffected.
+		details: hasDetails ? details : undefined,
 	});
+}
+
+/**
+ * Merge the platform envelope details with the HTTP `Retry-After` header. The
+ * envelope details win for any key already present (e.g. the platform's own
+ * `retry_after`); otherwise the header value (numeric seconds when parseable,
+ * else the raw string) is added under `retry_after`. Returns `undefined` when
+ * neither source contributed anything.
+ */
+function mergeRetryAfter(
+	envDetails: Record<string, unknown> | undefined,
+	headers?: Headers,
+): Record<string, unknown> | undefined {
+	const out: Record<string, unknown> = {};
+	if (envDetails) Object.assign(out, envDetails);
+	if (headers && out.retry_after === undefined) {
+		const retryAfter = headers.get("retry-after");
+		if (retryAfter !== null && retryAfter !== "") {
+			const n = Number(retryAfter);
+			out.retry_after = Number.isFinite(n) ? n : retryAfter;
+		}
+	}
+	return Object.keys(out).length ? out : undefined;
+}
+
+/**
+ * Verify a region payload's declared Content-SHA256 against the locally-computed
+ * digest. Empty `declaredSha` is treated as "no assertion" (older platforms) and
+ * passes; any non-empty mismatch → non-retryable `integrity_error`.
+ */
+function verifyRegionIntegrity(declaredSha: string, localSha: string): void {
+	if (declaredSha && declaredSha.toLowerCase() !== localSha) {
+		throw new ContractError({
+			code: "integrity_error",
+			message: "region Content-SHA256 与返回字节不符",
+			retryable: false,
+			httpStatus: 0,
+			details: { expected: declaredSha, actual: localSha },
+		});
+	}
+}
+
+/** Parse a JSON-encoded response header (e.g. X-Region-Bbox) into an object. */
+function headerJson(headers: Headers, name: string): Record<string, unknown> | undefined {
+	const raw = headers.get(name);
+	if (!raw) return undefined;
+	try {
+		const v = JSON.parse(raw);
+		return typeof v === "object" && v !== null ? (v as Record<string, unknown>) : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 /** Map the platform's v1 error code vocab to the stable contract code vocab. */

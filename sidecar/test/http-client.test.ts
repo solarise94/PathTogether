@@ -33,6 +33,8 @@ interface Call {
 interface ScriptedResponse {
 	status: number;
 	body?: unknown;
+	/** Raw response body (binary octet-stream). When set, overrides `body`. */
+	rawBody?: Uint8Array | string;
 	headers?: Record<string, string>;
 }
 
@@ -40,6 +42,15 @@ type Responder = (call: Call) => ScriptedResponse;
 
 function jsonResponse(status: number, body: unknown, headers: Record<string, string> = {}): ScriptedResponse {
 	return { status, body, headers };
+}
+
+/** Build a binary (application/octet-stream) scripted response carrying raw bytes. */
+function binaryResponse(
+	status: number,
+	rawBody: Uint8Array | string,
+	headers: Record<string, string> = {},
+): ScriptedResponse {
+	return { status, rawBody, headers: { "Content-Type": "application/octet-stream", ...headers } };
 }
 
 function makeFetch(script: Responder[]) {
@@ -63,8 +74,12 @@ function makeFetch(script: Responder[]) {
 		index += 1;
 		const status = resp.status;
 		const resHeaders = new Headers(resp.headers ?? {});
-		const text = resp.body === undefined ? "" : JSON.stringify(resp.body);
-		const r = new Response(text, { status, headers: resHeaders });
+		// rawBody (Uint8Array | string) is passed straight through as the Response
+		// body — JSON.stringify would corrupt binary octet-stream payloads.
+		const respBody = resp.rawBody !== undefined
+			? resp.rawBody
+			: (resp.body === undefined ? "" : JSON.stringify(resp.body));
+		const r = new Response(respBody, { status, headers: resHeaders });
 		return Promise.resolve(r);
 	};
 	return { fn: fn as typeof fetch, calls, get index() { return index; } };
@@ -369,6 +384,163 @@ describe("PathTogatherHttpClient region integrity", () => {
 		await expect(client.region({ slide: legacySlide("a.svs"), bbox: { x: 0, y: 0, w: 10, h: 5 } })).rejects.toMatchObject({
 			name: "ContractError", code: "integrity_error", retryable: false, httpStatus: 0,
 		});
+	});
+});
+
+// --------------------------------------------------------------------------- //
+// Region binary transport (Stage 4-2) — octet-stream + metadata headers
+// --------------------------------------------------------------------------- //
+
+describe("PathTogatherHttpClient region binary transport", () => {
+	const JPEG = Buffer.from("raw-jpeg-bytes-stage42");
+	const JPEG_SHA = createHash("sha256").update(JPEG).digest("hex");
+
+	it("sends Accept: octet-stream and parses an octet-stream response (bytes + headers)", async () => {
+		const m = makeFetch([
+			() => tokenResponse(),
+			() => binaryResponse(200, JPEG, {
+				"Content-SHA256": JPEG_SHA,
+				"X-Asset-Revision": "rev:42",
+				"X-Region-Bbox": JSON.stringify({ x: 1, y: 2, w: 30, h: 40 }),
+				"X-Region-Out": JSON.stringify({ outW: 100, outH: 50 }),
+				"X-Region-Magnification": JSON.stringify(2.5),
+				"X-Region-Encoder": JSON.stringify({
+					id: "pillow", version: "1.0", resize: "LANCZOS",
+					overlay_version: "v1", jpeg_quality: 85,
+				}),
+			}),
+		]);
+		const client = makeClient(m.fn);
+		const r = await client.region({ slide: legacySlide("a.svs"), bbox: { x: 1, y: 2, w: 30, h: 40 } });
+		// bytes path: raw JPEG bytes filled straight into RegionResult.bytes
+		expect(Buffer.from(r.bytes).equals(JPEG)).toBe(true);
+		expect(r.contentSha256).toBe(JPEG_SHA);
+		expect(r.mimeType).toBe("image/jpeg");
+		expect(r.width).toBe(100);
+		expect(r.height).toBe(50);
+		expect(r.src).toEqual({ x: 1, y: 2, w: 30, h: 40 });
+		expect(r.magnification).toBe(2.5);
+		expect(r.assetRevision).toBe("rev:42");
+		expect(r.encoder).toMatchObject({ id: "pillow", resize: "LANCZOS", jpegQuality: 85 });
+		// the request carried the binary Accept header
+		expect(m.calls[1]!.headers["accept"]).toBe("application/octet-stream");
+	});
+
+	it("treats a null X-Region-Magnification header as null (not NaN)", async () => {
+		const m = makeFetch([
+			() => tokenResponse(),
+			() => binaryResponse(200, JPEG, {
+				"Content-SHA256": JPEG_SHA,
+				"X-Region-Out": JSON.stringify({ outW: 8, outH: 8 }),
+				"X-Region-Magnification": JSON.stringify(null),
+			}),
+		]);
+		const client = makeClient(m.fn);
+		const r = await client.region({ slide: legacySlide("a.svs"), bbox: { x: 0, y: 0, w: 8, h: 8 } });
+		expect(r.magnification).toBeNull();
+	});
+
+	it("throws integrity_error when the binary Content-SHA256 header does not match", async () => {
+		const m = makeFetch([
+			() => tokenResponse(),
+			() => binaryResponse(200, JPEG, {
+				"Content-SHA256": "deadbeef",
+				"X-Region-Out": JSON.stringify({ outW: 8, outH: 8 }),
+			}),
+		]);
+		const client = makeClient(m.fn);
+		await expect(client.region({ slide: legacySlide("a.svs"), bbox: { x: 0, y: 0, w: 8, h: 8 } })).rejects.toMatchObject({
+			name: "ContractError", code: "integrity_error", retryable: false, httpStatus: 0,
+		});
+	});
+
+	it("falls back to the JSON base64 path when the platform answers application/json", async () => {
+		// Older platforms ignore Accept and return JSON; the client must still decode base64.
+		const imageBase64 = Buffer.from("jpeg-bytes-here").toString("base64");
+		const contentSha256 = createHash("sha256").update(Buffer.from("jpeg-bytes-here")).digest("hex");
+		const body = {
+			image_base64: imageBase64,
+			mime: "image/jpeg", width: 100, height: 50,
+			src: { x: 0, y: 0, w: 10, h: 5 }, magnification: 2.5,
+			content_sha256: contentSha256, asset_revision: "rev:1",
+			encoder: { id: "pillow", version: "1", resize: "LANCZOS", overlay_version: "v1", jpeg_quality: 85 },
+		};
+		const m = makeFetch([
+			() => tokenResponse(),
+			() => jsonResponse(200, body, { "Content-Type": "application/json", "Content-SHA256": contentSha256 }),
+		]);
+		const client = makeClient(m.fn);
+		const r = await client.region({ slide: legacySlide("a.svs"), bbox: { x: 0, y: 0, w: 10, h: 5 } });
+		expect(Buffer.from(r.bytes).toString()).toBe("jpeg-bytes-here");
+		expect(r.contentSha256).toBe(contentSha256);
+		// still sent the binary Accept header (preference), server just ignored it
+		expect(m.calls[1]!.headers["accept"]).toBe("application/octet-stream");
+	});
+});
+
+// --------------------------------------------------------------------------- //
+// 429 rate_limited Retry-After surfacing (Stage 4-2 budget / rate gates)
+// --------------------------------------------------------------------------- //
+
+describe("PathTogatherHttpClient rate_limited Retry-After", () => {
+	it("surfaces the HTTP Retry-After header into ContractError.details.retry_after", async () => {
+		const m = makeFetch([
+			() => tokenResponse(),
+			() => jsonResponse(429, {
+				error: { code: "rate_limited", message: "像素预算耗尽", retryable: true },
+			}, { "Retry-After": "5" }),
+		]);
+		const client = makeClient(m.fn);
+		let caught: unknown;
+		try {
+			await client.region({ slide: legacySlide("a.svs"), bbox: { x: 0, y: 0, w: 8, h: 8 } });
+		} catch (e) {
+			caught = e;
+		}
+		const e = caught as ContractError;
+		expect(e).toBeInstanceOf(ContractError);
+		expect(e.code).toBe("rate_limited");
+		expect(e.retryable).toBe(true);
+		expect(e.httpStatus).toBe(429);
+		expect(e.details?.retry_after).toBe(5);
+	});
+
+	it("lets the envelope details.retry_after take precedence over the header", async () => {
+		const m = makeFetch([
+			() => tokenResponse(),
+			() => jsonResponse(429, {
+				error: {
+					code: "rate_limited", message: "x", retryable: true,
+					details: { retry_after: 9, reason: "pixel_budget" },
+				},
+			}, { "Retry-After": "5" }),
+		]);
+		const client = makeClient(m.fn);
+		let caught: unknown;
+		try {
+			await client.region({ slide: legacySlide("a.svs"), bbox: { x: 0, y: 0, w: 8, h: 8 } });
+		} catch (e) {
+			caught = e;
+		}
+		const e = caught as ContractError;
+		expect(e.code).toBe("rate_limited");
+		expect(e.details?.retry_after).toBe(9);
+		expect(e.details?.reason).toBe("pixel_budget");
+	});
+
+	it("omits details entirely when neither envelope details nor Retry-After is present", async () => {
+		const m = makeFetch([
+			() => tokenResponse(),
+			() => jsonResponse(429, { error: { code: "rate_limited", message: "x", retryable: true } }),
+		]);
+		const client = makeClient(m.fn);
+		let caught: unknown;
+		try {
+			await client.region({ slide: legacySlide("a.svs"), bbox: { x: 0, y: 0, w: 8, h: 8 } });
+		} catch (e) {
+			caught = e;
+		}
+		expect((caught as ContractError).details).toBeUndefined();
 	});
 });
 

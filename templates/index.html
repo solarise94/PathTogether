@@ -280,12 +280,12 @@
               <select id="ai-window-tier">
                 <option value="" data-i18n="ai.tier.none">不启用（手动配置）</option>
                 <option value="saving" data-i18n="ai.tier.saving">200k 极致节约（预算 10%）</option>
-                <option value="balanced" data-i18n="ai.tier.balanced">400k 宽松（预算 15%）</option>
+                <option value="balanced" selected data-i18n="ai.tier.balanced">400k 宽松（预算 15%）</option>
                 <option value="performance" data-i18n="ai.tier.performance">500k 高性能（预算 20%）</option>
               </select>
               <small class="ai-field-note" data-i18n="ai.tier.note">档位会自动推导窗口大小、图片预算和压缩档；显式填写的窗口/预算/图片档优先生效。1M 模型建议选 500k 档。</small></label>
             <label class="ai-field"><span data-i18n="ai.advanced.ctx">上下文窗口 tokens</span>
-              <input id="ai-ctx-window" type="number" min="10000" placeholder="272000" /></label>
+              <input id="ai-ctx-window" type="number" min="10000" placeholder="400000" /></label>
             <label class="ai-field"><span data-i18n="ai.advanced.reserve">摘要预留 tokens</span>
               <input id="ai-reserve" type="number" min="0" placeholder="16000" /></label>
             <label class="ai-field"><span data-i18n="ai.advanced.safety">安全余量 tokens</span>

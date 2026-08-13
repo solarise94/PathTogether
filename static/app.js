@@ -3280,7 +3280,7 @@
     if (els.aiApiProtocol) {
       els.aiApiProtocol.value = aiConfig.api_protocol || "openai";
     }
-    if (els.aiWindowTier) els.aiWindowTier.value = aiConfig.window_tier || "";
+    if (els.aiWindowTier) els.aiWindowTier.value = aiConfig.window_tier != null ? aiConfig.window_tier : "balanced";
     if (els.aiCtxWindow) els.aiCtxWindow.value = aiConfig.context_window_tokens != null ? aiConfig.context_window_tokens : "";
     if (els.aiReserve) els.aiReserve.value = aiConfig.reserve_tokens != null ? aiConfig.reserve_tokens : "";
     if (els.aiSafetyMargin) els.aiSafetyMargin.value = aiConfig.safety_margin != null ? aiConfig.safety_margin : "";

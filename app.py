@@ -1072,7 +1072,9 @@ def _mask_api_key(key: str) -> str:
 # 调优参数集中在此。keep_recent_images 为 Step 4 加入的图片淘汰窗口（正整数）。
 DEFAULT_CONFIG = {
     "max_steps": 50,
-    "context_window_tokens": 272000,
+    # §9.2.1：窗口与视觉预算改由 window_tier（默认 balanced=400k/60000）推导；
+    # None = 未显式设置，sidecar 按档位推导。显式覆盖仍优先。
+    "context_window_tokens": None,
     "reserve_tokens": 16000,
     "safety_margin": 8192,
     "keep_recent_tokens": 20000,
@@ -1084,8 +1086,8 @@ DEFAULT_CONFIG = {
     # ---- Phase 1 图片管线降本（§11） ----
     # 视觉工作集上限（不含稳定概览）；keep_recent_images 的后继字段。
     "visual_working_set_max": 4,
-    # 每请求视觉 token 硬预算（含固定概览）。
-    "visual_context_budget_tokens": 8000,
+    # 每请求视觉 token 硬预算（含固定概览）；None = 按档位推导。
+    "visual_context_budget_tokens": None,
     # 自适应分辨率分档（§6.1/§6.2 最长边 px）。
     "overview_long_edge": 1024,
     "working_image_long_edge": 768,
@@ -1103,9 +1105,8 @@ DEFAULT_CONFIG = {
     # Phase 4 §17 风险 2：稳定区概览开关（默认 True）。False 时 Phase 2b
     # assembler 组装稳定区不带概览图（稳定文本块仍保留）。
     "overview_enabled": True,
-    # §9.2.1：窗口档位预设（None = 不启用，走 legacy 默认）。显式
-    # context_window_tokens/视觉预算/图片档覆盖时以显式值为准。
-    "window_tier": None,
+    # §9.2.1：窗口档位预设。默认 balanced（产品拍板 2026-08-13）。
+    "window_tier": "balanced",
 }
 
 
@@ -1265,6 +1266,22 @@ _AI_TUNING_BOOL = (
 _AI_TUNING_ENUM = {
     "window_tier": ("saving", "balanced", "performance"),
 }
+# §9.2.1 档位预设（与 sidecar WINDOW_TIER_PRESETS 保持一致）。window_tier
+# 选定后，未显式提交的 context_window_tokens / 视觉预算 / 图片档按此推导。
+_WINDOW_TIER_PRESETS = {
+    "saving": {"context_window_tokens": 200000, "visual_context_budget_tokens": 20000,
+               "overview_long_edge": 768, "detail_image_long_edge": 1024, "working_image_long_edge": 640},
+    "balanced": {"context_window_tokens": 400000, "visual_context_budget_tokens": 60000,
+                 "overview_long_edge": 1024, "detail_image_long_edge": 1280, "working_image_long_edge": 768},
+    "performance": {"context_window_tokens": 500000, "visual_context_budget_tokens": 100000,
+                    "overview_long_edge": 1024, "detail_image_long_edge": 1536, "working_image_long_edge": 1024},
+}
+def _resolve_tier_value(cfg, tier, field):
+    """推导字段值：显式配置优先，其次档位预设，最后 None（sidecar 自行兜底）。"""
+    v = cfg.get(field) if isinstance(cfg, dict) else None
+    if v is not None:
+        return v
+    return _WINDOW_TIER_PRESETS.get(tier, {}).get(field)
 # max_steps 上限：取自 templates/index.html 的 input max="500"（步数上限字段）。
 # 防止 max_steps=99999 之类失控（sidecar 运行循环只限下限，费用风险）。
 _MAX_STEPS_LIMIT = 500
@@ -1389,6 +1406,11 @@ def _validate_ai_tuning(body, cfg):
         reserve = merged["reserve_tokens"]
         keep = merged["keep_recent_tokens"]
         ctx = merged["context_window_tokens"]
+        if ctx is None:
+            # §9.2.1：窗口未显式设置 → 按当前档位推导（含本批次可能提交的 tier）。
+            tier = validated.get("window_tier") if "window_tier" in validated else cfg.get("window_tier")
+            ctx = _resolve_tier_value(cfg, tier, "context_window_tokens")
+        ctx = int(ctx or 0)
         if reserve + keep >= ctx:
             return None, (
                 "reserve_tokens + keep_recent_tokens（{}）必须小于 "

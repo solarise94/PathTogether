@@ -229,5 +229,12 @@ def test_appjs_registers_hostbridge_handlers():
     assert 'onEvent("annotation.changed"' in text
 
 
+def test_containerfile_ships_plugin_bundle():
+    """Containerfile 必须 COPY plugins/，否则 demo/生产镜像缺插件 bundle（路由 404）。"""
+    cf = REPO_ROOT / "Containerfile"
+    text = cf.read_text(encoding="utf-8")
+    assert "COPY plugins/ plugins/" in text, "Containerfile 未 COPY plugins/ 目录"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

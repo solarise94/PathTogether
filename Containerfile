@@ -66,6 +66,8 @@ COPY docker_entry.sh ./
 RUN chmod +x docker_entry.sh
 COPY templates/ templates/
 COPY static/ static/
+# HistoPilot 插件 UI bundle（Stage 2：/plugins/histopilot/ui/* 由 app.py 服务）
+COPY plugins/ plugins/
 
 # 注意：AI_FLASK_URL 不在这里固定——sidecar 回调 Flask 的端口必须跟随 PORT，
 # 由 docker_entry.sh 按 PORT 推导（AI_FLASK_URL 显式设置时优先）。在此写死

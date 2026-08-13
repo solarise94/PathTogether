@@ -193,6 +193,11 @@ export interface Observation {
  *
  * New: `messages` (pi AgentMessage[] form, replacing canonical_messages) and
  * `compaction_entries` (Step 4).
+ *
+ * Stage 3a-2b (AI 会话归属): optional `owner` (the platform user_id whose
+ * session this is). Absent on legacy sessions predating Stage 3a-2b — a session
+ * with no `owner` is treated as owner-unknown and is NOT returned when an
+ * `owner` filter is applied (see server.ts handleSessions / ownerForbidden).
  */
 export interface SessionData {
 	id: string;
@@ -215,6 +220,9 @@ export interface SessionData {
 
 	/** Size of the rolling event window (ai_session.py:341 `event_buffer_size`). */
 	event_buffer_size: number;
+
+	/** Stage 3a-2b: owning platform user_id. Absent on legacy sessions. */
+	owner?: string;
 
 	// New vs ai_session.py -------------------------------------------------
 	/** pi AgentMessage[] form with image blocks dehydrated to image_ref. */
@@ -471,9 +479,9 @@ export class SessionStore {
 	// ------------------------------------------------------------------ //
 	// Session creation (ai_session.py:135 _empty_session)
 	// ------------------------------------------------------------------ //
-	emptySession(slide: string, kind: SessionKind, id: string, annotationId = "", title = ""): SessionData {
+	emptySession(slide: string, kind: SessionKind, id: string, annotationId = "", title = "", owner?: string): SessionData {
 		const t = nowSec();
-		return {
+		const base: SessionData = {
 			id,
 			slide,
 			kind,
@@ -498,6 +506,8 @@ export class SessionStore {
 			// next value to hand out; 0 would mean "uninitialized".
 			next_message_seq: 1,
 		};
+		if (owner) base.owner = owner;
+		return base;
 	}
 
 	/**
@@ -511,10 +521,11 @@ export class SessionStore {
 		kind: SessionKind;
 		annotationId?: string;
 		title?: string;
+		owner?: string;
 	}): Promise<SessionData> {
 		await this.ensureDir();
 		const id = newSessionId();
-		const data = this.emptySession(args.slide, args.kind, id, args.annotationId ?? "", args.title ?? "");
+		const data = this.emptySession(args.slide, args.kind, id, args.annotationId ?? "", args.title ?? "", args.owner);
 		await this.writeSession(id, data);
 		await this.register(args.slide, id, args.kind, args.annotationId ?? "");
 		return data;
@@ -538,16 +549,31 @@ export class SessionStore {
 		kind: SessionKind;
 		annotationId?: string;
 		title?: string;
+		owner?: string;
 	}): Promise<SessionData> {
 		await this.ensureDir();
 		return this.withLock(args.sessionId ?? "", async (existing) => {
 			const id = args.sessionId ?? newSessionId();
 			let data: SessionData;
 			if (existing === null) {
-				data = this.emptySession(args.slide, args.kind, id, args.annotationId ?? "", args.title ?? "");
+				data = this.emptySession(args.slide, args.kind, id, args.annotationId ?? "", args.title ?? "", args.owner);
 			} else {
 				if (existing.slide !== args.slide || existing.kind !== args.kind) {
 					throw new SessionConflict("会话类型不匹配");
+				}
+				// Stage 3a-2b (AI 会话归属) ownership guard: a run carrying an
+				// owner (a role=user run; role=owner runs deliberately omit
+				// session_owner so the owner can manage/resume any session) may
+				// only acquire a session owned by that same user. Sessions with
+				// NO owner — legacy files or owner-created ones — are
+				// owner-role-only for acquiring: /run|/continue stream from
+				// seq 0, so letting a user acquire another user's (or an
+				// ownerless) session would replay the full transcript
+				// cross-user. Single-slot index (one main per slide, one fork
+				// per annotation) means the user must start fresh instead;
+				// per-user parallel slots are Stage 3c scope.
+				if (args.owner !== undefined && existing.owner !== args.owner) {
+					throw new SessionConflict("会话归属其他用户");
 				}
 				// Crash recovery: repair event seq against the events file tail
 				// (ai_session.py:490 _repair_event_seq).

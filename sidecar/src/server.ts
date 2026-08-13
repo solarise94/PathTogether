@@ -262,19 +262,25 @@ export class SidecarServer {
 	private async handleSessions(url: URL, res: ServerResponse): Promise<void> {
 		const slide = url.searchParams.get("slide") || "";
 		if (!slide) return this.sendJson(res, 400, { error: "缺少 slide" });
+		// Stage 3a-2b (AI 会话归属): optional ?owner=<user_id> filter. When present,
+		// only sessions whose `owner` matches are returned. A session with NO owner
+		// (legacy / AUTH_ENABLED=False internal runs) is NOT returned under an
+		// owner filter — its owner is unknown, so it cannot be attributed to any
+		// specific user (owner/role=owner callers omit the filter and see all).
+		const owner = url.searchParams.get("owner") || undefined;
 		const idx = await this.store.listBySlide(slide);
 		const out: unknown[] = [];
 		if (idx.main) {
 			const d = await this.store.readSession(idx.main);
-			if (d) out.push(sessionListItem(d));
+			if (d && matchesOwner(d, owner)) out.push(sessionListItem(d));
 		}
 		for (const sid of Object.values(idx.forks)) {
 			const d = await this.store.readSession(sid);
-			if (d && !d.archived) out.push(sessionListItem(d));
+			if (d && !d.archived && matchesOwner(d, owner)) out.push(sessionListItem(d));
 		}
 		for (const sid of Object.values(idx.branches)) {
 			const d = await this.store.readSession(sid);
-			if (d && !d.archived) out.push(sessionListItem(d));
+			if (d && !d.archived && matchesOwner(d, owner)) out.push(sessionListItem(d));
 		}
 		out.sort((a, b) => {
 			const ua = (a as { updated_at?: number }).updated_at || 0;
@@ -300,6 +306,7 @@ export class SidecarServer {
 				status: d.status,
 				archived: d.archived,
 				annotation_id: d.annotation_id || "",
+				owner: d.owner || "",
 				created_at: d.created_at,
 				updated_at: d.updated_at,
 				last_accessed_at: d.last_accessed_at,
@@ -583,6 +590,17 @@ function sessionListItem(d: { id: string; title: string; kind: string; status: s
 		created_at: d.created_at,
 	};
 }
+
+/**
+ * Stage 3a-2b owner filter. When `owner` is undefined (no filter) → every
+ * session matches. When set, only a session whose `owner` equals it matches; a
+ * session with NO owner (legacy / internal) never matches an owner filter.
+ */
+function matchesOwner(d: { owner?: string }, owner: string | undefined): boolean {
+	if (owner === undefined) return true;
+	return d.owner === owner;
+}
+
 
 /**
  * Cancellable heartbeat. Resolves with "heartbeat" after `ms`. The returned

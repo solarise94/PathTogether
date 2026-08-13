@@ -300,6 +300,40 @@ describe("SidecarServer — GET /sessions and /session/:id", () => {
 			await h.server.stop();
 		}
 	});
+
+	it("filters /sessions?owner= and omits owner-less legacy sessions", async () => {
+		const { fn } = makeFakeStreamFn([{ text: "done", stopReason: "stop" as const }]);
+		const h = await startServer(fn);
+		try {
+			// Seed sessions directly via the store (one main per slide survives, so
+			// we use forks/branches to coexist) — owner attribution is the concern.
+			const a = await h.store.createSession({ slide: SLIDE, kind: "fork", annotationId: "o-a", owner: "usr_A" });
+			const b = await h.store.createSession({ slide: SLIDE, kind: "branch", annotationId: "o-b", owner: "usr_B" });
+			// Owner-less legacy session.
+			await h.store.createSession({ slide: SLIDE, kind: "fork", annotationId: "o-legacy" });
+
+			// No filter → all three.
+			const all = await getJson(h.baseUrl, `/sessions?slide=${encodeURIComponent(SLIDE)}`);
+			const allIds = (all.body as { sessions: Array<{ id: string }> }).sessions.map((s) => s.id);
+			expect(allIds).toContain(a.id);
+			expect(allIds).toContain(b.id);
+			expect(allIds.length).toBe(3);
+
+			// owner=usr_A → only usr_A's.
+			const filtered = await getJson(h.baseUrl, `/sessions?slide=${encodeURIComponent(SLIDE)}&owner=usr_A`);
+			const filteredIds = (filtered.body as { sessions: Array<{ id: string }> }).sessions.map((s) => s.id);
+			expect(filteredIds).toContain(a.id);
+			expect(filteredIds).not.toContain(b.id);
+
+			// Detail exposes the owner.
+			const detail = await getJson(h.baseUrl, `/session/${a.id}`);
+			expect((detail.body as { session: { owner: string } }).session.owner).toBe("usr_A");
+			const detailB = await getJson(h.baseUrl, `/session/${b.id}`);
+			expect((detailB.body as { session: { owner: string } }).session.owner).toBe("usr_B");
+		} finally {
+			await h.server.stop();
+		}
+	});
 });
 
 describe("SidecarServer — GET /session/:id/stream (replay + event_reset)", () => {

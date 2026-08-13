@@ -286,6 +286,10 @@
             <input id="ai-model" type="text" placeholder="gpt-4o"
                    autocomplete="off" />
           </label>
+          <label class="ai-field ai-field-checkbox" id="ai-use-platform-wrap" style="display:none;">
+            <input id="ai-use-platform" type="checkbox" />
+            <span data-i18n="ai.field.useplatform">使用平台官方 API</span>
+          </label>
           <label class="ai-field">
             <span data-i18n="ai.field.maxsteps">步数上限</span>
             <input id="ai-max-steps" type="number" min="1" max="500" placeholder="50"
@@ -302,6 +306,7 @@
           <!-- 高级调优参数（折叠，§8.1，非必须） -->
           <details class="ai-advanced">
             <summary data-i18n="ai.advanced.summary">高级调优</summary>
+            <small class="ai-field-note" id="ai-tune-admin-note" data-i18n="ai.config.tune.admin" style="display:none;">由管理员配置，用户不可修改</small>
             <label class="ai-field"><span data-i18n="ai.advanced.tier">窗口档位预设</span>
               <select id="ai-window-tier">
                 <option value="" data-i18n="ai.tier.none">不启用（手动配置）</option>

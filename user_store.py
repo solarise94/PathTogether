@@ -278,6 +278,68 @@ def set_user_password(user_id, new_password, _enforce_min_length=True):
     return _with_lock("r+", _do)
 
 
+# --------------------------------------------------------------------------- #
+# 用户 AI 凭据（Stage 3a 第二节点 2b：AI 凭据规则 §5.1.2）
+#
+# 每个 user 行可带一个 `ai_config` 子对象：
+#   {use_platform: bool, base_url, model, api_key}
+# use_platform 缺省 True（默认沿用平台官方 API）。api_key 在落盘前由 app.py
+# 加密（Fernet，enc: 前缀）——本层只负责存取原样 dict，不感知加密细节（避免
+# 与 app.py 循环依赖；加密/解密统一在 app.py 侧完成）。owner 无独立 ai_config
+# （owner 读写平台配置，见 app.py _load_ai_config）。
+# --------------------------------------------------------------------------- #
+_DEFAULT_USER_AI_CONFIG = {"use_platform": True, "base_url": "", "model": "", "api_key": ""}
+
+
+def _user_ai_config(user: dict) -> dict:
+    """返回用户行内 ai_config（规范化后副本，缺省 use_platform=True）。"""
+    raw = user.get("ai_config") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    out = dict(_DEFAULT_USER_AI_CONFIG)
+    out.update({k: raw.get(k) for k in ("base_url", "model", "api_key")})
+    out["use_platform"] = bool(raw.get("use_platform", True))
+    return out
+
+
+def get_user_ai_config(user_id):
+    """按 user_id 取用户 AI 凭据 dict（api_key 为磁盘原样，可能 enc: 密文）。
+
+    不存在用户返回 None；用户未配置过返回规范化默认（use_platform=True 空凭据）。
+    """
+    def _do(f):
+        data = _load_locked(f)
+        user = data["users"].get(user_id)
+        if user is None:
+            return None
+        return _user_ai_config(user)
+
+    return _with_lock("r+", _do)
+
+
+def set_user_ai_config(user_id, cfg):
+    """设置用户 AI 凭据。cfg 应为 dict（use_platform/base_url/model/api_key）。
+
+    api_key 假定已由 app.py 加密为磁盘形态；本层原样写入，不重新加密。返回更新后
+    的公共用户 dict；用户不存在返回 None。
+    """
+    def _do(f):
+        data = _load_locked(f)
+        user = data["users"].get(user_id)
+        if user is None:
+            return None
+        merged = _user_ai_config(user)
+        if isinstance(cfg, dict):
+            for k in ("use_platform", "base_url", "model", "api_key"):
+                if k in cfg:
+                    merged[k] = cfg[k]
+        user["ai_config"] = merged
+        _save_locked(f, data)
+        return _to_public(user)
+
+    return _with_lock("r+", _do)
+
+
 def count_owners():
     """返回 role=owner 且未禁用的用户数量。"""
     def _do(f):

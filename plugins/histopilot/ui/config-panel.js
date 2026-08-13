@@ -10,6 +10,23 @@
   var S = HP.s;
   var apiFetch = HP.api, t = HP.t, toast = HP.toast;
 
+  function isUser() { return S.role === "user"; }
+
+  // 把高级调优输入区 readonly/disabled（user 只读平台值，由管理员配置）
+  function applyUserReadonlyTuning(user) {
+    if (!S.els) return;
+    var ids = ["aiMaxSteps", "aiWindowTier", "aiCtxWindow", "aiReserve",
+               "aiSafetyMargin", "aiKeepRecent", "aiForkLimit", "aiLeaseTtl",
+               "aiApiProtocol"];
+    for (var i = 0; i < ids.length; i++) {
+      var el = S.els[ids[i]];
+      if (el) {
+        if (ids[i] === "aiWindowTier" || ids[i] === "aiApiProtocol") el.disabled = !!user;
+        else el.readOnly = !!user;
+      }
+    }
+  }
+
   // 加载 AI 配置（GET /api/ai/config，api_key 脱敏）
   function loadAiConfig() {
     return apiFetch("/api/ai/config").then(function (r) { return r.json(); }).then(function (cfg) {
@@ -23,6 +40,27 @@
     var aiConfig = S.aiConfig;
     var els = S.els;
     if (!aiConfig) return;
+    // user：凭据区显示 use_platform 勾选 + 自己的 base_url/model/api_key
+    if (isUser()) {
+      if (els.aiUsePlatformWrap) els.aiUsePlatformWrap.style.display = "block";
+      if (els.aiUsePlatform) {
+        els.aiUsePlatform.checked = !!aiConfig.use_platform;
+        // 平台未配置官方 API 时，无法走平台 → 禁用 use_platform 并提示
+        if (aiConfig.platform_configured) {
+          els.aiUsePlatform.disabled = false;
+          if (els.aiUsePlatformWrap) els.aiUsePlatformWrap.title = "";
+        } else {
+          els.aiUsePlatform.disabled = true;
+          if (els.aiUsePlatformWrap) {
+            els.aiUsePlatformWrap.title = t("ai.config.platform.notconfigured");
+          }
+        }
+      }
+      els.aiBaseUrl.value = aiConfig.base_url || "";
+      els.aiModel.value = aiConfig.model || "";
+      fillAiTuningFields();
+      return;
+    }
     var configured = !!(aiConfig.base_url && aiConfig.api_key_set);
     if (configured) {
       els.aiConfigWrap.style.display = "none";
@@ -65,64 +103,70 @@
     };
     var keyVal = els.aiApiKey.value;
     if (keyVal !== "") { payload.api_key = keyVal; }
-    var MAX_STEPS = 500;
-    var steps = parseInt(els.aiMaxSteps.value, 10);
-    if (isNaN(steps) || steps < 1 || steps > MAX_STEPS || String(steps) !== els.aiMaxSteps.value.trim()) {
-      toast(t("ai.config.steps.range", { max: MAX_STEPS }), "error");
-      els.aiMaxSteps.focus();
-      return;
-    }
-    payload.max_steps = steps;
-    if (els.aiApiProtocol) { payload.api_protocol = els.aiApiProtocol.value || "openai"; }
-    // window_tier：选中档位提交字符串，选中空档（"不启用（手动配置）"）提交 null（手动模式）。
-    if (els.aiWindowTier) { payload.window_tier = els.aiWindowTier.value !== "" ? els.aiWindowTier.value : null; }
-    var advFields = [
-      ["context_window_tokens", els.aiCtxWindow, "pos"],
-      ["reserve_tokens", els.aiReserve, "reserve"],
-      ["safety_margin", els.aiSafetyMargin, "nonneg"],
-      ["keep_recent_tokens", els.aiKeepRecent, "nonneg"],
-      ["fork_active_limit", els.aiForkLimit, "intpos"],
-      ["lease_ttl", els.aiLeaseTtl, "intpos"],
-    ];
-    var fieldLabel = {};
-    function labelFor(key) {
-      if (fieldLabel[key]) return fieldLabel[key];
-      var el = { context_window_tokens: els.aiCtxWindow, reserve_tokens: els.aiReserve,
-                 safety_margin: els.aiSafetyMargin, keep_recent_tokens: els.aiKeepRecent,
-                 fork_active_limit: els.aiForkLimit, lease_ttl: els.aiLeaseTtl }[key];
-      if (el && el.parentElement) {
-        var sp = el.parentElement.querySelector("span");
-        if (sp && sp.textContent) { fieldLabel[key] = sp.textContent.trim(); return fieldLabel[key]; }
-      }
-      return key;
-    }
-    var parsed = {};
-    for (var ai = 0; ai < advFields.length; ai++) {
-      var entry = advFields[ai];
-      var fkey = entry[0], fel = entry[1], fkind = entry[2];
-      if (!fel) continue;
-      var raw = String(fel.value || "").trim();
-      if (raw === "") continue;
-      var num = Number(raw);
-      if (!isFinite(num)) { toast(t("ai.config.num.invalid", { f: labelFor(fkey) }), "error"); fel.focus(); return; }
-      if (fkind === "intpos") {
-        if (!/^\d+$/.test(raw) || num < 1) { toast(t("ai.config.num.int", { f: labelFor(fkey) }), "error"); fel.focus(); return; }
-      } else if (fkind === "reserve") {
-        var RESERVE_MIN = 128;
-        if (!/^\d+$/.test(raw) || num < RESERVE_MIN) { toast(t("ai.config.reserve.min", { min: RESERVE_MIN }), "error"); fel.focus(); return; }
-      } else if (fkind === "pos") {
-        if (!(num > 0)) { toast(t("ai.config.num.positive", { f: labelFor(fkey) }), "error"); fel.focus(); return; }
-      } else if (fkind === "nonneg") {
-        if (!(num >= 0)) { toast(t("ai.config.num.nonneg", { f: labelFor(fkey) }), "error"); fel.focus(); return; }
-      }
-      parsed[fkey] = num;
-      payload[fkey] = num;
-    }
-    if (parsed.context_window_tokens != null && parsed.reserve_tokens != null && parsed.keep_recent_tokens != null) {
-      if (parsed.reserve_tokens + parsed.keep_recent_tokens >= parsed.context_window_tokens) {
-        toast(t("ai.config.ctx.insufficient"), "error");
-        els.aiCtxWindow.focus();
+    if (isUser()) {
+      // user：只提交凭据四字段（use_platform 勾选），调优字段由管理员配置
+      if (els.aiUsePlatform) payload.use_platform = els.aiUsePlatform.checked;
+    } else {
+      // owner：全字段（现状不变）
+      var MAX_STEPS = 500;
+      var steps = parseInt(els.aiMaxSteps.value, 10);
+      if (isNaN(steps) || steps < 1 || steps > MAX_STEPS || String(steps) !== els.aiMaxSteps.value.trim()) {
+        toast(t("ai.config.steps.range", { max: MAX_STEPS }), "error");
+        els.aiMaxSteps.focus();
         return;
+      }
+      payload.max_steps = steps;
+      if (els.aiApiProtocol) { payload.api_protocol = els.aiApiProtocol.value || "openai"; }
+      // window_tier：选中档位提交字符串，选中空档（"不启用（手动配置）"）提交 null（手动模式）。
+      if (els.aiWindowTier) { payload.window_tier = els.aiWindowTier.value !== "" ? els.aiWindowTier.value : null; }
+      var advFields = [
+        ["context_window_tokens", els.aiCtxWindow, "pos"],
+        ["reserve_tokens", els.aiReserve, "reserve"],
+        ["safety_margin", els.aiSafetyMargin, "nonneg"],
+        ["keep_recent_tokens", els.aiKeepRecent, "nonneg"],
+        ["fork_active_limit", els.aiForkLimit, "intpos"],
+        ["lease_ttl", els.aiLeaseTtl, "intpos"],
+      ];
+      var fieldLabel = {};
+      function labelFor(key) {
+        if (fieldLabel[key]) return fieldLabel[key];
+        var el = { context_window_tokens: els.aiCtxWindow, reserve_tokens: els.aiReserve,
+                   safety_margin: els.aiSafetyMargin, keep_recent_tokens: els.aiKeepRecent,
+                   fork_active_limit: els.aiForkLimit, lease_ttl: els.aiLeaseTtl }[key];
+        if (el && el.parentElement) {
+          var sp = el.parentElement.querySelector("span");
+          if (sp && sp.textContent) { fieldLabel[key] = sp.textContent.trim(); return fieldLabel[key]; }
+        }
+        return key;
+      }
+      var parsed = {};
+      for (var ai = 0; ai < advFields.length; ai++) {
+        var entry = advFields[ai];
+        var fkey = entry[0], fel = entry[1], fkind = entry[2];
+        if (!fel) continue;
+        var raw = String(fel.value || "").trim();
+        if (raw === "") continue;
+        var num = Number(raw);
+        if (!isFinite(num)) { toast(t("ai.config.num.invalid", { f: labelFor(fkey) }), "error"); fel.focus(); return; }
+        if (fkind === "intpos") {
+          if (!/^\d+$/.test(raw) || num < 1) { toast(t("ai.config.num.int", { f: labelFor(fkey) }), "error"); fel.focus(); return; }
+        } else if (fkind === "reserve") {
+          var RESERVE_MIN = 128;
+          if (!/^\d+$/.test(raw) || num < RESERVE_MIN) { toast(t("ai.config.reserve.min", { min: RESERVE_MIN }), "error"); fel.focus(); return; }
+        } else if (fkind === "pos") {
+          if (!(num > 0)) { toast(t("ai.config.num.positive", { f: labelFor(fkey) }), "error"); fel.focus(); return; }
+        } else if (fkind === "nonneg") {
+          if (!(num >= 0)) { toast(t("ai.config.num.nonneg", { f: labelFor(fkey) }), "error"); fel.focus(); return; }
+        }
+        parsed[fkey] = num;
+        payload[fkey] = num;
+      }
+      if (parsed.context_window_tokens != null && parsed.reserve_tokens != null && parsed.keep_recent_tokens != null) {
+        if (parsed.reserve_tokens + parsed.keep_recent_tokens >= parsed.context_window_tokens) {
+          toast(t("ai.config.ctx.insufficient"), "error");
+          els.aiCtxWindow.focus();
+          return;
+        }
       }
     }
     els.aiConfigHint.textContent = t("ai.config.saving");
@@ -161,4 +205,5 @@
   HP.renderAiConfigState = renderAiConfigState;
   HP.fillAiTuningFields = fillAiTuningFields;
   HP.saveAiConfig = saveAiConfig;
+  HP.applyUserReadonlyTuning = applyUserReadonlyTuning;
 })();

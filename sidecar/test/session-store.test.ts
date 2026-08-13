@@ -661,3 +661,65 @@ describe("SessionStore: mutex serializes concurrent appends", () => {
 		expect(Math.max(...seqs)).toBe(100);
 	});
 });
+
+describe("SessionStore: owner (Stage 3a-2b session attribution)", () => {
+	let store: SessionStore;
+
+	beforeAll(async () => {
+		store = new SessionStore({ sessionsDir: await newStoreDir() });
+	});
+
+	it("persists owner when supplied via createSession / acquire", async () => {
+		const s = await store.createSession({ slide: SLIDE, kind: "main", title: "T", owner: "usr_A" });
+		expect(s.owner).toBe("usr_A");
+		const read = await store.readSession(s.id);
+		expect(read?.owner).toBe("usr_A");
+
+		const f = await store.acquire({ slide: SLIDE, kind: "fork", annotationId: "a9", owner: "usr_B" });
+		expect(f.owner).toBe("usr_B");
+		const readF = await store.readSession(f.id);
+		expect(readF?.owner).toBe("usr_B");
+	});
+
+	it("omits owner (undefined) when not supplied — legacy/default compat", async () => {
+		const s = await store.createSession({ slide: SLIDE, kind: "branch", annotationId: "br-legacy" });
+		expect(s.owner).toBeUndefined();
+		const read = await store.readSession(s.id);
+		expect(read?.owner).toBeUndefined();
+	});
+});
+
+describe("SessionStore: acquire ownership guard (Stage 3a-2b review hardening)", () => {
+	let store: SessionStore;
+
+	beforeAll(async () => {
+		store = new SessionStore({ sessionsDir: await newStoreDir() });
+	});
+
+	it("rejects acquiring another user's session (cross-user transcript replay guard)", async () => {
+		const s = await store.createSession({ slide: SLIDE, kind: "main", title: "A", owner: "usr_A" });
+		await store.setStatus(s.id, "finished");
+		await expect(store.acquire({ sessionId: s.id, slide: SLIDE, kind: "main", owner: "usr_B" }))
+			.rejects.toThrow("会话归属其他用户");
+		// 同一 owner 续跑放行
+		const ok = await store.acquire({ sessionId: s.id, slide: SLIDE, kind: "main", owner: "usr_A" });
+		expect(ok.id).toBe(s.id);
+	});
+
+	it("rejects a user run acquiring an owner-less session (legacy/owner-created)", async () => {
+		const s = await store.createSession({ slide: SLIDE, kind: "fork", annotationId: "a-ownerless" });
+		await store.setStatus(s.id, "finished");
+		await expect(store.acquire({ sessionId: s.id, slide: SLIDE, kind: "fork", owner: "usr_C" }))
+			.rejects.toThrow("会话归属其他用户");
+	});
+
+	it("owner-less runs (role=owner / AUTH off) acquire any session — guard off", async () => {
+		const s = await store.createSession({ slide: SLIDE, kind: "main", title: "owned", owner: "usr_A" });
+		await store.setStatus(s.id, "finished");
+		const ok = await store.acquire({ sessionId: s.id, slide: SLIDE, kind: "main" });
+		expect(ok.id).toBe(s.id);
+		// 归属不被覆盖
+		const read = await store.readSession(s.id);
+		expect(read?.owner).toBe("usr_A");
+	});
+});

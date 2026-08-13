@@ -1588,22 +1588,65 @@ def _apply_legacy_reserve_migration(cfg, *, log=True) -> bool:
     return True
 
 
-def _build_sidecar_config() -> dict:
+def _platform_configured(cfg: dict) -> bool:
+    """平台官方 API 是否可用（base_url + api_key 均已配置）。"""
+    return bool((cfg.get("base_url") or "").strip() and (cfg.get("api_key") or ""))
+
+
+def _resolve_ai_credentials(user_ctx):
+    """按身份解析 AI 凭据来源（Stage 3a 2b §5.1.2）。
+
+    返回 (source, cfg)：
+      source = "platform"：使用平台官方配置（owner 或 user 走 use_platform 且平台已配）；
+      source = "own"    ：使用 user 自带 key（base_url/model/api_key 均需齐备）；
+      source = None     ：无可用的官方 key 且 user 自带凭据不全 → 不可用（调用方回 400）。
+    cfg 在 "platform" 时为平台配置 dict（api_key 已解密为明文）；在 "own" 时为
+    {"base_url","model","api_key"}（api_key 解密为明文）。
+    """
+    platform_cfg = _load_ai_config()
+    if user_ctx is None or user_ctx.get("role") == user_store.ROLE_OWNER:
+        # owner（或 AUTH_ENABLED=False 时 current_identity 归一为 owner）→ 平台
+        return "platform", platform_cfg
+    uid = user_ctx.get("user_id")
+    own = user_store.get_user_ai_config(uid) if uid else None
+    if own is None:
+        return None, None
+    if own.get("use_platform") and _platform_configured(platform_cfg):
+        return "platform", platform_cfg
+    # 用户自带 key：base_url/model/api_key 三项齐备才算可用
+    base = (own.get("base_url") or "").strip()
+    model = (own.get("model") or "").strip()
+    key = _decrypt_api_key(own.get("api_key") or "")
+    if not (base and model and key):
+        return None, None
+    return "own", {"base_url": base, "model": model, "api_key": key}
+
+
+def _build_sidecar_config(user_ctx=None) -> dict:
     """组装 sidecar 请求所需的 config 字段（base_url/api_key 明文 + 全部调优字段）。
 
-    从 ai_config.json 读取（_load_ai_config 已解密 api_key 为明文），合并调优
-    默认参数。返回的 dict 直接作为 sidecar body 的 `config` 字段。
+    user_ctx 为 current_identity() 结果（{"role","user_id"}）或 None：
+      - owner（含 AUTH_ENABLED=False 的归一 owner）→ 平台配置；
+      - user → 按 §5.1.2 解析（use_platform 且平台已配 → 平台；否则自带凭据）；
+        自带凭据缺 key/base_url/model → 返回 None（调用端点回 400 指导去设置）。
+    tuning 调优字段始终来自平台 ai_config.json（user 无独立调优）。
+    返回的 dict 直接作为 sidecar body 的 `config` 字段。
     """
-    cfg = _load_ai_config()
-    out = _merge_config(cfg)
-    out["base_url"] = cfg.get("base_url") or ""
-    out["api_key"] = cfg.get("api_key") or ""  # 已解密为明文
-    out["model"] = cfg.get("model") or ""
-    # api_protocol 缺省 openai
-    out["api_protocol"] = cfg.get("api_protocol") or "openai"
+    source, cred_cfg = _resolve_ai_credentials(user_ctx)
+    if source is None:
+        return None
+    # tuning 始终来自平台 ai_config.json（user 无独立调优）
+    tuning_cfg = _load_ai_config()
+    out = _merge_config(tuning_cfg)
+    out["base_url"] = cred_cfg.get("base_url") or ""
+    out["api_key"] = cred_cfg.get("api_key") or ""  # 已解密为明文
+    out["model"] = cred_cfg.get("model") or ""
+    # api_protocol 缺省 openai（用户自带 key 无此字段，落默认）
+    out["api_protocol"] = cred_cfg.get("api_protocol") or "openai"
     # 运行时再守一次：即使加载迁移未持久化，注入 sidecar 的值也不能 <128。
     _apply_legacy_reserve_migration(out)
     return out
+
 
 
 def _load_ai_config() -> dict:
@@ -2048,32 +2091,113 @@ def api_slide_region(name):
 
 @app.route("/api/ai/config", methods=["GET", "PUT"])
 def api_ai_config():
-    """读写 AI 配置（base_url/api_key/model/max_tokens/api_protocol + 会话调优参数）。
+    """读写 AI 配置（Stage 3a-2b §5.1.2 角色化）。
 
-    GET：api_key 脱敏为 api_key_set:bool + 掩码（前4后4），不回显明文。
-    PUT：空串=清除；与掩码同值=不变；其他=覆盖（明文进 → 加密落盘）。
-    api_key 加密存盘（Fernet），旧明文配置自动迁移。api_key 不入日志。
-    会话调优参数（§8.1）进 ai_config.json，缺省用文档默认。api_protocol 为
-    "openai"|"anthropic"|"gemini"（默认 openai）：anthropic 直连暂未支持，
-    选了会在起跑时给出明确报错；gemini 走 pi google-generative-ai provider
-    （CPA 网关的 /v1beta gemini 兼容端点）。
+    GET：
+      - owner：读写**平台**配置（现状）；返回 platform_configured、using="platform"。
+      - user：读写**自己的**凭据（use_platform/base_url/model/api_key 掩码回显）；
+        tuning 调优字段只读平台值（不可改）；返回 platform_configured 与
+        using="platform"|"own"|null（前端据此人话提示）。AUTH_ENABLED=False
+        （current_identity 归一 owner）→ 平台配置。
+    PUT：
+      - owner：全字段（现状不变）。
+      - user：只接受凭据四字段（use_platform/base_url/model/api_key）；tuning 字段
+        若与平台值相同则忽略、不同则 403（明确拒绝 user 改调优）。
+
+    api_key 脱敏：api_key_set:bool + 掩码（前4后4），不回显明文。api_key 加密存盘
+    （Fernet），旧明文自动迁移。api_key 不入日志。
     """
+    user_ctx = current_identity()
+    is_owner = user_ctx["role"] == user_store.ROLE_OWNER
+
     if request.method == "GET":
-        cfg = _load_ai_config()
-        key = cfg.get("api_key") or ""
+        platform_cfg = _load_ai_config()
+        platform_configured = _platform_configured(platform_cfg)
+        if is_owner:
+            key = platform_cfg.get("api_key") or ""
+            out = {
+                "base_url": platform_cfg.get("base_url") or "",
+                "api_key_set": bool(key),
+                "api_key_mask": _mask_api_key(key),
+                "model": platform_cfg.get("model") or "",
+                "max_tokens": platform_cfg.get("max_tokens") or 2048,
+                "api_protocol": platform_cfg.get("api_protocol") or "openai",
+                "platform_configured": platform_configured,
+                "using": "platform",
+            }
+            for k, v in DEFAULT_CONFIG.items():
+                out[k] = platform_cfg.get(k, v)
+            return jsonify(out)
+        # user：自己的凭据 + 平台调优只读
+        own = user_store.get_user_ai_config(user_ctx.get("user_id")) or {}
+        own_key = _decrypt_api_key(own.get("api_key") or "")
+        own_key_set = bool(own_key)
+        # using：解析当前实际生效来源（与 _resolve_ai_credentials 一致）
+        source, _ = _resolve_ai_credentials(user_ctx)
+        using = source
         out = {
-            "base_url": cfg.get("base_url") or "",
-            "api_key_set": bool(key),
-            "api_key_mask": _mask_api_key(key),
-            "model": cfg.get("model") or "",
-            "max_tokens": cfg.get("max_tokens") or 2048,
-            "api_protocol": cfg.get("api_protocol") or "openai",
+            "use_platform": bool(own.get("use_platform", True)),
+            "base_url": own.get("base_url") or "",
+            "api_key_set": own_key_set,
+            "api_key_mask": _mask_api_key(own_key),
+            "model": own.get("model") or "",
+            "platform_configured": platform_configured,
+            "using": using,
         }
+        # tuning 字段只读平台值（user 无独立调优）
         for k, v in DEFAULT_CONFIG.items():
-            out[k] = cfg.get(k, v)
+            out[k] = platform_cfg.get(k, v)
+        out["max_tokens"] = platform_cfg.get("max_tokens") or 2048
+        out["api_protocol"] = platform_cfg.get("api_protocol") or "openai"
         return jsonify(out)
 
     body = request.get_json(silent=True) or {}
+
+    if not is_owner:
+        # ---- user PUT：只接受凭据四字段 ----
+        allowed = {"use_platform", "base_url", "model", "api_key"}
+        # tuning 字段：与平台值相同则忽略；不同则 403。
+        platform_cfg = _load_ai_config()
+        for k, v in DEFAULT_CONFIG.items():
+            if k in body and body[k] != platform_cfg.get(k, v):
+                return jsonify(error="会话调优参数由管理员配置，用户不可修改"), 403
+        for extra in ("max_tokens", "api_protocol"):
+            if extra in body and body.get(extra) != (platform_cfg.get(extra) or (2048 if extra == "max_tokens" else "openai")):
+                return jsonify(error="会话调优参数由管理员配置，用户不可修改"), 403
+        unknown = set(body.keys()) - allowed
+        if unknown:
+            return jsonify(error="未知字段：{}".format(", ".join(sorted(unknown)))), 400
+        own = user_store.get_user_ai_config(user_ctx.get("user_id"))
+        if own is None:
+            return _denied()
+        pending = {}
+        if "use_platform" in body:
+            up = body.get("use_platform")
+            if not isinstance(up, bool):
+                return jsonify(error="use_platform 需为布尔值"), 400
+            pending["use_platform"] = up
+        if "base_url" in body:
+            pending["base_url"] = str(body.get("base_url") or "").strip()
+        if "model" in body:
+            pending["model"] = str(body.get("model") or "").strip()
+        # api_key：空=清除；掩码同值=不变；其他=覆盖（明文 → 加密落盘）
+        if "api_key" in body:
+            new_key = body.get("api_key")
+            if new_key is None:
+                pass  # 不传不动
+            else:
+                new_key = str(new_key)
+                if new_key == "":
+                    pending["api_key"] = ""  # 清除
+                elif new_key == _mask_api_key(_decrypt_api_key(own.get("api_key") or "")):
+                    pass  # 与掩码同值，不变
+                else:
+                    pending["api_key"] = _encrypt_api_key(new_key)
+        user_store.set_user_ai_config(user_ctx["user_id"], pending)
+        # 回显（user 视角）
+        return _ai_user_config_get(user_ctx), 200
+
+    # ---- owner PUT：现状不变（全字段） ----
     cfg = _load_ai_config()
     # ---- 第一阶段：校验（不落盘，保证任一失败都不产生部分写入）----
     # base_url / model：字符串，去空白（无范围限制）
@@ -2135,10 +2259,36 @@ def api_ai_config():
         "model": cfg.get("model") or "",
         "max_tokens": cfg.get("max_tokens") or 2048,
         "api_protocol": cfg.get("api_protocol") or "openai",
+        "platform_configured": _platform_configured(cfg),
+        "using": "platform",
     }
     for k, v in DEFAULT_CONFIG.items():
         out[k] = cfg.get(k, v)
     return jsonify(out)
+
+
+def _ai_user_config_get(user_ctx):
+    """构造 user 视角的 GET /api/ai/config 回显（供 PUT 后复用）。"""
+    platform_cfg = _load_ai_config()
+    platform_configured = _platform_configured(platform_cfg)
+    own = user_store.get_user_ai_config(user_ctx.get("user_id")) or {}
+    own_key = _decrypt_api_key(own.get("api_key") or "")
+    source, _ = _resolve_ai_credentials(user_ctx)
+    out = {
+        "use_platform": bool(own.get("use_platform", True)),
+        "base_url": own.get("base_url") or "",
+        "api_key_set": bool(own_key),
+        "api_key_mask": _mask_api_key(own_key),
+        "model": own.get("model") or "",
+        "platform_configured": platform_configured,
+        "using": source,
+    }
+    for k, v in DEFAULT_CONFIG.items():
+        out[k] = platform_cfg.get(k, v)
+    out["max_tokens"] = platform_cfg.get("max_tokens") or 2048
+    out["api_protocol"] = platform_cfg.get("api_protocol") or "openai"
+    return out
+
 
 
 def _ai_slide_ctx(slide_name: str):
@@ -2568,16 +2718,27 @@ def api_ai_run():
     """主 session 起跑（SSE）。body: {slide, task?, fresh?}。
 
     代理到 sidecar POST /run：注入 config（base_url/api_key 明文/model/
-    api_protocol + 全部调优参数）。SSE 字节透传，状态码原样（含 409）。
+    api_protocol + 全部调优参数）。Stage 3a-2b：按当前身份做切片级鉴权
+    （can_view_slide，无权 403）与凭据解析（未配置 → 400 中文指导）。
     """
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
     if not isinstance(slide, str) or not slide:
         return jsonify(error="缺少 slide"), 400
+    if not can_view_slide(slide):
+        return _denied()
+    user_ctx = current_identity()
+    config = _build_sidecar_config(user_ctx)
+    if config is None:
+        return jsonify(error="未配置 AI 凭据：请在设置中填写平台官方 API 或你的 base_url/model/api_key"), 400
     payload = {
         "slide": slide,
-        "config": _build_sidecar_config(),
+        "config": config,
     }
+    # 仅 user 注入归属：role=owner 的会话保持无 owner（owner 全量可见、可续跑
+    # 任意会话，sidecar acquire 守卫对无 owner 注入的 run 不生效）；内网模式不注入。
+    if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
+        config["session_owner"] = user_ctx["user_id"]
     task = body.get("task")
     if isinstance(task, str):
         payload["task"] = task
@@ -2592,15 +2753,26 @@ def api_ai_continue():
     """主 session 从落库 state+messages 续跑（SSE）。body: {slide}。
 
     代理到 sidecar POST /continue：注入 config。无 main → 404（sidecar 返回）。
+    Stage 3a-2b：切片级鉴权 + 凭据解析。
     """
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
     if not isinstance(slide, str) or not slide:
         return jsonify(error="缺少 slide"), 400
+    if not can_view_slide(slide):
+        return _denied()
+    user_ctx = current_identity()
+    config = _build_sidecar_config(user_ctx)
+    if config is None:
+        return jsonify(error="未配置 AI 凭据：请在设置中填写平台官方 API 或你的 base_url/model/api_key"), 400
     payload = {
         "slide": slide,
-        "config": _build_sidecar_config(),
+        "config": config,
     }
+    # 仅 user 注入归属：role=owner 的会话保持无 owner（owner 全量可见、可续跑
+    # 任意会话，sidecar acquire 守卫对无 owner 注入的 run 不生效）；内网模式不注入。
+    if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
+        config["session_owner"] = user_ctx["user_id"]
     return _proxy_sse("/continue", payload)
 
 
@@ -2609,6 +2781,7 @@ def api_ai_ask():
     """fork 起跑/续聊（批注式对话，SSE）。body: {slide, annotation_id, question?}。
 
     代理到 sidecar POST /ask：注入 config。根标注已删除 → 410（sidecar 返回）。
+    Stage 3a-2b：切片可读即可（ask/branch 只需标注存在，view 足够）鉴权 + 凭据解析。
     """
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
@@ -2617,11 +2790,21 @@ def api_ai_ask():
         return jsonify(error="缺少 slide"), 400
     if not isinstance(annotation_id, str) or not annotation_id:
         return jsonify(error="缺少 annotation_id"), 400
+    if not can_view_slide(slide):
+        return _denied()
+    user_ctx = current_identity()
+    config = _build_sidecar_config(user_ctx)
+    if config is None:
+        return jsonify(error="未配置 AI 凭据：请在设置中填写平台官方 API 或你的 base_url/model/api_key"), 400
     payload = {
         "slide": slide,
         "annotation_id": annotation_id,
-        "config": _build_sidecar_config(),
+        "config": config,
     }
+    # 仅 user 注入归属：role=owner 的会话保持无 owner（owner 全量可见、可续跑
+    # 任意会话，sidecar acquire 守卫对无 owner 注入的 run 不生效）；内网模式不注入。
+    if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
+        config["session_owner"] = user_ctx["user_id"]
     question = body.get("question")
     if isinstance(question, str):
         payload["question"] = question
@@ -2634,6 +2817,7 @@ def api_ai_branch():
 
     body: {slide, annotation_id, question?}。代理到 sidecar POST /branch：注入
     config。根标注已删除 → 410（sidecar 返回）。契约同 /api/ai/ask。
+    Stage 3a-2b：切片可读即可鉴权 + 凭据解析。
     """
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
@@ -2642,11 +2826,21 @@ def api_ai_branch():
         return jsonify(error="缺少 slide"), 400
     if not isinstance(annotation_id, str) or not annotation_id:
         return jsonify(error="缺少 annotation_id"), 400
+    if not can_view_slide(slide):
+        return _denied()
+    user_ctx = current_identity()
+    config = _build_sidecar_config(user_ctx)
+    if config is None:
+        return jsonify(error="未配置 AI 凭据：请在设置中填写平台官方 API 或你的 base_url/model/api_key"), 400
     payload = {
         "slide": slide,
         "annotation_id": annotation_id,
-        "config": _build_sidecar_config(),
+        "config": config,
     }
+    # 仅 user 注入归属：role=owner 的会话保持无 owner（owner 全量可见、可续跑
+    # 任意会话，sidecar acquire 守卫对无 owner 注入的 run 不生效）；内网模式不注入。
+    if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
+        config["session_owner"] = user_ctx["user_id"]
     question = body.get("question")
     if isinstance(question, str):
         payload["question"] = question
@@ -2655,30 +2849,73 @@ def api_ai_branch():
 
 @app.route("/api/ai/cancel", methods=["POST"])
 def api_ai_cancel():
-    """显式取消。body: {session_id?, slide?}。原样转发到 sidecar POST /cancel。"""
+    """显式取消。body: {session_id?, slide?}。原样转发到 sidecar POST /cancel。
+
+    Stage 3a-2b：带 session_id 时做归属校验（user 仅自己名下）；仅 slide 时（取消
+    该切片 main）先经切片级鉴权。
+    """
     body = request.get_json(silent=True) or {}
+    session_id = body.get("session_id")
+    slide = body.get("slide")
+    user_ctx = current_identity()
+    if session_id:
+        if isinstance(session_id, str) and session_id:
+            auth = _require_ai_session_owner(session_id)
+            if auth is not None:
+                return auth
+        else:
+            return jsonify(error="缺少 session_id"), 400
+    elif slide:
+        if not isinstance(slide, str) or not slide:
+            return jsonify(error="缺少 slide"), 400
+        if not can_view_slide(slide):
+            return _denied()
+    else:
+        return jsonify(error="缺少 session_id 或 slide"), 400
     return _proxy_json("/cancel", body)
 
 
 @app.route("/api/ai/sessions")
 def api_ai_sessions():
-    """列出某切片的 main + 活跃 forks。?slide= 必填。代理 sidecar GET /sessions。"""
+    """列出某切片的 main + 活跃 forks。?slide= 必填。代理 sidecar GET /sessions。
+
+    Stage 3a-2b（AI 会话归属）：owner 全量；user 仅自己名下会话（按 session_owner
+    过滤，交由 sidecar ?owner=<user_id>）。AUTH_ENABLED=False → 不注入 owner（全量）。
+    """
     slide = request.args.get("slide")
     if not slide:
         return jsonify(error="缺少 slide"), 400
-    return _proxy_json("/sessions", None, method="GET", query={"slide": slide})
+    if not can_view_slide(slide):
+        return _denied()
+    user_ctx = current_identity()
+    query = {"slide": slide}
+    if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
+        query["owner"] = user_ctx["user_id"]
+    return _proxy_json("/sessions", None, method="GET", query=query)
 
 
 @app.route("/api/ai/session/<session_id>")
 def api_ai_session_detail(session_id):
-    """session detail + 脱敏 transcript。代理 sidecar GET /session/<id>。"""
+    """session detail + 脱敏 transcript。代理 sidecar GET /session/<id>。
+
+    Stage 3a-2b：owner 任意；user 仅自己名下会话（越权 403，统一不泄露存在性）。
+    """
+    auth = _require_ai_session_owner(session_id)
+    if auth is not None:
+        return auth
     return _proxy_json("/session/" + session_id, None, method="GET")
 
 
 @app.route("/api/ai/session/<session_id>/archive", methods=["POST"])
 @app.route("/api/ai/session/<session_id>/unarchive", methods=["POST"])
 def api_ai_session_archive(session_id):
-    """fork 归档/恢复。代理 sidecar POST /session/<id>/archive|unarchive。"""
+    """fork 归档/恢复。代理 sidecar POST /session/<id>/archive|unarchive。
+
+    Stage 3a-2b：owner 任意；user 仅自己名下会话。
+    """
+    auth = _require_ai_session_owner(session_id)
+    if auth is not None:
+        return auth
     sub = "archive" if request.path.endswith("/archive") else "unarchive"
     body = request.get_json(silent=True) or {}
     return _proxy_json("/session/{}/{}".format(session_id, sub), body)
@@ -2688,8 +2925,12 @@ def api_ai_session_archive(session_id):
 def api_ai_session_stream(session_id):
     """SSE 重挂/断线重连。代理 sidecar GET /session/<id>/stream。
 
+    Stage 3a-2b：owner 任意；user 仅自己名下会话。
     透传 after_seq query 与 Last-Event-ID header；SSE 字节透传。
     """
+    auth = _require_ai_session_owner(session_id)
+    if auth is not None:
+        return auth
     return _proxy_sse("/session/{}/stream".format(session_id), None, method="GET")
 
 
@@ -2699,6 +2940,46 @@ def api_ai_session_stream(session_id):
 def _sidecar_unavailable_response():
     """sidecar 不可达（ConnectionError/超时）→ 503 JSON。"""
     return jsonify(error="ai sidecar 不可用"), 503
+
+
+def _ai_session_owner(session_id: str):
+    """查询某会话的归属 owner（sidecar GET /session/<id> 的 session.owner）。
+
+    返回 owner 字符串（可能为 ""=历史/内网会话）；sidecar 不可达返回 None；
+    sidecar 返回 404（会话不存在）返回 None。仅用于归属判定，不发起代理响应。
+    """
+    url = AI_SIDECAR_URL + "/session/" + session_id
+    try:
+        r = requests.get(url, timeout=_AI_SIDECAR_TIMEOUT)
+    except (requests.ConnectionError, requests.Timeout):
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        body = r.json()
+    except Exception:
+        return None
+    sess = (body or {}).get("session") or {}
+    return sess.get("owner") or ""
+
+
+def _require_ai_session_owner(session_id):
+    """user 访问他人会话 → 403；owner 任意放行；AUTH_ENABLED=False 放行。
+
+    归属读取自 sidecar（含 owner 字段，缺省 ""=历史会话）。越权统一 403，不区分
+    session 是否存在（避免泄露存在性差异）。
+    """
+    user_ctx = current_identity()
+    if user_ctx["role"] == user_store.ROLE_OWNER:
+        return None  # owner 任意（含 AUTH_ENABLED=False 的归一 owner）
+    uid = user_ctx.get("user_id")
+    owner = _ai_session_owner(session_id)
+    if owner is None:
+        # sidecar 不可达或会话不存在：保守 403（同 _denied 语义，不泄露）
+        return _denied()
+    if not uid or owner != uid:
+        return _denied()
+    return None
 
 
 def _proxy_json(path, body, method="POST", query=None):

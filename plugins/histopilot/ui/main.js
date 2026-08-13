@@ -444,6 +444,8 @@
       aiFreshBtn: $("ai-fresh-btn"), aiStopBtn: $("ai-stop-btn"),
       aiTrace: $("ai-trace"), aiSessionBar: $("ai-session-bar"),
       aiSessionSelect: $("ai-session-select"),
+      aiUsePlatform: $("ai-use-platform"), aiUsePlatformWrap: $("ai-use-platform-wrap"),
+      aiTuneAdminNote: $("ai-tune-admin-note"),
     };
     S.mainAiCtx.container = S.els.aiTrace;
     var els = S.els;
@@ -483,6 +485,17 @@
 
     // 加载 AI 配置（渲染设置区/折叠区）
     HP.loadAiConfig();
+
+    // 获取当前身份 role（Stage 3a-2b）：owner 全配置；user 只读调优、可配自有凭据。
+    // AUTH_ENABLED=False（内网）→ /api/auth/info 返回 role=null，按 owner 处理。
+    HP.api("/api/auth/info").then(function (r) { return r.json(); }).then(function (info) {
+      S.role = info && info.role;
+      if (S.role === "user") {
+        if (S.els.aiTuneAdminNote) S.els.aiTuneAdminNote.style.display = "block";
+        HP.applyUserReadonlyTuning(true);
+        HP.renderAiConfigState(); // 重渲染凭据区（use_platform 勾选/禁用）
+      }
+    }).catch(function () { /* 内网/AUTH 关闭：保持 owner 语义 */ });
 
     // ---------- HostBridge 处理器注册 ----------
     // Host→Plugin request

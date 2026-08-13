@@ -174,6 +174,14 @@ export interface RunConfig extends AiEngineConfig {
 	 * `_validate_ai_tuning` and resolved by `resolveTransformSettings`.
 	 */
 	overview_enabled?: boolean;
+	/**
+	 * Stage 3a-2b (AI 会话归属): owning platform user_id. Set by the Flask
+	 * proxy from the session identity; persisted into session meta + index by
+	 * the store so /sessions and /session/:id can filter by owner. Absent in
+	 * AUTH_ENABLED=False (internal) mode and on legacy requests — those runs
+	 * produce owner-less sessions (visible only to owner / unfiltered).
+	 */
+	session_owner?: string;
 }
 
 /** Common run arguments. `config` is required. */
@@ -370,6 +378,7 @@ export class AgentRunner {
 	async runMain(args: RunArgs & { task?: string; fresh?: boolean }): Promise<{ sessionId: string }> {
 		const { slide, config } = args;
 		const fresh = args.fresh ?? false;
+		const owner = config.session_owner;
 
 		// Resolve which session to run.
 		let sessionId: string;
@@ -377,18 +386,18 @@ export class AgentRunner {
 		if (fresh) {
 			// Archive the old main slot (app.py:1655 fresh path).
 			await this.archiveMainSlot(slide);
-			const data = await this.store.acquire({ slide, kind: "main" });
+			const data = await this.store.acquire({ slide, kind: "main", owner });
 			sessionId = data.id;
 			isContinue = false;
 		} else {
 			const idx = await this.store.listBySlide(slide);
 			const existing = idx.main;
 			if (existing) {
-				const data = await this.store.acquire({ sessionId: existing, slide, kind: "main" });
+				const data = await this.store.acquire({ sessionId: existing, slide, kind: "main", owner });
 				sessionId = data.id;
 				isContinue = true;
 			} else {
-				const data = await this.store.acquire({ slide, kind: "main" });
+				const data = await this.store.acquire({ slide, kind: "main", owner });
 				sessionId = data.id;
 				isContinue = false;
 			}
@@ -433,6 +442,7 @@ export class AgentRunner {
 	 */
 	async askFork(args: RunArgs & { annotationId: string; question?: string }): Promise<{ sessionId: string; streamFromSeq: number }> {
 		const { slide, config, annotationId } = args;
+		const owner = config.session_owner;
 
 		// Locate the root annotation via the spot change log (tombstone-aware).
 		const roi = await this.findSpot(slide, annotationId);
@@ -445,7 +455,7 @@ export class AgentRunner {
 
 		if (existing) {
 			// Resume: acquire, append the question, emit fork_resumed, run.
-			const data = await this.store.acquire({ sessionId: existing, slide, kind: "fork", annotationId });
+			const data = await this.store.acquire({ sessionId: existing, slide, kind: "fork", annotationId, owner });
 			// SSE 起点水位：续聊时流只带本轮新事件（fork_resumed 起），
 			// 不从 0 重放历史——前端小框对话是增量渲染（不会清空重排），
 			// 重放会把旧工具轨迹重复渲染一遍。（create 路径从 0 起流。）
@@ -479,7 +489,7 @@ export class AgentRunner {
 		await this.enforceForkLimit(slide, limit);
 
 		const title = "批注@" + (roi.label || "");
-		const data = await this.store.acquire({ slide, kind: "fork", annotationId, title });
+		const data = await this.store.acquire({ slide, kind: "fork", annotationId, title, owner });
 		// seed spot_cursor (app.py:1739).
 		await this.store.withLock(data.id, async (d) => {
 			if (!d) return null;
@@ -519,6 +529,7 @@ export class AgentRunner {
 	 */
 	async askBranch(args: RunArgs & { annotationId: string; question?: string }): Promise<{ sessionId: string; streamFromSeq: number }> {
 		const { slide, config, annotationId } = args;
+		const owner = config.session_owner;
 
 		// Locate the root annotation via the spot change log (tombstone-aware).
 		const roi = await this.findSpot(slide, annotationId);
@@ -530,7 +541,7 @@ export class AgentRunner {
 
 		if (existing) {
 			// Resume: acquire, append the question, emit branch_resumed, run.
-			const data = await this.store.acquire({ sessionId: existing, slide, kind: "branch", annotationId });
+			const data = await this.store.acquire({ sessionId: existing, slide, kind: "branch", annotationId, owner });
 			// SSE 起点水位（同 fork 续聊）：只流本轮新事件，不重放历史。
 			const streamFromSeq = data.last_event_seq || 0;
 			const qText = args.question || "请谈谈这个区域";
@@ -563,7 +574,7 @@ export class AgentRunner {
 		await this.enforceBranchLimit(slide, limit);
 
 		const title = "批注深读@" + (roi.label || "");
-		const data = await this.store.acquire({ slide, kind: "branch", annotationId, title });
+		const data = await this.store.acquire({ slide, kind: "branch", annotationId, title, owner });
 		// seed spot_cursor (same as fork).
 		await this.store.withLock(data.id, async (d) => {
 			if (!d) return null;

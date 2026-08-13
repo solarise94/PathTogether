@@ -1,0 +1,447 @@
+# -*- coding: utf-8 -*-
+"""Stage 3a 第二节点 2b：AI 凭据规则（§5.1.2）+ AI 端点资源鉴权 + 会话归属。
+
+覆盖：
+  - per-user api_key 加密落盘（users.json 原文无明文）；
+  - 凭据解析决策表（_build_sidecar_config user_ctx）：
+      use_platform + 平台已配 → 平台；
+      use_platform 但平台未配 → 自己的；
+      自己的缺 key/base_url/model → None（调用端点回 400）；
+      owner / AUTH_ENABLED=False → 平台；
+  - user 改 tuning → 403；user 只能见掩码（不回显明文）；
+  - GET /api/ai/config 返回 platform_configured 与 using；
+  - AI run 无权切片 → 403；凭据未配置 → 400；
+  - sessions 按归属过滤（user 仅自己名下，owner 全量）；
+  - session 详情越权 403（user 访问他人会话）；
+  - AUTH_ENABLED=False 全兼容（owner 语义，不注入 owner，不 filter）。
+
+方案：隔离临时 SHARE_DATA_DIR；用 FakeRequests 替换 app.requests（无需真 sidecar）。
+登录状态用 Flask client.session_transaction 直接写 session["role"]/["user_id"]。
+运行：cd 项目根 && python3 -m pytest tests/test_ai_credentials.py -q
+"""
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+TMP = tempfile.mkdtemp(prefix="svs-aicred-")
+DATA_DIR = os.path.join(TMP, "share-data")
+os.environ["SHARE_DATA_DIR"] = DATA_DIR
+os.environ["AI_SIDECAR_URL"] = "http://127.0.0.1:8055"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+try:
+    import openslide  # noqa: F401
+except ImportError:
+    import types as _types
+    _os = _types.ModuleType("openslide")
+    _os.OpenSlide = object
+    sys.modules["openslide"] = _os
+    _dz = _types.ModuleType("openslide.deepzoom")
+    _dz.DeepZoomGenerator = object
+    sys.modules["openslide.deepzoom"] = _dz
+
+import user_store  # noqa: E402
+import app as app_mod  # noqa: E402
+
+
+def _client(auth=True):
+    app_mod.app.config["TESTING"] = True
+    app_mod.AUTH_ENABLED = auth
+    return app_mod.app.test_client()
+
+
+def _login(client, role, user_id):
+    """用 session_transaction 直接注入身份（等价登录成功后的 session 状态）。"""
+    with client.session_transaction() as sess:
+        sess["role"] = role
+        sess["user_id"] = user_id
+        sess["auth_user"] = "t@x.com"
+
+
+def _touch(name="demo.svs"):
+    p = Path(app_mod.UPLOAD_DIR) / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"svs-stub")
+    return name
+
+
+def _own(name, user_id):
+    app_mod.share_store.set_slide_meta(name, owner_user_id=user_id)
+
+
+def _reset_config():
+    p = app_mod._ai_config_path()
+    if p.is_file():
+        p.unlink()
+    # 清掉 user 表
+    uf = user_store.USER_FILE
+    if uf.exists():
+        uf.unlink()
+
+
+def _setup_platform(base_url="http://platform/v1", key="sk-platform-123456", model="gpt-p"):
+    app_mod._save_ai_config({"base_url": base_url, "api_key": key, "model": model})
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, content=None, ctype="application/json"):
+        self.status_code = status_code
+        self.content = content if content is not None else b"{}"
+        if isinstance(self.content, str):
+            self.content = self.content.encode("utf-8")
+        self.headers = {"Content-Type": ctype}
+
+    def close(self):
+        pass
+
+    def iter_content(self, chunk_size=4096):
+        yield self.content
+
+
+class FakeRequests:
+    def __init__(self):
+        self._routes = {}
+        self.calls = []
+
+    def register(self, method, path, handler):
+        self._routes[(method.upper(), path)] = handler
+
+    def _dispatch(self, method, url, **kwargs):
+        # 提取 path（不含 query）
+        raw_path = url.split("?")[0]
+        for prefix in ("http://", "https://"):
+            if raw_path.startswith(prefix):
+                raw_path = raw_path[len(prefix):]
+        slash = raw_path.find("/")
+        raw_path = raw_path[slash:] if slash >= 0 else "/"
+        handler = self._routes.get((method.upper(), raw_path))
+        self.calls.append({"method": method, "path": raw_path,
+                           "params": kwargs.get("params"), "headers": kwargs.get("headers"),
+                           "body": kwargs.get("json")})
+        if handler is None:
+            return FakeResponse(404, json.dumps({"error": "no route"}))
+        return handler(kwargs.get("params"))
+
+    def get(self, url, **kwargs):
+        return self._dispatch("GET", url, **kwargs)
+
+    def post(self, url, **kwargs):
+        return self._dispatch("POST", url, **kwargs)
+
+
+def _install_fake():
+    fake = FakeRequests()
+    app_mod.requests = fake
+    return fake
+
+
+# =========================================================================== #
+# 1. per-user api_key 加密落盘
+# =========================================================================== #
+def test_user_api_key_encrypted_on_disk():
+    _reset_config()
+    u = user_store.create_user("u@x.com", "password1", role="user")
+    # app 侧负责在落盘前加密（_encrypt_api_key）；store 层原样存储。
+    enc = app_mod._encrypt_api_key("sk-user-secret-abcdef")
+    assert enc.startswith("enc:")
+    user_store.set_user_ai_config(u["user_id"], {"api_key": enc})
+    # users.json 原文不得含明文
+    raw = user_store.USER_FILE.read_text(encoding="utf-8")
+    assert "sk-user-secret-abcdef" not in raw, "users.json 泄漏明文 api_key！"
+    assert "enc:" in raw, "users.json 应存 Fernet 加密密文"
+    # 读回应解密为明文
+    cfg = user_store.get_user_ai_config(u["user_id"])
+    assert app_mod._decrypt_api_key(cfg["api_key"]) == "sk-user-secret-abcdef"
+
+
+# =========================================================================== #
+# 2. 凭据解析决策表（_build_sidecar_config user_ctx）
+# =========================================================================== #
+def test_resolve_use_platform_when_platform_configured():
+    _reset_config()
+    _setup_platform()
+    u = user_store.create_user("u@x.com", "password1", role="user")
+    user_store.set_user_ai_config(u["user_id"], {"use_platform": True, "api_key": "sk-own"})
+    cfg = app_mod._build_sidecar_config({"role": "user", "user_id": u["user_id"]})
+    assert cfg is not None
+    assert cfg["base_url"] == "http://platform/v1"
+    assert cfg["api_key"] == "sk-platform-123456"
+    assert cfg["model"] == "gpt-p"
+
+
+def test_resolve_use_platform_but_platform_missing_falls_to_own():
+    _reset_config()  # 平台未配
+    u = user_store.create_user("u@x.com", "password1", role="user")
+    user_store.set_user_ai_config(u["user_id"], {
+        "use_platform": True, "base_url": "http://own/v1",
+        "model": "gpt-own", "api_key": "sk-own-secret"})
+    cfg = app_mod._build_sidecar_config({"role": "user", "user_id": u["user_id"]})
+    assert cfg is not None
+    assert cfg["base_url"] == "http://own/v1"
+    assert cfg["api_key"] == "sk-own-secret"
+
+
+def test_resolve_own_missing_key_returns_none():
+    _reset_config()  # 平台未配
+    u = user_store.create_user("u@x.com", "password1", role="user")
+    user_store.set_user_ai_config(u["user_id"], {"base_url": "http://own/v1", "model": "gpt-own"})
+    cfg = app_mod._build_sidecar_config({"role": "user", "user_id": u["user_id"]})
+    assert cfg is None
+
+
+def test_resolve_owner_uses_platform():
+    _reset_config()
+    _setup_platform()
+    u = user_store.create_user("o@x.com", "password1", role="owner")
+    cfg = app_mod._build_sidecar_config({"role": "owner", "user_id": u["user_id"]})
+    assert cfg is not None
+    assert cfg["base_url"] == "http://platform/v1"
+    assert cfg["api_key"] == "sk-platform-123456"
+
+
+def test_resolve_no_auth_uses_platform():
+    """AUTH_ENABLED=False：current_identity 归一 owner → 平台配置。"""
+    _reset_config()
+    _setup_platform()
+    cfg = app_mod._build_sidecar_config(None)
+    assert cfg is not None
+    assert cfg["base_url"] == "http://platform/v1"
+
+
+# =========================================================================== #
+# 3. /api/ai/config 角色化
+# =========================================================================== #
+def test_user_config_get_masked_and_platform_fields():
+    _reset_config()
+    _setup_platform()
+    u = user_store.create_user("u@x.com", "password1", role="user")
+    user_store.set_user_ai_config(u["user_id"], {"api_key": "sk-user-long-secret-12345678", "base_url": "http://own/v1", "model": "gpt-own"})
+    c = _client()
+    _login(c, "user", u["user_id"])
+    r = c.get("/api/ai/config")
+    j = r.get_json()
+    assert r.status_code == 200
+    assert j["platform_configured"] is True
+    assert j["using"] == "platform"  # use_platform 缺省 True 且平台已配
+    # api_key 只回显掩码，不回显明文
+    assert "sk-user-long-secret-12345678" not in r.get_data(as_text=True)
+    assert j["api_key_mask"]
+    # tuning 字段从平台值回显
+    assert j["model"] == "gpt-own"
+
+
+def test_user_put_tuning_differs_returns_403():
+    _reset_config()
+    _setup_platform()
+    u = user_store.create_user("u@x.com", "password1", role="user")
+    c = _client()
+    _login(c, "user", u["user_id"])
+    r = c.put("/api/ai/config", json={"max_steps": 999})
+    assert r.status_code == 403
+
+
+def test_user_put_credentials_ok_and_persisted():
+    _reset_config()
+    _setup_platform()
+    u = user_store.create_user("u@x.com", "password1", role="user")
+    c = _client()
+    _login(c, "user", u["user_id"])
+    r = c.put("/api/ai/config", json={
+        "use_platform": False, "base_url": "http://own/v1",
+        "model": "gpt-own", "api_key": "sk-own-secret-abcdef"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    j = r.get_json()
+    assert j["using"] == "own"
+    assert j["model"] == "gpt-own"
+    # 落盘（users.json 加密）
+    raw = user_store.USER_FILE.read_text(encoding="utf-8")
+    assert "sk-own-secret-abcdef" not in raw
+    cfg = user_store.get_user_ai_config(u["user_id"])
+    assert app_mod._decrypt_api_key(cfg["api_key"]) == "sk-own-secret-abcdef"
+
+
+def test_owner_config_get_uses_platform():
+    _reset_config()
+    _setup_platform()
+    o = user_store.create_user("o@x.com", "password1", role="owner")
+    c = _client()
+    _login(c, "owner", o["user_id"])
+    r = c.get("/api/ai/config")
+    j = r.get_json()
+    assert r.status_code == 200
+    assert j["base_url"] == "http://platform/v1"
+    assert j["using"] == "platform"
+
+
+def test_owner_put_tuning_ok():
+    _reset_config()
+    o = user_store.create_user("o@x.com", "password1", role="owner")
+    c = _client()
+    _login(c, "owner", o["user_id"])
+    r = c.put("/api/ai/config", json={"max_steps": 60})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    j = r.get_json()
+    assert j["max_steps"] == 60
+
+
+# =========================================================================== #
+# 4. AI 端点资源鉴权 + 凭据缺失
+# =========================================================================== #
+def test_ai_run_unauthorized_slide_403():
+    _reset_config()
+    _setup_platform()
+    ua = user_store.create_user("a@x.com", "password1", role="user")
+    ub = user_store.create_user("b@x.com", "password1", role="user")
+    _touch("a.svs")
+    _own("a.svs", ua["user_id"])
+    fake = _install_fake()
+    c = _client()
+    _login(c, "user", ub["user_id"])
+    r = c.post("/api/ai/run", json={"slide": "a.svs"})
+    assert r.status_code == 403
+    assert fake.calls == []  # 未转发到 sidecar
+
+
+def test_ai_run_no_credentials_400():
+    _reset_config()  # 平台未配
+    u = user_store.create_user("u@x.com", "password1", role="user")
+    _touch("own400.svs")
+    _own("own400.svs", u["user_id"])
+    c = _client()
+    _login(c, "user", u["user_id"])
+    r = c.post("/api/ai/run", json={"slide": "own400.svs"})
+    assert r.status_code == 400
+    j = r.get_json()
+    assert j and "未配置 AI 凭据" in (j.get("error") or "")
+
+
+def test_ai_run_authorized_proxies_with_owner():
+    _reset_config()
+    _setup_platform()
+    u = user_store.create_user("u@x.com", "password1", role="user")
+    _touch("ownok.svs")
+    _own("ownok.svs", u["user_id"])
+    fake = _install_fake()
+
+    def handler(params):
+        return FakeResponse(200, ctype="text/event-stream")
+    fake.register("POST", "/run", handler)
+    c = _client()
+    _login(c, "user", u["user_id"])
+    r = c.post("/api/ai/run", json={"slide": "ownok.svs"})
+    assert r.status_code == 200
+    # 断言注入 session_owner（起跑类端点按当前 user_id 注入）
+    assert fake.calls
+    sent = fake.calls[-1]["body"] or {}
+    cfg = sent.get("config") or {}
+    assert cfg.get("session_owner") == u["user_id"]
+    assert cfg.get("base_url") == "http://platform/v1"
+
+
+# =========================================================================== #
+# 5. sessions 按归属过滤 / session 详情越权
+# =========================================================================== #
+def test_sessions_user_filter_owner_all():
+    _reset_config()
+    _setup_platform()
+    u = user_store.create_user("u@x.com", "password1", role="user")
+    o = user_store.create_user("o@x.com", "password1", role="owner")
+    _touch("s.svs")
+    _own("s.svs", u["user_id"])
+
+    fake = _install_fake()
+
+    def sess_handler(params):
+        return FakeResponse(200, json.dumps({"sessions": [{"id": "s1"}, {"id": "s2"}]}))
+    fake.register("GET", "/sessions", sess_handler)
+
+    # user → ?owner=<user_id> 过滤
+    cu = _client()
+    _login(cu, "user", u["user_id"])
+    fake.calls.clear()
+    cu.get("/api/ai/sessions?slide=s.svs")
+    assert fake.calls and fake.calls[-1]["params"] == {"slide": "s.svs", "owner": u["user_id"]}
+
+    # owner → 不过滤（只传 slide）
+    co = _client()
+    _login(co, "owner", o["user_id"])
+    fake.calls.clear()
+    co.get("/api/ai/sessions?slide=s.svs")
+    assert fake.calls and fake.calls[-1]["params"] == {"slide": "s.svs"}
+
+
+def test_session_detail_owner_check():
+    _reset_config()
+    _setup_platform()
+    ua = user_store.create_user("a@x.com", "password1", role="user")
+    ub = user_store.create_user("b@x.com", "password1", role="user")
+    fake = _install_fake()
+
+    def detail_handler(params):
+        return FakeResponse(200, json.dumps({"session": {"id": "s-a", "owner": ua["user_id"]}}))
+    fake.register("GET", "/session/s-a", detail_handler)
+
+    # userB 访问 userA 的会话 → 403
+    cb = _client()
+    _login(cb, "user", ub["user_id"])
+    r = cb.get("/api/ai/session/s-a")
+    assert r.status_code == 403
+    # owner 访问任意会话 → 放行（透传）
+    o = user_store.create_user("o@x.com", "password1", role="owner")
+    co = _client()
+    _login(co, "owner", o["user_id"])
+    r2 = co.get("/api/ai/session/s-a")
+    assert r2.status_code == 200
+    assert r2.get_json()["session"]["id"] == "s-a"
+
+
+# =========================================================================== #
+# 6. AUTH_ENABLED=False 全兼容
+# =========================================================================== #
+def test_no_auth_full_compat():
+    _reset_config()
+    _setup_platform()
+    _touch("x.svs")
+    fake = _install_fake()
+
+    def run_handler(params):
+        return FakeResponse(200, ctype="text/event-stream")
+    fake.register("POST", "/run", run_handler)
+    fake.register("GET", "/sessions",
+                  lambda p: FakeResponse(200, json.dumps({"sessions": []})))
+
+    c = _client(auth=False)
+    # run：不注入 session_owner
+    fake.calls.clear()
+    r = c.post("/api/ai/run", json={"slide": "x.svs"})
+    assert r.status_code == 200
+    # sessions：不过滤 owner
+    fake.calls.clear()
+    c.get("/api/ai/sessions?slide=x.svs")
+    assert fake.calls and fake.calls[-1]["params"] == {"slide": "x.svs"}
+
+
+def test_owner_run_does_not_inject_session_owner():
+    """role=owner 起跑不注入 session_owner（owner 全量可见、可续跑任意会话，
+    sidecar acquire 归属守卫对无 owner 注入的 run 不生效）；owner 名下会话保持
+    无 owner 字段，user 的 ?owner= 过滤自然看不到。"""
+    _reset_config()
+    _setup_platform()
+    o = user_store.create_user("o2@x.com", "password1", role="owner")
+    _touch("ownr.svs")
+    fake = _install_fake()
+
+    def handler(params):
+        return FakeResponse(200, ctype="text/event-stream")
+    fake.register("POST", "/run", handler)
+    c = _client()
+    _login(c, "owner", o["user_id"])
+    r = c.post("/api/ai/run", json={"slide": "ownr.svs"})
+    assert r.status_code == 200
+    sent = fake.calls[-1]["body"] or {}
+    cfg = sent.get("config") or {}
+    assert "session_owner" not in cfg

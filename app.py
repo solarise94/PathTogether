@@ -3572,12 +3572,20 @@ def api_annotation_delete_admin(index):
     """管理员删除自己的标注（token="admin" 下第 index 条）。
 
     Stage 3a-2a：owner 任意；否则仅本人创建（owner_user_id 判定）。
+    Stage 3c-1：body 可带 expected_revision（CAS），不符 → 409 revision_conflict。
     """
     denied, _roi = _check_annotation_owner(share_store.ADMIN_TOKEN, index)
     if denied:
         return denied
-    # delete_roi 返回 (bool, annotation_id|None)；直接当 bool 用会让 404 分支永不触发
-    ok, _aid = share_store.delete_roi(share_store.ADMIN_TOKEN, index)
+    body = request.get_json(silent=True) or {}
+    expected = body.get("expected_revision")
+    try:
+        # delete_roi 返回 (bool, annotation_id|None)；直接当 bool 用会让 404 分支永不触发
+        ok, _aid = share_store.delete_roi(
+            share_store.ADMIN_TOKEN, index, expected_revision=expected)
+    except share_store.RevisionConflict as e:
+        return jsonify(error="revision_conflict",
+                       current_revision=e.current_revision), 409
     if not ok:
         return jsonify(error="标注不存在"), 404
     return jsonify(ok=True)
@@ -3588,14 +3596,21 @@ def api_annotation_delete(token, index):
     """管理员删除任意 token 的标注。token 仅允许非空字符串。
 
     Stage 3a-2a：owner 任意；否则仅本人创建（owner_user_id 判定）。
+    Stage 3c-1：body 可带 expected_revision（CAS），不符 → 409 revision_conflict。
     """
     if not isinstance(token, str) or not token:
         return jsonify(error="缺少 token"), 400
     denied, _roi = _check_annotation_owner(token, index)
     if denied:
         return denied
-    # delete_roi 返回 (bool, annotation_id|None)，需解包
-    ok, _aid = share_store.delete_roi(token, index)
+    body = request.get_json(silent=True) or {}
+    expected = body.get("expected_revision")
+    try:
+        # delete_roi 返回 (bool, annotation_id|None)，需解包
+        ok, _aid = share_store.delete_roi(token, index, expected_revision=expected)
+    except share_store.RevisionConflict as e:
+        return jsonify(error="revision_conflict",
+                       current_revision=e.current_revision), 409
     if not ok:
         return jsonify(error="标注不存在"), 404
     return jsonify(ok=True)
@@ -3609,7 +3624,9 @@ def api_annotation_set_shared(token, index):
       - {"shared": bool}：走 set_roi_shared；
       - {"geom": {...}}：走 update_roi 更新几何（不含 type）；
       - {"note": "..."}：走 update_roi 更新备注。
-    两者可同时传（shared 与 geom/note 独立处理）。
+      - {"expected_revision": int}（Stage 3c-1 CAS）：可选，不符 → 409。
+    两者可同时传（shared 与 geom/note 独立处理；expected_revision 对两者共同生效，
+    set_roi_shared 不 bump revision，故先 shared 后 update 顺序无碍）。
     token/index 无效（shared 或 update 侧）返回 404；
     成功返回 {"ok": true, "shared": <更新后值>, "note": <更新后值>}。
     Stage 3a-2a：owner 任意；否则仅本人创建（owner_user_id 判定），无权 403。
@@ -3620,6 +3637,7 @@ def api_annotation_set_shared(token, index):
     if denied:
         return denied
     body = request.get_json(silent=True) or {}
+    expected = body.get("expected_revision")
 
     shared_after = None
     note_after = None
@@ -3627,7 +3645,12 @@ def api_annotation_set_shared(token, index):
     # shared 部分
     if "shared" in body:
         shared_target = bool(body.get("shared"))
-        ok = share_store.set_roi_shared(token, index, shared_target)
+        try:
+            ok = share_store.set_roi_shared(
+                token, index, shared_target, expected_revision=expected)
+        except share_store.RevisionConflict as e:
+            return jsonify(error="revision_conflict",
+                           current_revision=e.current_revision), 409
         if not ok:
             return jsonify(error="标注不存在"), 404
         shared_after = shared_target
@@ -3637,7 +3660,11 @@ def api_annotation_set_shared(token, index):
         geom = body.get("geom")
         note = body.get("note")
         try:
-            updated = share_store.update_roi(token, index, geom=geom, note=note)
+            updated = share_store.update_roi(
+                token, index, geom=geom, note=note, expected_revision=expected)
+        except share_store.RevisionConflict as e:
+            return jsonify(error="revision_conflict",
+                           current_revision=e.current_revision), 409
         except ValueError as e:
             return jsonify(error=str(e)), 400
         if updated is False:
@@ -3658,6 +3685,151 @@ def api_annotation_set_shared(token, index):
         note_after = cur.get("note", "") if cur else ""
 
     return jsonify(ok=True, shared=shared_after, note=note_after)
+
+
+# --------------------------------------------------------------------------- #
+# Stage 3c-1：评论线程 / AI 审核 / 修改历史（docs §5.3）
+# --------------------------------------------------------------------------- #
+def _resolve_anno(token, index, require_annotate):
+    """解析 token+index → roi 并做切片级鉴权。
+
+    require_annotate=True 时用 can_annotate_slide，否则 can_view_slide。
+    返回 (roi, None) 或 (None, error_response)。roi=None 表示不存在（已 404）。
+    """
+    if not isinstance(token, str) or not token:
+        return None, (jsonify(error="缺少 token"), 400)
+    roi = share_store.get_roi(token, index)
+    if roi is None:
+        return None, (jsonify(error="标注不存在"), 404)
+    slide = roi.get("slide") or ""
+    ok = can_annotate_slide(slide) if require_annotate else can_view_slide(slide)
+    if not ok:
+        return None, (_denied(),)
+    return roi, None
+
+
+def _display_label(uid):
+    """取用户展示名快照（评论 author_label 用）；取不到回退 None。"""
+    if not uid:
+        return None
+    try:
+        u = user_store.get_user(uid) or {}
+        return u.get("display_name") or None
+    except Exception:
+        return None
+
+
+@app.route("/api/annotation/<token>/<int:index>/comments")
+def api_annotation_comments(token, index):
+    """列出某标注的评论。鉴权同查看（can_view_slide）。"""
+    roi, err = _resolve_anno(token, index, require_annotate=False)
+    if err:
+        return err
+    aid = roi.get("annotation_id")
+    return jsonify({"comments": share_store.list_comments(annotation_id=aid)})
+
+
+@app.route("/api/annotation/<token>/<int:index>/comments", methods=["POST"])
+def api_annotation_comment_add(token, index):
+    """在某标注下新增评论。鉴权同标注（can_annotate_slide）。
+
+    JSON: {body, parent_id?}。author_user_id 取当前 session，author_label 取展示名快照。
+    """
+    roi, err = _resolve_anno(token, index, require_annotate=True)
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    text = body.get("body")
+    parent_id = body.get("parent_id")
+    ident = current_identity()
+    try:
+        cmt = share_store.add_comment(
+            roi.get("annotation_id"), roi.get("slide"), token, text,
+            author_user_id=ident.get("user_id"),
+            author_label=_display_label(ident.get("user_id")),
+            parent_id=parent_id)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(ok=True, comment=cmt)
+
+
+@app.route("/api/comment/<comment_id>/resolve", methods=["POST"])
+def api_comment_resolve(comment_id):
+    """设置评论 resolved 状态。鉴权同标注（can_annotate_slide，按评论所在切片）。
+
+    JSON: {resolved?: bool}（缺省 True）。
+    """
+    # 先取评论定位其 slide（list_comments 不含软删，需用 change 流或直接查）；
+    # 这里用一个轻量办法：按 comment_id 在全量评论里找（小数据量，可接受）。
+    comments = share_store.list_comments()
+    target = next((c for c in comments if c.get("comment_id") == comment_id), None)
+    if target is None:
+        return jsonify(error="评论不存在"), 404
+    slide = target.get("slide") or ""
+    if not can_annotate_slide(slide):
+        return _denied()
+    body = request.get_json(silent=True) or {}
+    resolved = body.get("resolved")
+    resolved = True if resolved is None else bool(resolved)
+    ok = share_store.resolve_comment(comment_id, resolved)
+    if not ok:
+        return jsonify(error="评论不存在"), 404
+    return jsonify(ok=True, resolved=resolved)
+
+
+@app.route("/api/comment/<comment_id>", methods=["DELETE"])
+def api_comment_delete(comment_id):
+    """软删评论。鉴权：本人（author_user_id）或 owner；否则 403。
+
+    owner 任意；非 owner 仅当评论 author_user_id == 当前 uid 才可删。
+    """
+    comments = share_store.list_comments()
+    target = next((c for c in comments if c.get("comment_id") == comment_id), None)
+    if target is None:
+        return jsonify(error="评论不存在"), 404
+    ident = current_identity()
+    if ident["role"] != user_store.ROLE_OWNER:
+        if target.get("author_user_id") != ident.get("user_id"):
+            return _denied("只能删除自己发表的评论")
+    ok = share_store.delete_comment(comment_id)
+    if not ok:
+        return jsonify(error="评论不存在"), 404
+    return jsonify(ok=True)
+
+
+@app.route("/api/annotation/<token>/<int:index>/review", methods=["POST"])
+def api_annotation_review(token, index):
+    """AI 标注审核（接受/驳回）。鉴权同标注（can_annotate_slide）。
+
+    JSON: {action: accept|reject}。仅 source=ai 的标注可审（人工 → 400）。
+    """
+    roi, err = _resolve_anno(token, index, require_annotate=True)
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    action = body.get("action")
+    if action not in ("accept", "reject"):
+        return jsonify(error="action 需为 accept 或 reject"), 400
+    try:
+        updated = share_store.review_roi(token, index, action)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    if updated is False:
+        return jsonify(error="标注不存在"), 404
+    return jsonify(ok=True, review_status=updated.get("review_status"),
+                   revision=updated.get("revision"))
+
+
+@app.route("/api/annotation/<token>/<int:index>/history")
+def api_annotation_history(token, index):
+    """返回某标注的修改历史（geom/note/label/revision/ts 快照，上限 20）。
+
+    鉴权同查看（can_view_slide）。
+    """
+    roi, err = _resolve_anno(token, index, require_annotate=False)
+    if err:
+        return err
+    return jsonify({"history": roi.get("history", [])})
 
 
 if __name__ == "__main__":

@@ -2600,6 +2600,19 @@ button {
 .anno-item .ai-op.ai-fork:hover { color: #7b5cff; background: rgba(123, 92, 255, 0.12); }
 .anno-item .ai-op.ai-branch:hover { color: #0a9396; background: rgba(10, 147, 150, 0.12); }
 
+/* Stage 3c-1：AI 标注审核（接受/驳回）按钮与状态徽章 */
+.anno-item .ai-op.ai-review-accept { color: #0a9396; }
+.anno-item .ai-op.ai-review-accept:hover { background: rgba(10, 147, 150, 0.14); }
+.anno-item .ai-op.ai-review-reject { color: #c0392b; }
+.anno-item .ai-op.ai-review-reject:hover { background: rgba(192, 57, 43, 0.14); }
+.anno-review-badge {
+  display: inline-flex; align-items: center; font-size: 9px; font-weight: 600;
+  line-height: 1; padding: 2px 5px; margin-left: 4px; border-radius: 4px;
+  vertical-align: middle;
+}
+.anno-review-badge.accepted { color: #0a9396; background: rgba(10, 147, 150, 0.16); }
+.anno-review-badge.rejected { color: #c0392b; background: rgba(192, 57, 43, 0.16); }
+
 /* AI 轨迹流里标注行的 fork/branch chip（对话内嵌卡片用） */
 .ai-trace-row.annotation { display: flex; align-items: center; gap: 6px; }
 .ai-action-chip {

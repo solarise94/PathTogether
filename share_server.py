@@ -537,6 +537,7 @@ def share_roi_update(token, index):
     """编辑本 token 的标注几何与/或备注。
 
     JSON body: {"geom": {...}, "note": "..."}（两者均可缺省）。
+    可选 {"expected_revision": int}（Stage 3c-1 CAS），不符 → 409 revision_conflict。
     设备归属校验：只有创建该标注的访客可编辑（_roi_owned_by）；旧数据
     （无 visitor）按链接级共享允许编辑。越权返回 403。
     调 update_roi；update 返回 False 时 404；成功返回更新后的 roi dict（含 index）。
@@ -549,6 +550,7 @@ def share_roi_update(token, index):
     body = request.get_json(silent=True) or {}
     geom = body.get("geom")
     note = body.get("note")
+    expected = body.get("expected_revision")
     if geom is None and note is None:
         return jsonify(error="缺少 geom 或 note"), 400
     r = share_store.get_roi(token, index)
@@ -557,7 +559,11 @@ def share_roi_update(token, index):
     if not _roi_owned_by(r, _visitor_id()):
         return jsonify(error="只能编辑自己创建的标记"), 403
     try:
-        updated = share_store.update_roi(token, index, geom=geom, note=note)
+        updated = share_store.update_roi(
+            token, index, geom=geom, note=note, expected_revision=expected)
+    except share_store.RevisionConflict as e:
+        return jsonify(error="revision_conflict",
+                       current_revision=e.current_revision), 409
     except ValueError as e:
         return jsonify(error=str(e)), 400
     if updated is False:
@@ -615,20 +621,86 @@ def share_roi_delete(token, index):
 
     设备归属校验：只有创建该标注的访客可删除（_roi_owned_by）；旧数据
     （无 visitor）按链接级共享允许删除。越权返回 403。
+    可选 body {"expected_revision": int}（Stage 3c-1 CAS），不符 → 409。
     权限三档（docs §5.4）：无 annotate 权限的 token 写标注 403（旧链接默认含 annotate）。
     """
     share = _require_share(token)
     if not _share_has_annotate(share):
         return jsonify(error="该链接不允许标注"), 403
+    body = request.get_json(silent=True) or {}
+    expected = body.get("expected_revision")
     r = share_store.get_roi(token, index)
     if r is None:
         return jsonify(error="选区不存在"), 404
     if not _roi_owned_by(r, _visitor_id()):
         return jsonify(error="只能编辑自己创建的标记"), 403
-    ok = share_store.delete_roi(token, index)
+    try:
+        ok, _aid = share_store.delete_roi(token, index, expected_revision=expected)
+    except share_store.RevisionConflict as e:
+        return jsonify(error="revision_conflict",
+                       current_revision=e.current_revision), 409
     if not ok:
         return jsonify(error="选区不存在"), 404
     return jsonify(ok=True)
+
+
+# --------------------------------------------------------------------------- #
+# 评论线程（guest）—— Stage 3c-1（docs §5.3）
+#
+# guest 经 /s/* 评论，按 annotation_id 定位（支持评论本分享内任意可见标注，含
+# 管理员策展公开的标注）。校验：标注所在 slide ∈ 本次分享；评论需 share 含
+# annotate 权限。author_user_id 留空（guest），author_label 取 body.name 或"访客"。
+# --------------------------------------------------------------------------- #
+def _resolve_anno_in_share(share, annotation_id):
+    """按 annotation_id 取标注并校验其 slide 属于该 share；否则 (None, error_resp)。"""
+    roi = share_store.get_roi_by_annotation_id(annotation_id)
+    if roi is None:
+        return None, (jsonify(error="标注不存在"), 404)
+    slide = roi.get("slide")
+    if not slide or slide not in share.get("slides", []):
+        return None, (jsonify(error="无权访问"), 403)
+    return roi, None
+
+
+@app.route("/s/<token>/api/comments")
+def share_comments_list(token):
+    """列出某标注的评论（guest 视角，query: annotation_id）。share 有效即可查看。"""
+    share = _require_share(token)
+    annotation_id = request.args.get("annotation_id")
+    if not annotation_id:
+        return jsonify(error="缺少 annotation_id"), 400
+    _roi, err = _resolve_anno_in_share(share, annotation_id)
+    if err:
+        return err
+    return jsonify({"comments": share_store.list_comments(annotation_id=annotation_id)})
+
+
+@app.route("/s/<token>/api/comments", methods=["POST"])
+def share_comment_add(token):
+    """在某标注下新增评论（guest）。需 share 含 annotate 权限。
+
+    JSON: {annotation_id, body, parent_id?, name?}。
+    """
+    share = _require_share(token)
+    if not _share_has_annotate(share):
+        return jsonify(error="该链接不允许评论"), 403
+    body = request.get_json(silent=True) or {}
+    annotation_id = body.get("annotation_id")
+    text = body.get("body")
+    parent_id = body.get("parent_id")
+    label = (body.get("name") or "").strip() or None
+    if not annotation_id:
+        return jsonify(error="缺少 annotation_id"), 400
+    roi, err = _resolve_anno_in_share(share, annotation_id)
+    if err:
+        return err
+    try:
+        cmt = share_store.add_comment(
+            annotation_id, roi.get("slide"), token, text,
+            author_user_id=None, author_label=label, parent_id=parent_id)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(ok=True, comment=cmt)
 
 
 @app.route("/static/<path:filename>")

@@ -46,6 +46,7 @@ from share_store_json import (
     ALLOWED_ROI_SIZES,
     DEFAULT_ROI_SIZES,
     _clean_note,
+    _clean_comment_body,
     _grant_out,
     _is_active,
     _norm_label,
@@ -58,6 +59,20 @@ from share_store_json import (
     _status_of,
     _validate_geom,
 )
+
+
+class RevisionConflict(Exception):
+    """CAS 失败：expected_revision 与当前 revision 不符（与 json 同语义）。
+
+    携带 ``current_revision``（int）。pg 后端独立定义一份，保证 postgres 模式下
+    ``share_store.RevisionConflict`` 与本模块抛出的类一致（json 的 _check_cas 不能
+    直接复用——它引用 json 的 RevisionConflict）。
+    """
+
+    def __init__(self, current_revision, message=None):
+        self.current_revision = int(current_revision)
+        super().__init__(
+            message or "revision 冲突：标注已被他人修改，请刷新后重试")
 
 # 文件路径占位：PG 后端不用文件（dispatcher 公共名校验需要这些名字存在）
 SHARE_DATA_DIR = None
@@ -146,14 +161,61 @@ def _update_roi_row(cur, rid: str, roi: dict):
 
 
 def _roi_out(roi: dict, index=None, shared=None) -> dict:
-    """ROI 导出副本：统一补 index/shared/note 兼容字段（与 json 一致）。"""
+    """ROI 导出副本：统一补 index/shared/note 兼容字段（与 json 一致）。
+
+    tombstone（deleted=true）只保留最小字段；非 tombstone 补 review_status。
+    """
+    if roi.get("deleted"):
+        out = {
+            "annotation_id": roi.get("annotation_id"),
+            "slide": roi.get("slide"),
+            "token": roi.get("token"),
+            "revision": int(roi.get("revision") or 1),
+            "deleted": True,
+            "deleted_at": roi.get("deleted_at"),
+            "change_seq": roi.get("change_seq"),
+            "type": "annotation",
+        }
+        if index is not None:
+            out["index"] = index
+        return out
     out = dict(roi)
     if index is not None:
         out["index"] = index
     if shared is not None:
         out["shared"] = bool(shared)
     out["note"] = roi.get("note", "")
+    out.setdefault("review_status", "none")
     return out
+
+
+def _check_cas(roi, expected_revision):
+    """Stage 3c-1 CAS：expected_revision 提供且与当前 revision 不符 → 抛 RevisionConflict。
+
+    引用本模块（pg）的 RevisionConflict，保证 postgres 模式下异常类一致。
+    """
+    if expected_revision is None:
+        return
+    cur = int(roi.get("revision") or 1)
+    if int(expected_revision) != cur:
+        raise RevisionConflict(cur)
+
+
+def _append_history(roi):
+    """Stage 3c-1 修改历史：把当前快照 append 进 roi['history']，上限 20，丢最旧。
+    在 update/tombstone 修改**之前**调用。pg 存 data jsonb 内（同 roi dict）。
+    """
+    snap = {
+        "geom": {k: roi[k] for k in _GEOM_KEYS if k in roi},
+        "note": roi.get("note", ""),
+        "label": roi.get("label", ""),
+        "revision": int(roi.get("revision") or 1),
+        "ts": roi.get("ts"),
+    }
+    hist = roi.setdefault("history", [])
+    hist.append(snap)
+    if len(hist) > 20:
+        del hist[: len(hist) - 20]
 
 
 def _bump_change_seq(cur, slide, token, annotation_id, op):
@@ -462,6 +524,8 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
                     "updated_at": now,
                     "deleted": False,
                     "owner_user_id": owner_user_id or _OWNER_USER_ID or None,
+                    # Stage 3c-1：AI 新写入默认 pending 待审；人工标注 none
+                    "review_status": "pending" if src == "ai" else "none",
                 }
                 if _effect_key:
                     roi["effect_key"] = _effect_key
@@ -470,7 +534,7 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
                     cur, slide, token, roi["annotation_id"], "add")
                 rid = "roi_" + secrets.token_urlsafe(10)
                 _insert_roi(cur, roi, rid)
-                out = dict(roi)
+                out = _roi_out(roi)
                 out["index"] = total
                 out["shared"] = bool(shared)
                 return out
@@ -478,8 +542,12 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
         conn.close()
 
 
-def update_roi(token, index, geom=None, note=None):
-    """更新该 token 下第 index 条 roi 的几何与/或备注。返回更新后的 dict 或 False。"""
+def update_roi(token, index, geom=None, note=None, expected_revision=None):
+    """更新该 token 下第 index 条 roi 的几何与/或备注。返回更新后的 dict 或 False。
+
+    expected_revision（CAS）：提供且与当前 revision 不符 → 抛 RevisionConflict。
+    修改前 append history 快照（上限 20）。
+    """
     if geom is not None and not isinstance(geom, dict):
         raise ValueError("geom 需为对象")
     note_clean = "_UNSET_"
@@ -505,7 +573,9 @@ def update_roi(token, index, geom=None, note=None):
                     return False
                 rid = same[index]["id"]
                 roi = dict(same[index]["data"])
+                _check_cas(roi, expected_revision)  # CAS 在修改前校验
                 orig_type = roi.get("type", "rect")
+                _append_history(roi)  # 修改历史快照（修改前）
                 if geom is not None:
                     geom_full = dict(geom)
                     if orig_type == "rect" and "size_mm" not in geom_full:
@@ -528,7 +598,7 @@ def update_roi(token, index, geom=None, note=None):
                 idx = next((i for i, row in enumerate(all_rows)
                             if row["data"].get("annotation_id") ==
                             roi.get("annotation_id")), 0)
-                out = dict(roi)
+                out = _roi_out(roi)
                 out["index"] = idx
                 out["shared"] = _roi_shared_compat(roi)
                 return out
@@ -613,8 +683,12 @@ def get_roi_by_annotation_id(annotation_id):
         conn.close()
 
 
-def delete_roi(token, index):
-    """删除该 token 下第 index 条 ROI（置 tombstone）。返回 (bool, annotation_id|None)。"""
+def delete_roi(token, index, expected_revision=None):
+    """删除该 token 下第 index 条 ROI（置 tombstone）。返回 (bool, annotation_id|None)。
+
+    expected_revision（CAS）：提供且与当前 revision 不符 → 抛 RevisionConflict。
+    tombstone 设 deleted_at + bump revision/change_seq + append history。
+    """
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -629,18 +703,25 @@ def delete_roi(token, index):
                 roi = dict(same[index]["data"])
                 if roi.get("deleted"):
                     return False, None
+                _check_cas(roi, expected_revision)
+                _append_history(roi)
                 roi["deleted"] = True
+                roi["deleted_at"] = time.time()
+                roi["revision"] = int(roi.get("revision") or 1) + 1
                 roi["change_seq"] = _bump_change_seq(
                     cur, roi.get("slide"), token, roi.get("annotation_id"), "delete")
-                roi["updated_at"] = time.time()
+                roi["updated_at"] = roi["deleted_at"]
                 _update_roi_row(cur, rid, roi)
                 return True, roi.get("annotation_id")
     finally:
         conn.close()
 
 
-def delete_roi_by_annotation_id(annotation_id):
-    """按稳定 annotation_id 删除（tombstone 语义同 delete_roi）；返回是否成功。"""
+def delete_roi_by_annotation_id(annotation_id, expected_revision=None):
+    """按稳定 annotation_id 删除（tombstone 语义同 delete_roi）；返回是否成功。
+
+    expected_revision（CAS）：提供且与当前 revision 不符 → 抛 RevisionConflict。
+    """
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -653,11 +734,15 @@ def delete_roi_by_annotation_id(annotation_id):
                     return False
                 rid = row["id"]
                 roi = dict(row["data"])
+                _check_cas(roi, expected_revision)
+                _append_history(roi)
                 roi["deleted"] = True
+                roi["deleted_at"] = time.time()
+                roi["revision"] = int(roi.get("revision") or 1) + 1
                 roi["change_seq"] = _bump_change_seq(
                     cur, roi.get("slide"), roi.get("token"),
                     roi.get("annotation_id"), "delete")
-                roi["updated_at"] = time.time()
+                roi["updated_at"] = roi["deleted_at"]
                 _update_roi_row(cur, rid, roi)
                 return True
     finally:
@@ -665,7 +750,11 @@ def delete_roi_by_annotation_id(annotation_id):
 
 
 def list_changes(slide, after_seq):
-    """返回 change_seq > after_seq 的全部变更（含 tombstone）。"""
+    """返回 change_seq > after_seq 的全部变更（含 tombstone）。
+
+    Stage 3c-1：含评论增删（type=comment）与标注变更（type=annotation）；tombstone
+    标注走 _roi_out 最小字段输出。
+    """
     if not isinstance(after_seq, (int, float)):
         after_seq = 0
     conn = _connect()
@@ -676,13 +765,27 @@ def list_changes(slide, after_seq):
                     "SELECT data FROM rois WHERE slide=%s ORDER BY insert_seq",
                     (slide,))
                 rows = cur.fetchall()
+                cur.execute(
+                    "SELECT data FROM comments WHERE slide=%s ORDER BY created_at",
+                    (slide,))
+                crows = cur.fetchall()
         out = []
         for row in rows:
             r = row["data"]
             cs = r.get("change_seq")
             if cs is None or not isinstance(cs, (int, float)) or cs <= after_seq:
                 continue
-            out.append(dict(r))
+            rr = _roi_out(r)
+            rr.setdefault("type", "annotation")
+            out.append(rr)
+        for row in crows:
+            c = row["data"]
+            cs = c.get("change_seq")
+            if cs is None or not isinstance(cs, (int, float)) or cs <= after_seq:
+                continue
+            cc = dict(c)
+            cc["type"] = "comment"
+            out.append(cc)
         out.sort(key=lambda x: x.get("change_seq", 0))
         return out
     finally:
@@ -703,8 +806,11 @@ def current_change_seq(slide):
         conn.close()
 
 
-def set_roi_shared(token, index, shared):
-    """设置该 token 下第 index 条 ROI 的 shared 字段（跳过 tombstone）。"""
+def set_roi_shared(token, index, shared, expected_revision=None):
+    """设置该 token 下第 index 条 ROI 的 shared 字段（跳过 tombstone）。
+
+    expected_revision（CAS）：提供且与当前 revision 不符 → 抛 RevisionConflict。
+    """
     shared_b = bool(shared)
     conn = _connect()
     try:
@@ -718,9 +824,51 @@ def set_roi_shared(token, index, shared):
                     return False
                 rid = same[index]["id"]
                 roi = dict(same[index]["data"])
+                _check_cas(roi, expected_revision)
                 roi["shared"] = shared_b
                 _update_roi_row(cur, rid, roi)
                 return True
+    finally:
+        conn.close()
+
+
+def review_roi(token, index, action):
+    """Stage 3c-1：AI 标注审核（接受/驳回）。仅 source=ai 可审；否则 ValueError。
+
+    成功返回更新后的 roi dict（含 index/review_status/revision）；token/index
+    无效返回 False。bump revision + updated_at（不 bump change_seq）。
+    """
+    if action not in ("accept", "reject"):
+        raise ValueError("action 需为 accept 或 reject")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT id, data FROM rois WHERE token=%s AND NOT deleted "
+                    "ORDER BY insert_seq", (token,))
+                same = cur.fetchall()
+                if index < 0 or index >= len(same):
+                    return False
+                rid = same[index]["id"]
+                roi = dict(same[index]["data"])
+                if roi.get("source") != "ai":
+                    raise ValueError("仅 AI 标注可审核")
+                roi["review_status"] = "accepted" if action == "accept" else "rejected"
+                roi["revision"] = int(roi.get("revision") or 1) + 1
+                roi["updated_at"] = time.time()
+                _update_roi_row(cur, rid, roi)
+                cur.execute(
+                    "SELECT data FROM rois WHERE token=%s AND NOT deleted "
+                    "ORDER BY insert_seq", (token,))
+                all_rows = cur.fetchall()
+                idx = next((i for i, row in enumerate(all_rows)
+                            if row["data"].get("annotation_id") ==
+                            roi.get("annotation_id")), 0)
+                out = _roi_out(roi)
+                out["index"] = idx
+                out["shared"] = _roi_shared_compat(roi)
+                return out
     finally:
         conn.close()
 
@@ -1191,6 +1339,7 @@ def annotations_by_slide():
                 "created_by_session_id": r.get("created_by_session_id", ""),
                 "change_seq": r.get("change_seq"),
                 "revision": r.get("revision", 1),
+                "review_status": r.get("review_status", "none"),
                 "visitor": (r.get("visitor") or "")[:8],
             }
             for k in ("x1", "y1", "x2", "y2", "points"):
@@ -1217,6 +1366,145 @@ def annotations_by_project(pid=None):
         for slide, groups in by_slide.items()
         if slide in project_slides
     }
+
+
+# --------------------------------------------------------------------------- #
+# 评论线程（comments）—— Stage 3c-1（docs §5.3）
+#
+# comments 表存权威 dict 在 data JSONB（同 rois 语义），离散列镜像供过滤/索引。
+# 增删 bump change_log（op=comment_add/comment_delete），list_changes 以 type=comment
+# 返回。语义与 json 完全一致。
+# --------------------------------------------------------------------------- #
+def _insert_comment(cur, cmt: dict, cid: str):
+    """插入一条 comment：data 存权威 dict，离散列镜像。"""
+    now = cmt.get("updated_at") or cmt.get("created_at") or time.time()
+    cur.execute(
+        "INSERT INTO comments "
+        "(comment_id, annotation_id, slide, token, author_user_id, author_label, "
+        " body, parent_id, resolved, deleted, created_at, updated_at, data) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, to_timestamp(%s), to_timestamp(%s), %s)",
+        (
+            cid, cmt.get("annotation_id", ""), cmt.get("slide", ""),
+            cmt.get("token", ""), cmt.get("author_user_id"),
+            cmt.get("author_label", "访客"), cmt.get("body", ""),
+            cmt.get("parent_id"), bool(cmt.get("resolved", False)),
+            bool(cmt.get("deleted", False)), cmt.get("created_at", now), now,
+            psycopg.types.json.Jsonb(cmt),
+        ),
+    )
+
+
+def _update_comment_row(cur, cid: str, cmt: dict):
+    """更新一条 comment（data + 离散镜像列）。"""
+    now = cmt.get("updated_at") or time.time()
+    cur.execute(
+        "UPDATE comments SET resolved=%s, deleted=%s, updated_at=to_timestamp(%s), "
+        "data=%s WHERE comment_id=%s",
+        (bool(cmt.get("resolved", False)), bool(cmt.get("deleted", False)), now,
+         psycopg.types.json.Jsonb(cmt), cid),
+    )
+
+
+def add_comment(annotation_id, slide, token, body, author_user_id=None,
+                author_label="", parent_id=None, requester_role=None):
+    """新增评论；返回 comment dict（含 comment_id/change_seq）。语义同 json。"""
+    body_clean = _clean_comment_body(body)
+    if not body_clean:
+        raise ValueError("评论正文不能为空")
+    now = time.time()
+    cid = "cmt_" + uuid.uuid4().hex
+    cmt = {
+        "comment_id": cid,
+        "annotation_id": annotation_id or "",
+        "slide": slide or "",
+        "token": token or "",
+        "author_user_id": author_user_id or None,
+        "author_label": (author_label or "").strip()[:80] or "访客",
+        "body": body_clean,
+        "parent_id": parent_id or None,
+        "resolved": False,
+        "deleted": False,
+        "created_at": now,
+        "updated_at": now,
+    }
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cmt["change_seq"] = _bump_change_seq(
+                    cur, slide, token, cid, "comment_add")
+                _insert_comment(cur, cmt, cid)
+                return dict(cmt)
+    finally:
+        conn.close()
+
+
+def list_comments(annotation_id=None, slide=None):
+    """返回评论列表（跳过软删）。可按 annotation_id / slide 过滤。按 created_at 升序。"""
+    clauses = ["NOT deleted"]
+    params = []
+    if annotation_id is not None:
+        clauses.append("annotation_id=%s")
+        params.append(annotation_id)
+    if slide is not None:
+        clauses.append("slide=%s")
+        params.append(slide)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT data FROM comments WHERE " + " AND ".join(clauses) +
+                    " ORDER BY created_at", params)
+                rows = cur.fetchall()
+        return [dict(r["data"]) for r in rows]
+    finally:
+        conn.close()
+
+
+def resolve_comment(comment_id, resolved=True):
+    """设置评论 resolved 状态；返回是否成功。"""
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT data FROM comments WHERE comment_id=%s AND NOT deleted",
+                    (comment_id,))
+                row = cur.fetchone()
+                if row is None:
+                    return False
+                cmt = dict(row["data"])
+                cmt["resolved"] = bool(resolved)
+                cmt["updated_at"] = time.time()
+                _update_comment_row(cur, comment_id, cmt)
+                return True
+    finally:
+        conn.close()
+
+
+def delete_comment(comment_id):
+    """软删评论（deleted=true + bump change_seq）；返回是否成功。"""
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT data FROM comments WHERE comment_id=%s AND NOT deleted",
+                    (comment_id,))
+                row = cur.fetchone()
+                if row is None:
+                    return False
+                cmt = dict(row["data"])
+                cmt["deleted"] = True
+                cmt["updated_at"] = time.time()
+                cmt["change_seq"] = _bump_change_seq(
+                    cur, cmt.get("slide"), cmt.get("token"), comment_id,
+                    "comment_delete")
+                _update_comment_row(cur, comment_id, cmt)
+                return True
+    finally:
+        conn.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -1366,9 +1654,11 @@ def _mirror_roi_delete(ret, *a, **k):
                     return
                 roi = dict(row["data"])
                 roi["deleted"] = True
+                roi["deleted_at"] = time.time()
+                roi["revision"] = int(roi.get("revision") or 1) + 1
                 roi["change_seq"] = _bump_change_seq(
                     cur, roi.get("slide"), roi.get("token"), aid, "delete")
-                roi["updated_at"] = time.time()
+                roi["updated_at"] = roi["deleted_at"]
                 _update_roi_row(cur, row["id"], roi)
     finally:
         conn.close()
@@ -1451,5 +1741,59 @@ def _mirror_project_delete(ret, pid, *a, **k):
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute("DELETE FROM projects WHERE project_id=%s", (pid,))
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 评论 / 审核 镜像（Stage 3c-1）
+# --------------------------------------------------------------------------- #
+def _mirror_comment(ret, *a, **k):
+    """把 json add_comment 返回的权威 comment dict upsert 进 pg（按 comment_id）。
+
+    data 存权威负载；comment_id 由 json 生成，跨库身份一致靠这里。
+    """
+    cmt = ret if isinstance(ret, dict) else None
+    if not cmt or not cmt.get("comment_id"):
+        return
+    cid = cmt["comment_id"]
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute("SELECT comment_id FROM comments WHERE comment_id=%s", (cid,))
+                if cur.fetchone() is not None:
+                    _update_comment_row(cur, cid, cmt)
+                else:
+                    _insert_comment(cur, cmt, cid)
+    finally:
+        conn.close()
+
+
+def _mirror_comment_delete(ret, comment_id, *a, **k):
+    """delete_comment：comment_id 为调用方入参，同参软删 pg 评论。
+
+    delete_comment 返回 bool；comment_id 在入参首位。pg 侧也 bump change_seq
+    （op=comment_delete），与 json 一致。
+    """
+    if not comment_id or not ret:
+        return
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT data FROM comments WHERE comment_id=%s AND NOT deleted",
+                    (comment_id,))
+                row = cur.fetchone()
+                if row is None:
+                    return
+                cmt = dict(row["data"])
+                cmt["deleted"] = True
+                cmt["updated_at"] = time.time()
+                cmt["change_seq"] = _bump_change_seq(
+                    cur, cmt.get("slide"), cmt.get("token"), comment_id,
+                    "comment_delete")
+                _update_comment_row(cur, comment_id, cmt)
     finally:
         conn.close()

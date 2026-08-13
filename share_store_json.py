@@ -34,6 +34,7 @@ _EMPTY = {
     "slide_meta": {},
     "change_seq_by_slide": {},
     "grants": [],
+    "comments": [],
 }
 
 # 支持的标注类型
@@ -46,6 +47,27 @@ DEFAULT_ROI_SIZES = [6.0, 6.5]
 
 # 管理员标注使用的固定 token
 ADMIN_TOKEN = "admin"
+
+
+# --------------------------------------------------------------------------- #
+# Stage 3c-1：revision CAS（并发编辑不静默覆盖）
+#
+# update_roi/delete_roi/set_roi_shared 接受可选 expected_revision：提供且与当前
+# revision 不符 → 抛 RevisionConflict（携带 current_revision）。不提供则维持旧行为
+# （旧客户端兼容，不强制 CAS）。两 impl 各定义一份同语义类；dispatcher 导出 json
+# 侧为准（dual 下写路径权威在 json，抛出的也是 json 的类）。
+# --------------------------------------------------------------------------- #
+class RevisionConflict(Exception):
+    """CAS 失败：expected_revision 与当前 revision 不符。
+
+    携带 ``current_revision``（int）供 app.py 映射 409 {error:"revision_conflict"}。
+    """
+
+    def __init__(self, current_revision, message=None):
+        self.current_revision = int(current_revision)
+        super().__init__(
+            message or "revision 冲突：标注已被他人修改，请刷新后重试")
+
 
 # --------------------------------------------------------------------------- #
 # Stage 3a-2a：分享权限档位与认领（docs §5.4）
@@ -234,6 +256,8 @@ def _load_locked(f):
         data.setdefault("change_seq_by_slide", {})
         # 向后兼容：旧文件无 grants 时补 []（Stage 3a-2a 认领关系）
         data.setdefault("grants", [])
+        # 向后兼容：旧文件无 comments 时补 []（Stage 3c-1 评论线程）
+        data.setdefault("comments", [])
         if not isinstance(data["shares"], dict):
             data["shares"] = {}
         if not isinstance(data["rois"], list):
@@ -246,6 +270,8 @@ def _load_locked(f):
             data["change_seq_by_slide"] = {}
         if not isinstance(data["grants"], list):
             data["grants"] = []
+        if not isinstance(data["comments"], list):
+            data["comments"] = []
         # 存量 ROI 一次性迁移（补 annotation_id/change_seq/revision/source/deleted）
         # 迁移若改动数据，缓存给 _with_lock 用于补落盘
         changed = _ensure_roi_identity(data)
@@ -270,7 +296,7 @@ def _load_locked(f):
 def _copy_empty():
     """返回一个新的空结构（避免共享引用）。"""
     return {"shares": {}, "rois": [], "projects": {}, "slide_meta": {},
-            "change_seq_by_slide": {}, "grants": []}
+            "change_seq_by_slide": {}, "grants": [], "comments": []}
 
 
 # --------------------------------------------------------------------------- #
@@ -321,6 +347,11 @@ def _ensure_roi_identity(data):
         if roi.get("deleted") is None:
             roi["deleted"] = False
             migrated = True
+        if roi.get("review_status") is None:
+            # Stage 3c-1：旧标注缺审核状态 → 一律 none（兼容；新 AI 标注写入
+            # 时显式写 pending，新人工标注写 none）
+            roi["review_status"] = "none"
+            migrated = True
         if roi.get("change_seq") is None and slide is not None:
             # 按现有顺序赋递增初值；同一张切片的计数器共享
             nxt = next_seq.get(slide, 0) + 1
@@ -346,15 +377,68 @@ def _roi_index_map(data, token):
     return out
 
 
+# roi 几何字段集合（history 快照与镜像用）
+_GEOM_KEYS = ("x", "y", "side_px", "size_mm", "x1", "y1", "x2", "y2", "points")
+
+
 def _roi_out(roi, index=None, shared=None):
-    """ROI 导出副本：统一补 index/shared/note 兼容字段。"""
+    """ROI 导出副本：统一补 index/shared/note 兼容字段。
+
+    tombstone（deleted=true）只保留最小字段（annotation_id/slide/revision/
+    deleted_at/change_seq/deleted），避免泄露已删标注的几何/备注。
+    非 tombstone 补 review_status 字段（缺省 none）。
+    """
+    if roi.get("deleted"):
+        out = {
+            "annotation_id": roi.get("annotation_id"),
+            "slide": roi.get("slide"),
+            "token": roi.get("token"),
+            "revision": int(roi.get("revision") or 1),
+            "deleted": True,
+            "deleted_at": roi.get("deleted_at"),
+            "change_seq": roi.get("change_seq"),
+            "type": "annotation",
+        }
+        if index is not None:
+            out["index"] = index
+        return out
     out = dict(roi)
     if index is not None:
         out["index"] = index
     if shared is not None:
         out["shared"] = bool(shared)
     out["note"] = roi.get("note", "")
+    out.setdefault("review_status", "none")
     return out
+
+
+def _check_cas(roi, expected_revision):
+    """Stage 3c-1 CAS：expected_revision 提供且与当前 revision 不符 → 抛 RevisionConflict。
+
+    expected_revision 为 None 时跳过（旧行为兼容，不强制 CAS）。
+    """
+    if expected_revision is None:
+        return
+    cur = int(roi.get("revision") or 1)
+    if int(expected_revision) != cur:
+        raise RevisionConflict(cur)
+
+
+def _append_history(roi):
+    """Stage 3c-1 修改历史：把当前快照（geom/note/label/revision/ts）append 进
+    roi['history']，上限 20 条，超出丢最旧。在 update/tombstone 修改**之前**调用。
+    """
+    snap = {
+        "geom": {k: roi[k] for k in _GEOM_KEYS if k in roi},
+        "note": roi.get("note", ""),
+        "label": roi.get("label", ""),
+        "revision": int(roi.get("revision") or 1),
+        "ts": roi.get("ts"),
+    }
+    hist = roi.setdefault("history", [])
+    hist.append(snap)
+    if len(hist) > 20:
+        del hist[: len(hist) - 20]
 
 
 def _bump_change_seq(data, slide):
@@ -826,6 +910,8 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
             "updated_at": now,
             "deleted": False,
             "owner_user_id": owner_user_id or _OWNER_USER_ID or None,
+            # Stage 3c-1：AI 新写入默认 pending 待审；人工标注 none（兼容现状）
+            "review_status": "pending" if src == "ai" else "none",
         }
         if _effect_key:
             roi["effect_key"] = _effect_key
@@ -842,7 +928,7 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
     return _with_lock("r+", _do)
 
 
-def update_roi(token, index, geom=None, note=None):
+def update_roi(token, index, geom=None, note=None, expected_revision=None):
     """更新该 token 下第 index 条 roi 的几何与/或备注。
 
     - 锁定内按 token 内序号定位（逻辑同 delete_roi：same 列表）。
@@ -852,6 +938,9 @@ def update_roi(token, index, geom=None, note=None):
     - geom（dict，不含 type）经 _validate_geom(原type, geom) 归一化后 merge 进 roi
       （type 保持原值，ts 不动 → index 语义稳定）；geom 为 None/缺省时不改几何。
     - note 为 None 时不改备注，否则按 _clean_note 规则清洗并写入。
+    - expected_revision（Stage 3c-1 CAS）：提供且与当前 revision 不符 → 抛
+      RevisionConflict（携带 current_revision）；不提供则不校验（旧行为兼容）。
+    - 修改前把旧快照 append 进 roi['history']（上限 20，丢最旧）。
     - 返回更新后的 roi dict（含 index，按 token 内序号计算，同 list_rois 逻辑）。
     """
     # 几何基本校验（真正按原 type 归一化在锁内做，因需读取 roi 原始 type）
@@ -878,7 +967,11 @@ def update_roi(token, index, geom=None, note=None):
             return False
         real_i = same[index]
         roi = data["rois"][real_i]
+        _check_cas(roi, expected_revision)  # CAS 在修改前校验
         orig_type = roi.get("type", "rect")
+
+        # 修改历史快照（修改前）
+        _append_history(roi)
 
         # 几何更新：用原 type 归一化后 merge（type 保持原值，ts 不动）
         if geom is not None:
@@ -902,7 +995,7 @@ def update_roi(token, index, geom=None, note=None):
         _save_locked(f, data)
 
         # 返回更新后的 roi dict（含 index）
-        out = dict(roi)
+        out = _roi_out(roi)
         # index 按 token 内序号计算（同 list_rois 逻辑）
         all_same = [r for r in data["rois"] if r["token"] == token and not r.get("deleted")]
         out["index"] = all_same.index(roi)
@@ -992,12 +1085,14 @@ def get_roi_by_annotation_id(annotation_id):
     return _with_lock("r+", _do)
 
 
-def delete_roi(token, index):
+def delete_roi(token, index, expected_revision=None):
     """删除该 token 下第 index 条 ROI；返回是否删除成功。
 
-    docs §4.2【v3】：物理删除改为置 tombstone（deleted=true + 递增 change_seq，
-    产生 spot_deleted 事件）。重复删除（已 deleted=true 的）是 no-op，不再递增。
-    返回 (bool, annotation_id|None)。
+    docs §4.2【v3】：物理删除改为置 tombstone（deleted=true + deleted_at + 递增
+    revision/change_seq，产生 spot_deleted 事件）。重复删除（已 deleted=true 的）
+    是 no-op，不再递增。返回 (bool, annotation_id|None)。
+    expected_revision（Stage 3c-1 CAS）：提供且与当前 revision 不符 → 抛
+    RevisionConflict；不提供则不校验（旧行为兼容）。
     """
     def _do(f):
         data = _load_locked(f)
@@ -1009,24 +1104,36 @@ def delete_roi(token, index):
         roi = data["rois"][real_i]
         if roi.get("deleted"):
             return False, None
+        _check_cas(roi, expected_revision)  # CAS 在删除前校验
+        _append_history(roi)  # 修改历史快照（删除前）
         roi["deleted"] = True
+        roi["deleted_at"] = time.time()
+        roi["revision"] = int(roi.get("revision") or 1) + 1
         roi["change_seq"] = _bump_change_seq(data, roi.get("slide"))
-        roi["updated_at"] = time.time()
+        roi["updated_at"] = roi["deleted_at"]
         _save_locked(f, data)
         return True, roi.get("annotation_id")
 
     return _with_lock("r+", _do)
 
 
-def delete_roi_by_annotation_id(annotation_id):
-    """按稳定 annotation_id 删除（tombstone 语义同 delete_roi）；返回是否成功。"""
+def delete_roi_by_annotation_id(annotation_id, expected_revision=None):
+    """按稳定 annotation_id 删除（tombstone 语义同 delete_roi）；返回是否成功。
+
+    expected_revision（Stage 3c-1 CAS）：提供且与当前 revision 不符 → 抛
+    RevisionConflict；不提供则不校验。
+    """
     def _do(f):
         data = _load_locked(f)
         for r in data["rois"]:
             if r.get("annotation_id") == annotation_id and not r.get("deleted"):
+                _check_cas(r, expected_revision)
+                _append_history(r)
                 r["deleted"] = True
+                r["deleted_at"] = time.time()
+                r["revision"] = int(r.get("revision") or 1) + 1
                 r["change_seq"] = _bump_change_seq(data, r.get("slide"))
-                r["updated_at"] = time.time()
+                r["updated_at"] = r["deleted_at"]
                 _save_locked(f, data)
                 return True
         return False
@@ -1038,6 +1145,8 @@ def list_changes(slide, after_seq):
     """返回 change_seq > after_seq 的全部变更（含 tombstone，docs §4.2）。
 
     内部接口，供 session 做 spot 增量注入（§8.4）；不进入 UI 标注层。
+    Stage 3c-1：含评论增删（type=comment）与标注变更（type=annotation）；tombstone
+    标注走 _roi_out 最小字段输出。
     """
     if not isinstance(after_seq, (int, float)):
         after_seq = 0
@@ -1051,7 +1160,19 @@ def list_changes(slide, after_seq):
             cs = r.get("change_seq")
             if cs is None or not isinstance(cs, (int, float)) or cs <= after_seq:
                 continue
-            out.append(dict(r))
+            rr = _roi_out(r)
+            rr.setdefault("type", "annotation")
+            out.append(rr)
+        # 评论增删事件（type=comment）
+        for c in data.get("comments", []):
+            if c.get("slide") != slide:
+                continue
+            cs = c.get("change_seq")
+            if cs is None or not isinstance(cs, (int, float)) or cs <= after_seq:
+                continue
+            cc = dict(c)
+            cc["type"] = "comment"
+            out.append(cc)
         out.sort(key=lambda x: x.get("change_seq", 0))
         return out
 
@@ -1069,11 +1190,13 @@ def current_change_seq(slide):
     return _with_lock("r+", _do)
 
 
-def set_roi_shared(token, index, shared):
+def set_roi_shared(token, index, shared, expected_revision=None):
     """设置该 token 下第 index 条 ROI 的 shared 字段（跳过 tombstone）。
 
     返回是否设置成功（token/index 无效时返回 False，不抛异常）。
     shared 会被归一为 bool 并持久化。
+    expected_revision（Stage 3c-1 CAS）：提供且与当前 revision 不符 → 抛
+    RevisionConflict；不提供则不校验（旧行为兼容）。
     """
     shared_b = bool(shared)
 
@@ -1083,7 +1206,9 @@ def set_roi_shared(token, index, shared):
                 if r["token"] == token and not r.get("deleted")]
         if index < 0 or index >= len(same):
             return False
-        data["rois"][same[index]]["shared"] = shared_b
+        roi = data["rois"][same[index]]
+        _check_cas(roi, expected_revision)
+        roi["shared"] = shared_b
         _save_locked(f, data)
         return True
 
@@ -1100,6 +1225,39 @@ def roi_count_by_token():
                 continue
             counts[r["token"]] = counts.get(r["token"], 0) + 1
         return counts
+
+    return _with_lock("r+", _do)
+
+
+def review_roi(token, index, action):
+    """Stage 3c-1：AI 标注审核（接受/驳回）。
+
+    action ∈ {accept, reject} → review_status 迁移为 accepted/rejected。
+    仅 source=ai 的标注可审（人工标注抛 ValueError）；token/index 无效返回 False。
+    成功返回更新后的 roi dict（含 index/review_status/revision），不 bump
+    change_seq（审核不进标注变更流；但 bump revision + updated_at 便于 CAS）。
+    """
+    if action not in ("accept", "reject"):
+        raise ValueError("action 需为 accept 或 reject")
+
+    def _do(f):
+        data = _load_locked(f)
+        same = [i for i, r in enumerate(data["rois"])
+                if r["token"] == token and not r.get("deleted")]
+        if index < 0 or index >= len(same):
+            return False
+        roi = data["rois"][same[index]]
+        if roi.get("source") != "ai":
+            raise ValueError("仅 AI 标注可审核")
+        roi["review_status"] = "accepted" if action == "accept" else "rejected"
+        roi["revision"] = int(roi.get("revision") or 1) + 1
+        roi["updated_at"] = time.time()
+        _save_locked(f, data)
+        out = _roi_out(roi)
+        all_same = [r for r in data["rois"] if r["token"] == token and not r.get("deleted")]
+        out["index"] = all_same.index(roi)
+        out["shared"] = _roi_shared_compat(roi)
+        return out
 
     return _with_lock("r+", _do)
 
@@ -1138,6 +1296,123 @@ def list_shared_rois_for_slides(slides):
             out.append(rr)
         out.sort(key=lambda x: x.get("ts", 0), reverse=True)
         return out
+
+    return _with_lock("r+", _do)
+
+
+# --------------------------------------------------------------------------- #
+# 评论线程（comments）—— Stage 3c-1（docs §5.3）
+#
+# 标注级评论：挂在某条 annotation 下（annotation_id），一层回复（parent_id 不嵌套）。
+# 字段：comment_id(cmt_)、annotation_id、slide、token、author_user_id(可空=guest)、
+# author_label(展示名快照)、body(≤2000)、parent_id(可空)、resolved/deleted bool、
+# created_at/updated_at、change_seq（变更流用）。
+# 增删 bump change_seq（per-slide 计数器，同 rois），list_changes 以 type=comment 返回。
+# --------------------------------------------------------------------------- #
+def _clean_comment_body(body):
+    """归一化评论正文：非 str → ""；strip 后 ≤2000，否则抛 ValueError。"""
+    if body is None:
+        return ""
+    if not isinstance(body, str):
+        return ""
+    b = body.strip()
+    if len(b) > 2000:
+        raise ValueError("评论正文过长（≤2000 字）")
+    return b
+
+
+def add_comment(annotation_id, slide, token, body, author_user_id=None,
+                author_label="", parent_id=None, requester_role=None):
+    """新增评论；返回 comment dict（含 comment_id/change_seq）。
+
+    annotation_id 为挂靠的标注稳定 id；token 为归属上下文（admin 伪 token 或分享
+    token）；author_user_id 为空表示 guest；author_label 为展示名快照。
+    parent_id 为回复目标评论 id（一层回复，不嵌套）。
+    requester_role：显式传 "guest" 不拒绝（评论是 guest 合法操作；仓储边界只挡
+    图库写），保持 None 即可。
+    """
+    body_clean = _clean_comment_body(body)
+    if not body_clean:
+        raise ValueError("评论正文不能为空")
+    now = time.time()
+    cmt = {
+        "comment_id": "cmt_" + uuid.uuid4().hex,
+        "annotation_id": annotation_id or "",
+        "slide": slide or "",
+        "token": token or "",
+        "author_user_id": author_user_id or None,
+        "author_label": (author_label or "").strip()[:80] or "访客",
+        "body": body_clean,
+        "parent_id": parent_id or None,
+        "resolved": False,
+        "deleted": False,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    def _do(f):
+        data = _load_locked(f)
+        cmt["change_seq"] = _bump_change_seq(data, slide)
+        data["comments"].append(cmt)
+        _save_locked(f, data)
+        return dict(cmt)
+
+    return _with_lock("r+", _do)
+
+
+def list_comments(annotation_id=None, slide=None):
+    """返回评论列表（跳过软删 deleted）。
+
+    可按 annotation_id 或 slide 过滤（两者可组合：同切片下某标注的评论）。
+    不传任何过滤 → 全部。按 created_at 升序（线程阅读顺序）。
+    """
+    def _do(f):
+        data = _load_locked(f)
+        out = []
+        for c in data.get("comments", []):
+            if c.get("deleted"):
+                continue
+            if annotation_id is not None and c.get("annotation_id") != annotation_id:
+                continue
+            if slide is not None and c.get("slide") != slide:
+                continue
+            out.append(dict(c))
+        out.sort(key=lambda x: x.get("created_at", 0))
+        return out
+
+    return _with_lock("r+", _do)
+
+
+def resolve_comment(comment_id, resolved=True):
+    """设置评论 resolved 状态；返回是否成功（评论不存在/已软删 → False）。"""
+    def _do(f):
+        data = _load_locked(f)
+        for c in data.get("comments", []):
+            if c.get("comment_id") == comment_id and not c.get("deleted"):
+                c["resolved"] = bool(resolved)
+                c["updated_at"] = time.time()
+                _save_locked(f, data)
+                return True
+        return False
+
+    return _with_lock("r+", _do)
+
+
+def delete_comment(comment_id):
+    """软删评论（deleted=true + bump change_seq）；返回是否成功。
+
+    重复软删（已 deleted）是 no-op，不再递增 change_seq。
+    """
+    def _do(f):
+        data = _load_locked(f)
+        for c in data.get("comments", []):
+            if c.get("comment_id") == comment_id and not c.get("deleted"):
+                c["deleted"] = True
+                c["updated_at"] = time.time()
+                c["change_seq"] = _bump_change_seq(data, c.get("slide"))
+                _save_locked(f, data)
+                return True
+        return False
 
     return _with_lock("r+", _do)
 
@@ -1479,6 +1754,8 @@ def annotations_by_slide():
                 "created_by_session_id": r.get("created_by_session_id", ""),
                 "change_seq": r.get("change_seq"),
                 "revision": r.get("revision", 1),
+                # Stage 3c-1：AI 审核状态（none|pending|accepted|rejected；旧数据缺省 none）
+                "review_status": r.get("review_status", "none"),
                 # 设备标识短码：同链接不同设备在管理端可区分（旧数据缺省空）
                 "visitor": (r.get("visitor") or "")[:8],
             }

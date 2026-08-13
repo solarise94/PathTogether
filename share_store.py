@@ -68,6 +68,8 @@ _JSON_PUBLIC_NAMES = (
     "PERMISSION_ANNOTATE",
     "PERMISSION_DOWNLOAD",
     "DEFAULT_PERMISSIONS",
+    # —— 异常类（Stage 3c-1 CAS）——
+    "RevisionConflict",
     # —— 函数 ——
     "set_owner_user_id",
     "create_share",
@@ -89,6 +91,11 @@ _JSON_PUBLIC_NAMES = (
     "set_roi_shared",
     "roi_count_by_token",
     "list_shared_rois_for_slides",
+    "review_roi",
+    "add_comment",
+    "list_comments",
+    "resolve_comment",
+    "delete_comment",
     "set_slide_meta",
     "get_slide_meta",
     "get_slide_meta_full",
@@ -190,6 +197,8 @@ _WRITE_NAMES = {
     "set_roi_shared", "set_slide_meta", "record_slide_asset",
     "create_project", "update_project",
     "add_slides_to_project", "remove_slide_from_project", "delete_project",
+    # Stage 3c-1 新增写操作
+    "review_roi", "add_comment", "delete_comment", "resolve_comment",
 }
 
 # result-replay 镜像：凡 json 内部生成身份（token/annotation_id/grant_id/pid）的写，
@@ -210,13 +219,22 @@ _DUAL_MIRRORS = {
     "add_slides_to_project": "_mirror_project",
     "remove_slide_from_project": "_mirror_project",
     "delete_project": "_mirror_project_delete",
+    # Stage 3c-1：review_roi 复用 _mirror_roi（按 annotation_id upsert 完整 roi dict）；
+    # add_comment 自生成 comment_id → 必须按 json 权威 dict upsert；
+    # delete_comment(comment_id)：comment_id 是入参，但 pg 侧需 bump change_seq 产生
+    # comment_delete 事件，故走 result-replay（镜像同时需要 ret=bool 与入参 comment_id）。
+    "review_roi": "_mirror_roi",
+    "add_comment": "_mirror_comment",
+    "delete_comment": "_mirror_comment_delete",
 }
 
 # 同参重放：无内部生成身份，直接同参调 pg。
 #   - set_owner_user_id：标量注入（只是设模块变量），同参即可；
 #   - record_slide_asset：json shim 返回 None（pg-only 概念），asset_id 只存在于
 #     pg，由 pg_fn 自生成，无跨库身份发散问题。
-_DUAL_SAME_ARGS = {"set_owner_user_id", "record_slide_asset"}
+#   - resolve_comment(comment_id)：comment_id 为调用方入参，pg 同参定位即可
+#     （resolved 状态不涉及内部生成身份；change_seq 数值差异属允许实现差）。
+_DUAL_SAME_ARGS = {"set_owner_user_id", "record_slide_asset", "resolve_comment"}
 
 
 def _install_dual_backend():

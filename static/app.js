@@ -2647,6 +2647,37 @@
         });
         row.appendChild(sharedBtn);
 
+        // Stage 3c-1：AI 标注审核状态（接受/驳回）。仅 source=ai 且 pending 显示按钮；
+        // 已 accepted/rejected 显示状态徽章。
+        if (it.source === "ai") {
+          if (it.review_status === "pending") {
+            var acceptBtn = document.createElement("button");
+            acceptBtn.className = "ai-op ai-review-accept";
+            acceptBtn.textContent = t("anno.review.accept");
+            acceptBtn.title = t("anno.review.accept.tip");
+            acceptBtn.addEventListener("click", function (ev) {
+              ev.stopPropagation();
+              reviewAnnotation(it, "accept");
+            });
+            row.appendChild(acceptBtn);
+            var rejectBtn = document.createElement("button");
+            rejectBtn.className = "ai-op ai-review-reject";
+            rejectBtn.textContent = t("anno.review.reject");
+            rejectBtn.title = t("anno.review.reject.tip");
+            rejectBtn.addEventListener("click", function (ev) {
+              ev.stopPropagation();
+              reviewAnnotation(it, "reject");
+            });
+            row.appendChild(rejectBtn);
+          } else if (it.review_status === "accepted" || it.review_status === "rejected") {
+            var revBadge = document.createElement("span");
+            revBadge.className = "anno-review-badge " + it.review_status;
+            revBadge.textContent = t(it.review_status === "accepted"
+              ? "anno.review.accepted" : "anno.review.rejected");
+            row.appendChild(revBadge);
+          }
+        }
+
         // AI 动作（P1-6）：所有带 annotation_id 的标注都挂 fork「快速问答」+ branch
         // 「从此处深读」两个小按钮（图标+短文字），不再按 source 区分。fork 轻量就地
         // 展开；branch 进 AI 面板开/续分支会话（复用既有或新建）。
@@ -2754,6 +2785,34 @@
   }
 
   // 切换某标注的「公开」状态（策展）
+  // Stage 3c-1：AI 标注审核（接受/驳回）。POST review → 刷新当前切片标注。
+  function reviewAnnotation(it, action) {
+    var token = it.token;
+    if (!token) { toast(t("anno.no.src.token"), "error"); return; }
+    resolveIndexFast(it)
+      .then(function (index) {
+        return apiFetch(
+          "/api/annotation/" + encodeURIComponent(token) + "/" + index + "/review",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: action }),
+          }
+        ).then(function (r) {
+          if (!r.ok) return r.json().then(function (j) {
+            throw new Error(j.error || (t("anno.update.fail") + " " + r.status));
+          });
+          return r.json();
+        });
+      })
+      .then(function () {
+        toast(t(action === "accept" ? "anno.review.accepted" : "anno.review.rejected"),
+              "success");
+        refreshCurrentAnnotations();
+      })
+      .catch(function (e) { toast(e.message || t("anno.update.fail"), "error"); });
+  }
+
   function toggleAnnoShared(it, btnEl, rowEl) {
     var token = it.token;
     if (!token) { toast(t("anno.no.src.token"), "error"); return; }

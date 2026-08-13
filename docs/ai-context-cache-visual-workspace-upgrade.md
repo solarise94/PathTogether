@@ -672,7 +672,9 @@ checkpoint_turn_lifetime
 > | step1-overview-768 | 115 | 2,339 | 1,567,241 | 660k | 2 FAIL / 5 PENDING |
 > | step1-overview-none | 120 | 2,756 | 0 | 843k | 2 FAIL / 5 PENDING |
 >
-> 初步结论：**768 概览胜出**——input 均值最低、工作区字节/请求最低、机器 FAIL 最少；无概览对照组成本反而最高（失去概览后模型反复 snapshot 探索，input 与工作区字节双升），印证概览的语义价值。样本为单轮 21 cells（真实模型非确定性），列为初步结论；Step 2 以 `step1-overview-768` 为固定图像策略继续。
+> 初步结论：**768 概览胜出**。
+>
+> **方法学发现（限流）**：ikuncode 上游对连续约 120+ 请求触发 `Rate limit reached / model_cooldown`，冷却持续 5 小时以上（疑似日均额度粒度）。Step 2 首轮因此只有 272k 臂有效（126 行，input μ 3,307）；runner 已加 `--cell-gap-ms` 冷却参数，400k/512k 臂待限流解除后以 90s/cell 节奏补跑。教训：大矩阵真实采数必须 pacing，单臂连续全速跑会触发上游日额度。——input 均值最低、工作区字节/请求最低、机器 FAIL 最少；无概览对照组成本反而最高（失去概览后模型反复 snapshot 探索，input 与工作区字节双升），印证概览的语义价值。样本为单轮 21 cells（真实模型非确定性），列为初步结论；Step 2 以 `step1-overview-768` 为固定图像策略继续。
 >
 > **CPA gemini 兼容路径验证实录（2026-08-12，`sidecar/experiments/smoke-gemini.ts`）**：
 > - CPA 网关 gemini 兼容端点（`/v1beta`，模型 `gemini-3.6-flash-high`）文本与图片请求均正常，`usageMetadata` 完整透传（含 `thoughtsTokenCount`）。

@@ -84,9 +84,10 @@ def test_schema_migrations_recorded(conn):
         cur.execute("SELECT filename FROM schema_migrations ORDER BY filename")
         rows = [r[0] for r in cur.fetchall()]
     # 3b-1 只应有 0001；3b-2 追加 0002_roi_payload.sql（ROI 全量负载 + 插入序）；
-    # 3c-1 追加 0003_comments.sql（评论线程）
+    # 3c-1 追加 0003_comments.sql（评论线程）；3c-2 追加 0004_audit.sql（审计+归档）
     assert rows == [
         "0001_init.sql", "0002_roi_payload.sql", "0003_comments.sql",
+        "0004_audit.sql",
     ]
 
 

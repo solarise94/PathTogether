@@ -186,6 +186,9 @@ def _roi_out(roi: dict, index=None, shared=None) -> dict:
         out["shared"] = bool(shared)
     out["note"] = roi.get("note", "")
     out.setdefault("review_status", "none")
+    # Stage 3c-2：历史 AI 标注（source=ai 但无 provenance）输出 partial 标记
+    if roi.get("source") == "ai" and not isinstance(roi.get("provenance"), dict):
+        out["provenance"] = {"partial": True}
     return out
 
 
@@ -447,7 +450,7 @@ def list_grants_for_user(user_id):
 # --------------------------------------------------------------------------- #
 def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note="", visitor=None,
             source=None, created_by_session_id=None, _effect_key=None, owner_user_id=None,
-            requester_role=None, **geom):
+            requester_role=None, provenance=None, **geom):
     """为 token 的 share 添加一条标注；统一入口，支持 rect/arrow/freehand。
 
     语义与 json 完全一致（含 WAL effect_key 幂等、index 语义、source 推断）。
@@ -529,6 +532,9 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
                 }
                 if _effect_key:
                     roi["effect_key"] = _effect_key
+                # Stage 3c-2：AI 溯源子对象（仅 AI 写入，且仅当传入非空 dict 才落）
+                if src == "ai" and isinstance(provenance, dict) and provenance:
+                    roi["provenance"] = dict(provenance)
                 roi.update(norm)
                 roi["change_seq"] = _bump_change_seq(
                     cur, slide, token, roi["annotation_id"], "add")
@@ -1136,6 +1142,7 @@ def create_project(name, note="", slides=None, owner_user_id=None, requester_rol
         "slides": uniq,
         "created_at": now,
         "owner_user_id": owner_user_id or _OWNER_USER_ID or None,
+        "archived": False,  # Stage 3c-2：归档纯只读开关，默认未归档
     }
     conn = _connect()
     try:
@@ -1157,7 +1164,7 @@ def create_project(name, note="", slides=None, owner_user_id=None, requester_rol
 
 
 _PROJ_SEL = (
-    "project_id, name, note, owner_user_id, "
+    "project_id, name, note, owner_user_id, archived, "
     "extract(epoch from created_at)::float8 AS created_at"
 )
 
@@ -1714,15 +1721,17 @@ def _mirror_project(ret, *a, **k):
                 if cur.fetchone() is None:
                     cur.execute(
                         "INSERT INTO projects (project_id, name, note, owner_user_id, "
-                        "created_at) VALUES (%s,%s,%s,%s, to_timestamp(%s))",
+                        "created_at, archived) VALUES (%s,%s,%s,%s, to_timestamp(%s), %s)",
                         (pid, proj.get("name", ""), proj.get("note", ""),
-                         proj.get("owner_user_id"), proj.get("created_at")))
+                         proj.get("owner_user_id"), proj.get("created_at"),
+                         bool(proj.get("archived", False))))
                 else:
                     cur.execute(
-                        "UPDATE projects SET name=%s, note=%s, owner_user_id=%s "
-                        "WHERE project_id=%s",
+                        "UPDATE projects SET name=%s, note=%s, owner_user_id=%s, "
+                        "archived=%s WHERE project_id=%s",
                         (proj.get("name", ""), proj.get("note", ""),
-                         proj.get("owner_user_id"), pid))
+                         proj.get("owner_user_id"), bool(proj.get("archived", False)),
+                         pid))
                 cur.execute("DELETE FROM project_slides WHERE project_id=%s", (pid,))
                 for i, s in enumerate(proj.get("slides") or []):
                     cur.execute(
@@ -1795,5 +1804,123 @@ def _mirror_comment_delete(ret, comment_id, *a, **k):
                     cur, cmt.get("slide"), cmt.get("token"), comment_id,
                     "comment_delete")
                 _update_comment_row(cur, comment_id, cmt)
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 审计日志（audit_events）—— Stage 3c-2（docs §5.3/§6.4）
+#
+# 语义与 json 完全一致：协作操作日志，best-effort（record_audit 内部吞掉写失败），
+# 绝不写密钥/明文密码。pg 侧存 audit_events 表。
+# --------------------------------------------------------------------------- #
+AUDIT_MAX_EVENTS = 5000
+
+
+def record_audit(action, actor_user_id=None, actor_role=None, target_type=None,
+                 target_id=None, slide=None, detail=None, ts=None):
+    """best-effort 追加一条审计事件；写失败吞掉返回 False，绝不抛异常。
+
+    与 json 的 record_audit 同签名同语义（dispatcher 在 dual 下同参重放到 pg，
+    各自生成独立 event_id，跨库 id 无需一致）。detail 绝不存 api_key/明文密码。
+    """
+    ev_id = "aud_" + secrets.token_hex(16)
+    detail = dict(detail) if isinstance(detail, dict) else {}
+    try:
+        conn = _connect()
+        try:
+            with pg_store.transaction(conn) as c:
+                with c.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO audit_events "
+                        "(event_id, ts, actor_user_id, actor_role, action, "
+                        " target_type, target_id, slide, detail) "
+                        "VALUES (%s, to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s)",
+                        (ev_id, ts if ts is not None else time.time(),
+                         actor_user_id or None, actor_role or "",
+                         str(action or ""), target_type or None, target_id or None,
+                         slide or None, psycopg.types.json.Jsonb(detail)),
+                    )
+            return True
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
+def list_audit(limit=50, offset=0, action=None):
+    """返回审计事件（最新在前），支持分页与 action 过滤。owner-only 消费（app.py 鉴权）。"""
+    limit = max(0, int(limit if limit is not None else 50))
+    offset = max(0, int(offset if offset is not None else 0))
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                if action:
+                    cur.execute(
+                        "SELECT event_id, actor_user_id, actor_role, action, "
+                        " target_type, target_id, slide, detail, "
+                        " extract(epoch from ts)::float8 AS ts "
+                        "FROM audit_events WHERE action=%s "
+                        "ORDER BY ts DESC, event_id DESC LIMIT %s OFFSET %s",
+                        (action, limit, offset))
+                else:
+                    cur.execute(
+                        "SELECT event_id, actor_user_id, actor_role, action, "
+                        " target_type, target_id, slide, detail, "
+                        " extract(epoch from ts)::float8 AS ts "
+                        "FROM audit_events "
+                        "ORDER BY ts DESC, event_id DESC LIMIT %s OFFSET %s",
+                        (limit, offset))
+                rows = cur.fetchall()
+        out = []
+        for r in rows:
+            ev = {
+                "id": r["event_id"],
+                "ts": r["ts"],
+                "actor_user_id": r["actor_user_id"],
+                "actor_role": r["actor_role"],
+                "action": r["action"],
+                "target_type": r["target_type"],
+                "target_id": r["target_id"],
+                "slide": r["slide"],
+                "detail": r["detail"] or {},
+            }
+            out.append(ev)
+        return out
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 项目归档只读开关（docs §v1.5）
+# --------------------------------------------------------------------------- #
+def set_project_archived(pid, archived):
+    """设置项目 archived 纯只读开关。返回更新后的项目 dict；不存在返回 None。"""
+    archived_b = bool(archived)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute("UPDATE projects SET archived=%s WHERE project_id=%s",
+                            (archived_b, pid))
+                if cur.rowcount == 0:
+                    return None
+                return _fetch_project(cur, pid)
+    finally:
+        conn.close()
+
+
+def archived_slide_names():
+    """返回属于任意 archived 项目的切片名集合（归档只读判定用）。"""
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT ps.slide FROM project_slides ps "
+                    "JOIN projects p ON p.project_id=ps.project_id "
+                    "WHERE p.archived=TRUE")
+                return {r["slide"] for r in cur.fetchall()}
     finally:
         conn.close()

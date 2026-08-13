@@ -59,6 +59,7 @@ if _RUN_PG:
     _BUSINESS_TABLES = (
         "rois", "change_log", "grants", "shares",
         "project_slides", "projects", "slide_assets", "slides", "users",
+        "audit_events",
     )
 
     @pytest.fixture(scope="session")

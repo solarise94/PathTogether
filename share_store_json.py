@@ -35,6 +35,8 @@ _EMPTY = {
     "change_seq_by_slide": {},
     "grants": [],
     "comments": [],
+    # Stage 3c-2：协作操作审计日志（顶层数组，封顶 AUDIT_MAX_EVENTS 条丢最旧）
+    "audit": [],
 }
 
 # 支持的标注类型
@@ -272,6 +274,14 @@ def _load_locked(f):
             data["grants"] = []
         if not isinstance(data["comments"], list):
             data["comments"] = []
+        # 向后兼容：旧文件无 audit 时补 []（Stage 3c-2 审计日志）
+        data.setdefault("audit", [])
+        if not isinstance(data["audit"], list):
+            data["audit"] = []
+        # 向后兼容：旧项目无 archived 字段 → 默认 false（未归档，纯只读开关，docs §v1.5）
+        for _proj in data.get("projects", {}).values():
+            if isinstance(_proj, dict) and _proj.get("archived") is None:
+                _proj["archived"] = False
         # 存量 ROI 一次性迁移（补 annotation_id/change_seq/revision/source/deleted）
         # 迁移若改动数据，缓存给 _with_lock 用于补落盘
         changed = _ensure_roi_identity(data)
@@ -296,7 +306,7 @@ def _load_locked(f):
 def _copy_empty():
     """返回一个新的空结构（避免共享引用）。"""
     return {"shares": {}, "rois": [], "projects": {}, "slide_meta": {},
-            "change_seq_by_slide": {}, "grants": [], "comments": []}
+            "change_seq_by_slide": {}, "grants": [], "comments": [], "audit": []}
 
 
 # --------------------------------------------------------------------------- #
@@ -409,6 +419,10 @@ def _roi_out(roi, index=None, shared=None):
         out["shared"] = bool(shared)
     out["note"] = roi.get("note", "")
     out.setdefault("review_status", "none")
+    # Stage 3c-2：历史 AI 标注（source=ai 但无 provenance）输出 partial 标记，
+    # 供前端/审计识别「早期无溯源」的 AI 标注（docs §6.4）。
+    if roi.get("source") == "ai" and not isinstance(roi.get("provenance"), dict):
+        out["provenance"] = {"partial": True}
     return out
 
 
@@ -831,7 +845,7 @@ def _clean_note(note):
 
 def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note="", visitor=None,
             source=None, created_by_session_id=None, _effect_key=None, owner_user_id=None,
-            requester_role=None, **geom):
+            requester_role=None, provenance=None, **geom):
     """为 token 的 share 添加一条标注；统一入口，支持 rect/arrow/freehand。
 
     管理员标注使用 token="admin"（此时 share 校验放宽：不要求 token 命中 shares，
@@ -847,6 +861,9 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
     其余 → "human"）。created_by_session_id：AI 落标时所属 session（可选）。
     _effect_key：WAL 幂等键（docs §5.4）；同一键已落标时复用返回（不重复写入），
     幂等检查与写入在同一 share_store 锁临界区内完成。
+    provenance（Stage 3c-2，docs §6.4）：AI 写回时的溯源子对象
+    {plugin_id, plugin_version, run_id, model, provider, created_by_user_id,
+     slide_asset_revision, idempotency_key}。人工标注不传。
 
     返回新增的 roi dict（含该 token 下的 index，从 0 起按时间顺序，以及 shared/note、
     annotation_id/change_seq 等）。若校验失败抛出 ValueError。
@@ -915,6 +932,9 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
         }
         if _effect_key:
             roi["effect_key"] = _effect_key
+        # Stage 3c-2：AI 溯源子对象（仅 AI 写入，且仅当传入非空 dict 才落）
+        if src == "ai" and isinstance(provenance, dict) and provenance:
+            roi["provenance"] = dict(provenance)
         roi.update(norm)
         data["rois"].append(roi)
         _save_locked(f, data)
@@ -1567,6 +1587,7 @@ def create_project(name, note="", slides=None, owner_user_id=None, requester_rol
         "slides": uniq,
         "created_at": now,
         "owner_user_id": owner_user_id or _OWNER_USER_ID or None,
+        "archived": False,  # Stage 3c-2：归档纯只读开关，默认未归档
     }
 
     def _do(f):
@@ -1693,6 +1714,45 @@ def delete_project(pid):
     return _with_lock("r+", _do)
 
 
+def set_project_archived(pid, archived):
+    """Stage 3c-2（docs §v1.5）：设置项目 archived 纯只读开关。
+
+    archived=True → 该项目切片对所有身份（含 owner）只读（解除归档才可写）。
+    返回更新后的项目 dict；不存在返回 None。
+    """
+    archived_b = bool(archived)
+    def _do(f):
+        data = _load_locked(f)
+        proj = data["projects"].get(pid)
+        if proj is None:
+            return None
+        proj["archived"] = archived_b
+        _save_locked(f, data)
+        out = dict(proj)
+        out["pid"] = pid
+        return out
+
+    return _with_lock("r+", _do)
+
+
+def archived_slide_names():
+    """返回属于任意 archived 项目的切片名集合（归档只读判定用）。
+
+    某切片只要出现在任一归档项目内即视为只读（不区分来源项目）。
+    """
+    def _do(f):
+        data = _load_locked(f)
+        out = set()
+        for proj in data.get("projects", {}).values():
+            if isinstance(proj, dict) and proj.get("archived"):
+                for s in proj.get("slides", []):
+                    if isinstance(s, str):
+                        out.add(s)
+        return out
+
+    return _with_lock("r+", _do)
+
+
 # --------------------------------------------------------------------------- #
 # 标注（annotations）汇总 —— 把 rois 按 slide/label 聚合，供管理员查看
 # --------------------------------------------------------------------------- #
@@ -1811,3 +1871,79 @@ def resolve_slide_ref(name):
 def record_slide_asset(slide_id, legacy_revision):
     """JSON 后端无 slide_assets 表：返回 None（纯兼容形状）。"""
     return None
+
+
+# --------------------------------------------------------------------------- #
+# 审计日志（audit_events）—— Stage 3c-2（docs §5.3/§6.4）
+#
+# 协作操作日志（非医疗审计）：分享建/撤/claim、标注增删改/审核、评论增删、
+# 用户建/禁/启、AI 起跑（ai.run）、分享访问（share.access）。绝不在 detail 里写
+# 密钥/明文密码（脱敏见测试 test_audit_events.py）。
+#
+# record_audit 为 best-effort：**本函数内部**吞掉一切写失败（返回 False），调用方
+# 无需用 try 包裹即可安全调用、不阻断主流程。理由：审计是辅助记录，不应因日志失败
+# 破坏业务主链路；且 app.py / share_server.py 是在各自端点**写完业务后**再独立调用
+# 本函数（不在业务锁内嵌套调用），从根上规避死锁，见各调用处注释。
+# --------------------------------------------------------------------------- #
+AUDIT_MAX_EVENTS = 5000
+
+
+def record_audit(action, actor_user_id=None, actor_role=None, target_type=None,
+                 target_id=None, slide=None, detail=None, ts=None):
+    """best-effort 追加一条审计事件；写失败吞掉返回 False，绝不抛异常。
+
+    action 为枚举字符串（见 docs：share.create/share.revoke/share.claim/
+    share.access/annotation.add/annotation.update/annotation.delete/review/
+    comment.add/comment.delete/user.create/user.disable/user.enable/ai.run）。
+    detail 为少量上下文 dict（默认 {}）；**绝不在此放 api_key / 明文密码**。
+    """
+    ev = {
+        "id": "aud_" + uuid.uuid4().hex,
+        "ts": ts if ts is not None else time.time(),
+        "actor_user_id": actor_user_id or None,
+        "actor_role": actor_role or "",
+        "action": str(action or ""),
+        "target_type": target_type or None,
+        "target_id": target_id or None,
+        "slide": slide or None,
+        "detail": dict(detail) if isinstance(detail, dict) else {},
+    }
+
+    def _do(f):
+        data = _load_locked(f)
+        events = data.setdefault("audit", [])
+        if not isinstance(events, list):
+            events = []
+            data["audit"] = events
+        events.append(ev)
+        if len(events) > AUDIT_MAX_EVENTS:
+            del events[: len(events) - AUDIT_MAX_EVENTS]
+        _save_locked(f, data)
+        return True
+
+    try:
+        return _with_lock("r+", _do)
+    except Exception:
+        return False
+
+
+def list_audit(limit=50, offset=0, action=None):
+    """返回审计事件（最新在前），支持分页与 action 过滤。owner-only 消费（app.py 鉴权）。
+
+    limit 默认 50，offset 默认 0；action 传字符串时精确过滤。
+    """
+    limit = max(0, int(limit if limit is not None else 50))
+    offset = max(0, int(offset if offset is not None else 0))
+
+    def _do(f):
+        data = _load_locked(f)
+        events = data.get("audit") or []
+        if not isinstance(events, list):
+            events = []
+        if action:
+            events = [e for e in events if e.get("action") == action]
+        # 最新在前（按 ts 倒序，同 ts 按插入倒序）
+        events = list(reversed(events))
+        return events[offset:offset + limit]
+
+    return _with_lock("r+", _do)

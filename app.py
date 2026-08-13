@@ -800,9 +800,17 @@ def _claimed_slides(uid):
     return share_store.claimed_active_slides_for_user(uid)
 
 
-def can_upload():
-    """owner/user 可上传；guest 不可。"""
-    return current_identity()["role"] in (user_store.ROLE_OWNER, user_store.ROLE_USER)
+def can_upload(slide=None):
+    """owner/user 可上传；guest 不可。
+
+    Stage 3c-2（docs §v1.5）：归档项目内的切片只读，owner 亦不可写——上传/覆盖
+    指定切片时若属于归档项目返回 False（解除归档才可）。
+    """
+    if current_identity()["role"] not in (user_store.ROLE_OWNER, user_store.ROLE_USER):
+        return False
+    if slide and slide in _archived_slide_names():
+        return False
+    return True
 
 
 def can_view_slide(name):
@@ -829,7 +837,13 @@ def can_delete_slide(name):
 
 
 def can_annotate_slide(name):
-    """owner 全量；user = 自己的 ∪ 协作切片（不含纯公开只读）。"""
+    """owner 全量；user = 自己的 ∪ 协作切片（不含纯公开只读）。
+
+    Stage 3c-2（docs §v1.5）：归档项目内的切片对**所有身份**（含 owner）只读——
+    命中归档切片返回 False（解除归档才可标注）。
+    """
+    if name in _archived_slide_names():
+        return False
     ident = current_identity()
     if ident["role"] == user_store.ROLE_OWNER:
         return True
@@ -893,6 +907,30 @@ def _denied(msg="无权访问"):
     return jsonify(error=msg), 403
 
 
+def _audit(action, target_type=None, target_id=None, slide=None, detail=None):
+    """best-effort 记一条协作审计事件（Stage 3c-2）。
+
+    record_audit 自身吞写失败，这里不额外 try；在**业务写完成后**、独立于业务锁
+    调用（不嵌套在 store 锁内），避免死锁。actor 取当前身份；AUTH_ENABLED=False
+    时 role 归一 owner。
+    """
+    ident = current_identity()
+    share_store.record_audit(
+        action=action,
+        actor_user_id=ident.get("user_id"),
+        actor_role=ident.get("role"),
+        target_type=target_type,
+        target_id=target_id,
+        slide=slide,
+        detail=detail,
+    )
+
+
+def _archived_slide_names():
+    """属于归档项目的切片名集合（归档只读判定，docs §v1.5）。"""
+    return share_store.archived_slide_names()
+
+
 # --------------------------------------------------------------------------- #
 # owner 用户管理（Stage 3a 身份基础；注册默认关闭，docs §19-12）
 # --------------------------------------------------------------------------- #
@@ -938,6 +976,7 @@ def api_admin_users_create():
         if "已存在" in msg:
             return jsonify(error=msg), 409
         return jsonify(error=msg), 400
+    _audit("user.create", target_type="user", target_id=user.get("user_id"))
     return jsonify(user)
 
 
@@ -955,6 +994,7 @@ def api_admin_users_disable(user_id):
         if user_store.count_owners() <= 1:
             return jsonify(error="不能禁用最后一个启用中的 owner"), 400
     user = user_store.set_user_disabled(user_id, True)
+    _audit("user.disable", target_type="user", target_id=user_id)
     return jsonify(user)
 
 
@@ -967,6 +1007,7 @@ def api_admin_users_enable(user_id):
     user = user_store.set_user_disabled(user_id, False)
     if user is None:
         return jsonify(error="用户不存在"), 404
+    _audit("user.enable", target_type="user", target_id=user_id)
     return jsonify(user)
 
 
@@ -993,6 +1034,31 @@ def api_admin_users_password(user_id):
     if user is None:
         return jsonify(error="用户不存在"), 404
     return jsonify(user)
+
+
+@app.route("/api/admin/audit", methods=["GET"])
+def api_admin_audit():
+    """读取协作操作审计日志（Stage 3c-2）。仅 owner。
+
+    query: limit（缺省 50）、offset（缺省 0）、action（可选精确过滤）。
+    返回 {events: [...], limit, offset}，最新在前。
+    """
+    auth = _require_owner()
+    if auth:
+        return auth
+    try:
+        limit = int(request.args.get("limit", "50") or "50")
+    except (TypeError, ValueError):
+        limit = 50
+    try:
+        offset = int(request.args.get("offset", "0") or "0")
+    except (TypeError, ValueError):
+        offset = 0
+    limit = min(max(limit, 0), 500)
+    offset = max(offset, 0)
+    action = request.args.get("action") or None
+    events = share_store.list_audit(limit=limit, offset=offset, action=action)
+    return jsonify(events=events, limit=limit, offset=offset)
 
 
 @app.route("/api/slides")
@@ -2405,6 +2471,31 @@ def _slide_fingerprint(safe: str) -> str:
         return ""
 
 
+def _legacy_slide_revision(safe: str) -> str:
+    """切片 legacy_revision（mtime:size，docs §6.4）。
+
+    demo 规模下用它近似 slide_asset_revision；内容 sha 留 Stage 4 二进制 transport。
+    文件不存在返回空串（sidecar 校验时不会误匹配）。
+    """
+    p = UPLOAD_DIR / safe
+    try:
+        st = p.stat()
+        return "{}:{}".format(st.st_mtime_ns, st.st_size)
+    except Exception:
+        return ""
+
+
+def _provider_host(base_url: str) -> str:
+    """从 base_url 提取 host 作为 provider 溯源（不记全 URL 不记 key）。"""
+    if not base_url:
+        return ""
+    from urllib.parse import urlparse
+    try:
+        return urlparse(base_url).netloc or base_url[:64]
+    except Exception:
+        return base_url[:64]
+
+
 def _overlay_coord_ticks(img, x0, y0, w0, h0):
     """在 AI 快照图像顶缘/左缘画 level-0 坐标刻度（视觉尺子）。
 
@@ -2648,9 +2739,16 @@ def internal_ai_region():
 def internal_ai_annotate():
     """sidecar 落矩形标注（写入标注库，管理员可见可编辑）。
 
-    body: {slide, label, x, y, side_px, note, effect_key, session_id}。
+    body: {slide, label, x, y, side_px, note, effect_key, session_id}，可选
+    溯源字段：plugin_id/plugin_version/run_id/model/provider/created_by_user_id/
+    slide_asset_revision/expected_asset_revision（sidecar 本节点不改，Flask 侧
+    容忍缺省，缺的字段留空串）。
     调 share_store.add_roi(ADMIN_TOKEN, ...)（含 _effect_key 幂等、source="ai"）。
     返回 add_roi 的 roi dict（含 annotation_id/index）。
+
+    Stage 3c-2（docs §6.4）：仅当请求显式带 expected_asset_revision 且与当前
+    切片 legacy_revision（mtime:size）不符时，返回 409 slide_revision_conflict
+    （不静默写、不强制，兼容现状 sidecar）。
     """
     auth = _require_internal()
     if auth:
@@ -2690,16 +2788,43 @@ def internal_ai_annotate():
     effect_key = body.get("effect_key") or ""
     session_id = body.get("session_id") or ""
     # slide 文件名合法性（_safe_name 失败会 abort 400/404）
-    _safe_name(slide)
+    safe = _safe_name(slide)
+
+    # Stage 3c-2：slide_asset_revision 冲突校验（仅显式带 expected_asset_revision 时）
+    expected_asset_revision = body.get("expected_asset_revision")
+    if expected_asset_revision is not None and str(expected_asset_revision) != "":
+        cur_rev = _legacy_slide_revision(safe)
+        if str(expected_asset_revision) != cur_rev:
+            return jsonify(
+                error="slide_revision_conflict",
+                current_slide_asset_revision=cur_rev,
+            ), 409
+
+    # Stage 3c-2：AI 溯源子对象（缺省字段留空串，sidecar 容忍）
+    provenance = {
+        "plugin_id": body.get("plugin_id") or "histopilot",
+        "plugin_version": body.get("plugin_version") or "",
+        "run_id": body.get("run_id") or "",
+        "session_id": body.get("session_id") or "",
+        "model": body.get("model") or "",
+        # provider = base_url host 即可（不记全 URL 不记 key）
+        "provider": _provider_host(body.get("base_url") or body.get("provider") or ""),
+        "created_by_user_id": body.get("created_by_user_id") or "",
+        "slide_asset_revision": _legacy_slide_revision(safe),
+        "idempotency_key": effect_key or "",
+    }
     try:
         roi = share_store.add_roi(
-            share_store.ADMIN_TOKEN, slide, label, type="rect", note=note,
+            share_store.ADMIN_TOKEN, safe, label, type="rect", note=note,
             x=int(x), y=int(y), side_px=side_px,
             source="ai", created_by_session_id=session_id,
             _effect_key=effect_key or None,
+            provenance=provenance,
         )
     except ValueError as e:
         return jsonify(error="落标注失败：{}".format(e)), 400
+    _audit("annotation.add", target_type="annotation", target_id=roi.get("annotation_id"),
+           slide=safe, detail={"source": "ai"})
     return jsonify(roi)
 
 
@@ -2792,6 +2917,7 @@ def api_ai_run():
     # JSON body 与 query 双重兼容（前端历史上把 fresh=1 放在 query）
     if bool(body.get("fresh")) or request.args.get("fresh") == "1":
         payload["fresh"] = True
+    _audit("ai.run", target_type="session", slide=slide, detail={"mode": "run"})
     return _proxy_sse("/run", payload)
 
 
@@ -2820,6 +2946,7 @@ def api_ai_continue():
     # 任意会话，sidecar acquire 守卫对无 owner 注入的 run 不生效）；内网模式不注入。
     if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
         config["session_owner"] = user_ctx["user_id"]
+    _audit("ai.run", target_type="session", slide=slide, detail={"mode": "continue"})
     return _proxy_sse("/continue", payload)
 
 
@@ -2855,6 +2982,8 @@ def api_ai_ask():
     question = body.get("question")
     if isinstance(question, str):
         payload["question"] = question
+    _audit("ai.run", target_type="session", target_id=annotation_id, slide=slide,
+           detail={"mode": "ask"})
     return _proxy_sse("/ask", payload)
 
 
@@ -2891,6 +3020,8 @@ def api_ai_branch():
     question = body.get("question")
     if isinstance(question, str):
         payload["question"] = question
+    _audit("ai.run", target_type="session", target_id=annotation_id, slide=slide,
+           detail={"mode": "branch"})
     return _proxy_sse("/branch", payload)
 
 
@@ -3182,6 +3313,8 @@ def api_share_create():
     except (ValueError, PermissionError) as e:
         return jsonify(error=str(e)), 400
     url = SHARE_BASE_URL + "/s/" + share["token"]
+    _audit("share.create", target_type="share", target_id=share["token"],
+           detail={"slide_count": len(clean)})
     return jsonify(
         token=share["token"],
         url=url,
@@ -3223,6 +3356,7 @@ def api_share_revoke():
     ok = share_store.revoke_share(token)
     if not ok:
         return jsonify(error="分享不存在"), 404
+    _audit("share.revoke", target_type="share", target_id=token)
     return jsonify(ok=True)
 
 
@@ -3262,6 +3396,8 @@ def api_share_claim(token):
         grant = share_store.claim_share(token, ident["user_id"], permissions=perms)
     except ValueError as e:
         return jsonify(error=str(e)), 400
+    _audit("share.claim", target_type="grant", target_id=grant.get("grant_id"),
+           slide=None, detail={"share_token": token})
     return jsonify(grant)
 
 
@@ -3419,6 +3555,33 @@ def api_project_delete(pid):
     return jsonify(ok=True)
 
 
+@app.route("/api/project/<pid>/archive", methods=["POST"])
+def api_project_archive(pid):
+    """归档项目（docs §v1.5 纯只读开关）。owner 任意；user 仅自己的项目。
+
+    归档后该项目切片对所有身份（含 owner）只读，解除归档才可写。
+    """
+    if not _can_access_project(pid):
+        return _denied()
+    proj = share_store.set_project_archived(pid, True)
+    if proj is None:
+        return jsonify(error="项目不存在"), 404
+    _audit("project.archive", target_type="project", target_id=pid)
+    return jsonify(proj)
+
+
+@app.route("/api/project/<pid>/unarchive", methods=["POST"])
+def api_project_unarchive(pid):
+    """解除归档（docs §v1.5）。owner 任意；user 仅自己的项目。"""
+    if not _can_access_project(pid):
+        return _denied()
+    proj = share_store.set_project_archived(pid, False)
+    if proj is None:
+        return jsonify(error="项目不存在"), 404
+    _audit("project.unarchive", target_type="project", target_id=pid)
+    return jsonify(proj)
+
+
 @app.route("/api/annotations")
 def api_annotations():
     """返回标注（按 slide 或 project 过滤），供查看器加载某切片的标记。
@@ -3455,6 +3618,38 @@ def api_annotations():
     visible = _visible_slide_names()
     filtered = {s: v for s, v in by_slide.items() if s in visible}
     return jsonify({"by_slide": filtered})
+
+
+@app.route("/api/annotations/changes")
+def api_annotations_changes():
+    """正式事件 cursor（Stage 3c-2 强化，docs §4.2）。
+
+    query: slide（必填）、after（缺省 0）。
+    返回 {cursor, changes[], reset_required}：
+      - cursor = 该切片最新 change_seq（json：per-slide 计数器 / pg：全局 change_log seq）
+      - changes = change_seq > after 的全部变更（含 tombstone / 评论，带 type）
+      - reset_required：after 超出可读水位（json 结构被截断 / pg 无早期行）时为 True，
+        消费方应丢弃本地缓存、从 0 全量重拉。
+    鉴权同标注（can_view_slide）。
+    """
+    slide = request.args.get("slide")
+    if not slide:
+        return jsonify(error="缺少 slide"), 400
+    safe = _sanitize_name(slide)
+    if not safe or safe != slide:
+        return jsonify(error="非法文件名"), 400
+    if not can_view_slide(safe):
+        return _denied()
+    try:
+        after = int(float(request.args.get("after", "0") or "0"))
+    except (TypeError, ValueError):
+        after = 0
+    after = max(0, after)
+    cur = share_store.current_change_seq(safe)
+    changes = share_store.list_changes(safe, after)
+    # after 超出可读水位 → reset_required（json 截断/丢最旧；pg 无该早期行）
+    reset_required = bool(after > cur)
+    return jsonify({"cursor": cur, "changes": changes, "reset_required": reset_required})
 
 
 # --------------------------------------------------------------------------- #
@@ -3550,6 +3745,8 @@ def api_annotation_add():
         )
     except (ValueError, PermissionError) as e:
         return jsonify(error=str(e)), 400
+    _audit("annotation.add", target_type="annotation", target_id=roi.get("annotation_id"),
+           slide=safe, detail={"type": typ, "source": roi.get("source", "human")})
     return jsonify(ok=True, index=roi["index"], shared=roi.get("shared", shared))
 
 
@@ -3588,6 +3785,7 @@ def api_annotation_delete_admin(index):
                        current_revision=e.current_revision), 409
     if not ok:
         return jsonify(error="标注不存在"), 404
+    _audit("annotation.delete", target_type="annotation", target_id=_aid, slide=None)
     return jsonify(ok=True)
 
 
@@ -3613,6 +3811,7 @@ def api_annotation_delete(token, index):
                        current_revision=e.current_revision), 409
     if not ok:
         return jsonify(error="标注不存在"), 404
+    _audit("annotation.delete", target_type="annotation", target_id=_aid, slide=None)
     return jsonify(ok=True)
 
 
@@ -3684,6 +3883,8 @@ def api_annotation_set_shared(token, index):
                 break
         note_after = cur.get("note", "") if cur else ""
 
+    _audit("annotation.update", target_type="annotation", slide=None,
+           detail={"shared_after": shared_after})
     return jsonify(ok=True, shared=shared_after, note=note_after)
 
 
@@ -3750,6 +3951,8 @@ def api_annotation_comment_add(token, index):
             parent_id=parent_id)
     except ValueError as e:
         return jsonify(error=str(e)), 400
+    _audit("comment.add", target_type="comment", target_id=cmt.get("comment_id"),
+           slide=roi.get("slide"), detail={"parent_id": parent_id or None})
     return jsonify(ok=True, comment=cmt)
 
 
@@ -3794,6 +3997,8 @@ def api_comment_delete(comment_id):
     ok = share_store.delete_comment(comment_id)
     if not ok:
         return jsonify(error="评论不存在"), 404
+    _audit("comment.delete", target_type="comment", target_id=comment_id,
+           slide=target.get("slide"))
     return jsonify(ok=True)
 
 
@@ -3816,6 +4021,9 @@ def api_annotation_review(token, index):
         return jsonify(error=str(e)), 400
     if updated is False:
         return jsonify(error="标注不存在"), 404
+    _audit("review", target_type="annotation", target_id=roi.get("annotation_id"),
+           slide=roi.get("slide"), detail={"action": action,
+                                            "review_status": updated.get("review_status")})
     return jsonify(ok=True, review_status=updated.get("review_status"),
                    revision=updated.get("revision"))
 

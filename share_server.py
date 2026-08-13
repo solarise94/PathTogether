@@ -274,6 +274,62 @@ def _share_has_annotate(share):
 
 
 # --------------------------------------------------------------------------- #
+# Stage 3c-2：分享访问日志 + 归档只读（docs §5.4/§v1.5）
+# --------------------------------------------------------------------------- #
+# 分享访问日志：/s/<token> 页面加载与 /s/<token>/api/* 关键调用记 audit
+# （action=share.access，detail 带 visitor 与 IP 后两段脱敏）。
+# 为防每请求一条太密，按「同 token + 同 visitor」做 5 分钟窗口去重：内存 dict
+# {token+"|"+visitor: last_ts}，窗口内同键不再重复记。简单可靠，无需持久化状态。
+_SHARE_ACCESS_WINDOW = 300.0
+_share_access_last: dict = {}
+_share_access_lock = threading.Lock()
+
+
+def _mask_ip(ip: str) -> str:
+    """IP 脱敏：保留前两段（IPv4）或前 6 字符（IPv6），后段用 *。"""
+    if not ip:
+        return ""
+    if ":" in ip:
+        return ip[:6] + "*"
+    parts = ip.split(".")
+    if len(parts) == 4:
+        return ".".join(parts[:2]) + ".*.*"
+    return "*"
+
+
+def _log_share_access(token, detail=None):
+    """best-effort 记一条 share.access 审计事件（5 分钟窗口去重）。
+
+    调用方无需 try（record_audit 自吞失败）。去重键 = token + visitor。
+    """
+    visitor = _visitor_id() or ""
+    key = token + "|" + visitor
+    now = time.time()
+    with _share_access_lock:
+        last = _share_access_last.get(key)
+        if last is not None and (now - last) < _SHARE_ACCESS_WINDOW:
+            return
+        _share_access_last[key] = now
+    d = dict(detail or {})
+    d["visitor"] = visitor[:8] if visitor else ""
+    d["ip"] = _mask_ip(request.remote_addr or "")
+    share_store.record_audit(
+        action="share.access", target_type="share", target_id=token,
+        detail=d,
+    )
+
+
+def _archived_slide_names():
+    """属于归档项目的切片名集合（归档只读判定）。"""
+    return share_store.archived_slide_names()
+
+
+def _reject_archived_slide(share, name):
+    """归档项目内切片只读：guest 亦不可在归档项目内标注/评论。命中 → True。"""
+    return name in _archived_slide_names()
+
+
+# --------------------------------------------------------------------------- #
 # 路由
 # --------------------------------------------------------------------------- #
 @app.errorhandler(404)
@@ -299,7 +355,8 @@ def s_root():
 
 @app.route("/s/<token>")
 def share_page(token):
-    _require_share(token)
+    share = _require_share(token)
+    _log_share_access(token, detail={"via": "page"})
     return render_template("share.html", token=token)
 
 
@@ -478,6 +535,7 @@ def share_slide_thumbnail(token, name):
 @app.route("/s/<token>/api/roi", methods=["POST"])
 def share_roi_add(token):
     share = _require_share(token)
+    _log_share_access(token, detail={"via": "api_roi_add"})
     # 权限三档（docs §5.4）：无 annotate 权限的 token 写标注 403。
     # 旧链接无 permissions 字段 → 默认含 annotate（_share_has_annotate 兼容）。
     if not _share_has_annotate(share):
@@ -499,6 +557,9 @@ def share_roi_add(token):
     safe = _sanitize_name(slide)
     if not safe or safe != slide or safe not in share.get("slides", []):
         return jsonify(error="slide 不属于该分享"), 403
+    # Stage 3c-2（docs §v1.5）：归档项目内切片只读，guest 亦不可标注
+    if _reject_archived_slide(share, safe):
+        return jsonify(error="切片已归档只读"), 403
 
     # 收集几何字段透传给 store 校验
     geom = {}
@@ -545,6 +606,7 @@ def share_roi_update(token, index):
     权限三档（docs §5.4）：无 annotate 权限的 token 写标注 403（旧链接默认含 annotate）。
     """
     share = _require_share(token)
+    _log_share_access(token, detail={"via": "api_roi_update"})
     if not _share_has_annotate(share):
         return jsonify(error="该链接不允许标注"), 403
     body = request.get_json(silent=True) or {}
@@ -558,6 +620,8 @@ def share_roi_update(token, index):
         return jsonify(error="选区不存在"), 404
     if not _roi_owned_by(r, _visitor_id()):
         return jsonify(error="只能编辑自己创建的标记"), 403
+    if _reject_archived_slide(share, r.get("slide")):
+        return jsonify(error="切片已归档只读"), 403
     try:
         updated = share_store.update_roi(
             token, index, geom=geom, note=note, expected_revision=expected)
@@ -625,6 +689,7 @@ def share_roi_delete(token, index):
     权限三档（docs §5.4）：无 annotate 权限的 token 写标注 403（旧链接默认含 annotate）。
     """
     share = _require_share(token)
+    _log_share_access(token, detail={"via": "api_roi_delete"})
     if not _share_has_annotate(share):
         return jsonify(error="该链接不允许标注"), 403
     body = request.get_json(silent=True) or {}
@@ -634,6 +699,8 @@ def share_roi_delete(token, index):
         return jsonify(error="选区不存在"), 404
     if not _roi_owned_by(r, _visitor_id()):
         return jsonify(error="只能编辑自己创建的标记"), 403
+    if _reject_archived_slide(share, r.get("slide")):
+        return jsonify(error="切片已归档只读"), 403
     try:
         ok, _aid = share_store.delete_roi(token, index, expected_revision=expected)
     except share_store.RevisionConflict as e:
@@ -682,6 +749,7 @@ def share_comment_add(token):
     JSON: {annotation_id, body, parent_id?, name?}。
     """
     share = _require_share(token)
+    _log_share_access(token, detail={"via": "api_comment_add"})
     if not _share_has_annotate(share):
         return jsonify(error="该链接不允许评论"), 403
     body = request.get_json(silent=True) or {}
@@ -694,6 +762,9 @@ def share_comment_add(token):
     roi, err = _resolve_anno_in_share(share, annotation_id)
     if err:
         return err
+    # Stage 3c-2（docs §v1.5）：归档项目内切片只读，guest 亦不可评论
+    if _reject_archived_slide(share, roi.get("slide")):
+        return jsonify(error="切片已归档只读"), 403
     try:
         cmt = share_store.add_comment(
             annotation_id, roi.get("slide"), token, text,

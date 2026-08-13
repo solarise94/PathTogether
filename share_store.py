@@ -68,6 +68,7 @@ _JSON_PUBLIC_NAMES = (
     "PERMISSION_ANNOTATE",
     "PERMISSION_DOWNLOAD",
     "DEFAULT_PERMISSIONS",
+    "AUDIT_MAX_EVENTS",  # Stage 3c-2 审计日志封顶条数（两实现一致）
     # —— 异常类（Stage 3c-1 CAS）——
     "RevisionConflict",
     # —— 函数 ——
@@ -113,6 +114,11 @@ _JSON_PUBLIC_NAMES = (
     "delete_project",
     "annotations_by_slide",
     "annotations_by_project",
+    # —— Stage 3c-2：审计日志 / 归档只读 ——
+    "record_audit",
+    "list_audit",
+    "set_project_archived",
+    "archived_slide_names",
 )
 
 #: 需要实时镜像到 JSON 实现的路径配置名（函数体裸全局读取它们）。
@@ -199,6 +205,8 @@ _WRITE_NAMES = {
     "add_slides_to_project", "remove_slide_from_project", "delete_project",
     # Stage 3c-1 新增写操作
     "review_roi", "add_comment", "delete_comment", "resolve_comment",
+    # Stage 3c-2：审计写 / 归档开关
+    "record_audit", "set_project_archived",
 }
 
 # result-replay 镜像：凡 json 内部生成身份（token/annotation_id/grant_id/pid）的写，
@@ -226,6 +234,9 @@ _DUAL_MIRRORS = {
     "review_roi": "_mirror_roi",
     "add_comment": "_mirror_comment",
     "delete_comment": "_mirror_comment_delete",
+    # Stage 3c-2：set_project_archived 返回权威 project dict（含 archived），
+    # 复用 _mirror_project 按 pid 整体 upsert（把 archived 一并镜像）。
+    "set_project_archived": "_mirror_project",
 }
 
 # 同参重放：无内部生成身份，直接同参调 pg。
@@ -234,7 +245,8 @@ _DUAL_MIRRORS = {
 #     pg，由 pg_fn 自生成，无跨库身份发散问题。
 #   - resolve_comment(comment_id)：comment_id 为调用方入参，pg 同参定位即可
 #     （resolved 状态不涉及内部生成身份；change_seq 数值差异属允许实现差）。
-_DUAL_SAME_ARGS = {"set_owner_user_id", "record_slide_asset", "resolve_comment"}
+_DUAL_SAME_ARGS = {"set_owner_user_id", "record_slide_asset", "resolve_comment",
+                   "record_audit"}
 
 
 def _install_dual_backend():

@@ -236,5 +236,23 @@ def test_containerfile_ships_plugin_bundle():
     assert "COPY plugins/ plugins/" in text, "Containerfile 未 COPY plugins/ 目录"
 
 
+def test_containerfile_ships_app_modules():
+    """app.py import 的仓库内模块必须全部进镜像（否则 gunicorn worker 起不来）。
+
+    Stage 3a-1 曾漏 COPY user_store.py → demo 重建后 ModuleNotFoundError。
+    静态扫描 app.py 顶层 import，凡 repo 根有同名 .py 且非 tests/ 的都必须出现
+    在 Containerfile 的 COPY 行里。
+    """
+    cf = (REPO_ROOT / "Containerfile").read_text(encoding="utf-8")
+    src = (REPO_ROOT / "app.py").read_text(encoding="utf-8")
+    mods = set(re.findall(r"^(?:import|from)\s+([a-zA-Z_][\w]*)", src, re.M))
+    missing = []
+    for m in sorted(mods):
+        if (REPO_ROOT / (m + ".py")).is_file() and m != "app":
+            if not re.search(r"^COPY .*\b{}\.py\b".format(re.escape(m)), cf, re.M):
+                missing.append(m)
+    assert not missing, "Containerfile 未 COPY 这些 app.py 依赖模块：%r" % missing
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

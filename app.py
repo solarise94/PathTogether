@@ -12,6 +12,7 @@ import json
 import os
 import secrets
 import shutil
+import sys
 import threading
 import time
 import zipfile
@@ -115,6 +116,52 @@ def _resolve_admin_auth(environ=None):
 
 
 ADMIN_USERNAME, ADMIN_PASSWORD, _AUTH_BY_PASSWORD = _resolve_admin_auth()
+
+
+# --------------------------------------------------------------------------- #
+# PostgreSQL schema 启动接线（Stage 3b-3）
+#
+# STORAGE_BACKEND ∈ {postgres, dual} 时，在用任何仓储之前（先于 _bootstrap_owner
+# 等）确保 PG schema 已就绪：连不上 / 迁移失败 → fail-fast 退出（存储不可用不能
+# 带病启动）。gunicorn 多 worker（-w N、不 preload）并发首启时，ensure_schema 虽
+# 幂等（schema_migrations 记录 + IF NOT EXISTS），仍用 pg_advisory_lock 串行化，
+# 避免并发 DDL 抢跑。json 后端（默认 / AUTH_ENABLED=False）零影响——直接 return。
+# --------------------------------------------------------------------------- #
+# 固定 advisory lock key（任意稳定 bigint；"SVSG" 的 4 字节整数）。
+_PG_SCHEMA_LOCK = 0x53565347
+
+
+def _ensure_pg_schema_or_exit():
+    """postgres/dual 后端启动期 ensure_schema（失败 fail-fast）。json 后端 no-op。"""
+    backend = getattr(share_store, "STORAGE_BACKEND", "json")
+    if backend not in ("postgres", "dual"):
+        return
+    import logging
+    _log = logging.getLogger("svs.startup")
+    try:
+        import pg_store
+        conn = pg_store.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_lock(%s)", (_PG_SCHEMA_LOCK,))
+            try:
+                pg_store.ensure_schema(conn)
+            finally:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(%s)", (_PG_SCHEMA_LOCK,))
+        finally:
+            conn.close()
+    except Exception as exc:
+        # 存储不可用：带病启动比退出更危险（静默退化会让数据写丢），故 fail-fast。
+        sys.stderr.write(
+            "[startup] PostgreSQL schema 初始化失败，拒绝带病启动：%s\n" % exc)
+        raise SystemExit(1)
+    if backend == "dual":
+        _log.warning(
+            "STORAGE_BACKEND=dual：expand 形态，读 json 权威、写镜像 pg（3b-3）")
+
+
+_ensure_pg_schema_or_exit()
 
 
 def _bootstrap_owner(environ=None):

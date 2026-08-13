@@ -101,6 +101,34 @@ if [ -z "${AI_INTERNAL_TOKEN:-}" ]; then
 fi
 
 # --------------------------------------------------------------------------- #
+# 0b) PostgreSQL schema 预检（Stage 3b-3）。
+# STORAGE_BACKEND ∈ {postgres, dual} 时，启动服务前先 ensure_schema（与 app.py
+# import 期的 fail-fast 双保险：这里在 sidecar 起来之前给出更清晰的中文错误）。
+# 失败直接退出，绝不带病拉起 gunicorn。json 后端（默认）跳过。
+# --------------------------------------------------------------------------- #
+_BACKEND="$(printf '%s' "${STORAGE_BACKEND:-}" | tr '[:upper:]' '[:lower:]')"
+case "$_BACKEND" in
+  postgres|dual)
+    if ! python3 -c '
+import sys
+import pg_store
+try:
+    conn = pg_store.connect()
+    try:
+        pg_store.ensure_schema(conn)
+    finally:
+        conn.close()
+except Exception as exc:
+    sys.stderr.write("[entry] PostgreSQL schema 初始化失败，拒绝启动: %s\n" % exc)
+    sys.exit(1)
+'; then
+      exit 1
+    fi
+    [ "$_BACKEND" = "dual" ] && echo "[entry] STORAGE_BACKEND=dual: expand 形态，读 json 权威、写镜像 pg" >&2
+    ;;
+esac
+
+# --------------------------------------------------------------------------- #
 # 1) 起 sidecar（后台）
 # --------------------------------------------------------------------------- #
 echo "[entry] starting AI sidecar ($SIDECAR_BIN)" >&2

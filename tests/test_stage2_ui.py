@@ -254,5 +254,20 @@ def test_containerfile_ships_app_modules():
     assert not missing, "Containerfile 未 COPY 这些 app.py 依赖模块：%r" % missing
 
 
+def test_containerfile_ships_pg_layer():
+    """Stage 3b PostgreSQL 层必须进镜像：pg_store/share_store_pg/user_store_pg +
+    migrations/ + scripts/。这些在 app.py 里是函数内 / dispatcher 内 import，静态
+    顶层扫描抓不到，故单独守卫（漏 COPY 时 postgres/dual 后端起不来或无法迁移）。
+    """
+    cf = (REPO_ROOT / "Containerfile").read_text(encoding="utf-8")
+    for mod in ("pg_store.py", "share_store_pg.py", "user_store_pg.py"):
+        assert re.search(r"^COPY .*\b{}\b".format(re.escape(mod)), cf, re.M), \
+            "Containerfile 未 COPY %s" % mod
+    assert re.search(r"^COPY migrations/ migrations/", cf, re.M), \
+        "Containerfile 未 COPY migrations/ 目录"
+    assert re.search(r"^COPY scripts/ scripts/", cf, re.M), \
+        "Containerfile 未 COPY scripts/ 目录"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

@@ -34,6 +34,7 @@ import share_store  # noqa: E402  默认 json dispatcher
 import user_store  # noqa: E402
 import share_store_json  # noqa: E402  json 实现
 import user_store_json  # noqa: E402
+import conftest  # noqa: E402  （RUN_PG_TESTS=1 时提供 BACKEND）
 
 DISPATCHER_INFRA_NAMES = {"STORAGE_BACKEND"}  # dispatcher 自身额外暴露的非业务公共名
 
@@ -87,6 +88,8 @@ def _load_fresh(source_path, mod_name):
 # 1. 默认 json 后端冒烟（经 dispatcher）
 # --------------------------------------------------------------------------- #
 def test_default_backend_is_json():
+    if conftest.BACKEND == "postgres":
+        pytest.skip("RUN_PG_TESTS=1 下默认后端为 postgres（json-only 断言）")
     assert share_store.STORAGE_BACKEND == "json"
     assert user_store.STORAGE_BACKEND == "json"
 
@@ -120,32 +123,45 @@ def test_json_smoke_user_store(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# 2. STORAGE_BACKEND=postgres 时 getattr 公共名抛 RuntimeError
+# 2. STORAGE_BACKEND=postgres/dual 时公共名已接线（re-export，不再抛 RuntimeError）
+#    需 psycopg（share_store_pg/user_store_pg import 期依赖）；缺依赖的裸解释器
+#    整组 skip（与 test_pg_infra 同理，不 fail）。
 # --------------------------------------------------------------------------- #
-def test_postgres_backend_raises_on_access(monkeypatch):
+import importlib.util as _ilu  # noqa: E402
+
+_PSYCOPG_AVAILABLE = _ilu.find_spec("psycopg") is not None
+_pg_only = pytest.mark.skipif(
+    not _PSYCOPG_AVAILABLE, reason="缺 psycopg：postgres 后端 import 需该依赖")
+
+
+@_pg_only
+def test_postgres_backend_exports_public_names(monkeypatch):
     monkeypatch.setenv("STORAGE_BACKEND", "postgres")
     mod = _load_fresh(_REPO_ROOT / "share_store.py", "ss_pg_test")
-    # 公共名不在 __dict__，经自定义 __getattr__ 抛 RuntimeError
-    assert "create_share" not in vars(mod)
-    with pytest.raises(RuntimeError):
-        mod.create_share
+    # 公共名已 re-export 到模块 __dict__（不再是 __getattr__ 抛 RuntimeError）
+    assert "create_share" in vars(mod)
+    assert callable(mod.create_share)
+    assert mod.STORAGE_BACKEND == "postgres"
     # 非业务名的缺失仍按正常 AttributeError 行为
     with pytest.raises(AttributeError):
         mod.this_does_not_exist
 
 
-def test_postgres_backend_user_store_raises(monkeypatch):
+@_pg_only
+def test_postgres_backend_user_store_exports(monkeypatch):
     monkeypatch.setenv("STORAGE_BACKEND", "postgres")
     mod = _load_fresh(_REPO_ROOT / "user_store.py", "us_pg_test")
-    with pytest.raises(RuntimeError):
-        mod.verify_user
+    assert "verify_user" in vars(mod)
+    assert callable(mod.verify_user)
 
 
-def test_dual_backend_also_raises(monkeypatch):
+@_pg_only
+def test_dual_backend_exports_json_read_names(monkeypatch):
     monkeypatch.setenv("STORAGE_BACKEND", "dual")
     mod = _load_fresh(_REPO_ROOT / "share_store.py", "ss_dual_test")
-    with pytest.raises(RuntimeError):
-        mod.list_shares
+    assert "list_shares" in vars(mod)  # 读路径 re-export json
+    assert callable(mod.list_shares)
+    assert mod.STORAGE_BACKEND == "dual"
 
 
 # --------------------------------------------------------------------------- #

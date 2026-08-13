@@ -94,6 +94,9 @@ _JSON_PUBLIC_NAMES = (
     "get_slide_meta_full",
     "get_all_slide_meta_full",
     "get_all_slide_meta",
+    "get_slide_id",
+    "resolve_slide_ref",
+    "record_slide_asset",
     "create_project",
     "list_projects",
     "get_project",
@@ -125,15 +128,142 @@ def _install_json_backend():
         _g[_name] = getattr(_json, _name)
 
 
+def _install_pg_backend():
+    """postgres 后端：显式 re-export share_store_pg 的全部公共名到本模块。"""
+    import share_store_pg as _pg
+
+    missing = [n for n in _JSON_PUBLIC_NAMES if not hasattr(_pg, n)]
+    if missing:
+        raise RuntimeError(
+            "share_store_pg 缺少公共名 %s，dispatcher 与实现不一致" % missing
+        )
+    _g = globals()
+    for _name in _JSON_PUBLIC_NAMES:
+        _g[_name] = getattr(_pg, _name)
+
+
+def _make_dual_replay(name, json_fn, mirror):
+    """dual 后端写包装（result-replay）：json 为权威，ret=json_fn(...) → mirror(ret,
+    原参) 把权威 dict 按其中身份值镜像进 pg。json 抛错则不写 pg。"""
+    import functools
+    import logging
+
+    _log = logging.getLogger("svs.dual.share")
+
+    @functools.wraps(json_fn)
+    def _wrapped(*args, **kwargs):
+        ret = json_fn(*args, **kwargs)
+        try:
+            mirror(ret, *args, **kwargs)
+        except Exception:
+            _log.exception("dual 后端 pg 镜像写失败: %s", name)
+        return ret
+
+    return _wrapped
+
+
+def _make_dual_same(name, json_fn, pg_fn):
+    """dual 后端写包装（同参重放）：无内部生成身份的写，直接同参调 pg（异常记 log）。"""
+    import functools
+    import logging
+
+    _log = logging.getLogger("svs.dual.share")
+
+    @functools.wraps(json_fn)
+    def _wrapped(*args, **kwargs):
+        ret = json_fn(*args, **kwargs)
+        try:
+            pg_fn(*args, **kwargs)
+        except Exception:
+            _log.exception("dual 后端 pg 镜像写失败: %s", name)
+        return ret
+
+    return _wrapped
+
+
+# 写操作名（dual 需镜像到 pg；读操作 json 即为权威，不镜像）。
+# get_slide_id / resolve_slide_ref 是纯读查询（pg 有真实值，json 是 shim），
+# dual 下用 json shim（返回 None/name），保持「读 json」的 expand 语义。
+_WRITE_NAMES = {
+    "set_owner_user_id", "create_share", "revoke_share", "claim_share",
+    "add_roi", "update_roi", "delete_roi", "delete_roi_by_annotation_id",
+    "set_roi_shared", "set_slide_meta", "record_slide_asset",
+    "create_project", "update_project",
+    "add_slides_to_project", "remove_slide_from_project", "delete_project",
+}
+
+# result-replay 镜像：凡 json 内部生成身份（token/annotation_id/grant_id/pid）的写，
+# 用 json 返回的权威 dict 原样 upsert 进 pg，避免 pg 自生成不同身份值导致发散。
+# 值 = share_store_pg 模块内的镜像函数名（带 _ 前缀，不进公共名）。
+_DUAL_MIRRORS = {
+    "create_share": "_mirror_share",
+    "revoke_share": "_mirror_share_revoke",
+    "claim_share": "_mirror_grant",
+    "add_roi": "_mirror_roi",
+    "update_roi": "_mirror_roi",
+    "delete_roi": "_mirror_roi_delete",
+    "delete_roi_by_annotation_id": "_mirror_roi_delete",
+    "set_roi_shared": "_mirror_roi_shared",
+    "set_slide_meta": "_mirror_slide_meta",
+    "create_project": "_mirror_project",
+    "update_project": "_mirror_project",
+    "add_slides_to_project": "_mirror_project",
+    "remove_slide_from_project": "_mirror_project",
+    "delete_project": "_mirror_project_delete",
+}
+
+# 同参重放：无内部生成身份，直接同参调 pg。
+#   - set_owner_user_id：标量注入（只是设模块变量），同参即可；
+#   - record_slide_asset：json shim 返回 None（pg-only 概念），asset_id 只存在于
+#     pg，由 pg_fn 自生成，无跨库身份发散问题。
+_DUAL_SAME_ARGS = {"set_owner_user_id", "record_slide_asset"}
+
+
+def _install_dual_backend():
+    """dual 后端（expand 形态）：写 json + result-replay/best-effort 写 pg、读 json。
+
+    读路径切换留 Stage 3b-3。常量/读函数 re-export 自 json impl。
+    """
+    import share_store_json as _json
+    import share_store_pg as _pg
+
+    for n in _JSON_PUBLIC_NAMES:
+        if not hasattr(_json, n):
+            raise RuntimeError(
+                "share_store_json 缺少公共名 %s，dispatcher 与实现不一致" % n)
+    for n in _JSON_PUBLIC_NAMES:
+        if not hasattr(_pg, n):
+            raise RuntimeError(
+                "share_store_pg 缺少公共名 %s，dispatcher 与实现不一致" % n)
+    _g = globals()
+    for _name in _JSON_PUBLIC_NAMES:
+        if _name in _DUAL_MIRRORS:
+            _g[_name] = _make_dual_replay(
+                _name, getattr(_json, _name), getattr(_pg, _DUAL_MIRRORS[_name]))
+        elif _name in _DUAL_SAME_ARGS:
+            _g[_name] = _make_dual_same(
+                _name, getattr(_json, _name), getattr(_pg, _name))
+        else:
+            _g[_name] = getattr(_json, _name)
+
+
 if STORAGE_BACKEND == "json":
     _install_json_backend()
+elif STORAGE_BACKEND == "postgres":
+    _install_pg_backend()
+elif STORAGE_BACKEND == "dual":
+    _install_dual_backend()
 
 
 # --------------------------------------------------------------------------- #
 # 自定义模块类：路径常量镜像 + postgres/dual 公共名访问抛 RuntimeError
 # --------------------------------------------------------------------------- #
 class _ShareStoreModule(_types.ModuleType):
-    """过渡期分发模块类（详见模块 docstring）。"""
+    """过渡期分发模块类（详见模块 docstring）。
+
+    json：从 json impl re-export；postgres：从 share_store_pg re-export；
+    dual（expand 形态）：写 json + best-effort 写 pg、读 json。
+    """
 
     def __setattr__(self, name, value):
         super().__setattr__(name, value)
@@ -154,8 +284,8 @@ class _ShareStoreModule(_types.ModuleType):
         # 仅当 name 不在本模块 __dict__ 时触发（PEP 562 语义）。
         if name in _JSON_PUBLIC_NAMES:
             raise RuntimeError(
-                "存储后端 %r 尚未接入：postgres/dual 后端将在 Stage 3b-2 实现。"
-                % STORAGE_BACKEND
+                "存储后端 %r 未正确接线公共名 %r（postgres/dual 已接入）"
+                % (STORAGE_BACKEND, name)
             )
         raise AttributeError(
             "module %r has no attribute %r" % (__name__, name)

@@ -44,6 +44,7 @@ except ImportError:
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
+from pg_compat import json_only  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -107,6 +108,7 @@ def login(client, username, password):
 # =========================================================================== #
 # user_store CRUD
 # =========================================================================== #
+@json_only  # 断言 users.json 原文（无明文/含 pbkdf2 hash）
 def test_user_crud_and_email_unique():
     u = user_store.create_user("Alice@Example.COM", "pass1234", role="user",
                                display_name="Alice")

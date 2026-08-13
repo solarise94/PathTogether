@@ -31,6 +31,7 @@ os.environ["SHARE_DATA_DIR"] = SHARE_DATA_DIR
 os.makedirs(SHARE_DATA_DIR, exist_ok=True)
 
 import share_store  # noqa: E402
+from pg_compat import json_only  # noqa: E402
 
 # openslide 未安装时 stub（本测试只覆盖配置/迁移，不需真 OpenSlide）
 try:
@@ -123,6 +124,7 @@ def reset_store():
 # =========================================================================== #
 # #4：ROI 迁移 source 数据修正（只改 AI 落标，不误伤人工标注）
 # =========================================================================== #
+@json_only  # 直接写 shares.json 构造旧 ROI + 断言 json 迁移落盘（json-only）
 def test_roi_source_fix():
     print("== test_roi_source_fix（source 迁移：旧默认 human，新数据落标写 ai）==")
     reset_store()

@@ -46,6 +46,7 @@ except ImportError:
 
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
+from pg_compat import json_only  # noqa: E402
 
 
 def _client(auth=True):
@@ -142,6 +143,7 @@ def _install_fake():
 # =========================================================================== #
 # 1. per-user api_key 加密落盘
 # =========================================================================== #
+@json_only  # 断言 users.json 原文（PG 后端加密态在库里，无 json 文件）
 def test_user_api_key_encrypted_on_disk():
     _reset_config()
     u = user_store.create_user("u@x.com", "password1", role="user")
@@ -244,6 +246,7 @@ def test_user_put_tuning_differs_returns_403():
     assert r.status_code == 403
 
 
+@json_only  # 断言 users.json 原文落盘（PG 后端无 json 文件）
 def test_user_put_credentials_ok_and_persisted():
     _reset_config()
     _setup_platform()

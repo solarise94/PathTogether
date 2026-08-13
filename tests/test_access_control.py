@@ -50,6 +50,7 @@ import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
 import share_server as share_srv  # noqa: E402
+from pg_compat import json_only  # noqa: E402
 
 # 强制 UPLOAD_DIR 指回本次临时目录（其它测试可能先 import app 改写了它）
 app_mod.UPLOAD_DIR = Path(UPLOAD_DIR)
@@ -361,6 +362,7 @@ def test_share_view_only_blocks_annotate():
     assert r2.status_code == 403
 
 
+@json_only  # 直接写 shares.json 文件构造旧分享（PG 后端无文件 patch 语义）
 def test_old_share_without_permissions_unchanged():
     """旧分享（无 permissions 字段）行为不变：默认含 annotate，可落标。"""
     _setup_users()

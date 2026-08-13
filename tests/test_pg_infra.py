@@ -83,7 +83,8 @@ def test_schema_migrations_recorded(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT filename FROM schema_migrations ORDER BY filename")
         rows = [r[0] for r in cur.fetchall()]
-    assert rows == ["0001_init.sql"]
+    # 3b-1 只应有 0001；3b-2 追加 0002_roi_payload.sql（ROI 全量负载 + 插入序）
+    assert rows == ["0001_init.sql", "0002_roi_payload.sql"]
 
 
 # --------------------------------------------------------------------------- #

@@ -1512,3 +1512,25 @@ def annotations_by_project(pid=None):
         for slide, groups in by_slide.items()
         if slide in project_slides
     }
+
+
+# --------------------------------------------------------------------------- #
+# 稳定 slide 身份 —— JSON 兼容 shim（Stage 3b-2）
+#
+# JSON 后端没有稳定 slide_id（legacy filename 就是身份，可重名/可重命名），只提供
+# 同名 shim 保持 dispatcher 公共名一致（纯兼容形状）。真正的稳定 id 由
+# `share_store_pg`（PostgreSQL 后端）实现，见 docs §Stage 3b。
+# --------------------------------------------------------------------------- #
+def get_slide_id(name):
+    """JSON 后端无稳定 slide id：返回 None（纯兼容形状）。"""
+    return None
+
+
+def resolve_slide_ref(name):
+    """JSON 后端无稳定 slide id：返回原 name（纯兼容形状，调用方按字符串用）。"""
+    return name
+
+
+def record_slide_asset(slide_id, legacy_revision):
+    """JSON 后端无 slide_assets 表：返回 None（纯兼容形状）。"""
+    return None

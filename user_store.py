@@ -89,15 +89,119 @@ def _install_json_backend():
         _g[_name] = getattr(_json, _name)
 
 
+def _install_pg_backend():
+    """postgres 后端：显式 re-export user_store_pg 的全部公共名到本模块。"""
+    import user_store_pg as _pg
+
+    missing = [n for n in _JSON_PUBLIC_NAMES if not hasattr(_pg, n)]
+    if missing:
+        raise RuntimeError(
+            "user_store_pg 缺少公共名 %s，dispatcher 与实现不一致" % missing
+        )
+    _g = globals()
+    for _name in _JSON_PUBLIC_NAMES:
+        _g[_name] = getattr(_pg, _name)
+
+
+def _make_dual_replay(name, json_fn, mirror):
+    """dual 后端写包装（result-replay）：json 为权威，ret=json_fn(...) → mirror(ret,
+    原参) 把权威 dict 按其中身份值（user_id）镜像进 pg。json 抛错则不写 pg。"""
+    import functools
+    import logging
+
+    _log = logging.getLogger("svs.dual.user")
+
+    @functools.wraps(json_fn)
+    def _wrapped(*args, **kwargs):
+        ret = json_fn(*args, **kwargs)
+        try:
+            mirror(ret, *args, **kwargs)
+        except Exception:
+            _log.exception("dual 后端 pg 镜像写失败: %s", name)
+        return ret
+
+    return _wrapped
+
+
+def _make_dual_same(name, json_fn, pg_fn):
+    """dual 后端写包装（同参重放）：无内部生成身份的写，直接同参调 pg（异常记 log）。"""
+    import functools
+    import logging
+
+    _log = logging.getLogger("svs.dual.user")
+
+    @functools.wraps(json_fn)
+    def _wrapped(*args, **kwargs):
+        ret = json_fn(*args, **kwargs)
+        try:
+            pg_fn(*args, **kwargs)
+        except Exception:
+            _log.exception("dual 后端 pg 镜像写失败: %s", name)
+        return ret
+
+    return _wrapped
+
+
+# result-replay 镜像：json 内部生成 user_id 的写（create_user/ensure_owner），用 json
+# 返回的权威 dict 按 user_id 原样 upsert 进 pg（身份一致）。其余写按 user_id 定位，
+# user_id 来自调用方入参/已存在用户，同参重放即一致。
+_DUAL_MIRRORS = {
+    "create_user": "_mirror_user",
+    "ensure_owner": "_mirror_user",
+}
+
+# 同参重放：无内部生成身份，直接同参调 pg（set_user_* 均按调用方入参 user_id 定位，
+# 与 json 幂等——json 返回 None 时 pg 也不存在，镜像 no-op 等价）。
+_DUAL_SAME_ARGS = {
+    "set_user_disabled", "set_user_password", "set_user_ai_config",
+}
+
+
+def _install_dual_backend():
+    """dual 后端（expand 形态）：写 json + result-replay/best-effort 写 pg、读 json。
+
+    读路径切换留 Stage 3b-3。常量/读函数 re-export 自 json impl。
+    """
+    import user_store_json as _json
+    import user_store_pg as _pg
+
+    for n in _JSON_PUBLIC_NAMES:
+        if not hasattr(_json, n):
+            raise RuntimeError(
+                "user_store_json 缺少公共名 %s，dispatcher 与实现不一致" % n)
+    for n in _JSON_PUBLIC_NAMES:
+        if not hasattr(_pg, n):
+            raise RuntimeError(
+                "user_store_pg 缺少公共名 %s，dispatcher 与实现不一致" % n)
+    _g = globals()
+    for _name in _JSON_PUBLIC_NAMES:
+        if _name in _DUAL_MIRRORS:
+            _g[_name] = _make_dual_replay(
+                _name, getattr(_json, _name), getattr(_pg, _DUAL_MIRRORS[_name]))
+        elif _name in _DUAL_SAME_ARGS:
+            _g[_name] = _make_dual_same(
+                _name, getattr(_json, _name), getattr(_pg, _name))
+        else:
+            _g[_name] = getattr(_json, _name)
+
+
 if STORAGE_BACKEND == "json":
     _install_json_backend()
+elif STORAGE_BACKEND == "postgres":
+    _install_pg_backend()
+elif STORAGE_BACKEND == "dual":
+    _install_dual_backend()
 
 
 # --------------------------------------------------------------------------- #
 # 自定义模块类：路径常量镜像 + postgres/dual 公共名访问抛 RuntimeError
 # --------------------------------------------------------------------------- #
 class _UserStoreModule(_types.ModuleType):
-    """过渡期分发模块类（详见模块 docstring）。"""
+    """过渡期分发模块类（详见模块 docstring）。
+
+    json：从 json impl re-export；postgres：从 user_store_pg re-export；
+    dual（expand 形态）：写 json + best-effort 写 pg、读 json。
+    """
 
     def __setattr__(self, name, value):
         super().__setattr__(name, value)
@@ -116,8 +220,8 @@ class _UserStoreModule(_types.ModuleType):
     def __getattr__(self, name):
         if name in _JSON_PUBLIC_NAMES:
             raise RuntimeError(
-                "存储后端 %r 尚未接入：postgres/dual 后端将在 Stage 3b-2 实现。"
-                % STORAGE_BACKEND
+                "存储后端 %r 未正确接线公共名 %r（postgres/dual 已接入）"
+                % (STORAGE_BACKEND, name)
             )
         raise AttributeError(
             "module %r has no attribute %r" % (__name__, name)

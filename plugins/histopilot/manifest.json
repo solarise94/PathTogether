@@ -1,0 +1,23 @@
+{
+  "manifestSchemaVersion": "1.0.0",
+  "id": "com.pathtogather.histopilot",
+  "name": "HistoPilot",
+  "pluginVersion": "0.1.0",
+  "pluginContractVersion": "1.0.0",
+  "bridgeProtocolVersion": "1.0.0",
+  "ui": {
+    "entry": "/plugins/histopilot/ui/main.js",
+    "slots": ["viewer.right-panel", "annotation.actions"]
+  },
+  "service": {
+    "baseUrl": "/",
+    "health": "/healthz"
+  },
+  "permissions": [
+    "slide:metadata:read",
+    "slide:region:read",
+    "annotation:read",
+    "annotation:write",
+    "viewer:navigate"
+  ]
+}

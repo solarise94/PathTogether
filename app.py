@@ -6,6 +6,7 @@
 """
 
 import base64
+import functools
 import hashlib
 import hmac
 import io
@@ -714,24 +715,104 @@ def histopilot_ui_enabled():
 # Sample Annotator 示例插件目录（Stage 5-2，plugins/sample-annotator/）。
 SAMPLE_PLUGIN_DIR = Path(__file__).resolve().parent / "plugins" / "sample-annotator"
 
+# plugins/ 根目录（来源策略按目录名 = plugin key 计算 manifest sha256 pin）。
+PLUGINS_DIR = Path(__file__).resolve().parent / "plugins"
+
+
+# --------------------------------------------------------------------------- #
+# 插件来源策略（Stage 5-3：manifest sha256 pin + owner 批准，最小可用）
+# --------------------------------------------------------------------------- #
+# 产品约束：不做 SaaS 级 PKI/插件商店。策略随代码/镜像版本化（repo 内
+# ``plugins/source-policy.json``，随 ``COPY plugins/`` 进镜像），owner 通过改这个文件
+# 批准某插件目录的 manifest 内容；**不写数据库**，重启生效。文件缺失 = dev 模式全放行。
+@functools.lru_cache(maxsize=1)
+def _plugin_source_policy():
+    """模块级懒加载 + 缓存读取来源策略（manifest sha256 pin 表）。
+
+    - env ``PLUGINS_SOURCE_POLICY_FILE`` 指定策略文件路径；缺省
+      ``plugins/source-policy.json``（随镜像分发）。
+    - 文件缺失 / 不可解析 → 返回空 dict（**dev 模式全放行**），启动日志一行 warning。
+    - 返回 ``{ "<plugin_key>": "<sha256 hex>" | null, ... }``——key 是 ``plugins/`` 下
+      目录名，value 为期望的 manifest sha256（null = 显式放行）。
+
+    缓存为模块级（``lru_cache(maxsize=1)``）：进程生命周期内策略固定，重启重新读取。
+    测试可用 ``_plugin_source_policy.cache_clear()`` 在改 env 后强制重读。
+    """
+    configured = os.environ.get("PLUGINS_SOURCE_POLICY_FILE")
+    policy_path = Path(configured) if configured else (PLUGINS_DIR / "source-policy.json")
+    if not policy_path.is_file():
+        app.logger.warning(
+            "插件来源策略文件缺失（%s）：dev 模式全放行（来源策略未配置）", policy_path)
+        return {}
+    try:
+        data = json.loads(policy_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        app.logger.warning(
+            "插件来源策略文件解析失败（%s：%s）：dev 模式全放行", policy_path, e)
+        return {}
+    if not isinstance(data, dict):
+        app.logger.warning(
+            "插件来源策略文件顶层非对象（%s）：dev 模式全放行", policy_path)
+        return {}
+    return data
+
+
+def plugin_source_allowed(plugin_id):
+    """检查插件来源策略是否放行（manifest sha256 pin，Stage 5-3）。
+
+    返回 ``(allowed: bool, reason: str)``：
+
+    - 策略未配置（dev 模式空表）→ ``(True, "source policy not configured (dev mode)")``；
+    - 插件不在策略表内（未 pin）→ ``(True, "source not pinned")``；
+    - 策略值为 ``null``（显式放行）→ ``(True, "explicitly allowed")``；
+    - manifest 缺失 → ``(False, "manifest missing")``；
+    - 策略期望 sha256 与磁盘 manifest 实际 sha256 不等 →
+      ``(False, "source policy mismatch")``；
+    - 相等 → ``(True, "ok")``。
+
+    比较 hmac.compare_digest 常数时间（虽非密钥比较，零成本稳健）。manifest 读取用
+    raw bytes（``read_bytes``）与 ``shasum -a 256`` 结果一致，避免编码/换行归一漂移。
+    """
+    policy = _plugin_source_policy()
+    if not policy:
+        return (True, "source policy not configured (dev mode)")
+    if plugin_id not in policy:
+        return (True, "source not pinned")
+    expected = policy[plugin_id]
+    if expected is None:
+        return (True, "explicitly allowed")
+    mf = PLUGINS_DIR / plugin_id / "manifest.json"
+    try:
+        digest = hashlib.sha256(mf.read_bytes()).hexdigest()
+    except OSError:
+        return (False, "manifest missing")
+    if hmac.compare_digest(digest, str(expected)):
+        return (True, "ok")
+    return (False, "source policy mismatch")
+
 
 def sample_plugin_context():
     """Sample Annotator 示例插件上下文（Stage 5-2，受 SAMPLE_PLUGIN_ENABLED 控制）。
 
     默认关闭。仅当 env ``SAMPLE_PLUGIN_ENABLED`` 非 "0" **且** manifest.json 存在可
-    解析时返回 ``{"enabled": True, "permissions": [...]}``；否则返回
-    ``{"enabled": False, "permissions": []}``——manifest 缺失/损坏时视同关闭，index
-    模板不渲染插件脚本与权限表（渲染端把 sample_plugin_enabled 当 False 处理）。
+    解析 **且** 来源策略放行（Stage 5-3 sha256 pin）时返回
+    ``{"enabled": True, "permissions": [...]}``；否则返回
+    ``{"enabled": False, "permissions": []}``——manifest 缺失/损坏/来源拒绝时视同关闭，
+    index 模板不渲染插件脚本与权限表（渲染端把 sample_plugin_enabled 当 False 处理）。
     """
     enabled = os.environ.get("SAMPLE_PLUGIN_ENABLED", "0") != "0"
     permissions = []
     if enabled:
-        mf = SAMPLE_PLUGIN_DIR / "manifest.json"
-        try:
-            data = json.loads(mf.read_text(encoding="utf-8"))
-            permissions = data.get("permissions") or []
-        except (OSError, ValueError):
-            enabled = False  # manifest 缺失/损坏 → 视同关闭
+        allowed, _reason = plugin_source_allowed("sample-annotator")
+        if not allowed:
+            enabled = False  # 来源策略拒绝 → 视同关闭，index 不注入脚本
+        else:
+            mf = SAMPLE_PLUGIN_DIR / "manifest.json"
+            try:
+                data = json.loads(mf.read_text(encoding="utf-8"))
+                permissions = data.get("permissions") or []
+            except (OSError, ValueError):
+                enabled = False  # manifest 缺失/损坏 → 视同关闭
     return {"enabled": enabled, "permissions": permissions}
 
 
@@ -741,9 +822,12 @@ def sample_plugin_context():
 @app.route("/")
 def index():
     sample = sample_plugin_context()
+    # histopilot index 注入 = feature flag 与来源策略**与**逻辑（Stage 5-3）：
+    # 来源策略拒绝时不加载 bundle（与 flag=0 同等静默降级）。
+    histopilot_render = histopilot_ui_enabled() and plugin_source_allowed("histopilot")[0]
     return render_template(
         "index.html",
-        histopilot_ui_enabled=histopilot_ui_enabled(),
+        histopilot_ui_enabled=histopilot_render,
         sample_plugin_enabled=sample["enabled"],
         sample_plugin_permissions=sample["permissions"],
     )
@@ -767,6 +851,8 @@ def plugin_ui_asset(plugin_id, filename):
 
     - histopilot：保留原 feature flag gating（HISTOPILOT_UI_ENABLED=0 → 404），
       维持 Stage 2 行为与 test_stage2_ui 断言；
+    - 来源策略（Stage 5-3 sha256 pin）：目录存在后再判来源，拒绝 → 403（json，含
+      plugin_id 与原因 "source policy mismatch" / "manifest missing"）；
     - 通用插件（sample-annotator 等）：目录存在即服务（静态文件始终可服务，仅
       index.html 注入受 SAMPLE_PLUGIN_ENABLED flag 控制，见 sample_plugin_context）；
     - 非允许扩展名 403；plugin_id / filename 路径穿越均被拒绝（_plugin_ui_dir +
@@ -777,6 +863,10 @@ def plugin_ui_asset(plugin_id, filename):
     uidi = _plugin_ui_dir(plugin_id)
     if uidi is None:
         abort(404)
+    # 来源策略（manifest sha256 pin）：未知目录已在上面 404，此处 plugin_id 必有目录。
+    allowed, reason = plugin_source_allowed(plugin_id)
+    if not allowed:
+        return jsonify(error="forbidden", plugin_id=plugin_id, reason=reason), 403
     ext = os.path.splitext(filename)[1].lower()
     if ext not in _PLUGIN_UI_ALLOWED_EXT:
         abort(403)

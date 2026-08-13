@@ -746,3 +746,14 @@ def _setup_ai_config(plain_key="sk-plugin-test-123456"):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_healthz_no_auth_required():
+    """/healthz 健康检查必须免鉴权（demo 实测被 _require_auth 302 到 /login，
+    探活全挂——Stage 4-3 review 修复回归）。"""
+    c = _client()
+    r = c.get("/healthz")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["ok"] is True
+    assert "sidecar" in body  # reachable/unreachable 字段在

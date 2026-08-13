@@ -393,6 +393,10 @@ def _require_auth():
     # 放行登录页与静态资源（含 HistoPilot 插件前端 bundle，与 /static/ 同属非敏感前端资源）
     if path == "/login" or path.startswith("/static/") or path.startswith("/plugins/histopilot/ui/"):
         return None
+    # /healthz 是健康检查端点（负载/监控探活），不携带敏感数据，必须免鉴权
+    # （Stage 4-3 demo 实测被 302 到 /login，探活全挂）
+    if path == "/healthz":
+        return None
     # internal 回调端点由 _require_internal 单独鉴权（共享 token），不走管理员 session
     if path.startswith("/internal/"):
         return None

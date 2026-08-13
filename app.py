@@ -1089,9 +1089,11 @@ DEFAULT_CONFIG = {
     # 每请求视觉 token 硬预算（含固定概览）；None = 按档位推导。
     "visual_context_budget_tokens": None,
     # 自适应分辨率分档（§6.1/§6.2 最长边 px）。
-    "overview_long_edge": 1024,
-    "working_image_long_edge": 768,
-    "detail_image_long_edge": 1280,
+    # None = 未显式设置，由 sidecar 按 window_tier 预设（_WINDOW_TIER_PRESETS）
+    # 推导；sidecar 对 null 走 numOr 兜底。显式配置过才透传非 None 值。
+    "overview_long_edge": None,
+    "working_image_long_edge": None,
+    "detail_image_long_edge": None,
     # 确定性派生图编码参数（§6.3）。
     "image_jpeg_quality": 85,
     "image_overlay_version": "v1",
@@ -1119,7 +1121,14 @@ def _merge_config(cfg) -> dict:
     out = dict(DEFAULT_CONFIG)
     if isinstance(cfg, dict):
         for k in DEFAULT_CONFIG:
-            if k in cfg and cfg[k] is not None:
+            if k not in cfg:
+                continue
+            if k == "window_tier":
+                # 特例：window_tier 只要键存在于 cfg（即使值是 None）就以 cfg 为准。
+                # None = 手动模式（未启用档位），必须保留，否则会回退 DEFAULT_CONFIG
+                # 的 "balanced"（Bug 3：用户显式清成 None 后合并被击穿）。
+                out[k] = cfg[k]
+            elif cfg[k] is not None:
                 out[k] = cfg[k]
     return out
 
@@ -1251,19 +1260,18 @@ _AI_TUNING_NONNEG_INT = (
     "keep_recent_images",
     "safety_margin",
 )
-# 字符串枚举字段（Phase 1）
-_AI_TUNING_ENUM = {
-    "prompt_cache_mode": ("off", "auto", "explicit"),
-    "image_overlay_version": None,  # 任意非空字符串（版本号自由格式）
-}
 # 布尔字段（Phase 4 §17 风险 2：overview_enabled 产品开关，默认 True）
 # 注意：Python 中 isinstance(True, int) 为真，必须先排除 bool 再走整数校验，
 # 因此布尔字段单独一类、在整数校验之前处理。
 _AI_TUNING_BOOL = (
     "overview_enabled",
 )
-# 枚举字符串字段（§9.2.1：window_tier 窗口档位预设）
+# 字符串枚举字段（Phase 1 + §9.2.1 window_tier）：一个 dict 统管，避免二次赋值
+# 覆盖（曾导致 prompt_cache_mode / image_overlay_version 的 Flask 权威校验失效）。
+# allowed 为 tuple → 值必须在其中；allowed 为 None → 任意非空字符串合法。
 _AI_TUNING_ENUM = {
+    "prompt_cache_mode": ("off", "auto", "explicit"),
+    "image_overlay_version": None,  # 任意非空字符串（版本号自由格式）
     "window_tier": ("saving", "balanced", "performance"),
 }
 # §9.2.1 档位预设（与 sidecar WINDOW_TIER_PRESETS 保持一致）。window_tier
@@ -1338,17 +1346,6 @@ def _validate_ai_tuning(body, cfg):
         if not isinstance(raw, bool):
             return None, "{} 需为布尔值（true/false）".format(field)
         validated[field] = raw
-    # 1a2) 枚举字符串字段（§9.2.1 window_tier）
-    for field, allowed in _AI_TUNING_ENUM.items():
-        if field not in body:
-            continue
-        raw = body[field]
-        if raw is None:
-            validated[field] = None  # 显式清除预设
-            continue
-        if not isinstance(raw, str) or raw not in allowed:
-            return None, "{} 仅支持 {}".format(field, "/".join(allowed))
-        validated[field] = raw
     # 1b) 正整数字段
     for field in _AI_TUNING_POSITIVE_INT:
         if field not in body:
@@ -1368,19 +1365,33 @@ def _validate_ai_tuning(body, cfg):
         if iv < 0:
             return None, "{} 不可为负数（>= 0）".format(field)
         validated[field] = iv
-    # 3) 枚举 / 字符串字段（Phase 1：prompt_cache_mode / image_overlay_version）
+    # 1c) 字符串枚举字段（prompt_cache_mode / image_overlay_version / window_tier）
+    # 单循环统管三类字符串字段。语义：
+    #   - 字段不在 body → 跳过；
+    #   - raw is None → validated[field]=None（显式清除 → 回退默认/手动模式）；
+    #   - 非字符串 → 中文报错；
+    #   - allowed 是 tuple → 用 raw 原值比对（不 strip，保持 window_tier 对带空白
+    #     值如 "saving " 拒绝的原有严格语义），不在其中 → 中文报错；
+    #   - allowed 为 None（image_overlay_version）→ 保留第 3 节语义：strip 后非空
+    #     即合法（任意非空字符串）。
     for field, allowed in _AI_TUNING_ENUM.items():
         if field not in body:
             continue
         raw = body[field]
+        if raw is None:
+            validated[field] = None  # 显式清除 → 回退默认/手动模式
+            continue
         if not isinstance(raw, str):
             return None, "{} 需为字符串".format(field)
-        val = raw.strip()
-        if not val:
-            return None, "{} 不可为空".format(field)
-        if allowed is not None and val not in allowed:
-            return None, "{} 仅支持 {}".format(field, "/".join(allowed))
-        validated[field] = val
+        if allowed is not None:
+            if raw not in allowed:
+                return None, "{} 仅支持 {}".format(field, "/".join(allowed))
+            validated[field] = raw
+        else:
+            val = raw.strip()
+            if not val:
+                return None, "{} 不可为空".format(field)
+            validated[field] = val
     # 4) 分辨率分档上限（§6.1，最长边 ≤ 4096）
     for field in ("overview_long_edge", "working_image_long_edge", "detail_image_long_edge"):
         if field in validated and validated[field] > _LONG_EDGE_LIMIT:
@@ -1410,12 +1421,18 @@ def _validate_ai_tuning(body, cfg):
             # §9.2.1：窗口未显式设置 → 按当前档位推导（含本批次可能提交的 tier）。
             tier = validated.get("window_tier") if "window_tier" in validated else cfg.get("window_tier")
             ctx = _resolve_tier_value(cfg, tier, "context_window_tokens")
-        ctx = int(ctx or 0)
-        if reserve + keep >= ctx:
-            return None, (
-                "reserve_tokens + keep_recent_tokens（{}）必须小于 "
-                "context_window_tokens（{}）".format(reserve + keep, ctx)
-            )
+        if ctx is not None:
+            ctx = int(ctx)
+            if reserve + keep >= ctx:
+                return None, (
+                    "reserve_tokens + keep_recent_tokens（{}）必须小于 "
+                    "context_window_tokens（{}）".format(reserve + keep, ctx)
+                )
+        # ctx 为 None = 手动模式（window_tier 无效/已清除）且窗口无法确定 → 无法做
+        # 矛盾判定，跳过关系校验（sidecar 端会用 numOr 默认兜底窗口）。注意
+        # validated.get("window_tier") 取到 None（本批次显式清除）同样视为手动模式。
+        # 不能 early-return：后面的弃用字段映射（keep_recent_images →
+        # visual_working_set_max）仍须执行。
     # 3) 弃用字段映射：keep_recent_images → visual_working_set_max（§11）。
     #    两者同时存在时以新字段为准，并记一次弃用告警；仅旧字段存在时映射过去。
     #    safety_margin 同属弃用字段：接受、不展示、不写回（见 api_ai_config PUT）。

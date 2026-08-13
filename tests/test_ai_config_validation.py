@@ -531,3 +531,151 @@ def test_window_tier_enum_validation():
     merged = app_mod._merge_config(load_raw())
     check("sidecar config 透传 window_tier=None", merged.get("window_tier") is None,
           "got %r" % merged.get("window_tier"))
+
+
+# ============================================================================ #
+# §9.2.1 权威校验回归（Bug 1：_AI_TUNING_ENUM 二次赋值覆盖失效修复）。
+# prompt_cache_mode / image_overlay_version / window_tier 三类字符串字段统一校验。
+# ============================================================================ #
+def test_prompt_cache_mode_authority_validation():
+    """prompt_cache_mode：非法 400 / 合法通过 / None 清除通过。"""
+    print("== prompt_cache_mode 权威校验 ==")
+    reset_config()
+    code, j = put({"prompt_cache_mode": "bogus"})
+    check("prompt_cache_mode=bogus → 400", code == 400, "got %s %r" % (code, j))
+    reset_config()
+    code, j = put({"prompt_cache_mode": "auto"})
+    check("prompt_cache_mode=auto → 200", code == 200, "got %s %r" % (code, j))
+    check("回显 prompt_cache_mode=auto", j.get("prompt_cache_mode") == "auto",
+          "got %r" % j.get("prompt_cache_mode"))
+    reset_config()
+    code, j = put({"prompt_cache_mode": None})
+    check("prompt_cache_mode=null（清除）→ 200", code == 200, "got %s %r" % (code, j))
+    check("回显 prompt_cache_mode=null", j.get("prompt_cache_mode") is None,
+          "got %r" % j.get("prompt_cache_mode"))
+
+
+def test_image_overlay_version_authority_validation():
+    """image_overlay_version：空串 400 / 非字符串 400 / 任意非空串通过 / None 清除。"""
+    print("== image_overlay_version 权威校验 ==")
+    reset_config()
+    code, j = put({"image_overlay_version": ""})
+    check("image_overlay_version='' → 400", code == 400, "got %s %r" % (code, j))
+    reset_config()
+    code, j = put({"image_overlay_version": "   "})
+    check("image_overlay_version='   '（纯空白）→ 400", code == 400, "got %s %r" % (code, j))
+    reset_config()
+    code, j = put({"image_overlay_version": 123})
+    check("image_overlay_version=123（非字符串）→ 400", code == 400, "got %s %r" % (code, j))
+    reset_config()
+    code, j = put({"image_overlay_version": "v9.2-custom"})
+    check("image_overlay_version=任意非空串 → 200", code == 200, "got %s %r" % (code, j))
+    check("回显 image_overlay_version", j.get("image_overlay_version") == "v9.2-custom",
+          "got %r" % j.get("image_overlay_version"))
+    reset_config()
+    code, j = put({"image_overlay_version": None})
+    check("image_overlay_version=null（清除）→ 200", code == 200, "got %s %r" % (code, j))
+    check("回显 image_overlay_version=null", j.get("image_overlay_version") is None,
+          "got %r" % j.get("image_overlay_version"))
+
+
+def test_window_tier_all_three_valid():
+    """window_tier：三个合法档位都通过（Bug 1 合并后校验仍生效）。"""
+    print("== window_tier 三档合法 ==")
+    for tier in ("saving", "balanced", "performance"):
+        reset_config()
+        code, j = put({"window_tier": tier})
+        check("window_tier=%s → 200" % tier, code == 200, "got %s %r" % (code, j))
+        check("回显 window_tier=%s" % tier, j.get("window_tier") == tier,
+              "got %r" % j.get("window_tier"))
+    # 非法档位仍 400
+    reset_config()
+    code, j = put({"window_tier": "huge"})
+    check("window_tier=huge → 400", code == 400, "got %s %r" % (code, j))
+
+
+# ============================================================================ #
+# Bug 2 回归：DEFAULT_CONFIG 三个图片边长默认值为 None（不击穿 tier 推导）。
+# ============================================================================ #
+def test_default_config_image_edges_are_none():
+    """DEFAULT_CONFIG 三个图片边长默认 None（防击穿档位推导）。"""
+    print("== DEFAULT_CONFIG 图片边长为 None ==")
+    for k in ("overview_long_edge", "working_image_long_edge", "detail_image_long_edge"):
+        check("%s 默认 None" % k, app_mod.DEFAULT_CONFIG.get(k) is None,
+              "got %r" % app_mod.DEFAULT_CONFIG.get(k))
+
+
+def test_build_sidecar_config_defaults():
+    """全新默认配置：_build_sidecar_config 输出图片边长为 None、window_tier=balanced。"""
+    print("== _build_sidecar_config 默认输出 ==")
+    reset_config()
+    sc = app_mod._build_sidecar_config()
+    check("overview_long_edge 为 None", sc.get("overview_long_edge") is None,
+          "got %r" % sc.get("overview_long_edge"))
+    check("working_image_long_edge 为 None", sc.get("working_image_long_edge") is None,
+          "got %r" % sc.get("working_image_long_edge"))
+    check("detail_image_long_edge 为 None", sc.get("detail_image_long_edge") is None,
+          "got %r" % sc.get("detail_image_long_edge"))
+    check("window_tier=balanced（默认档位）", sc.get("window_tier") == "balanced",
+          "got %r" % sc.get("window_tier"))
+
+
+# ============================================================================ #
+# Bug 3 回归：_merge_config 对 window_tier=None 不回退 balanced。
+# ============================================================================ #
+def test_merge_config_window_tier_none_kept():
+    """cfg 里 window_tier=None → 合并结果仍是 None（手动模式不回退 balanced）。"""
+    print("== _merge_config window_tier=None 保留 ==")
+    merged = app_mod._merge_config({"window_tier": None})
+    check("window_tier=None → 合并结果 None", merged.get("window_tier") is None,
+          "got %r" % merged.get("window_tier"))
+    # 其它字段 None 仍不覆盖默认（回归：只对 window_tier 特例）
+    m2 = app_mod._merge_config({"overview_long_edge": None, "window_tier": None})
+    check("overview_long_edge=None 仍取默认（None）",
+          m2.get("overview_long_edge") is None,
+          "got %r" % m2.get("overview_long_edge"))
+
+
+# ============================================================================ #
+# Bug 4 回归：手动模式下关系校验跳过（不误报）。
+# ============================================================================ #
+def test_relationship_skipped_when_manual_mode():
+    """window_tier=None（手动模式）+ ctx 未定 + reserve=16000 → 不报关系错误。"""
+    print("== 手动模式关系校验跳过 ==")
+    reset_config()
+    code, j = put({"window_tier": None, "reserve_tokens": 16000})
+    check("手动模式 reserve=16000 → 200（不误报关系）", code == 200,
+          "got %s %r" % (code, j))
+
+
+def test_relationship_uses_tier_preset_when_saving():
+    """window_tier=saving + reserve=190000 → 200k 窗口推导后 190000+20000>=200000 报错。"""
+    print("== saving 档位关系校验（按预设窗口推导）==")
+    reset_config()
+    code, j = put({"window_tier": "saving", "reserve_tokens": 190000})
+    check("saving + reserve=190000 → 400（关系违反）", code == 400,
+          "got %s %r" % (code, j))
+    check("error 含 context_window_tokens",
+          j and "context_window_tokens" in (j or {}).get("error", ""),
+          "error=%r" % (j or {}).get("error"))
+    # 低于边界应通过：190000 以下使 190000+20000 < 200000
+    reset_config()
+    code, j = put({"window_tier": "saving", "reserve_tokens": 170000})
+    check("saving + reserve=170000 → 200（190000<200000）", code == 200,
+          "got %s %r" % (code, j))
+
+
+def test_deprecated_mapping_still_runs_when_relationship_skipped():
+    """手动模式跳过关系校验时，keep_recent_images → visual_working_set_max 映射仍执行。
+
+    回归：早期实现用 early-return 跳过关系校验，把后面的弃用字段映射也跳过了。
+    """
+    print("== 手动模式跳过关系校验 ≠ 跳过弃用映射 ==")
+    reset_config()
+    code, j = put({"window_tier": None, "reserve_tokens": 16000, "keep_recent_images": 3})
+    check("手动模式 + keep_recent_images=3 → 200", code == 200, "got %s %r" % (code, j))
+    check("visual_working_set_max 映射落盘 = 3",
+          j and (j or {}).get("visual_working_set_max") == 3,
+          "got %r" % (j or {}).get("visual_working_set_max"))
+
+

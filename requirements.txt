@@ -12,3 +12,6 @@ gunicorn
 requests
 # AI api_key 加密存储（Fernet，机器本地密钥 ai_secret.key 0600）
 cryptography
+# Stage 3b：PostgreSQL 运行期驱动（唯一存储，决策 #8）。dispatcher 默认仍走 json，
+# postgres/dual 后端接入在 3b-2；本节点先落地基建依赖。
+psycopg[binary]>=3.2

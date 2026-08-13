@@ -1,400 +1,127 @@
 # -*- coding: utf-8 -*-
-"""用户存储层 —— 四级身份的基础（Stage 3a 第一节点：身份基础）。
+"""用户存储层 dispatcher（Stage 3b-1：PostgreSQL 基建 + dispatcher 拆分）。
 
-数据文件为 SHARE_DATA_DIR/users.json（0600，fcntl 文件锁），风格仿 share_store.py。
+过渡形态（见 docs/pathtogather-histopilot-platform-plugin-upgrade.md §Stage 3b 与
+决策 #8）：
 
-四级身份（docs §5.1）：
-  - owner   ：部署者 / superadmin，管理一切；
-  - user    ：平台注册用户（邮箱账户，持久会话 / 标注历史）；
-  - guest   ：受邀链接匿名进入，无注册、无 users 行（走 share token，后续阶段）；
-  - sdk-user：插件访问身份（非自然人，代理某 user 调用，后续阶段）。
+- 原有 JSON 文件实现（users.json：四级身份基础）被**原样**搬到
+  `user_store_json.py`（含 _ 前缀私有函数、fcntl 文件锁、SHARE_DATA_DIR 逻辑），
+  本文件不再持有任何业务实现。
+- 按 `STORAGE_BACKEND` 环境变量分发：
+    * ``json``     （默认）→ 显式 re-export `user_store_json` 的全部公共名；
+    * ``postgres`` / ``dual`` → 暂不接入，访问任一公共名抛 RuntimeError
+      （Stage 3b-2 才接 PostgreSQL 实现；本节点只交付分发骨架 + 基建）。
+- 非法后端值在 import 期即抛 ValueError。
 
-本节点只做身份基础：owner/user 落 users 表；guest / sdk 仅声明 ROLE_GUEST /
-ROLE_SDK 常量，不入表。资源级鉴权矩阵是下一个节点的事。
+**验收红线：零行为变化**。所有调用方一律 ``import user_store`` 后以
+``user_store.X`` 访问，本 dispatcher 对调用方完全透明。
 
-密码一律用 werkzeug 的 generate_password_hash / check_password_hash（默认 pbkdf2）。
-全库不得再出现明文密码存储 / 比较。
+路径常量实时镜像（与 share_store.py 同理）：测试会 monkeypatch 本模块的
+``SHARE_DATA_DIR`` / ``USER_FILE``，而 JSON 实现函数体以裸全局读取
+``USER_FILE``（其 ``__globals__`` 指向 ``user_store_json``）。本 dispatcher 安装
+自定义模块类，把这两个路径常量的外部写入实时镜像回 ``user_store_json.__dict__``。
+模块自身初始化用字典写入（``globals()[name] = ...``），不走 ``__setattr__``。
+
+contract 计划：Stage 3b contract 阶段删除 JSON 写路径，PostgreSQL 成为唯一存储。
 """
 
-import json
-import os
-import secrets
-import time
-from pathlib import Path
+import os as _os
+import sys as _sys
+import types as _types
 
-import fcntl
+# --------------------------------------------------------------------------- #
+# 后端选择（与 share_store 同语义）
+# --------------------------------------------------------------------------- #
+_BACKEND_ENV = "STORAGE_BACKEND"
+_VALID_BACKENDS = ("json", "postgres", "dual")
 
-from werkzeug.security import check_password_hash, generate_password_hash
+#: 当前生效的存储后端（json|postgres|dual）。默认 json，等价拆分前行为。
+STORAGE_BACKEND = (_os.environ.get(_BACKEND_ENV) or "json").strip()
+if STORAGE_BACKEND not in _VALID_BACKENDS:
+    raise ValueError(
+        "STORAGE_BACKEND 仅支持 %s，当前值为 %r"
+        % ("/".join(_VALID_BACKENDS), STORAGE_BACKEND)
+    )
 
-# 数据目录与文件路径（与 share_store 同目录；SHARE_DATA_DIR 由 env 决定）
-SHARE_DATA_DIR = Path(
-    os.environ.get("SHARE_DATA_DIR") or (Path.home() / "svs-viewer" / "share-data")
+#: JSON 实现的公共 API（与 user_store_json 的公共名必须一致；由
+#: tests/test_backend_dispatch.py 守卫防漏 export）。显式枚举，不用 ``import *``。
+_JSON_PUBLIC_NAMES = (
+    # —— 常量 ——
+    "SHARE_DATA_DIR",
+    "USER_FILE",
+    "ROLE_OWNER",
+    "ROLE_USER",
+    "ROLE_GUEST",
+    "ROLE_SDK",
+    "VALID_ROLES",
+    # —— 函数 ——
+    "create_user",
+    "get_user",
+    "get_user_by_email",
+    "get_user_by_display_name",
+    "verify_user",
+    "list_users",
+    "set_user_disabled",
+    "set_user_password",
+    "get_user_ai_config",
+    "set_user_ai_config",
+    "count_owners",
+    "first_owner",
+    "has_enabled_users",
+    "ensure_owner",
 )
-SHARE_DATA_DIR.mkdir(parents=True, exist_ok=True)
-USER_FILE = SHARE_DATA_DIR / "users.json"
 
-# 角色常量
-ROLE_OWNER = "owner"
-ROLE_USER = "user"
-ROLE_GUEST = "guest"  # 仅常量声明：guest 走分享链接匿名，无 users 行
-ROLE_SDK = "sdk"      # 仅常量声明：sdk-user 为插件代理身份，后续阶段实现
-
-VALID_ROLES = (ROLE_OWNER, ROLE_USER)
-
-# 空结构骨架
-_EMPTY = {
-    "users": {},
-    "meta": {"schema_version": 1},
-}
+#: 需要实时镜像到 JSON 实现的路径配置名（函数体裸全局读取它们）。
+_MIRROR_NAMES = ("SHARE_DATA_DIR", "USER_FILE")
 
 
-def _copy_empty():
-    """返回一个新的空结构（避免共享引用）。"""
-    return {"users": {}, "meta": {"schema_version": 1}}
+def _install_json_backend():
+    """json 后端：显式 re-export user_store_json 的全部公共名到本模块。"""
+    import user_store_json as _json
+
+    missing = [n for n in _JSON_PUBLIC_NAMES if not hasattr(_json, n)]
+    if missing:
+        raise RuntimeError(
+            "user_store_json 缺少公共名 %s，dispatcher 与实现不一致" % missing
+        )
+    _g = globals()
+    for _name in _JSON_PUBLIC_NAMES:
+        _g[_name] = getattr(_json, _name)
 
 
-def _user_id() -> str:
-    return "usr_" + secrets.token_urlsafe(8)
-
-
-def _normalize_email(email: str) -> str:
-    """email 唯一键规范化：小写 + 去首尾空白。"""
-    return str(email or "").strip().lower()
-
-
-def _load_locked(f):
-    """在已锁定的文件对象上读取并解析 JSON；损坏则备份重建。"""
-    f.seek(0)
-    raw = f.read()
-    if not raw:
-        return _copy_empty()
-    try:
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise ValueError("top-level not object")
-        data.setdefault("users", {})
-        data.setdefault("meta", {"schema_version": 1})
-        if not isinstance(data["users"], dict):
-            data["users"] = {}
-        if not isinstance(data["meta"], dict):
-            data["meta"] = {"schema_version": 1}
-        return data
-    except (json.JSONDecodeError, ValueError):
-        # 损坏：备份后重建
-        f.seek(0)
-        bak = USER_FILE.with_suffix(".json.bak")
-        try:
-            with open(bak, "w", encoding="utf-8") as bf:
-                bf.write(raw)
-        except Exception:
-            pass
-        return _copy_empty()
-
-
-def _save_locked(f, data):
-    """在已锁定的文件对象上写入 JSON（先截断）。"""
-    f.seek(0)
-    f.truncate()
-    json.dump(data, f, ensure_ascii=False, indent=2)
-    f.flush()
-    os.fsync(f.fileno())
-
-
-def _with_lock(mode, fn):
-    """以指定模式打开 USER_FILE，加排他锁后执行 fn(file_obj)。返回 fn 返回值。"""
-    if not USER_FILE.exists():
-        USER_FILE.touch()
-    try:
-        os.chmod(USER_FILE, 0o600)
-    except OSError:
-        pass
-    with open(USER_FILE, mode, encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
-            return fn(f)
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-
-
-def _to_public(user: dict) -> dict:
-    """导出副本（不含 password_hash）。"""
-    out = dict(user)
-    out.pop("password_hash", None)
-    return out
+if STORAGE_BACKEND == "json":
+    _install_json_backend()
 
 
 # --------------------------------------------------------------------------- #
-# 公共 API
+# 自定义模块类：路径常量镜像 + postgres/dual 公共名访问抛 RuntimeError
 # --------------------------------------------------------------------------- #
-def create_user(email, password, role=ROLE_USER, display_name=None,
-                _enforce_min_length=True):
-    """创建用户。返回新用户 dict（不含 hash）；email 冲突抛 ValueError。
+class _UserStoreModule(_types.ModuleType):
+    """过渡期分发模块类（详见模块 docstring）。"""
 
-    email 会做小写规范化并作为唯一键。display_name 缺省用 email 值。
-    密码经 werkzeug generate_password_hash 哈希后存储。
-    _enforce_min_length=False 供 owner 引导（ADMIN_PASSWORD env）使用：既有部署
-    的 ADMIN_PASSWORD 可能不足 8 位，为保证 demo 兼容不做最小长度强制。
-    """
-    if role not in VALID_ROLES:
-        raise ValueError("非法角色")
-    norm_email = _normalize_email(email)
-    if not norm_email:
-        raise ValueError("邮箱/用户名不能为空")
-    if not isinstance(password, str) or not password:
-        raise ValueError("密码不能为空")
-    if _enforce_min_length and isinstance(password, str) and len(password) < 8:
-        raise ValueError("密码长度至少 8 位")
-    name = str(display_name or "").strip() or norm_email
-    now = time.time()
-    uid = _user_id()
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+        if name in _MIRROR_NAMES:
+            _json = _sys.modules.get("user_store_json")
+            if _json is not None:
+                _json.__dict__[name] = value
 
-    def _do(f):
-        data = _load_locked(f)
-        if norm_email in data["users"]:
-            raise ValueError("该邮箱/用户名已存在")
-        user = {
-            "user_id": uid,
-            "email": norm_email,
-            "display_name": name,
-            "password_hash": generate_password_hash(password),
-            "role": role,
-            "created_at": now,
-            "disabled": False,
-        }
-        data["users"][uid] = user
-        _save_locked(f, data)
-        return _to_public(user)
+    def __delattr__(self, name):
+        super().__delattr__(name)
+        if name in _MIRROR_NAMES:
+            _json = _sys.modules.get("user_store_json")
+            if _json is not None and name in _json.__dict__:
+                del _json.__dict__[name]
 
-    return _with_lock("r+", _do)
-
-
-def get_user(user_id):
-    """按 user_id 取用户 dict（含 hash）；不存在返回 None。"""
-    def _do(f):
-        data = _load_locked(f)
-        user = data["users"].get(user_id)
-        return dict(user) if user else None
-
-    return _with_lock("r+", _do)
-
-
-def get_user_by_email(email):
-    """按 email（小写规范化）取用户 dict（含 hash）；不存在返回 None。"""
-    key = _normalize_email(email)
-    if not key:
-        return None
-
-    def _do(f):
-        data = _load_locked(f)
-        for uid, u in data["users"].items():
-            if u.get("email") == key:
-                return dict(u)
-        return None
-
-    return _with_lock("r+", _do)
-
-
-def get_user_by_display_name(display_name):
-    """按 display_name 精确匹配取用户 dict（含 hash）；不存在返回 None。"""
-    key = str(display_name or "").strip()
-    if not key:
-        return None
-
-    def _do(f):
-        data = _load_locked(f)
-        for uid, u in data["users"].items():
-            if u.get("display_name") == key:
-                return dict(u)
-        return None
-
-    return _with_lock("r+", _do)
-
-
-def verify_user(email_or_name, password):
-    """校验登录：按 email 或 display_name 查找用户并核对密码。
-
-    返回用户 dict（含 hash）；查无此人 / 被禁用 / 密码错误返回 None。
-    """
-    if not isinstance(password, str) or not password:
-        return None
-    user = get_user_by_email(email_or_name)
-    if user is None:
-        user = get_user_by_display_name(email_or_name)
-    if user is None:
-        return None
-    if user.get("disabled"):
-        return None
-    try:
-        if not check_password_hash(user.get("password_hash") or "", password):
-            return None
-    except Exception:
-        return None
-    return user
-
-
-def list_users():
-    """返回全部用户（不含 hash），按 created_at 升序。"""
-    def _do(f):
-        data = _load_locked(f)
-        items = [_to_public(u) for u in data["users"].values()]
-        items.sort(key=lambda x: x.get("created_at", 0))
-        return items
-
-    return _with_lock("r+", _do)
-
-
-def set_user_disabled(user_id, flag):
-    """设置用户禁用状态（True=禁用）。返回更新后的用户 dict；不存在返回 None。"""
-    flag = bool(flag)
-
-    def _do(f):
-        data = _load_locked(f)
-        user = data["users"].get(user_id)
-        if user is None:
-            return None
-        user["disabled"] = flag
-        _save_locked(f, data)
-        return _to_public(user)
-
-    return _with_lock("r+", _do)
-
-
-def set_user_password(user_id, new_password, _enforce_min_length=True):
-    """重置用户密码。返回更新后的用户 dict；不存在返回 None。"""
-    if not isinstance(new_password, str) or not new_password:
-        raise ValueError("密码不能为空")
-    if _enforce_min_length and len(new_password) < 8:
-        raise ValueError("密码长度至少 8 位")
-
-    def _do(f):
-        data = _load_locked(f)
-        user = data["users"].get(user_id)
-        if user is None:
-            return None
-        user["password_hash"] = generate_password_hash(new_password)
-        _save_locked(f, data)
-        return _to_public(user)
-
-    return _with_lock("r+", _do)
-
-
-# --------------------------------------------------------------------------- #
-# 用户 AI 凭据（Stage 3a 第二节点 2b：AI 凭据规则 §5.1.2）
-#
-# 每个 user 行可带一个 `ai_config` 子对象：
-#   {use_platform: bool, base_url, model, api_key}
-# use_platform 缺省 True（默认沿用平台官方 API）。api_key 在落盘前由 app.py
-# 加密（Fernet，enc: 前缀）——本层只负责存取原样 dict，不感知加密细节（避免
-# 与 app.py 循环依赖；加密/解密统一在 app.py 侧完成）。owner 无独立 ai_config
-# （owner 读写平台配置，见 app.py _load_ai_config）。
-# --------------------------------------------------------------------------- #
-_DEFAULT_USER_AI_CONFIG = {"use_platform": True, "base_url": "", "model": "", "api_key": ""}
-
-
-def _user_ai_config(user: dict) -> dict:
-    """返回用户行内 ai_config（规范化后副本，缺省 use_platform=True）。"""
-    raw = user.get("ai_config") or {}
-    if not isinstance(raw, dict):
-        raw = {}
-    out = dict(_DEFAULT_USER_AI_CONFIG)
-    out.update({k: raw.get(k) for k in ("base_url", "model", "api_key")})
-    out["use_platform"] = bool(raw.get("use_platform", True))
-    return out
-
-
-def get_user_ai_config(user_id):
-    """按 user_id 取用户 AI 凭据 dict（api_key 为磁盘原样，可能 enc: 密文）。
-
-    不存在用户返回 None；用户未配置过返回规范化默认（use_platform=True 空凭据）。
-    """
-    def _do(f):
-        data = _load_locked(f)
-        user = data["users"].get(user_id)
-        if user is None:
-            return None
-        return _user_ai_config(user)
-
-    return _with_lock("r+", _do)
-
-
-def set_user_ai_config(user_id, cfg):
-    """设置用户 AI 凭据。cfg 应为 dict（use_platform/base_url/model/api_key）。
-
-    api_key 假定已由 app.py 加密为磁盘形态；本层原样写入，不重新加密。返回更新后
-    的公共用户 dict；用户不存在返回 None。
-    """
-    def _do(f):
-        data = _load_locked(f)
-        user = data["users"].get(user_id)
-        if user is None:
-            return None
-        merged = _user_ai_config(user)
-        if isinstance(cfg, dict):
-            for k in ("use_platform", "base_url", "model", "api_key"):
-                if k in cfg:
-                    merged[k] = cfg[k]
-        user["ai_config"] = merged
-        _save_locked(f, data)
-        return _to_public(user)
-
-    return _with_lock("r+", _do)
-
-
-def count_owners():
-    """返回 role=owner 且未禁用的用户数量。"""
-    def _do(f):
-        data = _load_locked(f)
-        return sum(
-            1 for u in data["users"].values()
-            if u.get("role") == ROLE_OWNER and not u.get("disabled")
+    def __getattr__(self, name):
+        if name in _JSON_PUBLIC_NAMES:
+            raise RuntimeError(
+                "存储后端 %r 尚未接入：postgres/dual 后端将在 Stage 3b-2 实现。"
+                % STORAGE_BACKEND
+            )
+        raise AttributeError(
+            "module %r has no attribute %r" % (__name__, name)
         )
 
-    return _with_lock("r+", _do)
 
-
-def first_owner():
-    """返回第一个 owner 用户 dict（含 hash）；无则 None。"""
-    def _do(f):
-        data = _load_locked(f)
-        for u in data["users"].values():
-            if u.get("role") == ROLE_OWNER:
-                return dict(u)
-        return None
-
-    return _with_lock("r+", _do)
-
-
-def has_enabled_users():
-    """是否存在任一 enabled（未禁用）用户（任意角色）。"""
-    def _do(f):
-        data = _load_locked(f)
-        return any(not u.get("disabled") for u in data["users"].values())
-
-    return _with_lock("r+", _do)
-
-
-def ensure_owner(email, password):
-    """owner 引导与迁移：按 ADMIN_USERNAME/ADMIN_PASSWORD 维护 owner 账户。
-
-    - 无 owner 角色用户 → 创建 owner（email 用 ADMIN_USERNAME 值，可非邮箱格式，
-      display_name=email 同值）；
-    - 已存在 owner 且 ADMIN_PASSWORD 与现存 hash 不匹配 → 更新该 owner 的
-      password_hash（env 始终可重置 owner 密码，保住「改密码靠 env」运维习惯）。
-
-    返回 owner 用户 dict（含 hash）。
-    """
-    norm_email = _normalize_email(email)
-    name = norm_email or "owner"
-    owner = first_owner()
-    if owner is None:
-        return create_user(name, password, role=ROLE_OWNER, display_name=name,
-                           _enforce_min_length=False)
-    # 已有 owner：ADMIN_PASSWORD 始终可重置其密码
-    try:
-        match = check_password_hash(owner.get("password_hash") or "", password)
-    except Exception:
-        match = False
-    if not match:
-        set_user_password(owner["user_id"], password, _enforce_min_length=False)
-        owner = get_user(owner["user_id"])
-    return owner
+_sys.modules[__name__].__class__ = _UserStoreModule

@@ -1646,6 +1646,37 @@ def _plugin_secret_file(plugin_id: str) -> Path:
     return _data_dir_for_secret() / ("plugin-secret-%s.txt" % plugin_id)
 
 
+def _plugin_secret_file_parse(raw: str):
+    """解析插件凭证文件，兼容两种格式：
+       - 4-1b 起：JSON `{"installation_id": ..., "secret": ...}`；
+       - 4-1a 旧格式：整行即明文 secret（此时 installation_id 未知，须由 env 补）。
+    返回 (installation_id, secret)；均可能为空串。
+    """
+    text = raw.strip()
+    if not text:
+        return "", ""
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return str(obj.get("installation_id") or ""), str(obj.get("secret") or "")
+    except (ValueError, TypeError):
+        pass
+    # 旧格式：整行即 secret
+    return "", text
+
+
+def _plugin_secret_file_write(path: Path, installation_id: str, secret: str) -> None:
+    """把 {installation_id, secret} 以 JSON 落盘（0600）；旧明文格式的读者
+    （4-1a sidecar）会把整行当 secret，但该格式只在无安装行时写，旧侧侧由
+    env 补 id，故不破坏。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"installation_id": installation_id, "secret": secret}), encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def _plugin_jwt_key() -> bytes:
     """scoped JWT 的 HS256 签名密钥：sha256("plugin-jwt:" + ai_secret.key 内容)。
 
@@ -1840,7 +1871,8 @@ def _bootstrap_plugin_installations(environ=None):
     file_secret = ""
     if secret_file.is_file():
         try:
-            file_secret = secret_file.read_text(encoding="utf-8").strip()
+            file_secret = _plugin_secret_file_parse(
+                secret_file.read_text(encoding="utf-8"))[1]
         except OSError:
             file_secret = ""
     if env_secret:
@@ -1856,14 +1888,10 @@ def _bootstrap_plugin_installations(environ=None):
         return None
     plaintext = created.get("secret") or ""
     if plaintext and not env_secret and not file_secret:
-        # 新生成的明文落盘（0600）；文件已存在（file_secret 非空）不会走到这里
+        # 新生成的明文落盘（0600，含 installation_id）；文件已存在
+        # （file_secret 非空）不会走到这里
         try:
-            secret_file.parent.mkdir(parents=True, exist_ok=True)
-            secret_file.write_text(plaintext, encoding="utf-8")
-            try:
-                os.chmod(secret_file, 0o600)
-            except OSError:
-                pass
+            _plugin_secret_file_write(secret_file, created.get("installation_id") or "", plaintext)
         except OSError:
             app.logger.warning("安装凭证文件写入失败：%s", secret_file)
     out = dict(created)

@@ -22,6 +22,34 @@ import { AgentRunner } from "./agent-runner.js";
 import { SidecarServer } from "./server.js";
 import { createFlaskClient } from "./flask-client.js";
 import { LegacyFlaskPlatformAdapter } from "./platform/legacy-flask-adapter.js";
+import { PathTogatherHttpClient } from "./platform/http-client.js";
+import { resolvePluginCredentials } from "./platform/plugin-credentials.js";
+import type { PlatformClient } from "./platform/contract.js";
+
+/**
+ * Resolve the platform {@link PlatformClient} for production:
+ *
+ *   - WITH plugin credentials (env PLUGIN_INSTALLATION_ID + PLUGIN_HISTOPILOT_SECRET,
+ *     or the platform's `plugin-secret-histopilot.txt`) → the formal
+ *     `/api/plugin/v1` client (Bearer JWT + X-Run-Grant + unified envelope).
+ *   - WITHOUT credentials → the legacy `/internal/ai/*` adapter (intranet/dev
+ *     unchanged), with a warn log. AI_FLASK_URL remains the base URL source.
+ */
+async function resolvePlatformClient(baseUrl: string): Promise<PlatformClient> {
+	const creds = await resolvePluginCredentials();
+	if (creds) {
+		return new PathTogatherHttpClient({
+			baseUrl,
+			installationId: creds.installationId,
+			secret: creds.secret,
+		});
+	}
+	console.warn(
+		"[sidecar] 未找到插件凭证（PLUGIN_INSTALLATION_ID/PLUGIN_HISTOPILOT_SECRET 或 plugin-secret-histopilot.txt）；回退 legacy /internal/ai/* 适配器",
+	);
+	const flaskEngine = await createFlaskClient();
+	return new LegacyFlaskPlatformAdapter({ flask: flaskEngine });
+}
 
 async function main(): Promise<void> {
 	const store = new SessionStore();
@@ -43,12 +71,12 @@ async function main(): Promise<void> {
 	}
 
 	const bus = new SessionEventBus(store);
-	// Production wiring (§9.2): wrap the existing FlaskClient engine in the
-	// legacy PlatformClient adapter. HistoPilot core (AgentRunner / SidecarServer)
-	// sees only the PlatformClient surface; base64 decode + snake_case→camelCase
-	// normalization happen inside the adapter.
-	const flaskEngine = await createFlaskClient();
-	const flask = new LegacyFlaskPlatformAdapter({ flask: flaskEngine });
+	// Production wiring (§9.2 / Stage 4-1b): prefer the formal /api/plugin/v1
+	// client when plugin credentials are present; fall back to the legacy Flask
+	// adapter otherwise. HistoPilot core (AgentRunner / SidecarServer) sees only
+	// the PlatformClient surface either way.
+	const baseUrl = process.env.AI_FLASK_URL || "http://127.0.0.1:8000";
+	const flask = await resolvePlatformClient(baseUrl);
 	const runner = new AgentRunner(store, bus, flask);
 
 	const port = parseInt(process.env.AI_SIDECAR_PORT || "", 10) || 8055;

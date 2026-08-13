@@ -21,7 +21,7 @@ import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 
 import type { SessionStore, SessionData, PendingSnapshotReview } from "./session-store.js";
-import { ContractError, bytesToBase64, legacySlide, type PlatformClient, type RegionResult, type RoiDict } from "./platform/contract.js";
+import { ContractError, bytesToBase64, legacySlide, type PlatformClient, type RegionResult, type RoiDict, type RunGrantRef } from "./platform/contract.js";
 
 // =========================================================================== //
 // Constants (ai_agent.py:33)
@@ -729,6 +729,10 @@ export function createTools(ctx: ToolContext): AgentTool<any, any>[] {
 					note: anote,
 					effectKey,
 					sessionId: ctx.sessionId,
+					// Stage 4-1b: pass the run grant (if any) so the v1 client can
+					// send X-Run-Grant. `ctx.cfg` carries the effective run config,
+					// which includes the Flask-injected `config.run_grant`.
+					runGrant: ctx.cfg.run_grant as RunGrantRef | undefined,
 				});
 			} catch (e) {
 				return okText(`落标注失败：${(e as Error).message || e}`);

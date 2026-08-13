@@ -182,6 +182,12 @@ export interface RunConfig extends AiEngineConfig {
 	 * produce owner-less sessions (visible only to owner / unfiltered).
 	 */
 	session_owner?: string;
+	/**
+	 * Stage 4-1b run grant (§7.6), injected by the Flask proxy at run start.
+	 * The v1 annotate capability requires it (X-Run-Grant); consumed by the
+	 * {@link PlatformClient} via {@link CreateAnnotationRequest.runGrant}.
+	 */
+	run_grant?: import("./platform/contract.js").RunGrantRef;
 }
 
 /** Common run arguments. `config` is required. */
@@ -361,8 +367,9 @@ export class AgentRunner {
 	}
 
 	// ----------------------------------------------------------------------- //
-	// run (fresh / reuse main) — app.py:1636 api_ai_run + 1941 _start_main_worker
-	// ----------------------------------------------------------------------- //
+		// ----------------------------------------------------------------------- //
+		// run (fresh / reuse main) — app.py:1636 api_ai_run + 1941 _start_main_worker
+		// ----------------------------------------------------------------------- //
 	/**
 	 * Start (or resume) the main session for a slide.
 	 *
@@ -379,6 +386,7 @@ export class AgentRunner {
 		const { slide, config } = args;
 		const fresh = args.fresh ?? false;
 		const owner = config.session_owner;
+		this.selfCheckRunGrant(config);
 
 		// Resolve which session to run.
 		let sessionId: string;
@@ -443,6 +451,7 @@ export class AgentRunner {
 	async askFork(args: RunArgs & { annotationId: string; question?: string }): Promise<{ sessionId: string; streamFromSeq: number }> {
 		const { slide, config, annotationId } = args;
 		const owner = config.session_owner;
+		this.selfCheckRunGrant(config);
 
 		// Locate the root annotation via the spot change log (tombstone-aware).
 		const roi = await this.findSpot(slide, annotationId);
@@ -530,6 +539,7 @@ export class AgentRunner {
 	async askBranch(args: RunArgs & { annotationId: string; question?: string }): Promise<{ sessionId: string; streamFromSeq: number }> {
 		const { slide, config, annotationId } = args;
 		const owner = config.session_owner;
+		this.selfCheckRunGrant(config);
 
 		// Locate the root annotation via the spot change log (tombstone-aware).
 		const roi = await this.findSpot(slide, annotationId);
@@ -620,6 +630,32 @@ export class AgentRunner {
 			await this.store.setStatus(sessionId, "paused");
 		}
 		return { ok: true };
+	}
+
+	// --------------------------------------------------------------------------- //
+	// Run-grant self-check (§7.6 / Stage 4-1b)
+	//
+	// Best-effort, log-only: when the run carries a run_grant AND the platform
+	// client implements verifyRunGrant (the v1 client does), probe the grant once
+	// before the run. Failure NEVER blocks a run — it is defensive against
+	// platform/plugin version skew during the migration window (a too-old platform
+	// returns no client, or a version mismatch surfaces a false negative). Real
+	// grant failures are still caught authoritatively by annotate's 403.
+	// --------------------------------------------------------------------------- //
+	private selfCheckRunGrant(config: RunConfig): void {
+		const grant = config.run_grant;
+		const verify = this.flask.verifyRunGrant;
+		if (!grant || !verify) return;
+		// Fire-and-forget; log-only. Never await (must not delay the run start).
+		void verify(grant)
+			.then((r) => {
+				if (!r.valid) {
+					console.warn(`[run-grant] pre-run self-check invalid for ${grant.slide} (${grant.grant_id}): ${r.reason || "unknown"}`);
+				}
+			})
+			.catch((e) => {
+				console.warn(`[run-grant] pre-run self-check failed (non-blocking) for ${grant.slide}: ${(e as Error)?.message || e}`);
+			});
 	}
 
 	// =========================================================================== //

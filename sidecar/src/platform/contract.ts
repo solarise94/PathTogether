@@ -220,6 +220,23 @@ export interface ChangePage {
 }
 
 /**
+ * Run-grant reference (§7.6). Issued by the platform at run start and injected
+ * into the sidecar run config as `config.run_grant` by the Flask proxy. The v1
+ * annotate capability requires the grant id (as `X-Run-Grant`); the stable-id
+ * and installation identity fields are carried for self-verification/logging.
+ */
+export interface RunGrantRef {
+	/** The grant id the platform issued at run start. */
+	grant_id: string;
+	/** The owning plugin installation id. */
+	installation_id: string;
+	/** The slide this grant is scoped to. */
+	slide: string;
+	/** Grant expiry (unix seconds, platform's `expires_at`). */
+	expires_at?: number | string;
+}
+
+/**
  * Idempotent annotation create request (§6.4). `effectKey` is the idempotency
  * key (recommended `${session_id}:${tool_call_id}:${effect_seq}`).
  */
@@ -232,6 +249,12 @@ export interface CreateAnnotationRequest {
 	note?: string;
 	effectKey?: string;
 	sessionId?: string;
+	/**
+	 * Run-grant for the v1 annotate capability. The formal channel REQUIRES it
+	 * (else 403 `run_grant_invalid`); the legacy adapter ignores it (uses the
+	 * shared `X-AI-Internal-Token`). Absent on internal/legacy runs.
+	 */
+	runGrant?: RunGrantRef;
 }
 
 /** Result of an annotation write — the legacy ROI dict shape. */
@@ -312,7 +335,25 @@ export type ContractErrorCode =
 	| "service_unavailable"
 	| "region_failed"
 	| "capability_not_supported"
-	| "unknown_error";
+	| "unknown_error"
+	// Stage 4-1b: codes surfaced by the formal /api/plugin/v1 channel (§7.7). They
+	// are deliberately added to the stable vocabulary (not folded into a nearby
+	// legacy code) so program branches can tell them apart:
+	//   - "unauthorized": the installation secret was rejected at token exchange
+	//     (wrong/rotated secret or installation disabled). Non-retryable by itself
+	//     — the operator must fix the credential file/env.
+	//   - "run_grant_invalid": an annotation write was refused because the
+	//     X-Run-Grant is missing/expired/revoked/mismatched (403). Non-retryable.
+	//   - "unavailable": a non-2xx v1 response whose error envelope is missing or
+	//     malformed (platform too old, or a proxy swallowed the JSON body). Treated
+	//     as retryable because it is defensive against version-skew, not an
+	//     authoritative rejection.
+	//   - "integrity_error": a region payload's Content-SHA256 did not match the
+	//     declared or locally-computed digest (corrupt/forged bytes). Non-retryable.
+	| "unauthorized"
+	| "run_grant_invalid"
+	| "unavailable"
+	| "integrity_error";
 
 /** Error thrown by every {@link PlatformClient} capability on failure (§7.7). */
 export class ContractError extends Error {
@@ -368,6 +409,14 @@ export interface PlatformClient {
 	annotate(request: CreateAnnotationRequest): Promise<AnnotationResult>;
 
 	// --- Declared capabilities, not yet exercised in Stage 1 (§7.2) --- //
+	/**
+	 * Best-effort run-grant self-check (§7.6). Implemented by the v1 client; the
+	 * legacy adapter does not implement it (undefined) because it has no grant
+	 * model. The AgentRunner calls it before a run when `config.run_grant` is
+	 * present, logging-only on failure so platform/plugin version skew cannot
+	 * block a run.
+	 */
+	verifyRunGrant?(grant: RunGrantRef): Promise<{ valid: boolean; reason: string }>;
 	updateAnnotation(request: UpdateAnnotationRequest): Promise<AnnotationResult>;
 	deleteAnnotation(request: DeleteAnnotationRequest): Promise<AnnotationTombstone>;
 	openEventStream(request: EventStreamRequest, signal?: AbortSignal): AsyncIterable<PlatformEvent>;

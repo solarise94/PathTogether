@@ -18,6 +18,7 @@ TRUNCATE）。运行：cd 项目根 && python3 -m pytest tests/test_plugin_api.p
 """
 import base64
 import hashlib
+import json
 import os
 import stat
 import sys
@@ -84,7 +85,15 @@ def _secret_file():
 
 
 def _file_secret():
-    return _secret_file().read_text(encoding="utf-8").strip()
+    raw = _secret_file().read_text(encoding="utf-8").strip()
+    # 4-1b 起凭证文件为 JSON {installation_id, secret}；旧格式整行即明文 secret。
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return str(obj.get("secret") or "")
+    except (ValueError, TypeError):
+        pass
+    return raw
 
 
 def _client():

@@ -130,7 +130,19 @@ esac
 
 # --------------------------------------------------------------------------- #
 # 1) 起 sidecar（后台）
+#
+# Stage 4-1b 启动顺序：sidecar 在启动时一次性解析插件凭证文件
+# （SHARE_DATA_DIR/plugin-secret-histopilot.txt，Flask import 期幂等引导写入）。
+# 若 sidecar 先于 Flask 首启完成引导，会因找不到文件而永久回退 legacy 适配器。
+# 故先做一次轻量 `import app` 预检：完成 owner/插件引导 + PG schema 检查（幂等），
+# 保证凭证文件在 sidecar 读取前已存在；失败则拒绝启动（与上面 PG 预检同语义）。
 # --------------------------------------------------------------------------- #
+if ! _APP_PRECHECK_OUT="$(python3 -c "import app" 2>&1)"; then
+    printf '%s\n' "$_APP_PRECHECK_OUT" >&2
+    echo "[entry] Flask 应用预检失败（import app 非零退出），拒绝启动" >&2
+    exit 1
+fi
+
 echo "[entry] starting AI sidecar ($SIDECAR_BIN)" >&2
 node "$SIDECAR_BIN" &
 SIDECAR_PID=$!

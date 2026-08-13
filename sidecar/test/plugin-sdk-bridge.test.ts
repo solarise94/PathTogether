@@ -2,7 +2,7 @@
  * plugin-sdk bridge-client + plugin-permissions 单测（Stage 5-2）。
  *
  * 用 createRequire 加载仓库根 UMD 模块（node 下走 module.exports 分支）：
- *   - plugins/sdk/bridge-client.js  → { createPluginBridge }
+ *   - plugins/sdk/ui/bridge-client.js → { createPluginBridge }
  *   - static/plugin-permissions.js  → { METHOD_PERMISSIONS, checkPermission }
  *
  * bridge 传输在浏览器里是同窗口函数分发（调 window.HostBridgeHost._receiveFromPlugin，
@@ -17,7 +17,7 @@ import { dirname, resolve } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
-const PluginSDK = require(resolve(here, "../../plugins/sdk/bridge-client.js")) as {
+const PluginSDK = require(resolve(here, "../../plugins/sdk/ui/bridge-client.js")) as {
 	createPluginBridge: (opts?: {
 		pluginId?: string;
 		timeoutMs?: number;

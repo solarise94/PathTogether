@@ -1,14 +1,14 @@
 # Sample Annotator（示例插件，Stage 5-2）
 
 一个**完全不依赖 HistoPilot 源码**的最小示例插件，演示通用插件 SDK
-`plugins/sdk/bridge-client.js`（`window.PluginSDK.createPluginBridge`）与平台 bridge
+`plugins/sdk/ui/bridge-client.js`（`window.PluginSDK.createPluginBridge`）与平台 bridge
 权限门（`static/plugin-permissions.js`）。
 
 ## 结构
 
 - `manifest.json`：插件清单（docs §7.1），四个版本字段相互独立。
 - `ui/index.html`：独立可开的 UI 入口（引 `/static/bridge-version.js` +
-  `/plugins/sdk/bridge-client.js` + `ui/main.js`），平台 iframe 或直开均可。
+  `/plugins/sdk/ui/bridge-client.js` + `ui/main.js`），平台 iframe 或直开均可。
 - `ui/main.js`：用 SDK 读取当前切片 metadata、导航 Viewer、创建测试标注、演示越权失败。
 
 ## service.baseUrl 说明

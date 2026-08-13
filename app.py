@@ -699,8 +699,10 @@ def _slide_info_dict(name: str) -> dict:
 # --------------------------------------------------------------------------- #
 # HistoPilot 插件 UI（Stage 2：同源独立 bundle）
 # --------------------------------------------------------------------------- #
-# 插件前端资源（仅服务 .js/.css；目录定位见 _plugin_ui_dir，路径穿越双重拒绝）。
-_PLUGIN_UI_ALLOWED_EXT = {".js", ".css"}
+# 插件前端资源（仅服务静态 .js/.css/.html——.html 供示例插件独立页/manifest ui.entry
+# 使用，send_from_directory 原样返回不经模板渲染；目录定位见 _plugin_ui_dir，
+# 路径穿越双重拒绝）。
+_PLUGIN_UI_ALLOWED_EXT = {".js", ".css", ".html"}
 
 
 def histopilot_ui_enabled():

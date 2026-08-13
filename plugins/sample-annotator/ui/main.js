@@ -1,7 +1,7 @@
 /* =========================================================================
    Sample Annotator 示例插件（Stage 5-2，docs §7.1/§7.5）
    -------------------------------------------------------------------------
-   演示通用 PluginSDK（plugins/sdk/bridge-client.js）：
+   演示通用 PluginSDK（plugins/sdk/ui/bridge-client.js）：
      - 启动时 negotiate() 握手；version_incompatible → 显示错误条并停止后续逻辑；
      - slide.getCurrent / viewer.navigate / annotation.create 走 bridge.request；
      - 越权演示：调 manifest 未声明权限的 annotation.read，验证稳定失败

@@ -114,7 +114,7 @@ def test_index_injects_sample_when_enabled(monkeypatch):
     assert r.status_code == 200
     body = r.get_data(as_text=True)
     assert "/plugins/sample-annotator/ui/main.js" in body
-    assert "/plugins/sdk/bridge-client.js" in body
+    assert "/plugins/sdk/ui/bridge-client.js" in body
     # 权限表：sample-annotator 键存在且含声明权限
     assert "SVS_PLUGIN_PERMISSIONS" in body
     assert "sample-annotator" in body
@@ -155,6 +155,28 @@ def test_plugin_route_rejects_path_traversal():
 def test_plugin_asset_rejects_non_js_css():
     r = _client().get("/plugins/sample-annotator/ui/README.txt")
     assert r.status_code == 403
+
+
+# =========================================================================== #
+# (f) SDK 静态资产与示例插件独立页（demo 烟雾发现的 404/403 回归守卫）
+# =========================================================================== #
+def test_sdk_bridge_client_served():
+    """SDK 浏览器端必须经通用路由可达：plugins/sdk/ui/bridge-client.js。
+
+    Stage 5-2 初版把它放 plugins/sdk/bridge-client.js（无 ui/ 层），通用路由
+    /plugins/<id>/ui/<file> 匹配不到 → demo 实测 404，示例插件面板引导崩。"""
+    r = _client().get("/plugins/sdk/ui/bridge-client.js")
+    assert r.status_code == 200
+    assert b"createPluginBridge" in r.data
+
+
+def test_sample_standalone_page_served():
+    """示例插件独立页（manifest ui.entry）必须可服务（.html 在允许扩展名内）。
+
+    Stage 5-2 初版扩展名白名单仅 .js/.css → 独立页 403。"""
+    r = _client().get("/plugins/sample-annotator/ui/index.html")
+    assert r.status_code == 200
+    assert b"sa-panel" in r.data
 
 
 def test_plugin_asset_rejects_nonexistent_js():

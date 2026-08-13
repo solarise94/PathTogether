@@ -45,6 +45,43 @@ DEFAULT_ROI_SIZES = [6.0, 6.5]
 # 管理员标注使用的固定 token
 ADMIN_TOKEN = "admin"
 
+# 数据归属（Stage 3a 身份基础）：懒迁移用「首个 owner 的 user_id」。
+# 由 app.py 在启动（owner 引导）后调用 set_owner_user_id() 注入；share_server.py
+# 不注入（保持其读路径无归属迁移）。_ensure_owner_refs 在 _load_locked 中对
+# projects/slide_meta/rois 补 owner_user_id 字段（本节点只落地字段，不做按字段
+# 过滤——那是下一个节点「资源级鉴权矩阵」的事）。
+_OWNER_USER_ID: str = ""
+
+
+def set_owner_user_id(user_id: str) -> None:
+    """注入当前 owner 的 user_id（供数据归属懒迁移使用）。"""
+    global _OWNER_USER_ID
+    _OWNER_USER_ID = user_id or ""
+
+
+def _ensure_owner_refs(data):
+    """把现存 projects/slide_meta/rois 懒迁移补 owner_user_id=首个 owner。
+
+    幂等：已有 owner_user_id 的不改。owner user_id 未注入（为空串）时跳过，
+    保持 share_server 等不关心归属的读路径零改动。返回是否发生过迁移。
+    """
+    if not _OWNER_USER_ID:
+        return False
+    migrated = False
+    for proj in data["projects"].values():
+        if isinstance(proj, dict) and proj.get("owner_user_id") is None:
+            proj["owner_user_id"] = _OWNER_USER_ID
+            migrated = True
+    for meta in data["slide_meta"].values():
+        if isinstance(meta, dict) and meta.get("owner_user_id") is None:
+            meta["owner_user_id"] = _OWNER_USER_ID
+            migrated = True
+    for roi in data["rois"]:
+        if isinstance(roi, dict) and roi.get("owner_user_id") is None:
+            roi["owner_user_id"] = _OWNER_USER_ID
+            migrated = True
+    return migrated
+
 
 def _roi_shared_compat(roi):
     """读取 roi 的 shared 字段并做旧数据兼容。
@@ -150,6 +187,9 @@ def _load_locked(f):
         # 存量 ROI 一次性迁移（补 annotation_id/change_seq/revision/source/deleted）
         # 迁移若改动数据，缓存给 _with_lock 用于补落盘
         changed = _ensure_roi_identity(data)
+        # 数据归属懒迁移（补 owner_user_id；owner 已注入时才生效）
+        if _ensure_owner_refs(data):
+            changed = True
         if changed:
             f._svs_migrated_data = data
         return data
@@ -520,7 +560,8 @@ def _clean_note(note):
 
 
 def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note="", visitor=None,
-            source=None, created_by_session_id=None, _effect_key=None, **geom):
+            source=None, created_by_session_id=None, _effect_key=None, owner_user_id=None,
+            **geom):
     """为 token 的 share 添加一条标注；统一入口，支持 rect/arrow/freehand。
 
     管理员标注使用 token="admin"（此时 share 校验放宽：不要求 token 命中 shares，
@@ -596,6 +637,7 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
             "change_seq": _bump_change_seq(data, slide),
             "updated_at": now,
             "deleted": False,
+            "owner_user_id": owner_user_id or _OWNER_USER_ID or None,
         }
         if _effect_key:
             roi["effect_key"] = _effect_key
@@ -915,11 +957,12 @@ def list_shared_rois_for_slides(slides):
 # --------------------------------------------------------------------------- #
 # 样本元数据（别名/备注）—— shares.json 顶层 slide_meta
 # --------------------------------------------------------------------------- #
-def set_slide_meta(name, alias=None, note=None):
+def set_slide_meta(name, alias=None, note=None, owner_user_id=None):
     """设置/更新某切片的别名与备注。
 
     alias/note 为 None 表示不改该项；空串表示清除该项。
     name 不存在时仍写入（便于先建别名后传文件）；返回更新后的 meta dict。
+    owner_user_id 为创建者归属（可选；缺省用已注入的 owner id）。
     """
     def _do(f):
         data = _load_locked(f)
@@ -942,6 +985,8 @@ def set_slide_meta(name, alias=None, note=None):
                 cur["note"] = n
             else:
                 cur.pop("note", None)
+        if cur.get("owner_user_id") is None:
+            cur["owner_user_id"] = owner_user_id or _OWNER_USER_ID or None
         if cur:
             meta_map[name] = cur
         else:
@@ -985,10 +1030,11 @@ def get_all_slide_meta():
 # --------------------------------------------------------------------------- #
 # 项目（projects）—— 仅维护切片归属关系，不移动/删除切片文件
 # --------------------------------------------------------------------------- #
-def create_project(name, note="", slides=None):
+def create_project(name, note="", slides=None, owner_user_id=None):
     """创建项目。pid=secrets.token_urlsafe(10)。
 
     slides 在此只做去重，是否为已存在切片由调用方保证。
+    owner_user_id 为创建者归属（可选；缺省用已注入的 owner id，否则留空）。
     返回新建项目 dict（含 pid）。
     """
     pid = secrets.token_urlsafe(10)
@@ -1005,6 +1051,7 @@ def create_project(name, note="", slides=None):
         "note": str(note or ""),
         "slides": uniq,
         "created_at": now,
+        "owner_user_id": owner_user_id or _OWNER_USER_ID or None,
     }
 
     def _do(f):

@@ -41,6 +41,7 @@ import requests
 import share_store
 import slide_cache
 import slide_io
+import user_store
 
 app = Flask(__name__)
 
@@ -113,7 +114,50 @@ def _resolve_admin_auth(environ=None):
     return username, password, bool(password)
 
 
-ADMIN_USERNAME, ADMIN_PASSWORD, AUTH_ENABLED = _resolve_admin_auth()
+ADMIN_USERNAME, ADMIN_PASSWORD, _AUTH_BY_PASSWORD = _resolve_admin_auth()
+
+
+def _bootstrap_owner(environ=None):
+    """owner 引导与迁移（Stage 3a 身份基础）。
+
+    ADMIN_PASSWORD 非空时：若 users.json 无 owner 角色用户，创建 owner 行
+    （email 用 ADMIN_USERNAME 值——它可以是名字不要求邮箱格式，display_name 同值）；
+    若已存在 owner 且 ADMIN_PASSWORD 与现存 hash 不匹配，更新该 owner 的
+    password_hash（env 始终可重置 owner 密码，保住「改密码靠 env」运维习惯）。
+
+    返回 owner 的 user_id；ADMIN_PASSWORD 为空时返回 None。
+    """
+    env = os.environ if environ is None else environ
+    password = env.get("ADMIN_PASSWORD") or ""
+    if not password:
+        return None
+    username = env.get("ADMIN_USERNAME") or "admin"
+    try:
+        owner = user_store.ensure_owner(username, password)
+    except Exception:
+        # 引导失败不阻断启动；auth 仍由密码开启，登录时会因无 owner 而无法验证
+        return None
+    return owner.get("user_id") if owner else None
+
+
+# 数据归属懒迁移：注入首个 owner 的 user_id（share_store._ensure_owner_refs 据此
+# 给现存 projects/slide_meta/rois 补 owner_user_id；本节点只落地字段，不做过滤）。
+_OWNER_USER_ID = _bootstrap_owner()
+if _OWNER_USER_ID:
+    share_store.set_owner_user_id(_OWNER_USER_ID)
+
+# AUTH_ENABLED 语义不变：有 ADMIN_PASSWORD 或存在任何 enabled 用户即开
+# （存在 admin 用户账户时即使未设 ADMIN_PASSWORD 也保持认证，防止误开免登录）。
+def _resolve_auth_enabled():
+    if _AUTH_BY_PASSWORD:
+        return True
+    try:
+        return user_store.has_enabled_users()
+    except Exception:
+        return False
+
+
+AUTH_ENABLED = _resolve_auth_enabled()
 
 # session 有效期 7 天
 app.permanent_session_lifetime = timedelta(days=7)
@@ -583,11 +627,13 @@ def histopilot_ui_asset(filename):
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    """管理员登录页。GET 渲染；POST 校验并写 session。
+    """登录页。GET 渲染；POST 校验并写 session。
 
-    用 hmac.compare_digest 比较用户名/密码；连续失败 5 次锁定 60 秒。
-    成功：session.permanent=True，session["auth_user"]=username，跳 next（校验
-    必须以 / 开头且不以 // 开头，防开放跳转）或 "/"。
+    支持用邮箱或用户名（display_name）登录，密码经 werkzeug 哈希校验
+    （user_store.verify_user）。连续失败 5 次锁定 60 秒。
+    成功：session.permanent=True，session["auth_user"]=display_name、
+    session["user_id"]、session["role"]；跳 next（校验必须以 / 开头且不以 // 开头，
+    防开放跳转）或 "/"。
     """
     if not AUTH_ENABLED:
         # 未启用认证：直接回首页
@@ -605,12 +651,13 @@ def login():
         password = request.form.get("password", "")
         # POST 时 next 来自表单隐藏域（GET 渲染时已写入）
         post_next = request.form.get("next") or "/"
-        user_ok = hmac.compare_digest(username, ADMIN_USERNAME)
-        pass_ok = hmac.compare_digest(password, ADMIN_PASSWORD)
+        user = user_store.verify_user(username, password)
 
-        if user_ok and pass_ok:
+        if user is not None:
             session.permanent = True
-            session["auth_user"] = ADMIN_USERNAME
+            session["auth_user"] = user.get("display_name") or user.get("email")
+            session["user_id"] = user.get("user_id")
+            session["role"] = user.get("role")
             _clear_auth_fails(ip)
             # 校验 next：必须以 / 开头且不以 // 开头，防开放跳转
             if not post_next.startswith("/") or post_next.startswith("//"):
@@ -633,11 +680,126 @@ def logout():
 
 @app.route("/api/auth/info")
 def api_auth_info():
-    """返回认证状态与当前登录用户名。"""
+    """返回认证状态与当前登录用户信息（含 role 与 user_id）。"""
     return jsonify(
         auth_enabled=AUTH_ENABLED,
         username=session.get("auth_user"),
+        role=session.get("role"),
+        user_id=session.get("user_id"),
     )
+
+
+def _require_owner():
+    """owner-only 守卫：当前 session 角色非 owner 返回 403 JSON。
+
+    仅 owner（部署者 / superadmin）可管理用户。未登录或 user/guest 一律 403
+    （资源级鉴权矩阵是下一节点的事，这里只做身份级 owner 判定）。
+    """
+    if session.get("role") == user_store.ROLE_OWNER:
+        return None
+    return jsonify(error="需要 owner 权限"), 403
+
+
+# --------------------------------------------------------------------------- #
+# owner 用户管理（Stage 3a 身份基础；注册默认关闭，docs §19-12）
+# --------------------------------------------------------------------------- #
+# 开放注册开关默认关闭（"0"）。本节点不做公开注册页——owner 手动添加用户。
+REGISTRATION_OPEN = (os.environ.get("REGISTRATION_OPEN") or "0").strip().lower() in (
+    "1", "true", "yes")
+
+
+@app.route("/api/admin/users", methods=["GET"])
+def api_admin_users_list():
+    """列出全部用户（不含 hash）与开放注册开关。仅 owner。"""
+    auth = _require_owner()
+    if auth:
+        return auth
+    return jsonify(users=user_store.list_users(), registration_open=REGISTRATION_OPEN)
+
+
+@app.route("/api/admin/users", methods=["POST"])
+def api_admin_users_create():
+    """创建 user 角色账户。仅 owner。JSON: {email, password, display_name?}。
+
+    email 冲突 409；密码 <8 位 400。返回新用户（不含 hash）。初始密码由 owner
+    线下告知用户（本节点不做邮件发送）。
+    """
+    auth = _require_owner()
+    if auth:
+        return auth
+    body = request.get_json(silent=True) or {}
+    email = body.get("email")
+    password = body.get("password")
+    display_name = body.get("display_name")
+    if not isinstance(email, str) or not email.strip():
+        return jsonify(error="缺少邮箱/用户名"), 400
+    if not isinstance(password, str) or not password:
+        return jsonify(error="缺少密码"), 400
+    if len(password) < 8:
+        return jsonify(error="密码长度至少 8 位"), 400
+    try:
+        user = user_store.create_user(
+            email, password, role=user_store.ROLE_USER, display_name=display_name)
+    except ValueError as e:
+        msg = str(e)
+        if "已存在" in msg:
+            return jsonify(error=msg), 409
+        return jsonify(error=msg), 400
+    return jsonify(user)
+
+
+@app.route("/api/admin/users/<user_id>/disable", methods=["POST"])
+def api_admin_users_disable(user_id):
+    """禁用用户。仅 owner。不能禁用最后一个 enabled owner（400）。"""
+    auth = _require_owner()
+    if auth:
+        return auth
+    target = user_store.get_user(user_id)
+    if target is None:
+        return jsonify(error="用户不存在"), 404
+    # 保护：不能禁用最后一个 enabled owner
+    if target.get("role") == user_store.ROLE_OWNER and not target.get("disabled"):
+        if user_store.count_owners() <= 1:
+            return jsonify(error="不能禁用最后一个启用中的 owner"), 400
+    user = user_store.set_user_disabled(user_id, True)
+    return jsonify(user)
+
+
+@app.route("/api/admin/users/<user_id>/enable", methods=["POST"])
+def api_admin_users_enable(user_id):
+    """启用用户。仅 owner。"""
+    auth = _require_owner()
+    if auth:
+        return auth
+    user = user_store.set_user_disabled(user_id, False)
+    if user is None:
+        return jsonify(error="用户不存在"), 404
+    return jsonify(user)
+
+
+@app.route("/api/admin/users/<user_id>/password", methods=["POST"])
+def api_admin_users_password(user_id):
+    """重置用户密码。仅 owner。JSON: {password}。
+
+    不能重置最后一个 enabled owner 的密码会致其失联——owner 密码由 env
+    ADMIN_PASSWORD 兜底可重置，故仅校验密码长度。
+    """
+    auth = _require_owner()
+    if auth:
+        return auth
+    body = request.get_json(silent=True) or {}
+    new_password = body.get("password")
+    if not isinstance(new_password, str) or not new_password:
+        return jsonify(error="缺少密码"), 400
+    if len(new_password) < 8:
+        return jsonify(error="密码长度至少 8 位"), 400
+    try:
+        user = user_store.set_user_password(user_id, new_password)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    if user is None:
+        return jsonify(error="用户不存在"), 404
+    return jsonify(user)
 
 
 @app.route("/api/slides")
@@ -2559,7 +2721,8 @@ def api_project_create():
     clean, err = _validate_slide_names(slides if isinstance(slides, list) else [])
     if err:
         return jsonify(error=err), 400
-    proj = share_store.create_project(name=name.strip(), note=note or "", slides=clean)
+    proj = share_store.create_project(name=name.strip(), note=note or "", slides=clean,
+                                      owner_user_id=session.get("user_id"))
     return jsonify(proj)
 
 
@@ -2702,7 +2865,8 @@ def api_slide_meta(name):
         return jsonify(error="alias 需为字符串"), 400
     if note is not None and not isinstance(note, str):
         return jsonify(error="note 需为字符串"), 400
-    meta = share_store.set_slide_meta(safe, alias=alias, note=note)
+    meta = share_store.set_slide_meta(safe, alias=alias, note=note,
+                                      owner_user_id=session.get("user_id"))
     return jsonify(ok=True, meta=meta)
 
 
@@ -2748,7 +2912,8 @@ def api_annotation_add():
             geom[k] = body[k]
     try:
         roi = share_store.add_roi(
-            share_store.ADMIN_TOKEN, safe, label, type=typ, shared=shared, note=note, **geom
+            share_store.ADMIN_TOKEN, safe, label, type=typ, shared=shared, note=note,
+            owner_user_id=session.get("user_id"), **geom
         )
     except ValueError as e:
         return jsonify(error=str(e)), 400

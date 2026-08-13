@@ -63,6 +63,10 @@
     });
   }
 
+  // 当前登录用户角色（/api/auth/info 缓存，供 users 管理区块显示）
+  var currentRole = null;
+  var currentUserId = null;
+
   // 页面初始化时拉取认证状态：启用认证则显示退出登录（附用户名）
   function initAuth() {
     if (!els.logoutBtn) return;
@@ -72,8 +76,131 @@
         if (info.username) { label += " (" + info.username + ")"; }
         els.logoutBtn.textContent = label;
         els.logoutBtn.hidden = false;
+        currentRole = info.role || null;
+        currentUserId = info.user_id || null;
+        showUsersMgr();
       }
     }).catch(function () { /* 忽略，不影响主功能 */ });
+  }
+
+  // ---------- 用户管理（仅 owner 可见；Stage 3a 身份基础） ----------
+  function showUsersMgr() {
+    var section = els.usersMgrSection;
+    if (!section) return;
+    if (currentRole === "owner") {
+      section.hidden = false;
+      loadUsers();
+    } else {
+      section.hidden = true;
+    }
+  }
+
+  function loadUsers() {
+    apiFetch("/api/admin/users").then(function (r) {
+      return r.json().then(function (body) {
+        return { status: r.status, body: body };
+      });
+    }).then(function (res) {
+      if (res.status === 403) { currentRole = null; showUsersMgr(); return; }
+      if (res.status !== 200) { toast(res.body.error || "加载失败", "error"); return; }
+      if (els.usersRegOpen) {
+        els.usersRegOpen.textContent = tt("sb.users.reg.open") + (res.body.registration_open ? " ✓" : "");
+      }
+      renderUsers(res.body.users || []);
+    }).catch(function () { /* 忽略 */ });
+  }
+
+  function renderUsers(users) {
+    var list = els.usersList;
+    if (!list) return;
+    list.innerHTML = users.map(function (u) {
+      var roleTxt = tt("sb.users.role." + (u.role === "owner" ? "owner" : "user"));
+      var statusTxt = u.disabled ? tt("sb.users.status.disabled") : tt("sb.users.status.enabled");
+      var created = u.created_at ? new Date(u.created_at * 1000).toLocaleString() : "";
+      var self = u.user_id === currentUserId;
+      var disableBtn = "";
+      if (!self) {
+        disableBtn = u.disabled
+          ? '<button class="btn secondary small" data-act="enable" data-uid="' + esc(u.user_id) + '">' + esc(tt("sb.users.enable")) + '</button>'
+          : '<button class="btn secondary small" data-act="disable" data-uid="' + esc(u.user_id) + '">' + esc(tt("sb.users.disable")) + '</button>';
+      }
+      return '<div class="user-row" data-uid="' + esc(u.user_id) + '">' +
+        '<div class="user-main"><span class="user-name">' + esc(u.display_name || u.email) + '</span>' +
+        '<span class="user-sub">' + esc(u.email) + ' · ' + roleTxt + ' · ' + statusTxt + '</span>' +
+        '<span class="user-created">' + esc(created) + '</span></div>' +
+        '<div class="user-actions">' +
+        disableBtn +
+        '<button class="btn secondary small" data-act="reset" data-uid="' + esc(u.user_id) + '">' + esc(tt("sb.users.reset")) + '</button>' +
+        '</div></div>';
+    }).join("");
+  }
+
+  function addUserAction(act, uid) {
+    if (act === "disable" || act === "enable") {
+      apiFetch("/api/admin/users/" + encodeURIComponent(uid) + "/" + act, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      }).then(function (r) {
+        return r.json().then(function (b) { return { status: r.status, body: b }; });
+      }).then(function (res) {
+        if (res.status !== 200) { toast(res.body.error || "操作失败", "error"); return; }
+        loadUsers();
+      });
+      return;
+    }
+    if (act === "reset") {
+      var np = window.prompt(tt("sb.users.reset.confirm"));
+      if (np == null || np === "") return;
+      apiFetch("/api/admin/users/" + encodeURIComponent(uid) + "/password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: np }),
+      }).then(function (r) {
+        return r.json().then(function (b) { return { status: r.status, body: b }; });
+      }).then(function (res) {
+        if (res.status !== 200) { toast(res.body.error || "操作失败", "error"); return; }
+        toast(tt("sb.users.reset.ok"), "info");
+        loadUsers();
+      });
+    }
+  }
+
+  function submitAddUser() {
+    var email = (els.usersEmail.value || "").trim();
+    var password = els.usersPassword.value || "";
+    var display = (els.usersDisplay.value || "").trim();
+    if (!email || !password) { toast(tt("sb.users.reset.confirm"), "error"); return; }
+    apiFetch("/api/admin/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: email, password: password, display_name: display || undefined }),
+    }).then(function (r) {
+      return r.json().then(function (b) { return { status: r.status, body: b }; });
+    }).then(function (res) {
+      if (res.status === 409 || res.status === 400) { toast(res.body.error || "添加失败", "error"); return; }
+      if (res.status !== 200) { toast("添加失败", "error"); return; }
+      els.usersEmail.value = "";
+      els.usersPassword.value = "";
+      els.usersDisplay.value = "";
+      toast(tt("sb.users.add.ok"), "info");
+      loadUsers();
+    });
+  }
+
+  function initUsersMgr() {
+    if (!els.usersMgrSection) return;
+    els.usersMgrToggle.addEventListener("click", function () {
+      var sec = els.usersMgrBody.closest(".section");
+      if (sec) sec.classList.toggle("collapsed");
+    });
+    els.usersAddBtn.addEventListener("click", submitAddUser);
+    els.usersPassword.addEventListener("keydown", function (e) { if (e.key === "Enter") submitAddUser(); });
+    els.usersList.addEventListener("click", function (e) {
+      var btn = e.target.closest("[data-act]");
+      if (!btn) return;
+      addUserAction(btn.getAttribute("data-act"), btn.getAttribute("data-uid"));
+    });
   }
 
   // 缓存：全部切片、全部项目、全部分享
@@ -179,6 +306,16 @@
     shareResultUrl: $("share-result-url"),
     shareResultCopy: $("share-result-copy"),
     shareList: $("share-list"),
+    // 用户管理（owner）
+    usersMgrSection: $("users-mgr-section"),
+    usersMgrToggle: $("users-mgr-toggle"),
+    usersMgrBody: $("users-mgr-body"),
+    usersEmail: $("users-email"),
+    usersDisplay: $("users-display"),
+    usersPassword: $("users-password"),
+    usersAddBtn: $("users-add-btn"),
+    usersRegOpen: $("users-reg-open"),
+    usersList: $("users-list"),
     // 切片选择器
     pickerMask: $("slide-picker-mask"),
     pickerTitleText: $("picker-title-text"),
@@ -3142,6 +3279,9 @@
       var sec = els.shareMgrBody.closest(".section");
       if (sec) sec.classList.toggle("collapsed");
     });
+
+    // 用户管理（owner）
+    initUsersMgr();
 
     // 切片选择器
     els.pickerClose.addEventListener("click", closeSlidePicker);

@@ -82,6 +82,25 @@
       "sb.share.create": "分享选中切片",
       "sb.share.copy": "复制",
       "sb.logout": "退出登录",
+      "sb.section.users": "用户管理",
+      "sb.users.email.ph": "邮箱 / 用户名",
+      "sb.users.display.ph": "显示名（可选）",
+      "sb.users.password.ph": "初始密码（≥8位）",
+      "sb.users.add": "添加用户",
+      "sb.users.reg.open": "开放注册：关闭",
+      "sb.users.role.owner": "owner",
+      "sb.users.role.user": "user",
+      "sb.users.status.enabled": "启用",
+      "sb.users.status.disabled": "已禁用",
+      "sb.users.disable": "禁用",
+      "sb.users.enable": "启用",
+      "sb.users.reset": "重置密码",
+      "sb.users.created": "创建时间",
+      "sb.users.add.ok": "用户已创建",
+      "sb.users.reset.ok": "密码已重置",
+      "sb.users.reset.ph": "新密码（≥8位）",
+      "sb.users.reset.confirm": "请输入新密码",
+      "sb.users.last.owner": "不能禁用最后一个启用中的 owner",
 
       // ---- 拖拽 / 选择器 ----
       "drop.text": "松开以上传切片",
@@ -142,7 +161,7 @@
 
       // ---- login ----
       "login.subtitle": "请输入管理员账号以继续",
-      "login.username": "用户名",
+      "login.username": "邮箱或用户名",
       "login.password": "密码",
       "login.submit": "登录",
 
@@ -482,6 +501,25 @@
       "sb.share.create": "Share selected slides",
       "sb.share.copy": "Copy",
       "sb.logout": "Log out",
+      "sb.section.users": "Users",
+      "sb.users.email.ph": "Email / username",
+      "sb.users.display.ph": "Display name (optional)",
+      "sb.users.password.ph": "Initial password (≥8 chars)",
+      "sb.users.add": "Add user",
+      "sb.users.reg.open": "Open registration: off",
+      "sb.users.role.owner": "owner",
+      "sb.users.role.user": "user",
+      "sb.users.status.enabled": "Enabled",
+      "sb.users.status.disabled": "Disabled",
+      "sb.users.disable": "Disable",
+      "sb.users.enable": "Enable",
+      "sb.users.reset": "Reset password",
+      "sb.users.created": "Created",
+      "sb.users.add.ok": "User created",
+      "sb.users.reset.ok": "Password reset",
+      "sb.users.reset.ph": "New password (≥8 chars)",
+      "sb.users.reset.confirm": "Enter new password",
+      "sb.users.last.owner": "Cannot disable the last enabled owner",
 
       // ---- 拖拽 / 选择器 ----
       "drop.text": "Drop to upload slide",
@@ -542,7 +580,7 @@
 
       // ---- login ----
       "login.subtitle": "Enter admin credentials to continue",
-      "login.username": "Username",
+      "login.username": "Email or username",
       "login.password": "Password",
       "login.submit": "Log in",
 

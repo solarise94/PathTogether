@@ -189,6 +189,26 @@
             <div id="share-list" class="share-list"></div>
           </div>
         </div>
+
+        <!-- 用户管理（仅 owner 可见；JS 依据 /api/auth/info 的 role 显示） -->
+        <div class="section" id="users-mgr-section" hidden>
+          <div class="section-head row" id="users-mgr-toggle">
+            <span class="caret">▾</span>
+            <span class="section-title" data-i18n="sb.section.users">用户管理</span>
+          </div>
+          <div id="users-mgr-body" class="section-body">
+            <!-- 添加用户表单 -->
+            <div class="users-add-form">
+              <input id="users-email" type="text" maxlength="120" data-i18n-ph="sb.users.email.ph" placeholder="邮箱 / 用户名" autocomplete="off" />
+              <input id="users-display" type="text" maxlength="120" data-i18n-ph="sb.users.display.ph" placeholder="显示名（可选）" autocomplete="off" />
+              <input id="users-password" type="password" maxlength="200" data-i18n-ph="sb.users.password.ph" placeholder="初始密码（≥8位）" autocomplete="new-password" />
+              <button id="users-add-btn" class="btn primary block" data-i18n="sb.users.add">添加用户</button>
+            </div>
+            <div class="users-reg-open" data-i18n="sb.users.reg.open">开放注册：关闭</div>
+            <!-- 用户列表 -->
+            <div id="users-list" class="users-list"></div>
+          </div>
+        </div>
       </div>
 
       <div class="sidebar-bottom">

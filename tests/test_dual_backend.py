@@ -203,3 +203,64 @@ def test_dual_pg_mirror_failure_does_not_block_json(dual, pg_conn, monkeypatch):
         assert cur.fetchone()["count"] == 0  # pg 影子未写（失败被吞）
     # json 权威仍在（读 json 路径）
     assert len(ss.list_shares()) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Stage 4-1a：插件安装 / run grant 的 dual 身份一致性
+# --------------------------------------------------------------------------- #
+def test_dual_plugin_installation_identity(dual, pg_conn):
+    ss, _us = dual
+    created = ss.create_plugin_installation("histopilot", version="0.1.0")
+    iid = created["installation_id"]
+    assert iid.startswith("pin_")
+    assert "secret" in created and "secret_hash" not in created
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "SELECT plugin_id, version, enabled, secret_hash "
+            "FROM plugin_installations WHERE installation_id=%s", (iid,))
+        row = cur.fetchone()
+    assert row is not None
+    assert row["plugin_id"] == "histopilot" and row["version"] == "0.1.0"
+    assert row["enabled"] is True
+    # 镜像按明文现算 hash（明文绝不进 pg），与 json 权威可互相验证
+    assert row["secret_hash"] and row["secret_hash"] != created["secret"]
+    import share_store_json
+    assert row["secret_hash"] == share_store_json._hash_installation_secret(created["secret"])
+    # rotate：旧 secret 失效，pg 行 hash 同步翻转（result-replay 复用同一镜像）
+    rotated = ss.rotate_installation_secret(iid)
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT secret_hash FROM plugin_installations WHERE installation_id=%s", (iid,))
+        assert cur.fetchone()["secret_hash"] == share_store_json._hash_installation_secret(rotated["secret"])
+    # disable：enabled 镜像翻转且不破坏 pg 已存 hash（postgres 单后端语义依赖它）
+    ss.set_installation_enabled(iid, False)
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT enabled, secret_hash FROM plugin_installations WHERE installation_id=%s", (iid,))
+        row = cur.fetchone()
+    assert row["enabled"] is False
+    assert row["secret_hash"] == share_store_json._hash_installation_secret(rotated["secret"])
+
+
+def test_dual_run_grant_identity(dual, pg_conn):
+    ss, _us = dual
+    created = ss.create_plugin_installation("histopilot")
+    grant = ss.create_run_grant(created["installation_id"], "a.svs",
+                                 session_id="sess_d", created_by_user_id="usr_d")
+    gid = grant["grant_id"]
+    assert gid.startswith("rgr_")
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "SELECT installation_id, slide, session_id, created_by_user_id, revoked "
+            "FROM run_grants WHERE grant_id=%s", (gid,))
+        row = cur.fetchone()
+    assert row is not None
+    assert row["installation_id"] == created["installation_id"]
+    assert row["slide"] == "a.svs" and row["session_id"] == "sess_d"
+    assert row["created_by_user_id"] == "usr_d" and row["revoked"] is False
+    # 撤销镜像
+    assert ss.revoke_run_grant(gid) is True
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT revoked, revoked_at FROM run_grants WHERE grant_id=%s", (gid,))
+        row = cur.fetchone()
+    assert row["revoked"] is True and row["revoked_at"] is not None
+    # session 维度列表（读 json 权威）
+    assert [g["grant_id"] for g in ss.list_run_grants_for_session("sess_d")] == [gid]

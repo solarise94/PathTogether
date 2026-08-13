@@ -59,7 +59,10 @@ if _RUN_PG:
     _BUSINESS_TABLES = (
         "rois", "change_log", "grants", "shares",
         "project_slides", "projects", "slide_assets", "slides", "users",
-        "audit_events",
+        "audit_events", "plugin_installations", "run_grants",
+        # comments 0003 起入库，但此前未进 truncate 清单——跨用例残留会让
+        # list_changes（含评论）读到上次用例的数据（Stage 4-1a 测试暴露）
+        "comments",
     )
 
     @pytest.fixture(scope="session")

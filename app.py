@@ -6,6 +6,7 @@
 """
 
 import base64
+import hashlib
 import hmac
 import io
 import json
@@ -393,6 +394,11 @@ def _require_auth():
         return None
     # internal 回调端点由 _require_internal 单独鉴权（共享 token），不走管理员 session
     if path.startswith("/internal/"):
+        return None
+    # plugin v1 端点自带鉴权（Stage 4-1a）：installation secret 换 scoped JWT、
+    # Bearer JWT 校验（_require_plugin_token），不走管理员 session（同 /internal/
+    # 一样是独立的机器对机器通道）
+    if path.startswith("/api/plugin/"):
         return None
     if path.startswith("/api/"):
         return jsonify(error="auth_required"), 401
@@ -1603,6 +1609,390 @@ def _mask_api_key(key: str) -> str:
     return key[:4] + "****" + key[-4:]
 
 
+# =========================================================================== #
+# Stage 4-1a：插件安装凭证 + scoped JWT + 正式 /api/plugin/v1（平台侧）
+#
+# 依据 docs/pathtogather-histopilot-platform-plugin-upgrade.md §7.6：
+#   1. 安装 HistoPilot 时平台为 installation 创建可撤销、可轮换的 service
+#      credential——只存 sha256 hash（share_store.plugin_installations），明文
+#      仅创建/轮换时返回一次 + 引导写 secret 文件（sidecar 4-1b 读取）；
+#   2. 用户起跑时平台发放 run_grant（slide 级、默认 2h、可撤销）；
+#   3. 插件后端用 installation secret 调 POST /api/plugin/v1/auth/token 换
+#      短期 access JWT（HS256、900s、scoped）；
+#   4. 插件用 Bearer JWT 调 /api/plugin/v1 能力端点（annotate 另需 X-Run-Grant）；
+#   5. installation disable 后其 token 立即不可用（每次校验回查 enabled——
+#      demo 规模每次一条读查询可接受，不做黑名单缓存）。
+# 旧的 /internal/ai/*（共享 AI_INTERNAL_TOKEN）在 4-1b sidecar 切换前保持
+# 并行可用（过渡期），contract 阶段删除。
+# =========================================================================== #
+
+# histopilot 安装引导用的插件标识（demo 单插件；插件目录是 4-1c 的事）
+_PLUGIN_HISTOPILOT_ID = "histopilot"
+
+# scoped JWT 常量（§7.6）
+_PLUGIN_JWT_ISSUER = "pathtogether"
+_PLUGIN_JWT_AUDIENCE = "plugin"
+_PLUGIN_JWT_TTL_SECONDS = 900
+# scope 空格分隔（JWT RFC 惯例）；逐端点校验（slide:read / region:read /
+# annotation:write；session:write / audit:write 留给 4-1b 之后的端点）
+_PLUGIN_JWT_SCOPES = "slide:read region:read annotation:write session:write audit:write"
+
+# run grant 默认生命周期（2h；§7.6 目标 1h，demo 放宽，env 可覆盖）
+_RUN_GRANT_TTL_SECONDS = float(os.environ.get("RUN_GRANT_TTL_SECONDS") or 7200)
+
+
+def _plugin_secret_file(plugin_id: str) -> Path:
+    """安装凭证明文文件路径（SHARE_DATA_DIR 下，0600）。"""
+    return _data_dir_for_secret() / ("plugin-secret-%s.txt" % plugin_id)
+
+
+def _plugin_jwt_key() -> bytes:
+    """scoped JWT 的 HS256 签名密钥：sha256("plugin-jwt:" + ai_secret.key 内容)。
+
+    复用 ai_secret.key 文件派生，不新增密钥文件（Stage 4-1a 决策）。先调
+    _load_or_create_ai_secret 确保文件存在（cryptography 可用时由它创建）；
+    不可用时（Fernet 降级路径）兜底写随机 hex——该文件此时无其他消费者，
+    cryptography 恢复后会按损坏密钥重建（见 _load_or_create_ai_secret 注释）。
+    """
+    p = _ai_secret_path()
+    _load_or_create_ai_secret()
+    try:
+        raw = p.read_bytes().strip()
+    except OSError:
+        raw = b""
+    if not raw:
+        raw = secrets.token_hex(32).encode("ascii")
+        try:
+            p.write_bytes(raw)
+            try:
+                os.chmod(p, 0o600)
+            except OSError:
+                pass
+        except OSError:
+            pass
+    return hashlib.sha256(b"plugin-jwt:" + raw).digest()
+
+
+# 模块级派生一次（重启/换 ai_secret.key 才变；测试可 monkeypatch 本值）
+_PLUGIN_JWT_KEY = _plugin_jwt_key()
+
+
+def _b64url(data: bytes) -> str:
+    """base64url 无 padding 编码。"""
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(seg: str) -> bytes:
+    """base64url 无 padding 解码（容忍缺 padding）。"""
+    pad = "=" * (-len(seg) % 4)
+    return base64.urlsafe_b64decode(seg + pad)
+
+
+def _plugin_jwt_encode(payload: dict, key: bytes = None, ttl: int = None) -> str:
+    """签发 HS256 JWT（header 固定 {"alg":"HS256","typ":"JWT"}）。"""
+    if key is None:
+        key = _PLUGIN_JWT_KEY
+    now = int(time.time())
+    body = dict(payload)
+    body.setdefault("iat", now)
+    body.setdefault("exp", now + int(ttl if ttl is not None else _PLUGIN_JWT_TTL_SECONDS))
+    body.setdefault("jti", secrets.token_hex(8))
+    header_b64 = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"},
+                                    separators=(",", ":")).encode("utf-8"))
+    payload_b64 = _b64url(json.dumps(body, separators=(",", ":")).encode("utf-8"))
+    signing_input = ("%s.%s" % (header_b64, payload_b64)).encode("ascii")
+    sig = _b64url(hmac.new(key, signing_input, hashlib.sha256).digest())
+    return "%s.%s.%s" % (header_b64, payload_b64, sig)
+
+
+def _plugin_jwt_decode(token: str, key: bytes = None):
+    """校验并解码 scoped JWT。
+
+    返回 (payload, None) 或 (None, err)：
+      err="invalid_token"  —— 格式/签名/alg/iss/aud 不符；
+      err="token_expired"  —— exp 已过（§7.7：可续期后重试）。
+    """
+    if key is None:
+        key = _PLUGIN_JWT_KEY
+    if not isinstance(token, str):
+        return None, "invalid_token"
+    parts = token.split(".")
+    if len(parts) != 3 or not all(parts):
+        return None, "invalid_token"
+    header_b64, payload_b64, sig_b64 = parts
+    try:
+        header = json.loads(_b64url_decode(header_b64))
+        payload = json.loads(_b64url_decode(payload_b64))
+    except Exception:
+        return None, "invalid_token"
+    if not isinstance(header, dict) or header.get("alg") != "HS256":
+        # 拒绝 alg 混淆（none/HS384 等）：本服务只签 HS256
+        return None, "invalid_token"
+    signing_input = ("%s.%s" % (header_b64, payload_b64)).encode("ascii")
+    expected = _b64url(hmac.new(key, signing_input, hashlib.sha256).digest())
+    if not hmac.compare_digest(expected, sig_b64):
+        return None, "invalid_token"
+    if not isinstance(payload, dict):
+        return None, "invalid_token"
+    if payload.get("iss") != _PLUGIN_JWT_ISSUER or payload.get("aud") != _PLUGIN_JWT_AUDIENCE:
+        return None, "invalid_token"
+    exp = payload.get("exp")
+    try:
+        if exp is None or float(exp) < time.time():
+            return None, "token_expired"
+    except (TypeError, ValueError):
+        return None, "invalid_token"
+    return payload, None
+
+
+# --------------------------------------------------------------------------- #
+# 统一错误信封（§7.7 的本节点子集）
+#
+# {error:{code, message, retryable}}（httpStatus 隐式在 HTTP 状态码；requestId
+# /details 可选）。code 用本节点词表：unauthorized / token_expired / forbidden /
+# run_grant_invalid / not_found / invalid_request / conflict /
+# slide_revision_conflict / rate_limited / internal / unavailable——完整 §7.7
+# 表（invalid_overlay / cursor_expired 等）随 4-2 二进制 transport 与事件流
+# 端点引入。retryable：token_expired（续期后可重试）与 5xx/限流为 true。
+# --------------------------------------------------------------------------- #
+_PLUGIN_ERROR_RETRYABLE = {
+    "unauthorized": False,
+    "token_expired": True,  # §7.7：仅 token_expired 可按续期流程重试
+    "forbidden": False,
+    "run_grant_invalid": False,
+    "not_found": False,
+    "invalid_request": False,
+    "conflict": False,
+    "slide_revision_conflict": False,
+    "rate_limited": True,
+    "internal": True,
+    "unavailable": True,
+}
+
+
+def _plugin_error(status: int, code: str, message: str, retryable=None, details=None):
+    """构造统一错误信封响应（plugin v1 端点专用）。"""
+    if retryable is None:
+        retryable = _PLUGIN_ERROR_RETRYABLE.get(code, False)
+    err = {"code": code, "message": message, "retryable": bool(retryable)}
+    if details is not None:
+        err["details"] = details
+    resp = jsonify(error=err)
+    resp.status_code = status
+    return resp
+
+
+def _require_plugin_token(required_scope=None):
+    """plugin v1 端点鉴权：Authorization: Bearer <scoped JWT>。
+
+    校验链：Bearer 形态 → 签名/iss/aud/exp（过期 → 401 token_expired）→
+    installation 存在且 enabled（**每次回查**，disable 后旧 token 立即失效；
+    demo 规模不做缓存）→ required_scope 包含于 payload.scope（不足 403 forbidden）。
+    返回 (claims, None) 或 (None, error_response)。
+    """
+    authz = request.headers.get("Authorization") or ""
+    if not authz.startswith("Bearer ") or not authz[len("Bearer "):].strip():
+        return None, _plugin_error(401, "unauthorized", "缺少 Bearer token")
+    token = authz[len("Bearer "):].strip()
+    payload, err = _plugin_jwt_decode(token)
+    if err is not None:
+        if err == "token_expired":
+            return None, _plugin_error(401, "token_expired", "token 已过期，请重新换取")
+        return None, _plugin_error(401, "unauthorized", "token 无效")
+    installation_id = payload.get("sub") or ""
+    installation = share_store.get_plugin_installation(installation_id)
+    if installation is None or not installation.get("enabled"):
+        return None, _plugin_error(401, "unauthorized", "插件安装不存在或已停用")
+    if required_scope:
+        scopes = (payload.get("scope") or "").split()
+        if required_scope not in scopes:
+            return None, _plugin_error(
+                403, "forbidden",
+                "scope 不足：需要 %s（当前 %s）" % (required_scope, payload.get("scope")))
+    return payload, None
+
+
+def _bootstrap_plugin_installations(environ=None):
+    """histopilot 安装引导（幂等，平台启动时调用）。
+
+    - 已有该 plugin_id 的安装行 → 原样返回，**绝不轮换 secret**（防止重启轮换
+      密钥打爆运行中的 sidecar）；
+    - 无安装行 → 创建。secret 来源优先级：
+        1. env PLUGIN_HISTOPILOT_SECRET（显式设置时优先于文件，且不写文件）；
+        2. secret 文件已存在 → 用文件内容（保持文件与安装行一致，也不重建）；
+        3. 新随机 → 写 SHARE_DATA_DIR/plugin-secret-histopilot.txt（0600），
+           **仅当该文件不存在**。
+    返回安装 dict（不含明文）；引导失败返回 None（不阻断平台启动——插件通道
+    不可用，但 Viewer/标注/协作照常）。
+    """
+    env = os.environ if environ is None else environ
+    plugin_id = _PLUGIN_HISTOPILOT_ID
+    try:
+        existing = [i for i in share_store.list_plugin_installations()
+                    if i.get("plugin_id") == plugin_id]
+    except Exception:
+        return None
+    if existing:
+        return existing[0]
+
+    env_secret = (env.get("PLUGIN_HISTOPILOT_SECRET") or "").strip()
+    secret_file = _plugin_secret_file(plugin_id)
+    file_secret = ""
+    if secret_file.is_file():
+        try:
+            file_secret = secret_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            file_secret = ""
+    if env_secret:
+        secret = env_secret
+    elif file_secret:
+        secret = file_secret
+    else:
+        secret = None  # create 内部生成
+    try:
+        created = share_store.create_plugin_installation(plugin_id, version="", secret=secret)
+    except Exception:
+        app.logger.warning("histopilot 安装引导失败（不阻断启动）", exc_info=True)
+        return None
+    plaintext = created.get("secret") or ""
+    if plaintext and not env_secret and not file_secret:
+        # 新生成的明文落盘（0600）；文件已存在（file_secret 非空）不会走到这里
+        try:
+            secret_file.parent.mkdir(parents=True, exist_ok=True)
+            secret_file.write_text(plaintext, encoding="utf-8")
+            try:
+                os.chmod(secret_file, 0o600)
+            except OSError:
+                pass
+        except OSError:
+            app.logger.warning("安装凭证文件写入失败：%s", secret_file)
+    out = dict(created)
+    out.pop("secret", None)
+    return out
+
+
+# 启动引导（幂等）：插件 v1 通道的 installation 凭证就位
+_HISTOPILOT_INSTALLATION = _bootstrap_plugin_installations()
+
+
+@app.route("/api/plugin/v1/auth/token", methods=["POST"])
+def plugin_v1_auth_token():
+    """installation secret → 短期 scoped access JWT（§7.6 第 3/5 步）。
+
+    body: {installation_id, secret}。校验通过返回
+    {access_token, expires_in: 900, token_type: "bearer"}；错误统一信封：
+    错 secret / 安装停用 → 401 unauthorized。
+    """
+    body = request.get_json(silent=True) or {}
+    installation_id = body.get("installation_id")
+    secret = body.get("secret")
+    if not isinstance(installation_id, str) or not installation_id.strip():
+        return _plugin_error(400, "invalid_request", "installation_id 与 secret 必填")
+    if not isinstance(secret, str) or not secret:
+        return _plugin_error(400, "invalid_request", "installation_id 与 secret 必填")
+    if not share_store.verify_installation_secret(installation_id, secret):
+        return _plugin_error(401, "unauthorized", "安装凭证无效")
+    installation = share_store.get_plugin_installation(installation_id)
+    if installation is None or not installation.get("enabled"):
+        return _plugin_error(401, "unauthorized", "插件安装不存在或已停用")
+    payload = {
+        "iss": _PLUGIN_JWT_ISSUER,
+        "aud": _PLUGIN_JWT_AUDIENCE,
+        "sub": installation_id,
+        "plugin_id": installation.get("plugin_id") or "",
+        "scope": _PLUGIN_JWT_SCOPES,
+    }
+    token = _plugin_jwt_encode(payload)
+    return jsonify(access_token=token, expires_in=_PLUGIN_JWT_TTL_SECONDS,
+                    token_type="bearer")
+
+
+# --------------------------------------------------------------------------- #
+# 插件安装管理 API（owner-only）
+# --------------------------------------------------------------------------- #
+@app.route("/api/admin/plugins", methods=["GET"])
+def api_admin_plugins():
+    """列出插件安装（含健康状态占位）。仅 owner。
+
+    health 为占位 "unknown"：sidecar 健康检查（manifest service.health）是
+    Stage 4-1b/4-1c 的事，本节点只交付安装凭证生命周期。
+    """
+    auth = _require_owner()
+    if auth:
+        return auth
+    items = []
+    for inst in share_store.list_plugin_installations():
+        item = dict(inst)
+        item["health"] = "unknown"  # 占位：4-1b 接 sidecar healthz 后填
+        items.append(item)
+    return jsonify(installations=items)
+
+
+@app.route("/api/admin/plugins/<installation_id>/rotate-secret", methods=["POST"])
+def api_admin_plugins_rotate(installation_id):
+    """轮换安装凭证：旧 secret 立即失效；新明文仅本次返回。仅 owner。"""
+    auth = _require_owner()
+    if auth:
+        return auth
+    rotated = share_store.rotate_installation_secret(installation_id)
+    if rotated is None:
+        return jsonify(error="安装不存在"), 404
+    _audit("plugin.rotate", target_type="plugin_installation",
+           target_id=installation_id)
+    return jsonify(installation_id=installation_id, secret=rotated["secret"])
+
+
+@app.route("/api/admin/plugins/<installation_id>/enable", methods=["POST"])
+@app.route("/api/admin/plugins/<installation_id>/disable", methods=["POST"])
+def api_admin_plugins_toggle(installation_id):
+    """启/停插件安装。disable 即撤销该安装全部在途 JWT（校验回查 enabled）。仅 owner。"""
+    auth = _require_owner()
+    if auth:
+        return auth
+    enable = request.path.endswith("/enable")
+    updated = share_store.set_installation_enabled(installation_id, enable)
+    if updated is None:
+        return jsonify(error="安装不存在"), 404
+    _audit("plugin.enable" if enable else "plugin.disable",
+           target_type="plugin_installation", target_id=installation_id)
+    return jsonify(updated)
+
+
+# --------------------------------------------------------------------------- #
+# run grant 发放（§7.6 第 2 步）
+# --------------------------------------------------------------------------- #
+def _issue_run_grant(slide, user_ctx, config):
+    """起跑时发放 run grant 并注入 sidecar 请求 config["run_grant"]。
+
+    sidecar 4-1b 才消费（本节点只发放 + 落库 + API）；发放是 best-effort：
+    失败记 log 不阻断起跑（存量 sidecar 不读该字段，行为不变）。session_id
+    起跑时未知 → 先 slide 级（session_id 空串）。
+    """
+    if not config or not slide:
+        return
+    installation = _HISTOPILOT_INSTALLATION or {}
+    installation_id = installation.get("installation_id")
+    if not installation_id:
+        return
+    try:
+        grant = share_store.create_run_grant(
+            installation_id=installation_id,
+            slide=slide,
+            session_id="",
+            created_by_user_id=(user_ctx or {}).get("user_id"),
+            ttl_seconds=_RUN_GRANT_TTL_SECONDS,
+        )
+    except Exception:
+        app.logger.warning("run grant 发放失败（不阻断起跑）", exc_info=True)
+        return
+    config["run_grant"] = {
+        "grant_id": grant["grant_id"],
+        "installation_id": installation_id,
+        "slide": slide,
+        "expires_at": grant["expires_at"],
+    }
+
+
 # --------------------------------------------------------------------------- #
 # AI 会话调优默认参数（内联自 ai_session.py；config 端点 + sidecar config 注入共用）
 # --------------------------------------------------------------------------- #
@@ -2652,6 +3042,12 @@ def _derivative_encoder_info(jpeg_quality=DERIVATIVE_JPEG_QUALITY):
 # --------------------------------------------------------------------------- #
 # AI sidecar internal 回调端点（pi 迁移 Step 2）
 #
+# **DEPRECATED（Stage 4-1a 起为过渡兼容层）**：正式通道是 /api/plugin/v1/*
+# （installation secret + scoped JWT + X-Run-Grant + 统一错误信封，见下方
+# plugin v1 区块）。sidecar 4-1b 切换到 PlatformClient 的 PathTogether 实现
+# 后，本区块在 contract 阶段整体删除；在此之前保持不动、并行可用（共享
+# AI_INTERNAL_TOKEN 互信）。
+#
 # 这些端点供 Node sidecar 回调本进程读图/落标注/取变更/取切片信息，复用
 # 上面的内部函数（_read_region_b64 / share_store.add_roi 等），不复制逻辑。
 # 全部用 _require_internal 校验 X-AI-Internal-Token（共享 token 互信），不走
@@ -2885,6 +3281,359 @@ def internal_ai_slide_info():
     })
 
 
+# =========================================================================== #
+# Stage 4-1a：正式插件能力 API /api/plugin/v1（scoped JWT + 统一错误信封）
+#
+# 镜像 /internal/ai/* 的四项能力（region/annotate/spots=changes/slide_info；
+# sidecar session state 本就归 sidecar 所有，无对应 internal 端点），差异：
+#   - 鉴权：Authorization: Bearer <scoped JWT>（_require_plugin_token 逐端点
+#     校验 scope），替代共享 X-AI-Internal-Token；
+#   - 错误：统一信封 {error:{code,message,retryable}}（_plugin_error，§7.7
+#     本节点子集），替代裸 {error:"中文"}；
+#   - annotate：强制 X-Run-Grant（有效 + installation/slide 匹配 + 未过期未
+#     撤销，否则 403 run_grant_invalid）；provenance.created_by_user_id 取自
+#     grant（不再信任请求体）；
+#   - region：本节点仍 base64 JSON（二进制 transport 是 4-2），但对返回的
+#     JPEG bytes 加 Content-SHA256 响应头（+ body 同值字段），供 sidecar 校验。
+# 路径命名对齐 docs §7.2（/slides/{slide_id}/...）；Stage 3b 映射完成前
+# {slide_id} 仍是 legacy filename（与 sidecar LegacySlideRef 一致）。
+# =========================================================================== #
+def _plugin_resolve_slide(slide):
+    """切片名清洗 + 存在性检查（错误走统一信封）。
+
+    返回 (safe, None) 或 (None, error_response)。存在性先查再交给 _get_slide，
+    保证 404 走信封（_safe_name 的 abort(JSON) 形状不同）。
+    """
+    safe = _sanitize_name(slide)
+    if not safe or safe != slide:
+        return None, _plugin_error(400, "invalid_request", "非法切片名")
+    if not (UPLOAD_DIR / safe).is_file():
+        return None, _plugin_error(404, "not_found", "切片不存在")
+    return safe, None
+
+
+def _verify_run_grant(grant_id, slide, installation_id):
+    """run grant 校验（annotate 端点与 verify 端点共用）。
+
+    返回 (valid, reason)；reason 供 verify 端点回显与日志（不泄露 grant 细节
+    之外的信息）。校验项：存在、未撤销、未过期、slide 匹配、installation 匹配。
+    """
+    if not grant_id:
+        return False, "missing_grant"
+    grant = share_store.get_run_grant(grant_id)
+    if grant is None:
+        return False, "grant_not_found"
+    if grant.get("revoked"):
+        return False, "grant_revoked"
+    try:
+        expired = float(grant.get("expires_at") or 0) <= time.time()
+    except (TypeError, ValueError):
+        expired = True
+    if expired:
+        return False, "grant_expired"
+    if slide is not None and grant.get("slide") != slide:
+        return False, "slide_mismatch"
+    if installation_id and grant.get("installation_id") != installation_id:
+        return False, "installation_mismatch"
+    return True, ""
+
+
+@app.route("/api/plugin/v1/slides/<slide>", methods=["GET"])
+def plugin_v1_slide_info(slide):
+    """切片尺寸/金字塔/mpp/指纹 + asset revision（对应 /internal/ai/slide_info）。
+
+    scope: slide:read。asset_revision 为 legacy mtime:size（Stage 3b 内容型
+    revision 的前身，仅供 region CAS 用）。
+    """
+    claims, err = _require_plugin_token("slide:read")
+    if err is not None:
+        return err
+    safe, serr = _plugin_resolve_slide(slide)
+    if serr is not None:
+        return serr
+    entry = _get_slide(safe)
+    with slide_cache.borrow_pair(entry) as pair:
+        osr = pair["osr"]
+        width, height = osr.dimensions
+        try:
+            level_downsamples = tuple(osr.level_downsamples)
+        except Exception:  # noqa: BLE001
+            level_downsamples = (1.0,)
+        meta = _read_metadata(osr, UPLOAD_DIR / safe)
+        mpp = meta.get("mpp_x")
+    return jsonify({
+        "width": width,
+        "height": height,
+        "level_downsamples": list(level_downsamples),
+        "mpp": mpp,
+        "fingerprint": _slide_fingerprint(safe),
+        "asset_revision": _legacy_slide_revision(safe),
+    })
+
+
+@app.route("/api/plugin/v1/slides/<slide>/regions", methods=["POST"])
+def plugin_v1_region(slide):
+    """读 level-0 区域派生图（对应 /internal/ai/region）。scope: region:read。
+
+    body 接受两种等价坐标形态（§7.3 / legacy）：
+      - {bbox: {x,y,w,h}, ...}（契约形态）
+      - {x, y, w, h, ...}（legacy 平铺，与 internal 端点一致）
+    可选：out_w/out_h、max_long_edge（优先，保宽高比）、jpeg_quality（1..100）、
+    expected_fingerprint（不符 → 409 slide_revision_conflict 信封）。
+    本节点仍返回 base64 JSON（二进制 transport 是 4-2）；Content-SHA256 响应头
+    与 body content_sha256 都是对返回 JPEG bytes 的 sha256（hex）。
+    """
+    claims, err = _require_plugin_token("region:read")
+    if err is not None:
+        return err
+    safe, serr = _plugin_resolve_slide(slide)
+    if serr is not None:
+        return serr
+    body = request.get_json(silent=True) or {}
+    # bbox 契约形态 → 平铺（两者同给时以平铺为准，与 internal 端点语义对齐）
+    bbox = body.get("bbox")
+    if isinstance(bbox, dict):
+        body = dict(body)
+        for k in ("x", "y", "w", "h"):
+            if k in bbox:
+                body.setdefault(k, bbox[k])
+
+    def _parse_int(key):
+        v = body.get(key)
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    x = _parse_int("x")
+    y = _parse_int("y")
+    w = _parse_int("w")
+    h = _parse_int("h")
+    if x is None or y is None or w is None or h is None:
+        return _plugin_error(400, "invalid_request", "x/y/w/h 参数需为整数")
+    if x < 0 or y < 0 or w <= 0 or h <= 0:
+        return _plugin_error(400, "invalid_request", "参数越界（0<=x,y，0<w,h）")
+    out_w = _parse_int("out_w")
+    out_h = _parse_int("out_h")
+    max_long_edge = _parse_int("max_long_edge")
+    if "maxLongEdge" in body and max_long_edge is None:
+        max_long_edge = _parse_int("maxLongEdge")  # camelCase 容错（§7.0 wire）
+    jpeg_quality = _parse_int("jpeg_quality")
+    if max_long_edge is not None and (max_long_edge < 1 or max_long_edge > 4096):
+        return _plugin_error(400, "invalid_request", "max_long_edge 需在 1..4096")
+    if jpeg_quality is not None and (jpeg_quality < 1 or jpeg_quality > 100):
+        return _plugin_error(400, "invalid_request", "jpeg_quality 需在 1..100")
+
+    expected_fp = body.get("expected_fingerprint") or body.get("expectedAssetRevision")
+    if isinstance(expected_fp, str) and expected_fp:
+        fp = _slide_fingerprint(safe)
+        if fp != expected_fp:
+            return _plugin_error(409, "slide_revision_conflict", "切片指纹不匹配（文件已变更）",
+                                 details={"expected": expected_fp, "actual": fp})
+    entry = _get_slide(safe)
+    with slide_cache.borrow_pair(entry) as pair:
+        osr = pair["osr"]
+        meta = _read_metadata(osr, UPLOAD_DIR / safe)
+        mpp = meta.get("mpp_x")
+    if not out_w or out_w <= 0:
+        out_w = 1568
+    if not out_h or out_h <= 0:
+        out_h = 1568
+    q = jpeg_quality if (jpeg_quality and jpeg_quality > 0) else DERIVATIVE_JPEG_QUALITY
+    r = _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
+                         max_long_edge=max_long_edge, jpeg_quality=q)
+    # Content-SHA256：对实际返回的 JPEG bytes 计算（4-1b sidecar 缓存校验用）
+    jpeg_bytes = base64.b64decode(r["image_base64"])
+    content_sha = hashlib.sha256(jpeg_bytes).hexdigest()
+    resp = jsonify({
+        "image_base64": r["image_base64"],
+        "mime": r["mime"],
+        "width": r["width"],
+        "height": r["height"],
+        "src": r["src"],
+        "magnification": r["magnification"],
+        "encoder": _derivative_encoder_info(q),
+        "content_sha256": content_sha,
+        "asset_revision": _legacy_slide_revision(safe),
+    })
+    resp.headers["Content-SHA256"] = content_sha
+    return resp
+
+
+@app.route("/api/plugin/v1/slides/<slide>/changes", methods=["GET"])
+def plugin_v1_changes(slide):
+    """增量取切片变更（含 tombstone；对应 /internal/ai/spots）。scope: slide:read。
+
+    query: after_seq（缺省 0；兼容 §7.2 的 after 别名）。
+    返回 {changes, current_seq}（与 internal 端点同形）。
+    """
+    claims, err = _require_plugin_token("slide:read")
+    if err is not None:
+        return err
+    safe, serr = _plugin_resolve_slide(slide)
+    if serr is not None:
+        return serr
+    raw_after = request.args.get("after_seq")
+    if raw_after is None:
+        raw_after = request.args.get("after", "0")
+    try:
+        after_seq = float(raw_after or "0")
+    except (TypeError, ValueError):
+        after_seq = 0
+    changes = share_store.list_changes(safe, after_seq)
+    current_seq = share_store.current_change_seq(safe)
+    return jsonify({"changes": changes, "current_seq": current_seq})
+
+
+@app.route("/api/plugin/v1/slides/<slide>/annotations", methods=["POST"])
+def plugin_v1_annotate(slide):
+    """落矩形标注（对应 /internal/ai/annotate）。scope: annotation:write。
+
+    与 internal 端点的差异（Stage 4-1a 契约）：
+      - **强制 X-Run-Grant header**：grant 须存在、未过期、未撤销、slide 与
+        installation 匹配，否则 403 run_grant_invalid（用户起跑授权，§7.6）；
+      - provenance.created_by_user_id **从 grant 来**（不信任请求体——请求体
+        的该字段被忽略）；plugin_id/plugin_version 回查 installation；
+      - expected_asset_revision 不符 → 409 slide_revision_conflict 统一信封。
+    body: {label, x, y, side_px, note?, effect_key?, session_id?, run_id?,
+    model?, provider?/base_url?, expected_asset_revision?}。
+    """
+    claims, err = _require_plugin_token("annotation:write")
+    if err is not None:
+        return err
+    safe, serr = _plugin_resolve_slide(slide)
+    if serr is not None:
+        return serr
+    grant_id = (request.headers.get("X-Run-Grant") or "").strip()
+    valid, reason = _verify_run_grant(grant_id, safe, claims.get("sub") or "")
+    if not valid:
+        return _plugin_error(403, "run_grant_invalid",
+                             "run grant 无效（%s）" % reason)
+    # verify 通过后原量再取一次供 provenance 用（竞态消失则按空 dict 降级）
+    grant = share_store.get_run_grant(grant_id) or {}
+
+    body = request.get_json(silent=True) or {}
+    label = body.get("label")
+    if not isinstance(label, str) or not label.strip():
+        return _plugin_error(400, "invalid_request", "label 参数缺失")
+
+    def _parse_num(key):
+        v = body.get(key)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_int(key):
+        v = body.get(key)
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    x = _parse_num("x")
+    y = _parse_num("y")
+    side_px = _parse_int("side_px")
+    if x is None or y is None or side_px is None:
+        return _plugin_error(400, "invalid_request", "x/y/side_px 参数需为数值")
+    if x < 0 or y < 0:
+        return _plugin_error(400, "invalid_request", "坐标需 ≥0")
+    if side_px < 1 or side_px > 40000:
+        return _plugin_error(400, "invalid_request", "side_px 需在 1~40000 之间")
+    note = body.get("note") or ""
+    effect_key = body.get("effect_key") or body.get("idempotency_key") or ""
+    session_id = body.get("session_id") or grant.get("session_id") or ""
+
+    expected_asset_revision = body.get("expected_asset_revision")
+    if expected_asset_revision is not None and str(expected_asset_revision) != "":
+        cur_rev = _legacy_slide_revision(safe)
+        if str(expected_asset_revision) != cur_rev:
+            return _plugin_error(
+                409, "slide_revision_conflict", "切片资产已更新",
+                details={"expected": str(expected_asset_revision), "actual": cur_rev})
+
+    # 归档项目只读（与 can_annotate_slide 同一规则；AI 写入同样受约束）
+    if safe in _archived_slide_names():
+        return _plugin_error(403, "forbidden", "切片所在项目已归档，只读")
+
+    # AI 溯源子对象（§6.4）：created_by_user_id 从 grant 来；plugin_id/version
+    # 回查 installation；请求体同名字段不采信。
+    installation = share_store.get_plugin_installation(claims.get("sub") or "") or {}
+    provenance = {
+        "plugin_id": installation.get("plugin_id") or "histopilot",
+        "plugin_version": body.get("plugin_version") or installation.get("version") or "",
+        "run_id": body.get("run_id") or "",
+        "session_id": session_id,
+        "model": body.get("model") or "",
+        "provider": _provider_host(body.get("base_url") or body.get("provider") or ""),
+        "created_by_user_id": grant.get("created_by_user_id") or "",
+        "slide_asset_revision": _legacy_slide_revision(safe),
+        "idempotency_key": effect_key or "",
+    }
+    try:
+        roi = share_store.add_roi(
+            share_store.ADMIN_TOKEN, safe, label, type="rect", note=note,
+            x=int(x), y=int(y), side_px=side_px,
+            source="ai", created_by_session_id=session_id,
+            _effect_key=effect_key or None,
+            provenance=provenance,
+        )
+    except ValueError as e:
+        return _plugin_error(400, "invalid_request", "落标注失败：{}".format(e))
+    _audit("annotation.add", target_type="annotation", target_id=roi.get("annotation_id"),
+           slide=safe, detail={"source": "ai", "via": "plugin_v1",
+                               "grant_id": grant_id})
+    return jsonify(roi)
+
+
+# --------------------------------------------------------------------------- #
+# run grant 管理 / 校验端点（§7.6）
+# --------------------------------------------------------------------------- #
+@app.route("/api/plugin/v1/run-grants/<grant_id>", methods=["DELETE"])
+def plugin_v1_run_grant_revoke(grant_id):
+    """撤销 run grant。Bearer JWT 认证；撤销权 = owner 或创建者本人。
+
+    owner（含 AUTH_ENABLED=False 归一 owner）任意；否则仅 grant.created_by_
+    user_id == 当前登录用户。撤销后 annotate 立即 403 run_grant_invalid。
+    """
+    claims, err = _require_plugin_token()
+    if err is not None:
+        return err
+    grant = share_store.get_run_grant(grant_id)
+    if grant is None:
+        return _plugin_error(404, "not_found", "run grant 不存在")
+    ident = current_identity()
+    if ident["role"] != user_store.ROLE_OWNER:
+        uid = ident.get("user_id")
+        creator = grant.get("created_by_user_id")
+        if not uid or not creator or uid != creator:
+            return _plugin_error(403, "forbidden", "仅 owner 或创建者可撤销 run grant")
+    share_store.revoke_run_grant(grant_id)
+    _audit("run_grant.revoke", target_type="run_grant", target_id=grant_id,
+           slide=grant.get("slide"))
+    return jsonify(ok=True, grant_id=grant_id, revoked=True)
+
+
+@app.route("/api/plugin/v1/run-grants/verify", methods=["POST"])
+def plugin_v1_run_grant_verify():
+    """run grant 校验（供 sidecar 4-1b 在 annotate 前自查）。Bearer JWT 认证。
+
+    body: {grant_id, slide}。恒 200 返回 {valid, reason}——valid=false 时
+    reason ∈ missing_grant/grant_not_found/grant_revoked/grant_expired/
+    slide_mismatch/installation_mismatch（§7.7：程序分支依赖稳定 code）。
+    """
+    claims, err = _require_plugin_token()
+    if err is not None:
+        return err
+    body = request.get_json(silent=True) or {}
+    grant_id = body.get("grant_id")
+    slide = body.get("slide")
+    if not isinstance(grant_id, str) or not grant_id:
+        return _plugin_error(400, "invalid_request", "grant_id 必填")
+    valid, reason = _verify_run_grant(grant_id, slide, claims.get("sub") or "")
+    return jsonify(valid=valid, reason=reason if not valid else "")
+
+
 @app.route("/api/ai/run", methods=["POST"])
 def api_ai_run():
     """主 session 起跑（SSE）。body: {slide, task?, fresh?}。
@@ -2911,6 +3660,8 @@ def api_ai_run():
     # 任意会话，sidecar acquire 守卫对无 owner 注入的 run 不生效）；内网模式不注入。
     if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
         config["session_owner"] = user_ctx["user_id"]
+    # Stage 4-1a：起跑发放 run grant（slide 级），sidecar 4-1b 消费
+    _issue_run_grant(slide, user_ctx, config)
     task = body.get("task")
     if isinstance(task, str):
         payload["task"] = task
@@ -2946,6 +3697,8 @@ def api_ai_continue():
     # 任意会话，sidecar acquire 守卫对无 owner 注入的 run 不生效）；内网模式不注入。
     if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
         config["session_owner"] = user_ctx["user_id"]
+    # Stage 4-1a：起跑发放 run grant（slide 级），sidecar 4-1b 消费
+    _issue_run_grant(slide, user_ctx, config)
     _audit("ai.run", target_type="session", slide=slide, detail={"mode": "continue"})
     return _proxy_sse("/continue", payload)
 
@@ -2979,6 +3732,8 @@ def api_ai_ask():
     # 任意会话，sidecar acquire 守卫对无 owner 注入的 run 不生效）；内网模式不注入。
     if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
         config["session_owner"] = user_ctx["user_id"]
+    # Stage 4-1a：起跑发放 run grant（slide 级），sidecar 4-1b 消费
+    _issue_run_grant(slide, user_ctx, config)
     question = body.get("question")
     if isinstance(question, str):
         payload["question"] = question
@@ -3017,6 +3772,8 @@ def api_ai_branch():
     # 任意会话，sidecar acquire 守卫对无 owner 注入的 run 不生效）；内网模式不注入。
     if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
         config["session_owner"] = user_ctx["user_id"]
+    # Stage 4-1a：起跑发放 run grant（slide 级），sidecar 4-1b 消费
+    _issue_run_grant(slide, user_ctx, config)
     question = body.get("question")
     if isinstance(question, str):
         payload["question"] = question

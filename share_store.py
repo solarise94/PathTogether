@@ -119,6 +119,17 @@ _JSON_PUBLIC_NAMES = (
     "list_audit",
     "set_project_archived",
     "archived_slide_names",
+    # —— Stage 4-1a：插件安装凭证 + run grant（docs §7.6）——
+    "create_plugin_installation",
+    "rotate_installation_secret",
+    "get_plugin_installation",
+    "verify_installation_secret",
+    "set_installation_enabled",
+    "list_plugin_installations",
+    "create_run_grant",
+    "get_run_grant",
+    "revoke_run_grant",
+    "list_run_grants_for_session",
 )
 
 #: 需要实时镜像到 JSON 实现的路径配置名（函数体裸全局读取它们）。
@@ -207,6 +218,10 @@ _WRITE_NAMES = {
     "review_roi", "add_comment", "delete_comment", "resolve_comment",
     # Stage 3c-2：审计写 / 归档开关
     "record_audit", "set_project_archived",
+    # Stage 4-1a：插件安装凭证 / run grant 写操作
+    "create_plugin_installation", "rotate_installation_secret",
+    "set_installation_enabled",
+    "create_run_grant", "revoke_run_grant",
 }
 
 # result-replay 镜像：凡 json 内部生成身份（token/annotation_id/grant_id/pid）的写，
@@ -237,6 +252,14 @@ _DUAL_MIRRORS = {
     # Stage 3c-2：set_project_archived 返回权威 project dict（含 archived），
     # 复用 _mirror_project 按 pid 整体 upsert（把 archived 一并镜像）。
     "set_project_archived": "_mirror_project",
+    # Stage 4-1a：插件安装 / run grant（json 内部生成 installation_id、grant_id
+    # 与 secret hash → 必须按 json 权威 dict 回放；镜像函数自带「明文 secret 不进
+    # pg、enabled 切换不覆盖已存 hash」的防护，见 share_store_pg._mirror_*）。
+    "create_plugin_installation": "_mirror_plugin_installation",
+    "rotate_installation_secret": "_mirror_plugin_installation",
+    "set_installation_enabled": "_mirror_plugin_installation",
+    "create_run_grant": "_mirror_run_grant",
+    "revoke_run_grant": "_mirror_run_grant_revoke",
 }
 
 # 同参重放：无内部生成身份，直接同参调 pg。

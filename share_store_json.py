@@ -14,6 +14,8 @@ import secrets
 import shutil
 import time
 import uuid
+import hashlib
+import hmac
 from pathlib import Path
 
 import fcntl
@@ -37,6 +39,10 @@ _EMPTY = {
     "comments": [],
     # Stage 3c-2：协作操作审计日志（顶层数组，封顶 AUDIT_MAX_EVENTS 条丢最旧）
     "audit": [],
+    # Stage 4-1a：插件安装（安装凭证只存 hash，明文仅创建/轮换时返回一次）
+    "plugin_installations": [],
+    # Stage 4-1a：run grant（起跑授权，slide 级、默认 2h、可撤销；无 org，docs §7.6）
+    "run_grants": [],
 }
 
 # 支持的标注类型
@@ -278,6 +284,13 @@ def _load_locked(f):
         data.setdefault("audit", [])
         if not isinstance(data["audit"], list):
             data["audit"] = []
+        # 向后兼容：旧文件无 plugin_installations / run_grants 时补 []（Stage 4-1a）
+        data.setdefault("plugin_installations", [])
+        if not isinstance(data["plugin_installations"], list):
+            data["plugin_installations"] = []
+        data.setdefault("run_grants", [])
+        if not isinstance(data["run_grants"], list):
+            data["run_grants"] = []
         # 向后兼容：旧项目无 archived 字段 → 默认 false（未归档，纯只读开关，docs §v1.5）
         for _proj in data.get("projects", {}).values():
             if isinstance(_proj, dict) and _proj.get("archived") is None:
@@ -306,7 +319,8 @@ def _load_locked(f):
 def _copy_empty():
     """返回一个新的空结构（避免共享引用）。"""
     return {"shares": {}, "rois": [], "projects": {}, "slide_meta": {},
-            "change_seq_by_slide": {}, "grants": [], "comments": [], "audit": []}
+            "change_seq_by_slide": {}, "grants": [], "comments": [], "audit": [],
+            "plugin_installations": [], "run_grants": []}
 
 
 # --------------------------------------------------------------------------- #
@@ -1945,5 +1959,244 @@ def list_audit(limit=50, offset=0, action=None):
         # 最新在前（按 ts 倒序，同 ts 按插入倒序）
         events = list(reversed(events))
         return events[offset:offset + limit]
+
+    return _with_lock("r+", _do)
+
+
+# --------------------------------------------------------------------------- #
+# 插件安装凭证（plugin_installations）—— Stage 4-1a（docs §7.6 / §6.2）
+#
+# 安装凭证（installation secret）是插件后端调 /api/plugin/v1/auth/token 换
+# scoped JWT 的长期凭证：只存 sha256 hash（secret_hash），明文仅在创建与
+# 轮换时随返回值出现一次，绝不落盘、绝不入日志。禁用（enabled=false）后
+# 其签发的 token 立即不可用（app.py 每次校验回查 enabled）。
+# 本实体是平台运行时状态，但 json 仍是默认后端（AUTH_ENABLED=False 内网零
+# 依赖红线），故与 pg 双实现（见 share_store_pg / migrations/0005_plugin.sql）。
+# --------------------------------------------------------------------------- #
+def _hash_installation_secret(secret: str) -> str:
+    """安装凭证明文 → sha256 hex（存储形态）。"""
+    return hashlib.sha256((secret or "").encode("utf-8")).hexdigest()
+
+
+def _installation_out(row: dict) -> dict:
+    """installation 导出副本：剥离 secret_hash（hash 不出存储层）。"""
+    out = dict(row)
+    out.pop("secret_hash", None)
+    out["enabled"] = bool(row.get("enabled"))
+    return out
+
+
+def create_plugin_installation(plugin_id, version="", secret=None):
+    """创建插件安装行，返回 {**installation, "secret": 明文}（仅此一次）。
+
+    plugin_id 必填（如 "histopilot"）；version 缺省空串；secret 可显式传入
+    （env 引导用），否则生成 "pin_" + 32 字节 urlsafe。installation_id 形如
+    pin_<12 字节 urlsafe>。同 plugin_id 允许多行（不做唯一约束，引导逻辑
+    由 app.py 保证单实例 demo 只有一行）。
+    """
+    if not isinstance(plugin_id, str) or not plugin_id.strip():
+        raise ValueError("plugin_id 不能为空")
+    plaintext = secret if isinstance(secret, str) and secret else (
+        "pin_" + secrets.token_urlsafe(32))
+    installation_id = "pin_" + secrets.token_urlsafe(12)
+    now = time.time()
+    row = {
+        "installation_id": installation_id,
+        "plugin_id": plugin_id.strip(),
+        "version": version or "",
+        "enabled": True,
+        "secret_hash": _hash_installation_secret(plaintext),
+        "created_at": now,
+        "disabled_at": None,
+    }
+
+    def _do(f):
+        data = _load_locked(f)
+        data["plugin_installations"].append(row)
+        _save_locked(f, data)
+        out = _installation_out(row)
+        out["secret"] = plaintext
+        return out
+
+    return _with_lock("r+", _do)
+
+
+def rotate_installation_secret(installation_id, secret=None):
+    """轮换安装凭证：旧 secret 立即失效，返回带新明文的一次性 dict。
+
+    不存在返回 None。secret 缺省时生成新随机值。
+    """
+    plaintext = secret if isinstance(secret, str) and secret else (
+        "pin_" + secrets.token_urlsafe(32))
+    new_hash = _hash_installation_secret(plaintext)
+
+    def _do(f):
+        data = _load_locked(f)
+        for row in data["plugin_installations"]:
+            if row.get("installation_id") == installation_id:
+                row["secret_hash"] = new_hash
+                _save_locked(f, data)
+                out = _installation_out(row)
+                out["secret"] = plaintext
+                return out
+        return None
+
+    return _with_lock("r+", _do)
+
+
+def get_plugin_installation(installation_id):
+    """按 installation_id 取安装行（不含 secret_hash）；无则 None。"""
+    def _do(f):
+        data = _load_locked(f)
+        for row in data["plugin_installations"]:
+            if row.get("installation_id") == installation_id:
+                return _installation_out(row)
+        return None
+
+    return _with_lock("r+", _do)
+
+
+def verify_installation_secret(installation_id, secret):
+    """校验安装凭证：行存在且 hash 一致才 True（常数时间比较）。
+
+    安装已禁用时凭证仍可校验通过（hash 本身没错），否决发生在 app.py 的
+    enabled 回查——这里保持纯凭证语义，便于引导/诊断复用。
+    """
+    if not isinstance(secret, str) or not secret:
+        return False
+    candidate = _hash_installation_secret(secret)
+
+    def _do(f):
+        data = _load_locked(f)
+        for row in data["plugin_installations"]:
+            if row.get("installation_id") == installation_id:
+                return hmac.compare_digest(
+                    str(row.get("secret_hash") or ""), candidate)
+        return False
+
+    return _with_lock("r+", _do)
+
+
+def set_installation_enabled(installation_id, enabled):
+    """启/禁安装。返回更新后的安装行（不含 hash）；不存在返回 None。
+
+    禁用时记 disabled_at；重新启用清空 disabled_at。禁用即撤销该安装全部
+    在途 JWT（app.py 每次校验回查 enabled）。
+    """
+    enabled_b = bool(enabled)
+
+    def _do(f):
+        data = _load_locked(f)
+        for row in data["plugin_installations"]:
+            if row.get("installation_id") == installation_id:
+                row["enabled"] = enabled_b
+                row["disabled_at"] = None if enabled_b else time.time()
+                _save_locked(f, data)
+                return _installation_out(row)
+        return None
+
+    return _with_lock("r+", _do)
+
+
+def list_plugin_installations():
+    """列出全部安装行（不含 hash），按创建时间升序。"""
+    def _do(f):
+        data = _load_locked(f)
+        rows = [r for r in data["plugin_installations"] if isinstance(r, dict)]
+        rows.sort(key=lambda r: r.get("created_at") or 0)
+        return [_installation_out(r) for r in rows]
+
+    return _with_lock("r+", _do)
+
+
+# --------------------------------------------------------------------------- #
+# run grant（run_grants）—— Stage 4-1a（docs §7.6）
+#
+# 用户起跑时平台发放的短期授权：绑定 installation + slide（+ 将来确定后的
+# session_id）、创建人与过期时间（默认 2h），可撤销。无 org（demo 单实例，
+# docs §7.6）。plugin v1 的 annotate 端点强制 X-Run-Grant（有效 + slide 匹配
+# + 未过期未撤销），provenance 的 created_by_user_id 取自 grant。
+# --------------------------------------------------------------------------- #
+def create_run_grant(installation_id, slide, session_id="",
+                     created_by_user_id=None, ttl_seconds=None):
+    """发放一条 run grant，返回 grant dict。
+
+    ttl_seconds 缺省 7200（2h，docs §7.6「run grant 默认最长 1 小时」的
+    demo 宽松值；本节点不缩紧，sidecar 4-1b 消费时按 expires_at 判定）。
+    """
+    if not isinstance(installation_id, str) or not installation_id:
+        raise ValueError("installation_id 不能为空")
+    if not isinstance(slide, str) or not slide:
+        raise ValueError("slide 不能为空")
+    try:
+        ttl = float(ttl_seconds) if ttl_seconds is not None else 7200.0
+    except (TypeError, ValueError):
+        ttl = 7200.0
+    if ttl <= 0:
+        ttl = 7200.0
+    now = time.time()
+    row = {
+        "grant_id": "rgr_" + secrets.token_urlsafe(12),
+        "installation_id": installation_id,
+        "slide": slide,
+        "session_id": session_id or "",
+        "created_by_user_id": created_by_user_id or None,
+        "created_at": now,
+        "expires_at": now + ttl,
+        "revoked": False,
+        "revoked_at": None,
+    }
+
+    def _do(f):
+        data = _load_locked(f)
+        data["run_grants"].append(row)
+        _save_locked(f, data)
+        return dict(row)
+
+    return _with_lock("r+", _do)
+
+
+def get_run_grant(grant_id):
+    """按 grant_id 取 grant dict；无则 None。"""
+    def _do(f):
+        data = _load_locked(f)
+        for row in data["run_grants"]:
+            if row.get("grant_id") == grant_id:
+                return dict(row)
+        return None
+
+    return _with_lock("r+", _do)
+
+
+def revoke_run_grant(grant_id):
+    """撤销 run grant（幂等）。返回是否找到并撤销（已撤销也算 True）。"""
+    def _do(f):
+        data = _load_locked(f)
+        for row in data["run_grants"]:
+            if row.get("grant_id") == grant_id:
+                if not row.get("revoked"):
+                    row["revoked"] = True
+                    row["revoked_at"] = time.time()
+                    _save_locked(f, data)
+                return True
+        return False
+
+    return _with_lock("r+", _do)
+
+
+def list_run_grants_for_session(session_id):
+    """列出某 session_id 的全部 grant（含已撤销/过期，按创建时间升序）。
+
+    session_id 为空串时返回空列表（slide 级 grant 不归属任何 session）。
+    """
+    if not session_id:
+        return []
+
+    def _do(f):
+        data = _load_locked(f)
+        rows = [dict(r) for r in data["run_grants"]
+                if isinstance(r, dict) and r.get("session_id") == session_id]
+        rows.sort(key=lambda r: r.get("created_at") or 0)
+        return rows
 
     return _with_lock("r+", _do)

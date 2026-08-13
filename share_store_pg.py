@@ -30,6 +30,8 @@
     （content_sha256 由 Stage 3b-3 迁移工具填充，本节点先用 legacy_revision 占位）。
 """
 
+import hashlib
+import hmac
 import secrets
 import time
 import uuid
@@ -48,6 +50,8 @@ from share_store_json import (
     _clean_note,
     _clean_comment_body,
     _grant_out,
+    _hash_installation_secret,
+    _installation_out,
     _is_active,
     _norm_label,
     _normalize_permissions,
@@ -1922,5 +1926,327 @@ def archived_slide_names():
                     "JOIN projects p ON p.project_id=ps.project_id "
                     "WHERE p.archived=TRUE")
                 return {r["slide"] for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 插件安装凭证（plugin_installations）—— Stage 4-1a（docs §7.6 / §6.2）
+#
+# 语义与 json 实现完全一致（secret 只存 sha256 hash；_installation_out 剥离
+# hash 的导出形状直接复用 json 侧私有助手，避免两份漂移）。表结构见
+# migrations/0005_plugin.sql。
+# --------------------------------------------------------------------------- #
+def _fetch_installation(cur, installation_id):
+    cur.execute(
+        "SELECT installation_id, plugin_id, version, enabled, secret_hash, "
+        " extract(epoch from created_at)::float8 AS created_at, "
+        " extract(epoch from disabled_at)::float8 AS disabled_at "
+        "FROM plugin_installations WHERE installation_id=%s",
+        (installation_id,))
+    return cur.fetchone()
+
+
+def create_plugin_installation(plugin_id, version="", secret=None):
+    """创建插件安装行，返回 {**installation, "secret": 明文}（仅此一次）。"""
+    if not isinstance(plugin_id, str) or not plugin_id.strip():
+        raise ValueError("plugin_id 不能为空")
+    plaintext = secret if isinstance(secret, str) and secret else (
+        "pin_" + secrets.token_urlsafe(32))
+    installation_id = "pin_" + secrets.token_urlsafe(12)
+    now = time.time()
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO plugin_installations "
+                    "(installation_id, plugin_id, version, enabled, secret_hash, "
+                    " created_at) VALUES (%s,%s,%s,TRUE,%s, to_timestamp(%s))",
+                    (installation_id, plugin_id.strip(), version or "",
+                     _hash_installation_secret(plaintext), now))
+                row = _fetch_installation(cur, installation_id)
+        out = _installation_out(dict(row))
+        out["secret"] = plaintext
+        return out
+    finally:
+        conn.close()
+
+
+def rotate_installation_secret(installation_id, secret=None):
+    """轮换安装凭证：旧 secret 立即失效，返回带新明文的一次性 dict；无则 None。"""
+    plaintext = secret if isinstance(secret, str) and secret else (
+        "pin_" + secrets.token_urlsafe(32))
+    new_hash = _hash_installation_secret(plaintext)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE plugin_installations SET secret_hash=%s "
+                    "WHERE installation_id=%s",
+                    (new_hash, installation_id))
+                if cur.rowcount == 0:
+                    return None
+                row = _fetch_installation(cur, installation_id)
+        out = _installation_out(dict(row))
+        out["secret"] = plaintext
+        return out
+    finally:
+        conn.close()
+
+
+def get_plugin_installation(installation_id):
+    """按 installation_id 取安装行（不含 secret_hash）；无则 None。"""
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                row = _fetch_installation(cur, installation_id)
+        return _installation_out(dict(row)) if row else None
+    finally:
+        conn.close()
+
+
+def verify_installation_secret(installation_id, secret):
+    """校验安装凭证（常数时间比较）；行不存在或 hash 不一致返回 False。"""
+    if not isinstance(secret, str) or not secret:
+        return False
+    candidate = _hash_installation_secret(secret)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT secret_hash FROM plugin_installations "
+                    "WHERE installation_id=%s", (installation_id,))
+                row = cur.fetchone()
+        if row is None:
+            return False
+        return hmac.compare_digest(str(row["secret_hash"] or ""), candidate)
+    finally:
+        conn.close()
+
+
+def set_installation_enabled(installation_id, enabled):
+    """启/禁安装（禁用即撤销该安装全部在途 JWT）；不存在返回 None。"""
+    enabled_b = bool(enabled)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                if enabled_b:
+                    cur.execute(
+                        "UPDATE plugin_installations SET enabled=TRUE, "
+                        "disabled_at=NULL WHERE installation_id=%s",
+                        (installation_id,))
+                else:
+                    cur.execute(
+                        "UPDATE plugin_installations SET enabled=FALSE, "
+                        "disabled_at=now() WHERE installation_id=%s",
+                        (installation_id,))
+                if cur.rowcount == 0:
+                    return None
+                row = _fetch_installation(cur, installation_id)
+        return _installation_out(dict(row))
+    finally:
+        conn.close()
+
+
+def list_plugin_installations():
+    """列出全部安装行（不含 hash），按创建时间升序。"""
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT installation_id, plugin_id, version, enabled, "
+                    " extract(epoch from created_at)::float8 AS created_at, "
+                    " extract(epoch from disabled_at)::float8 AS disabled_at "
+                    "FROM plugin_installations ORDER BY created_at ASC")
+                rows = cur.fetchall()
+        return [_installation_out(dict(r)) for r in rows]
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# run grant（run_grants）—— Stage 4-1a（docs §7.6）
+# --------------------------------------------------------------------------- #
+_GRANT_SEL = (
+    "SELECT grant_id, installation_id, slide, session_id, created_by_user_id, "
+    " extract(epoch from created_at)::float8 AS created_at, "
+    " extract(epoch from expires_at)::float8 AS expires_at, revoked, "
+    " extract(epoch from revoked_at)::float8 AS revoked_at "
+)
+
+
+def _fetch_grant(cur, grant_id):
+    cur.execute(_GRANT_SEL + "FROM run_grants WHERE grant_id=%s", (grant_id,))
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def create_run_grant(installation_id, slide, session_id="",
+                     created_by_user_id=None, ttl_seconds=None):
+    """发放一条 run grant（默认 2h），返回 grant dict。"""
+    if not isinstance(installation_id, str) or not installation_id:
+        raise ValueError("installation_id 不能为空")
+    if not isinstance(slide, str) or not slide:
+        raise ValueError("slide 不能为空")
+    try:
+        ttl = float(ttl_seconds) if ttl_seconds is not None else 7200.0
+    except (TypeError, ValueError):
+        ttl = 7200.0
+    if ttl <= 0:
+        ttl = 7200.0
+    now = time.time()
+    grant_id = "rgr_" + secrets.token_urlsafe(12)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO run_grants "
+                    "(grant_id, installation_id, slide, session_id, "
+                    " created_by_user_id, created_at, expires_at) "
+                    "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), to_timestamp(%s))",
+                    (grant_id, installation_id, slide, session_id or "",
+                     created_by_user_id or None, now, now + ttl))
+                return _fetch_grant(cur, grant_id)
+    finally:
+        conn.close()
+
+
+def get_run_grant(grant_id):
+    """按 grant_id 取 grant dict；无则 None。"""
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                return _fetch_grant(cur, grant_id)
+    finally:
+        conn.close()
+
+
+def revoke_run_grant(grant_id):
+    """撤销 run grant（幂等）。返回是否找到（已撤销也算 True）。"""
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE run_grants SET revoked=TRUE, revoked_at=now() "
+                    "WHERE grant_id=%s", (grant_id,))
+                return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def list_run_grants_for_session(session_id):
+    """列出某 session_id 的全部 grant（按创建时间升序）；空 session_id 返回空。"""
+    if not session_id:
+        return []
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    _GRANT_SEL + "FROM run_grants WHERE session_id=%s "
+                    "ORDER BY created_at ASC", (session_id,))
+                return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# dual 后端镜像（Stage 4-1a）：json 为权威，按返回的权威 dict upsert 进 pg。
+# --------------------------------------------------------------------------- #
+def _mirror_plugin_installation(ret, *a, **k):
+    """create/rotate/set_enabled 的 result-replay：按 installation_id 回放进 pg。
+
+    json 侧返回的 dict 已剥离 secret_hash，但 create/rotate 带一次性明文
+    "secret"——hash 由明文现算后整行 upsert（明文本身绝不进 pg）；不带
+    secret 的回放（set_enabled）走 UPDATE-only：不覆盖 pg 已存 hash（写空串
+    会破坏 postgres 单后端下的凭证校验），行不存在则跳过（dual 镜像
+    best-effort，身份值以 json 权威为准）。
+    """
+    row = ret if isinstance(ret, dict) else None
+    if not row or not row.get("installation_id"):
+        return
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                plaintext = row.get("secret")
+                if isinstance(plaintext, str) and plaintext:
+                    cur.execute(
+                        "INSERT INTO plugin_installations "
+                        "(installation_id, plugin_id, version, enabled, "
+                        " secret_hash, created_at, disabled_at) "
+                        "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), "
+                        " to_timestamp(%s)) "
+                        "ON CONFLICT (installation_id) DO UPDATE SET "
+                        " plugin_id=EXCLUDED.plugin_id, version=EXCLUDED.version, "
+                        " enabled=EXCLUDED.enabled, "
+                        " secret_hash=EXCLUDED.secret_hash, "
+                        " disabled_at=EXCLUDED.disabled_at",
+                        (row["installation_id"], row.get("plugin_id"),
+                         row.get("version") or "", bool(row.get("enabled")),
+                         _hash_installation_secret(plaintext),
+                         row.get("created_at") or time.time(),
+                         row.get("disabled_at")))
+                else:
+                    cur.execute(
+                        "UPDATE plugin_installations SET plugin_id=%s, "
+                        " version=%s, enabled=%s, disabled_at=to_timestamp(%s) "
+                        "WHERE installation_id=%s",
+                        (row.get("plugin_id"), row.get("version") or "",
+                         bool(row.get("enabled")),
+                         row.get("disabled_at"), row["installation_id"]))
+    finally:
+        conn.close()
+
+
+def _mirror_run_grant(ret, *a, **k):
+    """create_run_grant 的 result-replay：按 grant_id 整行 upsert。"""
+    row = ret if isinstance(ret, dict) else None
+    if not row or not row.get("grant_id"):
+        return
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO run_grants "
+                    "(grant_id, installation_id, slide, session_id, "
+                    " created_by_user_id, created_at, expires_at, revoked, "
+                    " revoked_at) "
+                    "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), to_timestamp(%s), "
+                    " %s, to_timestamp(%s)) "
+                    "ON CONFLICT (grant_id) DO UPDATE SET "
+                    " revoked=EXCLUDED.revoked, revoked_at=EXCLUDED.revoked_at, "
+                    " expires_at=EXCLUDED.expires_at",
+                    (row["grant_id"], row.get("installation_id"),
+                     row.get("slide"), row.get("session_id") or "",
+                     row.get("created_by_user_id"),
+                     row.get("created_at") or time.time(),
+                     row.get("expires_at") or (time.time() + 7200),
+                     bool(row.get("revoked")), row.get("revoked_at")))
+    finally:
+        conn.close()
+
+
+def _mirror_run_grant_revoke(ret, grant_id, *a, **k):
+    """revoke_run_grant 的同参镜像：按入参 grant_id 撤销 pg 行。"""
+    if not grant_id:
+        return
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE run_grants SET revoked=TRUE, revoked_at=now() "
+                    "WHERE grant_id=%s", (grant_id,))
     finally:
         conn.close()

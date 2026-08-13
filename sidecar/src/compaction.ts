@@ -102,8 +102,11 @@ export interface ResolvedCompactionSettings {
 }
 
 export function resolveCompactionSettings(cfg: CompactionConfig): ResolvedCompactionSettings {
-	const reserve = numOr(cfg.reserve_tokens, DEFAULT_COMPACTION_SETTINGS.reserveTokens);
-	const keepRecent = numOr(cfg.keep_recent_tokens, DEFAULT_COMPACTION_SETTINGS.keepRecentTokens);
+	// reserve/keep: 0 is a real "disable / keep nothing" value (Flask and
+	// validateRunConfig accept >=0). Do not reuse numOr (n>0), which used to
+	// rewrite 0 into 16384/20000 and break the budget invariant at runtime.
+	const reserve = nonNegOr(cfg.reserve_tokens, DEFAULT_COMPACTION_SETTINGS.reserveTokens);
+	const keepRecent = nonNegOr(cfg.keep_recent_tokens, DEFAULT_COMPACTION_SETTINGS.keepRecentTokens);
 	return {
 		settings: { enabled: true, reserveTokens: reserve, keepRecentTokens: keepRecent },
 		contextWindow: numOr(cfg.context_window_tokens, 272000),
@@ -113,6 +116,13 @@ export function resolveCompactionSettings(cfg: CompactionConfig): ResolvedCompac
 function numOr(v: unknown, d: number): number {
 	const n = Number(v);
 	return Number.isFinite(n) && n > 0 ? Math.floor(n) : d;
+}
+
+/** Like numOr, but 0 is kept (unset / NaN / negative still fall back to `d`). */
+function nonNegOr(v: unknown, d: number): number {
+	if (v === null || v === undefined || v === "") return d;
+	const n = Number(v);
+	return Number.isFinite(n) && n >= 0 ? Math.floor(n) : d;
 }
 
 // =========================================================================== //

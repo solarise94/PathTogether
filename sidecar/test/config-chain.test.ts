@@ -26,7 +26,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 import { resolveCompactionSettings } from "../src/compaction.js";
 import { resolveTransformSettings, WINDOW_TIER_PRESETS } from "../src/transform-context.js";
-import { deriveEffectiveRunConfig, validateRunConfig, type RunConfig } from "../src/agent-runner.js";
+import { deriveEffectiveRunConfig, validateRunConfig, resolveEffectiveContextWindow, LEGACY_CONTEXT_WINDOW_TOKENS, type RunConfig } from "../src/agent-runner.js";
 
 /** Repo root (parent of sidecar/). The Flask `app` module lives here. */
 const REPO_ROOT = resolve(__dirname, "..", "..");
@@ -97,6 +97,38 @@ function deriveEffectiveConfig(cfg: Record<string, unknown>): Record<string, unk
 	return deriveEffectiveRunConfig(cfg as unknown as RunConfig) as unknown as Record<string, unknown>;
 }
 
+/**
+ * Flask PUT-equivalent: run `_validate_ai_tuning` on `body`, persist, then
+ * dump `_build_sidecar_config()`. Used for the reserve/keep=0 chain so the
+ * JSON sidecar actually sees is the same shape Flask would inject at run start.
+ */
+const VALIDATE_AND_BUILD_SCRIPT = `
+import json, os, sys
+sys.path.insert(0, sys.argv[1])
+import app
+body = json.loads(os.environ["SVS_BODY"])
+validated, err = app._validate_ai_tuning(body, {})
+if err:
+    sys.stderr.write(err)
+    sys.exit(2)
+cfg = dict(body)
+cfg.update(validated)
+app._save_ai_config(cfg)
+out = app._build_sidecar_config()
+sys.stdout.write(json.dumps(out, ensure_ascii=False))
+`;
+
+function flaskValidateAndBuild(body: Record<string, unknown>): Record<string, unknown> {
+	if (!PYTHON) throw new Error("no python available");
+	const tmpDir = mkdtempSync(join(tmpdir(), "svs-config-chain-"));
+	const stdout = execFileSync(PYTHON, ["-c", VALIDATE_AND_BUILD_SCRIPT, REPO_ROOT], {
+		env: { ...process.env, SHARE_DATA_DIR: tmpDir, SVS_BODY: JSON.stringify(body) },
+		encoding: "utf-8",
+		maxBuffer: 1 << 20,
+	});
+	return JSON.parse(stdout) as Record<string, unknown>;
+}
+
 // =========================================================================== //
 // Flask-driven end-to-end chain (default config → JSON → sidecar resolution)
 // =========================================================================== //
@@ -156,6 +188,27 @@ function deriveEffectiveConfig(cfg: Record<string, unknown>): Record<string, unk
 			Math.ceil(WINDOW_TIER_PRESETS.balanced.contextWindowTokens * WINDOW_TIER_PRESETS.balanced.visualBudgetFraction),
 		);
 	});
+
+	it("preserves reserve/keep=0 through Flask validate → sidecar validate → compaction", () => {
+		// Reviewer P1: context=10000, reserve=0, keep=1 used to pass Flask and
+		// validateRunConfig, then numOr rewrote reserve to 16384 at runtime.
+		const flaskZero = flaskValidateAndBuild({
+			window_tier: null,
+			context_window_tokens: 10000,
+			reserve_tokens: 0,
+			keep_recent_tokens: 1,
+		});
+		expect(flaskZero.reserve_tokens).toBe(0);
+		expect(flaskZero.keep_recent_tokens).toBe(1);
+		expect(flaskZero.context_window_tokens).toBe(10000);
+		expect(() => validateRunConfig(flaskZero as unknown as RunConfig)).not.toThrow();
+		const effective = deriveEffectiveConfig(flaskZero);
+		const comp = resolveCompactionSettings(effective as never);
+		expect(comp.settings.reserveTokens).toBe(0);
+		expect(comp.settings.keepRecentTokens).toBe(1);
+		expect(comp.contextWindow).toBe(10000);
+		expect(comp.settings.reserveTokens + comp.settings.keepRecentTokens).toBeLessThan(comp.contextWindow);
+	});
 });
 
 // =========================================================================== //
@@ -194,5 +247,23 @@ describe("sidecar tier resolution (pure TS)", () => {
 		// config still fills the 400k window from the balanced tier).
 		const comp = resolveCompactionSettings(deriveEffectiveConfig(cfg) as never);
 		expect(comp.contextWindow).toBe(400_000);
+	});
+
+	it("manual mode (no ctx, no tier) derives the legacy 272k window", () => {
+		const cfg = {
+			window_tier: null,
+			context_window_tokens: null,
+		} as unknown as Record<string, unknown>;
+		expect(resolveEffectiveContextWindow(cfg as unknown as RunConfig)).toBe(LEGACY_CONTEXT_WINDOW_TOKENS);
+		expect(deriveEffectiveConfig(cfg).context_window_tokens).toBe(LEGACY_CONTEXT_WINDOW_TOKENS);
+		expect(() =>
+			validateRunConfig({
+				...cfg,
+				reserve_tokens: 300000,
+				keep_recent_tokens: 20000,
+			} as unknown as RunConfig),
+		).toThrow(/context_window_tokens/);
+		const comp = resolveCompactionSettings(deriveEffectiveConfig(cfg) as never);
+		expect(comp.contextWindow).toBe(LEGACY_CONTEXT_WINDOW_TOKENS);
 	});
 });

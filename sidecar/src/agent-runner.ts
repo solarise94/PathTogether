@@ -123,6 +123,9 @@ import {
 	type PromptCacheCapabilities,
 } from "./prompt-cache.js";
 
+/** compaction.ts / pi-model.ts 兼容默认：无显式窗口且无有效档位时的 272k。 */
+export const LEGACY_CONTEXT_WINDOW_TOKENS = 272000;
+
 // =========================================================================== //
 // Public config / option types
 // =========================================================================== //
@@ -209,26 +212,17 @@ export function validateRunConfig(config: RunConfig): void {
 		const n = Number(v);
 		return Number.isFinite(n) ? n : NaN;
 	};
-	// reserve_tokens + keep_recent_tokens < context_window_tokens (§9.2). When
-	// context_window_tokens is unset but a valid window_tier is present, derive
-	// the tier's preset window for this relationship check (aligned with Flask
-	// _validate_ai_tuning: ctx=None → _resolve_tier_value). Only skip the
-	// relationship check when BOTH ctx and tier are absent (legacy path).
+	// reserve_tokens + keep_recent_tokens < effective context window (§9.2).
+	// Same resolver as Flask `_resolve_effective_context_window`:
+	// explicit context_window_tokens > window_tier preset > legacy 272k.
+	// Manual mode (no ctx, no tier) no longer skips this check.
 	const reserve = num(config.reserve_tokens);
 	const keep = num(config.keep_recent_tokens);
-	const ctxRaw = num(config.context_window_tokens);
-	const ctxExplicit = Number.isFinite(ctxRaw) && ctxRaw > 0 ? ctxRaw : NaN;
-	let ctx = ctxExplicit;
-	if (!Number.isFinite(ctx)) {
-		const tier = normalizeWindowTier((config as { window_tier?: unknown }).window_tier);
-		if (tier) ctx = WINDOW_TIER_PRESETS[tier].contextWindowTokens;
-	}
-	if (Number.isFinite(reserve) && Number.isFinite(keep) && Number.isFinite(ctx)) {
-		if (reserve + keep >= ctx) {
-			throw new ConfigError(
-				`reserve_tokens + keep_recent_tokens（${reserve + keep}）必须小于 context_window_tokens（${ctx}）`,
-			);
-		}
+	const ctx = resolveEffectiveContextWindow(config);
+	if (Number.isFinite(reserve) && Number.isFinite(keep) && reserve + keep >= ctx) {
+		throw new ConfigError(
+			`reserve_tokens + keep_recent_tokens（${reserve + keep}）必须小于 context_window_tokens（${ctx}）`,
+		);
 	}
 	// Positive-int range checks for the Phase 1 fields (§11). Only validate when
 	// present; defaults are applied by resolveTransformSettings/resolveCompactionSettings.
@@ -264,20 +258,33 @@ export function validateRunConfig(config: RunConfig): void {
 }
 
 /**
- * §9.2.1: derive the single effective run config — when a valid window_tier is
- * set and context_window_tokens is not explicitly >0, fill in the tier preset
- * window. Everything else is untouched. runAgentLoop builds this ONCE and
- * threads it through every consumer (buildModel / compaction / transform /
- * checkpoint / metrics) so a run never sees two competing budget sources.
+ * Effective context window: explicit context_window_tokens > window_tier
+ * preset > legacy 272k. Shared by {@link validateRunConfig} and
+ * {@link deriveEffectiveRunConfig} so validation, derivation, and runtime
+ * records never disagree (Flask `_resolve_effective_context_window` mirrors
+ * this).
+ */
+export function resolveEffectiveContextWindow(config: RunConfig): number {
+	const n = Number(config.context_window_tokens);
+	if (Number.isFinite(n) && n > 0) return Math.floor(n);
+	const tier = normalizeWindowTier((config as { window_tier?: unknown }).window_tier);
+	if (tier) return WINDOW_TIER_PRESETS[tier].contextWindowTokens;
+	return LEGACY_CONTEXT_WINDOW_TOKENS;
+}
+
+/**
+ * §9.2.1: derive the single effective run config — fill context_window_tokens
+ * when it is not explicitly >0 (tier preset, else legacy 272k). Everything
+ * else is untouched. runAgentLoop builds this ONCE and threads it through
+ * every consumer (buildModel / compaction / transform / checkpoint / metrics)
+ * so a run never sees two competing budget sources.
  * Exported so the config-chain tests exercise the production derivation
  * instead of mirroring it.
  */
 export function deriveEffectiveRunConfig(config: RunConfig): RunConfig {
-	const tier = normalizeWindowTier((config as { window_tier?: unknown }).window_tier);
-	// Number(null)===0 is not >0, so an intentionally-unset
-	// context_window_tokens is correctly treated as "derive from tier".
-	if (!tier || Number(config.context_window_tokens) > 0) return config;
-	return { ...config, context_window_tokens: WINDOW_TIER_PRESETS[tier].contextWindowTokens };
+	const n = Number(config.context_window_tokens);
+	if (Number.isFinite(n) && n > 0) return config;
+	return { ...config, context_window_tokens: resolveEffectiveContextWindow(config) };
 }
 
 /** Inject a test streamFn into the runner (mock model). */

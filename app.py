@@ -76,10 +76,43 @@ SHARE_BASE_URL = os.environ.get(
 # --------------------------------------------------------------------------- #
 # 管理员登录认证（外网门户，可选）
 # --------------------------------------------------------------------------- #
-# 只有 ADMIN_PASSWORD 非空时才启用认证；未设置时行为与内网完全一致（免登录）。
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME") or "admin"
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD") or ""
-AUTH_ENABLED = bool(ADMIN_PASSWORD)
+# 默认：ADMIN_PASSWORD 非空才启用认证；未设置时与内网一致（免登录）。
+# Demo/公网：REQUIRE_ADMIN_AUTH=1 时密码为空或仍为文档占位符则拒绝启动（fail-closed）。
+# 与 docs/demo-deployment.md 中 admin.env 示例完全一致；复制未替换即拒绝启动。
+ADMIN_PASSWORD_PLACEHOLDER_SENTINEL = "<REPLACE_WITH_STRONG_PASSWORD>"
+
+
+def _is_placeholder_admin_password(password):
+    """空串、文档精确 sentinel、或 <...> 占位符视为未配置真实密码。"""
+    s = (password or "").strip()
+    if not s:
+        return True
+    if s == ADMIN_PASSWORD_PLACEHOLDER_SENTINEL:
+        return True
+    return s.startswith("<") and s.endswith(">")
+
+
+def _env_truthy(env, name):
+    return (env.get(name) or "").strip().lower() in ("1", "true", "yes")
+
+
+def _resolve_admin_auth(environ=None):
+    """解析管理员认证。返回 (username, password, auth_enabled)。
+
+    REQUIRE_ADMIN_AUTH 开启且密码为空/占位符时 SystemExit，避免公网免认证启动。
+    """
+    env = os.environ if environ is None else environ
+    username = env.get("ADMIN_USERNAME") or "admin"
+    password = env.get("ADMIN_PASSWORD") or ""
+    if _env_truthy(env, "REQUIRE_ADMIN_AUTH") and _is_placeholder_admin_password(password):
+        raise SystemExit(
+            "REQUIRE_ADMIN_AUTH=1 but ADMIN_PASSWORD is empty or a placeholder; "
+            "refusing to start"
+        )
+    return username, password, bool(password)
+
+
+ADMIN_USERNAME, ADMIN_PASSWORD, AUTH_ENABLED = _resolve_admin_auth()
 
 # session 有效期 7 天
 app.permanent_session_lifetime = timedelta(days=7)
@@ -140,7 +173,21 @@ def _load_or_create_secret_key() -> str:
         return _read_or_create_locked()
 
 
+def _resolve_session_cookie_secure(environ=None):
+    """管理端 session cookie 的 Secure 标志。
+
+    只认显式 ADMIN_SESSION_COOKIE_SECURE（1/true/yes）。TLS 常在 Caddy/nginx
+    终止，Flask 本地没有证书文件，不能用 SHARE_TLS_* 推断访问协议。
+    SSH 隧道 HTTP 保持关闭（缺省 false）。
+    """
+    env = os.environ if environ is None else environ
+    return _env_truthy(env, "ADMIN_SESSION_COOKIE_SECURE")
+
+
 app.secret_key = _load_or_create_secret_key()
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = _resolve_session_cookie_secure()
 
 
 # --------------------------------------------------------------------------- #
@@ -1209,10 +1256,12 @@ def _save_ai_config(cfg: dict) -> None:
 # --------------------------------------------------------------------------- #
 # 语义依据（读自 sidecar/src + templates/index.html）：
 #   context_window_tokens  compaction.ts:92 numOr 要求 n>0（否则回退 272000）；
-#                          UI min=10000。→ 正整数。
-#   reserve_tokens         compaction.ts:88 numOr（>0 才用，否则默认 16384）；
+#                          UI min=10000。→ 正整数。未显式设置时由
+#                          _resolve_effective_context_window 按
+#                          显式值 > window_tier 预设 > legacy 272k 推导。
+#   reserve_tokens         compaction 接受 >=0（0=不预留）；缺省 16384。
 #                          UI min=0。→ 非负整数（0 允许）。
-#   keep_recent_tokens     compaction.ts:89 numOr（>0 才用，否则默认 20000）；
+#   keep_recent_tokens     compaction 接受 >=0（0=不保留尾）；缺省 20000。
 #                          UI min=1000。→ 非负整数（0 允许，权威层不卡 UI 下限）。
 #   keep_recent_images     transform-context.ts:53-55（>0 才用，否则默认 6）。
 #                          无 UI 输入。→ 非负整数（0 允许）。
@@ -1231,8 +1280,8 @@ def _save_ai_config(cfg: dict) -> None:
 # 字段关系：reserve_tokens + keep_recent_tokens 必须 < context_window_tokens
 # （压缩：context - reserve 是触发线，keep_recent 是保留尾；重叠即配置矛盾）。
 # 允许 0 的字段（reserve_tokens / keep_recent_tokens / keep_recent_images /
-# safety_margin）：0 不代表 sidecar 的"禁用"（numOr 会回退默认），但作为权威层
-# 下限更宽松、与 UI min=0 一致；负数一律拒绝。
+# safety_margin）：0 表示禁用/不预留/不保留。sidecar compaction 对 reserve/keep
+# 接受真正的非负整数，校验与运行时按同一 0 值计算关系；负数一律拒绝。
 # 注意：所有校验失败返回中文明示 error 字符串；调用方负责在落盘前整体校验，
 # 任一字段失败都不应部分写入 cfg。
 _AI_TUNING_POSITIVE_INT = (
@@ -1284,12 +1333,31 @@ _WINDOW_TIER_PRESETS = {
     "performance": {"context_window_tokens": 500000, "visual_context_budget_tokens": 100000,
                     "overview_long_edge": 1024, "detail_image_long_edge": 1536, "working_image_long_edge": 1024},
 }
-def _resolve_tier_value(cfg, tier, field):
-    """推导字段值：显式配置优先，其次档位预设，最后 None（sidecar 自行兜底）。"""
-    v = cfg.get(field) if isinstance(cfg, dict) else None
-    if v is not None:
-        return v
-    return _WINDOW_TIER_PRESETS.get(tier, {}).get(field)
+# compaction.ts / pi-model.ts 在窗口未显式设置且无有效档位时的兼容默认。
+_LEGACY_CONTEXT_WINDOW_TOKENS = 272000
+
+
+def _resolve_effective_context_window(cfg):
+    """effective context window：显式 context_window_tokens > window_tier 预设 > legacy 272k。
+
+    与 sidecar ``resolveEffectiveContextWindow`` 同一语义。手动模式（tier 无效/
+    已清除且未填窗口）不再跳过关系校验，而是按 272k 校验，避免 reserve+keep
+    超过运行时实际窗口仍被两端接受。
+    """
+    if not isinstance(cfg, dict):
+        return _LEGACY_CONTEXT_WINDOW_TOKENS
+    raw = cfg.get("context_window_tokens")
+    if raw is not None:
+        try:
+            n = int(raw)
+            if n > 0:
+                return n
+        except (TypeError, ValueError):
+            pass
+    tier = cfg.get("window_tier")
+    if tier in _WINDOW_TIER_PRESETS:
+        return _WINDOW_TIER_PRESETS[tier]["context_window_tokens"]
+    return _LEGACY_CONTEXT_WINDOW_TOKENS
 # max_steps 上限：取自 templates/index.html 的 input max="500"（步数上限字段）。
 # 防止 max_steps=99999 之类失控（sidecar 运行循环只限下限，费用风险）。
 _MAX_STEPS_LIMIT = 500
@@ -1399,40 +1467,34 @@ def _validate_ai_tuning(body, cfg):
     # max_steps 上限（UI 声明 max=500）
     if "max_steps" in validated and validated["max_steps"] > _MAX_STEPS_LIMIT:
         return None, "max_steps 不可超过 {}（步数上限）".format(_MAX_STEPS_LIMIT)
-    # 2) 字段关系校验：reserve_tokens + keep_recent_tokens < context_window_tokens
-    #    未在本批次提交的字段用已落盘 cfg 的值（或缺省默认），保证语义一致。
-    #    仅当三者中至少一个在本批次出现时才校验（否则原值本应已合法）。
+    # 2) 字段关系校验：reserve + keep < effective context window
+    #    （显式 context_window_tokens > window_tier 预设 > legacy 272k）。
+    #    未提交字段取已落盘 cfg 或缺省默认。始终对合并后的完整候选校验，
+    #    这样只改 window_tier 也会按新窗口拒绝与 reserve/keep 冲突的配置。
+    #    不能 early-return：后面的弃用字段映射仍须执行。
     rel_keys = ("reserve_tokens", "keep_recent_tokens", "context_window_tokens")
-    if any(k in validated for k in rel_keys):
-        merged = dict(DEFAULT_CONFIG)
-        for k in rel_keys:
-            cur = cfg.get(k)
-            if cur is not None:
-                try:
-                    merged[k] = int(cur)
-                except (TypeError, ValueError):
-                    merged[k] = DEFAULT_CONFIG[k]
-            if k in validated:
-                merged[k] = validated[k]
-        reserve = merged["reserve_tokens"]
-        keep = merged["keep_recent_tokens"]
-        ctx = merged["context_window_tokens"]
-        if ctx is None:
-            # §9.2.1：窗口未显式设置 → 按当前档位推导（含本批次可能提交的 tier）。
-            tier = validated.get("window_tier") if "window_tier" in validated else cfg.get("window_tier")
-            ctx = _resolve_tier_value(cfg, tier, "context_window_tokens")
-        if ctx is not None:
-            ctx = int(ctx)
-            if reserve + keep >= ctx:
-                return None, (
-                    "reserve_tokens + keep_recent_tokens（{}）必须小于 "
-                    "context_window_tokens（{}）".format(reserve + keep, ctx)
-                )
-        # ctx 为 None = 手动模式（window_tier 无效/已清除）且窗口无法确定 → 无法做
-        # 矛盾判定，跳过关系校验（sidecar 端会用 numOr 默认兜底窗口）。注意
-        # validated.get("window_tier") 取到 None（本批次显式清除）同样视为手动模式。
-        # 不能 early-return：后面的弃用字段映射（keep_recent_images →
-        # visual_working_set_max）仍须执行。
+    merged = dict(DEFAULT_CONFIG)
+    for k in rel_keys:
+        cur = cfg.get(k)
+        if cur is not None:
+            try:
+                merged[k] = int(cur)
+            except (TypeError, ValueError):
+                merged[k] = DEFAULT_CONFIG[k]
+        if k in validated:
+            merged[k] = validated[k]
+    if "window_tier" in cfg:
+        merged["window_tier"] = cfg.get("window_tier")
+    if "window_tier" in validated:
+        merged["window_tier"] = validated["window_tier"]
+    reserve = merged["reserve_tokens"]
+    keep = merged["keep_recent_tokens"]
+    ctx = _resolve_effective_context_window(merged)
+    if reserve + keep >= ctx:
+        return None, (
+            "reserve_tokens + keep_recent_tokens（{}）必须小于 "
+            "context_window_tokens（{}）".format(reserve + keep, ctx)
+        )
     # 3) 弃用字段映射：keep_recent_images → visual_working_set_max（§11）。
     #    两者同时存在时以新字段为准，并记一次弃用告警；仅旧字段存在时映射过去。
     #    safety_margin 同属弃用字段：接受、不展示、不写回（见 api_ai_config PUT）。

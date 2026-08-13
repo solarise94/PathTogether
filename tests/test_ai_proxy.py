@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -470,6 +471,77 @@ def test_auth_still_enforced():
         app_mod.AUTH_ENABLED = False
 
 
+def test_require_admin_auth_fail_closed():
+    """REQUIRE_ADMIN_AUTH=1 时拒绝空密码和 <...> 占位符。"""
+    print("== REQUIRE_ADMIN_AUTH fail-closed ==")
+    user, pw, enabled = app_mod._resolve_admin_auth({})
+    check("无开关无密码 → 免认证", enabled is False and pw == "",
+          "user=%r pw=%r enabled=%r" % (user, pw, enabled))
+    user, pw, enabled = app_mod._resolve_admin_auth({"ADMIN_PASSWORD": "s3cret"})
+    check("有密码 → 启用认证", enabled is True and pw == "s3cret",
+          "enabled=%r pw=%r" % (enabled, pw))
+    raised = False
+    try:
+        app_mod._resolve_admin_auth({"REQUIRE_ADMIN_AUTH": "1"})
+    except SystemExit as e:
+        raised = True
+        check("空密码 SystemExit 文案含 placeholder",
+              "placeholder" in str(e), "msg=%r" % (e,))
+    check("REQUIRE_ADMIN_AUTH=1 且空密码 → SystemExit", raised)
+    assert raised
+    raised = False
+    try:
+        app_mod._resolve_admin_auth({
+            "REQUIRE_ADMIN_AUTH": "true",
+            "ADMIN_PASSWORD": app_mod.ADMIN_PASSWORD_PLACEHOLDER_SENTINEL,
+        })
+    except SystemExit:
+        raised = True
+    check("REQUIRE_ADMIN_AUTH + 文档精确 sentinel → SystemExit", raised)
+    assert raised
+    docs = Path(__file__).resolve().parents[1] / "docs" / "demo-deployment.md"
+    docs_text = docs.read_text(encoding="utf-8")
+    sentinel = app_mod.ADMIN_PASSWORD_PLACEHOLDER_SENTINEL
+    check("文档含精确 sentinel", sentinel in docs_text,
+          "missing %r in %s" % (sentinel, docs))
+    assert sentinel in docs_text
+    check("文档 sentinel 被判定为占位符",
+          app_mod._is_placeholder_admin_password(sentinel) is True)
+    user, pw, enabled = app_mod._resolve_admin_auth({
+        "REQUIRE_ADMIN_AUTH": "1",
+        "ADMIN_PASSWORD": "not-a-placeholder",
+    })
+    check("REQUIRE_ADMIN_AUTH + 真实密码 → 启用",
+          enabled is True and pw == "not-a-placeholder",
+          "enabled=%r pw=%r" % (enabled, pw))
+    check("尖括号占位符判定",
+          app_mod._is_placeholder_admin_password("<x>") is True)
+    check("空串占位符判定",
+          app_mod._is_placeholder_admin_password("") is True)
+    check("真实密码不是占位符",
+          app_mod._is_placeholder_admin_password("not-a-placeholder") is False)
+
+
+def test_admin_session_cookie_secure_explicit_only():
+    """SESSION_COOKIE_SECURE 只认 ADMIN_SESSION_COOKIE_SECURE，不看证书文件。"""
+    print("== ADMIN_SESSION_COOKIE_SECURE 显式开关 ==")
+    check("缺省 false（SSH 隧道 HTTP）",
+          app_mod._resolve_session_cookie_secure({}) is False)
+    check("SHARE_TLS_CERT 存在也不开",
+          app_mod._resolve_session_cookie_secure({
+              "SHARE_TLS_CERT": "/tmp/fullchain.crt",
+              "SHARE_TLS_KEY": "/tmp/privkey.key",
+          }) is False)
+    check("ADMIN_SESSION_COOKIE_SECURE=1 → True",
+          app_mod._resolve_session_cookie_secure({
+              "ADMIN_SESSION_COOKIE_SECURE": "1",
+          }) is True)
+    check("ADMIN_SESSION_COOKIE_SECURE=0 → False",
+          app_mod._resolve_session_cookie_secure({
+              "ADMIN_SESSION_COOKIE_SECURE": "0",
+          }) is False)
+
+
 def test_missing_slide_returns_400():
     print("== test_missing_slide: slide 缺失 400（不转发到 sidecar）==")
     fake = install_fake_requests()
@@ -492,6 +564,8 @@ if __name__ == "__main__":
     test_stream_proxy_passes_after_seq_and_last_event_id()
     test_sidecar_down_returns_503()
     test_auth_still_enforced()
+    test_require_admin_auth_fail_closed()
+    test_admin_session_cookie_secure_explicit_only()
     test_missing_slide_returns_400()
     print("\nPASS=%d FAIL=%d" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

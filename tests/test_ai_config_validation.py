@@ -199,13 +199,29 @@ def test_positive_int_fields_reject_non_integer():
 def test_nonneg_int_fields_allow_zero():
     print("== 非负整数类字段：0 → 200 落盘 ==")
     for field in ("reserve_tokens", "keep_recent_tokens", "keep_recent_images"):
-        # 单独 0 不触发关系校验（context_window 未变，默认 272000，0+0 < 272000）
+        # 单独 0：effective window 为 balanced 400k（默认档），0+keep 或 reserve+0 仍 < 400k
         reset_config()
         code, j = put({field: 0})
         check("%s=0 → 200" % field, code == 200, "got %s %r" % (code, j))
         if code == 200:
             check("%s=0 落盘为 0" % field, j.get(field) == 0,
                   "got %r" % j.get(field))
+
+
+def test_zero_reserve_keep_accepted_against_small_window():
+    """reserve=0 keep=1 ctx=10000 按字面 0 校验并通过（运行时不得再把 0 换成 16384）。"""
+    print("== reserve/keep=0 对小窗口按字面校验 ==")
+    reset_config()
+    code, j = put({
+        "window_tier": None,
+        "context_window_tokens": 10000,
+        "reserve_tokens": 0,
+        "keep_recent_tokens": 1,
+    })
+    check("ctx=10000 reserve=0 keep=1 → 200", code == 200, "got %s %r" % (code, j))
+    assert code == 200
+    check("reserve 落盘为 0", j.get("reserve_tokens") == 0, "got %r" % j.get("reserve_tokens"))
+    check("keep 落盘为 1", j.get("keep_recent_tokens") == 1, "got %r" % j.get("keep_recent_tokens"))
 
 
 def test_safety_margin_deprecated_not_persisted():
@@ -374,8 +390,8 @@ def test_omitted_fields_keep_defaults():
     check("只提交 base_url → 200", code == 200, "got %s %r" % (code, j))
     check("max_steps 回填默认 50", j.get("max_steps") == 50,
           "got %r" % j.get("max_steps"))
-    check("context_window_tokens 回填默认 272000",
-          j.get("context_window_tokens") == 272000,
+    check("context_window_tokens 缺省保持 None（由档位推导）",
+          j.get("context_window_tokens") is None,
           "got %r" % j.get("context_window_tokens"))
 
 
@@ -637,15 +653,65 @@ def test_merge_config_window_tier_none_kept():
 
 
 # ============================================================================ #
-# Bug 4 回归：手动模式下关系校验跳过（不误报）。
+# effective-window：显式 ctx > window_tier 预设 > legacy 272k
 # ============================================================================ #
-def test_relationship_skipped_when_manual_mode():
-    """window_tier=None（手动模式）+ ctx 未定 + reserve=16000 → 不报关系错误。"""
-    print("== 手动模式关系校验跳过 ==")
+def test_resolve_effective_context_window_precedence():
+    """解析顺序：显式 context_window_tokens > 档位预设 > 272k。"""
+    print("== effective-window 优先级 ==")
+    r = app_mod._resolve_effective_context_window
+    check("显式 ctx 覆盖档位", r({"context_window_tokens": 123456, "window_tier": "balanced"}) == 123456)
+    check("balanced 预设 400k", r({"window_tier": "balanced"}) == 400000)
+    check("saving 预设 200k", r({"window_tier": "saving"}) == 200000)
+    check("performance 预设 500k", r({"window_tier": "performance"}) == 500000)
+    check("手动模式 legacy 272k", r({"window_tier": None}) == 272000)
+    check("无档位无窗口 → 272k", r({}) == 272000)
+    check("ctx=None + 无档位 → 272k", r({"context_window_tokens": None}) == 272000)
+    assert r({"window_tier": None}) == 272000
+    assert r({"context_window_tokens": 123456, "window_tier": "balanced"}) == 123456
+
+
+def test_relationship_uses_legacy_272k_in_manual_mode():
+    """手动模式（tier=None、ctx 未定）按 272k 校验，不再跳过。"""
+    print("== 手动模式按 272k 关系校验 ==")
     reset_config()
     code, j = put({"window_tier": None, "reserve_tokens": 16000})
-    check("手动模式 reserve=16000 → 200（不误报关系）", code == 200,
+    check("手动模式 reserve=16000 → 200（36000<272000）", code == 200,
           "got %s %r" % (code, j))
+    reset_config()
+    code, j = put({
+        "window_tier": None,
+        "reserve_tokens": 300000,
+        "keep_recent_tokens": 20000,
+    })
+    check("手动模式 reserve=300000 keep=20000 → 400（320000>=272000）",
+          code == 400, "got %s %r" % (code, j))
+    assert code == 400
+    check("error 含 context_window_tokens",
+          j and "context_window_tokens" in (j or {}).get("error", ""),
+          "error=%r" % (j or {}).get("error"))
+
+
+def test_window_tier_only_put_triggers_relationship_check():
+    """已有高 reserve 时只提交 window_tier=saving，应对合并后的候选拒绝。"""
+    print("== 仅改 window_tier 也做关系校验 ==")
+    reset_config()
+    code, j = put({
+        "window_tier": "balanced",
+        "reserve_tokens": 250000,
+        "keep_recent_tokens": 20000,
+    })
+    check("balanced + reserve=250000 → 200（270000<400000）", code == 200,
+          "got %s %r" % (code, j))
+    code, j = put({"window_tier": "saving"})
+    check("只改 window_tier=saving → 400（270000>=200000）", code == 400,
+          "got %s %r" % (code, j))
+    assert code == 400
+    check("error 含 context_window_tokens",
+          j and "context_window_tokens" in (j or {}).get("error", ""),
+          "error=%r" % (j or {}).get("error"))
+    snap = load_raw()
+    check("落盘仍为 balanced（未部分写入）", snap.get("window_tier") == "balanced",
+          "got %r" % snap.get("window_tier"))
 
 
 def test_relationship_uses_tier_preset_when_saving():
@@ -665,12 +731,12 @@ def test_relationship_uses_tier_preset_when_saving():
           "got %s %r" % (code, j))
 
 
-def test_deprecated_mapping_still_runs_when_relationship_skipped():
-    """手动模式跳过关系校验时，keep_recent_images → visual_working_set_max 映射仍执行。
+def test_deprecated_mapping_still_runs_when_relationship_uses_legacy_window():
+    """手动模式走 272k 关系校验时，keep_recent_images → visual_working_set_max 映射仍执行。
 
     回归：早期实现用 early-return 跳过关系校验，把后面的弃用字段映射也跳过了。
     """
-    print("== 手动模式跳过关系校验 ≠ 跳过弃用映射 ==")
+    print("== 手动模式关系校验 ≠ 跳过弃用映射 ==")
     reset_config()
     code, j = put({"window_tier": None, "reserve_tokens": 16000, "keep_recent_images": 3})
     check("手动模式 + keep_recent_images=3 → 200", code == 200, "got %s %r" % (code, j))

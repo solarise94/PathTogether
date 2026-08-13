@@ -134,15 +134,37 @@ describe("validateRunConfig", () => {
 		).toThrow(/context_window_tokens/);
 	});
 
-	it("skips the relationship check when neither ctx nor tier is set", () => {
-		// Legacy path: no ctx, no tier → no relationship check fires even with
-		// large reserve/keep (defaults applied downstream).
+	it("uses legacy 272k for the relationship check when neither ctx nor tier is set", () => {
 		expect(() =>
 			validateRunConfig(
 				baseConfig({
 					context_window_tokens: null as unknown as number,
-					reserve_tokens: 999999,
-					keep_recent_tokens: 999999,
+					reserve_tokens: 16000,
+					keep_recent_tokens: 20000,
+					window_tier: undefined,
+				}),
+			),
+		).not.toThrow();
+		expect(() =>
+			validateRunConfig(
+				baseConfig({
+					context_window_tokens: null as unknown as number,
+					reserve_tokens: 300000,
+					keep_recent_tokens: 20000,
+					window_tier: undefined,
+				}),
+			),
+		).toThrow(/context_window_tokens/);
+	});
+
+	it("accepts reserve_tokens=0 / keep_recent_tokens=1 against a small explicit window", () => {
+		expect(() =>
+			validateRunConfig(
+				baseConfig({
+					context_window_tokens: 10000,
+					reserve_tokens: 0,
+					keep_recent_tokens: 1,
+					window_tier: undefined,
 				}),
 			),
 		).not.toThrow();

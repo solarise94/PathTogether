@@ -17,6 +17,31 @@
 # =========================================================================== #
 set -u
 
+# --------------------------------------------------------------------------- #
+# Demo fail-closed：REQUIRE_ADMIN_AUTH=1 时拒绝空密码、文档精确 sentinel、
+# 或 <...> 占位符。sentinel 必须与 app.py ADMIN_PASSWORD_PLACEHOLDER_SENTINEL
+# 及 docs/demo-deployment.md 示例一致。内网默认不设该开关（无密码则免登录）。
+# --------------------------------------------------------------------------- #
+_ADMIN_PASSWORD_SENTINEL="<REPLACE_WITH_STRONG_PASSWORD>"
+_require_auth="$(printf '%s' "${REQUIRE_ADMIN_AUTH:-}" | tr '[:upper:]' '[:lower:]')"
+case "$_require_auth" in
+  1|true|yes)
+    _pw="${ADMIN_PASSWORD:-}"
+    _placeholder=0
+    if [ -z "$_pw" ] || [ "$_pw" = "$_ADMIN_PASSWORD_SENTINEL" ]; then
+      _placeholder=1
+    else
+      case "$_pw" in
+        \<*\>) _placeholder=1 ;;
+      esac
+    fi
+    if [ "$_placeholder" -eq 1 ]; then
+      echo "[entry] REQUIRE_ADMIN_AUTH=1 but ADMIN_PASSWORD is empty or a placeholder; refusing to start" >&2
+      exit 1
+    fi
+    ;;
+esac
+
 SIDECAR_BIN="${SIDECAR_BIN:-/app/sidecar/dist/index.js}"
 SIDECAR_URL="${AI_SIDECAR_URL:-http://127.0.0.1:8055}"
 # sidecar 回调 Flask 的地址：显式 AI_FLASK_URL 优先，否则按 PORT 推导

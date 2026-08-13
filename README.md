@@ -109,6 +109,8 @@ podman run -d --name svs-share -p 38000:38000 \
 | `SHARE_TLS_CERT` / `SHARE_TLS_KEY` | — | 提供后分享端直接以 HTTPS 运行 |
 | `ADMIN_USERNAME` | `admin` | 管理员登录用户名 |
 | `ADMIN_PASSWORD` | — | 设置后管理端启用登录认证（内网同样需要） |
+| `REQUIRE_ADMIN_AUTH` | — | 设为 `1` 时密码为空、`<...>` 或文档 sentinel `<REPLACE_WITH_STRONG_PASSWORD>` 则拒绝启动（demo/公网 fail-closed） |
+| `ADMIN_SESSION_COOKIE_SECURE` | — | 设为 `1` 时管理端 session cookie 带 Secure（外部 HTTPS 终止时开启；SSH 隧道 HTTP 不要设） |
 | `SECRET_KEY` | 自动生成并持久化到数据目录 | Flask session 密钥 |
 | `JPEG_QUALITY` | 82 | 瓦片 JPEG 质量 |
 | `TILE_CACHE_MAX` | 3000 | 服务端瓦片缓存片数 |
@@ -213,7 +215,7 @@ cd sidecar && npm test
 - 分享端所有路由都校验 token（存在/未撤销/未过期）且切片属于该分享，否则一律 404
 - 分享端只读：无上传、无删除、无切片列表之外的任何信息
 - 分享链接建议经 HTTPS 暴露（`SHARE_TLS_*` 或前置反代），避免明文 token 被窃听
-- 管理端暴露到公网时务必设置 `ADMIN_PASSWORD`（登录认证 + IP 连续失败锁定），并经由分享端 TLS 监听（同端口路径分流）以 HTTPS 提供
+- 管理端暴露到公网时务必设置 `ADMIN_PASSWORD`（登录认证 + IP 连续失败锁定），并经由分享端 TLS 监听（同端口路径分流）以 HTTPS 提供；demo 部署另设 `REQUIRE_ADMIN_AUTH=1`，且不要在纯 HTTP 公网入口登录
 
 ---
 
@@ -254,7 +256,9 @@ Expose the share server publicly behind any reverse proxy (frp/nginx/caddy) and 
 - The share server is strictly read-only
 - Serve shares over HTTPS to protect tokens in transit
 - When exposing the admin UI publicly, always set `ADMIN_PASSWORD` (login + per-IP
-  lockout) and serve it via the share server's TLS listener (same port, path-routed)
+  lockout) and serve it via the share server's TLS listener (same port, path-routed).
+  Demo deploys should also set `REQUIRE_ADMIN_AUTH=1` and must not log in over
+  plaintext public HTTP.
 
 ## License
 

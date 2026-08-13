@@ -154,6 +154,17 @@ describe("compaction", () => {
 	});
 
 	describe("checkShouldCompact", () => {
+		it("preserves explicit 0 for reserve_tokens and keep_recent_tokens", () => {
+			const settings = resolveCompactionSettings({
+				context_window_tokens: 10000,
+				reserve_tokens: 0,
+				keep_recent_tokens: 1,
+			});
+			expect(settings.settings.reserveTokens).toBe(0);
+			expect(settings.settings.keepRecentTokens).toBe(1);
+			expect(settings.contextWindow).toBe(10000);
+		});
+
 		it("returns false under the threshold", () => {
 			const settings = resolveCompactionSettings({ context_window_tokens: 8192, reserve_tokens: 1024 });
 			// Small message, tiny usage.

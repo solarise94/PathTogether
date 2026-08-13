@@ -19,6 +19,33 @@
   }
 
   function bootstrap() {
+    // 面板 DOM 自举：独立 ui/index.html 自带 #sa-panel；平台 index.html 嵌入模式
+    // （<script src=".../main.js">）页面没有这些元素——此时自建 fixed 面板 append 到
+    // body（纯 DOM，不依赖平台私有 selector）。缺失直接 getElementById 会在
+    // addEventListener 处抛 TypeError，嵌入模式整个引导崩掉。
+    if (!document.getElementById("sa-panel")) {
+      var panel = document.createElement("div");
+      panel.id = "sa-panel";
+      panel.style.cssText = "position:fixed;top:16px;right:16px;width:280px;max-height:80vh;overflow:auto;"
+        + "background:#262e3d;color:#e6e9ef;border:1px solid #3a465c;border-radius:10px;"
+        + "padding:14px;z-index:9999;box-shadow:0 8px 24px rgba(0,0,0,.4);"
+        + "font:13px/1.5 system-ui,sans-serif";
+      panel.innerHTML = '<h3 style="margin:0 0 10px;font-size:15px;color:#7ab6ff">Sample Annotator（示例插件）</h3>'
+        + '<button id="sa-read" type="button">读取当前切片</button>'
+        + '<button id="sa-navigate" type="button">导航到中心</button>'
+        + '<button id="sa-create" type="button">创建测试标注</button>'
+        + '<button id="sa-overreach" type="button">越权演示（annotation.read）</button>'
+        + '<pre id="sa-out" style="white-space:pre-wrap;font-size:12px;margin:10px 0 0">就绪…</pre>'
+        + '<div id="sa-err" style="display:none;margin-top:10px;padding:8px;background:#4a2a2a;'
+        + 'border:1px solid #7a3a3a;border-radius:6px;font-size:12px;color:#ffb3b3"></div>';
+      document.body.appendChild(panel);
+      var btns = panel.querySelectorAll("button");
+      for (var i = 0; i < btns.length; i++) {
+        btns[i].style.cssText = "display:block;width:100%;margin:6px 0;padding:8px 10px;font-size:13px;"
+          + "background:#33415e;color:#e6e9ef;border:1px solid #46566f;border-radius:6px;"
+          + "cursor:pointer;text-align:left";
+      }
+    }
     var bridge = window.PluginSDK.createPluginBridge({ pluginId: "sample-annotator" });
     var out = document.getElementById("sa-out");
 
@@ -32,7 +59,8 @@
     }
 
     // 启动握手：bridge.negotiate。不兼容 → reject {code:"version_incompatible"}，
-    // 展示错误条并停止后续逻辑（后续按钮不启用由下方 failure 标志控制）。
+    // 展示错误条；此后所有 request 也会被 host 以 version_mismatch 稳定拒绝
+    // （host 端同 major 强制校验），按钮保留可点用于演示该失败路径。
     bridge.negotiate().then(function () {
       log("桥协议协商成功：protocolVersion=1.0.0");
     }, function (err) {

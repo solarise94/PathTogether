@@ -64,6 +64,7 @@ function help(): string {
 		"  --arms-dir <path>         Arms directory (default experiments/arms).",
 		"  --fixtures-dir <path>     Fixtures directory (default experiments/fixtures).",
 		"  --out <dir>               Output directory (default experiments/results/<run-id>).",
+		"  --cell-gap-ms <ms>        Cooldown gap between cells (upstream rate-limit protection, default 0).",
 		"  --keep-flask              Leave Flask running after the run (debug).",
 		"  --dry-run                 Resolve + print the matrix + config (key redacted); do NOT execute or spawn Flask.",
 		"  --max-cells <N>           Cost guard: cap the number of (arm, task) cells executed.",
@@ -87,6 +88,7 @@ async function main(): Promise<void> {
 			"dry-run": { type: "boolean", default: false },
 			"max-cells": { type: "string" },
 			"settle-timeout-ms": { type: "string" },
+			"cell-gap-ms": { type: "string" },
 			help: { type: "boolean", default: false },
 		},
 		strict: true,
@@ -126,6 +128,11 @@ async function main(): Promise<void> {
 	if (settleTimeoutMs !== undefined && (!Number.isFinite(settleTimeoutMs) || settleTimeoutMs <= 0 || !Number.isInteger(settleTimeoutMs))) {
 		throw new RunnerArgumentError("--settle-timeout-ms must be a positive integer");
 	}
+	const cellGapRaw = values["cell-gap-ms"];
+	const cellGapMs = cellGapRaw != null && cellGapRaw !== "" ? Number(cellGapRaw) : undefined;
+	if (cellGapMs !== undefined && (!Number.isFinite(cellGapMs) || cellGapMs < 0 || !Number.isInteger(cellGapMs))) {
+		throw new RunnerArgumentError("--cell-gap-ms must be a non-negative integer");
+	}
 
 	const opts: RunOptions = {
 		mode,
@@ -141,6 +148,7 @@ async function main(): Promise<void> {
 		dryRun: !!values["dry-run"],
 		maxCells,
 		settleTimeoutMs,
+		cellGapMs,
 	};
 
 	// Real acquireEnv: ensure slides → spawn Flask → pin manifest → FlaskClient.

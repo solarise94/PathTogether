@@ -280,7 +280,8 @@ def test_admin_plugins_list_and_toggle():
     items = r.get_json()["installations"]
     assert len(items) == 1
     assert items[0]["installation_id"] == inst["installation_id"]
-    assert items[0]["health"] == "unknown"  # 占位
+    # health 为 sidecar 可达性快照（reachable/unreachable），不再是占位 unknown
+    assert items[0]["health"] in ("reachable", "unreachable")
     # disable → token 立即失效；enable → 恢复
     secret = _file_secret()
     token = _exchange(client, inst["installation_id"], secret)
@@ -295,6 +296,25 @@ def test_admin_plugins_list_and_toggle():
     with m1, m2, m3:
         r = client.get("/api/plugin/v1/slides/%s" % _touch_slide(), headers=_bearer(token))
         assert r.status_code == 200
+
+
+def test_admin_plugins_health_probe_mock():
+    """平台 /api/admin/plugins 顺带探 sidecar /healthz（mock requests）。"""
+    inst = _bootstrap()
+    client = _client()
+    _owner_session(client)
+    # 用 FakeRequests 替换 app.requests 捕获 /healthz 调用；默认 404 → unreachable
+    fake = _install_fake_requests()
+    fake.register("GET", "/healthz",
+                  lambda b, q, h, k: _FakeResponse(200, b'{"ok":true}',
+                                                   headers={"Content-Type": "application/json"}))
+    items = client.get("/api/admin/plugins").get_json()["installations"]
+    assert items[0]["health"] == "reachable"
+    # 把 /healthz 关掉 → unreachable
+    fake2 = _install_fake_requests()
+    fake2.set_unreachable()
+    items = client.get("/api/admin/plugins").get_json()["installations"]
+    assert items[0]["health"] == "unreachable"
 
 
 def test_admin_plugins_requires_owner():
@@ -680,6 +700,10 @@ class _FakeRequests:
     def __init__(self):
         self._routes = {}
         self.calls = []
+        self._next_error = None
+
+    def set_unreachable(self):
+        self._next_error = True
 
     def register(self, method, path, handler):
         self._routes[(method.upper(), path)] = handler
@@ -689,6 +713,8 @@ class _FakeRequests:
         path = url[len(base):] if url.startswith(base) else url
         self.calls.append({"method": method, "path": path,
                            "body": kwargs.get("json"), "query": kwargs.get("params")})
+        if self._next_error:
+            raise _FakeRequests.ConnectionError("sidecar down (test)")
         handler = self._routes.get((method, path))
         if handler is None:
             return _FakeResponse(404, b'{"error":"no route"}')

@@ -723,3 +723,48 @@ describe("SessionStore: acquire ownership guard (Stage 3a-2b review hardening)",
 		expect(read?.owner).toBe("usr_A");
 	});
 });
+
+describe("SessionStore: sessions dir resolution (Stage 4-3)", () => {
+	it("AI_SESSIONS_DIR takes priority over default", async () => {
+		const prev = process.env.AI_SESSIONS_DIR;
+		const custom = join(rootTmp, "custom-sessions");
+		process.env.AI_SESSIONS_DIR = custom;
+		try {
+			const store = new SessionStore();
+			expect(store.sessionsDir).toBe(custom);
+		} finally {
+			if (prev === undefined) delete process.env.AI_SESSIONS_DIR;
+			else process.env.AI_SESSIONS_DIR = prev;
+		}
+	});
+
+	it("falls back to ~/.svs-sidecar/sessions when AI_SESSIONS_DIR unset", async () => {
+		const prev = process.env.AI_SESSIONS_DIR;
+		const prevHome = process.env.HOME;
+		const fakeHome = join(rootTmp, "fake-home");
+		delete process.env.AI_SESSIONS_DIR;
+		process.env.HOME = fakeHome;
+		try {
+			const store = new SessionStore();
+			expect(store.sessionsDir).toBe(join(fakeHome, ".svs-sidecar", "sessions"));
+		} finally {
+			if (prev === undefined) delete process.env.AI_SESSIONS_DIR;
+			else process.env.AI_SESSIONS_DIR = prev;
+			if (prevHome === undefined) delete process.env.HOME;
+			else process.env.HOME = prevHome;
+		}
+	});
+
+	it("explicit sessionsDir option still wins over env", async () => {
+		const prev = process.env.AI_SESSIONS_DIR;
+		process.env.AI_SESSIONS_DIR = join(rootTmp, "env-dir");
+		try {
+			const explicit = join(rootTmp, "explicit-dir");
+			const store = new SessionStore({ sessionsDir: explicit });
+			expect(store.sessionsDir).toBe(explicit);
+		} finally {
+			if (prev === undefined) delete process.env.AI_SESSIONS_DIR;
+			else process.env.AI_SESSIONS_DIR = prev;
+		}
+	});
+});

@@ -1428,6 +1428,59 @@ button {
 .user-actions { display: flex; gap: 4px; flex-shrink: 0; }
 
 /* =========================================================================
+   插件管理（owner；Stage 4-3）—— 风格对齐用户管理块
+   ========================================================================= */
+.plugins-list {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.plugin-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: var(--r-row);
+  transition: background 0.12s ease;
+}
+.plugin-row:hover { background: var(--hover-strong); }
+.plugin-row.plugin-empty { justify-content: flex-start; color: var(--text-3); font-size: 12px; }
+.plugin-main { display: flex; flex-direction: column; min-width: 0; }
+.plugin-name { font-size: 13px; font-weight: 600; color: var(--text); }
+.plugin-sub { font-size: 11px; color: var(--text-3); }
+.plugin-created { font-size: 11px; color: var(--text-3); }
+.plugin-actions { display: flex; gap: 4px; flex-shrink: 0; }
+.plugins-health-note {
+  font-size: 12px;
+  color: var(--text-3);
+  margin: 2px 2px 6px;
+}
+.plugins-health-note.degraded { color: var(--danger, #c0392b); }
+.plugin-secret-once {
+  margin: 6px 2px;
+  padding: 8px;
+  border: 1px solid var(--border, rgba(0,0,0,0.12));
+  border-radius: var(--r-row);
+  background: var(--hover-soft, rgba(0,0,0,0.04));
+}
+.plugin-secret-title { font-size: 12px; font-weight: 600; color: var(--text); }
+.plugin-secret-row { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+.plugin-secret-val {
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  color: var(--text);
+  word-break: break-all;
+  flex: 1;
+  background: rgba(0,0,0,0.05);
+  padding: 4px 6px;
+  border-radius: 4px;
+}
+.plugin-secret-hint { font-size: 11px; color: var(--text-3); margin-top: 6px; }
+
+
+/* =========================================================================
    标注画布层 + 绘制工具 + 别名备注编辑
    ========================================================================= */
 /* 标注画布层：瓦片之上、ROI 框之下；pointer-events 由绘制模式控制 */
@@ -1887,6 +1940,18 @@ button {
   display: inline-flex;
   align-items: center;
   gap: 2px;
+}
+
+/* AI 服务降级横幅（sidecar 不可达；平台功能不受影响） */
+.ai-degrade-banner {
+  margin: 8px 12px 0;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #8a5a00;
+  background: rgba(255, 204, 0, 0.16);
+  border: 0.5px solid rgba(180, 130, 0, 0.35);
+  border-radius: var(--r-row);
 }
 
 /* 1. 设置区 */

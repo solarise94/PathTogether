@@ -12,8 +12,9 @@
  *                     分享门户容器（svs-share，combined_app 同端口也挂
  *                     /api/ai/*）需要跨容器经 podman 内网访问本 sidecar；
  *                     不发布宿主端口，8055 只在容器网络内可达。
+ *   AI_SESSIONS_DIR   session store dir (default ~/.svs-sidecar/sessions;
+ *                     同容器由 docker_entry.sh export /data/sidecar-sessions)
  *   AI_FLASK_URL      Flask callback base URL (default http://127.0.0.1:8000)
- *   SHARE_DATA_DIR    data dir (sessions live under <dir>/ai_sessions)
  *   AI_INTERNAL_TOKEN shared callback token (else read from data dir)
  */
 import { SessionStore } from "./session-store.js";

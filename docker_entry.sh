@@ -1,21 +1,36 @@
 #!/bin/sh
 # =========================================================================== #
-# 容器入口：同进程起 Flask 管理端（gunicorn）+ Node AI sidecar。
+# 容器入口：进程拓扑由 ROLE 环境变量决定（Stage 4-3 独立容器形态）。
 #
-# 进程拓扑：
+# ROLE 三态（缺省 all，即历史双进程，demo 现状不变）：
+#   all      （缺省）同容器起 gunicorn（Flask 管理端）+ Node AI sidecar。
+#   platform 只起 gunicorn（不做 sidecar 探活/启动；仍做 PG / import 预检）。
+#   sidecar  只起 sidecar（跳过 Flask/PG 预检；启动前等 AI_FLASK_URL /login
+#            可达，最多 30s，超时退出——启动顺序兜底）。
+#
+# 进程拓扑（all 模式）：
 #   - sidecar（node /app/sidecar/dist/index.js）：仅监听 127.0.0.1:8055，
 #     通过 /internal/ai/* 回调 Flask（127.0.0.1:$PORT，AI_FLASK_URL 推导）读图/落标注/取变更。
 #   - gunicorn（app:app）：监听 0.0.0.0:$PORT（默认 8000），对外服务管理端，并把
 #     /api/ai/* 代理到 sidecar。
 #
-# 启动顺序：先起 sidecar，轮询 /healthz 直到就绪（最多 30s），再起 gunicorn。
-# 进程管理：
+# 启动顺序（all）：先起 sidecar，轮询 /healthz 直到就绪（最多 30s），再起 gunicorn。
+# 进程管理（all）：
 #   - 任一子进程退出 → 容器退出（exit code 取首个退出进程的码）。
 #   - SIGTERM/SIGINT：先停 gunicorn（优雅 drain），再停 sidecar，最后退出。
 # 不依赖 bash 的 wait -n（python:3.12-slim 默认 sh 是 dash，不支持 -n），
 # 用 kill -0 轮询监控子进程，纯 POSIX sh 可移植。
 # =========================================================================== #
 set -u
+
+# --------------------------------------------------------------------------- #
+# ROLE 解析（归一化小写；非法值 fallthrough 到 all）
+# --------------------------------------------------------------------------- #
+_ROLE="$(printf '%s' "${ROLE:-all}" | tr '[:upper:]' '[:lower:]')"
+case "$_ROLE" in
+  platform|sidecar|all) ;;
+  *) echo "[entry] 未知 ROLE='${ROLE:-}'; 回退 all（同容器双进程）" >&2; _ROLE=all ;;
+esac
 
 # --------------------------------------------------------------------------- #
 # Demo fail-closed：REQUIRE_ADMIN_AUTH=1 时拒绝空密码、文档精确 sentinel、
@@ -105,11 +120,13 @@ fi
 # STORAGE_BACKEND ∈ {postgres, dual} 时，启动服务前先 ensure_schema（与 app.py
 # import 期的 fail-fast 双保险：这里在 sidecar 起来之前给出更清晰的中文错误）。
 # 失败直接退出，绝不带病拉起 gunicorn。json 后端（默认）跳过。
+# 仅 ROLE ∈ {all, platform} 执行：sidecar 角色只跑 sidecar，PG 属平台侧。
 # --------------------------------------------------------------------------- #
-_BACKEND="$(printf '%s' "${STORAGE_BACKEND:-}" | tr '[:upper:]' '[:lower:]')"
-case "$_BACKEND" in
-  postgres|dual)
-    if ! python3 -c '
+if [ "$_ROLE" != "sidecar" ]; then
+  _BACKEND="$(printf '%s' "${STORAGE_BACKEND:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$_BACKEND" in
+    postgres|dual)
+      if ! python3 -c '
 import sys
 import pg_store
 try:
@@ -122,85 +139,149 @@ except Exception as exc:
     sys.stderr.write("[entry] PostgreSQL schema 初始化失败，拒绝启动: %s\n" % exc)
     sys.exit(1)
 '; then
-      exit 1
-    fi
-    [ "$_BACKEND" = "dual" ] && echo "[entry] STORAGE_BACKEND=dual: expand 形态，读 json 权威、写镜像 pg" >&2
-    ;;
-esac
+        exit 1
+      fi
+      [ "$_BACKEND" = "dual" ] && echo "[entry] STORAGE_BACKEND=dual: expand 形态，读 json 权威、写镜像 pg" >&2
+      ;;
+  esac
+fi
 
 # --------------------------------------------------------------------------- #
-# 1) 起 sidecar（后台）
+# 0c) sidecar 专属 session 目录（Stage 4-3 session DB 分离）。
+# 同容器（ROLE=all）显式 export AI_SESSIONS_DIR=/data/sidecar-sessions，与平台
+# SHARE_DATA_DIR 分开。含一次性迁移：新目录为空且旧目录（SHARE_DATA_DIR/ai_sessions）
+# 存在时把旧内容 mv 进新目录（仅 once；注释即说明）。独立 sidecar 容器不在此设
+# （用户自配 AI_SESSIONS_DIR 指向 sidecar 卷）。
+# --------------------------------------------------------------------------- #
+if [ "$_ROLE" != "sidecar" ]; then
+  # 平台/同容器都准备 sidecar-sessions 目录（同容器时 sidecar 也用它）。
+  _SIDECAR_SESSIONS="${AI_SESSIONS_DIR:-/data/sidecar-sessions}"
+  export AI_SESSIONS_DIR="$_SIDECAR_SESSIONS"
+  mkdir -p "$_SIDECAR_SESSIONS" 2>/dev/null || true
+  # 一次性迁移：新目录空 + 旧目录存在 → 把旧目录内容 mv 进新目录。
+  # 旧目录 = 平台卷内 ai_sessions（Stage 4-3 前 sidecar 与平台同卷共用的会话目录）。
+  _LEGACY_SESSIONS="$SHARE_DATA_DIR/ai_sessions"
+  if [ -d "$_LEGACY_SESSIONS" ] && [ -z "$(find "$_SIDECAR_SESSIONS" -mindepth 1 -maxdepth 1 2>/dev/null)" ]; then
+    _moved=0
+    for _f in "$_LEGACY_SESSIONS"/*; do
+      [ -e "$_f" ] || break
+      if mv "$_f" "$_SIDECAR_SESSIONS/" 2>/dev/null; then _moved=1; fi
+    done
+    if [ "$_moved" -eq 1 ]; then
+      rmdir "$_LEGACY_SESSIONS" 2>/dev/null || true
+      echo "[entry] 迁移旧 sessions（$SHARE_DATA_DIR/ai_sessions → $_SIDECAR_SESSIONS）" >&2
+    fi
+  fi
+fi
+
+# --------------------------------------------------------------------------- #
+# 1) 起 sidecar（后台）—— 仅 ROLE ∈ {all, sidecar}。
 #
-# Stage 4-1b 启动顺序：sidecar 在启动时一次性解析插件凭证文件
+# all 模式：Stage 4-1b 启动顺序 —— sidecar 在启动时一次性解析插件凭证文件
 # （SHARE_DATA_DIR/plugin-secret-histopilot.txt，Flask import 期幂等引导写入）。
 # 若 sidecar 先于 Flask 首启完成引导，会因找不到文件而永久回退 legacy 适配器。
 # 故先做一次轻量 `import app` 预检：完成 owner/插件引导 + PG schema 检查（幂等），
 # 保证凭证文件在 sidecar 读取前已存在；失败则拒绝启动（与上面 PG 预检同语义）。
+#
+# sidecar 模式：Flask/PG 属另一容器，不在此预检；但启动前等 AI_FLASK_URL /login
+# 可达（最多 30s，每 0.5s 一次；连接建立即视为可达——平台可能返回 401/302）。
+# 超时直接退出，避免 sidecar 以 legacy 适配器误连一个尚未就绪的平台。
 # --------------------------------------------------------------------------- #
-if ! _APP_PRECHECK_OUT="$(python3 -c "import app" 2>&1)"; then
-    printf '%s\n' "$_APP_PRECHECK_OUT" >&2
-    echo "[entry] Flask 应用预检失败（import app 非零退出），拒绝启动" >&2
-    exit 1
-fi
-
-echo "[entry] starting AI sidecar ($SIDECAR_BIN)" >&2
-node "$SIDECAR_BIN" &
-SIDECAR_PID=$!
-
-# --------------------------------------------------------------------------- #
-# 2) 等 sidecar /healthz 就绪（最多 30s）
-# 用 node 一行做 HTTP 探活（容器内已有 node，无需额外装 curl）。
-# --------------------------------------------------------------------------- #
-HEALTHZ_URL="${SIDECAR_URL%/}/healthz"
-READY=0
-i=0
-while [ "$i" -lt 60 ]; do
-    # node 退出码 0 表示 /healthz 返回 200。env 必须作为命令前缀
-    # （写在 -e 脚本后面会变成 argv 而非环境变量，探活恒失败）。
-    if SVS_HEALTHZ_URL="$HEALTHZ_URL" node -e '
+if [ "$_ROLE" != "platform" ]; then
+  if [ "$_ROLE" = "all" ]; then
+    if ! _APP_PRECHECK_OUT="$(python3 -c "import app" 2>&1)"; then
+      printf '%s\n' "$_APP_PRECHECK_OUT" >&2
+      echo "[entry] Flask 应用预检失败（import app 非零退出），拒绝启动" >&2
+      exit 1
+    fi
+  else
+    # sidecar 模式：等平台 /login 可达（任何 HTTP 状态即就绪，连接建立即可）。
+    _PLATFORM_READY=0
+    _j=0
+    while [ "$_j" -lt 60 ]; do
+      if SVS_PLATFORM_URL="${AI_FLASK_URL%/}/login" node -e '
         const http = require("http");
-        const url = new URL(process.env.SVS_HEALTHZ_URL);
+        const url = new URL(process.env.SVS_PLATFORM_URL);
         const req = http.get(
-            { hostname: url.hostname, port: url.port, path: url.pathname, timeout: 1000 },
-            (res) => { process.exit(res.statusCode === 200 ? 0 : 1); }
+          { hostname: url.hostname, port: url.port, path: url.pathname, timeout: 1000 },
+          (res) => { res.resume(); process.exit(0); }  // 连接建立即就绪
         );
         req.on("error", () => process.exit(1));
         req.on("timeout", () => { req.destroy(); process.exit(1); });
-    ' 2>/dev/null; then
-        READY=1
+      ' 2>/dev/null; then
+        _PLATFORM_READY=1
         break
+      fi
+      sleep 0.5
+      _j=$((_j + 1))
+    done
+    if [ "$_PLATFORM_READY" -ne 1 ]; then
+      echo "[entry] AI_FLASK_URL=$AI_FLASK_URL /login 30s 内不可达，退出（sidecar 依赖平台先就绪）" >&2
+      exit 1
     fi
-    # sidecar 进程已提前退出 → 不再等待。
-    if ! kill -0 "$SIDECAR_PID" 2>/dev/null; then
-        echo "[entry] sidecar exited before /healthz became ready" >&2
-        wait "$SIDECAR_PID"
-        EXIT_CODE=$?
-        exit "$EXIT_CODE"
-    fi
-    sleep 0.5
-    i=$((i + 1))
-done
+    echo "[entry] platform reachable at $AI_FLASK_URL, starting sidecar" >&2
+  fi
 
-if [ "$READY" -ne 1 ]; then
-    echo "[entry] sidecar /healthz not ready within 30s, aborting" >&2
-    kill -TERM "$SIDECAR_PID" 2>/dev/null
-    wait "$SIDECAR_PID" 2>/dev/null
-    exit 1
+  echo "[entry] starting AI sidecar ($SIDECAR_BIN)" >&2
+  node "$SIDECAR_BIN" &
+  SIDECAR_PID=$!
+
+  # ------------------------------------------------------------------------- #
+  # 2) 等 sidecar /healthz 就绪（最多 30s）
+  # 用 node 一行做 HTTP 探活（容器内已有 node，无需额外装 curl）。
+  # ------------------------------------------------------------------------- #
+  HEALTHZ_URL="${SIDECAR_URL%/}/healthz"
+  READY=0
+  i=0
+  while [ "$i" -lt 60 ]; do
+      # node 退出码 0 表示 /healthz 返回 200。env 必须作为命令前缀
+      # （写在 -e 脚本后面会变成 argv 而非环境变量，探活恒失败）。
+      if SVS_HEALTHZ_URL="$HEALTHZ_URL" node -e '
+          const http = require("http");
+          const url = new URL(process.env.SVS_HEALTHZ_URL);
+          const req = http.get(
+              { hostname: url.hostname, port: url.port, path: url.pathname, timeout: 1000 },
+              (res) => { process.exit(res.statusCode === 200 ? 0 : 1); }
+          );
+          req.on("error", () => process.exit(1));
+          req.on("timeout", () => { req.destroy(); process.exit(1); });
+      ' 2>/dev/null; then
+          READY=1
+          break
+      fi
+      # sidecar 进程已提前退出 → 不再等待。
+      if ! kill -0 "$SIDECAR_PID" 2>/dev/null; then
+          echo "[entry] sidecar exited before /healthz became ready" >&2
+          wait "$SIDECAR_PID"
+          EXIT_CODE=$?
+          exit "$EXIT_CODE"
+      fi
+      sleep 0.5
+      i=$((i + 1))
+  done
+
+  if [ "$READY" -ne 1 ]; then
+      echo "[entry] sidecar /healthz not ready within 30s, aborting" >&2
+      kill -TERM "$SIDECAR_PID" 2>/dev/null
+      wait "$SIDECAR_PID" 2>/dev/null
+      exit 1
+  fi
+  [ "$_ROLE" = "all" ] && echo "[entry] sidecar ready, starting gunicorn" >&2
 fi
 
-echo "[entry] sidecar ready, starting gunicorn" >&2
-
 # --------------------------------------------------------------------------- #
-# 3) 起 gunicorn（后台与 sidecar 并行）
+# 3) 起 gunicorn（后台）—— 仅 ROLE ∈ {all, platform}。
 # PORT 尊重环境（demo 多实例并跑不打架；默认 8000 保持生产兼容）。
 # --------------------------------------------------------------------------- #
-GUNICORN_BIND_PORT="${PORT:-8000}"
-gunicorn app:app \
-    -b "0.0.0.0:${GUNICORN_BIND_PORT}" \
-    -w "$GUNICORN_WORKERS" \
-    --threads "$GUNICORN_THREADS" \
-    --access-logfile - --error-logfile - &
-GUNICORN_PID=$!
+if [ "$_ROLE" != "sidecar" ]; then
+  GUNICORN_BIND_PORT="${PORT:-8000}"
+  gunicorn app:app \
+      -b "0.0.0.0:${GUNICORN_BIND_PORT}" \
+      -w "$GUNICORN_WORKERS" \
+      --threads "$GUNICORN_THREADS" \
+      --access-logfile - --error-logfile - &
+  GUNICORN_PID=$!
+fi
 
 # --------------------------------------------------------------------------- #
 # 4) 监控：任一子进程退出则容器退出。
@@ -208,13 +289,13 @@ GUNICORN_PID=$!
 # 的码（wait 取回）作为容器退出码。
 # --------------------------------------------------------------------------- #
 while [ "$SHUTTING_DOWN" -eq 0 ]; do
-    if ! kill -0 "$SIDECAR_PID" 2>/dev/null; then
+    if [ -n "$SIDECAR_PID" ] && ! kill -0 "$SIDECAR_PID" 2>/dev/null; then
         echo "[entry] sidecar exited, shutting down" >&2
         wait "$SIDECAR_PID"
         EXIT_CODE=$?
         break
     fi
-    if ! kill -0 "$GUNICORN_PID" 2>/dev/null; then
+    if [ -n "$GUNICORN_PID" ] && ! kill -0 "$GUNICORN_PID" 2>/dev/null; then
         echo "[entry] gunicorn exited, shutting down" >&2
         wait "$GUNICORN_PID"
         EXIT_CODE=$?
@@ -227,9 +308,9 @@ done
 # 这里是正常退出路径（子进程先退），直接 kill + wait。
 if [ "$SHUTTING_DOWN" -eq 0 ]; then
     trap '' TERM INT
-    kill -TERM "$GUNICORN_PID" 2>/dev/null
-    kill -TERM "$SIDECAR_PID" 2>/dev/null
-    wait "$GUNICORN_PID" 2>/dev/null
-    wait "$SIDECAR_PID" 2>/dev/null
+    [ -n "$GUNICORN_PID" ] && kill -TERM "$GUNICORN_PID" 2>/dev/null
+    [ -n "$SIDECAR_PID" ] && kill -TERM "$SIDECAR_PID" 2>/dev/null
+    [ -n "$GUNICORN_PID" ] && wait "$GUNICORN_PID" 2>/dev/null
+    [ -n "$SIDECAR_PID" ] && wait "$SIDECAR_PID" 2>/dev/null
 fi
 exit "$EXIT_CODE"

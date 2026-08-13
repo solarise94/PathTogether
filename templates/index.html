@@ -209,6 +209,19 @@
             <div id="users-list" class="users-list"></div>
           </div>
         </div>
+
+        <!-- 插件管理（仅 owner 可见；JS 依据 role 显示；Stage 4-3） -->
+        <div class="section" id="plugins-mgr-section" hidden>
+          <div class="section-head row" id="plugins-mgr-toggle">
+            <span class="caret">▾</span>
+            <span class="section-title" data-i18n="sb.section.plugins">插件管理</span>
+          </div>
+          <div id="plugins-mgr-body" class="section-body">
+            <div class="plugins-health-note" id="plugins-health-note"></div>
+            <!-- 插件安装列表 -->
+            <div id="plugins-list" class="plugins-list"></div>
+          </div>
+        </div>
       </div>
 
       <div class="sidebar-bottom">
@@ -267,6 +280,10 @@
             <button id="ai-panel-close" class="icon-btn close" aria-label="关闭" data-i18n-aria="picker.close">×</button>
           </div>
         </div>
+
+        <!-- AI 服务降级横幅（sidecar 不可达时显示；平台/标注/协作不受影响） -->
+        <div id="ai-degrade-banner" class="ai-degrade-banner" style="display:none;"
+             data-i18n="ai.degraded">AI 服务暂不可用，平台功能正常。将自动重试检测恢复…</div>
 
         <!-- 1. 设置区（未配置时展开） -->
         <div id="ai-config-wrap" class="ai-config-wrap">

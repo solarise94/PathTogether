@@ -85,10 +85,18 @@ ENV PORT=8000 \
     SHARE_DATA_DIR=/data/share \
     AI_SIDECAR_PORT=8055 \
     AI_SIDECAR_HOST=0.0.0.0 \
-    AI_SIDECAR_URL=http://127.0.0.1:8055
+    AI_SIDECAR_URL=http://127.0.0.1:8055 \
+    ROLE=all
+
+# sidecar 专属 session 目录（Stage 4-3 session DB 分离）：与平台 SHARE_DATA_DIR
+# 分开。同容器（ROLE=all）由 docker_entry.sh 显式 export AI_SESSIONS_DIR 指向此处，
+# 并在启动时把旧 SHARE_DATA_DIR/ai_sessions 一次性迁移过来。声明目录（非 VOLUME，
+# 由部署方按需挂载 sidecar 卷，例如 -v sidecar-sessions:/data/sidecar-sessions）。
+RUN mkdir -p /data/sidecar-sessions
 
 EXPOSE 8000
 
-# 双进程：docker_entry.sh 先起 sidecar，等 /healthz 就绪后起 gunicorn；
+# 双进程（ROLE=all 缺省）：docker_entry.sh 先起 sidecar，等 /healthz 就绪后起 gunicorn；
 # 任一进程退出则容器退出；收到 SIGTERM 先停 gunicorn 再停 sidecar。
+# ROLE=platform 只起 gunicorn；ROLE=sidecar 只起 sidecar（见 docker_entry.sh）。
 CMD ["./docker_entry.sh"]

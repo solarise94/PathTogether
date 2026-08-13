@@ -553,6 +553,52 @@ def test_missing_slide_returns_400():
           "calls=%d" % len(fake.calls))
 
 
+def test_healthz_reports_sidecar_and_backend():
+    """Stage 4-3：/healthz 返回 backend + sidecar 可达性；sidecar 不可达仍 200。"""
+    print("== /healthz: backend + sidecar 可达性，不可达不 fail ==")
+    fake = install_fake_requests()
+    client = make_client()
+    # sidecar 可达（mock /healthz 200）
+    fake.register("GET", "/healthz",
+                  lambda b, q, h, k: FakeResponse(200, b'{"ok":true}',
+                   headers={"Content-Type": "application/json"}))
+    r = client.get("/healthz")
+    check("healthz 200", r.status_code == 200, "got %d" % r.status_code)
+    body = json.loads(r.data)
+    check("healthz ok=true", body.get("ok") is True)
+    check("healthz backend 存在", "backend" in body, "got %r" % body)
+    check("healthz sidecar=reachable", body.get("sidecar") == "reachable",
+          "got %r" % body.get("sidecar"))
+    # sidecar 不可达 → healthz 仍 200，sidecar=unreachable
+    fake.set_unreachable()
+    r2 = client.get("/healthz")
+    check("sidecar 不可达时 healthz 仍 200", r2.status_code == 200,
+          "got %d" % r2.status_code)
+    check("sidecar=unreachable", json.loads(r2.data).get("sidecar") == "unreachable",
+          "got %r" % json.loads(r2.data).get("sidecar"))
+    fake.clear_unreachable()
+
+
+def test_degradation_platform_independent():
+    """Stage 4-3 降级验收：sidecar 不可达时 /api/ai/run 503，viewer API 正常。"""
+    print("== 降级：sidecar 不可达 → /api/ai/run 503，viewer(/api/slides) 正常 ==")
+    fake = install_fake_requests()
+    client = make_client()
+    setup_ai_config()
+    fake.set_unreachable()
+    # viewer API 不依赖 sidecar，应正常（非 503）
+    r0 = client.get("/api/slides")
+    check("sidecar 不可达时 /api/slides 正常（非 503）", r0.status_code != 503,
+          "got %d" % r0.status_code)
+    # /api/ai/run 503 形状
+    r = client.post("/api/ai/run", json={"slide": "s.svs"})
+    check("降级时 /api/ai/run 503", r.status_code == 503, "got %d" % r.status_code)
+    body = json.loads(r.data)
+    check("降级 503 body error 形状", body.get("error") == "ai sidecar 不可用",
+          "got %r" % body)
+    fake.clear_unreachable()
+
+
 if __name__ == "__main__":
     test_run_proxies_with_decrypted_config_and_sse()
     test_continue_and_ask_proxy()
@@ -567,5 +613,7 @@ if __name__ == "__main__":
     test_require_admin_auth_fail_closed()
     test_admin_session_cookie_secure_explicit_only()
     test_missing_slide_returns_400()
+    test_healthz_reports_sidecar_and_backend()
+    test_degradation_platform_independent()
     print("\nPASS=%d FAIL=%d" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

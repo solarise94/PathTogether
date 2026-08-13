@@ -139,7 +139,7 @@ podman run -d --name svs-share -p 38000:38000 \
 
 - **Flask（`app.py`）**：鉴权、切片 IO、标注库、AI 配置（`ai_config.json`，api_key Fernet 加密）；`/api/ai/*` 字节级透传代理到 sidecar；`/internal/ai/*` 是 sidecar 回调读图/落标注/取变更的内部端点（共享 token 互信）。
 - **sidecar（`sidecar/`，Node 22 + pi 0.84.0）**：跑 pi Agent loop、compaction、会话存储与 SSE 事件总线；**不读 `ai_config.json`**，每请求的引擎配置由 Flask 注入 body `config` 字段。
-- 两者共享 `SHARE_DATA_DIR/ai_sessions/`（会话文件）与 `SHARE_DATA_DIR/ai_internal.token`（内部 token，可由 env `AI_INTERNAL_TOKEN` 覆盖）。
+- 两者共享 `SHARE_DATA_DIR/ai_internal.token`（内部 token，可由 env `AI_INTERNAL_TOKEN` 覆盖）。会话文件**不再**共享：sidecar 存 `AI_SESSIONS_DIR`（Stage 4-3 起独立，同容器由 `docker_entry.sh` 指向 `/data/sidecar-sessions`）。
 
 **配置**（首次使用）：
 1. 在 AI 面板的「设置区」填写：
@@ -198,8 +198,10 @@ python3 app.py
 | `AI_SIDECAR_PORT` | 8055 | sidecar 监听端口（仅 127.0.0.1） |
 | `AI_FLASK_URL` | `http://127.0.0.1:8000` | sidecar 回调 Flask 的基础 URL |
 | `AI_SIDECAR_URL` | `http://127.0.0.1:8055` | Flask 代理 `/api/ai/*` 到 sidecar 的 URL |
+| `AI_SESSIONS_DIR` | `~/.svs-sidecar/sessions` | sidecar 会话存储目录（Stage 4-3 起独立，不再与平台 `SHARE_DATA_DIR` 混放；同容器由 `docker_entry.sh` 显式指向 `/data/sidecar-sessions`） |
 | `AI_INTERNAL_TOKEN` | （空 → 读文件） | sidecar ↔ Flask 内部回调共享 token；空则两边从 `SHARE_DATA_DIR/ai_internal.token`（0600）读取 |
-| `SHARE_DATA_DIR` | `~/svs-viewer/share-data`（容器内 `/data/share`） | 会话存储根目录（`ai_sessions/`）+ AI 配置/密钥文件 |
+| `ROLE` | `all` | 容器进程拓扑：`all`（双进程，缺省）/ `platform`（只 gunicorn）/ `sidecar`（只 sidecar，见下） |
+| `SHARE_DATA_DIR` | `~/svs-viewer/share-data`（容器内 `/data/share`） | 平台数据目录（AI 配置/密钥文件；会话已迁出到 `AI_SESSIONS_DIR`） |
 
 **测试**：
 ```bash

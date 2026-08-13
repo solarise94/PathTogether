@@ -79,6 +79,7 @@
         currentRole = info.role || null;
         currentUserId = info.user_id || null;
         showUsersMgr();
+        showPluginsMgr();
       }
     }).catch(function () { /* 忽略，不影响主功能 */ });
   }
@@ -203,6 +204,135 @@
     });
   }
 
+  // ---------- 插件管理（仅 owner 可见；Stage 4-3） ----------
+  function showPluginsMgr() {
+    var section = els.pluginsMgrSection;
+    if (!section) return;
+    if (currentRole === "owner") {
+      section.hidden = false;
+      loadPlugins();
+    } else {
+      section.hidden = true;
+    }
+  }
+
+  function loadPlugins() {
+    if (!els.pluginsList) return;
+    apiFetch("/api/admin/plugins").then(function (r) {
+      return r.json().then(function (body) {
+        return { status: r.status, body: body };
+      });
+    }).then(function (res) {
+      if (res.status === 403) { currentRole = null; showPluginsMgr(); return; }
+      if (res.status !== 200) { toast(res.body.error || "加载失败", "error"); return; }
+      var items = res.body.installations || [];
+      renderPluginHealthNote(items.length ? (items[0].health || "unknown") : "unknown");
+      renderPlugins(items);
+    }).catch(function () { /* 忽略 */ });
+  }
+
+  function renderPluginHealthNote(health) {
+    if (!els.pluginsHealthNote) return;
+    var txt = health === "reachable"
+      ? t("sb.plugins.health.reachable")
+      : (health === "unreachable" ? t("sb.plugins.health.unreachable") : "");
+    els.pluginsHealthNote.textContent = txt;
+    els.pluginsHealthNote.className = "plugins-health-note" +
+      (health === "unreachable" ? " degraded" : "");
+  }
+
+  function renderPlugins(items) {
+    if (!els.pluginsList) return;
+    if (!items.length) {
+      els.pluginsList.innerHTML = '<div class="plugin-row plugin-empty">' + esc(t("sb.plugins.empty")) + '</div>';
+      return;
+    }
+    els.pluginsList.innerHTML = items.map(function (p) {
+      var statusTxt = p.enabled ? t("sb.plugins.enabled") : t("sb.plugins.disabled");
+      var created = p.created_at ? new Date(p.created_at * 1000).toLocaleString() : "";
+      var toggle = p.enabled
+        ? '<button class="btn secondary small" data-pact="disable" data-pid="' + esc(p.installation_id) + '">' + esc(t("sb.plugins.disable")) + '</button>'
+        : '<button class="btn secondary small" data-pact="enable" data-pid="' + esc(p.installation_id) + '">' + esc(t("sb.plugins.enable")) + '</button>';
+      return '<div class="plugin-row" data-pid="' + esc(p.installation_id) + '">' +
+        '<div class="plugin-main"><span class="plugin-name">' + esc(p.plugin_id || p.installation_id) + '</span>' +
+        '<span class="plugin-sub">' + esc(p.installation_id) + ' · v' + esc(p.version || "?") + ' · ' + statusTxt + '</span>' +
+        '<span class="plugin-created">' + esc(created) + '</span></div>' +
+        '<div class="plugin-actions">' + toggle +
+        '<button class="btn secondary small" data-pact="rotate" data-pid="' + esc(p.installation_id) + '">' + esc(t("sb.plugins.rotate")) + '</button>' +
+        '</div></div>';
+    }).join("");
+  }
+
+  function pluginAction(act, pid) {
+    if (act === "disable" || act === "enable") {
+      apiFetch("/api/admin/plugins/" + encodeURIComponent(pid) + "/" + act, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      }).then(function (r) { return r.json().then(function (b) { return { status: r.status, body: b }; }); })
+        .then(function (res) {
+          if (res.status !== 200) { toast(res.body.error || "操作失败", "error"); return; }
+          toast(act === "enable" ? t("sb.plugins.enable") : t("sb.plugins.disable"), "info");
+          loadPlugins();
+        });
+      return;
+    }
+    if (act === "rotate") {
+      if (!window.confirm(t("sb.plugins.rotate.confirm"))) return;
+      apiFetch("/api/admin/plugins/" + encodeURIComponent(pid) + "/rotate-secret", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      }).then(function (r) { return r.json().then(function (b) { return { status: r.status, body: b }; }); })
+        .then(function (res) {
+          if (res.status !== 200) { toast(res.body.error || "轮换失败", "error"); return; }
+          var secret = res.body.secret || "";
+          toast(t("sb.plugins.rotate.ok"), "info");
+          showRotatedSecret(res.body.installation_id || pid, secret);
+          loadPlugins();
+        });
+    }
+  }
+
+  function showRotatedSecret(pid, secret) {
+    // 在插件列表上方插入一次性新凭证展示（带复制按钮）。
+    if (!els.pluginsList) return;
+    var box = document.createElement("div");
+    box.className = "plugin-secret-once";
+    box.innerHTML = '<div class="plugin-secret-title">' + esc(t("sb.plugins.secret.show.once")) + '</div>' +
+      '<div class="plugin-secret-row"><code class="plugin-secret-val">' + esc(secret) + '</code>' +
+      '<button class="btn secondary small" data-copy="1">' + esc(t("sb.plugins.copy")) + '</button></div>' +
+      '<div class="plugin-secret-hint">' + esc(t("sb.plugins.secret.distribute")) + '</div>';
+    els.pluginsList.prepend(box);
+    box.querySelector("[data-copy]").addEventListener("click", function () {
+      copyText(secret);
+      toast(t("sb.plugins.copied"), "info");
+    });
+    // 每次重渲插件列表会清掉此一次性盒子（loadPlugins 后重拉），符合「仅展示一次」语义。
+  }
+
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(function () { /* ignore */ });
+    } else {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } catch (e) {}
+      document.body.removeChild(ta);
+    }
+  }
+
+  function initPluginsMgr() {
+    if (!els.pluginsMgrSection) return;
+    els.pluginsMgrToggle.addEventListener("click", function () {
+      var sec = els.pluginsMgrBody.closest(".section");
+      if (sec) sec.classList.toggle("collapsed");
+    });
+    els.pluginsList.addEventListener("click", function (e) {
+      var btn = e.target.closest("[data-pact]");
+      if (!btn) return;
+      pluginAction(btn.getAttribute("data-pact"), btn.getAttribute("data-pid"));
+    });
+  }
+
   // 缓存：全部切片、全部项目、全部分享
   var allSlides = [];      // [{name,width,height,mpp_x,...}]
   var allProjects = [];    // [{pid,name,note,slides,roi_count,...}]
@@ -316,6 +446,12 @@
     usersAddBtn: $("users-add-btn"),
     usersRegOpen: $("users-reg-open"),
     usersList: $("users-list"),
+    // 插件管理（owner；Stage 4-3）
+    pluginsMgrSection: $("plugins-mgr-section"),
+    pluginsMgrToggle: $("plugins-mgr-toggle"),
+    pluginsMgrBody: $("plugins-mgr-body"),
+    pluginsHealthNote: $("plugins-health-note"),
+    pluginsList: $("plugins-list"),
     // 切片选择器
     pickerMask: $("slide-picker-mask"),
     pickerTitleText: $("picker-title-text"),
@@ -3341,6 +3477,9 @@
 
     // 用户管理（owner）
     initUsersMgr();
+
+    // 插件管理（owner；Stage 4-3）
+    initPluginsMgr();
 
     // 切片选择器
     els.pickerClose.addEventListener("click", closeSlidePicker);

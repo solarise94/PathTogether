@@ -784,6 +784,39 @@ def api_auth_info():
     )
 
 
+@app.route("/healthz")
+def api_healthz():
+    """容器存活探针（Stage 4-3）。
+
+    返回后端信息 + sidecar 可达性。sidecar 不可达**不**导致本端点失败
+    （platform 角色无 sidecar 也健康）；"sidecar" 字段供监控区分降级状态。
+    sidecar 可达性探测 2s 超时（比代理端点更短，避免探针拖慢健康检查）。
+    """
+    sidecar_status = _sidecar_health_status()
+    return jsonify(
+        ok=True,
+        backend=getattr(share_store, "STORAGE_BACKEND", "json"),
+        sidecar=sidecar_status,
+    )
+
+
+def _sidecar_health_status(timeout=2.0):
+    """探测 sidecar /healthz，返回 "reachable" / "unreachable" / "unknown"。
+
+    reachable    sidecar /healthz 200。
+    unreachable  连接错误/超时/非 200。
+    unknown      AI_SIDECAR_URL 未配置（理论上不会发生，防御）。
+    """
+    url = AI_SIDECAR_URL.rstrip("/") + "/healthz"
+    try:
+        r = requests.get(url, timeout=timeout)
+    except (requests.ConnectionError, requests.Timeout):
+        return "unreachable"
+    if r.status_code == 200:
+        return "reachable"
+    return "unreachable"
+
+
 def _require_owner():
     """owner-only 守卫：当前 session 角色非 owner 返回 403 JSON。
 
@@ -2098,18 +2131,20 @@ def plugin_v1_auth_token():
 # --------------------------------------------------------------------------- #
 @app.route("/api/admin/plugins", methods=["GET"])
 def api_admin_plugins():
-    """列出插件安装（含健康状态占位）。仅 owner。
+    """列出插件安装（含 sidecar 健康探测）。仅 owner。
 
-    health 为占位 "unknown"：sidecar 健康检查（manifest service.health）是
-    Stage 4-1b/4-1c 的事，本节点只交付安装凭证生命周期。
+    health 为 sidecar /healthz 的可达性快照（reachable/unreachable）：
+    由 _sidecar_health_status 探测（2s 超时，同 /healthz）。若 sidecar 不可达
+    仍正常返回列表（平台独立可用，降级可观测）。
     """
     auth = _require_owner()
     if auth:
         return auth
+    sidecar_health = _sidecar_health_status()
     items = []
     for inst in share_store.list_plugin_installations():
         item = dict(inst)
-        item["health"] = "unknown"  # 占位：4-1b 接 sidecar healthz 后填
+        item["health"] = sidecar_health
         items.append(item)
     return jsonify(installations=items)
 

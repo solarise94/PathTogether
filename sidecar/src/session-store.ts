@@ -10,8 +10,9 @@
  *
  * Alignment / deviation notes reference ai_session.py by line.
  *
- * Directory layout (under `<sessionsDir>`, env SHARE_DATA_DIR/ai_sessions,
- * default ~/svs-viewer/share-data/ai_sessions):
+ * Directory layout (under `<sessionsDir>`, env AI_SESSIONS_DIR; 缺省回落到
+ * sidecar 自己的数据目录 ~/.svs-sidecar/sessions，**不再与平台 SHARE_DATA_DIR
+ * 混放**。同容器部署时 docker_entry.sh 显式 export AI_SESSIONS_DIR 覆盖此缺省):
  *   - <id>.json            session metadata (atomic tmp+rename, 0600)
  *   - <id>.events.jsonl    one event per line, append + fsync
  *   - index.json           {slide: {main, forks:{annotation_id: sid}, branches:{annotation_id: sid}}}
@@ -289,9 +290,19 @@ export class SessionConflict extends Error {
 
 const DEFAULT_EVENT_BUFFER = 200;
 
+/**
+ * Resolve the sessions directory (Stage 4-3 session DB separation).
+ *
+ * Priority:
+ *   1. `AI_SESSIONS_DIR` env — 显式指定（同容器部署由 docker_entry.sh export
+ *      /data/sidecar-sessions；独立容器形态也用它指向 sidecar 专属卷）。
+ *   2. 缺省：sidecar 自己的数据目录 `~/.svs-sidecar/sessions`（不再与平台
+ *      SHARE_DATA_DIR 混放；该目录天然 0700，由 ensureDir 确保）。
+ */
 function defaultSessionsDir(): string {
-	const base = process.env.SHARE_DATA_DIR || join(homedir(), "svs-viewer", "share-data");
-	return join(base, "ai_sessions");
+	const env = process.env.AI_SESSIONS_DIR;
+	if (env && env.trim()) return env.trim();
+	return join(homedir(), ".svs-sidecar", "sessions");
 }
 
 function sessionFile(sessionsDir: string, id: string): string {
@@ -319,7 +330,7 @@ function nowSec(): number {
 // --------------------------------------------------------------------------- //
 
 export interface SessionStoreOptions {
-	/** Override sessions directory (tests). Defaults to SHARE_DATA_DIR/ai_sessions. */
+	/** Override sessions directory (tests). Defaults to AI_SESSIONS_DIR, else ~/.svs-sidecar/sessions. */
 	sessionsDir?: string;
 	/** Rolling event window size (ai_session.py:44 event_buffer). */
 	eventBuffer?: number;

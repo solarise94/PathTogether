@@ -113,6 +113,8 @@
         if (S.activeAiSession && S.activeAiSession.kind === "main") S.activeAiSession.id = sid;
         HP.refreshAiSessionSwitcher(slideName, epoch);
       }
+      // Stage 4-3 降级：sidecar 不可达（Flask 503）→ 可恢复提示 + 30s 重试探测。
+      if (resp.status === 503) { handleAiUnavailable(slideName, epoch, runCtrl); return; }
       if (!resp.ok || !resp.body) { return HP.aiResponseError(resp).then(function (msg) { throw new Error(msg); }); }
       return HP.pumpAiSse(resp.body.getReader(), slideName, epoch, runCtrl);
     }).catch(function (e) {
@@ -191,6 +193,58 @@
     setAiRunningUi(false);
     S.aiAbortCtrl = null;
     S.aiStreamCtrl = null;
+  }
+
+  // ---------- AI 服务降级监测（Stage 4-3） ----------
+  // sidecar 不可达时 /api/ai/* 返回 503（Flask 代理 _sidecar_unavailable_response），
+  // 前端在此显示可恢复提示「AI 服务暂不可用，平台功能正常」，并每 30s 轮询一次
+  // /api/ai/config（平台可达性）与 /api/ai/run 触发点的 503 探测；恢复后横幅消失。
+  // 判定 503 的来源：统一走 _handleAiUnavailable(respStatus, slideName, epoch, runCtrl)。
+  var _degradeTimer = null;
+  var _degradeShown = false;
+
+  // 显示/隐藏降级横幅。
+  function setAiDegraded(show) {
+    if (S.els.aiDegradeBanner) {
+      S.els.aiDegradeBanner.style.display = show ? "block" : "none";
+      S.els.aiDegradeBanner.textContent = show ? t("ai.degraded") : "";
+    }
+    if (show !== _degradeShown) {
+      _degradeShown = show;
+      if (show) startAiDegradeProbe();
+    }
+  }
+
+  // 每 30s 探测一次平台 /healthz（Flask 自身端点，返回 {ok, backend, sidecar}）。
+  // sidecar==="reachable" 即在线 → 隐藏横幅并停止轮询。
+  function startAiDegradeProbe() {
+    if (_degradeTimer) return;
+    _degradeTimer = setInterval(function () {
+      if (!S.els.aiDegradeBanner) { stopAiDegradeProbe(); return; }
+      HP.api("/healthz").then(function (r) {
+        return r.json().then(function (body) {
+          if (r.ok && body && body.sidecar === "reachable") {
+            stopAiDegradeProbe();
+            setAiDegraded(false);
+          }
+          // 仍是 unreachable → 保持横幅，下轮再试。
+        });
+      }).catch(function () { /* 网络抖动：保持横幅，下轮再试 */ });
+    }, 30000);
+  }
+
+  function stopAiDegradeProbe() {
+    if (_degradeTimer) { clearInterval(_degradeTimer); _degradeTimer = null; }
+  }
+
+  // 统一 503 处理：进入降级态（显示横幅 + 启动 30s 重试探测），并结束本次 run。
+  function handleAiUnavailable(slideName, epoch, runCtrl) {
+    if (!HP.isCurrentAiSlide(slideName, epoch)) return;
+    if (S.aiAbortCtrl !== runCtrl) return;
+    setAiDegraded(true);
+    toast(t("ai.degraded"), "info");
+    appendStatusRow(S.els.aiTrace, "error", t("ai.degraded"));
+    HP.finishAiRun(runCtrl);
   }
 
   // 运行中/暂停/空闲的按钮组状态（branch 活跃时隐藏继续/新会话）
@@ -446,6 +500,7 @@
       aiSessionSelect: $("ai-session-select"),
       aiUsePlatform: $("ai-use-platform"), aiUsePlatformWrap: $("ai-use-platform-wrap"),
       aiTuneAdminNote: $("ai-tune-admin-note"),
+      aiDegradeBanner: $("ai-degrade-banner"),
     };
     S.mainAiCtx.container = S.els.aiTrace;
     var els = S.els;
@@ -485,6 +540,15 @@
 
     // 加载 AI 配置（渲染设置区/折叠区）
     HP.loadAiConfig();
+
+    // Stage 4-3 降级：启动时探测一次 sidecar 可达性（平台 /healthz 的 sidecar 字段）。
+    // 不可达 → 显示降级横幅并启动 30s 自动重试探测；恢复后横幅消失。
+    HP.api("/healthz").then(function (r) {
+      return r.json().then(function (body) {
+        if (r.ok && body && body.sidecar === "unreachable") setAiDegraded(true);
+        else setAiDegraded(false);
+      });
+    }).catch(function () { setAiDegraded(false); /* 平台自身不可达不误报降级 */ });
 
     // 获取当前身份 role（Stage 3a-2b）：owner 全配置；user 只读调优、可配自有凭据。
     // AUTH_ENABLED=False（内网）→ /api/auth/info 返回 role=null，按 owner 处理。
@@ -559,6 +623,8 @@
   HP.handleAiEventReset = handleAiEventReset;
   HP.setThinkingRow = setThinkingRow;
   HP.clearThinkingRow = clearThinkingRow;
+  HP.setAiDegraded = setAiDegraded;
+  HP.handleAiUnavailable = handleAiUnavailable;
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
   else init();

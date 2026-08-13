@@ -1,0 +1,21 @@
+{
+  "manifestSchemaVersion": "1.0.0",
+  "id": "sample-annotator",
+  "name": "Sample Annotator",
+  "pluginVersion": "0.1.0",
+  "pluginContractVersion": "1.0.0",
+  "bridgeProtocolVersion": "1.0.0",
+  "ui": {
+    "entry": "/plugins/sample-annotator/ui/index.html",
+    "slots": ["viewer.right-panel"]
+  },
+  "service": {
+    "baseUrl": "/",
+    "health": "/healthz"
+  },
+  "permissions": [
+    "slide:metadata:read",
+    "viewer:navigate",
+    "annotation:write"
+  ]
+}

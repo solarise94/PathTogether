@@ -399,8 +399,9 @@ def _require_auth():
     if session.get("auth_user"):
         return None
     path = request.path
-    # 放行登录页与静态资源（含 HistoPilot 插件前端 bundle，与 /static/ 同属非敏感前端资源）
-    if path == "/login" or path.startswith("/static/") or path.startswith("/plugins/histopilot/ui/"):
+    # 放行登录页与静态资源（含插件前端 bundle 与通用插件静态文件，与 /static/ 同属
+    # 非敏感前端资源；plugin_id/filename 路径穿越由 plugin_ui_asset 双重拒绝）
+    if path == "/login" or path.startswith("/static/") or path.startswith("/plugins/"):
         return None
     # /healthz 是健康检查端点（负载/监控探活），不携带敏感数据，必须免鉴权
     # （Stage 4-3 demo 实测被 302 到 /login，探活全挂）
@@ -697,8 +698,7 @@ def _slide_info_dict(name: str) -> dict:
 # --------------------------------------------------------------------------- #
 # HistoPilot 插件 UI（Stage 2：同源独立 bundle）
 # --------------------------------------------------------------------------- #
-# 插件前端资源目录（仅服务 .js/.css，路径穿越交给 send_from_directory 拒绝）。
-PLUGINS_UI_DIR = Path(__file__).resolve().parent / "plugins" / "histopilot" / "ui"
+# 插件前端资源（仅服务 .js/.css；目录定位见 _plugin_ui_dir，路径穿越双重拒绝）。
 _PLUGIN_UI_ALLOWED_EXT = {".js", ".css"}
 
 
@@ -711,26 +711,76 @@ def histopilot_ui_enabled():
     return os.environ.get("HISTOPILOT_UI_ENABLED", "1") != "0"
 
 
+# Sample Annotator 示例插件目录（Stage 5-2，plugins/sample-annotator/）。
+SAMPLE_PLUGIN_DIR = Path(__file__).resolve().parent / "plugins" / "sample-annotator"
+
+
+def sample_plugin_context():
+    """Sample Annotator 示例插件上下文（Stage 5-2，受 SAMPLE_PLUGIN_ENABLED 控制）。
+
+    默认关闭。仅当 env ``SAMPLE_PLUGIN_ENABLED`` 非 "0" **且** manifest.json 存在可
+    解析时返回 ``{"enabled": True, "permissions": [...]}``；否则返回
+    ``{"enabled": False, "permissions": []}``——manifest 缺失/损坏时视同关闭，index
+    模板不渲染插件脚本与权限表（渲染端把 sample_plugin_enabled 当 False 处理）。
+    """
+    enabled = os.environ.get("SAMPLE_PLUGIN_ENABLED", "0") != "0"
+    permissions = []
+    if enabled:
+        mf = SAMPLE_PLUGIN_DIR / "manifest.json"
+        try:
+            data = json.loads(mf.read_text(encoding="utf-8"))
+            permissions = data.get("permissions") or []
+        except (OSError, ValueError):
+            enabled = False  # manifest 缺失/损坏 → 视同关闭
+    return {"enabled": enabled, "permissions": permissions}
+
+
 # --------------------------------------------------------------------------- #
 # 路由
 # --------------------------------------------------------------------------- #
 @app.route("/")
 def index():
-    return render_template("index.html", histopilot_ui_enabled=histopilot_ui_enabled())
+    sample = sample_plugin_context()
+    return render_template(
+        "index.html",
+        histopilot_ui_enabled=histopilot_ui_enabled(),
+        sample_plugin_enabled=sample["enabled"],
+        sample_plugin_permissions=sample["permissions"],
+    )
 
 
-@app.route("/plugins/histopilot/ui/<path:filename>")
-def histopilot_ui_asset(filename):
-    """HistoPilot 插件 UI 静态资源（仅 .js/.css）。
+def _plugin_ui_dir(plugin_id):
+    """定位 plugins/ 直下子插件的 ui 目录（拒绝路径穿越）。
 
-    feature flag 关闭时 404；非允许扩展名 403；路径穿越由 send_from_directory 拒绝。
+    仅允许 ``plugins/<plugin_id>/ui`` 形态；plugin_id 含 "/"、反斜杠或 ".." 视为非法，
+    返回 None（调用方 404）。send_from_directory 再对 filename 做 safe_join 双重拦截。
     """
-    if not histopilot_ui_enabled():
+    if not plugin_id or "/" in plugin_id or "\\" in plugin_id or ".." in plugin_id:
+        return None
+    uidi = Path(__file__).resolve().parent / "plugins" / plugin_id / "ui"
+    return uidi if uidi.is_dir() else None
+
+
+@app.route("/plugins/<plugin_id>/ui/<path:filename>")
+def plugin_ui_asset(plugin_id, filename):
+    """通用插件 UI 静态资源路由（仅 .js/.css；Stage 5-2 由 histopilot 特例泛化）。
+
+    - histopilot：保留原 feature flag gating（HISTOPILOT_UI_ENABLED=0 → 404），
+      维持 Stage 2 行为与 test_stage2_ui 断言；
+    - 通用插件（sample-annotator 等）：目录存在即服务（静态文件始终可服务，仅
+      index.html 注入受 SAMPLE_PLUGIN_ENABLED flag 控制，见 sample_plugin_context）；
+    - 非允许扩展名 403；plugin_id / filename 路径穿越均被拒绝（_plugin_ui_dir +
+      send_from_directory safe_join）。
+    """
+    if plugin_id == "histopilot" and not histopilot_ui_enabled():
+        abort(404)
+    uidi = _plugin_ui_dir(plugin_id)
+    if uidi is None:
         abort(404)
     ext = os.path.splitext(filename)[1].lower()
     if ext not in _PLUGIN_UI_ALLOWED_EXT:
         abort(403)
-    return send_from_directory(str(PLUGINS_UI_DIR), filename)
+    return send_from_directory(str(uidi), filename)
 
 
 @app.route("/login", methods=["GET", "POST"])

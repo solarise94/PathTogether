@@ -3520,6 +3520,28 @@
   function registerHostBridgeHandlers() {
     var host = window.HostBridgeHost;
     if (!host) return;
+    // 通用插件权限门（Stage 5-2）：每个被 gate 的 host 方法入口先查
+    // env.pluginInstallationId 对应插件在 SVS_PLUGIN_PERMISSIONS 中声明的权限。
+    //   - 插件在表内且未声明所需权限 → throw {code:"permission_denied"}（host 回 ok:false）；
+    //   - 插件不在表内（如 histopilot 内置特权插件）→ 放行；
+    //   - method 未映射（PluginPermissions.METHOD_PERMISSIONS 无此项）→ 放行。
+    // 用法：gate(method, fn(payload, env))，把 fn 包成 fn(payload, env) → 先 gate 再执行业务。
+    function gate(method, fn) {
+      return function (payload, env) {
+        var pp = window.PluginPermissions;
+        var pluginId = env && env.pluginInstallationId;
+        if (pp && pp.checkPermission && pluginId) {
+          var declared = window.SVS_PLUGIN_PERMISSIONS
+            && window.SVS_PLUGIN_PERMISSIONS[pluginId];
+          // 表内才 gate：declared 为数组即插件已登记（histopilot 不在表内 → undefined → 放行）
+          if (Array.isArray(declared)) {
+            var denied = pp.checkPermission(declared, method);
+            if (denied) throw denied; // → host 回 ok:false, error={code:"permission_denied",...}
+          }
+        }
+        return fn(payload, env);
+      };
+    }
     // Plugin→Host request：握手期桥协议版本协商（Stage 5-1）。
     // 插件发 bridge.negotiate {protocolVersion} → host 调 BridgeVersion.negotiate；
     // 兼容返回 {ok:true,protocolVersion}，不兼容 throw error → host 回 ok:false 信封
@@ -3535,14 +3557,15 @@
       if (!res.ok) throw res.error; // → host 回 ok:false, error={code:"version_incompatible",...}
       return res; // {ok:true, protocolVersion}
     });
-    // Plugin→Host request
-    host.onRequest("slide.getCurrent", function () {
+    // Plugin→Host request（被 gate 的方法：slide.getCurrent / selection.getBbox /
+    // viewer.navigate / viewer.highlight / annotation.create / annotation.read）
+    host.onRequest("slide.getCurrent", gate("slide.getCurrent", function () {
       if (!state.slide) return null;
       return { name: state.slide.name, width: state.slide.width, height: state.slide.height,
                mppX: state.slide.mppX, mppY: state.slide.mppY };
-    });
-    host.onRequest("selection.getBbox", function () { return currentSelectionBbox(); });
-    host.onRequest("viewer.navigate", function (p) {
+    }));
+    host.onRequest("selection.getBbox", gate("selection.getBbox", function () { return currentSelectionBbox(); }));
+    host.onRequest("viewer.navigate", gate("viewer.navigate", function (p) {
       // AI goto/snapshot 跳转：level-0 bbox → viewport.fitBounds。
       // （文档 {x,y,level} 在本阶段以 level-0 bbox 表达，agent 全程在图像坐标系工作）
       try {
@@ -3552,13 +3575,25 @@
         }
       } catch (e) {}
       return { ok: true };
-    });
-    host.onRequest("viewer.highlight", function (p) {
+    }));
+    host.onRequest("viewer.highlight", gate("viewer.highlight", function (p) {
       // 插件叠加层：写入平台 aiOverlay 并重绘画布（替代插件直接写 aiOverlay/redrawAnnoCanvas）
       aiOverlay = Array.isArray(p && p.boxes) ? p.boxes : [];
       redrawAnnoCanvas();
       return { ok: true };
-    });
+    }));
+    // Stage 5-2：通用 SDK 插件经 bridge 创建测试标注。gate 后复用平台现有
+    // /api/annotation POST 路径（rect 类型，payload 带 slide/x/y/side_px/label=text），
+    // 成功后按现有模式刷新标注面板与索引并 return {ok:true,id}；失败 throw → host 回
+    // ok:false, error={code:"annotation_create_failed",...}。
+    host.onRequest("annotation.create", gate("annotation.create", function (p) {
+      return createPluginAnnotation(p);
+    }));
+    host.onRequest("annotation.read", gate("annotation.read", function () {
+      // 通用权限门演示方法（manifest 未声明 annotation:read 的插件会被稳定拒绝）。
+      // 非特权插件不被允许批量读标注；已授权路径走 REST /api/annotations。
+      throw { code: "permission_denied", message: "annotation.read 需经平台 REST 读取", retryable: false };
+    }));
     // Plugin→Host event
     host.onEvent("notification.show", function (p) {
       toast(p && p.msg, (p && p.type) || "info");
@@ -3571,6 +3606,45 @@
     host.onEvent("panel.stateChanged", function (p) {
       // 插件打开 AI 面板时关闭标注面板（保留原 openAiPanel/openAiPanel 的互斥语义）
       if (p && p.open && annoPanelOpen) closeAnnoPanel();
+    });
+  }
+
+  // 通用插件 annotation.create 的 host 端实现（Stage 5-2）。入参 p: {text, x, y, w, h}
+  // （level-0 坐标）；rect 类型 side_px 取 max(w,h)（正方形侧边长，同平台 saveAnnotation）。
+  // 复用 app.js 现有创建标注的 fetch 形态（见 saveAnnotation，POST /api/annotation，
+  // body 含 slide/type/label + 几何字段），成功触发 refreshCurrentAnnotations +
+  // loadAnnotationsIndex（与 saveAnnotation / 插件 annotation.changed 一致），
+  // 返回 {ok:true, id}。失败 throw {code:"annotation_create_failed", message}。
+  function createPluginAnnotation(p) {
+    if (!state.slide) throw { code: "annotation_create_failed", message: "当前无切片", retryable: false };
+    p = p || {};
+    var side = Math.round(Math.max(Number(p.w) || 0, Number(p.h) || 0));
+    if (!(side >= 1)) throw { code: "annotation_create_failed", message: "标注尺寸非法", retryable: false };
+    var body = {
+      slide: state.slide.name,
+      type: "rect",
+      label: String(p.text != null ? p.text : "插件标注"),
+      x: Math.round(Number(p.x) || 0),
+      y: Math.round(Number(p.y) || 0),
+      side_px: side,
+    };
+    return apiFetch("/api/annotation", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(function (r) {
+      if (!r.ok) {
+        return r.json().then(function (j) {
+          throw { code: "annotation_create_failed", message: (j && j.error) || "标注创建失败", retryable: false };
+        });
+      }
+      return r.json();
+    }).then(function (res) {
+      refreshCurrentAnnotations();
+      loadAnnotationsIndex().then(function () {
+        if (typeof renderProjects === "function") { renderProjects(allProjects); renderUnfiled(); }
+      }).catch(function () {});
+      return { ok: true, id: res && (res.id || res.index) };
     });
   }
 

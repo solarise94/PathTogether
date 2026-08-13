@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sample Annotator</title>
+  <!-- Sample Annotator 示例插件（Stage 5-2）：演示通用 PluginSDK + bridge 权限门。
+       独立可开（直开本页），也可由平台 iframe 挂载。仅依赖平台共享的
+       bridge-version.js 与通用 SDK bridge-client.js，完全不依赖 HistoPilot 源码。 -->
+  <style>
+    body { margin: 0; font-family: system-ui, -apple-system, "PingFang SC", sans-serif; background: #1e2430; color: #e6e9ef; }
+    #sa-panel { position: fixed; top: 16px; right: 16px; width: 300px; max-height: 80vh; overflow: auto;
+      background: #262e3d; border: 1px solid #3a465c; border-radius: 10px; padding: 14px; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+    #sa-panel h3 { margin: 0 0 10px; font-size: 15px; color: #7ab6ff; }
+    #sa-panel button { display: block; width: 100%; margin: 6px 0; padding: 8px 10px; font-size: 13px;
+      background: #33415e; color: #e6e9ef; border: 1px solid #46566f; border-radius: 6px; cursor: pointer; text-align: left; }
+    #sa-panel button:hover { background: #3d4e70; }
+    #sa-out { margin-top: 10px; padding: 8px; background: #1a202c; border: 1px solid #333c4d; border-radius: 6px;
+      font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 220px; overflow: auto; }
+    #sa-err { margin-top: 10px; padding: 8px; background: #4a2a2a; border: 1px solid #7a3a3a; border-radius: 6px;
+      font-size: 12px; color: #ffb3b3; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <div id="sa-panel">
+    <h3>Sample Annotator（示例插件）</h3>
+    <button id="sa-read" type="button">读取当前切片</button>
+    <button id="sa-navigate" type="button">导航到中心</button>
+    <button id="sa-create" type="button">创建测试标注</button>
+    <button id="sa-overreach" type="button">越权演示（annotation.read）</button>
+    <div id="sa-out">就绪…</div>
+    <div id="sa-err" style="display:none"></div>
+  </div>
+
+  <script src="/static/bridge-version.js"></script>
+  <script src="/plugins/sdk/bridge-client.js"></script>
+  <script src="/plugins/sample-annotator/ui/main.js"></script>
+</body>
+</html>

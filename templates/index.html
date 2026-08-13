@@ -421,6 +421,20 @@
   <script src="/plugins/histopilot/ui/sessions.js?v=20260814stage2"></script>
   <script src="/plugins/histopilot/ui/main.js?v=20260814stage2"></script>
   {% endif %}
+  {% if sample_plugin_enabled %}
+  <!-- Sample Annotator 示例插件（Stage 5-2）：通用 PluginSDK + bridge 权限门演示。
+       注入已启用插件的 manifest permissions 供 host 端权限门查表：
+       SVS_PLUGIN_PERMISSIONS = { pluginInstallationId: [permission,...] }。
+       histopilot 不在表内 = 内置特权插件全放行（host 端 gatePluginPermission 判定）。
+       共享前置脚本（bridge-version/host-bridge/plugin-permissions）幂等，与 histopilot
+       块可能重复加载（各模块自带防重复初始化守卫，不崩） -->
+  <script>window.SVS_PLUGIN_PERMISSIONS = {{ {"sample-annotator": sample_plugin_permissions} | tojson }};</script>
+  <script src="/static/bridge-version.js?v=20260814stage5"></script>
+  <script src="/static/plugin-permissions.js?v=20260814stage5"></script>
+  <script src="/static/host-bridge.js?v=20260814stage5"></script>
+  <script src="/plugins/sdk/bridge-client.js?v=20260814stage5"></script>
+  <script src="/plugins/sample-annotator/ui/main.js?v=20260814stage5"></script>
+  {% endif %}
   <script src="/static/app.js?v=20260814stage2"></script>
 </body>
 </html>

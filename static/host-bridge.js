@@ -25,9 +25,18 @@
   var pending = {}; // requestId -> {resolve, reject, timer}
   var reqHandlers = {}; // Plugin→Host request: method -> fn(payload)->result|promise
   var evtHandlers = {}; // Plugin→Host event: type -> fn(payload)
+  // 通用插件注册表：pluginInstallationId -> receive(env) 函数（Stage 5-2）。
+  // 通用 SDK 插件（PluginSDK）在 createPluginBridge 时 registerPlugin 注册；histopilot
+  // 不注册（默认回落 window.HistoPilot._onHostMessage，保持 Stage 2 行为不变）。
+  var pluginReceivers = {};
 
   function pluginReady() {
     return !!(window.HistoPilot && typeof window.HistoPilot._onHostMessage === "function");
+  }
+
+  // 注册某插件的接收函数，使 _post 能按 pluginInstallationId 路由回来。
+  function registerPlugin(pluginId, fn) {
+    if (pluginId && typeof fn === "function") pluginReceivers[pluginId] = fn;
   }
 
   // 运行时主版本兼容校验（强制同 major）。优先走共享模块，缺失时内联兜底。
@@ -37,10 +46,17 @@
     catch (e) { return false; }
   }
 
-  // 发送：把信封交给插件入口。同窗口阶段直接调用 HistoPilot._onHostMessage。
+  // 发送：把信封交给插件入口。同窗口阶段优先走注册表（通用插件按 pluginInstallationId
+  // 路由）；未注册时回落 window.HistoPilot._onHostMessage（histopilot 默认兼容）。
   function _post(env) {
-    if (pluginReady()) {
-      try { window.HistoPilot._onHostMessage(env); } catch (e) {}
+    var target = null;
+    if (env && env.pluginInstallationId && pluginReceivers[env.pluginInstallationId]) {
+      target = pluginReceivers[env.pluginInstallationId]; // 通用 SDK 插件
+    } else if (pluginReady()) {
+      target = window.HistoPilot._onHostMessage; // histopilot（不设注册表）回落
+    }
+    if (target) {
+      try { target(env); } catch (e) {}
     }
     // 插件未加载（HISTOPILOT_UI_ENABLED=0）：静默丢弃，平台人工读片不受影响
   }
@@ -70,17 +86,20 @@
     });
   }
 
-  // 处理插件发来的 request：跑注册的 handler，回 response（未知 method 回 unknown_method，不崩）
+  // 处理插件发来的 request：跑注册的 handler（fn(payload, env)，向后兼容单参 fn），
+  // 回 response（未知 method 回 unknown_method，不崩）。响应信封回显发起者的
+  // pluginInstallationId，使通用插件注册表能正确路由（histopilot 回落不受影响）。
   function _handlePluginRequest(env) {
     var fn = reqHandlers[env.method];
+    var replyTo = env.pluginInstallationId || PLUGIN_ID;
     Promise.resolve().then(function () {
       if (!fn) throw { code: "unknown_method", message: "host 未实现 " + env.method };
-      return fn(env.payload || {});
+      return fn(env.payload || {}, env);
     }).then(function (result) {
-      _post({ kind: "response", protocolVersion: PROTO, pluginInstallationId: PLUGIN_ID,
+      _post({ kind: "response", protocolVersion: PROTO, pluginInstallationId: replyTo,
               requestId: env.requestId, ok: true, result: result == null ? null : result });
     }, function (err) {
-      _post({ kind: "response", protocolVersion: PROTO, pluginInstallationId: PLUGIN_ID,
+      _post({ kind: "response", protocolVersion: PROTO, pluginInstallationId: replyTo,
               requestId: env.requestId, ok: false,
               error: (err && err.code) ? err : { code: "host_error", message: String((err && err.message) || err) } });
     });
@@ -97,7 +116,7 @@
     if (env.protocolVersion && !compat(env.protocolVersion)) {
       // 主版本不兼容：request 回错，event/response 忽略，不崩
       if (env.kind === "request") {
-        _post({ kind: "response", protocolVersion: PROTO, pluginInstallationId: PLUGIN_ID,
+        _post({ kind: "response", protocolVersion: PROTO, pluginInstallationId: env.pluginInstallationId || PLUGIN_ID,
                 requestId: env.requestId, ok: false, error: { code: "version_mismatch", message: "协议主版本不兼容" } });
       }
       return;
@@ -119,6 +138,7 @@
     _host: true,
     PROTO: PROTO,
     pluginReady: pluginReady,
+    registerPlugin: registerPlugin,
     request: request,
     emit: emit,
     onRequest: function (method, fn) { reqHandlers[method] = fn; },

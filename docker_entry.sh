@@ -4,8 +4,8 @@
 #
 # 进程拓扑：
 #   - sidecar（node /app/sidecar/dist/index.js）：仅监听 127.0.0.1:8055，
-#     通过 /internal/ai/* 回调 Flask（127.0.0.1:8000）读图/落标注/取变更。
-#   - gunicorn（app:app）：监听 0.0.0.0:8000，对外服务管理端，并把
+#     通过 /internal/ai/* 回调 Flask（127.0.0.1:$PORT，AI_FLASK_URL 推导）读图/落标注/取变更。
+#   - gunicorn（app:app）：监听 0.0.0.0:$PORT（默认 8000），对外服务管理端，并把
 #     /api/ai/* 代理到 sidecar。
 #
 # 启动顺序：先起 sidecar，轮询 /healthz 直到就绪（最多 30s），再起 gunicorn。
@@ -19,6 +19,10 @@ set -u
 
 SIDECAR_BIN="${SIDECAR_BIN:-/app/sidecar/dist/index.js}"
 SIDECAR_URL="${AI_SIDECAR_URL:-http://127.0.0.1:8055}"
+# sidecar 回调 Flask 的地址：显式 AI_FLASK_URL 优先，否则按 PORT 推导
+# （gunicorn 绑 0.0.0.0:$PORT，sidecar 走 loopback 回调同端口）。不写死 8000，
+# 否则 PORT≠8000 的部署（如 demo :18080）回调失败或串到同主机另一实例。
+export AI_FLASK_URL="${AI_FLASK_URL:-http://127.0.0.1:${PORT:-8000}}"
 # gunicorn 启动参数与原 CMD 一致（-w 2 --threads 8）。
 GUNICORN_WORKERS="${GUNICORN_WORKERS:-2}"
 GUNICORN_THREADS="${GUNICORN_THREADS:-8}"

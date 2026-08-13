@@ -67,13 +67,16 @@ RUN chmod +x docker_entry.sh
 COPY templates/ templates/
 COPY static/ static/
 
+# 注意：AI_FLASK_URL 不在这里固定——sidecar 回调 Flask 的端口必须跟随 PORT，
+# 由 docker_entry.sh 按 PORT 推导（AI_FLASK_URL 显式设置时优先）。在此写死
+# 127.0.0.1:8000 会导致 PORT≠8000 的部署回调到错误端口（甚至可能串到同主机
+# 另一个实例）。
 ENV PORT=8000 \
     SHARE_PORT=38000 \
     UPLOAD_DIR=/data/uploads \
     SHARE_DATA_DIR=/data/share \
     AI_SIDECAR_PORT=8055 \
     AI_SIDECAR_HOST=0.0.0.0 \
-    AI_FLASK_URL=http://127.0.0.1:8000 \
     AI_SIDECAR_URL=http://127.0.0.1:8055
 
 EXPOSE 8000

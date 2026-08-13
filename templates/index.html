@@ -62,8 +62,10 @@
       <!-- 标记：打开当前切片标注面板 -->
       <button id="anno-btn" class="tool-btn" data-i18n="tb.anno.open" disabled>标记</button>
 
-      <!-- AI 读片助手（仅管理员，打开后 enable） -->
+      <!-- AI 读片助手（仅管理员，打开后 enable）。HistoPilot 插件停用时整体不渲染 -->
+      {% if histopilot_ui_enabled %}
       <button id="ai-btn" class="tool-btn ai-btn" data-i18n-title="tb.ai.title" disabled title="AI 读片助手（管理员）"><span data-i18n="tb.ai">✨ AI</span></button>
+      {% endif %}
 
       <!-- 显示全部标记：移动端已并入标注面板头部；桌面端在此内联保留 -->
       <button id="anno-all-btn" class="tool-btn" data-i18n="tb.anno.show.all" disabled>显示全部标记</button>
@@ -92,7 +94,9 @@
       <!-- ⋯ 溢出（仅移动端显示）：装 AI 读片助手 + 缩放徽章，避免挤爆底栏 -->
       <button id="tbb-more-btn" class="icon-btn tbb-more-btn" aria-label="更多" data-i18n-title="tb.more">⋯</button>
       <div id="tbb-more" class="tbb-more" role="menu">
+        {% if histopilot_ui_enabled %}
         <button id="tbb-more-ai" class="tool-btn" data-i18n-title="tb.ai.title" data-i18n="tb.ai.more">✨ AI 读片</button>
+        {% endif %}
       </div>
     </div>
   </header>
@@ -233,7 +237,9 @@
         </div>
       </div>
 
-      <!-- AI 读片助手面板（管理员） -->
+      <!-- AI 读片助手面板（管理员）。HistoPilot 插件停用时整体不渲染：插件 bundle 缺失，
+           平台对 window.HistoPilot 静默降级，人工读片完全正常（Stage 2 验收项） -->
+      {% if histopilot_ui_enabled %}
       <div id="ai-panel" class="ai-panel" style="display:none;">
         <div class="ai-panel-header">
           <span id="ai-panel-title" data-i18n="ai.panel.title">✨ AI 读片助手</span>
@@ -345,6 +351,7 @@
           </div>
         </div>
       </div>
+      {% endif %}
     </main>
   </div>
 
@@ -354,6 +361,20 @@
   <!-- toast 容器 -->
   <div id="toast-container"></div>
 
-  <script src="/static/app.js?v=20260807i18n2"></script>
+  {% if histopilot_ui_enabled %}
+  <!-- HostBridge host 端（平台侧）。先于插件 bundle 加载，提供 window.HostBridgeHost -->
+  <script src="/static/host-bridge.js?v=20260814stage2"></script>
+  <!-- HistoPilot 插件 UI bundle（同源独立加载）。顺序敏感：bridge-client 建命名空间，
+       其余文件向 window.HistoPilot 挂载能力；main.js 为入口，最后加载。
+       加载早于 app.js，使平台 init 时 window.HistoPilot 已就绪 -->
+  <script src="/plugins/histopilot/ui/bridge-client.js?v=20260814stage2"></script>
+  <script src="/plugins/histopilot/ui/api.js?v=20260814stage2"></script>
+  <script src="/plugins/histopilot/ui/sse.js?v=20260814stage2"></script>
+  <script src="/plugins/histopilot/ui/renderer.js?v=20260814stage2"></script>
+  <script src="/plugins/histopilot/ui/config-panel.js?v=20260814stage2"></script>
+  <script src="/plugins/histopilot/ui/sessions.js?v=20260814stage2"></script>
+  <script src="/plugins/histopilot/ui/main.js?v=20260814stage2"></script>
+  {% endif %}
+  <script src="/static/app.js?v=20260814stage2"></script>
 </body>
 </html>

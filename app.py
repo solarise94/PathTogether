@@ -28,6 +28,7 @@ from flask import (
     render_template,
     request,
     send_file,
+    send_from_directory,
     session,
 )
 from werkzeug.utils import secure_filename
@@ -296,8 +297,8 @@ def _require_auth():
     if session.get("auth_user"):
         return None
     path = request.path
-    # 放行登录页与静态资源
-    if path == "/login" or path.startswith("/static/"):
+    # 放行登录页与静态资源（含 HistoPilot 插件前端 bundle，与 /static/ 同属非敏感前端资源）
+    if path == "/login" or path.startswith("/static/") or path.startswith("/plugins/histopilot/ui/"):
         return None
     # internal 回调端点由 _require_internal 单独鉴权（共享 token），不走管理员 session
     if path.startswith("/internal/"):
@@ -542,11 +543,42 @@ def _slide_info_dict(name: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# HistoPilot 插件 UI（Stage 2：同源独立 bundle）
+# --------------------------------------------------------------------------- #
+# 插件前端资源目录（仅服务 .js/.css，路径穿越交给 send_from_directory 拒绝）。
+PLUGINS_UI_DIR = Path(__file__).resolve().parent / "plugins" / "histopilot" / "ui"
+_PLUGIN_UI_ALLOWED_EXT = {".js", ".css"}
+
+
+def histopilot_ui_enabled():
+    """HistoPilot 插件 UI feature flag。默认开启；HISTOPILOT_UI_ENABLED=0 时关闭。
+
+    在请求时读取（非 import 时），便于测试与运行时切换。关闭时 index 模板不渲染
+    插件 <script> 与 ai-btn / 溢出项，平台前端对 window.HistoPilot 缺失静默降级。
+    """
+    return os.environ.get("HISTOPILOT_UI_ENABLED", "1") != "0"
+
+
+# --------------------------------------------------------------------------- #
 # 路由
 # --------------------------------------------------------------------------- #
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", histopilot_ui_enabled=histopilot_ui_enabled())
+
+
+@app.route("/plugins/histopilot/ui/<path:filename>")
+def histopilot_ui_asset(filename):
+    """HistoPilot 插件 UI 静态资源（仅 .js/.css）。
+
+    feature flag 关闭时 404；非允许扩展名 403；路径穿越由 send_from_directory 拒绝。
+    """
+    if not histopilot_ui_enabled():
+        abort(404)
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in _PLUGIN_UI_ALLOWED_EXT:
+        abort(403)
+    return send_from_directory(str(PLUGINS_UI_DIR), filename)
 
 
 @app.route("/login", methods=["GET", "POST"])

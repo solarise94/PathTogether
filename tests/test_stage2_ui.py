@@ -237,21 +237,37 @@ def test_containerfile_ships_plugin_bundle():
 
 
 def test_containerfile_ships_app_modules():
-    """app.py import 的仓库内模块必须全部进镜像（否则 gunicorn worker 起不来）。
+    """app.py/share_server.py 依赖的仓库内模块（传递闭包）必须全部进镜像。
 
-    Stage 3a-1 曾漏 COPY user_store.py → demo 重建后 ModuleNotFoundError。
-    静态扫描 app.py 顶层 import，凡 repo 根有同名 .py 且非 tests/ 的都必须出现
-    在 Containerfile 的 COPY 行里。
+    Stage 3a-1 曾漏 COPY user_store.py、3b-3 曾漏 COPY share_store_json.py（后者
+    被 share_store.py dispatcher import，app.py 顶层扫不到）→ demo 重建后 worker
+    ModuleNotFoundError。故从 app.py + share_server.py 出发做 BFS：凡 repo 根有
+    同名 .py 的模块（含函数内 import，抓全 ``import x`` / ``from x import`` 两种
+    形态，不限行首）都必须在 Containerfile 的 COPY 行里。
     """
     cf = (REPO_ROOT / "Containerfile").read_text(encoding="utf-8")
-    src = (REPO_ROOT / "app.py").read_text(encoding="utf-8")
-    mods = set(re.findall(r"^(?:import|from)\s+([a-zA-Z_][\w]*)", src, re.M))
-    missing = []
-    for m in sorted(mods):
-        if (REPO_ROOT / (m + ".py")).is_file() and m != "app":
-            if not re.search(r"^COPY .*\b{}\.py\b".format(re.escape(m)), cf, re.M):
-                missing.append(m)
-    assert not missing, "Containerfile 未 COPY 这些 app.py 依赖模块：%r" % missing
+    import_re = re.compile(r"(?:^|\s)(?:import|from)\s+([a-zA-Z_][\w]*)")
+
+    def local_imports(path):
+        out = set()
+        for m in import_re.findall(path.read_text(encoding="utf-8")):
+            if m != "app" and (REPO_ROOT / (m + ".py")).is_file():
+                out.add(m)
+        return out
+
+    seen, queue = set(), ["app", "share_server"]
+    while queue:
+        mod = queue.pop()
+        if mod in seen:
+            continue
+        seen.add(mod)
+        queue.extend(sorted(local_imports(REPO_ROOT / (mod + ".py")) - seen))
+
+    missing = [
+        m for m in sorted(seen - {"app"})
+        if not re.search(r"^COPY .*\b{}\.py\b".format(re.escape(m)), cf, re.M)
+    ]
+    assert not missing, "Containerfile 未 COPY 这些依赖模块（传递闭包）：%r" % missing
 
 
 def test_containerfile_ships_pg_layer():

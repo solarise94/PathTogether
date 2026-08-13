@@ -575,14 +575,16 @@ def _slide_info_dict(name: str) -> dict:
                 "error": str(e),
             }
         )
-        sm = share_store.get_slide_meta(safe)
+        sm = share_store.get_slide_meta_full(safe)
         base["alias"] = sm.get("alias", "")
         base["note"] = sm.get("note", "")
+        base["public"] = bool(sm.get("public"))
         return base
     base.update(meta)
-    sm = share_store.get_slide_meta(safe)
+    sm = share_store.get_slide_meta_full(safe)
     base["alias"] = sm.get("alias", "")
     base["note"] = sm.get("note", "")
+    base["public"] = bool(sm.get("public"))
     return base
 
 
@@ -700,6 +702,150 @@ def _require_owner():
     return jsonify(error="需要 owner 权限"), 403
 
 
+# =========================================================================== #
+# Stage 3a-2a：身份与资源级鉴权矩阵（docs §5.1.1）
+#
+# 关键不变量：AUTH_ENABLED=False（内网模式）或 session 无 role 时，current_identity
+# 返回 role=owner —— 此时所有 can_* 放行、所有过滤返回全量，**完全不影响现状**
+# （这是现有 88 个测试在 AUTH_ENABLED=False 下全绿的关键）。
+#
+# owner：一切。
+# user：上传/维护自己的图库；查看 = 自己的 + 公开 + 受邀（认领过 active share）；
+#       标注 = 自己的 + 协作切片；删除标注 = 仅本人创建；创建分享 = 仅自己的切片。
+# guest：不能上传/维护图库；标注按分享权限走 /s/* 流程（share_server）；不能创建分享。
+# =========================================================================== #
+def current_identity():
+    """返回 {"role","user_id"}。
+
+    session 无 role（AUTH_ENABLED=False 内网模式 / 未登录）→ role=owner 全开。
+    AUTH_ENABLED=True 时未登录请求已被 _require_auth 在 before_request 拦截为 401，
+    不会走到资源级判定；此处对无 role 的分支保守放行，避免误锁。
+    """
+    role = session.get("role")
+    if role is None:
+        role = user_store.ROLE_OWNER
+    return {"role": role, "user_id": session.get("user_id")}
+
+
+def _is_owner():
+    return current_identity()["role"] == user_store.ROLE_OWNER
+
+
+def _current_uid():
+    return current_identity()["user_id"]
+
+
+def _slide_owner(name):
+    """切片归属 owner_user_id（来自 slide_meta）；无记录返回 None。"""
+    meta = share_store.get_slide_meta_full(name)
+    return meta.get("owner_user_id") if meta else None
+
+
+def _slide_is_public(name):
+    meta = share_store.get_slide_meta_full(name)
+    return bool(meta.get("public")) if meta else False
+
+
+def _claimed_slides(uid):
+    """user 认领的 active share 中的切片名集合（协作切片）。"""
+    if not uid:
+        return set()
+    return share_store.claimed_active_slides_for_user(uid)
+
+
+def can_upload():
+    """owner/user 可上传；guest 不可。"""
+    return current_identity()["role"] in (user_store.ROLE_OWNER, user_store.ROLE_USER)
+
+
+def can_view_slide(name):
+    """owner 全量；user = 自己的 ∪ 公开 ∪ 认领的协作切片。"""
+    ident = current_identity()
+    if ident["role"] == user_store.ROLE_OWNER:
+        return True
+    uid = ident["user_id"]
+    if _slide_owner(name) == uid:
+        return True
+    if _slide_is_public(name):
+        return True
+    if name in _claimed_slides(uid):
+        return True
+    return False
+
+
+def can_delete_slide(name):
+    """owner 任意；user 仅自己的。"""
+    ident = current_identity()
+    if ident["role"] == user_store.ROLE_OWNER:
+        return True
+    return _slide_owner(name) == ident["user_id"]
+
+
+def can_annotate_slide(name):
+    """owner 全量；user = 自己的 ∪ 协作切片（不含纯公开只读）。"""
+    ident = current_identity()
+    if ident["role"] == user_store.ROLE_OWNER:
+        return True
+    uid = ident["user_id"]
+    if _slide_owner(name) == uid:
+        return True
+    if name in _claimed_slides(uid):
+        return True
+    return False
+
+
+def can_delete_annotation(roi):
+    """owner 任意；否则仅本人创建（roi.owner_user_id == 自己）。"""
+    ident = current_identity()
+    if ident["role"] == user_store.ROLE_OWNER:
+        return True
+    return roi.get("owner_user_id") == ident["user_id"]
+
+
+def can_manage_share(slides):
+    """创建分享：owner 任意；user 仅当全部切片归自己。"""
+    ident = current_identity()
+    if ident["role"] == user_store.ROLE_OWNER:
+        return True
+    uid = ident["user_id"]
+    return all(_slide_owner(s) == uid for s in slides)
+
+
+def _visible_slide_names():
+    """当前身份可见的切片文件名集合。owner=全量；user=可见集。"""
+    ident = current_identity()
+    all_names = {
+        child.name for child in UPLOAD_DIR.iterdir()
+        if child.is_file() and child.suffix.lower().lstrip(".") in SUPPORTED_EXTS
+    }
+    if ident["role"] == user_store.ROLE_OWNER:
+        return all_names
+    uid = ident["user_id"]
+    meta_all = share_store.get_all_slide_meta_full()
+    claimed = _claimed_slides(uid)
+    visible = set()
+    for name in all_names:
+        m = meta_all.get(name, {})
+        if m.get("owner_user_id") == uid or m.get("public") or name in claimed:
+            visible.add(name)
+    return visible
+
+
+def _can_access_project(pid):
+    """owner 任意；user 仅自己 owner_user_id 的项目（不存在视为无权）。"""
+    if _is_owner():
+        return True
+    proj = share_store.get_project(pid)
+    if proj is None:
+        return False
+    return proj.get("owner_user_id") == _current_uid()
+
+
+def _denied(msg="无权访问"):
+    """统一的资源级 403 响应（不区分 404/403 以免泄露存在性，简单优先）。"""
+    return jsonify(error=msg), 403
+
+
 # --------------------------------------------------------------------------- #
 # owner 用户管理（Stage 3a 身份基础；注册默认关闭，docs §19-12）
 # --------------------------------------------------------------------------- #
@@ -804,12 +950,15 @@ def api_admin_users_password(user_id):
 
 @app.route("/api/slides")
 def api_slides():
-    """列出所有切片的元数据。"""
+    """列出所有切片的元数据（owner 全量；user 仅可见集，docs §5.1.1）。"""
+    visible = _visible_slide_names()
     items = []
     for child in sorted(UPLOAD_DIR.iterdir()):
         if not child.is_file():
             continue
         if child.suffix.lower().lstrip(".") not in SUPPORTED_EXTS:
+            continue
+        if child.name not in visible:
             continue
         try:
             items.append(_slide_info_dict(child.name))
@@ -982,7 +1131,14 @@ def _extract_zip_to_upload(src_zip: Path):
 
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
-    """流式上传切片文件，或上传 zip 解压（用于 MRXS 等伴侣数据目录格式）。"""
+    """流式上传切片文件，或上传 zip 解压（用于 MRXS 等伴侣数据目录格式）。
+
+    Stage 3a-2a：owner/user 可上传（guest 在 AUTH 下无 session 已 401）；
+    上传成功后为每个切片建立归属（slide_meta.owner_user_id = 上传者）。
+    """
+    if not can_upload():
+        return jsonify(error="无上传权限"), 403
+    ident = current_identity()
     if "file" not in request.files:
         return jsonify(error="缺少 file 字段"), 400
 
@@ -1009,6 +1165,13 @@ def api_upload():
             msg, status = result
             return jsonify(error=msg), status
         main_name, extracted = result
+        # 建立归属（zip 内全部有效切片均为上传者所有）
+        for sname in extracted:
+            try:
+                share_store.set_slide_meta(sname, owner_user_id=ident["user_id"],
+                                           requester_role=ident["role"])
+            except PermissionError:
+                return jsonify(error="无上传权限"), 403
         return jsonify(name=main_name, extracted=extracted)
 
     if ext not in SUPPORTED_EXTS:
@@ -1037,6 +1200,12 @@ def api_upload():
         hint = "MRXS 需连同数据目录打包为 zip 上传" if safe.lower().endswith(".mrxs") else "无效的切片文件"
         return jsonify(error=hint), 400
 
+    # 建立归属（slide_meta.owner_user_id = 上传者；guest 已在 can_upload 拦截）
+    try:
+        share_store.set_slide_meta(safe, owner_user_id=ident["user_id"],
+                                   requester_role=ident["role"])
+    except PermissionError:
+        return jsonify(error="无上传权限"), 403
     return jsonify(name=safe)
 
 
@@ -1045,7 +1214,10 @@ def api_slide_delete(name):
     """关闭句柄并删除切片。
 
     .mrxs 切片带有同名伴侣数据目录（去扩展名后的目录），一并删除。
+    Stage 3a-2a：owner 任意；user 仅自己的切片。
     """
+    if not can_delete_slide(name):
+        return _denied()
     safe = _safe_name(name)
     _close_slide(safe)
     try:
@@ -1068,13 +1240,17 @@ def api_slide_delete(name):
 
 @app.route("/api/slide/<name>/info")
 def api_slide_info(name):
-    """单个切片元数据。"""
+    """单个切片元数据。Stage 3a-2a：can_view_slide，无权 403。"""
+    if not can_view_slide(name):
+        return _denied()
     return jsonify(_slide_info_dict(name))
 
 
 @app.route("/api/slide/<name>.dzi")
 def api_slide_dzi(name):
-    """手工生成 Deep Zoom XML。"""
+    """手工生成 Deep Zoom XML。Stage 3a-2a：can_view_slide，无权 403。"""
+    if not can_view_slide(name):
+        return _denied()
     safe = _safe_name(name)
     entry = _get_slide(safe)
     with slide_cache.borrow_pair(entry) as pair:
@@ -1098,7 +1274,12 @@ def api_slide_dzi(name):
 
 @app.route("/api/slide/<name>_files/<int:level>/<int:x>_<int:y>.jpeg")
 def api_slide_tile(name, level, x, y):
-    """返回 Deep Zoom 单张瓦片 JPEG（512×512、baseline、q82，带 LRU 缓存）。"""
+    """返回 Deep Zoom 单张瓦片 JPEG（512×512、baseline、q82，带 LRU 缓存）。
+
+    Stage 3a-2a：can_view_slide，无权 403。
+    """
+    if not can_view_slide(name):
+        return _denied()
     safe = _safe_name(name)
 
     key = (safe, level, x, y)
@@ -1133,7 +1314,9 @@ def api_slide_tile(name, level, x, y):
 
 @app.route("/api/slide/<name>/crop")
 def api_slide_crop(name):
-    """裁剪 level-0 原始像素区域的 PNG 图像并下载。"""
+    """裁剪 level-0 原始像素区域的 PNG 图像并下载。Stage 3a-2a：can_view_slide。"""
+    if not can_view_slide(name):
+        return _denied()
     safe = _safe_name(name)
     entry = _get_slide(safe)
 
@@ -1180,7 +1363,9 @@ def api_slide_crop(name):
 
 @app.route("/api/slide/<name>/thumbnail")
 def api_slide_thumbnail(name):
-    """返回缩略图 JPEG。"""
+    """返回缩略图 JPEG。Stage 3a-2a：can_view_slide，无权 403。"""
+    if not can_view_slide(name):
+        return _denied()
     safe = _safe_name(name)
     entry = _get_slide(safe)
     with slide_cache.borrow_pair(entry) as pair:
@@ -1765,7 +1950,10 @@ def api_slide_region(name):
          out_w,out_h 可选（默认保持宽高比、最长边 1568，上限各 4096）。
     返回 JSON：{image_base64, mime, width, height, src:{x,y,w,h}, magnification}。
     src 是 clamp 到边界后的实际区域。
+    Stage 3a-2a：can_view_slide，无权 403（不泄露存在性差异，统一 403）。
     """
+    if not can_view_slide(name):
+        return _denied()
     safe = _safe_name(name)
     entry = _get_slide(safe)
 
@@ -2599,7 +2787,12 @@ def _proxy_sse(path, body, method="POST"):
 # --------------------------------------------------------------------------- #
 @app.route("/api/share/create", methods=["POST"])
 def api_share_create():
-    """创建分享链接。JSON: {slides: [...], expires_hours: number}。"""
+    """创建分享链接。JSON: {slides: [...], expires_hours: number, permissions?}。
+
+    Stage 3a-2a：user 只能分享自己拥有的切片（can_manage_share，403 并说明）；
+    permissions 可选（view/annotate/download 子集，缺省 view+annotate 等价旧行为）。
+    """
+    ident = current_identity()
     body = request.get_json(silent=True) or {}
     slides = body.get("slides")
     expires_hours = body.get("expires_hours")
@@ -2629,6 +2822,10 @@ def api_share_create():
             return jsonify(error=f"切片不存在: {name}"), 400
         clean.append(safe)
 
+    # 权限矩阵：user 只能分享自己的切片
+    if not can_manage_share(clean):
+        return jsonify(error="只能分享自己拥有的切片"), 403
+
     # roi_sizes 可选：未传或 None 用默认；数组则逐元素校验（6/6.5/6.0/6.5）
     roi_sizes = body.get("roi_sizes")
     if roi_sizes is not None:
@@ -2640,9 +2837,21 @@ def api_share_create():
             if float(s) not in share_store.ALLOWED_ROI_SIZES:
                 return jsonify(error="roi_sizes 仅允许 6 或 6.5"), 400
 
+    # permissions 可选：view/annotate/download 子集
+    permissions = body.get("permissions")
+    if permissions is not None:
+        if not isinstance(permissions, list):
+            return jsonify(error="permissions 需为数组"), 400
+        for p in permissions:
+            if p not in (share_store.PERMISSION_VIEW, share_store.PERMISSION_ANNOTATE,
+                         share_store.PERMISSION_DOWNLOAD):
+                return jsonify(error="permissions 仅支持 view/annotate/download"), 400
+
     try:
-        share = share_store.create_share(clean, expires_hours, roi_sizes=roi_sizes)
-    except ValueError as e:
+        share = share_store.create_share(
+            clean, expires_hours, roi_sizes=roi_sizes, permissions=permissions,
+            creator_user_id=ident["user_id"], requester_role=ident["role"])
+    except (ValueError, PermissionError) as e:
         return jsonify(error=str(e)), 400
     url = SHARE_BASE_URL + "/s/" + share["token"]
     return jsonify(
@@ -2650,13 +2859,18 @@ def api_share_create():
         url=url,
         expires_at=share["expires_at"],
         roi_sizes=share.get("roi_sizes", list(share_store.DEFAULT_ROI_SIZES)),
+        permissions=share.get("permissions", list(share_store.DEFAULT_PERMISSIONS)),
     )
 
 
 @app.route("/api/share/list")
 def api_share_list():
-    """列出全部分享，附加 url 与 roi_count。"""
+    """列出分享（owner 全量；user 仅自己创建的），附加 url 与 roi_count。"""
+    ident = current_identity()
     shares = share_store.list_shares()
+    if ident["role"] != user_store.ROLE_OWNER:
+        uid = ident["user_id"]
+        shares = [s for s in shares if s.get("creator_user_id") == uid]
     roi_counts = share_store.roi_count_by_token()
     for sh in shares:
         sh["url"] = SHARE_BASE_URL + "/s/" + sh["token"]
@@ -2666,11 +2880,18 @@ def api_share_list():
 
 @app.route("/api/share/revoke", methods=["POST"])
 def api_share_revoke():
-    """撤销分享。JSON: {token}。"""
+    """撤销分享。JSON: {token}。owner 任意；user 仅自己创建的。"""
+    ident = current_identity()
     body = request.get_json(silent=True) or {}
     token = body.get("token")
     if not token:
         return jsonify(error="缺少 token"), 400
+    # user 只能撤销自己创建的分享：先查 list 找 creator
+    if ident["role"] != user_store.ROLE_OWNER:
+        mine = [s for s in share_store.list_shares()
+                if s.get("token") == token and s.get("creator_user_id") == ident["user_id"]]
+        if not mine:
+            return _denied("只能撤销自己创建的分享")
     ok = share_store.revoke_share(token)
     if not ok:
         return jsonify(error="分享不存在"), 404
@@ -2679,9 +2900,41 @@ def api_share_revoke():
 
 @app.route("/api/share/rois")
 def api_share_rois():
-    """列出全部 ROI（管理员查看）。"""
+    """列出 ROI（owner 全量；user 仅可见切片的标注）。"""
     rois = share_store.list_rois()
-    return jsonify(rois)
+    if _is_owner():
+        return jsonify(rois)
+    visible = _visible_slide_names()
+    return jsonify([r for r in rois if r.get("slide") in visible])
+
+
+@app.route("/api/share/<token>/claim", methods=["POST"])
+def api_share_claim(token):
+    """注册 user 认领分享链接（docs §5.4）。
+
+    认领后该 share 的 slides 进入该 user 的「可见切片集」。幂等：重复认领返回
+    已有 grant。share 无效/已撤销/已过期 → 404。仅登录 owner/user 可认领。
+    """
+    ident = current_identity()
+    if ident["role"] not in (user_store.ROLE_OWNER, user_store.ROLE_USER):
+        return jsonify(error="需要登录用户身份认领"), 403
+    share = share_store.get_share(token)
+    if share is None:
+        return jsonify(error="链接无效或已过期"), 404
+    body = request.get_json(silent=True) or {}
+    perms = body.get("permissions")
+    if perms is not None:
+        if not isinstance(perms, list):
+            return jsonify(error="permissions 需为数组"), 400
+        for p in perms:
+            if p not in (share_store.PERMISSION_VIEW, share_store.PERMISSION_ANNOTATE,
+                         share_store.PERMISSION_DOWNLOAD):
+                return jsonify(error="permissions 仅支持 view/annotate/download"), 400
+    try:
+        grant = share_store.claim_share(token, ident["user_id"], permissions=perms)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(grant)
 
 
 # --------------------------------------------------------------------------- #
@@ -2711,7 +2964,8 @@ def _validate_slide_names(names):
 
 @app.route("/api/project/create", methods=["POST"])
 def api_project_create():
-    """创建项目。JSON: {name, note?, slides?}。"""
+    """创建项目。JSON: {name, note?, slides?}。Stage 3a-2a：归属=创建者。"""
+    ident = current_identity()
     body = request.get_json(silent=True) or {}
     name = body.get("name", "")
     note = body.get("note", "")
@@ -2721,15 +2975,23 @@ def api_project_create():
     clean, err = _validate_slide_names(slides if isinstance(slides, list) else [])
     if err:
         return jsonify(error=err), 400
-    proj = share_store.create_project(name=name.strip(), note=note or "", slides=clean,
-                                      owner_user_id=session.get("user_id"))
+    try:
+        proj = share_store.create_project(
+            name=name.strip(), note=note or "", slides=clean,
+            owner_user_id=ident["user_id"], requester_role=ident["role"])
+    except PermissionError:
+        return jsonify(error="无权创建项目"), 403
     return jsonify(proj)
 
 
 @app.route("/api/projects")
 def api_projects():
-    """列出全部项目，附加 roi_count（项目内切片的标注总数）。"""
+    """列出项目（owner 全量；user 仅自己 owner_user_id 的），附加 roi_count。"""
+    ident = current_identity()
     projects = share_store.list_projects()
+    if ident["role"] != user_store.ROLE_OWNER:
+        uid = ident["user_id"]
+        projects = [p for p in projects if p.get("owner_user_id") == uid]
     # 一次性取 annotations_by_slide，按项目 slides 汇总
     by_slide = share_store.annotations_by_slide()
 
@@ -2750,7 +3012,9 @@ def api_projects():
 
 @app.route("/api/project/<pid>")
 def api_project_detail(pid):
-    """单个项目详情，含每张切片的标注摘要。"""
+    """单个项目详情，含每张切片的标注摘要。Stage 3a-2a：owner 任意；user 仅自己。"""
+    if not _can_access_project(pid):
+        return _denied()
     proj = share_store.get_project(pid)
     if proj is None:
         return jsonify(error="项目不存在"), 404
@@ -2765,7 +3029,9 @@ def api_project_detail(pid):
 
 @app.route("/api/project/<pid>", methods=["PATCH"])
 def api_project_update(pid):
-    """更新项目字段。JSON: {name?, note?, slides?}。"""
+    """更新项目字段。JSON: {name?, note?, slides?}。Stage 3a-2a：owner 任意；user 仅自己。"""
+    if not _can_access_project(pid):
+        return _denied()
     body = request.get_json(silent=True) or {}
     slides = body.get("slides")
     if slides is not None:
@@ -2786,7 +3052,9 @@ def api_project_update(pid):
 
 @app.route("/api/project/<pid>/slides", methods=["POST"])
 def api_project_add_slides(pid):
-    """向项目追加切片。JSON: {slides: [...]}。"""
+    """向项目追加切片。JSON: {slides: [...]}。Stage 3a-2a：owner 任意；user 仅自己。"""
+    if not _can_access_project(pid):
+        return _denied()
     body = request.get_json(silent=True) or {}
     slides = body.get("slides")
     clean, err = _validate_slide_names(slides)
@@ -2800,7 +3068,9 @@ def api_project_add_slides(pid):
 
 @app.route("/api/project/<pid>/slide/<name>", methods=["DELETE"])
 def api_project_remove_slide(pid, name):
-    """从项目移除某切片（仅解除归属，不删文件）。"""
+    """从项目移除某切片（仅解除归属，不删文件）。Stage 3a-2a：owner 任意；user 仅自己。"""
+    if not _can_access_project(pid):
+        return _denied()
     safe = _sanitize_name(name)
     if not safe or safe != name:
         return jsonify(error="非法文件名"), 400
@@ -2812,7 +3082,9 @@ def api_project_remove_slide(pid, name):
 
 @app.route("/api/project/<pid>", methods=["DELETE"])
 def api_project_delete(pid):
-    """删除项目（不删切片文件）。"""
+    """删除项目（不删切片文件）。Stage 3a-2a：owner 任意；user 仅自己。"""
+    if not _can_access_project(pid):
+        return _denied()
     ok = share_store.delete_project(pid)
     if not ok:
         return jsonify(error="项目不存在"), 404
@@ -2828,6 +3100,7 @@ def api_annotations():
       - project=<pid>：只返回该项目内切片的标注
     同时传 slide 与 project 时，slide 优先（且需属于项目）。
     items 已含 type 与全部几何字段（经 store 自动带）。
+    Stage 3a-2a：owner 全量；user 仅可见切片的标注，越权 403。
     """
     slide = request.args.get("slide")
     project = request.args.get("project")
@@ -2836,15 +3109,24 @@ def api_annotations():
         safe = _sanitize_name(slide)
         if not safe or safe != slide:
             return jsonify(error="非法文件名"), 400
+        if not can_view_slide(safe):
+            return _denied()
         by_slide = share_store.annotations_by_slide()
         return jsonify({"slide": safe, "annotations": by_slide.get(safe, [])})
 
     if project:
+        if not _can_access_project(project):
+            return _denied()
         by_slide = share_store.annotations_by_project(project)
         return jsonify({"project": project, "by_slide": by_slide})
 
-    # 默认返回全部
-    return jsonify({"by_slide": share_store.annotations_by_slide()})
+    # 默认返回全部（user 按可见切片过滤）
+    by_slide = share_store.annotations_by_slide()
+    if _is_owner():
+        return jsonify({"by_slide": by_slide})
+    visible = _visible_slide_names()
+    filtered = {s: v for s, v in by_slide.items() if s in visible}
+    return jsonify({"by_slide": filtered})
 
 
 # --------------------------------------------------------------------------- #
@@ -2852,21 +3134,39 @@ def api_annotations():
 # --------------------------------------------------------------------------- #
 @app.route("/api/slide/<name>/meta", methods=["POST"])
 def api_slide_meta(name):
-    """设置切片的别名/备注。JSON: {alias?, note?}（None 不改，空串清除）。
+    """设置切片的别名/备注/公开档。JSON: {alias?, note?, public?}（None 不改，空串清除）。
 
     name 需为已存在的切片文件。
+    Stage 3a-2a（docs §5.1.1）：
+      - public 仅 owner 可设置（user 尝试 403）；
+      - user 可改自己切片的 alias/note（不变），改他人切片 403。
     """
+    ident = current_identity()
     safe = _safe_name(name)
     body = request.get_json(silent=True) or {}
     alias = body.get("alias", None)
     note = body.get("note", None)
+    public = body.get("public", None)
     # alias/note 仅接受字符串或 None
     if alias is not None and not isinstance(alias, str):
         return jsonify(error="alias 需为字符串"), 400
     if note is not None and not isinstance(note, str):
         return jsonify(error="note 需为字符串"), 400
-    meta = share_store.set_slide_meta(safe, alias=alias, note=note,
-                                      owner_user_id=session.get("user_id"))
+    if public is not None and not isinstance(public, bool):
+        return jsonify(error="public 需为布尔值"), 400
+    # public 仅 owner 可改
+    if public is not None and ident["role"] != user_store.ROLE_OWNER:
+        return jsonify(error="仅 owner 可设置公开状态"), 403
+    # user 只能编辑自己切片的 alias/note
+    if ident["role"] != user_store.ROLE_OWNER:
+        if _slide_owner(safe) != ident["user_id"]:
+            return jsonify(error="只能编辑自己切片的元数据"), 403
+    try:
+        meta = share_store.set_slide_meta(safe, alias=alias, note=note, public=public,
+                                          owner_user_id=ident["user_id"],
+                                          requester_role=ident["role"])
+    except PermissionError:
+        return jsonify(error="无权修改元数据"), 403
     return jsonify(ok=True, meta=meta)
 
 
@@ -2880,7 +3180,9 @@ def api_annotation_add():
     token 固定为 "admin"，label 默认 "管理员"。slide 必须存在。
     几何字段随 type 不同：rect(x,y,side_px,size_mm) / arrow(x1,y1,x2,y2) /
     freehand(points)。shared 可选（默认 false），透传给 store 记录公开状态。
+    Stage 3a-2a：can_annotate_slide（owner 全量；user 自己的 + 协作切片），无权 403。
     """
+    ident = current_identity()
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
     if not isinstance(slide, str) or not slide:
@@ -2890,6 +3192,9 @@ def api_annotation_add():
         return jsonify(error="非法文件名"), 400
     if not (UPLOAD_DIR / safe).is_file():
         return jsonify(error="切片不存在"), 404
+    # 资源级鉴权：能否在该切片落标
+    if not can_annotate_slide(safe):
+        return _denied()
 
     typ = body.get("type", "rect")
     if typ not in share_store.ROI_TYPES:
@@ -2913,17 +3218,38 @@ def api_annotation_add():
     try:
         roi = share_store.add_roi(
             share_store.ADMIN_TOKEN, safe, label, type=typ, shared=shared, note=note,
-            owner_user_id=session.get("user_id"), **geom
+            owner_user_id=ident["user_id"], requester_role=ident["role"], **geom
         )
-    except ValueError as e:
+    except (ValueError, PermissionError) as e:
         return jsonify(error=str(e)), 400
     return jsonify(ok=True, index=roi["index"], shared=roi.get("shared", shared))
 
 
+def _check_annotation_owner(token, index):
+    """资源级鉴权（docs §5.1.1）：owner 任意；否则仅本人创建的标注可改/删。
+
+    无权返回 (resp, None)（resp 为 403 JSON）；有权返回 (None, roi_or_None)。
+    roi 为 None 表示标注不存在（owner 放行后续 store 调用自行 404）。
+    """
+    if _is_owner():
+        return None, None
+    roi = share_store.get_roi(token, index)
+    if roi is None or roi.get("owner_user_id") != _current_uid():
+        return _denied("只能修改自己创建的标注"), None
+    return None, roi
+
+
 @app.route("/api/annotation/admin/<int:index>", methods=["DELETE"])
 def api_annotation_delete_admin(index):
-    """管理员删除自己的标注（token="admin" 下第 index 条）。"""
-    ok = share_store.delete_roi(share_store.ADMIN_TOKEN, index)
+    """管理员删除自己的标注（token="admin" 下第 index 条）。
+
+    Stage 3a-2a：owner 任意；否则仅本人创建（owner_user_id 判定）。
+    """
+    denied, _roi = _check_annotation_owner(share_store.ADMIN_TOKEN, index)
+    if denied:
+        return denied
+    # delete_roi 返回 (bool, annotation_id|None)；直接当 bool 用会让 404 分支永不触发
+    ok, _aid = share_store.delete_roi(share_store.ADMIN_TOKEN, index)
     if not ok:
         return jsonify(error="标注不存在"), 404
     return jsonify(ok=True)
@@ -2931,10 +3257,17 @@ def api_annotation_delete_admin(index):
 
 @app.route("/api/annotation/<token>/<int:index>", methods=["DELETE"])
 def api_annotation_delete(token, index):
-    """管理员删除任意 token 的标注。token 仅允许非空字符串。"""
+    """管理员删除任意 token 的标注。token 仅允许非空字符串。
+
+    Stage 3a-2a：owner 任意；否则仅本人创建（owner_user_id 判定）。
+    """
     if not isinstance(token, str) or not token:
         return jsonify(error="缺少 token"), 400
-    ok = share_store.delete_roi(token, index)
+    denied, _roi = _check_annotation_owner(token, index)
+    if denied:
+        return denied
+    # delete_roi 返回 (bool, annotation_id|None)，需解包
+    ok, _aid = share_store.delete_roi(token, index)
     if not ok:
         return jsonify(error="标注不存在"), 404
     return jsonify(ok=True)
@@ -2951,9 +3284,13 @@ def api_annotation_set_shared(token, index):
     两者可同时传（shared 与 geom/note 独立处理）。
     token/index 无效（shared 或 update 侧）返回 404；
     成功返回 {"ok": true, "shared": <更新后值>, "note": <更新后值>}。
+    Stage 3a-2a：owner 任意；否则仅本人创建（owner_user_id 判定），无权 403。
     """
     if not isinstance(token, str) or not token:
         return jsonify(error="缺少 token"), 400
+    denied, _roi = _check_annotation_owner(token, index)
+    if denied:
+        return denied
     body = request.get_json(silent=True) or {}
 
     shared_after = None

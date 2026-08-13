@@ -262,6 +262,17 @@ def _require_slide(share, name):
     return safe
 
 
+def _share_has_annotate(share):
+    """判断分享是否含 annotate 权限（docs §5.4 权限三档）。
+
+    旧分享无 permissions 字段 → 默认 view+annotate（严格等价旧行为）。
+    """
+    perms = share.get("permissions")
+    if not isinstance(perms, list) or not perms:
+        return True  # 旧链接默认可标注
+    return share_store.PERMISSION_ANNOTATE in perms
+
+
 # --------------------------------------------------------------------------- #
 # 路由
 # --------------------------------------------------------------------------- #
@@ -467,6 +478,10 @@ def share_slide_thumbnail(token, name):
 @app.route("/s/<token>/api/roi", methods=["POST"])
 def share_roi_add(token):
     share = _require_share(token)
+    # 权限三档（docs §5.4）：无 annotate 权限的 token 写标注 403。
+    # 旧链接无 permissions 字段 → 默认含 annotate（_share_has_annotate 兼容）。
+    if not _share_has_annotate(share):
+        return jsonify(error="该链接不允许标注"), 403
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
     label = body.get("label")
@@ -526,8 +541,11 @@ def share_roi_update(token, index):
     （无 visitor）按链接级共享允许编辑。越权返回 403。
     调 update_roi；update 返回 False 时 404；成功返回更新后的 roi dict（含 index）。
     编辑允许自由调大小，不做 6/6.5mm 限制。
+    权限三档（docs §5.4）：无 annotate 权限的 token 写标注 403（旧链接默认含 annotate）。
     """
-    _require_share(token)
+    share = _require_share(token)
+    if not _share_has_annotate(share):
+        return jsonify(error="该链接不允许标注"), 403
     body = request.get_json(silent=True) or {}
     geom = body.get("geom")
     note = body.get("note")
@@ -597,8 +615,11 @@ def share_roi_delete(token, index):
 
     设备归属校验：只有创建该标注的访客可删除（_roi_owned_by）；旧数据
     （无 visitor）按链接级共享允许删除。越权返回 403。
+    权限三档（docs §5.4）：无 annotate 权限的 token 写标注 403（旧链接默认含 annotate）。
     """
-    _require_share(token)
+    share = _require_share(token)
+    if not _share_has_annotate(share):
+        return jsonify(error="该链接不允许标注"), 403
     r = share_store.get_roi(token, index)
     if r is None:
         return jsonify(error="选区不存在"), 404

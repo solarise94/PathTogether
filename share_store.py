@@ -26,12 +26,14 @@ SHARE_DATA_DIR.mkdir(parents=True, exist_ok=True)
 SHARE_FILE = SHARE_DATA_DIR / "shares.json"
 
 # 空结构骨架（change_seq_by_slide 为切片级全局单调变更序号计数器，见 docs 4.2）
+# grants：Stage 3a-2a 认领关系（user 认领分享链接 → 可见受邀切片），见 docs §5.4。
 _EMPTY = {
     "shares": {},
     "rois": [],
     "projects": {},
     "slide_meta": {},
     "change_seq_by_slide": {},
+    "grants": [],
 }
 
 # 支持的标注类型
@@ -44,6 +46,62 @@ DEFAULT_ROI_SIZES = [6.0, 6.5]
 
 # 管理员标注使用的固定 token
 ADMIN_TOKEN = "admin"
+
+# --------------------------------------------------------------------------- #
+# Stage 3a-2a：分享权限档位与认领（docs §5.4）
+#
+# 分享权限三档：view / annotate / download。旧分享无 permissions 字段时一律视为
+# ["view","annotate"]（严格等价旧行为：分享页本来就能看能标，不能下载切片文件）。
+# download 控制未来文件下载端点；本节点只落地字段 + 在标注写入端点判定 annotate。
+# --------------------------------------------------------------------------- #
+PERMISSION_VIEW = "view"
+PERMISSION_ANNOTATE = "annotate"
+PERMISSION_DOWNLOAD = "download"
+_PERMISSION_ALL = (PERMISSION_VIEW, PERMISSION_ANNOTATE, PERMISSION_DOWNLOAD)
+# 旧分享 / 未指定时的默认权限（等价拆分前的"能看就能标"）
+DEFAULT_PERMISSIONS = [PERMISSION_VIEW, PERMISSION_ANNOTATE]
+
+
+def _normalize_permissions(perms):
+    """归一化分享权限档位：返回去重保序的合法子集 list。
+
+    None 或空 → DEFAULT_PERMISSIONS（["view","annotate"]，等价旧行为）。
+    非数组 / 含非法值抛 ValueError。
+    """
+    if perms is None:
+        return list(DEFAULT_PERMISSIONS)
+    if not isinstance(perms, list):
+        raise ValueError("permissions 需为数组")
+    if not perms:
+        return list(DEFAULT_PERMISSIONS)
+    out = []
+    for p in perms:
+        if p not in _PERMISSION_ALL:
+            raise ValueError("permissions 仅支持 view/annotate/download")
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def _share_permissions(share):
+    """从 share dict 读取归一化权限；旧分享无该字段时返回默认 view+annotate。"""
+    perms = share.get("permissions") if isinstance(share, dict) else None
+    if not isinstance(perms, list) or not perms:
+        return list(DEFAULT_PERMISSIONS)
+    # 兜底过滤脏数据（未知值剔除后为空则回默认）
+    clean = [p for p in perms if p in _PERMISSION_ALL]
+    return clean if clean else list(DEFAULT_PERMISSIONS)
+
+
+def _reject_guest_write(requester_role):
+    """仓储边界（docs §5.1.1）：显式传 guest 角色时拒绝图库写操作。
+
+    requester_role 默认 None = 内部调用（如 share_server 的 /s/* 标注流程、
+    internal AI 回调）不限制；显式传 "guest"（== user_store.ROLE_GUEST）时 raise
+    PermissionError。app.py 调用处传入当前 role，作为应用层之外的 defense-in-depth。
+    """
+    if requester_role == "guest":
+        raise PermissionError("guest 无权进行图库写操作")
 
 # 数据归属（Stage 3a 身份基础）：懒迁移用「首个 owner 的 user_id」。
 # 由 app.py 在启动（owner 引导）后调用 set_owner_user_id() 注入；share_server.py
@@ -174,6 +232,8 @@ def _load_locked(f):
         data.setdefault("slide_meta", {})
         # 向后兼容：旧文件无 change_seq_by_slide 时补 {}
         data.setdefault("change_seq_by_slide", {})
+        # 向后兼容：旧文件无 grants 时补 []（Stage 3a-2a 认领关系）
+        data.setdefault("grants", [])
         if not isinstance(data["shares"], dict):
             data["shares"] = {}
         if not isinstance(data["rois"], list):
@@ -184,6 +244,8 @@ def _load_locked(f):
             data["slide_meta"] = {}
         if not isinstance(data["change_seq_by_slide"], dict):
             data["change_seq_by_slide"] = {}
+        if not isinstance(data["grants"], list):
+            data["grants"] = []
         # 存量 ROI 一次性迁移（补 annotation_id/change_seq/revision/source/deleted）
         # 迁移若改动数据，缓存给 _with_lock 用于补落盘
         changed = _ensure_roi_identity(data)
@@ -208,7 +270,7 @@ def _load_locked(f):
 def _copy_empty():
     """返回一个新的空结构（避免共享引用）。"""
     return {"shares": {}, "rois": [], "projects": {}, "slide_meta": {},
-            "change_seq_by_slide": {}}
+            "change_seq_by_slide": {}, "grants": []}
 
 
 # --------------------------------------------------------------------------- #
@@ -358,13 +420,20 @@ def _with_lock(mode, fn):
 # --------------------------------------------------------------------------- #
 # 公共 API
 # --------------------------------------------------------------------------- #
-def create_share(slides, expires_hours, roi_sizes=None):
+def create_share(slides, expires_hours, roi_sizes=None, permissions=None,
+                 creator_user_id=None, requester_role=None):
     """创建分享：生成 token、写入并返回 share dict（含 token 与 roi_sizes）。
 
     roi_sizes：矩形标记可选尺寸子集（元素 6/6.5），None 时默认两者皆可。
     非法（非数组、含越界值、空）抛 ValueError。
+    permissions：权限档位子集（view/annotate/download），None 时默认 view+annotate
+    （等价旧行为）。creator_user_id：创建者归属（Stage 3a-2a 分享列表按此过滤）。
+    requester_role：显式传 "guest" 时拒绝（仓储边界 defense-in-depth）。
     """
+    _reject_guest_write(requester_role)
     roi_sizes_norm = _normalize_roi_sizes(roi_sizes)
+    perms = _normalize_permissions(permissions)
+    creator = creator_user_id or None
     token = secrets.token_urlsafe(18)
     now = time.time()
     expires_at = now + float(expires_hours) * 3600.0
@@ -375,6 +444,8 @@ def create_share(slides, expires_hours, roi_sizes=None):
         "revoked": False,
         "token": token,
         "roi_sizes": list(roi_sizes_norm),
+        "permissions": list(perms),
+        "creator_user_id": creator,
     }
 
     def _do(f):
@@ -385,6 +456,8 @@ def create_share(slides, expires_hours, roi_sizes=None):
             "expires_at": expires_at,
             "revoked": False,
             "roi_sizes": list(roi_sizes_norm),
+            "permissions": list(perms),
+            "creator_user_id": creator,
         }
         _save_locked(f, data)
         return share
@@ -417,6 +490,7 @@ def get_share(token):
         out = dict(share)
         out["token"] = token
         out["roi_sizes"] = _share_roi_sizes(share)
+        out["permissions"] = _share_permissions(share)
         return out
 
     return _with_lock("r+", _do)
@@ -441,6 +515,7 @@ def list_shares():
             out["token"] = tok
             out["status"] = _status_of(sh)
             out["roi_sizes"] = _share_roi_sizes(sh)
+            out["permissions"] = _share_permissions(sh)
             items.append(out)
         items.sort(key=lambda x: x.get("created_at", 0), reverse=True)
         return items
@@ -458,6 +533,117 @@ def revoke_share(token):
         share["revoked"] = True
         _save_locked(f, data)
         return True
+
+    return _with_lock("r+", _do)
+
+
+# --------------------------------------------------------------------------- #
+# 认领（grants）—— Stage 3a-2a 协作授权（docs §5.4）
+#
+# 注册 user 认领一个分享链接后，该 share 的 slides 进入其「可见切片集」
+# （{owner_user_id==自己} ∪ {public} ∪ {认领的 active share 的 slides}）。
+# grant 记录 {grant_id, user_id, share_token, permissions, claimed_at, revoked_at}。
+# share 被撤销/过期后 grant 自动失效（判定时检查 share active，见
+# claimed_active_slides_for_user）。
+# --------------------------------------------------------------------------- #
+def _grant_out(g):
+    """导出 grant 副本（确保字段齐全）。"""
+    out = dict(g)
+    out.setdefault("permissions", list(DEFAULT_PERMISSIONS))
+    out.setdefault("revoked_at", None)
+    return out
+
+
+def claim_share(token, user_id, permissions=None):
+    """user 认领分享链接（幂等）。
+
+    重复认领（同 token + 同 user，且未 revoke）返回已有 grant，不新建。
+    permissions 归一化（None → 默认 view+annotate）。
+    返回 grant dict。不校验 share 是否 active —— 由调用方（app.py）先用 get_share
+    判定；本函数只负责记录认领关系。
+    """
+    if not isinstance(token, str) or not token:
+        raise ValueError("token 不能为空")
+    if not isinstance(user_id, str) or not user_id:
+        raise ValueError("user_id 不能为空")
+    perms = _normalize_permissions(permissions)
+
+    def _do(f):
+        data = _load_locked(f)
+        grants = data.setdefault("grants", [])
+        if not isinstance(grants, list):
+            grants = []
+            data["grants"] = grants
+        for g in grants:
+            if (g.get("share_token") == token and g.get("user_id") == user_id
+                    and g.get("revoked_at") is None):
+                return _grant_out(g)
+        g = {
+            "grant_id": "grt_" + secrets.token_urlsafe(8),
+            "user_id": user_id,
+            "share_token": token,
+            "permissions": list(perms),
+            "claimed_at": time.time(),
+            "revoked_at": None,
+        }
+        grants.append(g)
+        _save_locked(f, data)
+        return _grant_out(g)
+
+    return _with_lock("r+", _do)
+
+
+def claimed_active_slides_for_user(user_id):
+    """返回该 user 认领过的、且对应 share 仍 active 的切片名集合。
+
+    grant.revoked_at 非 None 或 share 不存在/已撤销/已过期均不计入
+    （share 撤销/过期后 grant 自动失效）。
+    """
+    if not user_id:
+        return set()
+
+    def _do(f):
+        data = _load_locked(f)
+        grants = data.get("grants") or []
+        shares = data.get("shares") or {}
+        out = set()
+        for g in grants:
+            if g.get("user_id") != user_id:
+                continue
+            if g.get("revoked_at") is not None:
+                continue
+            tok = g.get("share_token")
+            share = shares.get(tok) if isinstance(tok, str) else None
+            if share is None or not _is_active(share):
+                continue
+            for s in share.get("slides", []):
+                if isinstance(s, str):
+                    out.add(s)
+        return out
+
+    return _with_lock("r+", _do)
+
+
+def list_grants_for_user(user_id):
+    """返回该 user 的全部 grant（含已失效，附 share_active 标志）。供调试/审计。"""
+    if not user_id:
+        return []
+
+    def _do(f):
+        data = _load_locked(f)
+        grants = data.get("grants") or []
+        shares = data.get("shares") or {}
+        out = []
+        for g in grants:
+            if g.get("user_id") != user_id:
+                continue
+            tok = g.get("share_token")
+            share = shares.get(tok) if isinstance(tok, str) else None
+            gg = _grant_out(g)
+            gg["share_active"] = bool(share is not None and _is_active(share))
+            out.append(gg)
+        out.sort(key=lambda x: x.get("claimed_at", 0), reverse=True)
+        return out
 
     return _with_lock("r+", _do)
 
@@ -561,7 +747,7 @@ def _clean_note(note):
 
 def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note="", visitor=None,
             source=None, created_by_session_id=None, _effect_key=None, owner_user_id=None,
-            **geom):
+            requester_role=None, **geom):
     """为 token 的 share 添加一条标注；统一入口，支持 rect/arrow/freehand。
 
     管理员标注使用 token="admin"（此时 share 校验放宽：不要求 token 命中 shares，
@@ -580,7 +766,9 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
 
     返回新增的 roi dict（含该 token 下的 index，从 0 起按时间顺序，以及 shared/note、
     annotation_id/change_seq 等）。若校验失败抛出 ValueError。
+    requester_role：显式传 "guest" 时拒绝（仓储边界 defense-in-depth）。
     """
+    _reject_guest_write(requester_role)
     # type 合法性
     if type not in ROI_TYPES:
         raise ValueError("未知标注类型")
@@ -957,13 +1145,18 @@ def list_shared_rois_for_slides(slides):
 # --------------------------------------------------------------------------- #
 # 样本元数据（别名/备注）—— shares.json 顶层 slide_meta
 # --------------------------------------------------------------------------- #
-def set_slide_meta(name, alias=None, note=None, owner_user_id=None):
+def set_slide_meta(name, alias=None, note=None, owner_user_id=None, public=None,
+                   requester_role=None):
     """设置/更新某切片的别名与备注。
 
     alias/note 为 None 表示不改该项；空串表示清除该项。
     name 不存在时仍写入（便于先建别名后传文件）；返回更新后的 meta dict。
     owner_user_id 为创建者归属（可选；缺省用已注入的 owner id）。
+    public：None 不改；True/False 设置公开档位（仅 owner 可改，由 app.py 强制）。
+    requester_role：显式传 "guest" 时拒绝（仓储边界 defense-in-depth）。
     """
+    _reject_guest_write(requester_role)
+
     def _do(f):
         data = _load_locked(f)
         meta_map = data.setdefault("slide_meta", {})
@@ -985,6 +1178,8 @@ def set_slide_meta(name, alias=None, note=None, owner_user_id=None):
                 cur["note"] = n
             else:
                 cur.pop("note", None)
+        if public is not None:
+            cur["public"] = bool(public)
         if cur.get("owner_user_id") is None:
             cur["owner_user_id"] = owner_user_id or _OWNER_USER_ID or None
         if cur:
@@ -1010,6 +1205,49 @@ def get_slide_meta(name):
     return _with_lock("r+", _do)
 
 
+def get_slide_meta_full(name):
+    """返回某切片的完整 meta（含 owner_user_id / public），供鉴权矩阵判定。
+
+    无记录返回 {alias:"", note:"", owner_user_id:None, public:False}。
+    """
+    def _do(f):
+        data = _load_locked(f)
+        meta_map = data.get("slide_meta", {})
+        cur = meta_map.get(name) if isinstance(meta_map, dict) else None
+        if not isinstance(cur, dict):
+            return {"alias": "", "note": "", "owner_user_id": None, "public": False}
+        return {
+            "alias": cur.get("alias", ""),
+            "note": cur.get("note", ""),
+            "owner_user_id": cur.get("owner_user_id"),
+            "public": bool(cur.get("public")),
+        }
+
+    return _with_lock("r+", _do)
+
+
+def get_all_slide_meta_full():
+    """返回全量 {name: {alias, note, owner_user_id, public}}（鉴权矩阵批量判定用）。"""
+    def _do(f):
+        data = _load_locked(f)
+        meta_map = data.get("slide_meta", {})
+        if not isinstance(meta_map, dict):
+            return {}
+        out = {}
+        for k, v in meta_map.items():
+            if not isinstance(v, dict):
+                continue
+            out[k] = {
+                "alias": v.get("alias", ""),
+                "note": v.get("note", ""),
+                "owner_user_id": v.get("owner_user_id"),
+                "public": bool(v.get("public")),
+            }
+        return out
+
+    return _with_lock("r+", _do)
+
+
 def get_all_slide_meta():
     """返回全量 {name: {alias, note}}。"""
     def _do(f):
@@ -1030,13 +1268,15 @@ def get_all_slide_meta():
 # --------------------------------------------------------------------------- #
 # 项目（projects）—— 仅维护切片归属关系，不移动/删除切片文件
 # --------------------------------------------------------------------------- #
-def create_project(name, note="", slides=None, owner_user_id=None):
+def create_project(name, note="", slides=None, owner_user_id=None, requester_role=None):
     """创建项目。pid=secrets.token_urlsafe(10)。
 
     slides 在此只做去重，是否为已存在切片由调用方保证。
     owner_user_id 为创建者归属（可选；缺省用已注入的 owner id，否则留空）。
     返回新建项目 dict（含 pid）。
+    requester_role：显式传 "guest" 时拒绝（仓储边界 defense-in-depth）。
     """
+    _reject_guest_write(requester_role)
     pid = secrets.token_urlsafe(10)
     now = time.time()
     # 去重（保序）

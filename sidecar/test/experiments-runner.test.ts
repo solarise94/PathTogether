@@ -421,13 +421,13 @@ describe("experiments runner — real-model mode", () => {
 		expect(result.mode).toBe("real-model");
 		expect(result.rows.length).toBeGreaterThanOrEqual(1);
 		expect(result.cpaModel).toBe("gpt-5.6-luna");
-		expect(result.cpaBaseUrl).toBe("http://198.51.100.10:46450/v1");
+		expect(result.cpaBaseUrl).toBe("http://localhost:46450/v1");
 		expect(result.cellErrors).toEqual([]);
 
 		// run.json carries cpa_model + cpa_base_url but NEVER the api key.
 		const runMeta = JSON.parse(await fs.readFile(join(setup_.outDir, "run.json"), "utf8")) as Record<string, unknown>;
 		expect(runMeta.cpa_model).toBe("gpt-5.6-luna");
-		expect(runMeta.cpa_base_url).toBe("http://198.51.100.10:46450/v1");
+		expect(runMeta.cpa_base_url).toBe("http://localhost:46450/v1");
 		expect(runMeta.cell_errors).toEqual([]);
 		const runJsonText = await fs.readFile(join(setup_.outDir, "run.json"), "utf8");
 		expect(runJsonText).not.toContain("sk-test-key");

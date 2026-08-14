@@ -10,5 +10,9 @@ share-data/
 certs/
 *.log
 
+# 本地环境变量（可能含密钥）
+.env
+.env.*
+
 # 系统
 .DS_Store

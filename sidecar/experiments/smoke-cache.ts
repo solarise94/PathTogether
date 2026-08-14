@@ -35,7 +35,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const SIDECAR = dirname(HERE);
 const REPO = dirname(SIDECAR);
 
-const CPA_URL = process.env.CPA_BASE_URL ?? "http://198.51.100.10:46450/v1";
+const CPA_URL = process.env.CPA_BASE_URL ?? "http://localhost:46450/v1";
 const CPA_KEY = process.env.CPA_API_KEY ?? "";
 const MODEL = "gpt-5.6-luna";
 

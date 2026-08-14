@@ -111,7 +111,7 @@ real-model 模式把 taskset 的**真实 `user_turns`** 通过 runner 的**真�
 | --- | --- | --- | --- |
 | `PHASE4_CPA_VERIFIED=1` | 是 | — | 解除 gate（openai-protocol 路径已验证；保留为显式 opt-in 成本防线） |
 | `CPA_API_KEY` | 是 | — | CPA 网关 api key。**不内嵌回退 key**；缺失即报错退出（`CpaApiKeyMissingError`） |
-| `CPA_BASE_URL` | 否 | `http://198.51.100.10:46450/v1` | CPA 网关 openai-compatible 端点 |
+| `CPA_BASE_URL` | 否 | `http://localhost:46450/v1` | CPA 网关 openai-compatible 端点 |
 | `CPA_MODEL` | 否 | `gpt-5.6-luna` | 缓存实验默认模型（openai 路径已验证缓存可观测） |
 | `CPA_API_PROTOCOL` | 否 | `openai` | `openai` \| `anthropic` \| `gemini`。**gemini 路径缓存不可观测（#592）** |
 

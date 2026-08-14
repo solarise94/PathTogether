@@ -7,7 +7,7 @@
  *
  * ## Gate policy (updated 2026-08-12 — LIFTED for the openai-protocol path)
  *
- * Cache observability on the real CPA gateway (http://198.51.100.10:46450) has
+ * Cache observability on the real CPA gateway (http://localhost:46450) has
  * now been VERIFIED for the **openai-protocol** path:
  *   - model `gpt-5.6-luna`, non-stream probe with `prompt_cache_key` set,
  *     returned `cached_tokens=3438` on repeat requests (≈99.9% prefix hit).

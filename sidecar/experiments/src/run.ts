@@ -89,7 +89,7 @@ export const RUNNER_BASE_CONFIG = {
 // =========================================================================== //
 
 /** Default CPA gateway base url (openai-compatible /v1 endpoint). */
-export const CPA_DEFAULT_BASE_URL = "http://198.51.100.10:46450/v1";
+export const CPA_DEFAULT_BASE_URL = "http://localhost:46450/v1";
 /**
  * Default model for cache experiments. The openai-protocol path on this gateway
  * reports cache hits (gpt-5.6-luna cached_tokens verified 2026-08-12). The

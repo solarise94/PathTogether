@@ -10,11 +10,13 @@ import functools
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import math
 import os
 import secrets
 import shutil
+import socket
 import sys
 import threading
 import time
@@ -22,6 +24,7 @@ import zipfile
 from collections import OrderedDict, deque
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 from flask import (
     Flask,
@@ -199,21 +202,41 @@ def _bootstrap_owner(environ=None):
     return owner.get("user_id") if owner else None
 
 
-# 数据归属懒迁移：注入首个 owner 的 user_id（share_store._ensure_owner_refs 据此
-# 给现存 projects/slide_meta/rois 补 owner_user_id；本节点只落地字段，不做过滤）。
+def _repair_pg_empty_password_hashes():
+    """dual/postgres：把 json 权威 hash 回填到旧 dual 写入的空 password_hash 行。"""
+    backend = getattr(user_store, "STORAGE_BACKEND", "json")
+    if backend not in ("dual", "postgres"):
+        return
+    try:
+        import user_store_pg
+        n = user_store_pg.repair_empty_password_hashes_from_json()
+        if n:
+            app.logger.warning("repaired %s empty password_hash row(s) from json", n)
+    except Exception:
+        app.logger.exception("password_hash backfill from json failed")
+
+
 _OWNER_USER_ID = _bootstrap_owner()
 if _OWNER_USER_ID:
     share_store.set_owner_user_id(_OWNER_USER_ID)
+_repair_pg_empty_password_hashes()
+
 
 # AUTH_ENABLED 语义不变：有 ADMIN_PASSWORD 或存在任何 enabled 用户即开
 # （存在 admin 用户账户时即使未设 ADMIN_PASSWORD 也保持认证，防止误开免登录）。
+# 用户库损坏/不可读必须拒绝启动，绝不能当成「无用户」而关闭鉴权。
 def _resolve_auth_enabled():
     if _AUTH_BY_PASSWORD:
         return True
     try:
         return user_store.has_enabled_users()
-    except Exception:
-        return False
+    except Exception as e:
+        corrupt = getattr(user_store, "UserStoreCorrupt", ())
+        kind = "损坏" if isinstance(e, corrupt) else "不可读"
+        raise SystemExit(
+            "用户库%s，拒绝以免登录模式启动（%s）。"
+            "请修复用户库或从 users.json.bak 恢复。" % (kind, e)
+        ) from e
 
 
 AUTH_ENABLED = _resolve_auth_enabled()
@@ -387,18 +410,8 @@ def _clear_auth_fails(ip: str):
     _auth_attempts.pop(ip, None)
 
 
-@app.before_request
-def _require_auth():
-    """启用认证时拦截未登录请求。
-
-    放行 /login、/static/ 下文件；其余请求检查 session：
-    /api/ 开头返回 401 jsonify(error="auth_required")，页面 302 到 /login。
-    """
-    if not AUTH_ENABLED:
-        return None
-    # 已登录放行
-    if session.get("auth_user"):
-        return None
+def _auth_challenge():
+    """未登录或会话失效：API 返回 401，页面 302 到 /login。放行公开路径。"""
     path = request.path
     # 放行登录页与静态资源（含插件前端 bundle 与通用插件静态文件，与 /static/ 同属
     # 非敏感前端资源；plugin_id/filename 路径穿越由 plugin_ui_asset 双重拒绝）
@@ -420,6 +433,45 @@ def _require_auth():
         return jsonify(error="auth_required"), 401
     # 页面：跳登录，带 next（防开放跳转在 login 路由内校验）
     return redirect("/login?next=" + path)
+
+
+@app.before_request
+def _require_auth():
+    """启用认证时拦截未登录 / 已禁用 / 已删除用户的请求。
+
+    放行 /login、/static/、/plugins/、/healthz、/internal/、/api/plugin/；
+    其余请求检查 session，并按 user_id 回查用户是否仍存在且 enabled
+    （禁用或删除立即失效，不等 cookie 过期）。
+    /api/ 开头返回 401 jsonify(error="auth_required")，页面 302 到 /login。
+    """
+    if not AUTH_ENABLED:
+        return None
+    # 公开路径不回查用户（避免每个静态资源打一次存储）
+    path = request.path
+    if path == "/login" or path.startswith("/static/") or path.startswith("/plugins/"):
+        return None
+    if path == "/healthz":
+        return None
+    if path.startswith("/internal/") or path.startswith("/api/plugin/"):
+        return None
+    if session.get("auth_user"):
+        uid = session.get("user_id")
+        user = None
+        lookup_failed = False
+        if uid:
+            try:
+                user = user_store.get_user(uid)
+            except Exception:
+                app.logger.exception("auth user lookup failed")
+                lookup_failed = True
+        if lookup_failed:
+            return _auth_challenge()
+        if user is not None and not user.get("disabled"):
+            if user.get("role"):
+                session["role"] = user["role"]
+            return None
+        session.clear()
+    return _auth_challenge()
 
 
 @app.before_request
@@ -694,6 +746,17 @@ def _slide_info_dict(name: str) -> dict:
     base["note"] = sm.get("note", "")
     base["public"] = bool(sm.get("public"))
     return base
+
+
+def _rect_size_mm(safe, side_px):
+    """AI 落标只带 side_px；用切片 mpp 换算物理边长（mm）。读不到 mpp 则 0。"""
+    try:
+        mpp = (_slide_info_dict(safe) or {}).get("mpp_x")
+        if mpp and float(mpp) > 0 and side_px:
+            return round(int(side_px) * float(mpp) / 1000.0, 2)
+    except Exception:
+        pass
+    return 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -1027,11 +1090,14 @@ def _slide_is_public(name):
     return bool(meta.get("public")) if meta else False
 
 
-def _claimed_slides(uid):
-    """user 认领的 active share 中的切片名集合（协作切片）。"""
+def _claimed_slides(uid, permission=None):
+    """user 认领的 active share 中的切片名集合（协作切片）。
+
+    permission 若给出，只计入 grant 含该权限的切片（view / annotate）。
+    """
     if not uid:
         return set()
-    return share_store.claimed_active_slides_for_user(uid)
+    return share_store.claimed_active_slides_for_user(uid, permission=permission)
 
 
 def can_upload(slide=None):
@@ -1048,7 +1114,7 @@ def can_upload(slide=None):
 
 
 def can_view_slide(name):
-    """owner 全量；user = 自己的 ∪ 公开 ∪ 认领的协作切片。"""
+    """owner 全量；user = 自己的 ∪ 公开 ∪ 认领且 grant 含 view 的协作切片。"""
     ident = current_identity()
     if ident["role"] == user_store.ROLE_OWNER:
         return True
@@ -1057,7 +1123,7 @@ def can_view_slide(name):
         return True
     if _slide_is_public(name):
         return True
-    if name in _claimed_slides(uid):
+    if name in _claimed_slides(uid, permission=share_store.PERMISSION_VIEW):
         return True
     return False
 
@@ -1071,7 +1137,7 @@ def can_delete_slide(name):
 
 
 def can_annotate_slide(name):
-    """owner 全量；user = 自己的 ∪ 协作切片（不含纯公开只读）。
+    """owner 全量；user = 自己的 ∪ 协作切片且 grant 含 annotate（不含纯公开只读）。
 
     Stage 3c-2（docs §v1.5）：归档项目内的切片对**所有身份**（含 owner）只读——
     命中归档切片返回 False（解除归档才可标注）。
@@ -1084,7 +1150,7 @@ def can_annotate_slide(name):
     uid = ident["user_id"]
     if _slide_owner(name) == uid:
         return True
-    if name in _claimed_slides(uid):
+    if name in _claimed_slides(uid, permission=share_store.PERMISSION_ANNOTATE):
         return True
     return False
 
@@ -1117,7 +1183,7 @@ def _visible_slide_names():
         return all_names
     uid = ident["user_id"]
     meta_all = share_store.get_all_slide_meta_full()
-    claimed = _claimed_slides(uid)
+    claimed = _claimed_slides(uid, permission=share_store.PERMISSION_VIEW)
     visible = set()
     for name in all_names:
         m = meta_all.get(name, {})
@@ -2501,6 +2567,91 @@ def _resolve_ai_credentials(user_ctx):
     return "own", {"base_url": base, "model": model, "api_key": key}
 
 
+_SSRF_BLOCKED_HOSTS = frozenset({
+    "localhost",
+    "localhost.localdomain",
+    "metadata.google.internal",
+    "metadata.goog",
+    "metadata",
+    "kubernetes.default",
+    "kubernetes.default.svc",
+})
+_SSRF_BLOCKED_NETWORKS = (
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("255.255.255.255/32"),
+)
+
+
+def _ip_is_blocked(ip):
+    """loopback / 私网 / 链路本地 / 保留 / CGNAT 等不可作为用户 base_url 目标。"""
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
+            or ip.is_reserved or ip.is_unspecified):
+        return True
+    for net in _SSRF_BLOCKED_NETWORKS:
+        try:
+            if ip in net:
+                return True
+        except TypeError:
+            continue
+    return False
+
+
+def _host_ips(hostname):
+    """解析主机名为 ip_address 列表（供 SSRF 检查；测试可 monkeypatch）。"""
+    try:
+        infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise ValueError("无法解析 base_url 主机名") from e
+    out = []
+    seen = set()
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if ip.version == 6 and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        key = str(ip)
+        if key not in seen:
+            seen.add(key)
+            out.append(ip)
+    if not out:
+        raise ValueError("无法解析 base_url 主机名")
+    return out
+
+
+def _assert_user_base_url(url):
+    """用户自带 AI base_url：仅 http(s)，拒绝 loopback/私网/链路本地/元数据。
+
+    在保存与注入 sidecar 时都调用。连接层 TOCTOU（DNS rebinding / 公网 30x 跳
+    内网）由 sidecar `ssrf_guard` 关闭：lookup 只返回公网 IP，fetch 不跟随重定向。
+    owner 平台 URL 不受此限（demo 常用 http://127.0.0.1:8317/v1）。
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("base_url 仅支持 http 或 https")
+    if parsed.username or parsed.password:
+        raise ValueError("base_url 不得包含用户名或密码")
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        raise ValueError("base_url 缺少主机名")
+    if host in _SSRF_BLOCKED_HOSTS or host.endswith(".localhost"):
+        raise ValueError("base_url 不得指向内网、回环或云元数据地址")
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None and _ip_is_blocked(literal):
+        raise ValueError("base_url 不得指向内网、回环或云元数据地址")
+    for ip in _host_ips(host):
+        if _ip_is_blocked(ip):
+            raise ValueError("base_url 不得指向内网、回环或云元数据地址")
+
+
 def _build_sidecar_config(user_ctx=None) -> dict:
     """组装 sidecar 请求所需的 config 字段（base_url/api_key 明文 + 全部调优字段）。
 
@@ -2524,6 +2675,13 @@ def _build_sidecar_config(user_ctx=None) -> dict:
     out["api_protocol"] = cred_cfg.get("api_protocol") or "openai"
     # 运行时再守一次：即使加载迁移未持久化，注入 sidecar 的值也不能 <128。
     _apply_legacy_reserve_migration(out)
+    if source == "own":
+        try:
+            _assert_user_base_url(out["base_url"])
+        except ValueError:
+            return None
+        # sidecar 连接层固定解析 IP 并禁止重定向（关闭 DNS rebinding / 30x 跳内网）
+        out["ssrf_guard"] = True
     return out
 
 
@@ -3021,6 +3179,8 @@ def api_ai_config():
             "api_key_mask": _mask_api_key(own_key),
             "model": own.get("model") or "",
             "platform_configured": platform_configured,
+            # 平台模型名（不含任何密钥）：user 侧提示“当前生效来源”用
+            "platform_model": (platform_cfg.get("model") or "") if platform_configured else "",
             "using": using,
         }
         # tuning 字段只读平台值（user 无独立调优）
@@ -3056,7 +3216,13 @@ def api_ai_config():
                 return jsonify(error="use_platform 需为布尔值"), 400
             pending["use_platform"] = up
         if "base_url" in body:
-            pending["base_url"] = str(body.get("base_url") or "").strip()
+            url = str(body.get("base_url") or "").strip()
+            if url:
+                try:
+                    _assert_user_base_url(url)
+                except ValueError as e:
+                    return jsonify(error=str(e)), 400
+            pending["base_url"] = url
         if "model" in body:
             pending["model"] = str(body.get("model") or "").strip()
         # api_key：空=清除；掩码同值=不变；其他=覆盖（明文 → 加密落盘）
@@ -3255,7 +3421,6 @@ def _provider_host(base_url: str) -> str:
     """从 base_url 提取 host 作为 provider 溯源（不记全 URL 不记 key）。"""
     if not base_url:
         return ""
-    from urllib.parse import urlparse
     try:
         return urlparse(base_url).netloc or base_url[:64]
     except Exception:
@@ -3589,6 +3754,7 @@ def internal_ai_annotate():
         roi = share_store.add_roi(
             share_store.ADMIN_TOKEN, safe, label, type="rect", note=note,
             x=int(x), y=int(y), side_px=side_px,
+            size_mm=_rect_size_mm(safe, side_px),
             source="ai", created_by_session_id=session_id,
             _effect_key=effect_key or None,
             provenance=provenance,
@@ -4012,6 +4178,7 @@ def plugin_v1_annotate(slide):
         roi = share_store.add_roi(
             share_store.ADMIN_TOKEN, safe, label, type="rect", note=note,
             x=int(x), y=int(y), side_px=side_px,
+            size_mm=_rect_size_mm(safe, side_px),
             source="ai", created_by_session_id=session_id,
             _effect_key=effect_key or None,
             provenance=provenance,
@@ -4118,13 +4285,13 @@ def api_ai_run():
 
     代理到 sidecar POST /run：注入 config（base_url/api_key 明文/model/
     api_protocol + 全部调优参数）。Stage 3a-2b：按当前身份做切片级鉴权
-    （can_view_slide，无权 403）与凭据解析（未配置 → 400 中文指导）。
+    （can_annotate_slide，无权 403）与凭据解析（未配置 → 400 中文指导）。
     """
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
     if not isinstance(slide, str) or not slide:
         return jsonify(error="缺少 slide"), 400
-    if not can_view_slide(slide):
+    if not can_annotate_slide(slide):
         return _denied()
     user_ctx = current_identity()
     config = _build_sidecar_config(user_ctx)
@@ -4138,7 +4305,8 @@ def api_ai_run():
     # 任意会话，sidecar acquire 守卫对无 owner 注入的 run 不生效）；内网模式不注入。
     if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
         config["session_owner"] = user_ctx["user_id"]
-    # Stage 4-1a：起跑发放 run grant（slide 级），sidecar 4-1b 消费
+    # Stage 4-1a：起跑发放 run grant（slide 级），sidecar 4-1b 消费。
+    # 写标注工具需要 annotate；只读访问不得拿到 annotation:write grant。
     _issue_run_grant(slide, user_ctx, config)
     task = body.get("task")
     if isinstance(task, str):
@@ -4155,13 +4323,13 @@ def api_ai_continue():
     """主 session 从落库 state+messages 续跑（SSE）。body: {slide}。
 
     代理到 sidecar POST /continue：注入 config。无 main → 404（sidecar 返回）。
-    Stage 3a-2b：切片级鉴权 + 凭据解析。
+    Stage 3a-2b：切片级鉴权（can_annotate_slide）+ 凭据解析。
     """
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
     if not isinstance(slide, str) or not slide:
         return jsonify(error="缺少 slide"), 400
-    if not can_view_slide(slide):
+    if not can_annotate_slide(slide):
         return _denied()
     user_ctx = current_identity()
     config = _build_sidecar_config(user_ctx)
@@ -4186,7 +4354,8 @@ def api_ai_ask():
     """fork 起跑/续聊（批注式对话，SSE）。body: {slide, annotation_id, question?}。
 
     代理到 sidecar POST /ask：注入 config。根标注已删除 → 410（sidecar 返回）。
-    Stage 3a-2b：切片可读即可（ask/branch 只需标注存在，view 足够）鉴权 + 凭据解析。
+    Stage 3a-2b：切片可读即可（ask 为 lite fork、无写工具）鉴权 + 凭据解析。
+    仅当 can_annotate_slide 时才发放可写 run grant，避免只读访问经 AI 落标。
     """
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
@@ -4210,8 +4379,8 @@ def api_ai_ask():
     # 任意会话，sidecar acquire 守卫对无 owner 注入的 run 不生效）；内网模式不注入。
     if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
         config["session_owner"] = user_ctx["user_id"]
-    # Stage 4-1a：起跑发放 run grant（slide 级），sidecar 4-1b 消费
-    _issue_run_grant(slide, user_ctx, config)
+    if can_annotate_slide(slide):
+        _issue_run_grant(slide, user_ctx, config)
     question = body.get("question")
     if isinstance(question, str):
         payload["question"] = question
@@ -4226,7 +4395,7 @@ def api_ai_branch():
 
     body: {slide, annotation_id, question?}。代理到 sidecar POST /branch：注入
     config。根标注已删除 → 410（sidecar 返回）。契约同 /api/ai/ask。
-    Stage 3a-2b：切片可读即可鉴权 + 凭据解析。
+    Stage 3a-2b：branch 含写工具，要求 can_annotate_slide。
     """
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
@@ -4235,7 +4404,7 @@ def api_ai_branch():
         return jsonify(error="缺少 slide"), 400
     if not isinstance(annotation_id, str) or not annotation_id:
         return jsonify(error="缺少 annotation_id"), 400
-    if not can_view_slide(slide):
+    if not can_annotate_slide(slide):
         return _denied()
     user_ctx = current_identity()
     config = _build_sidecar_config(user_ctx)
@@ -4250,7 +4419,6 @@ def api_ai_branch():
     # 任意会话，sidecar acquire 守卫对无 owner 注入的 run 不生效）；内网模式不注入。
     if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
         config["session_owner"] = user_ctx["user_id"]
-    # Stage 4-1a：起跑发放 run grant（slide 级），sidecar 4-1b 消费
     _issue_run_grant(slide, user_ctx, config)
     question = body.get("question")
     if isinstance(question, str):
@@ -4355,6 +4523,14 @@ def _sidecar_unavailable_response():
     return jsonify(error="ai sidecar 不可用"), 503
 
 
+def _sidecar_auth_headers(extra=None):
+    """Flask → sidecar 内部通道头：始终带 X-AI-Internal-Token。"""
+    headers = {"X-AI-Internal-Token": AI_INTERNAL_TOKEN}
+    if extra:
+        headers.update(extra)
+    return headers
+
+
 def _ai_session_owner(session_id: str):
     """查询某会话的归属 owner（sidecar GET /session/<id> 的 session.owner）。
 
@@ -4363,7 +4539,8 @@ def _ai_session_owner(session_id: str):
     """
     url = AI_SIDECAR_URL + "/session/" + session_id
     try:
-        r = requests.get(url, timeout=_AI_SIDECAR_TIMEOUT)
+        r = requests.get(url, timeout=_AI_SIDECAR_TIMEOUT,
+                         headers=_sidecar_auth_headers())
     except (requests.ConnectionError, requests.Timeout):
         return None
     if r.status_code != 200:
@@ -4403,9 +4580,11 @@ def _proxy_json(path, body, method="POST", query=None):
     url = AI_SIDECAR_URL + path
     try:
         if method == "GET":
-            r = requests.get(url, params=query, timeout=_AI_SIDECAR_TIMEOUT)
+            r = requests.get(url, params=query, timeout=_AI_SIDECAR_TIMEOUT,
+                             headers=_sidecar_auth_headers())
         else:
-            r = requests.post(url, json=body or {}, timeout=_AI_SIDECAR_TIMEOUT)
+            r = requests.post(url, json=body or {}, timeout=_AI_SIDECAR_TIMEOUT,
+                              headers=_sidecar_auth_headers())
     except (requests.ConnectionError, requests.Timeout):
         return _sidecar_unavailable_response()
     # 透传 Content-Type（JSON 或其它）与状态码
@@ -4422,7 +4601,7 @@ def _proxy_sse(path, body, method="POST"):
     content-type 正确处理：非 text/event-stream 视为普通 JSON 透传。
     """
     url = AI_SIDECAR_URL + path
-    headers = {}
+    headers = _sidecar_auth_headers()
     last_event_id = request.headers.get("Last-Event-ID")
     if last_event_id:
         headers["Last-Event-ID"] = last_event_id
@@ -4436,12 +4615,12 @@ def _proxy_sse(path, body, method="POST"):
     try:
         if method == "GET":
             upstream = requests.get(
-                url, params=params, headers=headers or None,
+                url, params=params, headers=headers,
                 stream=True, timeout=(_AI_SIDECAR_TIMEOUT, _AI_SIDECAR_SSE_READ_TIMEOUT),
             )
         else:
             upstream = requests.post(
-                url, json=body or {}, stream=True,
+                url, json=body or {}, stream=True, headers=headers,
                 timeout=(_AI_SIDECAR_TIMEOUT, _AI_SIDECAR_SSE_READ_TIMEOUT),
             )
     except (requests.ConnectionError, requests.Timeout):

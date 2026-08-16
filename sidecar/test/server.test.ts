@@ -15,7 +15,7 @@ import { BASE_CONFIG, makeFakeStreamFn, makeMockFlask, SLIDE } from "./helpers.j
 import { SessionStore } from "../src/session-store.js";
 import { SessionEventBus } from "../src/events.js";
 import { AgentRunner } from "../src/agent-runner.js";
-import { SidecarServer } from "../src/server.js";
+import { SidecarServer, assertInboundAuthAllowed, isLoopbackBindHost } from "../src/server.js";
 import type { PlatformClient } from "../src/platform/contract.js";
 
 /** Track created session dirs for cleanup. */
@@ -451,14 +451,30 @@ describe("SidecarServer — POST /continue 404", () => {
 	});
 });
 
-describe("SidecarServer — POST /ask 410", () => {
-	it("returns 410 when the root annotation is deleted", async () => {
+describe("SidecarServer — POST /ask deleted root (SSE agent_error)", () => {
+	it("returns SSE with agent_error (已删除) and session_ended{error} when the root annotation is deleted", async () => {
+		// Root lookup is post-return in the runner (deadlock fix), so a deleted
+		// root no longer surfaces as HTTP 410 — the SSE stream has already
+		// started and the fork settles error via agent_error.
 		const { fn } = makeFakeStreamFn([{ text: "x", stopReason: "stop" as const }]);
 		const h = await startServer(fn);
 		try {
 			h.mock.spotChanges.push({ annotation_id: "gone", x: 1, y: 1, side_px: 1, note: "", change_seq: ++h.mock.currentSeq, deleted: true });
-			const r = await post(h.baseUrl, "/ask", { slide: SLIDE, annotation_id: "gone", config: { ...BASE_CONFIG } });
-			expect(r.status).toBe(410);
+			const res = await fetch(h.baseUrl + "/ask", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ slide: SLIDE, annotation_id: "gone", config: { ...BASE_CONFIG } }),
+			});
+			expect(res.status).toBe(200);
+			expect(res.headers.get("content-type")).toContain("text/event-stream");
+			expect(res.headers.get("x-ai-session-id")).toBeTruthy();
+			const frames = await readSseUntil(res, (f) => f.includes("event: session_ended"));
+			const events = frames.map(parseFrame).filter((e) => e.event);
+			const err = events.find((e) => e.event === "agent_error");
+			expect(err).toBeDefined();
+			expect((err!.data as { error: string }).error).toMatch(/已删除/);
+			const ended = events.find((e) => e.event === "session_ended");
+			expect((ended!.data as { status: string }).status).toBe("error");
 		} finally {
 			await h.server.stop();
 		}
@@ -496,13 +512,29 @@ describe("SidecarServer — POST /branch", () => {
 		}
 	});
 
-	it("returns 410 when the root annotation is deleted", async () => {
+	it("returns SSE with agent_error (已删除) and session_ended{error} when the root annotation is deleted", async () => {
+		// Root lookup is post-return in the runner (deadlock fix), so a deleted
+		// root no longer surfaces as HTTP 410 — the SSE stream has already
+		// started and the branch settles error via agent_error.
 		const { fn } = makeFakeStreamFn([{ text: "x", stopReason: "stop" as const }]);
 		const h = await startServer(fn);
 		try {
 			h.mock.spotChanges.push({ annotation_id: "br-gone", x: 1, y: 1, side_px: 1, note: "", change_seq: ++h.mock.currentSeq, deleted: true });
-			const r = await post(h.baseUrl, "/branch", { slide: SLIDE, annotation_id: "br-gone", config: { ...BASE_CONFIG } });
-			expect(r.status).toBe(410);
+			const res = await fetch(h.baseUrl + "/branch", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ slide: SLIDE, annotation_id: "br-gone", config: { ...BASE_CONFIG } }),
+			});
+			expect(res.status).toBe(200);
+			expect(res.headers.get("content-type")).toContain("text/event-stream");
+			expect(res.headers.get("x-ai-session-id")).toBeTruthy();
+			const frames = await readSseUntil(res, (f) => f.includes("event: session_ended"));
+			const events = frames.map(parseFrame).filter((e) => e.event);
+			const err = events.find((e) => e.event === "agent_error");
+			expect(err).toBeDefined();
+			expect((err!.data as { error: string }).error).toMatch(/已删除/);
+			const ended = events.find((e) => e.event === "session_ended");
+			expect((ended!.data as { status: string }).status).toBe("error");
 		} finally {
 			await h.server.stop();
 		}
@@ -619,5 +651,77 @@ describe("SidecarServer — fork/branch 续聊 SSE 不重放历史", () => {
 		} finally {
 			await h.server.stop();
 		}
+	});
+});
+
+describe("SidecarServer — inbound internal token", () => {
+	it("rejects /run without token when internalToken is set; /healthz stays open", async () => {
+		const { fn } = makeFakeStreamFn([{ text: "x", stopReason: "stop" as const }]);
+		const dir = `/tmp/svs-srv-${Math.random().toString(36).slice(2)}`;
+		createdDirs.push(dir);
+		const store = new SessionStore({ sessionsDir: dir });
+		await store.ensureDir();
+		const bus = new SessionEventBus(store);
+		const mock = makeMockFlask();
+		const runner = new AgentRunner(store, bus, mock as unknown as PlatformClient, { streamFn: fn as never });
+		const server = new SidecarServer({
+			host: "127.0.0.1", port: 0, store, bus,
+			flask: mock as unknown as PlatformClient, runner,
+			internalToken: "test-sidecar-token",
+		});
+		await server.start();
+		const baseUrl = `http://127.0.0.1:${server.boundPort}`;
+		try {
+			const health = await getJson(baseUrl, "/healthz");
+			expect(health.status).toBe(200);
+
+			const denied = await post(baseUrl, "/run", { slide: SLIDE, config: { ...BASE_CONFIG } });
+			expect(denied.status).toBe(401);
+			expect(denied.body).toEqual({ error: "invalid_internal_token" });
+
+			const ok = await fetch(baseUrl + "/run", {
+				method: "POST",
+				headers: { "Content-Type": "application/json", "X-AI-Internal-Token": "test-sidecar-token" },
+				body: JSON.stringify({ slide: SLIDE, config: { ...BASE_CONFIG } }),
+			});
+			expect(ok.status).toBe(200);
+			expect((ok.headers.get("Content-Type") || "").includes("text/event-stream")).toBe(true);
+			await ok.body?.cancel();
+		} finally {
+			await server.stop();
+		}
+	});
+});
+
+describe("SidecarServer — non-loopback refuses empty token", () => {
+	it("treats 127.0.0.1 / ::1 / localhost as loopback", () => {
+		expect(isLoopbackBindHost("127.0.0.1")).toBe(true);
+		expect(isLoopbackBindHost("::1")).toBe(true);
+		expect(isLoopbackBindHost("localhost")).toBe(true);
+		expect(isLoopbackBindHost("0.0.0.0")).toBe(false);
+		expect(isLoopbackBindHost("::")).toBe(false);
+	});
+
+	it("allows empty token on loopback; refuses 0.0.0.0 unless allowUnauth or token set", () => {
+		expect(() => assertInboundAuthAllowed("127.0.0.1", "")).not.toThrow();
+		expect(() => assertInboundAuthAllowed("0.0.0.0", "")).toThrow(/refusing to start/);
+		expect(() => assertInboundAuthAllowed("0.0.0.0", "", true)).not.toThrow();
+		expect(() => assertInboundAuthAllowed("0.0.0.0", "tok")).not.toThrow();
+	});
+
+	it("start() throws before listen when binding 0.0.0.0 without token", async () => {
+		const { fn } = makeFakeStreamFn([{ text: "x", stopReason: "stop" as const }]);
+		const dir = `/tmp/svs-srv-${Math.random().toString(36).slice(2)}`;
+		createdDirs.push(dir);
+		const store = new SessionStore({ sessionsDir: dir });
+		await store.ensureDir();
+		const bus = new SessionEventBus(store);
+		const mock = makeMockFlask();
+		const runner = new AgentRunner(store, bus, mock as unknown as PlatformClient, { streamFn: fn as never });
+		const server = new SidecarServer({
+			host: "0.0.0.0", port: 0, store, bus,
+			flask: mock as unknown as PlatformClient, runner,
+		});
+		await expect(server.start()).rejects.toThrow(/refusing to start/);
 	});
 });

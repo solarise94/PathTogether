@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -172,6 +173,37 @@ def test_cas_set_shared_conflict():
     # 正确 revision → ok
     assert share_store.set_roi_shared(share_store.ADMIN_TOKEN, 0, True,
                                       expected_revision=2) is True
+
+
+def test_cas_concurrent_expected_revision_one_wins():
+    """两个相同 expected_revision 的并发更新只有一个成功，另一个 RevisionConflict。"""
+    _touch()
+    r = _add()
+    assert r["revision"] == 1
+    results = []
+    errors = []
+
+    def worker(note):
+        try:
+            out = share_store.update_roi(
+                share_store.ADMIN_TOKEN, 0, note=note, expected_revision=1)
+            results.append(out)
+        except Exception as e:
+            errors.append(e)
+
+    t1 = threading.Thread(target=worker, args=("a",))
+    t2 = threading.Thread(target=worker, args=("b",))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    assert len(results) == 1, "并发 CAS 应仅一人写入，got results=%r errors=%r" % (
+        results, errors)
+    assert len(errors) == 1
+    assert isinstance(errors[0], share_store.RevisionConflict)
+    listed = share_store.list_rois(share_store.ADMIN_TOKEN)
+    assert listed[0]["note"] in ("a", "b")
+    assert listed[0]["revision"] == 2
 
 
 def test_revision_monotonic_on_update_and_tombstone():

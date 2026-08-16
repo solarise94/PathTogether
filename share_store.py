@@ -85,6 +85,7 @@ _JSON_PUBLIC_NAMES = (
     "list_rois",
     "get_roi",
     "get_roi_by_annotation_id",
+    "rehash_plaintext_visitors",
     "delete_roi",
     "delete_roi_by_annotation_id",
     "list_changes",
@@ -211,6 +212,7 @@ def _make_dual_same(name, json_fn, pg_fn):
 _WRITE_NAMES = {
     "set_owner_user_id", "create_share", "revoke_share", "claim_share",
     "add_roi", "update_roi", "delete_roi", "delete_roi_by_annotation_id",
+    "rehash_plaintext_visitors",
     "set_roi_shared", "set_slide_meta", "record_slide_asset",
     "create_project", "update_project",
     "add_slides_to_project", "remove_slide_from_project", "delete_project",
@@ -269,7 +271,7 @@ _DUAL_MIRRORS = {
 #   - resolve_comment(comment_id)：comment_id 为调用方入参，pg 同参定位即可
 #     （resolved 状态不涉及内部生成身份；change_seq 数值差异属允许实现差）。
 _DUAL_SAME_ARGS = {"set_owner_user_id", "record_slide_asset", "resolve_comment",
-                   "record_audit"}
+                   "record_audit", "rehash_plaintext_visitors"}
 
 
 def _install_dual_backend():

@@ -49,7 +49,9 @@ from share_store_json import (
     DEFAULT_ROI_SIZES,
     _clean_note,
     _clean_comment_body,
+    _cap_claim_permissions,
     _grant_out,
+    _grant_permissions_of,
     _hash_installation_secret,
     _installation_out,
     _is_active,
@@ -194,6 +196,16 @@ def _roi_out(roi: dict, index=None, shared=None) -> dict:
     if roi.get("source") == "ai" and not isinstance(roi.get("provenance"), dict):
         out["provenance"] = {"partial": True}
     return out
+
+
+def _fetch_live_rois_locked(cur, token):
+    """按 token 取出未删除 ROI 并锁行，保证 revision CAS 与并发更新串行。"""
+    cur.execute(
+        "SELECT id, data FROM rois WHERE token=%s AND NOT deleted "
+        "ORDER BY insert_seq FOR UPDATE",
+        (token,),
+    )
+    return cur.fetchall()
 
 
 def _check_cas(roi, expected_revision):
@@ -347,22 +359,28 @@ def revoke_share(token):
 # 认领（grants）
 # --------------------------------------------------------------------------- #
 def claim_share(token, user_id, permissions=None):
-    """user 认领分享链接（幂等）。返回 grant dict。"""
+    """user 认领分享链接（幂等）。返回 grant dict。
+
+    权限夹在当前分享权限子集内；缺省使用分享权限（不是全局 DEFAULT）。
+    """
     if not isinstance(token, str) or not token:
         raise ValueError("token 不能为空")
     if not isinstance(user_id, str) or not user_id:
         raise ValueError("user_id 不能为空")
-    perms = _normalize_permissions(permissions)
 
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
+                share = _fetch_share(cur, token)
+                allowed = (_share_permissions(share) if share is not None
+                           else list(DEFAULT_PERMISSIONS))
                 # 幂等：同 token + 同 user 且未失效（active ⇔ json revoked_at is None）
                 cur.execute(
                     "SELECT id, token, user_id, permissions, "
                     "extract(epoch from claimed_at)::float8 AS claimed_at, active "
-                    "FROM grants WHERE token=%s AND user_id=%s AND active",
+                    "FROM grants WHERE token=%s AND user_id=%s AND active "
+                    "FOR UPDATE",
                     (token, user_id),
                 )
                 existing = cur.fetchone()
@@ -371,7 +389,20 @@ def claim_share(token, user_id, permissions=None):
                     g["grant_id"] = g["id"]
                     g["share_token"] = g["token"]
                     g["revoked_at"] = None
+                    if permissions is not None:
+                        perms = _cap_claim_permissions(permissions, allowed)
+                    else:
+                        perms = [p for p in _grant_permissions_of(g) if p in allowed]
+                        if not perms:
+                            perms = list(allowed)
+                    if list(g.get("permissions") or []) != list(perms):
+                        cur.execute(
+                            "UPDATE grants SET permissions=%s WHERE id=%s",
+                            (psycopg.types.json.Jsonb(list(perms)), g["id"]),
+                        )
+                        g["permissions"] = list(perms)
                     return _grant_out(g)
+                perms = _cap_claim_permissions(permissions, allowed)
                 gid = "grt_" + secrets.token_urlsafe(8)
                 now = time.time()
                 cur.execute(
@@ -392,20 +423,29 @@ def claim_share(token, user_id, permissions=None):
         conn.close()
 
 
-def claimed_active_slides_for_user(user_id):
-    """返回该 user 认领过的、且对应 share 仍 active 的切片名集合。"""
+def claimed_active_slides_for_user(user_id, permission=None):
+    """返回该 user 认领过的、且对应 share 仍 active 的切片名集合。
+
+    permission 若给出，只计入 grant 含该权限的切片。
+    """
     if not user_id:
+        return set()
+    if permission is not None and permission not in (
+            PERMISSION_VIEW, PERMISSION_ANNOTATE, PERMISSION_DOWNLOAD):
         return set()
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT token FROM grants WHERE user_id=%s AND active", (user_id,)
+                    "SELECT token, permissions FROM grants "
+                    "WHERE user_id=%s AND active", (user_id,)
                 )
                 grants = cur.fetchall()
                 out = set()
                 for g in grants:
+                    if permission is not None and permission not in _grant_permissions_of(g):
+                        continue
                     tok = g["token"]
                     share = _fetch_share(cur, tok)
                     if share is None or not _is_active(share):
@@ -573,12 +613,7 @@ def update_roi(token, index, geom=None, note=None, expected_revision=None):
                     share = _fetch_share(cur, token)
                     if share is None or not _is_active(share):
                         raise ValueError("share invalid")
-                cur.execute(
-                    "SELECT id, data FROM rois WHERE token=%s AND NOT deleted "
-                    "ORDER BY insert_seq",
-                    (token,),
-                )
-                same = cur.fetchall()
+                same = _fetch_live_rois_locked(cur, token)
                 if index < 0 or index >= len(same):
                     return False
                 rid = same[index]["id"]
@@ -693,6 +728,56 @@ def get_roi_by_annotation_id(annotation_id):
         conn.close()
 
 
+def rehash_plaintext_visitors(token, plaintext_vid, hashed_vid):
+    """当前 token 的 share 仍 active 且确有匹配明文时，原子迁移所有相同 visitor。
+
+    同一事务内先 `FOR UPDATE` 锁定 share 并验证未撤销/未过期，再按 id 升序锁定
+    ROI，避免与 revoke 并发窗口及认领死锁。无有效 share 或无活 ROI 证明则不改写。
+    不 bump revision。返回当前 token 下活 ROI 迁移条数。
+    """
+    if not token or not plaintext_vid or not hashed_vid:
+        return 0
+    if not isinstance(plaintext_vid, str) or not isinstance(hashed_vid, str):
+        return 0
+    if plaintext_vid.startswith("h1.") or hashed_vid == plaintext_vid:
+        return 0
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT " + _SHARE_SEL + " FROM shares WHERE token=%s FOR UPDATE",
+                    (token,),
+                )
+                share = cur.fetchone()
+                if share is None or not _is_active(share):
+                    return 0
+                cur.execute(
+                    "SELECT id, token, deleted, data FROM rois "
+                    "WHERE data->>'visitor' = %s "
+                    "ORDER BY id "
+                    "FOR UPDATE",
+                    (plaintext_vid,),
+                )
+                rows = cur.fetchall()
+                current_live = 0
+                for row in rows:
+                    roi = dict(row["data"])
+                    if (row.get("token") or roi.get("token")) == token and not (
+                        row.get("deleted") or roi.get("deleted")
+                    ):
+                        current_live += 1
+                if current_live == 0:
+                    return 0
+                for row in rows:
+                    roi = dict(row["data"])
+                    roi["visitor"] = hashed_vid
+                    _update_roi_row(cur, row["id"], roi)
+                return current_live
+    finally:
+        conn.close()
+
+
 def delete_roi(token, index, expected_revision=None):
     """删除该 token 下第 index 条 ROI（置 tombstone）。返回 (bool, annotation_id|None)。
 
@@ -703,10 +788,7 @@ def delete_roi(token, index, expected_revision=None):
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                cur.execute(
-                    "SELECT id, data FROM rois WHERE token=%s AND NOT deleted "
-                    "ORDER BY insert_seq", (token,))
-                same = cur.fetchall()
+                same = _fetch_live_rois_locked(cur, token)
                 if index < 0 or index >= len(same):
                     return False, None
                 rid = same[index]["id"]
@@ -737,7 +819,8 @@ def delete_roi_by_annotation_id(annotation_id, expected_revision=None):
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT id, data FROM rois WHERE annotation_id=%s AND NOT deleted",
+                    "SELECT id, data FROM rois WHERE annotation_id=%s AND NOT deleted "
+                    "FOR UPDATE",
                     (annotation_id,))
                 row = cur.fetchone()
                 if row is None:
@@ -826,10 +909,7 @@ def set_roi_shared(token, index, shared, expected_revision=None):
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                cur.execute(
-                    "SELECT id, data FROM rois WHERE token=%s AND NOT deleted "
-                    "ORDER BY insert_seq", (token,))
-                same = cur.fetchall()
+                same = _fetch_live_rois_locked(cur, token)
                 if index < 0 or index >= len(same):
                     return False
                 rid = same[index]["id"]
@@ -854,10 +934,7 @@ def review_roi(token, index, action):
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                cur.execute(
-                    "SELECT id, data FROM rois WHERE token=%s AND NOT deleted "
-                    "ORDER BY insert_seq", (token,))
-                same = cur.fetchall()
+                same = _fetch_live_rois_locked(cur, token)
                 if index < 0 or index >= len(same):
                     return False
                 rid = same[index]["id"]

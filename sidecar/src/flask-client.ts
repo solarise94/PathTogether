@@ -21,6 +21,8 @@ import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { withTrustedCallback } from "./ssrf-guard.js";
+
 // --------------------------------------------------------------------------- //
 // Types — mirror the Flask response shapes (app.py Step 2 endpoints)
 // --------------------------------------------------------------------------- //
@@ -189,15 +191,17 @@ export class FlaskClient {
 		}
 		let res: Response;
 		try {
-			res = await fetch(url, {
-				method,
-				headers: {
-					"X-AI-Internal-Token": this.token,
-					"Content-Type": "application/json",
-				},
-				body: init?.body !== undefined ? JSON.stringify(init.body) : undefined,
-				signal: controller.signal,
-			});
+			res = await withTrustedCallback(() =>
+				fetch(url, {
+					method,
+					headers: {
+						"X-AI-Internal-Token": this.token,
+						"Content-Type": "application/json",
+					},
+					body: init?.body !== undefined ? JSON.stringify(init.body) : undefined,
+					signal: controller.signal,
+				}),
+			);
 		} finally {
 			clearTimeout(timer);
 			if (external) external.removeEventListener("abort", onExternalAbort);

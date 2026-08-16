@@ -207,6 +207,19 @@ def test_auth_enabled_when_user_exists(monkeypatch):
     check("存在 user → AUTH_ENABLED True", app_mod._resolve_auth_enabled() is True)
 
 
+@json_only  # 损坏 users.json 文件语义；PG 后端无该文件
+def test_corrupt_users_json_refuses_fail_open():
+    """users.json 损坏不得当成空库关闭鉴权。"""
+    p = user_store.USER_FILE
+    p.write_text("{not-json", encoding="utf-8")
+    with pytest.raises(user_store.UserStoreCorrupt):
+        user_store.has_enabled_users()
+    bak = p.with_suffix(".json.bak")
+    check("损坏文件已备份", bak.is_file())
+    with pytest.raises(SystemExit):
+        app_mod._resolve_auth_enabled()
+
+
 # =========================================================================== #
 # 登录
 # =========================================================================== #
@@ -303,6 +316,30 @@ def test_admin_reset_password(monkeypatch):
     r = client.post("/api/admin/users/%s/password" % uid, json={"password": "newpass88"})
     check("owner 重置密码 200", r.status_code == 200)
     check("新密码可登录", user_store.verify_user("u@x.com", "newpass88") is not None)
+
+
+def test_disable_invalidates_existing_session(monkeypatch):
+    """禁用用户后，已有 Flask session 立刻失效（不能再打 /api/*）。"""
+    monkeypatch.setenv("ADMIN_PASSWORD", "owner-pass")
+    app_mod._bootstrap_owner()
+    u = user_store.create_user("u@x.com", "password1", role="user")
+    user_client = make_client()
+    login(user_client, "u@x.com", "password1")
+    r = user_client.get("/api/projects")
+    check("禁用前 /api/projects 200", r.status_code == 200)
+
+    owner_client = make_client()
+    login(owner_client, "admin", "owner-pass")
+    rd = owner_client.post("/api/admin/users/%s/disable" % u["user_id"])
+    check("禁用 user 200", rd.status_code == 200)
+
+    r2 = user_client.get("/api/projects")
+    check("禁用后 /api/projects 401", r2.status_code == 401,
+          "got %s" % r2.status_code)
+    body = json.loads(r2.data)
+    check("禁用后 error=auth_required", body.get("error") == "auth_required")
+    r3 = login(user_client, "u@x.com", "password1")
+    check("禁用期间无法再登录", r3.status_code == 401)
 
 
 # =========================================================================== #

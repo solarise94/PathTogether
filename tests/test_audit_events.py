@@ -376,7 +376,8 @@ def test_share_access_log_dedup():
     token = r.get_json()["token"]
     # 访问分享页（share_server 的 client）
     sc = share_srv.app.test_client()
-    sc.set_cookie("svs_visitor", "visitor-1", domain="localhost", path="/s")
+    sc.set_cookie("svs_visitor", share_srv._sign_visitor("visitor-1"),
+                  domain="localhost", path="/s")
     resp = sc.get("/s/%s" % token)
     assert resp.status_code == 200
     # 连续两次同 token+visitor → 5 分钟窗口内去重只记一条

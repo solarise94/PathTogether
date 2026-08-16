@@ -41,6 +41,11 @@ ROLE_SDK = "sdk"      # 仅常量声明：sdk-user 为插件代理身份，后�
 
 VALID_ROLES = (ROLE_OWNER, ROLE_USER)
 
+
+class UserStoreCorrupt(Exception):
+    """users.json 已存在但损坏/不可读。调用方必须 fail-closed，不得当成空库。"""
+
+
 # 空结构骨架
 _EMPTY = {
     "users": {},
@@ -63,7 +68,11 @@ def _normalize_email(email: str) -> str:
 
 
 def _load_locked(f):
-    """在已锁定的文件对象上读取并解析 JSON；损坏则备份重建。"""
+    """在已锁定的文件对象上读取并解析 JSON。
+
+    空文件（首次 touch）→ 空库。已有内容但损坏 → 备份后抛 UserStoreCorrupt，
+    绝不返回空库（否则鉴权会 fail-open）。
+    """
     f.seek(0)
     raw = f.read()
     if not raw:
@@ -75,20 +84,20 @@ def _load_locked(f):
         data.setdefault("users", {})
         data.setdefault("meta", {"schema_version": 1})
         if not isinstance(data["users"], dict):
-            data["users"] = {}
+            raise ValueError("users not object")
         if not isinstance(data["meta"], dict):
-            data["meta"] = {"schema_version": 1}
+            raise ValueError("meta not object")
         return data
-    except (json.JSONDecodeError, ValueError):
-        # 损坏：备份后重建
-        f.seek(0)
+    except (json.JSONDecodeError, ValueError) as e:
         bak = USER_FILE.with_suffix(".json.bak")
         try:
             with open(bak, "w", encoding="utf-8") as bf:
                 bf.write(raw)
         except Exception:
             pass
-        return _copy_empty()
+        raise UserStoreCorrupt(
+            "users.json 损坏（已备份至 %s）：%s" % (bak.name, e)
+        ) from e
 
 
 def _save_locked(f, data):

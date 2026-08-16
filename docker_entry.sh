@@ -9,8 +9,10 @@
 #            可达，最多 30s，超时退出——启动顺序兜底）。
 #
 # 进程拓扑（all 模式）：
-#   - sidecar（node /app/sidecar/dist/index.js）：仅监听 127.0.0.1:8055，
+#   - sidecar（node /app/sidecar/dist/index.js）：默认监听 127.0.0.1:8055
+#     （AI_SIDECAR_HOST，切勿在 --network host 下改成 0.0.0.0），
 #     通过 /internal/ai/* 回调 Flask（127.0.0.1:$PORT，AI_FLASK_URL 推导）读图/落标注/取变更。
+#     入站 /run|/sessions 等与回调共用 AI_INTERNAL_TOKEN（X-AI-Internal-Token）。
 #   - gunicorn（app:app）：监听 0.0.0.0:$PORT（默认 8000），对外服务管理端，并把
 #     /api/ai/* 代理到 sidecar。
 #
@@ -102,9 +104,11 @@ trap cleanup TERM INT
 # 启动顺序是 sidecar 先于 Flask，但 token 文件由 Flask 首 boot 才创建——
 # sidecar 启动时读不到会直接 ENOENT 退出（鸡生蛋问题）。这里在起 sidecar
 # 前确保文件存在；Flask 的 _load_or_create_ai_internal_token 会读到同一文件。
+# ROLE=sidecar 不在此生成新 token（会与平台容器分叉）；双容器请显式注入
+# AI_INTERNAL_TOKEN，或挂载平台 SHARE_DATA_DIR 以读同一文件。
 # --------------------------------------------------------------------------- #
 SHARE_DATA_DIR="${SHARE_DATA_DIR:-/data/share}"
-if [ -z "${AI_INTERNAL_TOKEN:-}" ]; then
+if [ "$_ROLE" != "sidecar" ] && [ -z "${AI_INTERNAL_TOKEN:-}" ]; then
     TOKEN_FILE="$SHARE_DATA_DIR/ai_internal.token"
     if [ ! -f "$TOKEN_FILE" ]; then
         mkdir -p "$SHARE_DATA_DIR" 2>/dev/null || true
@@ -113,6 +117,11 @@ if [ -z "${AI_INTERNAL_TOKEN:-}" ]; then
             && chmod 600 "$TOKEN_FILE" 2>/dev/null || true
         echo "[entry] generated ai_internal.token" >&2
     fi
+fi
+# 把文件里的 token 导出到 env，使同容器 sidecar 入站鉴权与 Flask 代理头一致。
+if [ -z "${AI_INTERNAL_TOKEN:-}" ] && [ -f "$SHARE_DATA_DIR/ai_internal.token" ]; then
+    AI_INTERNAL_TOKEN="$(tr -d '\n' < "$SHARE_DATA_DIR/ai_internal.token")"
+    export AI_INTERNAL_TOKEN
 fi
 
 # --------------------------------------------------------------------------- #

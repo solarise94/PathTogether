@@ -48,6 +48,26 @@ import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
 from pg_compat import json_only  # noqa: E402
 
+import ipaddress  # noqa: E402
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _ssrf_dns(monkeypatch):
+    """测试用 DNS：IP 字面量按字面；localhost/元数据指向私网；其余给公网 IP。"""
+    def fake_ips(hostname):
+        h = (hostname or "").lower().rstrip(".")
+        try:
+            return [ipaddress.ip_address(h)]
+        except ValueError:
+            pass
+        if h in ("localhost",) or h.endswith(".localhost"):
+            return [ipaddress.ip_address("127.0.0.1")]
+        if h in ("metadata.google.internal", "metadata.goog", "metadata"):
+            return [ipaddress.ip_address("169.254.169.254")]
+        return [ipaddress.ip_address("93.184.216.34")]
+    monkeypatch.setattr(app_mod, "_host_ips", fake_ips)
+
 
 def _client(auth=True):
     app_mod.app.config["TESTING"] = True
@@ -173,6 +193,7 @@ def test_resolve_use_platform_when_platform_configured():
     assert cfg["base_url"] == "http://platform/v1"
     assert cfg["api_key"] == "sk-platform-123456"
     assert cfg["model"] == "gpt-p"
+    assert cfg.get("ssrf_guard") is not True
 
 
 def test_resolve_use_platform_but_platform_missing_falls_to_own():
@@ -185,6 +206,7 @@ def test_resolve_use_platform_but_platform_missing_falls_to_own():
     assert cfg is not None
     assert cfg["base_url"] == "http://own/v1"
     assert cfg["api_key"] == "sk-own-secret"
+    assert cfg.get("ssrf_guard") is True
 
 
 def test_resolve_own_missing_key_returns_none():
@@ -229,6 +251,8 @@ def test_user_config_get_masked_and_platform_fields():
     assert r.status_code == 200
     assert j["platform_configured"] is True
     assert j["using"] == "platform"  # use_platform 缺省 True 且平台已配
+    # platform_model：user 侧“当前生效来源”提示用（不含任何密钥字段）
+    assert j["platform_model"] == "gpt-p"
     # api_key 只回显掩码，不回显明文
     assert "sk-user-long-secret-12345678" not in r.get_data(as_text=True)
     assert j["api_key_mask"]
@@ -307,6 +331,23 @@ def test_ai_run_unauthorized_slide_403():
     r = c.post("/api/ai/run", json={"slide": "a.svs"})
     assert r.status_code == 403
     assert fake.calls == []  # 未转发到 sidecar
+
+
+def test_ai_run_public_readonly_403():
+    """公共只读切片可 view 但不可 annotate，不得起跑并签发写 grant。"""
+    _reset_config()
+    _setup_platform()
+    ua = user_store.create_user("a@x.com", "password1", role="user")
+    ub = user_store.create_user("b@x.com", "password1", role="user")
+    _touch("pub.svs")
+    app_mod.share_store.set_slide_meta(
+        "pub.svs", public=True, owner_user_id=ua["user_id"])
+    fake = _install_fake()
+    c = _client()
+    _login(c, "user", ub["user_id"])
+    r = c.post("/api/ai/run", json={"slide": "pub.svs"})
+    assert r.status_code == 403
+    assert fake.calls == []
 
 
 def test_ai_run_no_credentials_400():
@@ -448,3 +489,38 @@ def test_owner_run_does_not_inject_session_owner():
     sent = fake.calls[-1]["body"] or {}
     cfg = sent.get("config") or {}
     assert "session_owner" not in cfg
+
+
+def test_user_put_loopback_base_url_rejected():
+    _reset_config()
+    _setup_platform()
+    u = user_store.create_user("u@x.com", "password1", role="user")
+    c = _client()
+    _login(c, "user", u["user_id"])
+    r = c.put("/api/ai/config", json={
+        "use_platform": False, "base_url": "http://127.0.0.1:8317/v1",
+        "model": "gpt-own", "api_key": "sk-own-secret-abcdef"})
+    assert r.status_code == 400
+    assert "内网" in (r.get_json() or {}).get("error", "")
+
+
+def test_user_put_link_local_metadata_base_url_rejected():
+    _reset_config()
+    _setup_platform()
+    u = user_store.create_user("u@x.com", "password1", role="user")
+    c = _client()
+    _login(c, "user", u["user_id"])
+    r = c.put("/api/ai/config", json={
+        "use_platform": False, "base_url": "http://169.254.169.254/latest/meta-data/",
+        "model": "m", "api_key": "sk-x"})
+    assert r.status_code == 400
+
+
+def test_build_sidecar_rejects_private_own_url():
+    _reset_config()
+    u = user_store.create_user("u@x.com", "password1", role="user")
+    user_store.set_user_ai_config(u["user_id"], {
+        "use_platform": False, "base_url": "http://10.0.0.1/v1",
+        "model": "gpt-own", "api_key": "sk-own-secret"})
+    cfg = app_mod._build_sidecar_config({"role": "user", "user_id": u["user_id"]})
+    assert cfg is None

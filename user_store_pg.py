@@ -27,6 +27,10 @@ from werkzeug.security import check_password_hash, generate_password_hash
 import pg_store
 
 
+class UserStoreCorrupt(Exception):
+    """JSON 用户库损坏（PG 后端不会抛出；dispatcher 公共名对齐）。"""
+
+
 def _connect():
     """建连接并设 dict_row（本模块所有查询按列名访问，与 psycopg3 默认 tuple 区分）。"""
     conn = pg_store.connect()
@@ -388,19 +392,24 @@ def ensure_owner(email, password):
 def _mirror_user(ret, *a, **k):
     """把 json create_user/ensure_owner 返回的权威用户 dict upsert 进 pg（按 user_id）。
 
+    json 公开返回值经 `_to_public` 去掉 password_hash，不能直接拿来写 pg。
+    这里按 user_id 再读 json 权威记录（含 hash），保证 dual→postgres 切换后仍能登录。
+    已存在的影子行也 upsert（含把旧 bug 写入的空 password_hash 回填为 json 权威 hash）。
     ai_config 原样保留（api_key 已是 app.py 加密形态）；created_at 转浮点写回。
     """
     u = ret if isinstance(ret, dict) else None
     if not u or not u.get("user_id"):
         return
     uid = u["user_id"]
+    # 公开返回值不含 hash；json 权威行才有。
+    import user_store_json as _json
+    authoritative = _json.get_user(uid)
+    if authoritative:
+        u = authoritative
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                cur.execute("SELECT user_id FROM users WHERE user_id=%s", (uid,))
-                if cur.fetchone() is not None:
-                    return  # 已镜像过（ensure_owner 命中已有 owner 时）
                 cur.execute(
                     "INSERT INTO users "
                     "(user_id, email, display_name, password_hash, role, "
@@ -408,6 +417,8 @@ def _mirror_user(ret, *a, **k):
                     "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), %s, %s) "
                     "ON CONFLICT (user_id) DO UPDATE SET "
                     " email=EXCLUDED.email, display_name=EXCLUDED.display_name, "
+                    " password_hash=CASE WHEN EXCLUDED.password_hash <> '' "
+                    "  THEN EXCLUDED.password_hash ELSE users.password_hash END, "
                     " role=EXCLUDED.role, created_at=EXCLUDED.created_at, "
                     " disabled=EXCLUDED.disabled, ai_config=EXCLUDED.ai_config",
                     (uid, u.get("email"), u.get("display_name", ""),
@@ -418,3 +429,43 @@ def _mirror_user(ret, *a, **k):
                 )
     finally:
         conn.close()
+
+
+def repair_empty_password_hashes_from_json():
+    """把 json 权威 password_hash 回填到 pg 中空 hash 的影子行。
+
+    旧 dual `_mirror_user` 曾把 create_user 的公开返回值（无 hash）写成空字符串；
+    那些用户启动时未必再走 create_user/ensure_owner，所以需要一次批量回填。
+    json 文件不存在或无法读取时返回 0（postgres 单后端、测试隔离目录皆安全）。
+    """
+    import user_store_json as _json
+    path = getattr(_json, "USER_FILE", None)
+    if path is None:
+        return 0
+    try:
+        if not path.exists():
+            return 0
+    except OSError:
+        return 0
+    repaired = 0
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                for pub in _json.list_users():
+                    uid = pub.get("user_id") if isinstance(pub, dict) else None
+                    if not uid:
+                        continue
+                    full = _json.get_user(uid)
+                    h = (full or {}).get("password_hash") or ""
+                    if not h:
+                        continue
+                    cur.execute(
+                        "UPDATE users SET password_hash=%s "
+                        "WHERE user_id=%s AND (password_hash IS NULL OR password_hash='')",
+                        (h, uid),
+                    )
+                    repaired += cur.rowcount or 0
+    finally:
+        conn.close()
+    return repaired

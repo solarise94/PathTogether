@@ -100,6 +100,84 @@ def test_dual_create_user_identity(dual, pg_conn):
     assert row["email"] == "dual@x.com"
 
 
+def test_dual_create_user_password_hash_survives_switch(dual, pg_conn):
+    """json create_user 公开返回值不含 hash；pg 镜像必须写入 json 权威 hash。"""
+    _ss, us = dual
+    u = us.create_user("dual-hash@x.com", "password1", role="user")
+    assert "password_hash" not in u
+    import user_store_json
+    import user_store_pg
+    json_user = user_store_json.get_user(u["user_id"])
+    assert json_user and json_user.get("password_hash")
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT password_hash FROM users WHERE user_id=%s",
+                    (u["user_id"],))
+        row = cur.fetchone()
+    assert row is not None
+    assert row["password_hash"]
+    assert row["password_hash"] == json_user["password_hash"]
+    assert user_store_pg.verify_user("dual-hash@x.com", "password1") is not None
+    assert user_store_pg.verify_user("dual-hash@x.com", "wrongpass") is None
+
+
+def test_dual_ensure_owner_password_hash_survives_switch(dual, pg_conn):
+    _ss, us = dual
+    owner = us.ensure_owner("admin", "owner-pass-1")
+    assert owner and owner["user_id"]
+    import user_store_pg
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT password_hash FROM users WHERE user_id=%s",
+                    (owner["user_id"],))
+        row = cur.fetchone()
+    assert row is not None and row["password_hash"]
+    assert user_store_pg.verify_user("admin", "owner-pass-1") is not None
+
+
+def test_dual_mirror_repairs_empty_pg_password_hash(dual, pg_conn):
+    """旧 dual 已写入空 hash 的影子行：再次 _mirror_user 必须回填 json 权威 hash。"""
+    _ss, us = dual
+    u = us.create_user("empty-hash@x.com", "password1", role="user")
+    import user_store_json
+    import user_store_pg
+    json_user = user_store_json.get_user(u["user_id"])
+    assert json_user and json_user.get("password_hash")
+    with pg_conn.cursor() as cur:
+        cur.execute("UPDATE users SET password_hash='' WHERE user_id=%s",
+                    (u["user_id"],))
+        pg_conn.commit()
+        cur.execute("SELECT length(password_hash) AS n FROM users WHERE user_id=%s",
+                    (u["user_id"],))
+        assert cur.fetchone()["n"] == 0
+    assert user_store_pg.verify_user("empty-hash@x.com", "password1") is None
+    user_store_pg._mirror_user(u)  # 公开返回值不含 hash
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT password_hash FROM users WHERE user_id=%s",
+                    (u["user_id"],))
+        row = cur.fetchone()
+    assert row["password_hash"] == json_user["password_hash"]
+    assert user_store_pg.verify_user("empty-hash@x.com", "password1") is not None
+
+
+def test_dual_repair_empty_hashes_without_remirror(dual, pg_conn):
+    """历史用户启动时未必再走 create_user：批量回填仍能修好空 hash。"""
+    _ss, us = dual
+    u = us.create_user("backfill@x.com", "password1", role="user")
+    import user_store_json
+    import user_store_pg
+    json_hash = user_store_json.get_user(u["user_id"])["password_hash"]
+    with pg_conn.cursor() as cur:
+        cur.execute("UPDATE users SET password_hash='' WHERE user_id=%s",
+                    (u["user_id"],))
+        pg_conn.commit()
+    n = user_store_pg.repair_empty_password_hashes_from_json()
+    assert n == 1
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT password_hash FROM users WHERE user_id=%s",
+                    (u["user_id"],))
+        assert cur.fetchone()["password_hash"] == json_hash
+    assert user_store_pg.verify_user("backfill@x.com", "password1") is not None
+
+
 def test_dual_create_share_identity(dual, pg_conn):
     ss, _us = dual
     s = ss.create_share(["a.svs", "b.svs"], 24, roi_sizes=[6.0],

@@ -123,6 +123,33 @@ def _share_permissions(share):
     return clean if clean else list(DEFAULT_PERMISSIONS)
 
 
+def _grant_permissions_of(g):
+    """grant.permissions；旧 grant 无该字段时等同 DEFAULT（view+annotate）。"""
+    perms = g.get("permissions") if isinstance(g, dict) else None
+    if not isinstance(perms, list) or not perms:
+        return list(DEFAULT_PERMISSIONS)
+    clean = [p for p in perms if p in _PERMISSION_ALL]
+    return clean if clean else list(DEFAULT_PERMISSIONS)
+
+
+def _cap_claim_permissions(requested, allowed):
+    """认领权限必须是分享权限的子集。None/空 → 使用分享权限（而非全局 DEFAULT）。"""
+    allowed = list(allowed)
+    if requested is None or requested == []:
+        return allowed
+    if not isinstance(requested, list):
+        raise ValueError("permissions 需为数组")
+    out = []
+    for p in requested:
+        if p not in _PERMISSION_ALL:
+            raise ValueError("permissions 仅支持 view/annotate/download")
+        if p not in allowed:
+            raise ValueError("permissions 超出分享权限")
+        if p not in out:
+            out.append(p)
+    return out if out else allowed
+
+
 def _reject_guest_write(requester_role):
     """仓储边界（docs §5.1.1）：显式传 guest 角色时拒绝图库写操作。
 
@@ -669,8 +696,9 @@ def _grant_out(g):
 def claim_share(token, user_id, permissions=None):
     """user 认领分享链接（幂等）。
 
-    重复认领（同 token + 同 user，且未 revoke）返回已有 grant，不新建。
-    permissions 归一化（None → 默认 view+annotate）。
+    重复认领（同 token + 同 user，且未 revoke）返回已有 grant；权限被夹到当前
+    分享权限子集（修复旧的越权 grant）。缺省 permissions 使用分享权限，而不是
+    全局 DEFAULT（避免 view-only 分享被认领成 annotate）。
     返回 grant dict。不校验 share 是否 active —— 由调用方（app.py）先用 get_share
     判定；本函数只负责记录认领关系。
     """
@@ -678,10 +706,13 @@ def claim_share(token, user_id, permissions=None):
         raise ValueError("token 不能为空")
     if not isinstance(user_id, str) or not user_id:
         raise ValueError("user_id 不能为空")
-    perms = _normalize_permissions(permissions)
 
     def _do(f):
         data = _load_locked(f)
+        shares = data.get("shares") or {}
+        share = shares.get(token) if isinstance(shares, dict) else None
+        allowed = _share_permissions(share) if share is not None else list(
+            DEFAULT_PERMISSIONS)
         grants = data.setdefault("grants", [])
         if not isinstance(grants, list):
             grants = []
@@ -689,7 +720,17 @@ def claim_share(token, user_id, permissions=None):
         for g in grants:
             if (g.get("share_token") == token and g.get("user_id") == user_id
                     and g.get("revoked_at") is None):
+                if permissions is not None:
+                    perms = _cap_claim_permissions(permissions, allowed)
+                else:
+                    perms = [p for p in _grant_permissions_of(g) if p in allowed]
+                    if not perms:
+                        perms = list(allowed)
+                if list(g.get("permissions") or []) != list(perms):
+                    g["permissions"] = list(perms)
+                    _save_locked(f, data)
                 return _grant_out(g)
+        perms = _cap_claim_permissions(permissions, allowed)
         g = {
             "grant_id": "grt_" + secrets.token_urlsafe(8),
             "user_id": user_id,
@@ -705,13 +746,16 @@ def claim_share(token, user_id, permissions=None):
     return _with_lock("r+", _do)
 
 
-def claimed_active_slides_for_user(user_id):
+def claimed_active_slides_for_user(user_id, permission=None):
     """返回该 user 认领过的、且对应 share 仍 active 的切片名集合。
 
     grant.revoked_at 非 None 或 share 不存在/已撤销/已过期均不计入
     （share 撤销/过期后 grant 自动失效）。
+    permission 若给出（view/annotate/download），只计入 grant 含该权限的切片。
     """
     if not user_id:
+        return set()
+    if permission is not None and permission not in _PERMISSION_ALL:
         return set()
 
     def _do(f):
@@ -723,6 +767,8 @@ def claimed_active_slides_for_user(user_id):
             if g.get("user_id") != user_id:
                 continue
             if g.get("revoked_at") is not None:
+                continue
+            if permission is not None and permission not in _grant_permissions_of(g):
                 continue
             tok = g.get("share_token")
             share = shares.get(tok) if isinstance(tok, str) else None
@@ -1115,6 +1161,44 @@ def get_roi_by_annotation_id(annotation_id):
             if r.get("annotation_id") == annotation_id:
                 return dict(r)
         return None
+
+    return _with_lock("r+", _do)
+
+
+def rehash_plaintext_visitors(token, plaintext_vid, hashed_vid):
+    """当前 token 的 share 仍 active 且确有匹配明文时，原子迁移所有 token 的相同 visitor。
+
+    必须在本文件锁内先验证 share 存在、未撤销、未过期，再改写 ROI：
+    `_bind_visitor` 早于路由 `_require_share`，只在 Flask 层 get_share 会留下
+    撤销并发窗口。签名 HMAC 不绑定 token，故证明通过后仍全局迁移（含 tombstone）。
+    不 bump revision。返回当前 token 下活 ROI 迁移条数；未通过则 0 且不改写。
+    """
+    if not token or not plaintext_vid or not hashed_vid:
+        return 0
+    if not isinstance(plaintext_vid, str) or not isinstance(hashed_vid, str):
+        return 0
+    if plaintext_vid.startswith("h1.") or hashed_vid == plaintext_vid:
+        return 0
+
+    def _do(f):
+        data = _load_locked(f)
+        share = (data.get("shares") or {}).get(token)
+        if share is None or not _is_active(share):
+            return 0
+        matched = []
+        current_live = 0
+        for r in data.get("rois") or []:
+            if (r.get("visitor") or "") != plaintext_vid:
+                continue
+            matched.append(r)
+            if r.get("token") == token and not r.get("deleted"):
+                current_live += 1
+        if current_live == 0:
+            return 0
+        for r in matched:
+            r["visitor"] = hashed_vid
+        _save_locked(f, data)
+        return current_live
 
     return _with_lock("r+", _do)
 

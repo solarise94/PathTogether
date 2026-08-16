@@ -195,11 +195,12 @@ python3 app.py
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `AI_SIDECAR_PORT` | 8055 | sidecar 监听端口（仅 127.0.0.1） |
+| `AI_SIDECAR_PORT` | 8055 | sidecar 监听端口 |
+| `AI_SIDECAR_HOST` | 127.0.0.1 | sidecar 监听地址。`--network host` 必须保持 loopback；仅私有容器网络且不发布宿主端口时才设 `0.0.0.0`（此时必须有 `AI_INTERNAL_TOKEN`，否则拒绝启动） |
 | `AI_FLASK_URL` | `http://127.0.0.1:8000` | sidecar 回调 Flask 的基础 URL |
 | `AI_SIDECAR_URL` | `http://127.0.0.1:8055` | Flask 代理 `/api/ai/*` 到 sidecar 的 URL |
 | `AI_SESSIONS_DIR` | `~/.svs-sidecar/sessions` | sidecar 会话存储目录（Stage 4-3 起独立，不再与平台 `SHARE_DATA_DIR` 混放；同容器由 `docker_entry.sh` 显式指向 `/data/sidecar-sessions`） |
-| `AI_INTERNAL_TOKEN` | （空 → 读文件） | sidecar ↔ Flask 内部回调共享 token；空则两边从 `SHARE_DATA_DIR/ai_internal.token`（0600）读取 |
+| `AI_INTERNAL_TOKEN` | （空 → 读文件） | sidecar ↔ Flask 双向内部 token（Flask `/internal/ai/*` 与 sidecar `/run` 等，除 `/healthz`）；空则两边从 `SHARE_DATA_DIR/ai_internal.token`（0600）读取 |
 | `ROLE` | `all` | 容器进程拓扑：`all`（双进程，缺省）/ `platform`（只 gunicorn）/ `sidecar`（只 sidecar，见下） |
 | `SHARE_DATA_DIR` | `~/svs-viewer/share-data`（容器内 `/data/share`） | 平台数据目录（AI 配置/密钥文件；会话已迁出到 `AI_SESSIONS_DIR`） |
 

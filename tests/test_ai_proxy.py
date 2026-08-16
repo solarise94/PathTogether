@@ -194,6 +194,9 @@ def test_run_proxies_with_decrypted_config_and_sse():
         check("run config 含调优字段 keep_recent_images", cfg.get("keep_recent_images") == 7)
         check("run config 含 api_protocol", cfg.get("api_protocol") == "openai")
         check("run body task 透传", body.get("task") == "看全片")
+        check("run 带内部 token",
+              (headers or {}).get("X-AI-Internal-Token") == app_mod.AI_INTERNAL_TOKEN,
+              "headers=%r" % headers)
         return FakeResponse(200, sse_frames=frames,
                             headers={"X-AI-Session-ID": "sess-run-1"})
 

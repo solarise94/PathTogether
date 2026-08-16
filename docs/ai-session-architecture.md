@@ -64,9 +64,10 @@ docker_entry.sh
 | 变量 | 缺省 | 说明 |
 |---|---|---|
 | `AI_SIDECAR_PORT` | 8055 | sidecar 监听端口 |
+| `AI_SIDECAR_HOST` | 127.0.0.1 | sidecar 监听地址。host 网络必须 loopback；`0.0.0.0` 仅用于不发布端口的私有容器网络，且必须配置 `AI_INTERNAL_TOKEN`（否则拒绝启动） |
 | `AI_FLASK_URL` | `http://127.0.0.1:8000` | sidecar 回调 Flask 的基础 URL |
 | `AI_SIDECAR_URL` | `http://127.0.0.1:8055` | Flask 代理 `/api/ai/*` 到 sidecar 的基础 URL |
-| `AI_INTERNAL_TOKEN` | （空 → 读文件） | sidecar ↔ Flask 内部回调共享 token；空则两边各自从 `SHARE_DATA_DIR/ai_internal.token`（0600）读取/生成，fcntl 锁保证 gunicorn 多 worker 首次生成只写一次 |
+| `AI_INTERNAL_TOKEN` | （空 → 读文件） | sidecar ↔ Flask 双向内部 token（`/internal/ai/*` 与 sidecar `/run` 等，`/healthz` 除外）；空则两边各自从 `SHARE_DATA_DIR/ai_internal.token`（0600）读取/生成，fcntl 锁保证 gunicorn 多 worker 首次生成只写一次 |
 | `SHARE_DATA_DIR` | `~/svs-viewer/share-data`（容器内 `/data/share`） | 会话存储根目录（`ai_sessions/` 子目录）；同时是 `ai_config.json` / `flask_secret.key` / `ai_internal.token` / `ai_secret.key` 所在目录 |
 
 **注意**：sidecar **不读** `ai_config.json`。每请求的引擎配置（`base_url` / `api_key` 明文 / `model` / `api_protocol` + 全部调优参数）由 Flask 在 `/api/ai/*` 代理时注入到 body 的 `config` 字段（`app.py:_build_sidecar_config`）。这样 api_key 只在 Flask 解密后短暂出现在内存与 loopback 请求里，不落 sidecar 磁盘。
@@ -88,7 +89,7 @@ docker_entry.sh
 
 ### 3.2 `/api/ai/*`（浏览器 → Flask → sidecar，代理契约）
 
-Flask 把这些端点**字节级透传**到 sidecar（普通端点 `_proxy_json`，SSE 端点 `_proxy_sse`：流式透传、状态码原样、`Last-Event-ID` / `after_seq` 透传）。sidecar 不可达 → 503。请求 body 里 Flask 注入 `config`。
+Flask 把这些端点**字节级透传**到 sidecar（普通端点 `_proxy_json`，SSE 端点 `_proxy_sse`：流式透传、状态码原样、`Last-Event-ID` / `after_seq` 透传），并带 `X-AI-Internal-Token`。sidecar 在配置了 token 时校验该头（`/healthz` 除外）。sidecar 不可达 → 503。请求 body 里 Flask 注入 `config`。
 
 | Flask 端点 | 方法 | sidecar 路径 | body / query | 说明 |
 |---|---|---|---|---|

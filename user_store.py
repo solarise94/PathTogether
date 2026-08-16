@@ -54,6 +54,7 @@ _JSON_PUBLIC_NAMES = (
     "ROLE_GUEST",
     "ROLE_SDK",
     "VALID_ROLES",
+    "UserStoreCorrupt",
     # —— 函数 ——
     "create_user",
     "get_user",

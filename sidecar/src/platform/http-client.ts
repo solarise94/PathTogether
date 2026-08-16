@@ -25,6 +25,8 @@
  */
 import { createHash } from "node:crypto";
 
+import { withTrustedCallback } from "../ssrf-guard.js";
+
 import {
 	CAPABILITY_NOT_SUPPORTED,
 	ContractError,
@@ -96,7 +98,9 @@ export class PathTogatherHttpClient implements PlatformClient {
 		this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
 		this.installationId = opts.installationId;
 		this.secret = opts.secret;
-		this.doFetch = opts.fetch ?? fetch;
+		const rawFetch = opts.fetch ?? fetch;
+		this.doFetch = ((input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+			withTrustedCallback(() => rawFetch(input, init))) as typeof fetch;
 		this.marginMs = (opts.tokenMarginSec ?? 60) * 1000;
 	}
 

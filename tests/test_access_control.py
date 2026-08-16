@@ -50,7 +50,7 @@ import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
 import share_server as share_srv  # noqa: E402
-from pg_compat import json_only  # noqa: E402
+from pg_compat import json_only, BACKEND  # noqa: E402
 
 # 强制 UPLOAD_DIR 指回本次临时目录（其它测试可能先 import app 改写了它）
 app_mod.UPLOAD_DIR = Path(UPLOAD_DIR)
@@ -453,6 +453,354 @@ def test_claim_invalid_share_404():
     _login(cb, "b@x.com", "userBpass1")
     r = cb.post("/api/share/nope/claim")
     assert r.status_code == 404
+
+
+def test_claim_view_only_cannot_escalate_or_annotate():
+    """view-only 分享：客户端不可自行提升为 annotate；认领后也不能落标。"""
+    owner, userA, userB = _setup_users()
+    so = _touch("owner.svs")
+    _own(so, owner["user_id"])
+    share = share_store.create_share([so], 24, permissions=["view"])
+    token = share["token"]
+
+    cb = _client()
+    _login(cb, "b@x.com", "userBpass1")
+    r = cb.post("/api/share/%s/claim" % token,
+                json={"permissions": ["view", "annotate"]})
+    assert r.status_code == 400, r.get_data(as_text=True)
+
+    r = cb.post("/api/share/%s/claim" % token)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    grant = r.get_json()
+    assert grant["permissions"] == ["view"]
+    assert "annotate" not in grant["permissions"]
+
+    names = {i["name"] for i in cb.get("/api/slides").get_json()}
+    assert so in names
+    r2 = _post_anno(cb, so)
+    assert r2.status_code == 403
+
+
+def test_share_visitor_cannot_impersonate_via_copied_id():
+    """分享端 ROI 响应不含 visitor；复制明文 cookie 不能冒用他人私有标注。"""
+    _setup_users()
+    _touch("demo.svs")
+    share = share_store.create_share(["demo.svs"], 1)
+    token = share["token"]
+    c1 = _share_client()
+    r = c1.post("/s/%s/api/roi" % token, json=_valid_roi_body("demo.svs"))
+    assert r.status_code == 200, r.get_data(as_text=True)
+    listed = c1.get("/s/%s/api/rois" % token).get_json()
+    assert listed
+    assert all("visitor" not in item for item in listed)
+    idx = listed[0]["index"]
+
+    c2 = _share_client()
+    c2.set_cookie("svs_visitor", "copied-plaintext-id", domain="localhost", path="/s")
+    listed2 = c2.get("/s/%s/api/rois" % token).get_json()
+    assert not any(item.get("index") == idx and item.get("source") == "me"
+                   for item in listed2)
+    r2 = c2.patch("/s/%s/api/roi/%s" % (token, idx), json={"note": "pwn"})
+    assert r2.status_code in (403, 404)
+
+
+def test_legacy_plaintext_visitor_reclaim_then_blocks_copy():
+    """升级前明文 visitor：原设备 unsigned cookie 可认领；认领后复制无法再冒用。"""
+    _setup_users()
+    _touch("demo.svs")
+    share = share_store.create_share(["demo.svs"], 1)
+    token = share["token"]
+    roi = share_store.add_roi(
+        token, "demo.svs", "L", type="rect", x=0, y=0, side_px=100, size_mm=6.0,
+        visitor="legacy-device-1")
+    idx = roi["index"]
+
+    owner_c = _share_client()
+    owner_c.set_cookie("svs_visitor", "legacy-device-1", domain="localhost", path="/s")
+    listed = owner_c.get("/s/%s/api/rois" % token).get_json()
+    assert any(item.get("index") == idx and item.get("source") == "me" for item in listed)
+    stored = share_store.get_roi(token, idx)
+    assert stored["visitor"].startswith("h1.")
+    r = owner_c.patch("/s/%s/api/roi/%s" % (token, idx), json={"note": "still mine"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+
+    attacker = _share_client()
+    attacker.set_cookie("svs_visitor", "legacy-device-1", domain="localhost", path="/s")
+    listed2 = attacker.get("/s/%s/api/rois" % token).get_json()
+    assert not any(item.get("index") == idx and item.get("source") == "me"
+                   for item in listed2)
+    r2 = attacker.patch("/s/%s/api/roi/%s" % (token, idx), json={"note": "pwn"})
+    assert r2.status_code in (403, 404)
+
+
+def test_legacy_reclaim_migrates_all_tokens_not_just_current():
+    """认领 A 时同步哈希 B；攻击者不能借未迁移的 B 重铸同一签名身份。"""
+    _setup_users()
+    _touch("demo.svs")
+    share_a = share_store.create_share(["demo.svs"], 1)
+    share_b = share_store.create_share(["demo.svs"], 1)
+    token_a, token_b = share_a["token"], share_b["token"]
+    roi_a = share_store.add_roi(
+        token_a, "demo.svs", "L", type="rect", x=0, y=0, side_px=100, size_mm=6.0,
+        visitor="legacy-device-1")
+    roi_b = share_store.add_roi(
+        token_b, "demo.svs", "L", type="rect", x=10, y=10, side_px=100, size_mm=6.0,
+        visitor="legacy-device-1")
+
+    owner_c = _share_client()
+    owner_c.set_cookie("svs_visitor", "legacy-device-1", domain="localhost", path="/s")
+    listed = owner_c.get("/s/%s/api/rois" % token_a).get_json()
+    assert any(item.get("index") == roi_a["index"] and item.get("source") == "me"
+               for item in listed)
+    assert share_store.get_roi(token_a, roi_a["index"])["visitor"].startswith("h1.")
+    assert share_store.get_roi(token_b, roi_b["index"])["visitor"].startswith("h1.")
+
+    attacker = _share_client()
+    attacker.set_cookie("svs_visitor", "legacy-device-1", domain="localhost", path="/s")
+    listed_b = attacker.get("/s/%s/api/rois" % token_b).get_json()
+    assert not any(item.get("index") == roi_b["index"] and item.get("source") == "me"
+                   for item in listed_b)
+    assert attacker.patch(
+        "/s/%s/api/roi/%s" % (token_b, roi_b["index"]), json={"note": "pwn"}
+    ).status_code in (403, 404)
+    listed_a = attacker.get("/s/%s/api/rois" % token_a).get_json()
+    assert not any(item.get("index") == roi_a["index"] and item.get("source") == "me"
+                   for item in listed_a)
+    assert attacker.patch(
+        "/s/%s/api/roi/%s" % (token_a, roi_a["index"]), json={"note": "pwn"}
+    ).status_code in (403, 404)
+
+
+def _cookie_val(client, name):
+    c = client.get_cookie(name, domain="localhost", path="/s")
+    return None if c is None else c.value
+
+
+def _expire_share(token):
+    """把 share 的 expires_at 拨到过去（JSON 写文件 / PG 更新行）。"""
+    if BACKEND == "postgres":
+        import psycopg
+        conn = psycopg.connect(os.environ["DATABASE_URL"])
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE shares SET expires_at = to_timestamp(1) WHERE token=%s",
+                    (token,),
+                )
+                assert cur.rowcount == 1
+        finally:
+            conn.close()
+    else:
+        path = Path(share_store.SHARE_FILE)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["shares"][token]["expires_at"] = 1.0
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _two_shares_same_visitor():
+    _setup_users()
+    _touch("demo.svs")
+    share_a = share_store.create_share(["demo.svs"], 1)
+    share_b = share_store.create_share(["demo.svs"], 1)
+    token_a, token_b = share_a["token"], share_b["token"]
+    roi_a = share_store.add_roi(
+        token_a, "demo.svs", "L", type="rect", x=0, y=0, side_px=100, size_mm=6.0,
+        visitor="legacy-device-1")
+    roi_b = share_store.add_roi(
+        token_b, "demo.svs", "L", type="rect", x=10, y=10, side_px=100, size_mm=6.0,
+        visitor="legacy-device-1")
+    return token_a, token_b, roi_a, roi_b
+
+
+def _assert_inactive_token_does_not_reclaim(
+        inactive_token, live_token, live_roi, status=404, inactive_roi=None):
+    """无效 token 不得当场全局迁移。
+
+    响应会保留 svs_visitor_mig（规格：之后在有效链接上仍可先到先得）。
+    本断言另开客户端、只复制随机 v2、不带 mig，证明「无效链接本身」没有
+    把身份迁走；不是「mig cookie 不存在」。
+    """
+    attacker = _share_client()
+    attacker.set_cookie("svs_visitor", "legacy-device-1", domain="localhost", path="/s")
+    r = attacker.get("/s/%s/api/rois" % inactive_token)
+    assert r.status_code == status
+    live = share_store.get_roi(live_token, live_roi["index"])
+    assert live["visitor"] == "legacy-device-1"
+    if inactive_roi is not None:
+        stored = share_store.get_roi(inactive_token, inactive_roi["index"])
+        assert stored["visitor"] == "legacy-device-1"
+    signed = _cookie_val(attacker, "svs_visitor")
+    assert signed and signed.startswith("v2.")
+    assert _cookie_val(attacker, "svs_visitor_mig") == "legacy-device-1"
+    other = _share_client()
+    other.set_cookie("svs_visitor", signed, domain="localhost", path="/s")
+    listed = other.get("/s/%s/api/rois" % live_token).get_json()
+    assert not any(item.get("index") == live_roi["index"] and item.get("source") == "me"
+                   for item in listed)
+    assert other.patch(
+        "/s/%s/api/roi/%s" % (live_token, live_roi["index"]), json={"note": "pwn"}
+    ).status_code in (403, 404)
+
+
+def test_revoked_share_cannot_reclaim_visitor():
+    """已撤销链接返回 404，当场不得全局迁移（另开客户端只带 v2）。"""
+    token_a, token_b, roi_a, roi_b = _two_shares_same_visitor()
+    assert share_store.revoke_share(token_a)
+    _assert_inactive_token_does_not_reclaim(
+        token_a, token_b, roi_b, inactive_roi=roi_a)
+
+
+def test_expired_share_cannot_reclaim_visitor():
+    """过期链接返回 404，当场不得全局迁移（另开客户端只带 v2）。"""
+    token_a, token_b, roi_a, roi_b = _two_shares_same_visitor()
+    _expire_share(token_a)
+    _assert_inactive_token_does_not_reclaim(
+        token_a, token_b, roi_b, inactive_roi=roi_a)
+
+
+def test_missing_share_cannot_reclaim_visitor():
+    """不存在的 token 返回 404，当场不得迁移；只复制 v2 不能编辑有效链接。"""
+    _setup_users()
+    _touch("demo.svs")
+    share_b = share_store.create_share(["demo.svs"], 1)
+    token_b = share_b["token"]
+    roi_b = share_store.add_roi(
+        token_b, "demo.svs", "L", type="rect", x=10, y=10, side_px=100, size_mm=6.0,
+        visitor="legacy-device-1")
+    _assert_inactive_token_does_not_reclaim("not-a-real-token", token_b, roi_b)
+
+
+def test_revoked_share_same_client_fcfs_on_valid_token():
+    """无效链接保留 mig cookie：同一客户端随后访问仍有效的 token 可先到先得认领。"""
+    token_a, token_b, roi_a, roi_b = _two_shares_same_visitor()
+    assert share_store.revoke_share(token_a)
+    c = _share_client()
+    c.set_cookie("svs_visitor", "legacy-device-1", domain="localhost", path="/s")
+    assert c.get("/s/%s/api/rois" % token_a).status_code == 404
+    assert share_store.get_roi(token_a, roi_a["index"])["visitor"] == "legacy-device-1"
+    assert _cookie_val(c, "svs_visitor_mig") == "legacy-device-1"
+    listed = c.get("/s/%s/api/rois" % token_b).get_json()
+    assert any(item.get("index") == roi_b["index"] and item.get("source") == "me"
+               for item in listed)
+    assert c.patch(
+        "/s/%s/api/roi/%s" % (token_b, roi_b["index"]), json={"note": "fcfs"}
+    ).status_code == 200
+    assert share_store.get_roi(token_b, roi_b["index"])["visitor"].startswith("h1.")
+    assert _cookie_val(c, "svs_visitor_mig") in (None, "")
+
+
+def test_legacy_mig_cookie_survives_s_then_reclaims():
+    """先访问 /s 不得销毁旧身份；随后正确链接仍可认领。"""
+    _setup_users()
+    _touch("demo.svs")
+    share = share_store.create_share(["demo.svs"], 1)
+    token = share["token"]
+    roi = share_store.add_roi(
+        token, "demo.svs", "L", type="rect", x=0, y=0, side_px=100, size_mm=6.0,
+        visitor="legacy-device-1")
+    idx = roi["index"]
+
+    c = _share_client()
+    c.set_cookie("svs_visitor", "legacy-device-1", domain="localhost", path="/s")
+    r = c.get("/s")
+    assert r.status_code == 404
+    assert _cookie_val(c, "svs_visitor_mig") == "legacy-device-1"
+    signed = _cookie_val(c, "svs_visitor")
+    assert signed and signed.startswith("v2.")
+
+    listed = c.get("/s/%s/api/rois" % token).get_json()
+    assert any(item.get("index") == idx and item.get("source") == "me" for item in listed)
+    assert c.patch("/s/%s/api/roi/%s" % (token, idx), json={"note": "still mine"}).status_code == 200
+    assert share_store.get_roi(token, idx)["visitor"].startswith("h1.")
+    assert _cookie_val(c, "svs_visitor_mig") in (None, "")
+
+
+def test_legacy_mig_cookie_survives_wrong_token_then_reclaims():
+    """错误 token / 过期链接覆盖签名 cookie 后，mig 凭据仍能在正确链接认领。"""
+    _setup_users()
+    _touch("demo.svs")
+    share_a = share_store.create_share(["demo.svs"], 1)
+    share_b = share_store.create_share(["demo.svs"], 1)
+    token_a, token_b = share_a["token"], share_b["token"]
+    roi = share_store.add_roi(
+        token_a, "demo.svs", "L", type="rect", x=0, y=0, side_px=100, size_mm=6.0,
+        visitor="legacy-device-1")
+    idx = roi["index"]
+
+    c = _share_client()
+    c.set_cookie("svs_visitor", "legacy-device-1", domain="localhost", path="/s")
+    assert c.get("/s/%s/api/rois" % token_b).status_code == 200
+    assert _cookie_val(c, "svs_visitor_mig") == "legacy-device-1"
+    assert c.get("/s/not-a-real-token/api/rois").status_code == 404
+    assert _cookie_val(c, "svs_visitor_mig") == "legacy-device-1"
+
+    listed = c.get("/s/%s/api/rois" % token_a).get_json()
+    assert any(item.get("index") == idx and item.get("source") == "me" for item in listed)
+    assert c.patch("/s/%s/api/roi/%s" % (token_a, idx), json={"note": "still mine"}).status_code == 200
+
+
+def test_reclaim_keeps_v2_identity_and_interim_roi_ownership():
+    """错误 token 上用随机 v2 新建的 ROI，认领后仍可编辑（不切换主 cookie）。"""
+    _setup_users()
+    _touch("demo.svs")
+    share_a = share_store.create_share(["demo.svs"], 1)
+    share_b = share_store.create_share(["demo.svs"], 1)
+    token_a, token_b = share_a["token"], share_b["token"]
+    old = share_store.add_roi(
+        token_a, "demo.svs", "L", type="rect", x=0, y=0, side_px=100, size_mm=6.0,
+        visitor="legacy-device-1")
+    old_idx = old["index"]
+
+    c = _share_client()
+    c.set_cookie("svs_visitor", "legacy-device-1", domain="localhost", path="/s")
+    assert c.get("/s/%s/api/rois" % token_b).status_code == 200
+    assert _cookie_val(c, "svs_visitor_mig") == "legacy-device-1"
+    v2_before = _cookie_val(c, "svs_visitor")
+    assert v2_before and v2_before.startswith("v2.")
+
+    created = c.post("/s/%s/api/roi" % token_b, json=_valid_roi_body("demo.svs"))
+    assert created.status_code == 200, created.get_data(as_text=True)
+    new_idx = created.get_json()["index"]
+    assert c.patch(
+        "/s/%s/api/roi/%s" % (token_b, new_idx), json={"note": "before reclaim"}
+    ).status_code == 200
+
+    listed_a = c.get("/s/%s/api/rois" % token_a).get_json()
+    assert any(item.get("index") == old_idx and item.get("source") == "me"
+               for item in listed_a)
+    assert _cookie_val(c, "svs_visitor") == v2_before
+    assert _cookie_val(c, "svs_visitor_mig") in (None, "")
+    vid = share_srv._parse_visitor_cookie(v2_before)
+    assert share_store.get_roi(token_a, old_idx)["visitor"] == share_srv._visitor_stored(vid)
+    assert c.patch(
+        "/s/%s/api/roi/%s" % (token_a, old_idx), json={"note": "old still mine"}
+    ).status_code == 200
+    assert c.patch(
+        "/s/%s/api/roi/%s" % (token_b, new_idx), json={"note": "new still mine"}
+    ).status_code == 200
+
+
+def test_visitor_hmac_secret_locked_create_is_stable():
+    """多线程首次创建 visitor_hmac.key 得到同一密钥。"""
+    import threading
+    share_srv._visitor_secret_cache = None
+    secret_file = Path(share_store.SHARE_DATA_DIR) / "visitor_hmac.key"
+    if secret_file.exists():
+        secret_file.unlink()
+    results = []
+
+    def worker():
+        results.append(share_srv._visitor_hmac_secret())
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(results) == 8
+    assert len(set(results)) == 1
+    assert secret_file.is_file()
 
 
 # =========================================================================== #

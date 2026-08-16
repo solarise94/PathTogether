@@ -7,6 +7,8 @@
 与主应用通过共享 JSON 文件（share_store）+ 共享上传目录（UPLOAD_DIR）交换数据。
 """
 
+import hashlib
+import hmac
 import io
 import os
 import secrets
@@ -19,6 +21,7 @@ from flask import (
     Flask,
     Response,
     abort,
+    g,
     jsonify,
     render_template,
     request,
@@ -186,10 +189,15 @@ def _read_metadata(osr: OpenSlide, path: Path) -> dict:
 # --------------------------------------------------------------------------- #
 # 安全核心：token 与 slide 校验
 # --------------------------------------------------------------------------- #
-# 设备级访客身份：为每个访问 /s/* 的设备静默分配一个 cookie（svs_visitor）。
-# 该设备创建的标注会记录 visitor，仅允许同一 visitor 编辑/删除自己新建的标记，
-# 避免同链接其他设备（或其他分享用户）误改他人标记。
+# 设备级访客身份：为每个访问 /s/* 的设备静默分配签名 cookie（svs_visitor）。
+# 该设备创建的标注会记录 visitor 的 HMAC 哈希，仅允许同一访客编辑/删除自己新建
+# 的标记。API 响应不回传原始 visitor，避免复制 cookie 冒用。
 VISITOR_COOKIE = "svs_visitor"
+VISITOR_MIG_COOKIE = "svs_visitor_mig"
+_VISITOR_COOKIE_PREFIX = "v2."
+_VISITOR_STORED_PREFIX = "h1."
+# (path, secret_bytes)；路径变化（测试隔离）时自动失效
+_visitor_secret_cache = None
 
 
 def _is_secure():
@@ -198,41 +206,233 @@ def _is_secure():
     return bool(cert) and os.path.exists(cert)
 
 
-def _visitor_id():
-    """返回当前请求的访客标识（cookie）；无 cookie 时返回 None。
+def _visitor_data_dir() -> Path:
+    d = getattr(share_store, "SHARE_DATA_DIR", None)
+    if d:
+        return Path(d)
+    return Path(os.environ.get("SHARE_DATA_DIR") or (Path.home() / "svs-viewer" / "share-data"))
 
-    首次访问 /s/* 的请求由 _ensure_visitor_cookie 在响应阶段补 cookie；
-    该请求本身没有 visitor，属于"游客"（不持有任何可编辑标注的归属）。
+
+def _visitor_hmac_secret() -> bytes:
+    """HMAC 密钥：SHARE_DATA_DIR/visitor_hmac.key（0600），跨进程复用。
+
+    gunicorn 多 worker 首启与 Flask secret 相同：fcntl 排他锁 + 双检 + 临时文件
+    原子替换；进程内按路径缓存，避免每次请求读盘。
     """
-    return request.cookies.get(VISITOR_COOKIE)
+    global _visitor_secret_cache
+    data_dir = _visitor_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    secret_file = data_dir / "visitor_hmac.key"
+    path_key = str(secret_file)
+    cached = _visitor_secret_cache
+    if cached and cached[0] == path_key:
+        return cached[1]
+
+    def _read_or_create_locked():
+        if secret_file.is_file():
+            try:
+                raw = secret_file.read_text(encoding="utf-8").strip()
+                if raw:
+                    return raw.encode("utf-8")
+            except OSError:
+                pass
+        key = secrets.token_hex(32)
+        tmp = secret_file.with_name(secret_file.name + ".tmp")
+        tmp.write_text(key, encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, secret_file)
+        try:
+            os.chmod(secret_file, 0o600)
+        except OSError:
+            pass
+        return key.encode("utf-8")
+
+    try:
+        import fcntl
+        lock_file = data_dir / "visitor_hmac.lock"
+        with open(lock_file, "a+") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                key_bytes = _read_or_create_locked()
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    except (ImportError, OSError):
+        key_bytes = _read_or_create_locked()
+
+    _visitor_secret_cache = (path_key, key_bytes)
+    return key_bytes
+
+
+def _sign_visitor(vid: str) -> str:
+    sig = hmac.new(_visitor_hmac_secret(), vid.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    return "%s%s.%s" % (_VISITOR_COOKIE_PREFIX, vid, sig)
+
+
+def _parse_visitor_cookie(raw):
+    """校验签名 cookie，返回 visitor id；非法 cookie 返回 None。
+
+    旧 unsigned cookie 不在这里接受；由 _bind_visitor 结合 svs_visitor_mig
+    走「当前 token 有明文证明 → 全局迁移」认领。
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    if not raw.startswith(_VISITOR_COOKIE_PREFIX):
+        return None
+    rest = raw[len(_VISITOR_COOKIE_PREFIX):]
+    vid, sep, sig = rest.partition(".")
+    if not sep or not vid or not sig:
+        return None
+    expected = hmac.new(
+        _visitor_hmac_secret(), vid.encode("utf-8"), hashlib.sha256
+    ).hexdigest()[:32]
+    if not hmac.compare_digest(sig, expected):
+        return None
+    return vid
+
+
+def _visitor_stored(vid):
+    """落库用的 visitor 哈希（不含原始 id）。"""
+    if not vid:
+        return ""
+    digest = hmac.new(
+        _visitor_hmac_secret(), vid.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return _VISITOR_STORED_PREFIX + digest
+
+
+def _visitor_id():
+    """当前请求的访客 id（before_request 绑定）；无则 None。"""
+    return getattr(g, "visitor_id", None)
+
+
+def _share_token_from_path(path):
+    """从 /s/<token>/... 抽出 share token；无则 None。"""
+    if not path:
+        return None
+    parts = path.split("/")
+    if len(parts) >= 3 and parts[1] == "s" and parts[2]:
+        return parts[2]
+    return None
+
+
+def _legacy_plaintext(raw):
+    """从 cookie 取出升级前的 unsigned visitor id；签名/空值返回 None。"""
+    if not raw or not isinstance(raw, str):
+        return None
+    if raw.startswith(_VISITOR_COOKIE_PREFIX) or raw.startswith(_VISITOR_STORED_PREFIX):
+        return None
+    return raw
+
+
+def _reclaim_legacy_visitor(token, plaintext_vid, canonical_vid=None):
+    """升级路径：当前 token 的分享仍有效且确有明文匹配时，原子全局迁移。
+
+    canonical_vid：已有合法签名身份时，明文 ROI 迁到该身份的哈希，避免切换
+    cookie 丢掉迁移期间新建 ROI 的所有权。缺省则迁到 plaintext_vid 自身。
+    share 有效性在存储层与 ROI 改写同一锁/事务内检查（撤销/过期/缺失均失败，
+    不会当场迁移）。失败不销毁 legacy 凭据：调用方写入 svs_visitor_mig，之后
+    在仍 active 的链接上先到先得认领。
+    返回是否认领成功。
+    """
+    if not token or not plaintext_vid or plaintext_vid.startswith(_VISITOR_COOKIE_PREFIX):
+        return False
+    target = canonical_vid or plaintext_vid
+    if not target or target.startswith(_VISITOR_COOKIE_PREFIX):
+        return False
+    hashed = _visitor_stored(target)
+    if not hashed or hashed == plaintext_vid:
+        return False
+    try:
+        n = share_store.rehash_plaintext_visitors(token, plaintext_vid, hashed)
+    except Exception:
+        return False
+    return n > 0
+
+
+def _set_visitor_cookie(resp, name, value):
+    resp.set_cookie(
+        name,
+        value,
+        path="/s",
+        httponly=True,
+        samesite="Lax",
+        secure=_is_secure(),
+    )
+
+
+@app.before_request
+def _bind_visitor():
+    """/s/* 绑定访客：签名 cookie 复用；legacy 凭据可在仍有效的 token 上认领。
+
+    已有合法 v2 时它是 canonical：明文 ROI 迁到该身份，不切换 cookie。
+    无 v2 才签发 legacy 签名。当场认领失败（含 share 撤销/过期/缺失、/s、
+    无匹配 ROI）时签发随机身份，并保留 svs_visitor_mig：无效链接不得立即
+    全局迁移，但同一浏览器之后访问仍 active 的链接可先到先得认领。
+    """
+    path = request.path
+    if path != "/s" and not path.startswith("/s/"):
+        return
+    raw = request.cookies.get(VISITOR_COOKIE)
+    mig = request.cookies.get(VISITOR_MIG_COOKIE)
+    vid = _parse_visitor_cookie(raw)
+    legacy = _legacy_plaintext(raw) or _legacy_plaintext(mig)
+    token = _share_token_from_path(path)
+    g.visitor_issue_cookie = False
+    g.visitor_mig_cookie = None
+    g.visitor_mig_clear = False
+
+    if legacy and token and _reclaim_legacy_visitor(token, legacy, canonical_vid=vid):
+        # 已有合法 v2：保留该身份，明文 ROI 已迁到其哈希。无 v2 才签发 legacy。
+        g.visitor_id = vid or legacy
+        g.visitor_issue_cookie = not bool(vid)
+        g.visitor_mig_clear = True
+        return
+    if vid:
+        g.visitor_id = vid
+        return
+    g.visitor_id = secrets.token_urlsafe(16)
+    g.visitor_issue_cookie = True
+    if legacy:
+        g.visitor_mig_cookie = legacy
 
 
 @app.after_request
 def _ensure_visitor_cookie(resp):
-    """对 /s/ 开头的响应静默补发访客 cookie（仅首次，无 cookie 时）。"""
-    path = request.path
-    if path == "/s" or path.startswith("/s/"):
-        if not request.cookies.get(VISITOR_COOKIE):
-            vid = secrets.token_urlsafe(8)
-            resp.set_cookie(
-                VISITOR_COOKIE,
-                vid,
-                path="/s",
-                httponly=True,
-                samesite="Lax",
-                secure=_is_secure(),
-            )
+    """补发签名访客 cookie。当场认领失败则写入/保留 mig；认领成功才清除。"""
+    if getattr(g, "visitor_issue_cookie", False) and getattr(g, "visitor_id", None):
+        _set_visitor_cookie(resp, VISITOR_COOKIE, _sign_visitor(g.visitor_id))
+    if getattr(g, "visitor_mig_clear", False):
+        resp.delete_cookie(VISITOR_MIG_COOKIE, path="/s")
+    elif getattr(g, "visitor_mig_cookie", None):
+        _set_visitor_cookie(resp, VISITOR_MIG_COOKIE, g.visitor_mig_cookie)
     return resp
 
 
 def _roi_owned_by(r, visitor):
     """判断某 roi 是否归当前访客所有（用于编辑/删除的归属校验）。
 
-    无 visitor 字段 = 旧数据（本轮改造前创建）：按链接级共享，任意访客可编辑
-    （兼容历史行为）；有 visitor 字段则必须与当前访客一致才可编辑。
+    无 visitor 字段 = 旧数据：按链接级共享，任意访客可编辑（兼容历史行为）。
+    新数据存 HMAC 哈希，与当前签名 cookie 的 id 哈希比对。
     """
     v = r.get("visitor") or ""
-    return (not v) or (v == visitor)
+    if not v:
+        return True
+    if not visitor:
+        return False
+    if v.startswith(_VISITOR_STORED_PREFIX):
+        return hmac.compare_digest(v, _visitor_stored(visitor))
+    # 旧明文 visitor：仅当签名 cookie 的 id 与明文一致（无法用复制的明文伪造签名）
+    return hmac.compare_digest(v, visitor)
+
+
+def _public_roi(r):
+    """分享端响应：去掉原始/哈希 visitor，避免身份被复制冒用。"""
+    out = dict(r)
+    out.pop("visitor", None)
+    return out
 
 
 def _require_share(token):
@@ -586,7 +786,8 @@ def share_roi_add(token):
 
     try:
         roi = share_store.add_roi(
-            token, safe, label, type=typ, note=note, visitor=_visitor_id(), **geom
+            token, safe, label, type=typ, note=note,
+            visitor=_visitor_stored(_visitor_id()), **geom
         )
     except ValueError as e:
         return jsonify(error=str(e)), 400
@@ -632,7 +833,7 @@ def share_roi_update(token, index):
         return jsonify(error=str(e)), 400
     if updated is False:
         return jsonify(error="选区不存在"), 404
-    return jsonify(updated)
+    return jsonify(_public_roi(updated))
 
 
 @app.route("/s/<token>/api/rois")
@@ -658,7 +859,7 @@ def share_roi_list(token):
     out = []
     for r in mine:
         if token == share_store.ADMIN_TOKEN or _roi_owned_by(r, visitor):
-            rr = dict(r)
+            rr = _public_roi(r)
             rr["source"] = "me"
             out.append(rr)
 
@@ -670,7 +871,7 @@ def share_roi_list(token):
             # shared 只读显示；me 已在上面列出，不重复
             if _roi_owned_by(r, visitor):
                 continue
-        rr = dict(r)
+        rr = _public_roi(r)
         rr["source"] = "admin" if r.get("token") == share_store.ADMIN_TOKEN else "shared"
         out.append(rr)
 

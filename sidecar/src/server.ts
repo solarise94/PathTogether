@@ -14,7 +14,11 @@
  *   GET  /session/:id                                              → {session, transcript}
  *   POST /session/:id/archive | /unarchive                         → {ok, archived} ; 409 running
  *   GET  /session/:id/stream?after_seq=N | Last-Event-ID           → SSE (replay + live)
- *   GET  /healthz                                                  → {ok:true}
+ *   GET  /healthz                                                  → {ok:true} (unauthenticated probe)
+ *
+ * When {@link SidecarServerOptions.internalToken} is set, every path except
+ * /healthz requires header `X-AI-Internal-Token` (same token Flask uses for
+ * /internal/ai/*). Flask `/api/ai/*` proxies send this header.
  *
  * SSE transport semantics (app.py:2066-2143):
  *   - event frame: `id: {seq}\nevent: {type}\ndata: {json}\n\n`
@@ -32,6 +36,7 @@
  * "running". No polling (the bus fans out instantly), but the on-disk log is
  * still the source of truth for catchup/reconnect.
  */
+import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
 import { AgentRunner, RunConfig, SessionConflict, RootAnnotationGone, ConfigError, validateRunConfig } from "./agent-runner.js";
@@ -56,6 +61,16 @@ export interface SidecarServerOptions {
 	flask?: PlatformClient;
 	/** Inject a fake streamFn into the runner (tests). */
 	streamFnOverride?: (model: unknown, context: unknown, options?: unknown) => unknown;
+	/**
+	 * Shared platform↔sidecar token. When non-empty, all endpoints except
+	 * /healthz require `X-AI-Internal-Token`. Tests omit this (open loopback).
+	 */
+	internalToken?: string;
+	/**
+	 * Allow empty token on a non-loopback bind (dev only). Production must
+	 * set AI_INTERNAL_TOKEN; index.ts also honors ALLOW_UNAUTH_SIDECAR=1.
+	 */
+	allowUnauth?: boolean;
 }
 
 // =========================================================================== //
@@ -70,6 +85,8 @@ export class SidecarServer {
 	readonly bus: SessionEventBus;
 	readonly flask: PlatformClient;
 	readonly runner: AgentRunner;
+	readonly internalToken: string;
+	readonly allowUnauth: boolean;
 	private server: Server | null = null;
 	/** The OS-assigned port after start() (equals {@link port} when non-zero). */
 	private _boundPort = 0;
@@ -81,6 +98,8 @@ export class SidecarServer {
 		this.bus = opts.bus ?? new SessionEventBus(this.store);
 		this.flask = opts.flask ?? (null as unknown as PlatformClient); // set via createSidecarServer in index.ts
 		this.runner = opts.runner ?? new AgentRunner(this.store, this.bus, this.flask, opts.streamFnOverride ? { streamFn: opts.streamFnOverride as never } : {});
+		this.internalToken = (opts.internalToken || "").trim();
+		this.allowUnauth = opts.allowUnauth === true;
 	}
 
 	/** The actual port the server is bound to (0 before start). */
@@ -90,6 +109,7 @@ export class SidecarServer {
 
 	/** Start listening. Returns once the server is up. */
 	async start(): Promise<void> {
+		assertInboundAuthAllowed(this.host, this.internalToken, this.allowUnauth);
 		this.server = createServer((req, res) => {
 			this.handle(req, res).catch((e) => {
 				this.sendJson(res, 500, { error: `internal: ${(e as Error)?.message || e}` });
@@ -119,6 +139,10 @@ export class SidecarServer {
 		const method = (req.method || "GET").toUpperCase();
 
 		if (method === "GET" && path === "/healthz") return this.sendJson(res, 200, { ok: true });
+
+		if (this.internalToken && !tokensMatch(headerToken(req), this.internalToken)) {
+			return this.sendJson(res, 401, { error: "invalid_internal_token" });
+		}
 
 		if (method === "POST" && path === "/run") return this.handleRun(req, res);
 		if (method === "POST" && path === "/continue") return this.handleContinue(req, res);
@@ -551,6 +575,43 @@ export class SidecarServer {
 function defaultPort(): number {
 	const p = parseInt(process.env.AI_SIDECAR_PORT || "", 10);
 	return Number.isFinite(p) && p > 0 ? p : 8055;
+}
+
+/** True for bind addresses that only accept local clients. */
+export function isLoopbackBindHost(host: string): boolean {
+	const h = String(host || "").trim().toLowerCase();
+	return h === "127.0.0.1" || h === "::1" || h === "localhost";
+}
+
+/**
+ * Non-loopback binds must have an inbound token (fail-closed). Loopback/dev
+ * may omit it. allowUnauth is the explicit escape hatch (ALLOW_UNAUTH_SIDECAR).
+ */
+export function assertInboundAuthAllowed(host: string, token: string, allowUnauth = false): void {
+	if ((token || "").trim()) return;
+	if (allowUnauth || isLoopbackBindHost(host)) return;
+	throw new Error(
+		`AI_SIDECAR_HOST=${host} is not loopback and inbound token is unset; refusing to start. Set AI_INTERNAL_TOKEN (or share-data/ai_internal.token), bind 127.0.0.1, or set ALLOW_UNAUTH_SIDECAR=1`,
+	);
+}
+
+function headerToken(req: IncomingMessage): string {
+	const raw = req.headers["x-ai-internal-token"];
+	if (typeof raw === "string") return raw;
+	if (Array.isArray(raw) && raw[0]) return raw[0];
+	return "";
+}
+
+/** Constant-time compare; empty expected means auth is disabled (tests). */
+function tokensMatch(got: string, expected: string): boolean {
+	if (!expected) return true;
+	const a = Buffer.from(got);
+	const b = Buffer.from(expected);
+	if (a.length !== b.length) {
+		timingSafeEqual(b, b);
+		return false;
+	}
+	return timingSafeEqual(a, b);
 }
 
 function str(v: unknown): string {

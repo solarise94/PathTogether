@@ -8,20 +8,23 @@
  *
  * Env:
  *   AI_SIDECAR_PORT   listen port (default 8055)
- *   AI_SIDECAR_HOST   listen host (default 127.0.0.1). 容器里设 0.0.0.0：
- *                     分享门户容器（svs-share，combined_app 同端口也挂
- *                     /api/ai/*）需要跨容器经 podman 内网访问本 sidecar；
- *                     不发布宿主端口，8055 只在容器网络内可达。
+ *   AI_SIDECAR_HOST   listen host (default 127.0.0.1). 仅在私有容器网络
+ *                     且不发布宿主端口时才设 0.0.0.0；`--network host` 下
+ *                     必须保持 127.0.0.1，否则无鉴权接口会绑到宿主网卡。
+ *   AI_INTERNAL_TOKEN inbound /run|/sessions 等与 Flask 回调共用；缺省读
+ *                     SHARE_DATA_DIR/ai_internal.token。有 token 则除 /healthz
+ *                     外要求 X-AI-Internal-Token。非 loopback 绑定且 token 为空
+ *                     时拒绝启动（fail-closed）；仅 127.0.0.1/::1/localhost
+ *                     或 ALLOW_UNAUTH_SIDECAR=1 允许无 token。
  *   AI_SESSIONS_DIR   session store dir (default ~/.svs-sidecar/sessions;
  *                     同容器由 docker_entry.sh export /data/sidecar-sessions)
  *   AI_FLASK_URL      Flask callback base URL (default http://127.0.0.1:8000)
- *   AI_INTERNAL_TOKEN shared callback token (else read from data dir)
  */
 import { SessionStore } from "./session-store.js";
 import { SessionEventBus } from "./events.js";
 import { AgentRunner } from "./agent-runner.js";
-import { SidecarServer } from "./server.js";
-import { createFlaskClient } from "./flask-client.js";
+import { SidecarServer, assertInboundAuthAllowed } from "./server.js";
+import { createFlaskClient, resolveAiInternalToken } from "./flask-client.js";
 import { LegacyFlaskPlatformAdapter } from "./platform/legacy-flask-adapter.js";
 import { PathTogatherHttpClient } from "./platform/http-client.js";
 import { resolvePluginCredentials } from "./platform/plugin-credentials.js";
@@ -82,9 +85,30 @@ async function main(): Promise<void> {
 
 	const port = parseInt(process.env.AI_SIDECAR_PORT || "", 10) || 8055;
 	const host = process.env.AI_SIDECAR_HOST || "127.0.0.1";
-	const server = new SidecarServer({ host, port, store, bus, flask, runner });
+	const allowUnauth = envFlag("ALLOW_UNAUTH_SIDECAR");
+	let inboundToken = "";
+	try {
+		inboundToken = await resolveAiInternalToken();
+	} catch {
+		inboundToken = "";
+	}
+	if (!inboundToken) {
+		assertInboundAuthAllowed(host, inboundToken, allowUnauth);
+		console.warn(
+			"[sidecar] inbound auth disabled (loopback or ALLOW_UNAUTH_SIDECAR): set AI_INTERNAL_TOKEN for production",
+		);
+	}
+	const server = new SidecarServer({
+		host, port, store, bus, flask, runner,
+		internalToken: inboundToken, allowUnauth,
+	});
 	await server.start();
 	console.log(`[sidecar] listening on http://${host}:${port}`);
+}
+
+function envFlag(name: string): boolean {
+	const v = (process.env[name] || "").trim().toLowerCase();
+	return v === "1" || v === "true" || v === "yes";
 }
 
 main().catch((err) => {

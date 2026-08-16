@@ -87,7 +87,7 @@ button {
   align-items: center;
   gap: 8px;
   min-width: 0;
-  flex-shrink: 0;
+  flex: 0 1 auto; /* 可缩不可涨：不与工具栏抢空间 */
 }
 
 .header-title {
@@ -95,12 +95,12 @@ button {
   font-weight: 600;
   color: var(--text);
   letter-spacing: -0.2px;
+  flex-shrink: 0; /* 品牌名不收缩 */
 }
 
-.title-sep {
-  color: var(--text-3);
-  font-size: 13px;
-}
+/* 装饰性副标题与分隔符一律不显示（宽屏也不占标题栏宽度），品牌与文件名靠 gap 分隔 */
+.title-sep,
+.header-subtitle { display: none; }
 
 .header-current {
   font-size: 13px;
@@ -108,7 +108,8 @@ button {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 260px;
+  /* 长文件名（如 TCGA 全名 70+ 字符）提前省略；悬停 title 看全名（app.js 已设） */
+  max-width: clamp(64px, 14vw, 180px);
 }
 
 /* ---------- 工具栏 ---------- */
@@ -2591,6 +2592,39 @@ button {
   margin-top: 3px;
   white-space: pre-wrap;
 }
+/* 标注卡片正文折叠：正文常与紧邻的观察段重复，默认收 2 行，角标展开 */
+.ai-attach.annotation .ai-attach-body {
+  position: relative;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  cursor: pointer;
+}
+.ai-attach.annotation .ai-attach-body.expanded {
+  display: block;
+  -webkit-line-clamp: unset;
+  overflow: visible;
+}
+.ai-clamp-hint {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  padding: 0 4px 0 14px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--accent);
+  background: linear-gradient(90deg, rgba(38, 46, 61, 0), rgba(38, 46, 61, 0.95) 34%);
+  cursor: pointer;
+  user-select: none;
+}
+/* AI 配置来源提示：owner=平台托管说明 / user=当前生效来源（§5.1.2） */
+.ai-config-source-hint {
+  font-size: 11.5px;
+  color: var(--text-3);
+  line-height: 1.45;
+  margin: 2px 0 6px;
+}
 .ai-attach-sub {
   font-size: 11.5px;
   color: var(--text-3);
@@ -2603,13 +2637,23 @@ button {
   gap: 6px;
   margin-top: 4px;
 }
-.ai-attach.observation {
-  background: rgba(0, 122, 255, 0.06);
+/* 碎碎念（观察/已判读总结）：不像卡片、不可点，读起来像随手记的一句 */
+.ai-mutter {
+  padding: 1px 4px;
+  border-radius: 6px;
+  background: transparent;
+  cursor: default;
 }
-.ai-attach.review {
-  background: rgba(52, 199, 89, 0.08);
+.ai-mutter .ai-attach-title {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-3);
 }
-.ai-attach.review .ai-attach-title { color: #1a7d34; }
+.ai-mutter .ai-attach-body {
+  font-style: italic;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
 .ai-attach.snapshot {
   background: rgba(0, 122, 255, 0.05);
   cursor: pointer;
@@ -2619,7 +2663,9 @@ button {
 .ai-attach.snapshot .ai-attach-title { color: var(--accent); font-weight: 500; }
 .ai-attach.annotation {
   background: rgba(255, 149, 0, 0.08);
+  cursor: pointer;
 }
+.fork-chat-stream .ai-mutter { padding: 1px 3px; }
 
 .fork-chat-stream {
   display: flex;

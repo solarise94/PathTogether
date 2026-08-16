@@ -4,11 +4,11 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>HistoPilot</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260807i18n2" />
+  <link rel="stylesheet" href="/static/style.css?v=20260816p5fix" />
   <!-- OpenSeadragon 5.0.1（已本地化） -->
   <script src="/static/openseadragon.min.js"></script>
   <!-- 中英双语切换（必须在 app.js 之前加载，提供 window.HP_I18N） -->
-  <script src="/static/i18n.js?v=20260807i18n2"></script>
+  <script src="/static/i18n.js?v=20260816p5fix"></script>
 </head>
 <body>
   <!-- 统一标题栏 + 工具栏（macOS unified titlebar-toolbar） -->
@@ -288,6 +288,7 @@
         <!-- 1. 设置区（未配置时展开） -->
         <div id="ai-config-wrap" class="ai-config-wrap">
           <div class="ai-config-title" data-i18n="ai.config.title">AI 服务配置</div>
+          <div id="ai-config-source-hint" class="ai-config-source-hint" style="display:none"></div>
           <label class="ai-field">
             <span data-i18n="ai.field.baseurl">Base URL</span>
             <input id="ai-base-url" type="text" placeholder="https://api.openai.com/v1"
@@ -409,32 +410,33 @@
        未加载时两侧各自有内联兜底，host/插件不崩 -->
   <script src="/static/bridge-version.js?v=20260814stage5"></script>
   <!-- HostBridge host 端（平台侧）。先于插件 bundle 加载，提供 window.HostBridgeHost -->
-  <script src="/static/host-bridge.js?v=20260814stage5"></script>
+  <script src="/static/host-bridge.js?v=20260816p2fix"></script>
+  <script src="/static/plugin-permissions.js?v=20260816p5fix"></script>
   <!-- HistoPilot 插件 UI bundle（同源独立加载）。顺序敏感：bridge-client 建命名空间，
        其余文件向 window.HistoPilot 挂载能力；main.js 为入口，最后加载。
        加载早于 app.js，使平台 init 时 window.HistoPilot 已就绪 -->
   <script src="/plugins/histopilot/ui/bridge-client.js?v=20260814stage5"></script>
   <script src="/plugins/histopilot/ui/api.js?v=20260814stage2"></script>
-  <script src="/plugins/histopilot/ui/sse.js?v=20260814stage2"></script>
-  <script src="/plugins/histopilot/ui/renderer.js?v=20260814stage2"></script>
-  <script src="/plugins/histopilot/ui/config-panel.js?v=20260814stage2"></script>
-  <script src="/plugins/histopilot/ui/sessions.js?v=20260814stage2"></script>
-  <script src="/plugins/histopilot/ui/main.js?v=20260814stage2"></script>
+  <script src="/plugins/histopilot/ui/sse.js?v=20260816p8fix"></script>
+  <script src="/plugins/histopilot/ui/renderer.js?v=20260816p5fix"></script>
+  <script src="/plugins/histopilot/ui/config-panel.js?v=20260816p2fix"></script>
+  <script src="/plugins/histopilot/ui/sessions.js?v=20260816p8fix"></script>
+  <script src="/plugins/histopilot/ui/main.js?v=20260816p5fix"></script>
   {% endif %}
   {% if sample_plugin_enabled %}
   <!-- Sample Annotator 示例插件（Stage 5-2）：通用 PluginSDK + bridge 权限门演示。
        注入已启用插件的 manifest permissions 供 host 端权限门查表：
        SVS_PLUGIN_PERMISSIONS = { pluginInstallationId: [permission,...] }。
-       histopilot 不在表内 = 内置特权插件全放行（host 端 gatePluginPermission 判定）。
+       histopilot 仅因 PRIVILEGED_PLUGIN_IDS 显式名单放行，未知 ID fail-closed。
        共享前置脚本（bridge-version/host-bridge/plugin-permissions）幂等，与 histopilot
        块可能重复加载（各模块自带防重复初始化守卫，不崩） -->
   <script>window.SVS_PLUGIN_PERMISSIONS = {{ {"sample-annotator": sample_plugin_permissions} | tojson }};</script>
   <script src="/static/bridge-version.js?v=20260814stage5"></script>
-  <script src="/static/plugin-permissions.js?v=20260814stage5"></script>
-  <script src="/static/host-bridge.js?v=20260814stage5"></script>
-  <script src="/plugins/sdk/ui/bridge-client.js?v=20260814stage5"></script>
-  <script src="/plugins/sample-annotator/ui/main.js?v=20260814stage5"></script>
+  <script src="/static/plugin-permissions.js?v=20260816p5fix"></script>
+  <script src="/static/host-bridge.js?v=20260816p2fix"></script>
+  <script src="/plugins/sdk/ui/bridge-client.js?v=20260814p1fix"></script>
+  <script src="/plugins/sample-annotator/ui/main.js?v=20260816p2fix"></script>
   {% endif %}
-  <script src="/static/app.js?v=20260814stage2"></script>
+  <script src="/static/app.js?v=20260816p7fix"></script>
 </body>
 </html>

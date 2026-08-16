@@ -89,13 +89,22 @@
     HP.handleAiEvent(eventType, payload);
   }
 
-  // fork 批注对话的轻量 SSE 泵：session_ended 忽略，其余交 handleForkEvent
+  // fork 批注对话的轻量 SSE 泵：收到终态事件即结束（不等 TCP 关连接），
+  // 否则心跳会让「发送中」一直挂着。
   function pumpForkSse(reader, streamEl, wrapEl) {
     var decoder = new TextDecoder("utf-8");
     var buffer = "";
+    var done = false;
+    function finish() {
+      if (done) return;
+      done = true;
+      try { reader.cancel(); } catch (e) {}
+    }
     function pump() {
+      if (done) return Promise.resolve();
       return reader.read().then(function (result) {
-        if (result.done) return;
+        if (done) return;
+        if (result.done) { finish(); return; }
         buffer += decoder.decode(result.value, { stream: true });
         var idx;
         while ((idx = buffer.indexOf("\n\n")) >= 0) {
@@ -107,10 +116,14 @@
             if (line.indexOf("event:") === 0) type = line.slice(6).trim();
             else if (line.indexOf("data:") === 0) dataStr += line.slice(5).trim();
           });
-          if (type === "session_ended") continue;
+          if (type === "session_ended") { finish(); return; }
           var payload = {};
           if (dataStr) { try { payload = JSON.parse(dataStr); } catch (e) {} }
           HP.handleForkEvent(type, payload, streamEl, wrapEl);
+          if (type === "agent_finished" || type === "agent_error" || type === "agent_paused") {
+            finish();
+            return;
+          }
         }
         return pump();
       });

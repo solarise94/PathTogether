@@ -853,6 +853,16 @@
     return Math.round((sizeMm * 1000) / state.mppX);
   }
 
+  // 矩形物理边长（mm）。AI 落标只写 side_px、size_mm 常为 0；用 mpp 现算。
+  function rectSizeMm(it) {
+    if (!it || (it.type && it.type !== "rect")) return null;
+    var mm = Number(it.size_mm);
+    if (!(mm > 0) && it.side_px != null && state.mppX > 0) {
+      mm = Math.round(Number(it.side_px) * state.mppX / 1000 * 100) / 100;
+    }
+    return (mm > 0) ? mm : null;
+  }
+
   function toggleRoi(sizeMm) {
     if (!state.slide) { toast(t("roi.need.slide"), "error"); return; }
     if (!state.mppX || state.mppX <= 0) {
@@ -2058,7 +2068,13 @@
       [[x, y], [x + w, y], [x, y + h], [x + w, y + h]].forEach(function (p) {
         annoCtx.beginPath(); annoCtx.arc(p[0], p[1], 3, 0, Math.PI * 2); annoCtx.fill();
       });
-      if (lbl) drawLabel(it.label, x, y, it.size_mm != null ? (it.size_mm + "mm") : "");
+      if (lbl) {
+        // 有备注气泡时标签改画在框内左上，避免和框顶居中的 callout 叠在一起
+        var hasNote = String(it.note || "").trim();
+        var mm = rectSizeMm(it);
+        var sizeTxt = (mm != null) ? (mm + "mm") : "";
+        drawLabel(it.label, x, y, sizeTxt, null, !!hasNote);
+      }
     } else if (typ === "arrow") {
       drawArrow(it.x1, it.y1, it.x2, it.y2, hlStroke || color.stroke, lbl);
     } else if (typ === "freehand") {
@@ -2106,7 +2122,8 @@
   }
 
   // 标签文字：黄底深字（与现有 ROI 标签风格一致）
-  function drawLabel(label, x, y, sizeText, strokeColor) {
+  // inside=true：画在矩形内左上（有备注气泡时用，避免和框顶 callout 重叠）
+  function drawLabel(label, x, y, sizeText, strokeColor, inside) {
     var text = String(label || "");
     if (sizeText) text = (text ? text + " · " : "") + sizeText;
     if (!text) return;
@@ -2115,7 +2132,8 @@
     var m = annoCtx.measureText(text);
     var w = m.width + padX * 2;
     var h = 16;
-    var bx = x, by = y - h - 2;
+    var bx = inside ? x + 3 : x;
+    var by = inside ? y + 3 : y - h - 2;
     if (strokeColor && strokeColor !== "#FFD700") {
       annoCtx.fillStyle = strokeColor;
     } else {
@@ -2756,7 +2774,10 @@
         left.className = "ai-info";
         var typIcon = (it.type === "arrow") ? "↗" : (it.type === "freehand" ? "〰" : "▭");
         var sizeStr = "";
-        if ((it.type || "rect") === "rect" && it.size_mm != null) sizeStr = " · " + it.size_mm + "mm";
+        if ((it.type || "rect") === "rect") {
+          var mm = rectSizeMm(it);
+          if (mm != null) sizeStr = " · " + mm + "mm";
+        }
         else if (it.type === "arrow") sizeStr = " · (" + it.x1 + "," + it.y1 + ")→(" + it.x2 + "," + it.y2 + ")";
         else if (it.type === "freehand") sizeStr = " · " + t("anno.free.points", { n: (it.points ? it.points.length : 0) });
         // P1-7：私有标注用「私有」徽章表达，不再整行降透明度。
@@ -3521,44 +3542,28 @@
     var host = window.HostBridgeHost;
     if (!host) return;
     // 通用插件权限门（Stage 5-2）：每个被 gate 的 host 方法入口先查
-    // env.pluginInstallationId 对应插件在 SVS_PLUGIN_PERMISSIONS 中声明的权限。
-    //   - 插件在表内且未声明所需权限 → throw {code:"permission_denied"}（host 回 ok:false）；
-    //   - 插件不在表内（如 histopilot 内置特权插件）→ 放行；
-    //   - method 未映射（PluginPermissions.METHOD_PERMISSIONS 无此项）→ 放行。
+    // env.pluginInstallationId。未知 ID fail-closed；histopilot 仅因在
+    // PRIVILEGED_PLUGIN_IDS 显式名单中才放行（不能靠「不在权限表」冒充）。
+    // 同窗口执行仍不是安全边界（插件可触达 host 全局）；iframe sandbox 另做。
     // 用法：gate(method, fn(payload, env))，把 fn 包成 fn(payload, env) → 先 gate 再执行业务。
     function gate(method, fn) {
       return function (payload, env) {
-        var pp = window.PluginPermissions;
         var pluginId = env && env.pluginInstallationId;
-        if (pp && pp.checkPermission && pluginId) {
-          var declared = window.SVS_PLUGIN_PERMISSIONS
-            && window.SVS_PLUGIN_PERMISSIONS[pluginId];
-          // 表内才 gate：declared 为数组即插件已登记（histopilot 不在表内 → undefined → 放行）
-          if (Array.isArray(declared)) {
-            var denied = pp.checkPermission(declared, method);
-            if (denied) throw denied; // → host 回 ok:false, error={code:"permission_denied",...}
-          }
+        var pp = window.PluginPermissions;
+        if (pp && pp.gatePermission) {
+          var denied = pp.gatePermission(pluginId, method, window.SVS_PLUGIN_PERMISSIONS);
+          if (denied) throw denied;
+        } else if (pluginId !== "histopilot") {
+          throw { code: "permission_denied", message: "未知插件身份", retryable: false };
         }
         return fn(payload, env);
       };
     }
-    // Plugin→Host request：握手期桥协议版本协商（Stage 5-1）。
-    // 插件发 bridge.negotiate {protocolVersion} → host 调 BridgeVersion.negotiate；
-    // 兼容返回 {ok:true,protocolVersion}，不兼容 throw error → host 回 ok:false 信封
-    // （{code:"version_incompatible"}），不崩 host（_handlePluginRequest 统一兜底）。
-    host.onRequest("bridge.negotiate", function (p) {
-      var bv = window.BridgeVersion;
-      var remote = (p && (p.protocolVersion || p.bridgeProtocolVersion)) || null;
-      if (!bv) {
-        // 兜底（BridgeVersion 未加载）：按当前 PROTO 同 major 接受
-        return { ok: true, protocolVersion: "1.0.0" };
-      }
-      var res = bv.negotiate(remote);
-      if (!res.ok) throw res.error; // → host 回 ok:false, error={code:"version_incompatible",...}
-      return res; // {ok:true, protocolVersion}
-    });
+    // 握手期 bridge.negotiate 不在此注册：host-bridge.js 路由器原生应答（2026-08-16
+    // 修复）——插件脚本先于 app.js 加载并立即握手时，等这里的 onRequest 注册会先
+    // 收到 unknown_method（demo 实测）。业务方法才走下方注册表。
     // Plugin→Host request（被 gate 的方法：slide.getCurrent / selection.getBbox /
-    // viewer.navigate / viewer.highlight / annotation.create / annotation.read）
+    // viewer.navigate / viewer.highlight / annotation.create / annotation.read / annotation.focus）
     host.onRequest("slide.getCurrent", gate("slide.getCurrent", function () {
       if (!state.slide) return null;
       return { name: state.slide.name, width: state.slide.width, height: state.slide.height,
@@ -3593,6 +3598,31 @@
       // 通用权限门演示方法（manifest 未声明 annotation:read 的插件会被稳定拒绝）。
       // 非特权插件不被允许批量读标注；已授权路径走 REST /api/annotations。
       throw { code: "permission_denied", message: "annotation.read 需经平台 REST 读取", retryable: false };
+    }));
+    // 标注卡点击聚焦：优先按 annotation_id 在 flatAnnoItems 里匹配 → 复用 jumpToAnno
+    // （20% 边距 fitBounds + 选中蓝色描边 + focusAnno）。匹配不到但有几何 → 只定位
+    // 视野并画临时 overlay 框（不动已有标注，不造假标注）。
+    host.onRequest("annotation.focus", gate("annotation.focus", function (p) {
+      p = p || {};
+      var match = null;
+      if (p.annotation_id) {
+        var items = flatAnnoItems();
+        for (var i = 0; i < items.length; i++) {
+          if (String(items[i].annotation_id || "") === String(p.annotation_id)) { match = items[i]; break; }
+        }
+      }
+      if (match) { jumpToAnno(match); return { ok: true, focused: true }; }
+      var side = Number(p.side_px) || 0;
+      if (viewer && viewer.viewport && p.x != null && side > 0) {
+        var pad = side * 0.2;
+        try {
+          viewer.viewport.fitBounds(
+            viewer.viewport.imageToViewportRectangle(p.x - pad, p.y - pad, side + pad * 2, side + pad * 2));
+        } catch (e) {}
+        aiOverlay = [{ x: p.x, y: p.y, w: side, h: side, magnification: "" }];
+        redrawAnnoCanvas();
+      }
+      return { ok: true, focused: false };
     }));
     // Plugin→Host event
     host.onEvent("notification.show", function (p) {

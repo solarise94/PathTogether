@@ -242,6 +242,8 @@
   // =========================================================================
   // branch 起跑/续聊：POST /api/ai/branch {slide, annotation_id, question?}。
   // 返回 true=已发起（调用方可清草稿），false=前置校验未过（保留草稿）。
+  // 失败安全：拿到新会话（X-AI-Session-ID）之前不清主轨迹、不切 activeAiSession，
+  // /branch 挂起或失败时主对话原样保留。
   function startBranchRun(annotationId, question) {
     var els = S.els;
     if (!S.slide) { toast(t("roi.need.slide"), "info"); return false; }
@@ -253,19 +255,15 @@
       return false;
     }
     abortActiveAiStream();
-    HP.setAiRunningUi(false);
-    S.activeAiSession = null;
-    HP.resetAiTrace();
-    S.mainAiCtx.lastSeq = 0;
 
     var slideName = S.slide.name;
     var epoch = S.aiSlideEpoch;
     var body = { slide: slideName, annotation_id: annotationId };
-    var hasQuestion = typeof question === "string" && question.trim();
-    if (hasQuestion) {
-      body.question = question.trim();
+    var qText = (typeof question === "string" && question.trim()) || null;
+    if (qText) { body.question = qText; }
+    if (qText) {
       appendMsgTs(S.els.aiTrace, new Date());
-      appendChatBubble(S.els.aiTrace, "user", question.trim());
+      appendChatBubble(S.els.aiTrace, "user", qText);
     }
     appendStatusRow(S.els.aiTrace, "info", t("ai.branch.opening"));
     setThinkingRow(S.mainAiCtx);
@@ -280,13 +278,27 @@
     }).then(function (resp) {
       if (!HP.isCurrentAiSlide(slideName, epoch)) return;
       var sid = resp.headers.get("X-AI-Session-ID");
-      if (sid) S.aiSessionId = sid;
       if (resp.status === 410) {
+        clearThinkingRow(S.mainAiCtx);
         appendStatusRow(S.els.aiTrace, "error", t("ai.branch.deleted"));
         HP.finishAiRun(runCtrl);
         throw new Error("gone");
       }
       if (!resp.ok || !resp.body) { return HP.aiResponseError(resp).then(function (msg) { throw new Error(msg); }); }
+      if (!sid) { throw new Error("missing X-AI-Session-ID"); }
+      // 成功：此刻才切换到 branch 会话并重建轨迹（放回问题气泡，SSE 从
+      // branch_created/branch_resumed 起重放；事件序列里不含用户问题）。
+      S.aiSessionId = sid;
+      S.activeAiSession = { id: sid, kind: "branch", annotation_id: annotationId };
+      HP.resetAiTrace();
+      S.mainAiCtx.lastSeq = 0;
+      HP.refreshAiSessionSwitcher(slideName, epoch);
+      applyActiveSessionUi();
+      if (qText) {
+        appendMsgTs(S.els.aiTrace, new Date());
+        appendChatBubble(S.els.aiTrace, "user", qText);
+      }
+      setThinkingRow(S.mainAiCtx);
       return HP.pumpAiSse(resp.body.getReader(), slideName, epoch, runCtrl);
     }).catch(function (e) {
       if (!HP.isCurrentAiSlide(slideName, epoch)) return;
@@ -294,6 +306,7 @@
       if (e && e.message === "gone") return;
       if (S.aiAbortCtrl !== runCtrl) return;
       var bem = (e && e.message ? e.message : e);
+      clearThinkingRow(S.mainAiCtx);
       toast(t("ai.branch.fail", { e: bem }), "error");
       appendStatusRow(S.els.aiTrace, "error", t("ai.branch.fail", { e: bem }));
       HP.finishAiRun(runCtrl);
@@ -437,11 +450,14 @@
     var input = wrapEl ? wrapEl.querySelector("input") : null;
     if (input) input.value = "";
     var ctx = forkTraceCtx(streamEl);
-    setThinkingRow(ctx);
+    try { if (setThinkingRow) setThinkingRow(ctx); } catch (eThink) {}
+    var ac = (typeof AbortController !== "undefined") ? new AbortController() : null;
+    var to = setTimeout(function () { try { if (ac) ac.abort(); } catch (e2) {} }, 90000);
     fetch("/api/ai/ask", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ slide: S.slide.name, annotation_id: annotationId, question: question }),
+      body: JSON.stringify({ slide: S.slide.name, annotation_id: String(annotationId || ""), question: question }),
       credentials: "same-origin",
+      signal: ac ? ac.signal : undefined,
     }).then(function (resp) {
       if (resp.status === 410) {
         appendStatusRow(streamEl, "error", t("ai.fork.deleted"));
@@ -458,8 +474,10 @@
       return HP.pumpForkSse(resp.body.getReader(), streamEl, wrapEl);
     }).catch(function (e) {
       if (e && e.message === "gone") return;
-      appendStatusRow(streamEl, "error", t("ai.fork.send.fail", { e: (e && e.message ? e.message : e) }));
+      var em = (e && e.name === "AbortError") ? "timeout" : (e && e.message ? e.message : e);
+      appendStatusRow(streamEl, "error", t("ai.fork.send.fail", { e: em }));
     }).then(function () {
+      clearTimeout(to);
       if (wrapEl && wrapEl._forkState !== "readonly") setForkState(wrapEl, "idle");
     });
   }
@@ -479,6 +497,7 @@
       var waits = streamEl.querySelectorAll(".ai-chat-thinking, .ai-trace-row.fork-wait, .ai-trace-row.thinking");
       waits.forEach(function (w) { if (w.parentNode) w.parentNode.removeChild(w); });
       ctx.thinkingEl = null;
+      if (wrapEl && wrapEl._forkState === "sending") setForkState(wrapEl, "idle");
     }
   }
 

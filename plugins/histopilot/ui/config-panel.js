@@ -36,10 +36,21 @@
     }).catch(function () { /* 静默，面板里会提示未配置 */ });
   }
 
+  // user 勾选“使用平台官方 API”时，自有凭据输入禁用（仅备用，取消勾选后生效）
+  function applyOwnCredsDisabled() {
+    var els = S.els;
+    if (!els || !els.aiUsePlatform || !isUser()) return;
+    var platformOn = els.aiUsePlatform.checked && !els.aiUsePlatform.disabled;
+    els.aiBaseUrl.disabled = platformOn;
+    els.aiModel.disabled = platformOn;
+    if (els.aiApiKey) els.aiApiKey.disabled = platformOn;
+  }
+
   function renderAiConfigState() {
     var aiConfig = S.aiConfig;
     var els = S.els;
     if (!aiConfig) return;
+    var hint = els.aiConfigSourceHint;
     // user：凭据区显示 use_platform 勾选 + 自己的 base_url/model/api_key
     if (isUser()) {
       if (els.aiUsePlatformWrap) els.aiUsePlatformWrap.style.display = "block";
@@ -55,9 +66,28 @@
             els.aiUsePlatformWrap.title = t("ai.config.platform.notconfigured");
           }
         }
+        // 勾选态切换时同步凭据输入可用性（只绑一次）
+        if (!els.aiUsePlatform._platformToggleBound) {
+          els.aiUsePlatform._platformToggleBound = true;
+          els.aiUsePlatform.addEventListener("change", applyOwnCredsDisabled);
+        }
       }
       els.aiBaseUrl.value = aiConfig.base_url || "";
       els.aiModel.value = aiConfig.model || "";
+      // 当前生效来源提示（§5.1.2：platform=平台托管 / own=自带凭据）
+      if (hint) {
+        if (aiConfig.using === "platform") {
+          hint.style.display = "block";
+          hint.textContent = t("ai.config.using.platform",
+            { s: aiConfig.platform_model || t("ai.config.source.platform") });
+        } else if (aiConfig.using === "own") {
+          hint.style.display = "block";
+          hint.textContent = t("ai.config.using.own", { s: aiConfig.model || "" });
+        } else {
+          hint.style.display = "none";
+        }
+      }
+      applyOwnCredsDisabled();
       fillAiTuningFields();
       return;
     }
@@ -66,12 +96,16 @@
       els.aiConfigWrap.style.display = "none";
       els.aiConfigCollapsed.style.display = "flex";
       els.aiConfigSummary.textContent =
+        t("ai.config.source.platform") + " · " +
         (aiConfig.model || t("ai.config.no.model")) + " @ " + aiConfig.base_url;
+      if (hint) hint.style.display = "none";
     } else {
       els.aiConfigWrap.style.display = "block";
       els.aiConfigCollapsed.style.display = "none";
       els.aiBaseUrl.value = aiConfig.base_url || "";
       els.aiModel.value = aiConfig.model || "";
+      // owner 表单即平台托管 AI 配置——明确标注，避免误以为要各自填凭据
+      if (hint) { hint.style.display = "block"; hint.textContent = t("ai.config.owner.hint"); }
       fillAiTuningFields();
     }
   }

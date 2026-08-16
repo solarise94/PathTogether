@@ -54,6 +54,18 @@
     S.aiPanelOpen = true;
     S.els.aiPanel.style.display = "flex";
     HP.bridge.emit("panel.stateChanged", { open: true });
+    // 关闭再开：轨迹被清空（空占位/只剩 status 行）且无进行中 run → 从当前
+    // 会话恢复 transcript，避免「正在开启分支会话…」卡死后主对话永久消失。
+    restoreAiTraceOnReopen();
+  }
+
+  function restoreAiTraceOnReopen() {
+    var trace = S.els.aiTrace;
+    if (!trace || S.aiRunning || !S.aiSessionId || !S.slide) return;
+    if (trace.querySelector(".ai-chat-bubble, .ai-attach")) return;
+    HP.loadAndRenderTranscript(S.aiSessionId, trace, {
+      emphasis: "main", slideName: S.slide.name, epoch: S.aiSlideEpoch,
+    });
   }
   function closeAiPanel() {
     S.aiPanelOpen = false;
@@ -362,7 +374,8 @@
       var bb = p.bboxLevel0 || {};
       S.overlay.push({ x: bb.x, y: bb.y, w: bb.w, h: bb.h, magnification: p.magnification || "" });
       if (S.overlay.length > 1) S.overlay = S.overlay.slice(-1);
-      HP.setOverlay(S.overlay);
+      // 导航外扩 20% + overlay 用原始 bbox：虚线框留在视野内一圈（HP.setOverlay 已含在内）
+      HP.navigateWithOverlay(bb, p.magnification);
       appendSnapshotCard(container, { magnification: p.magnification, bbox: bb });
       return;
     }
@@ -439,11 +452,14 @@
   function appendTextBubble(text, ctx) {
     ctx = ensureAiCtx(ctx);
     var container = ctx.container;
+    // 可续写的气泡累计文本仍为空白 → 不建 DOM（流式空 text_delta 不留空气泡）
+    var alive = ctx.bubbleEl && !ctx.bubbleEl.closed && ctx.bubbleEl.parentNode === container;
+    if (!((alive ? (ctx.bubbleEl._rawText || "") : "") + (text || "")).trim()) return;
     HP.clearAiEmpty(container);
     if (ctx.thinkingEl && ctx.thinkingEl.parentNode) {
       ctx.thinkingEl.parentNode.removeChild(ctx.thinkingEl); ctx.thinkingEl = null;
     }
-    if (!ctx.bubbleEl || ctx.bubbleEl.closed || ctx.bubbleEl.parentNode !== container) {
+    if (!alive) {
       var prev = container.lastElementChild;
       ctx.bubbleEl = document.createElement("div");
       ctx.bubbleEl.className = "ai-chat-bubble assistant";
@@ -477,6 +493,12 @@
     ctx = ensureAiCtx(ctx);
     if (ctx.thinkingEl && ctx.thinkingEl.parentNode) ctx.thinkingEl.parentNode.removeChild(ctx.thinkingEl);
     ctx.thinkingEl = null;
+    // 空白气泡不留 DOM：移除置空，而不是 close 一个空泡挂在轨迹里
+    if (ctx.bubbleEl && !String(ctx.bubbleEl._rawText || "").trim()) {
+      if (ctx.bubbleEl.parentNode) ctx.bubbleEl.parentNode.removeChild(ctx.bubbleEl);
+      ctx.bubbleEl = null;
+      return;
+    }
     if (ctx.bubbleEl) { ctx.bubbleEl.closed = true; }
   }
 
@@ -499,6 +521,7 @@
       aiTrace: $("ai-trace"), aiSessionBar: $("ai-session-bar"),
       aiSessionSelect: $("ai-session-select"),
       aiUsePlatform: $("ai-use-platform"), aiUsePlatformWrap: $("ai-use-platform-wrap"),
+      aiConfigSourceHint: $("ai-config-source-hint"),
       aiTuneAdminNote: $("ai-tune-admin-note"),
       aiDegradeBanner: $("ai-degrade-banner"),
     };

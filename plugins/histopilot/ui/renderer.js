@@ -46,6 +46,8 @@
 
   function renderMarkdown(src) {
     var text = String(src == null ? "" : src).replace(/\r\n/g, "\n");
+    // 空白输入返回空串：兜底 <p></p> 会叠出灰色空气泡
+    if (!text.trim()) return "";
     var fences = [];
     text = text.replace(/```[\w-]*\n?([\s\S]*?)```/g, function (_, code) {
       fences.push("<pre class=\"ai-md-pre\"><code>" + escHtml(code.replace(/\n$/, "")) + "</code></pre>");
@@ -103,7 +105,8 @@
     el._rawText = text == null ? "" : String(text);
     if (side === "assistant") {
       el.classList.add("ai-md");
-      el.innerHTML = renderMarkdown(el._rawText);
+      // 空白文本清空内容，不走 markdown（避免空 <p> 空气泡）
+      el.innerHTML = el._rawText.trim() ? renderMarkdown(el._rawText) : "";
     } else {
       el.classList.remove("ai-md");
       el.textContent = el._rawText;
@@ -112,7 +115,8 @@
 
   // 聊天气泡：side="user"（右，纯文本）/ "assistant"（左，Markdown）。
   function appendChatBubble(container, side, text) {
-    if (!text) return null;
+    // 空串 / 纯空白不建 DOM（历史重建与流式共用）
+    if (!String(text == null ? "" : text).trim()) return null;
     clearAiEmpty(container);
     var prev = container.lastElementChild;
     var row = document.createElement("div");
@@ -231,18 +235,27 @@
     return appendSnapshotCard(container, { magnification: imgRef && imgRef.magnification, bbox: (imgRef && imgRef.src) || {} });
   }
 
+  // 快照跳转：导航矩形外扩 20%（与 jumpToAnno 一致），overlay 用原始 bbox，
+  // 虚线框得以在视野内一圈而不是贴边。
+  function navigateWithOverlay(bbox, mag) {
+    if (!bbox || bbox.x == null || !bbox.w) return;
+    HP.setOverlay([{ x: bbox.x, y: bbox.y, w: bbox.w, h: bbox.h, magnification: mag || "" }]);
+    var h = bbox.h || bbox.w;
+    var pad = Math.max(bbox.w, h) * 0.2;
+    HP.bridge.request("viewer.navigate", {
+      x: bbox.x - pad, y: bbox.y - pad, w: bbox.w + pad * 2, h: h + pad * 2,
+    });
+  }
+
   // 快照跳转：原 viewer.viewport.fitBounds → 改为 viewer.navigate 请求（平台跟随）
-  function bindSnapshotJump(el, bbox) {
+  function bindSnapshotJump(el, bbox, mag) {
     if (!el || !bbox || bbox.x == null || !bbox.w) return;
     el.dataset.bbox = JSON.stringify(bbox);
     el.style.cursor = "pointer";
     el.title = t("ai.attach.jump.title");
     el.addEventListener("click", function () {
       try {
-        var bb = JSON.parse(el.dataset.bbox || "{}");
-        if (bb.x != null && bb.w) {
-          HP.bridge.request("viewer.navigate", { x: bb.x, y: bb.y, w: bb.w, h: bb.h });
-        }
+        navigateWithOverlay(JSON.parse(el.dataset.bbox || "{}"), mag);
       } catch (e) {}
     });
   }
@@ -257,17 +270,39 @@
     title.textContent = t("ai.snapshot.title") + (opts.magnification != null && opts.magnification !== ""
       ? " · " + fmtAiMag(opts.magnification) : "") + t("ai.snapshot.jump");
     card.appendChild(title);
-    bindSnapshotJump(card, opts.bbox || {});
+    bindSnapshotJump(card, opts.bbox || {}, opts.magnification);
     container.appendChild(card);
     container.scrollTop = container.scrollHeight;
     return card;
+  }
+
+  // 标注卡片正文折叠（正文常与紧邻观察段重复）：默认 2 行 + 右下“展开/收起”
+  // 角标。展开只由角标控制（stopPropagation，不冒泡触发卡片 focus）。
+  // 须在卡片已入 DOM 后调用（刷新角标要读 scrollHeight）。
+  function makeClampableBody(body) {
+    var hint = document.createElement("span");
+    hint.className = "ai-clamp-hint";
+    body.appendChild(hint);
+    function refresh() {
+      var expanded = body.classList.contains("expanded");
+      var overflows = body.scrollHeight > body.clientHeight + 2;
+      hint.style.display = (expanded || overflows) ? "" : "none";
+      hint.textContent = expanded ? t("ai.attach.collapse") : t("ai.attach.expand");
+    }
+    hint.addEventListener("click", function (e) {
+      e.stopPropagation();
+      body.classList.toggle("expanded");
+      refresh();
+    });
+    setTimeout(refresh, 0);
+    return body;
   }
 
   function appendObservationCard(p, container) {
     var target = container || aiTrace();
     clearAiEmpty(target);
     var card = document.createElement("div");
-    card.className = "ai-attach observation";
+    card.className = "ai-attach ai-mutter observation";
     var title = document.createElement("div");
     title.className = "ai-attach-title";
     title.textContent = p.label || t("ai.observation.default");
@@ -294,7 +329,7 @@
     var target = container || aiTrace();
     clearAiEmpty(target);
     var card = document.createElement("div");
-    card.className = "ai-attach review";
+    card.className = "ai-attach ai-mutter review";
     var head = document.createElement("div");
     head.className = "ai-attach-title";
     head.textContent = title;
@@ -326,25 +361,38 @@
     title.className = "ai-attach-title";
     title.textContent = p.label || t("ai.anno.default.label");
     card.appendChild(title);
-    var parts = [];
-    if (p.note) parts.push(p.note);
-    if (p.x != null || p.y != null || p.side_px != null) {
-      parts.push("@(" + fmtNum(p.x) + "," + fmtNum(p.y) + "," + (p.side_px || "?") + "px)");
-    }
-    if (parts.length) {
-      var body = document.createElement("div");
+    var body = null;
+    if (p.note) {
+      body = document.createElement("div");
       body.className = "ai-attach-body";
-      body.textContent = parts.join(" ");
+      body.textContent = p.note;
       card.appendChild(body);
     }
     if (p.annotation_id) card.dataset.annotationId = p.annotation_id;
+    // 机器坐标只进 dataset（不进正文），annotation_id 匹配不到时供 focus 兜底定位
+    if (p.x != null || p.y != null || p.side_px != null) {
+      card.dataset.geo = JSON.stringify({ x: p.x, y: p.y, side_px: p.side_px });
+    }
     if (opts.showFork && p.annotation_id) {
       var actions = document.createElement("div");
       actions.className = "ai-attach-actions";
       card.appendChild(actions);
       HP.attachForkBtn(actions, p.annotation_id);
     }
+    // 点击卡片 = 选中/聚焦该标注（复用平台 jumpToAnno 的选中高亮），动作按钮区除外
+    card.style.cursor = "pointer";
+    card.title = t("ai.attach.focus.title");
+    card.addEventListener("click", function (ev) {
+      if (ev.target && ev.target.closest && ev.target.closest(".ai-attach-actions")) return;
+      HP.bridge.request("annotation.focus", {
+        annotation_id: p.annotation_id || null,
+        x: p.x != null ? p.x : null,
+        y: p.y != null ? p.y : null,
+        side_px: p.side_px != null ? p.side_px : null,
+      }).catch(function () {});
+    });
     target.appendChild(card);
+    if (body) makeClampableBody(body);
     target.scrollTop = target.scrollHeight;
     return card;
   }
@@ -524,6 +572,8 @@
 
   // 导出
   HP.clearAiEmpty = clearAiEmpty;
+  HP.navigateWithOverlay = navigateWithOverlay;
+  HP.setBubbleContent = setBubbleContent;
   HP.renderAiTranscript = renderAiTranscript;
   HP.appendChatBubble = appendChatBubble;
   HP.markUserBubblesRead = markUserBubblesRead;

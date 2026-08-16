@@ -29,14 +29,40 @@
   // 通用 SDK 插件（PluginSDK）在 createPluginBridge 时 registerPlugin 注册；histopilot
   // 不注册（默认回落 window.HistoPilot._onHostMessage，保持 Stage 2 行为不变）。
   var pluginReceivers = {};
+  var PRIVILEGED_IDS = ["histopilot"];
+
+  function privilegedIds() {
+    var pp = window.PluginPermissions;
+    if (pp && Array.isArray(pp.PRIVILEGED_PLUGIN_IDS)) return pp.PRIVILEGED_PLUGIN_IDS;
+    return PRIVILEGED_IDS;
+  }
+
+  function isPrivilegedId(pluginId) {
+    return privilegedIds().indexOf(pluginId) !== -1;
+  }
 
   function pluginReady() {
     return !!(window.HistoPilot && typeof window.HistoPilot._onHostMessage === "function");
   }
 
   // 注册某插件的接收函数，使 _post 能按 pluginInstallationId 路由回来。
+  // 拒绝 SDK 占用内置特权身份（histopilot）。
   function registerPlugin(pluginId, fn) {
-    if (pluginId && typeof fn === "function") pluginReceivers[pluginId] = fn;
+    if (!pluginId || typeof fn !== "function") return;
+    if (isPrivilegedId(pluginId)) return;
+    pluginReceivers[pluginId] = fn;
+  }
+
+  // SDK 入站：由 host 盖章 pluginInstallationId，插件不能改信封冒充他人。
+  // 特权 ID 拒绝（histopilot 走 _receiveFromPlugin / 内置 bundle）。
+  function postFromPlugin(pluginId, env) {
+    if (!pluginId || isPrivilegedId(pluginId) || !env) return;
+    var stamped = {};
+    for (var k in env) {
+      if (Object.prototype.hasOwnProperty.call(env, k)) stamped[k] = env[k];
+    }
+    stamped.pluginInstallationId = pluginId;
+    _receiveFromPlugin(stamped);
   }
 
   // 运行时主版本兼容校验（强制同 major）。优先走共享模块，缺失时内联兜底。
@@ -86,11 +112,25 @@
     });
   }
 
+  // 握手期版本协商（bridge.negotiate）由路由器原生应答：协商属桥协议层，不依赖
+  // app.js 等业务脚本的注册时序——插件脚本可能先于 app.js 加载并立即握手，若等
+  // reqHandlers 注册会先收到 unknown_method（demo 实测回归）。信封层已做同 major
+  // 校验；此处判 payload.protocolVersion 是否落在 supportedMajors。
+  function nativeNegotiate(payload) {
+    var bv = (typeof window !== "undefined") ? window.BridgeVersion : null;
+    var remote = (payload && (payload.protocolVersion || payload.bridgeProtocolVersion)) || null;
+    if (!bv) return { ok: true, protocolVersion: PROTO }; // BV 未加载：信封已过同 major，兜底接受
+    var res = bv.negotiate(remote);
+    if (!res.ok) throw res.error; // → host 回 ok:false, error={code:"version_incompatible",...}
+    return res; // {ok:true, protocolVersion}
+  }
+
   // 处理插件发来的 request：跑注册的 handler（fn(payload, env)，向后兼容单参 fn），
   // 回 response（未知 method 回 unknown_method，不崩）。响应信封回显发起者的
   // pluginInstallationId，使通用插件注册表能正确路由（histopilot 回落不受影响）。
   function _handlePluginRequest(env) {
     var fn = reqHandlers[env.method];
+    if (!fn && env.method === "bridge.negotiate") fn = nativeNegotiate;
     var replyTo = env.pluginInstallationId || PLUGIN_ID;
     Promise.resolve().then(function () {
       if (!fn) throw { code: "unknown_method", message: "host 未实现 " + env.method };
@@ -139,6 +179,7 @@
     PROTO: PROTO,
     pluginReady: pluginReady,
     registerPlugin: registerPlugin,
+    postFromPlugin: postFromPlugin,
     request: request,
     emit: emit,
     onRequest: function (method, fn) { reqHandlers[method] = fn; },

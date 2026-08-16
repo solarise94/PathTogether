@@ -204,11 +204,15 @@ describe("AgentRunner.askFork — fork flows", () => {
 		const persisted = await h.store.replayEvents(sessionId, 0);
 		const forkCreated = persisted.find((e) => e.type === "fork_created");
 		expect(forkCreated).toBeDefined();
-		expect((forkCreated!.payload as { annotation_id: string; title: string })).toMatchObject({ annotation_id: "root-1", title: "批注@可疑" });
+		// Payload carries session_id + the placeholder title (spot lookup is
+		// post-return; driveFork renames afterwards).
+		expect((forkCreated!.payload as { annotation_id: string; session_id: string; title: string })).toMatchObject({ annotation_id: "root-1", session_id: sessionId, title: "批注@" });
 
 		const data = await h.store.readSession(sessionId);
 		expect(data!.kind).toBe("fork");
 		expect(data!.annotation_id).toBe("root-1");
+		// driveFork renamed the placeholder to 批注@label after findSpot.
+		expect(data!.title).toContain("可疑");
 		// The first user message is the spot card with the question as display_text.
 		const firstUser = data!.messages[0] as { role?: string; display_text?: string; content?: unknown };
 		expect(firstUser.role).toBe("user");
@@ -249,11 +253,19 @@ describe("AgentRunner.askFork — fork flows", () => {
 		expect(lastUser.display_text).toBe("再看一眼");
 	});
 
-	it("throws RootAnnotationGone (→ 410) when the root annotation is deleted", async () => {
+	it("settles the fork as error via agent_error when the root annotation is deleted", async () => {
 		const { fn } = makeFakeStreamFn([{ text: "x", stopReason: "stop" as const }]);
 		const h: Harness = await newHarness(fn);
 		h.mock.spotChanges.push({ annotation_id: "root-gone", x: 1, y: 1, side_px: 1, note: "", change_seq: ++h.mock.currentSeq, deleted: true });
-		await expect(h.runner.askFork({ slide: "test.svs", config: { ...BASE_CONFIG }, annotationId: "root-gone" })).rejects.toThrow(/已删除/);
+		// Root lookup is post-return (driveFork): askFork resolves a sessionId
+		// immediately, then the session settles error with agent_error (已删除).
+		const { sessionId } = await h.runner.askFork({ slide: "test.svs", config: { ...BASE_CONFIG }, annotationId: "root-gone" });
+		const status = await waitForSettle(h.store, sessionId);
+		expect(status).toBe("error");
+		const persisted = await h.store.replayEvents(sessionId, 0);
+		const err = persisted.find((e) => e.type === "agent_error");
+		expect(err).toBeDefined();
+		expect((err!.payload as { error: string }).error).toMatch(/已删除/);
 	});
 });
 
@@ -287,12 +299,15 @@ describe("AgentRunner.askBranch — branch flows", () => {
 		const persisted = await h.store.replayEvents(sessionId, 0);
 		const branchCreated = persisted.find((e) => e.type === "branch_created");
 		expect(branchCreated).toBeDefined();
-		expect((branchCreated!.payload as { annotation_id: string; title: string })).toMatchObject({ annotation_id: "br-root-1" });
-		expect((branchCreated!.payload as { title: string }).title).toContain("可疑");
+		// Payload carries session_id (UI switches on it) + the placeholder title
+		// (the spot lookup is post-return; driveBranch renames afterwards).
+		expect((branchCreated!.payload as { annotation_id: string; session_id: string; title: string })).toMatchObject({ annotation_id: "br-root-1", session_id: sessionId, title: "批注深读" });
 
 		const data = await h.store.readSession(sessionId);
 		expect(data!.kind).toBe("branch");
 		expect(data!.annotation_id).toBe("br-root-1");
+		// driveBranch renamed the placeholder to 批注深读@label after findSpot.
+		expect(data!.title).toContain("可疑");
 		// The session is registered under branches (not forks).
 		const idx = await h.store.listBySlide("test.svs");
 		expect(idx.branches["br-root-1"]).toBe(sessionId);
@@ -336,12 +351,42 @@ describe("AgentRunner.askBranch — branch flows", () => {
 		expect(lastUser.display_text).toBe("再看");
 	});
 
-	it("throws RootAnnotationGone (→ 410) when the root annotation is deleted", async () => {
+	it("settles the branch as error via agent_error when the root annotation is deleted", async () => {
 		const { fn } = makeFakeStreamFn([{ text: "x", stopReason: "stop" as const }]);
 		const h: Harness = await newHarness(fn);
 		h.mock.spotChanges.push({ annotation_id: "br-gone", x: 1, y: 1, side_px: 1, note: "", change_seq: ++h.mock.currentSeq, deleted: true });
-		await expect(h.runner.askBranch({ slide: "test.svs", config: { ...BASE_CONFIG }, annotationId: "br-gone" })).rejects.toThrow(/已删除/);
+		// Root lookup is post-return (driveBranch): askBranch resolves a
+		// sessionId immediately, then the session settles error with agent_error
+		// (已删除) — the SSE stream is already up, so no HTTP 410.
+		const { sessionId } = await h.runner.askBranch({ slide: "test.svs", config: { ...BASE_CONFIG }, annotationId: "br-gone" });
+		const status = await waitForSettle(h.store, sessionId);
+		expect(status).toBe("error");
+		const persisted = await h.store.replayEvents(sessionId, 0);
+		const err = persisted.find((e) => e.type === "agent_error");
+		expect(err).toBeDefined();
+		expect((err!.payload as { error: string }).error).toMatch(/已删除/);
 	});
+
+	it("returns sessionId promptly (<200ms) even when flask.spots never resolves", async () => {
+		// Locks the "no Flask callback before return" invariant: the Flask SSE
+		// proxy holds a worker while awaiting askBranch, so a spots call on the
+		// return path deadlocks the pair (demo symptom: 正在开启分支会话… forever).
+		const { fn } = makeFakeStreamFn([{ text: "x", stopReason: "stop" as const }]);
+		const h: Harness = await newHarness(fn);
+		h.mock.spotChanges.push({ annotation_id: "br-hang", x: 1, y: 2, side_px: 10, note: "n", label: "L", change_seq: ++h.mock.currentSeq, deleted: false });
+		const origSpots = h.mock.spots.bind(h.mock);
+		h.mock.spots = (() => new Promise(() => {})) as never;
+		try {
+			const result = await Promise.race([
+				h.runner.askBranch({ slide: "test.svs", config: { ...BASE_CONFIG }, annotationId: "br-hang", question: "q" }),
+				new Promise<null>((r) => setTimeout(() => r(null), 200)),
+			]);
+			expect(result).not.toBeNull();
+			expect((result as { sessionId: string }).sessionId).toBeTruthy();
+		} finally {
+			h.mock.spots = origSpots as never;
+		}
+	}, 5000);
 
 	it("archives the oldest non-running branch when the branch limit is exceeded", async () => {
 		// Create 3 branches (all finish immediately), then create a 4th with a

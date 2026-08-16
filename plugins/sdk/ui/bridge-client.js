@@ -59,10 +59,12 @@
     var reqHandlers = {}; // Host→Plugin request: method -> fn(payload)->result|promise
     var evtHandlers = {}; // Host→Plugin event: type -> fn(payload)
 
-    // 发送：把信封交给 host 入口。同窗口阶段直接调用 host._receiveFromPlugin。
+    // 发送：把信封交给 host 入口。同窗口阶段走 host.postFromPlugin，由 host 盖章身份。
     function _post(env) {
       var host = (typeof window !== "undefined") ? window.HostBridgeHost : null;
-      if (host && typeof host._receiveFromPlugin === "function") {
+      if (host && typeof host.postFromPlugin === "function") {
+        try { host.postFromPlugin(pluginId, env); } catch (e) {}
+      } else if (host && typeof host._receiveFromPlugin === "function") {
         try { host._receiveFromPlugin(env); } catch (e) {}
       }
       // host 未就绪（平台关闭插件 flag）：静默丢弃，不阻塞插件内部逻辑

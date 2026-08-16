@@ -34,7 +34,13 @@ const PluginSDK = require(resolve(here, "../../plugins/sdk/ui/bridge-client.js")
 };
 const PluginPermissions = require(resolve(here, "../../static/plugin-permissions.js")) as {
 	METHOD_PERMISSIONS: Record<string, string>;
+	PRIVILEGED_PLUGIN_IDS: string[];
 	checkPermission: (declaredPerms: string[], method: string) => null | {
+		code: string;
+		message: string;
+		retryable: boolean;
+	};
+	gatePermission: (pluginId: string, method: string, table?: Record<string, string[]>) => null | {
 		code: string;
 		message: string;
 		retryable: boolean;
@@ -66,6 +72,7 @@ interface FakeHost {
 	_requestBehavior?: Record<string, () => unknown>;
 	events: Array<{ type: string; payload: unknown }>;
 	registerPlugin: (pluginId: string, fn: (env: Env) => void) => void;
+	postFromPlugin: (pluginId: string, env: Env) => void;
 	_receiveFromPlugin: (env: Env) => void;
 }
 
@@ -76,7 +83,12 @@ function makeFakeHost(): FakeHost {
 		_receivers: {},
 		events: [],
 		registerPlugin(pluginId, fn) {
+			if (pluginId === "histopilot") return;
 			h._receivers[pluginId] = fn;
+		},
+		postFromPlugin(pluginId, env) {
+			if (!pluginId || pluginId === "histopilot" || !env) return;
+			h._receiveFromPlugin({ ...env, pluginInstallationId: pluginId });
 		},
 		_receiveFromPlugin(env) {
 			if (!env) return;
@@ -217,9 +229,7 @@ describe("PluginPermissions.checkPermission", () => {
 		expect(PluginPermissions.checkPermission([], "some.unknown.method")).toBeNull();
 	});
 
-	it("treats undefined/null declared as empty (permission_denied); allow-if-absent logic lives in host gate", () => {
-		// checkPermission 本身把非数组当空权限表 → permission_denied；"不在权限表内则放行"
-		// 是 app.js 的 gate() 判定（declared 非数组时跳过 checkPermission），不属于本函数。
+	it("treats undefined/null declared as empty (permission_denied)", () => {
 		expect(PluginPermissions.checkPermission(undefined as unknown as string[], "viewer.navigate")).toMatchObject({
 			code: "permission_denied",
 		});
@@ -231,5 +241,38 @@ describe("PluginPermissions.checkPermission", () => {
 		expect(PluginPermissions.METHOD_PERMISSIONS["viewer.navigate"]).toBe("viewer:navigate");
 		expect(PluginPermissions.METHOD_PERMISSIONS["viewer.highlight"]).toBe("viewer:navigate");
 		expect(PluginPermissions.METHOD_PERMISSIONS["annotation.create"]).toBe("annotation:write");
+		expect(PluginPermissions.METHOD_PERMISSIONS["annotation.focus"]).toBe("viewer:navigate");
+	});
+});
+
+describe("PluginPermissions.gatePermission", () => {
+	const table = { "sample-annotator": ["slide:metadata:read", "viewer:navigate", "annotation:write"] };
+
+	it("allows histopilot even when absent from the permissions table", () => {
+		expect(PluginPermissions.PRIVILEGED_PLUGIN_IDS).toContain("histopilot");
+		expect(PluginPermissions.gatePermission("histopilot", "annotation.create", table)).toBeNull();
+		expect(PluginPermissions.gatePermission("histopilot", "annotation.create", {})).toBeNull();
+	});
+
+	it("denies unknown plugin ids (fail-closed, including spoofed histopilot-like names)", () => {
+		expect(PluginPermissions.gatePermission("unknown-plugin", "slide.getCurrent", table)).toMatchObject({
+			code: "permission_denied",
+		});
+		expect(PluginPermissions.gatePermission("HistoPilot", "slide.getCurrent", table)).toMatchObject({
+			code: "permission_denied",
+		});
+	});
+
+	it("denies missing plugin identity", () => {
+		expect(PluginPermissions.gatePermission("", "slide.getCurrent", table)).toMatchObject({
+			code: "permission_denied",
+		});
+	});
+
+	it("enforces declared permissions for table entries", () => {
+		expect(PluginPermissions.gatePermission("sample-annotator", "slide.getCurrent", table)).toBeNull();
+		expect(PluginPermissions.gatePermission("sample-annotator", "annotation.read", table)).toMatchObject({
+			code: "permission_denied",
+		});
 	});
 });

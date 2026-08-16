@@ -36,6 +36,7 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 
 import { SYSTEM_PROMPT, DEFAULT_TASK, FORK_LITE_SYSTEM_PROMPT, makeMainMessages, makeForkMessages, type SpotDict } from "./prompts.js";
 import { buildModel, type AiEngineConfig } from "./pi-model.js";
+import { withSsrfGuard } from "./ssrf-guard.js";
 import {
 	AgentState,
 	createTools,
@@ -188,6 +189,11 @@ export interface RunConfig extends AiEngineConfig {
 	 * {@link PlatformClient} via {@link CreateAnnotationRequest.runGrant}.
 	 */
 	run_grant?: import("./platform/contract.js").RunGrantRef;
+	/**
+	 * 用户自带 base_url 时由 Flask 置 true。sidecar 在连接层固定已验证公网 IP
+	 * 并禁止重定向，关闭 DNS rebinding / 30x 跳内网窗口。平台/owner URL 不置。
+	 */
+	ssrf_guard?: boolean;
 }
 
 /** Common run arguments. `config` is required. */
@@ -440,11 +446,18 @@ export class AgentRunner {
 	 * tool calls in their transcript are preserved on resume; only new tool
 	 * availability is removed.
 	 *
-	 * - Root annotation gone → throws {@link RootAnnotationGone} (→ 410).
+	 * - No Flask callbacks (findSpot / spots) before the return: the Flask SSE
+	 *   proxy holds a worker thread while awaiting this promise, and a spots
+	 *   call back into Flask from here deadlocks the pair (root-annotation
+	 *   lookup + spot_cursor seed moved into {@link driveFork}). A deleted root
+	 *   therefore settles the session as error via an SSE agent_error instead
+	 *   of an HTTP 410.
 	 * - Existing fork for this annotation → resume it (append the question,
 	 *   emit `fork_resumed`).
 	 * - Otherwise: enforce the fork-active limit (archive oldest non-running),
-	 *   create a new fork, emit `fork_created`, then run the loop.
+	 *   create a new fork (placeholder title; driveFork renames it to
+	 *   `批注@label` after the spot lookup), emit `fork_created`, then run the
+	 *   loop.
 	 *
 	 * Returns `{sessionId}` immediately.
 	 */
@@ -452,12 +465,6 @@ export class AgentRunner {
 		const { slide, config, annotationId } = args;
 		const owner = config.session_owner;
 		this.selfCheckRunGrant(config);
-
-		// Locate the root annotation via the spot change log (tombstone-aware).
-		const roi = await this.findSpot(slide, annotationId);
-		if (!roi || roi.deleted) {
-			throw new RootAnnotationGone();
-		}
 
 		const idx = await this.store.listBySlide(slide);
 		const existing = idx.forks[annotationId];
@@ -487,33 +494,24 @@ export class AgentRunner {
 			});
 			void updated;
 			await this.bus.emit(data.id, "fork_resumed", { session_id: data.id, annotation_id: annotationId });
-			void this.driveFork(data.id, slide, config, annotationId).catch(async (e) => {
-				await this.handleFatal(data.id, e);
-			});
-			return { sessionId: data.id, streamFromSeq };
+				this.kickDrive(() => this.driveFork(data.id, slide, config, annotationId).catch(async (e) => {
+					await this.handleFatal(data.id, e);
+				}));
+				return { sessionId: data.id, streamFromSeq };
 		}
 
 		// New fork: enforce the active limit (app.py:1726).
 		const limit = Math.max(0, Math.floor(config.fork_active_limit ?? 20));
 		await this.enforceForkLimit(slide, limit);
 
-		const title = "批注@" + (roi.label || "");
+		const title = "批注@";
 		const data = await this.store.acquire({ slide, kind: "fork", annotationId, title, owner });
-		// seed spot_cursor (app.py:1739).
-		await this.store.withLock(data.id, async (d) => {
-			if (!d) return null;
-			const spots = await this.flask.spots(legacySlide(slide), 0).catch(() => ({ changes: [], currentSeq: 0 }));
-			d.spot_cursor = spots.currentSeq || 0;
-			d.updated_at = Math.floor(Date.now() / 1000);
-			await this.store.writeSession(data.id, d);
-			return d;
-		});
 
-		await this.bus.emit(data.id, "fork_created", { annotation_id: annotationId, title });
-		void this.driveFork(data.id, slide, config, annotationId, roi, args.question).catch(async (e) => {
-			await this.handleFatal(data.id, e);
-		});
-		return { sessionId: data.id, streamFromSeq: 0 };
+			await this.bus.emit(data.id, "fork_created", { session_id: data.id, annotation_id: annotationId, title });
+			this.kickDrive(() => this.driveFork(data.id, slide, config, annotationId, undefined, args.question).catch(async (e) => {
+				await this.handleFatal(data.id, e);
+			}));
+			return { sessionId: data.id, streamFromSeq: 0 };
 	}
 
 	// ----------------------------------------------------------------------- //
@@ -527,12 +525,19 @@ export class AgentRunner {
 	 * can navigate / snapshot / annotate starting from the spot. The initial
 	 * message is identical to a fork (spot card + bbox-expanded 15% image).
 	 *
-	 * - Root annotation gone → throws {@link RootAnnotationGone} (→ 410).
+	 * - No Flask callbacks (findSpot / spots) before the return: the Flask SSE
+	 *   proxy holds a worker thread while awaiting this promise, and a spots
+	 *   call back into Flask from here deadlocks the pair (root-annotation
+	 *   lookup + spot_cursor seed moved into {@link driveBranch}). A deleted root
+	 *   therefore settles the session as error via an SSE agent_error instead
+	 *   of an HTTP 410.
 	 * - Existing branch for this annotation → resume it (append the question,
 	 *   emit `branch_resumed`).
 	 * - Otherwise: enforce the branch-active limit (reuses fork_active_limit but
 	 *   counts only kind="branch"; archives the oldest non-running branch),
-	 *   create a new branch, emit `branch_created`, then run the loop.
+	 *   create a new branch (placeholder title; driveBranch renames it to
+	 *   `批注深读@label` after the spot lookup), emit `branch_created`, then run
+	 *   the loop.
 	 *
 	 * Returns `{sessionId}` immediately.
 	 */
@@ -540,12 +545,6 @@ export class AgentRunner {
 		const { slide, config, annotationId } = args;
 		const owner = config.session_owner;
 		this.selfCheckRunGrant(config);
-
-		// Locate the root annotation via the spot change log (tombstone-aware).
-		const roi = await this.findSpot(slide, annotationId);
-		if (!roi || roi.deleted) {
-			throw new RootAnnotationGone();
-		}
 
 		const existing = await this.store.findBranch(slide, annotationId);
 
@@ -571,11 +570,11 @@ export class AgentRunner {
 				return d;
 			});
 			void updated;
-			await this.bus.emit(data.id, "branch_resumed", { session_id: data.id, annotation_id: annotationId });
-			void this.driveBranch(data.id, slide, config, annotationId).catch(async (e) => {
-				await this.handleFatal(data.id, e);
-			});
-			return { sessionId: data.id, streamFromSeq };
+				await this.bus.emit(data.id, "branch_resumed", { session_id: data.id, annotation_id: annotationId });
+				this.kickDrive(() => this.driveBranch(data.id, slide, config, annotationId).catch(async (e) => {
+					await this.handleFatal(data.id, e);
+				}));
+				return { sessionId: data.id, streamFromSeq };
 		}
 
 		// New branch: enforce the active limit (reuses fork_active_limit but
@@ -583,23 +582,14 @@ export class AgentRunner {
 		const limit = Math.max(0, Math.floor(config.fork_active_limit ?? 20));
 		await this.enforceBranchLimit(slide, limit);
 
-		const title = "批注深读@" + (roi.label || "");
+		const title = "批注深读";
 		const data = await this.store.acquire({ slide, kind: "branch", annotationId, title, owner });
-		// seed spot_cursor (same as fork).
-		await this.store.withLock(data.id, async (d) => {
-			if (!d) return null;
-			const spots = await this.flask.spots(legacySlide(slide), 0).catch(() => ({ changes: [], currentSeq: 0 }));
-			d.spot_cursor = spots.currentSeq || 0;
-			d.updated_at = Math.floor(Date.now() / 1000);
-			await this.store.writeSession(data.id, d);
-			return d;
-		});
 
-		await this.bus.emit(data.id, "branch_created", { annotation_id: annotationId, title });
-		void this.driveBranch(data.id, slide, config, annotationId, roi, args.question).catch(async (e) => {
-			await this.handleFatal(data.id, e);
-		});
-		return { sessionId: data.id, streamFromSeq: 0 };
+			await this.bus.emit(data.id, "branch_created", { session_id: data.id, annotation_id: annotationId, title });
+			this.kickDrive(() => this.driveBranch(data.id, slide, config, annotationId, undefined, args.question).catch(async (e) => {
+				await this.handleFatal(data.id, e);
+			}));
+			return { sessionId: data.id, streamFromSeq: 0 };
 	}
 
 	// ----------------------------------------------------------------------- //
@@ -726,13 +716,22 @@ export class AgentRunner {
 			});
 		}
 
-		await this.runAgentLoop(sessionId, slide, config, slideInfo, initialMessages, resumed);
+		await this.runGuardedLoop(config, () =>
+			this.runAgentLoop(sessionId, slide, config, slideInfo, initialMessages, resumed),
+		);
 	}
 
 	/**
 	 * Drive a fork session: emit fork_resumed (already emitted by askFork for
 	 * new forks via fork_created), build/continue the context, run the loop.
 	 * Mirrors app.py:2017 `worker`.
+	 *
+	 * The root-annotation lookup (findSpot) + spot_cursor seed run HERE, after
+	 * askFork has returned: the HTTP handler must write its SSE headers before
+	 * any Flask callback, or the Flask SSE proxy (which holds a worker thread
+	 * awaiting this sidecar) deadlocks against the spots call. A deleted root
+	 * settles the session as error via agent_error (no HTTP 410 — the SSE
+	 * stream has already started).
 	 */
 	private async driveFork(
 		sessionId: string,
@@ -750,10 +749,11 @@ export class AgentRunner {
 
 		if (data.messages.length === 0) {
 			// Brand-new fork: build the spot card + image (app.py:1731-1741).
-			if (!roi) {
-				roi = (await this.findSpot(slide, annotationId)) || undefined;
-			}
-			const spot: SpotDict = roi || { annotation_id: annotationId };
+			roi = await this.resolveRootSpot(sessionId, slide, annotationId, roi);
+			if (!roi) return;
+			await this.seedSpotCursor(sessionId, slide);
+			await this.renamePlaceholderTitle(sessionId, "批注@", "批注@" + (roi.label || ""));
+			const spot: SpotDict = roi;
 			const { imageRef, imageB64 } = await this.forkSpotImageRef(slide, slideInfo, spot);
 			const userMsg = makeForkMessages({
 				slideName: slide,
@@ -773,7 +773,11 @@ export class AgentRunner {
 				return d;
 			});
 		} else {
-			// Resumed fork: inject spot changes (app.py:2021). injectSpotChanges
+			// Resumed fork: the root must still exist (was checked pre-return
+			// historically; now here so the HTTP layer never waits on Flask).
+			roi = await this.resolveRootSpot(sessionId, slide, annotationId, roi);
+			if (!roi) return;
+			// inject spot changes (app.py:2021). injectSpotChanges
 			// appends + persists internally; re-read the session for the full
 			// transcript (avoid double-appending the spot messages).
 			await this.injectSpotChanges(sessionId, slide);
@@ -782,9 +786,74 @@ export class AgentRunner {
 			// fork_resumed was already emitted by askFork; nothing to do here.
 		}
 
-		await this.runAgentLoop(sessionId, slide, config, slideInfo, initialMessages, false, {
-			kind: "fork",
-			systemPrompt: FORK_LITE_SYSTEM_PROMPT,
+		await this.runGuardedLoop(config, () =>
+			this.runAgentLoop(sessionId, slide, config, slideInfo, initialMessages, false, {
+				kind: "fork",
+				systemPrompt: FORK_LITE_SYSTEM_PROMPT,
+			}),
+		);
+	}
+
+	/**
+	 * Resolve the root annotation for a fork/branch drive, post-return.
+	 * Emits agent_error + settles "error" when the annotation is gone (the SSE
+	 * stream has already started, so no HTTP 410 is possible; the message text
+	 * matches {@link RootAnnotationGone}). Returns the live roi, or undefined
+	 * when the drive should abort.
+	 */
+		/**
+		 * Start driveFork/driveBranch only after the current turn yields, so
+		 * handleAsk/handleBranch can write SSE headers first. A same-tick
+		 * fetchSlideInfo/findSpot would deadlock the Flask SSE proxy (it holds a
+		 * worker until the sidecar writes response headers).
+		 */
+		private kickDrive(fn: () => Promise<void>): void {
+			setImmediate(() => { void fn(); });
+		}
+
+		private async resolveRootSpot(
+		sessionId: string,
+		slide: string,
+		annotationId: string,
+		roi?: RoiDict,
+	): Promise<RoiDict | undefined> {
+		let spot = roi;
+		if (!spot) {
+			spot = ((await this.findSpot(slide, annotationId)) || undefined) as RoiDict | undefined;
+		}
+		if (!spot || (spot as RoiDict & { deleted?: boolean }).deleted) {
+			await this.bus.emit(sessionId, "agent_error", { error: "该标注已删除" });
+			await this.store.setStatus(sessionId, "error");
+			return undefined;
+		}
+		return spot;
+	}
+
+	/**
+	 * Brand-new fork/branch: seed spot_cursor from the platform change log
+	 * (app.py:1739). Moved out of askFork/askBranch so their return never
+	 * waits on Flask. Failure seeds cursor=0 (spot injection then replays the
+	 * full change log, which is safe).
+	 */
+	private async seedSpotCursor(sessionId: string, slide: string): Promise<void> {
+		await this.store.withLock(sessionId, async (d) => {
+			if (!d) return null;
+			const spots = await this.flask.spots(legacySlide(slide), 0).catch(() => ({ changes: [], currentSeq: 0 }));
+			d.spot_cursor = spots.currentSeq || 0;
+			d.updated_at = Math.floor(Date.now() / 1000);
+			await this.store.writeSession(sessionId, d);
+			return d;
+		});
+	}
+
+	/** Replace a placeholder fork/branch title with the label-bearing one. */
+	private async renamePlaceholderTitle(sessionId: string, placeholder: string, title: string): Promise<void> {
+		await this.store.withLock(sessionId, async (d) => {
+			if (!d || d.title !== placeholder) return d;
+			d.title = title;
+			d.updated_at = Math.floor(Date.now() / 1000);
+			await this.store.writeSession(sessionId, d);
+			return d;
 		});
 	}
 
@@ -796,6 +865,10 @@ export class AgentRunner {
 	 * bbox-expanded image) but with the FULL toolset (incl. create_annotation),
 	 * so the model can navigate / snapshot / annotate starting from the spot.
 	 * Mirrors driveFork but passes kind="branch" (full tools + SYSTEM_PROMPT).
+	 *
+	 * Same post-return constraint as driveFork: findSpot + spot_cursor seed run
+	 * here (never before askBranch's return — see the Flask SSE proxy deadlock
+	 * note on askFork).
 	 */
 	private async driveBranch(
 		sessionId: string,
@@ -813,10 +886,11 @@ export class AgentRunner {
 
 		if (data.messages.length === 0) {
 			// Brand-new branch: build the spot card + image (same shape as fork).
-			if (!roi) {
-				roi = (await this.findSpot(slide, annotationId)) || undefined;
-			}
-			const spot: SpotDict = roi || { annotation_id: annotationId };
+			roi = await this.resolveRootSpot(sessionId, slide, annotationId, roi);
+			if (!roi) return;
+			await this.seedSpotCursor(sessionId, slide);
+			await this.renamePlaceholderTitle(sessionId, "批注深读", "批注深读@" + (roi.label || ""));
+			const spot: SpotDict = roi;
 			const { imageRef, imageB64 } = await this.forkSpotImageRef(slide, slideInfo, spot);
 			const userMsg = makeForkMessages({
 				slideName: slide,
@@ -836,7 +910,10 @@ export class AgentRunner {
 				return d;
 			});
 		} else {
-			// Resumed branch: inject spot changes (same as fork/main resume).
+			// Resumed branch: the root must still exist (post-return check, same
+			// as fork resume). inject spot changes (same as fork/main resume).
+			roi = await this.resolveRootSpot(sessionId, slide, annotationId, roi);
+			if (!roi) return;
 			await this.injectSpotChanges(sessionId, slide);
 			const after = await this.store.readSession(sessionId);
 			initialMessages = (after?.messages || []) as PersistedAgentMessage[];
@@ -844,11 +921,19 @@ export class AgentRunner {
 		}
 
 		// Full toolset + full SYSTEM_PROMPT (branch == main toolset, seeded from spot).
-		await this.runAgentLoop(sessionId, slide, config, slideInfo, initialMessages, false, {
-			kind: "branch",
-			systemPrompt: SYSTEM_PROMPT,
-		});
+		await this.runGuardedLoop(config, () =>
+			this.runAgentLoop(sessionId, slide, config, slideInfo, initialMessages, false, {
+				kind: "branch",
+				systemPrompt: SYSTEM_PROMPT,
+			}),
+		);
 	}
+
+	/** 用户自带 URL 时在连接层启用 SSRF 守卫（固定公网 IP、禁止重定向）。 */
+	private runGuardedLoop(config: RunConfig, fn: () => Promise<void>): Promise<void> {
+		return config.ssrf_guard ? withSsrfGuard(fn) : fn();
+	}
+
 	/**
 	 * Build a pi Agent, wire event mapping + run-level guards, and run to
 	 * completion. Settles status (finished/error/paused) at the end so the SSE

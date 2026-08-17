@@ -1,0 +1,14 @@
+{
+  "name": "@solarise94/pathtogether-platform-tests",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test:js": "vitest run tests/js"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.7"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

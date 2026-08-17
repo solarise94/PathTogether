@@ -86,7 +86,7 @@ SUPPORTED_EXTS = {
 # 归档扩展名：zip 上传后解压（用于 MRXS 等需要伴侣数据目录的格式）
 ARCHIVE_EXTS = {"zip"}
 
-# 分享服务基础 URL（外部用户访问入口，生产部署用 env 覆盖，如 https://slides.example.com:18767）
+# 分享服务基础 URL（外部用户访问入口，生产部署用 env 覆盖，如 https://slides.example.com）
 SHARE_BASE_URL = os.environ.get(
     "SHARE_BASE_URL", "http://localhost:38000"
 ).rstrip("/")
@@ -5486,7 +5486,7 @@ def api_annotation_history(token, index):
 
 if __name__ == "__main__":
     # 管理端外网门户由 share_server 合并进程提供（同端口按路径分流），
-    # 本进程只保留内网 HTTP 监听；外网走 https://browser.example.invalid/
+    # 本进程只保留内网 HTTP 监听；外网地址由反向代理和部署环境配置。
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 8000)),

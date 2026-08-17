@@ -83,7 +83,13 @@ PathTogether 容器只运行平台。HistoPilot 使用自己的镜像、进程�
 
 ```bash
 python3 -m pytest tests -q
+npm ci
+npm run test:js
 ```
+
+Python tests cover the platform and compatibility gateway. The small Vitest
+suite owns the platform-side HostBridge, permission gate, and plugin SDK
+contracts that moved out of HistoPilot during the repository split.
 
 插件协议定义位于 `plugins/manifest.schema.json` 和 `plugins/sdk/`。`plugins/sample-annotator/` 是不依赖 HistoPilot 的最小示例插件。
 

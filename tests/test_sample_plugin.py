@@ -196,21 +196,5 @@ def test_plugin_route_rejects_plugin_id_traversal():
         assert r.status_code == 404, pid
 
 
-# =========================================================================== #
-# (f) histopilot 既有行为不被通用化破坏（回看 Stage 2 关键断言）
-# =========================================================================== #
-def test_histopilot_asset_still_gated_by_flag(monkeypatch):
-    # HISTOPILOT_UI_ENABLED=0 时 histopilot 资源 404（test_stage2_ui 断言保持）
-    monkeypatch.setenv("HISTOPILOT_UI_ENABLED", "0")
-    r = _client().get("/plugins/histopilot/ui/main.js")
-    assert r.status_code == 404
-
-
-def test_histopilot_asset_served_when_flag_on(monkeypatch):
-    monkeypatch.delenv("HISTOPILOT_UI_ENABLED", raising=False)  # 默认开启
-    r = _client().get("/plugins/histopilot/ui/main.js")
-    assert r.status_code == 200
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

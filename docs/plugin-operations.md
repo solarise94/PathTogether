@@ -11,7 +11,7 @@
 
 ## 1. 四类版本字段与协商
 
-manifest（`plugins/<id>/manifest.json`）有**四个相互独立**的版本字段，平台按
+manifest（`${PLUGIN_BUNDLES_DIR}/<id>/manifest.json`；内置示例仍在 `plugins/`）有**四个相互独立**的版本字段，平台按
 N/N-1 major 协商：
 
 | 字段 | 含义 | 何时 bump major | 协商行为 |
@@ -27,9 +27,9 @@ N/N-1 major 协商：
 `supportedBridgeMajors` 含当前接受的 major 列表。校验器 `validate_manifest` /
 `negotiate_versions` 为纯 stdlib 实现，不依赖 `jsonschema`。
 
-> 注意：manifest 的 `id`（反向域名，如 `com.pathtogather.histopilot`）与 bridge
+> 注意：manifest 的 `id`（反向域名，如 `com.pathtogether.histopilot`）与 bridge
 > 凭证域的 `pluginInstallationId`（目录名简写，如 `histopilot`）**不同**。来源策略
-> 与静态路由统一以 **`plugins/` 下目录名**为 plugin key（`histopilot` /
+> 与静态路由统一以**安装目录名**为 plugin key（`histopilot` /
 > `sample-annotator`），凭证域的 installation_id 是另一套（见第 4 节）。
 
 ---
@@ -47,22 +47,21 @@ N/N-1 major 协商：
 
 ### 2.2 文件格式
 
-`plugins/source-policy.json`：
+`plugins/source-policy.json`（策略文件仍随平台版本发布，bundle 可以位于外部目录）：
 
 ```json
 {
-  "histopilot": "<sha256-of-plugins/histopilot/manifest.json>",
   "sample-annotator": "<sha256-of-plugins/sample-annotator/manifest.json>"
 }
 ```
 
-- key = `plugins/` 下目录名；value = 期望的 manifest sha256（hex）。
+- key = 安装目录名；value = 期望的 manifest sha256（hex）。
 - value 为 `null` = 显式放行（不校验 hash）；key 缺失 = 未 pin = 放行。
 
 ### 2.3 重算 hash（更新 manifest 后必须同步）
 
 ```sh
-shasum -a 256 plugins/histopilot/manifest.json
+shasum -a 256 "${PLUGIN_BUNDLES_DIR}/histopilot/manifest.json"
 shasum -a 256 plugins/sample-annotator/manifest.json
 ```
 

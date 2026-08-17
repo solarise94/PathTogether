@@ -318,18 +318,18 @@ app.config["SESSION_COOKIE_SECURE"] = _resolve_session_cookie_secure()
 
 
 # --------------------------------------------------------------------------- #
-# AI sidecar 共享 token（internal 回调端点鉴权，pi 迁移 Step 2）
+# HistoPilot 共享 token（internal 回调端点鉴权）
 # --------------------------------------------------------------------------- #
-# sidecar（Node）进程与本进程内部回调用同一 token 互信：env AI_INTERNAL_TOKEN
-# 优先；缺省则读/生成 SHARE_DATA_DIR/ai_internal.token（0600，32 字节 hex）。
-# sidecar 进程用同一规则解析 token（env 优先，否则读同一文件）。
+# HistoPilot 与本进程内部回调用同一 token 互信：优先读取
+# HISTOPILOT_INTERNAL_TOKEN；AI_INTERNAL_TOKEN 仅保留为旧一体仓兼容别名。
+# 缺省则读/生成 SHARE_DATA_DIR/ai_internal.token（0600，32 字节 hex）。
 def _load_or_create_ai_internal_token() -> str:
-    """优先 env AI_INTERNAL_TOKEN；否则在数据目录下持久化随机 token（0600）。
+    """优先 HistoPilot token env；否则在数据目录下持久化随机 token（0600）。
 
     与 secret key 同样用 fcntl 排他锁包裹「检查+生成+写」，保证多 worker
     首次生成时只写一次、其余 worker 读到同一 token。
     """
-    env_tok = os.environ.get("AI_INTERNAL_TOKEN")
+    env_tok = os.environ.get("HISTOPILOT_INTERNAL_TOKEN") or os.environ.get("AI_INTERNAL_TOKEN")
     if env_tok:
         return env_tok
     data_dir = _data_dir_for_secret()
@@ -760,7 +760,7 @@ def _rect_size_mm(safe, side_px):
 
 
 # --------------------------------------------------------------------------- #
-# HistoPilot 插件 UI（Stage 2：同源独立 bundle）
+# 插件 UI 资源
 # --------------------------------------------------------------------------- #
 # 插件前端资源（仅服务静态 .js/.css/.html——.html 供示例插件独立页/manifest ui.entry
 # 使用，send_from_directory 原样返回不经模板渲染；目录定位见 _plugin_ui_dir，
@@ -769,19 +769,40 @@ _PLUGIN_UI_ALLOWED_EXT = {".js", ".css", ".html"}
 
 
 def histopilot_ui_enabled():
-    """HistoPilot 插件 UI feature flag。默认开启；HISTOPILOT_UI_ENABLED=0 时关闭。
+    """HistoPilot 兼容 UI 开关。
 
-    在请求时读取（非 import 时），便于测试与运行时切换。关闭时 index 模板不渲染
-    插件 <script> 与 ai-btn / 溢出项，平台前端对 window.HistoPilot 缺失静默降级。
+    拆仓后 PathTogether 不再内置 HistoPilot bundle。只有在外部插件目录中已安装
+    ``histopilot`` 且未显式设置 ``HISTOPILOT_UI_ENABLED=0`` 时才启用兼容入口。
     """
-    return os.environ.get("HISTOPILOT_UI_ENABLED", "1") != "0"
+    if os.environ.get("HISTOPILOT_UI_ENABLED", "1") == "0":
+        return False
+    return _plugin_dir("histopilot") is not None
 
 
 # Sample Annotator 示例插件目录（Stage 5-2，plugins/sample-annotator/）。
 SAMPLE_PLUGIN_DIR = Path(__file__).resolve().parent / "plugins" / "sample-annotator"
 
-# plugins/ 根目录（来源策略按目录名 = plugin key 计算 manifest sha256 pin）。
+# 内置 plugins/ 根目录（SDK 与示例插件）。
 PLUGINS_DIR = Path(__file__).resolve().parent / "plugins"
+
+# 独立发布的插件安装目录。HistoPilot release bundle 应解压到
+# ``${PLUGIN_BUNDLES_DIR}/histopilot``；缺省放在平台数据目录下，升级平台镜像时
+# 不会被覆盖。
+PLUGIN_BUNDLES_DIR = Path(
+    os.environ.get("PLUGIN_BUNDLES_DIR")
+    or (Path(os.environ.get("SHARE_DATA_DIR") or Path.home() / "pathtogether" / "share-data") / "plugins")
+)
+
+
+def _plugin_dir(plugin_id):
+    """返回已安装插件目录；外部安装优先于内置示例，且拒绝路径穿越。"""
+    if not plugin_id or "/" in plugin_id or "\\" in plugin_id or ".." in plugin_id:
+        return None
+    for root in (PLUGIN_BUNDLES_DIR, PLUGINS_DIR):
+        candidate = root / plugin_id
+        if candidate.is_dir():
+            return candidate
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -846,10 +867,13 @@ def plugin_source_allowed(plugin_id):
     expected = policy[plugin_id]
     if expected is None:
         return (True, "explicitly allowed")
-    mf = PLUGINS_DIR / plugin_id / "manifest.json"
+    plugin_dir = _plugin_dir(plugin_id)
+    mf = plugin_dir / "manifest.json" if plugin_dir is not None else None
     try:
-        digest = hashlib.sha256(mf.read_bytes()).hexdigest()
+        digest = hashlib.sha256(mf.read_bytes()).hexdigest() if mf is not None else ""
     except OSError:
+        return (False, "manifest missing")
+    if not digest:
         return (False, "manifest missing")
     if hmac.compare_digest(digest, str(expected)):
         return (True, "ok")
@@ -906,7 +930,10 @@ def _plugin_ui_dir(plugin_id):
     """
     if not plugin_id or "/" in plugin_id or "\\" in plugin_id or ".." in plugin_id:
         return None
-    uidi = Path(__file__).resolve().parent / "plugins" / plugin_id / "ui"
+    plugin_dir = _plugin_dir(plugin_id)
+    if plugin_dir is None:
+        return None
+    uidi = plugin_dir / "ui"
     return uidi if uidi.is_dir() else None
 
 
@@ -1795,10 +1822,13 @@ def api_slide_thumbnail(name):
 # --------------------------------------------------------------------------- #
 # AI 读片助手相关 API（管理员，走 _require_auth）
 # --------------------------------------------------------------------------- #
-# AI sidecar 地址（pi 迁移 Step 5：Flask /api/ai/* 代理到此 Node sidecar）。
-# 默认 http://127.0.0.1:8055，可用 env AI_SIDECAR_URL 覆盖。代理无状态，gunicorn
-# 多 worker 各自转发，与单 sidecar 实例不冲突。
-AI_SIDECAR_URL = (os.environ.get("AI_SIDECAR_URL") or "http://127.0.0.1:8055").rstrip("/")
+# HistoPilot 地址。HISTOPILOT_URL 是拆仓后的正式变量；AI_SIDECAR_URL 仅作为
+# 旧部署兼容别名。代理无状态，gunicorn 多 worker 可共享一个 HistoPilot 实例。
+AI_SIDECAR_URL = (
+    os.environ.get("HISTOPILOT_URL")
+    or os.environ.get("AI_SIDECAR_URL")
+    or "http://127.0.0.1:8055"
+).rstrip("/")
 # 普通（非 SSE）代理端点超时（秒）；SSE 长连接另用大超时（不限制读）。
 _AI_SIDECAR_TIMEOUT = 30.0
 _AI_SIDECAR_SSE_READ_TIMEOUT = 31536000.0  # 一年：等价于不限制 SSE 读

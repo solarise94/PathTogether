@@ -3,7 +3,7 @@
 ## 功能调整与升级方案
 
 > 文档版本：v1.5
-> 状态：Stage 1 已实施（后端边界抽取：PlatformClient + LegacyFlaskPlatformAdapter，见 §10）；Stage 2+ 待实施
+> 状态：历史拆分设计。Stage 1–5 已在原一体仓实施；2026-08-17 起 PathTogether、HistoPilot 与 HistoPilot-DSH 改为独立仓库和独立发布。当前操作说明以各仓 README 为准。
 > 编写日期：2026-08-12
 > 设计基线：仓库 `HEAD 6dbab64` 及其之前已经提交的功能
 > 并行工作：`EXP-VISCTX-v1`（原“Phase 4”分辨率/上下文窗口 A/B）正在工作区中开发，不计入本文“已实现”状态
@@ -1350,7 +1350,7 @@ COLLAB_DB_V2_ENABLED
 | 7 | 实时协作 | **首版只做变更同步**（不做多人光标/同时编辑） | Stage 3c 范围收缩 |
 | 8 | 数据库 | **PostgreSQL 唯一存储**（开源、单实例多用户并发写稳妥）。砍掉 SQLite 兼容层：双仓储实现是技术债，demo/正式部署统一走 PostgreSQL（Docker compose 一键起）；现有 shares.json 迁移 Postgres 而非保留双轨 | Stage 3b：只做 expand-and-contract 迁 PostgreSQL 单一实现，无 SQLite 适配器 |
 | 9 | 插件 UI 隔离 | **直接 sandbox iframe**（跳过同源 bundle 过渡期） | Stage 2 改为直接 iframe；HostBridge 协议降级为 iframe 内 postMessage 通道，request/response/event 三类消息语义不变 |
-| 10 | 版本策略 | **同仓同版本发布**（HistoPilot 不独立版本化） | §7.0 版本模型简化：API/contract 仍版本化，但产品版本与平台共享；不设独立发布周期与兼容矩阵 |
+| 10 | 版本策略 | **已被 2026-08-17 拆仓 ADR 取代：独立仓库、独立 SemVer 发布** | Plugin Contract 与 Bridge Protocol 继续独立版本化；PathTogether、HistoPilot、HistoPilot-DSH 各自发布，并维护 N/N-1 兼容矩阵 |
 
 | 11 | Demo 模式 | **公开切片集 + 平台官方 API**：部署者提供公开 demo 切片；注册用户用平台官方 API 零配置体验读片；游客看 demo 切片仍需自带 key | 数据模型中需支持 slice visibility=public 与平台配置的官方 API key |
 | 12 | 注册策略 | **开放注册开关归 owner**：默认（demo 场景）不开放自助注册，用户由 owner 手动添加（邮箱创建）；owner 可开启开放注册 | user 模型带 `registration_open` 平台级开关，默认 false；owner 手动创建用户流程（生成初始密码/邀请注册链接） |

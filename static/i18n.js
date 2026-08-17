@@ -16,8 +16,8 @@
   var DICT = {
     zh: {
       // ---- 通用 / 页头 ----
-      "app.title": "HistoPilot",
-      "app.subtitle": "病理切片智能导航",
+      "app.title": "PathTogether",
+      "app.subtitle": "协作式病理读片",
       "share.title": "病理切片查看",
       "login.title": "管理员登录",
       "header.no.slide": "未打开切片",
@@ -471,8 +471,8 @@
 
     en: {
       // ---- 通用 / 页头 ----
-      "app.title": "HistoPilot",
-      "app.subtitle": "Intelligent pathology slide navigation",
+      "app.title": "PathTogether",
+      "app.subtitle": "Collaborative pathology review",
       "share.title": "Pathology Slide Viewer",
       "login.title": "Admin Login",
       "header.no.slide": "No slide open",

@@ -1,5 +1,6 @@
 # 开发/测试期依赖（不进运行镜像）。
 # pgserver：内嵌真实 PostgreSQL 二进制，供 tests/test_pg_infra.py 起隔离实例跑
 # 迁移与外键冒烟。本机无 postgres/podman/docker 时用它在进程内拉起 PG。
-# pytest 已在开发环境存在，不在此重复列出。
+# 测试运行器必须显式声明，避免干净 CI 环境缺少 pytest。
+pytest>=8.0
 pgserver>=0.1.4

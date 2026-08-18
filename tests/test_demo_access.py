@@ -1235,6 +1235,51 @@ def test_demo_available_template_hides_write_ops():
     assert "/plugins/histopilot/" not in html
 
 
+def test_demo_landing_login_cta_switches_for_logged_in_users(monkeypatch):
+    """/demo 已登录用户 CTA 切换「打开完整版」，匿名保持登录/注册（docs B2）。
+
+    仅模板渲染读登录态：/api/demo/* 面不读 identity 的 capability 设计不变。
+    """
+    # 路由层：logged_in 来自 session["auth_user"]
+    captured = {}
+    real_render = app_mod.render_template
+
+    def fake_render(template, **ctx):
+        captured.update(ctx)
+        return real_render(template, **ctx)
+
+    monkeypatch.setattr(app_mod, "render_template", fake_render)
+    client = _client()
+    client.get("/demo")
+    assert captured.get("logged_in") is False
+    with client.session_transaction() as sess:
+        sess["auth_user"] = "u@x.com"
+    client.get("/demo")
+    assert captured.get("logged_in") is True
+
+    # 模板层：login_cta 分支按 logged_in 切换 CTA
+    from flask import render_template
+    caps = app_mod._app_capabilities("demo")
+    common = dict(
+        demo_available=True, demo_enabled=True, app_mode="demo",
+        capabilities=caps, histopilot_ui_enabled=False,
+        adapter_mode="plugin-contract",
+    )
+    with app_mod.app.app_context():
+        anon = render_template("demo.html", logged_in=False, **common)
+        logged = render_template("demo.html", logged_in=True, **common)
+    assert 'data-i18n="demo.login"' in anon
+    assert 'data-i18n="demo.register"' in anon
+    assert 'data-i18n="demo.open.full"' not in anon
+    assert 'data-i18n="demo.open.full"' in logged
+    assert 'href="/"' in logged
+    assert 'data-i18n="demo.login"' not in logged
+    # i18n 双语键齐全
+    i18n = (Path(__file__).resolve().parent.parent / "static" / "i18n.js") \
+        .read_text(encoding="utf-8")
+    assert i18n.count('"demo.open.full":') == 2
+
+
 def test_official_template_keeps_write_ops_and_budget_diag():
     from flask import render_template
     with app_mod.app.app_context():

@@ -1634,6 +1634,9 @@ def demo_landing():
     pg_ok = platform_features.demo_features_available()
     enabled = bool(pg_ok and _demo_public_mode())
     adapter_mode = _histopilot_adapter_mode() if enabled else None
+    # 仅模板渲染用登录态（已登录访问 /demo 时 CTA 切换为“打开完整版”）；
+    # /api/demo/* 面仍不读 identity，capability 安全设计不变
+    logged_in = bool(session.get("auth_user"))
     resp = make_response(render_template(
         "demo.html",
         app_mode="demo",
@@ -1642,6 +1645,7 @@ def demo_landing():
         demo_available=pg_ok,
         demo_enabled=enabled,
         adapter_mode=adapter_mode,
+        logged_in=logged_in,
     ))
     if enabled:
         try:

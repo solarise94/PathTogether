@@ -19,8 +19,12 @@
     </div>
     <span id="header-zoom-badge" class="zoom-badge header-zoom-badge">—</span>
     {% if C.login_cta %}
+    {% if logged_in %}
+    <a class="header-login-link" href="/" data-i18n="demo.open.full">打开完整版</a>
+    {% else %}
     <a class="header-login-link" href="/login" data-i18n="demo.login">登录 PathTogether</a>
     <a class="header-login-link header-register-link" href="/register" data-i18n="demo.register">注册方式</a>
+    {% endif %}
     {% endif %}
     <button type="button" class="lang-toggle" aria-label="Switch language">EN</button>
 

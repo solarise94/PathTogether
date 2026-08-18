@@ -371,40 +371,64 @@
 
         <div id="ai-config-wrap" class="ai-config-wrap">
           <div class="ai-config-title" data-i18n="ai.config.title">AI 服务配置</div>
+          <!-- B1：user 角色的「平台 AI / 自定义 API」两卡 radio group（owner 不显示）。
+               #ai-use-platform checkbox 保留为隐藏状态载体（卡 A ⇔ checked），驱动 PUT use_platform。 -->
+          <div id="ai-source-cards" class="ai-source-cards" style="display:none;">
+            <label class="ai-source-card" id="ai-source-card-platform">
+              <input type="radio" name="ai-source" id="ai-source-platform" value="platform" />
+              <span class="ai-source-card-main">
+                <span class="ai-source-card-title" data-i18n="ai.source.platform">平台 AI（推荐）</span>
+                <span class="ai-source-card-sub" data-i18n="ai.source.platform.sub">由管理员统一提供，开箱即用</span>
+                <span class="ai-source-card-meta" id="ai-source-platform-meta"></span>
+              </span>
+            </label>
+            <label class="ai-source-card" id="ai-source-card-own">
+              <input type="radio" name="ai-source" id="ai-source-own" value="own" />
+              <span class="ai-source-card-main">
+                <span class="ai-source-card-title" data-i18n="ai.source.own">自定义 API</span>
+                <span class="ai-source-card-sub" data-i18n="ai.source.own.sub">使用自己的 Base URL / API Key / 模型</span>
+              </span>
+            </label>
+          </div>
           <div id="ai-config-source-hint" class="ai-config-source-hint" style="display:none"></div>
-          <label class="ai-field">
-            <span data-i18n="ai.field.baseurl">Base URL</span>
-            <input id="ai-base-url" type="text" placeholder="https://api.openai.com/v1"
-                   autocomplete="off" />
-          </label>
-          <label class="ai-field">
-            <span data-i18n="ai.field.apikey">API Key</span>
-            <input id="ai-api-key" type="password" placeholder="sk-..."
-                   autocomplete="off" />
-          </label>
-          <label class="ai-field">
-            <span data-i18n="ai.field.model">模型</span>
-            <input id="ai-model" type="text" placeholder="gpt-4o"
-                   autocomplete="off" />
-          </label>
-          <label class="ai-field ai-field-checkbox" id="ai-use-platform-wrap" style="display:none;">
-            <input id="ai-use-platform" type="checkbox" />
-            <span data-i18n="ai.field.useplatform">使用平台官方 API</span>
-          </label>
-          <label class="ai-field">
-            <span data-i18n="ai.field.maxsteps">步数上限</span>
-            <input id="ai-max-steps" type="number" min="1" max="500" placeholder="50"
-                   data-i18n-title="ai.field.maxsteps.title" title="单轮步数上限（到顶暂停可继续）" autocomplete="off" />
-          </label>
-          <label class="ai-field">
-            <span data-i18n="ai.field.protocol">协议</span>
-            <select id="ai-api-protocol" data-i18n-title="ai.protocol.title" title="openai 走 /chat/completions；gemini 走 CPA 网关 /v1beta（gemini 兼容）；anthropic 直连 /v1/messages">
-              <option value="openai" data-i18n="ai.protocol.openai">openai（兼容端点）</option>
-              <option value="gemini" data-i18n="ai.protocol.gemini">gemini（CPA /v1beta）</option>
-              <option value="anthropic" data-i18n="ai.protocol.anthropic">anthropic（直连）</option>
-            </select>
-          </label>
-          <details class="ai-advanced">
+          <!-- 选中「平台 AI」时整块收起（config-panel.js applySourceCards 切换 display） -->
+          <div id="ai-own-fields" class="ai-own-fields">
+            <label class="ai-field">
+              <span data-i18n="ai.field.baseurl">Base URL</span>
+              <input id="ai-base-url" type="text" placeholder="https://api.openai.com/v1"
+                     autocomplete="off" />
+            </label>
+            <label class="ai-field">
+              <span data-i18n="ai.field.apikey">API Key</span>
+              <input id="ai-api-key" type="password" placeholder="sk-..."
+                     autocomplete="off" />
+            </label>
+            <label class="ai-field">
+              <span data-i18n="ai.field.model">模型</span>
+              <input id="ai-model" type="text" placeholder="gpt-4o"
+                     autocomplete="off" />
+            </label>
+            <!-- B1：checkbox 保留为状态载体但视觉隐藏（内联 display:none 优先于
+                 .ai-field 的 display:flex；不能删，app.js 联动与 PUT 协议依赖它） -->
+            <label class="ai-field ai-field-checkbox" id="ai-use-platform-wrap" style="display:none;">
+              <input id="ai-use-platform" type="checkbox" />
+              <span data-i18n="ai.field.useplatform">使用平台官方 API</span>
+            </label>
+            <label class="ai-field">
+              <span data-i18n="ai.field.maxsteps">步数上限</span>
+              <input id="ai-max-steps" type="number" min="1" max="500" placeholder="50"
+                     data-i18n-title="ai.field.maxsteps.title" title="单轮步数上限（到顶暂停可继续）" autocomplete="off" />
+            </label>
+            <label class="ai-field">
+              <span data-i18n="ai.field.protocol">协议</span>
+              <select id="ai-api-protocol" data-i18n-title="ai.protocol.title" title="openai 走 /chat/completions；gemini 走 CPA 网关 /v1beta（gemini 兼容）；anthropic 直连 /v1/messages">
+                <option value="openai" data-i18n="ai.protocol.openai">openai（兼容端点）</option>
+                <option value="gemini" data-i18n="ai.protocol.gemini">gemini（CPA /v1beta）</option>
+                <option value="anthropic" data-i18n="ai.protocol.anthropic">anthropic（直连）</option>
+              </select>
+            </label>
+          </div>
+          <details class="ai-advanced" id="ai-advanced">
             <summary data-i18n="ai.advanced.summary">高级调优</summary>
             <small class="ai-field-note" id="ai-tune-admin-note" data-i18n="ai.config.tune.admin" style="display:none;">由管理员配置，用户不可修改</small>
             <label class="ai-field"><span data-i18n="ai.advanced.tier">窗口档位预设</span>

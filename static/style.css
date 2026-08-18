@@ -2067,6 +2067,63 @@ button {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-fill);
 }
+/* B1：AI 来源两卡（平台 AI / 自定义 API），user 专属，复用 seg-control 的视觉语言 */
+.ai-source-cards {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+.ai-source-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 8px 10px;
+  border: 0.5px solid var(--separator);
+  border-radius: var(--r-row);
+  background: rgba(255, 255, 255, 0.8);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.ai-source-card:hover { background: var(--hover); }
+.ai-source-card input[type="radio"] {
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+}
+.ai-source-card-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.ai-source-card-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.35;
+}
+.ai-source-card-sub,
+.ai-source-card-meta {
+  font-size: 10.5px;
+  color: var(--text-3);
+  line-height: 1.4;
+}
+/* 选中态：accent 描边 + 浅底（对齐 seg.active / tool-btn.active 的 accent 语义） */
+.ai-source-card.selected {
+  border-color: var(--accent);
+  background: var(--accent-fill);
+}
+/* 平台未配置：整卡置灰不可选（config-panel.js 同步 disabled + .disabled） */
+.ai-source-card.disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  background: rgba(127, 127, 127, 0.06);
+}
+.ai-source-card.disabled:hover { background: rgba(127, 127, 127, 0.06); }
+@media (max-width: 480px) {
+  .ai-source-cards { grid-template-columns: 1fr; }
+}
 /* 高级调优折叠区（§8.1，默认收起） */
 .ai-advanced {
   margin: 4px 0 8px;

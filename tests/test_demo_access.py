@@ -1136,7 +1136,12 @@ def test_demo_js_event_reset_uses_snapshot_not_second_stream():
     text = (Path(__file__).resolve().parent.parent / "static" / "demo.js") \
         .read_text(encoding="utf-8")
     assert "rebuildFromSnapshot" in text
-    assert "/api/demo/ai/session/" in text
+    # C2 起 demo.js 硬依赖 HP_API（app-mode.js demoAdapter）：
+    # 会话/流端点 URL 在 adapter 侧，demo.js 只经 demoApi() 调用
+    assert "demoApi().aiSession" in text
+    mode_js = (Path(__file__).resolve().parent.parent / "static" / "app-mode.js") \
+        .read_text(encoding="utf-8")
+    assert "/api/demo/ai/session/" in mode_js
     assert "demo.ai.reset.fail" in text
     # event_reset 分支必须走 snapshot，不得再开 after_seq=0 的第二条流
     idx = text.find('type === "event_reset"')

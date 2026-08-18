@@ -12,40 +12,12 @@
   var $ = function (id) { return document.getElementById(id); };
 
   function demoApi() {
+    // 硬依赖 app-mode.js 的 demoAdapter（demo.html 恒定先加载 app-mode.js）。
+    // 旧的内联兜底是 demoAdapter 的过时副本（缺 slideInfoUrl/thumbnailUrl），
+    // 已删除：HP_API 缺失属脚本加载顺序故障，直接报错暴露而非静默降级。
     if (window.HP_API && window.HP_API.mode === "demo") return window.HP_API;
-    return {
-      mode: "demo",
-      config: function () {
-        return fetch("/api/demo/config", { credentials: "same-origin" });
-      },
-      listSlides: function () {
-        return fetch("/api/demo/slides", { credentials: "same-origin" });
-      },
-      slideInfo: function (id) {
-        return fetch("/api/demo/slides/" + encodeURIComponent(id) + "/info",
-                     { credentials: "same-origin" });
-      },
-      dziUrl: function (id) {
-        return "/api/demo/slides/" + encodeURIComponent(id) + ".dzi";
-      },
-      aiRun: function (body, opts) {
-        return fetch("/api/demo/ai/run", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "same-origin",
-          body: JSON.stringify(body || {}),
-          signal: opts && opts.signal,
-        });
-      },
-      aiSession: function (id) {
-        return fetch("/api/demo/ai/session/" + encodeURIComponent(id),
-                     { credentials: "same-origin" });
-      },
-      aiStreamUrl: function (id, afterSeq) {
-        return "/api/demo/ai/session/" + encodeURIComponent(id) +
-          "/stream?after_seq=" + (afterSeq == null ? 0 : afterSeq);
-      },
-    };
+    console.error("[demo] window.HP_API 不可用：app-mode.js 未加载或非 demo 模式");
+    return null;
   }
 
   var state = {
@@ -140,14 +112,11 @@
     if (window.HP_ViewerCore && HP_ViewerCore.zoomText) {
       text = HP_ViewerCore.zoomText(state.viewer, state.info && state.info.mpp_x);
     } else if (state.viewer && state.viewer.viewport) {
+      // 兜底（仅 viewer-core 加载失败时可见）：与 viewer-core 无 mpp 时的
+      // 口径一致，只显示百分比，不自行换算 µm/px
       try {
         var zoom = state.viewer.viewport.getZoom(true);
-        if (state.info && state.info.mpp_x > 0 && zoom > 0) {
-          var um = state.info.mpp_x / zoom;
-          text = (um >= 1000 ? (um / 1000).toFixed(2) + " mm/px" : um.toFixed(2) + " µm/px");
-        } else {
-          text = (zoom * 100).toFixed(0) + "%";
-        }
+        text = zoom > 0 ? (zoom * 100).toFixed(0) + "%" : "—";
       } catch (e) { text = "—"; }
     }
     if ($("zoom-badge")) $("zoom-badge").textContent = text;

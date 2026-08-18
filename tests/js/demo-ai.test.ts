@@ -57,11 +57,40 @@ function fakeEl() {
 	return el;
 }
 
+// demo.js 硬依赖 window.HP_API（app-mode.js 的 demoAdapter；demo.html 恒定
+// 先加载 app-mode.js，兜底副本已删）。测试注入等价 adapter，URL 与真实一致。
+function demoAdapter(fetchImpl: typeof fetch) {
+	const enc = (id: string) => encodeURIComponent(id);
+	return {
+		mode: "demo",
+		config: () => fetchImpl("/api/demo/config", { credentials: "same-origin" }),
+		listSlides: () => fetchImpl("/api/demo/slides", { credentials: "same-origin" }),
+		slideInfo: (id: string) =>
+			fetchImpl(`/api/demo/slides/${enc(id)}/info`, { credentials: "same-origin" }),
+		dziUrl: (id: string) => `/api/demo/slides/${enc(id)}.dzi`,
+		aiRun: (body: unknown, opts: { signal?: AbortSignal } = {}) =>
+			fetchImpl("/api/demo/ai/run", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				credentials: "same-origin",
+				body: JSON.stringify(body || {}),
+				signal: opts.signal,
+			}),
+		aiSession: (id: string) =>
+			fetchImpl(`/api/demo/ai/session/${enc(id)}`, { credentials: "same-origin" }),
+		aiStreamUrl: (id: string, afterSeq: number) =>
+			`/api/demo/ai/session/${enc(id)}/stream?after_seq=${
+				afterSeq == null ? 0 : afterSeq
+			}`,
+	};
+}
+
 function loadDemo(fetchImpl: typeof fetch) {
 	const els: Record<string, ReturnType<typeof fakeEl>> = {};
 	const listeners: Record<string, Array<() => void>> = {};
 	const w: Record<string, unknown> = {
 		HP_I18N: { t: (k: string) => k },
+		HP_API: demoAdapter(fetchImpl),
 		AbortController,
 		fetch: fetchImpl,
 		OpenSeadragon: undefined,

@@ -11,65 +11,11 @@
   var boot = root.HP_APP_BOOTSTRAP || {};
   var mode = boot.mode === "demo" ? "demo" : "official";
 
-  var DEMO_CAPS = {
-    upload: false,
-    projects: false,
-    unfiled: false,
-    share: false,
-    annotate: false,
-    roi: false,
-    saveImage: false,
-    mpp: false,
-    aiConfig: false,
-    aiContinue: false,
-    aiAsk: false,
-    aiBranch: false,
-    aiHistory: false,
-    adminUsers: false,
-    adminPlugins: false,
-    adminBudget: false,
-    logout: false,
-    demoCatalog: true,
-    demoQuota: true,
-    loginCta: true,
-    readonlyBadge: true,
-    aiRun: true,
-    viewTools: true,
-    aiPanel: true,
-  };
-
-  var OFFICIAL_CAPS = {
-    upload: true,
-    projects: true,
-    unfiled: true,
-    share: true,
-    annotate: true,
-    roi: true,
-    saveImage: true,
-    mpp: true,
-    aiConfig: true,
-    aiContinue: true,
-    aiAsk: true,
-    aiBranch: true,
-    aiHistory: true,
-    adminUsers: true,
-    adminPlugins: true,
-    adminBudget: true,
-    logout: true,
-    demoCatalog: false,
-    demoQuota: false,
-    loginCta: false,
-    readonlyBadge: false,
-    aiRun: true,
-    viewTools: true,
-    aiPanel: true,
-  };
-
-  var caps = Object.assign(
-    {},
-    mode === "demo" ? DEMO_CAPS : OFFICIAL_CAPS,
-    boot.capabilities || {}
-  );
+  // capabilities 只信服务端下发（HP_APP_BOOTSTRAP.capabilities，snake_case，
+  // app.py _app_capabilities()）：不前端硬编码默认字典（旧 DEMO_CAPS/
+  // OFFICIAL_CAPS 已删——键名 camelCase 与服务端不一致且 OFFICIAL_CAPS 静态
+  // 写死 annotate:true 对分享访客是错的，属无人消费的死代码）。
+  var caps = Object.assign({}, boot.capabilities || {});
 
   function credFetch(url, opts) {
     opts = opts || {};

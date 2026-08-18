@@ -252,8 +252,8 @@ def test_user_config_get_masked_and_platform_fields():
     assert r.status_code == 200
     assert j["platform_configured"] is True
     assert j["using"] == "platform"  # use_platform 缺省 True 且平台已配
-    # platform_model：user 侧“当前生效来源”提示用（不含任何密钥字段）
-    assert j["platform_model"] == "gpt-p"
+    # 平台模型名不下发普通用户（平台运营信息，仅 owner 侧折叠摘要可见）
+    assert "platform_model" not in j
     # api_key 只回显掩码，不回显明文
     assert "sk-user-long-secret-12345678" not in r.get_data(as_text=True)
     assert j["api_key_mask"]

@@ -5345,8 +5345,8 @@ def api_ai_config():
             "api_key_mask": _mask_api_key(own_key),
             "model": own.get("model") or "",
             "platform_configured": platform_configured,
-            # 平台模型名（不含任何密钥）：user 侧提示“当前生效来源”用
-            "platform_model": (platform_cfg.get("model") or "") if platform_configured else "",
+            # 平台模型名不下发普通用户（平台运营信息，仅 owner 可见；
+            # user 侧来源提示用 i18n ai.config.using.platform.plain）
             "using": using,
         }
         # tuning 字段只读平台值（user 无独立调优）

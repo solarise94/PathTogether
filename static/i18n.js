@@ -240,7 +240,7 @@
       "entry.tagline": "协作式数字病理切片查看与 AI 导航",
       "entry.demo": "直接体验 Demo",
       "entry.login": "登录测试与协作",
-      "entry.demo.hint": "Demo 无需登录，可查看示例切片并体验 1 次 AI 导航",
+      "entry.demo.hint": "Demo 无需登录，可查看示例切片并体验 AI 导航",
       "entry.footer": "仅用于研究、教学和软件演示，不用于临床诊断。",
 
       // ---- 注册关闭态（docs §7.1） ----
@@ -265,9 +265,10 @@
       "demo.ai.title": "AI 导航（只读体验）",
       "demo.ai.task.ph": "想让 AI 在这张切片里看什么？（可选，最多 300 字）",
       "demo.ai.steps.hint": "单次最多 {steps} 步 · Demo 额度 {demo}/{demoLimit}",
-      "demo.ai.run.available": "体验 AI 导航（1 次）",
+      "demo.ai.run.available": "体验 AI 导航",
       "demo.ai.run.available.n": "体验 AI 导航（还剩 {n} 次）",
       "demo.ai.run.running": "AI 正在读片…",
+      "demo.ai.refreshing": "正在刷新额度…",
       "demo.ai.run.used": "本次体验已使用",
       "demo.ai.run.demo.exhausted": "今日 Demo 体验次数已用完，登录后继续使用",
       "demo.ai.run.ip.limited": "该网络的 Demo 体验次数已用完，请稍后再试或登录后继续",
@@ -291,7 +292,7 @@
       "demo.ai.reset.fail": "运行记录需要重新加载",
       "demo.ai.reconnecting": "连接中断，正在按进度重连（不消耗额度）…",
       "demo.admin.usage": "平台 {p}/{pl} · Demo {d}/{dl} · 本机已用 {consumed}",
-      "demo.quota.idle": "可体验 1 次 AI 导航",
+      "demo.quota.idle": "AI 导航额度加载中…",
 
       // ---- owner 切片操作：Demo 目录（docs §5.1） ----
       "demo.catalog.add": "加入 Demo 目录",
@@ -815,7 +816,7 @@
       "entry.tagline": "Collaborative digital pathology slide viewing with AI navigation",
       "entry.demo": "Try the Demo",
       "entry.login": "Log in for testing & collaboration",
-      "entry.demo.hint": "The Demo needs no login: view sample slides and try 1 AI navigation run",
+      "entry.demo.hint": "The Demo needs no login: view sample slides and try AI navigation",
       "entry.footer": "For research, teaching, and software demonstration only — not for clinical diagnosis.",
 
       // ---- 注册关闭态（docs §7.1） ----
@@ -840,9 +841,10 @@
       "demo.ai.title": "AI navigation (read-only)",
       "demo.ai.task.ph": "What should the AI look at on this slide? (optional, up to 300 chars)",
       "demo.ai.steps.hint": "Up to {steps} steps · Demo quota {demo}/{demoLimit}",
-      "demo.ai.run.available": "Try AI navigation (1 run)",
+      "demo.ai.run.available": "Try AI navigation",
       "demo.ai.run.available.n": "Try AI navigation ({n} remaining)",
       "demo.ai.run.running": "AI is reading the slide…",
+      "demo.ai.refreshing": "Refreshing quota…",
       "demo.ai.run.used": "This trial has been used",
       "demo.ai.run.demo.exhausted": "Today's Demo runs are used up; log in to continue",
       "demo.ai.run.ip.limited": "Demo runs from this network are used up; try later or log in",
@@ -866,7 +868,7 @@
       "demo.ai.reset.fail": "The run record needs to be reloaded",
       "demo.ai.reconnecting": "Connection lost; reconnecting from last position (no quota)…",
       "demo.admin.usage": "Platform {p}/{pl} · Demo {d}/{dl} · used here {consumed}",
-      "demo.quota.idle": "Try 1 AI navigation run",
+      "demo.quota.idle": "Loading AI quota…",
 
       // ---- owner slide actions: Demo catalog (docs §5.1) ----
       "demo.catalog.add": "Add to Demo catalog",

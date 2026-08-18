@@ -2928,6 +2928,9 @@ button {
   padding: 1px 6px;
   line-height: 1.4;
 }
+/* 侧栏顶部紧凑徽章：仅移动端显示（标题栏在 360px 级视口放不下徽章，
+   见文件末尾 @media (max-width: 760px) 的挪移规则；桌面隐藏避免与标题栏重复） */
+.demo-badge-side { display: none; }
 .header-login-link {
   flex-shrink: 0;
   font-size: 12px;
@@ -3036,6 +3039,21 @@ button {
 
 @media (max-width: 760px) {
   .header-register-link { display: none; }
-  .demo-badge { display: none; }
+  /* 只读徽章不在标题栏隐藏消失：标题栏（☰ + 切片名 + zoom 徽章 + 登录链接 +
+     语言钮）在 375/360px 视口放不下徽章，改在侧栏顶部与额度 chip 同行显示，
+     保证 Demo 页任何视口都有明确只读标识 */
+  .title-group .demo-badge { display: none; }
+  .demo-sidebar-top {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+  }
+  .demo-sidebar-top .demo-quota-chip { flex: 1; min-width: 0; }
+  .demo-badge-side {
+    display: inline-flex;
+    flex-shrink: 0;
+    font-size: 10px;
+    padding: 0 4px;
+  }
 }
 

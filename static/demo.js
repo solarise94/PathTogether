@@ -306,12 +306,20 @@
         label = t("demo.ai.run.running");
         setQuotaChip(label);
         break;
+      case "refreshing":
+        // run 结束后的额度刷新过渡态：保持禁用，最终态由 applyConfig() 落定
+        if (btn) btn.disabled = true;
+        label = t("demo.ai.refreshing");
+        setQuotaChip(label);
+        break;
       case "used":
         if (btn) btn.disabled = true;
         label = t("demo.ai.run.used");
         setQuotaChip(label);
-        var usedN = (state.config && state.config.per_browser_used) || 1;
-        var limN = (state.config && state.config.per_browser_limit) || 1;
+        var usedN = state.config && state.config.per_browser_used != null
+          ? Number(state.config.per_browser_used) : 1;
+        var limN = state.config && state.config.per_browser_limit != null
+          ? Number(state.config.per_browser_limit) : 1;
         if (status) {
           status.innerHTML = esc(t("demo.ai.login.hint", { used: usedN, limit: limN })) +
             ' <a href="/login">' + esc(t("demo.footer.login")) + "</a>";
@@ -408,7 +416,11 @@
           state.sessionId = sid;
         }
       })
-      .catch(function () { setAiButton("unavailable"); });
+      .catch(function () {
+        // 页面首次加载失败 → AI 不可用；finishRun 后的额度刷新失败 → 保守
+        // 回落“已使用”（本轮 run 确已消耗额度，不能误显示可再跑）
+        setAiButton(restore ? "unavailable" : "used");
+      });
   }
 
   // ---------- SSE 消费（与正式 UI 同语义：event_reset 全量重建；断线按 last id） ----------
@@ -710,7 +722,9 @@
   function finishRun() {
     state.running = false;
     closeActiveStream();
-    setAiButton("used");
+    // 不再无条件置 used（limit>1 时会先闪“已用完”）：保持禁用过渡态，
+    // 由 loadConfig → applyConfig 用最新额度落定最终按钮/文案
+    setAiButton("refreshing");
     loadConfig({ restore: false });
   }
 

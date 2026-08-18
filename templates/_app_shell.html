@@ -101,8 +101,9 @@
     <div id="sidebar-mask" class="sidebar-mask"></div>
     <aside id="sidebar">
       {% if mode == 'demo' %}
-      <div class="sidebar-top">
-        <div id="demo-quota-chip" class="demo-quota-chip" data-i18n="demo.quota.idle">可体验 1 次 AI 导航</div>
+      <div class="sidebar-top demo-sidebar-top">
+        <span class="demo-badge demo-badge-side">Demo</span>
+        <div id="demo-quota-chip" class="demo-quota-chip" data-i18n="demo.quota.idle">AI 导航额度加载中…</div>
       </div>
       <div class="sidebar-scroll">
         <div class="section-head" data-i18n="sb.section.demo.slides">示例切片</div>
@@ -347,7 +348,7 @@
               data-i18n-ph="demo.ai.task.ph"
               placeholder="想让 AI 在这张切片里看什么？（可选，最多 300 字）"></textarea>
             <button id="ai-run-btn" class="ai-send-btn" type="button" disabled
-                    data-i18n-title="demo.ai.run.available" title="体验 AI 导航（1 次）" aria-label="开始">
+                    data-i18n-title="demo.ai.run.available" title="体验 AI 导航" aria-label="开始">
               <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
                 <path d="M10 15V4.5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
                 <path d="M5 9l5-5 5 5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>

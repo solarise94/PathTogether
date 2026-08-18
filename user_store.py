@@ -55,6 +55,8 @@ _JSON_PUBLIC_NAMES = (
     "ROLE_SDK",
     "VALID_ROLES",
     "UserStoreCorrupt",
+    # user ai_config.max_steps 默认值（docs §9.2，PT-3；两实现一致）
+    "DEFAULT_USER_MAX_STEPS",
     # —— 函数 ——
     "create_user",
     "get_user",

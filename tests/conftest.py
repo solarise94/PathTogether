@@ -63,6 +63,11 @@ if _RUN_PG:
         # comments 0003 起入库，但此前未进 truncate 清单——跨用例残留会让
         # list_changes（含评论）读到上次用例的数据（Stage 4-1a 测试暴露）
         "comments",
+        # 0006 起：Demo / AI 预算 / 登录锁定数据层（RESTART IDENTITY CASCADE
+        # 会重置 ai_budget_periods 的 serial，保证 period id 从 1 起可预测）
+        "platform_settings", "auth_rate_limits",
+        "ai_budget_usage", "ai_budget_reservations", "ai_budget_periods",
+        "demo_sessions", "demo_catalog",
     )
 
     @pytest.fixture(scope="session")

@@ -14,6 +14,7 @@ import ipaddress
 import json
 import math
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -31,6 +32,7 @@ from flask import (
     Response,
     abort,
     jsonify,
+    make_response,
     redirect,
     render_template,
     request,
@@ -49,6 +51,19 @@ import share_store
 import slide_cache
 import slide_io
 import user_store
+# PT-1 数据层（docs demo-access-auth-ui-design §4.3/§7.3/§9.5）：
+# platform_features 判定 PG 前置条件；settings_store 提供 registration_open
+# 运行时权威读取（PG platform_settings / env bootstrap）。
+import platform_features
+import settings_store
+# PT-3 平台 AI 预算接线（docs §4.1/§4.2/§5.3/§9.4）：budget_store 提供 PG 原子
+# 预占 / 消费 / 释放 / 回收与用量报表原语。json/dual 后端 fail-closed（本模块
+# _ai_reserve_run_budget 守卫），绝不退化进程内计数。
+import budget_store
+# PT-4 匿名 Demo（docs §5/§9.1/§9.3）：demo_store 提供 capability / 一次性 run
+# 状态机与 owner Demo 目录（demo_catalog）。json/dual 后端 fail-closed
+# （platform_features 守卫），Demo API 绝不走 current_identity 的 owner 归一。
+import demo_store
 
 # Stage 5-1：插件 manifest 版本常量单一来源（plugins/sdk/manifest.py）。
 # plugins/ 与 plugins/sdk/ 各有 __init__.py（plugins/histopilot/ 不加，保持静态目录）。
@@ -177,6 +192,28 @@ def _ensure_pg_schema_or_exit():
 
 
 _ensure_pg_schema_or_exit()
+
+
+# --------------------------------------------------------------------------- #
+# PUBLIC_DEMO_ENABLED 启动期前置检查（docs §4.3）
+#
+# 公开 Demo（/demo、/api/demo/*）依赖 PostgreSQL 一致事务（capability、跨 worker
+# 预算与登录锁定）；配置 PUBLIC_DEMO_ENABLED=1 但后端不是 postgres 时拒绝启动，
+# 不允许 json/dual 静默退化到进程内计数。
+# --------------------------------------------------------------------------- #
+def _check_public_demo_backend_or_exit(environ=None):
+    """PUBLIC_DEMO_ENABLED=1 且后端非 postgres → SystemExit（fail-closed）。"""
+    env = os.environ if environ is None else environ
+    if not _env_truthy(env, "PUBLIC_DEMO_ENABLED"):
+        return
+    backend = platform_features.current_backend()
+    if backend != "postgres":
+        raise SystemExit(
+            "PUBLIC_DEMO_ENABLED=1 要求 STORAGE_BACKEND=postgres（当前 %r）："
+            "json/dual 不提供公开 Demo 的一致性保证，拒绝启动。" % backend)
+
+
+_check_public_demo_backend_or_exit()
 
 
 def _bootstrap_owner(environ=None):
@@ -378,44 +415,102 @@ def _require_internal():
     return None
 
 
-# 防爆破：内存 dict 按 IP 计数 {ip: {"fails": int, "locked_until": float}}
-_auth_attempts: dict = {}
-_AUTH_FAIL_LIMIT = 5
-_AUTH_LOCK_SECONDS = 60
+# --------------------------------------------------------------------------- #
+# 登录防爆破（docs §6.3 末段 / §9.5）
+#
+# 生产锁定状态来自 PostgreSQL auth_rate_limits（auth_limit_store，PT-1）：
+# 每账号与每规范化 IP 前缀各一个独立计数桶（账号 10 /窗、IP 前缀 5 /窗，可用
+# env 覆盖），任一桶达到阈值即锁定并保存 locked_until；两个 gunicorn worker
+# 看到同一失败次数与锁定截止时间；UI 倒计时来自服务端权威 retry_after。
+#
+# json/dual 后端：auth_limit_store 的存储原语 fail-closed（PgFeatureUnavailable）。
+# 设计 §6.3 要求「存储不可用时保守拒绝登录写操作，不能退化为无防爆破」——因此
+# AUTH_ENABLED=True 且非 postgres 时 POST /login 直接 503，绝不退回 per-worker
+# 内存字典（旧 _auth_attempts 已删除）。本地 AUTH_ENABLED=False（免登录）不受影响。
+#
+# subject 只存带盐 hash（盐来自 AUTH_SUBJECT_HASH_SALT env 或 SECRET_KEY）：
+# 账号 lower+strip 后哈希；IP 取 /24（IPv4）或 /64（IPv6）前缀再哈希。
+# 原始密码与完整明文 IP 不写日志、不入库。
+# --------------------------------------------------------------------------- #
+_LOGIN_LIMITS_UNAVAILABLE_MSG = (
+    "登录暂不可用：跨 worker 登录防爆破需要 PostgreSQL 后端"
+    "（当前 STORAGE_BACKEND 非 postgres），已按安全策略暂停登录。"
+    "请联系管理员配置 postgres 后端。")
 
 
-def _is_ip_locked(ip: str):
-    """返回该 IP 是否处于锁定期（含到期清理）。"""
-    rec = _auth_attempts.get(ip)
-    if not rec:
-        return False
-    if rec.get("locked_until", 0) and time.time() < rec["locked_until"]:
-        return True
-    # 锁定已过期：清零
-    if rec.get("locked_until", 0):
-        _auth_attempts.pop(ip, None)
-    return False
+def _auth_hash_salt() -> str:
+    """账号/IP 前缀哈希盐：优先独立 env，缺省用 Flask secret key。"""
+    return (os.environ.get("AUTH_SUBJECT_HASH_SALT") or "").strip() or app.secret_key
 
 
-def _record_auth_fail(ip: str):
-    """记录一次失败，达到阈值则锁定 60 秒。"""
-    rec = _auth_attempts.setdefault(ip, {"fails": 0, "locked_until": 0.0})
-    rec["fails"] += 1
-    if rec["fails"] >= _AUTH_FAIL_LIMIT:
-        rec["locked_until"] = time.time() + _AUTH_LOCK_SECONDS
+def _auth_subject_hash(account: str) -> str:
+    """规范化账号（lower+strip）的带盐 HMAC-SHA256（scope=account 的 subject）。"""
+    norm = (account or "").strip().lower()
+    return hmac.new(
+        ("acct:" + _auth_hash_salt()).encode("utf-8"),
+        norm.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def _clear_auth_fails(ip: str):
-    """登录成功后清零该 IP 的失败计数。"""
-    _auth_attempts.pop(ip, None)
+def _ip_prefix(ip: str) -> str:
+    """规范化 IP 前缀：IPv4 → /24、IPv6 → /64；解析失败原样返回（再入哈希）。"""
+    raw = (ip or "").strip()
+    if not raw:
+        return ""
+    try:
+        addr = ipaddress.ip_address(raw)
+    except ValueError:
+        return raw
+    bits = 24 if addr.version == 4 else 64
+    return str(ipaddress.ip_network("%s/%d" % (addr, bits), strict=False).network_address)
+
+
+def _ip_prefix_hash(ip: str) -> str:
+    """IP 前缀的带盐 HMAC-SHA256（scope=ip_prefix 的 subject；不存完整 IP）。"""
+    prefix = _ip_prefix(ip)
+    if not prefix:
+        return ""
+    return hmac.new(
+        ("ipp:" + _auth_hash_salt()).encode("utf-8"),
+        prefix.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _login_limits_available() -> bool:
+    """登录防爆破权威存储是否可用（仅 postgres；docs §4.3 前置条件）。"""
+    return platform_features.budget_features_available()
+
+
+def _check_login_locked(account_hash, ip_prefix_hash) -> int:
+    """查询权威锁定状态，返回剩余锁定秒数（0=未锁）。仅 postgres 后端可用。"""
+    import auth_limit_store
+    res = auth_limit_store.check_auth_locked(account_hash, ip_prefix_hash)
+    return int(res.get("retry_after_seconds") or 0)
+
+
+def _record_login_failure(account_hash, ip_prefix_hash) -> int:
+    """记录一次失败（同事务 UPSERT 两桶），返回锁定剩余秒数（0=未锁）。"""
+    import auth_limit_store
+    res = auth_limit_store.record_auth_failure(account_hash, ip_prefix_hash)
+    return int(res.get("retry_after_seconds") or 0)
+
+
+def _clear_login_failures(account_hash, ip_prefix_hash):
+    """成功登录后只清该账号与来源 IP 前缀两条记录（不影响其他主体）。"""
+    import auth_limit_store
+    auth_limit_store.clear_auth_failures(account_hash, ip_prefix_hash)
 
 
 def _auth_challenge():
     """未登录或会话失效：API 返回 401，页面 302 到 /login。放行公开路径。"""
     path = request.path
-    # 放行登录页与静态资源（含插件前端 bundle 与通用插件静态文件，与 /static/ 同属
-    # 非敏感前端资源；plugin_id/filename 路径穿越由 plugin_ui_asset 双重拒绝）
-    if path == "/login" or path.startswith("/static/") or path.startswith("/plugins/"):
+    # 放行登录/注册/Demo 入口页与静态资源（含插件前端 bundle 与通用插件静态文件，
+    # 与 /static/ 同属非敏感前端资源；plugin_id/filename 路径穿越由 plugin_ui_asset
+    # 双重拒绝）
+    if (path in ("/login", "/register", "/demo") or path.startswith("/static/")
+            or path.startswith("/plugins/")):
+        return None
+    # /api/demo/* 公开（docs §5.2）：由 Demo capability（独立 cookie + demo_sessions
+    # fail-closed 校验）自证，不进入登录 session 鉴权，也不做 owner 归一
+    if path.startswith("/api/demo/"):
         return None
     # /healthz 是健康检查端点（负载/监控探活），不携带敏感数据，必须免鉴权
     # （Stage 4-3 demo 实测被 302 到 /login，探活全挂）
@@ -439,16 +534,22 @@ def _auth_challenge():
 def _require_auth():
     """启用认证时拦截未登录 / 已禁用 / 已删除用户的请求。
 
-    放行 /login、/static/、/plugins/、/healthz、/internal/、/api/plugin/；
-    其余请求检查 session，并按 user_id 回查用户是否仍存在且 enabled
-    （禁用或删除立即失效，不等 cookie 过期）。
+    放行 /login、/register、/demo、/api/demo/*、/static/、/plugins/、/healthz、
+    /internal/、/api/plugin/；其余请求检查 session，并按 user_id 回查用户是否仍
+    存在且 enabled（禁用或删除立即失效，不等 cookie 过期）。
     /api/ 开头返回 401 jsonify(error="auth_required")，页面 302 到 /login。
+    例外：未登录访问 ``/`` 不跳登录——由 index() 渲染入口分流页（docs §3.1，
+    同一路由按认证状态分流，不做 302 /login）。
     """
     if not AUTH_ENABLED:
         return None
     # 公开路径不回查用户（避免每个静态资源打一次存储）
     path = request.path
-    if path == "/login" or path.startswith("/static/") or path.startswith("/plugins/"):
+    if (path in ("/login", "/register", "/demo") or path.startswith("/static/")
+            or path.startswith("/plugins/")):
+        return None
+    # /api/demo/* 由 Demo capability 独立校验（docs §5.2），不进登录 session
+    if path.startswith("/api/demo/"):
         return None
     if path == "/healthz":
         return None
@@ -471,6 +572,12 @@ def _require_auth():
                 session["role"] = user["role"]
             return None
         session.clear()
+        if path == "/":
+            # 会话失效的首页访问：入口分流页（不制造到 /login 的多余跳转）
+            return None
+    elif path == "/":
+        # 未登录访问首页：入口分流页（docs §3.1，不 302 /login）
+        return None
     return _auth_challenge()
 
 
@@ -511,6 +618,141 @@ def _plugin_v1_rate_limit():
             % _PLUGIN_RATE_LIMIT_PER_MIN, retry,
             details={"limit_per_min": _PLUGIN_RATE_LIMIT_PER_MIN, "reason": "rate_limit"})
     return None
+
+
+# --------------------------------------------------------------------------- #
+# 统一 CSRF 设施（docs §10.13 / §11.1-6，Phase 1）
+#
+# 覆盖**全部依赖 Cookie 会话的写端点**（POST /login、POST /logout、
+# PUT /api/ai/config、POST /api/admin/users、上传/标注/分享/项目等全部非安全方法），
+# 通过 before_request 统一校验，不逐视图手写（避免漏点）。
+#
+# 机制：同步 token 的双提交变体——
+#   - 服务端把 secrets.token_hex 生成的 token 绑定进签名 session（CSRF_SESSION_KEY）；
+#   - 同时下发同名明文 cookie ``csrf_token``（非 HttpOnly、SameSite=Lax，供前端 JS
+#     读取后以 ``X-CSRF-Token`` 头回传）；表单页走隐藏域 ``csrf_token``。
+#   - 校验：提交值（表单域或头）与 session 值 hmac 比较；明文 cookie 存在时也必须
+#     一致（防只偷 cookie / 只偷表单值的单边伪造）。
+#
+# 明确不套 CSRF 的通道（docs §10.13：这些通道使用各自的非 Cookie 鉴权）：
+#   - ``/internal/*``：HistoPilot internal token（X-AI-Internal-Token）；
+#   - ``/api/plugin/*``：installation secret 换发 JWT + Bearer 校验；
+#   - ``/api/demo/*``：匿名 Demo capability（独立 demo_capability cookie，
+#     HttpOnly+SameSite=Lax 已阻断跨站写携带；与登录 session CSRF 语义不混用，
+#     docs §5.2/§10.13——Demo cookie 也调不到 /api/ai/* 等登录态端点）。
+# GET/HEAD/OPTIONS 安全（只下发 token，不校验）。
+# --------------------------------------------------------------------------- #
+CSRF_SESSION_KEY = "csrf_token"
+CSRF_COOKIE_NAME = "csrf_token"
+CSRF_HEADER_NAME = "X-CSRF-Token"
+CSRF_FORM_FIELD = "csrf_token"
+_CSRF_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+# 非 Cookie 会话通道（internal token / plugin JWT / Demo capability），不混用 CSRF 语义
+_CSRF_EXEMPT_PREFIXES = ("/internal/", "/api/plugin/", "/api/demo/")
+# 静态资源通道（只读 GET）：不下发 token/cookie（避免每个资源响应都带 Set-Cookie）；
+# 非安全方法仍走统一校验（静态路由本无写端点，属纵深防御）
+_CSRF_STATIC_PREFIXES = ("/static/", "/plugins/")
+
+
+def _csrf_exempt_path(path: str) -> bool:
+    return path.startswith(_CSRF_EXEMPT_PREFIXES)
+
+
+def ensure_csrf_token() -> str:
+    """取/生成绑定当前 session 的 CSRF token（幂等；安全方法路径调用）。"""
+    token = session.get(CSRF_SESSION_KEY)
+    if not token:
+        token = secrets.token_hex(32)
+        session[CSRF_SESSION_KEY] = token
+    return token
+
+
+def rotate_csrf_token() -> str:
+    """身份切换点（登录成功）后重置 token：session.clear() 之后调用。"""
+    token = secrets.token_hex(32)
+    session[CSRF_SESSION_KEY] = token
+    return token
+
+
+def _csrf_submitted_token() -> str:
+    """双通道取提交值：表单隐藏域优先，其次 X-CSRF-Token 头。"""
+    tok = request.form.get(CSRF_FORM_FIELD)
+    if not tok:
+        tok = request.headers.get(CSRF_HEADER_NAME) or ""
+    return (tok or "").strip()
+
+
+def _csrf_validate() -> bool:
+    """校验提交 token 与 session 绑定值（及同步 cookie，若存在）。"""
+    expected = session.get(CSRF_SESSION_KEY) or ""
+    if not expected:
+        return False
+    submitted = _csrf_submitted_token()
+    if not submitted or not hmac.compare_digest(submitted, expected):
+        return False
+    cookie_tok = request.cookies.get(CSRF_COOKIE_NAME)
+    if cookie_tok and not hmac.compare_digest(cookie_tok, expected):
+        return False
+    return True
+
+
+@app.before_request
+def _csrf_protect():
+    """Cookie 会话写端点统一 CSRF 校验（安全方法只下发 token）。
+
+    挂在 _require_auth 之后：未登录的 /api/* 写请求先得到权威 401 auth_required，
+    登录/公开表单路径再校验 CSRF。
+    """
+    path = request.path
+    if _csrf_exempt_path(path):
+        return None
+    if request.method in _CSRF_SAFE_METHODS:
+        if not path.startswith(_CSRF_STATIC_PREFIXES):
+            ensure_csrf_token()
+        return None
+    if _csrf_validate():
+        return None
+    if path == "/login":
+        # 表单页给可重试的 HTML 错误（带新 token），不是裸 JSON
+        next_url = _safe_next_path(request.form.get("next") or request.args.get("next"))
+        return render_template(
+            "login.html", error=None, error_code="csrf", next_url=next_url,
+            csrf_token=ensure_csrf_token(), retry_after=0), 400
+    return jsonify(error="csrf_required"), 400
+
+
+@app.after_request
+def _mirror_csrf_cookie(resp):
+    """把 session 中的 CSRF token 镜像为非 HttpOnly cookie（前端 JS 双提交用）。
+
+    internal / plugin / 静态资源通道不下发；Secure 跟随 session cookie 配置。
+    """
+    if not _csrf_exempt_path(request.path) and \
+            not request.path.startswith(_CSRF_STATIC_PREFIXES):
+        token = session.get(CSRF_SESSION_KEY)
+        if token:
+            resp.set_cookie(
+                CSRF_COOKIE_NAME, token,
+                httponly=False, samesite="Lax",
+                secure=bool(app.config.get("SESSION_COOKIE_SECURE", False)),
+            )
+    return resp
+
+
+def _safe_next_path(candidate) -> str:
+    """登录 next 白名单校验：只允许站内绝对路径。
+
+    拒绝协议 URL（https://…）、`//host`（scheme-relative）与 ``\\\\host``（反斜杠
+    变体，部分浏览器把 /\\ 解释为协议分隔）；不合法一律回 `/`（docs §6.3）。
+    """
+    if not isinstance(candidate, str):
+        return "/"
+    p = candidate.strip()
+    if not p.startswith("/") or p.startswith("//") or p.startswith("/\\"):
+        return "/"
+    if "\\" in p[:2]:
+        return "/"
+    return p
 
 # Deep Zoom 参数（512 瓦片降低公网请求数，渐进式 q82 JPEG 降体积并支持模糊→清晰预览）
 DZ_TILE_SIZE = 512
@@ -779,6 +1021,42 @@ def histopilot_ui_enabled():
     return _plugin_dir("histopilot") is not None
 
 
+def _app_capabilities(mode):
+    """前端运行模式的 capabilities（隐藏入口；安全边界在服务端）。
+
+    Demo 是 ``demo/readonly``：不渲染上传、标注、分享、配置、分支等写操作入口，
+    只额外展示只读徽章、剩余额度和登录入口。owner 用量诊断留在正式版 AI 预算区。
+    """
+    demo = (mode == "demo")
+    return {
+        "mode": "demo" if demo else "official",
+        "upload": not demo,
+        "projects": not demo,
+        "unfiled": not demo,
+        "share": not demo,
+        "annotate": not demo,
+        "roi": not demo,
+        "save_image": not demo,
+        "mpp": not demo,
+        "ai_config": not demo,
+        "ai_continue": not demo,
+        "ai_ask": not demo,
+        "ai_branch": not demo,
+        "ai_history": not demo,
+        "admin_users": not demo,
+        "admin_plugins": not demo,
+        "admin_budget": not demo,
+        "logout": not demo,
+        "demo_catalog": demo,
+        "demo_quota": demo,
+        "login_cta": demo,
+        "readonly_badge": demo,
+        "ai_run": True,
+        "view_tools": True,
+        "ai_panel": True,
+    }
+
+
 # Sample Annotator 示例插件目录（Stage 5-2，plugins/sample-annotator/）。
 SAMPLE_PLUGIN_DIR = Path(__file__).resolve().parent / "plugins" / "sample-annotator"
 
@@ -910,12 +1188,19 @@ def sample_plugin_context():
 # --------------------------------------------------------------------------- #
 @app.route("/")
 def index():
+    # 未登录（AUTH_ENABLED=True）：渲染入口分流页，不 302 /login（docs §3.1）；
+    # 已登录或 AUTH_ENABLED=False（本地免登录）：保持现状渲染完整应用——
+    # 否则会破坏本地开发与既有测试。
+    if AUTH_ENABLED and not session.get("auth_user"):
+        return render_template("entry.html")
     sample = sample_plugin_context()
     # histopilot index 注入 = feature flag 与来源策略**与**逻辑（Stage 5-3）：
     # 来源策略拒绝时不加载 bundle（与 flag=0 同等静默降级）。
     histopilot_render = histopilot_ui_enabled() and plugin_source_allowed("histopilot")[0]
     return render_template(
         "index.html",
+        app_mode="official",
+        capabilities=_app_capabilities("official"),
         histopilot_ui_enabled=histopilot_render,
         sample_plugin_enabled=sample["enabled"],
         sample_plugin_permissions=sample["permissions"],
@@ -965,57 +1250,886 @@ def plugin_ui_asset(plugin_id, filename):
     return send_from_directory(str(uidi), filename)
 
 
+def _login_page(error=None, error_code=None, next_url="/", retry_after=0,
+                status=200, headers=None):
+    """渲染登录页（统一携带 CSRF token 与服务端权威 retry_after）。"""
+    html = render_template(
+        "login.html", error=error, error_code=error_code, next_url=next_url,
+        csrf_token=ensure_csrf_token(), retry_after=int(retry_after or 0))
+    resp = Response(html, status=status)
+    if headers:
+        for k, v in headers.items():
+            resp.headers[k] = v
+    return resp
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    """登录页。GET 渲染；POST 校验并写 session。
+    """登录页。GET 渲染（已登录则 302 到安全 next 或 /）；POST 校验并写 session。
 
-    支持用邮箱或用户名（display_name）登录，密码经 werkzeug 哈希校验
-    （user_store.verify_user）。连续失败 5 次锁定 60 秒。
-    成功：session.permanent=True，session["auth_user"]=display_name、
-    session["user_id"]、session["role"]；跳 next（校验必须以 / 开头且不以 // 开头，
-    防开放跳转）或 "/"。
+    - 支持邮箱或用户名登录，密码经 user_store.verify_user 哈希校验；
+    - 防爆破走 auth_limit_store 两桶独立计数（账号/IP 前缀，docs §6.3）：锁定期内
+      429 + Retry-After + 服务端权威倒计时；成功登录只清该主体两桶；
+    - json/dual 后端无权威存储：POST 503 保守拒绝（不退化为内存计数）；
+    - 登录成功先 session.clear() 再写新身份（防 fixation），并轮换 CSRF token；
+    - next 只允许站内绝对路径（_safe_next_path：拒绝 //host、协议与 \\\\host）；
+    - 失败统一「账号或密码错误」，不泄露账号是否存在。
     """
     if not AUTH_ENABLED:
         # 未启用认证：直接回首页
         return redirect("/")
 
-    next_url = request.args.get("next") or "/"
+    next_url = _safe_next_path(request.args.get("next") or "/")
 
-    if request.method == "POST":
-        ip = request.remote_addr or ""
-        # 锁定期内拒绝
-        if _is_ip_locked(ip):
-            return render_template("login.html", error="尝试过于频繁，请稍后再试", next_url=next_url), 429
+    if request.method == "GET":
+        if session.get("auth_user"):
+            # 已登录访问登录页：302 到安全 next 或 /（docs §3.1）
+            return redirect(next_url)
+        return _login_page(next_url=next_url)
 
-        username = request.form.get("username", "")
-        password = request.form.get("password", "")
-        # POST 时 next 来自表单隐藏域（GET 渲染时已写入）
-        post_next = request.form.get("next") or "/"
-        user = user_store.verify_user(username, password)
+    # ---- POST ----
+    post_next = _safe_next_path(request.form.get("next") or next_url)
+    username = request.form.get("username", "")
+    password = request.form.get("password", "")
+    account_hash = _auth_subject_hash(username)
+    ip_prefix_hash = _ip_prefix_hash(request.remote_addr or "")
 
-        if user is not None:
-            session.permanent = True
-            session["auth_user"] = user.get("display_name") or user.get("email")
-            session["user_id"] = user.get("user_id")
-            session["role"] = user.get("role")
-            _clear_auth_fails(ip)
-            # 校验 next：必须以 / 开头且不以 // 开头，防开放跳转
-            if not post_next.startswith("/") or post_next.startswith("//"):
-                post_next = "/"
-            return redirect(post_next)
+    # 跨 worker 锁定存储不可用（json/dual）：保守拒绝登录写操作（docs §6.3）
+    if not _login_limits_available():
+        app.logger.warning(
+            "POST /login 拒绝（503）：登录防爆破需要 postgres 后端（当前 %r）",
+            platform_features.current_backend())
+        return _login_page(
+            error=_LOGIN_LIMITS_UNAVAILABLE_MSG, error_code="unavailable",
+            next_url=post_next, status=503)
 
-        # 失败
-        _record_auth_fail(ip)
-        return render_template("login.html", error="用户名或密码错误", next_url=next_url), 401
+    retry = _check_login_locked(account_hash, ip_prefix_hash)
+    if retry > 0:
+        return _login_page(
+            error="尝试过于频繁，请稍后再试", error_code="locked",
+            next_url=post_next, retry_after=retry, status=429,
+            headers={"Retry-After": str(max(1, retry))})
 
-    return render_template("login.html", error=None, next_url=next_url)
+    user = user_store.verify_user(username, password)
+    if user is not None:
+        _clear_login_failures(account_hash, ip_prefix_hash)
+        # 防 session fixation：先清旧 session 再写新身份，并轮换 CSRF token
+        session.clear()
+        session.permanent = True
+        session["auth_user"] = user.get("display_name") or user.get("email")
+        session["user_id"] = user.get("user_id")
+        session["role"] = user.get("role")
+        rotate_csrf_token()
+        return redirect(post_next)
+
+    # 失败：统一文案（不泄露账号是否存在）；记录两桶计数，触发锁定则 429 + 倒计时
+    retry = _record_login_failure(account_hash, ip_prefix_hash)
+    if retry > 0:
+        return _login_page(
+            error="尝试过于频繁，请稍后再试", error_code="locked",
+            next_url=post_next, retry_after=retry, status=429,
+            headers={"Retry-After": str(max(1, retry))})
+    return _login_page(
+        error="账号或密码错误", error_code="invalid",
+        next_url=post_next, status=401)
 
 
-@app.route("/logout")
+@app.route("/logout", methods=["GET", "POST"])
 def logout():
-    """登出：清 session，跳登录页。"""
+    """登出：清 session，跳登录页。
+
+    推荐路径是 POST + CSRF（docs §10.14）；GET 保留为**短期兼容**（记 warning）。
+    兼容窗口仍开放：开发阶段不移除 GET，也不改产品语义。后续单独窗口结束后
+    再删路由、测试与文档分支。AUTH_ENABLED=False（本地免登录）时 GET 行为与旧版一致。
+    """
+    if request.method == "GET":
+        app.logger.warning(
+            "GET /logout 已废弃（CSRF 加固，docs §10.14）：短期兼容保留，请改用"
+            " POST /logout + CSRF token；后续版本将移除 GET。")
     session.clear()
     return redirect("/login")
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    """注册页（Phase 1：邀请注册关闭态，docs §7.1）。
+
+    GET：展示「当前采用邀请注册」状态页（主按钮回登录、次按钮体验 Demo），
+    不返回 404、不渲染无法提交的表单。registration_open 权威值来自
+    settings_store.get_registration_open()（PG 权威 / env bootstrap）。
+    POST：第一阶段一律 403（自助注册是 Phase 4；owner 运行时开关 API 不在本阶段）。
+    """
+    if request.method == "POST":
+        return jsonify(error="当前采用邀请注册，暂未开放自助注册"), 403
+    return render_template("register.html", registration_open=_registration_open())
+
+
+# =========================================================================== #
+# 匿名 Demo（Phase 2，docs §5/§9.1/§9.3/§12.1）
+#
+# 结构原则（fail-closed，逐条对设计）：
+#   - /api/demo/* 绝不调用 current_identity()（无 role→owner 归一）；身份一律
+#     来自独立 Demo capability cookie（demo_capability → demo_sessions token_hash）；
+#   - json/dual 后端一律 503 pg_backend_required（platform_features 守卫）；
+#   - 公开 Demo 模式（PUBLIC_DEMO_ENABLED=1 或周期 demo_enabled=true）下，HistoPilot
+#     healthz 的 adapter 必须是 plugin-contract；探测失败/legacy → /demo AI 与
+#     /api/demo/ai/run fail-closed（§5.4-1）；同时禁用 /internal/ai/annotate 写通道；
+#   - capability 只能调 /api/demo/*：其余端点不读该 cookie（登录态 session 鉴权
+#     照常 401）；
+#   - slide 一律按 demo_catalog allowlist（slide_id）校验，不接受任意文件名。
+# =========================================================================== #
+#: Demo capability cookie 名（与登录 session cookie 分离，docs §5.2/§10.3）
+DEMO_CAPABILITY_COOKIE = "demo_capability"
+#: Demo run 用户任务限长（docs §5.3：最多 300 字或预设任务）
+DEMO_TASK_MAX_CHARS = 300
+#: Demo session 可重连窗口：consumed_at + 1h（docs §5.3 表）
+DEMO_SESSION_RECONNECT_SECONDS = 3600
+#: Demo 安全协商 envelope（docs §5.4；与 HistoPilot security-envelope.ts 常量一致）
+DEMO_SECURITY_CONTRACT_VERSION = "1.0"
+DEMO_TOOL_PROFILE = "demo-readonly-v1"
+DEMO_SESSION_TTL_SECONDS = 86400
+DEMO_REQUIRED_FEATURES = [
+    "tool-profile:demo-readonly-v1",
+    "session:ephemeral-v1",
+    "session-ttl:v1",
+]
+
+
+def _demo_token_hash(token: str) -> str:
+    """Demo capability 明文 token 的带盐 hash（库中只存 hash，docs §5.2）。"""
+    return hmac.new(
+        ("democap:" + _auth_hash_salt()).encode("utf-8"),
+        (token or "").encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _demo_subject(token_hash: str) -> str:
+    """HistoPilot session_owner 用的不可反推 Demo subject（docs §5.4）。
+
+    ``demo_`` + token_hash 前 16 位——不含 IP、不含 cookie 明文，不可反推回
+    真实浏览器身份（token_hash 本身已是带盐单向哈希）。
+    """
+    return "demo_" + (token_hash or "")[:16]
+
+
+def _demo_require_pg():
+    """json/dual 后端：Demo API 一律 fail-closed（503 pg_backend_required）。"""
+    if platform_features.demo_features_available():
+        return None
+    return (
+        jsonify(
+            error="Demo 需要 STORAGE_BACKEND=postgres（当前 json/dual 后端不提供"
+                  "跨 worker 一致性保证，fail-closed）",
+            code=platform_features.PgFeatureUnavailable.code),
+        503,
+    )
+
+
+def _demo_require_open():
+    """PG 后端 + 公开 Demo 已开启；否则 503 / 403（切片与 AI 一并拒绝）。"""
+    err = _demo_require_pg()
+    if err is not None:
+        return err
+    if not _demo_public_mode():
+        return (jsonify(error="Demo 当前未开放", code="demo_disabled"), 403)
+    return None
+
+
+def _demo_public_mode() -> bool:
+    """公开 Demo 是否开启：PUBLIC_DEMO_ENABLED=1 或当前预算周期 demo_enabled。
+
+    PG 不可读时 fail-closed（False）。
+    """
+    if platform_features.public_demo_enabled():
+        return True
+    if not platform_features.demo_features_available():
+        return False
+    try:
+        period = budget_store.get_current_period()
+        return bool(period and period.get("demo_enabled"))
+    except Exception:
+        app.logger.warning("读取 Demo 开关失败（按关闭处理）", exc_info=True)
+        return False
+
+
+def _demo_task_max_steps() -> int:
+    """Demo 单次任务步骤（周期 demo_task_max_steps，默认 20；docs §4.1/§5.3）。"""
+    period = _current_budget_period_or_none() or {}
+    try:
+        v = int(period.get("demo_task_max_steps")
+                or budget_store.DEFAULT_DEMO_TASK_MAX_STEPS)
+    except (TypeError, ValueError):
+        v = budget_store.DEFAULT_DEMO_TASK_MAX_STEPS
+    return max(1, min(v, _MAX_STEPS_LIMIT))
+
+
+# --------------------------------------------------------------------------- #
+# HistoPilot adapter mode 探测（公开 Demo 前置，docs §5.4-1）
+# --------------------------------------------------------------------------- #
+_ADAPTER_MODE_CACHE = {"ts": 0.0, "mode": None}
+#: 探测结果短缓存（避免每个请求打一次 HistoPilot；TESTING 下不缓存保证可测）
+_ADAPTER_MODE_TTL_SECONDS = 15.0
+
+
+def _histopilot_adapter_mode(force=False):
+    """探测 HistoPilot /healthz 的 adapter mode。
+
+    返回 "plugin-contract" / "legacy" / None（不可达或应答异常）。legacy adapter
+    不消费 run grant，不能用于任何声称只读的 Demo（§5.4-1）。
+    """
+    ttl = 0.0 if app.config.get("TESTING") else _ADAPTER_MODE_TTL_SECONDS
+    now = time.time()
+    if not force and now - _ADAPTER_MODE_CACHE["ts"] < ttl:
+        return _ADAPTER_MODE_CACHE["mode"]
+    mode = None
+    try:
+        r = requests.get(AI_SIDECAR_URL.rstrip("/") + "/healthz", timeout=3.0,
+                         headers=_sidecar_auth_headers())
+        if r.status_code == 200:
+            mode = ((r.json() or {}).get("adapter")) or None
+    except Exception:
+        mode = None
+    _ADAPTER_MODE_CACHE.update(ts=now, mode=mode)
+    return mode
+
+
+def _demo_adapter_gate():
+    """公开 Demo AI 前置闸：HistoPilot 可达且 adapter=plugin-contract，否则 503。"""
+    mode = _histopilot_adapter_mode()
+    if mode == "plugin-contract":
+        return None, mode
+    if mode == "legacy":
+        return (
+            jsonify(error="HistoPilot 正运行 legacy adapter，公开 Demo 已按安全"
+                          "策略停用（需要 plugin-contract；legacy 不消费 run grant）",
+                    code="histopilot_legacy_adapter"),
+            503,
+        ), mode
+    return (
+        jsonify(error="HistoPilot 不可达，Demo AI 暂不可用（切片仍可浏览）",
+                code="histopilot_unreachable"),
+        503,
+    ), mode
+
+
+# --------------------------------------------------------------------------- #
+# Demo capability 解析与签发（docs §5.2）
+# --------------------------------------------------------------------------- #
+def _demo_current_capability():
+    """从 cookie 解析有效 Demo capability。
+
+    返回 (capability_dict|None, reason)：reason ∈ None / "missing"（无 cookie）/
+    "invalid"（过期、被撤销或库中无此 hash）。**绝不**回落到登录 session。
+    """
+    token = request.cookies.get(DEMO_CAPABILITY_COOKIE) or ""
+    if not token:
+        return None, "missing"
+    try:
+        cap = demo_store.get_valid_capability(_demo_token_hash(token))
+    except platform_features.PgFeatureUnavailable:
+        raise
+    except Exception:
+        app.logger.warning("Demo capability 读取失败", exc_info=True)
+        return None, "invalid"
+    if cap is None:
+        return None, "invalid"
+    return cap, None
+
+
+def _demo_require_capability():
+    """Demo API 的 capability fail-closed 守卫。
+
+    返回 (capability, None) 或 (None, error_response)：无 cookie → 401；
+    cookie 存在但无效/过期/已撤销 → 410 capability_expired（docs §5.2：过期或
+    退出后不能继续查看 AI session）。
+    """
+    try:
+        cap, why = _demo_current_capability()
+    except platform_features.PgFeatureUnavailable:
+        raise
+    if cap is not None:
+        return cap, None
+    if why == "missing":
+        return None, (jsonify(error="缺少 Demo capability", code="capability_missing"), 401)
+    return None, (jsonify(error="Demo capability 已失效或过期", code="capability_expired"), 410)
+
+
+def _demo_issue_capability():
+    """（无有效 cookie 时）生成新 Demo capability（不落 cookie）。
+
+    返回 (capability|None, token|None)：随机不透明 token（secrets）只留在浏览器，
+    库中只写 hash；签发失败 (None, None) 不阻断页面。
+    """
+    cap, _why = _demo_current_capability()
+    if cap is not None:
+        return cap, None
+    token = secrets.token_urlsafe(32)
+    ip_hash = _ip_prefix_hash(request.remote_addr or "") or None
+    try:
+        cap = demo_store.create_capability(
+            "dcp_" + secrets.token_hex(8), _demo_token_hash(token),
+            ip_prefix_hash=ip_hash)
+    except Exception:
+        app.logger.warning("Demo capability 签发失败", exc_info=True)
+        return None, None
+    return cap, token
+
+
+def _demo_capability_cookie_attrs(resp, token):
+    """把 capability 明文 token 写入响应 cookie（HttpOnly/Lax/Secure/24h）。"""
+    resp.set_cookie(
+        DEMO_CAPABILITY_COOKIE, token,
+        httponly=True, samesite="Lax",
+        secure=bool(app.config.get("SESSION_COOKIE_SECURE", False)),
+        max_age=int(demo_store.DEMO_CAPABILITY_TTL_HOURS * 3600),
+        path="/",
+    )
+    return resp
+
+
+def _demo_set_capability_cookie(resp):
+    """签发新 Demo capability 并 Set-Cookie（docs §5.2）；返回 capability|None。"""
+    cap, token = _demo_issue_capability()
+    if cap is not None and token:
+        _demo_capability_cookie_attrs(resp, token)
+    return cap
+
+
+# --------------------------------------------------------------------------- #
+# Demo 切片 allowlist 解析（docs §5.1：独立 demo_catalog，public ≠ 匿名可见）
+# --------------------------------------------------------------------------- #
+def _demo_catalog_slide(slide_id):
+    """校验 slide_id 在 Demo 目录并解析回 legacy 文件名。
+
+    返回 (entry, filename) 或 (None, None)：不在目录 / slides 行缺失 /
+    legacy_filename 为 NULL 一律 None（fail-closed，绝不按文件名猜）。
+    """
+    if not isinstance(slide_id, str) or not slide_id:
+        return None, None
+    try:
+        entry = demo_store.catalog_get(slide_id)
+        if entry is None:
+            return None, None
+        filename = demo_store.resolve_slide_filename(slide_id)
+    except platform_features.PgFeatureUnavailable:
+        raise
+    except Exception:
+        app.logger.warning("Demo 目录读取失败", exc_info=True)
+        return None, None
+    if not filename:
+        return None, None
+    return entry, filename
+
+
+# --------------------------------------------------------------------------- #
+# /demo 页面与 /api/demo/*（docs §9.1）
+# --------------------------------------------------------------------------- #
+@app.route("/demo")
+def demo_landing():
+    """Demo 只读 Viewer 入口（Phase 2，docs §5.6）。
+
+    服务端渲染明确的 demo 模式（非 CSS 隐藏）：json/dual 明确提示不满足 PG
+    前置；PG 下顺带签发 capability cookie（首次访问，docs §5.2）并探测 adapter
+    mode 供页面初始化降级提示。
+    """
+    pg_ok = platform_features.demo_features_available()
+    enabled = bool(pg_ok and _demo_public_mode())
+    adapter_mode = _histopilot_adapter_mode() if enabled else None
+    resp = make_response(render_template(
+        "demo.html",
+        app_mode="demo",
+        capabilities=_app_capabilities("demo"),
+        histopilot_ui_enabled=False,
+        demo_available=pg_ok,
+        demo_enabled=enabled,
+        adapter_mode=adapter_mode,
+    ))
+    if enabled:
+        try:
+            _demo_set_capability_cookie(resp)
+        except platform_features.PgFeatureUnavailable:
+            pass  # json/dual：页面已按 demo_available=False 提示
+    return resp
+
+
+@app.route("/api/demo/config")
+def api_demo_config():
+    """Demo 开关 / 额度状态 / AI 可达性（capability 首次在此签发，docs §9.1）。"""
+    err = _demo_require_pg()
+    if err is not None:
+        return err
+    payload = {
+        "demo_enabled": _demo_public_mode(),
+        "task_max_chars": DEMO_TASK_MAX_CHARS,
+        "task_max_steps": _demo_task_max_steps(),
+        "run_state": None,
+        "histopilot_session_id": None,
+        "session_reconnect_until": None,
+        "budget": None,
+        "per_browser_limit": 1,
+        "per_browser_used": 0,
+        "per_browser_remaining": 1,
+    }
+    # adapter / AI 可达性（探测失败也返回 200：Viewer 仍可浏览切片，§5.6）
+    gate, mode = _demo_adapter_gate()
+    payload["adapter_mode"] = mode
+    payload["ai_available"] = gate is None
+    payload["ai_unavailable_code"] = None if gate is None else (
+        gate[0].get_json().get("code"))
+    # 本浏览器 run 状态 + 平台/Demo 预算余量（读失败不阻断 config）
+    try:
+        cap, _why = _demo_current_capability()
+    except platform_features.PgFeatureUnavailable:
+        raise
+    except Exception:
+        cap = None
+    if cap is not None:
+        payload["run_state"] = cap.get("run_state")
+        payload["histopilot_session_id"] = cap.get("histopilot_session_id")
+        consumed_at = cap.get("consumed_at")
+        if consumed_at:
+            payload["session_reconnect_until"] = (
+                float(consumed_at) + DEMO_SESSION_RECONNECT_SECONDS)
+    try:
+        period = budget_store.get_current_period()
+        per_browser = int(period.get("demo_per_browser_limit")
+                          or budget_store.DEFAULT_DEMO_PER_BROWSER_LIMIT)
+        used_browser = 0
+        if cap is not None:
+            used_browser = budget_store.subject_turn_total(
+                "demo", cap["id"], "platform")
+        payload["per_browser_limit"] = per_browser
+        payload["per_browser_used"] = used_browser
+        payload["per_browser_remaining"] = max(0, per_browser - used_browser)
+    except platform_features.PgFeatureUnavailable:
+        raise
+    except Exception:
+        app.logger.warning("Demo 每浏览器额度读取失败", exc_info=True)
+    try:
+        report = budget_store.usage_report()
+        demo_total = report["demo"]["total"]
+        plat_total = report["platform"]["total"]
+        payload["budget"] = {
+            "demo_used": demo_total,
+            "demo_limit": report["demo"]["limit"],
+            "demo_exhausted": demo_total + 1 > report["demo"]["limit"],
+            "platform_used": plat_total,
+            "platform_limit": report["platform"]["limit"],
+            "platform_exhausted": plat_total + 1 > report["platform"]["limit"],
+        }
+    except platform_features.PgFeatureUnavailable:
+        raise
+    except Exception:
+        app.logger.warning("Demo 额度状态读取失败", exc_info=True)
+    issued_token = None
+    if cap is None and _demo_public_mode():
+        try:
+            issued_cap, issued_token = _demo_issue_capability()
+            if issued_cap is not None:
+                # 首次签发：新 capability 即 available（run_state 回填按钮态）
+                payload["run_state"] = issued_cap.get("run_state")
+        except Exception:
+            app.logger.warning("Demo capability 签发失败", exc_info=True)
+    resp = jsonify(payload)
+    if issued_token:
+        _demo_capability_cookie_attrs(resp, issued_token)
+    return resp
+
+
+@app.route("/api/demo/slides")
+def api_demo_slides():
+    """Demo 目录切片摘要（allowlist 内条目 + 稳定 slide_id，docs §5.1/§9.1）。"""
+    err = _demo_require_open()
+    if err is not None:
+        return err
+    cap, cap_err = _demo_require_capability()
+    if cap_err is not None:
+        return cap_err
+    items = []
+    try:
+        for entry in demo_store.catalog_list_ordered():
+            filename = demo_store.resolve_slide_filename(entry["slide_id"])
+            if not filename:
+                continue  # 行缺失/无映射：fail-closed 不展示
+            item = dict(entry)
+            item["name"] = filename
+            items.append(item)
+    except platform_features.PgFeatureUnavailable:
+        raise
+    except Exception:
+        app.logger.warning("Demo 目录读取失败", exc_info=True)
+        return jsonify(error="demo catalog 不可用"), 503
+    return jsonify({"slides": items})
+
+
+@app.route("/api/demo/slides/<slide_id>/info")
+def api_demo_slide_info(slide_id):
+    """Demo 切片信息；slide_id 必须在 catalog（否则 404，docs §12.1）。"""
+    err = _demo_require_open()
+    if err is not None:
+        return err
+    cap, cap_err = _demo_require_capability()
+    if cap_err is not None:
+        return cap_err
+    entry, filename = _demo_catalog_slide(slide_id)
+    if entry is None:
+        return jsonify(error="slide 不在 Demo 目录内", code="slide_not_in_catalog"), 404
+    info = _slide_info_dict(filename)
+    info["slide_id"] = slide_id
+    if entry.get("display_name"):
+        info["demo_display_name"] = entry["display_name"]
+    if entry.get("description"):
+        info["demo_description"] = entry["description"]
+    info["demo_is_default"] = bool(entry.get("is_default"))
+    return jsonify(info)
+
+
+@app.route("/api/demo/slides/<slide_id>.dzi")
+def api_demo_slide_dzi(slide_id):
+    """Demo Deep Zoom XML：瓦片 URL 指向 /api/demo/slides/<id>_files/（同样过
+    allowlist 校验，不接受任意文件名，docs §12.1）。"""
+    err = _demo_require_open()
+    if err is not None:
+        return err
+    cap, cap_err = _demo_require_capability()
+    if cap_err is not None:
+        return cap_err
+    entry, filename = _demo_catalog_slide(slide_id)
+    if entry is None:
+        return jsonify(error="slide 不在 Demo 目录内", code="slide_not_in_catalog"), 404
+    safe = _safe_name(filename)
+    dz_entry = _get_slide(safe)
+    with slide_cache.borrow_pair(dz_entry) as pair:
+        width, height = pair["dz"].level_dimensions[-1]
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Image xmlns="http://schemas.microsoft.com/deepzoom/2008" '
+        f'Url="/api/demo/slides/{slide_id}_files/" Format="jpeg" '
+        f'Overlap="{DZ_OVERLAP}" TileSize="{DZ_TILE_SIZE}">'
+        f'<Size Width="{width}" Height="{height}"/>'
+        "</Image>"
+    )
+    resp = Response(xml, mimetype="application/xml")
+    resp.headers["Cache-Control"] = "max-age=60"
+    return resp
+
+
+@app.route("/api/demo/slides/<slide_id>_files/<int:level>/<int:x>_<int:y>.jpeg")
+def api_demo_slide_tile(slide_id, level, x, y):
+    """Demo 瓦片（复用主站 DZI/tile 管线 + LRU 缓存，allowlist 先行校验）。"""
+    err = _demo_require_open()
+    if err is not None:
+        return err
+    cap, cap_err = _demo_require_capability()
+    if cap_err is not None:
+        return cap_err
+    entry, filename = _demo_catalog_slide(slide_id)
+    if entry is None:
+        return jsonify(error="slide 不在 Demo 目录内", code="slide_not_in_catalog"), 404
+    safe = _safe_name(filename)
+    key = (safe, level, x, y)
+    cached = _tile_cache_get(key)
+    if cached is not None:
+        buf = io.BytesIO(cached)
+    else:
+        dz_entry = _get_slide(safe)
+        with slide_cache.borrow_pair(dz_entry) as pair:
+            tile = pair["dz"].get_tile(level, (x, y))
+        if tile.mode != "RGB":
+            tile = tile.convert("RGB")
+        buf = io.BytesIO()
+        tile.save(buf, format="JPEG", quality=JPEG_QUALITY)
+        _tile_cache_put(key, buf.getvalue())
+        buf.seek(0)
+    resp = send_file(buf, mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
+
+
+def _demo_ip_run_gate(cap, request_id):
+    """同一 IP 前缀的 Demo run 次数闸（docs §9.5：Demo run 独立桶）。
+
+    同 request_id 的 reserved/consumed 重放不计入新尝试。超限 → 429
+    ``demo_ip_rate_limited`` + Retry-After。limit≤0 关闭该桶。
+    """
+    limit = demo_store.ip_run_limit()
+    if limit <= 0:
+        return None
+    if (isinstance(request_id, str) and request_id
+            and cap.get("request_id") == request_id
+            and cap.get("run_state") in (demo_store.RUN_STATE_RESERVED,
+                                         demo_store.RUN_STATE_CONSUMED)):
+        return None
+    ip_hash = _ip_prefix_hash(request.remote_addr or "") or "unknown"
+    try:
+        usage = demo_store.count_ip_runs(
+            ip_hash, window_seconds=demo_store.ip_run_window_seconds())
+    except platform_features.PgFeatureUnavailable:
+        raise
+    except Exception:
+        app.logger.warning("Demo IP run 限流查询失败（fail-closed）", exc_info=True)
+        return (jsonify(error="Demo 暂时无法确认访问频率，请稍后重试",
+                        code="demo_ip_rate_limited"), 429)
+    if int(usage.get("count") or 0) < limit:
+        return None
+    retry = max(1, int(usage.get("retry_after_seconds") or 0)
+                or demo_store.ip_run_window_seconds())
+    resp = jsonify(
+        error="该网络的 Demo 体验次数已用完，请稍后再试或登录后继续",
+        code="demo_ip_rate_limited",
+        retry_after_seconds=retry,
+        limit=limit,
+        used=int(usage.get("count") or 0),
+    )
+    resp.status_code = 429
+    resp.headers["Retry-After"] = str(retry)
+    return resp
+
+
+@app.route("/api/demo/ai/run", methods=["POST"])
+def api_demo_ai_run():
+    """Demo 一次性只读 AI run（docs §5.3/§5.4；单请求内按序推进，失败回滚）。
+
+    顺序：capability → Demo 开关 → adapter 闸 → catalog allowlist → request_id
+    → demo_store.reserve_run CAS → budget_store.reserve_turn → 组装 /run body
+    （平台凭据 + demo_task_max_steps + security envelope，**不发 run_grant**）→
+    代理 SSE；2xx（security_profile_applied 已确保，X-AI-Session-ID）→ consume；
+    4xx/连接失败 → release。禁止 continue/ask/branch（docs §5.3 表）。
+    """
+    err = _demo_require_open()
+    if err is not None:
+        return err
+    gate, _mode = _demo_adapter_gate()
+    if gate is not None:
+        return gate
+    cap, cap_err = _demo_require_capability()
+    if cap_err is not None:
+        return cap_err
+    body = request.get_json(silent=True) or {}
+    slide_id = body.get("slide_id") if isinstance(body.get("slide_id"), str) else None
+    entry, filename = _demo_catalog_slide(slide_id)
+    if entry is None:
+        return (jsonify(error="slide 不在 Demo 目录内", code="slide_not_in_catalog"),
+                404)
+    task = body.get("task")
+    if task is not None and (not isinstance(task, str)
+                             or len(task) > DEMO_TASK_MAX_CHARS):
+        return (jsonify(error="task 非法：需字符串且最多 %d 字"
+                        % DEMO_TASK_MAX_CHARS, code="task_too_long"), 400)
+    rid, rid_err = _parse_client_request_id(body)
+    if rid_err is not None:
+        return rid_err
+    ip_gate = _demo_ip_run_gate(cap, rid)
+    if ip_gate is not None:
+        return ip_gate
+    safe = _safe_name(filename)
+
+    # 惰性对账（docs §5.3-5：每次新预占前回收过期项；对账含 HistoPilot 反查）
+    try:
+        reconcile_expired_reservations()
+    except Exception:
+        app.logger.warning("Demo 预占前惰性对账失败（不阻断）", exc_info=True)
+
+    # 3) 每浏览器 run：CAS available→reserved；限额 >1 时允许 consumed 再预占。
+    from_states = (demo_store.RUN_STATE_AVAILABLE,)
+    try:
+        period = budget_store.get_current_period()
+        per_browser = int(period.get("demo_per_browser_limit")
+                          or budget_store.DEFAULT_DEMO_PER_BROWSER_LIMIT)
+        used_browser = budget_store.subject_turn_total(
+            "demo", cap["id"], "platform")
+        if per_browser > 1 and used_browser < per_browser:
+            from_states = (demo_store.RUN_STATE_AVAILABLE,
+                           demo_store.RUN_STATE_CONSUMED)
+    except Exception:
+        app.logger.warning("读取每浏览器限额失败（按 1 次处理）", exc_info=True)
+        per_browser = 1
+    run = demo_store.reserve_run(
+        cap["id"], rid, slide_id, _legacy_slide_revision(safe),
+        from_states=from_states,
+        ip_prefix_hash=_ip_prefix_hash(request.remote_addr or "") or "unknown")
+    if run is None:
+        return (jsonify(error="本次体验已使用（每浏览器 24 小时 %d 次）"
+                        % per_browser,
+                        code="demo_run_already_used"), 409)
+
+    run_attempt = run.get("attempt")
+    run_rollback_epoch = int(run.get("rollback_epoch") or 0)
+
+    def _rollback_demo_run(reason, expected_attempt=None, expected_request_id=None,
+                           expected_rollback_epoch=None):
+        """预占后、HistoPilot 接受前的统一回滚（幂等；consumed 拒绝释放）。"""
+        if run.get("replayed"):
+            app.logger.info("Demo 在途 request_id 重放失败，不释放原 run：%s (%s)",
+                            rid, reason)
+            return
+        try:
+            demo_store.release_run(
+                cap["id"], expected_attempt=expected_attempt,
+                expected_request_id=expected_request_id,
+                expected_rollback_epoch=expected_rollback_epoch)
+        except demo_store.RunAttemptConflict:
+            app.logger.warning("Demo run 回滚遇 attempt 冲突（保留新尝试）：%s",
+                               reason)
+        except ValueError:
+            app.logger.warning("Demo run 回滚遇 consumed（防误退款保留）：%s",
+                               reason)
+        except Exception:
+            app.logger.warning("Demo run 回滚失败：%s", reason, exc_info=True)
+
+    # 4) Demo 子额度 + 平台总预算原子预占（超限释放 run，不回退其它凭据）
+    try:
+        resv = budget_store.reserve_turn(rid, "demo", cap["id"], "platform")
+    except budget_store.DemoPerBrowserExhausted as exc:
+        _rollback_demo_run("demo_run_already_used", expected_attempt=run_attempt,
+                           expected_request_id=rid,
+                           expected_rollback_epoch=run_rollback_epoch)
+        return _budget_error_response(exc, 409)
+    except budget_store.DemoConcurrencyExceeded as exc:
+        _rollback_demo_run("demo_concurrency_exceeded", expected_attempt=run_attempt,
+                           expected_request_id=rid,
+                           expected_rollback_epoch=run_rollback_epoch)
+        return _budget_error_response(exc, 429)
+    except budget_store.DemoBudgetExhausted as exc:
+        _rollback_demo_run("demo_budget_exhausted", expected_attempt=run_attempt,
+                           expected_request_id=rid,
+                           expected_rollback_epoch=run_rollback_epoch)
+        return _budget_error_response(exc, 429)
+    except budget_store.PlatformBudgetExhausted as exc:
+        _rollback_demo_run("platform_ai_budget_exhausted", expected_attempt=run_attempt,
+                           expected_request_id=rid,
+                           expected_rollback_epoch=run_rollback_epoch)
+        return _budget_error_response(exc, 429)
+    except budget_store.BudgetError as exc:
+        _rollback_demo_run("budget_error", expected_attempt=run_attempt,
+                           expected_request_id=rid,
+                           expected_rollback_epoch=run_rollback_epoch)
+        return _budget_error_response(exc, 409)
+    except platform_features.PgFeatureUnavailable as exc:
+        _rollback_demo_run("pg_backend_required", expected_attempt=run_attempt,
+                           expected_request_id=rid,
+                           expected_rollback_epoch=run_rollback_epoch)
+        return _budget_error_response(exc, 503, code="pg_backend_required")
+
+    resv_attempt = resv.get("attempt")
+    resv_rollback_epoch = int(resv.get("rollback_epoch") or 0)
+
+    def _rollback_all(reason):
+        _rollback_demo_run(reason, expected_attempt=run_attempt,
+                           expected_request_id=rid,
+                           expected_rollback_epoch=run_rollback_epoch)
+        if resv.get("replayed"):
+            app.logger.info("Demo 在途预算重放失败，不释放原预占：%s", rid)
+            return
+        try:
+            budget_store.release(
+                rid, expected_attempt=resv_attempt,
+                expected_rollback_epoch=resv_rollback_epoch)
+        except budget_store.ReservationAttemptConflict:
+            app.logger.warning("预算回滚遇 attempt 冲突（保留新尝试）：%s", reason)
+        except ValueError:
+            app.logger.warning("预算回滚遇 consumed（防误退款保留）：%s", reason)
+        except Exception:
+            app.logger.warning("预算回滚失败：%s", reason, exc_info=True)
+
+    # 5) /run body：平台凭据 + 周期 demo_task_max_steps；不发 run_grant（只读
+    #    tool profile 无平台写工具，docs §5.4-5）；session_owner 用不可反推 subject。
+    config = _build_sidecar_config(None)
+    if config is None:
+        _rollback_all("platform_credentials_missing")
+        return (jsonify(error="平台 AI 未配置，Demo AI 暂不可用（切片仍可浏览）",
+                        code="platform_credentials_missing"), 503)
+    config["max_steps"] = _demo_task_max_steps()
+    config["session_owner"] = _demo_subject(cap["token_hash"])
+
+    payload = {
+        "slide": filename,
+        "config": config,
+        "request_id": rid,
+        "security": {
+            "security_contract_version": DEMO_SECURITY_CONTRACT_VERSION,
+            "required_features": list(DEMO_REQUIRED_FEATURES),
+            "tool_profile": DEMO_TOOL_PROFILE,
+            "session_ttl_seconds": DEMO_SESSION_TTL_SECONDS,
+            "request_id": rid,
+        },
+    }
+    if task is not None:
+        payload["task"] = task
+
+    # 6/7) 代理 SSE；_proxy_sse 在 2xx（security_profile_applied 已由 HistoPilot
+    #     在建流前发出/确保）时 on_accepted → consume；4xx/连接失败 on_rejected
+    #     → release。回调内部吞异常（交由对账兜底）。
+    def on_accepted(hp_session_id):
+        sid = hp_session_id or ""
+        try:
+            demo_store.consume_run(cap["id"], sid, expected_attempt=run_attempt,
+                                   expected_request_id=rid)
+        except demo_store.RunAttemptConflict:
+            app.logger.warning("Demo run consume attempt 冲突（对账兜底）",
+                               exc_info=True)
+        except Exception:
+            app.logger.warning("Demo run consume 失败（对账兜底）", exc_info=True)
+        try:
+            budget_store.consume(rid, sid, expected_attempt=resv_attempt)
+        except budget_store.ReservationAttemptConflict:
+            app.logger.warning("Demo 预算 consume attempt 冲突（对账兜底）",
+                               exc_info=True)
+        except Exception:
+            app.logger.warning("Demo 预算 consume 失败（对账兜底）", exc_info=True)
+
+    def on_rejected():
+        _rollback_all("histopilot_rejected")
+
+    _audit("demo.ai.run", target_type="demo_session", target_id=cap["id"],
+           slide=filename, detail={"request_id": rid, "slide_id": slide_id})
+    return _proxy_sse("/run", payload, on_accepted=on_accepted,
+                      on_rejected=on_rejected)
+
+
+@app.route("/api/demo/ai/session/<session_id>")
+def api_demo_ai_session_detail(session_id):
+    """Demo session snapshot（capability 绑定；不扣额度；docs §5.5 event_reset）。
+
+    与 stream 同一授权：capability 有效且绑定该 histopilot_session_id，且在
+    consumed_at + 1h 窗口内。供 UI 在 event_reset 后全量重建 transcript/overlay。
+    """
+    bound = _demo_session_access(session_id)
+    if bound is not None:
+        return bound
+    return _proxy_json("/session/" + session_id, None, method="GET")
+
+
+@app.route("/api/demo/ai/session/<session_id>/stream")
+def api_demo_ai_session_stream(session_id):
+    """Demo session SSE 重连（不扣额度，docs §5.3-3/§5.5）。
+
+    仅当：capability 有效（过期/撤销 → 410）且该 capability 绑定的
+    histopilot_session_id 与请求一致（拿别的 session id 读不到他人 session），
+    且仍在 consumed_at + 1h 重连窗口内。
+    """
+    bound = _demo_session_access(session_id)
+    if bound is not None:
+        return bound
+    return _proxy_sse("/session/{}/stream".format(session_id), None, method="GET")
+
+
+def _demo_session_access(session_id):
+    """Demo session 读通道共用守卫。通过返回 None；否则返回 error response。"""
+    err = _demo_require_open()
+    if err is not None:
+        return err
+    cap, cap_err = _demo_require_capability()
+    if cap_err is not None:
+        return cap_err
+    if cap.get("run_state") != demo_store.RUN_STATE_CONSUMED or \
+            cap.get("histopilot_session_id") != session_id:
+        return _denied()
+    consumed_at = cap.get("consumed_at")
+    if not consumed_at or (float(consumed_at) + DEMO_SESSION_RECONNECT_SECONDS
+                           < time.time()):
+        return (jsonify(error="Demo AI 会话重连窗口已过（consumed_at + 1 小时）",
+                        code="session_reconnect_expired"), 410)
+    return None
 
 
 @app.route("/api/auth/info")
@@ -1261,9 +2375,17 @@ def _archived_slide_names():
 # --------------------------------------------------------------------------- #
 # owner 用户管理（Stage 3a 身份基础；注册默认关闭，docs §19-12）
 # --------------------------------------------------------------------------- #
-# 开放注册开关默认关闭（"0"）。本节点不做公开注册页——owner 手动添加用户。
-REGISTRATION_OPEN = (os.environ.get("REGISTRATION_OPEN") or "0").strip().lower() in (
-    "1", "true", "yes")
+# 注册开关（docs §7.3）：settings_store 为运行时权威（PG platform_settings），
+# env REGISTRATION_OPEN 只作 bootstrap 默认（json 后端 fallback env）。默认关闭。
+# Phase 1 不做 owner 运行时开关 API（Phase 4）。
+# --------------------------------------------------------------------------- #
+def _registration_open() -> bool:
+    """注册开关权威读取（PG 权威 / env bootstrap）；读取失败按关闭处理。"""
+    try:
+        return bool(settings_store.get_registration_open())
+    except Exception:
+        app.logger.exception("读取 registration_open 失败，按关闭处理")
+        return False
 
 
 @app.route("/api/admin/users", methods=["GET"])
@@ -1272,7 +2394,8 @@ def api_admin_users_list():
     auth = _require_owner()
     if auth:
         return auth
-    return jsonify(users=user_store.list_users(), registration_open=REGISTRATION_OPEN)
+    return jsonify(users=user_store.list_users(),
+                   registration_open=_registration_open())
 
 
 @app.route("/api/admin/users", methods=["POST"])
@@ -1361,6 +2484,451 @@ def api_admin_users_password(user_id):
     if user is None:
         return jsonify(error="用户不存在"), 404
     return jsonify(user)
+
+
+# --------------------------------------------------------------------------- #
+# owner AI 预算设置 / 用量（docs §4.2 / §9.2，PT-3）
+#
+# 仅 postgres 后端（json/dual 无跨 worker 一致预算，fail-closed 503）；owner
+# only；全部写方法走统一 CSRF（before_request）。保存上限不清空已有用量；
+# 「开启新预算周期」二次确认 + audit。
+# --------------------------------------------------------------------------- #
+#: 预算限制整数上限（防误填巨型值；次数/步数 sane bound）
+_BUDGET_LIMIT_MAX = 1_000_000
+#: owner 可经 PUT 修改的周期限制字段（与 budget_store._PERIOD_LIMIT_COLUMNS 对齐）
+_BUDGET_SETTINGS_FIELDS = (
+    "platform_turn_limit", "demo_turn_limit", "user_turn_limit",
+    "platform_task_max_steps", "own_task_max_steps_limit", "demo_task_max_steps",
+    "demo_enabled", "demo_per_browser_limit", "demo_max_concurrency",
+)
+
+
+def _budget_require_pg():
+    """json/dual 后端访问预算 API → (error_response, None)；否则 (None, None)。"""
+    if not platform_features.budget_features_available():
+        return (
+            (jsonify(error="AI 预算需要 STORAGE_BACKEND=postgres；json/dual 后端"
+                           "不提供跨 worker 预算",
+                     code=platform_features.PgFeatureUnavailable.code),
+             503),
+            None,
+        )
+    return None, None
+
+
+def _validate_budget_settings(body, current_limits):
+    """校验 owner 提交的预算限制（docs §4.2）。
+
+    body 里只允许 _BUDGET_SETTINGS_FIELDS；次数/步数为有界正整数（0 不允许，
+    demo_turn_limit 允许 0=关闭 Demo 子额度）；demo_enabled 布尔。关系校验：
+    0 <= demo_turn_limit <= platform_turn_limit（按「本次提交 + 未提交沿用现值」
+    合并后判定）。返回 (validated, None) 或 (None, err)。
+    """
+    unknown = set(body.keys()) - set(_BUDGET_SETTINGS_FIELDS)
+    if unknown:
+        return None, "未知字段：{}".format(", ".join(sorted(unknown)))
+    validated = {}
+    for field in _BUDGET_SETTINGS_FIELDS:
+        if field not in body:
+            continue
+        raw = body.get(field)
+        if field == "demo_enabled":
+            if not isinstance(raw, bool):
+                return None, "demo_enabled 需为布尔值"
+            validated[field] = raw
+            continue
+        iv, err = _coerce_tuning_int(raw, field)
+        if err:
+            return None, err
+        if field == "demo_turn_limit":
+            if iv < 0:
+                return None, "demo_turn_limit 不可为负"
+        elif iv <= 0:
+            return None, "{} 需为正整数（> 0）".format(field)
+        if iv > _BUDGET_LIMIT_MAX:
+            return None, "{} 不可超过 {}".format(field, _BUDGET_LIMIT_MAX)
+        validated[field] = iv
+    # 关系校验：0 <= demo_turn_limit <= platform_turn_limit（合并现值后）
+    merged = dict(current_limits)
+    merged.update(validated)
+    demo = int(merged.get("demo_turn_limit") or 0)
+    platform = int(merged.get("platform_turn_limit") or 0)
+    if demo > platform:
+        return None, "demo_turn_limit（{}）不可超过 platform_turn_limit（{}）".format(
+            demo, platform)
+    return validated, None
+
+
+@app.route("/api/admin/settings/ai-budget", methods=["GET"])
+def api_admin_ai_budget_get():
+    """当前周期用量与限制（owner 后台「AI 预算」卡片数据源，docs §4.2）。
+
+    返回：period、limits、usage（platform/demo/构成/每用户/own）、
+    demo_sessions（未过期 capability 按状态计数）、concurrency。
+    json/dual → 503 pg_backend_required。
+    """
+    auth = _require_owner()
+    if auth:
+        return auth
+    err, _ = _budget_require_pg()
+    if err is not None:
+        return err
+    try:
+        report = budget_store.usage_report()
+    except platform_features.PgFeatureUnavailable as exc:
+        return _budget_error_response(exc, 503, code=exc.code)
+    except Exception:
+        app.logger.exception("读取 AI 预算用量失败")
+        return jsonify(error="读取 AI 预算用量失败"), 500
+    period = report["period"]
+    limits = {k: period.get(k) for k in _BUDGET_SETTINGS_FIELDS}
+    # 当前运行数：无独立并发计数器，用在途 reserved（已预占未终态）作近似；
+    # 上限取周期配置的并发字段（本阶段唯一并发上限）。
+    concurrency = {
+        "current": int(report["platform"]["reserved"]) + int(report["own"]["reserved"]),
+        "max": int(period.get("demo_max_concurrency") or 0),
+    }
+    demo_sessions = {"available": 0, "reserved": 0, "consumed": 0, "total": 0}
+    try:
+        demo_sessions = demo_store.count_run_states()
+    except Exception:
+        app.logger.warning("读取 Demo capability 用量失败", exc_info=True)
+    return jsonify(
+        period={
+            "id": period["id"],
+            "started_at": period["started_at"],
+            "closed_at": period["closed_at"],
+        },
+        limits=limits,
+        usage={
+            "platform": report["platform"],
+            "demo": report["demo"],
+            "by_subject_type": report["by_subject_type"],
+            "per_user": report["per_user"],
+            "own": report["own"],
+        },
+        demo_sessions=demo_sessions,
+        concurrency=concurrency,
+        backend=platform_features.current_backend(),
+    )
+
+
+@app.route("/api/admin/settings/ai-budget", methods=["PUT"])
+def api_admin_ai_budget_put():
+    """修改当前周期限制（不清空已有用量，docs §4.2）。
+
+    body 为限制字段子集；校验见 _validate_budget_settings。调低到小于已用量时
+    现有运行不取消、新请求立即被拒（budget_store 判定语义）。
+    """
+    auth = _require_owner()
+    if auth:
+        return auth
+    err, _ = _budget_require_pg()
+    if err is not None:
+        return err
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict) or not body:
+        return jsonify(error="缺少预算限制字段"), 400
+    try:
+        current = budget_store.get_current_period()
+    except platform_features.PgFeatureUnavailable as exc:
+        return _budget_error_response(exc, 503, code=exc.code)
+    current_limits = {k: current.get(k) for k in _BUDGET_SETTINGS_FIELDS}
+    validated, verr = _validate_budget_settings(body, current_limits)
+    if verr:
+        return jsonify(error=verr), 400
+    try:
+        period = budget_store.update_period_limits(validated)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except platform_features.PgFeatureUnavailable as exc:
+        return _budget_error_response(exc, 503, code=exc.code)
+    _audit("ai_budget.update", target_type="ai_budget_period",
+           target_id=str(period["id"]), detail={"fields": sorted(validated)})
+    limits = {k: period.get(k) for k in _BUDGET_SETTINGS_FIELDS}
+    return jsonify(period_id=period["id"], limits=limits)
+
+
+@app.route("/api/admin/settings/ai-budget/reset", methods=["POST"])
+def api_admin_ai_budget_reset():
+    """开启新预算周期并放开 Demo 每浏览器/IP 辅闸（二次确认 + audit）。
+
+    body: {confirm: true, limits?}。旧周期 closed_at=now() 且行/用量保留（排查
+    用）；新周期用量归零；reserved/consumed 的 Demo capability 退回 available
+    （同一 cookie 可立刻再跑，IP 桶也不再计入旧 run）。limits 可选（未给沿用旧值）。
+    """
+    auth = _require_owner()
+    if auth:
+        return auth
+    err, _ = _budget_require_pg()
+    if err is not None:
+        return err
+    body = request.get_json(silent=True) or {}
+    if body.get("confirm") is not True:
+        return jsonify(error="需二次确认：confirm=true 才能开启新的预算周期"), 400
+    new_limits = body.get("limits")
+    if new_limits is not None:
+        if not isinstance(new_limits, dict):
+            return jsonify(error="limits 需为对象"), 400
+        try:
+            current = budget_store.get_current_period()
+        except platform_features.PgFeatureUnavailable as exc:
+            return _budget_error_response(exc, 503, code=exc.code)
+        current_limits = {k: current.get(k) for k in _BUDGET_SETTINGS_FIELDS}
+        validated, verr = _validate_budget_settings(new_limits, current_limits)
+        if verr:
+            return jsonify(error=verr), 400
+        new_limits = validated
+    try:
+        period = budget_store.reset_period(
+            new_limits, created_by=current_identity().get("user_id"))
+        demo_reset_ids = demo_store.reset_demo_runs()
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except platform_features.PgFeatureUnavailable as exc:
+        return _budget_error_response(exc, 503, code=exc.code)
+    _audit("ai_budget.reset", target_type="ai_budget_period",
+           target_id=str(period["id"]),
+           detail={"closed_previous": True,
+                   "demo_runs_reset": len(demo_reset_ids)})
+    limits = {k: period.get(k) for k in _BUDGET_SETTINGS_FIELDS}
+    return jsonify(period_id=period["id"], limits=limits,
+                   started_at=period["started_at"],
+                   demo_runs_reset=len(demo_reset_ids))
+
+
+# --------------------------------------------------------------------------- #
+# owner Demo 目录管理（docs §5.1 / 任务 §3，PT-4）
+#
+# 只有 owner 能把切片加入/移出 Demo allowlist（public ≠ 互联网匿名可见）。
+# 移出/删除联动 revoke_by_slide：capability 立即失效、未完成 run 标记终止，
+# 并按返回的 terminated_runs 释放对应预算 reservation（已 consumed 拒绝释放）。
+# --------------------------------------------------------------------------- #
+def _release_budget_for_terminated_runs(terminated_runs):
+    """按 request_id 向 HistoPilot 确认后 consume / release / 顺延。
+
+    不得盲 release：sidecar 已接受但平台尚未 consume 时必须 consume，否则会
+    退回已经产生模型成本的额度。found+已接受 → consume；missing → release；
+    不可达或尚未接受 → 顺延 reservation。
+    """
+    released = []
+    for run_id in terminated_runs or []:
+        try:
+            row = demo_store.get_session(run_id)
+        except Exception:
+            app.logger.warning("terminated run 读取失败：%s", run_id, exc_info=True)
+            continue
+        rid = (row or {}).get("request_id")
+        run_attempt = (row or {}).get("attempt")
+        if not rid:
+            continue
+        budget_row = None
+        try:
+            budget_row = budget_store.get_reservation(rid)
+        except Exception:
+            budget_row = None
+        budget_attempt = (budget_row or {}).get("attempt") if budget_row else None
+        verdict, hp_sid, accepted = _histopilot_lookup_request(rid)
+        if verdict == "found" and accepted:
+            try:
+                budget_store.consume(rid, hp_sid or "",
+                                     expected_attempt=budget_attempt)
+            except budget_store.ReservationAttemptConflict:
+                try:
+                    budget_store.extend_reservation(
+                        rid, budget_store.DEFAULT_RESERVATION_TTL_SECONDS)
+                except Exception:
+                    pass
+            except ValueError:
+                pass  # 已 consumed
+            except Exception:
+                app.logger.warning("terminated run 预算 consume 失败：%s", rid,
+                                   exc_info=True)
+                try:
+                    budget_store.extend_reservation(
+                        rid, budget_store.DEFAULT_RESERVATION_TTL_SECONDS)
+                except Exception:
+                    pass
+            try:
+                demo_store.consume_run(run_id, hp_sid or "",
+                                       expected_attempt=run_attempt,
+                                       expected_request_id=rid)
+            except Exception:
+                app.logger.warning("terminated run demo consume 失败：%s",
+                                   run_id, exc_info=True)
+        elif verdict == "missing" or verdict == "abandoned":
+            try:
+                budget_store.release(rid, expected_attempt=budget_attempt)
+                released.append(rid)
+            except budget_store.ReservationAttemptConflict:
+                try:
+                    budget_store.extend_reservation(
+                        rid, budget_store.DEFAULT_RESERVATION_TTL_SECONDS)
+                except Exception:
+                    pass
+            except ValueError:
+                pass  # 已 consumed：不退款
+            except Exception:
+                app.logger.warning("terminated run 预算释放失败：%s", rid,
+                                   exc_info=True)
+            try:
+                demo_store.release_run(run_id, expected_attempt=run_attempt,
+                                       expected_request_id=rid)
+            except demo_store.RunAttemptConflict:
+                pass
+            except Exception:
+                pass
+        else:
+            # unavailable 或 found 但尚未接受：顺延，不得退款
+            try:
+                budget_store.extend_reservation(
+                    rid, budget_store.DEFAULT_RESERVATION_TTL_SECONDS)
+            except Exception:
+                app.logger.warning("terminated run 预算顺延失败：%s", rid,
+                                   exc_info=True)
+            try:
+                demo_store.extend_run_reservation(
+                    run_id, demo_store.DEMO_RUN_RESERVATION_TTL_SECONDS)
+            except Exception:
+                pass
+    return released
+
+
+def _revoke_demo_slide(slide_id):
+    """切片下架/删除路径的 Demo 撤销联动：移除目录条目（若有）+ revoke + 释放预算。
+
+    删除切片时目录条目一并移除（避免悬空条目指向已删除文件）；移出目录与
+    删除切片共享 revoke_by_slide 语义（§9.3）。
+    """
+    if not platform_features.demo_features_available():
+        return {"expired_capabilities": 0, "terminated_runs": [],
+                "released_reservations": []}
+    try:
+        result = demo_store.catalog_remove(slide_id)
+        if result is not None:
+            revoke = result["revoke"]
+        else:
+            # 不在目录内（不应发生——删除入口已查过）：仅按 slide 撤销防御
+            revoke = demo_store.revoke_by_slide(slide_id)
+    except Exception:
+        app.logger.warning("Demo revoke_by_slide 失败：%s", slide_id, exc_info=True)
+        return {"expired_capabilities": 0, "terminated_runs": [],
+                "released_reservations": []}
+    released = _release_budget_for_terminated_runs(
+        revoke.get("terminated_runs"))
+    return dict(revoke, released_reservations=released)
+
+
+@app.route("/api/admin/demo-catalog", methods=["GET"])
+def api_admin_demo_catalog_list():
+    """列出 Demo 目录（owner）。json/dual → 503 pg_backend_required。"""
+    auth = _require_owner()
+    if auth:
+        return auth
+    err = _demo_require_pg()
+    if err is not None:
+        return err
+    items = []
+    for entry in demo_store.catalog_list_ordered():
+        item = dict(entry)
+        item["name"] = demo_store.resolve_slide_filename(entry["slide_id"])
+        items.append(item)
+    return jsonify({"slides": items})
+
+
+@app.route("/api/admin/demo-catalog", methods=["PUT"])
+def api_admin_demo_catalog_put():
+    """加入/更新 Demo 目录条目（owner，UPSERT）。
+
+    body: {slide（文件名）, display_name?, description?, sort_order?, is_default?}。
+    切片文件必须存在（allowlist 只接受真实入库切片）；首次加入时为其确保稳定
+    slide_id。is_default=true 时设为默认 Demo 切片。
+    """
+    auth = _require_owner()
+    if auth:
+        return auth
+    err = _demo_require_pg()
+    if err is not None:
+        return err
+    body = request.get_json(silent=True) or {}
+    slide = body.get("slide")
+    if not isinstance(slide, str) or not slide:
+        return jsonify(error="缺少 slide"), 400
+    if not (UPLOAD_DIR / _safe_name(slide)).is_file():
+        return jsonify(error="切片文件不存在：%s" % slide), 404
+    slide_id = share_store.get_slide_id(slide)
+    if slide_id is None:
+        # 首次为该切片建立稳定身份（slides 行由 meta 写入路径创建）
+        share_store.set_slide_meta(slide)
+        slide_id = share_store.get_slide_id(slide)
+    if slide_id is None:
+        return jsonify(error="无法解析切片稳定 id：%s" % slide), 404
+    display_name = body.get("display_name")
+    description = body.get("description")
+    if display_name is not None and not isinstance(display_name, str):
+        return jsonify(error="display_name 需为字符串"), 400
+    if description is not None and not isinstance(description, str):
+        return jsonify(error="description 需为字符串"), 400
+    sort_order = body.get("sort_order") or 0
+    try:
+        sort_order = int(sort_order)
+    except (TypeError, ValueError):
+        return jsonify(error="sort_order 需为整数"), 400
+    try:
+        entry = demo_store.catalog_add(
+            slide_id, display_name=display_name, description=description,
+            sort_order=sort_order, added_by=current_identity().get("user_id"))
+        if body.get("is_default") is True:
+            entry = demo_store.catalog_set_default(slide_id)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except platform_features.PgFeatureUnavailable as exc:
+        return _budget_error_response(exc, 503, code=exc.code)
+    _audit("demo_catalog.add", target_type="demo_catalog", target_id=slide_id,
+           slide=slide)
+    entry = dict(entry)
+    entry["name"] = slide
+    return jsonify(entry)
+
+
+@app.route("/api/admin/demo-catalog", methods=["DELETE"])
+def api_admin_demo_catalog_delete():
+    """从 Demo 目录移除（owner）：同事务联动 revoke_by_slide（§9.3）。
+
+    body/query: {slide（文件名）} 或 {slide_id}。返回被撤销统计与释放的预算
+    预占 request_id 列表。
+    """
+    auth = _require_owner()
+    if auth:
+        return auth
+    err = _demo_require_pg()
+    if err is not None:
+        return err
+    body = request.get_json(silent=True) or {}
+    slide = body.get("slide") or request.args.get("slide")
+    slide_id = body.get("slide_id") or request.args.get("slide_id")
+    if not slide_id and isinstance(slide, str) and slide:
+        slide_id = share_store.get_slide_id(slide)
+        if slide_id is None:
+            # 给了文件名但解析不出稳定 id（从未入库）→ 404（区别于缺参 400）
+            return jsonify(error="切片不存在或从未入库：%s" % slide), 404
+    if not slide_id:
+        return jsonify(error="缺少 slide 或 slide_id"), 400
+    try:
+        result = demo_store.catalog_remove(slide_id)
+    except platform_features.PgFeatureUnavailable as exc:
+        return _budget_error_response(exc, 503, code=exc.code)
+    if result is None:
+        return jsonify(error="切片不在 Demo 目录内"), 404
+    released = _release_budget_for_terminated_runs(
+        result["revoke"].get("terminated_runs"))
+    _audit("demo_catalog.remove", target_type="demo_catalog", target_id=slide_id)
+    return jsonify(
+        removed=result["entry"],
+        expired_capabilities=result["revoke"].get("expired_capabilities", 0),
+        terminated_runs=result["revoke"].get("terminated_runs", []),
+        released_reservations=released,
+    )
 
 
 @app.route("/api/admin/audit", methods=["GET"])
@@ -1655,10 +3223,21 @@ def api_slide_delete(name):
 
     .mrxs 切片带有同名伴侣数据目录（去扩展名后的目录），一并删除。
     Stage 3a-2a：owner 任意；user 仅自己的切片。
+    PT-4：切片在 Demo 目录内时联动撤销（capability 失效 + 未完成 run 终止 +
+    对应预算预占释放，docs §9.3）。
     """
     if not can_delete_slide(name):
         return _denied()
     safe = _safe_name(name)
+    # Demo 撤销必须在文件删除前（revoke 后旧 capability 立即不可读，无悬空窗口）
+    if platform_features.demo_features_available():
+        try:
+            slide_id = share_store.get_slide_id(safe)
+            if slide_id:
+                _revoke_demo_slide(slide_id)
+        except Exception:
+            app.logger.warning("切片删除的 Demo 撤销联动失败：%s", safe,
+                               exc_info=True)
     _close_slide(safe)
     try:
         (UPLOAD_DIR / safe).unlink()
@@ -2431,21 +4010,24 @@ def api_admin_plugins_toggle(installation_id):
 
 
 # --------------------------------------------------------------------------- #
-# run grant 发放（§7.6 第 2 步）
+# run grant 发放（§7.6 第 2 步；docs §11.1-1 fail-closed）
 # --------------------------------------------------------------------------- #
 def _issue_run_grant(slide, user_ctx, config):
     """起跑时发放 run grant 并注入 sidecar 请求 config["run_grant"]。
 
-    sidecar 4-1b 才消费（本节点只发放 + 落库 + API）；发放是 best-effort：
-    失败记 log 不阻断起跑（存量 sidecar 不读该字段，行为不变）。session_id
-    起跑时未知 → 先 slide 级（session_id 空串）。
+    HP-1 起 HistoPilot 对含写工具的 run 缺 grant 直接 403，因此**发放失败必须
+    拒绝起跑**（不再 best-effort 只记 log）：返回 True=已注入；False=签发失败，
+    调用方（run/continue/branch）须拒绝转发。session_id 起跑时未知 → 先 slide 级
+    （session_id 空串）。
     """
     if not config or not slide:
-        return
+        app.logger.error("run grant 签发失败：slide/config 缺失（fail-closed）")
+        return False
     installation = _HISTOPILOT_INSTALLATION or {}
     installation_id = installation.get("installation_id")
     if not installation_id:
-        return
+        app.logger.error("run grant 签发失败：histopilot installation 未引导（fail-closed）")
+        return False
     try:
         grant = share_store.create_run_grant(
             installation_id=installation_id,
@@ -2455,14 +4037,549 @@ def _issue_run_grant(slide, user_ctx, config):
             ttl_seconds=_RUN_GRANT_TTL_SECONDS,
         )
     except Exception:
-        app.logger.warning("run grant 发放失败（不阻断起跑）", exc_info=True)
-        return
+        app.logger.error("run grant 签发失败（fail-closed，拒绝起跑）", exc_info=True)
+        return False
     config["run_grant"] = {
         "grant_id": grant["grant_id"],
         "installation_id": installation_id,
         "slide": slide,
         "expires_at": grant["expires_at"],
     }
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# 平台 AI 预算接线（docs §4.1/§4.2/§5.3/§9.4，PT-3）
+#
+# 「一次对话」= 一次用户主动触发并真正启动 Agent 的执行（run/continue/ask/
+# branch）；SSE 重连、查看历史、cancel、读取 session 不预占；cancel 不退已
+# consume 的额度。时序：
+#   1. 解析凭据来源（_resolve_ai_credentials）；
+#   2. credential_source=platform 且预算可用 → reserve_turn 原子预占
+#      （超限映射稳定 code，不回退其它凭据）；own → PG 下记可观测用量
+#      （不扣平台总量），json 下放行不记账（docs §4.3）；
+#   3. HistoPilot 2xx 且拿到 session（X-AI-Session-ID / 非 SSE 2xx）→ consume；
+#      4xx/5xx / 连接失败 → release；同一 request_id 重试命中已有 reservation
+#      不重复扣（budget_store 幂等）。
+# json/dual + platform 凭据：fail-closed 拒绝（pg_backend_required），生产路径
+# 绝不无配额放行；仅 pytest（app.config["TESTING"]，生产不可能设置）放行以保
+# 留 json 模式下的代理层回归测试。
+# --------------------------------------------------------------------------- #
+#: request_id 幂等键格式（与 HistoPilot isValidRequestId 同口径：1–128，[A-Za-z0-9_-]）
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+#: user 自带 API 步数默认（docs §4.1；与 user_store DEFAULT_USER_MAX_STEPS 一致）
+DEFAULT_USER_MAX_STEPS = 20
+
+
+def _parse_client_request_id(body):
+    """校验/生成请求幂等 request_id（docs §5.3-6）。
+
+    客户端未带 → 服务端生成（双击去重依赖客户端稳定 id，测试须覆盖客户端提供
+    的情况）；带了则必须 1–128 字符、仅 [A-Za-z0-9_-]。
+    返回 (request_id, None) 或 (None, error_response)。
+    """
+    rid = (body or {}).get("request_id") if isinstance(body, dict) else None
+    if rid is None or rid == "":
+        return "req_" + secrets.token_hex(16), None
+    if not isinstance(rid, str) or not _REQUEST_ID_RE.match(rid):
+        return None, (
+            jsonify(error="request_id 非法：需 1–128 字符，仅允许字母、数字、下划线与连字符"),
+            400,
+        )
+    return rid, None
+
+
+def _current_budget_period_or_none():
+    """读当前预算周期；postgres 之外 / 读失败 → None（按常量默认值降级取步数）。
+
+    注意 PG 下首次调用会创建默认周期行（get_or_create 语义，幂等）。
+    """
+    if not platform_features.budget_features_available():
+        return None
+    try:
+        return budget_store.get_current_period()
+    except Exception:
+        app.logger.warning("读取 AI 预算周期失败，步数按默认值注入", exc_info=True)
+        return None
+
+
+def _platform_task_max_steps() -> int:
+    """注册用户平台 AI 单次任务步骤（周期 platform_task_max_steps，默认 20）。"""
+    period = _current_budget_period_or_none()
+    raw = (period or {}).get("platform_task_max_steps")
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        v = budget_store.DEFAULT_PLATFORM_TASK_MAX_STEPS
+    return max(1, min(v, _MAX_STEPS_LIMIT))
+
+
+def _own_task_max_steps_limit() -> int:
+    """自带 API 可设置的步数硬上限（周期 own_task_max_steps_limit，默认 500）。"""
+    period = _current_budget_period_or_none()
+    raw = (period or {}).get("own_task_max_steps_limit")
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        v = budget_store.DEFAULT_OWN_TASK_MAX_STEPS_LIMIT
+    return max(1, min(v, _MAX_STEPS_LIMIT))
+
+
+def _budget_testing_bypass() -> bool:
+    """仅 pytest 测试放行 json 后端的平台 AI run（生产路径绝不能 bypass）。
+
+    Flask 的 TESTING 只能由测试代码显式设置（不受 env 影响，生产容器不会设），
+    现有 json 模式 AI 代理回归测试全部依赖它。fail-closed 语义由单独测试锁定
+    （TESTING 关闭时平台 run 仍被拒）。
+    """
+    return bool(app.config.get("TESTING"))
+
+
+def _ai_budget_subject(user_ctx):
+    """预占主体：owner → ("owner", user_id|"owner")；user → ("user", user_id)。"""
+    if user_ctx is None or user_ctx.get("role") == user_store.ROLE_OWNER:
+        return "owner", ((user_ctx or {}).get("user_id") or "owner")
+    return "user", (user_ctx.get("user_id") or "owner")
+
+
+def _ai_reserve_run_budget(user_ctx, request_id):
+    """起跑前预占一次 AI 对话额度（docs §5.3/§9.4）。
+
+    返回 (reservation|None, error_response|None)：
+      - platform 凭据 + postgres：原子预占（owner/user 分别计入对应维度）；超限
+        映射 429 + 稳定 code（platform_ai_budget_exhausted / user_budget_exhausted
+        / demo_budget_exhausted），不回退其它凭据；
+      - platform 凭据 + json/dual：生产 fail-closed（503 pg_backend_required）；
+        仅 TESTING bypass 放行（不预占）；
+      - own 凭据：postgres 记可观测用量（不扣平台总量）；json 放行不记账；
+      - 凭据缺失（None）：交由 _build_sidecar_config 的 400 分支处理，这里直放。
+    """
+    source, _cred = _resolve_ai_credentials(user_ctx)
+    if source is None:
+        return None, None
+    subject_type, subject_id = _ai_budget_subject(user_ctx)
+    if not platform_features.budget_features_available():
+        if source == "own":
+            return None, None  # json：own 放行但不记账（docs §4.3）
+        if _budget_testing_bypass():
+            return None, None  # 仅 pytest（见 _budget_testing_bypass 注释）
+        return None, (
+            jsonify(error="平台 AI 需要启用预算（STORAGE_BACKEND=postgres）；"
+                          "当前后端不支持无配额放行",
+                    code=platform_features.PgFeatureUnavailable.code),
+            503,
+        )
+    try:
+        resv = budget_store.reserve_turn(request_id, subject_type, subject_id, source)
+        return resv, None
+    except budget_store.PlatformBudgetExhausted as exc:
+        return None, _budget_error_response(exc, 429)
+    except budget_store.UserBudgetExhausted as exc:
+        return None, _budget_error_response(exc, 429)
+    except budget_store.DemoConcurrencyExceeded as exc:
+        return None, _budget_error_response(exc, 429)
+    except budget_store.DemoPerBrowserExhausted as exc:
+        return None, _budget_error_response(exc, 409)
+    except budget_store.DemoBudgetExhausted as exc:
+        return None, _budget_error_response(exc, 429)
+    except budget_store.BudgetError as exc:
+        return None, _budget_error_response(exc, 409)
+    except platform_features.PgFeatureUnavailable:
+        # 双重保险：budget_features_available 与 store 守卫口径一致，正常不可达
+        if source == "own":
+            return None, None
+        return None, _budget_error_response(
+            platform_features.PgFeatureUnavailable(), 503,
+            code="pg_backend_required")
+
+
+def _budget_error_response(exc, status, code=None):
+    """预算异常 → JSON {error, code}（code 供前端稳定分支）。"""
+    return (
+        jsonify(error=str(exc), code=code or getattr(exc, "code", "ai_budget_error")),
+        status,
+    )
+
+
+def _ai_budget_lifecycle(request_id, reservation):
+    """构造 (on_accepted, on_rejected) 回调（_proxy_sse 在拿到 HistoPilot 结果时调）。
+
+    - on_accepted(session_id)：2xx → consume（HistoPilot 已接受执行，计 1 次；
+      幂等：已 consumed 直接返回）；
+    - on_rejected()：4xx/5xx/连接失败 → release（未接受不扣额度；已 consumed
+      的拒绝释放，防误退款——budget_store.release 内保证）。
+    回调内部吞异常（记账失败不打断流式响应，只记 log 交由对账兜底）。
+    consume/release 带上本请求 reserve 时的 attempt。在途 reserved 重放
+    （reservation.replayed）失败不得 release；后来的 replay 会递增
+    rollback_epoch，原请求即使用捕获到的 replayed=false 去 release，
+    CAS 也会失败，交由确认式对账处理。
+    """
+    expected = None if reservation is None else reservation.get("attempt")
+    rollback_epoch = None if reservation is None else int(
+        reservation.get("rollback_epoch") or 0)
+    replayed = bool(reservation and reservation.get("replayed"))
+
+    def on_accepted(session_id):
+        if reservation is None:
+            return
+        try:
+            budget_store.consume(request_id, session_id or "",
+                                 expected_attempt=expected)
+        except budget_store.ReservationAttemptConflict:
+            app.logger.warning(
+                "AI 预算 consume attempt 冲突（request_id=%s，交由对账兜底）",
+                request_id, exc_info=True)
+        except Exception:
+            app.logger.warning(
+                "AI 预算 consume 失败（request_id=%s，交由对账兜底）", request_id,
+                exc_info=True)
+
+    def on_rejected():
+        if reservation is None:
+            return
+        if replayed:
+            app.logger.info(
+                "在途 request_id 重放失败，不释放原预占：%s", request_id)
+            return
+        try:
+            budget_store.release(
+                request_id, expected_attempt=expected,
+                expected_rollback_epoch=rollback_epoch)
+        except budget_store.ReservationAttemptConflict:
+            app.logger.warning(
+                "AI 预算 release attempt 冲突（request_id=%s，保留新尝试）",
+                request_id, exc_info=True)
+        except Exception:
+            app.logger.warning(
+                "AI 预算 release 失败（request_id=%s，交由对账兜底）", request_id,
+                exc_info=True)
+
+    return on_accepted, on_rejected
+
+
+def _ai_run_prepare(user_ctx, body, slide, need_grant):
+    """run/continue/ask/branch 起跑公共准备（docs §5.3/§9.2/§11.1-1）。
+
+    顺序（失败即返回，绝不部分推进）：
+      1. request_id 校验/生成（1–128，[A-Za-z0-9_-]；缺省服务端生成）；
+      2. sidecar config 组装（含 max_steps 注入规则；凭据缺失 → 400）；
+      3. session_owner 注入（仅 role=user，保持既有语义）；
+      4. need_grant 时签发 run grant（写工具 run fail-closed：失败 503 拒绝转发，
+         且发生在预占之前——grant 失败不扣额度）；
+      5. 额度预占（_ai_reserve_run_budget；超限 429 + 稳定 code）。
+    返回 dict（request_id/config/on_accepted/on_rejected）或 Flask error 响应
+    tuple。on_accepted/on_accepted 供 _proxy_sse 在 HistoPilot 应答后回调
+    （2xx→consume，4xx/5xx/连接失败→release）。
+    """
+    rid, rid_err = _parse_client_request_id(body)
+    if rid_err is not None:
+        return rid_err
+    config = _build_sidecar_config(user_ctx)
+    if config is None:
+        return (
+            jsonify(error="未配置 AI 凭据：请在设置中填写平台官方 API 或你的 "
+                          "base_url/model/api_key"),
+            400,
+        )
+    # 仅 user 注入归属：role=owner 的会话保持无 owner（owner 全量可见、可续跑
+    # 任意会话；内网模式不注入）。
+    if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
+        config["session_owner"] = user_ctx["user_id"]
+    if need_grant and not _issue_run_grant(slide, user_ctx, config):
+        return (jsonify(error="run grant 签发失败，已拒绝起跑（fail-closed）"), 503)
+    resv, budget_err = _ai_reserve_run_budget(user_ctx, rid)
+    if budget_err is not None:
+        # 形状防御：err 必须是 Flask (body, status) tuple（曾因包裹层级错误
+        # 产生裸 int 导致 500），异常形状按内部错误处理而非透传。
+        if not (isinstance(budget_err, tuple) and len(budget_err) == 2):
+            app.logger.error("预算错误响应形状异常：%r", budget_err)
+            return (jsonify(error="ai_budget_error", code="ai_budget_error"), 500)
+        return budget_err
+    on_accepted, on_rejected = _ai_budget_lifecycle(rid, resv)
+    return {
+        "request_id": rid,
+        "config": config,
+        "reservation": resv,
+        "on_accepted": on_accepted,
+        "on_rejected": on_rejected,
+    }
+
+
+def reclaim_expired_reservations(now=None):
+    """对账钩子（最小实现，docs §5.3-5）：惰性回收过期 reserved 预占。
+
+    本任务**只做时间回收**（budget_store.reclaim_expired 按
+    reservation_expires_at 释放并回退 usage）；后台周期线程**不再调用**本钩子
+    （确认式对账失败项必须顺延，盲回收会把 HistoPilot 已接受的执行误退款）。
+    「HistoPilot 不可达不释放、顺延」的对账语义属确认式对账
+    （``reconcile_expired_reservations``，PT-4）。注册用户路径 HistoPilot
+    4xx/5xx 已在请求内 release。json/dual 后端 no-op（无预算数据），失败不抛
+    （记 log 可重试）。
+    """
+    if not platform_features.budget_features_available():
+        return []
+    try:
+        return budget_store.reclaim_expired(now)
+    except Exception:
+        app.logger.warning("reclaim_expired_reservations 失败（可重试）", exc_info=True)
+        return []
+
+
+# --------------------------------------------------------------------------- #
+# Demo 确认式对账（PT-4，docs §5.3-6 / §5.4-7 / 任务 §7）
+#
+# 与 reclaim_expired_reservations 的盲时间回收不同：过期 reserved 项先经
+# HistoPilot ``GET /session/by-request/<request_id>`` 反查确认终态——
+#   200 且 security_profile_applied/accepted_at → consume（已接受执行）；
+#   200 但尚未接受 → **不 consume、不释放，顺延**（acquire 与安全确认之间崩溃）；
+#   404 not_found → release（确定未创建）；
+#   5xx / 连接失败 → **不释放，顺延** reservation_expires_at（一个 TTL），
+#     直至可确认；避免「误退款后白跑」。
+# 覆盖 demo_sessions.run_state=reserved（一次性 run）与
+# ai_budget_reservations.state=reserved（全部主体）。
+# --------------------------------------------------------------------------- #
+def _histopilot_action_accepted(session):
+    """by-request 200 的 session 是否已持久化接受（对账 consume 门槛）。"""
+    if not isinstance(session, dict):
+        return False
+    if session.get("security_profile_applied") is True:
+        return True
+    at = session.get("accepted_at")
+    try:
+        return at is not None and float(at) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _histopilot_action_abandoned(session):
+    """by-request 200：未接受且已放弃，对账按 missing 释放。"""
+    if not isinstance(session, dict):
+        return False
+    if session.get("abandoned") is True:
+        return True
+    at = session.get("abandoned_at")
+    try:
+        return at is not None and float(at) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _histopilot_lookup_request(request_id):
+    """按 request_id 反查 HistoPilot session（docs §5.4-7）。
+
+    返回 (verdict, session_id, accepted)：verdict ∈ "found"（200 且未放弃）/
+    "abandoned"（200 但启动恢复已放弃未接受动作）/ "missing"（404 not_found）/
+    "unavailable"（5xx、连接失败、应答异常）。accepted 仅在持久化的
+    security_profile_applied / accepted_at 成立时为 True。
+    """
+    try:
+        r = requests.get(
+            AI_SIDECAR_URL.rstrip("/") + "/session/by-request/" + request_id,
+            timeout=_AI_SIDECAR_TIMEOUT, headers=_sidecar_auth_headers())
+    except (requests.ConnectionError, requests.Timeout):
+        return "unavailable", None, False
+    except Exception:
+        return "unavailable", None, False
+    if r.status_code == 200:
+        try:
+            session = ((r.json() or {}).get("session")) or {}
+            sid = session.get("id") or ""
+        except Exception:
+            return "unavailable", None, False
+        if _histopilot_action_accepted(session):
+            return "found", sid, True
+        if _histopilot_action_abandoned(session):
+            return "abandoned", sid, False
+        return "found", sid, False
+    if r.status_code == 404:
+        try:
+            body = r.json() or {}
+        except Exception:
+            body = {}
+        # 只认明确的 not_found；其它 404 形态按不可确认处理
+        if body.get("code") == "not_found" or "没有对应会话" in str(body.get("error")):
+            return "missing", None, False
+        return "unavailable", None, False
+    return "unavailable", None, False
+
+
+def reconcile_expired_reservations(now=None):
+    """确认式对账：过期 reserved → 经 HistoPilot 反查转 consumed / released / 顺延。
+
+    返回摘要 dict：``{"demo": [{"id","request_id","action"}...],
+    "budget": [{"request_id","action"}...]}``（可测）。json/dual 后端
+    ``{"skipped": "pg_backend_required"}``。异常不抛（单条失败记 log 下轮再试）。
+    """
+    if not platform_features.budget_features_available():
+        return {"skipped": "pg_backend_required"}
+    ts = float(time.time() if now is None else now)
+    summary = {"demo": [], "budget": []}
+
+    def _lookup_or_extend(rid):
+        """反查；不可确认时返回 "unavailable"（调用方决定顺延/保守跳过）。"""
+        if not rid:
+            return "missing", None, False  # 无 request_id 的残留（防御路径）按未创建释放
+        return _histopilot_lookup_request(rid)
+
+    # 1) demo_sessions：reserved 且过期的 run
+    try:
+        expired_runs = demo_store.list_reserved_expired(ts)
+    except Exception:
+        app.logger.warning("对账扫描 demo_sessions 失败（可重试）", exc_info=True)
+        expired_runs = []
+    for run in expired_runs:
+        rid = run.get("request_id")
+        run_attempt = run.get("attempt")
+        verdict, hp_sid, accepted = _lookup_or_extend(rid)
+        if verdict == "found" and accepted:
+            # HistoPilot 已接受该动作 → 转 consumed（防误退款）
+            try:
+                demo_store.consume_run(run["id"], hp_sid or "",
+                                       expected_attempt=run_attempt,
+                                       expected_request_id=rid)
+                action = "consumed"
+            except demo_store.RunAttemptConflict:
+                try:
+                    demo_store.extend_run_reservation(
+                        run["id"], demo_store.DEMO_RUN_RESERVATION_TTL_SECONDS)
+                    action = "attempt_conflict_extended"
+                except Exception:
+                    action = "attempt_conflict_extend_failed"
+            except Exception:
+                app.logger.warning("对账 consume demo run 失败：%s", run["id"],
+                                   exc_info=True)
+                try:
+                    demo_store.extend_run_reservation(
+                        run["id"], demo_store.DEMO_RUN_RESERVATION_TTL_SECONDS)
+                    action = "consume_failed_extended"
+                except Exception:
+                    action = "consume_failed"
+        elif verdict == "missing" or verdict == "abandoned":
+            try:
+                demo_store.release_run(run["id"], expected_attempt=run_attempt,
+                                       expected_request_id=rid)
+                action = "released"
+            except demo_store.RunAttemptConflict:
+                try:
+                    demo_store.extend_run_reservation(
+                        run["id"], demo_store.DEMO_RUN_RESERVATION_TTL_SECONDS)
+                    action = "attempt_conflict_extended"
+                except Exception:
+                    action = "attempt_conflict_extend_failed"
+            except ValueError:
+                action = "consumed_keep"  # 已 consumed：不退款
+            except Exception:
+                action = "release_failed"
+                app.logger.warning("对账 release demo run 失败：%s", run["id"],
+                                   exc_info=True)
+        else:
+            # HistoPilot 不可达，或 session 已创建但尚未接受（安全确认前崩溃）：
+            # 不释放，顺延一个 TTL（§5.3-6）
+            try:
+                demo_store.extend_run_reservation(
+                    run["id"], demo_store.DEMO_RUN_RESERVATION_TTL_SECONDS)
+                action = ("pending_extended" if verdict == "found"
+                          else "extended")
+            except Exception:
+                action = "extend_failed"
+        summary["demo"].append({"id": run["id"], "request_id": rid,
+                                "action": action})
+
+    # 2) ai_budget_reservations：reserved 且过期（全部主体；同口径反查）
+    try:
+        expired_resv = budget_store.list_reserved_expired(ts)
+    except Exception:
+        app.logger.warning("对账扫描 ai_budget_reservations 失败（可重试）",
+                           exc_info=True)
+        expired_resv = []
+    for resv in expired_resv:
+        rid = resv.get("request_id")
+        resv_attempt = resv.get("attempt")
+        verdict, hp_sid, accepted = _histopilot_lookup_request(rid) if rid else (
+            "missing", None, False)
+        if verdict == "found" and accepted:
+            try:
+                budget_store.consume(rid, hp_sid or "",
+                                     expected_attempt=resv_attempt)
+                action = "consumed"
+            except budget_store.ReservationAttemptConflict:
+                try:
+                    budget_store.extend_reservation(
+                        rid, budget_store.DEFAULT_RESERVATION_TTL_SECONDS)
+                    action = "attempt_conflict_extended"
+                except Exception:
+                    action = "attempt_conflict_extend_failed"
+            except ValueError:
+                action = "consumed_keep"
+            except Exception:
+                app.logger.warning("对账 consume 预算失败：%s", rid, exc_info=True)
+                try:
+                    budget_store.extend_reservation(
+                        rid, budget_store.DEFAULT_RESERVATION_TTL_SECONDS)
+                    action = "consume_failed_extended"
+                except Exception:
+                    action = "consume_failed"
+        elif verdict == "missing" or verdict == "abandoned":
+            try:
+                budget_store.release(rid, expected_attempt=resv_attempt)
+                action = "released"
+            except budget_store.ReservationAttemptConflict:
+                try:
+                    budget_store.extend_reservation(
+                        rid, budget_store.DEFAULT_RESERVATION_TTL_SECONDS)
+                    action = "attempt_conflict_extended"
+                except Exception:
+                    action = "attempt_conflict_extend_failed"
+            except ValueError:
+                action = "consumed_keep"  # 已 consumed 拒绝释放（防误退款）
+            except Exception:
+                action = "release_failed"
+                app.logger.warning("对账 release 预算失败：%s", rid, exc_info=True)
+        else:
+            try:
+                budget_store.extend_reservation(
+                    rid, budget_store.DEFAULT_RESERVATION_TTL_SECONDS)
+                action = ("pending_extended" if verdict == "found"
+                          else "extended")
+            except Exception:
+                action = "extend_failed"
+        summary["budget"].append({"request_id": rid, "action": action})
+    return summary
+
+
+def _start_budget_reclaim_thread():
+    """postgres 后端启动后台周期对账线程（默认 5 分钟；env 可调/关闭）。
+
+    - ``AI_BUDGET_RECLAIM_INTERVAL_SECONDS``：间隔秒数；``0`` 或负数 = 关闭
+      （测试默认不应被线程干扰时可显式置 0）；
+    - 周期任务只跑确认式对账（``reconcile_expired_reservations``：经 HistoPilot
+      反查确认后才 consume/release，不可达或 consume 失败则顺延）。**不**再盲
+      时间回收：否则 consume/extend 失败后仍过期的 reservation 会被误退款。
+    - daemon 线程：进程退出即结束，不阻塞停机。
+    """
+    if not platform_features.budget_features_available():
+        return None
+    try:
+        interval = float(os.environ.get("AI_BUDGET_RECLAIM_INTERVAL_SECONDS") or 300)
+    except (TypeError, ValueError):
+        interval = 300.0
+    if interval <= 0:
+        return None
+
+    def _loop():
+        while True:
+            time.sleep(interval)
+            try:
+                reconcile_expired_reservations()
+            except Exception:
+                app.logger.warning("后台对账失败（可重试）", exc_info=True)
+
+    th = threading.Thread(target=_loop, name="ai-budget-reclaim", daemon=True)
+    th.start()
+    return th
+
+
+_BUDGET_RECLAIM_THREAD = _start_budget_reclaim_thread()
 
 
 # --------------------------------------------------------------------------- #
@@ -2690,6 +4807,12 @@ def _build_sidecar_config(user_ctx=None) -> dict:
       - user → 按 §5.1.2 解析（use_platform 且平台已配 → 平台；否则自带凭据）；
         自带凭据缺 key/base_url/model → 返回 None（调用端点回 400 指导去设置）。
     tuning 调优字段始终来自平台 ai_config.json（user 无独立调优）。
+    max_steps 注入规则（docs §9.2 / §12.3，不再一律用平台 ai_config.json 的 50）：
+      - owner：平台 ai_config.json 值（现状不变，owner 自担）；
+      - user + platform：忽略用户保存值，注入周期 platform_task_max_steps（默认 20）；
+      - user + own：注入**已保存**的用户 max_steps（默认 20），并按当前周期
+        own_task_max_steps_limit（默认 500）clamp——浏览器无法用请求体临时塞
+        更大值绕过（起跑类端点不读请求体里的调优字段，注入只读已保存配置）。
     返回的 dict 直接作为 sidecar body 的 `config` 字段。
     """
     source, cred_cfg = _resolve_ai_credentials(user_ctx)
@@ -2703,6 +4826,19 @@ def _build_sidecar_config(user_ctx=None) -> dict:
     out["model"] = cred_cfg.get("model") or ""
     # api_protocol 缺省 openai（用户自带 key 无此字段，落默认）
     out["api_protocol"] = cred_cfg.get("api_protocol") or "openai"
+    # ---- max_steps 注入（docs §9.2）----
+    if (user_ctx is not None
+            and user_ctx.get("role") == user_store.ROLE_USER
+            and user_ctx.get("user_id")):
+        if source == "platform":
+            out["max_steps"] = _platform_task_max_steps()
+        else:  # own：已保存的用户值 + 周期硬上限 clamp
+            own_cfg = user_store.get_user_ai_config(user_ctx["user_id"]) or {}
+            try:
+                saved = int(own_cfg.get("max_steps"))
+            except (TypeError, ValueError):
+                saved = DEFAULT_USER_MAX_STEPS
+            out["max_steps"] = max(1, min(saved, _own_task_max_steps_limit()))
     # 运行时再守一次：即使加载迁移未持久化，注入 sidecar 的值也不能 <128。
     _apply_legacy_reserve_migration(out)
     if source == "own":
@@ -3218,16 +5354,20 @@ def api_ai_config():
             out[k] = platform_cfg.get(k, v)
         out["max_tokens"] = platform_cfg.get("max_tokens") or 2048
         out["api_protocol"] = platform_cfg.get("api_protocol") or "openai"
+        _apply_user_max_steps_view(out, own, source)
         return jsonify(out)
 
     body = request.get_json(silent=True) or {}
 
     if not is_owner:
-        # ---- user PUT：只接受凭据四字段 ----
-        allowed = {"use_platform", "base_url", "model", "api_key"}
-        # tuning 字段：与平台值相同则忽略；不同则 403。
+        # ---- user PUT：只接受凭据四字段 + max_steps（docs §9.2）----
+        allowed = {"use_platform", "base_url", "model", "api_key", "max_steps"}
+        # tuning 字段：与平台值相同则忽略；不同则 403（max_steps 除外——它是
+        # user 自带 API 模式的自有字段，单独按下限/硬上限校验，见下）。
         platform_cfg = _load_ai_config()
         for k, v in DEFAULT_CONFIG.items():
+            if k == "max_steps":
+                continue
             if k in body and body[k] != platform_cfg.get(k, v):
                 return jsonify(error="会话调优参数由管理员配置，用户不可修改"), 403
         for extra in ("max_tokens", "api_protocol"):
@@ -3255,6 +5395,20 @@ def api_ai_config():
             pending["base_url"] = url
         if "model" in body:
             pending["model"] = str(body.get("model") or "").strip()
+        # max_steps（自带 API 步数，docs §9.2/§12.3）：1 ≤ v ≤ 当前周期硬上限
+        # （缺省 500）。保存与 use_platform 无关——切回自带 API 时即生效；平台
+        # AI 模式下注入层忽略该值（注入 platform_task_max_steps）。
+        if "max_steps" in body:
+            steps, err = _coerce_tuning_int(body.get("max_steps"), "max_steps")
+            if err:
+                return jsonify(error=err), 400
+            hard = _own_task_max_steps_limit()
+            if steps < 1:
+                return jsonify(error="max_steps 不可小于 1"), 400
+            if steps > hard:
+                return jsonify(
+                    error="max_steps 不可超过 {}（系统硬上限）".format(hard)), 400
+            pending["max_steps"] = steps
         # api_key：空=清除；掩码同值=不变；其他=覆盖（明文 → 加密落盘）
         if "api_key" in body:
             new_key = body.get("api_key")
@@ -3342,6 +5496,30 @@ def api_ai_config():
     return jsonify(out)
 
 
+def _apply_user_max_steps_view(out, own, source):
+    """user 视角 GET 回显的 max_steps 字段组（原地补充，docs §9.2/§8.3）。
+
+    - ``max_steps``：**生效步数**（平台模式 = 周期 platform_task_max_steps，
+      自带模式 = 已保存用户值 clamp 硬上限）——UI 输入框直接显示该值，平台
+      模式下配合前端只读展示；
+    - ``own_max_steps``：已保存的用户值（切换自带 API 后的编辑起点）；
+    - ``effective_max_steps``：同 max_steps，语义显式化；
+    - ``own_task_max_steps_limit``：自带 API 硬上限（前端 input max）。
+    """
+    try:
+        saved = int((own or {}).get("max_steps"))
+    except (TypeError, ValueError):
+        saved = DEFAULT_USER_MAX_STEPS
+    saved = max(1, saved)
+    hard = _own_task_max_steps_limit()
+    own_clamped = min(saved, hard)
+    effective = _platform_task_max_steps() if source == "platform" else own_clamped
+    out["max_steps"] = effective
+    out["own_max_steps"] = own_clamped
+    out["effective_max_steps"] = effective
+    out["own_task_max_steps_limit"] = hard
+
+
 def _ai_user_config_get(user_ctx):
     """构造 user 视角的 GET /api/ai/config 回显（供 PUT 后复用）。"""
     platform_cfg = _load_ai_config()
@@ -3362,6 +5540,7 @@ def _ai_user_config_get(user_ctx):
         out[k] = platform_cfg.get(k, v)
     out["max_tokens"] = platform_cfg.get("max_tokens") or 2048
     out["api_protocol"] = platform_cfg.get("api_protocol") or "openai"
+    _apply_user_max_steps_view(out, own, source)
     return out
 
 
@@ -3716,10 +5895,18 @@ def internal_ai_annotate():
     Stage 3c-2（docs §6.4）：仅当请求显式带 expected_asset_revision 且与当前
     切片 legacy_revision（mtime:size）不符时，返回 409 slide_revision_conflict
     （不静默写、不强制，兼容现状 sidecar）。
+
+    PT-4（docs §5.4-1）：公开 Demo 模式下本写通道禁用（403）——正式写入只走
+    带 run grant 的 Plugin Contract；legacy internal-token 通道不再承担写语义。
     """
     auth = _require_internal()
     if auth:
         return auth
+    if _demo_public_mode():
+        return jsonify(
+            error="公开 Demo 模式下 internal 写通道已禁用；正式写入只走带 run "
+                  "grant 的 Plugin Contract",
+            code="demo_write_channel_disabled"), 403
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
     label = body.get("label")
@@ -4311,11 +6498,13 @@ def plugin_v1_capabilities():
 
 @app.route("/api/ai/run", methods=["POST"])
 def api_ai_run():
-    """主 session 起跑（SSE）。body: {slide, task?, fresh?}。
+    """主 session 起跑（SSE）。body: {slide, task?, fresh?, request_id?}。
 
     代理到 sidecar POST /run：注入 config（base_url/api_key 明文/model/
     api_protocol + 全部调优参数）。Stage 3a-2b：按当前身份做切片级鉴权
     （can_annotate_slide，无权 403）与凭据解析（未配置 → 400 中文指导）。
+    PT-3：request_id 幂等贯通 + 平台 AI 预算预占（同 id 重试不双扣）+ run
+    grant fail-closed（写工具 run 缺 grant 拒绝转发）。
     """
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
@@ -4324,36 +6513,34 @@ def api_ai_run():
     if not can_annotate_slide(slide):
         return _denied()
     user_ctx = current_identity()
-    config = _build_sidecar_config(user_ctx)
-    if config is None:
-        return jsonify(error="未配置 AI 凭据：请在设置中填写平台官方 API 或你的 base_url/model/api_key"), 400
+    prep = _ai_run_prepare(user_ctx, body, slide, need_grant=True)
+    if not isinstance(prep, dict):
+        return prep
     payload = {
         "slide": slide,
-        "config": config,
+        "config": prep["config"],
+        # 同一 request_id 转发 HistoPilot（body.request_id 幂等去重）
+        "request_id": prep["request_id"],
     }
-    # 仅 user 注入归属：role=owner 的会话保持无 owner（owner 全量可见、可续跑
-    # 任意会话，sidecar acquire 守卫对无 owner 注入的 run 不生效）；内网模式不注入。
-    if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
-        config["session_owner"] = user_ctx["user_id"]
-    # Stage 4-1a：起跑发放 run grant（slide 级），sidecar 4-1b 消费。
-    # 写标注工具需要 annotate；只读访问不得拿到 annotation:write grant。
-    _issue_run_grant(slide, user_ctx, config)
     task = body.get("task")
     if isinstance(task, str):
         payload["task"] = task
     # JSON body 与 query 双重兼容（前端历史上把 fresh=1 放在 query）
     if bool(body.get("fresh")) or request.args.get("fresh") == "1":
         payload["fresh"] = True
-    _audit("ai.run", target_type="session", slide=slide, detail={"mode": "run"})
-    return _proxy_sse("/run", payload)
+    _audit("ai.run", target_type="session", slide=slide,
+           detail={"mode": "run", "request_id": prep["request_id"]})
+    return _proxy_sse("/run", payload, on_accepted=prep["on_accepted"],
+                      on_rejected=prep["on_rejected"])
 
 
 @app.route("/api/ai/continue", methods=["POST"])
 def api_ai_continue():
-    """主 session 从落库 state+messages 续跑（SSE）。body: {slide}。
+    """主 session 从落库 state+messages 续跑（SSE）。body: {slide, request_id?}。
 
     代理到 sidecar POST /continue：注入 config。无 main → 404（sidecar 返回）。
     Stage 3a-2b：切片级鉴权（can_annotate_slide）+ 凭据解析。
+    PT-3：request_id 幂等 + 预算预占 + grant fail-closed（continue 计 1 次）。
     """
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
@@ -4362,30 +6549,29 @@ def api_ai_continue():
     if not can_annotate_slide(slide):
         return _denied()
     user_ctx = current_identity()
-    config = _build_sidecar_config(user_ctx)
-    if config is None:
-        return jsonify(error="未配置 AI 凭据：请在设置中填写平台官方 API 或你的 base_url/model/api_key"), 400
+    prep = _ai_run_prepare(user_ctx, body, slide, need_grant=True)
+    if not isinstance(prep, dict):
+        return prep
     payload = {
         "slide": slide,
-        "config": config,
+        "config": prep["config"],
+        "request_id": prep["request_id"],
     }
-    # 仅 user 注入归属：role=owner 的会话保持无 owner（owner 全量可见、可续跑
-    # 任意会话，sidecar acquire 守卫对无 owner 注入的 run 不生效）；内网模式不注入。
-    if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
-        config["session_owner"] = user_ctx["user_id"]
-    # Stage 4-1a：起跑发放 run grant（slide 级），sidecar 4-1b 消费
-    _issue_run_grant(slide, user_ctx, config)
-    _audit("ai.run", target_type="session", slide=slide, detail={"mode": "continue"})
-    return _proxy_sse("/continue", payload)
+    _audit("ai.run", target_type="session", slide=slide,
+           detail={"mode": "continue", "request_id": prep["request_id"]})
+    return _proxy_sse("/continue", payload, on_accepted=prep["on_accepted"],
+                      on_rejected=prep["on_rejected"])
 
 
 @app.route("/api/ai/ask", methods=["POST"])
 def api_ai_ask():
-    """fork 起跑/续聊（批注式对话，SSE）。body: {slide, annotation_id, question?}。
+    """fork 起跑/续聊（批注式对话，SSE）。body: {slide, annotation_id, question?,
+    request_id?}。
 
     代理到 sidecar POST /ask：注入 config。根标注已删除 → 410（sidecar 返回）。
-    Stage 3a-2b：切片可读即可（ask 为 lite fork、无写工具）鉴权 + 凭据解析。
-    仅当 can_annotate_slide 时才发放可写 run grant，避免只读访问经 AI 落标。
+    Stage 3a-2b：切片可读即可（ask 为 lite fork、无写工具）。
+    PT-3：lite fork 无写工具 → 不签发也不要求 run grant（docs §5.4-5）；但仍是
+    一次用户触发的 Agent 执行 → 计 1 次额度（request_id 幂等）。
     """
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
@@ -4397,35 +6583,32 @@ def api_ai_ask():
     if not can_view_slide(slide):
         return _denied()
     user_ctx = current_identity()
-    config = _build_sidecar_config(user_ctx)
-    if config is None:
-        return jsonify(error="未配置 AI 凭据：请在设置中填写平台官方 API 或你的 base_url/model/api_key"), 400
+    prep = _ai_run_prepare(user_ctx, body, slide, need_grant=False)
+    if not isinstance(prep, dict):
+        return prep
     payload = {
         "slide": slide,
         "annotation_id": annotation_id,
-        "config": config,
+        "config": prep["config"],
+        "request_id": prep["request_id"],
     }
-    # 仅 user 注入归属：role=owner 的会话保持无 owner（owner 全量可见、可续跑
-    # 任意会话，sidecar acquire 守卫对无 owner 注入的 run 不生效）；内网模式不注入。
-    if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
-        config["session_owner"] = user_ctx["user_id"]
-    if can_annotate_slide(slide):
-        _issue_run_grant(slide, user_ctx, config)
     question = body.get("question")
     if isinstance(question, str):
         payload["question"] = question
     _audit("ai.run", target_type="session", target_id=annotation_id, slide=slide,
-           detail={"mode": "ask"})
-    return _proxy_sse("/ask", payload)
+           detail={"mode": "ask", "request_id": prep["request_id"]})
+    return _proxy_sse("/ask", payload, on_accepted=prep["on_accepted"],
+                      on_rejected=prep["on_rejected"])
 
 
 @app.route("/api/ai/branch", methods=["POST"])
 def api_ai_branch():
     """branch 起跑/续聊（从标注起步的完整会话，全量工具，SSE）。
 
-    body: {slide, annotation_id, question?}。代理到 sidecar POST /branch：注入
-    config。根标注已删除 → 410（sidecar 返回）。契约同 /api/ai/ask。
+    body: {slide, annotation_id, question?, request_id?}。代理到 sidecar POST
+    /branch：注入 config。根标注已删除 → 410（sidecar 返回）。契约同 /api/ai/ask。
     Stage 3a-2b：branch 含写工具，要求 can_annotate_slide。
+    PT-3：request_id 幂等 + 预算预占 + grant fail-closed（全量工具 run）。
     """
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
@@ -4437,25 +6620,22 @@ def api_ai_branch():
     if not can_annotate_slide(slide):
         return _denied()
     user_ctx = current_identity()
-    config = _build_sidecar_config(user_ctx)
-    if config is None:
-        return jsonify(error="未配置 AI 凭据：请在设置中填写平台官方 API 或你的 base_url/model/api_key"), 400
+    prep = _ai_run_prepare(user_ctx, body, slide, need_grant=True)
+    if not isinstance(prep, dict):
+        return prep
     payload = {
         "slide": slide,
         "annotation_id": annotation_id,
-        "config": config,
+        "config": prep["config"],
+        "request_id": prep["request_id"],
     }
-    # 仅 user 注入归属：role=owner 的会话保持无 owner（owner 全量可见、可续跑
-    # 任意会话，sidecar acquire 守卫对无 owner 注入的 run 不生效）；内网模式不注入。
-    if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
-        config["session_owner"] = user_ctx["user_id"]
-    _issue_run_grant(slide, user_ctx, config)
     question = body.get("question")
     if isinstance(question, str):
         payload["question"] = question
     _audit("ai.run", target_type="session", target_id=annotation_id, slide=slide,
-           detail={"mode": "branch"})
-    return _proxy_sse("/branch", payload)
+           detail={"mode": "branch", "request_id": prep["request_id"]})
+    return _proxy_sse("/branch", payload, on_accepted=prep["on_accepted"],
+                      on_rejected=prep["on_rejected"])
 
 
 @app.route("/api/ai/cancel", methods=["POST"])
@@ -4622,13 +6802,19 @@ def _proxy_json(path, body, method="POST", query=None):
     return Response(r.content, status=r.status_code, mimetype=ctype.split(";")[0])
 
 
-def _proxy_sse(path, body, method="POST"):
+def _proxy_sse(path, body, method="POST", on_accepted=None, on_rejected=None):
     """代理 SSE 端点到 sidecar：流式透传字节块，透传响应头与状态码。
 
     run/continue/ask（POST）注入 body；stream（GET）不注入 body，透传 after_seq
     query 与 Last-Event-ID header。SSE 长连接不设读超时（read timeout=大数）。
     sidecar 不可达 → 503 JSON。错误响应（409/404/410 等非 SSE，JSON）按
     content-type 正确处理：非 text/event-stream 视为普通 JSON 透传。
+
+    PT-3 预算回调（docs §5.3：HistoPilot 接受 → consume；接受前失败 → release）：
+      - on_accepted(session_id)：拿到 2xx 响应时调（SSE 取 X-AI-Session-ID；
+        非 SSE 2xx 传空串）；
+      - on_rejected()：4xx/5xx / 连接失败时调。
+    回调为 None 时行为与旧版完全一致（stream/cancel 等不预占的端点不传）。
     """
     url = AI_SIDECAR_URL + path
     headers = _sidecar_auth_headers()
@@ -4642,6 +6828,20 @@ def _proxy_sse(path, body, method="POST"):
         if after_seq is not None:
             params = {"after_seq": after_seq}
 
+    def _reject():
+        if on_rejected is not None:
+            try:
+                on_rejected()
+            except Exception:
+                app.logger.warning("预算 on_rejected 回调失败", exc_info=True)
+
+    def _accept(session_id):
+        if on_accepted is not None:
+            try:
+                on_accepted(session_id)
+            except Exception:
+                app.logger.warning("预算 on_accepted 回调失败", exc_info=True)
+
     try:
         if method == "GET":
             upstream = requests.get(
@@ -4654,6 +6854,7 @@ def _proxy_sse(path, body, method="POST"):
                 timeout=(_AI_SIDECAR_TIMEOUT, _AI_SIDECAR_SSE_READ_TIMEOUT),
             )
     except (requests.ConnectionError, requests.Timeout):
+        _reject()
         return _sidecar_unavailable_response()
 
     status = upstream.status_code
@@ -4664,11 +6865,21 @@ def _proxy_sse(path, body, method="POST"):
     if "text/event-stream" not in ctype:
         content = upstream.content
         upstream.close()
+        if status >= 400:
+            _reject()  # HistoPilot 未接受执行 → 释放预占
+        else:
+            _accept("")  # 2xx 非 SSE（罕见形态）：按已接受处理
         return Response(content, status=status,
                         mimetype=ctype.split(";")[0] if ctype else "application/json")
 
     # SSE：流式透传字节块（不缓冲、不修改帧内容）。
+    # 2xx + SSE 流已建立 = HistoPilot 已接受执行 → consume（session id 来自
+    # X-AI-Session-ID；之后流中断不退额度，docs §4.1「已开始执行计 1 次」）。
     session_id = upstream.headers.get("X-AI-Session-ID", "")
+    if status < 400:
+        _accept(session_id)
+    else:  # 防御：4xx/5xx 却带 SSE content-type（sidecar 契约外形态）
+        _reject()
 
     def generate():
         try:

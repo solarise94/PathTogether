@@ -259,7 +259,11 @@ def test_containerfile_ships_pg_layer():
     顶层扫描抓不到，故单独守卫（漏 COPY 时 postgres/dual 后端起不来或无法迁移）。
     """
     cf = (REPO_ROOT / "Containerfile").read_text(encoding="utf-8")
-    for mod in ("pg_store.py", "share_store_pg.py", "user_store_pg.py"):
+    for mod in (
+        "pg_store.py", "share_store_pg.py", "user_store_pg.py",
+        "platform_features.py", "settings_store.py", "budget_store.py",
+        "auth_limit_store.py", "demo_store.py",
+    ):
         assert re.search(r"^COPY .*\b{}\b".format(re.escape(mod)), cf, re.M), \
             "Containerfile 未 COPY %s" % mod
     assert re.search(r"^COPY migrations/ migrations/", cf, re.M), \

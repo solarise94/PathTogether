@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>PathTogether · Demo</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260818shell1" />
+  <script src="/static/i18n.js?v=20260818shell1"></script>
+  <script src="/static/openseadragon.min.js"></script>
+</head>
+<body class="app-mode-demo" data-app-mode="demo">
+  {% if not demo_available %}
+  {# json/dual 后端：不满足 PG 前置 → 服务端渲染降级页（docs §4.3 fail-closed）#}
+  <main class="demo-unavailable">
+    <h1 data-i18n="demo.title">Demo 体验</h1>
+    <p data-i18n="demo.requires.pg">当前部署未满足公开 Demo 的前置条件（需要 PostgreSQL 后端），Demo 暂不可用。</p>
+    <div class="actions">
+      <a class="btn primary" href="/login" data-i18n="demo.login">登录 PathTogether</a>
+      <a class="btn secondary" href="/" data-i18n="demo.home">返回首页</a>
+    </div>
+    <p class="demo-unavailable-footer" data-i18n="entry.footer">仅用于研究、教学和软件演示，不用于临床诊断。</p>
+  </main>
+  {% elif not demo_enabled %}
+  {# PG 可用但公开 Demo 关闭：不渲染 Viewer / 不加载 demo.js，切片不可匿名读 #}
+  <main class="demo-unavailable">
+    <h1 data-i18n="demo.title">Demo 体验</h1>
+    <p data-i18n="demo.closed">公开 Demo 当前未开放。登录后可继续使用，或稍后再来。</p>
+    <div class="actions">
+      <a class="btn primary" href="/login" data-i18n="demo.login">登录 PathTogether</a>
+      <a class="btn secondary" href="/" data-i18n="demo.home">返回首页</a>
+    </div>
+    <p class="demo-unavailable-footer" data-i18n="entry.footer">仅用于研究、教学和软件演示，不用于临床诊断。</p>
+  </main>
+  {% else %}
+  {# Demo 只读运行模式：共享外壳 + Viewer，不加载正式 app.js / HistoPilot 写插件。
+     写操作入口由 capabilities 不渲染；安全边界仍是 /api/demo/* 与服务端拒绝。 #}
+  <script>
+    window.HP_APP_BOOTSTRAP = {
+      mode: "demo",
+      capabilities: {{ capabilities | tojson }}
+    };
+  </script>
+  {% include "_app_shell.html" %}
+  <script src="/static/app-mode.js?v=20260818shell1"></script>
+  <script src="/static/viewer-core.js?v=20260818shell1"></script>
+  <script src="/static/demo.js?v=20260818shell1"></script>
+  {% endif %}
+</body>
+</html>

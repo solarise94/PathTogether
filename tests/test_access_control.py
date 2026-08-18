@@ -51,6 +51,7 @@ import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
 import share_server as share_srv  # noqa: E402
 from pg_compat import json_only, BACKEND  # noqa: E402
+from _pt_helpers import csrf_client, install_json_login_limits  # noqa: E402
 
 # 强制 UPLOAD_DIR 指回本次临时目录（其它测试可能先 import app 改写了它）
 app_mod.UPLOAD_DIR = Path(UPLOAD_DIR)
@@ -77,7 +78,9 @@ def _isolate(monkeypatch):
     monkeypatch.setattr(app_mod, "UPLOAD_DIR", up_dir)
     monkeypatch.setattr(share_srv, "UPLOAD_DIR", up_dir)
     share_store.set_owner_user_id("")
-    app_mod._auth_attempts.clear()
+    # 登录防爆破：json 后端装内存 mock（app 已删 _auth_attempts 内存字典）；
+    # PG 后端走真实 auth_rate_limits（conftest 每用例 TRUNCATE）
+    install_json_login_limits(monkeypatch)
     for name in ("users.json", "shares.json", "users.json.bak", "shares.json.bak"):
         p = data_dir / name
         if p.exists():
@@ -95,14 +98,14 @@ def _isolate(monkeypatch):
 def _client():
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = True
-    return app_mod.app.test_client()
+    return csrf_client(app_mod.app.test_client())
 
 
 def _client_noauth():
     """AUTH_ENABLED=False 内网模式客户端。"""
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = False
-    return app_mod.app.test_client()
+    return csrf_client(app_mod.app.test_client())
 
 
 def _login(client, email, password):

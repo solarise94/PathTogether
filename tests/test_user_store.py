@@ -45,6 +45,7 @@ import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
 from pg_compat import json_only  # noqa: E402
+from _pt_helpers import csrf_client, install_json_login_limits  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -71,8 +72,9 @@ def _isolate(monkeypatch):
     monkeypatch.setattr(share_store, "SHARE_FILE", data_dir / "shares.json")
     # 归属注入清空（避免跨用例串扰）
     share_store.set_owner_user_id("")
-    # 防爆破状态（内存全局）跨用例清空，避免锁定泄漏
-    app_mod._auth_attempts.clear()
+    # 登录防爆破：app 已删 per-worker 内存字典；json 后端装两桶 mock（PG 走真实
+    # auth_rate_limits，conftest 每用例 TRUNCATE）
+    install_json_login_limits(monkeypatch)
     # 每用例重置 users.json 与 shares.json
     for name in ("users.json", "shares.json", "users.json.bak", "shares.json.bak"):
         p = data_dir / name
@@ -98,7 +100,7 @@ def _read_users_raw():
 def make_client():
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = True
-    return app_mod.app.test_client()
+    return csrf_client(app_mod.app.test_client())
 
 
 def login(client, username, password):
@@ -244,11 +246,12 @@ def test_login_wrong_password_and_lock():
     client = make_client()
     r = login(client, "carol@ex.com", "wrongpass")
     check("错误密码 401", r.status_code == 401)
-    # 触发锁定：连续 5 次
+    # 触发锁定：连续失败命中 IP 前缀桶（5 次/窗；账号桶 10 次/窗，docs §9.5）
     for _ in range(5):
         login(client, "carol@ex.com", "wrongpass")
     rl = login(client, "carol@ex.com", "password1")
     check("锁定期内正确密码也 429", rl.status_code == 429)
+    check("429 带 Retry-After", int(rl.headers.get("Retry-After") or 0) > 0)
 
 
 # =========================================================================== #

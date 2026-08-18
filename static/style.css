@@ -376,6 +376,11 @@ button {
   font-size: 11px;
   color: var(--text-2);
   text-decoration: none;
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: inherit;
+  cursor: pointer;
 }
 
 .logout-link:hover {
@@ -734,6 +739,34 @@ button {
   display: flex;
   gap: 6px;
   margin-bottom: 6px;
+}
+
+/* 链接权限显式选择（docs §8.3）：仅查看为基线（锁定），标注/下载默认不勾选 */
+.share-perms {
+  align-items: center;
+  flex-wrap: wrap;
+}
+.perm-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text);
+  padding: 3px 8px;
+  border: 0.5px solid var(--separator-strong);
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  user-select: none;
+}
+.perm-chip input[type="checkbox"] {
+  margin: 0;
+  accent-color: var(--accent);
+}
+.perm-chip input:disabled { cursor: default; }
+.share-perm-hint {
+  font-size: 10.5px;
+  color: var(--text-3);
+  margin: 2px 0 6px;
 }
 .select {
   flex: 1;
@@ -1571,6 +1604,30 @@ button {
 .slide-share:hover { background: var(--accent-fill); color: var(--accent); }
 .slide-row.active .slide-share { color: #fff; }
 .slide-row.active .slide-share:hover { background: rgba(255, 255, 255, 0.2); }
+
+/* Demo 目录按钮（owner；加入/移出 Demo allowlist，PT-4 docs §5.1） */
+.slide-demo {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border: none;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+.slide-row:hover .slide-demo { opacity: 1; }
+.slide-demo:hover { background: var(--accent-fill); color: var(--accent); }
+.slide-demo[aria-pressed="true"] { color: var(--accent); }
+.slide-row.active .slide-demo { color: #fff; }
+.slide-row.active .slide-demo:hover { background: rgba(255, 255, 255, 0.2); }
 
 /* 行内编辑态：展开后替换原行内容 */
 .slide-edit-form {
@@ -2795,3 +2852,190 @@ button {
 .fork-chat.fork-readonly .fork-chat-input { display: none; }
 .fork-chat.fork-readonly { background: #f6f6f6; }
 .fork-chat.fork-readonly .fork-chat-head { color: var(--text-3); }
+
+/* ---- AI 预算卡片（owner；docs §4.2，PT-3） ---- */
+.aibudget-note {
+  font-size: 12px;
+  color: var(--text-3, #888);
+  margin-bottom: 6px;
+  white-space: pre-line;
+}
+.aibudget-usage {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+}
+.aibudget-badge {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2, #555);
+}
+.aibudget-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.aibudget-stat {
+  background: var(--hover, #f4f4f5);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.aibudget-stat-label {
+  font-size: 11px;
+  color: var(--text-3, #888);
+}
+.aibudget-stat-value {
+  font-size: 18px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  color: var(--text, #1d1d1f);
+}
+.aibudget-row {
+  font-size: 12px;
+  color: var(--text-2, #555);
+}
+.aibudget-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+.aibudget-field .input {
+  width: 90px;
+}
+.aibudget-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+/* =========================================================================
+   Demo 只读运行模式（与正式版共用外壳，仅额外展示徽章 / 额度 / 登录）
+   ========================================================================= */
+.demo-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  border: 1px solid rgba(0, 122, 255, 0.35);
+  border-radius: 6px;
+  padding: 1px 6px;
+  line-height: 1.4;
+}
+.header-login-link {
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--accent);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.header-login-link:hover { text-decoration: underline; }
+.demo-quota-chip {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+  background: var(--accent-fill);
+  border-radius: var(--r-row);
+  padding: 8px 10px;
+}
+.demo-quota-hint {
+  margin: 8px 12px 0;
+  font-size: 11px;
+  color: var(--text-2);
+  line-height: 1.5;
+}
+.ai-status {
+  margin: 6px 12px 0;
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.6;
+  min-height: 0;
+}
+.ai-status.error { color: var(--danger); }
+.ai-status a { color: var(--accent); }
+.ai-panel-header .ai-state {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-2);
+}
+.demo-disclaimer {
+  font-size: 11px;
+  color: var(--text-2);
+  line-height: 1.5;
+  margin: 0 0 8px;
+}
+.demo-ai-panel { display: flex; }
+.ai-send-btn:disabled { opacity: 0.45; cursor: default; }
+
+/* Demo 轨迹复用正式面板气泡语义（测试仍断言 ai-msg / ai-row） */
+.ai-trace .ai-msg {
+  font-size: 13px;
+  line-height: 1.4;
+  padding: 7px 11px;
+  border-radius: 13px;
+  max-width: 82%;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+.ai-trace .ai-msg.user {
+  align-self: flex-end;
+  background: var(--accent);
+  color: #fff;
+}
+.ai-trace .ai-msg.agent {
+  align-self: flex-start;
+  background: #e9e9eb;
+  color: var(--text);
+}
+.ai-trace .ai-row {
+  font-size: 12px;
+  color: var(--text-2);
+  padding: 2px 4px;
+}
+.ai-trace .ai-row.error { color: var(--danger); }
+.ai-trace .ai-obs {
+  align-self: flex-start;
+  background: #f0f7f0;
+  border: 1px solid rgba(52, 199, 89, 0.35);
+  border-radius: 9px;
+  padding: 6px 10px;
+  font-size: 12.5px;
+  color: var(--text);
+}
+.ai-trace .ai-obs b { font-size: 12px; }
+
+.demo-unavailable {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 32px 24px;
+  text-align: center;
+}
+.demo-unavailable h1 { font-size: 19px; font-weight: 600; }
+.demo-unavailable p { font-size: 13px; color: var(--text-2); line-height: 1.7; max-width: 460px; }
+.demo-unavailable .actions { display: flex; gap: 10px; margin-top: 8px; }
+.demo-unavailable .btn {
+  display: inline-block;
+  height: 40px;
+  line-height: 40px;
+  padding: 0 18px;
+  text-decoration: none;
+}
+.demo-unavailable-footer { font-size: 12px; color: var(--text-2); margin-top: 12px; }
+
+@media (max-width: 760px) {
+  .header-register-link { display: none; }
+  .demo-badge { display: none; }
+}
+

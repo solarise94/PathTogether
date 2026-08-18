@@ -1,0 +1,478 @@
+{# PathTogether 共享页面外壳：正式版与 Demo 共用 header / 工具栏 / 侧栏 / Viewer / AI 面板。
+   写操作入口按 capabilities 服务端不渲染（不只靠 CSS 隐藏）。Demo 额外只显示只读徽章、额度与登录入口。 #}
+{% set mode = app_mode|default('official') %}
+{% set C = capabilities|default({}) %}
+
+  <!-- 统一标题栏 + 工具栏（macOS unified titlebar-toolbar） -->
+  <header id="app-header">
+    <button id="menu-btn" class="icon-btn menu-btn" aria-label="菜单" data-i18n-title="tb.menu">☰</button>
+    <div class="title-group">
+      <span class="header-title" data-i18n="app.title">PathTogether</span>
+      {% if C.readonly_badge %}
+      <span class="demo-badge" data-i18n="demo.badge">Demo 只读体验</span>
+      {% else %}
+      <span class="title-sep">·</span>
+      <span class="header-subtitle" data-i18n="app.subtitle">协作式病理读片</span>
+      {% endif %}
+      <span class="title-sep">·</span>
+      <span id="current-slide" class="header-current" data-i18n="header.no.slide">未打开切片</span>
+    </div>
+    <span id="header-zoom-badge" class="zoom-badge header-zoom-badge">—</span>
+    {% if C.login_cta %}
+    <a class="header-login-link" href="/login" data-i18n="demo.login">登录 PathTogether</a>
+    <a class="header-login-link header-register-link" href="/register" data-i18n="demo.register">注册方式</a>
+    {% endif %}
+    <button type="button" class="lang-toggle" aria-label="Switch language">EN</button>
+
+    <div id="toolbar">
+      <div class="btn-group">
+        <button id="zoom-out" class="icon-btn" data-i18n-title="tb.zoom.out" aria-label="缩小" data-i18n-aria="tb.zoom.out">−</button>
+        <button id="zoom-in" class="icon-btn" data-i18n-title="tb.zoom.in" aria-label="放大" data-i18n-aria="tb.zoom.in">+</button>
+      </div>
+
+      <div class="btn-group view-tools">
+        <button id="rotate-btn" class="icon-btn" data-i18n-title="tb.rotate" aria-label="旋转">↻</button>
+        <button id="flip-btn" class="icon-btn" data-i18n-title="tb.flip" aria-label="镜像">⇋</button>
+        <button id="reset-btn" class="tool-btn" data-i18n-title="tb.reset" data-i18n="tb.reset.label">Reset</button>
+      </div>
+
+      {% if C.roi %}
+      <div class="seg-control roi-group" role="group" aria-label="ROI 分段" data-i18n-aria="tb.roi.group">
+        <button id="roi-6" class="seg roi-btn" data-size="6"><span class="tb-txt">ROI </span>6mm</button>
+        <button id="roi-6-5" class="seg roi-btn" data-size="6.5"><span class="tb-txt">ROI </span>6.5mm</button>
+      </div>
+      <div id="roi-box-btn" class="roi-slider" role="group" aria-label="矩形标记尺寸" data-i18n-aria="tb.roi.mark.group">
+        <span class="roi-slider-thumb" aria-hidden="true"></span>
+        <button type="button" class="roi-slider-seg" data-size="6" aria-label="6 毫米矩形标记" data-i18n-title="tb.roi.mark.6">6</button>
+        <button type="button" class="roi-slider-seg" data-size="6.5" aria-label="6.5 毫米矩形标记" data-i18n-title="tb.roi.mark.6.5">6.5</button>
+      </div>
+      {% endif %}
+
+      {% if C.annotate %}
+      <div class="btn-group anno-tools">
+        <button id="anno-arrow-btn" class="tool-btn" data-i18n-title="tb.anno.arrow.title" disabled><span aria-hidden="true">↗</span><span class="tb-txt" data-i18n="tb.anno.arrow"> 箭头</span></button>
+        <button id="anno-free-btn" class="tool-btn" data-i18n-title="tb.anno.free.title" disabled><span aria-hidden="true">〰</span><span class="tb-txt" data-i18n="tb.anno.free"> 描图</span></button>
+      </div>
+      <button id="anno-btn" class="tool-btn" data-i18n="tb.anno.open" disabled>标记</button>
+      {% endif %}
+
+      {% if mode == 'demo' or histopilot_ui_enabled %}
+      <button id="ai-btn" class="tool-btn ai-btn" data-i18n-title="tb.ai.title" {% if mode != 'demo' %}disabled {% endif %}title="AI 读片助手"><span data-i18n="tb.ai">✨ AI</span></button>
+      {% endif %}
+
+      {% if C.annotate %}
+      <button id="anno-all-btn" class="tool-btn" data-i18n="tb.anno.show.all" disabled>显示全部标记</button>
+      {% endif %}
+
+      {% if C.annotate or C.save_image or C.mpp %}
+      <div class="tbb-context" id="tbb-context">
+        {% if C.annotate %}
+        <input id="anno-label-input" type="text" maxlength="40"
+               class="anno-label-input" data-i18n-ph="tb.anno.label.ph" data-i18n-title="tb.anno.label.title"
+               placeholder="默认 管理员" autocomplete="off" />
+        <button id="save-anno-btn" class="tool-btn anno-save" data-i18n-title="tb.save.anno.title" data-i18n="tb.save.anno" disabled>保存标记</button>
+        {% endif %}
+        {% if C.save_image %}
+        <button id="save-btn" class="tool-btn primary" data-i18n="tb.save.img" disabled>保存图片</button>
+        {% endif %}
+        {% if C.mpp %}
+        <div id="mpp-setter" class="mpp-setter" style="display:none;">
+          <input id="mpp-input" type="number" step="0.01" min="0.01" data-i18n-ph="tb.mpp.ph" data-i18n-title="tb.mpp.title" placeholder="mpp" />
+          <button id="mpp-set-btn" class="tool-btn" data-i18n="tb.mpp.set">设置</button>
+        </div>
+        {% endif %}
+      </div>
+      {% endif %}
+
+      <div class="spacer"></div>
+
+      <span id="zoom-badge" class="zoom-badge">—</span>
+
+      <button id="tbb-more-btn" class="icon-btn tbb-more-btn" aria-label="更多" data-i18n-title="tb.more">⋯</button>
+      <div id="tbb-more" class="tbb-more" role="menu">
+        {% if mode == 'demo' or histopilot_ui_enabled %}
+        <button id="tbb-more-ai" class="tool-btn" data-i18n-title="tb.ai.title" data-i18n="tb.ai.more">✨ AI 读片</button>
+        {% endif %}
+      </div>
+    </div>
+  </header>
+
+  <div id="main">
+    <div id="sidebar-mask" class="sidebar-mask"></div>
+    <aside id="sidebar">
+      {% if mode == 'demo' %}
+      <div class="sidebar-top">
+        <div id="demo-quota-chip" class="demo-quota-chip" data-i18n="demo.quota.idle">可体验 1 次 AI 导航</div>
+      </div>
+      <div class="sidebar-scroll">
+        <div class="section-head" data-i18n="sb.section.demo.slides">示例切片</div>
+        <div id="demo-slide-list" class="unfiled-list"></div>
+      </div>
+      <div class="sidebar-bottom">
+        <p class="demo-disclaimer" data-i18n="entry.footer">仅用于研究、教学和软件演示，不用于临床诊断。</p>
+        <a href="/login" class="logout-link" data-i18n="demo.footer.login">登录后继续使用</a>
+      </div>
+      {% else %}
+      <div class="sidebar-top">
+        <button id="upload-btn" class="btn primary block" data-i18n="sb.upload">上传切片</button>
+        <button id="new-project-btn" class="btn secondary block" data-i18n="sb.new.project">＋ 新建项目</button>
+        <input id="file-input" type="file"
+               accept=".svs,.tif,.tiff,.ndpi,.mrxs,.vms,.vmu,.scn,.bif,.svslide,.zip"
+               hidden />
+        <div id="progress-wrap" class="progress-wrap" style="display:none;">
+          <div id="progress-bar" class="progress-bar"></div>
+          <span id="progress-text" class="progress-text">0%</span>
+        </div>
+
+        <div id="new-project-form" class="new-project-form" style="display:none;">
+          <input id="np-name" type="text" maxlength="60" data-i18n-ph="sb.np.name.ph" placeholder="项目名称" autocomplete="off" />
+          <input id="np-note" type="text" maxlength="200" data-i18n-ph="sb.np.note.ph" placeholder="备注（可选）" autocomplete="off" />
+          <div class="np-actions">
+            <button id="np-confirm" class="btn primary small" data-i18n="sb.np.confirm">确认</button>
+            <button id="np-cancel" class="btn secondary small" data-i18n="sb.np.cancel">取消</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="sidebar-scroll">
+        <div class="section-head" data-i18n="sb.section.projects">项目</div>
+        <div id="project-list" class="project-list"></div>
+
+        <div id="unfiled-section" class="section">
+          <div class="section-head row" id="unfiled-toggle">
+            <span class="caret">▾</span>
+            <span class="section-title" data-i18n="sb.section.unfiled">未归类切片</span>
+            <span id="unfiled-count" class="count-badge">0</span>
+          </div>
+          <div id="unfiled-body" class="section-body">
+            <div id="unfiled-list" class="unfiled-list"></div>
+            <div class="unfiled-ops">
+              <button id="unfiled-new-project" class="btn secondary small" data-i18n="sb.unfiled.new.project">新建项目(含选中)</button>
+              <button id="unfiled-share" class="btn primary small" data-i18n="sb.unfiled.share">分享选中</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-head row" id="share-mgr-toggle">
+            <span class="caret">▾</span>
+            <span class="section-title" data-i18n="sb.section.share">分享管理</span>
+          </div>
+          <div id="share-mgr-body" class="section-body">
+            <div class="share-row">
+              <select id="share-expires-select" class="select">
+                <option value="6" data-i18n="sb.share.expires.6">6 小时</option>
+                <option value="24" selected data-i18n="sb.share.expires.24">24 小时</option>
+                <option value="72" data-i18n="sb.share.expires.72">3 天</option>
+                <option value="168" data-i18n="sb.share.expires.168">7 天</option>
+                <option value="custom" data-i18n="sb.share.expires.custom">自定义</option>
+              </select>
+              <input id="share-expires-custom" class="input" type="number"
+                     min="0.1" max="720" step="0.1" data-i18n-ph="sb.share.hours.ph" placeholder="小时" style="display:none;" />
+              <select id="share-roi-size-select" class="select" data-i18n-title="sb.share.roi.title" title="矩形标记可选尺寸">
+                <option value="both" selected data-i18n="sb.share.roi.both">标记：两者</option>
+                <option value="6" data-i18n="sb.share.roi.6">仅 6mm</option>
+                <option value="6.5" data-i18n="sb.share.roi.6.5">仅 6.5mm</option>
+              </select>
+            </div>
+            <div class="share-row share-perms" role="group" data-i18n-title="sb.share.perm.title" title="链接权限">
+              <label class="perm-chip">
+                <input type="checkbox" id="share-perm-view" checked disabled />
+                <span data-i18n="sb.share.perm.view">仅查看</span>
+              </label>
+              <label class="perm-chip">
+                <input type="checkbox" id="share-perm-annotate" />
+                <span data-i18n="sb.share.perm.annotate">允许标注</span>
+              </label>
+              <label class="perm-chip">
+                <input type="checkbox" id="share-perm-download" />
+                <span data-i18n="sb.share.perm.download">允许下载</span>
+              </label>
+            </div>
+            <p class="share-perm-hint" id="share-perm-hint" data-i18n="sb.share.perm.hint" hidden>只能分享你拥有的切片</p>
+            <button id="share-create-btn" class="btn primary block" data-i18n="sb.share.create">分享选中切片</button>
+
+            <div id="share-result" class="share-result" style="display:none;">
+              <input id="share-result-url" class="share-result-url" readonly />
+              <button id="share-result-copy" class="btn primary small" data-i18n="sb.share.copy">复制</button>
+            </div>
+
+            <div id="share-list" class="share-list"></div>
+          </div>
+        </div>
+
+        <div class="section" id="users-mgr-section" hidden>
+          <div class="section-head row" id="users-mgr-toggle">
+            <span class="caret">▾</span>
+            <span class="section-title" data-i18n="sb.section.users">用户管理</span>
+          </div>
+          <div id="users-mgr-body" class="section-body">
+            <div class="users-add-form">
+              <input id="users-email" type="text" maxlength="120" data-i18n-ph="sb.users.email.ph" placeholder="邮箱 / 用户名" autocomplete="off" />
+              <input id="users-display" type="text" maxlength="120" data-i18n-ph="sb.users.display.ph" placeholder="显示名（可选）" autocomplete="off" />
+              <input id="users-password" type="password" maxlength="200" data-i18n-ph="sb.users.password.ph" placeholder="初始密码（≥8位）" autocomplete="new-password" />
+              <button id="users-add-btn" class="btn primary block" data-i18n="sb.users.add">添加用户</button>
+            </div>
+            <div class="users-reg-open" data-i18n="sb.users.reg.open">开放注册：关闭</div>
+            <div id="users-list" class="users-list"></div>
+          </div>
+        </div>
+
+        <div class="section" id="plugins-mgr-section" hidden>
+          <div class="section-head row" id="plugins-mgr-toggle">
+            <span class="caret">▾</span>
+            <span class="section-title" data-i18n="sb.section.plugins">插件管理</span>
+          </div>
+          <div id="plugins-mgr-body" class="section-body">
+            <div class="plugins-health-note" id="plugins-health-note"></div>
+            <div id="plugins-list" class="plugins-list"></div>
+          </div>
+        </div>
+
+        <div class="section" id="aibudget-mgr-section" hidden>
+          <div class="section-head row" id="aibudget-mgr-toggle">
+            <span class="caret">▾</span>
+            <span class="section-title" data-i18n="sb.section.aibudget">AI 预算</span>
+            <span id="aibudget-usage-badge" class="aibudget-badge"></span>
+          </div>
+          <div id="aibudget-mgr-body" class="section-body">
+            <div class="aibudget-note" id="aibudget-note"></div>
+            <div id="aibudget-usage" class="aibudget-usage"></div>
+            <label class="aibudget-field">
+              <span data-i18n="sb.aibudget.limit.platform">平台总对话上限</span>
+              <input id="aibudget-platform-limit" class="input" type="number" min="1" max="1000000" autocomplete="off" />
+            </label>
+            <label class="aibudget-field">
+              <span data-i18n="sb.aibudget.limit.demo">Demo 子额度上限</span>
+              <input id="aibudget-demo-limit" class="input" type="number" min="0" max="1000000" autocomplete="off" />
+            </label>
+            <label class="aibudget-field">
+              <span data-i18n="sb.aibudget.limit.user">每用户对话上限</span>
+              <input id="aibudget-user-limit" class="input" type="number" min="1" max="1000000" autocomplete="off" />
+            </label>
+            <label class="aibudget-field">
+              <span data-i18n="sb.aibudget.limit.psteps">平台 AI 单次任务步骤</span>
+              <input id="aibudget-psteps" class="input" type="number" min="1" max="500" autocomplete="off" />
+            </label>
+            <label class="aibudget-field">
+              <span data-i18n="sb.aibudget.limit.ownsteps">自带 API 步数硬上限</span>
+              <input id="aibudget-ownsteps" class="input" type="number" min="1" max="500" autocomplete="off" />
+            </label>
+            <label class="aibudget-field">
+              <span data-i18n="sb.aibudget.limit.demosteps">Demo 单次任务步骤</span>
+              <input id="aibudget-demosteps" class="input" type="number" min="1" max="500" autocomplete="off" />
+            </label>
+            <label class="aibudget-field">
+              <span data-i18n="sb.aibudget.limit.perbrowser">Demo 每浏览器次数</span>
+              <input id="aibudget-perbrowser" class="input" type="number" min="1" max="100" autocomplete="off" />
+            </label>
+            <label class="aibudget-field">
+              <span data-i18n="sb.aibudget.limit.concurrency">Demo 最大并发</span>
+              <input id="aibudget-concurrency" class="input" type="number" min="1" max="100" autocomplete="off" />
+            </label>
+            <label class="aibudget-field row">
+              <input id="aibudget-demo-enabled" type="checkbox" />
+              <span data-i18n="sb.aibudget.limit.demoenabled">开放公开 Demo</span>
+            </label>
+            <div class="aibudget-actions">
+              <button id="aibudget-save-btn" class="btn primary small" data-i18n="sb.aibudget.save">保存设置</button>
+              <button id="aibudget-reset-btn" class="btn danger small" data-i18n="sb.aibudget.reset">重置用量</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sidebar-bottom">
+        <button type="button" id="logout-btn" class="logout-link" data-i18n="toast.logout" hidden>退出登录</button>
+      </div>
+      {% endif %}
+    </aside>
+
+    <main id="viewer-wrap">
+      <div id="viewer"></div>
+      {% if mode == 'demo' %}
+      <canvas id="obs-canvas" class="anno-canvas"></canvas>
+      {% else %}
+      <canvas id="anno-canvas" class="anno-canvas"></canvas>
+      <div id="drop-overlay" class="drop-overlay">
+        <div class="drop-text" data-i18n="drop.text">松开以上传切片</div>
+      </div>
+
+      <div id="slide-picker-mask" class="picker-mask" style="display:none;">
+        <div class="picker-dialog">
+          <div class="picker-title">
+            <span id="picker-title-text" data-i18n="picker.title">添加切片到项目</span>
+            <button id="picker-close" class="icon-btn close" aria-label="关闭" data-i18n-aria="picker.close">×</button>
+          </div>
+          <div id="picker-list" class="picker-list"></div>
+          <div class="picker-footer">
+            <span id="picker-selected-count" class="picker-count" data-i18n="picker.selected" data-i18n-vars="n:0">已选 0</span>
+            <button id="picker-confirm" class="btn primary" data-i18n="picker.confirm">确认添加</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="anno-panel" class="anno-panel" style="display:none;">
+        <div class="anno-panel-header">
+          <span id="anno-panel-title" data-i18n="anno.panel.title">标注</span>
+          <div class="anno-panel-header-actions">
+            <button id="anno-all-toggle" class="panel-eye-btn" data-i18n-title="anno.panel.toggle.title" title="显示/隐藏全部标记" aria-label="显示/隐藏全部标记" aria-pressed="false">👁</button>
+            <button id="anno-panel-close" class="icon-btn close" aria-label="关闭" data-i18n-aria="picker.close">×</button>
+          </div>
+        </div>
+        <div id="anno-edit-wrap" class="anno-edit-wrap" style="display:none;"></div>
+        <div id="anno-panel-list" class="anno-panel-list">
+          <div class="anno-panel-empty" data-i18n="anno.panel.empty">暂无标注</div>
+        </div>
+      </div>
+      {% endif %}
+
+      {% if mode == 'demo' %}
+      <div id="ai-panel" class="ai-panel demo-ai-panel">
+        <div class="ai-panel-header">
+          <span id="ai-panel-title" data-i18n="demo.ai.title">AI 导航（只读体验）</span>
+          <span id="ai-state" class="ai-state"></span>
+          <div class="ai-panel-header-actions">
+            <button id="ai-panel-close" class="icon-btn close" aria-label="关闭" data-i18n-aria="picker.close">×</button>
+          </div>
+        </div>
+        <div id="ai-steps-hint" class="demo-quota-hint"></div>
+        <div id="ai-status" class="ai-status"></div>
+        <div id="ai-trace" class="ai-trace">
+          <div class="ai-trace-empty" data-i18n="ai.trace.empty">发条消息，AI 就开始读片。对话会显示在这里。</div>
+        </div>
+        <div class="ai-composer">
+          <div class="ai-composer-bar">
+            <textarea id="ai-task" class="ai-task" rows="1" maxlength="300"
+              data-i18n-ph="demo.ai.task.ph"
+              placeholder="想让 AI 在这张切片里看什么？（可选，最多 300 字）"></textarea>
+            <button id="ai-run-btn" class="ai-send-btn" type="button" disabled
+                    data-i18n-title="demo.ai.run.available" title="体验 AI 导航（1 次）" aria-label="开始">
+              <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                <path d="M10 15V4.5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+                <path d="M5 9l5-5 5 5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+      </div>
+      {% elif histopilot_ui_enabled %}
+      <div id="ai-panel" class="ai-panel" style="display:none;">
+        <div class="ai-panel-header">
+          <span id="ai-panel-title" data-i18n="ai.panel.title">✨ AI 读片助手</span>
+          <div class="ai-panel-header-actions">
+            <button id="ai-panel-close" class="icon-btn close" aria-label="关闭" data-i18n-aria="picker.close">×</button>
+          </div>
+        </div>
+
+        <div id="ai-degrade-banner" class="ai-degrade-banner" style="display:none;"
+             data-i18n="ai.degraded">AI 服务暂不可用，平台功能正常。将自动重试检测恢复…</div>
+
+        <div id="ai-config-wrap" class="ai-config-wrap">
+          <div class="ai-config-title" data-i18n="ai.config.title">AI 服务配置</div>
+          <div id="ai-config-source-hint" class="ai-config-source-hint" style="display:none"></div>
+          <label class="ai-field">
+            <span data-i18n="ai.field.baseurl">Base URL</span>
+            <input id="ai-base-url" type="text" placeholder="https://api.openai.com/v1"
+                   autocomplete="off" />
+          </label>
+          <label class="ai-field">
+            <span data-i18n="ai.field.apikey">API Key</span>
+            <input id="ai-api-key" type="password" placeholder="sk-..."
+                   autocomplete="off" />
+          </label>
+          <label class="ai-field">
+            <span data-i18n="ai.field.model">模型</span>
+            <input id="ai-model" type="text" placeholder="gpt-4o"
+                   autocomplete="off" />
+          </label>
+          <label class="ai-field ai-field-checkbox" id="ai-use-platform-wrap" style="display:none;">
+            <input id="ai-use-platform" type="checkbox" />
+            <span data-i18n="ai.field.useplatform">使用平台官方 API</span>
+          </label>
+          <label class="ai-field">
+            <span data-i18n="ai.field.maxsteps">步数上限</span>
+            <input id="ai-max-steps" type="number" min="1" max="500" placeholder="50"
+                   data-i18n-title="ai.field.maxsteps.title" title="单轮步数上限（到顶暂停可继续）" autocomplete="off" />
+          </label>
+          <label class="ai-field">
+            <span data-i18n="ai.field.protocol">协议</span>
+            <select id="ai-api-protocol" data-i18n-title="ai.protocol.title" title="openai 走 /chat/completions；gemini 走 CPA 网关 /v1beta（gemini 兼容）；anthropic 直连 /v1/messages">
+              <option value="openai" data-i18n="ai.protocol.openai">openai（兼容端点）</option>
+              <option value="gemini" data-i18n="ai.protocol.gemini">gemini（CPA /v1beta）</option>
+              <option value="anthropic" data-i18n="ai.protocol.anthropic">anthropic（直连）</option>
+            </select>
+          </label>
+          <details class="ai-advanced">
+            <summary data-i18n="ai.advanced.summary">高级调优</summary>
+            <small class="ai-field-note" id="ai-tune-admin-note" data-i18n="ai.config.tune.admin" style="display:none;">由管理员配置，用户不可修改</small>
+            <label class="ai-field"><span data-i18n="ai.advanced.tier">窗口档位预设</span>
+              <select id="ai-window-tier">
+                <option value="" data-i18n="ai.tier.none">不启用（手动配置）</option>
+                <option value="saving" data-i18n="ai.tier.saving">200k 极致节约（预算 10%）</option>
+                <option value="balanced" selected data-i18n="ai.tier.balanced">400k 宽松（预算 15%）</option>
+                <option value="performance" data-i18n="ai.tier.performance">500k 高性能（预算 20%）</option>
+              </select>
+              <small class="ai-field-note" data-i18n="ai.tier.note">档位会自动推导窗口大小、图片预算和压缩档；显式填写的窗口/预算/图片档优先生效。1M 模型建议选 500k 档。</small></label>
+            <label class="ai-field"><span data-i18n="ai.advanced.ctx">上下文窗口 tokens</span>
+              <input id="ai-ctx-window" type="number" min="10000" placeholder="400000" /></label>
+            <label class="ai-field"><span data-i18n="ai.advanced.reserve">摘要预留 tokens</span>
+              <input id="ai-reserve" type="number" min="128" placeholder="16000" />
+              <small class="ai-field-note" data-i18n="ai.advanced.reserve.note">至少 128（最小可用摘要预算，保证约 102 输出 tokens）；压缩摘要用 0.8×该值作为 maxTokens</small></label>
+            <label class="ai-field"><span data-i18n="ai.advanced.safety">安全余量 tokens</span>
+              <input id="ai-safety-margin" type="number" min="0" placeholder="8192" class="ai-field-legacy" />
+              <small class="ai-field-note" data-i18n="ai.config.field.legacy">兼容字段，当前不生效</small></label>
+            <label class="ai-field"><span data-i18n="ai.advanced.keep">压缩后保留 tokens</span>
+              <input id="ai-keep-recent" type="number" min="0" placeholder="20000" />
+              <small class="ai-field-note" data-i18n="ai.advanced.keep.note">0=不额外保留历史，但仍保留算法要求的最小当前回合</small></label>
+            <label class="ai-field"><span data-i18n="ai.advanced.fork">批注活跃上限</span>
+              <input id="ai-fork-limit" type="number" min="1" placeholder="20" /></label>
+            <label class="ai-field"><span data-i18n="ai.advanced.lease">租约 TTL（秒）</span>
+              <input id="ai-lease-ttl" type="number" min="30" placeholder="150" class="ai-field-legacy" />
+              <small class="ai-field-note" data-i18n="ai.config.field.legacy">兼容字段，当前不生效</small></label>
+          </details>
+          <div class="ai-config-actions">
+            <button id="ai-config-save" class="btn primary small" data-i18n="ai.config.save">保存配置</button>
+            <span id="ai-config-hint" class="ai-config-hint"></span>
+          </div>
+        </div>
+        <div id="ai-config-collapsed" class="ai-config-collapsed" style="display:none;">
+          <span id="ai-config-summary" class="ai-config-summary"></span>
+          <button id="ai-reconfig-btn" class="link-btn" data-i18n="ai.reconfig">重新配置</button>
+        </div>
+
+        <div id="ai-session-bar" class="ai-session-bar" style="display:none;">
+          <span class="ai-session-bar-label" data-i18n="ai.session.label">会话</span>
+          <select id="ai-session-select" class="ai-session-select" data-i18n-title="ai.session.switch.title" title="切换本切片的主/分支会话"></select>
+        </div>
+
+        <div id="ai-trace" class="ai-trace">
+          <div class="ai-trace-empty" data-i18n="ai.trace.empty">发条消息，AI 就开始读片。对话会显示在这里。</div>
+        </div>
+
+        <div class="ai-composer">
+          <div id="ai-composer-aux" class="ai-composer-aux" style="display:none;">
+            <button id="ai-continue-btn" class="btn small" style="display:none;" data-i18n="ai.continue">▶ 继续</button>
+            <button id="ai-fresh-btn" class="btn small" style="display:none;" data-i18n-title="ai.fresh.title" data-i18n="ai.fresh" title="归档旧对话开新，不影响标注与批注">🔄 新会话</button>
+          </div>
+          <div class="ai-composer-bar">
+            <button id="ai-task-jump" class="ai-plus-btn" data-i18n-title="ai.taskjump.title" title="把当前 ROI/选中标注的坐标写进任务" aria-label="判读当前选区" data-i18n-aria="ai.taskjump.aria">+</button>
+            <textarea id="ai-task" class="ai-task" rows="1"></textarea>
+            <button id="ai-stop-btn" class="ai-send-btn stop" style="display:none;" data-i18n-title="ai.stop.title" title="停止读片" aria-label="停止" data-i18n-aria="ai.stop.aria">
+              <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><rect x="4" y="4" width="8" height="8" rx="1.5"/></svg>
+            </button>
+            <button id="ai-start-btn" class="ai-send-btn" data-i18n-title="ai.start.title" title="开始读片" aria-label="开始" data-i18n-aria="ai.start.aria">
+              <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                <path d="M10 15V4.5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+                <path d="M5 9l5-5 5 5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+      </div>
+      {% endif %}
+    </main>
+  </div>
+
+  <div id="tbb-more-mask" class="tbb-more-mask"></div>
+  <div id="toast-container"></div>

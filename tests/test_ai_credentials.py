@@ -46,6 +46,7 @@ except ImportError:
 
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
+from _pt_helpers import csrf_client  # noqa: E402
 from pg_compat import json_only  # noqa: E402
 
 import ipaddress  # noqa: E402
@@ -72,7 +73,7 @@ def _ssrf_dns(monkeypatch):
 def _client(auth=True):
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = auth
-    return app_mod.app.test_client()
+    return csrf_client(app_mod.app.test_client())
 
 
 def _login(client, role, user_id):
@@ -261,13 +262,18 @@ def test_user_config_get_masked_and_platform_fields():
 
 
 def test_user_put_tuning_differs_returns_403():
+    """user 改平台调优字段 → 403（max_steps 已是 user 自有字段，单独走越界 400）。"""
     _reset_config()
     _setup_platform()
     u = user_store.create_user("u@x.com", "password1", role="user")
     c = _client()
     _login(c, "user", u["user_id"])
-    r = c.put("/api/ai/config", json={"max_steps": 999})
+    r = c.put("/api/ai/config", json={"fork_active_limit": 999})
     assert r.status_code == 403
+    # PT-3：max_steps 是 user 自带 API 步数（docs §9.2），越界 → 400 而非 403
+    r2 = c.put("/api/ai/config", json={"max_steps": 999})
+    assert r2.status_code == 400
+    assert "max_steps" in (r2.get_json() or {}).get("error", "")
 
 
 @json_only  # 断言 users.json 原文落盘（PG 后端无 json 文件）

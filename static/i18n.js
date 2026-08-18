@@ -19,7 +19,7 @@
       "app.title": "PathTogether",
       "app.subtitle": "协作式病理读片",
       "share.title": "病理切片查看",
-      "login.title": "管理员登录",
+      "login.title": "登录 PathTogether",
       "header.no.slide": "未打开切片",
       "header.loading": "加载中…",
       "lang.toggle": "EN", // 中文界面下按钮显示 EN（切到英文）
@@ -45,7 +45,7 @@
       "tb.anno.free.title": "绘制描图标注",
       "tb.anno.open": "标记",
       "tb.ai": "✨ AI",
-      "tb.ai.title": "AI 读片助手（管理员）",
+      "tb.ai.title": "AI 导航助手",
       "tb.ai.more": "✨ AI 读片",
       "tb.anno.show.all": "显示全部标记",
       "tb.anno.label.ph": "默认 管理员",
@@ -81,6 +81,12 @@
       "sb.share.roi.6.5": "仅 6.5mm",
       "sb.share.create": "分享选中切片",
       "sb.share.copy": "复制",
+      // ---- 分享链接权限（docs §8.3：显式选择，不无提示默认） ----
+      "sb.share.perm.title": "链接权限",
+      "sb.share.perm.view": "仅查看",
+      "sb.share.perm.annotate": "允许标注",
+      "sb.share.perm.download": "允许下载",
+      "sb.share.perm.hint": "只能分享你拥有的切片",
       "sb.logout": "退出登录",
       "sb.section.users": "用户管理",
       "sb.users.email.ph": "邮箱 / 用户名",
@@ -121,6 +127,38 @@
       "sb.plugins.created": "创建时间",
       "sb.plugins.noop": "无变化",
 
+      // ---- AI 预算（owner；docs §4.2，PT-3） ----
+      "sb.section.aibudget": "AI 预算",
+      "sb.section.demo.slides": "示例切片",
+      "sb.aibudget.period.start": "本周期开始",
+      "sb.aibudget.platform.usage": "平台总用量",
+      "sb.aibudget.demo.usage": "Demo 用量",
+      "sb.aibudget.bytype": "构成（demo/user/owner）",
+      "sb.aibudget.own.note": "自带 API 用量（不占平台额度）",
+      "sb.aibudget.concurrency": "当前运行/最大并发",
+      "sb.aibudget.limit.platform": "平台总对话上限",
+      "sb.aibudget.limit.demo": "Demo 子额度上限",
+      "sb.aibudget.limit.user": "每用户对话上限",
+      "sb.aibudget.limit.psteps": "平台 AI 单次任务步骤",
+      "sb.aibudget.limit.ownsteps": "自带 API 步数硬上限",
+      "sb.aibudget.limit.demosteps": "Demo 单次任务步骤",
+      "sb.aibudget.limit.perbrowser": "Demo 每浏览器次数",
+      "sb.aibudget.limit.concurrency": "Demo 最大并发",
+      "sb.aibudget.limit.demoenabled": "开放公开 Demo",
+      "sb.aibudget.save": "保存设置",
+      "sb.aibudget.saved": "预算设置已保存（用量保留）",
+      "sb.aibudget.save.fail": "保存预算设置失败",
+      "sb.aibudget.reset": "重置用量",
+      "sb.aibudget.reset.confirm": "确认重置用量？平台/Demo 对话次数归零，匿名 Demo 每浏览器次数和 IP 辅闸一并放开（同一浏览器可立刻再跑）。旧周期统计保留供排查。",
+      "sb.aibudget.reset.ok": "用量已重置",
+      "sb.aibudget.reset.fail": "重置用量失败",
+      "sb.aibudget.load.fail": "加载 AI 预算失败",
+      "sb.aibudget.invalid": "预算限制需为整数",
+      "sb.aibudget.unavailable": "AI 预算需要 PostgreSQL 后端（当前 json/dual 不支持跨 worker 预算）",
+      "sb.aibudget.gates": "Demo 浏览器占用",
+      "sb.aibudget.gates.detail": "已用 {consumed} · 进行中 {reserved} · 未用 {available}",
+      "ai.field.maxsteps.platform.title": "平台 AI 步数由管理员配置（只读）",
+
       // ---- 拖拽 / 选择器 ----
       "drop.text": "松开以上传切片",
       "picker.title": "添加切片到项目",
@@ -134,8 +172,10 @@
       "anno.panel.toggle.title": "显示/隐藏全部标记",
 
       // ---- AI 面板 ----
-      "ai.panel.title": "✨ AI 读片助手",
-      "ai.config.title": "AI 服务配置",
+      "ai.panel.title": "✨ AI 导航助手",
+      "ai.config.title": "AI 配置",
+      "ai.config.title.owner": "平台 AI 配置",
+      "ai.config.title.user": "我的 AI 设置",
       "ai.field.baseurl": "Base URL",
       "ai.field.apikey": "API Key",
       "ai.field.model": "模型",
@@ -179,11 +219,88 @@
       "ai.start.title": "开始读片",
       "ai.start.aria": "开始",
 
-      // ---- login ----
-      "login.subtitle": "请输入管理员账号以继续",
+      // ---- login（docs §6.1/§8.3：去 admin 专属措辞） ----
+      "login.title": "登录 PathTogether",
+      "login.subtitle": "登录后继续查看、测试 AI 和协作",
       "login.username": "邮箱或用户名",
       "login.password": "密码",
       "login.submit": "登录",
+      "login.submitting": "登录中…",
+      "login.register": "没有账号？查看注册方式",
+      "login.demo": "先体验 Demo",
+      "login.forgot": "忘记密码？请联系邀请你的管理员重置。",
+      "login.error.invalid": "账号或密码错误",
+      "login.error.locked": "尝试过于频繁，请 {s} 秒后重试",
+      "login.error.unavailable": "登录暂不可用：跨 worker 登录防爆破需要 PostgreSQL 后端，已按安全策略暂停登录。请联系管理员。",
+      "login.error.csrf": "登录状态已过期，请重新提交",
+      "login.pwd.show.aria": "显示密码",
+      "login.pwd.hide.aria": "隐藏密码",
+
+      // ---- 入口分流页（docs §3.2） ----
+      "entry.tagline": "协作式数字病理切片查看与 AI 导航",
+      "entry.demo": "直接体验 Demo",
+      "entry.login": "登录测试与协作",
+      "entry.demo.hint": "Demo 无需登录，可查看示例切片并体验 1 次 AI 导航",
+      "entry.footer": "仅用于研究、教学和软件演示，不用于临床诊断。",
+
+      // ---- 注册关闭态（docs §7.1） ----
+      "register.badge": "邀请注册",
+      "register.title": "当前采用邀请注册",
+      "register.desc": "测试账号由管理员创建。如果你已收到账号，请直接登录。",
+      "register.back": "返回登录",
+      "register.demo": "先体验 Demo",
+
+      // ---- Demo 页（Phase 2 只读 Viewer） ----
+      "demo.title": "Demo 体验",
+      "demo.coming": "Demo 正在准备中，即将开放：可查看示例切片并体验 1 次只读 AI 导航。",
+      "demo.requires.pg": "当前部署未满足公开 Demo 的前置条件（需要 PostgreSQL 后端），Demo 暂不可用。",
+      "demo.closed": "公开 Demo 当前未开放。登录后可继续使用，或稍后再来。",
+      "demo.login": "登录 PathTogether",
+      "demo.register": "注册方式",
+      "demo.home": "返回首页",
+      "demo.badge": "Demo 只读体验",
+      "demo.footer.login": "登录后继续使用",
+      "demo.slides.empty": "Demo 目录暂无切片",
+      "demo.slide.open.fail": "切片打开失败：{e}",
+      "demo.ai.title": "AI 导航（只读体验）",
+      "demo.ai.task.ph": "想让 AI 在这张切片里看什么？（可选，最多 300 字）",
+      "demo.ai.steps.hint": "单次最多 {steps} 步 · Demo 额度 {demo}/{demoLimit}",
+      "demo.ai.run.available": "体验 AI 导航（1 次）",
+      "demo.ai.run.available.n": "体验 AI 导航（还剩 {n} 次）",
+      "demo.ai.run.running": "AI 正在读片…",
+      "demo.ai.run.used": "本次体验已使用",
+      "demo.ai.run.demo.exhausted": "今日 Demo 体验次数已用完，登录后继续使用",
+      "demo.ai.run.ip.limited": "该网络的 Demo 体验次数已用完，请稍后再试或登录后继续",
+      "demo.ai.run.platform.exhausted": "当前平台 AI 体验额度已用完",
+      "demo.ai.run.unavailable": "AI 暂不可用，切片仍可浏览",
+      "demo.ai.run.demo.off": "Demo 当前未开放",
+      "demo.ai.login.hint": "本浏览器 24 小时内的体验次数已用完（{used}/{limit}）。",
+      "demo.ai.state.running": "运行中",
+      "demo.ai.need.slide": "请先选择切片",
+      "demo.ai.default.task": "请浏览这张切片，指出值得关注的区域。",
+      "demo.ai.started": "AI 已开始读片…",
+      "demo.ai.goto": "AI 移动了视野",
+      "demo.ai.security.applied": "只读安全配置已生效（ephemeral 会话）",
+      "demo.ai.paused": "AI 暂停",
+      "demo.ai.ended": "本次体验已结束，无法继续",
+      "demo.ai.snapshot": "AI 抓取了快照",
+      "demo.ai.finished": "AI 已完成本次读片",
+      "demo.ai.error": "AI 出错：{e}",
+      "demo.ai.dedup": "命中同一请求的进行中会话，已复用",
+      "demo.ai.reset": "事件游标已老化，正在全量重建运行记录…",
+      "demo.ai.reset.fail": "运行记录需要重新加载",
+      "demo.ai.reconnecting": "连接中断，正在按进度重连（不消耗额度）…",
+      "demo.admin.usage": "平台 {p}/{pl} · Demo {d}/{dl} · 本机已用 {consumed}",
+      "demo.quota.idle": "可体验 1 次 AI 导航",
+
+      // ---- owner 切片操作：Demo 目录（docs §5.1） ----
+      "demo.catalog.add": "加入 Demo 目录",
+      "demo.catalog.remove": "移出 Demo 目录",
+      "demo.catalog.add.confirm": "把「{name}」加入 Demo 目录？加入后无需登录即可从互联网访问该切片，请确认其适合公开（建议仅使用合成、教学或已脱敏切片）。",
+      "demo.catalog.remove.confirm": "把「{name}」移出 Demo 目录？移出后匿名访问立即失效。",
+      "demo.catalog.done.add": "已加入 Demo 目录：{name}",
+      "demo.catalog.done.remove": "已移出 Demo 目录：{name}",
+      "demo.catalog.fail": "Demo 目录操作失败：{e}",
 
       // ---- share ----
       "share.invalid": "链接无效或已过期",
@@ -216,6 +333,7 @@
 
       // ---- app.js 动态文案：状态行 / toast / 按钮 ----
       "toast.logout": "退出登录",
+      "toast.logout.fail": "退出登录失败：{e}",
       "badge.marks": "标记 {n} · {m} 人",
       "open.fail": "打开失败: {e}",
       "open.info.fail": "获取切片信息失败: {e}",
@@ -399,6 +517,7 @@
       "ai.continue.fail": "继续失败: {e}",
       "ai.fresh.confirm": "归档旧对话开新会话，不影响已落标注与批注对话，确认？",
       "ai.stopped": "已停止，可继续",
+      "ai.cancel.fail": "取消失败，服务端可能仍在运行：{e}",
       "ai.http.error": "HTTP {s} 服务器内部错误",
       "ai.history.empty": "（暂无对话记录）",
       "ai.history.fail": "（对话记录加载失败）",
@@ -474,7 +593,7 @@
       "app.title": "PathTogether",
       "app.subtitle": "Collaborative pathology review",
       "share.title": "Pathology Slide Viewer",
-      "login.title": "Admin Login",
+      "login.title": "Log in to PathTogether",
       "header.no.slide": "No slide open",
       "header.loading": "Loading…",
       "lang.toggle": "中", // 英文界面下按钮显示 中（切到中文）
@@ -500,7 +619,7 @@
       "tb.anno.free.title": "Draw freehand annotation",
       "tb.anno.open": "Annotate",
       "tb.ai": "✨ AI",
-      "tb.ai.title": "AI reading assistant (admin)",
+      "tb.ai.title": "AI navigation assistant",
       "tb.ai.more": "✨ AI reader",
       "tb.anno.show.all": "Show all marks",
       "tb.anno.label.ph": "Defaults to Admin",
@@ -536,6 +655,12 @@
       "sb.share.roi.6.5": "6.5mm only",
       "sb.share.create": "Share selected slides",
       "sb.share.copy": "Copy",
+      // ---- 分享链接权限（docs §8.3：显式选择，不无提示默认） ----
+      "sb.share.perm.title": "Link permissions",
+      "sb.share.perm.view": "View only",
+      "sb.share.perm.annotate": "Allow annotating",
+      "sb.share.perm.download": "Allow downloading",
+      "sb.share.perm.hint": "You can only share slides you own",
       "sb.logout": "Log out",
       "sb.section.users": "Users",
       "sb.users.email.ph": "Email / username",
@@ -576,6 +701,38 @@
       "sb.plugins.created": "Created",
       "sb.plugins.noop": "No change",
 
+      // ---- AI budget (owner; docs §4.2, PT-3) ----
+      "sb.section.aibudget": "AI budget",
+      "sb.section.demo.slides": "Sample slides",
+      "sb.aibudget.period.start": "Period started",
+      "sb.aibudget.platform.usage": "Platform total",
+      "sb.aibudget.demo.usage": "Demo usage",
+      "sb.aibudget.bytype": "Breakdown (demo/user/owner)",
+      "sb.aibudget.own.note": "Own-API turns (not counted against platform quota)",
+      "sb.aibudget.concurrency": "Running / max concurrency",
+      "sb.aibudget.limit.platform": "Platform turn limit",
+      "sb.aibudget.limit.demo": "Demo sub-limit",
+      "sb.aibudget.limit.user": "Per-user turn limit",
+      "sb.aibudget.limit.psteps": "Platform AI steps per run",
+      "sb.aibudget.limit.ownsteps": "Own-API steps hard limit",
+      "sb.aibudget.limit.demosteps": "Demo steps per run",
+      "sb.aibudget.limit.perbrowser": "Demo runs per browser",
+      "sb.aibudget.limit.concurrency": "Demo max concurrency",
+      "sb.aibudget.limit.demoenabled": "Enable public Demo",
+      "sb.aibudget.save": "Save settings",
+      "sb.aibudget.saved": "Budget settings saved (usage kept)",
+      "sb.aibudget.save.fail": "Failed to save budget settings",
+      "sb.aibudget.reset": "Reset usage",
+      "sb.aibudget.reset.confirm": "Reset usage? Platform and Demo turn counts go to zero, and anonymous Demo per-browser / IP gates are cleared so the same browser can run again immediately. Previous period stats are kept for auditing.",
+      "sb.aibudget.reset.ok": "Usage reset",
+      "sb.aibudget.reset.fail": "Failed to reset usage",
+      "sb.aibudget.load.fail": "Failed to load AI budget",
+      "sb.aibudget.invalid": "Budget limits must be integers",
+      "sb.aibudget.unavailable": "AI budget requires the PostgreSQL backend (json/dual has no cross-worker budget)",
+      "sb.aibudget.gates": "Demo browser occupancy",
+      "sb.aibudget.gates.detail": "used {consumed} · in flight {reserved} · unused {available}",
+      "ai.field.maxsteps.platform.title": "Platform AI step limit is set by the admin (read-only)",
+
       // ---- 拖拽 / 选择器 ----
       "drop.text": "Drop to upload slide",
       "picker.title": "Add slides to project",
@@ -589,8 +746,10 @@
       "anno.panel.toggle.title": "Show/hide all marks",
 
       // ---- AI 面板 ----
-      "ai.panel.title": "✨ AI reading assistant",
-      "ai.config.title": "AI service config",
+      "ai.panel.title": "✨ AI navigation assistant",
+      "ai.config.title": "AI config",
+      "ai.config.title.owner": "Platform AI config",
+      "ai.config.title.user": "My AI settings",
       "ai.field.baseurl": "Base URL",
       "ai.field.apikey": "API Key",
       "ai.field.model": "Model",
@@ -634,11 +793,88 @@
       "ai.start.title": "Start reading",
       "ai.start.aria": "Start",
 
-      // ---- login ----
-      "login.subtitle": "Enter admin credentials to continue",
+      // ---- login（docs §6.1/§8.3：去 admin 专属措辞） ----
+      "login.title": "Log in to PathTogether",
+      "login.subtitle": "Continue viewing, testing AI, and collaborating",
       "login.username": "Email or username",
       "login.password": "Password",
       "login.submit": "Log in",
+      "login.submitting": "Logging in…",
+      "login.register": "No account? See registration options",
+      "login.demo": "Try the Demo first",
+      "login.forgot": "Forgot your password? Contact the administrator who invited you to reset it.",
+      "login.error.invalid": "Incorrect account or password",
+      "login.error.locked": "Too many attempts. Try again in {s} seconds.",
+      "login.error.unavailable": "Login is temporarily unavailable: cross-worker brute-force protection requires a PostgreSQL backend. Please contact the administrator.",
+      "login.error.csrf": "Your session expired. Please submit again.",
+      "login.pwd.show.aria": "Show password",
+      "login.pwd.hide.aria": "Hide password",
+
+      // ---- 入口分流页（docs §3.2） ----
+      "entry.tagline": "Collaborative digital pathology slide viewing with AI navigation",
+      "entry.demo": "Try the Demo",
+      "entry.login": "Log in for testing & collaboration",
+      "entry.demo.hint": "The Demo needs no login: view sample slides and try 1 AI navigation run",
+      "entry.footer": "For research, teaching, and software demonstration only — not for clinical diagnosis.",
+
+      // ---- 注册关闭态（docs §7.1） ----
+      "register.badge": "Invite-only",
+      "register.title": "Registration is currently invite-only",
+      "register.desc": "Test accounts are created by the administrator. If you already received an account, just log in.",
+      "register.back": "Back to login",
+      "register.demo": "Try the Demo first",
+
+      // ---- Demo page (Phase 2 read-only viewer) ----
+      "demo.title": "Demo",
+      "demo.coming": "The Demo is being prepared: view sample slides and try 1 read-only AI navigation run.",
+      "demo.requires.pg": "This deployment does not meet the prerequisites for the public Demo (PostgreSQL backend required); the Demo is unavailable.",
+      "demo.closed": "The public Demo is currently closed. Log in to continue, or check back later.",
+      "demo.login": "Log in to PathTogether",
+      "demo.register": "Registration",
+      "demo.home": "Back to home",
+      "demo.badge": "Read-only demo",
+      "demo.footer.login": "Log in to continue",
+      "demo.slides.empty": "No slides in the Demo catalog yet",
+      "demo.slide.open.fail": "Failed to open slide: {e}",
+      "demo.ai.title": "AI navigation (read-only)",
+      "demo.ai.task.ph": "What should the AI look at on this slide? (optional, up to 300 chars)",
+      "demo.ai.steps.hint": "Up to {steps} steps · Demo quota {demo}/{demoLimit}",
+      "demo.ai.run.available": "Try AI navigation (1 run)",
+      "demo.ai.run.available.n": "Try AI navigation ({n} remaining)",
+      "demo.ai.run.running": "AI is reading the slide…",
+      "demo.ai.run.used": "This trial has been used",
+      "demo.ai.run.demo.exhausted": "Today's Demo runs are used up; log in to continue",
+      "demo.ai.run.ip.limited": "Demo runs from this network are used up; try later or log in",
+      "demo.ai.run.platform.exhausted": "The platform AI trial quota is used up",
+      "demo.ai.run.unavailable": "AI temporarily unavailable; slides remain viewable",
+      "demo.ai.run.demo.off": "The Demo is currently closed",
+      "demo.ai.login.hint": "This browser has used its Demo runs within 24 hours ({used}/{limit}).",
+      "demo.ai.state.running": "Running",
+      "demo.ai.need.slide": "Select a slide first",
+      "demo.ai.default.task": "Please browse this slide and point out regions of interest.",
+      "demo.ai.started": "AI started reading…",
+      "demo.ai.goto": "AI moved the viewport",
+      "demo.ai.security.applied": "Read-only security profile applied (ephemeral session)",
+      "demo.ai.paused": "AI paused",
+      "demo.ai.ended": "This trial has ended and cannot continue",
+      "demo.ai.snapshot": "AI captured a snapshot",
+      "demo.ai.finished": "AI finished this run",
+      "demo.ai.error": "AI error: {e}",
+      "demo.ai.dedup": "Reused the in-flight session for the same request",
+      "demo.ai.reset": "Event cursor aged out; rebuilding the full transcript…",
+      "demo.ai.reset.fail": "The run record needs to be reloaded",
+      "demo.ai.reconnecting": "Connection lost; reconnecting from last position (no quota)…",
+      "demo.admin.usage": "Platform {p}/{pl} · Demo {d}/{dl} · used here {consumed}",
+      "demo.quota.idle": "Try 1 AI navigation run",
+
+      // ---- owner slide actions: Demo catalog (docs §5.1) ----
+      "demo.catalog.add": "Add to Demo catalog",
+      "demo.catalog.remove": "Remove from Demo catalog",
+      "demo.catalog.add.confirm": "Add \"{name}\" to the Demo catalog? Once added it becomes accessible from the internet without login; make sure it is suitable for public access (synthetic/teaching/de-identified slides recommended).",
+      "demo.catalog.remove.confirm": "Remove \"{name}\" from the Demo catalog? Anonymous access stops immediately.",
+      "demo.catalog.done.add": "Added to Demo catalog: {name}",
+      "demo.catalog.done.remove": "Removed from Demo catalog: {name}",
+      "demo.catalog.fail": "Demo catalog operation failed: {e}",
 
       // ---- share ----
       "share.invalid": "Link invalid or expired",
@@ -671,6 +907,7 @@
 
       // ---- app.js 动态文案：状态行 / toast / 按钮 ----
       "toast.logout": "Log out",
+      "toast.logout.fail": "Log out failed: {e}",
       "badge.marks": "{n} marks · {m} people",
       "open.fail": "Open failed: {e}",
       "open.info.fail": "Failed to load slide info: {e}",
@@ -854,6 +1091,7 @@
       "ai.continue.fail": "Continue failed: {e}",
       "ai.fresh.confirm": "Archive the old conversation and start a new one? Annotations and fork chats are kept.",
       "ai.stopped": "Stopped, can continue",
+      "ai.cancel.fail": "Cancel failed; the server may still be running: {e}",
       "ai.http.error": "HTTP {s} internal server error",
       "ai.history.empty": "(no conversation yet)",
       "ai.history.fail": "(failed to load conversation)",
@@ -927,6 +1165,27 @@
 
   var STORAGE_KEY = "hp_lang";
 
+  // 当前登录角色（app.js initAuth 注入；docs §8.3：AI 配置标题按 owner/user 区分）
+  var _role = null;
+
+  function setRole(role) {
+    _role = role || null;
+    applyLang(currentLang);
+    // 通知动态内容（如 AI 配置面板）按新角色重渲染
+    document.dispatchEvent(new CustomEvent("hp-lang-change", { detail: { lang: currentLang } }));
+  }
+
+  // 角色相关键：按当前角色重定向到具体键
+  var ROLE_KEYS = {
+    "ai.config.title": { user: "ai.config.title.user", owner: "ai.config.title.owner" },
+  };
+
+  function resolveKey(key) {
+    var m = ROLE_KEYS[key];
+    if (!m) return key;
+    return _role === "user" ? m.user : m.owner;
+  }
+
   function detectLang() {
     try {
       var saved = localStorage.getItem(STORAGE_KEY);
@@ -956,27 +1215,43 @@
     return fmt(s, vars);
   }
 
+  function tResolved(key, vars) {
+    // 先做角色重定向（ai.config.title → owner/user 变体），再查表
+    return t(resolveKey(key), vars);
+  }
+
+  // 表查找（含角色键重定向；重定向键缺失时回退原键）
+  function lookup(table, key) {
+    var rk = resolveKey(key);
+    if (rk !== key && table[rk] != null) return table[rk];
+    return table[key];
+  }
+
   function applyLang(lang) {
     var table = DICT[lang] || DICT[currentLang];
     // textContent
     document.querySelectorAll("[data-i18n]").forEach(function (el) {
       var key = el.getAttribute("data-i18n");
-      if (key && table[key] != null) el.textContent = fmt(table[key], collectVars(el));
+      var s = lookup(table, key);
+      if (key && s != null) el.textContent = fmt(s, collectVars(el));
     });
     // placeholder
     document.querySelectorAll("[data-i18n-ph]").forEach(function (el) {
       var key = el.getAttribute("data-i18n-ph");
-      if (key && table[key] != null) el.setAttribute("placeholder", fmt(table[key], collectVars(el)));
+      var s = lookup(table, key);
+      if (key && s != null) el.setAttribute("placeholder", fmt(s, collectVars(el)));
     });
     // title
     document.querySelectorAll("[data-i18n-title]").forEach(function (el) {
       var key = el.getAttribute("data-i18n-title");
-      if (key && table[key] != null) el.setAttribute("title", fmt(table[key], collectVars(el)));
+      var s = lookup(table, key);
+      if (key && s != null) el.setAttribute("title", fmt(s, collectVars(el)));
     });
     // aria-label
     document.querySelectorAll("[data-i18n-aria]").forEach(function (el) {
       var key = el.getAttribute("data-i18n-aria");
-      if (key && table[key] != null) el.setAttribute("aria-label", fmt(table[key], collectVars(el)));
+      var s = lookup(table, key);
+      if (key && s != null) el.setAttribute("aria-label", fmt(s, collectVars(el)));
     });
     document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
     // 更新切换按钮文本（所有页面的 .lang-toggle）
@@ -1029,9 +1304,10 @@
 
   // 对外暴露（app.js / share.js 用 window.HP_I18N.t）
   window.HP_I18N = {
-    t: t,
+    t: tResolved,
     getLang: getLang,
     setLang: setLang,
+    setRole: setRole,
     applyLang: applyLang,
   };
 })();

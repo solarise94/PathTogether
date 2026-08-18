@@ -52,6 +52,7 @@ except ImportError:
     sys.modules["openslide.deepzoom"] = _dz
 
 import app as app_mod  # noqa: E402
+from _pt_helpers import csrf_client  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -100,7 +101,7 @@ def make_client():
     """Flask 测试客户端（认证关闭）。"""
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = False
-    return app_mod.app.test_client()
+    return csrf_client(app_mod.app.test_client())
 
 
 def reset_config():

@@ -51,8 +51,22 @@ from pathlib import Path as _Path  # noqa: E402
 SHARE_DATA_DIR = None
 USER_FILE = _Path("/svs-pg-backend/no-user-file")
 
-# AI 凭据默认（与 json 一致：use_platform 缺省 True）
-_DEFAULT_USER_AI_CONFIG = {"use_platform": True, "base_url": "", "model": "", "api_key": ""}
+# AI 凭据默认（与 json 一致：use_platform 缺省 True；max_steps 默认 20，docs §9.2）
+#: user 自带 API 步数默认值（与 budget_store.DEFAULT_PLATFORM_TASK_MAX_STEPS 一致）
+DEFAULT_USER_MAX_STEPS = 20
+_DEFAULT_USER_AI_CONFIG = {
+    "use_platform": True, "base_url": "", "model": "", "api_key": "",
+    "max_steps": DEFAULT_USER_MAX_STEPS,
+}
+
+
+def _user_max_steps(raw) -> int:
+    """规范化 max_steps：非法/缺失回默认 20（防御读取旧数据）。"""
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_USER_MAX_STEPS
+    return v if v > 0 else DEFAULT_USER_MAX_STEPS
 
 
 def _user_id() -> str:
@@ -79,6 +93,7 @@ def _user_ai_config(user: dict) -> dict:
     out = dict(_DEFAULT_USER_AI_CONFIG)
     out.update({k: raw.get(k) for k in ("base_url", "model", "api_key")})
     out["use_platform"] = bool(raw.get("use_platform", True))
+    out["max_steps"] = _user_max_steps(raw.get("max_steps"))
     return out
 
 
@@ -287,7 +302,8 @@ def get_user_ai_config(user_id):
 
 
 def set_user_ai_config(user_id, cfg):
-    """设置用户 AI 凭据。返回更新后的公共用户 dict；用户不存在返回 None。"""
+    """设置用户 AI 凭据（use_platform/base_url/model/api_key/max_steps）。返回更新
+    后的公共用户 dict；用户不存在返回 None。"""
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -304,6 +320,8 @@ def set_user_ai_config(user_id, cfg):
                     for k in ("use_platform", "base_url", "model", "api_key"):
                         if k in cfg:
                             merged[k] = cfg[k]
+                    if "max_steps" in cfg:
+                        merged["max_steps"] = _user_max_steps(cfg.get("max_steps"))
                 cur.execute(
                     "UPDATE users SET ai_config=%s WHERE user_id=%s "
                     "RETURNING " + _SEL_PUBLIC,

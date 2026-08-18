@@ -43,9 +43,27 @@
   };
 
   // ---------- 401 认证处理 ----------
-  // fetch 包装：响应 401 且 body 含 auth_required 时跳登录页。
+  // fetch 包装：
+  //  - 非安全方法自动附带 X-CSRF-Token（统一 CSRF 设施：非 HttpOnly 的 csrf_token
+  //    cookie 与 session 绑定，双提交校验）；
+  //  - 响应 401 且 body 含 auth_required 时跳登录页。
   // 对现有调用透明——仍返回 Response，调用方照常 .json()/.ok 判断。
+  function csrfToken() {
+    var m = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+    return m ? decodeURIComponent(m[1]) : "";
+  }
+
   function apiFetch(url, opts) {
+    opts = opts || {};
+    var method = (opts.method || "GET").toUpperCase();
+    if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
+      var tok = csrfToken();
+      if (tok) {
+        var headers = Object.assign({}, opts.headers || {});
+        if (!headers["X-CSRF-Token"]) { headers["X-CSRF-Token"] = tok; }
+        opts.headers = headers;
+      }
+    }
     return fetch(url, opts).then(function (resp) {
       if (resp.status === 401) {
         // 尝试读 body 判断是否 auth_required（不消费主响应流：克隆一份）
@@ -78,11 +96,34 @@
         els.logoutBtn.hidden = false;
         currentRole = info.role || null;
         currentUserId = info.user_id || null;
+        // AI 配置标题按角色区分（docs §8.3：owner「平台 AI 配置」/ user「我的 AI 设置」）
+        if (window.HP_I18N && HP_I18N.setRole) { HP_I18N.setRole(currentRole); }
+        // user 分享提示：只能分享自己拥有的切片（docs §8.3）
+        if (els.sharePermHint) {
+          els.sharePermHint.hidden = currentRole !== "user";
+        }
         showUsersMgr();
         showPluginsMgr();
+        showAiBudgetMgr();
+        // owner：加载 Demo 目录状态（切片行的「加入/移出 Demo」按钮用）
+        if (currentRole === "owner") loadDemoCatalog();
       }
     }).catch(function () { /* 忽略，不影响主功能 */ });
   }
+
+  // 退出登录：POST /logout + CSRF（docs §10.14；GET /logout 已废弃为短期兼容）
+  // 产品语义：只有服务端确认退出成功才跳登录页；网络/HTTP 失败留在当前页并提示。
+  function doLogout() {
+    apiFetch("/logout", { method: "POST" }).then(function (resp) {
+      if (!resp || !resp.ok) {
+        throw new Error((resp && resp.status) ? ("HTTP " + resp.status) : "logout failed");
+      }
+      location.href = "/login";
+    }).catch(function (e) {
+      toast(t("toast.logout.fail", { e: (e && e.message) ? e.message : e }), "error");
+    });
+  }
+  window.HP_AUTH = { doLogout: doLogout };
 
   // ---------- 用户管理（仅 owner 可见；Stage 3a 身份基础） ----------
   function showUsersMgr() {
@@ -333,6 +374,208 @@
     });
   }
 
+  // ---------- AI 预算管理（仅 owner 可见；docs §4.2，PT-3） ----------
+  function showAiBudgetMgr() {
+    var section = els.aibudgetMgrSection;
+    if (!section) return;
+    if (currentRole === "owner") {
+      section.hidden = false;
+      loadAiBudget();
+    } else {
+      section.hidden = true;
+    }
+  }
+
+  function loadAiBudget() {
+    if (!els.aibudgetUsage) return;
+    apiFetch("/api/admin/settings/ai-budget").then(function (r) {
+      return r.json().then(function (body) { return { status: r.status, body: body }; });
+    }).then(function (res) {
+      if (res.status === 403) { currentRole = null; showAiBudgetMgr(); return; }
+      if (res.status === 503) {
+        // json/dual 后端 fail-closed：无跨 worker 预算（docs §4.3）
+        if (els.aibudgetNote) els.aibudgetNote.textContent = tt("sb.aibudget.unavailable");
+        if (els.aibudgetUsage) els.aibudgetUsage.innerHTML = "";
+        return;
+      }
+      if (res.status !== 200) {
+        if (els.aibudgetNote) els.aibudgetNote.textContent = res.body.error || tt("sb.aibudget.load.fail");
+        return;
+      }
+      if (els.aibudgetNote) els.aibudgetNote.textContent = "";
+      renderAiBudget(res.body);
+    }).catch(function () {
+      if (els.aibudgetNote) els.aibudgetNote.textContent = tt("sb.aibudget.load.fail");
+    });
+  }
+
+  function renderAiBudget(body) {
+    var usage = body.usage || {};
+    var limits = body.limits || {};
+    var platform = usage.platform || {};
+    var demo = usage.demo || {};
+    var byType = usage.by_subject_type || {};
+    var perUser = usage.per_user || [];
+    var own = usage.own || {};
+    var startedAt = body.period && body.period.started_at
+      ? new Date(body.period.started_at * 1000).toLocaleString() : "-";
+    var conc = body.concurrency || {};
+    var gates = body.demo_sessions || {};
+    var platUsed = platform.total || 0;
+    var platLimit = platform.limit || 0;
+    var demoUsed = demo.total || 0;
+    var demoLimit = demo.limit || 0;
+    if (els.aibudgetUsageBadge) {
+      els.aibudgetUsageBadge.textContent = platUsed + "/" + platLimit
+        + " · Demo " + demoUsed + "/" + demoLimit;
+    }
+    var rows = [];
+    rows.push('<div class="aibudget-stats">'
+      + '<div class="aibudget-stat"><div class="aibudget-stat-label">'
+      + esc(tt("sb.aibudget.platform.usage")) + "</div>"
+      + '<div class="aibudget-stat-value">' + platUsed + " / " + platLimit + "</div></div>"
+      + '<div class="aibudget-stat"><div class="aibudget-stat-label">'
+      + esc(tt("sb.aibudget.demo.usage")) + "</div>"
+      + '<div class="aibudget-stat-value">' + demoUsed + " / " + demoLimit + "</div></div>"
+      + "</div>");
+    rows.push(esc(tt("sb.aibudget.period.start")) + ": " + esc(startedAt));
+    rows.push(esc(t("sb.aibudget.gates")) + ": "
+      + esc(t("sb.aibudget.gates.detail", {
+        consumed: gates.consumed || 0,
+        reserved: gates.reserved || 0,
+        available: gates.available || 0,
+      })));
+    var parts = ["demo", "user", "owner"].map(function (k) {
+      var v = byType[k];
+      return k + " " + (v ? v.total : 0);
+    }).join(" · ");
+    rows.push(esc(tt("sb.aibudget.bytype")) + ": " + esc(parts));
+    (perUser || []).forEach(function (u) {
+      rows.push("· " + esc(u.subject_id) + " " + u.total + " / " + u.limit);
+    });
+    rows.push(esc(tt("sb.aibudget.own.note")) + ": " + (own.total || 0));
+    rows.push(esc(tt("sb.aibudget.concurrency")) + ": " +
+      (conc.current || 0) + " / " + (conc.max || 0));
+    els.aibudgetUsage.innerHTML = rows.map(function (r, i) {
+      return i === 0 ? r : '<div class="aibudget-row">' + r + "</div>";
+    }).join("");
+    // 限制编辑框（保存不清空用量）
+    if (els.aibudgetPlatformLimit) els.aibudgetPlatformLimit.value = limits.platform_turn_limit;
+    if (els.aibudgetDemoLimit) els.aibudgetDemoLimit.value = limits.demo_turn_limit;
+    if (els.aibudgetUserLimit) els.aibudgetUserLimit.value = limits.user_turn_limit;
+    if (els.aibudgetPsteps) els.aibudgetPsteps.value = limits.platform_task_max_steps;
+    if (els.aibudgetOwnsteps) els.aibudgetOwnsteps.value = limits.own_task_max_steps_limit;
+    if (els.aibudgetDemosteps) els.aibudgetDemosteps.value = limits.demo_task_max_steps;
+    if (els.aibudgetPerbrowser) els.aibudgetPerbrowser.value = limits.demo_per_browser_limit;
+    if (els.aibudgetConcurrency) els.aibudgetConcurrency.value = limits.demo_max_concurrency;
+    if (els.aibudgetDemoEnabled) els.aibudgetDemoEnabled.checked = !!limits.demo_enabled;
+  }
+
+  function saveAiBudget() {
+    var payload = {
+      platform_turn_limit: els.aibudgetPlatformLimit.value,
+      demo_turn_limit: els.aibudgetDemoLimit.value,
+      user_turn_limit: els.aibudgetUserLimit.value,
+      platform_task_max_steps: els.aibudgetPsteps.value,
+      own_task_max_steps_limit: els.aibudgetOwnsteps.value,
+      demo_task_max_steps: els.aibudgetDemosteps.value,
+      demo_per_browser_limit: els.aibudgetPerbrowser.value,
+      demo_max_concurrency: els.aibudgetConcurrency.value,
+      demo_enabled: !!(els.aibudgetDemoEnabled && els.aibudgetDemoEnabled.checked),
+    };
+    for (var k in payload) {
+      if (k === "demo_enabled") continue;
+      var v = parseInt(payload[k], 10);
+      if (!isFinite(v)) { toast(tt("sb.aibudget.invalid"), "error"); return; }
+      payload[k] = v;
+    }
+    apiFetch("/api/admin/settings/ai-budget", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).then(function (r) { return r.json().then(function (b) { return { status: r.status, body: b }; }); })
+      .then(function (res) {
+        if (res.status !== 200) { toast(res.body.error || tt("sb.aibudget.save.fail"), "error"); return; }
+        toast(tt("sb.aibudget.saved"), "info");
+        loadAiBudget();
+      });
+  }
+
+  function resetAiBudget() {
+    // 二次确认（docs §4.2：用量归零、旧周期统计保留）
+    if (!window.confirm(tt("sb.aibudget.reset.confirm"))) return;
+    apiFetch("/api/admin/settings/ai-budget/reset", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: true }),
+    }).then(function (r) { return r.json().then(function (b) { return { status: r.status, body: b }; }); })
+      .then(function (res) {
+        if (res.status !== 200) { toast(res.body.error || tt("sb.aibudget.reset.fail"), "error"); return; }
+        toast(tt("sb.aibudget.reset.ok"), "info");
+        loadAiBudget();
+      }).catch(function (e) {
+        toast(tt("sb.aibudget.reset.fail") + ": " + ((e && e.message) ? e.message : e), "error");
+      });
+  }
+
+  function initAiBudgetMgr() {
+    if (!els.aibudgetMgrSection) return;
+    els.aibudgetMgrToggle.addEventListener("click", function () {
+      var sec = els.aibudgetMgrBody.closest(".section");
+      if (sec) sec.classList.toggle("collapsed");
+    });
+    if (els.aibudgetSaveBtn) els.aibudgetSaveBtn.addEventListener("click", saveAiBudget);
+    if (els.aibudgetResetBtn) els.aibudgetResetBtn.addEventListener("click", resetAiBudget);
+  }
+
+  // ---------- user max_steps 只读同步（docs §8.3/§9.2，PT-3） ----------
+  // AI 配置面板 DOM 在本页（index.html），但加载/保存逻辑归 HistoPilot 插件
+  // bundle（config-panel.js）。平台侧只做轻量补充：use_platform 勾选时把步数
+  // 输入框置只读并显示平台生效步数；切回自带 API 后恢复可编辑（默认 20）。
+  // 服务端注入规则（_build_sidecar_config）才是权威，这里仅是 UI 提示。
+  function syncAiMaxStepsInput() {
+    var usePlatform = document.getElementById("ai-use-platform");
+    var steps = document.getElementById("ai-max-steps");
+    if (!usePlatform || !steps) return;
+    var platformOn = usePlatform.checked && !usePlatform.disabled;
+    if (platformOn) {
+      if (!steps.readOnly) {
+        // 暂存自带值，切回自带 API 时恢复
+        if (steps.value && !steps.dataset.ownSteps) steps.dataset.ownSteps = steps.value;
+        steps.readOnly = true;
+        steps.title = tt("ai.field.maxsteps.platform.title");
+      }
+    } else if (steps.readOnly) {
+      steps.readOnly = false;
+      steps.title = tt("ai.field.maxsteps.title");
+      if (steps.dataset.ownSteps) {
+        steps.value = steps.dataset.ownSteps;
+        delete steps.dataset.ownSteps;
+      } else if (!steps.value) {
+        steps.value = 20; // 自带 API 默认步数（docs §4.1）
+      }
+    }
+  }
+
+  function initAiMaxStepsSync() {
+    document.addEventListener("change", function (e) {
+      if (e.target && e.target.id === "ai-use-platform") syncAiMaxStepsInput();
+    });
+    // 插件 bundle 加载配置后不派发事件（只设 input.value），用低频轮询补一次
+    // 初始只读状态；仅在面板存在且状态未同步时动作（幂等、开销可忽略）。
+    var tries = 0;
+    var timer = setInterval(function () {
+      tries += 1;
+      var usePlatform = document.getElementById("ai-use-platform");
+      var steps = document.getElementById("ai-max-steps");
+      if (!usePlatform || !steps || tries > 20) { clearInterval(timer); return; }
+      if (usePlatform.checked) {
+        syncAiMaxStepsInput();
+        clearInterval(timer);
+      }
+    }, 1000);
+  }
+
   // 缓存：全部切片、全部项目、全部分享
   var allSlides = [];      // [{name,width,height,mpp_x,...}]
   var allProjects = [];    // [{pid,name,note,slides,roi_count,...}]
@@ -431,6 +674,9 @@
     shareExpiresSelect: $("share-expires-select"),
     shareExpiresCustom: $("share-expires-custom"),
     shareRoiSizeSelect: $("share-roi-size-select"),
+    sharePermAnnotate: $("share-perm-annotate"),
+    sharePermDownload: $("share-perm-download"),
+    sharePermHint: $("share-perm-hint"),
     shareCreateBtn: $("share-create-btn"),
     shareResult: $("share-result"),
     shareResultUrl: $("share-result-url"),
@@ -452,6 +698,24 @@
     pluginsMgrBody: $("plugins-mgr-body"),
     pluginsHealthNote: $("plugins-health-note"),
     pluginsList: $("plugins-list"),
+    // AI 预算（owner；docs §4.2，PT-3）
+    aibudgetMgrSection: $("aibudget-mgr-section"),
+    aibudgetMgrToggle: $("aibudget-mgr-toggle"),
+    aibudgetMgrBody: $("aibudget-mgr-body"),
+    aibudgetNote: $("aibudget-note"),
+    aibudgetUsage: $("aibudget-usage"),
+    aibudgetUsageBadge: $("aibudget-usage-badge"),
+    aibudgetPlatformLimit: $("aibudget-platform-limit"),
+    aibudgetDemoLimit: $("aibudget-demo-limit"),
+    aibudgetUserLimit: $("aibudget-user-limit"),
+    aibudgetPsteps: $("aibudget-psteps"),
+    aibudgetOwnsteps: $("aibudget-ownsteps"),
+    aibudgetDemosteps: $("aibudget-demosteps"),
+    aibudgetPerbrowser: $("aibudget-perbrowser"),
+    aibudgetConcurrency: $("aibudget-concurrency"),
+    aibudgetDemoEnabled: $("aibudget-demo-enabled"),
+    aibudgetSaveBtn: $("aibudget-save-btn"),
+    aibudgetResetBtn: $("aibudget-reset-btn"),
     // 切片选择器
     pickerMask: $("slide-picker-mask"),
     pickerTitleText: $("picker-title-text"),
@@ -562,42 +826,40 @@
 
   // ---------- 初始化 OpenSeadragon ----------
   function initViewer() {
-    viewer = OpenSeadragon({
-      element: $("viewer"),
-      showNavigationControl: false,
-      // 慢网下适度限制并发图像请求（略增并发以更快填补空隙）
-      imageLoaderLimit: 8,
-      // 瓦片未到位时透明：露出后面铺好的缩略图底图，避免白/灰块
-      placeholderFillStyle: null,
-      compositeOperation: "source-over",
-      minZoomImageRatio: 0.5,
-      maxZoomPixelRatio: 10,
-      // 偏保守选层（默认 0.5 → 0.4）：同屏瓦片更倾向取自同一层，
-      // 减少高低层混排的“割裂”接缝，同时降低慢网请求量（轻微变柔，可接受）
-      minPixelRatio: 0.4,
-      defaultZoomLevel: 0,           // 自适应初始缩放
-      immediateRender: false,
-      preload: false,
-      wrapHorizontal: false,
-      wrapVertical: false,
-      preserveImageSizeOnResize: true,
-      // 滚轮缩放更细腻，便于慢网手动控缩放，避免一次跳太多层
-      pixelsPerWheelLine: 40,
-      gestureSettingsMouse: {
-        scrollToZoom: true,
-        clickToZoom: false,
-        dblClickToZoom: true,
-      },
-      gestureSettingsTouch: {
-        pinchToZoom: true,
-        flickEnabled: false,
-      },
-      animationTime: 0.3,
-      visibilityRatio: 0.1,
-      prefixUrl: "",
-    });
-    // 图外空白区用深色背景，减少慢网下大面积空白的刺眼感
-    viewer.container.style.backgroundColor = "#262a30";
+    if (window.HP_ViewerCore && HP_ViewerCore.create) {
+      viewer = HP_ViewerCore.create($("viewer"));
+    } else {
+      viewer = OpenSeadragon({
+        element: $("viewer"),
+        showNavigationControl: false,
+        imageLoaderLimit: 8,
+        placeholderFillStyle: null,
+        compositeOperation: "source-over",
+        minZoomImageRatio: 0.5,
+        maxZoomPixelRatio: 10,
+        minPixelRatio: 0.4,
+        defaultZoomLevel: 0,
+        immediateRender: false,
+        preload: false,
+        wrapHorizontal: false,
+        wrapVertical: false,
+        preserveImageSizeOnResize: true,
+        pixelsPerWheelLine: 40,
+        gestureSettingsMouse: {
+          scrollToZoom: true,
+          clickToZoom: false,
+          dblClickToZoom: true,
+        },
+        gestureSettingsTouch: {
+          pinchToZoom: true,
+          flickEnabled: false,
+        },
+        animationTime: 0.3,
+        visibilityRatio: 0.1,
+        prefixUrl: "",
+      });
+      viewer.container.style.backgroundColor = "#262a30";
+    }
     viewer.addHandler("zoom", function () { updateZoomBadge(); syncBaseThumb(); });
     viewer.addHandler("open", onViewerOpen);
     // 底图随平移/缩放实时跟随（animation 每帧触发，跟随最平滑）
@@ -692,27 +954,27 @@
     return (m >= 10 ? Math.round(m) : m.toFixed(1)) + "x";
   }
   function updateZoomBadge() {
-    var text = "—";
-    try {
-      if (viewer && viewer.viewport && viewer.source) {
-        var zoom = viewer.viewport.getZoom(true);
-        var containerW = viewer.viewport.getContainerSize().x;
-        var imgW = viewer.source.dimensions.x;
-        // 真实图像缩放 = 视口缩放 × 容器宽 / 图像宽（1 = 1 图像像素对应 1 屏幕像素）
-        var imageZoom = (zoom * containerW) / imgW;
-        var mpp = state.mppX;
-        if (mpp && mpp > 0 && imageZoom > 0) {
-          // 相对物镜倍率：以 1:1 图像像素 = 物镜倍率(10/mpp) 为锚，
-          // 全片 fit 时 <1（如 0.2×），zoom 到细胞细节趋近 40×。像显微镜的相对倍率。
-          var mag = imageZoom * (10 / mpp);
-          text = formatMag(mag);
-        } else {
-          text = Math.round(imageZoom * 100) + "%";
+    var text = (window.HP_ViewerCore && HP_ViewerCore.zoomText)
+      ? HP_ViewerCore.zoomText(viewer, state.mppX)
+      : "—";
+    if (text === "—" && !(window.HP_ViewerCore && HP_ViewerCore.zoomText)) {
+      try {
+        if (viewer && viewer.viewport && viewer.source) {
+          var zoom = viewer.viewport.getZoom(true);
+          var containerW = viewer.viewport.getContainerSize().x;
+          var imgW = viewer.source.dimensions.x;
+          var imageZoom = (zoom * containerW) / imgW;
+          var mpp = state.mppX;
+          if (mpp && mpp > 0 && imageZoom > 0) {
+            text = formatMag(imageZoom * (10 / mpp));
+          } else {
+            text = Math.round(imageZoom * 100) + "%";
+          }
         }
-      }
-    } catch (e) { /* 保持 — */ }
-    els.zoomBadge.textContent = text;
-    if (els.headerZoomBadge) els.headerZoomBadge.textContent = text;  // 同步顶部徽章（移动端）
+      } catch (e) { /* 保持 — */ }
+    }
+    if (els.zoomBadge) els.zoomBadge.textContent = text;
+    if (els.headerZoomBadge) els.headerZoomBadge.textContent = text;
   }
 
   // ---------- 底图缩略图层（慢网下瓦片未到区域的模糊预览） ----------
@@ -754,7 +1016,10 @@
   function openSlide(name) {
     // 切换切片前移除旧底图
     clearBaseThumb();
-    var url = "/api/slide/" + encodeURIComponent(name) + "/info";
+    var adapter = window.HP_API;
+    var url = (adapter && adapter.slideInfoUrl)
+      ? adapter.slideInfoUrl(name)
+      : "/api/slide/" + encodeURIComponent(name) + "/info";
     apiFetch(url)
       .then(function (r) { return r.json(); })
       .then(function (info) {
@@ -776,11 +1041,15 @@
         // 创建底图缩略图层：铺在瓦片 canvas 之前（下层），慢网下透出模糊预览
         baseThumbEl = document.createElement("img");
         baseThumbEl.className = "osd-base-thumb";
-        baseThumbEl.src = "/api/slide/" + encodeURIComponent(name) + "/thumbnail";
+        baseThumbEl.src = (adapter && adapter.thumbnailUrl)
+          ? adapter.thumbnailUrl(name)
+          : "/api/slide/" + encodeURIComponent(name) + "/thumbnail";
         baseThumbEl.alt = "";
         viewer.container.insertBefore(baseThumbEl, viewer.canvas);
         applyBaseThumbFlip();
-        viewer.open("/api/slide/" + encodeURIComponent(name) + ".dzi");
+        viewer.open((adapter && adapter.dziUrl)
+          ? adapter.dziUrl(name)
+          : "/api/slide/" + encodeURIComponent(name) + ".dzi");
         // 高亮列表项（未归类与项目切片行）
         document.querySelectorAll(".slide-row").forEach(function (it) {
           it.classList.toggle("active", it.dataset.name === name);
@@ -1402,8 +1671,78 @@
     delBtn.addEventListener("click", function (ev) { ev.stopPropagation(); deleteSlide(sname); });
     row.appendChild(delBtn);
 
+    // Demo 目录按钮（仅 owner；加入后无需登录即可从互联网访问，docs §5.1）
+    var demoBtn = document.createElement("button");
+    demoBtn.className = "slide-demo";
+    demoBtn.type = "button";
+    demoBtn.dataset.name = sname;
+    demoBtn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      toggleDemoCatalog(sname);
+    });
+    row.appendChild(demoBtn);
+    updateDemoBtn(demoBtn, sname);
+
     row.addEventListener("click", function () { openSlide(sname); });
     return row;
+  }
+
+  // ---------- Demo 目录（owner allowlist，PT-4 docs §5.1） ----------
+  var demoCatalogNames = {};
+  var demoCatalogLoaded = false;
+
+  function loadDemoCatalog() {
+    apiFetch("/api/admin/demo-catalog").then(function (r) {
+      if (!r.ok) return null; // json/dual 503 / 非 owner 403：按钮维持隐藏
+      return r.json();
+    }).then(function (data) {
+      if (!data) return;
+      demoCatalogNames = {};
+      (data.slides || []).forEach(function (s) {
+        if (s && s.name) demoCatalogNames[s.name] = true;
+      });
+      demoCatalogLoaded = true;
+      document.querySelectorAll(".slide-demo").forEach(function (btn) {
+        updateDemoBtn(btn, btn.dataset.name);
+      });
+    }).catch(function () { /* 目录状态读失败：按钮保持隐藏（fail-closed） */ });
+  }
+
+  function updateDemoBtn(btn, name) {
+    if (!btn) return;
+    if (!demoCatalogLoaded) { btn.style.display = "none"; return; }
+    var inCatalog = !!demoCatalogNames[name];
+    btn.style.display = "";
+    btn.textContent = inCatalog ? "▣" : "▢";
+    btn.title = inCatalog ? t("demo.catalog.remove") : t("demo.catalog.add");
+    btn.setAttribute("aria-pressed", inCatalog ? "true" : "false");
+  }
+
+  function toggleDemoCatalog(name) {
+    var inCatalog = !!demoCatalogNames[name];
+    var confirmKey = inCatalog ? "demo.catalog.remove.confirm" : "demo.catalog.add.confirm";
+    if (!confirm(t(confirmKey, { name: name }))) return;
+    var req = inCatalog
+      ? apiFetch("/api/admin/demo-catalog?slide=" + encodeURIComponent(name), { method: "DELETE" })
+      : apiFetch("/api/admin/demo-catalog", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ slide: name }),
+        });
+    req.then(function (r) {
+      return r.json().then(function (b) { return { ok: r.ok, body: b || {} }; },
+                            function () { return { ok: r.ok, body: {} }; });
+    }).then(function (res) {
+      if (!res.ok) {
+        toast(t("demo.catalog.fail", { e: res.body.error || "HTTP " }), "error");
+        return;
+      }
+      toast(t(inCatalog ? "demo.catalog.done.remove" : "demo.catalog.done.add",
+              { name: name }), "success");
+      loadDemoCatalog(); // 重新拉权威状态（PUT/DELETE 响应不含展示名集合）
+    }).catch(function (e) {
+      toast(t("demo.catalog.fail", { e: (e && e.message) || e }), "error");
+    });
   }
 
   // 行内别名/备注编辑态
@@ -1645,6 +1984,14 @@
     return [6, 6.5];
   }
 
+  // 读取分享链接权限（docs §8.3：显式选择，view 为基线，不无提示默认 annotate）
+  function getSharePermissions() {
+    var perms = ["view"];
+    if (els.sharePermAnnotate && els.sharePermAnnotate.checked) { perms.push("annotate"); }
+    if (els.sharePermDownload && els.sharePermDownload.checked) { perms.push("download"); }
+    return perms;
+  }
+
   // roi_sizes 数组 → 人类可读标签（用于分享列表 meta）
   function roiSizesLabel(sizes) {
     if (!sizes || !sizes.length) return "6/6.5mm";
@@ -1662,12 +2009,16 @@
     var hours = getExpiresHours();
     if (hours == null) { toast(t("share.need.hours"), "error"); return; }
     var roiSizes = getShareRoiSizes();
+    var permissions = getSharePermissions();
     els.shareCreateBtn.disabled = true;
     els.shareCreateBtn.textContent = t("share.creating");
     apiFetch("/api/share/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ slides: slides, expires_hours: hours, roi_sizes: roiSizes }),
+      body: JSON.stringify({
+        slides: slides, expires_hours: hours, roi_sizes: roiSizes,
+        permissions: permissions,
+      }),
     })
       .then(function (r) {
         if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || (t("share.create.fail") + " " + r.status)); });
@@ -3415,6 +3766,9 @@
     els.mppSetBtn.addEventListener("click", setMpp);
     els.mppInput.addEventListener("keydown", function (e) { if (e.key === "Enter") setMpp(); });
 
+    // 退出登录：POST /logout + CSRF（docs §10.14）
+    if (els.logoutBtn) { els.logoutBtn.addEventListener("click", doLogout); }
+
     els.uploadBtn.addEventListener("click", function () { els.fileInput.click(); });
     els.fileInput.addEventListener("change", function () {
       if (this.files && this.files[0]) { uploadFile(this.files[0]); this.value = ""; }
@@ -3501,6 +3855,10 @@
 
     // 插件管理（owner；Stage 4-3）
     initPluginsMgr();
+
+    // AI 预算（owner；docs §4.2，PT-3）+ user max_steps 只读同步
+    initAiBudgetMgr();
+    initAiMaxStepsSync();
 
     // 切片选择器
     els.pickerClose.addEventListener("click", closeSlidePicker);

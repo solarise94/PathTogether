@@ -75,6 +75,10 @@ def test_ensure_schema_idempotent(conn):
         "schema_migrations", "users", "slides", "slide_assets",
         "projects", "project_slides", "shares", "grants", "rois",
         "change_log",
+        # 0006：Demo / AI 预算 / 登录锁定数据层
+        "platform_settings", "auth_rate_limits", "ai_budget_periods",
+        "ai_budget_usage", "ai_budget_reservations", "demo_sessions",
+        "demo_catalog",
     }
     assert expected <= tables, "缺失表: %s" % (expected - tables)
 
@@ -85,10 +89,20 @@ def test_schema_migrations_recorded(conn):
         rows = [r[0] for r in cur.fetchall()]
     # 3b-1 只应有 0001；3b-2 追加 0002_roi_payload.sql（ROI 全量负载 + 插入序）；
     # 3c-1 追加 0003_comments.sql（评论线程）；3c-2 追加 0004_audit.sql（审计+归档）；
-    # 4-1a 追加 0005_plugin.sql（插件安装凭证 + run grant）
+    # 4-1a 追加 0005_plugin.sql（插件安装凭证 + run grant）；
+    # Demo 数据层追加 0006_demo_budget_auth.sql（platform_settings /
+    # auth_rate_limits / ai_budget_* / demo_sessions / demo_catalog）；
+    # 0007_reservation_attempt.sql 为 reservation/demo run 增加 attempt CAS；
+    # 0008_demo_ip_run_rate.sql 为 Demo AI run IP 前缀限流索引；
+    # 0009_rollback_epoch.sql 为在途重放增加 rollback CAS 栅栏；
+    # 0010_demo_task_max_steps_20.sql 把 Demo 单次默认从 10 步改为 20 步。
     assert rows == [
         "0001_init.sql", "0002_roi_payload.sql", "0003_comments.sql",
-        "0004_audit.sql", "0005_plugin.sql",
+        "0004_audit.sql", "0005_plugin.sql", "0006_demo_budget_auth.sql",
+        "0007_reservation_attempt.sql",
+        "0008_demo_ip_run_rate.sql",
+        "0009_rollback_epoch.sql",
+        "0010_demo_task_max_steps_20.sql",
     ]
 
 

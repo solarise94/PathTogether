@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>PathTogether · Login</title>
-  <script src="/static/i18n.js?v=20260807i18n2"></script>
+  <script src="/static/i18n.js?v=20260817p1"></script>
   <style>
     :root {
       --accent: #007AFF;
@@ -29,20 +29,84 @@
     body {
       background: var(--bg);
       color: var(--text);
+      min-height: 100vh;
       display: flex;
       align-items: center;
       justify-content: center;
-      min-height: 100vh;
       padding: 24px;
     }
 
-    .card {
+    /* 桌面左右布局（docs §6.2）：左品牌区约 55%，右登录卡片约 45%（360-420px） */
+    .layout {
+      display: flex;
+      align-items: stretch;
+      justify-content: center;
+      gap: 56px;
       width: 100%;
-      max-width: 360px;
+      max-width: 960px;
+      min-height: 480px;
+    }
+
+    .brand {
+      flex: 1 1 55%;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: 24px 8px;
+      min-width: 0;
+    }
+
+    .brand-name {
+      font-size: 34px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      margin-bottom: 10px;
+    }
+
+    .brand-tagline {
+      font-size: 15px;
+      color: var(--text-2);
+      line-height: 1.6;
+      margin-bottom: 28px;
+    }
+
+    /* 抽象的切片 Viewer 视觉（纯 CSS，不使用真实病例截图） */
+    .brand-visual {
+      position: relative;
+      height: 200px;
+      border-radius: 18px;
+      background: linear-gradient(135deg, #eaf3ff 0%, #f6f8fb 55%, #eef1f6 100%);
+      border: 1px solid var(--separator);
+      overflow: hidden;
+    }
+    .brand-visual .orb {
+      position: absolute;
+      border-radius: 50%;
+      opacity: 0.55;
+    }
+    .brand-visual .o1 { width: 190px; height: 190px; left: 8%; top: -40px;
+      background: radial-gradient(circle at 35% 35%, #9ecbff, #d3e5fd 70%); }
+    .brand-visual .o2 { width: 130px; height: 130px; right: 14%; top: 46px;
+      background: radial-gradient(circle at 40% 35%, #b7e0c8, #e2f2e9 72%); }
+    .brand-visual .o3 { width: 74px; height: 74px; left: 46%; bottom: 12px;
+      background: radial-gradient(circle at 40% 35%, #ffd9a8, #ffeeda 70%); }
+    .brand-visual .grid {
+      position: absolute; inset: 0;
+      background-image:
+        linear-gradient(rgba(0,122,255,0.05) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0,122,255,0.05) 1px, transparent 1px);
+      background-size: 28px 28px;
+    }
+
+    .card {
+      flex: 0 0 400px;
+      max-width: 400px;
+      width: 100%;
+      align-self: center;
       background: #fff;
       border-radius: 16px;
       box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), 0 12px 32px rgba(0, 0, 0, 0.10);
-      padding: 32px 28px 28px;
+      padding: 32px 28px 24px;
     }
 
     .title {
@@ -57,12 +121,22 @@
       font-size: 13px;
       color: var(--text-2);
       text-align: center;
-      margin-bottom: 24px;
+      margin-bottom: 22px;
     }
 
-    .field {
-      margin-bottom: 14px;
+    .error-box {
+      background: rgba(255, 59, 48, 0.08);
+      color: var(--danger);
+      font-size: 13px;
+      text-align: center;
+      padding: 9px 12px;
+      border-radius: 9px;
+      margin-bottom: 16px;
+      display: none;
     }
+    .error-box .countdown { font-variant-numeric: tabular-nums; }
+
+    .field { margin-bottom: 14px; }
 
     label {
       display: block;
@@ -72,13 +146,15 @@
       font-weight: 500;
     }
 
+    .pwd-wrap { position: relative; }
+
     input[type="text"],
     input[type="password"] {
       width: 100%;
       height: 38px;
       border: 1px solid var(--separator);
       border-radius: 9px;
-      padding: 0 12px;
+      padding: 0 44px 0 12px;
       font-size: 14px;
       font-family: inherit;
       color: var(--text);
@@ -86,12 +162,32 @@
       outline: none;
       transition: border-color 0.15s, box-shadow 0.15s;
     }
+    input[type="text"] { padding-right: 12px; }
 
     input[type="text"]:focus,
     input[type="password"]:focus {
       border-color: var(--accent);
       box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.15);
     }
+
+    .pwd-toggle {
+      position: absolute;
+      right: 5px;
+      top: 50%;
+      transform: translateY(-50%);
+      height: 28px;
+      min-width: 32px;
+      padding: 0 8px;
+      border: none;
+      border-radius: 7px;
+      background: transparent;
+      color: var(--text-2);
+      font-size: 12px;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+    }
+    .pwd-toggle:hover { background: #f0f0f2; color: var(--text); }
 
     .submit {
       width: 100%;
@@ -107,18 +203,40 @@
       cursor: pointer;
       transition: background 0.15s;
     }
-
     .submit:hover { background: var(--accent-hover); }
     .submit:active { background: #0058d0; }
+    .submit:disabled { background: var(--accent-hover); cursor: default; opacity: 0.75; }
 
-    .error {
-      background: rgba(255, 59, 48, 0.08);
-      color: var(--danger);
-      font-size: 13px;
+    .alt-actions {
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px solid var(--separator);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
       text-align: center;
-      padding: 9px 12px;
-      border-radius: 9px;
-      margin-bottom: 16px;
+    }
+
+    .alt-actions a {
+      color: var(--accent);
+      font-size: 13px;
+      text-decoration: none;
+      font-weight: 500;
+    }
+    .alt-actions a:hover { text-decoration: underline; }
+
+    .forgot {
+      font-size: 12px;
+      color: var(--text-2);
+      line-height: 1.5;
+    }
+
+    .disclaimer {
+      margin-top: 14px;
+      font-size: 11px;
+      color: var(--text-2);
+      text-align: center;
+      line-height: 1.5;
     }
 
     .lang-toggle {
@@ -142,38 +260,132 @@
     .lang-toggle:hover { background: #f0f0f2; border-color: rgba(0, 0, 0, 0.16); }
     .lang-toggle:active { background: #e8e8ea; }
 
-    .login-brand {
-      font-size: 12px;
-      color: var(--text-2);
-      text-align: center;
-      margin-top: 18px;
-      letter-spacing: 0.2px;
+    /* 移动端：单列，先品牌与表单，Demo 入口紧跟主按钮（docs §6.2） */
+    @media (max-width: 860px) {
+      .layout { flex-direction: column; gap: 20px; max-width: 420px; }
+      .brand { padding: 8px 0 0; }
+      .brand-visual { height: 120px; }
+      .card { flex: none; }
     }
   </style>
 </head>
 <body>
   <button type="button" class="lang-toggle" aria-label="Switch language">EN</button>
-  <main class="card">
-    <h1 class="title" data-i18n="app.title">PathTogether</h1>
-    <p class="subtitle" data-i18n="login.subtitle">请输入管理员账号以继续</p>
-
-    {% if error %}
-    <div class="error">{{ error }}</div>
-    {% endif %}
-
-    <form method="POST" action="/login">
-      <input type="hidden" name="next" value="{{ next_url }}" />
-      <div class="field">
-        <label for="username" data-i18n="login.username">邮箱或用户名</label>
-        <input id="username" name="username" type="text" autocomplete="username" autofocus required />
+  <div class="layout">
+    <main class="brand" aria-hidden="true">
+      <h1 class="brand-name" data-i18n="app.title">PathTogether</h1>
+      <p class="brand-tagline" data-i18n="entry.tagline">协作式数字病理切片查看与 AI 导航</p>
+      <div class="brand-visual">
+        <div class="grid"></div>
+        <div class="orb o1"></div>
+        <div class="orb o2"></div>
+        <div class="orb o3"></div>
       </div>
-      <div class="field">
-        <label for="password" data-i18n="login.password">密码</label>
-        <input id="password" name="password" type="password" autocomplete="current-password" required />
+    </main>
+
+    <section class="card">
+      <h2 class="title" data-i18n="login.title">登录 PathTogether</h2>
+      <p class="subtitle" data-i18n="login.subtitle">登录后继续查看、测试 AI 和协作</p>
+
+      <div class="error-box" id="error-box" role="alert"
+           {% if not error and not error_code %}hidden{% endif %}>
+        <span id="error-text"
+              {% if error_code %}data-i18n="login.error.{{ error_code }}"
+              {% if retry_after %}data-i18n-vars="s:{{ retry_after }}"{% endif %}{% endif %}>{{ error or "" }}</span>
+        {% if retry_after and retry_after > 0 %}
+        <span class="countdown" id="lock-countdown" data-retry-seconds="{{ retry_after }}"></span>
+        {% endif %}
       </div>
-      <button class="submit" type="submit" data-i18n="login.submit">登录</button>
-    </form>
-    <p class="login-brand" data-i18n="app.subtitle">病理切片智能导航</p>
-  </main>
+
+      <form method="POST" action="/login" id="login-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+        <input type="hidden" name="next" value="{{ next_url }}" />
+        <div class="field">
+          <label for="username" data-i18n="login.username">邮箱或用户名</label>
+          <input id="username" name="username" type="text" autocomplete="username"
+                 autofocus required />
+        </div>
+        <div class="field">
+          <label for="password" data-i18n="login.password">密码</label>
+          <div class="pwd-wrap">
+            <input id="password" name="password" type="password"
+                   autocomplete="current-password" required />
+            <button type="button" class="pwd-toggle" id="pwd-toggle"
+                    aria-label="Show password" data-i18n-aria="login.pwd.show.aria"
+                    data-shown-label-aria="login.pwd.hide.aria">👁</button>
+          </div>
+        </div>
+        <button class="submit" type="submit" id="login-submit"
+                data-i18n="login.submit">登录</button>
+      </form>
+
+      <div class="alt-actions">
+        <a href="/register" data-i18n="login.register">没有账号？查看注册方式</a>
+        <a href="/demo" data-i18n="login.demo">先体验 Demo</a>
+        <p class="forgot" data-i18n="login.forgot">忘记密码？请联系邀请你的管理员重置。</p>
+      </div>
+
+      <p class="disclaimer" data-i18n="entry.footer">仅用于研究、教学和软件演示，不用于临床诊断。</p>
+    </section>
+  </div>
+
+  <script>
+    (function () {
+      "use strict";
+      var t = function (k, v) { return (window.HP_I18N && HP_I18N.t(k, v)) || ""; };
+
+      // 密码显示/隐藏（按钮带可访问名称，docs §6.3）
+      var pwd = document.getElementById("password");
+      var toggle = document.getElementById("pwd-toggle");
+      if (pwd && toggle) {
+        toggle.addEventListener("click", function () {
+          var show = pwd.type === "password";
+          pwd.type = show ? "text" : "password";
+          var key = show ? "login.pwd.hide.aria" : "login.pwd.show.aria";
+          toggle.setAttribute("aria-label", t(key));
+          toggle.setAttribute("aria-pressed", show ? "true" : "false");
+        });
+      }
+
+      // 提交中：按钮「登录中…」+ 防重复提交（docs §6.3）
+      var form = document.getElementById("login-form");
+      var submitBtn = document.getElementById("login-submit");
+      if (form && submitBtn) {
+        form.addEventListener("submit", function () {
+          if (form.dataset.submitting === "1") { return; }
+          form.dataset.submitting = "1";
+          submitBtn.disabled = true;
+          submitBtn.textContent = t("login.submitting");
+          // 允许浏览器原生提交继续进行
+        });
+      }
+
+      // 锁定倒计时：以服务端权威 retry_after 起算（docs §6.3/§6.4）
+      var cd = document.getElementById("lock-countdown");
+      if (cd) {
+        var remain = parseInt(cd.getAttribute("data-retry-seconds") || "0", 10) || 0;
+        var render = function () {
+          if (remain > 0) {
+            cd.textContent = "（" + remain + "s）";
+          } else {
+            cd.textContent = "";
+          }
+        };
+        render();
+        var timer = setInterval(function () {
+          remain = Math.max(0, remain - 1);
+          render();
+          if (remain <= 0) { clearInterval(timer); }
+        }, 1000);
+      }
+
+      // 无 JS 提交兜底：error box 由服务端渲染状态控制显示
+      var box = document.getElementById("error-box");
+      var errText = document.getElementById("error-text");
+      if (box && (errText && (errText.textContent || "").trim())) {
+        box.hidden = false;
+      }
+    })();
+  </script>
 </body>
 </html>

@@ -41,6 +41,7 @@ except ImportError:
     sys.modules["openslide.deepzoom"] = _dz
 
 import app as app_mod  # noqa: E402
+from _pt_helpers import csrf_client  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -152,7 +153,7 @@ def make_client():
     app_mod.app.config["TESTING"] = True
     # 认证默认关闭（多数测试需要放行 /api/）
     app_mod.AUTH_ENABLED = False
-    return app_mod.app.test_client()
+    return csrf_client(app_mod.app.test_client())
 
 
 # =========================================================================== #

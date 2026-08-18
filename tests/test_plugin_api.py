@@ -50,6 +50,7 @@ except ImportError:
     sys.modules["openslide.deepzoom"] = _dz
 
 import app as app_mod  # noqa: E402
+from _pt_helpers import csrf_client  # noqa: E402
 import share_store  # noqa: E402
 
 app_mod.UPLOAD_DIR = Path(os.environ["UPLOAD_DIR"])
@@ -98,7 +99,7 @@ def _file_secret():
 
 def _client():
     app_mod.app.config["TESTING"] = True
-    return app_mod.app.test_client()
+    return csrf_client(app_mod.app.test_client())
 
 
 def _owner_session(client, user_id="usr_owner_test"):

@@ -291,13 +291,30 @@ def set_user_password(user_id, new_password, _enforce_min_length=True):
 # 用户 AI 凭据（Stage 3a 第二节点 2b：AI 凭据规则 §5.1.2）
 #
 # 每个 user 行可带一个 `ai_config` 子对象：
-#   {use_platform: bool, base_url, model, api_key}
+#   {use_platform: bool, base_url, model, api_key, max_steps}
 # use_platform 缺省 True（默认沿用平台官方 API）。api_key 在落盘前由 app.py
 # 加密（Fernet，enc: 前缀）——本层只负责存取原样 dict，不感知加密细节（避免
 # 与 app.py 循环依赖；加密/解密统一在 app.py 侧完成）。owner 无独立 ai_config
 # （owner 读写平台配置，见 app.py _load_ai_config）。
+# max_steps（docs §9.2 / §12.3）：自带 API 凭据时每次任务的步数，默认 20，
+# 仅在 use_platform=false 时生效（平台 AI 步数由周期 platform_task_max_steps
+# 决定）；上限校验在 app.py 权威层（当前周期 own_task_max_steps_limit）。
 # --------------------------------------------------------------------------- #
-_DEFAULT_USER_AI_CONFIG = {"use_platform": True, "base_url": "", "model": "", "api_key": ""}
+#: user 自带 API 步数默认值（与 budget_store.DEFAULT_PLATFORM_TASK_MAX_STEPS 一致）
+DEFAULT_USER_MAX_STEPS = 20
+_DEFAULT_USER_AI_CONFIG = {
+    "use_platform": True, "base_url": "", "model": "", "api_key": "",
+    "max_steps": DEFAULT_USER_MAX_STEPS,
+}
+
+
+def _user_max_steps(raw) -> int:
+    """规范化 max_steps：非法/缺失回默认 20（防御读取旧数据）。"""
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_USER_MAX_STEPS
+    return v if v > 0 else DEFAULT_USER_MAX_STEPS
 
 
 def _user_ai_config(user: dict) -> dict:
@@ -308,6 +325,7 @@ def _user_ai_config(user: dict) -> dict:
     out = dict(_DEFAULT_USER_AI_CONFIG)
     out.update({k: raw.get(k) for k in ("base_url", "model", "api_key")})
     out["use_platform"] = bool(raw.get("use_platform", True))
+    out["max_steps"] = _user_max_steps(raw.get("max_steps"))
     return out
 
 
@@ -327,7 +345,7 @@ def get_user_ai_config(user_id):
 
 
 def set_user_ai_config(user_id, cfg):
-    """设置用户 AI 凭据。cfg 应为 dict（use_platform/base_url/model/api_key）。
+    """设置用户 AI 凭据。cfg 应为 dict（use_platform/base_url/model/api_key/max_steps）。
 
     api_key 假定已由 app.py 加密为磁盘形态；本层原样写入，不重新加密。返回更新后
     的公共用户 dict；用户不存在返回 None。
@@ -342,6 +360,8 @@ def set_user_ai_config(user_id, cfg):
             for k in ("use_platform", "base_url", "model", "api_key"):
                 if k in cfg:
                     merged[k] = cfg[k]
+            if "max_steps" in cfg:
+                merged["max_steps"] = _user_max_steps(cfg.get("max_steps"))
         user["ai_config"] = merged
         _save_locked(f, data)
         return _to_public(user)

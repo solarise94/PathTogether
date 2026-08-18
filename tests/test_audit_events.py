@@ -49,6 +49,7 @@ except ImportError:
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
+from _pt_helpers import csrf_client, install_json_login_limits  # noqa: E402
 import share_server as share_srv  # noqa: E402
 
 app_mod.UPLOAD_DIR = Path(UPLOAD_DIR)
@@ -71,7 +72,7 @@ def _isolate(monkeypatch):
     monkeypatch.setattr(share_srv, "UPLOAD_DIR", up_dir)
     monkeypatch.setattr(app_mod, "AI_INTERNAL_TOKEN", "test-internal-token")
     share_store.set_owner_user_id("")
-    app_mod._auth_attempts.clear()
+    install_json_login_limits(monkeypatch)
     # 重置分享访问日志去重窗口
     share_srv._share_access_last.clear()
     for name in ("users.json", "shares.json", "users.json.bak", "shares.json.bak"):
@@ -90,13 +91,13 @@ def _isolate(monkeypatch):
 def _client():
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = True
-    return app_mod.app.test_client()
+    return csrf_client(app_mod.app.test_client())
 
 
 def _client_noauth():
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = False
-    return app_mod.app.test_client()
+    return csrf_client(app_mod.app.test_client())
 
 
 def _login(client, email, password):

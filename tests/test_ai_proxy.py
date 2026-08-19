@@ -44,6 +44,8 @@ except ImportError:
 import app as app_mod  # noqa: E402
 from _pt_helpers import csrf_client  # noqa: E402
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 PASS = 0
 FAIL = 0
 
@@ -53,9 +55,14 @@ def check(name, cond, detail=""):
     if cond:
         PASS += 1
         print("  ok  %s" % name)
-    else:
-        FAIL += 1
-        print("FAIL  %s  %s" % (name, detail))
+        return
+    FAIL += 1
+    print("FAIL  %s  %s" % (name, detail))
+    # pytest 收集运行时必须失败：计数式断言只看 PASS/FAIL 汇总，pytest 下
+    # 每个 test_* 都会「绿」，失败的检查会静默漏网（PYTEST_CURRENT_TEST 由
+    # pytest 在用例执行期间设置；脚本直跑模式保持原汇总行为）。
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        raise AssertionError("FAIL %s %s" % (name, detail))
 
 
 # =========================================================================== #
@@ -648,9 +655,14 @@ def test_official_run_injects_extra_tools_and_tool_token():
           "不可信" in (tool.get("description") or "")
           and "slide_summary" not in (tool.get("description") or ""),
           "got %r" % tool.get("description"))
-    check("parameters 来自 manifest（含 stain enum）",
-          "stain" in ((tool.get("parameters") or {}).get("properties") or {}),
-          "params=%r" % tool.get("parameters"))
+    # parameters 必须与 manifest 声明逐字一致（§9 锁死 extra_tools 形状；
+    # manifest 字段演进时本断言随之更新，不接受手写副本漂移）
+    mf = json.loads((REPO_ROOT / "plugins" / "sample-tma-score" / "manifest.json")
+                    .read_text(encoding="utf-8"))
+    mf_params = (mf.get("provides") or [{}])[0].get("parameters")
+    check("parameters 来自 manifest（原样透传）",
+          tool.get("parameters") == mf_params,
+          "params=%r manifest=%r" % (tool.get("parameters"), mf_params))
 
     # 注入了 extra_tools → 必须随附 standard-v1 + extra-tools:v1 信封
     # （sidecar fail-closed：缺信封/缺 feature 则整个 run 被 4xx 拒绝）

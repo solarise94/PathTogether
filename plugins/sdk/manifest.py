@@ -16,6 +16,7 @@ N/N-1 兼容策略：平台接受当前 major 与前一 major（current=1 时 0.
 平台在加载/启动前完成版本协商，不兼容则拒绝启动（``PluginVersionError``）。
 """
 import re
+from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
 # 版本常量（capabilities 端点的单一来源；app.py 复用）
@@ -351,6 +352,10 @@ def validate_manifest(d):
                     errors.append("ui.slots[%d] 需为非空字符串" % i)
 
     # ---- service ----
+    # baseUrl 的 http/https 约束只对**声明了 provides** 的 manifest 生效：
+    # 平台仅向提供能力（dispatch 会转发）的地址出站；纯 UI 插件（如
+    # sample-annotator）的 baseUrl 是同源占位（"/"），不作 out-of-band 请求。
+    _has_provides = isinstance(d.get("provides"), list) and bool(d.get("provides"))
     svc = d.get("service")
     if svc is None:
         errors.append("缺少必填字段：service")
@@ -360,6 +365,10 @@ def validate_manifest(d):
         base = svc.get("baseUrl")
         if not isinstance(base, str) or not base:
             errors.append("service.baseUrl 需为非空字符串")
+        elif _has_provides and urlparse(base).scheme not in ("http", "https"):
+            # 平台 dispatch 会向该地址发起出站请求：非 http(s)（file/gopher/
+            # 无 scheme 等）一律拒绝登记（D1 SSRF 收口的第一道闸）。
+            errors.append("service.baseUrl 仅允许 http/https 绝对地址，got %r" % base)
         health = svc.get("health")
         if not isinstance(health, str) or not health:
             errors.append("service.health 需为非空字符串")

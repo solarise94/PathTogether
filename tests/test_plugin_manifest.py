@@ -146,6 +146,26 @@ def test_validate_manifest_service_missing_field():
     assert errs and any("service.health" in e for e in errs), errs
 
 
+def test_validate_manifest_base_url_scheme_must_be_http():
+    """声明 provides 时 baseUrl 仅允许 http/https 绝对地址（D1：dispatch 出站）。"""
+    for bad in ("file:///etc/passwd", "gopher://x:70", "ftp://x/y",
+                "127.0.0.1:8061", "//x/capabilities", "/plugins/x"):
+        d = _valid_manifest(service={"baseUrl": bad, "health": "/healthz"})
+        d["provides"] = [_valid_capability()]
+        errs = M.validate_manifest(d)
+        assert errs and any("service.baseUrl" in e for e in errs), (bad, errs)
+    for ok in ("http://127.0.0.1:8061", "https://plugins.example.com/api"):
+        d = _valid_manifest(service={"baseUrl": ok, "health": "/healthz"})
+        d["provides"] = [_valid_capability()]
+        assert M.validate_manifest(d) == [], ok
+
+
+def test_validate_manifest_base_url_loose_without_provides():
+    """纯 UI 插件（无 provides）不出站：baseUrl 同源占位（"/"）不受 scheme 约束。"""
+    d = _valid_manifest(service={"baseUrl": "/", "health": "/healthz"})
+    assert M.validate_manifest(d) == []
+
+
 def test_validate_manifest_top_level_must_be_object():
     errs = M.validate_manifest(["not", "an", "object"])
     assert errs and any("顶层" in e for e in errs), errs

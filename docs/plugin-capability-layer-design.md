@@ -179,7 +179,11 @@ Resp:    200 { "result": <json> } | 4xx/5xx 统一错误信封（§7.7）
 4. **限流**：Stage 4-2 现有闸（`app.py:3733-3836`）的维度是 per-installation 滑窗
    像素预算/token bucket + 进程级并发信号量，**没有** session 维度；dispatch 需新增
    `(session, capability)` 维度计数器（复用 `_SlidingPixelWindow`/token bucket 原语
-   即可，判定逻辑是新代码）；超限 429 + Retry-After。
+   即可，判定逻辑是新代码）；超限 429 + Retry-After。限流键的 session 取
+   **token claims 内的 `session_id`**（为空串时回退同在签名内的 `jti`，即一次
+   run 一个桶）——`X-AI-Session` 头由调用方可随意改写，不能作为限流维度
+   （2026-08-19 评审修复：起跑 token 的 session 恒为空串，continue/ask/branch
+   的 session 也由 sidecar 接受请求时才解析/新建，prepare 阶段不可预知）。
 5. **审计**：每次调用写 audit event `plugin_capability_dispatch`
   （主体/session/plugin/capability/slide/耗时/结果码），基建沿用
   `tests/test_audit_events.py` 那套。

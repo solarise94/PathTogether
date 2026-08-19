@@ -3975,12 +3975,15 @@ _PLUGIN_RATE_LIMITER = _PluginRateLimiter(_PLUGIN_RATE_LIMIT_PER_MIN)
 # --------------------------------------------------------------------------- #
 # 插件能力层 P1：dispatch 通道常量（docs §4.2）
 #
-# 限流维度是 **(session, capability)** 计数器（token bucket，复用
+# 限流维度是 **(token session, capability)** 计数器（token bucket，复用
 # _PluginRateLimiter 原语；判定逻辑是新代码）——Stage 4-2 现有闸是
 # per-installation 维度，没有 session 维度。速率默认沿用
 # PLUGIN_RATE_LIMIT_PER_MIN 量级（demo 单实例），env 可独立覆盖。
+# session 取 **token claims 内的 session_id**（起跑 token 为空串时回退同在
+# 签名内的 jti，即一次 run 一个桶）：X-AI-Session 头由调用方可控，拿走
+# token 后轮换头即可绕过 header 维度限流，不能作为限流键。
 # --------------------------------------------------------------------------- #
-#: dispatch 每 (session, capability) 每分钟调用上限（默认与插件通道同量级）
+#: dispatch 每 (token session, capability) 每分钟调用上限（默认与插件通道同量级）
 _PLUGIN_DISPATCH_RATE_LIMIT_PER_MIN = int(
     os.environ.get("PLUGIN_DISPATCH_RATE_LIMIT_PER_MIN")
     or _PLUGIN_RATE_LIMIT_PER_MIN)
@@ -4615,9 +4618,13 @@ def _list_agent_capabilities(user_ctx, slide):
 def _inject_agent_extra_tools(user_ctx, slide, config):
     """起跑时注入 extra_tools + tool_token（无可用能力时不写入任何键）。
 
-    token claims（docs §5.1）：typ=agent-tool、session_id（起跑时未定 → 空串，
-    与 run grant 同语义）、user_id/role、slide、capabilities=[全名列表]、
-    exp=会话 TTL + 10 分钟。extra_tools 形状见 docs §5.1 jsonc。
+    token claims（docs §5.1）：typ=agent-tool、session_id（恒为空串——run
+    起跑时 session 未创建；continue/ask/branch 的 session 也由 sidecar 在
+    接受请求时才解析/新建（continueMain/askFork/askBranch），prepare 阶段
+    不可预知，预绑错误 id 只会让合法调报 session_mismatch。限流因此不依赖
+    该维度可伪造的头，见 dispatch 第 ④ 步：token session 为空时回退 jti）、
+    user_id/role、slide、capabilities=[全名列表]、exp=会话 TTL + 10 分钟。
+    extra_tools 形状见 docs §5.1 jsonc。
 
     返回 True 表示已注入（调用方须随附 AGENT_EXTRA_TOOLS_ENVELOPE——sidecar
     fail-closed：config 携带 extra_tools 而信封未声明 extra-tools:v1 时整个
@@ -7054,6 +7061,7 @@ def plugin_v1_dispatch(plugin_id, capability_name):
             "user_id": claims.get("user_id") or claims.get("sub") or "",
             "role": claims.get("role") or "",
             "session_id": session_id,
+            "token_jti": str(claims.get("jti") or ""),
             "plugin_id": plugin_id,
             "capability": capability_name,
             "slide": slide,
@@ -7088,13 +7096,19 @@ def plugin_v1_dispatch(plugin_id, capability_name):
             403, "permission_denied",
             "发起用户不满足能力所需权限（需 %s）" % ", ".join(required))
 
-    # ---- ④ 限流：(session, capability) 维度 token bucket ---- #
+    # ---- ④ 限流：(token session, capability) 维度 token bucket ---- #
+    # 限流键取签名 claims：token 绑定了 session 用 session，否则用 jti（一次
+    # run 的全部调用共享同一 token → 同一桶）。X-AI-Session 头由调用方可随意
+    # 改写，绝不能作为限流维度（否则拿走 token 后轮换头即可无限绕过 §4.2
+    # 第 4 步的 (session, capability) 限额）。
+    rate_session = str(claims.get("session_id") or "").strip() or \
+        "jti:%s" % (claims.get("jti") or "")
     ok, retry_after = _DISPATCH_RATE_LIMITER.consume(
-        "%s|%s" % (session_id, full_name), weight=1)
+        "%s|%s" % (rate_session, full_name), weight=1)
     if not ok:
         _audit_dispatch(429, "rate_limited", (time.time() - started) * 1000)
         return _plugin_rate_limited_response(
-            "dispatch 调用超出每分钟限额（维度 session+capability）", retry_after,
+            "dispatch 调用超出每分钟限额（维度 token 会话+能力）", retry_after,
             details={"reason": "dispatch_session_capability",
                      "capability": full_name})
 
@@ -7105,6 +7119,15 @@ def plugin_v1_dispatch(plugin_id, capability_name):
                         (time.time() - started) * 1000)
         return _plugin_error(503, "capability_unavailable",
                              "插件未配置服务地址，能力不可用")
+    if urlparse(base_url).scheme not in ("http", "https"):
+        # 登记侧已拒绝非 http(s)（validate_manifest）；此为对历史登记行的
+        # 运行时兜底：绝不向任意 scheme 的地址发起请求（D1 SSRF 收口）。
+        _audit_dispatch(503, "capability_unavailable",
+                        (time.time() - started) * 1000,
+                        extra={"reason": "invalid_base_url"})
+        return _plugin_error(503, "capability_unavailable",
+                             "插件服务地址协议不受支持，能力不可用",
+                             details={"reason": "invalid_base_url"})
     principal = json.dumps({
         "type": "agent",
         "user_id": claims.get("user_id") or claims.get("sub") or "",
@@ -7114,11 +7137,15 @@ def plugin_v1_dispatch(plugin_id, capability_name):
     forward_body = {"slide": slide, "arguments": body.get("arguments") or {}}
     timeout_sec = _capability_timeout_ms(cap) / 1000.0
     try:
+        # 安装时批准的是登记的 baseUrl；30x 目标未经批准——禁止跟随重定向
+        #（requests 默认 allow_redirects=True，插件后端可借此把平台出站
+        # 引到内网/元数据端点，扩大 D1/§6.4 想收口的 SSRF 面）。
         r = requests.post(
             "%s/capabilities/%s" % (base_url, capability_name),
             json=forward_body,
             headers={"X-Dispatch-Principal": principal},
-            timeout=timeout_sec)
+            timeout=timeout_sec,
+            allow_redirects=False)
     except (requests.ConnectionError, requests.Timeout):
         _audit_dispatch(503, "capability_unavailable",
                         (time.time() - started) * 1000,
@@ -7132,6 +7159,14 @@ def plugin_v1_dispatch(plugin_id, capability_name):
         return _plugin_error(503, "capability_unavailable",
                              "转发插件后端失败")
 
+    if 300 <= r.status_code < 400:
+        # 插件后端 30x：转发已禁止跟随，这里显式拒绝（而非落入非 JSON 分支）
+        _audit_dispatch(r.status_code, "capability_unavailable",
+                        (time.time() - started) * 1000,
+                        extra={"reason": "plugin_redirect"})
+        return _plugin_error(503, "capability_unavailable",
+                             "插件后端返回重定向（%d），能力不可用" % r.status_code,
+                             details={"reason": "plugin_redirect"})
     if r.status_code >= 500:
         _audit_dispatch(r.status_code, "capability_unavailable",
                         (time.time() - started) * 1000,

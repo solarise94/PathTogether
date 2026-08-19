@@ -9,7 +9,9 @@
   - 启用检查：插件停用 404、能力不存在 404（不泄露存在性）；
   - 权限：发起用户（claims role/user_id）不满足 requiredPermissions →
     403 permission_denied（§6.1 用户权限映射）；
-  - 限流：(session, capability) 维度 token bucket 超限 429 + Retry-After；
+  - 限流：(token session, capability) 维度 token bucket 超限 429 + Retry-After；
+    限流键在签名 claims 内（session 为空回退 jti），轮换 X-AI-Session 头不能
+    绕过；同 session 的多个 token 共享同一桶；
   - 转发：X-Dispatch-Principal 头（主体类型/id/session）、body.slide/arguments；
     插件 5xx / 超时 / 不可达 → 503 capability_unavailable（retryable）；
   - 截断：result 超 64KB → truncated: true；
@@ -298,22 +300,49 @@ def test_dispatch_owner_principal_passes_permission():
 
 
 # --------------------------------------------------------------------------- #
-# 4. 限流（④：(session, capability) 维度）
+# 4. 限流（④：(token session, capability) 维度，session 空时回退 jti）
 # --------------------------------------------------------------------------- #
 def test_dispatch_rate_limited_429(monkeypatch):
     _install_tma()
     monkeypatch.setattr(app_mod, "_DISPATCH_RATE_LIMITER",
                         app_mod._PluginRateLimiter(1))
     client = _client()
-    r1 = _dispatch(client, _tool_token())
+    token = _tool_token()
+    r1 = _dispatch(client, token)
     assert r1.status_code == 200, r1.get_json()
-    r2 = _dispatch(client, _tool_token())
+    r2 = _dispatch(client, token)
     err = _assert_envelope(r2, 429, "rate_limited", retryable=True)
     assert "Retry-After" in r2.headers
     assert err["details"]["capability"] == FULL_NAME
-    # 维度是 (session, capability)：换 session 不受限流影响
-    r3 = _dispatch(client, _tool_token(), session_id="sess-2")
-    assert r3.status_code == 200, r3.get_json()
+    # 限流键在签名 token 内（此处为 jti）：轮换 X-AI-Session 头不能绕过
+    r3 = _dispatch(client, token, session_id="sess-rotated-1")
+    _assert_envelope(r3, 429, "rate_limited", retryable=True)
+    r4 = _dispatch(client, token, session_id="sess-rotated-2")
+    _assert_envelope(r4, 429, "rate_limited", retryable=True)
+
+
+def test_dispatch_rate_limit_keyed_by_token_not_header(monkeypatch):
+    """起跑 token（session 空串）按 jti 限流：不同 token 各自一桶。"""
+    _install_tma()
+    monkeypatch.setattr(app_mod, "_DISPATCH_RATE_LIMITER",
+                        app_mod._PluginRateLimiter(1))
+    client = _client()
+    r1 = _dispatch(client, _tool_token())
+    assert r1.status_code == 200, r1.get_json()
+    r2 = _dispatch(client, _tool_token())  # 新 token → 新 jti → 新桶
+    assert r2.status_code == 200, r2.get_json()
+
+
+def test_dispatch_rate_limit_shared_across_tokens_of_same_session(monkeypatch):
+    """token 绑定 session 时按 session 维度：同 session 的新 token 也限流。"""
+    _install_tma()
+    monkeypatch.setattr(app_mod, "_DISPATCH_RATE_LIMITER",
+                        app_mod._PluginRateLimiter(1))
+    client = _client()
+    r1 = _dispatch(client, _tool_token(session_id="sess-1"), session_id="sess-1")
+    assert r1.status_code == 200, r1.get_json()
+    r2 = _dispatch(client, _tool_token(session_id="sess-1"), session_id="sess-1")
+    _assert_envelope(r2, 429, "rate_limited", retryable=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -370,6 +399,33 @@ def test_dispatch_plugin_4xx_passthrough_envelope():
     _assert_envelope(r, 400, "invalid_request", retryable=False)
 
 
+def test_dispatch_plugin_redirect_rejected_503():
+    """插件 30x 不跟随：转发显式 allow_redirects=False，3xx → 503。"""
+    _install_tma()
+    app_mod.requests.handler = lambda *a: _Resp(
+        302, {}, )
+    client = _client()
+    r = _dispatch(client, _tool_token())
+    _assert_envelope(r, 503, "capability_unavailable", retryable=True)
+    # 只有一次转发调用（没有跟随到 Location 目标）
+    assert len(app_mod.requests.calls) == 1
+    events = share_store.list_audit(action="plugin_capability_dispatch")
+    assert events and events[0]["detail"].get("reason") == "plugin_redirect"
+
+
+def test_dispatch_non_http_base_url_rejected_503():
+    """历史登记行带非 http(s) base_url → 运行时兜底拒绝（不发请求）。"""
+    installation = _install_tma()
+    caps = [dict(c) for c in installation["capabilities"]]
+    caps[0]["base_url"] = "file:///etc/passwd"
+    share_store.set_installation_capabilities(installation["installation_id"], caps)
+    client = _client()
+    r = _dispatch(client, _tool_token())
+    err = _assert_envelope(r, 503, "capability_unavailable", retryable=True)
+    assert err.get("details", {}).get("reason") == "invalid_base_url"
+    assert app_mod.requests.calls == []  # 从未出站
+
+
 def test_dispatch_result_truncated_over_64kb():
     _install_tma()
     big = "x" * (app_mod._PLUGIN_DISPATCH_RESULT_MAX_BYTES + 4096)
@@ -413,6 +469,7 @@ def test_dispatch_audit_event_recorded():
     assert ev["slide"] == "demo.svs"
     d = ev["detail"]
     assert d["session_id"] == "sess-aud"
+    assert d["token_jti"]  # 限流/追踪维度：token jti 落审计
     assert d["plugin_id"] == "dev.sample.tma"
     assert d["capability"] == "slide_summary"
     assert d["status"] == 200 and d["code"] == "ok"

@@ -1,0 +1,40 @@
+{
+  "manifestSchemaVersion": "1.1.0",
+  "id": "dev.sample.tma",
+  "name": "Sample TMA Score",
+  "pluginVersion": "0.1.0",
+  "pluginContractVersion": "1.1.0",
+  "bridgeProtocolVersion": "1.0.0",
+  "ui": {
+    "entry": "/plugins/sample-tma-score/ui/main.js",
+    "slots": ["viewer.right-panel"]
+  },
+  "service": {
+    "baseUrl": "http://127.0.0.1:8061",
+    "health": "/healthz"
+  },
+  "permissions": [
+    "slide:metadata:read",
+    "annotation:read"
+  ],
+  "provides": [
+    {
+      "name": "slide_summary",
+      "version": "1.0.0",
+      "description": "汇总当前数字切片的基础信息：切片尺寸（宽高像素）、扫描分辨率 mpp 与标注数量，帮助在细读前快速了解切片概况。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "include_mpp": {
+            "type": "boolean",
+            "description": "是否在摘要中包含扫描分辨率 mpp（缺省包含）"
+          }
+        },
+        "required": []
+      },
+      "accessMode": "read",
+      "requiredPermissions": ["slide:metadata:read", "annotation:read"],
+      "timeout_ms": 15000
+    }
+  ]
+}

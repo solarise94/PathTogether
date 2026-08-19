@@ -33,6 +33,7 @@ import app as app_mod  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SAMPLE_MANIFEST = REPO_ROOT / "plugins" / "sample-annotator" / "manifest.json"
+TMA_MANIFEST = REPO_ROOT / "plugins" / "sample-tma-score" / "manifest.json"
 
 
 def _sha256(path):
@@ -79,8 +80,14 @@ def test_sample_manifest_validates_and_policy_pin_matches():
     data = json.loads(SAMPLE_MANIFEST.read_text(encoding="utf-8"))
     assert M.validate_manifest(data) == []
     policy = json.loads((REPO_ROOT / "plugins" / "source-policy.json").read_text(encoding="utf-8"))
-    assert set(policy) == {"sample-annotator"}
+    # 防漂移守卫：两个内置示例插件的 manifest sha256 pin 均须与磁盘一致
+    assert set(policy) == {"sample-annotator", "sample-tma-score"}
     assert policy["sample-annotator"] == _sha256(SAMPLE_MANIFEST)
+    assert policy["sample-tma-score"] == _sha256(TMA_MANIFEST)
+    # sample-tma-score 的 provides 声明须通过校验器（能力注册表登记前置）
+    tma = json.loads(TMA_MANIFEST.read_text(encoding="utf-8"))
+    assert M.validate_manifest(tma) == []
+    assert [c["name"] for c in tma["provides"]] == ["slide_summary"]
 
 
 def test_histopilot_is_absent_by_default():

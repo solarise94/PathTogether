@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://pathtogather.dev/plugin/manifest.schema.json",
   "title": "Plugin Manifest",
-  "description": "HistoPilot 通用插件 manifest（docs §7.1）。四个版本字段相互独立：manifestSchemaVersion（manifest 文件结构）/ pluginContractVersion（capability API、领域类型、错误码）/ bridgeProtocolVersion（HostBridge 消息协议）/ pluginVersion（产品/镜像版本）。platforms/sdk/manifest.py 提供纯 stdlib 校验器（不依赖 jsonschema），本 schema 作为权威定义与工具链（IDE / 外部校验）参考。",
+  "description": "HistoPilot 通用插件 manifest（docs §7.1）。四个版本字段相互独立：manifestSchemaVersion（manifest 文件结构）/ pluginContractVersion（capability API、领域类型、错误码）/ bridgeProtocolVersion（HostBridge 消息协议）/ pluginVersion（产品/镜像版本）。plugins/sdk/manifest.py 提供纯 stdlib 校验器（不依赖 jsonschema），本 schema 作为权威定义与工具链（IDE / 外部校验）参考。",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -83,7 +83,7 @@
       }
     },
     "permissions": {
-      "description": "插件声明的能力权限枚举（与 capabilities 列表对齐）。未知值校验失败。",
+      "description": "插件向平台申请的权限枚举（5 项）。前 4 项（slide:metadata:read / slide:region:read / annotation:read / annotation:write）对应平台 plugin v1 服务端能力端点；viewer:navigate 是浏览器 UI 侧导航权限（HostBridge viewer.navigate / selection.getBbox），无服务端端点。平台 capabilities 公告（/api/plugin/v1/capabilities）在此基础上另有 events:read / audit:write 两项，属平台侧扩展公告，不在 manifest 申请枚举内。未知值校验失败。",
       "type": "array",
       "items": {
         "enum": [
@@ -93,6 +93,59 @@
           "annotation:write",
           "viewer:navigate"
         ]
+      }
+    },
+    "provides": {
+      "description": "插件对外提供的服务端能力声明（docs §3，可选；不声明则完全不受影响）。每项经平台登记进能力注册表，由平台 dispatch 端点统一转发。accessMode 枚举含 write，但 P1 校验层（plugins/sdk/manifest.py）拒绝 write——先放行只读链路；requiredPermissions 是调用方主体必须持有的权限（枚举收窄为 4 项服务端权限，不含 viewer:navigate）。description 直接进 LLM 上下文（8~500 字，安装审核人工过目）。timeout_ms 可选（1~60000，缺省 15000）。",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "version", "description", "parameters", "accessMode"],
+        "properties": {
+          "name": {
+            "description": "能力局部名（插件内唯一）。全局名 = {pluginId}/{name}；注入 agent 的工具名 = {pluginId 去域名点下划线连接}__{name}。",
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}$"
+          },
+          "version": {
+            "description": "能力自身版本（仅用于审计与兼容声明，不参与版本协商）。",
+            "type": "string",
+            "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)$"
+          },
+          "description": {
+            "description": "给 LLM 看的能力用途说明（必须写清用途与副作用；平台登记时拼接固定不信任后缀）。",
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 500
+          },
+          "parameters": {
+            "description": "能力参数 JSON Schema（draft 2020-12 子集：type/properties/required/enum/minimum/maximum/items/description，注册表拒绝超集）。",
+            "type": "object"
+          },
+          "accessMode": {
+            "description": "读写性。P1 校验层仅放行 read（write 拒绝登记）。",
+            "enum": ["read", "write"]
+          },
+          "requiredPermissions": {
+            "description": "调用方主体必须持有的权限（插件 permissions 枚举的服务端子集）。",
+            "type": "array",
+            "items": {
+              "enum": [
+                "slide:metadata:read",
+                "slide:region:read",
+                "annotation:read",
+                "annotation:write"
+              ]
+            }
+          },
+          "timeout_ms": {
+            "description": "插件端点转发超时（毫秒，可选；1~60000，缺省 15000）。",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 60000
+          }
+        }
       }
     }
   }

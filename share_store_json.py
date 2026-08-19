@@ -2063,20 +2063,28 @@ def _hash_installation_secret(secret: str) -> str:
 
 
 def _installation_out(row: dict) -> dict:
-    """installation 导出副本：剥离 secret_hash（hash 不出存储层）。"""
+    """installation 导出副本：剥离 secret_hash（hash 不出存储层）。
+
+    capabilities（插件能力注册表，docs §4.1）缺省补 []——旧安装行没有该字段，
+    读侧一律拿到 list（兼容 0011 迁移前的旧行）。
+    """
     out = dict(row)
     out.pop("secret_hash", None)
     out["enabled"] = bool(row.get("enabled"))
+    caps = out.get("capabilities")
+    out["capabilities"] = [c for c in caps if isinstance(c, dict)] if isinstance(caps, list) else []
     return out
 
 
-def create_plugin_installation(plugin_id, version="", secret=None):
+def create_plugin_installation(plugin_id, version="", secret=None,
+                               capabilities=None):
     """创建插件安装行，返回 {**installation, "secret": 明文}（仅此一次）。
 
     plugin_id 必填（如 "histopilot"）；version 缺省空串；secret 可显式传入
-    （env 引导用），否则生成 "pin_" + 32 字节 urlsafe。installation_id 形如
-    pin_<12 字节 urlsafe>。同 plugin_id 允许多行（不做唯一约束，引导逻辑
-    由 app.py 保证单实例 demo 只有一行）。
+    （env 引导用），否则生成 "pin_" + 32 字节 urlsafe；capabilities 为可选的
+    能力注册表登记项（安装时解析 manifest.provides 而来，docs §4.1；缺省 []）。
+    installation_id 形如 pin_<12 字节 urlsafe>。同 plugin_id 允许多行（不做
+    唯一约束，引导逻辑由 app.py 保证单实例 demo 只有一行）。
     """
     if not isinstance(plugin_id, str) or not plugin_id.strip():
         raise ValueError("plugin_id 不能为空")
@@ -2092,6 +2100,8 @@ def create_plugin_installation(plugin_id, version="", secret=None):
         "secret_hash": _hash_installation_secret(plaintext),
         "created_at": now,
         "disabled_at": None,
+        "capabilities": [dict(c) for c in capabilities]
+        if isinstance(capabilities, list) else [],
     }
 
     def _do(f):
@@ -2189,6 +2199,26 @@ def list_plugin_installations():
         rows = [r for r in data["plugin_installations"] if isinstance(r, dict)]
         rows.sort(key=lambda r: r.get("created_at") or 0)
         return [_installation_out(r) for r in rows]
+
+    return _with_lock("r+", _do)
+
+
+def set_installation_capabilities(installation_id, capabilities):
+    """整体替换安装行的能力注册表（docs §4.1：安装/启用时解析 provides 登记）。
+
+    capabilities 为能力登记项数组（空数组 = 清空登记，如 manifest 不再声明
+    provides）。返回更新后的安装行（不含 hash）；不存在返回 None。
+    """
+    caps = [dict(c) for c in capabilities] if isinstance(capabilities, list) else []
+
+    def _do(f):
+        data = _load_locked(f)
+        for row in data["plugin_installations"]:
+            if row.get("installation_id") == installation_id:
+                row["capabilities"] = caps
+                _save_locked(f, data)
+                return _installation_out(row)
+        return None
 
     return _with_lock("r+", _do)
 

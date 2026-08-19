@@ -127,6 +127,8 @@ _JSON_PUBLIC_NAMES = (
     "verify_installation_secret",
     "set_installation_enabled",
     "list_plugin_installations",
+    # —— 插件能力层 P1：能力注册表登记（docs §4.1）——
+    "set_installation_capabilities",
     "create_run_grant",
     "get_run_grant",
     "revoke_run_grant",
@@ -220,9 +222,11 @@ _WRITE_NAMES = {
     "review_roi", "add_comment", "delete_comment", "resolve_comment",
     # Stage 3c-2：审计写 / 归档开关
     "record_audit", "set_project_archived",
-    # Stage 4-1a：插件安装凭证 / run grant 写操作
+    # Stage 4-1a：插件安装 / run grant 写操作
     "create_plugin_installation", "rotate_installation_secret",
     "set_installation_enabled",
+    # 插件能力层 P1：能力注册表登记（result-replay，按返回行镜像 capabilities）
+    "set_installation_capabilities",
     "create_run_grant", "revoke_run_grant",
 }
 
@@ -260,6 +264,8 @@ _DUAL_MIRRORS = {
     "create_plugin_installation": "_mirror_plugin_installation",
     "rotate_installation_secret": "_mirror_plugin_installation",
     "set_installation_enabled": "_mirror_plugin_installation",
+    # 插件能力层 P1：能力登记（返回行含 capabilities，同一镜像函数整体回放）
+    "set_installation_capabilities": "_mirror_plugin_installation",
     "create_run_grant": "_mirror_run_grant",
     "revoke_run_grant": "_mirror_run_grant_revoke",
 }

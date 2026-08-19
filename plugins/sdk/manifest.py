@@ -2,8 +2,9 @@
 """Plugin manifest schema 校验器与版本协商（Stage 5-1，docs §7.0/§7.1）。
 
 纯 stdlib 实现（**不引入 jsonschema 依赖**）：手写最小校验覆盖必填/类型/
-semver pattern/permissions 枚举/slots 字符串。供平台 app.py（capabilities
-端点 + 加载期协商）与示例插件共用，权威字段定义见 ``plugins/manifest.schema.json``。
+semver pattern/permissions 枚举/slots 字符串/provides 能力契约（docs §3）。
+供平台 app.py（capabilities 端点 + 加载期协商 + 能力注册表）与示例插件共用，
+权威字段定义见 ``plugins/manifest.schema.json``。
 
 版本模型（§7.0）：四个版本字段相互独立，禁止共用一个模糊 ``version`` 字段——
   - ``manifestSchemaVersion``：manifest 文件自身的字段结构（语法不兼容 bump major）；
@@ -43,6 +44,42 @@ MANIFEST_PERMISSIONS = (
 # semver core：major.minor.patch（不带 prerelease/build，保持 parse 简单；与
 # manifest.schema.json 的 pattern 一致）。
 _SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+
+# ---------------------------------------------------------------------------
+# provides 契约常量（插件能力层 docs §3）
+# ---------------------------------------------------------------------------
+# 能力局部名：小写字母开头，后接小写字母/数字/下划线，总长 2~64。
+CAPABILITY_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+
+# 能力 accessMode 枚举（schema 层）；P1 校验层只放行 read（write 拒绝登记，
+# 先跑稳只读链路——docs §6.2）。
+CAPABILITY_ACCESS_MODES = ("read", "write")
+CAPABILITY_P1_ACCESS_MODES = ("read",)
+
+# requiredPermissions 枚举（有意收窄）：5 项 manifest permissions 中去掉
+# viewer:navigate——那是浏览器 UI 侧导航权限，服务端能力无消费场景。
+CAPABILITY_REQUIRED_PERMISSIONS = (
+    "slide:metadata:read",
+    "slide:region:read",
+    "annotation:read",
+    "annotation:write",
+)
+
+# capability description 长度界（给 LLM 看的安全面，docs §3.2）。
+CAPABILITY_DESCRIPTION_MIN = 8
+CAPABILITY_DESCRIPTION_MAX = 500
+
+# capability 转发超时（毫秒）：缺省 15s，manifest 可声明但不超过 60s。
+CAPABILITY_DEFAULT_TIMEOUT_MS = 15000
+CAPABILITY_MAX_TIMEOUT_MS = 60000
+
+# parameters 允许的 JSON Schema 子集键（与 sidecar TypeBox 校验兼容的公共
+# 子集；注册表用同源逻辑拒绝超集，docs §3.2）。
+_CAPABILITY_PARAM_KEYS = frozenset(
+    ("type", "properties", "required", "enum", "minimum", "maximum",
+     "items", "description"))
+_CAPABILITY_PARAM_TYPES = frozenset(
+    ("object", "array", "string", "number", "integer", "boolean", "null"))
 
 
 class PluginVersionError(Exception):
@@ -100,6 +137,163 @@ def check_manifest_schema_supported(mv):
     except (ValueError, TypeError):
         return False
     return major == MANIFEST_SCHEMA_MAJOR or major == MANIFEST_SCHEMA_MAJOR - 1
+
+
+def _validate_capability_parameters(node, path, errors):
+    """递归校验 parameters JSON Schema 子集（docs §3.2）。
+
+    只放行 ``type/properties/required/enum/minimum/maximum/items/description``
+    八个键；``type`` 限 TypeBox 兼容的七种基础类型。发现超集键/类型错/结构错
+    即向 ``errors`` 追加一条（含字段路径），不中断遍历。
+    """
+    if not isinstance(node, dict):
+        errors.append("%s 需为对象，got %s" % (path, type(node).__name__))
+        return
+    for key in node:
+        if key not in _CAPABILITY_PARAM_KEYS:
+            errors.append("%s.%s 不在 parameters 允许子集内（允许：%s）"
+                          % (path, key, ", ".join(sorted(_CAPABILITY_PARAM_KEYS))))
+    t = node.get("type")
+    if t is not None:
+        if t not in _CAPABILITY_PARAM_TYPES:
+            errors.append("%s.type=%r 不在允许类型中（允许：%s）"
+                          % (path, t, ", ".join(sorted(_CAPABILITY_PARAM_TYPES))))
+    props = node.get("properties")
+    if props is not None:
+        if not isinstance(props, dict):
+            errors.append("%s.properties 需为对象" % path)
+        else:
+            for pname, sub in props.items():
+                _validate_capability_parameters(
+                    sub, "%s.properties.%s" % (path, pname), errors)
+    req = node.get("required")
+    if req is not None:
+        if (not isinstance(req, list)
+                or not all(isinstance(r, str) for r in req)):
+            errors.append("%s.required 需为字符串数组" % path)
+        elif isinstance(props, dict):
+            for r in req:
+                if r not in props:
+                    errors.append("%s.required[%r] 未在 properties 中声明" % (path, r))
+    enum = node.get("enum")
+    if enum is not None:
+        if not isinstance(enum, list) or not enum:
+            errors.append("%s.enum 需为非空数组" % path)
+    for num_key in ("minimum", "maximum"):
+        v = node.get(num_key)
+        if v is not None and not isinstance(v, (int, float)):
+            errors.append("%s.%s 需为数值" % (path, num_key))
+    items = node.get("items")
+    if items is not None:
+        _validate_capability_parameters(items, "%s.items" % path, errors)
+    desc = node.get("description")
+    if desc is not None and not isinstance(desc, str):
+        errors.append("%s.description 需为字符串" % path)
+
+
+def validate_provides(d):
+    """校验 manifest 的可选 ``provides`` 数组（docs §3.1/§3.2），返回错误列表。
+
+    规则（P1）：
+      - 不声明 ``provides`` → 空列表（老插件零迁移）；
+      - 每项必填 ``name/version/description/parameters/accessMode``，
+        可选 ``requiredPermissions/timeout_ms``，其余键拒绝；
+      - name 匹配 ``^[a-z][a-z0-9_]{1,63}$``，同 manifest 内重名拒绝；
+      - version 为 semver core；description 8~500 字；
+      - parameters 限 JSON Schema 子集（``_validate_capability_parameters``）；
+      - accessMode 仅放行 ``read``（``write`` 校验层拒绝，docs §6.2）；
+      - requiredPermissions 枚举不含 ``viewer:navigate``；
+      - timeout_ms 为 1~60000 的整数（缺省 15000 由消费方补）。
+    """
+    errors = []
+    provides = d.get("provides")
+    if provides is None:
+        return errors  # 可选字段：未声明完全不受影响
+    if not isinstance(provides, list):
+        return ["provides 需为数组，got %s" % type(provides).__name__]
+    seen_names = set()
+    for i, item in enumerate(provides):
+        path = "provides[%d]" % i
+        if not isinstance(item, dict):
+            errors.append("%s 需为对象，got %s" % (path, type(item).__name__))
+            continue
+        for key in ("name", "version", "description", "parameters", "accessMode"):
+            if item.get(key) is None:
+                errors.append("缺少必填字段：%s.%s" % (path, key))
+        for key in item:
+            if key not in ("name", "version", "description", "parameters",
+                           "accessMode", "requiredPermissions", "timeout_ms"):
+                errors.append("%s.%s 不在 provides 允许字段内" % (path, key))
+        name = item.get("name")
+        if isinstance(name, str):
+            if not CAPABILITY_NAME_RE.match(name):
+                errors.append(
+                    "%s.name=%r 不匹配 ^[a-z][a-z0-9_]{1,63}$" % (path, name))
+            elif name in seen_names:
+                errors.append("%s.name=%r 与同 manifest 内其他能力重名"
+                              % (path, name))
+            else:
+                seen_names.add(name)
+        elif name is not None:
+            errors.append("%s.name 需为字符串" % path)
+        version = item.get("version")
+        if isinstance(version, str):
+            try:
+                parse_semver(version)
+            except ValueError as e:
+                errors.append("%s.version：%s" % (path, e))
+        elif version is not None:
+            errors.append("%s.version 需为字符串" % path)
+        desc = item.get("description")
+        if isinstance(desc, str):
+            if not (CAPABILITY_DESCRIPTION_MIN <= len(desc) <= CAPABILITY_DESCRIPTION_MAX):
+                errors.append("%s.description 长度需在 %d~%d 字之间（当前 %d）"
+                              % (path, CAPABILITY_DESCRIPTION_MIN,
+                                 CAPABILITY_DESCRIPTION_MAX, len(desc)))
+        elif desc is not None:
+            errors.append("%s.description 需为字符串" % path)
+        params = item.get("parameters")
+        if params is not None:
+            _validate_capability_parameters(params, "%s.parameters" % path, errors)
+        access = item.get("accessMode")
+        if access is not None:
+            if access not in CAPABILITY_ACCESS_MODES:
+                errors.append("%s.accessMode=%r 不在枚举中（允许：%s）"
+                              % (path, access, ", ".join(CAPABILITY_ACCESS_MODES)))
+            elif access not in CAPABILITY_P1_ACCESS_MODES:
+                errors.append("%s.accessMode=%r P1 仅放行 read（write 属 P2）"
+                              % (path, access))
+        elif access is None and "accessMode" in item:
+            errors.append("%s.accessMode 需为字符串" % path)
+        perms = item.get("requiredPermissions")
+        if perms is not None:
+            if not isinstance(perms, list):
+                errors.append("%s.requiredPermissions 需为数组" % path)
+            else:
+                for j, p in enumerate(perms):
+                    if not isinstance(p, str):
+                        errors.append("%s.requiredPermissions[%d] 需为字符串" % (path, j))
+                    elif p not in CAPABILITY_REQUIRED_PERMISSIONS:
+                        errors.append(
+                            "%s.requiredPermissions[%d]=%r 不在允许枚举中（允许：%s；"
+                            "viewer:navigate 是 UI 侧权限，不在列）"
+                            % (path, j, p, ", ".join(CAPABILITY_REQUIRED_PERMISSIONS)))
+        timeout_ms = item.get("timeout_ms")
+        if timeout_ms is not None:
+            if (not isinstance(timeout_ms, int) or isinstance(timeout_ms, bool)
+                    or not (1 <= timeout_ms <= CAPABILITY_MAX_TIMEOUT_MS)):
+                errors.append("%s.timeout_ms 需为 1~%d 的整数"
+                              % (path, CAPABILITY_MAX_TIMEOUT_MS))
+    return errors
+
+
+def capability_tool_name(plugin_id, name):
+    """注入 agent 的工具名：``{pluginId 去域名点下划线连接}__{name}``。
+
+    如 plugin_id="dev.example.tma"、name="score_core" →
+    ``dev_example_tma__score_core``（docs §3.2 命名空间；跨插件天然不冲突）。
+    """
+    return ("%s__%s" % ((plugin_id or "").replace(".", "_"), name))
 
 
 def validate_manifest(d):
@@ -183,6 +377,9 @@ def validate_manifest(d):
             elif p not in MANIFEST_PERMISSIONS:
                 errors.append("permissions[%d]=%r 不在允许枚举中（允许：%s）"
                               % (i, p, ", ".join(MANIFEST_PERMISSIONS)))
+
+    # ---- provides（可选：插件对外提供的服务端能力，docs §3）----
+    errors.extend(validate_provides(d))
 
     return errors
 

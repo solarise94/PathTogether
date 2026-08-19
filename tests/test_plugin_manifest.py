@@ -73,6 +73,32 @@ def _valid_manifest(**overrides):
     return base
 
 
+def _valid_capability(**overrides):
+    """合法 provides 条目（docs §3.1 schema 草案）。"""
+    base = {
+        "name": "score_core",
+        "version": "1.0.0",
+        "description": "计算 TMA 核心区域的着色评分，返回均值与分布摘要。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "core_count": {
+                    "type": "integer",
+                    "description": "参与评分的核心数",
+                    "minimum": 1,
+                    "maximum": 1000,
+                },
+                "stain": {"type": "string", "enum": ["hek", "ihc"]},
+            },
+            "required": ["core_count"],
+        },
+        "accessMode": "read",
+        "requiredPermissions": ["slide:metadata:read"],
+    }
+    base.update(overrides)
+    return base
+
+
 # --------------------------------------------------------------------------- #
 # 1. validate_manifest（结构校验）
 # --------------------------------------------------------------------------- #
@@ -214,6 +240,133 @@ def test_negotiate_returns_negotiated_version_echo():
     assert r["manifestSchemaVersion"] == "1.0.0"
     # 产品版本不影响协商结果字段，但可一并回显
     assert r["pluginVersion"] == "0.42.0"
+
+
+# --------------------------------------------------------------------------- #
+# 4.5 provides 契约校验（插件能力层 docs §3，P1）
+# --------------------------------------------------------------------------- #
+def test_provides_absent_is_fine():
+    """可选字段：不声明 provides 的老 manifest 完全不受影响（零迁移）。"""
+    assert M.validate_manifest(_valid_manifest()) == []
+
+
+def test_provides_valid_passes():
+    d = _valid_manifest(provides=[_valid_capability()])
+    assert M.validate_manifest(d) == []
+    assert M.validate_provides(d) == []
+
+
+def test_provides_write_access_mode_rejected():
+    """P1 校验层拒绝 write（docs §6.2：不是运行时过滤，是登记前拒绝）。"""
+    d = _valid_manifest(provides=[_valid_capability(accessMode="write")])
+    errs = M.validate_manifest(d)
+    assert errs and any("accessMode" in e and "write" in e for e in errs), errs
+
+
+def test_provides_unknown_access_mode_rejected():
+    d = _valid_manifest(provides=[_valid_capability(accessMode="admin")])
+    errs = M.validate_manifest(d)
+    assert errs and any("accessMode" in e for e in errs), errs
+
+
+def test_provides_parameter_superset_rejected():
+    """parameters 限 JSON Schema 子集：超集键（如 default/format）拒绝。"""
+    bad = _valid_capability()
+    bad["parameters"]["properties"]["core_count"]["default"] = 10
+    d = _valid_manifest(provides=[bad])
+    errs = M.validate_manifest(d)
+    assert errs and any("default" in e and "parameters" in e for e in errs), errs
+
+
+def test_provides_parameter_bad_type_and_required_keys():
+    bad = _valid_capability()
+    bad["parameters"]["properties"]["core_count"]["type"] = "function"
+    bad["parameters"]["required"] = ["not_declared"]
+    d = _valid_manifest(provides=[bad])
+    errs = M.validate_manifest(d)
+    assert errs and any("type=" in e for e in errs), errs
+    assert any("not_declared" in e for e in errs), errs
+
+
+def test_provides_duplicate_names_rejected():
+    """同 manifest 内能力重名拒绝（注册表层面 pluginId 内唯一，docs §3.2）。"""
+    d = _valid_manifest(provides=[
+        _valid_capability(name="score_core"),
+        _valid_capability(name="score_core", version="1.1.0"),
+    ])
+    errs = M.validate_manifest(d)
+    assert errs and any("重名" in e for e in errs), errs
+
+
+def test_provides_name_rule_enforced():
+    for bad_name in ("Score", "1score", "score-core", "s", "",
+                     "a" * 65, "score core"):
+        d = _valid_manifest(provides=[_valid_capability(name=bad_name)])
+        errs = M.validate_manifest(d)
+        assert errs and any(".name" in e for e in errs), "name=%r 应被拒绝" % bad_name
+    # 合法形态：小写开头 + [a-z0-9_]，长度 2~64
+    assert M.validate_manifest(
+        _valid_manifest(provides=[_valid_capability(name="a1")])) == []
+    assert M.validate_manifest(
+        _valid_manifest(provides=[_valid_capability(name="a" * 64)])) == []
+
+
+def test_provides_description_length_bounds():
+    for bad_desc in ("太短", "x" * 7, "y" * 501):
+        d = _valid_manifest(provides=[_valid_capability(description=bad_desc)])
+        errs = M.validate_manifest(d)
+        assert errs and any("description" in e for e in errs), "len=%d 应被拒绝" % len(bad_desc)
+    # 边界内合法：8 与 500
+    assert M.validate_manifest(
+        _valid_manifest(provides=[_valid_capability(description="z" * 8)])) == []
+    assert M.validate_manifest(
+        _valid_manifest(provides=[_valid_capability(description="z" * 500)])) == []
+
+
+def test_provides_required_permissions_enum_narrowed():
+    """requiredPermissions 不含 viewer:navigate（UI 侧权限无服务端消费场景）。"""
+    d = _valid_manifest(provides=[
+        _valid_capability(requiredPermissions=["viewer:navigate"])])
+    errs = M.validate_manifest(d)
+    assert errs and any("viewer:navigate" in e for e in errs), errs
+    # 4 项服务端权限均合法
+    for p in ("slide:metadata:read", "slide:region:read",
+              "annotation:read", "annotation:write"):
+        assert M.validate_manifest(
+            _valid_manifest(provides=[_valid_capability(requiredPermissions=[p])])) == []
+
+
+def test_provides_missing_required_field_and_unknown_field():
+    d = _valid_manifest(provides=[{"name": "score_core"}])  # 缺 version 等
+    errs = M.validate_manifest(d)
+    assert errs and any("缺少必填字段" in e for e in errs), errs
+    d2 = _valid_manifest(provides=[_valid_capability(unsupported=1)])
+    errs2 = M.validate_manifest(d2)
+    assert errs2 and any("unsupported" in e for e in errs2), errs2
+
+
+def test_provides_timeout_ms_bounds():
+    for bad in (0, -1, 60001, "15000", 1.5, True):
+        d = _valid_manifest(provides=[_valid_capability(timeout_ms=bad)])
+        errs = M.validate_manifest(d)
+        assert errs and any("timeout_ms" in e for e in errs), "timeout_ms=%r 应被拒绝" % bad
+    assert M.validate_manifest(
+        _valid_manifest(provides=[_valid_capability(timeout_ms=1)])) == []
+    assert M.validate_manifest(
+        _valid_manifest(provides=[_valid_capability(timeout_ms=60000)])) == []
+
+
+def test_provides_not_array_rejected():
+    errs = M.validate_manifest(_valid_manifest(provides={"name": "x"}))
+    assert errs and any("provides" in e for e in errs), errs
+
+
+def test_capability_tool_name_mangling():
+    """注入 agent 的工具名 = {pluginId 去域名点下划线连接}__{name}（§3.2）。"""
+    assert M.capability_tool_name("dev.example.tma", "score_core") == \
+        "dev_example_tma__score_core"
+    assert M.capability_tool_name("histopilot", "slide_summary") == \
+        "histopilot__slide_summary"
 
 
 # --------------------------------------------------------------------------- #

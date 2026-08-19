@@ -32,6 +32,7 @@
 
 import hashlib
 import hmac
+import json
 import secrets
 import time
 import uuid
@@ -2017,6 +2018,7 @@ def archived_slide_names():
 def _fetch_installation(cur, installation_id):
     cur.execute(
         "SELECT installation_id, plugin_id, version, enabled, secret_hash, "
+        " capabilities, "
         " extract(epoch from created_at)::float8 AS created_at, "
         " extract(epoch from disabled_at)::float8 AS disabled_at "
         "FROM plugin_installations WHERE installation_id=%s",
@@ -2024,14 +2026,20 @@ def _fetch_installation(cur, installation_id):
     return cur.fetchone()
 
 
-def create_plugin_installation(plugin_id, version="", secret=None):
-    """创建插件安装行，返回 {**installation, "secret": 明文}（仅此一次）。"""
+def create_plugin_installation(plugin_id, version="", secret=None,
+                               capabilities=None):
+    """创建插件安装行，返回 {**installation, "secret": 明文}（仅此一次）。
+
+    capabilities 为可选的能力注册表登记项（docs §4.1；缺省 []）。
+    """
     if not isinstance(plugin_id, str) or not plugin_id.strip():
         raise ValueError("plugin_id 不能为空")
     plaintext = secret if isinstance(secret, str) and secret else (
         "pin_" + secrets.token_urlsafe(32))
     installation_id = "pin_" + secrets.token_urlsafe(12)
     now = time.time()
+    caps_json = json.dumps(
+        [dict(c) for c in capabilities] if isinstance(capabilities, list) else [])
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -2039,9 +2047,10 @@ def create_plugin_installation(plugin_id, version="", secret=None):
                 cur.execute(
                     "INSERT INTO plugin_installations "
                     "(installation_id, plugin_id, version, enabled, secret_hash, "
-                    " created_at) VALUES (%s,%s,%s,TRUE,%s, to_timestamp(%s))",
+                    " capabilities, created_at) "
+                    "VALUES (%s,%s,%s,TRUE,%s,%s, to_timestamp(%s))",
                     (installation_id, plugin_id.strip(), version or "",
-                     _hash_installation_secret(plaintext), now))
+                     _hash_installation_secret(plaintext), caps_json, now))
                 row = _fetch_installation(cur, installation_id)
         out = _installation_out(dict(row))
         out["secret"] = plaintext
@@ -2138,11 +2147,35 @@ def list_plugin_installations():
             with c.cursor() as cur:
                 cur.execute(
                     "SELECT installation_id, plugin_id, version, enabled, "
+                    " capabilities, "
                     " extract(epoch from created_at)::float8 AS created_at, "
                     " extract(epoch from disabled_at)::float8 AS disabled_at "
                     "FROM plugin_installations ORDER BY created_at ASC")
                 rows = cur.fetchall()
         return [_installation_out(dict(r)) for r in rows]
+    finally:
+        conn.close()
+
+
+def set_installation_capabilities(installation_id, capabilities):
+    """整体替换安装行的能力注册表（docs §4.1；语义同 json 实现）。
+
+    返回更新后的安装行（不含 hash）；不存在返回 None。
+    """
+    caps_json = json.dumps(
+        [dict(c) for c in capabilities] if isinstance(capabilities, list) else [])
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE plugin_installations SET capabilities=%s "
+                    "WHERE installation_id=%s",
+                    (caps_json, installation_id))
+                if cur.rowcount == 0:
+                    return None
+                row = _fetch_installation(cur, installation_id)
+        return _installation_out(dict(row))
     finally:
         conn.close()
 
@@ -2251,6 +2284,7 @@ def _mirror_plugin_installation(ret, *a, **k):
     row = ret if isinstance(ret, dict) else None
     if not row or not row.get("installation_id"):
         return
+    caps_json = json.dumps(row.get("capabilities") or [])
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -2260,26 +2294,28 @@ def _mirror_plugin_installation(ret, *a, **k):
                     cur.execute(
                         "INSERT INTO plugin_installations "
                         "(installation_id, plugin_id, version, enabled, "
-                        " secret_hash, created_at, disabled_at) "
-                        "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), "
+                        " secret_hash, capabilities, created_at, disabled_at) "
+                        "VALUES (%s,%s,%s,%s,%s,%s, to_timestamp(%s), "
                         " to_timestamp(%s)) "
                         "ON CONFLICT (installation_id) DO UPDATE SET "
                         " plugin_id=EXCLUDED.plugin_id, version=EXCLUDED.version, "
                         " enabled=EXCLUDED.enabled, "
                         " secret_hash=EXCLUDED.secret_hash, "
+                        " capabilities=EXCLUDED.capabilities, "
                         " disabled_at=EXCLUDED.disabled_at",
                         (row["installation_id"], row.get("plugin_id"),
                          row.get("version") or "", bool(row.get("enabled")),
-                         _hash_installation_secret(plaintext),
+                         _hash_installation_secret(plaintext), caps_json,
                          row.get("created_at") or time.time(),
                          row.get("disabled_at")))
                 else:
                     cur.execute(
                         "UPDATE plugin_installations SET plugin_id=%s, "
-                        " version=%s, enabled=%s, disabled_at=to_timestamp(%s) "
+                        " version=%s, enabled=%s, capabilities=%s, "
+                        " disabled_at=to_timestamp(%s) "
                         "WHERE installation_id=%s",
                         (row.get("plugin_id"), row.get("version") or "",
-                         bool(row.get("enabled")),
+                         bool(row.get("enabled")), caps_json,
                          row.get("disabled_at"), row["installation_id"]))
     finally:
         conn.close()

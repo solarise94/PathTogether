@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -603,6 +604,146 @@ def test_degradation_platform_independent():
     fake.clear_unreachable()
 
 
+# =========================================================================== #
+# 插件能力网关注入（插件能力层 docs §5.1/§9，P1）
+# =========================================================================== #
+def test_official_run_injects_extra_tools_and_tool_token():
+    """官方 /api/ai/run：注册表有能力时 config 含 extra_tools + tool_token。"""
+    print("== 插件能力注入：官方 run config 含 extra_tools 与 tool_token ==")
+    fake = install_fake_requests()
+    client = make_client()
+    setup_ai_config()
+    installation, err = app_mod.install_plugin_bundle("sample-tma-score")
+    check("示例插件安装成功（登记能力注册表）", err is None and installation is not None,
+          "err=%r" % (err,))
+    caps = installation.get("capabilities") if installation else []
+    check("安装行登记了 slide_summary 能力",
+          [c.get("name") for c in caps] == ["slide_summary"], "caps=%r" % caps)
+
+    captured = {}
+
+    def handler(body, query, headers, kwargs):
+        captured["config"] = body.get("config") or {}
+        captured["security"] = body.get("security")
+        return FakeResponse(200, sse_frames=[], headers={"X-AI-Session-ID": "sess-1"})
+
+    fake.register("POST", "/run", handler)
+    resp = client.post("/api/ai/run", json={"slide": "s.svs"})
+    check("run 200", resp.status_code == 200, "got %d" % resp.status_code)
+    cfg = captured.get("config") or {}
+    tools = cfg.get("extra_tools")
+    check("run config 含 extra_tools", isinstance(tools, list) and len(tools) == 1,
+          "tools=%r" % tools)
+    tool = (tools or [{}])[0]
+    check("工具名 = pluginId 去点下划线连接__能力名",
+          tool.get("name") == "dev_sample_tma__slide_summary", "got %r" % tool.get("name"))
+    check("endpoint = dispatch 相对路径",
+          tool.get("endpoint") == "/api/plugin/v1/dispatch/dev.sample.tma/slide_summary",
+          "got %r" % tool.get("endpoint"))
+    check("auth = agent-tool-token", tool.get("auth") == "agent-tool-token")
+    check("access_mode = read", tool.get("access_mode") == "read")
+    check("timeout_ms 注入", tool.get("timeout_ms") == 15000,
+          "got %r" % tool.get("timeout_ms"))
+    check("description 拼接了不信任后缀",
+          "不可信" in (tool.get("description") or "")
+          and "slide_summary" not in (tool.get("description") or ""),
+          "got %r" % tool.get("description"))
+    check("parameters 来自 manifest（含 stain enum）",
+          "stain" in ((tool.get("parameters") or {}).get("properties") or {}),
+          "params=%r" % tool.get("parameters"))
+
+    # 注入了 extra_tools → 必须随附 standard-v1 + extra-tools:v1 信封
+    # （sidecar fail-closed：缺信封/缺 feature 则整个 run 被 4xx 拒绝）
+    sec = captured.get("security")
+    check("run 随附 security 信封", isinstance(sec, dict), "got %r" % sec)
+    check("信封 = AGENT_EXTRA_TOOLS_ENVELOPE",
+          sec == dict(app_mod.AGENT_EXTRA_TOOLS_ENVELOPE), "got %r" % sec)
+    if isinstance(sec, dict):
+        check("信封声明 tool-profile:standard-v1 + extra-tools:v1",
+              sec.get("required_features") == ["tool-profile:standard-v1",
+                                               "extra-tools:v1"],
+              "features=%r" % sec.get("required_features"))
+        check("信封 tool_profile=standard-v1（非只读）",
+              sec.get("tool_profile") == "standard-v1",
+              "got %r" % sec.get("tool_profile"))
+        check("信封不带 ephemeral/ttl（官方 run 非临时会话）",
+              "session_ttl_seconds" not in sec,
+              "keys=%r" % sorted(sec))
+
+    # tool_token claims 完整性（typ/session/slide/能力清单/exp）
+    token = cfg.get("tool_token")
+    check("run config 含 tool_token", isinstance(token, str) and bool(token),
+          "got %r" % token)
+    claims, derr = app_mod._agent_tool_token_decode(token or "")
+    check("tool_token 可验签", derr is None and isinstance(claims, dict),
+          "err=%r" % derr)
+    if isinstance(claims, dict):
+        check("claims.typ=agent-tool", claims.get("typ") == "agent-tool")
+        check("claims.aud=agent-tool", claims.get("aud") == "agent-tool")
+        check("claims.slide 绑定本切片", claims.get("slide") == "s.svs",
+              "got %r" % claims.get("slide"))
+        check("claims.session_id 起跑时未定（空串，与 run grant 同语义）",
+              claims.get("session_id") == "", "got %r" % claims.get("session_id"))
+        check("claims.capabilities 为全名清单",
+              claims.get("capabilities") == ["dev.sample.tma/slide_summary"],
+              "got %r" % claims.get("capabilities"))
+        check("claims.exp = 签发时刻 + 会话TTL + 10min",
+              abs(claims.get("exp", 0) - (time.time()
+                   + app_mod._AGENT_TOOL_TOKEN_TTL_SECONDS)) < 120,
+              "exp=%r" % claims.get("exp"))
+        check("claims 带 user_id/role（owner 归一）",
+              claims.get("role") == "owner", "got %r" % claims.get("role"))
+    # agent-tool-token 不得混入 plugin v1 端点（aud 域不同）
+    pclaims, perr = app_mod._plugin_jwt_decode(token or "")
+    check("agent-tool-token 解不开 plugin JWT 域（跨域拒绝）", perr == "invalid_token",
+          "err=%r" % perr)
+    # 清理登记，避免影响后续用例
+    if installation:
+        import share_store as _ss
+        _ss.set_installation_capabilities(installation["installation_id"], [])
+
+
+def test_official_run_without_capabilities_has_no_extra_tools():
+    """注册表无能力（默认状态）时 config 不带 extra_tools/tool_token 键。"""
+    print("== 插件能力注入：无能力时零键注入（老 sidecar 零感知） ==")
+    fake = install_fake_requests()
+    client = make_client()
+    setup_ai_config()
+    captured = {}
+    fake.register("POST", "/run",
+                  lambda b, q, h, k: (captured.__setitem__("config", b.get("config") or {}),
+                                      captured.__setitem__("security", b.get("security")),
+                                      FakeResponse(200, sse_frames=[]))[2])
+    resp = client.post("/api/ai/run", json={"slide": "s.svs"})
+    check("run 200", resp.status_code == 200, "got %d" % resp.status_code)
+    cfg = captured.get("config") or {}
+    check("config 不含 extra_tools", "extra_tools" not in cfg, "keys=%r" % sorted(cfg))
+    check("config 不含 tool_token", "tool_token" not in cfg, "keys=%r" % sorted(cfg))
+    check("无能力时不随附 security 信封（旧 sidecar 零感知）",
+          captured.get("security") is None, "got %r" % captured.get("security"))
+
+
+def test_demo_path_never_injects_extra_tools():
+    """demo 路径零改动：_build_sidecar_config 永不注入；DEMO 信封无 extra-tools。"""
+    print("== 插件能力注入：demo 路径零改动 ==")
+    setup_ai_config()
+    installation, err = app_mod.install_plugin_bundle("sample-tma-score")
+    check("示例插件安装成功", err is None, "err=%r" % (err,))
+    # /api/demo/ai/run 直接用 _build_sidecar_config 组装（不经 _ai_run_prepare）
+    cfg = app_mod._build_sidecar_config(None)
+    check("demo 用的 _build_sidecar_config 不注入 extra_tools",
+          cfg is not None and "extra_tools" not in cfg, "keys=%r" % sorted(cfg or {}))
+    check("demo 用的 _build_sidecar_config 不注入 tool_token",
+          cfg is not None and "tool_token" not in cfg, "keys=%r" % sorted(cfg or {}))
+    check("DEMO_REQUIRED_FEATURES 不含 extra-tools:v1",
+          "extra-tools:v1" not in app_mod.DEMO_REQUIRED_FEATURES,
+          "features=%r" % app_mod.DEMO_REQUIRED_FEATURES)
+    # 清理登记
+    if installation:
+        import share_store as _ss
+        _ss.set_installation_capabilities(installation["installation_id"], [])
+
+
 if __name__ == "__main__":
     test_run_proxies_with_decrypted_config_and_sse()
     test_continue_and_ask_proxy()
@@ -619,5 +760,8 @@ if __name__ == "__main__":
     test_missing_slide_returns_400()
     test_healthz_reports_sidecar_and_backend()
     test_degradation_platform_independent()
+    test_official_run_injects_extra_tools_and_tool_token()
+    test_official_run_without_capabilities_has_no_extra_tools()
+    test_demo_path_never_injects_extra_tools()
     print("\nPASS=%d FAIL=%d" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

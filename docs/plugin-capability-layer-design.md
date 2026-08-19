@@ -1,7 +1,9 @@
 # 插件能力层设计：provides 契约、平台 dispatch 与 agent 工具注入
 
 - 日期：2026-08-19
-- 状态：草案（待评审后列入实施计划）
+- 状态：**已评审拍板（2026-08-19），P1 启动**。§10 开放问题已决：P1 只审计+限流
+  不计费；插件不可达走工具级失败回文本；图片走平台资产引用；agent-tool-token 与
+  plugin JWT 同密钥域不同 typ；HostBridge UI 能力通道提上日程（列入 P2）。
 - 核查：2026-08-19 已对两仓逐条核验，文中锚点行号均确认准确；本轮修正 6 处与
   现状的表述偏差（§1.1 JWT scope 枚举与端点集、§1.1/§7 RunConfig 开放性、
   §4.1 JSON 侧存储落点、§4.2 限流维度、§5.2 401 重放行为、§6.2 grant 生命周期）。
@@ -58,7 +60,7 @@ RunConfig 虽是闭合接口（`agent-runner.ts:147-215`），未知字段仍经
 ### 1.3 非目标（本轮不做）
 
 - 不做 MCP 兼容层（自研轻量契约即可，契约字段不与 MCP 对齐也不冲突）。
-- 不做插件 UI 间的能力消费（HostBridge 层不动；浏览器侧插件仍只走 §7.5 桥）。
+- 插件 UI 间的能力消费（HostBridge 层）不在 P1；已拍板提上日程，列入 P2（见 §8）。
 - 不做 capability 长任务 / SSE 流式返回（P2 再评估）。
 - 不改变现有 5 项 permissions 枚举的语义。
 
@@ -327,8 +329,11 @@ SUPPORTED_SECURITY_FEATURES += "extra-tools:v1"
 
 ### P2：完整版 —— 约 2-3 周
 
-- 写能力 + run grant 扩展（§6.2）。
-- 插件主体互调（§6.1 第二行）+ `/capabilities` 公告 `provided` 字段。
+- 写能力 + run grant 扩展（§6.2；含 run 结束联动撤销 grant 的新逻辑）。
+- 插件主体互调（§6.1 第二行）+ `/capabilities` 公告 `provided` 字段；插件 JWT 新增
+  dispatch scope（`capability:invoke` 或独立 typ，避免存量 token 自动获得互调）。
+- **HostBridge UI 能力通道（已拍板提上日程）**：浏览器侧插件 UI 经 HostBridge
+  发现/调用其他插件能力；需扩展桥协议（§7.5），排期时单独评估。
 - 管理侧：per-capability 启用开关进插件管理面板；dispatch 用量报表。
 - 配额：capability 级 quotaClass（消耗哪个预算桶）。
 - 用户授权 UI：写能力 per-run 勾选清单。
@@ -349,15 +354,13 @@ SUPPORTED_SECURITY_FEATURES += "extra-tools:v1"
 - **安全**：token 重放（exp 过期后旧 token 拒绝）、能力清单外调用、demo 信封
   携带 extra_tools 的端到端拒绝。
 
-## 10. 开放问题（评审时拍板）
+## 10. 开放问题（2026-08-19 已拍板）
 
-1. **计费归属**：dispatch 消耗算用户 AI 预算、插件配额，还是独立桶？
-   （建议 P1 只审计+限流不计费，P2 按 capability quotaClass。）
-2. **插件不可达时的 run 行为**：工具级失败回文本（本文案选择）还是预热探活？
-   （建议前者，简单且 agent 可自适应。）
-3. **result 里引用图片**：P2 用平台资产引用（region 端点取图）还是允许
-   base64 小图（≤256KB）？（建议资产引用，避免 result 膨胀。）
-4. **agent-tool-token 密钥域**：与 plugin JWT 同密钥（HMAC 同 key 不同 typ claim）
-   还是独立密钥？（建议同域不同 typ，轮换运维简单。）
-5. **UI 插件消费通道**是否提上日程（HostBridge 侧能力发现）——本文档默认不做，
-   若产品需要请提前告知，影响 P2 排期。
+1. **计费归属** → **P1 只审计+限流不计费**；P2 按 capability quotaClass 再评估。
+2. **插件不可达时的 run 行为** → **工具级失败回文本**（agent 可自适应绕路，不炸 run）。
+3. **result 里引用图片** → **平台资产引用**（region 端点取图），不允许 base64 内联；
+   P1 契约即以 `truncated` + 资产引用为准。
+4. **agent-tool-token 密钥域** → **与 plugin JWT 同密钥（HMAC 同 key）、不同 typ
+   claim**，验签按 typ 拒绝跨域使用。
+5. **UI 插件消费通道** → **提上日程，列入 P2**（HostBridge 能力发现/调用，桥协议
+   扩展，排期单独评估）。

@@ -6564,8 +6564,9 @@ def plugin_v1_region(slide):
         （Content-SHA256/X-Asset-Revision/X-Region-Bbox/X-Region-Out/
         X-Region-Magnification/X-Region-Encoder）。缺省（无 Accept）保持 JSON
         base64 现状兼容。两条路径返回同一份 JPEG bytes（Content-SHA256 一致）。
-      - 像素预算——入口先算像素量（level0 w*h 与输出 outW*outH 取大者），超
-        PLUGIN_REGION_MAX_PIXELS 或滑窗预算 PLUGIN_REGION_PIXEL_BUDGET_PER_MIN
+      - 像素预算——入口先按**真实成本**估算像素量（max(输出像素, 估算解码像素)，
+        解码估算与 _read_region_b64 选层同式：约 1568 长边量级；纯算术、零磁盘），
+        超 PLUGIN_REGION_MAX_PIXELS 或滑窗预算 PLUGIN_REGION_PIXEL_BUDGET_PER_MIN
         → 429 rate_limited（**必须在读盘/解码前拒绝**，slide_cache 零触碰）。
       - 并发闸——PLUGIN_REGION_MAX_CONCURRENT 进程级信号量，超载 → 429。
     """
@@ -6611,19 +6612,50 @@ def plugin_v1_region(slide):
         return _plugin_error(400, "invalid_request", "jpeg_quality 需在 1..100")
 
     # ---- 像素预算闸 1：单请求上限（纯算术，零磁盘；必须在读盘/解码前拒绝）---- #
-    # 像素量 = level0 bbox w*h 与输出 outW*outH 取大者。max_long_edge 给定时按
-    # 保宽高比估算输出；否则用显式 out_w/out_h（缺省 1568，clamp 4096）。
+    # 计费口径 = 本次请求的真实成本：max(输出像素, 估算解码像素)。输出像素 =
+    # est_ow*est_oh（max_long_edge 给定时按保宽高比估算；否则用显式 out_w/out_h，
+    # 缺省 1568，clamp 4096）。解码估算与 _read_region_b64 的选层取数同式（零磁盘
+    # IO 的纯算术）：ds = max(w,h)/1568（max>1568 时，否则 1），est_decode =
+    # ceil(w/ds)*ceil(h/ds)（≈从金字塔层解码的 rw*rh 量级，长边 ≤1568；用整数
+    # 分式 w*1568/L 精确求 ceil，等价于 w/ds 且无浮点整除边界噪声）。
+    # 注意：**不按 level-0 bbox 面积 w*h 计费**——低放大层级的大视野小输出取景
+    # （bbox 可达 8192²+，真实解码仅 ≈1568 长边）会被误杀；而输出被 clamp 4096，
+    # 真正巨大的输出请求仍会被本闸拦下。
     if max_long_edge is not None and max_long_edge > 0:
         est_ow, est_oh = _aspect_fit_size(w, h, max_long_edge)
     else:
         est_ow = max(1, min(int(out_w or 1568), 4096))
         est_oh = max(1, min(int(out_h or 1568), 4096))
-    pixels = max(int(w) * int(h), int(est_ow) * int(est_oh))
+    _long_edge = max(int(w), int(h))
+    if _long_edge > 1568:
+        est_dec_w = (int(w) * 1568 + _long_edge - 1) // _long_edge  # ceil(w/ds)
+        est_dec_h = (int(h) * 1568 + _long_edge - 1) // _long_edge  # ceil(h/ds)
+    else:
+        est_dec_w, est_dec_h = int(w), int(h)
+    est_decode_pixels = est_dec_w * est_dec_h
+    out_pixels = int(est_ow) * int(est_oh)
+    pixels = max(out_pixels, est_decode_pixels)
     if pixels > _PLUGIN_REGION_MAX_PIXELS:
+        # 文案按实际触发项区分（out_pixels >= est_decode_pixels 时输出为主因）：
+        # 输出超限 → 引导缩输出尺寸；解码量超限（仅在 PLUGIN_REGION_MAX_PIXELS
+        # 压到 <1568² 的部署下可能）→ 引导先放大层级缩小视野，避免误导模型。
+        if out_pixels >= est_decode_pixels:
+            triggered_by = "output_pixels"
+            message = ("单次 region 请求像素预算超限（估算 %d > 上限 %d），"
+                       "请缩小输出尺寸（out_w/out_h/max_long_edge）后重试"
+                       % (pixels, _PLUGIN_REGION_MAX_PIXELS))
+        else:
+            triggered_by = "decode_pixels"
+            message = ("单次 region 请求像素预算超限（估算 %d > 上限 %d），"
+                       "当前视野区域过大（解码估算 %d 像素），"
+                       "请先放大层级缩小视野范围，或缩小输出尺寸后重试"
+                       % (pixels, _PLUGIN_REGION_MAX_PIXELS, est_decode_pixels))
         return _plugin_rate_limited_response(
-            "单次 region 请求像素量超限（%d > 上限 %d），请缩小区域或输出尺寸"
-            % (pixels, _PLUGIN_REGION_MAX_PIXELS), 1,
+            message, 1,
             details={"pixels": pixels, "max_pixels": _PLUGIN_REGION_MAX_PIXELS,
+                     "out_pixels": out_pixels,
+                     "est_decode_pixels": est_decode_pixels,
+                     "triggered_by": triggered_by,
                      "reason": "single_request_pixels"})
 
     # ---- 内容协商（缺省 JSON base64 兼容；octet-stream / format=binary 走二进制）---- #

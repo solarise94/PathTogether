@@ -546,5 +546,17 @@ def test_sample_backend_healthz():
     assert resp.get_json()["plugin"] == "dev.sample.tma"
 
 
+def test_docker_entry_supervises_sample_tma_backend():
+    """平台容器 entrypoint 默认托管 sample-tma-score，不必重建后手动 exec。"""
+    text = (REPO_ROOT / "docker_entry.sh").read_text(encoding="utf-8")
+    assert "sample-tma-score/backend/app.py" in text
+    assert "SAMPLE_TMA_BACKEND" in text
+    assert "exec gunicorn" in text
+    # 崩溃自动拉起（避免一次退出后能力永久不可用）
+    assert "restart in 2s" in text
+    # =0 可关，默认仍起
+    assert "${SAMPLE_TMA_BACKEND:-1}" in text
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

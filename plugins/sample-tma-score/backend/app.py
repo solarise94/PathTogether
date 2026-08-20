@@ -138,4 +138,6 @@ def capability_slide_summary():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PT_TMA_SCORE_PORT") or 8061)
-    app.run(host="127.0.0.1", port=port)
+    # use_reloader=False：容器内由 docker_entry.sh 托管，禁止 Flask debug
+    # reloader 再 fork 一份（否则 PID 关系乱、端口冲突）。
+    app.run(host="127.0.0.1", port=port, use_reloader=False, threaded=True)

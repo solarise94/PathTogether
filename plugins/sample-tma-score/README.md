@@ -20,6 +20,10 @@ dispatch 端点（`/api/plugin/v1/dispatch/dev.sample.tma/slide_summary`），
 
 ## 运行
 
+平台容器（`docker_entry.sh`）**默认会拉起**本后端（`127.0.0.1:8061`），崩溃
+自动重启；容器停则一起停。不必再 `podman exec`。关掉：
+`SAMPLE_TMA_BACKEND=0`。本地开发或独立进程：
+
 ```sh
 # 1. 起插件后端（监听 127.0.0.1:8061，须与 manifest service.baseUrl 一致）
 python3 plugins/sample-tma-score/backend/app.py

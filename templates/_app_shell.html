@@ -375,27 +375,35 @@
 
         <div id="ai-config-wrap" class="ai-config-wrap">
           <div class="ai-config-title" data-i18n="ai.config.title">AI 服务配置</div>
-          <!-- B1：user 角色的「平台 AI / 自定义 API」两卡 radio group（owner 不显示）。
-               #ai-use-platform checkbox 保留为隐藏状态载体（卡 A ⇔ checked），驱动 PUT use_platform。 -->
-          <div id="ai-source-cards" class="ai-source-cards" style="display:none;">
-            <label class="ai-source-card" id="ai-source-card-platform">
-              <input type="radio" name="ai-source" id="ai-source-platform" value="platform" />
-              <span class="ai-source-card-main">
-                <span class="ai-source-card-title" data-i18n="ai.source.platform">平台 AI（推荐）</span>
-                <span class="ai-source-card-sub" data-i18n="ai.source.platform.sub">由管理员统一提供，开箱即用</span>
-                <span class="ai-source-card-meta" id="ai-source-platform-meta"></span>
-              </span>
-            </label>
-            <label class="ai-source-card" id="ai-source-card-own">
-              <input type="radio" name="ai-source" id="ai-source-own" value="own" />
-              <span class="ai-source-card-main">
-                <span class="ai-source-card-title" data-i18n="ai.source.own">自定义 API</span>
-                <span class="ai-source-card-sub" data-i18n="ai.source.own.sub">使用自己的 Base URL / API Key / 模型</span>
-              </span>
+          <div id="ai-config-source-hint" class="ai-config-source-hint" style="display:none"></div>
+          {% if viewer_role == 'user' %}
+          <!-- user：AI 服务统一由平台提供，不再有「平台 AI / 自定义 API」选择与
+               自带凭据表单（p3fix B1 已下线）。只显示平台来源提示 + 只读步数。 -->
+          <small class="ai-field-note" id="ai-tune-admin-note" data-i18n="ai.config.tune.admin">由管理员配置，用户不可修改</small>
+          <label class="ai-field">
+            <span data-i18n="ai.field.maxsteps">步数上限</span>
+            <input id="ai-max-steps" type="number" min="1" max="500" readonly
+                   data-i18n-title="ai.field.maxsteps.platform.title" title="平台 AI 步数由管理员配置（只读）" autocomplete="off" />
+          </label>
+          <!-- 隐藏兼容载体：HistoPilot bundle（config-panel.js 的 renderAiConfigState
+               user 分支、main.js 的 gate）无 null 防护地引用这些 ID，删除会让未同步
+               升级的旧 bundle 抛 TypeError——整块隐藏而非移除（新 bundle 会保持其
+               隐藏状态）。#ai-use-platform checkbox 保持 checked：平台统一提供。 -->
+          <div id="ai-own-fields" class="ai-own-fields" style="display:none;">
+            <input id="ai-base-url" type="hidden" autocomplete="off" />
+            <input id="ai-api-key" type="hidden" autocomplete="off" />
+            <input id="ai-model" type="hidden" autocomplete="off" />
+            <label class="ai-field ai-field-checkbox" id="ai-use-platform-wrap" style="display:none;">
+              <input id="ai-use-platform" type="checkbox" checked />
+              <span data-i18n="ai.field.useplatform">使用平台官方 API</span>
             </label>
           </div>
-          <div id="ai-config-source-hint" class="ai-config-source-hint" style="display:none"></div>
-          <!-- 选中「平台 AI」时整块收起（config-panel.js applySourceCards 切换 display） -->
+          <div class="ai-config-actions" style="display:none;">
+            <button id="ai-config-save" class="btn primary small" data-i18n="ai.config.save">保存配置</button>
+            <span id="ai-config-hint" class="ai-config-hint"></span>
+          </div>
+          {% else %}
+          <!-- owner：平台 AI 配置表单（现状不变，全字段可写） -->
           <div id="ai-own-fields" class="ai-own-fields">
             <label class="ai-field">
               <span data-i18n="ai.field.baseurl">Base URL</span>
@@ -412,8 +420,7 @@
               <input id="ai-model" type="text" placeholder="gpt-4o"
                      autocomplete="off" />
             </label>
-            <!-- B1：checkbox 保留为状态载体但视觉隐藏（内联 display:none 优先于
-                 .ai-field 的 display:flex；不能删，app.js 联动与 PUT 协议依赖它） -->
+            <!-- checkbox 保留为 user 模式的隐藏状态载体（owner 不可见、不参与 PUT） -->
             <label class="ai-field ai-field-checkbox" id="ai-use-platform-wrap" style="display:none;">
               <input id="ai-use-platform" type="checkbox" />
               <span data-i18n="ai.field.useplatform">使用平台官方 API</span>
@@ -464,6 +471,7 @@
             <button id="ai-config-save" class="btn primary small" data-i18n="ai.config.save">保存配置</button>
             <span id="ai-config-hint" class="ai-config-hint"></span>
           </div>
+          {% endif %}
         </div>
         <div id="ai-config-collapsed" class="ai-config-collapsed" style="display:none;">
           <span id="ai-config-summary" class="ai-config-summary"></span>

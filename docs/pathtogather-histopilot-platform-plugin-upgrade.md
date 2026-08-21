@@ -276,6 +276,8 @@ type SlideRef =
 
 平台配置的官方 API 就是注册用户（owner/user）的常规 AI 来源之一，与自带 key 并列——不存在额外的"兜底"机制：平台未配置官方 API 时，注册用户同样需要自带 key；guest 则始终必须自带 key，无 key 时 AI 不可用、人工读片不受影响。
 
+> **2026-08 更新注记**：user 的自带 API key 通道已下线（AI 服务统一由平台提供）。上表中「自带 API key 运行 AI」一列现仅适用于 owner（owner 平台配置不变）；user 恒走平台凭据，平台未配置时 AI 不可用并提示联系管理员。详见 demo-access-auth-ui-design.md §9.2 的更新注记。
+
 AI 会话与标注历史：user 持久记录在名下；guest 的 AI 会话不持久（会话结束即弃），人工标注若允许则按分享权限记录。
 
 ### 5.2 项目升级为病例工作区

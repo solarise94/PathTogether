@@ -89,7 +89,7 @@ per-browser limit 调成 3，跑一轮 AI，结束后应直接显示「还剩 2 
 
 ## 批次 B：UI 改善
 
-### B1 「平台 AI / 自定义 API」两卡式切换 〔跨两仓〕
+### B1 「平台 AI / 自定义 API」两卡式切换 〔跨两仓〕〔已回退：自定义 API 通道于 2026-08 下线，user 恒走平台 AI〕
 
 **问题**：现状切换入口是藏在 Base URL 输入上方的小 checkbox（`_app_shell.html:389-392`，
 `ai-use-platform-wrap`，user 角色才显示）。视觉权重低；勾选平台后自定义三字段仅

@@ -301,9 +301,11 @@ def test_json_backend_platform_run_fail_closed_without_testing():
         app_mod.app.config["TESTING"] = True
 
 
-@json_only  # PG 后端 own 凭据正常记账（另见 PG 用例）；本用例锁 json 放行语义
-def test_json_backend_own_credentials_pass_without_booking():
-    _setup_platform()  # 平台已配，但用户走 own 凭据
+@json_only  # PG 后端 own 存量凭据同样被忽略走平台；本用例锁 json 放行语义
+def test_json_backend_legacy_own_credentials_now_platform():
+    """自带 API 通道下线：存量 own 凭据（use_platform=False）不再放行——
+    user 恒走平台凭据，json 生产路径 fail-closed（503 pg_backend_required）。"""
+    _setup_platform()  # 平台已配，但用户存量 use_platform=False + 自带凭据
     u = _make_user("user")
     _own_credentials(u["user_id"])
     _touch("own.svs")
@@ -314,87 +316,93 @@ def test_json_backend_own_credentials_pass_without_booking():
     _login(c, "user", u["user_id"])
     app_mod.app.config["TESTING"] = False
     try:
-        # json 下 own 凭据放行且不记账（docs §4.3：预算表不存在不得拒绝 own 执行）
+        # json 下平台凭据 fail-closed（own 存量凭据不再是无配额逃生通道）
         r = _run_ok(c, "own.svs")
-        assert r.status_code == 200
-        assert fake.calls and fake.calls[-1]["body"]["config"]["ssrf_guard"] is True
+        assert r.status_code == 503
+        assert r.get_json().get("code") == "pg_backend_required"
+        assert fake.calls == []  # 未转发 HistoPilot
     finally:
         app_mod.app.config["TESTING"] = True
 
 
 # --------------------------------------------------------------------------- #
-# 3. user max_steps（PUT / GET / 注入；json / PG 双跑）
+# 3. user PUT 全拒 + GET 只读形态（json / PG 双跑）
 # --------------------------------------------------------------------------- #
-def test_user_put_max_steps_bounds_and_persist():
+def test_user_put_any_field_rejected_400():
+    """AI 服务由平台统一提供：user PUT 凭据四字段 + max_steps + 调优一律 400。"""
     _setup_platform()
     u = _make_user("user")
     c = _client()
     _login(c, "user", u["user_id"])
-    for bad in (0, -3, 501, 100000, "abc"):
-        r = c.put("/api/ai/config", json={"max_steps": bad})
-        assert r.status_code == 400, bad
-    r = c.put("/api/ai/config", json={"max_steps": 33})
+    for body in ({"max_steps": 33}, {"max_steps": 501}, {"max_steps": "abc"},
+                 {"max_steps": 0}, {"use_platform": False},
+                 {"base_url": "http://own.example/v1", "model": "gpt-own",
+                  "api_key": "sk-own-secret-abcdef"},
+                 {"fork_active_limit": 999}, {}):
+        r = c.put("/api/ai/config", json=body)
+        assert r.status_code == 400, body
+        assert "平台统一提供" in (r.get_json() or {}).get("error", "")
+    # 不落库（users.json 无新增凭据 / 步数）
+    cfg = user_store.get_user_ai_config(u["user_id"]) or {}
+    assert not cfg.get("base_url")
+    assert cfg.get("max_steps", 20) == 20  # 缺省值未被改写
+    # owner PUT 不受影响（对照）
+    o = _make_user("owner")
+    co = _client()
+    _login(co, "owner", o["user_id"])
+    r = co.put("/api/ai/config", json={"max_steps": 60})
     assert r.status_code == 200, r.get_data(as_text=True)
-    j = r.get_json()
-    assert j["own_max_steps"] == 33
-    # 落库
-    cfg = user_store.get_user_ai_config(u["user_id"])
-    assert cfg["max_steps"] == 33
-    # 缺省 20
-    u2 = _make_user("user")
-    assert user_store.get_user_ai_config(u2["user_id"])["max_steps"] == 20
+    assert r.get_json()["max_steps"] == 60
 
 
 def test_user_get_effective_max_steps_platform_readonly():
+    """user GET 只读：using 恒 platform（平台已配）；生效步数=周期平台步数；
+    存量 own 步数仅作回显（own_max_steps），无写入通道。"""
     _setup_platform()  # 平台 ai_config.json 的 max_steps 用默认 50
     u = _make_user("user")
     _own_credentials(u["user_id"], steps=33)
-    user_store.set_user_ai_config(u["user_id"], {"use_platform": True})
     c = _client()
     _login(c, "user", u["user_id"])
     r = c.get("/api/ai/config")
     j = r.get_json()
     assert j["using"] == "platform"
-    # 平台模式：生效步数=周期 platform_task_max_steps（默认 20），忽略用户 33
+    # 平台模式：生效步数=周期 platform_task_max_steps（默认 20），忽略存量 33
     assert j["max_steps"] == 20
     assert j["effective_max_steps"] == 20
-    assert j["own_max_steps"] == 33  # 已保存值仍在（切回 own 后的起点）
+    assert j["own_max_steps"] == 33  # 存量值仍回显（历史数据）
     assert j["own_task_max_steps_limit"] >= 20
-    # 切回 own：生效步数=已保存值
+    # 切回 own 的 PUT 已下线：use_platform=false 同样 400
     r2 = c.put("/api/ai/config", json={"use_platform": False})
-    j2 = r2.get_json()
-    assert j2["using"] == "own"
-    assert j2["effective_max_steps"] == 33
+    assert r2.status_code == 400
+    j3 = c.get("/api/ai/config").get_json()
+    assert j3["using"] == "platform"
+    assert j3["effective_max_steps"] == 20
 
 
 def test_max_steps_injection_rules_for_sidecar_config():
+    """user 恒平台模式：注入周期 20；存量 own 步数（use_platform=False）被忽略。"""
     _setup_platform()
     u = _make_user("user")
-    _own_credentials(u["user_id"], steps=7)
+    _own_credentials(u["user_id"], steps=7)  # use_platform=False + steps=7
     _touch("inj.svs")
     _own("inj.svs", u["user_id"])
     fake = _install_fake()
     fake.register("POST", "/run", lambda p: _sse_ok())
     c = _client()
     _login(c, "user", u["user_id"])
-    # own 凭据：注入已保存 7（不是平台默认 50）
     r = _run_ok(c, "inj.svs")
     assert r.status_code == 200
     cfg = fake.calls[-1]["body"]["config"]
-    assert cfg["max_steps"] == 7
-    # 平台凭据：注入周期 20，忽略已保存 7
-    user_store.set_user_ai_config(u["user_id"], {"use_platform": True})
-    r2 = _run_ok(c, "inj.svs")
-    assert r2.status_code == 200
-    cfg2 = fake.calls[-1]["body"]["config"]
-    assert cfg2["max_steps"] == 20
+    assert cfg["max_steps"] == 20  # 平台周期步数，忽略存量 own 7
+    assert cfg["base_url"] == "http://platform.example/v1"  # 平台凭据
+    assert cfg.get("ssrf_guard") is not True
 
 
 def test_run_body_cannot_smuggle_tuning_fields():
     """浏览器不能靠请求体临时塞未保存的调优值（注入只读已保存配置）。"""
     _setup_platform()
     u = _make_user("user")
-    _own_credentials(u["user_id"], steps=9)
+    _own_credentials(u["user_id"], steps=9)  # 存量 own 步数（已不再生效）
     _touch("smug.svs")
     _own("smug.svs", u["user_id"])
     fake = _install_fake()
@@ -409,8 +417,8 @@ def test_run_body_cannot_smuggle_tuning_fields():
     })
     assert r.status_code == 200
     cfg = fake.calls[-1]["body"]["config"]
-    assert cfg["max_steps"] == 9          # 已保存值
-    assert cfg["api_key"] != "sk-smuggled"  # 请求体 config 整体被忽略
+    assert cfg["max_steps"] == 20         # 平台周期步数（存量 own 9 被忽略）
+    assert cfg["api_key"] == "sk-platform-123456"  # 平台 key，请求体整体被忽略
 
 
 # --------------------------------------------------------------------------- #
@@ -664,7 +672,9 @@ def test_platform_total_exhausted_rejects_owner_and_user():
 
 
 @pg_only
-def test_own_credentials_do_not_consume_platform_quota():
+def test_legacy_own_credentials_are_not_quota_escape_hatch():
+    """自带 API 通道下线：存量 own 凭据不再是平台配额的逃生通道——
+    平台总量打满后，即使 user 存量 use_platform=False 也按平台凭据拒（429）。"""
     _setup_platform()
     budget_store.update_period_limits({"platform_turn_limit": 1})
     u = _make_user("user")
@@ -676,16 +686,16 @@ def test_own_credentials_do_not_consume_platform_quota():
     _login(c, "user", u["user_id"])
     # 第 1 次平台凭据 → 平台总量满
     assert _run_ok(c, "mix.svs").status_code == 200
-    # own 凭据：平台总量已满仍可跑（不扣平台总量，记可观测量）
+    # 存量 own 凭据（use_platform=False）：同样走平台 → 平台总量已满 → 拒
     _own_credentials(u["user_id"], steps=15)
+    fake.calls.clear()
     r2 = _run_ok(c, "mix.svs")
-    assert r2.status_code == 200
+    assert r2.status_code == 429
+    assert r2.get_json().get("code") == "platform_ai_budget_exhausted"
+    assert fake.calls == []
     report = budget_store.usage_report()
     assert report["platform"]["total"] == 1
-    assert report["own"]["total"] == 1
-    # 平台模式再跑 → 拒
-    user_store.set_user_ai_config(u["user_id"], {"use_platform": True})
-    assert _run_ok(c, "mix.svs").status_code == 429
+    assert report["own"]["total"] == 0  # own 维度不再产生用量
 
 
 @pg_only

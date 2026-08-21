@@ -255,7 +255,7 @@ def test_containerfile_ships_app_modules():
 
 def test_containerfile_ships_pg_layer():
     """Stage 3b PostgreSQL 层必须进镜像：pg_store/share_store_pg/user_store_pg +
-    migrations/ + scripts/。这些在 app.py 里是函数内 / dispatcher 内 import，静态
+    migrations/ + scripts/。这些模块在 app.py 里是函数内 / dispatcher 内 import，静态
     顶层扫描抓不到，故单独守卫（漏 COPY 时 postgres/dual 后端起不来或无法迁移）。
     """
     cf = (REPO_ROOT / "Containerfile").read_text(encoding="utf-8")
@@ -270,6 +270,73 @@ def test_containerfile_ships_pg_layer():
         "Containerfile 未 COPY migrations/ 目录"
     assert re.search(r"^COPY scripts/ scripts/", cf, re.M), \
         "Containerfile 未 COPY scripts/ 目录"
+
+
+# =========================================================================== #
+# (f) AI 服务统一由平台提供：user 渲染不再有自带凭据表单（B1 通道下线）
+# =========================================================================== #
+def _login_session(client, role, user_id="usr-x"):
+    with client.session_transaction() as s:
+        s.update({"auth_user": "t@x.com", "user_id": user_id, "role": role})
+
+
+def _make_role_user(role):
+    """创建真实用户（_require_auth 会按 user_id 回查 user_store）。"""
+    import user_store
+    return user_store.create_user("t-%s@x.com" % role, "password1", role=role)
+
+
+def test_index_user_render_has_no_own_credentials_form(monkeypatch):
+    """user 视角：无两卡卡组 / 可见凭据输入 / 协议下拉 / 高级调优；兼容载体保留。"""
+    monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
+    u = _make_role_user("user")
+    c = _client()
+    _login_session(c, "user", u["user_id"])
+    r = c.get("/")
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    # 两卡卡组与自有凭据表单不再渲染
+    for gone in ('id="ai-source-cards"', 'id="ai-source-own"',
+                 'id="ai-source-platform"', 'id="ai-api-protocol"',
+                 'id="ai-advanced"'):
+        assert gone not in body, gone
+    # 兼容载体保留（旧 bundle 引用这些 ID，删除会抛 TypeError）且整体隐藏
+    assert 'id="ai-config-source-hint"' in body
+    assert 'id="ai-use-platform" type="checkbox" checked' in body
+    assert 'id="ai-own-fields" class="ai-own-fields" style="display:none;"' in body
+    assert body.count('id="ai-base-url"') == 1
+    assert body.count('id="ai-config-save"') == 1
+    # 步数上限只读展示（user 不再有可编辑步数）
+    assert body.count('id="ai-max-steps"') == 1
+    assert 'id="ai-max-steps" type="number" min="1" max="500" readonly' in body
+
+
+def test_index_owner_render_keeps_full_platform_form(monkeypatch):
+    """owner 视角：平台 AI 配置表单全字段保留可写（行为零变化）。"""
+    monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
+    o = _make_role_user("owner")
+    c = _client()
+    _login_session(c, "owner", o["user_id"])
+    r = c.get("/")
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    assert 'id="ai-own-fields" class="ai-own-fields">' in body  # 无内联隐藏
+    for present in ('id="ai-base-url" type="text"', 'id="ai-api-key" type="password"',
+                    'id="ai-model" type="text"', 'id="ai-api-protocol"',
+                    'id="ai-advanced"', 'id="ai-config-save"'):
+        assert present in body, present
+    # owner 分支的 max_steps 可编辑（无 readonly）
+    assert 'id="ai-max-steps" type="number" min="1" max="500" placeholder' in body
+    assert 'id="ai-use-platform"' in body  # 隐藏 checkbox 载体同样保留
+
+
+def test_index_no_auth_render_defaults_to_owner_form():
+    """AUTH_ENABLED=False（内网归一 owner）：渲染完整平台表单。"""
+    r = _client().get("/")
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    assert 'id="ai-own-fields" class="ai-own-fields">' in body
+    assert 'id="ai-api-protocol"' in body
 
 
 if __name__ == "__main__":

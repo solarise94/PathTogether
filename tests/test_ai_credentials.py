@@ -197,17 +197,36 @@ def test_resolve_use_platform_when_platform_configured():
     assert cfg.get("ssrf_guard") is not True
 
 
-def test_resolve_use_platform_but_platform_missing_falls_to_own():
+def test_resolve_user_ignores_legacy_own_credentials():
+    """user 自带 API 通道已下线：use_platform=False + 自带凭据齐备仍走平台。"""
+    _reset_config()
+    _setup_platform()
+    u = user_store.create_user("u@x.com", "password1", role="user")
+    user_store.set_user_ai_config(u["user_id"], {
+        "use_platform": False, "base_url": "http://own/v1",
+        "model": "gpt-own", "api_key": "sk-own-secret"})
+    source, cred = app_mod._resolve_ai_credentials(
+        {"role": "user", "user_id": u["user_id"]})
+    assert source == "platform"
+    assert cred["base_url"] == "http://platform/v1"
+    cfg = app_mod._build_sidecar_config({"role": "user", "user_id": u["user_id"]})
+    assert cfg is not None
+    assert cfg["base_url"] == "http://platform/v1"
+    assert cfg.get("ssrf_guard") is not True  # 平台 URL 不受 SSRF 限制
+
+
+def test_resolve_platform_missing_returns_none_even_with_own():
+    """平台未配置 → user 不可用（自带凭据齐备也不作为回退）。"""
     _reset_config()  # 平台未配
     u = user_store.create_user("u@x.com", "password1", role="user")
     user_store.set_user_ai_config(u["user_id"], {
-        "use_platform": True, "base_url": "http://own/v1",
+        "use_platform": False, "base_url": "http://own/v1",
         "model": "gpt-own", "api_key": "sk-own-secret"})
+    source, cred = app_mod._resolve_ai_credentials(
+        {"role": "user", "user_id": u["user_id"]})
+    assert source is None and cred is None
     cfg = app_mod._build_sidecar_config({"role": "user", "user_id": u["user_id"]})
-    assert cfg is not None
-    assert cfg["base_url"] == "http://own/v1"
-    assert cfg["api_key"] == "sk-own-secret"
-    assert cfg.get("ssrf_guard") is True
+    assert cfg is None
 
 
 def test_resolve_own_missing_key_returns_none():
@@ -252,32 +271,45 @@ def test_user_config_get_masked_and_platform_fields():
     assert r.status_code == 200
     assert j["platform_configured"] is True
     assert j["using"] == "platform"  # use_platform 缺省 True 且平台已配
+    # 存量 use_platform=False 同样恒平台（自带通道已下线）
+    user_store.set_user_ai_config(u["user_id"], {"use_platform": False})
+    j2 = c.get("/api/ai/config").get_json()
+    assert j2["using"] == "platform"
+    # 平台未配置 → using 为 null（前端提示联系管理员）；注意 _reset_config 会
+    # 清掉 users.json（用户被删会话即失效），需重建用户再登录
+    _reset_config()
+    u2 = user_store.create_user("u2@x.com", "password1", role="user")
+    _login(c, "user", u2["user_id"])
+    j3 = c.get("/api/ai/config").get_json()
+    assert j3["platform_configured"] is False
+    assert j3["using"] is None
+    _setup_platform()
     # 平台模型名不下发普通用户（平台运营信息，仅 owner 侧折叠摘要可见）
     assert "platform_model" not in j
-    # api_key 只回显掩码，不回显明文
+    # api_key 只回显掩码，不回显明文（存量数据过渡期回显）
     assert "sk-user-long-secret-12345678" not in r.get_data(as_text=True)
     assert j["api_key_mask"]
     # tuning 字段从平台值回显
     assert j["model"] == "gpt-own"
 
 
-def test_user_put_tuning_differs_returns_403():
-    """user 改平台调优字段 → 403（max_steps 已是 user 自有字段，单独走越界 400）。"""
+def test_user_put_tuning_differs_returns_400():
+    """user PUT 任何字段一律 400（tuning 与 max_steps 同样拒绝）。"""
     _reset_config()
     _setup_platform()
     u = user_store.create_user("u@x.com", "password1", role="user")
     c = _client()
     _login(c, "user", u["user_id"])
-    r = c.put("/api/ai/config", json={"fork_active_limit": 999})
-    assert r.status_code == 403
-    # PT-3：max_steps 是 user 自带 API 步数（docs §9.2），越界 → 400 而非 403
-    r2 = c.put("/api/ai/config", json={"max_steps": 999})
-    assert r2.status_code == 400
-    assert "max_steps" in (r2.get_json() or {}).get("error", "")
+    for body in ({"fork_active_limit": 999}, {"max_steps": 33},
+                 {"max_tokens": 9999}, {"api_protocol": "gemini"}):
+        r = c.put("/api/ai/config", json=body)
+        assert r.status_code == 400, body
+        assert "平台统一提供" in (r.get_json() or {}).get("error", "")
 
 
-@json_only  # 断言 users.json 原文落盘（PG 后端无 json 文件）
-def test_user_put_credentials_ok_and_persisted():
+@json_only  # 断言 users.json 原文不落盘（PG 后端无 json 文件）
+def test_user_put_credentials_rejected_and_not_persisted():
+    """user 凭据四字段一律 400；存量数据不被改写、新数据不落盘。"""
     _reset_config()
     _setup_platform()
     u = user_store.create_user("u@x.com", "password1", role="user")
@@ -286,15 +318,16 @@ def test_user_put_credentials_ok_and_persisted():
     r = c.put("/api/ai/config", json={
         "use_platform": False, "base_url": "http://own/v1",
         "model": "gpt-own", "api_key": "sk-own-secret-abcdef"})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    j = r.get_json()
-    assert j["using"] == "own"
-    assert j["model"] == "gpt-own"
-    # 落盘（users.json 加密）
+    assert r.status_code == 400
+    assert "平台统一提供" in (r.get_json() or {}).get("error", "")
+    # 空负载同样拒绝（user 无任何可写字段）
+    r_empty = c.put("/api/ai/config", json={})
+    assert r_empty.status_code == 400
+    # 未落盘：users.json 无新增凭据
     raw = user_store.USER_FILE.read_text(encoding="utf-8")
     assert "sk-own-secret-abcdef" not in raw
-    cfg = user_store.get_user_ai_config(u["user_id"])
-    assert app_mod._decrypt_api_key(cfg["api_key"]) == "sk-own-secret-abcdef"
+    cfg = user_store.get_user_ai_config(u["user_id"]) or {}
+    assert not cfg.get("base_url")
 
 
 def test_owner_config_get_uses_platform():
@@ -366,7 +399,8 @@ def test_ai_run_no_credentials_400():
     r = c.post("/api/ai/run", json={"slide": "own400.svs"})
     assert r.status_code == 400
     j = r.get_json()
-    assert j and "未配置 AI 凭据" in (j.get("error") or "")
+    assert j and "平台 AI 未配置" in (j.get("error") or "")
+    assert "联系管理员" in (j.get("error") or "")
 
 
 def test_ai_run_authorized_proxies_with_owner():
@@ -498,6 +532,7 @@ def test_owner_run_does_not_inject_session_owner():
 
 
 def test_user_put_loopback_base_url_rejected():
+    """user PUT 凭据字段整包 400（不再进入 SSRF 校验——无写入通道）。"""
     _reset_config()
     _setup_platform()
     u = user_store.create_user("u@x.com", "password1", role="user")
@@ -507,7 +542,7 @@ def test_user_put_loopback_base_url_rejected():
         "use_platform": False, "base_url": "http://127.0.0.1:8317/v1",
         "model": "gpt-own", "api_key": "sk-own-secret-abcdef"})
     assert r.status_code == 400
-    assert "内网" in (r.get_json() or {}).get("error", "")
+    assert "平台统一提供" in (r.get_json() or {}).get("error", "")
 
 
 def test_user_put_link_local_metadata_base_url_rejected():
@@ -522,7 +557,8 @@ def test_user_put_link_local_metadata_base_url_rejected():
     assert r.status_code == 400
 
 
-def test_build_sidecar_rejects_private_own_url():
+def test_build_sidecar_ignores_private_own_url():
+    """存量私网 own base_url 不再进入 sidecar（user 恒平台）；平台未配 → None。"""
     _reset_config()
     u = user_store.create_user("u@x.com", "password1", role="user")
     user_store.set_user_ai_config(u["user_id"], {
@@ -530,3 +566,9 @@ def test_build_sidecar_rejects_private_own_url():
         "model": "gpt-own", "api_key": "sk-own-secret"})
     cfg = app_mod._build_sidecar_config({"role": "user", "user_id": u["user_id"]})
     assert cfg is None
+    # 平台已配时忽略存量私网 own URL，走平台且不注入 ssrf_guard
+    _setup_platform()
+    cfg2 = app_mod._build_sidecar_config({"role": "user", "user_id": u["user_id"]})
+    assert cfg2 is not None
+    assert cfg2["base_url"] == "http://platform/v1"
+    assert cfg2.get("ssrf_guard") is not True

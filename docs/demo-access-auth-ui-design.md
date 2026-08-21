@@ -474,6 +474,8 @@ owner 额外看到：
 
 user 的 AI 配置需持久化自己的 `max_steps`：默认 20，当前允许 1–500。当 `use_platform=true` 时，服务端忽略该用户值并注入 owner 配置的平台 AI 步数（默认 20）；当 `use_platform=false` 且自带凭据完整时，才注入用户设置的步数。浏览器请求不能临时提交一个未保存的更大值绕过配置校验。
 
+> **2026-08 更新**：user 的「自定义 API（自带凭据）」通道已下线——AI 服务统一由平台提供。`_resolve_ai_credentials` 对 user 恒返回平台（未配置则不可用并提示联系管理员）；user `PUT /api/ai/config` 任意字段一律 400「AI 服务由平台统一提供，用户无需配置」；user GET 的 `using` 只会是 `"platform"` 或 `null`。上表与上文中的「自带凭据 / use_platform=false / max_steps 用户自设」等描述为历史设计，保留作演进记录；`user_store` 中的旧凭据字段保留不读（无害存量）。
+
 ### 9.3 Demo session 表
 
 建议字段：

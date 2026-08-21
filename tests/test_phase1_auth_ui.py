@@ -607,8 +607,8 @@ def test_i18n_no_admin_only_wording_left():
     for required in ("登录 PathTogether", "Log in to PathTogether",
                      "登录后继续查看、测试 AI 和协作",
                      "AI 导航助手", "AI navigation assistant",
-                     "平台 AI 配置", "我的 AI 设置",
-                     "Platform AI config", "My AI settings",
+                     "平台 AI 配置", "AI 服务（平台统一提供）",
+                     "Platform AI config", "AI service (platform-provided)",
                      "只能分享你拥有的切片", "允许标注", "允许下载"):
         assert required in text, "i18n.js 缺新文案：%r" % required
 

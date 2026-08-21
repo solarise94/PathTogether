@@ -1208,6 +1208,9 @@ def index():
         app_mode="official",
         capabilities=_app_capabilities("official"),
         histopilot_ui_enabled=histopilot_render,
+        # AI 面板按角色渲染（user 不再输出自带凭据表单，AI 服务统一由平台提供；
+        # 与 current_identity 同口径：无 role（内网/未登录）归一 owner）
+        viewer_role=current_identity()["role"],
         sample_plugin_enabled=sample["enabled"],
         sample_plugin_permissions=sample["permissions"],
     )
@@ -4685,11 +4688,10 @@ def _ai_run_prepare(user_ctx, body, slide, need_grant):
         return rid_err
     config = _build_sidecar_config(user_ctx)
     if config is None:
-        return (
-            jsonify(error="未配置 AI 凭据：请在设置中填写平台官方 API 或你的 "
-                          "base_url/model/api_key"),
-            400,
-        )
+        # AI 服务统一由平台提供：user 只能联系管理员；owner 自行完成平台配置
+        if (user_ctx or {}).get("role") == user_store.ROLE_USER:
+            return (jsonify(error="平台 AI 未配置，请联系管理员"), 400)
+        return (jsonify(error="未配置 AI 凭据：请在 AI 配置中填写平台官方 API"), 400)
     # 仅 user 注入归属：role=owner 的会话保持无 owner（owner 全量可见、可续跑
     # 任意会话；内网模式不注入）。
     if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
@@ -5104,32 +5106,26 @@ def _platform_configured(cfg: dict) -> bool:
 
 
 def _resolve_ai_credentials(user_ctx):
-    """按身份解析 AI 凭据来源（Stage 3a 2b §5.1.2）。
+    """按身份解析 AI 凭据来源（AI 服务统一由平台提供）。
 
     返回 (source, cfg)：
-      source = "platform"：使用平台官方配置（owner 或 user 走 use_platform 且平台已配）；
-      source = "own"    ：使用 user 自带 key（base_url/model/api_key 均需齐备）；
-      source = None     ：无可用的官方 key 且 user 自带凭据不全 → 不可用（调用方回 400）。
-    cfg 在 "platform" 时为平台配置 dict（api_key 已解密为明文）；在 "own" 时为
-    {"base_url","model","api_key"}（api_key 解密为明文）。
+      source = "platform"：平台官方配置可用（owner；或 user——user 不再有
+               自带 API 通道，平台已配置即走平台）；
+      source = None     ：user 且平台未配置 → 不可用（调用方回 400 提示联系
+               管理员）。
+    cfg 在 "platform" 时为平台配置 dict（api_key 已解密为明文）。
+
+    历史：p3fix B1 曾允许 user 自带 base_url/model/api_key（source="own"），
+    现已下线；user_store 里遗留的旧凭据字段保留不读（无害存量数据）。
     """
     platform_cfg = _load_ai_config()
     if user_ctx is None or user_ctx.get("role") == user_store.ROLE_OWNER:
         # owner（或 AUTH_ENABLED=False 时 current_identity 归一为 owner）→ 平台
         return "platform", platform_cfg
-    uid = user_ctx.get("user_id")
-    own = user_store.get_user_ai_config(uid) if uid else None
-    if own is None:
-        return None, None
-    if own.get("use_platform") and _platform_configured(platform_cfg):
+    # user：一律平台（平台未配置 → 不可用；旧自带凭据不再作为回退）
+    if _platform_configured(platform_cfg):
         return "platform", platform_cfg
-    # 用户自带 key：base_url/model/api_key 三项齐备才算可用
-    base = (own.get("base_url") or "").strip()
-    model = (own.get("model") or "").strip()
-    key = _decrypt_api_key(own.get("api_key") or "")
-    if not (base and model and key):
-        return None, None
-    return "own", {"base_url": base, "model": model, "api_key": key}
+    return None, None
 
 
 _SSRF_BLOCKED_HOSTS = frozenset({
@@ -5222,15 +5218,13 @@ def _build_sidecar_config(user_ctx=None) -> dict:
 
     user_ctx 为 current_identity() 结果（{"role","user_id"}）或 None：
       - owner（含 AUTH_ENABLED=False 的归一 owner）→ 平台配置；
-      - user → 按 §5.1.2 解析（use_platform 且平台已配 → 平台；否则自带凭据）；
-        自带凭据缺 key/base_url/model → 返回 None（调用端点回 400 指导去设置）。
+      - user → 平台统一提供：平台已配置走平台，未配置返回 None（调用端点回
+        400 提示联系管理员；旧版 user 自带凭据通道已下线，存量数据不再读取）。
     tuning 调优字段始终来自平台 ai_config.json（user 无独立调优）。
-    max_steps 注入规则（docs §9.2 / §12.3，不再一律用平台 ai_config.json 的 50）：
+    max_steps 注入规则（docs §9.2 / §12.3）：
       - owner：平台 ai_config.json 值（现状不变，owner 自担）；
-      - user + platform：忽略用户保存值，注入周期 platform_task_max_steps（默认 20）；
-      - user + own：注入**已保存**的用户 max_steps（默认 20），并按当前周期
-        own_task_max_steps_limit（默认 500）clamp——浏览器无法用请求体临时塞
-        更大值绕过（起跑类端点不读请求体里的调优字段，注入只读已保存配置）。
+      - user：一律平台模式，注入周期 platform_task_max_steps（默认 20），
+        忽略用户曾保存的自带 API 步数（注入只读已保存配置，请求体不可绕过）。
     返回的 dict 直接作为 sidecar body 的 `config` 字段。
     """
     source, cred_cfg = _resolve_ai_credentials(user_ctx)
@@ -5242,30 +5236,18 @@ def _build_sidecar_config(user_ctx=None) -> dict:
     out["base_url"] = cred_cfg.get("base_url") or ""
     out["api_key"] = cred_cfg.get("api_key") or ""  # 已解密为明文
     out["model"] = cred_cfg.get("model") or ""
-    # api_protocol 缺省 openai（用户自带 key 无此字段，落默认）
+    # api_protocol 缺省 openai（平台配置未写时落默认）
     out["api_protocol"] = cred_cfg.get("api_protocol") or "openai"
     # ---- max_steps 注入（docs §9.2）----
     if (user_ctx is not None
             and user_ctx.get("role") == user_store.ROLE_USER
             and user_ctx.get("user_id")):
-        if source == "platform":
-            out["max_steps"] = _platform_task_max_steps()
-        else:  # own：已保存的用户值 + 周期硬上限 clamp
-            own_cfg = user_store.get_user_ai_config(user_ctx["user_id"]) or {}
-            try:
-                saved = int(own_cfg.get("max_steps"))
-            except (TypeError, ValueError):
-                saved = DEFAULT_USER_MAX_STEPS
-            out["max_steps"] = max(1, min(saved, _own_task_max_steps_limit()))
+        # user 恒平台模式：注入周期 platform_task_max_steps（默认 20）
+        out["max_steps"] = _platform_task_max_steps()
     # 运行时再守一次：即使加载迁移未持久化，注入 sidecar 的值也不能 <128。
     _apply_legacy_reserve_migration(out)
-    if source == "own":
-        try:
-            _assert_user_base_url(out["base_url"])
-        except ValueError:
-            return None
-        # sidecar 连接层固定解析 IP 并禁止重定向（关闭 DNS rebinding / 30x 跳内网）
-        out["ssrf_guard"] = True
+    # source 恒为 "platform"（user 自带凭据通道已下线）；owner 平台 URL 不受
+    # SSRF 限制（demo 常用 http://127.0.0.1:8317/v1），故不再注入 ssrf_guard。
     return out
 
 
@@ -5712,18 +5694,18 @@ def api_slide_region(name):
 
 @app.route("/api/ai/config", methods=["GET", "PUT"])
 def api_ai_config():
-    """读写 AI 配置（Stage 3a-2b §5.1.2 角色化）。
+    """读写 AI 配置（AI 服务统一由平台提供，角色化）。
 
     GET：
-      - owner：读写**平台**配置（现状）；返回 platform_configured、using="platform"。
-      - user：读写**自己的**凭据（use_platform/base_url/model/api_key 掩码回显）；
-        tuning 调优字段只读平台值（不可改）；返回 platform_configured 与
-        using="platform"|"own"|null（前端据此人话提示）。AUTH_ENABLED=False
-        （current_identity 归一 owner）→ 平台配置。
+      - owner：读写**平台**配置（现状不变）；返回 platform_configured、using="platform"。
+      - user：只读。using 恒为 "platform"（平台已配置）或 null（平台未配置，前端
+        提示联系管理员）；调优字段只读平台值。use_platform/base_url/model/api_key_*
+        为旧自带凭据通道的存量回显（不再有写入通道，仅供过渡期兼容）。
+        AUTH_ENABLED=False（current_identity 归一 owner）→ 平台配置。
     PUT：
       - owner：全字段（现状不变）。
-      - user：只接受凭据四字段（use_platform/base_url/model/api_key）；tuning 字段
-        若与平台值相同则忽略、不同则 403（明确拒绝 user 改调优）。
+      - user：无任何可写字段——任意字段（含空负载）一律 400「AI 服务由平台统一
+        提供，用户无需配置」（p3fix B1 的凭据四字段 + max_steps 通道已下线）。
 
     api_key 脱敏：api_key_set:bool + 掩码（前4后4），不回显明文。api_key 加密存盘
     （Fernet），旧明文自动迁移。api_key 不入日志。
@@ -5749,100 +5731,16 @@ def api_ai_config():
             for k, v in DEFAULT_CONFIG.items():
                 out[k] = platform_cfg.get(k, v)
             return jsonify(out)
-        # user：自己的凭据 + 平台调优只读
-        own = user_store.get_user_ai_config(user_ctx.get("user_id")) or {}
-        own_key = _decrypt_api_key(own.get("api_key") or "")
-        own_key_set = bool(own_key)
-        # using：解析当前实际生效来源（与 _resolve_ai_credentials 一致）
-        source, _ = _resolve_ai_credentials(user_ctx)
-        using = source
-        out = {
-            "use_platform": bool(own.get("use_platform", True)),
-            "base_url": own.get("base_url") or "",
-            "api_key_set": own_key_set,
-            "api_key_mask": _mask_api_key(own_key),
-            "model": own.get("model") or "",
-            "platform_configured": platform_configured,
-            # 平台模型名不下发普通用户（平台运营信息，仅 owner 可见；
-            # user 侧来源提示用 i18n ai.config.using.platform.plain）
-            "using": using,
-        }
-        # tuning 字段只读平台值（user 无独立调优）
-        for k, v in DEFAULT_CONFIG.items():
-            out[k] = platform_cfg.get(k, v)
-        out["max_tokens"] = platform_cfg.get("max_tokens") or 2048
-        out["api_protocol"] = platform_cfg.get("api_protocol") or "openai"
-        _apply_user_max_steps_view(out, own, source)
-        return jsonify(out)
+        # user：只读回显（_ai_user_config_get：using 恒 platform/null + 平台调优只读）
+        return jsonify(_ai_user_config_get(user_ctx))
 
     body = request.get_json(silent=True) or {}
 
     if not is_owner:
-        # ---- user PUT：只接受凭据四字段 + max_steps（docs §9.2）----
-        allowed = {"use_platform", "base_url", "model", "api_key", "max_steps"}
-        # tuning 字段：与平台值相同则忽略；不同则 403（max_steps 除外——它是
-        # user 自带 API 模式的自有字段，单独按下限/硬上限校验，见下）。
-        platform_cfg = _load_ai_config()
-        for k, v in DEFAULT_CONFIG.items():
-            if k == "max_steps":
-                continue
-            if k in body and body[k] != platform_cfg.get(k, v):
-                return jsonify(error="会话调优参数由管理员配置，用户不可修改"), 403
-        for extra in ("max_tokens", "api_protocol"):
-            if extra in body and body.get(extra) != (platform_cfg.get(extra) or (2048 if extra == "max_tokens" else "openai")):
-                return jsonify(error="会话调优参数由管理员配置，用户不可修改"), 403
-        unknown = set(body.keys()) - allowed
-        if unknown:
-            return jsonify(error="未知字段：{}".format(", ".join(sorted(unknown)))), 400
-        own = user_store.get_user_ai_config(user_ctx.get("user_id"))
-        if own is None:
-            return _denied()
-        pending = {}
-        if "use_platform" in body:
-            up = body.get("use_platform")
-            if not isinstance(up, bool):
-                return jsonify(error="use_platform 需为布尔值"), 400
-            pending["use_platform"] = up
-        if "base_url" in body:
-            url = str(body.get("base_url") or "").strip()
-            if url:
-                try:
-                    _assert_user_base_url(url)
-                except ValueError as e:
-                    return jsonify(error=str(e)), 400
-            pending["base_url"] = url
-        if "model" in body:
-            pending["model"] = str(body.get("model") or "").strip()
-        # max_steps（自带 API 步数，docs §9.2/§12.3）：1 ≤ v ≤ 当前周期硬上限
-        # （缺省 500）。保存与 use_platform 无关——切回自带 API 时即生效；平台
-        # AI 模式下注入层忽略该值（注入 platform_task_max_steps）。
-        if "max_steps" in body:
-            steps, err = _coerce_tuning_int(body.get("max_steps"), "max_steps")
-            if err:
-                return jsonify(error=err), 400
-            hard = _own_task_max_steps_limit()
-            if steps < 1:
-                return jsonify(error="max_steps 不可小于 1"), 400
-            if steps > hard:
-                return jsonify(
-                    error="max_steps 不可超过 {}（系统硬上限）".format(hard)), 400
-            pending["max_steps"] = steps
-        # api_key：空=清除；掩码同值=不变；其他=覆盖（明文 → 加密落盘）
-        if "api_key" in body:
-            new_key = body.get("api_key")
-            if new_key is None:
-                pass  # 不传不动
-            else:
-                new_key = str(new_key)
-                if new_key == "":
-                    pending["api_key"] = ""  # 清除
-                elif new_key == _mask_api_key(_decrypt_api_key(own.get("api_key") or "")):
-                    pass  # 与掩码同值，不变
-                else:
-                    pending["api_key"] = _encrypt_api_key(new_key)
-        user_store.set_user_ai_config(user_ctx["user_id"], pending)
-        # 回显（user 视角）
-        return _ai_user_config_get(user_ctx), 200
+        # ---- user PUT：AI 服务由平台统一提供，无任何可写字段 ----
+        # 凭据四字段（use_platform/base_url/model/api_key）、max_steps 与其它
+        # 任何字段一律 400（旧自带 API 通道已下线；user_store 存量数据保留不动）。
+        return jsonify(error="AI 服务由平台统一提供，用户无需配置"), 400
 
     # ---- owner PUT：现状不变（全字段） ----
     cfg = _load_ai_config()
@@ -5939,7 +5837,12 @@ def _apply_user_max_steps_view(out, own, source):
 
 
 def _ai_user_config_get(user_ctx):
-    """构造 user 视角的 GET /api/ai/config 回显（供 PUT 后复用）。"""
+    """构造 user 视角的 GET /api/ai/config 只读回显。
+
+    using 恒为 "platform"（平台已配置）或 null（平台未配置）。use_platform /
+    base_url / model / api_key_* 为旧自带凭据通道的存量回显，仅过渡期兼容，
+    已无对应写入通道（user PUT 一律 400）。
+    """
     platform_cfg = _load_ai_config()
     platform_configured = _platform_configured(platform_cfg)
     own = user_store.get_user_ai_config(user_ctx.get("user_id")) or {}

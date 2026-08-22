@@ -5892,6 +5892,16 @@ _BUDGET_RECLAIM_THREAD = _start_budget_reclaim_thread()
 # 默认参数（§8.1；ai_config.json 可覆盖）。base_url/api_key/model/max_tokens/
 # api_protocol 是基础字段（不在 DEFAULT_CONFIG，分别由 ai_config.json 显式存），
 # 调优参数集中在此。keep_recent_images 为 Step 4 加入的图片淘汰窗口（正整数）。
+#
+# DEFAULT_MAX_TOKENS：单次响应输出上限缺省。2026-08-23 起 = DeepSeek 官方
+# MAX OUTPUT 上限 384K（api-docs.deepseek.com/quick_start/pricing：
+# v4-flash / v4-pro / v4-flash-vision-exp 均为 384K，context 1M）。旧默认 2048
+# 会让当前平台模型（deepseek-v4-flash-vision-exp）在正常读片回复时被
+# length 截断，runner 以 reason=max_tokens 暂停（生产事故 sess_aa5d805a，
+# 2 步即停）。CPA 对 vision-exp（deepseek-official 直连）无钳制，该值会
+# 原样透传；runinfra 组另有 32768 钳制。
+DEFAULT_MAX_TOKENS = 384000
+
 DEFAULT_CONFIG = {
     "max_steps": 50,
     # §9.2.1：窗口与视觉预算改由 window_tier（默认 balanced=400k/60000）推导；
@@ -5904,7 +5914,7 @@ DEFAULT_CONFIG = {
     "fork_active_limit": 20,
     "lease_ttl": 150.0,
     "event_buffer": 200,
-    "max_tokens": 2048,
+    "max_tokens": DEFAULT_MAX_TOKENS,
     # ---- Phase 1 图片管线降本（§11） ----
     # 视觉工作集上限（不含稳定概览）；keep_recent_images 的后继字段。
     "visual_working_set_max": 4,
@@ -6607,7 +6617,7 @@ def api_ai_config():
                 "api_key_set": bool(key),
                 "api_key_mask": _mask_api_key(key),
                 "model": platform_cfg.get("model") or "",
-                "max_tokens": platform_cfg.get("max_tokens") or 2048,
+                "max_tokens": platform_cfg.get("max_tokens") or DEFAULT_MAX_TOKENS,
                 "api_protocol": platform_cfg.get("api_protocol") or "openai",
                 "platform_configured": platform_configured,
                 "using": "platform",
@@ -6686,7 +6696,7 @@ def api_ai_config():
         "api_key_set": bool(key),
         "api_key_mask": _mask_api_key(key),
         "model": cfg.get("model") or "",
-        "max_tokens": cfg.get("max_tokens") or 2048,
+        "max_tokens": cfg.get("max_tokens") or DEFAULT_MAX_TOKENS,
         "api_protocol": cfg.get("api_protocol") or "openai",
         "platform_configured": _platform_configured(cfg),
         "using": "platform",
@@ -6743,7 +6753,7 @@ def _ai_user_config_get(user_ctx):
     }
     for k, v in DEFAULT_CONFIG.items():
         out[k] = platform_cfg.get(k, v)
-    out["max_tokens"] = platform_cfg.get("max_tokens") or 2048
+    out["max_tokens"] = platform_cfg.get("max_tokens") or DEFAULT_MAX_TOKENS
     out["api_protocol"] = platform_cfg.get("api_protocol") or "openai"
     _apply_user_max_steps_view(out, own, source)
     return out

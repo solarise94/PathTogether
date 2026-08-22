@@ -5285,16 +5285,20 @@ def _ai_budget_subject(user_ctx):
 def _user_ai_access_denied(user_id):
     """user 平台 AI 访问闸（docs §3.7：受邀用户默认 ai_access=false）。
 
-    返回 (403 响应) 或 None。owner 不经过本闸（保留池即 owner 可用）。存量/
-    owner 创建的用户 ai_access 缺省 True（0012 列默认），行为不变。
+    返回 (403 响应) / (503 响应) 或 None。owner 不经过本闸（保留池即 owner
+    可用）。存量/owner 创建的用户 ai_access 缺省 True（0012 列默认），行为
+    不变。读取异常 fail-closed 503（P0-B review：ai_access=false 的用户不能
+    因一次读库抖动获得平台 AI 访问）。
     """
     if not user_id:
         return None
     try:
         u = user_store.get_user(user_id)
     except Exception:
-        app.logger.exception("ai_access 读取失败（fail-open 仅限存量语义）")
-        return None
+        app.logger.exception("ai_access 读取失败（fail-closed 503）")
+        return (jsonify(error="平台 AI 访问状态确认失败，请稍后重试",
+                        code="ai_access_check_unavailable"),
+                503)
     if u is not None and not u.get("ai_access", True):
         return (jsonify(error="平台 AI 尚未对你开放，请联系管理员开通",
                         code="ai_access_required"),

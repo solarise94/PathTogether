@@ -255,6 +255,27 @@ def test_ai_access_gate_blocks_and_grants(monkeypatch):
     assert err4 is None and resv4["state"] == "reserved"
 
 
+def test_ai_access_gate_read_error_fails_closed(monkeypatch):
+    """P0-B review 修复：ai_access 用户行读取异常 → fail-closed 503
+    （ai_access=false 的用户不能因一次读库抖动获得平台 AI 访问）。"""
+    u, _inv = _redeem_new_user("gate-err@x.com", ai_access=True)
+    monkeypatch.setattr(
+        app_mod, "_resolve_ai_credentials",
+        lambda ctx: ("platform", {"base_url": "http://127.0.0.1:9/v1",
+                                  "api_key": "k", "model": "m"}))
+
+    def _boom(_uid):
+        raise RuntimeError("simulated read failure")
+
+    monkeypatch.setattr(user_store, "get_user", _boom)
+    with app_mod.app.test_request_context():
+        resv, err = app_mod._ai_reserve_run_budget(
+            {"role": "user", "user_id": u["user_id"]}, _req())
+        assert resv is None
+        assert err is not None and err[1] == 503
+        assert err[0].get_json()["code"] == "ai_access_check_unavailable"
+
+
 def test_ai_access_admin_api(monkeypatch):
     """POST /api/admin/users/<id>/ai-access：owner-only + CSRF + 持久化。"""
     from _pt_helpers import csrf_client

@@ -68,6 +68,9 @@ if _RUN_PG:
         "platform_settings", "auth_rate_limits",
         "ai_budget_usage", "ai_budget_reservations", "ai_budget_periods",
         "demo_sessions", "demo_catalog",
+        # 0012 起：邀请注册（registration_invites；users 的 ai_access 列随
+        # users 清空重置）
+        "registration_invites",
     )
 
     @pytest.fixture(scope="session")

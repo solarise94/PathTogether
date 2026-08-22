@@ -522,28 +522,35 @@ def test_register_post_always_rejected_phase1():
     assert r2.status_code == 403
 
 
-def test_registration_open_reads_settings_store(monkeypatch):
-    """/api/admin/users 的 registration_open 来自 settings_store（PG 权威/env）。"""
+def test_registration_mode_reads_settings_store(monkeypatch):
+    """/api/admin/users 的 registration_mode 来自 settings_store（PG 权威）。"""
     app_mod.AUTH_ENABLED = True
     owner, _u = _setup_owner_and_user()
     client = _client()
     with client.session_transaction() as s:
         s.update({"auth_user": "o", "user_id": owner["user_id"], "role": "owner"})
-    monkeypatch.setattr(app_mod.settings_store, "get_registration_open",
-                        lambda: True)
+    # json 后端下打开前置条件闸（PG 运行时三条件真实满足）
+    monkeypatch.setattr(app_mod, "_registration_precondition_failures",
+                        lambda environ=None: [])
+    monkeypatch.setattr(app_mod.settings_store, "get_registration_mode",
+                        lambda: "invite_only")
     body = client.get("/api/admin/users").get_json()
+    assert body["registration_mode"] == "invite_only"
+    # 旧 UI 兼容字段
     assert body["registration_open"] is True
-    monkeypatch.setattr(app_mod.settings_store, "get_registration_open",
-                        lambda: False)
+    monkeypatch.setattr(app_mod.settings_store, "get_registration_mode",
+                        lambda: "closed")
     body2 = client.get("/api/admin/users").get_json()
+    assert body2["registration_mode"] == "closed"
     assert body2["registration_open"] is False
 
 
-def test_registration_open_fail_closed_on_error(monkeypatch):
+def test_registration_mode_fail_closed_on_error(monkeypatch):
     def boom():
         raise RuntimeError("store down")
-    monkeypatch.setattr(app_mod.settings_store, "get_registration_open", boom)
-    assert app_mod._registration_open() is False
+    monkeypatch.setattr(app_mod.settings_store, "get_registration_mode", boom)
+    assert app_mod._registration_mode_stored() == "closed"
+    assert app_mod._effective_registration_mode() == "closed"
 
 
 # =========================================================================== #

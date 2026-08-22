@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="referrer" content="no-referrer" />
   <title>PathTogether · Register</title>
   <script src="/static/i18n.js?v=20260817p1"></script>
   <style>
@@ -12,6 +13,7 @@
       --bg: #f5f5f7;
       --text: #1d1d1f;
       --text-2: #86868b;
+      --danger: #FF3B30;
       --separator: rgba(0, 0, 0, 0.08);
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -49,7 +51,7 @@
     }
     .card {
       width: 100%;
-      max-width: 400px;
+      max-width: 420px;
       background: #fff;
       border-radius: 16px;
       box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), 0 12px 32px rgba(0, 0, 0, 0.10);
@@ -77,6 +79,47 @@
       color: var(--text-2);
       line-height: 1.7;
       margin-bottom: 24px;
+      text-align: left;
+    }
+    .error-box {
+      background: rgba(255, 59, 48, 0.08);
+      color: var(--danger);
+      font-size: 13px;
+      text-align: center;
+      padding: 9px 12px;
+      border-radius: 9px;
+      margin-bottom: 16px;
+    }
+    .field { margin-bottom: 14px; text-align: left; }
+    label {
+      display: block;
+      font-size: 12px;
+      color: var(--text-2);
+      margin-bottom: 6px;
+      font-weight: 500;
+    }
+    input[type="text"], input[type="password"] {
+      width: 100%;
+      height: 38px;
+      border: 1px solid var(--separator);
+      border-radius: 9px;
+      padding: 0 12px;
+      font-size: 14px;
+      font-family: inherit;
+      color: var(--text);
+      background: #fff;
+      outline: none;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    input[type="text"]:focus, input[type="password"]:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.15);
+    }
+    .hint {
+      font-size: 11px;
+      color: var(--text-2);
+      margin-top: 5px;
+      line-height: 1.5;
     }
     .actions {
       display: flex;
@@ -93,6 +136,8 @@
       font-family: inherit;
       text-decoration: none;
       cursor: pointer;
+      border: none;
+      width: 100%;
     }
     .btn.primary { background: var(--accent); color: #fff; }
     .btn.primary:hover { background: var(--accent-hover); }
@@ -108,10 +153,90 @@
       color: var(--text-2);
       line-height: 1.5;
     }
+    .alt-link {
+      display: block;
+      margin-top: 14px;
+      font-size: 13px;
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 500;
+    }
+    .alt-link:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
   <button type="button" class="lang-toggle" aria-label="Switch language">EN</button>
+
+  {% if mode == "invite_only" %}
+  <main class="card">
+    <span class="badge" data-i18n="register.badge">邀请注册</span>
+    <h1 class="title" data-i18n="register.invite.title">使用邀请码完成注册</h1>
+    <p class="desc" data-i18n="register.invite.desc">输入管理员发给你的邀请码，并设置你自己的密码。注册成功后请返回登录页登录。邀请码仅可使用一次，请勿在聊天或公开场合转发。</p>
+
+    {% if error %}
+    <div class="error-box" role="alert">{{ error }}</div>
+    {% endif %}
+
+    <!-- 邀请码只放 POST body（docs §4.2）：表单 POST，绝不进 URL query/path -->
+    <form method="POST" action="/register" id="register-form" autocomplete="on">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+      <div class="field">
+        <label for="invite_token" data-i18n="register.invite.code">邀请码</label>
+        <input id="invite_token" name="invite_token" type="text" required
+               autocomplete="off" spellcheck="false" autofocus
+               data-i18n-ph="register.invite.code.ph" placeholder="粘贴管理员发送的邀请码" />
+      </div>
+      <div class="field">
+        <label for="email" data-i18n="register.invite.email">邮箱 / 用户名</label>
+        <input id="email" name="email" type="text" required maxlength="120"
+               autocomplete="username"
+               data-i18n-ph="register.invite.email.ph" placeholder="邀请码绑定的邮箱" />
+      </div>
+      <div class="field">
+        <label for="display_name" data-i18n="register.invite.display">显示名（可选）</label>
+        <input id="display_name" name="display_name" type="text" maxlength="120"
+               autocomplete="nickname"
+               data-i18n-ph="register.invite.display.ph" placeholder="其他人看到的名字" />
+      </div>
+      <div class="field">
+        <label for="password" data-i18n="register.invite.password">设置密码</label>
+        <input id="password" name="password" type="password" required minlength="8"
+               maxlength="200" autocomplete="new-password"
+               data-i18n-ph="register.invite.password.ph" placeholder="至少 8 位，推荐 12 位以上" />
+        <!-- 允许密码管理器生成与粘贴：不做 onpaste 拦截（docs §4.4） -->
+        <p class="hint" data-i18n="register.invite.password.hint">推荐 12 位以上或长口令；可直接使用密码管理器生成并粘贴。</p>
+      </div>
+      <div class="field">
+        <label for="password_confirm" data-i18n="register.invite.confirm">确认密码</label>
+        <input id="password_confirm" name="password_confirm" type="password" required
+               minlength="8" maxlength="200" autocomplete="new-password" />
+      </div>
+      <button class="btn primary" type="submit" id="register-submit"
+              data-i18n="register.invite.submit">创建账号</button>
+    </form>
+
+    <a class="alt-link" href="/login" data-i18n="register.back">返回登录</a>
+    <p class="footer" data-i18n="entry.footer">仅用于研究、教学和软件演示，不用于临床诊断。</p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+      var t = function (k, v) { return (window.HP_I18N && HP_I18N.t(k, v)) || ""; };
+      var form = document.getElementById("register-form");
+      var btn = document.getElementById("register-submit");
+      if (form && btn) {
+        form.addEventListener("submit", function () {
+          if (form.dataset.submitting === "1") { return; }
+          form.dataset.submitting = "1";
+          btn.disabled = true;
+          btn.textContent = t("register.invite.submitting") || "创建中…";
+        });
+      }
+    })();
+  </script>
+
+  {% else %}
   <main class="card">
     <span class="badge" data-i18n="register.badge">邀请注册</span>
     <h1 class="title" data-i18n="register.title">当前采用邀请注册</h1>
@@ -122,5 +247,6 @@
     </div>
     <p class="footer" data-i18n="entry.footer">仅用于研究、教学和软件演示，不用于临床诊断。</p>
   </main>
+  {% endif %}
 </body>
 </html>

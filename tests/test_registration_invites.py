@@ -1,0 +1,621 @@
+# -*- coding: utf-8 -*-
+"""P0-B 邀请注册测试（docs §4.1–§4.4 / §6.1）。
+
+两段：
+  - 模式与 fail-closed（json/PG 双跑，monkeypatch 存储值）：closed/invite_only/
+    public 三模式行为；前置条件缺失降级 closed；启动检查告警；PUT 校验；
+    CSRF 缺失 400；
+  - PG 数据层（仅 RUN_PG_TESTS=1）：token 只存 hash、明文只在创建返回一次；
+    无/随机/过期/撤销/已消费统一失败；邮箱规范化与不匹配；20 路并发兑换仅一个
+    成功；邮箱唯一冲突时邀请码未消费；token 不出现在列表/审计/异常文本；
+    旧布尔 registration_open=true 的 fail-closed 迁移；owner 管理 API。
+"""
+import os
+import sys
+import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+TMP = tempfile.mkdtemp(prefix="svs-p0b-inv-")
+DATA_DIR = os.path.join(TMP, "share-data")
+UPLOAD_DIR = os.path.join(TMP, "uploads")
+os.environ["SHARE_DATA_DIR"] = DATA_DIR
+os.environ["UPLOAD_DIR"] = UPLOAD_DIR
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.environ["ADMIN_PASSWORD"] = ""
+
+try:
+    import openslide  # noqa: F401
+except ImportError:
+    import types as _types
+    _os = _types.ModuleType("openslide")
+    _os.OpenSlide = object
+    sys.modules["openslide"] = _os
+    _dz = _types.ModuleType("openslide.deepzoom")
+    _dz.DeepZoomGenerator = object
+    sys.modules["openslide.deepzoom"] = _dz
+
+import pytest  # noqa: E402
+
+import share_store  # noqa: E402
+import user_store  # noqa: E402
+import app as app_mod  # noqa: E402
+import platform_features  # noqa: E402
+import registration_store  # noqa: E402
+import settings_store  # noqa: E402
+from pg_compat import BACKEND  # noqa: E402
+from _pt_helpers import csrf_client  # noqa: E402
+
+pg_only = pytest.mark.skipif(
+    BACKEND != "postgres",
+    reason="registration_invites 数据层需 PG（RUN_PG_TESTS=1）",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate(monkeypatch):
+    """每用例：json 路径隔离 + 恢复注册相关 env/状态。"""
+    data_dir = Path(DATA_DIR)
+    monkeypatch.setenv("SHARE_DATA_DIR", DATA_DIR)
+    monkeypatch.setattr(user_store, "SHARE_DATA_DIR", data_dir)
+    monkeypatch.setattr(user_store, "USER_FILE", data_dir / "users.json")
+    monkeypatch.setattr(share_store, "SHARE_DATA_DIR", data_dir)
+    monkeypatch.setattr(share_store, "SHARE_FILE", data_dir / "shares.json")
+    share_store.set_owner_user_id("")
+    if BACKEND == "json":
+        for name in ("users.json", "users.json.bak", "shares.json",
+                     "shares.json.bak"):
+            p = data_dir / name
+            if p.exists():
+                p.unlink()
+    # 每用例重置 fail-closed 闸的进程内告警标记与 env
+    monkeypatch.setattr(app_mod, "_registration_gate_warned", {"flag": False})
+    for name in ("PUBLIC_BASE_URL", "ADMIN_SESSION_COOKIE_SECURE"):
+        monkeypatch.delenv(name, raising=False)
+    yield
+
+
+def _raw_client(auth=True):
+    app_mod.app.config["TESTING"] = True
+    app_mod.AUTH_ENABLED = auth
+    return app_mod.app.test_client()
+
+
+def _client(auth=True):
+    return csrf_client(_raw_client(auth))
+
+
+def _set_mode(monkeypatch, mode):
+    monkeypatch.setattr(app_mod.settings_store, "get_registration_mode",
+                        lambda: mode)
+
+
+def _satisfy_preconditions(monkeypatch):
+    """env 前置条件（HTTPS + Secure Cookie）。
+
+    注意**不**伪造 platform_features.STORAGE_BACKEND：json 后端下存储语义必须
+    保持真实（前置条件判定会如实报「非 postgres」）。需要在 json 后端打开路由
+    闸的用例改用 _open_route_gate（只 patch 判定函数）。
+    """
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://path.example.com")
+    monkeypatch.setenv("ADMIN_SESSION_COOKIE_SECURE", "1")
+
+
+def _open_route_gate(monkeypatch):
+    """json 后端下打开路由层 invite_only 闸（仅 patch 前置条件判定函数）。"""
+    _satisfy_preconditions(monkeypatch)
+    monkeypatch.setattr(app_mod, "_registration_precondition_failures",
+                        lambda environ=None: [])
+
+
+def _mk_owner():
+    return user_store.create_user("inv-owner@x.com", "ownerpass1", role="owner")
+
+
+def _owner_session(client, owner):
+    with client.session_transaction() as s:
+        s.update({"auth_user": "o", "user_id": owner["user_id"],
+                  "role": "owner"})
+
+
+# =========================================================================== #
+# 1. 三模式 fail-closed 与前置条件（json/PG 双跑）
+# =========================================================================== #
+def test_register_closed_mode_get_and_post():
+    app_mod.AUTH_ENABLED = True
+    client = _client()
+    r = client.get("/register")
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    assert "当前采用邀请注册" in body
+    assert "<form" not in body
+    r2 = client.post("/register", data={"email": "n@x.com",
+                                        "password": "password1"})
+    assert r2.status_code == 403
+    assert "邀请注册" in (r2.get_json() or {}).get("error", "")
+
+
+def test_register_public_mode_not_supported(monkeypatch):
+    _set_mode(monkeypatch, "public")
+    app_mod.AUTH_ENABLED = True
+    client = _client()
+    r = client.get("/register")
+    assert r.status_code == 503
+    assert r.get_json()["code"] == "public_registration_not_supported"
+    r2 = client.post("/register", data={"invite_token": "x",
+                                        "email": "n@x.com",
+                                        "password": "password1"})
+    assert r2.status_code == 503
+    assert r2.get_json()["code"] == "public_registration_not_supported"
+
+
+def test_register_invite_only_renders_form(monkeypatch):
+    _set_mode(monkeypatch, "invite_only")
+    _open_route_gate(monkeypatch)
+    app_mod.AUTH_ENABLED = True
+    client = _client()
+    r = client.get("/register")
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    assert "<form" in body
+    assert 'name="invite_token"' in body
+    assert 'name="csrf_token"' in body
+    assert 'autocomplete="new-password"' in body
+    assert "12" in body  # 密码长度推荐提示
+
+
+def test_invite_only_degraded_without_preconditions(monkeypatch, caplog):
+    """存储值 invite_only 但非 HTTPS/非 Secure/非 PG → 生效模式降级 closed。"""
+    _set_mode(monkeypatch, "invite_only")
+    app_mod.AUTH_ENABLED = True
+    client = _client()
+    r = client.get("/register")
+    assert r.status_code == 200
+    assert "<form" not in r.get_data(as_text=True)  # 关闭态页
+    r2 = client.post("/register", data={"invite_token": "x",
+                                        "email": "n@x.com",
+                                        "password": "password1"})
+    assert r2.status_code == 403
+    assert app_mod._effective_registration_mode() == "closed"
+
+
+@pytest.mark.parametrize("missing", [
+    "PUBLIC_BASE_URL", "ADMIN_SESSION_COOKIE_SECURE", "BACKEND",
+])
+def test_precondition_failures_detected(monkeypatch, missing):
+    _satisfy_preconditions(monkeypatch)
+    if missing == "PUBLIC_BASE_URL":
+        monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+    elif missing == "ADMIN_SESSION_COOKIE_SECURE":
+        monkeypatch.delenv("ADMIN_SESSION_COOKIE_SECURE", raising=False)
+    else:  # BACKEND：降级为 json
+        monkeypatch.setattr(platform_features, "STORAGE_BACKEND", "json")
+    failures = app_mod._registration_precondition_failures()
+    assert failures, "前置条件缺失未被检测到（%s）" % missing
+    _set_mode(monkeypatch, "invite_only")
+    assert app_mod._effective_registration_mode() == "closed"
+
+
+def test_http_public_base_url_rejected(monkeypatch):
+    _satisfy_preconditions(monkeypatch)
+    monkeypatch.setenv("PUBLIC_BASE_URL", "http://path.example.com")
+    assert app_mod._registration_precondition_failures()
+
+
+def test_startup_check_warns_and_degrades(monkeypatch, caplog):
+    monkeypatch.setattr(app_mod.settings_store, "get_registration_mode",
+                        lambda: "invite_only")
+    monkeypatch.delenv("ADMIN_SESSION_COOKIE_SECURE", raising=False)
+    with caplog.at_level("WARNING"):
+        app_mod._check_registration_preconditions_or_warn()
+    assert any("前置条件" in rec.getMessage() for rec in caplog.records)
+
+
+def test_put_registration_mode_validates(monkeypatch):
+    owner = _mk_owner()
+    app_mod.AUTH_ENABLED = True
+    client = _client()
+    _owner_session(client, owner)
+    # public 拒绝
+    r = client.put("/api/admin/settings/registration", json={"mode": "public"})
+    assert r.status_code == 400
+    assert r.get_json()["code"] == "public_registration_not_supported"
+    # invite_only 前置条件不满足 → 400（json 后端）
+    r2 = client.put("/api/admin/settings/registration",
+                    json={"mode": "invite_only"})
+    assert r2.status_code == 400
+    assert "前置条件" in r2.get_json()["error"]
+    # 非法值
+    r3 = client.put("/api/admin/settings/registration", json={"mode": "oops"})
+    assert r3.status_code == 400
+
+
+def test_put_registration_mode_invite_only_with_preconditions(monkeypatch):
+    _satisfy_preconditions(monkeypatch)
+    owner = _mk_owner()
+    app_mod.AUTH_ENABLED = True
+    client = _client()
+    _owner_session(client, owner)
+    r = client.put("/api/admin/settings/registration",
+                   json={"mode": "invite_only"})
+    if BACKEND == "postgres":
+        assert r.status_code == 200, r.get_data(as_text=True)
+        assert r.get_json()["mode"] == "invite_only"
+        # 生效模式受前置条件闸放行
+        assert app_mod._effective_registration_mode() == "invite_only"
+    else:
+        # json 后端：前置条件如实判定失败（STORAGE_BACKEND 非 postgres）→ 400
+        assert r.status_code == 400
+        assert "前置条件" in r.get_json()["error"]
+    # GET settings 反映模式与前置条件
+    g = client.get("/api/admin/settings/registration")
+    assert g.status_code == 200
+    body = g.get_json()
+    assert body["supported_modes"] == ["closed", "invite_only"]
+
+
+def test_register_post_csrf_missing_400(monkeypatch):
+    """invite_only 下 POST /register 缺 CSRF token → 400（统一 CSRF 层）。"""
+    _set_mode(monkeypatch, "invite_only")
+    _open_route_gate(monkeypatch)
+    app_mod.AUTH_ENABLED = True
+    raw = _raw_client()
+    raw.get("/register")
+    r = raw.post("/register", data={"invite_token": "x", "email": "n@x.com",
+                                    "password": "password1"})
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "csrf_required"
+
+
+def test_admin_registration_apis_require_owner(monkeypatch):
+    _satisfy_preconditions(monkeypatch)
+    app_mod.AUTH_ENABLED = True
+    client = _client()
+    # 未登录（AUTH_ENABLED=True）→ 401
+    assert client.get("/api/admin/registration-invites").status_code == 401
+    # 非 owner → 403
+    u = user_store.create_user("plain@x.com", "userpass1", role="user")
+    with client.session_transaction() as s:
+        s.update({"auth_user": "p", "user_id": u["user_id"], "role": "user"})
+    assert client.get("/api/admin/registration-invites").status_code == 403
+    assert client.post("/api/admin/registration-invites",
+                       json={}).status_code == 403
+
+
+# =========================================================================== #
+# 2. PG 数据层：token / 兑换 / 并发 / 审计
+# =========================================================================== #
+def _pg_conn():
+    """直连 PG（dict_row），核对库内行（token_hash 等）。仅 PG 模式可调。"""
+    import psycopg
+    import pg_store
+    c = pg_store.connect()
+    c.row_factory = psycopg.rows.dict_row
+    return c
+
+
+@pg_only
+def test_create_invite_stores_only_hash():
+    owner = _mk_owner()
+    inv = registration_store.create_invite(owner["user_id"],
+                                           email="Alice@X.com")
+    assert inv["token"] and len(inv["token"]) >= 43  # token_urlsafe(32)
+    assert inv["ai_access"] is False
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM registration_invites WHERE invite_id=%s",
+                        (inv["invite_id"],))
+            row = dict(cur.fetchone())
+    finally:
+        conn.close()
+    assert row["token_hash"] == registration_store.invite_token_hash(
+        inv["token"])
+    assert inv["token"] not in row["token_hash"]
+    assert row["email_normalized"] == "alice@x.com"
+    assert row["max_uses"] == 1 and row["use_count"] == 0
+
+
+@pg_only
+def test_list_invites_never_returns_token_or_hash():
+    owner = _mk_owner()
+    inv = registration_store.create_invite(owner["user_id"], email="a@x.com")
+    items = registration_store.list_invites()
+    assert len(items) == 1
+    dumped = repr(items)
+    assert inv["token"] not in dumped
+    assert "token_hash" not in items[0]
+
+
+@pg_only
+def test_redeem_success_consumes_invite_and_creates_user():
+    owner = _mk_owner()
+    inv = registration_store.create_invite(owner["user_id"], email="bob@x.com",
+                                           ai_access=True, cohort="t1")
+    out = registration_store.redeem_invite(inv["token"], "bob@x.com",
+                                           "longpassword1", "Bob")
+    user = user_store.get_user(out["user"]["user_id"])
+    assert user["role"] == "user"
+    assert user["email"] == "bob@x.com"
+    assert user["display_name"] == "Bob"
+    assert user["ai_access"] is True
+    assert user_store.verify_user("bob@x.com", "longpassword1") is not None
+    row = registration_store.get_invite(inv["invite_id"])
+    assert row["use_count"] == 1 and row["consumed_at"] is not None
+    assert row["consumed_by_user_id"] == user["user_id"]
+    # 再兑换：已消费 → 统一失败
+    with pytest.raises(registration_store.InviteRedeemError) as ei:
+        registration_store.redeem_invite(inv["token"], "bob@x.com",
+                                         "longpassword1")
+    assert ei.value.code == "invite_invalid_or_unavailable"
+
+
+@pg_only
+def test_redeem_failures_all_unified():
+    owner = _mk_owner()
+    msgs = set()
+    # 随机 token
+    with pytest.raises(registration_store.InviteRedeemError) as e1:
+        registration_store.redeem_invite("totally-random-token-xyz",
+                                         "x@x.com", "longpassword1")
+    msgs.add(str(e1.value))
+    # 过期
+    expired = registration_store.create_invite(owner["user_id"],
+                                               email="e@x.com", ttl_seconds=1)
+    time.sleep(1.1)
+    with pytest.raises(registration_store.InviteRedeemError) as e2:
+        registration_store.redeem_invite(expired["token"], "e@x.com",
+                                         "longpassword1")
+    msgs.add(str(e2.value))
+    # 撤销
+    revoked = registration_store.create_invite(owner["user_id"],
+                                               email="r@x.com")
+    registration_store.revoke_invite(revoked["invite_id"], owner["user_id"])
+    with pytest.raises(registration_store.InviteRedeemError) as e3:
+        registration_store.redeem_invite(revoked["token"], "r@x.com",
+                                         "longpassword1")
+    msgs.add(str(e3.value))
+    # 无 token（空）
+    with pytest.raises(registration_store.InviteRedeemError) as e4:
+        registration_store.redeem_invite("", "x@x.com", "longpassword1")
+    msgs.add(str(e4.value))
+    # 全部失败对外一个文案（无细分状态信号）
+    assert len(msgs) == 1
+    assert "邀请码无效或不可用" in msgs.pop()
+    # 细分 reason 只在内部属性，不进 str()
+    assert e1.value.reason == "not_found"
+    assert e2.value.reason == "expired"
+    assert e3.value.reason == "revoked"
+
+
+@pg_only
+def test_redeem_email_normalization_and_mismatch():
+    owner = _mk_owner()
+    inv = registration_store.create_invite(owner["user_id"],
+                                           email="Carol@X.com")
+    # 大小写/空白规范化后匹配
+    out = registration_store.redeem_invite(inv["token"], "  carol@x.COM ",
+                                           "longpassword1")
+    assert out["email"] == "carol@x.com"
+    # 不匹配邮箱：统一失败（不泄露是绑定差异）
+    inv2 = registration_store.create_invite(owner["user_id"],
+                                            email="dave@x.com")
+    with pytest.raises(registration_store.InviteRedeemError) as ei:
+        registration_store.redeem_invite(inv2["token"], "mallory@x.com",
+                                         "longpassword1")
+    assert ei.value.reason == "email_mismatch"
+    # 邀请码未被消费
+    assert registration_store.get_invite(inv2["invite_id"])[
+        "consumed_at"] is None
+
+
+@pg_only
+def test_redeem_email_conflict_leaves_invite_unconsumed():
+    owner = _mk_owner()
+    user_store.create_user("taken@x.com", "existingpass1", role="user")
+    inv = registration_store.create_invite(owner["user_id"],
+                                           email="taken@x.com")
+    with pytest.raises(registration_store.InviteRedeemError) as ei:
+        registration_store.redeem_invite(inv["token"], "taken@x.com",
+                                         "longpassword1")
+    assert ei.value.reason == "email_taken"
+    row = registration_store.get_invite(inv["invite_id"])
+    assert row["use_count"] == 0
+    assert row["consumed_at"] is None
+
+
+@pg_only
+def test_concurrent_redeem_same_invite_single_winner():
+    """§6.1：同一邀请码 20 路并发兑换仅一个成功，users/invite 状态一致。"""
+    owner = _mk_owner()
+    inv = registration_store.create_invite(owner["user_id"],
+                                           email="race@x.com")
+    n = 20
+    barrier = threading.Barrier(n)
+
+    def worker(_i):
+        barrier.wait()
+        try:
+            out = registration_store.redeem_invite(inv["token"], "race@x.com",
+                                                   "longpassword1")
+            return ("ok", out["user"]["user_id"])
+        except registration_store.InviteRedeemError:
+            return ("fail", None)
+        except Exception as exc:  # 意外异常单列
+            return ("unexpected:%s" % type(exc).__name__, None)
+
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        results = list(ex.map(worker, range(n)))
+    ok = [r for r in results if r[0] == "ok"]
+    assert len(ok) == 1, results
+    assert all(r[0] == "fail" for r in results if r[0] != "ok")
+    winner_uid = ok[0][1]
+    row = registration_store.get_invite(inv["invite_id"])
+    assert row["use_count"] == 1
+    assert row["consumed_by_user_id"] == winner_uid
+    # users 表只有一个该邮箱账号
+    u = user_store.get_user_by_email("race@x.com")
+    assert u["user_id"] == winner_uid
+
+
+@pg_only
+def test_token_never_in_audit_or_exceptions():
+    owner = _mk_owner()
+    inv = registration_store.create_invite(owner["user_id"], email="aud@x.com")
+    # 失败兑换（不匹配邮箱）与成功兑换各来一次（另一个邀请）
+    try:
+        registration_store.redeem_invite(inv["token"], "wrong@x.com",
+                                         "longpassword1")
+    except registration_store.InviteRedeemError:
+        pass
+    inv2 = registration_store.create_invite(owner["user_id"], email="aud2@x.com")
+    registration_store.redeem_invite(inv2["token"], "aud2@x.com",
+                                     "longpassword1")
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT event_id, actor_user_id, action, target_type, "
+                "target_id, detail::text AS detail FROM audit_events "
+                "WHERE action LIKE 'registration%'")
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    assert rows, "缺少注册审计事件"
+    for r in rows:
+        blob = repr(dict(r))
+        assert inv["token"] not in blob
+        assert inv2["token"] not in blob
+        assert "password" not in blob.lower()
+    # 异常文本不含 token
+    try:
+        registration_store.redeem_invite(inv["token"], "wrong@x.com",
+                                         "longpassword1")
+    except registration_store.InviteRedeemError as ei:
+        assert inv["token"] not in str(ei)
+
+
+@pg_only
+def test_owner_invite_api_lifecycle(monkeypatch):
+    _satisfy_preconditions(monkeypatch)
+    owner = _mk_owner()
+    app_mod.AUTH_ENABLED = True
+    client = _client()
+    _owner_session(client, owner)
+    # 创建：token 仅出现一次 + no-store
+    r = client.post("/api/admin/registration-invites",
+                    json={"email": "flow@x.com", "ai_access": False,
+                          "cohort": "c1", "note": "n1"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.headers.get("Cache-Control") == "no-store"
+    body = r.get_json()
+    assert body["token"]
+    invite_id = body["invite_id"]
+    assert "token_hash" not in body
+    # 列表：无 token/token_hash，邮箱掩码
+    r2 = client.get("/api/admin/registration-invites")
+    assert r2.status_code == 200
+    items = r2.get_json()["invites"]
+    assert len(items) == 1
+    it = items[0]
+    assert "token" not in it and "token_hash" not in it
+    assert it["email_masked"] == "f***@x.com"
+    assert it["status"] == "open"
+    assert it["ai_access"] is False and it["cohort"] == "c1"
+    # 撤销
+    r3 = client.post("/api/admin/registration-invites/%s/revoke" % invite_id,
+                     json={})
+    assert r3.status_code == 200
+    assert r3.get_json()["status"] == "revoked"
+    # 再撤销（幂等）仍 200；已消费的撤销 409
+    assert client.post(
+        "/api/admin/registration-invites/%s/revoke" % invite_id,
+        json={}).status_code == 200
+    # 不存在 404
+    assert client.post(
+        "/api/admin/registration-invites/inv_missing/revoke",
+        json={}).status_code == 404
+    # CSRF 缺失 400
+    r4 = client._base.post("/api/admin/registration-invites", json={})
+    assert r4.status_code == 400
+    assert r4.get_json()["error"] == "csrf_required"
+
+
+@pg_only
+def test_register_route_full_flow(monkeypatch):
+    """invite_only 全链路：创建 → 表单兑换 → 清 session 轮换 CSRF → 跳登录。"""
+    _satisfy_preconditions(monkeypatch)
+    # 真实模式写入（PG）：owner PUT 生效
+    owner = _mk_owner()
+    app_mod.AUTH_ENABLED = True
+    client = _client()
+    _owner_session(client, owner)
+    r = client.put("/api/admin/settings/registration",
+                   json={"mode": "invite_only"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    inv = client.post("/api/admin/registration-invites",
+                      json={"email": "flow2@x.com"}).get_json()
+    # 匿名 client 兑换
+    anon = _client()
+    anon.get("/register")
+    with anon.session_transaction() as s:
+        s["poison"] = "anon-session-data"  # 模拟匿名 session 残留
+    r2 = anon.post("/register", data={
+        "invite_token": inv["token"], "email": "flow2@x.com",
+        "password": "longpassword1", "password_confirm": "longpassword1"})
+    assert r2.status_code == 302
+    assert r2.headers["Location"].endswith("/login")
+    with anon.session_transaction() as s:
+        assert s.get("poison") is None       # 匿名 session 已清理
+        assert not s.get("auth_user")        # 不自动登录
+    assert user_store.get_user_by_email("flow2@x.com") is not None
+    # 错误兑换：统一文案、邀请码不回显
+    anon2 = _client()
+    r3 = anon2.post("/register", data={
+        "invite_token": inv["token"], "email": "flow2@x.com",
+        "password": "longpassword1", "password_confirm": "longpassword1"})
+    assert r3.status_code == 403
+    body = r3.get_data(as_text=True)
+    assert "邀请码无效或当前不可用" in body
+    assert inv["token"] not in body
+    # 切回 closed
+    r4 = client.put("/api/admin/settings/registration", json={"mode": "closed"})
+    assert r4.status_code == 200
+
+
+@pg_only
+def test_legacy_registration_open_true_fails_closed(monkeypatch):
+    """§4.1：旧布尔 true 不自动映射为开放模式；读取即固化 closed。"""
+    settings_store.set_setting(settings_store.REGISTRATION_OPEN_KEY, True,
+                               updated_by="test")
+    mode = settings_store.get_registration_mode()
+    assert mode == "closed"
+    # 固化后 PG 权威为 closed；owner 显式切 invite_only 才能开放
+    assert settings_store.get_setting(settings_store.REGISTRATION_MODE_KEY) \
+        == "closed"
+    settings_store.set_registration_mode("invite_only", updated_by="t")
+    assert settings_store.get_registration_mode() == "invite_only"
+
+
+@pg_only
+def test_registration_mode_env_and_invalid_values():
+    assert settings_store.get_registration_mode() == "closed"  # bootstrap
+    settings_store.set_setting(settings_store.REGISTRATION_MODE_KEY,
+                               "invite_only", updated_by="t")
+    assert settings_store.get_registration_mode() == "invite_only"
+    # 非法存量值按 closed
+    settings_store.set_setting(settings_store.REGISTRATION_MODE_KEY, 123,
+                               updated_by="t")
+    assert settings_store.get_registration_mode() == "closed"
+    # setter 拒绝 public
+    with pytest.raises(ValueError):
+        settings_store.set_registration_mode("public")
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-q"]))

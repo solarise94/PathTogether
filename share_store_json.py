@@ -2314,3 +2314,50 @@ def list_run_grants_for_session(session_id):
         return rows
 
     return _with_lock("r+", _do)
+
+
+def bind_run_grant_session(grant_id, session_id):
+    """§3.10 P0-C：把 grant 原子绑定到 session_id（CAS：仅未绑定可绑）。
+
+    返回绑定后的 grant dict；grant 不存在返回 None；已绑定到**其它**
+    session → ValueError("session_mismatch")；已绑定到同一 session → 幂等
+    返回当前 dict。session_id 需为非空字符串。
+    """
+    if not isinstance(grant_id, str) or not grant_id:
+        raise ValueError("grant_id 不能为空")
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id 不能为空")
+
+    def _do(f):
+        data = _load_locked(f)
+        for row in data["run_grants"]:
+            if row.get("grant_id") != grant_id:
+                continue
+            bound = row.get("session_id") or ""
+            if bound and bound != session_id:
+                raise ValueError("session_mismatch")
+            if not bound:
+                row["session_id"] = session_id
+                _save_locked(f, data)
+            return dict(row)
+        return None
+
+    return _with_lock("r+", _do)
+
+
+def list_run_grants(slide=None, include_revoked=False):
+    """列出 run grant（§3.10 P0-C 主动撤销钩子用；按创建时间升序）。
+
+    slide 给定时只返回该切片的 grant；include_revoked=False 时剔除已撤销行
+    （过期行仍返回——过期由校验时判定，不在此过滤）。
+    """
+    def _do(f):
+        data = _load_locked(f)
+        rows = [dict(r) for r in data["run_grants"]
+                if isinstance(r, dict)
+                and (slide is None or r.get("slide") == slide)
+                and (include_revoked or not r.get("revoked"))]
+        rows.sort(key=lambda r: r.get("created_at") or 0)
+        return rows
+
+    return _with_lock("r+", _do)

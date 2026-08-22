@@ -133,6 +133,8 @@ _JSON_PUBLIC_NAMES = (
     "get_run_grant",
     "revoke_run_grant",
     "list_run_grants_for_session",
+    "bind_run_grant_session",
+    "list_run_grants",
 )
 
 #: 需要实时镜像到 JSON 实现的路径配置名（函数体裸全局读取它们）。
@@ -228,6 +230,8 @@ _WRITE_NAMES = {
     # 插件能力层 P1：能力注册表登记（result-replay，按返回行镜像 capabilities）
     "set_installation_capabilities",
     "create_run_grant", "revoke_run_grant",
+    # §3.10 P0-C：grant → session 原子绑定（result-replay；json 抛错不镜像）
+    "bind_run_grant_session",
 }
 
 # result-replay 镜像：凡 json 内部生成身份（token/annotation_id/grant_id/pid）的写，
@@ -268,6 +272,8 @@ _DUAL_MIRRORS = {
     "set_installation_capabilities": "_mirror_plugin_installation",
     "create_run_grant": "_mirror_run_grant",
     "revoke_run_grant": "_mirror_run_grant_revoke",
+    # §3.10 P0-C：bind（ret=grant dict 时按入参 grant_id/session_id 镜像进 pg）
+    "bind_run_grant_session": "_mirror_run_grant_bind",
 }
 
 # 同参重放：无内部生成身份，直接同参调 pg。

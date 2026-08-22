@@ -94,6 +94,37 @@ from plugins.sdk.manifest import (  # noqa: E402
 
 app = Flask(__name__)
 
+
+# --------------------------------------------------------------------------- #
+# 真实访客 IP（2026-08-23：SakuraFrp PROXY protocol v2 链路）
+#
+# 公网链路：访客 → frp server → 路由器 frpc（PPv2 头携带真实 IP）→ pt-edge
+# nginx 18444（listen ... proxy_protocol + realip，$remote_addr 即真实访客
+# IP，并覆写 X-Forwarded-For=$remote_addr 防伪造）→ gunicorn 18080。
+# 但 gunicorn 看到的直接对端恒为 127.0.0.1，故仅当直接对端是回环
+# （pt-edge / sidecar 回调）时才采纳 XFF 最后一跳；LAN 直连 18080 的对端
+# 不是回环，自带 XFF 不予理睬（防 LAN 内伪造 IP 桶）。
+# --------------------------------------------------------------------------- #
+_TRUSTED_XFF_PEERS = frozenset({"127.0.0.1", "::1"})
+
+
+class _RealIPMiddleware:
+    """回环对端 + XFF 时，把 REMOTE_ADDR 改写为 XFF 最后一跳。"""
+
+    def __init__(self, wsgi_app):
+        self.wsgi_app = wsgi_app
+
+    def __call__(self, environ, start_response):
+        if environ.get("REMOTE_ADDR") in _TRUSTED_XFF_PEERS:
+            xff = environ.get("HTTP_X_FORWARDED_FOR") or ""
+            last_hop = xff.rsplit(",", 1)[-1].strip() if xff else ""
+            if last_hop:
+                environ["REMOTE_ADDR"] = last_hop
+        return self.wsgi_app(environ, start_response)
+
+
+app.wsgi_app = _RealIPMiddleware(app.wsgi_app)
+
 # 上传目录：默认 ~/svs-viewer/uploads，可用环境变量 UPLOAD_DIR 覆盖（容器内挂载）
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR") or (Path.home() / "svs-viewer" / "uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)

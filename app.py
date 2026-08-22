@@ -6972,7 +6972,6 @@ def plugin_v1_run_grant_bind():
 
 @app.route("/api/plugin/v1/run-grants/verify", methods=["POST"])
 def plugin_v1_run_grant_verify():
-def plugin_v1_run_grant_verify():
     """run grant 校验（供 sidecar 4-1b 在 annotate 前自查）。Bearer JWT 认证。
 
     body: {grant_id, slide}。恒 200 返回 {valid, reason}——valid=false 时

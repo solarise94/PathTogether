@@ -97,14 +97,17 @@ def _user_ai_config(user: dict) -> dict:
     return out
 
 
-# 公共 SELECT 列（created_at 转 epoch 浮点与 json 形状对齐）。
+# 公共 SELECT 列（created_at 转 epoch 浮点与 json 形状对齐；ai_access 为 P0-B
+# §3.7 新增列：受邀用户默认 FALSE，存量默认 TRUE，见 0012 迁移）。
 _SEL_HASH = (
     "user_id, email, display_name, password_hash, role, "
-    "extract(epoch from created_at)::float8 AS created_at, disabled, ai_config"
+    "extract(epoch from created_at)::float8 AS created_at, disabled, ai_config, "
+    "ai_access"
 )
 _SEL_PUBLIC = (
     "user_id, email, display_name, role, "
-    "extract(epoch from created_at)::float8 AS created_at, disabled, ai_config"
+    "extract(epoch from created_at)::float8 AS created_at, disabled, ai_config, "
+    "ai_access"
 )
 
 
@@ -329,6 +332,27 @@ def set_user_ai_config(user_id, cfg):
                 )
                 row2 = cur.fetchone()
         return _public(row2) if row2 else None
+    finally:
+        conn.close()
+
+
+def set_user_ai_access(user_id, enabled):
+    """授予/收回平台 AI 访问（P0-B docs §3.7；PG-only，不经 dispatcher）。
+
+    返回更新后的公共用户 dict；不存在返回 None。受邀用户建号时 ai_access 由
+    邀请码模板决定（registration_store，默认 False），owner 用本函数显式授予。
+    """
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET ai_access=%s WHERE user_id=%s "
+                    "RETURNING " + _SEL_PUBLIC,
+                    (bool(enabled), user_id),
+                )
+                row = cur.fetchone()
+        return _public(row) if row else None
     finally:
         conn.close()
 

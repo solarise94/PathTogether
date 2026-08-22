@@ -617,6 +617,9 @@ def test_same_request_id_retry_no_double_charge():
 @pg_only
 def test_user_11th_platform_run_rejected():
     _setup_platform()
+    # P0-B §3.7：单 user 默认初始额度收紧为 3；本用例验证每 user 上限机制，
+    # 显式恢复 10 以保留原语义（第 11 次拒）。
+    budget_store.update_period_limits({"user_turn_limit": 10})
     u = _make_user("user")
     _touch("u11.svs")
     _own("u11.svs", u["user_id"])

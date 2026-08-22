@@ -59,7 +59,9 @@ def test_period_defaults_and_row_is_authoritative():
     p1 = budget_store.get_current_period()
     assert p1["platform_turn_limit"] == 30
     assert p1["demo_turn_limit"] == 5
-    assert p1["user_turn_limit"] == 10
+    assert p1["user_turn_limit"] == 3  # P0-B §3.7：单 user 初始 3
+    assert p1["owner_reserved_turn_limit"] == 10  # owner 保留池
+    assert p1["user_pool_turn_limit"] == 15       # user 共享池
     assert p1["platform_task_max_steps"] == 20
     assert p1["own_task_max_steps_limit"] == 500
     assert p1["demo_task_max_steps"] == 20
@@ -227,6 +229,7 @@ def test_demo_per_browser_limit_and_concurrency_enforced():
 # 额度判定：user / demo / platform
 # --------------------------------------------------------------------------- #
 def test_user_limit_enforced_sequentially():
+    budget_store.update_period_limits({"user_turn_limit": 10})  # P0-B 默认改 3，显式回 10 保持本用例语义
     for _ in range(10):
         budget_store.reserve_turn(_req(), "user", "usr_b", "platform")
     with pytest.raises(budget_store.UserBudgetExhausted) as ei:
@@ -240,7 +243,8 @@ def test_user_limit_enforced_sequentially():
 
 
 def test_concurrent_reserve_same_user_exact_limit():
-    """N 线程同时 reserve 同一 user（限额 10）→ 成功数恰为 10，无超扣。"""
+    """N 线程同时 reserve 同一 user（限额显式 10）→ 成功数恰为 10，无超扣。"""
+    budget_store.update_period_limits({"user_turn_limit": 10})
     n = 30
     barrier = threading.Barrier(n)
 
@@ -377,7 +381,7 @@ def test_update_period_limits_keeps_usage():
     budget_store.reserve_turn(_req(), "user", "u1", "platform")
     p = budget_store.update_period_limits({"platform_turn_limit": 2})
     assert p["platform_turn_limit"] == 2
-    assert p["user_turn_limit"] == 10  # 未给的列不动
+    assert p["user_turn_limit"] == 3  # 未给的列不动（P0-B 默认 3）
     assert budget_store.usage_report()["platform"]["total"] == 1  # 不清用量
     # 调低到小于已用量：现有运行不取消，但新请求立即被拒（docs §4.2）
     budget_store.update_period_limits({"platform_turn_limit": 1})
@@ -402,7 +406,7 @@ def test_reset_period_closes_old_keeps_history_zeroes_usage(pg_conn):
         {"platform_turn_limit": 50}, created_by="usr_owner")
     assert p2["id"] > p1["id"]
     assert p2["platform_turn_limit"] == 50
-    assert p2["user_turn_limit"] == 10  # 未给的沿用旧周期值
+    assert p2["user_turn_limit"] == 3  # 未给的沿用旧周期值（P0-B 默认 3）
     assert p2["closed_at"] is None
     # 新周期用量归零、报表切到新周期
     report = budget_store.usage_report()
@@ -445,6 +449,10 @@ def test_usage_report_shape():
     per_user = {r["subject_id"]: r for r in report["per_user"]}
     assert per_user["usr_a"]["accepted"] == 1
     assert per_user["usr_a"]["reserved"] == 0
-    assert per_user["usr_a"]["limit"] == 10
+    assert per_user["usr_a"]["limit"] == 3  # P0-B 单 user 初始 3
     assert "usr_b" not in per_user  # own 凭据不计入 per_user
     assert report["own"]["total"] == 1
+    # P0-B 池区段（docs §3.7）
+    assert report["user_pool"]["total"] == 1
+    assert report["user_pool"]["limit"] == 15
+    assert report["owner"]["reserved_limit"] == 10

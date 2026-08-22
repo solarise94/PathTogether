@@ -52,8 +52,9 @@ import slide_cache
 import slide_io
 import user_store
 # PT-1 数据层（docs demo-access-auth-ui-design §4.3/§7.3/§9.5）：
-# platform_features 判定 PG 前置条件；settings_store 提供 registration_open
-# 运行时权威读取（PG platform_settings / env bootstrap）。
+# platform_features 判定 PG 前置条件；settings_store 提供 registration_mode
+# 运行时权威读取（PG platform_settings；旧布尔 registration_open 已 fail-closed
+# 迁移为 closed，P0-B docs §4.1）。
 import platform_features
 import settings_store
 # PT-3 平台 AI 预算接线（docs §4.1/§4.2/§5.3/§9.4）：budget_store 提供 PG 原子
@@ -64,6 +65,10 @@ import budget_store
 # 状态机与 owner Demo 目录（demo_catalog）。json/dual 后端 fail-closed
 # （platform_features 守卫），Demo API 绝不走 current_identity 的 owner 归一。
 import demo_store
+# P0-B 邀请注册（docs open-registration-security-remediation §4.2/§4.3）：
+# registration_store 提供一次性邀请码（只存 token_hash）与单事务原子兑换。
+# json/dual 后端 fail-closed（platform_features 守卫）。
+import registration_store
 
 # Stage 5-1：插件 manifest 版本常量单一来源（plugins/sdk/manifest.py）。
 # plugins/ 与 plugins/sdk/ 各有 __init__.py（plugins/histopilot/ 不加，保持静态目录）。
@@ -1361,16 +1366,137 @@ def logout():
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
-    """注册页（Phase 1：邀请注册关闭态，docs §7.1）。
+    """注册页（P0-B：registration_mode = closed | invite_only | public，§4.1）。
 
-    GET：展示「当前采用邀请注册」状态页（主按钮回登录、次按钮体验 Demo），
-    不返回 404、不渲染无法提交的表单。registration_open 权威值来自
-    settings_store.get_registration_open()（PG 权威 / env bootstrap）。
-    POST：第一阶段一律 403（自助注册是 Phase 4；owner 运行时开关 API 不在本阶段）。
+    - closed：GET 渲染关闭态页（不 404、无可提交表单），POST 一律 403；
+    - invite_only：GET 渲染邀请码/邮箱/显示名/密码表单（UI 推荐 ≥12 位、允许
+      密码管理器 paste），POST 走 registration_store 原子兑换；成功**不自动登录**
+      ——清理匿名 session、轮换 CSRF 后 302 /login；
+    - public：本阶段不支持，GET/POST 均 503 public_registration_not_supported
+      （无 public 回退路径）；
+    - 模式权威值还受 fail-closed 前置闸（_effective_registration_mode：非 HTTPS
+      / 非 Secure Cookie / 非 PG 一律按 closed 处理，docs §3.2 末段）。
+
+    限流（§4.5，PostgreSQL 权威，不可用 503 不退化）：每 IP 前缀 15 分钟 10 次
+    失败 + 24 小时 30 次尝试；每 invite hash 15 分钟 5 次失败短时锁定；IP 桶
+    为辅闸（FRP 可信链未定）。兑换失败文案统一（无枚举信号）；邀请码只放
+    POST body，绝不进 URL query/path。
     """
-    if request.method == "POST":
+    mode = _effective_registration_mode()
+    if mode == "public":
+        # 本阶段无 public 支持：稳定 code，不回退到任何开放形态
+        return (jsonify(error="公开注册暂不支持（public_registration_not_"
+                              "supported）",
+                        code="public_registration_not_supported"),
+                503)
+
+    if request.method == "GET":
+        if mode == "invite_only":
+            resp = Response(render_template(
+                "register.html", mode="invite_only",
+                csrf_token=ensure_csrf_token(), error=None, error_code=None),
+                200)
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+        return render_template("register.html", mode="closed",
+                               registration_open=False)
+
+    # ---- POST ----
+    if mode == "closed":
         return jsonify(error="当前采用邀请注册，暂未开放自助注册"), 403
-    return render_template("register.html", registration_open=_registration_open())
+
+    # invite_only：PG 权威限流先行（存储不可用 503，绝不退化进程内计数）
+    import auth_limit_store
+    ip_hash = _ip_prefix_hash(request.remote_addr or "")
+    invite_token = (request.form.get("invite_token") or "").strip()
+    invite_hash = registration_store.invite_token_hash(invite_token) \
+        if invite_token else ""
+    try:
+        retry = auth_limit_store.check_registration_locked(ip_hash, invite_hash)
+        if retry <= 0:
+            # 24 小时尝试桶：成功也计（先记尝试，处理结果不再重复计）
+            retry = auth_limit_store.record_registration_attempt(ip_hash)
+    except platform_features.PgFeatureUnavailable:
+        return _registration_unavailable_response()
+    except Exception:
+        app.logger.exception("注册限流存储不可用，fail-closed 503")
+        return _registration_unavailable_response()
+    if retry > 0:
+        resp = Response(render_template(
+            "register.html", mode="invite_only",
+            csrf_token=ensure_csrf_token(),
+            error="尝试过于频繁，请稍后再试", error_code="locked",
+            retry_after=int(retry)), 429)
+        resp.headers["Retry-After"] = str(max(1, int(retry)))
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    # 表单校验（本地形状错误，非枚举信号；不回显邀请码）
+    email = (request.form.get("email") or "").strip()
+    display_name = (request.form.get("display_name") or "").strip()
+    password = request.form.get("password") or ""
+    confirm = request.form.get("password_confirm") or ""
+    form_error = None
+    if not invite_token:
+        form_error = "请填写邀请码"
+    elif not email:
+        form_error = "请填写邮箱/用户名"
+    elif len(password) < registration_store.MIN_PASSWORD_LENGTH:
+        form_error = "密码长度至少 %d 位（推荐 12 位以上或使用长口令）" \
+            % registration_store.MIN_PASSWORD_LENGTH
+    elif password != confirm:
+        form_error = "两次输入的密码不一致"
+    if form_error:
+        return _register_form_error(form_error, "invalid")
+
+    # 原子兑换（docs §4.3）：失败统一文案（无细分状态），计数到限流桶
+    try:
+        result = registration_store.redeem_invite(
+            invite_token, email, password, display_name or None)
+    except registration_store.InviteRedeemError:
+        try:
+            auth_limit_store.record_registration_failure(ip_hash, invite_hash)
+        except Exception:
+            app.logger.exception("注册失败计数写入异常（不影响统一错误响应）")
+        app.logger.warning(
+            "邀请码兑换失败（invite 状态不外泄，错误统一）")
+        return _register_form_error(
+            "邀请码无效或当前不可用；请核对后重试，或联系管理员",
+            "invite_invalid_or_unavailable", status=403)
+    except platform_features.PgFeatureUnavailable:
+        return _registration_unavailable_response()
+    except Exception:
+        app.logger.exception("邀请码兑换异常（统一错误，不外泄细节）")
+        return _register_form_error(
+            "注册暂不可用，请稍后重试或联系管理员", "unavailable", status=503)
+
+    # 成功：不自动登录——清匿名 session、轮换 CSRF，跳登录页（docs §4.4）
+    session.clear()
+    rotate_csrf_token()
+    _audit("registration.user_created", target_type="user",
+           target_id=result["user"]["user_id"],
+           detail={"invite_id": result["invite_id"],
+                   "ai_access": bool(result["user"].get("ai_access"))})
+    resp = redirect("/login")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _register_form_error(message, error_code, status=200):
+    """渲染注册表单错误（统一文案；不回显邀请码；no-store）。"""
+    resp = Response(render_template(
+        "register.html", mode="invite_only", csrf_token=ensure_csrf_token(),
+        error=message, error_code=error_code), status)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _registration_unavailable_response():
+    """注册限流/兑换存储不可用：fail-closed 503（不退化内存计数，§4.5）。"""
+    return (jsonify(error="注册服务暂不可用（限流存储要求 PostgreSQL），"
+                          "请稍后重试",
+                    code="registration_unavailable"),
+            503)
 
 
 # =========================================================================== #
@@ -2449,29 +2575,106 @@ def _archived_slide_names():
 
 
 # --------------------------------------------------------------------------- #
-# owner 用户管理（Stage 3a 身份基础；注册默认关闭，docs §19-12）
+# owner 用户管理（Stage 3a 身份基础；P0-B 起注册模式为 registration_mode）
 # --------------------------------------------------------------------------- #
-# 注册开关（docs §7.3）：settings_store 为运行时权威（PG platform_settings），
-# env REGISTRATION_OPEN 只作 bootstrap 默认（json 后端 fallback env）。默认关闭。
-# Phase 1 不做 owner 运行时开关 API（Phase 4）。
+# 注册模式（docs §4.1，P0-B）：settings_store.get_registration_mode 为运行时权威
+# （PG platform_settings；旧布尔 registration_open=true 已 fail-closed 迁移为
+# closed，不自动映射为 invite_only/public）。模式生效还需通过 §3.2 末段的前置
+# 条件闸（HTTPS / Secure Cookie / postgres），未满足一律按 closed 处理并告警。
 # --------------------------------------------------------------------------- #
-def _registration_open() -> bool:
-    """注册开关权威读取（PG 权威 / env bootstrap）；读取失败按关闭处理。"""
+def _registration_mode_stored() -> str:
+    """存储层注册模式（closed|invite_only|public）；读取失败按 closed 处理。"""
     try:
-        return bool(settings_store.get_registration_open())
+        return settings_store.get_registration_mode()
     except Exception:
-        app.logger.exception("读取 registration_open 失败，按关闭处理")
-        return False
+        app.logger.exception("读取 registration_mode 失败，按 closed 处理")
+        return "closed"
+
+
+def _registration_precondition_failures(environ=None) -> list:
+    """invite_only 生效的前置条件（docs §3.2 末段，fail-closed）。
+
+    registration_mode != closed 时要求：
+      1. ``PUBLIC_BASE_URL`` 配置为 https://（公网入口 TLS 已终止）；
+      2. ``ADMIN_SESSION_COOKIE_SECURE`` 启用（session cookie 带 Secure）；
+      3. 存储后端为 postgres（邀请注册/限流整体 PG-only）。
+    任一不满足即拒绝启用注册功能（_effective_registration_mode 降级 closed）。
+    """
+    env = os.environ if environ is None else environ
+    failures = []
+    base_url = (env.get("PUBLIC_BASE_URL") or "").strip()
+    if not base_url or urlparse(base_url).scheme != "https":
+        failures.append("PUBLIC_BASE_URL 未配置为 https:// 入口")
+    if not _env_truthy(env, "ADMIN_SESSION_COOKIE_SECURE"):
+        failures.append("ADMIN_SESSION_COOKIE_SECURE 未启用（Secure Cookie）")
+    if platform_features.current_backend() != "postgres":
+        failures.append("STORAGE_BACKEND 非 postgres（当前 %r）"
+                        % platform_features.current_backend())
+    return failures
+
+
+_registration_gate_warned = {"flag": False}
+
+
+def _effective_registration_mode() -> str:
+    """生效注册模式：存储值 × 前置条件闸（未满足降级 closed，每进程告警一次）。
+
+    只降级 ``invite_only``（开放形态必须先满足 §3.2 前置条件）；``public``
+    原样透传给路由层统一 503 public_registration_not_supported（本阶段不支持，
+    也没有任何开放回退路径）。
+    """
+    mode = _registration_mode_stored()
+    if mode != "invite_only":
+        return mode
+    failures = _registration_precondition_failures()
+    if failures:
+        if not _registration_gate_warned["flag"]:
+            _registration_gate_warned["flag"] = True
+            app.logger.warning(
+                "registration_mode=%r 但前置条件不满足（%s）：注册功能已"
+                " fail-closed 降级为 closed（docs §3.2 末段）",
+                mode, "；".join(failures))
+        return "closed"
+    return mode
+
+
+def _check_registration_preconditions_or_warn(environ=None):
+    """启动期 fail-closed 检查：存储模式非 closed 但前置条件缺失 → 告警。
+
+    处置策略选择「降级为 closed + 告警」而非拒绝启动：匿名只读 Demo 必须保持
+    可用（docs §7「匿名只读 Demo 可继续运行，不受邀请注册开关影响」），整体
+    SystemExit 会把 Demo 一并拖死；降级后 /register 仍为关闭态，安全语义等价。
+    """
+    try:
+        mode = settings_store.get_registration_mode()
+    except Exception:
+        return  # json/dual 或存储不可达：读取路径自身 fail-closed 为 closed
+    if mode != "invite_only":
+        return  # closed 无需检查；public 本阶段路由统一拒绝
+    failures = _registration_precondition_failures(environ)
+    if failures:
+        app.logger.warning(
+            "[startup] registration_mode=%r 前置条件不满足（%s）：注册功能"
+            "将按 closed 运行；请先完成 TLS/Secure Cookie/PG 配置，再由 owner "
+            "显式切换 invite_only",
+            mode, "；".join(failures))
 
 
 @app.route("/api/admin/users", methods=["GET"])
 def api_admin_users_list():
-    """列出全部用户（不含 hash）与开放注册开关。仅 owner。"""
+    """列出全部用户（不含 hash）与注册模式。仅 owner。"""
     auth = _require_owner()
     if auth:
         return auth
+    mode = _effective_registration_mode()
     return jsonify(users=user_store.list_users(),
-                   registration_open=_registration_open())
+                   registration_mode=mode,
+                   # 旧 UI 兼容字段：invite_only 视为「开放」
+                   registration_open=(mode == "invite_only"))
+
+
+# 启动期 fail-closed 检查（§3.2 末段；在定义处就近执行，模块加载即告警一次）
+_check_registration_preconditions_or_warn()
 
 
 @app.route("/api/admin/users", methods=["POST"])
@@ -2562,6 +2765,255 @@ def api_admin_users_password(user_id):
     return jsonify(user)
 
 
+# =========================================================================== #
+# P0-B 邀请注册管理（docs §4.6 / §4.2 / §3.7）
+#
+# 全部 owner-only + Cookie session + 统一 CSRF（before_request）；PG-only
+# （json/dual 503 pg_backend_required，绝不退化）。安全要点：
+#   - 创建接口**仅首次响应**返回明文邀请码，且 Cache-Control: no-store；
+#   - 列表/审计/日志永不返回 token / token_hash；owner 列表只显示邮箱掩码、
+#     过期时间与状态；
+#   - owner 创建邀请码受每分钟/每日上限（auth_limit_store，PG 权威）；
+#   - invited 用户 ai_access 由邀请码模板决定（默认 false），owner 可显式授予。
+# =========================================================================== #
+#: 邀请码 TTL 默认 7 天、上限 30 天（docs §4.2）
+_INVITE_DEFAULT_TTL_HOURS = 168
+_INVITE_MAX_TTL_HOURS = 720
+
+
+def _registration_invite_owner_hash():
+    """owner 主体限流 hash（创建频率；不存明文 user_id）。"""
+    uid = current_identity().get("user_id") or "owner"
+    return hmac.new(
+        ("regowner:" + _auth_hash_salt()).encode("utf-8"),
+        uid.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _invite_public_view(invite: dict) -> dict:
+    """邀请行 → owner API 视图（掩码邮箱 + 状态；绝不含 token/token_hash）。"""
+    now = time.time()
+    out = dict(invite)
+    out.pop("token_hash", None)
+    out.pop("token", None)
+    out["email_masked"] = registration_store.mask_email(
+        out.pop("email_normalized", None))
+    if out.get("revoked_at") is not None:
+        out["status"] = "revoked"
+    elif out.get("consumed_at") is not None:
+        out["status"] = "consumed"
+    elif out.get("expires_at") is not None and out["expires_at"] <= now:
+        out["status"] = "expired"
+    else:
+        out["status"] = "open"
+    return out
+
+
+@app.route("/api/admin/settings/registration", methods=["GET"])
+def api_admin_registration_settings_get():
+    """注册模式与前置条件状态（owner）。"""
+    auth = _require_owner()
+    if auth:
+        return auth
+    stored = _registration_mode_stored()
+    effective = _effective_registration_mode()
+    return jsonify(
+        mode=effective,
+        stored_mode=stored,
+        supported_modes=["closed", "invite_only"],
+        precondition_failures=_registration_precondition_failures(),
+        registration_open=(effective == "invite_only"),
+        backend=platform_features.current_backend(),
+    )
+
+
+@app.route("/api/admin/settings/registration", methods=["PUT"])
+def api_admin_registration_settings_put():
+    """切换注册模式（owner）。body: {mode: closed|invite_only}。
+
+    - public 一律 400 public_registration_not_supported（本阶段无回退路径）；
+    - 切 invite_only 前置条件不满足（非 HTTPS / 非 Secure Cookie / 非 PG）→
+      400 列出原因（fail-closed，不允许写入一个不会生效的模式值）。
+    """
+    auth = _require_owner()
+    if auth:
+        return auth
+    body = request.get_json(silent=True) or {}
+    mode = body.get("mode")
+    if mode == "public":
+        return (jsonify(error="公开注册本阶段不支持（public_registration_not_"
+                              "supported）",
+                        code="public_registration_not_supported"),
+                400)
+    if mode not in ("closed", "invite_only"):
+        return jsonify(error="mode 需为 closed 或 invite_only"), 400
+    if mode == "invite_only":
+        failures = _registration_precondition_failures()
+        if failures:
+            return jsonify(error="注册前置条件不满足：" + "；".join(failures),
+                           code="registration_preconditions_failed"), 400
+    try:
+        settings_store.set_registration_mode(
+            mode, updated_by=current_identity().get("user_id"))
+    except platform_features.PgFeatureUnavailable as exc:
+        return _budget_error_response(exc, 503, code=exc.code)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    _audit("registration.mode_update", target_type="platform_settings",
+           target_id="registration_mode", detail={"mode": mode})
+    return jsonify(mode=mode)
+
+
+@app.route("/api/admin/registration-invites", methods=["POST"])
+def api_admin_registration_invites_create():
+    """创建一次性邀请码（owner）。body: {email?, ttl_hours?, ai_access?,
+    cohort?, note?}。
+
+    仅本响应返回明文 code（Cache-Control: no-store，刷新即失）；库内只存带盐
+    hash。owner 创建频率受每分钟/每日上限。email 省略 = 不绑定（高风险，UI 需
+    提示）。
+    """
+    auth = _require_owner()
+    if auth:
+        return auth
+    if not platform_features.budget_features_available():
+        return _registration_unavailable_response()
+    import auth_limit_store
+    owner_hash = _registration_invite_owner_hash()
+    try:
+        retry = auth_limit_store.check_owner_invite_creation_locked(owner_hash)
+    except Exception:
+        app.logger.exception("邀请码创建限流存储不可用，fail-closed 503")
+        return _registration_unavailable_response()
+    if retry > 0:
+        return (jsonify(error="邀请码创建过于频繁，请稍后再试",
+                        code="rate_limited",
+                        retry_after_seconds=max(1, int(retry))),
+                429, {"Retry-After": str(max(1, int(retry)))})
+
+    body = request.get_json(silent=True) or {}
+    email = body.get("email")
+    if email is not None:
+        email = str(email).strip()
+        if not email:
+            return jsonify(error="email 传空字符串请改传 null（不绑定）"), 400
+        if len(email) > 120:
+            return jsonify(error="email 过长（≤120 字符）"), 400
+        if any(ch.isspace() for ch in email):
+            return jsonify(error="email 不能包含空白字符"), 400
+    try:
+        ttl_hours = int(body.get("ttl_hours") or _INVITE_DEFAULT_TTL_HOURS)
+    except (TypeError, ValueError):
+        return jsonify(error="ttl_hours 需为整数小时"), 400
+    if not 1 <= ttl_hours <= _INVITE_MAX_TTL_HOURS:
+        return jsonify(error="ttl_hours 需在 1–%d 之间" % _INVITE_MAX_TTL_HOURS), 400
+    ai_access = body.get("ai_access")
+    if ai_access is not None and not isinstance(ai_access, bool):
+        return jsonify(error="ai_access 需为布尔值"), 400
+    cohort = body.get("cohort")
+    if cohort is not None and (not isinstance(cohort, str)
+                               or len(cohort) > 64):
+        return jsonify(error="cohort 需为 ≤64 字符的字符串"), 400
+    note = body.get("note")
+    if note is not None and (not isinstance(note, str) or len(note) > 200):
+        return jsonify(error="note 需为 ≤200 字符的字符串"), 400
+
+    try:
+        auth_limit_store.record_owner_invite_creation(owner_hash)
+        invite = registration_store.create_invite(
+            current_identity().get("user_id"), email=email,
+            ttl_seconds=ttl_hours * 3600,
+            ai_access=bool(ai_access), cohort=cohort or "",
+            note=note or "")
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except platform_features.PgFeatureUnavailable:
+        return _registration_unavailable_response()
+    except registration_store.RegistrationStoreError as exc:
+        return jsonify(error=str(exc)), 500
+    out = _invite_public_view(invite)
+    out["token"] = invite["token"]  # 明文码仅此一次
+    resp = jsonify(out)
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
+
+
+@app.route("/api/admin/registration-invites", methods=["GET"])
+def api_admin_registration_invites_list():
+    """列出邀请（owner）：邮箱掩码 + 过期时间 + 状态；永不返回 token/hash。"""
+    auth = _require_owner()
+    if auth:
+        return auth
+    if not platform_features.budget_features_available():
+        return _registration_unavailable_response()
+    try:
+        invites = registration_store.list_invites()
+    except platform_features.PgFeatureUnavailable:
+        return _registration_unavailable_response()
+    except Exception:
+        app.logger.exception("邀请码列表读取失败")
+        return jsonify(error="邀请码列表读取失败"), 500
+    return jsonify(invites=[_invite_public_view(i) for i in invites],
+                   mode=_effective_registration_mode(),
+                   cache_control_note="token 已在创建时一次性返回，不可再查询")
+
+
+@app.route("/api/admin/registration-invites/<invite_id>/revoke",
+           methods=["POST"])
+def api_admin_registration_invites_revoke(invite_id):
+    """撤销邀请码（owner，幂等；已消费的拒绝撤销）。"""
+    auth = _require_owner()
+    if auth:
+        return auth
+    if not platform_features.budget_features_available():
+        return _registration_unavailable_response()
+    try:
+        invite = registration_store.revoke_invite(
+            invite_id, current_identity().get("user_id"))
+    except registration_store.InviteNotFoundError:
+        return jsonify(error="邀请码不存在"), 404
+    except registration_store.RegistrationStoreError as exc:
+        return jsonify(error=str(exc)), 409
+    except platform_features.PgFeatureUnavailable:
+        return _registration_unavailable_response()
+    return jsonify(_invite_public_view(invite))
+
+
+@app.route("/api/admin/users/<user_id>/ai-access", methods=["POST"])
+def api_admin_users_ai_access(user_id):
+    """授予/收回注册用户的平台 AI 访问（owner；docs §3.7 显式授予）。
+
+    body: {enabled: bool}。受邀用户默认 ai_access=false。PG-only（users.ai_access
+    列随 0012 迁移；json/dual 后端 503）。
+    """
+    auth = _require_owner()
+    if auth:
+        return auth
+    if platform_features.current_backend() != "postgres":
+        return _registration_unavailable_response()
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body.get("enabled"), bool):
+        return jsonify(error="缺少 enabled 布尔字段"), 400
+    import user_store_pg
+    user = user_store_pg.set_user_ai_access(user_id, bool(body["enabled"]))
+    if user is None:
+        return jsonify(error="用户不存在"), 404
+    _audit("user.ai_access", target_type="user", target_id=user_id,
+           detail={"enabled": bool(body["enabled"])})
+    out = dict(user)
+    out.pop("password_hash", None)
+    return jsonify(out)
+
+
+@app.route("/admin/registration")
+def admin_registration_page():
+    """owner 邀请注册管理页（模式切换 / 创建 / 列表 / 撤销）。"""
+    if AUTH_ENABLED and session.get("role") != user_store.ROLE_OWNER:
+        return redirect("/login")
+    return render_template("admin_registration.html",
+                           registration_mode=_effective_registration_mode())
+
+
 # --------------------------------------------------------------------------- #
 # owner AI 预算设置 / 用量（docs §4.2 / §9.2，PT-3）
 #
@@ -2571,12 +3023,17 @@ def api_admin_users_password(user_id):
 # --------------------------------------------------------------------------- #
 #: 预算限制整数上限（防误填巨型值；次数/步数 sane bound）
 _BUDGET_LIMIT_MAX = 1_000_000
-#: owner 可经 PUT 修改的周期限制字段（与 budget_store._PERIOD_LIMIT_COLUMNS 对齐）
+#: owner 可经 PUT 修改的周期限制字段（与 budget_store._PERIOD_LIMIT_COLUMNS 对齐；
+#: P0-B §3.7 新增 owner_reserved_turn_limit / user_pool_turn_limit）
 _BUDGET_SETTINGS_FIELDS = (
     "platform_turn_limit", "demo_turn_limit", "user_turn_limit",
+    "owner_reserved_turn_limit", "user_pool_turn_limit",
     "platform_task_max_steps", "own_task_max_steps_limit", "demo_task_max_steps",
     "demo_enabled", "demo_per_browser_limit", "demo_max_concurrency",
 )
+#: 允许 0 的限制字段（0=关闭该子池：Demo 子额度 / owner 保留 / user 共享池）
+_BUDGET_ZEROABLE_FIELDS = frozenset((
+    "demo_turn_limit", "owner_reserved_turn_limit", "user_pool_turn_limit"))
 
 
 def _budget_require_pg():
@@ -2593,12 +3050,15 @@ def _budget_require_pg():
 
 
 def _validate_budget_settings(body, current_limits):
-    """校验 owner 提交的预算限制（docs §4.2）。
+    """校验 owner 提交的预算限制（docs §4.2 + §3.7 池隔离）。
 
-    body 里只允许 _BUDGET_SETTINGS_FIELDS；次数/步数为有界正整数（0 不允许，
-    demo_turn_limit 允许 0=关闭 Demo 子额度）；demo_enabled 布尔。关系校验：
-    0 <= demo_turn_limit <= platform_turn_limit（按「本次提交 + 未提交沿用现值」
-    合并后判定）。返回 (validated, None) 或 (None, err)。
+    body 里只允许 _BUDGET_SETTINGS_FIELDS；次数/步数为有界非负整数
+    （_BUDGET_ZEROABLE_FIELDS 允许 0=关闭子池，其余需 >0）；demo_enabled 布尔。
+    关系校验（按「本次提交 + 未提交沿用现值」合并后判定）：
+      1. 0 <= demo_turn_limit <= platform_turn_limit；
+      2. demo_turn_limit + user_pool_turn_limit + owner_reserved_turn_limit
+         <= platform_turn_limit（总池拆分不越界；owner 保留池由服务端闸保证）。
+    返回 (validated, None) 或 (None, err)。
     """
     unknown = set(body.keys()) - set(_BUDGET_SETTINGS_FIELDS)
     if unknown:
@@ -2616,15 +3076,15 @@ def _validate_budget_settings(body, current_limits):
         iv, err = _coerce_tuning_int(raw, field)
         if err:
             return None, err
-        if field == "demo_turn_limit":
+        if field in _BUDGET_ZEROABLE_FIELDS:
             if iv < 0:
-                return None, "demo_turn_limit 不可为负"
+                return None, "{} 不可为负（0=关闭该子池）".format(field)
         elif iv <= 0:
             return None, "{} 需为正整数（> 0）".format(field)
         if iv > _BUDGET_LIMIT_MAX:
             return None, "{} 不可超过 {}".format(field, _BUDGET_LIMIT_MAX)
         validated[field] = iv
-    # 关系校验：0 <= demo_turn_limit <= platform_turn_limit（合并现值后）
+    # 关系校验（合并现值后）
     merged = dict(current_limits)
     merged.update(validated)
     demo = int(merged.get("demo_turn_limit") or 0)
@@ -2632,6 +3092,14 @@ def _validate_budget_settings(body, current_limits):
     if demo > platform:
         return None, "demo_turn_limit（{}）不可超过 platform_turn_limit（{}）".format(
             demo, platform)
+    user_pool = int(merged.get("user_pool_turn_limit") or 0)
+    owner_reserve = int(merged.get("owner_reserved_turn_limit") or 0)
+    if demo + user_pool + owner_reserve > platform:
+        return None, (
+            "子池之和（demo {} + user_pool {} + owner_reserve {} = {}）不可超过"
+            " platform_turn_limit（{}）".format(
+                demo, user_pool, owner_reserve,
+                demo + user_pool + owner_reserve, platform))
     return validated, None
 
 
@@ -2679,6 +3147,8 @@ def api_admin_ai_budget_get():
         usage={
             "platform": report["platform"],
             "demo": report["demo"],
+            "owner": report["owner"],
+            "user_pool": report["user_pool"],
             "by_subject_type": report["by_subject_type"],
             "per_user": report["per_user"],
             "own": report["own"],
@@ -4451,13 +4921,36 @@ def _ai_budget_subject(user_ctx):
     return "user", (user_ctx.get("user_id") or "owner")
 
 
+def _user_ai_access_denied(user_id):
+    """user 平台 AI 访问闸（docs §3.7：受邀用户默认 ai_access=false）。
+
+    返回 (403 响应) 或 None。owner 不经过本闸（保留池即 owner 可用）。存量/
+    owner 创建的用户 ai_access 缺省 True（0012 列默认），行为不变。
+    """
+    if not user_id:
+        return None
+    try:
+        u = user_store.get_user(user_id)
+    except Exception:
+        app.logger.exception("ai_access 读取失败（fail-open 仅限存量语义）")
+        return None
+    if u is not None and not u.get("ai_access", True):
+        return (jsonify(error="平台 AI 尚未对你开放，请联系管理员开通",
+                        code="ai_access_required"),
+                403)
+    return None
+
+
 def _ai_reserve_run_budget(user_ctx, request_id):
-    """起跑前预占一次 AI 对话额度（docs §5.3/§9.4）。
+    """起跑前预占一次 AI 对话额度（docs §5.3/§9.4 + P0-B §3.7）。
 
     返回 (reservation|None, error_response|None)：
-      - platform 凭据 + postgres：原子预占（owner/user 分别计入对应维度）；超限
-        映射 429 + 稳定 code（platform_ai_budget_exhausted / user_budget_exhausted
-        / demo_budget_exhausted），不回退其它凭据；
+      - platform 凭据 + postgres：ai_access 闸（user 默认 false 需 owner 授予）
+        → 原子预占（owner/user 分别计入对应维度：总量 / owner 保留保护 /
+        user 共享池 / 每 user）；超限映射 429 + 稳定 code
+        （platform_ai_budget_exhausted / user_budget_exhausted /
+        user_pool_budget_exhausted / owner_reserve_protected /
+        demo_budget_exhausted），不回退其它凭据；
       - platform 凭据 + json/dual：生产 fail-closed（503 pg_backend_required）；
         仅 TESTING bypass 放行（不预占）；
       - own 凭据：postgres 记可观测用量（不扣平台总量）；json 放行不记账；
@@ -4467,6 +4960,10 @@ def _ai_reserve_run_budget(user_ctx, request_id):
     if source is None:
         return None, None
     subject_type, subject_id = _ai_budget_subject(user_ctx)
+    if subject_type == "user":
+        denied = _user_ai_access_denied(subject_id)
+        if denied is not None:
+            return None, denied
     if not platform_features.budget_features_available():
         if source == "own":
             return None, None  # json：own 放行但不记账（docs §4.3）
@@ -4484,6 +4981,10 @@ def _ai_reserve_run_budget(user_ctx, request_id):
     except budget_store.PlatformBudgetExhausted as exc:
         return None, _budget_error_response(exc, 429)
     except budget_store.UserBudgetExhausted as exc:
+        return None, _budget_error_response(exc, 429)
+    except budget_store.UserPoolBudgetExhausted as exc:
+        return None, _budget_error_response(exc, 429)
+    except budget_store.OwnerReserveProtected as exc:
         return None, _budget_error_response(exc, 429)
     except budget_store.DemoConcurrencyExceeded as exc:
         return None, _budget_error_response(exc, 429)

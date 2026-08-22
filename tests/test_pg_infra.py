@@ -96,7 +96,9 @@ def test_schema_migrations_recorded(conn):
     # 0008_demo_ip_run_rate.sql 为 Demo AI run IP 前缀限流索引；
     # 0009_rollback_epoch.sql 为在途重放增加 rollback CAS 栅栏；
     # 0010_demo_task_max_steps_20.sql 把 Demo 单次默认从 10 步改为 20 步；
-    # 插件能力层 P1 追加 0011_plugin_capabilities.sql（能力注册表列）。
+    # 插件能力层 P1 追加 0011_plugin_capabilities.sql（能力注册表列）；
+    # P0-B 追加 0012_registration_invites.sql（邀请注册表 + users.ai_access +
+    # ai_budget_periods owner 保留 / user 共享池列）。
     assert rows == [
         "0001_init.sql", "0002_roi_payload.sql", "0003_comments.sql",
         "0004_audit.sql", "0005_plugin.sql", "0006_demo_budget_auth.sql",
@@ -105,6 +107,7 @@ def test_schema_migrations_recorded(conn):
         "0009_rollback_epoch.sql",
         "0010_demo_task_max_steps_20.sql",
         "0011_plugin_capabilities.sql",
+        "0012_registration_invites.sql",
     ]
 
 

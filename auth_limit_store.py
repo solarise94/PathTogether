@@ -47,6 +47,34 @@ AUTH_LOCK_SECONDS = _int_env("AUTH_LOCK_SECONDS", 900)
 SCOPE_ACCOUNT = "account"
 SCOPE_IP_PREFIX = "ip_prefix"
 
+# --------------------------------------------------------------------------- #
+# 注册限流桶（P0-B docs §4.5；复用 auth_rate_limits 的 (scope, subject_hash)
+# 通用计数行，scope 取值域扩展，无需新表）：
+#   - reg_ip_short ：每 IP 前缀 15 分钟 10 次**失败**；
+#   - reg_ip_daily ：每 IP 前缀 24 小时 30 次**尝试**（成功也计）；
+#   - reg_invite   ：每 invite token_hash 15 分钟 5 次失败短时锁定；
+#   - reg_owner_min / reg_owner_day：owner 创建邀请码每分钟 / 每日上限。
+# IP 桶只是辅闸（FRP 可信链未定，docs §4.5）；主闸是邀请码高熵 + 单事务一次性
+# 消费。subject 一律带盐 hash，不存明文 IP / token。
+# --------------------------------------------------------------------------- #
+SCOPE_REG_IP_SHORT = "reg_ip_short"
+SCOPE_REG_IP_DAILY = "reg_ip_daily"
+SCOPE_REG_INVITE = "reg_invite"
+SCOPE_REG_OWNER_MIN = "reg_owner_min"
+SCOPE_REG_OWNER_DAY = "reg_owner_day"
+
+REG_IP_SHORT_FAILURE_LIMIT = _int_env("REG_IP_SHORT_FAILURE_LIMIT", 10)
+REG_IP_SHORT_WINDOW_SECONDS = _int_env("REG_IP_SHORT_WINDOW_SECONDS", 900)
+REG_IP_SHORT_LOCK_SECONDS = _int_env("REG_IP_SHORT_LOCK_SECONDS", 900)
+REG_IP_DAILY_ATTEMPT_LIMIT = _int_env("REG_IP_DAILY_ATTEMPT_LIMIT", 30)
+REG_IP_DAILY_WINDOW_SECONDS = _int_env("REG_IP_DAILY_WINDOW_SECONDS", 86400)
+REG_IP_DAILY_LOCK_SECONDS = _int_env("REG_IP_DAILY_LOCK_SECONDS", 86400)
+REG_INVITE_FAILURE_LIMIT = _int_env("REG_INVITE_FAILURE_LIMIT", 5)
+REG_INVITE_WINDOW_SECONDS = _int_env("REG_INVITE_WINDOW_SECONDS", 900)
+REG_INVITE_LOCK_SECONDS = _int_env("REG_INVITE_LOCK_SECONDS", 900)
+REG_OWNER_CREATE_PER_MINUTE = _int_env("REG_OWNER_INVITE_CREATE_PER_MINUTE", 10)
+REG_OWNER_CREATE_PER_DAY = _int_env("REG_OWNER_INVITE_CREATE_PER_DAY", 100)
+
 
 def _connect():
     """建连接并设 dict_row（本模块所有查询按列名访问）。"""
@@ -238,5 +266,143 @@ def clear_auth_failures(account_hash, ip_prefix_hash):
                     "DELETE FROM auth_rate_limits WHERE "
                     + " OR ".join(clauses), params)
                 return cur.rowcount
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 注册限流（P0-B docs §4.5）：全部 PostgreSQL 权威，多 worker 一致；
+# 存储不可用时调用方 fail-closed 503，绝不退化进程内计数。
+# --------------------------------------------------------------------------- #
+def check_registration_locked(ip_prefix_hash, invite_hash=None):
+    """查询注册限流锁定状态：返回剩余锁定秒数（0=未锁）。
+
+    覆盖 reg_ip_short / reg_ip_daily / reg_invite（invite_hash 未给时跳过该桶）。
+    """
+    platform_features.require_pg_backend("auth_rate_limits")
+    now = time.time()
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                retry = 0
+                for scope, subject_hash in (
+                        (SCOPE_REG_IP_SHORT, ip_prefix_hash),
+                        (SCOPE_REG_IP_DAILY, ip_prefix_hash),
+                        (SCOPE_REG_INVITE, invite_hash)):
+                    if not subject_hash:
+                        continue
+                    cur.execute(
+                        "SELECT extract(epoch from locked_until)::float8 "
+                        "AS locked_until FROM auth_rate_limits "
+                        "WHERE scope=%s AND subject_hash=%s",
+                        (scope, subject_hash))
+                    row = cur.fetchone()
+                    if row is not None:
+                        retry = max(retry, _retry_after(row["locked_until"], now))
+        return retry
+    finally:
+        conn.close()
+
+
+def record_registration_attempt(ip_prefix_hash):
+    """记录一次注册 POST 尝试（24 小时桶，成功也计；达 30 次锁 24h）。
+
+    返回锁定剩余秒数（0=未锁）。"""
+    platform_features.require_pg_backend("auth_rate_limits")
+    now = time.time()
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                _purge_expired(cur, now, REG_IP_DAILY_WINDOW_SECONDS,
+                               REG_IP_DAILY_LOCK_SECONDS)
+                if not ip_prefix_hash:
+                    return 0
+                state = _record_failure(
+                    cur, SCOPE_REG_IP_DAILY, ip_prefix_hash,
+                    REG_IP_DAILY_ATTEMPT_LIMIT, REG_IP_DAILY_WINDOW_SECONDS,
+                    REG_IP_DAILY_LOCK_SECONDS, now)
+        return int(state.get("retry_after_seconds") or 0)
+    finally:
+        conn.close()
+
+
+def record_registration_failure(ip_prefix_hash, invite_hash=None):
+    """记录一次注册失败：IP 前缀短窗桶 + invite token_hash 桶（同事务）。
+
+    任一桶达到阈值即锁定（返回锁定剩余秒数，0=未锁）。"""
+    platform_features.require_pg_backend("auth_rate_limits")
+    now = time.time()
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                _purge_expired(cur, now, max(REG_IP_SHORT_WINDOW_SECONDS,
+                                             REG_INVITE_WINDOW_SECONDS),
+                               max(REG_IP_SHORT_LOCK_SECONDS,
+                                   REG_INVITE_LOCK_SECONDS))
+                retry = 0
+                if ip_prefix_hash:
+                    s = _record_failure(
+                        cur, SCOPE_REG_IP_SHORT, ip_prefix_hash,
+                        REG_IP_SHORT_FAILURE_LIMIT,
+                        REG_IP_SHORT_WINDOW_SECONDS,
+                        REG_IP_SHORT_LOCK_SECONDS, now)
+                    retry = max(retry, int(s.get("retry_after_seconds") or 0))
+                if invite_hash:
+                    s = _record_failure(
+                        cur, SCOPE_REG_INVITE, invite_hash,
+                        REG_INVITE_FAILURE_LIMIT, REG_INVITE_WINDOW_SECONDS,
+                        REG_INVITE_LOCK_SECONDS, now)
+                    retry = max(retry, int(s.get("retry_after_seconds") or 0))
+        return retry
+    finally:
+        conn.close()
+
+
+def check_owner_invite_creation_locked(owner_hash):
+    """owner 邀请码创建限流：达到每分钟/每日上限时返回剩余锁定秒数（0=可建）。"""
+    platform_features.require_pg_backend("auth_rate_limits")
+    now = time.time()
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                retry = 0
+                for scope in (SCOPE_REG_OWNER_MIN, SCOPE_REG_OWNER_DAY):
+                    cur.execute(
+                        "SELECT extract(epoch from locked_until)::float8 "
+                        "AS locked_until FROM auth_rate_limits "
+                        "WHERE scope=%s AND subject_hash=%s",
+                        (scope, owner_hash))
+                    row = cur.fetchone()
+                    if row is not None:
+                        retry = max(retry, _retry_after(row["locked_until"], now))
+        return retry
+    finally:
+        conn.close()
+
+
+def record_owner_invite_creation(owner_hash):
+    """记录一次邀请码创建（每分钟/每日两桶）；返回锁定剩余秒数（0=未锁）。"""
+    platform_features.require_pg_backend("auth_rate_limits")
+    now = time.time()
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                _purge_expired(cur, now, 86400, 86400)
+                retry = 0
+                for scope, limit, window_sec, lock_sec in (
+                        (SCOPE_REG_OWNER_MIN, REG_OWNER_CREATE_PER_MINUTE,
+                         60, 60),
+                        (SCOPE_REG_OWNER_DAY, REG_OWNER_CREATE_PER_DAY,
+                         86400, 86400)):
+                    s = _record_failure(
+                        cur, scope, owner_hash, limit, window_sec, lock_sec,
+                        now)
+                    retry = max(retry, int(s.get("retry_after_seconds") or 0))
+        return retry
     finally:
         conn.close()

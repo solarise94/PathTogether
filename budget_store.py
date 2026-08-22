@@ -2,9 +2,11 @@
 """平台 AI 预算存储原子原语（ai_budget_*，docs §4.1/§4.2/§5.3/§9.4）。
 
 数据模型（migrations/0006_demo_budget_auth.sql + 0007_reservation_attempt.sql
-+ 0009_rollback_epoch.sql + 0010_demo_task_max_steps_20.sql）：
++ 0009_rollback_epoch.sql + 0010_demo_task_max_steps_20.sql
++ 0012_registration_invites.sql）：
   - ai_budget_periods：预算周期行（closed_at IS NULL 即当前开放周期）。默认值
-    与迁移 DDL 一致：总 30 / Demo 子 5 / 每 user 10 / 平台单次 20 步 /
+    与迁移 DDL 一致（0012 起 §3.7 池隔离）：总 30 / Demo 子 5 / owner 保留 10 /
+    user 共享池 15 / 每 user 3（可 env 覆盖缺省周期创建值）/ 平台单次 20 步 /
     own 硬上限 500 / Demo 单次 20 步。
   - ai_budget_usage：按 (period, subject_type, subject_id, credential_source)
     聚合的 accepted/reserved 计数。平台总额度 = 同 period 内
@@ -32,6 +34,7 @@ json/dual 后端：全部公共入口经 platform_features.require_pg_backend fa
 （不静默退化内存计数）。本模块不接 Flask 路由。
 """
 
+import os
 import time
 
 import psycopg
@@ -39,12 +42,28 @@ import psycopg
 import pg_store
 import platform_features
 
+
+def _int_env(name, default):
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 # --------------------------------------------------------------------------- #
-# 常量（与迁移 DDL 默认值保持一致；缺省周期按这些值创建）
+# 常量（缺省周期按这些值创建；0012 起 user/owner/user_pool 默认值可 env 覆盖，
+# 对齐 docs §3.7 推荐测试期默认：总 30 = owner 保留 10 + user 共享 15 + Demo 5；
+# 单 user 初始 3 次）
 # --------------------------------------------------------------------------- #
 DEFAULT_PLATFORM_TURN_LIMIT = 30
 DEFAULT_DEMO_TURN_LIMIT = 5
-DEFAULT_USER_TURN_LIMIT = 10
+DEFAULT_USER_TURN_LIMIT = _int_env("BUDGET_DEFAULT_USER_TURNS", 3)
+DEFAULT_OWNER_RESERVED_TURN_LIMIT = _int_env(
+    "BUDGET_DEFAULT_OWNER_RESERVED_TURNS", 10)
+DEFAULT_USER_POOL_TURN_LIMIT = _int_env("BUDGET_DEFAULT_USER_POOL_TURNS", 15)
 DEFAULT_PLATFORM_TASK_MAX_STEPS = 20
 DEFAULT_OWN_TASK_MAX_STEPS_LIMIT = 500
 DEFAULT_DEMO_TASK_MAX_STEPS = 20
@@ -66,6 +85,8 @@ _PERIOD_LIMIT_COLUMNS = {
     "platform_turn_limit": int,
     "demo_turn_limit": int,
     "user_turn_limit": int,
+    "owner_reserved_turn_limit": int,
+    "user_pool_turn_limit": int,
     "platform_task_max_steps": int,
     "own_task_max_steps_limit": int,
     "demo_task_max_steps": int,
@@ -106,6 +127,18 @@ class UserBudgetExhausted(BudgetError):
     code = "user_budget_exhausted"
 
 
+class UserPoolBudgetExhausted(BudgetError):
+    """全部注册 user 共享池（user_pool_turn_limit）耗尽（docs §3.7）。"""
+
+    code = "user_pool_budget_exhausted"
+
+
+class OwnerReserveProtected(BudgetError):
+    """user/Demo 合计用量将侵占 owner 保留池（platform - owner_reserve 上限）。"""
+
+    code = "owner_reserve_protected"
+
+
 class RequestIdSubjectConflict(BudgetError):
     """request_id 已被其他主体占用，禁止跨主体复用。"""
 
@@ -141,6 +174,7 @@ _PERIOD_SEL = (
     "id, extract(epoch from started_at)::float8 AS started_at, "
     "extract(epoch from closed_at)::float8 AS closed_at, "
     "platform_turn_limit, demo_turn_limit, user_turn_limit, "
+    "owner_reserved_turn_limit, user_pool_turn_limit, "
     "platform_task_max_steps, own_task_max_steps_limit, demo_task_max_steps, "
     "demo_enabled, demo_per_browser_limit, demo_max_concurrency, created_by"
 )
@@ -287,8 +321,12 @@ def get_or_create_current_period(conn, created_by=None):
         if row is not None:
             return _period_out(row)
         cur.execute(
-            "INSERT INTO ai_budget_periods (started_at, created_by) "
-            "VALUES (now(), %s) RETURNING " + _PERIOD_SEL, (created_by,))
+            "INSERT INTO ai_budget_periods (started_at, created_by, "
+            "user_turn_limit, owner_reserved_turn_limit, user_pool_turn_limit) "
+            "VALUES (now(), %s, %s, %s, %s) RETURNING " + _PERIOD_SEL,
+            (created_by, DEFAULT_USER_TURN_LIMIT,
+             DEFAULT_OWNER_RESERVED_TURN_LIMIT,
+             DEFAULT_USER_POOL_TURN_LIMIT))
         return _period_out(cur.fetchone())
 
 
@@ -502,10 +540,16 @@ def reserve_turn(request_id, subject_type, subject_id, credential_source,
 
 
 def _check_platform_quota(cur, period, subject_type, subject_id):
-    """平台凭据三项额度判定（须在周期行 FOR UPDATE 锁内调用）。
+    """平台凭据额度判定（须在周期行 FOR UPDATE 锁内调用）。
 
-    顺序：平台总量 → Demo 子量（subject_type=demo）→ 该 user 用量
-    （subject_type=user）。任一超限抛对应业务异常（事务整体回滚）。
+    顺序：平台总量 → 非主体细分判定。任一超限抛对应业务异常（事务整体回滚）。
+
+    docs §3.7 池隔离（P0-B）：
+      - owner：只受平台总量约束（保留池是「为 owner 保住的下限」，不设独立
+        上限；下限由 user/Demo 的闸保证）；
+      - user：单 user 上限 → user 共享池（Σ subject_type=user）→ owner 保留
+        保护（Σ user + Σ demo ≤ platform_turn_limit - owner_reserved_turn_limit）；
+      - demo：Demo 子额度/每浏览器/并发 → owner 保留保护（同上）。
     """
     pid = period["id"]
     used_total = _sum_used(cur, pid, credential_source="platform")
@@ -540,6 +584,7 @@ def _check_platform_quota(cur, period, subject_type, subject_id):
                 raise DemoConcurrencyExceeded(
                     "Demo 并发已达上限（%d/%d）" % (in_flight, max_cc),
                     limit=max_cc, used=in_flight)
+        _check_owner_reserve_guard(cur, period, used_demo=used_demo)
     elif subject_type == "user":
         used_user = _sum_used(cur, pid, subject_type="user",
                               subject_id=subject_id,
@@ -550,6 +595,45 @@ def _check_platform_quota(cur, period, subject_type, subject_id):
                     used_user, period["user_turn_limit"]),
                 limit=period["user_turn_limit"], used=used_user,
                 subject_id=subject_id)
+        # user 共享池（docs §3.7：所有 user 共享，而非仅「每 user + 全站总」）
+        used_user_pool = _sum_used(cur, pid, subject_type="user",
+                                   credential_source="platform")
+        if used_user_pool + 1 > period["user_pool_turn_limit"]:
+            raise UserPoolBudgetExhausted(
+                "用户共享 AI 额度已耗尽（%d/%d）" % (
+                    used_user_pool, period["user_pool_turn_limit"]),
+                limit=period["user_pool_turn_limit"], used=used_user_pool)
+        _check_owner_reserve_guard(cur, period, used_user_pool=used_user_pool)
+
+
+def _check_owner_reserve_guard(cur, period, used_user_pool=0, used_demo=0):
+    """owner 保留池保护：user+Demo 合计不得越过 platform - owner_reserve。
+
+    必须在周期行 FOR UPDATE 锁内调用（与 _check_platform_quota 同事务）。
+    owner 自身不受本闸约束（保留池就是给 owner 留的）。
+
+    guard = platform_turn_limit - owner_reserved_turn_limit < 0 视为配置错误
+    （保留池大于总池；app 层校验已阻止，直接 store 调用可绕过）——此时本闸
+    不再额外阻断，平台总量闸仍兜底，避免小总池场景把语义吞成 owner_reserve。
+    """
+    pid = period["id"]
+    if "user_pool_turn_limit" not in period or \
+            "owner_reserved_turn_limit" not in period:
+        return  # 旧周期行缺列（迁移前）：DDL 兜底默认已补，正常不可达
+    used_users = int(used_user_pool or _sum_used(
+        cur, pid, subject_type="user", credential_source="platform"))
+    used_demo_total = int(used_demo or _sum_used(
+        cur, pid, subject_type="demo", credential_source="platform"))
+    reserve = int(period["owner_reserved_turn_limit"])
+    guard = int(period["platform_turn_limit"]) - reserve
+    if guard < 0:
+        return  # 保留池配置大于总池：交由平台总量闸兜底（见 docstring）
+    if used_users + used_demo_total + 1 > guard:
+        raise OwnerReserveProtected(
+            "用户与 Demo 合计用量已达上限（%d/%d），owner 保留 %d 次不可被占用"
+            % (used_users + used_demo_total, guard, reserve),
+            limit=guard, used=used_users + used_demo_total,
+            owner_reserved=reserve)
 
 
 def consume(request_id, histopilot_session_id, expected_attempt=None):
@@ -792,6 +876,8 @@ def usage_report():
             return int(d["accepted"]) + int(d["reserved"])
 
         demo = by_type.get("demo", {"accepted": 0, "reserved": 0})
+        owner = by_type.get("owner", {"accepted": 0, "reserved": 0})
+        users_all = by_type.get("user", {"accepted": 0, "reserved": 0})
         return {
             "period": period,
             "platform": {
@@ -805,6 +891,23 @@ def usage_report():
                 "reserved": int(demo["reserved"]),
                 "total": _tot(demo),
                 "limit": period["demo_turn_limit"],
+            },
+            # owner 侧用量与保留池（docs §3.7：owner 可用下限 = reserve - 已用）
+            "owner": {
+                "accepted": int(owner["accepted"]),
+                "reserved": int(owner["reserved"]),
+                "total": _tot(owner),
+                "reserved_limit": int(period.get(
+                    "owner_reserved_turn_limit",
+                    DEFAULT_OWNER_RESERVED_TURN_LIMIT)),
+            },
+            # 全部注册 user 共享池（docs §3.7）
+            "user_pool": {
+                "accepted": int(users_all["accepted"]),
+                "reserved": int(users_all["reserved"]),
+                "total": _tot(users_all),
+                "limit": int(period.get("user_pool_turn_limit",
+                                        DEFAULT_USER_POOL_TURN_LIMIT)),
             },
             # Demo/user/owner 构成（均指 platform 凭据；own 单列）
             "by_subject_type": {

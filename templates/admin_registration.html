@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="referrer" content="no-referrer" />
+  <title>PathTogether · 邀请注册管理</title>
+  <style>
+    :root {
+      --accent: #007AFF;
+      --accent-hover: #0062CC;
+      --danger: #FF3B30;
+      --ok: #34C759;
+      --bg: #f5f5f7;
+      --text: #1d1d1f;
+      --text-2: #86868b;
+      --separator: rgba(0, 0, 0, 0.08);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+                   "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 32px 16px;
+    }
+    .wrap { max-width: 860px; margin: 0 auto; }
+    h1 { font-size: 22px; font-weight: 700; margin-bottom: 4px; }
+    .sub { font-size: 13px; color: var(--text-2); margin-bottom: 24px; }
+    .card {
+      background: #fff;
+      border-radius: 14px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05), 0 8px 24px rgba(0,0,0,0.06);
+      padding: 22px 24px;
+      margin-bottom: 18px;
+    }
+    .card h2 { font-size: 15px; font-weight: 600; margin-bottom: 12px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    label { font-size: 12px; color: var(--text-2); display: block; margin: 10px 0 4px; }
+    input[type="text"], input[type="number"], select {
+      height: 36px;
+      border: 1px solid var(--separator);
+      border-radius: 8px;
+      padding: 0 10px;
+      font-size: 13px;
+      font-family: inherit;
+      background: #fff;
+      color: var(--text);
+      outline: none;
+    }
+    input:focus, select:focus { border-color: var(--accent); }
+    .field-inline { display: flex; gap: 14px; flex-wrap: wrap; }
+    .field-inline > div { flex: 1 1 180px; }
+    .btn {
+      height: 36px;
+      padding: 0 16px;
+      border: none;
+      border-radius: 8px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 13px;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+    }
+    .btn:hover { background: var(--accent-hover); }
+    .btn.secondary { background: #fff; color: var(--accent); border: 1px solid var(--separator); }
+    .btn.danger { background: var(--danger); }
+    .btn.small { height: 28px; padding: 0 10px; font-size: 12px; }
+    .mode-note { font-size: 12px; color: var(--text-2); line-height: 1.7; margin-top: 8px; }
+    .warn {
+      background: rgba(255, 59, 48, 0.08);
+      color: var(--danger);
+      font-size: 12px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      margin-top: 8px;
+      line-height: 1.6;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    th, td { text-align: left; padding: 8px 8px; border-bottom: 1px solid var(--separator); }
+    th { color: var(--text-2); font-weight: 500; font-size: 11.5px; }
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .pill.open { background: rgba(52, 199, 89, 0.12); color: var(--ok); }
+    .pill.consumed { background: rgba(0, 122, 255, 0.10); color: var(--accent); }
+    .pill.revoked, .pill.expired { background: rgba(142, 142, 147, 0.15); color: var(--text-2); }
+    .token-box {
+      display: none;
+      background: rgba(52, 199, 89, 0.08);
+      border: 1px solid rgba(52, 199, 89, 0.35);
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin-top: 12px;
+    }
+    .token-box .tok {
+      font-family: SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 14px;
+      word-break: break-all;
+      color: var(--text);
+      user-select: all;
+    }
+    .token-box p { font-size: 12px; color: var(--danger); margin-bottom: 8px; font-weight: 600; }
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(29, 29, 31, 0.92);
+      color: #fff;
+      font-size: 13px;
+      padding: 10px 18px;
+      border-radius: 10px;
+      display: none;
+    }
+    .empty { color: var(--text-2); font-size: 12.5px; padding: 10px 0; }
+    a.back { font-size: 13px; color: var(--accent); text-decoration: none; }
+    .mono { font-family: SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <a class="back" href="/">← 返回</a>
+    <h1 style="margin-top:8px">邀请注册管理</h1>
+    <p class="sub">一次性邀请码的创建 / 列表 / 撤销与注册模式切换（仅 owner）。明文邀请码只在创建时显示一次。</p>
+
+    <!-- 注册模式 -->
+    <div class="card">
+      <h2>注册模式</h2>
+      <div class="row">
+        <select id="mode-select">
+          <option value="closed">closed（关闭注册）</option>
+          <option value="invite_only">invite_only（邀请注册）</option>
+        </select>
+        <button class="btn" id="mode-save">保存模式</button>
+        <span class="mode-note" id="mode-current"></span>
+      </div>
+      <div class="warn" id="mode-warn" hidden></div>
+      <p class="mode-note">
+        本阶段不支持 public（公开注册）。切到 invite_only 要求：公网入口为 HTTPS（PUBLIC_BASE_URL）、
+        ADMIN_SESSION_COOKIE_SECURE 已启用、存储为 PostgreSQL；条件不满足时保存会被拒绝，运行中也会 fail-closed 降级为 closed。
+      </p>
+    </div>
+
+    <!-- 创建邀请码 -->
+    <div class="card">
+      <h2>创建邀请码</h2>
+      <div class="field-inline">
+        <div>
+          <label>绑定邮箱（留空 = 不绑定，高风险）</label>
+          <input type="text" id="inv-email" maxlength="120" placeholder="user@example.com" />
+        </div>
+        <div>
+          <label>有效期（小时，默认 168 = 7 天）</label>
+          <input type="number" id="inv-ttl" min="1" max="720" placeholder="168" />
+        </div>
+        <div>
+          <label>分组标签 cohort（可选）</label>
+          <input type="text" id="inv-cohort" maxlength="64" placeholder="如 testing-2026Q3" />
+        </div>
+      </div>
+      <div class="field-inline">
+        <div>
+          <label>备注（可选，不出现在邀请码中）</label>
+          <input type="text" id="inv-note" maxlength="200" />
+        </div>
+        <div>
+          <label>平台 AI 权限（默认关闭）</label>
+          <div class="row" style="margin-top:6px">
+            <label style="margin:0;display:flex;align-items:center;gap:6px">
+              <input type="checkbox" id="inv-ai" /> 新用户可使用平台 AI
+            </label>
+          </div>
+        </div>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button class="btn" id="inv-create">创建邀请码</button>
+        <span class="mode-note">创建频率受每分钟 / 每日上限限制。</span>
+      </div>
+      <div class="token-box" id="token-box">
+        <p>⚠ 邀请码仅显示这一次，关闭页面后无法再查询。请立即通过可信渠道发送给被邀请人。</p>
+        <div class="tok" id="token-value"></div>
+        <div class="row" style="margin-top:8px">
+          <button class="btn secondary small" id="token-copy">复制</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 邀请码列表 -->
+    <div class="card">
+      <h2>邀请码列表 <span class="mode-note" id="inv-count"></span></h2>
+      <table>
+        <thead>
+          <tr>
+            <th>邮箱（掩码）</th><th>状态</th><th>过期时间</th><th>AI</th><th>cohort</th><th>备注</th><th></th>
+          </tr>
+        </thead>
+        <tbody id="inv-tbody"></tbody>
+      </table>
+      <div class="empty" id="inv-empty" hidden>暂无邀请码</div>
+    </div>
+  </div>
+  <div class="toast" id="toast"></div>
+
+  <script>
+    (function () {
+      "use strict";
+      function csrfToken() {
+        var m = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+        return m ? decodeURIComponent(m[1]) : "";
+      }
+      function api(method, url, body) {
+        var opts = { method: method, headers: { "X-CSRF-Token": csrfToken() } };
+        if (body !== undefined) {
+          opts.headers["Content-Type"] = "application/json";
+          opts.body = JSON.stringify(body);
+        }
+        return fetch(url, opts).then(function (r) {
+          return r.json().catch(function () { return {}; }).then(function (b) {
+            return { status: r.status, body: b };
+          });
+        });
+      }
+      var toastEl = document.getElementById("toast");
+      function toast(msg) {
+        toastEl.textContent = msg;
+        toastEl.style.display = "block";
+        setTimeout(function () { toastEl.style.display = "none"; }, 2600);
+      }
+      function fmtTs(v) {
+        return v ? new Date(v * 1000).toLocaleString() : "";
+      }
+
+      // —— 模式 ——
+      function loadMode() {
+        api("GET", "/api/admin/settings/registration").then(function (res) {
+          if (res.status !== 200) { toast(res.body.error || "读取失败"); return; }
+          document.getElementById("mode-select").value =
+            res.body.supported_modes.indexOf(res.body.mode) >= 0 ? res.body.mode : "closed";
+          document.getElementById("mode-current").textContent =
+            "当前生效：" + res.body.mode + "（存储值：" + res.body.stored_mode + "）";
+          var warn = document.getElementById("mode-warn");
+          var f = res.body.precondition_failures || [];
+          if (f.length) { warn.hidden = false; warn.textContent = "invite_only 前置条件未满足：" + f.join("；"); }
+          else { warn.hidden = true; }
+        });
+      }
+      document.getElementById("mode-save").addEventListener("click", function () {
+        var mode = document.getElementById("mode-select").value;
+        api("PUT", "/api/admin/settings/registration", { mode: mode }).then(function (res) {
+          if (res.status !== 200) { toast(res.body.error || "保存失败"); }
+          else { toast("已切换为 " + mode); }
+          loadMode();
+        });
+      });
+
+      // —— 列表 ——
+      function loadInvites() {
+        api("GET", "/api/admin/registration-invites").then(function (res) {
+          if (res.status !== 200) { toast(res.body.error || "读取失败"); return; }
+          var list = res.body.invites || [];
+          document.getElementById("inv-count").textContent = "（共 " + list.length + " 条）";
+          var tb = document.getElementById("inv-tbody");
+          document.getElementById("inv-empty").hidden = list.length > 0;
+          tb.innerHTML = list.map(function (i) {
+            var revokeBtn = i.status === "open"
+              ? '<button class="btn secondary small" data-revoke="' + esc(i.invite_id) + '">撤销</button>' : "";
+            return "<tr><td>" + esc(i.email_masked || "（不绑定）") +
+              "</td><td><span class=\"pill " + i.status + "\">" + i.status + "</span></td>" +
+              "<td>" + fmtTs(i.expires_at) + "</td>" +
+              "<td>" + (i.ai_access ? "开" : "关") + "</td>" +
+              "<td>" + esc(i.cohort || "") + "</td>" +
+              "<td>" + esc(i.note || "") + "</td>" +
+              "<td>" + revokeBtn + "</td></tr>";
+          }).join("");
+        });
+      }
+      function esc(s) {
+        return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+          return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+        });
+      }
+      document.getElementById("inv-tbody").addEventListener("click", function (e) {
+        var btn = e.target.closest("[data-revoke]");
+        if (!btn) return;
+        var id = btn.getAttribute("data-revoke");
+        if (!window.confirm("确认撤销该邀请码？未使用前撤销后立即失效。")) return;
+        api("POST", "/api/admin/registration-invites/" + encodeURIComponent(id) + "/revoke", {})
+          .then(function (res) {
+            if (res.status !== 200) { toast(res.body.error || "撤销失败"); }
+            else { toast("已撤销"); }
+            loadInvites();
+          });
+      });
+
+      // —— 创建 ——
+      document.getElementById("inv-create").addEventListener("click", function () {
+        var body = {};
+        var email = document.getElementById("inv-email").value.trim();
+        if (email) body.email = email;
+        var ttl = parseInt(document.getElementById("inv-ttl").value || "168", 10);
+        if (ttl) body.ttl_hours = ttl;
+        var cohort = document.getElementById("inv-cohort").value.trim();
+        if (cohort) body.cohort = cohort;
+        var note = document.getElementById("inv-note").value.trim();
+        if (note) body.note = note;
+        body.ai_access = document.getElementById("inv-ai").checked;
+        api("POST", "/api/admin/registration-invites", body).then(function (res) {
+          if (res.status !== 200) { toast(res.body.error || "创建失败"); return; }
+          var box = document.getElementById("token-box");
+          document.getElementById("token-value").textContent = res.body.token || "";
+          box.style.display = "block";
+          document.getElementById("inv-email").value = "";
+          document.getElementById("inv-cohort").value = "";
+          document.getElementById("inv-note").value = "";
+          document.getElementById("inv-ai").checked = false;
+          loadInvites();
+        });
+      });
+      document.getElementById("token-copy").addEventListener("click", function () {
+        var text = document.getElementById("token-value").textContent;
+        if (navigator.clipboard) { navigator.clipboard.writeText(text); toast("已复制"); }
+      });
+
+      loadMode();
+      loadInvites();
+    })();
+  </script>
+</body>
+</html>

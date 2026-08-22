@@ -3,11 +3,14 @@
 
 数据模型（migrations/0006_demo_budget_auth.sql + 0007_reservation_attempt.sql
 + 0009_rollback_epoch.sql + 0010_demo_task_max_steps_20.sql
-+ 0012_registration_invites.sql）：
++ 0012_registration_invites.sql + 0014_demo_daily_window.sql）：
   - ai_budget_periods：预算周期行（closed_at IS NULL 即当前开放周期）。默认值
-    与迁移 DDL 一致（0012 起 §3.7 池隔离）：总 30 / Demo 子 5 / owner 保留 10 /
-    user 共享池 15 / 每 user 3（可 env 覆盖缺省周期创建值）/ 平台单次 20 步 /
-    own 硬上限 500 / Demo 单次 20 步。
+    与迁移 DDL 一致（0014 起 Demo 子池改每日口径）：总 30 / Demo 每日 50 /
+    owner 保留 10 / user 共享池 15 / 每 user 3（可 env 覆盖缺省周期创建值）/
+    平台单次 20 步 / own 硬上限 500 / Demo 单次 20 步。
+    Demo 子池自 0014 起为「每日（滚动 24 小时窗口）」口径：demo_turn_limit
+    语义是单日上限，不随预算周期累计，也不因周期重置而清零（窗口按
+    reserved_at 滚动，见 _demo_window_used）。
   - ai_budget_usage：按 (period, subject_type, subject_id, credential_source)
     聚合的 accepted/reserved 计数。平台总额度 = 同 period 内
     credential_source=platform 的 Σ(accepted+reserved)；own 只记可观测用量。
@@ -55,11 +58,12 @@ def _int_env(name, default):
 
 # --------------------------------------------------------------------------- #
 # 常量（缺省周期按这些值创建；0012 起 user/owner/user_pool 默认值可 env 覆盖，
-# 对齐 docs §3.7 推荐测试期默认：总 30 = owner 保留 10 + user 共享 15 + Demo 5；
-# 单 user 初始 3 次）
+# 对齐 docs §3.7 推荐测试期默认：总 30 = owner 保留 10 + user 共享 15；
+# 单 user 初始 3 次。Demo 子池自 0014 起改每日滚动 24h 口径，缺省 50 次/日，
+# 不再按周期累计，也不参与周期加和约束）
 # --------------------------------------------------------------------------- #
 DEFAULT_PLATFORM_TURN_LIMIT = 30
-DEFAULT_DEMO_TURN_LIMIT = 5
+DEFAULT_DEMO_TURN_LIMIT = 50
 DEFAULT_USER_TURN_LIMIT = _int_env("BUDGET_DEFAULT_USER_TURNS", 3)
 DEFAULT_OWNER_RESERVED_TURN_LIMIT = _int_env(
     "BUDGET_DEFAULT_OWNER_RESERVED_TURNS", 10)
@@ -80,7 +84,9 @@ CREDENTIAL_SOURCES = ("platform", "own")
 #: 周期创建串行化 advisory key（事务级；任意稳定 bigint，"AIBP"）
 _PERIOD_LOCK_KEY = 0x41494250
 
-#: 可通过 reset_period / update_period_limits 修改的周期限制列（白名单）
+#: 可通过 reset_period / update_period_limits 修改的周期限制列（白名单）。
+#: 注意 demo_turn_limit 为「每日上限」（滚动 24h 窗口口径，见 _demo_window_used），
+#: 与其余按周期累计的列口径不同。
 _PERIOD_LIMIT_COLUMNS = {
     "platform_turn_limit": int,
     "demo_turn_limit": int,
@@ -268,6 +274,35 @@ def _count_reserved(cur, period_id, subject_type=None) -> int:
     return int(cur.fetchone()["n"])
 
 
+#: Demo 每日子池滚动窗口长度（小时）。0014 起 demo_turn_limit 为单日上限，
+#: 计数按 reserved_at 滚动窗口（不按周期累计、不因周期重置清零）。
+_DEMO_WINDOW_HOURS = 24
+
+#: 计入 Demo 每日窗口的 reservation 状态：consumed（已消费）+ reserved（预占中）。
+#: released（含显式释放与 reclaim_expired 过期回收）已退款，不计入。
+_DEMO_WINDOW_STATES = ("consumed", "reserved")
+
+
+def _demo_window_used(cur, hours=_DEMO_WINDOW_HOURS) -> int:
+    """Demo 每日子池用量：滚动窗口内有效 reservation 条数。
+
+    直接数 ai_budget_reservations 流水（不用 ai_budget_usage 聚合——那是
+    周期累计口径）：subject_type=demo & credential_source=platform &
+    state IN (consumed, reserved) & reserved_at > now() - interval。
+    released（显式退款 / 过期惰性回收）不计入；released 后同 request_id
+    重新预占会刷新 reserved_at，按新窗口重新计数。
+    不按 period_id 过滤：滚动窗口跨周期，正是「周期不滚动导致子池永久熄火」
+    的修复点（reset_period 开新周期不会清窗口计数，24h 后自然滚出）。
+    """
+    cur.execute(
+        "SELECT COUNT(*)::int AS n FROM ai_budget_reservations "
+        "WHERE subject_type='demo' AND credential_source='platform' "
+        "AND state = ANY(%s) "
+        "AND reserved_at > now() - (%s * interval '1 hour')",
+        (list(_DEMO_WINDOW_STATES), int(hours)))
+    return int(cur.fetchone()["n"])
+
+
 def subject_turn_total(subject_type, subject_id, credential_source="platform"):
     """当前周期该主体已用对话数（accepted + reserved）。"""
     platform_features.require_pg_backend("ai_budget")
@@ -430,7 +465,8 @@ def reserve_turn(request_id, subject_type, subject_id, credential_source,
         网关重试属于新的执行尝试，attempt+1，仍走额度判定）。
 
     - subject_type=demo 且 platform 凭据：查「每浏览器额度」之外的三项之一
-      ——Demo 子额度（Σ subject_type=demo & platform）；
+      ——Demo 每日子额度（滚动 24h 窗口内 subject_type=demo & platform 的
+      有效 reservation 计数，见 _demo_window_used）；
     - subject_type=user 且 platform 凭据：额外查该 user 本周期用量；
     - credential_source=own：不扣平台总量（无超限判定），仍落
       reservation/usage 供可观测。
@@ -549,7 +585,9 @@ def _check_platform_quota(cur, period, subject_type, subject_id):
         上限；下限由 user/Demo 的闸保证）；
       - user：单 user 上限 → user 共享池（Σ subject_type=user）→ owner 保留
         保护（Σ user + Σ demo ≤ platform_turn_limit - owner_reserved_turn_limit）；
-      - demo：Demo 子额度/每浏览器/并发 → owner 保留保护（同上）。
+      - demo：Demo 每日子额度（滚动 24h 窗口，_demo_window_used；0014 起
+        demo_turn_limit 为单日上限，与周期总量口径不同，不再可比）/每浏览器/
+        并发 → owner 保留保护（同上；owner 保留闸仍按周期累计口径判定）。
     """
     pid = period["id"]
     used_total = _sum_used(cur, pid, credential_source="platform")
@@ -559,13 +597,13 @@ def _check_platform_quota(cur, period, subject_type, subject_id):
                 used_total, period["platform_turn_limit"]),
             limit=period["platform_turn_limit"], used=used_total)
     if subject_type == "demo":
-        used_demo = _sum_used(cur, pid, subject_type="demo",
-                              credential_source="platform")
-        if used_demo + 1 > period["demo_turn_limit"]:
+        # 每日子池闸：滚动 24h 窗口计数 vs demo_turn_limit（单日上限）
+        used_demo_window = _demo_window_used(cur)
+        if used_demo_window + 1 > period["demo_turn_limit"]:
             raise DemoBudgetExhausted(
-                "Demo 子额度已耗尽（%d/%d）" % (
-                    used_demo, period["demo_turn_limit"]),
-                limit=period["demo_turn_limit"], used=used_demo)
+                "Demo 每日额度已耗尽（滚动 24 小时，%d/%d）" % (
+                    used_demo_window, period["demo_turn_limit"]),
+                limit=period["demo_turn_limit"], used=used_demo_window)
         per_browser = int(period.get("demo_per_browser_limit")
                           or DEFAULT_DEMO_PER_BROWSER_LIMIT)
         used_browser = _sum_used(cur, pid, subject_type="demo",
@@ -584,6 +622,10 @@ def _check_platform_quota(cur, period, subject_type, subject_id):
                 raise DemoConcurrencyExceeded(
                     "Demo 并发已达上限（%d/%d）" % (in_flight, max_cc),
                     limit=max_cc, used=in_flight)
+        # owner 保留保护仍按周期累计口径判定（与平台总量闸同口径），
+        # 单独重算周期值，不复用上面的 24h 窗口计数
+        used_demo = _sum_used(cur, pid, subject_type="demo",
+                              credential_source="platform")
         _check_owner_reserve_guard(cur, period, used_demo=used_demo)
     elif subject_type == "user":
         used_user = _sum_used(cur, pid, subject_type="user",
@@ -834,7 +876,14 @@ def extend_reservation(request_id, ttl_seconds=DEFAULT_RESERVATION_TTL_SECONDS):
 # 用量报表（owner 后台「AI 预算」卡片数据源，docs §4.2）
 # --------------------------------------------------------------------------- #
 def usage_report():
-    """当前周期用量报告：总量、Demo/user/owner 构成、每 user 明细、own 可观测。"""
+    """当前周期用量报告：总量、Demo/user/owner 构成、每 user 明细、own 可观测。
+
+    口径注意（0014 起）：demo.total 为**滚动 24h 窗口计数**（_demo_window_used，
+    与 Demo 每日子额度闸同口径、跨周期），demo.limit 即单日上限
+    demo_turn_limit；demo.accepted/reserved 仍为周期累计（来自 usage 聚合），
+    故 total != accepted + reserved（窗口会把 24h 外的周期用量滚出）。
+    其余区段（platform/user_pool/owner/per_user/own）保持周期累计口径。
+    """
     platform_features.require_pg_backend("ai_budget")
     conn = _connect()
     try:
@@ -842,6 +891,8 @@ def usage_report():
             period = get_or_create_current_period(c)
             pid = period["id"]
             with c.cursor() as cur:
+                # Demo 每日子池：滚动 24h 窗口计数（与闸同口径；不用 usage 聚合）
+                demo_window_total = _demo_window_used(cur)
                 cur.execute(
                     "SELECT COALESCE(SUM(accepted_turns),0)::int AS accepted, "
                     "COALESCE(SUM(reserved_turns),0)::int AS reserved "
@@ -887,9 +938,11 @@ def usage_report():
                 "limit": period["platform_turn_limit"],
             },
             "demo": {
+                # total：滚动 24h 窗口计数（与闸同口径）；accepted/reserved：
+                # 周期累计（见 docstring 口径说明）
                 "accepted": int(demo["accepted"]),
                 "reserved": int(demo["reserved"]),
-                "total": _tot(demo),
+                "total": demo_window_total,
                 "limit": period["demo_turn_limit"],
             },
             # owner 侧用量与保留池（docs §3.7：owner 可用下限 = reserve - 已用）

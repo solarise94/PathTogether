@@ -121,7 +121,7 @@ owner 后台增加“AI 预算”卡片，至少显示和允许修改：
 - Demo 用量，例如 `2 / 5`，并分别展示 Demo、user、owner 的构成；
 - 每个注册用户的用量，例如 `user@example.com 3 / 10`；
 - 平台总对话上限，默认 30；
-- Demo 子额度上限，默认 5；
+- Demo 每日额度上限（滚动 24 小时），默认 50；
 - 每用户对话上限，默认 10；
 - 注册用户平台 AI 单次任务步骤，默认 20；
 - 自带 API 可设置的步数硬上限，当前默认 500；
@@ -131,7 +131,7 @@ owner 后台增加“AI 预算”卡片，至少显示和允许修改：
 
 保存上限不清空已有用量：把总额度从 30 调到 50 后应显示 `已用 / 50`。若把上限调低到小于已用量，现有运行不取消，但新请求立即被拒绝。`开启新预算周期` 才把当前周期用量归零；该操作需要二次确认并写操作日志，旧周期统计保留用于排查，不做物理删除。
 
-设置校验要求 `0 <= demo_turn_limit <= platform_turn_limit`，所有次数/步数为有界整数。Demo 子额度不是预留给 Demo 的专属 5 次，而是“Demo 最多能从总 30 次中消耗 5 次”；未使用的 Demo 子额度不会阻止注册用户使用总额度。
+设置校验要求所有次数/步数为有界非负整数。Demo 子额度自 0014 迁移起为「每日（滚动 24 小时窗口）」口径：`demo_turn_limit` 是单日上限，按流水窗口计数（released/过期回收不计，窗口跨周期、不因周期重置清零），与平台周期总量的累计口径不再可比，因此不再要求 `demo_turn_limit <= platform_turn_limit`，也不参与周期加和约束（`user_pool + owner_reserve <= platform` 仍保留）。Demo 每日额度不是预留给 Demo 的专属次数，而是「Demo 单日最多能从平台凭据消耗的次数」；未使用的 Demo 每日额度不会阻止注册用户使用总额度。
 
 预算判断必须在 PostgreSQL 事务中原子预占。user 使用平台凭据时同时检查“用户额度 + 平台总额度”；Demo 同时检查“每浏览器额度 + Demo 子额度 + 平台总额度”；owner 检查平台总额度。不能先扣其中一个再失败，也不能依赖单个 gunicorn worker 的内存计数。
 
@@ -510,7 +510,7 @@ ai_budget_periods
   started_at
   closed_at
   platform_turn_limit       # 默认 30
-  demo_turn_limit           # 默认 5，包含在 platform_turn_limit 内
+  demo_turn_limit           # 每日（滚动 24h）默认 50，0014 起不再按周期累计
   user_turn_limit           # 默认 10
   platform_task_max_steps   # 注册用户平台 AI 默认 20
   own_task_max_steps_limit  # 自带 API 系统硬上限，默认 500

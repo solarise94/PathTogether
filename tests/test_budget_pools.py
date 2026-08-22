@@ -2,17 +2,21 @@
 """P0-B AI 预算池隔离测试（docs §3.7 / §6.3 预算条目）。
 
 覆盖：
-  - 缺省周期池拆分：总 30 = owner 保留 10 + user 共享 15 + Demo 5；单 user 3；
-    缺省值可 env/常量覆盖（BUDGET_DEFAULT_*）；
+  - 缺省周期池拆分：总 30 = owner 保留 10 + user 共享 15；单 user 3；
+    Demo 子池为每日口径缺省 50（滚动 24h，0014 起）；缺省值可 env/常量
+    覆盖（BUDGET_DEFAULT_*）；
   - owner 保留池保护：3 个以上受邀账号（每 user 3 次 ×5）合计打满 user 共享池
     后不能再消耗 owner 保留（OwnerReserveProtected / UserPoolBudgetExhausted），
     owner 仍可保留用量；
   - user 共享池独立于每 user 上限（多 user 分摊 15）；
-  - Demo 用量同样计入保留池保护；
+  - Demo 用量同样计入保留池保护（保留闸按周期累计口径）；
+  - Demo 每日子池滚动 24h 窗口：窗口外/已释放不计入、窗口内达上限拒
+    （DemoBudgetExhausted）、usage_report 与闸同口径；
   - owner 不受保留闸约束（总量闸兜底）；
   - 邀请模板 ai_access：受邀用户默认 False，owner 显式授予后放行
     （app 层 _ai_reserve_run_budget 403 ai_access_required）；
-  - owner PUT 校验：子池之和不可超过总池。
+  - owner PUT 校验：周期口径子池（user_pool+owner_reserve）之和不可超过
+    总池；demo_turn_limit 为每日口径不参与该约束。
 
 仅 RUN_PG_TESTS=1 时真跑（conftest 已起 pgserver；每用例 TRUNCATE 重置周期）。
 """
@@ -50,6 +54,8 @@ import pytest  # noqa: E402
 pytest.importorskip("pgserver")
 pytest.importorskip("psycopg")
 
+import psycopg  # noqa: E402
+
 import budget_store  # noqa: E402
 import registration_store  # noqa: E402
 import user_store  # noqa: E402
@@ -75,10 +81,11 @@ def _reserve(subject_type, subject_id, source="platform"):
 # 缺省值与池拆分
 # --------------------------------------------------------------------------- #
 def test_period_pool_defaults():
-    """测试期推荐默认（§3.7）：总 30 = owner 保留 10 + user 共享 15；单 user 3。"""
+    """测试期推荐默认（§3.7）：总 30 = owner 保留 10 + user 共享 15；单 user 3；
+    Demo 子池为每日口径缺省 50（滚动 24h，0014 起）。"""
     p = budget_store.get_current_period()
     assert p["platform_turn_limit"] == 30
-    assert p["demo_turn_limit"] == 5
+    assert p["demo_turn_limit"] == 50
     assert p["owner_reserved_turn_limit"] == 10
     assert p["user_pool_turn_limit"] == 15
     assert p["user_turn_limit"] == 3
@@ -153,7 +160,8 @@ def test_owner_reserve_guard_blocks_users_beyond_guard():
     """guard = platform - owner_reserve = 20：user+demo 合计越过即拒。"""
     budget_store.update_period_limits({
         "user_turn_limit": 30, "user_pool_turn_limit": 30,
-        "demo_turn_limit": 6, "demo_max_concurrency": 10})
+        # demo 子额度放宽（每日口径），保证第 6 次 demo 先撞 guard 而非每日闸
+        "demo_turn_limit": 30, "demo_max_concurrency": 10})
     for i in range(15):
         assert _reserve("user", "usr_g%d" % i)["state"] == "reserved"
     for i in range(5):
@@ -162,7 +170,7 @@ def test_owner_reserve_guard_blocks_users_beyond_guard():
     with pytest.raises(budget_store.OwnerReserveProtected) as ei:
         _reserve("user", "usr_g_extra")
     assert ei.value.code == "owner_reserve_protected"
-    # demo 侧同样被保留闸拦（demo 子额度 6 未满，先撞 guard）
+    # demo 侧同样被保留闸拦（demo 每日子额度 30 未满，先撞 guard）
     with pytest.raises(budget_store.OwnerReserveProtected):
         _reserve("demo", "dmo_g_extra")
     # owner 不受保留闸约束（总量 30 已用 20，owner 还能 10）
@@ -178,6 +186,74 @@ def test_owner_reserve_guard_ignores_misconfigured_reserve():
     assert _reserve("user", "usr_m1")["state"] == "reserved"
     with pytest.raises(budget_store.PlatformBudgetExhausted):
         _reserve("user", "usr_m2")
+
+
+# --------------------------------------------------------------------------- #
+# Demo 每日子池：滚动 24h 窗口口径（0014 起，不再按周期累计）
+# --------------------------------------------------------------------------- #
+def _age_reservation(pg_uri, request_id, hours):
+    """直连把流水 reserved_at 拨回 hours 小时前（构造窗口外数据）。"""
+    conn = psycopg.connect(pg_uri, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE ai_budget_reservations SET reserved_at = "
+                "now() - (%s * interval '1 hour') WHERE request_id=%s",
+                (int(hours), request_id))
+    finally:
+        conn.close()
+
+
+def test_demo_daily_window_excludes_out_of_window_consumed(pg_uri):
+    """窗口外（reserved_at 距今 >24h）的 consumed 流水不计入每日闸与报表。"""
+    budget_store.update_period_limits({
+        "demo_turn_limit": 1, "demo_max_concurrency": 10})
+    old = _reserve("demo", "dmo_w1")
+    budget_store.consume(old["request_id"], "hp_old")
+    _age_reservation(pg_uri, old["request_id"], 25)
+    # 窗口计数 0/1：新预占成功（旧口径周期累计=1 会把这一单误拦）
+    assert _reserve("demo", "dmo_w2")["state"] == "reserved"
+    # 周期累计口径仍计 2（owner 保留闸/总量闸继续用周期值）
+    assert budget_store.usage_report()["by_subject_type"]["demo"]["total"] == 2
+
+
+def test_demo_daily_window_excludes_released():
+    """released（显式退款/过期回收）不计入每日窗口。"""
+    budget_store.update_period_limits({
+        "demo_turn_limit": 1, "demo_max_concurrency": 10})
+    r1 = _reserve("demo", "dmo_r1")
+    budget_store.release(r1["request_id"])
+    assert _reserve("demo", "dmo_r2")["state"] == "reserved"
+    assert budget_store.usage_report()["demo"]["total"] == 1
+
+
+def test_demo_daily_window_limit_enforced():
+    """窗口内计数达到 demo_turn_limit（单日上限）→ DemoBudgetExhausted。"""
+    budget_store.update_period_limits({
+        "demo_turn_limit": 1, "demo_max_concurrency": 10})
+    r1 = _reserve("demo", "dmo_l1")
+    budget_store.consume(r1["request_id"], "hp_l1")
+    with pytest.raises(budget_store.DemoBudgetExhausted) as ei:
+        _reserve("demo", "dmo_l2")
+    assert ei.value.code == "demo_budget_exhausted"
+    assert ei.value.context["limit"] == 1
+    assert ei.value.context["used"] == 1
+    assert "每日" in str(ei.value) and "滚动 24" in str(ei.value)
+
+
+def test_usage_report_demo_total_same_window_as_gate(pg_uri):
+    """usage_report.demo.total 与每日闸同口径：窗口外不计、窗口内计。"""
+    budget_store.update_period_limits({"demo_turn_limit": 5})
+    r_in = _reserve("demo", "dmo_u1")
+    budget_store.consume(r_in["request_id"], "hp_u1")
+    r_out = _reserve("demo", "dmo_u2")
+    budget_store.consume(r_out["request_id"], "hp_u2")
+    _age_reservation(pg_uri, r_out["request_id"], 24 + 1)
+    report = budget_store.usage_report()
+    assert report["demo"]["total"] == 1  # 窗口外不计（与闸同口径）
+    assert report["demo"]["limit"] == 5
+    # 周期累计口径（by_subject_type）不受窗口影响，仍计 2
+    assert report["by_subject_type"]["demo"]["total"] == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -302,7 +378,8 @@ def test_ai_access_admin_api(monkeypatch):
 
 
 def test_budget_put_validates_pool_sum():
-    """owner PUT：demo+user_pool+owner_reserve 之和不可超过 platform。"""
+    """owner PUT：周期口径子池（user_pool+owner_reserve）之和不可超过
+    platform；demo_turn_limit 为每日滚动 24h 口径，不参与该约束。"""
     from _pt_helpers import csrf_client
     owner = _mk_owner()
     app_mod.app.config["TESTING"] = True
@@ -315,12 +392,19 @@ def test_budget_put_validates_pool_sum():
         "owner_reserved_turn_limit": 25, "user_pool_turn_limit": 15})
     assert r.status_code == 400
     assert "不可超过" in r.get_json()["error"]
+    # demo 每日口径与周期总量不再可比：demo_turn_limit > platform 允许保存
+    r_demo = client.put("/api/admin/settings/ai-budget", json={
+        "demo_turn_limit": 40})
+    assert r_demo.status_code == 200, r_demo.get_data(as_text=True)
+    assert r_demo.get_json()["limits"]["demo_turn_limit"] == 40
     r2 = client.put("/api/admin/settings/ai-budget", json={
         "owner_reserved_turn_limit": 12, "user_pool_turn_limit": 13})
     assert r2.status_code == 200, r2.get_data(as_text=True)
     limits = r2.get_json()["limits"]
     assert limits["owner_reserved_turn_limit"] == 12
     assert limits["user_pool_turn_limit"] == 13
+    # 未重提交的 demo_turn_limit 沿用现值（40），不参与周期加和判定
+    assert limits["demo_turn_limit"] == 40
 
 
 def test_concurrent_user_pool_exact_limit():

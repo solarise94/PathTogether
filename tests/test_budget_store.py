@@ -9,7 +9,7 @@ period id 每用例从 1 起）。缺 pgserver/psycopg 时整模块 skip。
   - 周期默认值、幂等取行（值以行为准）、conn 版 get_or_create；
   - reserve 基本流 + request_id 幂等重放不重复扣；
   - 并发 N 线程 reserve 同一 user（限额 10）→ 成功数恰为 10；
-  - demo 子额度 5 与平台总量 30 的组合超限场景；
+  - demo 每日子额度（缺省 50，滚动 24h）与平台总量 30 的组合超限场景；
   - own 凭据不扣平台总量但落可观测用量；
   - consume / release 的状态机与幂等、consumed 拒绝释放；
   - reclaim_expired 只按时间回收并回退 usage；
@@ -58,7 +58,7 @@ def pg_conn(pg_uri):
 def test_period_defaults_and_row_is_authoritative():
     p1 = budget_store.get_current_period()
     assert p1["platform_turn_limit"] == 30
-    assert p1["demo_turn_limit"] == 5
+    assert p1["demo_turn_limit"] == 50  # 0014 起每日（滚动 24h）口径
     assert p1["user_turn_limit"] == 3  # P0-B §3.7：单 user 初始 3
     assert p1["owner_reserved_turn_limit"] == 10  # owner 保留池
     assert p1["user_pool_turn_limit"] == 15       # user 共享池
@@ -269,8 +269,10 @@ def test_concurrent_reserve_same_user_exact_limit():
 
 
 def test_demo_sublimit_and_platform_combo():
-    """demo 子额度 5、总额 30：demo 第 6 次被拒，注册用户仍可用剩余总额。"""
-    budget_store.update_period_limits({"demo_max_concurrency": 10})
+    """demo 每日子额度（显式 5，滚动 24h）、总额 30：demo 第 6 次被拒，
+    注册用户仍可用剩余总额。"""
+    budget_store.update_period_limits({
+        "demo_turn_limit": 5, "demo_max_concurrency": 10})
     for i in range(5):
         assert budget_store.reserve_turn(
             _req(), "demo", "dmo_%d" % i, "platform")["state"] == "reserved"
@@ -278,11 +280,11 @@ def test_demo_sublimit_and_platform_combo():
         budget_store.reserve_turn(_req(), "demo", "dmo_5", "platform")
     assert ei.value.code == "demo_budget_exhausted"
     assert ei.value.context["limit"] == 5
-    # demo 子额度耗尽不影响注册用户使用剩余平台总额度
+    # demo 每日子额度耗尽不影响注册用户使用剩余平台总额度
     assert budget_store.reserve_turn(
         _req(), "user", "usr_x", "platform")["state"] == "reserved"
     report = budget_store.usage_report()
-    assert report["demo"]["total"] == 5
+    assert report["demo"]["total"] == 5  # 窗口口径（5 次均在 24h 内）
     assert report["demo"]["limit"] == 5
     assert report["platform"]["total"] == 6
     assert report["by_subject_type"]["demo"]["total"] == 5
@@ -442,7 +444,7 @@ def test_usage_report_shape():
     assert report["platform"]["total"] == 2
     assert report["platform"]["limit"] == 30
     assert report["demo"]["total"] == 1
-    assert report["demo"]["limit"] == 5
+    assert report["demo"]["limit"] == 50  # 0014 起每日（滚动 24h）口径
     assert report["by_subject_type"]["user"]["total"] == 1
     assert report["by_subject_type"]["demo"]["total"] == 1
     assert "owner" not in report["by_subject_type"]  # 无 owner 用量不出场

@@ -337,11 +337,21 @@
     state.config = cfg;
     var hint = $("ai-steps-hint");
     if (hint) {
-      hint.textContent = cfg && cfg.budget
-        ? t("demo.ai.steps.hint", {
-            steps: cfg.task_max_steps,
-            demo: cfg.budget.demo_used, demoLimit: cfg.budget.demo_limit })
-        : "";
+      // 提示行显示「本浏览器剩余额度」；per_browser_* 读取失败时保持
+      // payload 缺省（limit=1/remaining=1）的兜底，不回退全站池数字
+      if (cfg) {
+        var pbLimit = cfg.per_browser_limit != null
+          ? Number(cfg.per_browser_limit) : 1;
+        var pbRemaining = cfg.per_browser_remaining != null
+          ? Number(cfg.per_browser_remaining)
+          : Math.max(0, pbLimit - (cfg.per_browser_used != null
+              ? Number(cfg.per_browser_used) : 0));
+        hint.textContent = t("demo.ai.steps.hint", {
+          steps: cfg.task_max_steps,
+          remaining: pbRemaining, limit: pbLimit });
+      } else {
+        hint.textContent = "";
+      }
     }
     if (!cfg) { setAiButton("unavailable"); return; }
     if (!cfg.demo_enabled) { setAiButton("disabled"); return; }

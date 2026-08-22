@@ -535,7 +535,7 @@ def test_budget_api_owner_get_put_reset():
     assert j["limits"]["platform_turn_limit"] == 30
     assert j["concurrency"]["current"] >= 1
     assert j["demo_sessions"]["consumed"] == 0
-    # PUT：改限制不清用量；demo > platform 拒绝；负值/未知字段拒绝
+    # PUT：改限制不清用量；负值/未知字段拒绝
     r2 = c.put("/api/admin/settings/ai-budget", json={
         "platform_turn_limit": 50, "user_turn_limit": 12,
         "platform_task_max_steps": 25, "own_task_max_steps_limit": 400})
@@ -543,9 +543,14 @@ def test_budget_api_owner_get_put_reset():
     assert r2.get_json()["limits"]["platform_turn_limit"] == 50
     assert budget_store.usage_report()["platform"]["total"] == 1  # 用量保留
     assert budget_store.usage_report()["platform"]["limit"] == 50
+    # demo_turn_limit 为每日滚动 24h 口径（0014 起），与周期总量不再可比：
+    # demo（60）> platform（50）允许保存（此前 400）
     assert c.put("/api/admin/settings/ai-budget",
-                 json={"demo_turn_limit": 10, "platform_turn_limit": 5}
-                 ).status_code == 400
+                 json={"demo_turn_limit": 60}).status_code == 200
+    # 周期口径加和约束仍在：user_pool + owner_reserve > platform 拒绝
+    assert c.put("/api/admin/settings/ai-budget",
+                 json={"owner_reserved_turn_limit": 40,
+                       "user_pool_turn_limit": 20}).status_code == 400
     assert c.put("/api/admin/settings/ai-budget",
                  json={"user_turn_limit": -1}).status_code == 400
     assert c.put("/api/admin/settings/ai-budget",

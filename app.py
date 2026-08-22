@@ -3078,9 +3078,11 @@ def _validate_budget_settings(body, current_limits):
     body 里只允许 _BUDGET_SETTINGS_FIELDS；次数/步数为有界非负整数
     （_BUDGET_ZEROABLE_FIELDS 允许 0=关闭子池，其余需 >0）；demo_enabled 布尔。
     关系校验（按「本次提交 + 未提交沿用现值」合并后判定）：
-      1. 0 <= demo_turn_limit <= platform_turn_limit；
-      2. demo_turn_limit + user_pool_turn_limit + owner_reserved_turn_limit
-         <= platform_turn_limit（总池拆分不越界；owner 保留池由服务端闸保证）。
+      1. user_pool_turn_limit + owner_reserved_turn_limit
+         <= platform_turn_limit（周期口径的池拆分不越界）。
+    注意：demo_turn_limit 自 0014 起为「每日（滚动 24h 窗口）」口径，与
+    周期总量的累计口径不再可比，故不再参与「<= platform」及周期加和约束
+    （每日上限可与周期总量任意相对大小；owner 保留池仍由服务端闸保证）。
     返回 (validated, None) 或 (None, err)。
     """
     unknown = set(body.keys()) - set(_BUDGET_SETTINGS_FIELDS)
@@ -3107,22 +3109,18 @@ def _validate_budget_settings(body, current_limits):
         if iv > _BUDGET_LIMIT_MAX:
             return None, "{} 不可超过 {}".format(field, _BUDGET_LIMIT_MAX)
         validated[field] = iv
-    # 关系校验（合并现值后）
+    # 关系校验（合并现值后；仅周期口径字段参与，demo_turn_limit 为每日口径除外）
     merged = dict(current_limits)
     merged.update(validated)
-    demo = int(merged.get("demo_turn_limit") or 0)
     platform = int(merged.get("platform_turn_limit") or 0)
-    if demo > platform:
-        return None, "demo_turn_limit（{}）不可超过 platform_turn_limit（{}）".format(
-            demo, platform)
     user_pool = int(merged.get("user_pool_turn_limit") or 0)
     owner_reserve = int(merged.get("owner_reserved_turn_limit") or 0)
-    if demo + user_pool + owner_reserve > platform:
+    if user_pool + owner_reserve > platform:
         return None, (
-            "子池之和（demo {} + user_pool {} + owner_reserve {} = {}）不可超过"
+            "子池之和（user_pool {} + owner_reserve {} = {}）不可超过"
             " platform_turn_limit（{}）".format(
-                demo, user_pool, owner_reserve,
-                demo + user_pool + owner_reserve, platform))
+                user_pool, owner_reserve,
+                user_pool + owner_reserve, platform))
     return validated, None
 
 

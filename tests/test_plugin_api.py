@@ -333,7 +333,12 @@ def test_admin_plugins_requires_owner():
 # 3. scoped JWT 守卫
 # --------------------------------------------------------------------------- #
 def _token_for(inst):
-    return _exchange(_client(), inst["installation_id"], _file_secret())
+    secret = inst.get("secret")
+    if not secret:
+        # bootstrap/rotate 之外拿到的安装行不含明文——用共享 secret 文件
+        # （本测试模块单插件 histopilot 引导场景）。
+        secret = _file_secret()
+    return _exchange(_client(), inst["installation_id"], secret)
 
 
 def test_plugin_endpoints_require_bearer():
@@ -493,10 +498,13 @@ def _grant_headers(inst, grant_id):
 
 
 def _make_grant(slide, **kw):
+    """建一条 grant。缺省 created_by_user_id=None（AUTH_ENABLED=False 归一
+    owner 语义）；§3.10 P0-C 起创建者会被复查（账号存在/未禁用/仍有 annotate
+    权限），需要具体创建者的用例须先在 user_store 建真实用户。"""
     inst = app_mod._HISTOPILOT_INSTALLATION
+    kw.setdefault("created_by_user_id", None)
     return share_store.create_run_grant(
-        installation_id=inst["installation_id"], slide=slide,
-        created_by_user_id="usr_creator_1", **kw)
+        installation_id=inst["installation_id"], slide=slide, **kw)
 
 
 def test_run_start_issues_grant_into_sidecar_config():
@@ -577,6 +585,15 @@ def test_annotate_happy_path_provenance_from_grant():
     slide = _touch_slide()
     token = _token_for(inst)
     grant = _make_grant(slide)
+    # §3.10 P0-C：annotate 要求 grant 已绑定到同一 session（sidecar 接受
+    # run 后经 /run-grants/bind 原子绑定）。
+    r = _client().post("/api/plugin/v1/run-grants/bind",
+                       headers=_bearer(token),
+                       json={"grant_id": grant["grant_id"],
+                             "session_id": "sess_a"})
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json() == {"ok": True, "grant_id": grant["grant_id"],
+                            "session_id": "sess_a"}
     r = _client().post(
         "/api/plugin/v1/slides/%s/annotations" % slide,
         headers={**_bearer(token), "X-Run-Grant": grant["grant_id"]},
@@ -587,9 +604,10 @@ def test_annotate_happy_path_provenance_from_grant():
     assert r.status_code == 200, r.get_json()
     roi = r.get_json()
     assert roi["annotation_id"] and roi["source"] == "ai"
+    assert roi["review_status"] == "pending"
     prov = roi["provenance"]
-    # created_by_user_id 从 grant 来，不信任请求体
-    assert prov["created_by_user_id"] == "usr_creator_1"
+    # created_by_user_id 从 grant 来，不信任请求体（无主 grant → 空串）
+    assert prov["created_by_user_id"] == ""
     assert prov["plugin_id"] == "histopilot"
     assert prov["run_id"] == "run_9"
     assert prov["session_id"] == "sess_a"
@@ -601,7 +619,7 @@ def test_annotate_happy_path_provenance_from_grant():
         "/api/plugin/v1/slides/%s/annotations" % slide,
         headers={**_bearer(token), "X-Run-Grant": grant["grant_id"]},
         json={"label": "AI 病灶", "x": 10, "y": 10, "side_px": 100,
-              "effect_key": "ek-1"})
+              "effect_key": "ek-1", "session_id": "sess_a"})
     assert r2.get_json()["annotation_id"] == roi["annotation_id"]
 
 
@@ -642,26 +660,37 @@ def test_annotate_revoked_and_expired_grant():
 
 
 def test_run_grant_revoke_permission():
+    """§3.10 P0-C：机器端撤销只按 Bearer claims（installation）校验。
+
+    旧实现按 current_identity() 判"owner 或创建者"——/api/plugin/v1/* 绕过
+    Cookie 鉴权、无 session 请求缺省 owner，持插件 token 的机器请求会被当作
+    owner 撤销任意 grant。修复后：
+      - installation 匹配的 Bearer token 可撤销自己的 grant（即使请求带了
+        非创建者的 user session cookie——身份混用已被移除）；
+      - 其它 installation 的 token → 403。
+    """
     inst = _bootstrap()
     slide = _touch_slide()
-    grant = _make_grant(slide)  # created_by = usr_creator_1
+    grant = _make_grant(slide)
     token = _token_for(inst)
     client = _client()
-    # 非创建者、非 owner → 403
+    # 带着非创建者、非 owner 的 session cookie 也能经**installation 匹配的**
+    # Bearer token 撤销（机器通道语义；cookie 身份不参与判定）。
     with client.session_transaction() as s:
         s["role"] = "user"
         s["user_id"] = "usr_someone_else"
     r = client.delete("/api/plugin/v1/run-grants/%s" % grant["grant_id"],
                       headers=_bearer(token))
-    _assert_envelope(r, 403, "forbidden")
-    # 创建者本人 → 可撤销
-    with client.session_transaction() as s:
-        s["role"] = "user"
-        s["user_id"] = "usr_creator_1"
-    r = client.delete("/api/plugin/v1/run-grants/%s" % grant["grant_id"],
-                      headers=_bearer(token))
     assert r.status_code == 200
     assert share_store.get_run_grant(grant["grant_id"])["revoked"] is True
+    # 另一个 installation 的 token 不能撤销别人的 grant。
+    other = share_store.create_plugin_installation("other-plugin")
+    other_token = _token_for(other)
+    grant2 = _make_grant(slide)
+    r2 = client.delete("/api/plugin/v1/run-grants/%s" % grant2["grant_id"],
+                       headers=_bearer(other_token))
+    _assert_envelope(r2, 403, "forbidden")
+    assert share_store.get_run_grant(grant2["grant_id"])["revoked"] is False
 
 
 # --------------------------------------------------------------------------- #

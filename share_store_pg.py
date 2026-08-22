@@ -2269,6 +2269,60 @@ def list_run_grants_for_session(session_id):
         conn.close()
 
 
+def bind_run_grant_session(grant_id, session_id):
+    """§3.10 P0-C：把 grant 原子绑定到 session_id（CAS，同 json 语义）。
+
+    UPDATE ... WHERE grant_id=%s AND (session_id='' OR session_id IS NULL) 的
+   原子 CAS；返回绑定后的 grant dict；不存在返回 None；已绑定到其它 session
+    → ValueError("session_mismatch")；同一 session 重复绑定幂等。
+    """
+    if not isinstance(grant_id, str) or not grant_id:
+        raise ValueError("grant_id 不能为空")
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id 不能为空")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE run_grants SET session_id=%s "
+                    "WHERE grant_id=%s AND (session_id='' OR session_id IS NULL)",
+                    (session_id, grant_id))
+                if cur.rowcount == 0:
+                    row = _fetch_grant(cur, grant_id)
+                    if row is None:
+                        return None
+                    bound = row.get("session_id") or ""
+                    if bound and bound != session_id:
+                        raise ValueError("session_mismatch")
+                    return row  # 幂等：已绑定到同一 session
+                return _fetch_grant(cur, grant_id)
+    finally:
+        conn.close()
+
+
+def list_run_grants(slide=None, include_revoked=False):
+    """列出 run grant（§3.10 P0-C 主动撤销钩子用；按创建时间升序）。"""
+    sql = _GRANT_SEL + "FROM run_grants"
+    conds, params = [], []
+    if slide is not None:
+        conds.append("slide=%s")
+        params.append(slide)
+    if not include_revoked:
+        conds.append("revoked=FALSE")
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY created_at ASC"
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(sql, tuple(params))
+                return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
 # --------------------------------------------------------------------------- #
 # dual 后端镜像（Stage 4-1a）：json 为权威，按返回的权威 dict upsert 进 pg。
 # --------------------------------------------------------------------------- #
@@ -2361,5 +2415,24 @@ def _mirror_run_grant_revoke(ret, grant_id, *a, **k):
                 cur.execute(
                     "UPDATE run_grants SET revoked=TRUE, revoked_at=now() "
                     "WHERE grant_id=%s", (grant_id,))
+    finally:
+        conn.close()
+
+
+def _mirror_run_grant_bind(ret, grant_id, session_id, *a, **k):
+    """bind_run_grant_session 的 result-replay：按入参把 session 绑定进 pg。
+
+    ret=None（grant 不存在）时跳过；session_mismatch 在 json 侧已抛错，
+    不会进入镜像。
+    """
+    if ret is None or not grant_id or not session_id:
+        return
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE run_grants SET session_id=%s WHERE grant_id=%s",
+                    (session_id, grant_id))
     finally:
         conn.close()

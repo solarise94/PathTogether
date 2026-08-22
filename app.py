@@ -4428,8 +4428,10 @@ _PLUGIN_JWT_TTL_SECONDS = 900
 # annotation:write；session:write / audit:write 留给 4-1b 之后的端点）
 _PLUGIN_JWT_SCOPES = "slide:read region:read annotation:write session:write audit:write"
 
-# run grant 默认生命周期（2h；§7.6 目标 1h，demo 放宽，env 可覆盖）
-_RUN_GRANT_TTL_SECONDS = float(os.environ.get("RUN_GRANT_TTL_SECONDS") or 7200)
+# run grant 默认生命周期（§3.10 P0-C：从 2h 降到 30min——接近单次 run 的步数
+# 上限耗时量级；主动撤销（cancel/run 结束/session 归档/权限复查失效）是主路
+# 径，TTL 仅兜底。env 可覆盖）
+_RUN_GRANT_TTL_SECONDS = float(os.environ.get("RUN_GRANT_TTL_SECONDS") or 1800)
 
 # ---------------------------------------------------------------------------
 # agent-tool-token（插件能力层 docs §5.1/§10-4）
@@ -5169,6 +5171,23 @@ def _issue_run_grant(slide, user_ctx, config):
     return True
 
 
+def _revoke_grant_in_config(config, reason="run_rejected"):
+    """§3.10 P0-C：撤销 config.run_grant 指向的 grant（run 被拒/预算拒绝时）。
+
+    best-effort：失败记 log（TTL 兜底）。无 grant 的 run（fork/只读）为 no-op。
+    """
+    grant_id = ((config or {}).get("run_grant") or {}).get("grant_id") or ""
+    if not grant_id:
+        return
+    try:
+        share_store.revoke_run_grant(grant_id)
+        _audit_grant_event("run_grant.revoke", grant_id, None,
+                           {"trigger": reason})
+    except Exception:
+        app.logger.warning("run 拒绝后撤销 run grant 失败（TTL 兜底）",
+                           exc_info=True)
+
+
 # --------------------------------------------------------------------------- #
 # 平台 AI 预算接线（docs §4.1/§4.2/§5.3/§9.4，PT-3）
 #
@@ -5551,14 +5570,32 @@ def _ai_run_prepare(user_ctx, body, slide, need_grant):
         if not (isinstance(budget_err, tuple) and len(budget_err) == 2):
             app.logger.error("预算错误响应形状异常：%r", budget_err)
             return (jsonify(error="ai_budget_error", code="ai_budget_error"), 500)
+        # §3.10 P0-C：预算拒绝 → 已签发的 grant 立即撤销（不留给 TTL）。
+        _revoke_grant_in_config(config, reason="run_rejected")
         return budget_err
     on_accepted, on_rejected = _ai_budget_lifecycle(rid, resv)
+    # §3.10 P0-C：grant 生命周期回调——run 被拒（4xx/5xx/连接失败）→ 撤销本轮
+    # grant；run 结束（上游 SSE 正常关流）→ 撤销绑定到该 session 的 grant。
+    grant_id = ((config.get("run_grant") or {}).get("grant_id")) or ""
+    if grant_id:
+        _budget_on_rejected = on_rejected
+
+        def on_rejected():
+            _budget_on_rejected()
+            _revoke_grant_in_config(config, reason="run_rejected")
+
+        def _on_finished(finished_session_id):
+            _revoke_run_grants_for_session(finished_session_id,
+                                           reason="run_finished")
+    else:
+        _on_finished = None
     result = {
         "request_id": rid,
         "config": config,
         "reservation": resv,
         "on_accepted": on_accepted,
         "on_rejected": on_rejected,
+        "on_finished": _on_finished,
     }
     # 仅在真正注入了 extra_tools 时随附信封（AGENT_EXTRA_TOOLS_ENVELOPE）：
     # 注册表为空/读取失败时不注入也不带信封，旧 sidecar（不认识
@@ -7235,11 +7272,45 @@ def _plugin_resolve_slide(slide):
     return safe, None
 
 
-def _verify_run_grant(grant_id, slide, installation_id):
+def _run_grant_creator_allowed(grant):
+    """§3.10 P0-C：复查 grant 创建者当前是否仍可 annotate 该切片。
+
+    每次写标注前（annotate 端点 + verify 端点）调用：创建者账号被删除/禁用、
+    或已失去该切片 annotate 权限（协作 share 撤销/过期、切片归档）→ False。
+    created_by_user_id 为空（AUTH_ENABLED=False 归一 owner / 历史无主 grant）
+    按 owner 内部语义放行（归档由归档检查单独拦）。
+    """
+    creator = grant.get("created_by_user_id") or ""
+    slide = grant.get("slide") or ""
+    if not creator:
+        # 无主 grant（AUTH_ENABLED=False 归一 owner / 历史行）：owner 内部语义
+        # 放行，但归档切片对所有身份只读（与 can_annotate_slide 同规则）。
+        return slide not in _archived_slide_names()
+    try:
+        u = user_store.get_user(creator)
+    except Exception:
+        app.logger.warning("run grant 创建者复查失败（按无权限处理）", exc_info=True)
+        return False
+    if not u:
+        return False
+    if u.get("disabled"):
+        return False
+    if u.get("role") == user_store.ROLE_OWNER:
+        return slide not in _archived_slide_names()
+    return (slide not in _archived_slide_names()
+            and _user_can_annotate_slide(creator, slide))
+
+
+def _verify_run_grant(grant_id, slide, installation_id, expect_session=None):
     """run grant 校验（annotate 端点与 verify 端点共用）。
 
     返回 (valid, reason)；reason 供 verify 端点回显与日志（不泄露 grant 细节
-    之外的信息）。校验项：存在、未撤销、未过期、slide 匹配、installation 匹配。
+    之外的信息）。校验项：存在、未撤销、未过期、slide 匹配、installation 匹配、
+    创建者账号与 annotate 权限复查（§3.10）；expect_session 给出（annotate）
+    时还要求 grant 已原子绑定到**同一** session_id。
+
+    expect_session=None（sidecar run 前自查）时绑定校验跳过（起跑时 session
+    尚未创建、grant 仍为 slide 级空绑定）。
     """
     if not grant_id:
         return False, "missing_grant"
@@ -7258,7 +7329,73 @@ def _verify_run_grant(grant_id, slide, installation_id):
         return False, "slide_mismatch"
     if installation_id and grant.get("installation_id") != installation_id:
         return False, "installation_mismatch"
+    # §3.10 P0-C：写前复查创建者（账号未禁用 + 仍有该切片 annotate 权限）。
+    if not _run_grant_creator_allowed(grant):
+        return False, "creator_not_allowed"
+    # §3.10 P0-C：annotate 要求 grant 已绑定到同一 session。
+    if expect_session is not None:
+        bound = grant.get("session_id") or ""
+        if not bound:
+            return False, "grant_unbound"
+        if bound != expect_session:
+            return False, "session_mismatch"
     return True, ""
+
+
+def _audit_grant_event(action, grant_id, slide, detail):
+    """run grant 事件的审计（请求上下文外也可用）。
+
+    SSE 流结束回调（on_finished）可能在 WSGI 请求上下文 teardown 之后触发，
+    此时 _audit 的 current_identity() 不可用——降级为无 actor 的审计行，
+    绝不因审计失败中断撤销路径。
+    """
+    try:
+        _audit(action, target_type="run_grant", target_id=grant_id,
+               slide=slide, detail=detail)
+    except Exception:
+        try:
+            share_store.record_audit(action=action, actor_user_id=None,
+                                     actor_role=None, target_type="run_grant",
+                                     target_id=grant_id, slide=slide,
+                                     detail=detail)
+        except Exception:
+            app.logger.info("run grant 审计失败（%s %s）", action, grant_id)
+
+
+def _revoke_run_grants_for_session(session_id, reason="session_end"):
+    """§3.10 P0-C：撤销绑定到某 session 的全部 run grant（幂等，best-effort）。"""
+    if not session_id:
+        return
+    try:
+        for g in share_store.list_run_grants_for_session(session_id):
+            if g.get("revoked"):
+                continue
+            share_store.revoke_run_grant(g["grant_id"])
+            _audit_grant_event("run_grant.revoke", g["grant_id"],
+                               g.get("slide"), {"trigger": reason})
+    except Exception:
+        app.logger.warning("按 session 撤销 run grant 失败（TTL 兜底）",
+                           exc_info=True)
+
+
+def _revoke_stale_run_grants(slide=None, reason="creator_recheck"):
+    """§3.10 P0-C：撤销创建者已失去写权限的活跃 run grant。
+
+    权限撤销（share 撤销/过期）、用户禁用、归档等事件的主动清理钩子；逐条按
+    _run_grant_creator_allowed 复查，仅撤销已失效的（slide owner 自己的 grant
+    不受协作 share 撤销影响）。
+    """
+    try:
+        for g in share_store.list_run_grants(slide=slide):
+            if g.get("revoked"):
+                continue
+            if not _run_grant_creator_allowed(g):
+                share_store.revoke_run_grant(g["grant_id"])
+                _audit_grant_event("run_grant.revoke", g["grant_id"],
+                                   g.get("slide"), {"trigger": reason})
+    except Exception:
+        app.logger.warning("失效 run grant 清理失败（写前复查仍兜底）",
+                           exc_info=True)
 
 
 @app.route("/api/plugin/v1/slides/<slide>", methods=["GET"])
@@ -7521,15 +7658,19 @@ def plugin_v1_annotate(slide):
     safe, serr = _plugin_resolve_slide(slide)
     if serr is not None:
         return serr
+    body = request.get_json(silent=True) or {}
+    # §3.10 P0-C：annotate 要求 grant 已绑定到同一 session（HistoPilot 接受
+    # run 后调 /run-grants/bind 原子绑定）；session 缺失/不符 → 403。
+    session_id = str(body.get("session_id") or "")
     grant_id = (request.headers.get("X-Run-Grant") or "").strip()
-    valid, reason = _verify_run_grant(grant_id, safe, claims.get("sub") or "")
+    valid, reason = _verify_run_grant(grant_id, safe, claims.get("sub") or "",
+                                      expect_session=session_id or None)
     if not valid:
         return _plugin_error(403, "run_grant_invalid",
                              "run grant 无效（%s）" % reason)
     # verify 通过后原量再取一次供 provenance 用（竞态消失则按空 dict 降级）
     grant = share_store.get_run_grant(grant_id) or {}
 
-    body = request.get_json(silent=True) or {}
     label = body.get("label")
     if not isinstance(label, str) or not label.strip():
         return _plugin_error(400, "invalid_request", "label 参数缺失")
@@ -7559,7 +7700,9 @@ def plugin_v1_annotate(slide):
         return _plugin_error(400, "invalid_request", "side_px 需在 1~40000 之间")
     note = body.get("note") or ""
     effect_key = body.get("effect_key") or body.get("idempotency_key") or ""
-    session_id = body.get("session_id") or grant.get("session_id") or ""
+    # session_id 已在 verify 前解析：grant 绑定校验（expect_session）通过后，
+    # 这里不再回退 grant.session_id（二者已被强制相等）。
+    session_id = session_id or grant.get("session_id") or ""
 
     expected_asset_revision = body.get("expected_asset_revision")
     if expected_asset_revision is not None and str(expected_asset_revision) != "":
@@ -7609,10 +7752,15 @@ def plugin_v1_annotate(slide):
 # --------------------------------------------------------------------------- #
 @app.route("/api/plugin/v1/run-grants/<grant_id>", methods=["DELETE"])
 def plugin_v1_run_grant_revoke(grant_id):
-    """撤销 run grant。Bearer JWT 认证；撤销权 = owner 或创建者本人。
+    """撤销 run grant（机器端）。Bearer JWT 认证；撤销权 = installation 匹配。
 
-    owner（含 AUTH_ENABLED=False 归一 owner）任意；否则仅 grant.created_by_
-    user_id == 当前登录用户。撤销后 annotate 立即 403 run_grant_invalid。
+    §3.10 P0-C：本端点是**机器通道**（/api/plugin/v1/* 绕过 Cookie 鉴权，
+    current_identity() 对无 session 请求缺省为 owner——旧实现据 current_identity
+    判"owner 或创建者"会把持插件 Bearer token 的机器请求当作 owner，从而撤销
+    任意 grant）。修复后**只按 Bearer claims 校验**：claims.sub（installation_
+    id）必须与 grant.installation_id 一致，绝不调用 current_identity()。
+    人类主动撤销走 Cookie+CSRF 的 DELETE /api/ai/run-grants/<id>。
+    撤销后 annotate 立即 403 run_grant_invalid。
     """
     claims, err = _require_plugin_token()
     if err is not None:
@@ -7620,16 +7768,49 @@ def plugin_v1_run_grant_revoke(grant_id):
     grant = share_store.get_run_grant(grant_id)
     if grant is None:
         return _plugin_error(404, "not_found", "run grant 不存在")
-    ident = current_identity()
-    if ident["role"] != user_store.ROLE_OWNER:
-        uid = ident.get("user_id")
-        creator = grant.get("created_by_user_id")
-        if not uid or not creator or uid != creator:
-            return _plugin_error(403, "forbidden", "仅 owner 或创建者可撤销 run grant")
+    if grant.get("installation_id") != (claims.get("sub") or ""):
+        return _plugin_error(403, "forbidden", "仅 grant 所属 installation 可撤销")
     share_store.revoke_run_grant(grant_id)
     _audit("run_grant.revoke", target_type="run_grant", target_id=grant_id,
-           slide=grant.get("slide"))
+           slide=grant.get("slide"), detail={"via": "plugin_v1"})
     return jsonify(ok=True, grant_id=grant_id, revoked=True)
+
+
+@app.route("/api/plugin/v1/run-grants/bind", methods=["POST"])
+def plugin_v1_run_grant_bind():
+    """run grant → session 原子绑定（§3.10 P0-C）。Bearer JWT 认证。
+
+    body: {grant_id, session_id}。sidecar 接受 run（session 已解析/创建）后
+    调用；平台按 CAS 绑定：仅未绑定 grant 可绑，重复绑定同一 session 幂等，
+    已绑定到其它 session → 409 conflict。此后 annotate 必须携带同一
+    session_id（不符 → 403 run_grant_invalid session_mismatch）。
+    """
+    claims, err = _require_plugin_token("annotation:write")
+    if err is not None:
+        return err
+    body = request.get_json(silent=True) or {}
+    grant_id = body.get("grant_id")
+    session_id = body.get("session_id")
+    if not isinstance(grant_id, str) or not grant_id:
+        return _plugin_error(400, "invalid_request", "grant_id 必填")
+    if not isinstance(session_id, str) or not _REQUEST_ID_RE.match(session_id):
+        return _plugin_error(400, "invalid_request",
+                             "session_id 需为 1–128 字符（字母/数字/下划线/连字符）")
+    if share_store.get_run_grant(grant_id) is None:
+        return _plugin_error(404, "not_found", "run grant 不存在")
+    valid, reason = _verify_run_grant(grant_id, None, claims.get("sub") or "")
+    if not valid:
+        return _plugin_error(403, "run_grant_invalid",
+                             "run grant 无效（%s）" % reason)
+    try:
+        grant = share_store.bind_run_grant_session(grant_id, session_id)
+    except ValueError as e:
+        return _plugin_error(409, "conflict", "run grant 绑定冲突：%s" % e)
+    if grant is None:
+        return _plugin_error(404, "not_found", "run grant 不存在")
+    _audit("run_grant.bind", target_type="run_grant", target_id=grant_id,
+           slide=grant.get("slide"), detail={"session_id": session_id})
+    return jsonify(ok=True, grant_id=grant_id, session_id=session_id)
 
 
 @app.route("/api/plugin/v1/run-grants/verify", methods=["POST"])
@@ -7638,7 +7819,10 @@ def plugin_v1_run_grant_verify():
 
     body: {grant_id, slide}。恒 200 返回 {valid, reason}——valid=false 时
     reason ∈ missing_grant/grant_not_found/grant_revoked/grant_expired/
-    slide_mismatch/installation_mismatch（§7.7：程序分支依赖稳定 code）。
+    slide_mismatch/installation_mismatch/creator_not_allowed（§7.7：程序分支
+    依赖稳定 code）。§3.10 P0-C 起创建者复查（账号禁用/删除、失去 annotate
+    权限、切片归档）也在此判定。session 绑定校验只在 annotate 端点执行
+    （起跑自查时 grant 尚未绑定 session）。
     """
     claims, err = _require_plugin_token()
     if err is not None:
@@ -8016,7 +8200,8 @@ def api_ai_run():
     _audit("ai.run", target_type="session", slide=slide,
            detail={"mode": "run", "request_id": prep["request_id"]})
     return _proxy_sse("/run", payload, on_accepted=prep["on_accepted"],
-                      on_rejected=prep["on_rejected"])
+                      on_rejected=prep["on_rejected"],
+                      on_finished=prep.get("on_finished"))
 
 
 @app.route("/api/ai/continue", methods=["POST"])
@@ -8047,7 +8232,8 @@ def api_ai_continue():
     _audit("ai.run", target_type="session", slide=slide,
            detail={"mode": "continue", "request_id": prep["request_id"]})
     return _proxy_sse("/continue", payload, on_accepted=prep["on_accepted"],
-                      on_rejected=prep["on_rejected"])
+                      on_rejected=prep["on_rejected"],
+                      on_finished=prep.get("on_finished"))
 
 
 @app.route("/api/ai/ask", methods=["POST"])
@@ -8126,15 +8312,21 @@ def api_ai_branch():
     _audit("ai.run", target_type="session", target_id=annotation_id, slide=slide,
            detail={"mode": "branch", "request_id": prep["request_id"]})
     return _proxy_sse("/branch", payload, on_accepted=prep["on_accepted"],
-                      on_rejected=prep["on_rejected"])
+                      on_rejected=prep["on_rejected"],
+                      on_finished=prep.get("on_finished"))
 
 
 @app.route("/api/ai/cancel", methods=["POST"])
 def api_ai_cancel():
     """显式取消。body: {session_id?, slide?}。原样转发到 sidecar POST /cancel。
 
-    Stage 3a-2b：带 session_id 时做归属校验（user 仅自己名下）；仅 slide 时（取消
-    该切片 main）先经切片级鉴权。
+    §3.8 P0-C：
+      - user 请求**必须**使用 session_id，并强制 _require_ai_session_owner
+        （只允许取消自己名下的 run；A、B 可协作同一 slide，但 B 不能取消 A）；
+      - slide 分支（取消该切片 main）只保留给 owner（含 AUTH_ENABLED=False
+        归一 owner 的内部兼容调用）；user 传 slide → 403；
+      - 取消成功后按 sidecar 回显的 session_id 撤销绑定到该 session 的
+        run grant（§3.10 P0-C）。
     """
     body = request.get_json(silent=True) or {}
     session_id = body.get("session_id")
@@ -8150,11 +8342,49 @@ def api_ai_cancel():
     elif slide:
         if not isinstance(slide, str) or not slide:
             return jsonify(error="缺少 slide"), 400
-        if not can_view_slide(slide):
-            return _denied()
+        # §3.8：slide 取消只保留给 owner / 内部兼容（AUTH_ENABLED=False 归一
+        # owner）；can_view_slide 级别的授权不再允许取消他人 main run。
+        if user_ctx["role"] != user_store.ROLE_OWNER:
+            return _denied("仅 owner 可按切片取消会话；请使用 session_id 取消自己的会话")
     else:
         return jsonify(error="缺少 session_id 或 slide"), 400
-    return _proxy_json("/cancel", body)
+
+    cancelled_session = {"id": None}
+
+    def _on_response(status, parsed):
+        # §3.10 P0-C：sidecar 2xx 后按回显 session_id 撤销绑定 grant。
+        if status < 400 and isinstance(parsed, dict):
+            cancelled_session["id"] = parsed.get("session_id") or session_id
+
+    resp = _proxy_json("/cancel", body, on_response=_on_response)
+    # _proxy_json 不可达时返回 (body, 503) tuple；仅 2xx Response 才撤销 grant。
+    if not isinstance(resp, tuple) and resp.status_code < 400:
+        _revoke_run_grants_for_session(cancelled_session["id"] or session_id,
+                                       reason="cancel")
+    return resp
+
+
+@app.route("/api/ai/run-grants/<grant_id>", methods=["DELETE"])
+def api_ai_run_grant_revoke(grant_id):
+    """人类主动撤销 run grant（§3.10 P0-C）。Cookie session + CSRF（全局钩子）。
+
+    撤销权 = owner 或 grant 创建者本人（created_by_user_id）；机器端
+    （/api/plugin/v1/run-grants/<id>）只按 Bearer installation 匹配，两条通道
+    的鉴权主体不再混用。撤销后 annotate 立即 403 run_grant_invalid。
+    """
+    user_ctx = current_identity()
+    grant = share_store.get_run_grant(grant_id)
+    if grant is None:
+        return jsonify(error="run grant 不存在"), 404
+    if user_ctx["role"] != user_store.ROLE_OWNER:
+        uid = user_ctx.get("user_id")
+        creator = grant.get("created_by_user_id")
+        if not uid or not creator or uid != creator:
+            return _denied("仅 owner 或创建者可撤销 run grant")
+    share_store.revoke_run_grant(grant_id)
+    _audit("run_grant.revoke", target_type="run_grant", target_id=grant_id,
+           slide=grant.get("slide"), detail={"via": "api_ai"})
+    return jsonify(ok=True, grant_id=grant_id, revoked=True)
 
 
 @app.route("/api/ai/sessions")
@@ -8194,13 +8424,20 @@ def api_ai_session_archive(session_id):
     """fork 归档/恢复。代理 sidecar POST /session/<id>/archive|unarchive。
 
     Stage 3a-2b：owner 任意；user 仅自己名下会话。
+    §3.10 P0-C：归档成功（2xx）后撤销绑定到该 session 的 run grant。
     """
     auth = _require_ai_session_owner(session_id)
     if auth is not None:
         return auth
     sub = "archive" if request.path.endswith("/archive") else "unarchive"
     body = request.get_json(silent=True) or {}
-    return _proxy_json("/session/{}/{}".format(session_id, sub), body)
+
+    def _on_response(status, parsed):
+        if sub == "archive" and status < 400:
+            _revoke_run_grants_for_session(session_id, reason="session_archived")
+
+    return _proxy_json("/session/{}/{}".format(session_id, sub), body,
+                       on_response=_on_response)
 
 
 @app.route("/api/ai/session/<session_id>/stream")
@@ -8273,10 +8510,12 @@ def _require_ai_session_owner(session_id):
     return None
 
 
-def _proxy_json(path, body, method="POST", query=None):
+def _proxy_json(path, body, method="POST", query=None, on_response=None):
     """代理普通（非 SSE）端点到 sidecar，原样透传响应 body 与状态码。
 
     body 为 None 时不发 JSON（GET 请求）。query 仅 GET 时拼到 URL。
+    on_response(status, parsed_json_or_None)：拿到 sidecar 响应后回调（异常
+    吞掉记 log）；parsed 为 body 可 JSON 解析时的 dict，否则 None。
     """
     url = AI_SIDECAR_URL + path
     try:
@@ -8288,12 +8527,18 @@ def _proxy_json(path, body, method="POST", query=None):
                               headers=_sidecar_auth_headers())
     except (requests.ConnectionError, requests.Timeout):
         return _sidecar_unavailable_response()
+    if on_response is not None:
+        try:
+            on_response(r.status_code, r.get_json(silent=True))
+        except Exception:
+            app.logger.warning("代理 on_response 回调失败", exc_info=True)
     # 透传 Content-Type（JSON 或其它）与状态码
     ctype = r.headers.get("Content-Type", "application/json")
     return Response(r.content, status=r.status_code, mimetype=ctype.split(";")[0])
 
 
-def _proxy_sse(path, body, method="POST", on_accepted=None, on_rejected=None):
+def _proxy_sse(path, body, method="POST", on_accepted=None, on_rejected=None,
+               on_finished=None):
     """代理 SSE 端点到 sidecar：流式透传字节块，透传响应头与状态码。
 
     run/continue/ask（POST）注入 body；stream（GET）不注入 body，透传 after_seq
@@ -8305,6 +8550,10 @@ def _proxy_sse(path, body, method="POST", on_accepted=None, on_rejected=None):
       - on_accepted(session_id)：拿到 2xx 响应时调（SSE 取 X-AI-Session-ID；
         非 SSE 2xx 传空串）；
       - on_rejected()：4xx/5xx / 连接失败时调。
+    §3.10 P0-C：
+      - on_finished(session_id)：**上游 SSE 流正常结束**（sidecar 在 run 落定
+        后关闭流）时调；客户端提前断开（GeneratorExit）**不**调——此时 sidecar
+        run 仍在后台执行，grant 仍需有效。回调用于 run 结束后撤销绑定 grant。
     回调为 None 时行为与旧版完全一致（stream/cancel 等不预占的端点不传）。
     """
     url = AI_SIDECAR_URL + path
@@ -8373,12 +8622,24 @@ def _proxy_sse(path, body, method="POST", on_accepted=None, on_rejected=None):
         _reject()
 
     def generate():
+        upstream_done = False
         try:
             for chunk in upstream.iter_content(chunk_size=4096):
                 if chunk:
                     yield chunk
+            # for 循环正常耗尽 = 上游主动关流（sidecar run 已落定）。
+            upstream_done = True
+        except GeneratorExit:
+            # 客户端提前断开：sidecar run 仍在后台执行，不触发 on_finished。
+            raise
         finally:
             upstream.close()
+            if upstream_done and on_finished is not None:
+                try:
+                    on_finished(session_id)
+                except Exception:
+                    app.logger.warning("run grant on_finished 回调失败",
+                                       exc_info=True)
 
     out_headers = {
         "Cache-Control": "no-cache",
@@ -8493,6 +8754,7 @@ def api_share_revoke():
     token = body.get("token")
     if not token:
         return jsonify(error="缺少 token"), 400
+    share = share_store.get_share(token)
     # user 只能撤销自己创建的分享：先查 list 找 creator
     if ident["role"] != user_store.ROLE_OWNER:
         mine = [s for s in share_store.list_shares()
@@ -8502,6 +8764,11 @@ def api_share_revoke():
     ok = share_store.revoke_share(token)
     if not ok:
         return jsonify(error="分享不存在"), 404
+    # §3.10 P0-C：协作权限撤销 → 主动失效依赖该 share 的 run grant
+    # （仅撤销复查后确已失去 annotate 权限的创建者；切片 owner 不受影响）。
+    if share is not None:
+        for s in share.get("slides", []):
+            _revoke_stale_run_grants(slide=s, reason="share_revoked")
     _audit("share.revoke", target_type="share", target_id=token)
     return jsonify(ok=True)
 
@@ -8706,12 +8973,16 @@ def api_project_archive(pid):
     """归档项目（docs §v1.5 纯只读开关）。owner 任意；user 仅自己的项目。
 
     归档后该项目切片对所有身份（含 owner）只读，解除归档才可写。
+    §3.10 P0-C：归档后主动撤销该项目切片上的全部 run grant（写前复查同时
+    兜底拒绝）。
     """
     if not _can_access_project(pid):
         return _denied()
     proj = share_store.set_project_archived(pid, True)
     if proj is None:
         return jsonify(error="项目不存在"), 404
+    for s in proj.get("slides", []):
+        _revoke_stale_run_grants(slide=s, reason="project_archived")
     _audit("project.archive", target_type="project", target_id=pid)
     return jsonify(proj)
 

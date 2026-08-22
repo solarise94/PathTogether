@@ -9,6 +9,7 @@ COPY app.py share_server.py share_store.py user_store.py slide_io.py slide_cache
 COPY share_store_json.py user_store_json.py ./
 COPY pg_store.py share_store_pg.py user_store_pg.py ./
 COPY platform_features.py settings_store.py budget_store.py auth_limit_store.py demo_store.py ./
+COPY crop_guard.py upload_guard.py ./
 COPY migrations/ migrations/
 COPY scripts/ scripts/
 COPY docker_entry.sh ./

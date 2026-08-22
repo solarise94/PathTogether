@@ -35,6 +35,8 @@ from openslide import OpenSlide
 import share_store
 import slide_cache
 import slide_io
+# P0-A §3.5：与主站 app.py 共用的 crop 像素闸（同一实现，防两份逻辑漂移）
+import crop_guard
 
 app = Flask(__name__)
 
@@ -671,6 +673,13 @@ def share_slide_tile(token, name, level, x, y):
 
 @app.route("/s/<token>/api/slide/<name>/crop")
 def share_slide_crop(token, name):
+    """crop PNG 导出（分享端）。
+
+    P0-A §3.5：与主站 /api/slide/<name>/crop 共用 crop_guard（同一实现，
+    防两份逻辑漂移）。read_region 之前按 clamp 后实际 size2² 过三道闸：
+    像素硬闸 413 / 每分钟像素预算 429（按 share capability 即 token 计）/
+    并发闸 429；任何解码前拒绝。分享端无需登录，闸主体是 token。
+    """
     share = _require_share(token)
     safe = _require_slide(share, name)
     entry = _get_slide(safe)
@@ -699,7 +708,27 @@ def share_slide_crop(token, name):
         size2 = min(size, max_w, max_h)
         if size2 <= 0:
             return jsonify(error="裁剪区域超出图像边界"), 400
-        region = osr.read_region((x2, y2), 0, (size2, size2)).convert("RGB")
+        # 像素硬闸：clamp 后实际值，任何解码前拒绝（docs §3.5）
+        try:
+            crop_guard.check_pixel_limit(size2, size2)
+        except crop_guard.CropTooLargeError as e:
+            return jsonify(error=str(e), code=e.code,
+                           max_pixels=crop_guard.CROP_MAX_PIXELS), 413
+        # 每分钟像素预算（按 share capability）+ 并发闸：read_region 前
+        allowed, retry_after = crop_guard.admit_pixels(token, size2 * size2)
+        if not allowed:
+            resp = jsonify(error="crop 请求过于频繁，请稍后重试",
+                           code="crop_rate_limited", retry_after=retry_after)
+            resp.headers["Retry-After"] = str(int(max(1, retry_after)))
+            return resp, 429
+        slot = crop_guard.acquire_slot()
+        if slot is None:
+            return jsonify(error="crop 并发已达上限，请稍后重试",
+                           code="crop_busy"), 429
+        try:
+            region = osr.read_region((x2, y2), 0, (size2, size2)).convert("RGB")
+        finally:
+            crop_guard.release_slot(slot)
 
     buf = io.BytesIO()
     region.save(buf, format="PNG")

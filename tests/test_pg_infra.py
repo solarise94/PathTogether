@@ -98,7 +98,8 @@ def test_schema_migrations_recorded(conn):
     # 0010_demo_task_max_steps_20.sql 把 Demo 单次默认从 10 步改为 20 步；
     # 插件能力层 P1 追加 0011_plugin_capabilities.sql（能力注册表列）；
     # P0-B 追加 0012_registration_invites.sql（邀请注册表 + users.ai_access +
-    # ai_budget_periods owner 保留 / user 共享池列）。
+    # ai_budget_periods owner 保留 / user 共享池列）；
+    # P0-A 资源防护追加 0013_upload_quotas.sql（上传配额/reservation）。
     assert rows == [
         "0001_init.sql", "0002_roi_payload.sql", "0003_comments.sql",
         "0004_audit.sql", "0005_plugin.sql", "0006_demo_budget_auth.sql",
@@ -108,6 +109,7 @@ def test_schema_migrations_recorded(conn):
         "0010_demo_task_max_steps_20.sql",
         "0011_plugin_capabilities.sql",
         "0012_registration_invites.sql",
+        "0013_upload_quotas.sql",
     ]
 
 

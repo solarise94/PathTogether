@@ -18,6 +18,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import sys
 import threading
 import time
@@ -69,6 +70,12 @@ import demo_store
 # registration_store 提供一次性邀请码（只存 token_hash）与单事务原子兑换。
 # json/dual 后端 fail-closed（platform_features 守卫）。
 import registration_store
+# P0-A 资源防护（docs/open-registration-security-remediation §3.3/§3.4/§3.5）：
+# upload_guard：单请求计数流 + 磁盘保留水位 + PG 权威用户配额/reservation/
+#   在途与每小时限流（json/dual fail-closed，本地免登录 owner 语义不变）；
+# crop_guard：主站与 share_server 共用的 crop 像素硬闸 / 每分钟像素预算 / 并发闸。
+import crop_guard
+import upload_guard
 
 # Stage 5-1：插件 manifest 版本常量单一来源（plugins/sdk/manifest.py）。
 # plugins/ 与 plugins/sdk/ 各有 __init__.py（plugins/histopilot/ 不加，保持静态目录）。
@@ -90,6 +97,22 @@ app = Flask(__name__)
 # 上传目录：默认 ~/svs-viewer/uploads，可用环境变量 UPLOAD_DIR 覆盖（容器内挂载）
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR") or (Path.home() / "svs-viewer" / "uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# P0-A §3.3：单请求字节上限两层执行。
+# 第一层：Werkzeug MAX_CONTENT_LENGTH（含少量 multipart 开销余量）——超限
+# 请求在读体前/读体中被 413 拒绝（_handle_413 统一 JSON 信封）；
+# 第二层（权威）：保存时逐块计数的流（upload_guard.save_limited）——
+# Content-Length 缺省/伪造/chunked 超限都在上限处停止，不信任任何声明长度。
+# 注意：边缘代理（frp/nginx client_max_body_size）必须与
+# UPLOAD_MAX_REQUEST_BYTES 配置为同值（docs §3.3-1）。
+app.config["MAX_CONTENT_LENGTH"] = (
+    upload_guard.UPLOAD_MAX_REQUEST_BYTES + upload_guard.UPLOAD_MULTIPART_SLACK_BYTES)
+
+
+@app.errorhandler(413)
+def _handle_413(e):
+    """请求体超限（Werkzeug 层）：稳定 JSON 信封，不回显内部细节。"""
+    return jsonify(error="请求体超过单请求字节上限", code="upload_too_large"), 413
 
 # --------------------------------------------------------------------------- #
 # 图片派生图确定性规格常量（§6.3）
@@ -3537,6 +3560,33 @@ def api_slides():
     return jsonify(items)
 
 
+# --------------------------------------------------------------------------- #
+# P0-A §3.4：ZIP 解压防护参数（env 可调）
+#
+# 默认值依据（[测] 标记 = 上线前按真实 TCGA/MRXS zip 分布复核）：
+#   - ZIP_MAX_MEMBERS=4096：MRXS 伴侣目录（Slidedat.ini + 分层 dat）常见为
+#     数十到数百个文件；4096 留一个数量级余量。[测]
+#   - ZIP_MAX_PATH_DEPTH=8：MRXS 结构（<stem>/Level_<n>/...）通常 ≤6 层。
+#   - ZIP_MAX_MEMBER_BYTES=UPLOAD_MAX_REQUEST_BYTES：单成员不应大于单请求上限
+#     （zip 本体已受请求上限约束，成员更不该超过）。[测] 与请求上限同步调。
+#   - ZIP_MAX_TOTAL_BYTES=2×请求上限：zip 本体 ≤ 上限 + 解压后总量 ≈ 原始
+#     切片大小（WSI 数据基本不可压缩，压缩比接近 1），2× 是保守上界。[测]
+#   - ZIP_MAX_COMPRESSION_RATIO=100：WSI 已是压缩影像，正常 member 压缩比
+#     接近 1；全零/重复数据的解压炸弹轻松超过 1000。100 对合法内容极宽松。
+#   - ZIP_WATERMARK_CHECK_BYTES=64 MiB：解压过程中的磁盘水位检查粒度。
+# --------------------------------------------------------------------------- #
+ZIP_MAX_MEMBERS = int(os.environ.get("ZIP_MAX_MEMBERS") or 4096)
+ZIP_MAX_PATH_DEPTH = int(os.environ.get("ZIP_MAX_PATH_DEPTH") or 8)
+ZIP_MAX_MEMBER_BYTES = int(
+    os.environ.get("ZIP_MAX_MEMBER_BYTES") or upload_guard.UPLOAD_MAX_REQUEST_BYTES)
+ZIP_MAX_TOTAL_BYTES = int(
+    os.environ.get("ZIP_MAX_TOTAL_BYTES")
+    or 2 * upload_guard.UPLOAD_MAX_REQUEST_BYTES)
+ZIP_MAX_COMPRESSION_RATIO = float(
+    os.environ.get("ZIP_MAX_COMPRESSION_RATIO") or 100)
+ZIP_WATERMARK_CHECK_BYTES = 64 * 1024 * 1024
+
+
 def _validate_slide_file(path: Path):
     """验证单个切片文件能否被 slide_io 打开（成功返回 True，否则 False）。"""
     try:
@@ -3550,16 +3600,25 @@ def _validate_slide_file(path: Path):
     return True
 
 
-def _extract_zip_to_upload(src_zip: Path):
+def _extract_zip_to_upload(src_zip: Path, reservation=None):
     """把 zip 解压到 UPLOAD_DIR，返回 (主文件名, [解压出的相对路径...])。
 
-    流程：
+    P0-A §3.4 加固（docs/open-registration-security-remediation）：
     1. 解压到 UPLOAD_DIR 下临时目录 .extracting-<随机>；
     2. 防 zip-slip：拒绝绝对路径与含 .. 的 member，跳过 __MACOSX/隐藏文件；
-    3. 若临时目录仅含一个子目录（无文件）则剥掉包装层当根；
-    4. 把根下内容 move 到 UPLOAD_DIR；任何目标已存在 → 清理并返回 409 错误；
-    5. 找出 SUPPORTED_EXTS 切片文件逐个验证；一个都打不开 → 清理并返回 400。
+    3. 解压炸弹防护：成员数 / 路径深度 / 单成员与总展开字节（声明值与实际
+       复制字节都检查，任一超限立即中止并清理）/ 异常压缩比；
+    4. 拒绝符号链接、设备/FIFO 成员、加密成员、重复规范化路径（大小写不敏感，
+       防大小写不敏感文件系统上的覆盖）；
+    5. 解压过程中周期性检查磁盘保留水位（ZIP_WATERMARK_CHECK_BYTES）；
+    6. 暂存解压后识别合法 bundle（_recognize_slide_bundle）：单文件切片只提升
+       该文件；MRXS 只提升 .mrxs 与同 stem 伴侣目录；混入无关顶层内容 → 拒绝；
+    7. 最终 move 前一次性检查目标冲突 / 用户配额（reservation 补占）/ 磁盘水位；
+       目标冲突响应统一为「名称不可用」，不回显跨用户真实文件名（docs §3.12）；
+    8. move 用 os.link 原子 no-clobber（防 check-then-move 竞态覆盖他人文件）；
+    9. 找出 SUPPORTED_EXTS 切片文件逐个验证；一个都打不开 → 清理并返回 400。
 
+    reservation：api_upload 建立的 PG 预占 dict（无配额主体传 None）。
     失败时返回 (error_message, http_status)；成功返回 (main_name_or_None, moved_paths)。
     """
     tmp_dir = UPLOAD_DIR / (".extracting-" + secrets.token_hex(8))
@@ -3583,6 +3642,11 @@ def _extract_zip_to_upload(src_zip: Path):
             except Exception:
                 pass
 
+    member_count = 0
+    declared_total = 0
+    actual_total = 0
+    seen_norm = set()  # 规范化（casefold）路径集合：防重复 member
+
     try:
         with zipfile.ZipFile(src_zip, "r") as zf:
             for info in zf.infolist():
@@ -3599,6 +3663,22 @@ def _extract_zip_to_upload(src_zip: Path):
                 if norm.startswith("/") or any(p == ".." for p in parts):
                     _cleanup_all()
                     return "压缩包含非法路径", 400
+                member_count += 1
+                if member_count > ZIP_MAX_MEMBERS:
+                    _cleanup_all()
+                    return "压缩包成员数超过上限", 400
+                # 加密成员拒绝（zf.open 会要求口令，这里入口即拒）
+                if info.flag_bits & 0x1:
+                    _cleanup_all()
+                    return "压缩包含加密成员", 400
+                # 符号链接 / 字符设备 / 块设备 / FIFO / socket 拒绝：
+                # unix create_system 时 external_attr 高 16 位是 st_mode
+                mode = (info.external_attr >> 16) & 0xFFFF
+                fmt = mode & 0o170000
+                if fmt in (stat.S_IFLNK, stat.S_IFCHR, stat.S_IFBLK,
+                           stat.S_IFIFO, stat.S_IFSOCK):
+                    _cleanup_all()
+                    return "压缩包含非法成员类型", 400
                 # member 路径各组件过 _sanitize_name
                 clean_parts = [_sanitize_name(p) for p in parts]
                 if any((not p and i < len(clean_parts) - 1) for i, p in enumerate(clean_parts)):
@@ -3607,6 +3687,14 @@ def _extract_zip_to_upload(src_zip: Path):
                 clean_parts = [p for p in clean_parts if p]
                 if not clean_parts:
                     continue
+                if len(clean_parts) > ZIP_MAX_PATH_DEPTH:
+                    _cleanup_all()
+                    return "压缩包路径深度超过上限", 400
+                norm_key = "/".join(clean_parts).casefold()
+                if norm_key in seen_norm:
+                    _cleanup_all()
+                    return "压缩包包含重复路径", 400
+                seen_norm.add(norm_key)
                 target = tmp_dir.joinpath(*clean_parts)
                 # 二次校验目标在 tmp_dir 内
                 try:
@@ -3616,10 +3704,47 @@ def _extract_zip_to_upload(src_zip: Path):
                     return "压缩包含非法路径", 400
                 if info.is_dir():
                     target.mkdir(parents=True, exist_ok=True)
-                else:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    with zf.open(info) as src, open(target, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
+                    continue
+                # 声明大小检查（第一道）：单成员 + 累计总量 + 压缩比
+                declared = int(info.file_size or 0)
+                if declared > ZIP_MAX_MEMBER_BYTES:
+                    _cleanup_all()
+                    return "压缩包成员超过大小上限", 400
+                if declared_total + declared > ZIP_MAX_TOTAL_BYTES:
+                    _cleanup_all()
+                    return "压缩包总展开量超过上限", 400
+                comp = int(info.compress_size or 0)
+                if declared > 0 and comp > 0 and declared / comp > ZIP_MAX_COMPRESSION_RATIO:
+                    _cleanup_all()
+                    return "压缩包成员压缩比异常", 400
+                declared_total += declared
+                # 实际复制（第二道）：stdlib 会按声明值截断，但这里独立计数，
+                # 任何实现层面的偏差（声明伪造/流超限）都在上限处停止
+                target.parent.mkdir(parents=True, exist_ok=True)
+                member_actual = 0
+                watermark_checked = 0
+                with zf.open(info) as src, open(target, "wb") as dst:
+                    while True:
+                        chunk = src.read(upload_guard.CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        member_actual += len(chunk)
+                        actual_total += len(chunk)
+                        if (member_actual > ZIP_MAX_MEMBER_BYTES
+                                or actual_total > ZIP_MAX_TOTAL_BYTES
+                                or member_actual > declared):
+                            _cleanup_all()
+                            return "压缩包实际展开量超过上限", 400
+                        dst.write(chunk)
+                        watermark_checked += len(chunk)
+                        if watermark_checked >= ZIP_WATERMARK_CHECK_BYTES:
+                            # 解压过程中的磁盘保留水位检查（docs §3.3-5）
+                            try:
+                                upload_guard.check_disk_watermark(UPLOAD_DIR)
+                            except upload_guard.DiskWatermarkExceeded:
+                                _cleanup_all()
+                                return "磁盘空间不足", 507
+                            watermark_checked = 0
     except zipfile.BadZipFile as e:
         _cleanup_all()
         return f"无效的 zip 文件: {e}", 400
@@ -3627,37 +3752,64 @@ def _extract_zip_to_upload(src_zip: Path):
         _cleanup_all()
         return f"解压失败: {e}", 400
 
-    # 若仅含一个子目录且无文件，剥掉包装层
-    children = [p for p in tmp_dir.iterdir()] if tmp_dir.exists() else []
-    files_in_root = [p for p in children if p.is_file()]
-    dirs_in_root = [p for p in children if p.is_dir()]
+    # 若仅含子目录且无文件，逐层剥掉包装层（zip 由文件夹打包时常有多层包装）
     root = tmp_dir
-    if not files_in_root and len(dirs_in_root) == 1:
-        root = dirs_in_root[0]
+    while root.exists():
+        children = [p for p in root.iterdir()]
+        files_in_root = [p for p in children if p.is_file()]
+        dirs_in_root = [p for p in children if p.is_dir()]
+        if not files_in_root and len(dirs_in_root) == 1:
+            root = dirs_in_root[0]
+            continue
+        break
 
-    # 收集根下全部「文件」（不含目录，避免先移走父目录导致子文件找不到；
-    # 目标父目录按需创建）
-    entries = []
-    for p in root.rglob("*"):
-        if p.is_file():
-            entries.append((p, p.relative_to(root)))
+    # 暂存解压后识别合法 bundle（docs §3.4：保留 MRXS 伴侣目录语义）
+    entries = _recognize_slide_bundle(root)
+    if entries is None:
+        _cleanup_all()
+        return "压缩包内未找到有效切片或包含无关内容", 400
 
-    # move 到 UPLOAD_DIR；任何目标已存在 → 409
-    for abs_p, rel in entries:
-        dest = UPLOAD_DIR / rel
-        if dest.exists():
+    # 最终 move 前一次性检查：目标冲突 / 用户配额 / 磁盘水位（docs §3.4-5）
+    total_bytes = sum(p.stat().st_size for p, _rel in entries)
+    for _abs_p, rel in entries:
+        if (UPLOAD_DIR / rel).exists():
             _cleanup_all()
-            return f"文件已存在: {rel.as_posix()}", 409
+            return "名称不可用", 409
+    if reservation is not None:
+        need_extra = total_bytes - int(reservation["reserved_bytes"])
+        if need_extra > 0:
+            try:
+                refreshed = upload_guard.topup_reservation(
+                    reservation["reservation_id"], need_extra)
+            except upload_guard.UploadGuardError:
+                _cleanup_all()
+                return "存储配额不足", 413
+            if refreshed:
+                reservation["reserved_bytes"] = refreshed["reserved_bytes"]
+    try:
+        upload_guard.check_disk_watermark(UPLOAD_DIR, need_bytes=total_bytes)
+    except upload_guard.DiskWatermarkExceeded:
+        _cleanup_all()
+        return "磁盘空间不足", 507
 
+    # 提升到 UPLOAD_DIR：os.link 原子 no-clobber（防竞态覆盖他人文件）；
+    # 不支持 link 的环境退回 shutil.move
     for abs_p, rel in entries:
         dest = UPLOAD_DIR / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
-            shutil.move(str(abs_p), str(dest))
-            moved.append(rel.as_posix())
-        except Exception as e:
+            os.link(abs_p, dest)
+            abs_p.unlink()
+        except FileExistsError:
             _cleanup_all()
-            return f"移动文件失败: {e}", 400
+            return "名称不可用", 409
+        except OSError:
+            try:
+                shutil.move(str(abs_p), str(dest))
+            except Exception as e:
+                _cleanup_all()
+                return f"移动文件失败: {e}", 400
+        moved.append(rel.as_posix())
 
     # 找出其中支持的切片文件
     slide_files = []
@@ -3683,12 +3835,116 @@ def _extract_zip_to_upload(src_zip: Path):
     return main, sorted(set(valid))
 
 
+def _recognize_slide_bundle(root: Path):
+    """识别暂存区里的合法切片 bundle，返回 [(abs_path, rel_path)] 或 None。
+
+    规则（docs §3.4：不能按扩展名丢弃所有非切片文件——MRXS 需要同名伴侣
+    数据目录；同时拒绝混入无关顶层内容）：
+      - 顶层（剥掉包装层后）必须全部是：切片扩展名文件，或与某个顶层切片
+        同 stem 的伴侣目录；
+      - 单文件切片只提升该文件（多个单文件切片一并提升，保持旧语义）；
+      - MRXS 提升 .mrxs + 同 stem 伴侣目录的全部文件；
+      - 其它任何顶层内容（README、无关目录、非切片文件）→ None（整体拒绝）。
+    """
+    if not root.exists():
+        return None
+    children = [p for p in root.iterdir()]
+    files = [p for p in children if p.is_file()]
+    dirs = [p for p in children if p.is_dir()]
+    slide_files = [p for p in files
+                   if p.suffix.lower().lstrip(".") in SUPPORTED_EXTS]
+    if not slide_files:
+        return None
+    slide_names = {p.name for p in slide_files}
+    stems = {p.stem for p in slide_files}
+    if len(slide_names) != len(files):
+        # 存在非切片顶层文件 → 混入无关内容
+        return None
+    for d in dirs:
+        if d.name not in stems:
+            return None
+    entries = [(p, p.relative_to(root)) for p in slide_files]
+    for d in dirs:
+        for f in d.rglob("*"):
+            if f.is_file():
+                entries.append((f, f.relative_to(root)))
+    return entries
+
+
+def _upload_reservation_hint():
+    """预占字节提示：有 Content-Length 用之（clamp 到上限），否则按上限保守预占。
+
+    不信任该值做截断（计数流才是权威）；无声明时按最坏情况预占，防止
+    chunked 流绕过配额（docs §3.3-2/3）。
+    """
+    try:
+        cl = int(request.content_length or 0)
+    except (TypeError, ValueError):
+        cl = 0
+    if cl <= 0:
+        return upload_guard.UPLOAD_MAX_REQUEST_BYTES
+    return min(cl, upload_guard.UPLOAD_MAX_REQUEST_BYTES)
+
+
+def _upload_acquire_reservation(ident):
+    """按身份建立 PG 上传预占。返回 reservation dict 或 (error_resp) 元组。
+
+    配额主体 = role=user（docs §3.3 威胁模型：受邀账号铺满磁盘）。owner 与
+    AUTH_ENABLED=False 的本地免登录形态（user_id 为空）不占用配额——owner
+    是运维者本人。json/dual 后端对配额主体 fail-closed（503，不退化进程内
+    计数，与 POST /login 在 json 后端的 503 同款哲学）。
+    """
+    if not upload_guard.quota_applies(ident):
+        return None
+    if not upload_guard.quota_features_available():
+        return (jsonify(error="上传配额服务不可用", code="upload_guard_unavailable"), 503)
+    try:
+        return upload_guard.reserve_upload(ident["user_id"],
+                                           _upload_reservation_hint())
+    except upload_guard.UploadGuardError as e:
+        return (jsonify(error=str(e), code=e.code), e.http_status)
+    except Exception:
+        app.logger.exception("upload reservation failed")
+        return (jsonify(error="上传配额服务不可用",
+                        code="upload_guard_unavailable"), 503)
+
+
+def _upload_release_quietly(reservation):
+    """best-effort 释放预占（失败仅记日志，不掩盖主错误）。"""
+    if not reservation:
+        return
+    try:
+        upload_guard.release_reservation(reservation["reservation_id"])
+    except Exception:
+        app.logger.exception("upload reservation release failed: %s",
+                             reservation.get("reservation_id"))
+
+
+def _upload_consume_quietly(reservation, actual_bytes):
+    """best-effort 转实占（失败仅记日志：文件已落盘，不能因记账失败回滚）。"""
+    if not reservation:
+        return
+    try:
+        upload_guard.consume_reservation(reservation["reservation_id"],
+                                         int(actual_bytes))
+    except Exception:
+        app.logger.exception("upload reservation consume failed: %s",
+                             reservation.get("reservation_id"))
+
+
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
     """流式上传切片文件，或上传 zip 解压（用于 MRXS 等伴侣数据目录格式）。
 
     Stage 3a-2a：owner/user 可上传（guest 在 AUTH 下无 session 已 401）；
     上传成功后为每个切片建立归属（slide_meta.owner_user_id = 上传者）。
+
+    P0-A §3.3 资源防护（docs/open-registration-security-remediation）：
+      - 单请求字节上限两层执行（Werkzeug MAX_CONTENT_LENGTH + 计数流）；
+      - 始终先写 .uploading-* 临时文件，验证成功后原子 link/rename 提升；
+      - PG 权威用户配额预占（失败释放 / 成功转实占）+ 在途与每小时限流；
+      - 写入前与解压过程中检查磁盘保留水位；
+      - 目标名冲突统一回「名称不可用」，不回显跨用户真实文件名（§3.12）。
     """
     if not can_upload():
         return jsonify(error="无上传权限"), 403
@@ -3696,29 +3952,56 @@ def api_upload():
     if "file" not in request.files:
         return jsonify(error="缺少 file 字段"), 400
 
+    # 配额 / 限流（PG 权威；owner 与本地免登录跳过）
+    reservation = _upload_acquire_reservation(ident)
+    if isinstance(reservation, tuple):
+        return reservation
+
     file = request.files["file"]
     filename = file.filename or ""
     safe = _sanitize_name(filename)
     if not safe:
+        _upload_release_quietly(reservation)
         return jsonify(error="非法文件名"), 400
 
     ext = safe.rsplit(".", 1)[-1].lower() if "." in safe else ""
 
     # zip 上传：解压分支
     if ext in ARCHIVE_EXTS:
-        tmp_zip = UPLOAD_DIR / (".upload-" + secrets.token_hex(8) + ".zip")
+        tmp_zip = UPLOAD_DIR / (".uploading-" + secrets.token_hex(8) + ".zip")
+        # 计数流保存（不信任 Content-Length；超限即停并清理）
         try:
-            file.save(tmp_zip)
+            upload_guard.check_disk_watermark(UPLOAD_DIR,
+                                              need_bytes=_upload_reservation_hint())
+            upload_guard.save_limited(file.stream, tmp_zip)
+        except upload_guard.RequestTooLarge as e:
+            _upload_release_quietly(reservation)
+            return jsonify(error=str(e), code=e.code), 413
+        except upload_guard.DiskWatermarkExceeded as e:
+            _upload_release_quietly(reservation)
+            return jsonify(error="磁盘空间不足", code=e.code), 507
         except Exception as e:
             tmp_zip.unlink(missing_ok=True)
+            _upload_release_quietly(reservation)
             return jsonify(error=f"保存失败: {e}"), 400
-        result = _extract_zip_to_upload(tmp_zip)
-        tmp_zip.unlink(missing_ok=True)
+        try:
+            result = _extract_zip_to_upload(tmp_zip, reservation=reservation)
+        finally:
+            tmp_zip.unlink(missing_ok=True)
         # _extract_zip_to_upload 失败时返回 (error_msg, status)
         if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
             msg, status = result
+            _upload_release_quietly(reservation)
             return jsonify(error=msg), status
         main_name, extracted = result
+        # 成功：按实际落盘字节转实占（zip 暂存已删，只计最终提升的文件）
+        actual = 0
+        for sname in extracted:
+            try:
+                actual += (UPLOAD_DIR / sname).stat().st_size
+            except OSError:
+                pass
+        _upload_consume_quietly(reservation, actual)
         # 建立归属（zip 内全部有效切片均为上传者所有）
         for sname in extracted:
             try:
@@ -3729,21 +4012,47 @@ def api_upload():
         return jsonify(name=main_name, extracted=extracted)
 
     if ext not in SUPPORTED_EXTS:
+        _upload_release_quietly(reservation)
         return jsonify(error="不支持的文件类型"), 400
 
     dest = UPLOAD_DIR / safe
     if dest.exists():
-        return jsonify(error=f"文件已存在: {safe}"), 409
+        # 统一文案：不回显已存在的（可能跨用户的）真实文件名（docs §3.12）
+        _upload_release_quietly(reservation)
+        return jsonify(error="名称不可用", code="name_unavailable"), 409
 
-    # 流式保存
+    # 计数流写入临时文件（.uploading-*），不信任 Content-Length
+    tmp = UPLOAD_DIR / (".uploading-" + secrets.token_hex(8) + ".part")
     try:
-        file.save(dest)
+        upload_guard.check_disk_watermark(UPLOAD_DIR,
+                                          need_bytes=_upload_reservation_hint())
+        total = upload_guard.save_limited(file.stream, tmp)
+    except upload_guard.RequestTooLarge as e:
+        _upload_release_quietly(reservation)
+        return jsonify(error=str(e), code=e.code), 413
+    except upload_guard.DiskWatermarkExceeded as e:
+        _upload_release_quietly(reservation)
+        return jsonify(error="磁盘空间不足", code=e.code), 507
     except Exception as e:
-        try:
-            dest.unlink(missing_ok=True)
-        except Exception:
-            pass
+        tmp.unlink(missing_ok=True)
+        _upload_release_quietly(reservation)
         return jsonify(error=f"保存失败: {e}"), 400
+
+    # 原子 no-clobber 提升：link 失败（已存在）即统一 409，无 check-then-write 竞态
+    try:
+        os.link(tmp, dest)
+        tmp.unlink(missing_ok=True)
+    except FileExistsError:
+        tmp.unlink(missing_ok=True)
+        _upload_release_quietly(reservation)
+        return jsonify(error="名称不可用", code="name_unavailable"), 409
+    except OSError:
+        try:
+            os.replace(tmp, dest)
+        except Exception as e:
+            tmp.unlink(missing_ok=True)
+            _upload_release_quietly(reservation)
+            return jsonify(error=f"保存失败: {e}"), 400
 
     # 验证能否打开（裸 .mrxs 通常缺少数据目录，给出针对性提示）
     if not _validate_slide_file(dest):
@@ -3751,6 +4060,7 @@ def api_upload():
             dest.unlink(missing_ok=True)
         except Exception:
             pass
+        _upload_release_quietly(reservation)
         hint = "MRXS 需连同数据目录打包为 zip 上传" if safe.lower().endswith(".mrxs") else "无效的切片文件"
         return jsonify(error=hint), 400
 
@@ -3759,7 +4069,13 @@ def api_upload():
         share_store.set_slide_meta(safe, owner_user_id=ident["user_id"],
                                    requester_role=ident["role"])
     except PermissionError:
+        try:
+            dest.unlink(missing_ok=True)
+        except Exception:
+            pass
+        _upload_release_quietly(reservation)
         return jsonify(error="无上传权限"), 403
+    _upload_consume_quietly(reservation, total)
     return jsonify(name=safe)
 
 
@@ -3879,7 +4195,12 @@ def api_slide_tile(name, level, x, y):
 
 @app.route("/api/slide/<name>/crop")
 def api_slide_crop(name):
-    """裁剪 level-0 原始像素区域的 PNG 图像并下载。Stage 3a-2a：can_view_slide。"""
+    """裁剪 level-0 原始像素区域的 PNG 图像并下载。Stage 3a-2a：can_view_slide。
+
+    P0-A §3.5：read_region 之前按 clamp 后实际 size2² 过 crop_guard 三道闸
+    （像素硬闸 413 / 每分钟像素预算 429 / 并发闸 429），任何解码前拒绝。
+    预算按 user_id 计（本地免登录统一 "local" 主体）。
+    """
     if not can_view_slide(name):
         return _denied()
     safe = _safe_name(name)
@@ -3899,6 +4220,7 @@ def api_slide_crop(name):
     if x < 0 or y < 0 or size <= 0 or size > 40000:
         return jsonify(error="参数越界（0<=x,y，0<size<=40000）"), 400
 
+    subject = _current_uid() or "local"
     with slide_cache.borrow_pair(entry) as pair:
         osr = pair["osr"]
         width, height = osr.dimensions
@@ -3910,7 +4232,27 @@ def api_slide_crop(name):
         size2 = min(size, max_w, max_h)
         if size2 <= 0:
             return jsonify(error="裁剪区域超出图像边界"), 400
-        region = osr.read_region((x2, y2), 0, (size2, size2)).convert("RGB")
+        # 像素硬闸：clamp 后实际值，任何解码前拒绝（docs §3.5）
+        try:
+            crop_guard.check_pixel_limit(size2, size2)
+        except crop_guard.CropTooLargeError as e:
+            return jsonify(error=str(e), code=e.code,
+                           max_pixels=crop_guard.CROP_MAX_PIXELS), 413
+        # 每分钟像素预算（按用户）+ 并发闸：read_region 前
+        allowed, retry_after = crop_guard.admit_pixels(subject, size2 * size2)
+        if not allowed:
+            resp = jsonify(error="crop 请求过于频繁，请稍后重试",
+                           code="crop_rate_limited", retry_after=retry_after)
+            resp.headers["Retry-After"] = str(int(max(1, retry_after)))
+            return resp, 429
+        slot = crop_guard.acquire_slot()
+        if slot is None:
+            return jsonify(error="crop 并发已达上限，请稍后重试",
+                           code="crop_busy"), 429
+        try:
+            region = osr.read_region((x2, y2), 0, (size2, size2)).convert("RGB")
+        finally:
+            crop_guard.release_slot(slot)
 
     buf = io.BytesIO()
     region.save(buf, format="PNG")

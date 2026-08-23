@@ -1067,6 +1067,106 @@ def _rect_size_mm(safe, side_px):
 
 
 # --------------------------------------------------------------------------- #
+# AI 正式标注切片几何校验（docs/ai-viewport-observation-annotation-fix-plan.md
+# §6.1 / §9 批次 C 第 3 项）：/internal/ai/annotate 与
+# /api/plugin/v1/slides/<slide>/annotations 两条写入路径共用同一套规则。
+# --------------------------------------------------------------------------- #
+_ANNOTATION_MAX_SIDE_PX = 40000
+
+
+def _fmt_level0(v):
+    """level-0 坐标/尺寸的紧凑展示（整数不带小数点，浮点保留 2 位）。"""
+    f = float(v)
+    return str(int(f)) if f.is_integer() else "%.2f" % f
+
+
+def _annotation_slide_bounds(safe):
+    """取切片 level-0 尺寸 (width, height)；读不到返回 (None, None)。
+
+    与 _rect_size_mm 同一数据来源（_slide_info_dict → slide_cache 的 mtime
+    感知元数据缓存），同一请求内 size_mm 换算与边界校验不会重复打开切片。
+    """
+    try:
+        info = _slide_info_dict(safe) or {}
+        width = info.get("width")
+        height = info.get("height")
+        if (isinstance(width, (int, float)) and not isinstance(width, bool)
+                and math.isfinite(width) and width > 0
+                and isinstance(height, (int, float)) and not isinstance(height, bool)
+                and math.isfinite(height) and height > 0):
+            return float(width), float(height)
+    except Exception:
+        pass
+    return None, None
+
+
+def _validate_annotation_rect(safe, x, y, side_px):
+    """AI 正式标注（正方形 rect）的统一切片几何校验（§6.1）。
+
+    规则（/internal/ai/annotate 与 plugin v1 annotate 共用）：
+      - x/y 为有限数且 ≥0；side_px 为有限数且在 1..40000；
+      - x + side_px ≤ slide_width、y + side_px ≤ slide_height
+        （矩形右/下边界不得越出切片 level-0 边界；正方形时 x+side_px /
+        y+side_px 与 §6.1 的 x+w / y+h 同理）。
+
+    返回 None 表示通过；否则返回 (message, details)：message 指明哪条边越界、
+    超出多少与切片 level-0 尺寸，details 供 plugin v1 错误信封附带结构化字段。
+    越界一律 400 拒绝、绝不静默裁剪（静默裁剪会改变病理证据位置和范围）。
+
+    切片尺寸读不到（文件损坏/测试桩）时不做包含校验，与 _rect_size_mm 读不
+    到 mpp 返回 0 的降级语义一致；有限性/范围校验不依赖切片尺寸，恒定执行。
+    """
+    # 1) 有限性与范围（不依赖切片尺寸）
+    for name, v in (("x", x), ("y", y), ("side_px", side_px)):
+        if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                or not math.isfinite(v):
+            return ("x/y/side_px 需为有限数值（%s=%r 非法）" % (name, v),
+                    {"field": name, "value": v})
+    if x < 0 or y < 0:
+        return ("坐标需 ≥0（x=%s, y=%s）" % (_fmt_level0(x), _fmt_level0(y)),
+                {"x": x, "y": y})
+    if side_px < 1 or side_px > _ANNOTATION_MAX_SIDE_PX:
+        return ("side_px 需在 1~%d 之间（当前 %s）"
+                % (_ANNOTATION_MAX_SIDE_PX, _fmt_level0(side_px)),
+                {"side_px": side_px})
+    # 2) 切片右/下边界包含校验（§6.1）
+    slide_w, slide_h = _annotation_slide_bounds(safe)
+    if slide_w is None:
+        return None  # 尺寸不可读 → 不做包含校验（见 docstring 降级语义）
+    right, bottom = x + side_px, y + side_px
+    edges = []
+    overshoot = {}
+    if right > slide_w:
+        edges.append("right")
+        overshoot["right"] = right - slide_w
+    if bottom > slide_h:
+        edges.append("bottom")
+        overshoot["bottom"] = bottom - slide_h
+    if not edges:
+        return None
+    parts = []
+    if "right" in edges:
+        parts.append("右边界越界：x + side_px = %s > 切片宽 %s（超出 %s 像素）"
+                     % (_fmt_level0(right), _fmt_level0(slide_w),
+                        _fmt_level0(overshoot["right"])))
+    if "bottom" in edges:
+        parts.append("下边界越界：y + side_px = %s > 切片高 %s（超出 %s 像素）"
+                     % (_fmt_level0(bottom), _fmt_level0(slide_h),
+                        _fmt_level0(overshoot["bottom"])))
+    msg = ("标注矩形越出切片边界，已拒绝（不自动裁剪）：%s。切片 level-0 尺寸 "
+           "%s×%s，提交 x=%s, y=%s, side_px=%s；请修正坐标后重试。"
+           % ("；".join(parts), _fmt_level0(slide_w), _fmt_level0(slide_h),
+              _fmt_level0(x), _fmt_level0(y), _fmt_level0(side_px)))
+    details = {
+        "edges": edges,
+        "overshoot_px": overshoot,
+        "submitted": {"x": x, "y": y, "side_px": side_px},
+        "slide_level0": {"width": slide_w, "height": slide_h},
+    }
+    return msg, details
+
+
+# --------------------------------------------------------------------------- #
 # 插件 UI 资源
 # --------------------------------------------------------------------------- #
 # 插件前端资源（仅服务静态 .js/.css/.html——.html 供示例插件独立页/manifest ui.entry
@@ -7468,14 +7568,14 @@ def internal_ai_annotate():
         v = body.get(key)
         try:
             return float(v)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
 
     def _parse_int(key):
         v = body.get(key)
         try:
             return int(v)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
 
     x = _parse_num("x")
@@ -7483,15 +7583,16 @@ def internal_ai_annotate():
     side_px = _parse_int("side_px")
     if x is None or y is None or side_px is None:
         return jsonify(error="x/y/side_px 参数需为数值"), 400
-    if x < 0 or y < 0:
-        return jsonify(error="坐标需 ≥0"), 400
-    if side_px < 1 or side_px > 40000:
-        return jsonify(error="side_px 需在 1~40000 之间"), 400
+    # slide 文件名合法性（_safe_name 失败会 abort 400/404）
+    safe = _safe_name(slide)
+    # 切片几何统一校验（§6.1，批次 C：矩形右/下边界不得越出切片 level-0
+    # 边界；与 plugin v1 annotate 共用同一套规则，越界 400 不静默裁剪）。
+    reject = _validate_annotation_rect(safe, x, y, side_px)
+    if reject is not None:
+        return jsonify(error=reject[0]), 400
     note = body.get("note") or ""
     effect_key = body.get("effect_key") or ""
     session_id = body.get("session_id") or ""
-    # slide 文件名合法性（_safe_name 失败会 abort 400/404）
-    safe = _safe_name(slide)
 
     # Stage 3c-2：slide_asset_revision 冲突校验（仅显式带 expected_asset_revision 时）
     expected_asset_revision = body.get("expected_asset_revision")
@@ -8027,14 +8128,14 @@ def plugin_v1_annotate(slide):
         v = body.get(key)
         try:
             return float(v)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
 
     def _parse_int(key):
         v = body.get(key)
         try:
             return int(v)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
 
     x = _parse_num("x")
@@ -8042,10 +8143,11 @@ def plugin_v1_annotate(slide):
     side_px = _parse_int("side_px")
     if x is None or y is None or side_px is None:
         return _plugin_error(400, "invalid_request", "x/y/side_px 参数需为数值")
-    if x < 0 or y < 0:
-        return _plugin_error(400, "invalid_request", "坐标需 ≥0")
-    if side_px < 1 or side_px > 40000:
-        return _plugin_error(400, "invalid_request", "side_px 需在 1~40000 之间")
+    # 切片几何统一校验（§6.1，批次 C：矩形右/下边界不得越出切片 level-0
+    # 边界；与 /internal/ai/annotate 共用同一套规则，越界 400 不静默裁剪）。
+    reject = _validate_annotation_rect(safe, x, y, side_px)
+    if reject is not None:
+        return _plugin_error(400, "invalid_request", reject[0], details=reject[1])
     note = body.get("note") or ""
     effect_key = body.get("effect_key") or body.get("idempotency_key") or ""
     # session_id 已在 verify 前解析：grant 绑定校验（expect_session）通过后，

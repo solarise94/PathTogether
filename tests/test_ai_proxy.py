@@ -15,7 +15,9 @@
 运行：cd 项目根 && python3 tests/test_ai_proxy.py
 """
 import json
+import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -756,6 +758,152 @@ def test_demo_path_never_injects_extra_tools():
         _ss.set_installation_capabilities(installation["installation_id"], [])
 
 
+# ============================================================================ #
+# PR1：DeepSeek 官方 provider 配置注入（docs/deepseek-files-api-research.md §4）
+# ============================================================================ #
+HP_UID_RE = re.compile(r"^hp_[0-9a-f]{32}$")
+
+
+def setup_official_ai_config(plain_key="sk-official-proxy-1234567890"):
+    """落一份合法官方配置（canonical base URL / vision-exp / openai / files）。"""
+    app_mod._save_ai_config({
+        "provider_kind": "deepseek_official",
+        "base_url": "https://api.deepseek.com",
+        "api_key": plain_key,
+        "model": "deepseek-v4-flash-vision-exp",
+        "api_protocol": "openai",
+        "prompt_cache_mode": "auto",
+        "image_transport": "deepseek_files",
+        "files_rollout_percent": 100,
+        "files_ttl_seconds": 86400,
+        "keep_recent_images": 7,
+    })
+    return plain_key
+
+
+class _LogCapture(logging.Handler):
+    """捕获 app.logger 全部已格式化消息（验证伪名 user_id 不写日志）。"""
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.messages = []
+
+    def emit(self, record):
+        try:
+            self.messages.append(record.getMessage())
+        except Exception:
+            pass
+
+
+def test_official_run_injects_provider_fields_and_pseudonym():
+    """官方 run：config 注入 provider 字段 + hp_ 伪名 user_id，且不写日志。"""
+    print("== 官方 run：provider 字段 + 伪名 user_id 注入，日志零泄露 ==")
+    fake = install_fake_requests()
+    client = make_client()
+    plain = setup_official_ai_config()
+    captured = {}
+
+    def handler(body, query, headers, kwargs):
+        captured["config"] = body.get("config") or {}
+        return FakeResponse(200, sse_frames=[], headers={"X-AI-Session-ID": "sess-off-1"})
+
+    fake.register("POST", "/run", handler)
+    cap = _LogCapture()
+    app_mod.app.logger.addHandler(cap)
+    old_level = app_mod.app.logger.level
+    app_mod.app.logger.setLevel(logging.DEBUG)
+    try:
+        resp = client.post("/api/ai/run", json={"slide": "s.svs", "task": "看全片"})
+    finally:
+        app_mod.app.logger.removeHandler(cap)
+        app_mod.app.logger.setLevel(old_level)
+    check("run 200", resp.status_code == 200, "got %d" % resp.status_code)
+    cfg = captured.get("config") or {}
+    check("config.provider_kind=deepseek_official",
+          cfg.get("provider_kind") == "deepseek_official",
+          "got %r" % cfg.get("provider_kind"))
+    check("config.image_transport=deepseek_files",
+          cfg.get("image_transport") == "deepseek_files",
+          "got %r" % cfg.get("image_transport"))
+    check("config.files_ttl_seconds 注入（24 小时保留）",
+          cfg.get("files_ttl_seconds") == 86400,
+          "got %r" % cfg.get("files_ttl_seconds"))
+    check("config.files_rollout_percent 注入", cfg.get("files_rollout_percent") == 100,
+          "got %r" % cfg.get("files_rollout_percent"))
+    check("config.prompt_cache_mode=auto 注入",
+          cfg.get("prompt_cache_mode") == "auto",
+          "got %r" % cfg.get("prompt_cache_mode"))
+    check("官方 config.api_key 明文（解密后交 sidecar）",
+          cfg.get("api_key") == plain, "got %r" % cfg.get("api_key"))
+    uid = cfg.get("user_id")
+    check("伪名 user_id 形如 hp_<32hex>", isinstance(uid, str) and bool(HP_UID_RE.match(uid)),
+          "got %r" % uid)
+    assert isinstance(uid, str) and HP_UID_RE.match(uid)
+    # §4.2：伪名 user_id 不写日志（任何已格式化日志消息均不得含该值）
+    leaked = [m for m in cap.messages if uid in m]
+    check("伪名 user_id 不出现在日志", not leaked, "leaked=%r" % leaked[:3])
+    assert not leaked
+    # GET 配置回显同样不含伪名 user_id 与 api_key 明文
+    j = client.get("/api/ai/config").get_json()
+    check("GET 回显 provider_kind", j.get("provider_kind") == "deepseek_official",
+          "got %r" % j.get("provider_kind"))
+    check("GET 不回显伪名 user_id", "user_id" not in j, "keys=%r" % sorted(j))
+    check("GET 不回显 api_key 明文", plain not in json.dumps(j))
+
+
+def test_pseudonym_scope_isolation_registered_vs_demo():
+    """注册 scope=user_id、Demo scope=demo:capability_id，互不相同且稳定。"""
+    print("== 伪名 scope：注册 vs 匿名 Demo（每浏览器隔离）==")
+    setup_official_ai_config()
+    uid_owner = app_mod._build_sidecar_config()["user_id"]
+    uid_reg = app_mod._build_sidecar_config({"role": "user", "user_id": "u-100"})["user_id"]
+    uid_reg_again = app_mod._build_sidecar_config({"role": "user", "user_id": "u-100"})["user_id"]
+    uid_demo_a = app_mod._build_sidecar_config(
+        None, demo_capability_id="dcp_aabbccdd11223344")["user_id"]
+    uid_demo_b = app_mod._build_sidecar_config(
+        None, demo_capability_id="dcp_11223344aabbccdd")["user_id"]
+    for name, v in (("owner", uid_owner), ("reg", uid_reg),
+                    ("demo_a", uid_demo_a), ("demo_b", uid_demo_b)):
+        check("%s user_id 形如 hp_<32hex>" % name, bool(HP_UID_RE.match(v)),
+              "got %r" % v)
+    check("注册同 user_id 稳定一致", uid_reg == uid_reg_again,
+          "got %r vs %r" % (uid_reg, uid_reg_again))
+    check("注册 vs owner 不同", uid_reg != uid_owner)
+    check("注册 vs 匿名 Demo 不同", uid_reg != uid_demo_a)
+    check("不同浏览器（capability_id）Demo 伪名不同", uid_demo_a != uid_demo_b)
+    check("伪名不含 scope 源串", "u-100" not in uid_reg and "dcp_aabb" not in uid_demo_a)
+    assert uid_reg != uid_demo_a and uid_demo_a != uid_demo_b
+
+
+def test_generic_config_injection_unchanged():
+    """generic（存量 CPA）配置：provider_kind=generic、无伪名，代理行为不变。"""
+    print("== generic 配置注入不回归 ==")
+    fake = install_fake_requests()
+    client = make_client()
+    setup_ai_config()  # base_url=http://llm.example/v1（存量 generic 形态）
+    captured = {}
+    fake.register("POST", "/run",
+                  lambda b, q, h, k: (captured.__setitem__("config", b.get("config") or {}),
+                                      FakeResponse(200, sse_frames=[]))[1])
+    resp = client.post("/api/ai/run", json={"slide": "s.svs"})
+    check("run 200", resp.status_code == 200, "got %d" % resp.status_code)
+    cfg = captured.get("config") or {}
+    check("推断 provider_kind=generic", cfg.get("provider_kind") == "generic",
+          "got %r" % cfg.get("provider_kind"))
+    check("默认 image_transport=inline", cfg.get("image_transport") == "inline",
+          "got %r" % cfg.get("image_transport"))
+    check("默认 files_rollout_percent=0", cfg.get("files_rollout_percent") == 0,
+          "got %r" % cfg.get("files_rollout_percent"))
+    check("默认 files_ttl_seconds=86400", cfg.get("files_ttl_seconds") == 86400,
+          "got %r" % cfg.get("files_ttl_seconds"))
+    check("generic 不注入伪名 user_id", "user_id" not in cfg,
+          "keys=%r" % sorted(cfg))
+    check("base_url 原样透传", cfg.get("base_url") == "http://llm.example/v1",
+          "got %r" % cfg.get("base_url"))
+    check("api_key 明文注入不变", bool(cfg.get("api_key")),
+          "got %r" % cfg.get("api_key"))
+
+
 if __name__ == "__main__":
     test_run_proxies_with_decrypted_config_and_sse()
     test_continue_and_ask_proxy()
@@ -775,5 +923,8 @@ if __name__ == "__main__":
     test_official_run_injects_extra_tools_and_tool_token()
     test_official_run_without_capabilities_has_no_extra_tools()
     test_demo_path_never_injects_extra_tools()
+    test_official_run_injects_provider_fields_and_pseudonym()
+    test_pseudonym_scope_isolation_registered_vs_demo()
+    test_generic_config_injection_unchanged()
     print("\nPASS=%d FAIL=%d" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

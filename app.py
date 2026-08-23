@@ -2240,7 +2240,9 @@ def api_demo_ai_run():
 
     # 5) /run body：平台凭据 + 周期 demo_task_max_steps；不发 run_grant（只读
     #    tool profile 无平台写工具，docs §5.4-5）；session_owner 用不可反推 subject。
-    config = _build_sidecar_config(None)
+    #    demo_capability_id 供官方模式伪名 user_id 隔离：匿名 Demo scope =
+    #    "demo:" + capability_id（dcp_* 每浏览器伪名，§4.2，绝不共用匿名 scope）。
+    config = _build_sidecar_config(None, demo_capability_id=cap["id"])
     if config is None:
         _rollback_all("platform_credentials_missing")
         return (jsonify(error="平台 AI 未配置，Demo AI 暂不可用（切片仍可浏览）",
@@ -4393,16 +4395,21 @@ def _load_or_create_ai_secret() -> "Optional[object]":
 
 
 def _encrypt_api_key(plain: str):
-    """加密明文 api_key 为 'enc:' 前缀的密文；Fernet 不可用时退化为明文。"""
+    """加密明文 api_key 为 'enc:' 前缀的密文；Fernet 不可用时退化为明文。
+
+    该降级只对 generic provider 保留（旧行为）；官方模式（deepseek_official）
+    的保存门禁在 _validate_provider_contract 中直接拒绝——Fernet 不可用时
+    不允许保存新 API key（见 docs/deepseek-files-api-research.md §2/§4.1）。
+    """
     if not plain:
         return ""
     f = _load_or_create_ai_secret()
     if f is None:
-        return plain  # 降级明文（cryptography 缺失）
+        return plain  # 降级明文（cryptography 缺失；官方模式已被门禁拦截）
     try:
         return _FERNET_PREFIX + f.encrypt(plain.encode("utf-8")).decode("ascii")
     except Exception:
-        return plain  # 加密失败不阻断保存
+        return plain  # 加密失败不阻断保存（官方模式已被门禁拦截）
 
 
 def _decrypt_api_key(stored):
@@ -4427,6 +4434,31 @@ def _mask_api_key(key: str) -> str:
     if len(key) <= 8:
         return "*" * len(key)
     return key[:4] + "****" + key[-4:]
+
+
+def _ai_secret_file_perms_ok() -> bool:
+    """官方模式安全门禁：ai_secret.key / ai_config.json 权限必须 0600。
+
+    已存在的文件先尝试修正（chmod 0600）再复核；不存在则跳过（ai_config.json
+    由 _save_ai_config_raw 原子写、tmp 先 chmod 0600 后 replace，天然 0600；
+    ai_secret.key 在门禁前的 _load_or_create_ai_secret() 已按 0600 创建）。
+    修正失败或复核仍非 0600 → False（调用方拒绝保存）。
+    """
+    for p in (_ai_secret_path(), _ai_config_path()):
+        try:
+            if not p.is_file():
+                continue
+            mode = stat.S_IMODE(p.stat().st_mode)
+            if mode != 0o600:
+                os.chmod(p, 0o600)
+                mode = stat.S_IMODE(p.stat().st_mode)
+            if mode != 0o600:
+                app.logger.warning("官方模式门禁：%s 权限非 0600 且修正失败", p.name)
+                return False
+        except OSError:
+            app.logger.warning("官方模式门禁：%s 权限检查/修正异常", p.name)
+            return False
+    return True
 
 
 # =========================================================================== #
@@ -6136,13 +6168,211 @@ def _assert_user_base_url(url):
             raise ValueError("base_url 不得指向内网、回环或云元数据地址")
 
 
-def _build_sidecar_config(user_ctx=None) -> dict:
+# --------------------------------------------------------------------------- #
+# DeepSeek 官方直连 provider 配置（docs/deepseek-files-api-research.md §4.1）
+#
+# provider_kind / image_transport / files_rollout_percent / files_ttl_seconds
+# 是 provider 级字段（与 base_url/model/api_protocol 同层，不在 DEFAULT_CONFIG
+# 调优集）。计费语义：Files API 的文件**存储/上传免费**，模型推理（含图片）
+# **仍按 token 计费**（每张图片缩放后最多 384 token）——两者不得混同。
+# files_ttl_seconds 是上传文件的保留期（官方允许 3600–2592000 秒），默认
+# 86400 = 24 小时；产品永不省略 TTL（省略 = 永久保存，违反数据治理）。
+# 不新增 files_upload_url / files_api_key：Files 端点由 provider kind 推导
+# （https://api.deepseek.com/files），上传与聊天复用同一把 config.api_key。
+# --------------------------------------------------------------------------- #
+AI_PROVIDER_GENERIC = "generic"
+AI_PROVIDER_DEEPSEEK_OFFICIAL = "deepseek_official"
+_AI_PROVIDER_KINDS = (AI_PROVIDER_GENERIC, AI_PROVIDER_DEEPSEEK_OFFICIAL)
+# 官方模式 canonical 值（§4.1 原子校验的唯一合法取值；base URL 不带 /v1）
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_VISION_MODEL = "deepseek-v4-flash-vision-exp"
+# image_transport：inline（图片 base64 内联，首次部署默认）/ deepseek_files
+# （Files API 引用 file_id；仅官方 OpenAI 协议 + vision-exp 模型允许）
+AI_IMAGE_TRANSPORT_INLINE = "inline"
+AI_IMAGE_TRANSPORT_DEEPSEEK_FILES = "deepseek_files"
+_AI_IMAGE_TRANSPORTS = (AI_IMAGE_TRANSPORT_INLINE, AI_IMAGE_TRANSPORT_DEEPSEEK_FILES)
+# Files 保留期（官方契约 3600–2592000 秒；默认 24 小时）
+FILES_TTL_MIN_SECONDS = 3600
+FILES_TTL_MAX_SECONDS = 2592000
+DEFAULT_FILES_TTL_SECONDS = 86400
+# Files 灰度：0–100 整数；按 session id 稳定分桶在 HistoPilot 侧实现，
+# PT 只做范围校验与透传（§4.1）。
+FILES_ROLLOUT_MIN_PERCENT = 0
+FILES_ROLLOUT_MAX_PERCENT = 100
+DEFAULT_FILES_ROLLOUT_PERCENT = 0
+
+
+def _effective_provider_kind(cfg) -> str:
+    """provider_kind 有效值：显式字段 > 存量配置推断 > 默认官方（迁移后）。
+
+    存量 ai_config.json 未写 provider_kind 且 base_url 指向非官方地址
+    （CPA 等 generic 部署）时推断为 generic——避免升级把既有 generic 部署
+    强行套上官方契约（现有配置行为不回归）。字段缺省且未配置/已指向官方
+    地址时取新默认 deepseek_official。
+    """
+    if isinstance(cfg, dict):
+        v = cfg.get("provider_kind")
+        if v in _AI_PROVIDER_KINDS:
+            return v
+        base = str(cfg.get("base_url") or "").strip().rstrip("/")
+        if base and base != DEEPSEEK_BASE_URL:
+            return AI_PROVIDER_GENERIC
+    return AI_PROVIDER_DEEPSEEK_OFFICIAL
+
+
+def _effective_image_transport(cfg) -> str:
+    """image_transport 有效值：显式 inline/deepseek_files，缺省 inline（§4.1）。"""
+    v = (cfg or {}).get("image_transport")
+    if v in _AI_IMAGE_TRANSPORTS:
+        return v
+    return AI_IMAGE_TRANSPORT_INLINE
+
+
+def _effective_files_ttl_seconds(cfg) -> int:
+    """files_ttl_seconds 有效值：缺省/非法回默认 24 小时（落盘值已由 PUT 校验）。"""
+    try:
+        return int((cfg or {}).get("files_ttl_seconds"))
+    except (TypeError, ValueError):
+        return DEFAULT_FILES_TTL_SECONDS
+
+
+def _effective_files_rollout_percent(cfg) -> int:
+    """files_rollout_percent 有效值：缺省/非法回默认 0（落盘值已由 PUT 校验）。"""
+    try:
+        return int((cfg or {}).get("files_rollout_percent"))
+    except (TypeError, ValueError):
+        return DEFAULT_FILES_ROLLOUT_PERCENT
+
+
+# ---- DeepSeek 官方 user_id 伪名（§4.2）----
+# 官方 user_id 参与内容安全 / KV cache / 调度隔离。PT 用持久化 app.secret_key
+# 计算 HMAC-SHA256(app.secret_key, "deepseek-user-v1:" + internal_scope) 取前
+# 32 个 hex 字符，形如 hp_<32hex>（满足官方 [a-zA-Z0-9\-_]{1,512} 约束）。
+# internal_scope 只用平台内部标识：注册用户 = 内部 user_id；匿名 Demo =
+# "demo:" + capability_id（dcp_* 每浏览器伪名，绝不共用匿名 scope）。不使用
+# 邮箱/用户名/病例号；该值只随 loopback run config 交给 HistoPilot，不进
+# UI、不写日志。app.secret_key 轮换 = 新隔离域（预期行为）。
+_DEEPSEEK_USER_HMAC_PREFIX = "deepseek-user-v1:"
+_DEEPSEEK_USER_PSEUDONYM_PREFIX = "hp_"
+
+
+def _deepseek_user_pseudonym(internal_scope: str) -> str:
+    """internal_scope → DeepSeek 官方 user_id 伪名（hp_ + HMAC 前 32 hex）。"""
+    digest = hmac.new(
+        (app.secret_key or "").encode("utf-8"),
+        (_DEEPSEEK_USER_HMAC_PREFIX + str(internal_scope or "")).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return _DEEPSEEK_USER_PSEUDONYM_PREFIX + digest[:32]
+
+
+def _deepseek_user_scope(user_ctx=None, demo_capability_id=None) -> str:
+    """官方 user_id 的 internal_scope（§4.2）。
+
+    注册用户 = 平台内部 user_id；匿名 Demo = "demo:" + capability_id
+    （dcp_* 每浏览器伪名）；无 user_id 的 owner（AUTH_ENABLED=False 归一）
+    用稳定常量 "owner"（非 PII）。
+    """
+    if demo_capability_id:
+        return "demo:" + str(demo_capability_id)
+    uid = (user_ctx or {}).get("user_id")
+    if uid:
+        return str(uid)
+    return "owner"
+
+
+def _official_contract_applies(merged: dict) -> bool:
+    """官方原子契约是否适用于本落盘候选（§4.1）。
+
+    显式 provider_kind=deepseek_official，或字段缺省且已配置 canonical 官方
+    base_url（推断为官方）时适用；两者皆无（全新未配置实例）不套契约——
+    缺省 provider_kind 只影响回显/注入默认值，不拦截调优字段的日常保存。
+    """
+    v = merged.get("provider_kind")
+    if v is not None:
+        return v == AI_PROVIDER_DEEPSEEK_OFFICIAL
+    return str(merged.get("base_url") or "").strip().rstrip("/") == DEEPSEEK_BASE_URL
+
+
+def _validate_provider_contract(cfg, pending, key_action):
+    """provider 组合契约原子校验（PUT /api/ai/config；§4.1）。
+
+    对「落盘后的完整候选」（既有 cfg + 本批 pending + api_key 动作）整体
+    判定，任一失败返回中文错误文案（端点回 400，不产生部分写入）：
+      - image_transport=deepseek_files：仅官方 provider + OpenAI 协议 +
+        vision-exp 模型；
+      - provider_kind=deepseek_official（显式或 canonical 推断）：base_url/
+        api_protocol/model 必须为 canonical 官方值，api_key 非空，
+        prompt_cache_mode=auto，files_rollout_percent 为 0–100 整数，且
+        Fernet 加密组件可用 + ai_secret.key/ai_config.json 权限 0600
+        （官方模式拒绝明文降级保存 API key）。
+    """
+    merged = dict(cfg)
+    merged.update(pending)
+    if key_action is not None:
+        if key_action[0] == "clear":
+            merged.pop("api_key", None)
+        else:  # ("set", plain)
+            merged["api_key"] = key_action[1]
+    kind = _effective_provider_kind(merged)
+    transport = _effective_image_transport(merged)
+    base = str(merged.get("base_url") or "").strip()
+    proto = str(merged.get("api_protocol") or "openai").strip().lower()
+    model = str(merged.get("model") or "").strip()
+    if transport == AI_IMAGE_TRANSPORT_DEEPSEEK_FILES:
+        if kind != AI_PROVIDER_DEEPSEEK_OFFICIAL:
+            return ("image_transport=deepseek_files 仅支持 "
+                    "provider_kind=deepseek_official")
+        if proto != "openai":
+            return ("image_transport=deepseek_files 仅支持 OpenAI 协议"
+                    "（api_protocol=openai）")
+        if model != DEEPSEEK_VISION_MODEL:
+            return ("image_transport=deepseek_files 仅支持模型 {}"
+                    .format(DEEPSEEK_VISION_MODEL))
+    if kind == AI_PROVIDER_DEEPSEEK_OFFICIAL and _official_contract_applies(merged):
+        if base.rstrip("/") != DEEPSEEK_BASE_URL:
+            return ("provider_kind=deepseek_official 时 base_url 必须为 {}"
+                    .format(DEEPSEEK_BASE_URL))
+        if proto != "openai":
+            return "provider_kind=deepseek_official 时 api_protocol 必须为 openai"
+        if model != DEEPSEEK_VISION_MODEL:
+            return ("provider_kind=deepseek_official 时 model 必须为 {}"
+                    .format(DEEPSEEK_VISION_MODEL))
+        if not str(merged.get("api_key") or "").strip():
+            return ("provider_kind=deepseek_official 需要非空 api_key"
+                    "（随本批提交或已加密保存）")
+        cache_mode = merged.get("prompt_cache_mode")
+        if cache_mode is None:
+            cache_mode = DEFAULT_CONFIG["prompt_cache_mode"]
+        if cache_mode != "auto":
+            return "provider_kind=deepseek_official 时 prompt_cache_mode 必须为 auto"
+        rollout = merged.get("files_rollout_percent")
+        if rollout is None:
+            rollout = DEFAULT_FILES_ROLLOUT_PERCENT
+        if not isinstance(rollout, int) or isinstance(rollout, bool):
+            return "files_rollout_percent 需为 0–100 的整数"
+        if not (FILES_ROLLOUT_MIN_PERCENT <= rollout <= FILES_ROLLOUT_MAX_PERCENT):
+            return "files_rollout_percent 需为 0–100 的整数"
+        # 安全门禁：官方模式 Fernet 不可用 → 拒绝保存（不再降级明文落盘）；
+        # ai_secret.key / ai_config.json 必须 0600（先尝试修正，失败拒绝）。
+        if not _HAS_FERNET or _load_or_create_ai_secret() is None:
+            return ("官方模式安全门禁：cryptography/Fernet 不可用，"
+                    "拒绝保存 API key（不降级明文）")
+        if not _ai_secret_file_perms_ok():
+            return ("官方模式安全门禁：ai_secret.key / ai_config.json "
+                    "权限必须为 0600（自动修正失败，已拒绝保存）")
+    return None
+
+
+def _build_sidecar_config(user_ctx=None, demo_capability_id=None) -> dict:
     """组装 sidecar 请求所需的 config 字段（base_url/api_key 明文 + 全部调优字段）。
 
     user_ctx 为 current_identity() 结果（{"role","user_id"}）或 None：
       - owner（含 AUTH_ENABLED=False 的归一 owner）→ 平台配置；
       - user → 平台统一提供：平台已配置走平台，未配置返回 None（调用端点回
         400 提示联系管理员；旧版 user 自带凭据通道已下线，存量数据不再读取）。
+    demo_capability_id 仅 demo 路径（/api/demo/ai/run）传入：匿名 Demo 的
+    DeepSeek user_id 隔离 scope = "demo:" + capability_id（§4.2）。
     tuning 调优字段始终来自平台 ai_config.json（user 无独立调优）。
     max_steps 注入规则（docs §9.2 / §12.3）：
       - owner：平台 ai_config.json 值（现状不变，owner 自担）；
@@ -6169,6 +6399,17 @@ def _build_sidecar_config(user_ctx=None) -> dict:
         out["max_steps"] = _platform_task_max_steps()
     # 运行时再守一次：即使加载迁移未持久化，注入 sidecar 的值也不能 <128。
     _apply_legacy_reserve_migration(out)
+    # ---- DeepSeek 官方 provider 字段注入（PR1 §4.1/§4.2）----
+    out["provider_kind"] = _effective_provider_kind(cred_cfg)
+    out["image_transport"] = _effective_image_transport(cred_cfg)
+    out["files_ttl_seconds"] = _effective_files_ttl_seconds(cred_cfg)
+    out["files_rollout_percent"] = _effective_files_rollout_percent(cred_cfg)
+    # prompt_cache_mode 已随 DEFAULT_CONFIG 调优字段注入（默认 auto）。
+    # 伪名 user_id 只在官方模式注入（数据最小化：generic 端点不需要 DeepSeek
+    # 隔离域），形如 hp_<32hex>；不进 UI、不写日志（§4.2）。
+    if out["provider_kind"] == AI_PROVIDER_DEEPSEEK_OFFICIAL:
+        out["user_id"] = _deepseek_user_pseudonym(
+            _deepseek_user_scope(user_ctx, demo_capability_id))
     # source 恒为 "platform"（user 自带凭据通道已下线）；owner 平台 URL 不受
     # SSRF 限制（demo 常用 http://127.0.0.1:8317/v1），故不再注入 ssrf_guard。
     return out
@@ -6648,6 +6889,12 @@ def api_ai_config():
                 "model": platform_cfg.get("model") or "",
                 "max_tokens": platform_cfg.get("max_tokens") or DEFAULT_MAX_TOKENS,
                 "api_protocol": platform_cfg.get("api_protocol") or "openai",
+                # provider 状态字段（PR1 §4.1）：只回显配置状态；
+                # 绝不回显 api_key 明文，也绝不回显伪名 user_id。
+                "provider_kind": _effective_provider_kind(platform_cfg),
+                "image_transport": _effective_image_transport(platform_cfg),
+                "files_rollout_percent": _effective_files_rollout_percent(platform_cfg),
+                "files_ttl_seconds": _effective_files_ttl_seconds(platform_cfg),
                 "platform_configured": platform_configured,
                 "using": "platform",
             }
@@ -6680,6 +6927,49 @@ def api_ai_config():
         if proto not in ("openai", "anthropic", "gemini"):
             return jsonify(error="api_protocol 仅支持 openai、anthropic 或 gemini"), 400
         pending["api_protocol"] = proto
+    # provider_kind：generic | deepseek_official（None=清除，回退推断/默认官方）
+    if "provider_kind" in body:
+        pk = body.get("provider_kind")
+        if pk is None:
+            pending["provider_kind"] = None
+        elif isinstance(pk, str) and pk in _AI_PROVIDER_KINDS:
+            pending["provider_kind"] = pk
+        else:
+            return jsonify(error="provider_kind 仅支持 generic 或 deepseek_official"), 400
+    # image_transport：inline | deepseek_files（None=清除，回退默认 inline）
+    if "image_transport" in body:
+        it = body.get("image_transport")
+        if it is None:
+            pending["image_transport"] = None
+        elif isinstance(it, str) and it in _AI_IMAGE_TRANSPORTS:
+            pending["image_transport"] = it
+        else:
+            return jsonify(error="image_transport 仅支持 inline 或 deepseek_files"), 400
+    # files_rollout_percent：0–100 整数（None=清除，回退默认 0）
+    if "files_rollout_percent" in body:
+        raw = body.get("files_rollout_percent")
+        if raw is None:
+            pending["files_rollout_percent"] = None
+        else:
+            iv, err = _coerce_tuning_int(raw, "files_rollout_percent")
+            if err:
+                return jsonify(error=err), 400
+            if not (FILES_ROLLOUT_MIN_PERCENT <= iv <= FILES_ROLLOUT_MAX_PERCENT):
+                return jsonify(error="files_rollout_percent 需为 0–100 的整数"), 400
+            pending["files_rollout_percent"] = iv
+    # files_ttl_seconds：3600–2592000 整数（None=清除，回退默认 86400=24h）
+    if "files_ttl_seconds" in body:
+        raw = body.get("files_ttl_seconds")
+        if raw is None:
+            pending["files_ttl_seconds"] = None
+        else:
+            iv, err = _coerce_tuning_int(raw, "files_ttl_seconds")
+            if err:
+                return jsonify(error=err), 400
+            if not (FILES_TTL_MIN_SECONDS <= iv <= FILES_TTL_MAX_SECONDS):
+                return jsonify(
+                    error="files_ttl_seconds 需为 3600–2592000 的整数（秒）"), 400
+            pending["files_ttl_seconds"] = iv
     # 会话调优参数 + max_tokens：权威校验（正整数 / 非负整数 / 字段关系）
     # max_tokens 与 DEFAULT_CONFIG 调优字段共用同一套校验（均为数值字段）。
     tuning, err = _validate_ai_tuning(body, cfg)
@@ -6710,6 +7000,11 @@ def api_ai_config():
                 key_action = None  # 与掩码同值，不变
             else:
                 key_action = ("set", new_key)
+    # ---- provider 组合契约原子校验（PR1 §4.1）：对落盘候选整体判定，
+    # 任一失败 → 400，不产生部分写入（官方模式含 Fernet/0600 安全门禁）----
+    contract_err = _validate_provider_contract(cfg, pending, key_action)
+    if contract_err:
+        return jsonify(error=contract_err), 400
     # ---- 第二阶段：落盘（全部校验通过，原子写入 cfg）----
     cfg.update(pending)
     if key_action is not None:
@@ -6727,6 +7022,11 @@ def api_ai_config():
         "model": cfg.get("model") or "",
         "max_tokens": cfg.get("max_tokens") or DEFAULT_MAX_TOKENS,
         "api_protocol": cfg.get("api_protocol") or "openai",
+        # provider 状态字段（PR1 §4.1）：不回显 api_key 明文与伪名 user_id。
+        "provider_kind": _effective_provider_kind(cfg),
+        "image_transport": _effective_image_transport(cfg),
+        "files_rollout_percent": _effective_files_rollout_percent(cfg),
+        "files_ttl_seconds": _effective_files_ttl_seconds(cfg),
         "platform_configured": _platform_configured(cfg),
         "using": "platform",
     }
@@ -6777,6 +7077,11 @@ def _ai_user_config_get(user_ctx):
         "api_key_set": bool(own_key),
         "api_key_mask": _mask_api_key(own_key),
         "model": own.get("model") or "",
+        # provider 状态字段（只读，PR1 §4.1）：不含 api_key 明文与伪名 user_id。
+        "provider_kind": _effective_provider_kind(platform_cfg),
+        "image_transport": _effective_image_transport(platform_cfg),
+        "files_rollout_percent": _effective_files_rollout_percent(platform_cfg),
+        "files_ttl_seconds": _effective_files_ttl_seconds(platform_cfg),
         "platform_configured": platform_configured,
         "using": source,
     }

@@ -16,6 +16,7 @@
 """
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -807,5 +808,450 @@ def test_deprecated_mapping_still_runs_when_relationship_uses_legacy_window():
     check("visual_working_set_max 映射落盘 = 3",
           j and (j or {}).get("visual_working_set_max") == 3,
           "got %r" % (j or {}).get("visual_working_set_max"))
+
+
+# ============================================================================ #
+# PR1：DeepSeek 官方 provider 配置字段与安全门禁
+# （docs/deepseek-files-api-research.md §4.1 配置契约 / §4.2 user_id 隔离）
+# ============================================================================ #
+# 官方模式 canonical 负载模板（api_key 随批提交）
+OFFICIAL_PAYLOAD = {
+    "provider_kind": "deepseek_official",
+    "base_url": "https://api.deepseek.com",
+    "api_protocol": "openai",
+    "model": "deepseek-v4-flash-vision-exp",
+    "api_key": "sk-official-test-1234567890",
+    "prompt_cache_mode": "auto",
+}
+HP_UID_RE = re.compile(r"^hp_[0-9a-f]{32}$")
+
+
+def seed_official_config(**extra):
+    """直接落一份合法官方配置（绕过端点），供回显/注入/门禁回归用。"""
+    cfg = dict(OFFICIAL_PAYLOAD)
+    cfg.pop("api_key", None)
+    cfg["api_key"] = extra.pop("api_key", "sk-official-seed-1234567890")
+    cfg.update(extra)
+    app_mod._save_ai_config(cfg)
+
+
+def test_provider_kind_enum_validation():
+    """provider_kind：generic/deepseek_official 合法；其余 400；None 清除。"""
+    print("== provider_kind 枚举校验 ==")
+    reset_config()
+    code, j = put({"provider_kind": "generic"})
+    check("provider_kind=generic（空配置）→ 200", code == 200, "got %s %r" % (code, j))
+    check("回显 provider_kind=generic", j.get("provider_kind") == "generic",
+          "got %r" % j.get("provider_kind"))
+    for bad in ("bogus", "DEEPSEEK_OFFICIAL", 123, True):
+        reset_config()
+        code, j = put({"provider_kind": bad})
+        check("provider_kind=%r → 400" % (bad,), code == 400,
+              "got %s %r" % (code, j))
+    reset_config()
+    code, j = put({"provider_kind": None})
+    check("provider_kind=null（清除）→ 200", code == 200, "got %s %r" % (code, j))
+    check("清除后回退默认官方（迁移后默认）",
+          j.get("provider_kind") == "deepseek_official",
+          "got %r" % j.get("provider_kind"))
+
+
+def test_image_transport_enum_and_combination():
+    """image_transport：inline 合法；deepseek_files 需官方 provider/协议/模型。"""
+    print("== image_transport 枚举与组合校验 ==")
+    reset_config()
+    code, j = put({"image_transport": "inline"})
+    check("image_transport=inline → 200（默认传输）", code == 200,
+          "got %s %r" % (code, j))
+    for bad in ("bogus", "INLINE", 1):
+        reset_config()
+        code, j = put({"image_transport": bad})
+        check("image_transport=%r → 400" % (bad,), code == 400,
+              "got %s %r" % (code, j))
+    # files 模式 + 非官方 provider → 拒绝（§4.1：files 必须为 deepseek_official）
+    reset_config()
+    code, j = put({"provider_kind": "generic", "image_transport": "deepseek_files"})
+    check("files + generic provider → 400", code == 400, "got %s %r" % (code, j))
+    check("error 提及 provider 约束",
+          j and "deepseek_official" in (j or {}).get("error", ""),
+          "error=%r" % (j or {}).get("error"))
+    assert code == 400
+    # files 模式 + 非 openai 协议 → 拒绝
+    reset_config()
+    code, j = put({"provider_kind": "deepseek_official",
+                   "image_transport": "deepseek_files",
+                   "api_protocol": "anthropic"})
+    check("files + anthropic 协议 → 400", code == 400, "got %s %r" % (code, j))
+    assert code == 400
+    # files 模式 + 非 vision-exp 模型 → 拒绝
+    reset_config()
+    code, j = put({"provider_kind": "deepseek_official",
+                   "image_transport": "deepseek_files",
+                   "model": "deepseek-chat"})
+    check("files + 非 vision-exp 模型 → 400", code == 400, "got %s %r" % (code, j))
+    assert code == 400
+    # 完整官方负载 + files → 200
+    reset_config()
+    payload = dict(OFFICIAL_PAYLOAD)
+    payload["image_transport"] = "deepseek_files"
+    payload["files_rollout_percent"] = 100
+    code, j = put(payload)
+    check("官方 + deepseek_files + rollout=100 → 200", code == 200,
+          "got %s %r" % (code, j))
+    if code == 200:
+        check("回显 image_transport=deepseek_files",
+              j.get("image_transport") == "deepseek_files",
+              "got %r" % j.get("image_transport"))
+        check("回显 files_rollout_percent=100",
+              j.get("files_rollout_percent") == 100,
+              "got %r" % j.get("files_rollout_percent"))
+
+
+def test_files_rollout_percent_validation():
+    """files_rollout_percent：0/50/100 合法；越界/非整数 400；None 清除。"""
+    print("== files_rollout_percent 校验 ==")
+    reset_config()
+    # 显式 generic，避免空配置推断官方后叠加原子契约
+    put({"provider_kind": "generic", "base_url": "http://cpa.example/v1"})
+    for good in (0, 50, 100):
+        code, j = put({"files_rollout_percent": good})
+        check("files_rollout_percent=%d → 200" % good, code == 200,
+              "got %s %r" % (code, j))
+        if code == 200:
+            check("落盘 files_rollout_percent=%d" % good,
+                  j.get("files_rollout_percent") == good,
+                  "got %r" % j.get("files_rollout_percent"))
+    for bad in (-1, 101, 12.5, "abc", True):
+        code, j = put({"files_rollout_percent": bad})
+        check("files_rollout_percent=%r → 400" % (bad,), code == 400,
+              "got %s %r" % (code, j))
+    code, j = put({"files_rollout_percent": None})
+    check("files_rollout_percent=null（清除回默认 0）→ 200", code == 200,
+          "got %s %r" % (code, j))
+    if code == 200:
+        check("清除后回显 0", j.get("files_rollout_percent") == 0,
+              "got %r" % j.get("files_rollout_percent"))
+
+
+def test_files_ttl_seconds_validation():
+    """files_ttl_seconds：3600/2592000 边界合法；越界/非整数 400；None 清除。"""
+    print("== files_ttl_seconds 校验 ==")
+    reset_config()
+    put({"provider_kind": "generic", "base_url": "http://cpa.example/v1"})
+    for good in (3600, 86400, 2592000):
+        code, j = put({"files_ttl_seconds": good})
+        check("files_ttl_seconds=%d → 200" % good, code == 200,
+              "got %s %r" % (code, j))
+        if code == 200:
+            check("落盘 files_ttl_seconds=%d" % good,
+                  j.get("files_ttl_seconds") == good,
+                  "got %r" % j.get("files_ttl_seconds"))
+    for bad in (3599, 2592001, 12.5, "abc"):
+        code, j = put({"files_ttl_seconds": bad})
+        check("files_ttl_seconds=%r → 400" % (bad,), code == 400,
+              "got %s %r" % (code, j))
+    code, j = put({"files_ttl_seconds": None})
+    check("files_ttl_seconds=null（清除回默认 86400）→ 200", code == 200,
+          "got %s %r" % (code, j))
+    if code == 200:
+        check("清除后回显默认 86400（24 小时保留）",
+              j.get("files_ttl_seconds") == 86400,
+              "got %r" % j.get("files_ttl_seconds"))
+
+
+def test_official_mode_atomic_validation():
+    """官方模式原子校验：canonical base_url/协议/模型/key/cache/rollout。"""
+    print("== 官方模式原子校验 ==")
+    # 1) 完整合法负载 → 200，key 以 enc: 密文落盘
+    reset_config()
+    code, j = put(OFFICIAL_PAYLOAD)
+    check("完整官方负载 → 200", code == 200, "got %s %r" % (code, j))
+    assert code == 200
+    check("回显 provider_kind=deepseek_official",
+          j.get("provider_kind") == "deepseek_official",
+          "got %r" % j.get("provider_kind"))
+    raw = load_raw()
+    check("api_key 密文落盘（enc: 前缀）",
+          str(raw.get("api_key", "")).startswith("enc:"),
+          "got %r" % raw.get("api_key"))
+    check("明文 key 不落盘", "sk-official-test-1234567890" not in json.dumps(raw))
+    # 2) 非 canonical base_url → 400（带 /v1、尾斜杠、错 host 均拒绝）
+    for bad_base in ("https://api.deepseek.com/v1",
+                     "https://api.deepseek.com/",
+                     "https://cpa.example/v1"):
+        reset_config()
+        payload = dict(OFFICIAL_PAYLOAD)
+        payload["base_url"] = bad_base
+        code, j = put(payload)
+        check("官方 + base_url=%s → 400" % bad_base, code == 400,
+              "got %s %r" % (code, j))
+        check("error 指明 canonical 值",
+              j and "https://api.deepseek.com" in (j or {}).get("error", ""),
+              "error=%r" % (j or {}).get("error"))
+    # 3) 非 openai 协议 → 400
+    reset_config()
+    payload = dict(OFFICIAL_PAYLOAD)
+    payload["api_protocol"] = "anthropic"
+    code, j = put(payload)
+    check("官方 + anthropic → 400", code == 400, "got %s %r" % (code, j))
+    assert code == 400
+    # 4) 非 vision-exp 模型 → 400
+    reset_config()
+    payload = dict(OFFICIAL_PAYLOAD)
+    payload["model"] = "deepseek-chat"
+    code, j = put(payload)
+    check("官方 + deepseek-chat → 400", code == 400, "got %s %r" % (code, j))
+    assert code == 400
+    # 5) 缺 api_key → 400
+    reset_config()
+    payload = dict(OFFICIAL_PAYLOAD)
+    payload.pop("api_key")
+    code, j = put(payload)
+    check("官方 + 缺 api_key → 400", code == 400, "got %s %r" % (code, j))
+    check("error 提及 api_key",
+          j and "api_key" in (j or {}).get("error", ""),
+          "error=%r" % (j or {}).get("error"))
+    assert code == 400
+    # 6) prompt_cache_mode != auto → 400
+    reset_config()
+    payload = dict(OFFICIAL_PAYLOAD)
+    payload["prompt_cache_mode"] = "off"
+    code, j = put(payload)
+    check("官方 + prompt_cache_mode=off → 400", code == 400,
+          "got %s %r" % (code, j))
+    assert code == 400
+    # 7) 已存官方配置后再提交非法 rollout → 400（对完整候选原子校验）
+    reset_config()
+    put(OFFICIAL_PAYLOAD)
+    code, j = put({"files_rollout_percent": 101})
+    check("官方存档 + rollout=101 → 400", code == 400, "got %s %r" % (code, j))
+    check("磁盘 rollout 未落 101", load_raw().get("files_rollout_percent") != 101,
+          "got %r" % load_raw().get("files_rollout_percent"))
+    # 8) 只提交 canonical base_url（无 provider_kind 字段）→ 推断官方并套契约
+    reset_config()
+    code, j = put({"base_url": "https://api.deepseek.com"})
+    check("canonical base_url 推断官方 → 缺其余字段 400", code == 400,
+          "got %s %r" % (code, j))
+    assert code == 400
+    reset_config()
+    payload = dict(OFFICIAL_PAYLOAD)
+    payload.pop("provider_kind")  # 靠 canonical base_url 推断官方
+    code, j = put(payload)
+    check("canonical 推断官方 + 完整负载 → 200", code == 200,
+          "got %s %r" % (code, j))
+    if code == 200:
+        check("回显推断 provider_kind=deepseek_official",
+              j.get("provider_kind") == "deepseek_official",
+              "got %r" % j.get("provider_kind"))
+
+
+def test_official_mode_no_partial_write():
+    """官方原子校验失败不产生部分写入（配置保持原值）。"""
+    print("== 官方模式原子性 ==")
+    reset_config()
+    seed_official_config(max_steps=40, base_url="https://api.deepseek.com")
+    before = load_raw()
+    code, j = put({"model": "wrong-model", "max_steps": 60})
+    check("官方 + 改非法 model → 400", code == 400, "got %s %r" % (code, j))
+    after = load_raw()
+    check("model 保持原值", after.get("model") == before.get("model"),
+          "got %r" % after.get("model"))
+    check("max_steps 保持原值 40（未部分写入）", after.get("max_steps") == 40,
+          "got %r" % after.get("max_steps"))
+
+
+def test_official_mode_fernet_gate(monkeypatch):
+    """官方模式 Fernet 不可用 → 拒绝保存 API key；generic 保持旧降级行为。"""
+    print("== 官方模式 Fernet 门禁 ==")
+    reset_config()
+    monkeypatch.setattr(app_mod, "_HAS_FERNET", False)
+    code, j = put(OFFICIAL_PAYLOAD)
+    check("Fernet 缺失 + 官方负载 → 400", code == 400, "got %s %r" % (code, j))
+    check("error 提及加密门禁",
+          j and "Fernet" in (j or {}).get("error", ""),
+          "error=%r" % (j or {}).get("error"))
+    check("官方负载未落盘", not load_raw().get("provider_kind"),
+          "got %r" % load_raw())
+    assert code == 400
+    # generic 不受门禁（旧行为：允许明文降级保存，不回归）
+    reset_config()
+    code, j = put({"provider_kind": "generic", "base_url": "http://cpa.example/v1",
+                   "api_key": "sk-generic-legacy-1234567890"})
+    check("Fernet 缺失 + generic → 200（旧降级行为保留）", code == 200,
+          "got %s %r" % (code, j))
+    assert code == 200
+
+
+def test_official_mode_permission_gate(monkeypatch):
+    """官方模式 0600 门禁：越权文件自动修正；修正失败拒绝保存。"""
+    print("== 官方模式 0600 权限门禁 ==")
+    reset_config()
+    # 先种一份官方配置（顺带生成 ai_secret.key）
+    seed_official_config()
+    secret_p = app_mod._ai_secret_path()
+    check("ai_secret.key 已生成", secret_p.is_file())
+    # 放宽权限 → 门禁应自动修正回 0600 并放行保存
+    os.chmod(secret_p, 0o644)
+    code, j = put({"max_steps": 45})
+    check("越权 ai_secret.key 自动修正后保存 → 200", code == 200,
+          "got %s %r" % (code, j))
+    import stat as _stat
+    check("ai_secret.key 已修正为 0600",
+          _stat.S_IMODE(secret_p.stat().st_mode) == 0o600,
+          "mode=%o" % _stat.S_IMODE(secret_p.stat().st_mode))
+    # 修正失败（chmod 异常）→ 拒绝保存
+    os.chmod(secret_p, 0o644)
+
+    def _raise_chmod(*_a, **_k):
+        raise OSError("permission denied (test)")
+
+    monkeypatch.setattr(app_mod.os, "chmod", _raise_chmod)
+    code, j = put({"max_steps": 50})
+    check("chmod 失败 → 拒绝保存（400）", code == 400, "got %s %r" % (code, j))
+    check("error 提及 0600 门禁",
+          j and "0600" in (j or {}).get("error", ""),
+          "error=%r" % (j or {}).get("error"))
+    assert code == 400
+    check("max_steps 未写入（仍 45）", load_raw().get("max_steps") == 45,
+          "got %r" % load_raw().get("max_steps"))
+    monkeypatch.undo()
+    os.chmod(secret_p, 0o600)
+
+
+def test_sidecar_config_injects_provider_fields_and_pseudonym():
+    """_build_sidecar_config：官方模式注入 provider 字段 + hp_<32hex> 伪名。"""
+    print("== sidecar config 注入（官方）==")
+    reset_config()
+    seed_official_config(image_transport="deepseek_files",
+                         files_rollout_percent=100, files_ttl_seconds=2592000)
+    sc = app_mod._build_sidecar_config()
+    check("provider_kind 注入", sc.get("provider_kind") == "deepseek_official",
+          "got %r" % sc.get("provider_kind"))
+    check("image_transport 注入", sc.get("image_transport") == "deepseek_files",
+          "got %r" % sc.get("image_transport"))
+    check("files_ttl_seconds 注入", sc.get("files_ttl_seconds") == 2592000,
+          "got %r" % sc.get("files_ttl_seconds"))
+    check("files_rollout_percent 注入", sc.get("files_rollout_percent") == 100,
+          "got %r" % sc.get("files_rollout_percent"))
+    check("prompt_cache_mode 注入（auto）", sc.get("prompt_cache_mode") == "auto",
+          "got %r" % sc.get("prompt_cache_mode"))
+    uid = sc.get("user_id")
+    check("伪名 user_id 形如 hp_<32hex>", isinstance(uid, str)
+          and bool(HP_UID_RE.match(uid)), "got %r" % uid)
+    assert isinstance(uid, str) and HP_UID_RE.match(uid)
+    # 同 scope 稳定：两次调用一致（secret_key 持久化）
+    sc2 = app_mod._build_sidecar_config()
+    check("伪名稳定（同 scope 两次一致）", sc2.get("user_id") == uid,
+          "got %r vs %r" % (sc2.get("user_id"), uid))
+
+
+def test_pseudonym_scope_registered_vs_demo():
+    """注册用户 scope=内部 user_id；匿名 Demo scope="demo:"+capability_id。"""
+    print("== 伪名 scope 隔离（注册 vs 匿名 Demo）==")
+    reset_config()
+    seed_official_config()
+    u_owner = app_mod._build_sidecar_config()["user_id"]
+    u_reg = app_mod._build_sidecar_config(
+        {"role": "user", "user_id": "u-reg-77"})["user_id"]
+    u_reg2 = app_mod._build_sidecar_config(
+        {"role": "user", "user_id": "u-reg-77"})["user_id"]
+    u_other = app_mod._build_sidecar_config(
+        {"role": "user", "user_id": "u-reg-88"})["user_id"]
+    u_demo1 = app_mod._build_sidecar_config(
+        None, demo_capability_id="dcp_0011223344556677")["user_id"]
+    u_demo2 = app_mod._build_sidecar_config(
+        None, demo_capability_id="dcp_9988776655443322")["user_id"]
+    for name, v in (("owner", u_owner), ("reg", u_reg),
+                    ("other", u_other), ("demo1", u_demo1), ("demo2", u_demo2)):
+        check("%s 伪名形如 hp_<32hex>" % name, bool(HP_UID_RE.match(v)),
+              "got %r" % v)
+    check("注册同 user_id 伪名一致", u_reg == u_reg2)
+    check("不同 user_id 伪名不同", u_reg != u_other)
+    check("注册与匿名 Demo 伪名不同", u_reg != u_demo1)
+    check("不同 capability_id（每浏览器）伪名不同", u_demo1 != u_demo2)
+    check("伪名不含 scope 明文（不可反推 user_id/capability_id）",
+          "u-reg-77" not in u_reg and "dcp_0011" not in u_demo1)
+    assert u_reg != u_demo1 and u_demo1 != u_demo2
+
+
+def test_generic_sidecar_config_has_no_pseudonym():
+    """generic 配置：provider_kind=generic、默认 inline，且不注入 user_id。"""
+    print("== sidecar config 注入（generic）==")
+    reset_config()
+    seed_config(base_url="http://cpa.example/v1", api_key="sk-generic-seed-1234",
+                model="gpt-generic", provider_kind="generic")
+    sc = app_mod._build_sidecar_config()
+    check("provider_kind=generic 注入", sc.get("provider_kind") == "generic",
+          "got %r" % sc.get("provider_kind"))
+    check("image_transport 默认 inline", sc.get("image_transport") == "inline",
+          "got %r" % sc.get("image_transport"))
+    check("files_ttl_seconds 默认 86400", sc.get("files_ttl_seconds") == 86400,
+          "got %r" % sc.get("files_ttl_seconds"))
+    check("files_rollout_percent 默认 0", sc.get("files_rollout_percent") == 0,
+          "got %r" % sc.get("files_rollout_percent"))
+    check("generic 不注入伪名 user_id（数据最小化）", "user_id" not in sc,
+          "keys=%r" % sorted(sc))
+
+
+def test_get_config_echo_provider_fields_without_secrets():
+    """GET 回显 provider 状态字段；绝不回显 api_key 明文与伪名 user_id。"""
+    print("== GET 回显脱敏 ==")
+    reset_config()
+    plain = "sk-echo-secret-abcdefgh1234"
+    seed_official_config(api_key=plain, image_transport="deepseek_files",
+                         files_rollout_percent=100)
+    client = make_client()
+    j = client.get("/api/ai/config").get_json()
+    check("回显 provider_kind", j.get("provider_kind") == "deepseek_official",
+          "got %r" % j.get("provider_kind"))
+    check("回显 image_transport", j.get("image_transport") == "deepseek_files",
+          "got %r" % j.get("image_transport"))
+    check("回显 files_rollout_percent", j.get("files_rollout_percent") == 100,
+          "got %r" % j.get("files_rollout_percent"))
+    check("回显 files_ttl_seconds", j.get("files_ttl_seconds") == 86400,
+          "got %r" % j.get("files_ttl_seconds"))
+    check("不回显 api_key 字段", "api_key" not in j, "keys=%r" % sorted(j))
+    check("明文 api_key 不出现在响应", plain not in json.dumps(j))
+    check("不回显伪名 user_id", "user_id" not in j, "keys=%r" % sorted(j))
+    check("响应无 hp_ 伪名值", "hp_" not in json.dumps(j))
+    # PUT 回显同样脱敏
+    r = client.put("/api/ai/config", data=json.dumps({"max_steps": 35}),
+                   content_type="application/json")
+    j2 = r.get_json()
+    check("PUT 回显 provider_kind", j2.get("provider_kind") == "deepseek_official",
+          "got %r" % j2.get("provider_kind"))
+    check("PUT 回显无 api_key 明文", "api_key" not in j2 and plain not in json.dumps(j2))
+    check("PUT 回显无伪名 user_id", "user_id" not in j2)
+
+
+def test_legacy_generic_config_no_regression():
+    """存量 generic 配置（无 provider_kind + CPA base_url）行为不回归。"""
+    print("== 存量 generic 配置不回归 ==")
+    reset_config()
+    # 模拟升级前落盘形态：无 provider_kind 字段、CPA 地址
+    seed_config(base_url="http://cpa.example/v1", api_key="sk-cpa-legacy-123456",
+                model="deepseek-v4-flash-vision-exp", api_protocol="openai")
+    j = make_client().get("/api/ai/config").get_json()
+    check("推断 provider_kind=generic", j.get("provider_kind") == "generic",
+          "got %r" % j.get("provider_kind"))
+    # 日常调优 PUT 不被官方契约拦截
+    code, j = put({"max_steps": 33})
+    check("legacy generic + 调优 PUT → 200", code == 200, "got %s %r" % (code, j))
+    assert code == 200
+    # sidecar 注入保持 generic/inline，base_url 原样透传
+    sc = app_mod._build_sidecar_config()
+    check("sidecar provider_kind=generic", sc.get("provider_kind") == "generic",
+          "got %r" % sc.get("provider_kind"))
+    check("sidecar base_url 原样透传",
+          sc.get("base_url") == "http://cpa.example/v1",
+          "got %r" % sc.get("base_url"))
+    check("sidecar 无伪名 user_id", "user_id" not in sc)
+    # 显式切官方仍走完整原子校验（不会被 generic 推断豁免）
+    payload = dict(OFFICIAL_PAYLOAD)
+    payload["model"] = "deepseek-chat"
+    code, j = put(payload)
+    check("legacy 配置切官方 + 非法 model → 400", code == 400,
+          "got %s %r" % (code, j))
+    assert code == 400
 
 

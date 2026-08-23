@@ -3071,6 +3071,32 @@ button {
   color: var(--text);
 }
 .ai-trace .ai-obs b { font-size: 12px; }
+/* 观察卡：viewport 小结与 region 观察区；可点选的 region 卡选中后加边框 */
+.ai-trace .ai-obs .ai-obs-note {
+  margin-top: 2px;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+.ai-trace .ai-obs .ai-obs-scope {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: rgba(52, 199, 89, 0.12);
+  color: #1f7a37;
+}
+.ai-trace .ai-obs.obs-viewport .ai-obs-scope {
+  background: #ececec;
+  color: var(--text-2);
+}
+.ai-trace .ai-obs.obs-region[style*="pointer"] { user-select: none; }
+.ai-trace .ai-obs.selected {
+  border-color: rgba(52, 199, 89, 0.9);
+  box-shadow: 0 0 0 2px rgba(52, 199, 89, 0.2);
+}
 
 .demo-unavailable {
   flex: 1;

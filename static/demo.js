@@ -30,7 +30,11 @@
     sessionId: null,      // HistoPilot session（X-AI-Session-ID）
     lastSeq: 0,           // SSE 游标（id: 行）
     terminal: false,      // 已收到终止事件（agent_finished/agent_error/session_ended）
-    observations: [],     // {x,y,w,h,label,note}（level-0 坐标，临时 overlay）
+    // ---- AI 视角 / 临时观察状态拆分（fix-plan §7.1）----
+    currentSnapshotView: null, // 唯一当前 AI 视角：仅 snapshot_captured / Session 重建更新
+    observations: [],     // 归一化观察：{id,snapshot_id,scope,label,note,bbox,magnification,region_ok}
+    selectedObservationId: null, // 用户在观察卡中选中的观察（额外高亮）
+    obsSeq: 0,            // 观察自增 id 计数
     abortCtrl: null,      // POST /run 的 AbortController
     streamAbort: null,    // 只读重连/恢复流的 AbortController
     sessionAttached: false, // 本页已附着过该 session 的流（避免终态循环重连）
@@ -123,7 +127,130 @@
     if ($("header-zoom-badge")) $("header-zoom-badge").textContent = text;
   }
 
-  // ---------- 临时 overlay（observation，只画不写） ----------
+  // ---------- 事件字段归一化（fix-plan §5.3：旧事件/旧 Session 兼容） ----------
+  function osd() {
+    // 浏览器里 OpenSeadragon 由 <script> 先行加载；window 兜底供测试注入。
+    if (typeof OpenSeadragon !== "undefined") return OpenSeadragon;
+    return (window && window.OpenSeadragon) || null;
+  }
+
+  function validBbox(b) {
+    if (!b) return null;
+    var x = Number(b.x), y = Number(b.y), w = Number(b.w), h = Number(b.h);
+    if (!isFinite(x) || !isFinite(y) || !isFinite(w) || !isFinite(h)) return null;
+    if (x < 0 || y < 0 || w <= 0 || h <= 0) return null;
+    return { x: x, y: y, w: w, h: h };
+  }
+
+  function pick(o, k, fb) {
+    if (!o) return fb;
+    return o[k] != null ? o[k] : fb;
+  }
+
+  // snapshotBbox = p.bbox_level0 || p.bboxLevel0（§5.3）
+  function normalizeSnapshotView(raw, prev) {
+    if (!raw) return prev || null;
+    var bbox = validBbox(raw.bbox_level0 || raw.bboxLevel0);
+    if (!bbox) return prev || null; // 无有效 bbox：不得覆盖旧视角、不得导航
+    return {
+      snapshot_id: raw.snapshot_id || (prev && prev.snapshot_id) || null,
+      bbox: bbox,
+      level: pick(raw, "level", prev && prev.level != null ? prev.level : null),
+      magnification: raw.magnification || (prev && prev.magnification) || "",
+      out_w: pick(raw, "out_w", prev ? prev.out_w : null),
+      out_h: pick(raw, "out_h", prev ? prev.out_h : null),
+      captured_at: pick(raw, "captured_at", prev ? prev.captured_at : null),
+    };
+  }
+
+  // observationBbox = p.bbox_level0 || p.bbox（§5.3；旧 Session 的平铺 x/y/w/h 一并兼容）
+  function observationBboxFrom(o) {
+    var b = (o && (o.bbox_level0 || o.bbox)) ||
+      (o && o.x != null && o.y != null && o.w != null && o.h != null ? o : null);
+    return validBbox(b);
+  }
+
+  // 旧 observation 缺 scope 的推断（§5.3）：
+  //   bbox 与来源快照近似相同 → viewport；明显小于且位于快照内 → region；
+  //   无 bbox/零面积/非法 bbox → viewport（只出卡片）；
+  //   有 bbox 但关联不到来源快照 → 无法归类（只出卡片，不画框）。
+  function approxSameBbox(a, s) {
+    var e = 0.01;
+    return Math.abs(a.x - s.x) <= Math.max(1, s.w * e) &&
+      Math.abs(a.y - s.y) <= Math.max(1, s.h * e) &&
+      Math.abs(a.w - s.w) <= Math.max(1, s.w * e) &&
+      Math.abs(a.h - s.h) <= Math.max(1, s.h * e);
+  }
+
+  function smallerInsideBbox(a, s) {
+    return a.w <= s.w * 0.99 && a.h <= s.h * 0.99 &&
+      a.x >= s.x && a.y >= s.y &&
+      a.x + a.w <= s.x + s.w && a.y + a.h <= s.y + s.h;
+  }
+
+  function classifyLegacyObservation(bbox, src) {
+    if (!bbox) return "viewport";
+    if (!src || !src.bbox) return "none";
+    if (approxSameBbox(bbox, src.bbox)) return "viewport";
+    if (smallerInsideBbox(bbox, src.bbox)) return "region";
+    return "none";
+  }
+
+  // 把实时 observation 事件 / Session 里的 observation 记录归一化为同一结构。
+  // cur 为当前快照视角（state.currentSnapshotView）。
+  function normalizeObservationEntry(raw, cur) {
+    var o = raw || {};
+    var bbox = observationBboxFrom(o);
+    var snapshotId = o.snapshot_id || (cur && cur.snapshot_id) || null;
+    var scope = (o.scope === "viewport" || o.scope === "region") ? o.scope : null;
+    var regionOk = false;
+    if (!scope) {
+      var src = (cur && cur.snapshot_id === snapshotId) ? cur : null;
+      var cls = classifyLegacyObservation(bbox, src);
+      if (cls === "viewport") scope = "viewport";
+      else if (cls === "region") { scope = "region"; regionOk = true; }
+      // cls === "none"：scope 保持 null，只显示卡片，任何情况下不画框
+    } else if (scope === "region") {
+      regionOk = !!bbox; // 新契约 region 缺有效 bbox → 只出卡片
+    }
+    return {
+      id: null,
+      snapshot_id: snapshotId,
+      scope: scope,
+      label: o.label || "",
+      note: o.note || "",
+      magnification: o.magnification || (cur && cur.magnification) || "",
+      bbox: bbox,
+      region_ok: regionOk,
+    };
+  }
+
+  // 旧 Session 无 last_snapshot_view：从 transcript 最近一条有效 image_ref.src 推导；
+  // 推导不出返回 null（不伪造当前视角框）。
+  function deriveLastSnapshotViewFromTranscript(tx) {
+    if (!Array.isArray(tx)) return null;
+    for (var i = tx.length - 1; i >= 0; i--) {
+      var c = tx[i] && tx[i].content;
+      if (!Array.isArray(c)) continue;
+      for (var j = c.length - 1; j >= 0; j--) {
+        var part = c[j];
+        if (!part || part.type !== "image_ref") continue;
+        var bbox = validBbox(part.src);
+        if (bbox) {
+          return {
+            snapshot_id: null, // image_ref.ref_id 不是 snapshot_id，不伪造关联
+            bbox: bbox,
+            level: null,
+            magnification: part.magnification || "",
+            out_w: null, out_h: null, captured_at: null,
+          };
+        }
+      }
+    }
+    return null;
+  }
+
+  // ---------- Viewer 导航与 overlay 绘制（fix-plan §7.2） ----------
   function resizeObsCanvas() {
     var cv = $("obs-canvas");
     if (!cv || !cv.getBoundingClientRect) return;
@@ -135,31 +262,113 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
+  // 当前可见的局部观察：属于当前快照，或被用户在观察卡中选中（§7.2.2）。
+  // snapshot_id 为 null 的旧观察在归一化时已按“当前快照”安全关联（§5.3），
+  // 因此 null === null 视为同源；一旦新快照带有真实 id，旧 null 关联自然失效。
+  function visibleRegionObservations() {
+    var cur = state.currentSnapshotView;
+    return state.observations.filter(function (o) {
+      if (!o.region_ok || !o.bbox) return false;
+      if (o.id === state.selectedObservationId) return true;
+      return !!(cur && o.snapshot_id === cur.snapshot_id);
+    });
+  }
+
+  // 按实际 bbox fitBounds，四周外扩约 20%（与正式插件同一导航口径，§4.1.5）
+  function navigateToBbox(bbox) {
+    var O = osd();
+    var vp = state.viewer && state.viewer.viewport;
+    if (!O || !O.Rect || !vp || !vp.fitBounds) return false;
+    if (!bbox || !(bbox.w > 0) || !(bbox.h > 0)) return false;
+    try {
+      var pad = Math.max(bbox.w, bbox.h) * 0.2;
+      var rect = new O.Rect(bbox.x - pad, bbox.y - pad,
+        bbox.w + pad * 2, bbox.h + pad * 2);
+      var vRect = vp.imageToViewportRectangle ? vp.imageToViewportRectangle(rect) : rect;
+      vp.fitBounds(vRect);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
   function drawObservations() {
     var cv = $("obs-canvas");
     if (!cv || !state.viewer || !state.viewer.viewport) return;
+    var O = osd();
+    if (!O || !O.Point) return;
     if (cv.width === 1) resizeObsCanvas();
     var ctx = cv.getContext("2d");
+    if (!ctx) return;
     ctx.clearRect(0, 0, cv.width, cv.height);
     var vp = state.viewer.viewport;
-    state.observations.forEach(function (o, i) {
-      if (!(o.w > 0 && o.h > 0)) return;
+    var cssW = cv.width / (window.devicePixelRatio || 1);
+    var labels = []; // 已画标签矩形，用于视口内约束与上下避让（§7.2.6）
+
+    function elemRect(bbox) {
       try {
-        var tl = vp.imageToViewerElementCoordinates(new OpenSeadragon.Point(o.x, o.y));
-        var br = vp.imageToViewerElementCoordinates(new OpenSeadragon.Point(o.x + o.w, o.y + o.h));
+        var tl = vp.imageToViewerElementCoordinates(new O.Point(bbox.x, bbox.y));
+        var br = vp.imageToViewerElementCoordinates(new O.Point(bbox.x + bbox.w, bbox.y + bbox.h));
         var left = Math.min(tl.x, br.x), top = Math.min(tl.y, br.y);
-        var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
-        ctx.strokeStyle = "rgba(52,199,89,0.95)";
-        ctx.lineWidth = 2;
-        ctx.strokeRect(left, top, w, h);
-        var label = o.label || ("#" + (i + 1));
+        return { left: left, top: top, w: Math.abs(br.x - tl.x), h: Math.abs(br.y - tl.y) };
+      } catch (e) { return null; }
+    }
+
+    function drawLabel(text, left, top, bg) {
+      try {
         ctx.font = "600 12px -apple-system, PingFang SC, sans-serif";
-        var tw = ctx.measureText(label).width + 10;
-        ctx.fillStyle = "rgba(52,199,89,0.92)";
-        ctx.fillRect(left, Math.max(0, top - 18), tw, 17);
+        var tw = (ctx.measureText ? ctx.measureText(text).width : text.length * 6) + 10;
+        var x = Math.min(Math.max(left, 0), Math.max(0, cssW - tw));
+        var y = Math.max(0, top - 18);
+        for (var k = 0; k < 6; k++) {
+          var hit = labels.some(function (l) {
+            return x < l.x + l.w && x + tw > l.x && y < l.y + 17 && y + 17 > l.y;
+          });
+          if (!hit) break;
+          y += 18; // 基本上下避让
+        }
+        labels.push({ x: x, y: y, w: tw });
+        ctx.fillStyle = bg;
+        ctx.fillRect(x, y, tw, 17);
         ctx.fillStyle = "#fff";
-        ctx.fillText(label, left + 5, Math.max(0, top - 18) + 12.5);
-      } catch (e) { /* 视口未开/坐标非法：跳过该框 */ }
+        if (ctx.fillText) ctx.fillText(text, x + 5, y + 12.5);
+      } catch (e) { /* 标签绘制失败不影响框 */ }
+    }
+
+    // 1) 唯一当前 AI 视角：青色虚线框，标签显示倍率而非病理标题（§7.2.1）
+    var cur = state.currentSnapshotView;
+    if (cur && cur.bbox) {
+      var r = elemRect(cur.bbox);
+      if (r) {
+        try {
+          ctx.save();
+          ctx.strokeStyle = "rgba(41,199,222,0.95)";
+          ctx.lineWidth = 2;
+          if (ctx.setLineDash) ctx.setLineDash([7, 5]);
+          ctx.strokeRect(r.left, r.top, r.w, r.h);
+          if (ctx.setLineDash) ctx.setLineDash([]);
+          ctx.restore();
+          drawLabel(cur.magnification || t("demo.ai.view.current"), r.left, r.top,
+            "rgba(0,155,178,0.92)");
+        } catch (e) { /* 视口未开/坐标非法：跳过 */ }
+      }
+    }
+
+    // 2) 局部临时观察：绿色实线；仅当前快照所属或被选中（§7.2.2）
+    visibleRegionObservations().forEach(function (o) {
+      var r2 = elemRect(o.bbox);
+      if (!r2) return;
+      var selected = o.id === state.selectedObservationId;
+      try {
+        ctx.save();
+        ctx.strokeStyle = selected ? "rgba(52,199,89,1)" : "rgba(52,199,89,0.95)";
+        ctx.lineWidth = selected ? 2.5 : 2;
+        if (ctx.setLineDash) ctx.setLineDash([]);
+        ctx.strokeRect(r2.left, r2.top, r2.w, r2.h);
+        ctx.restore();
+        drawLabel(o.label || t("demo.ai.obs.region"), r2.left, r2.top,
+          "rgba(52,199,89,0.92)");
+      } catch (e) { /* 跳过该框 */ }
     });
   }
 
@@ -218,6 +427,8 @@
     var entry = state.slides.filter(function (s) { return s.slide_id === slideId; })[0];
     if (!entry) return;
     state.current = entry;
+    // 切片切换：清空当前视角与临时观察高亮（§7.2.5）
+    clearRunOverlays();
     renderDemoSlideList(slideId);
     if ($("current-slide")) {
       $("current-slide").textContent = entry.display_name || entry.name || slideId;
@@ -446,18 +657,92 @@
     return msg && (msg.display_text || msg.text) || "";
   }
 
+  // ---------- 观察卡与选中（fix-plan §7.1/§7.2：临时观察统一称「观察/观察区」） ----------
+  function appendObservationCard(obs) {
+    if (!obs) return;
+    var el = document.createElement("div");
+    el.className = "ai-obs" +
+      (obs.scope === "viewport" ? " obs-viewport" : " obs-region");
+    el.dataset.obsId = obs.id;
+    var head = document.createElement("b");
+    head.textContent = obs.label || t("demo.ai.obs.default");
+    el.appendChild(head);
+    if (obs.note) {
+      var note = document.createElement("div");
+      note.className = "ai-obs-note";
+      note.textContent = obs.note;
+      el.appendChild(note);
+    }
+    var tag = document.createElement("span");
+    tag.className = "ai-obs-scope";
+    tag.textContent = t(obs.scope === "viewport"
+      ? "demo.ai.obs.scope.viewport"
+      : "demo.ai.obs.scope.region");
+    el.appendChild(tag);
+    if (obs.region_ok && obs.bbox) {
+      // 仅可画框的局部观察支持点选高亮；整视野小结不承载 Viewer 交互
+      el.style.cursor = "pointer";
+      el.addEventListener("click", function () { toggleObservationSelect(obs.id); });
+    }
+    $("ai-trace").appendChild(el);
+    $("ai-trace").scrollTop = $("ai-trace").scrollHeight;
+  }
+
+  function toggleObservationSelect(id) {
+    state.selectedObservationId = state.selectedObservationId === id ? null : id;
+    updateObservationCardStates();
+    drawObservations();
+  }
+
+  function updateObservationCardStates() {
+    var trace = $("ai-trace");
+    if (!trace || !trace.children) return;
+    for (var i = 0; i < trace.children.length; i++) {
+      var el = trace.children[i];
+      var oid = el && el.dataset && el.dataset.obsId;
+      if (!oid) continue;
+      var on = oid === state.selectedObservationId;
+      if (el.classList && el.classList.add && el.classList.remove) {
+        if (on) el.classList.add("selected");
+        else el.classList.remove("selected");
+      }
+    }
+  }
+
+  // 切片切换 / 新 run 开始 / Session 明确重置：清空当前视角与临时高亮（§7.2.5）
+  function clearRunOverlays() {
+    state.currentSnapshotView = null;
+    state.observations = [];
+    state.selectedObservationId = null;
+    state.obsSeq = 0;
+    drawObservations();
+  }
+
+  function appendGotoRow(p) {
+    // goto 只是移动意图：只更新「AI 正在移动」轨迹状态，不导航、不画框（§4.1.6/7.3）
+    var bits = [];
+    if (p.x != null && p.y != null) bits.push("(" + fmtCoord(p.x) + ", " + fmtCoord(p.y) + ")");
+    if (p.magnification) bits.push(String(p.magnification));
+    else if (p.level != null) bits.push("level " + p.level);
+    if (p.reason) bits.push(String(p.reason));
+    appendTrace("ai-row", t("demo.ai.goto") + (bits.length ? " · " + bits.join(" · ") : ""));
+  }
+
+  function fmtCoord(n) {
+    n = Number(n);
+    if (!isFinite(n)) return "?";
+    return Math.abs(n - Math.round(n)) < 0.05 ? String(Math.round(n)) : n.toFixed(1);
+  }
+
   function handleEvent(type, payload) {
     var p = payload || {};
     if (type === "observation") {
       closeLiveTextBubble();
-      state.observations.push({
-        x: p.bbox && p.bbox.x, y: p.bbox && p.bbox.y,
-        w: p.bbox && p.bbox.w, h: p.bbox && p.bbox.h,
-        label: p.label, note: p.note,
-      });
+      var obs = normalizeObservationEntry(p, state.currentSnapshotView);
+      obs.id = "obs-" + (++state.obsSeq);
+      state.observations.push(obs);
+      appendObservationCard(obs);
       drawObservations();
-      appendTrace("ai-obs", "<b>" + esc(p.label || "观察") + "</b>" +
-        (p.note ? "<br/>" + esc(p.note) : ""), true);
       return;
     }
     if (type === "event_reset") {
@@ -479,30 +764,45 @@
       return;
     }
     if (type === "goto") {
+      // 兼容期旧独立 goto 事件：与 tool_started{tool:"goto"} 归一化为同一轨迹
+      // 状态；不读取 p.zoom、不导航 Viewer（§4.1.7）。确认部署基线均不发送
+      // 独立 goto 后再删除本分支。
       closeLiveTextBubble();
-      try {
-        var vp = state.viewer.viewport;
-        if (p.x != null && p.y != null) {
-          vp.panTo(vp.imageToViewportCoordinates(
-            new OpenSeadragon.Point(p.x, p.y)), true);
-          if (p.zoom != null) vp.zoomTo(p.zoom, null, true);
-        }
-      } catch (e) { /* 忽略导航事件坐标异常 */ }
-      appendTrace("ai-row", t("demo.ai.goto"));
+      appendGotoRow(p);
       return;
     }
     if (type === "tool_started") {
       closeLiveTextBubble();
+      if (p.tool === "goto") {
+        appendGotoRow(p);
+        return;
+      }
       if (p.tool === "snapshot") appendTrace("ai-row", t("demo.ai.snapshot"));
-      else if (p.tool && p.tool !== "goto" && p.tool !== "finish" &&
-               p.tool !== "mark_observation" && p.tool !== "complete_snapshot_review") {
+      else if (p.tool && p.tool !== "finish" && p.tool !== "mark_observation" &&
+               p.tool !== "complete_snapshot_review" && p.tool !== "create_annotation") {
         appendTrace("ai-row", p.tool);
       }
       return;
     }
     if (type === "snapshot_captured") {
+      // 唯一权威取景来源：用实际 bbox 更新当前视角框并按 bbox 外扩 20% 导航（§4.1）。
+      // 无效 bbox 不得覆盖旧视角、不得触发导航。
       closeLiveTextBubble();
-      appendTrace("ai-row", t("demo.ai.snapshot"));
+      var prevView = state.currentSnapshotView;
+      state.currentSnapshotView = normalizeSnapshotView(p, prevView);
+      if (state.currentSnapshotView && state.currentSnapshotView !== prevView) {
+        navigateToBbox(state.currentSnapshotView.bbox);
+      }
+      drawObservations();
+      var mag = state.currentSnapshotView && state.currentSnapshotView.magnification;
+      appendTrace("ai-row", t("demo.ai.snapshot") + (mag ? " · " + mag : ""));
+      return;
+    }
+    if (type === "annotation_created") {
+      // 正式标注：写入 PathTogether 标注库、待人工审核。不复用临时观察
+      // overlay 冒充成功状态；Demo 只读，仅以状态行呈现（§7.3）。
+      closeLiveTextBubble();
+      appendTrace("ai-row", t("demo.ai.annotation.created"));
       return;
     }
     if (type === "security_profile_applied") {
@@ -655,15 +955,21 @@
       if (!resp.ok) throw new Error("HTTP " + resp.status);
       return resp.json();
     }).then(function (data) {
-      var s = data && data.session;
+      var s = (data && data.session) || {};
       var tx = (data && data.transcript) || [];
-      var obs = (s && s.observations) || [];
-      state.observations = obs.map(function (o) {
-        var b = (o && o.bbox) || o || {};
-        return {
-          x: b.x, y: b.y, w: b.w, h: b.h,
-          label: o.label, note: o.note,
-        };
+      // 当前视角：优先 Session 的 last_snapshot_view；旧 Session 从 transcript
+      // 最近有效 image_ref.src 推导；仍推不出则不显示当前视角框，不伪造（§5.3）
+      var view = normalizeSnapshotView(s.last_snapshot_view, null) ||
+        deriveLastSnapshotViewFromTranscript(tx);
+      state.currentSnapshotView = view;
+      state.selectedObservationId = null;
+      state.obsSeq = 0;
+      // observation 按 snapshot_id/scope/bbox_level0/倍率完整重建；旧记录走
+      // 同一归一化函数（含 scope 推断与安全降级）
+      state.observations = ((s && s.observations) || []).map(function (o) {
+        var n = normalizeObservationEntry(o, view);
+        n.id = "obs-" + (++state.obsSeq);
+        return n;
       });
       drawObservations();
       $("ai-trace").innerHTML = "";
@@ -679,6 +985,8 @@
           if (at && String(at).trim()) appendTrace("ai-msg agent", at);
         }
       });
+      // 观察卡随重建恢复（历史观察保留在轨迹中，但不全部铺到 Viewer 上，§7.1）
+      state.observations.forEach(appendObservationCard);
       var snapSeq = (s && s.last_event_seq != null) ? Number(s.last_event_seq) || 0 : 0;
       state.lastSeq = Math.max(state.lastSeq || 0, snapSeq);
       var queued = state.pendingEvents;
@@ -718,9 +1026,9 @@
     state.terminal = false;
     state.sessionAttached = false;
     state.lastSeq = 0;
-    state.observations = [];
+    // 新 run 开始：清空旧当前视角与临时观察高亮（§7.2.5）
+    clearRunOverlays();
     closeLiveTextBubble();
-    drawObservations();
     $("ai-trace").innerHTML = "";
     setAiButton("running");
     appendTrace("ai-msg user", task || t("demo.ai.default.task"));
@@ -836,6 +1144,11 @@
     startRun: startRun,
     closeActiveStream: closeActiveStream,
     handleEvent: handleEvent,
+    openSlide: openSlide,
+    clearRunOverlays: clearRunOverlays,
+    toggleObservationSelect: toggleObservationSelect,
+    visibleRegionObservations: visibleRegionObservations,
+    drawObservations: drawObservations,
     state: state,
   };
 })();

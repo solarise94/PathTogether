@@ -520,9 +520,7 @@ Demo 观察卡补齐「回跳来源快照」行为，对齐正式插件（§7.4 
 - 跨快照被选中的观察照常绘制高亮框（§7.2 第 2 条「或用户在观察卡中选中的一项」）；viewport 观察与无 bbox 观察维持现状（只出卡片）。
 - 测试：`tests/js/demo-ai.test.ts`（回跳主路径、降级路径、viewport 补种、跨快照选中绘制、索引清空）。
 
-## 14. 验收记录（未执行）
+## 14. 验收记录
 
-- ⬜ 手工端到端验收（§10.4 的 9 项检查，一次真实只读 Demo 运行）——未执行
-- ⬜ 外部 HistoPilot release bundle 重建、安装与版本核对（`npm run bundle:pathtogether`，§11 最后一条完成标准：不能只验证源码仓）——未执行
-
-以上全部完成前，本方案保持「代码已合并（待验收）」状态，不得标「已实施」。
+- ✅ 外部 HistoPilot release bundle 重建、安装与版本核对（2026-08-24）：`npm run bundle:pathtogether` 产出 `histopilot-pathtogether-plugin-0.1.0.tar.gz`，release/histopilot 同步至平台 plugins 卷，边缘 `/plugins/histopilot/ui/main.js` 200；同批部署核实 `static/demo.js` 新代码（`registerSnapshotView`）与 HistoPilot dist 新实现（顶层 `user_id`）均在线上服役。
+- 🔄 手工端到端验收（§10.4 的 9 项检查）：2026-08-24 已在事件流层面覆盖主链路（真实只读 Demo run：snapshot_captured×5 → observation×5 → snapshot_reviewed×4 → finished，ephemeral demo-readonly-v1 全程无标注写入）；浏览器 UI 层的手工九项检查（观察卡点选/回跳/高亮等交互）仍未逐项执行——保持 ⬜，完成后本方案才可标「已实施」。

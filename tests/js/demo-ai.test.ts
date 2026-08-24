@@ -658,20 +658,23 @@ describe("demo.js AI 视角与临时观察（批次B）", () => {
 		});
 		expect(w.HP_DEMO.visibleRegionObservations()).toEqual([]);
 
-		// 观察卡点选（toggleObservationSelect 即卡点击入口）：恢复高亮
+		// 观察卡点选（toggleObservationSelect 即卡点击入口）：恢复高亮 + 视角回跳
+		// （2026-08-24 二轮 review：currentSnapshotView 同步恢复为来源快照）
 		w.HP_DEMO.toggleObservationSelect(obsId);
 		expect(w.HP_DEMO.state.selectedObservationId).toBe(obsId);
 		expect(w.HP_DEMO.visibleRegionObservations().map((o) => o.id)).toEqual([obsId]);
-		// 再次点选取消
+		expect(w.HP_DEMO.state.currentSnapshotView!.snapshot_id).toBe("snap-1");
+		// 再次点选取消：选中态清空，但视角停留在来源快照——该观察此刻属于
+		// 「当前快照」故仍可见（画面/状态一致，不再出现框属 snap-2 的错位）
 		w.HP_DEMO.toggleObservationSelect(obsId);
-		expect(w.HP_DEMO.visibleRegionObservations()).toEqual([]);
+		expect(w.HP_DEMO.visibleRegionObservations().map((o) => o.id)).toEqual([obsId]);
 
 		// 属于其他快照的 region 观察既不属于当前快照也未选中：不画
 		w.HP_DEMO.handleEvent("observation", {
 			snapshot_id: "snap-other", scope: "region", label: "别处",
 			bbox_level0: { x: 8100, y: 8100, w: 200, h: 200 },
 		});
-		expect(w.HP_DEMO.visibleRegionObservations()).toEqual([]);
+		expect(w.HP_DEMO.visibleRegionObservations().map((o) => o.id)).toEqual([obsId]);
 	});
 
 	it("点击历史观察卡回跳来源快照：navigateToBbox 用来源快照视角 bbox，选中框跨快照绘制", () => {
@@ -703,15 +706,21 @@ describe("demo.js AI 视角与临时观察（批次B）", () => {
 		// 回跳目标是来源快照 bbox（0,0,4096,4096）外扩 20%：不是 snap-2，也不是观察自身 bbox
 		const pad = Math.max(4096, 4096) * 0.2;
 		expect(fitBoundsCalls[2]).toEqual({ x: 0 - pad, y: 0 - pad, w: 4096 + pad * 2, h: 4096 + pad * 2 });
+		// 恢复视角状态：currentSnapshotView 切回 snap-1（画面/青色框/倍率一致）
+		expect(w.HP_DEMO.state.currentSnapshotView!.snapshot_id).toBe("snap-1");
+		// 青色当前视角框（虚线 [7,5]）画的是 snap-1 的 bbox，不再是 snap-2 的
+		expect(canvas._drawn.strokes.some(
+			(s) => s.left === 0 && s.top === 0 && s.w === 4096 && s.h === 4096 && s.dash.join(",") === "7,5")).toBe(true);
 		// 跨快照选中框被绘制（绿色实线、无 dash）
 		const stroke = canvas._drawn.strokes.find(
 			(s) => s.left === 100 && s.top === 100 && s.w === 800 && s.h === 600);
 		expect(stroke).toBeTruthy();
 		expect(stroke!.dash).toEqual([]);
-		// 取消选中不重复导航
+		// 取消选中不重复导航，也不回退视角（停留在 snap-1，状态与画面一致）
 		w.HP_DEMO.toggleObservationSelect(obsId);
 		expect(fitBoundsCalls.length).toBe(3);
 		expect(w.HP_DEMO.state.selectedObservationId).toBeNull();
+		expect(w.HP_DEMO.state.currentSnapshotView!.snapshot_id).toBe("snap-1");
 	});
 
 	it("会话重建后无来源快照视角记录时：点击观察卡降级用观察自身 bbox 导航", async () => {
@@ -739,10 +748,12 @@ describe("demo.js AI 视角与临时观察（批次B）", () => {
 		const obs = w.HP_DEMO.state.observations[0];
 		expect(obs.region_ok).toBe(true);
 		w.HP_DEMO.toggleObservationSelect(obs.id!);
-		// 降级路径：用观察自身 bbox（300,400,500,400）外扩 20% 导航，保证选中框进入视野
+		// 降级路径：用观察自身 bbox（300,400,500,400）外扩 20% 导航，保证选中框进入视野；
+		// 无完整视角可恢复，currentSnapshotView 保持 snap-9 不变
 		expect(fitBoundsCalls.length).toBe(1);
 		const pad = Math.max(500, 400) * 0.2;
 		expect(fitBoundsCalls[0]).toEqual({ x: 300 - pad, y: 400 - pad, w: 500 + pad * 2, h: 400 + pad * 2 });
+		expect(w.HP_DEMO.state.currentSnapshotView!.snapshot_id).toBe("snap-9");
 		expect(canvas._drawn.strokes.some(
 			(s) => s.left === 300 && s.top === 400 && s.w === 500 && s.h === 400)).toBe(true);
 	});

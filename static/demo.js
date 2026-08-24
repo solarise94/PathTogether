@@ -698,9 +698,11 @@
   }
 
   // 观察卡点击：切换选中，并对「来自其它快照」的局部观察回跳来源快照（§7.4）。
-  // 优先用 snapshotViews 里登记的该快照视角 bbox 导航；索引缺失（旧会话重建
-  // 数据不全）时降级用观察自身 bbox 导航，保证选中框进入视野。属于当前快照
-  // 的选中维持原行为（不导航，仅高亮）。先导航，再落选中态并重画。
+  // 有索引视角时先恢复 currentSnapshotView 为来源快照（对齐正式插件）再按该
+  // 视角 bbox 导航——画面、青色当前视角框、倍率标签与可见观察集合四者一致；
+  // 取消选中不回退（停留在来源快照，状态与画面保持一致）。索引缺失（旧会话
+  // 重建数据不全）时降级：仅用观察自身 bbox 导航、不恢复视角（无法重构完整
+  // 视角状态）。属于当前快照的选中维持原行为（不导航，仅高亮）。
   function toggleObservationSelect(id) {
     var target = null;
     state.observations.forEach(function (o) { if (o && o.id === id) target = o; });
@@ -710,7 +712,12 @@
         (!state.currentSnapshotView ||
           state.currentSnapshotView.snapshot_id !== target.snapshot_id)) {
       var view = target.snapshot_id ? state.snapshotViews[target.snapshot_id] : null;
-      navigateToBbox((view && view.bbox) || target.bbox);
+      if (view) {
+        state.currentSnapshotView = view;
+        navigateToBbox(view.bbox);
+      } else {
+        navigateToBbox(target.bbox);
+      }
     }
     state.selectedObservationId = nextSel;
     updateObservationCardStates();

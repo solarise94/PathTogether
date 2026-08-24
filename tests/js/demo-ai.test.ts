@@ -210,6 +210,7 @@ function loadDemo(fetchImpl: typeof fetch) {
 				currentSnapshotView: SnapshotView | null;
 				observations: ObsEntry[];
 				selectedObservationId: string | null;
+				snapshotViews: Record<string, SnapshotView>;
 			};
 		};
 		OpenSeadragon: unknown;
@@ -671,6 +672,119 @@ describe("demo.js AI 视角与临时观察（批次B）", () => {
 			bbox_level0: { x: 8100, y: 8100, w: 200, h: 200 },
 		});
 		expect(w.HP_DEMO.visibleRegionObservations()).toEqual([]);
+	});
+
+	it("点击历史观察卡回跳来源快照：navigateToBbox 用来源快照视角 bbox，选中框跨快照绘制", () => {
+		const w = setup();
+		w.HP_DEMO.handleEvent("snapshot_captured", {
+			snapshot_id: "snap-1", bbox_level0: { x: 0, y: 0, w: 4096, h: 4096 }, magnification: "5x",
+		});
+		w.HP_DEMO.handleEvent("observation", {
+			snapshot_id: "snap-1", scope: "region", label: "低倍致密区",
+			bbox_level0: { x: 100, y: 100, w: 800, h: 600 },
+		});
+		const obsId = w.HP_DEMO.state.observations[0].id!;
+		// 快照视角索引随 snapshot_captured 登记
+		expect(w.HP_DEMO.state.snapshotViews["snap-1"]!.bbox).toEqual({ x: 0, y: 0, w: 4096, h: 4096 });
+		// 属于当前快照的选中：不额外导航
+		expect(fitBoundsCalls.length).toBe(1);
+		w.HP_DEMO.toggleObservationSelect(obsId);
+		expect(fitBoundsCalls.length).toBe(1);
+		w.HP_DEMO.toggleObservationSelect(obsId); // 取消选中
+
+		// 新快照替换当前视角后，点击历史观察卡回跳 snap-1 的快照视角
+		w.HP_DEMO.handleEvent("snapshot_captured", {
+			snapshot_id: "snap-2", bbox_level0: { x: 8000, y: 8000, w: 1024, h: 1024 }, magnification: "20x",
+		});
+		expect(fitBoundsCalls.length).toBe(2);
+		w.HP_DEMO.toggleObservationSelect(obsId);
+		expect(w.HP_DEMO.state.selectedObservationId).toBe(obsId);
+		expect(fitBoundsCalls.length).toBe(3);
+		// 回跳目标是来源快照 bbox（0,0,4096,4096）外扩 20%：不是 snap-2，也不是观察自身 bbox
+		const pad = Math.max(4096, 4096) * 0.2;
+		expect(fitBoundsCalls[2]).toEqual({ x: 0 - pad, y: 0 - pad, w: 4096 + pad * 2, h: 4096 + pad * 2 });
+		// 跨快照选中框被绘制（绿色实线、无 dash）
+		const stroke = canvas._drawn.strokes.find(
+			(s) => s.left === 100 && s.top === 100 && s.w === 800 && s.h === 600);
+		expect(stroke).toBeTruthy();
+		expect(stroke!.dash).toEqual([]);
+		// 取消选中不重复导航
+		w.HP_DEMO.toggleObservationSelect(obsId);
+		expect(fitBoundsCalls.length).toBe(3);
+		expect(w.HP_DEMO.state.selectedObservationId).toBeNull();
+	});
+
+	it("会话重建后无来源快照视角记录时：点击观察卡降级用观察自身 bbox 导航", async () => {
+		const session = {
+			session: {
+				last_event_seq: 5,
+				last_snapshot_view: {
+					snapshot_id: "snap-9",
+					bbox_level0: { x: 500, y: 600, w: 2048, h: 2048 },
+				},
+				observations: [
+					{ snapshot_id: "snap-1", scope: "region", label: "旧局部证据",
+						bbox_level0: { x: 300, y: 400, w: 500, h: 400 } },
+				],
+			},
+			transcript: [],
+		};
+		const w = setup(session);
+		w.HP_DEMO.state.sessionId = "sess_back";
+		w.HP_DEMO.handleEvent("event_reset", {});
+		await flushMicrotasks();
+		// 重建本身不导航；索引只含 last_snapshot_view（snap-1 无视角记录）
+		expect(fitBoundsCalls.length).toBe(0);
+		expect(Object.keys(w.HP_DEMO.state.snapshotViews)).toEqual(["snap-9"]);
+		const obs = w.HP_DEMO.state.observations[0];
+		expect(obs.region_ok).toBe(true);
+		w.HP_DEMO.toggleObservationSelect(obs.id!);
+		// 降级路径：用观察自身 bbox（300,400,500,400）外扩 20% 导航，保证选中框进入视野
+		expect(fitBoundsCalls.length).toBe(1);
+		const pad = Math.max(500, 400) * 0.2;
+		expect(fitBoundsCalls[0]).toEqual({ x: 300 - pad, y: 400 - pad, w: 500 + pad * 2, h: 400 + pad * 2 });
+		expect(canvas._drawn.strokes.some(
+			(s) => s.left === 300 && s.top === 400 && s.w === 500 && s.h === 400)).toBe(true);
+	});
+
+	it("会话重建从 viewport 观察补种快照视角索引，回跳优先用该快照 bbox", async () => {
+		const session = {
+			session: {
+				last_event_seq: 6,
+				last_snapshot_view: {
+					snapshot_id: "snap-9",
+					bbox_level0: { x: 500, y: 600, w: 2048, h: 2048 },
+				},
+				observations: [
+					{ snapshot_id: "snap-1", scope: "viewport", label: "全片概览",
+						bbox_level0: { x: 0, y: 0, w: 4096, h: 4096 }, magnification: "5x" },
+					{ snapshot_id: "snap-1", scope: "region", label: "低倍致密区",
+						bbox_level0: { x: 100, y: 100, w: 800, h: 600 } },
+				],
+			},
+			transcript: [],
+		};
+		const w = setup(session);
+		w.HP_DEMO.state.sessionId = "sess_seed";
+		w.HP_DEMO.handleEvent("event_reset", {});
+		await flushMicrotasks();
+		// viewport 观察按契约携带来源快照 bbox（§5.2），补种 snap-1 视角
+		expect(w.HP_DEMO.state.snapshotViews["snap-1"]!.bbox).toEqual({ x: 0, y: 0, w: 4096, h: 4096 });
+		const region = w.HP_DEMO.state.observations[1];
+		w.HP_DEMO.toggleObservationSelect(region.id!);
+		// 回跳用补种的 snap-1 快照 bbox（外扩 20%），而不是观察子区域 bbox
+		const pad = Math.max(4096, 4096) * 0.2;
+		expect(fitBoundsCalls[0]).toEqual({ x: 0 - pad, y: 0 - pad, w: 4096 + pad * 2, h: 4096 + pad * 2 });
+	});
+
+	it("clearRunOverlays 清空快照视角索引：切片切换/新 run 不残留旧回跳目标", () => {
+		const w = setup();
+		w.HP_DEMO.handleEvent("snapshot_captured", {
+			snapshot_id: "snap-1", bbox_level0: { x: 0, y: 0, w: 4096, h: 4096 }, magnification: "5x",
+		});
+		expect(w.HP_DEMO.state.snapshotViews["snap-1"]).toBeTruthy();
+		w.HP_DEMO.clearRunOverlays();
+		expect(w.HP_DEMO.state.snapshotViews).toEqual({});
 	});
 
 	it("event_reset 按新 Session 字段完整重建 current view / scope / snapshot_id", async () => {

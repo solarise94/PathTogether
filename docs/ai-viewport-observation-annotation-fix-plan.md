@@ -1,7 +1,7 @@
 # AI 视角、临时观察区与正式标注修复方案
 
 - 日期：2026-08-24
-- 状态：**已实施（2026-08-24）**。批次 A/B/C 与批次 D 的代码侧核查全部完成；实施记录见文末 §13
+- 状态：**代码已合并（2026-08-24，待验收）**。批次 A/B/C 与批次 D 的代码侧核查全部完成，实施记录见文末 §13；手工端到端验收与外部 bundle 重建安装未执行（§14 验收记录），全部完成前不得标「已实施」
 - 范围：PathTogether Demo Viewer、PathTogether HostBridge、HistoPilot PathTogether 插件及 HistoPilot 工具/会话契约
 - 涉及仓库：`PathTogether`、`HistoPilot`
 - 产品决定：只保留“当前 AI 视角、临时观察、正式标注”三类语义；**本轮不增加扫描覆盖、覆盖热图或覆盖率展示**。
@@ -510,3 +510,19 @@ PathTogether（main）：
 - `tests/js/demo-ai.test.ts:860-866` 已有断言守护：Demo 源码与 i18n 值不得出现「已标注 / 第 N 处标注 / 标注区」。
 
 结论：无残留，无需修改。
+
+### 13.4 修订记录（2026-08-24 review 修复）
+
+Demo 观察卡补齐「回跳来源快照」行为，对齐正式插件（§7.4 / §2.4 第 3 条）：
+
+- `static/demo.js` 新增 `state.snapshotViews`（snapshot_id → 视角）索引：随 `snapshot_captured` 登记；Session 重建时从 `last_snapshot_view` 与 viewport 观察按契约携带的来源快照 bbox（§5.2）补种；`clearRunOverlays`（切片切换/新 run/Session 重置）同步清空。
+- 点击观察卡：选中一个 region 观察且其 `snapshot_id` ≠ 当前 `currentSnapshotView.snapshot_id` 时，优先 `navigateToBbox(来源快照视角 bbox)`（外扩 20%，与正式插件同一导航口径）；索引缺失（旧会话重建数据不全）时降级 `navigateToBbox(观察自身 bbox)`，保证选中框进入视野。属于当前快照的选中维持原行为（仅高亮、不导航）。
+- 跨快照被选中的观察照常绘制高亮框（§7.2 第 2 条「或用户在观察卡中选中的一项」）；viewport 观察与无 bbox 观察维持现状（只出卡片）。
+- 测试：`tests/js/demo-ai.test.ts`（回跳主路径、降级路径、viewport 补种、跨快照选中绘制、索引清空）。
+
+## 14. 验收记录（未执行）
+
+- ⬜ 手工端到端验收（§10.4 的 9 项检查，一次真实只读 Demo 运行）——未执行
+- ⬜ 外部 HistoPilot release bundle 重建、安装与版本核对（`npm run bundle:pathtogether`，§11 最后一条完成标准：不能只验证源码仓）——未执行
+
+以上全部完成前，本方案保持「代码已合并（待验收）」状态，不得标「已实施」。

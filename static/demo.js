@@ -34,6 +34,7 @@
     currentSnapshotView: null, // 唯一当前 AI 视角：仅 snapshot_captured / Session 重建更新
     observations: [],     // 归一化观察：{id,snapshot_id,scope,label,note,bbox,magnification,region_ok}
     selectedObservationId: null, // 用户在观察卡中选中的观察（额外高亮）
+    snapshotViews: {},    // snapshot_id → 视角索引：观察卡回跳恢复该快照 bbox（§7.4，对齐正式插件）
     obsSeq: 0,            // 观察自增 id 计数
     abortCtrl: null,      // POST /run 的 AbortController
     streamAbort: null,    // 只读重连/恢复流的 AbortController
@@ -688,8 +689,30 @@
     $("ai-trace").scrollTop = $("ai-trace").scrollHeight;
   }
 
+  // 登记快照视角索引（§7.4，对齐正式插件 S.snapshotViews）：仅带 snapshot_id
+  // 与有效 bbox 的视角进入索引；同 id 重复登记覆盖为最新视角。
+  function registerSnapshotView(view) {
+    if (view && view.snapshot_id && view.bbox) {
+      state.snapshotViews[view.snapshot_id] = view;
+    }
+  }
+
+  // 观察卡点击：切换选中，并对「来自其它快照」的局部观察回跳来源快照（§7.4）。
+  // 优先用 snapshotViews 里登记的该快照视角 bbox 导航；索引缺失（旧会话重建
+  // 数据不全）时降级用观察自身 bbox 导航，保证选中框进入视野。属于当前快照
+  // 的选中维持原行为（不导航，仅高亮）。先导航，再落选中态并重画。
   function toggleObservationSelect(id) {
-    state.selectedObservationId = state.selectedObservationId === id ? null : id;
+    var target = null;
+    state.observations.forEach(function (o) { if (o && o.id === id) target = o; });
+    if (!target) return;
+    var nextSel = state.selectedObservationId === id ? null : id;
+    if (nextSel && target.region_ok && target.bbox &&
+        (!state.currentSnapshotView ||
+          state.currentSnapshotView.snapshot_id !== target.snapshot_id)) {
+      var view = target.snapshot_id ? state.snapshotViews[target.snapshot_id] : null;
+      navigateToBbox((view && view.bbox) || target.bbox);
+    }
+    state.selectedObservationId = nextSel;
     updateObservationCardStates();
     drawObservations();
   }
@@ -709,11 +732,13 @@
     }
   }
 
-  // 切片切换 / 新 run 开始 / Session 明确重置：清空当前视角与临时高亮（§7.2.5）
+  // 切片切换 / 新 run 开始 / Session 明确重置：清空当前视角、临时高亮与
+  // 快照视角索引（§7.2.5/§7.4）
   function clearRunOverlays() {
     state.currentSnapshotView = null;
     state.observations = [];
     state.selectedObservationId = null;
+    state.snapshotViews = {};
     state.obsSeq = 0;
     drawObservations();
   }
@@ -790,6 +815,8 @@
       closeLiveTextBubble();
       var prevView = state.currentSnapshotView;
       state.currentSnapshotView = normalizeSnapshotView(p, prevView);
+      // 登记视角索引：观察卡回跳据此恢复该快照的 bbox（§7.4）
+      registerSnapshotView(state.currentSnapshotView);
       if (state.currentSnapshotView && state.currentSnapshotView !== prevView) {
         navigateToBbox(state.currentSnapshotView.bbox);
       }
@@ -964,12 +991,26 @@
       state.currentSnapshotView = view;
       state.selectedObservationId = null;
       state.obsSeq = 0;
+      // 快照视角索引随重建归零后补种（§7.4）：last_snapshot_view 是权威来源；
+      // 旧会话其余快照的视角按契约从 viewport 观察携带的快照 bbox 补种
+      // （§5.2「供内部定位和卡片回跳使用」）。region 观察的 bbox 是子区域、
+      // 不代表快照视角，不补种——其回跳走观察自身 bbox 的降级路径。
+      state.snapshotViews = {};
+      registerSnapshotView(view);
       // observation 按 snapshot_id/scope/bbox_level0/倍率完整重建；旧记录走
       // 同一归一化函数（含 scope 推断与安全降级）
       state.observations = ((s && s.observations) || []).map(function (o) {
         var n = normalizeObservationEntry(o, view);
         n.id = "obs-" + (++state.obsSeq);
         return n;
+      });
+      state.observations.forEach(function (o) {
+        if (o && o.scope === "viewport" && o.snapshot_id &&
+            !state.snapshotViews[o.snapshot_id]) {
+          registerSnapshotView({ snapshot_id: o.snapshot_id, bbox: o.bbox, level: null,
+            magnification: o.magnification || "", out_w: null, out_h: null,
+            captured_at: null });
+        }
       });
       drawObservations();
       $("ai-trace").innerHTML = "";

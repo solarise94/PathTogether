@@ -71,6 +71,9 @@ if _RUN_PG:
         # 0012 起：邀请注册（registration_invites；users 的 ai_access 列随
         # users 清空重置）
         "registration_invites",
+        # 0017 起：Upload V2 分片任务（无 users 外键——owner_user_id 允许空，
+        # 不随 users CASCADE 清空，必须显式列出，否则跨用例残留串数据）
+        "upload_tasks",
     )
 
     @pytest.fixture(scope="session")

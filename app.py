@@ -73,9 +73,12 @@ import registration_store
 # P0-A 资源防护（docs/open-registration-security-remediation §3.3/§3.4/§3.5）：
 # upload_guard：单请求计数流 + 磁盘保留水位 + PG 权威用户配额/reservation/
 #   在途与每小时限流（json/dual fail-closed，本地免登录 owner 语义不变）；
+# upload_task_store：Upload V2 分片续传任务表（dual-backend；状态机短事务锁，
+#   重 IO 不入锁，docs/upload-resumable-fix-plan.md §3）；
 # crop_guard：主站与 share_server 共用的 crop 像素硬闸 / 每分钟像素预算 / 并发闸。
 import crop_guard
 import upload_guard
+import upload_task_store
 
 # Stage 5-1：插件 manifest 版本常量单一来源（plugins/sdk/manifest.py）。
 # plugins/ 与 plugins/sdk/ 各有 __init__.py（plugins/histopilot/ 不加，保持静态目录）。
@@ -4591,6 +4594,590 @@ def api_upload():
         return jsonify(error="无上传权限"), 403
     _upload_consume_quietly(reservation, total)
     return jsonify(name=safe)
+
+
+# =========================================================================== #
+# Upload V2：分片续传后端（docs/upload-resumable-fix-plan.md §3，U2）
+#
+# 与旧 POST /api/upload 并存（§3.4）：小文件与 ZIP/MRXS 继续走旧单请求接口；
+# V2 只支持单文件 WSI，严格串行 offset（§3.2.2），commit 三段式（§3.2.5）。
+# CSRF：/api/* 只认 X-CSRF-Token 头（U1 契约），无 token 的 PUT/POST/DELETE 在
+# 消费 body 之前即 400 csrf_required。
+# =========================================================================== #
+#: 前端切分片阈值（§3.4；U3 前端使用，本波先落服务端常量/env）：
+#: file.size >= 该值走 V2 分片，小文件继续旧单请求上传。
+UPLOAD_CHUNK_THRESHOLD = int(
+    os.environ.get("UPLOAD_CHUNK_THRESHOLD") or 128 * 1024 * 1024)
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _upload_v2_part_path(task):
+    """任务临时分片文件（.uploading-<upload_id>.part；按 offset pwrite 单次落盘）。"""
+    return UPLOAD_DIR / (".uploading-%s.part" % task["upload_id"])
+
+
+def _upload_v2_renew_reservation_quietly(task):
+    """reservation 续租（§3.2.4）：失败只记日志，任务状态机不因此回滚。"""
+    rid = task.get("reservation_id")
+    if not rid:
+        return
+    try:
+        out = upload_guard.renew_reservation(rid)
+        if out is None or out.get("state") != "reserved":
+            app.logger.warning(
+                "upload task %s 的 reservation 续租未生效（state=%r）",
+                task["upload_id"], (out or {}).get("state"))
+    except Exception:
+        app.logger.exception("upload task reservation renew failed: %s", rid)
+
+
+def _upload_v2_release_reservation_quietly(task):
+    """释放任务预占（取消/过期/确定性失败）。"""
+    rid = task.get("reservation_id")
+    if not rid:
+        return
+    try:
+        upload_guard.release_reservation(rid)
+    except Exception:
+        app.logger.exception("upload task reservation release failed: %s", rid)
+
+
+def _upload_v2_consume_reservation_quietly(task, actual_bytes):
+    """commit 成功后预占转实占（文件已落盘，记账失败不回滚）。"""
+    rid = task.get("reservation_id")
+    if not rid:
+        return
+    try:
+        upload_guard.consume_reservation(rid, int(actual_bytes))
+    except Exception:
+        app.logger.exception("upload task reservation consume failed: %s", rid)
+
+
+def _upload_v2_cleanup_part(task):
+    """清临时分片文件（取消/过期/commit 提升完成后）。"""
+    try:
+        _upload_v2_part_path(task).unlink(missing_ok=True)
+    except OSError:
+        app.logger.exception("upload task part cleanup failed: %s",
+                             task.get("upload_id"))
+
+
+def _upload_v2_own_task(task, ident):
+    """任务归属绑定（§3.2）：owner 全放行（运维语义）；user 仅自己的任务。
+
+    他人与不存在统一 403（不泄露存在性差异）。
+    """
+    if ident["role"] == user_store.ROLE_OWNER:
+        return True
+    return task.get("owner_user_id") == (ident.get("user_id") or "")
+
+
+def _upload_v2_fetch(upload_id, ident):
+    """取任务 + can_upload + 归属校验。返回 (task, error_resp) 二元组。"""
+    if not can_upload():
+        return None, (jsonify(error="无上传权限"), 403)
+    try:
+        task = upload_task_store.get_task(upload_id)
+    except Exception:
+        app.logger.exception("upload task lookup failed: %s", upload_id)
+        return None, (jsonify(error="无上传权限"), 403)
+    if task is None or not _upload_v2_own_task(task, ident):
+        return None, (jsonify(error="无上传权限"), 403)
+    return task, None
+
+
+def _upload_v2_set_ownership(task, ident=None):
+    """ownership 入库（slide_meta.owner_user_id = 任务归属者；§3.2 commit 段 B）。"""
+    share_store.set_slide_meta(
+        task["safe_name"],
+        owner_user_id=(task.get("owner_user_id") or None),
+        requester_role=(ident or {}).get("role") or user_store.ROLE_OWNER)
+
+
+def _upload_v2_recover_commit(task):
+    """committing 超时的惰性恢复（§3.2.5 崩溃恢复）。
+
+    临时文件已提升为正式文件（dest 存在且大小吻合）→ 补 ownership + consume +
+    committed 收口；否则回滚 active（临时文件保留，续传后可重新 commit）。
+    """
+    dest = UPLOAD_DIR / task["safe_name"]
+    promoted = False
+    try:
+        promoted = (dest.is_file()
+                    and dest.stat().st_size == int(task["declared_size"]))
+    except OSError:
+        promoted = False
+    if not promoted:
+        try:
+            return upload_task_store.rollback_committing(task["upload_id"])
+        except upload_task_store.UploadTaskError:
+            return upload_task_store.get_task(task["upload_id"]) or task
+    try:
+        task = upload_task_store.finish_commit(
+            task["upload_id"], task.get("commit_token") or "",
+            task.get("sha256_actual") or "")
+        _upload_v2_set_ownership(task)
+        _upload_v2_consume_reservation_quietly(task, task["declared_size"])
+        _upload_v2_cleanup_part(task)
+    except Exception:
+        app.logger.exception("upload task commit 恢复收口失败：%s",
+                             task["upload_id"])
+    return task
+
+
+def _upload_v2_maintain(task):
+    """访问路径上的惰性维护：TTL 过期收尾 + committing 超时恢复。返回最新 task。"""
+    now = time.time()
+    if (task["state"] == upload_task_store.STATE_ACTIVE
+            and task.get("expires_at") is not None
+            and float(task["expires_at"]) <= now):
+        task = upload_task_store.expire_task(task["upload_id"])
+        _upload_v2_cleanup_part(task)
+        _upload_v2_release_reservation_quietly(task)
+        return task
+    if (task["state"] == upload_task_store.STATE_COMMITTING
+            and (float(task.get("commit_started_at") or 0)
+                 + upload_task_store.UPLOAD_COMMIT_TIMEOUT_SECONDS) <= now):
+        task = _upload_v2_recover_commit(task)
+    return task
+
+
+def _upload_v2_state_body(task, **extra):
+    """GET/PUT/commit 共用的服务端权威进度快照（供刷新恢复，§3.5）。"""
+    body = {
+        "upload_id": task["upload_id"],
+        "state": task["state"],
+        "confirmed_offset": int(task["confirmed_offset"]),
+        "chunk_size": int(task["chunk_size"]),
+        "expires_at": (float(task["expires_at"])
+                       if task.get("expires_at") else None),
+    }
+    body.update(extra)
+    return jsonify(body)
+
+
+def _upload_acquire_reservation_exact(ident, nbytes):
+    """V2：按 declared_size 精确预占（创建任务时即执行，早于任何 body 接收）。"""
+    if not upload_guard.quota_applies(ident):
+        return None
+    if not upload_guard.quota_features_available():
+        return (jsonify(error="上传配额服务不可用", code="upload_guard_unavailable"), 503)
+    try:
+        return upload_guard.reserve_upload(ident["user_id"], int(nbytes))
+    except upload_guard.UploadGuardError as e:
+        return (jsonify(error=str(e), code=e.code), e.http_status)
+    except Exception:
+        app.logger.exception("upload reservation failed")
+        return (jsonify(error="上传配额服务不可用", code="upload_guard_unavailable"), 503)
+
+
+def _sha256_file(path, chunk=4 * 1024 * 1024):
+    """流式复算整文件 SHA-256（commit 阶段权威值，§3.2.3）。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            buf = f.read(chunk)
+            if not buf:
+                break
+            h.update(buf)
+    return h.hexdigest()
+
+
+@app.route("/api/uploads", methods=["POST"])
+def api_uploads_create():
+    """创建 V2 上传任务（§3.2）。
+
+    body JSON：{filename, declared_size, sha256_expected?}。预校验文件名/类型/
+    大小上限，**初始化即** reserve_upload(declared_size) + check_disk_watermark
+    （§3.3：防护前移到接收任何分片 body 之前）。返回
+    {upload_id, chunk_size, confirmed_offset:0, state:"active", expires_at}。
+
+    范围（§3.4）：只支持单文件 WSI；ZIP / MRXS 引导走旧 POST /api/upload
+    （解压与伴侣目录语义在旧接口，首版不进 V2）。
+    """
+    if not can_upload():
+        return jsonify(error="无上传权限"), 403
+    ident = current_identity()
+    body = request.get_json(silent=True) or {}
+    filename = body.get("filename")
+    if not isinstance(filename, str) or not filename.strip():
+        return jsonify(error="缺少 filename 字段"), 400
+    safe = _sanitize_name(filename.strip())
+    if not safe:
+        return jsonify(error="非法文件名"), 400
+
+    ext = safe.rsplit(".", 1)[-1].lower() if "." in safe else ""
+    if ext in ARCHIVE_EXTS or ext == "mrxs":
+        return jsonify(
+            error="ZIP/MRXS 暂不支持分片上传，请使用旧 /api/upload 单请求上传",
+            code="use_legacy_upload"), 400
+    if ext not in SUPPORTED_EXTS:
+        return jsonify(error="不支持的文件类型"), 400
+
+    try:
+        declared_size = int(body.get("declared_size"))
+    except (TypeError, ValueError):
+        return jsonify(error="declared_size 需为正整数"), 400
+    if declared_size <= 0:
+        return jsonify(error="declared_size 需为正整数"), 400
+    if declared_size > upload_guard.UPLOAD_MAX_REQUEST_BYTES:
+        return jsonify(error="文件超过单文件上限", code="upload_too_large"), 413
+
+    sha256_expected = body.get("sha256_expected")
+    if sha256_expected is not None:
+        if (not isinstance(sha256_expected, str)
+                or not _SHA256_RE.match(sha256_expected.strip().lower())):
+            return jsonify(error="sha256_expected 需为 64 位十六进制"), 400
+        sha256_expected = sha256_expected.strip().lower()
+
+    if (UPLOAD_DIR / safe).exists():
+        return jsonify(error="名称不可用", code="name_unavailable"), 409
+
+    # 初始化即预占（§3.3 防护前移：任何分片 body 接收之前）+ 磁盘水位
+    reservation = _upload_acquire_reservation_exact(ident, declared_size)
+    if isinstance(reservation, tuple):
+        return reservation
+    try:
+        upload_guard.check_disk_watermark(UPLOAD_DIR, need_bytes=declared_size)
+        task = upload_task_store.create_task(
+            owner_user_id=(ident.get("user_id") or ""),
+            filename=filename.strip(),
+            safe_name=safe,
+            declared_size=declared_size,
+            chunk_size=upload_task_store.UPLOAD_CHUNK_SIZE,
+            sha256_expected=sha256_expected,
+            reservation_id=(reservation or {}).get("reservation_id"))
+    except upload_guard.DiskWatermarkExceeded as e:
+        _upload_release_quietly(reservation)
+        return jsonify(error="磁盘空间不足", code=e.code), 507
+    except upload_guard.UploadGuardError as e:
+        _upload_release_quietly(reservation)
+        return jsonify(error=str(e), code=e.code), e.http_status
+    except Exception:
+        app.logger.exception("upload task create failed")
+        _upload_release_quietly(reservation)
+        return jsonify(error="创建上传任务失败"), 500
+    return _upload_v2_state_body(task)
+
+
+@app.route("/api/uploads/<upload_id>", methods=["GET"])
+def api_uploads_status(upload_id):
+    """任务进度快照（服务端权威）：{state, confirmed_offset, chunk_size, expires_at}。
+
+    他人/不存在统一 403（按 owner 绑定，不泄露存在性）。顺带做惰性维护：
+    TTL 过期收尾与 committing 超时恢复（§3.2.4/§3.2.5）。
+    """
+    ident = current_identity()
+    task, err = _upload_v2_fetch(upload_id, ident)
+    if err is not None:
+        return err
+    task = _upload_v2_maintain(task)
+    return _upload_v2_state_body(task)
+
+
+@app.route("/api/uploads/<upload_id>/chunk", methods=["PUT"])
+def api_uploads_put_chunk(upload_id):
+    """PUT 单个分片：**原始二进制 body（非 multipart）** + offset + 本片 SHA-256。§3.2
+
+    query：offset（非负整数）、sha256（64 位十六进制，本片哈希，写入前校验）。
+
+    - 严格串行（§3.2.2）：只接受 offset == confirmed_offset；超前 → 409
+      offset_mismatch（带当前 confirmed_offset 供对齐）。
+    - 单次落盘（§3.3）：按 offset pwrite 进同一个 .uploading-<id>.part，
+      不经 multipart 暂存；本片哈希不匹配即整段回退（ftruncate）。
+    - 幂等（§3.2.1）：与最后已确认分片同 (offset,length,sha256) 的重放 → 200
+      不重复写；同 offset 不同 length/sha256 → 409；更早分片 → 200 返回当前
+      进度（不声称哈希比对）。
+    - body 接收不在任务行锁内（慢客户端不阻塞取消/过期）；confirmed_offset
+      推进在锁内短事务完成，输给并发写者的竞争由判定回退 + commit 整文件
+      复算兜底。
+    - 成功推进/幂等重放刷新任务 expires_at 并对 reservation 续租（§3.2.4）。
+    """
+    ident = current_identity()
+    if not can_upload():
+        return jsonify(error="无上传权限"), 403
+
+    try:
+        offset = int(request.args.get("offset", ""))
+    except (TypeError, ValueError):
+        return jsonify(error="offset 需为非负整数"), 400
+    if offset < 0:
+        return jsonify(error="offset 需为非负整数"), 400
+    sha256 = (request.args.get("sha256") or "").strip().lower()
+    if not _SHA256_RE.match(sha256):
+        return jsonify(error="sha256 需为 64 位十六进制（本片哈希）"), 400
+
+    task, err = _upload_v2_fetch(upload_id, ident)
+    if err is not None:
+        return err
+    task = _upload_v2_maintain(task)
+    confirmed = int(task["confirmed_offset"])
+    if task["state"] != upload_task_store.STATE_ACTIVE:
+        return jsonify(error="任务不可写入（state=%s）" % task["state"],
+                       code="upload_state_conflict", state=task["state"],
+                       confirmed_offset=confirmed), 409
+    if offset > confirmed:
+        # 快速失败：超前分片不接收 body（客户端对齐后重发）
+        return jsonify(error="offset 超前于服务端确认点（严格串行）",
+                       code="offset_mismatch", confirmed_offset=confirmed), 409
+
+    part = _upload_v2_part_path(task)
+    declared = int(task["declared_size"])
+    is_new = offset == confirmed
+    cap = (min(upload_task_store.UPLOAD_CHUNK_MAX_BYTES, declared - confirmed)
+           if is_new else upload_task_store.UPLOAD_CHUNK_MAX_BYTES)
+    try:
+        upload_guard.check_disk_watermark(UPLOAD_DIR, need_bytes=cap)
+    except upload_guard.DiskWatermarkExceeded as e:
+        return jsonify(error="磁盘空间不足", code=e.code), 507
+
+    received = 0
+    digest = hashlib.sha256()
+    if is_new:
+        # 新分片：流式 pwrite 到 .part（单次落盘），边收边算本片哈希
+        try:
+            fd = os.open(part, os.O_WRONLY | os.O_CREAT, 0o600)
+        except OSError as e:
+            return jsonify(error="临时文件打开失败: %s" % e), 500
+        too_large = False
+        try:
+            while True:
+                buf = request.stream.read(upload_guard.CHUNK_SIZE)
+                if not buf:
+                    break
+                received += len(buf)
+                if received > cap:
+                    too_large = True
+                    break
+                digest.update(buf)
+                pos = offset + received - len(buf)
+                if os.pwrite(fd, buf, pos) != len(buf):
+                    raise OSError("pwrite 短写")
+        except OSError as e:
+            app.logger.exception("upload task chunk write failed: %s", upload_id)
+            _truncate_part_quietly(part, confirmed)
+            return jsonify(error="分片写入失败: %s" % e), 500
+        finally:
+            os.close(fd)
+        if too_large:
+            _truncate_part_quietly(part, confirmed)
+            return jsonify(error="分片超过单片上限（%d 字节）" % cap,
+                           code="chunk_too_large"), 413
+        if digest.hexdigest() != sha256:
+            _truncate_part_quietly(part, confirmed)
+            return jsonify(error="本片 SHA-256 校验失败", code="hash_mismatch"), 400
+    else:
+        # 重放/更早分片：不落盘，只计数 + 验哈希（幂等键需要 length）
+        too_large = False
+        try:
+            while True:
+                buf = request.stream.read(upload_guard.CHUNK_SIZE)
+                if not buf:
+                    break
+                received += len(buf)
+                if received > cap:
+                    too_large = True
+                    break
+                digest.update(buf)
+        except Exception as e:  # noqa: BLE001
+            return jsonify(error="分片读取失败: %s" % e), 400
+        if too_large:
+            return jsonify(error="分片超过单片上限（%d 字节）" % cap,
+                           code="chunk_too_large"), 413
+        if digest.hexdigest() != sha256:
+            return jsonify(error="本片 SHA-256 校验失败", code="hash_mismatch"), 400
+
+    if received <= 0:
+        return jsonify(error="分片不能为空", code="chunk_empty"), 400
+
+    try:
+        action, task = upload_task_store.append_chunk(
+            upload_id, offset, received, sha256)
+    except upload_task_store.OffsetMismatch as e:
+        _truncate_part_quietly(part, int(e.task["confirmed_offset"]))
+        return jsonify(error=str(e), code="offset_mismatch",
+                       confirmed_offset=int(e.task["confirmed_offset"])), 409
+    except upload_task_store.ChunkConflict as e:
+        _truncate_part_quietly(part, int(e.task["confirmed_offset"]))
+        return jsonify(error=str(e), code="chunk_conflict",
+                       confirmed_offset=int(e.task["confirmed_offset"])), 409
+    except upload_task_store.SizeMismatch as e:
+        _truncate_part_quietly(part, int(e.task["confirmed_offset"]))
+        return jsonify(error=str(e), code="size_mismatch"), 413
+    except upload_task_store.StateConflict as e:
+        return jsonify(error=str(e), code="upload_state_conflict",
+                       state=e.task["state"],
+                       confirmed_offset=int(e.task["confirmed_offset"])), 409
+    except upload_task_store.TaskNotFound:
+        return jsonify(error="无上传权限"), 403
+
+    if action in ("advanced", "idempotent"):
+        _upload_v2_renew_reservation_quietly(task)
+    return _upload_v2_state_body(task, action=action)
+
+
+def _truncate_part_quietly(part, size):
+    """把 .part 截回已确认长度（失败分片/竞争回退；低于确认点的内容不动）。"""
+    try:
+        os.truncate(part, int(size))
+    except OSError:
+        app.logger.exception("upload task part truncate failed: %s", part)
+
+
+@app.route("/api/uploads/<upload_id>/commit", methods=["POST"])
+def api_uploads_commit(upload_id):
+    """commit 三段式（§3.2.5）。§3.2：
+
+    A 短事务（active→committing，写 commit_token + 续租）→ 事务外（流式复算
+    整文件 SHA-256 → 大小校验 → 仅当客户端创建时给了 sha256_expected 才比对 →
+    **_validate_slide_file 在提升之前**（§2.3 纠正）→ 原子 no-clobber 提升 →
+    ownership 入库）→ B 短事务（token 匹配且仍 committing → committed +
+    reservation 转实占）。
+
+    失败类型（§3.1）：哈希不匹配/非法切片/名称冲突 = 确定性失败 → failed
+    （只能 DELETE 取消后重传）；IO 类临时故障 → 回滚 active 可重试。崩溃后
+    committing 超时由 _upload_v2_maintain 惰性恢复。
+    """
+    ident = current_identity()
+    if not can_upload():
+        return jsonify(error="无上传权限"), 403
+    task, err = _upload_v2_fetch(upload_id, ident)
+    if err is not None:
+        return err
+    task = _upload_v2_maintain(task)
+    if task["state"] == upload_task_store.STATE_COMMITTED:
+        return _upload_v2_state_body(task, sha256=task.get("sha256_actual"))
+    if task["state"] != upload_task_store.STATE_ACTIVE:
+        return jsonify(error="任务状态 %s 不可 commit" % task["state"],
+                       code="upload_state_conflict"), 409
+
+    # ---- 短事务 A：受理（锁内只做状态转移 + token；§3.2.5）----
+    try:
+        token, task = upload_task_store.begin_commit(upload_id)
+    except upload_task_store.SizeMismatch as e:
+        return jsonify(error=str(e), code="size_mismatch",
+                       confirmed_offset=int(e.task["confirmed_offset"]),
+                       declared_size=int(e.task["declared_size"])), 400
+    except upload_task_store.StateConflict as e:
+        return jsonify(error=str(e), code="upload_state_conflict"), 409
+    except upload_task_store.TaskNotFound:
+        return jsonify(error="无上传权限"), 403
+    _upload_v2_renew_reservation_quietly(task)
+
+    part = _upload_v2_part_path(task)
+    dest = UPLOAD_DIR / task["safe_name"]
+    declared = int(task["declared_size"])
+
+    def _deterministic_fail(code, message, sha=None):
+        """确定性失败 → failed（§3.1）：预占释放，临时文件保留待 DELETE 清理。"""
+        try:
+            t = upload_task_store.fail_commit(upload_id, token, permanent=True,
+                                              sha256_actual=sha)
+        except upload_task_store.UploadTaskError:
+            app.logger.exception("upload task fail_commit failed: %s", upload_id)
+            return jsonify(error=message, code=code), 409
+        _upload_v2_release_reservation_quietly(t)
+        return jsonify(error=message, code=code, state=t["state"]), 409
+
+    def _rollback_temp(message, status=503):
+        """临时基础设施故障 → 回滚 active，可重试 commit（§3.1）。"""
+        try:
+            upload_task_store.fail_commit(upload_id, token, permanent=False)
+        except upload_task_store.UploadTaskError:
+            app.logger.exception("upload task temp-rollback failed: %s", upload_id)
+        return jsonify(error=message, code="commit_retryable"), status
+
+    # ---- 事务外 1：流式复算整文件哈希 + 大小权威校验 ----
+    try:
+        sha_actual = _sha256_file(part)
+        size = part.stat().st_size
+    except OSError as e:
+        return _rollback_temp("临时文件读取失败: %s" % e)
+    if size != declared or size != int(task["confirmed_offset"]):
+        return _deterministic_fail(
+            "size_mismatch", "文件大小与声明不符（%d != %d）" % (size, declared),
+            sha=sha_actual)
+
+    # ---- 事务外 2：整文件哈希比对（仅客户端显式提供时；§3.2.3）----
+    expected = (task.get("sha256_expected") or "").lower()
+    if expected and sha_actual != expected:
+        return _deterministic_fail(
+            "hash_mismatch", "整文件 SHA-256 与期望不符", sha=sha_actual)
+
+    # ---- 事务外 3：OpenSlide 试开验证（**在提升之前**，§2.3 纠正）----
+    if not _validate_slide_file(part):
+        return _deterministic_fail(
+            "invalid_slide",
+            "无效的切片文件" + ("（MRXS 需打包 zip 走旧 /api/upload）"
+                              if task["safe_name"].lower().endswith(".mrxs") else ""))
+
+    # ---- 事务外 4：原子 no-clobber 提升（提升后 .part 仍在，收口失败可回退）----
+    try:
+        os.link(part, dest)
+    except FileExistsError:
+        return _deterministic_fail("name_unavailable", "名称不可用")
+    except OSError:
+        try:
+            os.replace(part, dest)  # 跨设备等场景兜底（同 api_upload）
+        except OSError as e:
+            return _rollback_temp("文件提升失败: %s" % e)
+
+    # ---- ownership 入库（提升之后、收口之前；失败清孤儿文件并回滚）----
+    try:
+        _upload_v2_set_ownership(task, ident)
+    except PermissionError:
+        dest.unlink(missing_ok=True)
+        return _rollback_temp("无上传权限", status=403)
+    except Exception:
+        app.logger.exception("upload task ownership failed: %s", upload_id)
+        dest.unlink(missing_ok=True)
+        return _rollback_temp("归属登记失败")
+
+    # ---- 短事务 B：token 匹配且仍 committing → committed（§3.2.5）----
+    try:
+        task = upload_task_store.finish_commit(upload_id, token, sha_actual)
+    except upload_task_store.StateConflict as e:
+        cur = e.task or {}
+        if cur.get("state") == upload_task_store.STATE_COMMITTED:
+            # 惰性恢复已按提升文件收口完成：以库内现状为准
+            return _upload_v2_state_body(cur, sha256=cur.get("sha256_actual"))
+        # 恢复流程已回滚 active：清掉本次孤儿提升，允许重试
+        dest.unlink(missing_ok=True)
+        return _rollback_temp("commit 已被恢复流程回滚，请重试")
+    except upload_task_store.TaskNotFound:
+        dest.unlink(missing_ok=True)
+        return jsonify(error="无上传权限"), 403
+
+    _upload_v2_consume_reservation_quietly(task, size)
+    _upload_v2_cleanup_part(task)
+    return _upload_v2_state_body(task, sha256=sha_actual)
+
+
+@app.route("/api/uploads/<upload_id>", methods=["DELETE"])
+def api_uploads_cancel(upload_id):
+    """取消任务：清临时文件 + 释放 reservation。§3.2
+
+    active/failed → cancelled；cancelled/expired 幂等返回；committing → 409
+    （不阻塞等待 commit 长事务，§3.2.5）；committed → 409（已入库不撤回，
+    删文件走 DELETE /api/slide/<name>）。
+    """
+    ident = current_identity()
+    task, err = _upload_v2_fetch(upload_id, ident)
+    if err is not None:
+        return err
+    task = _upload_v2_maintain(task)  # 先做过期/超时恢复，再判定可取消性
+    try:
+        task = upload_task_store.cancel_task(upload_id)
+    except upload_task_store.StateConflict as e:
+        return jsonify(error="任务状态 %s 不可取消" % e.task["state"],
+                       code="upload_state_conflict"), 409
+    except upload_task_store.TaskNotFound:
+        return jsonify(error="无上传权限"), 403
+    if task["state"] == upload_task_store.STATE_CANCELLED:
+        _upload_v2_cleanup_part(task)
+        _upload_v2_release_reservation_quietly(task)
+    return jsonify(upload_id=upload_id, state=task["state"])
 
 
 @app.route("/api/slide/<name>", methods=["DELETE"])

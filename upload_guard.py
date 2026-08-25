@@ -408,6 +408,53 @@ def get_reservation(reservation_id):
         conn.close()
 
 
+def renew_reservation(reservation_id, ttl_seconds=None):
+    """续租（Upload V2 §3.2.4）：把 reserved 预占的 expires_at 后移 now()+ttl。
+
+    与 ``topup_reservation``（补字节）互补：本函数不改 reserved_bytes，只把
+    ``UPLOAD_RESERVATION_TTL_SECONDS`` 的过期点整体后移，保证「任务活多久、
+    预占保多久」——上传任务 TTL（默认 24h）远长于 reservation TTL（默认
+    30min），不续租会让惰性回收把在途任务的额度释放掉，形成配额超占。
+
+    单事务内 ``SELECT ... FOR UPDATE`` 锁 reservation 行后判定：
+
+    - ``reserved`` 且未过期 → UPDATE expires_at（返回续租后的行）；
+    - ``reserved`` 但已过期（尚未被惰性回收）→ **不复活**（此刻配额可能已被
+      回收重分配，复活会双占），返回当前行，调用方据此判定预占失效；
+    - ``consumed`` / ``released`` → 幂等 no-op，返回当前行；
+    - 不存在 → None。
+    """
+    platform_features.require_pg_backend("upload_quota")
+    ttl = (UPLOAD_RESERVATION_TTL_SECONDS if ttl_seconds is None
+           else int(ttl_seconds))
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT user_id, reserved_bytes, state FROM "
+                    "upload_reservations WHERE reservation_id=%s FOR UPDATE",
+                    (reservation_id,))
+                r = cur.fetchone()
+                if r is None:
+                    return None
+                if r["state"] == "reserved":
+                    # 过期判定放 SQL（与 now() 同钟，防应用/DB 时钟偏差）；
+                    # 已过期（未被惰性回收）不复活——配额可能已被回收重分配。
+                    cur.execute(
+                        "UPDATE upload_reservations SET expires_at = now() + "
+                        "make_interval(secs => %s), updated_at=now() "
+                        "WHERE reservation_id=%s AND state='reserved' "
+                        "AND expires_at > now()", (ttl, reservation_id))
+                cur.execute(
+                    "SELECT * FROM upload_reservations WHERE reservation_id=%s",
+                    (reservation_id,))
+                row = cur.fetchone()
+        return _reservation_out(row)
+    finally:
+        conn.close()
+
+
 def release_reservation(reservation_id):
     """失败释放：reserved → released，reserved_bytes 归还配额行。
 

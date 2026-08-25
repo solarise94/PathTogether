@@ -80,6 +80,8 @@ def test_ensure_schema_idempotent(conn):
         "platform_settings", "auth_rate_limits", "ai_budget_periods",
         "ai_budget_usage", "ai_budget_reservations", "demo_sessions",
         "demo_catalog",
+        # 0017：Upload V2 分片任务表
+        "upload_tasks",
     }
     assert expected <= tables, "缺失表: %s" % (expected - tables)
 
@@ -107,6 +109,8 @@ def test_schema_migrations_recorded(conn):
     # 账户系统批次 C 追加 0016_login_id_rename.sql（users.email → login_id、
     # registration_invites.email_normalized → login_id_normalized、
     # users_email_ci_key → users_login_id_ci_key，docs §4.2 物理收口）。
+    # Upload V2（U2）追加 0017_upload_tasks.sql（分片续传任务表，docs
+    # upload-resumable-fix-plan §3.1）。
     assert rows == [
         "0001_init.sql", "0002_roi_payload.sql", "0003_comments.sql",
         "0004_audit.sql", "0005_plugin.sql", "0006_demo_budget_auth.sql",
@@ -120,6 +124,7 @@ def test_schema_migrations_recorded(conn):
         "0014_demo_daily_window.sql",
         "0015_account_auth_version.sql",
         "0016_login_id_rename.sql",
+        "0017_upload_tasks.sql",
     ]
 
 

@@ -485,47 +485,57 @@ def test_auth_still_enforced():
         app_mod.AUTH_ENABLED = False
 
 
-def test_require_admin_auth_fail_closed():
-    """REQUIRE_ADMIN_AUTH=1 时拒绝空用户名、空密码和 <...> 占位符。
+def test_require_admin_auth_fail_closed(tmp_path):
+    """bootstrap 秘密解析（账户系统批次 A docs §5.1，替代旧 _resolve_admin_auth）。
 
-    owner 身份经 env 引导进数据库，代码不再内置默认用户名（隐私整改）。
+    - REQUIRE_ADMIN_AUTH/owner 状态机的拒启语义在 tests/test_account_auth.py
+      覆盖（需要 store/monkeypatch 基建）；本用例聚焦纯函数
+      ``_resolve_bootstrap_config``：占位符守护、secret 文件读取与兼容别名。
+    - owner 身份经 env/secret 引导进数据库，代码不再内置默认用户名（隐私整改）。
     """
-    print("== REQUIRE_ADMIN_AUTH fail-closed ==")
-    user, pw, enabled = app_mod._resolve_admin_auth({})
-    check("无开关无密码 → 免认证（开发态通用名）",
-          enabled is False and pw == "" and user == "admin",
-          "user=%r pw=%r enabled=%r" % (user, pw, enabled))
-    user, pw, enabled = app_mod._resolve_admin_auth({"ADMIN_PASSWORD": "s3cret"})
-    check("有密码 → 启用认证", enabled is True and pw == "s3cret",
-          "enabled=%r pw=%r" % (enabled, pw))
+    print("== bootstrap 秘密解析 fail-closed ==")
+    login, pw, legacy = app_mod._resolve_bootstrap_config({})
+    check("无配置 → 未配置（本地开发态）",
+          pw is None and login == "" and legacy is False,
+          "login=%r pw=%r legacy=%r" % (login, pw, legacy))
+    login, pw, legacy = app_mod._resolve_bootstrap_config(
+        {"ADMIN_PASSWORD": "s3cret-password-x"})
+    check("兼容 ADMIN_PASSWORD → 读到秘密且标记 legacy",
+          pw == "s3cret-password-x" and legacy is True,
+          "pw=%r legacy=%r" % (pw, legacy))
+    login, pw, legacy = app_mod._resolve_bootstrap_config(
+        {"BOOTSTRAP_OWNER_LOGIN_ID": "boss",
+         "BOOTSTRAP_OWNER_PASSWORD_FILE": ""})
+    check("新变量名不影响无秘密判定",
+          pw is None and login == "boss" and legacy is False)
     raised = False
     try:
-        app_mod._resolve_admin_auth({"REQUIRE_ADMIN_AUTH": "1"})
+        app_mod._resolve_bootstrap_config(
+            {"BOOTSTRAP_OWNER_PASSWORD_FILE": "/no/such/file-xyz"})
     except SystemExit as e:
         raised = True
-        check("空用户名 SystemExit 文案含 ADMIN_USERNAME",
-              "ADMIN_USERNAME" in str(e), "msg=%r" % (e,))
-    check("REQUIRE_ADMIN_AUTH=1 且空用户名 → SystemExit", raised)
+        check("secret 文件不存在 SystemExit 文案含路径",
+              "/no/such/file-xyz" in str(e), "msg=%r" % (e,))
+    check("secret 文件不存在 → SystemExit", raised)
     assert raised
+    empty = tmp_path / "empty.secret"
+    empty.write_text("   \n", encoding="utf-8")
     raised = False
     try:
-        app_mod._resolve_admin_auth({"REQUIRE_ADMIN_AUTH": "1", "ADMIN_USERNAME": "admin"})
-    except SystemExit as e:
-        raised = True
-        check("空密码 SystemExit 文案含 placeholder",
-              "placeholder" in str(e), "msg=%r" % (e,))
-    check("REQUIRE_ADMIN_AUTH=1 且空密码 → SystemExit", raised)
-    assert raised
-    raised = False
-    try:
-        app_mod._resolve_admin_auth({
-            "REQUIRE_ADMIN_AUTH": "true",
-            "ADMIN_PASSWORD": app_mod.ADMIN_PASSWORD_PLACEHOLDER_SENTINEL,
-        })
+        app_mod._resolve_bootstrap_config(
+            {"BOOTSTRAP_OWNER_PASSWORD_FILE": str(empty)})
     except SystemExit:
         raised = True
-    check("REQUIRE_ADMIN_AUTH + 文档精确 sentinel → SystemExit", raised)
+    check("secret 文件为空 → SystemExit", raised)
     assert raised
+    real = tmp_path / "real.secret"
+    real.write_text("  file-secret-12345  \n", encoding="utf-8")
+    login, pw, legacy = app_mod._resolve_bootstrap_config(
+        {"BOOTSTRAP_OWNER_LOGIN_ID": "boss",
+         "BOOTSTRAP_OWNER_PASSWORD_FILE": str(real)})
+    check("secret 文件读取成功（strip）且不算 legacy",
+          pw == "file-secret-12345" and login == "boss" and legacy is False,
+          "pw=%r" % (pw,))
     sentinel = app_mod.ADMIN_PASSWORD_PLACEHOLDER_SENTINEL
     docs = Path(__file__).resolve().parents[1] / "docs" / "demo-deployment.md"
     # 文档不随仓分发（隐私整改，仅本地保留）：缺失时跳过文档断言组。
@@ -535,14 +545,11 @@ def test_require_admin_auth_fail_closed():
     assert sentinel in docs_text
     check("文档 sentinel 被判定为占位符",
           app_mod._is_placeholder_admin_password(sentinel) is True)
-    user, pw, enabled = app_mod._resolve_admin_auth({
-        "REQUIRE_ADMIN_AUTH": "1",
-        "ADMIN_USERNAME": "admin",
-        "ADMIN_PASSWORD": "not-a-placeholder",
-    })
-    check("REQUIRE_ADMIN_AUTH + 真实密码 → 启用",
-          enabled is True and pw == "not-a-placeholder",
-          "enabled=%r pw=%r" % (enabled, pw))
+    ph = tmp_path / "ph.secret"
+    ph.write_text(sentinel, encoding="utf-8")
+    _login2, pw2, _legacy2 = app_mod._resolve_bootstrap_config(
+        {"BOOTSTRAP_OWNER_PASSWORD_FILE": str(ph)})
+    check("secret 文件内容为占位符 → 视为未配置", pw2 is None)
     check("尖括号占位符判定",
           app_mod._is_placeholder_admin_password("<x>") is True)
     check("空串占位符判定",

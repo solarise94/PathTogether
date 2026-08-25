@@ -176,6 +176,7 @@ def _login(client, user):
         s["auth_user"] = user.get("email") or user.get("user_id")
         s["user_id"] = user["user_id"]
         s["role"] = user.get("role") or "user"
+        s["auth_version"] = user.get("auth_version", 1)
     return client
 
 
@@ -187,9 +188,9 @@ def _touch(name="demo.svs"):
 
 
 def _setup_users():
-    owner = user_store.create_user("owner@x.com", "ownerpass1", role="owner")
-    usera = user_store.create_user("a@x.com", "userApass1", role="user")
-    userb = user_store.create_user("b@x.com", "userBpass1", role="user")
+    owner = user_store.create_user("owner@x.com", "ownerpass123456", role="owner")
+    usera = user_store.create_user("a@x.com", "userApass123456", role="user")
+    userb = user_store.create_user("b@x.com", "userBpass123456", role="user")
     share_store.set_owner_user_id(owner["user_id"])
     return owner, usera, userb
 
@@ -476,7 +477,7 @@ def test_human_revoke_endpoint_owner_or_creator_csrf():
 
     # 其它 user → 403。
     client = _login(_client(auth_enabled=True), owner)  # 先拿 owner client 备用
-    other = user_store.create_user("d@x.com", "userDpass1", role="user")
+    other = user_store.create_user("d@x.com", "userDpass123456", role="user")
     cd = _login(_client(auth_enabled=True), other)
     r = cd.delete("/api/ai/run-grants/%s" % grant["grant_id"])
     assert r.status_code == 403
@@ -500,6 +501,7 @@ def test_human_revoke_endpoint_owner_or_creator_csrf():
         s["auth_user"] = owner.get("email")
         s["user_id"] = owner["user_id"]
         s["role"] = "owner"
+        s["auth_version"] = owner.get("auth_version", 1)
     r = raw.delete("/api/ai/run-grants/%s" % grant3["grant_id"])
     assert r.status_code == 400, r.get_json()
     assert share_store.get_run_grant(grant3["grant_id"])["revoked"] is False

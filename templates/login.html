@@ -136,6 +136,18 @@
     }
     .error-box .countdown { font-variant-numeric: tabular-nums; }
 
+    /* 改密成功提示（账户系统批次 A docs §7.1-7）：沿用 error-box 结构的
+       非错误变体（绿色、role=status） */
+    .notice-box {
+      background: rgba(52, 199, 89, 0.10);
+      color: #248a3d;
+      font-size: 13px;
+      text-align: center;
+      padding: 9px 12px;
+      border-radius: 9px;
+      margin-bottom: 16px;
+    }
+
     .field { margin-bottom: 14px; }
 
     label {
@@ -286,6 +298,12 @@
     <section class="card">
       <h2 class="title" data-i18n="login.title">登录 PathTogether</h2>
       <p class="subtitle" data-i18n="login.subtitle">登录后继续查看、测试 AI 和协作</p>
+
+      {% if password_changed %}
+      <div class="notice-box" role="status">
+        <span data-i18n="login.password_changed">密码已修改，请使用新密码重新登录</span>
+      </div>
+      {% endif %}
 
       <div class="error-box" id="error-box" role="alert"
            {% if not error and not error_code %}hidden{% endif %}>

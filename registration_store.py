@@ -33,6 +33,7 @@ from werkzeug.security import generate_password_hash
 
 import pg_store
 import platform_features
+import user_store
 
 _log = logging.getLogger("svs.registration")
 
@@ -40,8 +41,11 @@ _log = logging.getLogger("svs.registration")
 DEFAULT_INVITE_TTL_SECONDS = 7 * 86400
 #: 邀请码明文字节数（docs §4.2：至少 32 字节 CSPRNG，URL-safe 展示）
 INVITE_TOKEN_BYTES = 32
-#: 服务端密码最小长度（与既有 create_user 口径一致；UI 推荐 ≥12）
-MIN_PASSWORD_LENGTH = 8
+#: 服务端密码最小长度——统一引用 user_store 常量（账户系统批次 A docs §3.3），
+#: 保留 MIN_PASSWORD_LENGTH 名字作兼容别名（app.py 注册表单校验在用）。
+MIN_PASSWORD_LENGTH = user_store.PASSWORD_MIN_LENGTH
+#: 服务端密码最大长度（同上统一来源；兑换防御层补齐上限校验）
+MAX_PASSWORD_LENGTH = user_store.PASSWORD_MAX_LENGTH
 
 REGISTRATION_MODES = ("closed", "invite_only", "public")
 
@@ -339,8 +343,9 @@ def redeem_invite(token, email, password, display_name=None):
     platform_features.require_pg_backend("registration_invites")
     tok = (token or "").strip()
     norm_email = normalize_email(email)
-    if not tok or not isinstance(password, str) or len(password) < \
-            MIN_PASSWORD_LENGTH or not norm_email:
+    if not tok or not isinstance(password, str) or not norm_email \
+            or len(password) < MIN_PASSWORD_LENGTH \
+            or len(password) > MAX_PASSWORD_LENGTH:
         # 输入形状问题也按统一错误处理（路由层已做过表单校验，这里是防御层）
         raise InviteRedeemError("bad_input")
     token_hash = invite_token_hash(tok)

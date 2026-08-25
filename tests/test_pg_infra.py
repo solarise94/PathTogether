@@ -101,6 +101,8 @@ def test_schema_migrations_recorded(conn):
     # ai_budget_periods owner 保留 / user 共享池列）；
     # P0-A 资源防护追加 0013_upload_quotas.sql（上传配额/reservation）；
     # 0014_demo_daily_window.sql 把 demo_turn_limit 缺省改 50（每日滚动 24h 口径）。
+    # 账户系统批次 A 追加 0015_account_auth_version.sql（users.auth_version +
+    # 单 enabled owner 部分唯一索引，docs §4.1）。
     assert rows == [
         "0001_init.sql", "0002_roi_payload.sql", "0003_comments.sql",
         "0004_audit.sql", "0005_plugin.sql", "0006_demo_budget_auth.sql",
@@ -112,6 +114,7 @@ def test_schema_migrations_recorded(conn):
         "0012_registration_invites.sql",
         "0013_upload_quotas.sql",
         "0014_demo_daily_window.sql",
+        "0015_account_auth_version.sql",
     ]
 
 

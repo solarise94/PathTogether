@@ -97,13 +97,13 @@ def _token_from(client):
 
 
 def _setup_owner_and_user():
-    owner = user_store.create_user("owner@x.com", "ownerpass1", role="owner")
-    user = user_store.create_user("u@x.com", "userpass1", role="user")
+    owner = user_store.create_user("owner@x.com", "ownerpass123456", role="owner")
+    user = user_store.create_user("u@x.com", "userpass1234567", role="user")
     share_store.set_owner_user_id(owner["user_id"])
     return owner, user
 
 
-def _login_ok(client, username="owner@x.com", password="ownerpass1", **extra):
+def _login_ok(client, username="owner@x.com", password="ownerpass123456", **extra):
     return client.post("/login", data={
         "username": username, "password": password, **extra})
 
@@ -131,10 +131,10 @@ def test_csrf_login_page_issues_token_cookie():
 def test_csrf_missing_token_post_login_rejected():
     """缺 token 的 POST /login 被拒（400，可重试的 HTML 错误）。"""
     app_mod.AUTH_ENABLED = True
-    user_store.create_user("o@x.com", "ownerpass1", role="owner")
+    user_store.create_user("o@x.com", "ownerpass123456", role="owner")
     client = _raw_client()
     client.get("/login")  # 取得 session/cookie，但提交不带 token
-    r = client.post("/login", data={"username": "o@x.com", "password": "ownerpass1"})
+    r = client.post("/login", data={"username": "o@x.com", "password": "ownerpass123456"})
     assert r.status_code == 400
     # 未建立登录态
     with client.session_transaction() as s:
@@ -162,7 +162,8 @@ def test_csrf_api_write_endpoints_enforced():
     # 有 session 无 token → 400 csrf_required
     authed = _raw_client()
     with authed.session_transaction() as s:
-        s.update({"auth_user": "o", "user_id": owner["user_id"], "role": "owner"})
+        s.update({"auth_user": "o", "user_id": owner["user_id"], "role": "owner",
+                  "auth_version": owner.get("auth_version", 1)})
     r = authed.put("/api/ai/config", json={"model": "m"})
     assert r.status_code == 400
     assert r.get_json()["error"] == "csrf_required"
@@ -170,7 +171,8 @@ def test_csrf_api_write_endpoints_enforced():
     client = _client()
     client.get("/login")  # 下发 token
     with client.session_transaction() as s:
-        s.update({"auth_user": "o", "user_id": owner["user_id"], "role": "owner"})
+        s.update({"auth_user": "o", "user_id": owner["user_id"], "role": "owner",
+                  "auth_version": owner.get("auth_version", 1)})
     tok = _token_from(client)
     assert tok
     r2 = client.put("/api/ai/config", json={"model": "m"},
@@ -184,15 +186,16 @@ def test_csrf_admin_users_post_enforced():
     owner, _u = _setup_owner_and_user()
     client = _client()
     with client.session_transaction() as s:
-        s.update({"auth_user": "o", "user_id": owner["user_id"], "role": "owner"})
+        s.update({"auth_user": "o", "user_id": owner["user_id"], "role": "owner",
+                  "auth_version": owner.get("auth_version", 1)})
     # 先摘掉 wrapper 注入：直接用底层 client 发（有 session、无 token）
     r = client._base.post("/api/admin/users",
-                          json={"email": "n@x.com", "password": "password1"})
+                          json={"email": "n@x.com", "password": "password1password1"})
     assert r.status_code == 400
     assert r.get_json()["error"] == "csrf_required"
     # wrapper 自动带 token → 通过 CSRF（业务 200/400 由参数决定）
     r2 = client.post("/api/admin/users",
-                     json={"email": "n@x.com", "password": "password1"})
+                     json={"email": "n@x.com", "password": "password1password1"})
     assert r2.status_code == 200, r2.get_data(as_text=True)
 
 
@@ -205,7 +208,7 @@ def test_csrf_token_bound_to_session():
     stolen = _token_from(a)
     b = _raw_client()
     b.get("/login")  # b 有自己的 session/token
-    r = b.post("/login", data={"username": "owner@x.com", "password": "ownerpass1"},
+    r = b.post("/login", data={"username": "owner@x.com", "password": "ownerpass123456"},
                headers={"X-CSRF-Token": stolen})
     assert r.status_code == 400
     with b.session_transaction() as s:
@@ -258,7 +261,8 @@ def test_logout_post_without_csrf_rejected():
     client = _raw_client()
     client.get("/login")  # 取得 session token
     with client.session_transaction() as s:
-        s.update({"auth_user": "o", "user_id": owner["user_id"], "role": "owner"})
+        s.update({"auth_user": "o", "user_id": owner["user_id"], "role": "owner",
+                  "auth_version": owner.get("auth_version", 1)})
     r = client.post("/logout")
     assert r.status_code == 400
     assert r.get_json()["error"] == "csrf_required"
@@ -273,7 +277,8 @@ def test_logout_get_short_term_compat_with_warning(caplog):
     owner, _u = _setup_owner_and_user()
     client = _raw_client()
     with client.session_transaction() as s:
-        s.update({"auth_user": "o", "user_id": owner["user_id"], "role": "owner"})
+        s.update({"auth_user": "o", "user_id": owner["user_id"], "role": "owner",
+                  "auth_version": owner.get("auth_version", 1)})
     with caplog.at_level("WARNING"):
         r = client.get("/logout")
     assert r.status_code == 302
@@ -348,9 +353,9 @@ def test_safe_next_path_unit():
 def test_json_backend_login_fails_closed_without_store():
     """json/dual 后端 POST /login 直接 503（不退化内存计数，docs §6.3）。"""
     app_mod.AUTH_ENABLED = True
-    user_store.create_user("o@x.com", "ownerpass1", role="owner")
+    user_store.create_user("o@x.com", "ownerpass123456", role="owner")
     client = _client()
-    r = _login_ok(client, "o@x.com", "ownerpass1")
+    r = _login_ok(client, "o@x.com", "ownerpass123456")
     assert r.status_code == 503
     body = r.get_data(as_text=True)
     assert "PostgreSQL" in body
@@ -371,7 +376,7 @@ def test_login_lock_two_buckets_mock_429_with_retry_after(monkeypatch):
     # IP 前缀桶（5 次/窗）打满 → 锁定
     for _ in range(4):
         _login_ok(client, "owner@x.com", "wrongpass")
-    r2 = _login_ok(client, "owner@x.com", "ownerpass1")
+    r2 = _login_ok(client, "owner@x.com", "ownerpass123456")
     assert r2.status_code == 429
     assert int(r2.headers.get("Retry-After") or 0) > 0
     # 页面含服务端权威倒计时
@@ -387,7 +392,7 @@ def test_login_success_clears_failure_buckets(monkeypatch):
     _setup_owner_and_user()
     client = _client()
     _login_ok(client, "owner@x.com", "wrongpass")  # 1 次失败
-    r = _login_ok(client, "owner@x.com", "ownerpass1")  # 成功清桶
+    r = _login_ok(client, "owner@x.com", "ownerpass123456")  # 成功清桶
     assert r.status_code == 302
     # 清桶后可继续正常登录失败计数（未锁）
     r2 = _login_ok(client, "owner@x.com", "wrongpass")
@@ -512,12 +517,12 @@ def test_register_post_always_rejected_phase1():
     app_mod.AUTH_ENABLED = True
     client = _client()
     r = client.post("/register", json={
-        "email": "n@x.com", "password": "password1"})
+        "email": "n@x.com", "password": "password1password1"})
     assert r.status_code == 403
     assert "邀请注册" in (r.get_json() or {}).get("error", "")
     # PG 后端 registration_open=true 时也一律 403（第一阶段）
     r2 = client.post("/register", json={
-        "email": "n@x.com", "password": "password1"},
+        "email": "n@x.com", "password": "password1password1"},
         headers={"X-Registration-Open": "1"})
     assert r2.status_code == 403
 
@@ -528,7 +533,8 @@ def test_registration_mode_reads_settings_store(monkeypatch):
     owner, _u = _setup_owner_and_user()
     client = _client()
     with client.session_transaction() as s:
-        s.update({"auth_user": "o", "user_id": owner["user_id"], "role": "owner"})
+        s.update({"auth_user": "o", "user_id": owner["user_id"], "role": "owner",
+                  "auth_version": owner.get("auth_version", 1)})
     # json 后端下打开前置条件闸（PG 运行时三条件真实满足）
     monkeypatch.setattr(app_mod, "_registration_precondition_failures",
                         lambda environ=None: [])
@@ -672,7 +678,8 @@ def test_share_create_with_view_only_permissions(monkeypatch):
     share_store.set_slide_meta(slide, owner_user_id=owner["user_id"])
     client = _client()
     with client.session_transaction() as s:
-        s.update({"auth_user": "o", "user_id": owner["user_id"], "role": "owner"})
+        s.update({"auth_user": "o", "user_id": owner["user_id"], "role": "owner",
+                  "auth_version": owner.get("auth_version", 1)})
     r = client.post("/api/share/create", json={
         "slides": [slide], "expires_hours": 1, "permissions": ["view"]})
     assert r.status_code == 200
@@ -689,7 +696,7 @@ pg_only = pytest.mark.skipif(BACKEND != "postgres",
 @pg_only
 class TestPgLoginLockout:
     def _mk_users(self, n):
-        return [user_store.create_user("u%d@x.com" % i, "password1", role="user")
+        return [user_store.create_user("u%d@x.com" % i, "password1password1", role="user")
                 for i in range(n)]
 
     def test_single_ip_many_accounts_locks_ip_prefix_bucket(self):
@@ -705,7 +712,7 @@ class TestPgLoginLockout:
         assert r.status_code == 429
         assert int(r.headers.get("Retry-After") or 0) > 0
         # 锁定期内正确密码也 429
-        r2 = _login_ok(client, users[0]["email"], "password1")
+        r2 = _login_ok(client, users[0]["email"], "password1password1")
         assert r2.status_code == 429
 
     def test_single_account_many_ips_locks_account_bucket(self):
@@ -724,7 +731,7 @@ class TestPgLoginLockout:
                         environ_overrides={"REMOTE_ADDR": "198.51.100.100"})
         assert r.status_code == 429
         # 换全新 /24（IP 桶 fresh）也仍被账号桶锁住
-        r2 = client.post("/login", data={"username": target, "password": "password1"},
+        r2 = client.post("/login", data={"username": target, "password": "password1password1"},
                          environ_overrides={"REMOTE_ADDR": "203.0.113.77"})
         assert r2.status_code == 429
 
@@ -734,7 +741,7 @@ class TestPgLoginLockout:
         users = self._mk_users(1)
         client = _client()
         _login_ok(client, users[0]["email"], "wrongpass")
-        r = _login_ok(client, users[0]["email"], "password1")
+        r = _login_ok(client, users[0]["email"], "password1password1")
         assert r.status_code == 302
         # 清桶后失败不立即 429
         r2 = _login_ok(client, users[0]["email"], "wrongpass")

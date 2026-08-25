@@ -200,16 +200,16 @@
       </div>
       <div class="field">
         <label for="password" data-i18n="register.invite.password">设置密码</label>
-        <input id="password" name="password" type="password" required minlength="8"
+        <input id="password" name="password" type="password" required minlength="15"
                maxlength="200" autocomplete="new-password"
-               data-i18n-ph="register.invite.password.ph" placeholder="至少 8 位，推荐 12 位以上" />
+               data-i18n-ph="register.invite.password.ph" placeholder="至少 15 位，推荐使用密码管理器生成的长口令" />
         <!-- 允许密码管理器生成与粘贴：不做 onpaste 拦截（docs §4.4） -->
-        <p class="hint" data-i18n="register.invite.password.hint">推荐 12 位以上或长口令；可直接使用密码管理器生成并粘贴。</p>
+        <p class="hint" data-i18n="register.invite.password.hint">至少 15 位，可直接使用密码管理器生成并粘贴；不要求大小写或符号组合。</p>
       </div>
       <div class="field">
         <label for="password_confirm" data-i18n="register.invite.confirm">确认密码</label>
         <input id="password_confirm" name="password_confirm" type="password" required
-               minlength="8" maxlength="200" autocomplete="new-password" />
+               minlength="15" maxlength="200" autocomplete="new-password" />
       </div>
       <button class="btn primary" type="submit" id="register-submit"
               data-i18n="register.invite.submit">创建账号</button>

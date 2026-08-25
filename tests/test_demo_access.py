@@ -203,11 +203,14 @@ def _login(client, role, user_id):
         sess["role"] = role
         sess["user_id"] = user_id
         sess["auth_user"] = "t@x.com"
+        # 批次 A：手工 session 需携带与库内一致的凭据版本（docs §6.2）
+        row = user_store.get_user(user_id)
+        sess["auth_version"] = (row or {}).get("auth_version", 1)
 
 
 def _make_user(role="owner"):
     return user_store.create_user(
-        "u-%s@x.com" % uuid.uuid4().hex[:8], "password1", role=role)
+        "u-%s@x.com" % uuid.uuid4().hex[:8], "password1password1", role=role)
 
 
 def _touch(name="demo1.svs"):

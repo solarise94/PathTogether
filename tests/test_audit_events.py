@@ -112,8 +112,8 @@ def _touch(name="demo.svs"):
 
 
 def _setup_users():
-    owner = user_store.create_user("owner@x.com", "ownerpass1", role="owner")
-    userA = user_store.create_user("a@x.com", "userApass1", role="user")
+    owner = user_store.create_user("owner@x.com", "ownerpass123456", role="owner")
+    userA = user_store.create_user("a@x.com", "userApass123456", role="user")
     share_store.set_owner_user_id(owner["user_id"])
     return owner, userA
 
@@ -129,7 +129,7 @@ def test_audit_record_list_filter_owner_only():
     owner, userA = _setup_users()
     _touch()
     c = _client()
-    _login(c, "owner@x.com", "ownerpass1")
+    _login(c, "owner@x.com", "ownerpass123456")
     # 触发一些审计事件
     share_store.record_audit("share.create", actor_user_id=owner["user_id"],
                              actor_role="owner", target_type="share",
@@ -153,7 +153,7 @@ def test_audit_record_list_filter_owner_only():
     assert len(r.get_json()["events"]) == 1
     # 非 owner 403
     ca = _client()
-    _login(ca, "a@x.com", "userApass1")
+    _login(ca, "a@x.com", "userApass123456")
     assert ca.get("/api/admin/audit").status_code == 403
 
 
@@ -161,7 +161,7 @@ def test_audit_redaction_no_secrets():
     owner, _ = _setup_users()
     _touch()
     c = _client()
-    _login(c, "owner@x.com", "ownerpass1")
+    _login(c, "owner@x.com", "ownerpass123456")
     # AI 起跑 + 分享（经 AI 标注不落 key 到 audit，只用 detail 空）
     share_store.record_audit("ai.run", actor_role="owner", slide="demo.svs",
                              detail={"mode": "run"})
@@ -188,7 +188,7 @@ def test_changes_cursor_advance_and_tombstone():
     owner, _ = _setup_users()
     _touch()
     c = _client()
-    _login(c, "owner@x.com", "ownerpass1")
+    _login(c, "owner@x.com", "ownerpass123456")
     # 添加两条标注
     r1 = share_store.add_roi(share_store.ADMIN_TOKEN, "demo.svs", "L",
                              type="rect", x=0, y=0, side_px=10, size_mm=6.0)
@@ -217,7 +217,7 @@ def test_changes_reset_required_after_ahead():
     owner, _ = _setup_users()
     _touch()
     c = _client()
-    _login(c, "owner@x.com", "ownerpass1")
+    _login(c, "owner@x.com", "ownerpass123456")
     share_store.add_roi(share_store.ADMIN_TOKEN, "demo.svs", "L",
                         type="rect", x=0, y=0, side_px=10, size_mm=6.0)
     # after 远超当前水位 → reset_required=True
@@ -230,7 +230,7 @@ def test_changes_reset_required_after_ahead():
     assert resp.get_json()["reset_required"] is False
     # 无权限用户 → 403
     ca = _client()
-    _login(ca, "a@x.com", "userApass1")
+    _login(ca, "a@x.com", "userApass123456")
     share_store.set_slide_meta("demo.svs", owner_user_id="someone-else")
     assert ca.get("/api/annotations/changes?slide=demo.svs&after=0").status_code == 403
 
@@ -242,7 +242,7 @@ def test_ai_provenance_written_and_partial_marker():
     owner, _ = _setup_users()
     _touch()
     c = _client()
-    _login(c, "owner@x.com", "ownerpass1")
+    _login(c, "owner@x.com", "ownerpass123456")
     # 历史 AI 标注（无 provenance）→ 变更流(_roi_out)输出 partial 标记
     old = share_store.add_roi(share_store.ADMIN_TOKEN, "demo.svs", "AI",
                               type="rect", x=0, y=0, side_px=10, size_mm=6.0,
@@ -278,7 +278,7 @@ def test_ai_provenance_effect_key_idempotent():
     owner, _ = _setup_users()
     _touch()
     c = _client()
-    _login(c, "owner@x.com", "ownerpass1")
+    _login(c, "owner@x.com", "ownerpass123456")
     body = {
         "slide": "demo.svs", "label": "AI", "x": 5, "y": 6, "side_px": 10,
         "effect_key": "ek-same", "session_id": "sess-1",
@@ -300,7 +300,7 @@ def test_ai_annotate_revision_conflict_409():
     owner, _ = _setup_users()
     _touch()
     c = _client()
-    _login(c, "owner@x.com", "ownerpass1")
+    _login(c, "owner@x.com", "ownerpass123456")
     body = {
         "slide": "demo.svs", "label": "AI", "x": 5, "y": 6, "side_px": 10,
         "effect_key": "ek-rev", "expected_asset_revision": "999:123",
@@ -321,7 +321,7 @@ def test_archived_project_write_protected():
     owner, userA = _setup_users()
     _touch()
     c = _client()
-    _login(c, "owner@x.com", "ownerpass1")
+    _login(c, "owner@x.com", "ownerpass123456")
     proj = share_store.create_project("P", slides=["demo.svs"], owner_user_id=owner["user_id"])
     pid = proj["pid"]
     # 归档
@@ -371,7 +371,7 @@ def test_share_access_log_dedup():
     owner, _ = _setup_users()
     _touch()
     c = _client()
-    _login(c, "owner@x.com", "ownerpass1")
+    _login(c, "owner@x.com", "ownerpass123456")
     # 建分享
     r = c.post("/api/share/create", json={"slides": ["demo.svs"], "expires_hours": 1})
     token = r.get_json()["token"]

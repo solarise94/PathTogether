@@ -3140,3 +3140,52 @@ button {
   }
 }
 
+
+/* =========================================================================
+   修改我的密码弹窗（账户系统批次 A docs §7.1/§8.1）
+   复用 picker-mask/picker-dialog 骨架；侧栏底部的入口与退出登录同风格。
+   ========================================================================= */
+.sidebar-bottom .changepw-link {
+  display: block;
+  margin-bottom: 6px;
+}
+.changepw-body {
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.changepw-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.changepw-field input {
+  height: 30px;
+  border: 1px solid var(--separator);
+  border-radius: var(--r-btn, 8px);
+  padding: 0 10px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--text);
+  background: #fff;
+  outline: none;
+}
+.changepw-field input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.15);
+}
+.changepw-hint {
+  font-size: 11px;
+  color: var(--text-3, var(--text-2));
+  line-height: 1.5;
+}
+.changepw-error {
+  font-size: 12px;
+  color: var(--danger);
+  background: var(--danger-tint);
+  border-radius: var(--r-btn, 8px);
+  padding: 6px 10px;
+}

@@ -127,9 +127,9 @@ def _own(name, user_id):
 
 def _setup_users():
     """创建 owner + userA + userB，注入 owner 归属，返回三元组 user dict。"""
-    owner = user_store.create_user("owner@x.com", "ownerpass1", role="owner")
-    userA = user_store.create_user("a@x.com", "userApass1", role="user")
-    userB = user_store.create_user("b@x.com", "userBpass1", role="user")
+    owner = user_store.create_user("owner@x.com", "ownerpass123456", role="owner")
+    userA = user_store.create_user("a@x.com", "userApass123456", role="user")
+    userB = user_store.create_user("b@x.com", "userBpass123456", role="user")
     share_store.set_owner_user_id(owner["user_id"])
     return owner, userA, userB
 
@@ -170,7 +170,7 @@ def test_cross_user_gallery_read_denied():
     _own(sa, userA["user_id"])
 
     cb = _client()
-    _login(cb, "b@x.com", "userBpass1")
+    _login(cb, "b@x.com", "userBpass123456")
 
     # userB GET userA 的切片 info → 403
     r = cb.get("/api/slide/%s/info" % sa)
@@ -200,7 +200,7 @@ def test_cross_user_not_in_slides_list():
     _own(sb, userB["user_id"])
 
     cb = _client()
-    _login(cb, "b@x.com", "userBpass1")
+    _login(cb, "b@x.com", "userBpass123456")
     body = cb.get("/api/slides").get_json()
     names = {i["name"] for i in body}
     assert sb in names           # 自己的可见
@@ -214,7 +214,7 @@ def test_owner_sees_all_slides():
     _own(sa, userA["user_id"])
     _own(sb, userB["user_id"])
     co = _client()
-    _login(co, "owner@x.com", "ownerpass1")
+    _login(co, "owner@x.com", "ownerpass123456")
     names = {i["name"] for i in co.get("/api/slides").get_json()}
     assert sa in names and sb in names
 
@@ -228,7 +228,7 @@ def test_unauthorized_id_enumeration_consistent():
     _own(sa, userA["user_id"])
 
     cb = _client()
-    _login(cb, "b@x.com", "userBpass1")
+    _login(cb, "b@x.com", "userBpass123456")
     # 无权（存在）
     r1 = cb.get("/api/slide/%s/info" % sa)
     # 不存在
@@ -253,9 +253,9 @@ def test_annotation_write_authorization():
     _own(sa, userA["user_id"])
 
     ca = _client()
-    _login(ca, "a@x.com", "userApass1")
+    _login(ca, "a@x.com", "userApass123456")
     cb = _client()
-    _login(cb, "b@x.com", "userBpass1")
+    _login(cb, "b@x.com", "userBpass123456")
 
     # userA 在自己切片落标 → 200
     r = _post_anno(ca, sa)
@@ -279,12 +279,12 @@ def test_owner_can_delete_any_annotation():
     sa = _touch("a.svs")
     _own(sa, userA["user_id"])
     ca = _client()
-    _login(ca, "a@x.com", "userApass1")
+    _login(ca, "a@x.com", "userApass123456")
     r = _post_anno(ca, sa)
     idx = r.get_json()["index"]
 
     co = _client()
-    _login(co, "owner@x.com", "ownerpass1")
+    _login(co, "owner@x.com", "ownerpass123456")
     # owner 删 userA 创建的标注 → 200
     r = co.delete("/api/annotation/admin/%d" % idx)
     assert r.status_code == 200
@@ -299,7 +299,7 @@ def test_public_slide_visible_to_user():
     _own(sa, userA["user_id"])
 
     co = _client()
-    _login(co, "owner@x.com", "ownerpass1")
+    _login(co, "owner@x.com", "ownerpass123456")
     # owner 设置公开
     r = co.post("/api/slide/%s/meta" % sa, json={"public": True})
     assert r.status_code == 200, r.get_data(as_text=True)
@@ -307,7 +307,7 @@ def test_public_slide_visible_to_user():
 
     # userB 现在能在列表里看到 userA 的公开切片
     cb = _client()
-    _login(cb, "b@x.com", "userBpass1")
+    _login(cb, "b@x.com", "userBpass123456")
     names = {i["name"] for i in cb.get("/api/slides").get_json()}
     assert sa in names
     # 公开切片可被 userB 查看（info 不再 403；可能因 openslide stub 报错，但非 403）
@@ -321,7 +321,7 @@ def test_public_only_owner_can_set():
     _own(sa, userA["user_id"])
 
     ca = _client()
-    _login(ca, "a@x.com", "userApass1")
+    _login(ca, "a@x.com", "userApass123456")
     # user（切片拥有者）尝试设置 public → 403
     r = ca.post("/api/slide/%s/meta" % sa, json={"public": True})
     assert r.status_code == 403
@@ -392,7 +392,7 @@ def test_share_create_with_permissions_and_default():
     sa = _touch("a.svs")
     _own(sa, userA["user_id"])
     ca = _client()
-    _login(ca, "a@x.com", "userApass1")
+    _login(ca, "a@x.com", "userApass123456")
     # 显式三档
     r = ca.post("/api/share/create", json={
         "slides": [sa], "expires_hours": 1,
@@ -417,7 +417,7 @@ def test_claim_grants_visibility_and_revocation_revokes():
     token = share["token"]
 
     cb = _client()
-    _login(cb, "b@x.com", "userBpass1")
+    _login(cb, "b@x.com", "userBpass123456")
     # 认领前：userB 看不到 owner.svs
     names = {i["name"] for i in cb.get("/api/slides").get_json()}
     assert so not in names
@@ -440,10 +440,10 @@ def test_claim_grants_visibility_and_revocation_revokes():
 
     # owner 撤销分享 → userB 失去访问
     co = _client()
-    _login(co, "owner@x.com", "ownerpass1")
+    _login(co, "owner@x.com", "ownerpass123456")
     assert co.post("/api/share/revoke", json={"token": token}).status_code == 200
     cb2 = _client()
-    _login(cb2, "b@x.com", "userBpass1")
+    _login(cb2, "b@x.com", "userBpass123456")
     names = {i["name"] for i in cb2.get("/api/slides").get_json()}
     assert so not in names
     assert cb2.get("/api/slide/%s/info" % so).status_code == 403
@@ -453,7 +453,7 @@ def test_claim_invalid_share_404():
     _setup_users()
     userB = user_store.get_user_by_email("b@x.com")
     cb = _client()
-    _login(cb, "b@x.com", "userBpass1")
+    _login(cb, "b@x.com", "userBpass123456")
     r = cb.post("/api/share/nope/claim")
     assert r.status_code == 404
 
@@ -467,7 +467,7 @@ def test_claim_view_only_cannot_escalate_or_annotate():
     token = share["token"]
 
     cb = _client()
-    _login(cb, "b@x.com", "userBpass1")
+    _login(cb, "b@x.com", "userBpass123456")
     r = cb.post("/api/share/%s/claim" % token,
                 json={"permissions": ["view", "annotate"]})
     assert r.status_code == 400, r.get_data(as_text=True)
@@ -841,7 +841,7 @@ def test_user_can_only_share_own_slides():
     _own(sb, userB["user_id"])
 
     ca = _client()
-    _login(ca, "a@x.com", "userApass1")
+    _login(ca, "a@x.com", "userApass123456")
     # 分享自己的 → 200
     r = ca.post("/api/share/create", json={"slides": [sa], "expires_hours": 1})
     assert r.status_code == 200
@@ -861,7 +861,7 @@ def test_user_can_only_delete_own_slides():
     _own(sb, userB["user_id"])
 
     ca = _client()
-    _login(ca, "a@x.com", "userApass1")
+    _login(ca, "a@x.com", "userApass123456")
     # 删他人的 → 403
     r = ca.delete("/api/slide/%s" % sb)
     assert r.status_code == 403
@@ -878,13 +878,13 @@ def test_share_list_revoke_owner_vs_user():
     _own(so, owner["user_id"])
 
     co = _client()
-    _login(co, "owner@x.com", "ownerpass1")
+    _login(co, "owner@x.com", "ownerpass123456")
     # owner 创建一个分享
     r_o = co.post("/api/share/create", json={"slides": [so], "expires_hours": 1})
     tok_o = r_o.get_json()["token"]
 
     ca = _client()
-    _login(ca, "a@x.com", "userApass1")
+    _login(ca, "a@x.com", "userApass123456")
     # userA 创建一个分享
     r_a = ca.post("/api/share/create", json={"slides": [sa], "expires_hours": 1})
     tok_a = r_a.get_json()["token"]
@@ -916,14 +916,14 @@ def test_project_isolation():
     _own(sa, userA["user_id"])
 
     ca = _client()
-    _login(ca, "a@x.com", "userApass1")
+    _login(ca, "a@x.com", "userApass123456")
     r = ca.post("/api/project/create", json={"name": "PA", "slides": [sa]})
     assert r.status_code == 200, r.get_data(as_text=True)
     pid_a = r.get_json()["pid"]
     assert r.get_json()["owner_user_id"] == userA["user_id"]
 
     cb = _client()
-    _login(cb, "b@x.com", "userBpass1")
+    _login(cb, "b@x.com", "userBpass123456")
     # userB 看不到 userA 的项目
     projects = cb.get("/api/projects").get_json()
     assert all(p["pid"] != pid_a for p in projects)
@@ -938,7 +938,7 @@ def test_project_isolation():
     assert ca.get("/api/project/%s" % pid_a).status_code == 200
     # owner 能访问任意项目
     co = _client()
-    _login(co, "owner@x.com", "ownerpass1")
+    _login(co, "owner@x.com", "ownerpass123456")
     assert co.get("/api/project/%s" % pid_a).status_code == 200
 
 
@@ -950,10 +950,10 @@ def test_annotations_filtered_for_user():
     _own(sb, userB["user_id"])
 
     ca = _client()
-    _login(ca, "a@x.com", "userApass1")
+    _login(ca, "a@x.com", "userApass123456")
     assert _post_anno(ca, sa).status_code == 200
     cb = _client()
-    _login(cb, "b@x.com", "userBpass1")
+    _login(cb, "b@x.com", "userBpass123456")
     assert _post_anno(cb, sb).status_code == 200
 
     # userB 默认拉标注：只能看到自己切片的标注（不含 a.svs）

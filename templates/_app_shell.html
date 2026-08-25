@@ -215,7 +215,7 @@
             <div class="users-add-form">
               <input id="users-email" type="text" maxlength="120" data-i18n-ph="sb.users.email.ph" placeholder="邮箱 / 用户名" autocomplete="off" />
               <input id="users-display" type="text" maxlength="120" data-i18n-ph="sb.users.display.ph" placeholder="显示名（可选）" autocomplete="off" />
-              <input id="users-password" type="password" maxlength="200" data-i18n-ph="sb.users.password.ph" placeholder="初始密码（≥8位）" autocomplete="new-password" />
+              <input id="users-password" type="password" minlength="15" maxlength="200" data-i18n-ph="sb.users.password.ph" placeholder="初始密码（≥15位）" autocomplete="new-password" />
               <button id="users-add-btn" class="btn primary block" data-i18n="sb.users.add">添加用户</button>
             </div>
             <div class="users-reg-open" data-i18n="sb.users.reg.open">开放注册：关闭</div>
@@ -292,6 +292,9 @@
       </div>
 
       <div class="sidebar-bottom">
+        <!-- 修改我的密码（owner/user 均可见；账户系统批次 A docs §8.1） -->
+        <button type="button" id="changepw-btn" class="logout-link changepw-link"
+                data-i18n="acct.changepw" hidden>修改我的密码</button>
         <button type="button" id="logout-btn" class="logout-link" data-i18n="toast.logout" hidden>退出登录</button>
       </div>
       {% endif %}
@@ -317,6 +320,40 @@
           <div class="picker-footer">
             <span id="picker-selected-count" class="picker-count" data-i18n="picker.selected" data-i18n-vars="n:0">已选 0</span>
             <button id="picker-confirm" class="btn primary" data-i18n="picker.confirm">确认添加</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 修改我的密码弹窗（账户系统批次 A docs §7.1/§8.1；owner/user 通用）：
+           成功后服务端清空全部 session，前端跳 /login?password_changed=1 -->
+      <div id="changepw-mask" class="picker-mask" style="display:none;">
+        <div class="picker-dialog changepw-dialog">
+          <div class="picker-title">
+            <span data-i18n="acct.changepw.title">修改我的密码</span>
+            <button id="changepw-close" class="icon-btn close" aria-label="关闭" data-i18n-aria="picker.close">×</button>
+          </div>
+          <div class="changepw-body">
+            <label class="changepw-field">
+              <span data-i18n="acct.changepw.current">当前密码</span>
+              <input id="changepw-current" type="password" minlength="15" maxlength="200"
+                     autocomplete="current-password" />
+            </label>
+            <label class="changepw-field">
+              <span data-i18n="acct.changepw.new">新密码</span>
+              <input id="changepw-new" type="password" minlength="15" maxlength="200"
+                     autocomplete="new-password" />
+            </label>
+            <label class="changepw-field">
+              <span data-i18n="acct.changepw.confirm">确认新密码</span>
+              <input id="changepw-confirm" type="password" minlength="15" maxlength="200"
+                     autocomplete="new-password" />
+            </label>
+            <p class="changepw-hint" data-i18n="acct.changepw.hint">至少 15 位；修改成功后所有已登录设备（含本设备）都会退出，需用新密码重新登录。</p>
+            <p class="changepw-error" id="changepw-error" role="alert" hidden></p>
+          </div>
+          <div class="picker-footer">
+            <button id="changepw-cancel" class="btn secondary small" data-i18n="acct.changepw.cancel">取消</button>
+            <button id="changepw-submit" class="btn primary" data-i18n="acct.changepw.submit">修改密码</button>
           </div>
         </div>
       </div>

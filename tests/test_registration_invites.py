@@ -114,13 +114,13 @@ def _open_route_gate(monkeypatch):
 
 
 def _mk_owner():
-    return user_store.create_user("inv-owner@x.com", "ownerpass1", role="owner")
+    return user_store.create_user("inv-owner@x.com", "ownerpass123456", role="owner")
 
 
 def _owner_session(client, owner):
     with client.session_transaction() as s:
         s.update({"auth_user": "o", "user_id": owner["user_id"],
-                  "role": "owner"})
+                  "role": "owner", "auth_version": owner.get("auth_version", 1)})
 
 
 # =========================================================================== #
@@ -135,7 +135,7 @@ def test_register_closed_mode_get_and_post():
     assert "当前采用邀请注册" in body
     assert "<form" not in body
     r2 = client.post("/register", data={"email": "n@x.com",
-                                        "password": "password1"})
+                                        "password": "password1password1"})
     assert r2.status_code == 403
     assert "邀请注册" in (r2.get_json() or {}).get("error", "")
 
@@ -149,7 +149,7 @@ def test_register_public_mode_not_supported(monkeypatch):
     assert r.get_json()["code"] == "public_registration_not_supported"
     r2 = client.post("/register", data={"invite_token": "x",
                                         "email": "n@x.com",
-                                        "password": "password1"})
+                                        "password": "password1password1"})
     assert r2.status_code == 503
     assert r2.get_json()["code"] == "public_registration_not_supported"
 
@@ -166,7 +166,7 @@ def test_register_invite_only_renders_form(monkeypatch):
     assert 'name="invite_token"' in body
     assert 'name="csrf_token"' in body
     assert 'autocomplete="new-password"' in body
-    assert "12" in body  # 密码长度推荐提示
+    assert "15" in body  # 密码长度口径（批次 A 统一 15..200；minlength=15）
 
 
 def test_invite_only_degraded_without_preconditions(monkeypatch, caplog):
@@ -179,7 +179,7 @@ def test_invite_only_degraded_without_preconditions(monkeypatch, caplog):
     assert "<form" not in r.get_data(as_text=True)  # 关闭态页
     r2 = client.post("/register", data={"invite_token": "x",
                                         "email": "n@x.com",
-                                        "password": "password1"})
+                                        "password": "password1password1"})
     assert r2.status_code == 403
     assert app_mod._effective_registration_mode() == "closed"
 
@@ -267,7 +267,7 @@ def test_register_post_csrf_missing_400(monkeypatch):
     raw = _raw_client()
     raw.get("/register")
     r = raw.post("/register", data={"invite_token": "x", "email": "n@x.com",
-                                    "password": "password1"})
+                                    "password": "password1password1"})
     assert r.status_code == 400
     assert r.get_json()["error"] == "csrf_required"
 
@@ -279,9 +279,10 @@ def test_admin_registration_apis_require_owner(monkeypatch):
     # 未登录（AUTH_ENABLED=True）→ 401
     assert client.get("/api/admin/registration-invites").status_code == 401
     # 非 owner → 403
-    u = user_store.create_user("plain@x.com", "userpass1", role="user")
+    u = user_store.create_user("plain@x.com", "userpass1234567", role="user")
     with client.session_transaction() as s:
-        s.update({"auth_user": "p", "user_id": u["user_id"], "role": "user"})
+        s.update({"auth_user": "p", "user_id": u["user_id"], "role": "user",
+                  "auth_version": u.get("auth_version", 1)})
     assert client.get("/api/admin/registration-invites").status_code == 403
     assert client.post("/api/admin/registration-invites",
                        json={}).status_code == 403
@@ -338,20 +339,20 @@ def test_redeem_success_consumes_invite_and_creates_user():
     inv = registration_store.create_invite(owner["user_id"], email="bob@x.com",
                                            ai_access=True, cohort="t1")
     out = registration_store.redeem_invite(inv["token"], "bob@x.com",
-                                           "longpassword1", "Bob")
+                                           "longpassword123", "Bob")
     user = user_store.get_user(out["user"]["user_id"])
     assert user["role"] == "user"
     assert user["email"] == "bob@x.com"
     assert user["display_name"] == "Bob"
     assert user["ai_access"] is True
-    assert user_store.verify_user("bob@x.com", "longpassword1") is not None
+    assert user_store.verify_user("bob@x.com", "longpassword123") is not None
     row = registration_store.get_invite(inv["invite_id"])
     assert row["use_count"] == 1 and row["consumed_at"] is not None
     assert row["consumed_by_user_id"] == user["user_id"]
     # 再兑换：已消费 → 统一失败
     with pytest.raises(registration_store.InviteRedeemError) as ei:
         registration_store.redeem_invite(inv["token"], "bob@x.com",
-                                         "longpassword1")
+                                         "longpassword123")
     assert ei.value.code == "invite_invalid_or_unavailable"
 
 
@@ -362,7 +363,7 @@ def test_redeem_failures_all_unified():
     # 随机 token
     with pytest.raises(registration_store.InviteRedeemError) as e1:
         registration_store.redeem_invite("totally-random-token-xyz",
-                                         "x@x.com", "longpassword1")
+                                         "x@x.com", "longpassword123")
     msgs.add(str(e1.value))
     # 过期
     expired = registration_store.create_invite(owner["user_id"],
@@ -370,7 +371,7 @@ def test_redeem_failures_all_unified():
     time.sleep(1.1)
     with pytest.raises(registration_store.InviteRedeemError) as e2:
         registration_store.redeem_invite(expired["token"], "e@x.com",
-                                         "longpassword1")
+                                         "longpassword123")
     msgs.add(str(e2.value))
     # 撤销
     revoked = registration_store.create_invite(owner["user_id"],
@@ -378,11 +379,11 @@ def test_redeem_failures_all_unified():
     registration_store.revoke_invite(revoked["invite_id"], owner["user_id"])
     with pytest.raises(registration_store.InviteRedeemError) as e3:
         registration_store.redeem_invite(revoked["token"], "r@x.com",
-                                         "longpassword1")
+                                         "longpassword123")
     msgs.add(str(e3.value))
     # 无 token（空）
     with pytest.raises(registration_store.InviteRedeemError) as e4:
-        registration_store.redeem_invite("", "x@x.com", "longpassword1")
+        registration_store.redeem_invite("", "x@x.com", "longpassword123")
     msgs.add(str(e4.value))
     # 全部失败对外一个文案（无细分状态信号）
     assert len(msgs) == 1
@@ -400,14 +401,14 @@ def test_redeem_email_normalization_and_mismatch():
                                            email="Carol@X.com")
     # 大小写/空白规范化后匹配
     out = registration_store.redeem_invite(inv["token"], "  carol@x.COM ",
-                                           "longpassword1")
+                                           "longpassword123")
     assert out["email"] == "carol@x.com"
     # 不匹配邮箱：统一失败（不泄露是绑定差异）
     inv2 = registration_store.create_invite(owner["user_id"],
                                             email="dave@x.com")
     with pytest.raises(registration_store.InviteRedeemError) as ei:
         registration_store.redeem_invite(inv2["token"], "mallory@x.com",
-                                         "longpassword1")
+                                         "longpassword123")
     assert ei.value.reason == "email_mismatch"
     # 邀请码未被消费
     assert registration_store.get_invite(inv2["invite_id"])[
@@ -417,12 +418,12 @@ def test_redeem_email_normalization_and_mismatch():
 @pg_only
 def test_redeem_email_conflict_leaves_invite_unconsumed():
     owner = _mk_owner()
-    user_store.create_user("taken@x.com", "existingpass1", role="user")
+    user_store.create_user("taken@x.com", "existingpass1234", role="user")
     inv = registration_store.create_invite(owner["user_id"],
                                            email="taken@x.com")
     with pytest.raises(registration_store.InviteRedeemError) as ei:
         registration_store.redeem_invite(inv["token"], "taken@x.com",
-                                         "longpassword1")
+                                         "longpassword123")
     assert ei.value.reason == "email_taken"
     row = registration_store.get_invite(inv["invite_id"])
     assert row["use_count"] == 0
@@ -442,7 +443,7 @@ def test_concurrent_redeem_same_invite_single_winner():
         barrier.wait()
         try:
             out = registration_store.redeem_invite(inv["token"], "race@x.com",
-                                                   "longpassword1")
+                                                   "longpassword123")
             return ("ok", out["user"]["user_id"])
         except registration_store.InviteRedeemError:
             return ("fail", None)
@@ -470,12 +471,12 @@ def test_token_never_in_audit_or_exceptions():
     # 失败兑换（不匹配邮箱）与成功兑换各来一次（另一个邀请）
     try:
         registration_store.redeem_invite(inv["token"], "wrong@x.com",
-                                         "longpassword1")
+                                         "longpassword123")
     except registration_store.InviteRedeemError:
         pass
     inv2 = registration_store.create_invite(owner["user_id"], email="aud2@x.com")
     registration_store.redeem_invite(inv2["token"], "aud2@x.com",
-                                     "longpassword1")
+                                     "longpassword123")
     conn = _pg_conn()
     try:
         with conn.cursor() as cur:
@@ -495,7 +496,7 @@ def test_token_never_in_audit_or_exceptions():
     # 异常文本不含 token
     try:
         registration_store.redeem_invite(inv["token"], "wrong@x.com",
-                                         "longpassword1")
+                                         "longpassword123")
     except registration_store.InviteRedeemError as ei:
         assert inv["token"] not in str(ei)
 
@@ -567,7 +568,7 @@ def test_register_route_full_flow(monkeypatch):
         s["poison"] = "anon-session-data"  # 模拟匿名 session 残留
     r2 = anon.post("/register", data={
         "invite_token": inv["token"], "email": "flow2@x.com",
-        "password": "longpassword1", "password_confirm": "longpassword1"})
+        "password": "longpassword123", "password_confirm": "longpassword123"})
     assert r2.status_code == 302
     assert r2.headers["Location"].endswith("/login")
     with anon.session_transaction() as s:
@@ -578,7 +579,7 @@ def test_register_route_full_flow(monkeypatch):
     anon2 = _client()
     r3 = anon2.post("/register", data={
         "invite_token": inv["token"], "email": "flow2@x.com",
-        "password": "longpassword1", "password_confirm": "longpassword1"})
+        "password": "longpassword123", "password_confirm": "longpassword123"})
     assert r3.status_code == 403
     body = r3.get_data(as_text=True)
     assert "邀请码无效或当前不可用" in body

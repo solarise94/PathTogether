@@ -108,8 +108,8 @@ def _touch(name="demo.svs"):
 
 
 def _setup_users():
-    owner = user_store.create_user("owner@x.com", "ownerpass1", role="owner")
-    userA = user_store.create_user("a@x.com", "userApass1", role="user")
+    owner = user_store.create_user("owner@x.com", "ownerpass123456", role="owner")
+    userA = user_store.create_user("a@x.com", "userApass123456", role="user")
     share_store.set_owner_user_id(owner["user_id"])
     return owner, userA
 
@@ -227,7 +227,7 @@ def test_api_patch_cas_409():
     _touch()
     _setup_users()
     co = _client()
-    _login(co, "owner@x.com", "ownerpass1")
+    _login(co, "owner@x.com", "ownerpass123456")
     idx = _post_anno(co, "demo.svs").get_json()["index"]
     # 先 PATCH 一次 bump revision
     co.patch("/api/annotation/admin/%d" % idx, json={"note": "v1"})
@@ -248,7 +248,7 @@ def test_api_delete_cas_409():
     _touch()
     _setup_users()
     co = _client()
-    _login(co, "owner@x.com", "ownerpass1")
+    _login(co, "owner@x.com", "ownerpass123456")
     idx = _post_anno(co, "demo.svs").get_json()["index"]
     co.patch("/api/annotation/admin/%d" % idx, json={"note": "bump"})
     r = co.delete("/api/annotation/admin/%d" % idx,
@@ -353,7 +353,7 @@ def test_api_comments_crud_and_perms():
     _touch()
     owner, userA = _setup_users()
     co = _client()
-    _login(co, "owner@x.com", "ownerpass1")
+    _login(co, "owner@x.com", "ownerpass123456")
     idx = _post_anno(co, "demo.svs").get_json()["index"]
     # POST 评论（owner 可标注）→ 200
     r = co.post("/api/annotation/admin/%d/comments" % idx,
@@ -380,7 +380,7 @@ def test_api_comment_delete_only_author_or_owner():
     owner, userA = _setup_users()
     _own("demo.svs", owner["user_id"])
     co = _client()
-    _login(co, "owner@x.com", "ownerpass1")
+    _login(co, "owner@x.com", "ownerpass123456")
     idx = _post_anno(co, "demo.svs").get_json()["index"]
     # userA 没权访问该切片 → 评论端点 403/404（这里 demo 无 owner 归属时 owner 全开）
     # owner 发评论
@@ -388,7 +388,7 @@ def test_api_comment_delete_only_author_or_owner():
     cid = r.get_json()["comment"]["comment_id"]
     # 让 userA 登录另一 client 删 → 无权
     ca = _client()
-    _login(ca, "a@x.com", "userApass1")
+    _login(ca, "a@x.com", "userApass123456")
     # userA 不是 owner 也不是作者 → 删除 403
     r = ca.delete("/api/comment/%s" % cid)
     assert r.status_code == 403
@@ -457,7 +457,7 @@ def test_api_review_accept_reject_and_human_400():
     _touch()
     _setup_users()
     co = _client()
-    _login(co, "owner@x.com", "ownerpass1")
+    _login(co, "owner@x.com", "ownerpass123456")
     # AI 标注（默认 shared=False）
     ai_idx = _post_anno(co, "demo.svs", shared=False).get_json()["index"]
     r = co.post("/api/annotation/admin/%d/review" % ai_idx,
@@ -528,7 +528,7 @@ def test_api_history_endpoint():
     _touch()
     _setup_users()
     co = _client()
-    _login(co, "owner@x.com", "ownerpass1")
+    _login(co, "owner@x.com", "ownerpass123456")
     idx = _post_anno(co, "demo.svs").get_json()["index"]
     co.patch("/api/annotation/admin/%d" % idx, json={"note": "a"})
     co.patch("/api/annotation/admin/%d" % idx, json={"note": "b"})

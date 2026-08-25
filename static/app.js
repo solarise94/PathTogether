@@ -85,7 +85,7 @@
   var currentRole = null;
   var currentUserId = null;
 
-  // 页面初始化时拉取认证状态：启用认证则显示退出登录（附用户名）
+  // 页面初始化时拉取认证状态：启用认证则显示「修改我的密码」与退出登录
   function initAuth() {
     if (!els.logoutBtn) return;
     apiFetch("/api/auth/info").then(function (r) { return r.json(); }).then(function (info) {
@@ -94,6 +94,8 @@
         if (info.username) { label += " (" + info.username + ")"; }
         els.logoutBtn.textContent = label;
         els.logoutBtn.hidden = false;
+        // 「修改我的密码」入口：owner/user 均可见（docs §8.1）
+        if (els.changepwBtn) { els.changepwBtn.hidden = false; }
         currentRole = info.role || null;
         currentUserId = info.user_id || null;
         // AI 配置标题按角色区分（docs §8.3：owner「平台 AI 配置」/ user「我的 AI 设置」）
@@ -124,6 +126,93 @@
     });
   }
   window.HP_AUTH = { doLogout: doLogout };
+
+  // ---------- 修改我的密码（账户系统批次 A docs §7.1；owner/user 通用） ----------
+  // 弹窗三字段（当前/新/确认，minlength=15 maxlength=200 由模板约束）；
+  // POST /api/account/password（JSON + 现有 CSRF header 机制）；成功后服务端
+  // 已清空全部 session，前端跳 /login?password_changed=1 重新登录。
+  function changepwShowError(msg) {
+    if (!els.changepwError) return;
+    els.changepwError.textContent = msg || "";
+    els.changepwError.hidden = !msg;
+  }
+
+  function changepwOpen() {
+    if (!els.changepwMask) return;
+    changepwShowError("");
+    els.changepwCurrent.value = "";
+    els.changepwNew.value = "";
+    els.changepwConfirm.value = "";
+    els.changepwMask.style.display = "";
+    if (els.changepwCurrent.focus) { setTimeout(function () { els.changepwCurrent.focus(); }, 30); }
+  }
+
+  function changepwClose() {
+    if (!els.changepwMask) return;
+    els.changepwMask.style.display = "none";
+  }
+
+  function changepwSubmit() {
+    var cur = els.changepwCurrent.value || "";
+    var np = els.changepwNew.value || "";
+    var cf = els.changepwConfirm.value || "";
+    if (!cur || !np || !cf) {
+      changepwShowError(tt("acct.changepw.err.required"));
+      return;
+    }
+    if (np !== cf) {
+      changepwShowError(tt("acct.changepw.err.mismatch"));
+      return;
+    }
+    var btn = els.changepwSubmitBtn;
+    if (btn) { btn.disabled = true; }
+    apiFetch("/api/account/password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ current_password: cur, new_password: np }),
+    }).then(function (r) {
+      return r.json().then(function (b) { return { status: r.status, body: b, retry: r.headers.get("Retry-After") }; });
+    }).then(function (res) {
+      if (btn) { btn.disabled = false; }
+      if (res.status === 200) {
+        // 成功：全部 session 已失效（含本设备），跳登录页带提示参数
+        location.href = "/login?password_changed=1";
+        return;
+      }
+      var b = res.body || {};
+      if (b.error === "invalid_current_password") {
+        changepwShowError(tt("acct.changepw.err.current"));
+        return;
+      }
+      if (res.status === 429) {
+        changepwShowError(tt("acct.changepw.err.locked"));
+        return;
+      }
+      if (b.error === "新密码不能与当前密码相同") {
+        changepwShowError(tt("acct.changepw.err.same"));
+        return;
+      }
+      // 其余（长度策略等）：直接展示服务端文案（与 store 口径一致）
+      changepwShowError(b.error || tt("acct.changepw.err.generic"));
+    }).catch(function () {
+      if (btn) { btn.disabled = false; }
+      changepwShowError(tt("acct.changepw.err.generic"));
+    });
+  }
+
+  function initChangePw() {
+    if (!els.changepwMask) return;
+    els.changepwBtn.addEventListener("click", changepwOpen);
+    els.changepwClose.addEventListener("click", changepwClose);
+    els.changepwCancel.addEventListener("click", changepwClose);
+    els.changepwMask.addEventListener("click", function (e) {
+      if (e.target === els.changepwMask) { changepwClose(); }
+    });
+    els.changepwSubmitBtn.addEventListener("click", changepwSubmit);
+    els.changepwConfirm.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { changepwSubmit(); }
+    });
+  }
 
   // ---------- 用户管理（仅 owner 可见；Stage 3a 身份基础） ----------
   function showUsersMgr() {
@@ -160,19 +249,24 @@
       var statusTxt = u.disabled ? tt("sb.users.status.disabled") : tt("sb.users.status.enabled");
       var created = u.created_at ? new Date(u.created_at * 1000).toLocaleString() : "";
       var self = u.user_id === currentUserId;
+      // owner 行不渲染「重置密码」「禁用/启用」按钮（账户系统批次 A docs §3.2
+      // 不变量 5：owner 不可经 Web 被禁用/重置；owner 改密走「修改我的密码」）
+      var isOwner = u.role === "owner";
       var disableBtn = "";
-      if (!self) {
+      if (!self && !isOwner) {
         disableBtn = u.disabled
           ? '<button class="btn secondary small" data-act="enable" data-uid="' + esc(u.user_id) + '">' + esc(tt("sb.users.enable")) + '</button>'
           : '<button class="btn secondary small" data-act="disable" data-uid="' + esc(u.user_id) + '">' + esc(tt("sb.users.disable")) + '</button>';
       }
+      var resetBtn = isOwner ? "" :
+        '<button class="btn secondary small" data-act="reset" data-uid="' + esc(u.user_id) + '">' + esc(tt("sb.users.reset")) + '</button>';
       return '<div class="user-row" data-uid="' + esc(u.user_id) + '">' +
         '<div class="user-main"><span class="user-name">' + esc(u.display_name || u.email) + '</span>' +
         '<span class="user-sub">' + esc(u.email) + ' · ' + roleTxt + ' · ' + statusTxt + '</span>' +
         '<span class="user-created">' + esc(created) + '</span></div>' +
         '<div class="user-actions">' +
         disableBtn +
-        '<button class="btn secondary small" data-act="reset" data-uid="' + esc(u.user_id) + '">' + esc(tt("sb.users.reset")) + '</button>' +
+        resetBtn +
         '</div></div>';
     }).join("");
   }
@@ -648,6 +742,16 @@
     dropOverlay: $("drop-overlay"),
     toastContainer: $("toast-container"),
     logoutBtn: $("logout-btn"),
+    // 修改我的密码（账户系统批次 A docs §8.1）
+    changepwBtn: $("changepw-btn"),
+    changepwMask: $("changepw-mask"),
+    changepwClose: $("changepw-close"),
+    changepwCancel: $("changepw-cancel"),
+    changepwSubmitBtn: $("changepw-submit"),
+    changepwCurrent: $("changepw-current"),
+    changepwNew: $("changepw-new"),
+    changepwConfirm: $("changepw-confirm"),
+    changepwError: $("changepw-error"),
     roiBoxBtn: $("roi-box-btn"),
     annoAllToggle: $("anno-all-toggle"),
     // 手机端侧栏抽屉
@@ -3852,6 +3956,9 @@
 
     // 用户管理（owner）
     initUsersMgr();
+
+    // 修改我的密码（owner/user 通用；docs §8.1）
+    initChangePw();
 
     // 插件管理（owner；Stage 4-3）
     initPluginsMgr();

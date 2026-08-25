@@ -261,11 +261,31 @@ def test_usage_report_demo_total_same_window_as_gate(pg_uri):
 # --------------------------------------------------------------------------- #
 OWNER_SEQ = {"n": 0}
 
+#: 用例级 owner 缓存（0015 部分唯一索引后 PG 上不可重复 create(role=owner)；
+#: conftest 每用例 TRUNCATE，跨用例自动重建）
+_OWNER_CACHE = {"uid": None}
+
 
 def _mk_owner():
+    """取/建本用例的唯一 owner。
+
+    批次 A store 线在 PG 上加了 users_single_enabled_owner_key：第二个
+    enabled owner 会被索引拦下。本模块用例只消费 owner 的 user_id/role
+    语义，用例内多次调用共享同一 owner 即可。
+    """
+    if _OWNER_CACHE["uid"]:
+        row = user_store.get_user(_OWNER_CACHE["uid"])
+        if row is not None:
+            return row
+    owners = user_store.list_enabled_owners()
+    if owners:
+        _OWNER_CACHE["uid"] = owners[0]["user_id"]
+        return owners[0]
     OWNER_SEQ["n"] += 1
-    return user_store.create_user(
-        "bp-owner-%d@x.com" % OWNER_SEQ["n"], "ownerpass1", role="owner")
+    owner = user_store.create_bootstrap_owner(
+        "bp-owner-%d@x.com" % OWNER_SEQ["n"], "ownerpass123456")
+    _OWNER_CACHE["uid"] = owner["user_id"]
+    return owner
 
 
 def _redeem_new_user(email, ai_access=False):
@@ -273,7 +293,7 @@ def _redeem_new_user(email, ai_access=False):
     owner = _mk_owner()
     inv = registration_store.create_invite(
         owner["user_id"], email=email, ai_access=ai_access)
-    out = registration_store.redeem_invite(inv["token"], email, "userpass1")
+    out = registration_store.redeem_invite(inv["token"], email, "userpass1234567")
     return out["user"], inv
 
 
@@ -291,7 +311,7 @@ def test_invited_user_ai_access_template_true():
 
 def test_owner_legacy_created_user_keeps_ai_access():
     """owner 线下创建（/api/admin/users 路径）的存量用户保持 ai_access=True。"""
-    u = user_store.create_user("legacy@x.com", "userpass1", role="user")
+    u = user_store.create_user("legacy@x.com", "userpass1234567", role="user")
     assert user_store.get_user(u["user_id"])["ai_access"] is True
 
 
@@ -362,7 +382,8 @@ def test_ai_access_admin_api(monkeypatch):
     client = csrf_client(app_mod.app.test_client())
     with client.session_transaction() as s:
         s.update({"auth_user": "o", "user_id": owner["user_id"],
-                  "role": "owner"})
+                  "role": "owner",
+                  "auth_version": owner.get("auth_version", 1)})
     r = client.post("/api/admin/users/%s/ai-access" % u["user_id"],
                     json={"enabled": True})
     assert r.status_code == 200, r.get_data(as_text=True)
@@ -371,7 +392,8 @@ def test_ai_access_admin_api(monkeypatch):
     # 非 owner 403
     c2 = csrf_client(app_mod.app.test_client())
     with c2.session_transaction() as s:
-        s.update({"auth_user": "g", "user_id": u["user_id"], "role": "user"})
+        s.update({"auth_user": "g", "user_id": u["user_id"], "role": "user",
+                  "auth_version": u.get("auth_version", 1)})
     r2 = c2.post("/api/admin/users/%s/ai-access" % u["user_id"],
                  json={"enabled": False})
     assert r2.status_code == 403
@@ -387,7 +409,8 @@ def test_budget_put_validates_pool_sum():
     client = csrf_client(app_mod.app.test_client())
     with client.session_transaction() as s:
         s.update({"auth_user": "o", "user_id": owner["user_id"],
-                  "role": "owner"})
+                  "role": "owner",
+                  "auth_version": owner.get("auth_version", 1)})
     r = client.put("/api/admin/settings/ai-budget", json={
         "owner_reserved_turn_limit": 25, "user_pool_turn_limit": 15})
     assert r.status_code == 400

@@ -393,8 +393,10 @@ def test_resolve_primary_owner_invariants():
 def test_empty_admin_password_no_owner_disables_auth(monkeypatch):
     monkeypatch.setenv("ADMIN_PASSWORD", "")
     reset_users_file()
-    owner_id = app_mod._bootstrap_owner()
-    check("空 ADMIN_PASSWORD 不建 owner", owner_id is None)
+    # 批次 A：旧 _bootstrap_owner（env 对账式引导）已删除，改走启动状态机
+    # 纯函数（docs §5.2）：空库 + 无秘密 → owner=None（本地免认证开发态）
+    owner = app_mod._resolve_owner_at_startup({})
+    check("空 ADMIN_PASSWORD 不建 owner", owner is None)
     check("无用户 → AUTH_ENABLED False", app_mod._resolve_auth_enabled() is False)
 
 
@@ -526,22 +528,25 @@ def test_last_owner_protection(monkeypatch):
     user_store.create_user("u@x.com", PW2, role="user")
     client = make_client()
     login(client, "admin", OWNER_PW)
-    # 禁用最后一个 enabled owner → 400
+    # owner 不可经 Web 禁用（批次 A docs §3.2 不变量 5/§7.2）：任何 owner
+    # target 一律 409（旧「最后 owner 400 / 多 owner 可禁用」语义已废除）
     r = client.post("/api/admin/users/%s/disable" % owner["user_id"])
-    check("禁用最后 owner 400", r.status_code == 400)
-    check("错误文案", "最后一个" in json.loads(r.data).get("error", ""))
+    check("禁用 owner 409", r.status_code == 409, "got %s" % r.status_code)
+    check("错误文案提示 owner 保护",
+          "owner" in json.loads(r.data).get("error", ""))
+    r_enable = client.post("/api/admin/users/%s/enable" % owner["user_id"])
+    check("启用 owner 409（同口径）", r_enable.status_code == 409)
     # 仍可禁用 user
     uid = user_store.get_user_by_email("u@x.com")["user_id"]
     r2 = client.post("/api/admin/users/%s/disable" % uid)
     check("禁用 user 200", r2.status_code == 200)
-    # 多 owner 时可禁用其一：json 后端可构造多个 enabled owner 验证；
-    # PG 下 0015 部分唯一索引使该场景不可达（>1 enabled owner 由索引与启动
-    # 检查双重防御），该分支只在 json 跑。
+    # 多 owner（json 后端可直插构造）：同样 409；PG 下 0015 部分唯一索引
+    # 使该场景不可达（>1 enabled owner 由索引与启动检查双重防御）。
     if conftest.BACKEND == "json":
         user_store.create_user("o2@x.com", PW2, role="owner", display_name="o2")
         o2 = user_store.get_user_by_email("o2@x.com")["user_id"]
         r3 = client.post("/api/admin/users/%s/disable" % o2)
-        check("多 owner 时可禁用其一 200", r3.status_code == 200)
+        check("多 owner 时禁用其一也 409", r3.status_code == 409)
 
 
 def test_admin_reset_password(monkeypatch):
@@ -580,8 +585,12 @@ def test_disable_invalidates_existing_session(monkeypatch):
           "got %s" % r2.status_code)
     body = json.loads(r2.data)
     check("禁用后 error=auth_required", body.get("error") == "auth_required")
+    # session 已被清理：先 GET /login 取新 CSRF token（模拟浏览器跳转流程），
+    # 再提交旧凭据 → 401
+    user_client.get("/login")
     r3 = login(user_client, "u@x.com", PW2)
-    check("禁用期间无法再登录", r3.status_code == 401)
+    check("禁用期间无法再登录", r3.status_code == 401,
+          "got %s" % r3.status_code)
 
 
 # =========================================================================== #

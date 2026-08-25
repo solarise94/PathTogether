@@ -3,19 +3,38 @@
 # and are never started or health-gated by this container.
 set -eu
 
+# ---------------------------------------------------------------------------
+# 账户引导 footgun 守护（账户系统批次 A，docs §5.1/§10）：
+#   - 「REQUIRE_ADMIN_AUTH=1 必须有 ADMIN_PASSWORD」的硬性拒启已移除——
+#     数据库已有 owner 时无需 bootstrap 秘密即可启动；空库/无 owner 等状态
+#     由应用启动状态机 fail-fast（错误消息更可读，见 app.py §5.2）；
+#   - 显式提供的 ADMIN_PASSWORD 为占位符/空 → 拒启（复制 admin.env 未替换）；
+#   - BOOTSTRAP_OWNER_PASSWORD_FILE 被设置但文件不存在/为空 → 拒启；
+#     存在则原样传给应用（应用读文件内容，entry 不展开进环境）。
+# ---------------------------------------------------------------------------
 _ADMIN_PASSWORD_SENTINEL="<REPLACE_WITH_STRONG_PASSWORD>"
-_require_auth="$(printf '%s' "${REQUIRE_ADMIN_AUTH:-}" | tr '[:upper:]' '[:lower:]')"
-case "$_require_auth" in
-  1|true|yes)
-    _pw="${ADMIN_PASSWORD:-}"
-    case "$_pw" in
-      ""|"$_ADMIN_PASSWORD_SENTINEL"|\<*\>)
-        echo "[entry] REQUIRE_ADMIN_AUTH=1 but ADMIN_PASSWORD is empty or a placeholder; refusing to start" >&2
-        exit 1
-        ;;
-    esac
-    ;;
-esac
+if [ "${ADMIN_PASSWORD+x}" = "x" ]; then
+  # 显式提供（设置过该变量，即使值为空）才做 footgun 守护；未设置则完全
+  # 交给应用状态机（数据库已有 owner 时无需任何 bootstrap 秘密，docs §5.2）。
+  case "$ADMIN_PASSWORD" in
+    ""|"$_ADMIN_PASSWORD_SENTINEL"|\<*\>)
+      echo "[entry] ADMIN_PASSWORD is set but empty or a placeholder; refusing to start" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+_boot_pw_file="${BOOTSTRAP_OWNER_PASSWORD_FILE:-}"
+if [ -n "$_boot_pw_file" ]; then
+  if [ ! -f "$_boot_pw_file" ]; then
+    echo "[entry] BOOTSTRAP_OWNER_PASSWORD_FILE=$_boot_pw_file does not exist; refusing to start" >&2
+    exit 1
+  fi
+  if [ ! -s "$_boot_pw_file" ]; then
+    echo "[entry] BOOTSTRAP_OWNER_PASSWORD_FILE=$_boot_pw_file is empty; refusing to start" >&2
+    exit 1
+  fi
+fi
 
 _backend="$(printf '%s' "${STORAGE_BACKEND:-json}" | tr '[:upper:]' '[:lower:]')"
 case "$_backend" in

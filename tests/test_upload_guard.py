@@ -98,12 +98,17 @@ def _client(auth=False):
 def _user_session(client, role="user", user_id="usr_test"):
     """直接注入登录 session（_require_auth 认 auth_user + 回查用户）。"""
     if user_id == "usr_test":
-        u = user_store.create_user("quota@x.com", "pass1234", role=role)
+        u = user_store.create_user("quota@x.com", "pass1234pass1234", role=role)
         user_id = u["user_id"]
     with client.session_transaction() as sess:
         sess["auth_user"] = True
         sess["user_id"] = user_id
         sess["role"] = role
+        # 批次 A：手工 session 需携带凭据版本（docs §6.2；新建用户=1）
+        sess["auth_version"] = 1
+        # 批次 A：手工 session 需携带与库内一致的凭据版本（docs §6.2）
+        row = user_store.get_user(user_id)
+        sess["auth_version"] = (row or {}).get("auth_version", 1)
     return user_id
 
 
@@ -257,7 +262,7 @@ else:
 
 @pg_only
 def test_quota_row_created_with_env_default(monkeypatch):
-    uid = user_store.create_user("q1@x.com", "pass1234", role="user")["user_id"]
+    uid = user_store.create_user("q1@x.com", "pass1234pass1234", role="user")["user_id"]
     row = upload_guard.get_quota_row(uid)
     assert row["quota_bytes"] == upload_guard.UPLOAD_USER_QUOTA_BYTES
     assert row["used_bytes"] == 0 and row["reserved_bytes"] == 0
@@ -266,7 +271,7 @@ def test_quota_row_created_with_env_default(monkeypatch):
 @pg_only
 def test_concurrent_reservations_cannot_bypass_quota():
     """并发预占不越过 quota：Σ(reserved) ≤ quota，且无部分写。"""
-    uid = user_store.create_user("q2@x.com", "pass1234", role="user")["user_id"]
+    uid = user_store.create_user("q2@x.com", "pass1234pass1234", role="user")["user_id"]
     quota = 10000
     _set_quota(uid, quota)
     results = []
@@ -298,7 +303,7 @@ def test_concurrent_reservations_cannot_bypass_quota():
 
 @pg_only
 def test_failure_releases_reservation():
-    uid = user_store.create_user("q3@x.com", "pass1234", role="user")["user_id"]
+    uid = user_store.create_user("q3@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid, 10000)
     r = upload_guard.reserve_upload(uid, 6000, inflight_limit=10, hourly_limit=10)
     # 不释放时第二笔 6000 会因配额不足失败
@@ -314,7 +319,7 @@ def test_failure_releases_reservation():
 
 @pg_only
 def test_consume_converts_reserved_to_used():
-    uid = user_store.create_user("q4@x.com", "pass1234", role="user")["user_id"]
+    uid = user_store.create_user("q4@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid, 10000)
     r = upload_guard.reserve_upload(uid, 5000, inflight_limit=10, hourly_limit=10)
     upload_guard.consume_reservation(r["reservation_id"], 3000)
@@ -329,7 +334,7 @@ def test_consume_converts_reserved_to_used():
 
 @pg_only
 def test_inflight_and_hourly_limits():
-    uid = user_store.create_user("q5@x.com", "pass1234", role="user")["user_id"]
+    uid = user_store.create_user("q5@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid, 10 ** 9)
     # 在途：默认上限内成功，超限 429 语义异常
     for _ in range(upload_guard.UPLOAD_MAX_INFLIGHT):
@@ -337,7 +342,7 @@ def test_inflight_and_hourly_limits():
     with pytest.raises(upload_guard.InflightLimitExceeded):
         upload_guard.reserve_upload(uid, 100)
     # 每小时：显式小上限（独立用户），尝试次数计满即拒
-    uid2 = user_store.create_user("q6@x.com", "pass1234", role="user")["user_id"]
+    uid2 = user_store.create_user("q6@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid2, 10 ** 9)
     for _ in range(2):
         r = upload_guard.reserve_upload(uid2, 100, inflight_limit=10,
@@ -349,7 +354,7 @@ def test_inflight_and_hourly_limits():
 
 @pg_only
 def test_expired_reservation_reclaimed_on_next_reserve(monkeypatch):
-    uid = user_store.create_user("q7@x.com", "pass1234", role="user")["user_id"]
+    uid = user_store.create_user("q7@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid, 5000)
     r = upload_guard.reserve_upload(uid, 4000, inflight_limit=10, hourly_limit=10)
     # 把该预占改为已过期
@@ -367,7 +372,7 @@ def test_expired_reservation_reclaimed_on_next_reserve(monkeypatch):
 
 @pg_only
 def test_endpoint_quota_denied_and_released(monkeypatch):
-    uid = user_store.create_user("q8@x.com", "pass1234", role="user")["user_id"]
+    uid = user_store.create_user("q8@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid, 1000)
     monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
     c = _client(auth=True)
@@ -375,6 +380,8 @@ def test_endpoint_quota_denied_and_released(monkeypatch):
         sess["auth_user"] = True
         sess["user_id"] = uid
         sess["role"] = "user"
+        # 批次 A：手工 session 需携带凭据版本（docs §6.2；新建用户=1）
+        sess["auth_version"] = 1
     r = _upload(c, name="big3.svs", size=5000)
     assert r.status_code == 413
     assert r.get_json()["code"] == "upload_quota_exceeded"
@@ -386,7 +393,7 @@ def test_endpoint_quota_denied_and_released(monkeypatch):
 
 @pg_only
 def test_endpoint_success_consumes_actual_bytes(monkeypatch):
-    uid = user_store.create_user("q9@x.com", "pass1234", role="user")["user_id"]
+    uid = user_store.create_user("q9@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid, 10 ** 7)
     monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
     c = _client(auth=True)
@@ -394,6 +401,8 @@ def test_endpoint_success_consumes_actual_bytes(monkeypatch):
         sess["auth_user"] = True
         sess["user_id"] = uid
         sess["role"] = "user"
+        # 批次 A：手工 session 需携带凭据版本（docs §6.2；新建用户=1）
+        sess["auth_version"] = 1
     r = _upload(c, name="ok2.svs", size=777)
     assert r.status_code == 200, r.get_data(as_text=True)
     row = upload_guard.get_quota_row(uid)
@@ -404,7 +413,7 @@ def test_endpoint_success_consumes_actual_bytes(monkeypatch):
 
 @pg_only
 def test_endpoint_inflight_429(monkeypatch):
-    uid = user_store.create_user("q10@x.com", "pass1234", role="user")["user_id"]
+    uid = user_store.create_user("q10@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid, 10 ** 9)
     # 在途上限压到 1，并预先占满名额
     monkeypatch.setattr(upload_guard, "UPLOAD_MAX_INFLIGHT", 1)
@@ -415,6 +424,8 @@ def test_endpoint_inflight_429(monkeypatch):
         sess["auth_user"] = True
         sess["user_id"] = uid
         sess["role"] = "user"
+        # 批次 A：手工 session 需携带凭据版本（docs §6.2；新建用户=1）
+        sess["auth_version"] = 1
     r = _upload(c, name="inf.svs", size=50)
     assert r.status_code == 429
     assert r.get_json()["code"] == "upload_inflight_limit"
@@ -426,7 +437,7 @@ def test_endpoint_inflight_429(monkeypatch):
 def test_endpoint_zip_failure_releases_reservation(monkeypatch):
     """非法 zip → 400，预占释放、无残留。"""
     import zipfile
-    uid = user_store.create_user("q11@x.com", "pass1234", role="user")["user_id"]
+    uid = user_store.create_user("q11@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid, 10 ** 9)
     monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
     c = _client(auth=True)
@@ -434,6 +445,8 @@ def test_endpoint_zip_failure_releases_reservation(monkeypatch):
         sess["auth_user"] = True
         sess["user_id"] = uid
         sess["role"] = "user"
+        # 批次 A：手工 session 需携带凭据版本（docs §6.2；新建用户=1）
+        sess["auth_version"] = 1
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("readme.txt", b"no slide here")

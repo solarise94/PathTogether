@@ -41,6 +41,7 @@ from flask import (
     send_from_directory,
     session,
 )
+from werkzeug.security import check_password_hash
 from werkzeug.utils import secure_filename
 
 from openslide import OpenSlide
@@ -172,11 +173,20 @@ SHARE_BASE_URL = os.environ.get(
 ).rstrip("/")
 
 # --------------------------------------------------------------------------- #
-# 管理员登录认证（外网门户，可选）
+# 管理员认证与 owner 启动状态机（账户系统批次 A，docs §5）
+#
+# 新配置语义（docs §5.1）——环境变量只在**空库首建** owner 时生效：
+#   - REQUIRE_ADMIN_AUTH=1：生产开关，要求 postgres 后端 + 可用 owner，
+#     任一不满足即拒绝启动（fail-closed）；
+#   - BOOTSTRAP_OWNER_LOGIN_ID / BOOTSTRAP_OWNER_PASSWORD_FILE：首建引导
+#     （secret 文件被显式指定但不存在/为空 → 拒绝启动）；
+#   - ADMIN_USERNAME / ADMIN_PASSWORD：一版兼容别名（deprecated，仅空库首建时
+#     读取并告警一次）。
+# 数据库已有 owner 时任何 bootstrap 秘密都只告警、绝不参与对账/改密
+# （旧「env 密码覆盖 DB hash」行为已删除，docs §2.1/§5.2）。
+# 与 docs/demo-deployment.md 中 admin.env 示例的 sentinel 完全一致；
+# 复制未替换的占位符在需要 bootstrap 时视为未配置。
 # --------------------------------------------------------------------------- #
-# 默认：ADMIN_PASSWORD 非空才启用认证；未设置时与内网一致（免登录）。
-# Demo/公网：REQUIRE_ADMIN_AUTH=1 时密码为空或仍为文档占位符则拒绝启动（fail-closed）。
-# 与 docs/demo-deployment.md 中 admin.env 示例完全一致；复制未替换即拒绝启动。
 ADMIN_PASSWORD_PLACEHOLDER_SENTINEL = "<REPLACE_WITH_STRONG_PASSWORD>"
 
 
@@ -194,41 +204,208 @@ def _env_truthy(env, name):
     return (env.get(name) or "").strip().lower() in ("1", "true", "yes")
 
 
-def _resolve_admin_auth(environ=None):
-    """解析管理员认证。返回 (username, password, auth_enabled)。
+def _read_bootstrap_password_file(path):
+    """读 bootstrap secret 文件内容（strip 后返回）。
 
-    REQUIRE_ADMIN_AUTH 开启时 ADMIN_USERNAME/ADMIN_PASSWORD 都必须经 env 显式
-    提供（owner 身份由 env 引导进数据库管理，不 baked 在代码里；空值
-    SystemExit，避免公网免认证启动）。auth 关闭的开发态回退为通用名 "admin"。
+    文件被显式指定但不存在/不可读/为空 → SystemExit（fail-fast，docs §5.1：
+    配置错误的 secret 路径必须显式失败，不能静默当「无秘密」处理）。
+    """
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(
+            "[startup] BOOTSTRAP_OWNER_PASSWORD_FILE=%r 无法读取（%s）："
+            "请检查 secret 文件挂载后重启。" % (path, exc)
+        ) from exc
+    text = raw.strip()
+    if not text:
+        raise SystemExit(
+            "[startup] BOOTSTRAP_OWNER_PASSWORD_FILE=%r 内容为空："
+            "请提供非空 secret 后重启。" % path)
+    return text
+
+
+def _resolve_bootstrap_config(environ=None):
+    """解析 bootstrap 引导配置。返回 (login_id, password, legacy_used)。
+
+    - password 优先读 BOOTSTRAP_OWNER_PASSWORD_FILE，缺省回退一版兼容的
+      ADMIN_PASSWORD；login_id 同理（BOOTSTRAP_OWNER_LOGIN_ID → ADMIN_USERNAME）；
+    - 占位符形态（sentinel / <...>）视为未配置（password=None）；
+    - legacy_used 表示读取了 ADMIN_* 兼容名（调用方据此记 deprecated 告警）；
+    - 本函数只取值不落库，environ 可注入，便于单测。
     """
     env = os.environ if environ is None else environ
-    username = env.get("ADMIN_USERNAME") or ""
-    password = env.get("ADMIN_PASSWORD") or ""
-    if _env_truthy(env, "REQUIRE_ADMIN_AUTH") and not username.strip():
-        raise SystemExit(
-            "REQUIRE_ADMIN_AUTH=1 but ADMIN_USERNAME is empty; "
-            "refusing to start"
-        )
-    if not username:
-        username = "admin"
-    if _env_truthy(env, "REQUIRE_ADMIN_AUTH") and _is_placeholder_admin_password(password):
-        raise SystemExit(
-            "REQUIRE_ADMIN_AUTH=1 but ADMIN_PASSWORD is empty or a placeholder; "
-            "refusing to start"
-        )
-    return username, password, bool(password)
+    login_id = (env.get("BOOTSTRAP_OWNER_LOGIN_ID")
+                or env.get("ADMIN_USERNAME") or "").strip()
+    pw_file = (env.get("BOOTSTRAP_OWNER_PASSWORD_FILE") or "").strip()
+    legacy_pw = (env.get("ADMIN_PASSWORD") or "").strip()
+    legacy_used = bool(login_id and not (
+        env.get("BOOTSTRAP_OWNER_LOGIN_ID") or "").strip()) or \
+        bool(legacy_pw and not pw_file)
+    password = None
+    if pw_file:
+        password = _read_bootstrap_password_file(pw_file)
+    elif legacy_pw and not _is_placeholder_admin_password(legacy_pw):
+        password = legacy_pw
+    if password is not None and _is_placeholder_admin_password(password):
+        password = None  # secret 文件内容是占位符：视为未配置
+    return login_id, password, legacy_used
 
 
-ADMIN_USERNAME, ADMIN_PASSWORD, _AUTH_BY_PASSWORD = _resolve_admin_auth()
+def _validate_owner_hash_or_exit(owner):
+    """owner password_hash 非空校验（空 → 拒绝启动，docs §5.2）。"""
+    if not (owner.get("password_hash") or "").strip():
+        raise SystemExit(
+            "[startup] owner（%s）的 password_hash 为空，拒绝启动：请用主机侧 "
+            "break-glass CLI（python3 -m useradmin reset-owner-password "
+            "--login-id <login> --password-stdin）重置密码后重启。"
+            % owner.get("user_id"))
+
+
+def _resolve_owner_at_startup(environ=None):
+    """owner 启动状态机（docs §5.2，批次 A）：解析或空库首建 primary owner。
+
+    返回 owner dict（含 user_id）或 None（本地免认证开发态：无 owner、无
+    bootstrap 秘密且未开 REQUIRE_ADMIN_AUTH）。以下情况一律 SystemExit
+    fail-fast（消息只说明阶段与修复动作，不输出敏感内容）：
+      - REQUIRE_ADMIN_AUTH=1 但后端非 postgres（docs §9.1）；
+      - enabled owner 多于 1 个（禁止选「第一个」）；
+      - 有用户行但没有任何 enabled owner（不静默建号，docs §7.3）；
+      - REQUIRE_ADMIN_AUTH=1 但空库且无 bootstrap 秘密；
+      - owner password_hash 为空；
+      - 任何用户库/数据库读写异常（不再「捕获所有异常返回 None」）。
+
+    gunicorn 多 worker 并发首启：create_bootstrap_owner 的 advisory lock /
+    部分唯一索引保证只建一个 owner；本侧捕获 users_table_not_empty 的
+    OwnerInvariantError 后重新解析即可（并发败者正常继续启动）。
+    纯函数（environ 可注入）便于单测；import 期由下方薄壳调用一次。
+    """
+    env = os.environ if environ is None else environ
+    require_auth = _env_truthy(env, "REQUIRE_ADMIN_AUTH")
+
+    backend = getattr(share_store, "STORAGE_BACKEND", "json")
+    if require_auth and backend != "postgres":
+        raise SystemExit(
+            "[startup] REQUIRE_ADMIN_AUTH=1 要求 STORAGE_BACKEND=postgres"
+            "（当前 %r）：json/dual 不提供生产认证的一致性保证，拒绝启动。"
+            % backend)
+
+    login_id, password, legacy_used = _resolve_bootstrap_config(env)
+
+    # 1) 解析 enabled owner 集合（DB 异常 fail-fast）
+    try:
+        owners = user_store.list_enabled_owners()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        raise SystemExit(
+            "[startup] 读取 owner 集合失败（%s）：请检查用户库/数据库后重启。"
+            % exc) from exc
+
+    if len(owners) > 1:
+        raise SystemExit(
+            "[startup] multiple_enabled_owners：存在 %d 个启用的 owner，违反"
+            "单 enabled owner 不变量；须人工审计后只保留一个，拒绝启动。"
+            % len(owners))
+
+    if len(owners) == 1:
+        try:
+            owner = user_store.resolve_primary_owner()
+        except Exception as exc:
+            raise SystemExit(
+                "[startup] 解析 primary owner 失败（%s）：请检查用户库后重启。"
+                % exc) from exc
+        # 已有 owner：bootstrap 秘密一律忽略（不对账、不覆盖密码），仅告警
+        if password is not None or legacy_used:
+            app.logger.warning(
+                "数据库已有 owner，BOOTSTRAP/ADMIN_* 引导配置被忽略"
+                "（deprecated：不对账、不覆盖密码）；请从部署配置中移除。")
+        _validate_owner_hash_or_exit(owner)
+        return owner
+
+    # ---- 0 个 enabled owner ----
+    try:
+        existing_users = user_store.list_users()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        raise SystemExit(
+            "[startup] 读取用户列表失败（%s）：请检查用户库/数据库后重启。"
+            % exc) from exc
+
+    if existing_users:
+        # 已有用户行但没有 enabled owner：不允许静默建号（docs §5.2/§7.3）
+        raise SystemExit(
+            "[startup] 用户库已有 %d 行但没有启用的 owner：拒绝启动。"
+            "请人工审计，或用主机侧 break-glass CLI（python3 -m useradmin "
+            "reset-owner-password --login-id <login> --password-stdin，"
+            "必要时 --enable）恢复唯一 owner 后重启。" % len(existing_users))
+
+    if password is not None:
+        # 空库 + bootstrap 秘密 → 首建 owner（一次性；之后从 DB 解析）
+        if not login_id:
+            raise SystemExit(
+                "[startup] 提供 bootstrap 秘密但缺少登录账号：请设置 "
+                "BOOTSTRAP_OWNER_LOGIN_ID（或兼容的 ADMIN_USERNAME）后重启。")
+        if legacy_used:
+            app.logger.warning(
+                "ADMIN_USERNAME/ADMIN_PASSWORD 已 deprecated：仅在空库首建 "
+                "owner 时作为兼容别名读取；请迁移到 BOOTSTRAP_OWNER_LOGIN_ID "
+                "/ BOOTSTRAP_OWNER_PASSWORD_FILE。")
+        try:
+            user_store.create_bootstrap_owner(login_id, password)
+        except user_store.OwnerInvariantError as exc:
+            if "users_table_not_empty" in str(exc):
+                # gunicorn 多 worker 并发首启的败者：另一 worker 已建号，
+                # 重走解析即可（docs §5.3，store 层已保证只建一个）
+                try:
+                    owner = user_store.resolve_primary_owner()
+                except Exception as exc2:
+                    raise SystemExit(
+                        "[startup] 并发首建后解析 primary owner 失败（%s）。"
+                        % exc2) from exc2
+                _validate_owner_hash_or_exit(owner)
+                return owner
+            raise SystemExit(
+                "[startup] owner 首建被拒绝（%s）：请人工审计 owner 不变量。"
+                % exc) from exc
+        except SystemExit:
+            raise
+        except ValueError as exc:
+            raise SystemExit(
+                "[startup] owner 首建参数非法（%s）：请检查引导配置后重启。"
+                % exc) from exc
+        except Exception as exc:
+            raise SystemExit(
+                "[startup] owner 首建失败（%s）：请检查数据库后重启。" % exc
+            ) from exc
+        try:
+            owner = user_store.resolve_primary_owner()
+        except Exception as exc:
+            raise SystemExit(
+                "[startup] 首建后解析 primary owner 失败（%s）。" % exc) from exc
+        _validate_owner_hash_or_exit(owner)
+        return owner
+
+    # 空库且无 bootstrap 秘密：REQUIRE_ADMIN_AUTH=1 拒绝启动，否则本地开发态
+    if require_auth:
+        raise SystemExit(
+            "[startup] REQUIRE_ADMIN_AUTH=1 但用户库为空且未提供 bootstrap "
+            "秘密（BOOTSTRAP_OWNER_PASSWORD_FILE 或兼容的 ADMIN_PASSWORD）："
+            "拒绝以无 owner 的认证态启动。")
+    app.logger.info(
+        "[startup] 本地免认证开发态：无 owner、无 bootstrap 秘密"
+        "（REQUIRE_ADMIN_AUTH 未开启）。")
+    return None
 
 
 # --------------------------------------------------------------------------- #
 # PostgreSQL schema 启动接线（Stage 3b-3）
 #
-# STORAGE_BACKEND ∈ {postgres, dual} 时，在用任何仓储之前（先于 _bootstrap_owner
-# 等）确保 PG schema 已就绪：连不上 / 迁移失败 → fail-fast 退出（存储不可用不能
-# 带病启动）。gunicorn 多 worker（-w N、不 preload）并发首启时，ensure_schema 虽
-# 幂等（schema_migrations 记录 + IF NOT EXISTS），仍用 pg_advisory_lock 串行化，
+# STORAGE_BACKEND ∈ {postgres, dual} 时，在用任何仓储之前（先于 owner 启动
+# 状态机等）确保 PG schema 已就绪：连不上 / 迁移失败 → fail-fast 退出（存储不可
+# 用不能带病启动）。gunicorn 多 worker（-w N、不 preload）并发首启时，ensure_schema
+# 虽幂等（schema_migrations 记录 + IF NOT EXISTS），仍用 pg_advisory_lock 串行化，
 # 避免并发 DDL 抢跑。json 后端（默认 / AUTH_ENABLED=False）零影响——直接 return。
 # --------------------------------------------------------------------------- #
 # 固定 advisory lock key（任意稳定 bigint；"SVSG" 的 4 字节整数）。
@@ -290,31 +467,12 @@ def _check_public_demo_backend_or_exit(environ=None):
 _check_public_demo_backend_or_exit()
 
 
-def _bootstrap_owner(environ=None):
-    """owner 引导与迁移（Stage 3a 身份基础）。
-
-    ADMIN_PASSWORD 非空时：若 users.json 无 owner 角色用户，创建 owner 行
-    （email 用 ADMIN_USERNAME 值——它可以是名字不要求邮箱格式，display_name 同值）；
-    若已存在 owner 且 ADMIN_PASSWORD 与现存 hash 不匹配，更新该 owner 的
-    password_hash（env 始终可重置 owner 密码，保住「改密码靠 env」运维习惯）。
-
-    返回 owner 的 user_id；ADMIN_PASSWORD 为空时返回 None。
-    """
-    env = os.environ if environ is None else environ
-    password = env.get("ADMIN_PASSWORD") or ""
-    if not password:
-        return None
-    username = env.get("ADMIN_USERNAME") or "admin"
-    try:
-        owner = user_store.ensure_owner(username, password)
-    except Exception:
-        # 引导失败不阻断启动；auth 仍由密码开启，登录时会因无 owner 而无法验证
-        return None
-    return owner.get("user_id") if owner else None
-
-
 def _repair_pg_empty_password_hashes():
-    """dual/postgres：把 json 权威 hash 回填到旧 dual 写入的空 password_hash 行。"""
+    """dual/postgres：把 json 权威 hash 回填到旧 dual 写入的空 password_hash 行。
+
+    批次 C（docs §9.2）会把本调用改为显式迁移脚本，届时整体移除；
+    本批次保留每次启动修复（与 store 线合入前的行为一致）。
+    """
     backend = getattr(user_store, "STORAGE_BACKEND", "json")
     if backend not in ("dual", "postgres"):
         return
@@ -327,17 +485,39 @@ def _repair_pg_empty_password_hashes():
         app.logger.exception("password_hash backfill from json failed")
 
 
-_OWNER_USER_ID = _bootstrap_owner()
-if _OWNER_USER_ID:
-    share_store.set_owner_user_id(_OWNER_USER_ID)
+# ---------------------------------------------------------------------------
+# owner 启动接线（账户系统批次 A，docs §5.2）：无论本次是否执行 bootstrap，
+# 都从数据库解析 owner 并注入资源默认归属（share_store.set_owner_user_id），
+# 保证旧式 set_slide_meta / project / ROI 写路径不会静默落成空归属。
+# ---------------------------------------------------------------------------
+def _inject_owner_into_share_store(owner):
+    """把启动解析出的 owner 注入资源默认归属（幂等；owner=None 清空注入）。
+
+    独立成函数便于启动接线与测试共用（docs §5.2 末段）。
+    """
+    global _OWNER_USER_ID
+    _OWNER_USER_ID = owner.get("user_id") if owner else None
+    if _OWNER_USER_ID:
+        share_store.set_owner_user_id(_OWNER_USER_ID)
+    else:
+        share_store.set_owner_user_id("")
+    return _OWNER_USER_ID
+
+
+_OWNER_AT_STARTUP = _resolve_owner_at_startup()
+#: 启动时解析出的 primary owner user_id（本地免认证开发态为 None）
+_OWNER_USER_ID = _inject_owner_into_share_store(_OWNER_AT_STARTUP)
 _repair_pg_empty_password_hashes()
 
 
-# AUTH_ENABLED 语义不变：有 ADMIN_PASSWORD 或存在任何 enabled 用户即开
-# （存在 admin 用户账户时即使未设 ADMIN_PASSWORD 也保持认证，防止误开免登录）。
-# 用户库损坏/不可读必须拒绝启动，绝不能当成「无用户」而关闭鉴权。
-def _resolve_auth_enabled():
-    if _AUTH_BY_PASSWORD:
+# AUTH_ENABLED 语义（docs §5.2 末行）：REQUIRE_ADMIN_AUTH=1，或存在任何
+# enabled 用户即开（存在用户账户时即使未设 REQUIRE_ADMIN_AUTH 也保持认证，
+# 防止误开免登录）。用户库损坏/不可读必须拒绝启动，绝不能当成「无用户」
+# 而关闭鉴权（fail-closed）。bootstrap 首建的 owner 本身就是 enabled 用户，
+# 空库 + 引导秘密 → AUTH_ENABLED=True，与旧行为一致。
+def _resolve_auth_enabled(environ=None):
+    env = os.environ if environ is None else environ
+    if _env_truthy(env, "REQUIRE_ADMIN_AUTH"):
         return True
     try:
         return user_store.has_enabled_users()
@@ -641,7 +821,13 @@ def _require_auth():
                 lookup_failed = True
         if lookup_failed:
             return _auth_challenge()
-        if user is not None and not user.get("disabled"):
+        # auth_version 比对（docs §6.2，批次 A）：复用本次 get_user 回查，
+        # 不新增 DB 查询。user 不存在 / disabled / session 版本与库内版本
+        # 不一致（改密、重置、disable/enable 后已递增）→ 清 session 走登录。
+        # 旧 Cookie 无 auth_version 键（部署前签发）必然 mismatch → 一次性
+        # 全员登出是预期行为（docs §12.2），不做任何回填兼容。
+        if (user is not None and not user.get("disabled")
+                and session.get("auth_version") == user.get("auth_version")):
             if user.get("role"):
                 session["role"] = user["role"]
             return None
@@ -1428,11 +1614,16 @@ def plugin_ui_asset(plugin_id, filename):
 
 
 def _login_page(error=None, error_code=None, next_url="/", retry_after=0,
-                status=200, headers=None):
-    """渲染登录页（统一携带 CSRF token 与服务端权威 retry_after）。"""
+                status=200, headers=None, password_changed=False):
+    """渲染登录页（统一携带 CSRF token 与服务端权威 retry_after）。
+
+    password_changed=True 时渲染「密码已修改，请使用新密码重新登录」提示
+    （本人改密成功后前端跳 /login?password_changed=1，docs §7.1-7）。
+    """
     html = render_template(
         "login.html", error=error, error_code=error_code, next_url=next_url,
-        csrf_token=ensure_csrf_token(), retry_after=int(retry_after or 0))
+        csrf_token=ensure_csrf_token(), retry_after=int(retry_after or 0),
+        password_changed=bool(password_changed))
     resp = Response(html, status=status)
     if headers:
         for k, v in headers.items():
@@ -1462,7 +1653,9 @@ def login():
         if session.get("auth_user"):
             # 已登录访问登录页：302 到安全 next 或 /（docs §3.1）
             return redirect(next_url)
-        return _login_page(next_url=next_url)
+        return _login_page(
+            next_url=next_url,
+            password_changed=request.args.get("password_changed") == "1")
 
     # ---- POST ----
     post_next = _safe_next_path(request.form.get("next") or next_url)
@@ -1490,12 +1683,15 @@ def login():
     user = user_store.verify_user(username, password)
     if user is not None:
         _clear_login_failures(account_hash, ip_prefix_hash)
-        # 防 session fixation：先清旧 session 再写新身份，并轮换 CSRF token
+        # 防 session fixation：先清旧 session 再写新身份，并轮换 CSRF token。
+        # auth_version（docs §6.2）：登录成功把当次凭据版本写进 session；
+        # 改密/重置/禁用/启用都会递增版本，旧 Cookie 随即失效。
         session.clear()
         session.permanent = True
         session["auth_user"] = user.get("display_name") or user.get("email")
         session["user_id"] = user.get("user_id")
         session["role"] = user.get("role")
+        session["auth_version"] = user.get("auth_version")
         rotate_csrf_token()
         return redirect(post_next)
 
@@ -1527,14 +1723,119 @@ def logout():
     return redirect("/login")
 
 
+# ---------------------------------------------------------------------------
+# 本人修改密码（账户系统批次 A，docs §7.1）。owner 与 user 通用；
+# 为保持实现简单，修改成功后注销全部 session（包括当前会话），
+# 前端跳 /login?password_changed=1 重新登录。
+# ---------------------------------------------------------------------------
+#: 改密端点与登录共用防爆破文案/状态码（docs §7.1-9）
+_CHANGE_PW_LOCKED_MSG = "尝试过于频繁，请稍后再试"
+
+
+@app.route("/api/account/password", methods=["POST"])
+def api_account_password():
+    """本人修改密码（docs §7.1，全部 9 条规则）。
+
+    - 必须已登录 Cookie session，并过统一 CSRF（before_request；/api/account/*
+      不在 _CSRF_EXEMPT_PREFIXES 豁免清单内）；
+    - 用当前 DB hash 验 current_password（get_user 返回含 hash 的行）；
+    - 新密码统一 15..200（user_store 常量，错误文案与 store 一致）；
+    - 新密码不得与当前密码相同（check_password_hash 对比当前 hash）；
+    - set_user_password 在 store 层同事务递增 auth_version（docs §6.2）；
+    - 写 user.password_change audit（actor=自己、target=自己，detail 只含
+      sessions_revoked=true，绝无密码/hash 特征）；
+    - 成功后 session.clear() 并返回 200 {"ok": true}；
+    - 当前密码错误 → 400 {"error": "invalid_current_password"}；
+    - 防爆破（docs §7.1-9）：invalid_current_password 计入登录失败桶
+      （主体=当前用户规范化 login_id 的带盐摘要，与 POST /login 同一套
+      _auth_subject_hash / _record_login_failure / _check_login_locked /
+      _clear_login_failures），锁定中 429 + Retry-After，改密成功清桶。
+      否则被窃 Cookie 的攻击者可经此端点高速穷举当前密码。
+    """
+    # AUTH_ENABLED=False 本地开发态没有登录 session：与受保护 API 一致 401
+    uid = session.get("user_id")
+    if not uid:
+        return jsonify(error="auth_required"), 401
+
+    # 跨 worker 锁定存储不可用（json/dual 无登录写通道）：与 POST /login 同口径
+    if not _login_limits_available():
+        app.logger.warning(
+            "POST /api/account/password 拒绝（503）：改密防爆破需要 postgres "
+            "后端（当前 %r）", platform_features.current_backend())
+        resp = jsonify(error=_LOGIN_LIMITS_UNAVAILABLE_MSG, code="unavailable")
+        return resp, 503
+
+    user = user_store.get_user(uid)
+    if user is None or user.get("disabled"):
+        # _require_auth 正常已拦截；此处防御并发禁用/删除
+        session.clear()
+        return jsonify(error="auth_required"), 401
+
+    body = request.get_json(silent=True) or {}
+    current_password = body.get("current_password")
+    new_password = body.get("new_password")
+
+    # 主体=当前用户规范化 login_id 摘要（email 列即 login_id，批次 B 才改名）
+    account_hash = _auth_subject_hash(user.get("email") or "")
+    ip_prefix_hash = _ip_prefix_hash(request.remote_addr or "")
+
+    # 进入即查锁定（锁定中直接 429，不再校验/计数）
+    retry = _check_login_locked(account_hash, ip_prefix_hash)
+    if retry > 0:
+        resp = jsonify(error=_CHANGE_PW_LOCKED_MSG, code="locked")
+        resp.headers["Retry-After"] = str(max(1, retry))
+        return resp, 429
+
+    # 1) 验当前密码（对 DB hash）
+    try:
+        current_ok = check_password_hash(
+            user.get("password_hash") or "", current_password or "")
+    except Exception:
+        current_ok = False
+    if not current_ok:
+        # 计入登录失败桶；触发阈值后按 429 拒绝（文案与登录一致）
+        retry = _record_login_failure(account_hash, ip_prefix_hash)
+        if retry > 0:
+            resp = jsonify(error=_CHANGE_PW_LOCKED_MSG, code="locked")
+            resp.headers["Retry-After"] = str(max(1, retry))
+            return resp, 429
+        return jsonify(error="invalid_current_password"), 400
+
+    # 2) 新密码统一长度策略（文案与 store 一致）
+    if not isinstance(new_password, str) or not new_password:
+        return jsonify(error="密码不能为空"), 400
+    if (len(new_password) < user_store.PASSWORD_MIN_LENGTH
+            or len(new_password) > user_store.PASSWORD_MAX_LENGTH):
+        return jsonify(error=(
+            "密码长度须在 %d..%d 字符之间（当前 %d 字符）"
+            % (user_store.PASSWORD_MIN_LENGTH, user_store.PASSWORD_MAX_LENGTH,
+               len(new_password)))), 400
+
+    # 3) 新密码不得与当前密码相同（对比当前 hash，而非明文入参）
+    if check_password_hash(user.get("password_hash") or "", new_password):
+        return jsonify(error="新密码不能与当前密码相同"), 400
+
+    # 4) 更新（store 层同事务 auth_version+1 → 所有旧 session 立即失效）
+    user_store.set_user_password(uid, new_password)
+
+    # 5) audit（先记再清 session：actor 取当前身份；detail 无密码特征）
+    _audit("user.password_change", target_type="user", target_id=uid,
+           detail={"sessions_revoked": True})
+
+    # 6) 成功：清失败桶 + 清空当前 session（含本设备，docs §7.1）
+    _clear_login_failures(account_hash, ip_prefix_hash)
+    session.clear()
+    return jsonify(ok=True)
+
+
 @app.route("/register", methods=["GET", "POST"])
 def register():
     """注册页（P0-B：registration_mode = closed | invite_only | public，§4.1）。
 
     - closed：GET 渲染关闭态页（不 404、无可提交表单），POST 一律 403；
-    - invite_only：GET 渲染邀请码/邮箱/显示名/密码表单（UI 推荐 ≥12 位、允许
-      密码管理器 paste），POST 走 registration_store 原子兑换；成功**不自动登录**
-      ——清理匿名 session、轮换 CSRF 后 302 /login；
+    - invite_only：GET 渲染邀请码/邮箱/显示名/密码表单（统一密码策略
+      15..200 位、允许密码管理器 paste），POST 走 registration_store 原子
+      兑换；成功**不自动登录**——清理匿名 session、轮换 CSRF 后 302 /login；
     - public：本阶段不支持，GET/POST 均 503 public_registration_not_supported
       （无 public 回退路径）；
     - 模式权威值还受 fail-closed 前置闸（_effective_registration_mode：非 HTTPS
@@ -1605,7 +1906,7 @@ def register():
     elif not email:
         form_error = "请填写邮箱/用户名"
     elif len(password) < registration_store.MIN_PASSWORD_LENGTH:
-        form_error = "密码长度至少 %d 位（推荐 12 位以上或使用长口令）" \
+        form_error = "密码长度至少 %d 位（推荐使用密码管理器生成的长口令）" \
             % registration_store.MIN_PASSWORD_LENGTH
     elif password != confirm:
         form_error = "两次输入的密码不一致"
@@ -2846,7 +3147,8 @@ _check_registration_preconditions_or_warn()
 def api_admin_users_create():
     """创建 user 角色账户。仅 owner。JSON: {email, password, display_name?}。
 
-    email 冲突 409；密码 <8 位 400。返回新用户（不含 hash）。初始密码由 owner
+    email 冲突 409；密码统一 15..200（user_store.PASSWORD_MIN/MAX_LENGTH，
+    账户系统批次 A docs §3.3）。返回新用户（不含 hash）。初始密码由 owner
     线下告知用户（本节点不做邮件发送）。
     """
     auth = _require_owner()
@@ -2860,8 +3162,12 @@ def api_admin_users_create():
         return jsonify(error="缺少邮箱/用户名"), 400
     if not isinstance(password, str) or not password:
         return jsonify(error="缺少密码"), 400
-    if len(password) < 8:
-        return jsonify(error="密码长度至少 8 位"), 400
+    if (len(password) < user_store.PASSWORD_MIN_LENGTH
+            or len(password) > user_store.PASSWORD_MAX_LENGTH):
+        return jsonify(error=(
+            "密码长度须在 %d..%d 字符之间（当前 %d 字符）"
+            % (user_store.PASSWORD_MIN_LENGTH, user_store.PASSWORD_MAX_LENGTH,
+               len(password)))), 400
     try:
         user = user_store.create_user(
             email, password, role=user_store.ROLE_USER, display_name=display_name)
@@ -2876,17 +3182,22 @@ def api_admin_users_create():
 
 @app.route("/api/admin/users/<user_id>/disable", methods=["POST"])
 def api_admin_users_disable(user_id):
-    """禁用用户。仅 owner。不能禁用最后一个 enabled owner（400）。"""
+    """禁用用户。仅 owner。target 为 owner → 409（owner 不可经 Web 禁用）。
+
+    账户系统批次 A（docs §3.2 不变量 5 / §7.2）：owner 的禁用/恢复只能走
+    主机侧 break-glass CLI；disable 在 store 层同事务递增 auth_version，
+    该用户全部旧 session 立即失效。
+    """
     auth = _require_owner()
     if auth:
         return auth
     target = user_store.get_user(user_id)
     if target is None:
         return jsonify(error="用户不存在"), 404
-    # 保护：不能禁用最后一个 enabled owner
-    if target.get("role") == user_store.ROLE_OWNER and not target.get("disabled"):
-        if user_store.count_owners() <= 1:
-            return jsonify(error="不能禁用最后一个启用中的 owner"), 400
+    if target.get("role") == user_store.ROLE_OWNER:
+        return jsonify(error=(
+            "不能经 Web 禁用 owner（docs §3.2 不变量 5）；如需恢复 owner 访问"
+            "请使用本人改密或主机侧 break-glass CLI（useradmin）")), 409
     user = user_store.set_user_disabled(user_id, True)
     _audit("user.disable", target_type="user", target_id=user_id)
     return jsonify(user)
@@ -2894,39 +3205,69 @@ def api_admin_users_disable(user_id):
 
 @app.route("/api/admin/users/<user_id>/enable", methods=["POST"])
 def api_admin_users_enable(user_id):
-    """启用用户。仅 owner。"""
+    """启用用户。仅 owner。target 为 owner → 409（与 disable 同口径）。
+
+    enable 同样在 store 层同事务递增 auth_version（docs §6.2：防止禁用期间
+    未发请求的旧 Cookie 在重新启用后被激活）。
+    """
     auth = _require_owner()
     if auth:
         return auth
-    user = user_store.set_user_disabled(user_id, False)
-    if user is None:
+    target = user_store.get_user(user_id)
+    if target is None:
         return jsonify(error="用户不存在"), 404
+    if target.get("role") == user_store.ROLE_OWNER:
+        return jsonify(error=(
+            "不能经 Web 启用/禁用 owner（docs §3.2 不变量 5）；owner 恢复"
+            "请使用主机侧 break-glass CLI（useradmin --enable）")), 409
+    user = user_store.set_user_disabled(user_id, False)
     _audit("user.enable", target_type="user", target_id=user_id)
     return jsonify(user)
 
 
 @app.route("/api/admin/users/<user_id>/password", methods=["POST"])
 def api_admin_users_password(user_id):
-    """重置用户密码。仅 owner。JSON: {password}。
+    """重置普通用户密码。仅 owner。JSON: {password}。
 
-    不能重置最后一个 enabled owner 的密码会致其失联——owner 密码由 env
-    ADMIN_PASSWORD 兜底可重置，故仅校验密码长度。
+    账户系统批次 A（docs §7.2）：
+      - target 必须存在且 role='user'；owner target → 409（提示走本人改密
+        或主机侧 break-glass CLI；旧「env ADMIN_PASSWORD 兜底可重置」的说法
+        已废除——env 不再参与已有账号的密码对账，docs §5.1）；
+      - 新密码统一 15..200（user_store 常量，不再硬编码 8）；
+      - hash 更新与 auth_version+1 同事务（store 层），该用户全部旧 session
+        立即失效；响应只回公共用户 dict，不回显密码/hash；
+      - 写 user.password_reset audit（actor=操作者、target、detail 只含
+        sessions_revoked=true）。
     """
     auth = _require_owner()
     if auth:
         return auth
+    target = user_store.get_user(user_id)
+    if target is None:
+        return jsonify(error="用户不存在"), 404
+    if target.get("role") == user_store.ROLE_OWNER:
+        return jsonify(error=(
+            "不能经 Web 重置 owner 密码（docs §3.2 不变量 5）：owner 请用"
+            "「修改我的密码」自助修改；失联恢复走主机侧 break-glass CLI"
+            "（useradmin reset-owner-password）")), 409
     body = request.get_json(silent=True) or {}
     new_password = body.get("password")
     if not isinstance(new_password, str) or not new_password:
         return jsonify(error="缺少密码"), 400
-    if len(new_password) < 8:
-        return jsonify(error="密码长度至少 8 位"), 400
+    if (len(new_password) < user_store.PASSWORD_MIN_LENGTH
+            or len(new_password) > user_store.PASSWORD_MAX_LENGTH):
+        return jsonify(error=(
+            "密码长度须在 %d..%d 字符之间（当前 %d 字符）"
+            % (user_store.PASSWORD_MIN_LENGTH, user_store.PASSWORD_MAX_LENGTH,
+               len(new_password)))), 400
     try:
         user = user_store.set_user_password(user_id, new_password)
     except ValueError as e:
         return jsonify(error=str(e)), 400
     if user is None:
         return jsonify(error="用户不存在"), 404
+    _audit("user.password_reset", target_type="user", target_id=user_id,
+           detail={"sessions_revoked": True})
     return jsonify(user)
 
 

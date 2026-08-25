@@ -72,7 +72,7 @@ def _invite_hash(token):
 
 
 def _mk_owner():
-    return user_store.create_user("rl-owner@x.com", "ownerpass1", role="owner")
+    return user_store.create_user("rl-owner@x.com", "ownerpass123456", role="owner")
 
 
 def _client():
@@ -181,7 +181,7 @@ def test_register_503_when_limit_store_unavailable(monkeypatch):
     client = _client()
     r = client.post("/register", data={
         "invite_token": "whatever", "email": "n@x.com",
-        "password": "longpassword1", "password_confirm": "longpassword1"})
+        "password": "longpassword123", "password_confirm": "longpassword123"})
     assert r.status_code == 503
     assert r.get_json()["code"] == "registration_unavailable"
     assert user_store.get_user_by_email("n@x.com") is None
@@ -195,14 +195,14 @@ def test_register_ip_short_window_429(monkeypatch):
     limit = auth_limit_store.REG_IP_SHORT_FAILURE_LIMIT
     for i in range(limit):
         data = {"invite_token": "no-such-token-%d" % i, "email": "n@x.com",
-                "password": "longpassword1",
-                "password_confirm": "longpassword1"}
+                "password": "longpassword123",
+                "password_confirm": "longpassword123"}
         r = client.post("/register", data=data)
         assert r.status_code == 403, r.status_code
         assert "邀请码无效或当前不可用" in r.get_data(as_text=True)
     r11 = client.post("/register", data={
         "invite_token": "no-such-token-final", "email": "n@x.com",
-        "password": "longpassword1", "password_confirm": "longpassword1"})
+        "password": "longpassword123", "password_confirm": "longpassword123"})
     assert r11.status_code == 429
     assert int(r11.headers.get("Retry-After") or 0) > 0
     # 锁定期内即使表单形状错误也直接 429（闸在表单校验之前）
@@ -219,13 +219,13 @@ def test_register_invite_hash_lockout_429(monkeypatch):
     for i in range(limit):
         r = client.post("/register", data={
             "invite_token": tok, "email": "n@x.com",
-            "password": "longpassword1", "password_confirm": "longpassword1"},
+            "password": "longpassword123", "password_confirm": "longpassword123"},
             environ_overrides={"REMOTE_ADDR": "192.0.2.%d" % (i + 1)})
         assert r.status_code == 403, r.status_code
     # 第 6 次（再换 IP）：invite 桶已锁
     r = client.post("/register", data={
         "invite_token": tok, "email": "n@x.com",
-        "password": "longpassword1", "password_confirm": "longpassword1"},
+        "password": "longpassword123", "password_confirm": "longpassword123"},
         environ_overrides={"REMOTE_ADDR": "198.51.100.9"})
     assert r.status_code == 429
 
@@ -243,7 +243,7 @@ def test_register_daily_attempt_429(monkeypatch):
     client = _client()
     r = client.post("/register", data={
         "invite_token": "x", "email": "n@x.com",
-        "password": "longpassword1", "password_confirm": "longpassword1"})
+        "password": "longpassword123", "password_confirm": "longpassword123"})
     assert r.status_code == 429
 
 
@@ -254,7 +254,8 @@ def test_owner_invite_create_rate_limited_via_api(monkeypatch):
     client = _client()
     with client.session_transaction() as s:
         s.update({"auth_user": "o", "user_id": owner["user_id"],
-                  "role": "owner"})
+                  "role": "owner",
+                  "auth_version": owner.get("auth_version", 1)})
     for _ in range(2):
         r = client.post("/api/admin/registration-invites", json={})
         assert r.status_code == 200

@@ -374,7 +374,7 @@ else:
 @pg_only
 def test_zip_expansion_topup_success():
     """zip 体小（CL 小）但展开大：move 前 topup 补占，成功后可 consume。"""
-    uid = user_store.create_user("z1@x.com", "pass1234", role="user")["user_id"]
+    uid = user_store.create_user("z1@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid, 10 ** 6)
     r = upload_guard.reserve_upload(uid, 100)  # CL 提示值远小于展开量
     # 随机数据：压缩比 ≈1，避免触发压缩比闸（本用例只测 topup 路径）
@@ -392,7 +392,7 @@ def test_zip_expansion_topup_success():
 
 @pg_only
 def test_zip_expansion_topup_quota_exceeded():
-    uid = user_store.create_user("z2@x.com", "pass1234", role="user")["user_id"]
+    uid = user_store.create_user("z2@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid, 3000)  # 展开总量 5005 超配额
     r = upload_guard.reserve_upload(uid, 100)
     z = _make_zip([("S.mrxs", b"m"), ("S/d.dat", os.urandom(5000))])

@@ -77,11 +77,17 @@ def _client(auth=True):
 
 
 def _login(client, role, user_id):
-    """用 session_transaction 直接注入身份（等价登录成功后的 session 状态）。"""
+    """用 session_transaction 直接注入身份（等价登录成功后的 session 状态）。
+
+    auth_version（批次 A docs §6.2）：手工 session 也要携带与库内一致的
+    凭据版本，否则 _require_auth 版本比对会判失效。
+    """
     with client.session_transaction() as sess:
         sess["role"] = role
         sess["user_id"] = user_id
         sess["auth_user"] = "t@x.com"
+        row = user_store.get_user(user_id) if user_id else None
+        sess["auth_version"] = (row or {}).get("auth_version", 1)
 
 
 def _touch(name="demo.svs"):
@@ -167,7 +173,7 @@ def _install_fake():
 @json_only  # 断言 users.json 原文（PG 后端加密态在库里，无 json 文件）
 def test_user_api_key_encrypted_on_disk():
     _reset_config()
-    u = user_store.create_user("u@x.com", "password1", role="user")
+    u = user_store.create_user("u@x.com", "password1password1", role="user")
     # app 侧负责在落盘前加密（_encrypt_api_key）；store 层原样存储。
     enc = app_mod._encrypt_api_key("sk-user-secret-abcdef")
     assert enc.startswith("enc:")
@@ -187,7 +193,7 @@ def test_user_api_key_encrypted_on_disk():
 def test_resolve_use_platform_when_platform_configured():
     _reset_config()
     _setup_platform()
-    u = user_store.create_user("u@x.com", "password1", role="user")
+    u = user_store.create_user("u@x.com", "password1password1", role="user")
     user_store.set_user_ai_config(u["user_id"], {"use_platform": True, "api_key": "sk-own"})
     cfg = app_mod._build_sidecar_config({"role": "user", "user_id": u["user_id"]})
     assert cfg is not None
@@ -201,7 +207,7 @@ def test_resolve_user_ignores_legacy_own_credentials():
     """user 自带 API 通道已下线：use_platform=False + 自带凭据齐备仍走平台。"""
     _reset_config()
     _setup_platform()
-    u = user_store.create_user("u@x.com", "password1", role="user")
+    u = user_store.create_user("u@x.com", "password1password1", role="user")
     user_store.set_user_ai_config(u["user_id"], {
         "use_platform": False, "base_url": "http://own/v1",
         "model": "gpt-own", "api_key": "sk-own-secret"})
@@ -218,7 +224,7 @@ def test_resolve_user_ignores_legacy_own_credentials():
 def test_resolve_platform_missing_returns_none_even_with_own():
     """平台未配置 → user 不可用（自带凭据齐备也不作为回退）。"""
     _reset_config()  # 平台未配
-    u = user_store.create_user("u@x.com", "password1", role="user")
+    u = user_store.create_user("u@x.com", "password1password1", role="user")
     user_store.set_user_ai_config(u["user_id"], {
         "use_platform": False, "base_url": "http://own/v1",
         "model": "gpt-own", "api_key": "sk-own-secret"})
@@ -231,7 +237,7 @@ def test_resolve_platform_missing_returns_none_even_with_own():
 
 def test_resolve_own_missing_key_returns_none():
     _reset_config()  # 平台未配
-    u = user_store.create_user("u@x.com", "password1", role="user")
+    u = user_store.create_user("u@x.com", "password1password1", role="user")
     user_store.set_user_ai_config(u["user_id"], {"base_url": "http://own/v1", "model": "gpt-own"})
     cfg = app_mod._build_sidecar_config({"role": "user", "user_id": u["user_id"]})
     assert cfg is None
@@ -240,7 +246,7 @@ def test_resolve_own_missing_key_returns_none():
 def test_resolve_owner_uses_platform():
     _reset_config()
     _setup_platform()
-    u = user_store.create_user("o@x.com", "password1", role="owner")
+    u = user_store.create_user("o@x.com", "password1password1", role="owner")
     cfg = app_mod._build_sidecar_config({"role": "owner", "user_id": u["user_id"]})
     assert cfg is not None
     assert cfg["base_url"] == "http://platform/v1"
@@ -262,7 +268,7 @@ def test_resolve_no_auth_uses_platform():
 def test_user_config_get_masked_and_platform_fields():
     _reset_config()
     _setup_platform()
-    u = user_store.create_user("u@x.com", "password1", role="user")
+    u = user_store.create_user("u@x.com", "password1password1", role="user")
     user_store.set_user_ai_config(u["user_id"], {"api_key": "sk-user-long-secret-12345678", "base_url": "http://own/v1", "model": "gpt-own"})
     c = _client()
     _login(c, "user", u["user_id"])
@@ -278,7 +284,7 @@ def test_user_config_get_masked_and_platform_fields():
     # 平台未配置 → using 为 null（前端提示联系管理员）；注意 _reset_config 会
     # 清掉 users.json（用户被删会话即失效），需重建用户再登录
     _reset_config()
-    u2 = user_store.create_user("u2@x.com", "password1", role="user")
+    u2 = user_store.create_user("u2@x.com", "password1password1", role="user")
     _login(c, "user", u2["user_id"])
     j3 = c.get("/api/ai/config").get_json()
     assert j3["platform_configured"] is False
@@ -297,7 +303,7 @@ def test_user_put_tuning_differs_returns_400():
     """user PUT 任何字段一律 400（tuning 与 max_steps 同样拒绝）。"""
     _reset_config()
     _setup_platform()
-    u = user_store.create_user("u@x.com", "password1", role="user")
+    u = user_store.create_user("u@x.com", "password1password1", role="user")
     c = _client()
     _login(c, "user", u["user_id"])
     for body in ({"fork_active_limit": 999}, {"max_steps": 33},
@@ -312,7 +318,7 @@ def test_user_put_credentials_rejected_and_not_persisted():
     """user 凭据四字段一律 400；存量数据不被改写、新数据不落盘。"""
     _reset_config()
     _setup_platform()
-    u = user_store.create_user("u@x.com", "password1", role="user")
+    u = user_store.create_user("u@x.com", "password1password1", role="user")
     c = _client()
     _login(c, "user", u["user_id"])
     r = c.put("/api/ai/config", json={
@@ -333,7 +339,7 @@ def test_user_put_credentials_rejected_and_not_persisted():
 def test_owner_config_get_uses_platform():
     _reset_config()
     _setup_platform()
-    o = user_store.create_user("o@x.com", "password1", role="owner")
+    o = user_store.create_user("o@x.com", "password1password1", role="owner")
     c = _client()
     _login(c, "owner", o["user_id"])
     r = c.get("/api/ai/config")
@@ -345,7 +351,7 @@ def test_owner_config_get_uses_platform():
 
 def test_owner_put_tuning_ok():
     _reset_config()
-    o = user_store.create_user("o@x.com", "password1", role="owner")
+    o = user_store.create_user("o@x.com", "password1password1", role="owner")
     c = _client()
     _login(c, "owner", o["user_id"])
     r = c.put("/api/ai/config", json={"max_steps": 60})
@@ -360,8 +366,8 @@ def test_owner_put_tuning_ok():
 def test_ai_run_unauthorized_slide_403():
     _reset_config()
     _setup_platform()
-    ua = user_store.create_user("a@x.com", "password1", role="user")
-    ub = user_store.create_user("b@x.com", "password1", role="user")
+    ua = user_store.create_user("a@x.com", "password1password1", role="user")
+    ub = user_store.create_user("b@x.com", "password1password1", role="user")
     _touch("a.svs")
     _own("a.svs", ua["user_id"])
     fake = _install_fake()
@@ -376,8 +382,8 @@ def test_ai_run_public_readonly_403():
     """公共只读切片可 view 但不可 annotate，不得起跑并签发写 grant。"""
     _reset_config()
     _setup_platform()
-    ua = user_store.create_user("a@x.com", "password1", role="user")
-    ub = user_store.create_user("b@x.com", "password1", role="user")
+    ua = user_store.create_user("a@x.com", "password1password1", role="user")
+    ub = user_store.create_user("b@x.com", "password1password1", role="user")
     _touch("pub.svs")
     app_mod.share_store.set_slide_meta(
         "pub.svs", public=True, owner_user_id=ua["user_id"])
@@ -391,7 +397,7 @@ def test_ai_run_public_readonly_403():
 
 def test_ai_run_no_credentials_400():
     _reset_config()  # 平台未配
-    u = user_store.create_user("u@x.com", "password1", role="user")
+    u = user_store.create_user("u@x.com", "password1password1", role="user")
     _touch("own400.svs")
     _own("own400.svs", u["user_id"])
     c = _client()
@@ -406,7 +412,7 @@ def test_ai_run_no_credentials_400():
 def test_ai_run_authorized_proxies_with_owner():
     _reset_config()
     _setup_platform()
-    u = user_store.create_user("u@x.com", "password1", role="user")
+    u = user_store.create_user("u@x.com", "password1password1", role="user")
     _touch("ownok.svs")
     _own("ownok.svs", u["user_id"])
     fake = _install_fake()
@@ -432,8 +438,8 @@ def test_ai_run_authorized_proxies_with_owner():
 def test_sessions_user_filter_owner_all():
     _reset_config()
     _setup_platform()
-    u = user_store.create_user("u@x.com", "password1", role="user")
-    o = user_store.create_user("o@x.com", "password1", role="owner")
+    u = user_store.create_user("u@x.com", "password1password1", role="user")
+    o = user_store.create_user("o@x.com", "password1password1", role="owner")
     _touch("s.svs")
     _own("s.svs", u["user_id"])
 
@@ -461,8 +467,8 @@ def test_sessions_user_filter_owner_all():
 def test_session_detail_owner_check():
     _reset_config()
     _setup_platform()
-    ua = user_store.create_user("a@x.com", "password1", role="user")
-    ub = user_store.create_user("b@x.com", "password1", role="user")
+    ua = user_store.create_user("a@x.com", "password1password1", role="user")
+    ub = user_store.create_user("b@x.com", "password1password1", role="user")
     fake = _install_fake()
 
     def detail_handler(params):
@@ -475,7 +481,7 @@ def test_session_detail_owner_check():
     r = cb.get("/api/ai/session/s-a")
     assert r.status_code == 403
     # owner 访问任意会话 → 放行（透传）
-    o = user_store.create_user("o@x.com", "password1", role="owner")
+    o = user_store.create_user("o@x.com", "password1password1", role="owner")
     co = _client()
     _login(co, "owner", o["user_id"])
     r2 = co.get("/api/ai/session/s-a")
@@ -515,7 +521,7 @@ def test_owner_run_does_not_inject_session_owner():
     无 owner 字段，user 的 ?owner= 过滤自然看不到。"""
     _reset_config()
     _setup_platform()
-    o = user_store.create_user("o2@x.com", "password1", role="owner")
+    o = user_store.create_user("o2@x.com", "password1password1", role="owner")
     _touch("ownr.svs")
     fake = _install_fake()
 
@@ -535,7 +541,7 @@ def test_user_put_loopback_base_url_rejected():
     """user PUT 凭据字段整包 400（不再进入 SSRF 校验——无写入通道）。"""
     _reset_config()
     _setup_platform()
-    u = user_store.create_user("u@x.com", "password1", role="user")
+    u = user_store.create_user("u@x.com", "password1password1", role="user")
     c = _client()
     _login(c, "user", u["user_id"])
     r = c.put("/api/ai/config", json={
@@ -548,7 +554,7 @@ def test_user_put_loopback_base_url_rejected():
 def test_user_put_link_local_metadata_base_url_rejected():
     _reset_config()
     _setup_platform()
-    u = user_store.create_user("u@x.com", "password1", role="user")
+    u = user_store.create_user("u@x.com", "password1password1", role="user")
     c = _client()
     _login(c, "user", u["user_id"])
     r = c.put("/api/ai/config", json={
@@ -560,7 +566,7 @@ def test_user_put_link_local_metadata_base_url_rejected():
 def test_build_sidecar_ignores_private_own_url():
     """存量私网 own base_url 不再进入 sidecar（user 恒平台）；平台未配 → None。"""
     _reset_config()
-    u = user_store.create_user("u@x.com", "password1", role="user")
+    u = user_store.create_user("u@x.com", "password1password1", role="user")
     user_store.set_user_ai_config(u["user_id"], {
         "use_platform": False, "base_url": "http://10.0.0.1/v1",
         "model": "gpt-own", "api_key": "sk-own-secret"})

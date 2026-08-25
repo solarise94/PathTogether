@@ -190,6 +190,9 @@ def _login(client, role, user_id):
         sess["role"] = role
         sess["user_id"] = user_id
         sess["auth_user"] = "t@x.com"
+        # 批次 A：手工 session 需携带与库内一致的凭据版本（docs §6.2）
+        row = user_store.get_user(user_id)
+        sess["auth_version"] = (row or {}).get("auth_version", 1)
 
 
 def _touch(name="s.svs"):
@@ -210,7 +213,7 @@ def _setup_platform(base_url="http://platform.example/v1",
 
 def _make_user(role="user"):
     return user_store.create_user(
-        "u-%s@x.com" % uuid.uuid4().hex[:8], "password1", role=role)
+        "u-%s@x.com" % uuid.uuid4().hex[:8], "password1password1", role=role)
 
 
 def _rid():
@@ -476,7 +479,8 @@ def test_csrf_required_on_budget_and_ai_write_endpoints():
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = True
     with raw.session_transaction() as s:
-        s.update({"auth_user": "o", "user_id": o["user_id"], "role": "owner"})
+        s.update({"auth_user": "o", "user_id": o["user_id"], "role": "owner",
+                  "auth_version": o.get("auth_version", 1)})
     # 无 token → 400 csrf_required（统一 before_request）
     r = raw.put("/api/admin/settings/ai-budget", json={"platform_turn_limit": 30})
     assert r.status_code == 400

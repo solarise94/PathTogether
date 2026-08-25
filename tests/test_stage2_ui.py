@@ -277,13 +277,14 @@ def test_containerfile_ships_pg_layer():
 # =========================================================================== #
 def _login_session(client, role, user_id="usr-x"):
     with client.session_transaction() as s:
-        s.update({"auth_user": "t@x.com", "user_id": user_id, "role": role})
+        s.update({"auth_user": "t@x.com", "user_id": user_id, "role": role,
+                  "auth_version": 1})
 
 
 def _make_role_user(role):
     """创建真实用户（_require_auth 会按 user_id 回查 user_store）。"""
     import user_store
-    return user_store.create_user("t-%s@x.com" % role, "password1", role=role)
+    return user_store.create_user("t-%s@x.com" % role, "password1password1", role=role)
 
 
 def test_index_user_render_has_no_own_credentials_form(monkeypatch):

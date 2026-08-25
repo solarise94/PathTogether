@@ -91,7 +91,7 @@
       "sb.section.users": "用户管理",
       "sb.users.email.ph": "邮箱 / 用户名",
       "sb.users.display.ph": "显示名（可选）",
-      "sb.users.password.ph": "初始密码（≥8位）",
+      "sb.users.password.ph": "初始密码（≥15位）",
       "sb.users.add": "添加用户",
       "sb.users.reg.open": "开放注册：关闭",
       "sb.users.role.owner": "owner",
@@ -103,10 +103,26 @@
       "sb.users.reset": "重置密码",
       "sb.users.created": "创建时间",
       "sb.users.add.ok": "用户已创建",
-      "sb.users.reset.ok": "密码已重置",
-      "sb.users.reset.ph": "新密码（≥8位）",
-      "sb.users.reset.confirm": "请输入新密码",
+      "sb.users.reset.ok": "密码已重置，该用户所有已登录设备均已退出",
+      "sb.users.reset.ph": "新密码（≥15位）",
+      "sb.users.reset.confirm": "请输入新密码（≥15 位）",
       "sb.users.last.owner": "不能禁用最后一个启用中的 owner",
+
+      // ---- 修改我的密码（owner/user 通用；账户系统批次 A docs §7.1/§8.1） ----
+      "acct.changepw": "修改我的密码",
+      "acct.changepw.title": "修改我的密码",
+      "acct.changepw.current": "当前密码",
+      "acct.changepw.new": "新密码",
+      "acct.changepw.confirm": "确认新密码",
+      "acct.changepw.hint": "至少 15 位；修改成功后所有已登录设备（含本设备）都会退出，需用新密码重新登录。",
+      "acct.changepw.cancel": "取消",
+      "acct.changepw.submit": "修改密码",
+      "acct.changepw.err.required": "请填写当前密码、新密码与确认新密码",
+      "acct.changepw.err.mismatch": "两次输入的新密码不一致",
+      "acct.changepw.err.current": "当前密码错误",
+      "acct.changepw.err.locked": "尝试过于频繁，请稍后再试",
+      "acct.changepw.err.same": "新密码不能与当前密码相同",
+      "acct.changepw.err.generic": "修改失败，请稍后重试",
 
       // ---- 插件管理（owner；Stage 4-3） ----
       "sb.section.plugins": "插件管理",
@@ -241,6 +257,8 @@
       "login.error.csrf": "登录状态已过期，请重新提交",
       "login.pwd.show.aria": "显示密码",
       "login.pwd.hide.aria": "隐藏密码",
+      // 本人改密成功后的登录页提示（docs §7.1-7）
+      "login.password_changed": "密码已修改，请使用新密码重新登录",
 
       // ---- 入口分流页（docs §3.2） ----
       "entry.tagline": "协作式数字病理切片查看与 AI 导航",
@@ -255,6 +273,9 @@
       "register.desc": "测试账号由管理员创建。如果你已收到账号，请直接登录。",
       "register.back": "返回登录",
       "register.demo": "先体验 Demo",
+      // 注册表单密码口径（账户系统批次 A：统一 15..200，docs §3.3）
+      "register.invite.password.ph": "至少 15 位，推荐使用密码管理器生成的长口令",
+      "register.invite.password.hint": "至少 15 位，可直接使用密码管理器生成并粘贴；不要求大小写或符号组合。",
 
       // ---- Demo 页（Phase 2 只读 Viewer） ----
       "demo.title": "Demo 体验",
@@ -680,7 +701,7 @@
       "sb.section.users": "Users",
       "sb.users.email.ph": "Email / username",
       "sb.users.display.ph": "Display name (optional)",
-      "sb.users.password.ph": "Initial password (≥8 chars)",
+      "sb.users.password.ph": "Initial password (≥15 chars)",
       "sb.users.add": "Add user",
       "sb.users.reg.open": "Open registration: off",
       "sb.users.role.owner": "owner",
@@ -692,10 +713,26 @@
       "sb.users.reset": "Reset password",
       "sb.users.created": "Created",
       "sb.users.add.ok": "User created",
-      "sb.users.reset.ok": "Password reset",
-      "sb.users.reset.ph": "New password (≥8 chars)",
-      "sb.users.reset.confirm": "Enter new password",
+      "sb.users.reset.ok": "Password reset. All of that user's signed-in devices have been signed out.",
+      "sb.users.reset.ph": "New password (≥15 chars)",
+      "sb.users.reset.confirm": "Enter new password (≥15 chars)",
       "sb.users.last.owner": "Cannot disable the last enabled owner",
+
+      // ---- Change my password (owner/user; account batch A docs §7.1/§8.1) ----
+      "acct.changepw": "Change my password",
+      "acct.changepw.title": "Change my password",
+      "acct.changepw.current": "Current password",
+      "acct.changepw.new": "New password",
+      "acct.changepw.confirm": "Confirm new password",
+      "acct.changepw.hint": "At least 15 characters. After a successful change, all signed-in devices (including this one) are signed out; log in again with the new password.",
+      "acct.changepw.cancel": "Cancel",
+      "acct.changepw.submit": "Change password",
+      "acct.changepw.err.required": "Please fill in the current password, new password, and confirmation",
+      "acct.changepw.err.mismatch": "The two new passwords do not match",
+      "acct.changepw.err.current": "Current password is incorrect",
+      "acct.changepw.err.locked": "Too many attempts, please try again later",
+      "acct.changepw.err.same": "The new password must differ from the current password",
+      "acct.changepw.err.generic": "Failed to change password, please try again later",
 
       // ---- 插件管理（owner；Stage 4-3） ----
       "sb.section.plugins": "Plugins",
@@ -830,6 +867,8 @@
       "login.error.csrf": "Your session expired. Please submit again.",
       "login.pwd.show.aria": "Show password",
       "login.pwd.hide.aria": "Hide password",
+      // Notice after a successful self password change (docs §7.1-7)
+      "login.password_changed": "Password changed. Please log in again with your new password.",
 
       // ---- 入口分流页（docs §3.2） ----
       "entry.tagline": "Collaborative digital pathology slide viewing with AI navigation",
@@ -844,6 +883,9 @@
       "register.desc": "Test accounts are created by the administrator. If you already received an account, just log in.",
       "register.back": "Back to login",
       "register.demo": "Try the Demo first",
+      // Register form password policy (account batch A: unified 15..200, docs §3.3)
+      "register.invite.password.ph": "At least 15 characters; a long passphrase from a password manager is recommended",
+      "register.invite.password.hint": "At least 15 characters. Paste from a password manager is fine; no character-class requirements.",
 
       // ---- Demo page (Phase 2 read-only viewer) ----
       "demo.title": "Demo",

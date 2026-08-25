@@ -53,7 +53,11 @@ except ImportError:
     sys.modules["openslide.deepzoom"] = _dz
 
 import app as app_mod  # noqa: E402
-from _pt_helpers import csrf_client  # noqa: E402
+# check()：_pt_helpers 统一带守卫实现；PASS/FAIL 计数仍落在本模块
+from _pt_helpers import check, csrf_client  # noqa: E402
+
+PASS = 0
+FAIL = 0
 
 
 @pytest.fixture(autouse=True)
@@ -83,19 +87,6 @@ def _isolate_data_dir(monkeypatch):
         "share_store.SHARE_FILE 未隔离到临时目录！期望前缀 %r，实际 %r"
         % (TMP, str(share_store.SHARE_FILE)))
     yield
-
-PASS = 0
-FAIL = 0
-
-
-def check(name, cond, detail=""):
-    global PASS, FAIL
-    if cond:
-        PASS += 1
-        print("  ok  %s" % name)
-    else:
-        FAIL += 1
-        print("FAIL  %s  %s" % (name, detail))
 
 
 def make_client():
@@ -417,6 +408,10 @@ def test_legal_payload_persists():
     code, j = put(payload)
     check("合法负载 → 200", code == 200, "got %s %r" % (code, j))
     for k, v in payload.items():
+        if k == "safety_margin":
+            # 已弃用字段：接受但不写回（app PUT 显式 pop，见
+            # test_safety_margin_deprecated_not_persisted），不再断言落盘值
+            continue
         check("落盘 %s=%r" % (k, v), j.get(k) == v,
               "got %r" % j.get(k))
     # 磁盘也落对（max_tokens 是基础字段）
@@ -975,9 +970,9 @@ def test_official_mode_atomic_validation():
           str(raw.get("api_key", "")).startswith("enc:"),
           "got %r" % raw.get("api_key"))
     check("明文 key 不落盘", "sk-official-test-1234567890" not in json.dumps(raw))
-    # 2) 非 canonical base_url → 400（带 /v1、尾斜杠、错 host 均拒绝）
+    # 2) 非 canonical base_url → 400（带 /v1、错 host 均拒绝；
+    #    尾斜杠被 rstrip 归一容忍，等价 canonical——app 侧 strip 后比对）
     for bad_base in ("https://api.deepseek.com/v1",
-                     "https://api.deepseek.com/",
                      "https://cpa.example/v1"):
         reset_config()
         payload = dict(OFFICIAL_PAYLOAD)

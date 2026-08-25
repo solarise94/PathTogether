@@ -54,7 +54,8 @@ import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
 import conftest  # noqa: E402
 from pg_compat import BACKEND, json_only  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits  # noqa: E402
+# check()：_pt_helpers 统一带守卫实现；PASS/FAIL 计数仍落在本模块
+from _pt_helpers import check, csrf_client, install_json_login_limits  # noqa: E402
 
 pg_only = pytest.mark.skipif(
     BACKEND != "postgres",
@@ -70,15 +71,6 @@ PW2 = "password1password1"
 PW3 = "newpass99newpass99"
 OWNER_PW = "owner-pass-123456"
 
-
-def check(name, cond, detail=""):
-    global PASS, FAIL
-    if cond:
-        PASS += 1
-        print("  ok  %s" % name)
-    else:
-        FAIL += 1
-        print("FAIL  %s  %s" % (name, detail))
 
 
 @pytest.fixture(autouse=True)

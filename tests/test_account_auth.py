@@ -50,26 +50,17 @@ import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
 import conftest  # noqa: E402
 from pg_compat import json_only  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits  # noqa: E402
+# check()：_pt_helpers 统一带守卫实现；PASS/FAIL 计数仍落在本模块
+from _pt_helpers import check, csrf_client, install_json_login_limits  # noqa: E402
+
+PASS = 0
+FAIL = 0
 
 #: 测试用密码（≥15 字符，满足统一 15..200 策略）
 OWNER_PW = "owner-pass-123456"
 USER_PW = "user-pass-1234567"
 NEW_PW = "new-pass-12345678"
 OTHER_PW = "other-pass-123456"
-
-PASS = 0
-FAIL = 0
-
-
-def check(name, cond, detail=""):
-    global PASS, FAIL
-    if cond:
-        PASS += 1
-        print("  ok  %s" % name)
-    else:
-        FAIL += 1
-        print("FAIL  %s  %s" % (name, detail))
 
 
 def _share_impl():

@@ -46,7 +46,8 @@ import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
 import conftest  # noqa: E402
 from pg_compat import json_only  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits  # noqa: E402
+# check()：_pt_helpers 统一带守卫实现；PASS/FAIL 计数仍落在本模块
+from _pt_helpers import check, csrf_client, install_json_login_limits  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -56,16 +57,6 @@ PW = "pass1234pass1234"
 PW2 = "password1password1"
 PW3 = "newpass99newpass99"
 OWNER_PW = "owner-pass-123456"
-
-
-def check(name, cond, detail=""):
-    global PASS, FAIL
-    if cond:
-        PASS += 1
-        print("  ok  %s" % name)
-    else:
-        FAIL += 1
-        print("FAIL  %s  %s" % (name, detail))
 
 
 @pytest.fixture(autouse=True)
@@ -177,7 +168,9 @@ def test_user_crud_and_login_id_unique():
     assert raw is not None
     raw_text = json.dumps(raw, ensure_ascii=False)
     check("users.json 无明文密码", PW not in raw_text and "pass9999" not in raw_text)
-    check("users.json 含 pbkdf2 hash", "pbkdf2" in raw_text)
+    # werkzeug 3.x 默认哈希已从 pbkdf2 切到 scrypt，两者都是合法 werkzeug 格式
+    check("users.json 含 werkzeug hash（pbkdf2/scrypt）",
+          "pbkdf2" in raw_text or "scrypt" in raw_text)
 
 
 def test_set_disabled_and_password():

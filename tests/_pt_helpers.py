@@ -15,9 +15,32 @@
    本 mock（等价「改为 mock store」的验收路径）。
 """
 import math
+import os
+import sys
 import time
 
 from pg_compat import BACKEND
+
+# --------------------------------------------------------------------------- #
+# 计数式断言（统一收敛实现，替代各脚本式测试文件自带的 check()）
+# --------------------------------------------------------------------------- #
+def check(name, cond, detail=""):
+    """计数式断言：在**调用方模块**的 PASS/FAIL 上计数 + print。
+
+    - 脚本直跑（python tests/test_xxx.py）：各文件的汇总计数彼此独立，
+      收尾 print / sys.exit 逻辑保持原样（读各自模块的 PASS/FAIL）。
+    - pytest 收集运行（PYTEST_CURRENT_TEST 由 pytest 在用例执行期间设置）：
+      失败必须 raise——否则计数式断言下每个 test_* 都会「绿」，失败静默漏网。
+    """
+    g = sys._getframe(1).f_globals
+    if cond:
+        g["PASS"] = g.get("PASS", 0) + 1
+        print("  ok  %s" % name)
+        return
+    g["FAIL"] = g.get("FAIL", 0) + 1
+    print("FAIL  %s  %s" % (name, detail))
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        raise AssertionError("FAIL %s %s" % (name, detail))
 
 
 class CsrfClient:

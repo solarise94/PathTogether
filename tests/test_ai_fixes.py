@@ -32,6 +32,8 @@ os.makedirs(SHARE_DATA_DIR, exist_ok=True)
 
 import share_store  # noqa: E402
 from pg_compat import json_only  # noqa: E402
+# check()：_pt_helpers 统一带守卫实现；PASS/FAIL 计数仍落在本模块
+from _pt_helpers import check  # noqa: E402
 
 # openslide 未安装时 stub（本测试只覆盖配置/迁移，不需真 OpenSlide）
 try:
@@ -101,16 +103,6 @@ def _isolate_share_store(monkeypatch):
 
 PASS = 0
 FAIL = 0
-
-
-def check(name, cond, detail=""):
-    global PASS, FAIL
-    if cond:
-        PASS += 1
-        print("  ok  %s" % name)
-    else:
-        FAIL += 1
-        print("FAIL  %s  %s" % (name, detail))
 
 
 def reset_store():

@@ -1,8 +1,12 @@
 # 账户系统简化与完善修复方案
 
 - 日期：2026-08-25
-- 状态：**批次 A 已实施并上线**（2026-08-25，PT `89660cb`，验证记录见
-  `docs/demo-deployment.md`「账户系统批次 A 上线」）；批次 B/C 待排期
+- 状态：**全部完成**（2026-08-25）。批次 A（凭据与会话闭环）PT `89660cb`、
+  批次 B（login_id 语义收口）PT `218aa81`、批次 C（物理改名 + 兼容窗口/dual/JSON
+  收口）PT `ded77a2`+`7c08aa7`；三批次均已部署 homePC demo 并经公网 HTTPS 冒烟，
+  验证记录见 `docs/demo-deployment.md`「账户系统批次 A/B/C 上线」三节。批次 C
+  为破坏性 schema 变更（0016 物理改名），回滚依赖
+  `svs_demo-pre-acctC-20260825-153238.dump` + 镜像标签 `pre-acctC`。
 - 适用基线：PathTogether `e7b5f1d`
 - 范围：PathTogether owner 引导、登录标识、密码生命周期、Web 会话、用户管理、
   账户存储收口

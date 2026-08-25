@@ -3383,8 +3383,9 @@ def api_admin_registration_invites_create():
     cohort?, note?}。
 
     批次 C（docs §4.2/§8.2）：绑定字段语义为「允许兑换的登录账号 login_id」
-    （非已验证邮箱）；只接受 ``login_id`` 入参（批次 B 的 ``email`` 兼容入参
-    已删除）。响应只携带 login_id_masked（email_masked 已删除）。
+    （非已验证邮箱）；只接受 ``login_id`` 入参——批次 B 的 ``email`` 兼容入参
+    已删除，body 仍带 email 键一律显式 400（绝不静默降级为不绑定邀请）。
+    响应只携带 login_id_masked（email_masked 已删除）。
 
     仅本响应返回明文 code（Cache-Control: no-store，刷新即失）；库内只存带盐
     hash。owner 创建频率受每分钟/每日上限。绑定值省略 = 不绑定（高风险，
@@ -3409,7 +3410,10 @@ def api_admin_registration_invites_create():
                 429, {"Retry-After": str(max(1, int(retry)))})
 
     body = request.get_json(silent=True) or {}
-    # 绑定登录账号：只接受 login_id（批次 C 删除 email 兼容入参）
+    # 绑定登录账号：只接受 login_id（批次 C 删除 email 兼容入参）。email 键
+    # 仍出现说明是旧客户端——显式 400，绝不静默降级为不绑定邀请（高风险）。
+    if "email" in body:
+        return jsonify(error="email 入参已随批次 C 移除，绑定登录账号请改用 login_id"), 400
     login_id = body.get("login_id")
     if login_id is not None:
         login_id = str(login_id).strip()

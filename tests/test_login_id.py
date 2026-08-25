@@ -378,17 +378,20 @@ def test_invite_admin_api_login_id_only(monkeypatch):
           "newuser@x.com" not in json.dumps(body)
           and "token_hash" not in body)
 
-    # 批次 C：email 兼容入参已删除。邀请端点的 login_id 本就可选（不绑定是
-    # owner 高风险选项），只传 email 不给 login_id → email 被忽略，创建的
-    # 是**不绑定**邀请（email 值不再被当作绑定别名）。
+    # 批次 C：email 兼容入参已删除——body 仍带 email 键说明是旧客户端，
+    # 显式 400（绝不静默降级为不绑定邀请这一高风险形态）。
     r2 = client.post("/api/admin/registration-invites",
                      json={"email": "LegacyInv@x.com"})
-    check("email 入参被忽略（仍 200 创建）", r2.status_code == 200,
+    check("email 入参显式 400", r2.status_code == 400,
           "got %s" % r2.status_code)
-    b2 = r2.get_json()
-    check("email 不再被当作绑定别名（login_id_masked 为空串）",
+    check("400 文案指引 login_id",
+          "login_id" in (r2.get_json() or {}).get("error", ""))
+    # 显式不绑定（不带 email/login_id）仍可创建（owner 高风险选项语义保持）
+    r2u = client.post("/api/admin/registration-invites", json={})
+    check("显式不绑定创建 200", r2u.status_code == 200)
+    b2 = r2u.get_json()
+    check("不绑定邀请 login_id_masked 为空串",
           b2.get("login_id_masked") == "", "got %r" % b2.get("login_id_masked"))
-    check("email 值未泄露进响应", "legacyinv" not in json.dumps(b2).lower())
 
     # 列表：只带 login_id_masked
     r3 = client.get("/api/admin/registration-invites")
@@ -424,7 +427,7 @@ def test_invite_admin_api_login_id_only(monkeypatch):
     except registration_store.InviteRedeemError:
         redeemed_wrong = False
     check("绑定不匹配兑换失败", redeemed_wrong is False)
-    # 不绑定邀请（r2，email 被忽略）任意登录账号可兑换（高风险选项语义保持）
+    # 不绑定邀请（r2u）任意登录账号可兑换（高风险选项语义保持）
     out_unbound = registration_store.redeem_invite(
         b2["token"], "FreePick@x.com", PW)
     check("不绑定邀请任意登录账号兑换成功",

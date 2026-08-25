@@ -18,6 +18,12 @@
     "anno.branch.deep": { zh: "从此处深读", en: "Deep dive" },
     "anno.branch.deep.tip": { zh: "在 AI 面板从此标注开分支会话（全量工具深读）", en: "Open a branch session from here (full tools, deep read)" },
     "anno.private.badge": { zh: "私有", en: "Private" },
+    // 上传错误码 → 可读文案（上传修复 U1：服务端返回的机器码不再原样透出）
+    "upload.err.csrf": { zh: "登录状态已失效，请刷新页面后重试", en: "Session expired, please refresh and retry" },
+    "upload.err.guard": { zh: "上传配额服务暂不可用，请稍后重试", en: "Upload quota service unavailable, please retry later" },
+    "upload.err.name": { zh: "名称不可用，请重命名后重试", en: "Name unavailable, please rename and retry" },
+    "upload.err.too_large": { zh: "文件超过单次上传上限", en: "File exceeds the per-request upload limit" },
+    "upload.err.disk": { zh: "服务器磁盘空间不足", en: "Insufficient disk space on server" },
   };
   function tt(key) {
     try {
@@ -3809,6 +3815,18 @@
   }
 
   // ---------- 上传 ----------
+  // 上传错误信息：已知机器码翻成可读文案，其余回退服务端 error 字段
+  // （多为中文描述）或 HTTP 状态码
+  function uploadErrorMessage(xhr, data) {
+    var code = (data && data.error) || "";
+    if (code === "csrf_required") return tt("upload.err.csrf");
+    if (code === "upload_guard_unavailable") return tt("upload.err.guard");
+    if (code === "name_unavailable") return tt("upload.err.name");
+    if (code === "upload_too_large" || xhr.status === 413) return tt("upload.err.too_large");
+    if (xhr.status === 507) return tt("upload.err.disk");
+    return code || xhr.status;
+  }
+
   function uploadFile(file) {
     if (!file) return;
     var formData = new FormData();
@@ -3833,7 +3851,7 @@
         loadAll();
         openSlide(data.name);
       } else {
-        toast(t("upload.fail", { e: (data.error || xhr.status) }), "error");
+        toast(t("upload.fail", { e: uploadErrorMessage(xhr, data) }), "error");
       }
     });
     xhr.addEventListener("error", function () {
@@ -3841,8 +3859,14 @@
       toast(t("upload.net.fail"), "error");
     });
     xhr.open("POST", "/api/upload");
+    // 裸 XHR 与 apiFetch 同一 CSRF 契约：双提交头必须带上（上传修复 U1，
+    // 漏头会被服务端 400 csrf_required 拒绝）
+    xhr.setRequestHeader("X-CSRF-Token", csrfToken());
     xhr.send(formData);
   }
+  // 供测试（tests/js/upload-csrf.test.ts loadApp harness）驱动真实上传路径；
+  // 与 HP_AUTH 同风格的命名空间导出，不进业务调用面
+  window.HP_UPLOAD = { uploadFile: uploadFile };
 
   // ---------- 拖拽上传 ----------
   function setupDragDrop() {

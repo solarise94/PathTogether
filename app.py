@@ -918,11 +918,20 @@ def rotate_csrf_token() -> str:
 
 
 def _csrf_submitted_token() -> str:
-    """双通道取提交值：表单隐藏域优先，其次 X-CSRF-Token 头。"""
-    tok = request.form.get(CSRF_FORM_FIELD)
-    if not tok:
-        tok = request.headers.get(CSRF_HEADER_NAME) or ""
-    return (tok or "").strip()
+    """取提交值：``/api/*`` 只认 X-CSRF-Token 头，其余路径表单域优先。
+
+    契约（上传修复 U1 §1.4）：``/api/*`` 写接口不回退 ``request.form``——对
+    multipart 请求访问 ``request.form`` 会触发 Werkzeug 解析整个 body（大文件
+    spool 到系统临时盘），只为找一个不存在的表单域。header-only 后，无 token 的
+    multipart 在消费 body 之前即被 400 拒绝。表单域回退只保留给 HTML 表单路径
+    （``/login``、``/register`` 等浏览器原生 form 无法带自定义 header；现有
+    ``/api/*`` 前端调用全部经 apiFetch/uploadFile 带 header）。
+    """
+    if not request.path.startswith("/api/"):
+        tok = request.form.get(CSRF_FORM_FIELD)
+        if tok:
+            return tok.strip()
+    return (request.headers.get(CSRF_HEADER_NAME) or "").strip()
 
 
 def _csrf_validate() -> bool:

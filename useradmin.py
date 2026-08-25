@@ -19,7 +19,7 @@
 - 目标为被禁用的唯一 owner 时必须显式 ``--enable``：同一事务内解除禁用 +
   更新 hash + auth_version+1；目标已启用却带 ``--enable`` → 报错退出（语义
   模糊拒绝）。0 个 owner 行 → 拒绝并输出逃生路径，**绝不静默建号**；
-- 密码只从 stdin（交互 TTY 读一行即可，无需二次确认；管道读全部）或
+- 密码只从 stdin（TTY 经 getpass 无回显读一次；管道读全部）或
   ``--password-file``（去单个尾部换行）读取，拒绝命令行参数值、空/全空白；
   执行统一 15..200 策略（常量取自 ``user_store_pg``，与 store 层单一来源）；
 - audit：同一事务写 ``audit_events``，action=
@@ -76,14 +76,10 @@ def _strip_trailing_newline(text):
 
 
 def _read_password_stdin():
-    """--password-stdin：TTY 下读一行（无二次确认，自动化友好）；非 TTY 读全部。"""
+    """--password-stdin：TTY 下经 getpass 无回显读一次；非 TTY 读全部。"""
     if sys.stdin.isatty():
-        sys.stderr.write("请输入新密码（只输入一次，无二次确认）：")
-        sys.stderr.flush()
-        line = sys.stdin.readline()
-        if not line:
-            return ""
-        return _strip_trailing_newline(line)
+        import getpass
+        return getpass.getpass("请输入新密码（输入不回显）：")
     return _strip_trailing_newline(sys.stdin.read())
 
 
@@ -252,7 +248,7 @@ def _build_parser():
     grp = rp.add_mutually_exclusive_group(required=True)
     grp.add_argument(
         "--password-stdin", action="store_true",
-        help="从 stdin 读新密码（TTY 交互读一行即可；管道/重定向读全部并去单个尾部换行）",
+        help="从 stdin 读新密码（TTY 经 getpass 无回显；管道/重定向读全部并去单个尾部换行）",
     )
     grp.add_argument(
         "--password-file", metavar="PATH",
@@ -275,8 +271,11 @@ def main(argv=None):
         _err(str(exc))
         return 1
     except psycopg.Error as exc:
-        # 数据库异常：只透出类型与消息（psycopg 消息不含密码/hash）
-        _err("数据库操作失败：%s: %s" % (type(exc).__name__, exc.diag.message_primary or exc))
+        # 数据库异常：只透出类型与消息（psycopg 消息不含密码/hash）；
+        # 客户端侧错误（如连接中断）没有 server diag，回退到 str(exc)
+        diag = getattr(exc, "diag", None)
+        msg = getattr(diag, "message_primary", None) or str(exc)
+        _err("数据库操作失败：%s: %s" % (type(exc).__name__, msg))
         return 1
 
 

@@ -7241,8 +7241,9 @@ def api_slide_region(name):
 
     参数：x,y,w,h（level-0 整数，必填，x,y>=0，w,h>0）；
          out_w,out_h 可选（默认保持宽高比、最长边 1568，上限各 4096）。
-    返回 JSON：{image_base64, mime, width, height, src:{x,y,w,h}, magnification}。
-    src 是 clamp 到边界后的实际区域。
+    返回 JSON：{image_base64, mime, width, height, src:{x,y,w,h}, magnification,
+              read_level}。src 是 clamp 到边界后的实际区域；read_level 为实际
+    解码金字塔层（W0 跨仓契约，向后兼容新增字段）。
     Stage 3a-2a：can_view_slide，无权 403（不泄露存在性差异，统一 403）。
     """
     if not can_view_slide(name):
@@ -7336,6 +7337,8 @@ def api_slide_region(name):
         "height": oh,
         "src": {"x": x2, "y": y2, "w": w2, "h": h2},
         "magnification": mag,
+        # W0 契约：实际解码金字塔层（与 _read_region_b64 同式选层；向后兼容新增）
+        "read_level": int(lvl),
     })
 
 
@@ -7800,6 +7803,10 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
         "width": ow, "height": oh,
         "src": {"x": x2, "y": y2, "w": w2, "h": h2},
         "magnification": mag,
+        # W0 跨仓契约（HistoPilot whole-slide-snapshot-fix-plan）：实际解码层
+        # （get_best_level_for_downsample 选出的金字塔层，非语义 state_level），
+        # 向后兼容新增字段，供 snapshot_captured 事件标注 read_level。
+        "read_level": int(lvl),
     }
 
 
@@ -7848,8 +7855,9 @@ def internal_ai_region():
         （最长边 = max_long_edge，保持比例）。与显式 out_w/out_h 同时给出时，以
         max_long_edge 为准（保宽高比，避免固定拉伸）。
       - 仅 out_w/out_h：旧契约，强制到精确尺寸（不保宽高比），保持向后兼容。
-    返回 {image_base64, mime, width, height, src, magnification, encoder}（encoder
-    含 id/version/resize/overlay_version/jpeg_quality，供 sidecar 校验派生规格 §6.3）。
+    返回 {image_base64, mime, width, height, src, magnification, read_level, encoder}
+    （encoder 含 id/version/resize/overlay_version/jpeg_quality，供 sidecar 校验派生
+    规格 §6.3；read_level 为实际解码金字塔层——W0 跨仓契约，向后兼容新增）。
     """
     auth = _require_internal()
     if auth:
@@ -7909,6 +7917,8 @@ def internal_ai_region():
         "height": r["height"],
         "src": r["src"],
         "magnification": r["magnification"],
+        # W0 契约：实际解码金字塔层（向后兼容新增；mock 兼容用 .get）
+        "read_level": r.get("read_level"),
         "encoder": _derivative_encoder_info(q),
     })
 
@@ -8427,6 +8437,8 @@ def plugin_v1_region(slide):
             resp.headers["X-Region-Out"] = json.dumps(
                 {"outW": int(r["width"]), "outH": int(r["height"])})
             resp.headers["X-Region-Magnification"] = json.dumps(r["magnification"])
+            # W0 契约：实际解码金字塔层（与 JSON 路径的 read_level 同值）
+            resp.headers["X-Region-Read-Level"] = json.dumps(r.get("read_level"))
             resp.headers["X-Region-Encoder"] = json.dumps(_derivative_encoder_info(q))
             return resp
         resp = jsonify({
@@ -8436,6 +8448,7 @@ def plugin_v1_region(slide):
             "height": r["height"],
             "src": r["src"],
             "magnification": r["magnification"],
+            "read_level": r.get("read_level"),
             "encoder": _derivative_encoder_info(q),
             "content_sha256": content_sha,
             "asset_revision": _legacy_slide_revision(safe),

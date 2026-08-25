@@ -144,6 +144,7 @@ def _fake_region(jpeg_bytes, width=1568, height=1568):
         "image_base64": base64.b64encode(jpeg_bytes).decode("ascii"),
         "mime": "image/jpeg", "width": width, "height": height,
         "src": {"x": 0, "y": 0, "w": 100, "h": 100}, "magnification": 20.0,
+        "read_level": 1,  # W0 契约：实际解码金字塔层（mock 与真实返回同形）
     }
 
 
@@ -184,6 +185,8 @@ def test_region_binary_via_accept_header():
     assert json.loads(r.headers["X-Region-Bbox"]) == {"x": 0, "y": 0, "w": 100, "h": 100}
     assert json.loads(r.headers["X-Region-Out"]) == {"outW": 1568, "outH": 1568}
     assert json.loads(r.headers["X-Region-Magnification"]) == 20.0
+    # W0 契约：二进制路径以响应头回传实际解码层（int）
+    assert json.loads(r.headers["X-Region-Read-Level"]) == 1
     enc = json.loads(r.headers["X-Region-Encoder"])
     assert enc["id"] == "pillow" and enc["resize"] == "LANCZOS" and enc["jpeg_quality"] == 85
 
@@ -220,6 +223,8 @@ def test_region_default_no_accept_is_json_base64():
     body = r.get_json()
     assert "image_base64" in body
     assert base64.b64decode(body["image_base64"]) == jpeg
+    # W0 契约：JSON 路径携带 read_level 且为 int
+    assert isinstance(body["read_level"], int) and body["read_level"] == 1
 
 
 def test_region_binary_bytes_identical_to_json_base64():

@@ -106,6 +106,7 @@ def _patch_read_region(captured):
             "width": ow, "height": oh,
             "src": {"x": x, "y": y, "w": w, "h": h},
             "magnification": 20,
+            "read_level": 2,  # W0 契约：实际解码层随响应透传
         }
     return fake
 
@@ -133,6 +134,8 @@ def test_max_long_edge_horizontal_2to1():
     assert j["height"] == 512
     # 比例保持 2:1
     assert abs(j["width"] / j["height"] - 2.0) < 0.01
+    # W0 契约：internal 转发路径携带 read_level 且为 int
+    assert isinstance(j["read_level"], int) and j["read_level"] == 2
 
 
 def test_max_long_edge_vertical_1to2():

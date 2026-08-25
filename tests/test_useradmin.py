@@ -13,7 +13,11 @@
     （disabled=false + 版本递增 + audit 含 reenabled=true）；enabled 目标配
     --enable 拒绝；
   - 0 个 owner 行（空表 / 只有普通 user）拒绝并输出逃生路径，绝不静默建号；
-  - 多 owner 行拒绝（不选「第一条」）；--login-id 不匹配拒绝；
+  - owner 定位以**唯一 enabled owner** 为准（P2 修复，与启动模型/0015 索引
+    一致）：1 enabled + 历史 disabled 行 → 正常重置 enabled owner，disabled
+    历史行不动；--login-id 命中 disabled 历史行 → 拒绝并说明；0 enabled 且
+    >1 全禁用 → 无法唯一定位拒绝；>1 enabled（临时落下 0015 索引构造）→
+    不变量破坏拒绝（不选「第一条」）；--login-id 不匹配拒绝；
   - 短密码 / 空 / 全空白拒绝（统一 15..200 策略）；
   - 原子性：audit 写失败（触发器注入异常）→ 密码更新一并回滚；
   - 未设 DATABASE_URL → 清晰报错非 0 退出。
@@ -229,32 +233,113 @@ def test_zero_owner_rows_refused_with_escape_hint(pg_uri, capsys, tmp_path):
     assert _fetch(pg_uri, "SELECT 1 FROM users WHERE role='owner'") == []
 
 
-def test_multiple_owner_rows_refused(pg_uri, capsys, tmp_path):
-    """>1 行 role='owner'（1 enabled + 1 disabled，唯一可经 SQL 构造的形态）：
-    拒绝执行，不选「第一条」。"""
-    owner = _bootstrap_owner()
+def _insert_owner_row(pg_uri, user_id, login_id, disabled):
+    """直插一条 owner 行（绕过应用层；hash 用占位值 'x'，不影响断言）。"""
     c = psycopg.connect(pg_uri)
     try:
         with c.cursor() as cur:
             cur.execute(
                 "INSERT INTO users (user_id, login_id, display_name, "
                 "password_hash, role, created_at, disabled) "
-                "VALUES ('usr_o2','o2@x.com','','x','owner',"
-                "to_timestamp(1),TRUE)")
+                "VALUES (%s,%s,'','x','owner',to_timestamp(1),%s)",
+                (user_id, login_id, disabled))
         c.commit()
     finally:
         c.close()
-    f = tmp_path / "secret.txt"
-    f.write_text(NEW_PW, encoding="utf-8")
-    rc = useradmin.main(["reset-owner-password", "--login-id", "browser_admin",
-                         "--password-file", str(f)])
-    assert rc != 0
+
+
+def test_enabled_plus_disabled_history_owner_resets_enabled(
+        pg_uri, capsys, monkeypatch):
+    """P2：1 enabled + 1 历史 disabled owner（唯一可经 SQL 构造的正常形态）→
+    以唯一 enabled owner 为恢复目标正常重置；disabled 历史行原样不动。"""
+    owner = _bootstrap_owner()
+    _insert_owner_row(pg_uri, "usr_o2", "o2@x.com", True)
+    rc = _run_stdin(monkeypatch, [
+        "reset-owner-password", "--login-id", "browser_admin",
+        "--password-stdin"], NEW_PW + "\n")
+    assert rc == 0, capsys.readouterr().err
     out, err = capsys.readouterr()
-    assert "2 行 role='owner'" in err  # 报告 owner 行数，拒绝执行
+    assert owner["user_id"] in out
+    # enabled owner：hash 换新 + 版本递增
+    assert user_store_pg.verify_user("browser_admin", NEW_PW) is not None
+    assert user_store_pg.verify_user("browser_admin", OLD_PW) is None
     row = _row(pg_uri, "SELECT auth_version FROM users WHERE user_id=%s",
                (owner["user_id"],))
-    assert row["auth_version"] == 1
+    assert row["auth_version"] == 2
+    # disabled 历史 owner 行原样保留（不参与定位、不被启用/改密）
+    legacy = _row(pg_uri, "SELECT disabled, auth_version FROM users "
+                          "WHERE user_id='usr_o2'")
+    assert legacy["disabled"] is True and legacy["auth_version"] == 1
+    aud = _last_audit(pg_uri)
+    assert aud is not None and aud["target_id"] == owner["user_id"]
+
+
+def test_disabled_history_login_id_refused_when_enabled_exists(
+        pg_uri, capsys, monkeypatch):
+    """--login-id 命中历史 disabled owner 行（库中另有 enabled owner）→
+    拒绝并说明（重新启用会违反单 enabled owner 不变量），带不带 --enable 同拒。"""
+    _bootstrap_owner()
+    _insert_owner_row(pg_uri, "usr_o2", "legacy@x.com", True)
+    for extra in ([], ["--enable"]):
+        argv = ["reset-owner-password", "--login-id", "legacy@x.com",
+                "--password-stdin"] + extra
+        rc = _run_stdin(monkeypatch, argv, NEW_PW + "\n")
+        assert rc != 0, "extra=%r 不应放行" % (extra,)
+    out, err = capsys.readouterr()
+    assert "历史 disabled owner" in err
+    # 库未被动：enabled owner 旧密码仍可登录，无 audit
+    assert user_store_pg.verify_user("browser_admin", OLD_PW) is not None
     assert _last_audit(pg_uri) is None
+
+
+def test_all_disabled_multiple_owner_rows_refused(
+        pg_uri, capsys, monkeypatch):
+    """0 enabled + >1 disabled：无法唯一定位恢复目标 → 拒绝（含 --enable）。"""
+    _insert_owner_row(pg_uri, "usr_a", "a@x.com", True)
+    _insert_owner_row(pg_uri, "usr_b", "b@x.com", True)
+    rc = _run_stdin(monkeypatch, [
+        "reset-owner-password", "--login-id", "a@x.com",
+        "--password-stdin", "--enable"], NEW_PW + "\n")
+    assert rc != 0
+    out, err = capsys.readouterr()
+    assert "全部被禁用" in err or "无法唯一定位" in err
+    assert _last_audit(pg_uri) is None
+
+
+def test_multiple_enabled_owners_refused(pg_uri, capsys, monkeypatch):
+    """>1 enabled owner（临时落下 0015 部分唯一索引构造的不变量破坏态）→
+    拒绝执行，不选「第一条」；用后恢复索引。"""
+    _bootstrap_owner()
+    c = psycopg.connect(pg_uri)
+    try:
+        with c.cursor() as cur:
+            cur.execute("DROP INDEX IF EXISTS users_single_enabled_owner_key")
+        c.commit()
+    finally:
+        c.close()
+    try:
+        _insert_owner_row(pg_uri, "usr_o2", "second@x.com", False)
+        rc = _run_stdin(monkeypatch, [
+            "reset-owner-password", "--login-id", "browser_admin",
+            "--password-stdin"], NEW_PW + "\n")
+        assert rc != 0
+        out, err = capsys.readouterr()
+        assert "启用的 owner" in err
+        assert user_store_pg.verify_user("browser_admin", OLD_PW) is not None
+        assert _last_audit(pg_uri) is None
+    finally:
+        # 恢复 0015 索引（conftest 的 TRUNCATE 不会重建）：先清掉破坏态行
+        c = psycopg.connect(pg_uri)
+        try:
+            with c.cursor() as cur:
+                cur.execute("DELETE FROM users WHERE user_id='usr_o2'")
+                cur.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "users_single_enabled_owner_key "
+                    "ON users (role) WHERE role = 'owner' AND NOT disabled")
+            c.commit()
+        finally:
+            c.close()
 
 
 def test_wrong_login_id_refused(pg_uri, capsys, tmp_path):

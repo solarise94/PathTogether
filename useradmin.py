@@ -13,12 +13,18 @@
 - 连接：只读 ``DATABASE_URL`` 环境变量，经 ``pg_store.connect()`` 直连
   PostgreSQL；未设置或连接失败 → stderr 报错 + 非 0 退出。**不依赖
   STORAGE_BACKEND**（主机侧工具等价于直接改库，数据库本身就是唯一事实源）；
-- 目标定位：``lower(login_id) = lower(trim(--login-id))`` 且 ``role='owner'``；
-  且库内 ``role='owner'`` 行总数必须**恰好为 1**（0 个或多个都拒绝，绝不选
-  「第一条」）；
-- 目标为被禁用的唯一 owner 时必须显式 ``--enable``：同一事务内解除禁用 +
-  更新 hash + auth_version+1；目标已启用却带 ``--enable`` → 报错退出（语义
-  模糊拒绝）。0 个 owner 行 → 拒绝并输出逃生路径，**绝不静默建号**；
+- 目标定位（与启动模型 / 0015 部分唯一索引一致，以**唯一 enabled owner**
+  为准）：``lower(login_id) = lower(trim(--login-id))`` 且 ``role='owner'``；
+  - 启用 owner 恰好 1 个 → 恢复目标只认该启用 owner（库中允许保留
+    disabled 历史 owner 行，不参与定位；``--login-id`` 命中历史 disabled
+    行 → 拒绝并说明，绝不选「第一条」）；
+  - 启用 owner 0 个且 owner 行总数恰好 1（该行被禁用）→ 唯一 disabled
+    owner 恢复路径：必须显式 ``--enable``；启用 owner 0 个且总数 > 1
+    （全部禁用）、或启用 owner 多于 1 个（不变量已破坏）→ 拒绝，须人工
+    审计收敛；0 个 owner 行 → 拒绝并输出逃生路径，**绝不静默建号**；
+  - 目标为被禁用的唯一 owner 时必须显式 ``--enable``：同一事务内解除禁用 +
+    更新 hash + auth_version+1；目标已启用却带 ``--enable`` → 报错退出（语义
+    模糊拒绝）。
 - 密码只从 stdin（TTY 经 getpass 无回显读一次；管道读全部）或
   ``--password-file``（去单个尾部换行）读取，拒绝命令行参数值、空/全空白；
   执行统一 15..200 策略（常量取自 ``user_store_pg``，与 store 层单一来源）；
@@ -143,29 +149,69 @@ def _cmd_reset_owner_password(args):
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                # owner 行总数必须恰好为 1：0 个/多个都拒绝，不选「第一条」
-                cur.execute("SELECT count(*) AS n FROM users WHERE role='owner'")
-                n_owners = int(cur.fetchone()["n"])
-                if n_owners == 0:
+                # 恢复目标以「唯一 enabled owner」为准（与启动模型及 0015 部分
+                # 唯一索引一致，P2 修复）：启用 owner 恰好 1 个即可恢复，库中
+                # 允许保留 disabled 历史 owner 行；启用 0 个时仅接受「恰好 1 行
+                # 且被禁用」的 --enable 恢复路径（详见模块 docstring）。
+                cur.execute(
+                    "SELECT count(*) FILTER (WHERE NOT disabled) AS enabled_n, "
+                    "count(*) AS total_n FROM users WHERE role='owner'")
+                cnt = cur.fetchone()
+                n_enabled = int(cnt["enabled_n"])
+                n_total = int(cnt["total_n"])
+                if n_total == 0:
                     _err(
                         "库中不存在任何 role='owner' 行，拒绝执行。\n"
                         + _NO_OWNER_ESCAPE_HINT
                     )
                     return 1
-                if n_owners > 1:
+                if n_enabled > 1:
                     _err(
-                        "库中存在 %d 行 role='owner'（要求恰好 1 行）；"
-                        "须人工审计收敛到唯一 owner 后再执行。" % n_owners
+                        "库中存在 %d 个启用的 owner（违反单 enabled owner "
+                        "不变量，正常应被 0015 索引拦截）；须人工审计收敛到"
+                        "唯一启用 owner 后再执行。" % n_enabled
+                    )
+                    return 1
+                if n_enabled == 0 and n_total > 1:
+                    _err(
+                        "库中存在 %d 行 role='owner' 且全部被禁用，无法唯一定位"
+                        "恢复目标；须人工审计收敛后再执行。" % n_total
                     )
                     return 1
 
-                cur.execute(
-                    "SELECT user_id, login_id, disabled FROM users "
-                    "WHERE lower(login_id) = lower(trim(%s)) AND role='owner'",
-                    (args.login_id,),
-                )
+                if n_enabled == 1:
+                    # 恢复目标只认唯一启用 owner（disabled 历史 owner 行不参与）
+                    cur.execute(
+                        "SELECT user_id, login_id, disabled FROM users "
+                        "WHERE lower(login_id) = lower(trim(%s)) "
+                        "AND role='owner' AND NOT disabled",
+                        (args.login_id,),
+                    )
+                else:
+                    # n_enabled==0 且 n_total==1：唯一 disabled owner 恢复路径
+                    cur.execute(
+                        "SELECT user_id, login_id, disabled FROM users "
+                        "WHERE lower(login_id) = lower(trim(%s)) AND role='owner'",
+                        (args.login_id,),
+                    )
                 target = cur.fetchone()
                 if target is None:
+                    if n_enabled == 1:
+                        # 区分说明：--login-id 命中的是 disabled 历史 owner 行
+                        cur.execute(
+                            "SELECT 1 FROM users "
+                            "WHERE lower(login_id) = lower(trim(%s)) "
+                            "AND role='owner' AND disabled",
+                            (args.login_id,),
+                        )
+                        if cur.fetchone() is not None:
+                            _err(
+                                "--login-id %r 匹配的是历史 disabled owner 行；"
+                                "库中当前另有一个启用的 owner，恢复目标只认唯一"
+                                "启用 owner（重新启用历史 owner 会违反单 "
+                                "enabled owner 不变量）。" % args.login_id
+                            )
+                            return 1
                     _err(
                         "--login-id %r 与库中唯一 owner 的登录账号不匹配"
                         "（大小写不敏感、两侧均做 trim）。" % args.login_id

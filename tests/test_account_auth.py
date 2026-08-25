@@ -563,7 +563,7 @@ def test_change_password_brute_force_lockout(monkeypatch):
 
 
 def test_change_password_validation_rejections():
-    """新密码 <15 / >200 / 与当前相同 → 400。"""
+    """新密码 <15 / >200 / 全空白 / 与当前相同 → 400。"""
     c = _login_user_client()
     r_short = c.post("/api/account/password", json={
         "current_password": USER_PW, "new_password": "short"})
@@ -573,11 +573,46 @@ def test_change_password_validation_rejections():
     r_long = c.post("/api/account/password", json={
         "current_password": USER_PW, "new_password": "x" * 201})
     check("新密码 >200 → 400", r_long.status_code == 400)
+    r_ws = c.post("/api/account/password", json={
+        "current_password": USER_PW, "new_password": " " * 15})
+    check("新密码全空白 → 400", r_ws.status_code == 400, "got %s" % r_ws.status_code)
+    check("全空白文案（与 CLI 一致）",
+          "全空白" in r_ws.get_json().get("error", ""),
+          r_ws.get_data(as_text=True))
     r_same = c.post("/api/account/password", json={
         "current_password": USER_PW, "new_password": USER_PW})
     check("新密码与当前相同 → 400", r_same.status_code == 400,
           "got %s" % r_same.status_code)
     check("同密码文案", "相同" in r_same.get_json().get("error", ""))
+
+
+def test_change_password_concurrent_reset_returns_409(monkeypatch):
+    """P1 TOCTOU：请求期间管理员重置先提交 → 409 冲突，绝不覆盖新密码。"""
+    make_owner("admin", OWNER_PW)
+    u = user_store.create_user("u@x.com", USER_PW, role="user")
+    c = make_client()
+    login(c, "u@x.com", USER_PW)
+
+    real_change = user_store.change_own_password
+
+    def _reset_then_change(uid, cur_pw, new_pw, expected_ver):
+        # 模拟并发窗口：端点已读到旧版本（expected_ver），写库前管理员
+        # 重置先提交（版本递增）——旧实现会无条件覆盖，此处必须冲突
+        user_store.set_user_password(uid, OTHER_PW)
+        return real_change(uid, cur_pw, new_pw, expected_ver)
+
+    monkeypatch.setattr(user_store, "change_own_password", _reset_then_change)
+    r = c.post("/api/account/password", json={
+        "current_password": USER_PW, "new_password": NEW_PW})
+    check("并发重置 → 409", r.status_code == 409,
+          "got %s: %r" % (r.status_code, r.data))
+    check("错误码 auth_version_conflict",
+          r.get_json().get("code") == "auth_version_conflict")
+    check("管理员重置的密码未被覆盖",
+          user_store.verify_user("u@x.com", OTHER_PW) is not None)
+    check("本请求的新密码未生效",
+          user_store.verify_user("u@x.com", NEW_PW) is None)
+    check("冲突路径不写 audit", len(_audits("user.password_change")) == 0)
 
 
 def test_change_password_success_clears_session():
@@ -642,14 +677,33 @@ def test_admin_disable_owner_409():
 
 
 def test_admin_create_user_password_policy():
-    """创建用户：短密码 400（统一 15..200，无硬编码 8）。"""
+    """创建用户：短密码 400（统一 15..200，无硬编码 8）；全空白 400。"""
     make_owner("admin", OWNER_PW)
     c = _owner_client()
     r = c.post("/api/admin/users", json={"login_id": "n@x.com", "password": "short14chars__x"[:13]})
     check("14 位密码 400", r.status_code == 400)
     check("长度文案统一（15..200）", "15" in json.loads(r.data).get("error", ""))
+    r_ws = c.post("/api/admin/users", json={"login_id": "n@x.com",
+                                            "password": " " * 15})
+    check("全空白密码 400（与 CLI 一致）", r_ws.status_code == 400,
+          "got %s" % r_ws.status_code)
+    check("全空白文案", "全空白" in json.loads(r_ws.data).get("error", ""))
+    check("全空白未建号",
+          user_store.get_user_by_login_id("n@x.com") is None)
     r2 = c.post("/api/admin/users", json={"login_id": "n@x.com", "password": USER_PW})
     check("15 位密码 200", r2.status_code == 200, "got %s" % r2.status_code)
+
+
+def test_admin_reset_whitespace_password_400():
+    """管理员重置普通用户密码：全空白 400（P2：与创建/CLI 策略一致）。"""
+    make_owner("admin", OWNER_PW)
+    u = user_store.create_user("u@x.com", USER_PW, role="user")
+    c = _owner_client()
+    r = c.post("/api/admin/users/%s/password" % u["user_id"],
+               json={"password": " " * 15})
+    check("全空白 400", r.status_code == 400, "got %s" % r.status_code)
+    check("全空白文案", "全空白" in json.loads(r.data).get("error", ""))
+    check("原密码未变", user_store.verify_user("u@x.com", USER_PW) is not None)
 
 
 def test_no_web_endpoint_can_demote_or_delete_owner():

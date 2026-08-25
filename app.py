@@ -41,7 +41,6 @@ from flask import (
     send_from_directory,
     session,
 )
-from werkzeug.security import check_password_hash
 from werkzeug.utils import secure_filename
 
 from openslide import OpenSlide
@@ -1729,10 +1728,13 @@ def api_account_password():
 
     - 必须已登录 Cookie session，并过统一 CSRF（before_request；/api/account/*
       不在 _CSRF_EXEMPT_PREFIXES 豁免清单内）；
-    - 用当前 DB hash 验 current_password（get_user 返回含 hash 的行）；
-    - 新密码统一 15..200（user_store 常量，错误文案与 store 一致）；
-    - 新密码不得与当前密码相同（check_password_hash 对比当前 hash）；
-    - set_user_password 在 store 层同事务递增 auth_version（docs §6.2）；
+    - change_own_password CAS 原语（P1 修复）：验 current_password（对当前
+      DB hash）+ 比对 auth_version 与本次读取版本 + 更新 hash 并递增版本，
+      全部在同一 store 事务内（docs §6.2）。请求期间密码已被管理员重置 /
+      break-glass / 另一端改密先提交 → 409 auth_version_conflict（清
+      session），绝不覆盖新密码；
+    - 新密码统一 15..200 且不得全空白、不得与当前密码相同（user_store
+      常量与 _validate_password，错误文案与 store 一致）；
     - 写 user.password_change audit（actor=自己、target=自己，detail 只含
       sessions_revoked=true，绝无密码/hash 特征）；
     - 成功后 session.clear() 并返回 200 {"ok": true}；
@@ -1778,43 +1780,45 @@ def api_account_password():
         resp.headers["Retry-After"] = str(max(1, retry))
         return resp, 429
 
-    # 1) 验当前密码（对 DB hash）
+    # 1) CAS 改密（P1 修复）：验 current_password + 库内 auth_version 与本次
+    #    get_user 读到的版本一致 + 更新 hash/version，三步在 store 同一事务
+    #    内完成。若管理员重置 / break-glass / 另一端改密在「本次读取」与
+    #    「写库」之间先提交，版本比对失败 → 409，绝不覆盖新密码（旧实现
+    #    为请求外验旧 hash + 无条件 set_user_password，存在 TOCTOU 覆盖窗口）
     try:
-        current_ok = check_password_hash(
-            user.get("password_hash") or "", current_password or "")
-    except Exception:
-        current_ok = False
-    if not current_ok:
-        # 计入登录失败桶；触发阈值后按 429 拒绝（文案与登录一致）
-        retry = _record_login_failure(account_hash, ip_prefix_hash)
-        if retry > 0:
-            resp = jsonify(error=_CHANGE_PW_LOCKED_MSG, code="locked")
-            resp.headers["Retry-After"] = str(max(1, retry))
-            return resp, 429
-        return jsonify(error="invalid_current_password"), 400
+        user_store.change_own_password(
+            uid, current_password, new_password, user.get("auth_version"))
+    except user_store.PasswordChangeConflict as exc:
+        if exc.reason == "invalid_current_password":
+            # 计入登录失败桶；触发阈值后按 429 拒绝（文案与登录一致）
+            retry = _record_login_failure(account_hash, ip_prefix_hash)
+            if retry > 0:
+                resp = jsonify(error=_CHANGE_PW_LOCKED_MSG, code="locked")
+                resp.headers["Retry-After"] = str(max(1, retry))
+                return resp, 429
+            return jsonify(error="invalid_current_password"), 400
+        if exc.reason == "auth_version_conflict":
+            # 请求期间凭据版本已被其它写路径推进：本 session 已失效，
+            # 清 session 并要求重新登录后再改（不写 audit、不动密码）
+            session.clear()
+            return jsonify(
+                error="密码已被修改（如管理员重置或另一处本人改密），"
+                      "请重新登录后再试",
+                code="auth_version_conflict"), 409
+        if exc.reason == "same_as_current":
+            return jsonify(error="新密码不能与当前密码相同"), 400
+        # user_missing / user_disabled：并发禁用/删除防御
+        session.clear()
+        return jsonify(error="auth_required"), 401
+    except ValueError as e:
+        # 新密码统一策略（空 / 全空白 / 长度 15..200；文案与 store 一致）
+        return jsonify(error=str(e)), 400
 
-    # 2) 新密码统一长度策略（文案与 store 一致）
-    if not isinstance(new_password, str) or not new_password:
-        return jsonify(error="密码不能为空"), 400
-    if (len(new_password) < user_store.PASSWORD_MIN_LENGTH
-            or len(new_password) > user_store.PASSWORD_MAX_LENGTH):
-        return jsonify(error=(
-            "密码长度须在 %d..%d 字符之间（当前 %d 字符）"
-            % (user_store.PASSWORD_MIN_LENGTH, user_store.PASSWORD_MAX_LENGTH,
-               len(new_password)))), 400
-
-    # 3) 新密码不得与当前密码相同（对比当前 hash，而非明文入参）
-    if check_password_hash(user.get("password_hash") or "", new_password):
-        return jsonify(error="新密码不能与当前密码相同"), 400
-
-    # 4) 更新（store 层同事务 auth_version+1 → 所有旧 session 立即失效）
-    user_store.set_user_password(uid, new_password)
-
-    # 5) audit（先记再清 session：actor 取当前身份；detail 无密码特征）
+    # 2) audit（先记再清 session：actor 取当前身份；detail 无密码特征）
     _audit("user.password_change", target_type="user", target_id=uid,
            detail={"sessions_revoked": True})
 
-    # 6) 成功：清失败桶 + 清空当前 session（含本设备，docs §7.1）
+    # 3) 成功：清失败桶 + 清空当前 session（含本设备，docs §7.1）
     _clear_login_failures(account_hash, ip_prefix_hash)
     session.clear()
     return jsonify(ok=True)
@@ -1901,6 +1905,8 @@ def register():
         form_error = "请填写邀请码"
     elif not login_id:
         form_error = "请填写登录账号"
+    elif not password.strip():
+        form_error = "密码不能为全空白字符"
     elif len(password) < registration_store.MIN_PASSWORD_LENGTH:
         form_error = "密码长度至少 %d 位（推荐使用密码管理器生成的长口令）" \
             % registration_store.MIN_PASSWORD_LENGTH

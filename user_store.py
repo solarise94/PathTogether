@@ -75,6 +75,7 @@ _JSON_PUBLIC_NAMES = (
     "VALID_ROLES",
     "UserStoreCorrupt",
     "OwnerInvariantError",
+    "PasswordChangeConflict",
     # 统一密码策略（docs §3.3；两实现一致）
     "PASSWORD_MIN_LENGTH",
     "PASSWORD_MAX_LENGTH",
@@ -88,6 +89,7 @@ _JSON_PUBLIC_NAMES = (
     "list_users",
     "set_user_disabled",
     "set_user_password",
+    "change_own_password",
     "get_user_ai_config",
     "set_user_ai_config",
     "count_owners",

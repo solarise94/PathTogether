@@ -74,13 +74,16 @@ PASSWORD_MAX_LENGTH = 200
 
 
 def _validate_password(password):
-    """统一密码策略校验：str 且 15..200 字符；违规 raise ValueError。
+    """统一密码策略校验：str、非全空白且 15..200 字符；违规 raise ValueError。
 
-    只做长度与类型校验（允许空格/长口令），不做组合规则；错误消息不含
-    密码本身。所有密码写路径共用，无 _enforce_min_length 一类旁路。
+    只做长度/类型/全空白校验（口令中段允许空格，长口令友好），不做组合
+    规则；错误消息不含密码本身。所有密码写路径共用，无 _enforce_min_length
+    一类旁路。全空白拒绝与 useradmin CLI 对齐（P2：Web 与 CLI 策略一致）。
     """
     if not isinstance(password, str) or not password:
         raise ValueError("密码不能为空")
+    if not password.strip():
+        raise ValueError("密码不能为全空白字符")
     if len(password) < PASSWORD_MIN_LENGTH or len(password) > PASSWORD_MAX_LENGTH:
         raise ValueError(
             "密码长度须在 %d..%d 字符之间（当前 %d 字符）"
@@ -105,6 +108,19 @@ class OwnerInvariantError(Exception):
     不再是可登录生产形态；本类与 pg 实现语义一致，保证同一 dispatcher 在
     不同后端下行为对齐。
     """
+
+
+class PasswordChangeConflict(Exception):
+    """本人改密 CAS 冲突（P1 修复；与 user_store_pg 语义一致）。
+
+    ``reason`` 携带可区分的失败场景：user_missing / user_disabled /
+    auth_version_conflict / invalid_current_password / same_as_current
+    （各场景含义见 user_store_pg 同名类 docstring）。
+    """
+
+    def __init__(self, reason, message=None):
+        self.reason = reason
+        super().__init__(message or reason)
 
 
 # 空结构骨架
@@ -392,6 +408,9 @@ def set_user_password(user_id, new_password):
     密码统一执行 15..200 策略（无旁路参数）；hash 更新与 auth_version+1
     在同一次原子写内（批次 A docs §6.2，旧 session 凭据版本随之失效）。
     旧记录缺 auth_version 按 1 起算（§9.1）。
+
+    注意：本函数**不做**当前密码/版本校验，仅供管理员重置等权威路径；
+    本人改密一律走 change_own_password（CAS，P1 修复）。
     """
     _validate_password(new_password)
 
@@ -400,6 +419,49 @@ def set_user_password(user_id, new_password):
         user = data["users"].get(user_id)
         if user is None:
             return None
+        _migrate_record_key(user)
+        user["password_hash"] = generate_password_hash(new_password)
+        user["auth_version"] = _auth_version(user) + 1
+        _save_locked(f, data)
+        return _to_public(user)
+
+    return _with_lock("r+", _do)
+
+
+def change_own_password(user_id, current_password, new_password,
+                        expected_auth_version):
+    """本人改密 CAS 原语：验当前密码/版本 + 更新 hash 与版本，同一次原子写。
+
+    与 user_store_pg.change_own_password 语义一致（P1 修复）：在文件排他锁
+    内重读行，依次校验存在/未禁用、``auth_version == expected_auth_version``
+    （不符 → 已被管理员重置等写路径推进，拒绝覆盖）、current_password 对
+    当前 hash、新密码策略与「不得与当前相同」，全部通过才写 hash 并
+    auth_version+1。失败 raise PasswordChangeConflict 或 ValueError（策略），
+    不落盘。成功返回更新后的用户 dict（不含 hash）。
+    """
+    def _do(f):
+        data = _load_locked(f)
+        user = data["users"].get(user_id)
+        if user is None:
+            raise PasswordChangeConflict("user_missing")
+        if user.get("disabled"):
+            raise PasswordChangeConflict("user_disabled")
+        if _auth_version(user) != int(expected_auth_version or 0):
+            raise PasswordChangeConflict(
+                "auth_version_conflict",
+                "auth_version_conflict：库内版本已被其它写路径推进"
+                "（expected=%s, actual=%s），拒绝覆盖"
+                % (expected_auth_version, _auth_version(user)))
+        try:
+            current_ok = check_password_hash(
+                user.get("password_hash") or "", current_password or "")
+        except Exception:
+            current_ok = False
+        if not current_ok:
+            raise PasswordChangeConflict("invalid_current_password")
+        _validate_password(new_password)
+        if check_password_hash(user.get("password_hash") or "", new_password):
+            raise PasswordChangeConflict("same_as_current")
         _migrate_record_key(user)
         user["password_hash"] = generate_password_hash(new_password)
         user["auth_version"] = _auth_version(user) + 1

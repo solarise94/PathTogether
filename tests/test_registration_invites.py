@@ -590,6 +590,47 @@ def test_register_route_full_flow(monkeypatch):
 
 
 @pg_only
+def test_redeem_invite_whitespace_password_bad_input():
+    """兑换防御层（P2）：全空白密码（长度达标）→ bad_input，不建号不消费。"""
+    owner = _mk_owner()
+    inv = registration_store.create_invite(owner["user_id"], login_id="ws@x.com")
+    with pytest.raises(registration_store.InviteRedeemError) as ei:
+        registration_store.redeem_invite(inv["token"], "ws@x.com", " " * 15)
+    assert ei.value.reason == "bad_input"
+    assert user_store.get_user_by_login_id("ws@x.com") is None
+    row = registration_store.get_invite(inv["invite_id"])
+    assert row["use_count"] == 0 and row["consumed_at"] is None
+
+
+@pg_only
+def test_register_route_whitespace_password_rejected(monkeypatch):
+    """注册表单（P2）：全空白密码 → 表单错误回显，不建号不消费邀请码。"""
+    _satisfy_preconditions(monkeypatch)
+    owner = _mk_owner()
+    app_mod.AUTH_ENABLED = True
+    client = _client()
+    _owner_session(client, owner)
+    assert client.put("/api/admin/settings/registration",
+                      json={"mode": "invite_only"}).status_code == 200
+    inv = client.post("/api/admin/registration-invites",
+                      json={"login_id": "wsform@x.com"}).get_json()
+    anon = _client()
+    anon.get("/register")
+    r = anon.post("/register", data={
+        "invite_token": inv["token"], "login_id": "wsform@x.com",
+        "password": " " * 15, "password_confirm": " " * 15})
+    assert r.status_code == 200  # 表单错误回显（不 302）
+    body = r.get_data(as_text=True)
+    assert "全空白" in body
+    assert user_store.get_user_by_login_id("wsform@x.com") is None
+    # 邀请码未被消费：同一邀请码随后可正常兑换
+    r2 = anon.post("/register", data={
+        "invite_token": inv["token"], "login_id": "wsform@x.com",
+        "password": "longpassword123", "password_confirm": "longpassword123"})
+    assert r2.status_code == 302
+
+
+@pg_only
 def test_legacy_registration_open_true_fails_closed(monkeypatch):
     """§4.1：旧布尔 true 不自动映射为开放模式；读取即固化 closed。"""
     settings_store.set_setting(settings_store.REGISTRATION_OPEN_KEY, True,

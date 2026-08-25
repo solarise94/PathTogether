@@ -638,6 +638,122 @@ def test_lazy_migration_owner_refs(monkeypatch):
 
 
 # =========================================================================== #
+# 统一密码策略：全空白拒绝（P2：Web 写入口与 useradmin CLI 一致）
+# =========================================================================== #
+def test_password_policy_rejects_all_whitespace():
+    """全空白密码在 store 写入口一律 ValueError；中段含空格的长口令不受影响。"""
+    for i, pw in enumerate((" " * 15, "\t" * 20, " \r\n" * 8)):
+        try:
+            user_store.create_user("ws%d@x.com" % i, pw)
+            check("create_user 拒绝全空白 #%d" % i, False, "未抛 ValueError")
+        except ValueError as e:
+            check("create_user 拒绝全空白 #%d（文案）" % i,
+                  "全空白" in str(e), str(e))
+    u = user_store.create_user("ws-user@x.com", PW)
+    try:
+        user_store.set_user_password(u["user_id"], " " * 15)
+        check("set_user_password 拒绝全空白", False, "未抛 ValueError")
+    except ValueError as e:
+        check("set_user_password 拒绝全空白（文案）", "全空白" in str(e), str(e))
+    # 策略只拒「全」空白：中段含空格的长口令仍可创建/登录
+    v = user_store.create_user("ws-ok@x.com", "pass word 123456 ok")
+    check("含空格长口令仍可创建",
+          v is not None and v.get("login_id") == "ws-ok@x.com")
+    check("含空格长口令可登录",
+          user_store.verify_user("ws-ok@x.com", "pass word 123456 ok") is not None)
+
+
+# =========================================================================== #
+# change_own_password CAS 原语（P1：消除本人改密「先验后写」TOCTOU 覆盖窗口）
+# =========================================================================== #
+def _cas_user():
+    u = user_store.create_user("cas-user@x.com", PW)
+    assert u is not None
+    return u
+
+
+def test_change_own_password_success_bumps_version():
+    """成功路径：hash 更新 + auth_version+1；旧密码失效、新密码可登录。"""
+    u = _cas_user()
+    out = user_store.change_own_password(
+        u["user_id"], PW, PW2, u["auth_version"])
+    check("返回更新后用户（不含 hash）",
+          out is not None and out.get("user_id") == u["user_id"]
+          and "password_hash" not in out)
+    row = user_store.get_user(u["user_id"])
+    check("版本 +1", row["auth_version"] == u["auth_version"] + 1,
+          "ver=%r" % row.get("auth_version"))
+    check("旧密码失效", user_store.verify_user("cas-user@x.com", PW) is None)
+    check("新密码可登录", user_store.verify_user("cas-user@x.com", PW2) is not None)
+
+
+def test_change_own_password_wrong_current_rejected():
+    """当前密码错误 → PasswordChangeConflict(invalid_current_password)，不写库。"""
+    u = _cas_user()
+    try:
+        user_store.change_own_password(
+            u["user_id"], "wrong-current-pw-0", PW2, u["auth_version"])
+        check("错误当前密码拒绝", False, "未抛 PasswordChangeConflict")
+    except user_store.PasswordChangeConflict as e:
+        check("reason=invalid_current_password",
+              e.reason == "invalid_current_password", e.reason)
+    row = user_store.get_user(u["user_id"])
+    check("未写库（版本不变）", row["auth_version"] == u["auth_version"])
+    check("未写库（旧密码仍可登录）",
+          user_store.verify_user("cas-user@x.com", PW) is not None)
+
+
+def test_change_own_password_stale_version_conflict():
+    """P1 核心：expected 版本落后（管理员重置已先发生）→ 冲突且绝不覆盖。"""
+    u = _cas_user()
+    # 模拟：请求读到 v_n 后、写库前，管理员重置把版本推进到 v_n+1
+    user_store.set_user_password(u["user_id"], PW3)
+    try:
+        user_store.change_own_password(
+            u["user_id"], PW, PW2, u["auth_version"])
+        check("版本冲突拒绝", False, "未抛 PasswordChangeConflict")
+    except user_store.PasswordChangeConflict as e:
+        check("reason=auth_version_conflict",
+              e.reason == "auth_version_conflict", e.reason)
+    row = user_store.get_user(u["user_id"])
+    check("管理员新密码未被覆盖",
+          user_store.verify_user("cas-user@x.com", PW3) is not None)
+    check("本请求的新密码未生效",
+          user_store.verify_user("cas-user@x.com", PW2) is None)
+    check("版本保持重置后的值", row["auth_version"] == u["auth_version"] + 1)
+
+
+def test_change_own_password_same_policy_disabled_missing():
+    """同密码 / 策略违规 / 并发禁用 / 用户不存在的可区分失败。"""
+    u = _cas_user()
+    try:
+        user_store.change_own_password(u["user_id"], PW, PW, u["auth_version"])
+        check("同密码拒绝", False, "未抛")
+    except user_store.PasswordChangeConflict as e:
+        check("reason=same_as_current", e.reason == "same_as_current", e.reason)
+    try:
+        user_store.change_own_password(
+            u["user_id"], PW, " " * 15, u["auth_version"])
+        check("全空白新密码 ValueError", False, "未抛")
+    except ValueError as e:
+        check("全空白文案", "全空白" in str(e), str(e))
+    except user_store.PasswordChangeConflict:
+        check("全空白新密码 ValueError", False, "抛成了 Conflict（顺序错误）")
+    user_store.set_user_disabled(u["user_id"], True)
+    try:
+        user_store.change_own_password(
+            u["user_id"], PW, PW2, u["auth_version"] + 1)
+        check("禁用用户拒绝", False, "未抛")
+    except user_store.PasswordChangeConflict as e:
+        check("reason=user_disabled", e.reason == "user_disabled", e.reason)
+    try:
+        user_store.change_own_password("usr_missing", PW, PW2, 1)
+        check("用户不存在拒绝", False, "未抛")
+    except user_store.PasswordChangeConflict as e:
+        check("reason=user_missing", e.reason == "user_missing", e.reason)
+
+
+# =========================================================================== #
 # 收尾
 # =========================================================================== #
 def _finish():

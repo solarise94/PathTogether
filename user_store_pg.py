@@ -63,6 +63,22 @@ class OwnerInvariantError(Exception):
     """
 
 
+class PasswordChangeConflict(Exception):
+    """本人改密 CAS 冲突（P1 修复：消除「请求外验旧 hash + 无条件覆写」窗口）。
+
+    ``reason`` 携带可区分的失败场景：
+      - ``user_missing`` / ``user_disabled``：目标用户不存在或已被并发禁用；
+      - ``auth_version_conflict``：库内 auth_version 与调用方 expected 不符
+        （管理员重置 / break-glass / 另一端本人改密已先完成，绝不能覆盖）；
+      - ``invalid_current_password``：current_password 与库内 hash 不匹配；
+      - ``same_as_current``：新密码与当前密码相同。
+    """
+
+    def __init__(self, reason, message=None):
+        self.reason = reason
+        super().__init__(message or reason)
+
+
 # --------------------------------------------------------------------------- #
 # 统一密码策略（批次 A，docs §3.3；对齐 NIST SP 800-63B）：
 # 15..200 字符，允许空格与长口令，不要求组合规则。所有密码写入口（create_user /
@@ -75,13 +91,16 @@ PASSWORD_MAX_LENGTH = 200
 
 
 def _validate_password(password):
-    """统一密码策略校验：str 且 15..200 字符；违规 raise ValueError。
+    """统一密码策略校验：str、非全空白且 15..200 字符；违规 raise ValueError。
 
-    只做长度与类型校验（允许空格/长口令），不做组合规则；错误消息不含
-    密码本身。所有密码写路径共用，无 _enforce_min_length 一类旁路。
+    只做长度/类型/全空白校验（口令中段允许空格，长口令友好），不做组合
+    规则；错误消息不含密码本身。所有密码写路径共用，无 _enforce_min_length
+    一类旁路。全空白拒绝与 useradmin CLI 对齐（P2：Web 与 CLI 策略一致）。
     """
     if not isinstance(password, str) or not password:
         raise ValueError("密码不能为空")
+    if not password.strip():
+        raise ValueError("密码不能为全空白字符")
     if len(password) < PASSWORD_MIN_LENGTH or len(password) > PASSWORD_MAX_LENGTH:
         raise ValueError(
             "密码长度须在 %d..%d 字符之间（当前 %d 字符）"
@@ -347,6 +366,9 @@ def set_user_password(user_id, new_password):
 
     密码统一执行 15..200 策略（无旁路参数）；hash 更新与 auth_version+1
     在同一事务内（批次 A docs §6.2，旧 session 凭据版本随之失效）。
+
+    注意：本函数**不做**当前密码/版本校验，仅供管理员重置与 break-glass
+    等权威路径；本人改密一律走 change_own_password（CAS，P1 修复）。
     """
     _validate_password(new_password)
     conn = _connect()
@@ -361,6 +383,71 @@ def set_user_password(user_id, new_password):
                 )
                 row = cur.fetchone()
         return _public(row) if row else None
+    finally:
+        conn.close()
+
+
+def change_own_password(user_id, current_password, new_password,
+                        expected_auth_version):
+    """本人改密 CAS 原语：锁行 + 验当前密码/版本 + 更新 hash 与版本，同一事务。
+
+    「验证 current_password（对请求开始时的旧 hash）」与「更新密码」之间存
+    在并发窗口：管理员重置 / break-glass / 另一端改密若先提交，无条件
+    UPDATE 会覆盖新密码（P1 TOCTOU）。本原语在单事务内完成：
+
+      1. ``SELECT ... FOR UPDATE`` 锁定目标行（并发写在此串行化）；
+      2. 校验用户存在且未禁用；
+      3. 校验库内 ``auth_version == expected_auth_version``（调用方传入其
+         读到的版本；不符 → 说明行已被其它写路径推进，拒绝覆盖）；
+      4. 校验 ``current_password`` 对**当前行内** hash；
+      5. 统一密码策略 + 新密码不得与当前密码相同；
+      6. 更新 hash 并 ``auth_version+1``。
+
+    成功返回更新后的用户 dict（不含 hash）；失败 raise
+    ``PasswordChangeConflict``（reason 见该类 docstring；不写库、不计 audit
+    ——失败计数与文案由调用方分层处理）或 ``ValueError``（新密码策略违规，
+    文案与 _validate_password 一致）。
+    """
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT " + _SEL_HASH + " FROM users "
+                    "WHERE user_id=%s FOR UPDATE",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise PasswordChangeConflict("user_missing")
+                if row.get("disabled"):
+                    raise PasswordChangeConflict("user_disabled")
+                if int(row.get("auth_version") or 0) != int(
+                        expected_auth_version or 0):
+                    raise PasswordChangeConflict(
+                        "auth_version_conflict",
+                        "auth_version_conflict：库内版本已被其它写路径推进"
+                        "（expected=%s, actual=%s），拒绝覆盖"
+                        % (expected_auth_version, row.get("auth_version")))
+                try:
+                    current_ok = check_password_hash(
+                        row.get("password_hash") or "", current_password or "")
+                except Exception:
+                    current_ok = False
+                if not current_ok:
+                    raise PasswordChangeConflict("invalid_current_password")
+                _validate_password(new_password)
+                if check_password_hash(row.get("password_hash") or "",
+                                       new_password):
+                    raise PasswordChangeConflict("same_as_current")
+                cur.execute(
+                    "UPDATE users SET password_hash=%s, "
+                    "auth_version=auth_version+1 "
+                    "WHERE user_id=%s RETURNING " + _SEL_PUBLIC,
+                    (generate_password_hash(new_password), user_id),
+                )
+                updated = cur.fetchone()
+        return _public(updated) if updated else None
     finally:
         conn.close()
 

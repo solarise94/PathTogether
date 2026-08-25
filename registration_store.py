@@ -367,9 +367,11 @@ def redeem_invite(token, login_id, password, display_name=None):
     tok = (token or "").strip()
     norm_login = normalize_login_id(login_id)
     if not tok or not isinstance(password, str) or not norm_login \
+            or not password.strip() \
             or len(password) < MIN_PASSWORD_LENGTH \
             or len(password) > MAX_PASSWORD_LENGTH:
-        # 输入形状问题也按统一错误处理（路由层已做过表单校验，这里是防御层）
+        # 输入形状问题也按统一错误处理（路由层已做过表单校验，这里是防御层；
+        # 全空白拒绝与 user_store/_validate_password 及 useradmin CLI 对齐）
         raise InviteRedeemError("bad_input")
     token_hash = invite_token_hash(tok)
     fail_invite_id = None

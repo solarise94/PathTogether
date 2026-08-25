@@ -197,11 +197,20 @@ def _env_truthy(env, name):
 def _resolve_admin_auth(environ=None):
     """解析管理员认证。返回 (username, password, auth_enabled)。
 
-    REQUIRE_ADMIN_AUTH 开启且密码为空/占位符时 SystemExit，避免公网免认证启动。
+    REQUIRE_ADMIN_AUTH 开启时 ADMIN_USERNAME/ADMIN_PASSWORD 都必须经 env 显式
+    提供（owner 身份由 env 引导进数据库管理，不 baked 在代码里；空值
+    SystemExit，避免公网免认证启动）。auth 关闭的开发态回退为通用名 "admin"。
     """
     env = os.environ if environ is None else environ
-    username = env.get("ADMIN_USERNAME") or "admin"
+    username = env.get("ADMIN_USERNAME") or ""
     password = env.get("ADMIN_PASSWORD") or ""
+    if _env_truthy(env, "REQUIRE_ADMIN_AUTH") and not username.strip():
+        raise SystemExit(
+            "REQUIRE_ADMIN_AUTH=1 but ADMIN_USERNAME is empty; "
+            "refusing to start"
+        )
+    if not username:
+        username = "admin"
     if _env_truthy(env, "REQUIRE_ADMIN_AUTH") and _is_placeholder_admin_password(password):
         raise SystemExit(
             "REQUIRE_ADMIN_AUTH=1 but ADMIN_PASSWORD is empty or a placeholder; "

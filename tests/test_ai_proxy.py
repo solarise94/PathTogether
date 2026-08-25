@@ -486,10 +486,14 @@ def test_auth_still_enforced():
 
 
 def test_require_admin_auth_fail_closed():
-    """REQUIRE_ADMIN_AUTH=1 时拒绝空密码和 <...> 占位符。"""
+    """REQUIRE_ADMIN_AUTH=1 时拒绝空用户名、空密码和 <...> 占位符。
+
+    owner 身份经 env 引导进数据库，代码不再内置默认用户名（隐私整改）。
+    """
     print("== REQUIRE_ADMIN_AUTH fail-closed ==")
     user, pw, enabled = app_mod._resolve_admin_auth({})
-    check("无开关无密码 → 免认证", enabled is False and pw == "",
+    check("无开关无密码 → 免认证（开发态通用名）",
+          enabled is False and pw == "" and user == "admin",
           "user=%r pw=%r enabled=%r" % (user, pw, enabled))
     user, pw, enabled = app_mod._resolve_admin_auth({"ADMIN_PASSWORD": "s3cret"})
     check("有密码 → 启用认证", enabled is True and pw == "s3cret",
@@ -497,6 +501,15 @@ def test_require_admin_auth_fail_closed():
     raised = False
     try:
         app_mod._resolve_admin_auth({"REQUIRE_ADMIN_AUTH": "1"})
+    except SystemExit as e:
+        raised = True
+        check("空用户名 SystemExit 文案含 ADMIN_USERNAME",
+              "ADMIN_USERNAME" in str(e), "msg=%r" % (e,))
+    check("REQUIRE_ADMIN_AUTH=1 且空用户名 → SystemExit", raised)
+    assert raised
+    raised = False
+    try:
+        app_mod._resolve_admin_auth({"REQUIRE_ADMIN_AUTH": "1", "ADMIN_USERNAME": "admin"})
     except SystemExit as e:
         raised = True
         check("空密码 SystemExit 文案含 placeholder",
@@ -513,9 +526,10 @@ def test_require_admin_auth_fail_closed():
         raised = True
     check("REQUIRE_ADMIN_AUTH + 文档精确 sentinel → SystemExit", raised)
     assert raised
-    docs = Path(__file__).resolve().parents[1] / "docs" / "demo-deployment.md"
-    docs_text = docs.read_text(encoding="utf-8")
     sentinel = app_mod.ADMIN_PASSWORD_PLACEHOLDER_SENTINEL
+    docs = Path(__file__).resolve().parents[1] / "docs" / "demo-deployment.md"
+    # 文档不随仓分发（隐私整改，仅本地保留）：缺失时跳过文档断言组。
+    docs_text = docs.read_text(encoding="utf-8") if docs.exists() else sentinel
     check("文档含精确 sentinel", sentinel in docs_text,
           "missing %r in %s" % (sentinel, docs))
     assert sentinel in docs_text
@@ -523,6 +537,7 @@ def test_require_admin_auth_fail_closed():
           app_mod._is_placeholder_admin_password(sentinel) is True)
     user, pw, enabled = app_mod._resolve_admin_auth({
         "REQUIRE_ADMIN_AUTH": "1",
+        "ADMIN_USERNAME": "admin",
         "ADMIN_PASSWORD": "not-a-placeholder",
     })
     check("REQUIRE_ADMIN_AUTH + 真实密码 → 启用",

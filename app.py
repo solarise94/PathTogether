@@ -8989,13 +8989,15 @@ def plugin_v1_dispatch(plugin_id, capability_name):
 
 @app.route("/api/ai/run", methods=["POST"])
 def api_ai_run():
-    """主 session 起跑（SSE）。body: {slide, task?, fresh?, request_id?}。
+    """主 session 起跑（SSE）。body: {slide, task?, fresh?, session_id?, request_id?}。
 
     代理到 sidecar POST /run：注入 config（base_url/api_key 明文/model/
     api_protocol + 全部调优参数）。Stage 3a-2b：按当前身份做切片级鉴权
     （can_annotate_slide，无权 403）与凭据解析（未配置 → 400 中文指导）。
     PT-3：request_id 幂等贯通 + 平台 AI 预算预占（同 id 重试不双扣）+ run
     grant fail-closed（写工具 run 缺 grant 拒绝转发）。
+    session_id（非空字符串）原样透传（会话隔离 S2 前置）；fresh=1 透传，
+    其归档语义归 sidecar（HistoPilot 仓负责）。
     """
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
@@ -9018,6 +9020,11 @@ def api_ai_run():
     task = body.get("task")
     if isinstance(task, str):
         payload["task"] = task
+    # 会话隔离 S2 前置（纵深防御）：body 带非空字符串 session_id 时原样透传，
+    # 让 sidecar 把消息发到用户当前选中的会话（归档/路由语义归 sidecar）
+    session_id = body.get("session_id")
+    if isinstance(session_id, str) and session_id:
+        payload["session_id"] = session_id
     # JSON body 与 query 双重兼容（前端历史上把 fresh=1 放在 query）
     if bool(body.get("fresh")) or request.args.get("fresh") == "1":
         payload["fresh"] = True
@@ -9030,11 +9037,14 @@ def api_ai_run():
 
 @app.route("/api/ai/continue", methods=["POST"])
 def api_ai_continue():
-    """主 session 从落库 state+messages 续跑（SSE）。body: {slide, request_id?}。
+    """主 session 从落库 state+messages 续跑（SSE）。body: {slide, session_id?,
+    request_id?}。
 
     代理到 sidecar POST /continue：注入 config。无 main → 404（sidecar 返回）。
     Stage 3a-2b：切片级鉴权（can_annotate_slide）+ 凭据解析。
     PT-3：request_id 幂等 + 预算预占 + grant fail-closed（continue 计 1 次）。
+    session_id（非空字符串）原样透传：会话目标由客户端显式指定（S2 前置），
+    未带时目标会话选择（如 idx.main）语义归 sidecar。
     """
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
@@ -9053,6 +9063,11 @@ def api_ai_continue():
     }
     if prep.get("security"):
         payload["security"] = prep["security"]
+    # 会话隔离 S2 前置（纵深防御）：与 /run 相同，非空字符串 session_id 原样
+    # 透传给 sidecar（continue 目标会话由客户端显式指定）
+    session_id = body.get("session_id")
+    if isinstance(session_id, str) and session_id:
+        payload["session_id"] = session_id
     _audit("ai.run", target_type="session", slide=slide,
            detail={"mode": "continue", "request_id": prep["request_id"]})
     return _proxy_sse("/continue", payload, on_accepted=prep["on_accepted"],

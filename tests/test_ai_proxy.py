@@ -222,13 +222,23 @@ def test_run_proxies_with_decrypted_config_and_sse():
           "got %r" % resp.headers.get("Content-Type"))
     check("run SSE 字节完全一致", resp.data == sent_bytes,
           "got %r" % resp.data)
-    # fresh=1 query 透传成 body.fresh=True
+    # fresh=1 query 透传成 body.fresh=True（归档语义归 sidecar 仓，PT 不断言）
     fake.calls.clear()
     fake.register("POST", "/run", lambda b, q, h, k: FakeResponse(200, sse_frames=[]))
     client.post("/api/ai/run?fresh=1", json={"slide": "s.svs"})
     check("run fresh=1 query → body.fresh=True",
           fake.calls[-1]["body"].get("fresh") is True,
           "got %r" % fake.calls[-1]["body"])
+    # session_id 透传（会话隔离 S2 前置）：非空字符串原样进 sidecar body；
+    # 空串不带（不伪造会话目标）
+    client.post("/api/ai/run", json={"slide": "s.svs", "session_id": "sess-run-9"})
+    check("run session_id 透传",
+          fake.calls[-1]["body"].get("session_id") == "sess-run-9",
+          "got %r" % fake.calls[-1]["body"].get("session_id"))
+    client.post("/api/ai/run", json={"slide": "s.svs", "session_id": ""})
+    check("run 空 session_id 不透传",
+          "session_id" not in fake.calls[-1]["body"],
+          "got %r" % fake.calls[-1]["body"].get("session_id"))
 
 
 def test_continue_and_ask_proxy():
@@ -247,6 +257,16 @@ def test_continue_and_ask_proxy():
           (fake.calls[-1]["body"].get("config") or {}).get("api_key"))
     check("continue SSE 透传", r.data == b"x\n\n", "got %r" % r.data)
     check("continue X-AI-Session-ID", r.headers.get("X-AI-Session-ID") == "sess-c")
+    # session_id 透传（与 /run 同一 S2 前置契约）
+    client.post("/api/ai/continue",
+                json={"slide": "s.svs", "session_id": "sess-cont-7"})
+    check("continue session_id 透传",
+          fake.calls[-1]["body"].get("session_id") == "sess-cont-7",
+          "got %r" % fake.calls[-1]["body"].get("session_id"))
+    client.post("/api/ai/continue", json={"slide": "s.svs", "session_id": ""})
+    check("continue 空 session_id 不透传",
+          "session_id" not in fake.calls[-1]["body"],
+          "got %r" % fake.calls[-1]["body"].get("session_id"))
 
     # ask：410 根标注已删除（错误响应，非 SSE，JSON 透传）
     fake.register("POST", "/ask",

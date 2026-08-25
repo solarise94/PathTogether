@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """用户存储层 —— PostgreSQL 后端实现（Stage 3b-2）。
 
-逐函数对照 `user_store_json` 语义移植（21 个公共名全实现）。调用方仍经
+逐函数对照 `user_store_json` 语义移植（公共名全实现）。调用方仍经
 `user_store` dispatcher 访问（`STORAGE_BACKEND=postgres` 时 re-export 本模块），
 app.py / share_server.py / tests 一行不改。
 
@@ -13,6 +13,15 @@ app.py / share_server.py / tests 一行不改。
     dict 形状（浮点时间戳）完全一致；
   - 密码一律 werkzeug pbkdf2 哈希落库（与 json 一致，绝不存明文）；
   - ai_config 落 users.ai_config JSONB（api_key 已是 app.py 加密形态，原样存储）。
+
+账户系统批次 A（docs/account-system-simplification-fix-plan.md §5.3）：
+  - auth_version（0015 列）随所有读路径带出；密码/disable/enable 写路径同事务
+    递增（docs §6.2）；
+  - owner 引导改为 list_enabled_owners / list_owners / create_bootstrap_owner /
+    resolve_primary_owner，删除 ensure_owner / first_owner 的「env 对账覆盖 +
+    最早 owner」语义；
+  - 密码统一 15..200 策略（PASSWORD_MIN_LENGTH / PASSWORD_MAX_LENGTH），
+    无旁路参数。
 
 无文件锁 / SHARE_DATA_DIR 语义：PG 是唯一事实源。SHARE_DATA_DIR / USER_FILE 仍
 暴露为 None 占位，仅供 dispatcher 公共名校验（hasattr）与形状兼容。
@@ -29,6 +38,43 @@ import pg_store
 
 class UserStoreCorrupt(Exception):
     """JSON 用户库损坏（PG 后端不会抛出；dispatcher 公共名对齐）。"""
+
+
+class OwnerInvariantError(Exception):
+    """owner 不变量被破坏（账户系统批次 A，docs §3.2/§5.3）。
+
+    消息携带场景标识便于区分处理：
+      - ``no_owner``：库中无任何启用 owner（resolve_primary_owner 拒绝解析）；
+      - ``multiple_enabled_owners``：启用的 owner 多于一个（禁止选「第一条」）；
+      - ``users_table_not_empty``：create_bootstrap_owner 只允许空库首建。
+    """
+
+
+# --------------------------------------------------------------------------- #
+# 统一密码策略（批次 A，docs §3.3；对齐 NIST SP 800-63B）：
+# 15..200 字符，允许空格与长口令，不要求组合规则。所有密码写入口（create_user /
+# set_user_password / create_bootstrap_owner）共用，无旁路参数。
+# --------------------------------------------------------------------------- #
+#: 密码最小长度（存量短 hash 仍可登录，仅新写入执行本策略）
+PASSWORD_MIN_LENGTH = 15
+#: 密码最大长度（与 UI 上限一致，防御异常大输入）
+PASSWORD_MAX_LENGTH = 200
+
+
+def _validate_password(password):
+    """统一密码策略校验：str 且 15..200 字符；违规 raise ValueError。
+
+    只做长度与类型校验（允许空格/长口令），不做组合规则；错误消息不含
+    密码本身。所有密码写路径共用，无 _enforce_min_length 一类旁路。
+    """
+    if not isinstance(password, str) or not password:
+        raise ValueError("密码不能为空")
+    if len(password) < PASSWORD_MIN_LENGTH or len(password) > PASSWORD_MAX_LENGTH:
+        raise ValueError(
+            "密码长度须在 %d..%d 字符之间（当前 %d 字符）"
+            % (PASSWORD_MIN_LENGTH, PASSWORD_MAX_LENGTH, len(password))
+        )
+    return password
 
 
 def _connect():
@@ -98,31 +144,33 @@ def _user_ai_config(user: dict) -> dict:
 
 
 # 公共 SELECT 列（created_at 转 epoch 浮点与 json 形状对齐；ai_access 为 P0-B
-# §3.7 新增列：受邀用户默认 FALSE，存量默认 TRUE，见 0012 迁移）。
+# §3.7 新增列：受邀用户默认 FALSE，存量默认 TRUE，见 0012 迁移；auth_version 为
+# 0015 新增的 session 凭据版本列，读路径一律带出供 session 比对）。
 _SEL_HASH = (
     "user_id, email, display_name, password_hash, role, "
     "extract(epoch from created_at)::float8 AS created_at, disabled, ai_config, "
-    "ai_access"
+    "ai_access, auth_version"
 )
 _SEL_PUBLIC = (
     "user_id, email, display_name, role, "
     "extract(epoch from created_at)::float8 AS created_at, disabled, ai_config, "
-    "ai_access"
+    "ai_access, auth_version"
 )
 
 
-def create_user(email, password, role=ROLE_USER, display_name=None,
-                _enforce_min_length=True):
-    """创建用户。返回新用户 dict（不含 hash）；email 冲突抛 ValueError。"""
+def create_user(email, password, role=ROLE_USER, display_name=None):
+    """创建用户。返回新用户 dict（不含 hash）；email 冲突抛 ValueError。
+
+    密码统一执行 15..200 策略（无旁路参数；批次 A docs §3.3）。
+    在 PG 上创建第二个 enabled owner 会被 users_single_enabled_owner_key
+    部分唯一索引（0015）拦下，同样抛 ValueError。
+    """
     if role not in VALID_ROLES:
         raise ValueError("非法角色")
     norm_email = _normalize_email(email)
     if not norm_email:
         raise ValueError("邮箱/用户名不能为空")
-    if not isinstance(password, str) or not password:
-        raise ValueError("密码不能为空")
-    if _enforce_min_length and isinstance(password, str) and len(password) < 8:
-        raise ValueError("密码长度至少 8 位")
+    _validate_password(password)
     name = str(display_name or "").strip() or norm_email
     uid = _user_id()
     now = time.time()
@@ -145,11 +193,21 @@ def create_user(email, password, role=ROLE_USER, display_name=None,
                          role, now),
                     )
                     row = cur.fetchone()
-        except psycopg.errors.UniqueViolation:
-            raise ValueError("该邮箱/用户名已存在")
+        except psycopg.errors.UniqueViolation as exc:
+            raise ValueError(_unique_violation_message(exc)) from exc
         return _public(row) if row else None
     finally:
         conn.close()
+
+
+def _unique_violation_message(exc):
+    """把 users 表 UniqueViolation 映射成可区分的中文 ValueError 消息。"""
+    name = getattr(getattr(exc, "diag", None), "constraint_name", "") or ""
+    text = str(exc)
+    if "users_single_enabled_owner_key" in name or \
+            "users_single_enabled_owner_key" in text:
+        return "已存在启用的 owner：单 enabled owner 不变量（0015 索引）禁止再建"
+    return "该邮箱/用户名已存在"
 
 
 def get_user(user_id):
@@ -245,15 +303,20 @@ def list_users():
 
 
 def set_user_disabled(user_id, flag):
-    """设置用户禁用状态（True=禁用）。返回更新后的用户 dict；不存在返回 None。"""
+    """设置用户禁用状态（True=禁用）。返回更新后的用户 dict；不存在返回 None。
+
+    disable 与 enable 两个方向都在同一 UPDATE 事务内递增 auth_version
+    （批次 A docs §6.2：enable 也递增，防止禁用期间未发请求的旧 Cookie
+    在重新启用后被激活）。
+    """
     flag = bool(flag)
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "UPDATE users SET disabled=%s WHERE user_id=%s "
-                    "RETURNING " + _SEL_PUBLIC,
+                    "UPDATE users SET disabled=%s, auth_version=auth_version+1 "
+                    "WHERE user_id=%s RETURNING " + _SEL_PUBLIC,
                     (flag, user_id),
                 )
                 row = cur.fetchone()
@@ -262,19 +325,21 @@ def set_user_disabled(user_id, flag):
         conn.close()
 
 
-def set_user_password(user_id, new_password, _enforce_min_length=True):
-    """重置用户密码。返回更新后的用户 dict；不存在返回 None。"""
-    if not isinstance(new_password, str) or not new_password:
-        raise ValueError("密码不能为空")
-    if _enforce_min_length and len(new_password) < 8:
-        raise ValueError("密码长度至少 8 位")
+def set_user_password(user_id, new_password):
+    """重置用户密码。返回更新后的用户 dict；不存在返回 None。
+
+    密码统一执行 15..200 策略（无旁路参数）；hash 更新与 auth_version+1
+    在同一事务内（批次 A docs §6.2，旧 session 凭据版本随之失效）。
+    """
+    _validate_password(new_password)
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "UPDATE users SET password_hash=%s WHERE user_id=%s "
-                    "RETURNING " + _SEL_PUBLIC,
+                    "UPDATE users SET password_hash=%s, "
+                    "auth_version=auth_version+1 "
+                    "WHERE user_id=%s RETURNING " + _SEL_PUBLIC,
                     (generate_password_hash(new_password), user_id),
                 )
                 row = cur.fetchone()
@@ -371,8 +436,43 @@ def count_owners():
         conn.close()
 
 
-def first_owner():
-    """返回第一个 owner 用户 dict（含 hash）；无则 None。"""
+# --------------------------------------------------------------------------- #
+# owner 解析与引导（账户系统批次 A，docs §3.2/§5.3）
+#
+# 删除含糊的 ensure_owner()/first_owner()（「最早创建的 owner」+ env 密码对账
+# 覆盖），改为显式的三个原语：list_enabled_owners / create_bootstrap_owner /
+# resolve_primary_owner。数据库层由 0015 的部分唯一索引
+# users_single_enabled_owner_key 兜底「最多一个 enabled owner」。
+# --------------------------------------------------------------------------- #
+# create_bootstrap_owner 专用 advisory lock key（"SVOW" 的 4 字节整数）。
+# 独立于 app.py schema 初始化的 0x53565347（"SVSG"）：两个启动阶段互不串行
+# 耦合（docs §5.3 明确要求不复用 schema 锁）。
+_BOOTSTRAP_OWNER_LOCK = 0x53564F57
+
+
+def list_enabled_owners():
+    """返回全部启用 owner（role='owner' AND NOT disabled）的 dict 列表。
+
+    按 created_at, user_id 升序；每项含 password_hash 与 auth_version
+    （owner 解析需要校验 hash 非空，属内部 API，不经公共用户输出）。
+    """
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT " + _SEL_HASH +
+                    " FROM users WHERE role='owner' AND NOT disabled "
+                    "ORDER BY extract(epoch from created_at) ASC, user_id"
+                )
+                rows = cur.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def list_owners():
+    """返回全部 owner 行（含 disabled），排序与字段同 list_enabled_owners。"""
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -380,12 +480,92 @@ def first_owner():
                 cur.execute(
                     "SELECT " + _SEL_HASH +
                     " FROM users WHERE role='owner' "
-                    "ORDER BY extract(epoch from created_at) ASC, user_id LIMIT 1"
+                    "ORDER BY extract(epoch from created_at) ASC, user_id"
                 )
-                row = cur.fetchone()
-        return dict(row) if row else None
+                rows = cur.fetchall()
+        return [dict(r) for r in rows]
     finally:
         conn.close()
+
+
+def create_bootstrap_owner(login_id, password):
+    """空库首建 owner（仅引导用）。返回新 owner dict（含 hash 与 auth_version）。
+
+    语义（docs §5.2/§5.3）：
+      - 仅当 users 表**完全为空**时创建；任何已存在行 → OwnerInvariantError
+        （users_table_not_empty）；
+      - 事务内先取专用 advisory lock（_BOOTSTRAP_OWNER_LOCK）串行化 gunicorn
+        多 worker 并发首启，锁内复查空表再插入；0015 部分唯一索引作数据库层
+        兜底（正常路径不会走到）；
+      - email 列写规范化 login_id（trim + lower），display_name 同值，
+        role='owner'；密码统一执行 15..200 策略；
+      - 不对已有 owner 做任何对账/改密（那是已删除的 ensure_owner 语义）。
+    """
+    norm_login = _normalize_email(login_id)
+    if not norm_login:
+        raise ValueError("登录账号不能为空")
+    _validate_password(password)
+    uid = _user_id()
+    now = time.time()
+    conn = _connect()
+    try:
+        try:
+            with pg_store.transaction(conn) as c:
+                with c.cursor() as cur:
+                    # xact 级锁：commit/rollback 自动释放，与检查+插入同事务
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock(%s)",
+                        (_BOOTSTRAP_OWNER_LOCK,),
+                    )
+                    cur.execute("SELECT count(*) AS n FROM users")
+                    existing = int(cur.fetchone()["n"])
+                    if existing:
+                        raise OwnerInvariantError(
+                            "users_table_not_empty：users 表已有 %d 行，"
+                            "create_bootstrap_owner 仅允许在完全空库时创建"
+                            "首个 owner（已有 owner 时任何 bootstrap 环境变量"
+                            "不得改动账号）" % existing
+                        )
+                    cur.execute(
+                        "INSERT INTO users "
+                        "(user_id, email, display_name, password_hash, role, "
+                        " created_at, disabled) "
+                        "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), FALSE) "
+                        "RETURNING " + _SEL_HASH,
+                        (uid, norm_login, norm_login,
+                         generate_password_hash(password), ROLE_OWNER, now),
+                    )
+                    row = cur.fetchone()
+        except psycopg.errors.UniqueViolation as exc:
+            # 兜底路径：并发建号未被 advisory lock 挡住时由 0015 索引拦下
+            raise OwnerInvariantError(
+                "multiple_enabled_owners：并发创建 owner 被单 enabled owner "
+                "索引（users_single_enabled_owner_key）拒绝"
+            ) from exc
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def resolve_primary_owner():
+    """解析唯一的 primary owner（只读，永不写库、永不接受密码参数）。
+
+    恰好 1 个启用 owner → 返回该 dict（含 hash 与 auth_version）；
+    0 个 → OwnerInvariantError（no_owner）；>1 个 → OwnerInvariantError
+    （multiple_enabled_owners，禁止选「第一条」）。
+    """
+    owners = list_enabled_owners()
+    if not owners:
+        raise OwnerInvariantError(
+            "no_owner：库中不存在任何启用的 owner（role='owner' 且未禁用），"
+            "无法解析 primary owner"
+        )
+    if len(owners) > 1:
+        raise OwnerInvariantError(
+            "multiple_enabled_owners：存在 %d 个启用的 owner，违反单 "
+            "enabled owner 不变量；须人工审计后只保留一个" % len(owners)
+        )
+    return owners[0]
 
 
 def has_enabled_users():
@@ -400,44 +580,25 @@ def has_enabled_users():
         conn.close()
 
 
-def ensure_owner(email, password):
-    """owner 引导与迁移：按 ADMIN_USERNAME/ADMIN_PASSWORD 维护 owner 账户。
-
-    语义与 json 完全一致：无 owner → 创建；已有 owner 且 ADMIN_PASSWORD 不匹配 →
-    重置该 owner 密码。返回 owner 用户 dict（含 hash）。
-    """
-    norm_email = _normalize_email(email)
-    name = norm_email or "owner"
-    owner = first_owner()
-    if owner is None:
-        return create_user(name, password, role=ROLE_OWNER, display_name=name,
-                           _enforce_min_length=False)
-    try:
-        match = check_password_hash(owner.get("password_hash") or "", password)
-    except Exception:
-        match = False
-    if not match:
-        set_user_password(owner["user_id"], password, _enforce_min_length=False)
-        owner = get_user(owner["user_id"])
-    return owner
-
-
 # --------------------------------------------------------------------------- #
 # dual 后端 result-replay 镜像（Stage 3b-2）
 #
-# json 为权威、pg 为影子副本。create_user/ensure_owner 在 json 侧内部生成 user_id，
-# 同参调 pg 会让 pg 生成不同 user_id → 两库发散。这里提供 _mirror_user：接收 json
-# 返回的权威用户 dict，按其中 user_id 原样 upsert 进 pg（身份逐项一致）。
-# 走 force_user_id 方案而非直接给 pg create_user 重放，是因为 email 冲突/密码长度
-# 校验在 json 侧已完成，pg 只需按权威结果落影子行。
+# json 为权威、pg 为影子副本。create_user/create_bootstrap_owner 在 json 侧内部
+# 生成 user_id，同参调 pg 会让 pg 生成不同 user_id → 两库发散。这里提供
+# _mirror_user：接收 json 返回的权威用户 dict，按其中 user_id 原样 upsert 进
+# pg（身份逐项一致）。
+# 走 force_user_id 方案而非直接给 pg create_user 重放，是因为 email 冲突/密码
+# 长度校验在 json 侧已完成，pg 只需按权威结果落影子行。
 # --------------------------------------------------------------------------- #
 def _mirror_user(ret, *a, **k):
-    """把 json create_user/ensure_owner 返回的权威用户 dict upsert 进 pg（按 user_id）。
+    """把 json create_user/create_bootstrap_owner 返回的权威用户 dict upsert 进 pg。
 
     json 公开返回值经 `_to_public` 去掉 password_hash，不能直接拿来写 pg。
     这里按 user_id 再读 json 权威记录（含 hash），保证 dual→postgres 切换后仍能登录。
-    已存在的影子行也 upsert（含把旧 bug 写入的空 password_hash 回填为 json 权威 hash）。
-    ai_config 原样保留（api_key 已是 app.py 加密形态）；created_at 转浮点写回。
+    已存在的影子行也 upsert（含把旧 bug 写入的空 password_hash 回填为 json 权威
+    hash）。ai_config 原样保留（api_key 已是 app.py 加密形态）；created_at 转浮点
+    写回；auth_version（0015 起）一并镜像，保证 dual 双侧 session 版本语义一致
+    （docs §9.1）。
     """
     u = ret if isinstance(ret, dict) else None
     if not u or not u.get("user_id"):
@@ -455,19 +616,21 @@ def _mirror_user(ret, *a, **k):
                 cur.execute(
                     "INSERT INTO users "
                     "(user_id, email, display_name, password_hash, role, "
-                    " created_at, disabled, ai_config) "
-                    "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), %s, %s) "
+                    " created_at, disabled, ai_config, auth_version) "
+                    "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), %s, %s, %s) "
                     "ON CONFLICT (user_id) DO UPDATE SET "
                     " email=EXCLUDED.email, display_name=EXCLUDED.display_name, "
                     " password_hash=CASE WHEN EXCLUDED.password_hash <> '' "
                     "  THEN EXCLUDED.password_hash ELSE users.password_hash END, "
                     " role=EXCLUDED.role, created_at=EXCLUDED.created_at, "
-                    " disabled=EXCLUDED.disabled, ai_config=EXCLUDED.ai_config",
+                    " disabled=EXCLUDED.disabled, ai_config=EXCLUDED.ai_config, "
+                    " auth_version=EXCLUDED.auth_version",
                     (uid, u.get("email"), u.get("display_name", ""),
                      u.get("password_hash") or "",
                      u.get("role", ROLE_USER), u.get("created_at"),
                      bool(u.get("disabled", False)),
-                     psycopg.types.json.Jsonb(u.get("ai_config") or {})),
+                     psycopg.types.json.Jsonb(u.get("ai_config") or {}),
+                     int(u.get("auth_version") or 1)),
                 )
     finally:
         conn.close()

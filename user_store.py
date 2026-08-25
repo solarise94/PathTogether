@@ -45,6 +45,11 @@ if STORAGE_BACKEND not in _VALID_BACKENDS:
 
 #: JSON 实现的公共 API（与 user_store_json 的公共名必须一致；由
 #: tests/test_backend_dispatch.py 守卫防漏 export）。显式枚举，不用 ``import *``。
+#:
+#: 账户系统批次 A（docs/account-system-simplification-fix-plan.md §5.3）：
+#: 删除 ensure_owner / first_owner，新增 owner 原语与统一密码策略常量；
+#: PASSWORD_MIN_LENGTH / PASSWORD_MAX_LENGTH / OwnerInvariantError 由本表
+#: re-export，调用方一律 ``import user_store`` 后访问。
 _JSON_PUBLIC_NAMES = (
     # —— 常量 ——
     "SHARE_DATA_DIR",
@@ -55,6 +60,10 @@ _JSON_PUBLIC_NAMES = (
     "ROLE_SDK",
     "VALID_ROLES",
     "UserStoreCorrupt",
+    "OwnerInvariantError",
+    # 统一密码策略（docs §3.3；两实现一致）
+    "PASSWORD_MIN_LENGTH",
+    "PASSWORD_MAX_LENGTH",
     # user ai_config.max_steps 默认值（docs §9.2，PT-3；两实现一致）
     "DEFAULT_USER_MAX_STEPS",
     # —— 函数 ——
@@ -69,9 +78,12 @@ _JSON_PUBLIC_NAMES = (
     "get_user_ai_config",
     "set_user_ai_config",
     "count_owners",
-    "first_owner",
     "has_enabled_users",
-    "ensure_owner",
+    # owner 解析与引导原语（docs §5.3）
+    "list_enabled_owners",
+    "list_owners",
+    "create_bootstrap_owner",
+    "resolve_primary_owner",
 )
 
 #: 需要实时镜像到 JSON 实现的路径配置名（函数体裸全局读取它们）。
@@ -145,12 +157,13 @@ def _make_dual_same(name, json_fn, pg_fn):
     return _wrapped
 
 
-# result-replay 镜像：json 内部生成 user_id 的写（create_user/ensure_owner），用 json
-# 返回的权威 dict 按 user_id 原样 upsert 进 pg（身份一致）。其余写按 user_id 定位，
-# user_id 来自调用方入参/已存在用户，同参重放即一致。
+# result-replay 镜像：json 内部生成 user_id 的写（create_user/create_bootstrap_owner），
+# 用 json 返回的权威 dict 按 user_id 原样 upsert 进 pg（身份一致）。其余写按
+# user_id 定位，user_id 来自调用方入参/已存在用户，同参重放即一致。
+# （ensure_owner 已在账户系统批次 A 删除，其镜像映射一并移除。）
 _DUAL_MIRRORS = {
     "create_user": "_mirror_user",
-    "ensure_owner": "_mirror_user",
+    "create_bootstrap_owner": "_mirror_user",
 }
 
 # 同参重放：无内部生成身份，直接同参调 pg（set_user_* 均按调用方入参 user_id 定位，

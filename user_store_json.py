@@ -14,6 +14,15 @@ ROLE_SDK 常量，不入表。资源级鉴权矩阵是下一个节点的事。
 
 密码一律用 werkzeug 的 generate_password_hash / check_password_hash（默认 pbkdf2）。
 全库不得再出现明文密码存储 / 比较。
+
+账户系统批次 A（docs/account-system-simplification-fix-plan.md §5.3/§9.1）：
+  - auth_version 过渡兼容：读旧数据缺字段按 1，密码/disable/enable 原子递增，
+    与 pg 实现语义一致；
+  - owner 引导改为 list_enabled_owners / list_owners / create_bootstrap_owner /
+    resolve_primary_owner，删除 ensure_owner / first_owner 的「env 对账覆盖 +
+    最早 owner」语义；
+  - 密码统一 15..200 策略（PASSWORD_MIN_LENGTH / PASSWORD_MAX_LENGTH），
+    无旁路参数。json 后端仅服务本地免认证开发与隔离单元测试。
 """
 
 import json
@@ -41,9 +50,49 @@ ROLE_SDK = "sdk"      # 仅常量声明：sdk-user 为插件代理身份，后�
 
 VALID_ROLES = (ROLE_OWNER, ROLE_USER)
 
+# --------------------------------------------------------------------------- #
+# 统一密码策略（账户系统批次 A，docs §3.3；与 user_store_pg 完全一致）：
+# 15..200 字符，允许空格与长口令，不要求组合规则。所有密码写入口
+# （create_user / set_user_password / create_bootstrap_owner）共用，无旁路参数。
+# --------------------------------------------------------------------------- #
+#: 密码最小长度（存量短 hash 仍可登录，仅新写入执行本策略）
+PASSWORD_MIN_LENGTH = 15
+#: 密码最大长度（与 UI 上限一致，防御异常大输入）
+PASSWORD_MAX_LENGTH = 200
+
+
+def _validate_password(password):
+    """统一密码策略校验：str 且 15..200 字符；违规 raise ValueError。
+
+    只做长度与类型校验（允许空格/长口令），不做组合规则；错误消息不含
+    密码本身。所有密码写路径共用，无 _enforce_min_length 一类旁路。
+    """
+    if not isinstance(password, str) or not password:
+        raise ValueError("密码不能为空")
+    if len(password) < PASSWORD_MIN_LENGTH or len(password) > PASSWORD_MAX_LENGTH:
+        raise ValueError(
+            "密码长度须在 %d..%d 字符之间（当前 %d 字符）"
+            % (PASSWORD_MIN_LENGTH, PASSWORD_MAX_LENGTH, len(password))
+        )
+    return password
+
 
 class UserStoreCorrupt(Exception):
     """users.json 已存在但损坏/不可读。调用方必须 fail-closed，不得当成空库。"""
+
+
+class OwnerInvariantError(Exception):
+    """owner 不变量被破坏（账户系统批次 A，docs §3.2/§5.3）。
+
+    消息携带场景标识便于区分处理：
+      - ``no_owner``：库中无任何启用 owner（resolve_primary_owner 拒绝解析）；
+      - ``multiple_enabled_owners``：启用的 owner 多于一个（禁止选「第一条」）；
+      - ``users_table_not_empty``：create_bootstrap_owner 只允许空库首建。
+
+    过渡兼容（docs §9.1）：json 后端仅服务本地免认证开发与隔离单元测试，
+    不再是可登录生产形态；本类与 pg 实现语义一致，保证同一 dispatcher 在
+    不同后端下行为对齐。
+    """
 
 
 # 空结构骨架
@@ -132,27 +181,41 @@ def _to_public(user: dict) -> dict:
     return out
 
 
+def _auth_version(user: dict) -> int:
+    """读侧 auth_version 规范化：旧 json 数据缺字段/非法值按 1（docs §9.1）。"""
+    v = user.get("auth_version") if isinstance(user, dict) else None
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return 1
+    return v if v >= 1 else 1
+
+
+def _with_auth_version(user):
+    """返回带 int auth_version 的副本；None 透传（读路径统一出口）。"""
+    if user is None:
+        return None
+    out = dict(user)
+    out["auth_version"] = _auth_version(user)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # 公共 API
 # --------------------------------------------------------------------------- #
-def create_user(email, password, role=ROLE_USER, display_name=None,
-                _enforce_min_length=True):
+def create_user(email, password, role=ROLE_USER, display_name=None):
     """创建用户。返回新用户 dict（不含 hash）；email 冲突抛 ValueError。
 
     email 会做小写规范化并作为唯一键。display_name 缺省用 email 值。
-    密码经 werkzeug generate_password_hash 哈希后存储。
-    _enforce_min_length=False 供 owner 引导（ADMIN_PASSWORD env）使用：既有部署
-    的 ADMIN_PASSWORD 可能不足 8 位，为保证 demo 兼容不做最小长度强制。
+    密码经 werkzeug generate_password_hash 哈希后存储，统一执行 15..200
+    策略（批次 A docs §3.3，无旁路参数）。新用户 auth_version=1。
     """
     if role not in VALID_ROLES:
         raise ValueError("非法角色")
     norm_email = _normalize_email(email)
     if not norm_email:
         raise ValueError("邮箱/用户名不能为空")
-    if not isinstance(password, str) or not password:
-        raise ValueError("密码不能为空")
-    if _enforce_min_length and isinstance(password, str) and len(password) < 8:
-        raise ValueError("密码长度至少 8 位")
+    _validate_password(password)
     name = str(display_name or "").strip() or norm_email
     now = time.time()
     uid = _user_id()
@@ -169,6 +232,7 @@ def create_user(email, password, role=ROLE_USER, display_name=None,
             "role": role,
             "created_at": now,
             "disabled": False,
+            "auth_version": 1,
         }
         data["users"][uid] = user
         _save_locked(f, data)
@@ -178,17 +242,20 @@ def create_user(email, password, role=ROLE_USER, display_name=None,
 
 
 def get_user(user_id):
-    """按 user_id 取用户 dict（含 hash）；不存在返回 None。"""
+    """按 user_id 取用户 dict（含 hash 与 auth_version）；不存在返回 None。
+
+    旧 json 数据缺 auth_version 字段时读为 1（docs §9.1 过渡兼容）。
+    """
     def _do(f):
         data = _load_locked(f)
         user = data["users"].get(user_id)
-        return dict(user) if user else None
+        return _with_auth_version(user) if user else None
 
     return _with_lock("r+", _do)
 
 
 def get_user_by_email(email):
-    """按 email（小写规范化）取用户 dict（含 hash）；不存在返回 None。"""
+    """按 email（小写规范化）取用户 dict（含 hash 与 auth_version）；无则 None。"""
     key = _normalize_email(email)
     if not key:
         return None
@@ -197,14 +264,14 @@ def get_user_by_email(email):
         data = _load_locked(f)
         for uid, u in data["users"].items():
             if u.get("email") == key:
-                return dict(u)
+                return _with_auth_version(u)
         return None
 
     return _with_lock("r+", _do)
 
 
 def get_user_by_display_name(display_name):
-    """按 display_name 精确匹配取用户 dict（含 hash）；不存在返回 None。"""
+    """按 display_name 精确匹配取用户 dict（含 hash 与 auth_version）；无则 None。"""
     key = str(display_name or "").strip()
     if not key:
         return None
@@ -213,7 +280,7 @@ def get_user_by_display_name(display_name):
         data = _load_locked(f)
         for uid, u in data["users"].items():
             if u.get("display_name") == key:
-                return dict(u)
+                return _with_auth_version(u)
         return None
 
     return _with_lock("r+", _do)
@@ -242,18 +309,23 @@ def verify_user(email_or_name, password):
 
 
 def list_users():
-    """返回全部用户（不含 hash），按 created_at 升序。"""
+    """返回全部用户（不含 hash，含 auth_version），按 created_at 升序。"""
     def _do(f):
         data = _load_locked(f)
-        items = [_to_public(u) for u in data["users"].values()]
+        items = [_with_auth_version(u) for u in data["users"].values()]
         items.sort(key=lambda x: x.get("created_at", 0))
-        return items
+        return [_to_public(x) for x in items]
 
     return _with_lock("r+", _do)
 
 
 def set_user_disabled(user_id, flag):
-    """设置用户禁用状态（True=禁用）。返回更新后的用户 dict；不存在返回 None。"""
+    """设置用户禁用状态（True=禁用）。返回更新后的用户 dict；不存在返回 None。
+
+    disable 与 enable 两个方向都在同一次原子写内递增 auth_version
+    （批次 A docs §6.2：enable 也递增，防止禁用期间未发请求的旧 Cookie
+    在重新启用后被激活）。旧记录缺 auth_version 按 1 起算（§9.1）。
+    """
     flag = bool(flag)
 
     def _do(f):
@@ -262,18 +334,21 @@ def set_user_disabled(user_id, flag):
         if user is None:
             return None
         user["disabled"] = flag
+        user["auth_version"] = _auth_version(user) + 1
         _save_locked(f, data)
         return _to_public(user)
 
     return _with_lock("r+", _do)
 
 
-def set_user_password(user_id, new_password, _enforce_min_length=True):
-    """重置用户密码。返回更新后的用户 dict；不存在返回 None。"""
-    if not isinstance(new_password, str) or not new_password:
-        raise ValueError("密码不能为空")
-    if _enforce_min_length and len(new_password) < 8:
-        raise ValueError("密码长度至少 8 位")
+def set_user_password(user_id, new_password):
+    """重置用户密码。返回更新后的用户 dict；不存在返回 None。
+
+    密码统一执行 15..200 策略（无旁路参数）；hash 更新与 auth_version+1
+    在同一次原子写内（批次 A docs §6.2，旧 session 凭据版本随之失效）。
+    旧记录缺 auth_version 按 1 起算（§9.1）。
+    """
+    _validate_password(new_password)
 
     def _do(f):
         data = _load_locked(f)
@@ -281,6 +356,7 @@ def set_user_password(user_id, new_password, _enforce_min_length=True):
         if user is None:
             return None
         user["password_hash"] = generate_password_hash(new_password)
+        user["auth_version"] = _auth_version(user) + 1
         _save_locked(f, data)
         return _to_public(user)
 
@@ -363,6 +439,9 @@ def set_user_ai_config(user_id, cfg):
             if "max_steps" in cfg:
                 merged["max_steps"] = _user_max_steps(cfg.get("max_steps"))
         user["ai_config"] = merged
+        # 写路径携带 auth_version（docs §9.1）：旧记录落盘时补齐为 1，不递增
+        #（AI 凭据配置不是安全相关变化，不废止 session）
+        user.setdefault("auth_version", _auth_version(user))
         _save_locked(f, data)
         return _to_public(user)
 
@@ -381,16 +460,111 @@ def count_owners():
     return _with_lock("r+", _do)
 
 
-def first_owner():
-    """返回第一个 owner 用户 dict（含 hash）；无则 None。"""
+# --------------------------------------------------------------------------- #
+# owner 解析与引导（账户系统批次 A，docs §3.2/§5.3）
+#
+# 删除含糊的 ensure_owner()/first_owner()（「最早创建的 owner」+ env 密码对账
+# 覆盖），改为显式原语：list_enabled_owners / list_owners /
+# create_bootstrap_owner / resolve_primary_owner。json 后端无部分唯一索引，
+# 「最多一个 enabled owner」由 resolve_primary_owner 的计数检查与启动检查
+# 双重防御（docs §9.1：json 仅过渡/测试形态，不再是可登录生产形态）。
+# --------------------------------------------------------------------------- #
+def _sorted_owners(users: dict):
+    """按 (created_at, user_id) 升序返回 owner 行（含 disabled）。"""
+    owners = [u for u in users.values() if u.get("role") == ROLE_OWNER]
+    owners.sort(key=lambda u: (u.get("created_at", 0), u.get("user_id", "")))
+    return owners
+
+
+def list_enabled_owners():
+    """返回全部启用 owner（role='owner' 且未 disabled）的 dict 列表。
+
+    按 created_at, user_id 升序；每项含 password_hash 与 auth_version
+    （owner 解析需要校验 hash 非空，属内部 API，不经公共用户输出）。
+    """
     def _do(f):
         data = _load_locked(f)
-        for u in data["users"].values():
-            if u.get("role") == ROLE_OWNER:
-                return dict(u)
-        return None
+        return [
+            _with_auth_version(u)
+            for u in _sorted_owners(data["users"])
+            if not u.get("disabled")
+        ]
 
     return _with_lock("r+", _do)
+
+
+def list_owners():
+    """返回全部 owner 行（含 disabled），排序与字段同 list_enabled_owners。"""
+    def _do(f):
+        data = _load_locked(f)
+        return [_with_auth_version(u) for u in _sorted_owners(data["users"])]
+
+    return _with_lock("r+", _do)
+
+
+def create_bootstrap_owner(login_id, password):
+    """空库首建 owner（仅引导用）。返回新 owner dict（含 hash 与 auth_version）。
+
+    语义与 user_store_pg 完全一致（docs §5.2/§5.3）：
+      - 仅当 users 存储完全为空时创建；任何已存在行 → OwnerInvariantError
+        （users_table_not_empty）；
+      - fcntl 排他锁内复查空表再插入（进程间串行化，等价 pg 侧 advisory lock）；
+      - email 字段写规范化 login_id（trim + lower），display_name 同值，
+        role='owner'；密码统一执行 15..200 策略；
+      - 不对已有 owner 做任何对账/改密（那是已删除的 ensure_owner 语义）。
+    """
+    norm_login = _normalize_email(login_id)
+    if not norm_login:
+        raise ValueError("登录账号不能为空")
+    _validate_password(password)
+    now = time.time()
+    uid = _user_id()
+
+    def _do(f):
+        data = _load_locked(f)
+        if data["users"]:
+            raise OwnerInvariantError(
+                "users_table_not_empty：users 存储已有 %d 行，"
+                "create_bootstrap_owner 仅允许在完全空库时创建首个 owner"
+                "（已有 owner 时任何 bootstrap 环境变量不得改动账号）"
+                % len(data["users"])
+            )
+        user = {
+            "user_id": uid,
+            "email": norm_login,
+            "display_name": norm_login,
+            "password_hash": generate_password_hash(password),
+            "role": ROLE_OWNER,
+            "created_at": now,
+            "disabled": False,
+            "auth_version": 1,
+        }
+        data["users"][uid] = user
+        _save_locked(f, data)
+        return dict(user)
+
+    return _with_lock("r+", _do)
+
+
+def resolve_primary_owner():
+    """解析唯一的 primary owner（只读，永不写库、永不接受密码参数）。
+
+    恰好 1 个启用 owner → 返回该 dict（含 hash 与 auth_version）；
+    0 个 → OwnerInvariantError（no_owner）；>1 个 → OwnerInvariantError
+    （multiple_enabled_owners，禁止选「第一条」）。
+    """
+    owners = list_enabled_owners()
+    if not owners:
+        raise OwnerInvariantError(
+            "no_owner：库中不存在任何启用的 owner（role='owner' 且未禁用），"
+            "无法解析 primary owner"
+        )
+    if len(owners) > 1:
+        raise OwnerInvariantError(
+            "multiple_enabled_owners：存在 %d 个启用的 owner，违反单 "
+            "enabled owner 不变量；须人工审计后只保留一个" % len(owners)
+        )
+    return owners[0]
 
 
 def has_enabled_users():
@@ -400,30 +574,3 @@ def has_enabled_users():
         return any(not u.get("disabled") for u in data["users"].values())
 
     return _with_lock("r+", _do)
-
-
-def ensure_owner(email, password):
-    """owner 引导与迁移：按 ADMIN_USERNAME/ADMIN_PASSWORD 维护 owner 账户。
-
-    - 无 owner 角色用户 → 创建 owner（email 用 ADMIN_USERNAME 值，可非邮箱格式，
-      display_name=email 同值）；
-    - 已存在 owner 且 ADMIN_PASSWORD 与现存 hash 不匹配 → 更新该 owner 的
-      password_hash（env 始终可重置 owner 密码，保住「改密码靠 env」运维习惯）。
-
-    返回 owner 用户 dict（含 hash）。
-    """
-    norm_email = _normalize_email(email)
-    name = norm_email or "owner"
-    owner = first_owner()
-    if owner is None:
-        return create_user(name, password, role=ROLE_OWNER, display_name=name,
-                           _enforce_min_length=False)
-    # 已有 owner：ADMIN_PASSWORD 始终可重置其密码
-    try:
-        match = check_password_hash(owner.get("password_hash") or "", password)
-    except Exception:
-        match = False
-    if not match:
-        set_user_password(owner["user_id"], password, _enforce_min_length=False)
-        owner = get_user(owner["user_id"])
-    return owner

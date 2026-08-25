@@ -26,6 +26,7 @@ pytest.importorskip("psycopg")
 
 import conftest  # noqa: E402
 import psycopg  # noqa: E402
+import pg_store  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     conftest.BACKEND != "postgres",
@@ -291,3 +292,108 @@ def test_verify_detects_drift(mig, args_ns, fixture_dir, pg_uri, tmp_path,
     out, err = capsys.readouterr()
     assert rc == 2, "有差异时 verify 应 exit 2"
     assert "aid_live" in err  # 差异报告列在前 20 条
+
+
+# --------------------------------------------------------------------------- #
+# 5. 0015_account_auth_version（账户系统批次 A，docs §4.1）：幂等应用 +
+#    auth_version 默认值 / CHECK 约束 / 单 enabled owner 部分唯一索引冒烟
+# --------------------------------------------------------------------------- #
+_MIGRATION_0015 = "0015_account_auth_version.sql"
+
+
+def test_migration_0015_applied_and_raw_sql_idempotent(pg_uri):
+    """conftest ensure_schema 已应用 0015；其原始 SQL 直接重跑两次必须 no-op。
+
+    幂等性来自脚本自身（ADD COLUMN IF NOT EXISTS / DO 块守护约束 /
+    CREATE UNIQUE INDEX IF NOT EXISTS / VALIDATE 重跑安全），不依赖 runner 的
+    schema_migrations 记录。
+    """
+    c = psycopg.connect(pg_uri)
+    try:
+        with c.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM schema_migrations WHERE filename=%s",
+                (_MIGRATION_0015,))
+            assert cur.fetchone() is not None, "0015 应已被 ensure_schema 应用"
+    finally:
+        c.close()
+
+    sql = (pg_store.migrations_dir() / _MIGRATION_0015).read_text(
+        encoding="utf-8")
+    c = psycopg.connect(pg_uri)
+    try:
+        with c.cursor() as cur:
+            for _ in range(2):
+                cur.execute(sql)  # 已应用过的 DDL 重跑不抛错
+        c.commit()
+    finally:
+        c.close()
+
+
+def test_migration_0015_auth_version_default_and_check(pg_uri):
+    """新行默认 auth_version=1；CHECK 约束拒绝 <1（已 VALIDATE）。"""
+    c = psycopg.connect(pg_uri)
+    try:
+        with c.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (user_id, email, display_name, "
+                "password_hash, role, created_at, disabled) "
+                "VALUES ('usr_m15a','m15a@x.com','','x','user',"
+                "to_timestamp(1),FALSE) RETURNING auth_version")
+            assert cur.fetchone()[0] == 1, "缺省 auth_version 应为 1"
+            # 约束存在且已 VALIDATE（NOT VALID → VALIDATE 两段式完成）
+            cur.execute(
+                "SELECT convalidated FROM pg_constraint "
+                "WHERE conname='users_auth_version_positive'")
+            row = cur.fetchone()
+            assert row is not None and row[0] is True
+        c.commit()
+        violated = False
+        try:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET auth_version=0 WHERE user_id='usr_m15a'")
+                c.commit()
+        except psycopg.errors.CheckViolation:
+            violated = True
+            c.rollback()
+        assert violated, "auth_version=0 应被 users_auth_version_positive 拒绝"
+    finally:
+        c.close()
+
+
+def test_migration_0015_single_enabled_owner_index(pg_uri):
+    """部分唯一索引：第二个 enabled owner 被拦；disabled owner 不受限。"""
+    c = psycopg.connect(pg_uri)
+
+    def _ins_owner(uid, email, disabled):
+        with c.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (user_id, email, display_name, "
+                "password_hash, role, created_at, disabled) "
+                "VALUES (%s,%s,'','x','owner',to_timestamp(1),%s)",
+                (uid, email, disabled))
+        c.commit()
+
+    try:
+        with c.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM pg_indexes "
+                "WHERE indexname='users_single_enabled_owner_key'")
+            assert cur.fetchone() is not None, "0015 唯一索引应存在"
+        _ins_owner("usr_m15o1", "o1@x.com", False)  # 第一个 enabled owner OK
+        blocked = False
+        try:
+            _ins_owner("usr_m15o2", "o2@x.com", False)
+        except psycopg.errors.UniqueViolation:
+            blocked = True
+            c.rollback()
+        assert blocked, "第二个 enabled owner 应被部分唯一索引拒绝"
+        _ins_owner("usr_m15o3", "o3@x.com", True)  # disabled owner 不占索引
+        with c.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM users WHERE role='owner'")
+            assert cur.fetchone()[0] == 2
+        c.commit()
+    finally:
+        c.close()

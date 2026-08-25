@@ -109,17 +109,18 @@ def test_json_smoke_share_store(monkeypatch, tmp_path):
 
 
 def test_json_smoke_user_store(monkeypatch, tmp_path):
-    """create_user → verify_user 走通 json 实现。"""
+    """create_user → verify_user 走通 json 实现（密码满足批次 A 15..200 策略）。"""
     uf = tmp_path / "users.json"
     monkeypatch.setattr(user_store, "SHARE_DATA_DIR", tmp_path)
     monkeypatch.setattr(user_store, "USER_FILE", uf)
     assert user_store_json.USER_FILE == uf
 
     email = "alice@example.com"
-    created = user_store.create_user(email, "Password1234", role="user")
+    password = "Password12345678"  # 16 字符（≥ PASSWORD_MIN_LENGTH=15）
+    created = user_store.create_user(email, password, role="user")
     assert created and created["email"] == email
-    assert user_store.verify_user(email, "Password1234")  # dict（truthy）
-    assert not user_store.verify_user(email, "wrong-password")
+    assert user_store.verify_user(email, password)  # dict（truthy）
+    assert not user_store.verify_user(email, "wrong-password-xxx")
 
 
 # --------------------------------------------------------------------------- #

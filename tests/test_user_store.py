@@ -126,17 +126,20 @@ def make_owner(login_id="admin", password=OWNER_PW):
 # user_store CRUD
 # =========================================================================== #
 @json_only  # 断言 users.json 原文（无明文/含 pbkdf2 hash）
-def test_user_crud_and_email_unique():
+def test_user_crud_and_login_id_unique():
     u = user_store.create_user("Alice@Example.COM", PW, role="user",
                                display_name="Alice")
     check("创建用户返回不含 hash", "password_hash" not in u)
-    check("email 小写规范化", u["email"] == "alice@example.com")
+    check("login_id 小写规范化", u["login_id"] == "alice@example.com")
+    check("批次 C：返回 dict 无 email 键", "email" not in u)
     check("display_name 保留", u["display_name"] == "Alice")
     check("user_id 前缀", u["user_id"].startswith("usr_"))
     check("新用户 auth_version=1", u.get("auth_version") == 1)
 
     got = user_store.get_user(u["user_id"])
-    check("get_user 命中", got is not None and got["email"] == "alice@example.com")
+    check("get_user 命中", got is not None
+          and got["login_id"] == "alice@example.com")
+    check("get_user 无 email 键", "email" not in got)
     check("get_user 含 hash", "password_hash" in got)
     check("get_user 带 auth_version", got.get("auth_version") == 1)
 
@@ -145,16 +148,19 @@ def test_user_crud_and_email_unique():
         user_store.create_user("ALICE@example.com", PW)
     except ValueError:
         dup = "raised"
-    check("email 唯一（大小写不敏感）", dup == "raised")
+    check("login_id 唯一（大小写不敏感）", dup == "raised")
 
-    by_email = user_store.get_user_by_email("alice@example.com")
-    check("get_user_by_email 命中", by_email is not None)
-    check("get_user_by_email 带 auth_version",
-          by_email.get("auth_version") == 1)
+    by_login = user_store.get_user_by_login_id("alice@example.com")
+    check("get_user_by_login_id 命中", by_login is not None)
+    check("get_user_by_login_id 带 auth_version",
+          by_login.get("auth_version") == 1)
     # 批次 B（docs §6.1）：get_user_by_display_name 已删除（原唯一调用方是
     # verify_user 的 display_name 登录 fallback）；dispatcher 不再导出该名
     check("get_user_by_display_name 已从 dispatcher 删除",
           not hasattr(user_store, "get_user_by_display_name"))
+    # 批次 C（docs §4.2）：get_user_by_email 随物理列改名删除
+    check("get_user_by_email 已从 dispatcher 删除",
+          not hasattr(user_store, "get_user_by_email"))
 
     listed = user_store.list_users()
     check("list_users 不含 hash", listed and "password_hash" not in listed[0])
@@ -252,7 +258,9 @@ def test_create_bootstrap_owner_empty_store():
     """空库首建成功：规范化 login_id、display_name 同值、auth_version=1。"""
     owner = user_store.create_bootstrap_owner("  Browser_Admin  ", OWNER_PW)
     check("首建 owner 返回 role=owner", owner.get("role") == "owner")
-    check("login_id trim+lower 规范化", owner["email"] == "browser_admin")
+    check("login_id trim+lower 规范化",
+          owner["login_id"] == "browser_admin")
+    check("owner dict 无 email 键（批次 C）", "email" not in owner)
     check("display_name 同 login_id", owner["display_name"] == "browser_admin")
     check("含 password_hash", bool(owner.get("password_hash")))
     check("auth_version=1", owner.get("auth_version") == 1)
@@ -439,8 +447,9 @@ def test_legacy_json_without_auth_version_reads_as_one():
     check("旧数据读 auth_version=1", got.get("auth_version") == 1)
     check("旧数据 list_users 读 auth_version=1",
           user_store.list_users()[0].get("auth_version") == 1)
-    v = user_store.get_user_by_email("legacy@x.com")
-    check("get_user_by_email 旧数据 auth_version=1", v.get("auth_version") == 1)
+    v = user_store.get_user_by_login_id("legacy@x.com")
+    check("get_user_by_login_id 旧数据 auth_version=1",
+          v.get("auth_version") == 1)
     p = user_store.set_user_password("usr_legacy", PW3)
     check("旧数据改密递增 1→2", p.get("auth_version") == 2)
     d = user_store.set_user_disabled("usr_legacy", True)
@@ -505,14 +514,16 @@ def test_admin_users_owner_vs_user(monkeypatch):
     check("返回 registration_open", "registration_open" in body)
     check("list 不含 hash", all("password_hash" not in u for u in body["users"]))
     # 创建 user
-    r2 = client.post("/api/admin/users", json={"email": "new@x.com", "password": PW2})
+    r2 = client.post("/api/admin/users", json={"login_id": "new@x.com", "password": PW2})
     check("owner 创建用户 200", r2.status_code == 200)
     check("新用户 role=user", json.loads(r2.data).get("role") == "user")
+    check("创建响应无 email 键（批次 C）",
+          "email" not in json.loads(r2.data))
     # 冲突
-    r3 = client.post("/api/admin/users", json={"email": "u@x.com", "password": PW2})
-    check("创建冲突 409", r3.status_code == 409)
+    r3 = client.post("/api/admin/users", json={"login_id": "u@x.com", "password": PW2})
+    check("创建冲突 409", r3.status_code == 409, "got %s" % r3.status_code)
     # 短密码（store 层 15..200 统一策略；app 层 8 位旧校验也仍拦）
-    r4 = client.post("/api/admin/users", json={"email": "s@x.com", "password": "short"})
+    r4 = client.post("/api/admin/users", json={"login_id": "s@x.com", "password": "short"})
     check("短密码创建 400", r4.status_code == 400)
 
     # user 角色登录 → 403
@@ -537,14 +548,14 @@ def test_last_owner_protection(monkeypatch):
     r_enable = client.post("/api/admin/users/%s/enable" % owner["user_id"])
     check("启用 owner 409（同口径）", r_enable.status_code == 409)
     # 仍可禁用 user
-    uid = user_store.get_user_by_email("u@x.com")["user_id"]
+    uid = user_store.get_user_by_login_id("u@x.com")["user_id"]
     r2 = client.post("/api/admin/users/%s/disable" % uid)
     check("禁用 user 200", r2.status_code == 200)
     # 多 owner（json 后端可直插构造）：同样 409；PG 下 0015 部分唯一索引
     # 使该场景不可达（>1 enabled owner 由索引与启动检查双重防御）。
     if conftest.BACKEND == "json":
         user_store.create_user("o2@x.com", PW2, role="owner", display_name="o2")
-        o2 = user_store.get_user_by_email("o2@x.com")["user_id"]
+        o2 = user_store.get_user_by_login_id("o2@x.com")["user_id"]
         r3 = client.post("/api/admin/users/%s/disable" % o2)
         check("多 owner 时禁用其一也 409", r3.status_code == 409)
 
@@ -553,7 +564,7 @@ def test_admin_reset_password(monkeypatch):
     monkeypatch.setenv("ADMIN_PASSWORD", "")
     make_owner()
     user_store.create_user("u@x.com", PW2, role="user")
-    uid = user_store.get_user_by_email("u@x.com")["user_id"]
+    uid = user_store.get_user_by_login_id("u@x.com")["user_id"]
     client = make_client()
     login(client, "admin", OWNER_PW)
     r = client.post("/api/admin/users/%s/password" % uid, json={"password": PW3})

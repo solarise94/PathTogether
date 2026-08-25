@@ -2,21 +2,28 @@
 """dual 后端 result-replay 身份一致性测试（仅 RUN_PG_TESTS=1 下跑，Stage 3b-2）。
 
 验证：dual（expand）形态下 json 为权威、pg 为影子副本，凡 json 内部生成身份
-（token/annotation_id/grant_id/pid/user_id）的写，pg 镜像按 json 返回的权威 dict
+（token/annotation_id/grant_id/pid）的写，pg 镜像按 json 返回的权威 dict
 原样 upsert → 两库身份逐项一致，不会因 pg 自生成不同身份值而发散。
 
-覆盖：
-  - create_user：json 返回的 user_id 在 pg users 中存在且相同；
+账户系统批次 C（docs §9.3）：**user 侧 dual 后端已删除**（原
+create_user / password_hash_survives_switch / bootstrap_owner_mirror_parity /
+auth_version_increment_parity / mirror_repairs_empty_pg_password_hash /
+repair_empty_hashes_without_remirror 用例一并移除；user_store dispatcher 在
+STORAGE_BACKEND=dual 时降级安装 json 后端并打 deprecation warning）。本模块
+只保留 **share 侧** dual 用例：
   - create_share：token / slides / permissions 与 json 权威一致；
   - add_roi：annotation_id / geom / shared / token 一致，insert_seq 与 json index 对齐；
   - claim_share：grant_id / permissions 一致；
   - create_project / add_slides_to_project：pid / slides 一致；
   - json 抛错（非法入参）时 pg 不写；
-  - pg 镜像失败不阻断 json 返回（log 即可）。
+  - pg 镜像失败不阻断 json 返回（log 即可）；
+  - 插件安装 / run grant 的 dual 身份一致性。
 
 conftest 在 RUN_PG_TESTS=1 时已起 pgserver 并设 DATABASE_URL + STORAGE_BACKEND=postgres；
-本模块用独立模块名重新加载一份 STORAGE_BACKEND=dual 的 dispatcher（读 DATABASE_URL），
-json 侧用独立 SHARE_DATA_DIR。pg 表由 conftest 每用例 TRUNCATE。
+本模块用独立模块名重新加载一份 STORAGE_BACKEND=dual 的 share_store dispatcher
+（读 DATABASE_URL），json 侧用独立 SHARE_DATA_DIR。user_store dispatcher 在同一
+env 下重载时会降级为 json 后端（deprecation warning，不炸）——fixture 就此断言。
+pg 表由 conftest 每用例 TRUNCATE。
 """
 import importlib.util
 import os
@@ -57,6 +64,10 @@ def dual(monkeypatch, tmp_path):
 
     json 实现是共享模块，其 SHARE_FILE/USER_FILE 是模块级常量；这里把它们指到
     每用例独立的临时目录，保证 json 权威侧各用例隔离（pg 侧由 conftest TRUNCATE）。
+
+    批次 C：user_store dispatcher 在 STORAGE_BACKEND=dual 下已删除 dual 后端，
+    降级安装 json 后端（import 不炸，落一条 deprecation warning）；share_store
+    的 dual 机制保持原样。fixture 就此断言，防止降级路径静默回退成 import 崩溃。
     """
     import share_store_json
     import user_store_json
@@ -72,9 +83,26 @@ def dual(monkeypatch, tmp_path):
     monkeypatch.setattr(user_store_json, "USER_FILE", data_dir / "users.json")
     ss = _load_fresh(_REPO_ROOT / "share_store.py", "dual_share")
     us = _load_fresh(_REPO_ROOT / "user_store.py", "dual_user")
-    assert ss.STORAGE_BACKEND == "dual"
-    assert us.STORAGE_BACKEND == "dual"
+    assert ss.STORAGE_BACKEND == "dual"  # share 侧 dual 保留
+    assert us.STORAGE_BACKEND == "dual"  # env 值透传（user 侧已降级 json）
+    # user 侧降级断言：公共名走 json 实现（本地开发/测试形态），不再镜像 pg
+    assert callable(us.create_user)
+    u = us.create_user("dual-fallback@x.com", "password1password1", role="user")
+    assert u["login_id"] == "dual-fallback@x.com"
+    assert "email" not in u  # 批次 C：单键出口
+    with pg_conn_default().cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM users")
+        assert cur.fetchone()["n"] == 0  # user 写不进 pg（dual 已删）
     return ss, us
+
+
+def pg_conn_default():
+    """默认 PG 连接（dict_row；fixture 内部降级断言用）。"""
+    import psycopg
+    import pg_store
+    c = pg_store.connect()
+    c.row_factory = psycopg.rows.dict_row
+    return c
 
 
 @pytest.fixture
@@ -87,144 +115,15 @@ def pg_conn(pg_uri):
     c.close()
 
 
-def test_dual_create_user_identity(dual, pg_conn):
-    ss, us = dual
-    u = us.create_user("dual@x.com", "password1password1", role="user", display_name="Dual")
-    assert u and u["user_id"].startswith("usr_")
-    with pg_conn.cursor() as cur:
-        cur.execute("SELECT user_id, email, display_name FROM users WHERE user_id=%s",
-                    (u["user_id"],))
-        row = cur.fetchone()
-    assert row is not None
-    assert row["user_id"] == u["user_id"]  # 身份一致
-    assert row["email"] == "dual@x.com"
-
-
-def test_dual_create_user_password_hash_survives_switch(dual, pg_conn):
-    """json create_user 公开返回值不含 hash；pg 镜像必须写入 json 权威 hash。"""
-    _ss, us = dual
-    u = us.create_user("dual-hash@x.com", "password1password1", role="user")
-    assert "password_hash" not in u
-    import user_store_json
-    import user_store_pg
-    json_user = user_store_json.get_user(u["user_id"])
-    assert json_user and json_user.get("password_hash")
-    with pg_conn.cursor() as cur:
-        cur.execute("SELECT password_hash FROM users WHERE user_id=%s",
-                    (u["user_id"],))
-        row = cur.fetchone()
-    assert row is not None
-    assert row["password_hash"]
-    assert row["password_hash"] == json_user["password_hash"]
-    assert user_store_pg.verify_user("dual-hash@x.com", "password1password1") is not None
-    assert user_store_pg.verify_user("dual-hash@x.com", "wrongpass") is None
-
-
-def test_dual_create_bootstrap_owner_mirror_parity(dual, pg_conn):
-    """dual 下 create_bootstrap_owner 走 result-replay 镜像：pg 影子行与 json
-    权威逐项一致（含 auth_version，批次 A docs §9.1）。"""
-    _ss, us = dual
-    owner = us.create_bootstrap_owner("  Admin  ", "owner-pass-123456")
-    assert owner and owner["user_id"]
-    assert owner["role"] == "owner"
-    assert owner["email"] == "admin"  # trim + lower 规范化
-    assert owner.get("auth_version") == 1
-    import user_store_json
-    import user_store_pg
-    json_owner = user_store_json.get_user(owner["user_id"])
-    assert json_owner and json_owner.get("password_hash")
-    with pg_conn.cursor() as cur:
-        cur.execute(
-            "SELECT email, display_name, password_hash, role, disabled, "
-            "auth_version FROM users WHERE user_id=%s",
-            (owner["user_id"],))
-        row = cur.fetchone()
-    assert row is not None
-    assert row["email"] == "admin" and row["display_name"] == "admin"
-    assert row["role"] == "owner" and row["disabled"] is False
-    assert row["auth_version"] == json_owner["auth_version"] == 1  # 版本 parity
-    assert row["password_hash"] == json_owner["password_hash"]
-    # 切到 postgres 单后端后语义连续：可登录、可解析 primary owner
-    assert user_store_pg.verify_user("admin", "owner-pass-123456") is not None
-    resolved = user_store_pg.resolve_primary_owner()
-    assert resolved["user_id"] == owner["user_id"]
-    assert resolved["auth_version"] == 1
-
-    # json 权威非空时再 bootstrap → OwnerInvariantError，且 pg 影子不写
-    with pytest.raises(us.OwnerInvariantError):
-        us.create_bootstrap_owner("another", "owner-pass-123456")
-    with pg_conn.cursor() as cur:
-        cur.execute("SELECT count(*) AS n FROM users")
-        assert cur.fetchone()["n"] == 1  # 仍只有一行 owner 影子
-
-
-def test_dual_auth_version_increment_parity(dual, pg_conn):
-    """dual 写路径双侧 auth_version 递增保持 parity（docs §9.1）。
-
-    set_user_password / set_user_disabled（disable 与 enable 两个方向）在 json
-    权威侧与 pg 影子侧（同参重放）都递增，双库值一致。
-    """
-    _ss, us = dual
-    u = us.create_user("ver@x.com", "password1password1", role="user")
-    uid = u["user_id"]
-    us.set_user_password(uid, "newpass99newpass99")      # 1→2
-    us.set_user_disabled(uid, True)                       # 2→3
-    us.set_user_disabled(uid, False)                      # 3→4
-
-    def _pg_ver():
-        with pg_conn.cursor() as cur:
-            cur.execute("SELECT auth_version FROM users WHERE user_id=%s", (uid,))
-            return cur.fetchone()["auth_version"]
-
-    import user_store_json
-    check_json = user_store_json.get_user(uid)
-    assert check_json["auth_version"] == 4
-    assert _pg_ver() == 4  # 双侧 parity
-
-
-def test_dual_mirror_repairs_empty_pg_password_hash(dual, pg_conn):
-    """旧 dual 已写入空 hash 的影子行：再次 _mirror_user 必须回填 json 权威 hash。"""
-    _ss, us = dual
-    u = us.create_user("empty-hash@x.com", "password1password1", role="user")
-    import user_store_json
-    import user_store_pg
-    json_user = user_store_json.get_user(u["user_id"])
-    assert json_user and json_user.get("password_hash")
-    with pg_conn.cursor() as cur:
-        cur.execute("UPDATE users SET password_hash='' WHERE user_id=%s",
-                    (u["user_id"],))
-        pg_conn.commit()
-        cur.execute("SELECT length(password_hash) AS n FROM users WHERE user_id=%s",
-                    (u["user_id"],))
-        assert cur.fetchone()["n"] == 0
-    assert user_store_pg.verify_user("empty-hash@x.com", "password1password1") is None
-    user_store_pg._mirror_user(u)  # 公开返回值不含 hash
-    with pg_conn.cursor() as cur:
-        cur.execute("SELECT password_hash FROM users WHERE user_id=%s",
-                    (u["user_id"],))
-        row = cur.fetchone()
-    assert row["password_hash"] == json_user["password_hash"]
-    assert user_store_pg.verify_user("empty-hash@x.com", "password1password1") is not None
-
-
-def test_dual_repair_empty_hashes_without_remirror(dual, pg_conn):
-    """历史用户启动时未必再走 create_user：批量回填仍能修好空 hash。"""
-    _ss, us = dual
-    u = us.create_user("backfill@x.com", "password1password1", role="user")
-    import user_store_json
-    import user_store_pg
-    json_hash = user_store_json.get_user(u["user_id"])["password_hash"]
-    with pg_conn.cursor() as cur:
-        cur.execute("UPDATE users SET password_hash='' WHERE user_id=%s",
-                    (u["user_id"],))
-        pg_conn.commit()
-    n = user_store_pg.repair_empty_password_hashes_from_json()
-    assert n == 1
-    with pg_conn.cursor() as cur:
-        cur.execute("SELECT password_hash FROM users WHERE user_id=%s",
-                    (u["user_id"],))
-        assert cur.fetchone()["password_hash"] == json_hash
-    assert user_store_pg.verify_user("backfill@x.com", "password1password1") is not None
+# --------------------------------------------------------------------------- #
+# user 侧 dual 用例已随账户系统批次 C 删除（docs §9.3）：
+#   test_dual_create_user_identity / test_dual_create_user_password_hash_survives_switch /
+#   test_dual_create_bootstrap_owner_mirror_parity / test_dual_auth_version_increment_parity /
+#   test_dual_mirror_repairs_empty_pg_password_hash /
+#   test_dual_repair_empty_hashes_without_remirror
+# （user 侧降级语义由上方 dual fixture 的断言覆盖；历史空 hash 修复由
+#   scripts/repair_pg_user_password_hashes.py 承担。）
+# --------------------------------------------------------------------------- #
 
 
 def test_dual_create_share_identity(dual, pg_conn):

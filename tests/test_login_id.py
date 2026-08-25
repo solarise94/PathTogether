@@ -1,23 +1,23 @@
 # -*- coding: utf-8 -*-
-"""账户系统批次 B「登录标识收口」测试（docs/account-system-simplification-
-fix-plan.md §4.1 兼容窗口 / §6.1 登录只认 login_id / §11.2 登录标识矩阵）。
+"""账户系统批次 B「登录标识收口」+ 批次 C「物理收口」测试（docs
+account-system-simplification-fix-plan.md §4.2 / §6.1 / §11.2 矩阵）。
 
 覆盖（json 默认 + RUN_PG_TESTS=1 双跑）：
-  - 用户 dict 双键输出：login_id（规范名）与 email（deprecated，同值）在
-    create_user / get_user / get_user_by_email / verify_user / list_users /
-    list_enabled_owners / create_bootstrap_owner 等读写路径一致携带；
-    json 侧 login_id 只是对外别名、不落盘；
+  - 用户 dict 单键输出（批次 C）：create_user / get_user /
+    get_user_by_login_id / verify_user / list_users / list_enabled_owners /
+    create_bootstrap_owner / set_user_password 等读写路径只带 login_id，
+    **email 键不再出现**（反向断言）；json 侧物理键即 login_id；
   - 登录只认 login_id：大小写/空白不敏感登录成功；display_name 登录失败；
     两人同 display_name 各自 login_id 均可登录；A 的 display_name == B 的
     login_id 时该字符串只能登进 B；
   - 登录防爆破主体：大小写变体与正确值共用同一账号桶（_auth_subject_hash
     规范化直接断言 + 混合大小写连续失败触发 429 的功能断言）；
   - 统一失败文案「账号或密码错误」，不泄露账号存在性；
-  - 管理 API：/api/admin/users 列表/创建/重置/禁用响应双字段；创建接受
-    login_id（优先）或 email（兼容）；
-  - 邀请管理 API 别名（仅 PG，registration_invites 为 PG-only 能力）：创建
-    接受 login_id 优先 / email 兼容，响应携带 login_id_masked 与
-    email_masked（deprecated 同值），绑定语义为「允许兑换的登录账号」。
+  - 管理 API：/api/admin/users 列表/创建/重置/禁用响应无 email 键；创建
+    **只接受 login_id**（只传 email 不给 login_id → 400，批次 C 删兼容入参）；
+  - 邀请管理 API（仅 PG，registration_invites 为 PG-only 能力）：创建只接受
+    login_id 入参，响应只携带 login_id_masked（email_masked 已删除），绑定
+    语义为「允许兑换的登录账号」；redeem_invite 返回 login_id 键。
 
 隔离：独立临时 SHARE_DATA_DIR / UPLOAD_DIR，monkeypatch 夺回 user_store /
 share_store 常量与 env，绝不触碰真实数据。
@@ -117,52 +117,57 @@ def make_owner(login_id="admin", password=OWNER_PW):
 
 
 # =========================================================================== #
-# 1. 双键输出（docs §4.1 兼容窗口）
+# 1. 单键输出（docs §4.2 物理收口：email 键不再出现）
 # =========================================================================== #
-def test_user_dicts_carry_login_id_and_email():
-    """所有返回用户 dict 的路径同时携带 login_id（规范）与 email（deprecated）。"""
+def test_user_dicts_login_id_only_no_email_key():
+    """所有返回用户 dict 的路径只带 login_id；email 键不再出现（批次 C）。"""
     owner = make_owner("Owner_One")
-    check("create_bootstrap_owner login_id==email==规范化值",
-          owner.get("login_id") == owner.get("email") == "owner_one")
+    check("create_bootstrap_owner login_id==规范化值",
+          owner.get("login_id") == "owner_one")
+    check("create_bootstrap_owner 无 email 键", "email" not in owner)
     u = user_store.create_user("Alice@Example.COM", PW, role="user",
                                display_name="Alice")
-    check("create_user 双键同值",
-          u.get("login_id") == u.get("email") == "alice@example.com")
+    check("create_user login_id 规范化值",
+          u.get("login_id") == "alice@example.com")
+    check("create_user 无 email 键", "email" not in u)
 
     got = user_store.get_user(u["user_id"])
-    check("get_user 双键同值",
-          got.get("login_id") == got.get("email") == "alice@example.com")
-    by_email = user_store.get_user_by_email("alice@example.com")
-    check("get_user_by_email 双键同值",
-          by_email.get("login_id") == by_email.get("email"))
+    check("get_user login_id 命中",
+          got.get("login_id") == "alice@example.com")
+    check("get_user 无 email 键", "email" not in got)
+    by_login = user_store.get_user_by_login_id("alice@example.com")
+    check("get_user_by_login_id 命中且无 email 键",
+          by_login is not None and by_login.get("login_id")
+          == "alice@example.com" and "email" not in by_login)
     v = user_store.verify_user("ALICE@example.com", PW)
-    check("verify_user 双键同值且命中本人",
+    check("verify_user 命中本人且无 email 键",
           v is not None and v["user_id"] == u["user_id"]
-          and v.get("login_id") == v.get("email"))
+          and "email" not in v)
     listed = user_store.list_users()
-    check("list_users 每行双键同值",
+    check("list_users 每行只有 login_id 键",
           len(listed) == 2 and all(
-              x.get("login_id") == x.get("email") for x in listed))
+              x.get("login_id") and "email" not in x for x in listed))
     owners = user_store.list_enabled_owners()
-    check("list_enabled_owners 双键同值",
-          len(owners) == 1 and owners[0].get("login_id")
-          == owners[0].get("email") == "owner_one")
-    # 写路径返回同样补键（set_user_password 递增 auth_version 后的公共 dict）
+    check("list_enabled_owners 单键",
+          len(owners) == 1 and owners[0].get("login_id") == "owner_one"
+          and "email" not in owners[0])
+    # 写路径返回同样单键（set_user_password 递增 auth_version 后的公共 dict）
     p = user_store.set_user_password(u["user_id"], PW3)
-    check("set_user_password 返回双键同值",
-          p is not None and p.get("login_id") == p.get("email"))
+    check("set_user_password 返回单键",
+          p is not None and p.get("login_id") == "alice@example.com"
+          and "email" not in p)
 
 
 @json_only  # 直读 users.json 物理文件；PG 后端无该文件
-def test_login_id_not_persisted_in_json_store():
-    """json 侧 login_id 只是对外别名：users.json 物理记录不新增该键。"""
+def test_login_id_is_physical_key_in_json_store():
+    """批次 C：json 物理记录键即 login_id（不再落 email 键、不双写）。"""
     u = user_store.create_user("persist@x.com", PW, role="user")
     raw = json.loads(user_store.USER_FILE.read_text(encoding="utf-8"))
     rec = raw["users"][u["user_id"]]
-    check("物理记录保留 email 键", rec.get("email") == "persist@x.com")
-    check("物理记录不落 login_id 键", "login_id" not in rec)
+    check("物理记录 login_id 键", rec.get("login_id") == "persist@x.com")
+    check("物理记录不落 email 键", "email" not in rec)
     got = user_store.get_user(u["user_id"])
-    check("读出口仍补 login_id 别名", got.get("login_id") == "persist@x.com")
+    check("读出口同值", got.get("login_id") == "persist@x.com")
 
 
 # =========================================================================== #
@@ -292,73 +297,74 @@ def test_case_variants_share_account_lockout_bucket(monkeypatch):
 
 
 # =========================================================================== #
-# 4. 管理 API 双字段输出与 login_id 入参（docs §4.1/§8.1）
+# 4. 管理 API 单键输出与 login_id-only 入参（docs §4.2/§8.1，批次 C）
 # =========================================================================== #
-def test_admin_users_api_dual_fields_and_login_id_input(monkeypatch):
-    """列表/创建/重置/禁用响应双字段；创建接受 login_id（优先）或 email。"""
+def test_admin_users_api_login_id_only(monkeypatch):
+    """列表/创建/重置/禁用响应无 email 键；创建只接受 login_id（email 入参
+    已删除——只传 email 不给 login_id 一律 400）。"""
     monkeypatch.setenv("ADMIN_PASSWORD", "")
     make_owner()
     user_store.create_user("u@x.com", PW2, role="user")
     client = make_client()
     check("owner 登录 302", login(client, "admin", OWNER_PW).status_code == 302)
 
-    # 列表：每个用户双键同值
+    # 列表：每个用户只有 login_id 键
     r = client.get("/api/admin/users")
     check("GET /api/admin/users 200", r.status_code == 200)
     users = r.get_json().get("users") or []
     check("列表非空", len(users) == 2)
-    check("列表每行 login_id==email 且无 hash",
-          all(u.get("login_id") == u.get("email")
-              and "password_hash" not in u for u in users))
+    check("列表每行 login_id 且无 hash 无 email 键",
+          all(u.get("login_id") and "password_hash" not in u
+              and "email" not in u for u in users))
 
-    # 创建：login_id 入参（优先形式）
+    # 创建：login_id 入参
     r2 = client.post("/api/admin/users",
                      json={"login_id": "New@X.com", "password": PW})
     check("login_id 入参创建 200", r2.status_code == 200,
           "got %s %s" % (r2.status_code, r2.get_data(as_text=True)))
     body2 = r2.get_json()
-    check("创建响应 login_id==email==规范化值",
-          body2.get("login_id") == body2.get("email") == "new@x.com")
+    check("创建响应 login_id==规范化值",
+          body2.get("login_id") == "new@x.com")
+    check("创建响应无 email 键", "email" not in body2)
 
-    # 创建：email 兼容入参仍可用（deprecated）
+    # 批次 C：email 兼容入参已删除——只传 email 不给 login_id → 400
     r3 = client.post("/api/admin/users",
                      json={"email": "legacy@x.com", "password": PW})
-    check("email 兼容入参创建 200", r3.status_code == 200)
-    body3 = r3.get_json()
-    check("兼容创建响应双键同值",
-          body3.get("login_id") == body3.get("email") == "legacy@x.com")
+    check("email 入参不再被接受（400）", r3.status_code == 400,
+          "got %s" % r3.status_code)
+    check("错误文案为缺登录账号", "登录账号" in r3.get_json().get("error", ""))
 
     # 两个都没给 → 400（登录账号缺失）
     r4 = client.post("/api/admin/users", json={"password": PW})
     check("缺登录账号 400", r4.status_code == 400)
     check("缺登录账号文案", "登录账号" in r4.get_json().get("error", ""))
 
-    # 重置密码 / 禁用 / 启用响应同样双字段
-    uid = user_store.get_user_by_email("u@x.com")["user_id"]
+    # 重置密码 / 禁用 / 启用响应同样单键
+    uid = user_store.get_user_by_login_id("u@x.com")["user_id"]
     r5 = client.post("/api/admin/users/%s/password" % uid,
                      json={"password": PW3})
     check("重置密码 200", r5.status_code == 200)
     b5 = r5.get_json()
-    check("重置响应双键同值", b5.get("login_id") == b5.get("email"))
+    check("重置响应单键", b5.get("login_id") == "u@x.com"
+          and "email" not in b5)
     r6 = client.post("/api/admin/users/%s/disable" % uid)
     check("禁用 200", r6.status_code == 200)
-    check("禁用响应双键同值",
-          r6.get_json().get("login_id") == r6.get_json().get("email"))
+    check("禁用响应单键", "email" not in r6.get_json())
     r7 = client.post("/api/admin/users/%s/enable" % uid)
-    check("启用响应双键同值",
-          r7.get_json().get("login_id") == r7.get_json().get("email"))
+    check("启用响应单键", "email" not in r7.get_json())
 
 
 @pg_only
-def test_invite_admin_api_login_id_alias(monkeypatch):
-    """邀请管理 API：login_id（优先）/ email（兼容）入参；响应掩码双键；
+def test_invite_admin_api_login_id_only(monkeypatch):
+    """邀请管理 API：只接受 login_id 入参（email 兼容入参已删除）；响应只带
+    login_id_masked（email_masked 已删除）；redeem_invite 返回 login_id 键；
     绑定语义为「允许兑换的登录账号」（大小写不敏感匹配）。"""
     import registration_store
     make_owner()
     client = make_client()
     check("owner 登录 302", login(client, "admin", OWNER_PW).status_code == 302)
 
-    # 创建：login_id 入参（优先形式）
+    # 创建：login_id 入参
     r = client.post("/api/admin/registration-invites",
                     json={"login_id": "NewUser@X.com"})
     check("login_id 入参创建邀请 200", r.status_code == 200,
@@ -366,48 +372,63 @@ def test_invite_admin_api_login_id_alias(monkeypatch):
     body = r.get_json()
     check("创建响应 login_id_masked",
           body.get("login_id_masked") == "n***@x.com")
-    check("创建响应 email_masked 同值（deprecated）",
-          body.get("email_masked") == body.get("login_id_masked"))
+    check("创建响应无 email_masked 键（批次 C）",
+          "email_masked" not in body)
     check("响应不含完整绑定值与 token_hash",
           "newuser@x.com" not in json.dumps(body)
           and "token_hash" not in body)
 
-    # 创建：email 兼容入参（deprecated）仍可用
+    # 批次 C：email 兼容入参已删除。邀请端点的 login_id 本就可选（不绑定是
+    # owner 高风险选项），只传 email 不给 login_id → email 被忽略，创建的
+    # 是**不绑定**邀请（email 值不再被当作绑定别名）。
     r2 = client.post("/api/admin/registration-invites",
                      json={"email": "LegacyInv@x.com"})
-    check("email 兼容入参创建邀请 200", r2.status_code == 200)
-    check("兼容创建响应掩码双键",
-          r2.get_json().get("login_id_masked")
-          == r2.get_json().get("email_masked") == "l***@x.com")
+    check("email 入参被忽略（仍 200 创建）", r2.status_code == 200,
+          "got %s" % r2.status_code)
+    b2 = r2.get_json()
+    check("email 不再被当作绑定别名（login_id_masked 为空串）",
+          b2.get("login_id_masked") == "", "got %r" % b2.get("login_id_masked"))
+    check("email 值未泄露进响应", "legacyinv" not in json.dumps(b2).lower())
 
-    # 列表：掩码双键
+    # 列表：只带 login_id_masked
     r3 = client.get("/api/admin/registration-invites")
     items = r3.get_json().get("invites") or []
     check("列表两条", len(items) == 2)
-    check("列表每条掩码双键同值",
-          all(i.get("login_id_masked") == i.get("email_masked")
-              for i in items))
+    check("列表每条无 email_masked 键",
+          all("email_masked" not in i for i in items))
 
     # 兑换：绑定语义为允许兑换的登录账号（大小写不敏感）
     result = registration_store.redeem_invite(
         body["token"], "NEWUSER@x.com", PW)
     created = result["user"]
     check("大小写不敏感兑换成功",
-          created.get("email") == "newuser@x.com")
-    check("兑换创建的用户 dict 双键同值",
-          created.get("login_id") == created.get("email"))
+          created.get("login_id") == "newuser@x.com")
+    check("redeem_invite 返回 login_id 键（批次 C）",
+          result.get("login_id") == "newuser@x.com")
+    check("redeem_invite 返回无 email 键", "email" not in result)
+    check("兑换创建的用户 dict 单键",
+          created.get("login_id") == "newuser@x.com"
+          and "email" not in created)
     # 新用户可用该登录账号登录（display_name 缺省同 login_id）
     v = user_store.verify_user("newuser@x.com", PW)
     check("兑换后可登录", v is not None
           and v["user_id"] == created["user_id"])
-    # 错误绑定值兑换失败（统一错误，不消费语义由既有套件覆盖）
+    # 绑定邀请 + 错误绑定值兑换失败（统一错误；不消费语义由既有套件覆盖）
+    r_bound = client.post("/api/admin/registration-invites",
+                          json={"login_id": "BoundUser@X.com"})
+    check("绑定邀请创建 200", r_bound.status_code == 200)
     try:
         registration_store.redeem_invite(
-            r2.get_json()["token"], "someone-else@x.com", PW)
+            r_bound.get_json()["token"], "someone-else@x.com", PW)
         redeemed_wrong = True
     except registration_store.InviteRedeemError:
         redeemed_wrong = False
     check("绑定不匹配兑换失败", redeemed_wrong is False)
+    # 不绑定邀请（r2，email 被忽略）任意登录账号可兑换（高风险选项语义保持）
+    out_unbound = registration_store.redeem_invite(
+        b2["token"], "FreePick@x.com", PW)
+    check("不绑定邀请任意登录账号兑换成功",
+          out_unbound.get("login_id") == "freepick@x.com")
 
 
 # =========================================================================== #

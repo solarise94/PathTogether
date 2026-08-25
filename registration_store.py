@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
 """邀请注册存储原语（registration_invites，P0-B docs §4.2/§4.3/§4.4）。
 
-账户系统批次 B（docs/account-system-simplification-fix-plan.md §8.2）：
-邀请绑定字段（物理列 ``email_normalized``，批次 C 才改名）的语义为
-**「允许兑换的登录账号 login_id」**，不是已验证邮箱。本模块函数签名与参数名
-（``email`` / ``email_normalized``）本批次保持不变，注释按 login_id 语义表述；
+账户系统批次 B（docs/account-system-simplification-fix-plan.md §8.2）：邀请
+绑定字段的语义为**「允许兑换的登录账号 login_id」**，不是已验证邮箱。
 兑换匹配的是用户自选的登录账号，display_name 不参与唯一性或邀请匹配。
+
+账户系统批次 C（docs §4.2 物理收口）：函数签名与参数名随物理列一并收口为
+login_id 口径——``create_invite``/``redeem_invite`` 参数 ``login_id``、
+``normalize_login_id``/``mask_login_id``、SQL 列 ``login_id_normalized``
+（0016 改名）、redeem_invite 返回 dict 的 "login_id" 键（原 "email" 键删除）。
+内部细分 reason（email_mismatch/email_taken）为稳定标识符，维持不变。
 
 安全不变量：
 
@@ -112,18 +116,18 @@ def invite_token_hash(token: str) -> str:
         msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def normalize_email(email) -> str:
+def normalize_login_id(login_id) -> str:
     """登录账号规范化：strip + lower（与 user_store 写入侧一致）。
 
-    参数/函数名沿用 email（批次 C 收口为 login_id）；规范化口径即 login_id
-    的唯一键规范化（docs §3.1/§8.2）。
+    规范化口径即 login_id 的唯一键规范化（docs §3.1/§8.2；原批次 B 名
+    normalize_email，批次 C 随物理列改名）。
     """
-    return str(email or "").strip().lower()
+    return str(login_id or "").strip().lower()
 
 
-def mask_email(email) -> str:
+def mask_login_id(login_id) -> str:
     """owner 列表展示用登录账号掩码：保留首字符与域名（无 @ 则保留首字符）。"""
-    s = str(email or "").strip()
+    s = str(login_id or "").strip()
     if not s:
         return ""
     if "@" in s:
@@ -141,33 +145,32 @@ def _new_user_id() -> str:
     return "usr_" + secrets.token_urlsafe(8)
 
 
-def _insert_user_locked(cur, email_normalized, password, display_name,
+def _insert_user_locked(cur, login_id_normalized, password, display_name,
                         ai_access=False):
     """在**调用方事务的 cursor** 内插入 role=user 用户行，返回公共 dict。
 
-    email_normalized 语义为规范化登录账号 login_id（批次 B docs §8.2）。
-    与 user_store_pg.create_user 的差异：不开连接、不独立提交（供 redeem_invite
-    同事务使用）；users.lower(email) 唯一索引冲突时抛 psycopg UniqueViolation
-    （由调用方在同一事务内翻译为统一错误并回滚）。返回 dict 同时携带
-    "login_id" 与 "email"（deprecated，同值；docs §4.1 兼容窗口）。
+    login_id_normalized 为规范化登录账号（docs §8.2）。与
+    user_store_pg.create_user 的差异：不开连接、不独立提交（供 redeem_invite
+    同事务使用）；users.lower(login_id) 唯一索引冲突时抛 psycopg
+    UniqueViolation（由调用方在同一事务内翻译为统一错误并回滚）。返回 dict
+    只带 "login_id" 键（批次 C 起无 "email" 别名，docs §4.2）。
     """
     uid = _new_user_id()
-    name = str(display_name or "").strip() or email_normalized
+    name = str(display_name or "").strip() or login_id_normalized
     cur.execute(
         "INSERT INTO users "
-        "(user_id, email, display_name, password_hash, role, created_at, "
+        "(user_id, login_id, display_name, password_hash, role, created_at, "
         " disabled, ai_config, ai_access) "
         "VALUES (%s,%s,%s,%s,'user', now(), FALSE, '{}'::jsonb, %s) "
-        "RETURNING user_id, email, display_name, role, "
+        "RETURNING user_id, login_id, display_name, role, "
         "extract(epoch from created_at)::float8 AS created_at, disabled, "
         "ai_config, ai_access",
-        (uid, email_normalized, name, generate_password_hash(password),
+        (uid, login_id_normalized, name, generate_password_hash(password),
          bool(ai_access)),
     )
     row = cur.fetchone()
     out = dict(row)
     out["ai_access"] = bool(out.get("ai_access"))
-    out["login_id"] = out.get("email")
     return out
 
 
@@ -188,7 +191,7 @@ def _insert_audit(cur, action, actor_user_id, target_type, target_id, detail):
 # 邀请创建 / 查询 / 撤销（owner 管理 API 数据源）
 # --------------------------------------------------------------------------- #
 _INVITE_SEL = (
-    "invite_id, email_normalized, created_by_user_id, "
+    "invite_id, login_id_normalized, created_by_user_id, "
     "extract(epoch from created_at)::float8 AS created_at, "
     "extract(epoch from expires_at)::float8 AS expires_at, max_uses, use_count, "
     "extract(epoch from consumed_at)::float8 AS consumed_at, "
@@ -203,22 +206,22 @@ def _invite_out(row) -> dict:
     return out
 
 
-def create_invite(created_by_user_id, email=None,
+def create_invite(created_by_user_id, login_id=None,
                   ttl_seconds=DEFAULT_INVITE_TTL_SECONDS,
                   ai_access=False, cohort="", note=""):
     """创建一次性邀请码。返回 dict：含**明文 token**（唯一出现处）与行信息。
 
     - token：``secrets.token_urlsafe(32)``；库内只存 invite_token_hash(token)；
-    - email 给出时按 normalize_email 绑定——语义为「允许兑换的登录账号
-      login_id」（批次 B docs §8.2；参数名沿用 email，批次 C 收口改名）；
+    - login_id 给出时按 normalize_login_id 绑定——语义为「允许兑换的登录账号
+      login_id」（docs §8.2；原批次 B 参数名 email，批次 C 收口改名）；
       None = 不绑定（owner 明确选择的高风险选项，UI 需标注）；
     - ai_access/cohort/note 为邀请模板：兑换时决定新用户平台 AI 权限与分组。
     """
     platform_features.require_pg_backend("registration_invites")
     if not isinstance(created_by_user_id, str) or not created_by_user_id:
         raise ValueError("created_by_user_id 不能为空")
-    bound = normalize_email(email) if email else ""
-    if email and not bound:
+    bound = normalize_login_id(login_id) if login_id else ""
+    if login_id and not bound:
         raise ValueError("绑定登录账号不能为空白")
     try:
         ttl = int(ttl_seconds)
@@ -239,7 +242,7 @@ def create_invite(created_by_user_id, email=None,
                 with c.cursor() as cur:
                     cur.execute(
                         "INSERT INTO registration_invites "
-                        "(invite_id, token_hash, email_normalized, "
+                        "(invite_id, token_hash, login_id_normalized, "
                         " created_by_user_id, created_at, expires_at, "
                         " max_uses, use_count, ai_access, cohort, note) "
                         "VALUES (%s,%s,%s,%s, now(), "
@@ -341,28 +344,29 @@ class _RedeemFail(Exception):
         super().__init__(reason)
 
 
-def redeem_invite(token, email, password, display_name=None):
+def redeem_invite(token, login_id, password, display_name=None):
     """兑换邀请码并在**同一事务**内创建 role=user 账号。
 
-    ``email`` 参数语义为兑换人自选的**登录账号 login_id**（批次 B docs §8.2；
-    参数名沿用 email，批次 C 收口改名）。
+    ``login_id`` 参数为兑换人自选的**登录账号**（docs §8.2；原批次 B 参数名
+    email，批次 C 收口改名）。
 
     失败一律抛 ``InviteRedeemError``（对外统一 code
     ``invite_invalid_or_unavailable``）：
       - 无效/随机 token、过期、撤销、已消费（细分 reason：not_found / expired /
         revoked / consumed）；
-      - 绑定登录账号不匹配（email_mismatch；常数时间比较规范化值）；
+      - 绑定登录账号不匹配（email_mismatch——稳定 reason 标识符，批次 C 维持
+        不变；常数时间比较规范化值）；
       - users 登录账号已存在（email_taken；此时 invite 未消费——检查先于
         UPDATE）；
-    成功返回 ``{"user": <新用户公共 dict>, "invite_id": ..., "email": ...}``
-    （email 键值即规范化 login_id；批次 C 收口键名）。
+    成功返回 ``{"user": <新用户公共 dict>, "invite_id": ..., "login_id": ...}``
+    （login_id 键即规范化登录账号；批次 C 起不再返回 "email" 键）。
     成功审计在同一事务内（registration.redeem，actor=被创建 user_id）；失败审计
     在独立 best-effort 事务（主事务已随异常回滚），detail 只含 invite_id/status。
     """
     platform_features.require_pg_backend("registration_invites")
     tok = (token or "").strip()
-    norm_email = normalize_email(email)
-    if not tok or not isinstance(password, str) or not norm_email \
+    norm_login = normalize_login_id(login_id)
+    if not tok or not isinstance(password, str) or not norm_login \
             or len(password) < MIN_PASSWORD_LENGTH \
             or len(password) > MAX_PASSWORD_LENGTH:
         # 输入形状问题也按统一错误处理（路由层已做过表单校验，这里是防御层）
@@ -375,7 +379,7 @@ def redeem_invite(token, email, password, display_name=None):
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT invite_id, token_hash, email_normalized, "
+                    "SELECT invite_id, token_hash, login_id_normalized, "
                     "extract(epoch from expires_at)::float8 AS expires_at, "
                     "max_uses, use_count, consumed_at, revoked_at, ai_access, "
                     "cohort FROM registration_invites WHERE token_hash=%s "
@@ -393,24 +397,24 @@ def redeem_invite(token, email, password, display_name=None):
                 if row["consumed_at"] is not None or \
                         int(row["use_count"] or 0) >= int(row["max_uses"] or 1):
                     raise _RedeemFail("consumed")
-                bound = row["email_normalized"]
+                bound = row["login_id_normalized"]
                 if bound:
                     # 常数时间比较（规范化后等长补齐，长度差不泄露信息）
-                    a = norm_email.encode("utf-8")
+                    a = norm_login.encode("utf-8")
                     b = str(bound).encode("utf-8")
                     n = max(len(a), len(b), 1)
                     if not hmac.compare_digest(a + b"\0" * (n - len(a)),
                                                b + b"\0" * (n - len(b))):
                         raise _RedeemFail("email_mismatch")
-                # users 邮箱唯一检查（在消费 invite 之前；冲突则整体回滚不消费）
+                # users 登录账号唯一检查（在消费 invite 之前；冲突则整体回滚不消费）
                 cur.execute(
-                    "SELECT 1 FROM users WHERE lower(email)=lower(%s) LIMIT 1",
-                    (norm_email,))
+                    "SELECT 1 FROM users WHERE lower(login_id)=lower(%s) LIMIT 1",
+                    (norm_login,))
                 if cur.fetchone() is not None:
                     raise _RedeemFail("email_taken")
                 try:
                     user = _insert_user_locked(
-                        cur, norm_email, password, display_name,
+                        cur, norm_login, password, display_name,
                         ai_access=bool(row["ai_access"]))
                 except psycopg.errors.UniqueViolation:
                     raise _RedeemFail("email_taken")
@@ -425,12 +429,12 @@ def redeem_invite(token, email, password, display_name=None):
                     raise _RedeemFail("consumed")
                 _audit_redeem(cur, invite_id, "success",
                               created_user_id=user["user_id"])
-        return {"user": user, "invite_id": invite_id, "email": norm_email}
+        return {"user": user, "invite_id": invite_id, "login_id": norm_login}
     except _RedeemFail as exc:
         _audit_redeem_best_effort(fail_invite_id, exc.reason)
         raise InviteRedeemError(exc.reason)
     except psycopg.errors.UniqueViolation:
-        # users.lower(email) 唯一索引冲突（检查与插入之间的并发窗口）
+        # users.lower(login_id) 唯一索引冲突（检查与插入之间的并发窗口）
         _audit_redeem_best_effort(fail_invite_id, "email_taken")
         raise InviteRedeemError("email_taken")
     finally:

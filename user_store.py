@@ -1,16 +1,18 @@
 # -*- coding: utf-8 -*-
 """用户存储层 dispatcher（Stage 3b-1：PostgreSQL 基建 + dispatcher 拆分）。
 
-过渡形态（见 docs/pathtogather-histopilot-platform-plugin-upgrade.md §Stage 3b 与
-决策 #8）：
+形态（见 docs/pathtogather-histopilot-platform-plugin-upgrade.md §Stage 3b 与
+决策 #8；账户系统批次 C 收口见 docs/account-system-simplification-fix-plan.md
+§9.3）：
 
-- 原有 JSON 文件实现（users.json：四级身份基础）被**原样**搬到
-  `user_store_json.py`（含 _ 前缀私有函数、fcntl 文件锁、SHARE_DATA_DIR 逻辑），
-  本文件不再持有任何业务实现。
-- 按 `STORAGE_BACKEND` 环境变量分发：
-    * ``json``     （默认）→ 显式 re-export `user_store_json` 的全部公共名；
-    * ``postgres`` / ``dual`` → 暂不接入，访问任一公共名抛 RuntimeError
-      （Stage 3b-2 才接 PostgreSQL 实现；本节点只交付分发骨架 + 基建）。
+- JSON 文件实现（users.json）位于 ``user_store_json.py``（含 _ 前缀私有函数、
+  fcntl 文件锁、SHARE_DATA_DIR 逻辑），本文件不持有任何业务实现；
+- 按 ``STORAGE_BACKEND`` 环境变量分发：
+    * ``json`` （默认）→ 显式 re-export ``user_store_json`` 的全部公共名；
+    * ``postgres`` → re-export ``user_store_pg`` 的全部公共名；
+    * ``dual`` → **user 侧 dual 已在批次 C 删除**：降级安装 json 后端并打一条
+      deprecation warning（``STORAGE_BACKEND`` env 与 share_store 共享，share
+      侧 dual 迁移机器保留，不能让本模块 import 直接炸）。
 - 非法后端值在 import 期即抛 ValueError。
 
 **验收红线：零行为变化**。所有调用方一律 ``import user_store`` 后以
@@ -22,7 +24,8 @@
 自定义模块类，把这两个路径常量的外部写入实时镜像回 ``user_store_json.__dict__``。
 模块自身初始化用字典写入（``globals()[name] = ...``），不走 ``__setattr__``。
 
-contract 计划：Stage 3b contract 阶段删除 JSON 写路径，PostgreSQL 成为唯一存储。
+contract 状态：PostgreSQL 为生产唯一用户存储；json 仅服务本地免认证开发与
+隔离单元测试（批次 C 已删 user 侧 dual 镜像与启动修复 shim）。
 """
 
 import os as _os
@@ -33,13 +36,17 @@ import types as _types
 # 后端选择（与 share_store 同语义）
 # --------------------------------------------------------------------------- #
 _BACKEND_ENV = "STORAGE_BACKEND"
-_VALID_BACKENDS = ("json", "postgres", "dual")
+# user 侧合法后端（账户系统批次 C 删除 dual）。"dual" 不在其中但仍被接受：
+# env 与 share_store 共享且 share 侧 dual（Stage 3b 迁移机器）保留，遇 dual
+# 时降级 json + deprecation warning（见下方安装分支），不让 import 直接炸。
+_VALID_BACKENDS = ("json", "postgres")
 
 #: 当前生效的存储后端（json|postgres|dual）。默认 json，等价拆分前行为。
+#: "dual" 表示 env 请求了 dual：user 侧实际安装 json 后端（已删除 dual）。
 STORAGE_BACKEND = (_os.environ.get(_BACKEND_ENV) or "json").strip()
-if STORAGE_BACKEND not in _VALID_BACKENDS:
+if STORAGE_BACKEND not in _VALID_BACKENDS and STORAGE_BACKEND != "dual":
     raise ValueError(
-        "STORAGE_BACKEND 仅支持 %s，当前值为 %r"
+        "STORAGE_BACKEND 仅支持 %s（当前值为 %r）"
         % ("/".join(_VALID_BACKENDS), STORAGE_BACKEND)
     )
 
@@ -54,6 +61,9 @@ if STORAGE_BACKEND not in _VALID_BACKENDS:
 #: 账户系统批次 B（docs §6.1）：删除 get_user_by_display_name——其唯一调用方
 #: 是 verify_user 的 display_name 登录 fallback（已随本批次移除），全仓无
 #: 展示用途调用方。
+#:
+#: 账户系统批次 C（docs §4.2）：get_user_by_email → get_user_by_login_id
+#: （随物理列 users.login_id 改名）。
 _JSON_PUBLIC_NAMES = (
     # —— 常量 ——
     "SHARE_DATA_DIR",
@@ -73,7 +83,7 @@ _JSON_PUBLIC_NAMES = (
     # —— 函数 ——
     "create_user",
     "get_user",
-    "get_user_by_email",
+    "get_user_by_login_id",
     "verify_user",
     "list_users",
     "set_user_disabled",
@@ -121,105 +131,34 @@ def _install_pg_backend():
         _g[_name] = getattr(_pg, _name)
 
 
-def _make_dual_replay(name, json_fn, mirror):
-    """dual 后端写包装（result-replay）：json 为权威，ret=json_fn(...) → mirror(ret,
-    原参) 把权威 dict 按其中身份值（user_id）镜像进 pg。json 抛错则不写 pg。"""
-    import functools
-    import logging
-
-    _log = logging.getLogger("svs.dual.user")
-
-    @functools.wraps(json_fn)
-    def _wrapped(*args, **kwargs):
-        ret = json_fn(*args, **kwargs)
-        try:
-            mirror(ret, *args, **kwargs)
-        except Exception:
-            _log.exception("dual 后端 pg 镜像写失败: %s", name)
-        return ret
-
-    return _wrapped
-
-
-def _make_dual_same(name, json_fn, pg_fn):
-    """dual 后端写包装（同参重放）：无内部生成身份的写，直接同参调 pg（异常记 log）。"""
-    import functools
-    import logging
-
-    _log = logging.getLogger("svs.dual.user")
-
-    @functools.wraps(json_fn)
-    def _wrapped(*args, **kwargs):
-        ret = json_fn(*args, **kwargs)
-        try:
-            pg_fn(*args, **kwargs)
-        except Exception:
-            _log.exception("dual 后端 pg 镜像写失败: %s", name)
-        return ret
-
-    return _wrapped
-
-
-# result-replay 镜像：json 内部生成 user_id 的写（create_user/create_bootstrap_owner），
-# 用 json 返回的权威 dict 按 user_id 原样 upsert 进 pg（身份一致）。其余写按
-# user_id 定位，user_id 来自调用方入参/已存在用户，同参重放即一致。
-# （ensure_owner 已在账户系统批次 A 删除，其镜像映射一并移除。）
-_DUAL_MIRRORS = {
-    "create_user": "_mirror_user",
-    "create_bootstrap_owner": "_mirror_user",
-}
-
-# 同参重放：无内部生成身份，直接同参调 pg（set_user_* 均按调用方入参 user_id 定位，
-# 与 json 幂等——json 返回 None 时 pg 也不存在，镜像 no-op 等价）。
-_DUAL_SAME_ARGS = {
-    "set_user_disabled", "set_user_password", "set_user_ai_config",
-}
-
-
-def _install_dual_backend():
-    """dual 后端（expand 形态）：写 json + result-replay/best-effort 写 pg、读 json。
-
-    读路径切换留 Stage 3b-3。常量/读函数 re-export 自 json impl。
-    """
-    import user_store_json as _json
-    import user_store_pg as _pg
-
-    for n in _JSON_PUBLIC_NAMES:
-        if not hasattr(_json, n):
-            raise RuntimeError(
-                "user_store_json 缺少公共名 %s，dispatcher 与实现不一致" % n)
-    for n in _JSON_PUBLIC_NAMES:
-        if not hasattr(_pg, n):
-            raise RuntimeError(
-                "user_store_pg 缺少公共名 %s，dispatcher 与实现不一致" % n)
-    _g = globals()
-    for _name in _JSON_PUBLIC_NAMES:
-        if _name in _DUAL_MIRRORS:
-            _g[_name] = _make_dual_replay(
-                _name, getattr(_json, _name), getattr(_pg, _DUAL_MIRRORS[_name]))
-        elif _name in _DUAL_SAME_ARGS:
-            _g[_name] = _make_dual_same(
-                _name, getattr(_json, _name), getattr(_pg, _name))
-        else:
-            _g[_name] = getattr(_json, _name)
-
-
 if STORAGE_BACKEND == "json":
     _install_json_backend()
 elif STORAGE_BACKEND == "postgres":
     _install_pg_backend()
-elif STORAGE_BACKEND == "dual":
-    _install_dual_backend()
+else:
+    # STORAGE_BACKEND=dual：user 侧 dual 后端已随账户系统批次 C 删除
+    # （docs §9.3：_install_dual_backend / _make_dual_replay / _make_dual_same /
+    # _DUAL_MIRRORS 及 user_store_pg._mirror_user 一并移除）。但 STORAGE_BACKEND
+    # env 与 share_store 共享、share 侧 dual（Stage 3b 迁移机器）保留，这里
+    # 降级安装 json 后端并打一条 deprecation warning，保证 share 侧 dual 部署
+    # 与重载 dispatcher 的测试（tests/test_dual_backend.py）不会 import 即炸。
+    import logging as _logging
+
+    _logging.getLogger("svs.user_store").warning(
+        "STORAGE_BACKEND=dual：user 侧 dual 后端已删除（账户系统批次 C，"
+        "docs §9.3），user_store 降级为 json 后端（本地开发/测试形态，不是"
+        "可登录生产形态）；share 侧 dual 机制保留。")
+    _install_json_backend()
 
 
 # --------------------------------------------------------------------------- #
-# 自定义模块类：路径常量镜像 + postgres/dual 公共名访问抛 RuntimeError
+# 自定义模块类：路径常量镜像 + 未接线公共名访问抛 RuntimeError
 # --------------------------------------------------------------------------- #
 class _UserStoreModule(_types.ModuleType):
-    """过渡期分发模块类（详见模块 docstring）。
+    """分发模块类（详见模块 docstring）。
 
     json：从 json impl re-export；postgres：从 user_store_pg re-export；
-    dual（expand 形态）：写 json + best-effort 写 pg、读 json。
+    dual：user 侧已删除，降级安装 json 后端（share 侧 dual 保留）。
     """
 
     def __setattr__(self, name, value):
@@ -239,7 +178,7 @@ class _UserStoreModule(_types.ModuleType):
     def __getattr__(self, name):
         if name in _JSON_PUBLIC_NAMES:
             raise RuntimeError(
-                "存储后端 %r 未正确接线公共名 %r（postgres/dual 已接入）"
+                "存储后端 %r 未正确接线公共名 %r"
                 % (STORAGE_BACKEND, name)
             )
         raise AttributeError(

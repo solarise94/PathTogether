@@ -132,7 +132,7 @@ def test_reset_success_stdin(pg_uri, capsys, monkeypatch):
 
 
 def test_reset_login_id_case_and_trim_insensitive(pg_uri, capsys, monkeypatch):
-    """--login-id 做两侧 trim + 大小写不敏感匹配（lower(email)=lower(trim(?))）。"""
+    """--login-id 做两侧 trim + 大小写不敏感匹配（lower(login_id)=lower(trim(?))）。"""
     _bootstrap_owner("Browser_Admin")
     rc = _run_stdin(monkeypatch, [
         "reset-owner-password", "--login-id", "  browser_admin  ",
@@ -237,7 +237,7 @@ def test_multiple_owner_rows_refused(pg_uri, capsys, tmp_path):
     try:
         with c.cursor() as cur:
             cur.execute(
-                "INSERT INTO users (user_id, email, display_name, "
+                "INSERT INTO users (user_id, login_id, display_name, "
                 "password_hash, role, created_at, disabled) "
                 "VALUES ('usr_o2','o2@x.com','','x','owner',"
                 "to_timestamp(1),TRUE)")

@@ -13,7 +13,7 @@
 - 连接：只读 ``DATABASE_URL`` 环境变量，经 ``pg_store.connect()`` 直连
   PostgreSQL；未设置或连接失败 → stderr 报错 + 非 0 退出。**不依赖
   STORAGE_BACKEND**（主机侧工具等价于直接改库，数据库本身就是唯一事实源）；
-- 目标定位：``lower(email) = lower(trim(--login-id))`` 且 ``role='owner'``；
+- 目标定位：``lower(login_id) = lower(trim(--login-id))`` 且 ``role='owner'``；
   且库内 ``role='owner'`` 行总数必须**恰好为 1**（0 个或多个都拒绝，绝不选
   「第一条」）；
 - 目标为被禁用的唯一 owner 时必须显式 ``--enable``：同一事务内解除禁用 +
@@ -53,7 +53,7 @@ AUDIT_ACTION = "user.password_break_glass_reset"
 #: 0 个 owner 行时的逃生路径说明（docs §7.3：不得静默建号）
 _NO_OWNER_ESCAPE_HINT = (
     "逃生路径（人工操作，CLI 不会代为执行）：\n"
-    "  1. 人工审计后用 SQL 直接恢复 owner 行（基于备份的 user_id/email/"
+    "  1. 人工审计后用 SQL 直接恢复 owner 行（基于备份的 user_id/login_id/"
     "password_hash，恢复后先用本人改密或再次 break-glass 换掉恢复的 hash）；或\n"
     "  2. 确认并清空整个 users 表后，走 bootstrap secret（空库首建，"
     "BOOTSTRAP_OWNER_LOGIN_ID + BOOTSTRAP_OWNER_PASSWORD_FILE）重新引导。\n"
@@ -160,8 +160,8 @@ def _cmd_reset_owner_password(args):
                     return 1
 
                 cur.execute(
-                    "SELECT user_id, email, disabled FROM users "
-                    "WHERE lower(email) = lower(trim(%s)) AND role='owner'",
+                    "SELECT user_id, login_id, disabled FROM users "
+                    "WHERE lower(login_id) = lower(trim(%s)) AND role='owner'",
                     (args.login_id,),
                 )
                 target = cur.fetchone()
@@ -192,7 +192,7 @@ def _cmd_reset_owner_password(args):
                         "UPDATE users SET password_hash=%s, disabled=FALSE, "
                         "auth_version = auth_version + 1 "
                         "WHERE user_id=%s "
-                        "RETURNING user_id, email, disabled, auth_version",
+                        "RETURNING user_id, login_id, disabled, auth_version",
                         (generate_password_hash(password), target["user_id"]),
                     )
                 else:
@@ -200,7 +200,7 @@ def _cmd_reset_owner_password(args):
                         "UPDATE users SET password_hash=%s, "
                         "auth_version = auth_version + 1 "
                         "WHERE user_id=%s "
-                        "RETURNING user_id, email, disabled, auth_version",
+                        "RETURNING user_id, login_id, disabled, auth_version",
                         (generate_password_hash(password), target["user_id"]),
                     )
                 row = cur.fetchone()
@@ -220,7 +220,7 @@ def _cmd_reset_owner_password(args):
         # 事务提交成功后才输出（任何拒绝路径都在事务内 return，触发 rollback）
         print("OK：owner 密码已重置（break-glass）")
         print("user_id:  %s" % row["user_id"])
-        print("login_id: %s" % row["email"])
+        print("login_id: %s" % row["login_id"])
         if reenable:
             print("已同时解除禁用（disabled=false，reenabled=true）")
         print("旧 session 已失效：该账号全部已登录会话即刻作废，需用新密码重新登录。")

@@ -119,6 +119,8 @@ def fixture_dir(tmp_path):
              "permissions": ["view"], "claimed_at": now, "revoked_at": None},
         ],
     }
+    # users.json 刻意保持旧格式（email 键）：批次 C 迁移工具读侧兼容旧格式
+    # json（_login_id_of），此 fixture 即兼容路径的回归样本。
     users = {
         "users": {
             owner_uid: {"user_id": owner_uid, "email": "owner@x.co",
@@ -336,7 +338,7 @@ def test_migration_0015_auth_version_default_and_check(pg_uri):
     try:
         with c.cursor() as cur:
             cur.execute(
-                "INSERT INTO users (user_id, email, display_name, "
+                "INSERT INTO users (user_id, login_id, display_name, "
                 "password_hash, role, created_at, disabled) "
                 "VALUES ('usr_m15a','m15a@x.com','','x','user',"
                 "to_timestamp(1),FALSE) RETURNING auth_version")
@@ -366,13 +368,13 @@ def test_migration_0015_single_enabled_owner_index(pg_uri):
     """部分唯一索引：第二个 enabled owner 被拦；disabled owner 不受限。"""
     c = psycopg.connect(pg_uri)
 
-    def _ins_owner(uid, email, disabled):
+    def _ins_owner(uid, login_id, disabled):
         with c.cursor() as cur:
             cur.execute(
-                "INSERT INTO users (user_id, email, display_name, "
+                "INSERT INTO users (user_id, login_id, display_name, "
                 "password_hash, role, created_at, disabled) "
                 "VALUES (%s,%s,'','x','owner',to_timestamp(1),%s)",
-                (uid, email, disabled))
+                (uid, login_id, disabled))
         c.commit()
 
     try:

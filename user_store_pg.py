@@ -7,8 +7,8 @@ app.py / share_server.py / tests 一行不改。
 
 与 JSON 实现的差异（允许的实现差，在 docstring 声明）：
   - 数据落 PostgreSQL `users` 表，不再是 users.json 文件；
-  - email 大小写不敏感唯一由 `lower(email)` 唯一索引保证（等价 json 写入侧小写
-    规范化 + 冲突即 ValueError）；
+  - login_id 大小写不敏感唯一由 `lower(login_id)` 唯一索引保证（等价 json
+    写入侧小写规范化 + 冲突即 ValueError）；
   - `created_at` 在库里是 TIMESTAMPTZ，读出统一转 epoch 浮点，保持与 json 版本
     dict 形状（浮点时间戳）完全一致；
   - 密码一律 werkzeug pbkdf2 哈希落库（与 json 一致，绝不存明文）；
@@ -23,13 +23,18 @@ app.py / share_server.py / tests 一行不改。
   - 密码统一 15..200 策略（PASSWORD_MIN_LENGTH / PASSWORD_MAX_LENGTH），
     无旁路参数。
 
-账户系统批次 B（docs §4.1/§6.1，登录标识收口）：
-  - 返回用户 dict 的读/写路径统一同时携带 "email"（deprecated，批次 C 移除）
-    与 "login_id"（规范名，同值）两键；物理列仍为 users.email（批次 C 才改名），
-    不在 SQL 里加列别名；
-  - verify_user 只认规范化 login_id（trim + lower 后按 lower(email) 唯一索引
-    查），删除 display_name 登录 fallback（展示属性不得用作身份属性）；
-  - get_user_by_display_name 已删除（全仓无认证路径之外的调用方）。
+账户系统批次 B（docs §6.1）：verify_user 只认规范化 login_id，删除
+display_name 登录 fallback；get_user_by_display_name 删除。
+
+账户系统批次 C（docs §4.2 物理收口）：
+  - 物理列由 users.email 改名为 users.login_id（0016），函数唯一索引
+    users_login_id_ci_key（lower(login_id)）；
+  - 删除批次 B 兼容窗口 `_with_login_id`：返回用户 dict 只带 "login_id" 键，
+    不再有 "email" 键；
+  - get_user_by_email → get_user_by_login_id（公共 API 改名）；
+  - 删除 user 侧 dual 镜像原语 _mirror_user 与启动修复
+    repair_empty_password_hashes_from_json（修复迁至
+    scripts/repair_pg_user_password_hashes.py，docs §9.2/§9.3）。
 
 无文件锁 / SHARE_DATA_DIR 语义：PG 是唯一事实源。SHARE_DATA_DIR / USER_FILE 仍
 暴露为 None 占位，仅供 dispatcher 公共名校验（hasattr）与形状兼容。
@@ -127,34 +132,21 @@ def _user_id() -> str:
     return "usr_" + secrets.token_urlsafe(8)
 
 
-def _normalize_email(email: str) -> str:
+def _normalize_login_id(login_id: str) -> str:
     """登录账号（login_id）规范化：小写 + 去首尾空白（与 json 一致）。
 
-    物理列名为 email（批次 C 改名）；规范化即 login_id 的唯一键规范化。
+    物理列 0016 起为 users.login_id；规范化即 login_id 的唯一键规范化。
     """
-    return str(email or "").strip().lower()
-
-
-def _with_login_id(user):
-    """批次 B 兼容窗口（docs §4.1）：返回同时携带 login_id 与 email 的副本。
-
-    物理列仍为 users.email（批次 C 才物理改名）；返回 dict 中 "login_id" 为
-    规范登录标识，"email" 同值但 **deprecated**（批次 C 移除）。含 hash 与
-    不含 hash 的出口统一经本函数（或其包装 _public）补键。None 透传。
-    """
-    if user is None:
-        return None
-    out = dict(user)
-    out["login_id"] = out.get("email")
-    return out
+    return str(login_id or "").strip().lower()
 
 
 def _public(user: dict) -> dict:
     """导出副本（不含 password_hash），与 json `_to_public` 对齐。
 
-    批次 B 起统一经 _with_login_id 补 login_id 别名键（docs §4.1）。
+    批次 C 起返回 dict 只带 "login_id"（SQL 列名即 login_id），不再补
+    "email" 兼容键（docs §4.2 物理收口）。
     """
-    out = _with_login_id(user)
+    out = dict(user)
     out.pop("password_hash", None)
     return out
 
@@ -175,23 +167,23 @@ def _user_ai_config(user: dict) -> dict:
 # §3.7 新增列：受邀用户默认 FALSE，存量默认 TRUE，见 0012 迁移；auth_version 为
 # 0015 新增的 session 凭据版本列，读路径一律带出供 session 比对）。
 _SEL_HASH = (
-    "user_id, email, display_name, password_hash, role, "
+    "user_id, login_id, display_name, password_hash, role, "
     "extract(epoch from created_at)::float8 AS created_at, disabled, ai_config, "
     "ai_access, auth_version"
 )
 _SEL_PUBLIC = (
-    "user_id, email, display_name, role, "
+    "user_id, login_id, display_name, role, "
     "extract(epoch from created_at)::float8 AS created_at, disabled, ai_config, "
     "ai_access, auth_version"
 )
 
 
-def create_user(email, password, role=ROLE_USER, display_name=None):
+def create_user(login_id, password, role=ROLE_USER, display_name=None):
     """创建用户。返回新用户 dict（不含 hash）；登录账号冲突抛 ValueError。
 
-    参数名 ``email`` 本批次保持不变（批次 C 收口为 login_id），语义为**登录账号**
-    （login_id，docs §3.1）：可为用户名或邮箱形式，写入前 trim + lower 规范化。
-    返回 dict 同时携带 "login_id" 与 "email"（deprecated，同值，docs §4.1）。
+    参数 ``login_id`` 为**登录账号**（docs §3.1）：可为用户名或邮箱形式，
+    写入前 trim + lower 规范化。返回 dict 只带 "login_id" 键（批次 C 起不再
+    携带 deprecated 的 "email" 别名，docs §4.2）。
 
     密码统一执行 15..200 策略（无旁路参数；批次 A docs §3.3）。
     在 PG 上创建第二个 enabled owner 会被 users_single_enabled_owner_key
@@ -199,11 +191,11 @@ def create_user(email, password, role=ROLE_USER, display_name=None):
     """
     if role not in VALID_ROLES:
         raise ValueError("非法角色")
-    norm_email = _normalize_email(email)
-    if not norm_email:
+    norm_login = _normalize_login_id(login_id)
+    if not norm_login:
         raise ValueError("登录账号不能为空")
     _validate_password(password)
-    name = str(display_name or "").strip() or norm_email
+    name = str(display_name or "").strip() or norm_login
     uid = _user_id()
     now = time.time()
 
@@ -214,15 +206,15 @@ def create_user(email, password, role=ROLE_USER, display_name=None):
                 with c.cursor() as cur:
                     sql = (
                         "INSERT INTO users "
-                        "(user_id, email, display_name, password_hash, role, "
-                        " created_at, disabled) "
+                        "(user_id, login_id, display_name, password_hash, "
+                        " role, created_at, disabled) "
                         "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), FALSE) "
                         "RETURNING " + _SEL_PUBLIC
                     )
                     cur.execute(
                         sql,
-                        (uid, norm_email, name, generate_password_hash(password),
-                         role, now),
+                        (uid, norm_login, name,
+                         generate_password_hash(password), role, now),
                     )
                     row = cur.fetchone()
         except psycopg.errors.UniqueViolation as exc:
@@ -245,7 +237,7 @@ def _unique_violation_message(exc):
 def get_user(user_id):
     """按 user_id 取用户 dict（含 hash）；不存在返回 None。
 
-    批次 B 起 dict 同时携带 "login_id" 与 "email"（deprecated，同值）。
+    批次 C 起返回 dict 只带 "login_id" 键（docs §4.2 物理收口）。
     """
     conn = _connect()
     try:
@@ -256,19 +248,19 @@ def get_user(user_id):
                     (user_id,),
                 )
                 row = cur.fetchone()
-        return _with_login_id(row) if row else None
+        return dict(row) if row else None
     finally:
         conn.close()
 
 
-def get_user_by_email(email):
-    """按登录账号（login_id，物理列 email；trim+lower 规范化）取用户 dict
+def get_user_by_login_id(login_id):
+    """按登录账号（login_id，物理列 login_id；trim+lower 规范化）取用户 dict
     （含 hash）；不存在返回 None。
 
-    认证路径唯一入口（docs §6.1，批次 B）：按 lower(email) 唯一索引查。
-    返回 dict 同时携带 "login_id" 与 "email"（deprecated，同值）。
+    认证路径唯一入口（docs §6.1）：按 lower(login_id) 唯一索引查
+    （原批次 B 名 get_user_by_email，批次 C 随物理列改名）。
     """
-    key = _normalize_email(email)
+    key = _normalize_login_id(login_id)
     if not key:
         return None
     conn = _connect()
@@ -276,11 +268,12 @@ def get_user_by_email(email):
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT " + _SEL_HASH + " FROM users WHERE lower(email)=lower(%s)",
+                    "SELECT " + _SEL_HASH +
+                    " FROM users WHERE lower(login_id)=lower(%s)",
                     (key,),
                 )
                 row = cur.fetchone()
-        return _with_login_id(row) if row else None
+        return dict(row) if row else None
     finally:
         conn.close()
 
@@ -288,17 +281,16 @@ def get_user_by_email(email):
 def verify_user(login_id, password):
     """校验登录：只认规范化 login_id，按唯一索引查用户并核对密码（docs §6.1）。
 
-    流程：normalize(trim + lower) → 按 lower(email) 唯一索引查 → disabled
-    检查 → check_password_hash。display_name 不再参与登录解析（批次 B 删除
+    流程：normalize(trim + lower) → 按 lower(login_id) 唯一索引查 → disabled
+    检查 → check_password_hash。display_name 不参与登录解析（批次 B 删除
     fallback：展示属性可重复，不得用作身份属性）。
 
-    返回用户 dict（含 hash，携带 login_id/email 双键）；查无此人 / 被禁用 /
-    密码错误一律返回 None——调用方统一「账号或密码错误」文案，不泄露账号
-    存在性。
+    返回用户 dict（含 hash）；查无此人 / 被禁用 / 密码错误一律返回 None——
+    调用方统一「账号或密码错误」文案，不泄露账号存在性。
     """
     if not isinstance(password, str) or not password:
         return None
-    user = get_user_by_email(login_id)
+    user = get_user_by_login_id(login_id)
     if user is None:
         return None
     if user.get("disabled"):
@@ -480,7 +472,6 @@ def list_enabled_owners():
 
     按 created_at, user_id 升序；每项含 password_hash 与 auth_version
     （owner 解析需要校验 hash 非空，属内部 API，不经公共用户输出）。
-    批次 B 起每项同时携带 "login_id" 与 "email"（deprecated，同值）。
     """
     conn = _connect()
     try:
@@ -492,7 +483,7 @@ def list_enabled_owners():
                     "ORDER BY extract(epoch from created_at) ASC, user_id"
                 )
                 rows = cur.fetchall()
-        return [_with_login_id(r) for r in rows]
+        return [dict(r) for r in rows]
     finally:
         conn.close()
 
@@ -509,14 +500,13 @@ def list_owners():
                     "ORDER BY extract(epoch from created_at) ASC, user_id"
                 )
                 rows = cur.fetchall()
-        return [_with_login_id(r) for r in rows]
+        return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
 def create_bootstrap_owner(login_id, password):
-    """空库首建 owner（仅引导用）。返回新 owner dict（含 hash 与 auth_version，
-    批次 B 起同时携带 login_id/email 双键）。
+    """空库首建 owner（仅引导用）。返回新 owner dict（含 hash 与 auth_version）。
 
     语义（docs §5.2/§5.3）：
       - 仅当 users 表**完全为空**时创建；任何已存在行 → OwnerInvariantError
@@ -524,11 +514,11 @@ def create_bootstrap_owner(login_id, password):
       - 事务内先取专用 advisory lock（_BOOTSTRAP_OWNER_LOCK）串行化 gunicorn
         多 worker 并发首启，锁内复查空表再插入；0015 部分唯一索引作数据库层
         兜底（正常路径不会走到）；
-      - email 列写规范化 login_id（trim + lower），display_name 同值，
+      - login_id 列写规范化值（trim + lower），display_name 同值，
         role='owner'；密码统一执行 15..200 策略；
       - 不对已有 owner 做任何对账/改密（那是已删除的 ensure_owner 语义）。
     """
-    norm_login = _normalize_email(login_id)
+    norm_login = _normalize_login_id(login_id)
     if not norm_login:
         raise ValueError("登录账号不能为空")
     _validate_password(password)
@@ -555,8 +545,8 @@ def create_bootstrap_owner(login_id, password):
                         )
                     cur.execute(
                         "INSERT INTO users "
-                        "(user_id, email, display_name, password_hash, role, "
-                        " created_at, disabled) "
+                        "(user_id, login_id, display_name, password_hash, "
+                        " role, created_at, disabled) "
                         "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), FALSE) "
                         "RETURNING " + _SEL_HASH,
                         (uid, norm_login, norm_login,
@@ -569,7 +559,7 @@ def create_bootstrap_owner(login_id, password):
                 "multiple_enabled_owners：并发创建 owner 被单 enabled owner "
                 "索引（users_single_enabled_owner_key）拒绝"
             ) from exc
-        return _with_login_id(row)
+        return dict(row)
     finally:
         conn.close()
 
@@ -608,96 +598,9 @@ def has_enabled_users():
 
 
 # --------------------------------------------------------------------------- #
-# dual 后端 result-replay 镜像（Stage 3b-2）
-#
-# json 为权威、pg 为影子副本。create_user/create_bootstrap_owner 在 json 侧内部
-# 生成 user_id，同参调 pg 会让 pg 生成不同 user_id → 两库发散。这里提供
-# _mirror_user：接收 json 返回的权威用户 dict，按其中 user_id 原样 upsert 进
-# pg（身份逐项一致）。
-# 走 force_user_id 方案而非直接给 pg create_user 重放，是因为 email 冲突/密码
-# 长度校验在 json 侧已完成，pg 只需按权威结果落影子行。
+# user 侧 dual 后端镜像原语（_mirror_user）与启动修复
+# repair_empty_password_hashes_from_json 已随账户系统批次 C 删除
+# （docs §9.2/§9.3）：user_store dispatcher 不再安装 dual；历史空 hash
+# 修复迁至 scripts/repair_pg_user_password_hashes.py（默认 dry-run 的
+# 主机侧一次性命令）。share 侧 dual 机制不受影响（share_store.py）。
 # --------------------------------------------------------------------------- #
-def _mirror_user(ret, *a, **k):
-    """把 json create_user/create_bootstrap_owner 返回的权威用户 dict upsert 进 pg。
-
-    json 公开返回值经 `_to_public` 去掉 password_hash，不能直接拿来写 pg。
-    这里按 user_id 再读 json 权威记录（含 hash），保证 dual→postgres 切换后仍能登录。
-    已存在的影子行也 upsert（含把旧 bug 写入的空 password_hash 回填为 json 权威
-    hash）。ai_config 原样保留（api_key 已是 app.py 加密形态）；created_at 转浮点
-    写回；auth_version（0015 起）一并镜像，保证 dual 双侧 session 版本语义一致
-    （docs §9.1）。
-    """
-    u = ret if isinstance(ret, dict) else None
-    if not u or not u.get("user_id"):
-        return
-    uid = u["user_id"]
-    # 公开返回值不含 hash；json 权威行才有。
-    import user_store_json as _json
-    authoritative = _json.get_user(uid)
-    if authoritative:
-        u = authoritative
-    conn = _connect()
-    try:
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO users "
-                    "(user_id, email, display_name, password_hash, role, "
-                    " created_at, disabled, ai_config, auth_version) "
-                    "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), %s, %s, %s) "
-                    "ON CONFLICT (user_id) DO UPDATE SET "
-                    " email=EXCLUDED.email, display_name=EXCLUDED.display_name, "
-                    " password_hash=CASE WHEN EXCLUDED.password_hash <> '' "
-                    "  THEN EXCLUDED.password_hash ELSE users.password_hash END, "
-                    " role=EXCLUDED.role, created_at=EXCLUDED.created_at, "
-                    " disabled=EXCLUDED.disabled, ai_config=EXCLUDED.ai_config, "
-                    " auth_version=EXCLUDED.auth_version",
-                    (uid, u.get("email"), u.get("display_name", ""),
-                     u.get("password_hash") or "",
-                     u.get("role", ROLE_USER), u.get("created_at"),
-                     bool(u.get("disabled", False)),
-                     psycopg.types.json.Jsonb(u.get("ai_config") or {}),
-                     int(u.get("auth_version") or 1)),
-                )
-    finally:
-        conn.close()
-
-
-def repair_empty_password_hashes_from_json():
-    """把 json 权威 password_hash 回填到 pg 中空 hash 的影子行。
-
-    旧 dual `_mirror_user` 曾把 create_user 的公开返回值（无 hash）写成空字符串；
-    那些用户启动时未必再走 create_user/ensure_owner，所以需要一次批量回填。
-    json 文件不存在或无法读取时返回 0（postgres 单后端、测试隔离目录皆安全）。
-    """
-    import user_store_json as _json
-    path = getattr(_json, "USER_FILE", None)
-    if path is None:
-        return 0
-    try:
-        if not path.exists():
-            return 0
-    except OSError:
-        return 0
-    repaired = 0
-    conn = _connect()
-    try:
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
-                for pub in _json.list_users():
-                    uid = pub.get("user_id") if isinstance(pub, dict) else None
-                    if not uid:
-                        continue
-                    full = _json.get_user(uid)
-                    h = (full or {}).get("password_hash") or ""
-                    if not h:
-                        continue
-                    cur.execute(
-                        "UPDATE users SET password_hash=%s "
-                        "WHERE user_id=%s AND (password_hash IS NULL OR password_hash='')",
-                        (h, uid),
-                    )
-                    repaired += cur.rowcount or 0
-    finally:
-        conn.close()
-    return repaired

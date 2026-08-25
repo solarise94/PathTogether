@@ -180,11 +180,11 @@ def test_register_503_when_limit_store_unavailable(monkeypatch):
     monkeypatch.setattr(auth_limit_store, "check_registration_locked", boom)
     client = _client()
     r = client.post("/register", data={
-        "invite_token": "whatever", "email": "n@x.com",
+        "invite_token": "whatever", "login_id": "n@x.com",
         "password": "longpassword123", "password_confirm": "longpassword123"})
     assert r.status_code == 503
     assert r.get_json()["code"] == "registration_unavailable"
-    assert user_store.get_user_by_email("n@x.com") is None
+    assert user_store.get_user_by_login_id("n@x.com") is None
 
 
 def test_register_ip_short_window_429(monkeypatch):
@@ -194,14 +194,14 @@ def test_register_ip_short_window_429(monkeypatch):
     client = _client()
     limit = auth_limit_store.REG_IP_SHORT_FAILURE_LIMIT
     for i in range(limit):
-        data = {"invite_token": "no-such-token-%d" % i, "email": "n@x.com",
+        data = {"invite_token": "no-such-token-%d" % i, "login_id": "n@x.com",
                 "password": "longpassword123",
                 "password_confirm": "longpassword123"}
         r = client.post("/register", data=data)
         assert r.status_code == 403, r.status_code
         assert "邀请码无效或当前不可用" in r.get_data(as_text=True)
     r11 = client.post("/register", data={
-        "invite_token": "no-such-token-final", "email": "n@x.com",
+        "invite_token": "no-such-token-final", "login_id": "n@x.com",
         "password": "longpassword123", "password_confirm": "longpassword123"})
     assert r11.status_code == 429
     assert int(r11.headers.get("Retry-After") or 0) > 0
@@ -218,13 +218,13 @@ def test_register_invite_hash_lockout_429(monkeypatch):
     limit = auth_limit_store.REG_INVITE_FAILURE_LIMIT
     for i in range(limit):
         r = client.post("/register", data={
-            "invite_token": tok, "email": "n@x.com",
+            "invite_token": tok, "login_id": "n@x.com",
             "password": "longpassword123", "password_confirm": "longpassword123"},
             environ_overrides={"REMOTE_ADDR": "192.0.2.%d" % (i + 1)})
         assert r.status_code == 403, r.status_code
     # 第 6 次（再换 IP）：invite 桶已锁
     r = client.post("/register", data={
-        "invite_token": tok, "email": "n@x.com",
+        "invite_token": tok, "login_id": "n@x.com",
         "password": "longpassword123", "password_confirm": "longpassword123"},
         environ_overrides={"REMOTE_ADDR": "198.51.100.9"})
     assert r.status_code == 429
@@ -242,7 +242,7 @@ def test_register_daily_attempt_429(monkeypatch):
     # 第 30 次尝试（POST /register）触发锁定 → 本次响应 429
     client = _client()
     r = client.post("/register", data={
-        "invite_token": "x", "email": "n@x.com",
+        "invite_token": "x", "login_id": "n@x.com",
         "password": "longpassword123", "password_confirm": "longpassword123"})
     assert r.status_code == 429
 

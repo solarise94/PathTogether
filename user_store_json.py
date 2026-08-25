@@ -24,12 +24,17 @@ ROLE_SDK 常量，不入表。资源级鉴权矩阵是下一个节点的事。
   - 密码统一 15..200 策略（PASSWORD_MIN_LENGTH / PASSWORD_MAX_LENGTH），
     无旁路参数。json 后端仅服务本地免认证开发与隔离单元测试。
 
-账户系统批次 B（docs §4.1/§6.1，登录标识收口）：
-  - 返回用户 dict 的读/写路径统一同时携带 "email"（deprecated，批次 C 移除）
-    与 "login_id"（规范名，同值）两键；login_id 只是对外别名，**不落盘**
-    （users.json 物理键仍为 email，批次 C 才收口）；
-  - verify_user 只认规范化 login_id，删除 display_name 登录 fallback；
-  - get_user_by_display_name 已删除（全仓无认证路径之外的调用方）。
+账户系统批次 B（docs §6.1，登录标识收口）：verify_user 只认规范化
+login_id，删除 display_name 登录 fallback；get_user_by_display_name 删除。
+
+账户系统批次 C（docs §4.2 物理收口）：
+  - users.json 物理记录键 ``email`` → ``login_id``；写路径只写 ``login_id``
+    （不双写），写旧格式记录时顺带完成键收口（写入后该记录只含 login_id）；
+  - 读侧一次性兼容旧格式文件：记录只有 ``email`` 键时读为 login_id（口径同
+    ``_auth_version`` 的缺省规范化；不写回旧键、不触发迁移写盘）；
+  - 返回用户 dict 只带 "login_id" 键，删除批次 B 的 "email" deprecated 别名；
+  - get_user_by_email → get_user_by_login_id（公共 API 改名）。
+json 后端仅服务本地免认证开发与隔离单元测试，不是可登录生产形态。
 """
 
 import json
@@ -118,12 +123,13 @@ def _user_id() -> str:
     return "usr_" + secrets.token_urlsafe(8)
 
 
-def _normalize_email(email: str) -> str:
+def _normalize_login_id(login_id: str) -> str:
     """登录账号（login_id）规范化：小写 + 去首尾空白。
 
-    json 物理键仍为 email（批次 C 改名）；规范化即 login_id 的唯一键规范化。
+    users.json 物理键 0016 批次 C 起为 login_id；规范化即 login_id 的唯一键
+    规范化。
     """
-    return str(email or "").strip().lower()
+    return str(login_id or "").strip().lower()
 
 
 def _load_locked(f):
@@ -184,26 +190,34 @@ def _with_lock(mode, fn):
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
-def _with_login_id(user):
-    """批次 B 兼容窗口（docs §4.1）：返回同时携带 login_id 与 email 的副本。
+def _login_id_of(user) -> str:
+    """读侧旧格式兼容（docs §9，一次性）：记录只有 ``email`` 键时读为
+    login_id（口径同 _auth_version 缺省规范化；不写回、不双写）。"""
+    if not isinstance(user, dict):
+        return ""
+    v = user.get("login_id")
+    if v is None and "email" in user:
+        v = user.get("email")
+    return str(v or "")
 
-    json 物理键仍为 email（批次 C 才收口）；"login_id" 为规范登录标识、
-    "email" 同值但 **deprecated**（批次 C 移除）。login_id 只存在于返回副本，
-    **不落盘**（users.json 记录保持原键集合）。None 透传。
+
+def _migrate_record_key(user: dict) -> dict:
+    """写路径键收口：被写记录的旧 ``email`` 键就地改为 ``login_id``
+    （批次 C 物理改名；写入后该记录只含 login_id 键，不双写）。
+
+    仅作用于本次写路径修改的目标记录；其余未触碰记录保持原样（读侧
+    _login_id_of 兼容），避免读路径触发全量迁移写盘。
     """
-    if user is None:
-        return None
-    out = dict(user)
-    out["login_id"] = out.get("email")
-    return out
+    if "login_id" not in user and "email" in user:
+        user["login_id"] = user.pop("email")
+    else:
+        user.pop("email", None)
+    return user
 
 
 def _to_public(user: dict) -> dict:
-    """导出副本（不含 password_hash）。
-
-    批次 B 起统一经 _with_login_id 补 login_id 别名键（docs §4.1）。
-    """
-    out = _with_login_id(user)
+    """导出副本（不含 password_hash；login_id 规范化出口，无 email 键）。"""
+    out = _with_auth_version(user)
     out.pop("password_hash", None)
     return out
 
@@ -219,13 +233,18 @@ def _auth_version(user: dict) -> int:
 
 
 def _with_auth_version(user):
-    """返回带 int auth_version 的副本；None 透传（读路径统一出口）。
+    """返回带 int auth_version 与规范化 login_id 的副本；None 透传
+    （读路径统一出口）。
 
-    批次 B 起同时补 login_id 别名键（docs §4.1；login_id 不落盘）。
+    批次 C 起出口 dict 只带 "login_id" 键：旧格式记录的 ``email`` 键读为
+    login_id 后不再出现在返回 dict 中（docs §4.2 物理收口）。
     """
     if user is None:
         return None
-    out = _with_login_id(user)
+    out = dict(user)
+    out.pop("email", None)
+    if "login_id" not in out:
+        out["login_id"] = _login_id_of(user)
     out["auth_version"] = _auth_version(user)
     return out
 
@@ -233,33 +252,32 @@ def _with_auth_version(user):
 # --------------------------------------------------------------------------- #
 # 公共 API
 # --------------------------------------------------------------------------- #
-def create_user(email, password, role=ROLE_USER, display_name=None):
+def create_user(login_id, password, role=ROLE_USER, display_name=None):
     """创建用户。返回新用户 dict（不含 hash）；登录账号冲突抛 ValueError。
 
-    参数名 ``email`` 本批次保持不变（批次 C 收口为 login_id），语义为**登录账号**
-    （login_id，docs §3.1）：trim + lower 规范化后作为唯一键（物理 json 键仍为
-    email，批次 C 改名）。display_name 缺省用登录账号值。返回 dict 同时携带
-    "login_id" 与 "email"（deprecated，同值，docs §4.1；login_id 不落盘）。
-    密码经 werkzeug generate_password_hash 哈希后存储，统一执行 15..200
-    策略（批次 A docs §3.3，无旁路参数）。新用户 auth_version=1。
+    参数 ``login_id`` 为**登录账号**（docs §3.1）：trim + lower 规范化后作为
+    唯一键。display_name 缺省用登录账号值。返回 dict 只带 "login_id" 键
+    （批次 C 起不再携带 deprecated 的 "email" 别名，docs §4.2）。密码经
+    werkzeug generate_password_hash 哈希后存储，统一执行 15..200 策略
+    （批次 A docs §3.3，无旁路参数）。新用户 auth_version=1。
     """
     if role not in VALID_ROLES:
         raise ValueError("非法角色")
-    norm_email = _normalize_email(email)
-    if not norm_email:
+    norm_login = _normalize_login_id(login_id)
+    if not norm_login:
         raise ValueError("登录账号不能为空")
     _validate_password(password)
-    name = str(display_name or "").strip() or norm_email
+    name = str(display_name or "").strip() or norm_login
     now = time.time()
     uid = _user_id()
 
     def _do(f):
         data = _load_locked(f)
-        if norm_email in data["users"]:
+        if any(_login_id_of(u) == norm_login for u in data["users"].values()):
             raise ValueError("该登录账号已存在")
         user = {
             "user_id": uid,
-            "email": norm_email,
+            "login_id": norm_login,
             "display_name": name,
             "password_hash": generate_password_hash(password),
             "role": role,
@@ -277,8 +295,8 @@ def create_user(email, password, role=ROLE_USER, display_name=None):
 def get_user(user_id):
     """按 user_id 取用户 dict（含 hash 与 auth_version）；不存在返回 None。
 
-    旧 json 数据缺 auth_version 字段时读为 1（docs §9.1 过渡兼容）。
-    批次 B 起 dict 同时携带 "login_id" 与 "email"（deprecated，同值）。
+    旧 json 数据缺 auth_version 字段时读为 1（docs §9.1 过渡兼容）；
+    旧格式记录（只有 email 键）读为 login_id。返回 dict 只带 "login_id" 键。
     """
     def _do(f):
         data = _load_locked(f)
@@ -288,21 +306,21 @@ def get_user(user_id):
     return _with_lock("r+", _do)
 
 
-def get_user_by_email(email):
-    """按登录账号（login_id，物理 json 键 email；trim+lower 规范化）取用户
+def get_user_by_login_id(login_id):
+    """按登录账号（login_id，物理 json 键 login_id；trim+lower 规范化）取用户
     dict（含 hash 与 auth_version）；无则 None。
 
-    认证路径唯一入口（docs §6.1，批次 B）；返回 dict 同时携带
-    "login_id" 与 "email"（deprecated，同值）。
+    认证路径唯一入口（docs §6.1；原批次 B 名 get_user_by_email，批次 C 随
+    物理键改名）。旧格式记录只有 email 键时按 _login_id_of 兼容匹配。
     """
-    key = _normalize_email(email)
+    key = _normalize_login_id(login_id)
     if not key:
         return None
 
     def _do(f):
         data = _load_locked(f)
         for uid, u in data["users"].items():
-            if u.get("email") == key:
+            if _login_id_of(u) == key:
                 return _with_auth_version(u)
         return None
 
@@ -310,19 +328,18 @@ def get_user_by_email(email):
 
 
 def verify_user(login_id, password):
-    """校验登录：只认规范化 login_id，核对密码（docs §6.1，批次 B）。
+    """校验登录：只认规范化 login_id，核对密码（docs §6.1）。
 
-    流程：normalize(trim + lower) → 按规范化 email 唯一键查（等价 PG 侧
-    lower(email) 唯一索引）→ disabled 检查 → check_password_hash。
-    display_name 不再参与登录解析（展示属性可重复，不得用作身份属性）。
+    流程：normalize(trim + lower) → 按规范化 login_id 唯一键查（等价 PG 侧
+    lower(login_id) 唯一索引）→ disabled 检查 → check_password_hash。
+    display_name 不参与登录解析（展示属性可重复，不得用作身份属性）。
 
-    返回用户 dict（含 hash，携带 login_id/email 双键）；查无此人 / 被禁用 /
-    密码错误一律返回 None——调用方统一「账号或密码错误」文案，不泄露账号
-    存在性。
+    返回用户 dict（含 hash）；查无此人 / 被禁用 / 密码错误一律返回 None——
+    调用方统一「账号或密码错误」文案，不泄露账号存在性。
     """
     if not isinstance(password, str) or not password:
         return None
-    user = get_user_by_email(login_id)
+    user = get_user_by_login_id(login_id)
     if user is None:
         return None
     if user.get("disabled"):
@@ -360,6 +377,7 @@ def set_user_disabled(user_id, flag):
         user = data["users"].get(user_id)
         if user is None:
             return None
+        _migrate_record_key(user)
         user["disabled"] = flag
         user["auth_version"] = _auth_version(user) + 1
         _save_locked(f, data)
@@ -382,6 +400,7 @@ def set_user_password(user_id, new_password):
         user = data["users"].get(user_id)
         if user is None:
             return None
+        _migrate_record_key(user)
         user["password_hash"] = generate_password_hash(new_password)
         user["auth_version"] = _auth_version(user) + 1
         _save_locked(f, data)
@@ -458,6 +477,7 @@ def set_user_ai_config(user_id, cfg):
         user = data["users"].get(user_id)
         if user is None:
             return None
+        _migrate_record_key(user)
         merged = _user_ai_config(user)
         if isinstance(cfg, dict):
             for k in ("use_platform", "base_url", "model", "api_key"):
@@ -530,18 +550,17 @@ def list_owners():
 
 
 def create_bootstrap_owner(login_id, password):
-    """空库首建 owner（仅引导用）。返回新 owner dict（含 hash 与 auth_version，
-    批次 B 起同时携带 login_id/email 双键）。
+    """空库首建 owner（仅引导用）。返回新 owner dict（含 hash 与 auth_version）。
 
     语义与 user_store_pg 完全一致（docs §5.2/§5.3）：
       - 仅当 users 存储完全为空时创建；任何已存在行 → OwnerInvariantError
         （users_table_not_empty）；
       - fcntl 排他锁内复查空表再插入（进程间串行化，等价 pg 侧 advisory lock）；
-      - email 字段写规范化 login_id（trim + lower），display_name 同值，
+      - login_id 字段写规范化值（trim + lower），display_name 同值，
         role='owner'；密码统一执行 15..200 策略；
       - 不对已有 owner 做任何对账/改密（那是已删除的 ensure_owner 语义）。
     """
-    norm_login = _normalize_email(login_id)
+    norm_login = _normalize_login_id(login_id)
     if not norm_login:
         raise ValueError("登录账号不能为空")
     _validate_password(password)
@@ -559,7 +578,7 @@ def create_bootstrap_owner(login_id, password):
             )
         user = {
             "user_id": uid,
-            "email": norm_login,
+            "login_id": norm_login,
             "display_name": norm_login,
             "password_hash": generate_password_hash(password),
             "role": ROLE_OWNER,
@@ -569,7 +588,7 @@ def create_bootstrap_owner(login_id, password):
         }
         data["users"][uid] = user
         _save_locked(f, data)
-        return _with_login_id(user)
+        return _with_auth_version(user)
 
     return _with_lock("r+", _do)
 

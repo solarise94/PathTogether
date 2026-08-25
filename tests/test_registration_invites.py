@@ -134,7 +134,7 @@ def test_register_closed_mode_get_and_post():
     body = r.get_data(as_text=True)
     assert "当前采用邀请注册" in body
     assert "<form" not in body
-    r2 = client.post("/register", data={"email": "n@x.com",
+    r2 = client.post("/register", data={"login_id": "n@x.com",
                                         "password": "password1password1"})
     assert r2.status_code == 403
     assert "邀请注册" in (r2.get_json() or {}).get("error", "")
@@ -148,7 +148,7 @@ def test_register_public_mode_not_supported(monkeypatch):
     assert r.status_code == 503
     assert r.get_json()["code"] == "public_registration_not_supported"
     r2 = client.post("/register", data={"invite_token": "x",
-                                        "email": "n@x.com",
+                                        "login_id": "n@x.com",
                                         "password": "password1password1"})
     assert r2.status_code == 503
     assert r2.get_json()["code"] == "public_registration_not_supported"
@@ -178,7 +178,7 @@ def test_invite_only_degraded_without_preconditions(monkeypatch, caplog):
     assert r.status_code == 200
     assert "<form" not in r.get_data(as_text=True)  # 关闭态页
     r2 = client.post("/register", data={"invite_token": "x",
-                                        "email": "n@x.com",
+                                        "login_id": "n@x.com",
                                         "password": "password1password1"})
     assert r2.status_code == 403
     assert app_mod._effective_registration_mode() == "closed"
@@ -266,7 +266,7 @@ def test_register_post_csrf_missing_400(monkeypatch):
     app_mod.AUTH_ENABLED = True
     raw = _raw_client()
     raw.get("/register")
-    r = raw.post("/register", data={"invite_token": "x", "email": "n@x.com",
+    r = raw.post("/register", data={"invite_token": "x", "login_id": "n@x.com",
                                     "password": "password1password1"})
     assert r.status_code == 400
     assert r.get_json()["error"] == "csrf_required"
@@ -304,7 +304,7 @@ def _pg_conn():
 def test_create_invite_stores_only_hash():
     owner = _mk_owner()
     inv = registration_store.create_invite(owner["user_id"],
-                                           email="Alice@X.com")
+                                           login_id="Alice@X.com")
     assert inv["token"] and len(inv["token"]) >= 43  # token_urlsafe(32)
     assert inv["ai_access"] is False
     conn = _pg_conn()
@@ -318,14 +318,14 @@ def test_create_invite_stores_only_hash():
     assert row["token_hash"] == registration_store.invite_token_hash(
         inv["token"])
     assert inv["token"] not in row["token_hash"]
-    assert row["email_normalized"] == "alice@x.com"
+    assert row["login_id_normalized"] == "alice@x.com"
     assert row["max_uses"] == 1 and row["use_count"] == 0
 
 
 @pg_only
 def test_list_invites_never_returns_token_or_hash():
     owner = _mk_owner()
-    inv = registration_store.create_invite(owner["user_id"], email="a@x.com")
+    inv = registration_store.create_invite(owner["user_id"], login_id="a@x.com")
     items = registration_store.list_invites()
     assert len(items) == 1
     dumped = repr(items)
@@ -336,13 +336,13 @@ def test_list_invites_never_returns_token_or_hash():
 @pg_only
 def test_redeem_success_consumes_invite_and_creates_user():
     owner = _mk_owner()
-    inv = registration_store.create_invite(owner["user_id"], email="bob@x.com",
+    inv = registration_store.create_invite(owner["user_id"], login_id="bob@x.com",
                                            ai_access=True, cohort="t1")
     out = registration_store.redeem_invite(inv["token"], "bob@x.com",
                                            "longpassword123", "Bob")
     user = user_store.get_user(out["user"]["user_id"])
     assert user["role"] == "user"
-    assert user["email"] == "bob@x.com"
+    assert user["login_id"] == "bob@x.com"
     assert user["display_name"] == "Bob"
     assert user["ai_access"] is True
     assert user_store.verify_user("bob@x.com", "longpassword123") is not None
@@ -367,7 +367,7 @@ def test_redeem_failures_all_unified():
     msgs.add(str(e1.value))
     # 过期
     expired = registration_store.create_invite(owner["user_id"],
-                                               email="e@x.com", ttl_seconds=1)
+                                               login_id="e@x.com", ttl_seconds=1)
     time.sleep(1.1)
     with pytest.raises(registration_store.InviteRedeemError) as e2:
         registration_store.redeem_invite(expired["token"], "e@x.com",
@@ -375,7 +375,7 @@ def test_redeem_failures_all_unified():
     msgs.add(str(e2.value))
     # 撤销
     revoked = registration_store.create_invite(owner["user_id"],
-                                               email="r@x.com")
+                                               login_id="r@x.com")
     registration_store.revoke_invite(revoked["invite_id"], owner["user_id"])
     with pytest.raises(registration_store.InviteRedeemError) as e3:
         registration_store.redeem_invite(revoked["token"], "r@x.com",
@@ -398,14 +398,14 @@ def test_redeem_failures_all_unified():
 def test_redeem_email_normalization_and_mismatch():
     owner = _mk_owner()
     inv = registration_store.create_invite(owner["user_id"],
-                                           email="Carol@X.com")
+                                           login_id="Carol@X.com")
     # 大小写/空白规范化后匹配
     out = registration_store.redeem_invite(inv["token"], "  carol@x.COM ",
                                            "longpassword123")
-    assert out["email"] == "carol@x.com"
+    assert out["login_id"] == "carol@x.com"
     # 不匹配邮箱：统一失败（不泄露是绑定差异）
     inv2 = registration_store.create_invite(owner["user_id"],
-                                            email="dave@x.com")
+                                            login_id="dave@x.com")
     with pytest.raises(registration_store.InviteRedeemError) as ei:
         registration_store.redeem_invite(inv2["token"], "mallory@x.com",
                                          "longpassword123")
@@ -420,7 +420,7 @@ def test_redeem_email_conflict_leaves_invite_unconsumed():
     owner = _mk_owner()
     user_store.create_user("taken@x.com", "existingpass1234", role="user")
     inv = registration_store.create_invite(owner["user_id"],
-                                           email="taken@x.com")
+                                           login_id="taken@x.com")
     with pytest.raises(registration_store.InviteRedeemError) as ei:
         registration_store.redeem_invite(inv["token"], "taken@x.com",
                                          "longpassword123")
@@ -435,7 +435,7 @@ def test_concurrent_redeem_same_invite_single_winner():
     """§6.1：同一邀请码 20 路并发兑换仅一个成功，users/invite 状态一致。"""
     owner = _mk_owner()
     inv = registration_store.create_invite(owner["user_id"],
-                                           email="race@x.com")
+                                           login_id="race@x.com")
     n = 20
     barrier = threading.Barrier(n)
 
@@ -460,21 +460,21 @@ def test_concurrent_redeem_same_invite_single_winner():
     assert row["use_count"] == 1
     assert row["consumed_by_user_id"] == winner_uid
     # users 表只有一个该邮箱账号
-    u = user_store.get_user_by_email("race@x.com")
+    u = user_store.get_user_by_login_id("race@x.com")
     assert u["user_id"] == winner_uid
 
 
 @pg_only
 def test_token_never_in_audit_or_exceptions():
     owner = _mk_owner()
-    inv = registration_store.create_invite(owner["user_id"], email="aud@x.com")
+    inv = registration_store.create_invite(owner["user_id"], login_id="aud@x.com")
     # 失败兑换（不匹配邮箱）与成功兑换各来一次（另一个邀请）
     try:
         registration_store.redeem_invite(inv["token"], "wrong@x.com",
                                          "longpassword123")
     except registration_store.InviteRedeemError:
         pass
-    inv2 = registration_store.create_invite(owner["user_id"], email="aud2@x.com")
+    inv2 = registration_store.create_invite(owner["user_id"], login_id="aud2@x.com")
     registration_store.redeem_invite(inv2["token"], "aud2@x.com",
                                      "longpassword123")
     conn = _pg_conn()
@@ -510,7 +510,7 @@ def test_owner_invite_api_lifecycle(monkeypatch):
     _owner_session(client, owner)
     # 创建：token 仅出现一次 + no-store
     r = client.post("/api/admin/registration-invites",
-                    json={"email": "flow@x.com", "ai_access": False,
+                    json={"login_id": "flow@x.com", "ai_access": False,
                           "cohort": "c1", "note": "n1"})
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.headers.get("Cache-Control") == "no-store"
@@ -525,7 +525,7 @@ def test_owner_invite_api_lifecycle(monkeypatch):
     assert len(items) == 1
     it = items[0]
     assert "token" not in it and "token_hash" not in it
-    assert it["email_masked"] == "f***@x.com"
+    assert it["login_id_masked"] == "f***@x.com"
     assert it["status"] == "open"
     assert it["ai_access"] is False and it["cohort"] == "c1"
     # 撤销
@@ -560,25 +560,25 @@ def test_register_route_full_flow(monkeypatch):
                    json={"mode": "invite_only"})
     assert r.status_code == 200, r.get_data(as_text=True)
     inv = client.post("/api/admin/registration-invites",
-                      json={"email": "flow2@x.com"}).get_json()
+                      json={"login_id": "flow2@x.com"}).get_json()
     # 匿名 client 兑换
     anon = _client()
     anon.get("/register")
     with anon.session_transaction() as s:
         s["poison"] = "anon-session-data"  # 模拟匿名 session 残留
     r2 = anon.post("/register", data={
-        "invite_token": inv["token"], "email": "flow2@x.com",
+        "invite_token": inv["token"], "login_id": "flow2@x.com",
         "password": "longpassword123", "password_confirm": "longpassword123"})
     assert r2.status_code == 302
     assert r2.headers["Location"].endswith("/login")
     with anon.session_transaction() as s:
         assert s.get("poison") is None       # 匿名 session 已清理
         assert not s.get("auth_user")        # 不自动登录
-    assert user_store.get_user_by_email("flow2@x.com") is not None
+    assert user_store.get_user_by_login_id("flow2@x.com") is not None
     # 错误兑换：统一文案、邀请码不回显
     anon2 = _client()
     r3 = anon2.post("/register", data={
-        "invite_token": inv["token"], "email": "flow2@x.com",
+        "invite_token": inv["token"], "login_id": "flow2@x.com",
         "password": "longpassword123", "password_confirm": "longpassword123"})
     assert r3.status_code == 403
     body = r3.get_data(as_text=True)

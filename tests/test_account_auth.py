@@ -171,7 +171,8 @@ def test_startup_bootstrap_creates_owner_and_login():
         "ADMIN_PASSWORD": OWNER_PW,
     })
     check("首建返回 owner dict", isinstance(owner, dict) and owner.get("role") == "owner")
-    check("login_id 规范化（trim+lower）", owner.get("email") == "browser_admin")
+    check("login_id 规范化（trim+lower）",
+          owner.get("login_id") == "browser_admin")
     check("新 owner auth_version=1", owner.get("auth_version") == 1)
     check("库中恰一个 enabled owner", len(user_store.list_enabled_owners()) == 1)
     check("可用该密码登录", user_store.verify_user("browser_admin", OWNER_PW) is not None)
@@ -188,7 +189,7 @@ def test_startup_bootstrap_legacy_alias():
         "ADMIN_PASSWORD": OWNER_PW,
     })
     check("兼容别名空库可引导", owner2 is not None
-          and owner2.get("email") == "legacy_admin")
+          and owner2.get("login_id") == "legacy_admin")
     check("兼容别名引导后可登录",
           user_store.verify_user("legacy_admin", OWNER_PW) is not None)
 
@@ -201,7 +202,7 @@ def test_startup_existing_owner_env_password_not_reconciled():
         "ADMIN_USERNAME": "admin",
         "ADMIN_PASSWORD": "totally-different-pw-123",
     })
-    check("正常解析已有 owner", owner is not None and owner.get("email") == "admin")
+    check("正常解析已有 owner", owner is not None and owner.get("login_id") == "admin")
     hash_after = user_store.list_enabled_owners()[0]["password_hash"]
     check("DB hash 不变（无对账覆盖）", hash_before == hash_after)
     check("原密码仍可登录", user_store.verify_user("admin", OWNER_PW) is not None)
@@ -213,7 +214,7 @@ def test_startup_existing_owner_without_env(monkeypatch):
     """已有 owner + 无 ADMIN_PASSWORD → 正常启动可登录（§11.1-3）。"""
     make_owner("admin", OWNER_PW)
     owner = app_mod._resolve_owner_at_startup({})
-    check("无 env 正常解析", owner is not None and owner.get("email") == "admin")
+    check("无 env 正常解析", owner is not None and owner.get("login_id") == "admin")
     # 归属注入（docs §5.2 末段）：无论是否有 bootstrap env，都从 DB 注入
     uid = app_mod._inject_owner_into_share_store(owner)
     check("share_store 归属注入 = 解析出的 owner", _share_owner_uid() == uid)
@@ -230,9 +231,9 @@ def test_startup_admin_username_change_only_warns(monkeypatch, caplog):
             "ADMIN_USERNAME": "someone-else",
             "ADMIN_PASSWORD": "whatever-password-1",
         })
-    check("仍解析原 owner", owner is not None and owner.get("email") == "admin")
+    check("仍解析原 owner", owner is not None and owner.get("login_id") == "admin")
     check("DB login_id 未被改动",
-          user_store.list_enabled_owners()[0]["email"] == "admin")
+          user_store.list_enabled_owners()[0]["login_id"] == "admin")
     warned = any(
         ("忽略" in rec.message or "deprecated" in rec.message)
         and ("ADMIN" in rec.message or "BOOTSTRAP" in rec.message)
@@ -344,7 +345,7 @@ def test_startup_concurrent_loser_re_resolves(monkeypatch):
         "BOOTSTRAP_OWNER_LOGIN_ID": "admin",
         "ADMIN_PASSWORD": OWNER_PW,
     })
-    check("并发败者重解析成功", owner is not None and owner.get("email") == "admin")
+    check("并发败者重解析成功", owner is not None and owner.get("login_id") == "admin")
     check("create_bootstrap_owner 确被调用过（模拟并发）",
           real_create is not None)
 
@@ -382,7 +383,7 @@ def test_change_password_audit_no_secrets():
     """改密 audit：action/actor/target 正确且 detail 无密码特征。"""
     make_owner("admin", OWNER_PW)
     user_store.create_user("u@x.com", USER_PW, role="user")
-    uid = user_store.get_user_by_email("u@x.com")["user_id"]
+    uid = user_store.get_user_by_login_id("u@x.com")["user_id"]
     c = make_client()
     login(c, "u@x.com", USER_PW)
     c.post("/api/account/password", json={
@@ -644,10 +645,10 @@ def test_admin_create_user_password_policy():
     """创建用户：短密码 400（统一 15..200，无硬编码 8）。"""
     make_owner("admin", OWNER_PW)
     c = _owner_client()
-    r = c.post("/api/admin/users", json={"email": "n@x.com", "password": "short14chars__x"[:13]})
+    r = c.post("/api/admin/users", json={"login_id": "n@x.com", "password": "short14chars__x"[:13]})
     check("14 位密码 400", r.status_code == 400)
     check("长度文案统一（15..200）", "15" in json.loads(r.data).get("error", ""))
-    r2 = c.post("/api/admin/users", json={"email": "n@x.com", "password": USER_PW})
+    r2 = c.post("/api/admin/users", json={"login_id": "n@x.com", "password": USER_PW})
     check("15 位密码 200", r2.status_code == 200, "got %s" % r2.status_code)
 
 

@@ -6,7 +6,8 @@
 
 覆盖：
   - ensure_schema 幂等：连跑多遍无异常，目标表存在；
-  - users 插入/查询 + email 大小写不敏感唯一（citext 等价：lower(email) 唯一索引）；
+  - users 插入/查询 + login_id 大小写不敏感唯一（citext 等价：lower(login_id)
+    唯一索引；0016 物理改名后）；
   - rois 基本冒烟（含 ADMIN_TOKEN='admin' 伪 token，无 shares 行——印证 rois.token 不设
     外键的迁移期决策）；
   - 外键冒烟：slide_assets.slide_id → slides（含违规插入失败 + ON DELETE CASCADE）；
@@ -103,6 +104,9 @@ def test_schema_migrations_recorded(conn):
     # 0014_demo_daily_window.sql 把 demo_turn_limit 缺省改 50（每日滚动 24h 口径）。
     # 账户系统批次 A 追加 0015_account_auth_version.sql（users.auth_version +
     # 单 enabled owner 部分唯一索引，docs §4.1）。
+    # 账户系统批次 C 追加 0016_login_id_rename.sql（users.email → login_id、
+    # registration_invites.email_normalized → login_id_normalized、
+    # users_email_ci_key → users_login_id_ci_key，docs §4.2 物理收口）。
     assert rows == [
         "0001_init.sql", "0002_roi_payload.sql", "0003_comments.sql",
         "0004_audit.sql", "0005_plugin.sql", "0006_demo_budget_auth.sql",
@@ -115,44 +119,81 @@ def test_schema_migrations_recorded(conn):
         "0013_upload_quotas.sql",
         "0014_demo_daily_window.sql",
         "0015_account_auth_version.sql",
+        "0016_login_id_rename.sql",
     ]
 
 
 # --------------------------------------------------------------------------- #
-# 2. users 插入/查询 + email 大小写不敏感唯一
+# 2. users 插入/查询 + login_id 大小写不敏感唯一（0016 物理改名后）
 # --------------------------------------------------------------------------- #
 def test_users_insert_and_query(conn):
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO users (user_id, email, display_name, role) "
-            "VALUES (%s,%s,%s,%s) RETURNING user_id, email, role",
+            "INSERT INTO users (user_id, login_id, display_name, role) "
+            "VALUES (%s,%s,%s,%s) RETURNING user_id, login_id, role",
             ("usr_smoke", "smoke@example.com", "Smoke", "user"),
         )
-        uid, email, role = cur.fetchone()
+        uid, login_id, role = cur.fetchone()
         conn.commit()
-    assert uid == "usr_smoke" and email == "smoke@example.com" and role == "user"
+    assert uid == "usr_smoke" and login_id == "smoke@example.com" \
+        and role == "user"
 
     with conn.cursor() as cur:
-        cur.execute("SELECT email FROM users WHERE user_id=%s", ("usr_smoke",))
+        cur.execute("SELECT login_id FROM users WHERE user_id=%s",
+                    ("usr_smoke",))
         assert cur.fetchone()[0] == "smoke@example.com"
 
 
-def test_users_email_case_insensitive_unique(conn):
+def test_users_login_id_case_insensitive_unique(conn):
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO users (user_id, email, role) VALUES (%s,%s,%s)",
+            "INSERT INTO users (user_id, login_id, role) VALUES (%s,%s,%s)",
             ("usr_ci1", "Case@Example.com", "user"),
         )
         conn.commit()
-    # 仅大小写不同的 email 应被 lower(email) 唯一索引拒绝
+    # 仅大小写不同的 login_id 应被 lower(login_id) 唯一索引拒绝
     with conn.cursor() as cur:
         with pytest.raises(psycopg.errors.UniqueViolation):
             cur.execute(
-                "INSERT INTO users (user_id, email, role) VALUES (%s,%s,%s)",
+                "INSERT INTO users (user_id, login_id, role) VALUES (%s,%s,%s)",
                 ("usr_ci2", "case@example.COM", "user"),
             )
             conn.commit()
         conn.rollback()
+
+
+def test_migration_0016_renamed_index_expression_follows_column(conn):
+    """0016 物理改名核验：旧列名消失、索引改名且表达式随列联动为
+    lower(login_id)（PG RENAME COLUMN 自动改写函数索引定义，无需重建）；
+    原始 SQL 重跑两次 no-op（DO 块守护，对齐 0015 幂等口径）。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='users'")
+        cols = {r[0] for r in cur.fetchall()}
+        assert "login_id" in cols and "email" not in cols
+        cur.execute(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE indexname='users_login_id_ci_key'")
+        row = cur.fetchone()
+        assert row is not None, "0016 后索引应改名为 users_login_id_ci_key"
+        assert "lower(login_id)" in row[0]
+        assert "lower(email)" not in row[0]
+        cur.execute(
+            "SELECT 1 FROM pg_indexes WHERE indexname='users_email_ci_key'")
+        assert cur.fetchone() is None, "旧索引名应已不存在"
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='registration_invites'")
+        rcols = {r[0] for r in cur.fetchall()}
+        assert "login_id_normalized" in rcols and "email_normalized" not in rcols
+    conn.commit()
+    sql = (pg_store.migrations_dir() / "0016_login_id_rename.sql").read_text(
+        encoding="utf-8")
+    with conn.cursor() as cur:
+        for _ in range(2):
+            cur.execute(sql)  # 已应用过的 DDL 重跑不抛错
+    conn.commit()
 
 
 # --------------------------------------------------------------------------- #
@@ -241,7 +282,7 @@ def test_transaction_commits_and_keeps_connection_open(conn):
     with pg_store.transaction(conn) as c:
         with c.cursor() as cur:
             cur.execute(
-                "INSERT INTO users (user_id, email, role) VALUES (%s,%s,%s)",
+                "INSERT INTO users (user_id, login_id, role) VALUES (%s,%s,%s)",
                 ("usr_tx_ok", "tx-ok@example.com", "user"),
             )
     # 正常退出 → commit；连接仍可用（不被关闭）
@@ -257,7 +298,8 @@ def test_transaction_rolls_back_on_exception(conn):
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO users (user_id, email, role) VALUES (%s,%s,%s)",
+                    "INSERT INTO users (user_id, login_id, role) "
+                    "VALUES (%s,%s,%s)",
                     ("usr_tx_rollback", "tx-rb@example.com", "user"),
                 )
             raise RuntimeError("boom")

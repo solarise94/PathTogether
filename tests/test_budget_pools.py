@@ -288,12 +288,13 @@ def _mk_owner():
     return owner
 
 
-def _redeem_new_user(email, ai_access=False):
+def _redeem_new_user(login_id, ai_access=False):
     """走真实邀请兑换创建一个 ai_access 模板可控的注册用户。"""
     owner = _mk_owner()
     inv = registration_store.create_invite(
-        owner["user_id"], email=email, ai_access=ai_access)
-    out = registration_store.redeem_invite(inv["token"], email, "userpass1234567")
+        owner["user_id"], login_id=login_id, ai_access=ai_access)
+    out = registration_store.redeem_invite(inv["token"], login_id,
+                                           "userpass1234567")
     return out["user"], inv
 
 

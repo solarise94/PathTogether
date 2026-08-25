@@ -187,10 +187,11 @@
                data-i18n-ph="register.invite.code.ph" placeholder="粘贴管理员发送的邀请码" />
       </div>
       <div class="field">
-        <!-- 批次 B（docs §8.2）：表单 email 字段语义为登录账号 login_id
-             （邀请绑定的就是「允许兑换的登录账号」），非已验证邮箱 -->
-        <label for="email" data-i18n="register.invite.email">登录账号</label>
-        <input id="email" name="email" type="text" required maxlength="120"
+        <!-- 账户系统批次 C（docs §8.2）：表单字段名为登录账号 login_id
+             （邀请绑定的就是「允许兑换的登录账号」），非已验证邮箱；
+             批次 B 的 email 字段名已随物理收口删除 -->
+        <label for="login_id" data-i18n="register.invite.email">登录账号</label>
+        <input id="login_id" name="login_id" type="text" required maxlength="120"
                autocomplete="username"
                data-i18n-ph="register.invite.email.ph" placeholder="邀请码绑定的登录账号" />
       </div>

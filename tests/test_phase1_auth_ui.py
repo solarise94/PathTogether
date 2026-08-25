@@ -190,12 +190,12 @@ def test_csrf_admin_users_post_enforced():
                   "auth_version": owner.get("auth_version", 1)})
     # 先摘掉 wrapper 注入：直接用底层 client 发（有 session、无 token）
     r = client._base.post("/api/admin/users",
-                          json={"email": "n@x.com", "password": "password1password1"})
+                          json={"login_id": "n@x.com", "password": "password1password1"})
     assert r.status_code == 400
     assert r.get_json()["error"] == "csrf_required"
     # wrapper 自动带 token → 通过 CSRF（业务 200/400 由参数决定）
     r2 = client.post("/api/admin/users",
-                     json={"email": "n@x.com", "password": "password1password1"})
+                     json={"login_id": "n@x.com", "password": "password1password1"})
     assert r2.status_code == 200, r2.get_data(as_text=True)
 
 
@@ -517,12 +517,12 @@ def test_register_post_always_rejected_phase1():
     app_mod.AUTH_ENABLED = True
     client = _client()
     r = client.post("/register", json={
-        "email": "n@x.com", "password": "password1password1"})
+        "login_id": "n@x.com", "password": "password1password1"})
     assert r.status_code == 403
     assert "邀请注册" in (r.get_json() or {}).get("error", "")
     # PG 后端 registration_open=true 时也一律 403（第一阶段）
     r2 = client.post("/register", json={
-        "email": "n@x.com", "password": "password1password1"},
+        "login_id": "n@x.com", "password": "password1password1"},
         headers={"X-Registration-Open": "1"})
     assert r2.status_code == 403
 
@@ -705,14 +705,14 @@ class TestPgLoginLockout:
         users = self._mk_users(4)
         client = _client()
         for u in users:
-            r = _login_ok(client, u["email"], "wrongpass")
+            r = _login_ok(client, u["login_id"], "wrongpass")
             assert r.status_code == 401
         # 第 5 次失败（仍同 IP）触发锁定 → 本次响应即 429
         r = _login_ok(client, "ghost@x.com", "wrongpass")
         assert r.status_code == 429
         assert int(r.headers.get("Retry-After") or 0) > 0
         # 锁定期内正确密码也 429
-        r2 = _login_ok(client, users[0]["email"], "password1password1")
+        r2 = _login_ok(client, users[0]["login_id"], "password1password1")
         assert r2.status_code == 429
 
     def test_single_account_many_ips_locks_account_bucket(self):
@@ -720,7 +720,7 @@ class TestPgLoginLockout:
         app_mod.AUTH_ENABLED = True
         users = self._mk_users(1)
         client = _client()
-        target = users[0]["email"]
+        target = users[0]["login_id"]
         # 每次失败来自不同 /24（IP 桶按前缀聚合，docs §9.5：IPv4 → /24）
         for i in range(9):
             r = client.post("/login", data={"username": target, "password": "wrongpass"},
@@ -740,11 +740,11 @@ class TestPgLoginLockout:
         app_mod.AUTH_ENABLED = True
         users = self._mk_users(1)
         client = _client()
-        _login_ok(client, users[0]["email"], "wrongpass")
-        r = _login_ok(client, users[0]["email"], "password1password1")
+        _login_ok(client, users[0]["login_id"], "wrongpass")
+        r = _login_ok(client, users[0]["login_id"], "password1password1")
         assert r.status_code == 302
         # 清桶后失败不立即 429
-        r2 = _login_ok(client, users[0]["email"], "wrongpass")
+        r2 = _login_ok(client, users[0]["login_id"], "wrongpass")
         assert r2.status_code == 401
 
 

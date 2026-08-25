@@ -115,12 +115,12 @@ def test_json_smoke_user_store(monkeypatch, tmp_path):
     monkeypatch.setattr(user_store, "USER_FILE", uf)
     assert user_store_json.USER_FILE == uf
 
-    email = "alice@example.com"
+    login_id = "alice@example.com"
     password = "Password12345678"  # 16 字符（≥ PASSWORD_MIN_LENGTH=15）
-    created = user_store.create_user(email, password, role="user")
-    assert created and created["email"] == email
-    assert user_store.verify_user(email, password)  # dict（truthy）
-    assert not user_store.verify_user(email, "wrong-password-xxx")
+    created = user_store.create_user(login_id, password, role="user")
+    assert created and created["login_id"] == login_id
+    assert user_store.verify_user(login_id, password)  # dict（truthy）
+    assert not user_store.verify_user(login_id, "wrong-password-xxx")
 
 
 # --------------------------------------------------------------------------- #

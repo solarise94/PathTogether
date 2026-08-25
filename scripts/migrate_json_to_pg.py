@@ -6,6 +6,10 @@
 作为把 ``STORAGE_BACKEND`` 从 ``json`` 切到 ``postgres`` 的过渡。与 3b-2 的
 dispatcher / PG 仓储实现配套使用。
 
+账户系统批次 C（docs §4.2）：users.json 记录键与 PG 物理列均已收口为
+``login_id``（0016）。读侧兼容旧格式 json（记录只有 ``email`` 键时读为
+login_id，口径同 user_store_json._login_id_of）。
+
 **前置假设（工具自身不强制，由运维保证）**：迁移在「停写窗口」执行——
 迁移期间 json 写路径必须停止（关停 gunicorn / share_server），避免边导边写。
 本工具**只读 json**（``json.load`` 直读，不经 dispatcher，与 STORAGE_BACKEND 无关），
@@ -120,6 +124,17 @@ def _load_users(share_data_dir):
     return data
 
 
+def _login_id_of(u) -> str:
+    """users.json 记录读侧兼容（批次 C）：键 ``login_id`` 优先，旧格式记录
+    只有 ``email`` 键时读为 login_id（口径同 user_store_json._login_id_of）。"""
+    if not isinstance(u, dict):
+        return ""
+    v = u.get("login_id")
+    if v is None and "email" in u:
+        v = u.get("email")
+    return str(v or "").strip().lower()
+
+
 # --------------------------------------------------------------------------- #
 # 校验（dry-run：纯 json + 磁盘，不碰 pg）
 # --------------------------------------------------------------------------- #
@@ -165,19 +180,20 @@ def _scan_problems(shares, users, upload_dir):
         else:
             seen_aid[aid] = i
 
-    # 2. users email 重复（lower(email) 唯一索引会失败）
-    seen_email = {}
+    # 2. users login_id 重复（lower(login_id) 唯一索引会失败）。旧格式记录
+    #    只有 email 键时读为 login_id（批次 C 读侧兼容）
+    seen_login_id = {}
     for uid, u in (users.get("users") or {}).items():
-        email = (u.get("email") if isinstance(u, dict) else "") or ""
-        email = str(email).strip().lower()
-        if not email:
-            problems.append("user %s 缺少 email（跳过）" % uid)
+        login_id = _login_id_of(u)
+        login_id = str(login_id).strip().lower()
+        if not login_id:
+            problems.append("user %s 缺少 login_id（跳过）" % uid)
             continue
-        if email in seen_email:
-            problems.append("user email 重复：%s（%s 与 %s）"
-                            % (email, seen_email[email], uid))
+        if login_id in seen_login_id:
+            problems.append("user login_id 重复：%s（%s 与 %s）"
+                            % (login_id, seen_login_id[login_id], uid))
         else:
-            seen_email[email] = uid
+            seen_login_id[login_id] = uid
 
     # 3. grants 引用未知 share_token（grants.token 有 FK → shares.token）
     share_tokens = set((shares.get("shares") or {}).keys())
@@ -270,7 +286,7 @@ class _Plan:
         self.problems = []          # json/磁盘问题（dry-run 可见）
         self.pg_conflicts = []      # apply 期检测的 pg 同名冲突（owner 矛盾）
         self.slide_map = {}         # legacy_filename → slide_id
-        self.user_map = {}          # email → user_id
+        self.user_map = {}          # login_id → user_id
         self.tokens = []            # share token 清单
         self.annotation_ids = []    # roi annotation_id 清单
         self.skipped_slides = set()  # 因冲突跳过 identity/asset 的切片名
@@ -281,11 +297,11 @@ def _build_plan(shares, users, upload_dir, conn):
     plan.counts = _counts(shares, users)
     plan.problems = _scan_problems(shares, users, upload_dir)
 
-    # user_map：email → user_id
+    # user_map：login_id → user_id（旧格式记录 email 键读为 login_id）
     for uid, u in (users.get("users") or {}).items():
-        email = str((u.get("email") if isinstance(u, dict) else "") or "").lower()
-        if email:
-            plan.user_map[email] = uid
+        login_id = _login_id_of(u)
+        if login_id:
+            plan.user_map[login_id] = uid
 
     # tokens
     plan.tokens = sorted((shares.get("shares") or {}).keys())
@@ -340,19 +356,19 @@ def _import_users(cur, users):
     for uid, u in (users.get("users") or {}).items():
         if not isinstance(u, dict):
             continue
-        email = str(u.get("email") or "").strip().lower() or uid
+        login_id = _login_id_of(u) or uid
         created = u.get("created_at") or time.time()
         cur.execute(
             "INSERT INTO users "
-            "(user_id, email, display_name, password_hash, role, created_at, "
-            " disabled, ai_config) "
+            "(user_id, login_id, display_name, password_hash, role, "
+            " created_at, disabled, ai_config) "
             "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), %s, %s) "
             "ON CONFLICT (user_id) DO UPDATE SET "
-            " email=EXCLUDED.email, display_name=EXCLUDED.display_name, "
+            " login_id=EXCLUDED.login_id, display_name=EXCLUDED.display_name, "
             " password_hash=EXCLUDED.password_hash, role=EXCLUDED.role, "
             " created_at=EXCLUDED.created_at, disabled=EXCLUDED.disabled, "
             " ai_config=EXCLUDED.ai_config",
-            (uid, email, str(u.get("display_name") or "") or email,
+            (uid, login_id, str(u.get("display_name") or "") or login_id,
              str(u.get("password_hash") or ""), str(u.get("role") or "user"),
              created, bool(u.get("disabled", False)),
              psycopg.types.json.Jsonb(u.get("ai_config") or {})),
@@ -656,7 +672,7 @@ def cmd_apply(args):
             "created_at": time.time(),
             "share_data_dir": str(share_data_dir),
             "legacy_filename_to_slide_id": plan.slide_map,
-            "email_to_user_id": plan.user_map,
+            "login_id_to_user_id": plan.user_map,
             "tokens": plan.tokens,
             "annotation_ids": plan.annotation_ids,
             "skipped_slides": sorted(skipped),
@@ -707,28 +723,28 @@ def cmd_verify(args):
     conn = _connect()
     try:
         with conn.cursor() as cur:
-            # ---- users ----
-            cur.execute("SELECT user_id, email, role, disabled, password_hash "
-                        "FROM users")
-            pg_users = {r["email"]: r for r in cur.fetchall()}
+            # ---- users（旧格式 json 的 email 键读为 login_id 后比对）----
+            cur.execute("SELECT user_id, login_id, role, disabled, "
+                        "password_hash FROM users")
+            pg_users = {r["login_id"]: r for r in cur.fetchall()}
             json_users = {}
             for uid, u in (users.get("users") or {}).items():
                 if isinstance(u, dict):
-                    json_users[str(u.get("email") or "").lower()] = u
+                    json_users[_login_id_of(u)] = u
             _diff_count(diffs, "users", len(json_users), len(pg_users))
-            for email, u in json_users.items():
-                pg = pg_users.get(email)
+            for login_id, u in json_users.items():
+                pg = pg_users.get(login_id)
                 if pg is None:
-                    diffs.append("users: json 有 %s 但 pg 无" % email)
+                    diffs.append("users: json 有 %s 但 pg 无" % login_id)
                     continue
                 if str(u.get("role") or "user") != str(pg["role"] or "user"):
                     diffs.append("users[%s] role: json=%s pg=%s"
-                                 % (email, u.get("role"), pg["role"]))
+                                 % (login_id, u.get("role"), pg["role"]))
                 if bool(u.get("disabled", False)) != bool(pg["disabled"]):
                     diffs.append("users[%s] disabled: json=%s pg=%s"
-                                 % (email, u.get("disabled"), pg["disabled"]))
+                                 % (login_id, u.get("disabled"), pg["disabled"]))
                 if str(u.get("password_hash") or "") != str(pg["password_hash"] or ""):
-                    diffs.append("users[%s] password_hash 不一致" % email)
+                    diffs.append("users[%s] password_hash 不一致" % login_id)
 
             # ---- shares ----
             cur.execute("SELECT token, slides, permissions, "

@@ -100,8 +100,8 @@ def _client_noauth():
     return csrf_client(app_mod.app.test_client())
 
 
-def _login(client, email, password):
-    return client.post("/login", data={"username": email, "password": password})
+def _login(client, login_id, password):
+    return client.post("/login", data={"username": login_id, "password": password})
 
 
 def _touch(name="demo.svs"):

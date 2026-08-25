@@ -261,8 +261,8 @@
       var resetBtn = isOwner ? "" :
         '<button class="btn secondary small" data-act="reset" data-uid="' + esc(u.user_id) + '">' + esc(tt("sb.users.reset")) + '</button>';
       return '<div class="user-row" data-uid="' + esc(u.user_id) + '">' +
-        '<div class="user-main"><span class="user-name">' + esc(u.display_name || u.login_id || u.email) + '</span>' +
-        '<span class="user-sub">' + esc(u.login_id || u.email) + ' · ' + roleTxt + ' · ' + statusTxt + '</span>' +
+        '<div class="user-main"><span class="user-name">' + esc(u.display_name || u.login_id) + '</span>' +
+        '<span class="user-sub">' + esc(u.login_id) + ' · ' + roleTxt + ' · ' + statusTxt + '</span>' +
         '<span class="user-created">' + esc(created) + '</span></div>' +
         '<div class="user-actions">' +
         disableBtn +
@@ -303,8 +303,8 @@
   }
 
   function submitAddUser() {
-    // 批次 B（docs §4.1/§8.1）：登录账号字段优先发 login_id（email 为服务端
-    // deprecated 兼容入参）；显示名仅展示，不用于登录
+    // 批次 C（docs §4.2/§8.1）：登录账号字段发 login_id（email 兼容入参已在
+    // 服务端删除）；显示名仅展示，不用于登录
     var loginId = (els.usersEmail.value || "").trim();
     var password = els.usersPassword.value || "";
     var display = (els.usersDisplay.value || "").trim();

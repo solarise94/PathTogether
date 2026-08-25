@@ -108,8 +108,8 @@ def _client_noauth():
     return csrf_client(app_mod.app.test_client())
 
 
-def _login(client, email, password):
-    return client.post("/login", data={"username": email, "password": password})
+def _login(client, login_id, password):
+    return client.post("/login", data={"username": login_id, "password": password})
 
 
 def _touch(name="demo.svs"):
@@ -451,7 +451,7 @@ def test_claim_grants_visibility_and_revocation_revokes():
 
 def test_claim_invalid_share_404():
     _setup_users()
-    userB = user_store.get_user_by_email("b@x.com")
+    userB = user_store.get_user_by_login_id("b@x.com")
     cb = _client()
     _login(cb, "b@x.com", "userBpass123456")
     r = cb.post("/api/share/nope/claim")

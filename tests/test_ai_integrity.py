@@ -173,7 +173,7 @@ def _client(auth_enabled=False):
 def _login(client, user):
     """以给定 user_store 用户行建立登录 session（回查通过 _require_auth）。"""
     with client.session_transaction() as s:
-        s["auth_user"] = user.get("email") or user.get("user_id")
+        s["auth_user"] = user.get("login_id") or user.get("user_id")
         s["user_id"] = user["user_id"]
         s["role"] = user.get("role") or "user"
         s["auth_version"] = user.get("auth_version", 1)
@@ -498,7 +498,7 @@ def test_human_revoke_endpoint_owner_or_creator_csrf():
     app_mod.app.config["TESTING"] = True
     raw = app_mod.app.test_client()
     with raw.session_transaction() as s:
-        s["auth_user"] = owner.get("email")
+        s["auth_user"] = owner.get("login_id")
         s["user_id"] = owner["user_id"]
         s["role"] = "owner"
         s["auth_version"] = owner.get("auth_version", 1)

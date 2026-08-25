@@ -467,24 +467,6 @@ def _check_public_demo_backend_or_exit(environ=None):
 _check_public_demo_backend_or_exit()
 
 
-def _repair_pg_empty_password_hashes():
-    """dual/postgres：把 json 权威 hash 回填到旧 dual 写入的空 password_hash 行。
-
-    批次 C（docs §9.2）会把本调用改为显式迁移脚本，届时整体移除；
-    本批次保留每次启动修复（与 store 线合入前的行为一致）。
-    """
-    backend = getattr(user_store, "STORAGE_BACKEND", "json")
-    if backend not in ("dual", "postgres"):
-        return
-    try:
-        import user_store_pg
-        n = user_store_pg.repair_empty_password_hashes_from_json()
-        if n:
-            app.logger.warning("repaired %s empty password_hash row(s) from json", n)
-    except Exception:
-        app.logger.exception("password_hash backfill from json failed")
-
-
 # ---------------------------------------------------------------------------
 # owner 启动接线（账户系统批次 A，docs §5.2）：无论本次是否执行 bootstrap，
 # 都从数据库解析 owner 并注入资源默认归属（share_store.set_owner_user_id），
@@ -507,7 +489,9 @@ def _inject_owner_into_share_store(owner):
 _OWNER_AT_STARTUP = _resolve_owner_at_startup()
 #: 启动时解析出的 primary owner user_id（本地免认证开发态为 None）
 _OWNER_USER_ID = _inject_owner_into_share_store(_OWNER_AT_STARTUP)
-_repair_pg_empty_password_hashes()
+# （账户系统批次 C，docs §9.2）原每次启动执行的 _repair_pg_empty_password_hashes
+# 已删除：历史 dual 写入的空 password_hash 修复改由主机侧一次性命令
+# scripts/repair_pg_user_password_hashes.py（默认 dry-run，--apply 才写）承担。
 
 
 # AUTH_ENABLED 语义（docs §5.2 末行）：REQUIRE_ADMIN_AUTH=1，或存在任何
@@ -1782,8 +1766,8 @@ def api_account_password():
     current_password = body.get("current_password")
     new_password = body.get("new_password")
 
-    # 主体=当前用户规范化 login_id 摘要（批次 B：store 读路径已携带 login_id；
-    # email 键 deprecated，批次 C 移除）
+    # 主体=当前用户规范化 login_id 摘要（store 读路径携带 login_id；
+    # 批次 C 起响应无 email 键）
     account_hash = _auth_subject_hash(user.get("login_id") or "")
     ip_prefix_hash = _ip_prefix_hash(request.remote_addr or "")
 
@@ -1843,8 +1827,9 @@ def register():
     - closed：GET 渲染关闭态页（不 404、无可提交表单），POST 一律 403；
     - invite_only：GET 渲染邀请码/登录账号/显示名/密码表单（统一密码策略
       15..200 位、允许密码管理器 paste），POST 走 registration_store 原子
-      兑换（表单 email 字段语义为登录账号 login_id，批次 B docs §8.2）；
-      成功**不自动登录**——清理匿名 session、轮换 CSRF 后 302 /login；
+      兑换（表单 login_id 字段为登录账号，批次 C docs §8.2；批次 B 的 email
+      字段名已随物理收口删除）；成功**不自动登录**——清理匿名 session、
+      轮换 CSRF 后 302 /login；
     - public：本阶段不支持，GET/POST 均 503 public_registration_not_supported
       （无 public 回退路径）；
     - 模式权威值还受 fail-closed 前置闸（_effective_registration_mode：非 HTTPS
@@ -1904,16 +1889,17 @@ def register():
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
-    # 表单校验（本地形状错误，非枚举信号；不回显邀请码）。email 字段语义为
-    # 登录账号 login_id（批次 B docs §8.2：邀请绑定的是「允许兑换的登录账号」）
-    email = (request.form.get("email") or "").strip()
+    # 表单校验（本地形状错误，非枚举信号；不回显邀请码）。login_id 字段为
+    # 登录账号（docs §8.2：邀请绑定的是「允许兑换的登录账号」；批次 C 起
+    # 表单字段名即 login_id，email 入参已删除）
+    login_id = (request.form.get("login_id") or "").strip()
     display_name = (request.form.get("display_name") or "").strip()
     password = request.form.get("password") or ""
     confirm = request.form.get("password_confirm") or ""
     form_error = None
     if not invite_token:
         form_error = "请填写邀请码"
-    elif not email:
+    elif not login_id:
         form_error = "请填写登录账号"
     elif len(password) < registration_store.MIN_PASSWORD_LENGTH:
         form_error = "密码长度至少 %d 位（推荐使用密码管理器生成的长口令）" \
@@ -1926,7 +1912,7 @@ def register():
     # 原子兑换（docs §4.3）：失败统一文案（无细分状态），计数到限流桶
     try:
         result = registration_store.redeem_invite(
-            invite_token, email, password, display_name or None)
+            invite_token, login_id, password, display_name or None)
     except registration_store.InviteRedeemError:
         try:
             auth_limit_store.record_registration_failure(ip_hash, invite_hash)
@@ -3140,8 +3126,8 @@ def _check_registration_preconditions_or_warn(environ=None):
 def api_admin_users_list():
     """列出全部用户（不含 hash）与注册模式。仅 owner。
 
-    批次 B（docs §4.1）：每个用户 dict 同时携带 "login_id"（规范登录账号）
-    与 "email"（deprecated，同值；批次 C 移除）——由 store 层读路径统一补键。
+    批次 C（docs §4.2）：每个用户 dict 只带 "login_id"（规范登录账号），
+    不再携带 deprecated 的 "email" 同值键。
     """
     auth = _require_owner()
     if auth:
@@ -3159,23 +3145,19 @@ _check_registration_preconditions_or_warn()
 
 @app.route("/api/admin/users", methods=["POST"])
 def api_admin_users_create():
-    """创建 user 角色账户。仅 owner。JSON: {login_id | email, password,
-    display_name?}。
+    """创建 user 角色账户。仅 owner。JSON: {login_id, password, display_name?}。
 
-    批次 B（docs §4.1/§8.1）：请求体登录账号字段 ``login_id`` 优先，``email``
-    为 deprecated 兼容别名（同语义：登录账号，非已验证邮箱）。冲突 409；密码
-    统一 15..200（user_store.PASSWORD_MIN/MAX_LENGTH，账户系统批次 A
-    docs §3.3）。返回新用户（不含 hash，携带 login_id + email 双键）。
+    批次 C（docs §4.2/§8.1）：登录账号字段只接受 ``login_id``（批次 B 的
+    ``email`` 兼容入参已删除——只传 email 不给 login_id 一律 400）。冲突 409；
+    密码统一 15..200（user_store.PASSWORD_MIN/MAX_LENGTH，账户系统批次 A
+    docs §3.3）。返回新用户（不含 hash，只带 login_id 键）。
     初始密码由 owner 线下告知用户（本节点不做邮件发送）。
     """
     auth = _require_owner()
     if auth:
         return auth
     body = request.get_json(silent=True) or {}
-    # login_id 优先，email 为兼容别名（批次 C 移除 email 入参）
     login_id = body.get("login_id")
-    if login_id is None:
-        login_id = body.get("email")
     password = body.get("password")
     display_name = body.get("display_name")
     if not isinstance(login_id, str) or not login_id.strip():
@@ -3319,18 +3301,16 @@ def _registration_invite_owner_hash():
 def _invite_public_view(invite: dict) -> dict:
     """邀请行 → owner API 视图（掩码登录账号 + 状态；绝不含 token/token_hash）。
 
-    批次 B（docs §4.1/§8.2）：邀请绑定字段语义为「允许兑换的登录账号
-    （login_id）」。视图同时携带 "login_id_masked"（规范名）与 "email_masked"
-    （deprecated，同值；批次 C 移除）——掩码口径不变（不外泄完整绑定值）。
+    批次 C（docs §4.2/§8.2）：邀请绑定字段语义为「允许兑换的登录账号
+    （login_id）」。视图只输出 "login_id_masked"（批次 B 的 "email_masked"
+    deprecated 同值键已删除）——掩码口径不变（不外泄完整绑定值）。
     """
     now = time.time()
     out = dict(invite)
     out.pop("token_hash", None)
     out.pop("token", None)
-    bound = out.pop("email_normalized", None)
-    masked = registration_store.mask_email(bound)
-    out["login_id_masked"] = masked
-    out["email_masked"] = masked
+    bound = out.pop("login_id_normalized", None)
+    out["login_id_masked"] = registration_store.mask_login_id(bound)
     if out.get("revoked_at") is not None:
         out["status"] = "revoked"
     elif out.get("consumed_at") is not None:
@@ -3399,12 +3379,12 @@ def api_admin_registration_settings_put():
 
 @app.route("/api/admin/registration-invites", methods=["POST"])
 def api_admin_registration_invites_create():
-    """创建一次性邀请码（owner）。body: {login_id? | email?, ttl_hours?,
-    ai_access?, cohort?, note?}。
+    """创建一次性邀请码（owner）。body: {login_id?, ttl_hours?, ai_access?,
+    cohort?, note?}。
 
-    批次 B（docs §4.1/§8.2）：绑定字段语义为「允许兑换的登录账号 login_id」
-    （非已验证邮箱）；请求体 ``login_id`` 优先，``email`` 为 deprecated 兼容
-    别名（同语义）。响应同时携带 login_id_masked 与 email_masked（deprecated）。
+    批次 C（docs §4.2/§8.2）：绑定字段语义为「允许兑换的登录账号 login_id」
+    （非已验证邮箱）；只接受 ``login_id`` 入参（批次 B 的 ``email`` 兼容入参
+    已删除）。响应只携带 login_id_masked（email_masked 已删除）。
 
     仅本响应返回明文 code（Cache-Control: no-store，刷新即失）；库内只存带盐
     hash。owner 创建频率受每分钟/每日上限。绑定值省略 = 不绑定（高风险，
@@ -3429,10 +3409,8 @@ def api_admin_registration_invites_create():
                 429, {"Retry-After": str(max(1, int(retry)))})
 
     body = request.get_json(silent=True) or {}
-    # 绑定登录账号：login_id 优先，email 为兼容别名（批次 C 移除 email 入参）
+    # 绑定登录账号：只接受 login_id（批次 C 删除 email 兼容入参）
     login_id = body.get("login_id")
-    if login_id is None:
-        login_id = body.get("email")
     if login_id is not None:
         login_id = str(login_id).strip()
         if not login_id:
@@ -3460,10 +3438,8 @@ def api_admin_registration_invites_create():
 
     try:
         auth_limit_store.record_owner_invite_creation(owner_hash)
-        # registration_store.create_invite 的 email 参数语义即「允许兑换的
-        # 登录账号」（批次 B 注明；函数签名本批次不动，批次 C 收口改名）
         invite = registration_store.create_invite(
-            current_identity().get("user_id"), email=login_id,
+            current_identity().get("user_id"), login_id=login_id,
             ttl_seconds=ttl_hours * 3600,
             ai_access=bool(ai_access), cohort=cohort or "",
             note=note or "")
@@ -3484,7 +3460,7 @@ def api_admin_registration_invites_create():
 @app.route("/api/admin/registration-invites", methods=["GET"])
 def api_admin_registration_invites_list():
     """列出邀请（owner）：绑定登录账号掩码 + 过期时间 + 状态；永不返回
-    token/hash（login_id_masked 与 email_masked 同值，后者 deprecated）。"""
+    token/hash（批次 C 起只输出 login_id_masked）。"""
     auth = _require_owner()
     if auth:
         return auth

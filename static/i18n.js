@@ -278,8 +278,9 @@
       // 注册表单密码口径（账户系统批次 A：统一 15..200，docs §3.3）
       "register.invite.password.ph": "至少 15 位，推荐使用密码管理器生成的长口令",
       "register.invite.password.hint": "至少 15 位，可直接使用密码管理器生成并粘贴；不要求大小写或符号组合。",
-      // 注册表单账号口径（账户系统批次 B：登录账号 login_id，docs §8.2；
-      // 表单 email 字段语义为邀请绑定的登录账号，显示名仅展示不用于登录）
+      // 注册表单账号口径（账户系统批次 C：登录账号 login_id，docs §8.2；
+      // 表单 login_id 字段为邀请绑定的登录账号，显示名仅展示不用于登录；
+      // key 名 register.invite.email 为不透明标识符，保持不动）
       "register.invite.email": "登录账号",
       "register.invite.email.ph": "邀请码绑定的登录账号",
       "register.invite.display": "显示名（可选，仅展示）",
@@ -897,7 +898,7 @@
       "register.invite.password.ph": "At least 15 characters; a long passphrase from a password manager is recommended",
       "register.invite.password.hint": "At least 15 characters. Paste from a password manager is fine; no character-class requirements.",
       // Register form account fields (account batch B: login ID, docs §8.2; the
-      // email form field means the invite-bound login ID; display name is
+      // login_id form field means the invite-bound login ID; display name is
       // display-only and never used for login)
       "register.invite.email": "Login ID",
       "register.invite.email.ph": "Login ID bound to the invite",

@@ -462,6 +462,50 @@ button {
   z-index: 1;
 }
 
+/* U3：多文件各自独立进度行（名称 + 独立进度条 + 三段状态） */
+.upload-progress-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+.upload-item {
+  padding: 6px 8px;
+  border: 1px solid var(--hover-strong);
+  border-radius: var(--r-row);
+  background: var(--hover);
+}
+.upload-item-name {
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.upload-item-bar {
+  height: 6px;
+  margin: 5px 0 4px;
+  background: var(--hover-strong);
+  border-radius: var(--r-pill);
+  position: relative;
+  overflow: hidden;
+}
+.upload-item-bar-fill {
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 0%;
+  background: var(--accent);
+  border-radius: var(--r-pill);
+  transition: width 0.2s ease;
+}
+.upload-item-bar-fill.upload-item-bar-error { background: var(--danger); }
+.upload-item-status {
+  font-size: 11px;
+  color: var(--text);
+}
+.upload-item.upload-item-error .upload-item-status { color: var(--danger); }
+
 /* =========================================================================
    项目行（Finder 风源列表行）
    ========================================================================= */

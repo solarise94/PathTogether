@@ -18,12 +18,26 @@
     "anno.branch.deep": { zh: "从此处深读", en: "Deep dive" },
     "anno.branch.deep.tip": { zh: "在 AI 面板从此标注开分支会话（全量工具深读）", en: "Open a branch session from here (full tools, deep read)" },
     "anno.private.badge": { zh: "私有", en: "Private" },
-    // 上传错误码 → 可读文案（上传修复 U1：服务端返回的机器码不再原样透出）
+    // 上传错误码 → 可读文案（上传修复 U1：服务端返回的机器码不再原样透出；
+    // U3 补充 V2 分片机器码与三段状态文案）
     "upload.err.csrf": { zh: "登录状态已失效，请刷新页面后重试", en: "Session expired, please refresh and retry" },
     "upload.err.guard": { zh: "上传配额服务暂不可用，请稍后重试", en: "Upload quota service unavailable, please retry later" },
     "upload.err.name": { zh: "名称不可用，请重命名后重试", en: "Name unavailable, please rename and retry" },
     "upload.err.too_large": { zh: "文件超过单次上传上限", en: "File exceeds the per-request upload limit" },
     "upload.err.disk": { zh: "服务器磁盘空间不足", en: "Insufficient disk space on server" },
+    "upload.err.offset_mismatch": { zh: "分片偏移与服务端不一致，正在对齐重传", en: "Chunk offset out of sync, realigning and retrying" },
+    "upload.err.hash_mismatch": { zh: "内容校验失败（哈希不匹配），请重新上传", en: "Integrity check failed (hash mismatch), please re-upload" },
+    "upload.err.state_conflict": { zh: "上传任务状态冲突，请刷新页面后重试", en: "Upload task state conflict, please refresh and retry" },
+    "upload.err.use_legacy": { zh: "ZIP/MRXS 请使用单请求上传", en: "ZIP/MRXS must use the single-request upload" },
+    "upload.err.invalid_slide": { zh: "文件校验失败：不是有效的切片文件", en: "Validation failed: not a valid slide file" },
+    "upload.err.commit_retry": { zh: "服务端校验暂时失败，请稍后重试提交", en: "Server validation failed temporarily, retry commit later" },
+    "upload.err.size_mismatch": { zh: "文件大小与声明不符，请重新上传", en: "File size mismatch, please re-upload" },
+    "upload.err.resume": { zh: "上传中断；刷新页面后将从断点续传", en: "Upload interrupted; refresh to resume from breakpoint" },
+    // U3 三段状态（§3.5：正在传输 → 服务端校验 → 入库完成）
+    "upload.stage.transferring": { zh: "正在传输", en: "Transferring" },
+    "upload.stage.validating": { zh: "服务端校验中", en: "Validating on server" },
+    "upload.stage.done": { zh: "入库完成", en: "Completed" },
+    "upload.stage.failed": { zh: "上传失败", en: "Upload failed" },
   };
   function tt(key) {
     try {
@@ -746,6 +760,7 @@
     progressWrap: $("progress-wrap"),
     progressBar: $("progress-bar"),
     progressText: $("progress-text"),
+    uploadProgressList: $("upload-progress-list"),
     viewerWrap: $("viewer-wrap"),
     dropOverlay: $("drop-overlay"),
     toastContainer: $("toast-container"),
@@ -3816,46 +3831,326 @@
 
   // ---------- 上传 ----------
   // 上传错误信息：已知机器码翻成可读文案，其余回退服务端 error 字段
-  // （多为中文描述）或 HTTP 状态码
+  // （多为中文描述）或 HTTP 状态码。U3 补充 V2 分片机器码（offset_mismatch/
+  // hash_mismatch/upload_state_conflict 等，upload-resumable-fix-plan §3.6）。
   function uploadErrorMessage(xhr, data) {
-    var code = (data && data.error) || "";
+    var code = (data && (data.code || data.error)) || "";
+    var status = (xhr && xhr.status) || 0;
     if (code === "csrf_required") return tt("upload.err.csrf");
     if (code === "upload_guard_unavailable") return tt("upload.err.guard");
     if (code === "name_unavailable") return tt("upload.err.name");
-    if (code === "upload_too_large" || xhr.status === 413) return tt("upload.err.too_large");
-    if (xhr.status === 507) return tt("upload.err.disk");
-    return code || xhr.status;
+    if (code === "offset_mismatch") return tt("upload.err.offset_mismatch");
+    if (code === "hash_mismatch") return tt("upload.err.hash_mismatch");
+    if (code === "upload_state_conflict") return tt("upload.err.state_conflict");
+    if (code === "use_legacy_upload") return tt("upload.err.use_legacy");
+    if (code === "invalid_slide") return tt("upload.err.invalid_slide");
+    if (code === "commit_retryable") return tt("upload.err.commit_retry");
+    if (code === "size_mismatch") return tt("upload.err.size_mismatch");
+    if (code === "upload_too_large" || status === 413) return tt("upload.err.too_large");
+    if (status === 507) return tt("upload.err.disk");
+    return code || status;
+  }
+
+  // ---------- 多文件独立进度行（U3 §3.5：修共用进度条的 bug） ----------
+  // 每个上传文件一行（名称 + 独立进度条 + 三段状态文本）；行挂在侧栏
+  // #upload-progress-list 容器下，完成后短暂保留再移除。容器缺失（旧模板）
+  // 时回退到旧的单进度条元素。
+  function humanSize(n) {
+    if (n >= 1024 * 1024 * 1024) return (n / (1024 * 1024 * 1024)).toFixed(1) + " GB";
+    if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
+    if (n >= 1024) return (n / 1024).toFixed(1) + " KB";
+    return n + " B";
+  }
+
+  function makeUploadRow(file) {
+    var host = els.uploadProgressList;
+    var row = document.createElement("div");
+    var nameEl = document.createElement("div");
+    var barWrap = document.createElement("div");
+    var bar = document.createElement("div");
+    var statusEl = document.createElement("div");
+    row.className = "upload-item";
+    nameEl.className = "upload-item-name";
+    barWrap.className = "upload-item-bar";
+    bar.className = "upload-item-bar-fill";
+    statusEl.className = "upload-item-status";
+    nameEl.textContent = (file && file.name || "?") + " · " +
+      humanSize((file && file.size) || 0);
+    barWrap.appendChild(bar);
+    row.appendChild(nameEl);
+    row.appendChild(barWrap);
+    row.appendChild(statusEl);
+    var fallback = !host || !host.appendChild;
+    if (!fallback) host.appendChild(row);
+    var removed = false;
+    function removeLater(delay) {
+      if (removed) return;
+      removed = true;
+      setTimeout(function () {
+        if (row.parentNode && row.parentNode.removeChild) {
+          row.parentNode.removeChild(row);
+        }
+      }, delay);
+    }
+    return {
+      // 三段状态：正在传输（confirmed_offset 为准）→ 服务端校验 → 入库完成
+      setStage: function (stageKey, frac) {
+        var label = tt(stageKey);
+        if (frac !== undefined && frac !== null && isFinite(frac)) {
+          label += " " + Math.round(frac * 100) + "%";
+        }
+        statusEl.textContent = label;
+        if (fallback) {
+          // 旧模板回退：写入共用进度条（单文件场景行为与旧版一致）
+          if (els.progressWrap && els.progressWrap.style) els.progressWrap.style.display = "block";
+          if (els.progressBar && els.progressBar.style) els.progressBar.style.width = Math.round((frac || 0) * 100) + "%";
+          if (els.progressText) els.progressText.textContent = label;
+        } else if (bar.style) {
+          bar.style.width = Math.round((frac || 0) * 100) + "%";
+        }
+      },
+      markError: function () {
+        if (row.classList) row.classList.add("upload-item-error");
+        if (bar && bar.classList) bar.classList.add("upload-item-bar-error");
+      },
+      finish: function (keepMs) {
+        if (fallback) {
+          if (els.progressWrap && els.progressWrap.style) els.progressWrap.style.display = "none";
+        } else {
+          removeLater(keepMs === undefined ? 6000 : keepMs);
+        }
+      },
+      _row: row,
+    };
+  }
+
+  // ---------- Upload V2：分片续传（U3；docs/upload-resumable-fix-plan §3） ----------
+  // 阈值与后端 UPLOAD_CHUNK_THRESHOLD 默认对齐（128MiB）；ZIP/MRXS 留旧接口
+  // （§3.4 首版只支持单文件 WSI）。分片严格串行单并发（§3.2.2），每片算
+  // SHA-256（Web Crypto 对该片 ArrayBuffer，不整文件入内存）；offset 以服务端
+  // confirmed_offset 为权威，offset_mismatch 时对齐重传（§3.2.1）。
+  var UPLOAD_V2_THRESHOLD = 128 * 1024 * 1024;
+
+  function shouldChunkUpload(file) {
+    if (!file || typeof file.size !== "number") return false;
+    var name = file.name || "";
+    var ext = name.slice(name.lastIndexOf(".") + 1).toLowerCase();
+    if (ext === "zip" || ext === "mrxs") return false;  // §3.4：ZIP/MRXS 走旧接口
+    return file.size >= UPLOAD_V2_THRESHOLD;
+  }
+
+  function uploadResumeKey(file) {
+    // 文件指纹（名+大小+mtime）：刷新后据此找回未完成任务（§3.5 断点恢复）
+    return "pt.upload.v2::" + (file.name || "") + ":" + file.size + ":" +
+      (file.lastModified || 0);
+  }
+
+  function sha256Hex(buf) {
+    // 单片哈希：Web Crypto 只需该片入内存（整文件哈希受限于无增量 API，
+    // 创建时不带 sha256_expected；commit 时服务端复算为权威，§3.2.3 裁决）
+    return crypto.subtle.digest("SHA-256", buf).then(function (digest) {
+      var bytes = new Uint8Array(digest);
+      var hex = "";
+      for (var i = 0; i < bytes.length; i++) {
+        hex += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+      }
+      return hex;
+    });
+  }
+
+  // XHR 发送（PUT 分片二进制用；与 apiFetch 同一 CSRF 双提交头契约）
+  function xhrSend(method, url, body, opts) {
+    opts = opts || {};
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      if (opts.onProgress) {
+        xhr.upload.addEventListener("progress", opts.onProgress);
+      }
+      xhr.addEventListener("load", function () {
+        var data = null;
+        try { data = JSON.parse(xhr.responseText); } catch (e) { /* 非 JSON body */ }
+        resolve({ status: xhr.status, data: data });
+      });
+      xhr.addEventListener("error", function () { reject({ network: true }); });
+      xhr.open(method, url);
+      var tok = csrfToken();
+      if (tok) xhr.setRequestHeader("X-CSRF-Token", tok);
+      xhr.send(body);
+    });
+  }
+
+  function uploadV2Chunks(file, task, row) {
+    // 严格串行：从 task.offset（= 服务端 confirmed_offset）逐片推进
+    var size = file.size;
+    function nextChunk() {
+      var offset = task.offset;
+      if (offset >= size) return Promise.resolve();
+      var end = Math.min(offset + task.chunk_size, size);
+      return file.slice(offset, end).arrayBuffer().then(function (buf) {
+        return sha256Hex(buf).then(function (hex) {
+          return xhrSend(
+            "PUT",
+            "/api/uploads/" + encodeURIComponent(task.upload_id) +
+              "/chunk?offset=" + offset + "&sha256=" + hex,
+            buf,
+            {
+              onProgress: function (e) {
+                // 乐观的片内发送进度（上限 99.9%，最终以 confirmed_offset 为准）
+                if (e.lengthComputable) {
+                  row.setStage("upload.stage.transferring",
+                    Math.min((offset + e.loaded) / size, 0.999));
+                }
+              },
+            });
+        });
+      }).then(function (resp) {
+        if (resp.status === 200 && resp.data &&
+            typeof resp.data.confirmed_offset === "number") {
+          // 服务端权威进度（§3.5：不用 XHR 本地发送进度）
+          task.offset = resp.data.confirmed_offset;
+          row.setStage("upload.stage.transferring", task.offset / size);
+          return nextChunk();
+        }
+        if (resp.status === 409 && resp.data &&
+            resp.data.code === "offset_mismatch" &&
+            typeof resp.data.confirmed_offset === "number") {
+          // 对齐重传（§3.2.1）：按服务端 confirmed_offset 回退/前进后重发
+          task.offset = resp.data.confirmed_offset;
+          return nextChunk();
+        }
+        throw { status: resp.status, data: resp.data };
+      });
+    }
+    return nextChunk();
+  }
+
+  function uploadFileV2(file, row) {
+    var key = uploadResumeKey(file);
+    var task = null;
+    Promise.resolve().then(function () {
+      // 1) 刷新恢复：按文件指纹找未完成任务，GET 状态后从 confirmed_offset 续传
+      var saved = null;
+      try { saved = JSON.parse(localStorage.getItem(key) || "null"); } catch (e) { saved = null; }
+      if (!saved || !saved.upload_id || saved.declared_size !== file.size) return null;
+      row.setStage("upload.stage.transferring", 0);
+      return apiFetch("/api/uploads/" + encodeURIComponent(saved.upload_id))
+        .then(function (r) {
+          if (!r.ok) return null;  // 403/404/409 等：任务没了 → 重新创建
+          return r.json().then(function (body) {
+            if (!body || body.state !== "active") return null;
+            return { upload_id: saved.upload_id,
+                     chunk_size: body.chunk_size,
+                     offset: body.confirmed_offset | 0 };
+          });
+        })
+        .catch(function () { return null; });
+    }).then(function (resumed) {
+      if (resumed) { task = resumed; return; }
+      // 2) 创建新任务（初始化即预占配额，服务端给 chunk_size）
+      row.setStage("upload.stage.transferring", 0);
+      return apiFetch("/api/uploads", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename: file.name, declared_size: file.size }),
+      }).then(function (r) {
+        return r.json().then(function (body) {
+          if (!r.ok || !body || !body.upload_id) {
+            throw { status: r.status, data: body };
+          }
+          task = { upload_id: body.upload_id,
+                   chunk_size: body.chunk_size,
+                   offset: body.confirmed_offset | 0 };
+          try {
+            localStorage.setItem(key, JSON.stringify({
+              upload_id: task.upload_id, declared_size: file.size,
+              chunk_size: task.chunk_size }));
+          } catch (e) { /* localStorage 不可用：仅失去刷新恢复 */ }
+        });
+      });
+    }).then(function () {
+      // 3) 串行传完全部分片
+      return uploadV2Chunks(file, task, row);
+    }).then(function () {
+      // 4) 服务端校验（commit 三段式：整文件复算 + OpenSlide + 原子提升）
+      row.setStage("upload.stage.validating");
+      return apiFetch("/api/uploads/" + encodeURIComponent(task.upload_id) +
+                      "/commit", { method: "POST" });
+    }).then(function (r) {
+      return r.json().then(function (body) {
+        if (!r.ok) throw { status: r.status, data: body };
+        return body;
+      });
+    }).then(function () {
+      try { localStorage.removeItem(key); } catch (e) { /* 同上 */ }
+      row.setStage("upload.stage.done");
+      row.finish();
+      toast(t("upload.done", { name: file.name }), "success");
+      loadAll();
+      openSlide(file.name);
+    }).catch(function (err) {
+      var data = (err && err.data) || null;
+      var status = (err && err.status) || 0;
+      var msg;
+      if (err && err.network) {
+        // 网络中断：任务与已传分片保留，刷新后可从 confirmed_offset 续传
+        msg = tt("upload.err.resume");
+      } else {
+        msg = uploadErrorMessage({ status: status }, data);
+      }
+      // 确定性失败（§3.1）：原任务不可再用，清恢复记录（下次全新上传）
+      var code = data && data.code;
+      if (code === "hash_mismatch" || code === "invalid_slide" ||
+          code === "name_unavailable" || code === "size_mismatch") {
+        try { localStorage.removeItem(key); } catch (e) { /* 同上 */ }
+      }
+      row.markError();
+      row.setStage("upload.stage.failed");
+      row.finish(10000);
+      toast(t("upload.fail", { e: msg }), "error");
+    });
   }
 
   function uploadFile(file) {
     if (!file) return;
+    var row = makeUploadRow(file);
+    if (shouldChunkUpload(file)) {
+      uploadFileV2(file, row);
+      return;
+    }
+    uploadFileLegacy(file, row);
+  }
+
+  // 旧单请求上传：小文件与 ZIP/MRXS（§3.4 并存）
+  function uploadFileLegacy(file, row) {
     var formData = new FormData();
     formData.append("file", file);
     var xhr = new XMLHttpRequest();
-    els.progressWrap.style.display = "block";
-    els.progressBar.style.width = "0%";
-    els.progressText.textContent = "0%";
+    row.setStage("upload.stage.transferring", 0);
     xhr.upload.addEventListener("progress", function (e) {
       if (e.lengthComputable) {
-        var pct = Math.round((e.loaded / e.total) * 100);
-        els.progressBar.style.width = pct + "%";
-        els.progressText.textContent = pct + "%";
+        row.setStage("upload.stage.transferring", e.loaded / e.total);
       }
     });
     xhr.addEventListener("load", function () {
-      els.progressWrap.style.display = "none";
       var data;
-      try { data = JSON.parse(xhr.responseText); } catch (e) { toast(t("upload.parse.fail"), "error"); return; }
+      try { data = JSON.parse(xhr.responseText); } catch (e) { row.finish(); toast(t("upload.parse.fail"), "error"); return; }
       if (xhr.status >= 200 && xhr.status < 300) {
+        row.setStage("upload.stage.done");
+        row.finish();
         toast(t("upload.done", { name: data.name }), "success");
         loadAll();
         openSlide(data.name);
       } else {
+        row.markError();
+        row.setStage("upload.stage.failed");
+        row.finish(10000);
         toast(t("upload.fail", { e: uploadErrorMessage(xhr, data) }), "error");
       }
     });
     xhr.addEventListener("error", function () {
-      els.progressWrap.style.display = "none";
+      row.markError();
+      row.setStage("upload.stage.failed");
+      row.finish(10000);
       toast(t("upload.net.fail"), "error");
     });
     xhr.open("POST", "/api/upload");
@@ -3864,9 +4159,14 @@
     xhr.setRequestHeader("X-CSRF-Token", csrfToken());
     xhr.send(formData);
   }
-  // 供测试（tests/js/upload-csrf.test.ts loadApp harness）驱动真实上传路径；
+  // 供测试（tests/js/*.test.ts loadApp harness）驱动真实上传路径；
   // 与 HP_AUTH 同风格的命名空间导出，不进业务调用面
-  window.HP_UPLOAD = { uploadFile: uploadFile };
+  window.HP_UPLOAD = {
+    uploadFile: uploadFile,
+    uploadFileV2: uploadFileV2,
+    shouldChunkUpload: shouldChunkUpload,
+    UPLOAD_V2_THRESHOLD: UPLOAD_V2_THRESHOLD,
+  };
 
   // ---------- 拖拽上传 ----------
   function setupDragDrop() {

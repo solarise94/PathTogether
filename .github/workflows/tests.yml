@@ -21,6 +21,37 @@ jobs:
       - run: python -m pip install -r requirements.txt -r requirements-dev.txt
       - run: python -m pytest tests -q
 
+  # PG 后端全量跑（test-review P0-3）：requirements-dev.txt 已含 pgserver，
+  # conftest 在 RUN_PG_TESTS=1 时自动起内嵌 PostgreSQL 并设 STORAGE_BACKEND。
+  python-pg:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      - run: python -m pytest tests -q
+        env:
+          RUN_PG_TESTS: "1"
+      # canary 不可跳过：单独再跑一次 canary 文件，断言真实执行且未被 skip
+      # （若 pgserver 缺失 / RUN_PG_TESTS 未生效，canary 会 fail 或 skip，此步红）
+      - name: PG canary 必须真实执行
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_pg_backend_canary.py -q -rA | tee canary-out.txt
+          if grep -qiE "skipped|no tests ran" canary-out.txt; then
+            echo "::error::PG canary 被 skip——pgserver/psycopg 缺失或 RUN_PG_TESTS 未生效"
+            exit 1
+          fi
+          grep -q "passed" canary-out.txt || {
+            echo "::error::PG canary 没有 passed 输出（未真实执行）"
+            exit 1
+          }
+        env:
+          RUN_PG_TESTS: "1"
+
   host-bridge:
     runs-on: ubuntu-latest
     steps:

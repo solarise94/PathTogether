@@ -187,16 +187,18 @@
                data-i18n-ph="register.invite.code.ph" placeholder="粘贴管理员发送的邀请码" />
       </div>
       <div class="field">
-        <label for="email" data-i18n="register.invite.email">邮箱 / 用户名</label>
+        <!-- 批次 B（docs §8.2）：表单 email 字段语义为登录账号 login_id
+             （邀请绑定的就是「允许兑换的登录账号」），非已验证邮箱 -->
+        <label for="email" data-i18n="register.invite.email">登录账号</label>
         <input id="email" name="email" type="text" required maxlength="120"
                autocomplete="username"
-               data-i18n-ph="register.invite.email.ph" placeholder="邀请码绑定的邮箱" />
+               data-i18n-ph="register.invite.email.ph" placeholder="邀请码绑定的登录账号" />
       </div>
       <div class="field">
-        <label for="display_name" data-i18n="register.invite.display">显示名（可选）</label>
+        <label for="display_name" data-i18n="register.invite.display">显示名（可选，仅展示）</label>
         <input id="display_name" name="display_name" type="text" maxlength="120"
                autocomplete="nickname"
-               data-i18n-ph="register.invite.display.ph" placeholder="其他人看到的名字" />
+               data-i18n-ph="register.invite.display.ph" placeholder="其他人看到的名字（不用于登录）" />
       </div>
       <div class="field">
         <label for="password" data-i18n="register.invite.password">设置密码</label>

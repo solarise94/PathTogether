@@ -1,21 +1,27 @@
 # -*- coding: utf-8 -*-
 """邀请注册存储原语（registration_invites，P0-B docs §4.2/§4.3/§4.4）。
 
+账户系统批次 B（docs/account-system-simplification-fix-plan.md §8.2）：
+邀请绑定字段（物理列 ``email_normalized``，批次 C 才改名）的语义为
+**「允许兑换的登录账号 login_id」**，不是已验证邮箱。本模块函数签名与参数名
+（``email`` / ``email_normalized``）本批次保持不变，注释按 login_id 语义表述；
+兑换匹配的是用户自选的登录账号，display_name 不参与唯一性或邀请匹配。
+
 安全不变量：
 
 - 邀请码明文 ``secrets.token_urlsafe(32)``（≥32 字节 CSPRNG），只在
   ``create_invite`` 的返回值里出现一次（owner 经可信通道线下交付）；数据库只存
   带域分离盐的 HMAC-SHA-256（``token_hash`` UNIQUE），绝不存明文；
 - ``redeem_invite`` 在**单个 PostgreSQL 事务**内完成：按 token_hash
-  ``SELECT ... FOR UPDATE`` 锁行 → 检查撤销/过期/消费 → 绑定邮箱常数时间比较
-  → users 邮箱唯一检查 → 生成 user_id + Werkzeug 密码 hash 插入 role=user
-  （不走 user_store.create_user——它自开连接，会产生跨事务窗口）→ 消费 invite
-  → 写注册审计 → commit。并发兑换同一邀请码只有一个成功；
+  ``SELECT ... FOR UPDATE`` 锁行 → 检查撤销/过期/消费 → 绑定登录账号常数时间
+  比较 → users 登录账号唯一检查 → 生成 user_id + Werkzeug 密码 hash 插入
+  role=user（不走 user_store.create_user——它自开连接，会产生跨事务窗口）→
+  消费 invite → 写注册审计 → commit。并发兑换同一邀请码只有一个成功；
 - 对外（路由/调用方）所有兑换失败统一 ``InviteRedeemError``，公开 code 固定
-  ``invite_invalid_or_unavailable``（不泄露不存在/已撤销/已消费/邮箱不匹配的
+  ``invite_invalid_or_unavailable``（不泄露不存在/已撤销/已消费/账号不匹配的
   细分状态）；细分 reason 只进 owner 审计 detail 与日志，且**绝不包含 token**；
 - 审计只记 invite_id、actor、状态、被创建 user_id；不记 token、密码、完整 IP、
-  明文邮箱（owner 列表也只显示邮箱掩码）；
+  明文登录账号（owner 列表也只显示掩码）；
 - json/dual 后端 fail-closed（platform_features.require_pg_backend）。
 
 Werkzeug 密码哈希沿用默认算法（当前 scrypt:32768:8:1），旧 hash 验证兼容由
@@ -107,12 +113,16 @@ def invite_token_hash(token: str) -> str:
 
 
 def normalize_email(email) -> str:
-    """邮箱规范化：strip + lower（与 user_store 写入侧一致）。"""
+    """登录账号规范化：strip + lower（与 user_store 写入侧一致）。
+
+    参数/函数名沿用 email（批次 C 收口为 login_id）；规范化口径即 login_id
+    的唯一键规范化（docs §3.1/§8.2）。
+    """
     return str(email or "").strip().lower()
 
 
 def mask_email(email) -> str:
-    """owner 列表展示用邮箱掩码：保留首字符与域名（无 @ 则保留首字符）。"""
+    """owner 列表展示用登录账号掩码：保留首字符与域名（无 @ 则保留首字符）。"""
     s = str(email or "").strip()
     if not s:
         return ""
@@ -135,9 +145,11 @@ def _insert_user_locked(cur, email_normalized, password, display_name,
                         ai_access=False):
     """在**调用方事务的 cursor** 内插入 role=user 用户行，返回公共 dict。
 
+    email_normalized 语义为规范化登录账号 login_id（批次 B docs §8.2）。
     与 user_store_pg.create_user 的差异：不开连接、不独立提交（供 redeem_invite
     同事务使用）；users.lower(email) 唯一索引冲突时抛 psycopg UniqueViolation
-    （由调用方在同一事务内翻译为统一错误并回滚）。
+    （由调用方在同一事务内翻译为统一错误并回滚）。返回 dict 同时携带
+    "login_id" 与 "email"（deprecated，同值；docs §4.1 兼容窗口）。
     """
     uid = _new_user_id()
     name = str(display_name or "").strip() or email_normalized
@@ -155,6 +167,7 @@ def _insert_user_locked(cur, email_normalized, password, display_name,
     row = cur.fetchone()
     out = dict(row)
     out["ai_access"] = bool(out.get("ai_access"))
+    out["login_id"] = out.get("email")
     return out
 
 
@@ -196,8 +209,9 @@ def create_invite(created_by_user_id, email=None,
     """创建一次性邀请码。返回 dict：含**明文 token**（唯一出现处）与行信息。
 
     - token：``secrets.token_urlsafe(32)``；库内只存 invite_token_hash(token)；
-    - email 给出时按 normalize_email 绑定（推荐）；None = 不绑定（owner 明确
-      选择的高风险选项，UI 需标注）；
+    - email 给出时按 normalize_email 绑定——语义为「允许兑换的登录账号
+      login_id」（批次 B docs §8.2；参数名沿用 email，批次 C 收口改名）；
+      None = 不绑定（owner 明确选择的高风险选项，UI 需标注）；
     - ai_access/cohort/note 为邀请模板：兑换时决定新用户平台 AI 权限与分组。
     """
     platform_features.require_pg_backend("registration_invites")
@@ -205,7 +219,7 @@ def create_invite(created_by_user_id, email=None,
         raise ValueError("created_by_user_id 不能为空")
     bound = normalize_email(email) if email else ""
     if email and not bound:
-        raise ValueError("绑定邮箱不能为空白")
+        raise ValueError("绑定登录账号不能为空白")
     try:
         ttl = int(ttl_seconds)
     except (TypeError, ValueError):
@@ -330,13 +344,18 @@ class _RedeemFail(Exception):
 def redeem_invite(token, email, password, display_name=None):
     """兑换邀请码并在**同一事务**内创建 role=user 账号。
 
+    ``email`` 参数语义为兑换人自选的**登录账号 login_id**（批次 B docs §8.2；
+    参数名沿用 email，批次 C 收口改名）。
+
     失败一律抛 ``InviteRedeemError``（对外统一 code
     ``invite_invalid_or_unavailable``）：
       - 无效/随机 token、过期、撤销、已消费（细分 reason：not_found / expired /
         revoked / consumed）；
-      - 绑定邮箱不匹配（email_mismatch；常数时间比较规范化值）；
-      - users 邮箱已存在（email_taken；此时 invite 未消费——检查先于 UPDATE）；
-    成功返回 ``{"user": <新用户公共 dict>, "invite_id": ..., "email": ...}``。
+      - 绑定登录账号不匹配（email_mismatch；常数时间比较规范化值）；
+      - users 登录账号已存在（email_taken；此时 invite 未消费——检查先于
+        UPDATE）；
+    成功返回 ``{"user": <新用户公共 dict>, "invite_id": ..., "email": ...}``
+    （email 键值即规范化 login_id；批次 C 收口键名）。
     成功审计在同一事务内（registration.redeem，actor=被创建 user_id）；失败审计
     在独立 best-effort 事务（主事务已随异常回滚），detail 只含 invite_id/status。
     """

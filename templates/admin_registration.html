@@ -153,8 +153,10 @@
       <h2>创建邀请码</h2>
       <div class="field-inline">
         <div>
-          <label>绑定邮箱（留空 = 不绑定，高风险）</label>
-          <input type="text" id="inv-email" maxlength="120" placeholder="user@example.com" />
+          <!-- 批次 B（docs §8.2）：绑定字段语义为「允许兑换的登录账号 login_id」，
+               非已验证邮箱；留空 = 不绑定（高风险） -->
+          <label>绑定登录账号（留空 = 不绑定，高风险）</label>
+          <input type="text" id="inv-email" maxlength="120" placeholder="被邀请人的登录账号，如 alice 或 alice@example.com" />
         </div>
         <div>
           <label>有效期（小时，默认 168 = 7 天）</label>
@@ -198,7 +200,7 @@
       <table>
         <thead>
           <tr>
-            <th>邮箱（掩码）</th><th>状态</th><th>过期时间</th><th>AI</th><th>cohort</th><th>备注</th><th></th>
+            <th>登录账号（掩码）</th><th>状态</th><th>过期时间</th><th>AI</th><th>cohort</th><th>备注</th><th></th>
           </tr>
         </thead>
         <tbody id="inv-tbody"></tbody>
@@ -271,7 +273,9 @@
           tb.innerHTML = list.map(function (i) {
             var revokeBtn = i.status === "open"
               ? '<button class="btn secondary small" data-revoke="' + esc(i.invite_id) + '">撤销</button>' : "";
-            return "<tr><td>" + esc(i.email_masked || "（不绑定）") +
+            // 批次 B：绑定字段语义为登录账号——优先读 login_id_masked
+            //（email_masked 为 deprecated 兼容键，同值）
+            return "<tr><td>" + esc(i.login_id_masked || i.email_masked || "（不绑定）") +
               "</td><td><span class=\"pill " + i.status + "\">" + i.status + "</span></td>" +
               "<td>" + fmtTs(i.expires_at) + "</td>" +
               "<td>" + (i.ai_access ? "开" : "关") + "</td>" +
@@ -303,7 +307,9 @@
       document.getElementById("inv-create").addEventListener("click", function () {
         var body = {};
         var email = document.getElementById("inv-email").value.trim();
-        if (email) body.email = email;
+        // 批次 B：绑定字段语义为登录账号，请求体用 login_id（email 为
+        // deprecated 兼容入参，服务端两者同语义）
+        if (email) body.login_id = email;
         var ttl = parseInt(document.getElementById("inv-ttl").value || "168", 10);
         if (ttl) body.ttl_hours = ttl;
         var cohort = document.getElementById("inv-cohort").value.trim();

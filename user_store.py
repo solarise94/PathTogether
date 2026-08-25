@@ -50,6 +50,10 @@ if STORAGE_BACKEND not in _VALID_BACKENDS:
 #: 删除 ensure_owner / first_owner，新增 owner 原语与统一密码策略常量；
 #: PASSWORD_MIN_LENGTH / PASSWORD_MAX_LENGTH / OwnerInvariantError 由本表
 #: re-export，调用方一律 ``import user_store`` 后访问。
+#:
+#: 账户系统批次 B（docs §6.1）：删除 get_user_by_display_name——其唯一调用方
+#: 是 verify_user 的 display_name 登录 fallback（已随本批次移除），全仓无
+#: 展示用途调用方。
 _JSON_PUBLIC_NAMES = (
     # —— 常量 ——
     "SHARE_DATA_DIR",
@@ -70,7 +74,6 @@ _JSON_PUBLIC_NAMES = (
     "create_user",
     "get_user",
     "get_user_by_email",
-    "get_user_by_display_name",
     "verify_user",
     "list_users",
     "set_user_disabled",

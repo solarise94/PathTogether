@@ -151,10 +151,10 @@ def test_user_crud_and_email_unique():
     check("get_user_by_email 命中", by_email is not None)
     check("get_user_by_email 带 auth_version",
           by_email.get("auth_version") == 1)
-    by_name = user_store.get_user_by_display_name("Alice")
-    check("get_user_by_display_name 命中", by_name is not None)
-    check("get_user_by_display_name 带 auth_version",
-          by_name.get("auth_version") == 1)
+    # 批次 B（docs §6.1）：get_user_by_display_name 已删除（原唯一调用方是
+    # verify_user 的 display_name 登录 fallback）；dispatcher 不再导出该名
+    check("get_user_by_display_name 已从 dispatcher 删除",
+          not hasattr(user_store, "get_user_by_display_name"))
 
     listed = user_store.list_users()
     check("list_users 不含 hash", listed and "password_hash" not in listed[0])

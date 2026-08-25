@@ -213,8 +213,9 @@
           </div>
           <div id="users-mgr-body" class="section-body">
             <div class="users-add-form">
-              <input id="users-email" type="text" maxlength="120" data-i18n-ph="sb.users.email.ph" placeholder="邮箱 / 用户名" autocomplete="off" />
-              <input id="users-display" type="text" maxlength="120" data-i18n-ph="sb.users.display.ph" placeholder="显示名（可选）" autocomplete="off" />
+              <!-- 批次 B（docs §8.1）：登录账号 login_id；显示名仅展示不用于登录 -->
+              <input id="users-email" type="text" maxlength="120" data-i18n-ph="sb.users.email.ph" placeholder="登录账号" autocomplete="off" />
+              <input id="users-display" type="text" maxlength="120" data-i18n-ph="sb.users.display.ph" placeholder="显示名（可选，仅展示）" autocomplete="off" />
               <input id="users-password" type="password" minlength="15" maxlength="200" data-i18n-ph="sb.users.password.ph" placeholder="初始密码（≥15位）" autocomplete="new-password" />
               <button id="users-add-btn" class="btn primary block" data-i18n="sb.users.add">添加用户</button>
             </div>

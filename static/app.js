@@ -261,8 +261,8 @@
       var resetBtn = isOwner ? "" :
         '<button class="btn secondary small" data-act="reset" data-uid="' + esc(u.user_id) + '">' + esc(tt("sb.users.reset")) + '</button>';
       return '<div class="user-row" data-uid="' + esc(u.user_id) + '">' +
-        '<div class="user-main"><span class="user-name">' + esc(u.display_name || u.email) + '</span>' +
-        '<span class="user-sub">' + esc(u.email) + ' · ' + roleTxt + ' · ' + statusTxt + '</span>' +
+        '<div class="user-main"><span class="user-name">' + esc(u.display_name || u.login_id || u.email) + '</span>' +
+        '<span class="user-sub">' + esc(u.login_id || u.email) + ' · ' + roleTxt + ' · ' + statusTxt + '</span>' +
         '<span class="user-created">' + esc(created) + '</span></div>' +
         '<div class="user-actions">' +
         disableBtn +
@@ -303,14 +303,16 @@
   }
 
   function submitAddUser() {
-    var email = (els.usersEmail.value || "").trim();
+    // 批次 B（docs §4.1/§8.1）：登录账号字段优先发 login_id（email 为服务端
+    // deprecated 兼容入参）；显示名仅展示，不用于登录
+    var loginId = (els.usersEmail.value || "").trim();
     var password = els.usersPassword.value || "";
     var display = (els.usersDisplay.value || "").trim();
-    if (!email || !password) { toast(tt("sb.users.reset.confirm"), "error"); return; }
+    if (!loginId || !password) { toast(tt("sb.users.reset.confirm"), "error"); return; }
     apiFetch("/api/admin/users", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: email, password: password, display_name: display || undefined }),
+      body: JSON.stringify({ login_id: loginId, password: password, display_name: display || undefined }),
     }).then(function (r) {
       return r.json().then(function (b) { return { status: r.status, body: b }; });
     }).then(function (res) {

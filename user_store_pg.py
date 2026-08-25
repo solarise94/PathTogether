@@ -23,6 +23,14 @@ app.py / share_server.py / tests 一行不改。
   - 密码统一 15..200 策略（PASSWORD_MIN_LENGTH / PASSWORD_MAX_LENGTH），
     无旁路参数。
 
+账户系统批次 B（docs §4.1/§6.1，登录标识收口）：
+  - 返回用户 dict 的读/写路径统一同时携带 "email"（deprecated，批次 C 移除）
+    与 "login_id"（规范名，同值）两键；物理列仍为 users.email（批次 C 才改名），
+    不在 SQL 里加列别名；
+  - verify_user 只认规范化 login_id（trim + lower 后按 lower(email) 唯一索引
+    查），删除 display_name 登录 fallback（展示属性不得用作身份属性）；
+  - get_user_by_display_name 已删除（全仓无认证路径之外的调用方）。
+
 无文件锁 / SHARE_DATA_DIR 语义：PG 是唯一事实源。SHARE_DATA_DIR / USER_FILE 仍
 暴露为 None 占位，仅供 dispatcher 公共名校验（hasattr）与形状兼容。
 """
@@ -120,13 +128,33 @@ def _user_id() -> str:
 
 
 def _normalize_email(email: str) -> str:
-    """email 唯一键规范化：小写 + 去首尾空白（与 json 一致）。"""
+    """登录账号（login_id）规范化：小写 + 去首尾空白（与 json 一致）。
+
+    物理列名为 email（批次 C 改名）；规范化即 login_id 的唯一键规范化。
+    """
     return str(email or "").strip().lower()
 
 
-def _public(user: dict) -> dict:
-    """导出副本（不含 password_hash），与 json `_to_public` 对齐。"""
+def _with_login_id(user):
+    """批次 B 兼容窗口（docs §4.1）：返回同时携带 login_id 与 email 的副本。
+
+    物理列仍为 users.email（批次 C 才物理改名）；返回 dict 中 "login_id" 为
+    规范登录标识，"email" 同值但 **deprecated**（批次 C 移除）。含 hash 与
+    不含 hash 的出口统一经本函数（或其包装 _public）补键。None 透传。
+    """
+    if user is None:
+        return None
     out = dict(user)
+    out["login_id"] = out.get("email")
+    return out
+
+
+def _public(user: dict) -> dict:
+    """导出副本（不含 password_hash），与 json `_to_public` 对齐。
+
+    批次 B 起统一经 _with_login_id 补 login_id 别名键（docs §4.1）。
+    """
+    out = _with_login_id(user)
     out.pop("password_hash", None)
     return out
 
@@ -159,7 +187,11 @@ _SEL_PUBLIC = (
 
 
 def create_user(email, password, role=ROLE_USER, display_name=None):
-    """创建用户。返回新用户 dict（不含 hash）；email 冲突抛 ValueError。
+    """创建用户。返回新用户 dict（不含 hash）；登录账号冲突抛 ValueError。
+
+    参数名 ``email`` 本批次保持不变（批次 C 收口为 login_id），语义为**登录账号**
+    （login_id，docs §3.1）：可为用户名或邮箱形式，写入前 trim + lower 规范化。
+    返回 dict 同时携带 "login_id" 与 "email"（deprecated，同值，docs §4.1）。
 
     密码统一执行 15..200 策略（无旁路参数；批次 A docs §3.3）。
     在 PG 上创建第二个 enabled owner 会被 users_single_enabled_owner_key
@@ -169,7 +201,7 @@ def create_user(email, password, role=ROLE_USER, display_name=None):
         raise ValueError("非法角色")
     norm_email = _normalize_email(email)
     if not norm_email:
-        raise ValueError("邮箱/用户名不能为空")
+        raise ValueError("登录账号不能为空")
     _validate_password(password)
     name = str(display_name or "").strip() or norm_email
     uid = _user_id()
@@ -207,11 +239,14 @@ def _unique_violation_message(exc):
     if "users_single_enabled_owner_key" in name or \
             "users_single_enabled_owner_key" in text:
         return "已存在启用的 owner：单 enabled owner 不变量（0015 索引）禁止再建"
-    return "该邮箱/用户名已存在"
+    return "该登录账号已存在"
 
 
 def get_user(user_id):
-    """按 user_id 取用户 dict（含 hash）；不存在返回 None。"""
+    """按 user_id 取用户 dict（含 hash）；不存在返回 None。
+
+    批次 B 起 dict 同时携带 "login_id" 与 "email"（deprecated，同值）。
+    """
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -221,13 +256,18 @@ def get_user(user_id):
                     (user_id,),
                 )
                 row = cur.fetchone()
-        return dict(row) if row else None
+        return _with_login_id(row) if row else None
     finally:
         conn.close()
 
 
 def get_user_by_email(email):
-    """按 email（小写规范化）取用户 dict（含 hash）；不存在返回 None。"""
+    """按登录账号（login_id，物理列 email；trim+lower 规范化）取用户 dict
+    （含 hash）；不存在返回 None。
+
+    认证路径唯一入口（docs §6.1，批次 B）：按 lower(email) 唯一索引查。
+    返回 dict 同时携带 "login_id" 与 "email"（deprecated，同值）。
+    """
     key = _normalize_email(email)
     if not key:
         return None
@@ -240,40 +280,25 @@ def get_user_by_email(email):
                     (key,),
                 )
                 row = cur.fetchone()
-        return dict(row) if row else None
+        return _with_login_id(row) if row else None
     finally:
         conn.close()
 
 
-def get_user_by_display_name(display_name):
-    """按 display_name 精确匹配取用户 dict（含 hash）；不存在返回 None。"""
-    key = str(display_name or "").strip()
-    if not key:
-        return None
-    conn = _connect()
-    try:
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
-                cur.execute(
-                    "SELECT " + _SEL_HASH + " FROM users WHERE display_name=%s",
-                    (key,),
-                )
-                row = cur.fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
+def verify_user(login_id, password):
+    """校验登录：只认规范化 login_id，按唯一索引查用户并核对密码（docs §6.1）。
 
+    流程：normalize(trim + lower) → 按 lower(email) 唯一索引查 → disabled
+    检查 → check_password_hash。display_name 不再参与登录解析（批次 B 删除
+    fallback：展示属性可重复，不得用作身份属性）。
 
-def verify_user(email_or_name, password):
-    """校验登录：按 email 或 display_name 查找用户并核对密码。
-
-    返回用户 dict（含 hash）；查无此人 / 被禁用 / 密码错误返回 None。
+    返回用户 dict（含 hash，携带 login_id/email 双键）；查无此人 / 被禁用 /
+    密码错误一律返回 None——调用方统一「账号或密码错误」文案，不泄露账号
+    存在性。
     """
     if not isinstance(password, str) or not password:
         return None
-    user = get_user_by_email(email_or_name)
-    if user is None:
-        user = get_user_by_display_name(email_or_name)
+    user = get_user_by_email(login_id)
     if user is None:
         return None
     if user.get("disabled"):
@@ -455,6 +480,7 @@ def list_enabled_owners():
 
     按 created_at, user_id 升序；每项含 password_hash 与 auth_version
     （owner 解析需要校验 hash 非空，属内部 API，不经公共用户输出）。
+    批次 B 起每项同时携带 "login_id" 与 "email"（deprecated，同值）。
     """
     conn = _connect()
     try:
@@ -466,7 +492,7 @@ def list_enabled_owners():
                     "ORDER BY extract(epoch from created_at) ASC, user_id"
                 )
                 rows = cur.fetchall()
-        return [dict(r) for r in rows]
+        return [_with_login_id(r) for r in rows]
     finally:
         conn.close()
 
@@ -483,13 +509,14 @@ def list_owners():
                     "ORDER BY extract(epoch from created_at) ASC, user_id"
                 )
                 rows = cur.fetchall()
-        return [dict(r) for r in rows]
+        return [_with_login_id(r) for r in rows]
     finally:
         conn.close()
 
 
 def create_bootstrap_owner(login_id, password):
-    """空库首建 owner（仅引导用）。返回新 owner dict（含 hash 与 auth_version）。
+    """空库首建 owner（仅引导用）。返回新 owner dict（含 hash 与 auth_version，
+    批次 B 起同时携带 login_id/email 双键）。
 
     语义（docs §5.2/§5.3）：
       - 仅当 users 表**完全为空**时创建；任何已存在行 → OwnerInvariantError
@@ -542,7 +569,7 @@ def create_bootstrap_owner(login_id, password):
                 "multiple_enabled_owners：并发创建 owner 被单 enabled owner "
                 "索引（users_single_enabled_owner_key）拒绝"
             ) from exc
-        return dict(row)
+        return _with_login_id(row)
     finally:
         conn.close()
 

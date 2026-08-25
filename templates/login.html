@@ -319,7 +319,9 @@
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
         <input type="hidden" name="next" value="{{ next_url }}" />
         <div class="field">
-          <label for="username" data-i18n="login.username">邮箱或用户名</label>
+          <!-- 批次 B（docs §8.1）：登录只认登录账号 login_id；不承诺「显示名
+               可登录」。表单字段名仍为 username（页面语义不变） -->
+          <label for="username" data-i18n="login.username">登录账号</label>
           <input id="username" name="username" type="text" autocomplete="username"
                  autofocus required />
         </div>

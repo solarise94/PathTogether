@@ -89,8 +89,8 @@
       "sb.share.perm.hint": "只能分享你拥有的切片",
       "sb.logout": "退出登录",
       "sb.section.users": "用户管理",
-      "sb.users.email.ph": "邮箱 / 用户名",
-      "sb.users.display.ph": "显示名（可选）",
+      "sb.users.email.ph": "登录账号",
+      "sb.users.display.ph": "显示名（可选，仅展示）",
       "sb.users.password.ph": "初始密码（≥15位）",
       "sb.users.add": "添加用户",
       "sb.users.reg.open": "开放注册：关闭",
@@ -242,9 +242,11 @@
       "ai.start.aria": "开始",
 
       // ---- login（docs §6.1/§8.3：去 admin 专属措辞） ----
+      // 批次 B（账户系统 docs §6.1/§8.1）：登录只认登录账号 login_id，
+      // 不再承诺「邮箱或用户名/显示名可登录」
       "login.title": "登录 PathTogether",
       "login.subtitle": "登录后继续查看、测试 AI 和协作",
-      "login.username": "邮箱或用户名",
+      "login.username": "登录账号",
       "login.password": "密码",
       "login.submit": "登录",
       "login.submitting": "登录中…",
@@ -276,6 +278,12 @@
       // 注册表单密码口径（账户系统批次 A：统一 15..200，docs §3.3）
       "register.invite.password.ph": "至少 15 位，推荐使用密码管理器生成的长口令",
       "register.invite.password.hint": "至少 15 位，可直接使用密码管理器生成并粘贴；不要求大小写或符号组合。",
+      // 注册表单账号口径（账户系统批次 B：登录账号 login_id，docs §8.2；
+      // 表单 email 字段语义为邀请绑定的登录账号，显示名仅展示不用于登录）
+      "register.invite.email": "登录账号",
+      "register.invite.email.ph": "邀请码绑定的登录账号",
+      "register.invite.display": "显示名（可选，仅展示）",
+      "register.invite.display.ph": "其他人看到的名字（不用于登录）",
 
       // ---- Demo 页（Phase 2 只读 Viewer） ----
       "demo.title": "Demo 体验",
@@ -699,8 +707,8 @@
       "sb.share.perm.hint": "You can only share slides you own",
       "sb.logout": "Log out",
       "sb.section.users": "Users",
-      "sb.users.email.ph": "Email / username",
-      "sb.users.display.ph": "Display name (optional)",
+      "sb.users.email.ph": "Login ID",
+      "sb.users.display.ph": "Display name (optional, display only)",
       "sb.users.password.ph": "Initial password (≥15 chars)",
       "sb.users.add": "Add user",
       "sb.users.reg.open": "Open registration: off",
@@ -852,9 +860,11 @@
       "ai.start.aria": "Start",
 
       // ---- login（docs §6.1/§8.3：去 admin 专属措辞） ----
+      // Batch B (account docs §6.1/§8.1): login accepts the login ID only —
+      // no longer promises "email or username / display name" logins
       "login.title": "Log in to PathTogether",
       "login.subtitle": "Continue viewing, testing AI, and collaborating",
-      "login.username": "Email or username",
+      "login.username": "Login ID",
       "login.password": "Password",
       "login.submit": "Log in",
       "login.submitting": "Logging in…",
@@ -886,6 +896,13 @@
       // Register form password policy (account batch A: unified 15..200, docs §3.3)
       "register.invite.password.ph": "At least 15 characters; a long passphrase from a password manager is recommended",
       "register.invite.password.hint": "At least 15 characters. Paste from a password manager is fine; no character-class requirements.",
+      // Register form account fields (account batch B: login ID, docs §8.2; the
+      // email form field means the invite-bound login ID; display name is
+      // display-only and never used for login)
+      "register.invite.email": "Login ID",
+      "register.invite.email.ph": "Login ID bound to the invite",
+      "register.invite.display": "Display name (optional, display only)",
+      "register.invite.display.ph": "Name shown to others (not used for login)",
 
       // ---- Demo page (Phase 2 read-only viewer) ----
       "demo.title": "Demo",

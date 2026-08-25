@@ -1,0 +1,318 @@
+# -*- coding: utf-8 -*-
+"""S5 路径回放代理 + `_require_ai_session_owner` 四端点越权补齐测试。
+
+覆盖（test-review-and-optimization P1-7 + session-isolation-fix-plan S5）：
+  - GET /api/ai/session/<id>/path 代理：属主 200、透传 after_seq/limit、
+    user B 读 A 的 path → 403（sidecar 只收到归属查询，无 path 转发）；
+    archived session 属主仍可读（S5 契约：owner 归属判定不看 archived 位）；
+  - `_require_ai_session_owner` 挂载的 session 详情 / stream / archive /
+    unarchive 四处补 user B→A 403（此前只有 cancel 有越权用例）。
+
+Fake sidecar（FakeRequests）替换 app.requests，无需真 HistoPilot 服务；
+path 投影端点字段宽松透传（`{waypoints, next_after_seq}` 形态即可）。
+运行：cd 项目根 && python3 -m pytest tests/test_ai_session_owner.py -q
+"""
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+TMP = tempfile.mkdtemp(prefix="svs-ai-owner-")
+DATA_DIR = os.path.join(TMP, "share-data")
+UPLOAD_DIR = os.path.join(TMP, "uploads")
+os.environ["SHARE_DATA_DIR"] = DATA_DIR
+os.environ["UPLOAD_DIR"] = UPLOAD_DIR
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.environ["AI_SIDECAR_URL"] = "http://127.0.0.1:8055"
+os.environ["ADMIN_PASSWORD"] = ""
+
+# openslide 未安装时 stub（本测试不打开真实切片）
+try:
+    import openslide  # noqa: F401
+except ImportError:
+    import types as _types
+    _os = _types.ModuleType("openslide")
+    _os.OpenSlide = object
+    sys.modules["openslide"] = _os
+    _dz = _types.ModuleType("openslide.deepzoom")
+    _dz.DeepZoomGenerator = object
+    sys.modules["openslide.deepzoom"] = _dz
+
+import pytest  # noqa: E402
+
+import app as app_mod  # noqa: E402
+import share_store  # noqa: E402
+import user_store  # noqa: E402
+from _pt_helpers import csrf_client, install_json_login_limits  # noqa: E402
+
+app_mod.UPLOAD_DIR = Path(UPLOAD_DIR)
+app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@pytest.fixture(autouse=True)
+def _isolate(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHARE_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(share_store, "SHARE_DATA_DIR", tmp_path)
+    monkeypatch.setattr(share_store, "SHARE_FILE", tmp_path / "shares.json")
+    monkeypatch.setattr(user_store, "SHARE_DATA_DIR", tmp_path)
+    monkeypatch.setattr(user_store, "USER_FILE", tmp_path / "users.json")
+    monkeypatch.setattr(app_mod, "UPLOAD_DIR", Path(UPLOAD_DIR))
+    monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
+    share_store.set_owner_user_id("")
+    install_json_login_limits(monkeypatch)
+    for child in Path(UPLOAD_DIR).iterdir():
+        if child.is_file():
+            child.unlink()
+    yield
+
+
+# --------------------------------------------------------------------------- #
+# Fake sidecar：requests 兼容（普通 JSON + SSE 两种形态）
+# --------------------------------------------------------------------------- #
+class FakeResponse:
+    def __init__(self, status_code=200, content=b"", sse_frames=None):
+        self.status_code = status_code
+        if sse_frames is not None:
+            self._sse_frames = list(sse_frames)
+            self.content = b"".join(sse_frames)
+            self.headers = {"Content-Type": "text/event-stream"}
+        else:
+            self._sse_frames = None
+            self.content = content if isinstance(content, bytes) else content.encode()
+            self.headers = {"Content-Type": "application/json"}
+
+    def iter_content(self, chunk_size=4096):
+        if self._sse_frames is None:
+            yield self.content
+            return
+        for frame in self._sse_frames:
+            yield frame
+
+    def close(self):
+        pass
+
+    def get_json(self, silent=False):
+        try:
+            return json.loads(self.content.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    def json(self):
+        data = self.get_json(silent=True)
+        if data is None:
+            raise ValueError("no json")
+        return data
+
+
+class FakeRequests:
+    ConnectionError = __import__("requests").ConnectionError
+    Timeout = __import__("requests").Timeout
+
+    def __init__(self):
+        self._routes = {}
+        self.calls = []
+
+    def register_json(self, method, path, status=200, body=None):
+        payload = json.dumps(body if body is not None else {"ok": True}).encode()
+        self._routes[(method.upper(), path)] = ("json", status, payload)
+
+    def register_sse(self, method, path, frames, status=200):
+        self._routes[(method.upper(), path)] = ("sse", status, list(frames))
+
+    def _dispatch(self, method, url, **kwargs):
+        base = app_mod.AI_SIDECAR_URL
+        path = url[len(base):] if url.startswith(base) else url
+        self.calls.append({"method": method, "path": path,
+                           "query": kwargs.get("params")})
+        route = self._routes.get((method.upper(), path))
+        if route is None:
+            return FakeResponse(404, json.dumps({"error": "no route"}).encode())
+        kind, status, payload = route
+        if kind == "sse":
+            return FakeResponse(status, sse_frames=payload)
+        return FakeResponse(status, payload)
+
+    def get(self, url, **kwargs):
+        return self._dispatch("GET", url, **kwargs)
+
+    def post(self, url, **kwargs):
+        return self._dispatch("POST", url, **kwargs)
+
+
+@pytest.fixture()
+def fake_sidecar(monkeypatch):
+    fake = FakeRequests()
+    monkeypatch.setattr(app_mod, "requests", fake)
+    return fake
+
+
+def _client():
+    app_mod.app.config["TESTING"] = True
+    return csrf_client(app_mod.app.test_client())
+
+
+def _login(client, user):
+    with client.session_transaction() as s:
+        s["auth_user"] = user.get("login_id") or user.get("user_id")
+        s["user_id"] = user["user_id"]
+        s["role"] = user.get("role") or "user"
+        s["auth_version"] = user.get("auth_version", 1)
+    return client
+
+
+def _setup():
+    owner = user_store.create_user("owner@x.com", "ownerpass123456", role="owner")
+    usera = user_store.create_user("a@x.com", "userApass123456", role="user")
+    userb = user_store.create_user("b@x.com", "userBpass123456", role="user")
+    share_store.set_owner_user_id(owner["user_id"])
+    slide = "coop.svs"
+    p = Path(UPLOAD_DIR) / slide
+    p.write_bytes(b"svs-stub")
+    share_store.set_slide_meta(slide, owner_user_id=usera["user_id"])
+    # A 建分享（view+annotate），B 认领 → B 有该切片 annotate 权限但不是会话属主
+    share = share_store.create_share([slide], 24,
+                                     permissions=["view", "annotate"],
+                                     creator_user_id=usera["user_id"])
+    share_store.claim_share(share["token"], userb["user_id"])
+    return owner, usera, userb, slide
+
+
+WAYPOINTS = {
+    "waypoints": [
+        {"seq": 3, "x": 100, "y": 200, "reason": "inspect",
+         "bbox_level0": [90, 190, 20, 20], "level": 2,
+         "magnification": "10x", "captured_at": 1750000000},
+        {"seq": 7, "x": 400, "y": 500, "reason": "goto",
+         "bbox_level0": [390, 490, 20, 20], "level": 1,
+         "magnification": "20x", "captured_at": 1750000100},
+    ],
+    "next_after_seq": 7,
+}
+
+
+# --------------------------------------------------------------------------- #
+# S5：GET /api/ai/session/<id>/path 代理
+# --------------------------------------------------------------------------- #
+def test_path_owner_200_and_query_passthrough(fake_sidecar):
+    """属主 200：waypoints 透传 + after_seq/limit 原样转发到 sidecar。"""
+    owner, usera, _b, _slide = _setup()
+    fake = fake_sidecar
+    fake.register_json("GET", "/session/sess-a", body={
+        "session": {"owner": usera["user_id"], "archived": True}})
+    fake.register_json("GET", "/session/sess-a/path", body=WAYPOINTS)
+    ca = _login(_client(), usera)
+    r = ca.get("/api/ai/session/sess-a/path?after_seq=3&limit=50")
+    assert r.status_code == 200, r.get_data(as_text=True)
+    body = r.get_json()
+    assert body["waypoints"] == WAYPOINTS["waypoints"]
+    assert body["next_after_seq"] == 7
+    path_call = [c for c in fake.calls if c["path"] == "/session/sess-a/path"][-1]
+    assert path_call["query"] == {"after_seq": "3", "limit": "50"}
+
+
+def test_path_owner_archived_session_readable(fake_sidecar):
+    """archived session 属主仍可读 path（S5 契约；归属判定不看 archived）。"""
+    owner, usera, _b, _slide = _setup()
+    fake = fake_sidecar
+    fake.register_json("GET", "/session/sess-arch", body={
+        "session": {"owner": usera["user_id"], "archived": True}})
+    fake.register_json("GET", "/session/sess-arch/path", body=WAYPOINTS)
+    ca = _login(_client(), usera)
+    r = ca.get("/api/ai/session/sess-arch/path")
+    assert r.status_code == 200
+    assert r.get_json()["waypoints"]
+
+
+def test_path_user_b_reads_a_gets_403_no_proxy(fake_sidecar):
+    """user B 读 A 的 path → 403；sidecar 只收到归属查询，无 path 转发。"""
+    owner, usera, userb, _slide = _setup()
+    fake = fake_sidecar
+    fake.register_json("GET", "/session/sess-a",
+                       body={"session": {"owner": usera["user_id"]}})
+    cb = _login(_client(), userb)
+    r = cb.get("/api/ai/session/sess-a/path?after_seq=0&limit=100")
+    assert r.status_code == 403, r.get_data(as_text=True)
+    assert not any(c["path"] == "/session/sess-a/path" for c in fake.calls)
+    # 归属查询确实发生过（403 来自归属判定，而非路由缺失）
+    assert any(c["path"] == "/session/sess-a" for c in fake.calls)
+
+
+def test_path_owner_admin_any_session(fake_sidecar):
+    """owner（管理员）读任意 session 的 path → 200（_require_ai_session_owner）。"""
+    owner, _a, _b, _slide = _setup()
+    fake = fake_sidecar
+    fake.register_json("GET", "/session/sess-x/path", body=WAYPOINTS)
+    co = _login(_client(), owner)
+    r = co.get("/api/ai/session/sess-x/path")
+    assert r.status_code == 200
+    assert r.get_json()["waypoints"]
+
+
+# --------------------------------------------------------------------------- #
+# P1-7：_require_ai_session_owner 四端点越权（B→A 403）
+# --------------------------------------------------------------------------- #
+def test_session_detail_foreign_user_403(fake_sidecar):
+    """GET session 详情：B 读 A → 403；A 读自己 → 200。"""
+    owner, usera, userb, _slide = _setup()
+    fake = fake_sidecar
+    fake.register_json("GET", "/session/sess-a",
+                       body={"session": {"owner": usera["user_id"]},
+                             "transcript": []})
+    cb = _login(_client(), userb)
+    r = cb.get("/api/ai/session/sess-a")
+    assert r.status_code == 403
+    # A 读自己 → 200 且转发
+    ca = _login(_client(), usera)
+    r = ca.get("/api/ai/session/sess-a")
+    assert r.status_code == 200
+    assert r.get_json()["session"]["owner"] == usera["user_id"]
+
+
+def test_session_stream_foreign_user_403(fake_sidecar):
+    """GET stream：B 挂 A → 403（sidecar 无 stream 连接）；A → 200 SSE 透传。"""
+    owner, usera, userb, _slide = _setup()
+    fake = fake_sidecar
+    fake.register_json("GET", "/session/sess-a",
+                       body={"session": {"owner": usera["user_id"]}})
+    fake.register_sse("GET", "/session/sess-a/stream",
+                      [b"id: 1\nevent: delta\ndata: {\"t\":\"hi\"}\n\n"])
+    cb = _login(_client(), userb)
+    r = cb.get("/api/ai/session/sess-a/stream?after_seq=0")
+    assert r.status_code == 403
+    assert not any(c["path"] == "/session/sess-a/stream" for c in fake.calls)
+    ca = _login(_client(), usera)
+    r = ca.get("/api/ai/session/sess-a/stream?after_seq=0")
+    assert r.status_code == 200
+    assert b"delta" in r.data
+
+
+def test_session_archive_unarchive_foreign_user_403(fake_sidecar):
+    """POST archive/unarchive：B 对 A 的会话 → 403；A → 200 转发。"""
+    owner, usera, userb, _slide = _setup()
+    fake = fake_sidecar
+    fake.register_json("GET", "/session/sess-a",
+                       body={"session": {"owner": usera["user_id"]}})
+    fake.register_json("POST", "/session/sess-a/archive",
+                       body={"ok": True, "archived": True})
+    fake.register_json("POST", "/session/sess-a/unarchive",
+                       body={"ok": True, "archived": False})
+    cb = _login(_client(), userb)
+    assert cb.post("/api/ai/session/sess-a/archive").status_code == 403
+    assert cb.post("/api/ai/session/sess-a/unarchive").status_code == 403
+    assert not any(c["method"] == "POST" for c in fake.calls)
+    ca = _login(_client(), usera)
+    assert ca.post("/api/ai/session/sess-a/archive").status_code == 200
+    assert ca.post("/api/ai/session/sess-a/unarchive").status_code == 200
+
+
+def test_session_path_csrf_exempt_get_only(fake_sidecar):
+    """path 是 GET（安全方法）：无 CSRF 要求，但未登录（AUTH_ENABLED=True）→ 401。"""
+    owner, _a, _b, _slide = _setup()
+    c = _client()
+    r = c.get("/api/ai/session/sess-a/path")
+    assert r.status_code == 401
+    assert r.get_json()["error"] == "auth_required"

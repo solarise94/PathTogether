@@ -976,6 +976,36 @@ def _csrf_protect():
     return jsonify(error="csrf_required"), 400
 
 
+@app.before_request
+def _preview_write_guard():
+    """S4 预览只读硬闸（session-isolation-fix-plan §3.3）：服务端统一拦截。
+
+    「只读预览」不能只靠 UI 与权限描述——subject 本身可能有标注/分享/AI 权限，
+    必须有后端硬闸：预览态下**拒绝所有非安全方法（写）**，白名单仅「退出预览」
+    （POST /api/admin/preview/stop）；GET/HEAD/OPTIONS 放行（只读浏览语义）。
+
+    挂在 _csrf_protect **之后**（定义顺序即执行顺序）：无 token 的写在 CSRF
+    层先 400；带 token 的写在预览态被本闸 403 preview_readonly。TTL 过期的
+    预览在此顺带自动退出（清 session 后按 actor 放行本次请求）。
+    """
+    if request.method in _CSRF_SAFE_METHODS:
+        return None
+    pv = _preview_state()
+    if pv is None:
+        return None
+    try:
+        expires_at = float(pv.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        expires_at = 0.0
+    if expires_at <= time.time():
+        _quit_preview()  # 过期自动退出：本次请求起回到 actor 本人
+        return None
+    if request.path == "/api/admin/preview/stop":
+        return None  # 白名单：退出预览本身是写（已过 CSRF）
+    return jsonify(error="预览态只读，写操作被拒绝（请先退出预览）",
+                   code="preview_readonly"), 403
+
+
 @app.after_request
 def _mirror_csrf_cookie(resp):
     """把 session 中的 CSRF token 镜像为非 HttpOnly cookie（前端 JS 双提交用）。
@@ -2810,12 +2840,14 @@ def _sidecar_health_status(timeout=2.0):
 
 
 def _require_owner():
-    """owner-only 守卫：当前 session 角色非 owner 返回 403 JSON。
+    """owner-only 守卫：**actor** 角色非 owner 返回 403 JSON。
 
     仅 owner（部署者 / superadmin）可管理用户。未登录或 user/guest 一律 403
     （资源级鉴权矩阵是下一节点的事，这里只做身份级 owner 判定）。
+    S4：查 actor_identity()（真实管理员），**永不被身份预览骗过**——预览态下
+    管理员仍可过本守卫（如 GET 管理端点），subject 的 role 无关。
     """
-    if session.get("role") == user_store.ROLE_OWNER:
+    if actor_identity()["role"] == user_store.ROLE_OWNER:
         return None
     return jsonify(error="需要 owner 权限"), 403
 
@@ -2832,17 +2864,103 @@ def _require_owner():
 #       标注 = 自己的 + 协作切片；删除标注 = 仅本人创建；创建分享 = 仅自己的切片。
 # guest：不能上传/维护图库；标注按分享权限走 /s/* 流程（share_server）；不能创建分享。
 # =========================================================================== #
-def current_identity():
-    """返回 {"role","user_id"}。
+# --------------------------------------------------------------------------- #
+# S4 管理员只读身份预览（HistoPilot/docs/session-isolation-fix-plan.md §3）：
+# actor / subject **非破坏分离**——不改 current_identity() 的返回形状（全平台
+# 直接读 ident["role"]/ident["user_id"]），而是：
+#   - current_identity() 保持扁平，返回 **effective subject**（预览态 = 被预览
+#     用户；否则 = 本人）。权限矩阵 / 切片可见性 / AI 会话过滤继续读它。
+#   - actor_identity() 返回真实管理员 actor（永不被预览替换）。
+#   - _require_owner() 查 actor（预览态不能骗过 owner 守卫）。
+#   - _audit 写 actor，预览态附 subject_user_id / preview 字段。
+# 预览只读：_preview_write_guard（before_request，挂在 CSRF 之后）拦截预览态的
+# 一切非安全方法（白名单仅退出预览）；subject 每请求重新解析，禁用/删除/TTL
+# 过期即自动退出。AUTH_ENABLED=False 无预览（start 明确 400），不变量不破。
+# --------------------------------------------------------------------------- #
+#: session 内预览态键：{subject_user_id, expires_at, actor_user_id}（S4 §3.4）
+PREVIEW_SESSION_KEY = "preview"
+#: 预览 TTL 秒（默认 15 分钟；env 可调）
+PREVIEW_TTL_SECONDS = int(
+    os.environ.get("PREVIEW_TTL_SECONDS") or 15 * 60)
 
-    session 无 role（AUTH_ENABLED=False 内网模式 / 未登录）→ role=owner 全开。
-    AUTH_ENABLED=True 时未登录请求已被 _require_auth 在 before_request 拦截为 401，
-    不会走到资源级判定；此处对无 role 的分支保守放行，避免误锁。
+
+def actor_identity():
+    """真实登录身份（flat {"role","user_id"}，**永不被预览替换**）。
+
+    归一契约与 current_identity 一致：session 无 role（AUTH_ENABLED=False
+    内网模式 / 未登录）→ role=owner。预览态下 session 仍是管理员的——本函数
+    即「管理员本人」视角。
     """
     role = session.get("role")
     if role is None:
         role = user_store.ROLE_OWNER
     return {"role": role, "user_id": session.get("user_id")}
+
+
+def _preview_state():
+    """读 session 内预览态 dict；无/形态不对返回 None。"""
+    pv = session.get(PREVIEW_SESSION_KEY)
+    return pv if isinstance(pv, dict) else None
+
+
+def _quit_preview():
+    session.pop(PREVIEW_SESSION_KEY, None)
+
+
+def _preview_subject():
+    """解析当前预览 subject 用户行；无效自动退出预览并返回 None。
+
+    每次调用**重新回查 user_store**（§3.4 不缓存）；TTL 过期、subject 不存在、
+    已禁用、结构非法 → 清掉 session 预览态（自动退出），回到 actor 本人身份。
+    """
+    pv = _preview_state()
+    if pv is None:
+        return None
+    try:
+        expires_at = float(pv.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        _quit_preview()
+        return None
+    if expires_at <= time.time():
+        _quit_preview()  # TTL 过期自动退出（§3.4）
+        return None
+    subject_id = pv.get("subject_user_id") or ""
+    if not subject_id:
+        _quit_preview()
+        return None
+    try:
+        user = user_store.get_user(subject_id)
+    except Exception:
+        app.logger.exception("preview subject lookup failed: %s", subject_id)
+        _quit_preview()
+        return None
+    if not user or user.get("disabled"):
+        _quit_preview()  # 禁用/删除用户不可作 subject（§3.4）
+        return None
+    return user
+
+
+def _preview_active():
+    """预览态是否生效（subject 有效）。写 guard / 审计共用。"""
+    return _preview_subject() is not None
+
+
+def current_identity():
+    """返回 {"role","user_id"}（**effective subject**；S4 预览态 = 被预览用户）。
+
+    session 无 role（AUTH_ENABLED=False 内网模式 / 未登录）→ role=owner 全开。
+    AUTH_ENABLED=True 时未登录请求已被 _require_auth 在 before_request 拦截为 401，
+    不会走到资源级判定；此处对无 role 的分支保守放行，避免误锁。
+
+    预览态（session[preview] 有效）→ 返回 subject 的 role/user_id：can_view /
+    can_annotate / 切片列表 / AI 会话过滤等继续读本函数，预览下自动按 subject
+    生效（§3.2 非破坏式——调用方零改动）。
+    """
+    subject = _preview_subject()
+    if subject is not None:
+        return {"role": subject.get("role") or user_store.ROLE_USER,
+                "user_id": subject.get("user_id") or ""}
+    return actor_identity()
 
 
 def _is_owner():
@@ -3036,8 +3154,18 @@ def _audit(action, target_type=None, target_id=None, slide=None, detail=None):
     record_audit 自身吞写失败，这里不额外 try；在**业务写完成后**、独立于业务锁
     调用（不嵌套在 store 锁内），避免死锁。actor 取当前身份；AUTH_ENABLED=False
     时 role 归一 owner。
+
+    S4：actor 永远是 actor_identity()（真实管理员，不被预览替换）；预览态下
+    business 操作按 subject 生效，故在 detail 里附 ``subject_user_id`` 与
+    ``preview`` 字段（record_audit 签名不变，subject 经 detail 落库——json detail
+    dict / PG detail jsonb 同构）。
     """
-    ident = current_identity()
+    ident = actor_identity()
+    detail = dict(detail) if isinstance(detail, dict) else {}
+    subject = _preview_subject()
+    if subject is not None:
+        detail.setdefault("subject_user_id", subject.get("user_id"))
+        detail.setdefault("preview", True)
     share_store.record_audit(
         action=action,
         actor_user_id=ident.get("user_id"),
@@ -3545,6 +3673,82 @@ def api_admin_users_ai_access(user_id):
     out = dict(user)
     out.pop("password_hash", None)
     return jsonify(out)
+
+
+# --------------------------------------------------------------------------- #
+# S4 管理员只读身份预览：进入 / 退出（session-isolation-fix-plan §3.4）
+#
+# owner-only + 统一 CSRF（before_request，/api/* 只认 header）。进入时在
+# session 记 preview={subject_user_id, expires_at, actor_user_id}；目标用户
+# 每请求重新解析（禁用/删除即自动退出）；TTL 默认 15 分钟过期自动退出。
+# start/stop 各记一条审计（actor + subject）。AUTH_ENABLED=False 下明确 400
+# （无认证维度可预览，保持「无 preview、identity 归一 owner」不变量）。
+# --------------------------------------------------------------------------- #
+@app.route("/api/admin/preview/start", methods=["POST"])
+def api_admin_preview_start():
+    """进入只读身份预览。body: {user_id}。owner-only（查 actor）+ CSRF。
+
+    - 目标用户必须存在且未禁用（禁用用户不可作 subject）→ 400；
+    - AUTH_ENABLED=False → 400（预览以认证身份为前提）；
+    - 幂等：重复 start 刷新 TTL（同 subject）或切换 subject（覆盖写）。
+    - 审计 preview.start（actor + subject + TTL）。
+    """
+    if not AUTH_ENABLED:
+        return jsonify(error="预览需要启用认证（AUTH_ENABLED）"), 400
+    auth = _require_owner()
+    if auth:
+        return auth
+    body = request.get_json(silent=True) or {}
+    user_id = body.get("user_id")
+    if not isinstance(user_id, str) or not user_id.strip():
+        return jsonify(error="缺少 user_id 字段"), 400
+    try:
+        user = user_store.get_user(user_id.strip())
+    except Exception:
+        app.logger.exception("preview target lookup failed: %s", user_id)
+        return jsonify(error="预览目标用户查询失败"), 500
+    if user is None:
+        return jsonify(error="用户不存在", code="subject_not_found"), 404
+    if user.get("disabled"):
+        return jsonify(error="禁用用户不可作为预览对象",
+                       code="subject_disabled"), 400
+    actor = actor_identity()
+    expires_at = time.time() + PREVIEW_TTL_SECONDS
+    session[PREVIEW_SESSION_KEY] = {
+        "subject_user_id": user["user_id"],
+        "expires_at": expires_at,
+        "actor_user_id": actor.get("user_id") or "",
+    }
+    _audit("preview.start", target_type="user", target_id=user["user_id"],
+           slide=None, detail={"subject_user_id": user["user_id"],
+                               "subject_role": user.get("role") or "",
+                               "expires_at": expires_at,
+                               "ttl_seconds": PREVIEW_TTL_SECONDS})
+    return jsonify(ok=True, preview={
+        "subject_user_id": user["user_id"],
+        "subject_role": user.get("role") or "",
+        "expires_at": expires_at,
+        "actor_user_id": actor.get("user_id") or "",
+    })
+
+
+@app.route("/api/admin/preview/stop", methods=["POST"])
+def api_admin_preview_stop():
+    """退出身份预览。owner-only（查 actor）+ CSRF；无预览时幂等成功。
+
+    审计 preview.stop（actor；本次退出时的 subject 若可解析则一并记录）。
+    """
+    if not AUTH_ENABLED:
+        return jsonify(error="预览需要启用认证（AUTH_ENABLED）"), 400
+    auth = _require_owner()
+    if auth:
+        return auth
+    pv = _preview_state() or {}
+    stopped_subject = pv.get("subject_user_id") or ""
+    _quit_preview()
+    _audit("preview.stop", target_type="user", target_id=stopped_subject or None,
+           slide=None, detail={"subject_user_id": stopped_subject or None})
+    return jsonify(ok=True, preview=None)
 
 
 @app.route("/admin/registration")
@@ -9899,6 +10103,29 @@ def api_ai_session_stream(session_id):
     if auth is not None:
         return auth
     return _proxy_sse("/session/{}/stream".format(session_id), None, method="GET")
+
+
+@app.route("/api/ai/session/<session_id>/path")
+def api_ai_session_path(session_id):
+    """S5 Agent 路径回放：代理 sidecar GET /session/<id>/path（path_waypoint 投影）。
+
+    鉴权与 stream/archive 同款 ``_require_ai_session_owner``（user 仅自己名下
+    会话，越权统一 403 不泄露存在性；**archived session 属主仍可读**——owner
+    归属判定只看 session.owner，不看 archived 位）。
+    透传分页 query：``after_seq``（游标，升序）与 ``limit``；sidecar 响应形如
+    ``{waypoints: path_waypoint[], next_after_seq}``（字段宽松透传，HP 落地
+    前后本代理不改形状）。
+    """
+    auth = _require_ai_session_owner(session_id)
+    if auth is not None:
+        return auth
+    query = {}
+    for key in ("after_seq", "limit"):
+        val = request.args.get(key)
+        if val is not None:
+            query[key] = val
+    return _proxy_json("/session/{}/path".format(session_id), None,
+                       method="GET", query=query or None)
 
 
 # --------------------------------------------------------------------------- #

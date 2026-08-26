@@ -385,6 +385,57 @@ def test_commit_happy_path(monkeypatch):
     assert upload_task_store.get_task(uid)["state"] == "committed"
 
 
+def test_recover_ownership_failure_keeps_committing(monkeypatch):
+    """ownership 失败不得 finish_commit：保持 committing，文件仍在，下次可自愈。"""
+    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    c = _client()
+    uid = _create(c, name="own.svs", size=100).get_json()["upload_id"]
+    data = b"o" * 100
+    _upload_full(c, uid, data, chunk=50)
+    _token, task = upload_task_store.begin_commit(uid)
+    dest = Path(UPLOAD_DIR) / "own.svs"
+    dest.write_bytes(data)
+    finish_calls = []
+    real_finish = upload_task_store.finish_commit
+
+    def wrap_finish(*a, **k):
+        finish_calls.append(1)
+        return real_finish(*a, **k)
+
+    monkeypatch.setattr(upload_task_store, "finish_commit", wrap_finish)
+    monkeypatch.setattr(app_mod, "_upload_v2_set_ownership",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("crash")))
+    out = app_mod._upload_v2_recover_commit(task)
+    assert out["state"] == "committing"
+    assert finish_calls == []
+    assert dest.exists()
+
+    monkeypatch.setattr(app_mod, "_upload_v2_set_ownership",
+                        lambda *a, **k: None)
+    out2 = app_mod._upload_v2_recover_commit(out)
+    assert out2["state"] == "committed"
+    assert finish_calls == [1]
+
+
+def test_maintain_heals_committed_missing_owner(monkeypatch):
+    """GET 路径校正已 committed 但漏写 slide_meta 的归属。"""
+    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    c = _client()
+    uid = _create(c, name="heal.svs", size=80).get_json()["upload_id"]
+    _upload_full(c, uid, b"h" * 80, chunk=40)
+    assert c.post("/api/uploads/%s/commit" % uid).status_code == 200
+    healed = []
+
+    def note(*a, **k):
+        healed.append(True)
+
+    monkeypatch.setattr(app_mod, "_upload_v2_set_ownership", note)
+    task = upload_task_store.get_task(uid)
+    out = app_mod._upload_v2_maintain(task)
+    assert out["state"] == "committed"
+    assert healed == [True]
+
+
 def test_recover_commit_does_not_commit_when_settle_fails(monkeypatch):
     """崩溃恢复：入账失败不得留下 committed 文件。"""
     monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)

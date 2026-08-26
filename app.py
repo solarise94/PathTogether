@@ -5005,9 +5005,9 @@ def _upload_v2_set_ownership(task, ident=None):
 def _upload_v2_recover_commit(task):
     """committing 超时的惰性恢复（§3.2.5 崩溃恢复）。
 
-    临时文件已提升为正式文件（dest 存在且大小吻合）→ 补 ownership，并在
-    **同一短事务**内 committed 收口 + 配额转实占；否则回滚 active（临时文件
-    保留，续传后可重新 commit）。入账失败不得留下 committed 文件。
+    临时文件已提升为正式文件（dest 存在且大小吻合）→ **先**补 ownership（失败
+    保持 committing，下次访问再试），再在同一短事务内 committed + 配额转实占。
+    未提升则回滚 active。入账失败不得留下 committed 文件。
     """
     dest = UPLOAD_DIR / task["safe_name"]
     promoted = False
@@ -5026,9 +5026,14 @@ def _upload_v2_recover_commit(task):
     sha = task.get("sha256_actual") or ""
     size = int(task["declared_size"])
     try:
+        _upload_v2_set_ownership(task)
+    except Exception:
+        app.logger.exception(
+            "upload task %s 恢复时 ownership 失败，保持 committing", upload_id)
+        return task
+    try:
         task = upload_task_store.finish_commit(
             upload_id, token, sha, settle_bytes=size)
-        _upload_v2_set_ownership(task)
         _upload_v2_cleanup_part(task)
         return task
     except upload_guard.ReservationInvalid:
@@ -5064,6 +5069,13 @@ def _upload_v2_maintain(task):
             and (float(task.get("commit_started_at") or 0)
                  + upload_task_store.UPLOAD_COMMIT_TIMEOUT_SECONDS) <= now):
         task = _upload_v2_recover_commit(task)
+    if task["state"] == upload_task_store.STATE_COMMITTED:
+        # 已 committed 但崩溃窗口里漏写 slide_meta 时，GET 路径校正归属。
+        try:
+            _upload_v2_set_ownership(task)
+        except Exception:
+            app.logger.exception(
+                "upload task %s committed ownership 校正失败", task.get("upload_id"))
     return task
 
 

@@ -177,6 +177,11 @@ def test_bundle_absence_hides_histopilot_ui(monkeypatch, tmp_path):
 
 
 def test_appjs_no_longer_contains_moved_ai_functions():
+    """源码子串断言（脆弱）：防 AI 函数从插件 bundle 漏回 app.js 的结构守护。
+
+    无行为测试可替代（「函数不存在」本身即结构性检查）；改动 app.js 或
+    bundle 边界时允许同步更新清单。
+    """
     text = APP_JS.read_text(encoding="utf-8")
     # app.js 收缩为平台 viewer + HostBridge host 适配层：以下函数定义应已迁入插件 bundle
     moved = ["pumpAiSse", "handleAiEvent", "handleSseFrame", "loadAiConfig",

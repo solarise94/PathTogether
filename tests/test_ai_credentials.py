@@ -31,7 +31,7 @@ import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest
 DATA_DIR = _bootstrap.SHARE_DATA_DIR
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app # noqa: E402
+from _pt_helpers import csrf_client, isolate_app, FakeRequests, FakeResponse # noqa: E402
 from pg_compat import json_only  # noqa: E402
 
 import ipaddress  # noqa: E402
@@ -109,52 +109,6 @@ def _reset_config():
 
 def _setup_platform(base_url="http://platform/v1", key="sk-platform-123456", model="gpt-p"):
     app_mod._save_ai_config({"base_url": base_url, "api_key": key, "model": model})
-
-
-class FakeResponse:
-    def __init__(self, status_code=200, content=None, ctype="application/json"):
-        self.status_code = status_code
-        self.content = content if content is not None else b"{}"
-        if isinstance(self.content, str):
-            self.content = self.content.encode("utf-8")
-        self.headers = {"Content-Type": ctype}
-
-    def close(self):
-        pass
-
-    def iter_content(self, chunk_size=4096):
-        yield self.content
-
-
-class FakeRequests:
-    def __init__(self):
-        self._routes = {}
-        self.calls = []
-
-    def register(self, method, path, handler):
-        self._routes[(method.upper(), path)] = handler
-
-    def _dispatch(self, method, url, **kwargs):
-        # 提取 path（不含 query）
-        raw_path = url.split("?")[0]
-        for prefix in ("http://", "https://"):
-            if raw_path.startswith(prefix):
-                raw_path = raw_path[len(prefix):]
-        slash = raw_path.find("/")
-        raw_path = raw_path[slash:] if slash >= 0 else "/"
-        handler = self._routes.get((method.upper(), raw_path))
-        self.calls.append({"method": method, "path": raw_path,
-                           "params": kwargs.get("params"), "headers": kwargs.get("headers"),
-                           "body": kwargs.get("json")})
-        if handler is None:
-            return FakeResponse(404, json.dumps({"error": "no route"}))
-        return handler(kwargs.get("params"))
-
-    def get(self, url, **kwargs):
-        return self._dispatch("GET", url, **kwargs)
-
-    def post(self, url, **kwargs):
-        return self._dispatch("POST", url, **kwargs)
 
 
 def _install_fake():
@@ -413,7 +367,7 @@ def test_ai_run_authorized_proxies_with_owner():
     _own("ownok.svs", u["user_id"])
     fake = _install_fake()
 
-    def handler(params):
+    def handler(body, query, headers, kwargs):
         return FakeResponse(200, ctype="text/event-stream")
     fake.register("POST", "/run", handler)
     c = _client()
@@ -441,7 +395,7 @@ def test_sessions_user_filter_owner_all():
 
     fake = _install_fake()
 
-    def sess_handler(params):
+    def sess_handler(body, query, headers, kwargs):
         return FakeResponse(200, json.dumps({"sessions": [{"id": "s1"}, {"id": "s2"}]}))
     fake.register("GET", "/sessions", sess_handler)
 
@@ -467,7 +421,7 @@ def test_session_detail_owner_check():
     ub = user_store.create_user("b@x.com", "password1password1", role="user")
     fake = _install_fake()
 
-    def detail_handler(params):
+    def detail_handler(body, query, headers, kwargs):
         return FakeResponse(200, json.dumps({"session": {"id": "s-a", "owner": ua["user_id"]}}))
     fake.register("GET", "/session/s-a", detail_handler)
 
@@ -494,11 +448,11 @@ def test_no_auth_full_compat():
     _touch("x.svs")
     fake = _install_fake()
 
-    def run_handler(params):
+    def run_handler(body, query, headers, kwargs):
         return FakeResponse(200, ctype="text/event-stream")
     fake.register("POST", "/run", run_handler)
     fake.register("GET", "/sessions",
-                  lambda p: FakeResponse(200, json.dumps({"sessions": []})))
+                  lambda b, q, h, k: FakeResponse(200, json.dumps({"sessions": []})))
 
     c = _client(auth=False)
     # run：不注入 session_owner
@@ -521,7 +475,7 @@ def test_owner_run_does_not_inject_session_owner():
     _touch("ownr.svs")
     fake = _install_fake()
 
-    def handler(params):
+    def handler(body, query, headers, kwargs):
         return FakeResponse(200, ctype="text/event-stream")
     fake.register("POST", "/run", handler)
     c = _client()

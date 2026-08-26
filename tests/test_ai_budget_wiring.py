@@ -43,7 +43,7 @@ import budget_store  # noqa: E402
 import demo_store  # noqa: E402
 import platform_features  # noqa: E402
 from pg_compat import BACKEND, json_only  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app # noqa: E402
+from _pt_helpers import csrf_client, isolate_app, FakeRequests, FakeResponse # noqa: E402
 
 pg_only = pytest.mark.skipif(
     BACKEND != "postgres",
@@ -80,69 +80,6 @@ def _reset_stores(monkeypatch, tmp_path):
     """
     isolate_app(monkeypatch, tmp_path)
     yield
-
-
-class FakeResponse:
-    """模拟 requests.Response：JSON / SSE 两种形态（含 X-AI-Session-ID）。"""
-
-    def __init__(self, status_code=200, content=None, ctype="application/json",
-                 headers=None):
-        self.status_code = status_code
-        self.content = content if content is not None else b"{}"
-        if isinstance(self.content, str):
-            self.content = self.content.encode("utf-8")
-        self.headers = {"Content-Type": ctype}
-        if headers:
-            self.headers.update(headers)
-
-    def close(self):
-        pass
-
-    def json(self):
-        return json.loads(self.content.decode("utf-8"))
-
-    def iter_content(self, chunk_size=4096):
-        yield self.content
-
-
-class FakeRequests:
-    """替换 app.requests：按 (method, path) 注册 handler；记录调用。"""
-
-    def __init__(self):
-        self._routes = {}
-        self.calls = []
-        self.unreachable = False
-
-    ConnectionError = __import__("requests").ConnectionError
-    Timeout = __import__("requests").Timeout
-
-    def register(self, method, path, handler):
-        self._routes[(method.upper(), path)] = handler
-
-    def _dispatch(self, method, url, **kwargs):
-        raw_path = url.split("?")[0]
-        for prefix in ("http://", "https://"):
-            if raw_path.startswith(prefix):
-                raw_path = raw_path[len(prefix):]
-        slash = raw_path.find("/")
-        raw_path = raw_path[slash:] if slash >= 0 else "/"
-        self.calls.append({
-            "method": method.upper(), "path": raw_path,
-            "body": kwargs.get("json"), "params": kwargs.get("params"),
-            "headers": kwargs.get("headers"),
-        })
-        if self.unreachable:
-            raise FakeRequests.ConnectionError("sidecar down (test)")
-        handler = self._routes.get((method.upper(), raw_path))
-        if handler is None:
-            return FakeResponse(404, json.dumps({"error": "no route"}))
-        return handler(kwargs.get("params"))
-
-    def get(self, url, **kwargs):
-        return self._dispatch("GET", url, **kwargs)
-
-    def post(self, url, **kwargs):
-        return self._dispatch("POST", url, **kwargs)
 
 
 def _install_fake():
@@ -199,6 +136,11 @@ def _rid():
     return "req_" + uuid.uuid4().hex
 
 
+#: 存量 own 凭据步数种子（test-review P3-17 magic 值收敛）：33 不是 app 里的
+#: 「官方值」，只是本文件写进存量凭据、再断言 GET 回显一致的同一常量。
+OWN_STEPS = 33
+
+
 def _own_credentials(uid, steps=None, base_url="http://own.example/v1"):
     cfg = {"use_platform": False, "base_url": base_url,
            "model": "gpt-own", "api_key": "sk-own-secret-abcdef"}
@@ -225,7 +167,7 @@ def _platform_report():
 def test_request_id_invalid_rejected_400():
     _setup_platform()
     fake = _install_fake()
-    fake.register("POST", "/run", lambda p: _sse_ok())
+    fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
     o = _make_user("owner")
     _touch("r1.svs")
     c = _client()
@@ -240,7 +182,7 @@ def test_request_id_invalid_rejected_400():
 def test_request_id_client_provided_forwarded_and_generated_when_absent():
     _setup_platform()
     fake = _install_fake()
-    fake.register("POST", "/run", lambda p: _sse_ok())
+    fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
     o = _make_user("owner")
     _touch("r2.svs")
     c = _client()
@@ -263,7 +205,7 @@ def test_request_id_client_provided_forwarded_and_generated_when_absent():
 def test_json_backend_platform_run_fail_closed_without_testing():
     _setup_platform()
     fake = _install_fake()
-    fake.register("POST", "/run", lambda p: _sse_ok())
+    fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
     o = _make_user("owner")
     _touch("fc.svs")
     c = _client()
@@ -293,7 +235,7 @@ def test_json_backend_legacy_own_credentials_now_platform():
     _touch("own.svs")
     _own("own.svs", u["user_id"])
     fake = _install_fake()
-    fake.register("POST", "/run", lambda p: _sse_ok())
+    fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
     c = _client()
     _login(c, "user", u["user_id"])
     app_mod.app.config["TESTING"] = False
@@ -342,16 +284,16 @@ def test_user_get_effective_max_steps_platform_readonly():
     存量 own 步数仅作回显（own_max_steps），无写入通道。"""
     _setup_platform()  # 平台 ai_config.json 的 max_steps 用默认 50
     u = _make_user("user")
-    _own_credentials(u["user_id"], steps=33)
+    _own_credentials(u["user_id"], steps=OWN_STEPS)
     c = _client()
     _login(c, "user", u["user_id"])
     r = c.get("/api/ai/config")
     j = r.get_json()
     assert j["using"] == "platform"
-    # 平台模式：生效步数=周期 platform_task_max_steps（默认 20），忽略存量 33
+    # 平台模式：生效步数=周期 platform_task_max_steps（默认 20），忽略存量 OWN_STEPS
     assert j["max_steps"] == 20
     assert j["effective_max_steps"] == 20
-    assert j["own_max_steps"] == 33  # 存量值仍回显（历史数据）
+    assert j["own_max_steps"] == OWN_STEPS  # 存量回显：值是本测试写入的种子，不是生效步数
     assert j["own_task_max_steps_limit"] >= 20
     # 切回 own 的 PUT 已下线：use_platform=false 同样 400
     r2 = c.put("/api/ai/config", json={"use_platform": False})
@@ -369,7 +311,7 @@ def test_max_steps_injection_rules_for_sidecar_config():
     _touch("inj.svs")
     _own("inj.svs", u["user_id"])
     fake = _install_fake()
-    fake.register("POST", "/run", lambda p: _sse_ok())
+    fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
     c = _client()
     _login(c, "user", u["user_id"])
     r = _run_ok(c, "inj.svs")
@@ -388,7 +330,7 @@ def test_run_body_cannot_smuggle_tuning_fields():
     _touch("smug.svs")
     _own("smug.svs", u["user_id"])
     fake = _install_fake()
-    fake.register("POST", "/run", lambda p: _sse_ok())
+    fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
     c = _client()
     _login(c, "user", u["user_id"])
     r = c.post("/api/ai/run", json={
@@ -409,7 +351,7 @@ def test_run_body_cannot_smuggle_tuning_fields():
 def test_run_grant_failure_rejects_run(monkeypatch):
     _setup_platform()
     fake = _install_fake()
-    fake.register("POST", "/run", lambda p: _sse_ok())
+    fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
     o = _make_user("owner")
     _touch("g.svs")
     c = _client()
@@ -433,7 +375,7 @@ def test_ask_does_not_require_run_grant(monkeypatch):
     _own("a.svs", u["user_id"])
     _touch("a.svs")
     fake = _install_fake()
-    fake.register("POST", "/ask", lambda p: _sse_ok("sess-ask"))
+    fake.register("POST", "/ask", lambda b, q, h, k: _sse_ok("sess-ask"))
     c = _client()
     _login(c, "user", u["user_id"])
 
@@ -587,7 +529,7 @@ def test_same_request_id_retry_no_double_charge():
     _touch("idem.svs")
     _own("idem.svs", u["user_id"])
     fake = _install_fake()
-    fake.register("POST", "/run", lambda p: _sse_ok("sess-idem"))
+    fake.register("POST", "/run", lambda b, q, h, k: _sse_ok("sess-idem"))
     c = _client()
     _login(c, "user", u["user_id"])
     rid = _rid()
@@ -612,7 +554,7 @@ def test_user_11th_platform_run_rejected():
     _touch("u11.svs")
     _own("u11.svs", u["user_id"])
     fake = _install_fake()
-    fake.register("POST", "/run", lambda p: _sse_ok())
+    fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
     c = _client()
     _login(c, "user", u["user_id"])
     for _ in range(10):
@@ -644,7 +586,7 @@ def test_platform_total_exhausted_rejects_owner_and_user():
     _touch("p.svs")
     _own("p.svs", u["user_id"])
     fake = _install_fake()
-    fake.register("POST", "/run", lambda p: _sse_ok())
+    fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
     co = _client()
     _login(co, "owner", o["user_id"])
     cu = _client()
@@ -672,7 +614,7 @@ def test_legacy_own_credentials_are_not_quota_escape_hatch():
     _touch("mix.svs")
     _own("mix.svs", u["user_id"])
     fake = _install_fake()
-    fake.register("POST", "/run", lambda p: _sse_ok())
+    fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
     c = _client()
     _login(c, "user", u["user_id"])
     # 第 1 次平台凭据 → 平台总量满
@@ -696,7 +638,7 @@ def test_histopilot_4xx_releases_reservation():
     _touch("rel.svs")
     _own("rel.svs", u["user_id"])
     fake = _install_fake()
-    fake.register("POST", "/run", lambda p: FakeResponse(
+    fake.register("POST", "/run", lambda b, q, h, k: FakeResponse(
         409, json.dumps({"error": "会话正在运行中"}).encode()))
     c = _client()
     _login(c, "user", u["user_id"])
@@ -719,7 +661,7 @@ def test_histopilot_unreachable_releases_reservation():
     _touch("down.svs")
     _own("down.svs", u["user_id"])
     fake = _install_fake()
-    fake.register("POST", "/run", lambda p: _sse_ok())
+    fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
     fake.unreachable = True
     c = _client()
     _login(c, "user", u["user_id"])
@@ -737,11 +679,11 @@ def test_stream_reconnect_and_cancel_do_not_reserve():
     u = _make_user("user")
     fake = _install_fake()
     fake.register("GET", "/session/sess-x/stream",
-                  lambda p: FakeResponse(200, b"id: 1\nevent: delta\ndata: {}\n\n",
+                  lambda b, q, h, k: FakeResponse(200, b"id: 1\nevent: delta\ndata: {}\n\n",
                                          ctype="text/event-stream"))
-    fake.register("POST", "/cancel", lambda p: FakeResponse(200, b'{"ok":true}'))
+    fake.register("POST", "/cancel", lambda b, q, h, k: FakeResponse(200, b'{"ok":true}'))
     fake.register("GET", "/session/sess-x",
-                  lambda p: FakeResponse(200, json.dumps(
+                  lambda b, q, h, k: FakeResponse(200, json.dumps(
                       {"session": {"id": "sess-x", "owner": u["user_id"]}})))
     c = _client()
     _login(c, "user", u["user_id"])

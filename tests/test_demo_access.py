@@ -48,7 +48,7 @@ import demo_store  # noqa: E402
 import platform_features  # noqa: E402
 import app as app_mod  # noqa: E402
 from pg_compat import BACKEND, json_only  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app # noqa: E402
+from _pt_helpers import csrf_client, isolate_app, FakeResponse # noqa: E402
 
 pg_only = pytest.mark.skipif(
     BACKEND != "postgres",
@@ -70,29 +70,6 @@ def _reset_stores(monkeypatch, tmp_path):
     isolate_app(monkeypatch, tmp_path)
     app_mod._ADAPTER_MODE_CACHE.update(ts=0.0, mode=None)
     yield
-
-
-class FakeResponse:
-    def __init__(self, status_code=200, content=None, ctype="application/json",
-                 headers=None):
-        self.status_code = status_code
-        self.content = content if content is not None else b"{}"
-        if isinstance(self.content, str):
-            self.content = self.content.encode("utf-8")
-        elif isinstance(self.content, dict):
-            self.content = json.dumps(self.content).encode("utf-8")
-        self.headers = {"Content-Type": ctype}
-        if headers:
-            self.headers.update(headers)
-
-    def json(self):
-        return json.loads(self.content.decode("utf-8"))
-
-    def close(self):
-        pass
-
-    def iter_content(self, chunk_size=4096):
-        yield self.content
 
 
 class FakeSidecar:

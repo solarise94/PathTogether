@@ -36,7 +36,7 @@ import pytest  # noqa: E402
 import app as app_mod  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits, isolate_app # noqa: E402
+from _pt_helpers import csrf_client, install_json_login_limits, isolate_app, FakeRequests # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -55,46 +55,6 @@ def _isolate(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 # 基建：fake sidecar（path/stream 等代理端点不被本文件触发，仅归属查询用）
 # --------------------------------------------------------------------------- #
-class FakeResponse:
-    def __init__(self, status_code=200, content=b""):
-        self.status_code = status_code
-        self.content = content if isinstance(content, bytes) else content.encode()
-        self.headers = {"Content-Type": "application/json"}
-
-    def get_json(self, silent=False):
-        try:
-            return json.loads(self.content.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            return None
-
-    def json(self):
-        data = self.get_json(silent=True)
-        if data is None:
-            raise ValueError("no json")
-        return data
-
-
-class FakeRequests:
-    ConnectionError = __import__("requests").ConnectionError
-    Timeout = __import__("requests").Timeout
-
-    def __init__(self):
-        self.calls = []
-        self._routes = {}
-
-    def register_json(self, method, path, status=200, body=None):
-        payload = json.dumps(body if body is not None else {"ok": True}).encode()
-        self._routes[(method.upper(), path)] = (status, payload)
-
-    def get(self, url, **kwargs):
-        base = app_mod.AI_SIDECAR_URL
-        path = url[len(base):] if url.startswith(base) else url
-        self.calls.append({"method": "GET", "path": path,
-                           "query": kwargs.get("params")})
-        route = self._routes.get(("GET", path))
-        if route is None:
-            return FakeResponse(404, json.dumps({"error": "no route"}).encode())
-        return FakeResponse(route[0], route[1])
 
 
 @pytest.fixture()

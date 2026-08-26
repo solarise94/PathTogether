@@ -29,7 +29,7 @@ import pytest  # noqa: E402
 import app as app_mod  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits, isolate_app # noqa: E402
+from _pt_helpers import csrf_client, install_json_login_limits, isolate_app, FakeRequests # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -46,74 +46,6 @@ def _isolate(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 # Fake sidecar：requests 兼容（普通 JSON + SSE 两种形态）
 # --------------------------------------------------------------------------- #
-class FakeResponse:
-    def __init__(self, status_code=200, content=b"", sse_frames=None):
-        self.status_code = status_code
-        if sse_frames is not None:
-            self._sse_frames = list(sse_frames)
-            self.content = b"".join(sse_frames)
-            self.headers = {"Content-Type": "text/event-stream"}
-        else:
-            self._sse_frames = None
-            self.content = content if isinstance(content, bytes) else content.encode()
-            self.headers = {"Content-Type": "application/json"}
-
-    def iter_content(self, chunk_size=4096):
-        if self._sse_frames is None:
-            yield self.content
-            return
-        for frame in self._sse_frames:
-            yield frame
-
-    def close(self):
-        pass
-
-    def get_json(self, silent=False):
-        try:
-            return json.loads(self.content.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            return None
-
-    def json(self):
-        data = self.get_json(silent=True)
-        if data is None:
-            raise ValueError("no json")
-        return data
-
-
-class FakeRequests:
-    ConnectionError = __import__("requests").ConnectionError
-    Timeout = __import__("requests").Timeout
-
-    def __init__(self):
-        self._routes = {}
-        self.calls = []
-
-    def register_json(self, method, path, status=200, body=None):
-        payload = json.dumps(body if body is not None else {"ok": True}).encode()
-        self._routes[(method.upper(), path)] = ("json", status, payload)
-
-    def register_sse(self, method, path, frames, status=200):
-        self._routes[(method.upper(), path)] = ("sse", status, list(frames))
-
-    def _dispatch(self, method, url, **kwargs):
-        base = app_mod.AI_SIDECAR_URL
-        path = url[len(base):] if url.startswith(base) else url
-        self.calls.append({"method": method, "path": path,
-                           "query": kwargs.get("params")})
-        route = self._routes.get((method.upper(), path))
-        if route is None:
-            return FakeResponse(404, json.dumps({"error": "no route"}).encode())
-        kind, status, payload = route
-        if kind == "sse":
-            return FakeResponse(status, sse_frames=payload)
-        return FakeResponse(status, payload)
-
-    def get(self, url, **kwargs):
-        return self._dispatch("GET", url, **kwargs)
-
-    def post(self, url, **kwargs):
-        return self._dispatch("POST", url, **kwargs)
 
 
 @pytest.fixture()

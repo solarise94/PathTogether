@@ -31,7 +31,7 @@ UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 import pytest  # noqa: E402
 
 import app as app_mod  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app  # noqa: E402
+from _pt_helpers import csrf_client, isolate_app, FakeRequests, FakeResponse # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -57,87 +57,6 @@ def check(name, cond, detail=""):
 # =========================================================================== #
 # Fake requests layer
 # =========================================================================== #
-class FakeResponse:
-    """模拟 requests.Response：普通 + SSE 两种形态。"""
-
-    def __init__(self, status_code=200, content=b"", headers=None,
-                 sse_frames=None, ctype=None):
-        self.status_code = status_code
-        if sse_frames is not None:
-            # SSE：content 是帧字节序列拼接；iter_content 逐帧吐
-            self._sse_frames = list(sse_frames)
-            data = b"".join(sse_frames)
-            self.content = data
-            self.headers = {"Content-Type": ctype or "text/event-stream"}
-            # X-AI-Session-ID 由调用方在 headers 里给
-            if headers:
-                self.headers.update(headers)
-        else:
-            self._sse_frames = None
-            self.content = content if isinstance(content, bytes) else content.encode("utf-8")
-            self.headers = dict(headers or {})
-            if "Content-Type" not in self.headers:
-                self.headers["Content-Type"] = ctype or "application/json"
-        self._closed = False
-
-    def iter_content(self, chunk_size=4096):
-        if self._sse_frames is None:
-            # 普通 body：一次吐完
-            yield self.content
-            return
-        # SSE：逐帧吐（不分块，保持帧边界便于断言）
-        for frame in self._sse_frames:
-            yield frame
-
-    def close(self):
-        self._closed = True
-
-
-class FakeRequests:
-    """替换 app.requests。按 (method, path) 注册响应工厂；记录所有调用。"""
-
-    def __init__(self):
-        self._routes = {}  # (method, path) -> handler(body, query, headers, kwargs)
-        self.calls = []    # 记录：{method, path, body, query, headers}
-        self._next_error = None  # ConnectionError/Timeout 触发器
-
-    ConnectionError = __import__("requests").ConnectionError
-    Timeout = __import__("requests").Timeout
-
-    def register(self, method, path, handler):
-        self._routes[(method.upper(), path)] = handler
-
-    def set_unreachable(self):
-        self._next_error = True
-
-    def clear_unreachable(self):
-        self._next_error = None
-        self.calls.clear()
-
-    def _dispatch(self, method, url, **kwargs):
-        # url 形如 http://127.0.0.1:8055/run
-        base = app_mod.AI_SIDECAR_URL
-        path = url[len(base):] if url.startswith(base) else url
-        body = kwargs.get("json")
-        params = kwargs.get("params")
-        headers = kwargs.get("headers") or {}
-        self.calls.append({
-            "method": method, "path": path, "body": body,
-            "query": params, "headers": headers,
-        })
-        if self._next_error:
-            raise FakeRequests.ConnectionError("sidecar down (test)")
-        handler = self._routes.get((method, path))
-        if handler is None:
-            return FakeResponse(404, json.dumps({"error": "no route"}).encode(),
-                                headers={"Content-Type": "application/json"})
-        return handler(body, params, headers, kwargs)
-
-    def get(self, url, **kwargs):
-        return self._dispatch("GET", url, **kwargs)
-
-    def post(self, url, **kwargs):
-        return self._dispatch("POST", url, **kwargs)
 
 
 def install_fake_requests():

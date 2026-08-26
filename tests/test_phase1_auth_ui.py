@@ -629,8 +629,14 @@ def test_index_template_share_permissions_and_logout():
 
 
 def test_appjs_csrf_header_and_post_logout():
+    """源码子串断言（脆弱，test-review P3-17 收敛说明）：
+
+    「X-CSRF-Token 出现在 app.js 全文」已删——那是虚假信心断言：上传 CSRF 的
+    **行为**测试在 tests/js/upload-csrf.test.ts（stub fetch 断言头真实附带）与
+    tests/test_upload_csrf.py（后端 header-only 契约）。此处仅保留无行为测试
+    覆盖的零散锚点，改动 app.js 时允许同步更新。
+    """
     text = (REPO_ROOT / "static" / "app.js").read_text(encoding="utf-8")
-    assert "X-CSRF-Token" in text, "app.js 未附带 CSRF 头"
     assert '"/logout"' in text and '"POST"' in text, "app.js 未改 POST /logout"
     assert "resp.ok" in text
     assert "toast.logout.fail" in text

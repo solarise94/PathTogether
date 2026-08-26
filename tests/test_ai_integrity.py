@@ -35,7 +35,7 @@ import pytest  # noqa: E402
 import app as app_mod  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits, isolate_app # noqa: E402
+from _pt_helpers import csrf_client, install_json_login_limits, isolate_app, FakeRequests, FakeResponse # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -53,81 +53,6 @@ def _isolate(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 # 基建：fake sidecar / 用户 / 切片 / grant
 # --------------------------------------------------------------------------- #
-class FakeResponse:
-    def __init__(self, status_code=200, content=b"", headers=None,
-                 sse_frames=None, ctype=None):
-        self.status_code = status_code
-        if sse_frames is not None:
-            self._sse_frames = list(sse_frames)
-            self.content = b"".join(sse_frames)
-            self.headers = {"Content-Type": ctype or "text/event-stream"}
-            if headers:
-                self.headers.update(headers)
-        else:
-            self._sse_frames = None
-            self.content = content if isinstance(content, bytes) else content.encode()
-            self.headers = dict(headers or {})
-            self.headers.setdefault("Content-Type", ctype or "application/json")
-
-    def iter_content(self, chunk_size=4096):
-        if self._sse_frames is None:
-            yield self.content
-            return
-        for frame in self._sse_frames:
-            yield frame
-
-    def close(self):
-        pass
-
-    def get_json(self, silent=False):
-        try:
-            return json.loads(self.content.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            return None
-
-    def json(self):
-        """requests 兼容：r.json()（_ai_session_owner 等平台路径使用）。"""
-        data = self.get_json(silent=True)
-        if data is None:
-            raise ValueError("No JSON object could be decoded")
-        return data
-
-
-class FakeRequests:
-    ConnectionError = __import__("requests").ConnectionError
-    Timeout = __import__("requests").Timeout
-
-    def __init__(self):
-        self._routes = {}
-        self.calls = []
-
-    def register(self, method, path, handler):
-        self._routes[(method.upper(), path)] = handler
-
-    def register_json(self, method, path, status=200, body=None, headers=None):
-        payload = json.dumps(body if body is not None else {"ok": True}).encode()
-        self._routes[(method.upper(), path)] = (
-            lambda b, q, h, k: FakeResponse(status, payload, headers=headers))
-
-    def _dispatch(self, method, url, **kwargs):
-        base = app_mod.AI_SIDECAR_URL
-        path = url[len(base):] if url.startswith(base) else url
-        self.calls.append({
-            "method": method, "path": path, "body": kwargs.get("json"),
-            "query": kwargs.get("params"), "headers": kwargs.get("headers") or {},
-        })
-        handler = self._routes.get((method, path))
-        if handler is None:
-            return FakeResponse(404, json.dumps({"error": "no route"}).encode(),
-                                headers={"Content-Type": "application/json"})
-        return handler(kwargs.get("json"), kwargs.get("params"),
-                       kwargs.get("headers") or {}, kwargs)
-
-    def get(self, url, **kwargs):
-        return self._dispatch("GET", url, **kwargs)
-
-    def post(self, url, **kwargs):
-        return self._dispatch("POST", url, **kwargs)
 
 
 @pytest.fixture()

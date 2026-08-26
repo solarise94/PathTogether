@@ -31,29 +31,13 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TMP = tempfile.mkdtemp(prefix="svs-dispatch-")
-os.environ["SHARE_DATA_DIR"] = os.path.join(TMP, "share-data")
-os.makedirs(os.environ["SHARE_DATA_DIR"], exist_ok=True)
-os.environ["UPLOAD_DIR"] = os.path.join(TMP, "uploads")
-os.makedirs(os.environ["UPLOAD_DIR"], exist_ok=True)
-os.environ["AI_SIDECAR_URL"] = "http://127.0.0.1:8055"
-
-# openslide 未安装时 stub（本测试不需要真 OpenSlide）
-try:
-    import openslide  # noqa: F401
-except ImportError:
-    import types as _types
-    _os = _types.ModuleType("openslide")
-    _os.OpenSlide = object
-    sys.modules["openslide"] = _os
-    _dz = _types.ModuleType("openslide.deepzoom")
-    _dz.DeepZoomGenerator = object
-    sys.modules["openslide.deepzoom"] = _dz
-
+import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
+UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 import requests as real_requests  # noqa: E402
 
 import app as app_mod  # noqa: E402
 import share_store  # noqa: E402
+from _pt_helpers import isolate_app  # noqa: E402
 
 app_mod.UPLOAD_DIR = Path(os.environ["UPLOAD_DIR"])
 app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -118,10 +102,8 @@ def _load_sample_backend():
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
     """每用例独立存储 + AUTH_ENABLED=False + 全新 dispatch 限流器。"""
-    monkeypatch.setenv("SHARE_DATA_DIR", str(tmp_path))
+    isolate_app(monkeypatch, tmp_path)
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", False)
-    monkeypatch.setattr(share_store, "SHARE_DATA_DIR", tmp_path)
-    monkeypatch.setattr(share_store, "SHARE_FILE", tmp_path / "shares.json")
     monkeypatch.setattr(app_mod, "_DISPATCH_RATE_LIMITER",
                         app_mod._PluginRateLimiter(
                             app_mod._PLUGIN_DISPATCH_RATE_LIMIT_PER_MIN))

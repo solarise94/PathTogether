@@ -22,24 +22,8 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TMP = tempfile.mkdtemp(prefix="svs-sample-")
-os.environ["SHARE_DATA_DIR"] = os.path.join(TMP, "share-data")
-os.makedirs(os.environ["SHARE_DATA_DIR"], exist_ok=True)
-os.environ["UPLOAD_DIR"] = os.path.join(TMP, "uploads")
-os.makedirs(os.environ["UPLOAD_DIR"], exist_ok=True)
-os.environ["AI_SIDECAR_URL"] = "http://127.0.0.1:8055"
-
-try:
-    import openslide  # noqa: F401
-except ImportError:
-    import types as _types
-    _os = _types.ModuleType("openslide")
-    _os.OpenSlide = object
-    sys.modules["openslide"] = _os
-    _dz = _types.ModuleType("openslide.deepzoom")
-    _dz.DeepZoomGenerator = object
-    sys.modules["openslide.deepzoom"] = _dz
-
+import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
+UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 from plugins.sdk import manifest as M  # noqa: E402
 import app as app_mod  # noqa: E402
 import pytest  # noqa: E402

@@ -24,27 +24,10 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TMP = tempfile.mkdtemp(prefix="svs-upguard-")
-DATA_DIR = os.path.join(TMP, "share-data")
-UPLOAD_DIR = os.path.join(TMP, "uploads")
-os.environ["SHARE_DATA_DIR"] = DATA_DIR
-os.makedirs(DATA_DIR, exist_ok=True)
-os.environ["UPLOAD_DIR"] = UPLOAD_DIR
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
+DATA_DIR = _bootstrap.SHARE_DATA_DIR
+UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 os.environ["ADMIN_PASSWORD"] = ""
-
-# openslide 未安装时 stub（上传路径只需文件级操作 + mock 验证）
-try:
-    import openslide  # noqa: F401
-except ImportError:
-    import types as _types
-    _os = _types.ModuleType("openslide")
-    _os.OpenSlide = object
-    sys.modules["openslide"] = _os
-    _dz = _types.ModuleType("openslide.deepzoom")
-    _dz.DeepZoomGenerator = object
-    sys.modules["openslide.deepzoom"] = _dz
-
 import pytest  # noqa: E402
 
 import share_store  # noqa: E402
@@ -52,10 +35,8 @@ import user_store  # noqa: E402
 import upload_guard  # noqa: E402
 import app as app_mod  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits  # noqa: E402
+from _pt_helpers import csrf_client, install_json_login_limits, isolate_app, clear_upload_dir # noqa: E402
 
-app_mod.UPLOAD_DIR = Path(UPLOAD_DIR)
-app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 pg_only = pytest.mark.skipif(
     BACKEND != "postgres", reason="上传配额需 PG（RUN_PG_TESTS=1）")
@@ -66,26 +47,14 @@ json_only = pytest.mark.skipif(
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     """每用例：独立存储 + 无登录限制 mock + 防护参数复位 + 清空 uploads。"""
-    monkeypatch.setenv("SHARE_DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(share_store, "SHARE_DATA_DIR", tmp_path)
-    monkeypatch.setattr(share_store, "SHARE_FILE", tmp_path / "shares.json")
-    monkeypatch.setattr(user_store, "SHARE_DATA_DIR", tmp_path)
-    monkeypatch.setattr(user_store, "USER_FILE", tmp_path / "users.json")
-    up_dir = Path(UPLOAD_DIR)
-    monkeypatch.setattr(app_mod, "UPLOAD_DIR", up_dir)
-    share_store.set_owner_user_id("")
-    install_json_login_limits(monkeypatch)
+    _, up_dir = isolate_app(monkeypatch, tmp_path, UPLOAD_DIR,
+                            login_limits=True)
     # 防护参数复位（防环境变量/其它用例污染；水印置 0 使本机磁盘不干扰；
     # Werkzeug 层上限置 None = 放开，计数层单独收紧的用例自行 monkeypatch）
     monkeypatch.setattr(upload_guard, "UPLOAD_MAX_REQUEST_BYTES", 10 * 1024 ** 3)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
     monkeypatch.setitem(app_mod.app.config, "MAX_CONTENT_LENGTH", None)
-    for child in up_dir.iterdir():
-        if child.is_file():
-            child.unlink()
-        else:
-            import shutil
-            shutil.rmtree(child, ignore_errors=True)
+    clear_upload_dir(up_dir)
     yield
 
 

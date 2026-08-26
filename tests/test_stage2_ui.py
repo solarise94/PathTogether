@@ -25,12 +25,8 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TMP = tempfile.mkdtemp(prefix="svs-stage2-")
-os.environ["SHARE_DATA_DIR"] = os.path.join(TMP, "share-data")
-os.makedirs(os.environ["SHARE_DATA_DIR"], exist_ok=True)
-os.environ["UPLOAD_DIR"] = os.path.join(TMP, "uploads")
-os.makedirs(os.environ["UPLOAD_DIR"], exist_ok=True)
-
+import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
+UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 # 拆仓后 HistoPilot 是外部 release bundle。测试在 import app 前建立一个最小 bundle，
 # 使模块级 PLUGIN_BUNDLES_DIR 指向隔离目录，既验证发现链路又不依赖兄弟仓库。
 PLUGIN_ROOT = Path(os.environ["SHARE_DATA_DIR"]) / "plugins" / "histopilot"
@@ -50,17 +46,6 @@ for _asset in ("bridge-client.js", "api.js", "sse.js", "renderer.js",
                "config-panel.js", "sessions.js", "main.js"):
     (PLUGIN_UI_DIR / _asset).write_text("window.HistoPilot = window.HistoPilot || {};\n", encoding="utf-8")
 
-# openslide 未安装时 stub（本测试不需要真 OpenSlide）
-try:
-    import openslide  # noqa: F401
-except ImportError:
-    import types as _types
-    _os = _types.ModuleType("openslide")
-    _os.OpenSlide = object
-    sys.modules["openslide"] = _os
-    _dz = _types.ModuleType("openslide.deepzoom")
-    _dz.DeepZoomGenerator = object
-    sys.modules["openslide.deepzoom"] = _dz
 
 import app as app_mod  # noqa: E402
 import pytest  # noqa: E402

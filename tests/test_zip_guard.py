@@ -22,26 +22,10 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TMP = tempfile.mkdtemp(prefix="svs-zipguard-")
-DATA_DIR = os.path.join(TMP, "share-data")
-UPLOAD_DIR = os.path.join(TMP, "uploads")
-os.environ["SHARE_DATA_DIR"] = DATA_DIR
-os.makedirs(DATA_DIR, exist_ok=True)
-os.environ["UPLOAD_DIR"] = UPLOAD_DIR
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
+DATA_DIR = _bootstrap.SHARE_DATA_DIR
+UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 os.environ["ADMIN_PASSWORD"] = ""
-
-try:
-    import openslide  # noqa: F401
-except ImportError:
-    import types as _types
-    _os = _types.ModuleType("openslide")
-    _os.OpenSlide = object
-    sys.modules["openslide"] = _os
-    _dz = _types.ModuleType("openslide.deepzoom")
-    _dz.DeepZoomGenerator = object
-    sys.modules["openslide.deepzoom"] = _dz
-
 import pytest  # noqa: E402
 
 import share_store  # noqa: E402
@@ -49,9 +33,8 @@ import user_store  # noqa: E402
 import upload_guard  # noqa: E402
 import app as app_mod  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
+from _pt_helpers import isolate_app, clear_upload_dir  # noqa: E402
 
-app_mod.UPLOAD_DIR = Path(UPLOAD_DIR)
-app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 pg_only = pytest.mark.skipif(
     BACKEND != "postgres", reason="配额 topup 需 PG（RUN_PG_TESTS=1）")
@@ -62,14 +45,7 @@ SVS = b"fake-svs-content-0123456789"
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     """独立存储 + ZIP 上限复位 + _validate_slide_file 放行 + 清空 uploads。"""
-    monkeypatch.setenv("SHARE_DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(share_store, "SHARE_DATA_DIR", tmp_path)
-    monkeypatch.setattr(share_store, "SHARE_FILE", tmp_path / "shares.json")
-    monkeypatch.setattr(user_store, "SHARE_DATA_DIR", tmp_path)
-    monkeypatch.setattr(user_store, "USER_FILE", tmp_path / "users.json")
-    up_dir = Path(UPLOAD_DIR)
-    monkeypatch.setattr(app_mod, "UPLOAD_DIR", up_dir)
-    share_store.set_owner_user_id("")
+    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
     monkeypatch.setattr(app_mod, "ZIP_MAX_MEMBERS", 4096)
     monkeypatch.setattr(app_mod, "ZIP_MAX_PATH_DEPTH", 8)
@@ -79,12 +55,7 @@ def _isolate(tmp_path, monkeypatch):
                         2 * upload_guard.UPLOAD_MAX_REQUEST_BYTES)
     monkeypatch.setattr(app_mod, "ZIP_MAX_COMPRESSION_RATIO", 100.0)
     monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
-    for child in up_dir.iterdir():
-        if child.is_file():
-            child.unlink()
-        else:
-            import shutil
-            shutil.rmtree(child, ignore_errors=True)
+    clear_upload_dir(UPLOAD_DIR)
     yield
 
 

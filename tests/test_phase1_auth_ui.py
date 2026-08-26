@@ -32,32 +32,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest  # noqa: E402
 
-TMP = tempfile.mkdtemp(prefix="svs-p1-")
-DATA_DIR = os.path.join(TMP, "share-data")
-UPLOAD_DIR = os.path.join(TMP, "uploads")
-os.environ["SHARE_DATA_DIR"] = DATA_DIR
-os.environ["UPLOAD_DIR"] = UPLOAD_DIR
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
+DATA_DIR = _bootstrap.SHARE_DATA_DIR
+UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 os.environ["ADMIN_PASSWORD"] = ""
-
-try:
-    import openslide  # noqa: F401
-except ImportError:
-    import types as _types
-    _os = _types.ModuleType("openslide")
-    _os.OpenSlide = object
-    sys.modules["openslide"] = _os
-    _dz = _types.ModuleType("openslide.deepzoom")
-    _dz.DeepZoomGenerator = object
-    sys.modules["openslide.deepzoom"] = _dz
-
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
 import platform_features  # noqa: E402
 from pg_compat import json_only, BACKEND  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits  # noqa: E402
+from _pt_helpers import csrf_client, install_json_login_limits, isolate_app # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -65,17 +49,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
     """每用例：临时目录夺回 + 关认证默认（认证用例自行开启）。"""
-    data_dir = Path(DATA_DIR)
-    monkeypatch.setenv("SHARE_DATA_DIR", DATA_DIR)
-    monkeypatch.setattr(user_store, "SHARE_DATA_DIR", data_dir)
-    monkeypatch.setattr(user_store, "USER_FILE", data_dir / "users.json")
-    monkeypatch.setattr(share_store, "SHARE_DATA_DIR", data_dir)
-    monkeypatch.setattr(share_store, "SHARE_FILE", data_dir / "shares.json")
-    share_store.set_owner_user_id("")
-    for name in ("users.json", "users.json.bak", "shares.json", "shares.json.bak"):
-        p = data_dir / name
-        if p.exists():
-            p.unlink()
+    isolate_app(monkeypatch, DATA_DIR, clear_stores=True)
     yield
 
 

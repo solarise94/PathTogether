@@ -29,26 +29,10 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TMP = tempfile.mkdtemp(prefix="svs-p0b-bp-")
-DATA_DIR = os.path.join(TMP, "share-data")
-UPLOAD_DIR = os.path.join(TMP, "uploads")
-os.environ["SHARE_DATA_DIR"] = DATA_DIR
-os.environ["UPLOAD_DIR"] = UPLOAD_DIR
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
+DATA_DIR = _bootstrap.SHARE_DATA_DIR
+UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 os.environ["ADMIN_PASSWORD"] = ""
-
-try:
-    import openslide  # noqa: F401
-except ImportError:
-    import types as _types
-    _os = _types.ModuleType("openslide")
-    _os.OpenSlide = object
-    sys.modules["openslide"] = _os
-    _dz = _types.ModuleType("openslide.deepzoom")
-    _dz.DeepZoomGenerator = object
-    sys.modules["openslide.deepzoom"] = _dz
-
 import pytest  # noqa: E402
 
 pytest.importorskip("pgserver")

@@ -33,59 +33,40 @@ import pytest  # noqa: E402
 # 夺回 share_store 常量与 env，用例结束自动还原。share_store 此时可能已被别的测试
 # 模块预导入、其常量指向别人的目录，这在收集阶段是正常的，不在收集阶段断言。
 # --------------------------------------------------------------------------- #
-TMP = tempfile.mkdtemp(prefix="svs-aicfg-")
-DATA_DIR = os.path.join(TMP, "share-data")
-os.environ["SHARE_DATA_DIR"] = DATA_DIR
-os.makedirs(DATA_DIR, exist_ok=True)
-
+import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
+DATA_DIR = _bootstrap.SHARE_DATA_DIR
 import share_store  # noqa: E402
 
-# openslide 未安装时 stub（本测试只覆盖配置校验，不需真 OpenSlide）
-try:
-    import openslide  # noqa: F401
-except ImportError:
-    import types as _types
-    _os = _types.ModuleType("openslide")
-    _os.OpenSlide = object
-    sys.modules["openslide"] = _os
-    _dz = _types.ModuleType("openslide.deepzoom")
-    _dz.DeepZoomGenerator = object
-    sys.modules["openslide.deepzoom"] = _dz
 
 import app as app_mod  # noqa: E402
 # check()：_pt_helpers 统一带守卫实现；PASS/FAIL 计数仍落在本模块
-from _pt_helpers import check, csrf_client  # noqa: E402
+from _pt_helpers import check, csrf_client, isolate_app  # noqa: E402
 
 PASS = 0
 FAIL = 0
 
 
 @pytest.fixture(autouse=True)
-def _isolate_data_dir(monkeypatch):
-    """每个用例前把 SHARE_DATA_DIR / share_store 常量指回本模块的临时目录。
+def _isolate_data_dir(monkeypatch, tmp_path):
+    """每个用例前把 SHARE_DATA_DIR / share_store 常量指到本用例私有目录。
 
-    必要性：pytest 在收集阶段会 import 所有测试模块；其它测试模块（如
-    test_ai_proxy）在 import 时会把 os.environ["SHARE_DATA_DIR"] 改成它们自己的
-    临时目录。app._data_dir_for_secret() 在调用时（非 import 时）读取该环境变量，
-    若不在此处夺回，配置路径会落到别的测试的临时目录里。同理 share_store.SHARE_FILE
-    可能被别的模块的 fixture 改写到其临时目录，故一并夺回。monkeypatch 保证用例
-    结束后还原 env 与常量，互不污染。
+    目录选择已收敛到 tests/_bootstrap.py（conftest 先于任何 ``import app``
+    设 session 级 env）；本 fixture 只负责 per-test 夺回：isolate_app 把
+    env / share_store 常量 / AUTH_ENABLED·requests 还原护栏一并处理，
+    app._data_dir_for_secret() 调用时读到的即本用例目录。
 
     绝不在收集阶段 importlib.reload share_store —— reload 会把共享的 share_store
     模块对象改写到最后一个被收集模块的目录，制造收集期顺序依赖（见问题 1）。
     """
-    data_dir = Path(DATA_DIR)
-    share_file = data_dir / "shares.json"
-    monkeypatch.setenv("SHARE_DATA_DIR", DATA_DIR)
-    monkeypatch.setattr(share_store, "SHARE_DATA_DIR", data_dir)
-    monkeypatch.setattr(share_store, "SHARE_FILE", share_file)
+    isolate_app(monkeypatch, tmp_path)
     # 夺回后立刻校验落点在本次临时目录内（失败即中断，避免误写真实数据）。
     p = app_mod._ai_config_path()
-    assert str(p).startswith(TMP), (
-        "_ai_config_path() 未隔离到临时目录！期望前缀 %r，实际 %r" % (TMP, str(p)))
-    assert str(share_store.SHARE_FILE).startswith(TMP), (
+    assert str(p).startswith(str(tmp_path)), (
+        "_ai_config_path() 未隔离到临时目录！期望前缀 %r，实际 %r"
+        % (str(tmp_path), str(p)))
+    assert str(share_store.SHARE_FILE).startswith(str(tmp_path)), (
         "share_store.SHARE_FILE 未隔离到临时目录！期望前缀 %r，实际 %r"
-        % (TMP, str(share_store.SHARE_FILE)))
+        % (str(tmp_path), str(share_store.SHARE_FILE)))
     yield
 
 
@@ -97,10 +78,8 @@ def make_client():
 
 
 def reset_config():
-    """每个用例前清空 ai_config.json（落在临时目录内）。"""
+    """每个用例前清空 ai_config.json（落点已由 _isolate_data_dir 校验隔离）。"""
     p = app_mod._ai_config_path()
-    assert str(p).startswith(TMP), (
-        "reset_config 目标路径越界！%r 不在临时目录 %r 内" % (str(p), TMP))
     try:
         p.unlink()
     except FileNotFoundError:

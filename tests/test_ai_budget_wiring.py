@@ -32,26 +32,9 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TMP = tempfile.mkdtemp(prefix="svs-pt3-")
-DATA_DIR = os.path.join(TMP, "share-data")
-UPLOAD_DIR = os.path.join(TMP, "uploads")
-os.environ["SHARE_DATA_DIR"] = DATA_DIR
-os.environ["UPLOAD_DIR"] = UPLOAD_DIR
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.environ["AI_SIDECAR_URL"] = "http://127.0.0.1:8055"
-
-try:
-    import openslide  # noqa: F401
-except ImportError:
-    import types as _types
-    _os = _types.ModuleType("openslide")
-    _os.OpenSlide = object
-    sys.modules["openslide"] = _os
-    _dz = _types.ModuleType("openslide.deepzoom")
-    _dz.DeepZoomGenerator = object
-    sys.modules["openslide.deepzoom"] = _dz
-
+import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
+DATA_DIR = _bootstrap.SHARE_DATA_DIR
+UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 import pytest  # noqa: E402
 
 import user_store  # noqa: E402
@@ -60,7 +43,7 @@ import budget_store  # noqa: E402
 import demo_store  # noqa: E402
 import platform_features  # noqa: E402
 from pg_compat import BACKEND, json_only  # noqa: E402
-from _pt_helpers import csrf_client  # noqa: E402
+from _pt_helpers import csrf_client, isolate_app # noqa: E402
 
 pg_only = pytest.mark.skipif(
     BACKEND != "postgres",
@@ -89,17 +72,13 @@ def _ssrf_dns(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _reset_stores():
-    """每用例：清空平台 ai_config、用户库与（json）share 数据的预算相关状态。"""
-    p = app_mod._ai_config_path()
-    if p.is_file():
-        p.unlink()
-    uf = getattr(user_store, "USER_FILE", None)
-    if uf is not None and getattr(uf, "exists", lambda: False)():
-        try:
-            uf.unlink()
-        except OSError:
-            pass
+def _reset_stores(monkeypatch, tmp_path):
+    """每用例：独立存储目录（ai_config/用户库/json share 全部落本用例私有目录）。
+
+    通用隔离主体在 _pt_helpers.isolate_app（test-review P3-16 收敛），并附带
+    AUTH_ENABLED / app.requests 还原护栏；PG 后端由 conftest 每用例 TRUNCATE。
+    """
+    isolate_app(monkeypatch, tmp_path)
     yield
 
 

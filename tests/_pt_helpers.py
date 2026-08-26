@@ -13,11 +13,17 @@
    背景：app.py 已删除 per-worker 内存字典（docs §11.1-7），json 后端生产路径
    POST /login 一律 503 fail-closed；需要真实登录流程的旧测试在 json 模式显式装
    本 mock（等价「改为 mock store」的验收路径）。
+
+3. ``isolate_app(monkeypatch, ...)``：通用 per-test 存储隔离（test-review P3-16
+   收敛点）——替代各测试文件自带的高度重复的 ``_isolate`` 主体。文件特有的
+   额外 monkeypatch（upload_guard 常量复位等）留在各文件的薄 fixture 里，
+   先调本函数再加自己的。
 """
 import math
 import os
 import sys
 import time
+from pathlib import Path
 
 from pg_compat import BACKEND
 
@@ -107,6 +113,77 @@ class CsrfClient:
 
 def csrf_client(base):
     return CsrfClient(base)
+
+
+# --------------------------------------------------------------------------- #
+# 通用 per-test 存储隔离（test-review P3-16 收敛点）
+# --------------------------------------------------------------------------- #
+def isolate_app(monkeypatch, data_dir, upload_dir=None, login_limits=False,
+                clear_stores=False):
+    """把存储相关 env/常量指到本用例私有目录，并登记防泄漏还原护栏。
+
+    做的事（PG 后端下这些 json 常量不被读，等价 no-op）：
+      - ``SHARE_DATA_DIR`` env + ``user_store.SHARE_DATA_DIR/USER_FILE`` +
+        ``share_store.SHARE_DATA_DIR/SHARE_FILE`` → ``data_dir``；
+      - ``app.UPLOAD_DIR`` 与 ``share_server.UPLOAD_DIR`` → ``upload_dir``
+        （缺省 ``data_dir/uploads``，自动创建）；
+      - ``share_store.set_owner_user_id("")`` 清归属注入；
+      - ``login_limits=True``：json 后端装登录防爆破内存 mock（默认不装——
+        部分用例专门断言 json 生产行为的 503 fail-closed，装了会掩盖）；
+      - ``clear_stores=True``：删 ``data_dir`` 下 users/shares json（含 .bak）；
+      - 防泄漏护栏：登记 ``app.AUTH_ENABLED`` / ``app.requests`` 的当前值，
+        用例内（``_client()`` 辅助函数等）对它们的**裸赋值**在 teardown 一律
+        自动还原——「模块级直接赋值不还原」类串扰从根上堵住。
+
+    返回 ``(data_dir, upload_dir)``（均为 ``Path``）。
+    """
+    import app as app_mod
+    import share_server as share_srv
+    import share_store
+    import user_store
+
+    data_dir = Path(data_dir)
+    if upload_dir is None:
+        upload_dir = data_dir / "uploads"
+    upload_dir = Path(upload_dir)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setenv("SHARE_DATA_DIR", str(data_dir))
+    monkeypatch.setattr(user_store, "SHARE_DATA_DIR", data_dir)
+    monkeypatch.setattr(user_store, "USER_FILE", data_dir / "users.json")
+    monkeypatch.setattr(share_store, "SHARE_DATA_DIR", data_dir)
+    monkeypatch.setattr(share_store, "SHARE_FILE", data_dir / "shares.json")
+    # UPLOAD_DIR：app 与 share_server 各有一份模块级常量
+    monkeypatch.setattr(app_mod, "UPLOAD_DIR", upload_dir)
+    monkeypatch.setattr(share_srv, "UPLOAD_DIR", upload_dir)
+    share_store.set_owner_user_id("")
+    if login_limits:
+        install_json_login_limits(monkeypatch)
+    if clear_stores:
+        for name in ("users.json", "shares.json",
+                     "users.json.bak", "shares.json.bak"):
+            p = data_dir / name
+            if p.exists():
+                p.unlink()
+    # 防泄漏还原护栏（值不变、只登记还原）：见 docstring
+    monkeypatch.setattr(app_mod, "AUTH_ENABLED", app_mod.AUTH_ENABLED)
+    monkeypatch.setattr(app_mod, "requests", app_mod.requests)
+    return data_dir, upload_dir
+
+
+def clear_upload_dir(upload_dir):
+    """清空上传目录里的测试切片文件（子目录一并 rmtree）。
+
+    供沿用**模块级** UPLOAD_DIR（跨用例复用、非 tmp_path）的薄 fixture 作
+    文件内额外清理。
+    """
+    import shutil
+
+    for child in Path(upload_dir).iterdir():
+        if child.is_file():
+            child.unlink()
+        else:
+            shutil.rmtree(child, ignore_errors=True)
 
 
 def install_json_login_limits(monkeypatch, account_limit=10, ip_limit=5,

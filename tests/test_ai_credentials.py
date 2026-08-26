@@ -27,30 +27,26 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TMP = tempfile.mkdtemp(prefix="svs-aicred-")
-DATA_DIR = os.path.join(TMP, "share-data")
-os.environ["SHARE_DATA_DIR"] = DATA_DIR
-os.environ["AI_SIDECAR_URL"] = "http://127.0.0.1:8055"
-os.makedirs(DATA_DIR, exist_ok=True)
-
-try:
-    import openslide  # noqa: F401
-except ImportError:
-    import types as _types
-    _os = _types.ModuleType("openslide")
-    _os.OpenSlide = object
-    sys.modules["openslide"] = _os
-    _dz = _types.ModuleType("openslide.deepzoom")
-    _dz.DeepZoomGenerator = object
-    sys.modules["openslide.deepzoom"] = _dz
-
+import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
+DATA_DIR = _bootstrap.SHARE_DATA_DIR
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
-from _pt_helpers import csrf_client  # noqa: E402
+from _pt_helpers import csrf_client, isolate_app # noqa: E402
 from pg_compat import json_only  # noqa: E402
 
 import ipaddress  # noqa: E402
 import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate(monkeypatch, tmp_path):
+    """每用例：独立存储目录（ai_config/users.json 落本用例私有目录）。
+
+    通用隔离主体在 _pt_helpers.isolate_app（test-review P3-16 收敛），并附带
+    AUTH_ENABLED / app.requests 还原护栏（_install_fake 的裸赋值不再跨用例泄漏）。
+    """
+    isolate_app(monkeypatch, tmp_path)
+    yield
 
 
 @pytest.fixture(autouse=True)

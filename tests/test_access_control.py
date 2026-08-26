@@ -25,38 +25,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest  # noqa: E402
 
-TMP = tempfile.mkdtemp(prefix="svs-ac-")
-DATA_DIR = os.path.join(TMP, "share-data")
-UPLOAD_DIR = os.path.join(TMP, "uploads")
-os.environ["SHARE_DATA_DIR"] = DATA_DIR
-os.environ["UPLOAD_DIR"] = UPLOAD_DIR
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
+DATA_DIR = _bootstrap.SHARE_DATA_DIR
+UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 os.environ["ADMIN_PASSWORD"] = ""  # 默认无 owner 引导；各用例手动建用户
-
-# openslide 未安装时 stub（本测试多数路径在打开切片前即返回 403）
-try:
-    import openslide  # noqa: F401
-except ImportError:
-    import types as _types
-    _os = _types.ModuleType("openslide")
-    _os.OpenSlide = object
-    sys.modules["openslide"] = _os
-    _dz = _types.ModuleType("openslide.deepzoom")
-    _dz.DeepZoomGenerator = object
-    sys.modules["openslide.deepzoom"] = _dz
-
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
 import share_server as share_srv  # noqa: E402
 from pg_compat import json_only, BACKEND  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits  # noqa: E402
-
-# 强制 UPLOAD_DIR 指回本次临时目录（其它测试可能先 import app 改写了它）
-app_mod.UPLOAD_DIR = Path(UPLOAD_DIR)
-app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-share_srv.UPLOAD_DIR = Path(UPLOAD_DIR)
+from _pt_helpers import csrf_client, install_json_login_limits, isolate_app # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -67,25 +45,9 @@ def _isolate(monkeypatch):
     改写到它们自己的临时目录；必须在此处用 monkeypatch 每用例夺回，否则 app 读取
     的 UPLOAD_DIR 与本模块写入的不是同一个目录（见 test_ai_config_validation 注释）。
     """
-    data_dir = Path(DATA_DIR)
-    up_dir = Path(UPLOAD_DIR)
-    monkeypatch.setenv("SHARE_DATA_DIR", DATA_DIR)
-    monkeypatch.setattr(user_store, "SHARE_DATA_DIR", data_dir)
-    monkeypatch.setattr(user_store, "USER_FILE", data_dir / "users.json")
-    monkeypatch.setattr(share_store, "SHARE_DATA_DIR", data_dir)
-    monkeypatch.setattr(share_store, "SHARE_FILE", data_dir / "shares.json")
-    # 夺回 UPLOAD_DIR（app 与 share_server 各有一份模块级常量）
-    monkeypatch.setattr(app_mod, "UPLOAD_DIR", up_dir)
-    monkeypatch.setattr(share_srv, "UPLOAD_DIR", up_dir)
-    share_store.set_owner_user_id("")
-    # 登录防爆破：json 后端装内存 mock（app 已删 _auth_attempts 内存字典）；
-    # PG 后端走真实 auth_rate_limits（conftest 每用例 TRUNCATE）
-    install_json_login_limits(monkeypatch)
-    for name in ("users.json", "shares.json", "users.json.bak", "shares.json.bak"):
-        p = data_dir / name
-        if p.exists():
-            p.unlink()
-    # 清空 uploads 目录中的测试切片文件
+    _, up_dir = isolate_app(monkeypatch, DATA_DIR, UPLOAD_DIR,
+                            login_limits=True, clear_stores=True)
+    # 清空 uploads 目录中的测试切片文件（沿用模块级 UPLOAD_DIR 的文件内额外清理）
     for child in up_dir.iterdir():
         if child.is_file():
             child.unlink()
@@ -310,7 +272,6 @@ def test_public_slide_visible_to_user():
     _login(cb, "b@x.com", "userBpass123456")
     names = {i["name"] for i in cb.get("/api/slides").get_json()}
     assert sa in names
-    # 公开切片可被 userB 查看（info 不再 403；可能因 openslide stub 报错，但非 403）
     r = cb.get("/api/slide/%s/info" % sa)
     assert r.status_code != 403
 

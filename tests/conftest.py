@@ -1,7 +1,14 @@
 # -*- coding: utf-8 -*-
-"""PG 双跑测试基建（Stage 3b-2）。
+"""PG 双跑测试基建（Stage 3b-2）+ 测试自举入口（test-review P3-16）。
 
-仅当环境变量 ``RUN_PG_TESTS=1`` 时启用：
+**无条件部分（json 模式也执行）**：顶部 ``import _bootstrap``——pytest 先加载
+conftest 再加载任何测试模块，保证 session 级 ``SHARE_DATA_DIR`` / ``UPLOAD_DIR``
+env 与 openslide stub **早于第一个 ``import app``** 生效。此前约 38 个测试模块
+在各自 import 期抢写这些 env，只有第一个模块生效、其余靠 per-test ``_isolate``
+补偿；现在目录选择收敛到 ``tests/_bootstrap.py`` 唯一一份（脚本直跑路径同样
+import 它）。per-test 隔离见 ``_pt_helpers.isolate_app``。
+
+仅当环境变量 ``RUN_PG_TESTS=1`` 时启用 PG 部分：
   - 在 conftest **import 期**（pytest 先加载 conftest 再加载各测试模块，故早于任何
     ``import share_store`` / ``import app``）起一个 pgserver session 实例，并设
     ``DATABASE_URL`` + ``STORAGE_BACKEND=postgres``——保证 app.py / share_store /
@@ -10,9 +17,11 @@
     表，保证用例隔离；
   - ``pg_uri`` fixture 暴露连接串（测试自建连接用）。
 
-json 默认路径零影响：``RUN_PG_TESTS`` 未设时本模块什么都不做（不起 PG、不设 env、
-不注册 truncate fixture）。
+json 默认路径零影响：``RUN_PG_TESTS`` 未设时 PG 部分什么都不做（不起 PG、不设
+env、不注册 truncate fixture）。
 """
+import _bootstrap  # noqa: F401  # 须最先：session 目录 + openslide stub
+
 import os
 
 _RUN_PG = (os.environ.get("RUN_PG_TESTS") or "").strip() in ("1", "true", "True")

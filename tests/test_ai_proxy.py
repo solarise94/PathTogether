@@ -25,26 +25,13 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TMP = tempfile.mkdtemp(prefix="svs-proxy-")
-os.environ["SHARE_DATA_DIR"] = os.path.join(TMP, "share-data")
-os.makedirs(os.environ["SHARE_DATA_DIR"], exist_ok=True)
-# 固定 sidecar 地址（测试用假 requests，地址不会真的被访问）
-os.environ["AI_SIDECAR_URL"] = "http://127.0.0.1:8055"
+import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
+UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 
-# openslide 未安装时 stub（本测试不需要真 OpenSlide）
-try:
-    import openslide  # noqa: F401
-except ImportError:
-    import types as _types
-    _os = _types.ModuleType("openslide")
-    _os.OpenSlide = object
-    sys.modules["openslide"] = _os
-    _dz = _types.ModuleType("openslide.deepzoom")
-    _dz.DeepZoomGenerator = object
-    sys.modules["openslide.deepzoom"] = _dz
+import pytest  # noqa: E402
 
 import app as app_mod  # noqa: E402
-from _pt_helpers import csrf_client  # noqa: E402
+from _pt_helpers import csrf_client, isolate_app  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -161,9 +148,24 @@ def install_fake_requests():
 
 def make_client():
     app_mod.app.config["TESTING"] = True
-    # 认证默认关闭（多数测试需要放行 /api/）
+    # 认证默认关闭（多数测试需要放行 /api/）。
+    # AUTH_ENABLED / app.requests 的还原由 _isolate 的还原护栏接管（P3-16）。
     app_mod.AUTH_ENABLED = False
     return csrf_client(app_mod.app.test_client())
+
+
+@pytest.fixture(autouse=True)
+def _isolate(monkeypatch, tmp_path):
+    """每用例：独立存储目录 + 清空 ai_config + AUTH_ENABLED/requests 还原护栏。
+
+    通用隔离主体在 _pt_helpers.isolate_app（test-review P3-16 收敛）；
+    本文件特有：ai_config.json 每用例清空（各测试自行 setup_*_ai_config）。
+    """
+    isolate_app(monkeypatch, tmp_path)
+    p = app_mod._ai_config_path()
+    if p.is_file():
+        p.unlink()
+    yield
 
 
 # =========================================================================== #
@@ -222,7 +224,11 @@ def test_run_proxies_with_decrypted_config_and_sse():
           "got %r" % resp.headers.get("Content-Type"))
     check("run SSE 字节完全一致", resp.data == sent_bytes,
           "got %r" % resp.data)
-    # fresh=1 query 透传成 body.fresh=True（归档语义归 sidecar 仓，PT 不断言）
+    # fresh=1 query 透传成 body.fresh=True。
+    # CROSS_REPO_CONTRACT: histopilot sidecar owns fresh-archive semantics ——
+    # fresh=1 的「清档/新会话」语义由 HistoPilot 侧仓实现与测试；PT 侧只保证
+    # query→body 透传契约，绝不在本仓断言归档顺序/副作用（见 test-review §7-13）。
+    # 稳定标记：grep "CROSS_REPO_CONTRACT" 可找到全部跨仓契约测试。
     fake.calls.clear()
     fake.register("POST", "/run", lambda b, q, h, k: FakeResponse(200, sse_frames=[]))
     client.post("/api/ai/run?fresh=1", json={"slide": "s.svs"})

@@ -7,17 +7,8 @@
 
 import io
 import sys
-import types as _types
 
-try:
-    import openslide  # noqa: F401
-except ImportError:
-    _os = _types.ModuleType("openslide")
-    _os.OpenSlide = object
-    sys.modules["openslide"] = _os
-    _dz = _types.ModuleType("openslide.deepzoom")
-    _dz.DeepZoomGenerator = object
-    sys.modules["openslide.deepzoom"] = _dz
+import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
 
 import app as app_mod  # noqa: E402
 

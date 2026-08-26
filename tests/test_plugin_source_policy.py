@@ -11,23 +11,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TMP = tempfile.mkdtemp(prefix="pathtogether-srcpol-")
-os.environ["SHARE_DATA_DIR"] = os.path.join(TMP, "share-data")
-os.environ["UPLOAD_DIR"] = os.path.join(TMP, "uploads")
-os.makedirs(os.environ["SHARE_DATA_DIR"], exist_ok=True)
-os.makedirs(os.environ["UPLOAD_DIR"], exist_ok=True)
-
-try:
-    import openslide  # noqa: F401
-except ImportError:
-    import types as _types
-    _os = _types.ModuleType("openslide")
-    _os.OpenSlide = object
-    sys.modules["openslide"] = _os
-    _dz = _types.ModuleType("openslide.deepzoom")
-    _dz.DeepZoomGenerator = object
-    sys.modules["openslide.deepzoom"] = _dz
-
+import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
+UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 from plugins.sdk import manifest as M  # noqa: E402
 import app as app_mod  # noqa: E402
 

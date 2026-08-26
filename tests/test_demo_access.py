@@ -32,26 +32,11 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TMP = tempfile.mkdtemp(prefix="svs-pt4-")
-DATA_DIR = os.path.join(TMP, "share-data")
-UPLOAD_DIR = os.path.join(TMP, "uploads")
-os.environ["SHARE_DATA_DIR"] = DATA_DIR
-os.environ["UPLOAD_DIR"] = UPLOAD_DIR
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.environ["AI_SIDECAR_URL"] = "http://127.0.0.1:8056"
+import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
+DATA_DIR = _bootstrap.SHARE_DATA_DIR
+UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 os.environ.setdefault("AI_BUDGET_RECLAIM_INTERVAL_SECONDS", "0")  # 关后台线程
 
-try:
-    import openslide  # noqa: F401
-except ImportError:
-    import types as _types
-    _os = _types.ModuleType("openslide")
-    _os.OpenSlide = object
-    sys.modules["openslide"] = _os
-    _dz = _types.ModuleType("openslide.deepzoom")
-    _dz.DeepZoomGenerator = object
-    sys.modules["openslide.deepzoom"] = _dz
 
 import pytest  # noqa: E402
 import requests as real_requests  # noqa: E402
@@ -63,7 +48,7 @@ import demo_store  # noqa: E402
 import platform_features  # noqa: E402
 import app as app_mod  # noqa: E402
 from pg_compat import BACKEND, json_only  # noqa: E402
-from _pt_helpers import csrf_client  # noqa: E402
+from _pt_helpers import csrf_client, isolate_app # noqa: E402
 
 pg_only = pytest.mark.skipif(
     BACKEND != "postgres",
@@ -75,21 +60,16 @@ pg_only = pytest.mark.skipif(
 # 公共基建
 # --------------------------------------------------------------------------- #
 @pytest.fixture(autouse=True)
-def _reset_stores():
-    """每用例：清平台 ai_config / 用户库；恢复 app.requests。"""
-    p = app_mod._ai_config_path()
-    if p.is_file():
-        p.unlink()
-    uf = getattr(user_store, "USER_FILE", None)
-    if uf is not None and getattr(uf, "exists", lambda: False)():
-        try:
-            uf.unlink()
-        except OSError:
-            pass
-    app_mod.requests = real_requests
+def _reset_stores(monkeypatch, tmp_path):
+    """每用例：独立存储目录（ai_config/用户库全落本用例私有目录）+ adapter 缓存复位。
+
+    通用隔离主体在 _pt_helpers.isolate_app（test-review P3-16 收敛）；其还原护栏
+    会把用例内 FakeSidecar 对 app.requests 的裸赋值在 teardown 还原成真 requests，
+    无需原先的防御性恢复行。
+    """
+    isolate_app(monkeypatch, tmp_path)
     app_mod._ADAPTER_MODE_CACHE.update(ts=0.0, mode=None)
     yield
-    app_mod.requests = real_requests
 
 
 class FakeResponse:

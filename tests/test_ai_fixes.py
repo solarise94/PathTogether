@@ -23,29 +23,14 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TMP = tempfile.mkdtemp(prefix="svs-fixes-")
-# SHARE_DATA_DIR 必须在 import share_store 之前设置（env 是 share_store 模块级
-# 常量的初值来源），但 importlib.reload 不再使用——见模块 docstring。
-SHARE_DATA_DIR = os.path.join(TMP, "share-data")
-os.environ["SHARE_DATA_DIR"] = SHARE_DATA_DIR
-os.makedirs(SHARE_DATA_DIR, exist_ok=True)
-
+import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
+SHARE_DATA_DIR = _bootstrap.SHARE_DATA_DIR
+TMP = _bootstrap.SESSION_TMP  # 「路径必须落在临时树内」防御断言用
 import share_store  # noqa: E402
 from pg_compat import json_only  # noqa: E402
 # check()：_pt_helpers 统一带守卫实现；PASS/FAIL 计数仍落在本模块
-from _pt_helpers import check  # noqa: E402
+from _pt_helpers import check, isolate_app  # noqa: E402
 
-# openslide 未安装时 stub（本测试只覆盖配置/迁移，不需真 OpenSlide）
-try:
-    import openslide  # noqa: F401
-except ImportError:
-    import types as _types
-    _os = _types.ModuleType("openslide")
-    _os.OpenSlide = object
-    sys.modules["openslide"] = _os
-    _dz = _types.ModuleType("openslide.deepzoom")
-    _dz.DeepZoomGenerator = object
-    sys.modules["openslide.deepzoom"] = _dz
 
 # cryptography 可用性检测（影响 api_key 加密是否启用）
 try:
@@ -85,15 +70,9 @@ def _isolate_share_store(monkeypatch):
     test_ai_config_validation）的隔离 fixture 会把 share_store.SHARE_FILE 改写到
     它们自己的临时目录。若不在用例前夺回，本模块的 reset_store() 会写到别人的
     目录里。monkeypatch 用例结束后自动还原，互不污染。
-    用 pathlib.Path 保持 share_store.SHARE_FILE 的类型（测试代码依赖
-    .write_text()/.read_text()/.unlink()）。
+    通用隔离主体已收敛到 _pt_helpers.isolate_app（test-review P3-16）。
     """
-    data_dir = Path(SHARE_DATA_DIR)
-    share_file = data_dir / "shares.json"
-    monkeypatch.setenv("SHARE_DATA_DIR", SHARE_DATA_DIR)
-    # 注意：用 monkeypatch.setattr 才能在用例结束后还原，避免反向污染别的模块。
-    monkeypatch.setattr(share_store, "SHARE_DATA_DIR", data_dir)
-    monkeypatch.setattr(share_store, "SHARE_FILE", share_file)
+    isolate_app(monkeypatch, SHARE_DATA_DIR)
     # 越界检查：目标必须在本模块临时目录内，否则 fail（绝不 unlink 真实文件）。
     assert str(share_store.SHARE_FILE).startswith(TMP), (
         "SHARE_FILE 未隔离到临时目录！期望前缀 %r，实际 %r"

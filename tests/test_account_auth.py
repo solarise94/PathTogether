@@ -27,31 +27,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest  # noqa: E402
 
-TMP = tempfile.mkdtemp(prefix="svs-acct-auth-")
-DATA_DIR = os.path.join(TMP, "share-data")
-os.environ["SHARE_DATA_DIR"] = DATA_DIR
-os.makedirs(DATA_DIR, exist_ok=True)
-# 默认无 bootstrap 秘密；认证由用户是否存在决定（与 test_user_store 同口径）
+import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
+DATA_DIR = _bootstrap.SHARE_DATA_DIR
 os.environ["ADMIN_PASSWORD"] = ""
-
-try:
-    import openslide  # noqa: F401
-except ImportError:
-    import types as _types
-    _os = _types.ModuleType("openslide")
-    _os.OpenSlide = object
-    sys.modules["openslide"] = _os
-    _dz = _types.ModuleType("openslide.deepzoom")
-    _dz.DeepZoomGenerator = object
-    sys.modules["openslide.deepzoom"] = _dz
-
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
 import conftest  # noqa: E402
 from pg_compat import json_only  # noqa: E402
 # check()：_pt_helpers 统一带守卫实现；PASS/FAIL 计数仍落在本模块
-from _pt_helpers import check, csrf_client, install_json_login_limits  # noqa: E402
+from _pt_helpers import check, csrf_client, install_json_login_limits, isolate_app # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -101,23 +86,10 @@ def _read_json_users() -> dict:
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
     """每用例：隔离目录 / 清空用户库 / 归属注入清空 / json 登录限流 mock。"""
-    data_dir = Path(DATA_DIR)
-    monkeypatch.setenv("SHARE_DATA_DIR", DATA_DIR)
-    if conftest.BACKEND == "json":
-        monkeypatch.setattr(user_store, "SHARE_DATA_DIR", data_dir)
-        monkeypatch.setattr(user_store, "USER_FILE", data_dir / "users.json")
-        monkeypatch.setattr(share_store, "SHARE_DATA_DIR", data_dir)
-        monkeypatch.setattr(share_store, "SHARE_FILE", data_dir / "shares.json")
-    share_store.set_owner_user_id("")
-    install_json_login_limits(monkeypatch)
+    isolate_app(monkeypatch, DATA_DIR, login_limits=True, clear_stores=True)
     _reset_users_file()
-    for name in ("users.json", "shares.json", "users.json.bak", "shares.json.bak"):
-        p = data_dir / name
-        if p.exists():
-            p.unlink()
     yield
-    # 恢复全局开关，避免串扰其他测试文件
-    app_mod.AUTH_ENABLED = app_mod._resolve_auth_enabled({})
+    # AUTH_ENABLED 的还原已由 isolate_app 的还原护栏接管（防泄漏登记）
 
 
 def _fake_pg_backend(monkeypatch):

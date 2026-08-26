@@ -1,0 +1,12 @@
+# 覆盖率度量配置（test-review P3-19）。
+# 阈值原则：先度量再设阈值，宁可偏低不让套件变红（CI --cov-fail-under 以
+# 本配置度量出的 TOTAL 为准，设在其下约 10 点）。
+[run]
+omit =
+    tests/*
+    migrations/*
+    scripts/*
+
+[report]
+# scripts/repair_pg_user_password_hashes.py 等运维脚本有专用测试按需直跑，
+# 不计入常规覆盖率门槽数字。

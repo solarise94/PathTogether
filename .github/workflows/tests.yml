@@ -19,7 +19,9 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -r requirements.txt -r requirements-dev.txt
-      - run: python -m pytest tests -q
+      # 覆盖率（test-review P3-19）：fail-under=44 —— 本机 json 模式度量产品代码
+      # TOTAL 54% 减 10 点；阈值宁可偏低，不让套件变红到不可用。
+      - run: python -m pytest tests -q --cov=. --cov-report=term --cov-report=xml --cov-fail-under=44
 
   # PG 后端全量跑（test-review P0-3）：requirements-dev.txt 已含 pgserver，
   # conftest 在 RUN_PG_TESTS=1 时自动起内嵌 PostgreSQL 并设 STORAGE_BACKEND。
@@ -32,7 +34,8 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -r requirements.txt -r requirements-dev.txt
-      - run: python -m pytest tests -q
+      # PG 模式覆盖率天然更高（pg 各 store 被真实执行）；阈值与 json job 一致。
+      - run: python -m pytest tests -q --cov=. --cov-report=term --cov-report=xml --cov-fail-under=44
         env:
           RUN_PG_TESTS: "1"
       # canary 不可跳过：单独再跑一次 canary 文件，断言真实执行且未被 skip

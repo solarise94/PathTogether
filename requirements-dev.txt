@@ -4,3 +4,6 @@
 # 测试运行器必须显式声明，避免干净 CI 环境缺少 pytest。
 pytest>=8.0
 pgserver>=0.1.4
+# 覆盖率（test-review P3-19）：CI json/PG 两个 job 均带 --cov；fail-under 阈值
+# 经本机度量后设定（json 模式产品代码 TOTAL 54%，阈值 44 = 其下 10 点，宁低勿红）。
+pytest-cov>=5.0

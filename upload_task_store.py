@@ -502,11 +502,15 @@ def begin_commit(upload_id, *, ttl_seconds=None):
     return token, task
 
 
-def finish_commit(upload_id, commit_token, sha256_actual):
+def finish_commit(upload_id, commit_token, sha256_actual, *, settle_bytes=None):
     """commit 三段式的短事务 B：token 匹配且仍 committing → committed。§3.2.5
 
     token 不匹配 / 状态已变 → StateConflict（进程外崩溃后的惰性恢复凭同一
     token 收口；过时 worker 的收口被拒）。
+
+    PG 且任务绑定 reservation 时，``settle_bytes`` 把配额转实占放进**同一事务**
+    （任务 committed 与 used_bytes 同时提交 / 同时回滚）。json 后端无配额。
+    预占失效抛 ``upload_guard.ReservationInvalid``，任务行保持 committing。
     """
 
     def _mutate(task):
@@ -518,10 +522,45 @@ def finish_commit(upload_id, commit_token, sha256_actual):
         return {"state": STATE_COMMITTED,
                 "sha256_actual": sha256_actual or None}, None
 
+    if _use_pg():
+        return _pg_finish_commit(upload_id, commit_token, sha256_actual,
+                                 settle_bytes=settle_bytes)
+
     task, _ = _apply(upload_id, _mutate)
     if task is None:
         raise TaskNotFound("上传任务不存在：%r" % upload_id)
     return task
+
+
+def _pg_finish_commit(upload_id, commit_token, sha256_actual, *, settle_bytes=None):
+    """PG：锁任务行 →（可选）同事务 consume reservation → committed。"""
+    import upload_guard
+    conn = _pg_connect()
+    try:
+        with pg_store.transaction(conn):
+            with conn.cursor() as cur:
+                cur.execute("SELECT %s FROM upload_tasks WHERE upload_id = %%s "
+                            "FOR UPDATE" % _PG_COLS, (upload_id,))
+                row = cur.fetchone()
+            if row is None:
+                raise TaskNotFound("上传任务不存在：%r" % upload_id)
+            task = _norm_row(row)
+            if (task["state"] != STATE_COMMITTING
+                    or task.get("commit_token") != commit_token):
+                raise StateConflict(
+                    "commit 收口失败：任务已不在受理态或 token 不匹配（state=%r）"
+                    % task["state"], task)
+            rid = task.get("reservation_id")
+            if rid and settle_bytes is not None:
+                with conn.cursor() as cur:
+                    upload_guard.consume_reservation_locked(
+                        cur, rid, int(settle_bytes))
+            fields = {"state": STATE_COMMITTED,
+                      "sha256_actual": sha256_actual or None}
+            new_row = _pg_update(conn, upload_id, fields)
+            return _norm_row(new_row)
+    finally:
+        conn.close()
 
 
 def fail_commit(upload_id, commit_token, *, permanent, sha256_actual=None,

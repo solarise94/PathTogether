@@ -508,48 +508,55 @@ def release_reservation(reservation_id):
         conn.close()
 
 
+def consume_reservation_locked(cur, reservation_id, actual_bytes):
+    """在调用方已打开的事务/cursor 内转实占（与 upload_tasks 收口同事务）。
+
+    幂等：已 consumed 的行再次 consume 返回现状，不重复累计。
+    """
+    actual_bytes = int(actual_bytes)
+    cur.execute(
+        "SELECT user_id, reserved_bytes, state FROM "
+        "upload_reservations WHERE reservation_id=%s FOR UPDATE",
+        (reservation_id,))
+    r = cur.fetchone()
+    if r is None:
+        raise ReservationInvalid("预占不存在：%r" % reservation_id)
+    if r["state"] == "consumed":
+        return {"reservation_id": reservation_id, "state": "consumed"}
+    if r["state"] != "reserved":
+        raise ReservationInvalid(
+            "预占已释放，不能转实占：%r" % reservation_id)
+    cur.execute(
+        "SELECT 1 FROM upload_reservations WHERE reservation_id=%s "
+        "AND expires_at > now()", (reservation_id,))
+    if cur.fetchone() is None:
+        raise ReservationInvalid(
+            "预占已过期，不能转实占：%r" % reservation_id)
+    cur.execute(
+        "UPDATE upload_reservations SET state='consumed', "
+        "settled_at=now(), settled_bytes=%s, updated_at=now() "
+        "WHERE reservation_id=%s", (actual_bytes, reservation_id))
+    cur.execute(
+        "UPDATE upload_user_quotas SET "
+        "reserved_bytes = GREATEST(0, reserved_bytes - %s), "
+        "used_bytes = used_bytes + %s, updated_at=now() "
+        "WHERE user_id=%s",
+        (int(r["reserved_bytes"]), actual_bytes, r["user_id"]))
+    return {"reservation_id": reservation_id, "state": "consumed",
+            "settled_bytes": actual_bytes}
+
+
 def consume_reservation(reservation_id, actual_bytes):
     """成功转实占：reserved → consumed，reserved 转 used（按实际字节数）。
 
     幂等：已 consumed 的行再次 consume 返回现状，不重复累计。
     """
     platform_features.require_pg_backend("upload_quota")
-    actual_bytes = int(actual_bytes)
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                cur.execute(
-                    "SELECT user_id, reserved_bytes, state FROM "
-                    "upload_reservations WHERE reservation_id=%s FOR UPDATE",
-                    (reservation_id,))
-                r = cur.fetchone()
-                if r is None:
-                    raise ReservationInvalid("预占不存在：%r" % reservation_id)
-                if r["state"] == "consumed":
-                    return {"reservation_id": reservation_id,
-                            "state": "consumed"}
-                if r["state"] != "reserved":
-                    raise ReservationInvalid(
-                        "预占已释放，不能转实占：%r" % reservation_id)
-                cur.execute(
-                    "SELECT 1 FROM upload_reservations WHERE reservation_id=%s "
-                    "AND expires_at > now()", (reservation_id,))
-                if cur.fetchone() is None:
-                    raise ReservationInvalid(
-                        "预占已过期，不能转实占：%r" % reservation_id)
-                cur.execute(
-                    "UPDATE upload_reservations SET state='consumed', "
-                    "settled_at=now(), settled_bytes=%s, updated_at=now() "
-                    "WHERE reservation_id=%s", (actual_bytes, reservation_id))
-                cur.execute(
-                    "UPDATE upload_user_quotas SET "
-                    "reserved_bytes = GREATEST(0, reserved_bytes - %s), "
-                    "used_bytes = used_bytes + %s, updated_at=now() "
-                    "WHERE user_id=%s",
-                    (int(r["reserved_bytes"]), actual_bytes, r["user_id"]))
-        return {"reservation_id": reservation_id, "state": "consumed",
-                "settled_bytes": actual_bytes}
+                return consume_reservation_locked(cur, reservation_id, actual_bytes)
     finally:
         conn.close()
 

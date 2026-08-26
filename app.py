@@ -5005,8 +5005,9 @@ def _upload_v2_set_ownership(task, ident=None):
 def _upload_v2_recover_commit(task):
     """committing 超时的惰性恢复（§3.2.5 崩溃恢复）。
 
-    临时文件已提升为正式文件（dest 存在且大小吻合）→ 补 ownership + consume +
-    committed 收口；否则回滚 active（临时文件保留，续传后可重新 commit）。
+    临时文件已提升为正式文件（dest 存在且大小吻合）→ 补 ownership，并在
+    **同一短事务**内 committed 收口 + 配额转实占；否则回滚 active（临时文件
+    保留，续传后可重新 commit）。入账失败不得留下 committed 文件。
     """
     dest = UPLOAD_DIR / task["safe_name"]
     promoted = False
@@ -5020,17 +5021,33 @@ def _upload_v2_recover_commit(task):
             return upload_task_store.rollback_committing(task["upload_id"])
         except upload_task_store.UploadTaskError:
             return upload_task_store.get_task(task["upload_id"]) or task
+    upload_id = task["upload_id"]
+    token = task.get("commit_token") or ""
+    sha = task.get("sha256_actual") or ""
+    size = int(task["declared_size"])
     try:
         task = upload_task_store.finish_commit(
-            task["upload_id"], task.get("commit_token") or "",
-            task.get("sha256_actual") or "")
+            upload_id, token, sha, settle_bytes=size)
         _upload_v2_set_ownership(task)
-        _upload_v2_consume_reservation(task, task["declared_size"])
         _upload_v2_cleanup_part(task)
+        return task
+    except upload_guard.ReservationInvalid:
+        app.logger.warning(
+            "upload task %s 恢复收口时预占已失效，撤回提升", upload_id)
+        dest.unlink(missing_ok=True)
+        try:
+            task = upload_task_store.fail_commit(
+                upload_id, token, permanent=True, sha256_actual=sha)
+        except upload_task_store.UploadTaskError:
+            task = upload_task_store.get_task(upload_id) or task
+        _upload_v2_release_reservation_quietly(task)
+        _upload_v2_cleanup_part(task)
+        return task
+    except upload_task_store.StateConflict as e:
+        return e.task or upload_task_store.get_task(upload_id) or task
     except Exception:
-        app.logger.exception("upload task commit 恢复收口失败：%s",
-                             task["upload_id"])
-    return task
+        app.logger.exception("upload task commit 恢复收口失败：%s", upload_id)
+        return upload_task_store.get_task(upload_id) or task
 
 
 def _upload_v2_maintain(task):
@@ -5446,16 +5463,14 @@ def api_uploads_commit(upload_id):
         dest.unlink(missing_ok=True)
         return _rollback_temp("归属登记失败")
 
-    # 入账必须在 committed 收口之前：失败则撤回提升，任务转 failed，避免
-    # 「文件已 committed 但 used_bytes 未增加」。
-    if not _upload_v2_consume_reservation(task, size):
+    # ---- 短事务 B：token 匹配且仍 committing → committed，配额同事务转实占 ----
+    try:
+        task = upload_task_store.finish_commit(
+            upload_id, token, sha_actual, settle_bytes=size)
+    except upload_guard.ReservationInvalid:
         dest.unlink(missing_ok=True)
         return _deterministic_fail(
             "reservation_expired", "上传预占已失效，文件未入账")
-
-    # ---- 短事务 B：token 匹配且仍 committing → committed（§3.2.5）----
-    try:
-        task = upload_task_store.finish_commit(upload_id, token, sha_actual)
     except upload_task_store.StateConflict as e:
         cur = e.task or {}
         if cur.get("state") == upload_task_store.STATE_COMMITTED:

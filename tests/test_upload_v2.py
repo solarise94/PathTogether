@@ -385,6 +385,26 @@ def test_commit_happy_path(monkeypatch):
     assert upload_task_store.get_task(uid)["state"] == "committed"
 
 
+def test_recover_commit_does_not_commit_when_settle_fails(monkeypatch):
+    """崩溃恢复：入账失败不得留下 committed 文件。"""
+    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    c = _client()
+    uid = _create(c, name="rc.svs", size=100).get_json()["upload_id"]
+    data = b"r" * 100
+    _upload_full(c, uid, data, chunk=50)
+    _token, task = upload_task_store.begin_commit(uid)
+    dest = Path(UPLOAD_DIR) / "rc.svs"
+    dest.write_bytes(data)
+
+    def boom(*_a, **_k):
+        raise upload_guard.ReservationInvalid("expired")
+
+    monkeypatch.setattr(upload_task_store, "finish_commit", boom)
+    out = app_mod._upload_v2_recover_commit(task)
+    assert out["state"] == "failed"
+    assert not dest.exists()
+
+
 def test_commit_validates_before_promotion(monkeypatch):
     """§2.3 纠正：_validate_slide_file 必须在原子提升**之前**调用。"""
     calls = []

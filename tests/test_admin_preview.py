@@ -327,13 +327,27 @@ def test_preview_start_stop_audited_with_actor_and_subject():
 
 
 def test_preview_state_in_auth_info_or_identity_only():
-    """（形态检查）预览不改 /api/auth/info 的 401/200 契约——GET 放行即可。"""
+    """/api/auth/info：顶层 role/user_id 为 effective subject，actor 仍是管理员。"""
     owner, _a, userb = _setup_users()
     oc = _login(_client(), owner)
+    before = oc.get("/api/auth/info").get_json()
+    assert before["role"] == "owner"
+    assert before["user_id"] == owner["user_id"]
+    assert before.get("preview") is None
+    assert before["actor"]["role"] == "owner"
     assert oc.post("/api/admin/preview/start",
                    json={"user_id": userb["user_id"]}).status_code == 200
     r = oc.get("/api/auth/info")
     assert r.status_code == 200
+    info = r.get_json()
+    assert info["role"] == "user"
+    assert info["user_id"] == userb["user_id"]
+    assert info["username"] == userb["login_id"]
+    assert info["actor"]["role"] == "owner"
+    assert info["actor"]["user_id"] == owner["user_id"]
+    assert info["preview"]["subject_user_id"] == userb["user_id"]
+    assert info["preview"]["subject_role"] == "user"
+    assert info["preview"]["expires_at"] > time.time()
 
 
 # --------------------------------------------------------------------------- #

@@ -40,6 +40,7 @@ P95/P99 后复核，见模块尾部的 DEFAULTS_RATIONALE）。
 import os
 import secrets
 import shutil
+import time
 
 import pg_store
 import platform_features
@@ -219,6 +220,25 @@ def _reservation_out(row) -> dict:
         if out.get(k) is not None:
             out[k] = int(out[k])
     return out
+
+
+def reservation_is_active(out) -> bool:
+    """预占是否仍有效：state=reserved 且 expires_at 尚未到期。
+
+    renew_reservation 对「已过期但尚未惰性回收」的行返回 state=reserved、
+    expires_at 在过去——调用方必须用本函数判定，不能只看 state。
+    """
+    if not out or out.get("state") != "reserved":
+        return False
+    exp = out.get("expires_at")
+    if exp is None:
+        return False
+    if hasattr(exp, "timestamp"):
+        exp = exp.timestamp()
+    try:
+        return float(exp) > time.time()
+    except (TypeError, ValueError):
+        return False
 
 
 def get_quota_row(user_id):
@@ -512,6 +532,12 @@ def consume_reservation(reservation_id, actual_bytes):
                 if r["state"] != "reserved":
                     raise ReservationInvalid(
                         "预占已释放，不能转实占：%r" % reservation_id)
+                cur.execute(
+                    "SELECT 1 FROM upload_reservations WHERE reservation_id=%s "
+                    "AND expires_at > now()", (reservation_id,))
+                if cur.fetchone() is None:
+                    raise ReservationInvalid(
+                        "预占已过期，不能转实占：%r" % reservation_id)
                 cur.execute(
                     "UPDATE upload_reservations SET state='consumed', "
                     "settled_at=now(), settled_bytes=%s, updated_at=now() "

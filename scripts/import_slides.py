@@ -104,25 +104,11 @@ def import_one(src: Path, upload_dir: Path, owner_user_id, requester_role,
         raise ValueError("无效的切片文件：%s" % name)
 
     try:
-        os.link(src, dest)
+        app_mod._promote_no_clobber(src, dest)
     except FileExistsError:
         raise ValueError("名称不可用（目标已存在）：%s" % safe)
-    except OSError:
-        # 跨设备：copy 到临时再 replace
-        tmp = upload_dir / (".importing-" + safe)
-        try:
-            import shutil
-            shutil.copy2(src, tmp)
-            if not app_mod._validate_slide_file(tmp):
-                tmp.unlink(missing_ok=True)
-                raise ValueError("无效的切片文件：%s" % name)
-            os.replace(tmp, dest)
-        except Exception:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+    except OSError as e:
+        raise ValueError("导入提升失败：%s" % e)
 
     try:
         share_store.set_slide_meta(

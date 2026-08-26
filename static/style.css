@@ -3029,6 +3029,19 @@ button {
   padding: 1px 6px;
   line-height: 1.4;
 }
+.preview-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 8px 16px;
+  background: #fff6d6;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+  font-size: 13px;
+  color: #6b5a00;
+  z-index: 20;
+}
+.preview-banner[hidden] { display: none !important; }
 /* 侧栏顶部紧凑徽章：仅移动端显示（标题栏在 360px 级视口放不下徽章，
    见文件末尾 @media (max-width: 760px) 的挪移规则；桌面隐藏避免与标题栏重复） */
 .demo-badge-side { display: none; }

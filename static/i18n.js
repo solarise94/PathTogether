@@ -107,6 +107,11 @@
       "sb.users.reset.ph": "新密码（≥15位）",
       "sb.users.reset.confirm": "请输入新密码（≥15 位）",
       "sb.users.last.owner": "不能禁用最后一个启用中的 owner",
+      "sb.users.preview": "预览身份",
+      "preview.stop": "退出预览",
+      "preview.banner": "正在预览 {user}（{role}）的身份，只读 · 剩余约 {mins} 分钟",
+      "preview.start.ok": "已进入身份预览",
+      "preview.stop.ok": "已退出预览",
 
       // ---- 修改我的密码（owner/user 通用；账户系统批次 A docs §7.1/§8.1） ----
       "acct.changepw": "修改我的密码",
@@ -726,6 +731,11 @@
       "sb.users.reset.ph": "New password (≥15 chars)",
       "sb.users.reset.confirm": "Enter new password (≥15 chars)",
       "sb.users.last.owner": "Cannot disable the last enabled owner",
+      "sb.users.preview": "Preview as",
+      "preview.stop": "Exit preview",
+      "preview.banner": "Previewing {user} ({role}), read-only · ~{mins} min left",
+      "preview.start.ok": "Identity preview started",
+      "preview.stop.ok": "Preview ended",
 
       // ---- Change my password (owner/user; account batch A docs §7.1/§8.1) ----
       "acct.changepw": "Change my password",

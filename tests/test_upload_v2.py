@@ -358,7 +358,11 @@ def test_concurrent_distinct_put_one_wins():
         t.join()
     assert results.count(200) == 1, results
     assert results.count(409) == len(payloads) - 1
-    assert upload_task_store.get_task(uid)["confirmed_offset"] == 64
+    t = upload_task_store.get_task(uid)
+    assert t["confirmed_offset"] == 64
+    part = _part(uid).read_bytes()
+    assert hashlib.sha256(part).hexdigest() == t["last_chunk_sha256"]
+    assert part in payloads
 
 
 # =========================================================================== #
@@ -701,6 +705,33 @@ def test_commit_hash_mismatch_releases_reservation():
     r = c.post("/api/uploads/%s/commit" % uid)
     assert r.status_code == 409
     assert _quota_row(uid_user)[1] == 0  # 确定性失败即释放（不占额度）
+
+
+@pg_only
+def test_expired_reservation_reclaimed_rejects_old_put_and_commit(monkeypatch):
+    """过期预占被新任务回收后，旧任务 PUT/commit fail-closed，不得无记账提交。"""
+    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    c = _client(auth=True)
+    uid_user = _user_session(c, role="user", login="p6@x.com")
+    _set_quota(uid_user, 5000)
+    uid = _create(c, name="old.svs", size=5000).get_json()["upload_id"]
+    rid = upload_task_store.get_task(uid)["reservation_id"]
+    assert _put(c, uid, 0, b"a" * 100).status_code == 200
+    with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE upload_reservations SET expires_at = now() - interval '1 second' "
+                "WHERE reservation_id=%s", (rid,))
+    uid2 = _create(c, name="new.svs", size=5000)
+    assert uid2.status_code == 200, uid2.get_data(as_text=True)
+    r = _put(c, uid, 100, b"b" * 100)
+    assert r.status_code == 409
+    assert r.get_json().get("code") == "reservation_expired"
+    used, reserved = _quota_row(uid_user)
+    assert used == 0
+    assert reserved == 5000  # 仅新任务预占
+    dest = Path(UPLOAD_DIR) / "old.svs"
+    assert not dest.exists()
 
 
 @json_only

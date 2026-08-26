@@ -449,8 +449,9 @@ def get_task(upload_id):
 def append_chunk(upload_id, offset, length, sha256, *, ttl_seconds=None):
     """PUT chunk 的状态转移（短事务/文件锁内判定 + 推进）。
 
-    分片字节的 pwrite 由调用方在**本调用之前**完成（锁外，§3.2.5 同精神：
-    重 IO 不入锁）；本调用只做对齐判定与 confirmed_offset 推进。
+    分片字节的 pwrite 由调用方在**本调用之前**完成，但必须与本调用处于同一
+    每任务写租约内（app.py ``_upload_v2_chunk_lock``），避免同 offset 并发
+    覆盖。本调用只做对齐判定与 confirmed_offset 推进。
 
     返回 (action, task)：action ∈ advanced / idempotent / progressed。
     advanced 与 idempotent 刷新任务 expires_at（§3.2.4；progressed 只读回进度）。

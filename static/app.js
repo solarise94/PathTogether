@@ -101,36 +101,95 @@
     });
   }
 
-  // 当前登录用户角色（/api/auth/info 缓存，供 users 管理区块显示）
+  // 当前登录用户角色（/api/auth/info 缓存）。currentRole/currentUserId 是
+  // effective subject（预览中为被预览用户）；actorRole 永远是真实管理员。
   var currentRole = null;
   var currentUserId = null;
+  var actorRole = null;
+  var actorUserId = null;
+  var previewState = null;
+
+  function applyAuthInfo(info) {
+    if (!info || !info.auth_enabled) return info;
+    var actor = info.actor || {};
+    previewState = info.preview || null;
+    currentRole = info.role || null;
+    currentUserId = info.user_id || null;
+    actorRole = actor.role || info.role || null;
+    actorUserId = actor.user_id || info.user_id || null;
+    var actorName = actor.username || info.username;
+    if (els.logoutBtn) {
+      var label = t("toast.logout");
+      if (actorName) { label += " (" + actorName + ")"; }
+      els.logoutBtn.textContent = label;
+      els.logoutBtn.hidden = !!previewState;
+    }
+    if (els.changepwBtn) { els.changepwBtn.hidden = !!previewState; }
+    if (window.HP_I18N && window.HP_I18N.setRole) { window.HP_I18N.setRole(currentRole); }
+    if (els.sharePermHint) {
+      els.sharePermHint.hidden = currentRole !== "user";
+    }
+    applyPreviewBanner(info);
+    showUsersMgr();
+    showPluginsMgr();
+    showAiBudgetMgr();
+    if (currentRole === "owner") loadDemoCatalog();
+    return info;
+  }
+
+  function applyPreviewBanner(info) {
+    var banner = els.previewBanner;
+    if (!banner) return;
+    var pv = (info && info.preview) || null;
+    if (!pv) {
+      banner.hidden = true;
+      return;
+    }
+    var mins = Math.max(1, Math.round(((pv.expires_at || 0) * 1000 - Date.now()) / 60000));
+    if (els.previewBannerText) {
+      els.previewBannerText.textContent = t("preview.banner", {
+        user: pv.subject_username || pv.subject_user_id || "",
+        role: pv.subject_role || "",
+        mins: mins,
+      });
+    }
+    banner.hidden = false;
+  }
+
+  function startIdentityPreview(uid) {
+    apiFetch("/api/admin/preview/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: uid }),
+    }).then(function (r) {
+      return r.json().then(function (b) { return { status: r.status, body: b }; });
+    }).then(function (res) {
+      if (res.status !== 200) { toast(res.body.error || "预览失败", "error"); return; }
+      location.reload();
+    }).catch(function (e) {
+      toast((e && e.message) ? e.message : "预览失败", "error");
+    });
+  }
+
+  function stopIdentityPreview() {
+    apiFetch("/api/admin/preview/stop", { method: "POST" }).then(function (r) {
+      return r.json().then(function (b) { return { status: r.status, body: b }; });
+    }).then(function (res) {
+      if (res.status !== 200) { toast(res.body.error || "退出预览失败", "error"); return; }
+      location.reload();
+    }).catch(function (e) {
+      toast((e && e.message) ? e.message : "退出预览失败", "error");
+    });
+  }
 
   // 页面初始化时拉取认证状态：启用认证则显示「修改我的密码」与退出登录
   function initAuth() {
-    if (!els.logoutBtn) return;
     apiFetch("/api/auth/info").then(function (r) { return r.json(); }).then(function (info) {
-      if (info && info.auth_enabled) {
-        var label = t("toast.logout");
-        if (info.username) { label += " (" + info.username + ")"; }
-        els.logoutBtn.textContent = label;
-        els.logoutBtn.hidden = false;
-        // 「修改我的密码」入口：owner/user 均可见（docs §8.1）
-        if (els.changepwBtn) { els.changepwBtn.hidden = false; }
-        currentRole = info.role || null;
-        currentUserId = info.user_id || null;
-        // AI 配置标题按角色区分（docs §8.3：owner「平台 AI 配置」/ user「我的 AI 设置」）
-        if (window.HP_I18N && HP_I18N.setRole) { HP_I18N.setRole(currentRole); }
-        // user 分享提示：只能分享自己拥有的切片（docs §8.3）
-        if (els.sharePermHint) {
-          els.sharePermHint.hidden = currentRole !== "user";
-        }
-        showUsersMgr();
-        showPluginsMgr();
-        showAiBudgetMgr();
-        // owner：加载 Demo 目录状态（切片行的「加入/移出 Demo」按钮用）
-        if (currentRole === "owner") loadDemoCatalog();
-      }
+      applyAuthInfo(info);
     }).catch(function () { /* 忽略，不影响主功能 */ });
+    if (els.previewStopBtn) {
+      els.previewStopBtn.addEventListener("click", stopIdentityPreview);
+    }
   }
 
   // 退出登录：POST /logout + CSRF（docs §10.14；GET /logout 已废弃为短期兼容）
@@ -147,7 +206,13 @@
   }
   // apiFetch 一并导出：tests/js/api-fetch-401.test.ts 对 401→/login?next=...
   // 跳转契约做行为测试（与 doLogout 同一挂载点）。
-  window.HP_AUTH = { doLogout: doLogout, apiFetch: apiFetch };
+  window.HP_AUTH = {
+    doLogout: doLogout,
+    apiFetch: apiFetch,
+    applyAuthInfo: applyAuthInfo,
+    startIdentityPreview: startIdentityPreview,
+    stopIdentityPreview: stopIdentityPreview,
+  };
 
   // ---------- 修改我的密码（账户系统批次 A docs §7.1；owner/user 通用） ----------
   // 弹窗三字段（当前/新/确认，minlength=15 maxlength=200 由模板约束）；
@@ -282,11 +347,16 @@
       }
       var resetBtn = isOwner ? "" :
         '<button class="btn secondary small" data-act="reset" data-uid="' + esc(u.user_id) + '">' + esc(tt("sb.users.reset")) + '</button>';
+      var previewBtn = "";
+      if (!self && !isOwner && !u.disabled && actorRole === "owner" && !previewState) {
+        previewBtn = '<button class="btn secondary small" data-act="preview" data-uid="' + esc(u.user_id) + '">' + esc(tt("sb.users.preview")) + '</button>';
+      }
       return '<div class="user-row" data-uid="' + esc(u.user_id) + '">' +
         '<div class="user-main"><span class="user-name">' + esc(u.display_name || u.login_id) + '</span>' +
         '<span class="user-sub">' + esc(u.login_id) + ' · ' + roleTxt + ' · ' + statusTxt + '</span>' +
         '<span class="user-created">' + esc(created) + '</span></div>' +
         '<div class="user-actions">' +
+        previewBtn +
         disableBtn +
         resetBtn +
         '</div></div>';
@@ -305,6 +375,10 @@
         if (res.status !== 200) { toast(res.body.error || "操作失败", "error"); return; }
         loadUsers();
       });
+      return;
+    }
+    if (act === "preview") {
+      startIdentityPreview(uid);
       return;
     }
     if (act === "reset") {
@@ -821,6 +895,9 @@
     usersAddBtn: $("users-add-btn"),
     usersRegOpen: $("users-reg-open"),
     usersList: $("users-list"),
+    previewBanner: $("preview-banner"),
+    previewBannerText: $("preview-banner-text"),
+    previewStopBtn: $("preview-stop-btn"),
     // 插件管理（owner；Stage 4-3）
     pluginsMgrSection: $("plugins-mgr-section"),
     pluginsMgrToggle: $("plugins-mgr-toggle"),

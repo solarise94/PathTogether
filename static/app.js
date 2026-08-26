@@ -145,7 +145,9 @@
       toast(t("toast.logout.fail", { e: (e && e.message) ? e.message : e }), "error");
     });
   }
-  window.HP_AUTH = { doLogout: doLogout };
+  // apiFetch 一并导出：tests/js/api-fetch-401.test.ts 对 401→/login?next=...
+  // 跳转契约做行为测试（与 doLogout 同一挂载点）。
+  window.HP_AUTH = { doLogout: doLogout, apiFetch: apiFetch };
 
   // ---------- 修改我的密码（账户系统批次 A docs §7.1；owner/user 通用） ----------
   // 弹窗三字段（当前/新/确认，minlength=15 maxlength=200 由模板约束）；

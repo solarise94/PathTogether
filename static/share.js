@@ -2110,4 +2110,16 @@
       if (currentRois && currentRois.length >= 0) renderRoiPanel(currentRois);
     } catch (e) {}
   });
+
+  // ---------- 最小测试导出（不改 IIFE 结构）----------
+  // tests/js/share-write.test.ts 用这些函数断言分享页写请求的 method/URL/body
+  // 契约。按实际代码测试：分享页鉴权 = URL 内 share token（capability），
+  // 写端点不带主站 X-CSRF-Token 头（share_server 无 CSRF 中间件）。
+  window.HP_SHARE = {
+    state: state,
+    saveRoi: saveRoi,
+    saveAnnotation: saveAnnotation,
+    commitEdit: commitEdit,
+    deleteRoi: deleteRoi,
+  };
 })();

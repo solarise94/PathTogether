@@ -418,7 +418,7 @@ def test_recover_ownership_failure_keeps_committing(monkeypatch):
 
 
 def test_maintain_heals_committed_missing_owner(monkeypatch):
-    """GET 路径校正已 committed 但漏写 slide_meta 的归属。"""
+    """GET 路径仅在 slide_meta 缺 owner 时校正归属。"""
     monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
     c = _client()
     uid = _create(c, name="heal.svs", size=80).get_json()["upload_id"]
@@ -429,11 +429,19 @@ def test_maintain_heals_committed_missing_owner(monkeypatch):
     def note(*a, **k):
         healed.append(True)
 
+    monkeypatch.setattr(share_store, "get_slide_meta_full",
+                        lambda *_a, **_k: {"owner_user_id": None})
     monkeypatch.setattr(app_mod, "_upload_v2_set_ownership", note)
     task = upload_task_store.get_task(uid)
     out = app_mod._upload_v2_maintain(task)
     assert out["state"] == "committed"
     assert healed == [True]
+
+    healed.clear()
+    monkeypatch.setattr(share_store, "get_slide_meta_full",
+                        lambda *_a, **_k: {"owner_user_id": "usr_x"})
+    app_mod._upload_v2_maintain(task)
+    assert healed == []
 
 
 def test_recover_commit_does_not_commit_when_settle_fails(monkeypatch):

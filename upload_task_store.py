@@ -551,7 +551,10 @@ def _pg_finish_commit(upload_id, commit_token, sha256_actual, *, settle_bytes=No
                     "commit 收口失败：任务已不在受理态或 token 不匹配（state=%r）"
                     % task["state"], task)
             rid = task.get("reservation_id")
-            if rid and settle_bytes is not None:
+            if rid:
+                if settle_bytes is None:
+                    raise UploadTaskError(
+                        "任务绑定 reservation 时 finish_commit 必须提供 settle_bytes")
                 with conn.cursor() as cur:
                     upload_guard.consume_reservation_locked(
                         cur, rid, int(settle_bytes))

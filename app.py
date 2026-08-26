@@ -4948,19 +4948,6 @@ def _upload_v2_release_reservation_quietly(task):
         app.logger.exception("upload task reservation release failed: %s", rid)
 
 
-def _upload_v2_consume_reservation(task, actual_bytes):
-    """commit 成功路径：预占转实占。无 reservation 视为成功；失败返回 False。"""
-    rid = task.get("reservation_id")
-    if not rid:
-        return True
-    try:
-        upload_guard.consume_reservation(rid, int(actual_bytes))
-        return True
-    except Exception:
-        app.logger.exception("upload task reservation consume failed: %s", rid)
-        return False
-
-
 def _upload_v2_cleanup_part(task):
     """清临时分片文件（取消/过期/commit 提升完成后）。"""
     try:
@@ -5072,7 +5059,9 @@ def _upload_v2_maintain(task):
     if task["state"] == upload_task_store.STATE_COMMITTED:
         # 已 committed 但崩溃窗口里漏写 slide_meta 时，GET 路径校正归属。
         try:
-            _upload_v2_set_ownership(task)
+            meta = share_store.get_slide_meta_full(task["safe_name"])
+            if not (meta or {}).get("owner_user_id"):
+                _upload_v2_set_ownership(task)
         except Exception:
             app.logger.exception(
                 "upload task %s committed ownership 校正失败", task.get("upload_id"))

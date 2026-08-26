@@ -579,34 +579,34 @@ describe("demo.js AI 视角与临时观察（批次B）", () => {
 		expect(v!.magnification).toBe("20x");
 	});
 
-	it("snapshot_captured 缺有效 bbox 时不覆盖当前视角、不导航", () => {
-		const w = setup();
-		w.HP_DEMO.handleEvent("snapshot_captured", {
-			snapshot_id: "snap-1", bbox_level0: { x: 0, y: 0, w: 4096, h: 4096 }, magnification: "5x",
+		it("snapshot_captured 缺有效 bbox 时不覆盖当前视角、不导航", () => {
+			const w = setup();
+			w.HP_DEMO.handleEvent("snapshot_captured", {
+				snapshot_id: "snap-1", bbox_level0: { x: 0, y: 0, w: 4096, h: 4096 }, magnification: "5x",
+			});
+			expect(fitBoundsCalls.length).toBe(0);
+			w.HP_DEMO.handleEvent("snapshot_captured", {
+				snapshot_id: "snap-bad", bbox_level0: { x: 10, y: 10, w: 0, h: 100 },
+			});
+			const v = w.HP_DEMO.state.currentSnapshotView;
+			expect(v!.snapshot_id).toBe("snap-1");
+			expect(v!.bbox).toEqual({ x: 0, y: 0, w: 4096, h: 4096 });
+			expect(fitBoundsCalls.length).toBe(0);
 		});
-		expect(fitBoundsCalls.length).toBe(1);
-		w.HP_DEMO.handleEvent("snapshot_captured", {
-			snapshot_id: "snap-bad", bbox_level0: { x: 10, y: 10, w: 0, h: 100 },
-		});
-		const v = w.HP_DEMO.state.currentSnapshotView;
-		expect(v!.snapshot_id).toBe("snap-1");
-		expect(v!.bbox).toEqual({ x: 0, y: 0, w: 4096, h: 4096 });
-		expect(fitBoundsCalls.length).toBe(1);
-	});
 
-	it("Viewer 最终导航 bbox 来自 snapshot_captured 实际 bbox（四周外扩约 20%），不是 goto 推算", () => {
-		const w = setup();
-		w.HP_DEMO.handleEvent("tool_started", { tool: "goto", x: 3000, y: 3000, level: 0 });
-		expect(fitBoundsCalls.length).toBe(0);
-		w.HP_DEMO.handleEvent("snapshot_captured", {
-			snapshot_id: "snap-1",
-			bbox_level0: { x: 1000, y: 2000, w: 4000, h: 2000 },
-			magnification: "5x（低倍）",
+		it("snapshot_captured 只画虚线框，不自动导航人眼 Viewer；goto 也不导航", () => {
+			const w = setup();
+			w.HP_DEMO.handleEvent("tool_started", { tool: "goto", x: 3000, y: 3000, level: 0 });
+			expect(fitBoundsCalls.length).toBe(0);
+			w.HP_DEMO.handleEvent("snapshot_captured", {
+				snapshot_id: "snap-1",
+				bbox_level0: { x: 1000, y: 2000, w: 4000, h: 2000 },
+				magnification: "5x（低倍）",
+			});
+			expect(fitBoundsCalls.length).toBe(0);
+			expect(canvas._drawn.strokes.some(
+				(s) => s.left === 1000 && s.top === 2000 && s.w === 4000 && s.h === 2000 && s.dash && s.dash.join(",") === "7,5")).toBe(true);
 		});
-		expect(fitBoundsCalls.length).toBe(1);
-		// pad = max(w,h)*0.2 = 800 → {200,1200,5600,3600}
-		expect(fitBoundsCalls[0]).toEqual({ x: 200, y: 1200, w: 5600, h: 3600 });
-	});
 
 	it("scope=viewport 观察只出卡片：不进绘制列表；当前视角画青色虚线框且标签显示倍率", () => {
 		const w = setup();
@@ -686,26 +686,26 @@ describe("demo.js AI 视角与临时观察（批次B）", () => {
 			snapshot_id: "snap-1", scope: "region", label: "低倍致密区",
 			bbox_level0: { x: 100, y: 100, w: 800, h: 600 },
 		});
-		const obsId = w.HP_DEMO.state.observations[0].id!;
-		// 快照视角索引随 snapshot_captured 登记
-		expect(w.HP_DEMO.state.snapshotViews["snap-1"]!.bbox).toEqual({ x: 0, y: 0, w: 4096, h: 4096 });
-		// 属于当前快照的选中：不额外导航
-		expect(fitBoundsCalls.length).toBe(1);
-		w.HP_DEMO.toggleObservationSelect(obsId);
-		expect(fitBoundsCalls.length).toBe(1);
-		w.HP_DEMO.toggleObservationSelect(obsId); // 取消选中
+			const obsId = w.HP_DEMO.state.observations[0].id!;
+			// 快照视角索引随 snapshot_captured 登记
+			expect(w.HP_DEMO.state.snapshotViews["snap-1"]!.bbox).toEqual({ x: 0, y: 0, w: 4096, h: 4096 });
+			// 属于当前快照的选中：不额外导航（实时快照也不自动导航）
+			expect(fitBoundsCalls.length).toBe(0);
+			w.HP_DEMO.toggleObservationSelect(obsId);
+			expect(fitBoundsCalls.length).toBe(0);
+			w.HP_DEMO.toggleObservationSelect(obsId); // 取消选中
 
-		// 新快照替换当前视角后，点击历史观察卡回跳 snap-1 的快照视角
-		w.HP_DEMO.handleEvent("snapshot_captured", {
-			snapshot_id: "snap-2", bbox_level0: { x: 8000, y: 8000, w: 1024, h: 1024 }, magnification: "20x",
-		});
-		expect(fitBoundsCalls.length).toBe(2);
-		w.HP_DEMO.toggleObservationSelect(obsId);
-		expect(w.HP_DEMO.state.selectedObservationId).toBe(obsId);
-		expect(fitBoundsCalls.length).toBe(3);
-		// 回跳目标是来源快照 bbox（0,0,4096,4096）外扩 20%：不是 snap-2，也不是观察自身 bbox
-		const pad = Math.max(4096, 4096) * 0.2;
-		expect(fitBoundsCalls[2]).toEqual({ x: 0 - pad, y: 0 - pad, w: 4096 + pad * 2, h: 4096 + pad * 2 });
+			// 新快照替换当前视角后，点击历史观察卡回跳 snap-1 的快照视角
+			w.HP_DEMO.handleEvent("snapshot_captured", {
+				snapshot_id: "snap-2", bbox_level0: { x: 8000, y: 8000, w: 1024, h: 1024 }, magnification: "20x",
+			});
+			expect(fitBoundsCalls.length).toBe(0);
+			w.HP_DEMO.toggleObservationSelect(obsId);
+			expect(w.HP_DEMO.state.selectedObservationId).toBe(obsId);
+			expect(fitBoundsCalls.length).toBe(1);
+			// 回跳目标是来源快照 bbox（0,0,4096,4096）外扩 20%：不是 snap-2，也不是观察自身 bbox
+			const pad = Math.max(4096, 4096) * 0.2;
+			expect(fitBoundsCalls[0]).toEqual({ x: 0 - pad, y: 0 - pad, w: 4096 + pad * 2, h: 4096 + pad * 2 });
 		// 恢复视角状态：currentSnapshotView 切回 snap-1（画面/青色框/倍率一致）
 		expect(w.HP_DEMO.state.currentSnapshotView!.snapshot_id).toBe("snap-1");
 		// 青色当前视角框（虚线 [7,5]）画的是 snap-1 的 bbox，不再是 snap-2 的
@@ -717,9 +717,9 @@ describe("demo.js AI 视角与临时观察（批次B）", () => {
 		expect(stroke).toBeTruthy();
 		expect(stroke!.dash).toEqual([]);
 		// 取消选中不重复导航，也不回退视角（停留在 snap-1，状态与画面一致）
-		w.HP_DEMO.toggleObservationSelect(obsId);
-		expect(fitBoundsCalls.length).toBe(3);
-		expect(w.HP_DEMO.state.selectedObservationId).toBeNull();
+			w.HP_DEMO.toggleObservationSelect(obsId);
+			expect(fitBoundsCalls.length).toBe(1);
+			expect(w.HP_DEMO.state.selectedObservationId).toBeNull();
 		expect(w.HP_DEMO.state.currentSnapshotView!.snapshot_id).toBe("snap-1");
 	});
 

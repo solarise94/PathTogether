@@ -30,13 +30,13 @@
   <!-- HistoPilot 插件 UI bundle（同源独立加载）。顺序敏感：bridge-client 建命名空间，
        其余文件向 window.HistoPilot 挂载能力；main.js 为入口，最后加载。
        加载早于 app.js，使平台 init 时 window.HistoPilot 已就绪 -->
-  <script src="/plugins/histopilot/ui/bridge-client.js?v=20260814stage5"></script>
-  <script src="/plugins/histopilot/ui/api.js?v=20260814stage2"></script>
-  <script src="/plugins/histopilot/ui/sse.js?v=20260816p8fix"></script>
-  <script src="/plugins/histopilot/ui/renderer.js?v=20260816p5fix"></script>
-  <script src="/plugins/histopilot/ui/config-panel.js?v=20260816p2fix"></script>
-  <script src="/plugins/histopilot/ui/sessions.js?v=20260816p8fix"></script>
-  <script src="/plugins/histopilot/ui/main.js?v=20260816p5fix"></script>
+  <script src="/plugins/histopilot/ui/bridge-client.js?v=20260827view"></script>
+  <script src="/plugins/histopilot/ui/api.js?v=20260827view"></script>
+  <script src="/plugins/histopilot/ui/sse.js?v=20260827view"></script>
+  <script src="/plugins/histopilot/ui/renderer.js?v=20260827view"></script>
+  <script src="/plugins/histopilot/ui/config-panel.js?v=20260827view"></script>
+  <script src="/plugins/histopilot/ui/sessions.js?v=20260827view"></script>
+  <script src="/plugins/histopilot/ui/main.js?v=20260827view"></script>
   {% endif %}
   {% if sample_plugin_enabled %}
   <!-- Sample Annotator 示例插件（Stage 5-2）：通用 PluginSDK + bridge 权限门演示。
@@ -54,6 +54,6 @@
   {% endif %}
   <script src="/static/app-mode.js?v=20260818shell1"></script>
   <script src="/static/viewer-core.js?v=20260818shell1"></script>
-  <script src="/static/app.js?v=20260826preview"></script>
+  <script src="/static/app.js?v=20260827view"></script>
 </body>
 </html>

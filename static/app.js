@@ -2512,23 +2512,38 @@
         drawAnnoItem(it, labelColor(it.label), selected, !animating);
       });
     }
-    // AI overlay（agent 的 goto/snapshot bbox）：高对比虚线框 + 半透明填充
+    // AI overlay：当前视角 / 历史路径 = 虚线框；局部观察 = 绿色实线。不跟人眼视野走。
     if (hasAiOverlay) {
       aiOverlay.forEach(function (bb) {
         var tl = imgToCanvas(bb.x, bb.y);
         var br = imgToCanvas(bb.x + bb.w, bb.y + bb.h);
         var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
         var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
+        var role = bb.role || "view";
+        var fill = AI_OVERLAY_FILL, stroke = AI_OVERLAY_STROKE, halo = AI_OVERLAY_HALO, dash = [7, 4];
+        if (role === "path") {
+          fill = null;
+          stroke = "rgba(255, 149, 0, 0.72)";
+          halo = "rgba(0, 0, 0, 0.45)";
+          dash = [6, 4];
+        } else if (role === "obs") {
+          fill = "rgba(52, 199, 89, 0.10)";
+          stroke = "#34C759";
+          halo = "rgba(0, 0, 0, 0.45)";
+          dash = [];
+        }
         annoCtx.save();
-        annoCtx.fillStyle = AI_OVERLAY_FILL;
-        annoCtx.fillRect(x, y, w, h);
-        annoCtx.setLineDash([7, 4]);
+        if (fill) {
+          annoCtx.fillStyle = fill;
+          annoCtx.fillRect(x, y, w, h);
+        }
+        if (dash.length) annoCtx.setLineDash(dash);
         // 深色外描边：在粉白组织上托住主色
-        annoCtx.lineWidth = 4;
-        annoCtx.strokeStyle = AI_OVERLAY_HALO;
+        annoCtx.lineWidth = role === "path" ? 3 : 4;
+        annoCtx.strokeStyle = halo;
         annoCtx.strokeRect(x, y, w, h);
         annoCtx.lineWidth = 2;
-        annoCtx.strokeStyle = AI_OVERLAY_STROKE;
+        annoCtx.strokeStyle = stroke;
         annoCtx.strokeRect(x, y, w, h);
         annoCtx.setLineDash([]);
         if (!animating && bb.magnification) {

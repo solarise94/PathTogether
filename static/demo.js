@@ -156,6 +156,7 @@
     return {
       snapshot_id: raw.snapshot_id || (prev && prev.snapshot_id) || null,
       bbox: bbox,
+      scope: raw.scope === "whole_slide" ? "whole_slide" : "viewport",
       level: pick(raw, "level", prev && prev.level != null ? prev.level : null),
       magnification: raw.magnification || (prev && prev.magnification) || "",
       out_w: pick(raw, "out_w", prev ? prev.out_w : null),
@@ -336,9 +337,9 @@
       } catch (e) { /* 标签绘制失败不影响框 */ }
     }
 
-    // 1) 唯一当前 AI 视角：青色虚线框，标签显示倍率而非病理标题（§7.2.1）
+    // 1) 唯一当前 AI 视角：青色虚线框（全片概览框盖住整张切片，跳过）
     var cur = state.currentSnapshotView;
-    if (cur && cur.bbox) {
+    if (cur && cur.bbox && cur.scope !== "whole_slide") {
       var r = elemRect(cur.bbox);
       if (r) {
         try {
@@ -817,16 +818,13 @@
       return;
     }
     if (type === "snapshot_captured") {
-      // 唯一权威取景来源：用实际 bbox 更新当前视角框并按 bbox 外扩 20% 导航（§4.1）。
-      // 无效 bbox 不得覆盖旧视角、不得触发导航。
+      // 唯一权威取景来源：用实际 bbox 更新当前视角虚线框。不自动平移人眼 Viewer
+      // （Agent 有自己的看图视角）。无效 bbox 不得覆盖旧视角。
       closeLiveTextBubble();
       var prevView = state.currentSnapshotView;
       state.currentSnapshotView = normalizeSnapshotView(p, prevView);
       // 登记视角索引：观察卡回跳据此恢复该快照的 bbox（§7.4）
       registerSnapshotView(state.currentSnapshotView);
-      if (state.currentSnapshotView && state.currentSnapshotView !== prevView) {
-        navigateToBbox(state.currentSnapshotView.bbox);
-      }
       drawObservations();
       var mag = state.currentSnapshotView && state.currentSnapshotView.magnification;
       appendTrace("ai-row", t("demo.ai.snapshot") + (mag ? " · " + mag : ""));

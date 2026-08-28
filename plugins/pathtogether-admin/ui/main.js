@@ -29,7 +29,8 @@
     dead: false,            // 宿主作废（reload/登出/切换）后不再发任何请求
     page: "overview",       // 当前页（内存态导航）
     // 分页游标（每列表独立；仅内存）
-    cursors: { users: null, usage: null, unpriced: null, ledger: null, audit: null },
+    cursors: { users: null, usage: null, unpriced: null, ledger: null,
+               audit: null, acqUsers: null },
     filters: { users: {}, usage: {}, audit: {} },
   };
 
@@ -41,6 +42,7 @@
     pages: {
       overview: $("adm-page-overview"),
       users: $("adm-page-users"),
+      invites: $("adm-page-invites"),
       billing: $("adm-page-billing"),
       audit: $("adm-page-audit"),
     },
@@ -327,9 +329,11 @@
   // 用户（§10.2 只读）
   // ------------------------------------------------------------------
   function resetLists() {
-    state.cursors = { users: null, usage: null, unpriced: null, ledger: null, audit: null };
+    state.cursors = { users: null, usage: null, unpriced: null, ledger: null,
+                      audit: null, acqUsers: null };
     ["adm-users-tbody", "adm-usage-tbody", "adm-unpriced-tbody",
-     "adm-ledger-tbody", "adm-audit-tbody"].forEach(function (id) {
+     "adm-ledger-tbody", "adm-audit-tbody",
+     "adm-acq-funnel-tbody", "adm-acq-users-tbody"].forEach(function (id) {
       var el = $(id);
       if (el) el.textContent = "";
     });
@@ -380,6 +384,99 @@
       tr.appendChild(td(fmtTs(u.last_ai_call_at)));
       tbody.appendChild(tr);
     });
+  }
+
+  // ------------------------------------------------------------------
+  // 邀请与来源（§10.3 只读部分，PR4）：注册模式 + campaign 漏斗 +
+  // 用户来源明细（first/last touch 分列）。邀请创建/撤销按钮属 PR5。
+  // ------------------------------------------------------------------
+  function loadAcquisitionPage() {
+    loadAcqModeCard();
+    loadAcqFunnel();
+    loadAcqUsers(false);
+  }
+
+  function loadAcqModeCard() {
+    // 注册模式随漏斗汇总一并返回；失败时单独给出错误卡内容
+    var dl = $("adm-acq-mode");
+    if (!dl) return;
+    dl.textContent = "";
+    kvRow(dl, "可用性", "等待漏斗汇总加载…");
+  }
+
+  function renderAcqMode(mode) {
+    var dl = $("adm-acq-mode");
+    if (!dl) return;
+    dl.textContent = "";
+    kvRow(dl, "当前模式", mode || "—");
+  }
+
+  function loadAcqFunnel() {
+    request("admin.acquisition.summary", {}).then(function (res) {
+      hideError();
+      renderAcqMode(res.registration_mode);
+      var tbody = $("adm-acq-funnel-tbody");
+      if (tbody) {
+        tbody.textContent = "";
+        (res.items || []).forEach(function (row) {
+          var tr = document.createElement("tr");
+          tr.appendChild(td(row.source_code));
+          tr.appendChild(td(row.campaign_id));
+          tr.appendChild(td(row.campaign_id === null ? "—" : (row.campaign_status || "—")));
+          tr.appendChild(td(fmtNum(row.visits)));
+          tr.appendChild(td(fmtNum(row.visitors)));
+          tr.appendChild(td(fmtNum(row.registrations)));
+          tr.appendChild(td(fmtNum(row.first_ai_count)));
+          tbody.appendChild(tr);
+        });
+      }
+      var totals = $("adm-acq-totals");
+      if (totals) {
+        totals.textContent = "";
+        var t = res.totals || {};
+        kvRow(totals, "合计", "访问 " + fmtNum(t.visits) + " · 注册 " +
+              fmtNum(t.registrations) + " · 首次 AI " + fmtNum(t.first_ai_count));
+      }
+    }).catch(function (err) {
+      var dl = $("adm-acq-mode");
+      if (dl) { dl.textContent = ""; kvRow(dl, "可用性", errText(err)); }
+      handleErr(err, null);
+    });
+  }
+
+  // 触点列：source/campaign + 时间（visitor 只给 hash 前缀；无完整 IP/query）
+  function acqTouchText(touch) {
+    if (!touch) return "—（无触点）";
+    var label = (touch.source_code || "?") +
+      (touch.campaign_id ? (" / " + touch.campaign_id) : "");
+    return label + "（" + fmtTs(touch.touched_at) + "）";
+  }
+
+  function loadAcqUsers(append) {
+    var payload = { limit: 50, cursor: append ? state.cursors.acqUsers : null };
+    var status = $("adm-acq-status");
+    request("admin.acquisition.list", payload).then(function (res) {
+      hideError();
+      var tbody = $("adm-acq-users-tbody");
+      if (!tbody) return;
+      if (!append) tbody.textContent = "";
+      (res.items || []).forEach(function (u) {
+        var tr = document.createElement("tr");
+        tr.appendChild(td(u.display_name));
+        tr.appendChild(td(u.login_id_masked));
+        tr.appendChild(td(u.source_code));
+        tr.appendChild(td(u.campaign_id));
+        tr.appendChild(td(u.attribution_method));
+        tr.appendChild(td(acqTouchText(u.first_touch)));
+        tr.appendChild(td(acqTouchText(u.last_touch)));
+        tr.appendChild(td(fmtTs(u.attributed_at)));
+        tbody.appendChild(tr);
+      });
+      state.cursors.acqUsers = res.next_cursor || null;
+      var more = $("adm-acq-more-btn");
+      if (more) more.disabled = !res.next_cursor;
+      if (status) status.textContent = res.next_cursor ? "还有更多" : "已到底";
+    }).catch(function (err) { handleErr(err, status); });
   }
 
   // ------------------------------------------------------------------
@@ -607,6 +704,7 @@
     hideError();
     if (name === "overview") loadOverview();
     else if (name === "users") loadUsers(false);
+    else if (name === "invites") loadAcquisitionPage();
     else if (name === "billing") loadBillingPage();
     else if (name === "audit") loadAudit(false);
   }
@@ -635,6 +733,8 @@
       loadUsers(false);
     });
     onClick("adm-users-more-btn", function () { loadUsers(true); });
+    // 邀请与来源页
+    onClick("adm-acq-more-btn", function () { loadAcqUsers(true); });
     // 账单页
     onClick("adm-balance-refresh-btn", refreshProviderBalance);
     onClick("adm-usage-search-btn", function () {

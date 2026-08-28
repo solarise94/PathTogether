@@ -119,6 +119,12 @@
       },
       additionalProperties: false,
     },
+    // PR4 来源归因（§9 GET /api/admin/v1/acquisition/*；只读）
+    "admin.acquisition.summary": { properties: {}, additionalProperties: false },
+    "admin.acquisition.list": {
+      properties: { cursor: _cursorSpec, limit: _limitSpec },
+      additionalProperties: false,
+    },
     "admin.turnBudgets.get": { properties: {}, additionalProperties: false },
   };
 
@@ -378,9 +384,25 @@
 
     "admin.turnBudgets.get": jsonGet("/api/admin/v1/turn-budgets"),
 
+    // PR4 来源归因（§9/§10.3 只读）：漏斗汇总 + 用户来源明细（first/last
+    // touch 分开）；json/dual 后端 503 pg_backend_required 由 backendError
+    // 透传（插件页显示「不可用」，不降级伪造数据）。
+    "admin.acquisition.summary":
+      jsonGet("/api/admin/v1/acquisition/summary"),
+
+    "admin.acquisition.list": function (ctx, payload) {
+      var url = "/api/admin/v1/acquisition/users" + buildQuery({
+        cursor: payload.cursor, limit: payload.limit,
+      });
+      return ctx.fetchJson(url).then(function (res) {
+        if (!res.ok) throw backendError(url, res);
+        return res.body;
+      });
+    },
+
     // PR5 写方法（users.create/setEnabled/setAiAccess/resetPassword、
     // invites.*、turnBudgets.update/newPeriod、billing.account.updateCaps/
-    // adjust、acquisition.*）在此追加实现。
+    // adjust）在此追加实现。
   };
 
   // ---- 桥实例 ----

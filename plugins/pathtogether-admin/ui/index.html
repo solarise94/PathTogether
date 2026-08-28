@@ -15,10 +15,12 @@
       - 一切平台数据经 AdminBridge postMessage 通道（static/admin-host.js 宿主侧）；
       - 全部页面状态只在内存（当前页/筛选/分页游标），刷新即回概览首页。
 
-    页面（§10.1/§10.2/§10.4/§10.5 只读部分）：
+    页面（§10.1/§10.2/§10.3/§10.4/§10.5 只读部分）：
       - 概览：用户计数 + 双额度并列（「对话额度」与「金额余额」分开标注，
         §10.1 红线）+ cache 命中率 + provider 余额 + unpriced/lag；
       - 用户：只读表格（操作按钮 PR5 实现）；
+      - 邀请与来源（PR4）：注册模式 + campaign 漏斗 + 用户来源明细
+        （first/last touch 分列；邀请创建/撤销按钮 PR5）；
       - 额度与账单：turn 预算卡 + usage 明细（筛选/unpriced 单独告警）+
         ledger 只读表 + provider 余额卡（手动刷新）；
       - 审计：表格（detail 已由服务端脱敏）。
@@ -35,6 +37,7 @@
     <nav class="adm-nav" id="adm-nav">
       <button type="button" class="adm-nav-btn" data-page="overview">概览</button>
       <button type="button" class="adm-nav-btn" data-page="users">用户</button>
+      <button type="button" class="adm-nav-btn" data-page="invites">邀请与来源</button>
       <button type="button" class="adm-nav-btn" data-page="billing">额度与账单</button>
       <button type="button" class="adm-nav-btn" data-page="audit">审计</button>
     </nav>
@@ -106,6 +109,50 @@
         <div class="adm-pager">
           <button type="button" id="adm-users-more-btn">加载更多</button>
           <span id="adm-users-status" class="adm-status"></span>
+        </div>
+      </section>
+    </section>
+
+    <!-- 邀请与来源（§10.3 只读部分，PR4） -->
+    <section class="adm-page" id="adm-page-invites" hidden>
+      <section class="adm-card">
+        <h2>注册模式</h2>
+        <p class="adm-note">当前生效的注册模式（closed / invite_only）；切换仍走 Viewer 侧旧设置入口，写操作在 PR5 迁入。</p>
+        <dl id="adm-acq-mode" class="adm-kv"></dl>
+      </section>
+      <section class="adm-card">
+        <h2>来源漏斗（campaign → 访问 → 注册 → 首次 AI）</h2>
+        <p class="adm-note">「首次 AI」= 该来源注册用户中至少产生过一条 AI 用量事件的人数；同一访客多次跳转不折叠（first/last touch 分开，见下表）。</p>
+        <div class="adm-table-wrap">
+          <table class="adm-table" id="adm-acq-funnel-table">
+            <thead>
+              <tr>
+                <th>source</th><th>campaign</th><th>状态</th><th>访问次数</th>
+                <th>独立访客</th><th>注册数</th><th>首次 AI</th>
+              </tr>
+            </thead>
+            <tbody id="adm-acq-funnel-tbody"></tbody>
+          </table>
+        </div>
+        <dl id="adm-acq-totals" class="adm-kv"></dl>
+      </section>
+      <section class="adm-card">
+        <h2>用户来源明细（first touch / last touch 分列）</h2>
+        <p class="adm-note">登录账号仅显示掩码；visitor 仅显示 hash 前缀；无完整 IP、无 referrer query（隐私红线 §9/§11.3）。归因优先级：邀请码 campaign &gt; 有效触点 &gt; referrer/UTM &gt; direct。</p>
+        <div class="adm-table-wrap">
+          <table class="adm-table" id="adm-acq-users-table">
+            <thead>
+              <tr>
+                <th>用户</th><th>登录账号</th><th>归因来源</th><th>campaign</th>
+                <th>方式</th><th>first touch</th><th>last touch</th><th>归因时间</th>
+              </tr>
+            </thead>
+            <tbody id="adm-acq-users-tbody"></tbody>
+          </table>
+        </div>
+        <div class="adm-pager">
+          <button type="button" id="adm-acq-more-btn">加载更多</button>
+          <span id="adm-acq-status" class="adm-status"></span>
         </div>
       </section>
     </section>

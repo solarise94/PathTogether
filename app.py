@@ -72,6 +72,11 @@ import demo_store
 # registration_store 提供一次性邀请码（只存 token_hash）与单事务原子兑换。
 # json/dual 后端 fail-closed（platform_features 守卫）。
 import registration_store
+# PR4 用户来源归因（docs/admin-billing-plugin-implementation-plan.md §11）：
+# acquisition_store 提供 /r/<source_code> 触点写入、注册归因（redeem_invite
+# 同事务）、匿名触点 90 天清理与 admin 漏斗/明细汇总。PG-only（json/dual
+# 由 /r/* 降级安全 302、admin API 稳定 pg_backend_required，§16.2）。
+import acquisition_store
 # PR2 金额计费（docs/admin-billing-plugin-implementation-plan.md §6/§7）：
 # billing_store 提供价格表 / 用量事件计价 / 账本原语（PG-only，json/dual 稳定
 # pg_backend_required）。本阶段只影子计价——不写 usage_debit，demo 不开户。
@@ -755,7 +760,7 @@ def _auth_challenge():
     # 与 /static/ 同属非敏感前端资源；plugin_id/filename 路径穿越由 plugin_ui_asset
     # 双重拒绝）
     if (path in ("/login", "/register", "/demo") or path.startswith("/static/")
-            or path.startswith("/plugins/")):
+            or path.startswith("/plugins/") or path.startswith("/r/")):
         return None
     # /api/demo/* 公开（docs §5.2）：由 Demo capability（独立 cookie + demo_sessions
     # fail-closed 校验）自证，不进入登录 session 鉴权，也不做 owner 归一
@@ -2195,6 +2200,121 @@ def api_account_password():
     return jsonify(ok=True)
 
 
+# =========================================================================== #
+# PR4 用户来源归因（docs/admin-billing-plugin-implementation-plan.md §11）
+#
+# /r/<source_code> 匿名跳转入口 + pt_acq cookie（§11.1）：
+#   - slug 只允许 [a-z0-9_-]{1,64}；非法 → 302 到 /（安全兜底，不报错不泄露）；
+#   - cookie 签名复用 Flask secret_key（itsdangerous URLSafeTimedSerializer，
+#     独立 salt 域分离——session payload 与 pt_acq payload 不可互相移植）；
+#     HttpOnly + Secure（随 SESSION_COOKIE_SECURE）+ SameSite=Lax + 90 天；
+#   - landing 只允许固定 allowlist（/demo、/register、/）；query 里任何
+#     redirect/next 参数一律忽略（禁止开放重定向）；
+#   - 触点写入故障（含 json/dual 后端）→ warning + 安全 302 照常（§16.2）。
+# =========================================================================== #
+#: 匿名访客 cookie 名（§11.1）
+ACQ_COOKIE_NAME = "pt_acq"
+#: cookie 保留期（与匿名触点 expires_at 默认 90 天同步，§11.3）
+ACQ_COOKIE_TTL_SECONDS = 90 * 86400
+#: cookie 签名域分离 salt（itsdangerous；密钥与 Flask session 同源）
+_ACQ_COOKIE_SALT = "pt-acq-cookie-v1"
+#: /r/ landing allowlist（与 acquisition_store.LANDING_ALLOWLIST 同源）
+ACQ_LANDING_ALLOWLIST = ("/demo", "/register", "/")
+
+
+def _acq_cookie_serializer():
+    """pt_acq cookie 签名器：itsdangerous URLSafeTimedSerializer。
+
+    密钥 = Flask secret_key（复用既有 session 签名密钥，不另造密钥文件）；
+    独立 salt 使 session 与 pt_acq 的签名 payload 域分离。时间戳签名自带
+    签发时间，loads(max_age=...) 即过期校验。
+    """
+    import itsdangerous
+    return itsdangerous.URLSafeTimedSerializer(
+        str(app.secret_key), salt=_ACQ_COOKIE_SALT)
+
+
+def _acq_cookie_payload():
+    """读取并验签 pt_acq cookie → dict；缺失/篡改/过期/形态非法一律 None。"""
+    raw = request.cookies.get(ACQ_COOKIE_NAME)
+    if not raw or not isinstance(raw, str):
+        return None
+    import itsdangerous
+    try:
+        data = _acq_cookie_serializer().loads(
+            raw, max_age=ACQ_COOKIE_TTL_SECONDS)
+    except itsdangerous.BadData:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not acquisition_store.valid_visitor_id(data.get("v")):
+        return None
+    return data
+
+
+@app.route("/r/<source_code>", methods=["GET"])
+def acquisition_redirect(source_code):
+    """来源跳转入口（§11.1）。mywebpage 产品 CTA 形如::
+
+        /r/mywebpage?campaign=<slug>&utm_medium=<...>
+
+    - slug 校验（[a-z0-9_-]{1,64}）：非法 → 302 /（不报错，不泄露判定）；
+    - visitor_id：读 pt_acq cookie（验签 + 90 天过期），无效则新生成高熵 id；
+    - 落**一个不可变触点**（acquisition_store.record_visit）：referrer 只留
+      hostname、UTM 限长清控制字符、IP 只存前缀 hash（ACQ_IP_SALT 未配置则
+      不采集）；campaign 未知/非 active 落 NULL 不报错（slug 经 utm_campaign
+      保留）；landing 只接受 allowlist；
+    - 302 目标规则：query ``to`` 与 allowlist 精确匹配才采用，缺省
+      ``/register``（campaign 行不携带 landing 配置——§11.2 字典表无该列）；
+      **redirect/next 等重定向参数一律忽略**（禁止开放重定向）；
+    - 邀请码绝不进 CTA URL/query/日志/referrer（§11.1 末段）。
+    """
+    if not acquisition_store.valid_slug(source_code):
+        return redirect("/")
+    campaign_raw = (request.args.get("campaign") or "").strip()
+    utm_source = acquisition_store.sanitize_text(request.args.get("utm_source"))
+    utm_medium = acquisition_store.sanitize_text(request.args.get("utm_medium"))
+    # campaign 参数同时充当 utm_campaign 缺省值（mywebpage CTA 契约）：
+    # 未登记 campaign 的 slug 不丢——campaign_id 落 NULL，utm_campaign 保留。
+    utm_campaign = acquisition_store.sanitize_text(
+        request.args.get("utm_campaign")) \
+        or acquisition_store.sanitize_text(campaign_raw)
+    referrer_domain = acquisition_store.sanitize_referrer_domain(
+        request.referrer or "")
+    # allowlist 之外（含缺省）一律回 /register；next/redirect 参数从不读取
+    landing = acquisition_store.sanitize_landing_path(
+        request.args.get("to")) or "/register"
+
+    payload = _acq_cookie_payload() or {}
+    visitor_id = payload.get("v") or acquisition_store.new_visitor_id()
+
+    if platform_features.current_backend() == "postgres":
+        try:
+            acquisition_store.record_visit(
+                visitor_id=visitor_id, source_code=source_code,
+                campaign_id=campaign_raw,
+                referrer_domain=referrer_domain, landing_path=landing,
+                utm_source=utm_source, utm_medium=utm_medium,
+                utm_campaign=utm_campaign,
+                ip=request.remote_addr or "")
+        except Exception:
+            # §16.2 来源故障降级：安全 302 照常（只记 warning），不影响注册
+            app.logger.warning("/r/%s 触点写入失败（降级为仅跳转）",
+                               source_code, exc_info=True)
+
+    resp = redirect(landing)
+    resp.set_cookie(
+        ACQ_COOKIE_NAME,
+        _acq_cookie_serializer().dumps({
+            "v": visitor_id, "us": utm_source, "um": utm_medium,
+            "uc": utm_campaign, "rd": referrer_domain}),
+        max_age=ACQ_COOKIE_TTL_SECONDS, httponly=True, samesite="Lax",
+        secure=bool(app.config.get("SESSION_COOKIE_SECURE", False)),
+        path="/")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.route("/register", methods=["GET", "POST"])
 def register():
     """注册页（P0-B：registration_mode = closed | invite_only | public，§4.1）。
@@ -2286,10 +2406,22 @@ def register():
     if form_error:
         return _register_form_error(form_error, "invalid")
 
-    # 原子兑换（docs §4.3）：失败统一文案（无细分状态），计数到限流桶
+    # 原子兑换（docs §4.3）：失败统一文案（无细分状态），计数到限流桶。
+    # PR4 §11.2：注册来源上下文——已验签 pt_acq cookie（visitor_id + 末次
+    # sanitized UTM/referrer）+ 本请求 Referer hostname 兜底；归因在
+    # redeem_invite 的同一事务内完成，绝不事后按 IP/账号/邮箱模糊匹配。
+    acq_payload = _acq_cookie_payload() or {}
+    acq = {
+        "visitor_id": acq_payload.get("v"),
+        "utm_source": acq_payload.get("us") or "",
+        "utm_medium": acq_payload.get("um") or "",
+        "utm_campaign": acq_payload.get("uc") or "",
+        "referrer_domain": acquisition_store.sanitize_referrer_domain(
+            request.referrer or "") or acq_payload.get("rd") or "",
+    }
     try:
         result = registration_store.redeem_invite(
-            invite_token, login_id, password, display_name or None)
+            invite_token, login_id, password, display_name or None, acq=acq)
     except registration_store.InviteRedeemError:
         try:
             auth_limit_store.record_registration_failure(ip_hash, invite_hash)
@@ -3953,6 +4085,16 @@ def api_admin_registration_invites_create():
     note = body.get("note")
     if note is not None and (not isinstance(note, str) or len(note) > 200):
         return jsonify(error="note 需为 ≤200 字符的字符串"), 400
+    # PR4 §11.2：邀请显式来源。campaign_id 必须已登记（owner API 显式失败，
+    # 不静默丢）；source_code 为可选 slug；两者缺省不传 = 兼容旧调用。
+    source_code = body.get("source_code")
+    if source_code is not None and (not isinstance(source_code, str)
+                                    or len(source_code) > 64):
+        return jsonify(error="source_code 需为 ≤64 字符的字符串"), 400
+    campaign_id = body.get("campaign_id")
+    if campaign_id is not None and (not isinstance(campaign_id, str)
+                                    or len(campaign_id) > 64):
+        return jsonify(error="campaign_id 需为 ≤64 字符的字符串"), 400
 
     try:
         auth_limit_store.record_owner_invite_creation(owner_hash)
@@ -3960,7 +4102,8 @@ def api_admin_registration_invites_create():
             current_identity().get("user_id"), login_id=login_id,
             ttl_seconds=ttl_hours * 3600,
             ai_access=bool(ai_access), cohort=cohort or "",
-            note=note or "")
+            note=note or "",
+            source_code=source_code or "", campaign_id=campaign_id or None)
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
     except platform_features.PgFeatureUnavailable:
@@ -4938,6 +5081,15 @@ def admin_v1_users():
     billing_ok = platform_features.billing_features_available()
     accounts = last_calls = turn_by_user = {}
     reg_methods = _admin_v1_registration_methods(user_ids)
+    # PR4 来源归因填充（campaign/source 留位）；PG 侧 best-effort（展示用途，
+    # 与 reg_methods 同口径：失败按 None 展示，不 fail-closed 整页 500）
+    acq_by_user = {}
+    if platform_features.current_backend() == "postgres":
+        try:
+            acq_by_user = acquisition_store.user_acquisition_by_ids(user_ids)
+        except Exception:
+            app.logger.warning("admin v1 users 来源归因查询失败（按空展示）",
+                               exc_info=True)
     if billing_ok:
         try:
             accounts = billing_store.admin_account_summaries(user_ids)
@@ -4954,6 +5106,7 @@ def admin_v1_users():
     for u in page:
         uid = str(u.get("user_id") or "")
         turn = turn_by_user.get(uid)
+        acq = acq_by_user.get(uid) or {}
         items.append({
             "user_id": uid,
             "display_name": u.get("display_name"),
@@ -4964,8 +5117,9 @@ def admin_v1_users():
             "ai_access": bool(u.get("ai_access")),
             "created_at": u.get("created_at"),
             "registration_method": reg_methods.get(uid, "manual"),
-            "campaign": None,   # PR4 来源归因填充
-            "source": None,     # PR4 来源归因填充
+            # PR4：user_acquisition 归因（无行 = 未归因，保持 null）
+            "campaign": acq.get("campaign_id"),
+            "source": acq.get("source_code"),
             # 对话额度（turn budget；json 后端无预算权威来源 → null）
             "turn_used": int(turn["total"]) if turn else None,
             "turn_limit": int(turn["limit"]) if turn else None,
@@ -5272,6 +5426,75 @@ def admin_v1_turn_budgets():
         usage=report,
         backend=platform_features.current_backend(),
     )
+
+
+# --------------------------------------------------------------------------- #
+# PR4 Admin API v1 来源归因（§9 表末两行 / §10.3 / §11.3 脱敏红线）
+# --------------------------------------------------------------------------- #
+@app.route("/api/admin/v1/acquisition/summary", methods=["GET"])
+def admin_v1_acquisition_summary():
+    """来源漏斗汇总（§10.3）：每 source/campaign 的访问 → 注册 → 首次 AI。
+
+    首次 AI = ai_usage_events 每用户最早 occurred_at 是否存在（不重复计数）。
+    附注册模式（§10.3「注册模式显示」）。脱敏红线（§9）：无完整 IP、无
+    referrer query、无 visitor hash（汇总只有计数与 slug）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.budget_features_available():
+        return _admin_v1_pg_required()
+    try:
+        summary = acquisition_store.admin_funnel_summary()
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 acquisition summary 读取失败")
+        return _admin_v1_error(500, "internal", "来源汇总读取失败")
+    return jsonify(
+        registration_mode=_effective_registration_mode(),
+        backend=platform_features.current_backend(),
+        **summary)
+
+
+@app.route("/api/admin/v1/acquisition/users", methods=["GET"])
+def admin_v1_acquisition_users():
+    """用户来源明细分页（§10.3：first touch 与 last touch 分开显示）。
+
+    cursor 分页（(attributed_at, user_id) keyset 降序）。脱敏红线（§9）：
+    login ID 只出掩码；visitor 只给 hash 前缀 8 hex；无完整 IP（触点行本就
+    只有前缀 hash 且不导出）；referrer 只有 hostname（触点写入时已剥 query）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.budget_features_available():
+        return _admin_v1_pg_required()
+    limit = _admin_v1_limit_arg()
+    raw_cursor = _admin_v1_decode_cursor(request.args.get("cursor"))
+    cursor = None
+    if raw_cursor and "k" in raw_cursor and isinstance(raw_cursor["k"], list) \
+            and len(raw_cursor["k"]) == 2:
+        cursor = (raw_cursor["k"][0], raw_cursor["k"][1])
+    try:
+        page = acquisition_store.admin_user_acquisition_page(
+            cursor=cursor, limit=limit)
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 acquisition users 读取失败")
+        return _admin_v1_error(500, "internal", "用户来源明细读取失败")
+    for item in page["items"]:
+        # login ID 掩码（§9：原始账号不回显）
+        item["login_id_masked"] = registration_store.mask_login_id(
+            item.pop("login_id", None) or "")
+    next_cursor = None
+    if page["next_cursor"] is not None:
+        next_cursor = _admin_v1_encode_cursor(
+            {"k": list(page["next_cursor"])})
+    return jsonify(items=page["items"], next_cursor=next_cursor, limit=limit)
 
 
 @app.route("/api/slides")

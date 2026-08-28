@@ -657,6 +657,73 @@ describe("AdminBridge host — PR3b read backend proxy (§9 Admin API v1)", () =
 	});
 });
 
+describe("AdminBridge host — PR4 acquisition read backend proxy (§9 Admin API v1)", () => {
+	it("admin.acquisition.summary proxies GET /api/admin/v1/acquisition/summary", async () => {
+		const summary = {
+			registration_mode: "invite_only",
+			items: [{ source_code: "mywebpage", campaign_id: null, visits: 3,
+				registrations: 1, first_ai_count: 1 }],
+			totals: { visits: 3, registrations: 1, first_ai_count: 1 },
+		};
+		const { handle, posted, contentWindow } = makeHost({
+			permissions: ["admin:acquisition:read"],
+			fetchJson: async (url) => {
+				expect(url).toBe("/api/admin/v1/acquisition/summary");
+				return { status: 200, ok: true, body: summary };
+			},
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.acquisition.summary"),
+		});
+		await ticks();
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(true);
+		expect(rs[0].env.result).toEqual(summary);
+	});
+
+	it("admin.acquisition.list maps cursor/limit into the users query string", async () => {
+		const { handle, posted, contentWindow } = makeHost({
+			permissions: ["admin:acquisition:read"],
+			fetchJson: async (url) => {
+				expect(url).toBe("/api/admin/v1/acquisition/users?cursor=k1&limit=25");
+				return { status: 200, ok: true, body: { items: [], next_cursor: null } };
+			},
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.acquisition.list", {
+				cursor: "k1", limit: 25,
+			}),
+		});
+		await ticks();
+		expect(responses(posted, "r1")[0].env.ok).toBe(true);
+	});
+
+	it("rejects undeclared params on acquisition methods (schema gate)", async () => {
+		const { handle, posted, contentWindow } = makeHost({
+			permissions: ["admin:acquisition:read"],
+			fetchJson: async () => ({ status: 200, ok: true, body: {} }),
+		});
+		handle._handleIframeLoad();
+		const nonce = nonce0(posted);
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "b1", "admin.acquisition.list", { q: "evil" }),
+		});
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "b2", "admin.acquisition.summary", { user_id: "x" }),
+		});
+		await ticks();
+		expect((responses(posted, "b1")[0].env.error as { code: string }).code).toBe("invalid_params");
+		expect((responses(posted, "b2")[0].env.error as { code: string }).code).toBe("invalid_params");
+		expect(handle.stats().handled).toBe(0);
+	});
+});
+
 function nonce0(posted: Posted[]): string {
 	return initNonce(posted);
 }

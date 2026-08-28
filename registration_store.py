@@ -44,6 +44,10 @@ from werkzeug.security import generate_password_hash
 import pg_store
 import platform_features
 import user_store
+# PR4 来源归因（docs/admin-billing-plugin-implementation-plan.md §11.2）：
+# 邀请可带 source_code/campaign_id；兑换事务内由 acquisition_store 写
+# user_acquisition（同 cursor 原子，见 redeem_invite）。
+import acquisition_store
 
 _log = logging.getLogger("svs.registration")
 
@@ -196,7 +200,7 @@ _INVITE_SEL = (
     "extract(epoch from expires_at)::float8 AS expires_at, max_uses, use_count, "
     "extract(epoch from consumed_at)::float8 AS consumed_at, "
     "consumed_by_user_id, extract(epoch from revoked_at)::float8 AS revoked_at, "
-    "ai_access, cohort, note"
+    "ai_access, cohort, note, source_code, campaign_id"
 )
 
 
@@ -208,14 +212,19 @@ def _invite_out(row) -> dict:
 
 def create_invite(created_by_user_id, login_id=None,
                   ttl_seconds=DEFAULT_INVITE_TTL_SECONDS,
-                  ai_access=False, cohort="", note=""):
+                  ai_access=False, cohort="", note="",
+                  source_code="", campaign_id=None):
     """创建一次性邀请码。返回 dict：含**明文 token**（唯一出现处）与行信息。
 
     - token：``secrets.token_urlsafe(32)``；库内只存 invite_token_hash(token)；
     - login_id 给出时按 normalize_login_id 绑定——语义为「允许兑换的登录账号
       login_id」（docs §8.2；原批次 B 参数名 email，批次 C 收口改名）；
       None = 不绑定（owner 明确选择的高风险选项，UI 需标注）；
-    - ai_access/cohort/note 为邀请模板：兑换时决定新用户平台 AI 权限与分组。
+    - ai_access/cohort/note 为邀请模板：兑换时决定新用户平台 AI 权限与分组；
+    - source_code/campaign_id（PR4 §11.2）：邀请显式来源。campaign_id 必须是
+      已存在的 acquisition_campaigns 行（slug 校验 + 存在性检查，未知值
+      ValueError——owner API 应显式失败，不静默丢）；source_code 为可选 slug
+      （空 = 未指定）。两者参与兑换归因优先级最高（邀请码显式 campaign）。
     """
     platform_features.require_pg_backend("registration_invites")
     if not isinstance(created_by_user_id, str) or not created_by_user_id:
@@ -231,6 +240,15 @@ def create_invite(created_by_user_id, login_id=None,
         raise ValueError("ttl_seconds 需为正整数")
     cohort = str(cohort or "").strip()[:64]
     note = str(note or "").strip()[:200]
+    source_code = str(source_code or "").strip()
+    if source_code and not acquisition_store.valid_slug(source_code):
+        raise ValueError("source_code 需匹配 [a-z0-9_-]{1,64}")
+    campaign_id = (campaign_id or "").strip() or None
+    if campaign_id is not None:
+        if not acquisition_store.valid_slug(campaign_id):
+            raise ValueError("campaign_id 需匹配 [a-z0-9_-]{1,64}")
+        if acquisition_store.get_campaign(campaign_id) is None:
+            raise ValueError("campaign 不存在：%s" % campaign_id)
 
     for _ in range(5):  # token_hash 撞唯一键概率可忽略，重试兜底
         token = secrets.token_urlsafe(INVITE_TOKEN_BYTES)
@@ -244,13 +262,15 @@ def create_invite(created_by_user_id, login_id=None,
                         "INSERT INTO registration_invites "
                         "(invite_id, token_hash, login_id_normalized, "
                         " created_by_user_id, created_at, expires_at, "
-                        " max_uses, use_count, ai_access, cohort, note) "
+                        " max_uses, use_count, ai_access, cohort, note, "
+                        " source_code, campaign_id) "
                         "VALUES (%s,%s,%s,%s, now(), "
-                        " now() + (%s * interval '1 second'), 1, 0, %s, %s, %s) "
+                        " now() + (%s * interval '1 second'), 1, 0, %s, %s, "
+                        " %s, %s, %s) "
                         "RETURNING " + _INVITE_SEL,
                         (invite_id, token_hash, bound or None,
                          created_by_user_id, ttl, bool(ai_access), cohort,
-                         note),
+                         note, source_code, campaign_id),
                     )
                     row = cur.fetchone()
                     _insert_audit(
@@ -258,7 +278,9 @@ def create_invite(created_by_user_id, login_id=None,
                         "registration_invite", invite_id,
                         {"email_bound": bool(bound), "ai_access":
                          bool(ai_access), "cohort": cohort,
-                         "ttl_seconds": ttl})
+                         "ttl_seconds": ttl,
+                         "source_code": source_code,
+                         "campaign_bound": campaign_id is not None})
         except psycopg.errors.UniqueViolation:
             continue  # finally 先关连接再重试
         finally:
@@ -344,11 +366,20 @@ class _RedeemFail(Exception):
         super().__init__(reason)
 
 
-def redeem_invite(token, login_id, password, display_name=None):
+def redeem_invite(token, login_id, password, display_name=None, acq=None):
     """兑换邀请码并在**同一事务**内创建 role=user 账号。
 
     ``login_id`` 参数为兑换人自选的**登录账号**（docs §8.2；原批次 B 参数名
     email，批次 C 收口改名）。
+
+    ``acq``（PR4 §11.2，可选 dict）：注册请求携带的来源上下文
+    ``{visitor_id, utm_source, utm_medium, utm_campaign, referrer_domain}``
+    （路由层从已验签 pt_acq cookie 与请求头组装，值已 sanitize）。本事务内
+    经 acquisition_store.insert_user_acquisition 写 user_acquisition——
+    优先级：邀请码显式 campaign > 有效 pt_acq 触点 > sanitized referrer/UTM
+    > direct/unknown；**绝不**事后按 IP/login ID/邮箱模糊匹配。归因插入失败
+    与兑换同事务回滚（用户也不创建）。``acq=None`` 仍会写 direct 归因行
+    （老调用兼容）。
 
     失败一律抛 ``InviteRedeemError``（对外统一 code
     ``invite_invalid_or_unavailable``）：
@@ -358,7 +389,8 @@ def redeem_invite(token, login_id, password, display_name=None):
         不变；常数时间比较规范化值）；
       - users 登录账号已存在（email_taken；此时 invite 未消费——检查先于
         UPDATE）；
-    成功返回 ``{"user": <新用户公共 dict>, "invite_id": ..., "login_id": ...}``
+    成功返回 ``{"user": <新用户公共 dict>, "invite_id": ..., "login_id": ...,
+    "acquisition": <归因行 dict|None>}``
     （login_id 键即规范化登录账号；批次 C 起不再返回 "email" 键）。
     成功审计在同一事务内（registration.redeem，actor=被创建 user_id）；失败审计
     在独立 best-effort 事务（主事务已随异常回滚），detail 只含 invite_id/status。
@@ -384,7 +416,8 @@ def redeem_invite(token, login_id, password, display_name=None):
                     "SELECT invite_id, token_hash, login_id_normalized, "
                     "extract(epoch from expires_at)::float8 AS expires_at, "
                     "max_uses, use_count, consumed_at, revoked_at, ai_access, "
-                    "cohort FROM registration_invites WHERE token_hash=%s "
+                    "cohort, source_code, campaign_id "
+                    "FROM registration_invites WHERE token_hash=%s "
                     "FOR UPDATE",
                     (token_hash,))
                 row = cur.fetchone()
@@ -429,9 +462,24 @@ def redeem_invite(token, login_id, password, display_name=None):
                 if (cur.rowcount or 0) != 1:
                     # FOR UPDATE 下不可达；防御性回滚（CAS 失败=状态已变）
                     raise _RedeemFail("consumed")
+                # PR4 §11.2：user_acquisition 与兑换/建号/invite 消费同事务
+                # （同 cursor）。插入失败 → 整体回滚（用户也不创建）。
+                try:
+                    acquisition = acquisition_store.insert_user_acquisition(
+                        cur, user_id=user["user_id"], invite_id=invite_id,
+                        invite_campaign_id=row["campaign_id"],
+                        invite_source_code=row["source_code"] or "",
+                        acq=acq)
+                except Exception:
+                    _log.warning(
+                        "user_acquisition 写入失败（整体回滚，不建号）",
+                        exc_info=True)
+                    raise
                 _audit_redeem(cur, invite_id, "success",
                               created_user_id=user["user_id"])
-        return {"user": user, "invite_id": invite_id, "login_id": norm_login}
+        return {"user": user, "invite_id": invite_id,
+                "login_id": norm_login,
+                "acquisition": acquisition}
     except _RedeemFail as exc:
         _audit_redeem_best_effort(fail_invite_id, exc.reason)
         raise InviteRedeemError(exc.reason)

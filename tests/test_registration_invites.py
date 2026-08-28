@@ -631,5 +631,102 @@ def test_registration_mode_env_and_invalid_values():
         settings_store.set_registration_mode("public")
 
 
+# =========================================================================== #
+# 3. PG 数据层（PR4 §11.2）：邀请显式 source/campaign 与兑换归因
+# =========================================================================== #
+def _seed_campaign(cid, source, status="active"):
+    import acquisition_store as acq_store
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO acquisition_campaigns "
+                "(campaign_id, source_code, name, status, created_by) "
+                "VALUES (%s,%s,%s,%s,'test') "
+                "ON CONFLICT (campaign_id) DO UPDATE SET status=%s",
+                (cid, source, "camp-" + cid, status, status))
+        conn.commit()
+    finally:
+        conn.close()
+    return acq_store.get_campaign(cid)
+
+
+@pg_only
+def test_create_invite_with_source_and_campaign_validation():
+    owner = _mk_owner()
+    _seed_campaign("camp-ok", "src-ok")
+    # 合法：campaign 已登记
+    inv = registration_store.create_invite(
+        owner["user_id"], login_id="sc1@x.com", source_code="mywebpage",
+        campaign_id="camp-ok")
+    assert inv["source_code"] == "mywebpage"
+    assert inv["campaign_id"] == "camp-ok"
+    # 兼容旧调用：不传两字段 → 空/NULL
+    inv2 = registration_store.create_invite(owner["user_id"],
+                                            login_id="sc2@x.com")
+    assert inv2["source_code"] == "" and inv2["campaign_id"] is None
+    # 非法 slug / 未知 campaign → ValueError（不静默丢）
+    with pytest.raises(ValueError):
+        registration_store.create_invite(owner["user_id"],
+                                         login_id="sc3@x.com",
+                                         source_code="Bad Slug")
+    with pytest.raises(ValueError):
+        registration_store.create_invite(owner["user_id"],
+                                         login_id="sc4@x.com",
+                                         campaign_id="no-such-campaign")
+
+
+@pg_only
+def test_invite_list_exposes_source_campaign_and_owner_api(monkeypatch):
+    _satisfy_preconditions(monkeypatch)
+    _seed_campaign("camp-api", "src-api")
+    owner = _mk_owner()
+    app_mod.AUTH_ENABLED = True
+    client = _client()
+    _owner_session(client, owner)
+    r = client.post("/api/admin/registration-invites", json={
+        "login_id": "apisrc@x.com", "source_code": "src-api",
+        "campaign_id": "camp-api"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    body = r.get_json()
+    assert body["source_code"] == "src-api"
+    assert body["campaign_id"] == "camp-api"
+    # 未知 campaign → 400（owner API 显式失败，不静默丢）
+    r2 = client.post("/api/admin/registration-invites", json={
+        "login_id": "apibad@x.com", "campaign_id": "ghost"})
+    assert r2.status_code == 400
+    # 非法 slug → 400
+    r3 = client.post("/api/admin/registration-invites", json={
+        "login_id": "apibad2@x.com", "source_code": "NOT A SLUG"})
+    assert r3.status_code == 400
+    # 列表暴露两字段；掩码规则不变（login_id_masked，无 token/hash）
+    r4 = client.get("/api/admin/registration-invites").get_json()
+    it = next(i for i in r4["invites"] if i["invite_id"] == body["invite_id"])
+    assert it["source_code"] == "src-api" and it["campaign_id"] == "camp-api"
+    assert it["login_id_masked"] == "a***@x.com"
+    assert "token" not in it and "token_hash" not in it
+
+
+@pg_only
+def test_redeem_without_acq_writes_direct_attribution():
+    """老调用（acq=None）也写 user_acquisition：direct/unknown，行完整。"""
+    owner = _mk_owner()
+    inv = registration_store.create_invite(owner["user_id"],
+                                           login_id="legacy@x.com")
+    out = registration_store.redeem_invite(inv["token"], "legacy@x.com",
+                                           "longpassword123")
+    assert out["acquisition"]["attribution_method"] == "direct"
+    assert out["acquisition"]["source_code"] == "unknown"
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*)::int AS n FROM user_acquisition "
+                "WHERE user_id=%s", (out["user"]["user_id"],))
+            assert cur.fetchone()["n"] == 1
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

@@ -114,6 +114,8 @@ def test_schema_migrations_recorded(conn):
     # admin-billing PR2 追加 0018_billing.sql（价格表/用量事件/账户/账本/
     # 余额快照六表 + DeepSeek 2026-08-28 价格种子，docs
     # admin-billing-plugin-implementation-plan.md §6）。
+    # admin-billing PR4 追加 0019_acquisition.sql（来源归因三表 +
+    # registration_invites source/campaign 列，docs 同上 §11.2）。
     assert rows == [
         "0001_init.sql", "0002_roi_payload.sql", "0003_comments.sql",
         "0004_audit.sql", "0005_plugin.sql", "0006_demo_budget_auth.sql",
@@ -129,6 +131,7 @@ def test_schema_migrations_recorded(conn):
         "0016_login_id_rename.sql",
         "0017_upload_tasks.sql",
         "0018_billing.sql",
+        "0019_acquisition.sql",
     ]
 
 

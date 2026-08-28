@@ -8190,13 +8190,58 @@ def _bootstrap_plugin_installations(environ=None):
     return out
 
 
-# 启动引导（幂等）：插件 v1 通道的 installation 凭证就位
-_HISTOPILOT_INSTALLATION = _bootstrap_plugin_installations()
+# 固定 advisory lock key（"SVSP" 的 4 字节整数，区别于 ensure_schema 的 SVSG）。
+# gunicorn -w N 多 worker 并发执行模块级插件安装引导时，check-then-insert 竞态
+# 会产生重复 plugin_installations 行（2026-08-28 生产观察到 pathtogether-admin
+# 双行，间隔 308µs）。postgres/dual 后端用会话级 advisory lock 串行化两个引导。
+_PG_PLUGIN_BOOTSTRAP_LOCK = 0x53565350
 
-# 启动引导（幂等）：特权 admin 插件的安装行（PR3 fix）。前置是信任判定的
-# ①②③项（白名单 + 显式 pin + hash 精确匹配），不依赖也不替代每请求的
-# _admin_plugin_trusted 重判；失败/跳过 → /admin 走降级页，不阻断启动。
-_ADMIN_PLUGIN_INSTALLATION = _bootstrap_admin_plugin_installation()
+
+@contextmanager
+def _plugin_bootstrap_serialized():
+    """插件安装引导串行化（仅 postgres/dual；json 后端单进程无需防护）。
+
+    锁不可用（如 PG 连接失败）时降级为无锁执行——引导自身 try/except 兜底，
+    启动不被防护逻辑阻断；关闭连接本身也会释放会话级锁。
+    """
+    backend = getattr(share_store, "STORAGE_BACKEND", "json")
+    if backend not in ("postgres", "dual"):
+        yield
+        return
+    conn = None
+    try:
+        import pg_store
+        conn = pg_store.connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_lock(%s)",
+                        (_PG_PLUGIN_BOOTSTRAP_LOCK,))
+    except Exception:
+        app.logger.warning("插件安装引导锁不可用，降级无锁执行", exc_info=True)
+        if conn is not None:
+            conn.close()
+            conn = None
+    try:
+        yield
+    finally:
+        if conn is not None:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(%s)",
+                                (_PG_PLUGIN_BOOTSTRAP_LOCK,))
+            except Exception:
+                app.logger.warning("插件安装引导锁释放失败", exc_info=True)
+            conn.close()
+
+
+# 启动引导（幂等）：插件 v1 通道的 installation 凭证就位。
+# 两个引导置于同一把 advisory lock 下，避免多 worker 首启竞态重复建行。
+with _plugin_bootstrap_serialized():
+    _HISTOPILOT_INSTALLATION = _bootstrap_plugin_installations()
+
+    # 启动引导（幂等）：特权 admin 插件的安装行（PR3 fix）。前置是信任判定的
+    # ①②③项（白名单 + 显式 pin + hash 精确匹配），不依赖也不替代每请求的
+    # _admin_plugin_trusted 重判；失败/跳过 → /admin 走降级页，不阻断启动。
+    _ADMIN_PLUGIN_INSTALLATION = _bootstrap_admin_plugin_installation()
 
 
 @app.route("/api/plugin/v1/auth/token", methods=["POST"])

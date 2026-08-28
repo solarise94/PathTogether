@@ -35,6 +35,10 @@ import share_store  # noqa: E402
 import user_store  # noqa: E402
 from plugins.sdk import manifest as M  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app  # noqa: E402
+from pg_compat import BACKEND  # noqa: E402
+
+PG = pytest.mark.skipif(BACKEND != "postgres",
+                        reason="advisory lock 并发回归需 PG（RUN_PG_TESTS=1）")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ADMIN_PLUGIN_DIR = REPO_ROOT / "plugins" / "pathtogether-admin"
@@ -507,6 +511,35 @@ def test_bootstrap_creates_enabled_installation_idempotently():
     r = _login(_client(), owner).get("/admin")
     assert r.status_code == 200
     assert "admin-plugin-frame" in r.get_data(as_text=True)
+
+
+@PG
+def test_bootstrap_serialized_concurrent_pg():
+    """多 worker 首启竞态回归（2026-08-28 生产双行事故）：两个线程同时进入带
+    advisory lock 的引导，最终只有一条安装行，且两次返回同一 installation_id。
+    无锁时 check-then-insert 竞态会重复建行（本测试应随之失败）。"""
+    import threading
+    _setup_users()
+    assert _admin_installation_rows() == []
+    barrier = threading.Barrier(2)
+    results = []
+
+    def _worker():
+        barrier.wait(timeout=10)
+        with app_mod._plugin_bootstrap_serialized():
+            results.append(app_mod._bootstrap_admin_plugin_installation())
+
+    threads = [threading.Thread(target=_worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert all(not t.is_alive() for t in threads), "advisory lock 死锁？"
+    rows = _admin_installation_rows()
+    assert len(rows) == 1
+    assert len(results) == 2
+    assert all(r is not None and r["installation_id"] == rows[0]["installation_id"]
+               for r in results)
 
 
 def test_bootstrap_skips_when_hash_or_pin_invalid(monkeypatch, tmp_path):

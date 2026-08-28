@@ -96,7 +96,7 @@
       }
     },
     "adminPermissions": {
-      "description": "可选（Manifest v1.1，docs/admin-billing-plugin-implementation-plan.md §8.2/§8.4）：admin 插件申请的管理能力枚举（11 项），与 §8.4 AdminBridge method→permission 映射表一一对应。申请不建立信任——admin 插件信任由代码级 PRIVILEGED_ADMIN_PLUGIN_IDS 白名单 + source-policy 显式 manifest sha256 pin + hash 精确匹配 + installation enabled 共同判定，永远 fail-closed。未声明该字段的旧 manifest 完全不受影响；未知值校验失败。",
+      "description": "可选（Manifest v1.1，docs/admin-billing-plugin-implementation-plan.md §8.2/§8.4）：admin 插件申请的管理能力枚举（13 项），与 §8.4 AdminBridge method→permission 映射表一一对应（PR5 修订补入 admin:plugins:read/write：插件列表/健康/启停/凭证轮换页）。申请不建立信任——admin 插件信任由代码级 PRIVILEGED_ADMIN_PLUGIN_IDS 白名单 + source-policy 显式 manifest sha256 pin + hash 精确匹配 + installation enabled 共同判定，永远 fail-closed。未声明该字段的旧 manifest 完全不受影响；未知值校验失败。",
       "type": "array",
       "items": {
         "enum": [
@@ -110,7 +110,9 @@
           "admin:billing:read",
           "admin:billing:write",
           "admin:acquisition:read",
-          "admin:audit:read"
+          "admin:audit:read",
+          "admin:plugins:read",
+          "admin:plugins:write"
         ]
       }
     },

@@ -19,7 +19,9 @@ PG 模式（RUN_PG_TESTS=1）：
   - first/last touch：同一访客两次不同 campaign 不折叠；
   - 过期触点不参与归因；注册路由全链路（/r/ → cookie → /register POST 事务）；
   - 兑换事务原子性（user_acquisition 写入失败 → 用户不创建，故障注入）；
-  - 90 天清理只删未被引用的过期触点；
+  - 90 天保留（PR5 §11.3）：过期未引用行删除、过期已归因行脱敏
+    （ip/referrer/UTM/landing/visitor hash 置空，保留 source/campaign）、
+    未到期不动、幂等与计数；retention 入口 json fail-closed；daemon 开关；
   - admin API 门控/脱敏（login 掩码、visitor 只给前缀、无完整 IP/query）；
   - 漏斗汇总（访问/注册/首次 AI 计数，首次 AI 直接 SQL 造 ai_usage_events）。
 
@@ -609,14 +611,22 @@ def test_redeem_atomic_user_acquisition_failure_rolls_back(monkeypatch):
 
 
 @pg_only
-def test_cleanup_expired_visits_keeps_referenced_rows():
+def test_visit_retention_deletes_scrubs_and_is_idempotent(monkeypatch):
+    """§11.3 PR5：过期引用行脱敏、未引用行删除、未到期不动、计数正确。"""
+    monkeypatch.setenv("ACQ_IP_SALT", "salt-ret")   # 让 ip_prefix_hash 非空
     owner = _mk_owner()
+    _seed_campaign("keep-camp", "keep")
     vid = acq_store.new_visitor_id()
-    referenced = acq_store.record_visit(visitor_id=vid, source_code="keep")
-    stale = acq_store.record_visit(visitor_id=acq_store.new_visitor_id(),
-                                   source_code="drop-me")
-    fresh = acq_store.record_visit(visitor_id=acq_store.new_visitor_id(),
-                                   source_code="fresh")
+    referenced = acq_store.record_visit(
+        visitor_id=vid, source_code="keep", campaign_id="keep-camp",
+        referrer_domain="https://ref.example.com/x?q=1", landing_path="/demo",
+        utm_source="us", utm_medium="um", utm_campaign="uc", ip="203.0.113.7")
+    stale = acq_store.record_visit(
+        visitor_id=acq_store.new_visitor_id(), source_code="drop-me",
+        utm_source="bye")
+    fresh = acq_store.record_visit(
+        visitor_id=acq_store.new_visitor_id(), source_code="fresh",
+        utm_source="stay", ip="198.51.100.9")
     inv = _mk_invite(owner["user_id"])
     _redeem(inv, "clean@x.com", acq={"visitor_id": vid})
     # 只把 stale 与 referenced 标过期
@@ -630,20 +640,66 @@ def test_cleanup_expired_visits_keeps_referenced_rows():
         conn.commit()
     finally:
         conn.close()
-    deleted = acq_store.cleanup_expired_visits()
-    assert deleted >= 1
-    conn = _pg_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT acquisition_id FROM acquisition_visits")
-            left = {r["acquisition_id"] for r in cur.fetchall()}
-    finally:
-        conn.close()
-    # 已归因的过期触点保留（长期保留 campaign/source）；未过期保留
-    assert referenced["acquisition_id"] in left
-    assert fresh["acquisition_id"] in left
-    assert stale["acquisition_id"] not in left
+    deleted, scrubbed = acq_store.run_visit_retention()
+    assert deleted >= 1 and scrubbed == 1
+
+    def _row(acq_id):
+        conn = _pg_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM acquisition_visits WHERE acquisition_id=%s",
+                    (acq_id,))
+                r = cur.fetchone()
+                return dict(r) if r is not None else None
+        finally:
+            conn.close()
+
+    # 已归因的过期触点：骨架保留，但脱敏字段全部清空（§11.3 长期只留
+    # campaign/source：ip/referrer/UTM/landing/visitor hash 到期即清）
+    ref_row = _row(referenced["acquisition_id"])
+    for f in acq_store._SCRUB_FIELDS:
+        assert ref_row[f] == "", f
+    assert ref_row["source_code"] == "keep"
+    assert ref_row["campaign_id"] == "keep-camp"
+    assert ref_row["touched_at"] is not None
+    # 未引用过期行删除；未到期行原样不动
+    assert _row(stale["acquisition_id"]) is None
+    fresh_row = _row(fresh["acquisition_id"])
+    assert fresh_row["utm_source"] == "stay"
+    assert fresh_row["ip_prefix_hash"]
+    assert fresh_row["visitor_id_hash"]
+    # 幂等：再跑一轮两类计数均为 0（脱敏 UPDATE 带 <>'' 条件）
+    assert acq_store.run_visit_retention() == (0, 0)
+
+
+def test_visit_retention_requires_pg_backend():
+    """json/dual 后端：retention 入口 fail-closed（不静默跳过）。"""
+    if BACKEND == "postgres":
+        pytest.skip("json 后端专用反向用例（PG 模式跑正向路径）")
+    import platform_features
+    with pytest.raises(platform_features.PgFeatureUnavailable):
+        acq_store.run_visit_retention()
+    # 兼容包装同源 fail-closed
+    with pytest.raises(platform_features.PgFeatureUnavailable):
+        acq_store.cleanup_expired_visits()
+
+
+def test_acquisition_retention_daemon_switch(monkeypatch):
+    """retention daemon：非 PG 不启动；env ≤0 关闭；PG + 正间隔才起线程。"""
+    if BACKEND != "postgres":
+        # json/dual：导入期即不启动（fail-closed）
+        assert app_mod._ACQUISITION_RETENTION_THREAD is None
+    # 开关：0 / 负数 → None（不建线程）
+    monkeypatch.setenv("ACQ_RETENTION_INTERVAL_SECONDS", "0")
+    assert app_mod._start_acquisition_retention_thread() is None
+    monkeypatch.setenv("ACQ_RETENTION_INTERVAL_SECONDS", "-5")
+    assert app_mod._start_acquisition_retention_thread() is None
+    if BACKEND == "postgres":
+        monkeypatch.setenv("ACQ_RETENTION_INTERVAL_SECONDS", "3600")
+        th = app_mod._start_acquisition_retention_thread()
+        assert th is not None and th.name == "acquisition-retention" \
+            and th.daemon is True
 
 
 @pg_only

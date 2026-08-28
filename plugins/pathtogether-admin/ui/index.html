@@ -21,11 +21,13 @@
       - 概览：用户计数 + 双额度并列（「对话额度」与「金额余额」分开标注，
         §10.1 红线）+ cache 命中率 + provider 余额 + unpriced/lag；
       - 用户（PR5）：创建用户 + 启停 / AI access / 重置密码（仅普通用户）/
-        打开账本；
+        身份预览 / 打开账本；
       - 邀请与来源（PR4+PR5）：注册模式展示 + 邀请创建/撤销 + campaign 漏斗
         + 用户来源明细（first/last touch 分列）；
       - 额度与账单（PR5）：turn 预算编辑 + 开新周期 + caps 编辑器（null=清除、
         版本 CAS）+ 人工调整（原因必填）+ usage/ledger 只读 + provider 余额；
+      - 插件（PR5 修订）：安装列表 + sidecar 健康提示 + 启停 + 凭证轮换
+        （新 secret 仅一次展示；运行时安装不上 UI，走版本化 releases）；
       - 审计：表格（detail 已由服务端脱敏）。
 
     只加载相对路径 style.css / main.js（owner-only 的
@@ -42,6 +44,7 @@
       <button type="button" class="adm-nav-btn" data-page="users">用户</button>
       <button type="button" class="adm-nav-btn" data-page="invites">邀请与来源</button>
       <button type="button" class="adm-nav-btn" data-page="billing">额度与账单</button>
+      <button type="button" class="adm-nav-btn" data-page="plugins">插件</button>
       <button type="button" class="adm-nav-btn" data-page="audit">审计</button>
     </nav>
   </header>
@@ -325,6 +328,35 @@
         <div class="adm-pager">
           <button type="button" id="adm-ledger-more-btn">加载更多</button>
         </div>
+      </section>
+    </section>
+
+    <!-- 插件（PR5 修订：恢复旧侧栏插件管理功能面） -->
+    <section class="adm-page" id="adm-page-plugins" hidden>
+      <section class="adm-card">
+        <h2>插件安装</h2>
+        <p class="adm-note">「健康」是 sidecar /healthz 探测快照（reachable/unreachable/unknown）：不可达只影响依赖该 sidecar 的能力，平台本身照常可用。运行时「安装/更新」入口不上本页——插件发布走版本化 releases 原子切换（§16），本页只做已安装启停与凭证轮换；轮换出的新 secret 只显示一次，关闭后无法再查看。</p>
+        <div class="adm-table-wrap">
+          <table class="adm-table" id="adm-plugins-table">
+            <thead>
+              <tr>
+                <th>installation</th><th>plugin</th><th>版本</th><th>状态</th>
+                <th>健康</th><th>能力</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="adm-plugins-tbody"></tbody>
+          </table>
+        </div>
+        <div class="adm-confirm" id="adm-plugins-confirm" hidden></div>
+        <p class="adm-status" id="adm-plugins-status"></p>
+        <div class="adm-token-once" id="adm-plugin-secret-box" hidden>
+          <p class="adm-note">新凭证明文仅此一次展示（旧 secret 已立即失效）：</p>
+          <code id="adm-plugin-secret"></code>
+          <button type="button" id="adm-plugin-secret-copy">复制</button>
+        </div>
+        <p class="adm-pager">
+          <button type="button" id="adm-plugins-refresh-btn">刷新列表</button>
+        </p>
       </section>
     </section>
 

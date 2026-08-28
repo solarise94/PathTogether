@@ -405,8 +405,9 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 		const { AdminBridgeHost } = loadModule();
 		const table = AdminBridgeHost.METHOD_PERMISSIONS;
 		// 22 个 §8.4 表方法 + PR3b 扩展的 providerBalance.refresh（与 get 同级
-		// admin:billing:read：只抓取供应商自身余额，不触碰用户数据）
-		expect(Object.keys(table)).toHaveLength(23);
+		// admin:billing:read：只抓取供应商自身余额，不触碰用户数据）+ PR5
+		// 修订补的 4 个 UI parity 方法（users.startPreview / plugins.*）
+		expect(Object.keys(table)).toHaveLength(27);
 		expect(table["admin.auth.get"]).toBe("admin:overview:read");
 		expect(table["admin.overview.get"]).toBe("admin:overview:read");
 		expect(table["admin.users.list"]).toBe("admin:users:read");
@@ -430,6 +431,12 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 		expect(table["admin.acquisition.summary"]).toBe("admin:acquisition:read");
 		expect(table["admin.acquisition.list"]).toBe("admin:acquisition:read");
 		expect(table["admin.audit.list"]).toBe("admin:audit:read");
+		// PR5 修订（UI parity）：身份预览（写 owner session，归 users:write）+
+		// 插件管理（独立 plugins:read/write，不复用 users/billing）
+		expect(table["admin.users.startPreview"]).toBe("admin:users:write");
+		expect(table["admin.plugins.list"]).toBe("admin:plugins:read");
+		expect(table["admin.plugins.setEnabled"]).toBe("admin:plugins:write");
+		expect(table["admin.plugins.rotateSecret"]).toBe("admin:plugins:write");
 	});
 
 	it("declares param schemas for every PR3b read method (whitelist + types)", () => {
@@ -978,6 +985,14 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 				amount_nano_cny: 0, reason: "r" }],                               // nonZero
 			["admin.billing.adjust", { user_id: "u1", kind: "grant",
 				amount_nano_cny: 5, reason: "" }],                                // reason minLength
+			// §6.5 PR5 修订：幂等键必须由调用方生成——缺失/null/空串在桥层即拒
+			//（纯空白的 trim 语义归服务端，见 test_admin_billing_writes.py）
+			["admin.billing.adjust", { user_id: "u1", kind: "grant",
+				amount_nano_cny: 5, reason: "r" }],                               // 缺 idempotency_key
+			["admin.billing.adjust", { user_id: "u1", kind: "grant",
+				amount_nano_cny: 5, reason: "r", idempotency_key: null }],       // 不再 nullable
+			["admin.billing.adjust", { user_id: "u1", kind: "grant",
+				amount_nano_cny: 5, reason: "r", idempotency_key: "" }],        // minLength 1
 			["admin.invites.list", { q: "evil" }],                                // 未声明字段
 		];
 		for (let i = 0; i < bad.length; i++) {
@@ -1012,7 +1027,8 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		handle._handleWindowMessage({
 			source: contentWindow,
 			data: requestEnv(nonce, "r2", "admin.billing.adjust",
-				{ user_id: "u1", kind: "grant", amount_nano_cny: 1, reason: "r" }),
+				{ user_id: "u1", kind: "grant", amount_nano_cny: 1, reason: "r",
+					idempotency_key: "adj_retry_same_key" }),
 		});
 		await ticks();
 		expect((responses(posted, "r1")[0].env.error as { code: string }).code)
@@ -1038,6 +1054,179 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		const rs = responses(posted, "r1");
 		expect(rs[0].env.ok).toBe(false);
 		expect((rs[0].env.error as { code: string }).code).toBe("version_conflict");
+	});
+});
+
+describe("AdminBridge host — PR5 UI parity methods (preview + plugins, §10.2)", () => {
+	const PARITY_PERMS = [
+		"admin:users:write", "admin:plugins:read", "admin:plugins:write",
+	];
+
+	it("admin.users.startPreview POSTs /api/admin/preview/start with user_id", async () => {
+		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+		const { handle, posted, contentWindow } = makeHost({
+			permissions: PARITY_PERMS,
+			fetchJson: async (url, o) => {
+				calls.push({
+					url, method: (o as { method?: string } | undefined)?.method,
+					body: JSON.parse(String((o as { body?: string }).body)),
+				});
+				return {
+					status: 200, ok: true,
+					body: { ok: true, preview: { subject_user_id: "usr_9", expires_at: 123 } },
+				};
+			},
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.users.startPreview",
+				{ user_id: "usr_9" }),
+		});
+		await ticks();
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(true);
+		expect(calls).toEqual([{
+			url: "/api/admin/preview/start", method: "POST", body: { user_id: "usr_9" },
+		}]);
+	});
+
+	it("admin.plugins.list GETs /api/admin/plugins verbatim", async () => {
+		const list = {
+			installations: [{
+				installation_id: "inst_1", plugin_id: "sample-tma-score",
+				enabled: true, health: "reachable", capabilities: [],
+			}],
+		};
+		const { handle, posted, contentWindow } = makeHost({
+			permissions: PARITY_PERMS,
+			fetchJson: async (url) => {
+				expect(url).toBe("/api/admin/plugins");
+				return { status: 200, ok: true, body: list };
+			},
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow, data: requestEnv(nonce0(posted), "r1", "admin.plugins.list"),
+		});
+		await ticks();
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(true);
+		expect(rs[0].env.result).toEqual(list);
+	});
+
+	it("admin.plugins.setEnabled maps enabled onto enable/disable path", async () => {
+		const calls: Array<{ url: string; method?: string }> = [];
+		const { handle, posted, contentWindow } = makeHost({
+			permissions: PARITY_PERMS,
+			fetchJson: async (url, o) => {
+				calls.push({ url, method: (o as { method?: string } | undefined)?.method });
+				return { status: 200, ok: true, body: { installation_id: "inst_1" } };
+			},
+		});
+		handle._handleIframeLoad();
+		const nonce = nonce0(posted);
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r1", "admin.plugins.setEnabled",
+				{ installation_id: "inst_1", enabled: false }),
+		});
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r2", "admin.plugins.setEnabled",
+				{ installation_id: "inst_1", enabled: true }),
+		});
+		await ticks();
+		expect(calls[0]).toEqual({ url: "/api/admin/plugins/inst_1/disable", method: "POST" });
+		expect(calls[1]).toEqual({ url: "/api/admin/plugins/inst_1/enable", method: "POST" });
+	});
+
+	it("admin.plugins.rotateSecret POSTs and passes the secret through once", async () => {
+		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+		const { handle, posted, contentWindow } = makeHost({
+			permissions: PARITY_PERMS,
+			fetchJson: async (url, o) => {
+				calls.push({
+					url, method: (o as { method?: string } | undefined)?.method,
+					body: (o as { body?: string } | undefined)?.body
+						? JSON.parse(String((o as { body?: string }).body)) : undefined,
+				});
+				return {
+					status: 200, ok: true,
+					// 新明文 secret 仅本次响应出现（一次性透传给插件 UI 展示）
+					body: { installation_id: "inst_2", secret: "new-secret-once" },
+				};
+			},
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.plugins.rotateSecret",
+				{ installation_id: "inst_2" }),
+		});
+		await ticks();
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(true);
+		expect(rs[0].env.result).toEqual({
+			installation_id: "inst_2", secret: "new-secret-once",
+		});
+		expect(calls).toEqual([{
+			url: "/api/admin/plugins/inst_2/rotate-secret", method: "POST", body: {},
+		}]);
+	});
+
+	it("plugin path params with / are rejected before any backend call; write perms enforced", async () => {
+		const calls: string[] = [];
+		const { handle, posted, contentWindow } = makeHost({
+			permissions: PARITY_PERMS,
+			fetchJson: async (url) => {
+				calls.push(url);
+				return { status: 200, ok: true, body: {} };
+			},
+		});
+		handle._handleIframeLoad();
+		const nonce = nonce0(posted);
+		// 路径参数含 "/" → invalid_params（pathId 防护，后端不可达）
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r1", "admin.plugins.setEnabled",
+				{ installation_id: "inst/../../api/admin/users", enabled: true }),
+		});
+		// schema 门：缺 enabled / 缺 installation_id / 多余字段
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r2", "admin.plugins.setEnabled",
+				{ installation_id: "inst_1" }),
+		});
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r3", "admin.plugins.rotateSecret", {}),
+		});
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r4", "admin.users.startPreview",
+				{ user_id: "u1", extra: 1 }),
+		});
+		await ticks();
+		for (const rid of ["r1", "r2", "r3", "r4"]) {
+			const rs = responses(posted, rid);
+			expect(rs, rid).toHaveLength(1);
+			expect((rs[0].env.error as { code: string }).code).toBe("invalid_params");
+		}
+		expect(calls).toEqual([]);
+		// 权限门：未申请 admin:plugins:* → permission_denied（schema 已过）
+		const { handle: h2, posted: p2, contentWindow: cw2 } = makeHost({
+			permissions: ["admin:users:write"], // 无 plugins 权限
+			fetchJson: async () => ({ status: 200, ok: true, body: {} }),
+		});
+		h2._handleIframeLoad();
+		h2._handleWindowMessage({
+			source: cw2,
+			data: requestEnv(nonce0(p2), "p1", "admin.plugins.list"),
+		});
+		await ticks();
+		expect((responses(p2, "p1")[0].env.error as { code: string }).code)
+			.toBe("permission_denied");
 	});
 });
 

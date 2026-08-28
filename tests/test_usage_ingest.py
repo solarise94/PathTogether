@@ -7,8 +7,8 @@ json 模式（无 PG）：鉴权链 + fail-closed——
   - json 后端 → 503 pg_backend_required（稳定 code，不降级）。
 
 PG 模式（RUN_PG_TESTS=1）：schema 正例、幂等重放、payload/call_id 冲突、
-主体绑定各路径（reservation 匹配 / demo session / run grant 交叉校验 /
-assertion 冲突 / not_ready 可重试）、未知模型与缺价格 unpriced、时钟 skew
+主体绑定各路径（reservation 匹配 / demo session / run grant 仅交叉校验不
+补位、assertion 冲突 / not_ready 可重试）、未知模型与缺价格 unpriced、时钟 skew
 两条（含 BILLING_OCCURRED_AT_MAX_AGE_DAYS 可配）、算术不符 unpriced、
 影子阶段 ledger 为空、demo 主体不入 ledger/不开户、敏感字段不出现在
 响应与 audit。
@@ -379,7 +379,15 @@ def test_subject_resolution_paths():
 
 
 @PG
-def test_subject_via_run_grant_and_cross_check():
+def test_subject_run_grant_cross_check_only_no_fallback():
+    """§7.2 步骤 3（PR5 修订锁定）：run grant 只做交叉校验，不做主体来源。
+
+    ① 无 reservation/demo，仅 session 绑定了 run grant → 409 not_ready
+      （可重试）——grant 创建者绝不补位充当权威主体（run grant 只覆盖需要
+      写能力的 run，不能作为只读调用唯一的主体来源）；
+    ② 同 session 两个不同创建者的 grant → 确定性 409 usage_subject_conflict；
+    ③ grant 创建者与权威主体（reservation）不一致 → 确定性 409。
+    """
     import user_store
     inst = _bootstrap()
     token = _token_for(inst)
@@ -387,8 +395,7 @@ def test_subject_via_run_grant_and_cross_check():
     creator = user_store.create_user("grantor@x.com", "pass123456789012")
     other = user_store.create_user("other@x.com", "pass123456789012")
 
-    # ① 无 reservation/demo，但 session 有已绑定 run grant（installation 匹配）
-    # → grant 创建者作为权威主体来源
+    # ① 仅 run grant（无 reservation/demo）→ not_ready，不入账
     event = _fresh(bh.load_event(
         "06_user_priced_flash_no_provider_request_id.json"))
     event["request_id"] = None
@@ -400,13 +407,31 @@ def test_subject_via_run_grant_and_cross_check():
         created_by_user_id=creator["user_id"])
     share_store.bind_run_grant_session(grant["grant_id"], event["session_id"])
     r = _post(event, token=token)
-    assert r.status_code == 200, r.get_data(as_text=True)
+    _assert_envelope(r, 409, "usage_subject_not_ready", retryable=True)
     import billing_store
-    row = billing_store.get_usage_event(event["event_id"])
-    assert row["subject_id"] == creator["user_id"]
-    assert row["user_id"] == creator["user_id"]
+    assert billing_store.get_usage_event(event["event_id"]) is None
 
-    # ② grant 创建者与权威主体（reservation）不一致 → 确定性 409
+    # ② 同 session 多创建者 grant（含已撤销的失效 grant——交叉校验保留对
+    # 失效行的覆盖）→ 确定性冲突
+    clash_multi = _fresh(bh.load_event(
+        "02_user_priced_pro_offpeak_reasoning.json"))
+    clash_multi["request_id"] = "req_grant_multi_creator"
+    clash_multi["subject_type"] = "user"
+    clash_multi["subject_id"] = creator["user_id"]
+    clash_multi["user_id"] = creator["user_id"]
+    g1 = share_store.create_run_grant(
+        inst["installation_id"], slide="demo.svs",
+        created_by_user_id=creator["user_id"])
+    g2 = share_store.create_run_grant(
+        inst["installation_id"], slide="demo.svs",
+        created_by_user_id=other["user_id"])
+    share_store.bind_run_grant_session(g1["grant_id"], clash_multi["session_id"])
+    share_store.bind_run_grant_session(g2["grant_id"], clash_multi["session_id"])
+    share_store.revoke_run_grant(g1["grant_id"])  # 失效 grant 仍参与校验
+    r = _post(clash_multi, token=token)
+    _assert_envelope(r, 409, "usage_subject_conflict", retryable=False)
+
+    # ③ grant 创建者与权威主体（reservation）不一致 → 确定性 409
     clash = dict(bh.load_event("02_user_priced_pro_offpeak_reasoning.json"))
     clash["request_id"] = "req_grant_cross_case"
     bh.bind_reservation(clash["request_id"], clash["session_id"],

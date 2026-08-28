@@ -26,7 +26,10 @@
    PR5（本版）补齐全部写方法的后端映射与参数 schema：users.create/
    setEnabled/setAiAccess/resetPassword、invites.list/create/revoke、
    turnBudgets.update/newPeriod、billing.account.updateCaps、billing.adjust
-   （路径参数拒绝含 "/"；POST/PUT 均带 CSRF 双提交）。owner 回查带 5s 短
+   （路径参数拒绝含 "/"；POST/PUT 均带 CSRF 双提交）。PR5 修订再补 UI parity
+   四方法：users.startPreview（§10.2 身份预览，admin:users:write）与
+   plugins.list/setEnabled/rotateSecret（插件管理页，admin:plugins:read|write；
+   运行时 /install 不上桥——§16 发布走版本化 releases）。owner 回查带 5s 短
    TTL 缓存（见 makeOwnerGuard——缓存只是省一次每消息 HTTP，服务端每 API
    独立复核不受影响；401 登出仍立即作废整个桥会话）。
    ========================================================================= */
@@ -69,6 +72,14 @@
     "admin.acquisition.summary": "admin:acquisition:read",
     "admin.acquisition.list": "admin:acquisition:read",
     "admin.audit.list": "admin:audit:read",
+    // PR5 修订（UI parity 恢复旧侧栏功能面）：身份预览（§10.2 用户行操作）
+    // 走 admin:users:write（服务端 /api/admin/preview/start 是写 session 的
+    // owner-only 操作）；插件管理（列表/健康/启停/凭证轮换）用独立的
+    // admin:plugins:read/write，不复用 users/billing 权限。
+    "admin.users.startPreview": "admin:users:write",
+    "admin.plugins.list": "admin:plugins:read",
+    "admin.plugins.setEnabled": "admin:plugins:write",
+    "admin.plugins.rotateSecret": "admin:plugins:write",
   };
 
   // 参数 schema（§14.1：每方法白名单 + 类型/长度/枚举/范围；未声明属性
@@ -227,11 +238,46 @@
         },
         amount_nano_cny: { type: "integer", nonZero: true },
         reason: { type: "string", minLength: 1, maxLength: 500 },
+        // §6.5 PR5 修订：幂等键必须由调用方（插件 UI）生成，桥层与服务端
+        // 双重 required——服务端已入账 + 浏览器超时的重试必须带同一 key 命中
+        // duplicate，缺失/空串在桥层即拒绝（不再 nullable）。
         idempotency_key: {
-          type: "string", minLength: 1, maxLength: 128, nullable: true,
+          type: "string", minLength: 1, maxLength: 128,
         },
       },
-      required: ["user_id", "kind", "amount_nano_cny", "reason"],
+      required: ["user_id", "kind", "amount_nano_cny", "reason",
+                 "idempotency_key"],
+      additionalProperties: false,
+    },
+
+    // ---- PR5 修订（UI parity）：身份预览 + 插件管理 ----
+    // 预览进入（旧侧栏「身份预览」入口恢复）：写 owner session，归
+    // admin:users:write；停止预览不做桥方法——宿主页 Viewer 右上角自带
+    // stop 按钮（iframe 无 allow-top-navigation，插件不能也不应跳转宿主）。
+    "admin.users.startPreview": {
+      properties: { user_id: _userIdSpec },
+      required: ["user_id"],
+      additionalProperties: false,
+    },
+    // 插件安装列表（含 sidecar 健康快照）；无分页（服务端全量返回）
+    "admin.plugins.list": { properties: {}, additionalProperties: false },
+    // 启停安装行（enable/disable 映射到两个后端路径）；installation_id
+    // 走 pathId 防护（拒绝空值/含 "/"，见 METHOD_BACKENDS）
+    "admin.plugins.setEnabled": {
+      properties: {
+        installation_id: { type: "string", minLength: 1, maxLength: 128 },
+        enabled: { type: "boolean" },
+      },
+      required: ["installation_id", "enabled"],
+      additionalProperties: false,
+    },
+    // 轮换安装凭证：响应原样透传——新明文 secret 仅此一次展示（插件 UI
+    // 一次性显示 + 复制按钮，绝不落 localStorage）
+    "admin.plugins.rotateSecret": {
+      properties: {
+        installation_id: { type: "string", minLength: 1, maxLength: 128 },
+      },
+      required: ["installation_id"],
       additionalProperties: false,
     },
   };
@@ -629,6 +675,29 @@
         reason: payload.reason,
         idempotency_key: payload.idempotency_key,
       })(ctx);
+    },
+
+    // ---- PR5 修订（UI parity）：身份预览 + 插件管理（旧 /api/admin/* 端点，
+    // 非 v1——预览与插件管理 API 先于 Admin API v1 存在，沿用原路径）----
+    "admin.users.startPreview": function (ctx, payload) {
+      return jsonWrite("/api/admin/preview/start", "POST", {
+        user_id: payload.user_id,
+      })(ctx);
+    },
+
+    "admin.plugins.list": jsonGet("/api/admin/plugins"),
+
+    "admin.plugins.setEnabled": function (ctx, payload) {
+      var url = "/api/admin/plugins/" +
+          pathId(payload.installation_id, "installation_id") +
+          (payload.enabled ? "/enable" : "/disable");
+      return jsonWrite(url, "POST", {})(ctx);
+    },
+
+    "admin.plugins.rotateSecret": function (ctx, payload) {
+      var url = "/api/admin/plugins/" +
+          pathId(payload.installation_id, "installation_id") + "/rotate-secret";
+      return jsonWrite(url, "POST", {})(ctx);
     },
   };
 

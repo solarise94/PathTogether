@@ -14,8 +14,9 @@ PG 模式（RUN_PG_TESTS=1）：
   - caps：未开户 404 / CAS 版本冲突 409 / null 清除 / soft>hard 400 /
     非 NEG 400 / 与 audit 同事务（强制 audit 失败 → caps 未落库）；
   - adjustments：kind 符号 400（grant 负数、manual_adjustment 0）/
-    reason 空 400 / grant 未开户自动开户 / refund 未开户 404 / 幂等键重放
-    duplicate:true 不重复入账 / audit 同事务回滚（ledger 无残留）；
+    reason 空 400 / 缺 idempotency_key 400（§6.5 PR5 修订：调用方生成，
+    服务端不代生成）/ grant 未开户自动开户 / refund 未开户 404 / 幂等键
+    重放 duplicate:true 不重复入账 / audit 同事务回滚（ledger 无残留）；
   - invites：创建（含 source_code/campaign slug 校验）token 仅一次 + 列表
     永不回 token / 撤销 / 已消费拒绝撤销 / 不存在 404；
   - turn-budgets：PUT 全字段校验（未知字段 400、子池和 > platform 400），
@@ -430,16 +431,19 @@ def test_adjustment_refund_requires_existing_account():
     uid = usera["user_id"]
     # refund / manual_adjustment 未开户 → 404（不隐式开户）
     r = _adjust(c, {"user_id": uid, "kind": "refund",
-                    "amount_nano_cny": 100, "reason": "r"})
+                    "amount_nano_cny": 100, "reason": "r",
+                    "idempotency_key": "adj_refund_no_acct"})
     assert r.status_code == 404
     assert r.get_json()["error"]["code"] == "billing_account_not_found"
     r = _adjust(c, {"user_id": uid, "kind": "manual_adjustment",
-                    "amount_nano_cny": -100, "reason": "r"})
+                    "amount_nano_cny": -100, "reason": "r",
+                    "idempotency_key": "adj_manual_no_acct"})
     assert r.status_code == 404
     assert _pg_count("billing_accounts") == 0
     # 用户不存在 → user_not_found
     r = _adjust(c, {"user_id": "ghost", "kind": "grant",
-                    "amount_nano_cny": 1, "reason": "r"})
+                    "amount_nano_cny": 1, "reason": "r",
+                    "idempotency_key": "adj_ghost_user"})
     assert r.status_code == 404
     assert r.get_json()["error"]["code"] == "user_not_found"
 
@@ -454,6 +458,9 @@ def test_adjustment_idempotent_replay():
                      "amount_nano_cny": 2_000_000_000, "reason": "一次就好",
                      "idempotency_key": key})
     assert r1.status_code == 200
+    # UI 语义（PR5 §6.5 修订）：插件在「一次逻辑提交」内生成一个 key，服务端
+    # 已入账但浏览器超时后管理员直接重试（表单未动 → 复用同 key 同载荷），
+    # 必须命中 duplicate 而不是二次入账。
     r2 = _adjust(c, {"user_id": uid, "kind": "grant",
                      "amount_nano_cny": 2_000_000_000, "reason": "一次就好",
                      "idempotency_key": key})
@@ -512,20 +519,31 @@ def test_adjustment_audit_same_transaction_rollback(monkeypatch):
 
 
 @PG
-def test_adjustment_server_generates_idempotency_key():
-    """缺省 idempotency_key → 服务端生成 adj_<hex>；两次独立调用各自入账。"""
+def test_adjustment_requires_caller_generated_idempotency_key():
+    """§6.5 PR5 修订：幂等键必须由调用方生成——缺失/空白一律 400，不代生成。
+
+    服务端代生成会让「已入账 + 浏览器超时 + 重试」以新 key 产出第二笔账，
+    因此这里锁定：缺 key 的合法载荷也绝不入账。
+    """
     owner, usera = _setup_users()
     c = _login(_client(), owner)
     uid = usera["user_id"]
-    for _ in range(2):
-        r = _adjust(c, {"user_id": uid, "kind": "topup",
-                        "amount_nano_cny": 100, "reason": "r"})
-        assert r.status_code == 200
-    assert _pg_count("billing_ledger_entries") == 2
-    # 坏形态 idempotency_key → 400
+    billing_store.create_billing_account(uid)
+    # 缺 key / None / 空白 / 全空格 / 超长 → 400 invalid_request（旧版会代生成）
+    for bad in (None, "", "  ", "x" * 129):
+        body = {"user_id": uid, "kind": "topup",
+                "amount_nano_cny": 100, "reason": "r"}
+        if bad is not None:
+            body["idempotency_key"] = bad
+        r = _adjust(c, body)
+        assert r.status_code == 400, repr(bad)
+        assert r.get_json()["error"]["code"] == "invalid_request"
+    assert _pg_count("billing_ledger_entries") == 0
+    # 带调用方生成的 key → 正常入账
     r = _adjust(c, {"user_id": uid, "kind": "topup", "amount_nano_cny": 100,
-                    "reason": "r", "idempotency_key": "  "})
-    assert r.status_code == 400
+                    "reason": "r", "idempotency_key": "adj_caller_gen_1"})
+    assert r.status_code == 200, r.get_json()
+    assert _pg_count("billing_ledger_entries") == 1
 
 
 # --------------------------------------------------------------------------- #

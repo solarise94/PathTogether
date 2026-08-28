@@ -4,7 +4,7 @@
 >
 > 日期：2026-08-28
 >
-> 版本：v0.2（已吸收代码/部署审阅意见并二次核实）
+> 版本：v0.3（v0.2 基础上吸收 PR5 外部 review 的 P1 修订，见文末「v0.3 修订记录」）
 >
 > 范围：PathTogether + HistoPilot + mywebpage 来源入口；HistoPilot-DSH 协议不改
 >
@@ -377,7 +377,7 @@ CREATE TABLE billing_ledger_entries (
 
 - 充值/赠送/退款为正，消费/过期为负，人工调整不得为 0；这些符号语义由数据库 `CHECK` 强制；
 - usage debit 的 idempotency key 固定为 `usage:<event_id>`；
-- 人工调整必须提供非空 `reason` 和调用方生成的 `idempotency_key`；
+- 人工调整必须提供非空 `reason` 和调用方生成的 `idempotency_key`（PR5 修订：服务端**不再代生成**，缺失/空白一律 400 `invalid_request`——代生成会让「服务端已入账 + 浏览器超时 + 重试」以新 key 产出第二笔账；调用方 UI 在一次逻辑提交的全部重试中复用同一 key）；
 - owner 不能编辑或删除已有 ledger entry；冲正必须追加新 entry；
 - `event_id` 对 `kind='usage_debit'` 只允许一条，可用部分唯一索引保证；
 - 写入 ledger 与 audit event 必须同一 PostgreSQL 事务提交。
@@ -614,6 +614,7 @@ admin.users.create
 admin.users.setEnabled
 admin.users.setAiAccess
 admin.users.resetPassword
+admin.users.startPreview
 admin.invites.list/create/revoke
 admin.turnBudgets.get/update/newPeriod
 admin.billing.account.get
@@ -624,6 +625,7 @@ admin.billing.ledger.list
 admin.billing.providerBalance.get
 admin.acquisition.summary/list
 admin.audit.list
+admin.plugins.list/setEnabled/rotateSecret
 ```
 
 Host 校验 plugin ID、协商版本、request ID、method、参数 schema、manifest 申请权限和当前 actor。Host 使用现有 `apiFetch`/CSRF 逻辑请求 PathTogether API；不向 iframe返回 CSRF token、session 内容或通用 fetch 能力。
@@ -645,6 +647,9 @@ Bridge 方法到 manifest permission 的映射是代码级常量，未知方法�
 | `admin.billing.account.updateCaps/adjust` | `admin:billing:write` |
 | `admin.acquisition.summary/list` | `admin:acquisition:read` |
 | `admin.audit.list` | `admin:audit:read` |
+| `admin.users.startPreview`（PR5 修订：§10.2 身份预览入口；POST /api/admin/preview/start） | `admin:users:write` |
+| `admin.plugins.list`（PR5 修订：插件列表+健康；GET /api/admin/plugins） | `admin:plugins:read` |
+| `admin.plugins.setEnabled/rotateSecret`（PR5 修订：启停+凭证轮换，新 secret 仅一次透传；运行时 `/install` 不上桥——发布走 §16 版本化 releases） | `admin:plugins:write` |
 
 ## 9. Admin API v1
 
@@ -808,8 +813,8 @@ CREATE TABLE user_acquisition (
 - 不保存完整 IP，只保存带轮换盐的 IP 前缀 hash，且仅作反滥用/粗粒度统计；
 - referrer 只保留 hostname，不保存 query；
 - UTM 每字段限制长度并清理控制字符；
-- 匿名 visit 默认 90 天清理；
-- 用户归因长期保留 campaign/source，但不复制原始 IP/referrer；
+- 匿名 visit 默认 90 天清理；用户归因长期保留 campaign/source，但不复制原始 IP/referrer。PR5 修订（落地语义）：到期触点按引用关系分流——未被 `user_acquisition` 引用的行直接删除；被 first/last_acquisition_id 引用的行保留骨架（acquisition_id/source_code/campaign_id/touched_at），但把 `ip_prefix_hash`、`referrer_domain`、`utm_source`、`utm_medium`、`utm_campaign`、`landing_path`、`visitor_id_hash`（匿名联结键，过期后不再参与归因，一并置空以免延长可重识别窗口）全部置空串。两类处理由 `acquisition_store.run_visit_retention()` 单事务完成、幂等可重叠调度；
+- 每日 retention 调度（PR5 修订）：PathTogether 启动后台 daemon 线程（env `ACQ_RETENTION_INTERVAL_SECONDS`，默认 86400；`<=0` 关闭；仅 PG backend 启动；循环内异常记日志不杀线程），定期执行上述删除+脱敏；多实例重叠安全（幂等），无需 advisory lock；
 - 后台小样本来源统计应避免暴露可重新识别的单人组合。
 
 ## 12. 影子计量、软额度和硬额度
@@ -1126,3 +1131,13 @@ plugins/histopilot -> releases/histopilot-<version>
 10. 达到 §14 的观察门槛后，扣费仍需单独显式开启，不能随部署自动生效。
 
 在此之前，状态只能标为“设计”“实现中”“影子计量”或“灰度”，不得标为“计费已上线”。
+
+## 19. v0.3 修订记录（2026-08-28）
+
+PR5 外部 review 的 5 个 P1 阻断项，根因与修法各一句话：
+
+1. **人工调账幂等键**：服务端曾对缺省 `idempotency_key` 代生成 `adj_<hex>`，使超时重试绕过幂等去重产出第二笔账；改为调用方（插件 UI，`crypto.getRandomValues` 生成 `adj_<32hex>`，同一逻辑提交的重试复用）生成，桥层与服务端双重 required，缺失一律 400（§6.5）。
+2. **计费主体解析 run grant 回退**：`_resolve_usage_subject` 曾在 reservation/demo 均未命中时用 run grant 创建者补位充当权威主体，违反 §7.2 步骤 3「run grant 不能作为只读调用唯一的主体来源」；删除该回退（grant 查询只保留交叉校验语义，且继续覆盖失效/撤销行），①② 未命中一律 409 `usage_subject_not_ready`（可重试）。
+3. **来源触点 90 天保留未真正落地**：旧 `cleanup_expired_visits` 只删未被引用的过期行，被归因引用的触点连同 IP 前缀 hash/referrer/UTM/landing/visitor 联结键被永久保留，且该函数无生产调度入口；新增 `run_visit_retention()`（单事务：未引用过期行删除 + 已归因过期行七字段脱敏置空，幂等返回计数）并由 `ACQ_RETENTION_INTERVAL_SECONDS`（默认 86400、≤0 关闭、仅 PG）驱动的后台 daemon 每日执行（§11.3）。
+4. **UI parity 缺口**：旧侧栏删除后「身份预览」与「插件管理」（列表/健康/启停/凭证轮换）失去 UI 入口（API 均在）；补 `admin:plugins:read/write` 权限枚举（manifest/schema/pin 三处同步）、AdminBridge 四方法（`admin.users.startPreview`、`admin.plugins.list/setEnabled/rotateSecret`）与插件 UI 用户页预览按钮 + 插件页（§8.4/§10.2；运行时 `/install` 不上 UI，发布走 §16 版本化 releases）。
+5. **§7.2 步骤 3 保持原文**：核对后实现已按上述第 2 条对齐方案原文（交叉校验语义），规格无需改动，仅实现侧删除与原文冲突的回退分支及其 docstring。

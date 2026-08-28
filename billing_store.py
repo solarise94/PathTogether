@@ -404,11 +404,13 @@ def _resolve_usage_subject(cur, event, installation_id):
     （capability id）。不过滤过期：计量归属是历史事实，过期 capability 的
     事件仍应入账（只计量、不开户、不写 ledger）。
 
-    ③ run_grants 交叉校验：取该 session 绑定、且属于当前 installation 的
-    grant（不过滤过期/撤销——grant 行仍记录 run 创建者）；同 session 多
-    grant 创建者不一致 → 确定性冲突；resolved 主体为 owner/user 时创建者
-    必须一致；无 ①② 来源时 grant 创建者可作为 owner/user 主体来源（run
-    grant 只覆盖写能力 run，不因此影响只读调用的 ①② 路径）。
+    ③ run_grants **仅交叉校验**（§7.2 步骤 3 原文：run grant 只覆盖需要写
+    能力的 run，不能作为只读调用唯一的主体来源）：取该 session 绑定、且
+    属于当前 installation 的 grant——同 session 多 grant 创建者不一致 →
+    确定性冲突；①② 已解析出 owner/user 主体时 grant 创建者必须一致。查询
+    不过滤过期/撤销 grant（失效行仍记录着 run 创建者，历史事件的交叉校验
+    依赖它），但**绝不**用 grant 创建者补位充当权威主体：①② 均未命中 →
+    usage_subject_not_ready（可重试），不按 grant 或 body 入账。
 
     ④ body 的 subject_type/subject_id/user_id 只是 assertion：与权威解析
     不一致 → 409 usage_subject_conflict（确定性）；完全没有权威来源 → 409
@@ -437,6 +439,10 @@ def _resolve_usage_subject(cur, event, installation_id):
         if demo is not None:
             resolved = ("demo", demo["id"])
 
+    # ③ 交叉校验（只校验、不补位）：失效/撤销 grant 也在查询范围内——过期
+    # 不改变「谁创建过这个 run」的历史事实，删掉会让迟到的 usage 事件失去
+    # 冲突检测维度。PR5 修订：删除「无 ①② 来源时以 grant 创建者当主体」的
+    # 回退（§7.2：run grant 只覆盖写能力 run，不能作为只读调用的主体来源）。
     cur.execute(
         "SELECT grant_id, installation_id, created_by_user_id "
         "FROM run_grants WHERE session_id=%s", (session_id,))
@@ -453,15 +459,11 @@ def _resolve_usage_subject(cur, event, installation_id):
             and grant_user and grant_user != resolved[1]:
         raise UsageSubjectConflictError(
             "run grant 创建者与权威主体不一致", session_id=session_id)
-    if resolved is None and grant_user:
-        cur.execute("SELECT role FROM users WHERE user_id=%s", (grant_user,))
-        row = cur.fetchone()
-        if row is not None and row["role"] in ("owner", "user"):
-            resolved = (row["role"], grant_user)
 
     if resolved is None:
         raise UsageSubjectNotReadyError(
-            "权威主体绑定行不存在或未就绪（reservation/demo session/run grant）",
+            "权威主体绑定行不存在或未就绪（reservation/demo session；"
+            "run grant 仅交叉校验不构成主体来源）",
             session_id=session_id)
     if (event["subject_type"], event["subject_id"]) != resolved:
         raise UsageSubjectConflictError(

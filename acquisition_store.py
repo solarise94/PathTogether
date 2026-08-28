@@ -14,8 +14,10 @@ fail-closed（json/dual 稳定 ``pg_backend_required``）。**例外**是纯计�
     优先级严格按 §11.2：邀请码显式 campaign > 有效 pt_acq 触点（未过期，按
     touched_at/acquisition_id 稳定选 first/last）> sanitized referrer/UTM >
     direct/unknown；``attribution_method`` 记录走了哪条路径；
-  - 匿名触点 90 天清理 ``cleanup_expired_visits``（只删未被 user_acquisition
-    引用的过期行；已归因行由 FK 兜底永不删）；
+  - 匿名触点 90 天清理 ``run_visit_retention``（§11.3）：过期未引用行删除、
+    过期已归因行保留骨架但脱敏（IP/referrer/UTM/landing/visitor hash 全部
+    置空，只留 source/campaign/时间）；由 app.py 的 acquisition retention
+    daemon 每日调度；
   - admin 汇总：campaign/source → 访问 → 注册 → 首次 AI 漏斗
     （首次 AI = ai_usage_events 每用户最早 occurred_at）与用户来源明细分页。
 
@@ -472,13 +474,32 @@ def user_acquisition_by_ids(user_ids):
 
 
 # --------------------------------------------------------------------------- #
-# 匿名触点 90 天清理
+# 匿名触点 90 天保留（§11.3：过期清理 + 已归因行脱敏，单事务）
 # --------------------------------------------------------------------------- #
-def cleanup_expired_visits() -> int:
-    """删除过期且未被 user_acquisition 引用的触点行，返回删除数。
+#: 过期已归因触点要脱敏清空的字段（§11.3「用户归因长期保留 campaign/source，
+#: 但不复制原始 IP/referrer」的落地清单）。visitor_id_hash 一并置空：它是
+#: 匿名联结键，过期后不再参与归因（insert_user_acquisition 只取
+#: expires_at>now() 的行），保留只会延长可重识别窗口；代价是 admin 来源
+#: 明细页该行 first/last touch 的 visitor 前缀显示为空——归因事实（source/
+#: campaign/时间）不受影响，属 §11.3 允许的取舍。
+_SCRUB_FIELDS = (
+    "ip_prefix_hash", "referrer_domain", "utm_source", "utm_medium",
+    "utm_campaign", "landing_path", "visitor_id_hash",
+)
 
-    已归因行（first/last_acquisition_id 引用）由 WHERE NOT EXISTS 排除，且
-    FK 兜底——用户归因长期保留 campaign/source，被引用触点不随匿名清理消失。
+
+def run_visit_retention():
+    """匿名触点 90 天保留（§11.3），单事务完成两类处理：
+
+    1. 过期且**未被** user_acquisition 引用的行 → 删除（匿名数据到期即清）；
+    2. 过期且**被** first/last_acquisition_id 引用的行 → 不删（FK + 长期
+       保留 campaign/source），但把 ``_SCRUB_FIELDS`` 全部置空串：归因已
+       完成，IP 前缀 hash/referrer/UTM/landing/visitor 联结键不再有保留
+       依据。
+
+    幂等：脱敏 UPDATE 带 ``<>''`` 条件，重复执行匹配 0 行；删除集与脱敏集
+    互斥（引用与否），多实例重叠调度安全（无需 advisory lock）。返回
+    ``(deleted, scrubbed)`` 计数。
     """
     platform_features.require_pg_backend("acquisition")
     conn = _connect()
@@ -491,9 +512,31 @@ def cleanup_expired_visits() -> int:
                     " SELECT 1 FROM user_acquisition ua WHERE "
                     " ua.first_acquisition_id=v.acquisition_id OR "
                     " ua.last_acquisition_id=v.acquisition_id)")
-                return int(cur.rowcount or 0)
+                deleted = int(cur.rowcount or 0)
+                cur.execute(
+                    "UPDATE acquisition_visits v SET "
+                    + ", ".join("%s=''" % f for f in _SCRUB_FIELDS) +
+                    " WHERE v.expires_at<now() "
+                    "AND EXISTS ("
+                    " SELECT 1 FROM user_acquisition ua WHERE "
+                    " ua.first_acquisition_id=v.acquisition_id OR "
+                    " ua.last_acquisition_id=v.acquisition_id) "
+                    "AND (" + " OR ".join(
+                        "v.%s<>''" % f for f in _SCRUB_FIELDS) + ")")
+                scrubbed = int(cur.rowcount or 0)
+        return (deleted, scrubbed)
     finally:
         conn.close()
+
+
+def cleanup_expired_visits() -> int:
+    """兼容包装：只删过期未引用行，返回删除数（PR5 之前的生产入口形态）。
+
+    新调度（app.py retention daemon）与测试应使用 ``run_visit_retention``
+    ——只删不脱敏会把被引用触点的 IP/referrer/UTM 永久留在库里（本次 PR5
+    修复的缺口）。保留本函数是给潜在的外部脚本一个不意外扩权的过渡。
+    """
+    return run_visit_retention()[0]
 
 
 # --------------------------------------------------------------------------- #

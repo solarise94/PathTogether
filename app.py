@@ -5863,7 +5863,9 @@ def admin_v1_billing_adjustments():
     - grant/topup：未开户**同事务显式开户**后入账；refund/manual_adjustment
       未开户 404（不隐式开户）；
     - 符号先在路由层校验（400，不靠 DB CHECK 500）；reason 必填（trim ≥1，
-      ≤500）；idempotency_key 缺省服务端生成 ``adj_<hex>``；
+      ≤500）；idempotency_key 必须由调用方生成（§6.5 PR5 修订）：缺失/空白
+      一律 400 invalid_request，服务端**不再代生成**——否则「服务端已入账 +
+      浏览器超时 + 管理员重试」会以新 key 产出第二笔账；
     - 入账 + audit 同一事务；幂等键重放返回原 entry + duplicate:true（200）。
     """
     auth = _require_owner_admin_v1()
@@ -5899,14 +5901,15 @@ def admin_v1_billing_adjustments():
             400, "invalid_request",
             "reason 上限 %d 字符" % billing_store.ADJUSTMENT_REASON_MAX_LENGTH)
     idem = body.get("idempotency_key")
-    if idem is not None and (not isinstance(idem, str)
-                             or not idem.strip() or len(idem) > 128):
-        return _admin_v1_error(400, "invalid_request",
-                               "idempotency_key 需为 ≤128 字符的非空字符串")
+    if not isinstance(idem, str) or not idem.strip() or len(idem) > 128:
+        # §6.5 PR5 修订：幂等键必须由调用方生成；缺失/空白/超长一律 400，
+        # 服务端绝不代生成（代生成会让超时重试绕过幂等去重）。
+        return _admin_v1_error(
+            400, "invalid_request",
+            "缺少 idempotency_key（调用方生成；同一逻辑提交的重试必须复用同 key）")
+    idem = idem.strip()
     if user_store.get_user(user_id) is None:
         return _admin_v1_error(404, "user_not_found", "用户不存在")
-    if not idem:
-        idem = "adj_" + secrets.token_hex(16)
     try:
         result = billing_store.apply_billing_adjustment(
             user_id, kind, amount, reason.strip(), idem,
@@ -9116,6 +9119,48 @@ def _start_budget_reclaim_thread():
 
 
 _BUDGET_RECLAIM_THREAD = _start_budget_reclaim_thread()
+
+
+def _start_acquisition_retention_thread():
+    """postgres 后端启动来源触点 90 天保留调度线程（§11.3，PR5）。
+
+    - ``ACQ_RETENTION_INTERVAL_SECONDS``：间隔秒数（默认 86400 = 每日）；
+      ``0`` 或负数 = 关闭（测试可显式置 0 隔离）；
+    - 每轮执行 ``acquisition_store.run_visit_retention``（过期未引用行删除
+      + 过期已归因行脱敏，单事务幂等）——多实例重叠调度安全（删除/脱敏均
+      幂等，无需 advisory lock）；
+    - daemon 线程：循环内异常吞掉记日志（下一轮重试），不杀线程、不阻塞停机。
+    """
+    if not platform_features.budget_features_available():
+        return None
+    try:
+        interval = float(
+            os.environ.get("ACQ_RETENTION_INTERVAL_SECONDS") or 86400)
+    except (TypeError, ValueError):
+        interval = 86400.0
+    if interval <= 0:
+        return None
+
+    def _loop():
+        while True:
+            time.sleep(interval)
+            try:
+                deleted, scrubbed = acquisition_store.run_visit_retention()
+                if deleted or scrubbed:
+                    app.logger.info(
+                        "acquisition retention：删除过期触点 %d 行，脱敏已归因触点 %d 行",
+                        deleted, scrubbed)
+            except Exception:
+                app.logger.warning(
+                    "acquisition retention 执行失败（下一轮重试）", exc_info=True)
+
+    th = threading.Thread(target=_loop, name="acquisition-retention",
+                          daemon=True)
+    th.start()
+    return th
+
+
+_ACQUISITION_RETENTION_THREAD = _start_acquisition_retention_thread()
 
 
 # --------------------------------------------------------------------------- #

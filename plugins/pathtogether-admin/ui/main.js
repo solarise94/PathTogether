@@ -13,7 +13,8 @@
        二次确认一律用页内确认条（§3.3）；
      - PR5 写操作：创建用户、启停/AI access/重置密码、邀请创建/撤销、turn
        预算编辑与开新周期、caps 编辑（CAS）、人工调账（CNY→nano 全字符串
-       换算，禁 float）。表单校验只是体验层，权威校验在服务端。
+       换算，禁 float；幂等键由本端生成并在同一逻辑提交的重试间复用，§6.5）。
+       表单校验只是体验层，权威校验在服务端。
    渲染只用 textContent / createElement（不拼 HTML，插件数据永不进标记）。
  ========================================================================= */
 (function () {
@@ -38,12 +39,20 @@
     filters: { users: {}, usage: {}, audit: {} },
     // 金额账户卡当前查询结果（caps 编辑器提交 CAS version 用；仅内存）
     account: null,
+    // 人工调账幂等键（§6.5 PR5 修订：必须由调用方生成，服务端缺失即 400）。
+    // 一次逻辑提交（用户点确认执行那一刻）生成一个 key，失败重试复用同 key
+    // （服务端已入账 + 浏览器超时的场景，重试必须命中 duplicate 而不是二次
+    // 入账）；成功或表单任一字段（user/kind/金额/reason）被修改后才换新 key。
+    adjustIdem: null,
+    // adjustIdem 生成时的表单指纹（user/kind/金额/reason 四元组）：指纹变化
+    // = 用户改了载荷 = 新的逻辑提交 → 下次提交前换新 key。
+    adjustFingerprint: null,
   };
 
   // 深链起始页（PR5 /admin#invites 兼容）：宿主把父页 hash 透传到本 iframe
   // 自身 URL；只接受已知页面 slug，其余回概览。
   function initialPageFromHash() {
-    var pages = ["overview", "users", "invites", "billing", "audit"];
+    var pages = ["overview", "users", "invites", "billing", "plugins", "audit"];
     var hash = "";
     try { hash = window.location.hash || ""; } catch (e) { hash = ""; }
     var name = hash.replace(/^#/, "");
@@ -61,6 +70,7 @@
       users: $("adm-page-users"),
       invites: $("adm-page-invites"),
       billing: $("adm-page-billing"),
+      plugins: $("adm-page-plugins"),
       audit: $("adm-page-audit"),
     },
     errorCard: $("adm-error-card"),
@@ -433,7 +443,8 @@
     state.account = null;
     ["adm-users-tbody", "adm-usage-tbody", "adm-unpriced-tbody",
      "adm-ledger-tbody", "adm-audit-tbody", "adm-invites-tbody",
-     "adm-acq-funnel-tbody", "adm-acq-users-tbody"].forEach(function (id) {
+     "adm-acq-funnel-tbody", "adm-acq-users-tbody",
+     "adm-plugins-tbody"].forEach(function (id) {
       var el = $(id);
       if (el) el.textContent = "";
     });
@@ -487,9 +498,9 @@
     });
   }
 
-  // 行内操作（§10.2）：启停 / AI access / 重置密码（仅普通用户）/ 打开账本。
-  // owner 行不提供禁用与重置（break-glass 不变量，服务端同样 409）；禁用与
-  // 重置密码为危险操作，走页内确认条。
+  // 行内操作（§10.2）：身份预览 / 启停 / AI access / 重置密码（仅普通用户）/
+  // 打开账本。owner 行不提供禁用与重置（break-glass 不变量，服务端同样 409）；
+  // 禁用、重置密码与身份预览为危险操作，走页内确认条。
   function renderUserActions(u) {
     var cell = document.createElement("td");
     cell.className = "adm-actions-cell";
@@ -513,10 +524,33 @@
         askResetPassword(u);
       }));
     }
+    cell.appendChild(actionBtn("身份预览", function () {
+      askConfirm($("adm-users-confirm"),
+        "确认以 " + (u.display_name || u.user_id) + " 的身份进入只读预览？" +
+        "预览期间以该用户视角使用 Viewer；管理写操作仍要求真实 owner（被拒绝）。",
+        function () { startPreviewFor(u); });
+    }));
     cell.appendChild(actionBtn("打开账本", function () {
       openLedgerForUser(u.user_id);
     }));
     return cell;
+  }
+
+  // 身份预览（§10.2，PR5 修订恢复入口）：进入后宿主页 effective subject 变为
+  // 目标用户。本 iframe 是 opaque origin（sandbox 无 allow-top-navigation），
+  // 不能也不应把宿主导航到 Viewer——只提示 owner 手动切换标签页；停止按钮
+  // 在宿主页右上角的预览横幅（app.js），不经桥。
+  function startPreviewFor(u) {
+    request("admin.users.startPreview", { user_id: u.user_id })
+      .then(function (res) {
+        var until = res && res.preview && res.preview.expires_at
+          ? "（至 " + fmtTs(res.preview.expires_at) + " 自动退出）" : "";
+        setStatus("adm-users-status",
+          "预览已开启，切到 Viewer 标签页查看，右上角可停止" + until);
+      })
+      .catch(function (err) {
+        userWriteDone(err, null, null, "adm-users-status");
+      });
   }
 
   function userWriteDone(err, res, okText, statusId) {
@@ -935,6 +969,29 @@
   // 金额账户管理（§10.4，PR5）：caps 编辑器（版本 CAS）+ 人工调整。
   // 当前查询到的账户缓存在内存 state.account（含 version，供 CAS 提交）。
   // ------------------------------------------------------------------
+  // 调用方生成幂等键（§6.5 PR5 修订：服务端不再代生成）：16 字节随机 →
+  // "adj_" + 32 hex。用 crypto.getRandomValues（opaque sandbox 内可用），
+  // 不依赖 randomUUID 的 secure-context 假设；熵源缺失时宁可拒绝提交也
+  // 不退化为 Math.random（弱 key 会破坏「重试不重复入账」保证）。
+  function newAdjustIdemKey() {
+    var cryptoObj = window.crypto;
+    if (!cryptoObj || typeof cryptoObj.getRandomValues !== "function") {
+      return null;
+    }
+    var buf = new Uint8Array(16);
+    cryptoObj.getRandomValues(buf);
+    var hex = "";
+    for (var i = 0; i < buf.length; i++) {
+      hex += ("0" + buf[i].toString(16)).slice(-2);
+    }
+    return "adj_" + hex;
+  }
+
+  // 当前调整表单指纹：任一字段变化即视为新的逻辑提交（换新幂等键）
+  function adjustFingerprint(uid, kind, amount, reason) {
+    return [uid, kind, amount, reason].join("\u0000");
+  }
+
   function loadBillingAccount() {
     var uid = ($("adm-acct-user") && $("adm-acct-user").value || "").trim();
     var dl = $("adm-acct-info");
@@ -1050,15 +1107,36 @@
       setStatus("adm-adjust-status", "原因必填（≤500 字符）");
       return;
     }
+    // 幂等键生命周期（§6.5 PR5 修订，调用方生成）：
+    //   - 表单指纹与上次不同（首次提交或用户改过任一字段）→ 换新 key；
+    //   - 指纹相同（同一逻辑提交的失败重试）→ 复用旧 key，服务端按 duplicate
+    //     幂等重放，绝不二次入账；
+    //   - 成功后清空，下次提交重新生成。
+    var fingerprint = adjustFingerprint(uid, kind, amount, reason);
+    if (!state.adjustIdem || state.adjustFingerprint !== fingerprint) {
+      var fresh = newAdjustIdemKey();
+      if (!fresh) {
+        setStatus("adm-adjust-status",
+          "浏览器不支持 crypto.getRandomValues，无法生成幂等键（拒绝提交以防重复入账）");
+        return;
+      }
+      state.adjustIdem = fresh;
+      state.adjustFingerprint = fingerprint;
+    }
+    var idemKey = state.adjustIdem;
     askConfirm($("adm-adjust-confirm"),
       "确认对用户 " + uid + " 入账 " + kind + " " + amountText + " CNY（" +
       amount + " nano）？原因：" + reason,
       function () {
-        setStatus("adm-adjust-status", "提交中…");
+        setStatus("adm-adjust-status", "提交中…（失败后可直接重试：将复用同一幂等键，不会重复入账）");
         request("admin.billing.adjust", {
           user_id: uid, kind: kind,
           amount_nano_cny: amount, reason: reason,
+          idempotency_key: idemKey,
         }).then(function (res) {
+          // 成功：作废当前 key（下次提交是新的逻辑操作，换新 key）
+          state.adjustIdem = null;
+          state.adjustFingerprint = null;
           setStatus("adm-adjust-status",
             (res && res.duplicate ? "幂等重放（未重复入账）" : "已入账") +
             "：" + ((res && res.entry && res.entry.kind) || kind) + " " +
@@ -1069,7 +1147,9 @@
           loadBillingAccount();
           loadLedger(false);
         }).catch(function (err) {
-          setStatus("adm-adjust-status", errText(err));
+          // 失败：保留 key + 指纹 → 用户重试（表单未动）时复用同一幂等键
+          setStatus("adm-adjust-status",
+            errText(err) + "（重试将使用同一幂等键，不会重复入账）");
           showError(err && err.code, err && err.message);
         });
       });
@@ -1243,6 +1323,91 @@
   }
 
   // ------------------------------------------------------------------
+  // 插件管理（PR5 修订：恢复旧侧栏插件管理功能面）。运行时安装/更新不上
+  // UI——§16 的发布方向是版本化 releases + 原子切换（宿主机动作），本页只
+  // 做：列表 + sidecar 健康提示 + 启停 + 凭证轮换（secret 仅一次展示）。
+  // ------------------------------------------------------------------
+  function pluginHealthText(h) {
+    if (h === "reachable") return "可达";
+    if (h === "unreachable") return "不可达（仅影响依赖 sidecar 的能力）";
+    return "未知（未配置探测地址）";
+  }
+
+  function loadPlugins() {
+    var status = $("adm-plugins-status");
+    request("admin.plugins.list", {}).then(function (res) {
+      hideError();
+      var tbody = $("adm-plugins-tbody");
+      if (!tbody) return;
+      tbody.textContent = "";
+      ((res && res.installations) || []).forEach(function (inst) {
+        var tr = document.createElement("tr");
+        tr.appendChild(td(inst.installation_id));
+        tr.appendChild(td(inst.plugin_id));
+        tr.appendChild(td(inst.version || "—"));
+        tr.appendChild(td(inst.enabled ? "启用" : "停用"));
+        tr.appendChild(td(pluginHealthText(inst.health)));
+        var caps = inst.capabilities || [];
+        tr.appendChild(td(caps.length
+          ? caps.map(function (c) { return c && c.name; }).join(", ")
+          : "（纯 UI 插件）"));
+        var cell = document.createElement("td");
+        cell.className = "adm-actions-cell";
+        var enabled = !!inst.enabled;
+        cell.appendChild(actionBtn(enabled ? "停用" : "启用", function () {
+          if (enabled) {
+            askConfirm($("adm-plugins-confirm"),
+              "确认停用 " + inst.plugin_id + "？该安装全部在途 JWT 立即失效，" +
+              "依赖其能力的调用会被拒绝。",
+              function () { setPluginEnabled(inst, false); });
+          } else {
+            setPluginEnabled(inst, true);
+          }
+        }, enabled));
+        cell.appendChild(actionBtn("轮换凭证", function () {
+          askConfirm($("adm-plugins-confirm"),
+            "确认轮换 " + inst.plugin_id + " 的安装凭证？旧 secret 立即失效，" +
+            "使用方必须同步更新；新明文只显示一次。",
+            function () { rotatePluginSecret(inst); });
+        }, true));
+        tr.appendChild(cell);
+        tbody.appendChild(tr);
+      });
+      if (status) status.textContent = "";
+    }).catch(function (err) { handleErr(err, status); });
+  }
+
+  function setPluginEnabled(inst, enabled) {
+    request("admin.plugins.setEnabled",
+            { installation_id: inst.installation_id, enabled: enabled })
+      .then(function () {
+        setStatus("adm-plugins-status",
+          (enabled ? "已启用 " : "已停用 ") + inst.plugin_id);
+        loadPlugins();
+      })
+      .catch(function (err) { handleErr(err, $("adm-plugins-status")); });
+  }
+
+  // 轮换凭证：响应里的新明文 secret 只在此处展示一次（内存 DOM），不落
+  // localStorage/cookie（opaque origin 本也写不了）——与邀请码同款一次性语义
+  function rotatePluginSecret(inst) {
+    request("admin.plugins.rotateSecret",
+            { installation_id: inst.installation_id })
+      .then(function (res) {
+        setStatus("adm-plugins-status",
+          "已轮换 " + inst.plugin_id + " 的凭证（旧 secret 已失效）：");
+        var box = $("adm-plugin-secret-box");
+        var code = $("adm-plugin-secret");
+        if (box && code) {
+          code.textContent = (res && res.secret) || "";
+          box.hidden = false;
+        }
+        loadPlugins();
+      })
+      .catch(function (err) { handleErr(err, $("adm-plugins-status")); });
+  }
+
+  // ------------------------------------------------------------------
   // 内存态导航（opaque origin：不用 location.hash，避免任何存储型状态）
   // ------------------------------------------------------------------
   function showPage(name) {
@@ -1262,6 +1427,7 @@
     else if (name === "users") loadUsers(false);
     else if (name === "invites") { loadAcquisitionPage(); loadInvites(false); }
     else if (name === "billing") loadBillingPage();
+    else if (name === "plugins") loadPlugins();
     else if (name === "audit") loadAudit(false);
   }
 
@@ -1329,6 +1495,12 @@
       loadAudit(false);
     });
     onClick("adm-audit-more-btn", function () { loadAudit(true); });
+    // 插件页（PR5 修订）
+    onClick("adm-plugins-refresh-btn", function () { loadPlugins(); });
+    onClick("adm-plugin-secret-copy", function () {
+      var code = $("adm-plugin-secret");
+      if (code) copyToClipboard(code.textContent || "");
+    });
   }
 
   window.addEventListener("message", onMessage);

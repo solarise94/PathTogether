@@ -25,6 +25,8 @@
     "admin:billing:read",
     "admin:billing:write",
     "admin:acquisition:read",
-    "admin:audit:read"
+    "admin:audit:read",
+    "admin:plugins:read",
+    "admin:plugins:write"
   ]
 }

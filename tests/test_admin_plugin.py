@@ -500,8 +500,10 @@ def test_bootstrap_creates_enabled_installation_idempotently():
     assert second is not None
     assert second["installation_id"] == rows[0]["installation_id"]
     assert len(_admin_installation_rows()) == 1
-    # 引导后 /admin 直接可用（信任判定四项全满足）
-    owner, _u = user_store.create_user("o2@x.com", "ownerpass123456", role="owner"), None
+    # 引导后 /admin 直接可用（信任判定四项全满足）。复用 _setup_users 的
+    # owner——PG 的 users_single_enabled_owner_key（0015）不允许再建第二个
+    # enabled owner（此前这里新建 o2@x.com 在 PG 模式必炸，PR3b 顺带修复）
+    owner = user_store.list_enabled_owners()[0]
     r = _login(_client(), owner).get("/admin")
     assert r.status_code == 200
     assert "admin-plugin-frame" in r.get_data(as_text=True)

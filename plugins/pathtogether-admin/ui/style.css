@@ -48,3 +48,48 @@ body {
 
 .adm-error-card { border: 1px solid rgba(255, 59, 48, 0.35); }
 .adm-error-text { font-size: 13px; color: var(--danger); line-height: 1.7; word-break: break-all; }
+
+/* ---- PR3b 只读页面：导航 / 表格 / 筛选 / 分页 / 告警 ---- */
+.adm-nav { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.adm-nav-btn {
+  font-size: 13px; padding: 6px 14px; border-radius: 8px;
+  border: 1px solid var(--separator); background: var(--card);
+  color: var(--text); cursor: pointer;
+}
+.adm-nav-btn--active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+.adm-filters { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 14px; }
+.adm-filters input, .adm-filters select {
+  font-size: 13px; padding: 6px 10px; border-radius: 8px;
+  border: 1px solid var(--separator); background: #fff; color: var(--text);
+  max-width: 240px;
+}
+.adm-filters button {
+  font-size: 13px; padding: 6px 14px; border-radius: 8px;
+  border: 1px solid var(--accent); background: var(--accent); color: #fff;
+  cursor: pointer;
+}
+
+.adm-table-wrap { overflow-x: auto; }
+.adm-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.adm-table th {
+  text-align: left; font-weight: 600; color: var(--text-2);
+  padding: 8px 10px; border-bottom: 1px solid var(--separator); white-space: nowrap;
+}
+.adm-table td {
+  padding: 8px 10px; border-bottom: 1px solid var(--separator);
+  vertical-align: top; word-break: break-all; white-space: nowrap;
+}
+.adm-table td:last-child, .adm-table td:nth-child(9) { white-space: normal; }
+
+.adm-pager { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+.adm-pager button {
+  font-size: 13px; padding: 6px 14px; border-radius: 8px;
+  border: 1px solid var(--separator); background: var(--card);
+  color: var(--text); cursor: pointer;
+}
+.adm-pager button:disabled { opacity: 0.45; cursor: default; }
+
+.adm-alerts { list-style: none; font-size: 13px; color: var(--danger); }
+.adm-alerts li { padding: 6px 0; line-height: 1.6; word-break: break-all; }
+.adm-alerts li::before { content: "⚠ "; }

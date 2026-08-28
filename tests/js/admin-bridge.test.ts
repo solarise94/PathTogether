@@ -287,14 +287,14 @@ describe("AdminBridge host — message gate (§8.3/§8.4)", () => {
 		expect((rs[0].env.error as { code: string }).code).toBe("permission_denied");
 	});
 
-	it("returns stable not_implemented for mapped-but-unimplemented methods (PR3b)", async () => {
+	it("returns stable not_implemented for mapped-but-unimplemented methods (PR5 writes)", async () => {
 		const { handle, posted, contentWindow } = makeHost({
-			permissions: ["admin:overview:read", "admin:billing:read"],
+			permissions: ["admin:users:read", "admin:users:write"],
 		});
 		handle._handleIframeLoad();
 		const nonce = initNonce(posted);
 		handle._handleWindowMessage({
-			source: contentWindow, data: requestEnv(nonce, "r1", "admin.billing.ledger.list"),
+			source: contentWindow, data: requestEnv(nonce, "r1", "admin.users.create"),
 		});
 		await ticks();
 		const rs = responses(posted, "r1");
@@ -402,7 +402,9 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 	it("matches the documented table", () => {
 		const { AdminBridgeHost } = loadModule();
 		const table = AdminBridgeHost.METHOD_PERMISSIONS;
-		expect(Object.keys(table)).toHaveLength(22);
+		// 22 个 §8.4 表方法 + PR3b 扩展的 providerBalance.refresh（与 get 同级
+		// admin:billing:read：只抓取供应商自身余额，不触碰用户数据）
+		expect(Object.keys(table)).toHaveLength(23);
 		expect(table["admin.auth.get"]).toBe("admin:overview:read");
 		expect(table["admin.overview.get"]).toBe("admin:overview:read");
 		expect(table["admin.users.list"]).toBe("admin:users:read");
@@ -422,8 +424,239 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 		expect(table["admin.billing.usage.list"]).toBe("admin:billing:read");
 		expect(table["admin.billing.ledger.list"]).toBe("admin:billing:read");
 		expect(table["admin.billing.providerBalance.get"]).toBe("admin:billing:read");
+		expect(table["admin.billing.providerBalance.refresh"]).toBe("admin:billing:read");
 		expect(table["admin.acquisition.summary"]).toBe("admin:acquisition:read");
 		expect(table["admin.acquisition.list"]).toBe("admin:acquisition:read");
 		expect(table["admin.audit.list"]).toBe("admin:audit:read");
 	});
+
+	it("declares param schemas for every PR3b read method (whitelist + types)", () => {
+		const { AdminBridgeHost } = loadModule();
+		const schemas = (
+			AdminBridgeHost as unknown as {
+				METHOD_PARAM_SCHEMAS: Record<string, { properties: Record<string, unknown> }>;
+			}
+		).METHOD_PARAM_SCHEMAS;
+		for (const method of [
+			"admin.auth.get",
+			"admin.overview.get",
+			"admin.users.list",
+			"admin.billing.account.get",
+			"admin.billing.usage.list",
+			"admin.billing.ledger.list",
+			"admin.billing.providerBalance.get",
+			"admin.billing.providerBalance.refresh",
+			"admin.audit.list",
+			"admin.turnBudgets.get",
+		]) {
+			expect(schemas[method], method).toBeTruthy();
+			// 附加属性一律拒绝（iframe 不能借桥传任意字段）
+			expect((schemas[method] as { additionalProperties?: boolean }).additionalProperties).toBe(false);
+		}
+	});
 });
+
+describe("AdminBridge host — PR3b read backend proxy (§9 Admin API v1)", () => {
+	const ALL_READ = [
+		"admin:overview:read", "admin:users:read", "admin:turn-budgets:read",
+		"admin:billing:read", "admin:audit:read",
+	];
+
+	function makeReadHost(fetchJson: (url: string, o?: unknown) => Promise<unknown>) {
+		return makeHost({ permissions: ALL_READ, fetchJson });
+	}
+
+	it("admin.overview.get proxies GET /api/admin/v1/overview verbatim", async () => {
+		const overview = {
+			users: { total: 2, active: 2, disabled: 0, ai_access: 1 },
+			billing: { available: true, charge_nano_cny: 42 },
+			turn_budget: { available: true, platform: { total: 3, limit: 30 } },
+		};
+		const { handle, posted, contentWindow } = makeReadHost(async (url) => {
+			expect(url).toBe("/api/admin/v1/overview");
+			return { status: 200, ok: true, body: overview };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow, data: requestEnv(nonce0(posted), "r1", "admin.overview.get"),
+		});
+		await ticks();
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(true);
+		expect(rs[0].env.result).toEqual(overview);
+	});
+
+	it("admin.users.list maps cursor/limit/filters into the query string", async () => {
+		const { handle, posted, contentWindow } = makeReadHost(async (url) => {
+			expect(url).toBe(
+				"/api/admin/v1/users?cursor=abc&limit=25&q=alice&enabled=true&ai_access=false",
+			);
+			return { status: 200, ok: true, body: { items: [], next_cursor: null } };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.users.list", {
+				cursor: "abc", limit: 25, q: "alice", enabled: true, ai_access: false,
+			}),
+		});
+		await ticks();
+		expect(responses(posted, "r1")[0].env.ok).toBe(true);
+	});
+
+	it("admin.billing.usage.list only whitelists cursor/limit/model/user_id/status", async () => {
+		const { handle, posted, contentWindow } = makeReadHost(async (url) => {
+			expect(url).toBe("/api/admin/v1/billing/usage-events?limit=10&status=unpriced");
+			return { status: 200, ok: true, body: { items: [], next_cursor: null } };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.billing.usage.list", {
+				limit: 10, status: "unpriced", model: "", user_id: null,
+			}),
+		});
+		await ticks();
+		expect(responses(posted, "r1")[0].env.ok).toBe(true);
+	});
+
+	it("admin.billing.account.get URL-encodes user_id", async () => {
+		const { handle, posted, contentWindow } = makeReadHost(async (url) => {
+			expect(url).toBe("/api/admin/v1/billing/accounts/usr_abc%2Fdef");
+			return { status: 200, ok: true, body: { account: null, balance_nano: null } };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.billing.account.get", {
+				user_id: "usr_abc/def",
+			}),
+		});
+		await ticks();
+		expect(responses(posted, "r1")[0].env.ok).toBe(true);
+	});
+
+	it("admin.billing.providerBalance.refresh issues POST and maps server error codes", async () => {
+		const calls: Array<{ url: string; method?: string }> = [];
+		const { handle, posted, contentWindow } = makeReadHost(async (url, o) => {
+			calls.push({ url, method: (o as { method?: string } | undefined)?.method });
+			if (calls.length === 1) {
+				return { status: 429, ok: false, body: { error: { code: "refresh_throttled", message: "slow down" } } };
+			}
+			return {
+				status: 200, ok: true,
+				body: { ok: true, snapshot: { total_balance_nano: 1 }, age_seconds: 0 },
+			};
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.billing.providerBalance.refresh"),
+		});
+		await ticks();
+		let rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(false);
+		expect((rs[0].env.error as { code: string }).code).toBe("refresh_throttled");
+
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r2", "admin.billing.providerBalance.refresh"),
+		});
+		await ticks();
+		rs = responses(posted, "r2");
+		expect(rs[0].env.ok).toBe(true);
+		expect(calls).toHaveLength(2);
+		expect(calls[0]).toEqual({ url: "/api/admin/v1/billing/provider-balance/refresh", method: "POST" });
+	});
+
+	it("maps 503 pg_backend_required envelopes to the bridge error code", async () => {
+		const { handle, posted, contentWindow } = makeReadHost(async () => ({
+			status: 503, ok: false,
+			body: { error: { code: "pg_backend_required", message: "fail-closed" } },
+		}));
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow, data: requestEnv(nonce0(posted), "r1", "admin.turnBudgets.get"),
+		});
+		await ticks();
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(false);
+		expect((rs[0].env.error as { code: string }).code).toBe("pg_backend_required");
+	});
+
+	it("rejects schema-invalid params on the new methods (type / enum / extra field)", async () => {
+		const { handle, posted, contentWindow } = makeReadHost(async () => ({
+			status: 200, ok: true, body: {},
+		}));
+		handle._handleIframeLoad();
+		const nonce = nonce0(posted);
+		const bad: Array<[string, unknown]> = [
+			["admin.users.list", { limit: "25" }],                    // 类型：integer
+			["admin.users.list", { limit: 0 }],                       // 范围：min 1
+			["admin.users.list", { q: 123 }],                         // 类型：string
+			["admin.billing.usage.list", { status: "free" }],         // 枚举
+			["admin.billing.usage.list", { csrfToken: "leak" }],      // 未声明字段
+			["admin.billing.account.get", { user_id: 123 }],         // 类型：string
+			["admin.audit.list", { action: true }],                   // 类型
+			["admin.overview.get", { anything: 1 }],                   // 空白名单
+		];
+		for (let i = 0; i < bad.length; i++) {
+			handle._handleWindowMessage({
+				source: contentWindow,
+				data: requestEnv(nonce, "bad-" + i, bad[i][0], bad[i][1]),
+			});
+		}
+		await ticks();
+		for (let i = 0; i < bad.length; i++) {
+			const rs = responses(posted, "bad-" + i);
+			expect(rs, bad[i][0] + " #" + i).toHaveLength(1);
+			expect(rs[0].env.ok).toBe(false);
+			expect((rs[0].env.error as { code: string }).code).toBe("invalid_params");
+		}
+		// 后端一次都没被打到（参数门在 backend 之前）
+		expect(handle.stats().handled).toBe(0);
+	});
+
+	it("caches the owner recheck for 5s (one /api/auth/info per burst)", async () => {
+		const { AdminBridgeHost, crypto } = loadModule();
+		const posted: Posted[] = [];
+		const contentWindow = {
+			postMessage: (env: Record<string, unknown>, targetOrigin: string) =>
+				posted.push({ env, targetOrigin }),
+		};
+		const authCalls: string[] = [];
+		const fetchJson = async (url: string) => {
+			if (url === "/api/auth/info") {
+				authCalls.push(url);
+				return {
+					status: 200, ok: true,
+					body: { actor: { role: "owner", username: "owner@x.com" } },
+				};
+			}
+			return { status: 200, ok: true, body: {} };
+		};
+		const handle = AdminBridgeHost.create({
+			iframe: { contentWindow, addEventListener() {}, getAttribute: () => "x", setAttribute() {} },
+			permissions: ALL_READ,
+			crypto,
+			fetchJson, // 不传 ensureOwner：走默认 makeOwnerGuard（带 TTL 缓存）
+			timeoutMs: 5000,
+		});
+		handle._handleIframeLoad();
+		const nonce = initNonce(posted);
+		for (let i = 1; i <= 3; i++) {
+			handle._handleWindowMessage({
+				source: contentWindow, data: requestEnv(nonce, "c" + i, "admin.overview.get"),
+			});
+		}
+		await ticks(6);
+		// 三条消息共用一次 owner 回查（5s TTL 内）
+		expect(authCalls).toHaveLength(1);
+		expect(responses(posted, "c1")[0].env.ok).toBe(true);
+		expect(responses(posted, "c3")[0].env.ok).toBe(true);
+	});
+});
+
+function nonce0(posted: Posted[]): string {
+	return initNonce(posted);
+}

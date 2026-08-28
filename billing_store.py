@@ -1077,3 +1077,279 @@ def latest_provider_balance_snapshot(provider):
         return dict(row) if row is not None else None
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# Admin API v1 只读查询原语（PR3b，admin-billing 方案 §9）
+#
+# 设计约束：
+#   - 全部 keyset/limit 分页（禁止一次返回全量 usage/ledger）；
+#   - 输出字段白名单化：不携带 raw_usage / payload_hash（大对象与互锁细节
+#     不是管理页需要的信息），敏感字段红线（api_key/完整 IP/outbox 路径/
+#     credential fingerprint）在数据层就不存在；
+#   - 与 ingest 同一权威表，无旁路聚合表（影子阶段量级不需要物化）。
+# --------------------------------------------------------------------------- #
+#: admin usage 列表输出列（_EVENT_SEL 的展示子集；raw_usage/payload_hash 除外）
+_ADMIN_EVENT_SEL = (
+    "event_id, call_id, schema_version, request_id, session_id, "
+    "subject_type, subject_id, user_id, provider, model, "
+    "cache_hit_input_tokens, cache_miss_input_tokens, output_tokens, "
+    "reasoning_tokens, total_tokens, "
+    "extract(epoch from occurred_at)::float8 AS occurred_at, "
+    "extract(epoch from enqueued_at)::float8 AS enqueued_at, "
+    "extract(epoch from received_at)::float8 AS received_at, "
+    "status, unpriced_reason, provider_price_book_id, charge_price_book_id, "
+    "provider_cost_nano_cny, charge_nano_cny"
+)
+
+#: 合法 usage 列表筛选 status（§9：unpriced 单独可过滤，不混入 0 元）
+ADMIN_USAGE_STATUSES = ("priced", "unpriced")
+
+
+def admin_usage_events_page(*, cursor=None, limit=50, model=None, user_id=None,
+                            subject_type=None, status=None):
+    """admin usage 明细分页（§10.4：按模型/用户/状态筛选，最新在前）。
+
+    keyset 游标：(occurred_at epoch, event_id) 降序。``status`` 限
+    priced/unpriced；``user_id`` 按 ai_usage_events.user_id（权威主体解析后
+    的镜像列）精确过滤；未就绪的 user_id 缺行按 NULL 存储时不会命中筛选
+    （subject_type/subject_id 仍保留在行内供归因展示）。
+    返回 ``{"items": [...], "next_cursor": str|None}``。
+    """
+    platform_features.require_pg_backend("billing")
+    limit = max(1, min(int(limit or 50), 200))
+    where, params = [], []
+    if model is not None:
+        where.append("model=%s")
+        params.append(str(model))
+    if user_id is not None:
+        where.append("user_id=%s")
+        params.append(str(user_id))
+    if subject_type is not None:
+        where.append("subject_type=%s")
+        params.append(str(subject_type))
+    if status is not None:
+        if status not in ADMIN_USAGE_STATUSES:
+            raise ValueError("status 需为 %s" % (ADMIN_USAGE_STATUSES,))
+        where.append("status=%s")
+        params.append(status)
+    after = None
+    if cursor is not None:
+        try:
+            occurred, event_id = cursor
+            after = (float(occurred), str(event_id))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("cursor 非法") from exc
+        where.append("(occurred_at < to_timestamp(%s) OR "
+                     "(occurred_at = to_timestamp(%s) AND event_id < %s))")
+        params.extend([after[0], after[0], after[1]])
+    sql_where = (" WHERE " + " AND ".join(where)) if where else ""
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT " + _ADMIN_EVENT_SEL + " FROM ai_usage_events"
+                    + sql_where +
+                    " ORDER BY occurred_at DESC, event_id DESC LIMIT %s",
+                    params + [limit + 1])
+                rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    for row in rows:
+        for key in ("provider_cost_nano_cny", "charge_nano_cny"):
+            if row.get(key) is not None:
+                row[key] = int(row[key])
+    next_cursor = None
+    if has_more and rows:
+        last = rows[-1]
+        next_cursor = (last["occurred_at"], last["event_id"])
+    return {"items": rows, "next_cursor": next_cursor}
+
+
+def admin_ledger_page(*, cursor=None, limit=50):
+    """admin ledger 只读分页（不可变账本，最新在前；§10.4 只读表）。
+
+    keyset 游标：(created_at epoch, entry_id) 降序。
+    """
+    platform_features.require_pg_backend("billing")
+    limit = max(1, min(int(limit or 50), 200))
+    where, params = "", []
+    if cursor is not None:
+        try:
+            created, entry_id = cursor
+            created = float(created)
+            entry_id = str(entry_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("cursor 非法") from exc
+        where = (" WHERE (extract(epoch from created_at) < %s OR "
+                 "(extract(epoch from created_at) = %s AND entry_id < %s))")
+        params = [created, created, entry_id]
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT entry_id, account_id, event_id, kind, "
+                    "amount_nano_cny, idempotency_key, reason, actor_user_id, "
+                    "extract(epoch from created_at)::float8 AS created_at "
+                    "FROM billing_ledger_entries" + where +
+                    " ORDER BY created_at DESC, entry_id DESC LIMIT %s",
+                    params + [limit + 1])
+                rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    for row in rows:
+        row["amount_nano_cny"] = int(row["amount_nano_cny"])
+    next_cursor = None
+    if has_more and rows:
+        next_cursor = (rows[-1]["created_at"], rows[-1]["entry_id"])
+    return {"items": rows, "next_cursor": next_cursor}
+
+
+def _as_aware_dt(value):
+    """窗口参数归一：epoch 秒（float/int）/ RFC3339 字符串 / datetime → aware dt。"""
+    if value is None or isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return billing_pricing.parse_rfc3339(value)
+    return datetime.fromtimestamp(float(value), tz=timezone.utc)
+
+
+def admin_overview_usage_stats(period_start=None, today_start=None):
+    """概览用量聚合（§10.1；窗口：周期起点 / 今日零点，均为含端点）。
+
+    返回 dict（全部整数或 None）：
+      - ``model_calls_today`` / ``model_calls_period``：ai_usage_events 计数；
+      - token 合计（cache hit/miss input、output）与 ``cache_hit_ratio``
+        （hit/(hit+miss)，无输入 token 时 None）——周期窗口；
+      - ``provider_cost_nano_cny`` / ``charge_nano_cny``：priced 事件金额
+        合计（unpriced 不按 0 元混入）——周期窗口；
+      - ``unpriced_count``：unpriced 事件数——周期窗口；
+      - ``ingestion_lag_seconds_max`` / ``ingestion_lag_seconds_avg``：
+        received_at - occurred_at 的最大/均值——周期窗口。
+
+    窗口参数接受 epoch 秒 / RFC3339 字符串 / datetime（budget_store 的
+    usage_report 周期起点是 epoch float）。
+    """
+    platform_features.require_pg_backend("billing")
+    period_start = _as_aware_dt(period_start)
+    today_start = _as_aware_dt(today_start)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                out = {}
+                cur.execute(
+                    "SELECT count(*)::int AS n FROM ai_usage_events"
+                    + (" WHERE occurred_at >= %s" if today_start else ""),
+                    ([today_start] if today_start else []))
+                out["model_calls_today"] = int(cur.fetchone()["n"])
+                period_where = " WHERE occurred_at >= %s" if period_start else ""
+                period_and = " AND occurred_at >= %s" if period_start else ""
+                period_params = [period_start] if period_start else []
+                cur.execute(
+                    "SELECT count(*)::int AS n FROM ai_usage_events"
+                    + period_where, period_params)
+                out["model_calls_period"] = int(cur.fetchone()["n"])
+                cur.execute(
+                    "SELECT "
+                    "COALESCE(SUM(cache_hit_input_tokens),0)::bigint AS hit, "
+                    "COALESCE(SUM(cache_miss_input_tokens),0)::bigint AS miss, "
+                    "COALESCE(SUM(output_tokens),0)::bigint AS output, "
+                    "COALESCE(SUM(provider_cost_nano_cny),0)::bigint AS cost, "
+                    "COALESCE(SUM(charge_nano_cny),0)::bigint AS charge "
+                    "FROM ai_usage_events WHERE status='priced'" + period_and,
+                    period_params)
+                agg = dict(cur.fetchone())
+                hit, miss = int(agg["hit"]), int(agg["miss"])
+                out["cache_hit_input_tokens"] = hit
+                out["cache_miss_input_tokens"] = miss
+                out["output_tokens"] = int(agg["output"])
+                out["cache_hit_ratio"] = (
+                    hit / (hit + miss)) if (hit + miss) > 0 else None
+                out["provider_cost_nano_cny"] = int(agg["cost"])
+                out["charge_nano_cny"] = int(agg["charge"])
+                cur.execute(
+                    "SELECT count(*)::int AS n FROM ai_usage_events "
+                    "WHERE status='unpriced'" + period_and, period_params)
+                out["unpriced_count"] = int(cur.fetchone()["n"])
+                cur.execute(
+                    "SELECT COALESCE(MAX(extract(epoch from received_at) "
+                    "- extract(epoch from occurred_at)),0)::float8 AS lag_max, "
+                    "COALESCE(AVG(extract(epoch from received_at) "
+                    "- extract(epoch from occurred_at)),0)::float8 AS lag_avg "
+                    "FROM ai_usage_events" + period_where, period_params)
+                lag = dict(cur.fetchone())
+                out["ingestion_lag_seconds_max"] = float(lag["lag_max"])
+                out["ingestion_lag_seconds_avg"] = float(lag["lag_avg"])
+        return out
+    finally:
+        conn.close()
+
+
+def admin_account_summaries(user_ids):
+    """一批用户的账户+余额+caps 摘要（余额 = ledger 有符号合计）。
+
+    未开户用户不在返回 dict 中（调用方按 ``account: null`` 语义渲染，不伪造
+    0 余额账户）。返回 ``{user_id: {account_id, status, currency, version,
+    soft_spend_cap_nano, hard_spend_cap_nano, balance_nano}}``。
+    """
+    platform_features.require_pg_backend("billing")
+    ids = [str(u) for u in (user_ids or []) if u]
+    if not ids:
+        return {}
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT a.user_id, a.account_id, a.currency, a.status, "
+                    "a.version, a.soft_spend_cap_nano, a.hard_spend_cap_nano, "
+                    "COALESCE(SUM(l.amount_nano_cny),0)::bigint AS balance "
+                    "FROM billing_accounts a "
+                    "LEFT JOIN billing_ledger_entries l "
+                    " ON l.account_id = a.account_id "
+                    "WHERE a.user_id = ANY(%s) "
+                    "GROUP BY a.user_id, a.account_id, a.currency, a.status, "
+                    " a.version, a.soft_spend_cap_nano, a.hard_spend_cap_nano",
+                    (ids,))
+                rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    out = {}
+    for row in rows:
+        out[row["user_id"]] = {
+            "account_id": row["account_id"],
+            "currency": row["currency"],
+            "status": row["status"],
+            "version": int(row["version"]),
+            "soft_spend_cap_nano": row["soft_spend_cap_nano"],
+            "hard_spend_cap_nano": row["hard_spend_cap_nano"],
+            "balance_nano": int(row["balance"]),
+        }
+    return out
+
+
+def admin_last_ai_call_by_user():
+    """每用户最近一次 AI 调用时间（ai_usage_events.occurred_at 最大值）。
+
+    返回 ``{user_id: epoch 秒}``；无任何事件的用户不在 dict 中。
+    """
+    platform_features.require_pg_backend("billing")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT user_id, extract(epoch from max(occurred_at))"
+                    "::float8 AS last_call FROM ai_usage_events "
+                    "WHERE user_id IS NOT NULL GROUP BY user_id")
+                rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    return {r["user_id"]: float(r["last_call"]) for r in rows}

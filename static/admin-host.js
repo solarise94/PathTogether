@@ -20,8 +20,13 @@
      - 宿主用 fetch + CSRF cookie（与 app.js 同机制）请求 Admin API；**绝不**
        向 iframe 暴露 CSRF token / session 内容 / 通用 fetch 能力。
 
-   本批只实现 admin.auth.get（最小身份 JSON）；其余方法在 METHOD_PERMISSIONS
-   表中占位并稳定返回 not_implemented —— PR3b 只需在 METHOD_BACKENDS 加条目。
+   PR3a 只实现 admin.auth.get；PR3b（本版）补齐只读方法：overview.get /
+   users.list / billing.account.get / billing.usage.list / billing.ledger.list /
+   billing.providerBalance.get(+refresh) / audit.list / turnBudgets.get。
+   写方法（users.create/setEnabled/... invites/adjust/updateCaps）仍在表中
+   占位并稳定返回 not_implemented（PR5）。owner 回查带 5s 短 TTL 缓存（见
+   makeOwnerGuard——缓存只是省一次每消息 HTTP，服务端每 API 独立复核不受
+   影响；401 登出仍立即作废整个桥会话）。
    ========================================================================= */
 (function () {
   "use strict";
@@ -55,15 +60,66 @@
     "admin.billing.usage.list": "admin:billing:read",
     "admin.billing.ledger.list": "admin:billing:read",
     "admin.billing.providerBalance.get": "admin:billing:read",
+    // refresh 是 PR3b 对 §8.4 表的最小扩展：只抓取供应商自身余额写快照，
+    // 不触碰任何用户数据，与 get 同级（admin:billing:read）；服务端有独立
+    // 节流 + owner/CSRF 复核。
+    "admin.billing.providerBalance.refresh": "admin:billing:read",
     "admin.acquisition.summary": "admin:acquisition:read",
     "admin.acquisition.list": "admin:acquisition:read",
     "admin.audit.list": "admin:audit:read",
   };
 
-  // 参数 schema（最小子集：对象形态 + 未声明属性拒绝；PR3b 按方法细化）。
-  // 未列出的方法仅要求 payload 是对象（真正的前端参数校验在接入实现时补齐）。
+  // 参数 schema（§14.1：每方法白名单 + 类型/长度/枚举/范围；未声明属性
+  // 一律拒绝——iframe 不能借桥传任意字段）。未列出 schema 的方法（PR5 写
+  // 方法）仅要求 payload 是对象。
+  var _cursorSpec = { type: "string", maxLength: 512, nullable: true };
+  var _limitSpec = { type: "integer", min: 1, max: 200 };
   var METHOD_PARAM_SCHEMAS = {
     "admin.auth.get": { properties: {}, additionalProperties: false },
+    "admin.overview.get": { properties: {}, additionalProperties: false },
+    "admin.users.list": {
+      properties: {
+        cursor: _cursorSpec,
+        limit: _limitSpec,
+        q: { type: "string", maxLength: 128, nullable: true },
+        enabled: { type: "boolean" },
+        ai_access: { type: "boolean" },
+      },
+      additionalProperties: false,
+    },
+    "admin.billing.account.get": {
+      properties: { user_id: { type: "string", maxLength: 128, nullable: true } },
+      additionalProperties: false,
+    },
+    "admin.billing.usage.list": {
+      properties: {
+        cursor: _cursorSpec,
+        limit: _limitSpec,
+        model: { type: "string", maxLength: 128, nullable: true },
+        user_id: { type: "string", maxLength: 128, nullable: true },
+        status: { type: "string", enum: ["priced", "unpriced"] },
+      },
+      additionalProperties: false,
+    },
+    "admin.billing.ledger.list": {
+      properties: { cursor: _cursorSpec, limit: _limitSpec },
+      additionalProperties: false,
+    },
+    "admin.billing.providerBalance.get": {
+      properties: {}, additionalProperties: false,
+    },
+    "admin.billing.providerBalance.refresh": {
+      properties: {}, additionalProperties: false,
+    },
+    "admin.audit.list": {
+      properties: {
+        cursor: _cursorSpec,
+        limit: _limitSpec,
+        action: { type: "string", maxLength: 128, nullable: true },
+      },
+      additionalProperties: false,
+    },
+    "admin.turnBudgets.get": { properties: {}, additionalProperties: false },
   };
 
   // ---- 工具 ----
@@ -82,16 +138,43 @@
     return diff === 0;
   }
 
+  // 单值校验：类型（string/integer/boolean）+ maxLength + enum + min/max。
+  // null 只在显式 nullable 时接受（游标翻页用「缺键」表达，不用 null）。
+  function validateValue(value, spec) {
+    if (value === undefined) return false;
+    if (value === null) return spec.nullable === true;
+    switch (spec.type) {
+      case "string":
+        if (typeof value !== "string") return false;
+        if (spec.maxLength && value.length > spec.maxLength) return false;
+        if (spec.enum && spec.enum.indexOf(value) === -1) return false;
+        return true;
+      case "integer":
+        if (typeof value !== "number" || !isFinite(value) ||
+            Math.floor(value) !== value) return false;
+        if (spec.min !== undefined && value < spec.min) return false;
+        if (spec.max !== undefined && value > spec.max) return false;
+        return true;
+      case "boolean":
+        return typeof value === "boolean";
+      default:
+        return true;
+    }
+  }
+
   function validateParams(method, payload) {
     if (payload == null) payload = {};
     if (typeof payload !== "object" || Array.isArray(payload)) return false;
     var schema = METHOD_PARAM_SCHEMAS[method];
-    if (!schema) return true; // 未声明 schema（PR3b 待实现）：仅要求对象形态
-    if (schema.additionalProperties === false) {
-      var props = schema.properties || {};
-      for (var k in payload) {
-        if (Object.prototype.hasOwnProperty.call(payload, k) && !(k in props)) return false;
+    if (!schema) return true; // 未声明 schema（PR5 写方法）：仅要求对象形态
+    var props = schema.properties || {};
+    for (var k in payload) {
+      if (!Object.prototype.hasOwnProperty.call(payload, k)) continue;
+      if (!(k in props)) {
+        if (schema.additionalProperties === false) return false;
+        continue;
       }
+      if (!validateValue(payload[k], props[k])) return false;
     }
     return true;
   }
@@ -139,21 +222,77 @@
 
   // 每条消息回查当前 actor 是否仍是 owner（服务端仍会对每个 Admin API 独立
   // 复核 owner + CSRF —— 本检查是纵深防御，不是授权替代）。
+  // PR3b：加 5s 短 TTL 缓存——概览/用户/账单一次渲染会连发多条桥消息，
+  // 每条都打一次 /api/auth/info 既无谓又放大时序抖动。缓存只省这次 HTTP：
+  //  - 缓存过期即回查（最长 5s 的陈旧放行窗口）；
+  //  - 任何后端调用收到 401 → observedFetchJson 立即 invalidate("logout")，
+  //    nonce/在途请求全部作废（不依赖本缓存收敛）；
+  //  - 服务端 owner 复核永远独立生效（本缓存不是授权）。
+  var OWNER_GUARD_TTL_MS = 5000;
   function makeOwnerGuard(fetchJson) {
+    var cache = { at: 0, value: false, inflight: null };
     return function () {
-      return fetchJson("/api/auth/info").then(function (res) {
-        if (!res.ok || !res.body) return false;
-        var actor = res.body.actor || {};
-        return actor.role === "owner";
-      }, function () { return false; });
+      var now = Date.now();
+      if (now - cache.at < OWNER_GUARD_TTL_MS) {
+        return Promise.resolve(cache.value);
+      }
+      if (cache.inflight) {
+        return cache.inflight; // 同一批并发消息合并为一次回查
+      }
+      cache.inflight = fetchJson("/api/auth/info").then(function (res) {
+        cache.at = Date.now();
+        cache.value = !!(res && res.ok && res.body &&
+                         (res.body.actor || {}).role === "owner");
+        cache.inflight = null;
+        return cache.value;
+      }, function () {
+        cache.at = 0; // 网络失败不缓存，下条消息重查
+        cache.inflight = null;
+        return false;
+      });
+      return cache.inflight;
     };
   }
 
   // ------------------------------------------------------------------
-  // method → 后端调用映射表（**唯一一处**；PR3b 只在这里加条目）。
-  // 每项 fn(ctx, payload)，ctx = { fetchJson, ensureOwner }；
-  // 返回值即 iframe 收到的 result；throw / reject → error 信封。
+  // method → 后端调用映射表（**唯一一处**）。每项 fn(ctx, payload)，
+  // ctx = { fetchJson, ensureOwner }；返回值即 iframe 收到的 result；
+  // throw / reject → error 信封。PR3b：只读方法全部指向 Admin API v1。
   // ------------------------------------------------------------------
+  // 服务端错误信封 {error:{code,message}} → 桥错误 {code,message}。
+  function backendError(url, res) {
+    var body = (res && res.body) || {};
+    var err = body.error;
+    if (err && typeof err === "object" && err.code) {
+      return { code: err.code, message: err.message || "" };
+    }
+    var code = "backend_error";
+    if (res && res.status === 401) code = "auth_required";
+    else if (res && res.status === 403) code = "forbidden";
+    else if (res && res.status === 503) code = "pg_backend_required";
+    return { code: code, message: (res && res.status) + " " + url };
+  }
+
+  // 只保留有值的键（null/undefined/空串不进 query）。
+  function buildQuery(params) {
+    var parts = [];
+    Object.keys(params || {}).forEach(function (k) {
+      var v = params[k];
+      if (v === undefined || v === null || v === "") return;
+      parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(v)));
+    });
+    return parts.length ? "?" + parts.join("&") : "";
+  }
+
+  function jsonGet(url) {
+    return function (ctx) {
+      return ctx.fetchJson(url).then(function (res) {
+        if (!res.ok) throw backendError(url, res);
+        return res.body;
+      });
+    };
+  }
+
   var METHOD_BACKENDS = {
     "admin.auth.get": function (ctx) {
       return ctx.fetchJson("/api/auth/info").then(function (res) {
@@ -170,7 +309,78 @@
         };
       });
     },
-    // PR3b：admin.overview.get / admin.users.list / ... 在此追加实现。
+
+    "admin.overview.get": jsonGet("/api/admin/v1/overview"),
+
+    "admin.users.list": function (ctx, payload) {
+      var url = "/api/admin/v1/users" + buildQuery({
+        cursor: payload.cursor, limit: payload.limit, q: payload.q,
+        enabled: payload.enabled, ai_access: payload.ai_access,
+      });
+      return ctx.fetchJson(url).then(function (res) {
+        if (!res.ok) throw backendError(url, res);
+        return res.body;
+      });
+    },
+
+    "admin.billing.account.get": function (ctx, payload) {
+      var uid = String(payload.user_id || "");
+      var url = "/api/admin/v1/billing/accounts/" + encodeURIComponent(uid);
+      return ctx.fetchJson(url).then(function (res) {
+        if (!res.ok) throw backendError(url, res);
+        return res.body;
+      });
+    },
+
+    "admin.billing.usage.list": function (ctx, payload) {
+      var url = "/api/admin/v1/billing/usage-events" + buildQuery({
+        cursor: payload.cursor, limit: payload.limit, model: payload.model,
+        user_id: payload.user_id, status: payload.status,
+      });
+      return ctx.fetchJson(url).then(function (res) {
+        if (!res.ok) throw backendError(url, res);
+        return res.body;
+      });
+    },
+
+    "admin.billing.ledger.list": function (ctx, payload) {
+      var url = "/api/admin/v1/billing/ledger" + buildQuery({
+        cursor: payload.cursor, limit: payload.limit,
+      });
+      return ctx.fetchJson(url).then(function (res) {
+        if (!res.ok) throw backendError(url, res);
+        return res.body;
+      });
+    },
+
+    "admin.billing.providerBalance.get":
+      jsonGet("/api/admin/v1/billing/provider-balance"),
+
+    // 手动刷新（§10.4 余额卡按钮）：POST 走 makeFetchJson 的 CSRF 双提交；
+    // 429 refresh_throttled / 502 provider_* 由 backendError 透传类别。
+    "admin.billing.providerBalance.refresh": function (ctx) {
+      var url = "/api/admin/v1/billing/provider-balance/refresh";
+      return ctx.fetchJson(url, { method: "POST" }).then(function (res) {
+        if (!res.ok) throw backendError(url, res);
+        return res.body;
+      });
+    },
+
+    "admin.audit.list": function (ctx, payload) {
+      var url = "/api/admin/v1/audit" + buildQuery({
+        cursor: payload.cursor, limit: payload.limit, action: payload.action,
+      });
+      return ctx.fetchJson(url).then(function (res) {
+        if (!res.ok) throw backendError(url, res);
+        return res.body;
+      });
+    },
+
+    "admin.turnBudgets.get": jsonGet("/api/admin/v1/turn-budgets"),
+
+    // PR5 写方法（users.create/setEnabled/setAiAccess/resetPassword、
+    // invites.*、turnBudgets.update/newPeriod、billing.account.updateCaps/
+    // adjust、acquisition.*）在此追加实现。
   };
 
   // ---- 桥实例 ----

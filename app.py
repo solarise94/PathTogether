@@ -26,7 +26,7 @@ import zipfile
 import fcntl
 from contextlib import contextmanager
 from collections import OrderedDict, deque
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -75,7 +75,10 @@ import registration_store
 # PR2 金额计费（docs/admin-billing-plugin-implementation-plan.md §6/§7）：
 # billing_store 提供价格表 / 用量事件计价 / 账本原语（PG-only，json/dual 稳定
 # pg_backend_required）。本阶段只影子计价——不写 usage_debit，demo 不开户。
+# billing_pricing：纯计算（时段判定 / RFC3339 / 余额十进制字符串→nano 的
+# Decimal 精确换算），Admin API v1 的 provider balance refresh 复用。
 import billing_store
+import billing_pricing
 # P0-A 资源防护（docs/open-registration-security-remediation §3.3/§3.4/§3.5）：
 # upload_guard：单请求计数流 + 磁盘保留水位 + PG 权威用户配额/reservation/
 #   在途与每小时限流（json/dual fail-closed，本地免登录 owner 语义不变）；
@@ -4609,6 +4612,666 @@ def api_admin_audit():
     action = request.args.get("action") or None
     events = share_store.list_audit(limit=limit, offset=offset, action=action)
     return jsonify(events=events, limit=limit, offset=offset)
+
+
+# =========================================================================== #
+# Admin API v1 —— 只读子集（PR3b，docs/admin-billing-plugin-implementation-plan.md §9）
+#
+# 面向 admin.workspace 插件（经 AdminBridge → apiFetch/CSRF 调用）的分页、
+# 可版本化管理 API；旧 /api/admin/* 在迁移期保留不动（PR5 才迁 UI）。
+#
+# 本批只做**只读**（+ provider balance refresh 这一个受控动作）：
+#   - 全部端点 `_require_owner()`（actor 判定——预览态 actor 仍是 owner，但
+#     预览下的写方法本就被 _preview_write_guard 拦截；POST refresh 同样受
+#     CSRF 双提交保护）；
+#   - 列表一律 cursor/limit（keyset 或显式 offset 游标），禁止全量返回；
+#   - 敏感字段红线（§9）：响应绝不出现 password_hash / api_key / 完整邀请
+#     token / 完整 IP / outbox 路径 / credential fingerprint；
+#   - billing 系端点 PG-only：json/dual 稳定 503 pg_backend_required（与
+#     billing_store §6.1 fail-closed 语义一致，不降级进程内数据）。
+#   - overview 在 json/dual 下**分段标记**（用户段可用；billing/turn_budget
+#     段返回 {available:false, code:"pg_backend_required"}），而非整体 503
+#     ——选择分段是因为概览的用户计数在任何后端都真实可用，整体 503 会让
+#     管理页连基本用户概况都失去（偏离选择见 PR3b 总结）。
+# =========================================================================== #
+#: admin v1 列表缺省/最大 limit
+_ADMIN_V1_DEFAULT_LIMIT = 50
+_ADMIN_V1_MAX_LIMIT = 200
+#: provider balance refresh 的进程内节流窗口（秒；§9 速率收敛意识）
+PROVIDER_BALANCE_REFRESH_MIN_INTERVAL_SECONDS = 60.0
+_provider_balance_refresh_state = {"last_ok_attempt": 0.0}
+_provider_balance_refresh_lock = threading.Lock()
+#: provider balance 的固定 provider id（当前唯一官方来源）
+BILLING_BALANCE_PROVIDER = "deepseek"
+
+#: 审计 detail 中**永不导出**的键片段（§10.5：密码/token/API key/完整 IP
+#: 永不展示；命中即整键丢弃，不做值脱敏——防形态演化漏网）
+_ADMIN_V1_AUDIT_DROP_KEY_FRAGMENTS = (
+    "password", "secret", "api_key", "apikey", "token", "credential",
+    "fingerprint", "cookie",
+)
+#: IP 类键（完整 IP 永不展示：统一丢弃，admin 页无消费场景。用边界片段而非
+#: 裸 "ip" 子串——否则 "description" 这类无害键也会被误伤）
+_ADMIN_V1_AUDIT_DROP_IP_KEYS = ("_ip", "ip_", "ipaddr", "remote_addr",
+                                "forwarded_for")
+_ADMIN_V1_AUDIT_DROP_IP_EXACT = frozenset({"ip", "clientip", "peer"})
+
+
+def _require_owner_admin_v1():
+    """Admin API v1 统一 owner 门控：_require_owner() + **预览态一律拒绝**。
+
+    与 PR3a /admin 宿主页同口径（§14.1 权限行「匿名/user/preview subject 均
+    不能访问 admin」）：预览态下 actor 虽仍是 owner，但管理读端点与预览 subject
+    视角并存只会制造 actor/subject 混淆，且预览写 guard 本就拦 POST——统一
+    拒绝（403 preview_forbidden）保持两个入口行为一致。
+    """
+    auth = _require_owner()
+    if auth:
+        return auth
+    if AUTH_ENABLED and _preview_active():
+        return _admin_v1_error(
+            403, "preview_forbidden", "身份预览期间管理 API 不可用（请先退出预览）")
+    return None
+
+
+def _admin_v1_error(status, code, message):
+    """admin v1 统一错误信封（code 稳定、message 无敏感信息）。"""
+    return jsonify(error={"code": code, "message": message}), status
+
+
+def _admin_v1_pg_required():
+    """json/dual 后端的 billing 端点稳定 503（不降级进程内数据）。"""
+    return _admin_v1_error(
+        503, "pg_backend_required",
+        "该能力要求 STORAGE_BACKEND=postgres（当前 %r），fail-closed"
+        % platform_features.current_backend())
+
+
+def _admin_v1_encode_cursor(obj):
+    """游标对象 → 不透明 base64url 字符串（服务端私有格式，客户端只回传）。"""
+    raw = json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _admin_v1_decode_cursor(raw):
+    """不透明游标 → dict；None/损坏一律 None（回到第一页，不抛错）。"""
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        pad = "=" * (-len(raw) % 4)
+        data = base64.urlsafe_b64decode(raw + pad).decode("utf-8")
+        obj = json.loads(data)
+        return obj if isinstance(obj, dict) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _admin_v1_limit_arg():
+    """limit 查询参数 → [1, _ADMIN_V1_MAX_LIMIT]（缺省 50；非法回缺省）。"""
+    raw = request.args.get("limit")
+    try:
+        limit = int(raw) if raw is not None else _ADMIN_V1_DEFAULT_LIMIT
+    except (TypeError, ValueError):
+        return _ADMIN_V1_DEFAULT_LIMIT
+    return max(1, min(limit, _ADMIN_V1_MAX_LIMIT))
+
+
+def _admin_v1_flag_arg(name):
+    """布尔筛选参数 → True/False/None（None=不过滤）。"""
+    raw = (request.args.get(name) or "").strip().lower()
+    if raw in ("true", "1", "yes"):
+        return True
+    if raw in ("false", "0", "no"):
+        return False
+    return None
+
+
+def _admin_v1_sanitize_audit_detail(value, key=None):
+    """审计 detail 递归脱敏（§10.5 红线）。
+
+    - 键名含敏感片段（password/secret/api_key/token/credential/fingerprint/
+      cookie/IP 类）→ 整键丢弃；
+    - ``idempotency_key`` 只保留后 8 字符（§10.5「idempotency key 后缀」）；
+    - dict/list 递归，其余标量原样保留（detail 本就不落敏感内容，这里是
+      出口防线而非唯一防线）。
+    """
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            ks = str(k).lower()
+            if any(frag in ks for frag in _ADMIN_V1_AUDIT_DROP_KEY_FRAGMENTS):
+                continue
+            if any(ipk in ks for ipk in _ADMIN_V1_AUDIT_DROP_IP_KEYS) \
+                    or ks in _ADMIN_V1_AUDIT_DROP_IP_EXACT:
+                continue
+            if ks == "idempotency_key" and isinstance(v, str) and v:
+                out[k] = v[-8:]
+                continue
+            cleaned = _admin_v1_sanitize_audit_detail(v, key=k)
+            if cleaned is not _ADMIN_V1_DROP:
+                out[k] = cleaned
+        return out
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            cleaned = _admin_v1_sanitize_audit_detail(item)
+            if cleaned is not _ADMIN_V1_DROP:
+                out.append(cleaned)
+        return out
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return _ADMIN_V1_DROP
+    return value
+
+
+#: 哨兵：sanitize 过程中标记「丢弃」（不能给 None——None 是合法 JSON 值）
+_ADMIN_V1_DROP = object()
+
+
+def _admin_v1_audit_event_out(event):
+    """audit 行 → admin v1 导出形态（detail 脱敏；顶层键白名单）。"""
+    detail = event.get("detail")
+    cleaned = _admin_v1_sanitize_audit_detail(
+        detail if isinstance(detail, dict) else {})
+    return {
+        "id": event.get("id"),
+        "ts": event.get("ts"),
+        "actor_user_id": event.get("actor_user_id"),
+        "actor_role": event.get("actor_role"),
+        "action": event.get("action"),
+        "target_type": event.get("target_type"),
+        "target_id": event.get("target_id"),
+        "slide": event.get("slide"),
+        "detail": cleaned,
+    }
+
+
+def _admin_v1_registration_methods(user_ids):
+    """注册方式归因：registration.redeem 审计（actor=被创建 user）→ invite。
+
+    其余（owner 直接创建）→ manual；查询失败按 manual（管理页展示用途，
+    不是权限判定，不 fail-closed）。campaign/source 留位 null 由 PR4 填充。
+    """
+    invite_users = set()
+    try:
+        events = share_store.list_audit(
+            limit=_ADMIN_V1_MAX_LIMIT * 5, action="registration.redeem")
+        for ev in events:
+            actor = ev.get("actor_user_id")
+            if actor:
+                invite_users.add(str(actor))
+    except Exception:
+        app.logger.warning("注册方式归因查询失败（按 manual 展示）",
+                           exc_info=True)
+    return {str(u): ("invite" if str(u) in invite_users else "manual")
+            for u in user_ids}
+
+
+@app.route("/api/admin/v1/overview", methods=["GET"])
+def admin_v1_overview():
+    """概览（§10.1）：用户计数 + billing 用量/余额 + turn 预算（双额度并列）。
+
+    json/dual：用户段可用；billing / turn_budget 段各自
+    ``{available:false, code:"pg_backend_required"}``（分段标记，见节注释）。
+    PG：billing 段含 model calls（今日/周期）、cache token 合计与命中率、
+    provider cost / charge 合计（nano）、unpriced 数、ingestion lag、DeepSeek
+    最新余额快照与年龄；turn_budget 段为周期预算摘要（usage_report 原语）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    users = user_store.list_users()
+    users_section = {
+        "total": len(users),
+        "active": sum(1 for u in users if not u.get("disabled")),
+        "disabled": sum(1 for u in users if u.get("disabled")),
+        "ai_access": sum(1 for u in users if u.get("ai_access")),
+    }
+
+    if not platform_features.billing_features_available():
+        billing_section = {"available": False, "code": "pg_backend_required"}
+        turn_section = {"available": False, "code": "pg_backend_required"}
+    else:
+        try:
+            period_start = None
+            report = None
+            try:
+                report = budget_store.usage_report()
+                period_start = report["period"].get("started_at")
+            except Exception:
+                app.logger.warning("概览读取预算周期失败（按全量窗口）",
+                                   exc_info=True)
+            # 「今日」按计价时区（Asia/Shanghai）零点，与价格时段同口径
+            now_local = datetime.now(tz=billing_pricing.PRICING_TIMEZONE)
+            today_start = now_local.replace(
+                hour=0, minute=0, second=0, microsecond=0).isoformat()
+            stats = billing_store.admin_overview_usage_stats(
+                period_start=period_start, today_start=today_start)
+            snapshot = billing_store.latest_provider_balance_snapshot(
+                BILLING_BALANCE_PROVIDER)
+            age = None
+            if snapshot is not None:
+                age = max(0.0, time.time() - float(snapshot["observed_at"]))
+            billing_section = {
+                "available": True,
+                "provider": BILLING_BALANCE_PROVIDER,
+                "model_calls_today": stats["model_calls_today"],
+                "model_calls_period": stats["model_calls_period"],
+                "cache_hit_input_tokens": stats["cache_hit_input_tokens"],
+                "cache_miss_input_tokens": stats["cache_miss_input_tokens"],
+                "output_tokens": stats["output_tokens"],
+                "cache_hit_ratio": stats["cache_hit_ratio"],
+                "provider_cost_nano_cny": stats["provider_cost_nano_cny"],
+                "charge_nano_cny": stats["charge_nano_cny"],
+                "unpriced_count": stats["unpriced_count"],
+                "ingestion_lag_seconds_max":
+                    stats["ingestion_lag_seconds_max"],
+                "ingestion_lag_seconds_avg":
+                    stats["ingestion_lag_seconds_avg"],
+                "provider_balance_snapshot": snapshot,
+                "provider_balance_age_seconds": age,
+            }
+            turn_section = {"available": True}
+            if report is not None:
+                period = report["period"]
+                turn_section.update({
+                    "period_id": period.get("id"),
+                    "period_started_at": period.get("started_at"),
+                    "platform": report["platform"],
+                    "demo": report["demo"],
+                    "owner": report["owner"],
+                    "user_pool": report["user_pool"],
+                    "by_subject_type": report["by_subject_type"],
+                })
+        except platform_features.PgFeatureUnavailable:
+            return _admin_v1_pg_required()
+        except Exception:
+            app.logger.exception("admin v1 overview billing 段读取失败")
+            return _admin_v1_error(500, "internal", "概览读取失败")
+
+    return jsonify(
+        users=users_section,
+        billing=billing_section,
+        # 「对话额度」（turn budget）与「金额余额」必须并列展示（§10.1）
+        turn_budget=turn_section,
+        backend=platform_features.current_backend(),
+    )
+
+
+@app.route("/api/admin/v1/users", methods=["GET"])
+def admin_v1_users():
+    """用户列表（§10.2 只读）：cursor(offset) 分页 + 搜索 + enabled/ai_access 筛选。
+
+    每行：display name、login ID 掩码、role、enabled、ai_access、创建时间、
+    注册方式、turn 使用/上限（json 后端 null）、金额余额/caps（未开户 null；
+    json 后端 null）、最近 AI 调用时间（json 后端 null）、campaign/source
+    留位 null（PR4）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    limit = _admin_v1_limit_arg()
+    cur = _admin_v1_decode_cursor(request.args.get("cursor"))
+    offset = int(cur.get("o") or 0) if cur else 0
+    if offset < 0:
+        offset = 0
+    search = (request.args.get("q") or "").strip().lower() or None
+    enabled_f = _admin_v1_flag_arg("enabled")
+    ai_f = _admin_v1_flag_arg("ai_access")
+
+    users = user_store.list_users()
+    users.sort(key=lambda u: (float(u.get("created_at") or 0.0),
+                              str(u.get("user_id") or "")))
+    if search:
+        users = [u for u in users if search in (
+            str(u.get("login_id") or "").lower() + " " +
+            str(u.get("display_name") or "").lower())]
+    if enabled_f is not None:
+        users = [u for u in users if bool(u.get("disabled")) != enabled_f]
+    if ai_f is not None:
+        users = [u for u in users if bool(u.get("ai_access")) == ai_f]
+
+    page = users[offset:offset + limit + 1]
+    has_more = len(page) > limit
+    page = page[:limit]
+    user_ids = [u.get("user_id") for u in page]
+
+    billing_ok = platform_features.billing_features_available()
+    accounts = last_calls = turn_by_user = {}
+    reg_methods = _admin_v1_registration_methods(user_ids)
+    if billing_ok:
+        try:
+            accounts = billing_store.admin_account_summaries(user_ids)
+            last_calls = billing_store.admin_last_ai_call_by_user()
+            per_user = budget_store.usage_report().get("per_user") or []
+            turn_by_user = {p["subject_id"]: p for p in per_user}
+        except platform_features.PgFeatureUnavailable:
+            return _admin_v1_pg_required()
+        except Exception:
+            app.logger.exception("admin v1 users 附属数据读取失败")
+            return _admin_v1_error(500, "internal", "用户列表读取失败")
+
+    items = []
+    for u in page:
+        uid = str(u.get("user_id") or "")
+        turn = turn_by_user.get(uid)
+        items.append({
+            "user_id": uid,
+            "display_name": u.get("display_name"),
+            "login_id_masked": registration_store.mask_login_id(
+                u.get("login_id") or ""),
+            "role": u.get("role"),
+            "enabled": not bool(u.get("disabled")),
+            "ai_access": bool(u.get("ai_access")),
+            "created_at": u.get("created_at"),
+            "registration_method": reg_methods.get(uid, "manual"),
+            "campaign": None,   # PR4 来源归因填充
+            "source": None,     # PR4 来源归因填充
+            # 对话额度（turn budget；json 后端无预算权威来源 → null）
+            "turn_used": int(turn["total"]) if turn else None,
+            "turn_limit": int(turn["limit"]) if turn else None,
+            # 金额余额（billing；未开户 null，绝不伪造 0 余额账户）
+            "billing": accounts.get(uid) if billing_ok else None,
+            "last_ai_call_at": last_calls.get(uid) if billing_ok else None,
+        })
+    next_cursor = None
+    if has_more:
+        next_cursor = _admin_v1_encode_cursor({"o": offset + limit})
+    return jsonify(items=items, next_cursor=next_cursor, limit=limit,
+                   billing_available=billing_ok)
+
+
+@app.route("/api/admin/v1/billing/accounts/<user_id>", methods=["GET"])
+def admin_v1_billing_account(user_id):
+    """单用户账户+余额+caps（§9：未开户 account:null，不伪造 0 余额）。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.billing_features_available():
+        return _admin_v1_pg_required()
+    target = user_store.get_user(user_id)
+    if target is None:
+        return _admin_v1_error(404, "user_not_found", "用户不存在")
+    try:
+        account = billing_store.get_billing_account_by_user(user_id)
+        if account is None:
+            return jsonify(user_id=user_id, account=None, balance_nano=None)
+        balance = billing_store.account_balance_nano(account["account_id"])
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 billing account 读取失败")
+        return _admin_v1_error(500, "internal", "账户读取失败")
+    out = dict(account)
+    return jsonify(user_id=user_id, account=out, balance_nano=int(balance))
+
+
+@app.route("/api/admin/v1/billing/usage-events", methods=["GET"])
+def admin_v1_billing_usage_events():
+    """usage 明细分页（§10.4）：model/user_id/status 筛选；unpriced 单独过滤。
+
+    status 仅接受 priced/unpriced（unpriced 不混入「0 元调用」——金额列保持
+    null 而非 0）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.billing_features_available():
+        return _admin_v1_pg_required()
+    limit = _admin_v1_limit_arg()
+    raw_cursor = _admin_v1_decode_cursor(request.args.get("cursor"))
+    cursor = None
+    if raw_cursor and "k" in raw_cursor and isinstance(raw_cursor["k"], list) \
+            and len(raw_cursor["k"]) == 2:
+        cursor = (raw_cursor["k"][0], raw_cursor["k"][1])
+    status = (request.args.get("status") or "").strip() or None
+    if status is not None and status not in billing_store.ADMIN_USAGE_STATUSES:
+        return _admin_v1_error(
+            400, "invalid_request",
+            "status 需为 %s" % (billing_store.ADMIN_USAGE_STATUSES,))
+    try:
+        page = billing_store.admin_usage_events_page(
+            cursor=cursor, limit=limit,
+            model=(request.args.get("model") or "").strip() or None,
+            user_id=(request.args.get("user_id") or "").strip() or None,
+            subject_type=(request.args.get("subject_type") or "").strip() or None,
+            status=status)
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 usage events 读取失败")
+        return _admin_v1_error(500, "internal", "用量明细读取失败")
+    next_cursor = None
+    if page["next_cursor"] is not None:
+        next_cursor = _admin_v1_encode_cursor({"k": list(page["next_cursor"])})
+    return jsonify(items=page["items"], next_cursor=next_cursor, limit=limit)
+
+
+@app.route("/api/admin/v1/billing/ledger", methods=["GET"])
+def admin_v1_billing_ledger():
+    """不可变账本只读分页（§10.4：只读表，冲正用新操作，无编辑/删除）。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.billing_features_available():
+        return _admin_v1_pg_required()
+    limit = _admin_v1_limit_arg()
+    raw_cursor = _admin_v1_decode_cursor(request.args.get("cursor"))
+    cursor = None
+    if raw_cursor and "k" in raw_cursor and isinstance(raw_cursor["k"], list) \
+            and len(raw_cursor["k"]) == 2:
+        cursor = (raw_cursor["k"][0], raw_cursor["k"][1])
+    try:
+        page = billing_store.admin_ledger_page(cursor=cursor, limit=limit)
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 ledger 读取失败")
+        return _admin_v1_error(500, "internal", "账本读取失败")
+    next_cursor = None
+    if page["next_cursor"] is not None:
+        next_cursor = _admin_v1_encode_cursor({"k": list(page["next_cursor"])})
+    return jsonify(items=page["items"], next_cursor=next_cursor, limit=limit)
+
+
+def _admin_v1_provider_balance_payload():
+    """最新 provider 余额快照 + 年龄（无快照 → snapshot:null）。"""
+    snapshot = billing_store.latest_provider_balance_snapshot(
+        BILLING_BALANCE_PROVIDER)
+    age = None
+    if snapshot is not None:
+        age = max(0.0, time.time() - float(snapshot["observed_at"]))
+    return {"provider": BILLING_BALANCE_PROVIDER,
+            "snapshot": snapshot,
+            "age_seconds": age}
+
+
+@app.route("/api/admin/v1/billing/provider-balance", methods=["GET"])
+def admin_v1_billing_provider_balance():
+    """DeepSeek 最新余额快照 + 年龄（§10.1/§10.4 余额卡数据源）。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.billing_features_available():
+        return _admin_v1_pg_required()
+    try:
+        return jsonify(**_admin_v1_provider_balance_payload())
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 provider balance 读取失败")
+        return _admin_v1_error(500, "internal", "供应商余额读取失败")
+
+
+@app.route("/api/admin/v1/billing/provider-balance/refresh", methods=["POST"])
+def admin_v1_billing_provider_balance_refresh():
+    """手动抓取 DeepSeek GET /user/balance 并写快照（§6.6/§9）。
+
+    - 用**加密保存的官方 API key**（ai_config.json 的 enc: 密文经
+      _load_ai_config/_decrypt_api_key 解密，密钥 ai_secret.key 0600）；
+      key 绝不进日志/响应/审计；
+    - 金额十进制字符串经 billing_pricing.parse_balance_to_nano（Decimal 精确
+      换算，禁 float 中转）；解析失败只返回错误类别，**不写伪造零余额**；
+    - 简单节流：PROVIDER_BALANCE_REFRESH_MIN_INTERVAL_SECONDS（进程内，缺省
+      60s）内的重复刷新 429 refresh_throttled；
+    - 失败错误类别（稳定 code）：provider_not_configured /
+      provider_unreachable / provider_rejected（4xx）/ provider_error（5xx、
+      响应形态异常）/ invalid_balance_response（金额解析失败）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.billing_features_available():
+        return _admin_v1_pg_required()
+    with _provider_balance_refresh_lock:
+        now = time.time()
+        if now - _provider_balance_refresh_state["last_ok_attempt"] < \
+                PROVIDER_BALANCE_REFRESH_MIN_INTERVAL_SECONDS:
+            return _admin_v1_error(
+                429, "refresh_throttled",
+                "刷新过于频繁（>%ds 一次）" %
+                int(PROVIDER_BALANCE_REFRESH_MIN_INTERVAL_SECONDS))
+        _provider_balance_refresh_state["last_ok_attempt"] = now
+
+    cfg = _load_ai_config()
+    if _effective_provider_kind(cfg) != AI_PROVIDER_DEEPSEEK_OFFICIAL:
+        _provider_balance_refresh_state["last_ok_attempt"] = 0.0
+        return _admin_v1_error(
+            400, "provider_not_configured",
+            "provider balance 仅支持 deepseek_official 官方配置")
+    api_key = str(cfg.get("api_key") or "").strip()
+    if not api_key:
+        _provider_balance_refresh_state["last_ok_attempt"] = 0.0
+        return _admin_v1_error(
+            400, "provider_not_configured", "官方 API key 未配置")
+    base = str(cfg.get("base_url") or DEEPSEEK_BASE_URL).strip().rstrip("/")
+    url = base + "/user/balance"
+
+    def _fail(status, code, message):
+        # key 不进日志/响应：message 只含类别与状态码
+        app.logger.warning("provider balance refresh 失败（%s）", code)
+        return _admin_v1_error(status, code, message)
+
+    try:
+        # Authorization 头只进官方端点；异常文本可能含 URL，但 URL 不含 key
+        resp = requests.get(url, headers={
+            "Authorization": "Bearer " + api_key,
+        }, timeout=10.0)
+    except (requests.ConnectionError, requests.Timeout):
+        return _fail(502, "provider_unreachable", "官方余额端点不可达")
+    except Exception:
+        return _fail(502, "provider_error", "官方余额端点请求失败")
+    if 400 <= resp.status_code < 500:
+        return _fail(502, "provider_rejected",
+                     "官方余额端点拒绝（HTTP %d）" % resp.status_code)
+    if resp.status_code != 200:
+        return _fail(502, "provider_error",
+                     "官方余额端点异常（HTTP %d）" % resp.status_code)
+    try:
+        body = resp.json()
+    except ValueError:  # requests JSONDecodeError 是 ValueError 子类
+        return _fail(502, "provider_error", "官方余额响应非 JSON")
+    if not isinstance(body, dict):
+        return _fail(502, "provider_error", "官方余额响应形态非法")
+    infos = body.get("balance_infos")
+    cny = None
+    if isinstance(infos, list):
+        for info in infos:
+            if isinstance(info, dict) and str(
+                    info.get("currency") or "").upper() == "CNY":
+                cny = info
+                break
+    if cny is None:
+        return _fail(502, "invalid_balance_response", "响应缺少 CNY 余额条目")
+    try:
+        total = billing_pricing.parse_balance_to_nano(cny["total_balance"])
+        granted = billing_pricing.parse_balance_to_nano(
+            cny.get("granted_balance"))
+        topped = billing_pricing.parse_balance_to_nano(
+            cny.get("topped_up_balance"))
+    except (KeyError, TypeError, ValueError):
+        # 不写伪造零余额：解析失败只报错误类别（§5/§6.6）
+        return _fail(502, "invalid_balance_response", "余额金额解析失败")
+    is_available = bool(body.get("is_available"))
+    try:
+        snapshot = billing_store.insert_provider_balance_snapshot(
+            BILLING_BALANCE_PROVIDER, "CNY", total, granted, topped,
+            is_available, datetime.now(timezone.utc))
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("provider balance 快照写入失败")
+        return _admin_v1_error(500, "internal", "余额快照写入失败")
+    _audit("billing.provider_balance_refresh",
+           target_type="provider_balance", target_id=BILLING_BALANCE_PROVIDER,
+           detail={"status": "ok", "is_available": is_available})
+    return jsonify(ok=True, snapshot=snapshot, age_seconds=0.0,
+                   provider=BILLING_BALANCE_PROVIDER)
+
+
+@app.route("/api/admin/v1/audit", methods=["GET"])
+def admin_v1_audit():
+    """审计分页（§10.5）：cursor(offset) + action 筛选，detail 出口脱敏。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    limit = _admin_v1_limit_arg()
+    cur = _admin_v1_decode_cursor(request.args.get("cursor"))
+    offset = int(cur.get("o") or 0) if cur else 0
+    if offset < 0:
+        offset = 0
+    action = (request.args.get("action") or "").strip() or None
+    try:
+        events = share_store.list_audit(limit=limit + 1, offset=offset,
+                                        action=action)
+    except Exception:
+        app.logger.exception("admin v1 audit 读取失败")
+        return _admin_v1_error(500, "internal", "审计读取失败")
+    has_more = len(events) > limit
+    events = events[:limit]
+    next_cursor = None
+    if has_more:
+        next_cursor = _admin_v1_encode_cursor({"o": offset + limit})
+    return jsonify(items=[_admin_v1_audit_event_out(e) for e in events],
+                   next_cursor=next_cursor, limit=limit)
+
+
+@app.route("/api/admin/v1/turn-budgets", methods=["GET"])
+def admin_v1_turn_budgets():
+    """现有 turn 预算读取（§9 GET /api/admin/v1/turn-budgets 只读版）。
+
+    返回与旧 GET /api/admin/settings/ai-budget 同源的 period/limits/usage
+    （budget_store.usage_report 权威原语）；写方法（update/new-period）属
+    PR5，本批不实现。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.budget_features_available():
+        return _admin_v1_error(
+            503, "pg_backend_required",
+            "turn 预算要求 STORAGE_BACKEND=postgres（当前 %r），fail-closed"
+            % platform_features.current_backend())
+    try:
+        report = budget_store.usage_report()
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 turn budgets 读取失败")
+        return _admin_v1_error(500, "internal", "turn 预算读取失败")
+    period = report["period"]
+    limits = {k: period.get(k) for k in _BUDGET_SETTINGS_FIELDS}
+    return jsonify(
+        period={"id": period["id"],
+                "started_at": period["started_at"],
+                "closed_at": period["closed_at"]},
+        limits=limits,
+        usage=report,
+        backend=platform_features.current_backend(),
+    )
 
 
 @app.route("/api/slides")

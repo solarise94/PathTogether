@@ -6,35 +6,204 @@
   <meta name="referrer" content="no-referrer">
   <title>PathTogether Admin</title>
   <!--
-    pathtogether-admin 插件 UI（PR3 骨架，docs/admin-billing-plugin-implementation-plan.md §8）。
+    pathtogether-admin 插件 UI（PR3b 只读版，docs/admin-billing-plugin-
+    implementation-plan.md §10）。
 
     运行环境：/admin 宿主页的 <iframe sandbox="allow-scripts"> 内 —— opaque origin：
       - 不能读写 localStorage/cookie（也绝不尝试）；
       - 不能直接 fetch 平台 API（同源 fetch 被 sandbox 阻断）；
-      - 一切平台数据经 AdminBridge postMessage 通道（static/admin-host.js 宿主侧）。
+      - 一切平台数据经 AdminBridge postMessage 通道（static/admin-host.js 宿主侧）；
+      - 全部页面状态只在内存（当前页/筛选/分页游标），刷新即回概览首页。
 
-    本页只加载相对路径的 style.css / main.js（解析为 owner-only 的
-    /admin/plugin-assets/pathtogether-admin/ui/*，同源 'self'，满足响应 CSP）。
-    不写内联 <style>/<script>（CSP 无 unsafe-inline）。
+    页面（§10.1/§10.2/§10.4/§10.5 只读部分）：
+      - 概览：用户计数 + 双额度并列（「对话额度」与「金额余额」分开标注，
+        §10.1 红线）+ cache 命中率 + provider 余额 + unpriced/lag；
+      - 用户：只读表格（操作按钮 PR5 实现）；
+      - 额度与账单：turn 预算卡 + usage 明细（筛选/unpriced 单独告警）+
+        ledger 只读表 + provider 余额卡（手动刷新）；
+      - 审计：表格（detail 已由服务端脱敏）。
+
+    只加载相对路径 style.css / main.js（owner-only 的
+    /admin/plugin-assets/pathtogether-admin/ui/*）；不写内联样式/脚本（CSP）。
   -->
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <header class="adm-header">
     <h1>PathTogether 管理工作台</h1>
-    <p class="adm-sub">admin.workspace 插件 · PR3 骨架（业务页面后续批次接入）</p>
+    <p class="adm-sub" id="adm-handshake-status">等待宿主初始化消息…</p>
+    <nav class="adm-nav" id="adm-nav">
+      <button type="button" class="adm-nav-btn" data-page="overview">概览</button>
+      <button type="button" class="adm-nav-btn" data-page="users">用户</button>
+      <button type="button" class="adm-nav-btn" data-page="billing">额度与账单</button>
+      <button type="button" class="adm-nav-btn" data-page="audit">审计</button>
+    </nav>
   </header>
 
   <main id="adm-root" class="adm-root">
-    <section class="adm-card" id="adm-handshake-card">
-      <h2>桥接握手</h2>
-      <p id="adm-handshake-status" class="adm-status">等待宿主初始化消息…</p>
+    <!-- 概览（§10.1） -->
+    <section class="adm-page" id="adm-page-overview" hidden>
+      <section class="adm-card" id="adm-actor-card">
+        <h2>当前身份</h2>
+        <dl id="adm-actor-info" class="adm-kv"></dl>
+      </section>
+      <section class="adm-card">
+        <h2>用户</h2>
+        <dl id="adm-ov-users" class="adm-kv"></dl>
+      </section>
+      <section class="adm-card">
+        <h2>对话额度（turn budget · 本周期）</h2>
+        <p class="adm-note">按次计的 Agent 对话额度，与下方金额余额是两种不同额度（§10.1）。</p>
+        <dl id="adm-ov-turn" class="adm-kv"></dl>
+      </section>
+      <section class="adm-card">
+        <h2>金额余额与用量（billing · nano-CNY）</h2>
+        <p class="adm-note">DeepSeek 总余额是平台供应商余额，只作成本监控，不等于任何用户余额（§4/§10.1）。</p>
+        <dl id="adm-ov-billing" class="adm-kv"></dl>
+      </section>
+      <section class="adm-card">
+        <h2>模型调用与缓存</h2>
+        <dl id="adm-ov-usage" class="adm-kv"></dl>
+      </section>
+      <section class="adm-card" id="adm-ov-alert-card" hidden>
+        <h2>告警</h2>
+        <ul id="adm-ov-alerts" class="adm-alerts"></ul>
+      </section>
     </section>
 
-    <section class="adm-card" id="adm-overview-card" hidden>
-      <h2>概览</h2>
-      <dl id="adm-actor-info" class="adm-kv"></dl>
-      <p class="adm-note">本批仅接入 admin.auth.get；overview / users / billing 等业务页面由后续批次（PR3b）填充。</p>
+    <!-- 用户（§10.2 只读） -->
+    <section class="adm-page" id="adm-page-users" hidden>
+      <section class="adm-card">
+        <h2>用户（只读）</h2>
+        <p class="adm-note">操作（启停 / AI access / 重置密码 / 账本）在 PR5 提供写方法后开放；「金额余额」为 null 表示尚未开户。</p>
+        <div class="adm-filters" id="adm-users-filters">
+          <input type="search" id="adm-users-q" placeholder="搜索 login ID / 显示名" maxlength="128">
+          <select id="adm-users-enabled">
+            <option value="">启用状态：全部</option>
+            <option value="true">仅启用</option>
+            <option value="false">仅禁用</option>
+          </select>
+          <select id="adm-users-ai">
+            <option value="">AI access：全部</option>
+            <option value="true">仅有 AI access</option>
+            <option value="false">仅无 AI access</option>
+          </select>
+          <button type="button" id="adm-users-search-btn">筛选</button>
+        </div>
+        <div class="adm-table-wrap">
+          <table class="adm-table" id="adm-users-table">
+            <thead>
+              <tr>
+                <th>显示名</th><th>登录账号</th><th>角色</th><th>状态</th>
+                <th>AI access</th><th>创建时间</th><th>注册方式</th>
+                <th>对话额度（用/上限）</th><th>金额余额（nano）</th>
+                <th>soft/hard cap</th><th>最近 AI 调用</th>
+              </tr>
+            </thead>
+            <tbody id="adm-users-tbody"></tbody>
+          </table>
+        </div>
+        <div class="adm-pager">
+          <button type="button" id="adm-users-more-btn">加载更多</button>
+          <span id="adm-users-status" class="adm-status"></span>
+        </div>
+      </section>
+    </section>
+
+    <!-- 额度与账单（§10.4 只读部分） -->
+    <section class="adm-page" id="adm-page-billing" hidden>
+      <section class="adm-card">
+        <h2>对话额度（turn budget · 当前周期）</h2>
+        <dl id="adm-billing-turn" class="adm-kv"></dl>
+      </section>
+      <section class="adm-card">
+        <h2>供应商余额（DeepSeek · 平台成本监控）</h2>
+        <dl id="adm-billing-provider" class="adm-kv"></dl>
+        <p class="adm-pager">
+          <button type="button" id="adm-balance-refresh-btn">手动刷新余额</button>
+          <span id="adm-balance-refresh-status" class="adm-status"></span>
+        </p>
+      </section>
+      <section class="adm-card adm-error-card" id="adm-unpriced-card" hidden>
+        <h2>Unpriced 事件告警</h2>
+        <p class="adm-note">未计价事件不等于 0 元调用（§10.4 红线）：以下事件缺少可用的最终价格或 usage，需单独排查。</p>
+        <div class="adm-table-wrap">
+          <table class="adm-table">
+            <thead><tr><th>时间</th><th>模型</th><th>原因</th><th>event</th></tr></thead>
+            <tbody id="adm-unpriced-tbody"></tbody>
+          </table>
+        </div>
+        <div class="adm-pager">
+          <button type="button" id="adm-unpriced-more-btn">加载更多</button>
+        </div>
+      </section>
+      <section class="adm-card">
+        <h2>用量明细（usage events）</h2>
+        <div class="adm-filters" id="adm-usage-filters">
+          <input type="text" id="adm-usage-model" placeholder="模型（精确）" maxlength="128">
+          <input type="text" id="adm-usage-user" placeholder="user_id（精确）" maxlength="128">
+          <select id="adm-usage-status">
+            <option value="">状态：全部</option>
+            <option value="priced">priced</option>
+            <option value="unpriced">unpriced</option>
+          </select>
+          <button type="button" id="adm-usage-search-btn">筛选</button>
+        </div>
+        <div class="adm-table-wrap">
+          <table class="adm-table">
+            <thead>
+              <tr>
+                <th>时间</th><th>模型</th><th>主体</th><th>状态</th>
+                <th>hit/miss/output</th><th>provider 成本</th><th>charge</th><th>event</th>
+              </tr>
+            </thead>
+            <tbody id="adm-usage-tbody"></tbody>
+          </table>
+        </div>
+        <div class="adm-pager">
+          <button type="button" id="adm-usage-more-btn">加载更多</button>
+          <span id="adm-usage-status" class="adm-status"></span>
+        </div>
+      </section>
+      <section class="adm-card">
+        <h2>账本（ledger · 只读不可变）</h2>
+        <p class="adm-note">账本只读；冲正通过新条目追加，不提供编辑/删除（§10.4）。</p>
+        <div class="adm-table-wrap">
+          <table class="adm-table">
+            <thead>
+              <tr><th>时间</th><th>账户</th><th>类型</th><th>金额（nano）</th><th>原因</th><th>entry</th></tr>
+            </thead>
+            <tbody id="adm-ledger-tbody"></tbody>
+          </table>
+        </div>
+        <div class="adm-pager">
+          <button type="button" id="adm-ledger-more-btn">加载更多</button>
+        </div>
+      </section>
+    </section>
+
+    <!-- 审计（§10.5） -->
+    <section class="adm-page" id="adm-page-audit" hidden>
+      <section class="adm-card">
+        <h2>审计</h2>
+        <p class="adm-note">密码、token、API key、完整 IP 永不展示（服务端出口已脱敏；idempotency key 仅显示后缀）。</p>
+        <div class="adm-filters">
+          <input type="text" id="adm-audit-action" placeholder="action（精确，如 user.create）" maxlength="128">
+          <button type="button" id="adm-audit-search-btn">筛选</button>
+        </div>
+        <div class="adm-table-wrap">
+          <table class="adm-table">
+            <thead>
+              <tr><th>时间</th><th>actor</th><th>action</th><th>target</th><th>detail</th></tr>
+            </thead>
+            <tbody id="adm-audit-tbody"></tbody>
+          </table>
+        </div>
+        <div class="adm-pager">
+          <button type="button" id="adm-audit-more-btn">加载更多</button>
+          <span id="adm-audit-status" class="adm-status"></span>
+        </div>
+      </section>
     </section>
 
     <section class="adm-card adm-error-card" id="adm-error-card" hidden>

@@ -345,15 +345,17 @@ def test_audit_pagination_and_sanitization():
 # 5. PG：overview 双额度 / usage / ledger / account
 # --------------------------------------------------------------------------- #
 def _seed_event(name, subject_type, subject_id, *, hours_back=1,
-                session_id=None, request_id=None, mutate=None):
+                session_id=None, request_id=None, mutate=None, occurred=None):
     """经 billing_store.ingest_usage_event 直接入库（绕开插件 JWT 通道）。
 
     绑定权威行（reservation）后按 fixture 事件投递；``mutate`` 可在投递前
-    改事件（构造 unpriced 等）。返回 (event_id, status)。
+    改事件（构造 unpriced 等）。``occurred`` 显式指定 aware datetime（缺省
+    now-hours_back）。返回 (event_id, status)。
     """
     event = bh.load_event(name)
     now = datetime.now(timezone.utc)
-    occurred = now - timedelta(hours=hours_back)
+    occurred = occurred if occurred is not None \
+        else now - timedelta(hours=hours_back)
     event["occurred_at"] = occurred.isoformat().replace("+00:00", "Z")
     event["enqueued_at"] = (occurred + timedelta(seconds=2)
                             ).isoformat().replace("+00:00", "Z")
@@ -384,11 +386,20 @@ def _make_arithmetic_bad(event):
 @PG
 def test_overview_dual_quota_semantics():
     """概览必须同时含「对话额度」（turn）与「金额余额」（billing）两段（§10.1）。"""
+    import billing_pricing
     owner, usera = _setup_users()
     bh.seed_price_books_with_history()
-    _seed_event("01_owner_priced_flash_peak.json", "owner", owner["user_id"])
+    # 事件固定在「今日（Asia/Shanghai）零点后 1 秒」：model_calls_today 的
+    # 窗口是计价时区当日零点起，若用 now-1h/2h 平移，深夜（00:00–02:00）
+    # 跑测试时事件会落在昨日 → 计数 0（曾由此产生跨零点偶发失败）。零点后
+    # 1 秒恒 ≤ now 且不超 5 分钟超前容忍，30 天窗口内，任何时段确定性成立。
+    today_local = datetime.now(
+        tz=billing_pricing.PRICING_TIMEZONE).replace(
+        hour=0, minute=0, second=0, microsecond=0) + timedelta(seconds=1)
+    _seed_event("01_owner_priced_flash_peak.json", "owner", owner["user_id"],
+                occurred=today_local)
     _seed_event("02_user_priced_pro_offpeak_reasoning.json", "user",
-                usera["user_id"], hours_back=2)
+                usera["user_id"], occurred=today_local + timedelta(minutes=30))
     # 周期在事件之后才创建（bind_reservation 首次触发）——把起点回拨到事件
     # 之前，使「本周期」窗口覆盖种子事件（金额聚合断言才有意义）
     conn = bh.connect()
@@ -557,7 +568,11 @@ def test_account_null_when_not_opened_and_balance_when_opened():
 
 
 @PG
-def test_users_row_joins_turn_billing_last_call():
+def test_users_row_joins_turn_billing_last_call(monkeypatch):
+    # 本用例聚焦 users 行联结展示；关闭 PR6 模拟扣费，避免 _seed_event 的
+    # priced 事件自动开户/入账改变下方「开户 + 余额」断言的账面（模拟扣费
+    # 语义由 tests/test_billing_sim_debit.py 覆盖）
+    monkeypatch.setenv("BILLING_SIMULATED_DEBIT", "0")
     owner, usera = _setup_users(1)
     bh.seed_price_books_with_history()
     _seed_event("02_user_priced_pro_offpeak_reasoning.json", "user",

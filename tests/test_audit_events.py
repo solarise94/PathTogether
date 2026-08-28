@@ -414,7 +414,9 @@ def test_usage_ingest_audit_no_sensitive_content(monkeypatch):
     detail = events[0]["detail"]
     assert set(detail.keys()) <= {"provider", "model", "subject_type", "status",
                                   "duplicate", "unpriced_reason",
-                                  "installation_id", "plugin_id"}
+                                  "installation_id", "plugin_id",
+                                  # PR6 模拟扣费结果并入 detail（§19 v0.4）
+                                  "simulated_debit", "simulated_debit_skipped"}
     dumped = _json.dumps(detail, ensure_ascii=False)
     for banned in ("api_key", "password", "prompt", "raw_usage",
                    event["session_id"], "Bearer"):

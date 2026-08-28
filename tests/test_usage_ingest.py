@@ -10,8 +10,8 @@ PG 模式（RUN_PG_TESTS=1）：schema 正例、幂等重放、payload/call_id �
 主体绑定各路径（reservation 匹配 / demo session / run grant 仅交叉校验不
 补位、assertion 冲突 / not_ready 可重试）、未知模型与缺价格 unpriced、时钟 skew
 两条（含 BILLING_OCCURRED_AT_MAX_AGE_DAYS 可配）、算术不符 unpriced、
-影子阶段 ledger 为空、demo 主体不入 ledger/不开户、敏感字段不出现在
-响应与 audit。
+PR6 模拟扣费语义（demo 主体不入 ledger/不开户；正向路径见
+test_billing_sim_debit.py）、敏感字段不出现在响应与 audit。
 
 运行：cd 项目根 && python3 -m pytest tests/test_usage_ingest.py -q
 """
@@ -612,23 +612,56 @@ def test_arithmetic_mismatch_unpriced():
 
 
 @PG
-def test_shadow_ledger_empty_demo_no_account():
+def test_pr6_sim_debit_semantics_and_demo_red_line():
+    """PR6 模拟软扣费（§12.2/§19 v0.4）：owner/user priced 扣、demo 永不。
+
+    owner 主体用真实注册用户（自动开户 + 一条负 debit）；合成 subject（无
+    users 行）不开户（user_missing）；04 unpriced 不扣；05 demo priced 只计量。
+    金额/幂等/失败路径的完整断言在 tests/test_billing_sim_debit.py。
+    """
+    import user_store
     inst = _bootstrap()
     token = _token_for(inst)
     bh.seed_price_books_with_history()
-    for name in ("01_owner_priced_flash_peak.json",
-                 "04_owner_interrupted_no_usage.json",
-                 "05_demo_subject_offpeak.json"):
-        event = _fresh(bh.load_event(name))
-        _bind_for(event)
-        assert _post(event, token=token).status_code == 200
+    owner = user_store.create_user("simdeb-route@x.com", "pass123456789012",
+                                   role="owner")
+    client = _client()
+
+    # ① owner priced（真实用户）→ 自动开户 + 一条负金额 usage_debit
+    event = _fresh(bh.load_event("01_owner_priced_flash_peak.json"))
+    event["subject_id"] = owner["user_id"]
+    event["user_id"] = owner["user_id"]
+    _bind_for(event)  # reservation 以改写后的 subject 绑定
+    r = _post(event, token=token, client=client)
+    assert r.status_code == 200 and r.get_json()["status"] == "priced"
+    charge = billing_store.get_usage_event(event["event_id"])["charge_nano_cny"]
+    acct = billing_store.get_billing_account_by_user(owner["user_id"])
+    assert acct is not None, "owner priced 应自动开户"
+    assert billing_store.account_balance_nano(acct["account_id"]) == -charge
+
+    # ② owner unpriced（中断无 usage）→ 不追加 debit（仍只有 ① 那一条）
+    aborted = _fresh(bh.load_event("04_owner_interrupted_no_usage.json"))
+    aborted["subject_id"] = owner["user_id"]
+    aborted["user_id"] = owner["user_id"]
+    _bind_for(aborted)
+    assert _post(aborted, token=token, client=client).status_code == 200
+
+    # ③ demo priced → 只计量：不开户、不写 ledger（§14.1 红线）
+    demo = _fresh(bh.load_event("05_demo_subject_offpeak.json"))
+    _bind_for(demo)
+    assert _post(demo, token=token, client=client).status_code == 200
+
     conn = bh.connect()
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) AS n FROM billing_ledger_entries")
-            assert cur.fetchone()["n"] == 0, "影子阶段不得写 ledger"
+            assert cur.fetchone()["n"] == 1, "仅 ① 一条模拟 debit"
             cur.execute("SELECT COUNT(*) AS n FROM billing_accounts")
-            assert cur.fetchone()["n"] == 0, "demo 主体永不开户"
+            assert cur.fetchone()["n"] == 1, "仅 owner 一户，demo 永不开户"
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM ai_usage_events "
+                "WHERE subject_type='demo' AND user_id IS NOT NULL")
+            assert cur.fetchone()["n"] == 0
     finally:
         conn.close()
 
@@ -659,7 +692,9 @@ def test_no_sensitive_data_in_response_or_audit():
         conn.close()
     assert details, "应写入 ingest audit"
     allowed = {"provider", "model", "subject_type", "status", "duplicate",
-               "unpriced_reason", "installation_id", "plugin_id"}
+               "unpriced_reason", "installation_id", "plugin_id",
+               # PR6 模拟扣费结果并入 detail（§19 v0.4；非敏感）
+               "simulated_debit", "simulated_debit_skipped"}
     for detail in details:
         assert set(detail.keys()) <= allowed, detail
         dumped = json.dumps(detail, ensure_ascii=False)

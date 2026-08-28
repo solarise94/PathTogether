@@ -11,8 +11,10 @@ fail-closed（json/dual 返回稳定 ``pg_backend_required``，不降级进程�
     tests/fixtures/usage_events/README.md 为唯一依据，PR0 互锁用例校验）；
   - :func:`ingest_usage_event`：单事务投递端点数据层（§7.5）——dedup 比对
     payload_hash → §7.2 四步权威主体解析 → 时钟偏差/算术校验 → 双 price book
-    计价写回（或 unpriced+reason）→ 同事务无敏感信息 audit。**影子阶段不写
-    任何 billing_ledger_entries，demo 主体永不开户**；
+    计价写回（或 unpriced+reason）→ PR6 模拟软扣费（§12.2/§19 v0.4：priced
+    且 owner/user 主体同事务自动开户 + 负金额 usage_debit，SAVEPOINT
+    best-effort 不阻断计量）→ 同事务无敏感信息 audit（含扣费结果）。
+    **demo 主体永不开户、永不扣账（§14.1 红线）**；
   - price book 创建/激活（§6.3：固定 key ``pg_advisory_xact_lock`` + active
     区间重叠拒绝，明确不用 btree_gist）；
   - 账户/账本/余额快照基础读写（余额 = SUM(amount)，projection 可重建）；
@@ -20,12 +22,14 @@ fail-closed（json/dual 返回稳定 ``pg_backend_required``，不降级进程�
     （Decimal，禁 float 中转）。
 
 审计红线：不落 prompt/输出文本/图片/API key/完整 IP/完整请求体；ingest
-audit 只含 provider/model/subject_type/status/duplicate/unpriced_reason 等
-非敏感字段。
+audit 只含 provider/model/subject_type/status/duplicate/unpriced_reason 与
+PR6 模拟扣费结果（simulated_debit{entry_id, amount_nano_cny, duplicate} /
+simulated_debit_skipped<原因词表>）等非敏感字段。
 """
 
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -37,6 +41,10 @@ import billing_pricing
 import pg_store
 import platform_features
 import share_store_pg
+
+#: 本模块日志（模拟扣费 best-effort 失败的 warning/指标行走这里；消息只含
+#: event_id 与错误类别，绝不落 SQL 参数/主体/请求内容）
+_LOG = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
 # 常量
@@ -109,6 +117,76 @@ USAGE_INGEST_AUDIT_ACTION = "usage.ingest"
 #: None）。tests/test_billing_store.py 用它在连接 A 的两条语句之间用连接 B
 #: 提交同 event_id/call_id 行，确定性复现并发投递竞态（§7.5 步骤 2）。
 _INGEST_PRE_INSERT_HOOK = None
+
+# --------------------------------------------------------------------------- #
+# PR6 模拟软扣费（§12.2 Phase B / §19 v0.4；owner 2026-08-28 指令：
+# 注册用户不做真实计费限制，只在后台记录数据做模拟计费）
+# --------------------------------------------------------------------------- #
+#: BILLING_SIMULATED_DEBIT 的关闭值（大小写不敏感；缺省启用）
+_SIM_DEBIT_OFF_VALUES = ("0", "false", "off")
+
+#: 模拟扣费行的 reason（§6.5 reason 必填非空；不含敏感信息）
+SIM_DEBIT_REASON = "模拟扣费（PR6）"
+
+#: ingest audit detail 的跳过原因稳定词表（simulated_debit_skipped 的取值，
+#: 供测试与排障对齐；不得掺入敏感信息）：
+#:   - ``disabled``            —— BILLING_SIMULATED_DEBIT=0/false/off（优先判定，
+#:                                开关关闭时所有事件统一记 disabled，便于生产
+#:                                确认开关生效）；
+#:   - ``unpriced``            —— 事件未计价（含 void），无从扣费；
+#:   - ``demo_subject``        —— demo 主体永不开户（§14.1 红线）；
+#:   - ``user_missing``        —— owner/user 主体在 users 无行（权威归因保留在
+#:                                subject 列，但 billing_accounts.user_id 有 FK，
+#:                                不伪造用户行也不开户）；
+#:   - ``zero_charge``         —— priced 但 customer_charge 为 0（usage_debit
+#:                                的符号 CHECK 要求严格负数，0 元不能入账）；
+#:   - ``account_suspended``   —— 账户 status 非 active（suspended/closed）；
+#:   - ``failed``              —— 扣费段异常（SAVEPOINT 已回滚；ingest 主路径
+#:                                不受影响，另计 billing_sim_debit_failed_total）。
+SIM_DEBIT_SKIPPED_DISABLED = "disabled"
+SIM_DEBIT_SKIPPED_UNPRICED = "unpriced"
+SIM_DEBIT_SKIPPED_DEMO = "demo_subject"
+SIM_DEBIT_SKIPPED_USER_MISSING = "user_missing"
+SIM_DEBIT_SKIPPED_ZERO_CHARGE = "zero_charge"
+SIM_DEBIT_SKIPPED_ACCOUNT_SUSPENDED = "account_suspended"
+SIM_DEBIT_SKIPPED_FAILED = "failed"
+
+#: 模拟扣费 best-effort 失败计数（进程内，重启归零；只用于观测，不做限流）
+_SIM_DEBIT_FAILED_TOTAL = 0
+
+#: 测试专用钩子：SAVEPOINT sp_sim_debit 内、开户/入账语句之前同步回调
+#: （生产恒 None）。tests/test_billing_sim_debit.py 用它确定性注入扣费段异常，
+#: 验证 ingest 主路径不受影响（ROLLBACK TO SAVEPOINT + skipped=failed）。
+_SIM_DEBIT_HOOK = None
+
+
+def simulated_debit_enabled() -> bool:
+    """PR6 模拟软扣费开关（env ``BILLING_SIMULATED_DEBIT``，缺省启用）。
+
+    ``0/false/off``（大小写不敏感、允许首尾空白）关闭，其余（含未设置）启用。
+    每次调用现读 env（与 :func:`occurred_at_max_age_days` 同风格，测试
+    monkeypatch.setenv 即时生效）。json/dual 后端天然 no-op——ingest 入口本就
+    ``require_pg_backend("billing")`` fail-closed，开关只在 PG 路径有意义。
+    """
+    raw = (os.environ.get("BILLING_SIMULATED_DEBIT") or "").strip().lower()
+    return raw not in _SIM_DEBIT_OFF_VALUES
+
+
+def _sim_debit_note_failure(event_id, exc):
+    """模拟扣费失败：进程内计数 + 无敏感 warning + 指标日志行。
+
+    日志只含 event_id 与错误类别（异常类型名）——异常消息可能携带 SQL 参数，
+    不落。指标行仿 HistoPilot outbox 的单行 JSON 风格，供日志侧聚合：
+    ``[billing-sim-debit] {"metric":"billing_sim_debit_failed_total","value":N}``。
+    """
+    global _SIM_DEBIT_FAILED_TOTAL
+    _SIM_DEBIT_FAILED_TOTAL += 1
+    _LOG.warning(
+        "[billing-sim-debit] 模拟扣费失败（best-effort 已回滚，事件照常入库）"
+        " event_id=%s error=%s", event_id, type(exc).__name__)
+    _LOG.warning(
+        '[billing-sim-debit] {"metric":"billing_sim_debit_failed_total",'
+        '"value":%d}', _SIM_DEBIT_FAILED_TOTAL)
 
 #: price book 激活串行化 advisory key（§6.3，事务级；稳定 bigint "BLPB"）
 _PRICE_BOOK_LOCK_KEY = 0x424C5042
@@ -586,6 +664,127 @@ def _classify_unpriced(event, occurred, received, max_age_days):
     return ("priced" if not reason else "unpriced", reason, stored)
 
 
+def _apply_simulated_usage_debit(cur, event, *, subject_type, user_id, status,
+                                 charge, charge_price_book_id, stored_tokens):
+    """ingest 事务内的 PR6 模拟软扣费（§12.2 Phase B / §19 v0.4）。
+
+    触发：``status == "priced"`` 且主体为 owner/user（**demo 永不开户、永不
+    扣账**，§14.1 红线）；主体尚无 billing_accounts 行则同事务自动开户
+    （currency 默认 CNY、account_id ``bac_<24hex>``、并发/既有账户经
+    ``ON CONFLICT (user_id) DO NOTHING`` 后改读既有行）。扣费行：
+    ``kind='usage_debit'``、``amount_nano_cny = -charge``（customer_charge 价，
+    负数由数据库符号 CHECK 强制）、幂等键固定 ``usage:<event_id>``（部分唯一
+    索引兜底同 event 只一条）、``actor_user_id=NULL``（系统行为非人工操作）、
+    metadata 至少含 ``{simulated, charge_price_book_id, model, total_tokens,
+    session_id}``（全部非敏感字段）。
+
+    **模拟阶段纪律（best-effort，不阻断 ingest）**：整段包在显式
+    ``SAVEPOINT sp_sim_debit`` 里，任何异常 → ``ROLLBACK TO SAVEPOINT`` +
+    :func:`_sim_debit_note_failure`（warning + 失败计数），ingest 主路径必须
+    仍成功——模拟期计量链路可用性优先于模拟账完整性。**真实计费阶段此处
+    分支必须改成强一致（扣费失败即让整个事务回滚，事件与 debit 同生共死）**；
+    模拟期之所以放宽，正是为了先观察余额/幂等/失败率数据再收紧（§14.3 门槛
+    被 owner 2026-08-28 指令覆盖为「只记录不限制」）。
+
+    返回并入 ingest audit detail 的片段（同一事务，§6.5「写 ledger 与 audit
+    同事务」不变）：
+      - 成功：``{"simulated_debit": {"entry_id", "amount_nano_cny",
+        "duplicate"}}``（amount 为负整数；admin v1 出口经
+        ``_admin_v1_nano_out`` 白名单键 ``amount_nano_cny`` 递归字符串化）；
+      - 跳过：``{"simulated_debit_skipped": <词表见 SIM_DEBIT_SKIPPED_*>}``。
+    """
+    if not simulated_debit_enabled():
+        return {"simulated_debit_skipped": SIM_DEBIT_SKIPPED_DISABLED}
+    if status != "priced" or charge is None:
+        return {"simulated_debit_skipped": SIM_DEBIT_SKIPPED_UNPRICED}
+    if subject_type not in ("owner", "user"):
+        return {"simulated_debit_skipped": SIM_DEBIT_SKIPPED_DEMO}
+    if not user_id:
+        # users 行缺（权威归因仍在事件 subject 列）：billing_accounts.user_id
+        # 有 FK，不伪造用户行也不开户——只记 warning（数据态，非扣费故障，
+        # 不动失败计数）
+        _LOG.warning("[billing-sim-debit] 主体无 users 行，跳过模拟扣费"
+                     " event_id=%s subject_type=%s", event["event_id"],
+                     subject_type)
+        return {"simulated_debit_skipped": SIM_DEBIT_SKIPPED_USER_MISSING}
+    if int(charge) <= 0:
+        # usage_debit 符号 CHECK 要求严格负数；全 0 token 的 priced 事件
+        # charge 为 0，不能也无需入账（≠ 0 元冒充扣费）
+        return {"simulated_debit_skipped": SIM_DEBIT_SKIPPED_ZERO_CHARGE}
+
+    cur.execute("SAVEPOINT sp_sim_debit")
+    try:
+        if _SIM_DEBIT_HOOK is not None:
+            _SIM_DEBIT_HOOK(cur)
+        # 自动开户（缺户时）。并发同用户投递：对方先提交同 user_id 账户 →
+        # ON CONFLICT DO NOTHING 不置 aborted，改读既有行（与
+        # apply_billing_adjustment 的开户先例同构，pg_store.transaction 无
+        # 自动 savepoint，不能用裸 INSERT 吞 UniqueViolation）。
+        cur.execute(
+            "INSERT INTO billing_accounts (account_id, user_id) "
+            "VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING "
+            "RETURNING account_id, status",
+            ("bac_" + secrets.token_hex(12), user_id))
+        acct = cur.fetchone()
+        if acct is None:
+            cur.execute(
+                "SELECT account_id, status FROM billing_accounts "
+                "WHERE user_id=%s", (user_id,))
+            acct = cur.fetchone()
+        if acct is None:
+            raise RuntimeError("billing account row missing after upsert")
+        if acct["status"] != "active":
+            # suspended/closed：模拟期同样不扣（真实计费期的语义另行决策）；
+            # 账户行来自上面的读路径（新开户恒 active），回滚 savepoint 只会
+            # 丢弃本段内未提交的语句，主事务不受影响
+            cur.execute("ROLLBACK TO SAVEPOINT sp_sim_debit")
+            _LOG.warning("[billing-sim-debit] 账户非 active，跳过模拟扣费"
+                         " event_id=%s account_status=%s", event["event_id"],
+                         acct["status"])
+            return {"simulated_debit_skipped":
+                    SIM_DEBIT_SKIPPED_ACCOUNT_SUSPENDED}
+
+        event_id = event["event_id"]
+        entry_id = _LEDGER_ENTRY_ID_PREFIX + secrets.token_hex(12)
+        metadata = {
+            "simulated": True,
+            "charge_price_book_id": charge_price_book_id,
+            "model": event["model"],
+            "total_tokens": (stored_tokens or {}).get("total_tokens"),
+            "session_id": event["session_id"],
+        }
+        # ON CONFLICT DO NOTHING 兜底（正常流到不了重放：同 event 重放在
+        # dedup 步骤已提前返回；此处防御 event 行被清而 ledger 残留等异常态）
+        cur.execute(
+            "INSERT INTO billing_ledger_entries "
+            "(entry_id, account_id, event_id, kind, amount_nano_cny, "
+            " idempotency_key, reason, actor_user_id, metadata) "
+            "VALUES (%s,%s,%s,'usage_debit',%s,%s,%s,NULL,%s) "
+            "ON CONFLICT (idempotency_key) DO NOTHING "
+            "RETURNING entry_id, amount_nano_cny",
+            (entry_id, acct["account_id"], event_id, -int(charge),
+             "usage:%s" % event_id, SIM_DEBIT_REASON,
+             psycopg.types.json.Jsonb(metadata)))
+        row = cur.fetchone()
+        duplicate = row is None
+        if duplicate:
+            cur.execute(
+                "SELECT entry_id, amount_nano_cny "
+                "FROM billing_ledger_entries WHERE idempotency_key=%s",
+                ("usage:%s" % event_id,))
+            row = cur.fetchone()
+        cur.execute("RELEASE SAVEPOINT sp_sim_debit")
+        return {"simulated_debit": {
+            "entry_id": row["entry_id"],
+            "amount_nano_cny": int(row["amount_nano_cny"]),
+            "duplicate": duplicate,
+        }}
+    except Exception as exc:  # noqa: BLE001 —— best-effort 边界（见 docstring）
+        cur.execute("ROLLBACK TO SAVEPOINT sp_sim_debit")
+        _sim_debit_note_failure(event["event_id"], exc)
+        return {"simulated_debit_skipped": SIM_DEBIT_SKIPPED_FAILED}
+
+
 def ingest_usage_event(event, *, installation_id, plugin_id="histopilot",
                        max_age_days=None, now=None):
     """投递端点数据层（§7.5）：单事务入库 + 计价，返回结果 dict。
@@ -599,9 +798,14 @@ def ingest_usage_event(event, *, installation_id, plugin_id="histopilot",
       4. 时钟（§4）与算术校验；按 occurred_at（不改用 received_at）查两套
          active price book，写死价格版本与两种金额；任一缺失/未知模型 →
          unpriced(no_active_price_book)；
-      5. 同事务写无敏感信息的 ingest audit；
-      6. **影子阶段不写任何 billing_ledger_entries**（§12.1）；demo 主体
-         永不开户（§7.2）。
+      5. PR6 模拟软扣费（§12.2/§19 v0.4，``BILLING_SIMULATED_DEBIT`` 缺省
+         启用）：priced 且 owner/user 主体 → 同事务自动开户（缺户时）+ 一条
+         负金额 usage_debit（幂等键 ``usage:<event_id>``，metadata
+         ``simulated:true``）；**demo 主体永不开户**；unpriced/void 不扣。
+         扣费段包在 SAVEPOINT 里 best-effort——失败只记 warning/指标 +
+         audit ``simulated_debit_skipped=failed``，不阻断 ingest（真实计费
+         阶段须改强一致，见 :func:`_apply_simulated_usage_debit`）；
+      6. 同事务写无敏感信息的 ingest audit（detail 并入扣费结果片段）。
 
     ``now`` 为 received_at（测试注入口；缺省当前 UTC 时间）。计价时段与时钟
     偏差判定都用 occurred_at——服务端不得为「能计价」静默换用 received_at。
@@ -736,10 +940,33 @@ def ingest_usage_event(event, *, installation_id, plugin_id="histopilot",
                         "并发投递冲突：event_id/call_id 已被其他 payload 占用",
                         event_id=event["event_id"]) from exc
 
-                # -- 步骤 5：同事务无敏感信息 audit（§7.5 单事务语义：audit
+                # -- 步骤 5（PR6）：模拟软扣费（best-effort，SAVEPOINT 内）。
+                # 放在事件 INSERT 之后、audit INSERT 之前：结果直接并入 audit
+                # detail（同一事务，§6.5「ledger 与 audit 同事务提交」不变），
+                # 且扣费段任何异常都被 SAVEPOINT 吸收——若放在 audit 之后用
+                # UPDATE 回写，UPDATE 失败反而会污染 ingest 主路径 --
+                sim_detail = _apply_simulated_usage_debit(
+                    cur, event, subject_type=subject_type, user_id=user_id,
+                    status=status, charge=charge,
+                    charge_price_book_id=(charge_book or {}).get(
+                        "price_book_id") if charge_book else None,
+                    stored_tokens=stored_tokens)
+
+                # -- 步骤 6：同事务无敏感信息 audit（§7.5 单事务语义：audit
                 # 失败必须随事务回滚——吞掉失败会让事务带毒、commit 变
                 # rollback、事件静默丢失而路由仍报成功；此处不 try/except，
                 # 路由层 except Exception → 500 retryable，outbox 退避重投） --
+                audit_detail = {
+                    "provider": event["provider"],
+                    "model": event["model"],
+                    "subject_type": subject_type,
+                    "status": status,
+                    "duplicate": False,
+                    "unpriced_reason": reason,
+                    "installation_id": installation_id,
+                    "plugin_id": plugin_id,
+                }
+                audit_detail.update(sim_detail)
                 cur.execute(
                     "INSERT INTO audit_events "
                     "(event_id, ts, actor_user_id, actor_role, action, "
@@ -749,16 +976,7 @@ def ingest_usage_event(event, *, installation_id, plugin_id="histopilot",
                     ("aud_" + secrets.token_hex(16),
                      received.timestamp(), USAGE_INGEST_AUDIT_ACTION,
                      event["event_id"],
-                     psycopg.types.json.Jsonb({
-                         "provider": event["provider"],
-                         "model": event["model"],
-                         "subject_type": subject_type,
-                         "status": status,
-                         "duplicate": False,
-                         "unpriced_reason": reason,
-                         "installation_id": installation_id,
-                         "plugin_id": plugin_id,
-                     })))
+                     psycopg.types.json.Jsonb(audit_detail)))
 
                 return {
                     "event_id": event["event_id"],
@@ -945,7 +1163,8 @@ def get_price_book(price_book_id):
 
 
 # --------------------------------------------------------------------------- #
-# 账户 / 账本 / 余额快照（影子阶段无任何路由写 debit；demo 永不开户）
+# 账户 / 账本 / 余额快照（PR6 起 ingest 在同事务写模拟 usage_debit；demo
+# 永不开户；余额 = ledger 有符号合计，模拟期允许为负——正是要观察的数据）
 # --------------------------------------------------------------------------- #
 _LEDGER_ENTRY_ID_PREFIX = "ble_"
 
@@ -998,8 +1217,9 @@ def append_ledger_entry(account_id, kind, amount_nano_cny, idempotency_key, *,
 
     usage_debit 的幂等键固定 ``usage:<event_id>``（调用方保证；部分唯一索引
     兜底同 event 只一条 debit）。idempotency_key 重放 → 返回原行
-    （duplicate=True），不重复入账。**影子阶段没有任何路由调用本函数写
-    usage_debit**（§12.1）；保留原语供 Phase B 与测试验证符号/幂等约束。
+    （duplicate=True），不重复入账。PR6 的模拟 usage_debit 在
+    :func:`ingest_usage_event` 事务内**内联**实现（本函数自开连接，无法参与
+    ingest 事务）；本函数保留供人工调账入口与测试验证符号/幂等约束。
     """
     platform_features.require_pg_backend("billing")
     if kind == "usage_debit" and (not event_id
@@ -1068,7 +1288,8 @@ def account_balance_nano(account_id):
 
 
 #: 人工调账允许的 kind（§9：grant/topup/refund 为正，manual_adjustment 非零；
-#: usage_debit/expiry 不经 admin 调账入口——影子阶段无 debit，PR6 走受控路径）
+#: usage_debit/expiry 不经 admin 调账入口——PR6 模拟 debit 由 ingest 内联写，
+#: 真实扣费走 §12.3 holds 路径，均非人工调账）
 ADJUSTMENT_KINDS = ("grant", "topup", "refund", "manual_adjustment")
 
 #: 人工调账 reason 长度上限（§9：必填非空，上限 500）
@@ -1465,7 +1686,11 @@ def admin_usage_events_page(*, cursor=None, limit=50, model=None, user_id=None,
 def admin_ledger_page(*, cursor=None, limit=50):
     """admin ledger 只读分页（不可变账本，最新在前；§10.4 只读表）。
 
-    keyset 游标：(created_at epoch, entry_id) 降序。
+    keyset 游标：(created_at epoch, entry_id) 降序。含 ``metadata``（PR6 起
+    模拟 usage_debit 携带 ``{simulated, charge_price_book_id, model,
+    total_tokens, session_id}``，全部非敏感字段；人工调账行恒 ``{}``）——
+    插件 UI 用 ``metadata.simulated`` 渲染「模拟」徽标。metadata 的写入侧
+    即红线边界（不落 prompt/key/IP/请求体），出口不再二次脱敏。
     """
     platform_features.require_pg_backend("billing")
     limit = max(1, min(int(limit or 50), 200))
@@ -1487,6 +1712,7 @@ def admin_ledger_page(*, cursor=None, limit=50):
                 cur.execute(
                     "SELECT entry_id, account_id, event_id, kind, "
                     "amount_nano_cny, idempotency_key, reason, actor_user_id, "
+                    "metadata, "
                     "extract(epoch from created_at)::float8 AS created_at "
                     "FROM billing_ledger_entries" + where +
                     " ORDER BY created_at DESC, entry_id DESC LIMIT %s",

@@ -1322,7 +1322,18 @@
         var tr = document.createElement("tr");
         tr.appendChild(td(fmtTs(e.created_at)));
         tr.appendChild(td(e.account_id));
-        tr.appendChild(td(e.kind));
+        var kindCell = td(e.kind);
+        // PR6 模拟扣费条目：metadata.simulated=true → kind 旁加「模拟」徽标
+        // （真实扣费落地后该徽标即自然消失；metadata 为服务端受控写入的
+        // 非敏感字段，此处只读渲染）
+        if (e.metadata && e.metadata.simulated === true) {
+          var badge = document.createElement("span");
+          badge.className = "adm-badge";
+          badge.textContent = "模拟";
+          kindCell.appendChild(document.createTextNode(" "));
+          kindCell.appendChild(badge);
+        }
+        tr.appendChild(kindCell);
         tr.appendChild(td(e.amount_nano_cny));
         tr.appendChild(td(e.reason));
         tr.appendChild(td(e.entry_id));

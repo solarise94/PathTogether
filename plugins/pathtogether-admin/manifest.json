@@ -2,7 +2,7 @@
   "manifestSchemaVersion": "1.1.0",
   "id": "pathtogether-admin",
   "name": "PathTogether Admin",
-  "pluginVersion": "0.1.0",
+  "pluginVersion": "0.1.1",
   "pluginContractVersion": "1.0.0",
   "bridgeProtocolVersion": "1.0.0",
   "ui": {

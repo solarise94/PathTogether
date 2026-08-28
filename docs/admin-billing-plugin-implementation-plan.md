@@ -944,11 +944,13 @@ PR3 的**硬前置**是先把 homePC 的插件发布从“普通目录直接覆�
 - `/admin/registration` 保留一个版本的重定向兼容，再删除独立模板；
 - Viewer 在 admin 插件缺失时仍完整可用。
 
-### PR6：受控软扣费
+### PR6：受控软扣费（v0.4 修订：模拟软扣费）
 
-- 指定测试账户启用 `usage_debit`；
-- 观察余额、幂等、unpriced 和退款流程；
-- 未达到 §14 门槛不得全量开启。
+- 对**全部注册用户**（owner/user 主体）的 priced 事件在 ingest 同事务写**模拟** `usage_debit`：金额为负的 customer_charge、幂等键固定 `usage:<event_id>`、metadata 标记 `simulated:true`，主体缺户时同事务自动开户；
+- **demo 主体永不开户、永不扣账**（§14.1 红线不变）；unpriced/void 不扣；
+- owner 2026-08-28 指令：**注册用户不做真实计费限制，只在后台记录数据做模拟计费**——本节原「指定测试账户启用 usage_debit」「未达 §14.3 门槛不得全量开启」措辞据此由 v0.4 修订覆盖（软扣费以模拟形态先行落地，真实限制另行决策）；
+- 模拟扣费 best-effort（显式 SAVEPOINT，失败不阻断计量主链路，记 warning + `billing_sim_debit_failed_total` 指标）；`BILLING_SIMULATED_DEBIT`（缺省启用，`0/false/off` 关闭）一键停用；
+- 观察余额（模拟期允许为负）、幂等、unpriced 跳过与失败指标，为真实计费阶段（强一致，见 §12.2/§19 v0.4）积累数据。
 
 ### PR7：硬额度（独立立项）
 
@@ -1140,7 +1142,9 @@ plugins/histopilot -> releases/histopilot-<version>
 
 在此之前，状态只能标为“设计”“实现中”“影子计量”或“灰度”，不得标为“计费已上线”。
 
-## 19. v0.3 修订记录（2026-08-28）
+## 19. 修订记录
+
+### v0.3（2026-08-28）
 
 PR5 外部 review 的 5 个 P1 阻断项，根因与修法各一句话：
 
@@ -1155,3 +1159,17 @@ PR5 外部 review 的 5 个 P1 阻断项，根因与修法各一句话：
 6. **（P2）金额端到端十进制字符串**：admin v1 响应把 nano-CNY 序列化成 JSON number、桥 schema 用 `type:"integer"`、插件 UI 换算经 `Number()`——超 2^53（≈9,007,199 CNY 的 nano 值量级）静默失真。修复：服务端出口统一 `_admin_v1_nano_out` helper 全量转十进制字符串（§5）；caps/adjustments 入参只接受 `^-?[0-9]{1,19}$` 十进制字符串（JSON number 一律 400，19 位内但溢出 PG BIGINT 同样确定性 400）；桥 schema 改 `type:"string"` + pattern（validateValue 补 pattern 支持）；插件 `cnyToNano` 返回字符串、`nanoToCnyString`/`fmtNano` 改 BigInt，展示路径不经过 `Number`。
 7. **（P2）插件侧响应来源认证（对称化）**：宿主已校验请求的 `event.source` + nonce + requestId，但插件 `onMessage` 不检查 `event.source === window.parent`、宿主响应不带 nonce——其他 frame/窗口可向插件伪造响应（伪造 UI 状态/DoS）。修复：宿主全部 result/error 回包带当前 load 的 nonce（§8.3）；插件一律先验 source，init 之后的响应必须携带与 init 相同的 session nonce（恒时间比较）且命中在途 requestId，不符静默丢弃。
 8. **（P2）token 计数上限**：`_check_token_count` 只验非负整数，超大整数（> PG BIGINT max）漏到 INSERT 时 500 retryable，在 outbox 侧成永久重试毒丸。修复：schema_v1 的 `token_count` 加 `"maximum": 9007199254740991`（2^53-1：同时保证 JSON number 精确与 BIGINT 安全，§7.1），`_check_token_count` 与 `_check_raw_usage` 的 token 计数分支同步上限，超限确定性 400（outbox dead，非 500）。
+
+### v0.4（2026-08-28，PR6 模拟软扣费）
+
+背景：owner 2026-08-28 指令——**「对注册用户不做真实计费限制，只在后台记录数据做模拟计费」**。该指令覆盖 §14.3「开启软扣费前的量化门槛」的原文（门槛观察仍在进行，但不再阻断软扣费以**模拟形态**先行落地）；本节记录 PR6 落地语义与偏离点：
+
+1. **触发条件**：`ingest_usage_event` 事务内、事件 INSERT 之后，`status == "priced"` 且 `subject_type ∈ {owner, user}` 才扣；demo 主体**永不开户、永不扣账**（§14.1 红线原样保留）；unpriced/void 不扣。
+2. **自动开户**：主体无 `billing_accounts` 行则同事务建户（currency 默认 CNY、`bac_<24hex>`、`ON CONFLICT (user_id) DO NOTHING` 后改读既有行，吸收并发开户）；账户 status 非 active（suspended/closed）→ 跳过扣费并记 warning。新增跳过原因 `user_missing`（owner/user 主体在 users 无行——`billing_accounts.user_id` 有 FK，不伪造用户行）与 `zero_charge`（priced 但 charge 为 0：`usage_debit` 符号 CHECK 要求严格负数，0 元不入账），与既定词表 `unpriced|demo_subject|disabled|account_suspended|failed` 并列。
+3. **扣费行**：`kind='usage_debit'`、`amount_nano_cny = -charge_nano_cny`（customer_charge 价）、幂等键 `usage:<event_id>`（部分唯一索引兜底）、`actor_user_id=NULL`（系统）、reason「模拟扣费（PR6）」、metadata `{simulated:true, charge_price_book_id, model, total_tokens, session_id}`（全部非敏感）。
+4. **best-effort 纪律（模拟期专用）**：扣费段包在显式 `SAVEPOINT sp_sim_debit` 里，任何异常 → `ROLLBACK TO SAVEPOINT` + 无敏感 warning（只含 event_id/错误类别）+ 进程内计数与日志行 `[billing-sim-debit] {"metric":"billing_sim_debit_failed_total","value":N}`，**ingest 主路径必须仍成功**。真实计费阶段此处必须改强一致（失败即整个事务回滚，事件与 debit 同生共死）——模拟期放宽正是为了先观察数据再收紧。
+5. **audit 并入**：不新增独立 audit 行；扣费结果并入 `usage.ingest` 的 detail——`simulated_debit: {entry_id, amount_nano_cny, duplicate}` 或 `simulated_debit_skipped: <reason>`，仍在同一事务。金额键复用 `_ADMIN_V1_NANO_OUT_KEYS` 已覆盖的 `amount_nano_cny`（`_admin_v1_nano_out` 递归字符串化，嵌套对象同样命中），无需扩白名单。
+6. **开关**：`BILLING_SIMULATED_DEBIT`（缺省启用；`0/false/off` 关闭）。关闭后所有事件统一记 `skipped=disabled`（优先判定，便于生产确认开关生效）。json/dual 后端天然 no-op（ingest 本就 `pg_backend_required` fail-closed）。
+7. **余额口径不变**：余额 = ledger 有符号合计（无余额列）；模拟期余额允许为负——这正是要观察的数据。admin v1 账户/账本出口的负金额照常以十进制字符串出 wire（`balance_nano`/`amount_nano_cny` 均在既有白名单内）。
+8. **admin 插件 UI**：账本页对 `metadata.simulated=true` 的条目在 kind 旁渲染「模拟」徽标（`admin_ledger_page` 输出补充 `metadata` 字段；写入侧即脱敏边界）。
+9. **§13 PR6 小节**：原文「指定测试账户启用 usage_debit」改写为上述全量模拟语义；§12.2「usage debit 可以在测试账户启用」措辞一并按 owner 指令理解（模拟先行、不做真实限制）。

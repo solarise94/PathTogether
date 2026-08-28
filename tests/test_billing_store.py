@@ -747,8 +747,14 @@ def test_concurrent_insert_race_savepoint_paths(monkeypatch):
 
 
 @PG
-def test_shadow_phase_never_writes_ledger():
-    import psycopg
+def test_sim_debit_disabled_never_writes_ledger(monkeypatch):
+    """PR6 kill-switch（§19 v0.4）：BILLING_SIMULATED_DEBIT=0 → 回到纯计量。
+
+    影子语义回归（原 test_shadow_phase_never_writes_ledger）：开关关闭时
+    ledger/账户恒空，audit detail 记 skipped=disabled。模拟扣费正向路径见
+    tests/test_billing_sim_debit.py。
+    """
+    monkeypatch.setenv("BILLING_SIMULATED_DEBIT", "0")
     bh.seed_price_books()
     now = datetime.now(timezone.utc)
     for name in ("01_owner_priced_flash_peak.json",
@@ -766,13 +772,20 @@ def test_shadow_phase_never_writes_ledger():
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) AS n FROM billing_ledger_entries")
-            assert cur.fetchone()["n"] == 0  # 影子阶段 ledger 恒空
+            assert cur.fetchone()["n"] == 0  # 开关关闭：ledger 恒空
             cur.execute("SELECT COUNT(*) AS n FROM billing_accounts")
             assert cur.fetchone()["n"] == 0  # demo 主体永不开户
             cur.execute(
                 "SELECT COUNT(*) AS n FROM ai_usage_events "
                 "WHERE subject_type='demo' AND user_id IS NOT NULL")
             assert cur.fetchone()["n"] == 0
+            cur.execute(
+                "SELECT detail FROM audit_events WHERE action=%s "
+                "AND target_type='usage_event'",
+                (billing_store.USAGE_INGEST_AUDIT_ACTION,))
+            details = [r["detail"] for r in cur.fetchall()]
+            assert details and all(
+                d.get("simulated_debit_skipped") == "disabled" for d in details)
     finally:
         conn.close()
 

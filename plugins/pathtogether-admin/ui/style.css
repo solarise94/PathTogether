@@ -82,6 +82,14 @@ body {
 }
 .adm-table td:last-child, .adm-table td:nth-child(9) { white-space: normal; }
 
+/* PR6：账本 usage_debit 的 metadata.simulated=true 条目在 kind 旁的「模拟」徽标 */
+.adm-badge {
+  display: inline-block; margin-left: 4px; padding: 0 6px;
+  border: 1px solid var(--accent); border-radius: 8px;
+  font-size: 11px; line-height: 18px; color: var(--accent);
+  vertical-align: middle; white-space: nowrap;
+}
+
 .adm-pager { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
 .adm-pager button {
   font-size: 13px; padding: 6px 14px; border-radius: 8px;

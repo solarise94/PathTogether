@@ -111,6 +111,9 @@ def test_schema_migrations_recorded(conn):
     # users_email_ci_key → users_login_id_ci_key，docs §4.2 物理收口）。
     # Upload V2（U2）追加 0017_upload_tasks.sql（分片续传任务表，docs
     # upload-resumable-fix-plan §3.1）。
+    # admin-billing PR2 追加 0018_billing.sql（价格表/用量事件/账户/账本/
+    # 余额快照六表 + DeepSeek 2026-08-28 价格种子，docs
+    # admin-billing-plugin-implementation-plan.md §6）。
     assert rows == [
         "0001_init.sql", "0002_roi_payload.sql", "0003_comments.sql",
         "0004_audit.sql", "0005_plugin.sql", "0006_demo_budget_auth.sql",
@@ -125,6 +128,7 @@ def test_schema_migrations_recorded(conn):
         "0015_account_auth_version.sql",
         "0016_login_id_rename.sql",
         "0017_upload_tasks.sql",
+        "0018_billing.sql",
     ]
 
 

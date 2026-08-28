@@ -29,6 +29,7 @@ DATA_DIR = _bootstrap.SHARE_DATA_DIR
 UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 os.environ["AI_INTERNAL_TOKEN"] = "test-internal-token"
 os.environ["ADMIN_PASSWORD"] = ""  # 默认无 owner 引导；各用例手动建用户
+from pg_compat import BACKEND  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
@@ -354,3 +355,68 @@ def test_share_access_log_dedup():
     d = evs[0]["detail"]
     assert d["visitor"]  # 有 visitor 前段
     assert "*" in d["ip"]  # IP 已脱敏
+
+
+# =========================================================================== #
+# 6. usage ingest 审计（PR2 admin-billing §7.5：无敏感内容）
+# =========================================================================== #
+@pytest.mark.skipif(BACKEND != "postgres",
+                    reason="usage ingest 数据路径需 PG（RUN_PG_TESTS=1）")
+def test_usage_ingest_audit_no_sensitive_content(monkeypatch):
+    """投递一条 usage event → audit 落 usage.ingest，detail 只含白名单键。
+
+    红线（§9/§7.4）：审计不得出现 prompt/输出文本/图片、API key、完整请求体、
+    raw_usage、session_id 或任何 token 片段。
+    """
+    import json as _json
+    from datetime import datetime, timedelta, timezone
+
+    import _billing_helpers as bh
+    import billing_store
+
+    inst = app_mod._bootstrap_plugin_installations()
+    assert inst is not None
+    app_mod._HISTOPILOT_INSTALLATION = inst
+    secret_file = Path(os.environ["SHARE_DATA_DIR"]) / \
+        "plugin-secret-histopilot.txt"
+    raw = secret_file.read_text(encoding="utf-8").strip()
+    try:
+        obj = _json.loads(raw)
+        secret = str(obj.get("secret") or "")
+    except (ValueError, TypeError):
+        secret = raw
+    client = app_mod.app.test_client()
+    app_mod.app.config["TESTING"] = True
+    app_mod.AUTH_ENABLED = False
+    tr = client.post("/api/plugin/v1/auth/token",
+                     json={"installation_id": inst["installation_id"],
+                           "secret": secret})
+    token = tr.get_json()["access_token"]
+
+    bh.seed_price_books_with_history()
+    event = bh.load_event("01_owner_priced_flash_peak.json")
+    now = datetime.now(timezone.utc)
+    occurred = now - timedelta(hours=1)
+    event = dict(event,
+                 occurred_at=occurred.isoformat().replace("+00:00", "Z"),
+                 enqueued_at=(occurred + timedelta(seconds=1)
+                              ).isoformat().replace("+00:00", "Z"))
+    bh.bind_reservation(event["request_id"], event["session_id"],
+                        event["subject_type"], event["subject_id"])
+    r = client.post("/api/plugin/v1/usage-events",
+                    headers={"Authorization": "Bearer " + token,
+                             "Idempotency-Key": event["event_id"]},
+                    json=event)
+    assert r.status_code == 200, r.get_data(as_text=True)
+
+    events = share_store.list_audit(action=billing_store.USAGE_INGEST_AUDIT_ACTION)
+    assert len(events) == 1
+    detail = events[0]["detail"]
+    assert set(detail.keys()) <= {"provider", "model", "subject_type", "status",
+                                  "duplicate", "unpriced_reason",
+                                  "installation_id", "plugin_id"}
+    dumped = _json.dumps(detail, ensure_ascii=False)
+    for banned in ("api_key", "password", "prompt", "raw_usage",
+                   event["session_id"], "Bearer"):
+        assert banned not in dumped, "审计出现敏感内容：%s" % banned
+    assert detail["status"] == "priced" and detail["provider"] == "deepseek"

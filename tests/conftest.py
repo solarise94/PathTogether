@@ -83,6 +83,12 @@ if _RUN_PG:
         # 0017 起：Upload V2 分片任务（无 users 外键——owner_user_id 允许空，
         # 不随 users CASCADE 清空，必须显式列出，否则跨用例残留串数据）
         "upload_tasks",
+        # 0018 起：金额计费（admin-billing §6）。billing_price_books 的迁移
+        # 种子会随 TRUNCATE 清掉——需要种子的用例用 tests/_billing_helpers
+        # .seed_price_books() 幂等重放 migrations/0018_billing.sql（迁移文件
+        # 是种子唯一权威来源）。
+        "billing_ledger_entries", "ai_usage_events", "billing_accounts",
+        "billing_rates", "billing_price_books", "provider_balance_snapshots",
     )
 
     @pytest.fixture(scope="session")

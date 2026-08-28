@@ -59,6 +59,25 @@ def demo_features_available() -> bool:
     return STORAGE_BACKEND == "postgres"
 
 
+def billing_features_available() -> bool:
+    """金额计费（价格表 / 用量计价 / 账本 / 余额快照）是否可用：仅 postgres。
+
+    admin-billing 方案 §6.1：billing 能力只在 STORAGE_BACKEND=postgres 开放；
+    json/dual 稳定 pg_backend_required，不得降级到进程内余额（金额账本无
+    跨 worker 一致保证时不可信）。
+    """
+    return STORAGE_BACKEND == "postgres"
+
+
+def usage_ingest_available() -> bool:
+    """插件用量投递（POST /api/plugin/v1/usage-events）是否可用：仅 postgres。
+
+    与 billing_features_available 同口径（ingest 即 billing 写路径的入口）；
+    单独暴露便于路由层与未来 admin API 分别引用。
+    """
+    return STORAGE_BACKEND == "postgres"
+
+
 def public_demo_enabled() -> bool:
     """解析 PUBLIC_DEMO_ENABLED（默认 0）。仅解析+暴露；启动拒绝由路由层做。"""
     return _truthy(os.environ.get("PUBLIC_DEMO_ENABLED"))

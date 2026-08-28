@@ -72,6 +72,10 @@ import demo_store
 # registration_store 提供一次性邀请码（只存 token_hash）与单事务原子兑换。
 # json/dual 后端 fail-closed（platform_features 守卫）。
 import registration_store
+# PR2 金额计费（docs/admin-billing-plugin-implementation-plan.md §6/§7）：
+# billing_store 提供价格表 / 用量事件计价 / 账本原语（PG-only，json/dual 稳定
+# pg_backend_required）。本阶段只影子计价——不写 usage_debit，demo 不开户。
+import billing_store
 # P0-A 资源防护（docs/open-registration-security-remediation §3.3/§3.4/§3.5）：
 # upload_guard：单请求计数流 + 磁盘保留水位 + PG 权威用户配额/reservation/
 #   在途与每小时限流（json/dual fail-closed，本地免登录 owner 语义不变）；
@@ -2705,6 +2709,11 @@ def api_demo_ai_run():
                         code="platform_credentials_missing"), 503)
     config["max_steps"] = _demo_task_max_steps()
     config["session_owner"] = _demo_subject(cap["token_hash"])
+    # 计费主体断言注入（PR2 §7.2）：demo_sessions.id（capability id）与
+    # consume_run 绑定 histopilot_session_id 的行同源，resolver 第②步
+    # SELECT id 同值；缺省回退 "unknown" 会 409 usage_subject_conflict 进 dead。
+    config["billing_subject"] = _billing_subject_assertion(
+        None, demo_capability_id=cap["id"])
 
     payload = {
         "slide": filename,
@@ -6122,6 +6131,13 @@ _PLUGIN_ERROR_RETRYABLE = {
     "capability_not_granted": False,
     "permission_denied": False,
     "capability_unavailable": True,
+    # PR2 usage ingestion（admin-billing §7.4/§7.7）：payload/subject 冲突是
+    # 确定性 4xx（进 dead 队列，不重试）；主体绑定未就绪可退避重试；billing
+    # 的 PG-only 守卫是配置性错误（不可重试，状态码 503）
+    "usage_event_conflict": False,
+    "usage_subject_conflict": False,
+    "usage_subject_not_ready": True,
+    "pg_backend_required": False,
 }
 
 
@@ -6747,6 +6763,38 @@ def _ai_budget_subject(user_ctx):
     return "user", (user_ctx.get("user_id") or "owner")
 
 
+def _billing_subject_assertion(user_ctx, demo_capability_id=None):
+    """组装注入 sidecar ``config.billing_subject`` 的权威主体断言（PR2 §7.2）。
+
+    跨仓契约（HistoPilot PR1）：sidecar 读取 ``config.billing_subject`` =
+    ``{subject_type, subject_id, user_id}`` 作为 usage event 的主体 assertion；
+    **缺省**时 sidecar 回退 session_owner→user / demo→"unknown"——与
+    PathTogether 权威解析不一致会 409 usage_subject_conflict 进 dead 队列，
+    生产管道全盘死信，因此 run/continue/ask/branch 与 Demo run 两条派发路径
+    都必须显式注入。
+
+    注入值与 ``billing_store._resolve_usage_subject`` 的权威解析输出必须
+    **逐字节一致**：
+      - 官方模式：``_ai_budget_subject(user_ctx)`` 与
+        ``_ai_reserve_run_budget`` 写入 ai_budget_reservations 的
+        subject_type/subject_id 同源同参（同一 user_ctx、同一纯函数）；
+        HistoPilot 接受后 consume() 落 session，resolver 第①步按
+        reservation 行比对必然相等。user_id 取真实登录 user_id（内网
+        AUTH_ENABLED=False 归一 owner 无 user_id → null；resolver 对 null
+        user_id 断言跳过比对，非 null 时与 subject_id 同值）；
+      - Demo 路径：subject_id = demo_sessions 行 id（capability id），与
+        demo_store.consume_run 写入 histopilot_session_id 的行、resolver
+        第②步 ``SELECT id`` 同值；user_id 恒 null（demo 永不映射登录用户，
+        亦不开户）。
+    """
+    if demo_capability_id is not None:
+        return {"subject_type": "demo", "subject_id": demo_capability_id,
+                "user_id": None}
+    subject_type, subject_id = _ai_budget_subject(user_ctx)
+    return {"subject_type": subject_type, "subject_id": subject_id,
+            "user_id": (user_ctx or {}).get("user_id") or None}
+
+
 def _user_ai_access_denied(user_id):
     """user 平台 AI 访问闸（docs §3.7：受邀用户默认 ai_access=false）。
 
@@ -7003,7 +7051,8 @@ def _ai_run_prepare(user_ctx, body, slide, need_grant):
 
     顺序（失败即返回，绝不部分推进）：
       1. request_id 校验/生成（1–128，[A-Za-z0-9_-]；缺省服务端生成）；
-      2. sidecar config 组装（含 max_steps 注入规则；凭据缺失 → 400）；
+      2. sidecar config 组装（含 max_steps 注入规则；凭据缺失 → 400）+
+         billing_subject 计费主体断言注入（PR2 §7.2，与预占主体同源）；
       3. session_owner 注入（仅 role=user，保持既有语义）；
       4. need_grant 时签发 run grant（写工具 run fail-closed：失败 503 拒绝转发，
          且发生在预占之前——grant 失败不扣额度）；
@@ -7023,6 +7072,10 @@ def _ai_run_prepare(user_ctx, body, slide, need_grant):
         if (user_ctx or {}).get("role") == user_store.ROLE_USER:
             return (jsonify(error="平台 AI 未配置，请联系管理员"), 400)
         return (jsonify(error="未配置 AI 凭据：请在 AI 配置中填写平台官方 API"), 400)
+    # 计费主体断言注入（PR2 §7.2）：与 _ai_reserve_run_budget 写入 reservation
+    # 的 subject 同源同参（_ai_budget_subject(user_ctx)），HistoPilot 据此生成
+    # usage event 的主体 assertion；缺省回退会与权威解析 409 进 dead。
+    config["billing_subject"] = _billing_subject_assertion(user_ctx)
     # 仅 user 注入归属：role=owner 的会话保持无 owner（owner 全量可见、可续跑
     # 任意会话；内网模式不注入）。
     if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
@@ -9601,6 +9654,97 @@ def plugin_v1_run_grant_verify():
         return _plugin_error(400, "invalid_request", "grant_id 必填")
     valid, reason = _verify_run_grant(grant_id, slide, claims.get("sub") or "")
     return jsonify(valid=valid, reason=reason if not valid else "")
+
+
+# --------------------------------------------------------------------------- #
+# usage ingestion（admin-billing 方案 §7.5，PR2：影子计价，不扣账本）
+#
+# HistoPilot durable usage outbox 的投递端点：每次真实 provider 调用一个事件，
+# 单事务完成 dedup（payload_hash 比对）→ §7.2 四步权威主体解析 → 时钟/算术
+# 校验 → 双 price book 计价写回（或 unpriced+reason）→ 无敏感信息 audit。
+# **影子阶段（§12.1）不写任何 usage_debit；demo 主体只计量、不开户。**
+# 数据层见 billing_store.ingest_usage_event；计价规则见 billing_pricing。
+# --------------------------------------------------------------------------- #
+#: 允许投递 usage event 的插件白名单（当前仅 histopilot bundle；鉴权后按
+#: JWT claims.plugin_id 回查，不信任请求体）
+_USAGE_INGEST_PLUGIN_IDS = frozenset({_PLUGIN_HISTOPILOT_ID})
+
+
+@app.route("/api/plugin/v1/usage-events", methods=["POST"])
+def plugin_v1_usage_events():
+    """投递一条 usage event（Idempotency-Key 必须等于 body event_id）。
+
+    鉴权：Bearer scoped JWT（_require_plugin_token：签名/iss/aud/exp +
+    installation 存在且 enabled 每次回查）+ plugin_id 白名单（仅 HistoPilot
+    安装）。浏览器 owner session 不可调本端点（机器通道，CSRF 豁免按
+    /api/plugin/ 前缀既有规则）。
+
+    错误（统一插件信封，code 稳定、message 无敏感信息）：
+      400 invalid_request            —— schema/Idempotency-Key 不符；
+      401/403                         —— 鉴权/白名单；
+      409 usage_event_conflict        —— 同 event_id/call_id 重放 payload 不同
+                                          （确定性，outbox 进 dead + P0 告警）；
+      409 usage_subject_conflict      —— body 主体 assertion 与权威解析不一致
+                                          （确定性，进 dead + P0 告警）；
+      409 usage_subject_not_ready     —— 权威绑定行未提交（retryable=true，
+                                          按退避重试）；
+      503 pg_backend_required         —— json/dual 后端 fail-closed。
+
+    成功返回 ``{ok, event_id, duplicate, status, priced}``；duplicate=true 时
+    返回原行语义（status/priced 为首次入库结果，价格版本不重算）。
+    """
+    claims, err = _require_plugin_token()
+    if err is not None:
+        return err
+    if (claims.get("plugin_id") or "") not in _USAGE_INGEST_PLUGIN_IDS:
+        return _plugin_error(403, "forbidden",
+                             "仅 HistoPilot 插件安装可投递用量事件")
+    if not platform_features.usage_ingest_available():
+        # json/dual fail-closed（§6.1）：不降级进程内余额/计数
+        return _plugin_error(
+            503, "pg_backend_required",
+            "用量计费要求 STORAGE_BACKEND=postgres（当前 %r），fail-closed"
+            % platform_features.current_backend())
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return _plugin_error(400, "invalid_request", "request body 需为 JSON object")
+    idem = (request.headers.get("Idempotency-Key") or "").strip()
+    if not idem or idem != body.get("event_id"):
+        return _plugin_error(400, "invalid_request",
+                             "Idempotency-Key 头必须与 body event_id 一致")
+    installation_id = claims.get("sub") or ""
+    try:
+        result = billing_store.ingest_usage_event(
+            body, installation_id=installation_id,
+            plugin_id=claims.get("plugin_id") or "",
+            max_age_days=billing_store.occurred_at_max_age_days())
+    except billing_store.InvalidUsageEventError as exc:
+        # details 只含字段级校验信息（字段名/规则），不含请求体内容
+        return _plugin_error(400, "invalid_request", "usage event 校验失败",
+                             details={"errors": exc.errors[:10]})
+    except billing_store.UsageEventConflictError:
+        return _plugin_error(409, "usage_event_conflict",
+                             "同 event_id/call_id 的 payload 与原记录不一致")
+    except billing_store.UsageSubjectConflictError:
+        return _plugin_error(409, "usage_subject_conflict",
+                             "事件主体 assertion 与权威绑定不一致")
+    except billing_store.UsageSubjectNotReadyError:
+        return _plugin_error(409, "usage_subject_not_ready",
+                             "权威主体绑定尚未就绪，请退避后重试", retryable=True)
+    except platform_features.PgFeatureUnavailable:
+        return _plugin_error(503, "pg_backend_required",
+                             "用量计费要求 STORAGE_BACKEND=postgres")
+    except Exception:
+        app.logger.exception("usage event ingest 失败（event_id=%s）",
+                             body.get("event_id"))
+        return _plugin_error(500, "internal", "内部错误", retryable=True)
+    return jsonify(
+        ok=True,
+        event_id=result["event_id"],
+        duplicate=result["duplicate"],
+        status=result["status"],
+        priced=result["priced"],
+    )
 
 
 # --------------------------------------------------------------------------- #

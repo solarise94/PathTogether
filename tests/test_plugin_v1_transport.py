@@ -365,7 +365,7 @@ def test_legacy_internal_region_unaffected_by_plugin_gates(monkeypatch):
         json={"x": 0, "y": 0, "w": 10, "h": 10, "out_w": 100, "out_h": 100})
     assert plugin_r.status_code == 429
 
-    jpeg = b"\xff\xd8legacy-base64-payload\xff\xd9"
+    jpeg = b"legacy-base64-payload\xff\xd9"
     m1, m2, m3 = _slide_read_mocks()
     with m1, m2, m3, \
             mock.patch.object(app_mod, "_read_region_b64", return_value=_fake_region(jpeg)):
@@ -379,6 +379,59 @@ def test_legacy_internal_region_unaffected_by_plugin_gates(monkeypatch):
     body = r.get_json()
     assert "image_base64" in body and "content_sha256" not in body
     assert base64.b64decode(body["image_base64"]) == jpeg
+
+
+# --------------------------------------------------------------------------- #
+# 7. usage-events 端点纳入 v1 传输约定（PR2 admin-billing §7.5）
+# --------------------------------------------------------------------------- #
+def _usage_event_body():
+    """最小 schema 合法事件（值取自 tests/fixtures/usage_events/01）。"""
+    return {
+        "event_id": "use_0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "call_id": "call_11223344556677889900aabbccddeeff",
+        "schema_version": 1,
+        "request_id": "req_5d4e3f2a1b0c9d8e7f6a5b4c",
+        "session_id": "sess_7f3a2b1c9d4e5f6a7b8c",
+        "subject_type": "owner",
+        "subject_id": "usr_owner0a1b2c3d",
+        "user_id": "usr_owner0a1b2c3d",
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "provider_request_id": "8a2c1f0e-9d3b-4c6a-b5e7-2f8d0a1c3e5f",
+        "occurred_at": "2026-09-07T02:30:12.345Z",
+        "enqueued_at": "2026-09-07T02:30:13.120Z",
+        "cache_hit_input_tokens": 1856,
+        "cache_miss_input_tokens": 2418,
+        "output_tokens": 357,
+        "reasoning_tokens": 0,
+        "total_tokens": 4631,
+        "raw_usage": {"finish_reason": "stop"},
+    }
+
+
+def test_usage_events_unified_error_envelope_without_token():
+    inst = _bootstrap()  # noqa: F841 — 引导安装（token 不取，走无 Bearer 分支）
+    body = _usage_event_body()
+    r = _client().post(
+        "/api/plugin/v1/usage-events",
+        headers={"Idempotency-Key": body["event_id"]},
+        json=body)
+    _assert_envelope(r, 401, "unauthorized", retryable=False)
+
+
+def test_usage_events_rate_limited_in_shared_v1_bucket(monkeypatch):
+    inst = _bootstrap()
+    token = _token_for(inst)
+    # v1 全端点统一速率桶（before_request）：容量 1 → 第 2 次调用 429
+    monkeypatch.setattr(app_mod, "_PLUGIN_RATE_LIMITER", app_mod._PluginRateLimiter(1))
+    body = _usage_event_body()
+    headers = {**_bearer(token), "Idempotency-Key": body["event_id"]}
+    r1 = _client().post("/api/plugin/v1/usage-events", headers=headers, json=body)
+    assert r1.status_code in (200, 403, 409, 503)  # 视后端/主体绑定而定，不 429
+    r2 = _client().post("/api/plugin/v1/usage-events", headers=headers, json=body)
+    err = _assert_envelope(r2, 429, "rate_limited", retryable=True)
+    assert err["details"]["reason"] == "rate_limit"
+    assert int(r2.headers["Retry-After"]) >= 1
 
 
 if __name__ == "__main__":

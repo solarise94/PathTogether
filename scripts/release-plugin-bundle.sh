@@ -41,9 +41,7 @@
 set -euo pipefail
 
 SSH_HOST="${PT_RELEASE_SSH_HOST:-homePC}"
-REMOTE_PLUGINS_ROOT="${PT_RELEASE_PLUGINS_ROOT:-~/svs-viewer-demo-data/plugins}"
-RELEASES_DIR="$REMOTE_PLUGINS_ROOT/releases"
-RELEASE_LOG="$RELEASES_DIR/RELEASE_LOG"
+# REMOTE_PLUGINS_ROOT / RELEASES_DIR / RELEASE_LOG 在 die() 定义之后解析（见下）。
 HEALTH_URL="${PT_RELEASE_HEALTH_URL:-https://pt.solarise94.fun/healthz}"
 MIN_FREE_MB="${PT_RELEASE_MIN_FREE_MB:-512}"
 
@@ -52,6 +50,19 @@ LOCAL_POLICY_FILE="$REPO_ROOT/plugins/source-policy.json"
 
 die() { echo "release: ERROR: $*" >&2; exit 1; }
 info() { echo "release: $*"; }
+
+# 远端插件根必须解析为**绝对路径**：远端命令一律单引号包裹路径，字面 `~` 不会
+# 展开（存在性检查会静默失真）；本地 macOS 的 $HOME 又与远端不同，故经 ssh
+# 取远端 $HOME 拼接。
+if [ -n "${PT_RELEASE_PLUGINS_ROOT:-}" ]; then
+  REMOTE_PLUGINS_ROOT="$PT_RELEASE_PLUGINS_ROOT"
+else
+  REMOTE_HOME="$(ssh "$SSH_HOST" 'printf %s "$HOME"')" || die "无法经 ssh 解析远端 HOME"
+  [ -n "$REMOTE_HOME" ] || die "远端 HOME 为空"
+  REMOTE_PLUGINS_ROOT="$REMOTE_HOME/svs-viewer-demo-data/plugins"
+fi
+RELEASES_DIR="$REMOTE_PLUGINS_ROOT/releases"
+RELEASE_LOG="$RELEASES_DIR/RELEASE_LOG"
 
 usage() {
   sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -92,7 +103,7 @@ append_log() {  # <stage> <id> <version> <sha256|-> <old|-> <new|-> [note]
   note="${7:-}"
   remote "mkdir -p '$RELEASES_DIR' && printf '%s %s %s %s %s %s old_target=%s new_target=%s %s\n' \
     '$ts' '$op' '$stage' '$id' '$ver' '$sha' '$old' '$new' '$note' >> '$RELEASE_LOG'"
-  info "RELEASE_LOG 已追加（$stage $id $ver）"
+  info "RELEASE_LOG 已追加（$stage $id ${ver}）"
 }
 
 current_target() {  # 入口 symlink 当前 target（相对名，如 releases/x-1.2.0；无入口输出 -）
@@ -109,7 +120,7 @@ cmd_stage() {
   [ "$mid" = "$id" ] || die "manifest.id=$mid 与目录名 $id 不一致"
   remote "[ -e '$dest' ]" >/dev/null 2>&1 && die "目标 release 已存在（版本化目录不可变）：$dest"
   local sha; sha="$(manifest_sha256_local "$src/manifest.json")"
-  info "stage：rsync $src -> $SSH_HOST:$dest（manifest sha256=$sha）"
+  info "stage：rsync $src -> $SSH_HOST:${dest}（manifest sha256=${sha}）"
   rsync -a --delete --exclude '__pycache__' --exclude '*.pyc' "$src/" "$SSH_HOST:$dest/"
   remote "[ -f '$dest/manifest.json' ]" >/dev/null 2>&1 || die "stage 后远程缺 manifest.json"
   append_log stage "$id" "$ver" "$sha" "-" "releases/$id-$ver" "staged_from_workstation"
@@ -184,7 +195,7 @@ cmd_rollback() {
   local sha; sha="$(echo "$last" | awk '{print $6}')"
   [ "$old_target" != "-" ] || die "最近一次 switch 无旧 target（首次发布），回滚 = 移除入口，请人工确认"
   remote "[ -d '$REMOTE_PLUGINS_ROOT/$old_target' ]" >/dev/null 2>&1 \
-    || die "旧 release 目录不存在：$old_target（不得指向已删除目录）"
+    || die "旧 release 目录不存在：${old_target}（不得指向已删除目录）"
   local cur; cur="$(current_target "$id")"
   info "rollback：$id 入口 $cur -> $old_target"
   remote "set -e; cd '$REMOTE_PLUGINS_ROOT'; ln -sfn '$old_target' '.$id.rollback.tmp'; mv -T '.$id.rollback.tmp' '$id'"

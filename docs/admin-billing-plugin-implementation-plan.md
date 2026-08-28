@@ -860,6 +860,8 @@ POST /api/plugin/v1/billing/holds/<hold_id>/settle
 
 同事务写 usage、实际 debit、释放差额。超时/崩溃 hold 惰性回收。0018/0019 阶段不实现该路径，避免在影子数据尚未证明可靠前制造误拒绝。
 
+**已按影子语义实现于 v0.5（PR7）**：两个端点已上线（复用插件 v1 机器通道鉴权与 HistoPilot 白名单），但「不足则拒绝」替换为 would_deny 观测——authorize 恒放行，settle 只改 hold 状态不写 ledger；其余契约（最坏价预占、TTL 惰性回收、幂等）不变，见 §19 v0.5。
+
 ## 13. 实现批次与文件清单
 
 ### PR0：契约与测试夹具
@@ -954,8 +956,10 @@ PR3 的**硬前置**是先把 homePC 的插件发布从“普通目录直接覆�
 
 ### PR7：硬额度（独立立项）
 
+**以影子/advisory 形态落地（v0.5）**：authorize/settle/TTL 回收端点与数据层已上线（`0020_billing_holds.sql` + `billing_store.authorize_hold`/`settle_hold` + 插件 v1 路由），但 hold **永不因余额拒绝**——would_deny 只观测不裁决（§19 v0.5）；真实 enforcement 待 §14.4 门槛且另行决策。
+
 - `migrations/0020_billing_holds.sql`；
-- per-call authorize/settle；
+- per-call authorize/settle（影子语义）；
 - crash/TTL/余额并发测试；
 - 不与前述 PR 合并发布。
 
@@ -1173,3 +1177,17 @@ PR5 外部 review 的 5 个 P1 阻断项，根因与修法各一句话：
 7. **余额口径不变**：余额 = ledger 有符号合计（无余额列）；模拟期余额允许为负——这正是要观察的数据。admin v1 账户/账本出口的负金额照常以十进制字符串出 wire（`balance_nano`/`amount_nano_cny` 均在既有白名单内）。
 8. **admin 插件 UI**：账本页对 `metadata.simulated=true` 的条目在 kind 旁渲染「模拟」徽标（`admin_ledger_page` 输出补充 `metadata` 字段；写入侧即脱敏边界）。
 9. **§13 PR6 小节**：原文「指定测试账户启用 usage_debit」改写为上述全量模拟语义；§12.2「usage debit 可以在测试账户启用」措辞一并按 owner 指令理解（模拟先行、不做真实限制）。
+
+### v0.5（2026-08-28，PR7 影子 holds）
+
+§12.3 Phase C 的 per-call hold 以**advisory/影子形态**落地（`0020_billing_holds.sql` + `billing_store.authorize_hold`/`settle_hold` + `POST /api/plugin/v1/billing/holds`、`POST .../holds/<hold_id>/settle`，复用插件 v1 机器通道鉴权与 `_USAGE_INGEST_PLUGIN_IDS` 白名单，json/dual 稳定 503 `pg_backend_required`）。语义与偏离点：
+
+1. **advisory 永不拒绝**：owner 指令（注册用户不做真实计费限制）下，authorize 恒返回 `authorized:true`；`would_deny`（balance − open_holds 合计 < 最坏估算，且余额与估算均已知）只作为「若开启硬额度会不会拒」的观测字段入库/出 wire，unknown（无账户或无价目）为 NULL——未知不裁决。最坏估算按 customer_charge 价目把 `estimated_input_tokens` 全按 cache-miss + `max_output_tokens` 输出计（§14.4「hold 估算不得把 cache hit 按 miss 重复结算」天然满足：hit 部分压根不参与）。
+2. **与扣费链解耦**：hold 不写 usage_debit；模拟扣费仍由 PR6 ingest 链承担。同 call_id 的 usage 事件随后照常 ingest（两条链独立重试，互不阻塞）。
+3. **event_id 无 FK**：settle 可先于 outbox 投递的 usage 事件到达（乱序/退避重投），`billing_holds.event_id` 只做格式与终态一致性校验、不加外键，影子期容忍悬空引用，由观测口径核对。
+4. **状态机与幂等**：open → settled（带合法 `use_<32hex>` event_id）/ released（空 body：调用失败无 usage 的正常终态）/ expired（TTL 惰性回收）。同 call_id 重放按 metadata.request_hash 比对：一致 duplicate 返回原行（含已 expired 的行），不一致 409 `hold_conflict`；settled 后同 event 重放 duplicate、异/缺 event 409；released/expired 再 settle 409 `hold_not_open`（均不可重试）；跨 installation 与不存在统一 404 `hold_not_found`（不泄露存在性）。并发同 call_id 由 UNIQUE(call_id) + SAVEPOINT 吸收，恰一行。惰性回收（`UPDATE ... WHERE status='open' AND expires_at < now`）挂在每次 authorize/settle 事务上，无 daemon；业务拒绝（确定性 409/404）经 SAVEPOINT 隔离、**不连带回滚回收标记**（否则 expired 行永远停在 open）。
+5. **demo 红线**：demo 主体不写 hold 行、不开户、不算 would_deny——返回 `{"skipped":"demo_subject","authorized":true,"would_deny":false,"hold_id":null}` 并写 skipped audit。
+6. **不开户**：主体无 `billing_accounts` 行时 account_id/balance 记 NULL（影子期不因 hold 副作用改账户面；与 ingest 模拟扣费的自动开户语义差异是刻意的）。
+7. **TTL**：`BILLING_HOLD_TTL_SECONDS`（缺省 300，非法/非正回退缺省）。
+8. **wire/audit 纪律**：金额（estimated/balance/open_holds_nano_cny）一律十进制字符串或 null（§5），时间 RFC3339；audit `billing.hold_authorize`/`billing.hold_settle` detail 只含 call_id 后 8 字符、金额、would_deny、status、event_id、subject_type/model/provider/installation/plugin 标识——session_id 与完整请求体不落（与 ingest audit 纪律对齐）。
+9. **与 §14.4 门槛的关系**：本版只交付「影子基础设施 + 观测字段」，**门槛全绿前不动真 enforcement**；且在 owner 指令下注册用户永不因计费被真实限制——would_deny 数据积累的意义正是验证「假如开启」的误拒率与并发透支（§14.4 第 1/3 条），是否/何时收紧另行决策，届时 settled 分支才引入真实 debit 与差额释放（§12.3 原文语义）。

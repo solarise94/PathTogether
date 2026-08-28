@@ -89,6 +89,9 @@ if _RUN_PG:
         # 是种子唯一权威来源）。
         "billing_ledger_entries", "ai_usage_events", "billing_accounts",
         "billing_rates", "billing_price_books", "provider_balance_snapshots",
+        # 0020 起：billing holds（admin-billing §12.3，PR7 影子预授权）。
+        # account_id 引用 billing_accounts，CASCADE 已覆盖，显式列出防残留
+        "billing_holds",
         # 0019 起：来源归因（admin-billing §11）。user_acquisition 引用
         # users/registration_invites/acquisition_visits，acquisition_visits 引用
         # acquisition_campaigns——显式列出保证跨用例无残留

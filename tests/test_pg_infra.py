@@ -116,6 +116,8 @@ def test_schema_migrations_recorded(conn):
     # admin-billing-plugin-implementation-plan.md §6）。
     # admin-billing PR4 追加 0019_acquisition.sql（来源归因三表 +
     # registration_invites source/campaign 列，docs 同上 §11.2）。
+    # admin-billing PR7 追加 0020_billing_holds.sql（逐 model call 预授权
+    # hold，影子/advisory 形态，docs 同上 §12.3/§19 v0.5）。
     assert rows == [
         "0001_init.sql", "0002_roi_payload.sql", "0003_comments.sql",
         "0004_audit.sql", "0005_plugin.sql", "0006_demo_budget_auth.sql",
@@ -132,6 +134,7 @@ def test_schema_migrations_recorded(conn):
         "0017_upload_tasks.sql",
         "0018_billing.sql",
         "0019_acquisition.sql",
+        "0020_billing_holds.sql",
     ]
 
 

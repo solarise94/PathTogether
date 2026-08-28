@@ -15,6 +15,9 @@ fail-closed（json/dual 返回稳定 ``pg_backend_required``，不降级进程�
     且 owner/user 主体同事务自动开户 + 负金额 usage_debit，SAVEPOINT
     best-effort 不阻断计量）→ 同事务无敏感信息 audit（含扣费结果）。
     **demo 主体永不开户、永不扣账（§14.1 红线）**；
+  - :func:`authorize_hold` / :func:`settle_hold`：PR7 逐 model call 预授权
+    hold（§12.3/§19 v0.5，**advisory/影子**——永不因余额拒绝，would_deny
+    仅观测；TTL 惰性回收；demo 主体不写行；与 ingest 扣费链解耦）；
   - price book 创建/激活（§6.3：固定 key ``pg_advisory_xact_lock`` + active
     区间重叠拒绝，明确不用 btree_gist）；
   - 账户/账本/余额快照基础读写（余额 = SUM(amount)，projection 可重建）；
@@ -288,6 +291,34 @@ class BillingIdempotencyKeyConflictError(BillingError):
     """idempotency_key 已被其他账户/参数占用（不是同请求重放）。"""
 
     code = "idempotency_key_conflict"
+
+
+class InvalidHoldRequestError(BillingError):
+    """hold authorize/settle request body 不符（400 invalid_request，稳定词表）。"""
+
+    code = "invalid_request"
+
+    def __init__(self, errors):
+        self.errors = [str(e) for e in errors]
+        super().__init__("hold 请求校验失败：%s" % "; ".join(self.errors[:5]))
+
+
+class HoldConflictError(BillingError):
+    """同 call_id 重放但请求载荷不同 / settled 后 settle 到不同 event（409 确定性）。"""
+
+    code = "hold_conflict"
+
+
+class HoldNotOpenError(BillingError):
+    """hold 已 released/expired，不能再结算（409，不可重试）。"""
+
+    code = "hold_not_open"
+
+
+class HoldNotFoundError(BillingError):
+    """hold 不存在或不属于当前 installation（统一 404，不泄露存在性）。"""
+
+    code = "hold_not_found"
 
 
 def _connect():
@@ -987,6 +1018,464 @@ def ingest_usage_event(event, *, installation_id, plugin_id="histopilot",
                 }
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# PR7 billing holds（§12.3 Phase C / §19 v0.5）：逐 model call 预授权，
+# **advisory/影子语义**——authorize 永不因余额拒绝（owner 2026-08-28 指令：
+# 注册用户不做真实计费限制），只把「若开启硬额度会不会拒」（would_deny）
+# 算出来记录观测。不写 usage_debit：真实（模拟）扣费仍走 PR6 ingest 链，
+# 影子期两条链解耦（hold 的 call_id 对应事件随后照常 ingest）。
+# --------------------------------------------------------------------------- #
+#: hold TTL 缺省 300 秒（5 分钟：单次 model call 最坏时长 + 投递余量）
+DEFAULT_HOLD_TTL_SECONDS = 300
+
+#: holds audit 动作名（detail 无敏感字段；session_id 不落——与 ingest audit 纪律对齐）
+HOLD_AUTHORIZE_AUDIT_ACTION = "billing.hold_authorize"
+HOLD_SETTLE_AUDIT_ACTION = "billing.hold_settle"
+
+#: authorize 必填字段（additionalProperties:false 语义；provider 参与价目查询，
+#: 与 usage event schema 同 pattern）
+_HOLD_AUTH_REQUIRED_FIELDS = (
+    "call_id", "session_id", "subject_type", "subject_id", "provider",
+    "model", "estimated_input_tokens", "max_output_tokens",
+)
+_HOLD_AUTH_OPTIONAL_FIELDS = ("request_id", "user_id")
+_HOLD_AUTH_KNOWN_FIELDS = frozenset(
+    _HOLD_AUTH_REQUIRED_FIELDS + _HOLD_AUTH_OPTIONAL_FIELDS)
+
+#: authorize canonical request_hash 的参与字段（幂等重放比对依据；PR0 风格
+#: sorted-keys JSON → SHA-256）
+_HOLD_HASH_FIELDS = _HOLD_AUTH_REQUIRED_FIELDS + _HOLD_AUTH_OPTIONAL_FIELDS
+
+_HOLD_ID_PREFIX = "hold_"
+
+_HOLD_SEL = (
+    "hold_id, call_id, account_id, subject_type, subject_id, installation_id, "
+    "session_id, model, estimated_nano_cny, balance_nano_cny, would_deny, "
+    "status, event_id, created_at, settled_at, expires_at, metadata"
+)
+
+
+def hold_ttl_seconds() -> int:
+    """读取 ``BILLING_HOLD_TTL_SECONDS``（缺省 300；非法/非正回退缺省）。"""
+    raw = (os.environ.get("BILLING_HOLD_TTL_SECONDS") or "").strip()
+    try:
+        val = int(raw)
+    except ValueError:
+        return DEFAULT_HOLD_TTL_SECONDS
+    return val if val > 0 else DEFAULT_HOLD_TTL_SECONDS
+
+
+def validate_hold_authorize_body(body) -> list:
+    """authorize 请求校验（稳定 400 词表；语义与 usage event 校验器同风格）。"""
+    errors = []
+    if not isinstance(body, dict):
+        return ["request body 需为 JSON object"]
+    for key in _HOLD_AUTH_REQUIRED_FIELDS:
+        if key not in body:
+            errors.append("缺必填字段 %r" % key)
+    for key in body:
+        if key not in _HOLD_AUTH_KNOWN_FIELDS:
+            errors.append("不允许的额外字段 %r（additionalProperties:false）" % key)
+    if "call_id" in body and (not isinstance(body["call_id"], str)
+                              or not _CALL_ID_RE.match(body["call_id"])):
+        errors.append("call_id 需匹配 ^call_[0-9a-f]{32}$")
+    if "session_id" in body:
+        value = body["session_id"]
+        if not isinstance(value, str) or not (1 <= len(value) <= 128):
+            errors.append("session_id 需为 1..128 字符")
+    if "subject_type" in body and body["subject_type"] not in SUBJECT_TYPES:
+        errors.append("subject_type 需为 %s" % (SUBJECT_TYPES,))
+    if "subject_id" in body:
+        value = body["subject_id"]
+        if not isinstance(value, str) or not (1 <= len(value) <= 128):
+            errors.append("subject_id 需为 1..128 字符")
+    if "provider" in body and (not isinstance(body["provider"], str)
+                               or not _PROVIDER_RE.match(body["provider"])):
+        errors.append("provider 需匹配 ^[a-z][a-z0-9_-]{0,63}$")
+    if "model" in body and (not isinstance(body["model"], str)
+                            or not _MODEL_RE.match(body["model"])):
+        errors.append("model 需匹配 ^[a-z][a-z0-9._-]{0,127}$")
+    for key in ("estimated_input_tokens", "max_output_tokens"):
+        if key not in body:
+            continue
+        value = body[key]
+        if not _is_int(value):
+            errors.append("%s 需为非负整数" % key)
+            continue
+        _check_token_count(value, key, errors)  # 复用 >=0 与 2^53-1 上限
+    for key in ("request_id", "user_id"):
+        if key in body:
+            _check_nullable_str(body[key], key, errors, 1, 128)
+    return errors
+
+
+def validate_hold_settle_body(body) -> list:
+    """settle 请求校验：空 body（release）/ 只含可选 event_id。"""
+    errors = []
+    if body is None:
+        return errors  # 空 body = release（调用失败无 usage 的正常终态）
+    if not isinstance(body, dict):
+        return ["request body 需为 JSON object 或空"]
+    for key in body:
+        if key != "event_id":
+            errors.append("不允许的额外字段 %r（additionalProperties:false）" % key)
+    if "event_id" in body and body["event_id"] is not None:
+        value = body["event_id"]
+        if not isinstance(value, str) or not _EVENT_ID_RE.match(value):
+            errors.append("event_id 需匹配 ^use_[0-9a-f]{32}$（省略/null = release）")
+    return errors
+
+
+def hold_request_hash(body) -> str:
+    """authorize 载荷 canonical hash（缺省可选键补 null；sorted-keys JSON）。"""
+    obj = {key: body.get(key) for key in _HOLD_HASH_FIELDS}
+    canonical = json.dumps(
+        obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+        allow_nan=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _hold_out(row) -> dict:
+    out = dict(row)
+    for key in ("estimated_nano_cny", "balance_nano_cny"):
+        if out.get(key) is not None:
+            out[key] = int(out[key])
+    return out
+
+
+def _expire_stale_holds_tx(cur, now):
+    """同事务惰性回收（§12.3）：把 expires_at 已过的 open hold 标 expired。
+
+    没有 daemon——回收挂在每次 authorize/settle 的事务上（影子期量级足够；
+    索引 idx_billing_holds_expiry 支撑该扫描）。
+    """
+    cur.execute(
+        "UPDATE billing_holds SET status='expired' "
+        "WHERE status='open' AND expires_at < %s", (now,))
+
+
+def _open_holds_sum(cur, account_id, now):
+    """该账户当前 open 且未过期 holds 的 estimated 合计（无账户 → None）。
+
+    estimated 为 NULL 的行（无价目）贡献 0——无估算即无占用可计。
+    """
+    if account_id is None:
+        return None
+    cur.execute(
+        "SELECT COALESCE(SUM(estimated_nano_cny), 0)::bigint AS s "
+        "FROM billing_holds "
+        "WHERE account_id=%s AND status='open' AND expires_at >= %s",
+        (account_id, now))
+    return int(cur.fetchone()["s"])
+
+
+def _fetch_hold_locked_by_call(cur, call_id):
+    cur.execute("SELECT " + _HOLD_SEL +
+                " FROM billing_holds WHERE call_id=%s FOR UPDATE", (call_id,))
+    return cur.fetchone()
+
+
+def authorize_hold(body, *, installation_id, plugin_id="histopilot", now=None):
+    """预授权一次 model call（§12.3，advisory/影子：永不因余额拒绝）。
+
+    步骤（同一 PostgreSQL 事务）：
+      1. 请求校验 + canonical request_hash；
+      2. 惰性回收过期 open hold；
+      3. call_id dedup：已有行 → request_hash 一致返回原行（duplicate=True，
+         不重新解析主体/重算；expired 行同样幂等返回，客户端按 status 识别）；
+         不一致 → 409 hold_conflict（确定性）；
+      4. §7.2 四步权威主体解析（与 ingest 同一实现，复用
+         :func:`_resolve_usage_subject`）；demo 主体 → **不写行**，返回
+         ``{"skipped": "demo_subject", "authorized": True, "would_deny":
+         False, "hold_id": None}``（§14.1 红线：demo 永不入计费面），仍写
+         skipped audit；
+      5. 最坏价估算：customer_charge 价目（``find_active_rate``，时刻用
+         authorize 当前 ``now``），输入全按 cache-miss + max_output 输出；
+         无价目 → estimated=None（would_deny 亦 None——未知不裁决）；
+      6. 余额快照 = 账户 ledger 有符号合计（**不强制开户**：无账户 →
+         account_id/balance 均 NULL）；同账户其他 open 未过期 holds 的
+         estimated 合计计入占用；``would_deny = balance is not None and
+         estimated is not None and balance - open_sum < estimated``；
+      7. INSERT（status=open，expires_at=now+TTL）；并发同 call_id 由
+         SAVEPOINT + UNIQUE 约束吸收（对方先提交 → 回滚到 savepoint 重读
+         比对 hash，同 ingest 竞态先例）；
+      8. 同事务无敏感 audit（``billing.hold_authorize``；detail 不落
+         session_id/prompt/完整请求体，call_id 只落后 8 字符）。
+
+    返回行 dict（金额为 int 或 None，wire 层负责十进制字符串化）外加
+    ``duplicate`` 与 ``open_holds_nano_cny``（当前账户 open 合计，含本次）。
+
+    业务拒绝（BillingError：conflict/主体冲突等确定性 409/404）**不连带回滚
+    惰性回收**——回收是幂等安全副作用，且行内持久状态应与拒绝理由一致
+    （否则 expired 行永远停在 open，全靠下一次成功操作兜底回收）：业务段包
+    在 ``SAVEPOINT sp_hold_business`` 里，BillingError 回滚到 savepoint 后
+    事务仍带着回收结果提交、异常照样抛给路由；非 BillingError（基础设施
+    错误）整体回滚。
+    """
+    platform_features.require_pg_backend("billing")
+    errors = validate_hold_authorize_body(body)
+    if errors:
+        raise InvalidHoldRequestError(errors)
+    now = now if now is not None else datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    request_hash = hold_request_hash(body)
+    ttl = hold_ttl_seconds()
+    conn = _connect()
+    try:
+        business_error = None
+        result = None
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                _expire_stale_holds_tx(cur, now)
+                cur.execute("SAVEPOINT sp_hold_business")
+                try:
+                    result = _authorize_hold_tx(
+                        cur, body, installation_id=installation_id,
+                        plugin_id=plugin_id, now=now,
+                        request_hash=request_hash, ttl=ttl)
+                except BillingError as exc:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_hold_business")
+                    business_error = exc
+        if business_error is not None:
+            raise business_error
+        return result
+    finally:
+        conn.close()
+
+
+def _authorize_hold_tx(cur, body, *, installation_id, plugin_id, now,
+                       request_hash, ttl):
+    """authorize 的事务段（回收已做完；见 :func:`authorize_hold` 步骤 3-8）。"""
+    # -- dedup（重放幂等返回原行，不重新解析/重算） --
+    existing = _fetch_hold_locked_by_call(cur, body["call_id"])
+    if existing is not None:
+        stored_hash = (existing["metadata"] or {}).get("request_hash")
+        if stored_hash != request_hash:
+            raise HoldConflictError(
+                "同 call_id 重放的 hold 请求与原记录不一致",
+                call_id=body["call_id"])
+        row = _hold_out(existing)
+        row["duplicate"] = True
+        row["open_holds_nano_cny"] = _open_holds_sum(
+            cur, row.get("account_id"), now)
+        return row
+
+    # -- §7.2 权威主体（与 ingest 同一解析器：伪 event 只携带解析所需键，
+    #    绝不影响 ingest 行为） --
+    subject_type, subject_id = _resolve_usage_subject(
+        cur,
+        {"session_id": body["session_id"],
+         "request_id": body.get("request_id"),
+         "subject_type": body["subject_type"],
+         "subject_id": body["subject_id"],
+         "user_id": body.get("user_id")},
+        installation_id)
+
+    if subject_type == "demo":
+        # §14.1 红线：demo 永不入计费面——不写 hold 行、不开户；
+        # skipped 原样透传给调用方（authorized=True：影子期永不拒绝）
+        share_store_pg.record_audit_tx(
+            cur, HOLD_AUTHORIZE_AUDIT_ACTION,
+            actor_user_id=None, actor_role="plugin",
+            target_type="billing_hold", target_id=None,
+            detail={"skipped": "demo_subject",
+                    "subject_type": "demo",
+                    "model": body["model"],
+                    "provider": body["provider"],
+                    "installation_id": installation_id,
+                    "plugin_id": plugin_id},
+            ts=now.timestamp())
+        return {"skipped": "demo_subject", "authorized": True,
+                "would_deny": False, "hold_id": None}
+
+    # -- 最坏价估算（customer_charge；时刻 = authorize now） --
+    charge_book = billing_pricing.find_active_rate(
+        cur, "customer_charge", body["provider"], body["model"], now)
+    estimated = None
+    if charge_book is not None:
+        estimated = billing_pricing.price_tokens_nano(
+            0, body["estimated_input_tokens"],
+            body["max_output_tokens"], charge_book)
+
+    # -- 余额快照（不强制开户：无账户 → NULL 全套） --
+    cur.execute(
+        "SELECT account_id FROM billing_accounts WHERE user_id=%s",
+        (subject_id,))
+    acct = cur.fetchone()
+    account_id = acct["account_id"] if acct is not None else None
+    balance = None
+    if account_id is not None:
+        cur.execute(
+            "SELECT COALESCE(SUM(amount_nano_cny), 0)::bigint AS bal "
+            "FROM billing_ledger_entries WHERE account_id=%s", (account_id,))
+        balance = int(cur.fetchone()["bal"])
+
+    open_sum = _open_holds_sum(cur, account_id, now)
+    would_deny = None
+    if balance is not None and estimated is not None:
+        would_deny = (balance - (open_sum or 0)) < estimated
+
+    hold_id = _HOLD_ID_PREFIX + secrets.token_hex(12)
+    metadata = {
+        "request_hash": request_hash,
+        "provider": body["provider"],
+        "charge_price_book_id":
+            charge_book["price_book_id"] if charge_book else None,
+        "ttl_seconds": ttl,
+    }
+    # SAVEPOINT：并发同 call_id authorize → 对方先提交，本事务 INSERT 抛
+    # UniqueViolation（语句置 aborted），先回滚到 savepoint 恢复事务再重读
+    # 对方行比对 hash（ingest 同款；嵌套在 sp_hold_business 之内）
+    duplicate = False
+    cur.execute("SAVEPOINT sp_hold_insert")
+    try:
+        cur.execute(
+            "INSERT INTO billing_holds "
+            "(hold_id, call_id, account_id, subject_type, subject_id, "
+            " installation_id, session_id, model, estimated_nano_cny, "
+            " balance_nano_cny, would_deny, status, expires_at, metadata) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open',%s,%s) "
+            "RETURNING " + _HOLD_SEL,
+            (hold_id, body["call_id"], account_id, subject_type, subject_id,
+             installation_id, body["session_id"], body["model"], estimated,
+             balance, would_deny, now + timedelta(seconds=ttl),
+             psycopg.types.json.Jsonb(metadata)))
+        inserted = cur.fetchone()
+    except psycopg.errors.UniqueViolation as exc:
+        name = (getattr(getattr(exc, "diag", None), "constraint_name", "")
+                or "")
+        if name not in ("billing_holds_pkey", "billing_holds_call_id_key"):
+            raise
+        cur.execute("ROLLBACK TO SAVEPOINT sp_hold_insert")
+        again = _fetch_hold_locked_by_call(cur, body["call_id"])
+        if again is None \
+                or (again["metadata"] or {}).get("request_hash") != request_hash:
+            raise HoldConflictError(
+                "并发 authorize 冲突：call_id 已被其他载荷占用",
+                call_id=body["call_id"]) from exc
+        inserted = again
+        duplicate = True
+    else:
+        cur.execute("RELEASE SAVEPOINT sp_hold_insert")
+
+    row = _hold_out(inserted)
+    row["duplicate"] = duplicate
+    row["open_holds_nano_cny"] = _open_holds_sum(cur, row.get("account_id"),
+                                                 now)
+    if not duplicate:
+        # 重放不重复写 audit（与 ingest/adjust 纪律一致）
+        share_store_pg.record_audit_tx(
+            cur, HOLD_AUTHORIZE_AUDIT_ACTION,
+            actor_user_id=None, actor_role="plugin",
+            target_type="billing_hold", target_id=row["hold_id"],
+            detail={"call_id_suffix": row["call_id"][-8:],
+                    "subject_type": subject_type,
+                    "model": body["model"],
+                    "provider": body["provider"],
+                    "estimated_nano_cny": estimated,
+                    "balance_nano_cny": balance,
+                    "open_holds_nano_cny": row["open_holds_nano_cny"],
+                    "would_deny": would_deny,
+                    "status": row["status"],
+                    "installation_id": installation_id,
+                    "plugin_id": plugin_id},
+            ts=now.timestamp())
+    return row
+
+
+def settle_hold(hold_id, body, *, installation_id, now=None):
+    """结算/释放一个 hold（§12.3；与 ingest 链解耦，见 :func:`authorize_hold`）。
+
+    状态机（同一事务；先做惰性回收——目标行若已过期会被标 expired，随后
+    按非 open 拒绝；业务拒绝不连带回滚回收标记，见 :func:`authorize_hold`
+    的 SAVEPOINT 说明）：
+      - 不存在 / 不属于该 installation → 404 hold_not_found（**统一 404**：
+        跨 installation 探测与不存在不可区分，不泄露存在性——与插件通道
+        「无授权即不可见」原则一致）；
+      - open + 合法 event_id → settled（写 event_id + settled_at）；
+        open + 不带 event_id → released（调用失败无 usage 的正常终态，
+        event_id 保持 NULL）；
+      - settled + 同 event_id → 200 duplicate=True（不重复写 audit）；
+        settled + 不同/缺 event_id → 409 hold_conflict（防二次释放/改绑）；
+      - released/expired → 409 hold_not_open（retryable=false）。
+
+    event_id 只做格式与终态一致性校验，**不校验事件已入库**——billing_holds
+    无 FK（outbox 乱序时 settle 可先于 usage 事件到达，影子期容忍悬空引用）。
+    """
+    platform_features.require_pg_backend("billing")
+    errors = validate_hold_settle_body(body)
+    if errors:
+        raise InvalidHoldRequestError(errors)
+    event_id = body.get("event_id") if isinstance(body, dict) else None
+    now = now if now is not None else datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    conn = _connect()
+    try:
+        business_error = None
+        result = None
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                _expire_stale_holds_tx(cur, now)
+                cur.execute("SAVEPOINT sp_hold_business")
+                try:
+                    result = _settle_hold_tx(
+                        cur, hold_id, event_id,
+                        installation_id=installation_id, now=now)
+                except BillingError as exc:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_hold_business")
+                    business_error = exc
+        if business_error is not None:
+            raise business_error
+        return result
+    finally:
+        conn.close()
+
+
+def _settle_hold_tx(cur, hold_id, event_id, *, installation_id, now):
+    """settle 的事务段（回收已做完；见 :func:`settle_hold` 状态机）。"""
+    cur.execute("SELECT " + _HOLD_SEL +
+                " FROM billing_holds WHERE hold_id=%s FOR UPDATE", (hold_id,))
+    row = cur.fetchone()
+    if row is None or row["installation_id"] != installation_id:
+        raise HoldNotFoundError("hold 不存在或不可访问", hold_id=hold_id)
+
+    if row["status"] == "open":
+        new_status = "settled" if event_id else "released"
+        cur.execute(
+            "UPDATE billing_holds SET status=%s, event_id=%s, settled_at=%s "
+            "WHERE hold_id=%s AND status='open' RETURNING " + _HOLD_SEL,
+            (new_status, event_id, now, hold_id))
+        updated = cur.fetchone()
+        if updated is None:  # 并发 settle：对方先终局化本行
+            raise HoldNotOpenError("hold 已被并发结算终局化", hold_id=hold_id)
+        out = _hold_out(updated)
+        out["duplicate"] = False
+        share_store_pg.record_audit_tx(
+            cur, HOLD_SETTLE_AUDIT_ACTION,
+            actor_user_id=None, actor_role="plugin",
+            target_type="billing_hold", target_id=hold_id,
+            detail={"call_id_suffix": out["call_id"][-8:],
+                    "status": out["status"],
+                    "event_id": event_id,
+                    "installation_id": installation_id},
+            ts=now.timestamp())
+        return out
+
+    if row["status"] == "settled":
+        if event_id is not None and row["event_id"] == event_id:
+            out = _hold_out(row)
+            out["duplicate"] = True
+            return out
+        raise HoldConflictError(
+            "hold 已结算，不能再次结算或改绑 event", hold_id=hold_id)
+
+    raise HoldNotOpenError(
+        "hold 已 %s，不可结算" % row["status"],
+        hold_id=hold_id, status=row["status"])
 
 
 # --------------------------------------------------------------------------- #

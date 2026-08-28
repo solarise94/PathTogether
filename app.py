@@ -7952,6 +7952,11 @@ _PLUGIN_ERROR_RETRYABLE = {
     "usage_subject_conflict": False,
     "usage_subject_not_ready": True,
     "pg_backend_required": False,
+    # PR7 billing holds（admin-billing §12.3/§19 v0.5）：载荷冲突/改绑与
+    # 非 open 终态均为确定性 409（不重试）；hold_not_found 404 同理
+    "hold_conflict": False,
+    "hold_not_open": False,
+    "hold_not_found": False,
 }
 
 
@@ -11650,6 +11655,167 @@ def plugin_v1_usage_events():
         duplicate=result["duplicate"],
         status=result["status"],
         priced=result["priced"],
+    )
+
+
+# --------------------------------------------------------------------------- #
+# billing holds（admin-billing 方案 §12.3 Phase C，PR7——v0.5 影子/advisory）
+#
+# 逐 model call 预授权：HistoPilot 在每次 provider 调用前 POST /billing/holds，
+# 调用结束后（成功带 event_id / 失败不带）POST .../settle。**影子语义**
+# （§19 v0.5，owner 2026-08-28 指令）：authorize 永不因余额拒绝，would_deny
+# 只记录「若开启硬额度会不会拒」供观测；不写 usage_debit（模拟扣费仍走
+# PR6 ingest 链，两条链解耦）；TTL 惰性回收挂在 authorize/settle 事务上。
+# 鉴权/白名单/错误信封与 usage-events 同一机器通道纪律。数据层见
+# billing_store.authorize_hold / settle_hold。
+# --------------------------------------------------------------------------- #
+def _hold_nano_wire(value):
+    """hold 响应金额：nano-CNY 整数 → 十进制字符串（§5 wire 纪律；None 透传）。"""
+    return None if value is None else str(int(value))
+
+
+def _hold_rfc3339(value):
+    """hold 响应时间 → RFC3339（UTC，Z 后缀；None 透传）。"""
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@app.route("/api/plugin/v1/billing/holds", methods=["POST"])
+def plugin_v1_billing_hold_authorize():
+    """预授权一次 model call（advisory/影子：authorized 恒 True，永不因余额拒绝）。
+
+    鉴权：Bearer scoped JWT（_require_plugin_token）+ plugin_id 白名单
+    （复用 _USAGE_INGEST_PLUGIN_IDS，仅 HistoPilot 安装——同一机器通道）。
+    json/dual → 503 pg_backend_required（fail-closed，不降级）。
+
+    错误（统一插件信封，code 稳定、message 无敏感）：
+      400 invalid_request          —— 字段校验（call_id/session_id/model 格式、
+                                       token 上限 2^53-1、必填项）；
+      409 hold_conflict            —— 同 call_id 重放但载荷不同（确定性）；
+      409 usage_subject_conflict   —— body 主体 assertion 与权威解析不一致；
+      409 usage_subject_not_ready  —— 权威绑定未就绪（retryable=true）；
+      503 pg_backend_required      —— json/dual fail-closed。
+
+    成功返回 ``{ok, authorized:true, hold_id, call_id, duplicate, status,
+    subject_type, model, estimated_nano_cny, balance_nano_cny,
+    open_holds_nano_cny, would_deny, expires_at}``；金额一律十进制字符串或
+    null，expires_at RFC3339；demo 主体返回 ``{ok, skipped:"demo_subject",
+    authorized:true, would_deny:false, hold_id:null}``（不写行，§14.1 红线）。
+    """
+    claims, err = _require_plugin_token()
+    if err is not None:
+        return err
+    if (claims.get("plugin_id") or "") not in _USAGE_INGEST_PLUGIN_IDS:
+        return _plugin_error(403, "forbidden",
+                             "仅 HistoPilot 插件安装可预授权计费 hold")
+    if not platform_features.billing_features_available():
+        # json/dual fail-closed（§6.1）：不降级进程内估算
+        return _plugin_error(
+            503, "pg_backend_required",
+            "billing hold 要求 STORAGE_BACKEND=postgres（当前 %r），fail-closed"
+            % platform_features.current_backend())
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return _plugin_error(400, "invalid_request", "request body 需为 JSON object")
+    try:
+        result = billing_store.authorize_hold(
+            body, installation_id=claims.get("sub") or "",
+            plugin_id=claims.get("plugin_id") or "")
+    except billing_store.InvalidHoldRequestError as exc:
+        # details 只含字段级校验信息，不含请求体内容
+        return _plugin_error(400, "invalid_request", "hold 请求校验失败",
+                             details={"errors": exc.errors[:10]})
+    except billing_store.HoldConflictError:
+        return _plugin_error(409, "hold_conflict",
+                             "同 call_id 的 hold 请求与原记录不一致")
+    except billing_store.UsageSubjectConflictError:
+        return _plugin_error(409, "usage_subject_conflict",
+                             "hold 主体 assertion 与权威绑定不一致")
+    except billing_store.UsageSubjectNotReadyError:
+        return _plugin_error(409, "usage_subject_not_ready",
+                             "权威主体绑定尚未就绪，请退避后重试", retryable=True)
+    except platform_features.PgFeatureUnavailable:
+        return _plugin_error(503, "pg_backend_required",
+                             "billing hold 要求 STORAGE_BACKEND=postgres")
+    except Exception:
+        app.logger.exception("billing hold authorize 失败（call_id=%s）",
+                             body.get("call_id"))
+        return _plugin_error(500, "internal", "内部错误", retryable=True)
+    if result.get("skipped") is not None:
+        # demo 主体：不写行（§14.1 红线），skipped 语义原样透传
+        return jsonify(ok=True, skipped=result["skipped"],
+                       authorized=result["authorized"],
+                       would_deny=result["would_deny"],
+                       hold_id=result["hold_id"])
+    return jsonify(
+        ok=True,
+        authorized=True,  # 影子语义：永不因余额拒绝（§19 v0.5）
+        hold_id=result["hold_id"],
+        call_id=result["call_id"],
+        duplicate=result["duplicate"],
+        status=result["status"],
+        subject_type=result["subject_type"],
+        model=result["model"],
+        estimated_nano_cny=_hold_nano_wire(result["estimated_nano_cny"]),
+        balance_nano_cny=_hold_nano_wire(result["balance_nano_cny"]),
+        open_holds_nano_cny=_hold_nano_wire(result["open_holds_nano_cny"]),
+        would_deny=result["would_deny"],
+        expires_at=_hold_rfc3339(result["expires_at"]),
+    )
+
+
+@app.route("/api/plugin/v1/billing/holds/<hold_id>/settle", methods=["POST"])
+def plugin_v1_billing_hold_settle(hold_id):
+    """结算/释放一个 hold（成功调用带 event_id → settled；失败/无 usage 空 body → released）。
+
+    鉴权同 authorize（同 installation 白名单通道）；hold 不属于该 installation
+    与不存在统一 404 hold_not_found（不泄露存在性）。已 settled 后同 event_id
+    重放 → duplicate=true；不同/缺 event_id → 409 hold_conflict；
+    released/expired → 409 hold_not_open（均不可重试）。
+    """
+    claims, err = _require_plugin_token()
+    if err is not None:
+        return err
+    if (claims.get("plugin_id") or "") not in _USAGE_INGEST_PLUGIN_IDS:
+        return _plugin_error(403, "forbidden",
+                             "仅 HistoPilot 插件安装可结算计费 hold")
+    if not platform_features.billing_features_available():
+        return _plugin_error(
+            503, "pg_backend_required",
+            "billing hold 要求 STORAGE_BACKEND=postgres（当前 %r），fail-closed"
+            % platform_features.current_backend())
+    body = request.get_json(silent=True)
+    if body is not None and not isinstance(body, dict):
+        return _plugin_error(400, "invalid_request",
+                             "request body 需为 JSON object 或空（release）")
+    try:
+        result = billing_store.settle_hold(
+            hold_id, body, installation_id=claims.get("sub") or "")
+    except billing_store.InvalidHoldRequestError as exc:
+        return _plugin_error(400, "invalid_request", "hold 请求校验失败",
+                             details={"errors": exc.errors[:10]})
+    except billing_store.HoldNotFoundError:
+        return _plugin_error(404, "hold_not_found", "hold 不存在或不可访问")
+    except billing_store.HoldConflictError:
+        return _plugin_error(409, "hold_conflict",
+                             "hold 已结算，不能再次结算或改绑 event")
+    except billing_store.HoldNotOpenError:
+        return _plugin_error(409, "hold_not_open", "hold 已终局（released/expired），不可再结算")
+    except platform_features.PgFeatureUnavailable:
+        return _plugin_error(503, "pg_backend_required",
+                             "billing hold 要求 STORAGE_BACKEND=postgres")
+    except Exception:
+        app.logger.exception("billing hold settle 失败（hold_id=%s）", hold_id)
+        return _plugin_error(500, "internal", "内部错误", retryable=True)
+    return jsonify(
+        ok=True,
+        hold_id=result["hold_id"],
+        status=result["status"],
+        duplicate=result["duplicate"],
+        event_id=result["event_id"],
+        settled_at=_hold_rfc3339(result["settled_at"]),
+        expires_at=_hold_rfc3339(result["expires_at"]),
     )
 
 

@@ -556,6 +556,7 @@ experiment_profile?
 | DELETE | `/annotations/{annotation_id}` | 带 revision 的 tombstone 删除 |
 | GET | `/events/stream?slide_id=` | 标注/切片变化事件 |
 | POST | `/audit/plugin-events` | 上报插件关键操作摘要 |
+| POST | `/usage-events` | HistoPilot durable usage outbox 投递模型调用量事件（§7.8） |
 
 `PlatformClient` 必须覆盖本表全部能力；尚未使用的能力可以由 adapter 返回显式 `capability_not_supported`，不能从类型中消失。manifest 的 permissions、HTTP endpoint 和 client 方法使用同一份 contract schema 生成或校验，避免三份定义漂移。
 
@@ -757,6 +758,53 @@ Host 必须校验 `event.origin`、iframe window、plugin installation、协议�
 | 5xx | `service_unavailable`, `region_failed` | 按 code 决定 |
 
 SSE 已建立后不能改 HTTP 状态，使用 `event: error`，data 为同一 error 对象；是否重连由 `retryable` 决定。错误 `message` 用于展示，程序分支只能依赖稳定 `code`。
+
+### 7.8 Usage ingestion（用量事件投递）
+
+> 登记于 2026-08-28，实施批次 PR0（契约先行）/ PR2（PathTogether 服务端）。业务背景、
+> 计价与时钟规则见 `docs/admin-billing-plugin-implementation-plan.md` §4–§7。
+
+HistoPilot 为每次真实 provider 调用生成一个 usage event，经 durable outbox
+at-least-once 投递：
+
+```http
+POST /api/plugin/v1/usage-events
+Authorization: Bearer <plugin JWT>
+Content-Type: application/json
+Idempotency-Key: <event_id>
+```
+
+要求：
+
+- **鉴权**：沿用 §7.6 的插件 JWT（`iss=pathtogether`，`aud=plugin`），且对应
+  installation 必须处于 enabled 状态。不得使用浏览器 owner session 调用本端点；
+- **schema 版本**：body 携带 `schema_version`，v1 的 request body 契约固定为
+  `tests/fixtures/usage_events/schema_v1.json`（draft 2020-12，
+  `additionalProperties:false`；样例事件与 canonical payload_hash 规范见同目录
+  `README.md`）。不兼容变更必须 bump 版本并协商，不得原地改语义；
+- **幂等语义**：`Idempotency-Key` header 必须与 body `event_id` 一致。服务端在
+  schema 校验与字段规范化后自行计算 canonical `payload_hash`（规则以
+  `tests/fixtures/usage_events/README.md` 为唯一依据），不信任客户端提交值。
+  同一 `event_id` 重放且 hash 相同：返回原行并标记 `duplicate`，不重复计价或入账；
+  hash 不同：返回 409 `usage_event_conflict` 并告警，绝不能以新 payload 覆盖旧账单。
+  `call_id` 服务端唯一；
+- **主体绑定**：body 中的 `subject_type`/`subject_id`/`user_id` 只是 assertion。
+  服务端按权威顺序解析计费主体：`request_id` → `ai_budget_reservations`（要求
+  `state='consumed'` 且 session 一致）→ demo capability（`demo_sessions` 的
+  `histopilot_session_id`）→ run grant 交叉校验，最后与 assertion 比对。不一致返回
+  确定性 409 `usage_subject_conflict`（P0 告警）；绑定行尚未提交返回可重试 409
+  `usage_subject_not_ready`。Demo 主体只计量，不开户、不写 ledger；
+- **影子阶段**：PR2 只做入库与计价，不写 `usage_debit` ledger entry；硬计费另按
+  admin-billing 方案 §12/§14 门槛显式开启。
+
+成功响应（§7.7 错误信封之外的正常信封）：
+
+```json
+{ "ok": true, "event_id": "use_...", "duplicate": false, "status": "priced", "priced": true }
+```
+
+`status` 取 `priced`/`unpriced`/`void`：未知模型、找不到有效价格、缺最终 usage、
+算术或时钟校验失败时写 `unpriced`，不猜测 token、不自动扣费。
 
 ---
 

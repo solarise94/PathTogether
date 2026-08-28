@@ -1,0 +1,77 @@
+{
+  "_comment": "DeepSeek 官方价格快照测试夹具（docs/admin-billing-plugin-implementation-plan.md §4，快照日 2026-08-28）。PR2 的 billing_pricing.py 消费本文件；实施日必须重新核对官方文档。价格单位：CNY/百万 tokens。nano 换算公式：nano_per_million = CNY_per_million × 1e9 nano/CNY ÷ 1e6 tokens = CNY_per_million × 1000（例：0.05 CNY → 50 nano；27.0 CNY → 27000 nano）。换算必须用十进制精确算术（Decimal(str(cny)) × 1000），禁止先转 float 再乘。最低价 0.05 CNY/百万 token = 每 token 50 nano-CNY，这是 §5 选择 BIGINT nano_cny 的原因。",
+  "provider": "deepseek",
+  "kind": "provider_cost",
+  "currency": "CNY",
+  "snapshot_date": "2026-08-28",
+  "source_url": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
+  "timezone": "Asia/Shanghai",
+  "time_bands": ["peak", "off_peak"],
+  "schedule_rule_text": "peak = 北京时间（Asia/Shanghai）工作日 09:00–12:00、14:00–18:00（区间左闭右开），其余均为 off_peak。计价时间取该次 provider 调用的 occurred_at，不得静默改用 received_at。边界用例见同目录 time_band_cases.json。",
+  "unit_cny_per_million": {
+    "cache_hit_input_tokens": "cache_hit_cny_per_million",
+    "cache_miss_input_tokens": "cache_miss_cny_per_million",
+    "output_tokens": "output_cny_per_million"
+  },
+  "conversion": {
+    "formula": "nano_per_million = Decimal(cny_per_million) * 1000",
+    "derivation": "1 CNY = 1e9 nano_cny；价格以每 1e6 tokens 计，故 nano_per_million = CNY × 1e9 / 1e6 = CNY × 1000",
+    "note": "禁止 float 中转；所有快照值换算后必须是整数"
+  },
+  "models": {
+    "deepseek-v4-flash": {
+      "off_peak": {
+        "cache_hit_cny_per_million": 0.05,
+        "cache_miss_cny_per_million": 1.5,
+        "output_cny_per_million": 4.5,
+        "cache_hit_nano_per_million": 50,
+        "cache_miss_nano_per_million": 1500,
+        "output_nano_per_million": 4500
+      },
+      "peak": {
+        "cache_hit_cny_per_million": 0.1,
+        "cache_miss_cny_per_million": 3.0,
+        "output_cny_per_million": 9.0,
+        "cache_hit_nano_per_million": 100,
+        "cache_miss_nano_per_million": 3000,
+        "output_nano_per_million": 9000
+      }
+    },
+    "deepseek-v4-pro": {
+      "off_peak": {
+        "cache_hit_cny_per_million": 0.15,
+        "cache_miss_cny_per_million": 4.5,
+        "output_cny_per_million": 13.5,
+        "cache_hit_nano_per_million": 150,
+        "cache_miss_nano_per_million": 4500,
+        "output_nano_per_million": 13500
+      },
+      "peak": {
+        "cache_hit_cny_per_million": 0.3,
+        "cache_miss_cny_per_million": 9.0,
+        "output_cny_per_million": 27.0,
+        "cache_hit_nano_per_million": 300,
+        "cache_miss_nano_per_million": 9000,
+        "output_nano_per_million": 27000
+      }
+    },
+    "deepseek-v4-flash-vision-exp": {
+      "off_peak": {
+        "cache_hit_cny_per_million": 0.05,
+        "cache_miss_cny_per_million": 1.5,
+        "output_cny_per_million": 4.5,
+        "cache_hit_nano_per_million": 50,
+        "cache_miss_nano_per_million": 1500,
+        "output_nano_per_million": 4500
+      },
+      "peak": {
+        "cache_hit_cny_per_million": 0.1,
+        "cache_miss_cny_per_million": 3.0,
+        "output_cny_per_million": 9.0,
+        "cache_hit_nano_per_million": 100,
+        "cache_miss_nano_per_million": 3000,
+        "output_nano_per_million": 9000
+      }
+    }
+  }
+}

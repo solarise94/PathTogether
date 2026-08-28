@@ -1,0 +1,31 @@
+{
+  "_comment": "peak/off_peak 时段边界判定用例（docs/admin-billing-plugin-implementation-plan.md §4/§14.1）。判定规则文字见 rule_text；输入可以是 UTC（Z）、+08:00 或其他偏移的 RFC3339 时间，判定一律先转到 Asia/Shanghai 再套规则。这些只是数据夹具：PR2 的 pricing 代码消费它们，tests/test_usage_event_fixtures.py 用 zoneinfo 实现的最小判定函数交叉验证。",
+  "rule_text": "北京时间（Asia/Shanghai）工作日 09:00–12:00、14:00–18:00 为 peak，其余均为 off_peak；区间左闭右开：09:00:00/14:00:00 计 peak，12:00:00/18:00:00 计 off_peak；周六、周日全天 off_peak。",
+  "timezone": "Asia/Shanghai",
+  "cases": [
+    { "input": "2026-09-07T08:59:59+08:00", "expected_time_band": "off_peak", "note": "周一早高峰开始前 1 秒" },
+    { "input": "2026-09-07T09:00:00+08:00", "expected_time_band": "peak", "note": "周一早高峰开始（左闭）" },
+    { "input": "2026-09-07T11:59:59+08:00", "expected_time_band": "peak", "note": "周一午前高峰最后 1 秒" },
+    { "input": "2026-09-07T12:00:00+08:00", "expected_time_band": "off_peak", "note": "周一午休开始（右开）" },
+    { "input": "2026-09-07T13:59:59+08:00", "expected_time_band": "off_peak", "note": "周一午休最后 1 秒" },
+    { "input": "2026-09-07T14:00:00+08:00", "expected_time_band": "peak", "note": "周一下午高峰开始（左闭）" },
+    { "input": "2026-09-07T17:59:59+08:00", "expected_time_band": "peak", "note": "周一下午高峰最后 1 秒" },
+    { "input": "2026-09-07T18:00:00+08:00", "expected_time_band": "off_peak", "note": "周一下午高峰结束（右开）" },
+    { "input": "2026-09-07T07:15:40.512+08:00", "expected_time_band": "off_peak", "note": "周一清晨（含毫秒）" },
+    { "input": "2026-09-07T19:45:02.900+08:00", "expected_time_band": "off_peak", "note": "周一晚间（含毫秒）" },
+    { "input": "2026-09-07T08:59:59.999999+08:00", "expected_time_band": "off_peak", "note": "边界前微秒级仍属 off_peak" },
+    { "input": "2026-09-12T09:30:00+08:00", "expected_time_band": "off_peak", "note": "周六落在早高峰窗口内，但周末全天 off_peak" },
+    { "input": "2026-09-12T15:00:00+08:00", "expected_time_band": "off_peak", "note": "周六午后高峰窗口内" },
+    { "input": "2026-09-13T10:00:00+08:00", "expected_time_band": "off_peak", "note": "周日早高峰窗口内" },
+    { "input": "2026-09-07T01:00:00Z", "expected_time_band": "peak", "note": "UTC 输入 = 北京周一 09:00:00" },
+    { "input": "2026-09-07T03:59:59Z", "expected_time_band": "peak", "note": "UTC 输入 = 北京周一 11:59:59" },
+    { "input": "2026-09-07T04:00:00Z", "expected_time_band": "off_peak", "note": "UTC 输入 = 北京周一 12:00:00" },
+    { "input": "2026-09-07T09:59:59Z", "expected_time_band": "peak", "note": "UTC 输入 = 北京周一 17:59:59" },
+    { "input": "2026-09-06T18:30:00Z", "expected_time_band": "off_peak", "note": "UTC 仍是周日，北京已周一 02:30（跨日）" },
+    { "input": "2026-09-11T16:30:00Z", "expected_time_band": "off_peak", "note": "UTC 仍是周五，北京已周六 00:30（跨日跨周，周末判定）" },
+    { "input": "2026-09-07T10:00:00+09:00", "expected_time_band": "peak", "note": "非北京偏移输入 = 北京周一 09:00:00" },
+    { "input": "2026-09-12T01:00:00+09:00", "expected_time_band": "off_peak", "note": "非北京偏移输入 = 北京周六 00:00" },
+    { "input": "2026-09-04T23:30:00-05:00", "expected_time_band": "off_peak", "note": "负偏移输入 = 北京 2026-09-05（周六）12:30，跨日跨周落进周末" },
+    { "input": "2026-09-07T21:30:00-05:00", "expected_time_band": "peak", "note": "负偏移输入 = 北京 2026-09-08（周二）10:30，跨日进入工作日高峰" }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "event_id": "use_0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+  "call_id": "call_11223344556677889900aabbccddeeff",
+  "schema_version": 1,
+  "request_id": "req_5d4e3f2a1b0c9d8e7f6a5b4c",
+  "session_id": "sess_7f3a2b1c9d4e5f6a7b8c",
+  "subject_type": "owner",
+  "subject_id": "usr_owner0a1b2c3d",
+  "user_id": "usr_owner0a1b2c3d",
+  "provider": "deepseek",
+  "model": "deepseek-v4-flash",
+  "provider_request_id": "8a2c1f0e-9d3b-4c6a-b5e7-2f8d0a1c3e5f",
+  "occurred_at": "2026-09-07T02:30:12.345Z",
+  "enqueued_at": "2026-09-07T02:30:13.120Z",
+  "cache_hit_input_tokens": 1856,
+  "cache_miss_input_tokens": 2418,
+  "output_tokens": 357,
+  "reasoning_tokens": 0,
+  "total_tokens": 4631,
+  "raw_usage": {
+    "finish_reason": "stop",
+    "prompt_tokens": 4274,
+    "completion_tokens": 357,
+    "prompt_cache_hit_tokens": 1856,
+    "prompt_cache_miss_tokens": 2418,
+    "provider_meta_v1": {
+      "meta_version": 1,
+      "service": "deepseek",
+      "usage_shape": "chat-completions",
+      "stream": true
+    }
+  }
+}

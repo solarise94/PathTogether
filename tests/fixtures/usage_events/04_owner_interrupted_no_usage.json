@@ -1,0 +1,28 @@
+{
+  "event_id": "use_00000000000000000000000000000001",
+  "call_id": "call_00000000000000000000000000000002",
+  "schema_version": 1,
+  "request_id": "req_aborted111111111112222222",
+  "session_id": "sess_9a8b7c6d5e4f3021fedcba98",
+  "subject_type": "owner",
+  "subject_id": "usr_owner0a1b2c3d",
+  "user_id": "usr_owner0a1b2c3d",
+  "provider": "deepseek",
+  "model": "deepseek-v4-pro",
+  "provider_request_id": null,
+  "occurred_at": "2026-09-07T02:41:07.220Z",
+  "enqueued_at": "2026-09-07T02:41:07.900Z",
+  "cache_hit_input_tokens": null,
+  "cache_miss_input_tokens": null,
+  "output_tokens": null,
+  "reasoning_tokens": null,
+  "total_tokens": null,
+  "raw_usage": {
+    "finish_reason": "aborted",
+    "provider_meta_v1": {
+      "meta_version": 1,
+      "service": "deepseek",
+      "stream_state": "interrupted_no_final_usage"
+    }
+  }
+}

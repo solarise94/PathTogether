@@ -1,0 +1,32 @@
+{
+  "event_id": "use_33333333333333333333333333333333",
+  "call_id": "call_44444444444444444444444444444444",
+  "schema_version": 1,
+  "request_id": "req_7777888899990000aaaabbbb",
+  "session_id": "sess_3c4b5a6978879654321fedcb",
+  "subject_type": "user",
+  "subject_id": "usr_556677889900aabbccddeeff",
+  "user_id": "usr_556677889900aabbccddeeff",
+  "provider": "deepseek",
+  "model": "deepseek-v4-flash",
+  "occurred_at": "2026-09-07T11:45:02.900Z",
+  "enqueued_at": "2026-09-07T11:45:03.310Z",
+  "cache_hit_input_tokens": 0,
+  "cache_miss_input_tokens": 512,
+  "output_tokens": 128,
+  "reasoning_tokens": 0,
+  "total_tokens": 640,
+  "raw_usage": {
+    "finish_reason": "stop",
+    "prompt_tokens": 512,
+    "completion_tokens": 128,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 512,
+    "provider_meta_v1": {
+      "meta_version": 1,
+      "service": "deepseek",
+      "usage_shape": "chat-completions",
+      "stream": false
+    }
+  }
+}

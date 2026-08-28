@@ -1,0 +1,188 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pathtogether.invalid/schemas/plugin/v1/usage-event-v1.json",
+  "title": "UsageEvent request body (schema_version 1)",
+  "description": "POST /api/plugin/v1/usage-events 的 request body 契约（docs/pathtogather-histopilot-platform-plugin-upgrade.md §7.8；docs/admin-billing-plugin-implementation-plan.md §6.4/§7.2/§7.5）。HistoPilot durable usage outbox 每次真实 provider 调用投递一个事件。body 中的 subject_type/subject_id/user_id 只是 assertion，PathTogether 服务端按权威链路解析计费主体，不信任 body 值。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "call_id",
+    "schema_version",
+    "session_id",
+    "subject_type",
+    "subject_id",
+    "provider",
+    "model",
+    "occurred_at",
+    "enqueued_at",
+    "cache_hit_input_tokens",
+    "cache_miss_input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "total_tokens"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "pattern": "^use_[0-9a-f]{32}$",
+      "description": "128-bit 随机十六进制，整条链路的幂等键；必须与 Idempotency-Key header 一致。同一 provider call 终态只允许 enqueue 一次。"
+    },
+    "call_id": {
+      "type": "string",
+      "pattern": "^call_[0-9a-f]{32}$",
+      "description": "HistoPilot 在创建 provider stream 之前生成的内部调用 ID；服务端唯一，用于把事件钉死到具体 model call。"
+    },
+    "schema_version": {
+      "const": 1,
+      "description": "本 body schema 的版本。不兼容变更必须 bump 并由服务端协商，不得原地改语义。"
+    },
+    "request_id": {
+      "anyOf": [
+        { "type": "null" },
+        { "type": "string", "minLength": 1, "maxLength": 128 }
+      ],
+      "description": "PathTogether 用户动作幂等键（turn reservation）。可空/可选：Demo 调用与部分内部调用没有 reservation。"
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "HistoPilot session ID；服务端用它反查 reservation / demo capability / run grant 做权威主体绑定。"
+    },
+    "subject_type": {
+      "enum": ["owner", "user", "demo"],
+      "description": "投递端断言的计费主体类型。仅为 assertion：服务端按 admin-billing 方案 §7.2 四步权威解析，不一致时返回 409 usage_subject_conflict。Demo 主体只计量，不开户、不写 ledger。"
+    },
+    "subject_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "投递端断言的主体标识（owner/user 的 user_id，或 demo capability id）。同样仅为 assertion。"
+    },
+    "user_id": {
+      "anyOf": [
+        { "type": "null" },
+        { "type": "string", "minLength": 1, "maxLength": 128 }
+      ],
+      "description": "可空/可选。PathTogether user_id 断言；DeepSeek 侧调度用的 user 标识不属于本字段，且不构成计费权威。"
+    },
+    "provider": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+      "description": "本次调用实际生效的 provider（如 deepseek）。"
+    },
+    "model": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+      "description": "本次调用实际生效的模型名，不能使用 UI 提交但未生效的值。"
+    },
+    "provider_request_id": {
+      "anyOf": [
+        { "type": "null" },
+        { "type": "string", "minLength": 1, "maxLength": 255 }
+      ],
+      "description": "可空/可选：上游 SDK 或中断场景未必总能取得 provider 响应 ID。"
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?([Zz]|[+-][0-9]{2}:[0-9]{2})$",
+      "description": "provider 调用发生时刻，RFC3339/ISO-8601 且必须带时区。计价时段与时钟偏差校验以本字段为准（不是 enqueued_at，更不是服务端 received_at）。"
+    },
+    "enqueued_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?([Zz]|[+-][0-9]{2}:[0-9]{2})$",
+      "description": "事件写入 durable outbox 的时刻，RFC3339/ISO-8601 且必须带时区。仅用于判断发送积压与投递延迟。"
+    },
+    "cache_hit_input_tokens": {
+      "$ref": "#/$defs/token_count",
+      "description": "DeepSeek prompt_cache_hit_tokens（KV cache 命中输入）。必须使用 provider 返回的实际数字，不得本地推算。"
+    },
+    "cache_miss_input_tokens": {
+      "$ref": "#/$defs/token_count",
+      "description": "缓存未命中输入 = prompt_tokens - prompt_cache_hit_tokens（即 pi-ai usage.input 语义）。"
+    },
+    "output_tokens": {
+      "$ref": "#/$defs/token_count",
+      "description": "completion_tokens，已包含 reasoning tokens。"
+    },
+    "reasoning_tokens": {
+      "$ref": "#/$defs/token_count",
+      "description": "completion_tokens_details.reasoning_tokens；必须 <= output_tokens。"
+    },
+    "total_tokens": {
+      "$ref": "#/$defs/token_count",
+      "description": "provider 的 total_tokens。非 null 时必须等于 hit + miss + output（算术校验兜底在数据库 CHECK）。"
+    },
+    "raw_usage": {
+      "type": "object",
+      "description": "provider 原始 usage 摘要：只允许 token 计数、finish_reason 和带 meta_version 的版本化 provider 元数据。禁止存放 prompt 文本、模型输出文本、图片或图片 URL、API key、完整请求/响应体、对话内容、病例信息或其他敏感数据（admin-billing 方案 §6.4 明文红线）。可选字段：缺省时服务端存 {}。",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]{0,63}$"
+      },
+      "properties": {
+        "finish_reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "stop / tool_calls / length / content_filter / aborted 等短枚举字符串；仅记录终止原因。"
+        },
+        "prompt_tokens": {
+          "$ref": "#/$defs/token_count",
+          "description": "provider 返回的 prompt_tokens，仅用于与 hit+miss 做一致性校验，不是计费输入。"
+        },
+        "completion_tokens": {
+          "$ref": "#/$defs/token_count",
+          "description": "provider 返回的 completion_tokens，仅一致性校验用。"
+        },
+        "prompt_cache_hit_tokens": {
+          "$ref": "#/$defs/token_count",
+          "description": "provider 返回的原始 cache hit 计数，仅一致性校验用。"
+        },
+        "prompt_cache_miss_tokens": {
+          "$ref": "#/$defs/token_count",
+          "description": "provider 返回的原始 cache miss 计数，仅一致性校验用。"
+        }
+      },
+      "additionalProperties": {
+        "description": "其余键只允许两种：token 计数（非负整数或 null），或必须携带 meta_version 的版本化 provider 元数据对象。字符串、数组、长文本一律不允许，避免成为内容外泄通道。",
+        "anyOf": [
+          { "$ref": "#/$defs/token_count" },
+          {
+            "type": "object",
+            "description": "版本化 provider 元数据；结构变化必须 bump meta_version，不能原地改语义。",
+            "required": ["meta_version"],
+            "propertyNames": {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$"
+            },
+            "properties": {
+              "meta_version": {
+                "type": "integer",
+                "minimum": 1
+              }
+            },
+            "additionalProperties": {
+              "anyOf": [
+                { "type": "null" },
+                { "type": "boolean" },
+                { "type": "integer" },
+                { "type": "string", "maxLength": 128 }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "token_count": {
+      "anyOf": [
+        { "type": "null" },
+        { "type": "integer", "minimum": 0 }
+      ],
+      "description": "token 计数：>= 0 整数，或 null。null 只表示『中断且无最终 usage』的 unpriced 候选，不得用 0 冒充；字段必须显式出现，不允许缺省（缺省与 null 混用会造成幂等哈希歧义）。"
+    }
+  }
+}

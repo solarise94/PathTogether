@@ -4,7 +4,7 @@
 >
 > 日期：2026-08-28
 >
-> 版本：v0.3（v0.2 基础上吸收 PR5 外部 review 的 P1 修订，见文末「v0.3 修订记录」）
+> 版本：v0.3（v0.2 基础上吸收 PR5 外部 review 的 P1 修订与同轮 3 个 P2 风险项，见文末「v0.3 修订记录」）
 >
 > 范围：PathTogether + HistoPilot + mywebpage 来源入口；HistoPilot-DSH 协议不改
 >
@@ -223,6 +223,8 @@ ceil(tokens * rate / 1,000,000)
 
 影子阶段 `charge_nano_cny` 可以复制 provider cost，但两套 price book 仍须独立，避免以后加折扣、赠送额度或服务费时重写历史结构。
 
+**admin v1 wire 全部十进制字符串（v0.3 P2 修订）**：Admin API v1 的所有 nano-CNY 金额字段（账户余额 `balance_nano`、caps（`soft/hard_spend_cap_nano`）、ledger entry 的 `amount_nano_cny`、usage 事件的 `provider_cost_nano_cny`/`charge_nano_cny`、provider 余额快照各 `*_balance_nano`、overview 的合计）在 JSON wire 上序列化为**十进制整数字符串**（如 `"5000000000"`），不用 JSON number——JS `Number` 超 2^53（≈9,007,199 CNY 对应的 nano 值量级）读取即静默舍入。写端点对称收紧：`PUT .../caps` 的 `soft_cap_nano_cny`/`hard_cap_nano_cny` 与 `POST .../adjustments` 的 `amount_nano_cny` **只接受**十进制字符串（`^-?[0-9]{1,19}$`；caps 另限非负；`null`=清除语义保留），JSON number 一律 400（「金额须为十进制字符串（防 float 失真）」）；19 位内但溢出 PG BIGINT 的值同样确定性 400。桥层 schema（`static/admin-host.js`）与插件 UI（`cnyToNano`/`nanoToCnyString`/`fmtNano`）同步：换算全程字符串/BigInt，任何 nano 展示路径不经 `Number`。
+
 ## 6. PostgreSQL 数据模型
 
 ### 6.1 迁移拆分
@@ -425,6 +427,8 @@ reasoning_tokens: number | "unknown";
 
 不要把 `prompt_tokens` 与 `cacheRead` 再次相加。provider 返回的 `prompt_tokens` 如能取得，只用于一致性校验。
 
+token 计数上限为 `2^53-1`（9007199254740991，v0.3 P2 修订）：同时保证 JSON number 精确可表示与 PG BIGINT 安全。超限值在 schema 校验阶段即确定性 400（outbox 进 dead），不得漏到 INSERT 才以 500 可重试错误的形式成为永久重试毒丸。
+
 DeepSeek 流式响应的 usage 位于**最后一个正常数据 chunk**，不是额外的 usage-only chunk。实现必须在消费最终 chunk 时保留 usage，再进入完成/工具调用分支；不能等待一个并不存在的后续 chunk。当前 `publishMetricsOnce` 已有一次性保护，应复用这条终态闸门；但现有 `emitRequestMetrics` 会把 usage 收窄成旧字段，必须与新的 metrics builder 一起扩展，否则 provider 已返回的 output/reasoning 仍会在 sink 前丢失。
 
 ### 7.2 每次 model call 的身份
@@ -602,6 +606,8 @@ GET /admin/plugin-assets/<plugin_id>/<path>
 
 iframe reload、插件切换、owner 登出或 pin 变化时立即作废旧 nonce 和全部在途请求。nonce 不放 URL、不写 DOM dataset/localStorage、不作为服务端鉴权凭据；初始化向 opaque origin 发送时可使用 `targetOrigin="*"`，安全边界来自精确 WindowProxy + 高熵 nonce + 服务端 owner/CSRF 复核。
 
+**插件侧对称认证（v0.3 P2 修订）**：请求方向认证宿主的同时，响应方向也必须认证——宿主发出的全部 result/error 回包都携带当前 load 的 nonce（与请求侧同一值）；插件 `onMessage` 一律先验 `event.source === window.parent`（init 亦然——nonce 正是由 init 下发，init 只依赖 source 认证），init 之后的响应必须携带与 init 收到的 session nonce 相等的 nonce（恒时间比较）且命中一个在途 requestId，否则静默丢弃。没有这层对称校验，任意其他 frame/窗口都能向插件伪造响应（不绕过服务端 owner 授权，但可伪造 UI 状态或 DoS）。
+
 ### 8.4 AdminBridge
 
 父页面实现 `static/admin-host.js`，使用 `postMessage` 提供固定方法表：
@@ -629,6 +635,8 @@ admin.plugins.list/setEnabled/rotateSecret
 ```
 
 Host 校验 plugin ID、协商版本、request ID、method、参数 schema、manifest 申请权限和当前 actor。Host 使用现有 `apiFetch`/CSRF 逻辑请求 PathTogether API；不向 iframe返回 CSRF token、session 内容或通用 fetch 能力。
+
+参数 schema 的金额字段（`admin.billing.account.updateCaps` 的 caps、`admin.billing.adjust` 的 `amount_nano_cny`）为十进制字符串 pattern（`^[0-9]{1,19}$` / `^-?[0-9]{1,19}$`，v0.3 P2 修订），与 §5 的 wire 规则一致：桥层即拒绝 JSON number 与超 19 位形态，服务端再作权威复核。
 
 所有写方法重新在服务端执行 `_require_owner()`，Bridge 权限不能代替服务端授权。
 
@@ -1141,3 +1149,9 @@ PR5 外部 review 的 5 个 P1 阻断项，根因与修法各一句话：
 3. **来源触点 90 天保留未真正落地**：旧 `cleanup_expired_visits` 只删未被引用的过期行，被归因引用的触点连同 IP 前缀 hash/referrer/UTM/landing/visitor 联结键被永久保留，且该函数无生产调度入口；新增 `run_visit_retention()`（单事务：未引用过期行删除 + 已归因过期行七字段脱敏置空，幂等返回计数）并由 `ACQ_RETENTION_INTERVAL_SECONDS`（默认 86400、≤0 关闭、仅 PG）驱动的后台 daemon 每日执行（§11.3）。
 4. **UI parity 缺口**：旧侧栏删除后「身份预览」与「插件管理」（列表/健康/启停/凭证轮换）失去 UI 入口（API 均在）；补 `admin:plugins:read/write` 权限枚举（manifest/schema/pin 三处同步）、AdminBridge 四方法（`admin.users.startPreview`、`admin.plugins.list/setEnabled/rotateSecret`）与插件 UI 用户页预览按钮 + 插件页（§8.4/§10.2；运行时 `/install` 不上 UI，发布走 §16 版本化 releases）。
 5. **§7.2 步骤 3 保持原文**：核对后实现已按上述第 2 条对齐方案原文（交叉校验语义），规格无需改动，仅实现侧删除与原文冲突的回退分支及其 docstring。
+
+同轮 review 另有 3 个 P2 风险项（wire 未部署，全部按破坏性收紧直接落地）：
+
+6. **（P2）金额端到端十进制字符串**：admin v1 响应把 nano-CNY 序列化成 JSON number、桥 schema 用 `type:"integer"`、插件 UI 换算经 `Number()`——超 2^53（≈9,007,199 CNY 的 nano 值量级）静默失真。修复：服务端出口统一 `_admin_v1_nano_out` helper 全量转十进制字符串（§5）；caps/adjustments 入参只接受 `^-?[0-9]{1,19}$` 十进制字符串（JSON number 一律 400，19 位内但溢出 PG BIGINT 同样确定性 400）；桥 schema 改 `type:"string"` + pattern（validateValue 补 pattern 支持）；插件 `cnyToNano` 返回字符串、`nanoToCnyString`/`fmtNano` 改 BigInt，展示路径不经过 `Number`。
+7. **（P2）插件侧响应来源认证（对称化）**：宿主已校验请求的 `event.source` + nonce + requestId，但插件 `onMessage` 不检查 `event.source === window.parent`、宿主响应不带 nonce——其他 frame/窗口可向插件伪造响应（伪造 UI 状态/DoS）。修复：宿主全部 result/error 回包带当前 load 的 nonce（§8.3）；插件一律先验 source，init 之后的响应必须携带与 init 相同的 session nonce（恒时间比较）且命中在途 requestId，不符静默丢弃。
+8. **（P2）token 计数上限**：`_check_token_count` 只验非负整数，超大整数（> PG BIGINT max）漏到 INSERT 时 500 retryable，在 outbox 侧成永久重试毒丸。修复：schema_v1 的 `token_count` 加 `"maximum": 9007199254740991`（2^53-1：同时保证 JSON number 精确与 BIGINT 安全，§7.1），`_check_token_count` 与 `_check_raw_usage` 的 token 计数分支同步上限，超限确定性 400（outbox dead，非 500）。

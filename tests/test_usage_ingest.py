@@ -251,6 +251,46 @@ def test_schema_negative_rejected_400():
 
 
 @PG
+def test_token_count_upper_bound_deterministic_400():
+    """§7.1 v0.3（P2）：token 计数上限 2^53-1——超限确定性 400 不进库。
+
+    超大整数（> PG BIGINT）若漏进 INSERT 会 500 retryable，在 outbox 侧
+    变永久重试毒丸；schema 校验阶段拦截后走确定性 400（outbox 进 dead）。
+    """
+    inst = _bootstrap()
+    token = _token_for(inst)
+    bh.seed_price_books_with_history()
+    base = _fresh(bh.load_event("01_owner_priced_flash_peak.json"))
+    _bind_for(base)
+    # 2^63 / 10^20 / 2^53 → 400（> 2^63 的值在旧实现会 INSERT 500）
+    for huge in (2 ** 63, 10 ** 20, 2 ** 53):
+        r = _post(dict(base, total_tokens=huge), token=token)
+        err = _assert_envelope(r, 400, "invalid_request")
+        assert any("2^53-1" in e or "9007199254740991" in e
+                   for e in err["details"]["errors"]), huge
+    # raw_usage 镜像 token 计数同样受限（schema additionalProperties 分支）
+    r = _post(dict(base, raw_usage={"prompt_tokens": 2 ** 53}), token=token)
+    _assert_envelope(r, 400, "invalid_request")
+    # 边界 2^53-1 合法（算术一致 → 入库，不是 400）
+    edge = dict(base)
+    edge["cache_hit_input_tokens"] = 0
+    edge["cache_miss_input_tokens"] = 0
+    edge["output_tokens"] = 9007199254740991
+    edge["reasoning_tokens"] = 0
+    edge["total_tokens"] = 9007199254740991
+    r = _post(edge, token=token)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    # 超限请求零入库：只有边界事件那一条
+    conn = bh.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) AS n FROM ai_usage_events")
+            assert cur.fetchone()["n"] == 1
+    finally:
+        conn.close()
+
+
+@PG
 def test_duplicate_replay_returns_original():
     inst = _bootstrap()
     token = _token_for(inst)

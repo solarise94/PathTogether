@@ -221,6 +221,9 @@ def test_validator_rejects_invalid_bodies():
         "token 字符串化": lambda b: b.update(total_tokens="4631"),
         "token 负数": lambda b: b.update(output_tokens=-1),
         "token 布尔": lambda b: b.update(output_tokens=True),
+        "token 超 2^53-1": lambda b: b.update(total_tokens=2 ** 53),
+        "raw_usage token 超 2^53-1": lambda b: b.update(
+            raw_usage={"prompt_tokens": 10 ** 20}),
         "额外字段": lambda b: b.update(_description="x"),
         "provider_request_id 整数": lambda b: b.update(provider_request_id=12345),
         "raw_usage 长文本": lambda b: b.update(

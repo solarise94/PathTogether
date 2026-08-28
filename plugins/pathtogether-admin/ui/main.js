@@ -6,6 +6,10 @@
      - 宿主在每次 iframe load 后 postMessage 一条 {kind:"init"} 携带一次性
        256-bit nonce 与协议版本；本端保存 nonce（仅内存），此后所有请求回带
        nonce + 本次会话内递增的 requestId；
+     - 响应来源认证（§8.3 P2 修订，与宿主对称）：onMessage 一律先验
+       event.source === window.parent；init 之后的响应必须携带与 init 收到的
+       session nonce 相等的 nonce 且命中在途 requestId，否则静默丢弃——其他
+       frame/窗口无法向本页伪造响应；
      - 响应按 requestId 配对；超时（15s）与拒绝都有稳定错误码；
      - opaque origin：不能读写 localStorage/cookie，全部页面状态（当前页/
        筛选/分页游标/账户卡缓存）只在内存；
@@ -106,11 +110,23 @@
     return v.toLocaleString("en-US");
   }
 
-  // nano-CNY（1e9 = 1 CNY）：同时给 CNY 近似值与原始 nano 整数
+  // nano-CNY（1e9 = 1 CNY）：精确换算给 CNY 字符串 + 原始 nano。BigInt 运算
+  //（语言特性，opaque sandbox 可用），全程不经 Number——wire 金额是十进制
+  // 字符串（§5 v0.3），>2^53 的值经 Number 会静默失真。
   function fmtNano(v) {
     if (v === null || v === undefined) return "—";
-    var n = Number(v);
-    return (n / 1e9).toFixed(6) + " CNY（" + n + " nano）";
+    try {
+      var b = BigInt(v);
+      var neg = b < 0n;
+      if (neg) b = -b;
+      var whole = (b / 1000000000n).toString();
+      var frac = (b % 1000000000n).toString()
+        .padStart(9, "0").replace(/0+$/, "");
+      return (neg ? "-" : "") + whole + (frac ? "." + frac : "") +
+        " CNY（" + String(v) + " nano）";
+    } catch (e) {
+      return String(v);
+    }
   }
 
   function fmtRatio(v) {
@@ -133,9 +149,10 @@
     return cell;
   }
 
-  // ---- CNY ↔ nano 换算（§5：1 CNY = 1e9 nano；全程字符串运算，禁 float）----
-  // "12.345678901" → 12345678901；小数最多 9 位；允许负号（manual_adjustment）。
-  // 非法形态 / 超出安全整数范围返回 null（调用方按校验失败提示）。
+  // ---- CNY ↔ nano 换算（§5：1 CNY = 1e9 nano；全程字符串/BigInt，禁 float）----
+  // "12.345678901" → "12345678901"；小数最多 9 位；允许负号（manual_adjustment）。
+  // 返回**字符串** nano（§5 v0.3：wire 金额是十进制字符串；去前导零后超 19
+  // 位即非法——与桥/服务端 pattern 上限一致）。非法形态返回 null。
   function cnyToNano(text) {
     var s = String(text == null ? "" : text).trim();
     if (!/^-?\d{1,15}(\.\d{1,9})?$/.test(s)) return null;
@@ -144,19 +161,24 @@
     var parts = s.split(".");
     var digits = parts[0] + (parts[1] || "").padEnd(9, "0");
     digits = digits.replace(/^0+(?=\d)/, "");
-    var n = Number(digits);
-    if (!Number.isSafeInteger(n)) return null;
-    return neg ? -n : n;
+    if (digits.length > 19) return null;
+    if (digits === "0") return "0";
+    return neg ? "-" + digits : digits;
   }
 
-  // 精确 nano → CNY 字符串（cap/金额输入框回显用；与 fmtNano 的近似显示互补）
+  // 精确 nano → CNY 字符串（cap/金额输入框回显用；BigInt 运算，不经 Number）
   function nanoToCnyString(n) {
-    if (n === null || n === undefined) return "";
-    var neg = n < 0;
-    var digits = Math.abs(Number(n)).toString().padStart(10, "0");
-    var whole = digits.slice(0, -9);
-    var frac = digits.slice(-9).replace(/0+$/, "");
-    return (neg ? "-" : "") + whole + (frac ? "." + frac : "");
+    if (n === null || n === undefined || n === "") return "";
+    try {
+      var b = BigInt(n);
+      var neg = b < 0n;
+      var digits = (neg ? -b : b).toString().padStart(10, "0");
+      var whole = digits.slice(0, -9);
+      var frac = digits.slice(-9).replace(/0+$/, "");
+      return (neg ? "-" : "") + whole + (frac ? "." + frac : "");
+    } catch (e) {
+      return String(n);
+    }
   }
 
   // ---- 页内确认条（§3.3 危险操作二次确认）----
@@ -256,7 +278,21 @@
     });
   }
 
+  // 常数时间字符串比较（与宿主 admin-host.js 同款；nonce 高熵值下主要是
+  // 防侥幸短路，双方值都在各自内存中）
+  function timingSafeEqual(a, b) {
+    if (typeof a !== "string" || typeof b !== "string") return false;
+    if (a.length !== b.length) return false;
+    var diff = 0;
+    for (var i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    return diff === 0;
+  }
+
   function onMessage(event) {
+    // 来源认证第一道（§8.3 P2 修订，与宿主对称）：只接受宿主 window.parent。
+    // opaque origin 读不出宿主 origin，event.origin 恒 "null" 不能用于鉴权；
+    // init 本身即 nonce 的下发通道，因此 init 只依赖 source 认证。
+    if (event.source !== window.parent) return;
     var env = event.data;
     if (!env || typeof env !== "object" || env.bridge !== BRIDGE) return;
 
@@ -276,6 +312,10 @@
     }
 
     if (env.kind === "response") {
+      // §8.3 P2 修订：init 之后所有响应必须携带与 init 收到的 session nonce
+      // 相等的 nonce（恒时间比较）——不符（其他 frame/窗口伪造、旧 load 残留
+      // 回包）一律静默丢弃；requestId 必须命中在途表（防重放/孤儿响应）。
+      if (!state.nonce || !timingSafeEqual(env.nonce, state.nonce)) return;
       var p = state.pending[env.requestId];
       if (!p) return; // 未知/已超时/已作废的响应：静默丢弃
       clearTimeout(p.timer);
@@ -289,7 +329,8 @@
     }
 
     if (env.kind === "event" && env.type === "bridge_invalidated") {
-      // 宿主作废（reload/登出/插件切换）：立即停止一切请求
+      // 宿主作废（reload/登出/插件切换）：立即停止一切请求（本消息的来源
+      // 认证即上面的 window.parent 检查——只有宿主能发出）
       state.dead = true;
       state.nonce = null;
       failAllPending({ code: "bridge_invalidated", message: env.message || "宿主已作废桥接会话" });
@@ -1062,7 +1103,7 @@
       setStatus("adm-caps-status", "hard cap 金额非法（最多 9 位小数，如 12.5）");
       return;
     }
-    if (soft !== null && hard !== null && soft > hard) {
+    if (soft !== null && hard !== null && BigInt(soft) > BigInt(hard)) {
       setStatus("adm-caps-status", "soft cap 不可大于 hard cap（客户端拦截；服务端同样校验）");
       return;
     }
@@ -1099,7 +1140,7 @@
         "金额非法：最多 9 位小数的 CNY 数值（如 12.5；manual_adjustment 可为负）");
       return;
     }
-    if (kind !== "manual_adjustment" && amount <= 0) {
+    if (kind !== "manual_adjustment" && BigInt(amount) <= 0n) {
       setStatus("adm-adjust-status", kind + " 金额必须为正数");
       return;
     }
@@ -1506,10 +1547,14 @@
   window.addEventListener("message", onMessage);
   bindNav();
 
-  // 导出（仅调试/测试用；不含 nonce 读取器）
+  // 导出（仅调试/测试用；不含 nonce 读取器）。金额换算函数一并导出供
+  // tests/js/admin-plugin-ui.test.ts 锁定「字符串进、字符串出」契约。
   window.PathTogetherAdminClient = {
     request: request,
     showPage: showPage,
+    cnyToNano: cnyToNano,
+    nanoToCnyString: nanoToCnyString,
+    fmtNano: fmtNano,
     handshakeState: function () {
       return {
         ready: !!state.nonce && !state.dead,

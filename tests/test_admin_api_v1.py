@@ -416,9 +416,10 @@ def test_overview_dual_quota_semantics():
     assert billing["available"] is True
     assert isinstance(billing["model_calls_today"], int)
     assert billing["model_calls_today"] >= 2
-    assert isinstance(billing["provider_cost_nano_cny"], int)
-    assert isinstance(billing["charge_nano_cny"], int)
-    assert billing["provider_cost_nano_cny"] > 0
+    # §5 v0.3（P2）：金额字段一律十进制字符串（wire 禁 JSON number）
+    assert isinstance(billing["provider_cost_nano_cny"], str)
+    assert isinstance(billing["charge_nano_cny"], str)
+    assert int(billing["provider_cost_nano_cny"]) > 0
     assert billing["cache_hit_ratio"] is None or 0 <= billing["cache_hit_ratio"] <= 1
     assert billing["provider_balance_snapshot"] is None  # 尚无快照
     assert isinstance(billing["unpriced_count"], int)
@@ -521,8 +522,9 @@ def test_ledger_pagination_readonly():
     assert len(seen) == 3 and len(set(seen)) == 3
     r0 = c.get("/api/admin/v1/billing/ledger?limit=100").get_json()
     amounts = [item["amount_nano_cny"] for item in r0["items"]]
-    assert -500_000_000 in amounts and 5_000_000_000 in amounts
-    assert all(isinstance(a, int) for a in amounts)
+    # §5 v0.3（P2）：金额为十进制字符串，不做数值比较
+    assert "-500000000" in amounts and "5000000000" in amounts
+    assert all(isinstance(a, str) for a in amounts)
     assert scan_sensitive(r0) == []
 
 
@@ -546,7 +548,9 @@ def test_account_null_when_not_opened_and_balance_when_opened():
     r = c.get("/api/admin/v1/billing/accounts/" + owner["user_id"]).get_json()
     assert r["account"]["account_id"] == account["account_id"]
     assert r["account"]["soft_spend_cap_nano"] is None
-    assert r["balance_nano"] == 7_000_000_000
+    # §5 v0.3（P2）：余额为十进制字符串
+    assert r["balance_nano"] == "7000000000"
+    assert isinstance(r["balance_nano"], str)
     # 用户不存在 → 404
     r = c.get("/api/admin/v1/billing/accounts/usr_missing000")
     assert r.status_code == 404
@@ -585,7 +589,7 @@ def test_users_row_joins_turn_billing_last_call():
     assert item["role"] == "user" and item["enabled"] is True
     assert item["registration_method"] == "manual"  # owner 直接创建
     assert item["turn_used"] == 3 and item["turn_limit"] is not None
-    assert item["billing"]["balance_nano"] == 3_000_000_000
+    assert item["billing"]["balance_nano"] == "3000000000"
     assert item["billing"]["soft_spend_cap_nano"] is None
     assert item["last_ai_call_at"] is not None
     assert item["campaign"] is None and item["source"] is None
@@ -655,9 +659,10 @@ def test_provider_balance_get_empty_then_snapshot_after_refresh(monkeypatch):
     r = c.post("/api/admin/v1/billing/provider-balance/refresh")
     assert r.status_code == 200, r.get_data(as_text=True)
     snap = r.get_json()["snapshot"]
-    assert snap["total_balance_nano"] == 110_000_000_000
-    assert snap["granted_balance_nano"] == 10_000_000_000
-    assert snap["topped_up_balance_nano"] == 100_000_000_000
+    # §5 v0.3（P2）：快照金额为十进制字符串
+    assert snap["total_balance_nano"] == "110000000000"
+    assert snap["granted_balance_nano"] == "10000000000"
+    assert snap["topped_up_balance_nano"] == "100000000000"
     assert snap["is_available"] is True
     # key 绝不进响应（也不进请求 URL）
     assert "sk-official-key-123456" not in r.get_data(as_text=True)

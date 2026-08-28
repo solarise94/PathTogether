@@ -4871,6 +4871,79 @@ def _admin_v1_flag_arg(name):
     return None
 
 
+# --------------------------------------------------------------------------- #
+# §5 v0.3 修订（P2）：admin v1 金额 wire 全部十进制整数字符串
+#
+# JS Number 超 2^53（≈9,007,199 CNY 对应的 nano 值量级）读取即静默失真，
+# 因此 nano-CNY 金额在 admin v1 wire 上禁用 JSON number：出口统一 str(int)，
+# 入口只接受十进制字符串。入参限 1..19 位（可负号）；19 位字符串在
+# (2^63-1, 10^19) 区间仍会溢出 PG BIGINT，解析后再卡一次界给确定性 400。
+# --------------------------------------------------------------------------- #
+#: 金额入参形态（§9 caps/adjustments；JSON number 一律拒绝）
+_ADMIN_V1_NANO_IN_RE = re.compile(r"^-?[0-9]{1,19}$")
+_PG_BIGINT_MAX = 2 ** 63 - 1
+_PG_BIGINT_MIN = -(2 ** 63)
+
+#: 响应中按字段名匹配即字符串化的 nano-CNY 键（白名单制，不误伤 token 计数）
+_ADMIN_V1_NANO_OUT_KEYS = frozenset((
+    "balance_nano", "amount_nano_cny", "soft_cap_nano_cny",
+    "hard_cap_nano_cny", "provider_cost_nano_cny", "charge_nano_cny",
+    "soft_spend_cap_nano", "hard_spend_cap_nano", "total_balance_nano",
+    "granted_balance_nano", "topped_up_balance_nano",
+))
+
+
+def _admin_v1_nano_str(value):
+    """nano-CNY 整数 → 十进制字符串（None 透传；唯一标量出口转换点）。"""
+    if value is None:
+        return None
+    return str(int(value))
+
+
+def _admin_v1_nano_out(value):
+    """admin v1 响应对象 → 金额字段十进制字符串化（§5 v0.3 修订）。
+
+    递归 dict/list；键名命中 ``_ADMIN_V1_NANO_OUT_KEYS`` 的值经
+    :func:`_admin_v1_nano_str` 转换，其余原样。所有 admin v1 金额出口
+    （overview / users / account / usage-events / ledger / provider-balance /
+    caps / adjustments）统一走本 helper，禁止散落 str()。
+    """
+    if isinstance(value, dict):
+        return {
+            k: (_admin_v1_nano_str(v) if k in _ADMIN_V1_NANO_OUT_KEYS
+                else _admin_v1_nano_out(v))
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_admin_v1_nano_out(v) for v in value]
+    return value
+
+
+def _admin_v1_amount_in(value, field, *, allow_negative=False):
+    """admin v1 金额入参：十进制字符串 → int（§5 v0.3 修订；None 透传）。
+
+    - 只接受 ``^-?[0-9]{1,19}$`` 字符串，JSON number / 小数 / 超长一律
+      ``ValueError``（消息含「金额须为十进制字符串（防 float 失真）」），
+      路由层映射 400；
+    - 解析后卡 PG BIGINT 上下界（溢出区间的 19 位值给确定性 400，不让
+      INSERT 抛 500）；
+    - ``allow_negative=False``（caps）时负数同样 400。
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _ADMIN_V1_NANO_IN_RE.match(value):
+        raise ValueError(
+            "%s 金额须为十进制字符串（防 float 失真；1..19 位整数%s）"
+            % (field, "，manual_adjustment 可为负" if allow_negative else ""))
+    number = int(value)
+    if not _PG_BIGINT_MIN <= number <= _PG_BIGINT_MAX:
+        raise ValueError(
+            "%s 超出 PG BIGINT 范围（|值| ≤ 9223372036854775807）" % field)
+    if number < 0 and not allow_negative:
+        raise ValueError("%s 需为非负整数的十进制字符串（nano-CNY）" % field)
+    return number
+
+
 def _admin_v1_sanitize_audit_detail(value, key=None):
     """审计 detail 递归脱敏（§10.5 红线）。
 
@@ -4996,7 +5069,7 @@ def admin_v1_overview():
             age = None
             if snapshot is not None:
                 age = max(0.0, time.time() - float(snapshot["observed_at"]))
-            billing_section = {
+            billing_section = _admin_v1_nano_out({
                 "available": True,
                 "provider": BILLING_BALANCE_PROVIDER,
                 "model_calls_today": stats["model_calls_today"],
@@ -5014,7 +5087,7 @@ def admin_v1_overview():
                     stats["ingestion_lag_seconds_avg"],
                 "provider_balance_snapshot": snapshot,
                 "provider_balance_age_seconds": age,
-            }
+            })
             turn_section = {"available": True}
             if report is not None:
                 period = report["period"]
@@ -5125,8 +5198,10 @@ def admin_v1_users():
             # 对话额度（turn budget；json 后端无预算权威来源 → null）
             "turn_used": int(turn["total"]) if turn else None,
             "turn_limit": int(turn["limit"]) if turn else None,
-            # 金额余额（billing；未开户 null，绝不伪造 0 余额账户）
-            "billing": accounts.get(uid) if billing_ok else None,
+            # 金额余额（billing；未开户 null，绝不伪造 0 余额账户；金额字段
+            # 十进制字符串化，§5 v0.3）
+            "billing": _admin_v1_nano_out(accounts.get(uid))
+            if billing_ok else None,
             "last_ai_call_at": last_calls.get(uid) if billing_ok else None,
         })
     next_cursor = None
@@ -5157,8 +5232,9 @@ def admin_v1_billing_account(user_id):
     except Exception:
         app.logger.exception("admin v1 billing account 读取失败")
         return _admin_v1_error(500, "internal", "账户读取失败")
-    out = dict(account)
-    return jsonify(user_id=user_id, account=out, balance_nano=int(balance))
+    out = _admin_v1_nano_out(dict(account))
+    return jsonify(user_id=user_id, account=out,
+                   balance_nano=_admin_v1_nano_str(balance))
 
 
 @app.route("/api/admin/v1/billing/usage-events", methods=["GET"])
@@ -5201,7 +5277,9 @@ def admin_v1_billing_usage_events():
     next_cursor = None
     if page["next_cursor"] is not None:
         next_cursor = _admin_v1_encode_cursor({"k": list(page["next_cursor"])})
-    return jsonify(items=page["items"], next_cursor=next_cursor, limit=limit)
+    # 计价金额字段十进制字符串化（§5 v0.3；unpriced 保持 null 不混 0 元）
+    return jsonify(items=_admin_v1_nano_out(page["items"]),
+                   next_cursor=next_cursor, limit=limit)
 
 
 @app.route("/api/admin/v1/billing/ledger", methods=["GET"])
@@ -5230,19 +5308,23 @@ def admin_v1_billing_ledger():
     next_cursor = None
     if page["next_cursor"] is not None:
         next_cursor = _admin_v1_encode_cursor({"k": list(page["next_cursor"])})
-    return jsonify(items=page["items"], next_cursor=next_cursor, limit=limit)
+    # entry.amount_nano_cny 十进制字符串化（§5 v0.3）
+    return jsonify(items=_admin_v1_nano_out(page["items"]),
+                   next_cursor=next_cursor, limit=limit)
 
 
 def _admin_v1_provider_balance_payload():
-    """最新 provider 余额快照 + 年龄（无快照 → snapshot:null）。"""
+    """最新 provider 余额快照 + 年龄（无快照 → snapshot:null；金额字符串化）。"""
     snapshot = billing_store.latest_provider_balance_snapshot(
         BILLING_BALANCE_PROVIDER)
     age = None
     if snapshot is not None:
         age = max(0.0, time.time() - float(snapshot["observed_at"]))
-    return {"provider": BILLING_BALANCE_PROVIDER,
-            "snapshot": snapshot,
-            "age_seconds": age}
+    return _admin_v1_nano_out({
+        "provider": BILLING_BALANCE_PROVIDER,
+        "snapshot": snapshot,
+        "age_seconds": age,
+    })
 
 
 @app.route("/api/admin/v1/billing/provider-balance", methods=["GET"])
@@ -5364,8 +5446,8 @@ def admin_v1_billing_provider_balance_refresh():
     _audit("billing.provider_balance_refresh",
            target_type="provider_balance", target_id=BILLING_BALANCE_PROVIDER,
            detail={"status": "ok", "is_available": is_available})
-    return jsonify(ok=True, snapshot=snapshot, age_seconds=0.0,
-                   provider=BILLING_BALANCE_PROVIDER)
+    return jsonify(ok=True, snapshot=_admin_v1_nano_out(snapshot),
+                   age_seconds=0.0, provider=BILLING_BALANCE_PROVIDER)
 
 
 @app.route("/api/admin/v1/audit", methods=["GET"])
@@ -5806,8 +5888,14 @@ def admin_v1_turn_budgets_new_period():
 
 @app.route("/api/admin/v1/billing/accounts/<user_id>/caps", methods=["PUT"])
 def admin_v1_billing_caps(user_id):
-    """更新 soft/hard spend cap（§9：null=清除；非空 ≥0；同存 soft<=hard；
-    version CAS 冲突 409；未开户 404 不伪造；caps 写与 audit 同一事务）。"""
+    """更新 soft/hard spend cap（§9：null=清除；非空为非负十进制字符串；
+    同存 soft<=hard；version CAS 冲突 409；未开户 404 不伪造；caps 写与
+    audit 同一事务）。
+
+    金额 wire 规则（§5 v0.3 修订）：``soft_cap_nano_cny`` /
+    ``hard_cap_nano_cny`` 只接受 ``^[0-9]{1,19}$`` 十进制字符串（JSON
+    number 一律 400——JS Number 超 2^53 静默失真）；null=清除语义保留。
+    """
     auth = _require_owner_admin_v1()
     if auth:
         return auth
@@ -5818,16 +5906,13 @@ def admin_v1_billing_caps(user_id):
         if field not in body:
             return _admin_v1_error(400, "invalid_request",
                                    "缺少 %s 字段" % field)
-    soft = body.get("soft_cap_nano_cny")
-    hard = body.get("hard_cap_nano_cny")
-    for value, field in ((soft, "soft_cap_nano_cny"),
-                         (hard, "hard_cap_nano_cny")):
-        if value is None:
-            continue
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            return _admin_v1_error(
-                400, "invalid_request",
-                "%s 需为非负整数（nano-CNY）或 null（清除）" % field)
+    try:
+        soft = _admin_v1_amount_in(body.get("soft_cap_nano_cny"),
+                                   "soft_cap_nano_cny")
+        hard = _admin_v1_amount_in(body.get("hard_cap_nano_cny"),
+                                   "hard_cap_nano_cny")
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
     if soft is not None and hard is not None and soft > hard:
         return _admin_v1_error(
             400, "invalid_request", "soft_cap_nano_cny 不可大于 hard_cap_nano_cny")
@@ -5853,7 +5938,8 @@ def admin_v1_billing_caps(user_id):
     except Exception:
         app.logger.exception("admin v1 billing caps 更新失败")
         return _admin_v1_error(500, "internal", "caps 更新失败")
-    return jsonify(account=result["account"], balance_nano=result["balance_nano"])
+    return jsonify(account=_admin_v1_nano_out(result["account"]),
+                   balance_nano=_admin_v1_nano_str(result["balance_nano"]))
 
 
 @app.route("/api/admin/v1/billing/adjustments", methods=["POST"])
@@ -5883,10 +5969,16 @@ def admin_v1_billing_adjustments():
         return _admin_v1_error(
             400, "invalid_request",
             "kind 需为 %s" % (billing_store.ADJUSTMENT_KINDS,))
-    amount = body.get("amount_nano_cny")
-    if isinstance(amount, bool) or not isinstance(amount, int):
+    # 金额 wire 规则（§5 v0.3 修订）：只接受 ^-?[0-9]{1,19}$ 十进制字符串
+    #（manual_adjustment 可为负），JSON number 一律 400（防 float 失真）
+    try:
+        amount = _admin_v1_amount_in(body.get("amount_nano_cny"),
+                                     "amount_nano_cny", allow_negative=True)
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    if amount is None:
         return _admin_v1_error(400, "invalid_request",
-                               "amount_nano_cny 需为整数（nano-CNY）")
+                               "amount_nano_cny 需为十进制整数字符串（nano-CNY）")
     if kind in ("grant", "topup", "refund") and amount <= 0:
         return _admin_v1_error(400, "invalid_request",
                                "%s 金额必须为正数（nano-CNY）" % kind)
@@ -5928,10 +6020,10 @@ def admin_v1_billing_adjustments():
     except Exception:
         app.logger.exception("admin v1 billing adjustment 失败")
         return _admin_v1_error(500, "internal", "调账入账失败")
-    return jsonify(ok=True, entry=result["entry"],
+    return jsonify(ok=True, entry=_admin_v1_nano_out(result["entry"]),
                    duplicate=result["duplicate"],
-                   balance_nano=result["balance_nano"],
-                   account=result["account"])
+                   balance_nano=_admin_v1_nano_str(result["balance_nano"]),
+                   account=_admin_v1_nano_out(result["account"]))
 
 
 # --------------------------------------------------------------------------- #

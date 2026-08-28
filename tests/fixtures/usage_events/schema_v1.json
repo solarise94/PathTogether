@@ -180,9 +180,9 @@
     "token_count": {
       "anyOf": [
         { "type": "null" },
-        { "type": "integer", "minimum": 0 }
+        { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
       ],
-      "description": "token 计数：>= 0 整数，或 null。null 只表示『中断且无最终 usage』的 unpriced 候选，不得用 0 冒充；字段必须显式出现，不允许缺省（缺省与 null 混用会造成幂等哈希歧义）。"
+      "description": "token 计数：[0, 2^53-1] 整数，或 null。上限 9007199254740991（2^53-1）同时保证 JSON number 精确可表示与 PG BIGINT 安全，超限在 schema 校验阶段确定性 400（outbox 进 dead），不会以 INSERT 溢出 500 的形式成为重试毒丸（v0.3 P2 修订）。null 只表示『中断且无最终 usage』的 unpriced 候选，不得用 0 冒充；字段必须显式出现，不允许缺省（缺省与 null 混用会造成幂等哈希歧义）。"
     }
   }
 }

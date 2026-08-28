@@ -12,6 +12,7 @@
  *   - 已登记但未实现（PR3b 待填）→ 稳定 not_implemented；
  *   - 参数 schema（admin.auth.get 拒绝多余字段）；
  *   - reload / 登出（后端 401）→ nonce 与在途请求立即作废；
+ *   - 宿主全部 result/error 回包带当前 load 的 nonce（§8.3 P2 对称认证）；
  *   - method→permission 映射表与 §8.4 一致（防漂移）。
  */
 import { describe, expect, it } from "vitest";
@@ -927,28 +928,29 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		});
 		handle._handleIframeLoad();
 		const nonce = nonce0(posted);
+		// §5 v0.3（P2）：金额 wire 为十进制字符串（桥层 pattern 限定 1..19 位）
 		handle._handleWindowMessage({
 			source: contentWindow,
 			data: requestEnv(nonce, "r1", "admin.billing.account.updateCaps", {
-				user_id: "usr_3", soft_cap_nano_cny: null, hard_cap_nano_cny: 200, version: 4,
+				user_id: "usr_3", soft_cap_nano_cny: null, hard_cap_nano_cny: "200", version: 4,
 			}),
 		});
 		handle._handleWindowMessage({
 			source: contentWindow,
 			data: requestEnv(nonce, "r2", "admin.billing.adjust", {
-				user_id: "usr_3", kind: "grant", amount_nano_cny: 1000,
+				user_id: "usr_3", kind: "grant", amount_nano_cny: "1000",
 				reason: "welcome", idempotency_key: "adj_x1",
 			}),
 		});
 		await ticks();
 		expect(calls[0]).toEqual({
 			url: "/api/admin/v1/billing/accounts/usr_3/caps", method: "PUT",
-			body: { soft_cap_nano_cny: null, hard_cap_nano_cny: 200, version: 4 },
+			body: { soft_cap_nano_cny: null, hard_cap_nano_cny: "200", version: 4 },
 		});
 		expect(calls[1]).toEqual({
 			url: "/api/admin/v1/billing/adjustments", method: "POST",
 			body: {
-				user_id: "usr_3", kind: "grant", amount_nano_cny: 1000,
+				user_id: "usr_3", kind: "grant", amount_nano_cny: "1000",
 				reason: "welcome", idempotency_key: "adj_x1",
 			},
 		});
@@ -973,18 +975,38 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 			["admin.turnBudgets.update", { platform_turn_limit: 0 }],            // min 1
 			["admin.turnBudgets.newPeriod", { limits: [] }],                      // object
 			["admin.billing.account.updateCaps", { user_id: "u1", version: 1 }], // 缺 caps 键
+			// §5 v0.3（P2）：金额只接受十进制字符串——JSON number / 负 cap /
+			// 小数 / 超 19 位 / 零值形态（nonZero）一律桥层拒绝
 			["admin.billing.account.updateCaps", {
-				user_id: "u1", soft_cap_nano_cny: -5, hard_cap_nano_cny: 10, version: 1,
-			}],                                                                    // min 0
+				user_id: "u1", soft_cap_nano_cny: 10, hard_cap_nano_cny: "20", version: 1,
+			}],                                                                    // number 型金额
 			["admin.billing.account.updateCaps", {
-				user_id: "u1", soft_cap_nano_cny: 1, hard_cap_nano_cny: null, version: 0,
+				user_id: "u1", soft_cap_nano_cny: "-5", hard_cap_nano_cny: "20", version: 1,
+			}],                                                                    // pattern 非负
+			["admin.billing.account.updateCaps", {
+				user_id: "u1", soft_cap_nano_cny: "1.5", hard_cap_nano_cny: "20", version: 1,
+			}],                                                                    // pattern 整数
+			["admin.billing.account.updateCaps", {
+				user_id: "u1", soft_cap_nano_cny: "12345678901234567890",
+				hard_cap_nano_cny: "20", version: 1,
+			}],                                                                    // 超 19 位
+			["admin.billing.account.updateCaps", {
+				user_id: "u1", soft_cap_nano_cny: "1", hard_cap_nano_cny: null, version: 0,
 			}],                                                                    // version min 1
 			["admin.billing.adjust", { user_id: "u1", kind: "usage_debit",
-				amount_nano_cny: -5, reason: "r" }],                              // 枚举
+				amount_nano_cny: "-5", reason: "r" }],                              // 枚举
 			["admin.billing.adjust", { user_id: "u1", kind: "grant",
-				amount_nano_cny: 0, reason: "r" }],                               // nonZero
+				amount_nano_cny: 0, reason: "r" }],                                // number 型金额
 			["admin.billing.adjust", { user_id: "u1", kind: "grant",
-				amount_nano_cny: 5, reason: "" }],                                // reason minLength
+				amount_nano_cny: "0", reason: "r" }],                               // nonZero（零值字符串）
+			["admin.billing.adjust", { user_id: "u1", kind: "grant",
+				amount_nano_cny: "-0", reason: "r" }],                              // nonZero（负零形态）
+			["admin.billing.adjust", { user_id: "u1", kind: "grant",
+				amount_nano_cny: "1.5", reason: "r" }],                             // pattern 整数
+			["admin.billing.adjust", { user_id: "u1", kind: "grant",
+				amount_nano_cny: "9" + "0".repeat(19), reason: "r" }],              // 超 19 位
+			["admin.billing.adjust", { user_id: "u1", kind: "grant",
+				amount_nano_cny: "5", reason: "" }],                                // reason minLength
 			// §6.5 PR5 修订：幂等键必须由调用方生成——缺失/null/空串在桥层即拒
 			//（纯空白的 trim 语义归服务端，见 test_admin_billing_writes.py）
 			["admin.billing.adjust", { user_id: "u1", kind: "grant",
@@ -1027,7 +1049,7 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		handle._handleWindowMessage({
 			source: contentWindow,
 			data: requestEnv(nonce, "r2", "admin.billing.adjust",
-				{ user_id: "u1", kind: "grant", amount_nano_cny: 1, reason: "r",
+				{ user_id: "u1", kind: "grant", amount_nano_cny: "1", reason: "r",
 					idempotency_key: "adj_retry_same_key" }),
 		});
 		await ticks();
@@ -1047,13 +1069,51 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		handle._handleWindowMessage({
 			source: contentWindow,
 			data: requestEnv(nonce0(posted), "r1", "admin.billing.account.updateCaps", {
-				user_id: "u1", soft_cap_nano_cny: 1, hard_cap_nano_cny: 2, version: 1,
+				user_id: "u1", soft_cap_nano_cny: "1", hard_cap_nano_cny: "2", version: 1,
 			}),
 		});
 		await ticks();
 		const rs = responses(posted, "r1");
 		expect(rs[0].env.ok).toBe(false);
 		expect((rs[0].env.error as { code: string }).code).toBe("version_conflict");
+	});
+
+	it("host responses carry the current-load nonce (P2 symmetric auth)", async () => {
+		// §8.3 P2 修订：宿主全部 result/error 回包都带当前 load 的 nonce——
+		// 插件侧据此（+ event.source）拒绝其他 frame/窗口伪造的响应。
+		const { handle, posted, contentWindow } = makeHost({});
+		handle._handleIframeLoad();
+		const nonce = initNonce(posted);
+		handle._handleWindowMessage({
+			source: contentWindow, data: requestEnv(nonce, "r1", "admin.auth.get"),
+		});
+		await ticks();
+		const rs = responses(posted, "r1");
+		expect(rs).toHaveLength(1);
+		expect(rs[0].env.nonce).toBe(nonce);
+		// 错误回包同样带 nonce（invalid_params 分支）
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r2", "admin.auth.get", { evil: 1 }),
+		});
+		await ticks();
+		const rs2 = responses(posted, "r2");
+		expect(rs2).toHaveLength(1);
+		expect(rs2[0].env.nonce).toBe(nonce);
+		// reload 后新 load 的响应对应新 nonce（旧 load 在途请求收到旧 nonce）
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r3", "admin.auth.get", {}),
+		});
+		handle._handleIframeLoad(); // r3 在途 → 作废回包（旧 nonce）
+		await ticks();
+		const rs3 = responses(posted, "r3");
+		expect(rs3).toHaveLength(1);
+		expect(rs3[0].env.nonce).toBe(nonce);
+		const nonce2 = posted
+			.filter((p) => p.env.kind === "init")
+			.map((p) => p.env.nonce as string)[1];
+		expect(nonce2).not.toBe(nonce);
 	});
 });
 

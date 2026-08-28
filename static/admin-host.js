@@ -15,6 +15,9 @@
        协议版本同 major、requestId 本次 load 内唯一（防重放）、method 在固定
        表、参数过 schema、所需 adminPermission 已在 manifest 申请、当前 actor
        仍是 owner（每条消息回查 /api/auth/info）；
+     - 对称认证（P2 修订）：宿主发出的全部 result/error 回包都带当前 load 的
+       nonce，插件侧以 event.source === window.parent + nonce 校验响应来源，
+       其他 frame/窗口无法向插件伪造响应；
      - iframe reload / 登出（401）/ 插件切换 / 页面卸载 → 立即作废 nonce 与
        全部在途请求（reject + 通知 iframe）；
      - 宿主用 fetch + CSRF cookie（与 app.js 同机制）请求 Admin API；**绝不**
@@ -221,9 +224,14 @@
     "admin.billing.account.updateCaps": {
       properties: {
         user_id: _userIdSpec,
-        // null = 清除该上限（§9）；非空须为非负整数
-        soft_cap_nano_cny: { type: "integer", min: 0, nullable: true },
-        hard_cap_nano_cny: { type: "integer", min: 0, nullable: true },
+        // §5 v0.3（P2）：金额 wire 为十进制字符串（null = 清除该上限，
+        // §9）；JSON number 在桥层即拒（JS Number 超 2^53 静默失真）
+        soft_cap_nano_cny: {
+          type: "string", pattern: "^[0-9]{1,19}$", nullable: true,
+        },
+        hard_cap_nano_cny: {
+          type: "string", pattern: "^[0-9]{1,19}$", nullable: true,
+        },
         version: { type: "integer", min: 1 },
       },
       required: ["user_id", "soft_cap_nano_cny", "hard_cap_nano_cny", "version"],
@@ -236,7 +244,11 @@
           type: "string",
           enum: ["grant", "topup", "refund", "manual_adjustment"],
         },
-        amount_nano_cny: { type: "integer", nonZero: true },
+        // §5 v0.3（P2）：十进制字符串（manual_adjustment 可为负）；桥层
+        // nonZero 拒 "0"/"-0"/"00" 等零值形态，kind 符号语义由服务端复核
+        amount_nano_cny: {
+          type: "string", pattern: "^-?[0-9]{1,19}$", nonZero: true,
+        },
         reason: { type: "string", minLength: 1, maxLength: 500 },
         // §6.5 PR5 修订：幂等键必须由调用方（插件 UI）生成，桥层与服务端
         // 双重 required——服务端已入账 + 浏览器超时的重试必须带同一 key 命中
@@ -299,8 +311,11 @@
   }
 
   // 单值校验：类型（string/integer/boolean/object）+ minLength/maxLength +
-  // enum + min/max + nonZero。null 只在显式 nullable 时接受（caps 的
-  // null=清除是唯一合法 null 语义；游标翻页用「缺键」表达，不用 null）。
+  // pattern + enum + min/max + nonZero。null 只在显式 nullable 时接受（caps
+  // 的 null=清除是唯一合法 null 语义；游标翻页用「缺键」表达，不用 null）。
+  // 金额字段是十进制字符串（§5 v0.3：wire 禁 JSON number，防 >2^53 失真），
+  // pattern 限定 ^-?[0-9]{1,19}$；字符串形态的 nonZero 用去前导零判零，
+  // 全程不经 Number（大值中转会丢精度）。
   function validateValue(value, spec) {
     if (value === undefined) return false;
     if (value === null) return spec.nullable === true;
@@ -309,7 +324,11 @@
         if (typeof value !== "string") return false;
         if (spec.minLength !== undefined && value.length < spec.minLength) return false;
         if (spec.maxLength && value.length > spec.maxLength) return false;
+        if (spec.pattern && !(new RegExp(spec.pattern)).test(value)) return false;
         if (spec.enum && spec.enum.indexOf(value) === -1) return false;
+        if (spec.nonZero && value.replace(/^-/, "").replace(/^0+/, "") === "") {
+          return false;
+        }
         return true;
       case "integer":
         if (typeof value !== "number" || !isFinite(value) ||
@@ -750,12 +769,15 @@
       return hex;
     }
 
-    function respond(targetWindow, requestId, ok, data) {
+    // §8.3 P2 修订（对称认证）：宿主的全部 result/error 回包都带当前 load
+    // 的 nonce（与请求侧同一值）——插件侧据此 + event.source 拒绝其他
+    // frame/窗口伪造的响应。
+    function respond(session, requestId, ok, data) {
       var env = { kind: "response", bridge: BRIDGE, protocolVersion: protocolVersion,
-                  requestId: requestId, ok: ok };
+                  nonce: session.nonce, requestId: requestId, ok: ok };
       if (ok) env.result = data == null ? null : data;
       else env.error = data || { code: "bridge_error" };
-      postToPlugin(targetWindow, env);
+      postToPlugin(session.contentWindow, env);
     }
 
     function failPending(session, err) {
@@ -765,7 +787,7 @@
         if (entry && entry.timer) clearTimeout(entry.timer);
         delete session.pending[rid];
         if (entry && entry.reject) entry.reject(err);
-        if (session.contentWindow) respond(session.contentWindow, rid, false, err);
+        if (session.contentWindow) respond(session, rid, false, err);
       });
     }
 
@@ -813,7 +835,7 @@
       entry.timer = setTimeout(function () {
         if (load !== session || !session.pending[rid]) return;
         delete session.pending[rid];
-        respond(session.contentWindow, rid, false,
+        respond(session, rid, false,
                 { code: "bridge_timeout", message: "宿主处理 " + env.method + " 超时" });
       }, timeoutMs);
       session.pending[rid] = entry;
@@ -822,7 +844,7 @@
         if (load !== session || !session.pending[rid]) return; // 已作废/已应答
         clearTimeout(entry.timer);
         delete session.pending[rid];
-        respond(session.contentWindow, rid, ok, data);
+        respond(session, rid, ok, data);
       };
       entry.reject = function (err) { finish(false, err || { code: "bridge_error" }); };
 
@@ -868,7 +890,7 @@
       if (typeof rid !== "string" || !rid) { stats.denied++; return; }
       if (Object.prototype.hasOwnProperty.call(load.seen, rid)) {
         stats.denied++;
-        respond(load.contentWindow, rid, false,
+        respond(load, rid, false,
                 { code: "request_id_replayed", message: "requestId 已在本次会话中使用" });
         return;
       }
@@ -878,14 +900,14 @@
       if (typeof method !== "string" ||
           !Object.prototype.hasOwnProperty.call(METHOD_PERMISSIONS, method)) {
         stats.denied++;
-        respond(load.contentWindow, rid, false,
+        respond(load, rid, false,
                 { code: "unknown_method", message: "未知或未登记的桥方法" });
         return;
       }
       // ⑥ 参数 schema
       if (!validateParams(method, env.payload)) {
         stats.denied++;
-        respond(load.contentWindow, rid, false,
+        respond(load, rid, false,
                 { code: "invalid_params", message: "参数校验失败：" + method });
         return;
       }
@@ -893,7 +915,7 @@
       var required = METHOD_PERMISSIONS[method];
       if (grantedPermissions.indexOf(required) === -1) {
         stats.denied++;
-        respond(load.contentWindow, rid, false,
+        respond(load, rid, false,
                 { code: "permission_denied",
                   message: "manifest 未申请 " + required + "，禁止调用 " + method });
         return;

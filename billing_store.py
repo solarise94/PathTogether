@@ -72,6 +72,11 @@ TOKEN_FIELDS = (
     "total_tokens",
 )
 
+#: token 计数上限 2^53-1（§7.1 v0.3 P2 修订）：同时保证 JSON number 精确
+#: 可表示与 PG BIGINT 安全；超限在 schema 校验阶段即确定性 400（outbox
+#: 进 dead），杜绝超大整数撑到 INSERT 才以 500 可重试错误变成毒丸。
+MAX_TOKEN_COUNT = 9007199254740991
+
 #: §4 时钟规则：occurred_at 晚于 received_at + 5 分钟 → unpriced(clock_skew_future)
 OCCURRED_AT_FUTURE_TOLERANCE_SECONDS = 300
 
@@ -222,7 +227,11 @@ def _is_int(value):
 
 
 def _check_token_count(value, path, errors):
-    """token_count：null 或 >=0 整数（bool 不算整数）。"""
+    """token_count：null 或 [0, 2^53-1] 整数（bool 不算整数）。
+
+    上限 2^53-1 见 :data:`MAX_TOKEN_COUNT`（超限报 schema 校验 400，
+    不让 BIGINT INSERT 溢出变 500）。
+    """
     if value is None:
         return
     if not _is_int(value):
@@ -230,6 +239,9 @@ def _check_token_count(value, path, errors):
         return
     if value < 0:
         errors.append("%s 需 >= 0" % path)
+        return
+    if value > MAX_TOKEN_COUNT:
+        errors.append("%s 超出上限 2^53-1（9007199254740991）" % path)
 
 
 def _check_nullable_str(value, path, errors, min_len=1, max_len=128):
@@ -264,8 +276,12 @@ def _check_raw_usage(raw, path, errors):
             _check_token_count(value, child, errors)
             continue
         if value is None or _is_int(value):
+            # 未知整数键按 schema 语义是 token 计数（additionalProperties 的
+            # token_count 分支）：同样受 2^53-1 上限约束（§7.1 v0.3）
             if value is not None and value < 0:
                 errors.append("%s 需 >= 0" % child)
+            elif value is not None and value > MAX_TOKEN_COUNT:
+                errors.append("%s 超出上限 2^53-1（9007199254740991）" % child)
             continue
         if isinstance(value, dict):
             meta_version = value.get("meta_version")

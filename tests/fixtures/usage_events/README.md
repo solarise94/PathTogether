@@ -32,7 +32,9 @@
 - `occurred_at`：provider 调用发生时刻，**计价时段与时钟偏差校验的唯一时间依据**；
   `enqueued_at` 只用于判断 outbox 积压。两者都必须是带时区的 RFC3339/ISO-8601；
 - 五个 token 字段（`cache_hit_input_tokens`/`cache_miss_input_tokens`/`output_tokens`/
-  `reasoning_tokens`/`total_tokens`）**必须显式出现**：值为非负整数或 `null`。
+  `reasoning_tokens`/`total_tokens`）**必须显式出现**：值为非负整数或 `null`，
+  且上限 `2^53-1`（9007199254740991——同时保证 JSON number 精确可表示与
+  PG BIGINT 安全，超限是确定性 schema 400，不是入库 500；v0.3 P2 修订）。
   `null` 只表示「中断且无最终 usage」的 unpriced 候选；不允许缺省与 null 混用，
   否则幂等哈希语义含糊。非 null 时必须满足
   `total = hit + miss + output` 且 `reasoning <= output`；

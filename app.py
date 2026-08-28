@@ -4264,11 +4264,13 @@ def api_admin_preview_stop():
 
 @app.route("/admin/registration")
 def admin_registration_page():
-    """owner 邀请注册管理页（模式切换 / 创建 / 列表 / 撤销）。"""
-    if AUTH_ENABLED and session.get("role") != user_store.ROLE_OWNER:
-        return redirect("/login")
-    return render_template("admin_registration.html",
-                           registration_mode=_effective_registration_mode())
+    """PR5 迁移兼容：独立邀请注册页已并入 admin 插件「邀请与来源」页。
+
+    旧 URL 保留一个版本做 302 → /admin#invites（方案 §13 PR5「保留一个版本的
+    重定向兼容，再删除独立模板」）；管理动作全部改在 admin 插件内完成。非
+    owner 不强制在此判权——目标 /admin 自带 owner 门控（§8.1）。
+    """
+    return redirect("/admin#invites", code=302)
 
 
 # --------------------------------------------------------------------------- #
@@ -5426,6 +5428,507 @@ def admin_v1_turn_budgets():
         usage=report,
         backend=platform_features.current_backend(),
     )
+
+
+# --------------------------------------------------------------------------- #
+# PR5：Admin API v1 写端点（§9 表写行 / §12.2 Phase B 调账 / §13 PR5 批次）
+#
+# 统一口径：
+#   - owner 门控 = _require_owner_admin_v1（_require_owner + 预览态一律 403，
+#     与只读端点/宿主页同口径 §14.1）；CSRF 沿用 before_request 全局闸；
+#   - 旧写端点（/api/admin/users 等）**保留不删**（§9 迁移期兼容），本节复用
+#     其校验与 store 调用、break-glass 不变量原样镜像（owner 禁用/重置一律
+#     409，disable/enable 同事务推进 auth_version）；
+#   - billing 写（caps/adjustments）：仅 PG；CAS 版本冲突 409、未开户 404
+#     （不伪造账户）、符号/reason 校验 400；**业务写入与 audit 同一事务**
+#     （billing_store.update_account_caps / apply_billing_adjustment 内经
+#     share_store_pg.record_audit_tx 实现，audit 失败整体回滚）；
+#   - 响应红线与只读端点一致：绝不含 password_hash / ai_config（内含 enc:
+#     密文形态）/ 完整邀请 token（创建邀请的明文码仅首次响应返回 + no-store）
+#     / 完整 IP。
+# --------------------------------------------------------------------------- #
+def _admin_v1_user_out(user):
+    """用户写端点响应出口：剥 password_hash 与 ai_config（§9 敏感红线）。"""
+    out = dict(user or {})
+    out.pop("password_hash", None)
+    out.pop("ai_config", None)
+    return out
+
+
+@app.route("/api/admin/v1/users", methods=["POST"])
+def admin_v1_users_create():
+    """创建普通用户（§9：仅 role=user，禁止经此创建 owner）。
+
+    校验/错误码镜像旧 POST /api/admin/users（login_id 唯一冲突 409；密码
+    15..200）；audit 动作与旧端点一致（user.create）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    body = request.get_json(silent=True) or {}
+    # §9「创建普通用户」：本端点不接受 role 入参（显式给 owner 一律 400）
+    if body.get("role") not in (None, user_store.ROLE_USER):
+        return _admin_v1_error(400, "invalid_request",
+                               "本端点只能创建普通用户（role=user）")
+    login_id = body.get("login_id")
+    password = body.get("password")
+    display_name = body.get("display_name")
+    if not isinstance(login_id, str) or not login_id.strip():
+        return _admin_v1_error(400, "invalid_request", "缺少登录账号")
+    if not isinstance(password, str) or not password:
+        return _admin_v1_error(400, "invalid_request", "缺少密码")
+    if (len(password) < user_store.PASSWORD_MIN_LENGTH
+            or len(password) > user_store.PASSWORD_MAX_LENGTH):
+        return _admin_v1_error(
+            400, "invalid_request",
+            "密码长度须在 %d..%d 字符之间（当前 %d 字符）"
+            % (user_store.PASSWORD_MIN_LENGTH, user_store.PASSWORD_MAX_LENGTH,
+               len(password)))
+    try:
+        user = user_store.create_user(
+            login_id, password, role=user_store.ROLE_USER,
+            display_name=display_name)
+    except ValueError as e:
+        msg = str(e)
+        if "已存在" in msg:
+            return _admin_v1_error(409, "login_id_conflict", msg)
+        return _admin_v1_error(400, "invalid_request", msg)
+    _audit("user.create", target_type="user", target_id=user.get("user_id"))
+    return jsonify(user=_admin_v1_user_out(user))
+
+
+def _admin_v1_set_user_enabled(user_id, enabled):
+    """enable/disable 共用实现（镜像旧 3832/3855：owner → 409 break-glass）。"""
+    target = user_store.get_user(user_id)
+    if target is None:
+        return _admin_v1_error(404, "user_not_found", "用户不存在")
+    if target.get("role") == user_store.ROLE_OWNER:
+        return _admin_v1_error(
+            409, "owner_break_glass",
+            "不能经 Web 启用/禁用 owner（docs §3.2 不变量 5）；owner 恢复"
+            "请使用主机侧 break-glass CLI（useradmin）")
+    user = user_store.set_user_disabled(user_id, not enabled)
+    _audit("user.enable" if enabled else "user.disable",
+           target_type="user", target_id=user_id)
+    return jsonify(user=_admin_v1_user_out(user))
+
+
+@app.route("/api/admin/v1/users/<user_id>/enable", methods=["POST"])
+def admin_v1_users_enable(user_id):
+    """启用用户（镜像旧端点：store 层同事务推进 auth_version）。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    return _admin_v1_set_user_enabled(user_id, True)
+
+
+@app.route("/api/admin/v1/users/<user_id>/disable", methods=["POST"])
+def admin_v1_users_disable(user_id):
+    """禁用用户（旧 session 立即失效：disable 同事务 auth_version+1）。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    return _admin_v1_set_user_enabled(user_id, False)
+
+
+@app.route("/api/admin/v1/users/<user_id>/ai-access", methods=["POST"])
+def admin_v1_users_ai_access(user_id):
+    """设置平台 AI 权限（镜像旧 4163；body {enabled: bool}；PG-only）。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if platform_features.current_backend() != "postgres":
+        return _admin_v1_pg_required()
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body.get("enabled"), bool):
+        return _admin_v1_error(400, "invalid_request", "缺少 enabled 布尔字段")
+    import user_store_pg
+    user = user_store_pg.set_user_ai_access(user_id, bool(body["enabled"]))
+    if user is None:
+        return _admin_v1_error(404, "user_not_found", "用户不存在")
+    _audit("user.ai_access", target_type="user", target_id=user_id,
+           detail={"enabled": bool(body["enabled"])})
+    return jsonify(user=_admin_v1_user_out(user))
+
+
+@app.route("/api/admin/v1/users/<user_id>/password-reset", methods=["POST"])
+def admin_v1_users_password_reset(user_id):
+    """重置普通用户密码（镜像旧 3877：owner → 409；hash 与 auth_version+1 同事务）。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    target = user_store.get_user(user_id)
+    if target is None:
+        return _admin_v1_error(404, "user_not_found", "用户不存在")
+    if target.get("role") == user_store.ROLE_OWNER:
+        return _admin_v1_error(
+            409, "owner_break_glass",
+            "不能经 Web 重置 owner 密码（docs §3.2 不变量 5）：owner 请用"
+            "「修改我的密码」自助修改；失联恢复走主机侧 break-glass CLI")
+    body = request.get_json(silent=True) or {}
+    new_password = body.get("password")
+    if not isinstance(new_password, str) or not new_password:
+        return _admin_v1_error(400, "invalid_request", "缺少密码")
+    if (len(new_password) < user_store.PASSWORD_MIN_LENGTH
+            or len(new_password) > user_store.PASSWORD_MAX_LENGTH):
+        return _admin_v1_error(
+            400, "invalid_request",
+            "密码长度须在 %d..%d 字符之间（当前 %d 字符）"
+            % (user_store.PASSWORD_MIN_LENGTH, user_store.PASSWORD_MAX_LENGTH,
+               len(new_password)))
+    try:
+        user = user_store.set_user_password(user_id, new_password)
+    except ValueError as e:
+        return _admin_v1_error(400, "invalid_request", str(e))
+    if user is None:
+        return _admin_v1_error(404, "user_not_found", "用户不存在")
+    _audit("user.password_reset", target_type="user", target_id=user_id,
+           detail={"sessions_revoked": True})
+    return jsonify(user=_admin_v1_user_out(user))
+
+
+@app.route("/api/admin/v1/invites", methods=["GET"])
+def admin_v1_invites_list():
+    """邀请列表（cursor offset 分页 + 掩码视图；token/hash 永不返回）。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.budget_features_available():
+        return _admin_v1_pg_required()
+    limit = _admin_v1_limit_arg()
+    cur = _admin_v1_decode_cursor(request.args.get("cursor"))
+    offset = int(cur.get("o") or 0) if cur else 0
+    if offset < 0:
+        offset = 0
+    try:
+        # list_invites 只有 limit 参数（内部上限 1000）：offset 分页按
+        # 「取 offset+limit+1 再切片」实现，邀请规模远小于上限，足够
+        invites = registration_store.list_invites(
+            limit=min(offset + limit + 1, 1000))
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 invites 读取失败")
+        return _admin_v1_error(500, "internal", "邀请列表读取失败")
+    page = invites[offset:offset + limit]
+    has_more = len(invites) > offset + limit
+    next_cursor = None
+    if has_more:
+        next_cursor = _admin_v1_encode_cursor({"o": offset + limit})
+    return jsonify(invites=[_invite_public_view(i) for i in page],
+                   next_cursor=next_cursor, limit=limit)
+
+
+@app.route("/api/admin/v1/invites", methods=["POST"])
+def admin_v1_invites_create():
+    """创建一次性邀请码（镜像旧 4026：限流 + source_code/campaign_id 校验）。
+
+    明文 code 仅本响应返回一次（no-store）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.budget_features_available():
+        return _admin_v1_pg_required()
+    import auth_limit_store
+    owner_hash = _registration_invite_owner_hash()
+    try:
+        retry = auth_limit_store.check_owner_invite_creation_locked(owner_hash)
+    except Exception:
+        app.logger.exception("邀请码创建限流存储不可用，fail-closed 503")
+        return _admin_v1_pg_required()
+    if retry > 0:
+        return (jsonify(error={"code": "rate_limited",
+                               "message": "邀请码创建过于频繁，请稍后再试",
+                               "retry_after_seconds": max(1, int(retry))}),
+                429, {"Retry-After": str(max(1, int(retry)))})
+
+    body = request.get_json(silent=True) or {}
+    login_id = body.get("login_id")
+    if login_id is not None:
+        login_id = str(login_id).strip()
+        if not login_id:
+            return _admin_v1_error(
+                400, "invalid_request", "绑定登录账号传空字符串请改传 null（不绑定）")
+        if len(login_id) > 120:
+            return _admin_v1_error(400, "invalid_request",
+                                   "绑定登录账号过长（≤120 字符）")
+        if any(ch.isspace() for ch in login_id):
+            return _admin_v1_error(400, "invalid_request",
+                                   "绑定登录账号不能包含空白字符")
+    try:
+        ttl_hours = int(body.get("ttl_hours") or _INVITE_DEFAULT_TTL_HOURS)
+    except (TypeError, ValueError):
+        return _admin_v1_error(400, "invalid_request", "ttl_hours 需为整数小时")
+    if not 1 <= ttl_hours <= _INVITE_MAX_TTL_HOURS:
+        return _admin_v1_error(400, "invalid_request",
+                               "ttl_hours 需在 1–%d 之间" % _INVITE_MAX_TTL_HOURS)
+    ai_access = body.get("ai_access")
+    if ai_access is not None and not isinstance(ai_access, bool):
+        return _admin_v1_error(400, "invalid_request", "ai_access 需为布尔值")
+    cohort = body.get("cohort")
+    if cohort is not None and (not isinstance(cohort, str) or len(cohort) > 64):
+        return _admin_v1_error(400, "invalid_request",
+                               "cohort 需为 ≤64 字符的字符串")
+    note = body.get("note")
+    if note is not None and (not isinstance(note, str) or len(note) > 200):
+        return _admin_v1_error(400, "invalid_request",
+                               "note 需为 ≤200 字符的字符串")
+    source_code = body.get("source_code")
+    if source_code is not None and (not isinstance(source_code, str)
+                                    or len(source_code) > 64):
+        return _admin_v1_error(400, "invalid_request",
+                               "source_code 需为 ≤64 字符的字符串")
+    campaign_id = body.get("campaign_id")
+    if campaign_id is not None and (not isinstance(campaign_id, str)
+                                    or len(campaign_id) > 64):
+        return _admin_v1_error(400, "invalid_request",
+                               "campaign_id 需为 ≤64 字符的字符串")
+
+    try:
+        auth_limit_store.record_owner_invite_creation(owner_hash)
+        invite = registration_store.create_invite(
+            current_identity().get("user_id"), login_id=login_id,
+            ttl_seconds=ttl_hours * 3600,
+            ai_access=bool(ai_access), cohort=cohort or "",
+            note=note or "",
+            source_code=source_code or "", campaign_id=campaign_id or None)
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except registration_store.RegistrationStoreError as exc:
+        return _admin_v1_error(500, "internal", str(exc))
+    out = _invite_public_view(invite)
+    out["token"] = invite["token"]  # 明文码仅此一次
+    resp = jsonify(invite=out)
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
+
+
+@app.route("/api/admin/v1/invites/<invite_id>/revoke", methods=["POST"])
+def admin_v1_invites_revoke(invite_id):
+    """撤销邀请（镜像旧 4142：幂等；已消费拒绝撤销）。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.budget_features_available():
+        return _admin_v1_pg_required()
+    try:
+        invite = registration_store.revoke_invite(
+            invite_id, current_identity().get("user_id"))
+    except registration_store.InviteNotFoundError:
+        return _admin_v1_error(404, "invite_not_found", "邀请码不存在")
+    except registration_store.RegistrationStoreError as exc:
+        return _admin_v1_error(409, "invite_not_revocable", str(exc))
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    return jsonify(invite=_invite_public_view(invite))
+
+
+@app.route("/api/admin/v1/turn-budgets", methods=["PUT"])
+def admin_v1_turn_budgets_update():
+    """修改当前周期限制（镜像旧 4417：全部 _BUDGET_SETTINGS_FIELDS 可调字段）。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.budget_features_available():
+        return _admin_v1_pg_required()
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict) or not body:
+        return _admin_v1_error(400, "invalid_request", "缺少预算限制字段")
+    try:
+        current = budget_store.get_current_period()
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 turn budgets 读取当前周期失败")
+        return _admin_v1_error(500, "internal", "turn 预算读取失败")
+    current_limits = {k: current.get(k) for k in _BUDGET_SETTINGS_FIELDS}
+    validated, verr = _validate_budget_settings(body, current_limits)
+    if verr:
+        return _admin_v1_error(400, "invalid_request", verr)
+    try:
+        period = budget_store.update_period_limits(validated)
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    _audit("ai_budget.update", target_type="ai_budget_period",
+           target_id=str(period["id"]), detail={"fields": sorted(validated)})
+    limits = {k: period.get(k) for k in _BUDGET_SETTINGS_FIELDS}
+    return jsonify(period_id=period["id"], limits=limits)
+
+
+@app.route("/api/admin/v1/turn-budgets/new-period", methods=["POST"])
+def admin_v1_turn_budgets_new_period():
+    """开启新预算周期（镜像旧 4453 reset：confirm 二次确认 + 可选 limits）。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.budget_features_available():
+        return _admin_v1_pg_required()
+    body = request.get_json(silent=True) or {}
+    if body.get("confirm") is not True:
+        return _admin_v1_error(400, "confirm_required",
+                               "需二次确认：confirm=true 才能开启新的预算周期")
+    new_limits = body.get("limits")
+    if new_limits is not None:
+        if not isinstance(new_limits, dict):
+            return _admin_v1_error(400, "invalid_request", "limits 需为对象")
+        try:
+            current = budget_store.get_current_period()
+        except platform_features.PgFeatureUnavailable:
+            return _admin_v1_pg_required()
+        current_limits = {k: current.get(k) for k in _BUDGET_SETTINGS_FIELDS}
+        validated, verr = _validate_budget_settings(new_limits, current_limits)
+        if verr:
+            return _admin_v1_error(400, "invalid_request", verr)
+        new_limits = validated
+    try:
+        period = budget_store.reset_period(
+            new_limits, created_by=current_identity().get("user_id"))
+        demo_reset_ids = demo_store.reset_demo_runs()
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    _audit("ai_budget.reset", target_type="ai_budget_period",
+           target_id=str(period["id"]),
+           detail={"closed_previous": True,
+                   "demo_runs_reset": len(demo_reset_ids)})
+    limits = {k: period.get(k) for k in _BUDGET_SETTINGS_FIELDS}
+    return jsonify(period_id=period["id"], limits=limits,
+                   started_at=period["started_at"],
+                   demo_runs_reset=len(demo_reset_ids))
+
+
+@app.route("/api/admin/v1/billing/accounts/<user_id>/caps", methods=["PUT"])
+def admin_v1_billing_caps(user_id):
+    """更新 soft/hard spend cap（§9：null=清除；非空 ≥0；同存 soft<=hard；
+    version CAS 冲突 409；未开户 404 不伪造；caps 写与 audit 同一事务）。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.billing_features_available():
+        return _admin_v1_pg_required()
+    body = request.get_json(silent=True) or {}
+    for field in ("soft_cap_nano_cny", "hard_cap_nano_cny", "version"):
+        if field not in body:
+            return _admin_v1_error(400, "invalid_request",
+                                   "缺少 %s 字段" % field)
+    soft = body.get("soft_cap_nano_cny")
+    hard = body.get("hard_cap_nano_cny")
+    for value, field in ((soft, "soft_cap_nano_cny"),
+                         (hard, "hard_cap_nano_cny")):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return _admin_v1_error(
+                400, "invalid_request",
+                "%s 需为非负整数（nano-CNY）或 null（清除）" % field)
+    if soft is not None and hard is not None and soft > hard:
+        return _admin_v1_error(
+            400, "invalid_request", "soft_cap_nano_cny 不可大于 hard_cap_nano_cny")
+    version = body.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        return _admin_v1_error(400, "invalid_request", "version 需为正整数")
+    if user_store.get_user(user_id) is None:
+        return _admin_v1_error(404, "user_not_found", "用户不存在")
+    try:
+        result = billing_store.update_account_caps(
+            user_id, soft, hard, version,
+            actor_user_id=actor_identity().get("user_id"))
+    except billing_store.BillingAccountNotFoundError:
+        return _admin_v1_error(404, "billing_account_not_found",
+                               "该用户尚未开户（读取账户后才能设置 caps）")
+    except billing_store.BillingCapsVersionConflictError:
+        return _admin_v1_error(409, "version_conflict",
+                               "数据已被他人修改，请刷新后重试")
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 billing caps 更新失败")
+        return _admin_v1_error(500, "internal", "caps 更新失败")
+    return jsonify(account=result["account"], balance_nano=result["balance_nano"])
+
+
+@app.route("/api/admin/v1/billing/adjustments", methods=["POST"])
+def admin_v1_billing_adjustments():
+    """人工调账（§9 + §12.2 Phase B：grant/topup/refund/manual_adjustment）。
+
+    - grant/topup：未开户**同事务显式开户**后入账；refund/manual_adjustment
+      未开户 404（不隐式开户）；
+    - 符号先在路由层校验（400，不靠 DB CHECK 500）；reason 必填（trim ≥1，
+      ≤500）；idempotency_key 缺省服务端生成 ``adj_<hex>``；
+    - 入账 + audit 同一事务；幂等键重放返回原 entry + duplicate:true（200）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.billing_features_available():
+        return _admin_v1_pg_required()
+    body = request.get_json(silent=True) or {}
+    user_id = body.get("user_id")
+    if not isinstance(user_id, str) or not user_id.strip():
+        return _admin_v1_error(400, "invalid_request", "缺少 user_id 字段")
+    user_id = user_id.strip()
+    kind = body.get("kind")
+    if kind not in billing_store.ADJUSTMENT_KINDS:
+        return _admin_v1_error(
+            400, "invalid_request",
+            "kind 需为 %s" % (billing_store.ADJUSTMENT_KINDS,))
+    amount = body.get("amount_nano_cny")
+    if isinstance(amount, bool) or not isinstance(amount, int):
+        return _admin_v1_error(400, "invalid_request",
+                               "amount_nano_cny 需为整数（nano-CNY）")
+    if kind in ("grant", "topup", "refund") and amount <= 0:
+        return _admin_v1_error(400, "invalid_request",
+                               "%s 金额必须为正数（nano-CNY）" % kind)
+    if kind == "manual_adjustment" and amount == 0:
+        return _admin_v1_error(400, "invalid_request",
+                               "manual_adjustment 金额不可为 0")
+    reason = body.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return _admin_v1_error(400, "invalid_request", "reason 必填（不可为空白）")
+    if len(reason.strip()) > billing_store.ADJUSTMENT_REASON_MAX_LENGTH:
+        return _admin_v1_error(
+            400, "invalid_request",
+            "reason 上限 %d 字符" % billing_store.ADJUSTMENT_REASON_MAX_LENGTH)
+    idem = body.get("idempotency_key")
+    if idem is not None and (not isinstance(idem, str)
+                             or not idem.strip() or len(idem) > 128):
+        return _admin_v1_error(400, "invalid_request",
+                               "idempotency_key 需为 ≤128 字符的非空字符串")
+    if user_store.get_user(user_id) is None:
+        return _admin_v1_error(404, "user_not_found", "用户不存在")
+    if not idem:
+        idem = "adj_" + secrets.token_hex(16)
+    try:
+        result = billing_store.apply_billing_adjustment(
+            user_id, kind, amount, reason.strip(), idem,
+            actor_user_id=actor_identity().get("user_id"))
+    except billing_store.BillingAccountNotFoundError:
+        return _admin_v1_error(
+            404, "billing_account_not_found",
+            "该用户尚未开户（%s 不隐式开户）" % kind)
+    except billing_store.BillingIdempotencyKeyConflictError:
+        return _admin_v1_error(409, "idempotency_key_conflict",
+                               "idempotency_key 已被其他调账使用")
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 billing adjustment 失败")
+        return _admin_v1_error(500, "internal", "调账入账失败")
+    return jsonify(ok=True, entry=result["entry"],
+                   duplicate=result["duplicate"],
+                   balance_nano=result["balance_nano"],
+                   account=result["account"])
 
 
 # --------------------------------------------------------------------------- #

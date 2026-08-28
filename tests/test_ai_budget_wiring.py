@@ -712,35 +712,43 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_ui_budget_card_and_max_steps_sync_present():
+    """PR5 UI 迁移后：「AI 预算」管理卡片只在 admin 插件内交付。
+
+    Viewer 侧栏的 users/plugins/aibudget 三个管理 section 已删（方案 §13
+    PR5「完成 UI parity 后删除」）；turn 预算的用量展示/限制编辑/保存/开新
+    周期全部在 plugins/pathtogether-admin/ui/。平台侧保留的只有 user
+    max_steps 只读同步（syncAiMaxStepsInput，§8.3）。
+    """
     index = (REPO_ROOT / "templates" / "index.html").read_text(encoding="utf-8")
     shell = (REPO_ROOT / "templates" / "_app_shell.html").read_text(encoding="utf-8")
-    # owner 后台「AI 预算」卡片：用量展示 + 限制编辑 + 保存/新周期
+    plugin_ui = (REPO_ROOT / "plugins" / "pathtogether-admin" / "ui"
+                 / "index.html").read_text(encoding="utf-8")
+    plugin_js = (REPO_ROOT / "plugins" / "pathtogether-admin" / "ui"
+                 / "main.js").read_text(encoding="utf-8")
     assert '{% include "_app_shell.html" %}' in index
-    assert 'id="aibudget-mgr-section"' in shell
-    assert 'id="aibudget-usage"' in shell
-    assert 'id="aibudget-save-btn"' in shell
-    assert 'id="aibudget-usage-badge"' in shell
-    assert 'id="aibudget-reset-btn"' in shell
-    assert 'id="aibudget-demosteps"' in shell
-    assert 'id="aibudget-perbrowser"' in shell
-    assert 'id="aibudget-concurrency"' in shell
-    assert 'id="aibudget-demo-enabled"' in shell
-    assert 'data-i18n="sb.section.aibudget"' in shell
+    # 旧侧栏管理块已删（含指向 /admin/registration 的链接）
+    assert "aibudget-mgr-section" not in shell
+    assert "users-mgr-section" not in shell
+    assert "plugins-mgr-section" not in shell
+    assert "admin/registration" not in shell
+    # turn 预算管理 UI 交付物迁入 admin 插件（限制编辑 + 保存 + 开新周期）
+    assert 'id="adm-turn-edit-form"' in plugin_ui
+    assert 'id="adm-turn-save-btn"' in plugin_ui
+    assert 'id="adm-turn-newperiod-btn"' in plugin_ui
+    assert 'id="adm-turn-demosteps"' in plugin_ui
+    assert 'id="adm-turn-perbrowser"' in plugin_ui
+    assert 'id="adm-turn-concurrency"' in plugin_ui
+    assert 'id="adm-turn-demo-enabled"' in plugin_ui
+    assert "admin.turnBudgets.update" in plugin_js
+    assert "admin.turnBudgets.newPeriod" in plugin_js
     app_js = (REPO_ROOT / "static" / "app.js").read_text(encoding="utf-8")
-    assert "showAiBudgetMgr" in app_js
     assert "syncAiMaxStepsInput" in app_js  # 平台 AI 步数只读同步（§8.3）
-    assert "demo_task_max_steps" in app_js
-    assert "demo_per_browser_limit" in app_js
-    assert "demo_max_concurrency" in app_js
-    assert "demo_enabled" in app_js
-    assert "demo_sessions" in app_js
-    assert "aibudget-usage-badge" in app_js
+    assert "showAiBudgetMgr" not in app_js  # 旧侧栏实现已删
     i18n = (REPO_ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
-    for key in ("sb.section.aibudget", "sb.aibudget.save", "sb.aibudget.reset",
-                "sb.aibudget.reset.confirm", "ai.field.maxsteps.platform.title",
-                "sb.aibudget.limit.demosteps", "sb.aibudget.limit.perbrowser",
-                "sb.aibudget.limit.concurrency", "sb.aibudget.limit.demoenabled",
-                "sb.aibudget.gates", "sb.aibudget.gates.detail",
-                "demo.admin.usage"):
+    for key in ("ai.field.maxsteps.platform.title", "demo.admin.usage"):
         # 中英两份字典都必须有（每个 key 出现两次）
         assert i18n.count('"%s":' % key) == 2, key
+    # 旧侧栏管理 i18n 键已随 UI 一并删除（中英两份都不再出现）
+    for key in ("sb.section.aibudget", "sb.aibudget.save",
+                "sb.section.users", "sb.section.plugins"):
+        assert '"%s":' % key not in i18n, key

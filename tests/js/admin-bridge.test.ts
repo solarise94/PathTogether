@@ -287,20 +287,22 @@ describe("AdminBridge host — message gate (§8.3/§8.4)", () => {
 		expect((rs[0].env.error as { code: string }).code).toBe("permission_denied");
 	});
 
-	it("returns stable not_implemented for mapped-but-unimplemented methods (PR5 writes)", async () => {
-		const { handle, posted, contentWindow } = makeHost({
-			permissions: ["admin:users:read", "admin:users:write"],
-		});
-		handle._handleIframeLoad();
-		const nonce = initNonce(posted);
-		handle._handleWindowMessage({
-			source: contentWindow, data: requestEnv(nonce, "r1", "admin.users.create"),
-		});
-		await ticks();
-		const rs = responses(posted, "r1");
-		expect(rs).toHaveLength(1);
-		expect(rs[0].env.ok).toBe(false);
-		expect((rs[0].env.error as { code: string }).code).toBe("not_implemented");
+	it("wires a backend and param schema for every mapped method (PR5 drift guard)", () => {
+		const { AdminBridgeHost } = loadModule();
+		const table = AdminBridgeHost.METHOD_PERMISSIONS;
+		const schemas = (
+			AdminBridgeHost as unknown as {
+				METHOD_PARAM_SCHEMAS: Record<string, unknown>;
+			}
+		).METHOD_PARAM_SCHEMAS;
+		for (const method of Object.keys(table)) {
+			// 防御性兜底（not_implemented）只对「漏接线」生效；PR5 后全表必须
+			// 同时具备 backend 实现与参数 schema——这里通过 schema 存在性 +
+			// dispatch 全链路用例锁定（backend 存在性由下方逐方法代理用例覆盖）
+			expect(schemas[method], method + " 缺参数 schema").toBeTruthy();
+			const schema = schemas[method] as { additionalProperties?: boolean };
+			expect(schema.additionalProperties, method).toBe(false);
+		}
 	});
 
 	it("enforces per-method param schema (admin.auth.get rejects extra fields)", async () => {
@@ -721,6 +723,321 @@ describe("AdminBridge host — PR4 acquisition read backend proxy (§9 Admin API
 		expect((responses(posted, "b1")[0].env.error as { code: string }).code).toBe("invalid_params");
 		expect((responses(posted, "b2")[0].env.error as { code: string }).code).toBe("invalid_params");
 		expect(handle.stats().handled).toBe(0);
+	});
+});
+
+describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () => {
+	const ALL_WRITE = [
+		"admin:users:write", "admin:invites:read", "admin:invites:write",
+		"admin:turn-budgets:write", "admin:billing:write",
+	];
+
+	function makeWriteHost(
+		fetchJson: (url: string, o?: unknown) => Promise<unknown>,
+		permissions = ALL_WRITE,
+	) {
+		return makeHost({ permissions, fetchJson });
+	}
+
+	it("admin.users.create proxies POST /api/admin/v1/users with whitelisted body", async () => {
+		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+		const { handle, posted, contentWindow } = makeWriteHost(async (url, o) => {
+			calls.push({
+				url, method: (o as { method?: string } | undefined)?.method,
+				body: JSON.parse(String((o as { body?: string }).body)),
+			});
+			return { status: 200, ok: true, body: { user: { user_id: "u1" } } };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.users.create", {
+				login_id: "a@x.com", password: "longpass-12345", display_name: "A",
+			}),
+		});
+		await ticks();
+		expect(responses(posted, "r1")[0].env.ok).toBe(true);
+		expect(calls).toEqual([{
+			url: "/api/admin/v1/users", method: "POST",
+			body: { login_id: "a@x.com", password: "longpass-12345", display_name: "A" },
+		}]);
+	});
+
+	it("admin.users.setEnabled maps enabled flag onto enable/disable path", async () => {
+		const calls: Array<{ url: string; method?: string }> = [];
+		const { handle, posted, contentWindow } = makeWriteHost(async (url, o) => {
+			calls.push({ url, method: (o as { method?: string } | undefined)?.method });
+			return { status: 200, ok: true, body: { user: {} } };
+		});
+		handle._handleIframeLoad();
+		const nonce = nonce0(posted);
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r1", "admin.users.setEnabled", { user_id: "usr_1", enabled: false }),
+		});
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r2", "admin.users.setEnabled", { user_id: "usr_1", enabled: true }),
+		});
+		await ticks();
+		expect(calls[0]).toEqual({ url: "/api/admin/v1/users/usr_1/disable", method: "POST" });
+		expect(calls[1]).toEqual({ url: "/api/admin/v1/users/usr_1/enable", method: "POST" });
+	});
+
+	it("rejects path params containing / before any backend call (invalid_params)", async () => {
+		const calls: string[] = [];
+		const { handle, posted, contentWindow } = makeWriteHost(async (url) => {
+			calls.push(url);
+			return { status: 200, ok: true, body: {} };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.users.setEnabled", {
+				user_id: "usr/../../api/admin/users", enabled: true,
+			}),
+		});
+		await ticks();
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(false);
+		expect((rs[0].env.error as { code: string }).code).toBe("invalid_params");
+		expect(calls).toEqual([]); // 后端一次都没被打到
+	});
+
+	it("admin.users.setAiAccess / resetPassword hit their v1 endpoints", async () => {
+		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+		const { handle, posted, contentWindow } = makeWriteHost(async (url, o) => {
+			calls.push({
+				url, method: (o as { method?: string } | undefined)?.method,
+				body: JSON.parse(String((o as { body?: string }).body)),
+			});
+			return { status: 200, ok: true, body: { user: {} } };
+		});
+		handle._handleIframeLoad();
+		const nonce = nonce0(posted);
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r1", "admin.users.setAiAccess", { user_id: "usr_2", enabled: true }),
+		});
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r2", "admin.users.resetPassword", { user_id: "usr_2", password: "longpass-12345" }),
+		});
+		await ticks();
+		expect(calls[0]).toEqual({
+			url: "/api/admin/v1/users/usr_2/ai-access", method: "POST", body: { enabled: true },
+		});
+		expect(calls[1]).toEqual({
+			url: "/api/admin/v1/users/usr_2/password-reset", method: "POST",
+			body: { password: "longpass-12345" },
+		});
+	});
+
+	it("admin.invites.list/create/revoke map to the v1 invite endpoints", async () => {
+		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+		const { handle, posted, contentWindow } = makeWriteHost(async (url, o) => {
+			calls.push({
+				url, method: (o as { method?: string } | undefined)?.method,
+				body: (o as { body?: string } | undefined)?.body
+					? JSON.parse(String((o as { body?: string }).body)) : undefined,
+			});
+			if (url.startsWith("/api/admin/v1/invites") && !calls[0].method) {
+				return { status: 200, ok: true, body: { invites: [], next_cursor: null } };
+			}
+			return { status: 200, ok: true, body: { invite: {} } };
+		});
+		handle._handleIframeLoad();
+		const nonce = nonce0(posted);
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r1", "admin.invites.list", { limit: 25, cursor: "k9" }),
+		});
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r2", "admin.invites.create", {
+				ttl_hours: 48, ai_access: true, source_code: "mywebpage",
+			}),
+		});
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r3", "admin.invites.revoke", { invite_id: "inv_9" }),
+		});
+		await ticks();
+		expect(calls[0]).toEqual({ url: "/api/admin/v1/invites?cursor=k9&limit=25" });
+		expect(calls[1]).toEqual({
+			url: "/api/admin/v1/invites", method: "POST",
+			body: {
+				login_id: undefined, ttl_hours: 48, ai_access: true, cohort: undefined,
+				note: undefined, source_code: "mywebpage", campaign_id: undefined,
+			},
+		});
+		expect(calls[2]).toEqual({
+			url: "/api/admin/v1/invites/inv_9/revoke", method: "POST", body: {},
+		});
+	});
+
+	it("admin.turnBudgets.update PUTs whitelisted fields; newPeriod forces confirm=true", async () => {
+		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+		const { handle, posted, contentWindow } = makeWriteHost(async (url, o) => {
+			calls.push({
+				url, method: (o as { method?: string } | undefined)?.method,
+				body: JSON.parse(String((o as { body?: string }).body)),
+			});
+			return { status: 200, ok: true, body: { period_id: 2 } };
+		});
+		handle._handleIframeLoad();
+		const nonce = nonce0(posted);
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r1", "admin.turnBudgets.update", {
+				platform_turn_limit: 500, demo_enabled: false,
+			}),
+		});
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r2", "admin.turnBudgets.newPeriod", {}),
+		});
+		await ticks();
+		expect(calls[0]).toEqual({
+			url: "/api/admin/v1/turn-budgets", method: "PUT",
+			body: { platform_turn_limit: 500, demo_enabled: false },
+		});
+		// confirm 由桥层固定补 true（二次确认在插件 UI 层做，§3.3）
+		expect(calls[1]).toEqual({
+			url: "/api/admin/v1/turn-budgets/new-period", method: "POST",
+			body: { confirm: true, limits: undefined },
+		});
+	});
+
+	it("admin.billing.account.updateCaps PUTs caps with version; adjust POSTs adjustment", async () => {
+		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+		const { handle, posted, contentWindow } = makeWriteHost(async (url, o) => {
+			calls.push({
+				url, method: (o as { method?: string } | undefined)?.method,
+				body: JSON.parse(String((o as { body?: string }).body)),
+			});
+			return { status: 200, ok: true, body: { ok: true } };
+		});
+		handle._handleIframeLoad();
+		const nonce = nonce0(posted);
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r1", "admin.billing.account.updateCaps", {
+				user_id: "usr_3", soft_cap_nano_cny: null, hard_cap_nano_cny: 200, version: 4,
+			}),
+		});
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r2", "admin.billing.adjust", {
+				user_id: "usr_3", kind: "grant", amount_nano_cny: 1000,
+				reason: "welcome", idempotency_key: "adj_x1",
+			}),
+		});
+		await ticks();
+		expect(calls[0]).toEqual({
+			url: "/api/admin/v1/billing/accounts/usr_3/caps", method: "PUT",
+			body: { soft_cap_nano_cny: null, hard_cap_nano_cny: 200, version: 4 },
+		});
+		expect(calls[1]).toEqual({
+			url: "/api/admin/v1/billing/adjustments", method: "POST",
+			body: {
+				user_id: "usr_3", kind: "grant", amount_nano_cny: 1000,
+				reason: "welcome", idempotency_key: "adj_x1",
+			},
+		});
+	});
+
+	it("rejects schema-invalid write params (required / types / enums / nonZero)", async () => {
+		const { handle, posted, contentWindow } = makeWriteHost(async () => ({
+			status: 200, ok: true, body: {},
+		}));
+		handle._handleIframeLoad();
+		const nonce = nonce0(posted);
+		const bad: Array<[string, unknown]> = [
+			["admin.users.create", { login_id: "a@x.com" }],                     // 缺 password
+			["admin.users.create", { login_id: "", password: "longpass-12345" }], // minLength
+			["admin.users.setEnabled", { user_id: "u1" }],                        // 缺 enabled
+			["admin.users.setEnabled", { user_id: "u1", enabled: "yes" }],       // boolean
+			["admin.users.resetPassword", { user_id: "u1", password: "" }],      // minLength
+			["admin.invites.create", { ttl_hours: 9999 }],                        // max 720
+			["admin.invites.create", { evil: 1 }],                                // 未声明字段
+			["admin.invites.revoke", {}],                                         // 缺 invite_id
+			["admin.turnBudgets.update", { platform_turn_limit: 1.5 }],          // integer
+			["admin.turnBudgets.update", { platform_turn_limit: 0 }],            // min 1
+			["admin.turnBudgets.newPeriod", { limits: [] }],                      // object
+			["admin.billing.account.updateCaps", { user_id: "u1", version: 1 }], // 缺 caps 键
+			["admin.billing.account.updateCaps", {
+				user_id: "u1", soft_cap_nano_cny: -5, hard_cap_nano_cny: 10, version: 1,
+			}],                                                                    // min 0
+			["admin.billing.account.updateCaps", {
+				user_id: "u1", soft_cap_nano_cny: 1, hard_cap_nano_cny: null, version: 0,
+			}],                                                                    // version min 1
+			["admin.billing.adjust", { user_id: "u1", kind: "usage_debit",
+				amount_nano_cny: -5, reason: "r" }],                              // 枚举
+			["admin.billing.adjust", { user_id: "u1", kind: "grant",
+				amount_nano_cny: 0, reason: "r" }],                               // nonZero
+			["admin.billing.adjust", { user_id: "u1", kind: "grant",
+				amount_nano_cny: 5, reason: "" }],                                // reason minLength
+			["admin.invites.list", { q: "evil" }],                                // 未声明字段
+		];
+		for (let i = 0; i < bad.length; i++) {
+			handle._handleWindowMessage({
+				source: contentWindow,
+				data: requestEnv(nonce, "w-" + i, bad[i][0], bad[i][1]),
+			});
+		}
+		await ticks();
+		for (let i = 0; i < bad.length; i++) {
+			const rs = responses(posted, "w-" + i);
+			expect(rs, bad[i][0] + " #" + i).toHaveLength(1);
+			expect(rs[0].env.ok).toBe(false);
+			expect((rs[0].env.error as { code: string }).code).toBe("invalid_params");
+		}
+		// 参数门在 backend 之前：一次都没代理
+		expect(handle.stats().handled).toBe(0);
+	});
+
+	it("write methods require their admin:*:write permission", async () => {
+		const { handle, posted, contentWindow } = makeHost({
+			permissions: ["admin:users:read", "admin:billing:read"], // 无 write 权限
+			fetchJson: async () => ({ status: 200, ok: true, body: {} }),
+		});
+		handle._handleIframeLoad();
+		const nonce = nonce0(posted);
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r1", "admin.users.create",
+				{ login_id: "a@x.com", password: "longpass-12345" }),
+		});
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r2", "admin.billing.adjust",
+				{ user_id: "u1", kind: "grant", amount_nano_cny: 1, reason: "r" }),
+		});
+		await ticks();
+		expect((responses(posted, "r1")[0].env.error as { code: string }).code)
+			.toBe("permission_denied");
+		expect((responses(posted, "r2")[0].env.error as { code: string }).code)
+			.toBe("permission_denied");
+		expect(handle.stats().handled).toBe(0);
+	});
+
+	it("maps 409 version_conflict envelopes from caps updates", async () => {
+		const { handle, posted, contentWindow } = makeWriteHost(async () => ({
+			status: 409, ok: false,
+			body: { error: { code: "version_conflict", message: "stale" } },
+		}));
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.billing.account.updateCaps", {
+				user_id: "u1", soft_cap_nano_cny: 1, hard_cap_nano_cny: 2, version: 1,
+			}),
+		});
+		await ticks();
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(false);
+		expect((rs[0].env.error as { code: string }).code).toBe("version_conflict");
 	});
 });
 

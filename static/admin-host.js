@@ -20,13 +20,15 @@
      - 宿主用 fetch + CSRF cookie（与 app.js 同机制）请求 Admin API；**绝不**
        向 iframe 暴露 CSRF token / session 内容 / 通用 fetch 能力。
 
-   PR3a 只实现 admin.auth.get；PR3b（本版）补齐只读方法：overview.get /
+   PR3a 只实现 admin.auth.get；PR3b 补齐只读方法：overview.get /
    users.list / billing.account.get / billing.usage.list / billing.ledger.list /
    billing.providerBalance.get(+refresh) / audit.list / turnBudgets.get。
-   写方法（users.create/setEnabled/... invites/adjust/updateCaps）仍在表中
-   占位并稳定返回 not_implemented（PR5）。owner 回查带 5s 短 TTL 缓存（见
-   makeOwnerGuard——缓存只是省一次每消息 HTTP，服务端每 API 独立复核不受
-   影响；401 登出仍立即作废整个桥会话）。
+   PR5（本版）补齐全部写方法的后端映射与参数 schema：users.create/
+   setEnabled/setAiAccess/resetPassword、invites.list/create/revoke、
+   turnBudgets.update/newPeriod、billing.account.updateCaps、billing.adjust
+   （路径参数拒绝含 "/"；POST/PUT 均带 CSRF 双提交）。owner 回查带 5s 短
+   TTL 缓存（见 makeOwnerGuard——缓存只是省一次每消息 HTTP，服务端每 API
+   独立复核不受影响；401 登出仍立即作废整个桥会话）。
    ========================================================================= */
 (function () {
   "use strict";
@@ -70,10 +72,16 @@
   };
 
   // 参数 schema（§14.1：每方法白名单 + 类型/长度/枚举/范围；未声明属性
-  // 一律拒绝——iframe 不能借桥传任意字段）。未列出 schema 的方法（PR5 写
-  // 方法）仅要求 payload 是对象。
+  // 一律拒绝——iframe 不能借桥传任意字段）。PR5 写方法补齐 required（必填
+  // 字段缺键即拒）与 nonZero（manual_adjustment 金额非零）两类最小校验；
+  // 权威校验仍在服务端，这里只是桥层最小门。
   var _cursorSpec = { type: "string", maxLength: 512, nullable: true };
   var _limitSpec = { type: "integer", min: 1, max: 200 };
+  var _userIdSpec = { type: "string", minLength: 1, maxLength: 128 };
+  var _slugSpec = { type: "string", maxLength: 64, nullable: true };
+  var _budgetIntSpec = function (min) {
+    return { type: "integer", min: min, max: 1000000 };
+  };
   var METHOD_PARAM_SCHEMAS = {
     "admin.auth.get": { properties: {}, additionalProperties: false },
     "admin.overview.get": { properties: {}, additionalProperties: false },
@@ -126,6 +134,106 @@
       additionalProperties: false,
     },
     "admin.turnBudgets.get": { properties: {}, additionalProperties: false },
+
+    // ---- PR5 写方法（§9 Admin API v1 写端点；服务端 owner/CSRF 复核权威）----
+    "admin.users.create": {
+      properties: {
+        login_id: { type: "string", minLength: 1, maxLength: 120 },
+        password: { type: "string", minLength: 1, maxLength: 200 },
+        display_name: { type: "string", maxLength: 120, nullable: true },
+      },
+      required: ["login_id", "password"],
+      additionalProperties: false,
+    },
+    "admin.users.setEnabled": {
+      properties: { user_id: _userIdSpec, enabled: { type: "boolean" } },
+      required: ["user_id", "enabled"],
+      additionalProperties: false,
+    },
+    "admin.users.setAiAccess": {
+      properties: { user_id: _userIdSpec, enabled: { type: "boolean" } },
+      required: ["user_id", "enabled"],
+      additionalProperties: false,
+    },
+    "admin.users.resetPassword": {
+      properties: {
+        user_id: _userIdSpec,
+        password: { type: "string", minLength: 1, maxLength: 200 },
+      },
+      required: ["user_id", "password"],
+      additionalProperties: false,
+    },
+    "admin.invites.list": {
+      properties: { cursor: _cursorSpec, limit: _limitSpec },
+      additionalProperties: false,
+    },
+    "admin.invites.create": {
+      properties: {
+        login_id: { type: "string", maxLength: 120, nullable: true },
+        ttl_hours: { type: "integer", min: 1, max: 720 },
+        ai_access: { type: "boolean" },
+        cohort: { type: "string", maxLength: 64, nullable: true },
+        note: { type: "string", maxLength: 200, nullable: true },
+        source_code: _slugSpec,
+        campaign_id: _slugSpec,
+      },
+      additionalProperties: false,
+    },
+    "admin.invites.revoke": {
+      properties: { invite_id: { type: "string", minLength: 1, maxLength: 128 } },
+      required: ["invite_id"],
+      additionalProperties: false,
+    },
+    // turn 预算限制字段（与服务端 _BUDGET_SETTINGS_FIELDS 同源；0 仅对
+    // demo_turn_limit/owner_reserved_turn_limit/user_pool_turn_limit 合法=关闭子池）
+    "admin.turnBudgets.update": {
+      properties: {
+        platform_turn_limit: _budgetIntSpec(1),
+        demo_turn_limit: _budgetIntSpec(0),
+        user_turn_limit: _budgetIntSpec(1),
+        owner_reserved_turn_limit: _budgetIntSpec(0),
+        user_pool_turn_limit: _budgetIntSpec(0),
+        platform_task_max_steps: _budgetIntSpec(1),
+        own_task_max_steps_limit: _budgetIntSpec(1),
+        demo_task_max_steps: _budgetIntSpec(1),
+        demo_enabled: { type: "boolean" },
+        demo_per_browser_limit: _budgetIntSpec(1),
+        demo_max_concurrency: _budgetIntSpec(1),
+      },
+      additionalProperties: false,
+    },
+    // confirm 由桥层固定置 true（插件的危险操作二次确认在 UI 层做，§3.3）
+    "admin.turnBudgets.newPeriod": {
+      properties: { limits: { type: "object", nullable: true } },
+      additionalProperties: false,
+    },
+    "admin.billing.account.updateCaps": {
+      properties: {
+        user_id: _userIdSpec,
+        // null = 清除该上限（§9）；非空须为非负整数
+        soft_cap_nano_cny: { type: "integer", min: 0, nullable: true },
+        hard_cap_nano_cny: { type: "integer", min: 0, nullable: true },
+        version: { type: "integer", min: 1 },
+      },
+      required: ["user_id", "soft_cap_nano_cny", "hard_cap_nano_cny", "version"],
+      additionalProperties: false,
+    },
+    "admin.billing.adjust": {
+      properties: {
+        user_id: _userIdSpec,
+        kind: {
+          type: "string",
+          enum: ["grant", "topup", "refund", "manual_adjustment"],
+        },
+        amount_nano_cny: { type: "integer", nonZero: true },
+        reason: { type: "string", minLength: 1, maxLength: 500 },
+        idempotency_key: {
+          type: "string", minLength: 1, maxLength: 128, nullable: true,
+        },
+      },
+      required: ["user_id", "kind", "amount_nano_cny", "reason"],
+      additionalProperties: false,
+    },
   };
 
   // ---- 工具 ----
@@ -144,25 +252,30 @@
     return diff === 0;
   }
 
-  // 单值校验：类型（string/integer/boolean）+ maxLength + enum + min/max。
-  // null 只在显式 nullable 时接受（游标翻页用「缺键」表达，不用 null）。
+  // 单值校验：类型（string/integer/boolean/object）+ minLength/maxLength +
+  // enum + min/max + nonZero。null 只在显式 nullable 时接受（caps 的
+  // null=清除是唯一合法 null 语义；游标翻页用「缺键」表达，不用 null）。
   function validateValue(value, spec) {
     if (value === undefined) return false;
     if (value === null) return spec.nullable === true;
     switch (spec.type) {
       case "string":
         if (typeof value !== "string") return false;
+        if (spec.minLength !== undefined && value.length < spec.minLength) return false;
         if (spec.maxLength && value.length > spec.maxLength) return false;
         if (spec.enum && spec.enum.indexOf(value) === -1) return false;
         return true;
       case "integer":
         if (typeof value !== "number" || !isFinite(value) ||
             Math.floor(value) !== value) return false;
+        if (spec.nonZero && value === 0) return false;
         if (spec.min !== undefined && value < spec.min) return false;
         if (spec.max !== undefined && value > spec.max) return false;
         return true;
       case "boolean":
         return typeof value === "boolean";
+      case "object":
+        return typeof value === "object" && !Array.isArray(value);
       default:
         return true;
     }
@@ -172,8 +285,12 @@
     if (payload == null) payload = {};
     if (typeof payload !== "object" || Array.isArray(payload)) return false;
     var schema = METHOD_PARAM_SCHEMAS[method];
-    if (!schema) return true; // 未声明 schema（PR5 写方法）：仅要求对象形态
+    if (!schema) return true; // 未声明 schema：仅要求对象形态
     var props = schema.properties || {};
+    var required = schema.required || [];
+    for (var r = 0; r < required.length; r++) {
+      if (!(required[r] in payload)) return false;
+    }
     for (var k in payload) {
       if (!Object.prototype.hasOwnProperty.call(payload, k)) continue;
       if (!(k in props)) {
@@ -299,6 +416,32 @@
     };
   }
 
+  // PR5 写端点路径参数：encodeURIComponent + 拒绝空值/含 "/" 或 "?" 的值
+  // （防 iframe 借 user_id/invite_id 拼出任意后端路径）。
+  function pathId(value, field) {
+    var s = String(value == null ? "" : value);
+    if (!s || s.indexOf("/") !== -1 || s.indexOf("?") !== -1) {
+      throw { code: "invalid_params",
+              message: field + " 非法（不能为空或含路径分隔符）" };
+    }
+    return encodeURIComponent(s);
+  }
+
+  // PR5 写端点通用 POST/PUT JSON 调用（makeFetchJson 对非安全方法自动附
+  // CSRF 双提交 header；错误信封映射同只读方法）。
+  function jsonWrite(url, method, body) {
+    return function (ctx) {
+      return ctx.fetchJson(url, {
+        method: method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body === undefined ? {} : body),
+      }).then(function (res) {
+        if (!res.ok) throw backendError(url, res);
+        return res.body;
+      });
+    };
+  }
+
   var METHOD_BACKENDS = {
     "admin.auth.get": function (ctx) {
       return ctx.fetchJson("/api/auth/info").then(function (res) {
@@ -400,9 +543,93 @@
       });
     },
 
-    // PR5 写方法（users.create/setEnabled/setAiAccess/resetPassword、
-    // invites.*、turnBudgets.update/newPeriod、billing.account.updateCaps/
-    // adjust）在此追加实现。
+    // ---- PR5 写方法 → Admin API v1 写端点（POST/PUT 走 makeFetchJson 的
+    // CSRF 双提交；路径参数必须 encodeURIComponent 且拒绝含 "/" 的值，防止
+    // iframe 借 user_id/invite_id 拼出任意路径）----
+    "admin.users.create": function (ctx, payload) {
+      return jsonWrite("/api/admin/v1/users", "POST", {
+        login_id: payload.login_id,
+        password: payload.password,
+        display_name: payload.display_name,
+      })(ctx);
+    },
+
+    "admin.users.setEnabled": function (ctx, payload) {
+      var url = "/api/admin/v1/users/" + pathId(payload.user_id, "user_id") +
+          (payload.enabled ? "/enable" : "/disable");
+      return jsonWrite(url, "POST", {})(ctx);
+    },
+
+    "admin.users.setAiAccess": function (ctx, payload) {
+      var url = "/api/admin/v1/users/" + pathId(payload.user_id, "user_id") +
+          "/ai-access";
+      return jsonWrite(url, "POST", { enabled: !!payload.enabled })(ctx);
+    },
+
+    "admin.users.resetPassword": function (ctx, payload) {
+      var url = "/api/admin/v1/users/" + pathId(payload.user_id, "user_id") +
+          "/password-reset";
+      return jsonWrite(url, "POST", { password: payload.password })(ctx);
+    },
+
+    "admin.invites.list": function (ctx, payload) {
+      var url = "/api/admin/v1/invites" + buildQuery({
+        cursor: payload.cursor, limit: payload.limit,
+      });
+      return ctx.fetchJson(url).then(function (res) {
+        if (!res.ok) throw backendError(url, res);
+        return res.body;
+      });
+    },
+
+    "admin.invites.create": function (ctx, payload) {
+      return jsonWrite("/api/admin/v1/invites", "POST", {
+        login_id: payload.login_id,
+        ttl_hours: payload.ttl_hours,
+        ai_access: payload.ai_access,
+        cohort: payload.cohort,
+        note: payload.note,
+        source_code: payload.source_code,
+        campaign_id: payload.campaign_id,
+      })(ctx);
+    },
+
+    "admin.invites.revoke": function (ctx, payload) {
+      var url = "/api/admin/v1/invites/" + pathId(payload.invite_id, "invite_id") +
+          "/revoke";
+      return jsonWrite(url, "POST", {})(ctx);
+    },
+
+    "admin.turnBudgets.update": function (ctx, payload) {
+      // schema 已白名单限制为 _BUDGET_SETTINGS_FIELDS 子集，原样透传
+      return jsonWrite("/api/admin/v1/turn-budgets", "PUT", payload)(ctx);
+    },
+
+    "admin.turnBudgets.newPeriod": function (ctx, payload) {
+      return jsonWrite("/api/admin/v1/turn-budgets/new-period", "POST", {
+        confirm: true, limits: payload.limits,
+      })(ctx);
+    },
+
+    "admin.billing.account.updateCaps": function (ctx, payload) {
+      var url = "/api/admin/v1/billing/accounts/" +
+          pathId(payload.user_id, "user_id") + "/caps";
+      return jsonWrite(url, "PUT", {
+        soft_cap_nano_cny: payload.soft_cap_nano_cny,
+        hard_cap_nano_cny: payload.hard_cap_nano_cny,
+        version: payload.version,
+      })(ctx);
+    },
+
+    "admin.billing.adjust": function (ctx, payload) {
+      return jsonWrite("/api/admin/v1/billing/adjustments", "POST", {
+        user_id: payload.user_id,
+        kind: payload.kind,
+        amount_nano_cny: payload.amount_nano_cny,
+        reason: payload.reason,
+        idempotency_key: payload.idempotency_key,
+      })(ctx);
+    },
   };
 
   // ---- 桥实例 ----
@@ -539,7 +766,7 @@
         }
         var backend = METHOD_BACKENDS[env.method];
         if (!backend) {
-          // 本批未实现：稳定错误码，PR3b 填实现
+          // 防御性兜底：METHOD_PERMISSIONS 有映射但缺 backend 实现时稳定报错
           finish(false, { code: "not_implemented", message: env.method + " 尚未实现" });
           return;
         }
@@ -627,6 +854,19 @@
   function boot(win, doc) {
     var iframe = doc.getElementById && doc.getElementById("admin-plugin-frame");
     if (!iframe) return null;
+    // 深链支持（PR5 /admin/registration → /admin#invites 兼容）：把宿主页的
+    // #<page> 透传到 iframe 自身 URL 的 hash——opaque iframe 读不到父页
+    // location，插件初始化时按自己的 location.hash 选起始页。hash 形态严格
+    // 白名单（# + 页面 slug），不回显任何其他内容。
+    try {
+      var deepLink = (win.location && win.location.hash) || "";
+      if (/^#[a-z][a-z0-9_-]{0,31}$/.test(deepLink)) {
+        var baseSrc = iframe.getAttribute("src");
+        if (baseSrc && baseSrc.indexOf("#") === -1) {
+          iframe.setAttribute("src", baseSrc + deepLink);
+        }
+      }
+    } catch (e) { /* 读不到 location/hash：保持原 src */ }
     var perms = [];
     try {
       perms = JSON.parse(iframe.getAttribute("data-admin-permissions") || "[]");

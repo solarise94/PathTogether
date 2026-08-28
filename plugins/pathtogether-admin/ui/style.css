@@ -93,3 +93,53 @@ body {
 .adm-alerts { list-style: none; font-size: 13px; color: var(--danger); }
 .adm-alerts li { padding: 6px 0; line-height: 1.6; word-break: break-all; }
 .adm-alerts li::before { content: "⚠ "; }
+
+/* ---- PR5 写操作：表单 / 行内按钮 / 页内确认条 / 一次性 token ---- */
+.adm-form { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+.adm-form input, .adm-form select {
+  font-size: 13px; padding: 6px 10px; border-radius: 8px;
+  border: 1px solid var(--separator); background: #fff; color: var(--text);
+  min-width: 180px; flex: 0 1 auto;
+}
+.adm-form button, .adm-confirm button, .adm-actions-cell button {
+  font-size: 13px; padding: 6px 14px; border-radius: 8px;
+  border: 1px solid var(--accent); background: var(--accent); color: #fff;
+  cursor: pointer;
+}
+.adm-btn-danger {
+  border-color: var(--danger) !important; background: var(--danger) !important;
+}
+.adm-check {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 13px; color: var(--text-2);
+}
+.adm-check input { min-width: 0; width: auto; }
+
+/* 页内二次确认条（sandbox 无 allow-modals，window.confirm 不可用） */
+.adm-confirm {
+  display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  background: rgba(255, 59, 48, 0.06); border: 1px solid rgba(255, 59, 48, 0.35);
+  border-radius: 10px; padding: 10px 12px; margin: 10px 0;
+}
+.adm-confirm-text { font-size: 13px; color: var(--danger); word-break: break-all; }
+.adm-confirm input {
+  font-size: 13px; padding: 6px 10px; border-radius: 8px;
+  border: 1px solid var(--separator); background: #fff; min-width: 200px;
+}
+
+.adm-actions-cell button {
+  font-size: 12px; padding: 3px 8px; margin: 2px 4px 2px 0;
+  border: 1px solid var(--separator); background: var(--card); color: var(--text);
+  white-space: nowrap;
+}
+
+/* 邀请码一次性展示（仅创建响应携带；刷新即失） */
+.adm-token-once {
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  background: rgba(0, 122, 255, 0.06); border: 1px dashed var(--accent);
+  border-radius: 10px; padding: 10px 12px; margin-top: 8px;
+}
+.adm-token-once code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px; word-break: break-all;
+}

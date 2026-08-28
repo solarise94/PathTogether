@@ -1128,15 +1128,19 @@ def test_demo_js_event_reset_uses_snapshot_not_second_stream():
 
 
 def test_demo_html_owner_admin_reset_bar_not_in_product_ui():
-    """黑色 Admin 用量栏不得进入普通 Demo；owner 诊断留在正式版 AI 预算区。"""
+    """黑色 Admin 用量栏不得进入普通 Demo；owner 诊断已迁入 admin 插件（PR5）。"""
     root = Path(__file__).resolve().parent.parent
     demo = (root / "templates" / "demo.html").read_text(encoding="utf-8")
     shell = (root / "templates" / "_app_shell.html").read_text(encoding="utf-8")
+    plugin_ui = (root / "plugins" / "pathtogether-admin" / "ui"
+                 / "index.html").read_text(encoding="utf-8")
     assert 'id="demo-admin-bar"' not in demo
     assert 'id="demo-admin-reset"' not in demo
     assert 'id="demo-admin-usage"' not in demo
     assert 'id="demo-admin-bar"' not in shell
-    assert 'id="aibudget-reset-btn"' in shell
+    # 旧侧栏 AI 预算区已删（PR5 UI parity 完成）；开新周期按钮只在 admin 插件
+    assert 'id="aibudget-reset-btn"' not in shell
+    assert 'id="adm-turn-newperiod-btn"' in plugin_ui
 
 
 def test_demo_uses_shared_shell_not_separate_product():
@@ -1258,7 +1262,8 @@ def test_official_template_keeps_write_ops_and_budget_diag():
         )
     assert 'id="upload-btn"' in html
     assert 'id="ai-config-wrap"' in html
-    assert 'id="aibudget-reset-btn"' in html
+    # PR5：旧侧栏 AI 预算区已删（管理动作迁入 admin 插件）
+    assert 'id="aibudget-reset-btn"' not in html
     assert 'src="/static/app.js' in html
     assert 'data-i18n="demo.badge"' not in html
 

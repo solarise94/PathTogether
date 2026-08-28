@@ -36,6 +36,7 @@ import psycopg
 import billing_pricing
 import pg_store
 import platform_features
+import share_store_pg
 
 # --------------------------------------------------------------------------- #
 # 常量
@@ -186,6 +187,24 @@ class BillingAccountExistsError(BillingError):
     """用户已有 billing account（user_id UNIQUE）。"""
 
     code = "billing_account_exists"
+
+
+class BillingAccountNotFoundError(BillingError):
+    """目标用户尚未开户（§9：不伪造 0 余额账户，refund/manual_adjustment 不隐式开户）。"""
+
+    code = "billing_account_not_found"
+
+
+class BillingCapsVersionConflictError(BillingError):
+    """caps CAS 更新未命中（客户端携带的 version 已过期；不做 last-write-wins）。"""
+
+    code = "version_conflict"
+
+
+class BillingIdempotencyKeyConflictError(BillingError):
+    """idempotency_key 已被其他账户/参数占用（不是同请求重放）。"""
+
+    code = "idempotency_key_conflict"
 
 
 def _connect():
@@ -1026,6 +1045,262 @@ def account_balance_nano(account_id):
                 if cur.fetchone() is None:
                     return None
         return bal
+    finally:
+        conn.close()
+
+
+#: 人工调账允许的 kind（§9：grant/topup/refund 为正，manual_adjustment 非零；
+#: usage_debit/expiry 不经 admin 调账入口——影子阶段无 debit，PR6 走受控路径）
+ADJUSTMENT_KINDS = ("grant", "topup", "refund", "manual_adjustment")
+
+#: 人工调账 reason 长度上限（§9：必填非空，上限 500）
+ADJUSTMENT_REASON_MAX_LENGTH = 500
+
+#: 同事务写 audit 的动作名（detail 不含敏感字段；idempotency_key 在 admin v1
+#: 出口只保留后 8 字符，§10.5）
+CAPS_AUDIT_ACTION = "billing.caps_update"
+ADJUST_AUDIT_ACTION = "billing.adjust"
+
+_ACCOUNT_SEL = ("account_id, user_id, currency, status, "
+                "soft_spend_cap_nano, hard_spend_cap_nano, version, "
+                "extract(epoch from created_at)::float8 AS created_at, "
+                "extract(epoch from updated_at)::float8 AS updated_at")
+
+
+def _validate_cap_value(value, field):
+    """cap 值校验：None=清除（§9）；否则须为 ≥0 整数（不接受 bool）。"""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("%s 需为非负整数或 null" % field)
+    if value < 0:
+        raise ValueError("%s 需为非负整数（nano-CNY）" % field)
+    return value
+
+
+def update_account_caps(user_id, soft_cap_nano, hard_cap_nano, expected_version,
+                        *, actor_user_id, audit_detail=None):
+    """CAS 更新账户 soft/hard spend cap，与 audit 同一事务（§9 caps 规则）。
+
+    语义（PR5，方案 §9）：
+      - ``soft_cap_nano`` / ``hard_cap_nano``：``None``=清除该上限；非空须为
+        ≥0 整数；两者同存须 ``soft <= hard``；
+      - ``expected_version``：客户端携带的当前 ``billing_accounts.version``，
+        ``UPDATE ... WHERE version=%s`` 命中后 version+1；0 行命中抛
+        :class:`BillingCapsVersionConflictError`（409，不做 last-write-wins）；
+      - 未开户抛 :class:`BillingAccountNotFoundError`（404，绝不隐式开户）；
+      - audit 经 :func:`share_store_pg.record_audit_tx` 在**同一事务**内写入，
+        失败随事务回滚（审计不丢原则，PR2 已确立）。
+
+    返回 ``{"account": <更新后账户行>, "balance_nano": <同事务余额合计>}``。
+    """
+    platform_features.require_pg_backend("billing")
+    soft = _validate_cap_value(soft_cap_nano, "soft_cap_nano_cny")
+    hard = _validate_cap_value(hard_cap_nano, "hard_cap_nano_cny")
+    if soft is not None and hard is not None and soft > hard:
+        raise ValueError("soft_cap_nano_cny 不可大于 hard_cap_nano_cny")
+    if isinstance(expected_version, bool) or not isinstance(expected_version, int):
+        raise ValueError("version 需为整数")
+    if expected_version < 1:
+        raise ValueError("version 需为正整数")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT account_id FROM billing_accounts WHERE user_id=%s",
+                    (user_id,))
+                row = cur.fetchone()
+                if row is None:
+                    raise BillingAccountNotFoundError(
+                        "该用户尚未开户（caps 更新不隐式开户）", user_id=user_id)
+                account_id = row["account_id"]
+                cur.execute(
+                    "UPDATE billing_accounts SET soft_spend_cap_nano=%s, "
+                    "hard_spend_cap_nano=%s, version=version+1, updated_at=now() "
+                    "WHERE account_id=%s AND version=%s",
+                    (soft, hard, account_id, expected_version))
+                if cur.rowcount != 1:
+                    raise BillingCapsVersionConflictError(
+                        "caps 版本冲突（数据已被他人修改，请刷新后重试）",
+                        user_id=user_id, expected_version=expected_version)
+                cur.execute("SELECT " + _ACCOUNT_SEL +
+                            " FROM billing_accounts WHERE account_id=%s",
+                            (account_id,))
+                account = dict(cur.fetchone())
+                cur.execute(
+                    "SELECT COALESCE(SUM(amount_nano_cny), 0)::bigint AS bal "
+                    "FROM billing_ledger_entries WHERE account_id=%s",
+                    (account_id,))
+                balance = int(cur.fetchone()["bal"])
+                detail = dict(audit_detail or {})
+                detail.setdefault("user_id", user_id)
+                detail.update({
+                    "soft_cap_nano": soft,
+                    "hard_cap_nano": hard,
+                    "previous_version": expected_version,
+                    "new_version": account["version"],
+                })
+                share_store_pg.record_audit_tx(
+                    cur, CAPS_AUDIT_ACTION,
+                    actor_user_id=actor_user_id, actor_role="owner",
+                    target_type="billing_account", target_id=account_id,
+                    detail=detail)
+        return {"account": account, "balance_nano": balance}
+    finally:
+        conn.close()
+
+
+def _entry_sel(prefix=""):
+    return (prefix + "entry_id, account_id, event_id, kind, amount_nano_cny, "
+            "idempotency_key, reason, actor_user_id, "
+            "extract(epoch from created_at)::float8 AS created_at")
+
+
+def apply_billing_adjustment(user_id, kind, amount_nano_cny, reason,
+                             idempotency_key, *, actor_user_id,
+                             audit_detail=None):
+    """人工调账入账（grant/topup/refund/manual_adjustment），与 audit 同一事务。
+
+    语义（§9 + §12.2 Phase B）：
+      - grant/topup：用户尚无账户时**同事务显式开户**后入账（并发开户用
+        SAVEPOINT 吸收 UniqueViolation 后改读既有行）；
+      - refund/manual_adjustment：未开户抛
+        :class:`BillingAccountNotFoundError`（404，不隐式开户）；
+      - 符号先在路由层校验（400），DB CHECK 兜底；本函数同样先验（防御
+        直调路径）：grant/topup/refund 必须 >0，manual_adjustment ≠0；
+      - ``reason`` 必填非空（trim 后 ≥1），上限 500；``idempotency_key``
+        必填非空（路由层缺省生成 ``adj_<hex>``）；
+      - ``idempotency_key`` 重放：返回原 entry + ``duplicate=True``，不重复
+        入账、不重复写 audit；key 已被**不同账户或不同参数**（kind/金额/
+        reason 任一不一致）的请求占用抛
+        :class:`BillingIdempotencyKeyConflictError`（409）；
+      - ledger 入账 + audit 同一事务（record_audit_tx 失败即整体回滚）。
+
+    返回 ``{"entry": <entry 行>, "duplicate": bool, "balance_nano": int,
+    "account": <账户行>}``。
+    """
+    platform_features.require_pg_backend("billing")
+    if kind not in ADJUSTMENT_KINDS:
+        raise ValueError("kind 需为 %s" % (ADJUSTMENT_KINDS,))
+    if isinstance(amount_nano_cny, bool) or not isinstance(amount_nano_cny, int):
+        raise ValueError("amount_nano_cny 需为整数（nano-CNY）")
+    if kind in ("grant", "topup", "refund") and amount_nano_cny <= 0:
+        raise ValueError("%s 金额必须为正数（nano-CNY）" % kind)
+    if kind == "manual_adjustment" and amount_nano_cny == 0:
+        raise ValueError("manual_adjustment 金额不可为 0")
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValueError("reason 必填（不可为空白）")
+    if len(reason) > ADJUSTMENT_REASON_MAX_LENGTH:
+        raise ValueError("reason 上限 %d 字符" % ADJUSTMENT_REASON_MAX_LENGTH)
+    if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+        raise ValueError("idempotency_key 必填（路由层缺省生成）")
+
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT account_id FROM billing_accounts WHERE user_id=%s",
+                    (user_id,))
+                row = cur.fetchone()
+                if row is None:
+                    if kind not in ("grant", "topup"):
+                        raise BillingAccountNotFoundError(
+                            "该用户尚未开户（%s 不隐式开户）" % kind,
+                            user_id=user_id)
+                    # 首次 grant/topup 显式开户（§9）。并发竞态：对方先提交同
+                    # user_id 账户 → INSERT 抛 UniqueViolation，rollback 到
+                    # savepoint 恢复事务后改读既有行（pg_store.transaction 无
+                    # 自动 savepoint，失败语句会置 aborted，先例见 ingest）。
+                    cur.execute("SAVEPOINT sp_adjust_open_account")
+                    try:
+                        cur.execute(
+                            "INSERT INTO billing_accounts (account_id, user_id) "
+                            "VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING "
+                            "RETURNING account_id",
+                            ("bac_" + secrets.token_hex(12), user_id))
+                        opened = cur.fetchone()
+                    except psycopg.errors.UniqueViolation:
+                        cur.execute(
+                            "ROLLBACK TO SAVEPOINT sp_adjust_open_account")
+                        cur.execute(
+                            "SELECT account_id FROM billing_accounts "
+                            "WHERE user_id=%s", (user_id,))
+                        opened = cur.fetchone()
+                    if opened is None:  # ON CONFLICT DO NOTHING 未插入
+                        cur.execute(
+                            "SELECT account_id FROM billing_accounts "
+                            "WHERE user_id=%s", (user_id,))
+                        opened = cur.fetchone()
+                    account_id = opened["account_id"]
+                else:
+                    account_id = row["account_id"]
+
+                entry_id = _LEDGER_ENTRY_ID_PREFIX + secrets.token_hex(12)
+                # ON CONFLICT DO NOTHING 不置 aborted，可直接重读原行判重放
+                cur.execute(
+                    "INSERT INTO billing_ledger_entries "
+                    "(entry_id, account_id, event_id, kind, amount_nano_cny, "
+                    " idempotency_key, reason, actor_user_id, metadata) "
+                    "VALUES (%s,%s,NULL,%s,%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (idempotency_key) DO NOTHING "
+                    "RETURNING " + _entry_sel(),
+                    (entry_id, account_id, kind, int(amount_nano_cny),
+                     idempotency_key, reason, actor_user_id,
+                     psycopg.types.json.Jsonb({})))
+                new_row = cur.fetchone()
+                duplicate = new_row is None
+                if duplicate:
+                    cur.execute(
+                        "SELECT " + _entry_sel() +
+                        " FROM billing_ledger_entries "
+                        "WHERE idempotency_key=%s", (idempotency_key,))
+                    existing = dict(cur.fetchone())
+                    existing["amount_nano_cny"] = int(existing["amount_nano_cny"])
+                    # 真重放 = 同 key 且请求载荷逐项一致；同 key 不同载荷是
+                    # 客户端 bug 或伪造重放，必须 409 而非静默返回原行（与
+                    # ingest payload_hash 冲突同原则，防止金额被张冠李戴）。
+                    if (existing["account_id"] != account_id
+                            or existing["kind"] != kind
+                            or existing["amount_nano_cny"] != int(amount_nano_cny)
+                            or existing["reason"] != reason):
+                        raise BillingIdempotencyKeyConflictError(
+                            "idempotency_key 已被不同参数的调账使用",
+                            user_id=user_id)
+                    entry = existing
+                else:
+                    entry = dict(new_row)
+                    entry["amount_nano_cny"] = int(entry["amount_nano_cny"])
+
+                cur.execute(
+                    "SELECT COALESCE(SUM(amount_nano_cny), 0)::bigint AS bal "
+                    "FROM billing_ledger_entries WHERE account_id=%s",
+                    (account_id,))
+                balance = int(cur.fetchone()["bal"])
+                cur.execute("SELECT " + _ACCOUNT_SEL +
+                            " FROM billing_accounts WHERE account_id=%s",
+                            (account_id,))
+                account = dict(cur.fetchone())
+                if not duplicate:
+                    # 重放不重复写 audit（entry 只有一条，audit 与之一一对应）
+                    detail = dict(audit_detail or {})
+                    detail.setdefault("user_id", user_id)
+                    detail.update({
+                        "kind": kind,
+                        "amount_nano_cny": int(amount_nano_cny),
+                        "reason": reason,
+                        "idempotency_key": idempotency_key,
+                        "balance_after_nano": balance,
+                    })
+                    share_store_pg.record_audit_tx(
+                        cur, ADJUST_AUDIT_ACTION,
+                        actor_user_id=actor_user_id, actor_role="owner",
+                        target_type="billing_account", target_id=account_id,
+                        detail=detail)
+        return {"entry": entry, "duplicate": duplicate,
+                "balance_nano": balance, "account": account}
     finally:
         conn.close()
 

@@ -90,11 +90,10 @@ describe("admin identity preview UI", () => {
 		});
 		expect(h.els["preview-banner"].hidden).toBe(false);
 		expect(h.els["preview-banner-text"].textContent).toContain("user@x.com");
-		expect(h.els["users-mgr-section"].hidden).toBe(true);
 		expect(h.els["logout-btn"].hidden).toBe(true);
 	});
 
-	it("非预览 owner 显示用户管理、隐藏 banner", () => {
+	it("非预览 owner 隐藏 banner（用户管理 UI 已迁入 admin 插件，PR5）", () => {
 		const h = loadApp();
 		h.applyAuthInfo({
 			auth_enabled: true,
@@ -105,6 +104,5 @@ describe("admin identity preview UI", () => {
 			preview: null,
 		});
 		expect(h.els["preview-banner"].hidden).toBe(true);
-		expect(h.els["users-mgr-section"].hidden).toBe(false);
 	});
 });

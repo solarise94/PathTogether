@@ -6,23 +6,26 @@
   <meta name="referrer" content="no-referrer">
   <title>PathTogether Admin</title>
   <!--
-    pathtogether-admin 插件 UI（PR3b 只读版，docs/admin-billing-plugin-
-    implementation-plan.md §10）。
+    pathtogether-admin 插件 UI（PR3b 只读 + PR5 写操作，docs/admin-billing-
+    plugin-implementation-plan.md §10）。
 
     运行环境：/admin 宿主页的 <iframe sandbox="allow-scripts"> 内 —— opaque origin：
       - 不能读写 localStorage/cookie（也绝不尝试）；
       - 不能直接 fetch 平台 API（同源 fetch 被 sandbox 阻断）；
       - 一切平台数据经 AdminBridge postMessage 通道（static/admin-host.js 宿主侧）；
-      - 全部页面状态只在内存（当前页/筛选/分页游标），刷新即回概览首页。
+      - 全部页面状态只在内存（当前页/筛选/分页游标），刷新即回概览首页；
+      - sandbox 无 allow-modals：window.confirm/prompt 被浏览器静默吞掉，
+        危险操作的二次确认一律用页内确认条（§3.3 红线不因此放松）。
 
-    页面（§10.1/§10.2/§10.3/§10.4/§10.5 只读部分）：
+    页面（§10.1–§10.5）：
       - 概览：用户计数 + 双额度并列（「对话额度」与「金额余额」分开标注，
         §10.1 红线）+ cache 命中率 + provider 余额 + unpriced/lag；
-      - 用户：只读表格（操作按钮 PR5 实现）；
-      - 邀请与来源（PR4）：注册模式 + campaign 漏斗 + 用户来源明细
-        （first/last touch 分列；邀请创建/撤销按钮 PR5）；
-      - 额度与账单：turn 预算卡 + usage 明细（筛选/unpriced 单独告警）+
-        ledger 只读表 + provider 余额卡（手动刷新）；
+      - 用户（PR5）：创建用户 + 启停 / AI access / 重置密码（仅普通用户）/
+        打开账本；
+      - 邀请与来源（PR4+PR5）：注册模式展示 + 邀请创建/撤销 + campaign 漏斗
+        + 用户来源明细（first/last touch 分列）；
+      - 额度与账单（PR5）：turn 预算编辑 + 开新周期 + caps 编辑器（null=清除、
+        版本 CAS）+ 人工调整（原因必填）+ usage/ledger 只读 + provider 余额；
       - 审计：表格（detail 已由服务端脱敏）。
 
     只加载相对路径 style.css / main.js（owner-only 的
@@ -74,11 +77,22 @@
       </section>
     </section>
 
-    <!-- 用户（§10.2 只读） -->
+    <!-- 用户（§10.2；PR5 写操作） -->
     <section class="adm-page" id="adm-page-users" hidden>
       <section class="adm-card">
-        <h2>用户（只读）</h2>
-        <p class="adm-note">操作（启停 / AI access / 重置密码 / 账本）在 PR5 提供写方法后开放；「金额余额」为 null 表示尚未开户。</p>
+        <h2>创建用户（role=user）</h2>
+        <p class="adm-note">初始密码 ≥15 位，由 owner 线下告知用户；经本表创建的账户与旧入口语义一致（不会创建 owner）。</p>
+        <div class="adm-form" id="adm-users-create-form">
+          <input type="text" id="adm-users-new-login" placeholder="登录账号（login_id）" maxlength="120" autocomplete="off">
+          <input type="text" id="adm-users-new-display" placeholder="显示名（可选，仅展示）" maxlength="120" autocomplete="off">
+          <input type="password" id="adm-users-new-password" placeholder="初始密码（≥15 位）" minlength="15" maxlength="200" autocomplete="new-password">
+          <button type="button" id="adm-users-create-btn">创建用户</button>
+        </div>
+        <p class="adm-status" id="adm-users-create-status"></p>
+      </section>
+      <section class="adm-card">
+        <h2>用户</h2>
+        <p class="adm-note">「金额余额」为 null 表示尚未开户；owner 行不提供禁用/重置（break-glass 不变量，服务端同样拒绝）。</p>
         <div class="adm-filters" id="adm-users-filters">
           <input type="search" id="adm-users-q" placeholder="搜索 login ID / 显示名" maxlength="128">
           <select id="adm-users-enabled">
@@ -100,12 +114,13 @@
                 <th>显示名</th><th>登录账号</th><th>角色</th><th>状态</th>
                 <th>AI access</th><th>创建时间</th><th>注册方式</th>
                 <th>对话额度（用/上限）</th><th>金额余额（nano）</th>
-                <th>soft/hard cap</th><th>最近 AI 调用</th>
+                <th>soft/hard cap</th><th>最近 AI 调用</th><th>操作</th>
               </tr>
             </thead>
             <tbody id="adm-users-tbody"></tbody>
           </table>
         </div>
+        <div class="adm-confirm" id="adm-users-confirm" hidden></div>
         <div class="adm-pager">
           <button type="button" id="adm-users-more-btn">加载更多</button>
           <span id="adm-users-status" class="adm-status"></span>
@@ -113,12 +128,51 @@
       </section>
     </section>
 
-    <!-- 邀请与来源（§10.3 只读部分，PR4） -->
+    <!-- 邀请与来源（§10.3；PR5 补邀请创建/撤销） -->
     <section class="adm-page" id="adm-page-invites" hidden>
       <section class="adm-card">
         <h2>注册模式</h2>
-        <p class="adm-note">当前生效的注册模式（closed / invite_only）；切换仍走 Viewer 侧旧设置入口，写操作在 PR5 迁入。</p>
+        <p class="adm-note">当前生效的注册模式（closed / invite_only）。模式切换未纳入 AdminBridge 方法表（§8.4），本页仅展示；切换仍走平台设置 API。</p>
         <dl id="adm-acq-mode" class="adm-kv"></dl>
+      </section>
+      <section class="adm-card">
+        <h2>创建邀请（一次性邀请码）</h2>
+        <p class="adm-note">绑定登录账号留空 = 不绑定邀请（高风险）；明文邀请码仅创建响应展示一次，库内只存 hash。campaign_id 必须是已登记的 campaign（slug）。</p>
+        <div class="adm-form" id="adm-invite-create-form">
+          <input type="text" id="adm-invite-login" placeholder="绑定登录账号（可选）" maxlength="120" autocomplete="off">
+          <input type="number" id="adm-invite-ttl" placeholder="有效期（小时，1–720）" min="1" max="720" value="168">
+          <label class="adm-check"><input type="checkbox" id="adm-invite-ai"> 兑换用户默认开通 AI access</label>
+          <input type="text" id="adm-invite-cohort" placeholder="cohort（可选，≤64 字符）" maxlength="64" autocomplete="off">
+          <input type="text" id="adm-invite-note" placeholder="备注（可选，≤200 字符）" maxlength="200" autocomplete="off">
+          <input type="text" id="adm-invite-source" placeholder="source_code（可选 slug：a-z0-9_-）" maxlength="64" autocomplete="off">
+          <input type="text" id="adm-invite-campaign" placeholder="campaign_id（可选，须已登记）" maxlength="64" autocomplete="off">
+          <button type="button" id="adm-invite-create-btn">创建邀请</button>
+        </div>
+        <p class="adm-status" id="adm-invite-create-status"></p>
+        <div class="adm-token-once" id="adm-invite-token-box" hidden>
+          <code id="adm-invite-token"></code>
+          <button type="button" id="adm-invite-token-copy">复制</button>
+        </div>
+      </section>
+      <section class="adm-card">
+        <h2>邀请列表</h2>
+        <p class="adm-note">登录账号仅显示掩码；token/hash 永不返回。已消费邀请不可撤销。</p>
+        <div class="adm-table-wrap">
+          <table class="adm-table" id="adm-invites-table">
+            <thead>
+              <tr>
+                <th>invite</th><th>绑定账号</th><th>AI</th><th>cohort</th>
+                <th>source/campaign</th><th>状态</th><th>过期时间</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="adm-invites-tbody"></tbody>
+          </table>
+        </div>
+        <div class="adm-confirm" id="adm-invites-confirm" hidden></div>
+        <div class="adm-pager">
+          <button type="button" id="adm-invites-more-btn">加载更多</button>
+          <span id="adm-invites-status" class="adm-status"></span>
+        </div>
       </section>
       <section class="adm-card">
         <h2>来源漏斗（campaign → 访问 → 注册 → 首次 AI）</h2>
@@ -157,11 +211,56 @@
       </section>
     </section>
 
-    <!-- 额度与账单（§10.4 只读部分） -->
+    <!-- 额度与账单（§10.4；PR5 补 turn 预算编辑 / caps / 人工调整） -->
     <section class="adm-page" id="adm-page-billing" hidden>
       <section class="adm-card">
         <h2>对话额度（turn budget · 当前周期）</h2>
         <dl id="adm-billing-turn" class="adm-kv"></dl>
+        <div class="adm-form" id="adm-turn-edit-form">
+          <input type="number" id="adm-turn-platform" min="1" max="1000000" placeholder="平台总对话上限">
+          <input type="number" id="adm-turn-demo" min="0" max="1000000" placeholder="Demo 每日额度（24h 滚动）">
+          <input type="number" id="adm-turn-user" min="1" max="1000000" placeholder="每用户对话上限">
+          <input type="number" id="adm-turn-owner-reserve" min="0" max="1000000" placeholder="owner 保留池（0=关闭）">
+          <input type="number" id="adm-turn-user-pool" min="0" max="1000000" placeholder="用户共享池（0=关闭）">
+          <input type="number" id="adm-turn-psteps" min="1" max="1000000" placeholder="平台单次任务步骤">
+          <input type="number" id="adm-turn-ownsteps" min="1" max="1000000" placeholder="自带 API 步数硬上限">
+          <input type="number" id="adm-turn-demosteps" min="1" max="1000000" placeholder="Demo 单次任务步骤">
+          <input type="number" id="adm-turn-perbrowser" min="1" max="1000000" placeholder="Demo 每浏览器次数">
+          <input type="number" id="adm-turn-concurrency" min="1" max="1000000" placeholder="Demo 最大并发">
+          <label class="adm-check"><input type="checkbox" id="adm-turn-demo-enabled"> 开放公开 Demo</label>
+          <button type="button" id="adm-turn-save-btn">保存限制（不清空用量）</button>
+          <button type="button" id="adm-turn-newperiod-btn" class="adm-btn-danger">开启新周期</button>
+        </div>
+        <div class="adm-confirm" id="adm-turn-confirm" hidden></div>
+        <p class="adm-status" id="adm-turn-edit-status"></p>
+      </section>
+      <section class="adm-card">
+        <h2>金额账户（caps 与人工调整 · nano-CNY）</h2>
+        <p class="adm-note">余额 = 账本有符号合计；未开户用户显示 account:null（绝不伪造 0 余额）。caps 更新带版本号 CAS：他人先改会得到 409，需刷新后重填。人工调整必须填写原因；冲正只能追加新条目，账本不可编辑。</p>
+        <div class="adm-form" id="adm-acct-lookup-form">
+          <input type="text" id="adm-acct-user" placeholder="user_id（精确）" maxlength="128" autocomplete="off">
+          <button type="button" id="adm-acct-load-btn">查询账户</button>
+        </div>
+        <dl id="adm-acct-info" class="adm-kv"></dl>
+        <div class="adm-form" id="adm-caps-form" hidden>
+          <input type="text" id="adm-caps-soft" placeholder="soft cap（CNY，留空=清除）" autocomplete="off">
+          <input type="text" id="adm-caps-hard" placeholder="hard cap（CNY，留空=清除）" autocomplete="off">
+          <button type="button" id="adm-caps-save-btn">保存 caps</button>
+        </div>
+        <p class="adm-status" id="adm-caps-status"></p>
+        <div class="adm-confirm" id="adm-adjust-confirm" hidden></div>
+        <div class="adm-form" id="adm-adjust-form">
+          <select id="adm-adjust-kind">
+            <option value="grant">grant（赠送，正数）</option>
+            <option value="topup">topup（充值，正数）</option>
+            <option value="refund">refund（退款，正数）</option>
+            <option value="manual_adjustment">manual_adjustment（人工调整，非零，可为负）</option>
+          </select>
+          <input type="text" id="adm-adjust-amount" placeholder="金额（CNY，最多 9 位小数，如 12.5 / -0.000000001）" autocomplete="off">
+          <input type="text" id="adm-adjust-reason" placeholder="原因（必填，≤500 字符）" maxlength="500" autocomplete="off">
+          <button type="button" id="adm-adjust-btn" class="adm-btn-danger">提交调整</button>
+        </div>
+        <p class="adm-status" id="adm-adjust-status"></p>
       </section>
       <section class="adm-card">
         <h2>供应商余额（DeepSeek · 平台成本监控）</h2>

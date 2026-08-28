@@ -1930,6 +1930,32 @@ def record_audit(action, actor_user_id=None, actor_role=None, target_type=None,
         return False
 
 
+def record_audit_tx(cur, action, actor_user_id=None, actor_role=None,
+                    target_type=None, target_id=None, slide=None, detail=None,
+                    ts=None):
+    """同事务审计写入（cursor 注入变体，PR5 billing 写路径专用）。
+
+    与 record_audit 的关键差异：**不吞错**——任何失败直接抛出，让调用方的
+    业务事务（billing caps 更新 / 人工调账入账）整体回滚（方案 §6.5「写入
+    ledger 与 audit event 必须同一 PostgreSQL 事务提交」；PR2 ingest_usage_event
+    已确立同一原则）。不进 dispatcher 公共名：json 后端没有「同事务」概念，
+    billing 系调用方（billing_store）本就 PG-only 直连本模块。
+    """
+    ev_id = "aud_" + secrets.token_hex(16)
+    detail = dict(detail) if isinstance(detail, dict) else {}
+    cur.execute(
+        "INSERT INTO audit_events "
+        "(event_id, ts, actor_user_id, actor_role, action, "
+        " target_type, target_id, slide, detail) "
+        "VALUES (%s, to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s)",
+        (ev_id, ts if ts is not None else time.time(),
+         actor_user_id or None, actor_role or "",
+         str(action or ""), target_type or None, target_id or None,
+         slide or None, psycopg.types.json.Jsonb(detail)),
+    )
+    return ev_id
+
+
 def list_audit(limit=50, offset=0, action=None):
     """返回审计事件（最新在前），支持分页与 action 过滤。owner-only 消费（app.py 鉴权）。"""
     limit = max(0, int(limit if limit is not None else 50))

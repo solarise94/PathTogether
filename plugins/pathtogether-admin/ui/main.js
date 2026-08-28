@@ -1,5 +1,5 @@
 /* =========================================================================
-   pathtogether-admin 桥接客户端 + 只读业务页面（PR3b）
+   pathtogether-admin 桥接客户端 + 业务页面（PR3b 只读 + PR5 写操作）
 
    docs/admin-billing-plugin-implementation-plan.md §8.3/§8.4/§10：
      - 本页运行在 /admin 宿主页的 opaque iframe（sandbox="allow-scripts"）内；
@@ -8,10 +8,14 @@
        nonce + 本次会话内递增的 requestId；
      - 响应按 requestId 配对；超时（15s）与拒绝都有稳定错误码；
      - opaque origin：不能读写 localStorage/cookie，全部页面状态（当前页/
-       筛选/分页游标）只在内存。
-   页面只读（§10.1/§10.2/§10.4/§10.5）：操作按钮与写方法留给 PR5。
+       筛选/分页游标/账户卡缓存）只在内存；
+     - sandbox 无 allow-modals：window.confirm/prompt 被静默吞掉，危险操作
+       二次确认一律用页内确认条（§3.3）；
+     - PR5 写操作：创建用户、启停/AI access/重置密码、邀请创建/撤销、turn
+       预算编辑与开新周期、caps 编辑（CAS）、人工调账（CNY→nano 全字符串
+       换算，禁 float）。表单校验只是体验层，权威校验在服务端。
    渲染只用 textContent / createElement（不拼 HTML，插件数据永不进标记）。
-   ========================================================================= */
+ ========================================================================= */
 (function () {
   "use strict";
 
@@ -30,9 +34,22 @@
     page: "overview",       // 当前页（内存态导航）
     // 分页游标（每列表独立；仅内存）
     cursors: { users: null, usage: null, unpriced: null, ledger: null,
-               audit: null, acqUsers: null },
+               audit: null, acqUsers: null, invites: null },
     filters: { users: {}, usage: {}, audit: {} },
+    // 金额账户卡当前查询结果（caps 编辑器提交 CAS version 用；仅内存）
+    account: null,
   };
+
+  // 深链起始页（PR5 /admin#invites 兼容）：宿主把父页 hash 透传到本 iframe
+  // 自身 URL；只接受已知页面 slug，其余回概览。
+  function initialPageFromHash() {
+    var pages = ["overview", "users", "invites", "billing", "audit"];
+    var hash = "";
+    try { hash = window.location.hash || ""; } catch (e) { hash = ""; }
+    var name = hash.replace(/^#/, "");
+    return pages.indexOf(name) !== -1 ? name : "overview";
+  }
+  var initialPage = initialPageFromHash();
 
   function $(id) { return document.getElementById(id); }
 
@@ -106,6 +123,87 @@
     return cell;
   }
 
+  // ---- CNY ↔ nano 换算（§5：1 CNY = 1e9 nano；全程字符串运算，禁 float）----
+  // "12.345678901" → 12345678901；小数最多 9 位；允许负号（manual_adjustment）。
+  // 非法形态 / 超出安全整数范围返回 null（调用方按校验失败提示）。
+  function cnyToNano(text) {
+    var s = String(text == null ? "" : text).trim();
+    if (!/^-?\d{1,15}(\.\d{1,9})?$/.test(s)) return null;
+    var neg = s.charAt(0) === "-";
+    if (neg) s = s.slice(1);
+    var parts = s.split(".");
+    var digits = parts[0] + (parts[1] || "").padEnd(9, "0");
+    digits = digits.replace(/^0+(?=\d)/, "");
+    var n = Number(digits);
+    if (!Number.isSafeInteger(n)) return null;
+    return neg ? -n : n;
+  }
+
+  // 精确 nano → CNY 字符串（cap/金额输入框回显用；与 fmtNano 的近似显示互补）
+  function nanoToCnyString(n) {
+    if (n === null || n === undefined) return "";
+    var neg = n < 0;
+    var digits = Math.abs(Number(n)).toString().padStart(10, "0");
+    var whole = digits.slice(0, -9);
+    var frac = digits.slice(-9).replace(/0+$/, "");
+    return (neg ? "-" : "") + whole + (frac ? "." + frac : "");
+  }
+
+  // ---- 页内确认条（§3.3 危险操作二次确认）----
+  // sandbox 无 allow-modals：window.confirm 会被浏览器静默吞掉（恒 false），
+  // 因此禁用/重置密码/revoke/调账/开新周期一律走页内两步确认。
+  function clearConfirm(box) {
+    if (box) { box.hidden = true; box.textContent = ""; }
+  }
+
+  function askConfirm(box, text, onConfirm) {
+    if (!box) { onConfirm(); return; }
+    box.hidden = false;
+    box.textContent = "";
+    var msg = document.createElement("span");
+    msg.className = "adm-confirm-text";
+    msg.textContent = text;
+    var ok = document.createElement("button");
+    ok.type = "button";
+    ok.className = "adm-btn-danger";
+    ok.textContent = "确认执行";
+    var cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.textContent = "取消";
+    ok.addEventListener("click", function () {
+      clearConfirm(box);
+      onConfirm();
+    });
+    cancel.addEventListener("click", function () { clearConfirm(box); });
+    box.appendChild(msg);
+    box.appendChild(ok);
+    box.appendChild(cancel);
+  }
+
+  function setStatus(id, text) {
+    var el = $(id);
+    if (el) el.textContent = text || "";
+  }
+
+  function actionBtn(label, handler, danger) {
+    var btn = document.createElement("button");
+    btn.type = "button";
+    if (danger) btn.className = "adm-btn-danger";
+    btn.textContent = label;
+    btn.addEventListener("click", handler);
+    return btn;
+  }
+
+  function copyToClipboard(text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).catch(function () { /* ignore */ });
+        return;
+      }
+    } catch (e) { /* ignore */ }
+    // 降级：选中文本由用户手动复制（opaque origin 下 execCommand 可能被拒）
+  }
+
   // ---- 请求：nonce + 递增 requestId；targetOrigin "*" —— iframe 是 opaque
   //      origin，读不到宿主 origin；安全边界在宿主侧（精确 WindowProxy +
   //      高熵 nonce + 服务端 owner/CSRF 复核，docs §8.3）。
@@ -161,8 +259,9 @@
       setHandshake("桥接已建立（protocolVersion=" + state.protocolVersion +
         "，管理能力 " + state.granted.length + " 项）");
       resetLists();
-      showPage("overview");
-      loadOverview();
+      // 深链（/admin#invites 等旧入口 302）：宿主把父页 hash 透传到本 iframe
+      // 的 URL，握手后直接落到目标页；无 hash 时回概览（showPage 自带加载）
+      showPage(initialPage);
       return;
     }
 
@@ -330,9 +429,10 @@
   // ------------------------------------------------------------------
   function resetLists() {
     state.cursors = { users: null, usage: null, unpriced: null, ledger: null,
-                      audit: null, acqUsers: null };
+                      audit: null, acqUsers: null, invites: null };
+    state.account = null;
     ["adm-users-tbody", "adm-usage-tbody", "adm-unpriced-tbody",
-     "adm-ledger-tbody", "adm-audit-tbody",
+     "adm-ledger-tbody", "adm-audit-tbody", "adm-invites-tbody",
      "adm-acq-funnel-tbody", "adm-acq-users-tbody"].forEach(function (id) {
       var el = $(id);
       if (el) el.textContent = "";
@@ -382,7 +482,145 @@
                           (u.billing.hard_spend_cap_nano === null ? "—" : fmtNano(u.billing.hard_spend_cap_nano)))
                        : "—"));
       tr.appendChild(td(fmtTs(u.last_ai_call_at)));
+      tr.appendChild(renderUserActions(u));
       tbody.appendChild(tr);
+    });
+  }
+
+  // 行内操作（§10.2）：启停 / AI access / 重置密码（仅普通用户）/ 打开账本。
+  // owner 行不提供禁用与重置（break-glass 不变量，服务端同样 409）；禁用与
+  // 重置密码为危险操作，走页内确认条。
+  function renderUserActions(u) {
+    var cell = document.createElement("td");
+    cell.className = "adm-actions-cell";
+    var isOwner = u.role === "owner";
+    if (!isOwner) {
+      cell.appendChild(actionBtn(u.enabled ? "禁用" : "启用", function () {
+        if (u.enabled) {
+          askConfirm($("adm-users-confirm"),
+            "确认禁用用户 " + (u.display_name || u.user_id) + "？其全部会话将立即失效。",
+            function () { setUserEnabled(u, false); });
+        } else {
+          setUserEnabled(u, true);
+        }
+      }, u.enabled));
+    }
+    cell.appendChild(actionBtn(u.ai_access ? "收回 AI" : "授予 AI", function () {
+      setAiAccess(u, !u.ai_access);
+    }));
+    if (!isOwner) {
+      cell.appendChild(actionBtn("重置密码", function () {
+        askResetPassword(u);
+      }));
+    }
+    cell.appendChild(actionBtn("打开账本", function () {
+      openLedgerForUser(u.user_id);
+    }));
+    return cell;
+  }
+
+  function userWriteDone(err, res, okText, statusId) {
+    if (err) {
+      showError(err && err.code, err && err.message);
+      setStatus(statusId, errText(err));
+      return;
+    }
+    setStatus(statusId, okText);
+    loadUsers(false);
+  }
+
+  function setUserEnabled(u, enabled) {
+    request("admin.users.setEnabled",
+            { user_id: u.user_id, enabled: enabled })
+      .then(function (res) {
+        userWriteDone(null, res,
+          enabled ? "已启用（auth_version 已推进，旧会话失效）" : "已禁用（旧会话立即失效）",
+          "adm-users-status");
+      })
+      .catch(function (err) { userWriteDone(err, null, null, "adm-users-status"); });
+  }
+
+  function setAiAccess(u, enabled) {
+    request("admin.users.setAiAccess",
+            { user_id: u.user_id, enabled: enabled })
+      .then(function () {
+        userWriteDone(null, null,
+          enabled ? "已授予 AI access" : "已收回 AI access",
+          "adm-users-status");
+      })
+      .catch(function (err) { userWriteDone(err, null, null, "adm-users-status"); });
+  }
+
+  // 重置密码：页内输入新密码（sandbox 下 window.prompt 不可用）+ 确认执行
+  function askResetPassword(u) {
+    var box = $("adm-users-confirm");
+    if (!box) return;
+    box.hidden = false;
+    box.textContent = "";
+    var label = document.createElement("span");
+    label.className = "adm-confirm-text";
+    label.textContent = "为 " + (u.display_name || u.user_id) + " 设置新密码（≥15 位）：";
+    var input = document.createElement("input");
+    input.type = "password";
+    input.minLength = 15;
+    input.maxLength = 200;
+    input.autocomplete = "new-password";
+    input.placeholder = "新密码（≥15 位）";
+    var ok = actionBtn("确认重置", function () {
+      var np = input.value || "";
+      if (np.length < 15) {
+        setStatus("adm-users-status", "新密码至少 15 位（当前 " + np.length + " 位）");
+        return;
+      }
+      clearConfirm(box);
+      request("admin.users.resetPassword", { user_id: u.user_id, password: np })
+        .then(function () {
+          userWriteDone(null, null,
+            "密码已重置，该用户全部会话已退出", "adm-users-status");
+        })
+        .catch(function (err) {
+          userWriteDone(err, null, null, "adm-users-status");
+        });
+    }, true);
+    var cancel = actionBtn("取消", function () { clearConfirm(box); });
+    box.appendChild(label);
+    box.appendChild(input);
+    box.appendChild(ok);
+    box.appendChild(cancel);
+  }
+
+  // 行内「打开账本」→ 额度与账单页：usage 明细按该 user_id 过滤 + 账户卡带入
+  function openLedgerForUser(userId) {
+    state.filters.usage = { model: "", user_id: userId, status: "" };
+    var input = $("adm-usage-user");
+    if (input) input.value = userId;
+    var acct = $("adm-acct-user");
+    if (acct) acct.value = userId;
+    showPage("billing");
+  }
+
+  function submitCreateUser() {
+    var loginId = ($("adm-users-new-login") && $("adm-users-new-login").value || "").trim();
+    var display = ($("adm-users-new-display") && $("adm-users-new-display").value || "").trim();
+    var password = $("adm-users-new-password") ? $("adm-users-new-password").value : "";
+    if (!loginId) { setStatus("adm-users-create-status", "缺少登录账号"); return; }
+    if (password.length < 15) {
+      setStatus("adm-users-create-status",
+                "初始密码至少 15 位（当前 " + password.length + " 位）");
+      return;
+    }
+    var payload = { login_id: loginId, password: password };
+    if (display) payload.display_name = display;
+    setStatus("adm-users-create-status", "创建中…");
+    request("admin.users.create", payload).then(function (res) {
+      ["adm-users-new-login", "adm-users-new-display", "adm-users-new-password"]
+        .forEach(function (id) { var el = $(id); if (el) el.value = ""; });
+      setStatus("adm-users-create-status",
+        "已创建 " + ((res && res.user && res.user.user_id) || loginId));
+      loadUsers(false);
+    }).catch(function (err) {
+      showError(err && err.code, err && err.message);
+      setStatus("adm-users-create-status", errText(err));
     });
   }
 
@@ -480,6 +718,108 @@
   }
 
   // ------------------------------------------------------------------
+  // 邀请管理（§10.3，PR5 写部分）：列表 + 创建（token 仅一次）+ 撤销。
+  // ------------------------------------------------------------------
+  function inviteStatusLabel(inv) {
+    if (inv.revoked_at) return "已撤销";
+    if (inv.consumed_at) return "已消费";
+    if (inv.expires_at !== null && inv.expires_at !== undefined
+        && inv.expires_at <= Date.now() / 1000) return "已过期";
+    return "开放中";
+  }
+
+  function loadInvites(append) {
+    var payload = { limit: 50, cursor: append ? state.cursors.invites : null };
+    var status = $("adm-invites-status");
+    request("admin.invites.list", payload).then(function (res) {
+      hideError();
+      var tbody = $("adm-invites-tbody");
+      if (!tbody) return;
+      if (!append) tbody.textContent = "";
+      (res.invites || []).forEach(function (inv) {
+        var tr = document.createElement("tr");
+        tr.appendChild(td(inv.invite_id));
+        tr.appendChild(td(inv.login_id_masked || "（不绑定）"));
+        tr.appendChild(td(inv.ai_access ? "开" : "关"));
+        tr.appendChild(td(inv.cohort));
+        tr.appendChild(td((inv.source_code || "—") +
+                          (inv.campaign_id ? (" / " + inv.campaign_id) : "")));
+        tr.appendChild(td(inviteStatusLabel(inv)));
+        tr.appendChild(td(fmtTs(inv.expires_at)));
+        var cell = document.createElement("td");
+        cell.className = "adm-actions-cell";
+        if (inviteStatusLabel(inv) === "开放中") {
+          cell.appendChild(actionBtn("撤销", function () {
+            askConfirm($("adm-invites-confirm"),
+              "确认撤销邀请 " + inv.invite_id + "？撤销后立即不可兑换。",
+              function () { revokeInvite(inv.invite_id); });
+          }, true));
+        }
+        tr.appendChild(cell);
+        tbody.appendChild(tr);
+      });
+      state.cursors.invites = res.next_cursor || null;
+      var more = $("adm-invites-more-btn");
+      if (more) more.disabled = !res.next_cursor;
+      if (status) status.textContent = res.next_cursor ? "还有更多" : "已到底";
+    }).catch(function (err) { handleErr(err, status); });
+  }
+
+  function revokeInvite(inviteId) {
+    request("admin.invites.revoke", { invite_id: inviteId })
+      .then(function () {
+        setStatus("adm-invites-status", "已撤销 " + inviteId);
+        loadInvites(false);
+      })
+      .catch(function (err) { handleErr(err, $("adm-invites-status")); });
+  }
+
+  function showInviteTokenOnce(token) {
+    var box = $("adm-invite-token-box");
+    var code = $("adm-invite-token");
+    if (!box || !code) return;
+    code.textContent = token;
+    box.hidden = false;
+  }
+
+  function submitCreateInvite() {
+    var loginId = ($("adm-invite-login") && $("adm-invite-login").value || "").trim();
+    var ttlRaw = $("adm-invite-ttl") ? $("adm-invite-ttl").value : "";
+    var ai = $("adm-invite-ai") ? !!$("adm-invite-ai").checked : false;
+    var cohort = ($("adm-invite-cohort") && $("adm-invite-cohort").value || "").trim();
+    var note = ($("adm-invite-note") && $("adm-invite-note").value || "").trim();
+    var source = ($("adm-invite-source") && $("adm-invite-source").value || "").trim();
+    var campaign = ($("adm-invite-campaign") && $("adm-invite-campaign").value || "").trim();
+    var ttl = parseInt(ttlRaw, 10);
+    if (!ttl || ttl < 1 || ttl > 720) {
+      setStatus("adm-invite-create-status", "有效期需为 1–720 小时");
+      return;
+    }
+    var payload = { ttl_hours: ttl, ai_access: ai };
+    if (loginId) payload.login_id = loginId;
+    if (cohort) payload.cohort = cohort;
+    if (note) payload.note = note;
+    if (source) payload.source_code = source;
+    if (campaign) payload.campaign_id = campaign;
+    setStatus("adm-invite-create-status", "创建中…");
+    request("admin.invites.create", payload).then(function (res) {
+      setStatus("adm-invite-create-status",
+        "已创建 " + ((res && res.invite && res.invite.invite_id) || "?") +
+        "；明文邀请码只显示这一次：");
+      showInviteTokenOnce((res && res.invite && res.invite.token) || "");
+      ["adm-invite-login", "adm-invite-cohort", "adm-invite-note",
+       "adm-invite-source", "adm-invite-campaign"].forEach(function (id) {
+        var el = $(id);
+        if (el) el.value = "";
+      });
+      loadInvites(false);
+    }).catch(function (err) {
+      showError(err && err.code, err && err.message);
+      setStatus("adm-invite-create-status", errText(err));
+    });
+  }
+
+  // ------------------------------------------------------------------
   // 额度与账单（§10.4 只读部分）
   // ------------------------------------------------------------------
   function loadBillingPage() {
@@ -494,6 +834,7 @@
     var dl = $("adm-billing-turn");
     request("admin.turnBudgets.get", {}).then(function (res) {
       hideError();
+      prefillTurnEditForm(res.limits || {});
       if (!dl) return;
       dl.textContent = "";
       var period = res.period || {};
@@ -517,6 +858,221 @@
       if (dl) { dl.textContent = ""; kvRow(dl, "可用性", errText(err)); }
       else handleErr(err, null);
     });
+  }
+
+  // turn 预算限制编辑（PR5）：输入框 id → 限制字段映射（与服务端
+  // _BUDGET_SETTINGS_FIELDS 同源）；保存不清空用量，未填字段沿用现值。
+  var _TURN_FIELDS = [
+    ["adm-turn-platform", "platform_turn_limit"],
+    ["adm-turn-demo", "demo_turn_limit"],
+    ["adm-turn-user", "user_turn_limit"],
+    ["adm-turn-owner-reserve", "owner_reserved_turn_limit"],
+    ["adm-turn-user-pool", "user_pool_turn_limit"],
+    ["adm-turn-psteps", "platform_task_max_steps"],
+    ["adm-turn-ownsteps", "own_task_max_steps_limit"],
+    ["adm-turn-demosteps", "demo_task_max_steps"],
+    ["adm-turn-perbrowser", "demo_per_browser_limit"],
+    ["adm-turn-concurrency", "demo_max_concurrency"],
+  ];
+
+  function prefillTurnEditForm(limits) {
+    _TURN_FIELDS.forEach(function (pair) {
+      var el = $(pair[0]);
+      if (el && limits[pair[1]] !== null && limits[pair[1]] !== undefined) {
+        el.value = String(limits[pair[1]]);
+      }
+    });
+    var demoEnabled = $("adm-turn-demo-enabled");
+    if (demoEnabled) demoEnabled.checked = !!limits.demo_enabled;
+  }
+
+  function saveTurnBudget() {
+    var payload = {};
+    for (var i = 0; i < _TURN_FIELDS.length; i++) {
+      var el = $(_TURN_FIELDS[i][0]);
+      var raw = el ? String(el.value || "").trim() : "";
+      if (!raw) continue; // 未填字段沿用现值（服务端按子集合并校验）
+      var v = Number(raw);
+      if (!Number.isSafeInteger(v) || v < 0) {
+        setStatus("adm-turn-edit-status",
+                  _TURN_FIELDS[i][1] + " 需为非负整数");
+        return;
+      }
+      payload[_TURN_FIELDS[i][1]] = v;
+    }
+    var demoEnabled = $("adm-turn-demo-enabled");
+    payload.demo_enabled = !!(demoEnabled && demoEnabled.checked);
+    setStatus("adm-turn-edit-status", "保存中…");
+    request("admin.turnBudgets.update", payload).then(function (res) {
+      setStatus("adm-turn-edit-status",
+        "已保存（周期 #" + fmtNum(res && res.period_id) + "，用量保留）");
+      loadTurnBudgetCard();
+    }).catch(function (err) {
+      showError(err && err.code, err && err.message);
+      setStatus("adm-turn-edit-status", errText(err));
+    });
+  }
+
+  function startNewTurnPeriod() {
+    askConfirm($("adm-turn-confirm"),
+      "确认开启新的预算周期？本周期用量归零（旧行保留供排查），Demo 每浏览器/" +
+      "IP 辅闸一并放开。此操作不可撤销。",
+      function () {
+        setStatus("adm-turn-edit-status", "开新周期中…");
+        request("admin.turnBudgets.newPeriod", {}).then(function (res) {
+          setStatus("adm-turn-edit-status",
+            "已开启周期 #" + fmtNum(res && res.period_id) +
+            "（重置 Demo runs " + fmtNum(res && res.demo_runs_reset) + "）");
+          loadTurnBudgetCard();
+        }).catch(function (err) {
+          showError(err && err.code, err && err.message);
+          setStatus("adm-turn-edit-status", errText(err));
+        });
+      });
+  }
+
+  // ------------------------------------------------------------------
+  // 金额账户管理（§10.4，PR5）：caps 编辑器（版本 CAS）+ 人工调整。
+  // 当前查询到的账户缓存在内存 state.account（含 version，供 CAS 提交）。
+  // ------------------------------------------------------------------
+  function loadBillingAccount() {
+    var uid = ($("adm-acct-user") && $("adm-acct-user").value || "").trim();
+    var dl = $("adm-acct-info");
+    if (!uid) {
+      setStatus("adm-caps-status", "请输入 user_id");
+      return;
+    }
+    request("admin.billing.account.get", { user_id: uid }).then(function (res) {
+      hideError();
+      state.account = { user_id: uid, account: res.account || null,
+                        balance_nano: res.balance_nano };
+      if (!dl) return;
+      dl.textContent = "";
+      if (!res.account) {
+        kvRow(dl, "user_id", uid);
+        kvRow(dl, "账户", "尚未开户（account:null；首次 grant/topup 会自动开户）");
+        var closedForm = $("adm-caps-form");
+        if (closedForm) closedForm.hidden = true;
+        return;
+      }
+      var acct = res.account;
+      kvRow(dl, "user_id", uid);
+      kvRow(dl, "account_id", acct.account_id);
+      kvRow(dl, "状态", acct.status);
+      kvRow(dl, "version", acct.version);
+      kvRow(dl, "余额", fmtNano(res.balance_nano));
+      kvRow(dl, "当前 soft cap",
+            acct.soft_spend_cap_nano === null ? "（未设置）"
+            : nanoToCnyString(acct.soft_spend_cap_nano) + " CNY");
+      kvRow(dl, "当前 hard cap",
+            acct.hard_spend_cap_nano === null ? "（未设置）"
+            : nanoToCnyString(acct.hard_spend_cap_nano) + " CNY");
+      var capsForm = $("adm-caps-form");
+      if (capsForm) capsForm.hidden = false;
+      var softInput = $("adm-caps-soft");
+      var hardInput = $("adm-caps-hard");
+      if (softInput) {
+        softInput.value = acct.soft_spend_cap_nano === null
+          ? "" : nanoToCnyString(acct.soft_spend_cap_nano);
+      }
+      if (hardInput) {
+        hardInput.value = acct.hard_spend_cap_nano === null
+          ? "" : nanoToCnyString(acct.hard_spend_cap_nano);
+      }
+    }).catch(function (err) {
+      state.account = null;
+      if (dl) { dl.textContent = ""; kvRow(dl, "可用性", errText(err)); }
+      else handleErr(err, null);
+    });
+  }
+
+  function saveCaps() {
+    var acctState = state.account;
+    if (!acctState || !acctState.account) {
+      setStatus("adm-caps-status", "请先查询已开户用户");
+      return;
+    }
+    var softText = ($("adm-caps-soft") && $("adm-caps-soft").value || "").trim();
+    var hardText = ($("adm-caps-hard") && $("adm-caps-hard").value || "").trim();
+    // 留空 = 清除该上限（null）；填值按 CNY 字符串精确换算 nano（禁 float）
+    var soft = softText ? cnyToNano(softText) : null;
+    var hard = hardText ? cnyToNano(hardText) : null;
+    if (softText && soft === null) {
+      setStatus("adm-caps-status", "soft cap 金额非法（最多 9 位小数，如 12.5）");
+      return;
+    }
+    if (hardText && hard === null) {
+      setStatus("adm-caps-status", "hard cap 金额非法（最多 9 位小数，如 12.5）");
+      return;
+    }
+    if (soft !== null && hard !== null && soft > hard) {
+      setStatus("adm-caps-status", "soft cap 不可大于 hard cap（客户端拦截；服务端同样校验）");
+      return;
+    }
+    setStatus("adm-caps-status", "保存中…");
+    request("admin.billing.account.updateCaps", {
+      user_id: acctState.user_id,
+      soft_cap_nano_cny: soft,
+      hard_cap_nano_cny: hard,
+      version: acctState.account.version,
+    }).then(function (res) {
+      setStatus("adm-caps-status",
+        "已保存（新 version " + ((res && res.account && res.account.version) || "?") + "）");
+      loadBillingAccount();
+    }).catch(function (err) {
+      if (err && err.code === "version_conflict") {
+        setStatus("adm-caps-status",
+          "数据已被他人修改（409 version_conflict），请重新查询后重填");
+      } else {
+        setStatus("adm-caps-status", errText(err));
+      }
+      showError(err && err.code, err && err.message);
+    });
+  }
+
+  function submitAdjustment() {
+    var uid = ($("adm-acct-user") && $("adm-acct-user").value || "").trim();
+    if (!uid) { setStatus("adm-adjust-status", "请先在上方输入 user_id"); return; }
+    var kind = $("adm-adjust-kind") ? $("adm-adjust-kind").value : "";
+    var amountText = ($("adm-adjust-amount") && $("adm-adjust-amount").value || "").trim();
+    var reason = ($("adm-adjust-reason") && $("adm-adjust-reason").value || "").trim();
+    var amount = amountText ? cnyToNano(amountText) : null;
+    if (amount === null) {
+      setStatus("adm-adjust-status",
+        "金额非法：最多 9 位小数的 CNY 数值（如 12.5；manual_adjustment 可为负）");
+      return;
+    }
+    if (kind !== "manual_adjustment" && amount <= 0) {
+      setStatus("adm-adjust-status", kind + " 金额必须为正数");
+      return;
+    }
+    if (!reason) {
+      setStatus("adm-adjust-status", "原因必填（≤500 字符）");
+      return;
+    }
+    askConfirm($("adm-adjust-confirm"),
+      "确认对用户 " + uid + " 入账 " + kind + " " + amountText + " CNY（" +
+      amount + " nano）？原因：" + reason,
+      function () {
+        setStatus("adm-adjust-status", "提交中…");
+        request("admin.billing.adjust", {
+          user_id: uid, kind: kind,
+          amount_nano_cny: amount, reason: reason,
+        }).then(function (res) {
+          setStatus("adm-adjust-status",
+            (res && res.duplicate ? "幂等重放（未重复入账）" : "已入账") +
+            "：" + ((res && res.entry && res.entry.kind) || kind) + " " +
+            ((res && res.entry && res.entry.amount_nano_cny) || amount) +
+            " nano，余额 " + fmtNano(res && res.balance_nano));
+          if ($("adm-adjust-amount")) $("adm-adjust-amount").value = "";
+          if ($("adm-adjust-reason")) $("adm-adjust-reason").value = "";
+          loadBillingAccount();
+          loadLedger(false);
+        }).catch(function (err) {
+          setStatus("adm-adjust-status", errText(err));
+          showError(err && err.code, err && err.message);
+        });
+      });
   }
 
   function renderProviderBalance(payload) {
@@ -704,7 +1260,7 @@
     hideError();
     if (name === "overview") loadOverview();
     else if (name === "users") loadUsers(false);
-    else if (name === "invites") loadAcquisitionPage();
+    else if (name === "invites") { loadAcquisitionPage(); loadInvites(false); }
     else if (name === "billing") loadBillingPage();
     else if (name === "audit") loadAudit(false);
   }
@@ -733,10 +1289,25 @@
       loadUsers(false);
     });
     onClick("adm-users-more-btn", function () { loadUsers(true); });
+    // 用户页写操作（PR5）
+    onClick("adm-users-create-btn", submitCreateUser);
     // 邀请与来源页
     onClick("adm-acq-more-btn", function () { loadAcqUsers(true); });
+    // 邀请写操作（PR5）
+    onClick("adm-invite-create-btn", submitCreateInvite);
+    onClick("adm-invites-more-btn", function () { loadInvites(true); });
+    onClick("adm-invite-token-copy", function () {
+      var code = $("adm-invite-token");
+      if (code) copyToClipboard(code.textContent || "");
+    });
     // 账单页
     onClick("adm-balance-refresh-btn", refreshProviderBalance);
+    // turn 预算 / 金额账户写操作（PR5）
+    onClick("adm-turn-save-btn", saveTurnBudget);
+    onClick("adm-turn-newperiod-btn", startNewTurnPeriod);
+    onClick("adm-acct-load-btn", loadBillingAccount);
+    onClick("adm-caps-save-btn", saveCaps);
+    onClick("adm-adjust-btn", submitAdjustment);
     onClick("adm-usage-search-btn", function () {
       state.filters.usage = {
         model: ($("adm-usage-model") && $("adm-usage-model").value || "").trim(),

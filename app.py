@@ -4884,12 +4884,16 @@ _ADMIN_V1_NANO_IN_RE = re.compile(r"^-?[0-9]{1,19}$")
 _PG_BIGINT_MAX = 2 ** 63 - 1
 _PG_BIGINT_MIN = -(2 ** 63)
 
-#: 响应中按字段名匹配即字符串化的 nano-CNY 键（白名单制，不误伤 token 计数）
+#: 响应中按字段名匹配即字符串化的 nano-CNY 键（白名单制，不误伤 token 计数）。
+#: 后三个是审计 detail 内的金额镜像键（billing_store 的 caps/adjust 审计
+#: detail 用无 _cny 后缀拼写；§10.5 审计页同样走金额字符串化，否则
+#: >2^53 的金额经 JSON number 进浏览器会静默失真——owner 复审 P2 遗留）。
 _ADMIN_V1_NANO_OUT_KEYS = frozenset((
     "balance_nano", "amount_nano_cny", "soft_cap_nano_cny",
     "hard_cap_nano_cny", "provider_cost_nano_cny", "charge_nano_cny",
     "soft_spend_cap_nano", "hard_spend_cap_nano", "total_balance_nano",
     "granted_balance_nano", "topped_up_balance_nano",
+    "soft_cap_nano", "hard_cap_nano", "balance_after_nano",
 ))
 
 
@@ -4986,7 +4990,13 @@ _ADMIN_V1_DROP = object()
 
 
 def _admin_v1_audit_event_out(event):
-    """audit 行 → admin v1 导出形态（detail 脱敏；顶层键白名单）。"""
+    """audit 行 → admin v1 导出形态（detail 脱敏；顶层键白名单）。
+
+    detail 脱敏后再经 ``_admin_v1_nano_out``：审计 detail 里的金额镜像
+    （caps 的 soft_cap_nano/hard_cap_nano、调账的 amount_nano_cny/
+    balance_after_nano）同样字符串化——>2^53 的金额以 JSON number 出线，
+    浏览器 JSON.parse 会静默失真（owner 复审 P2 遗留修复）。
+    """
     detail = event.get("detail")
     cleaned = _admin_v1_sanitize_audit_detail(
         detail if isinstance(detail, dict) else {})
@@ -4999,7 +5009,7 @@ def _admin_v1_audit_event_out(event):
         "target_type": event.get("target_type"),
         "target_id": event.get("target_id"),
         "slide": event.get("slide"),
-        "detail": cleaned,
+        "detail": _admin_v1_nano_out(cleaned),
     }
 
 

@@ -608,6 +608,45 @@ def test_adjustment_requires_caller_generated_idempotency_key():
     assert _pg_count("billing_ledger_entries") == 1
 
 
+@PG
+def test_audit_detail_amounts_serialized_as_decimal_strings():
+    """审计 detail 金额镜像同样字符串化（owner 复审 P2 遗留）。
+
+    >2^53 的金额若以 JSON number 出审计接口，浏览器 JSON.parse 会静默失真
+    （9007199254740993 → 9007199254740992）。锁定：调账的 amount_nano_cny/
+    balance_after_nano 与 caps 的 soft_cap_nano/hard_cap_nano 在
+    /api/admin/v1/audit 出口均为精确十进制字符串。
+    """
+    owner, usera = _setup_users()
+    billing_store.create_billing_account(usera["user_id"])
+    c = _login(_client(), owner)
+    uid = usera["user_id"]
+    big = str(2 ** 53 + 1)  # 9007199254740993：JS number 不可精确表示
+    r = _adjust(c, {"user_id": uid, "kind": "grant", "amount_nano_cny": big,
+                    "reason": "大额精度", "idempotency_key": "adj_big_1"})
+    assert r.status_code == 200, r.get_json()
+    acct = billing_store.get_billing_account_by_user(uid)
+    r = c.put("/api/admin/v1/billing/accounts/%s/caps" % uid,
+              json={"soft_cap_nano_cny": big, "hard_cap_nano_cny": None,
+                    "version": acct["version"]})
+    assert r.status_code == 200, r.get_json()
+
+    r = c.get("/api/admin/v1/audit?limit=50")
+    assert r.status_code == 200
+    items = r.get_json()["items"]
+    adjust_ev = next(e for e in items if e["action"] == "billing.adjust")
+    assert adjust_ev["detail"]["amount_nano_cny"] == big
+    assert isinstance(adjust_ev["detail"]["amount_nano_cny"], str)
+    assert adjust_ev["detail"]["balance_after_nano"] == big
+    caps_ev = next(e for e in items if e["action"] == "billing.caps_update")
+    assert caps_ev["detail"]["soft_cap_nano"] == big
+    assert isinstance(caps_ev["detail"]["soft_cap_nano"], str)
+    # wire 级锁定：原始报文里必须是带引号的字符串形态（不是裸 number；
+    # Flask jsonify 用紧凑分隔符，键值间无空格）
+    assert ('"amount_nano_cny":"%s"' % big) in r.get_data(as_text=True)
+    assert ('"soft_cap_nano":"%s"' % big) in r.get_data(as_text=True)
+
+
 # --------------------------------------------------------------------------- #
 # 7. ai-access（PG）
 # --------------------------------------------------------------------------- #

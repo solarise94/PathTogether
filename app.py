@@ -770,6 +770,11 @@ def _auth_challenge():
     # 一样是独立的机器对机器通道）
     if path.startswith("/api/plugin/"):
         return None
+    # admin 插件资源是 owner-only 子资源（iframe src / fetch 目标，docs §8.3），
+    # 不是可导航页面：未登录不给 302 /login（对子资源无意义且徒增跳转），给权威
+    # 401 JSON。owner/非 owner 的进一步判定在 admin_plugin_asset 视图内。
+    if path.startswith("/admin/plugin-assets/"):
+        return jsonify(error="auth_required"), 401
     if path.startswith("/api/"):
         return jsonify(error="auth_required"), 401
     # 页面：跳登录，带 next（防开放跳转在 login 路由内校验）
@@ -1627,8 +1632,14 @@ def plugin_ui_asset(plugin_id, filename):
     - 通用插件（sample-annotator 等）：目录存在即服务（静态文件始终可服务，仅
       index.html 注入受 SAMPLE_PLUGIN_ENABLED flag 控制，见 sample_plugin_context）；
     - 非允许扩展名 403；plugin_id / filename 路径穿越均被拒绝（_plugin_ui_dir +
-      send_from_directory safe_join）。
+      send_from_directory safe_join）；
+    - **特权 admin 插件（PR3 fix）**：一律 404——admin bundle 绝不经公开路由
+      服务（docs §8.3：admin 资源只走 owner-only 的 /admin/plugin-assets/*），
+      且用 404 而非 403，不向匿名访问者暴露 bundle 存在性。此判定在最前（先于
+      目录探测与来源策略），匿名/登录、有无 pin 均一视同仁。
     """
+    if plugin_id in PRIVILEGED_ADMIN_PLUGIN_IDS:
+        abort(404)
     if plugin_id == "histopilot" and not histopilot_ui_enabled():
         abort(404)
     uidi = _plugin_ui_dir(plugin_id)
@@ -1642,6 +1653,315 @@ def plugin_ui_asset(plugin_id, filename):
     if ext not in _PLUGIN_UI_ALLOWED_EXT:
         abort(403)
     return send_from_directory(str(uidi), filename)
+
+
+# --------------------------------------------------------------------------- #
+# PR3（前半）：admin.workspace 宿主 + owner-only 资源路由
+# （docs/admin-billing-plugin-implementation-plan.md §8）
+#
+# 信任模型（§8.2，**永远 fail-closed**）——admin 插件可信须**同时**满足：
+#   ① 插件 id 在代码级 PRIVILEGED_ADMIN_PLUGIN_IDS 白名单；
+#   ② source-policy 中存在该 id 的**显式** manifest sha256 pin（策略文件缺失 /
+#      空表 / 未 pin / null 显式放行，对 admin 一律**不**信任——与 viewer 插件
+#      的 dev 模式 fail-open 兼容行为相反）；
+#   ③ 磁盘 manifest 实际 sha256 与 pin 精确匹配，且 manifest 通过校验器、
+#      ui.slots 含 admin.workspace；
+#   ④ 存在该 plugin_id 且 enabled 的 installation 行。
+# 任何一步缺失/异常 → 不可信（_admin_plugin_trusted 内整体 try/except 兜底）。
+# 普通插件（viewer）沿用 plugin_source_allowed 的既有 fail-open 语义，不受影响。
+# --------------------------------------------------------------------------- #
+#: 代码级特权 admin 插件白名单（§8.2）：不随 manifest/策略文件/数据库变化，
+#: 新增 admin 插件必须改代码发版。
+PRIVILEGED_ADMIN_PLUGIN_IDS = frozenset({"pathtogether-admin"})
+
+#: admin 工作台插槽（manifest ui.slots 的认可值之一；普通 slot 兼容不变）
+ADMIN_WORKSPACE_SLOT = "admin.workspace"
+
+#: admin 资源路由允许的扩展名（§8.3：明确拒绝 .svg / source map / 任意下载）
+_ADMIN_ASSET_ALLOWED_EXT = frozenset({".html", ".js", ".css", ".png", ".webp"})
+#: 按后缀固定的 MIME（不信任文件内容探测）
+_ADMIN_ASSET_MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+#: admin iframe HTML 响应 CSP（§8.3 sandbox 语义：只许自身脚本/样式/图片）。
+#: 注意：不能用 'self' —— 见 _admin_asset_html_csp 的注释（opaque origin 坑）。
+_ADMIN_ASSET_HTML_CSP_FRAME_ANCESTORS = "frame-ancestors 'self'"
+#: /admin 宿主页响应 CSP（§8.1 严格收紧：self 脚本/样式/iframe + 同源 API）
+_ADMIN_HOST_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; "
+                   "img-src 'self'; connect-src 'self'; frame-src 'self'; "
+                   "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+
+
+def _admin_plugin_trusted(plugin_id):
+    """admin 插件信任判定（fail-closed，见上方信任模型注释）。
+
+    返回 ``(trusted: bool, reason: str)``；reason 供降级页与日志（不含敏感信息）。
+    任何异常（I/O、JSON 解析、存储查询……）一律按不可信处理，绝不放大权限。
+    """
+    try:
+        # ① 代码级白名单
+        if plugin_id not in PRIVILEGED_ADMIN_PLUGIN_IDS:
+            return False, "plugin not privileged"
+        # ② 显式 pin：策略文件缺失 / 未 pin / null 放行对 admin 都不可信
+        policy = _plugin_source_policy()
+        if not policy:
+            return False, "source policy not configured"
+        expected = policy.get(plugin_id)
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
+            return False, "admin plugin not pinned"
+        # ③ manifest hash 精确匹配 + 结构校验 + 插槽声明
+        plugin_dir = _plugin_dir(plugin_id)
+        if plugin_dir is None:
+            return False, "plugin directory missing"
+        mf = plugin_dir / "manifest.json"
+        raw = mf.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        if not hmac.compare_digest(digest, expected.lower()):
+            return False, "manifest hash mismatch"
+        manifest = json.loads(raw.decode("utf-8"))
+        errors = validate_manifest(manifest)
+        if errors:
+            return False, "manifest invalid"
+        ui = manifest.get("ui") or {}
+        if ADMIN_WORKSPACE_SLOT not in (ui.get("slots") or []):
+            return False, "admin.workspace slot missing"
+        # ④ installation 存在且 enabled（plugin_id 口径与安装行一致）
+        manifest_plugin_id = manifest.get("id") or plugin_id
+        installations = [i for i in share_store.list_plugin_installations()
+                         if i.get("plugin_id") == manifest_plugin_id
+                         and i.get("enabled")]
+        if not installations:
+            return False, "installation missing or disabled"
+        return True, "ok"
+    except Exception as exc:  # noqa: BLE001 —— 信任判定必须整体 fail-closed
+        app.logger.warning("admin 插件信任判定异常（%s）：%r", plugin_id, exc)
+        return False, "trust check error"
+
+
+def _admin_plugin_workspace():
+    """解析可信 admin 插件的工作台上下文；不可信返回 ``(None, reason)``。
+
+    返回的 context（可信时）：
+      - ``plugin_id``：插件目录名（也是资源路由的 plugin_id 段）；
+      - ``entry``：manifest ui.entry（相对 bundle 根）；
+      - ``entry_url``：映射到 owner-only 资源路由的 iframe src；
+      - ``admin_permissions``：manifest 申请的 adminPermissions（宿主页注入
+        AdminBridge 作权限门查表用；申请≠授予，授予由信任判定+方法表决定）。
+    entry 非法（绝对路径 / 穿越 / 非白名单后缀）按不可信处理（fail-closed）。
+    """
+    for plugin_id in sorted(PRIVILEGED_ADMIN_PLUGIN_IDS):
+        trusted, reason = _admin_plugin_trusted(plugin_id)
+        if not trusted:
+            continue
+        try:
+            manifest = json.loads(
+                (_plugin_dir(plugin_id) / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None, "manifest unreadable"
+        entry = (manifest.get("ui") or {}).get("entry") or ""
+        entry_rel = entry.strip().lstrip("/")
+        parts = entry_rel.split("/")
+        ext = os.path.splitext(entry_rel)[1].lower()
+        if (not entry_rel or entry_rel.startswith("\\")
+                or any(p in ("", ".", "..") for p in parts)
+                or "\\" in entry_rel or ext != ".html"):
+            return None, "ui.entry invalid"
+        entry_url = "/admin/plugin-assets/%s/%s" % (plugin_id, entry_rel)
+        return {
+            "plugin_id": plugin_id,
+            "entry": entry_rel,
+            "entry_url": entry_url,
+            "admin_permissions": list(manifest.get("adminPermissions") or []),
+        }, "ok"
+    # 白名单里没有任何可信插件：报告首个不可信原因（降级页展示用）
+    first_reason = "admin plugin unavailable"
+    for plugin_id in sorted(PRIVILEGED_ADMIN_PLUGIN_IDS):
+        _, first_reason = _admin_plugin_trusted(plugin_id)
+        break
+    return None, first_reason
+
+
+def _bootstrap_admin_plugin_installation():
+    """幂等引导特权 admin 插件的 plugin_installations 行（PR3 fix）。
+
+    与 histopilot 的 ``_bootstrap_plugin_installations()`` 不同：admin 插件走
+    AdminBridge（owner session + CSRF），**不消费**插件 v1 的 secret/JWT 通道，
+    所以这里只建安装行、不生成/落盘任何凭证。
+
+    引导前置（缺一即跳过，**不抛错、不阻断启动**——降级页兜底）：
+      ① plugin_id 在 PRIVILEGED_ADMIN_PLUGIN_IDS；
+      ② bundle 目录存在且 manifest 可读；
+      ③ source-policy 存在该 id 的显式 sha256 pin（文件缺失/空表/null 均不引导）；
+      ④ 磁盘 manifest hash 与 pin 精确匹配，且 manifest 通过校验器、声明
+         admin.workspace slot（注意：此步**不依赖** installation 存在——它恰好
+         是信任判定的第①②③项，是第④项 installation enabled 的前置）。
+
+    幂等与不动既有行：已有同 plugin_id 安装行 → 原样返回（**不**重建、**不**
+    自动启用、也**不**自动禁用——hash/pin 失配时的 fail-closed 由
+    ``_admin_plugin_trusted`` 每请求重判，引导不做任何"修复"动作）。
+    """
+    for plugin_id in sorted(PRIVILEGED_ADMIN_PLUGIN_IDS):
+        try:
+            plugin_dir = _plugin_dir(plugin_id)
+            if plugin_dir is None:
+                continue
+            policy = _plugin_source_policy()
+            if not policy:
+                continue
+            expected = policy.get(plugin_id)
+            if not isinstance(expected, str) or \
+                    not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
+                continue
+            raw = (plugin_dir / "manifest.json").read_bytes()
+            if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(),
+                                       expected.lower()):
+                continue
+            manifest = json.loads(raw.decode("utf-8"))
+            if validate_manifest(manifest) or \
+                    ADMIN_WORKSPACE_SLOT not in ((manifest.get("ui") or {}).get("slots") or []):
+                continue
+            manifest_plugin_id = manifest.get("id") or plugin_id
+            existing = [i for i in share_store.list_plugin_installations()
+                        if i.get("plugin_id") == manifest_plugin_id]
+            if existing:
+                return existing[0]  # 幂等：已有行不轮换/不启用/不禁用
+            created = share_store.create_plugin_installation(
+                manifest_plugin_id, version=manifest.get("pluginVersion") or "")
+            out = dict(created)
+            out.pop("secret", None)
+            app.logger.info("admin 插件安装引导完成：%s", manifest_plugin_id)
+            return out
+        except Exception:
+            app.logger.warning("admin 插件安装引导失败（%s，不阻断启动）",
+                               plugin_id, exc_info=True)
+    return None
+
+
+def _admin_host_response(template_mode, status=200, **ctx):
+    """渲染 admin 宿主页族（forbidden / degraded / workspace），统一安全头。"""
+    html = render_template("admin_host.html", mode=template_mode, **ctx)
+    resp = Response(html, status=status)
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Content-Security-Policy"] = _ADMIN_HOST_CSP
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
+
+
+def _admin_asset_json(payload, status):
+    """admin 资源路由的错误响应：JSON + 统一安全头（nosniff/no-store 全响应）。"""
+    resp = jsonify(payload)
+    resp.status_code = status
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _admin_asset_html_csp():
+    """admin iframe entry HTML 的 CSP（须在请求上下文调用）。
+
+    **opaque origin 坑（PR3 fix）**：iframe 带 ``sandbox="allow-scripts"`` 且**无**
+    ``allow-same-origin``，文档 origin 变为 opaque。CSP 源表达式 ``'self'`` 按
+    受保护文档的 origin 做 scheme/host/port 匹配，而 opaque origin 没有可比对的
+    tuple origin——真实浏览器（Chromium/Firefox 按 CSP 规范）会把 ``script-src
+    'self'`` 下的**同源** .js/.css 一并拒绝（jsdom 类环境照不出来）。因此这里
+    不能写 'self'，必须写**显式部署 origin**（``request.host_url`` 派生，去尾
+    斜杠）——资源 URL 本来就是该 origin 下的同源路径，允许范围不变，安全语义
+    不变（真正的隔离边界是 iframe sandbox，CSP 只是纵深防御）。
+
+    ``frame-ancestors 'self'`` 保留：该指令按受保护资源 **URL** 与祖先链匹配
+    （在父页面上下文求值），不受文档 opaque origin 影响。
+    host_url 异常取不到时退化为全拒绝（fail-closed，宁可掐死脚本也不放宽）。
+    """
+    origin = (request.host_url or "").strip().rstrip("/")
+    if not origin or "://" not in origin:
+        return "default-src 'none'; %s" % _ADMIN_ASSET_HTML_CSP_FRAME_ANCESTORS
+    return ("default-src 'none'; script-src %(o)s; style-src %(o)s; "
+            "img-src %(o)s; %(fa)s" % {"o": origin,
+                                       "fa": _ADMIN_ASSET_HTML_CSP_FRAME_ANCESTORS})
+
+
+@app.route("/admin")
+def admin_workspace():
+    """owner-only admin 宿主页（§8.1，PR3）。
+
+    - 鉴权读 ``actor_identity()``（真实登录 owner，**不接受 preview effective
+      subject**）；未登录由 _require_auth 先行 302 ``/login?next=/admin``；
+    - 登录非 owner / 预览态激活（§14.1：preview subject 不得访问 admin）→ 403
+      简单错误页，不渲染任何 admin 内容；
+    - admin 插件可信且有 admin.workspace slot → 渲染宿主页（iframe 指向 §8.3
+      资源路由的 entry HTML）；否则渲染平台降级页（不影响 ``/`` Viewer）。
+    """
+    if actor_identity()["role"] != user_store.ROLE_OWNER:
+        return _admin_host_response("forbidden", status=403)
+    # §14.1：预览态下宿主页一律拒绝（桥接写方法本就会被 preview write guard
+    # 拦截，且宿主/预览两种视角并存只会制造 actor/subject 混淆）。
+    if AUTH_ENABLED and _preview_active():
+        return _admin_host_response("forbidden", status=403)
+    admin_plugin, reason = _admin_plugin_workspace()
+    if admin_plugin is None:
+        return _admin_host_response("degraded", admin_reason=reason)
+    return _admin_host_response(
+        "workspace",
+        admin_plugin=admin_plugin,
+        admin_entry_url=admin_plugin["entry_url"],
+        admin_permissions=admin_plugin["admin_permissions"],
+        # 与 static/admin-host.js 的 PROTOCOL_VERSION 保持一致（宿主侧有同值
+        # 兜底，此处注入使版本声明有单一来源）
+        admin_protocol_version="1.0.0")
+
+
+@app.route("/admin/plugin-assets/<plugin_id>/<path:filename>")
+def admin_plugin_asset(plugin_id, filename):
+    """owner-only admin 插件资源路由（§8.3）。
+
+    - 只服务**受信** admin 插件目录内文件（每次请求重新做信任判定，pin 变化 /
+      禁用即时生效）；未登录 401（_auth_challenge 前置），非 owner 403；
+    - 扩展名白名单 ``.html/.js/.css/.png/.webp``（.svg / source map / 其他一律
+      403）；路径穿越 / 绝对路径 / 反斜杠 / 符号链接逃逸全部拒绝（resolve 后
+      必须仍位于插件目录内）；
+    - 按后缀固定 MIME；所有响应 ``X-Content-Type-Options: nosniff`` +
+      ``Cache-Control: no-store``；HTML 另加严格 CSP。
+    """
+    if actor_identity()["role"] != user_store.ROLE_OWNER:
+        return _admin_asset_json({"error": "forbidden"}, 403)
+    trusted, reason = _admin_plugin_trusted(plugin_id)
+    if not trusted:
+        return _admin_asset_json({"error": "forbidden", "reason": reason}, 403)
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in _ADMIN_ASSET_ALLOWED_EXT:
+        return _admin_asset_json(
+            {"error": "forbidden", "reason": "extension not allowed"}, 403)
+    if (not filename or filename.startswith("/") or filename.startswith("\\")
+            or "\\" in filename or any(p in ("", ".", "..") for p in filename.split("/"))):
+        return _admin_asset_json(
+            {"error": "forbidden", "reason": "invalid path"}, 403)
+    plugin_dir = _plugin_dir(plugin_id)
+    if plugin_dir is None:
+        return _admin_asset_json({"error": "not_found"}, 404)
+    root = plugin_dir.resolve()
+    try:
+        target = (plugin_dir / filename).resolve()
+        target.relative_to(root)
+    except (OSError, ValueError):
+        return _admin_asset_json(
+            {"error": "forbidden", "reason": "path outside plugin directory"}, 403)
+    if not target.is_file():
+        return _admin_asset_json({"error": "not_found"}, 404)
+    try:
+        data = target.read_bytes()
+    except OSError:
+        return _admin_asset_json({"error": "not_found"}, 404)
+    resp = Response(data, mimetype=_ADMIN_ASSET_MIME[ext])
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Cache-Control"] = "no-store"
+    if ext == ".html":
+        # 显式 origin 而非 'self'（opaque origin 坑，见 _admin_asset_html_csp）
+        resp.headers["Content-Security-Policy"] = _admin_asset_html_csp()
+    return resp
 
 
 def _login_page(error=None, error_code=None, next_url="/", retry_after=0,
@@ -6378,6 +6698,11 @@ def _bootstrap_plugin_installations(environ=None):
 
 # 启动引导（幂等）：插件 v1 通道的 installation 凭证就位
 _HISTOPILOT_INSTALLATION = _bootstrap_plugin_installations()
+
+# 启动引导（幂等）：特权 admin 插件的安装行（PR3 fix）。前置是信任判定的
+# ①②③项（白名单 + 显式 pin + hash 精确匹配），不依赖也不替代每请求的
+# _admin_plugin_trusted 重判；失败/跳过 → /admin 走降级页，不阻断启动。
+_ADMIN_PLUGIN_INSTALLATION = _bootstrap_admin_plugin_installation()
 
 
 @app.route("/api/plugin/v1/auth/token", methods=["POST"])

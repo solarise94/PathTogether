@@ -42,6 +42,27 @@ MANIFEST_PERMISSIONS = (
     "viewer:navigate",
 )
 
+# Manifest v1.1（docs/admin-billing-plugin-implementation-plan.md §8.2/§8.4）：
+# 可选 ``adminPermissions`` 数组的枚举——admin 插件申请的 11 项管理能力，与
+# §8.4 AdminBridge method→permission 映射表一一对应（app.py 与
+# static/admin-host.js 各自持有同源常量，三处不得漂移）。
+# 注意：申请不建立信任——admin 插件信任由 PRIVILEGED_ADMIN_PLUGIN_IDS 白名单 +
+# source-policy 显式 sha256 pin + manifest hash 精确匹配 + installation enabled
+# 共同判定，永远 fail-closed（app.py _admin_plugin_trusted）。
+MANIFEST_ADMIN_PERMISSIONS = (
+    "admin:overview:read",
+    "admin:users:read",
+    "admin:users:write",
+    "admin:invites:read",
+    "admin:invites:write",
+    "admin:turn-budgets:read",
+    "admin:turn-budgets:write",
+    "admin:billing:read",
+    "admin:billing:write",
+    "admin:acquisition:read",
+    "admin:audit:read",
+)
+
 # semver core：major.minor.patch（不带 prerelease/build，保持 parse 简单；与
 # manifest.schema.json 的 pattern 一致）。
 _SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
@@ -386,6 +407,25 @@ def validate_manifest(d):
             elif p not in MANIFEST_PERMISSIONS:
                 errors.append("permissions[%d]=%r 不在允许枚举中（允许：%s）"
                               % (i, p, ", ".join(MANIFEST_PERMISSIONS)))
+
+    # ---- adminPermissions（可选，Manifest v1.1，docs §8.2）----
+    # 未声明 → 完全不受影响（旧 manifest 零迁移）；声明则必须是数组且逐项落在
+    # 11 项管理枚举内。admin 权限与普通 permissions 分开声明，避免 viewer 插件
+    # 语义混杂；申请本身不建立信任（见 MANIFEST_ADMIN_PERMISSIONS 注释）。
+    admin_perms = d.get("adminPermissions")
+    if admin_perms is not None:
+        if not isinstance(admin_perms, list):
+            errors.append("adminPermissions 需为数组，got %s"
+                          % type(admin_perms).__name__)
+        else:
+            for i, p in enumerate(admin_perms):
+                if not isinstance(p, str):
+                    errors.append("adminPermissions[%d] 需为字符串，got %s"
+                                  % (i, type(p).__name__))
+                elif p not in MANIFEST_ADMIN_PERMISSIONS:
+                    errors.append(
+                        "adminPermissions[%d]=%r 不在允许枚举中（允许：%s）"
+                        % (i, p, ", ".join(MANIFEST_ADMIN_PERMISSIONS)))
 
     # ---- provides（可选：插件对外提供的服务端能力，docs §3）----
     errors.extend(validate_provides(d))

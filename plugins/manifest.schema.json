@@ -95,6 +95,25 @@
         ]
       }
     },
+    "adminPermissions": {
+      "description": "可选（Manifest v1.1，docs/admin-billing-plugin-implementation-plan.md §8.2/§8.4）：admin 插件申请的管理能力枚举（11 项），与 §8.4 AdminBridge method→permission 映射表一一对应。申请不建立信任——admin 插件信任由代码级 PRIVILEGED_ADMIN_PLUGIN_IDS 白名单 + source-policy 显式 manifest sha256 pin + hash 精确匹配 + installation enabled 共同判定，永远 fail-closed。未声明该字段的旧 manifest 完全不受影响；未知值校验失败。",
+      "type": "array",
+      "items": {
+        "enum": [
+          "admin:overview:read",
+          "admin:users:read",
+          "admin:users:write",
+          "admin:invites:read",
+          "admin:invites:write",
+          "admin:turn-budgets:read",
+          "admin:turn-budgets:write",
+          "admin:billing:read",
+          "admin:billing:write",
+          "admin:acquisition:read",
+          "admin:audit:read"
+        ]
+      }
+    },
     "provides": {
       "description": "插件对外提供的服务端能力声明（docs §3，可选；不声明则完全不受影响）。每项经平台登记进能力注册表，由平台 dispatch 端点统一转发。accessMode 枚举含 write，但 P1 校验层（plugins/sdk/manifest.py）拒绝 write——先放行只读链路；requiredPermissions 是调用方主体必须持有的权限（枚举收窄为 4 项服务端权限，不含 viewer:navigate）。description 直接进 LLM 上下文（8~500 字，安装审核人工过目）。timeout_ms 可选（1~60000，缺省 15000）。",
       "type": "array",

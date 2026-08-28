@@ -65,10 +65,19 @@ def test_sample_manifest_validates_and_policy_pin_matches():
     data = json.loads(SAMPLE_MANIFEST.read_text(encoding="utf-8"))
     assert M.validate_manifest(data) == []
     policy = json.loads((REPO_ROOT / "plugins" / "source-policy.json").read_text(encoding="utf-8"))
-    # 防漂移守卫：两个内置示例插件的 manifest sha256 pin 均须与磁盘一致
-    assert set(policy) == {"sample-annotator", "sample-tma-score"}
+    # 防漂移守卫：三个内置插件的 manifest sha256 pin 均须与磁盘一致
+    # （pathtogether-admin pin 是 admin 宿主信任链的硬前提——_admin_plugin_trusted
+    # fail-closed 要求显式 pin + hash 精确匹配，docs §8.2）
+    admin_manifest = REPO_ROOT / "plugins" / "pathtogether-admin" / "manifest.json"
+    assert set(policy) == {"sample-annotator", "sample-tma-score", "pathtogether-admin"}
     assert policy["sample-annotator"] == _sha256(SAMPLE_MANIFEST)
     assert policy["sample-tma-score"] == _sha256(TMA_MANIFEST)
+    assert policy["pathtogether-admin"] == _sha256(admin_manifest)
+    # pathtogether-admin manifest（Manifest v1.1 adminPermissions）须通过校验器
+    admin = json.loads(admin_manifest.read_text(encoding="utf-8"))
+    assert M.validate_manifest(admin) == []
+    assert admin["ui"]["slots"] == ["admin.workspace"]
+    assert len(admin["adminPermissions"]) == len(M.MANIFEST_ADMIN_PERMISSIONS)
     # sample-tma-score 的 provides 声明须通过校验器（能力注册表登记前置）
     tma = json.loads(TMA_MANIFEST.read_text(encoding="utf-8"))
     assert M.validate_manifest(tma) == []

@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="referrer" content="no-referrer" />
+  <title>PathTogether · 管理工作台</title>
+  <!--
+    PR3 admin.workspace 宿主页（docs/admin-billing-plugin-implementation-plan.md §8.1/§8.3）。
+    - 仅真实登录 owner 可见（actor_identity 判定；预览态 403）；
+    - 响应头带 Cache-Control: no-store 与严格 CSP（app.py _admin_host_response），
+      因此本页**不写**内联 <style>/<script>（无 unsafe-inline）；
+    - admin 插件经 opaque iframe（sandbox="allow-scripts"，无 allow-same-origin/
+      allow-forms/allow-popups/allow-top-navigation）挂载，src 指向 owner-only 的
+      插件资源路由（§8.3）；
+    - 桥接宿主逻辑在 /static/admin-host.js：每次 iframe load 生成 256-bit 一次性
+      nonce，只接受精确 WindowProxy + nonce + 唯一 requestId 的消息（§8.3）。
+  -->
+  <link rel="stylesheet" href="/static/admin-host.css" />
+</head>
+<body class="adm-host-body">
+  {% if mode == "forbidden" %}
+  <main class="adm-host-wrap">
+    <section class="adm-host-card adm-host-card--error">
+      <h1>403 · 需要 owner 权限</h1>
+      <p>管理工作台仅对部署管理员（owner）开放；身份预览期间同样不可用。</p>
+      <p class="adm-host-actions"><a href="/">返回 Viewer</a></p>
+    </section>
+  </main>
+  {% elif mode == "degraded" %}
+  <main class="adm-host-wrap">
+    <section class="adm-host-card adm-host-card--warn">
+      <h1>管理插件当前不可用</h1>
+      <p>admin.workspace 插件未通过平台信任校验，管理工作台已降级。Viewer、登录与分享等平台功能不受影响。</p>
+      <p class="adm-host-reason">原因：<code>{{ admin_reason }}</code></p>
+      <p class="adm-host-note">常见原因：插件未安装或被禁用、来源策略未 pin 或 manifest 哈希不匹配。修复后刷新本页即可。</p>
+      <p class="adm-host-actions"><a href="/">返回 Viewer</a></p>
+    </section>
+  </main>
+  {% else %}
+  <header class="adm-host-header">
+    <div class="adm-host-header-inner">
+      <h1>PathTogether 管理工作台</h1>
+      <div class="adm-host-actions">
+        <button type="button" id="admin-reload-btn">重新加载插件</button>
+        <a href="/">返回 Viewer</a>
+      </div>
+    </div>
+  </header>
+  <main class="adm-host-main">
+    <iframe id="admin-plugin-frame"
+            title="PathTogether Admin 插件"
+            sandbox="allow-scripts"
+            referrerpolicy="no-referrer"
+            src="{{ admin_entry_url }}"
+            data-plugin-id="pathtogether-admin"
+            data-protocol-version="{{ admin_protocol_version }}"
+            data-admin-permissions="{{ admin_permissions | tojson }}"></iframe>
+  </main>
+  <script src="/static/admin-host.js"></script>
+  {% endif %}
+</body>
+</html>

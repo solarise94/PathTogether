@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>PathTogether Admin</title>
+  <!--
+    pathtogether-admin 插件 UI（PR3 骨架，docs/admin-billing-plugin-implementation-plan.md §8）。
+
+    运行环境：/admin 宿主页的 <iframe sandbox="allow-scripts"> 内 —— opaque origin：
+      - 不能读写 localStorage/cookie（也绝不尝试）；
+      - 不能直接 fetch 平台 API（同源 fetch 被 sandbox 阻断）；
+      - 一切平台数据经 AdminBridge postMessage 通道（static/admin-host.js 宿主侧）。
+
+    本页只加载相对路径的 style.css / main.js（解析为 owner-only 的
+    /admin/plugin-assets/pathtogether-admin/ui/*，同源 'self'，满足响应 CSP）。
+    不写内联 <style>/<script>（CSP 无 unsafe-inline）。
+  -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="adm-header">
+    <h1>PathTogether 管理工作台</h1>
+    <p class="adm-sub">admin.workspace 插件 · PR3 骨架（业务页面后续批次接入）</p>
+  </header>
+
+  <main id="adm-root" class="adm-root">
+    <section class="adm-card" id="adm-handshake-card">
+      <h2>桥接握手</h2>
+      <p id="adm-handshake-status" class="adm-status">等待宿主初始化消息…</p>
+    </section>
+
+    <section class="adm-card" id="adm-overview-card" hidden>
+      <h2>概览</h2>
+      <dl id="adm-actor-info" class="adm-kv"></dl>
+      <p class="adm-note">本批仅接入 admin.auth.get；overview / users / billing 等业务页面由后续批次（PR3b）填充。</p>
+    </section>
+
+    <section class="adm-card adm-error-card" id="adm-error-card" hidden>
+      <h2>错误</h2>
+      <p id="adm-error-text" class="adm-error-text"></p>
+    </section>
+  </main>
+
+  <script src="main.js"></script>
+</body>
+</html>

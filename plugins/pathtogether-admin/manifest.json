@@ -1,0 +1,30 @@
+{
+  "manifestSchemaVersion": "1.1.0",
+  "id": "pathtogether-admin",
+  "name": "PathTogether Admin",
+  "pluginVersion": "0.1.0",
+  "pluginContractVersion": "1.0.0",
+  "bridgeProtocolVersion": "1.0.0",
+  "ui": {
+    "entry": "ui/index.html",
+    "slots": ["admin.workspace"]
+  },
+  "service": {
+    "baseUrl": "/",
+    "health": "/healthz"
+  },
+  "permissions": [],
+  "adminPermissions": [
+    "admin:overview:read",
+    "admin:users:read",
+    "admin:users:write",
+    "admin:invites:read",
+    "admin:invites:write",
+    "admin:turn-budgets:read",
+    "admin:turn-budgets:write",
+    "admin:billing:read",
+    "admin:billing:write",
+    "admin:acquisition:read",
+    "admin:audit:read"
+  ]
+}

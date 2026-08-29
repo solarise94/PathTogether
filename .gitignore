@@ -28,3 +28,5 @@ certs/
 docs/demo-deployment.md
 docs/deepseek-files-api-research.md
 docs/open-registration-security-remediation.md
+test-results/
+playwright-report/

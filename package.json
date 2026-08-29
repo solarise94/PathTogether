@@ -3,10 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "test:js": "vitest run tests/js"
+    "test:js": "vitest run tests/js",
+    "test:e2e:admin": "playwright test"
   },
   "devDependencies": {
-    "vitest": "^3.2.7"
+    "vitest": "^3.2.7",
+    "@playwright/test": "^1.50.0"
   },
   "engines": {
     "node": ">=20"

@@ -25,7 +25,9 @@
 
 公开 API（backend 无关，返回普通 dict；时间戳一律 epoch 秒 float）：
   create_task / get_task / append_chunk / begin_commit / finish_commit /
-  fail_commit / rollback_committing / cancel_task / expire_task
+  fail_commit / rollback_committing / cancel_task / expire_task /
+  begin_legacy_commit（V1 单请求直入 committing）/ list_tasks（恢复扫描与
+  admin 观测的只读列举）
 
 错误类型（路由映射稳定错误码）：
   TaskNotFound / StateConflict / OffsetMismatch / ChunkConflict / SizeMismatch
@@ -192,6 +194,68 @@ def _decide_append(task, offset, length, sha256):
 
 
 # --------------------------------------------------------------------------- #
+# V1 artifact manifest（review-2026-08-29 §10.4 G7）
+# --------------------------------------------------------------------------- #
+def _encode_artifacts(artifacts):
+    """校验并归一 V1 artifact manifest（[{name, size, sha256, slide}]）。
+
+    返回新构造的 list[dict]（不引用调用方对象）；非法抛 UploadTaskError。
+    name 允许嵌套 "/"（MRXS 伴侣目录），拒绝绝对路径 / ".." / 反斜杠 / 空名。
+    """
+    if not isinstance(artifacts, (list, tuple)) or not artifacts:
+        raise UploadTaskError("artifact manifest 不能为空")
+    out = []
+    for a in artifacts:
+        if not isinstance(a, dict):
+            raise UploadTaskError("artifact 项需为 dict")
+        name = a.get("name")
+        if (not isinstance(name, str) or not name
+                or name.startswith("/") or "\\" in name or "\x00" in name
+                or any(p == ".." for p in name.split("/"))):
+            raise UploadTaskError("artifact 名非法：%r" % (name,))
+        try:
+            size = int(a.get("size"))
+        except (TypeError, ValueError):
+            raise UploadTaskError("artifact size 需为整数：%r" % (a.get("size"),))
+        if size < 0:
+            raise UploadTaskError("artifact size 需为非负整数")
+        sha = a.get("sha256")
+        out.append({
+            "name": name,
+            "size": size,
+            "sha256": (str(sha) if sha else None),
+            "slide": bool(a.get("slide")),
+        })
+    if sum(o["size"] for o in out) <= 0:
+        raise UploadTaskError("artifact 总字节数需为正")
+    return out
+
+
+def _artifacts_to_db(v):
+    """list[dict] → PG TEXT 列的 JSON 字符串（None 原样）。"""
+    if v is None:
+        return None
+    return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+
+
+def _artifacts_from_db(v):
+    """PG TEXT 列 / json 后端内存值 → list（V2 任务为 None）。
+
+    损坏（非法 JSON / 非数组）返回 **[]**（空列表）：与 None（=V2 任务）区分，
+    调用方按「manifest 丢失但任务是 V1」的证据冲突 fail-closed，绝不猜。
+    """
+    if v is None:
+        return None
+    if isinstance(v, list):
+        return v
+    try:
+        data = json.loads(v)
+    except (ValueError, TypeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+# --------------------------------------------------------------------------- #
 # 字段表（两后端同序；PG INSERT 显式列序依赖它）
 # --------------------------------------------------------------------------- #
 _TASK_FIELDS = (
@@ -199,7 +263,7 @@ _TASK_FIELDS = (
     "chunk_size", "confirmed_offset", "last_chunk_offset", "last_chunk_length",
     "last_chunk_sha256", "sha256_expected", "sha256_actual", "reservation_id",
     "state", "commit_token", "commit_started_at", "expires_at", "created_at",
-    "updated_at",
+    "updated_at", "v1_artifacts",
 )
 
 # epoch 秒（float/int）入参 → timestamptz 的键
@@ -323,7 +387,17 @@ def _norm_row(row):
     for k in _TS_KEYS:
         v = out.get(k)
         out[k] = v.timestamp() if hasattr(v, "timestamp") else (float(v) if v else None)
+    out["v1_artifacts"] = _artifacts_from_db(out.get("v1_artifacts"))
     return out
+
+
+def _to_db_value(key, value):
+    """task 字段 → PG 参数（epoch → timestamptz；manifest list → JSON 文本）。"""
+    if key in _TS_KEYS and isinstance(value, (int, float)):
+        return _epoch_to_dt(value)
+    if key == "v1_artifacts":
+        return _artifacts_to_db(value)
+    return value
 
 
 def _pg_update(conn, upload_id, fields):
@@ -331,8 +405,7 @@ def _pg_update(conn, upload_id, fields):
     sets, params = [], []
     for k, v in fields.items():
         sets.append("%s = %%s" % k)
-        params.append(_epoch_to_dt(v) if (k in _TS_KEYS and isinstance(v, (int, float)))
-                      else v)
+        params.append(_to_db_value(k, v))
     sets.append("updated_at = now()")
     params.append(upload_id)
     with conn.cursor() as cur:
@@ -376,6 +449,24 @@ def _apply(upload_id, mutate):
 # --------------------------------------------------------------------------- #
 # 公共 API（双后端统一）
 # --------------------------------------------------------------------------- #
+def _task_row(task):
+    """task dict → 与 _TASK_FIELDS 同序的 PG INSERT 参数元组。"""
+    return tuple(_to_db_value(k, task[k]) for k in _TASK_FIELDS)
+
+
+def _pg_insert(task):
+    conn = _pg_connect()
+    try:
+        with pg_store.transaction(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO upload_tasks (%s) VALUES (%s)"
+                    % (_PG_COLS, ", ".join(["%s"] * len(_TASK_FIELDS))),
+                    _task_row(task))
+    finally:
+        conn.close()
+
+
 def create_task(owner_user_id, filename, safe_name, declared_size, chunk_size,
                 sha256_expected=None, reservation_id=None, ttl_seconds=None):
     """创建任务（state=active，confirmed_offset=0）。返回新任务 dict。"""
@@ -401,21 +492,10 @@ def create_task(owner_user_id, filename, safe_name, declared_size, chunk_size,
         "expires_at": now + ttl,
         "created_at": now,
         "updated_at": now,
+        "v1_artifacts": None,
     }
     if _use_pg():
-        conn = _pg_connect()
-        try:
-            with pg_store.transaction(conn):
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "INSERT INTO upload_tasks (%s) VALUES (%s)"
-                        % (_PG_COLS, ", ".join(["%s"] * len(_TASK_FIELDS))),
-                        tuple(_epoch_to_dt(task[k])
-                              if k in _TS_KEYS and task[k] is not None
-                              else task[k]
-                              for k in _TASK_FIELDS))
-        finally:
-            conn.close()
+        _pg_insert(task)
         return task
 
     def _do(f):
@@ -423,6 +503,103 @@ def create_task(owner_user_id, filename, safe_name, declared_size, chunk_size,
         data["tasks"][task["upload_id"]] = task
         _save_locked(f, data)
         return task
+
+    return _with_lock(_do)
+
+
+def begin_legacy_commit(owner_user_id, filename, safe_name, artifacts,
+                        reservation_id=None, ttl_seconds=None):
+    """V1（旧单请求 /api/upload）的 commit 受理（review-2026-08-29 §10.4 G7）。
+
+    与 V2「create_task → 分片 → begin_commit」不同：V1 无分片阶段，请求字节
+    在受理前已全部落盘并通过内容验证，故「建任务 + 受理 commit（committing +
+    commit_token + artifact manifest + reservation 绑定）」合并为**一次原子
+    写**（json 文件锁内单次落盘 / PG 单条 INSERT 短事务）——崩溃只见完整
+    旧/新版，不会留下无人认领的 active 任务，也无需第二张补偿表。
+
+    artifacts 为**提升之前**持久化的 manifest（_encode_artifacts 校验归一）；
+    declared_size = confirmed_offset = settle_bytes = Σsize（提升后转实占的
+    权威字节数）。返回 (upload_id, commit_token, task)。
+    """
+    arts = _encode_artifacts(artifacts)
+    total = sum(int(a["size"]) for a in arts)
+    ttl = (UPLOAD_TASK_TTL_SECONDS if ttl_seconds is None else int(ttl_seconds))
+    # 任务 TTL 至少盖过 commit 超时窗口（同 begin_commit）
+    ttl = max(ttl, 2 * UPLOAD_COMMIT_TIMEOUT_SECONDS)
+    now = time.time()
+    task = {
+        "upload_id": _new_task_id(),
+        "owner_user_id": str(owner_user_id or ""),
+        "filename": str(filename),
+        "safe_name": str(safe_name),
+        "declared_size": total,
+        "chunk_size": 0,
+        "confirmed_offset": total,
+        "last_chunk_offset": None,
+        "last_chunk_length": None,
+        "last_chunk_sha256": None,
+        "sha256_expected": None,
+        "sha256_actual": None,
+        "reservation_id": (str(reservation_id) if reservation_id else None),
+        "state": STATE_COMMITTING,
+        "commit_token": "uct_" + secrets.token_hex(16),
+        "commit_started_at": now,
+        "expires_at": now + ttl,
+        "created_at": now,
+        "updated_at": now,
+        "v1_artifacts": arts,
+    }
+    if _use_pg():
+        _pg_insert(task)
+        return task["upload_id"], task["commit_token"], task
+
+    def _do(f):
+        data = _load_locked(f)
+        data["tasks"][task["upload_id"]] = task
+        _save_locked(f, data)
+        return task
+
+    t = _with_lock(_do)
+    return t["upload_id"], t["commit_token"], t
+
+
+def list_tasks(*, owner_user_id=None, state=None):
+    """任务快照列举（不加锁读；恢复扫描与 admin 观测用，§10.4 G7）。
+
+    过滤条件相与；owner_user_id="" 匹配本地免登录 owner 归一后的任务。
+    返回 list[task]（created_at 升序 + upload_id tie-break，双后端同序）。
+    """
+    if _use_pg():
+        sql = "SELECT %s FROM upload_tasks" % _PG_COLS
+        conds, params = [], []
+        if owner_user_id is not None:
+            conds.append("owner_user_id = %s")
+            params.append(str(owner_user_id))
+        if state is not None:
+            conds.append("state = %s")
+            params.append(str(state))
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        sql += " ORDER BY created_at, upload_id"
+        conn = _pg_connect()
+        try:
+            with pg_store.transaction(conn):
+                with conn.cursor() as cur:
+                    cur.execute(sql, tuple(params))
+                    return [_norm_row(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def _do(f):
+        tasks = list(_load_locked(f)["tasks"].values())
+        if owner_user_id is not None:
+            tasks = [t for t in tasks
+                     if str(t.get("owner_user_id") or "") == str(owner_user_id)]
+        if state is not None:
+            tasks = [t for t in tasks if t.get("state") == state]
+        tasks.sort(key=lambda t: (float(t.get("created_at") or 0),
+                                  str(t.get("upload_id") or "")))
+        return tasks
 
     return _with_lock(_do)
 

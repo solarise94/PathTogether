@@ -838,9 +838,10 @@ def test_reconcile_consume_failed_extends_instead_of_blind_release(monkeypatch):
     assert demo_store.get_session(cap["id"])["run_state"] == "reserved"
     assert budget_store.get_reservation(rid)["state"] == "reserved"
     assert budget_store.get_reservation(rid)["reservation_expires_at"] > time.time()
-    # 后台线程不得再盲 reclaim（源码守卫）
+    # 后台线程只走确认式对账；盲回收钩子已整体删除（符号不存在，防误接回）
     loop_src = inspect.getsource(app_mod._start_budget_reclaim_thread)
-    assert "reclaim_expired_reservations()" not in loop_src.split("def _loop")[1]
+    assert "reconcile_expired_reservations()" in loop_src.split("def _loop")[1]
+    assert not hasattr(app_mod, "reclaim_expired_reservations")
 
 
 @pg_only

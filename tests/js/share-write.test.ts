@@ -145,3 +145,94 @@ describe("share.js 写请求契约（token 即凭据，无主站 CSRF 头）", (
 		expect(fetchImpl).not.toHaveBeenCalled();
 	});
 });
+
+// ========================================================================== //
+// G8 倍率徽章：唯一口径 HP_ViewerCore.zoomText，单调且三页面同源
+// （review-2026-08-29 §10.4 G8）
+// ========================================================================== //
+const viewerCoreSrc = readFileSync(resolve(here, "../../static/viewer-core.js"), "utf8");
+const appSrc = readFileSync(resolve(here, "../../static/app.js"), "utf8");
+const demoSrc = readFileSync(resolve(here, "../../static/demo.js"), "utf8");
+const shareHtml = readFileSync(resolve(here, "../../templates/share.html"), "utf8");
+
+function loadViewerCore() {
+	const w: Record<string, unknown> = {};
+	new Function("window", viewerCoreSrc)(w);
+	return w.HP_ViewerCore as {
+		zoomText: (viewer: unknown, mppX: unknown) => string;
+		formatMag: (mag: number) => string;
+	};
+}
+
+function fakeViewer(zoom: number) {
+	return {
+		viewport: {
+			getZoom: () => zoom,
+			getContainerSize: () => ({ x: 1000 }),
+		},
+		source: { dimensions: { x: 2000 } },
+	};
+}
+
+function magValue(text: string): number {
+	// "40×" / "1.2k×" / "3.4M×" / "57%" → 数值；"—" 视为 -Infinity
+	if (text === "—" || text === "") return -Infinity;
+	const m = String(text).match(/^([\d.]+)(k|M)?[%×]?$/);
+	if (!m) throw new Error("unexpected zoomText output: " + text);
+	let v = parseFloat(m[1]);
+	if (m[2] === "k") v *= 1e3;
+	if (m[2] === "M") v *= 1e6;
+	return v;
+}
+
+describe("G8 倍率徽章：唯一口径 viewer-core.zoomText（三页面同源 + 单调）", () => {
+	it("zoom 增大时倍率单调不减（mpp 有效，imageZoom × 10/mpp）", () => {
+		const core = loadViewerCore();
+		const mpp = 0.5; // 20× 物镜
+		let prev = -Infinity;
+		for (let i = 0; i <= 40; i++) {
+			const zoom = 0.05 * Math.pow(1.25, i); // 视口缩放递增
+			const v = magValue(core.zoomText(fakeViewer(zoom), mpp));
+			expect(v).toBeGreaterThanOrEqual(prev);
+			prev = v;
+		}
+		// 1× 图像像素/屏幕像素 且 mpp=0.5 → 20×（物镜等效）
+		expect(core.zoomText(fakeViewer(2), 0.5)).toBe("20×");
+	});
+
+	it("无 mpp 时退回百分比，同样单调", () => {
+		const core = loadViewerCore();
+		let prev = -Infinity;
+		for (let i = 0; i <= 20; i++) {
+			const zoom = 0.1 * Math.pow(1.3, i);
+			const v = magValue(core.zoomText(fakeViewer(zoom), null));
+			expect(v).toBeGreaterThanOrEqual(prev);
+			prev = v;
+		}
+	});
+
+	it("同一输入下 formatMag 是唯一展示格式（app/share/viewer-core 无第二套公式）", () => {
+		const core = loadViewerCore();
+		// 与 app.js/demo.js 的显示格式同源：由 viewer-core.formatMag 定义
+		expect(core.formatMag(20)).toBe("20×");
+		expect(core.formatMag(1234)).toMatch(/1k|1234/);
+	});
+
+	it("share.js 已删除本地倍率公式：不含 25400 / 本地 formatMag，只调 zoomText", () => {
+		expect(shareSrc).not.toContain("25400");
+		expect(shareSrc).not.toMatch(/function\s+formatMag\s*\(/);
+		expect(shareSrc).not.toMatch(/function\s+updateMag\s*\(/);
+		expect(shareSrc).toMatch(/HP_ViewerCore\.zoomText/);
+		// 倍率数值换算只允许出现在 viewer-core（app.js 已委托；demo.js 已委托）
+		expect(appSrc).toMatch(/HP_ViewerCore\.zoomText/);
+		expect(demoSrc).toMatch(/HP_ViewerCore\.zoomText/);
+	});
+
+	it("share.html 在 share.js 之前加载带版本的 viewer-core.js", () => {
+		const coreIdx = shareHtml.indexOf("/static/viewer-core.js");
+		const shareIdx = shareHtml.indexOf("/static/share.js");
+		expect(coreIdx).toBeGreaterThan(-1);
+		expect(shareIdx).toBeGreaterThan(coreIdx);
+		expect(shareHtml).toMatch(/viewer-core\.js\?v=/); // 与主站同 cache-bust 约定
+	});
+});

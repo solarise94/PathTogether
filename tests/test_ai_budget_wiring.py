@@ -19,8 +19,10 @@ PG 模式（RUN_PG_TESTS=1）追加：
   - HistoPilot 4xx / 不可达 → release 回退；2xx → consume；
   - run grant 签发失败 → 503 不转发且不扣额度；
   - owner GET/PUT/reset 预算 API（含校验与 audit）；
-  - reclaim_expired_reservations 时间回收钩子。
+  - reclaim_expired_reservations 已删除（盲时间回收被确认式对账否定；
+    守卫断言符号不存在，防止误接回）。
 """
+import inspect
 import ipaddress
 import json
 import os
@@ -693,16 +695,19 @@ def test_stream_reconnect_and_cancel_do_not_reserve():
     assert _platform_report() == 0
 
 
-@pg_only
-def test_reclaim_expired_reservations_hook():
-    rid = _rid()
-    budget_store.reserve_turn(rid, "user", "usr_z", "platform", ttl_seconds=60)
-    # json 语义：wrapper 在无预算后端 no-op；PG 下未过期不回收
-    assert app_mod.reclaim_expired_reservations() == []
-    reclaimed = app_mod.reclaim_expired_reservations(time.time() + 120)
-    assert [r["request_id"] for r in reclaimed] == [rid]
-    assert budget_store.get_reservation(rid)["state"] == "released"
-    assert _platform_report() == 0
+def test_reclaim_expired_reservations_removed():
+    """盲时间回收钩子已删除（review 2026-08-29 §10.3 阶段 5）。
+
+    其语义（按 expires_at 到期即退款）被确认式对账明确否定：HistoPilot
+    不可达/未确认的过期预占必须顺延，盲回收会把已接受的执行误退款。守卫
+    断言 app 层符号不存在，防止未来误接回；budget_store.reclaim_expired
+    原语本身保留（其直接单测在 test_budget_store.py）。
+    """
+    assert not hasattr(app_mod, "reclaim_expired_reservations")
+    assert "def reclaim_expired_reservations" not in inspect.getsource(app_mod)
+    # 后台线程只走确认式对账（源码守卫）
+    loop_src = inspect.getsource(app_mod._start_budget_reclaim_thread)
+    assert "reconcile_expired_reservations()" in loop_src.split("def _loop")[1]
 
 
 # --------------------------------------------------------------------------- #

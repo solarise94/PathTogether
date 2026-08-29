@@ -10,7 +10,9 @@
   - 磁盘水位在解压过程中触发（507）；
   - PG（RUN_PG_TESTS=1）：展开总量超过预占 → 原子 topup；quota 不足 → 413。
 
-直接调 _extract_zip_to_upload（端点级流程在 test_upload_guard.py 覆盖）。
+直接调 _prepare_zip_bundle + _promote_zip_bundle 两阶段（G7：生产端点在
+两阶段之间插入 task intent = upload_task_store.begin_legacy_commit，端点级
+流程在 test_upload_guard.py / test_upload_accounting_recovery.py 覆盖）。
 """
 import io
 import os
@@ -78,6 +80,26 @@ def _make_zip_raw(infos, path=None):
     return path
 
 
+def _extract_and_promote(z, reservation=None):
+    """旧 _extract_zip_to_upload 的两阶段等价（G7 拆分后的测试聚合器）。
+
+    生产端点在 prepare 与 promote 之间持久化 task intent（manifest）；本
+    helper 只聚合解压/识别/防护与提升本身，返回旧契约 (main, extracted) 或
+    (msg, status)。
+    """
+    result = app_mod._prepare_zip_bundle(z, reservation=reservation)
+    if isinstance(result, tuple):
+        return result
+    bundle = result
+    try:
+        app_mod._promote_zip_bundle(bundle)
+    except FileExistsError:
+        return ("名称不可用", 409)
+    except OSError as e:
+        return (str(e), 400)
+    return bundle["main"], sorted(set(bundle["slides"]))
+
+
 def _residue():
     return [p.name for p in Path(UPLOAD_DIR).iterdir()
             if p.name.startswith(".uploading-")
@@ -96,7 +118,7 @@ def _no_slide_residue(*names):
 # =========================================================================== #
 def test_legal_single_file_zip():
     z = _make_zip([("a.svs", SVS)])
-    result = app_mod._extract_zip_to_upload(z)
+    result = _extract_and_promote(z)
     assert not isinstance(result[1], int), result
     main, extracted = result
     assert main == "a.svs"
@@ -112,7 +134,7 @@ def test_legal_mrxs_with_companion_dir():
         ("S/Slidedat.ini", b"ini"),
         ("S/Level_0/data.dat", b"dat"),
     ])
-    main, extracted = app_mod._extract_zip_to_upload(z)
+    main, extracted = _extract_and_promote(z)
     # 返回契约：extracted 只列有效切片文件；伴侣目录文件随 bundle 落盘
     assert main == "S.mrxs"
     assert extracted == ["S.mrxs"]
@@ -125,7 +147,7 @@ def test_legal_mrxs_with_companion_dir():
 def test_legal_multi_layer_wrapped_zip():
     """文件夹打包产生的多层包装：逐层剥掉后按顶层 bundle 识别。"""
     z = _make_zip([("wrap/inner/S.mrxs", b"m"), ("wrap/inner/S/d.dat", b"d")])
-    main, extracted = app_mod._extract_zip_to_upload(z)
+    main, extracted = _extract_and_promote(z)
     assert main == "S.mrxs"
     assert extracted == ["S.mrxs"]
     assert (Path(UPLOAD_DIR) / "S" / "d.dat").exists()
@@ -133,7 +155,7 @@ def test_legal_multi_layer_wrapped_zip():
 
 def test_legal_multiple_single_file_slides():
     z = _make_zip([("a.svs", SVS), ("b.tif", b"tif-bytes")])
-    main, extracted = app_mod._extract_zip_to_upload(z)
+    main, extracted = _extract_and_promote(z)
     assert set(extracted) == {"a.svs", "b.tif"}
 
 
@@ -144,7 +166,7 @@ def test_declared_member_size_over_limit(monkeypatch):
     """随机数据（压缩比≈1）超单成员上限 → 拒绝（不依赖压缩比触发）。"""
     monkeypatch.setattr(app_mod, "ZIP_MAX_MEMBER_BYTES", 1000)
     z = _make_zip([("a.svs", os.urandom(5000))])
-    msg, status = app_mod._extract_zip_to_upload(z)
+    msg, status = _extract_and_promote(z)
     assert status == 400 and "大小上限" in msg
     _no_slide_residue("a.svs")
 
@@ -153,7 +175,7 @@ def test_total_expansion_over_limit(monkeypatch):
     monkeypatch.setattr(app_mod, "ZIP_MAX_MEMBER_BYTES", 10 ** 9)
     monkeypatch.setattr(app_mod, "ZIP_MAX_TOTAL_BYTES", 2000)
     z = _make_zip([("a.svs", os.urandom(1200)), ("b.svs", os.urandom(1200))])
-    msg, status = app_mod._extract_zip_to_upload(z)
+    msg, status = _extract_and_promote(z)
     assert status == 400 and "总展开量" in msg
     _no_slide_residue("a.svs", "b.svs")
 
@@ -161,7 +183,7 @@ def test_total_expansion_over_limit(monkeypatch):
 def test_extreme_compression_ratio_rejected():
     """全零数据（deflate 后极小）→ 声明/实际都在限内但压缩比异常 → 拒绝。"""
     z = _make_zip([("a.svs", b"\x00" * (1024 * 1024))])  # 1 MiB 零 → 比例 >1000
-    msg, status = app_mod._extract_zip_to_upload(z)
+    msg, status = _extract_and_promote(z)
     assert status == 400 and "压缩比" in msg
     _no_slide_residue("a.svs")
 
@@ -169,14 +191,14 @@ def test_extreme_compression_ratio_rejected():
 def test_too_many_members(monkeypatch):
     monkeypatch.setattr(app_mod, "ZIP_MAX_MEMBERS", 5)
     z = _make_zip([("S.mrxs", b"m")] + [("S/f%d.dat" % i, b"d") for i in range(6)])
-    msg, status = app_mod._extract_zip_to_upload(z)
+    msg, status = _extract_and_promote(z)
     assert status == 400 and "成员数" in msg
     _no_slide_residue("S.mrxs")
 
 
 def test_deep_path_rejected():
     z = _make_zip([("a/b/c/d/e/f/g/h/i.svs", SVS)])  # 深度 9 > 8
-    msg, status = app_mod._extract_zip_to_upload(z)
+    msg, status = _extract_and_promote(z)
     assert status == 400 and "路径深度" in msg
     _no_slide_residue("a")
 
@@ -184,14 +206,14 @@ def test_deep_path_rejected():
 def test_duplicate_normalized_path_rejected():
     """大小写不敏感文件系统上的覆盖攻击：大小写变体也算重复。"""
     z = _make_zip([("S/a.dat", b"1"), ("S/A.dat", b"2"), ("S.mrxs", b"m")])
-    msg, status = app_mod._extract_zip_to_upload(z)
+    msg, status = _extract_and_promote(z)
     assert status == 400 and "重复路径" in msg
     _no_slide_residue("S.mrxs", "S")
 
 
 def test_exact_duplicate_path_rejected():
     z = _make_zip([("a.svs", SVS), ("a.svs", SVS)])
-    msg, status = app_mod._extract_zip_to_upload(z)
+    msg, status = _extract_and_promote(z)
     assert status == 400 and "重复路径" in msg
     _no_slide_residue("a.svs")
 
@@ -201,7 +223,7 @@ def test_symlink_member_rejected():
     zi.create_system = 3
     zi.external_attr = (0o120777 << 16)  # S_IFLNK | 0777
     z = _make_zip_raw([(zi, b"a.svs")])
-    msg, status = app_mod._extract_zip_to_upload(z)
+    msg, status = _extract_and_promote(z)
     assert status == 400 and "非法成员类型" in msg
     _no_slide_residue("link.svs", "a.svs")
 
@@ -211,7 +233,7 @@ def test_device_member_rejected():
     zi.create_system = 3
     zi.external_attr = (stat_mod.S_IFCHR | 0o644) << 16
     z = _make_zip_raw([(zi, b"")])
-    msg, status = app_mod._extract_zip_to_upload(z)
+    msg, status = _extract_and_promote(z)
     assert status == 400 and "非法成员类型" in msg
 
 
@@ -234,28 +256,28 @@ def test_encrypted_member_rejected():
         return infos
 
     with mock.patch.object(zipfile.ZipFile, "infolist", _encrypted_infolist):
-        msg, status = app_mod._extract_zip_to_upload(z)
+        msg, status = _extract_and_promote(z)
     assert status == 400 and "加密成员" in msg
     _no_slide_residue("a.svs")
 
 
 def test_unrelated_toplevel_file_rejected():
     z = _make_zip([("a.svs", SVS), ("readme.txt", b"unrelated")])
-    msg, status = app_mod._extract_zip_to_upload(z)
+    msg, status = _extract_and_promote(z)
     assert status == 400
     _no_slide_residue("a.svs", "readme.txt")
 
 
 def test_unrelated_toplevel_dir_rejected():
     z = _make_zip([("a.svs", SVS), ("other/x.bin", b"unrelated")])
-    msg, status = app_mod._extract_zip_to_upload(z)
+    msg, status = _extract_and_promote(z)
     assert status == 400
     _no_slide_residue("a.svs", "other")
 
 
 def test_no_slide_in_zip_rejected():
     z = _make_zip([("data/x.bin", b"nope")])
-    msg, status = app_mod._extract_zip_to_upload(z)
+    msg, status = _extract_and_promote(z)
     assert status == 400
     _no_slide_residue("data")
 
@@ -263,12 +285,12 @@ def test_no_slide_in_zip_rejected():
 def test_zip_slip_regression():
     """绝对路径 member → 「非法路径」拒绝；.. member 被跳过（绝不落盘父目录）。"""
     z = _make_zip([("/abs/evil.svs", SVS)])
-    msg, status = app_mod._extract_zip_to_upload(z)
+    msg, status = _extract_and_promote(z)
     assert status == 400 and "非法路径" in msg
     _no_slide_residue("abs")
     # ".." member：隐藏文件过滤先行跳过（既有行为），任何情况下不得写出
     z2 = _make_zip([("../evil.svs", SVS)])
-    msg2, status2 = app_mod._extract_zip_to_upload(z2)
+    msg2, status2 = _extract_and_promote(z2)
     assert status2 == 400
     _no_slide_residue("evil.svs")
     assert not (Path(UPLOAD_DIR).parent / "evil.svs").exists()
@@ -295,7 +317,7 @@ def test_actual_stream_exceeds_declared_backstop(monkeypatch):
     import unittest.mock as mock
     with mock.patch.object(zipfile.ZipFile, "open",
                            lambda self, name, mode="r", pwd=None: _FatStream()):
-        msg, status = app_mod._extract_zip_to_upload(z)
+        msg, status = _extract_and_promote(z)
     assert status == 400 and "实际展开量" in msg
     _no_slide_residue("a.svs")
 
@@ -305,7 +327,7 @@ def test_watermark_during_extraction_507(monkeypatch):
     monkeypatch.setattr(app_mod, "ZIP_WATERMARK_CHECK_BYTES", 1)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 10 ** 15)
     z = _make_zip([("a.svs", SVS)])
-    msg, status = app_mod._extract_zip_to_upload(z)
+    msg, status = _extract_and_promote(z)
     assert status == 507
     _no_slide_residue("a.svs")
 
@@ -316,7 +338,7 @@ def test_watermark_during_extraction_507(monkeypatch):
 def test_target_conflict_unified_409_no_name_leak():
     (Path(UPLOAD_DIR) / "a.svs").write_bytes(b"existing")  # 可能是其他用户的
     z = _make_zip([("a.svs", SVS)])
-    msg, status = app_mod._extract_zip_to_upload(z)
+    msg, status = _extract_and_promote(z)
     assert status == 409
     assert msg == "名称不可用"  # 不回显冲突文件名
     assert (Path(UPLOAD_DIR) / "a.svs").read_bytes() == b"existing"  # 未覆盖
@@ -350,7 +372,7 @@ def test_zip_expansion_topup_success():
     r = upload_guard.reserve_upload(uid, 100)  # CL 提示值远小于展开量
     # 随机数据：压缩比 ≈1，避免触发压缩比闸（本用例只测 topup 路径）
     z = _make_zip([("S.mrxs", b"m"), ("S/d.dat", os.urandom(5000))])
-    result = app_mod._extract_zip_to_upload(z, reservation=r)
+    result = _extract_and_promote(z, reservation=r)
     assert not isinstance(result[1], int), result
     # topup 后预占 = 实际展开总量（1 字节 mrxs + 5000 字节 dat）
     refreshed = upload_guard.get_reservation(r["reservation_id"])
@@ -367,7 +389,7 @@ def test_zip_expansion_topup_quota_exceeded():
     _set_quota(uid, 3000)  # 展开总量 5005 超配额
     r = upload_guard.reserve_upload(uid, 100)
     z = _make_zip([("S.mrxs", b"m"), ("S/d.dat", os.urandom(5000))])
-    msg, status = app_mod._extract_zip_to_upload(z, reservation=r)
+    msg, status = _extract_and_promote(z, reservation=r)
     assert status == 413
     _no_slide_residue("S.mrxs", "S")
     upload_guard.release_reservation(r["reservation_id"])

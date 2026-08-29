@@ -533,6 +533,63 @@ def _resolve_auth_enabled(environ=None):
 
 AUTH_ENABLED = _resolve_auth_enabled()
 
+
+# --------------------------------------------------------------------------- #
+# 启动期 share store 只读 probe（review-2026-08-29 G1/DS-1，与另一分支的
+# shares fail-closed 改造的兼容约定）：
+#   - share_store_json 引入 ShareStoreCorrupt / ShareStoreUnavailable 后，
+#     损坏的 shares.json 不再被静默折叠为空库——本侧用 getattr 兼容探测：
+#     异常类已合入 → 分流 fail-fast SystemExit（类别稳定）；
+#     尚未合入 → 仍执行同一只读 API（get_share 不存在的 token），probe 结构
+#     就位，合入后无需再改这里；
+#   - 运行期同类异常由下方 errorhandler 稳定映射 503
+#     share_store_corrupt / share_store_unavailable（异常类存在才注册）。
+# --------------------------------------------------------------------------- #
+def _probe_share_store_at_startup():
+    """启动只读 probe：分享库不可读/损坏时拒绝启动（仿 _resolve_auth_enabled）。"""
+    corrupt = getattr(share_store, "ShareStoreCorrupt", ())
+    unavailable = getattr(share_store, "ShareStoreUnavailable", ())
+    try:
+        probe = getattr(share_store, "probe_readable", None)
+        if callable(probe):
+            probe()
+        else:
+            share_store.get_share("__startup_probe__")
+    except SystemExit:
+        raise
+    except Exception as e:
+        if corrupt and isinstance(e, corrupt):
+            raise SystemExit(
+                "[startup] 分享库（shares 存储）损坏（share_store_corrupt）："
+                "拒绝启动以免空库写回销毁数据；请从备份恢复后重启。") from e
+        if unavailable and isinstance(e, unavailable):
+            raise SystemExit(
+                "[startup] 分享库（shares 存储）不可读（share_store_unavailable）："
+                "拒绝启动；请检查存储挂载/权限后重启。") from e
+        raise
+    return True
+
+
+def _register_share_store_error_handlers():
+    """运行期 share store 专用异常 → 稳定 503（异常类存在才注册）。"""
+    for cls, code in ((getattr(share_store, "ShareStoreCorrupt", None),
+                       "share_store_corrupt"),
+                      (getattr(share_store, "ShareStoreUnavailable", None),
+                       "share_store_unavailable")):
+        if cls is None:
+            continue
+
+        def _handler(exc, code=code):
+            app.logger.error("share store %s：请求拒绝（类别见 code）", code,
+                             exc_info=True)
+            return (jsonify(error="分享存储不可用", code=code), 503)
+
+        app.errorhandler(cls)(_handler)
+
+
+_SHARE_STORE_STARTUP_PROBE = _probe_share_store_at_startup()
+_register_share_store_error_handlers()
+
 # session 有效期 7 天
 app.permanent_session_lifetime = timedelta(days=7)
 
@@ -547,6 +604,54 @@ def _data_dir_for_secret() -> Path:
     )
 
 
+# --------------------------------------------------------------------------- #
+# secret/config 降级观测（review-2026-08-29 §10.4 G8）
+#
+# 约定：日志只含**类别**（kind）与安全路径/异常类名标识，禁止打印密钥、
+# 密文、token 或完整配置 body。启动关键 secret（flask secret / internal
+# token）读失败/为空 → fail-fast SystemExit；可降级的 AI 配置链路返回稳定
+# 不可用状态并记**节流** warning（同类 5 分钟最多一条，防止请求路径刷屏）。
+# --------------------------------------------------------------------------- #
+_SECRET_WARN_INTERVAL_SECONDS = 300
+_secret_warn_last: dict = {}
+
+
+def _warn_secret_throttled(kind: str, message: str) -> None:
+    """secret/config 降级告警节流（同类一条/5 分钟；message 不得含秘密值）。"""
+    now = time.time()
+    last = _secret_warn_last.get(kind)
+    if last is not None and (now - last) < _SECRET_WARN_INTERVAL_SECONDS:
+        return
+    _secret_warn_last[kind] = now
+    app.logger.warning("[secret/config:%s] %s", kind, message)
+
+
+def _read_persistent_secret(path: Path, *, what: str) -> str:
+    """读取持久化 secret 文件内容（strip 后返回）——启动关键 secret 专用。
+
+    文件存在但不可读/为空 → SystemExit（fail-fast，docs §5.1 同
+    _read_bootstrap_password_file 的哲学）：静默轮换会使全体 session /
+    内部 token 瞬间失效且无排障入口；空文件也不得伪装「未配置」。
+    文件恰好消失（ENOENT 竞态）→ FileNotFoundError 交由调用方走创建分支。
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise SystemExit(
+            "[startup] %s 文件 %r 无法读取（%s）：请检查 secret 文件挂载/权限"
+            "后重启；不得静默轮换（轮换会使既有凭据全部失效）。"
+            % (what, path, exc.__class__.__name__)
+        ) from exc
+    text = raw.strip()
+    if not text:
+        raise SystemExit(
+            "[startup] %s 文件 %r 内容为空：请提供非空 secret 后重启"
+            "（空文件不得当作未配置而轮换新 key）。" % (what, path))
+    return text
+
+
 def _load_or_create_secret_key() -> str:
     """优先用 SECRET_KEY env；否则在数据目录下持久化随机 secret（0600）。
 
@@ -554,6 +659,8 @@ def _load_or_create_secret_key() -> str:
     若不加锁会在「文件不存在」窗口各自生成不同 secret，导致 session 跨 worker
     失效（反复跳登录）。故用 fcntl 排他锁包裹「检查+生成+写」，保证并发首次
     生成时只写一次、其余 worker 读到同一 key。
+
+    G8：文件已存在但不可读/为空 → fail-fast SystemExit（不静默轮换）。
     """
     env_key = os.environ.get("SECRET_KEY")
     if env_key:
@@ -565,10 +672,7 @@ def _load_or_create_secret_key() -> str:
     def _read_or_create_locked():
         """持排他锁内：双检文件，不存在才生成写入。"""
         if secret_file.is_file():
-            try:
-                return secret_file.read_text(encoding="utf-8").strip()
-            except OSError:
-                pass
+            return _read_persistent_secret(secret_file, what="flask secret key")
         key = secrets.token_hex(32)
         secret_file.write_text(key, encoding="utf-8")
         try:
@@ -620,6 +724,9 @@ def _load_or_create_ai_internal_token() -> str:
 
     与 secret key 同样用 fcntl 排他锁包裹「检查+生成+写」，保证多 worker
     首次生成时只写一次、其余 worker 读到同一 token。
+
+    G8：文件已存在但不可读/为空 → fail-fast SystemExit（静默轮换会使
+    HistoPilot sidecar 的全部旧 token 立即 401，且无日志可排障）。
     """
     env_tok = os.environ.get("HISTOPILOT_INTERNAL_TOKEN") or os.environ.get("AI_INTERNAL_TOKEN")
     if env_tok:
@@ -630,10 +737,7 @@ def _load_or_create_ai_internal_token() -> str:
 
     def _read_or_create_locked():
         if tok_file.is_file():
-            try:
-                return tok_file.read_text(encoding="utf-8").strip()
-            except OSError:
-                pass
+            return _read_persistent_secret(tok_file, what="AI internal token")
         tok = secrets.token_hex(32)
         tok_file.write_text(tok, encoding="utf-8")
         try:
@@ -5296,6 +5400,33 @@ def _admin_v1_registration_methods(user_ids):
             for u in user_ids}
 
 
+def _admin_v1_uploads_section():
+    """uploads 段（G7）：committing 收口积压观测——只给计数与年龄。
+
+    不暴露路径、原文件名或用户标识（含 fail-closed 保持 committing 的证据
+    冲突任务，它们正是需要人工处置的积压）。json 后端同样可观测
+    （upload_tasks.json 只读列举）；列举失败分段标记不可用，不拖垮整个概览。
+    """
+    try:
+        tasks = upload_task_store.list_tasks(
+            state=upload_task_store.STATE_COMMITTING)
+    except Exception:
+        app.logger.exception("admin v1 overview uploads 段读取失败")
+        return {"available": False, "code": "upload_tasks_unavailable"}
+    now = time.time()
+    ages = [max(0.0, now - float(t.get("commit_started_at") or now))
+            for t in tasks if t.get("commit_started_at")]
+    backlog = [a for a in ages
+               if a > upload_task_store.UPLOAD_COMMIT_TIMEOUT_SECONDS]
+    return {
+        "available": True,
+        "committing": len(tasks),
+        "committing_oldest_age_seconds": round(max(ages), 1) if ages else 0.0,
+        # 超过 commit 超时仍未收口（含证据冲突 fail-closed 的任务）
+        "committing_backlog": len(backlog),
+    }
+
+
 @app.route("/api/admin/v1/overview", methods=["GET"])
 def admin_v1_overview():
     """概览（§10.1）：用户计数 + billing 用量/余额 + turn 预算（双额度并列）。
@@ -5305,6 +5436,8 @@ def admin_v1_overview():
     PG：billing 段含 model calls（今日/周期）、cache token 合计与命中率、
     provider cost / charge 合计（nano）、unpriced 数、ingestion lag、DeepSeek
     最新余额快照与年龄；turn_budget 段为周期预算摘要（usage_report 原语）。
+    uploads 段（G7）：V1/ZIP 收口 committing/backlog 计数与最老年龄
+    （json/PG 双后端可观测；只含聚合计数，不暴露路径/文件名/用户）。
     """
     auth = _require_owner_admin_v1()
     if auth:
@@ -5383,6 +5516,8 @@ def admin_v1_overview():
         billing=billing_section,
         # 「对话额度」（turn budget）与「金额余额」必须并列展示（§10.1）
         turn_budget=turn_section,
+        # G7：V1/ZIP 收口状态机的 committing 积压观测（只含计数与年龄）
+        uploads=_admin_v1_uploads_section(),
         backend=platform_features.current_backend(),
     )
 
@@ -6442,26 +6577,34 @@ def _validate_slide_file(path: Path):
     return True
 
 
-def _extract_zip_to_upload(src_zip: Path, reservation=None):
-    """把 zip 解压到 UPLOAD_DIR，返回 (主文件名, [解压出的相对路径...])。
+def _prepare_zip_bundle(src_zip: Path, reservation=None):
+    """zip 解压的**提升前**阶段：解压 + 识别 + 预检 + 内容验证 + 哈希。
 
-    P0-A §3.4 加固（docs/open-registration-security-remediation）：
+    成功返回 bundle dict：
+      tmp_dir / entries [(abs, rel)] / slides [rel]（已验证的有效切片，验证在
+      提升之前）/ hashes {str(abs): sha256}（解压复制时逐成员增量计算，无第二
+      次整读）/ main（主切片 rel，.mrxs 优先）/ total_bytes（Σsize = settle_bytes）
+    失败返回 (error_message, http_status)（自清理，无残留）。
+
+    G7（review-2026-08-29 §10.4）：本函数**不提升任何文件**——提升由
+    _promote_zip_bundle 在 task intent（upload_task_store.begin_legacy_commit
+    持久化 manifest 之后）执行；单文件与 ZIP 在 task intent 前不得提升。
+
+    旧防护全部保留（P0-A §3.4）：
     1. 解压到 UPLOAD_DIR 下临时目录 .extracting-<随机>；
     2. 防 zip-slip：拒绝绝对路径与含 .. 的 member，跳过 __MACOSX/隐藏文件；
     3. 解压炸弹防护：成员数 / 路径深度 / 单成员与总展开字节（声明值与实际
        复制字节都检查，任一超限立即中止并清理）/ 异常压缩比；
-    4. 拒绝符号链接、设备/FIFO 成员、加密成员、重复规范化路径（大小写不敏感，
-       防大小写不敏感文件系统上的覆盖）；
+    4. 拒绝符号链接、设备/FIFO 成员、加密成员、重复规范化路径（大小写不敏感）；
     5. 解压过程中周期性检查磁盘保留水位（ZIP_WATERMARK_CHECK_BYTES）；
-    6. 暂存解压后识别合法 bundle（_recognize_slide_bundle）：单文件切片只提升
-       该文件；MRXS 只提升 .mrxs 与同 stem 伴侣目录；混入无关顶层内容 → 拒绝；
-    7. 最终 move 前一次性检查目标冲突 / 用户配额（reservation 补占）/ 磁盘水位；
-       目标冲突响应统一为「名称不可用」，不回显跨用户真实文件名（docs §3.12）；
-    8. move 用 os.link 原子 no-clobber（防 check-then-move 竞态覆盖他人文件）；
-    9. 找出 SUPPORTED_EXTS 切片文件逐个验证；一个都打不开 → 清理并返回 400。
+    6. 暂存解压后识别合法 bundle（_recognize_slide_bundle）；
+    7. 提升 (in _promote_zip_bundle) 前一次性检查目标冲突 / 用户配额
+       （reservation 补占）/ 磁盘水位；目标冲突响应统一为「名称不可用」，
+       不回显跨用户真实文件名（docs §3.12）；
+    8. 找出 SUPPORTED_EXTS 切片文件逐个验证（在暂存区，提升之前）；
+       一个都打不开 → 清理并返回 400。
 
     reservation：api_upload 建立的 PG 预占 dict（无配额主体传 None）。
-    失败时返回 (error_message, http_status)；成功返回 (main_name_or_None, moved_paths)。
     """
     tmp_dir = UPLOAD_DIR / (".extracting-" + secrets.token_hex(8))
     try:
@@ -6469,25 +6612,14 @@ def _extract_zip_to_upload(src_zip: Path, reservation=None):
     except OSError as e:
         return f"创建临时目录失败: {e}", 400
 
-    moved: list = []
-
     def _cleanup_all():
-        # 清理临时目录与已 move 的文件/目录
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        for p in moved:
-            try:
-                p = UPLOAD_DIR / p
-                if p.is_dir():
-                    shutil.rmtree(p, ignore_errors=True)
-                else:
-                    p.unlink(missing_ok=True)
-            except Exception:
-                pass
 
     member_count = 0
     declared_total = 0
     actual_total = 0
     seen_norm = set()  # 规范化（casefold）路径集合：防重复 member
+    hashes = {}        # str(abs_path) -> sha256（解压复制时增量计算）
 
     try:
         with zipfile.ZipFile(src_zip, "r") as zf:
@@ -6564,6 +6696,7 @@ def _extract_zip_to_upload(src_zip: Path, reservation=None):
                 # 任何实现层面的偏差（声明伪造/流超限）都在上限处停止
                 target.parent.mkdir(parents=True, exist_ok=True)
                 member_actual = 0
+                member_hash = hashlib.sha256()
                 watermark_checked = 0
                 with zf.open(info) as src, open(target, "wb") as dst:
                     while True:
@@ -6578,6 +6711,7 @@ def _extract_zip_to_upload(src_zip: Path, reservation=None):
                             _cleanup_all()
                             return "压缩包实际展开量超过上限", 400
                         dst.write(chunk)
+                        member_hash.update(chunk)
                         watermark_checked += len(chunk)
                         if watermark_checked >= ZIP_WATERMARK_CHECK_BYTES:
                             # 解压过程中的磁盘保留水位检查（docs §3.3-5）
@@ -6587,6 +6721,7 @@ def _extract_zip_to_upload(src_zip: Path, reservation=None):
                                 _cleanup_all()
                                 return "磁盘空间不足", 507
                             watermark_checked = 0
+                hashes[str(target)] = member_hash.hexdigest()
     except zipfile.BadZipFile as e:
         _cleanup_all()
         return f"无效的 zip 文件: {e}", 400
@@ -6611,7 +6746,8 @@ def _extract_zip_to_upload(src_zip: Path, reservation=None):
         _cleanup_all()
         return "压缩包内未找到有效切片或包含无关内容", 400
 
-    # 最终 move 前一次性检查：目标冲突 / 用户配额 / 磁盘水位（docs §3.4-5）
+    # 提升（由 _promote_zip_bundle，在 task intent 之后）前一次性检查：
+    # 目标冲突 / 用户配额 / 磁盘水位（docs §3.4-5）
     total_bytes = sum(p.stat().st_size for p, _rel in entries)
     for _abs_p, rel in entries:
         if (UPLOAD_DIR / rel).exists():
@@ -6634,9 +6770,55 @@ def _extract_zip_to_upload(src_zip: Path, reservation=None):
         _cleanup_all()
         return "磁盘空间不足", 507
 
-    # 提升到 UPLOAD_DIR：os.link 原子 no-clobber（防竞态覆盖他人文件）；
-    # 不支持 link 的环境退回 shutil.move
+    # 内容验证在提升之前（G7）：切片文件逐个试开，一个都打不开 → 整体拒绝
+    valid = []
     for abs_p, rel in entries:
+        ext = rel.as_posix().rsplit(".", 1)[-1].lower() if "." in rel.as_posix() else ""
+        if ext in SUPPORTED_EXTS and _validate_slide_file(abs_p):
+            valid.append(rel.as_posix())
+    if not valid:
+        _cleanup_all()
+        return "压缩包内未找到可打开的有效切片文件", 400
+    # 排序稳定化：iterdir 顺序不稳定，旧实现的 main 提取随目录序漂移
+    valid = sorted(valid)
+
+    # 主文件优先 .mrxs，其次第一个
+    main = next((v for v in valid if v.lower().endswith(".mrxs")), valid[0])
+    return {
+        "tmp_dir": tmp_dir,
+        "entries": entries,
+        "slides": valid,
+        "hashes": hashes,
+        "main": main,
+        "total_bytes": total_bytes,
+    }
+
+
+def _promote_zip_bundle(bundle) -> list:
+    """把已验证 bundle 提升到 UPLOAD_DIR（task intent 之后、事务外执行）。
+
+    os.link 原子 no-clobber（防竞态覆盖他人文件）；不支持 link 的环境退回
+    shutil.move。成功返回提升的相对路径（posix str）列表并清理暂存目录；
+    失败自清理（含已提升部分）后抛 FileExistsError（目标冲突）或 OSError。
+    """
+    tmp_dir = bundle["tmp_dir"]
+    moved: list = []
+
+    def _cleanup_all():
+        # 清理临时目录与已 move 的文件/目录
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        for p in moved:
+            try:
+                p = UPLOAD_DIR / p
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    p.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    # 提升到 UPLOAD_DIR：os.link 原子 no-clobber（防竞态覆盖他人文件）
+    for abs_p, rel in bundle["entries"]:
         dest = UPLOAD_DIR / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -6644,37 +6826,18 @@ def _extract_zip_to_upload(src_zip: Path, reservation=None):
             abs_p.unlink()
         except FileExistsError:
             _cleanup_all()
-            return "名称不可用", 409
+            raise
         except OSError:
             try:
                 shutil.move(str(abs_p), str(dest))
-            except Exception as e:
+            except Exception as move_err:
                 _cleanup_all()
-                return f"移动文件失败: {e}", 400
+                raise OSError(f"移动文件失败: {move_err}") from move_err
         moved.append(rel.as_posix())
 
-    # 找出其中支持的切片文件
-    slide_files = []
-    for rel in moved:
-        ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else ""
-        if ext in SUPPORTED_EXTS:
-            slide_files.append(rel)
-
-    # 逐个验证能否打开
-    valid = []
-    for sf in slide_files:
-        if _validate_slide_file(UPLOAD_DIR / sf):
-            valid.append(sf)
-
-    if not valid:
-        _cleanup_all()
-        return "压缩包内未找到可打开的有效切片文件", 400
-
-    # 主文件优先 .mrxs，其次第一个
-    main = next((v for v in valid if v.lower().endswith(".mrxs")), valid[0])
     # 清理临时目录（已 move 的留下）
     shutil.rmtree(tmp_dir, ignore_errors=True)
-    return main, sorted(set(valid))
+    return moved
 
 
 def _recognize_slide_bundle(root: Path):
@@ -6762,16 +6925,203 @@ def _upload_release_quietly(reservation):
                              reservation.get("reservation_id"))
 
 
-def _upload_consume_quietly(reservation, actual_bytes):
-    """best-effort 转实占（失败仅记日志：文件已落盘，不能因记账失败回滚）。"""
-    if not reservation:
-        return
+# --------------------------------------------------------------------------- #
+# V1（旧单请求 /api/upload）配额收口状态机（review-2026-08-29 §10.4 G7）
+#
+# 与 V2 共用 upload_task_store 的 committing/committed 状态机与 commit
+# token；finish_commit 在 PG 下把 consume reservation 与 task→committed 放
+# 在**同一事务**。禁止再造独立补偿表 / JSON outbox / 后台 worker——崩溃后
+# 由请求路径上的 committing 扫描（_upload_legacy_recover_stale）幂等补账。
+# --------------------------------------------------------------------------- #
+def _upload_manifest_sha(artifacts):
+    """manifest 摘要（finish_commit 的 sha256_actual 用；确定性纯函数）。"""
+    if len(artifacts) == 1 and artifacts[0].get("sha256"):
+        return artifacts[0]["sha256"]
+    h = hashlib.sha256()
+    for a in artifacts:
+        h.update((a.get("sha256") or "").encode("ascii", "ignore"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def _upload_legacy_manifest(task):
+    """V1 任务的 artifact manifest；None=V2 任务，[]=manifest 损坏（fail-closed）。"""
+    arts = task.get("v1_artifacts")
+    if arts is None:
+        return None
+    return arts if isinstance(arts, list) else []
+
+
+def _upload_legacy_promote_state(task):
+    """V1 提升证据的三态判定（纯函数，json/PG 同一判定）。
+
+    返回 'promoted'（manifest 全存在且大小/哈希吻合）/ 'absent'（全不存在）/
+    'conflict'（部分存在或证据不符——含 manifest 损坏）。
+    """
+    arts = _upload_legacy_manifest(task)
+    if not arts:
+        return "conflict"  # manifest 缺失/损坏：无法安全判定，fail-closed
+    present = 0
+    for a in arts:
+        p = UPLOAD_DIR / str(a.get("name") or "")
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        if not p.is_file() or int(st.st_size) != int(a.get("size") or -1):
+            return "conflict"
+        want_sha = a.get("sha256")
+        if want_sha and _sha256_file(p) != want_sha:
+            return "conflict"
+        present += 1
+    if present == len(arts):
+        return "promoted"
+    if present == 0:
+        return "absent"
+    return "conflict"
+
+
+def _upload_legacy_fail(upload_id, token, task, *, permanent, remove_names=()):
+    """V1 受理后的失败收尾：fail_commit → 清提升文件 → （临时类）取消 → 释放预占。
+
+    - permanent=True（确定性失败：非法切片/名称冲突/预占失效）→ failed；
+    - permanent=False（临时基础设施故障）→ 回滚 active 后立即取消（V1 没有
+      重试端点，不留 active 残骸），两条路径都释放 reservation。
+    """
     try:
-        upload_guard.consume_reservation(reservation["reservation_id"],
-                                         int(actual_bytes))
+        t = upload_task_store.fail_commit(upload_id, token, permanent=permanent)
+    except upload_task_store.UploadTaskError:
+        app.logger.exception("V1 上传 fail_commit 失败：%s", upload_id)
+        t = upload_task_store.get_task(upload_id) or task
+    for name in remove_names:
+        try:
+            (UPLOAD_DIR / name).unlink(missing_ok=True)
+        except OSError:
+            app.logger.exception("V1 上传失败清理提升文件失败：%s", name)
+    if not permanent:
+        try:
+            t = upload_task_store.cancel_task(upload_id)
+        except upload_task_store.UploadTaskError:
+            app.logger.exception("V1 上传临时失败后取消任务失败：%s", upload_id)
+    _upload_v2_release_reservation_quietly(t)
+    return t
+
+
+def _upload_legacy_remove_artifacts(artifacts):
+    """撤回提升：只删 manifest 内（且仍吻合大小）的文件，绝不删他人文件。"""
+    for a in artifacts:
+        p = UPLOAD_DIR / str(a.get("name") or "")
+        try:
+            if p.is_file() and p.stat().st_size == int(a.get("size") or -1):
+                p.unlink(missing_ok=True)
+        except OSError:
+            app.logger.exception("V1 上传撤回提升失败：%s", a.get("name"))
+
+
+def _upload_legacy_recover_commit(task):
+    """V1 committing 超时的惰性恢复（G7；与 _upload_v2_recover_commit 并列）。
+
+    证据三态（_upload_legacy_promote_state，纯状态判定）：
+      promoted → 先补 ownership（失败保持 committing 下次再试），再
+        finish_commit（PG 下 consume 与 committed 同事务；重复恢复
+        used_bytes 只增加一次——consumed 行幂等 + 状态机单次转移）；
+      absent → rollback + 取消 + 释放预占（从未提升，安全回退）；
+      conflict（部分存在/大小哈希不符/manifest 损坏）→ fail-closed 告警并
+        保持 committing，**绝不按过期时间盲 release**。
+    """
+    upload_id = task["upload_id"]
+    token = task.get("commit_token") or ""
+    arts = _upload_legacy_manifest(task)
+    state = _upload_legacy_promote_state(task)
+    if state == "conflict":
+        app.logger.error(
+            "upload task %s 恢复证据冲突（部分 artifact 存在或大小/哈希不符），"
+            "保持 committing 等待人工处置，不释放预占", upload_id)
+        return task
+    if state == "absent":
+        try:
+            t = upload_task_store.rollback_committing(upload_id)
+            t = upload_task_store.cancel_task(upload_id)
+        except upload_task_store.UploadTaskError:
+            app.logger.exception("upload task %s 恢复回滚失败", upload_id)
+            t = upload_task_store.get_task(upload_id) or task
+        _upload_v2_release_reservation_quietly(t)
+        return t
+    sha = _upload_manifest_sha(arts)
+    for a in arts:
+        if not a.get("slide"):
+            continue
+        try:
+            share_store.set_slide_meta(
+                a["name"],
+                owner_user_id=(task.get("owner_user_id") or None),
+                requester_role=user_store.ROLE_OWNER)
+        except Exception:
+            app.logger.exception(
+                "upload task %s 恢复时 ownership 失败，保持 committing", upload_id)
+            return task
+    try:
+        return upload_task_store.finish_commit(
+            upload_id, token, sha, settle_bytes=int(task["declared_size"]))
+    except upload_guard.ReservationInvalid:
+        app.logger.warning(
+            "upload task %s 恢复收口时预占已失效，撤回提升", upload_id)
+        _upload_legacy_remove_artifacts(arts)
+        return _upload_legacy_fail(upload_id, token, task, permanent=True)
+    except upload_task_store.StateConflict as e:
+        return e.task or upload_task_store.get_task(upload_id) or task
     except Exception:
-        app.logger.exception("upload reservation consume failed: %s",
-                             reservation.get("reservation_id"))
+        app.logger.exception("upload task %s 恢复收口失败", upload_id)
+        return upload_task_store.get_task(upload_id) or task
+
+
+def _upload_legacy_recover_stale(ident=None, *, now=None):
+    """V1 请求路径的惰性恢复扫描：committing 且超过 commit 超时的任务。
+
+    复用现有 committing 扫描的恢复判定（_upload_v2_maintain → dispatch 到
+    _upload_legacy_recover_commit）；owner 角色扫全量（运维语义），user 只扫
+    自己的。异常只记日志（下一请求再试），不阻塞当次上传。
+    """
+    ts = float(time.time() if now is None else now)
+    try:
+        tasks = upload_task_store.list_tasks(
+            state=upload_task_store.STATE_COMMITTING)
+    except Exception:
+        app.logger.exception("V1 上传恢复扫描失败（下一请求再试）")
+        return []
+    # owner 角色扫全量（运维语义）；user 只扫自己的（owner_user_id 归一空串
+    # = 本地免登录 owner 的任务，仅 owner 角色可及）
+    role = (ident or {}).get("role")
+    owner = (None if role == user_store.ROLE_OWNER
+            else ((ident or {}).get("user_id") or ""))
+    recovered = []
+    for task in tasks:
+        if (float(task.get("commit_started_at") or 0)
+                + upload_task_store.UPLOAD_COMMIT_TIMEOUT_SECONDS) > ts:
+            continue
+        if owner is not None and (task.get("owner_user_id") or "") != owner:
+            continue
+        recovered.append(_upload_v2_maintain(task))
+    return recovered
+
+
+def _upload_legacy_intent(ident, filename, safe_name, artifacts, reservation):
+    """V1 commit 受理：内容验证后、提升前持久化 manifest（G7 步骤 1）。
+
+    成功返回 (upload_id, commit_token, task)；失败返回 (None, error_resp)。
+    """
+    try:
+        upload_id, token, task = upload_task_store.begin_legacy_commit(
+            owner_user_id=(ident.get("user_id") or ""),
+            filename=filename,
+            safe_name=safe_name,
+            artifacts=artifacts,
+            reservation_id=(reservation or {}).get("reservation_id"))
+    except upload_task_store.UploadTaskError as e:
+        app.logger.exception("V1 上传 commit 受理失败")
+        _upload_release_quietly(reservation)
+        return None, (jsonify(error="上传受理失败，请重试", code=e.code), 500)
+    return (upload_id, token, task), None
 
 
 @app.route("/api/upload", methods=["POST"])
@@ -6787,12 +7137,22 @@ def api_upload():
       - PG 权威用户配额预占（失败释放 / 成功转实占）+ 在途与每小时限流；
       - 写入前与解压过程中检查磁盘保留水位；
       - 目标名冲突统一回「名称不可用」，不回显跨用户真实文件名（§3.12）。
+
+    G7（review-2026-08-29 §10.4）：配额收口接入 upload_task_store 状态机——
+    内容验证完成后、**提升之前**用 commit token 持久化 artifact manifest 与
+    settle_bytes（begin_legacy_commit）；提升在事务外完成；finish_commit 在
+    同一 PG 事务内 consume reservation 并把任务置 committed。收口崩溃由
+    _upload_legacy_recover_stale 的 committing 扫描幂等补账，不再有
+    best-effort consume 的成功路径终点。
     """
     if not can_upload():
         return jsonify(error="无上传权限"), 403
     ident = current_identity()
     if "file" not in request.files:
         return jsonify(error="缺少 file 字段"), 400
+
+    # G7：请求路径上的 committing 惰性恢复扫描（上一请求崩溃后的幂等补账）
+    _upload_legacy_recover_stale(ident)
 
     # 配额 / 限流（PG 权威；owner 与本地免登录跳过）
     reservation = _upload_acquire_reservation(ident)
@@ -6810,48 +7170,7 @@ def api_upload():
 
     # zip 上传：解压分支
     if ext in ARCHIVE_EXTS:
-        tmp_zip = UPLOAD_DIR / (".uploading-" + secrets.token_hex(8) + ".zip")
-        # 计数流保存（不信任 Content-Length；超限即停并清理）
-        try:
-            upload_guard.check_disk_watermark(UPLOAD_DIR,
-                                              need_bytes=_upload_reservation_hint())
-            upload_guard.save_limited(file.stream, tmp_zip)
-        except upload_guard.RequestTooLarge as e:
-            _upload_release_quietly(reservation)
-            return jsonify(error=str(e), code=e.code), 413
-        except upload_guard.DiskWatermarkExceeded as e:
-            _upload_release_quietly(reservation)
-            return jsonify(error="磁盘空间不足", code=e.code), 507
-        except Exception as e:
-            tmp_zip.unlink(missing_ok=True)
-            _upload_release_quietly(reservation)
-            return jsonify(error=f"保存失败: {e}"), 400
-        try:
-            result = _extract_zip_to_upload(tmp_zip, reservation=reservation)
-        finally:
-            tmp_zip.unlink(missing_ok=True)
-        # _extract_zip_to_upload 失败时返回 (error_msg, status)
-        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
-            msg, status = result
-            _upload_release_quietly(reservation)
-            return jsonify(error=msg), status
-        main_name, extracted = result
-        # 成功：按实际落盘字节转实占（zip 暂存已删，只计最终提升的文件）
-        actual = 0
-        for sname in extracted:
-            try:
-                actual += (UPLOAD_DIR / sname).stat().st_size
-            except OSError:
-                pass
-        _upload_consume_quietly(reservation, actual)
-        # 建立归属（zip 内全部有效切片均为上传者所有）
-        for sname in extracted:
-            try:
-                share_store.set_slide_meta(sname, owner_user_id=ident["user_id"],
-                                           requester_role=ident["role"])
-            except PermissionError:
-                return jsonify(error="无上传权限"), 403
-        return jsonify(name=main_name, extracted=extracted)
+        return _api_upload_zip(file, filename, safe, ident, reservation)
 
     if ext not in SUPPORTED_EXTS:
         _upload_release_quietly(reservation)
@@ -6880,42 +7199,179 @@ def api_upload():
         _upload_release_quietly(reservation)
         return jsonify(error=f"保存失败: {e}"), 400
 
-    # 原子 no-clobber 提升：link 失败（已存在）即统一 409，无 check-then-write 竞态
-    try:
-        _promote_no_clobber(tmp, dest)
-        tmp.unlink(missing_ok=True)
-    except FileExistsError:
+    # ---- 内容验证在提升之前（G7：验证通过才有 manifest / 受理）----
+    if not _validate_slide_file(tmp):
         tmp.unlink(missing_ok=True)
         _upload_release_quietly(reservation)
-        return jsonify(error="名称不可用", code="name_unavailable"), 409
+        hint = "MRXS 需连同数据目录打包为 zip 上传" if safe.lower().endswith(".mrxs") else "无效的切片文件"
+        return jsonify(error=hint), 400
+    try:
+        file_sha = _sha256_file(tmp)
     except OSError as e:
         tmp.unlink(missing_ok=True)
         _upload_release_quietly(reservation)
         return jsonify(error=f"保存失败: {e}"), 400
 
-    # 验证能否打开（裸 .mrxs 通常缺少数据目录，给出针对性提示）
-    if not _validate_slide_file(dest):
-        try:
-            dest.unlink(missing_ok=True)
-        except Exception:
-            pass
-        _upload_release_quietly(reservation)
-        hint = "MRXS 需连同数据目录打包为 zip 上传" if safe.lower().endswith(".mrxs") else "无效的切片文件"
-        return jsonify(error=hint), 400
+    # ---- task intent：commit token + manifest 持久化（提升之前，G7 步骤 1）----
+    intent, err = _upload_legacy_intent(
+        ident, filename, safe,
+        [{"name": safe, "size": int(total), "sha256": file_sha, "slide": True}],
+        reservation)
+    if err is not None:
+        tmp.unlink(missing_ok=True)
+        return err
+    upload_id, token, task = intent
 
-    # 建立归属（slide_meta.owner_user_id = 上传者；guest 已在 can_upload 拦截）
+    # ---- 提升（事务外）：link 失败（已存在）即统一 409，无 check-then-write 竞态 ----
+    try:
+        _promote_no_clobber(tmp, dest)
+        tmp.unlink(missing_ok=True)
+    except FileExistsError:
+        tmp.unlink(missing_ok=True)
+        _upload_legacy_fail(upload_id, token, task, permanent=True)
+        return jsonify(error="名称不可用", code="name_unavailable"), 409
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        _upload_legacy_fail(upload_id, token, task, permanent=False)
+        return jsonify(error=f"保存失败: {e}"), 400
+
+    # ---- 建立归属（slide_meta.owner_user_id = 上传者；guest 已在 can_upload 拦截）----
     try:
         share_store.set_slide_meta(safe, owner_user_id=ident["user_id"],
                                    requester_role=ident["role"])
     except PermissionError:
-        try:
-            dest.unlink(missing_ok=True)
-        except Exception:
-            pass
+        _upload_legacy_fail(upload_id, token, task, permanent=True,
+                            remove_names=(safe,))
+        return jsonify(error="无上传权限"), 403
+    except Exception:
+        app.logger.exception("V1 上传归属登记失败：%s", upload_id)
+        _upload_legacy_fail(upload_id, token, task, permanent=False,
+                            remove_names=(safe,))
+        return jsonify(error="归属登记失败，请重试"), 503
+
+    # ---- 短事务 B：committed + 配额同事务转实占（G7 收口；崩溃后由恢复扫描
+    #      幂等补账，文件已持久提升，请求仍按成功返回）----
+    try:
+        upload_task_store.finish_commit(upload_id, token, file_sha,
+                                        settle_bytes=int(total))
+    except upload_task_store.StateConflict as e:
+        cur = e.task or {}
+        if cur.get("state") == upload_task_store.STATE_COMMITTED:
+            return jsonify(name=safe)
+        # 恢复流程已回滚（提升被撤/未提升）：清孤儿文件并允许重试
+        app.logger.warning("V1 上传收口被恢复流程回滚：%s", upload_id)
+        dest.unlink(missing_ok=True)
+        _upload_legacy_fail(upload_id, token, task, permanent=False)
+        return jsonify(error="上传已失效，请重试", code="commit_retryable"), 503
+    except upload_task_store.TaskNotFound:
+        dest.unlink(missing_ok=True)
         _upload_release_quietly(reservation)
         return jsonify(error="无上传权限"), 403
-    _upload_consume_quietly(reservation, total)
+    except Exception:
+        app.logger.exception(
+            "V1 上传收口失败（任务保持 committing，由恢复扫描幂等补账）：%s",
+            upload_id)
     return jsonify(name=safe)
+
+
+def _api_upload_zip(file, filename, safe, ident, reservation):
+    """zip 分支（api_upload 拆出）：prepare → intent → promote → ownership → finish。
+
+    顺序固定（G7）：_prepare_zip_bundle 完成解压/识别/预检/内容验证/哈希（
+    不提升）→ begin_legacy_commit 持久化 manifest（提升之前）→ _promote_zip_bundle
+    事务外提升 → ownership → finish_commit 同事务转实占。
+    """
+    tmp_zip = UPLOAD_DIR / (".uploading-" + secrets.token_hex(8) + ".zip")
+    # 计数流保存（不信任 Content-Length；超限即停并清理）
+    try:
+        upload_guard.check_disk_watermark(UPLOAD_DIR,
+                                          need_bytes=_upload_reservation_hint())
+        upload_guard.save_limited(file.stream, tmp_zip)
+    except upload_guard.RequestTooLarge as e:
+        _upload_release_quietly(reservation)
+        return jsonify(error=str(e), code=e.code), 413
+    except upload_guard.DiskWatermarkExceeded as e:
+        _upload_release_quietly(reservation)
+        return jsonify(error="磁盘空间不足", code=e.code), 507
+    except Exception as e:
+        tmp_zip.unlink(missing_ok=True)
+        _upload_release_quietly(reservation)
+        return jsonify(error=f"保存失败: {e}"), 400
+    try:
+        result = _prepare_zip_bundle(tmp_zip, reservation=reservation)
+    finally:
+        tmp_zip.unlink(missing_ok=True)
+    # prepare 失败时返回 (error_msg, status)（已自清理）
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        msg, status = result
+        _upload_release_quietly(reservation)
+        return jsonify(error=msg), status
+    bundle = result
+    try:
+        # manifest：全部待提升文件（伴侣目录文件 slide=False，只提升不入归属）
+        artifacts = [
+            {"name": rel.as_posix(),
+             "size": abs_p.stat().st_size,
+             "sha256": (bundle["hashes"] or {}).get(str(abs_p)),
+             "slide": rel.as_posix() in set(bundle["slides"])}
+            for abs_p, rel in bundle["entries"]
+        ]
+        intent, err = _upload_legacy_intent(
+            ident, filename, bundle["main"], artifacts, reservation)
+        if err is not None:
+            return err
+        upload_id, token, task = intent
+
+        # 提升（事务外；task intent 之后，G7 步骤 2）
+        try:
+            _promote_zip_bundle(bundle)
+        except FileExistsError:
+            _upload_legacy_fail(upload_id, token, task, permanent=True)
+            return jsonify(error="名称不可用", code="name_unavailable"), 409
+        except OSError as e:
+            _upload_legacy_fail(upload_id, token, task, permanent=False)
+            return jsonify(error=str(e)), 400
+
+        # 建立归属（zip 内全部有效切片均为上传者所有）
+        for sname in bundle["slides"]:
+            try:
+                share_store.set_slide_meta(sname, owner_user_id=ident["user_id"],
+                                           requester_role=ident["role"])
+            except PermissionError:
+                _upload_legacy_fail(upload_id, token, task, permanent=True,
+                                    remove_names=[a["name"] for a in artifacts])
+                return jsonify(error="无上传权限"), 403
+            except Exception:
+                app.logger.exception("V1 zip 上传归属登记失败：%s", upload_id)
+                _upload_legacy_fail(upload_id, token, task, permanent=False,
+                                    remove_names=[a["name"] for a in artifacts])
+                return jsonify(error="归属登记失败，请重试"), 503
+
+        # 短事务 B：committed + 配额同事务转实占（G7 步骤 3）
+        try:
+            upload_task_store.finish_commit(
+                upload_id, token, _upload_manifest_sha(artifacts),
+                settle_bytes=int(bundle["total_bytes"]))
+        except upload_task_store.StateConflict as e:
+            cur = e.task or {}
+            if cur.get("state") == upload_task_store.STATE_COMMITTED:
+                return jsonify(name=bundle["main"], extracted=bundle["slides"])
+            app.logger.warning("V1 zip 上传收口被恢复流程回滚：%s", upload_id)
+            _upload_legacy_fail(upload_id, token, task, permanent=False,
+                                remove_names=[a["name"] for a in artifacts])
+            return jsonify(error="上传已失效，请重试", code="commit_retryable"), 503
+        except upload_task_store.TaskNotFound:
+            _upload_legacy_fail(upload_id, token, task, permanent=True,
+                                remove_names=[a["name"] for a in artifacts])
+            return jsonify(error="无上传权限"), 403
+        except Exception:
+            app.logger.exception(
+                "V1 zip 上传收口失败（任务保持 committing，由恢复扫描幂等补账）：%s",
+                upload_id)
+        return jsonify(name=bundle["main"], extracted=bundle["slides"])
+    finally:
+        # 暂存目录兜底清理（成功路径已在 _promote_zip_bundle 内清理）
+        shutil.rmtree(bundle["tmp_dir"], ignore_errors=True)
 
 
 # =========================================================================== #
@@ -7140,7 +7596,11 @@ def _upload_v2_maintain(task):
     if (task["state"] == upload_task_store.STATE_COMMITTING
             and (float(task.get("commit_started_at") or 0)
                  + upload_task_store.UPLOAD_COMMIT_TIMEOUT_SECONDS) <= now):
-        task = _upload_v2_recover_commit(task)
+        # G7：V1 任务（带 artifact manifest）走证据三态恢复；V2 维持原逻辑
+        if task.get("v1_artifacts") is not None:
+            task = _upload_legacy_recover_commit(task)
+        else:
+            task = _upload_v2_recover_commit(task)
     if task["state"] == upload_task_store.STATE_COMMITTED:
         # 已 committed 但崩溃窗口里漏写 slide_meta 时，GET 路径校正归属。
         try:
@@ -7847,8 +8307,17 @@ def _load_or_create_ai_secret() -> "Optional[object]":
 
     cryptography 不可用时返回 None（此时退化为明文存储，与旧行为一致，安全降级）。
     gunicorn 多 worker 下用 fcntl 锁保证并发首次生成只写一次（同 flask_secret）。
+
+    G8（分类降级，不静默）：文件**已存在**但不可读/为空/不是合法 Fernet key
+    → 返回 None（稳定不可用）+ 节流 warning。绝不静默重建——重建会使全部
+    ``enc:`` 密文（含 _PLUGIN_JWT_KEY 派生源）永久失效。不存在时仍按现有
+    设计创建。
     """
     if not _HAS_FERNET:
+        _warn_secret_throttled(
+            "ai_secret_fernet_missing",
+            "cryptography 不可用：AI api_key 将以明文落盘（官方模式保存已被"
+            "门禁拒绝），generic provider 维持旧行为")
         return None
     p = _ai_secret_path()
     data_dir = _data_dir_for_secret()
@@ -7858,10 +8327,26 @@ def _load_or_create_ai_secret() -> "Optional[object]":
         if p.is_file():
             try:
                 raw = p.read_bytes().strip()
-                if raw:
-                    return Fernet(raw)
+            except OSError as exc:
+                _warn_secret_throttled(
+                    "ai_secret_unreadable",
+                    "ai_secret.key 读取失败（%s）：AI 凭据加解密不可用，请检查"
+                    "文件挂载/权限" % exc.__class__.__name__)
+                return None
+            if not raw:
+                _warn_secret_throttled(
+                    "ai_secret_empty",
+                    "ai_secret.key 为空：不静默重建（重建会使全部已存密文永久"
+                    "失效）；AI 凭据解密不可用，请人工轮换密钥并重录 API key")
+                return None
+            try:
+                return Fernet(raw)
             except Exception:
-                pass  # 损坏 → 重新生成（旧密文将无法解密，调用方会提示重填 key）
+                _warn_secret_throttled(
+                    "ai_secret_corrupt",
+                    "ai_secret.key 已损坏：不静默重建（重建会使全部已存密文"
+                    "永久失效）；AI 凭据解密不可用，请人工轮换密钥并重录 API key")
+                return None
         key = Fernet.generate_key()
         p.write_bytes(key)
         try:
@@ -7889,6 +8374,7 @@ def _encrypt_api_key(plain: str):
     该降级只对 generic provider 保留（旧行为）；官方模式（deepseek_official）
     的保存门禁在 _validate_provider_contract 中直接拒绝——Fernet 不可用时
     不允许保存新 API key（见 docs/deepseek-files-api-research.md §2/§4.1）。
+    G8：加密失败记节流 warning（不再零日志）。
     """
     if not plain:
         return ""
@@ -7897,23 +8383,40 @@ def _encrypt_api_key(plain: str):
         return plain  # 降级明文（cryptography 缺失；官方模式已被门禁拦截）
     try:
         return _FERNET_PREFIX + f.encrypt(plain.encode("utf-8")).decode("ascii")
-    except Exception:
-        return plain  # 加密失败不阻断保存（官方模式已被门禁拦截）
+    except Exception as exc:
+        _warn_secret_throttled(
+            "api_key_encrypt_failed",
+            "api_key 加密失败（%s）：本次保存将落明文（官方模式已被门禁拦截）"
+            % exc.__class__.__name__)
+        return plain
 
 
 def _decrypt_api_key(stored):
-    """解密磁盘上的 api_key 值（'enc:' 前缀→解密；否则视为明文原样返回）。"""
+    """解密磁盘上的 api_key 值（'enc:' 前缀→解密；否则视为明文原样返回）。
+
+    G8（分类降级，不静默伪装未配置）：密文存在但密钥不可用/解密失败 →
+    返回 ""（稳定不可用）+ 节流 warning——旧实现零日志，排障时全平台只表现
+    为「AI 未配置」。
+    """
     if not stored or not isinstance(stored, str):
         return ""
     if not stored.startswith(_FERNET_PREFIX):
         return stored  # 明文（旧配置 / 降级）
     f = _load_or_create_ai_secret()
     if f is None:
-        return ""  # 密文但无法解密（密钥丢失/库缺失）
+        _warn_secret_throttled(
+            "api_key_decrypt_unavailable",
+            "api_key 为密文但 ai_secret 不可用（缺失/损坏/库缺失）：按未配置"
+            "处理，请恢复密钥或重录 API key")
+        return ""
     try:
         return f.decrypt(stored[len(_FERNET_PREFIX):].encode("ascii")).decode("utf-8")
     except Exception:
-        return ""  # 密钥不匹配/损坏 → 当作未配置，提示用户重填
+        _warn_secret_throttled(
+            "api_key_decrypt_failed",
+            "api_key 密文解密失败（密钥失配/密文损坏）：按未配置处理，"
+            "请重录 API key")
+        return ""
 
 
 def _mask_api_key(key: str) -> str:
@@ -9258,31 +9761,15 @@ def _ai_run_prepare(user_ctx, body, slide, need_grant):
     return result
 
 
-def reclaim_expired_reservations(now=None):
-    """对账钩子（最小实现，docs §5.3-5）：惰性回收过期 reserved 预占。
-
-    本任务**只做时间回收**（budget_store.reclaim_expired 按
-    reservation_expires_at 释放并回退 usage）；后台周期线程**不再调用**本钩子
-    （确认式对账失败项必须顺延，盲回收会把 HistoPilot 已接受的执行误退款）。
-    「HistoPilot 不可达不释放、顺延」的对账语义属确认式对账
-    （``reconcile_expired_reservations``，PT-4）。注册用户路径 HistoPilot
-    4xx/5xx 已在请求内 release。json/dual 后端 no-op（无预算数据），失败不抛
-    （记 log 可重试）。
-    """
-    if not platform_features.budget_features_available():
-        return []
-    try:
-        return budget_store.reclaim_expired(now)
-    except Exception:
-        app.logger.warning("reclaim_expired_reservations 失败（可重试）", exc_info=True)
-        return []
-
-
 # --------------------------------------------------------------------------- #
 # Demo 确认式对账（PT-4，docs §5.3-6 / §5.4-7 / 任务 §7）
 #
-# 与 reclaim_expired_reservations 的盲时间回收不同：过期 reserved 项先经
-# HistoPilot ``GET /session/by-request/<request_id>`` 反查确认终态——
+# 历史的 ``reclaim_expired_reservations``（盲时间回收钩子）已删除（review
+# 2026-08-29 §10.3 阶段 5）：其语义——按 reservation_expires_at 到期即退款
+# ——已被确认式对账明确否定（HistoPilot 不可达时顺延而非释放，盲回收会把
+# 已接受的执行误退款）。后台周期线程只走 reconcile_expired_reservations。
+# 过期 reserved 项经 HistoPilot ``GET /session/by-request/<request_id>``
+# 反查确认终态——
 #   200 且 security_profile_applied/accepted_at → consume（已接受执行）；
 #   200 但尚未接受 → **不 consume、不释放，顺延**（acquire 与安全确认之间崩溃）；
 #   404 not_found → release（确定未创建）；
@@ -10054,16 +10541,42 @@ def _load_ai_config() -> dict:
     旧版 reserve_tokens < 128 同样在读取时迁移为默认 16000 并落盘，避免升级后
     sidecar run 边界拒绝。其他字段（base_url/model/max_tokens/调优参数/
     api_protocol）原样返回。
+
+    G8（可降级但可观测）：文件存在但损坏/不可读/顶层非对象 → 返回空 dict
+    （稳定不可用状态，调用方按「AI 未配置」处理）+ **节流 warning**——旧实现
+    零日志，ai_config.json 损坏时排障无入口。迁移重写失败同样告警（保留
+    磁盘现状，不阻断读取）。
     """
     p = _ai_config_path()
-    if not p.is_file():
+    try:
+        exists = p.is_file()
+    except OSError as exc:
+        _warn_secret_throttled(
+            "ai_config_unreadable",
+            "ai_config.json 状态检查失败（%s）：按未配置处理，请检查文件挂载/权限"
+            % exc.__class__.__name__)
+        return {}
+    if not exists:
         return {}
     try:
         with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
+            _warn_secret_throttled(
+                "ai_config_shape",
+                "ai_config.json 顶层不是 JSON 对象：按未配置处理，请人工检查")
             return {}
-    except Exception:
+    except OSError as exc:
+        _warn_secret_throttled(
+            "ai_config_unreadable",
+            "ai_config.json 读取失败（%s）：按未配置处理，请检查文件挂载/权限"
+            % exc.__class__.__name__)
+        return {}
+    except (ValueError, UnicodeDecodeError) as exc:
+        _warn_secret_throttled(
+            "ai_config_corrupt",
+            "ai_config.json 损坏（%s）：按未配置处理，请从备份恢复或重录配置"
+            % exc.__class__.__name__)
         return {}
     stored = data.get("api_key") or ""
     if stored and not stored.startswith(_FERNET_PREFIX) and _HAS_FERNET:
@@ -10073,15 +10586,21 @@ def _load_ai_config() -> dict:
             data["api_key"] = enc
             try:
                 _save_ai_config_raw(data)
-            except Exception:
-                pass
+            except Exception as exc:
+                _warn_secret_throttled(
+                    "ai_config_migrate_write_failed",
+                    "ai_config.json 明文密钥加密迁移重写失败（%s）：磁盘保留明文"
+                    "现状，下次读取再试" % exc.__class__.__name__)
     # 旧版允许 reserve=0/1–127 落盘；升级后 sidecar 会拒绝 <128。
     # 在解密前改写并落盘，避免把明文 api_key 写回磁盘。
     if _apply_legacy_reserve_migration(data):
         try:
             _save_ai_config_raw(data)
-        except Exception:
-            pass
+        except Exception as exc:
+            _warn_secret_throttled(
+                "ai_config_migrate_write_failed",
+                "ai_config.json reserve_tokens 迁移重写失败（%s）：磁盘保留现状"
+                % exc.__class__.__name__)
     data["api_key"] = _decrypt_api_key(stored)
     return data
 

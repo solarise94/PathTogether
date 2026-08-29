@@ -1,6 +1,11 @@
-/* pathtogether-admin 插件 UI 样式（PR3 骨架）。
-   运行在 opaque iframe 内；只允许外链同源 CSS（响应 CSP style-src 'self'，
-   无内联样式）。 */
+/* pathtogether-admin 插件 UI 样式（PR3 骨架 + 包 E 工作台化，
+   docs/admin-workbench-ci-one-shot-remediation-plan.md §9）。
+   运行在 opaque iframe 内；只允许外链同源 CSS（响应 CSP style-src <origin>，
+   无内联样式）。
+
+   布局：桌面 240px 侧栏 + 流式主内容（max 1280px）；平板（<1024px）侧栏收窄
+   为图标条；手机（<768px）侧栏收成顶部抽屉（#adm-nav-toggle 切换）。
+   设计 token 走 :root 自定义属性；危险操作统一 .adm-btn-danger 视觉区分。 */
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -11,36 +16,120 @@
   --text-2: #86868b;
   --separator: rgba(0, 0, 0, 0.08);
   --accent: #007AFF;
+  --accent-soft: rgba(0, 122, 255, 0.08);
+  --ok: #1d7a34;
+  --warn: #B25000;
   --danger: #FF3B30;
+  --danger-soft: rgba(255, 59, 48, 0.06);
+  --radius: 10px;
+  --sidebar-w: 240px;
+  --content-max: 1280px;
+  --shadow: 0 1px 3px rgba(0,0,0,0.05), 0 8px 24px rgba(0,0,0,0.06);
 }
 
+html { height: 100%; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
                "Helvetica Neue", Arial, sans-serif;
   background: var(--bg);
   color: var(--text);
   min-height: 100vh;
-  padding: 24px 16px;
 }
 
-.adm-header { max-width: 860px; margin: 0 auto 18px; }
-.adm-header h1 { font-size: 20px; font-weight: 700; }
-.adm-sub { font-size: 13px; color: var(--text-2); margin-top: 4px; }
+/* ---- 壳层：顶栏 +（侧栏 + 主内容） ---- */
+.adm-shell { min-height: 100vh; display: flex; flex-direction: column; }
+.adm-topbar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 12px 20px; background: var(--card);
+  border-bottom: 1px solid var(--separator);
+  position: sticky; top: 0; z-index: 5;
+}
+.adm-page-title { font-size: 17px; font-weight: 700; }
+.adm-sub { font-size: 12px; color: var(--text-2); }
+.adm-nav-toggle {
+  display: none; font-size: 13px; padding: 6px 12px; border-radius: 8px;
+  border: 1px solid var(--separator); background: var(--card);
+  color: var(--text); cursor: pointer;
+}
 
-.adm-root { max-width: 860px; margin: 0 auto; }
+.adm-shell-body { display: flex; flex: 1 1 auto; align-items: stretch; }
+
+/* ---- 侧栏导航（§9.1） ---- */
+.adm-nav {
+  width: var(--sidebar-w); flex: 0 0 auto;
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 16px 12px; background: var(--card);
+  border-right: 1px solid var(--separator);
+  position: sticky; top: 57px; align-self: flex-start;
+  max-height: calc(100vh - 57px);
+}
+.adm-nav-btn {
+  font-size: 14px; text-align: left; padding: 9px 14px; border-radius: 8px;
+  border: 1px solid transparent; background: transparent;
+  color: var(--text); cursor: pointer;
+}
+.adm-nav-btn:hover { background: var(--accent-soft); }
+.adm-nav-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.adm-nav-btn--active,
+.adm-nav-btn[aria-current="page"] {
+  background: var(--accent); color: #fff; font-weight: 600;
+}
+
+/* ---- 主内容：流式，不锁死宽度 ---- */
+.adm-root {
+  flex: 1 1 auto; min-width: 0;
+  max-width: var(--content-max);
+  padding: 20px; margin: 0 auto; width: 100%;
+}
+
+.adm-page { display: flex; flex-direction: column; gap: 16px; }
 
 .adm-card {
-  background: var(--card);
-  border-radius: 14px;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.05), 0 8px 24px rgba(0,0,0,0.06);
-  padding: 20px 22px;
-  margin-bottom: 16px;
+  background: var(--card); border-radius: var(--radius);
+  box-shadow: var(--shadow); padding: 20px 22px;
 }
 .adm-card h2 { font-size: 15px; font-weight: 600; margin-bottom: 10px; }
 
 .adm-status { font-size: 13px; color: var(--text-2); line-height: 1.7; }
 
-.adm-kv { display: grid; grid-template-columns: 160px 1fr; row-gap: 8px; column-gap: 12px; }
+/* ---- 页级状态组件（§9.2：loading/empty/error/ready 四态） ---- */
+.adm-state {
+  font-size: 13px; line-height: 1.8; border-radius: var(--radius);
+  padding: 0; /* idle 时不可见 */
+}
+.adm-state[data-page-state="loading"] {
+  padding: 12px 16px; background: var(--accent-soft); color: var(--text);
+}
+.adm-state[data-page-state="empty"] {
+  padding: 12px 16px; background: rgba(0,0,0,0.02);
+  border: 1px dashed var(--separator); color: var(--text-2);
+}
+.adm-state[data-page-state="error"] {
+  padding: 12px 16px; background: var(--danger-soft);
+  border: 1px solid rgba(255, 59, 48, 0.35); color: var(--danger);
+}
+.adm-state[data-page-state="ready"] { padding: 0; color: var(--text-2); }
+.adm-state button {
+  margin-left: 10px; font-size: 12px; padding: 4px 10px; border-radius: 8px;
+  border: 1px solid var(--separator); background: var(--card);
+  color: var(--text); cursor: pointer;
+}
+
+/* KPI 卡网格（§9.1 概览） */
+.adm-kpis {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+.adm-kpi {
+  background: var(--card); border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: 14px 16px;
+}
+.adm-kpi-label { font-size: 12px; color: var(--text-2); }
+.adm-kpi-value { font-size: 22px; font-weight: 700; margin-top: 4px; word-break: break-all; }
+.adm-kpi-note { font-size: 11px; color: var(--text-2); margin-top: 2px; }
+.adm-kpi--danger .adm-kpi-value { color: var(--danger); }
+
+.adm-kv { display: grid; grid-template-columns: 180px 1fr; row-gap: 8px; column-gap: 12px; }
 .adm-kv dt { font-size: 12px; color: var(--text-2); align-self: center; }
 .adm-kv dd { font-size: 13px; word-break: break-all; }
 
@@ -48,15 +137,6 @@ body {
 
 .adm-error-card { border: 1px solid rgba(255, 59, 48, 0.35); }
 .adm-error-text { font-size: 13px; color: var(--danger); line-height: 1.7; word-break: break-all; }
-
-/* ---- PR3b 只读页面：导航 / 表格 / 筛选 / 分页 / 告警 ---- */
-.adm-nav { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
-.adm-nav-btn {
-  font-size: 13px; padding: 6px 14px; border-radius: 8px;
-  border: 1px solid var(--separator); background: var(--card);
-  color: var(--text); cursor: pointer;
-}
-.adm-nav-btn--active { background: var(--accent); border-color: var(--accent); color: #fff; }
 
 .adm-filters { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 14px; }
 .adm-filters input, .adm-filters select {
@@ -70,17 +150,23 @@ body {
   cursor: pointer;
 }
 
-.adm-table-wrap { overflow-x: auto; }
-.adm-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+/* 大表（§9.1）：sticky header + 最小宽度 + 横向滚动容器 */
+.adm-table-wrap {
+  overflow-x: auto; border: 1px solid var(--separator);
+  border-radius: var(--radius); background: var(--card);
+}
+.adm-table { width: 100%; border-collapse: collapse; font-size: 12px; min-width: 640px; }
 .adm-table th {
   text-align: left; font-weight: 600; color: var(--text-2);
-  padding: 8px 10px; border-bottom: 1px solid var(--separator); white-space: nowrap;
+  padding: 8px 10px; border-bottom: 1px solid var(--separator);
+  white-space: nowrap; background: var(--card);
+  position: sticky; top: 0; z-index: 1;
 }
 .adm-table td {
   padding: 8px 10px; border-bottom: 1px solid var(--separator);
   vertical-align: top; word-break: break-all; white-space: nowrap;
 }
-.adm-table td:last-child, .adm-table td:nth-child(9) { white-space: normal; }
+.adm-table td:last-child { white-space: normal; }
 
 /* PR6：账本 usage_debit 的 metadata.simulated=true 条目在 kind 旁的「模拟」徽标 */
 .adm-badge {
@@ -90,7 +176,7 @@ body {
   vertical-align: middle; white-space: nowrap;
 }
 
-.adm-pager { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+.adm-pager { display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
 .adm-pager button {
   font-size: 13px; padding: 6px 14px; border-radius: 8px;
   border: 1px solid var(--separator); background: var(--card);
@@ -106,21 +192,27 @@ body {
 .adm-empty {
   font-size: 13px; color: var(--text-2); line-height: 1.8;
   background: rgba(0, 0, 0, 0.02); border: 1px dashed var(--separator);
-  border-radius: 10px; padding: 14px 16px; margin: 10px 0;
+  border-radius: var(--radius); padding: 14px 16px; margin: 10px 0;
 }
 
-/* ---- PR5 写操作：表单 / 行内按钮 / 页内确认条 / 一次性 token ---- */
+/* ---- 表单 / 行内按钮 / 页内确认条 / 一次性 token ---- */
 .adm-form { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+.adm-form--grid {
+  display: grid; gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+}
 .adm-form input, .adm-form select {
   font-size: 13px; padding: 6px 10px; border-radius: 8px;
   border: 1px solid var(--separator); background: #fff; color: var(--text);
-  min-width: 180px; flex: 0 1 auto;
+  min-width: 180px; flex: 0 1 auto; width: 100%;
 }
+.adm-form--grid input, .adm-form--grid select { min-width: 0; }
 .adm-form button, .adm-confirm button, .adm-actions-cell button {
   font-size: 13px; padding: 6px 14px; border-radius: 8px;
   border: 1px solid var(--accent); background: var(--accent); color: #fff;
-  cursor: pointer;
+  cursor: pointer; white-space: nowrap;
 }
+.adm-form--grid button { align-self: start; }
 .adm-btn-danger {
   border-color: var(--danger) !important; background: var(--danger) !important;
 }
@@ -133,8 +225,8 @@ body {
 /* 页内二次确认条（sandbox 无 allow-modals，window.confirm 不可用） */
 .adm-confirm {
   display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
-  background: rgba(255, 59, 48, 0.06); border: 1px solid rgba(255, 59, 48, 0.35);
-  border-radius: 10px; padding: 10px 12px; margin: 10px 0;
+  background: var(--danger-soft); border: 1px solid rgba(255, 59, 48, 0.35);
+  border-radius: var(--radius); padding: 10px 12px; margin: 10px 0;
 }
 .adm-confirm-text { font-size: 13px; color: var(--danger); word-break: break-all; }
 .adm-confirm input {
@@ -148,13 +240,64 @@ body {
   white-space: nowrap;
 }
 
-/* 邀请码一次性展示（仅创建响应携带；刷新即失） */
+/* 邀请码/凭证一次性展示（仅创建响应携带；刷新即失） */
 .adm-token-once {
   display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
-  background: rgba(0, 122, 255, 0.06); border: 1px dashed var(--accent);
-  border-radius: 10px; padding: 10px 12px; margin-top: 8px;
+  background: var(--accent-soft); border: 1px dashed var(--accent);
+  border-radius: var(--radius); padding: 10px 12px; margin-top: 8px;
 }
 .adm-token-once code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 13px; word-break: break-all;
+}
+
+/* ---- 用户详情抽屉（§9.1：余额/来源/状态/操作收纳） ---- */
+.adm-drawer-mask {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.25); z-index: 20;
+}
+.adm-drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(440px, 92vw);
+  background: var(--card); z-index: 21; box-shadow: -8px 0 32px rgba(0,0,0,0.12);
+  display: flex; flex-direction: column;
+}
+.adm-drawer-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 18px; border-bottom: 1px solid var(--separator);
+}
+.adm-drawer-head h2 { font-size: 15px; font-weight: 600; }
+.adm-drawer-head button {
+  font-size: 13px; padding: 6px 14px; border-radius: 8px;
+  border: 1px solid var(--separator); background: var(--card);
+  color: var(--text); cursor: pointer;
+}
+.adm-drawer-body { padding: 16px 18px; overflow-y: auto; flex: 1 1 auto; }
+.adm-drawer-body .adm-kv { margin-bottom: 14px; }
+.adm-drawer-actions { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+
+/* ---- 响应式（§9.3） ---- */
+@media (max-width: 1023px) {
+  .adm-nav { width: 64px; padding: 12px 6px; }
+  .adm-nav-btn { font-size: 0; padding: 10px 0; text-align: center; }
+  .adm-nav-btn::before { font-size: 14px; }
+  .adm-nav-btn[data-page="overview"]::before { content: "概"; }
+  .adm-nav-btn[data-page="users"]::before { content: "户"; }
+  .adm-nav-btn[data-page="invites"]::before { content: "邀"; }
+  .adm-nav-btn[data-page="billing"]::before { content: "账"; }
+  .adm-nav-btn[data-page="plugins"]::before { content: "件"; }
+  .adm-nav-btn[data-page="audit"]::before { content: "审"; }
+}
+@media (max-width: 767px) {
+  .adm-nav-toggle { display: inline-block; }
+  .adm-shell-body { flex-direction: column; }
+  .adm-nav {
+    width: 100%; max-height: none; position: static; flex-direction: row;
+    overflow-x: auto; border-right: none; border-bottom: 1px solid var(--separator);
+    display: none; padding: 8px 12px; gap: 6px;
+  }
+  .adm-nav.adm-nav--open { display: flex; flex-wrap: wrap; }
+  .adm-nav-btn { font-size: 14px; padding: 8px 12px; flex: 1 1 auto; text-align: center; }
+  .adm-nav-btn::before { content: none; }
+  .adm-root { padding: 12px; }
+  .adm-card { padding: 16px; }
+  .adm-kv { grid-template-columns: 120px 1fr; }
 }

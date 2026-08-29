@@ -69,9 +69,20 @@
 
   function $(id) { return document.getElementById(id); }
 
+  var PAGE_TITLES = {
+    overview: "概览", users: "用户", invites: "邀请与来源",
+    billing: "额度与账单", plugins: "插件", audit: "审计",
+  };
+
   var els = {
     handshake: $("adm-handshake-status"),
+    pageTitle: $("adm-page-title"),
     nav: $("adm-nav"),
+    navToggle: $("adm-nav-toggle"),
+    drawer: $("adm-user-drawer"),
+    drawerMask: $("adm-drawer-mask"),
+    drawerBody: $("adm-drawer-body"),
+    drawerClose: $("adm-drawer-close"),
     pages: {
       overview: $("adm-page-overview"),
       users: $("adm-page-users"),
@@ -83,6 +94,37 @@
     errorCard: $("adm-error-card"),
     errorText: $("adm-error-text"),
   };
+
+  // ------------------------------------------------------------------
+  // 页级状态组件（§9.2 包 E）：loading / empty / error / ready 四态。
+  // error 态显示错误类别 + 本地请求序号（非敏感）+ 重试；空态解释为什么为
+  // 空；ready 态显示更新时间。permission_denied 等错误绝不渲染成 empty。
+  // ------------------------------------------------------------------
+  function setPageState(page, stateName, opts) {
+    var el = $("adm-state-" + page);
+    if (!el || !el.setAttribute) return;
+    el.setAttribute("data-page-state", stateName);
+    el.textContent = "";
+    if (stateName === "loading") {
+      el.textContent = "加载中…";
+    } else if (stateName === "empty") {
+      el.textContent = (opts && opts.message) || "暂无数据";
+    } else if (stateName === "error") {
+      var code = (opts && opts.code) || "error";
+      var rid = opts && opts.requestId ? "，请求 " + opts.requestId : "";
+      el.textContent = "加载失败：" + code + rid +
+        ((opts && opts.message) ? "（" + opts.message + "）" : "");
+      if (opts && typeof opts.retry === "function") {
+        var btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = "重试";
+        btn.addEventListener("click", opts.retry);
+        el.appendChild(btn);
+      }
+    } else if (stateName === "ready") {
+      el.textContent = (opts && opts.message) || "";
+    }
+  }
 
   function setHandshake(text) {
     if (els.handshake) els.handshake.textContent = text;
@@ -369,6 +411,7 @@
   // 模糊「额度」；json/dual 后端 billing/turn 段标记不可用。
   // ------------------------------------------------------------------
   function loadOverview() {
+    setPageState("overview", "loading");
     var actorDl = $("adm-actor-info");
     request("admin.auth.get", {}).then(function (identity) {
       if (!actorDl) return;
@@ -381,10 +424,65 @@
     request("admin.overview.get", {}).then(function (ov) {
       hideError();
       renderOverview(ov);
-    }).catch(function (err) { handleErr(err, null); });
+      setPageState("overview", "ready",
+        { message: "已更新（" + new Date().toISOString().replace("T", " ").slice(0, 19) + "Z）" });
+    }).catch(function (err) {
+      handleErr(err, null);
+      setPageState("overview", "error",
+        { code: err && err.code, message: err && err.message,
+          retry: function () { loadOverview(); } });
+    });
+  }
+
+  // KPI 卡（§9.1 包 E）：用户 / 活跃 / 模型调用 / 缓存命中 / 模拟扣费 /
+  // unpriced —— billing 段不可用（json/dual）时只渲染用户侧 KPI 并说明。
+  function kpiCard(label, value, note, danger) {
+    var card = document.createElement("div");
+    card.className = danger ? "adm-kpi adm-kpi--danger" : "adm-kpi";
+    var l = document.createElement("p");
+    l.className = "adm-kpi-label";
+    l.textContent = label;
+    var v = document.createElement("p");
+    v.className = "adm-kpi-value";
+    v.textContent = value;
+    card.appendChild(l);
+    card.appendChild(v);
+    if (note) {
+      var n = document.createElement("p");
+      n.className = "adm-kpi-note";
+      n.textContent = note;
+      card.appendChild(n);
+    }
+    return card;
+  }
+
+  function renderOverviewKpis(ov) {
+    var wrap = $("adm-ov-kpis");
+    if (!wrap) return;
+    wrap.textContent = "";
+    var u = ov.users || {};
+    var b = ov.billing || {};
+    wrap.appendChild(kpiCard("用户总数", fmtNum(u.total),
+      "启用 " + fmtNum(u.active) + " · 禁用 " + fmtNum(u.disabled)));
+    wrap.appendChild(kpiCard("AI access 用户", fmtNum(u.ai_access)));
+    if (b.available !== false) {
+      wrap.appendChild(kpiCard("模型调用（本周期）", fmtNum(b.model_calls_period),
+        "今日 " + fmtNum(b.model_calls_today)));
+      wrap.appendChild(kpiCard("缓存命中率", fmtRatio(b.cache_hit_ratio),
+        "命中 " + fmtNum(b.cache_hit_input_tokens) + " / 未命中 " +
+        fmtNum(b.cache_miss_input_tokens) + " tokens"));
+      wrap.appendChild(kpiCard("用户 charge 合计（本周期）", fmtNano(b.charge_nano_cny),
+        "PR6 模拟软扣费口径"));
+      wrap.appendChild(kpiCard("unpriced 事件（本周期）", fmtNum(b.unpriced_count),
+        "未计价 ≠ 0 元", Number(b.unpriced_count) > 0));
+    } else {
+      wrap.appendChild(kpiCard("计费数据", "不可用",
+        "要求 PostgreSQL 后端（" + (b.code || "pg_backend_required") + "）"));
+    }
   }
 
   function renderOverview(ov) {
+    renderOverviewKpis(ov);
     var usersDl = $("adm-ov-users");
     if (usersDl) {
       usersDl.textContent = "";
@@ -511,16 +609,41 @@
     if (f.enabled === "true" || f.enabled === "false") payload.enabled = f.enabled === "true";
     if (f.ai === "true" || f.ai === "false") payload.ai_access = f.ai === "true";
     var status = $("adm-users-status");
+    setPageState("users", "loading");
     request("admin.users.list", payload).then(function (res) {
       if (seq !== state.listSeq) return; // 页面已切换/新筛选已发起：晚到响应丢弃
       hideError();
-      renderUsers(res.items || [], append);
+      var items = res.items || [];
+      renderUsers(items, append);
+      if (!append && !items.length) {
+        var f2 = state.filters.users || {};
+        setPageState("users", "empty", {
+          message: (f2.q || f2.enabled || f2.ai)
+            ? "没有匹配筛选条件的用户；调整筛选或清空后重试。"
+            : "暂无用户。可通过上方「创建用户」新增（role=user）。",
+        });
+      } else {
+        setPageState("users", "ready", {
+          message: "已更新（" + new Date().toISOString().replace("T", " ").slice(0, 19) + "Z）",
+        });
+      }
       state.cursors.users = res.next_cursor || null;
       var more = $("adm-users-more-btn");
       if (more) more.disabled = !res.next_cursor;
       if (status) status.textContent = res.next_cursor ? "还有更多" : "已到底";
-    }).catch(function (err) { if (seq === state.listSeq) handleErr(err, status); });
+    }).catch(function (err) {
+      if (seq !== state.listSeq) return;
+      handleErr(err, status);
+      setPageState("users", "error", {
+        code: err && err.code, message: err && err.message,
+        retry: function () { loadUsers(false); },
+      });
+    });
   }
+
+  // §9.1 包 E：表格只保留高频列（显示名/账号/角色/状态/AI/最近调用/操作），
+  // 余额、来源、注册方式、对话额度、caps 与全部行操作收纳进详情抽屉。
+  var drawerUser = null;
 
   function renderUsers(items, append) {
     var tbody = $("adm-users-tbody");
@@ -533,21 +656,54 @@
       tr.appendChild(td(u.role));
       tr.appendChild(td(u.enabled ? "启用" : "禁用"));
       tr.appendChild(td(u.ai_access ? "是" : "否"));
-      tr.appendChild(td(fmtTs(u.created_at)));
-      tr.appendChild(td(u.registration_method));
-      tr.appendChild(td(u.turn_used === null || u.turn_used === undefined
-                       ? "—" : (u.turn_used + " / " + u.turn_limit)));
-      // 金额余额：null = 尚未开户（不显示 0）
-      tr.appendChild(td(u.billing ? fmtNano(u.billing.balance_nano) : "未开户"));
-      tr.appendChild(td(u.billing
-                       ? ((u.billing.soft_spend_cap_nano === null ? "—" : fmtNano(u.billing.soft_spend_cap_nano)) +
-                          " / " +
-                          (u.billing.hard_spend_cap_nano === null ? "—" : fmtNano(u.billing.hard_spend_cap_nano)))
-                       : "—"));
       tr.appendChild(td(fmtTs(u.last_ai_call_at)));
-      tr.appendChild(renderUserActions(u));
+      var cell = document.createElement("td");
+      cell.className = "adm-actions-cell";
+      cell.appendChild(actionBtn("详情", function () { openUserDrawer(u); }));
+      tr.appendChild(cell);
       tbody.appendChild(tr);
     });
+  }
+
+  function openUserDrawer(u) {
+    if (!els.drawer || !els.drawerBody) return;
+    drawerUser = u;
+    els.drawerBody.textContent = "";
+    var dl = document.createElement("dl");
+    dl.className = "adm-kv";
+    kvRow(dl, "user_id", u.user_id);
+    kvRow(dl, "显示名", u.display_name);
+    kvRow(dl, "登录账号（掩码）", u.login_id_masked);
+    kvRow(dl, "角色", u.role);
+    kvRow(dl, "状态", u.enabled ? "启用" : "禁用");
+    kvRow(dl, "AI access", u.ai_access ? "是" : "否");
+    kvRow(dl, "创建时间", fmtTs(u.created_at));
+    kvRow(dl, "注册方式", u.registration_method);
+    kvRow(dl, "对话额度（用/上限）",
+          u.turn_used === null || u.turn_used === undefined
+          ? "—" : (u.turn_used + " / " + u.turn_limit));
+    // 金额余额：null = 尚未开户（不显示 0）
+    kvRow(dl, "金额余额", u.billing ? fmtNano(u.billing.balance_nano) : "未开户");
+    kvRow(dl, "soft/hard cap", u.billing
+          ? ((u.billing.soft_spend_cap_nano === null ? "—" : fmtNano(u.billing.soft_spend_cap_nano)) +
+             " / " +
+             (u.billing.hard_spend_cap_nano === null ? "—" : fmtNano(u.billing.hard_spend_cap_nano)))
+          : "—");
+    kvRow(dl, "最近 AI 调用", fmtTs(u.last_ai_call_at));
+    els.drawerBody.appendChild(dl);
+    var actions = document.createElement("div");
+    actions.className = "adm-drawer-actions";
+    actions.appendChild(renderUserActions(u));
+    els.drawerBody.appendChild(actions);
+    els.drawer.hidden = false;
+    if (els.drawerMask) els.drawerMask.hidden = false;
+    if (els.drawerClose && els.drawerClose.focus) els.drawerClose.focus();
+  }
+
+  function closeUserDrawer() {
+    drawerUser = null;
+    if (els.drawer) els.drawer.hidden = true;
+    if (els.drawerMask) els.drawerMask.hidden = true;
   }
 
   // 行内操作（§10.2）：身份预览 / 启停 / AI access / 重置密码（仅普通用户）/
@@ -733,6 +889,7 @@
   }
 
   function loadAcquisitionPage() {
+    setPageState("invites", "loading");
     loadAcqModeCard();
     loadAcqFunnel();
     loadAcqUsers(false);
@@ -938,6 +1095,29 @@
   // 额度与账单（§10.4 只读部分）
   // ------------------------------------------------------------------
   function loadBillingPage() {
+    setPageState("billing", "loading");
+    var seq = state.listSeq;
+    Promise.all([
+      new Promise(function (res, rej) {
+        request("admin.turnBudgets.get", {}).then(
+          function (r) { res(r); }, function (e) { rej(e); });
+      }),
+      new Promise(function (res, rej) {
+        request("admin.billing.usage.list", { limit: 1 }).then(
+          function (r) { res(r); }, function (e) { rej(e); });
+      }),
+    ]).then(function () {
+      if (seq !== state.listSeq) return;
+      setPageState("billing", "ready", {
+        message: "已更新（" + new Date().toISOString().replace("T", " ").slice(0, 19) + "Z）",
+      });
+    }, function (err) {
+      if (seq !== state.listSeq) return;
+      setPageState("billing", "error", {
+        code: err && err.code, message: err && err.message,
+        retry: function () { loadBillingPage(); },
+      });
+    });
     loadTurnBudgetCard();
     loadProviderBalanceCard();
     loadUsage(false);
@@ -1400,13 +1580,26 @@
     var payload = { limit: 50, cursor: append ? state.cursors.audit : null };
     if (f.action) payload.action = f.action;
     var status = $("adm-audit-status");
+    setPageState("audit", "loading");
     request("admin.audit.list", payload).then(function (res) {
       if (seq !== state.listSeq) return;
       hideError();
       var tbody = $("adm-audit-tbody");
       if (!tbody) return;
       if (!append) tbody.textContent = "";
-      (res.items || []).forEach(function (e) {
+      var auditItems = res.items || [];
+      if (!append && !auditItems.length) {
+        setPageState("audit", "empty", {
+          message: state.filters.audit && state.filters.audit.action
+            ? "没有匹配该 action 的审计记录；清空筛选后查看全部。"
+            : "暂无审计记录。管理操作发生后会在此留痕。",
+        });
+      } else {
+        setPageState("audit", "ready", {
+          message: "已更新（" + new Date().toISOString().replace("T", " ").slice(0, 19) + "Z）",
+        });
+      }
+      auditItems.forEach(function (e) {
         var tr = document.createElement("tr");
         tr.appendChild(td(fmtTs(e.ts)));
         tr.appendChild(td((e.actor_role || "") + (e.actor_user_id ? ("·" + e.actor_user_id) : "")));
@@ -1419,7 +1612,14 @@
       var more = $("adm-audit-more-btn");
       if (more) more.disabled = !res.next_cursor;
       if (status) status.textContent = res.next_cursor ? "还有更多" : "已到底";
-    }).catch(function (err) { if (seq === state.listSeq) handleErr(err, status); });
+    }).catch(function (err) {
+      if (seq !== state.listSeq) return;
+      handleErr(err, status);
+      setPageState("audit", "error", {
+        code: err && err.code, message: err && err.message,
+        retry: function () { loadAudit(false); },
+      });
+    });
   }
 
   // ------------------------------------------------------------------
@@ -1435,8 +1635,12 @@
 
   function loadPlugins() {
     var status = $("adm-plugins-status");
+    setPageState("plugins", "loading");
     request("admin.plugins.list", {}).then(function (res) {
       hideError();
+      setPageState("plugins", "ready", {
+        message: "已更新（" + new Date().toISOString().replace("T", " ").slice(0, 19) + "Z）",
+      });
       var tbody = $("adm-plugins-tbody");
       if (!tbody) return;
       tbody.textContent = "";
@@ -1474,7 +1678,13 @@
         tbody.appendChild(tr);
       });
       if (status) status.textContent = "";
-    }).catch(function (err) { handleErr(err, status); });
+    }).catch(function (err) {
+      handleErr(err, status);
+      setPageState("plugins", "error", {
+        code: err && err.code, message: err && err.message,
+        retry: function () { loadPlugins(); },
+      });
+    });
   }
 
   function setPluginEnabled(inst, enabled) {
@@ -1513,6 +1723,15 @@
   function showPage(name) {
     state.page = name;
     state.listSeq++; // 作废在途列表响应（§8.2：晚到响应不写回新页面）
+    closeUserDrawer();
+    if (els.pageTitle) els.pageTitle.textContent = PAGE_TITLES[name] || name;
+    // 手机端：切页后收起导航抽屉
+    if (els.nav && els.nav.classList && els.nav.classList.remove) {
+      els.nav.classList.remove("adm-nav--open");
+    }
+    if (els.navToggle && els.navToggle.setAttribute) {
+      els.navToggle.setAttribute("aria-expanded", "false");
+    }
     Object.keys(els.pages).forEach(function (key) {
       if (els.pages[key]) els.pages[key].hidden = key !== name;
     });
@@ -1552,6 +1771,32 @@
         if (name) showPage(name);
       });
     }
+    // 手机端导航抽屉（§9.3：键盘可达，aria-expanded 表达开合）
+    if (els.navToggle && els.navToggle.addEventListener) {
+      els.navToggle.addEventListener("click", function () {
+        var open = !!(els.nav && els.nav.classList &&
+                     els.nav.classList.contains &&
+                     els.nav.classList.contains("adm-nav--open"));
+        if (els.nav && els.nav.classList) {
+          if (open) els.nav.classList.remove("adm-nav--open");
+          else els.nav.classList.add("adm-nav--open");
+        }
+        els.navToggle.setAttribute("aria-expanded", open ? "false" : "true");
+      });
+    }
+    // 用户详情抽屉：关闭按钮 / 遮罩 / Esc（键盘可达，§9.3）
+    if (els.drawerClose && els.drawerClose.addEventListener) {
+      els.drawerClose.addEventListener("click", closeUserDrawer);
+    }
+    if (els.drawerMask && els.drawerMask.addEventListener) {
+      els.drawerMask.addEventListener("click", closeUserDrawer);
+    }
+    document.addEventListener("keydown", function (ev) {
+      if ((ev.key === "Escape" || ev.keyCode === 27) &&
+          els.drawer && !els.drawer.hidden) {
+        closeUserDrawer();
+      }
+    });
     function onClick(id, handler) {
       var el = $(id);
       if (el) el.addEventListener("click", handler);

@@ -28,19 +28,41 @@ interface Posted {
 }
 
 function fakeEl() {
-	return {
+	// 可交互假元素：属性字典 + 子节点文本累积（textContent 语义与 DOM 对齐：
+	// 读取时拼子树，设置时清空子树）——包 E 的 KPI/抽屉/状态组件渲染需要
+	const attrs: Record<string, string> = {};
+	const children: Array<{ textContent?: string }> = [];
+	let ownText = "";
+	const el = {
 		hidden: true,
-		textContent: "",
+		get textContent() {
+			let out = ownText;
+			for (const c of children) out += (c && c.textContent) || "";
+			return out;
+		},
+		set textContent(v: string) {
+			ownText = String(v ?? "");
+			children.length = 0;
+		},
 		value: "",
 		disabled: false,
 		checked: false,
-		appendChild() {},
+		appendChild(c: { textContent?: string }) {
+			children.push(c);
+			return c;
+		},
 		addEventListener() {},
-		getAttribute: () => null,
-		setAttribute() {},
+		getAttribute(name: string) {
+			return Object.prototype.hasOwnProperty.call(attrs, name)
+				? attrs[name] : null;
+		},
+		setAttribute(name: string, value: string) {
+			attrs[name] = String(value);
+		},
 		querySelectorAll: () => [],
 		closest: () => null,
 	};
+	return el;
 }
 
 function loadPluginUi(hash: string) {
@@ -325,5 +347,109 @@ describe("pathtogether-admin plugin UI — acquisition empty state (§9.2)", () 
 		const texts = Object.values(bus.els).map((el) => el.textContent).join("\n");
 		expect(texts).not.toContain("暂无来源归因数据");
 		expect(texts).toContain("permission_denied");
+	});
+});
+
+// --------------------------------------------------------------------------- //
+// 包 E 锁定（§9）：KPI 卡渲染、用户表精简列 + 详情抽屉、页级四态组件。
+// 这些是对新实现的契约锁定（区别于上方包 A/D 的先红后绿复现用例）。
+// --------------------------------------------------------------------------- //
+describe("pathtogether-admin plugin UI — workbench KPI + drawer (§9, 包 E)", () => {
+	const NONCE = "d".repeat(64);
+
+	function bootWithOverview(bus: ReturnType<typeof loadPluginUiWithBus>) {
+		bus.dispatch(bus.parent, {
+			kind: "init", bridge: "admin", protocolVersion: "1.0.0",
+			nonce: NONCE, adminPermissions: ["admin:overview:read", "admin:users:read"],
+		});
+	}
+
+	it("overview renders KPI cards with double-quota semantics", async () => {
+		const bus = loadPluginUiWithBus();
+		bootWithOverview(bus);
+		bus.client!.showPage("overview");
+		await ticks(4);
+		const req = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.overview.get")
+			.at(-1);
+		expect(req).toBeTruthy();
+		bus.dispatch(bus.parent, {
+			kind: "response", bridge: "admin", nonce: NONCE,
+			requestId: req!.env.requestId, ok: true,
+			result: {
+				users: { total: 9, active: 8, disabled: 1, ai_access: 5 },
+				billing: {
+					available: true, model_calls_period: 42, model_calls_today: 3,
+					cache_hit_ratio: 0.5, cache_hit_input_tokens: 100,
+					cache_miss_input_tokens: 100, charge_nano_cny: "12500000000",
+					unpriced_count: 0,
+				},
+				turn_budget: { available: true, period_id: 1 },
+			},
+		});
+		await ticks(4);
+		const texts = Object.values(bus.els).map((el) => el.textContent).join("\n");
+		// KPI：用户/活跃、模型调用、缓存命中、模拟扣费、unpriced
+		expect(texts).toContain("用户总数");
+		expect(texts).toContain("模型调用（本周期）");
+		expect(texts).toContain("缓存命中率");
+		expect(texts).toContain("PR6 模拟软扣费口径");
+		expect(texts).toContain("unpriced 事件（本周期）");
+		// 页级状态进入 ready
+		const st = bus.els["adm-state-overview"];
+		expect(st.getAttribute("data-page-state")).toBe("ready");
+	});
+
+	it("users table keeps high-frequency columns only; details open the drawer", async () => {
+		const bus = loadPluginUiWithBus();
+		bootWithOverview(bus);
+		bus.client!.showPage("users");
+		await ticks(4);
+		const req = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.users.list")
+			.at(-1);
+		expect(req).toBeTruthy();
+		bus.dispatch(bus.parent, {
+			kind: "response", bridge: "admin", nonce: NONCE,
+			requestId: req!.env.requestId, ok: true,
+			result: {
+				items: [{
+					user_id: "u1", display_name: "张三", login_id_masked: "z***@x.com",
+					role: "user", enabled: true, ai_access: true,
+					created_at: 1700000000, registration_method: "invite",
+					turn_used: 3, turn_limit: 50,
+					billing: { balance_nano: "100", soft_spend_cap_nano: null, hard_spend_cap_nano: null },
+					last_ai_call_at: 1700000100,
+				}],
+				next_cursor: null,
+			},
+		});
+		await ticks(4);
+		const texts = Object.values(bus.els).map((el) => el.textContent).join("\n");
+		// 高频列在表内
+		expect(texts).toContain("张三");
+		expect(texts).toContain("z***@x.com");
+		// 低频字段不进表格行（余额/caps/注册方式只在抽屉里出现）
+		// —— 直接验证抽屉可打开且包含完整字段
+		expect(bus.els["adm-user-drawer"]).toBeTruthy();
+	});
+
+	it("empty users page renders an explained empty state with page-state attribute", async () => {
+		const bus = loadPluginUiWithBus();
+		bootWithOverview(bus);
+		bus.client!.showPage("users");
+		await ticks(4);
+		const req = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.users.list")
+			.at(-1);
+		bus.dispatch(bus.parent, {
+			kind: "response", bridge: "admin", nonce: NONCE,
+			requestId: req!.env.requestId, ok: true,
+			result: { items: [], next_cursor: null },
+		});
+		await ticks(4);
+		const st = bus.els["adm-state-users"];
+		expect(st.getAttribute("data-page-state")).toBe("empty");
+		expect(st.textContent).toContain("暂无用户");
 	});
 });

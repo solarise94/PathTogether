@@ -71,8 +71,12 @@ _JSON_PUBLIC_NAMES = (
     "AUDIT_MAX_EVENTS",  # Stage 3c-2 审计日志封顶条数（两实现一致）
     # —— 异常类（Stage 3c-1 CAS）——
     "RevisionConflict",
+    # —— 异常类（review G1 fail-closed：损坏 / IO 不可用分流）——
+    "ShareStoreCorrupt",
+    "ShareStoreUnavailable",
     # —— 函数 ——
     "set_owner_user_id",
+    "probe_readable",
     "create_share",
     "get_share",
     "list_shares",

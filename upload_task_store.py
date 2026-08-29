@@ -32,7 +32,6 @@
   （后四者携带 .task 快照，供 409 响应回当前 confirmed_offset 等进度字段）。
 """
 
-import fcntl
 import json
 import os
 import secrets
@@ -40,6 +39,7 @@ import time
 
 import pg_store
 import platform_features
+import locked_atomic_json
 
 # --------------------------------------------------------------------------- #
 # env 可调常量（import 期一次性读取；测试用 monkeypatch 改模块属性）
@@ -239,27 +239,16 @@ def _path():
 
 
 def _with_lock(fn):
-    """打开 upload_tasks.json 加排他锁后执行 fn(file_obj)（user_store_json 同款）。"""
-    p = _path()
-    os.makedirs(os.path.dirname(str(p)) or ".", exist_ok=True)
-    if not os.path.exists(p):
-        with open(p, "a", encoding="utf-8"):
-            pass
-    try:
-        os.chmod(p, 0o600)
-    except OSError:
-        pass
-    with open(p, "r+", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
-            return fn(f)
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    """在 upload_tasks.json 的稳定锁（upload_tasks.json.lock）内执行 fn(session)。
+
+    review 10.2：与 shares 共用 ``locked_atomic_json`` 的 IO/锁原语（稳定
+    lock file + tmp/fsync/replace）；本 store 的 schema/异常语义不变。
+    """
+    return locked_atomic_json.with_locked_file(_path(), fn)
 
 
 def _load_locked(f):
-    f.seek(0)
-    raw = f.read()
+    raw = f.read_bytes()
     if not raw:
         return {"tasks": {}, "meta": {"schema_version": 1}}
     data = json.loads(raw)
@@ -269,11 +258,8 @@ def _load_locked(f):
 
 
 def _save_locked(f, data):
-    f.seek(0)
-    f.truncate()
-    json.dump(data, f, ensure_ascii=False, indent=2)
-    f.flush()
-    os.fsync(f.fileno())
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    f.write_bytes(payload.encode("utf-8"))
 
 
 def _json_apply(upload_id, mutate):

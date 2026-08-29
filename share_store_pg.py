@@ -81,6 +81,20 @@ class RevisionConflict(Exception):
         super().__init__(
             message or "revision 冲突：标注已被他人修改，请刷新后重试")
 
+
+class ShareStoreCorrupt(Exception):
+    """PG 后端不落 shares.json 文件；本类仅为 dispatcher 公共名对齐（json 后端
+    的文件损坏语义在 PG 模式不可达）。数据级损坏由 SQL 约束/事务保证不发生。"""
+
+
+class ShareStoreUnavailable(Exception):
+    """PG 后端连接/查询失败（等价 json 后端 EACCES/EIO 的分流）。
+
+    连接异常时上抛本类，share_server 映射 503 share_store_unavailable
+    （fail-closed，不回空库）。
+    """
+
+
 # 文件路径占位：PG 后端不用文件（dispatcher 公共名校验需要这些名字存在）
 SHARE_DATA_DIR = None
 SHARE_FILE = None
@@ -103,6 +117,29 @@ def _connect():
     conn = pg_store.connect()
     conn.row_factory = psycopg.rows.dict_row
     return conn
+
+
+def probe_readable():
+    """启动只读探针（与 json 后端公共名对齐）：SELECT 1 验证存储可用。
+
+    连接/查询失败 → ``ShareStoreUnavailable``（worker 不 ready）；成功 True。
+    """
+    try:
+        conn = _connect()
+    except Exception as e:  # noqa: BLE001 - psycopg 各类连接错误统一分流
+        raise ShareStoreUnavailable("share 存储 PG 连接失败：%s" % e) from e
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+    except Exception as e:  # noqa: BLE001
+        raise ShareStoreUnavailable("share 存储 PG 探针查询失败：%s" % e) from e
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return True
 
 
 # 数据归属：由 app.py 启动时注入首个 owner 的 user_id（与 json 的 _OWNER_USER_ID

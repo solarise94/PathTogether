@@ -375,6 +375,24 @@ def validate_manifest(d):
             for i, s in enumerate(slots):
                 if not isinstance(s, str) or not s:
                     errors.append("ui.slots[%d] 需为非空字符串" % i)
+        # ui.fileHashes（可选，manifestSchemaVersion 1.1 起支持）：bundle 内容
+        # 完整性绑定——{相对 bundle 根的路径: sha256(64hex)}。特权 admin 插件
+        # 依赖它把 manifest pin 间接绑定到全部可服务文件（2026-08-29 复核：
+        # 此前 pin 只锁 manifest.json，UI 文件可漂移）。
+        fh = ui.get("fileHashes")
+        if fh is not None:
+            if not isinstance(fh, dict) or not fh:
+                errors.append("ui.fileHashes 需为非空的路径→sha256 对象")
+            else:
+                for path, digest in fh.items():
+                    if not isinstance(path, str) or not path or \
+                            path.startswith("/") or ".." in path.split("/") or \
+                            "\\" in path:
+                        errors.append("ui.fileHashes 键 %r 需为相对 bundle 根的"
+                                      "安全路径" % path)
+                    if not isinstance(digest, str) or                             not re.fullmatch(r"[0-9a-fA-F]{64}", digest or ""):
+                        errors.append("ui.fileHashes[%r] 需为 64 位 sha256 hex"
+                                      % path)
 
     # ---- service ----
     # baseUrl 的 http/https 约束只对**声明了 provides** 的 manifest 生效：

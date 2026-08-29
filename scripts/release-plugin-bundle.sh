@@ -118,6 +118,11 @@ cmd_stage() {
   # 版本一致性：manifest.id 必须与目录名一致（防把 A 插件发成 B 的版本目录）
   local mid; mid="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["id"])' "$src/manifest.json")"
   [ "$mid" = "$id" ] || die "manifest.id=$mid 与目录名 $id 不一致"
+  # 版本一致性（复核 P1 2026-08-29）：CLI version 必须等于 manifest.pluginVersion
+  # ——否则 release 目录号与插件自报版本脱钩（0.1.2 目录装着 pluginVersion
+  # 0.1.1 的 manifest 即此类漂移）。
+  local mver; mver="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("pluginVersion",""))' "$src/manifest.json")"
+  [ "$mver" = "$ver" ] || die "CLI version=$ver 与 manifest.pluginVersion=$mver 不一致（先 bump manifest 再 stage）"
   remote "[ -e '$dest' ]" >/dev/null 2>&1 && die "目标 release 已存在（版本化目录不可变）：$dest"
   local sha; sha="$(manifest_sha256_local "$src/manifest.json")"
   info "stage：rsync $src -> $SSH_HOST:${dest}（manifest sha256=${sha}）"
@@ -139,6 +144,30 @@ cmd_preflight() {
     >/dev/null 2>&1 || die "远程 manifest.json 无法解析：$dest/manifest.json"
   local rsha; rsha="$(remote "sha256sum '$dest/manifest.json' | cut -d' ' -f1")"
   [ "$rsha" = "$pin" ] || die "manifest hash 不匹配：release=$rsha pin=$pin"
+  # bundle 内容完整性（复核 P1 2026-08-29）：manifest 声明 ui.fileHashes 时，
+  # 远端 release 的每个文件逐一 sha256 对照 + 检查多余文件（manifest.json
+  # 之外的未声明文件存在即失败——未声明文件不经 pin 绑定，是漂移通道）。
+  remote "python3 - '$dest' <<'PYEOF'
+import hashlib, json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
+declared = ((manifest.get('ui') or {}).get('fileHashes') or {})
+if declared:
+    for rel, expected in sorted(declared.items()):
+        f = root / rel
+        if not f.is_file():
+            sys.exit('bundle file missing: %s' % rel)
+        actual = hashlib.sha256(f.read_bytes()).hexdigest()
+        if actual != str(expected).lower():
+            sys.exit('bundle file hash mismatch: %s' % rel)
+    allowed = {'manifest.json'} | set(declared)
+    present = {str(p.relative_to(root)) for p in root.rglob('*') if p.is_file()}
+    extra = present - allowed
+    if extra:
+        sys.exit('undeclared files in release: %s' % ', '.join(sorted(extra)))
+print('bundle integrity ok: %d files verified' % (len(declared) + 1))
+PYEOF" || die "bundle 内容完整性校验失败（见上方输出）"
   # 不在用
   local cur; cur="$(current_target "$id")"
   [ "$cur" != "releases/$id-$ver" ] || die "该 release 已是当前入口（不在用检查失败）"

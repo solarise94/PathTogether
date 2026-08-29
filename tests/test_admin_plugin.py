@@ -782,3 +782,114 @@ def test_bootstrap_node_survives_boundary_characters():
     assert "<" not in raw
     # 页面上只有 bootstrap JSON 节点 + admin-host.js 两个 <script> 开标签
     assert html_text.count("<script") == 2
+
+
+# --------------------------------------------------------------------------- #
+# 8. bundle 内容完整性（复核 P1 2026-08-29：pin 间接绑定全部可服务文件）
+# --------------------------------------------------------------------------- #
+def _copy_admin_bundle(root):
+    """复制 admin bundle（manifest + ui 三件套）到独立根，返回 plugin 目录。"""
+    plugin = root / "pathtogether-admin"
+    (plugin / "ui").mkdir(parents=True)
+    (plugin / "manifest.json").write_bytes(ADMIN_MANIFEST.read_bytes())
+    for name in ("index.html", "main.js", "style.css"):
+        (plugin / "ui" / name).write_bytes(
+            (ADMIN_PLUGIN_DIR / "ui" / name).read_bytes())
+    return plugin
+
+
+def test_bundle_filehash_mismatch_is_untrusted(monkeypatch, tmp_path):
+    """manifest 声明 fileHashes 后：磁盘文件被篡改 → 整个插件不可信
+    （fail-closed：pin 通过也不能服务漂移的 UI 代码）。"""
+    _setup_users()
+    _install_admin_plugin()
+    root = tmp_path / "bundles"
+    plugin = _copy_admin_bundle(root)
+    _set_policy(monkeypatch, tmp_path,
+                {"pathtogether-admin": _sha256(plugin / "manifest.json")})
+    monkeypatch.setattr(app_mod, "PLUGIN_BUNDLES_DIR", root)
+    assert app_mod._admin_plugin_trusted("pathtogether-admin") == (True, "ok")
+    # 篡改 main.js 一个字节 → hash mismatch → 不可信；/admin 降级
+    data = bytearray((plugin / "ui" / "main.js").read_bytes())
+    data[0] ^= 0xFF
+    (plugin / "ui" / "main.js").write_bytes(bytes(data))
+    assert app_mod._admin_plugin_trusted("pathtogether-admin")[0] is False
+    assert "bundle file hash mismatch" in app_mod._admin_plugin_trusted(
+        "pathtogether-admin")[1]
+    owner, _u = user_store.list_users()[0], None
+    r = _login(_client(), owner).get("/admin")
+    assert "管理插件当前不可用" in r.get_data(as_text=True)
+    # 声明的文件缺失同样不可信（恢复 main.js 后单独验证 missing 分支）
+    (plugin / "ui" / "main.js").write_bytes(
+        (ADMIN_PLUGIN_DIR / "ui" / "main.js").read_bytes())
+    (plugin / "ui" / "style.css").unlink()
+    assert "bundle file missing" in app_mod._admin_plugin_trusted(
+        "pathtogether-admin")[1]
+
+
+def test_asset_rejects_files_not_declared_in_manifest(monkeypatch, tmp_path):
+    """fileHashes 声明集合外的文件（多余/新增）→ 资源路由 403。"""
+    owner, _u = _setup_users()
+    _install_admin_plugin()
+    root = tmp_path / "bundles"
+    plugin = _copy_admin_bundle(root)
+    (plugin / "ui" / "extra.js").write_text("console.log('drift')",
+                                            encoding="utf-8")
+    monkeypatch.setattr(app_mod, "PLUGIN_BUNDLES_DIR", root)
+    _set_policy(monkeypatch, tmp_path,
+                {"pathtogether-admin": _sha256(plugin / "manifest.json")})
+    oc = _login(_client(), owner)
+    r = oc.get(ASSET_BASE + "/ui/extra.js")
+    assert r.status_code == 403
+    assert r.get_json()["reason"] == "file not declared in manifest"
+    # 已声明的文件照常服务
+    assert oc.get(ASSET_BASE + "/ui/main.js").status_code == 200
+
+
+def test_admin_asset_token_bound_to_manifest_sha():
+    """token 绑定磁盘 manifest sha：bundle 切换后旧 token 全部失效。"""
+    sha_a = "a" * 64
+    sha_b = "b" * 64
+    tok = app_mod._admin_asset_token("pathtogether-admin", sha_a)
+    assert app_mod._admin_asset_token_valid(
+        "pathtogether-admin", tok, manifest_sha=sha_a) is True
+    assert app_mod._admin_asset_token_valid(
+        "pathtogether-admin", tok, manifest_sha=sha_b) is False
+    assert app_mod._admin_asset_token_valid(
+        "other-plugin", tok, manifest_sha=sha_a) is False
+    assert app_mod._admin_asset_token_valid(
+        "pathtogether-admin", "9999.deadbeef", manifest_sha=sha_a) is False
+
+
+def test_manifest_validator_enforces_filehashes_structure():
+    """ui.fileHashes 结构校验：非对象 / 坏 hex / 绝对路径 / .. 均拒绝。"""
+    data = json.loads(ADMIN_MANIFEST.read_text(encoding="utf-8"))
+    assert M.validate_manifest(data) == []  # repo manifest 自身合法
+
+    bad = json.loads(json.dumps(data))
+    bad["ui"]["fileHashes"] = "not-an-object"
+    errs = M.validate_manifest(bad)
+    assert errs and any("fileHashes" in e for e in errs)
+
+    bad["ui"]["fileHashes"] = {"ui/main.js": "xyz"}  # 非 64 hex
+    errs = M.validate_manifest(bad)
+    assert errs and any("fileHashes" in e for e in errs)
+
+    bad["ui"]["fileHashes"] = {"/etc/passwd": "0" * 64}  # 绝对路径
+    errs = M.validate_manifest(bad)
+    assert errs and any("fileHashes" in e for e in errs)
+
+    bad["ui"]["fileHashes"] = {"../escape.js": "0" * 64}  # 穿越
+    errs = M.validate_manifest(bad)
+    assert errs and any("fileHashes" in e for e in errs)
+
+
+def test_admin_manifest_plugin_version_bumped_with_hashes():
+    """复核收口：pluginVersion 0.1.2 与 release 目录对齐，fileHashes 覆盖
+    全部可服务 UI 文件（manifest 的入口/资源不得游离声明之外）。"""
+    data = json.loads(ADMIN_MANIFEST.read_text(encoding="utf-8"))
+    assert data["pluginVersion"] == "0.1.2"
+    hashes = data["ui"]["fileHashes"]
+    assert data["ui"]["entry"] in hashes
+    for name in ("index.html", "main.js", "style.css"):
+        assert ("ui/" + name) in hashes

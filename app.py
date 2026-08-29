@@ -1758,6 +1758,18 @@ def _admin_plugin_trusted(plugin_id):
         ui = manifest.get("ui") or {}
         if ADMIN_WORKSPACE_SLOT not in (ui.get("slots") or []):
             return False, "admin.workspace slot missing"
+        # ③b bundle 内容完整性（2026-08-29 复核 P1）：manifest pin 此前只锁
+        # manifest.json 自身，UI 文件可漂移。声明了 ui.fileHashes 的 manifest
+        # 把 pin 间接绑定到全部可服务文件——每请求重判时逐一验证磁盘文件
+        # sha256（缺失/不匹配一律不可信，fail-closed）。
+        for rel, expected in (ui.get("fileHashes") or {}).items():
+            ftarget = plugin_dir / rel
+            try:
+                factual = hashlib.sha256(ftarget.read_bytes()).hexdigest()
+            except OSError:
+                return False, "bundle file missing: %s" % rel
+            if not hmac.compare_digest(factual, str(expected).lower()):
+                return False, "bundle file hash mismatch: %s" % rel
         # ④ installation 存在且 enabled（plugin_id 口径与安装行一致）
         manifest_plugin_id = manifest.get("id") or plugin_id
         installations = [i for i in share_store.list_plugin_installations()
@@ -2033,7 +2045,7 @@ _ADMIN_ASSET_TOKEN_PARAM = "pt_at"
 _ADMIN_ASSET_TOKEN_TTL = 600
 
 
-def _admin_asset_token(plugin_id) -> str:
+def _admin_asset_token(plugin_id, manifest_sha) -> str:
     """为 admin 插件子资源签发短时 HMAC token（exp 签名，无敏感内容）。
 
     为什么需要它（2026-08-29 E2E 真实捕获的架构级根因）：插件 iframe 是
@@ -2045,21 +2057,40 @@ def _admin_asset_token(plugin_id) -> str:
     （owner-only 导航请求）在服务端把静态相对资源引用改写为带 token 的
     URL；CSS/JS/PNG 验 token（或 owner session）。匿名无 token 仍 401，
     不放宽任何安全边界；token 只出现在 no-store 的 owner-only HTML 中。
+
+    token 绑定当前磁盘 manifest sha256（复核 P2）：bundle 切换（manifest
+    变化）后旧 token 立即全部失效，token 不能跨 release 重放。
     """
     exp = int(time.time()) + _ADMIN_ASSET_TOKEN_TTL
-    msg = "%s|%d" % (plugin_id, exp)
+    msg = "%s|%d|%s" % (plugin_id, exp, manifest_sha)
     sig = hmac.new(str(app.secret_key).encode("utf-8"),
                    msg.encode("utf-8"), hashlib.sha256).hexdigest()
     return "%d.%s" % (exp, sig)
 
 
-def _admin_asset_token_valid(plugin_id, token) -> bool:
+def _admin_manifest_sha(plugin_id):
+    """当前磁盘 manifest 的 sha256（信任链锚点；读不到返回 None）。"""
+    try:
+        plugin_dir = _plugin_dir(plugin_id)
+        if plugin_dir is None:
+            return None
+        return hashlib.sha256(
+            (plugin_dir / "manifest.json").read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _admin_asset_token_valid(plugin_id, token, manifest_sha=None) -> bool:
+    if manifest_sha is None:
+        manifest_sha = _admin_manifest_sha(plugin_id)
+    if not manifest_sha:
+        return False
     try:
         exp_raw, _, sig = str(token or "").partition(".")
         exp = int(exp_raw)
         if exp < int(time.time()):
             return False
-        msg = "%s|%d" % (plugin_id, exp)
+        msg = "%s|%d|%s" % (plugin_id, exp, manifest_sha)
         expected = hmac.new(str(app.secret_key).encode("utf-8"),
                             msg.encode("utf-8"), hashlib.sha256).hexdigest()
         return hmac.compare_digest(sig, expected)
@@ -2076,7 +2107,7 @@ _ADMIN_ASSET_REWRITE_RE = re.compile(
 
 def _admin_rewrite_asset_urls(html_text: str, plugin_id: str) -> str:
     """把插件 HTML 内的静态相对资源引用改写为带短时 token 的 URL。"""
-    token = _admin_asset_token(plugin_id)
+    token = _admin_asset_token(plugin_id, _admin_manifest_sha(plugin_id) or "")
     return _ADMIN_ASSET_REWRITE_RE.sub(
         lambda m: '%s%s?%s=%s"' % (m.group(1), m.group(2),
                                    _ADMIN_ASSET_TOKEN_PARAM, token),
@@ -2128,6 +2159,18 @@ def admin_plugin_asset(plugin_id, filename):
             {"error": "forbidden", "reason": "path outside plugin directory"}, 403)
     if not target.is_file():
         return _admin_asset_json({"error": "not_found"}, 404)
+    # fileHashes 声明集合外的文件一律拒绝（复核 P1：未声明的多余/新增文件
+    # 不经完整性校验即可服务 = 漂移通道；信任判定的全量校验只覆盖已声明文件）
+    try:
+        manifest = json.loads(
+            (_plugin_dir(plugin_id) / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return _admin_asset_json({"error": "forbidden",
+                                  "reason": "manifest unreadable"}, 403)
+    declared = ((manifest.get("ui") or {}).get("fileHashes") or {})
+    if declared and filename not in declared:
+        return _admin_asset_json({"error": "forbidden",
+                                  "reason": "file not declared in manifest"}, 403)
     try:
         data = target.read_bytes()
     except OSError:

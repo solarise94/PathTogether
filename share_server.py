@@ -12,6 +12,7 @@ import hmac
 import io
 import os
 import secrets
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -58,8 +59,10 @@ TILE_SIZE = DZ_TILE_SIZE
 OVERLAP = DZ_OVERLAP
 
 # 切片句柄池与元数据缓存（与主应用共享 slide_cache 抽象，进程独立）
-# 瓦片内存缓存（LRU + TTL）：key=(name, level, x, y)，value=(ts, JPEG bytes)
-# 分享端只读，但切片可能被管理端删除后同名重传，加 TTL 兜底避免长期服务旧图
+# 瓦片内存缓存（LRU + TTL）：key=(name, generation, level, x, y)，value=(ts, JPEG bytes)
+# review G3：generation 由 slide_cache 的文件签名统一驱动——同名重传/原地改写后
+# 旧代键永不命中（TTL 只是容量兜底，不再承担正确性）。分享端只读不 evict，
+# 换代完全依赖借用时的跨进程签名检查。
 TILE_CACHE_MAX = int(os.environ.get("TILE_CACHE_MAX") or 3000)
 TILE_CACHE_TTL = float(os.environ.get("TILE_CACHE_TTL") or 3600)  # 秒
 _tile_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
@@ -544,6 +547,44 @@ def _handle_403(e):
     return "无权访问", 403
 
 
+# --------------------------------------------------------------------------- #
+# 存储层 fail-closed（review G1）：损坏/不可用一律 503，绝不映射成 404 空库
+# --------------------------------------------------------------------------- #
+def _share_store_error_response(e):
+    """把 ShareStoreCorrupt/ShareStoreUnavailable 映射为稳定 503 JSON。"""
+    code = ("share_store_corrupt"
+            if isinstance(e, share_store.ShareStoreCorrupt)
+            else "share_store_unavailable")
+    app.logger.error("share 存储不可用（%s）：%s", code, e)
+    return jsonify(error=code), 503
+
+
+@app.errorhandler(share_store.ShareStoreCorrupt)
+def _handle_share_store_corrupt(e):
+    return _share_store_error_response(e)
+
+
+@app.errorhandler(share_store.ShareStoreUnavailable)
+def _handle_share_store_unavailable(e):
+    return _share_store_error_response(e)
+
+
+@app.route("/s/healthz")
+def share_healthz():
+    """分享服务就绪探针：存储不可读/损坏 → 503（ready 失败，不对外服务空库）。
+
+    只做只读 probe（不迁移、不写数据文件）。combined 部署下主站路径由
+    admin app 处理，本端点挂在 /s/ 前缀下供 share worker 单独探活。
+    """
+    try:
+        share_store.probe_readable()
+    except share_store.ShareStoreCorrupt as e:
+        return jsonify(error="share_store_corrupt", detail=str(e)), 503
+    except share_store.ShareStoreUnavailable as e:
+        return jsonify(error="share_store_unavailable", detail=str(e)), 503
+    return jsonify(status="ok"), 200
+
+
 @app.route("/")
 def index():
     return "链接无效或已过期", 404
@@ -612,14 +653,21 @@ def share_config(token):
     return jsonify({"roi_sizes": share.get("roi_sizes") or list(share_store.DEFAULT_ROI_SIZES)})
 
 
+@app.errorhandler(slide_cache.SlideFileChanged)
+def _handle_slide_file_changed(e):
+    """读取期间切片被连续替换（重试后仍变）：丢弃结果，返回可重试 503。"""
+    app.logger.warning("切片读取期间文件被连续替换：%s", e)
+    return jsonify(error="slide_file_changed"), 503
+
+
 @app.route("/s/<token>/api/slide/<name>.dzi")
 def share_slide_dzi(token, name):
     share = _require_share(token)
     safe = _require_slide(share, name)
     entry = _get_slide(safe)
-    with slide_cache.borrow_pair(entry) as pair:
-        dz = pair["dz"]
-        width, height = dz.level_dimensions[-1]
+    # 尺寸按代读取（review G3）：文件换名重传后 dims 必须来自新代句柄
+    (width, height), _gen = slide_cache.read_stable(
+        entry, lambda pair: pair["dz"].level_dimensions[-1])
 
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -637,23 +685,32 @@ def share_slide_dzi(token, name):
 
 @app.route("/s/<token>/api/slide/<name>_files/<int:level>/<int:x>_<int:y>.jpeg")
 def share_slide_tile(token, name, level, x, y):
-    """返回 Deep Zoom 单张瓦片 JPEG（512×512、baseline、q82，带 LRU+TTL 缓存）。"""
+    """返回 Deep Zoom 单张瓦片 JPEG（512×512、baseline、q82，带 LRU+TTL 缓存）。
+
+    review G3（CACHE-1）：瓦片缓存键含 generation——同名重传/原地改写后旧代
+    键不再命中（不再依赖 TTL 兜底服务旧图），generation 由 slide_cache 的
+    文件签名（dev/ino/size/mtime_ns）统一驱动，与句柄/info 同一套换代。
+    """
     share = _require_share(token)
     safe = _require_slide(share, name)
+    entry = _get_slide(safe)
 
-    key = (safe, level, x, y)
+    gen = slide_cache.refresh_generation(entry)
+    key = (safe, gen, level, x, y)
     cached = _tile_cache_get(key)
     if cached is not None:
         buf = io.BytesIO(cached)
     else:
-        entry = _get_slide(safe)
-        with slide_cache.borrow_pair(entry) as pair:
-            dz = pair["dz"]
-            tile = dz.get_tile(level, (x, y))
+        def _decode(pair):
+            tile = pair["dz"].get_tile(level, (x, y))
+            if tile.mode != "RGB":
+                tile = tile.convert("RGB")
+            return tile
 
-        # 含 alpha 通道时先转 RGB（JPEG 不支持透明度）
-        if tile.mode != "RGB":
-            tile = tile.convert("RGB")
+        # 按代读取：读取前后签名变化则换代重读一次（SlideFileChanged → 503）
+        tile, tile_gen = slide_cache.read_stable(entry, _decode)
+        key = (safe, tile_gen, level, x, y)
+
         buf = io.BytesIO()
         # baseline JPEG：省掉 progressive/optimize 的编码开销（快 3–5×）；
         # 模糊→清晰的渐进预览已由查看器 base-thumb 底图层负责，瓦片无需 progressive
@@ -1007,6 +1064,34 @@ def share_comment_add(token):
 @app.route("/static/<path:filename>")
 def share_static(filename):
     return send_from_directory("static", filename)
+
+
+# --------------------------------------------------------------------------- #
+# 启动只读 probe（review G1）：存储损坏/不可读 → worker 不 ready
+# --------------------------------------------------------------------------- #
+# gunicorn 以 share_server:combined_app 拉起 worker，模块加载即 probe：
+# 失败直接抛错使 worker boot 失败（服务不 ready），绝不在不可判读状态下
+# 对外服务空库。失败信息只含错误类别与安全路径标识，不含数据内容。
+SHARE_STORE_STARTUP_ERROR = None
+
+
+def run_share_store_startup_probe():
+    """执行启动 probe；失败记录到 SHARE_STORE_STARTUP_ERROR 并抛 SystemExit。
+
+    独立成函数便于部署脚本/测试显式调用。
+    """
+    global SHARE_STORE_STARTUP_ERROR
+    try:
+        share_store.probe_readable()
+    except (share_store.ShareStoreCorrupt, share_store.ShareStoreUnavailable) as e:
+        SHARE_STORE_STARTUP_ERROR = "%s: %s" % (type(e).__name__, e)
+        print("[share_server] FATAL share 存储启动 probe 失败：%s"
+              % SHARE_STORE_STARTUP_ERROR, file=sys.stderr, flush=True)
+        raise SystemExit(2)
+    return True
+
+
+run_share_store_startup_probe()
 
 
 # --------------------------------------------------------------------------- #

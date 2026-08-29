@@ -5,20 +5,26 @@
 - app.py（主应用 :8000，管理员写入）
 - share_server.py（分享服务 :38000，读为主，外部用户写入 ROI）
 
-数据文件为单个 JSON，所有读写通过 fcntl.flock 互斥访问，保证一致性。
+数据文件为单个 JSON。读写互斥在**稳定 lock file**（``shares.json.lock``）上
+以 fcntl.flock 实现；写盘走 tmp+fsync+``os.replace`` 原子替换（IO/锁原语见
+``locked_atomic_json``）。旧实现把 flock 加在数据文件 inode 上并以 truncate+
+dump 写盘——同名 replace 后锁与数据同时失效，且损坏文件会被当成空库继续写，
+两者均已按 review G1（fail-closed + 原子写）修正：
+- 文件不存在 / 零字节（首次 touch） → 空库；
+- 非空但 parse/shape 损坏 → 备份后抛 ``ShareStoreCorrupt``；
+- EACCES/EIO 等读失败 → ``ShareStoreUnavailable``。
 """
 
 import json
 import os
 import secrets
-import shutil
 import time
 import uuid
 import hashlib
 import hmac
 from pathlib import Path
 
-import fcntl
+import locked_atomic_json
 
 # 数据目录与文件路径
 SHARE_DATA_DIR = Path(
@@ -75,6 +81,26 @@ class RevisionConflict(Exception):
         self.current_revision = int(current_revision)
         super().__init__(
             message or "revision 冲突：标注已被他人修改，请刷新后重试")
+
+
+class ShareStoreCorrupt(Exception):
+    """shares.json 已存在且非空，但 JSON parse / 顶层 shape 损坏。
+
+    fail-closed（review G1/DS-1）：调用方必须以不可用处理（share_server 503
+    share_store_corrupt、app 启动不 ready），绝不得当作空库继续服务——否则
+    下一次写盘会把多年分享/标注整体覆盖。损坏原文已备份到
+    ``shares.json.corrupt-<时间戳>-<sha256前缀>.bak``（备份失败也照样抛本错，
+    不得回空库）。
+    """
+
+
+class ShareStoreUnavailable(Exception):
+    """shares.json 读/写遇到 IO 层错误（EACCES/EIO/EMFILE 等）。
+
+    与 Corrupt 分流（review G1）：损坏是数据问题（需人工处置备份），不可用是
+    运行环境问题（磁盘/权限，恢复后自愈）。调用方同样 fail-closed（503
+    share_store_unavailable），不得回空库。
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -265,60 +291,66 @@ def _is_finite_num(v):
     return math.isfinite(v)
 
 
+#: 顶层容器字段的合法类型（shape 校验；缺失字段仍按 setdefault 兼容旧文件，
+#: 但**已存在**的字段类型错误一律视为损坏，不再静默重置——review G1）。
+_TOP_LEVEL_SHAPE = (
+    ("shares", dict),
+    ("rois", list),
+    ("projects", dict),
+    ("slide_meta", dict),
+    ("change_seq_by_slide", dict),
+    ("grants", list),
+    ("comments", list),
+    ("audit", list),
+    ("plugin_installations", list),
+    ("run_grants", list),
+)
+
+
+def _backup_corrupt_raw(raw: bytes) -> Path:
+    """把损坏原文备份到唯一名（时间戳 + sha256 前缀）。
+
+    best-effort：备份失败（目录只读等）不吞掉原始错误——调用方随后照抛
+    ShareStoreCorrupt，绝不回空库（review G1：备份失败也必须抛原错误）。
+    """
+    bak = locked_atomic_json.corrupt_backup_path(SHARE_FILE, raw)
+    try:
+        with open(bak, "wb") as bf:
+            bf.write(raw)
+    except OSError:
+        pass
+    return bak
+
+
 def _load_locked(f):
-    """在已锁定的文件对象上读取并解析 JSON；损坏则备份重建。
+    """在稳定锁内的会话上读取并解析 JSON；损坏 fail-closed。
+
+    语义（与 user_store_json 对齐，review G1/DS-1）：
+    - 文件不存在（ENOENT）或零字节（首次 touch） → 空库；
+    - 非空但 JSON parse 失败 / 顶层错型 / 关键字段错型 → 备份原文后抛
+      ``ShareStoreCorrupt``（备份失败也抛）；
+    - EACCES/EIO 等 IO 错误 → ``ShareStoreUnavailable``。
 
     会做存量 ROI 迁移（_ensure_roi_identity）。若迁移改动数据，本次临界区的
     迁移后 dict 会缓存到 f._svs_migrated_data；_with_lock 在 fn 结束后若发现
-    fn 自身未保存（缓存未被消费）且 fn 未显式写盘，则补一次落盘，保证读路径
-    返回的迁移值（annotation_id/source 等）下次落盘不丢。迁移本身幂等。
+    fn 自身未保存（缓存未被消费）且 fn 未显式写盘，则补一次落盘。迁移幂等。
     """
-    f.seek(0)
-    raw = f.read()
+    try:
+        raw = f.read_bytes()
+    except OSError as e:
+        raise ShareStoreUnavailable(
+            "shares.json 读取失败（%s: %s）" % (type(e).__name__, e)) from e
     if not raw:
         return _copy_empty()
     try:
         data = json.loads(raw)
         if not isinstance(data, dict):
             raise ValueError("top-level not object")
-        data.setdefault("shares", {})
-        data.setdefault("rois", [])
-        # 向后兼容：旧文件无 projects 时补 {}
-        data.setdefault("projects", {})
-        # 向后兼容：旧文件无 slide_meta 时补 {}
-        data.setdefault("slide_meta", {})
-        # 向后兼容：旧文件无 change_seq_by_slide 时补 {}
-        data.setdefault("change_seq_by_slide", {})
-        # 向后兼容：旧文件无 grants 时补 []（Stage 3a-2a 认领关系）
-        data.setdefault("grants", [])
-        # 向后兼容：旧文件无 comments 时补 []（Stage 3c-1 评论线程）
-        data.setdefault("comments", [])
-        if not isinstance(data["shares"], dict):
-            data["shares"] = {}
-        if not isinstance(data["rois"], list):
-            data["rois"] = []
-        if not isinstance(data["projects"], dict):
-            data["projects"] = {}
-        if not isinstance(data["slide_meta"], dict):
-            data["slide_meta"] = {}
-        if not isinstance(data["change_seq_by_slide"], dict):
-            data["change_seq_by_slide"] = {}
-        if not isinstance(data["grants"], list):
-            data["grants"] = []
-        if not isinstance(data["comments"], list):
-            data["comments"] = []
-        # 向后兼容：旧文件无 audit 时补 []（Stage 3c-2 审计日志）
-        data.setdefault("audit", [])
-        if not isinstance(data["audit"], list):
-            data["audit"] = []
-        # 向后兼容：旧文件无 plugin_installations / run_grants 时补 []（Stage 4-1a）
-        data.setdefault("plugin_installations", [])
-        if not isinstance(data["plugin_installations"], list):
-            data["plugin_installations"] = []
-        data.setdefault("run_grants", [])
-        if not isinstance(data["run_grants"], list):
-            data["run_grants"] = []
-        # 向后兼容：旧项目无 archived 字段 → 默认 false（未归档，纯只读开关，docs §v1.5）
+        for key, typ in _TOP_LEVEL_SHAPE:
+            data.setdefault(key, typ())
+            if not isinstance(data[key], typ):
+                raise ValueError("字段 %s 类型错误（期望 %s）" % (key, typ.__name__))
+        # 向后兼容：旧项目无 archived 字段 → 默认 false（未归档，纯只读开关）
         for _proj in data.get("projects", {}).values():
             if isinstance(_proj, dict) and _proj.get("archived") is None:
                 _proj["archived"] = False
@@ -331,16 +363,10 @@ def _load_locked(f):
         if changed:
             f._svs_migrated_data = data
         return data
-    except (json.JSONDecodeError, ValueError):
-        # 损坏：备份后重建
-        f.seek(0)
-        bak = SHARE_FILE.with_suffix(".json.bak")
-        try:
-            with open(bak, "w", encoding="utf-8") as bf:
-                bf.write(raw)
-        except Exception:
-            pass
-        return _copy_empty()
+    except (json.JSONDecodeError, ValueError) as e:
+        bak = _backup_corrupt_raw(raw)
+        raise ShareStoreCorrupt(
+            "shares.json 损坏（已备份至 %s）：%s" % (bak.name, e)) from e
 
 
 def _copy_empty():
@@ -513,47 +539,90 @@ def _visible(data):
 
 
 def _save_locked(f, data):
-    """在已锁定的文件对象上写入 JSON（先截断）。
+    """在稳定锁内的会话上原子写入 JSON（tmp 0600 + fsync + replace）。
 
+    任何崩溃点（tmp 写入/fsync/replace 前后）数据文件都只保留完整旧版或
+    完整新版（review G1）。IO 失败抛 ``ShareStoreUnavailable``。
     fn 自身已写盘时，清掉 _with_lock 的迁移补落盘缓存（避免用过期快照覆盖）。
     """
-    f.seek(0)
-    f.truncate()
-    json.dump(data, f, ensure_ascii=False, indent=2)
-    f.flush()
-    os.fsync(f.fileno())
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    try:
+        f.write_bytes(payload.encode("utf-8"))
+    except OSError as e:
+        raise ShareStoreUnavailable(
+            "shares.json 写入失败（%s: %s）" % (type(e).__name__, e)) from e
     # fn 已落盘 → 取消 _with_lock 末尾的迁移补落盘
     if hasattr(f, "_svs_migrated_data"):
         f._svs_migrated_data = None
 
 
 def _with_lock(mode, fn):
-    """以指定模式打开 SHARE_FILE，加排他锁后执行 fn(file_obj)。
+    """在稳定锁（shares.json.lock）内执行 fn(session)，返回 fn 的返回值。
 
-    mode 为 'r+'（读写，要求文件已存在；不存在则先创建）或 'w+'。
-    返回 fn 的返回值。
-
-    若本次 _load_locked 触发了存量 ROI 迁移，而 fn 自身未显式写盘（只读路径如
-    list_rois / annotations_by_slide），这里补一次保存，让迁移结果落盘——读路径
-    返回的 annotation_id/source 立即可被前端使用，下次任何写自然带上迁移后格式。
-    迁移本身幂等（已补字段的 ROI 不再改），重复读不会重复落盘。
+    - 锁加在**独立 lock file** 上（从不被 replace），跨进程（app.py 与
+      share_server.py）互斥稳定有效；旧实现锁在数据 inode 上，改原子替换后
+      会失效（review G1）。
+    - mode 参数保留兼容旧调用（'r+'/'w+'），读写均排他，不再区分。
+    - 若本次 _load_locked 触发了存量 ROI 迁移而 fn 自身未写盘（只读路径如
+      list_rois），这里补一次保存，让迁移结果落盘（幂等，重复读不重复落盘）。
     """
-    # 确保文件存在
-    if not SHARE_FILE.exists():
-        SHARE_FILE.touch()
-    with open(SHARE_FILE, mode, encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        migrated_data = None
+    def _run(session):
+        ret = fn(session)
+        migrated_data = getattr(session, "_svs_migrated_data", None)
+        if migrated_data is not None:
+            _save_locked(session, migrated_data)
+            session._svs_migrated_data = None
+        return ret
+
+    try:
+        return locked_atomic_json.with_locked_file(SHARE_FILE, _run)
+    except ShareStoreCorrupt:
+        raise
+    except OSError as e:
+        # 锁文件打开/创建失败（EACCES/EIO 等）同样 fail-closed
+        raise ShareStoreUnavailable(
+            "shares.json 锁获取失败（%s: %s）" % (type(e).__name__, e)) from e
+
+
+def probe_readable():
+    """启动只读探针（review G1）：SHARE_FILE 可读且可解析。
+
+    不迁移、不写数据文件、不创建数据文件（只创建稳定锁文件）。语义与
+    _load_locked 的分流一致：
+    - 文件不存在 / 零字节 → True（空库是合法初始态）；
+    - 非空损坏 → ``ShareStoreCorrupt``；
+    - IO 错误 → ``ShareStoreUnavailable``。
+    share_server 在模块加载（gunicorn worker boot）时调用：失败即 worker
+    不 ready，绝不在存储不可判读的状态下对外服务空库。
+    """
+
+    def _do(f):
         try:
-            ret = fn(f)
-            # 若迁移发生且 fn 未消费（未清缓存），补落盘
-            migrated_data = getattr(f, "_svs_migrated_data", None)
-            if migrated_data is not None:
-                _save_locked(f, migrated_data)
-                f._svs_migrated_data = None
-            return ret
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            raw = f.read_bytes()
+        except OSError as e:
+            raise ShareStoreUnavailable(
+                "shares.json 读取失败（%s: %s）" % (type(e).__name__, e)) from e
+        if not raw:
+            return True
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("top-level not object")
+            for key, typ in _TOP_LEVEL_SHAPE:
+                if key in data and not isinstance(data[key], typ):
+                    raise ValueError("字段 %s 类型错误（期望 %s）"
+                                     % (key, typ.__name__))
+            return True
+        except (json.JSONDecodeError, ValueError) as e:
+            raise ShareStoreCorrupt("shares.json 损坏：%s" % e) from e
+
+    try:
+        return locked_atomic_json.with_locked_file(SHARE_FILE, _do)
+    except ShareStoreCorrupt:
+        raise
+    except OSError as e:
+        raise ShareStoreUnavailable(
+            "shares.json 锁获取失败（%s: %s）" % (type(e).__name__, e)) from e
 
 
 # --------------------------------------------------------------------------- #

@@ -43,6 +43,7 @@ from flask import (
     send_from_directory,
     session,
 )
+from flask.sessions import SecureCookieSessionInterface
 from werkzeug.utils import secure_filename
 
 from openslide import OpenSlide
@@ -781,7 +782,16 @@ def _auth_challenge():
     # admin 插件资源是 owner-only 子资源（iframe src / fetch 目标，docs §8.3），
     # 不是可导航页面：未登录不给 302 /login（对子资源无意义且徒增跳转），给权威
     # 401 JSON。owner/非 owner 的进一步判定在 admin_plugin_asset 视图内。
+    # 例外：CSS/JS 等子资源由 opaque iframe 发起，SameSite=Lax cookie 不随请求
+    # 发送（见 _admin_asset_token），凭 HTML 注入的短时 token 放行（HTML 本身
+    # 仍要求 owner session，token 只出现在 no-store 的 owner-only HTML 中）。
     if path.startswith("/admin/plugin-assets/"):
+        asset_path = path[len("/admin/plugin-assets/"):]
+        asset_plugin_id = asset_path.split("/", 1)[0]
+        if _admin_asset_token_valid(
+                asset_plugin_id,
+                request.args.get(_ADMIN_ASSET_TOKEN_PARAM)):
+            return None
         return jsonify(error="auth_required"), 401
     if path.startswith("/api/"):
         return jsonify(error="auth_required"), 401
@@ -916,7 +926,14 @@ _CSRF_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _CSRF_EXEMPT_PREFIXES = ("/internal/", "/api/plugin/", "/api/demo/")
 # 静态资源通道（只读 GET）：不下发 token/cookie（避免每个资源响应都带 Set-Cookie）；
 # 非安全方法仍走统一校验（静态路由本无写端点，属纵深防御）
-_CSRF_STATIC_PREFIXES = ("/static/", "/plugins/")
+#: 静态/资源通道前缀：不做 CSRF 镜像、不在 GET 时 ensure token（session 不
+#: 落 Set-Cookie）。含 ``/admin/plugin-assets/``——插件资源响应**绝不能带
+#: Set-Cookie**：opaque iframe（sandbox 无 allow-same-origin）以 no-cors 拉
+#: CSS/JS，Fetch 规范 ORB 对「跨源 no-cors + 响应含 Set-Cookie」一律网络级
+#: 阻塞（ERR_BLOCKED_BY_ORB，Chrome 2024+ 覆盖 sandboxed iframe；2026-08-29
+#: 生产插件 CSS/JS 未生效的另一半根因，E2E 首次真实捕获）。插件 iframe 是
+#: opaque origin，本就读不到 cookie；宿主页负责携带 session/CSRF。
+_CSRF_STATIC_PREFIXES = ("/static/", "/plugins/", "/admin/plugin-assets/")
 
 
 def _csrf_exempt_path(path: str) -> bool:
@@ -1687,11 +1704,15 @@ ADMIN_WORKSPACE_SLOT = "admin.workspace"
 
 #: admin 资源路由允许的扩展名（§8.3：明确拒绝 .svg / source map / 任意下载）
 _ADMIN_ASSET_ALLOWED_EXT = frozenset({".html", ".js", ".css", ".png", ".webp"})
-#: 按后缀固定的 MIME（不信任文件内容探测）
+#: 按后缀固定的 MIME（不信任文件内容探测）。**只写裸 MIME 类型**：Flask
+#: Response(mimetype=...) 会自动追加一次 charset；此处若自带 charset 会生成
+#: 「text/css; charset=utf-8; charset=utf-8」——重复参数是无效 MIME，
+#: Chromium ORB 解析失败即网络级拦截（ERR_BLOCKED_BY_ORB，2026-08-29 E2E
+#: 首次真实捕获），jsdom/单测层照不出来。
 _ADMIN_ASSET_MIME = {
-    ".html": "text/html; charset=utf-8",
-    ".js": "text/javascript; charset=utf-8",
-    ".css": "text/css; charset=utf-8",
+    ".html": "text/html",
+    ".js": "text/javascript",
+    ".css": "text/css",
     ".png": "image/png",
     ".webp": "image/webp",
 }
@@ -2006,24 +2027,88 @@ def admin_workspace():
         })
 
 
+#: admin 插件资源 URL token（query）参数名
+_ADMIN_ASSET_TOKEN_PARAM = "pt_at"
+#: token 有效期（秒）：HTML 响应 no-store，宿主每次进 /admin 重新获取
+_ADMIN_ASSET_TOKEN_TTL = 600
+
+
+def _admin_asset_token(plugin_id) -> str:
+    """为 admin 插件子资源签发短时 HMAC token（exp 签名，无敏感内容）。
+
+    为什么需要它（2026-08-29 E2E 真实捕获的架构级根因）：插件 iframe 是
+    opaque origin（sandbox 无 allow-same-origin），其文档 site 为 null——
+    从它发出的 CSS/JS 子资源请求按**跨 site** 处理，``SameSite=Lax`` 的
+    owner session cookie **不会随请求发送**（iframe src 的导航请求带
+    cookie，所以 HTML 本身可达；子资源一律 401，401 JSON 又被 ORB 网络级
+    阻塞）。因此子资源需要一条不依赖 cookie 的短时 bearer 通道：HTML
+    （owner-only 导航请求）在服务端把静态相对资源引用改写为带 token 的
+    URL；CSS/JS/PNG 验 token（或 owner session）。匿名无 token 仍 401，
+    不放宽任何安全边界；token 只出现在 no-store 的 owner-only HTML 中。
+    """
+    exp = int(time.time()) + _ADMIN_ASSET_TOKEN_TTL
+    msg = "%s|%d" % (plugin_id, exp)
+    sig = hmac.new(str(app.secret_key).encode("utf-8"),
+                   msg.encode("utf-8"), hashlib.sha256).hexdigest()
+    return "%d.%s" % (exp, sig)
+
+
+def _admin_asset_token_valid(plugin_id, token) -> bool:
+    try:
+        exp_raw, _, sig = str(token or "").partition(".")
+        exp = int(exp_raw)
+        if exp < int(time.time()):
+            return False
+        msg = "%s|%d" % (plugin_id, exp)
+        expected = hmac.new(str(app.secret_key).encode("utf-8"),
+                            msg.encode("utf-8"), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+#: HTML 内相对资源引用改写（href/src="相对路径.{css,js,png,webp}"）：
+#: 只匹配相对路径 + 白名单扩展名；绝对 URL / 协议 URL / 已带 query 不碰。
+_ADMIN_ASSET_REWRITE_RE = re.compile(
+    r'((?:href|src)=")((?:[A-Za-z0-9][A-Za-z0-9._/-]*)?'
+    r'(?:\.css|\.js|\.png|\.webp))"')
+
+
+def _admin_rewrite_asset_urls(html_text: str, plugin_id: str) -> str:
+    """把插件 HTML 内的静态相对资源引用改写为带短时 token 的 URL。"""
+    token = _admin_asset_token(plugin_id)
+    return _ADMIN_ASSET_REWRITE_RE.sub(
+        lambda m: '%s%s?%s=%s"' % (m.group(1), m.group(2),
+                                   _ADMIN_ASSET_TOKEN_PARAM, token),
+        html_text)
+
+
 @app.route("/admin/plugin-assets/<plugin_id>/<path:filename>")
 def admin_plugin_asset(plugin_id, filename):
     """owner-only admin 插件资源路由（§8.3）。
 
-    - 只服务**受信** admin 插件目录内文件（每次请求重新做信任判定，pin 变化 /
-      禁用即时生效）；未登录 401（_auth_challenge 前置），非 owner 403；
-    - 扩展名白名单 ``.html/.js/.css/.png/.webp``（.svg / source map / 其他一律
-      403）；路径穿越 / 绝对路径 / 反斜杠 / 符号链接逃逸全部拒绝（resolve 后
-      必须仍位于插件目录内）；
+    - HTML（iframe src 导航请求，带 session cookie）：owner 鉴权 + 信任
+      判定后原样服务，并把内部相对资源引用改写为带短时 token 的 URL
+      （见 _admin_asset_token：opaque origin 子资源带不上 Lax cookie）；
+    - CSS/JS/图片（opaque origin 子资源，无 cookie）：验 URL 内短时
+      token；owner session 直连（curl/测试）同样放行；
+    - 只服务**受信** admin 插件目录内文件（每次请求重新做信任判定，pin
+      变化/禁用即时生效）；扩展名白名单 ``.html/.js/.css/.png/.webp``
+      （.svg / source map / 其他一律 403）；路径穿越 / 绝对路径 / 反斜杠 /
+      符号链接逃逸全部拒绝（resolve 后必须仍位于插件目录内）；
     - 按后缀固定 MIME；所有响应 ``X-Content-Type-Options: nosniff`` +
       ``Cache-Control: no-store``；HTML 另加严格 CSP。
     """
-    if actor_identity()["role"] != user_store.ROLE_OWNER:
-        return _admin_asset_json({"error": "forbidden"}, 403)
+    ext = os.path.splitext(filename)[1].lower()
     trusted, reason = _admin_plugin_trusted(plugin_id)
     if not trusted:
         return _admin_asset_json({"error": "forbidden", "reason": reason}, 403)
-    ext = os.path.splitext(filename)[1].lower()
+    # HTML（iframe src 导航，带 cookie）：仅 owner session；子资源（opaque
+    # origin 发起，无 cookie）：短时 token 或 owner session 二选一。
+    if not (ext != ".html" and _admin_asset_token_valid(
+            plugin_id, request.args.get(_ADMIN_ASSET_TOKEN_PARAM))):
+        if actor_identity()["role"] != user_store.ROLE_OWNER:
+            return _admin_asset_json({"error": "forbidden"}, 403)
     if ext not in _ADMIN_ASSET_ALLOWED_EXT:
         return _admin_asset_json(
             {"error": "forbidden", "reason": "extension not allowed"}, 403)
@@ -2047,13 +2132,63 @@ def admin_plugin_asset(plugin_id, filename):
         data = target.read_bytes()
     except OSError:
         return _admin_asset_json({"error": "not_found"}, 404)
+    if ext == ".html":
+        # 服务端把静态相对资源引用改写为带短时 token 的 URL（opaque iframe
+        # 子资源带不上 Lax cookie，见 _admin_asset_token）
+        try:
+            data = _admin_rewrite_asset_urls(
+                data.decode("utf-8"), plugin_id).encode("utf-8")
+        except UnicodeDecodeError:
+            return _admin_asset_json(
+                {"error": "forbidden", "reason": "html not utf-8"}, 403)
     resp = Response(data, mimetype=_ADMIN_ASSET_MIME[ext])
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Cache-Control"] = "no-store"
+    # ORB（Opaque Response Blocking，Chrome 2024+ 全面实施并覆盖 sandboxed
+    # iframe）：opaque origin 文档（sandbox 无 allow-same-origin）发起的
+    # style/script 子资源按 cross-origin no-cors 分类，响应无 CORS 头即被
+    # 网络级拦截（ERR_BLOCKED_BY_ORB）——CSP origin 正确也救不回来，插件
+    # CSS/JS 照样全灭（2026-08-29 生产 CSS/JS 未生效的另一半根因，E2E
+    # 首次真实捕获）。ACAO 让浏览器放行 ORB；**不放宽任何安全边界**：
+    #   - 资源仍 owner-only（每请求信任判定 + session；跨站子资源请求在
+    #     SameSite=Lax 下带不上 owner cookie，只会 401）；
+    #   - ACAO:* 与凭据 CORS 互斥（浏览器拒绝 credentialed CORS 读响应）；
+    #   - nosniff + 固定 MIME + CSP frame-ancestors 'self' 均不变。
+    resp.headers["Access-Control-Allow-Origin"] = "*"
     if ext == ".html":
         # 显式 origin 而非 'self'（opaque origin 坑，见 _admin_asset_html_csp）
         resp.headers["Content-Security-Policy"] = _admin_asset_html_csp()
     return resp
+
+
+#: admin 插件资源路由前缀（ORB 红线，见下方 _PtSessionInterface 注释）
+_ADMIN_ASSET_URL_PREFIX = "/admin/plugin-assets/"
+
+
+class _PtSessionInterface(SecureCookieSessionInterface):
+    """平台 session 接口：admin 插件资源响应**绝不**写 session cookie。
+
+    Flask 默认 ``SESSION_REFRESH_EACH_REQUEST=True`` + permanent session 会在
+    **每个**响应（含静态资源）刷 ``Set-Cookie``，且 save_session 晚于全部
+    after_request 钩子、无法在钩子内移除。而 opaque iframe（sandbox 无
+    allow-same-origin）以 no-cors 拉 CSS/JS 时，Fetch 规范 ORB 对「跨源
+    no-cors + 响应含 Set-Cookie」一律网络级阻塞（ERR_BLOCKED_BY_ORB；
+    Chrome 2024+ 已覆盖 sandboxed iframe）——这正是 2026-08-29 生产插件
+    CSS/JS 未生效的另一半根因（CSP origin 修复也救不回，E2E 首次真实
+    捕获）。插件 iframe 是 opaque origin，本就读不到 cookie；宿主页负责
+    携带 session/CSRF，资源路由不写任何 session 状态。
+    """
+
+    def save_session(self, app_obj, session, response):
+        try:
+            if request and request.path.startswith(_ADMIN_ASSET_URL_PREFIX):
+                return  # 资源通道：无 Set-Cookie / 无 Vary: Cookie
+        except RuntimeError:
+            pass  # 无请求上下文：走默认路径
+        return super().save_session(app_obj, session, response)
+
+
+app.session_interface = _PtSessionInterface()
 
 
 def _login_page(error=None, error_code=None, next_url="/", retry_after=0,

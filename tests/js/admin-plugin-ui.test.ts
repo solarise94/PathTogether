@@ -297,56 +297,104 @@ describe("pathtogether-admin plugin UI — not-ready pages wait instead of error
 	});
 });
 
-describe("pathtogether-admin plugin UI — acquisition empty state (§9.2)", () => {
+describe("pathtogether-admin plugin UI — acquisition aggregated page state (§9.2 + 复核 P2)", () => {
 	const NONCE = "c".repeat(64);
 
 	function bootAndWait(bus: ReturnType<typeof loadPluginUiWithBus>) {
 		bus.dispatch(bus.parent, {
 			kind: "init", bridge: "admin", protocolVersion: "1.0.0",
-			nonce: NONCE, adminPermissions: ["admin:acquisition:read"],
+			nonce: NONCE, adminPermissions: ["admin:acquisition:read", "admin:invites:read"],
 		});
 	}
 
-	it("zero acquisition data renders the fixed empty-state copy, not a blank table", async () => {
+	/** 回复 invites 页首屏的三组请求（summary / acquisition.list / invites.list）。 */
+	function replyAll(
+		bus: ReturnType<typeof loadPluginUiWithBus>,
+		reply: (method: string) => { ok: boolean; result?: unknown; error?: unknown } | null,
+	) {
+		for (const posted of bus.parentPosted) {
+			if (posted.env.kind !== "request") continue;
+			const r = reply(String(posted.env.method));
+			if (!r) continue;
+			bus.dispatch(bus.parent, {
+				kind: "response", bridge: "admin", nonce: NONCE,
+				requestId: posted.env.requestId, ok: r.ok,
+				result: r.result, error: r.error,
+			});
+		}
+	}
+
+	it("zero data everywhere → terminal empty state, long copy exactly once (page-level)", async () => {
 		const bus = loadPluginUiWithBus();
 		bootAndWait(bus);
 		bus.client!.showPage("invites");
 		await ticks(4);
-		// 找到 acquisition.summary 的请求并回复零数据
-		const req = bus.parentPosted
-			.filter((p) => p.env.kind === "request" && p.env.method === "admin.acquisition.summary")
-			.at(-1);
-		expect(req).toBeTruthy();
-		bus.dispatch(bus.parent, {
-			kind: "response", bridge: "admin", nonce: NONCE,
-			requestId: req!.env.requestId, ok: true,
-			result: { registration_mode: "closed", items: [], totals: { visits: 0, registrations: 0, first_ai_count: 0 } },
-		});
-		await ticks(4);
-		const texts = Object.values(bus.els).map((el) => el.textContent).join("\n");
-		expect(texts).toContain("暂无来源归因数据");
-		// 空状态必须解释「仅覆盖功能上线后的有效访问触点，历史用户尚未回填」
-		expect(texts).toContain("历史用户尚未回填");
+		replyAll(bus, () => ({
+			ok: true,
+			result: { registration_mode: "closed", items: [], invites: [],
+				totals: { visits: 0, registrations: 0, first_ai_count: 0 } },
+		}));
+		await ticks(6);
+		// 终态：empty（不是永久 loading）
+		const st = bus.els["adm-state-invites"];
+		expect(st.getAttribute("data-page-state")).toBe("empty");
+		const pageMsg = st.textContent;
+		expect(pageMsg).toContain("暂无来源归因数据");
+		expect(pageMsg).toContain("历史用户尚未回填");
+		// 完整长文案只在页级状态条出现一次（子区块是简短提示）
+		const all = Object.values(bus.els).map((el) => el.textContent).join("\n");
+		expect(all.split("历史用户尚未回填").length - 1).toBe(1);
+		expect(bus.els["adm-acq-empty"].textContent).toContain("本周期暂无来源访问记录");
 	});
 
-	it("an acquisition error must NOT be rendered as the empty state", async () => {
+	it("any data in one group → ready（页面必须离开 loading）", async () => {
 		const bus = loadPluginUiWithBus();
 		bootAndWait(bus);
 		bus.client!.showPage("invites");
 		await ticks(4);
-		const req = bus.parentPosted
-			.filter((p) => p.env.kind === "request" && p.env.method === "admin.acquisition.summary")
-			.at(-1);
-		expect(req).toBeTruthy();
-		bus.dispatch(bus.parent, {
-			kind: "response", bridge: "admin", nonce: NONCE,
-			requestId: req!.env.requestId, ok: false,
-			error: { code: "permission_denied", message: "manifest 未申请" },
+		replyAll(bus, (method) => {
+			if (method === "admin.invites.list") {
+				return { ok: true, result: { invites: [{ invite_id: "iv1" }], next_cursor: null } };
+			}
+			return { ok: true, result: { registration_mode: "closed", items: [], totals: {} } };
 		});
+		await ticks(6);
+		expect(bus.els["adm-state-invites"].getAttribute("data-page-state")).toBe("ready");
+	});
+
+	it("all requests fail → terminal error with retry, never rendered as empty", async () => {
+		const bus = loadPluginUiWithBus();
+		bootAndWait(bus);
+		bus.client!.showPage("invites");
 		await ticks(4);
-		const texts = Object.values(bus.els).map((el) => el.textContent).join("\n");
-		expect(texts).not.toContain("暂无来源归因数据");
-		expect(texts).toContain("permission_denied");
+		replyAll(bus, () => ({
+			ok: false, error: { code: "permission_denied", message: "manifest 未申请" },
+		}));
+		await ticks(6);
+		const st = bus.els["adm-state-invites"];
+		expect(st.getAttribute("data-page-state")).toBe("error");
+		expect(st.textContent).toContain("permission_denied");
+		expect(st.textContent).not.toContain("暂无来源归因数据");
+	});
+
+	it("partial failure with data elsewhere → ready with partial note", async () => {
+		const bus = loadPluginUiWithBus();
+		bootAndWait(bus);
+		bus.client!.showPage("invites");
+		await ticks(4);
+		replyAll(bus, (method) => {
+			if (method === "admin.acquisition.summary") {
+				return { ok: false, error: { code: "bridge_timeout", message: "" } };
+			}
+			if (method === "admin.invites.list") {
+				return { ok: true, result: { invites: [{ invite_id: "iv1" }], next_cursor: null } };
+			}
+			return { ok: true, result: { items: [], next_cursor: null } };
+		});
+		await ticks(6);
+		const st = bus.els["adm-state-invites"];
+		expect(st.getAttribute("data-page-state")).toBe("ready");
+		expect(st.textContent).toContain("部分数据加载失败");
 	});
 });
 

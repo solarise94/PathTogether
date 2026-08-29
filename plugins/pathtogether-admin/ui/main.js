@@ -876,23 +876,60 @@
   var ACQ_EMPTY_TEXT = "暂无来源归因数据。来源统计仅覆盖功能上线后的有效访问触点，历史用户尚未回填。";
 
   function setAcqEmpty(show) {
+    // 子区块只留简短提示；完整空态文案（含「历史用户尚未回填」说明）由
+    // 页级状态条统一展示一次（复核 P2：两处重复展示长文案属冗余）
     var funnelEmpty = $("adm-acq-empty");
     if (funnelEmpty) {
       funnelEmpty.hidden = !show;
-      if (show) funnelEmpty.textContent = ACQ_EMPTY_TEXT;
+      if (show) funnelEmpty.textContent = "本周期暂无来源访问记录。";
     }
     var usersEmpty = $("adm-acq-users-empty");
     if (usersEmpty) {
       usersEmpty.hidden = !show;
-      if (show) usersEmpty.textContent = ACQ_EMPTY_TEXT;
+      if (show) usersEmpty.textContent = "暂无已归因用户。";
     }
   }
 
+  // 来源页聚合加载（复核 P2 2026-08-29：三个首屏请求由协调器统一计算
+  // 页面终态——此前没有任何一处写入 ready/empty/error，生产零数据场景
+  // 永久停留「加载中…」）。语义：
+  //   - 任一请求有数据 → ready（部分失败时附 partial 提示）；
+  //   - 三组都成功且都无数据 → empty（完整说明文案只在此展示一次）；
+  //   - 全部失败 → error（含重试）。
   function loadAcquisitionPage() {
+    var seq = state.listSeq;
     setPageState("invites", "loading");
     loadAcqModeCard();
-    loadAcqFunnel();
-    loadAcqUsers(false);
+    var settled = Promise.allSettled([
+      loadAcqFunnel(),
+      loadAcqUsers(false),
+      loadInvites(false),
+    ]);
+    settled.then(function (results) {
+      if (seq !== state.listSeq) return; // 页面已切换：不写终态
+      var ok = [], failed = [];
+      results.forEach(function (r) {
+        (r.status === "fulfilled" ? ok : failed).push(r);
+      });
+      if (!ok.length) {
+        var err = results[0].reason;
+        setPageState("invites", "error", {
+          code: err && err.code, message: err && err.message,
+          retry: function () { loadAcquisitionPage(); },
+        });
+        return;
+      }
+      var anyData = ok.some(function (r) { return r.value === true; });
+      if (anyData) {
+        setPageState("invites", "ready", {
+          message: "已更新（" +
+            new Date().toISOString().replace("T", " ").slice(0, 19) + "Z）" +
+            (failed.length ? "（部分数据加载失败，可刷新重试）" : ""),
+        });
+      } else {
+        setPageState("invites", "empty", { message: ACQ_EMPTY_TEXT });
+      }
+    });
   }
 
   function loadAcqModeCard() {
@@ -912,7 +949,7 @@
 
   function loadAcqFunnel() {
     var seq = state.listSeq;
-    request("admin.acquisition.summary", {}).then(function (res) {
+    return request("admin.acquisition.summary", {}).then(function (res) {
       if (seq !== state.listSeq) return;
       hideError();
       setAcqEmpty(!(res.items && res.items.length));
@@ -939,12 +976,14 @@
         kvRow(totals, "合计", "访问 " + fmtNum(t.visits) + " · 注册 " +
               fmtNum(t.registrations) + " · 首次 AI " + fmtNum(t.first_ai_count));
       }
+      return !!(res.items && res.items.length); // 供协调器计算终态
     }).catch(function (err) {
-      if (seq !== state.listSeq) return;
+      if (seq !== state.listSeq) throw err;
       setAcqEmpty(false); // 错误不是空状态
       var dl = $("adm-acq-mode");
       if (dl) { dl.textContent = ""; kvRow(dl, "可用性", errText(err)); }
       handleErr(err, null);
+      throw err; // 交给协调器计数（partial-error 语义）
     });
   }
 
@@ -960,7 +999,7 @@
     var seq = state.listSeq;
     var payload = { limit: 50, cursor: append ? state.cursors.acqUsers : null };
     var status = $("adm-acq-status");
-    request("admin.acquisition.list", payload).then(function (res) {
+    return request("admin.acquisition.list", payload).then(function (res) {
       if (seq !== state.listSeq) return;
       hideError();
       var usersEmpty = $("adm-acq-users-empty");
@@ -984,7 +1023,11 @@
       var more = $("adm-acq-more-btn");
       if (more) more.disabled = !res.next_cursor;
       if (status) status.textContent = res.next_cursor ? "还有更多" : "已到底";
-    }).catch(function (err) { if (seq === state.listSeq) handleErr(err, status); });
+      return !!(res.items && res.items.length); // 供协调器计算终态
+    }).catch(function (err) {
+      if (seq === state.listSeq) handleErr(err, status);
+      throw err;
+    });
   }
 
   // ------------------------------------------------------------------
@@ -1002,7 +1045,7 @@
     var seq = state.listSeq;
     var payload = { limit: 50, cursor: append ? state.cursors.invites : null };
     var status = $("adm-invites-status");
-    request("admin.invites.list", payload).then(function (res) {
+    return request("admin.invites.list", payload).then(function (res) {
       if (seq !== state.listSeq) return;
       hideError();
       var tbody = $("adm-invites-tbody");
@@ -1034,7 +1077,11 @@
       var more = $("adm-invites-more-btn");
       if (more) more.disabled = !res.next_cursor;
       if (status) status.textContent = res.next_cursor ? "还有更多" : "已到底";
-    }).catch(function (err) { if (seq === state.listSeq) handleErr(err, status); });
+      return !!(res.invites && res.invites.length); // 供协调器计算终态
+    }).catch(function (err) {
+      if (seq === state.listSeq) handleErr(err, status);
+      throw err;
+    });
   }
 
   function revokeInvite(inviteId) {
@@ -1756,7 +1803,7 @@
     }
     if (name === "overview") loadOverview();
     else if (name === "users") loadUsers(false);
-    else if (name === "invites") { loadAcquisitionPage(); loadInvites(false); }
+    else if (name === "invites") loadAcquisitionPage();
     else if (name === "billing") loadBillingPage();
     else if (name === "plugins") loadPlugins();
     else if (name === "audit") loadAudit(false);

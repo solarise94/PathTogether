@@ -145,16 +145,29 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		await expect(frame.locator("#adm-user-drawer")).toBeHidden();
 	});
 
-	test("7. acquisition zero data shows the fixed empty-state copy", async ({ page }) => {
+	test("7. acquisition zero data reaches terminal empty state, long copy exactly once", async ({ page }) => {
 		await login(page, CREDS.ownerLogin, CREDS.ownerPassword);
 		await page.goto("/admin");
 		await expect(hostStatus(page)).toHaveAttribute(
 			"data-admin-host-state", "ready", { timeout: 5000 });
 		const frame = page.frameLocator("#admin-plugin-frame");
 		await frame.locator('.adm-nav-btn[data-page="invites"]').click();
-		await expect(frame.locator("#adm-acq-empty")).toBeVisible({ timeout: 10_000 });
-		await expect(frame.locator("#adm-acq-empty")).toContainText("暂无来源归因数据");
-		await expect(frame.locator("#adm-acq-empty")).toContainText("历史用户尚未回填");
+		// 终态断言（复核 P2 2026-08-29：此前只断言空文案可见，页面永久
+		// 停留 loading 也会通过）：限定时间内离开 loading 进入 empty
+		await expect
+			.poll(async () =>
+				frame.locator("#adm-state-invites").getAttribute("data-page-state"))
+			.toBe("empty", { timeout: 10_000 });
+		// 加载文案必须消失
+		await expect(frame.locator("#adm-state-invites")).not.toContainText("加载中");
+		// 完整空态说明（历史用户尚未回填）只在页级状态条出现一次，
+		// 子区块是简短提示（不重复长文案）
+		await expect(frame.locator("#adm-state-invites")).toContainText("暂无来源归因数据");
+		await expect(frame.locator("#adm-state-invites")).toContainText("历史用户尚未回填");
+		expect(
+			await frame.locator("text=历史用户尚未回填").count(),
+		).toBe(1);
+		await expect(frame.locator("#adm-acq-empty")).toContainText("本周期暂无来源访问记录");
 	});
 
 	const bridgePages: Array<[string, RegExp]> = [

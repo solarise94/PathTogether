@@ -888,7 +888,7 @@ def test_admin_manifest_plugin_version_bumped_with_hashes():
     """复核收口：pluginVersion 0.1.2 与 release 目录对齐，fileHashes 覆盖
     全部可服务 UI 文件（manifest 的入口/资源不得游离声明之外）。"""
     data = json.loads(ADMIN_MANIFEST.read_text(encoding="utf-8"))
-    assert data["pluginVersion"] == "0.1.2"
+    assert data["pluginVersion"] == "0.1.3"
     hashes = data["ui"]["fileHashes"]
     assert data["ui"]["entry"] in hashes
     for name in ("index.html", "main.js", "style.css"):

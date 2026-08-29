@@ -253,3 +253,77 @@ describe("pathtogether-admin plugin UI — decimal-string amounts (§5 v0.3 P2)"
 			.toBe("9007199.254740993 CNY（9007199254740993 nano）");
 	});
 });
+
+// --------------------------------------------------------------------------- //
+// 一次性修复包 A/D 回归（docs/admin-workbench-ci-one-shot-remediation-plan.md
+// §8.2/§9.2）——在旧实现上必须失败：
+//   - 未握手时切页：页面应呈现「等待桥接」的可见等待态，而不是把 not_ready
+//     渲染成全局错误（旧实现 request reject → showError → errorCard 展开）；
+//   - 来源零数据：固定空状态文案（历史用户未回填的说明），而不是空白表格
+//     （旧实现空 items 渲染空 tbody，无任何解释）。
+// --------------------------------------------------------------------------- //
+describe("pathtogether-admin plugin UI — not-ready pages wait instead of erroring (§8.2)", () => {
+	it("switching pages before handshake shows a waiting state, not the global error card", async () => {
+		const bus = loadPluginUiWithBus();
+		expect(bus.client!.handshakeState().ready).toBe(false);
+		bus.client!.showPage("overview");
+		await ticks(4);
+		// 未 ready：不得把 not_ready 渲染成全局错误
+		expect(bus.els["adm-error-card"].hidden).toBe(true);
+		// 且不得发出任何管理 API 请求（骨架等待，§8.2「未 ready 不发请求」）
+		expect(bus.parentPosted.filter((p) => p.env.kind === "request")).toHaveLength(0);
+	});
+});
+
+describe("pathtogether-admin plugin UI — acquisition empty state (§9.2)", () => {
+	const NONCE = "c".repeat(64);
+
+	function bootAndWait(bus: ReturnType<typeof loadPluginUiWithBus>) {
+		bus.dispatch(bus.parent, {
+			kind: "init", bridge: "admin", protocolVersion: "1.0.0",
+			nonce: NONCE, adminPermissions: ["admin:acquisition:read"],
+		});
+	}
+
+	it("zero acquisition data renders the fixed empty-state copy, not a blank table", async () => {
+		const bus = loadPluginUiWithBus();
+		bootAndWait(bus);
+		bus.client!.showPage("invites");
+		await ticks(4);
+		// 找到 acquisition.summary 的请求并回复零数据
+		const req = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.acquisition.summary")
+			.at(-1);
+		expect(req).toBeTruthy();
+		bus.dispatch(bus.parent, {
+			kind: "response", bridge: "admin", nonce: NONCE,
+			requestId: req!.env.requestId, ok: true,
+			result: { registration_mode: "closed", items: [], totals: { visits: 0, registrations: 0, first_ai_count: 0 } },
+		});
+		await ticks(4);
+		const texts = Object.values(bus.els).map((el) => el.textContent).join("\n");
+		expect(texts).toContain("暂无来源归因数据");
+		// 空状态必须解释「仅覆盖功能上线后的有效访问触点，历史用户尚未回填」
+		expect(texts).toContain("历史用户尚未回填");
+	});
+
+	it("an acquisition error must NOT be rendered as the empty state", async () => {
+		const bus = loadPluginUiWithBus();
+		bootAndWait(bus);
+		bus.client!.showPage("invites");
+		await ticks(4);
+		const req = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.acquisition.summary")
+			.at(-1);
+		expect(req).toBeTruthy();
+		bus.dispatch(bus.parent, {
+			kind: "response", bridge: "admin", nonce: NONCE,
+			requestId: req!.env.requestId, ok: false,
+			error: { code: "permission_denied", message: "manifest 未申请" },
+		});
+		await ticks(4);
+		const texts = Object.values(bus.els).map((el) => el.textContent).join("\n");
+		expect(texts).not.toContain("暂无来源归因数据");
+		expect(texts).toContain("permission_denied");
+	});
+});

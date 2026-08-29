@@ -18,6 +18,7 @@ docs/admin-billing-plugin-implementation-plan.md §8 / §14.1（权限/插件行
 （PG 双跑：RUN_PG_TESTS=1 python3 -m pytest tests/test_admin_plugin.py -q）
 """
 import hashlib
+import html.parser
 import json
 import os
 import sys
@@ -615,3 +616,164 @@ def test_admin_permissions_enum_and_type_enforced():
     bad["adminPermissions"] = [123]
     errs = M.validate_manifest(bad)
     assert errs and any("adminPermissions[0] 需为字符串" in e for e in errs)
+
+
+# --------------------------------------------------------------------------- #
+# 7. 一次性修复回归（docs/admin-workbench-ci-one-shot-remediation-plan.md 包 A）
+#
+# 以下用例复现 2026-08-29 生产 /admin 三连故障的根因，在旧实现上必须失败：
+#   ① CSP origin 用 request.host_url 推导：公网 HTTPS 反代（PUBLIC_BASE_URL）
+#      下得到内部 http origin，iframe 内 CSS/JS 全被 CSP 拦截；
+#   ② data-admin-permissions="{{ ... | tojson }}"：tojson 输出的双引号会
+#      提前终结 HTML 属性，浏览器解析后值只剩 "["，权限门查表恒空；
+#   ③ 宿主对 PUBLIC_BASE_URL 非法值没有确定性拒绝路径（fail-closed 缺失）。
+# --------------------------------------------------------------------------- #
+_BAD_PUBLIC_BASE_URLS = [
+    "https://user:pw@pt.example",     # userinfo
+    "https://pt.example/path",        # 非根 path
+    "https://pt.example/?q=1",        # query
+    "https://pt.example#frag",        # fragment
+    "ftp://pt.example",               # 非法 scheme
+    "://no-scheme",                   # 无 scheme
+    "not a url",                      # 完全非法
+]
+
+
+def test_public_base_url_parser_accepts_and_normalizes():
+    """规范公网 origin parser（包 B 单一事实来源）：
+    合法 https 输入 → 纯 scheme://host[:port]；默认端口与尾斜杠规范化。"""
+    parse = app_mod.parse_public_base_url
+    assert parse("https://pt.example") == ("https://pt.example", None)
+    assert parse("https://pt.example/") == ("https://pt.example", None)
+    assert parse("https://pt.example:443/") == ("https://pt.example", None)
+    assert parse("http://pt.example:8080") == ("http://pt.example:8080", None)
+    assert parse("  https://pt.example  ") == ("https://pt.example", None)
+    # 非法形态：确定性拒绝（返回 (None, 原因码)，不抛敏感信息）
+    for bad in _BAD_PUBLIC_BASE_URLS:
+        origin, err = parse(bad)
+        assert origin is None and isinstance(err, str), bad
+    assert parse("") == (None, "empty")
+
+
+def test_asset_csp_prefers_public_base_url_over_request_host(monkeypatch):
+    """根因 ① 回归：PUBLIC_BASE_URL=https://pt.example 且请求从内部
+    http://localhost 到达时，iframe HTML CSP 的 script/style/img origin
+    必须全部是 https://pt.example（scheme 分离由该测试覆盖，E2E 可用本地 HTTP）。"""
+    owner, _u = _setup_users()
+    _install_admin_plugin()
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://pt.example")
+    oc = _login(_client(), owner)
+    r = oc.get(ASSET_BASE + "/ui/index.html")
+    assert r.status_code == 200
+    csp = r.headers["Content-Security-Policy"]
+    assert csp == ("default-src 'none'; script-src https://pt.example; "
+                   "style-src https://pt.example; img-src https://pt.example; "
+                   "frame-ancestors 'self'")
+    assert "http://localhost" not in csp
+
+
+@pytest.mark.parametrize("bad", _BAD_PUBLIC_BASE_URLS)
+def test_asset_csp_fails_closed_on_invalid_public_base_url(monkeypatch, bad):
+    """根因 ③ 回归：PUBLIC_BASE_URL 非法 → CSP 回退全拒绝（无任何源列表），
+    fail-closed——宁可掐死脚本也不放宽。"""
+    owner, _u = _setup_users()
+    _install_admin_plugin()
+    monkeypatch.setenv("PUBLIC_BASE_URL", bad)
+    oc = _login(_client(), owner)
+    r = oc.get(ASSET_BASE + "/ui/index.html")
+    assert r.status_code == 200
+    assert r.headers["Content-Security-Policy"] == \
+        "default-src 'none'; frame-ancestors 'self'"
+
+
+def test_asset_csp_fails_closed_when_prod_missing_public_base_url(monkeypatch):
+    """生产（非 TESTING/debug）未配置 PUBLIC_BASE_URL → fail-closed 全拒绝；
+    本地测试模式（TESTING）未配置 → 回退 request origin（现有行为兼容）。"""
+    owner, _u = _setup_users()
+    _install_admin_plugin()
+    oc = _login(_client(), owner)
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+    # TESTING=True 的 test client：回退 request origin（本地开发兼容路径）
+    r = oc.get(ASSET_BASE + "/ui/index.html")
+    assert "http://localhost" in r.headers["Content-Security-Policy"]
+    # 生产形态：TESTING 关闭 → 未配置即全拒绝
+    monkeypatch.setitem(app_mod.app.config, "TESTING", False)
+    monkeypatch.setattr(app_mod.app, "debug", False)
+    r2 = oc.get(ASSET_BASE + "/ui/index.html")
+    assert r2.headers["Content-Security-Policy"] == \
+        "default-src 'none'; frame-ancestors 'self'"
+
+
+class _BootstrapGrab(html.parser.HTMLParser):
+    """提取 <script id="admin-bootstrap" type="application/json"> 的原文段。"""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.in_json = False
+        self.chunks = []
+
+    def handle_starttag(self, tag, attrs):
+        d = dict(attrs)
+        if (tag == "script" and d.get("id") == "admin-bootstrap"
+                and d.get("type") == "application/json"):
+            self.in_json = True
+
+    def handle_endtag(self, tag):
+        if tag == "script":
+            self.in_json = False
+
+    def handle_data(self, data):
+        if self.in_json:
+            self.chunks.append(data)
+
+
+def test_admin_page_bootstrap_json_node_has_exact_permissions():
+    """根因 ② 回归：真实 HTML parser 解析 /admin，bootstrap JSON 节点的
+    permissions 与 manifest 授权集合完全一致；data 属性注入不复存在。"""
+    owner, _u = _setup_users()
+    _install_admin_plugin()
+    r = _login(_client(), owner).get("/admin")
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    assert "data-admin-permissions" not in body
+    grab = _BootstrapGrab()
+    grab.feed(body)
+    raw = "".join(grab.chunks)
+    assert raw, "缺少 #admin-bootstrap application/json 节点"
+    # JSON 完整可解析（旧实现的 data 属性被 tojson 双引号截断，解析必失败）
+    data = json.loads(raw)
+    manifest = json.loads(ADMIN_MANIFEST.read_text(encoding="utf-8"))
+    assert data["schemaVersion"] == 1
+    assert data["protocolVersion"] == "1.0.0"
+    assert data["permissions"] == sorted(set(manifest["adminPermissions"]))
+    assert data["assetUrl"] == "/admin/plugin-assets/pathtogether-admin/ui/index.html"
+    # bootstrap 只放非敏感启动字段：无 csrf/session/token/用户数据
+    lowered = raw.lower()
+    for banned in ("csrf", "token", "session", "secret", "password"):
+        assert banned not in lowered
+    # 原文段不含可逃逸标记（tojson 对 < 已转义为 \u003c）
+    assert "<" not in raw
+
+
+def test_bootstrap_node_survives_boundary_characters():
+    """边界字符（引号/尖括号）注入 bootstrap 值时不逃逸成新标签或可执行脚本。"""
+    owner, _u = _setup_users()
+    _install_admin_plugin()
+    with app_mod.app.test_request_context("/admin"):
+        # 直接以含边界字符的 ctx 渲染模板（权限枚举服务端受控，此处验证
+        # 模板层的 tojson 转义不依赖权限值本身合法）
+        html_text = app_mod.render_template(
+            "admin_host.html", mode="workspace",
+            admin_plugin={"plugin_id": "pathtogether-admin", "entry": "ui/index.html",
+                          "entry_url": "/admin/plugin-assets/pathtogether-admin/ui/index.html",
+                          "admin_permissions": ['a"b', "x<y", "z&w"]},
+            admin_entry_url="/admin/plugin-assets/pathtogether-admin/ui/index.html",
+            admin_permissions=['a"b', "x<y", "z&w"],
+            admin_protocol_version="1.0.0")
+    grab = _BootstrapGrab()
+    grab.feed(html_text)
+    data = json.loads("".join(grab.chunks))
+    assert data["permissions"] == ['a"b', "x<y", "z&w"]
+    # 尖括号只允许以 \u003c 转义形态出现，不产生新的 <script> 标签
+    assert "<script" not in "".join(grab.chunks).replace("<\\/", "")
+    assert html_text.count("<script") == 1  # 只有 bootstrap JSON 节点本身

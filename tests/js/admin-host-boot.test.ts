@@ -28,7 +28,7 @@ interface Posted {
 	targetOrigin: string;
 }
 
-/** 假 iframe：属性存储 + load 监听器捕获（src 赋值可断言）。 */
+/** 假 iframe：属性存储 + load 监听器捕获（src 赋值时可断言监听器是否已就位）。 */
 function fakeIframe(entryUrl: string) {
 	const listeners: Record<string, Array<() => void>> = {};
 	const attrs: Record<string, string> = {
@@ -41,6 +41,7 @@ function fakeIframe(entryUrl: string) {
 	const contentWindow = {
 		postMessage() {},
 	};
+	const state = { srcSetWithLoadListeners: null as boolean | null };
 	const frame = {
 		contentWindow,
 		src: "",
@@ -52,12 +53,16 @@ function fakeIframe(entryUrl: string) {
 		},
 		setAttribute(name: string, value: string) {
 			attrs[name] = value;
-			if (name === "src") frame.src = value;
+			if (name === "src") {
+				frame.src = value;
+				state.srcSetWithLoadListeners = (listeners.load || []).length > 0;
+			}
 		},
 	};
 	return {
 		frame,
 		contentWindow,
+		state,
 		fireLoad() {
 			for (const h of listeners.load || []) h();
 		},
@@ -106,8 +111,11 @@ function loadHostPage(opts: {
 	const posted: Posted[] = [];
 	const events: Array<{ type: string; detail: unknown }> = [];
 	const crypto = {
+		// 计数式确定性熵源：每次 getRandomValues 输出不同（nonce 轮换可断言）
+		calls: 0,
 		getRandomValues(buf: Uint8Array) {
-			for (let i = 0; i < buf.length; i++) buf[i] = (i * 11 + 5) % 256;
+			this.calls += 1;
+			for (let i = 0; i < buf.length; i++) buf[i] = (i * 11 + 5 + this.calls * 29) % 256;
 			return buf;
 		},
 	};
@@ -226,9 +234,10 @@ describe("admin host boot — bootstrap JSON v1（包 C 回归）", () => {
 describe("admin host boot — iframe src race（包 D 回归）", () => {
 	it("assigns iframe src only after load/message listeners are installed", () => {
 		const page = loadHostPage({});
-		// boot 之前模板不预设业务 src（data-entry-url 持有入口）
-		expect(page.iframe.frame.getAttribute("src")).toBeNull();
+		// boot 完成：业务 src 已按 bootstrap.assetUrl 赋值，且赋值发生时
+		// load 监听器已就位（旧实现 src 静态存在于 HTML，脚本晚于 load 即死锁）
 		expect(page.iframe.frame.src).toBe(entryUrlOf(page));
+		expect(page.iframe.state.srcSetWithLoadListeners).toBe(true);
 	});
 
 	it("an iframe load that already finished before boot still completes init", () => {

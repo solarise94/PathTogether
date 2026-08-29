@@ -102,6 +102,13 @@ body {
 .adm-alerts li { padding: 6px 0; line-height: 1.6; word-break: break-all; }
 .adm-alerts li::before { content: "⚠ "; }
 
+/* 统一空状态（§9.2）：解释为什么为空以及下一步；错误态绝不复用本样式 */
+.adm-empty {
+  font-size: 13px; color: var(--text-2); line-height: 1.8;
+  background: rgba(0, 0, 0, 0.02); border: 1px dashed var(--separator);
+  border-radius: 10px; padding: 14px 16px; margin: 10px 0;
+}
+
 /* ---- PR5 写操作：表单 / 行内按钮 / 页内确认条 / 一次性 token ---- */
 .adm-form { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
 .adm-form input, .adm-form select {

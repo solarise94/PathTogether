@@ -180,6 +180,7 @@
       <section class="adm-card">
         <h2>来源漏斗（campaign → 访问 → 注册 → 首次 AI）</h2>
         <p class="adm-note">「首次 AI」= 该来源注册用户中至少产生过一条 AI 用量事件的人数；同一访客多次跳转不折叠（first/last touch 分开，见下表）。</p>
+        <div class="adm-empty" id="adm-acq-empty" hidden></div>
         <div class="adm-table-wrap">
           <table class="adm-table" id="adm-acq-funnel-table">
             <thead>
@@ -196,6 +197,7 @@
       <section class="adm-card">
         <h2>用户来源明细（first touch / last touch 分列）</h2>
         <p class="adm-note">登录账号仅显示掩码；visitor 仅显示 hash 前缀；无完整 IP、无 referrer query（隐私红线 §9/§11.3）。归因优先级：邀请码 campaign &gt; 有效触点 &gt; referrer/UTM &gt; direct。</p>
+        <div class="adm-empty" id="adm-acq-users-empty" hidden></div>
         <div class="adm-table-wrap">
           <table class="adm-table" id="adm-acq-users-table">
             <thead>

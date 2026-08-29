@@ -37,6 +37,9 @@
     pending: {},            // requestId -> {resolve, reject, timer, method}
     dead: false,            // 宿主作废（reload/登出/切换）后不再发任何请求
     page: "overview",       // 当前页（内存态导航）
+    // 列表代际（§8.2 包 D）：showPage/筛选重置时 ++；在途响应回来时代际不符
+    // 即丢弃——快速连续点击、reload 与晚到响应不把旧数据写回新页面
+    listSeq: 0,
     // 分页游标（每列表独立；仅内存）
     cursors: { users: null, usage: null, unpriced: null, ledger: null,
                audit: null, acqUsers: null, invites: null },
@@ -83,6 +86,12 @@
 
   function setHandshake(text) {
     if (els.handshake) els.handshake.textContent = text;
+  }
+
+  // §8.2（包 D）：桥接可用 = 已收到 init 且未被作废。未 ready 时导航只切换
+  // 本地骨架，不得发管理 API 请求，也不把 not_ready 渲染成全局错误。
+  function bridgeReady() {
+    return !!state.nonce && !state.dead;
   }
 
   function showError(code, message) {
@@ -492,6 +501,7 @@
   }
 
   function loadUsers(append) {
+    var seq = state.listSeq;
     var f = state.filters.users || {};
     var payload = {
       limit: 50,
@@ -502,13 +512,14 @@
     if (f.ai === "true" || f.ai === "false") payload.ai_access = f.ai === "true";
     var status = $("adm-users-status");
     request("admin.users.list", payload).then(function (res) {
+      if (seq !== state.listSeq) return; // 页面已切换/新筛选已发起：晚到响应丢弃
       hideError();
       renderUsers(res.items || [], append);
       state.cursors.users = res.next_cursor || null;
       var more = $("adm-users-more-btn");
       if (more) more.disabled = !res.next_cursor;
       if (status) status.textContent = res.next_cursor ? "还有更多" : "已到底";
-    }).catch(function (err) { handleErr(err, status); });
+    }).catch(function (err) { if (seq === state.listSeq) handleErr(err, status); });
   }
 
   function renderUsers(items, append) {
@@ -703,6 +714,24 @@
   // 邀请与来源（§10.3 只读部分，PR4）：注册模式 + campaign 漏斗 +
   // 用户来源明细（first/last touch 分列）。邀请创建/撤销按钮属 PR5。
   // ------------------------------------------------------------------
+  // 来源空状态（§9.2 包 E 前置）：零数据必须解释「仅覆盖上线后的有效访问
+  // 触点、历史用户尚未回填」，且 permission_denied / 网络失败 / handshake
+  // 失败绝不渲染成这个 empty 状态（错误走 handleErr 的错误呈现）。
+  var ACQ_EMPTY_TEXT = "暂无来源归因数据。来源统计仅覆盖功能上线后的有效访问触点，历史用户尚未回填。";
+
+  function setAcqEmpty(show) {
+    var funnelEmpty = $("adm-acq-empty");
+    if (funnelEmpty) {
+      funnelEmpty.hidden = !show;
+      if (show) funnelEmpty.textContent = ACQ_EMPTY_TEXT;
+    }
+    var usersEmpty = $("adm-acq-users-empty");
+    if (usersEmpty) {
+      usersEmpty.hidden = !show;
+      if (show) usersEmpty.textContent = ACQ_EMPTY_TEXT;
+    }
+  }
+
   function loadAcquisitionPage() {
     loadAcqModeCard();
     loadAcqFunnel();
@@ -725,8 +754,11 @@
   }
 
   function loadAcqFunnel() {
+    var seq = state.listSeq;
     request("admin.acquisition.summary", {}).then(function (res) {
+      if (seq !== state.listSeq) return;
       hideError();
+      setAcqEmpty(!(res.items && res.items.length));
       renderAcqMode(res.registration_mode);
       var tbody = $("adm-acq-funnel-tbody");
       if (tbody) {
@@ -751,6 +783,8 @@
               fmtNum(t.registrations) + " · 首次 AI " + fmtNum(t.first_ai_count));
       }
     }).catch(function (err) {
+      if (seq !== state.listSeq) return;
+      setAcqEmpty(false); // 错误不是空状态
       var dl = $("adm-acq-mode");
       if (dl) { dl.textContent = ""; kvRow(dl, "可用性", errText(err)); }
       handleErr(err, null);
@@ -766,10 +800,14 @@
   }
 
   function loadAcqUsers(append) {
+    var seq = state.listSeq;
     var payload = { limit: 50, cursor: append ? state.cursors.acqUsers : null };
     var status = $("adm-acq-status");
     request("admin.acquisition.list", payload).then(function (res) {
+      if (seq !== state.listSeq) return;
       hideError();
+      var usersEmpty = $("adm-acq-users-empty");
+      if (usersEmpty) usersEmpty.hidden = !!(res.items && res.items.length);
       var tbody = $("adm-acq-users-tbody");
       if (!tbody) return;
       if (!append) tbody.textContent = "";
@@ -789,7 +827,7 @@
       var more = $("adm-acq-more-btn");
       if (more) more.disabled = !res.next_cursor;
       if (status) status.textContent = res.next_cursor ? "还有更多" : "已到底";
-    }).catch(function (err) { handleErr(err, status); });
+    }).catch(function (err) { if (seq === state.listSeq) handleErr(err, status); });
   }
 
   // ------------------------------------------------------------------
@@ -804,9 +842,11 @@
   }
 
   function loadInvites(append) {
+    var seq = state.listSeq;
     var payload = { limit: 50, cursor: append ? state.cursors.invites : null };
     var status = $("adm-invites-status");
     request("admin.invites.list", payload).then(function (res) {
+      if (seq !== state.listSeq) return;
       hideError();
       var tbody = $("adm-invites-tbody");
       if (!tbody) return;
@@ -837,7 +877,7 @@
       var more = $("adm-invites-more-btn");
       if (more) more.disabled = !res.next_cursor;
       if (status) status.textContent = res.next_cursor ? "还有更多" : "已到底";
-    }).catch(function (err) { handleErr(err, status); });
+    }).catch(function (err) { if (seq === state.listSeq) handleErr(err, status); });
   }
 
   function revokeInvite(inviteId) {
@@ -1247,6 +1287,7 @@
   }
 
   function loadUsage(append) {
+    var seq = state.listSeq;
     var f = state.filters.usage || {};
     var payload = { limit: 50, cursor: append ? state.cursors.usage : null };
     if (f.model) payload.model = f.model;
@@ -1254,13 +1295,14 @@
     if (f.status) payload.status = f.status;
     var status = $("adm-usage-status");
     request("admin.billing.usage.list", payload).then(function (res) {
+      if (seq !== state.listSeq) return;
       hideError();
       renderUsage(res.items || [], append);
       state.cursors.usage = res.next_cursor || null;
       var more = $("adm-usage-more-btn");
       if (more) more.disabled = !res.next_cursor;
       if (status) status.textContent = res.next_cursor ? "还有更多" : "已到底";
-    }).catch(function (err) { handleErr(err, status); });
+    }).catch(function (err) { if (seq === state.listSeq) handleErr(err, status); });
   }
 
   function renderUsage(items, append) {
@@ -1285,8 +1327,10 @@
   }
 
   function loadUnpriced(append) {
+    var seq = state.listSeq;
     var payload = { limit: 50, status: "unpriced", cursor: append ? state.cursors.unpriced : null };
     request("admin.billing.usage.list", payload).then(function (res) {
+      if (seq !== state.listSeq) return;
       var card = $("adm-unpriced-card");
       var tbody = $("adm-unpriced-tbody");
       if (!tbody) return;
@@ -1312,8 +1356,10 @@
   }
 
   function loadLedger(append) {
+    var seq = state.listSeq;
     var payload = { limit: 50, cursor: append ? state.cursors.ledger : null };
     request("admin.billing.ledger.list", payload).then(function (res) {
+      if (seq !== state.listSeq) return;
       hideError();
       var tbody = $("adm-ledger-tbody");
       if (!tbody) return;
@@ -1342,18 +1388,20 @@
       state.cursors.ledger = res.next_cursor || null;
       var more = $("adm-ledger-more-btn");
       if (more) more.disabled = !res.next_cursor;
-    }).catch(function (err) { handleErr(err, null); });
+    }).catch(function (err) { if (seq === state.listSeq) handleErr(err, null); });
   }
 
   // ------------------------------------------------------------------
   // 审计（§10.5）
   // ------------------------------------------------------------------
   function loadAudit(append) {
+    var seq = state.listSeq;
     var f = state.filters.audit || {};
     var payload = { limit: 50, cursor: append ? state.cursors.audit : null };
     if (f.action) payload.action = f.action;
     var status = $("adm-audit-status");
     request("admin.audit.list", payload).then(function (res) {
+      if (seq !== state.listSeq) return;
       hideError();
       var tbody = $("adm-audit-tbody");
       if (!tbody) return;
@@ -1371,7 +1419,7 @@
       var more = $("adm-audit-more-btn");
       if (more) more.disabled = !res.next_cursor;
       if (status) status.textContent = res.next_cursor ? "还有更多" : "已到底";
-    }).catch(function (err) { handleErr(err, status); });
+    }).catch(function (err) { if (seq === state.listSeq) handleErr(err, status); });
   }
 
   // ------------------------------------------------------------------
@@ -1464,6 +1512,7 @@
   // ------------------------------------------------------------------
   function showPage(name) {
     state.page = name;
+    state.listSeq++; // 作废在途列表响应（§8.2：晚到响应不写回新页面）
     Object.keys(els.pages).forEach(function (key) {
       if (els.pages[key]) els.pages[key].hidden = key !== name;
     });
@@ -1472,9 +1521,20 @@
       for (var i = 0; i < buttons.length; i++) {
         var on = buttons[i].getAttribute("data-page") === name;
         buttons[i].className = on ? "adm-nav-btn adm-nav-btn--active" : "adm-nav-btn";
+        if (buttons[i].setAttribute) {
+          buttons[i].setAttribute("aria-current", on ? "page" : "false");
+        }
       }
     }
     hideError();
+    // §8.2（包 D）：未 ready（未握手/已作废）只显示等待态，不发管理 API 请求，
+    // 也不渲染成错误——握手建立后 init 处理器会重新 showPage 加载真实数据
+    if (!bridgeReady()) {
+      setHandshake(state.dead
+        ? "桥接会话已作废，等待宿主重新握手…（当前页：" + name + "）"
+        : "等待宿主初始化消息…（当前页：" + name + "）");
+      return;
+    }
     if (name === "overview") loadOverview();
     else if (name === "users") loadUsers(false);
     else if (name === "invites") { loadAcquisitionPage(); loadInvites(false); }
@@ -1504,6 +1564,7 @@
         ai: $("adm-users-ai") ? $("adm-users-ai").value : "",
       };
       state.cursors.users = null;
+      state.listSeq++;
       loadUsers(false);
     });
     onClick("adm-users-more-btn", function () { loadUsers(true); });
@@ -1533,6 +1594,7 @@
         status: $("adm-usage-status") ? $("adm-usage-status").value : "",
       };
       state.cursors.usage = null;
+      state.listSeq++;
       loadUsage(false);
     });
     onClick("adm-usage-more-btn", function () { loadUsage(true); });
@@ -1544,6 +1606,7 @@
         action: ($("adm-audit-action") && $("adm-audit-action").value || "").trim(),
       };
       state.cursors.audit = null;
+      state.listSeq++;
       loadAudit(false);
     });
     onClick("adm-audit-more-btn", function () { loadAudit(true); });

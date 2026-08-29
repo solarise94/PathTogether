@@ -1868,28 +1868,104 @@ def _admin_asset_json(payload, status):
     return resp
 
 
+def parse_public_base_url(raw):
+    """规范公网 origin parser（一次性修复包 B 的单一事实来源）。
+
+    输入 ``PUBLIC_BASE_URL`` 原始字符串，返回 ``(origin, None)`` 或
+    ``(None, reason)``——origin 形如 ``scheme://host[:port]``（纯小写
+    scheme + netloc，无尾斜杠、无默认端口）。确定性拒绝：空值、非
+    http/https scheme、带 userinfo、带 query/fragment、非根 path、无 host。
+
+    CSP（``_admin_asset_html_csp``）与 readiness/注册前置闸共用本 parser，
+    不允许各写一套字符串判断。
+    """
+    if not isinstance(raw, str):
+        return None, "not_a_string"
+    value = raw.strip()
+    if not value:
+        return None, "empty"
+    try:
+        parts = urlparse(value)
+    except ValueError:
+        return None, "unparseable"
+    if parts.scheme not in ("http", "https"):
+        return None, "scheme_not_http_https"
+    if parts.username or parts.password:
+        return None, "userinfo_not_allowed"
+    host = (parts.hostname or "").lower()
+    if not host:
+        return None, "missing_host"
+    if parts.path not in ("", "/"):
+        return None, "path_not_root"
+    if parts.query or parts.fragment:
+        return None, "query_or_fragment_not_allowed"
+    port = parts.port
+    if port is not None and port == (443 if parts.scheme == "https" else 80):
+        port = None  # 默认端口规范化去除
+    origin = "%s://%s" % (parts.scheme, host + (":%d" % port if port is not None else ""))
+    return origin, None
+
+
+def _canonical_public_origin(environ=None):
+    """当前请求应使用的资源 origin（CSP 语义，须在 app/请求上下文调用）。
+
+    优先且在生产唯一使用 ``PUBLIC_BASE_URL``（经 parse_public_base_url 严格
+    校验——公网 HTTPS 反代下 ``request.host_url`` 只是内部 origin，绝不能作
+    CSP 源）；未配置时仅测试（app.testing）与本地开发（app.debug）回退
+    request origin；生产缺失/非法一律 raise ValueError（fail-closed，调用方
+    退化为全拒绝 CSP 并记录不含敏感信息的可操作日志）。
+    """
+    env = os.environ if environ is None else environ
+    raw = (env.get("PUBLIC_BASE_URL") or "").strip()
+    if raw:
+        origin, reason = parse_public_base_url(raw)
+        if origin is None:
+            raise ValueError("PUBLIC_BASE_URL 非法（%s）——CSP 已 fail-closed，"
+                             "请修正为 https://host[:port] 形态" % reason)
+        return origin
+    if app.testing or app.debug:
+        # 测试/本地开发：回退请求 origin（test client 即 http://localhost）
+        origin = (request.host_url or "").strip().rstrip("/")
+        if origin and "://" in origin:
+            return origin
+        raise ValueError("request origin 不可用")
+    raise ValueError("PUBLIC_BASE_URL 未配置——生产 CSP 需要"
+                     " https:// 公网 origin（公网入口 TLS 终止后的规范 origin）")
+
+
 def _admin_asset_html_csp():
-    """admin iframe entry HTML 的 CSP（须在请求上下文调用）。
+    """admin iframe entry HTML 的 CSP。
 
     **opaque origin 坑（PR3 fix）**：iframe 带 ``sandbox="allow-scripts"`` 且**无**
     ``allow-same-origin``，文档 origin 变为 opaque。CSP 源表达式 ``'self'`` 按
     受保护文档的 origin 做 scheme/host/port 匹配，而 opaque origin 没有可比对的
     tuple origin——真实浏览器（Chromium/Firefox 按 CSP 规范）会把 ``script-src
     'self'`` 下的**同源** .js/.css 一并拒绝（jsdom 类环境照不出来）。因此这里
-    不能写 'self'，必须写**显式部署 origin**（``request.host_url`` 派生，去尾
-    斜杠）——资源 URL 本来就是该 origin 下的同源路径，允许范围不变，安全语义
-    不变（真正的隔离边界是 iframe sandbox，CSP 只是纵深防御）。
+    不能写 'self'，必须写**显式部署 origin**。
+
+    **一次性修复包 B（2026-08-29 生产事故根因）**：origin 不再从
+    ``request.host_url`` 推导——公网 HTTPS（SakuraFrp PPv2 → 内部 HTTP）下它
+    是内部 origin，浏览器以公网 origin 请求资源 → CSP 全拦 → iframe 内
+    CSS/JS 失效、宿主 init 后插件无法执行。现统一走
+    ``_canonical_public_origin``（PUBLIC_BASE_URL 严格解析）；非法/生产缺失
+    时 fail-closed 全拒绝（宁可掐死脚本也不放宽）。
 
     ``frame-ancestors 'self'`` 保留：该指令按受保护资源 **URL** 与祖先链匹配
     （在父页面上下文求值），不受文档 opaque origin 影响。
-    host_url 异常取不到时退化为全拒绝（fail-closed，宁可掐死脚本也不放宽）。
     """
-    origin = (request.host_url or "").strip().rstrip("/")
-    if not origin or "://" not in origin:
+    try:
+        origin = _canonical_public_origin()
+    except ValueError as exc:
+        app.logger.warning("admin 插件 HTML CSP fail-closed：%s", exc)
         return "default-src 'none'; %s" % _ADMIN_ASSET_HTML_CSP_FRAME_ANCESTORS
     return ("default-src 'none'; script-src %(o)s; style-src %(o)s; "
             "img-src %(o)s; %(fa)s" % {"o": origin,
                                        "fa": _ADMIN_ASSET_HTML_CSP_FRAME_ANCESTORS})
+
+
+#: /admin 宿主页 bootstrap JSON 的 schema 版本（一次性修复包 C：版本化
+#: bootstrap 取代 data 属性注入；宿主 JS parseBootstrap 同源对齐）
+ADMIN_BOOTSTRAP_SCHEMA_VERSION = 1
 
 
 @app.route("/admin")
@@ -1901,7 +1977,12 @@ def admin_workspace():
     - 登录非 owner / 预览态激活（§14.1：preview subject 不得访问 admin）→ 403
       简单错误页，不渲染任何 admin 内容；
     - admin 插件可信且有 admin.workspace slot → 渲染宿主页（iframe 指向 §8.3
-      资源路由的 entry HTML）；否则渲染平台降级页（不影响 ``/`` Viewer）。
+      资源路由的 entry HTML）；否则渲染平台降级页（不影响 ``/`` Viewer）；
+    - 启动配置经不可执行的 ``<script type="application/json">`` bootstrap 节点
+      下发（包 C：``{{ | tojson }}`` 注入双引号 HTML 属性会提前终结属性值，
+      生产实测 data-admin-permissions 只剩 "["——见
+      docs/admin-workbench-ci-one-shot-remediation-plan.md §2.1/§7）。
+      bootstrap 只含非敏感启动必需字段，权限为服务端授权集合的排序去重结果。
     """
     if actor_identity()["role"] != user_store.ROLE_OWNER:
         return _admin_host_response("forbidden", status=403)
@@ -1915,11 +1996,14 @@ def admin_workspace():
     return _admin_host_response(
         "workspace",
         admin_plugin=admin_plugin,
-        admin_entry_url=admin_plugin["entry_url"],
-        admin_permissions=admin_plugin["admin_permissions"],
         # 与 static/admin-host.js 的 PROTOCOL_VERSION 保持一致（宿主侧有同值
         # 兜底，此处注入使版本声明有单一来源）
-        admin_protocol_version="1.0.0")
+        admin_bootstrap={
+            "schemaVersion": ADMIN_BOOTSTRAP_SCHEMA_VERSION,
+            "protocolVersion": "1.0.0",
+            "permissions": sorted(set(admin_plugin["admin_permissions"])),
+            "assetUrl": admin_plugin["entry_url"],
+        })
 
 
 @app.route("/admin/plugin-assets/<plugin_id>/<path:filename>")

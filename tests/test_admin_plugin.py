@@ -164,10 +164,13 @@ def test_owner_gets_host_page_with_strict_headers():
     assert "style-src 'self'" in csp
     assert "frame-src 'self'" in csp
     body = r.get_data(as_text=True)
-    assert 'src="/admin/plugin-assets/pathtogether-admin/ui/index.html"' in body
+    # 包 D：iframe 不预设业务 src（宿主先装监听器再赋 src，消除 load race）；
+    # 入口经 bootstrap JSON 的 assetUrl 下发
+    assert 'id="admin-plugin-frame"' in body
     assert 'sandbox="allow-scripts"' in body
-    assert "referrerpolicy" in body
-    # adminPermissions 注入（宿主权限门查表数据）
+    assert 'src="/admin/plugin-assets/' not in body
+    assert 'data-plugin-id="pathtogether-admin"' in body
+    # 权限注入改走 bootstrap JSON 节点（包 C）
     assert "admin:overview:read" in body
 
 
@@ -759,21 +762,23 @@ def test_bootstrap_node_survives_boundary_characters():
     """边界字符（引号/尖括号）注入 bootstrap 值时不逃逸成新标签或可执行脚本。"""
     owner, _u = _setup_users()
     _install_admin_plugin()
+    # 直接以含边界字符的权限渲染模板（服务端 ctx 受控为枚举，此处验证
+    # 模板层的 tojson 转义不依赖权限值本身合法）
     with app_mod.app.test_request_context("/admin"):
-        # 直接以含边界字符的 ctx 渲染模板（权限枚举服务端受控，此处验证
-        # 模板层的 tojson 转义不依赖权限值本身合法）
         html_text = app_mod.render_template(
             "admin_host.html", mode="workspace",
             admin_plugin={"plugin_id": "pathtogether-admin", "entry": "ui/index.html",
                           "entry_url": "/admin/plugin-assets/pathtogether-admin/ui/index.html",
                           "admin_permissions": ['a"b', "x<y", "z&w"]},
-            admin_entry_url="/admin/plugin-assets/pathtogether-admin/ui/index.html",
-            admin_permissions=['a"b', "x<y", "z&w"],
-            admin_protocol_version="1.0.0")
+            admin_bootstrap={"schemaVersion": 1, "protocolVersion": "1.0.0",
+                             "permissions": ['a"b', "x<y", "z&w"],
+                             "assetUrl": "/admin/plugin-assets/pathtogether-admin/ui/index.html"})
     grab = _BootstrapGrab()
     grab.feed(html_text)
     data = json.loads("".join(grab.chunks))
     assert data["permissions"] == ['a"b', "x<y", "z&w"]
-    # 尖括号只允许以 \u003c 转义形态出现，不产生新的 <script> 标签
-    assert "<script" not in "".join(grab.chunks).replace("<\\/", "")
-    assert html_text.count("<script") == 1  # 只有 bootstrap JSON 节点本身
+    # JSON 节点原文不含裸 "<"（tojson 已转义为 \u003c），不产生可执行 script
+    raw = "".join(grab.chunks)
+    assert "<" not in raw
+    # 页面上只有 bootstrap JSON 节点 + admin-host.js 两个 <script> 开标签
+    assert html_text.count("<script") == 2

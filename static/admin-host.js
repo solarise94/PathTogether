@@ -44,6 +44,11 @@
   var PROTOCOL_VERSION = "1.0.0";
   var NONCE_BYTES = 32;        // 256-bit
   var REQUEST_TIMEOUT_MS = 20000;
+  // 一次性修复包 D（§8.1）：握手超时——宿主进入可见 error 态而非永久等待
+  var HANDSHAKE_TIMEOUT_MS = 5000;
+  // 包 C（§7.1）：bootstrap JSON v1 的 schema 版本（与 app.py
+  // ADMIN_BOOTSTRAP_SCHEMA_VERSION 同源；未知版本进可见错误态，不静默降级）
+  var BOOTSTRAP_SCHEMA_VERSION = 1;
 
   // §8.4 method → 所需 adminPermission（代码级常量，与
   // plugins/sdk/manifest.py 的 MANIFEST_ADMIN_PERMISSIONS、文档 §8.4 表同源；
@@ -299,6 +304,69 @@
     try {
       return String(remote || "").split(".")[0] === String(local).split(".")[0];
     } catch (e) { return false; }
+  }
+
+  // ------------------------------------------------------------------
+  // bootstrap JSON v1 严格解析（包 C §7.1）：
+  //   - 顶层对象 + schemaVersion 必须精确匹配（未知版本 → 可见错误，不静默降级）；
+  //   - permissions 必须是已知字符串（METHOD_PERMISSIONS 值域）的去重数组；
+  //   - assetUrl 必须是站内 admin 插件资源路径（拒绝外域/协议相对/绝对 URL）；
+  //   - protocolVersion 必须是非空字符串；
+  //   - 任何失败抛 {code, message}（宿主进入 bootstrap_invalid 错误态，
+  //     桥接请求数为 0——绝不静默回退空权限数组）。
+  // ------------------------------------------------------------------
+  var KNOWN_PERMISSIONS = (function () {
+    var set = {};
+    Object.keys(METHOD_PERMISSIONS).forEach(function (m) {
+      set[METHOD_PERMISSIONS[m]] = true;
+    });
+    return set;
+  })();
+  var ASSET_URL_RE =
+      /^\/admin\/plugin-assets\/[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._\/-]*$/;
+
+  function parseBootstrap(text) {
+    var data;
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      throw { code: "bootstrap_invalid", message: "bootstrap 节点不是合法 JSON" };
+    }
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      throw { code: "bootstrap_invalid", message: "bootstrap 顶层必须是对象" };
+    }
+    if (data.schemaVersion !== BOOTSTRAP_SCHEMA_VERSION) {
+      throw { code: "bootstrap_unsupported_version",
+              message: "bootstrap schemaVersion=" + data.schemaVersion +
+                       " 不受支持（宿主要求 " + BOOTSTRAP_SCHEMA_VERSION + "）" };
+    }
+    if (typeof data.protocolVersion !== "string" || !data.protocolVersion) {
+      throw { code: "bootstrap_invalid", message: "protocolVersion 缺失" };
+    }
+    var perms = data.permissions;
+    if (!Array.isArray(perms)) {
+      throw { code: "bootstrap_invalid", message: "permissions 必须是数组" };
+    }
+    var seen = {};
+    for (var i = 0; i < perms.length; i++) {
+      var p = perms[i];
+      if (typeof p !== "string" || !KNOWN_PERMISSIONS[p]) {
+        throw { code: "bootstrap_invalid",
+                message: "permissions 含未知值（第 " + (i + 1) + " 项）" };
+      }
+      if (seen[p]) {
+        throw { code: "bootstrap_invalid", message: "permissions 含重复项 " + p };
+      }
+      seen[p] = true;
+    }
+    if (typeof data.assetUrl !== "string" || !ASSET_URL_RE.test(data.assetUrl)) {
+      throw { code: "bootstrap_invalid", message: "assetUrl 非法（须为站内插件资源路径）" };
+    }
+    return {
+      protocolVersion: data.protocolVersion,
+      permissions: perms.slice(),
+      assetUrl: data.assetUrl,
+    };
   }
 
   // 常数时间字符串比较（nonce / requestId 用；高熵值下主要是防侥幸短路）。
@@ -735,6 +803,8 @@
     });
     var protocolVersion = opts.protocolVersion || PROTOCOL_VERSION;
     var timeoutMs = opts.timeoutMs || REQUEST_TIMEOUT_MS;
+    // 包 D（§8.1）：invalidate（reload/登出/pagehide）时通知宿主状态机
+    var onSessionEnd = typeof opts.onSessionEnd === "function" ? opts.onSessionEnd : null;
 
     // 登出探测：任一后端调用收到 401 → 会话失效，立即作废（包装在创建处，
     // 使 backend ctx 拿到的 fetchJson 也带观测）
@@ -804,6 +874,9 @@
           kind: "event", bridge: BRIDGE, protocolVersion: protocolVersion,
           type: "bridge_invalidated", reason: reason,
         });
+      }
+      if (onSessionEnd) {
+        try { onSessionEnd(reason); } catch (e) { /* 状态机异常不波及桥 */ }
       }
     }
 
@@ -941,46 +1014,135 @@
     return handle;
   }
 
-  // ---- 页面装配（/admin 宿主页）----
-  function boot(win, doc) {
+  // ---- 页面装配（/admin 宿主页；包 C/D：bootstrap v1 + 生命周期状态机）----
+  // 状态机：idle → loading → waiting_handshake → ready / error
+  //         ready/error → reload → loading（新 nonce，旧请求全部作废）
+  //         pagehide / 登出 → disposed
+  var STATE_TEXT = {
+    idle: "正在初始化…",
+    loading: "正在加载管理插件…",
+    waiting_handshake: "等待插件握手…",
+    ready: "桥接已建立",
+    error: "出错",
+    disposed: "已断开",
+  };
+
+  function boot(win, doc, bootOpts) {
+    bootOpts = bootOpts || {};
     var iframe = doc.getElementById && doc.getElementById("admin-plugin-frame");
     if (!iframe) return null;
-    // 深链支持（PR5 /admin/registration → /admin#invites 兼容）：把宿主页的
-    // #<page> 透传到 iframe 自身 URL 的 hash——opaque iframe 读不到父页
-    // location，插件初始化时按自己的 location.hash 选起始页。hash 形态严格
-    // 白名单（# + 页面 slug），不回显任何其他内容。
+    var statusEl = doc.getElementById && doc.getElementById("admin-host-status");
+
+    // 状态只经 DOM 属性 + 可测试事件表达（§8.1-5）；消息不含敏感内容
+    function setState(state, code, message) {
+      if (statusEl && statusEl.setAttribute) {
+        statusEl.setAttribute("data-admin-host-state", state);
+        statusEl.textContent = message ||
+            (STATE_TEXT[state] + (code ? "（" + code + "）" : ""));
+      }
+      try {
+        var ev = new (win.CustomEvent)("adminhoststatechange",
+                                       { detail: { state: state, code: code || null } });
+        win.dispatchEvent(ev);
+      } catch (e) { /* 事件是可测试性通道，失败不阻断 */ }
+    }
+
+    // bootstrap 严格解析：失败进入可见 error 态，桥接请求数为 0（§7.1）
+    var bootstrapEl = doc.getElementById && doc.getElementById("admin-bootstrap");
+    var bootstrap;
+    try {
+      bootstrap = parseBootstrap(
+        bootstrapEl && bootstrapEl.textContent ? String(bootstrapEl.textContent) : "");
+    } catch (err) {
+      setState("error", err && err.code,
+               "管理工作台配置无效：" + ((err && err.message) || "bootstrap 缺失") +
+               "（" + ((err && err.code) || "bootstrap_invalid") + "）");
+      return null;
+    }
+
+    var handshakeTimeoutMs = bootOpts.handshakeTimeoutMs || HANDSHAKE_TIMEOUT_MS;
+    var handshakeTimer = null;
+    var readyAnnounced = false;
+
+    function clearHandshakeTimer() {
+      if (handshakeTimer) {
+        clearTimeout(handshakeTimer);
+        handshakeTimer = null;
+      }
+    }
+
+    var handle = create({
+      iframe: iframe,
+      permissions: bootstrap.permissions,
+      protocolVersion: bootstrap.protocolVersion,
+      window: win,
+      document: doc,
+      onSessionEnd: function (reason) {
+        clearHandshakeTimer();
+        if (reason === "logout" || reason === "pagehide") {
+          setState("disposed", reason === "logout" ? "logout" : null,
+                   reason === "logout" ? "登录已失效，请重新登录（logout）" : "已断开");
+        }
+        // iframe_reload / plugin_reload：load 监听器会把状态带回 waiting_handshake
+      },
+    });
+
+    // ① 先安装全部监听器（§8.1-1：消除初次 load race）
+    iframe.addEventListener("load", function () {
+      handle._handleIframeLoad(); // 生成新 nonce、作废旧会话
+      readyAnnounced = false;
+      setState("waiting_handshake");
+      clearHandshakeTimer();
+      handshakeTimer = setTimeout(function () {
+        handshakeTimer = null;
+        handle.invalidate("handshake_timeout");
+        setState("error", "handshake_timeout",
+                 "插件握手超时（handshake_timeout，" +
+                 Math.round(handshakeTimeoutMs / 1000) + " 秒无响应）——" +
+                 "可点「重新加载插件」重试");
+      }, handshakeTimeoutMs);
+    });
+    win.addEventListener("message", function (event) {
+      var handledBefore = handle.stats().handled;
+      handle._handleWindowMessage(event);
+      // 首条通过全部校验（WindowProxy/nonce/requestId/method/schema/权限）的
+      // 请求 = 握手完成 → ready（§8.1 状态机）
+      if (!readyAnnounced && handle.stats().handled > handledBefore) {
+        readyAnnounced = true;
+        clearHandshakeTimer();
+        setState("ready", null,
+                 "桥接已建立（已授权管理能力 " + bootstrap.permissions.length + " 项）");
+      }
+    });
+    win.addEventListener("pagehide", function () { handle.invalidate("pagehide"); });
+    var reloadBtn = doc.getElementById && doc.getElementById("admin-reload-btn");
+    if (reloadBtn) {
+      reloadBtn.addEventListener("click", function () {
+        clearHandshakeTimer();
+        setState("loading");
+        handle.reloadPlugin();
+      });
+    }
+
+    // ② 监听器就位后才赋业务 src（深链 hash 透传严格白名单，不回显其他内容）
+    setState("loading");
+    var src = bootstrap.assetUrl;
     try {
       var deepLink = (win.location && win.location.hash) || "";
       if (/^#[a-z][a-z0-9_-]{0,31}$/.test(deepLink)) {
-        var baseSrc = iframe.getAttribute("src");
-        if (baseSrc && baseSrc.indexOf("#") === -1) {
-          iframe.setAttribute("src", baseSrc + deepLink);
-        }
+        src = src + deepLink;
       }
     } catch (e) { /* 读不到 location/hash：保持原 src */ }
-    var perms = [];
-    try {
-      perms = JSON.parse(iframe.getAttribute("data-admin-permissions") || "[]");
-    } catch (e) { perms = []; }
-    var handle = create({
-      iframe: iframe,
-      permissions: perms,
-      protocolVersion: iframe.getAttribute("data-protocol-version") || undefined,
-      window: win,
-      document: doc,
-    });
-    iframe.addEventListener("load", handle._handleIframeLoad);
-    win.addEventListener("message", handle._handleWindowMessage);
-    win.addEventListener("pagehide", function () { handle.invalidate("pagehide"); });
-    var reloadBtn = doc.getElementById("admin-reload-btn");
-    if (reloadBtn) reloadBtn.addEventListener("click", handle.reloadPlugin);
+    iframe.setAttribute("src", src);
     return handle;
   }
 
   window.AdminBridgeHost = {
     PROTOCOL_VERSION: PROTOCOL_VERSION,
+    BOOTSTRAP_SCHEMA_VERSION: BOOTSTRAP_SCHEMA_VERSION,
     METHOD_PERMISSIONS: METHOD_PERMISSIONS,
     METHOD_PARAM_SCHEMAS: METHOD_PARAM_SCHEMAS,
+    parseBootstrap: parseBootstrap,
     maskLoginId: maskLoginId,
     create: create,
     boot: boot,

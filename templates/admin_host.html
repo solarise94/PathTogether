@@ -6,15 +6,24 @@
   <meta name="referrer" content="no-referrer" />
   <title>PathTogether · 管理工作台</title>
   <!--
-    PR3 admin.workspace 宿主页（docs/admin-billing-plugin-implementation-plan.md §8.1/§8.3）。
+    PR3 admin.workspace 宿主页（docs/admin-billing-plugin-implementation-plan.md §8.1/§8.3；
+    一次性修复包 C/D：docs/admin-workbench-ci-one-shot-remediation-plan.md §7/§8）。
     - 仅真实登录 owner 可见（actor_identity 判定；预览态 403）；
     - 响应头带 Cache-Control: no-store 与严格 CSP（app.py _admin_host_response），
-      因此本页**不写**内联 <style>/<script>（无 unsafe-inline）；
+      因此本页**不写**内联 style 或 script（无 unsafe-inline）；
     - admin 插件经 opaque iframe（sandbox="allow-scripts"，无 allow-same-origin/
       allow-forms/allow-popups/allow-top-navigation）挂载，src 指向 owner-only 的
       插件资源路由（§8.3）；
-    - 桥接宿主逻辑在 /static/admin-host.js：每次 iframe load 生成 256-bit 一次性
-      nonce，只接受精确 WindowProxy + nonce + 唯一 requestId 的消息（§8.3）。
+    - 启动配置经不可执行 bootstrap JSON 节点下发（type="application/json"
+      不可执行；Jinja tojson 对闭合 script 标签与边界字符已转义）。**不得**回退为
+      data 属性注入 JSON——tojson 输出的双引号会提前终结属性值（生产实测
+      权限 data 属性解析后只剩 "["，权限门查表恒空）；
+    - iframe **不预设业务 src**：宿主脚本（/static/admin-host.js）先安装
+      load/message 监听器与生命周期状态机，再赋 src——消除初次 load race；
+    - 宿主生命周期：idle → loading → waiting_handshake → ready / error；
+      reload → loading（新 nonce）；pagehide/登出 → disposed。状态经
+      #admin-host-status 的 data-admin-host-state 属性 + adminhoststatechange
+      事件表达。
   -->
   <link rel="stylesheet" href="/static/admin-host.css" />
 </head>
@@ -41,6 +50,8 @@
   <header class="adm-host-header">
     <div class="adm-host-header-inner">
       <h1>PathTogether 管理工作台</h1>
+      <p class="adm-host-status" id="admin-host-status" data-admin-host-state="idle"
+         role="status" aria-live="polite">正在初始化…</p>
       <div class="adm-host-actions">
         <button type="button" id="admin-reload-btn">重新加载插件</button>
         <a href="/">返回 Viewer</a>
@@ -52,11 +63,9 @@
             title="PathTogether Admin 插件"
             sandbox="allow-scripts"
             referrerpolicy="no-referrer"
-            src="{{ admin_entry_url }}"
-            data-plugin-id="pathtogether-admin"
-            data-protocol-version="{{ admin_protocol_version }}"
-            data-admin-permissions="{{ admin_permissions | tojson }}"></iframe>
+            data-plugin-id="{{ admin_plugin.plugin_id }}"></iframe>
   </main>
+  <script id="admin-bootstrap" type="application/json">{{ admin_bootstrap | tojson }}</script>
   <script src="/static/admin-host.js"></script>
   {% endif %}
 </body>

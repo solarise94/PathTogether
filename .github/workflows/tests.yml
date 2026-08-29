@@ -10,11 +10,12 @@ permissions:
   contents: read
 
 jobs:
-  python:
+  # 必需 job 1/5：JSON 后端全量（python-json）
+  python-json:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -23,24 +24,19 @@ jobs:
       # TOTAL 54% 减 10 点；阈值宁可偏低，不让套件变红到不可用。
       - run: python -m pytest tests -q --cov=. --cov-report=term --cov-report=xml --cov-fail-under=44
 
-  # PG 后端全量跑（test-review P0-3）：requirements-dev.txt 已含 pgserver，
-  # conftest 在 RUN_PG_TESTS=1 时自动起内嵌 PostgreSQL 并设 STORAGE_BACKEND。
-  python-pg:
+  # 必需 job 2/5：PG canary 独立必需 job（一次性修复包 G §11.2）。
+  # 拆出独立 job 并先于全量收敛语义：canary 只证明「runner 真的启动了
+  # PostgreSQL 且 RUN_PG_TESTS 生效」；全量失败时 canary 不再被连坐 skip。
+  python-pg-canary:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -r requirements.txt -r requirements-dev.txt
-      # PG 模式覆盖率天然更高（pg 各 store 被真实执行）；阈值与 json job 一致。
-      - run: python -m pytest tests -q --cov=. --cov-report=term --cov-report=xml --cov-fail-under=44
-        env:
-          RUN_PG_TESTS: "1"
-      # canary 不可跳过：单独再跑一次 canary 文件，断言真实执行且未被 skip
-      # （若 pgserver 缺失 / RUN_PG_TESTS 未生效，canary 会 fail 或 skip，此步红）
-      - name: PG canary 必须真实执行
+      - name: PG canary 必须真实执行（不可 skip）
         run: |
           set -o pipefail
           python -m pytest tests/test_pg_backend_canary.py -q -rA | tee canary-out.txt
@@ -55,13 +51,60 @@ jobs:
         env:
           RUN_PG_TESTS: "1"
 
-  host-bridge:
+  # 必需 job 3/5：PG 后端全量（python-pg；conftest 起内嵌 PostgreSQL）
+  python-pg:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      # PG 模式覆盖率天然更高（pg 各 store 被真实执行）；阈值与 json job 一致。
+      - run: python -m pytest tests -q --cov=. --cov-report=term --cov-report=xml --cov-fail-under=44
+        env:
+          RUN_PG_TESTS: "1"
+
+  # 必需 job 4/5：HostBridge / 插件 JS 单元（Vitest）
+  host-bridge-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run test:js
+
+  # 必需 job 5/5：管理工作台真实 Chromium E2E（一次性修复包 F §10）。
+  # webServer 起临时目录 + 内嵌 PostgreSQL + 一次性凭据的被测应用；
+  # 凭据只经临时文件传递，不写日志/artifact；截图仅测试虚构数据。
+  admin-browser-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e:admin
+        env:
+          CI: "1"
+      - name: 上传 E2E 截图（仅测试虚构数据）
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: admin-e2e-artifacts
+          path: |
+            test-results/
+            playwright-report/
+          retention-days: 7

@@ -1,0 +1,16 @@
+# Dependabot：GitHub Actions 依赖定期更新（一次性修复包 G §11.3 推荐）。
+# 避免 action 运行时再次长期滞后（旧 run 的 Node 运行时弃用告警即由此而来）。
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly

@@ -572,6 +572,9 @@ def test_disable_invalidates_existing_session(monkeypatch):
 # =========================================================================== #
 # 懒迁移：旧 shares.json 读一次后补 owner_user_id
 # =========================================================================== #
+@json_only  # 直写旧格式 shares.json 并断言 JSON 懒迁移落盘；PG 后端无该文件
+# （一次性修复包 G：该用例曾连续六次污染 PG job——json-only 语义在
+#  STORAGE_BACKEND=postgres 下不成立，属标记缺失而非测试缺陷）
 def test_lazy_migration_owner_refs(monkeypatch):
     monkeypatch.setenv("ADMIN_PASSWORD", "")
     owner = make_owner()

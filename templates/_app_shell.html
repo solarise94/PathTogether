@@ -214,6 +214,10 @@
         </div>
 
       <div class="sidebar-bottom">
+        <!-- 管理工作台入口：仅 owner 可见（PR5 后 /admin 的唯一 UI 入口；
+             服务端 /admin 仍独立 owner 鉴权，此链接只是可发现性） -->
+        <a href="/admin" id="admin-entry-link" class="logout-link"
+           data-i18n="acct.adminconsole" hidden>管理工作台</a>
         <!-- 修改我的密码（owner/user 均可见；账户系统批次 A docs §8.1） -->
         <button type="button" id="changepw-btn" class="logout-link changepw-link"
                 data-i18n="acct.changepw" hidden>修改我的密码</button>

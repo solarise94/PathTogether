@@ -91,6 +91,33 @@ describe("admin identity preview UI", () => {
 		expect(h.els["preview-banner"].hidden).toBe(false);
 		expect(h.els["preview-banner-text"].textContent).toContain("user@x.com");
 		expect(h.els["logout-btn"].hidden).toBe(true);
+		expect(h.els["admin-entry-link"].hidden).toBe(true); // 预览态隐藏（与改密/登出同级）
+	});
+
+	it("非预览 owner 可见管理台入口（PR5 后 /admin 唯一 UI 入口）", () => {
+		const h = loadApp();
+		h.applyAuthInfo({
+			auth_enabled: true,
+			username: "owner@x.com",
+			role: "owner",
+			user_id: "usr_a",
+			actor: { username: "owner@x.com", role: "owner", user_id: "usr_a" },
+			preview: null,
+		});
+		expect(h.els["admin-entry-link"].hidden).toBe(false);
+	});
+
+	it("普通 user 不见管理台入口（入口按真实 actor 判定）", () => {
+		const h = loadApp();
+		h.applyAuthInfo({
+			auth_enabled: true,
+			username: "user@x.com",
+			role: "user",
+			user_id: "usr_b",
+			actor: { username: "user@x.com", role: "user", user_id: "usr_b" },
+			preview: null,
+		});
+		expect(h.els["admin-entry-link"].hidden).toBe(true);
 	});
 
 	it("非预览 owner 隐藏 banner（用户管理 UI 已迁入 admin 插件，PR5）", () => {

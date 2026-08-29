@@ -94,6 +94,7 @@
       "preview.stop.ok": "已退出预览",
 
       // ---- 修改我的密码（owner/user 通用；账户系统批次 A docs §7.1/§8.1） ----
+      "acct.adminconsole": "管理工作台",
       "acct.changepw": "修改我的密码",
       "acct.changepw.title": "修改我的密码",
       "acct.changepw.current": "当前密码",
@@ -653,6 +654,7 @@
       "preview.stop.ok": "Preview ended",
 
       // ---- Change my password (owner/user; account batch A docs §7.1/§8.1) ----
+      "acct.adminconsole": "Admin console",
       "acct.changepw": "Change my password",
       "acct.changepw.title": "Change my password",
       "acct.changepw.current": "Current password",

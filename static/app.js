@@ -125,6 +125,11 @@
       els.logoutBtn.hidden = !!previewState;
     }
     if (els.changepwBtn) { els.changepwBtn.hidden = !!previewState; }
+    // 管理台入口按真实 actor 判定（预览态隐藏——与改密/登出同级约定；
+    // 预览中 /admin 仍可手动直达，宿主每条消息回查真实 owner）。
+    if (els.adminEntryLink) {
+      els.adminEntryLink.hidden = !!previewState || actorRole !== "owner";
+    }
     if (window.HP_I18N && window.HP_I18N.setRole) { window.HP_I18N.setRole(currentRole); }
     if (els.sharePermHint) {
       els.sharePermHint.hidden = currentRole !== "user";
@@ -432,6 +437,8 @@
     dropOverlay: $("drop-overlay"),
     toastContainer: $("toast-container"),
     logoutBtn: $("logout-btn"),
+    // 管理工作台入口（仅 owner 可见；PR5 后 /admin 的唯一 UI 入口）
+    adminEntryLink: $("admin-entry-link"),
     // 修改我的密码（账户系统批次 A docs §8.1）
     changepwBtn: $("changepw-btn"),
     changepwMask: $("changepw-mask"),

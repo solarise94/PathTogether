@@ -2,9 +2,13 @@
 """billing/usage-ingest 测试共用基建（PR2）。
 
 - ``load_event``：读 tests/fixtures/usage_events/ 样例（深拷贝，用例可改写）；
-- ``seed_price_books``：幂等重放 migrations/0018_billing.sql——迁移文件是
-  DeepSeek 2026-08-28 价格种子的唯一权威来源（conftest 每用例 TRUNCATE 会
-  清掉迁移期种子，需要种子的用例显式调用本函数重建）；
+- ``seed_price_books``：幂等重放 migrations/0018_billing.sql +
+  migrations/0022_billing_price_unit_fix.sql——迁移文件是 DeepSeek
+  2026-08-28 价格种子与批次 A 单位修复（corrected v2 书 + legacy 收口）的
+  唯一权威来源（conftest 每用例 TRUNCATE 会清掉迁移期种子，需要种子的
+  用例显式调用本函数重建）；
+- ``seed_legacy_price_books_only``：只重放 0018（单位修复**前**的错误状态，
+  供 cutover/legacy 用例构造历史区间）；
 - ``bind_reservation`` / ``bind_demo_session``：直接写权威绑定行
   （ai_budget_reservations / demo_sessions），构造 §7.2 四步解析的前置态。
 
@@ -19,6 +23,18 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 USAGE_DIR = REPO_ROOT / "tests" / "fixtures" / "usage_events"
 BILLING_DIR = REPO_ROOT / "tests" / "fixtures" / "billing"
 _MIGRATION_0018 = REPO_ROOT / "migrations" / "0018_billing.sql"
+_MIGRATION_0022 = REPO_ROOT / "migrations" / "0022_billing_price_unit_fix.sql"
+
+#: 0018 种子书（错误 legacy 换算 CNY×1000；批次 A 起在 cutover 收口保留）
+LEGACY_BOOK_IDS = (
+    "pb_deepseek_provider_cost_20260828",
+    "pb_deepseek_customer_charge_20260828",
+)
+#: 0022 corrected v2 书（正确换算 CNY×1e9；cutover 起生效）
+CORRECTED_BOOK_IDS = (
+    "pb_deepseek_provider_cost_v2_corrected",
+    "pb_deepseek_customer_charge_v2_corrected",
+)
 
 
 def load_event(name):
@@ -46,19 +62,62 @@ def connect():
     return conn
 
 
+def _replay(conn, path):
+    with conn.cursor() as cur:
+        cur.execute(path.read_text(encoding="utf-8"))
+    conn.commit()
+
+
 def seed_price_books(conn=None):
-    """幂等重放 0018 迁移（IF NOT EXISTS/ON CONFLICT DO NOTHING）→ 重建
-    2026-08-28 DeepSeek 种子价格书（provider_cost + customer_charge）。"""
+    """幂等重放 0018 + 0022（IF NOT EXISTS/ON CONFLICT/守卫 UPDATE）→ 重建
+    「legacy 书（已收口）+ corrected v2 书（当前生效）」的完整价格史。"""
+    own = conn is None
+    if own:
+        conn = connect()
+    try:
+        _replay(conn, _MIGRATION_0018)
+        _replay(conn, _MIGRATION_0022)
+    finally:
+        if own:
+            conn.close()
+
+
+def seed_legacy_price_books_only(conn=None):
+    """只重放 0018：单位修复**前**的错误价格书（active、区间开放）。
+
+    仅用于 cutover/legacy 语义用例（旧事件定价、历史 rate 不被改写）；
+    普通用例请用 :func:`seed_price_books`（当前生效价 = corrected v2）。"""
+    own = conn is None
+    if own:
+        conn = connect()
+    try:
+        _replay(conn, _MIGRATION_0018)
+    finally:
+        if own:
+            conn.close()
+
+
+def pricing_cutover(conn=None):
+    """读取 0022 写入的 pricing_v2_cutover_at（datetime，UTC）。
+
+    未迁移（无标志）时返回 None。测试用它取确定性 cutover，再构造
+    cutover 前/后的事件时间，避免依赖真实时钟与种子时刻的相对快慢。
+    """
     own = conn is None
     if own:
         conn = connect()
     try:
         with conn.cursor() as cur:
-            cur.execute(_MIGRATION_0018.read_text(encoding="utf-8"))
-        conn.commit()
+            cur.execute(
+                "SELECT value FROM platform_settings "
+                "WHERE key='pricing_v2_cutover_at'")
+            row = cur.fetchone()
     finally:
         if own:
             conn.close()
+    if row is None:
+        return None
+    return datetime.fromtimestamp(float(row["value"]), tz=timezone.utc)
 
 
 #: 种子书起点（快照日 Asia/Shanghai 00:00 = UTC 前一日 16:00）
@@ -72,8 +131,8 @@ def seed_early_price_books():
     ``now - 1h`` 的 occurred_at 在时钟贴近该日期时会落进种子起点之前，
     找不到价格 → no_active_price_book（非确定）。本对书与种子区间半开
     不相交（可无 supersede 直接激活），保证任何过去时刻都有价可查；
-    值与种子一致（夹具 nano 值），不影响金额断言（金额断言用注入 now
-    的确定性用例，此处只为 priced 状态稳定）。
+    值与 corrected 夹具一致，不影响金额断言（金额断言用注入 now 的
+    确定性用例，此处只为 priced 状态稳定）。
     """
     import billing_store
     from datetime import datetime

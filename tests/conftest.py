@@ -85,8 +85,9 @@ if _RUN_PG:
         "upload_tasks",
         # 0018 起：金额计费（admin-billing §6）。billing_price_books 的迁移
         # 种子会随 TRUNCATE 清掉——需要种子的用例用 tests/_billing_helpers
-        # .seed_price_books() 幂等重放 migrations/0018_billing.sql（迁移文件
-        # 是种子唯一权威来源）。
+        # .seed_price_books() 幂等重放 migrations/0018_billing.sql +
+        # 0022_billing_price_unit_fix.sql（迁移文件是种子与批次 A 单位修复
+        # 的唯一权威来源）。
         "billing_ledger_entries", "ai_usage_events", "billing_accounts",
         "billing_rates", "billing_price_books", "provider_balance_snapshots",
         # 0020 起：billing holds（admin-billing §12.3，PR7 影子预授权）。

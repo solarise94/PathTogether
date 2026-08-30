@@ -2228,6 +2228,36 @@ def _as_aware_dt(value):
     return datetime.fromtimestamp(float(value), tz=timezone.utc)
 
 
+#: §7.2 旧错误价格口径（批次 A，只读标记）：cutover 之前的旧价格书/用量/
+#: 模拟 debit 是错误换算（CNY×1000）产生的影子数据，只作诊断展示，
+#: 不参与任何硬额度判定；管理端汇总须把新旧数据区分展示。
+LEGACY_PRICING_NOTE = "legacy pricing scale invalid; excluded from hard enforcement"
+
+#: 0022 迁移写入的 cutover 标志键（platform_settings，epoch 秒，无敏感信息）
+PRICING_V2_CUTOVER_SETTING_KEY = "pricing_v2_cutover_at"
+
+
+def pricing_v2_cutover():
+    """读取 corrected v2 价格书生效时刻（0022 迁移标志；datetime 或 None）。
+
+    返回 None 表示标志缺失（0022 未应用）。只读查询，不改任何价格数据。
+    """
+    platform_features.require_pg_backend("billing")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM platform_settings WHERE key=%s",
+                    (PRICING_V2_CUTOVER_SETTING_KEY,))
+                row = cur.fetchone()
+    finally:
+        conn.close()
+    if row is None or row["value"] is None:
+        return None
+    return datetime.fromtimestamp(float(row["value"]), tz=timezone.utc)
+
+
 def admin_overview_usage_stats(period_start=None, today_start=None):
     """概览用量聚合（§10.1；窗口：周期起点 / 今日零点，均为含端点）。
 
@@ -2239,7 +2269,13 @@ def admin_overview_usage_stats(period_start=None, today_start=None):
         合计（unpriced 不按 0 元混入）——周期窗口；
       - ``unpriced_count``：unpriced 事件数——周期窗口；
       - ``ingestion_lag_seconds_max`` / ``ingestion_lag_seconds_avg``：
-        received_at - occurred_at 的最大/均值——周期窗口。
+        received_at - occurred_at 的最大/均值——周期窗口；
+      - ``pricing_cutover_epoch`` / ``legacy_priced_events`` /
+        ``legacy_pricing_note``（§7.2 批次 A 只读口径）：corrected v2 价格
+        生效时刻（epoch 秒，None=未迁移）、cutover 前按旧错误价格计价的
+        事件数、以及固定说明「legacy pricing scale invalid; excluded
+        from hard enforcement」——旧影子数据只作诊断，不参与硬额度，
+        管理端不得把它与修复后的金额混合解读。
 
     窗口参数接受 epoch 秒 / RFC3339 字符串 / datetime（budget_store 的
     usage_report 周期起点是 epoch float）。
@@ -2295,6 +2331,25 @@ def admin_overview_usage_stats(period_start=None, today_start=None):
                 lag = dict(cur.fetchone())
                 out["ingestion_lag_seconds_max"] = float(lag["lag_max"])
                 out["ingestion_lag_seconds_avg"] = float(lag["lag_avg"])
+                # §7.2（批次 A）只读口径：cutover 前的旧错误价格影子数据
+                # 单列计数，管理端据此区分新旧数据（不改 enforcement）
+                cutover = None
+                cur.execute(
+                    "SELECT value FROM platform_settings WHERE key=%s",
+                    (PRICING_V2_CUTOVER_SETTING_KEY,))
+                marker = cur.fetchone()
+                if marker is not None and marker["value"] is not None:
+                    cutover = datetime.fromtimestamp(
+                        float(marker["value"]), tz=timezone.utc)
+                out["pricing_cutover_epoch"] = (
+                    cutover.timestamp() if cutover is not None else None)
+                out["legacy_pricing_note"] = LEGACY_PRICING_NOTE
+                cur.execute(
+                    "SELECT count(*)::int AS n FROM ai_usage_events "
+                    "WHERE status='priced'"
+                    + (" AND occurred_at < %s" if cutover is not None else ""),
+                    ([cutover] if cutover is not None else []))
+                out["legacy_priced_events"] = int(cur.fetchone()["n"])
         return out
     finally:
         conn.close()

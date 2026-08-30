@@ -1,5 +1,5 @@
 {
-  "_comment": "DeepSeek 官方价格快照测试夹具（docs/admin-billing-plugin-implementation-plan.md §4，快照日 2026-08-28）。PR2 的 billing_pricing.py 消费本文件；实施日必须重新核对官方文档。价格单位：CNY/百万 tokens。nano 换算公式：nano_per_million = CNY_per_million × 1e9 nano/CNY ÷ 1e6 tokens = CNY_per_million × 1000（例：0.05 CNY → 50 nano；27.0 CNY → 27000 nano）。换算必须用十进制精确算术（Decimal(str(cny)) × 1000），禁止先转 float 再乘。最低价 0.05 CNY/百万 token = 每 token 50 nano-CNY，这是 §5 选择 BIGINT nano_cny 的原因。",
+  "_comment": "DeepSeek 官方价格快照测试夹具（docs/admin-billing-plugin-implementation-plan.md §4，快照日 2026-08-28）。PR2 的 billing_pricing.py 消费本文件；实施日必须重新核对官方文档。价格单位：CNY/百万 tokens。nano 换算公式（批次 A 0022 修正）：nano_per_million = CNY_per_million × 1e9（1 CNY = 1e9 nano-CNY；rate 列单位是「nano-CNY / 百万 tokens」，例：0.05 CNY → 50,000,000；27.0 CNY → 27,000,000,000）。注意不要把「每 token 的 nano 值」（0.05 CNY/百万 = 每 token 50 nano）误写进每百万列——0018 种子曾因此少算 1e6 倍（0.05 → 50），由 migrations/0022_billing_price_unit_fix.sql 以 corrected v2 价格书修复，旧书保留为 legacy 区间。换算必须用十进制精确算术（Decimal(str(cny)) × 1e9），禁止先转 float 再乘。",
   "provider": "deepseek",
   "kind": "provider_cost",
   "currency": "CNY",
@@ -14,9 +14,9 @@
     "output_tokens": "output_cny_per_million"
   },
   "conversion": {
-    "formula": "nano_per_million = Decimal(cny_per_million) * 1000",
-    "derivation": "1 CNY = 1e9 nano_cny；价格以每 1e6 tokens 计，故 nano_per_million = CNY × 1e9 / 1e6 = CNY × 1000",
-    "note": "禁止 float 中转；所有快照值换算后必须是整数"
+    "formula": "nano_per_million = Decimal(cny_per_million) * 1000000000",
+    "derivation": "1 CNY = 1e9 nano_cny；rate 列单位是每 1e6 tokens 的 nano-CNY 单价，故 nano_per_million = CNY × 1e9（每 token nano 值 = CNY × 1e9 / 1e6 = CNY × 1000，那是另一个量，不得写入本列）",
+    "note": "禁止 float 中转；所有快照值换算后必须是整数。0018 旧种子按错误公式 CNY×1000 写入（legacy，历史保留，不作正确规则）"
   },
   "models": {
     "deepseek-v4-flash": {
@@ -24,17 +24,17 @@
         "cache_hit_cny_per_million": 0.05,
         "cache_miss_cny_per_million": 1.5,
         "output_cny_per_million": 4.5,
-        "cache_hit_nano_per_million": 50,
-        "cache_miss_nano_per_million": 1500,
-        "output_nano_per_million": 4500
+        "cache_hit_nano_per_million": 50000000,
+        "cache_miss_nano_per_million": 1500000000,
+        "output_nano_per_million": 4500000000
       },
       "peak": {
         "cache_hit_cny_per_million": 0.1,
         "cache_miss_cny_per_million": 3.0,
         "output_cny_per_million": 9.0,
-        "cache_hit_nano_per_million": 100,
-        "cache_miss_nano_per_million": 3000,
-        "output_nano_per_million": 9000
+        "cache_hit_nano_per_million": 100000000,
+        "cache_miss_nano_per_million": 3000000000,
+        "output_nano_per_million": 9000000000
       }
     },
     "deepseek-v4-pro": {
@@ -42,17 +42,17 @@
         "cache_hit_cny_per_million": 0.15,
         "cache_miss_cny_per_million": 4.5,
         "output_cny_per_million": 13.5,
-        "cache_hit_nano_per_million": 150,
-        "cache_miss_nano_per_million": 4500,
-        "output_nano_per_million": 13500
+        "cache_hit_nano_per_million": 150000000,
+        "cache_miss_nano_per_million": 4500000000,
+        "output_nano_per_million": 13500000000
       },
       "peak": {
         "cache_hit_cny_per_million": 0.3,
         "cache_miss_cny_per_million": 9.0,
         "output_cny_per_million": 27.0,
-        "cache_hit_nano_per_million": 300,
-        "cache_miss_nano_per_million": 9000,
-        "output_nano_per_million": 27000
+        "cache_hit_nano_per_million": 300000000,
+        "cache_miss_nano_per_million": 9000000000,
+        "output_nano_per_million": 27000000000
       }
     },
     "deepseek-v4-flash-vision-exp": {
@@ -60,17 +60,17 @@
         "cache_hit_cny_per_million": 0.05,
         "cache_miss_cny_per_million": 1.5,
         "output_cny_per_million": 4.5,
-        "cache_hit_nano_per_million": 50,
-        "cache_miss_nano_per_million": 1500,
-        "output_nano_per_million": 4500
+        "cache_hit_nano_per_million": 50000000,
+        "cache_miss_nano_per_million": 1500000000,
+        "output_nano_per_million": 4500000000
       },
       "peak": {
         "cache_hit_cny_per_million": 0.1,
         "cache_miss_cny_per_million": 3.0,
         "output_cny_per_million": 9.0,
-        "cache_hit_nano_per_million": 100,
-        "cache_miss_nano_per_million": 3000,
-        "output_nano_per_million": 9000
+        "cache_hit_nano_per_million": 100000000,
+        "cache_miss_nano_per_million": 3000000000,
+        "output_nano_per_million": 9000000000
       }
     }
   }

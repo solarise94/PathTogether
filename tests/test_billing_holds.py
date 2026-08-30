@@ -354,6 +354,40 @@ def test_authorize_estimated_balance_would_deny_deterministic():
 
 
 @PG
+def test_authorize_estimate_matches_cny_conversion_independent():
+    """authorize 估算与「CNY 面值 ×1e9」独立复算一致（批次 A §9.1）。
+
+    不从迁移/DB rate 复制常量：直接用 flash 的 CNY 面值经
+    parse_balance_to_nano 换算复算最坏价（输入 1M 全按 cache-miss +
+    输出 200k）。corrected 价下该估算必然是「元」量级（≥2.4 CNY）；
+    0018 错误量级只会算出 2400 nano（0.0000024 CNY）。
+    """
+    bh.seed_price_books_with_history()
+    user = _user_with_account("hold-unit@x.com", grant_nano=1_000_000_000)
+    occurred = bh.pricing_cutover() + timedelta(seconds=1)
+    band = billing_pricing.time_band_for(occurred)
+    cny = {"peak": ("0.1", "3.0", "9.0"),
+           "off_peak": ("0.05", "1.5", "4.5")}[band]
+    expected = (
+        billing_pricing.price_component_nano(
+            0, billing_pricing.parse_balance_to_nano(cny[0]))
+        + billing_pricing.price_component_nano(
+            1_000_000, billing_pricing.parse_balance_to_nano(cny[1]))
+        + billing_pricing.price_component_nano(
+            200_000, billing_pricing.parse_balance_to_nano(cny[2])))
+    # 量级护栏：peak 3+1.8=4.8 CNY、off_peak 1.5+0.9=2.4 CNY
+    assert expected >= 2_400_000_000, "疑似 legacy 错误量级（CNY×1000）"
+    call_id, session_id, request_id = _ids()
+    body = _hold_body("user", user["user_id"], session_id=session_id,
+                      request_id=request_id, call_id=call_id,
+                      user_id=user["user_id"])
+    bh.bind_reservation(request_id, session_id, "user", user["user_id"])
+    result = _authorize(body, now=occurred)
+    assert result["estimated_nano_cny"] == expected
+    assert result["estimated_nano_cny"] >= 2_400_000_000
+
+
+@PG
 def test_authorize_unknown_model_estimated_null():
     """无价目（未知 model）→ estimated/would_deny NULL（未知不裁决）。"""
     bh.seed_price_books_with_history()

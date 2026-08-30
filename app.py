@@ -5472,6 +5472,11 @@ def admin_v1_overview():
                     stats["ingestion_lag_seconds_max"],
                 "ingestion_lag_seconds_avg":
                     stats["ingestion_lag_seconds_avg"],
+                # §7.2 批次 A 只读口径：cutover 前旧错误价格影子数据
+                # 区分展示（legacy_pricing_note 固定说明，不参与硬额度）
+                "pricing_cutover_epoch": stats["pricing_cutover_epoch"],
+                "legacy_priced_events": stats["legacy_priced_events"],
+                "legacy_pricing_note": stats["legacy_pricing_note"],
                 "provider_balance_snapshot": snapshot,
                 "provider_balance_age_seconds": age,
             })

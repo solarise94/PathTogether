@@ -199,7 +199,9 @@ DeepSeek context cache 默认启用、best effort。计费必须使用 provider 
 1 CNY = 1,000,000,000 nano_cny
 ```
 
-原因：最低价 0.05 CNY/百万 token 等于每 token 50 nano-CNY；使用“分”、浮点数或整数微元会丢失单次调用精度。
+原因：最低价 0.05 CNY/百万 token 等于每 token 50 nano-CNY（0.05×1e9÷1e6）；使用“分”、浮点数或整数微元会丢失单次调用精度。
+
+**价格列换算（批次 A 0022 修正）**：`*_rate_nano_per_million` 的单位是「nano-CNY / 百万 tokens」，正确换算是 `rate = CNY 面值 × 1,000,000,000`（0.05 CNY → 50,000,000；27.0 CNY → 27,000,000,000）。“每 token 50 nano”是**另一个量**（单价÷1e6），不得写入价格列。0018 种子曾误按 `CNY×1000` 写入（0.05 → 50），计价时又除以 1e6，少算 1,000,000 倍；`migrations/0022_billing_price_unit_fix.sql` 以 corrected v2 价格书修复（旧书收口保留为 legacy 区间，历史事件金额不改写，详见 docs/ai-money-budget-bugfix-and-simplification-plan.md §7.1/§7.2）。
 
 单次费用：
 
@@ -233,7 +235,8 @@ ceil(tokens * rate / 1,000,000)
 
 1. `migrations/0018_billing.sql`：价格、用量、账户、账本、余额快照；
 2. `migrations/0019_acquisition.sql`：campaign、访问触点、用户归因、邀请来源字段；
-3. `migrations/0020_billing_holds.sql`：只在硬额度阶段加入 model-call hold；不得提前开启执行路径。
+3. `migrations/0020_billing_holds.sql`：只在硬额度阶段加入 model-call hold；不得提前开启执行路径；
+4. `migrations/0022_billing_price_unit_fix.sql`（批次 A）：0018 种子价格单位少算 1e6 倍的 corrected v2 修复（legacy 书收口 + cutover 标志 + 旧影子数据隔离口径）。
 
 0018/0019 必须幂等，并由现有 migration runner 记录。billing/acquisition 能力只在 `STORAGE_BACKEND=postgres` 开放；json/dual 返回稳定 `pg_backend_required`，不得降级到进程内余额。
 

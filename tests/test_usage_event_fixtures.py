@@ -9,8 +9,9 @@ keyword 子集的最小 draft 2020-12 校验器；schema/夹具不变更时它�
      一组刻意构造的非法 body 必须被拒绝（防止校验器空转）；
   b) token 算术：非 null 时 total = hit + miss + output 且 reasoning <= output
      （镜像 ai_usage_events 的数据库 CHECK，见方案 §6.4）；
-  c) DeepSeek 价格快照换算：全部 CNY×1000 精确等于 nano 值（Decimal，禁止 float
-     中转），并与方案 §4 价格表逐项核对，另抽查三档 nano 值；
+  c) DeepSeek 价格快照换算：全部 CNY×1e9 精确等于 nano 值（Decimal，禁止 float
+     中转；rate 列单位 = nano-CNY / 百万 tokens，批次 A 0022 修正了 0018 的
+     CNY×1000 误写），并与方案 §4 价格表逐项核对，另抽查三档 nano 值；
   d) time_band_cases 期望值与「北京时间工作日 09:00–12:00/14:00–18:00（左闭
      右开，周末 off_peak）」规则一致——用 zoneinfo 实现最小判定函数交叉验证。
      该函数仅用于夹具校验，不是生产 pricing 代码；
@@ -355,24 +356,34 @@ def test_price_snapshot_matches_plan_doc_table():
 
 def test_price_snapshot_nano_conversion_exact():
     snap = _load_price_snapshot()
+    # 换算公式（§P0-1 批次 A）：rate 列单位是 nano-CNY / 百万 tokens，
+    # nano_per_million = CNY × 1e9（1 CNY = 1e9 nano）。独立十进制推导，
+    # 不从迁移/夹具复制常量自证。
+    one_cny_nano = Decimal(1_000_000_000)
     for model, bands in snap["models"].items():
         for band, rates in bands.items():
             for cny_key, nano_key in zip(_CNY_KEYS, _NANO_KEYS):
                 cny, nano = rates[cny_key], rates[nano_key]
                 assert isinstance(nano, int), "%s/%s/%s 必须是整数" % (model, band, nano_key)
-                # 换算公式：nano_per_million = CNY × 1e9 / 1e6 = CNY × 1000
-                assert cny * Decimal(1000) == Decimal(nano), (
-                    "%s/%s/%s 换算错误：%s×1000 != %s" % (model, band, nano_key, cny, nano)
+                assert cny * one_cny_nano == Decimal(nano), (
+                    "%s/%s/%s 换算错误：%s×1e9 != %s" % (model, band, nano_key, cny, nano)
+                )
+                # 量级护栏：禁止退回 0018 的 CNY×1000（每 token nano）误写
+                assert nano >= 50_000_000, (
+                    "%s/%s/%s 疑似 legacy 错误量级（CNY×1000）" % (model, band, nano_key)
                 )
 
 
 def test_price_snapshot_spot_checks():
     snap = _load_price_snapshot()
     models = snap["models"]
-    # 三档抽查（README/§5 的最低价示例 + 最高价档 + 常规 miss 档）
-    assert models["deepseek-v4-flash"]["off_peak"]["cache_hit_nano_per_million"] == 50
-    assert models["deepseek-v4-pro"]["peak"]["output_nano_per_million"] == 27000
-    assert models["deepseek-v4-flash-vision-exp"]["peak"]["cache_miss_nano_per_million"] == 3000
+    # 三档抽查（§P0-1 表 + 最高价档 + 常规 miss 档；独立手算值）
+    # 0.05 CNY → 0.05×1e9 = 50,000,000 nano/百万 tokens
+    assert models["deepseek-v4-flash"]["off_peak"]["cache_hit_nano_per_million"] == 50_000_000
+    # 27.0 CNY → 27,000,000,000
+    assert models["deepseek-v4-pro"]["peak"]["output_nano_per_million"] == 27_000_000_000
+    # 3.0 CNY → 3,000,000,000
+    assert models["deepseek-v4-flash-vision-exp"]["peak"]["cache_miss_nano_per_million"] == 3_000_000_000
 
 
 # --------------------------------------------------------------------------- #

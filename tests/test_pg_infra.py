@@ -120,6 +120,9 @@ def test_schema_migrations_recorded(conn):
     # hold，影子/advisory 形态，docs 同上 §12.3/§19 v0.5）。
     # review-2026-08-29 G7 追加 0021_upload_tasks_v1_artifacts.sql（V1 旧
     # 单请求上传接入 upload_tasks 收口状态机的 artifact manifest 列）。
+    # 批次 A（价格单位修复）追加 0022_billing_price_unit_fix.sql（0018
+    # 种子价格少算 1e6 倍的 corrected v2 书 + legacy 收口 + cutover 标志，
+    # docs ai-money-budget-bugfix-and-simplification-plan.md §7.1）。
     assert rows == [
         "0001_init.sql", "0002_roi_payload.sql", "0003_comments.sql",
         "0004_audit.sql", "0005_plugin.sql", "0006_demo_budget_auth.sql",
@@ -138,6 +141,7 @@ def test_schema_migrations_recorded(conn):
         "0019_acquisition.sql",
         "0020_billing_holds.sql",
         "0021_upload_tasks_v1_artifacts.sql",
+        "0022_billing_price_unit_fix.sql",
     ]
 
 

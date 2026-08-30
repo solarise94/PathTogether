@@ -143,6 +143,10 @@ def _endpoints(owner_id):
         "/api/admin/v1/billing/provider-balance/refresh",
         "/api/admin/v1/audit",
         "/api/admin/v1/turn-budgets",
+        # 批次 B：金额 policy/window 只读出口（owner-only + PG-only）
+        "/api/admin/v1/spend/policies",
+        "/api/admin/v1/spend/windows/current",
+        "/api/admin/v1/spend/reconcile",
     ]
 
 
@@ -192,7 +196,10 @@ def test_json_billing_endpoints_pg_backend_required():
                  "/api/admin/v1/billing/provider-balance",
                  "/api/admin/v1/billing/provider-balance/refresh",
                  "/api/admin/v1/billing/accounts/" + owner["user_id"],
-                 "/api/admin/v1/turn-budgets"):
+                 "/api/admin/v1/turn-budgets",
+                 "/api/admin/v1/spend/policies",
+                 "/api/admin/v1/spend/windows/current",
+                 "/api/admin/v1/spend/reconcile"):
         r = c.get(path) if "refresh" not in path else c.post(path)
         assert r.status_code == 503, "%s -> %s" % (path, r.status_code)
         assert r.get_json()["error"]["code"] == "pg_backend_required"
@@ -775,3 +782,109 @@ def test_provider_balance_refresh_not_configured(monkeypatch):
     r = c.post("/api/admin/v1/billing/provider-balance/refresh")
     assert r.status_code == 400
     assert r.get_json()["error"]["code"] == "provider_not_configured"
+
+
+# --------------------------------------------------------------------------- #
+# 批次 B：金额 policy/window 只读出口（/api/admin/v1/spend/*）
+# --------------------------------------------------------------------------- #
+@PG
+def test_spend_endpoints_readonly_owner_only():
+    """PG：三端点 200；金额十进制字符串；窗口含 demo 周池 + 每用户月窗口；
+    普通用户 403（批次 B 不做写 API——POST 不存在路由，Flask 405）。"""
+    bh.seed_spend_policies()
+    owner, usera = _setup_users()
+    c = _login(_client(), owner)
+
+    r = c.get("/api/admin/v1/spend/policies")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["enforcement_mode"] == "shadow"
+    assert body["backend"] == "postgres"
+    by_id = {p["policy_id"]: p for p in body["items"]}
+    assert set(by_id) >= {"spp_demo_global", "spp_user_default", "spp_owner"}
+    # nano 金额一律十进制字符串（§5 v0.3；独立 CNY→nano 换算断言：
+    # 50 CNY = 50×1e9 = 50000000000，不从迁移常量自证）
+    assert isinstance(by_id["spp_demo_global"]["limit_nano_cny"], str)
+    assert by_id["spp_demo_global"]["limit_nano_cny"] == "50000000000"
+    assert isinstance(by_id["spp_user_default"]["limit_nano_cny"], str)
+    assert by_id["spp_user_default"]["limit_nano_cny"] == "20000000000"
+    assert by_id["spp_owner"]["limit_nano_cny"] == "1000000000000"
+    # 当前生效解析
+    assert body["resolved"]["demo_global"]["policy_id"] == "spp_demo_global"
+    assert body["resolved"]["user_default"]["policy_id"] == "spp_user_default"
+    assert body["resolved"]["owner"]["policy_id"] == "spp_owner"
+
+    r = c.get("/api/admin/v1/spend/windows/current")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["enforcement_mode"] == "shadow"
+    demo = body["demo"]
+    assert demo["subject_type"] == "demo" and demo["subject_id"] == "demo_global"
+    assert demo["limit_nano_snapshot"] == "50000000000"
+    assert demo["policy_id"] == "spp_demo_global"
+    assert demo["spent_nano_cny"] == "0" and demo["reserved_nano_cny"] == "0"
+    assert demo["remaining_nano"] == "50000000000"
+    assert demo["window_start"] < demo["window_end"]
+    assert demo["status"] == "open"
+    subjects = {(u["subject_type"], u["subject_id"]) for u in body["users"]}
+    assert ("user", usera["user_id"]) in subjects
+    assert ("owner", owner["user_id"]) in subjects
+    user_row = next(u for u in body["users"]
+                    if u["subject_id"] == usera["user_id"])
+    assert user_row["policy_id"] == "spp_user_default"
+    assert user_row["limit_nano_snapshot"] == "20000000000"
+    owner_row = next(u for u in body["users"]
+                     if u["subject_id"] == owner["user_id"])
+    assert owner_row["policy_id"] == "spp_owner"
+    assert owner_row["limit_nano_snapshot"] == "1000000000000"
+    # 敏感字段红线扫描
+    assert scan_sensitive(body) == []
+
+    r = c.get("/api/admin/v1/spend/reconcile")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["checked"] >= 3  # demo 周池 + owner/用户月窗口
+    assert body["drift_windows"] == 0
+    item = body["items"][0]
+    for key in ("expected_spent_nano", "actual_spent_nano", "spent_drift_nano",
+                "expected_reserved_nano", "actual_reserved_nano",
+                "reserved_drift_nano", "limit_nano_snapshot"):
+        assert isinstance(item[key], str), key
+    assert scan_sensitive(body) == []
+
+    # 普通用户 403（owner 门控不因后端可用而放宽）
+    rc = _login(_client(), usera)
+    for path in ("/api/admin/v1/spend/policies",
+                 "/api/admin/v1/spend/windows/current",
+                 "/api/admin/v1/spend/reconcile"):
+        assert rc.get(path).status_code == 403
+    # 批次 B 无写 API：POST 未注册路由 → 405
+    assert c.post("/api/admin/v1/spend/policies").status_code == 405
+
+
+@PG
+def test_spend_windows_current_reports_policy_missing_per_subject():
+    """user_default 被禁用时：单主体降级为稳定 error 项，整页仍 200（管理页
+    需要看到「谁没有有效策略」，而不是整页失败）。"""
+    bh.seed_spend_policies()
+    owner, usera = _setup_users()
+    _bh_connect = bh.connect()
+    try:
+        with _bh_connect.cursor() as cur:
+            cur.execute("UPDATE ai_spend_policies SET enabled=false "
+                        "WHERE policy_id='spp_user_default'")
+        _bh_connect.commit()
+    finally:
+        _bh_connect.close()
+    c = _login(_client(), owner)
+    r = c.get("/api/admin/v1/spend/windows/current")
+    assert r.status_code == 200
+    body = r.get_json()
+    user_row = next(u for u in body["users"]
+                    if u["subject_id"] == usera["user_id"])
+    assert user_row["error"] == "spend_policy_missing"
+    # demo/owner 策略未动，照常给窗口
+    assert body["demo"]["policy_id"] == "spp_demo_global"
+    assert next(u for u in body["users"]
+                if u["subject_id"] == owner["user_id"])["policy_id"] == \
+        "spp_owner"

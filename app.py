@@ -85,6 +85,13 @@ import acquisition_store
 # Decimal 精确换算），Admin API v1 的 provider balance refresh 复用。
 import billing_store
 import billing_pricing
+# 批次 B 金额额度 policy/window 数据层（docs
+# ai-money-budget-bugfix-and-simplification-plan.md §3.1/§3.2/§8）：spend_store
+# 提供周/月窗口边界、策略解析（override→default 回退）、get_or_create 窗口与
+# FOR UPDATE 原子 reserve/release/settle 投影（PG-only，json/dual 稳定
+# pg_backend_required）。本批仍为 shadow：不接入 run/hold/usage 请求路径
+# （接进 billing_holds 链路是批次 C），admin 只读出口见 /api/admin/v1/spend/*。
+import spend_store
 # P0-A 资源防护（docs/open-registration-security-remediation §3.3/§3.4/§3.5）：
 # upload_guard：单请求计数流 + 磁盘保留水位 + PG 权威用户配额/reservation/
 #   在途与每小时限流（json/dual fail-closed，本地免登录 owner 语义不变）；
@@ -5242,6 +5249,15 @@ _ADMIN_V1_NANO_OUT_KEYS = frozenset((
     "soft_spend_cap_nano", "hard_spend_cap_nano", "total_balance_nano",
     "granted_balance_nano", "topped_up_balance_nano",
     "soft_cap_nano", "hard_cap_nano", "balance_after_nano",
+    # 批次 B（§3.1/§3.2）：金额策略与周/月窗口的 nano 字段（额度面值、
+    # 窗口 snapshot/spent/reserved/remaining、对账器 drift 口径、调整审计
+    # 里的前后额度镜像）——同样必须十进制字符串出线，防 >2^53 失真
+    "limit_nano_cny", "limit_nano_snapshot", "spent_nano_cny",
+    "reserved_nano_cny", "remaining_nano", "overage_nano",
+    "expected_spent_nano", "actual_spent_nano", "spent_drift_nano",
+    "expected_reserved_nano", "actual_reserved_nano", "reserved_drift_nano",
+    "previous_limit_nano_snapshot", "new_limit_nano_snapshot",
+    "estimated_nano", "actual_nano",
 ))
 
 
@@ -6418,6 +6434,125 @@ def admin_v1_billing_adjustments():
                    duplicate=result["duplicate"],
                    balance_nano=_admin_v1_nano_str(result["balance_nano"]),
                    account=_admin_v1_nano_out(result["account"]))
+
+
+# --------------------------------------------------------------------------- #
+# 批次 B：金额 policy/window 只读出口（docs
+# ai-money-budget-bugfix-and-simplification-plan.md §8 批次 B / §6.1-§6.2）
+#
+# 本批**只读**：不做写 API（策略修改/调整当前窗口/用户覆盖是批次 D 的
+# AdminBridge + UI）；不接 enforcement（spend_enforcement_mode 恒 shadow）。
+# 三端点与 billing 系同口径：owner-only（_require_owner_admin_v1 含预览态
+# 拒绝）、json/dual 稳定 503 pg_backend_required、金额十进制字符串出线。
+# --------------------------------------------------------------------------- #
+def _admin_v1_spend_window_summary(window):
+    """窗口行 → admin v1 摘要（limit/spent/reserved/remaining/边界/版本）。"""
+    out = _admin_v1_nano_out(dict(window))
+    out["remaining_nano"] = _admin_v1_nano_str(
+        spend_store.window_remaining_nano(window))
+    return out
+
+
+def _admin_v1_spend_window_subject(subject_type, subject_id):
+    """单主体当前窗口（get_or_create；策略解析失败降级为 error 项不拖垮整页）。"""
+    try:
+        return _admin_v1_spend_window_summary(
+            spend_store.get_or_create_window(subject_type, subject_id))
+    except spend_store.SpendError as exc:
+        # 单主体策略缺失（如 user_default 被禁用）：带稳定 code 报告，
+        # 其余主体照常展示——管理页需要看到「谁没有有效策略」
+        return {"subject_type": subject_type, "subject_id": subject_id,
+                "error": exc.code}
+
+
+@app.route("/api/admin/v1/spend/policies", methods=["GET"])
+def admin_v1_spend_policies():
+    """金额策略列表 + 三类全局 scope 当前生效解析（批次 B 只读）。
+
+    resolved 为 demo_global / user_default / owner 三个 scope 当前时刻的
+    有效策略（或 None）；enforcement_mode 本批恒 shadow（0023 种子）。
+    金额字段（limit_nano_cny 等）十进制字符串化（§5 v0.3 修订）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.billing_features_available():
+        return _admin_v1_pg_required()
+    try:
+        result = spend_store.admin_list_policies()
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 spend policies 读取失败")
+        return _admin_v1_error(500, "internal", "金额策略读取失败")
+    return jsonify(items=_admin_v1_nano_out(result["items"]),
+                   resolved=_admin_v1_nano_out(result["resolved"]),
+                   enforcement_mode=result["enforcement_mode"],
+                   backend=platform_features.current_backend())
+
+
+@app.route("/api/admin/v1/spend/windows/current", methods=["GET"])
+def admin_v1_spend_windows_current():
+    """当前窗口一览（批次 B 只读）：demo_global 周窗口 + 每用户月窗口。
+
+    每行含 limit/spent/reserved/remaining（nano 十进制字符串）、窗口边界
+    （epoch 秒，服务端按 Asia/Shanghai 生成）、policy_id/policy_version 与
+    窗口 version；owner 用户走独立 owner 策略（不与用户/Demo 共池）。
+    窗口按需 get_or_create（幂等，UNIQUE 兜底并发）；策略解析失败的主体
+    返回稳定 error code 而非整页失败。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.billing_features_available():
+        return _admin_v1_pg_required()
+    try:
+        demo = _admin_v1_spend_window_subject(
+            "demo", spend_store.DEMO_GLOBAL_SUBJECT)
+        users = []
+        for user in user_store.list_users():
+            uid = user.get("user_id")
+            if not uid:
+                continue
+            subject_type = ("owner" if user.get("role") == "owner"
+                            else "user")
+            users.append(_admin_v1_spend_window_subject(subject_type, uid))
+        mode = spend_store.enforcement_mode()
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 spend windows 读取失败")
+        return _admin_v1_error(500, "internal", "当前窗口读取失败")
+    return jsonify(demo=demo, users=users, enforcement_mode=mode,
+                   backend=platform_features.current_backend())
+
+
+@app.route("/api/admin/v1/spend/reconcile", methods=["GET"])
+def admin_v1_spend_reconcile():
+    """窗口对账（批次 B 只读）：usage events / open holds 重算 vs 投影 drift。
+
+    expected spent 只接纳 priced 且 occurred_at >= max(窗口起点,
+    pricing_v2_cutover_at) 的用量（旧错误价格影子数据不进窗口，§7.2）；
+    expected reserved 按 open 未过期 holds 的 estimated 合计。只报告不修数。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.billing_features_available():
+        return _admin_v1_pg_required()
+    try:
+        result = spend_store.reconcile_spend_windows()
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 spend reconcile 失败")
+        return _admin_v1_error(500, "internal", "窗口对账失败")
+    return jsonify(checked=result["checked"],
+                   drift_windows=result["drift_windows"],
+                   items=_admin_v1_nano_out(result["items"]),
+                   pricing_cutover_epoch=result["pricing_cutover_epoch"],
+                   enforcement_mode=result["enforcement_mode"],
+                   backend=platform_features.current_backend())
 
 
 # --------------------------------------------------------------------------- #

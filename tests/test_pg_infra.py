@@ -123,6 +123,10 @@ def test_schema_migrations_recorded(conn):
     # 批次 A（价格单位修复）追加 0022_billing_price_unit_fix.sql（0018
     # 种子价格少算 1e6 倍的 corrected v2 书 + legacy 收口 + cutover 标志，
     # docs ai-money-budget-bugfix-and-simplification-plan.md §7.1）。
+    # 批次 B（金额 policy/window 数据层）追加
+    # 0023_spend_policies_windows.sql（ai_spend_policies / ai_spend_windows
+    # 两表 + 三条默认策略种子 + spend_enforcement_mode=shadow 开关，
+    # docs 同上 §3.1/§3.2/§8）。
     assert rows == [
         "0001_init.sql", "0002_roi_payload.sql", "0003_comments.sql",
         "0004_audit.sql", "0005_plugin.sql", "0006_demo_budget_auth.sql",
@@ -142,6 +146,7 @@ def test_schema_migrations_recorded(conn):
         "0020_billing_holds.sql",
         "0021_upload_tasks_v1_artifacts.sql",
         "0022_billing_price_unit_fix.sql",
+        "0023_spend_policies_windows.sql",
     ]
 
 

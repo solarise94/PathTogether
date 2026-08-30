@@ -93,6 +93,12 @@ if _RUN_PG:
         # 0020 起：billing holds（admin-billing §12.3，PR7 影子预授权）。
         # account_id 引用 billing_accounts，CASCADE 已覆盖，显式列出防残留
         "billing_holds",
+        # 0023 起：金额 policy/window（批次 B shadow 数据层）。0023 的迁移
+        # 种子（三条默认策略 + spend_enforcement_mode）会随 TRUNCATE 清掉
+        # ——需要种子的用例用 _billing_helpers.seed_spend_policies() 幂等
+        # 重放 migrations/0023_spend_policies_windows.sql（迁移文件是种子
+        # 的唯一权威来源，与 seed_price_books 同约定）
+        "ai_spend_windows", "ai_spend_policies",
         # 0019 起：来源归因（admin-billing §11）。user_acquisition 引用
         # users/registration_invites/acquisition_visits，acquisition_visits 引用
         # acquisition_campaigns——显式列出保证跨用例无残留

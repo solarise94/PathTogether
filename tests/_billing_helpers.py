@@ -24,6 +24,11 @@ USAGE_DIR = REPO_ROOT / "tests" / "fixtures" / "usage_events"
 BILLING_DIR = REPO_ROOT / "tests" / "fixtures" / "billing"
 _MIGRATION_0018 = REPO_ROOT / "migrations" / "0018_billing.sql"
 _MIGRATION_0022 = REPO_ROOT / "migrations" / "0022_billing_price_unit_fix.sql"
+_MIGRATION_0023 = REPO_ROOT / "migrations" / "0023_spend_policies_windows.sql"
+
+#: 0023 种子策略（占位默认额度：demo 周池 50 CNY / 用户默认月 20 CNY /
+#: owner 月 1000 CNY；面值是 owner 待决策的占位默认，后台可改）
+SEED_POLICY_IDS = ("spp_demo_global", "spp_user_default", "spp_owner")
 
 #: 0018 种子书（错误 legacy 换算 CNY×1000；批次 A 起在 cutover 收口保留）
 LEGACY_BOOK_IDS = (
@@ -92,6 +97,21 @@ def seed_legacy_price_books_only(conn=None):
         conn = connect()
     try:
         _replay(conn, _MIGRATION_0018)
+    finally:
+        if own:
+            conn.close()
+
+
+def seed_spend_policies(conn=None):
+    """幂等重放 0023：重建三条默认策略 + spend_enforcement_mode=shadow。
+
+    conftest 每用例 TRUNCATE 会清掉迁移期种子；需要策略解析/窗口的用例显式
+    调用本函数（迁移文件是种子与 shadow 开关的唯一权威来源）。"""
+    own = conn is None
+    if own:
+        conn = connect()
+    try:
+        _replay(conn, _MIGRATION_0023)
     finally:
         if own:
             conn.close()

@@ -154,18 +154,33 @@ describe("pathtogether-admin plugin UI bootstrap (PR5)", () => {
 		expect(typeof client!.request).toBe("function");
 		expect(typeof client!.showPage).toBe("function");
 		expect(typeof client!.handshakeState).toBe("function");
-		// 未握手：请求应拒绝（not_ready），showPage 切页不抛错（含 plugins）
+		// 未握手：请求应拒绝（not_ready），showPage 切页不抛错（含 plugins/settings）
 		expect(() => client!.showPage("plugins")).not.toThrow();
 		expect(() => client!.showPage("overview")).not.toThrow();
+		expect(() => client!.showPage("settings")).not.toThrow();
 	});
 
 	it("initial page whitelist includes the PR5 plugins page; unknown falls back", () => {
-		// plugins 在白名单内：hash 透传后不再回退概览（宿主深链 #plugins）
+		// plugins 在白名单内：hash 透传后不再回概览（宿主深链 #plugins）
 		const a = loadPluginUi("#plugins");
 		expect(a.client).toBeTruthy();
 		// 未知 slug：装配仍成功并回 overview（白名单校验在模块内部完成）
 		const b = loadPluginUi("#no-such-page");
 		expect(b.client).toBeTruthy();
+	});
+
+	it("批次 D：设置页在白名单内（#settings 深链；设置页元素在装配期被绑定）", () => {
+		// settings 在白名单内（宿主深链 /admin#settings）
+		const a = loadPluginUi("#settings");
+		expect(a.client).toBeTruthy();
+		// 设置页 section 装配期注册；bindNav 对设置页按钮/主体选择器做了
+		// 可选探测绑定（缺省 DOM 下不抛错即装配完成）
+		expect(a.els["adm-page-settings"]).toBeTruthy();
+		expect(a.els["adm-regmode-save-btn"]).toBeTruthy();
+		expect(a.els["adm-spend-save-btn"]).toBeTruthy();
+		expect(a.els["adm-rt-save-btn"]).toBeTruthy();
+		expect(a.els["adm-window-adjust-btn"]).toBeTruthy();
+		expect(a.els["adm-window-subject"]).toBeTruthy();
 	});
 });
 

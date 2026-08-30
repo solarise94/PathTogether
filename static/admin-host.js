@@ -88,6 +88,15 @@
     "admin.plugins.list": "admin:plugins:read",
     "admin.plugins.setEnabled": "admin:plugins:write",
     "admin.plugins.rotateSecret": "admin:plugins:write",
+    // 批次 D（docs ai-money-budget-bugfix-and-simplification-plan.md §6.5）：
+    // 统一设置页。settings.get 聚合只读（注册模式 + 金额策略/窗口边界 +
+    // 运行时安全参数）；settings.update / currentWindow.adjust 归
+    // admin:settings:write；用户月额度覆盖归 admin:users:write（与既有
+    // users 写方法同权限域）。服务端对每个端点独立 owner/CSRF 复核。
+    "admin.settings.get": "admin:settings:read",
+    "admin.settings.update": "admin:settings:write",
+    "admin.spend.currentWindow.adjust": "admin:settings:write",
+    "admin.users.setSpendOverride": "admin:users:write",
   };
 
   // 参数 schema（§14.1：每方法白名单 + 类型/长度/枚举/范围；未声明属性
@@ -160,6 +169,12 @@
         login_id: { type: "string", minLength: 1, maxLength: 120 },
         password: { type: "string", minLength: 1, maxLength: 200 },
         display_name: { type: "string", maxLength: 120, nullable: true },
+        // 批次 D §5.1：可选月额度覆盖（十进制字符串 nano；null/缺省=继承默认；
+        // 建号+覆盖+audit 服务端同一事务）
+        monthly_limit_nano_cny: {
+          type: "string", pattern: "^[0-9]{1,19}$", nullable: true,
+        },
+        ai_access: { type: "boolean" },
       },
       required: ["login_id", "password"],
       additionalProperties: false,
@@ -195,6 +210,10 @@
         note: { type: "string", maxLength: 200, nullable: true },
         source_code: _slugSpec,
         campaign_id: _slugSpec,
+        // 批次 D §5.2：可选月额度模板（兑换事务内为新用户建 override）
+        monthly_limit_nano_cny: {
+          type: "string", pattern: "^[0-9]{1,19}$", nullable: true,
+        },
       },
       additionalProperties: false,
     },
@@ -295,6 +314,58 @@
         installation_id: { type: "string", minLength: 1, maxLength: 128 },
       },
       required: ["installation_id"],
+      additionalProperties: false,
+    },
+
+    // ---- 批次 D（§6.1/§6.5）：统一设置页 ----
+    // 金额 wire 全部十进制字符串（^-?[0-9]{1,19}$，§5 v0.3；JSON number 在
+    // 桥层即拒）；策略额度更新必须带 CAS 上下文（policy_id + version——插件
+    // 从 settings.get 读到的值；服务端未命中 409 version_conflict）。
+    "admin.settings.get": { properties: {}, additionalProperties: false },
+    "admin.settings.update": {
+      properties: {
+        registration_mode: {
+          type: "string", enum: ["closed", "invite_only"],
+        },
+        demo_enabled: { type: "boolean" },
+        demo_weekly_limit: { type: "object" },
+        user_default_monthly_limit: { type: "object" },
+        owner_monthly_limit: { type: "object" },
+        spend_enforcement_mode: {
+          type: "string", enum: ["shadow", "registered", "all"],
+        },
+        expected_enforcement_mode: {
+          type: "string", enum: ["shadow", "registered", "all"],
+          nullable: true,
+        },
+        platform_task_max_steps: _budgetIntSpec(1),
+        demo_task_max_steps: _budgetIntSpec(1),
+        own_task_max_steps_limit: _budgetIntSpec(1),
+        demo_max_concurrency: _budgetIntSpec(1),
+      },
+      additionalProperties: false,
+    },
+    // confirm 由桥层固定置 true（二次确认在插件 UI 页内确认条完成，§3.3）
+    "admin.spend.currentWindow.adjust": {
+      properties: {
+        window_id: { type: "string", minLength: 1, maxLength: 128 },
+        limit_nano_snapshot: {
+          type: "string", pattern: "^[0-9]{1,19}$",
+        },
+        version: { type: "integer", min: 1 },
+      },
+      required: ["window_id", "limit_nano_snapshot", "version"],
+      additionalProperties: false,
+    },
+    // null = 清除覆盖（DELETE，下个窗口起回退全局默认）；十进制字符串设置
+    "admin.users.setSpendOverride": {
+      properties: {
+        user_id: _userIdSpec,
+        monthly_limit_nano_cny: {
+          type: "string", pattern: "^[0-9]{1,19}$", nullable: true,
+        },
+      },
+      required: ["user_id", "monthly_limit_nano_cny"],
       additionalProperties: false,
     },
   };
@@ -684,6 +755,9 @@
         login_id: payload.login_id,
         password: payload.password,
         display_name: payload.display_name,
+        // 批次 D §5.1：可选月额度覆盖 + ai_access（缺省沿用服务端默认）
+        monthly_limit_nano_cny: payload.monthly_limit_nano_cny,
+        ai_access: payload.ai_access,
       })(ctx);
     },
 
@@ -724,6 +798,8 @@
         note: payload.note,
         source_code: payload.source_code,
         campaign_id: payload.campaign_id,
+        // 批次 D §5.2：可选月额度模板（十进制字符串 | null=继承默认）
+        monthly_limit_nano_cny: payload.monthly_limit_nano_cny,
       })(ctx);
     },
 
@@ -785,6 +861,127 @@
       var url = "/api/admin/plugins/" +
           pathId(payload.installation_id, "installation_id") + "/rotate-secret";
       return jsonWrite(url, "POST", {})(ctx);
+    },
+
+    // ---- 批次 D（§6.1/§6.5）：统一设置页 → Admin API v1 ----
+    "admin.settings.get": jsonGet("/api/admin/v1/settings"),
+
+    // settings.update 的部分失败语义（§6.5「选可实现并在注释说明」的取舍）：
+    // **逐项顺序提交、失败即停、不回滚已成功项**。理由：各项本就落各自权威
+    // store（registration → platform_settings、金额策略 → ai_spend_policies、
+    // enforcement → platform_settings、运行时参数 → ai_budget_periods），
+    // 各自独立事务 + 独立 audit，不存在跨 store 的整批事务原语；伪造一个
+    // 「整批」语义需要新的服务端聚合端点且会拉长锁窗口。桥层按固定顺序
+    // （注册模式 → 三条金额策略 → enforcement 模式 → 运行时参数）提交，
+    // 首个失败即返回 {applied:[...], failed:{step,code,message}}——插件 UI
+    // 据此提示「部分已保存」，用户可刷新后重试剩余项（每项自身原子）。
+    "admin.settings.update": function (ctx, payload) {
+      var applied = [];
+      var steps = [];
+      if (payload.registration_mode !== undefined && payload.registration_mode !== null) {
+        steps.push(["registration_mode", function () {
+          return jsonWrite("/api/admin/v1/settings/registration", "PUT", {
+            mode: payload.registration_mode,
+          })(ctx);
+        }]);
+      }
+      var policyFields = [
+        ["demo_weekly_limit", "demo_weekly_limit"],
+        ["user_default_monthly_limit", "user_default_monthly_limit"],
+        ["owner_monthly_limit", "owner_monthly_limit"],
+      ];
+      policyFields.forEach(function (pair) {
+        var update = payload[pair[0]];
+        if (update === undefined || update === null) return;
+        steps.push([pair[1], function () {
+          return jsonWrite(
+            "/api/admin/v1/spend/policies/" +
+              pathId(update.policy_id, pair[1] + ".policy_id"),
+            "PUT", {
+              limit_nano_cny: update.limit_nano_cny,
+              version: update.version,
+            })(ctx);
+        }]);
+      });
+      if (payload.spend_enforcement_mode !== undefined &&
+          payload.spend_enforcement_mode !== null) {
+        steps.push(["spend_enforcement_mode", function () {
+          return jsonWrite("/api/admin/v1/spend/enforcement-mode", "PUT", {
+            mode: payload.spend_enforcement_mode,
+            expected: payload.expected_enforcement_mode || null,
+          })(ctx);
+        }]);
+      }
+      var runtime = {};
+      ["platform_task_max_steps", "demo_task_max_steps",
+       "own_task_max_steps_limit", "demo_max_concurrency"].forEach(
+        function (k) {
+          if (payload[k] !== undefined && payload[k] !== null) {
+            runtime[k] = payload[k];
+          }
+        });
+      if (payload.demo_enabled !== undefined && payload.demo_enabled !== null) {
+        runtime.demo_enabled = !!payload.demo_enabled;
+      }
+      if (Object.keys(runtime).length) {
+        steps.push(["runtime_limits", function () {
+          return jsonWrite("/api/admin/v1/turn-budgets", "PUT", runtime)(ctx);
+        }]);
+      }
+      if (!steps.length) {
+        return Promise.reject({
+          code: "invalid_params",
+          message: "settings.update 需要至少一项可更新字段",
+        });
+      }
+      var chain = Promise.resolve();
+      steps.forEach(function (step) {
+        chain = chain.then(function () {
+          return step[1]().then(function (result) {
+            applied.push({ step: step[0], result: result });
+          });
+        });
+      });
+      return chain.then(function () {
+        return { applied: applied, failed: null };
+      }, function (err) {
+        err = (err && err.code) ? err
+          : { code: "bridge_error", message: String(err) };
+        return { applied: applied, failed: { step: null, error: err } };
+      }).then(function (out) {
+        // 失败也要让插件看到步骤归属：chain 内无法直接拿到当前 step 名，
+        // 用 applied 长度推导（顺序提交，失败发生在 applied.length 处）
+        if (out.failed) {
+          out.failed.step = steps[applied.length]
+            ? steps[applied.length][0] : null;
+        }
+        return out;
+      });
+    },
+
+    // confirm 由桥层固定 true（页内确认条已在插件 UI 完成，服务端仍强制
+    // body confirm=true；窗口 version 从 settings/窗口读取处带来）
+    "admin.spend.currentWindow.adjust": function (ctx, payload) {
+      var url = "/api/admin/v1/spend/windows/" +
+          pathId(payload.window_id, "window_id") + "/adjust";
+      return jsonWrite(url, "POST", {
+        limit_nano_snapshot: payload.limit_nano_snapshot,
+        version: payload.version,
+        confirm: true,
+      })(ctx);
+    },
+
+    // null = 清除（DELETE，下个窗口回退全局默认）；字符串 = 设置/更新
+    "admin.users.setSpendOverride": function (ctx, payload) {
+      var base = "/api/admin/v1/users/" +
+          pathId(payload.user_id, "user_id") + "/spend-override";
+      if (payload.monthly_limit_nano_cny === null ||
+          payload.monthly_limit_nano_cny === undefined) {
+        return jsonWrite(base, "DELETE", {})(ctx);
+      }
+      return jsonWrite(base, "PUT", {
+        monthly_limit_nano_cny: payload.monthly_limit_nano_cny,
+      })(ctx);
     },
   };
 

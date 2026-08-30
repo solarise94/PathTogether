@@ -4323,27 +4323,66 @@ def _invite_public_view(invite: dict) -> dict:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# 注册模式设置 service（批次 D §5.3：权威实现只此一份，旧路由与 Admin API v1
+# 共同调用，不复制校验逻辑）。
+# --------------------------------------------------------------------------- #
+def _registration_settings_payload() -> dict:
+    """注册模式 GET 权威 payload（存储值 × 前置条件闸 + 支持的模式词表）。"""
+    stored = _registration_mode_stored()
+    effective = _effective_registration_mode()
+    return {
+        "mode": effective,
+        "stored_mode": stored,
+        "supported_modes": ["closed", "invite_only"],
+        "precondition_failures": _registration_precondition_failures(),
+        "registration_open": effective == "invite_only",
+        "backend": platform_features.current_backend(),
+    }
+
+
+def _set_registration_mode_service(mode, actor_user_id):
+    """注册模式 PUT 权威实现（校验 + 写 settings_store + audit）。
+
+    返回 ``(payload, None)`` 或 ``(None, (status, code, message))``——错误以
+    三元组返回，由两个路由层（旧 /api/admin/settings/registration 与
+    Admin API v1 /api/admin/v1/settings/registration）各自映射错误信封格式；
+    校验/审计/前置条件语义在两入口完全一致（§5.3「不复制校验逻辑」）。
+    """
+    if mode == "public":
+        return None, (400, "public_registration_not_supported",
+                      "公开注册本阶段不支持（public_registration_not_"
+                      "supported）")
+    if mode not in ("closed", "invite_only"):
+        return None, (400, "invalid_request", "mode 需为 closed 或 invite_only")
+    if mode == "invite_only":
+        failures = _registration_precondition_failures()
+        if failures:
+            return None, (400, "registration_preconditions_failed",
+                          "注册前置条件不满足：" + "；".join(failures))
+    try:
+        settings_store.set_registration_mode(mode, updated_by=actor_user_id)
+    except platform_features.PgFeatureUnavailable as exc:
+        return None, (503, exc.code, str(exc))
+    except ValueError as exc:
+        return None, (400, "invalid_request", str(exc))
+    _audit("registration.mode_update", target_type="platform_settings",
+           target_id="registration_mode", detail={"mode": mode})
+    return {"mode": mode}, None
+
+
 @app.route("/api/admin/settings/registration", methods=["GET"])
 def api_admin_registration_settings_get():
-    """注册模式与前置条件状态（owner）。"""
+    """注册模式与前置条件状态（owner；兼容旧路由，逻辑见 service）。"""
     auth = _require_owner()
     if auth:
         return auth
-    stored = _registration_mode_stored()
-    effective = _effective_registration_mode()
-    return jsonify(
-        mode=effective,
-        stored_mode=stored,
-        supported_modes=["closed", "invite_only"],
-        precondition_failures=_registration_precondition_failures(),
-        registration_open=(effective == "invite_only"),
-        backend=platform_features.current_backend(),
-    )
+    return jsonify(**_registration_settings_payload())
 
 
 @app.route("/api/admin/settings/registration", methods=["PUT"])
 def api_admin_registration_settings_put():
-    """切换注册模式（owner）。body: {mode: closed|invite_only}。
+    """切换注册模式（owner；兼容旧路由，逻辑见 service）。
 
     - public 一律 400 public_registration_not_supported（本阶段无回退路径）；
     - 切 invite_only 前置条件不满足（非 HTTPS / 非 Secure Cookie / 非 PG）→
@@ -4353,29 +4392,12 @@ def api_admin_registration_settings_put():
     if auth:
         return auth
     body = request.get_json(silent=True) or {}
-    mode = body.get("mode")
-    if mode == "public":
-        return (jsonify(error="公开注册本阶段不支持（public_registration_not_"
-                              "supported）",
-                        code="public_registration_not_supported"),
-                400)
-    if mode not in ("closed", "invite_only"):
-        return jsonify(error="mode 需为 closed 或 invite_only"), 400
-    if mode == "invite_only":
-        failures = _registration_precondition_failures()
-        if failures:
-            return jsonify(error="注册前置条件不满足：" + "；".join(failures),
-                           code="registration_preconditions_failed"), 400
-    try:
-        settings_store.set_registration_mode(
-            mode, updated_by=current_identity().get("user_id"))
-    except platform_features.PgFeatureUnavailable as exc:
-        return _budget_error_response(exc, 503, code=exc.code)
-    except ValueError as exc:
-        return jsonify(error=str(exc)), 400
-    _audit("registration.mode_update", target_type="platform_settings",
-           target_id="registration_mode", detail={"mode": mode})
-    return jsonify(mode=mode)
+    payload, err = _set_registration_mode_service(
+        body.get("mode"), current_identity().get("user_id"))
+    if err:
+        status, code, message = err
+        return jsonify(error=message, code=code), status
+    return jsonify(**payload)
 
 
 @app.route("/api/admin/registration-invites", methods=["POST"])
@@ -5258,6 +5280,9 @@ _ADMIN_V1_NANO_OUT_KEYS = frozenset((
     "expected_reserved_nano", "actual_reserved_nano", "reserved_drift_nano",
     "previous_limit_nano_snapshot", "new_limit_nano_snapshot",
     "estimated_nano", "actual_nano",
+    # 批次 D（§5.1/§5.2）：用户月额度覆盖与邀请码月额度模板（nano-CNY，
+    # 库内 BIGINT → wire 十进制字符串）
+    "monthly_limit_nano_cny",
 ))
 
 
@@ -5569,11 +5594,21 @@ def admin_v1_users():
     # PR4 来源归因填充（campaign/source 留位）；PG 侧 best-effort（展示用途，
     # 与 reg_methods 同口径：失败按 None 展示，不 fail-closed 整页 500）
     acq_by_user = {}
+    # 批次 D（§6.2）：每用户当前月窗口 + 默认/覆盖状态（单事务批量解析）
+    spend_by_user = {}
     if platform_features.current_backend() == "postgres":
         try:
             acq_by_user = acquisition_store.user_acquisition_by_ids(user_ids)
         except Exception:
             app.logger.warning("admin v1 users 来源归因查询失败（按空展示）",
+                               exc_info=True)
+        try:
+            spend_by_user = spend_store.admin_users_spend_summaries([
+                ("owner" if u.get("role") == user_store.ROLE_OWNER
+                 else "user", str(u.get("user_id") or ""))
+                for u in page if u.get("user_id")])
+        except Exception:
+            app.logger.warning("admin v1 users 金额窗口查询失败（按空展示）",
                                exc_info=True)
     if billing_ok:
         try:
@@ -5592,6 +5627,16 @@ def admin_v1_users():
         uid = str(u.get("user_id") or "")
         turn = turn_by_user.get(uid)
         acq = acq_by_user.get(uid) or {}
+        spend = spend_by_user.get(uid)
+        if spend is not None:
+            win = spend.get("window")
+            spend = {
+                "policy_scope": spend.get("policy_scope"),
+                "policy_id": spend.get("policy_id"),
+                "error": spend.get("error"),
+                "window": _admin_v1_spend_window_summary(win)
+                if win is not None else None,
+            }
         items.append({
             "user_id": uid,
             "display_name": u.get("display_name"),
@@ -5612,6 +5657,8 @@ def admin_v1_users():
             # 十进制字符串化，§5 v0.3）
             "billing": _admin_v1_nano_out(accounts.get(uid))
             if billing_ok else None,
+            # 批次 D §6.2：当前月金额窗口 + 默认/覆盖状态（json 后端 null）
+            "spend": _admin_v1_nano_out(spend) if spend is not None else None,
             "last_ai_call_at": last_calls.get(uid) if billing_ok else None,
         })
     next_cursor = None
@@ -5953,6 +6000,14 @@ def admin_v1_users_create():
 
     校验/错误码镜像旧 POST /api/admin/users（login_id 唯一冲突 409；密码
     15..200）；audit 动作与旧端点一致（user.create）。
+
+    批次 D（§5.1）扩展可选字段：
+      - ``monthly_limit_nano_cny``：十进制字符串 nano-CNY | null（缺省）。
+        null/缺省 = 继承全局 user_default；非 null = 同一 PG 事务内为新用户
+        建 user_override 月额度策略（user 插入 + override + audit 任一失败
+        整体回滚，user_store_pg.create_user_with_spend_override）；
+      - ``ai_access``：bool（缺省 True，与 users.ai_access 列默认一致）。
+    两个新字段要求 PG（json/dual 稳定 503，不降级）。
     """
     auth = _require_owner_admin_v1()
     if auth:
@@ -5976,17 +6031,57 @@ def admin_v1_users_create():
             "密码长度须在 %d..%d 字符之间（当前 %d 字符）"
             % (user_store.PASSWORD_MIN_LENGTH, user_store.PASSWORD_MAX_LENGTH,
                len(password)))
+    ai_access = body.get("ai_access")
+    if ai_access is not None and not isinstance(ai_access, bool):
+        return _admin_v1_error(400, "invalid_request",
+                               "ai_access 需为布尔值")
+    # 金额 wire：只接受 ^-?[0-9]{1,19}$ 十进制字符串（JSON number 一律 400）
     try:
-        user = user_store.create_user(
-            login_id, password, role=user_store.ROLE_USER,
-            display_name=display_name)
+        monthly_limit = _admin_v1_amount_in(body.get("monthly_limit_nano_cny"),
+                                            "monthly_limit_nano_cny")
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+
+    actor = actor_identity().get("user_id")
+    if monthly_limit is None and ai_access is None:
+        # 无新字段：保持既有路径（json 后端也可建号；audit 与建号分离与旧
+        # 端点一致）
+        try:
+            user = user_store.create_user(
+                login_id, password, role=user_store.ROLE_USER,
+                display_name=display_name)
+        except ValueError as e:
+            msg = str(e)
+            if "已存在" in msg:
+                return _admin_v1_error(409, "login_id_conflict", msg)
+            return _admin_v1_error(400, "invalid_request", msg)
+        _audit("user.create", target_type="user", target_id=user.get("user_id"))
+        return jsonify(user=_admin_v1_user_out(user))
+
+    # 带新字段：user 插入 + override + audit 必须同一 PG 事务（§5.1）
+    if platform_features.current_backend() != "postgres":
+        return _admin_v1_pg_required()
+    import user_store_pg
+    try:
+        user, override = user_store_pg.create_user_with_spend_override(
+            login_id, password, display_name=display_name,
+            ai_access=True if ai_access is None else ai_access,
+            monthly_limit_nano_cny=monthly_limit, actor_user_id=actor)
     except ValueError as e:
         msg = str(e)
         if "已存在" in msg:
             return _admin_v1_error(409, "login_id_conflict", msg)
         return _admin_v1_error(400, "invalid_request", msg)
-    _audit("user.create", target_type="user", target_id=user.get("user_id"))
-    return jsonify(user=_admin_v1_user_out(user))
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        # 单事务组合原语（建号+override+audit）任一失败已整体回滚——
+        # 统一 500，不暴露内部错误细节
+        app.logger.exception("admin v1 users create（含月额度覆盖）失败")
+        return _admin_v1_error(500, "internal",
+                               "用户创建失败（事务已整体回滚，无半创建状态）")
+    return jsonify(user=_admin_v1_user_out(user),
+                   spend_override=_admin_v1_nano_out(override))
 
 
 def _admin_v1_set_user_enabled(user_id, enabled):
@@ -6107,7 +6202,9 @@ def admin_v1_invites_list():
     next_cursor = None
     if has_more:
         next_cursor = _admin_v1_encode_cursor({"o": offset + limit})
-    return jsonify(invites=[_invite_public_view(i) for i in page],
+    # 金额字段（monthly_limit_nano_cny）十进制字符串化（§5 v0.3）
+    return jsonify(invites=[_admin_v1_nano_out(_invite_public_view(i))
+                            for i in page],
                    next_cursor=next_cursor, limit=limit)
 
 
@@ -6115,7 +6212,9 @@ def admin_v1_invites_list():
 def admin_v1_invites_create():
     """创建一次性邀请码（镜像旧 4026：限流 + source_code/campaign_id 校验）。
 
-    明文 code 仅本响应返回一次（no-store）。
+    明文 code 仅本响应返回一次（no-store）。批次 D §5.2 扩展可选
+    ``monthly_limit_nano_cny``（十进制字符串 nano-CNY | null=继承默认）：
+    兑换事务内为新用户建 user_override 月额度（见 registration_store）。
     """
     auth = _require_owner_admin_v1()
     if auth:
@@ -6176,6 +6275,12 @@ def admin_v1_invites_create():
                                     or len(campaign_id) > 64):
         return _admin_v1_error(400, "invalid_request",
                                "campaign_id 需为 ≤64 字符的字符串")
+    # 批次 D §5.2：可选月额度覆盖模板（十进制字符串 nano-CNY | null=继承默认）
+    try:
+        monthly_limit = _admin_v1_amount_in(
+            body.get("monthly_limit_nano_cny"), "monthly_limit_nano_cny")
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
 
     try:
         auth_limit_store.record_owner_invite_creation(owner_hash)
@@ -6184,14 +6289,15 @@ def admin_v1_invites_create():
             ttl_seconds=ttl_hours * 3600,
             ai_access=bool(ai_access), cohort=cohort or "",
             note=note or "",
-            source_code=source_code or "", campaign_id=campaign_id or None)
+            source_code=source_code or "", campaign_id=campaign_id or None,
+            monthly_limit_nano_cny=monthly_limit)
     except ValueError as exc:
         return _admin_v1_error(400, "invalid_request", str(exc))
     except platform_features.PgFeatureUnavailable:
         return _admin_v1_pg_required()
     except registration_store.RegistrationStoreError as exc:
         return _admin_v1_error(500, "internal", str(exc))
-    out = _invite_public_view(invite)
+    out = _admin_v1_nano_out(_invite_public_view(invite))
     out["token"] = invite["token"]  # 明文码仅此一次
     resp = jsonify(invite=out)
     resp.headers["Cache-Control"] = "no-store"
@@ -6553,6 +6659,373 @@ def admin_v1_spend_reconcile():
                    pricing_cutover_epoch=result["pricing_cutover_epoch"],
                    enforcement_mode=result["enforcement_mode"],
                    backend=platform_features.current_backend())
+
+
+# --------------------------------------------------------------------------- #
+# 批次 D：金额 policy/window 写端点 + 设置聚合（docs
+# ai-money-budget-bugfix-and-simplification-plan.md §5/§6.1/§6.5/§8 批次 D）
+#
+# 统一口径（与上方只读端点/PR5 写端点一致）：
+#   - owner 门控 _require_owner_admin_v1（预览态 403）+ 全局 CSRF 双提交；
+#   - PG-only（json/dual 稳定 503 pg_backend_required）；
+#   - 金额入参十进制字符串（_admin_v1_amount_in；JSON number 一律 400），
+#     出口经 _admin_v1_nano_out（>2^53 不失真）；
+#   - CAS 版本冲突 → 409 version_conflict（不做 last-write-wins）；
+#   - 业务写入与 audit 同一事务（spend_store 各原语内实现）；
+#   - 「调整当前窗口」必须 body confirm=true（二次确认位，§1.1）。
+# --------------------------------------------------------------------------- #
+def _admin_v1_spend_error_response(exc):
+    """spend_store.SpendError → admin v1 错误信封（code 稳定）。"""
+    status = 400
+    if isinstance(exc, spend_store.SpendVersionConflictError):
+        status = 409
+    elif isinstance(exc, spend_store.UnprotectedSpendConfigError):
+        status = 400
+    elif isinstance(exc, (spend_store.SpendPolicyMissingError,
+                          spend_store.SpendWindowUnavailableError)):
+        status = 404
+    return _admin_v1_error(status, exc.code, str(exc))
+
+
+@app.route("/api/admin/v1/spend/policies/<policy_id>", methods=["PUT"])
+def admin_v1_spend_policy_update(policy_id):
+    """CAS 修改金额策略额度（§3.1：默认更新只影响之后新建的窗口）。
+
+    body: ``{limit_nano_cny: <十进制字符串>, version: <正整数>}``；version
+    未命中 → 409 version_conflict（数据已被他人修改）。要立即影响当前周期
+    走独立的「调整当前窗口」端点（POST .../windows/<id>/adjust）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.billing_features_available():
+        return _admin_v1_pg_required()
+    body = request.get_json(silent=True) or {}
+    try:
+        new_limit = _admin_v1_amount_in(body.get("limit_nano_cny"),
+                                        "limit_nano_cny")
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    if new_limit is None:
+        return _admin_v1_error(400, "invalid_request",
+                               "缺少 limit_nano_cny（十进制字符串）")
+    version = body.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        return _admin_v1_error(400, "invalid_request", "version 需为正整数")
+    try:
+        policy = spend_store.update_policy_limit(
+            policy_id, new_limit, version,
+            updated_by=actor_identity().get("user_id"),
+            actor_user_id=actor_identity().get("user_id"))
+    except spend_store.SpendError as exc:
+        return _admin_v1_spend_error_response(exc)
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 spend policy 更新失败")
+        return _admin_v1_error(500, "internal", "金额策略更新失败")
+    return jsonify(policy=_admin_v1_nano_out(policy))
+
+
+@app.route("/api/admin/v1/spend/enforcement-mode", methods=["PUT"])
+def admin_v1_spend_enforcement_mode():
+    """切换金额 enforcement 模式（§7.3；批次 D 受审计的写入口）。
+
+    body: ``{mode: shadow|registered|all, expected?: <当前模式>}``。
+
+    - ``expected`` 为 CAS 位：与当前模式不符 → 409 version_conflict（防两个
+      管理员并发覆盖）；
+    - §7.3 校验：保存前拒绝「金额硬闸未就绪（shadow）且旧 turn 消费闸也已
+      关闭」的无保护配置（当前 legacy_turn_guard_enabled 键不存在=闸恒开，
+      校验以可扩展形式落地，见 spend_store._assert_not_unprotected_tx）；
+    - 写入与 audit（spend.enforcement_mode_update）同一事务；
+    - **运维门槛**：registered/all 只应在批次 C2 验收（§11 门）之后由 owner
+      手工切换；端点本身不做批次判定（文档化而非硬编码——回滚到 shadow
+      也走同一入口）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.billing_features_available():
+        return _admin_v1_pg_required()
+    body = request.get_json(silent=True) or {}
+    mode = body.get("mode")
+    expected = body.get("expected")
+    if expected is not None and expected not in \
+            spend_store.SPEND_ENFORCEMENT_MODES:
+        return _admin_v1_error(400, "invalid_request",
+                               "expected 需为 %s 之一的当前模式值"
+                               % (spend_store.SPEND_ENFORCEMENT_MODES,))
+    try:
+        result = spend_store.set_enforcement_mode(
+            mode, expected=expected,
+            updated_by=actor_identity().get("user_id"),
+            actor_user_id=actor_identity().get("user_id"))
+    except spend_store.SpendError as exc:
+        return _admin_v1_spend_error_response(exc)
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 enforcement mode 更新失败")
+        return _admin_v1_error(500, "internal", "enforcement 模式更新失败")
+    return jsonify(previous_mode=result["previous_mode"], mode=result["mode"])
+
+
+@app.route("/api/admin/v1/spend/windows/<window_id>/adjust", methods=["POST"])
+def admin_v1_spend_window_adjust(window_id):
+    """调整当前窗口额度（§1.1「调整当前周期」：只改 limit_nano_snapshot）。
+
+    body: ``{limit_nano_snapshot: <十进制字符串>, version: <窗口 version>,
+    confirm: true}``：
+
+    - ``confirm`` 必须精确为 true（二次确认位；缺省/false → 400
+      confirm_required——spend_store 层只如实记录，HTTP 层强制）；
+    - CAS：窗口 version 未命中 → 409 version_conflict；
+    - **不**修改 spent/reserved（已完成消费不取消）；调低到低于 spent 后，
+      下一次预占自然拒绝（§3.2）；
+    - audit（spend.window_adjust，detail 含前后额度/已消费/预占）同一事务。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.billing_features_available():
+        return _admin_v1_pg_required()
+    body = request.get_json(silent=True) or {}
+    if body.get("confirm") is not True:
+        return _admin_v1_error(
+            400, "confirm_required",
+            "调整当前窗口需二次确认：confirm=true（该操作立即影响本周期"
+            "额度，不等下个窗口）")
+    try:
+        new_limit = _admin_v1_amount_in(body.get("limit_nano_snapshot"),
+                                        "limit_nano_snapshot")
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    if new_limit is None:
+        return _admin_v1_error(400, "invalid_request",
+                               "缺少 limit_nano_snapshot（十进制字符串）")
+    version = body.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        return _admin_v1_error(400, "invalid_request", "version 需为正整数")
+    try:
+        window = spend_store.adjust_current_window(
+            window_id, new_limit, version,
+            actor_user_id=actor_identity().get("user_id"), confirm=True)
+    except spend_store.SpendError as exc:
+        return _admin_v1_spend_error_response(exc)
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 spend window adjust 失败")
+        return _admin_v1_error(500, "internal", "当前窗口调整失败")
+    return jsonify(window=_admin_v1_spend_window_summary(window))
+
+
+@app.route("/api/admin/v1/users/<user_id>/spend-override", methods=["PUT"])
+def admin_v1_users_spend_override_set(user_id):
+    """设置/更新用户月额度覆盖（§5.1；body: {monthly_limit_nano_cny}）。
+
+    - 金额入参十进制字符串（JSON number 400；>2^53 不失真）；
+    - owner 目标拒绝：owner 主体解析独立 owner 策略，不存在用户覆盖语义
+      （§3.1「Owner 不与普通用户共用金额池」的镜像约束）；
+    - 覆盖只影响**之后新建**的窗口（当前已开窗口 snapshot 不变，§1.1）；
+    - set 与 audit 同一事务（spend_store.set_user_override）。清除走 DELETE。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.billing_features_available():
+        return _admin_v1_pg_required()
+    if "/" in user_id:
+        return _admin_v1_error(400, "invalid_request", "user_id 非法")
+    body = request.get_json(silent=True) or {}
+    try:
+        limit = _admin_v1_amount_in(body.get("monthly_limit_nano_cny"),
+                                    "monthly_limit_nano_cny")
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    if limit is None:
+        return _admin_v1_error(
+            400, "invalid_request",
+            "缺少 monthly_limit_nano_cny（十进制字符串；清除覆盖请用 DELETE）")
+    target = user_store.get_user(user_id)
+    if target is None:
+        return _admin_v1_error(404, "user_not_found", "用户不存在")
+    if target.get("role") == user_store.ROLE_OWNER:
+        return _admin_v1_error(
+            400, "invalid_request",
+            "owner 使用独立 owner 策略，不设用户月额度覆盖（§3.1）")
+    try:
+        override = spend_store.set_user_override(
+            user_id, limit, updated_by=actor_identity().get("user_id"),
+            actor_user_id=actor_identity().get("user_id"))
+    except spend_store.SpendError as exc:
+        return _admin_v1_spend_error_response(exc)
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 user spend override 设置失败")
+        return _admin_v1_error(500, "internal", "用户月额度覆盖设置失败")
+    return jsonify(user_id=user_id, override=_admin_v1_nano_out(override))
+
+
+@app.route("/api/admin/v1/users/<user_id>/spend-override", methods=["DELETE"])
+def admin_v1_users_spend_override_clear(user_id):
+    """清除用户月额度覆盖（下个窗口起回退 user_default，§9.2）。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.billing_features_available():
+        return _admin_v1_pg_required()
+    if "/" in user_id:
+        return _admin_v1_error(400, "invalid_request", "user_id 非法")
+    target = user_store.get_user(user_id)
+    if target is None:
+        return _admin_v1_error(404, "user_not_found", "用户不存在")
+    if target.get("role") == user_store.ROLE_OWNER:
+        return _admin_v1_error(
+            400, "invalid_request",
+            "owner 使用独立 owner 策略，无用户月额度覆盖可清除（§3.1）")
+    try:
+        cleared = spend_store.clear_user_override(
+            user_id, updated_by=actor_identity().get("user_id"),
+            actor_user_id=actor_identity().get("user_id"))
+    except spend_store.SpendError as exc:
+        return _admin_v1_spend_error_response(exc)
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 user spend override 清除失败")
+        return _admin_v1_error(500, "internal", "用户月额度覆盖清除失败")
+    return jsonify(user_id=user_id, cleared=cleared)
+
+
+# --------------------------------------------------------------------------- #
+# 批次 D：设置聚合（§6.1/§6.5 admin.settings.get 的数据源，只读）
+# --------------------------------------------------------------------------- #
+#: 运行时安全参数（§1.2「继续保留并统一到运行时设置」的子集；与
+#: _BUDGET_SETTINGS_FIELDS 同源——demo_per_browser_limit/demo_turn_limit 等
+#: 消费类次数额度属批次 F 退役对象，不在设置页展示）
+_SETTINGS_RUNTIME_FIELDS = (
+    "demo_enabled", "platform_task_max_steps", "demo_task_max_steps",
+    "own_task_max_steps_limit", "demo_max_concurrency",
+)
+
+
+@app.route("/api/admin/v1/settings", methods=["GET"])
+def admin_v1_settings():
+    """设置页聚合（§6.1，只读）：注册模式 + 金额策略/窗口边界 + 运行时参数。
+
+    分段可用性：registration 段任何后端都真实（json 后端模式恒 closed）；
+    spend 段（策略/窗口/enforcement）PG-only；runtime 段（turn 预算的安全
+    参数）PG-only。分段失败 ``{available:false, code}``，不拖垮整页。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    payload = {"registration": _registration_settings_payload()}
+    if not platform_features.billing_features_available():
+        payload["spend"] = {"available": False,
+                            "code": "pg_backend_required"}
+        payload["runtime"] = {"available": False,
+                              "code": "pg_backend_required"}
+    else:
+        try:
+            result = spend_store.admin_list_policies()
+            demo_resolved = result["resolved"].get("demo_global")
+            user_resolved = result["resolved"].get("user_default")
+            owner_resolved = result["resolved"].get("owner")
+            # 下个窗口边界由服务端按 Asia/Shanghai 计算（§1.1；不创建窗口行）
+            now_dt = datetime.now(timezone.utc)
+            demo_bounds = spend_store.week_window_bounds(now_dt) \
+                if demo_resolved else None
+            month_bounds = spend_store.month_window_bounds(now_dt)
+            # 当前 demo/owner 窗口（按需 get_or_create，幂等）——「调整当前
+            # 窗口」的影响展示数据源；各用户月窗口在 users 列表的 spend 字段
+            # （owner 窗口 subject_id = owner 的 user_id，与 windows/current
+            # 同口径）
+            owner_uid = ""
+            for _u in user_store.list_users():
+                if _u.get("role") == user_store.ROLE_OWNER:
+                    owner_uid = str(_u.get("user_id") or "")
+                    break
+
+            def _window_or_error(subject_type, subject_id):
+                try:
+                    return _admin_v1_spend_window_summary(
+                        spend_store.get_or_create_window(
+                            subject_type, subject_id, now_dt))
+                except spend_store.SpendError as exc:
+                    return {"subject_type": subject_type,
+                            "subject_id": subject_id, "error": exc.code}
+            payload["spend"] = _admin_v1_nano_out({
+                "available": True,
+                "enforcement_mode": result["enforcement_mode"],
+                "policies": {
+                    "demo_global": demo_resolved,
+                    "user_default": user_resolved,
+                    "owner": owner_resolved,
+                },
+                "current_windows": {
+                    "demo": _window_or_error(
+                        "demo", spend_store.DEMO_GLOBAL_SUBJECT),
+                    "owner": (_window_or_error("owner", owner_uid)
+                              if owner_uid else None),
+                },
+                "next_window_bounds": {
+                    "demo_week": [b.timestamp() for b in demo_bounds]
+                    if demo_bounds else None,
+                    "user_month": [b.timestamp() for b in month_bounds],
+                    "owner_month": [b.timestamp() for b in month_bounds],
+                },
+            })
+        except platform_features.PgFeatureUnavailable:
+            return _admin_v1_pg_required()
+        except Exception:
+            app.logger.exception("admin v1 settings spend 段读取失败")
+            payload["spend"] = {"available": False, "code": "internal"}
+        try:
+            period = budget_store.get_current_period()
+            payload["runtime"] = {
+                "available": True,
+                "limits": {k: period.get(k) for k in _SETTINGS_RUNTIME_FIELDS},
+                # Demo IP 短窗口桶现状（只读观测：env 配置；批次 E 将改造为
+                # 短窗口请求速率——本批不改 run/demo 请求路径）
+                "demo_ip_run_limit": demo_store.ip_run_limit(),
+                "demo_ip_run_window_seconds":
+                    demo_store.ip_run_window_seconds(),
+            }
+        except platform_features.PgFeatureUnavailable:
+            payload["runtime"] = {"available": False,
+                                  "code": "pg_backend_required"}
+        except Exception:
+            app.logger.exception("admin v1 settings runtime 段读取失败")
+            payload["runtime"] = {"available": False, "code": "internal"}
+    return jsonify(**payload)
+
+
+@app.route("/api/admin/v1/settings/registration", methods=["GET"])
+def admin_v1_settings_registration_get():
+    """注册模式（Admin API v1；逻辑与旧路由同一 service，§5.3）。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    return jsonify(**_registration_settings_payload())
+
+
+@app.route("/api/admin/v1/settings/registration", methods=["PUT"])
+def admin_v1_settings_registration_put():
+    """切换注册模式（Admin API v1；与旧路由同一 service，§5.3 不复制校验）。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    body = request.get_json(silent=True) or {}
+    payload, err = _set_registration_mode_service(
+        body.get("mode"), current_identity().get("user_id"))
+    if err:
+        status, code, message = err
+        return _admin_v1_error(status, code, message)
+    return jsonify(**payload)
 
 
 # --------------------------------------------------------------------------- #

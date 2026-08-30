@@ -132,6 +132,10 @@ def test_schema_migrations_recorded(conn):
     # spend_window_id/reserved_nano_cny/actual_nano_cny/enforcement_mode/
     # denial_reason + subject_type 放宽含 demo + 迁移 audit，docs 同上
     # §3.3/§3.4/§4.2）。
+    # 批次 D（后台设置、用户覆盖与邀请码模板）追加
+    # 0025_invite_monthly_limit.sql（registration_invites 可选月额度模板列
+    # monthly_limit_nano_cny，兑换事务内为新用户建 user_override，docs 同上
+    # §5.2/§8）。
     assert rows == [
         "0001_init.sql", "0002_roi_payload.sql", "0003_comments.sql",
         "0004_audit.sql", "0005_plugin.sql", "0006_demo_budget_auth.sql",
@@ -153,6 +157,7 @@ def test_schema_migrations_recorded(conn):
         "0022_billing_price_unit_fix.sql",
         "0023_spend_policies_windows.sql",
         "0024_billing_holds_spend_strong_settle.sql",
+        "0025_invite_monthly_limit.sql",
     ]
 
 

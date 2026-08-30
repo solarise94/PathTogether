@@ -407,8 +407,10 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 		const table = AdminBridgeHost.METHOD_PERMISSIONS;
 		// 22 个 §8.4 表方法 + PR3b 扩展的 providerBalance.refresh（与 get 同级
 		// admin:billing:read：只抓取供应商自身余额，不触碰用户数据）+ PR5
-		// 修订补的 4 个 UI parity 方法（users.startPreview / plugins.*）
-		expect(Object.keys(table)).toHaveLength(27);
+		// 修订补的 4 个 UI parity 方法（users.startPreview / plugins.*）+
+		// 批次 D 的 4 个统一设置页方法（settings.get/update /
+		// spend.currentWindow.adjust / users.setSpendOverride）
+		expect(Object.keys(table)).toHaveLength(31);
 		expect(table["admin.auth.get"]).toBe("admin:overview:read");
 		expect(table["admin.overview.get"]).toBe("admin:overview:read");
 		expect(table["admin.users.list"]).toBe("admin:users:read");
@@ -438,6 +440,12 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 		expect(table["admin.plugins.list"]).toBe("admin:plugins:read");
 		expect(table["admin.plugins.setEnabled"]).toBe("admin:plugins:write");
 		expect(table["admin.plugins.rotateSecret"]).toBe("admin:plugins:write");
+		// 批次 D（§6.5）：统一设置页（settings 独立权限；金额窗口调整归
+		// settings:write；用户月额度覆盖归 users:write）
+		expect(table["admin.settings.get"]).toBe("admin:settings:read");
+		expect(table["admin.settings.update"]).toBe("admin:settings:write");
+		expect(table["admin.spend.currentWindow.adjust"]).toBe("admin:settings:write");
+		expect(table["admin.users.setSpendOverride"]).toBe("admin:users:write");
 	});
 
 	it("declares param schemas for every PR3b read method (whitelist + types)", () => {
@@ -1293,3 +1301,341 @@ describe("AdminBridge host — PR5 UI parity methods (preview + plugins, §10.2)
 function nonce0(posted: Posted[]): string {
 	return initNonce(posted);
 }
+
+describe("AdminBridge host — 批次 D：统一设置页方法（§6.1/§6.5）", () => {
+	const ALL_D = [
+		"admin:settings:read", "admin:settings:write", "admin:users:write",
+	];
+
+	function makeDHost(fetchJson: (url: string, o?: unknown) => Promise<unknown>) {
+		return makeHost({ permissions: ALL_D, fetchJson });
+	}
+
+	it("admin.settings.get proxies GET /api/admin/v1/settings", async () => {
+		const calls: Array<{ url: string; method?: string }> = [];
+		const { handle, posted, contentWindow } = makeDHost(async (url, o) => {
+			calls.push({ url, method: (o as { method?: string } | undefined)?.method });
+			return { status: 200, ok: true, body: { registration: { mode: "closed" } } };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.settings.get"),
+		});
+		await ticks();
+		expect(responses(posted, "r1")[0].env.ok).toBe(true);
+		expect(calls).toEqual([{ url: "/api/admin/v1/settings", method: undefined }]);
+	});
+
+	it("settings.update applies sequentially and reports partial failure (order + applied/failed)", async () => {
+		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+		const { handle, posted, contentWindow } = makeDHost(async (url, o) => {
+			calls.push({
+				url, method: (o as { method?: string } | undefined)?.method,
+				body: JSON.parse(String((o as { body?: string }).body)),
+			});
+			// 第二步（金额策略）失败：409 version_conflict
+			if (calls.length === 2) {
+				return { status: 409, ok: false, body: { error: { code: "version_conflict", message: "stale" } } };
+			}
+			return { status: 200, ok: true, body: {} };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.settings.update", {
+				registration_mode: "closed",
+				demo_weekly_limit: {
+					policy_id: "spp_demo_global", version: 1,
+					limit_nano_cny: "51000000000",
+				},
+				spend_enforcement_mode: "shadow",
+				expected_enforcement_mode: "shadow",
+				demo_max_concurrency: 4,
+			}),
+		});
+		await ticks(6);
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(true);
+		const result = rs[0].env.result as {
+			applied: Array<{ step: string }>;
+			failed: { step: string; error: { code: string } };
+		};
+		// 顺序提交在失败处停步：注册模式已保存；金额策略失败；enforcement/
+		// runtime 未再提交（部分失败语义：各项独立事务，不回滚已成功项）
+		expect(calls.map((c) => c.url)).toEqual([
+			"/api/admin/v1/settings/registration",
+			"/api/admin/v1/spend/policies/spp_demo_global",
+		]);
+		expect(result.applied).toHaveLength(1);
+		expect(result.applied[0].step).toBe("registration_mode");
+		expect(result.failed.step).toBe("demo_weekly_limit");
+		expect(result.failed.error.code).toBe("version_conflict");
+	});
+
+	it("settings.update with all steps ok applies every group", async () => {
+		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+		const { handle, posted, contentWindow } = makeDHost(async (url, o) => {
+			calls.push({
+				url, method: (o as { method?: string } | undefined)?.method,
+				body: JSON.parse(String((o as { body?: string }).body)),
+			});
+			return { status: 200, ok: true, body: {} };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.settings.update", {
+				user_default_monthly_limit: {
+					policy_id: "spp_user_default", version: 1,
+					limit_nano_cny: "20000000000",
+				},
+				owner_monthly_limit: {
+					policy_id: "spp_owner", version: 1,
+					limit_nano_cny: "1000000000000",
+				},
+				spend_enforcement_mode: "shadow",
+				platform_task_max_steps: 60,
+				demo_task_max_steps: 20,
+				own_task_max_steps_limit: 40,
+				demo_max_concurrency: 2,
+				demo_enabled: true,
+			}),
+		});
+		await ticks(6);
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(true);
+		const result = rs[0].env.result as { applied: unknown[]; failed: null };
+		expect(result.failed).toBeNull();
+		expect(result.applied).toHaveLength(4);
+		// runtime 参数聚合为一个 turn-budgets PUT（demo_enabled 一并携带）
+		expect(calls[3]).toEqual({
+			url: "/api/admin/v1/turn-budgets", method: "PUT",
+			body: {
+				platform_task_max_steps: 60, demo_task_max_steps: 20,
+				own_task_max_steps_limit: 40, demo_max_concurrency: 2,
+				demo_enabled: true,
+			},
+		});
+	});
+
+	it("settings.update with no fields rejects invalid_params (no backend call)", async () => {
+		const calls: string[] = [];
+		const { handle, posted, contentWindow } = makeDHost(async (url) => {
+			calls.push(url);
+			return { status: 200, ok: true, body: {} };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.settings.update", {}),
+		});
+		await ticks();
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(false);
+		expect((rs[0].env.error as { code: string }).code).toBe("invalid_params");
+		expect(calls).toEqual([]);
+	});
+
+	it("currentWindow.adjust posts confirm:true with pathId guard", async () => {
+		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+		const { handle, posted, contentWindow } = makeDHost(async (url, o) => {
+			calls.push({
+				url, method: (o as { method?: string } | undefined)?.method,
+				body: JSON.parse(String((o as { body?: string }).body)),
+			});
+			return { status: 200, ok: true, body: { window: {} } };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.spend.currentWindow.adjust", {
+				window_id: "spw_abc", limit_nano_snapshot: "51000000000", version: 3,
+			}),
+		});
+		await ticks();
+		expect(responses(posted, "r1")[0].env.ok).toBe(true);
+		// confirm 由桥层固定 true（二次确认在插件 UI 页内确认条完成）
+		expect(calls).toEqual([{
+			url: "/api/admin/v1/spend/windows/spw_abc/adjust", method: "POST",
+			body: { limit_nano_snapshot: "51000000000", version: 3, confirm: true },
+		}]);
+		// window_id 含 "/" → 桥层 invalid_params，后端零调用
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r2", "admin.spend.currentWindow.adjust", {
+				window_id: "spw/x", limit_nano_snapshot: "1", version: 1,
+			}),
+		});
+		await ticks();
+		expect((responses(posted, "r2")[0].env.error as { code: string }).code)
+			.toBe("invalid_params");
+		expect(calls).toHaveLength(1);
+	});
+
+	it("setSpendOverride: string → PUT, null → DELETE (decimal string only)", async () => {
+		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+		const { handle, posted, contentWindow } = makeDHost(async (url, o) => {
+			calls.push({
+				url, method: (o as { method?: string } | undefined)?.method,
+				body: JSON.parse(String((o as { body?: string }).body)),
+			});
+			return { status: 200, ok: true, body: { cleared: false } };
+		});
+		handle._handleIframeLoad();
+		const nonce = nonce0(posted);
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r1", "admin.users.setSpendOverride", {
+				user_id: "usr_9", monthly_limit_nano_cny: "30500000000",
+			}),
+		});
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r2", "admin.users.setSpendOverride", {
+				user_id: "usr_9", monthly_limit_nano_cny: null,
+			}),
+		});
+		await ticks();
+		expect(calls).toEqual([
+			{ url: "/api/admin/v1/users/usr_9/spend-override", method: "PUT",
+				body: { monthly_limit_nano_cny: "30500000000" } },
+			{ url: "/api/admin/v1/users/usr_9/spend-override", method: "DELETE",
+				body: {} },
+		]);
+	});
+
+	it("setSpendOverride rejects JSON number amounts at the schema gate", async () => {
+		const calls: string[] = [];
+		const { handle, posted, contentWindow } = makeDHost(async (url) => {
+			calls.push(url);
+			return { status: 200, ok: true, body: {} };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.users.setSpendOverride", {
+				user_id: "usr_9", monthly_limit_nano_cny: 30500000000,
+			}),
+		});
+		await ticks();
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(false);
+		expect((rs[0].env.error as { code: string }).code).toBe("invalid_params");
+		expect(calls).toEqual([]);
+	});
+
+	it("settings.update rejects unknown fields (additionalProperties:false)", async () => {
+		const { handle, posted, contentWindow } = makeDHost(async () => ({
+			status: 200, ok: true, body: {},
+		}));
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.settings.update", {
+				registration_mode: "closed", legacy_turn_guard_enabled: false,
+			}),
+		});
+		await ticks();
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(false);
+		expect((rs[0].env.error as { code: string }).code).toBe("invalid_params");
+	});
+
+	it("permission gate: settings methods denied without admin:settings:*", async () => {
+		const { handle, posted, contentWindow } = makeHost({
+			permissions: ["admin:users:write"], // 无 settings 权限
+			fetchJson: async () => ({ status: 200, ok: true, body: {} }),
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "s1", "admin.settings.get"),
+		});
+		await ticks();
+		expect((responses(posted, "s1")[0].env.error as { code: string }).code)
+			.toBe("permission_denied");
+	});
+});
+
+describe("AdminBridge host — 批次 D：users/invites 月额度字段过桥（§5.1/§5.2）", () => {
+	it("admin.users.create forwards monthly_limit_nano_cny + ai_access", async () => {
+		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+		const { handle, posted, contentWindow } = makeHost({
+			permissions: ["admin:users:write"],
+			fetchJson: async (url, o) => {
+				calls.push({
+					url, method: (o as { method?: string } | undefined)?.method,
+					body: JSON.parse(String((o as { body?: string }).body)),
+				});
+				return { status: 200, ok: true, body: { user: { user_id: "u1" } } };
+			},
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.users.create", {
+				login_id: "a@x.com", password: "longpass-12345",
+				monthly_limit_nano_cny: "3500000000", ai_access: false,
+			}),
+		});
+		await ticks();
+		expect(responses(posted, "r1")[0].env.ok).toBe(true);
+		expect(calls).toEqual([{
+			url: "/api/admin/v1/users", method: "POST",
+			body: {
+				login_id: "a@x.com", password: "longpass-12345",
+				display_name: undefined,
+				monthly_limit_nano_cny: "3500000000", ai_access: false,
+			},
+		}]);
+		// JSON number 金额在 schema 门即拒（§5 v0.3 wire 纪律）
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r2", "admin.users.create", {
+				login_id: "b@x.com", password: "longpass-12345",
+				monthly_limit_nano_cny: 3500000000,
+			}),
+		});
+		await ticks();
+		expect((responses(posted, "r2")[0].env.error as { code: string }).code)
+			.toBe("invalid_params");
+		expect(calls).toHaveLength(1);
+	});
+
+	it("admin.invites.create forwards monthly_limit_nano_cny template", async () => {
+		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+		const { handle, posted, contentWindow } = makeHost({
+			permissions: ["admin:invites:write"],
+			fetchJson: async (url, o) => {
+				calls.push({
+					url, method: (o as { method?: string } | undefined)?.method,
+					body: JSON.parse(String((o as { body?: string }).body)),
+				});
+				return { status: 200, ok: true, body: { invite: {} } };
+			},
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.invites.create", {
+				ttl_hours: 24, ai_access: true,
+				monthly_limit_nano_cny: "2500000000",
+			}),
+		});
+		await ticks();
+		expect(responses(posted, "r1")[0].env.ok).toBe(true);
+		const body = calls[0].body as Record<string, unknown>;
+		expect(body.monthly_limit_nano_cny).toBe("2500000000");
+		// 负数/小数形态拒绝（pattern ^[0-9]{1,19}$）
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r2", "admin.invites.create", {
+				ttl_hours: 24, monthly_limit_nano_cny: "-5",
+			}),
+		});
+		await ticks();
+		expect((responses(posted, "r2")[0].env.error as { code: string }).code)
+			.toBe("invalid_params");
+	});
+});

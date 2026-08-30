@@ -885,10 +885,13 @@ def test_manifest_validator_enforces_filehashes_structure():
 
 
 def test_admin_manifest_plugin_version_bumped_with_hashes():
-    """复核收口：pluginVersion 0.1.2 与 release 目录对齐，fileHashes 覆盖
-    全部可服务 UI 文件（manifest 的入口/资源不得游离声明之外）。"""
+    """复核收口：pluginVersion 0.2.0 与 release 目录对齐，fileHashes 覆盖
+    全部可服务 UI 文件（manifest 的入口/资源不得游离声明之外）。批次 D 起
+    manifest 申请 admin:settings:read/write（统一设置页，§6.5）。"""
     data = json.loads(ADMIN_MANIFEST.read_text(encoding="utf-8"))
-    assert data["pluginVersion"] == "0.1.3"
+    assert data["pluginVersion"] == "0.2.0"
+    assert "admin:settings:read" in data["adminPermissions"]
+    assert "admin:settings:write" in data["adminPermissions"]
     hashes = data["ui"]["fileHashes"]
     assert data["ui"]["entry"] in hashes
     for name in ("index.html", "main.js", "style.css"):

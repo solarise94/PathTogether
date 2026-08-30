@@ -43,11 +43,14 @@ MANIFEST_PERMISSIONS = (
 )
 
 # Manifest v1.1（docs/admin-billing-plugin-implementation-plan.md §8.2/§8.4）：
-# 可选 ``adminPermissions`` 数组的枚举——admin 插件申请的 13 项管理能力，与
-# §8.4 AdminBridge method→permission 映射表一一对应（app.py 与
+# 可选 ``adminPermissions`` 数组的枚举——admin 插件申请的管理能力，与
+# AdminBridge method→permission 映射表一一对应（app.py 与
 # static/admin-host.js 各自持有同源常量，三处不得漂移）。
 # PR5 修订补入 admin:plugins:read/write（§10.2 身份预览入口与插件管理页的
 # parity 恢复：插件列表/健康/启停/凭证轮换走独立权限，不复用 users/billing）。
+# 批次 D（docs ai-money-budget-bugfix-and-simplification-plan.md §6.5）补入
+# admin:settings:read/write（统一设置页：注册模式/金额策略额度/enforcement
+# 模式/运行时安全参数的读取与受审计写入）。
 # 注意：申请不建立信任——admin 插件信任由 PRIVILEGED_ADMIN_PLUGIN_IDS 白名单 +
 # source-policy 显式 sha256 pin + manifest hash 精确匹配 + installation enabled
 # 共同判定，永远 fail-closed（app.py _admin_plugin_trusted）。
@@ -65,6 +68,8 @@ MANIFEST_ADMIN_PERMISSIONS = (
     "admin:audit:read",
     "admin:plugins:read",
     "admin:plugins:write",
+    "admin:settings:read",
+    "admin:settings:write",
 )
 
 # semver core：major.minor.patch（不带 prerelease/build，保持 parse 简单；与

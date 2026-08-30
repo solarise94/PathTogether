@@ -240,6 +240,8 @@ def test_json_backend_fail_closed():
         lambda: spend_store.set_user_override("u1", 1),
         lambda: spend_store.clear_user_override("u1"),
         lambda: spend_store.adjust_current_window("spw_x", 1, 1),
+        lambda: spend_store.set_enforcement_mode("shadow"),
+        lambda: spend_store.admin_users_spend_summaries([("user", "u1")]),
     ):
         with pytest.raises(platform_features.PgFeatureUnavailable) as exc:
             call()
@@ -323,8 +325,8 @@ def test_seed_policies_shadow_flag_and_partial_unique():
 
 @PG
 def test_fresh_database_full_migration_to_0023_idempotent():
-    """fresh PG 全量迁移 0001→0023：种子与 shadow 开关就位；ensure_schema
-    重跑幂等（种子不翻倍、开关不被改写）。"""
+    """fresh PG 全量迁移 0001→0025：种子与 shadow 开关就位；ensure_schema
+    重跑幂等（种子不翻倍、开关不被改写、0025 邀请列存在）。"""
     pytest.importorskip("pgserver")
     import tempfile
     import pg_store
@@ -337,6 +339,7 @@ def test_fresh_database_full_migration_to_0023_idempotent():
             files = pg_store.ensure_schema(conn)
             pg_store.ensure_schema(conn)  # 幂等重跑
             assert "0023_spend_policies_windows.sql" in files
+            assert "0025_invite_monthly_limit.sql" in files
             conn.row_factory = psycopg.rows.dict_row
             with conn.cursor() as cur:
                 cur.execute("SELECT count(*) AS n FROM ai_spend_policies "
@@ -350,6 +353,12 @@ def test_fresh_database_full_migration_to_0023_idempotent():
                 assert cur.fetchone()["value"] == "shadow"
                 cur.execute("SELECT count(*) AS n FROM audit_events WHERE "
                             "event_id='aud_migration_0023_spend_windows'")
+                assert cur.fetchone()["n"] == 1
+                # 0025：邀请月额度模板列存在且可空（幂等 ADD COLUMN IF NOT EXISTS）
+                cur.execute("SELECT count(*) AS n FROM information_schema"
+                            ".columns WHERE table_name="
+                            "'registration_invites' AND column_name="
+                            "'monthly_limit_nano_cny'")
                 assert cur.fetchone()["n"] == 1
         finally:
             conn.close()
@@ -915,3 +924,135 @@ def test_reconcile_demo_window_counts_all_demo_subjects():
     assert item["expected_spent_nano"] == 333
     assert item["actual_spent_nano"] == 0
     assert item["matches"] is False
+
+
+# =========================================================================== #
+# 11. 批次 D：enforcement 写入口（§7.3）+ override tx 变体（§5.1/§5.2）
+# =========================================================================== #
+@PG
+def test_set_enforcement_mode_vocab_cas_and_audit():
+    """词表校验、CAS（expected 不符 409 语义）、audit 与写入同事务。"""
+    bh.seed_spend_policies()
+    assert spend_store.enforcement_mode() == "shadow"
+    # 词表外拒绝（不落库）
+    for bad in ("hard", "off", "", None, 1):
+        with pytest.raises(spend_store.InvalidSpendRequestError):
+            spend_store.set_enforcement_mode(bad)
+    assert spend_store.enforcement_mode() == "shadow"
+    # CAS：expected 不匹配当前值 → version_conflict
+    with pytest.raises(spend_store.SpendVersionConflictError):
+        spend_store.set_enforcement_mode("all", expected="registered")
+    # 切 registered → all → 回 shadow（测试内切换；生产缺省恒 shadow）
+    out = spend_store.set_enforcement_mode("registered", expected="shadow")
+    assert out == {"previous_mode": "shadow", "mode": "registered"}
+    assert spend_store.mode_is_hard("registered", "user") is True
+    assert spend_store.mode_is_hard("registered", "demo") is False
+    out2 = spend_store.set_enforcement_mode("all", expected="registered")
+    assert out2["previous_mode"] == "registered"
+    assert spend_store.mode_is_hard("all", "demo") is True
+    out3 = spend_store.set_enforcement_mode("shadow", expected="all")
+    assert out3["mode"] == "shadow"
+    assert spend_store.enforcement_mode() == "shadow"
+    # audit：每次写入一条 spend.enforcement_mode_update（含前后模式）
+    conn = bh.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT detail FROM audit_events WHERE action="
+                        "'spend.enforcement_mode_update' ORDER BY ts")
+            details = [r["detail"] for r in cur.fetchall()]
+    finally:
+        conn.close()
+    assert [d["mode"] for d in details] == \
+        ["registered", "all", "shadow"]
+    assert details[0]["previous_mode"] == "shadow"
+
+
+@PG
+def test_set_enforcement_mode_unprotected_config_extensible_check():
+    """§7.3 可扩展校验：shadow（金额硬闸未就绪）+ 旧 turn 闸关闭 = 拒绝。
+
+    当前平台没有写 legacy_turn_guard_enabled 的路径（旧 turn 闸恒开）；本用例
+    注入该键验证「未来引入开关」后的拒绝分支无需改判定代码（§9.7）。
+    """
+    bh.seed_spend_policies()
+    import settings_store
+    settings_store.set_setting(spend_store.LEGACY_TURN_GUARD_KEY, False)
+    with pytest.raises(spend_store.UnprotectedSpendConfigError):
+        spend_store.set_enforcement_mode("shadow", expected="shadow")
+    assert spend_store.enforcement_mode() == "shadow"  # 未被改写
+    # registered/all 金额硬闸就绪 → 可保存
+    out = spend_store.set_enforcement_mode("registered", expected="shadow")
+    assert out["mode"] == "registered"
+    # 键缺失（缺省=闸开）时 shadow 总可保存
+    settings_store.set_setting(spend_store.LEGACY_TURN_GUARD_KEY, True)
+    assert spend_store.set_enforcement_mode("shadow",
+                                            expected="registered")["mode"] \
+        == "shadow"
+    conn = bh.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM platform_settings WHERE key=%s",
+                        (spend_store.LEGACY_TURN_GUARD_KEY,))
+        conn.commit()
+    finally:
+        conn.close()
+    assert spend_store.set_enforcement_mode("shadow")["mode"] == "shadow"
+
+
+@PG
+def test_override_tx_variants_commit_with_caller_transaction():
+    """set/clear_user_override_tx 在调用方事务内生效（外部事务组合原语）。"""
+    import pg_store
+    bh.seed_spend_policies()
+    conn = bh.connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                p1 = spend_store.set_user_override_tx(
+                    cur, "usr_tx_1", 15 * 10 ** 9, updated_by="tester")
+                p2 = spend_store.set_user_override_tx(
+                    cur, "usr_tx_2", 25 * 10 ** 9, updated_by="tester")
+        assert p1["scope_type"] == "user_override"
+        assert p1["limit_nano_cny"] == 15 * 10 ** 9
+        assert p2["limit_nano_cny"] == 25 * 10 ** 9
+        # 事务回滚路径：tx 内抛错 → 覆盖行不留
+        with pytest.raises(RuntimeError):
+            with pg_store.transaction(conn) as c:
+                with c.cursor() as cur:
+                    spend_store.set_user_override_tx(
+                        cur, "usr_tx_3", 35 * 10 ** 9, updated_by="tester")
+                    raise RuntimeError("boom")
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cleared = spend_store.clear_user_override_tx(
+                    cur, "usr_tx_1", updated_by="tester")
+        assert cleared is True
+    finally:
+        conn.close()
+    assert spend_store.resolve_policy("user", "usr_tx_1")["scope_type"] \
+        == "user_default"
+    assert spend_store.resolve_policy("user", "usr_tx_2")["scope_type"] \
+        == "user_override"
+    assert spend_store.resolve_policy("user", "usr_tx_3") is None or \
+        spend_store.resolve_policy("user", "usr_tx_3")["scope_type"] \
+        == "user_default"
+
+
+@PG
+def test_admin_users_spend_summaries_batch():
+    """admin_users_spend_summaries：批量窗口 + 默认/覆盖状态 + 单主体降级。"""
+    bh.seed_spend_policies()
+    spend_store.set_user_override("usr_s_1", 42 * 10 ** 9)
+    summaries = spend_store.admin_users_spend_summaries(
+        [("user", "usr_s_1"), ("user", "usr_s_2"),
+         ("owner", "usr_s_owner")])
+    assert summaries["usr_s_1"]["policy_scope"] == "user_override"
+    assert summaries["usr_s_1"]["window"]["subject_type"] == "user"
+    assert summaries["usr_s_1"]["window"]["limit_nano_snapshot"] == \
+        42 * 10 ** 9
+    assert summaries["usr_s_2"]["policy_scope"] == "user_default"
+    assert summaries["usr_s_2"]["window"]["limit_nano_snapshot"] == 20 * 10 ** 9
+    assert summaries["usr_s_owner"]["policy_scope"] == "owner"
+    assert summaries["usr_s_owner"]["window"]["subject_type"] == "owner"
+    assert summaries["usr_s_owner"]["window"]["limit_nano_snapshot"] == \
+        1000 * 10 ** 9

@@ -13,8 +13,10 @@ ai-money-budget-bugfix-and-simplification-plan.md §1.1/§3.1/§3.2/§7.3/§8；
     ``spend_window_unavailable``（批次 B 为 TypeError）；
   - ``mode_is_hard``：全局 enforcement 模式 × 主体 → 硬闸判定（§7.3）。
 
-**模式纪律**：``spend_enforcement_mode`` 仍缺省 ``"shadow"``（0023 种子）；
-切到 registered/all 是运维动作（批次 C2 验收后），本模块只读不写该键。
+**模式纪律**：``spend_enforcement_mode`` 缺省 ``"shadow"``（0023 种子）；
+批次 D 起 ``set_enforcement_mode`` 提供受审计的写原语（owner-only 路由 +
+CAS + §7.3 无保护配置校验），但把模式切到 registered/all 仍是批次 C2
+验收（§11 门）之后的运维动作——本模块不自动切换。
 
 内容（仿 billing_store 惯例：模块级函数 + 中文注释 + PG-only fail-closed）：
 
@@ -88,10 +90,19 @@ WINDOW_SUBJECT_TYPES = ("demo", "user", "owner")
 #: demo 主体的窗口 subject_id（所有浏览器/capability 归同一周窗口）
 DEMO_GLOBAL_SUBJECT = "demo_global"
 
-#: enforcement 开关（§7.3；0023 种子固定 "shadow"，本批不改）
+#: enforcement 开关（§7.3；0023 种子固定 "shadow"）。批次 D 起 admin v1
+#: 提供受审计的写入口 set_enforcement_mode（owner-only + CAS + §7.3 校验）；
+#: 切到 registered/all 仍是批次 C2 验收后的运维动作
 SPEND_ENFORCEMENT_MODE_KEY = "spend_enforcement_mode"
 SPEND_ENFORCEMENT_MODES = ("shadow", "registered", "all")
 DEFAULT_ENFORCEMENT_MODE = "shadow"
+
+#: §7.3 迁移期兼容开关 legacy_turn_guard_enabled（platform_settings 键）。
+#: **当前不存在该键**（旧 turn 闸恒开、无关闭入口，批次 F 才退役）；写函数
+#: 的无保护配置校验仍读取它并按「缺省 = 闸开」判定，保证未来引入该开关时
+#: 「金额 hard 未就绪 + 旧 turn 闸关闭」的组合在保存时即被拒绝（可扩展形式，
+#: 见 :func:`_assert_not_unprotected_tx`）。
+LEGACY_TURN_GUARD_KEY = "legacy_turn_guard_enabled"
 
 #: 策略写路径串行化 advisory key（事务级；稳定 bigint "SPPW"）
 _POLICY_LOCK_KEY = 0x53505057
@@ -103,6 +114,7 @@ _WINDOW_ID_PREFIX = "spw_"
 #: audit 动作名（detail 只含非敏感字段）
 POLICY_UPDATE_AUDIT_ACTION = "spend.policy_update"
 WINDOW_ADJUST_AUDIT_ACTION = "spend.window_adjust"
+ENFORCEMENT_MODE_AUDIT_ACTION = "spend.enforcement_mode_update"
 
 #: 0022 写入的 cutover 标志键（对账器只接纳 occurred_at >= cutover 的用量）
 _PRICING_CUTOVER_KEY = billing_store.PRICING_V2_CUTOVER_SETTING_KEY
@@ -747,42 +759,59 @@ def set_user_override(user_id, limit_nano_cny, *, updated_by=None, at=None,
     实现：收口该用户现有 open 覆盖（保留历史行，effective_to=at）+ 插入新
     覆盖行（version=1，effective_from=at）。新覆盖只影响**之后新建**的窗口
     ——当前已开月窗口的 limit_nano_snapshot 不变（§1.1 默认只影响新周期）。
+    独立事务版；单事务组合路径（建号+覆盖+audit）见
+    :func:`set_user_override_tx`。
     """
     platform_features.require_pg_backend("spend")
+    limit = _validate_nano(limit_nano_cny, "limit_nano_cny")
+    at = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                return set_user_override_tx(
+                    cur, user_id, limit, updated_by=updated_by, at=at,
+                    audit=audit, actor_user_id=actor_user_id)
+    finally:
+        conn.close()
+
+
+def set_user_override_tx(cur, user_id, limit_nano_cny, *, updated_by=None,
+                         at=None, audit=True, actor_user_id=None):
+    """设置/替换用户月额度覆盖（cursor 注入变体，调用方事务内提交）。
+
+    语义与 :func:`set_user_override` 完全一致（§5.1：owner 直接建号/邀请码
+    兑换等「user 行 + override 策略 + audit 必须同一事务」的组合路径共用本
+    原语）；at 缺省按当前时刻解析。
+    """
     limit = _validate_nano(limit_nano_cny, "limit_nano_cny")
     if not isinstance(user_id, str) or not user_id.strip():
         raise InvalidSpendRequestError("user_id 需为非空字符串")
     at = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
     policy_id = _OVERRIDE_ID_PREFIX + secrets.token_hex(10)
-    conn = _connect()
-    try:
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
-                closed = _close_open_policies_tx(
-                    cur, "user_override", user_id, at, updated_by)
-                cur.execute(
-                    "INSERT INTO ai_spend_policies "
-                    "(policy_id, scope_type, scope_id, period_kind, "
-                    " limit_nano_cny, enabled, effective_from, effective_to, "
-                    " version, updated_by) "
-                    "VALUES (%s,'user_override',%s,'calendar_month',%s,true,"
-                    "%s,NULL,1,%s) RETURNING " + _POLICY_SEL,
-                    (policy_id, user_id, limit, at, updated_by))
-                out = _policy_out(cur.fetchone())
-                if audit:
-                    share_store_pg.record_audit_tx(
-                        cur, POLICY_UPDATE_AUDIT_ACTION,
-                        actor_user_id=actor_user_id, actor_role="owner",
-                        target_type="spend_policy", target_id=policy_id,
-                        detail={
-                            "op": "set_user_override",
-                            "user_id": user_id,
-                            "limit_nano_cny": limit,
-                            "replaced_open_policies": int(closed),
-                        })
-                return out
-    finally:
-        conn.close()
+    closed = _close_open_policies_tx(cur, "user_override", user_id, at,
+                                     updated_by)
+    cur.execute(
+        "INSERT INTO ai_spend_policies "
+        "(policy_id, scope_type, scope_id, period_kind, "
+        " limit_nano_cny, enabled, effective_from, effective_to, "
+        " version, updated_by) "
+        "VALUES (%s,'user_override',%s,'calendar_month',%s,true,"
+        "%s,NULL,1,%s) RETURNING " + _POLICY_SEL,
+        (policy_id, user_id, limit, at, updated_by))
+    out = _policy_out(cur.fetchone())
+    if audit:
+        share_store_pg.record_audit_tx(
+            cur, POLICY_UPDATE_AUDIT_ACTION,
+            actor_user_id=actor_user_id, actor_role="owner",
+            target_type="spend_policy", target_id=policy_id,
+            detail={
+                "op": "set_user_override",
+                "user_id": user_id,
+                "limit_nano_cny": limit,
+                "replaced_open_policies": int(closed),
+            })
+    return out
 
 
 def clear_user_override(user_id, *, updated_by=None, at=None, audit=True,
@@ -790,31 +819,41 @@ def clear_user_override(user_id, *, updated_by=None, at=None, audit=True,
     """清除某用户的月额度覆盖：收口 open 覆盖行（保留历史）。
 
     清除后：当前已开窗口不受影响（snapshot 不变），**下一个**窗口解析回退
-    user_default（§9.2）。返回是否确有行被收口。
+    user_default（§9.2）。返回是否确有行被收口。独立事务版；单事务组合路径
+    见 :func:`clear_user_override_tx`。
     """
     platform_features.require_pg_backend("spend")
-    if not isinstance(user_id, str) or not user_id.strip():
-        raise InvalidSpendRequestError("user_id 需为非空字符串")
     at = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                closed = _close_open_policies_tx(
-                    cur, "user_override", user_id, at, updated_by)
-                if audit:
-                    share_store_pg.record_audit_tx(
-                        cur, POLICY_UPDATE_AUDIT_ACTION,
-                        actor_user_id=actor_user_id, actor_role="owner",
-                        target_type="spend_policy", target_id=None,
-                        detail={
-                            "op": "clear_user_override",
-                            "user_id": user_id,
-                            "replaced_open_policies": int(closed),
-                        })
-                return bool(closed)
+                return clear_user_override_tx(
+                    cur, user_id, updated_by=updated_by, at=at, audit=audit,
+                    actor_user_id=actor_user_id)
     finally:
         conn.close()
+
+
+def clear_user_override_tx(cur, user_id, *, updated_by=None, at=None,
+                           audit=True, actor_user_id=None):
+    """清除用户月额度覆盖（cursor 注入变体；语义同独立事务版）。"""
+    if not isinstance(user_id, str) or not user_id.strip():
+        raise InvalidSpendRequestError("user_id 需为非空字符串")
+    at = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
+    closed = _close_open_policies_tx(cur, "user_override", user_id, at,
+                                     updated_by)
+    if audit:
+        share_store_pg.record_audit_tx(
+            cur, POLICY_UPDATE_AUDIT_ACTION,
+            actor_user_id=actor_user_id, actor_role="owner",
+            target_type="spend_policy", target_id=None,
+            detail={
+                "op": "clear_user_override",
+                "user_id": user_id,
+                "replaced_open_policies": int(closed),
+            })
+    return bool(closed)
 
 
 # --------------------------------------------------------------------------- #
@@ -899,16 +938,127 @@ def _enforcement_mode_tx(cur) -> str:
 
 
 def enforcement_mode() -> str:
-    """读 ``platform_settings.spend_enforcement_mode``（缺省/非法 → shadow）。
-
-    只读：本批没有任何路径改这个键（0023 迁移只在不存在时种 "shadow"）。
-    """
+    """读 ``platform_settings.spend_enforcement_mode``（缺省/非法 → shadow）。"""
     platform_features.require_pg_backend("spend")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 return _enforcement_mode_tx(cur)
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# §7.3 enforcement 写入口（批次 D：admin v1 owner-only 路由专用）
+# --------------------------------------------------------------------------- #
+def _legacy_turn_guard_enabled_tx(cur) -> bool:
+    """同事务读旧 turn 闸兼容开关（缺省/非法 → True=闸开）。
+
+    当前平台**没有**任何写 ``legacy_turn_guard_enabled`` 的路径（旧 turn 闸
+    恒开，批次 F 才退役）：本读取只为 §7.3 的无保护配置校验留可扩展挂钩。
+    """
+    cur.execute("SELECT value FROM platform_settings WHERE key=%s",
+                (LEGACY_TURN_GUARD_KEY,))
+    row = cur.fetchone()
+    if row is None or row["value"] is None:
+        return True
+    value = row["value"]
+    if isinstance(value, bool):
+        return value
+    _LOG.warning("platform_settings.%s 存量值非法（%r），按闸开处理",
+                 LEGACY_TURN_GUARD_KEY, value)
+    return True
+
+
+class UnprotectedSpendConfigError(SpendError):
+    """§7.3 无保护配置：金额硬闸未就绪且旧 turn 消费闸也已关闭。"""
+
+    code = "unprotected_spend_config"
+
+
+def _assert_not_unprotected_tx(cur, mode):
+    """§7.3 写入前校验：禁止保存「两道消费保护都关闭」的配置。
+
+    可扩展形式（当前与未来的判定口径一致）：
+
+    - ``mode in ("registered", "all")``：金额硬闸至少覆盖注册用户（all 覆盖
+      全部主体）——无论旧 turn 闸状态如何，都存在有效消费保护，放行；
+    - ``mode == "shadow"``：金额硬闸**未就绪**（任何主体都只观测）。此时若
+      旧 turn 消费闸（legacy_turn_guard_enabled）已关闭，则两道闸全部失效
+      ——这正是 §7.3「不能关闭最后一个有效消费保护」的禁止形态，抛
+      :class:`UnprotectedSpendConfigError`（400 语义）。
+
+    当前 ``legacy_turn_guard_enabled`` 键不存在（缺省闸开），所以 shadow
+    总是可保存的；未来引入该开关（批次 F 前的退役步骤）时，本函数无需改动
+    即拒绝 ``shadow + legacy_turn_guard_enabled=false`` 的组合。
+    """
+    if mode in ("registered", "all"):
+        return
+    legacy_guard_on = _legacy_turn_guard_enabled_tx(cur)
+    if not legacy_guard_on:
+        raise UnprotectedSpendConfigError(
+            "无保护配置：金额硬闸未就绪（mode=shadow）且旧 turn 消费闸已"
+            "关闭（legacy_turn_guard_enabled=false）；至少保留一道有效"
+            "消费保护（§7.3）", mode=mode,
+            legacy_turn_guard_enabled=False)
+
+
+def set_enforcement_mode(mode, expected=None, *, updated_by=None,
+                         actor_user_id=None):
+    """写 ``platform_settings.spend_enforcement_mode``（批次 D）。
+
+    - ``mode`` 必须在 :data:`SPEND_ENFORCEMENT_MODES` 词表内（其它值
+      ``invalid_request``，不落库）；
+    - ``expected``（可选）：CAS 防并发覆盖——与当前值不符抛
+      :class:`SpendVersionConflictError`（409 语义）。None = 不做 CAS
+      （首个设置者/无人竞争的运维路径）；
+    - §7.3 校验：``_assert_not_unprotected_tx``（见其 docstring；当前旧
+      turn 闸恒开，shadow 总可保存，校验以可扩展形式落地）；
+    - 写入与审计（action=``spend.enforcement_mode_update``，detail 只含
+      前后模式与操作者标识等非敏感字段）**同一事务**，任一失败整体回滚；
+    - 返回 ``{"previous_mode", "mode"}``。
+
+    注意：把模式切到 registered/all 是批次 C2 验收门（§11）之后的运维动作；
+    本函数只负责受审计的写原语，不做批次门槛判定（路由层文档同步说明）。
+    """
+    platform_features.require_pg_backend("spend")
+    if mode not in SPEND_ENFORCEMENT_MODES:
+        raise InvalidSpendRequestError(
+            "mode 需为 %s" % (SPEND_ENFORCEMENT_MODES,), mode=mode)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                current = _enforcement_mode_tx(cur)
+                if expected is not None and expected != current:
+                    raise SpendVersionConflictError(
+                        "enforcement 模式已被他人修改（expected=%r, "
+                        "current=%r），请刷新后重试" % (expected, current),
+                        expected_mode=expected, current_mode=current)
+                _assert_not_unprotected_tx(cur, mode)
+                if mode != current:
+                    cur.execute(
+                        "INSERT INTO platform_settings "
+                        "(key, value, updated_at, updated_by) "
+                        "VALUES (%s, %s, now(), %s) "
+                        "ON CONFLICT (key) DO UPDATE SET "
+                        "value=EXCLUDED.value, updated_at=now(), "
+                        "updated_by=EXCLUDED.updated_by",
+                        (SPEND_ENFORCEMENT_MODE_KEY,
+                         psycopg.types.json.Jsonb(mode), updated_by))
+                share_store_pg.record_audit_tx(
+                    cur, ENFORCEMENT_MODE_AUDIT_ACTION,
+                    actor_user_id=actor_user_id, actor_role="owner",
+                    target_type="platform_settings",
+                    target_id=SPEND_ENFORCEMENT_MODE_KEY,
+                    detail={
+                        "previous_mode": current,
+                        "mode": mode,
+                        "expected_mode": expected,
+                        "changed": mode != current,
+                    })
+                return {"previous_mode": current, "mode": mode}
     finally:
         conn.close()
 
@@ -1083,5 +1233,46 @@ def admin_list_policies(*, at=None):
                 mode = _enforcement_mode_tx(cur)
         return {"items": items, "resolved": resolved,
                 "enforcement_mode": mode}
+    finally:
+        conn.close()
+
+
+def admin_users_spend_summaries(subjects, *, at=None):
+    """每用户当前月窗口 + 策略解析结果（§6.2 用户详情数据源；单事务批量）。
+
+    ``subjects`` 为 ``(subject_type, user_id)`` 可迭代（owner 用户传
+    ``("owner", user_id)``，普通用户 ``("user", user_id)``）。每项返回：
+
+    - ``policy_scope``：当前时刻解析到的策略 scope（user_override=覆盖生效 /
+      user_default=继承默认 / owner=独立策略；解析失败 None+error）；
+    - ``window``：当前窗口（get_or_create，含 limit/spent/reserved/边界/
+      version）；单主体失败（如 user_default 被禁用）带稳定 ``error`` code，
+      不拖垮整页（与 admin v1 windows/current 同口径）。
+    """
+    platform_features.require_pg_backend("spend")
+    at_dt = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                out = {}
+                for subject_type, subject_id in subjects:
+                    item = {"subject_type": subject_type,
+                            "subject_id": subject_id}
+                    try:
+                        policy = _resolve_policy_tx(cur, subject_type,
+                                                    subject_id, at_dt)
+                        item["policy_scope"] = (policy["scope_type"]
+                                                if policy else None)
+                        item["policy_id"] = (policy["policy_id"]
+                                             if policy else None)
+                        item["policy_version"] = (policy["version"]
+                                                  if policy else None)
+                        item["window"] = _get_or_create_window_tx(
+                            cur, subject_type, subject_id, at_dt)
+                    except SpendError as exc:
+                        item["error"] = exc.code
+                    out[subject_id] = item
+        return out
     finally:
         conn.close()

@@ -25,8 +25,8 @@
     .adm-state 页级状态条（role=status aria-live=polite）承载；错误显示
     类别 + 本地请求序号（非敏感）+ 重试；空态解释为什么为空与下一步。
 
-    页面（§10.1–§10.5）：概览（KPI 卡 + 双额度并列 + 告警）/ 用户（高频列
-    + 详情抽屉）/ 邀请与来源 / 额度与账单 / 插件 / 审计。
+    页面（§10.1–§10.5 + 批次 D §6.1）：概览 / 用户 / 邀请与来源 / 设置 /
+    额度与账单 / 插件 / 审计。
 
     只加载相对路径 style.css / main.js（owner-only 的
     /admin/plugin-assets/pathtogether-admin/ui/*）；不写内联样式/脚本（CSP）。
@@ -46,6 +46,7 @@
         <button type="button" class="adm-nav-btn" data-page="overview">概览</button>
         <button type="button" class="adm-nav-btn" data-page="users">用户</button>
         <button type="button" class="adm-nav-btn" data-page="invites">邀请与来源</button>
+        <button type="button" class="adm-nav-btn" data-page="settings">设置</button>
         <button type="button" class="adm-nav-btn" data-page="billing">额度与账单</button>
         <button type="button" class="adm-nav-btn" data-page="plugins">插件</button>
         <button type="button" class="adm-nav-btn" data-page="audit">审计</button>
@@ -84,11 +85,12 @@
           <div class="adm-state" id="adm-state-users" data-page-state="idle" role="status" aria-live="polite"></div>
           <section class="adm-card">
             <h2>创建用户（role=user）</h2>
-            <p class="adm-note">初始密码 ≥15 位，由 owner 线下告知用户；经本表创建的账户与旧入口语义一致（不会创建 owner）。</p>
+            <p class="adm-note">初始密码 ≥15 位，由 owner 线下告知用户；经本表创建的账户与旧入口语义一致（不会创建 owner）。月额度覆盖留空 = 继承全局默认；填 CNY 值则与建号同一事务创建覆盖策略。</p>
             <div class="adm-form" id="adm-users-create-form">
               <input type="text" id="adm-users-new-login" placeholder="登录账号（login_id）" maxlength="120" autocomplete="off">
               <input type="text" id="adm-users-new-display" placeholder="显示名（可选，仅展示）" maxlength="120" autocomplete="off">
               <input type="password" id="adm-users-new-password" placeholder="初始密码（≥15 位）" minlength="15" maxlength="200" autocomplete="new-password">
+              <input type="text" id="adm-users-new-limit" placeholder="每月金额覆盖（CNY，可选，留空=默认）" autocomplete="off">
               <button type="button" id="adm-users-create-btn">创建用户</button>
             </div>
             <p class="adm-status" id="adm-users-create-status"></p>
@@ -144,6 +146,7 @@
               <input type="text" id="adm-invite-login" placeholder="绑定登录账号（可选）" maxlength="120" autocomplete="off">
               <input type="number" id="adm-invite-ttl" placeholder="有效期（小时，1–720）" min="1" max="720" value="168">
               <label class="adm-check"><input type="checkbox" id="adm-invite-ai"> 兑换用户默认开通 AI access</label>
+              <input type="text" id="adm-invite-limit" placeholder="兑换用户每月金额覆盖（CNY，可选，留空=默认）" autocomplete="off">
               <input type="text" id="adm-invite-cohort" placeholder="cohort（可选，≤64 字符）" maxlength="64" autocomplete="off">
               <input type="text" id="adm-invite-note" placeholder="备注（可选，≤200 字符）" maxlength="200" autocomplete="off">
               <input type="text" id="adm-invite-source" placeholder="source_code（可选 slug：a-z0-9_-）" maxlength="64" autocomplete="off">
@@ -163,8 +166,9 @@
               <table class="adm-table" id="adm-invites-table">
                 <thead>
                   <tr>
-                    <th>invite</th><th>绑定账号</th><th>AI</th><th>cohort</th>
-                    <th>source/campaign</th><th>状态</th><th>过期时间</th><th>操作</th>
+                    <th>invite</th><th>绑定账号</th><th>AI</th><th>月额度模板</th>
+                    <th>cohort</th><th>source/campaign</th><th>状态</th>
+                    <th>过期时间</th><th>操作</th>
                   </tr>
                 </thead>
                 <tbody id="adm-invites-tbody"></tbody>
@@ -215,9 +219,78 @@
           </section>
         </section>
 
+        <!-- 设置（§6.1，批次 D）：注册模式 / 金额策略 / enforcement / 运行时安全
+             参数 / 调整当前窗口（独立按钮 + 二次确认 + 影响展示） -->
+        <section class="adm-page" id="adm-page-settings" hidden>
+          <div class="adm-state" id="adm-state-settings" data-page-state="idle" role="status" aria-live="polite"></div>
+          <section class="adm-card">
+            <h2>注册模式</h2>
+            <p class="adm-note">closed=关闭注册；invite_only=邀请码注册（需 HTTPS、Secure Cookie、PostgreSQL 前置条件）。public 本阶段不支持（单独安全评审前不可选）。保存经服务端校验并写审计。</p>
+            <div class="adm-form" id="adm-regmode-form">
+              <select id="adm-regmode-select" aria-label="注册模式">
+                <option value="closed">closed（关闭注册）</option>
+                <option value="invite_only">invite_only（邀请码注册）</option>
+                <option value="public" disabled>public（本阶段不支持）</option>
+              </select>
+              <button type="button" id="adm-regmode-save-btn">保存注册模式</button>
+            </div>
+            <p class="adm-status" id="adm-regmode-status"></p>
+            <dl id="adm-regmode-info" class="adm-kv"></dl>
+          </section>
+          <section class="adm-card">
+            <h2>金额策略（nano-CNY wire；输入按 CNY 精确换算）</h2>
+            <p class="adm-note">默认修改只影响<b>之后新建</b>的窗口（已开窗口额度固定）；要立即影响当前周期，用下方「调整当前窗口」（独立操作 + 二次确认 + 审计）。金额输入/输出均为十进制字符串换算，超过 JS 安全整数也不失真。</p>
+            <div class="adm-form adm-form--grid">
+              <input type="text" id="adm-spend-demo-week" placeholder="Demo 每周金额（CNY，如 50）" autocomplete="off">
+              <input type="text" id="adm-spend-user-month" placeholder="注册用户默认每月金额（CNY，如 20）" autocomplete="off">
+              <input type="text" id="adm-spend-owner-month" placeholder="Owner 策略额度（CNY / 月，如 1000）" autocomplete="off">
+              <select id="adm-spend-mode" aria-label="enforcement 模式">
+                <option value="shadow">shadow（金额只观测，旧 turn 闸硬限制）</option>
+                <option value="registered">registered（注册用户金额硬闸）</option>
+                <option value="all">all（含 Demo 金额硬闸）</option>
+              </select>
+              <button type="button" id="adm-spend-save-btn">保存金额策略</button>
+            </div>
+            <p class="adm-status" id="adm-spend-status"></p>
+            <div class="adm-confirm" id="adm-spend-confirm" hidden></div>
+            <dl id="adm-spend-info" class="adm-kv"></dl>
+          </section>
+          <section class="adm-card">
+            <h2>运行时安全参数</h2>
+            <p class="adm-note">「放开次数限制」不等于取消安全限制（§1.2）：Demo 开关、单任务最大步骤、并发与短窗口速率仍生效。Demo IP 桶当前为 24 小时窗口的 env 配置（只读展示；改造为短窗口请求速率属批次 E）。</p>
+            <div class="adm-form adm-form--grid">
+              <label class="adm-check"><input type="checkbox" id="adm-rt-demo-enabled"> 开放公开 Demo</label>
+              <input type="number" id="adm-rt-psteps" min="1" max="1000000" placeholder="平台单任务最大步骤">
+              <input type="number" id="adm-rt-demosteps" min="1" max="1000000" placeholder="Demo 单任务最大步骤">
+              <input type="number" id="adm-rt-ownsteps" min="1" max="1000000" placeholder="自带 API 单任务最大步骤">
+              <input type="number" id="adm-rt-concurrency" min="1" max="1000000" placeholder="Demo 最大并发">
+              <button type="button" id="adm-rt-save-btn">保存运行时参数</button>
+            </div>
+            <p class="adm-status" id="adm-rt-status"></p>
+            <dl id="adm-rt-info" class="adm-kv"></dl>
+          </section>
+          <section class="adm-card">
+            <h2>当前窗口（立即生效的单独操作）</h2>
+            <p class="adm-note">调整只改当前窗口的额度快照：已消费/预占不回退；调低到低于已消费后，下一次预占即被拒绝。需二次确认并写审计；窗口版本冲突（409）时刷新后重试。</p>
+            <div class="adm-form adm-form--grid">
+              <select id="adm-window-subject" aria-label="选择主体"></select>
+              <input type="text" id="adm-window-newlimit" placeholder="新额度（CNY，如 30.5）" autocomplete="off">
+              <button type="button" id="adm-window-adjust-btn" class="adm-btn-danger">调整当前窗口</button>
+            </div>
+            <p class="adm-status" id="adm-window-status"></p>
+            <div class="adm-confirm" id="adm-window-confirm" hidden></div>
+            <dl id="adm-window-info" class="adm-kv"></dl>
+          </section>
+        </section>
+
         <!-- 额度与账单（§10.4；PR5 补 turn 预算编辑 / caps / 人工调整） -->
         <section class="adm-page" id="adm-page-billing" hidden>
           <div class="adm-state" id="adm-state-billing" data-page-state="idle" role="status" aria-live="polite"></div>
+          <section class="adm-card adm-error-card" id="adm-legacy-card" hidden>
+            <h2>历史影子数据（不参与硬额度）</h2>
+            <p class="adm-note">价格单位修复（批次 A cutover）之前的用量按旧错误价格计价，属历史影子数据：不参与任何当前金额额度/窗口/余额，不与修复后的金额混合汇总。当前周期金额请看「设置」页的金额策略与当前窗口。</p>
+            <dl id="adm-legacy-info" class="adm-kv"></dl>
+          </section>
           <section class="adm-card">
             <h2>对话额度（turn budget · 当前周期）</h2>
             <dl id="adm-billing-turn" class="adm-kv"></dl>

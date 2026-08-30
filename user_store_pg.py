@@ -223,22 +223,92 @@ def create_user(login_id, password, role=ROLE_USER, display_name=None):
         try:
             with pg_store.transaction(conn) as c:
                 with c.cursor() as cur:
-                    sql = (
-                        "INSERT INTO users "
-                        "(user_id, login_id, display_name, password_hash, "
-                        " role, created_at, disabled) "
-                        "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), FALSE) "
-                        "RETURNING " + _SEL_PUBLIC
-                    )
-                    cur.execute(
-                        sql,
-                        (uid, norm_login, name,
-                         generate_password_hash(password), role, now),
-                    )
-                    row = cur.fetchone()
+                    row = _insert_user_tx(
+                        cur, uid, norm_login, name, password, role, now)
         except psycopg.errors.UniqueViolation as exc:
             raise ValueError(_unique_violation_message(exc)) from exc
         return _public(row) if row else None
+    finally:
+        conn.close()
+
+
+def _insert_user_tx(cur, uid, norm_login, name, password, role, now,
+                    ai_access=True):
+    """在调用方事务的 cursor 内插入用户行，返回公共列 dict（不提交）。
+
+    供 :func:`create_user` 与 :func:`create_user_with_spend_override` 共用
+    （后者要求 user 行与 override 策略/audit 同一事务）。ai_access 缺省
+    True 与 users.ai_access 列默认一致（保持 create_user 既有行为；邀请
+    兑换路径经 registration_store 的显式模板值，不经本函数）。
+    """
+    cur.execute(
+        "INSERT INTO users "
+        "(user_id, login_id, display_name, password_hash, "
+        " role, created_at, disabled, ai_access) "
+        "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), FALSE, %s) "
+        "RETURNING " + _SEL_PUBLIC,
+        (uid, norm_login, name, generate_password_hash(password), role,
+         now, bool(ai_access)),
+    )
+    return cur.fetchone()
+
+
+def create_user_with_spend_override(login_id, password, display_name=None,
+                                    ai_access=True,
+                                    monthly_limit_nano_cny=None,
+                                    actor_user_id=None):
+    """**单个 PostgreSQL 事务**内：创建 role=user 用户 + 可选月额度覆盖 + audit。
+
+    批次 D（docs ai-money-budget-bugfix-and-simplification-plan.md §5.1）：
+    owner 经 admin v1 建号时可选 ``monthly_limit_nano_cny``（nano-CNY 整数；
+    None = 继承全局 user_default，不建 override 行）。user 插入、override
+    策略（spend_store.set_user_override_tx）与 ``user.create`` 审计
+    （share_store_pg.record_audit_tx，不吞错）全部同一事务，任一失败整体
+    回滚（用户不存在半创建状态）。
+
+    本入口只创建普通用户（role=user；owner 建号走主机侧 break-glass，docs
+    §3.2 不变量 5）。登录账号冲突抛 ValueError（与 create_user 同文案）。
+    返回 ``(user_dict, override_policy_dict_or_None)``。
+    """
+    norm_login = _normalize_login_id(login_id)
+    if not norm_login:
+        raise ValueError("登录账号不能为空")
+    _validate_password(password)
+    name = str(display_name or "").strip() or norm_login
+    uid = _user_id()
+    now = time.time()
+
+    import share_store_pg
+    import spend_store
+    conn = _connect()
+    try:
+        try:
+            with pg_store.transaction(conn) as c:
+                with c.cursor() as cur:
+                    row = _insert_user_tx(
+                        cur, uid, norm_login, name, password, ROLE_USER, now,
+                        ai_access=ai_access)
+                    override = None
+                    if monthly_limit_nano_cny is not None:
+                        override = spend_store.set_user_override_tx(
+                            cur, uid, monthly_limit_nano_cny,
+                            updated_by=actor_user_id or "admin",
+                            actor_user_id=actor_user_id)
+                    # 审计 detail 只含非敏感字段（§9.6：无密码/token/IP）
+                    share_store_pg.record_audit_tx(
+                        cur, "user.create", actor_user_id=actor_user_id,
+                        actor_role="owner", target_type="user",
+                        target_id=uid,
+                        detail={
+                            "role": ROLE_USER,
+                            "ai_access": bool(ai_access),
+                            "monthly_limit_nano_cny":
+                                None if override is None
+                                else int(override["limit_nano_cny"]),
+                        })
+        except psycopg.errors.UniqueViolation as exc:
+            raise ValueError(_unique_violation_message(exc)) from exc
+        return _public(row), override
     finally:
         conn.close()
 

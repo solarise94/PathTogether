@@ -535,49 +535,31 @@ AUTH_ENABLED = _resolve_auth_enabled()
 
 
 # --------------------------------------------------------------------------- #
-# 启动期 share store 只读 probe（review-2026-08-29 G1/DS-1，与另一分支的
-# shares fail-closed 改造的兼容约定）：
-#   - share_store_json 引入 ShareStoreCorrupt / ShareStoreUnavailable 后，
-#     损坏的 shares.json 不再被静默折叠为空库——本侧用 getattr 兼容探测：
-#     异常类已合入 → 分流 fail-fast SystemExit（类别稳定）；
-#     尚未合入 → 仍执行同一只读 API（get_share 不存在的 token），probe 结构
-#     就位，合入后无需再改这里；
+# 启动期 share store 只读 probe（review-2026-08-29 G1/DS-1）：
+#   - 损坏的 shares.json 不再被静默折叠为空库——ShareStoreCorrupt /
+#     ShareStoreUnavailable 分流 fail-fast SystemExit（类别稳定）；
 #   - 运行期同类异常由下方 errorhandler 稳定映射 503
-#     share_store_corrupt / share_store_unavailable（异常类存在才注册）。
+#     share_store_corrupt / share_store_unavailable。
 # --------------------------------------------------------------------------- #
 def _probe_share_store_at_startup():
     """启动只读 probe：分享库不可读/损坏时拒绝启动（仿 _resolve_auth_enabled）。"""
-    corrupt = getattr(share_store, "ShareStoreCorrupt", ())
-    unavailable = getattr(share_store, "ShareStoreUnavailable", ())
     try:
-        probe = getattr(share_store, "probe_readable", None)
-        if callable(probe):
-            probe()
-        else:
-            share_store.get_share("__startup_probe__")
-    except SystemExit:
-        raise
-    except Exception as e:
-        if corrupt and isinstance(e, corrupt):
-            raise SystemExit(
-                "[startup] 分享库（shares 存储）损坏（share_store_corrupt）："
-                "拒绝启动以免空库写回销毁数据；请从备份恢复后重启。") from e
-        if unavailable and isinstance(e, unavailable):
-            raise SystemExit(
-                "[startup] 分享库（shares 存储）不可读（share_store_unavailable）："
-                "拒绝启动；请检查存储挂载/权限后重启。") from e
-        raise
+        share_store.probe_readable()
+    except share_store.ShareStoreCorrupt as e:
+        raise SystemExit(
+            "[startup] 分享库（shares 存储）损坏（share_store_corrupt）："
+            "拒绝启动以免空库写回销毁数据；请从备份恢复后重启。") from e
+    except share_store.ShareStoreUnavailable as e:
+        raise SystemExit(
+            "[startup] 分享库（shares 存储）不可读（share_store_unavailable）："
+            "拒绝启动；请检查存储挂载/权限后重启。") from e
     return True
 
 
 def _register_share_store_error_handlers():
-    """运行期 share store 专用异常 → 稳定 503（异常类存在才注册）。"""
-    for cls, code in ((getattr(share_store, "ShareStoreCorrupt", None),
-                       "share_store_corrupt"),
-                      (getattr(share_store, "ShareStoreUnavailable", None),
-                       "share_store_unavailable")):
-        if cls is None:
-            continue
+    """运行期 share store 专用异常 → 稳定 503。"""
+    for cls, code in ((share_store.ShareStoreCorrupt, "share_store_corrupt"),
+                      (share_store.ShareStoreUnavailable, "share_store_unavailable")):
 
         def _handler(exc, code=code):
             app.logger.error("share store %s：请求拒绝（类别见 code）", code,
@@ -7264,9 +7246,13 @@ def api_upload():
         _upload_legacy_fail(upload_id, token, task, permanent=False)
         return jsonify(error="上传已失效，请重试", code="commit_retryable"), 503
     except upload_task_store.TaskNotFound:
+        # 任务由本请求 begin_legacy_commit 刚创建，正常不可达；真发生说明
+        # 任务存储被外部清空/换后端，属内部故障——记日志并按 500 处理，
+        # 不伪装成权限问题。
+        app.logger.error("V1 上传收口时任务丢失（upload_id=%s）", upload_id)
         dest.unlink(missing_ok=True)
         _upload_release_quietly(reservation)
-        return jsonify(error="无上传权限"), 403
+        return jsonify(error="上传任务状态丢失，请重试", code="upload_task_lost"), 500
     except Exception:
         app.logger.exception(
             "V1 上传收口失败（任务保持 committing，由恢复扫描幂等补账）：%s",
@@ -7361,9 +7347,11 @@ def _api_upload_zip(file, filename, safe, ident, reservation):
                                 remove_names=[a["name"] for a in artifacts])
             return jsonify(error="上传已失效，请重试", code="commit_retryable"), 503
         except upload_task_store.TaskNotFound:
+            # 同单文件分支：本请求内刚创建的任务丢失属内部故障，不伪装 403。
+            app.logger.error("V1 zip 上传收口时任务丢失（upload_id=%s）", upload_id)
             _upload_legacy_fail(upload_id, token, task, permanent=True,
                                 remove_names=[a["name"] for a in artifacts])
-            return jsonify(error="无上传权限"), 403
+            return jsonify(error="上传任务状态丢失，请重试", code="upload_task_lost"), 500
         except Exception:
             app.logger.exception(
                 "V1 zip 上传收口失败（任务保持 committing，由恢复扫描幂等补账）：%s",

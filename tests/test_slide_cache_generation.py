@@ -421,3 +421,93 @@ def test_share_server_slides_info_follows_signature(share_env, fake_pairs):
     r2 = c.get("/s/%s/api/slides" % token)
     assert r2.status_code == 200
     assert r2.get_json()[0]["exists"] is True
+
+
+# --------------------------------------------------------------------------- #
+# 7) 字面双进程：分享进程不 evict，管理端（本进程）替换文件后照常换代
+#    （G3「app/share_server 两进程都看到新切片」的直接证据；上面各用例是
+#    同进程等价，本用例补跨进程形态——子进程模拟 share_server 工作进程）
+# --------------------------------------------------------------------------- #
+_READER_CHILD = r"""
+import os, sys, time, types
+from pathlib import Path
+
+# openslide stub（与 tests/_bootstrap 同款；slide_cache import 期需要）
+try:
+    import openslide  # noqa: F401
+except ImportError:
+    _o = types.ModuleType("openslide"); _o.OpenSlide = object
+    _d = types.ModuleType("openslide.deepzoom"); _d.DeepZoomGenerator = object
+    _o.deepzoom = _d
+    sys.modules.setdefault("openslide", _o)
+    sys.modules.setdefault("openslide.deepzoom", _d)
+
+sys.path.insert(0, %(repo)r)
+import slide_cache
+
+
+class FakeOsr:
+    def __init__(self, marker):
+        self.marker = marker
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def fake_make(path, generation):
+    return {"osr": FakeOsr(Path(path).read_text(encoding="utf-8")),
+            "dz": None, "gen": generation}
+
+
+slide_cache._make_pair = fake_make
+
+slide, ready, go = sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3])
+entry = slide_cache.get_slide("demo.svs", slide)
+with slide_cache.borrow_pair(entry) as p1:
+    m1, g1 = p1["osr"].marker, p1["gen"]
+ready.write_text("1", encoding="utf-8")
+deadline = time.time() + 60
+while not go.exists() and time.time() < deadline:
+    time.sleep(0.05)
+# 本进程从未收到 evict：换代只能来自借用时的签名检查
+with slide_cache.borrow_pair(entry) as p2:
+    m2, g2 = p2["osr"].marker, p2["gen"]
+print(repr((m1, g1, m2, g2)))
+"""
+
+
+def test_cross_process_replacement_switches_generation(tmp_path):
+    """子进程持有句柄池（不知会 evict）；本进程「保持 mtime+size」同名替换后，
+    子进程再次借用必须读到新代（签名只剩 ino 可判别的最难形态）。"""
+    import ast
+    import subprocess
+
+    slide = tmp_path / "demo.svs"
+    slide.write_text("v1", encoding="utf-8")
+    ready = tmp_path / "ready"
+    go = tmp_path / "go"
+
+    repo = Path(__file__).resolve().parent.parent
+    code = _READER_CHILD % {"repo": str(repo)}
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code, str(slide), str(ready), str(go)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.time() + 60
+        while not ready.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert ready.exists(), "子进程未能建立首代句柄"
+        # 管理端同名重传：保持 mtime+size，只换 inode
+        _replace_preserving_stat(slide, "v2")
+        go.write_text("1", encoding="utf-8")
+        out, err = proc.communicate(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    assert proc.returncode == 0, "reader 子进程失败：%s" % err
+    m1, g1, m2, g2 = ast.literal_eval(out.strip())
+    assert m1 == "v1"
+    assert m2.startswith("v2"), "子进程仍读到旧代内容：%r" % (m2,)
+    assert g2 > g1, "子进程未换代：gen %s -> %s" % (g1, g2)

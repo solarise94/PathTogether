@@ -72,10 +72,8 @@ def test_secret_key_missing_creates_and_is_stable(tmp_path):
     p = tmp_path / "flask_secret.key"
     assert p.is_file()
     assert app_mod._load_or_create_secret_key() == k1  # 重启不轮换
-    try:
-        assert (p.stat().st_mode & 0o777) == 0o600
-    except AssertionError:  # pragma: no cover - 平台差异兜底
-        pass
+    # 本仓仅支持 POSIX（全仓 fcntl），0600 为硬约定，不做平台兜底
+    assert (p.stat().st_mode & 0o777) == 0o600
 
 
 def test_secret_key_empty_file_exits(tmp_path, caplog):
@@ -84,7 +82,8 @@ def test_secret_key_empty_file_exits(tmp_path, caplog):
         with pytest.raises(SystemExit) as ei:
             app_mod._load_or_create_secret_key()
     assert "内容为空" in str(ei.value)
-    assert not (tmp_path / "flask_secret.lock").exists() or True
+    # fail-fast 不得触碰原文件（空文件不得被轮换覆盖）
+    assert (tmp_path / "flask_secret.key").read_text() == "   \n"
 
 
 def test_secret_key_unreadable_exits(tmp_path, monkeypatch, caplog):

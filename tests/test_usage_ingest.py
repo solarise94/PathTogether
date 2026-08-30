@@ -853,8 +853,8 @@ def test_billing_subject_owner_user_dispatch_matches_resolution():
 @PG
 def test_billing_subject_demo_dispatch_matches_resolution():
     """demo /api/demo/ai/run：config.billing_subject = {demo, capability id,
-    null}，与 resolver 第②步 demo_sessions.id 同值 → 喂回 ingest 无 409、
-    demo 主体不入 ledger/不开户。"""
+    null}，与 resolver 第②步（0026 起 demo_runs.capability_id）同值 → 喂回
+    ingest 无 409、demo 主体不入 ledger/不开户。"""
     import budget_store
     import demo_store
     import share_store as share_store_mod
@@ -888,17 +888,18 @@ def test_billing_subject_demo_dispatch_matches_resolution():
     subject = body["config"]["billing_subject"]
     assert subject["subject_type"] == "demo"
     assert subject["user_id"] is None
-    # subject_id 必须是 demo_sessions 行 id（resolver 第②步同值）
+    # subject_id 必须是 demo_sessions 行 id（capability id）；session 绑定在
+    # demo_runs 流水（0026 起 resolver 第②步主源，capability_id 同值）
     conn = bh.connect()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM demo_sessions "
+            cur.execute("SELECT capability_id FROM demo_runs "
                         "WHERE histopilot_session_id=%s", (session_id,))
             row = cur.fetchone()
     finally:
         conn.close()
     assert row is not None
-    assert subject["subject_id"] == row["id"]
+    assert subject["subject_id"] == row["capability_id"]
 
     event = _usage_event_from_dispatch(
         "05_demo_subject_offpeak.json", subject, rid, session_id, "e5")

@@ -214,7 +214,10 @@ def bind_reservation(request_id, session_id, subject_type, subject_id,
 
 def bind_demo_session(histopilot_session_id, capability_id=None,
                       run_state="consumed", conn=None):
-    """直接插一条 demo_sessions（histopilot_session_id 绑定，恢复 demo 主体）。"""
+    """直接插一条 demo_sessions（histopilot_session_id 绑定，恢复 demo 主体）。
+
+    0026 前的**历史行形态**（resolver 第②步回退源）；新模型的绑定请用
+    :func:`bind_demo_run`（批次 E：capability 与 run 分离）。"""
     own = conn is None
     if own:
         conn = connect()
@@ -236,6 +239,49 @@ def bind_demo_session(histopilot_session_id, capability_id=None,
     finally:
         if own:
             conn.close()
+
+
+def bind_demo_run(histopilot_session_id, capability_id=None, conn=None):
+    """0026 模型：插 demo_sessions（capability）+ demo_runs（accepted 流水，
+    绑定 histopilot_session_id）——resolver 第②步的主绑定源（批次 E）。
+
+    返回 capability id（= 权威 subject_id）。同一 capability 可先后绑定多个
+    HP session（顺序多次 run 各绑各的）：复用同一 capability_id 再次调用时，
+    上一条 active 流水先转 finished（终态后才能再开，模拟顺序体验）。"""
+    import pg_store
+    own = conn is None
+    if own:
+        conn = connect()
+    try:
+        cap = capability_id or ("demo_cap_" + uuid.uuid4().hex[:20])
+        rid = "req_" + uuid.uuid4().hex[:16]
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO demo_sessions "
+                    "(id, token_hash, created_at, expires_at) "
+                    "VALUES (%s,%s, now(), now() + interval '1 day') "
+                    "ON CONFLICT (id) DO NOTHING",
+                    (cap, "tok_" + uuid.uuid4().hex))
+                # 顺序语义：同 capability 上一个 active run 先终态化
+                cur.execute(
+                    "UPDATE demo_runs SET state='finished', "
+                    "finished_at=now(), updated_at=now() "
+                    "WHERE capability_id=%s AND state IN "
+                    "('reserved', 'accepted')", (cap,))
+                cur.execute(
+                    "INSERT INTO demo_runs "
+                    "(demo_run_id, capability_id, request_id, state, "
+                    " histopilot_session_id, slide_id, accepted_at, "
+                    " expires_at) "
+                    "VALUES (%s,%s,%s,'accepted',%s,'sld_stub', now(), "
+                    " now() + interval '1 hour')",
+                    ("dmr_" + uuid.uuid4().hex[:20], cap, rid,
+                     histopilot_session_id))
+    finally:
+        if own:
+            conn.close()
+    return cap
 
 
 def now_utc() -> datetime:

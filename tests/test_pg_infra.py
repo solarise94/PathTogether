@@ -158,6 +158,7 @@ def test_schema_migrations_recorded(conn):
         "0023_spend_policies_windows.sql",
         "0024_billing_holds_spend_strong_settle.sql",
         "0025_invite_monthly_limit.sql",
+        "0026_demo_runs.sql",
     ]
 
 

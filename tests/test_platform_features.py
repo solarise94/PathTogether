@@ -85,11 +85,15 @@ def test_demo_store_fail_closed_on_json_and_dual(monkeypatch, backend):
     with pytest.raises(platform_features.PgFeatureUnavailable):
         demo_store.reserve_run("dmo_1", "req_1", "sld_a", "rev_1")
     with pytest.raises(platform_features.PgFeatureUnavailable):
-        demo_store.consume_run("dmo_1", "hp_sess")
+        demo_store.accept_run("dmr_1", "hp_sess")
     with pytest.raises(platform_features.PgFeatureUnavailable):
-        demo_store.release_run("dmo_1")
+        demo_store.release_run("dmr_1")
     with pytest.raises(platform_features.PgFeatureUnavailable):
-        demo_store.reclaim_expired_runs(0)
+        demo_store.finish_run("dmr_1")
+    with pytest.raises(platform_features.PgFeatureUnavailable):
+        demo_store.expire_run("dmr_1")
+    with pytest.raises(platform_features.PgFeatureUnavailable):
+        demo_store.hit_ip_request_rate("ipp_1")
     with pytest.raises(platform_features.PgFeatureUnavailable):
         demo_store.revoke_by_slide("sld_a")
     with pytest.raises(platform_features.PgFeatureUnavailable):

@@ -212,14 +212,19 @@ def test_reserve_rejects_cross_subject_request_id_reuse():
     assert budget_store.get_reservation(rid)["state"] == "consumed"
 
 
-def test_demo_per_browser_limit_and_concurrency_enforced():
+def test_demo_concurrency_enforced_and_per_browser_gate_retired():
+    """批次 E：每浏览器累计次数闸退役（同 capability 可顺序多次预占不同
+    request_id）；demo_max_concurrency 全站并发闸仍生效。"""
     budget_store.update_period_limits({
-        "demo_per_browser_limit": 1, "demo_max_concurrency": 1,
-        "demo_turn_limit": 5})
-    budget_store.reserve_turn(_req(), "demo", "dmo_same", "platform")
-    with pytest.raises(budget_store.DemoPerBrowserExhausted) as ei:
-        budget_store.reserve_turn(_req(), "demo", "dmo_same", "platform")
-    assert ei.value.code == "demo_run_already_used"
+        "demo_per_browser_limit": 1, "demo_max_concurrency": 3,
+        "demo_turn_limit": 50})
+    # 同 subject 连续 3 个不同 request_id 全部放行：旧 per-browser 闸
+    # （DemoPerBrowserExhausted / demo_run_already_used）已删除
+    for _ in range(3):
+        assert budget_store.reserve_turn(
+            _req(), "demo", "dmo_same", "platform")["state"] == "reserved"
+    assert not hasattr(budget_store, "DemoPerBrowserExhausted")
+    # 全站并发（在途 reserved 计数）仍拦截（第 4 个在途，任意 capability）
     with pytest.raises(budget_store.DemoConcurrencyExceeded) as ei2:
         budget_store.reserve_turn(_req(), "demo", "dmo_other", "platform")
     assert ei2.value.code == "demo_concurrency_exceeded"

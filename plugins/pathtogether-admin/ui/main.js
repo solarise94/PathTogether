@@ -1420,10 +1420,11 @@
       if (rt.available === false) {
         kvRow(rtDl, "可用性", "不可用（" + (rt.code || "pg_backend_required") + "）");
       } else {
-        kvRow(rtDl, "Demo IP 桶（只读，env 配置）",
-          rt.demo_ip_run_limit + " 次 / " +
-          Math.round((rt.demo_ip_run_window_seconds || 0) / 3600) +
-          " 小时窗口（改造为短窗口请求速率属批次 E）");
+        // 批次 E 起：IP 保护为每分钟请求数短窗口（防刷/防 DoS，env 配置只读）
+        kvRow(rtDl, "Demo IP 短窗口请求速率（只读，env 配置）",
+          rt.demo_ip_request_rate_per_minute + " 次 / " +
+          Math.round((rt.demo_ip_request_rate_window_seconds || 60) / 60) +
+          " 分钟窗口（DEMO_IP_RATE_PER_MINUTE，≤0 关闭；非消费额度）");
       }
     }
   }

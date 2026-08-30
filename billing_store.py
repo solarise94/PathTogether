@@ -571,9 +571,12 @@ def _resolve_usage_subject(cur, event, installation_id):
     确认）与 released（已退款，可能随后被重试重新 consume 并带 session）都
     落到后续步骤，最终无权威来源时按 usage_subject_not_ready 可重试。
 
-    ② session_id → demo_sessions.histopilot_session_id：恢复 demo subject
-    （capability id）。不过滤过期：计量归属是历史事实，过期 capability 的
-    事件仍应入账（只计量、不开户、不写 ledger）。
+    ② session_id → demo 主体绑定行（0026 起 demo_runs.histopilot_session_id，
+    回退 demo_sessions.histopilot_session_id 读 0026 前的历史行）：恢复 demo
+    subject（capability id）。不过滤过期：计量归属是历史事实，过期 capability
+    的事件仍应入账（只计量、不开户、不写 ledger）。批次 E 的顺序多次 run 使
+    同一 capability 可先后绑定多个 HP session——各 run 流水行独立携带自己的
+    histopilot_session_id，互不覆盖。
 
     ③ run_grants **仅交叉校验**（§7.2 步骤 3 原文：run grant 只覆盖需要写
     能力的 run，不能作为只读调用唯一的主体来源）：取该 session 绑定、且
@@ -604,11 +607,20 @@ def _resolve_usage_subject(cur, event, installation_id):
 
     if resolved is None:
         cur.execute(
-            "SELECT id FROM demo_sessions WHERE histopilot_session_id=%s "
+            "SELECT capability_id FROM demo_runs "
+            "WHERE histopilot_session_id=%s "
             "ORDER BY created_at DESC LIMIT 1", (session_id,))
-        demo = cur.fetchone()
-        if demo is not None:
-            resolved = ("demo", demo["id"])
+        demo_run = cur.fetchone()
+        if demo_run is not None:
+            resolved = ("demo", demo_run["capability_id"])
+        else:
+            # 0026 前的历史行：一次性状态机时代 session 绑定写在 demo_sessions
+            cur.execute(
+                "SELECT id FROM demo_sessions WHERE histopilot_session_id=%s "
+                "ORDER BY created_at DESC LIMIT 1", (session_id,))
+            demo = cur.fetchone()
+            if demo is not None:
+                resolved = ("demo", demo["id"])
 
     # ③ 交叉校验（只校验、不补位）：失效/撤销 grant 也在查询范围内——过期
     # 不改变「谁创建过这个 run」的历史事实，删掉会让迟到的 usage 事件失去

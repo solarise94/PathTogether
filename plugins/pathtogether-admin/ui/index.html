@@ -257,7 +257,7 @@
           </section>
           <section class="adm-card">
             <h2>运行时安全参数</h2>
-            <p class="adm-note">「放开次数限制」不等于取消安全限制（§1.2）：Demo 开关、单任务最大步骤、并发与短窗口速率仍生效。Demo IP 桶当前为 24 小时窗口的 env 配置（只读展示；改造为短窗口请求速率属批次 E）。</p>
+            <p class="adm-note">「放开次数限制」不等于取消安全限制（§1.2）：Demo 开关、单任务最大步骤、并发、同浏览器单在途 run 与短窗口请求速率仍生效。Demo IP 保护现为每分钟请求数短窗口（env 配置只读展示；每浏览器累计次数闸已随批次 E 退役）。</p>
             <div class="adm-form adm-form--grid">
               <label class="adm-check"><input type="checkbox" id="adm-rt-demo-enabled"> 开放公开 Demo</label>
               <input type="number" id="adm-rt-psteps" min="1" max="1000000" placeholder="平台单任务最大步骤">

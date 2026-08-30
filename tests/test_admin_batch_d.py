@@ -717,8 +717,8 @@ def test_settings_aggregate_sections_and_decimal_strings():
     demo_win = spend["current_windows"]["demo"]
     assert demo_win["limit_nano_snapshot"] == str(50 * 10 ** 9)
     assert demo_win["remaining_nano"] == str(50 * 10 ** 9)
-    # runtime 段：安全参数 + Demo IP 桶现状
+    # runtime 段：安全参数 + Demo IP 短窗口请求速率现状（批次 E 起只读观测）
     rt = body["runtime"]
     assert rt["available"] is True
     assert rt["limits"]["demo_enabled"] is not None
-    assert isinstance(rt["demo_ip_run_limit"], int)
+    assert isinstance(rt["demo_ip_request_rate_per_minute"], int)

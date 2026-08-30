@@ -461,7 +461,10 @@ def test_budget_api_owner_get_put_reset():
     assert j["usage"]["per_user"][0]["subject_id"] == u["user_id"]
     assert j["limits"]["platform_turn_limit"] == 30
     assert j["concurrency"]["current"] >= 1
-    assert j["demo_sessions"]["consumed"] == 0
+    # 批次 E：run 用量卡片改为 demo_runs 流水计数（demo_sessions 键退役）
+    assert j["demo_runs"]["total"] == 0
+    assert j["demo_runs"]["active"] == 0
+    assert "demo_sessions" not in j
     # PUT：改限制不清用量；负值/未知字段拒绝
     r2 = c.put("/api/admin/settings/ai-budget", json={
         "platform_turn_limit": 50, "user_turn_limit": 12,
@@ -498,26 +501,34 @@ def test_budget_api_owner_get_put_reset():
 
 
 @pg_only
-def test_budget_reset_also_clears_demo_browser_and_ip_gates():
-    """一键重置同时退回 Demo consumed，IP 桶不再计入。"""
+def test_budget_reset_expires_inflight_demo_runs():
+    """一键重置：在途 demo run 转 expired 终态（capability 立即可再开）。
+
+    批次 E：每浏览器累计闸与 24h 成功次数 IP 桶已退役（无对象可清）；预算
+    reservation 不随 reset 盲动（确认式对账定局）。
+    """
     _setup_platform()
     o = _make_user("owner")
     demo_store.create_capability("dmo_rst", "hash_rst", ip_prefix_hash="ipp_rst")
-    demo_store.reserve_run("dmo_rst", "req_rst", "sld_a", "rev_1",
-                           ip_prefix_hash="ipp_rst")
-    demo_store.consume_run("dmo_rst", "hp_rst")
-    assert demo_store.count_ip_runs("ipp_rst")["count"] == 1
+    run = demo_store.reserve_run("dmo_rst", "req_rst", "sld_a", "rev_1",
+                                 ip_prefix_hash="ipp_rst")
+    assert run is not None
     c = _client()
     _login(c, "owner", o["user_id"])
     got = c.get("/api/admin/settings/ai-budget").get_json()
-    assert got["demo_sessions"]["consumed"] == 1
+    assert got["demo_runs"]["active"] == 1
+    assert got["demo_runs"]["reserved"] == 1
     r = c.post("/api/admin/settings/ai-budget/reset", json={"confirm": True})
     assert r.status_code == 200
     assert r.get_json()["demo_runs_reset"] == 1
-    assert demo_store.get_session("dmo_rst")["run_state"] == "available"
-    assert demo_store.count_ip_runs("ipp_rst")["count"] == 0
+    assert demo_store.get_run(run["demo_run_id"])["state"] == "expired"
+    assert demo_store.count_run_states()["active"] == 0
+    # capability 立即可再开（不使 cookie 失效）
+    nxt = demo_store.reserve_run("dmo_rst", "req_rst2", "sld_a", "rev_1")
+    assert nxt is not None and nxt["state"] == "reserved"
     after = c.get("/api/admin/settings/ai-budget").get_json()
-    assert after["demo_sessions"]["consumed"] == 0
+    assert after["demo_runs"]["total"] == 2  # 流水保留（append-only）
+    assert after["demo_runs"]["active"] == 1
     assert after["usage"]["platform"]["total"] == 0
 
 

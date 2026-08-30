@@ -72,7 +72,8 @@ DEFAULT_PLATFORM_TASK_MAX_STEPS = 20
 DEFAULT_OWN_TASK_MAX_STEPS_LIMIT = 500
 DEFAULT_DEMO_TASK_MAX_STEPS = 20
 DEFAULT_DEMO_ENABLED = False
-DEFAULT_DEMO_PER_BROWSER_LIMIT = 1
+#: 批次 E（§4.1）：每浏览器累计次数闸已退役。demo_per_browser_limit 列仍在
+#: _PERIOD_LIMIT_COLUMNS（admin 兼容展示，批次 F 一并清理），但运行时不再读取。
 DEFAULT_DEMO_MAX_CONCURRENCY = 2
 
 #: reservation 默认 TTL（docs §5.3：reserved 默认 10 分钟过期）
@@ -97,6 +98,7 @@ _PERIOD_LIMIT_COLUMNS = {
     "own_task_max_steps_limit": int,
     "demo_task_max_steps": int,
     "demo_enabled": bool,
+    # 批次 E 起 demo_per_browser_limit 仅兼容展示（无运行时闸）；批次 F 退役列
     "demo_per_browser_limit": int,
     "demo_max_concurrency": int,
 }
@@ -155,12 +157,6 @@ class DemoConcurrencyExceeded(BudgetError):
     """Demo 在途 reserved 数达到 demo_max_concurrency。"""
 
     code = "demo_concurrency_exceeded"
-
-
-class DemoPerBrowserExhausted(BudgetError):
-    """该 Demo capability 已达到 demo_per_browser_limit。"""
-
-    code = "demo_run_already_used"
 
 
 class ReservationAttemptConflict(BudgetError):
@@ -586,8 +582,10 @@ def _check_platform_quota(cur, period, subject_type, subject_id):
       - user：单 user 上限 → user 共享池（Σ subject_type=user）→ owner 保留
         保护（Σ user + Σ demo ≤ platform_turn_limit - owner_reserved_turn_limit）；
       - demo：Demo 每日子额度（滚动 24h 窗口，_demo_window_used；0014 起
-        demo_turn_limit 为单日上限，与周期总量口径不同，不再可比）/每浏览器/
-        并发 → owner 保留保护（同上；owner 保留闸仍按周期累计口径判定）。
+        demo_turn_limit 为单日上限，与周期总量口径不同，不再可比）/并发 →
+        owner 保留保护（同上；owner 保留闸仍按周期累计口径判定）。批次 E 起
+        每浏览器累计次数闸已退役（见下）；同 capability 单 active run 约束在
+        demo_store.demo_runs（部分唯一索引），不在此处。
     """
     pid = period["id"]
     used_total = _sum_used(cur, pid, credential_source="platform")
@@ -604,16 +602,11 @@ def _check_platform_quota(cur, period, subject_type, subject_id):
                 "Demo 每日额度已耗尽（滚动 24 小时，%d/%d）" % (
                     used_demo_window, period["demo_turn_limit"]),
                 limit=period["demo_turn_limit"], used=used_demo_window)
-        per_browser = int(period.get("demo_per_browser_limit")
-                          or DEFAULT_DEMO_PER_BROWSER_LIMIT)
-        used_browser = _sum_used(cur, pid, subject_type="demo",
-                                 subject_id=subject_id,
-                                 credential_source="platform")
-        if per_browser > 0 and used_browser + 1 > per_browser:
-            raise DemoPerBrowserExhausted(
-                "该浏览器 Demo 次数已用完（%d/%d）" % (
-                    used_browser, per_browser),
-                limit=per_browser, used=used_browser, subject_id=subject_id)
+        # 批次 E（§1.2/§4.1）：每浏览器累计次数闸（demo_per_browser_limit /
+        # DemoPerBrowserExhausted / demo_run_already_used）已退役——capability
+        # 与 run 分离后同 capability 可顺序多次 run，无累计成功次数上限。
+        # 「同 capability 同时至多一个 active run」由 demo_store.demo_runs 的
+        # 部分唯一索引保证，不在本判定内。
         max_cc = int(period.get("demo_max_concurrency")
                      or DEFAULT_DEMO_MAX_CONCURRENCY)
         if max_cc > 0:

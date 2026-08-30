@@ -265,14 +265,13 @@ describe("demo.js 终态 session 不循环重连", () => {
 			const u = String(url);
 			calls.push(u);
 			if (u.includes("/api/demo/config")) {
+				// 批次 E：run_state 来自 demo_runs（accepted=在途可恢复；finished=终态）
 				return jsonResponse({
 					demo_enabled: true,
 					ai_available: true,
-					run_state: consumed ? "consumed" : "available",
+					run_state: consumed ? "accepted" : null,
 					histopilot_session_id: consumed ? "sess_term" : null,
-					per_browser_limit: 1,
-					per_browser_used: consumed ? 1 : 0,
-					per_browser_remaining: consumed ? 0 : 1,
+					active_run: consumed,
 					budget: { demo_used: 1, demo_limit: 10, demo_exhausted: false, platform_exhausted: false },
 				});
 			}
@@ -283,7 +282,7 @@ describe("demo.js 终态 session 不循环重连", () => {
 		}) as unknown as typeof fetch;
 	}
 
-	it("页面 restore 会对 consumed session 请求一次 stream", async () => {
+	it("页面 restore 会对 accepted run 的 session 请求一次 stream", async () => {
 		const w = loadDemo(makeFetch(true));
 		await w.HP_DEMO.loadConfig({ restore: true });
 		expect(calls.some((u) => u.includes("/stream"))).toBe(true);
@@ -338,11 +337,9 @@ describe("demo.js 恢复流断线后重连", () => {
 				return jsonResponse({
 					demo_enabled: true,
 					ai_available: true,
-					run_state: "consumed",
+					run_state: "accepted",
 					histopilot_session_id: "sess_live",
-					per_browser_limit: 1,
-					per_browser_used: 1,
-					per_browser_remaining: 0,
+					active_run: true,
 					budget: { demo_used: 1, demo_limit: 10, demo_exhausted: false, platform_exhausted: false },
 				});
 			}
@@ -382,12 +379,12 @@ describe("demo.js 恢复流断线后重连", () => {
 });
 
 describe("demo.js IP 限流 429", () => {
-	it("startRun 遇到 demo_ip_rate_limited 时禁用按钮", async () => {
+	it("startRun 遇到 demo_ip_request_rate_limited 时禁用按钮", async () => {
 		const fetchImpl = vi.fn((url: string) => {
 			const u = String(url);
 			if (u.includes("/api/demo/ai/run")) {
 				return jsonResponse(
-					{ code: "demo_ip_rate_limited", error: "ip limited" },
+					{ code: "demo_ip_request_rate_limited", error: "ip limited" },
 					{},
 					429,
 				);
@@ -406,6 +403,31 @@ describe("demo.js IP 限流 429", () => {
 		expect(btn.disabled).toBe(true);
 		expect(btn.textContent).toBe("demo.ai.run.ip.limited");
 	});
+
+	it("startRun 遇到 demo_run_in_progress（单 active 并发闸）时按运行中呈现", async () => {
+		const fetchImpl = vi.fn((url: string) => {
+			const u = String(url);
+			if (u.includes("/api/demo/ai/run")) {
+				return jsonResponse(
+					{ code: "demo_run_in_progress", error: "in progress", active_run: true },
+					{},
+					409,
+				);
+			}
+			return jsonResponse({});
+		}) as unknown as typeof fetch;
+		const w = loadDemo(fetchImpl);
+		w.HP_DEMO.state.current = { slide_id: "sld_x" };
+		w.HP_DEMO.startRun();
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		const btn = (globalThis as { document: { getElementById: (id: string) => { disabled: boolean; textContent: string } } })
+			.document.getElementById("ai-run-btn");
+		expect(w.HP_DEMO.state.running).toBe(false);
+		expect(btn.disabled).toBe(true);
+		expect(btn.textContent).toBe("demo.ai.run.running");
+	});
 });
 
 describe("demo.js 展示 text_delta 并在 agent_paused 结束本轮", () => {
@@ -416,11 +438,9 @@ describe("demo.js 展示 text_delta 并在 agent_paused 结束本轮", () => {
 				return jsonResponse({
 					demo_enabled: true,
 					ai_available: true,
-					run_state: "consumed",
+					run_state: "accepted",
 					histopilot_session_id: "sess_term",
-					per_browser_limit: 1,
-					per_browser_used: 1,
-					per_browser_remaining: 0,
+					active_run: true,
 					budget: { demo_used: 1, demo_limit: 10, demo_exhausted: false, platform_exhausted: false },
 				});
 			}
@@ -454,11 +474,9 @@ describe("demo.js 展示 text_delta 并在 agent_paused 结束本轮", () => {
 				return jsonResponse({
 					demo_enabled: true,
 					ai_available: true,
-					run_state: "consumed",
+					run_state: "accepted",
 					histopilot_session_id: "sess_paused",
-					per_browser_limit: 1,
-					per_browser_used: 1,
-					per_browser_remaining: 0,
+					active_run: true,
 					budget: { demo_used: 1, demo_limit: 10, demo_exhausted: false, platform_exhausted: false },
 				});
 			}

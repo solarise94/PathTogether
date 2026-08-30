@@ -329,13 +329,15 @@ def test_capability_issuance_and_config():
     assert cfg["demo_enabled"] is True
     assert cfg["adapter_mode"] == "plugin-contract"
     assert cfg["ai_available"] is True
-    assert cfg["run_state"] == "available"
+    assert cfg["run_state"] is None  # 新 capability 无 run 流水（可立即体验）
+    assert cfg["active_run"] is False
     assert cfg["task_max_steps"] == budget_store.DEFAULT_DEMO_TASK_MAX_STEPS
     assert cfg["task_max_chars"] == 300
     assert cfg["budget"]["demo_limit"] == budget_store.DEFAULT_DEMO_TURN_LIMIT
-    assert cfg["per_browser_limit"] == 1
-    assert cfg["per_browser_used"] == 0
-    assert cfg["per_browser_remaining"] == 1
+    # 批次 E：每浏览器累计次数闸退役，config 不再有 per_browser_* 字段
+    assert "per_browser_limit" not in cfg
+    assert "per_browser_used" not in cfg
+    assert "per_browser_remaining" not in cfg
     # 未带 capability：slides 端点 401（签发只在 /demo 与 /config）
     client2 = _client()
     assert client2.get("/api/demo/slides").status_code == 401
@@ -454,19 +456,23 @@ def test_demo_run_full_flow_and_security_envelope():
     assert cfg["session_owner"].startswith("demo_")
     assert len(cfg["session_owner"]) == len("demo_") + 16
     assert "run_grant" not in cfg  # 只读 run 不发 grant（docs §5.4-5）
-    # consume：run_state=consumed + 双记账
+    # accept + finish：run 终态 + 双记账（读 r.data 耗尽 fake SSE → on_finished）
+    assert r.get_data()
     after = client.get("/api/demo/config").get_json()
-    assert after["run_state"] == "consumed"
+    assert after["run_state"] == "finished"
     assert after["histopilot_session_id"] == "sess-demo-1"
-    assert after["per_browser_used"] == 1
-    assert after["per_browser_remaining"] == 0
+    assert after["session_reconnect_until"] is not None
     assert _demo_usage_total() == 1
     assert _platform_usage_total() == 1
-    # 再跑一次（新动作）→ 409 已使用
+    # 批次 E：终态后同 capability 可顺序再跑（无每浏览器累计上限）
     r2 = client.post("/api/demo/ai/run", json={"slide_id": slide_id})
-    assert r2.status_code == 409
-    assert (r2.get_json() or {}).get("code") == "demo_run_already_used"
-    assert _demo_usage_total() == 1  # 未双扣
+    assert r2.status_code == 200, r2.get_json()
+    assert r2.get_data()
+    cfg3 = client.get("/api/demo/config").get_json()
+    assert cfg3["run_state"] == "finished"
+    assert cfg3["histopilot_session_id"] == "sess-demo-1"
+    assert _demo_usage_total() == 2  # 每次成功 run 各计一次
+    assert demo_store.count_run_states()["total"] == 2
 
 
 @pg_only
@@ -478,14 +484,16 @@ def test_demo_run_double_click_only_one_succeeds():
     client = _client()
     client.get("/api/demo/config")
     rid = "req_" + uuid.uuid4().hex[:12]
-    # 双击：同 request_id 两次（第二次 CAS 冲突 → 409；预算只预占一次）
+    # 双击：同 request_id 两次（第二次命中在途重放：run/预算都只计一次；
+    # 真实 HistoPilot 按 request_id 幂等去重，fake 不去重故转发两次）
     r1 = client.post("/api/demo/ai/run",
                      json={"slide_id": slide_id, "request_id": rid})
     r2 = client.post("/api/demo/ai/run",
                      json={"slide_id": slide_id, "request_id": rid})
-    assert {r1.status_code, r2.status_code} == {200, 409}
-    assert len(fake.calls_of("POST", "/run")) == 1
-    assert _demo_usage_total() == 1
+    assert r1.status_code == r2.status_code == 200
+    assert r1.get_data() and r2.get_data()
+    assert _demo_usage_total() == 1  # 同 ID 重放不双扣
+    assert demo_store.count_run_states()["total"] == 1  # 单条 run 流水
 
 
 @pg_only
@@ -503,16 +511,20 @@ def test_demo_run_retry_same_request_id_no_double_charge():
     r1 = client.post("/api/demo/ai/run",
                      json={"slide_id": slide_id, "request_id": rid})
     assert r1.status_code == 400
-    assert client.get("/api/demo/config").get_json()["run_state"] == "available"
+    cfg = client.get("/api/demo/config").get_json()
+    assert cfg["run_state"] == "released"  # 终态：可立即重试
     report = budget_store.usage_report()
     assert report["demo"]["reserved"] == 0 and report["demo"]["accepted"] == 0
-    # 同 request_id 重试成功 → 只计 1 次
+    # 同 request_id 重试成功 → 只计 1 次（released 复位 attempt+1）
     fake.on("POST", "/run", lambda p, b, q, h: _sse_ok("sess-retry"))
     r2 = client.post("/api/demo/ai/run",
                      json={"slide_id": slide_id, "request_id": rid})
     assert r2.status_code == 200
+    assert r2.get_data()
     assert _demo_usage_total() == 1
-    assert client.get("/api/demo/config").get_json()["run_state"] == "consumed"
+    assert client.get("/api/demo/config").get_json()["run_state"] == "finished"
+    assert client.get("/api/demo/config").get_json()["histopilot_session_id"] == \
+        "sess-retry"
 
 
 @pg_only
@@ -527,7 +539,7 @@ def test_demo_run_rejected_releases_reservation():
     fake.on("POST", "/run", lambda p, b, q, h: _json_err(409, "session_conflict"))
     r = client.post("/api/demo/ai/run", json={"slide_id": slide_id})
     assert r.status_code == 409
-    assert client.get("/api/demo/config").get_json()["run_state"] == "available"
+    assert client.get("/api/demo/config").get_json()["run_state"] == "released"
     assert _demo_usage_total() == 0
 
 
@@ -545,6 +557,8 @@ def test_demo_sse_reconnect_no_extra_charge():
     fake.on("GET", "/session/", lambda p, b, q, h: FakeResponse(
         200, "id: 2\nevent: agent_finished\ndata: {}\n\n",
         ctype="text/event-stream"), prefix=True)
+    # run 仍 accepted（POST 响应体未消费，on_finished 未触发）→ 重连放行
+    assert client.get("/api/demo/config").get_json()["run_state"] == "accepted"
     for after_seq in ("0", "1"):
         r = client.get("/api/demo/ai/session/sess-demo-1/stream?after_seq=%s"
                        % after_seq)
@@ -581,7 +595,7 @@ def test_capability_expired_stream_410():
 
 
 @pg_only
-def test_slide_removed_from_catalog_revokes_capability():
+def test_slide_removed_from_catalog_terminates_active_run():
     _enable_demo_period()
     _setup_platform()
     FakeSidecar()._install()
@@ -590,18 +604,24 @@ def test_slide_removed_from_catalog_revokes_capability():
     client = _client()
     client.get("/api/demo/config")
     assert client.post("/api/demo/ai/run",
-                       json={"slide_id": slide_id}).status_code == 200
+                      json={"slide_id": slide_id}).status_code == 200
     owner = _make_user("owner")
     admin = _client()
     _login(admin, "owner", owner["user_id"])
     r = admin.delete("/api/admin/demo-catalog?slide=" + name)
     assert r.status_code == 200
     body = r.get_json()
-    assert body["expired_capabilities"] >= 1
-    # 旧 capability：不能读该 slide（info/dzi 410），stream 410
-    assert client.get("/api/demo/slides/%s/info" % slide_id).status_code == 410
+    # 批次 E：capability 多切片复用不整体失效；在途 run 被终止
+    assert body["expired_capabilities"] == 0
+    assert len(body["terminated_runs"]) >= 1
+    # 旧 capability：不能读该 slide（info/dzi 404，目录成员资格拦截）
+    assert client.get("/api/demo/slides/%s/info" % slide_id).status_code == 404
+    # 在途 run 已被终态化（expired）：不再可读该 session
     assert client.get(
-        "/api/demo/ai/session/sess-demo-1/stream").status_code == 410
+        "/api/demo/ai/session/sess-demo-1/stream").status_code == 403
+    # capability 本身仍有效（可浏览其它切片）
+    cfg = client.get("/api/demo/config").get_json()
+    assert cfg["demo_enabled"] is True
     # 目录已空
     client3 = _client()
     client3.get("/api/demo/config")
@@ -618,15 +638,15 @@ def test_slide_delete_revokes_demo():
     client = _client()
     client.get("/api/demo/config")
     assert client.post("/api/demo/ai/run",
-                       json={"slide_id": slide_id}).status_code == 200
+                      json={"slide_id": slide_id}).status_code == 200
     owner = _make_user("owner")
     admin = _client()
     _login(admin, "owner", owner["user_id"])
     assert admin.delete("/api/slide/" + name).status_code == 200
     assert demo_store.catalog_get(slide_id) is None  # 目录条目一并清理
-    assert client.get("/api/demo/slides/%s/info" % slide_id).status_code == 410
+    assert client.get("/api/demo/slides/%s/info" % slide_id).status_code == 404
     assert client.get(
-        "/api/demo/ai/session/sess-demo-1/stream").status_code == 410
+        "/api/demo/ai/session/sess-demo-1/stream").status_code == 403
 
 
 @pg_only
@@ -643,8 +663,8 @@ def test_demo_budget_exhausted_releases_run():
     r = c2.post("/api/demo/ai/run", json={"slide_id": slide_id})
     assert r.status_code == 429
     assert (r.get_json() or {}).get("code") == "demo_budget_exhausted"
-    # 超限回滚：新浏览器 run 回 available、未占预算
-    assert c2.get("/api/demo/config").get_json()["run_state"] == "available"
+    # 超限回滚：新浏览器 run released、未占预算
+    assert c2.get("/api/demo/config").get_json()["run_state"] == "released"
     assert _demo_usage_total() == 1
     assert len(fake.calls_of("POST", "/run")) == 1
 
@@ -662,7 +682,7 @@ def test_platform_budget_exhausted():
     r = c2.post("/api/demo/ai/run", json={"slide_id": slide_id})
     assert r.status_code == 429
     assert (r.get_json() or {}).get("code") == "platform_ai_budget_exhausted"
-    assert c2.get("/api/demo/config").get_json()["run_state"] == "available"
+    assert c2.get("/api/demo/config").get_json()["run_state"] == "released"
 
 
 @pg_only
@@ -688,9 +708,9 @@ def test_legacy_adapter_and_unreachable_fail_closed():
     assert r2.status_code == 503
     assert (r2.get_json() or {}).get("code") == "histopilot_unreachable"
     assert fake.calls_of("POST", "/run") == []  # 未转发
-    # 两种拒绝都不扣额度
+    # 两种拒绝都不扣额度（run 从未创建）
     assert _demo_usage_total() == 0
-    assert client.get("/api/demo/config").get_json()["run_state"] == "available"
+    assert client.get("/api/demo/config").get_json()["run_state"] is None
 
 
 @pg_only
@@ -705,7 +725,7 @@ def test_task_too_long_rejected():
                     json={"slide_id": slide_id, "task": "字" * 301})
     assert r.status_code == 400
     assert (r.get_json() or {}).get("code") == "task_too_long"
-    assert client.get("/api/demo/config").get_json()["run_state"] == "available"
+    assert client.get("/api/demo/config").get_json()["run_state"] is None
 
 
 @pg_only
@@ -725,23 +745,23 @@ def test_run_disabled_when_demo_off():
 # --------------------------------------------------------------------------- #
 def _reserve_pending_run(slide_id):
     """模拟 worker 崩溃：store 层直接预占（不触发 HistoPilot），返回
-    (capability_dict, request_id)。"""
+    (capability_dict, request_id, run_dict)。"""
     cap = demo_store.create_capability(
         "dcp_" + uuid.uuid4().hex[:8], "hash_" + uuid.uuid4().hex[:12])
     rid = "req_" + uuid.uuid4().hex[:12]
     run = demo_store.reserve_run(cap["id"], rid, slide_id, "rev-stub")
     assert run is not None
     budget_store.reserve_turn(rid, "demo", cap["id"], "platform")
-    return cap, rid
+    return cap, rid, run
 
 
 def _expire_everything():
     conn = _pg_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("UPDATE demo_sessions SET "
-                        "reservation_expires_at = now() - interval '1 hour' "
-                        "WHERE run_state='reserved'")
+            cur.execute("UPDATE demo_runs SET "
+                        "expires_at = now() - interval '1 hour' "
+                        "WHERE state IN ('reserved', 'accepted')")
             cur.execute("UPDATE ai_budget_reservations SET "
                         "reservation_expires_at = now() - interval '1 hour' "
                         "WHERE state='reserved'")
@@ -776,38 +796,41 @@ def test_reconcile_found_consumes_missing_releases_unavailable_extends():
     fake.on("GET", "/session/by-request/", by_request_handler, prefix=True)
     fake._install()
 
-    # a) 200 → consume（防误退款）
-    cap_a, rid_a = _reserve_pending_run(slide_id)
+    # a) 200 → accept（防误退款）
+    cap_a, rid_a, run_a = _reserve_pending_run(slide_id)
     verdicts[rid_a] = "found"
     _expire_everything()
     summary = app_mod.reconcile_expired_reservations()
-    assert {e["action"] for e in summary["demo"] if e["id"] == cap_a["id"]} == \
-        {"consumed"}
-    assert demo_store.get_session(cap_a["id"])["run_state"] == "consumed"
+    assert {e["action"] for e in summary["demo"]
+            if e["id"] == run_a["demo_run_id"]} == {"accepted"}
+    assert demo_store.get_run(run_a["demo_run_id"])["state"] == "accepted"
+    assert demo_store.get_run(run_a["demo_run_id"])["histopilot_session_id"] \
+        == "sess-rec-" + rid_a[-4:]
     assert budget_store.get_reservation(rid_a)["state"] == "consumed"
 
-    # b) 404 not_found → release（run 回 available、预算 released）
-    cap_b, rid_b = _reserve_pending_run(slide_id)
+    # b) 404 not_found → release（run released 终态、预算 released）
+    cap_b, rid_b, run_b = _reserve_pending_run(slide_id)
     verdicts[rid_b] = "missing"
     _expire_everything()
     app_mod.reconcile_expired_reservations()
-    assert demo_store.get_session(cap_b["id"])["run_state"] == "available"
+    assert demo_store.get_run(run_b["demo_run_id"])["state"] == "released"
     assert budget_store.get_reservation(rid_b)["state"] == "released"
 
     # c) 5xx → 不释放，顺延（仍 reserved，且过期时间被推回未来）
-    cap_c, rid_c = _reserve_pending_run(slide_id)
+    cap_c, rid_c, run_c = _reserve_pending_run(slide_id)
     verdicts[rid_c] = "unavailable"
     _expire_everything()
     app_mod.reconcile_expired_reservations()
-    row = demo_store.get_session(cap_c["id"])
-    assert row["run_state"] == "reserved"
-    assert row["reservation_expires_at"] > time.time()
+    row = demo_store.get_run(run_c["demo_run_id"])
+    assert row["state"] == "reserved"
+    assert row["expires_at"] > time.time()
     resv = budget_store.get_reservation(rid_c)
     assert resv["state"] == "reserved"
     assert resv["reservation_expires_at"] > time.time()
     # 顺延后的项下一轮对账不再被当作过期（除非再次到期）
     summary2 = app_mod.reconcile_expired_reservations()
-    assert not [e for e in summary2["demo"] if e["id"] == cap_c["id"]]
+    assert not [e for e in summary2["demo"]
+                if e["id"] == run_c["demo_run_id"]]
 
 
 @pg_only
@@ -822,20 +845,22 @@ def test_reconcile_consume_failed_extends_instead_of_blind_release(monkeypatch):
                                   "security_profile_applied": True,
                                   "accepted_at": 1}}), prefix=True)
     fake._install()
-    cap, rid = _reserve_pending_run(slide_id)
+    cap, rid, run = _reserve_pending_run(slide_id)
     _expire_everything()
 
     def _boom(*_a, **_k):
         raise RuntimeError("consume exploded")
 
     monkeypatch.setattr(budget_store, "consume", _boom)
-    monkeypatch.setattr(demo_store, "consume_run", _boom)
+    monkeypatch.setattr(demo_store, "accept_run", _boom)
     summary = app_mod.reconcile_expired_reservations()
-    demo_actions = {e["action"] for e in summary["demo"] if e["id"] == cap["id"]}
-    budget_actions = {e["action"] for e in summary["budget"] if e["request_id"] == rid}
-    assert demo_actions == {"consume_failed_extended"}
+    demo_actions = {e["action"] for e in summary["demo"]
+                    if e["id"] == run["demo_run_id"]}
+    budget_actions = {e["action"] for e in summary["budget"]
+                      if e["request_id"] == rid}
+    assert demo_actions == {"accept_failed_extended"}
     assert budget_actions == {"consume_failed_extended"}
-    assert demo_store.get_session(cap["id"])["run_state"] == "reserved"
+    assert demo_store.get_run(run["demo_run_id"])["state"] == "reserved"
     assert budget_store.get_reservation(rid)["state"] == "reserved"
     assert budget_store.get_reservation(rid)["reservation_expires_at"] > time.time()
     # 后台线程只走确认式对账；盲回收钩子已整体删除（符号不存在，防误接回）
@@ -856,14 +881,16 @@ def test_reconcile_found_without_accepted_extends():
                                   "security_profile_applied": False,
                                   "accepted_at": None}}), prefix=True)
     fake._install()
-    cap, rid = _reserve_pending_run(slide_id)
+    cap, rid, run = _reserve_pending_run(slide_id)
     _expire_everything()
     summary = app_mod.reconcile_expired_reservations()
-    demo_actions = {e["action"] for e in summary["demo"] if e["id"] == cap["id"]}
-    budget_actions = {e["action"] for e in summary["budget"] if e["request_id"] == rid}
+    demo_actions = {e["action"] for e in summary["demo"]
+                    if e["id"] == run["demo_run_id"]}
+    budget_actions = {e["action"] for e in summary["budget"]
+                      if e["request_id"] == rid}
     assert demo_actions == {"pending_extended"}
     assert budget_actions == {"pending_extended"}
-    assert demo_store.get_session(cap["id"])["run_state"] == "reserved"
+    assert demo_store.get_run(run["demo_run_id"])["state"] == "reserved"
     assert budget_store.get_reservation(rid)["state"] == "reserved"
     assert budget_store.get_reservation(rid)["reservation_expires_at"] > time.time()
 
@@ -882,14 +909,16 @@ def test_reconcile_abandoned_releases():
                                   "abandoned": True,
                                   "abandoned_at": time.time()}}), prefix=True)
     fake._install()
-    cap, rid = _reserve_pending_run(slide_id)
+    cap, rid, run = _reserve_pending_run(slide_id)
     _expire_everything()
     summary = app_mod.reconcile_expired_reservations()
-    demo_actions = {e["action"] for e in summary["demo"] if e["id"] == cap["id"]}
-    budget_actions = {e["action"] for e in summary["budget"] if e["request_id"] == rid}
+    demo_actions = {e["action"] for e in summary["demo"]
+                    if e["id"] == run["demo_run_id"]}
+    budget_actions = {e["action"] for e in summary["budget"]
+                      if e["request_id"] == rid}
     assert demo_actions == {"released"}
     assert budget_actions == {"released"}
-    assert demo_store.get_session(cap["id"])["run_state"] == "available"
+    assert demo_store.get_run(run["demo_run_id"])["state"] == "released"
     assert budget_store.get_reservation(rid)["state"] == "released"
 
 
@@ -898,7 +927,7 @@ def test_reconcile_abandoned_stale_attempt_does_not_release_newer_try():
     """abandoned 确认退款后重新预占才换代；旧 attempt 对账不得退新尝试。"""
     _setup_platform()
     slide_id = _catalog_add(_touch("rec-toc.svs"))
-    cap, rid = _reserve_pending_run(slide_id)
+    cap, rid, run = _reserve_pending_run(slide_id)
     fake = FakeSidecar()
     fake.on("GET", "/session/by-request/",
             lambda path, body, params, headers: FakeResponse(
@@ -912,9 +941,10 @@ def test_reconcile_abandoned_stale_attempt_does_not_release_newer_try():
     fake._install()
     _expire_everything()
     summary = app_mod.reconcile_expired_reservations()
-    demo_actions = {e["action"] for e in summary["demo"] if e["id"] == cap["id"]}
+    demo_actions = {e["action"] for e in summary["demo"]
+                    if e["id"] == run["demo_run_id"]}
     assert demo_actions == {"released"}
-    assert demo_store.get_session(cap["id"])["run_state"] == "available"
+    assert demo_store.get_run(run["demo_run_id"])["state"] == "released"
     assert budget_store.get_reservation(rid)["state"] == "released"
     # 确认放弃后显式换代
     again_demo = demo_store.reserve_run(cap["id"], rid, slide_id, "rev-stub")
@@ -922,10 +952,11 @@ def test_reconcile_abandoned_stale_attempt_does_not_release_newer_try():
     assert again_demo["attempt"] == 2
     assert again_budget["attempt"] == 2
     with pytest.raises(demo_store.RunAttemptConflict):
-        demo_store.release_run(cap["id"], expected_attempt=1, expected_request_id=rid)
+        demo_store.release_run(run["demo_run_id"], expected_attempt=1,
+                               expected_request_id=rid)
     with pytest.raises(budget_store.ReservationAttemptConflict):
         budget_store.release(rid, expected_attempt=1)
-    assert demo_store.get_session(cap["id"])["run_state"] == "reserved"
+    assert demo_store.get_run_by_request(cap["id"], rid)["state"] == "reserved"
     assert budget_store.get_reservation(rid)["state"] == "reserved"
 
 
@@ -935,9 +966,9 @@ def test_catalog_remove_reconciles_reservations_not_blind_release():
     _setup_platform()
     budget_store.update_period_limits({"demo_max_concurrency": 8})
     slide_id = _catalog_add(_touch("rev-cat.svs"))
-    cap_ok, rid_ok = _reserve_pending_run(slide_id)
-    cap_miss, rid_miss = _reserve_pending_run(slide_id)
-    cap_pend, rid_pend = _reserve_pending_run(slide_id)
+    cap_ok, rid_ok, run_ok = _reserve_pending_run(slide_id)
+    cap_miss, rid_miss, run_miss = _reserve_pending_run(slide_id)
+    cap_pend, rid_pend, run_pend = _reserve_pending_run(slide_id)
     verdicts = {
         rid_ok: "accepted",
         rid_miss: "missing",
@@ -969,47 +1000,81 @@ def test_catalog_remove_reconciles_reservations_not_blind_release():
     assert budget_store.get_reservation(rid_ok)["state"] == "consumed"
     assert budget_store.get_reservation(rid_miss)["state"] == "released"
     assert budget_store.get_reservation(rid_pend)["state"] == "reserved"
-    assert demo_store.get_session(cap_ok["id"])["run_state"] == "consumed"
-    assert demo_store.get_session(cap_miss["id"])["run_state"] == "available"
-    assert demo_store.get_session(cap_pend["id"])["run_state"] == "reserved"
+    # run 侧：revoke 已把三者置 expired 终态（revocation 是终态化本身）；
+    # 预算侧按 HP 反查定局（consumed / released / 顺延 reserved）
+    for run in (run_ok, run_miss, run_pend):
+        assert demo_store.get_run(run["demo_run_id"])["state"] == "expired"
 
 
 @pg_only
-def test_demo_per_browser_limit_two_runs_via_ui_config():
-    """demo_per_browser_limit=2：第一次 consumed 后 config 仍有剩余，可再跑。"""
+def test_demo_sequential_runs_unlimited_via_ui():
+    """批次 E §4.1：同 capability 顺序多次 run，无累计次数上限。"""
     _enable_demo_period()
-    budget_store.update_period_limits({"demo_per_browser_limit": 2})
     _setup_platform()
-    FakeSidecar()._install()
+    fake = FakeSidecar()._install()
     slide_id = _catalog_add(_touch("twice.svs"))
     client = _client()
     client.get("/api/demo/config")
-    r1 = client.post("/api/demo/ai/run", json={"slide_id": slide_id})
-    assert r1.status_code == 200, r1.get_json()
-    cfg = client.get("/api/demo/config").get_json()
-    assert cfg["run_state"] == "consumed"
-    assert cfg["per_browser_limit"] == 2
-    assert cfg["per_browser_used"] == 1
-    assert cfg["per_browser_remaining"] == 1
-    r2 = client.post("/api/demo/ai/run", json={"slide_id": slide_id})
-    assert r2.status_code == 200, r2.get_json()
-    cfg2 = client.get("/api/demo/config").get_json()
-    assert cfg2["per_browser_used"] == 2
-    assert cfg2["per_browser_remaining"] == 0
-    r3 = client.post("/api/demo/ai/run", json={"slide_id": slide_id})
-    assert r3.status_code == 409
-    assert (r3.get_json() or {}).get("code") == "demo_run_already_used"
+    for i in range(4):
+        r = client.post("/api/demo/ai/run", json={"slide_id": slide_id})
+        assert r.status_code == 200, (i, r.get_json())
+        assert r.get_data()  # 耗尽流 → on_finished → finished 终态
+        cfg = client.get("/api/demo/config").get_json()
+        assert cfg["run_state"] == "finished"
+        assert cfg["active_run"] is False
+    # 4 次成功后仍可继续（demo_run_already_used 不再出现）
+    r5 = client.post("/api/demo/ai/run", json={"slide_id": slide_id})
+    assert r5.status_code == 200, r5.get_json()
+    assert demo_store.count_run_states()["total"] == 5
+    assert _demo_usage_total() == 5
 
 
 @pg_only
-def test_demo_ip_run_limit_blocks_cookie_rotation(monkeypatch):
-    """清 cookie 换 capability 不能从同一 IP 前缀耗尽 Demo 子额度。"""
-    monkeypatch.setenv("DEMO_IP_RUN_LIMIT", "1")
+def test_demo_second_run_blocked_while_first_active():
+    """批次 E §9.5：同 capability 同时第二个 run 被并发闸拒绝（409）。"""
     _enable_demo_period()
-    budget_store.update_period_limits({"demo_turn_limit": 5})
     _setup_platform()
     fake = FakeSidecar()._install()
-    slide_id = _catalog_add(_touch("ip-run.svs"))
+    slide_id = _catalog_add(_touch("active.svs"))
+    client = _client()
+    client.get("/api/demo/config")
+    # 第一个 run：POST 返回但流未消费 → run 停在 accepted（在途）
+    r1 = client.post("/api/demo/ai/run", json={"slide_id": slide_id})
+    assert r1.status_code == 200
+    assert client.get("/api/demo/config").get_json()["run_state"] == "accepted"
+    # 在途时第二个 run（新 request_id）→ 409 demo_run_in_progress，不预占预算
+    r2 = client.post("/api/demo/ai/run", json={"slide_id": slide_id})
+    assert r2.status_code == 409
+    assert (r2.get_json() or {}).get("code") == "demo_run_in_progress"
+    assert _demo_usage_total() == 1
+    assert demo_store.count_run_states()["total"] == 1
+    # 同 request_id 在途重放仍 200（幂等，不双扣）
+    r3 = client.post("/api/demo/ai/run", json={
+        "slide_id": slide_id, "request_id":
+            (fake.calls_of("POST", "/run")[0]["body"] or {}).get("request_id")})
+    assert r3.status_code == 200
+    assert _demo_usage_total() == 1
+    # 流耗尽 → finished → capability 解锁可再开
+    assert r1.get_data() and r3.get_data()
+    assert client.get("/api/demo/config").get_json()["run_state"] == "finished"
+    r4 = client.post("/api/demo/ai/run", json={"slide_id": slide_id})
+    assert r4.status_code == 200, r4.get_json()
+
+
+@pg_only
+def test_demo_ip_request_rate_limit_blocks_flood(monkeypatch):
+    """批次 E §9.5：短窗口请求速率仍拒绝刷请求（429 + Retry-After）。
+
+    旧 24h 成功次数桶（demo_ip_rate_limited）已退役：多次成功不因 IP 被阻断，
+    只有分钟级请求数超限才拒绝。
+    """
+    monkeypatch.setenv("DEMO_IP_RATE_PER_MINUTE", "2")
+    _enable_demo_period()
+    budget_store.update_period_limits({"demo_turn_limit": 50})
+    _setup_platform()
+    fake = FakeSidecar()._install()
+    slide_id = _catalog_add(_touch("ip-rate.svs"))
+    # 同 IP 前缀第 1、2 个请求放行（不同浏览器=不同 capability）
     c1 = _fresh_capability(fake)
     r1 = c1.post("/api/demo/ai/run", json={"slide_id": slide_id},
                  environ_base={"REMOTE_ADDR": "203.0.113.10"})
@@ -1017,31 +1082,71 @@ def test_demo_ip_run_limit_blocks_cookie_rotation(monkeypatch):
     c2 = _fresh_capability(fake)
     r2 = c2.post("/api/demo/ai/run", json={"slide_id": slide_id},
                  environ_base={"REMOTE_ADDR": "203.0.113.200"})
-    assert r2.status_code == 429, r2.get_json()
-    body = r2.get_json() or {}
-    assert body.get("code") == "demo_ip_rate_limited"
-    assert r2.headers.get("Retry-After")
-    assert c2.get("/api/demo/config").get_json()["run_state"] == "available"
-    assert _demo_usage_total() == 1
-    assert len(fake.calls_of("POST", "/run")) == 1
-    # 不同 /24 不受该桶限制
+    assert r2.status_code == 200, r2.get_json()
+    # 第 3 个请求（同 /24，新浏览器）→ 429 + Retry-After（请求速率，非成功次数）
     c3 = _fresh_capability(fake)
     r3 = c3.post("/api/demo/ai/run", json={"slide_id": slide_id},
-                 environ_base={"REMOTE_ADDR": "203.0.114.1"})
-    assert r3.status_code == 200, r3.get_json()
-    # 同 request_id 重放不因已计数被挡
-    rid = "req_replay_ip"
+                 environ_base={"REMOTE_ADDR": "203.0.113.30"})
+    assert r3.status_code == 429
+    body = r3.get_json() or {}
+    assert body.get("code") == "demo_ip_request_rate_limited"
+    assert r3.headers.get("Retry-After")
+    assert 0 < int(body.get("retry_after_seconds") or 0) <= 60
+    assert c3.get("/api/demo/config").get_json()["run_state"] is None
+    assert len(fake.calls_of("POST", "/run")) == 2  # 被拒请求未转发
+    # 不同 /24 不受该桶限制
     c4 = _fresh_capability(fake)
-    r4 = c4.post("/api/demo/ai/run",
-                 json={"slide_id": slide_id, "request_id": rid},
-                 environ_base={"REMOTE_ADDR": "198.51.100.9"})
+    r4 = c4.post("/api/demo/ai/run", json={"slide_id": slide_id},
+                 environ_base={"REMOTE_ADDR": "203.0.114.1"})
     assert r4.status_code == 200, r4.get_json()
-    r4b = c4.post("/api/demo/ai/run",
-                  json={"slide_id": slide_id, "request_id": rid},
-                  environ_base={"REMOTE_ADDR": "198.51.100.9"})
-    # 同 ID 重放跳过 IP 闸；capability 已 consumed 故 reserve 返回 409，不得 429
-    assert r4b.status_code == 409, r4b.get_json()
-    assert (r4b.get_json() or {}).get("code") == "demo_run_already_used"
+    # 多次成功本身不触发 IP 阻断（旧 24h 成功桶语义已删除）
+    monkeypatch.setenv("DEMO_IP_RATE_PER_MINUTE", "0")
+    c5 = _fresh_capability(fake)
+    for _i in range(3):
+        rx = c5.post("/api/demo/ai/run", json={"slide_id": slide_id},
+                     environ_base={"REMOTE_ADDR": "198.51.100.9"})
+        assert rx.status_code == 200, rx.get_json()
+        assert rx.get_data()  # finished → 可顺序再跑
+
+
+@pg_only
+def test_demo_max_concurrency_gate_still_enforced():
+    """批次 E 回归：全站 demo_max_concurrency 安全闸仍生效。
+
+    闸的口径是「在途 reserved 预占数」（HistoPilot 接受后转 consumed 不再占
+    并发，与批次 B 语义一致）：store 层预占一个未接受的 run 占满并发后，
+    其它浏览器的 API run → 429 demo_concurrency_exceeded，且不转发 HP。
+    """
+    _enable_demo_period()
+    budget_store.update_period_limits({"demo_max_concurrency": 1,
+                                       "demo_turn_limit": 50})
+    _setup_platform()
+    fake = FakeSidecar()._install()
+    slide_id = _catalog_add(_touch("conc.svs"))
+    cap = demo_store.create_capability(
+        "dcp_" + uuid.uuid4().hex[:8], "hash_" + uuid.uuid4().hex[:12])
+    demo_store.reserve_run(cap["id"], "req_conc_stub", slide_id, "rev-stub")
+    budget_store.reserve_turn("req_conc_stub", "demo", cap["id"], "platform")
+    c2 = _fresh_capability(fake)  # 新浏览器（绕过单 capability 闸）
+    r2 = c2.post("/api/demo/ai/run", json={"slide_id": slide_id})
+    assert r2.status_code == 429
+    assert (r2.get_json() or {}).get("code") == "demo_concurrency_exceeded"
+    assert c2.get("/api/demo/config").get_json()["run_state"] == "released"
+    assert fake.calls_of("POST", "/run") == []  # 被拒未转发
+
+
+@pg_only
+def test_demo_ip_request_rate_env_zero_disables_bucket(monkeypatch):
+    monkeypatch.setenv("DEMO_IP_RATE_PER_MINUTE", "0")
+    _enable_demo_period()
+    _setup_platform()
+    fake = FakeSidecar()._install()
+    slide_id = _catalog_add(_touch("ip-off.svs"))
+    for _i in range(3):
+        c = _fresh_capability(fake)
+        r = c.post("/api/demo/ai/run", json={"slide_id": slide_id},
+                   environ_base={"REMOTE_ADDR": "203.0.113.77"})
+        assert r.status_code == 200, r.get_json()
 
 
 # --------------------------------------------------------------------------- #
@@ -1118,14 +1223,19 @@ def test_demo_js_event_reset_uses_snapshot_not_second_stream():
     # 管理员用量栏已移出 Demo 产品界面（诊断在正式版 AI 预算区）
     assert "initAdminBar" not in text
     assert "/api/admin/settings/ai-budget/reset" not in text
-    # 每浏览器多次配额：consumed 且仍有剩余时不得永久禁用按钮
-    assert "per_browser_remaining" in text
-    assert "remaining <= 0" in text
+    # 批次 E：每浏览器次数闸退役——demo.js 不再消费 per_browser_* / 旧 IP 桶码
+    assert "per_browser_remaining" not in text
+    assert "remaining <= 0" not in text
+    assert "demo_run_already_used" not in text
+    assert "demo_ip_rate_limited" not in text
+    # 新模型：run_state 来自 demo_runs（在途 → running；终态 → available）
+    assert 'cfg.run_state === "reserved" || cfg.run_state === "accepted"' in text
+    assert 'code === "demo_run_in_progress"' in text
+    assert 'code === "demo_ip_request_rate_limited"' in text
     i18n = (Path(__file__).resolve().parent.parent / "static" / "i18n.js") \
         .read_text(encoding="utf-8")
     assert i18n.count('"demo.ai.run.available.n":') == 2
     assert i18n.count('"demo.ai.run.ip.limited":') == 2
-    assert "demo_ip_rate_limited" in text
 
 
 def test_demo_html_owner_admin_reset_bar_not_in_product_ui():

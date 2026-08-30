@@ -77,6 +77,9 @@ if _RUN_PG:
         "platform_settings", "auth_rate_limits",
         "ai_budget_usage", "ai_budget_reservations", "ai_budget_periods",
         "demo_sessions", "demo_catalog",
+        # 0026 起：Demo run 流水 + IP 短窗口请求速率桶（批次 E）。demo_runs
+        # 无 FK（capability 行不删除），必须显式列出防跨用例残留
+        "demo_runs", "demo_ip_request_rate",
         # 0012 起：邀请注册（registration_invites；users 的 ai_access 列随
         # users 清空重置）
         "registration_invites",

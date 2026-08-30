@@ -2841,8 +2841,9 @@ def _registration_unavailable_response():
 DEMO_CAPABILITY_COOKIE = "demo_capability"
 #: Demo run 用户任务限长（docs §5.3：最多 300 字或预设任务）
 DEMO_TASK_MAX_CHARS = 300
-#: Demo session 可重连窗口：consumed_at + 1h（docs §5.3 表）
-DEMO_SESSION_RECONNECT_SECONDS = 3600
+#: Demo session 可重连窗口（0026 起 = accepted_at + 1h；与 demo_store 的
+#: accepted run 活跃窗口同源，run 到期由 finish/对账/惰性路径转终态）
+DEMO_SESSION_RECONNECT_SECONDS = demo_store.DEMO_RUN_RECONNECT_WINDOW_SECONDS
 #: Demo 安全协商 envelope（docs §5.4；与 HistoPilot security-envelope.ts 常量一致）
 DEMO_SECURITY_CONTRACT_VERSION = "1.0"
 DEMO_TOOL_PROFILE = "demo-readonly-v1"
@@ -3130,7 +3131,13 @@ def demo_landing():
 
 @app.route("/api/demo/config")
 def api_demo_config():
-    """Demo 开关 / 额度状态 / AI 可达性（capability 首次在此签发，docs §9.1）。"""
+    """Demo 开关 / run 状态 / AI 可达性（capability 首次在此签发，docs §9.1）。
+
+    批次 E（§4.1）：run 状态来自 demo_runs 最近一次流水（capability 与 run
+    分离；同 capability 顺序多次 run，无每浏览器累计上限）。``run_state`` ∈
+    reserved|accepted（在途）| finished|released|expired（终态）| None（未跑过）；
+    ``histopilot_session_id`` / ``session_reconnect_until`` 取最近一次已接受 run。
+    """
     err = _demo_require_pg()
     if err is not None:
         return err
@@ -3141,10 +3148,8 @@ def api_demo_config():
         "run_state": None,
         "histopilot_session_id": None,
         "session_reconnect_until": None,
+        "active_run": False,
         "budget": None,
-        "per_browser_limit": 1,
-        "per_browser_used": 0,
-        "per_browser_remaining": 1,
     }
     # adapter / AI 可达性（探测失败也返回 200：Viewer 仍可浏览切片，§5.6）
     gate, mode = _demo_adapter_gate()
@@ -3152,7 +3157,7 @@ def api_demo_config():
     payload["ai_available"] = gate is None
     payload["ai_unavailable_code"] = None if gate is None else (
         gate[0].get_json().get("code"))
-    # 本浏览器 run 状态 + 平台/Demo 预算余量（读失败不阻断 config）
+    # 本浏览器最近一次 run + 平台/Demo 预算余量（读失败不阻断 config）
     try:
         cap, _why = _demo_current_capability()
     except platform_features.PgFeatureUnavailable:
@@ -3160,27 +3165,21 @@ def api_demo_config():
     except Exception:
         cap = None
     if cap is not None:
-        payload["run_state"] = cap.get("run_state")
-        payload["histopilot_session_id"] = cap.get("histopilot_session_id")
-        consumed_at = cap.get("consumed_at")
-        if consumed_at:
-            payload["session_reconnect_until"] = (
-                float(consumed_at) + DEMO_SESSION_RECONNECT_SECONDS)
-    try:
-        period = budget_store.get_current_period()
-        per_browser = int(period.get("demo_per_browser_limit")
-                          or budget_store.DEFAULT_DEMO_PER_BROWSER_LIMIT)
-        used_browser = 0
-        if cap is not None:
-            used_browser = budget_store.subject_turn_total(
-                "demo", cap["id"], "platform")
-        payload["per_browser_limit"] = per_browser
-        payload["per_browser_used"] = used_browser
-        payload["per_browser_remaining"] = max(0, per_browser - used_browser)
-    except platform_features.PgFeatureUnavailable:
-        raise
-    except Exception:
-        app.logger.warning("Demo 每浏览器额度读取失败", exc_info=True)
+        try:
+            run = demo_store.latest_run_for_capability(cap["id"])
+        except Exception:
+            app.logger.warning("Demo run 状态读取失败", exc_info=True)
+            run = None
+        if run is not None:
+            payload["run_state"] = run.get("state")
+            payload["active_run"] = run.get("state") in demo_store.RUN_ACTIVE_STATES
+            sid = run.get("histopilot_session_id")
+            accepted_at = run.get("accepted_at")
+            if sid and run.get("state") in ("accepted", "finished") \
+                    and accepted_at:
+                payload["histopilot_session_id"] = sid
+                payload["session_reconnect_until"] = (
+                    float(accepted_at) + DEMO_SESSION_RECONNECT_SECONDS)
     try:
         report = budget_store.usage_report()
         demo_total = report["demo"]["total"]
@@ -3202,8 +3201,9 @@ def api_demo_config():
         try:
             issued_cap, issued_token = _demo_issue_capability()
             if issued_cap is not None:
-                # 首次签发：新 capability 即 available（run_state 回填按钮态）
-                payload["run_state"] = issued_cap.get("run_state")
+                # 首次签发：新 capability 无 run（run_state=None，可立即体验）
+                payload["run_state"] = None
+                payload["active_run"] = False
         except Exception:
             app.logger.warning("Demo capability 签发失败", exc_info=True)
     resp = jsonify(payload)
@@ -3322,37 +3322,34 @@ def api_demo_slide_tile(slide_id, level, x, y):
     return resp
 
 
-def _demo_ip_run_gate(cap, request_id):
-    """同一 IP 前缀的 Demo run 次数闸（docs §9.5：Demo run 独立桶）。
+def _demo_ip_request_rate_gate():
+    """Demo 短窗口请求速率闸（批次 E §1.2/§4.1：防刷/防 DoS，非消费额度）。
 
-    同 request_id 的 reserved/consumed 重放不计入新尝试。超限 → 429
-    ``demo_ip_rate_limited`` + Retry-After。limit≤0 关闭该桶。
+    每 IP 前缀每分钟**请求数**（PG 权威固定窗口计数，不累计成功次数——
+    24h 成功 run 桶已退役）。超限 → 429 ``demo_ip_request_rate_limited`` +
+    Retry-After。``DEMO_IP_RATE_PER_MINUTE`` ≤ 0 关闭该桶。存储异常 fail-closed
+    （429，不得因抖动放行洪泛）。
     """
-    limit = demo_store.ip_run_limit()
+    limit = demo_store.ip_rate_limit()
     if limit <= 0:
-        return None
-    if (isinstance(request_id, str) and request_id
-            and cap.get("request_id") == request_id
-            and cap.get("run_state") in (demo_store.RUN_STATE_RESERVED,
-                                         demo_store.RUN_STATE_CONSUMED)):
         return None
     ip_hash = _ip_prefix_hash(request.remote_addr or "") or "unknown"
     try:
-        usage = demo_store.count_ip_runs(
-            ip_hash, window_seconds=demo_store.ip_run_window_seconds())
+        usage = demo_store.hit_ip_request_rate(ip_hash, limit=limit)
     except platform_features.PgFeatureUnavailable:
         raise
     except Exception:
-        app.logger.warning("Demo IP run 限流查询失败（fail-closed）", exc_info=True)
+        app.logger.warning("Demo IP 请求速率计数失败（fail-closed）",
+                           exc_info=True)
         return (jsonify(error="Demo 暂时无法确认访问频率，请稍后重试",
-                        code="demo_ip_rate_limited"), 429)
-    if int(usage.get("count") or 0) < limit:
+                        code="demo_ip_request_rate_limited"), 429)
+    if usage.get("allowed") is not False:
         return None
     retry = max(1, int(usage.get("retry_after_seconds") or 0)
-                or demo_store.ip_run_window_seconds())
+                or demo_store.ip_rate_window_seconds())
     resp = jsonify(
-        error="该网络的 Demo 体验次数已用完，请稍后再试或登录后继续",
-        code="demo_ip_rate_limited",
+        error="请求过于频繁，请稍后再试",
+        code="demo_ip_request_rate_limited",
         retry_after_seconds=retry,
         limit=limit,
         used=int(usage.get("count") or 0),
@@ -3366,11 +3363,17 @@ def _demo_ip_run_gate(cap, request_id):
 def api_demo_ai_run():
     """Demo 一次性只读 AI run（docs §5.3/§5.4；单请求内按序推进，失败回滚）。
 
+    批次 E（§4.1）：capability 与 run 分离——每次 run 是 demo_runs 独立流水，
+    上一次终态后即可再开（无限顺序体验）；同 capability 同时最多一个
+    reserved/accepted run（DB 部分唯一索引硬保证，409 ``demo_run_in_progress``）。
+
     顺序：capability → Demo 开关 → adapter 闸 → catalog allowlist → request_id
-    → demo_store.reserve_run CAS → budget_store.reserve_turn → 组装 /run body
+    → IP 短窗口请求速率闸 → demo_store.reserve_run（capability 行锁 + 惰性
+    过期 + active 冲突判定）→ budget_store.reserve_turn → 组装 /run body
     （平台凭据 + demo_task_max_steps + security envelope，**不发 run_grant**）→
-    代理 SSE；2xx（security_profile_applied 已确保，X-AI-Session-ID）→ consume；
-    4xx/连接失败 → release。禁止 continue/ask/branch（docs §5.3 表）。
+    代理 SSE；2xx（security_profile_applied 已确保，X-AI-Session-ID）→ accept；
+    上游流正常结束 → finish（capability 解锁，可开下一个 run）；4xx/连接失败
+    → release。禁止 continue/ask/branch（docs §5.3 表）。
     """
     err = _demo_require_open()
     if err is not None:
@@ -3395,7 +3398,7 @@ def api_demo_ai_run():
     rid, rid_err = _parse_client_request_id(body)
     if rid_err is not None:
         return rid_err
-    ip_gate = _demo_ip_run_gate(cap, rid)
+    ip_gate = _demo_ip_request_rate_gate()
     if ip_gate is not None:
         return ip_gate
     safe = _safe_name(filename)
@@ -3406,49 +3409,49 @@ def api_demo_ai_run():
     except Exception:
         app.logger.warning("Demo 预占前惰性对账失败（不阻断）", exc_info=True)
 
-    # 3) 每浏览器 run：CAS available→reserved；限额 >1 时允许 consumed 再预占。
-    from_states = (demo_store.RUN_STATE_AVAILABLE,)
+    # 3) run 预占：demo_runs 流水（capability 行锁内：过期校验 + 惰性终态 +
+    #    同 ID 幂等 + 单 active 冲突；DB 部分唯一索引兜底并发）
     try:
-        period = budget_store.get_current_period()
-        per_browser = int(period.get("demo_per_browser_limit")
-                          or budget_store.DEFAULT_DEMO_PER_BROWSER_LIMIT)
-        used_browser = budget_store.subject_turn_total(
-            "demo", cap["id"], "platform")
-        if per_browser > 1 and used_browser < per_browser:
-            from_states = (demo_store.RUN_STATE_AVAILABLE,
-                           demo_store.RUN_STATE_CONSUMED)
-    except Exception:
-        app.logger.warning("读取每浏览器限额失败（按 1 次处理）", exc_info=True)
-        per_browser = 1
-    run = demo_store.reserve_run(
-        cap["id"], rid, slide_id, _legacy_slide_revision(safe),
-        from_states=from_states,
-        ip_prefix_hash=_ip_prefix_hash(request.remote_addr or "") or "unknown")
+        run = demo_store.reserve_run(
+            cap["id"], rid, slide_id, _legacy_slide_revision(safe),
+            ip_prefix_hash=_ip_prefix_hash(request.remote_addr or "") or "unknown")
+    except demo_store.DemoCapabilityExpired:
+        return (jsonify(error="Demo capability 已失效或过期",
+                        code="capability_expired"), 410)
+    except demo_store.DemoRunActiveConflict as exc:
+        return (jsonify(error="本次体验仍在进行中，请等待当前运行结束",
+                        code="demo_run_in_progress",
+                        active_run=True), 409)
+    except demo_store.DemoRunFinalConflict as exc:
+        return (jsonify(error="该请求已结束，请重新发起体验",
+                        code="demo_run_request_final"), 409)
+    except platform_features.PgFeatureUnavailable as exc:
+        return _budget_error_response(exc, 503, code="pg_backend_required")
     if run is None:
-        return (jsonify(error="本次体验已使用（每浏览器 24 小时 %d 次）"
-                        % per_browser,
-                        code="demo_run_already_used"), 409)
-
+        # capability 在守卫与预占之间消失（撤销/过期竞态）：按失效处理
+        return (jsonify(error="Demo capability 已失效或过期",
+                        code="capability_expired"), 410)
+    demo_run_id = run["demo_run_id"]
     run_attempt = run.get("attempt")
     run_rollback_epoch = int(run.get("rollback_epoch") or 0)
 
     def _rollback_demo_run(reason, expected_attempt=None, expected_request_id=None,
                            expected_rollback_epoch=None):
-        """预占后、HistoPilot 接受前的统一回滚（幂等；consumed 拒绝释放）。"""
+        """预占后、HistoPilot 接受前的统一回滚（幂等；accepted 拒绝释放）。"""
         if run.get("replayed"):
             app.logger.info("Demo 在途 request_id 重放失败，不释放原 run：%s (%s)",
                             rid, reason)
             return
         try:
             demo_store.release_run(
-                cap["id"], expected_attempt=expected_attempt,
+                demo_run_id, expected_attempt=expected_attempt,
                 expected_request_id=expected_request_id,
                 expected_rollback_epoch=expected_rollback_epoch)
         except demo_store.RunAttemptConflict:
             app.logger.warning("Demo run 回滚遇 attempt 冲突（保留新尝试）：%s",
                                reason)
         except ValueError:
-            app.logger.warning("Demo run 回滚遇 consumed（防误退款保留）：%s",
+            app.logger.warning("Demo run 回滚遇 accepted（防误退款保留）：%s",
                                reason)
         except Exception:
             app.logger.warning("Demo run 回滚失败：%s", reason, exc_info=True)
@@ -3456,11 +3459,6 @@ def api_demo_ai_run():
     # 4) Demo 子额度 + 平台总预算原子预占（超限释放 run，不回退其它凭据）
     try:
         resv = budget_store.reserve_turn(rid, "demo", cap["id"], "platform")
-    except budget_store.DemoPerBrowserExhausted as exc:
-        _rollback_demo_run("demo_run_already_used", expected_attempt=run_attempt,
-                           expected_request_id=rid,
-                           expected_rollback_epoch=run_rollback_epoch)
-        return _budget_error_response(exc, 409)
     except budget_store.DemoConcurrencyExceeded as exc:
         _rollback_demo_run("demo_concurrency_exceeded", expected_attempt=run_attempt,
                            expected_request_id=rid,
@@ -3520,8 +3518,9 @@ def api_demo_ai_run():
     config["max_steps"] = _demo_task_max_steps()
     config["session_owner"] = _demo_subject(cap["token_hash"])
     # 计费主体断言注入（PR2 §7.2）：demo_sessions.id（capability id）与
-    # consume_run 绑定 histopilot_session_id 的行同源，resolver 第②步
-    # SELECT id 同值；缺省回退 "unknown" 会 409 usage_subject_conflict 进 dead。
+    # accept_run 绑定 histopilot_session_id 的 run 行同源（0026 起绑定在
+    # demo_runs，resolver 第②步 SELECT capability_id 同值）；缺省回退
+    # "unknown" 会 409 usage_subject_conflict 进 dead。
     config["billing_subject"] = _billing_subject_assertion(
         None, demo_capability_id=cap["id"])
 
@@ -3541,18 +3540,22 @@ def api_demo_ai_run():
         payload["task"] = task
 
     # 6/7) 代理 SSE；_proxy_sse 在 2xx（security_profile_applied 已由 HistoPilot
-    #     在建流前发出/确保）时 on_accepted → consume；4xx/连接失败 on_rejected
-    #     → release。回调内部吞异常（交由对账兜底）。
+    #     在建流前发出/确保）时 on_accepted → accept（reserved→accepted + 预算
+    #     consume）；4xx/连接失败 on_rejected → release；上游流**正常结束**
+    #     on_finished → finish（accepted→finished 终态，capability 解锁，可顺序
+    #     再开下一个 run；客户端提前断开不 finish——由重连窗口/对账收敛）。
+    #     回调内部吞异常（交由对账兜底）。
     def on_accepted(hp_session_id):
         sid = hp_session_id or ""
         try:
-            demo_store.consume_run(cap["id"], sid, expected_attempt=run_attempt,
-                                   expected_request_id=rid)
+            demo_store.accept_run(demo_run_id, sid,
+                                  expected_attempt=run_attempt,
+                                  expected_request_id=rid)
         except demo_store.RunAttemptConflict:
-            app.logger.warning("Demo run consume attempt 冲突（对账兜底）",
+            app.logger.warning("Demo run accept attempt 冲突（对账兜底）",
                                exc_info=True)
         except Exception:
-            app.logger.warning("Demo run consume 失败（对账兜底）", exc_info=True)
+            app.logger.warning("Demo run accept 失败（对账兜底）", exc_info=True)
         try:
             budget_store.consume(rid, sid, expected_attempt=resv_attempt)
         except budget_store.ReservationAttemptConflict:
@@ -3561,13 +3564,21 @@ def api_demo_ai_run():
         except Exception:
             app.logger.warning("Demo 预算 consume 失败（对账兜底）", exc_info=True)
 
+    def on_finished(_session_id):
+        # 流正常结束：run 转 finished 终态 → capability 可立即再开（顺序多次）
+        try:
+            demo_store.finish_run(demo_run_id)
+        except Exception:
+            app.logger.warning("Demo run finish 失败（对账兜底）", exc_info=True)
+
     def on_rejected():
         _rollback_all("histopilot_rejected")
 
     _audit("demo.ai.run", target_type="demo_session", target_id=cap["id"],
-           slide=filename, detail={"request_id": rid, "slide_id": slide_id})
+           slide=filename, detail={"request_id": rid, "slide_id": slide_id,
+                                   "demo_run_id": demo_run_id})
     return _proxy_sse("/run", payload, on_accepted=on_accepted,
-                      on_rejected=on_rejected)
+                      on_rejected=on_rejected, on_finished=on_finished)
 
 
 @app.route("/api/demo/ai/session/<session_id>")
@@ -3598,20 +3609,33 @@ def api_demo_ai_session_stream(session_id):
 
 
 def _demo_session_access(session_id):
-    """Demo session 读通道共用守卫。通过返回 None；否则返回 error response。"""
+    """Demo session 读通道共用守卫。通过返回 None；否则返回 error response。
+
+    capability 有效（过期/撤销 → 410）且该 capability 的 demo_runs 流水中
+    存在 histopilot_session_id 与请求一致的 accepted/finished run，且仍在
+    accepted_at + 1h 重连窗口内（0026 起：capability 可顺序多次 run，各 run
+    绑定各自 HP session，互不串读）。
+    """
     err = _demo_require_open()
     if err is not None:
         return err
     cap, cap_err = _demo_require_capability()
     if cap_err is not None:
         return cap_err
-    if cap.get("run_state") != demo_store.RUN_STATE_CONSUMED or \
-            cap.get("histopilot_session_id") != session_id:
+    run = None
+    try:
+        run = demo_store.get_run_for_session(cap["id"], session_id)
+    except platform_features.PgFeatureUnavailable:
+        raise
+    except Exception:
+        app.logger.warning("Demo run 会话绑定读取失败", exc_info=True)
         return _denied()
-    consumed_at = cap.get("consumed_at")
-    if not consumed_at or (float(consumed_at) + DEMO_SESSION_RECONNECT_SECONDS
+    if run is None:
+        return _denied()
+    accepted_at = run.get("accepted_at")
+    if not accepted_at or (float(accepted_at) + DEMO_SESSION_RECONNECT_SECONDS
                            < time.time()):
-        return (jsonify(error="Demo AI 会话重连窗口已过（consumed_at + 1 小时）",
+        return (jsonify(error="Demo AI 会话重连窗口已过（accepted_at + 1 小时）",
                         code="session_reconnect_expired"), 410)
     return None
 
@@ -4766,11 +4790,14 @@ def api_admin_ai_budget_get():
         "current": int(report["platform"]["reserved"]) + int(report["own"]["reserved"]),
         "max": int(period.get("demo_max_concurrency") or 0),
     }
-    demo_sessions = {"available": 0, "reserved": 0, "consumed": 0, "total": 0}
+    demo_runs = {"reserved": 0, "accepted": 0, "finished": 0, "released": 0,
+                 "expired": 0, "active": 0, "total": 0}
     try:
-        demo_sessions = demo_store.count_run_states()
+        # 批次 E：run 状态权威在 demo_runs（0026）；demo_sessions.run_state
+        # 一次性状态机已退役，不再计数
+        demo_runs = demo_store.count_run_states()
     except Exception:
-        app.logger.warning("读取 Demo capability 用量失败", exc_info=True)
+        app.logger.warning("读取 Demo run 用量失败", exc_info=True)
     return jsonify(
         period={
             "id": period["id"],
@@ -4787,7 +4814,7 @@ def api_admin_ai_budget_get():
             "per_user": report["per_user"],
             "own": report["own"],
         },
-        demo_sessions=demo_sessions,
+        demo_runs=demo_runs,
         concurrency=concurrency,
         backend=platform_features.current_backend(),
     )
@@ -4831,11 +4858,13 @@ def api_admin_ai_budget_put():
 
 @app.route("/api/admin/settings/ai-budget/reset", methods=["POST"])
 def api_admin_ai_budget_reset():
-    """开启新预算周期并放开 Demo 每浏览器/IP 辅闸（二次确认 + audit）。
+    """开启新预算周期并把在途 Demo run 置为终态（二次确认 + audit）。
 
     body: {confirm: true, limits?}。旧周期 closed_at=now() 且行/用量保留（排查
-    用）；新周期用量归零；reserved/consumed 的 Demo capability 退回 available
-    （同一 cookie 可立刻再跑，IP 桶也不再计入旧 run）。limits 可选（未给沿用旧值）。
+    用）；新周期用量归零。批次 E 后每浏览器累计闸与 24h 成功次数 IP 桶已退役，
+    reset 的残余语义是把 reserved/accepted 的在途 demo run 转 expired 终态
+    （卡死的 capability 立即可再开；预算 reservation 不在此动，由确认式对账
+    按 HistoPilot 反查定局，避免误退款）。limits 可选（未给沿用旧值）。
     """
     auth = _require_owner()
     if auth:
@@ -4887,19 +4916,18 @@ def api_admin_ai_budget_reset():
 def _release_budget_for_terminated_runs(terminated_runs):
     """按 request_id 向 HistoPilot 确认后 consume / release / 顺延。
 
-    不得盲 release：sidecar 已接受但平台尚未 consume 时必须 consume，否则会
-    退回已经产生模型成本的额度。found+已接受 → consume；missing → release；
-    不可达或尚未接受 → 顺延 reservation。
+    ``terminated_runs`` 为 revoke_by_slide 返回的 demo_runs 流水 dict 列表
+    （含 demo_run_id / request_id / attempt；0026 起 run 与 capability 分离，
+    不再回查 demo_sessions）。
+
+    不得盲 release：sidecar 已接受但平台尚未 accept 时必须 consume，否则会
+    退回已经产生模型成本的额度。found+已接受 → consume（run 侧已被 revoke
+    置为 expired 终态，不重复流转）；missing → release；不可达或尚未接受 →
+    顺延 reservation。
     """
     released = []
-    for run_id in terminated_runs or []:
-        try:
-            row = demo_store.get_session(run_id)
-        except Exception:
-            app.logger.warning("terminated run 读取失败：%s", run_id, exc_info=True)
-            continue
-        rid = (row or {}).get("request_id")
-        run_attempt = (row or {}).get("attempt")
+    for run in terminated_runs or []:
+        rid = (run or {}).get("request_id")
         if not rid:
             continue
         budget_row = None
@@ -4929,13 +4957,6 @@ def _release_budget_for_terminated_runs(terminated_runs):
                         rid, budget_store.DEFAULT_RESERVATION_TTL_SECONDS)
                 except Exception:
                     pass
-            try:
-                demo_store.consume_run(run_id, hp_sid or "",
-                                       expected_attempt=run_attempt,
-                                       expected_request_id=rid)
-            except Exception:
-                app.logger.warning("terminated run demo consume 失败：%s",
-                                   run_id, exc_info=True)
         elif verdict == "missing" or verdict == "abandoned":
             try:
                 budget_store.release(rid, expected_attempt=budget_attempt)
@@ -4951,13 +4972,6 @@ def _release_budget_for_terminated_runs(terminated_runs):
             except Exception:
                 app.logger.warning("terminated run 预算释放失败：%s", rid,
                                    exc_info=True)
-            try:
-                demo_store.release_run(run_id, expected_attempt=run_attempt,
-                                       expected_request_id=rid)
-            except demo_store.RunAttemptConflict:
-                pass
-            except Exception:
-                pass
         else:
             # unavailable 或 found 但尚未接受：顺延，不得退款
             try:
@@ -4966,11 +4980,6 @@ def _release_budget_for_terminated_runs(terminated_runs):
             except Exception:
                 app.logger.warning("terminated run 预算顺延失败：%s", rid,
                                    exc_info=True)
-            try:
-                demo_store.extend_run_reservation(
-                    run_id, demo_store.DEMO_RUN_RESERVATION_TTL_SECONDS)
-            except Exception:
-                pass
     return released
 
 
@@ -6361,7 +6370,12 @@ def admin_v1_turn_budgets_update():
 
 @app.route("/api/admin/v1/turn-budgets/new-period", methods=["POST"])
 def admin_v1_turn_budgets_new_period():
-    """开启新预算周期（镜像旧 4453 reset：confirm 二次确认 + 可选 limits）。"""
+    """开启新预算周期（镜像旧 4453 reset：confirm 二次确认 + 可选 limits）。
+
+    批次 E 后 reset 的 Demo 侧残余语义：在途 demo run 转 expired 终态
+    （每浏览器累计闸与 24h 成功次数 IP 桶已退役；预算 reservation 由确认式
+    对账定局）。
+    """
     auth = _require_owner_admin_v1()
     if auth:
         return auth
@@ -6989,11 +7003,11 @@ def admin_v1_settings():
             payload["runtime"] = {
                 "available": True,
                 "limits": {k: period.get(k) for k in _SETTINGS_RUNTIME_FIELDS},
-                # Demo IP 短窗口桶现状（只读观测：env 配置；批次 E 将改造为
-                # 短窗口请求速率——本批不改 run/demo 请求路径）
-                "demo_ip_run_limit": demo_store.ip_run_limit(),
-                "demo_ip_run_window_seconds":
-                    demo_store.ip_run_window_seconds(),
+                # Demo IP 短窗口请求速率现状（只读观测：批次 E 起 env 配置
+                # DEMO_IP_RATE_PER_MINUTE，≤0 关闭；admin 可写入口不在本批）
+                "demo_ip_request_rate_per_minute": demo_store.ip_rate_limit(),
+                "demo_ip_request_rate_window_seconds":
+                    demo_store.ip_rate_window_seconds(),
             }
         except platform_features.PgFeatureUnavailable:
             payload["runtime"] = {"available": False,
@@ -10018,9 +10032,9 @@ def _billing_subject_assertion(user_ctx, demo_capability_id=None):
         AUTH_ENABLED=False 归一 owner 无 user_id → null；resolver 对 null
         user_id 断言跳过比对，非 null 时与 subject_id 同值）；
       - Demo 路径：subject_id = demo_sessions 行 id（capability id），与
-        demo_store.consume_run 写入 histopilot_session_id 的行、resolver
-        第②步 ``SELECT id`` 同值；user_id 恒 null（demo 永不映射登录用户，
-        亦不开户）。
+        demo_store.accept_run 写入 histopilot_session_id 的 run 行（0026 起
+        demo_runs 流水）、resolver 第②步 ``SELECT capability_id`` 同值；
+        user_id 恒 null（demo 永不映射登录用户，亦不开户）。
     """
     if demo_capability_id is not None:
         return {"subject_type": "demo", "subject_id": demo_capability_id,
@@ -10101,8 +10115,6 @@ def _ai_reserve_run_budget(user_ctx, request_id):
         return None, _budget_error_response(exc, 429)
     except budget_store.DemoConcurrencyExceeded as exc:
         return None, _budget_error_response(exc, 429)
-    except budget_store.DemoPerBrowserExhausted as exc:
-        return None, _budget_error_response(exc, 409)
     except budget_store.DemoBudgetExhausted as exc:
         return None, _budget_error_response(exc, 429)
     except budget_store.BudgetError as exc:
@@ -10371,13 +10383,14 @@ def _ai_run_prepare(user_ctx, body, slide, need_grant):
 # 已接受的执行误退款）。后台周期线程只走 reconcile_expired_reservations。
 # 过期 reserved 项经 HistoPilot ``GET /session/by-request/<request_id>``
 # 反查确认终态——
-#   200 且 security_profile_applied/accepted_at → consume（已接受执行）；
-#   200 但尚未接受 → **不 consume、不释放，顺延**（acquire 与安全确认之间崩溃）；
+#   200 且 security_profile_applied/accepted_at → accept（已接受执行）；
+#   200 但尚未接受 → **不 accept、不释放，顺延**（acquire 与安全确认之间崩溃）；
 #   404 not_found → release（确定未创建）；
 #   5xx / 连接失败 → **不释放，顺延** reservation_expires_at（一个 TTL），
 #     直至可确认；避免「误退款后白跑」。
-# 覆盖 demo_sessions.run_state=reserved（一次性 run）与
-# ai_budget_reservations.state=reserved（全部主体）。
+# 覆盖 demo_runs.state ∈ (reserved, accepted)（批次 E：run 流水；accepted
+# 到期只转 expired 终态解锁 capability）与 ai_budget_reservations.state=
+# reserved（全部主体）。
 # --------------------------------------------------------------------------- #
 def _histopilot_action_accepted(session):
     """by-request 200 的 session 是否已持久化接受（对账 consume 门槛）。"""
@@ -10445,7 +10458,8 @@ def _histopilot_lookup_request(request_id):
 
 
 def reconcile_expired_reservations(now=None):
-    """确认式对账：过期 reserved → 经 HistoPilot 反查转 consumed / released / 顺延。
+    """确认式对账：过期 reserved → 经 HistoPilot 反查转 accepted / released /
+    顺延；过期 accepted → expired 终态（解锁 capability）。
 
     返回摘要 dict：``{"demo": [{"id","request_id","action"}...],
     "budget": [{"request_id","action"}...]}``（可测）。json/dual 后端
@@ -10462,68 +10476,84 @@ def reconcile_expired_reservations(now=None):
             return "missing", None, False  # 无 request_id 的残留（防御路径）按未创建释放
         return _histopilot_lookup_request(rid)
 
-    # 1) demo_sessions：reserved 且过期的 run
+    # 1) demo_runs：active（reserved/accepted）且过期的 run。
+    #    reserved：反查定局——found+accepted → accept（防误退款）；missing/
+    #    abandoned → release；不可达/未接受 → 顺延（§5.3-6）。
+    #    accepted：重连窗口到期 → expired 终态（预算已在 accept 时消费，无需
+    #    再动；终态后 capability 可开新 run，§4.1）。
     try:
-        expired_runs = demo_store.list_reserved_expired(ts)
+        expired_runs = demo_store.list_active_expired(ts)
     except Exception:
-        app.logger.warning("对账扫描 demo_sessions 失败（可重试）", exc_info=True)
+        app.logger.warning("对账扫描 demo_runs 失败（可重试）", exc_info=True)
         expired_runs = []
     for run in expired_runs:
         rid = run.get("request_id")
+        run_id = run["demo_run_id"]
+        if run.get("state") == demo_store.RUN_STATE_ACCEPTED:
+            try:
+                demo_store.expire_run(run_id)
+                action = "expired"
+            except Exception:
+                action = "expire_failed"
+                app.logger.warning("对账 expire accepted run 失败：%s", run_id,
+                                   exc_info=True)
+            summary["demo"].append({"id": run_id, "request_id": rid,
+                                    "action": action})
+            continue
         run_attempt = run.get("attempt")
         verdict, hp_sid, accepted = _lookup_or_extend(rid)
         if verdict == "found" and accepted:
-            # HistoPilot 已接受该动作 → 转 consumed（防误退款）
+            # HistoPilot 已接受该动作 → 转 accepted（防误退款）
             try:
-                demo_store.consume_run(run["id"], hp_sid or "",
-                                       expected_attempt=run_attempt,
-                                       expected_request_id=rid)
-                action = "consumed"
+                demo_store.accept_run(run_id, hp_sid or "",
+                                      expected_attempt=run_attempt,
+                                      expected_request_id=rid)
+                action = "accepted"
             except demo_store.RunAttemptConflict:
                 try:
                     demo_store.extend_run_reservation(
-                        run["id"], demo_store.DEMO_RUN_RESERVATION_TTL_SECONDS)
+                        run_id, demo_store.DEMO_RUN_RESERVATION_TTL_SECONDS)
                     action = "attempt_conflict_extended"
                 except Exception:
                     action = "attempt_conflict_extend_failed"
             except Exception:
-                app.logger.warning("对账 consume demo run 失败：%s", run["id"],
+                app.logger.warning("对账 accept demo run 失败：%s", run_id,
                                    exc_info=True)
                 try:
                     demo_store.extend_run_reservation(
-                        run["id"], demo_store.DEMO_RUN_RESERVATION_TTL_SECONDS)
-                    action = "consume_failed_extended"
+                        run_id, demo_store.DEMO_RUN_RESERVATION_TTL_SECONDS)
+                    action = "accept_failed_extended"
                 except Exception:
-                    action = "consume_failed"
+                    action = "accept_failed"
         elif verdict == "missing" or verdict == "abandoned":
             try:
-                demo_store.release_run(run["id"], expected_attempt=run_attempt,
+                demo_store.release_run(run_id, expected_attempt=run_attempt,
                                        expected_request_id=rid)
                 action = "released"
             except demo_store.RunAttemptConflict:
                 try:
                     demo_store.extend_run_reservation(
-                        run["id"], demo_store.DEMO_RUN_RESERVATION_TTL_SECONDS)
+                        run_id, demo_store.DEMO_RUN_RESERVATION_TTL_SECONDS)
                     action = "attempt_conflict_extended"
                 except Exception:
                     action = "attempt_conflict_extend_failed"
             except ValueError:
-                action = "consumed_keep"  # 已 consumed：不退款
+                action = "accepted_keep"  # 已 accepted：不退款
             except Exception:
                 action = "release_failed"
-                app.logger.warning("对账 release demo run 失败：%s", run["id"],
+                app.logger.warning("对账 release demo run 失败：%s", run_id,
                                    exc_info=True)
         else:
             # HistoPilot 不可达，或 session 已创建但尚未接受（安全确认前崩溃）：
             # 不释放，顺延一个 TTL（§5.3-6）
             try:
                 demo_store.extend_run_reservation(
-                    run["id"], demo_store.DEMO_RUN_RESERVATION_TTL_SECONDS)
+                    run_id, demo_store.DEMO_RUN_RESERVATION_TTL_SECONDS)
                 action = ("pending_extended" if verdict == "found"
                           else "extended")
             except Exception:
                 action = "extend_failed"
-        summary["demo"].append({"id": run["id"], "request_id": rid,
+        summary["demo"].append({"id": run_id, "request_id": rid,
                                 "action": action})
 
     # 2) ai_budget_reservations：reserved 且过期（全部主体；同口径反查）

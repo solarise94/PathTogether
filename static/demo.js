@@ -477,10 +477,8 @@
     switch (kind) {
       case "available":
         if (btn) btn.disabled = false;
-        var remain = state.config && state.config.per_browser_remaining;
-        label = (remain != null)
-          ? t("demo.ai.run.available.n", { n: remain })
-          : t("demo.ai.run.available");
+        // 批次 E：无每浏览器累计上限——顺序多次体验不受次数限制
+        label = t("demo.ai.run.available");
         setQuotaChip(label);
         break;
       case "running":
@@ -489,23 +487,16 @@
         setQuotaChip(label);
         break;
       case "refreshing":
-        // run 结束后的额度刷新过渡态：保持禁用，最终态由 applyConfig() 落定
+        // run 结束后的状态刷新过渡态：保持禁用，最终态由 applyConfig() 落定
         if (btn) btn.disabled = true;
         label = t("demo.ai.refreshing");
         setQuotaChip(label);
         break;
-      case "used":
+      case "demo_run_in_progress":
+        // 同 capability 已有在途 run（单 active 并发闸）：按运行中呈现
         if (btn) btn.disabled = true;
-        label = t("demo.ai.run.used");
+        label = t("demo.ai.run.running");
         setQuotaChip(label);
-        var usedN = state.config && state.config.per_browser_used != null
-          ? Number(state.config.per_browser_used) : 1;
-        var limN = state.config && state.config.per_browser_limit != null
-          ? Number(state.config.per_browser_limit) : 1;
-        if (status) {
-          status.innerHTML = esc(t("demo.ai.login.hint", { used: usedN, limit: limN })) +
-            ' <a href="/login">' + esc(t("demo.footer.login")) + "</a>";
-        }
         break;
       case "demo_budget_exhausted":
         if (btn) btn.disabled = true;
@@ -513,11 +504,10 @@
         setQuotaChip(label);
         if (status) status.innerHTML = '<a href="/login">' + esc(t("demo.footer.login")) + "</a>";
         break;
-      case "demo_ip_rate_limited":
+      case "demo_ip_request_rate_limited":
         if (btn) btn.disabled = true;
         label = t("demo.ai.run.ip.limited");
         setQuotaChip(label);
-        if (status) status.innerHTML = '<a href="/login">' + esc(t("demo.footer.login")) + "</a>";
         break;
       case "platform_ai_budget_exhausted":
         if (btn) btn.disabled = true;
@@ -550,18 +540,10 @@
     state.config = cfg;
     var hint = $("ai-steps-hint");
     if (hint) {
-      // 提示行显示「本浏览器剩余额度」；per_browser_* 读取失败时保持
-      // payload 缺省（limit=1/remaining=1）的兜底，不回退全站池数字
+      // 提示行显示单次步数上限（批次 E：无每浏览器次数额度，不显示剩余次数）
       if (cfg) {
-        var pbLimit = cfg.per_browser_limit != null
-          ? Number(cfg.per_browser_limit) : 1;
-        var pbRemaining = cfg.per_browser_remaining != null
-          ? Number(cfg.per_browser_remaining)
-          : Math.max(0, pbLimit - (cfg.per_browser_used != null
-              ? Number(cfg.per_browser_used) : 0));
         hint.textContent = t("demo.ai.steps.hint", {
-          steps: cfg.task_max_steps,
-          remaining: pbRemaining, limit: pbLimit });
+          steps: cfg.task_max_steps });
       } else {
         hint.textContent = "";
       }
@@ -578,12 +560,10 @@
     if (cfg.budget && cfg.budget.platform_exhausted) {
       setAiButton("platform_ai_budget_exhausted"); return;
     }
-    var limit = cfg.per_browser_limit != null ? Number(cfg.per_browser_limit) : 1;
-    var used = cfg.per_browser_used != null ? Number(cfg.per_browser_used) : 0;
-    var remaining = cfg.per_browser_remaining != null
-      ? Number(cfg.per_browser_remaining) : Math.max(0, limit - used);
-    if (cfg.run_state === "consumed" && remaining <= 0) {
-      setAiButton("used"); return;
+    // run_state 来自最近一次 demo_runs 流水：在途（reserved/accepted）→ 运行中；
+    // 终态（finished/released/expired）或未跑过 → 可再跑（顺序多次，无次数上限）
+    if (cfg.run_state === "reserved" || cfg.run_state === "accepted") {
+      setAiButton("running"); return;
     }
     setAiButton("available");
   }
@@ -594,10 +574,10 @@
       .then(function (r) { return r.json(); })
       .then(function (cfg) {
         applyConfig(cfg);
-        // 仅页面首次加载、尚未附着流、且确实需要恢复轨迹时才重连。
-        // finishRun 刷新配额时 restore=false，禁止对终态 session 再开流。
+        // 仅页面首次加载、尚未附着流、且确有在途 accepted run 时才重连轨迹。
+        // finishRun 刷新 config 时 restore=false，禁止对终态 session 再开流。
         var sid = cfg.histopilot_session_id || null;
-        if (restore && !state.sessionAttached && cfg.run_state === "consumed" && sid) {
+        if (restore && !state.sessionAttached && cfg.run_state === "accepted" && sid) {
           state.sessionId = sid;
           state.sessionAttached = true;
           state.running = true;
@@ -609,9 +589,9 @@
         }
       })
       .catch(function () {
-        // 页面首次加载失败 → AI 不可用；finishRun 后的额度刷新失败 → 保守
-        // 回落“已使用”（本轮 run 确已消耗额度，不能误显示可再跑）
-        setAiButton(restore ? "unavailable" : "used");
+        // 页面首次加载失败 → AI 不可用；finishRun 后的状态刷新失败 → 保守
+        // 禁用（本轮 run 状态未知，不能误显示可再跑）
+        setAiButton(restore ? "unavailable" : "refreshing");
       });
   }
 
@@ -1055,8 +1035,8 @@
   function finishRun() {
     state.running = false;
     closeActiveStream();
-    // 不再无条件置 used（limit>1 时会先闪“已用完”）：保持禁用过渡态，
-    // 由 loadConfig → applyConfig 用最新额度落定最终按钮/文案
+    // 过渡态保持禁用：run 终态（finished）由 loadConfig → applyConfig 落定为
+    // 「可再次体验」（批次 E：顺序多次 run，无每浏览器次数上限）
     setAiButton("refreshing");
     loadConfig({ restore: false });
   }
@@ -1094,15 +1074,16 @@
         return resp.json().then(function (body) {
           var code = body && body.code;
           if (code === "demo_budget_exhausted") setAiButton("demo_budget_exhausted");
-          else if (code === "demo_ip_rate_limited") setAiButton("demo_ip_rate_limited");
+          else if (code === "demo_ip_request_rate_limited") setAiButton("demo_ip_request_rate_limited");
           else if (code === "platform_ai_budget_exhausted") setAiButton("platform_ai_budget_exhausted");
-          else if (code === "demo_run_already_used") setAiButton("used");
+          else if (code === "demo_run_in_progress") setAiButton("demo_run_in_progress");
           else if (code === "demo_disabled") setAiButton("disabled");
           else if (code === "histopilot_unreachable" ||
                    code === "histopilot_legacy_adapter" ||
                    code === "platform_credentials_missing" ||
                    code === "pg_backend_required") setAiButton("unavailable");
-          else setAiButton("used");
+          else if (code === "demo_run_request_final") setAiButton("available");
+          else setAiButton("refreshing");
           state.running = false;
           appendTrace("ai-row error", (body && body.error) || ("HTTP " + resp.status));
         });

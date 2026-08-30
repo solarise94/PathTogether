@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""金额计费存储层（admin-billing 方案 §6/§7，PR2：影子计价，不扣账本）。
+"""金额计费存储层（admin-billing 方案 §6/§7；批次 C 起为强一致 usage/hold
+协议，docs ai-money-budget-bugfix-and-simplification-plan.md §3.3/§3.4/§4.2）。
 
 PG-only：全部公共入口经 ``platform_features.require_pg_backend("billing")``
 fail-closed（json/dual 返回稳定 ``pg_backend_required``，不降级进程内余额）。
@@ -9,15 +10,22 @@ fail-closed（json/dual 返回稳定 ``pg_backend_required``，不降级进程�
     schema_v1.json 一致；仓库无 jsonschema 依赖，不新增）；
   - canonical payload_hash（18 字段，规则以
     tests/fixtures/usage_events/README.md 为唯一依据，PR0 互锁用例校验）；
-  - :func:`ingest_usage_event`：单事务投递端点数据层（§7.5）——dedup 比对
-    payload_hash → §7.2 四步权威主体解析 → 时钟偏差/算术校验 → 双 price book
-    计价写回（或 unpriced+reason）→ PR6 模拟软扣费（§12.2/§19 v0.4：priced
-    且 owner/user 主体同事务自动开户 + 负金额 usage_debit，SAVEPOINT
-    best-effort 不阻断计量）→ 同事务无敏感信息 audit（含扣费结果）。
-    **demo 主体永不开户、永不扣账（§14.1 红线）**；
-  - :func:`authorize_hold` / :func:`settle_hold`：PR7 逐 model call 预授权
-    hold（§12.3/§19 v0.5，**advisory/影子**——永不因余额拒绝，would_deny
-    仅观测；TTL 惰性回收；demo 主体不写行；与 ingest 扣费链解耦）；
+  - :func:`_ingest_usage_event_tx`：ingest 事务内核（§7.5 全部步骤）——
+    dedup 比对 payload_hash → §7.2 四步权威主体解析 → 时钟偏差/算术校验 →
+    双 price book 计价写回（或 unpriced+reason）→ debit（shadow=PR6 模拟
+    软扣费 SAVEPOINT best-effort；hard=真实 debit 无 SAVEPOINT 强一致）→
+    窗口 spent 投影（§3.2/§3.4.5）→ 同事务无敏感信息 audit。
+    /usage-events 端点与 hold settle **共用本内核**（同一事件两个方向只
+    计一次价/扣一次账/加一次 spent）；:func:`ingest_usage_event` 是它的
+    连接壳。demo 主体永不开户、永不写 ledger（§14.1 红线）；
+  - :func:`authorize_hold` / :func:`settle_hold`（批次 C，§3.3/§3.4）：
+    逐 model call 预授权 + 单事务强一致结算。authorize 按
+    ``spend_enforcement_mode`` 快照分流（shadow 永不因金额拒绝但照常投影
+    reserved；registered/all 对应主体硬拒绝，稳定码 + 不写 reserved）；
+    demo 主体**所有模式都写 hold 行**并进 demo_global 周窗口投影（§4.2）；
+    settle 接受旧 ``{event_id}``（shadow 快照兼容）与新 ``{usage_event}``
+    （hard 快照唯一合法形态）两种 body；hold TTL 惰性回收时归还窗口
+    reserved；过期后迟到的合法 usage 仍记实际消费（§3.4.7）；
   - price book 创建/激活（§6.3：固定 key ``pg_advisory_xact_lock`` + active
     区间重叠拒绝，明确不用 btree_gist）；
   - 账户/账本/余额快照基础读写（余额 = SUM(amount)，projection 可重建）；
@@ -25,9 +33,10 @@ fail-closed（json/dual 返回稳定 ``pg_backend_required``，不降级进程�
     （Decimal，禁 float 中转）。
 
 审计红线：不落 prompt/输出文本/图片/API key/完整 IP/完整请求体；ingest
-audit 只含 provider/model/subject_type/status/duplicate/unpriced_reason 与
-PR6 模拟扣费结果（simulated_debit{entry_id, amount_nano_cny, duplicate} /
-simulated_debit_skipped<原因词表>）等非敏感字段。
+audit 只含 provider/model/subject_type/status/duplicate/unpriced_reason、
+debit 结果（simulated_debit{...} / simulated_debit_skipped<词表> /
+real_debit{...}）与窗口投影结果（window_projection*）等非敏感字段；hold
+audit 只含 call_id 后 8 字符与金额/状态等标量。
 """
 
 import hashlib
@@ -130,6 +139,10 @@ _SIM_DEBIT_OFF_VALUES = ("0", "false", "off")
 
 #: 模拟扣费行的 reason（§6.5 reason 必填非空；不含敏感信息）
 SIM_DEBIT_REASON = "模拟扣费（PR6）"
+
+#: hard 模式真实扣费行的 reason（批次 C §3.4.4；kind 同为 usage_debit，
+#: metadata.simulated=false 区分）
+REAL_DEBIT_REASON = "真实扣费（批次 C）"
 
 #: ingest audit detail 的跳过原因稳定词表（simulated_debit_skipped 的取值，
 #: 供测试与排障对齐；不得掺入敏感信息）：
@@ -319,6 +332,39 @@ class HoldNotFoundError(BillingError):
     """hold 不存在或不属于当前 installation（统一 404，不泄露存在性）。"""
 
     code = "hold_not_found"
+
+
+class HoldPricingUnavailableError(BillingError):
+    """authorize 时刻无 active 价目（§3.3 稳定码 ``pricing_unavailable``）。
+
+    hard 模式 fail-closed（不确定的价格绝不放行 provider 调用）；shadow
+    模式只记观测（hold.denial_reason）。retryable=true：价目补齐/DB 恢复
+    后同 call_id 重放即可恢复。
+    """
+
+    code = "pricing_unavailable"
+    retryable = True
+
+
+class SettlePayloadRequiredError(BillingError):
+    """hard 模式下 settle 只接受新 ``{usage_event}`` body（§3.4 兼容滚动升级）。
+
+    旧 ``{event_id}`` body 在 registered/all 快照的 hold 上必须**明确拒绝**
+    （稳定码 ``settle_payload_required``），不能静默少记金额；客户端收到本
+    错误后改投新 body。release（空 body）不受影响（§3.4.6）。
+    """
+
+    code = "settle_payload_required"
+
+
+def _spend():
+    """惰性 import spend_store（其顶层 import billing_store，避免环）。
+
+    批次 C 起本模块在 authorize/settle/ingest 事务内调用 spend_store 的
+    ``*_tx`` 投影原语与模式判定；模块级 import 会成环，故函数内取。
+    """
+    import spend_store
+    return spend_store
 
 
 def _connect():
@@ -816,27 +862,370 @@ def _apply_simulated_usage_debit(cur, event, *, subject_type, user_id, status,
         return {"simulated_debit_skipped": SIM_DEBIT_SKIPPED_FAILED}
 
 
+def _apply_real_usage_debit_tx(cur, event, *, subject_type, user_id, status,
+                               charge, charge_price_book_id, stored_tokens):
+    """hard 模式（registered/all）真实 ledger debit（§3.4.4/§3.4.9）。
+
+    与 :func:`_apply_simulated_usage_debit` 的关键差异：**没有 SAVEPOINT**——
+    开户/入账任一步失败让整个 ingest/settle 事务回滚并进入可重试路径（outbox
+    退避重投 / settle 重试），绝不吞错后让事件「入账成功但没扣钱」（模拟期
+    best-effort 纪律在 hard 模式废止，§3.4.9）。幂等键同样固定
+    ``usage:<event_id>``（部分唯一索引兜底：settle 与 outbox 双投递只扣一次；
+    shadow→hard 切换期同事件已存在模拟 debit 时 ON CONFLICT DO NOTHING 改读
+    原行，不双扣）。metadata ``simulated:false``，其余非敏感字段与模拟 debit
+    同构。
+
+    skip 词表复用模拟期（返回 None 表示跳过，detail 并入 audit）：
+    unpriced / demo_subject / user_missing / zero_charge /
+    account_suspended——hard 模式的额度闸在**窗口**（§3.2），不在账户余额；
+    suspended/缺户先跳过并记 warning（真实成本仍完整记录在事件与窗口 spent，
+    账户面缺口由对账器暴露），不阻断计量链（不丢真实成本，§3.4.7 精神）。
+    """
+    if status != "priced" or charge is None:
+        return {"real_debit_skipped": SIM_DEBIT_SKIPPED_UNPRICED}
+    if subject_type not in ("owner", "user"):
+        return {"real_debit_skipped": SIM_DEBIT_SKIPPED_DEMO}
+    if not user_id:
+        _LOG.warning("[billing-real-debit] 主体无 users 行，跳过真实扣费"
+                     " event_id=%s subject_type=%s", event["event_id"],
+                     subject_type)
+        return {"real_debit_skipped": SIM_DEBIT_SKIPPED_USER_MISSING}
+    if int(charge) <= 0:
+        return {"real_debit_skipped": SIM_DEBIT_SKIPPED_ZERO_CHARGE}
+
+    # 自动开户（缺户时）；并发同用户：ON CONFLICT DO NOTHING 后改读既有行
+    cur.execute(
+        "INSERT INTO billing_accounts (account_id, user_id) "
+        "VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING "
+        "RETURNING account_id, status",
+        ("bac_" + secrets.token_hex(12), user_id))
+    acct = cur.fetchone()
+    if acct is None:
+        cur.execute(
+            "SELECT account_id, status FROM billing_accounts "
+            "WHERE user_id=%s", (user_id,))
+        acct = cur.fetchone()
+    if acct is None:
+        # 不可能（DO NOTHING 只在并发赢家存在时返回空，重读必命中）——防御
+        raise RuntimeError("billing account row missing after upsert")
+    if acct["status"] != "active":
+        _LOG.warning("[billing-real-debit] 账户非 active，跳过真实扣费"
+                     " event_id=%s account_status=%s", event["event_id"],
+                     acct["status"])
+        return {"real_debit_skipped": SIM_DEBIT_SKIPPED_ACCOUNT_SUSPENDED}
+
+    event_id = event["event_id"]
+    entry_id = _LEDGER_ENTRY_ID_PREFIX + secrets.token_hex(12)
+    metadata = {
+        "simulated": False,
+        "charge_price_book_id": charge_price_book_id,
+        "model": event["model"],
+        "total_tokens": (stored_tokens or {}).get("total_tokens"),
+        "session_id": event["session_id"],
+    }
+    cur.execute(
+        "INSERT INTO billing_ledger_entries "
+        "(entry_id, account_id, event_id, kind, amount_nano_cny, "
+        " idempotency_key, reason, actor_user_id, metadata) "
+        "VALUES (%s,%s,%s,'usage_debit',%s,%s,%s,NULL,%s) "
+        "ON CONFLICT (idempotency_key) DO NOTHING "
+        "RETURNING entry_id, amount_nano_cny",
+        (entry_id, acct["account_id"], event_id, -int(charge),
+         "usage:%s" % event_id, REAL_DEBIT_REASON,
+         psycopg.types.json.Jsonb(metadata)))
+    row = cur.fetchone()
+    duplicate = row is None
+    if duplicate:
+        cur.execute(
+            "SELECT entry_id, amount_nano_cny "
+            "FROM billing_ledger_entries WHERE idempotency_key=%s",
+            ("usage:%s" % event_id,))
+        row = cur.fetchone()
+    return {"real_debit": {
+        "entry_id": row["entry_id"],
+        "amount_nano_cny": int(row["amount_nano_cny"]),
+        "duplicate": duplicate,
+    }}
+
+
+def _project_window_spent_tx(cur, *, subject_type, subject_id, occurred,
+                             charge):
+    """窗口 spent 投影（§3.2/§3.4.4/§3.4.5，批次 C）。
+
+    priced 事件的 charge 计入**事件发生时刻**所属窗口（与对账器
+    ``reconcile_spend_windows`` 的 expected 口径一致：spent 按事件归窗，
+    不按 authorize 归窗——月界/周边界附近二者可能不同，reserved 归还才用
+    hold.spend_window_id 快照）。demo 主体经 ``_get_or_create_window_tx``
+    归一到 demo_global 周窗口。
+
+    **失败语义**：策略缺失/窗口异常只记 warning + 返回 None，**不阻断计量**
+    （真实成本不得因投影问题丢失，§3.4.7 精神）——窗口欠计由对账器报 drift。
+    事件级幂等由调用方（ingest 内核 dedup）保证：同一事件行只投影一次。
+    """
+    spend = _spend()
+    if charge is None or int(charge) == 0:
+        return None
+    try:
+        # §7.2 口径：cutover 之前的旧错误价格影子数据不进窗口（与对账器
+        # reconcile 的 expected 口径一致——否则投影与重建必然漂移）。cutover
+        # 缺失（0022 未应用）按无界处理。
+        cur.execute("SELECT value FROM platform_settings WHERE key=%s",
+                    (PRICING_V2_CUTOVER_SETTING_KEY,))
+        marker = cur.fetchone()
+        if marker is not None and marker["value"] is not None:
+            cutover = datetime.fromtimestamp(float(marker["value"]),
+                                             tz=timezone.utc)
+            if occurred < cutover:
+                _LOG.warning("[billing-window] cutover 前旧价格事件跳过窗口"
+                             "投影 subject_type=%s", subject_type)
+                return None
+        window = spend._get_or_create_window_tx(
+            cur, subject_type, subject_id, occurred)
+        return spend.window_add_spent_tx(cur, window["window_id"],
+                                         int(charge))
+    except spend.SpendError as exc:
+        _LOG.warning("[billing-window] 窗口 spent 投影跳过（code=%s）"
+                     " subject_type=%s", exc.code, subject_type)
+        return None
+
+
+def _ingest_usage_event_tx(cur, event, *, installation_id, plugin_id,
+                           received, age_days, enforcement_mode=None):
+    """ingest 事务内核（§7.5 全部步骤；/usage-events 与 hold settle 共用）。
+
+    ``received`` = received_at（调用方注入，测试可固定）；``enforcement_mode``
+    缺省读当前全局开关，settle 传 hold 行的**授权时刻快照**（每条 hold 的
+    debit 语义按其授权契约走，混合期可审计）。hard（registered/all ×
+    user/owner）→ 真实 debit（无 SAVEPOINT，失败整体回滚）；否则 → PR6 模拟
+    软扣费（best-effort，语义不变）。两套 debit 幂等键同为 ``usage:<event_id>``。
+
+    返回内部结果 dict：``{event_id, duplicate, status, priced, row,
+    subject_type, subject_id, user_id, charge, charge_price_book_id,
+    enforcement_mode, window_projection}``（settle 需要 charge/主体上下文；
+    公共出口 :func:`ingest_usage_event` 只暴露前五个 + enforcement_mode，
+    行为与批次 C 之前一致）。duplicate 命中时无任何副作用（不重复计价/
+    扣费/投影）。
+    """
+    payload_hash = canonical_payload_hash(event)
+    occurred = billing_pricing.parse_rfc3339(event["occurred_at"])
+    enqueued = billing_pricing.parse_rfc3339(event["enqueued_at"])
+    spend = _spend()
+    mode = (enforcement_mode if enforcement_mode is not None
+            else spend._enforcement_mode_tx(cur))
+
+    raw_usage = dict(event.get("raw_usage") or {})
+    # -- 步骤 2：dedup（先比对，重放幂等返回原行，不重复计价/扣费/投影） --
+    existing = _fetch_event_locked(cur, event["event_id"])
+    if existing is not None:
+        if existing["payload_hash"] != payload_hash:
+            raise UsageEventConflictError(
+                "同 event_id 重放的 payload 与原记录不一致",
+                event_id=event["event_id"])
+        out = _duplicate_result(existing)
+        out.update(subject_type=existing["subject_type"],
+                   subject_id=existing["subject_id"],
+                   user_id=existing["user_id"],
+                   charge=(int(existing["charge_nano_cny"])
+                           if existing["charge_nano_cny"] is not None
+                           else None),
+                   charge_price_book_id=existing["charge_price_book_id"],
+                   enforcement_mode=mode, window_projection=None)
+        return out
+    cur.execute(
+        "SELECT event_id FROM ai_usage_events WHERE call_id=%s",
+        (event["call_id"],))
+    clash = cur.fetchone()
+    if clash is not None:
+        raise UsageEventConflictError(
+            "call_id 已绑定其他事件", call_id=event["call_id"])
+
+    # -- 步骤 3：权威主体（异常则整体回滚，不先按 body 入账） --
+    subject_type, subject_id = _resolve_usage_subject(
+        cur, event, installation_id)
+    user_id = None
+    if subject_type in ("owner", "user"):
+        cur.execute("SELECT user_id FROM users WHERE user_id=%s",
+                    (subject_id,))
+        urow = cur.fetchone()
+        # users 不物理删除（disable 语义）；极端缺行时 user_id 列
+        # 置 NULL 入库（subject 列仍保留权威归因），不让 FK 阻断计量
+        user_id = urow["user_id"] if urow is not None else None
+
+    # -- 步骤 4：时钟/算术/计价（occurred_at 为唯一时间依据） --
+    status, reason, stored_tokens = _classify_unpriced(
+        event, occurred, received, age_days)
+    if stored_tokens is None and reason == UNPRICED_ARITHMETIC_MISMATCH:
+        # 原始数字镜像进 raw_usage（token 列按 CHECK 置 NULL）
+        raw_usage["reported_tokens_v1"] = dict(
+            {"meta_version": 1}, **{k: event.get(k)
+                                    for k in TOKEN_FIELDS})
+    provider_book = charge_book = None
+    provider_cost = charge = None
+    if status == "priced":
+        provider_book = billing_pricing.find_active_rate(
+            cur, "provider_cost", event["provider"],
+            event["model"], occurred)
+        charge_book = billing_pricing.find_active_rate(
+            cur, "customer_charge", event["provider"],
+            event["model"], occurred)
+        if provider_book is None or charge_book is None:
+            status, reason = "unpriced", UNPRICED_NO_ACTIVE_PRICE_BOOK
+        else:
+            provider_cost = billing_pricing.price_tokens_nano(
+                stored_tokens["cache_hit_input_tokens"],
+                stored_tokens["cache_miss_input_tokens"],
+                stored_tokens["output_tokens"], provider_book)
+            charge = billing_pricing.price_tokens_nano(
+                stored_tokens["cache_hit_input_tokens"],
+                stored_tokens["cache_miss_input_tokens"],
+                stored_tokens["output_tokens"], charge_book)
+
+    # SAVEPOINT：并发投递竞态时对方先提交同 event_id/call_id，
+    # 本事务的 INSERT 抛 UniqueViolation——PG 中失败语句会把事务置
+    # aborted（pg_store.transaction 是裸 commit/rollback，无自动
+    # savepoint），必须先 ROLLBACK TO SAVEPOINT 恢复事务才能重读
+    # 对方已提交的行比对 payload_hash（§7.5 步骤 2 的竞态分支）。
+    if _INGEST_PRE_INSERT_HOOK is not None:
+        _INGEST_PRE_INSERT_HOOK(cur)
+    cur.execute("SAVEPOINT sp_usage_insert")
+    try:
+        cur.execute(
+            "INSERT INTO ai_usage_events "
+            "(event_id, call_id, payload_hash, schema_version, "
+            " request_id, session_id, subject_type, subject_id, "
+            " user_id, provider, model, provider_request_id, "
+            " cache_hit_input_tokens, cache_miss_input_tokens, "
+            " output_tokens, reasoning_tokens, total_tokens, "
+            " occurred_at, enqueued_at, received_at, status, "
+            " unpriced_reason, provider_price_book_id, "
+            " charge_price_book_id, provider_cost_nano_cny, "
+            " charge_nano_cny, raw_usage) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+            "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+            "RETURNING " + _EVENT_SEL,
+            (event["event_id"], event["call_id"], payload_hash,
+             int(event["schema_version"]), event.get("request_id"),
+             event["session_id"], subject_type, subject_id,
+             user_id, event["provider"], event["model"],
+             event.get("provider_request_id"),
+             stored_tokens["cache_hit_input_tokens"] if stored_tokens else None,
+             stored_tokens["cache_miss_input_tokens"] if stored_tokens else None,
+             stored_tokens["output_tokens"] if stored_tokens else None,
+             stored_tokens["reasoning_tokens"] if stored_tokens else None,
+             stored_tokens["total_tokens"] if stored_tokens else None,
+             occurred, enqueued, received, status, reason,
+             provider_book["price_book_id"] if provider_book else None,
+             charge_book["price_book_id"] if charge_book else None,
+             provider_cost, charge,
+             psycopg.types.json.Jsonb(raw_usage)))
+        row = cur.fetchone()
+    except psycopg.errors.UniqueViolation as exc:
+        # 与并发投递竞态：对方先提交同 event_id/call_id → 回滚到
+        # savepoint 恢复事务，再重读对方行比 hash
+        name = (getattr(getattr(exc, "diag", None),
+                        "constraint_name", "") or "")
+        if name not in ("ai_usage_events_pkey",
+                        "ai_usage_events_call_id_key"):
+            raise
+        cur.execute("ROLLBACK TO SAVEPOINT sp_usage_insert")
+        again = _fetch_event_locked(cur, event["event_id"])
+        if again is not None and again["payload_hash"] == payload_hash:
+            out = _duplicate_result(again)
+            out.update(subject_type=again["subject_type"],
+                       subject_id=again["subject_id"],
+                       user_id=again["user_id"],
+                       charge=(int(again["charge_nano_cny"])
+                               if again["charge_nano_cny"] is not None
+                               else None),
+                       charge_price_book_id=again["charge_price_book_id"],
+                       enforcement_mode=mode, window_projection=None)
+            return out
+        raise UsageEventConflictError(
+            "并发投递冲突：event_id/call_id 已被其他 payload 占用",
+            event_id=event["event_id"]) from exc
+
+    # -- 步骤 5：debit（§3.4.4）。hard（mode × 主体）→ 真实 debit 强一致
+    # （无 SAVEPOINT，失败整体回滚，§3.4.9）；shadow → PR6 模拟软扣费
+    # （best-effort，SAVEPOINT 内，语义不变）。demo 永不 debit。 --
+    hard_debit = spend.mode_is_hard(mode, subject_type)
+    debit_detail = (_apply_real_usage_debit_tx(
+        cur, event, subject_type=subject_type, user_id=user_id,
+        status=status, charge=charge,
+        charge_price_book_id=(charge_book or {}).get("price_book_id")
+        if charge_book else None,
+        stored_tokens=stored_tokens)
+        if hard_debit else _apply_simulated_usage_debit(
+            cur, event, subject_type=subject_type, user_id=user_id,
+            status=status, charge=charge,
+            charge_price_book_id=(charge_book or {}).get("price_book_id")
+            if charge_book else None,
+            stored_tokens=stored_tokens))
+
+    # -- 步骤 5b：窗口 spent 投影（§3.2/§3.4.5，批次 C）：同一事件只投一次
+    # （本内核 dedup 守卫）——settle 先入、outbox 后到 → duplicate 不再投影；
+    # 反之亦然。策略缺失只观测不阻断。 --
+    window_projection = _project_window_spent_tx(
+        cur, subject_type=subject_type, subject_id=subject_id,
+        occurred=occurred, charge=charge)
+
+    # -- 步骤 6：同事务无敏感信息 audit（§7.5 单事务语义：audit
+    # 失败必须随事务回滚——吞掉失败会让事务带毒、commit 变
+    # rollback、事件静默丢失而路由仍报成功；此处不 try/except，
+    # 路由层 except Exception → 500 retryable，outbox 退避重投） --
+    audit_detail = {
+        "provider": event["provider"],
+        "model": event["model"],
+        "subject_type": subject_type,
+        "status": status,
+        "duplicate": False,
+        "unpriced_reason": reason,
+        "installation_id": installation_id,
+        "plugin_id": plugin_id,
+    }
+    audit_detail.update(debit_detail)
+    if window_projection is not None:
+        audit_detail["window_projection"] = {
+            "window_id": window_projection["window_id"],
+            "spent_nano_cny": int(window_projection["spent_nano_cny"]),
+        }
+    cur.execute(
+        "INSERT INTO audit_events "
+        "(event_id, ts, actor_user_id, actor_role, action, "
+        " target_type, target_id, slide, detail) "
+        "VALUES (%s, to_timestamp(%s), NULL, 'plugin', %s, "
+        " 'usage_event', %s, NULL, %s)",
+        ("aud_" + secrets.token_hex(16),
+         received.timestamp(), USAGE_INGEST_AUDIT_ACTION,
+         event["event_id"],
+         psycopg.types.json.Jsonb(audit_detail)))
+
+    return {
+        "event_id": event["event_id"],
+        "duplicate": False,
+        "status": status,
+        "priced": status == "priced",
+        "row": _event_out(row),
+        "subject_type": subject_type,
+        "subject_id": subject_id,
+        "user_id": user_id,
+        "charge": int(charge) if charge is not None else None,
+        "charge_price_book_id": (charge_book or {}).get("price_book_id")
+        if charge_book else None,
+        "enforcement_mode": mode,
+        "window_projection": window_projection,
+    }
+
+
 def ingest_usage_event(event, *, installation_id, plugin_id="histopilot",
                        max_age_days=None, now=None):
-    """投递端点数据层（§7.5）：单事务入库 + 计价，返回结果 dict。
+    """/api/plugin/v1/usage-events 的数据层（§7.5）：连接壳 + 事务内核。
 
-    步骤（同一 PostgreSQL 事务）：
-      1. schema 校验 + canonical payload_hash；
-      2. dedup：先按 event_id 锁行比对 hash（相同 → duplicate 原行；不同 →
-         409 usage_event_conflict）；call_id 已绑定其他事件 → 409（hash 含
-         event_id，同 call 不同 event_id 的 hash 必然不同）；
-      3. §7.2 四步权威主体解析（conflict / not_ready 异常回滚，不入账）；
-      4. 时钟（§4）与算术校验；按 occurred_at（不改用 received_at）查两套
-         active price book，写死价格版本与两种金额；任一缺失/未知模型 →
-         unpriced(no_active_price_book)；
-      5. PR6 模拟软扣费（§12.2/§19 v0.4，``BILLING_SIMULATED_DEBIT`` 缺省
-         启用）：priced 且 owner/user 主体 → 同事务自动开户（缺户时）+ 一条
-         负金额 usage_debit（幂等键 ``usage:<event_id>``，metadata
-         ``simulated:true``）；**demo 主体永不开户**；unpriced/void 不扣。
-         扣费段包在 SAVEPOINT 里 best-effort——失败只记 warning/指标 +
-         audit ``simulated_debit_skipped=failed``，不阻断 ingest（真实计费
-         阶段须改强一致，见 :func:`_apply_simulated_usage_debit`）；
-      6. 同事务写无敏感信息的 ingest audit（detail 并入扣费结果片段）。
+    行为与批次 C 之前一致（dedup/主体解析/计价/模拟 debit/audit 单事务），
+    差异只有两处（均为追加）：
+      - 事务内核抽出 :func:`_ingest_usage_event_tx` 与 hold settle 共用
+        （同一事件两条投递链只计一次价/扣一次账/加一次窗口 spent，§3.4.5）；
+      - priced 事件的 charge 追加进主体窗口 spent 投影（§3.2）；策略缺失
+        只观测不阻断；返回 dict 追加 ``enforcement_mode``（路由能力探测）。
 
     ``now`` 为 received_at（测试注入口；缺省当前 UTC 时间）。计价时段与时钟
     偏差判定都用 occurred_at——服务端不得为「能计价」静默换用 received_at。
@@ -845,187 +1234,45 @@ def ingest_usage_event(event, *, installation_id, plugin_id="histopilot",
     errors = validate_usage_event_body(event)
     if errors:
         raise InvalidUsageEventError(errors)
-    payload_hash = canonical_payload_hash(event)
-    occurred = billing_pricing.parse_rfc3339(event["occurred_at"])
-    enqueued = billing_pricing.parse_rfc3339(event["enqueued_at"])
     received = now if now is not None else datetime.now(timezone.utc)
     if received.tzinfo is None:
         received = received.replace(tzinfo=timezone.utc)
     age_days = (occurred_at_max_age_days() if max_age_days is None
                 else int(max_age_days))
-
-    raw_usage = dict(event.get("raw_usage") or {})
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                # -- 步骤 2：dedup（先比对，重放幂等返回原行，不重复计价） --
-                existing = _fetch_event_locked(cur, event["event_id"])
-                if existing is not None:
-                    if existing["payload_hash"] != payload_hash:
-                        raise UsageEventConflictError(
-                            "同 event_id 重放的 payload 与原记录不一致",
-                            event_id=event["event_id"])
-                    return _duplicate_result(existing)
-                cur.execute(
-                    "SELECT event_id FROM ai_usage_events WHERE call_id=%s",
-                    (event["call_id"],))
-                clash = cur.fetchone()
-                if clash is not None:
-                    raise UsageEventConflictError(
-                        "call_id 已绑定其他事件", call_id=event["call_id"])
-
-                # -- 步骤 3：权威主体（异常则整体回滚，不先按 body 入账） --
-                subject_type, subject_id = _resolve_usage_subject(
-                    cur, event, installation_id)
-                user_id = None
-                if subject_type in ("owner", "user"):
-                    cur.execute("SELECT user_id FROM users WHERE user_id=%s",
-                                (subject_id,))
-                    urow = cur.fetchone()
-                    # users 不物理删除（disable 语义）；极端缺行时 user_id 列
-                    # 置 NULL 入库（subject 列仍保留权威归因），不让 FK 阻断计量
-                    user_id = urow["user_id"] if urow is not None else None
-
-                # -- 步骤 4：时钟/算术/计价（occurred_at 为唯一时间依据） --
-                status, reason, stored_tokens = _classify_unpriced(
-                    event, occurred, received, age_days)
-                if stored_tokens is None and reason == UNPRICED_ARITHMETIC_MISMATCH:
-                    # 原始数字镜像进 raw_usage（token 列按 CHECK 置 NULL）
-                    raw_usage["reported_tokens_v1"] = dict(
-                        {"meta_version": 1}, **{k: event.get(k)
-                                                for k in TOKEN_FIELDS})
-                provider_book = charge_book = None
-                provider_cost = charge = None
-                if status == "priced":
-                    provider_book = billing_pricing.find_active_rate(
-                        cur, "provider_cost", event["provider"],
-                        event["model"], occurred)
-                    charge_book = billing_pricing.find_active_rate(
-                        cur, "customer_charge", event["provider"],
-                        event["model"], occurred)
-                    if provider_book is None or charge_book is None:
-                        status, reason = "unpriced", UNPRICED_NO_ACTIVE_PRICE_BOOK
-                    else:
-                        provider_cost = billing_pricing.price_tokens_nano(
-                            stored_tokens["cache_hit_input_tokens"],
-                            stored_tokens["cache_miss_input_tokens"],
-                            stored_tokens["output_tokens"], provider_book)
-                        charge = billing_pricing.price_tokens_nano(
-                            stored_tokens["cache_hit_input_tokens"],
-                            stored_tokens["cache_miss_input_tokens"],
-                            stored_tokens["output_tokens"], charge_book)
-
-                # SAVEPOINT：并发投递竞态时对方先提交同 event_id/call_id，
-                # 本事务的 INSERT 抛 UniqueViolation——PG 中失败语句会把事务置
-                # aborted（pg_store.transaction 是裸 commit/rollback，无自动
-                # savepoint），必须先 ROLLBACK TO SAVEPOINT 恢复事务才能重读
-                # 对方已提交的行比对 payload_hash（§7.5 步骤 2 的竞态分支）。
-                if _INGEST_PRE_INSERT_HOOK is not None:
-                    _INGEST_PRE_INSERT_HOOK(cur)
-                cur.execute("SAVEPOINT sp_usage_insert")
-                try:
-                    cur.execute(
-                        "INSERT INTO ai_usage_events "
-                        "(event_id, call_id, payload_hash, schema_version, "
-                        " request_id, session_id, subject_type, subject_id, "
-                        " user_id, provider, model, provider_request_id, "
-                        " cache_hit_input_tokens, cache_miss_input_tokens, "
-                        " output_tokens, reasoning_tokens, total_tokens, "
-                        " occurred_at, enqueued_at, received_at, status, "
-                        " unpriced_reason, provider_price_book_id, "
-                        " charge_price_book_id, provider_cost_nano_cny, "
-                        " charge_nano_cny, raw_usage) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
-                        "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-                        "RETURNING " + _EVENT_SEL,
-                        (event["event_id"], event["call_id"], payload_hash,
-                         int(event["schema_version"]), event.get("request_id"),
-                         event["session_id"], subject_type, subject_id,
-                         user_id, event["provider"], event["model"],
-                         event.get("provider_request_id"),
-                         stored_tokens["cache_hit_input_tokens"] if stored_tokens else None,
-                         stored_tokens["cache_miss_input_tokens"] if stored_tokens else None,
-                         stored_tokens["output_tokens"] if stored_tokens else None,
-                         stored_tokens["reasoning_tokens"] if stored_tokens else None,
-                         stored_tokens["total_tokens"] if stored_tokens else None,
-                         occurred, enqueued, received, status, reason,
-                         provider_book["price_book_id"] if provider_book else None,
-                         charge_book["price_book_id"] if charge_book else None,
-                         provider_cost, charge,
-                         psycopg.types.json.Jsonb(raw_usage)))
-                    row = cur.fetchone()
-                except psycopg.errors.UniqueViolation as exc:
-                    # 与并发投递竞态：对方先提交同 event_id/call_id → 回滚到
-                    # savepoint 恢复事务，再重读对方行比 hash
-                    name = (getattr(getattr(exc, "diag", None),
-                                    "constraint_name", "") or "")
-                    if name not in ("ai_usage_events_pkey",
-                                    "ai_usage_events_call_id_key"):
-                        raise
-                    cur.execute("ROLLBACK TO SAVEPOINT sp_usage_insert")
-                    again = _fetch_event_locked(cur, event["event_id"])
-                    if again is not None and again["payload_hash"] == payload_hash:
-                        return _duplicate_result(again)
-                    raise UsageEventConflictError(
-                        "并发投递冲突：event_id/call_id 已被其他 payload 占用",
-                        event_id=event["event_id"]) from exc
-
-                # -- 步骤 5（PR6）：模拟软扣费（best-effort，SAVEPOINT 内）。
-                # 放在事件 INSERT 之后、audit INSERT 之前：结果直接并入 audit
-                # detail（同一事务，§6.5「ledger 与 audit 同事务提交」不变），
-                # 且扣费段任何异常都被 SAVEPOINT 吸收——若放在 audit 之后用
-                # UPDATE 回写，UPDATE 失败反而会污染 ingest 主路径 --
-                sim_detail = _apply_simulated_usage_debit(
-                    cur, event, subject_type=subject_type, user_id=user_id,
-                    status=status, charge=charge,
-                    charge_price_book_id=(charge_book or {}).get(
-                        "price_book_id") if charge_book else None,
-                    stored_tokens=stored_tokens)
-
-                # -- 步骤 6：同事务无敏感信息 audit（§7.5 单事务语义：audit
-                # 失败必须随事务回滚——吞掉失败会让事务带毒、commit 变
-                # rollback、事件静默丢失而路由仍报成功；此处不 try/except，
-                # 路由层 except Exception → 500 retryable，outbox 退避重投） --
-                audit_detail = {
-                    "provider": event["provider"],
-                    "model": event["model"],
-                    "subject_type": subject_type,
-                    "status": status,
-                    "duplicate": False,
-                    "unpriced_reason": reason,
-                    "installation_id": installation_id,
-                    "plugin_id": plugin_id,
-                }
-                audit_detail.update(sim_detail)
-                cur.execute(
-                    "INSERT INTO audit_events "
-                    "(event_id, ts, actor_user_id, actor_role, action, "
-                    " target_type, target_id, slide, detail) "
-                    "VALUES (%s, to_timestamp(%s), NULL, 'plugin', %s, "
-                    " 'usage_event', %s, NULL, %s)",
-                    ("aud_" + secrets.token_hex(16),
-                     received.timestamp(), USAGE_INGEST_AUDIT_ACTION,
-                     event["event_id"],
-                     psycopg.types.json.Jsonb(audit_detail)))
-
-                return {
-                    "event_id": event["event_id"],
-                    "duplicate": False,
-                    "status": status,
-                    "priced": status == "priced",
-                    "row": _event_out(row),
-                }
+                result = _ingest_usage_event_tx(
+                    cur, event, installation_id=installation_id,
+                    plugin_id=plugin_id, received=received,
+                    age_days=age_days)
+        return {
+            "event_id": result["event_id"],
+            "duplicate": result["duplicate"],
+            "status": result["status"],
+            "priced": result["priced"],
+            "row": result["row"],
+            "enforcement_mode": result["enforcement_mode"],
+        }
     finally:
         conn.close()
 
 
 # --------------------------------------------------------------------------- #
-# PR7 billing holds（§12.3 Phase C / §19 v0.5）：逐 model call 预授权，
-# **advisory/影子语义**——authorize 永不因余额拒绝（owner 2026-08-28 指令：
-# 注册用户不做真实计费限制），只把「若开启硬额度会不会拒」（would_deny）
-# 算出来记录观测。不写 usage_debit：真实（模拟）扣费仍走 PR6 ingest 链，
-# 影子期两条链解耦（hold 的 call_id 对应事件随后照常 ingest）。
+# billing holds（admin-billing §12.3 + 批次 C docs
+# ai-money-budget-bugfix-and-simplification-plan.md §3.3/§3.4）：逐 model
+# call 预授权 + 单事务强一致结算。
+#
+# 批次 C 起（原 PR7 v0.5 纯影子语义升级）：
+#   - authorize 按 spend_enforcement_mode **快照**分流（§7.3）：shadow 永不
+#     因金额拒绝但照常维护窗口 reserved 投影、would_deny/denial_reason 照记；
+#     registered/all 对应主体硬拒绝（稳定码 + 不写 reserved，fail-closed）；
+#   - demo 主体所有模式都写 hold 行并进 demo_global 周窗口（§4.2，不再 skip）；
+#   - settle 与 /usage-events 共用 _ingest_usage_event_tx（§3.4.4/§3.4.5：
+#     事件幂等入库 + 计价 + debit + 窗口投影 + hold 终局化 + audit 单事务）；
+#   - TTL 惰性回收归还窗口 reserved；过期后迟到的合法 usage 仍记实际消费
+#     （§3.4.7）。
 # --------------------------------------------------------------------------- #
 #: hold TTL 缺省 300 秒（5 分钟：单次 model call 最坏时长 + 投递余量）
 DEFAULT_HOLD_TTL_SECONDS = 300
@@ -1053,8 +1300,28 @@ _HOLD_ID_PREFIX = "hold_"
 _HOLD_SEL = (
     "hold_id, call_id, account_id, subject_type, subject_id, installation_id, "
     "session_id, model, estimated_nano_cny, balance_nano_cny, would_deny, "
-    "status, event_id, created_at, settled_at, expires_at, metadata"
+    "status, event_id, created_at, settled_at, expires_at, metadata, "
+    "spend_window_id, reserved_nano_cny, actual_nano_cny, enforcement_mode, "
+    "denial_reason"
 )
+
+#: authorize/settle 事务内惰性回收的过期计数指标（单行 JSON 日志，仿
+#: spend_store._metric；观测用不做限流）
+_HOLD_METRICS = {}
+
+
+def _hold_metric(name, **fields):
+    """hold 链指标：进程内计数 + 单行 JSON warning 日志（无敏感字段）。"""
+    _HOLD_METRICS[name] = _HOLD_METRICS.get(name, 0) + 1
+    payload = {"metric": name, "value": _HOLD_METRICS[name]}
+    payload.update(fields)
+    _LOG.warning("[billing-hold] %s", json.dumps(payload, sort_keys=True,
+                                                 ensure_ascii=False))
+
+
+def hold_metrics_snapshot():
+    """hold 链进程内指标快照（测试/观测用，只读）。"""
+    return dict(_HOLD_METRICS)
 
 
 def hold_ttl_seconds() -> int:
@@ -1112,20 +1379,55 @@ def validate_hold_authorize_body(body) -> list:
 
 
 def validate_hold_settle_body(body) -> list:
-    """settle 请求校验：空 body（release）/ 只含可选 event_id。"""
+    """settle 请求校验（批次 C，§3.4 兼容滚动升级）。
+
+    合法形态：
+      - 空 body / ``{}`` / ``{"event_id": null}`` → release（§3.4.6：provider
+        在产生 usage 前失败的正常终态；任何模式都允许）；
+      - ``{"event_id": "use_..."}`` → 旧 body：只在 hold 的 enforcement 快照
+        为 shadow 时走旧路径（只改状态 + 归还 reserved）；registered/all
+        快照由 :func:`_settle_hold_tx` 明确拒绝（``settle_payload_required``，
+        不能静默少记金额）；
+      - ``{"usage_event": {...完整 usage event...}}`` → 新 body（§3.4.4 单事务
+        强一致结算链，事件含全部计价字段与 event_id）；可同时携带 event_id，
+        但必须与 ``usage_event.event_id`` 一致。事件本体的 schema 校验复用
+        :func:`validate_usage_event_body`（settle 事务内做）。
+    """
     errors = []
     if body is None:
         return errors  # 空 body = release（调用失败无 usage 的正常终态）
     if not isinstance(body, dict):
         return ["request body 需为 JSON object 或空"]
     for key in body:
-        if key != "event_id":
+        if key not in ("event_id", "usage_event"):
             errors.append("不允许的额外字段 %r（additionalProperties:false）" % key)
+    if "usage_event" in body:
+        event = body["usage_event"]
+        if not isinstance(event, dict):
+            errors.append("usage_event 需为 JSON object（完整 usage event）")
+        elif "event_id" in body and body["event_id"] is not None \
+                and body["event_id"] != event.get("event_id"):
+            errors.append("event_id 与 usage_event.event_id 不一致")
     if "event_id" in body and body["event_id"] is not None:
         value = body["event_id"]
         if not isinstance(value, str) or not _EVENT_ID_RE.match(value):
             errors.append("event_id 需匹配 ^use_[0-9a-f]{32}$（省略/null = release）")
     return errors
+
+
+def _parse_settle_body(body):
+    """已通过校验的 settle body → ("release"|"legacy"|"usage_event", payload)。
+
+    - release：空 body / ``{}`` / event_id=null；
+    - legacy：``{event_id}``（不含 usage_event）；
+    - usage_event：携带 ``usage_event`` dict。
+    """
+    if body is None or "usage_event" not in body:
+        event_id = body.get("event_id") if isinstance(body, dict) else None
+        if event_id is None:
+            return ("release", None)
+        return ("legacy", event_id)
+    return ("usage_event", body["usage_event"])
 
 
 def hold_request_hash(body) -> str:
@@ -1139,21 +1441,46 @@ def hold_request_hash(body) -> str:
 
 def _hold_out(row) -> dict:
     out = dict(row)
-    for key in ("estimated_nano_cny", "balance_nano_cny"):
+    for key in ("estimated_nano_cny", "balance_nano_cny", "reserved_nano_cny",
+                "actual_nano_cny"):
         if out.get(key) is not None:
             out[key] = int(out[key])
     return out
 
 
 def _expire_stale_holds_tx(cur, now):
-    """同事务惰性回收（§12.3）：把 expires_at 已过的 open hold 标 expired。
+    """同事务惰性回收（§12.3 + 批次 C §3.4.7）：过期 open hold 标 expired
+    并**归还其窗口预占**（reserved_nano_cny → 所属窗口 reserved -=，夹 0）。
 
-    没有 daemon——回收挂在每次 authorize/settle 的事务上（影子期量级足够；
-    索引 idx_billing_holds_expiry 支撑该扫描）。
+    - 没有 daemon——回收挂在每次 authorize/settle 的事务上（量级足够；
+      索引 idx_billing_holds_expiry 支撑该扫描）；
+    - 先按 hold_id **有序** FOR UPDATE 锁待回收行再逐行终局化：两个并发
+      回收事务以相同顺序拿锁，避免批量 UPDATE 乱序死锁；
+    - 0024 之前的旧行（spend_window_id/reserved NULL）只改状态不动窗口；
+    - 归还用 :func:`spend_store.window_release_tx`（clamped，保 reserved>=0
+      并对漂移记指标）；本函数是「安全副作用」——挂在业务 SAVEPOINT 之外，
+      业务拒绝不连带回滚回收（幂等，与批次 B 纪律一致）；
+    - 回收后迟到的合法 usage event 仍由 settle 的 expired 分支记实际消费
+      （§3.4.7：真实成本不因 hold 过期被丢弃，且不二次归还 reserved）。
     """
     cur.execute(
-        "UPDATE billing_holds SET status='expired' "
-        "WHERE status='open' AND expires_at < %s", (now,))
+        "SELECT hold_id, spend_window_id, reserved_nano_cny "
+        "FROM billing_holds WHERE status='open' AND expires_at < %s "
+        "ORDER BY hold_id FOR UPDATE", (now,))
+    stale = cur.fetchall()
+    if not stale:
+        return 0
+    spend = _spend()
+    for row in stale:
+        cur.execute(
+            "UPDATE billing_holds SET status='expired' "
+            "WHERE hold_id=%s AND status='open'", (row["hold_id"],))
+        if row["spend_window_id"] is not None \
+                and row["reserved_nano_cny"] is not None \
+                and int(row["reserved_nano_cny"]) > 0:
+            spend.window_release_tx(cur, row["spend_window_id"],
+                                    int(row["reserved_nano_cny"]))
+    return len(stale)
 
 
 def _open_holds_sum(cur, account_id, now):
@@ -1178,41 +1505,45 @@ def _fetch_hold_locked_by_call(cur, call_id):
 
 
 def authorize_hold(body, *, installation_id, plugin_id="histopilot", now=None):
-    """预授权一次 model call（§12.3，advisory/影子：永不因余额拒绝）。
+    """预授权一次 model call（§3.3 授权事务八步 + §7.3 模式分流，批次 C）。
+
+    模式行为（``spend_enforcement_mode`` **授权时刻快照**写入 hold 行，混合
+    期可审计；subject 分流见 :func:`spend_store.mode_is_hard`）：
+      - shadow（或 registered 下 demo）：与既有行为兼容——**永不因金额拒绝**
+        （authorized=true），窗口投影照常维护（reserve 写行 + reserved 累加，
+        不做额度检查）；would_deny 照记；未知价格/策略缺失/窗口不可用只观测
+        （denial_reason 记稳定码）；
+      - registered 下 user/owner、all 下全部主体：硬闸——
+        余额不足 ``spend_budget_exhausted``、无价 ``pricing_unavailable``、
+        无策略 ``spend_policy_missing``、窗口不可用 ``spend_window_unavailable``
+        （fail-closed：稳定码抛出、不写行、不写 reserved，路由映射错误信封）。
 
     步骤（同一 PostgreSQL 事务）：
-      1. 请求校验 + canonical request_hash；
-      2. 惰性回收过期 open hold；
+      1. 请求校验 + canonical request_hash（连接前）；
+      2. 惰性回收过期 open hold（含窗口 reserved 归还，§3.4.7）；
       3. call_id dedup：已有行 → request_hash 一致返回原行（duplicate=True，
-         不重新解析主体/重算；expired 行同样幂等返回，客户端按 status 识别）；
-         不一致 → 409 hold_conflict（确定性）；
-      4. §7.2 四步权威主体解析（与 ingest 同一实现，复用
-         :func:`_resolve_usage_subject`）；demo 主体 → **不写行**，返回
-         ``{"skipped": "demo_subject", "authorized": True, "would_deny":
-         False, "hold_id": None}``（§14.1 红线：demo 永不入计费面），仍写
-         skipped audit；
-      5. 最坏价估算：customer_charge 价目（``find_active_rate``，时刻用
-         authorize 当前 ``now``），输入全按 cache-miss + max_output 输出；
-         无价目 → estimated=None（would_deny 亦 None——未知不裁决）；
-      6. 余额快照 = 账户 ledger 有符号合计（**不强制开户**：无账户 →
-         account_id/balance 均 NULL）；同账户其他 open 未过期 holds 的
-         estimated 合计计入占用；``would_deny = balance is not None and
-         estimated is not None and balance - open_sum < estimated``；
-      7. INSERT（status=open，expires_at=now+TTL）；并发同 call_id 由
-         SAVEPOINT + UNIQUE 约束吸收（对方先提交 → 回滚到 savepoint 重读
-         比对 hash，同 ingest 竞态先例）；
-      8. 同事务无敏感 audit（``billing.hold_authorize``；detail 不落
-         session_id/prompt/完整请求体，call_id 只落后 8 字符）。
+         不重新解析主体/重算；expired 行同样幂等返回）；不一致 → 409
+         hold_conflict（确定性）；
+      4. §7.2 四步权威主体解析（与 ingest 同一实现）；**demo 不再 skip**
+         （§4.2）：所有模式都写 hold 行 + 进 demo_global 周窗口投影；
+      5. 最坏价估算（customer_charge，时刻=now）；hard 无价 fail-closed；
+      6. 策略解析 + get_or_create 窗口（§3.2）+ ``FOR UPDATE`` 锁窗口行
+         （不同 call 的并发 authorize 在窗口行上串行化，不能合计透支）；
+      7. 检查 ``spent + reserved + estimated <= limit``（hard 超限拒绝且
+         **不写 reserved**；shadow 照常累加并记 would_deny/denial_reason）；
+      8. INSERT hold（快照 enforcement_mode/spend_window_id/reserved_nano/
+         denial_reason）+ 原子窗口预占 + 无敏感 audit（call_id 只落后 8 字符）。
 
-    返回行 dict（金额为 int 或 None，wire 层负责十进制字符串化）外加
-    ``duplicate`` 与 ``open_holds_nano_cny``（当前账户 open 合计，含本次）。
+    返回行 dict（金额为 int 或 None，wire 层十进制字符串化）外加
+    ``duplicate`` 与 ``open_holds_nano_cny``（legacy 余额口径的账户 open
+    合计，含本次；无账户 None）。
 
-    业务拒绝（BillingError：conflict/主体冲突等确定性 409/404）**不连带回滚
-    惰性回收**——回收是幂等安全副作用，且行内持久状态应与拒绝理由一致
-    （否则 expired 行永远停在 open，全靠下一次成功操作兜底回收）：业务段包
-    在 ``SAVEPOINT sp_hold_business`` 里，BillingError 回滚到 savepoint 后
-    事务仍带着回收结果提交、异常照样抛给路由；非 BillingError（基础设施
-    错误）整体回滚。
+    业务拒绝（BillingError / spend 稳定码异常）**不连带回滚惰性回收**——
+    回收是幂等安全副作用：业务段包在 ``SAVEPOINT sp_hold_business`` 里，
+    回滚到 savepoint 后事务仍带着回收结果提交、异常照样抛给路由；hard
+    拒绝额外落一条 ``denied=<code>`` 的 authorize audit（无敏感字段）；
+    非 Business 异常（基础设施错误）整体回滚 → 路由 500 retryable（hard
+    语义 fail-closed：authorize 不成功即不得调用 provider）。
     """
     platform_features.require_pg_backend("billing")
     errors = validate_hold_authorize_body(body)
@@ -1223,6 +1554,7 @@ def authorize_hold(body, *, installation_id, plugin_id="histopilot", now=None):
         now = now.replace(tzinfo=timezone.utc)
     request_hash = hold_request_hash(body)
     ttl = hold_ttl_seconds()
+    spend = _spend()
     conn = _connect()
     try:
         business_error = None
@@ -1236,9 +1568,24 @@ def authorize_hold(body, *, installation_id, plugin_id="histopilot", now=None):
                         cur, body, installation_id=installation_id,
                         plugin_id=plugin_id, now=now,
                         request_hash=request_hash, ttl=ttl)
-                except BillingError as exc:
+                except (BillingError, spend.SpendError) as exc:
                     cur.execute("ROLLBACK TO SAVEPOINT sp_hold_business")
                     business_error = exc
+                    if isinstance(exc, (HoldPricingUnavailableError,
+                                         spend.SpendError)):
+                        # hard 拒绝观测 audit（§3.3 稳定码；不含敏感字段）
+                        share_store_pg.record_audit_tx(
+                            cur, HOLD_AUTHORIZE_AUDIT_ACTION,
+                            actor_user_id=None, actor_role="plugin",
+                            target_type="billing_hold", target_id=None,
+                            detail={"denied": exc.code,
+                                    "call_id_suffix": body["call_id"][-8:],
+                                    "subject_type": body["subject_type"],
+                                    "model": body["model"],
+                                    "provider": body["provider"],
+                                    "installation_id": installation_id,
+                                    "plugin_id": plugin_id},
+                            ts=now.timestamp())
         if business_error is not None:
             raise business_error
         return result
@@ -1248,8 +1595,9 @@ def authorize_hold(body, *, installation_id, plugin_id="histopilot", now=None):
 
 def _authorize_hold_tx(cur, body, *, installation_id, plugin_id, now,
                        request_hash, ttl):
-    """authorize 的事务段（回收已做完；见 :func:`authorize_hold` 步骤 3-8）。"""
-    # -- dedup（重放幂等返回原行，不重新解析/重算） --
+    """authorize 的事务段（§3.3 步骤 3-8；回收已做完）。"""
+    spend = _spend()
+    # -- 步骤 3：dedup（重放幂等返回原行，不重新解析/重算/重预占） --
     existing = _fetch_hold_locked_by_call(cur, body["call_id"])
     if existing is not None:
         stored_hash = (existing["metadata"] or {}).get("request_hash")
@@ -1263,8 +1611,8 @@ def _authorize_hold_tx(cur, body, *, installation_id, plugin_id, now,
             cur, row.get("account_id"), now)
         return row
 
-    # -- §7.2 权威主体（与 ingest 同一解析器：伪 event 只携带解析所需键，
-    #    绝不影响 ingest 行为） --
+    # -- 步骤 4：§7.2 权威主体（与 ingest 同一解析器：伪 event 只携带解析
+    #    所需键，绝不影响 ingest 行为）；demo 不再 skip（§4.2） --
     subject_type, subject_id = _resolve_usage_subject(
         cur,
         {"session_id": body["session_id"],
@@ -1274,49 +1622,58 @@ def _authorize_hold_tx(cur, body, *, installation_id, plugin_id, now,
          "user_id": body.get("user_id")},
         installation_id)
 
-    if subject_type == "demo":
-        # §14.1 红线：demo 永不入计费面——不写 hold 行、不开户；
-        # skipped 原样透传给调用方（authorized=True：影子期永不拒绝）
-        share_store_pg.record_audit_tx(
-            cur, HOLD_AUTHORIZE_AUDIT_ACTION,
-            actor_user_id=None, actor_role="plugin",
-            target_type="billing_hold", target_id=None,
-            detail={"skipped": "demo_subject",
-                    "subject_type": "demo",
-                    "model": body["model"],
-                    "provider": body["provider"],
-                    "installation_id": installation_id,
-                    "plugin_id": plugin_id},
-            ts=now.timestamp())
-        return {"skipped": "demo_subject", "authorized": True,
-                "would_deny": False, "hold_id": None}
+    # -- 步骤 4b：enforcement 模式（授权时刻快照，§7.3；registered 下 demo
+    #    仍观测，all 才硬闸 demo） --
+    mode = spend._enforcement_mode_tx(cur)
+    hard = spend.mode_is_hard(mode, subject_type)
 
-    # -- 最坏价估算（customer_charge；时刻 = authorize now） --
+    # -- 步骤 5：最坏价估算（customer_charge；时刻 = authorize now）。
+    #    hard 无价 fail-closed（§3.3）；shadow 只观测。 --
     charge_book = billing_pricing.find_active_rate(
         cur, "customer_charge", body["provider"], body["model"], now)
     estimated = None
+    denial_reason = None
     if charge_book is not None:
         estimated = billing_pricing.price_tokens_nano(
             0, body["estimated_input_tokens"],
             body["max_output_tokens"], charge_book)
+    elif hard:
+        raise HoldPricingUnavailableError(
+            "无 active customer_charge 价目（hard 模式 fail-closed）",
+            provider=body["provider"], model=body["model"])
+    else:
+        denial_reason = "pricing_unavailable"
 
-    # -- 余额快照（不强制开户：无账户 → NULL 全套） --
-    cur.execute(
-        "SELECT account_id FROM billing_accounts WHERE user_id=%s",
-        (subject_id,))
-    acct = cur.fetchone()
-    account_id = acct["account_id"] if acct is not None else None
+    # -- 步骤 6：策略解析 + get_or_create 窗口（§3.2）。hard 缺策略/窗口
+    #    不可用 fail-closed（稳定码透传）；shadow 只观测。 --
+    window = None
+    try:
+        window = spend._get_or_create_window_tx(
+            cur, subject_type, subject_id, now)
+    except spend.SpendError as exc:
+        if hard:
+            raise
+        if denial_reason is None:
+            denial_reason = exc.code  # spend_policy_missing / spend_window_unavailable
+    window_id = window["window_id"] if window is not None else None
+
+    # -- legacy 余额快照（user/owner；demo 无账户面，恒 NULL 全套） --
+    account_id = None
     balance = None
-    if account_id is not None:
+    open_sum = None
+    if subject_type in ("owner", "user"):
         cur.execute(
-            "SELECT COALESCE(SUM(amount_nano_cny), 0)::bigint AS bal "
-            "FROM billing_ledger_entries WHERE account_id=%s", (account_id,))
-        balance = int(cur.fetchone()["bal"])
-
-    open_sum = _open_holds_sum(cur, account_id, now)
-    would_deny = None
-    if balance is not None and estimated is not None:
-        would_deny = (balance - (open_sum or 0)) < estimated
+            "SELECT account_id FROM billing_accounts WHERE user_id=%s",
+            (subject_id,))
+        acct = cur.fetchone()
+        account_id = acct["account_id"] if acct is not None else None
+        if account_id is not None:
+            cur.execute(
+                "SELECT COALESCE(SUM(amount_nano_cny), 0)::bigint AS bal "
+                "FROM billing_ledger_entries WHERE account_id=%s",
+                (account_id,))
+            balance = int(cur.fetchone()["bal"])
+        open_sum = _open_holds_sum(cur, account_id, now)
 
     hold_id = _HOLD_ID_PREFIX + secrets.token_hex(12)
     metadata = {
@@ -1326,23 +1683,57 @@ def _authorize_hold_tx(cur, body, *, installation_id, plugin_id, now,
             charge_book["price_book_id"] if charge_book else None,
         "ttl_seconds": ttl,
     }
-    # SAVEPOINT：并发同 call_id authorize → 对方先提交，本事务 INSERT 抛
-    # UniqueViolation（语句置 aborted），先回滚到 savepoint 恢复事务再重读
-    # 对方行比对 hash（ingest 同款；嵌套在 sp_hold_business 之内）
+    # SAVEPOINT：**预占与 INSERT 同 savepoint**——并发同 call_id authorize
+    # 输给对方时（对方先提交，本事务 INSERT 抛 UniqueViolation，语句置
+    # aborted），回滚到 savepoint 同时撤销本事务的窗口预占（否则窗口会留下
+    # 双份 reserved 且永不归还——赢家的 hold 自带其 reserved，归还职责随它
+    # 的 settle/release/TTL 走），再重读对方行比对 hash（ingest 同款；嵌套
+    # 在 sp_hold_business 之内）。hard 超限的 SpendBudgetExhaustedError 从
+    # 本 savepoint 内抛出并穿透（不是 UniqueViolation），由外层回滚到
+    # sp_hold_business——本就无写入可撤销。
     duplicate = False
     cur.execute("SAVEPOINT sp_hold_insert")
     try:
+        # -- 步骤 7（§3.2）：锁窗口行 + spent+reserved+estimated 检查 + 预占。
+        #    hard 由 window_reserve_tx 强制额度（超限抛 spend_budget_
+        #    exhausted，不改数、不写行）；shadow enforce_limit=False 照常
+        #    累加（投影真实占用），would_deny 换算窗口口径（无窗口/无估算
+        #    回退 legacy 余额口径，兼容批次 B 观测）。 --
+        reserved_nano = None
+        would_deny = None
+        if window_id is not None and estimated is not None:
+            locked = spend._fetch_window_locked(cur, window_id)
+            over = (int(locked["spent_nano_cny"])
+                    + int(locked["reserved_nano_cny"]) + estimated
+                    > int(locked["limit_nano_snapshot"]))
+            if hard:
+                spend.window_reserve_tx(cur, window_id, estimated,
+                                        enforce_limit=True)
+                would_deny = False  # 能写行的 hard 授权必已过闸
+            else:
+                spend.window_reserve_tx(cur, window_id, estimated,
+                                        enforce_limit=False)
+                would_deny = over
+                if over and denial_reason is None:
+                    denial_reason = "spend_budget_exhausted"
+            reserved_nano = estimated
+        elif balance is not None and estimated is not None:
+            would_deny = (balance - (open_sum or 0)) < estimated
+
         cur.execute(
             "INSERT INTO billing_holds "
             "(hold_id, call_id, account_id, subject_type, subject_id, "
             " installation_id, session_id, model, estimated_nano_cny, "
-            " balance_nano_cny, would_deny, status, expires_at, metadata) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open',%s,%s) "
-            "RETURNING " + _HOLD_SEL,
+            " balance_nano_cny, would_deny, status, expires_at, metadata, "
+            " spend_window_id, reserved_nano_cny, enforcement_mode, "
+            " denial_reason) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open',%s,%s,%s,%s,%s,%s)"
+            " RETURNING " + _HOLD_SEL,
             (hold_id, body["call_id"], account_id, subject_type, subject_id,
              installation_id, body["session_id"], body["model"], estimated,
              balance, would_deny, now + timedelta(seconds=ttl),
-             psycopg.types.json.Jsonb(metadata)))
+             psycopg.types.json.Jsonb(metadata), window_id, reserved_nano,
+             mode, denial_reason))
         inserted = cur.fetchone()
     except psycopg.errors.UniqueViolation as exc:
         name = (getattr(getattr(exc, "diag", None), "constraint_name", "")
@@ -1380,36 +1771,54 @@ def _authorize_hold_tx(cur, body, *, installation_id, plugin_id, now,
                     "open_holds_nano_cny": row["open_holds_nano_cny"],
                     "would_deny": would_deny,
                     "status": row["status"],
+                    "enforcement_mode": mode,
+                    "denial_reason": denial_reason,
                     "installation_id": installation_id,
                     "plugin_id": plugin_id},
             ts=now.timestamp())
     return row
 
 
-def settle_hold(hold_id, body, *, installation_id, now=None):
-    """结算/释放一个 hold（§12.3；与 ingest 链解耦，见 :func:`authorize_hold`）。
+def settle_hold(hold_id, body, *, installation_id, plugin_id="histopilot",
+                now=None):
+    """结算/释放一个 hold（§3.4 强一致结算链，批次 C）。
 
-    状态机（同一事务；先做惰性回收——目标行若已过期会被标 expired，随后
-    按非 open 拒绝；业务拒绝不连带回滚回收标记，见 :func:`authorize_hold`
+    状态机（同一事务；先做惰性回收——目标行若已过期会被标 expired 且其
+    reserved 已归还窗口；业务拒绝不连带回滚回收，见 :func:`authorize_hold`
     的 SAVEPOINT 说明）：
-      - 不存在 / 不属于该 installation → 404 hold_not_found（**统一 404**：
-        跨 installation 探测与不存在不可区分，不泄露存在性——与插件通道
-        「无授权即不可见」原则一致）；
-      - open + 合法 event_id → settled（写 event_id + settled_at）；
-        open + 不带 event_id → released（调用失败无 usage 的正常终态，
-        event_id 保持 NULL）；
-      - settled + 同 event_id → 200 duplicate=True（不重复写 audit）；
-        settled + 不同/缺 event_id → 409 hold_conflict（防二次释放/改绑）；
-      - released/expired → 409 hold_not_open（retryable=false）。
 
-    event_id 只做格式与终态一致性校验，**不校验事件已入库**——billing_holds
-    无 FK（outbox 乱序时 settle 可先于 usage 事件到达，影子期容忍悬空引用）。
+      - 不存在 / 不属于该 installation → 404 hold_not_found（统一 404，不
+        泄露存在性）；
+      - body 形态（:func:`validate_hold_settle_body`）：空 body → release；
+        ``{event_id}`` → 旧 body；``{usage_event}`` → 新 body；
+      - open + release → released：只减窗口 reserved + hold→released
+        （§3.4.6，任何模式允许——provider 在产生 usage 前失败无成本可记）；
+      - open + 旧 body：hold 的 enforcement 快照为 shadow → 兼容旧路径
+        （状态终局化 + 归还 reserved，金额由 outbox /usage-events 链补记）；
+        快照为 registered/all → 400 ``settle_payload_required``（§3.4：hard
+        下旧 body 必须明确拒绝，不能静默少记金额）；
+      - open + 新 body → **单事务强一致结算**（§3.4.4 全项）：usage event
+        幂等入库 + canonical hash 校验（复用 :func:`_ingest_usage_event_tx`
+        ——与 /usage-events 同一内核，两个投递方向只扣一次账/加一次 spent，
+        §3.4.5）+ 实际计价 + debit（hard=真实 debit 无 SAVEPOINT；shadow=
+        模拟 debit）+ 窗口 ``reserved -= estimate`` / ``spent += actual``
+        + hold open→settled 记 actual + audit；任一关键写失败整体回滚
+        （§3.4.9）；
+      - expired + 新 body → §3.4.7 迟到结算：真实成本照记（事件入库 + 窗口
+        spent 投影，允许 overage、后续新调用由窗口检查自然阻断），hold 记
+        event/actual 转 settled；**不**二次归还 reserved（TTL 回收已还）；
+      - settled + 同 event → 200 duplicate=True（重放幂等，不重复 debit/
+        spent/audit）；不同/缺 event → 409 hold_conflict；
+      - released + release 重放 → 200 duplicate=True（§9.3 幂等）；
+      - released/expired + 其他 body → 409 hold_not_open（不可重试）。
+
+    事件的 call_id 必须等于 hold 的 call_id（改绑 → 409 hold_conflict）。
     """
     platform_features.require_pg_backend("billing")
     errors = validate_hold_settle_body(body)
     if errors:
         raise InvalidHoldRequestError(errors)
-    event_id = body.get("event_id") if isinstance(body, dict) else None
+    payload_kind, payload = _parse_settle_body(body)
     now = now if now is not None else datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -1423,8 +1832,9 @@ def settle_hold(hold_id, body, *, installation_id, now=None):
                 cur.execute("SAVEPOINT sp_hold_business")
                 try:
                     result = _settle_hold_tx(
-                        cur, hold_id, event_id,
-                        installation_id=installation_id, now=now)
+                        cur, hold_id, (payload_kind, payload),
+                        installation_id=installation_id, plugin_id=plugin_id,
+                        now=now)
                 except BillingError as exc:
                     cur.execute("ROLLBACK TO SAVEPOINT sp_hold_business")
                     business_error = exc
@@ -1435,37 +1845,37 @@ def settle_hold(hold_id, body, *, installation_id, now=None):
         conn.close()
 
 
-def _settle_hold_tx(cur, hold_id, event_id, *, installation_id, now):
-    """settle 的事务段（回收已做完；见 :func:`settle_hold` 状态机）。"""
+def _settle_hold_tx(cur, hold_id, payload, *, installation_id, plugin_id, now):
+    """settle 的事务段（回收已做完；状态机见 :func:`settle_hold`）。"""
+    payload_kind, payload = payload
     cur.execute("SELECT " + _HOLD_SEL +
                 " FROM billing_holds WHERE hold_id=%s FOR UPDATE", (hold_id,))
     row = cur.fetchone()
     if row is None or row["installation_id"] != installation_id:
         raise HoldNotFoundError("hold 不存在或不可访问", hold_id=hold_id)
 
+    # hold 的协议按授权时刻快照走（混合期一致且可审计）
+    mode = row["enforcement_mode"] or "shadow"
+    hard = _spend().mode_is_hard(mode, row["subject_type"])
+
     if row["status"] == "open":
-        new_status = "settled" if event_id else "released"
-        cur.execute(
-            "UPDATE billing_holds SET status=%s, event_id=%s, settled_at=%s "
-            "WHERE hold_id=%s AND status='open' RETURNING " + _HOLD_SEL,
-            (new_status, event_id, now, hold_id))
-        updated = cur.fetchone()
-        if updated is None:  # 并发 settle：对方先终局化本行
-            raise HoldNotOpenError("hold 已被并发结算终局化", hold_id=hold_id)
-        out = _hold_out(updated)
-        out["duplicate"] = False
-        share_store_pg.record_audit_tx(
-            cur, HOLD_SETTLE_AUDIT_ACTION,
-            actor_user_id=None, actor_role="plugin",
-            target_type="billing_hold", target_id=hold_id,
-            detail={"call_id_suffix": out["call_id"][-8:],
-                    "status": out["status"],
-                    "event_id": event_id,
-                    "installation_id": installation_id},
-            ts=now.timestamp())
-        return out
+        if payload_kind == "release":
+            return _release_hold_tx(cur, row, installation_id=installation_id,
+                                    now=now)
+        if payload_kind == "legacy":
+            if hard:
+                raise SettlePayloadRequiredError(
+                    "hard 模式 settle 必须携带完整 usage_event（旧 event_id "
+                    "body 会少记金额）", hold_id=hold_id, enforcement_mode=mode)
+            return _settle_legacy_tx(cur, row, payload,
+                                     installation_id=installation_id, now=now)
+        return _settle_with_usage_tx(cur, row, payload, hard=hard, mode=mode,
+                                     installation_id=installation_id,
+                                     plugin_id=plugin_id, now=now,
+                                     late_after_expiry=False)
 
     if row["status"] == "settled":
+        event_id = _payload_event_id(payload_kind, payload)
         if event_id is not None and row["event_id"] == event_id:
             out = _hold_out(row)
             out["duplicate"] = True
@@ -1473,9 +1883,178 @@ def _settle_hold_tx(cur, hold_id, event_id, *, installation_id, now):
         raise HoldConflictError(
             "hold 已结算，不能再次结算或改绑 event", hold_id=hold_id)
 
+    if row["status"] == "released":
+        if payload_kind == "release":
+            # release 重放幂等（§9.3）：原样返回，不重复归还/写 audit
+            out = _hold_out(row)
+            out["duplicate"] = True
+            return out
+        raise HoldNotOpenError(
+            "hold 已 released，不可结算", hold_id=hold_id, status="released")
+
+    # expired：旧 body/release → 不可结算；新 body → §3.4.7 迟到结算
+    if payload_kind == "usage_event":
+        return _settle_with_usage_tx(cur, row, payload, hard=hard, mode=mode,
+                                     installation_id=installation_id,
+                                     plugin_id=plugin_id, now=now,
+                                     late_after_expiry=True)
     raise HoldNotOpenError(
         "hold 已 %s，不可结算" % row["status"],
         hold_id=hold_id, status=row["status"])
+
+
+def _payload_event_id(payload_kind, payload):
+    """settle payload → 其声称的 event_id（release 无）。"""
+    if payload_kind == "legacy":
+        return payload
+    if payload_kind == "usage_event":
+        return payload.get("event_id")
+    return None
+
+
+def _release_window_reserved_tx(cur, row):
+    """按 hold 快照归还窗口预占（release/旧 body settle 共用；0024 前旧行
+    无窗口则 no-op）。返回归还额（无窗口 → None）。"""
+    if row["spend_window_id"] is None or row["reserved_nano_cny"] is None:
+        return None
+    reserved = int(row["reserved_nano_cny"])
+    if reserved <= 0:
+        return 0
+    _spend().window_release_tx(cur, row["spend_window_id"], reserved)
+    return reserved
+
+
+def _release_hold_tx(cur, row, *, installation_id, now):
+    """release（§3.4.6）：只减 reserved + hold open→released，无金额入账。"""
+    released_nano = _release_window_reserved_tx(cur, row)
+    cur.execute(
+        "UPDATE billing_holds SET status='released', settled_at=%s "
+        "WHERE hold_id=%s AND status='open' RETURNING " + _HOLD_SEL,
+        (now, row["hold_id"]))
+    updated = cur.fetchone()
+    if updated is None:  # 并发终局化（行已锁，防御）
+        raise HoldNotOpenError("hold 已被并发终局化", hold_id=row["hold_id"])
+    out = _hold_out(updated)
+    out["duplicate"] = False
+    share_store_pg.record_audit_tx(
+        cur, HOLD_SETTLE_AUDIT_ACTION,
+        actor_user_id=None, actor_role="plugin",
+        target_type="billing_hold", target_id=row["hold_id"],
+        detail={"call_id_suffix": out["call_id"][-8:],
+                "status": out["status"],
+                "event_id": None,
+                "enforcement_mode": out["enforcement_mode"],
+                "reserved_released_nano_cny": released_nano,
+                "installation_id": installation_id},
+        ts=now.timestamp())
+    return out
+
+
+def _settle_legacy_tx(cur, row, event_id, *, installation_id, now):
+    """旧 body ``{event_id}``（仅 shadow 快照，§3.4 兼容滚动升级）。
+
+    与批次 B 行为一致（只终局化状态，金额由 outbox /usage-events 链补记、
+    模拟 debit 照旧），差异只有归还窗口 reserved（shadow authorize 已投影
+    预占，不还会永久虚占）。event_id 只做格式与终态一致性校验，不校验事件
+    已入库（billing_holds 无 FK，outbox 乱序容忍悬空引用）。
+    """
+    released_nano = _release_window_reserved_tx(cur, row)
+    cur.execute(
+        "UPDATE billing_holds SET status='settled', event_id=%s, "
+        "settled_at=%s WHERE hold_id=%s AND status='open' "
+        "RETURNING " + _HOLD_SEL,
+        (event_id, now, row["hold_id"]))
+    updated = cur.fetchone()
+    if updated is None:
+        raise HoldNotOpenError("hold 已被并发终局化", hold_id=row["hold_id"])
+    out = _hold_out(updated)
+    out["duplicate"] = False
+    share_store_pg.record_audit_tx(
+        cur, HOLD_SETTLE_AUDIT_ACTION,
+        actor_user_id=None, actor_role="plugin",
+        target_type="billing_hold", target_id=row["hold_id"],
+        detail={"call_id_suffix": out["call_id"][-8:],
+                "status": out["status"],
+                "event_id": event_id,
+                "enforcement_mode": out["enforcement_mode"],
+                "reserved_released_nano_cny": released_nano,
+                "installation_id": installation_id},
+        ts=now.timestamp())
+    return out
+
+
+def _settle_with_usage_tx(cur, row, event, *, hard, mode, installation_id,
+                          plugin_id, now, late_after_expiry):
+    """新 body ``{usage_event}`` 的单事务强一致结算（§3.4.4/§3.4.7/§3.4.8）。
+
+    - 事件校验复用 usage schema（400 invalid_request）；call_id 必须等于
+      hold 的 call_id（409 hold_conflict）；
+    - ingest 内核（与 /usage-events 共用）完成：dedup + canonical hash 校验
+      + 实际计价 + debit（hard=真实 debit，失败整体回滚 §3.4.9；shadow=
+      模拟 debit）+ 窗口 spent 投影（按事件 occurred_at 归窗，与对账口径
+      一致）；duplicate（outbox 先到/settle 重试）不再有任何副作用；
+    - 归还窗口 reserved 按 hold.spend_window_id 快照（授权在哪预占就还哪，
+      跨窗口边界的迟到结算不挪用别的窗口的额度）；
+    - hold 终局化记 actual_nano_cny（priced=实扣 charge；unpriced=NULL 未知）；
+      ``late_after_expiry=True``（§3.4.7）时不归还 reserved（TTL 回收已还）
+      且记告警指标；actual > 估算按 actual 入账并记估算不足指标（§3.4.8）；
+    - audit 与以上写同事务（失败整体回滚）。
+    """
+    errors = validate_usage_event_body(event)
+    if errors:
+        raise InvalidUsageEventError(errors)
+    if event.get("call_id") != row["call_id"]:
+        raise HoldConflictError(
+            "settle 事件的 call_id 与 hold 不一致（不可改绑）",
+            hold_id=row["hold_id"], call_id=row["call_id"])
+
+    ingested = _ingest_usage_event_tx(
+        cur, event, installation_id=installation_id, plugin_id=plugin_id,
+        received=now, age_days=occurred_at_max_age_days(),
+        enforcement_mode=mode)
+    actual = ingested["charge"]  # priced=实扣；unpriced=None（未知）
+
+    released_nano = None
+    if not late_after_expiry:
+        released_nano = _release_window_reserved_tx(cur, row)
+        reserved = int(row["reserved_nano_cny"] or 0)
+        if actual is not None and actual > reserved:
+            # §3.4.8：估算不足指标（真实成本已按 actual 入账，不拒绝）
+            _hold_metric("hold_settle_estimate_short_total",
+                         overage_nano=actual - reserved)
+    else:
+        # §3.4.7：TTL 回收已归还 reserved，迟到结算只记真实成本 + 告警
+        _hold_metric("hold_late_usage_after_expiry_total",
+                     hold_id_suffix=row["hold_id"][-8:])
+
+    guard = "expired" if late_after_expiry else "open"
+    cur.execute(
+        "UPDATE billing_holds SET status='settled', event_id=%s, "
+        "settled_at=%s, actual_nano_cny=%s "
+        "WHERE hold_id=%s AND status=%s RETURNING " + _HOLD_SEL,
+        (event["event_id"], now, actual, row["hold_id"], guard))
+    updated = cur.fetchone()
+    if updated is None:
+        raise HoldNotOpenError("hold 已被并发终局化", hold_id=row["hold_id"])
+    out = _hold_out(updated)
+    out["duplicate"] = False
+    out["usage_duplicate"] = bool(ingested["duplicate"])
+    detail = {"call_id_suffix": out["call_id"][-8:],
+              "status": out["status"],
+              "event_id": event["event_id"],
+              "enforcement_mode": mode,
+              "actual_nano_cny": actual,
+              "reserved_released_nano_cny": released_nano,
+              "usage_duplicate": out["usage_duplicate"],
+              "installation_id": installation_id}
+    if late_after_expiry:
+        detail["late_after_expiry"] = True
+    share_store_pg.record_audit_tx(
+        cur, HOLD_SETTLE_AUDIT_ACTION,
+        actor_user_id=None, actor_role="plugin",
+        target_type="billing_hold", target_id=row["hold_id"],
+        detail=detail, ts=now.timestamp())
+    return out
 
 
 # --------------------------------------------------------------------------- #

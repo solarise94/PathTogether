@@ -1,10 +1,20 @@
 # -*- coding: utf-8 -*-
-"""金额额度 policy/window 数据层（批次 B，docs
-ai-money-budget-bugfix-and-simplification-plan.md §1.1/§3.1/§3.2/§7.3/§8）。
+"""金额额度 policy/window 数据层（批次 B 起步，docs
+ai-money-budget-bugfix-and-simplification-plan.md §1.1/§3.1/§3.2/§7.3/§8；
+批次 C 起投影原语接入 billing_holds 授权/结算事务）。
 
-**本批仍为 shadow**：``spend_enforcement_mode`` 固定 ``"shadow"``（0023 迁移
-种子），本模块的任何原语都**不**接入 run/hold/usage 请求路径——把窗口接进
-billing_holds 链路是批次 C；turn 预算（budget_store）本批不动。
+批次 C 变化（本文件）：
+  - 投影原语补齐 ``*_tx`` 事务内变体（``window_reserve_tx`` /
+    ``window_release_tx`` / ``window_settle_tx``），供 billing_store 的
+    authorize/settle 在**同一事务**内维护窗口投影；独立事务版签名/行为不变；
+  - ``window_reserve_tx`` 增加 ``enforce_limit=False``（shadow 观测：不做
+    额度检查仍累加 reserved）；
+  - ``_get_or_create_window_tx`` 并发赢家回滚导致重读为空时抛稳定
+    ``spend_window_unavailable``（批次 B 为 TypeError）；
+  - ``mode_is_hard``：全局 enforcement 模式 × 主体 → 硬闸判定（§7.3）。
+
+**模式纪律**：``spend_enforcement_mode`` 仍缺省 ``"shadow"``（0023 种子）；
+切到 registered/all 是运维动作（批次 C2 验收后），本模块只读不写该键。
 
 内容（仿 billing_store 惯例：模块级函数 + 中文注释 + PG-only fail-closed）：
 
@@ -99,6 +109,12 @@ _PRICING_CUTOVER_KEY = billing_store.PRICING_V2_CUTOVER_SETTING_KEY
 
 #: 进程内指标计数（重启归零；观测用，不做限流；仿 billing_store 计数惯例）
 _METRICS = {}
+
+#: 测试专用钩子：get_or_create 的 INSERT ... ON CONFLICT DO NOTHING 未返回行
+#: （并发赢家存在）之后、重读之前同步回调（生产恒 None）。tests 用它在两条
+#: 语句之间删除赢家行，确定性复现「重读为空 → SpendWindowUnavailableError」
+#: 分支（§9.3；仿 billing_store._INGEST_PRE_INSERT_HOOK 惯例）。
+_WINDOW_POST_INSERT_HOOK = None
 
 
 def _metric(name, **fields):
@@ -389,12 +405,23 @@ def _get_or_create_window_tx(cur, subject_type, subject_id, at) -> dict:
          policy["limit_nano_cny"]))
     row = cur.fetchone()
     if row is None:
+        if _WINDOW_POST_INSERT_HOOK is not None:
+            _WINDOW_POST_INSERT_HOOK(cur)
         cur.execute(
             "SELECT " + _WINDOW_SEL + " FROM ai_spend_windows "
             "WHERE subject_type=%s AND subject_id=%s AND window_start=%s "
             "  AND window_end=%s",
             (subject_type, subject_id, start, end))
         row = cur.fetchone()
+    if row is None:
+        # ON CONFLICT DO NOTHING 后重读仍为空：唯一可能是并发赢家事务未提交
+        # 时其窗口行对本事务不可见，赢家随后回滚（绑定行/策略被并发改写等）
+        # → 窗口此刻确实不存在。批次 C 前这里会 _window_out(None) 抛 TypeError
+        # （不稳定 500）；fail-closed 抛稳定 spend_window_unavailable，调用方
+        # （authorize/settle）按模式分流：hard 拒绝、shadow 记观测。
+        raise SpendWindowUnavailableError(
+            "窗口创建并发竞态未收敛（赢家回滚或行不可见）",
+            subject_type=subject_type, subject_id=subject_id)
     return _window_out(row)
 
 
@@ -463,6 +490,108 @@ def _fetch_window_locked(cur, window_id):
     return _window_out(row)
 
 
+def window_reserve_tx(cur, window_id, estimated_nano, *, enforce_limit=True):
+    """预占的事务内变体（批次 C：供 authorize/settle 把投影接进同一事务）。
+
+    语义与 :func:`window_reserve` 相同（§3.2：锁窗口行后检查
+    ``spent + reserved + estimated <= limit``），外加：
+
+    - ``enforce_limit=False``：**shadow 观测路径**——不做额度检查也不要求
+      窗口 open，照常 ``reserved += estimated``（批次 C authorize：shadow
+      模式永不因金额拒绝，但窗口投影必须照常维护真实占用）；
+    - 与独立事务版共用同一 SQL/指标/异常语义（独立版是本函数的连接壳）。
+    """
+    estimated = _validate_nano(estimated_nano, "estimated_nano")
+    win = _fetch_window_locked(cur, window_id)
+    if enforce_limit:
+        if win["status"] != "open":
+            raise SpendWindowUnavailableError(
+                "窗口已关闭，不能再预占", window_id=window_id,
+                status=win["status"])
+        spent = int(win["spent_nano_cny"])
+        reserved = int(win["reserved_nano_cny"])
+        limit = int(win["limit_nano_snapshot"])
+        if spent + reserved + estimated > limit:
+            _metric("spend_reserve_denied_total",
+                    subject_type=win["subject_type"])
+            raise SpendBudgetExhaustedError(
+                "窗口额度不足：spent+reserved+estimated > limit_nano_snapshot",
+                window_id=window_id, spent_nano_cny=spent,
+                reserved_nano_cny=reserved, estimated_nano=estimated,
+                limit_nano_snapshot=limit)
+    cur.execute(
+        "UPDATE ai_spend_windows SET "
+        "reserved_nano_cny = reserved_nano_cny + %s, "
+        "version = version + 1, updated_at = now() "
+        "WHERE window_id=%s RETURNING " + _WINDOW_SEL,
+        (estimated, window_id))
+    return _window_out(cur.fetchone())
+
+
+def window_release_tx(cur, window_id, estimated_nano):
+    """释放预占的事务内变体（语义与 :func:`window_release` 相同）。"""
+    estimated = _validate_nano(estimated_nano, "estimated_nano")
+    win = _fetch_window_locked(cur, window_id)
+    reserved = int(win["reserved_nano_cny"])
+    release = estimated
+    if estimated > reserved:
+        _metric("spend_release_clamp_total",
+                requested_nano=estimated, reserved_nano=reserved)
+        release = reserved
+    cur.execute(
+        "UPDATE ai_spend_windows SET "
+        "reserved_nano_cny = reserved_nano_cny - %s, "
+        "version = version + 1, updated_at = now() "
+        "WHERE window_id=%s RETURNING " + _WINDOW_SEL,
+        (release, window_id))
+    return _window_out(cur.fetchone())
+
+
+def window_settle_tx(cur, window_id, estimated_nano, actual_nano):
+    """结算的事务内变体（语义与 :func:`window_settle` 相同）。"""
+    estimated = _validate_nano(estimated_nano, "estimated_nano")
+    actual = _validate_nano(actual_nano, "actual_nano")
+    win = _fetch_window_locked(cur, window_id)
+    reserved = int(win["reserved_nano_cny"])
+    overage = max(0, actual - estimated)
+    release = estimated
+    if estimated > reserved:
+        _metric("spend_settle_release_clamp_total",
+                requested_nano=estimated, reserved_nano=reserved)
+        release = reserved
+    if overage > 0:
+        _metric("spend_settle_overage_total", overage_nano=overage)
+    cur.execute(
+        "UPDATE ai_spend_windows SET "
+        "reserved_nano_cny = reserved_nano_cny - %s, "
+        "spent_nano_cny = spent_nano_cny + %s, "
+        "version = version + 1, updated_at = now() "
+        "WHERE window_id=%s RETURNING " + _WINDOW_SEL,
+        (release, actual, window_id))
+    out = _window_out(cur.fetchone())
+    out["overage_nano"] = overage
+    return out
+
+
+def window_add_spent_tx(cur, window_id, actual_nano):
+    """只累加 spent 的事务内投影原语（批次 C usage 投影专用）。
+
+    与 :func:`window_settle_tx` 的差异：不动 reserved、不触发 overage 指标
+    ——「估算不足」的口径是 settle 实扣对比 **hold 估算**（billing_store
+    settle 链负责该指标），不是对比 0；本原语只把已成事实的事件成本记进
+    所属窗口（§3.4.4 的 ``window spent += actual`` 半步，reserved 归还由
+    hold release 半步单独完成，两步可在不同窗口边界上各自成立）。
+    """
+    actual = _validate_nano(actual_nano, "actual_nano")
+    cur.execute(
+        "UPDATE ai_spend_windows SET "
+        "spent_nano_cny = spent_nano_cny + %s, "
+        "version = version + 1, updated_at = now() "
+        "WHERE window_id=%s RETURNING " + _WINDOW_SEL,
+        (actual, window_id))
+    return _window_out(cur.fetchone())
+
+
 def window_reserve(window, estimated_nano):
     """预占（§3.2）：锁窗口行后检查 ``spent + reserved + estimated <= limit``。
 
@@ -473,6 +602,9 @@ def window_reserve(window, estimated_nano):
       并发 reserve 合计只有额度内的能越过临界点）；
     - 窗口不存在/已关闭抛 :class:`SpendWindowUnavailableError`（closed 窗口
       不能再开新预占）。
+
+    签名/行为与批次 B 完全一致（独立事务版）；事务内核心见
+    :func:`window_reserve_tx`。
     """
     platform_features.require_pg_backend("spend")
     estimated = _validate_nano(estimated_nano, "estimated_nano")
@@ -481,30 +613,7 @@ def window_reserve(window, estimated_nano):
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                win = _fetch_window_locked(cur, window_id)
-                if win["status"] != "open":
-                    raise SpendWindowUnavailableError(
-                        "窗口已关闭，不能再预占", window_id=window_id,
-                        status=win["status"])
-                spent = int(win["spent_nano_cny"])
-                reserved = int(win["reserved_nano_cny"])
-                limit = int(win["limit_nano_snapshot"])
-                if spent + reserved + estimated > limit:
-                    _metric("spend_reserve_denied_total",
-                            subject_type=win["subject_type"])
-                    raise SpendBudgetExhaustedError(
-                        "窗口额度不足：spent+reserved+estimated > "
-                        "limit_nano_snapshot",
-                        window_id=window_id, spent_nano_cny=spent,
-                        reserved_nano_cny=reserved, estimated_nano=estimated,
-                        limit_nano_snapshot=limit)
-                cur.execute(
-                    "UPDATE ai_spend_windows SET "
-                    "reserved_nano_cny = reserved_nano_cny + %s, "
-                    "version = version + 1, updated_at = now() "
-                    "WHERE window_id=%s RETURNING " + _WINDOW_SEL,
-                    (estimated, window_id))
-                return _window_out(cur.fetchone())
+                return window_reserve_tx(cur, window_id, estimated)
     finally:
         conn.close()
 
@@ -517,6 +626,9 @@ def window_release(window, estimated_nano):
     超过当前 reserved（重放/乱序/漂移）时夹到 0 并记
     ``spend_release_clamp_total`` 指标，保住 ``reserved >= 0`` 的 DB 不变量；
     调用级幂等（同一次调用不重复释放）由批次 C 的 hold 状态机负责。
+
+    签名/行为与批次 B 完全一致（独立事务版）；事务内核心见
+    :func:`window_release_tx`。
     """
     platform_features.require_pg_backend("spend")
     estimated = _validate_nano(estimated_nano, "estimated_nano")
@@ -525,20 +637,7 @@ def window_release(window, estimated_nano):
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                win = _fetch_window_locked(cur, window_id)
-                reserved = int(win["reserved_nano_cny"])
-                release = estimated
-                if estimated > reserved:
-                    _metric("spend_release_clamp_total",
-                            requested_nano=estimated, reserved_nano=reserved)
-                    release = reserved
-                cur.execute(
-                    "UPDATE ai_spend_windows SET "
-                    "reserved_nano_cny = reserved_nano_cny - %s, "
-                    "version = version + 1, updated_at = now() "
-                    "WHERE window_id=%s RETURNING " + _WINDOW_SEL,
-                    (release, window_id))
-                return _window_out(cur.fetchone())
+                return window_release_tx(cur, window_id, estimated)
     finally:
         conn.close()
 
@@ -552,6 +651,9 @@ def window_settle(window, estimated_nano, actual_nano):
     - estimated 超过当前 reserved（重放/乱序/漂移）时夹 0 记
       ``spend_settle_release_clamp_total``；spent 永远按 actual 累加；
     - 返回窗口 dict，附加 ``overage_nano = max(0, actual - estimated)``。
+
+    签名/行为与批次 B 完全一致（独立事务版）；事务内核心见
+    :func:`window_settle_tx`。
     """
     platform_features.require_pg_backend("spend")
     estimated = _validate_nano(estimated_nano, "estimated_nano")
@@ -561,27 +663,7 @@ def window_settle(window, estimated_nano, actual_nano):
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                win = _fetch_window_locked(cur, window_id)
-                reserved = int(win["reserved_nano_cny"])
-                overage = max(0, actual - estimated)
-                release = estimated
-                if estimated > reserved:
-                    _metric("spend_settle_release_clamp_total",
-                            requested_nano=estimated, reserved_nano=reserved)
-                    release = reserved
-                if overage > 0:
-                    _metric("spend_settle_overage_total",
-                            overage_nano=overage)
-                cur.execute(
-                    "UPDATE ai_spend_windows SET "
-                    "reserved_nano_cny = reserved_nano_cny - %s, "
-                    "spent_nano_cny = spent_nano_cny + %s, "
-                    "version = version + 1, updated_at = now() "
-                    "WHERE window_id=%s RETURNING " + _WINDOW_SEL,
-                    (release, actual, window_id))
-                out = _window_out(cur.fetchone())
-                out["overage_nano"] = overage
-                return out
+                return window_settle_tx(cur, window_id, estimated, actual)
     finally:
         conn.close()
 
@@ -829,6 +911,21 @@ def enforcement_mode() -> str:
                 return _enforcement_mode_tx(cur)
     finally:
         conn.close()
+
+
+def mode_is_hard(mode, subject_type) -> bool:
+    """全局 enforcement 模式 × 主体 → 是否金额硬闸（§7.3/§8 批次 C）。
+
+    - ``shadow``：任何主体都只观测（永不因金额拒绝）；
+    - ``registered``：user/owner 硬闸；demo 仍观测（§8：registered 只切
+      注册用户，demo 硬闸要等批次 E 验收后的 ``all``）；
+    - ``all``：demo 也硬闸。
+    """
+    if mode == "all":
+        return True
+    if mode == "registered":
+        return subject_type in ("user", "owner")
+    return False
 
 
 # --------------------------------------------------------------------------- #

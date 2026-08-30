@@ -127,6 +127,11 @@ def test_schema_migrations_recorded(conn):
     # 0023_spend_policies_windows.sql（ai_spend_policies / ai_spend_windows
     # 两表 + 三条默认策略种子 + spend_enforcement_mode=shadow 开关，
     # docs 同上 §3.1/§3.2/§8）。
+    # 批次 C（强一致 usage/hold 协议）追加
+    # 0024_billing_holds_spend_strong_settle.sql（billing_holds 五列：
+    # spend_window_id/reserved_nano_cny/actual_nano_cny/enforcement_mode/
+    # denial_reason + subject_type 放宽含 demo + 迁移 audit，docs 同上
+    # §3.3/§3.4/§4.2）。
     assert rows == [
         "0001_init.sql", "0002_roi_payload.sql", "0003_comments.sql",
         "0004_audit.sql", "0005_plugin.sql", "0006_demo_budget_auth.sql",
@@ -147,6 +152,7 @@ def test_schema_migrations_recorded(conn):
         "0021_upload_tasks_v1_artifacts.sql",
         "0022_billing_price_unit_fix.sql",
         "0023_spend_policies_windows.sql",
+        "0024_billing_holds_spend_strong_settle.sql",
     ]
 
 

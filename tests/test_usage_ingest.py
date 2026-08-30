@@ -226,13 +226,19 @@ def test_schema_positives_accepted_and_shape():
         r = _post(event, token=token, client=client)
         assert r.status_code == 200, "%s: %r" % (name, r.get_data(as_text=True))
         body = r.get_json()
+        # 批次 C（§3.4）起追加能力探测字段（enforcement_mode + capabilities，
+        # 供 HistoPilot 探测 settle 新协议）；其余键集不变
         assert set(body.keys()) == {"ok", "event_id", "duplicate",
-                                    "status", "priced"}, body
+                                    "status", "priced", "enforcement_mode",
+                                    "capabilities"}, body
         assert body["ok"] is True
         assert body["event_id"] == event["event_id"]
         assert body["duplicate"] is False
         assert body["status"] == status
         assert body["priced"] is (status == "priced")
+        assert body["enforcement_mode"] == "shadow"
+        assert body["capabilities"] == {"settle_with_usage_event": True,
+                                        "spend_enforcement": "shadow"}
 
 
 @PG

@@ -12477,12 +12477,15 @@ def plugin_v1_run_grant_verify():
 
 
 # --------------------------------------------------------------------------- #
-# usage ingestion（admin-billing 方案 §7.5，PR2：影子计价，不扣账本）
+# usage ingestion（admin-billing 方案 §7.5；批次 C 起为 hold settle 的孪生链）
 #
 # HistoPilot durable usage outbox 的投递端点：每次真实 provider 调用一个事件，
 # 单事务完成 dedup（payload_hash 比对）→ §7.2 四步权威主体解析 → 时钟/算术
-# 校验 → 双 price book 计价写回（或 unpriced+reason）→ 无敏感信息 audit。
-# **影子阶段（§12.1）不写任何 usage_debit；demo 主体只计量、不开户。**
+# 校验 → 双 price book 计价写回（或 unpriced+reason）→ debit（shadow=PR6 模拟
+# 软扣费 best-effort；registered/all × user/owner=真实 debit 强一致）→ 窗口
+# spent 投影（§3.2/§3.4.5）→ 无敏感信息 audit。demo 主体只计量、不开户。
+# 与 settle 共用同一事务内核（billing_store._ingest_usage_event_tx）：同一
+# 事件两条投递链只计一次价/扣一次账/加一次窗口 spent。
 # 数据层见 billing_store.ingest_usage_event；计价规则见 billing_pricing。
 # --------------------------------------------------------------------------- #
 #: 允许投递 usage event 的插件白名单（当前仅 histopilot bundle；鉴权后按
@@ -12558,25 +12561,37 @@ def plugin_v1_usage_events():
         app.logger.exception("usage event ingest 失败（event_id=%s）",
                              body.get("event_id"))
         return _plugin_error(500, "internal", "内部错误", retryable=True)
+    # capabilities（批次 C §3.4）：客户端能力探测——settle 可携带完整
+    # usage_event；spend_enforcement 为当前金额 enforcement 模式（hard 模式
+    # 下旧 {event_id} settle body 会被明确拒绝，客户端据此切换新协议）。
+    mode = result.get("enforcement_mode") or "shadow"
     return jsonify(
         ok=True,
         event_id=result["event_id"],
         duplicate=result["duplicate"],
         status=result["status"],
         priced=result["priced"],
+        enforcement_mode=mode,
+        capabilities={"settle_with_usage_event": True,
+                      "spend_enforcement": mode},
     )
 
 
 # --------------------------------------------------------------------------- #
-# billing holds（admin-billing 方案 §12.3 Phase C，PR7——v0.5 影子/advisory）
+# billing holds（admin-billing §12.3 + 批次 C docs
+# ai-money-budget-bugfix-and-simplification-plan.md §3.3/§3.4）
 #
-# 逐 model call 预授权：HistoPilot 在每次 provider 调用前 POST /billing/holds，
-# 调用结束后（成功带 event_id / 失败不带）POST .../settle。**影子语义**
-# （§19 v0.5，owner 2026-08-28 指令）：authorize 永不因余额拒绝，would_deny
-# 只记录「若开启硬额度会不会拒」供观测；不写 usage_debit（模拟扣费仍走
-# PR6 ingest 链，两条链解耦）；TTL 惰性回收挂在 authorize/settle 事务上。
+# 逐 model call 预授权 + 单事务强一致结算：HistoPilot 在每次 provider 调用前
+# POST /billing/holds（hard 模式必须 await 且 deny/unknown/unavailable 不调
+# provider——客户端侧是批次 C2）；调用结束后 POST .../settle（成功带完整
+# usage_event / 失败空 body release）。服务端行为按 spend_enforcement_mode
+# 快照分流（§7.3）：shadow 永不因金额拒绝但照常投影窗口 reserved（would_deny
+# /denial_reason 照记）；registered（user/owner）/all 硬拒绝（稳定码 +
+# 不写 reserved）。demo 所有模式都进 hold + demo_global 周窗口（§4.2）。
+# settle 与 /usage-events 共用同一 ingest 内核：事件/ddebit/窗口 spent 两个
+# 投递方向只落一次（§3.4.5）；TTL 惰性回收归还窗口 reserved（§3.4.7）。
 # 鉴权/白名单/错误信封与 usage-events 同一机器通道纪律。数据层见
-# billing_store.authorize_hold / settle_hold。
+# billing_store.authorize_hold / settle_hold / _ingest_usage_event_tx。
 # --------------------------------------------------------------------------- #
 def _hold_nano_wire(value):
     """hold 响应金额：nano-CNY 整数 → 十进制字符串（§5 wire 纪律；None 透传）。"""
@@ -12592,25 +12607,45 @@ def _hold_rfc3339(value):
 
 @app.route("/api/plugin/v1/billing/holds", methods=["POST"])
 def plugin_v1_billing_hold_authorize():
-    """预授权一次 model call（advisory/影子：authorized 恒 True，永不因余额拒绝）。
+    """预授权一次 model call（批次 C §3.3：模式分流 + 窗口强一致预占）。
 
     鉴权：Bearer scoped JWT（_require_plugin_token）+ plugin_id 白名单
     （复用 _USAGE_INGEST_PLUGIN_IDS，仅 HistoPilot 安装——同一机器通道）。
     json/dual → 503 pg_backend_required（fail-closed，不降级）。
 
-    错误（统一插件信封，code 稳定、message 无敏感）：
-      400 invalid_request          —— 字段校验（call_id/session_id/model 格式、
-                                       token 上限 2^53-1、必填项）；
+    模式（spend_enforcement_mode 快照进 hold 行，§7.3）：shadow（及
+    registered 下的 demo）永不因金额拒绝、照常投影；registered 下 user/
+    owner 与 all 下全部主体硬拒绝。demo 主体所有模式都写 hold 行 + 进
+    demo_global 周窗口投影（§4.2，不再返回 skipped）。
+
+    错误（统一插件信封，code 稳定、message 无敏感；HTTP 状态选择依据）：
+      400 invalid_request          —— 字段校验（同前）；
       409 hold_conflict            —— 同 call_id 重放但载荷不同（确定性）；
       409 usage_subject_conflict   —— body 主体 assertion 与权威解析不一致；
       409 usage_subject_not_ready  —— 权威绑定未就绪（retryable=true）；
+      429 spend_budget_exhausted   —— 窗口额度不足（hard）。**用 429 而非
+                                      402/403**：仓库既有惯例把「配额/额度
+                                      用尽」归 429（_plugin_rate_limited_
+                                      response / dispatch 限流同族）；402 是
+                                      付费语义（本系统不是充值扣款模型，
+                                      插件信封从未使用），403 是权限语义
+                                      （用户并未失去调用权限，是池额度用尽）；
+      503 pricing_unavailable      —— 无 active 价目（hard，fail-closed，
+                                      retryable=true：价目补齐后同 call_id
+                                      重放即可恢复）；
+      503 spend_policy_missing     —— 无有效金额策略（hard fail-closed，
+                                      retryable=true）。503 与 pg_backend_
+                                      required 同族：服务端金额前置条件缺失，
+                                      客户端退避重试或放弃，绝不无额度放行；
+      503 spend_window_unavailable —— 窗口不可用（hard fail-closed，同上）；
       503 pg_backend_required      —— json/dual fail-closed。
 
     成功返回 ``{ok, authorized:true, hold_id, call_id, duplicate, status,
     subject_type, model, estimated_nano_cny, balance_nano_cny,
-    open_holds_nano_cny, would_deny, expires_at}``；金额一律十进制字符串或
-    null，expires_at RFC3339；demo 主体返回 ``{ok, skipped:"demo_subject",
-    authorized:true, would_deny:false, hold_id:null}``（不写行，§14.1 红线）。
+    open_holds_nano_cny, would_deny, denial_reason, enforcement_mode,
+    capabilities, expires_at}``；金额一律十进制字符串或 null，expires_at
+    RFC3339；``capabilities={"settle_with_usage_event": true,
+    "spend_enforcement": <mode>}`` 供客户端（批次 C2）能力探测。
     """
     claims, err = _require_plugin_token()
     if err is not None:
@@ -12644,6 +12679,22 @@ def plugin_v1_billing_hold_authorize():
     except billing_store.UsageSubjectNotReadyError:
         return _plugin_error(409, "usage_subject_not_ready",
                              "权威主体绑定尚未就绪，请退避后重试", retryable=True)
+    except billing_store.HoldPricingUnavailableError:
+        return _plugin_error(503, "pricing_unavailable",
+                             "无可用价格（hard 模式 fail-closed），价目补齐后重试",
+                             retryable=True)
+    except spend_store.SpendBudgetExhaustedError:
+        # 429 选型理由见本端点 docstring（配额用尽族，非付费/权限语义）
+        return _plugin_error(429, "spend_budget_exhausted",
+                             "金额窗口额度不足（spent+reserved+estimate > limit）")
+    except spend_store.SpendPolicyMissingError:
+        return _plugin_error(503, "spend_policy_missing",
+                             "无有效金额策略（hard 模式 fail-closed）",
+                             retryable=True)
+    except spend_store.SpendWindowUnavailableError:
+        return _plugin_error(503, "spend_window_unavailable",
+                             "金额窗口不可用（hard 模式 fail-closed）",
+                             retryable=True)
     except platform_features.PgFeatureUnavailable:
         return _plugin_error(503, "pg_backend_required",
                              "billing hold 要求 STORAGE_BACKEND=postgres")
@@ -12651,15 +12702,10 @@ def plugin_v1_billing_hold_authorize():
         app.logger.exception("billing hold authorize 失败（call_id=%s）",
                              body.get("call_id"))
         return _plugin_error(500, "internal", "内部错误", retryable=True)
-    if result.get("skipped") is not None:
-        # demo 主体：不写行（§14.1 红线），skipped 语义原样透传
-        return jsonify(ok=True, skipped=result["skipped"],
-                       authorized=result["authorized"],
-                       would_deny=result["would_deny"],
-                       hold_id=result["hold_id"])
+    mode = result.get("enforcement_mode") or "shadow"
     return jsonify(
         ok=True,
-        authorized=True,  # 影子语义：永不因余额拒绝（§19 v0.5）
+        authorized=True,  # 硬拒绝走错误信封；成功行必已过当前模式硬闸
         hold_id=result["hold_id"],
         call_id=result["call_id"],
         duplicate=result["duplicate"],
@@ -12670,18 +12716,34 @@ def plugin_v1_billing_hold_authorize():
         balance_nano_cny=_hold_nano_wire(result["balance_nano_cny"]),
         open_holds_nano_cny=_hold_nano_wire(result["open_holds_nano_cny"]),
         would_deny=result["would_deny"],
+        denial_reason=result.get("denial_reason"),
+        enforcement_mode=mode,
+        capabilities={"settle_with_usage_event": True,
+                      "spend_enforcement": mode},
         expires_at=_hold_rfc3339(result["expires_at"]),
     )
 
 
 @app.route("/api/plugin/v1/billing/holds/<hold_id>/settle", methods=["POST"])
 def plugin_v1_billing_hold_settle(hold_id):
-    """结算/释放一个 hold（成功调用带 event_id → settled；失败/无 usage 空 body → released）。
+    """结算/释放一个 hold（批次 C §3.4 强一致结算链）。
+
+    body 三形态：空 body → release（§3.4.6，任何模式允许）；``{event_id}`` →
+    旧 body（仅 hold 的 enforcement 快照为 shadow 时兼容，hard 快照明确
+    400 settle_payload_required）；``{usage_event: {...}}`` → 新 body（§3.4.4
+    单事务：事件幂等入库 + 计价 + debit + 窗口 spent/reserved + hold 终局化
+    + audit；与 /usage-events outbox 双向不重复扣账/加 spent，§3.4.5）。
+    hold 过期后的合法迟到 usage 仍记实际消费（§3.4.7）。
 
     鉴权同 authorize（同 installation 白名单通道）；hold 不属于该 installation
-    与不存在统一 404 hold_not_found（不泄露存在性）。已 settled 后同 event_id
-    重放 → duplicate=true；不同/缺 event_id → 409 hold_conflict；
-    released/expired → 409 hold_not_open（均不可重试）。
+    与不存在统一 404 hold_not_found。已 settled 后同 event 重放 → duplicate=
+    true；不同/缺 event → 409 hold_conflict；release 重放 → duplicate=true；
+    released/expired 后其它 settle → 409 hold_not_open。settle 事件的
+    call_id 与 hold 不一致 → 409 hold_conflict（不可改绑）。
+
+    响应：``{ok, hold_id, status, duplicate, usage_duplicate, event_id,
+    actual_nano_cny, enforcement_mode, capabilities, settled_at,
+    expires_at}``（金额十进制字符串或 null）。
     """
     claims, err = _require_plugin_token()
     if err is not None:
@@ -12700,29 +12762,58 @@ def plugin_v1_billing_hold_settle(hold_id):
                              "request body 需为 JSON object 或空（release）")
     try:
         result = billing_store.settle_hold(
-            hold_id, body, installation_id=claims.get("sub") or "")
+            hold_id, body, installation_id=claims.get("sub") or "",
+            plugin_id=claims.get("plugin_id") or "")
     except billing_store.InvalidHoldRequestError as exc:
         return _plugin_error(400, "invalid_request", "hold 请求校验失败",
                              details={"errors": exc.errors[:10]})
+    except billing_store.InvalidUsageEventError as exc:
+        # settle 新 body 内嵌 usage event：schema 校验失败同样 400
+        return _plugin_error(400, "invalid_request", "usage event 校验失败",
+                             details={"errors": exc.errors[:10]})
+    except billing_store.SettlePayloadRequiredError:
+        return _plugin_error(
+            400, "settle_payload_required",
+            "hard 模式 settle 必须携带完整 usage_event（旧 event_id body 会"
+            "少记金额）")
     except billing_store.HoldNotFoundError:
         return _plugin_error(404, "hold_not_found", "hold 不存在或不可访问")
     except billing_store.HoldConflictError:
         return _plugin_error(409, "hold_conflict",
-                             "hold 已结算，不能再次结算或改绑 event")
+                             "hold 已结算/事件与本 hold 不一致，不能再次结算或改绑")
     except billing_store.HoldNotOpenError:
         return _plugin_error(409, "hold_not_open", "hold 已终局（released/expired），不可再结算")
+    except billing_store.UsageEventConflictError:
+        return _plugin_error(409, "usage_event_conflict",
+                             "同 event_id/call_id 的 payload 与原记录不一致")
+    except billing_store.UsageSubjectConflictError:
+        return _plugin_error(409, "usage_subject_conflict",
+                             "事件主体 assertion 与权威绑定不一致")
+    except billing_store.UsageSubjectNotReadyError:
+        return _plugin_error(409, "usage_subject_not_ready",
+                             "权威主体绑定尚未就绪，请退避后重试", retryable=True)
+    except spend_store.SpendWindowUnavailableError:
+        # 结算链归还 reserved 时窗口行缺失（数据异常）：可重试，整体已回滚
+        return _plugin_error(503, "spend_window_unavailable",
+                             "金额窗口不可用，结算未生效，请重试", retryable=True)
     except platform_features.PgFeatureUnavailable:
         return _plugin_error(503, "pg_backend_required",
                              "billing hold 要求 STORAGE_BACKEND=postgres")
     except Exception:
         app.logger.exception("billing hold settle 失败（hold_id=%s）", hold_id)
         return _plugin_error(500, "internal", "内部错误", retryable=True)
+    mode = result.get("enforcement_mode") or "shadow"
     return jsonify(
         ok=True,
         hold_id=result["hold_id"],
         status=result["status"],
         duplicate=result["duplicate"],
+        usage_duplicate=result.get("usage_duplicate", False),
         event_id=result["event_id"],
+        actual_nano_cny=_hold_nano_wire(result.get("actual_nano_cny")),
+        enforcement_mode=mode,
+        capabilities={"settle_with_usage_event": True,
+                      "spend_enforcement": mode},
         settled_at=_hold_rfc3339(result["settled_at"]),
         expires_at=_hold_rfc3339(result["expires_at"]),
     )

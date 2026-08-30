@@ -57,6 +57,7 @@ PG = pytest.mark.skipif(BACKEND != "postgres",
 
 if BACKEND == "postgres":
     import _billing_helpers as bh  # noqa: E402
+    import spend_store  # noqa: E402
     import user_store  # noqa: E402
 
 app_mod.UPLOAD_DIR = Path(os.environ["UPLOAD_DIR"])
@@ -407,19 +408,54 @@ def test_authorize_unknown_model_estimated_null():
 
 
 @PG
-def test_demo_subject_skipped_no_row():
-    """demo 主体 → skipped=demo_subject，不写行、不开户（§14.1 红线）。"""
+def test_demo_subject_writes_hold_and_week_window():
+    """批次 C §4.2：demo 不再 skip——所有模式都写 hold 行 + 进 demo_global
+    周窗口投影（此处 shadow 模式：策略已种 → 窗口预占照常；无策略时只记
+    denial_reason=spend_policy_missing 仍写行）。"""
     bh.seed_price_books_with_history()
+    bh.seed_spend_policies()
+    now = datetime.now(timezone.utc)
     _, session_id, _ = _ids()
     cap = bh.bind_demo_session(session_id)
     call_id = "call_" + uuid.uuid4().hex
     body = _hold_body("demo", cap, session_id=session_id, call_id=call_id)
-    result = _authorize(body)
-    assert result == {"skipped": "demo_subject", "authorized": True,
-                      "would_deny": False, "hold_id": None}
-    assert _count("billing_holds") == 0
+    result = _authorize(body, now=now)
+    # 写行：subject_type=demo（0024 CHECK 放宽）、无账户面、模式快照
+    assert result["status"] == "open"
+    assert result["subject_type"] == "demo"
+    assert result["enforcement_mode"] == "shadow"
+    assert result["account_id"] is None
+    assert result["balance_nano_cny"] is None
+    row = _hold_row(call_id=call_id)
+    assert row is not None
+    assert row["spend_window_id"] is not None
+    assert row["reserved_nano_cny"] == result["estimated_nano_cny"]
+    # 进 demo_global 周窗口投影（§4.2 服务端半）
+    window = spend_store.get_window(row["spend_window_id"])
+    assert window["subject_type"] == "demo"
+    assert window["subject_id"] == "demo_global"
+    assert window["reserved_nano_cny"] == row["reserved_nano_cny"]
+    assert spend_store.window_remaining_nano(window) >= 0
+    # 不开户（demo 无 billing_accounts，§14.1 红线不变）
     assert _count("billing_accounts") == 0
-    assert _hold_row(call_id=call_id) is None
+    # 无策略（shadow）：仍写行，denial_reason 只观测、authorized=true
+    # （enabled=false 而非 DELETE——窗口行有 policy FK）
+    conn = bh.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE ai_spend_policies SET enabled=false")
+        conn.commit()
+    finally:
+        conn.close()
+    _, session2, _ = _ids()
+    cap2 = bh.bind_demo_session(session2)
+    call2 = "call_" + uuid.uuid4().hex
+    r2 = _authorize(_hold_body("demo", cap2, session_id=session2,
+                               call_id=call2), now=now)
+    assert r2["status"] == "open"
+    assert r2["denial_reason"] == "spend_policy_missing"
+    assert r2["estimated_nano_cny"] is not None
+    assert _hold_row(call_id=call2)["spend_window_id"] is None
 
 
 @PG
@@ -757,14 +793,23 @@ def test_wire_amounts_strings_or_null():
     assert out3["balance_nano_cny"].isdigit()
     assert out3["open_holds_nano_cny"] == "0"
 
-    # demo：skipped 形态（无金额字段）
+    # demo（批次 C §4.2）：不再 skipped——照常写行 + 金额 wire 纪律
     _, sess4, _ = _ids()
     cap = bh.bind_demo_session(sess4)
     body4 = _hold_body("demo", cap, session_id=sess4,
                        call_id="call_" + uuid.uuid4().hex)
     out4 = _post_hold(token, body4, client=client).get_json()
-    assert out4 == {"ok": True, "skipped": "demo_subject",
-                    "authorized": True, "would_deny": False, "hold_id": None}
+    assert out4["ok"] is True and out4["authorized"] is True
+    assert out4["subject_type"] == "demo"
+    assert out4["hold_id"] is not None
+    assert _is_nano_wire(out4["estimated_nano_cny"])
+    assert out4["balance_nano_cny"] is None
+    # 能力探测字段（批次 C）：authorize 响应带 enforcement_mode + capabilities
+    assert out["enforcement_mode"] == "shadow"
+    assert out["capabilities"] == {"settle_with_usage_event": True,
+                                   "spend_enforcement": "shadow"}
+    assert out4["enforcement_mode"] == "shadow"
+    assert out4["capabilities"]["settle_with_usage_event"] is True
 
     # settle 响应：settled_at RFC3339、event_id 原样
     r = _settle(token, out["hold_id"], body={"event_id": "use_" + "9" * 32},
@@ -910,9 +955,12 @@ def test_hold_audit_written_without_sensitive_fields():
     auth_allowed = {"call_id_suffix", "subject_type", "model", "provider",
                     "estimated_nano_cny", "balance_nano_cny",
                     "open_holds_nano_cny", "would_deny", "status",
-                    "installation_id", "plugin_id", "skipped"}
+                    "enforcement_mode", "denial_reason", "skipped",
+                    "installation_id", "plugin_id"}
     settle_allowed = {"call_id_suffix", "status", "event_id",
-                      "installation_id"}
+                      "enforcement_mode", "reserved_released_nano_cny",
+                      "actual_nano_cny", "usage_duplicate",
+                      "late_after_expiry", "installation_id"}
     for detail in auth:
         assert set(detail.keys()) <= auth_allowed, detail
         dumped = json.dumps(detail, ensure_ascii=False)
@@ -922,7 +970,8 @@ def test_hold_audit_written_without_sensitive_fields():
         assert set(detail.keys()) <= settle_allowed, detail
         dumped = json.dumps(detail, ensure_ascii=False)
         assert session_id not in dumped and call_id not in dumped
-    # demo skip 也有 audit（skipped=demo_subject）
+    # demo（批次 C §4.2）：authorize 照常写 audit（subject_type=demo，不再
+    # 有 skipped=demo_subject 形态）
     _, demo_sess, _ = _ids()
     cap = bh.bind_demo_session(demo_sess)
     demo_body = _hold_body("demo", cap, session_id=demo_sess,
@@ -933,12 +982,15 @@ def test_hold_audit_written_without_sensitive_fields():
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT detail FROM audit_events WHERE action=%s "
-                "AND detail->>'skipped' = 'demo_subject'",
+                "AND detail->>'subject_type' = 'demo'",
                 (billing_store.HOLD_AUTHORIZE_AUDIT_ACTION,))
             demo_rows = cur.fetchall()
     finally:
         conn.close()
-    assert demo_rows, "demo skip 应写 skipped audit"
+    assert demo_rows, "demo hold 应写 authorize audit"
+    for r in demo_rows:
+        assert "skipped" not in r["detail"]
+        assert r["detail"]["subject_type"] == "demo"
 
 
 if __name__ == "__main__":

@@ -854,6 +854,141 @@ def record_run_binding(request_id, session_id, subject_type, subject_id,
         conn.close()
 
 
+def ensure_run_binding_pending(request_id, subject_type, subject_id,
+                               installation_id=None):
+    """金额硬闸起跑前写入 pending 绑定（阶段 1，0028，session NULL）。
+
+    两阶段绑定（P1-2 fail-closed）的第①步：在调用 HistoPilot **之前**先把
+    run 的主体落到 ai_run_bindings（histopilot_session_id = NULL）。这样
+    HistoPilot 返回 session 后立刻后台 driveMain 的第一次 authorizeHold /
+    usage event 也能按 request_id 解析到主体，不再落入 not_ready 窗口。
+
+    语义：
+      - 首次 INSERT（session NULL）→ 返回行，``replayed=False``；
+      - 已有行且 subject_type/subject_id 一致（无论 session 是否已 attach）
+        → 原样返回并标 ``replayed=True``；**绝不**把已 attach 的 session
+        改回 NULL（同 request_id 网络重试不回退阶段）；
+      - 已有行但主体不一致 → :class:`RequestIdSubjectConflict`（跨主体复用
+        拒绝，与 record_run_binding 同码 409）；
+      - subject_type 仅接受 owner/user（demo 绑定归 demo_runs，ValueError）；
+      - request_id / subject_id 非空（ValueError）。
+    """
+    platform_features.require_pg_backend("ai_budget")
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError("request_id 不能为空")
+    if subject_type not in _RUN_BINDING_SUBJECT_TYPES:
+        raise ValueError("subject_type 需为 %s（demo 绑定归 demo_runs）"
+                         % (_RUN_BINDING_SUBJECT_TYPES,))
+    if not isinstance(subject_id, str) or not subject_id:
+        raise ValueError("subject_id 不能为空")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ai_run_bindings "
+                    "(request_id, subject_type, subject_id, "
+                    " histopilot_session_id, installation_id) "
+                    "VALUES (%s,%s,%s,NULL,%s) "
+                    "ON CONFLICT (request_id) DO NOTHING "
+                    "RETURNING " + _RUN_BINDING_SEL,
+                    (request_id, subject_type, subject_id, installation_id))
+                row = cur.fetchone()
+                if row is not None:
+                    out = dict(row)
+                    out["replayed"] = False
+                    return out
+                # 冲突回读：主体一致（session 任意状态）→ 幂等命中，不改写
+                # 已 attach 的 session；主体不一致 → 跨主体拒绝
+                cur.execute(
+                    "SELECT " + _RUN_BINDING_SEL +
+                    " FROM ai_run_bindings WHERE request_id=%s",
+                    (request_id,))
+                existing = cur.fetchone()
+                if (existing["subject_type"] != subject_type
+                        or existing["subject_id"] != subject_id):
+                    raise RequestIdSubjectConflict(
+                        "request_id 已被其他主体使用，不能复用",
+                        request_id=request_id)
+                out = dict(existing)
+                out["replayed"] = True
+                return out
+    finally:
+        conn.close()
+
+
+def attach_run_binding_session(request_id, session_id, subject_type,
+                               subject_id, installation_id=None):
+    """把 pending 绑定行的 histopilot_session_id attach 上（阶段 2，on_accepted）。
+
+    HistoPilot 2xx 接受后调用（携带 X-AI-Session-ID）。语义：
+      - 无行 → 插入完整绑定（补偿：pending 行丢失但 run 已开始；正常路径
+        阶段 1 先行，此分支不应发生）；
+      - 行存在、subject 一致、且（session 为 NULL 或已等于本次 session）
+        → UPDATE session；重放命中（原本就等于本次 session）标
+        ``replayed=True``；
+      - subject 不一致或已绑定**其他** session →
+        :class:`RequestIdSubjectConflict`（HTTP 409）；
+      - session_id 非空字符串（ValueError，与 record_run_binding 同口径）。
+    """
+    platform_features.require_pg_backend("ai_budget")
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError("request_id 不能为空")
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id 不能为空")
+    if subject_type not in _RUN_BINDING_SUBJECT_TYPES:
+        raise ValueError("subject_type 需为 %s（demo 绑定归 demo_runs）"
+                         % (_RUN_BINDING_SUBJECT_TYPES,))
+    if not isinstance(subject_id, str) or not subject_id:
+        raise ValueError("subject_id 不能为空")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ai_run_bindings "
+                    "(request_id, subject_type, subject_id, "
+                    " histopilot_session_id, installation_id) "
+                    "VALUES (%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (request_id) DO NOTHING "
+                    "RETURNING " + _RUN_BINDING_SEL,
+                    (request_id, subject_type, subject_id, session_id,
+                     installation_id))
+                row = cur.fetchone()
+                if row is not None:
+                    out = dict(row)
+                    out["replayed"] = False
+                    return out
+                # 冲突回读：主体或已绑定 session 不一致 → 拒绝；一致则
+                # UPDATE attach（NULL → session 或同 session 重放幂等）
+                cur.execute(
+                    "SELECT " + _RUN_BINDING_SEL +
+                    " FROM ai_run_bindings WHERE request_id=%s FOR UPDATE",
+                    (request_id,))
+                existing = cur.fetchone()
+                if (existing["subject_type"] != subject_type
+                        or existing["subject_id"] != subject_id):
+                    raise RequestIdSubjectConflict(
+                        "request_id 已被其他主体使用，不能复用",
+                        request_id=request_id)
+                if existing["histopilot_session_id"] not in (None, session_id):
+                    raise RequestIdSubjectConflict(
+                        "request_id 已绑定其他会话，不能复用",
+                        request_id=request_id)
+                replayed = existing["histopilot_session_id"] == session_id
+                if not replayed:
+                    cur.execute(
+                        "UPDATE ai_run_bindings SET histopilot_session_id=%s "
+                        "WHERE request_id=%s",
+                        (session_id, request_id))
+                out = dict(existing)
+                out["histopilot_session_id"] = session_id
+                out["replayed"] = replayed
+                return out
+    finally:
+        conn.close()
+
+
 def get_run_binding(request_id):
     """按 request_id 读 run 绑定（只读）；不存在返回 None。"""
     platform_features.require_pg_backend("ai_budget")

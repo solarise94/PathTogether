@@ -274,6 +274,17 @@
     if (el) el.textContent = text || "";
   }
 
+  // 分页提示（「还有更多/已到底」）与操作反馈共用同一 status 元素时的
+  // 竞态防护：操作成功文案（如「已清除月额度覆盖」）不得被紧随的列表
+  // 刷新覆盖——仅当元素为空或当前就是分页提示时才写分页提示；操作反馈
+  // 由下一次操作自行替换。错误路径不经过本函数（错误必须始终可见）。
+  function setPageHint(el, text) {
+    if (!el) return;
+    var cur = el.textContent || "";
+    if (cur && cur !== "还有更多" && cur !== "已到底") return;
+    el.textContent = text;
+  }
+
   function actionBtn(label, handler, danger) {
     var btn = document.createElement("button");
     btn.type = "button";
@@ -636,7 +647,7 @@
       state.cursors.users = res.next_cursor || null;
       var more = $("adm-users-more-btn");
       if (more) more.disabled = !res.next_cursor;
-      if (status) status.textContent = res.next_cursor ? "还有更多" : "已到底";
+      setPageHint(status, res.next_cursor ? "还有更多" : "已到底");
     }).catch(function (err) {
       if (seq !== state.listSeq) return;
       handleErr(err, status);
@@ -1132,7 +1143,7 @@
       state.cursors.acqUsers = res.next_cursor || null;
       var more = $("adm-acq-more-btn");
       if (more) more.disabled = !res.next_cursor;
-      if (status) status.textContent = res.next_cursor ? "还有更多" : "已到底";
+      setPageHint(status, res.next_cursor ? "还有更多" : "已到底");
       return !!(res.items && res.items.length); // 供协调器计算终态
     }).catch(function (err) {
       if (seq === state.listSeq) handleErr(err, status);
@@ -1190,7 +1201,7 @@
       state.cursors.invites = res.next_cursor || null;
       var more = $("adm-invites-more-btn");
       if (more) more.disabled = !res.next_cursor;
-      if (status) status.textContent = res.next_cursor ? "还有更多" : "已到底";
+      setPageHint(status, res.next_cursor ? "还有更多" : "已到底");
       return !!(res.invites && res.invites.length); // 供协调器计算终态
     }).catch(function (err) {
       if (seq === state.listSeq) handleErr(err, status);
@@ -2007,7 +2018,7 @@
       state.cursors.usage = res.next_cursor || null;
       var more = $("adm-usage-more-btn");
       if (more) more.disabled = !res.next_cursor;
-      if (status) status.textContent = res.next_cursor ? "还有更多" : "已到底";
+      setPageHint(status, res.next_cursor ? "还有更多" : "已到底");
     }).catch(function (err) { if (seq === state.listSeq) handleErr(err, status); });
   }
 
@@ -2137,7 +2148,7 @@
       state.cursors.audit = res.next_cursor || null;
       var more = $("adm-audit-more-btn");
       if (more) more.disabled = !res.next_cursor;
-      if (status) status.textContent = res.next_cursor ? "还有更多" : "已到底";
+      setPageHint(status, res.next_cursor ? "还有更多" : "已到底");
     }).catch(function (err) {
       if (seq !== state.listSeq) return;
       handleErr(err, status);

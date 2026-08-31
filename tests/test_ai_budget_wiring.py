@@ -714,8 +714,9 @@ def test_hard_mode_run_skips_reservations_and_writes_binding():
     """批次 F 核心分流：mode=all 下官方 run 200 且**不写** ai_budget_reservations。
 
     - 不预占/不消费/不释放（usage 平移为零）；
-    - request_id 幂等与主体绑定由 ai_run_bindings 承担：2xx 后写入绑定行
-      （session 匹配），重复同 rid run 仍 200（replayed）；
+    - request_id 幂等与主体绑定由 ai_run_bindings 承担（0028 两阶段：起跑前
+      pending、2xx 后 attach）：响应完成后绑定行 session 为 HP 返回的 session
+      （attach 完成）；重复同 rid run 仍 200（replayed）；
     - 跨主体复用同 request_id → 409 request_id_subject_conflict（预检）。
     """
     import spend_store
@@ -735,15 +736,17 @@ def test_hard_mode_run_skips_reservations_and_writes_binding():
     assert budget_store.get_reservation(rid) is None
     assert _platform_report() == 0
     assert (budget_store.usage_report()["own"]["total"]) == 0
-    # 绑定行在 2xx 接受后写入（session 匹配）
+    # 绑定行两阶段完成：主体在起跑前（阶段 1 pending）已落，session 在 2xx
+    # 接受后 attach（阶段 2）——响应完成后两者齐备
     binding = budget_store.get_run_binding(rid)
     assert binding is not None
     assert binding["subject_type"] == "user"
     assert binding["subject_id"] == u["user_id"]
     assert binding["histopilot_session_id"] == "sess-hard"
-    # 同 rid 重试（同主体）→ 200（幂等由绑定行承担）
+    # 同 rid 重试（同主体）→ 200（幂等由绑定行承担，session 不被回退 NULL）
     assert _run_ok(c, "hard.svs", rid).status_code == 200
-    # 跨主体复用同 rid → 409（预检拒绝，且不转发）
+    assert budget_store.get_run_binding(rid)["histopilot_session_id"] == "sess-hard"
+    # 跨主体复用同 rid → 409（阶段 1 写入预检拒绝，且不转发）
     o = _make_user("owner")
     co = _client()
     _login(co, "owner", o["user_id"])
@@ -754,6 +757,65 @@ def test_hard_mode_run_skips_reservations_and_writes_binding():
     assert r_conflict.get_json().get("code") == "request_id_subject_conflict"
     assert fake.calls == []  # 预检在转发之前拒绝
     assert budget_store.get_reservation(rid) is None  # 全程零 reservation
+
+
+@pg_only
+def test_hard_mode_pending_binding_exists_before_sidecar_call():
+    """0028 阶段 1（P1-2）：fake sidecar /run handler 被调用时 pending 绑定行
+    必须已经存在（attach 在 2xx 头之后，此时 session 可能仍 NULL——以实际
+    时序为准，handler 入口处应能读到绑定行）。"""
+    import spend_store
+    spend_store.set_enforcement_mode("all")
+    _setup_platform()
+    u = _make_user("user")
+    _touch("pend.svs")
+    _own("pend.svs", u["user_id"])
+    fake = _install_fake()
+    seen = {}
+
+    def handler(b, q, h, k):
+        seen["binding"] = budget_store.get_run_binding(b["request_id"])
+        return _sse_ok("sess-pend")
+
+    fake.register("POST", "/run", handler)
+    c = _client()
+    _login(c, "user", u["user_id"])
+    rid = _rid()
+    assert _run_ok(c, "pend.svs", rid).status_code == 200
+    # 转发 sidecar 时绑定行已存在（阶段 1 在调用 HP 之前写入）
+    assert seen["binding"] is not None
+    assert seen["binding"]["subject_type"] == "user"
+    assert seen["binding"]["subject_id"] == u["user_id"]
+    # attach 发生在 2xx SSE 头之后：handler 内 session 允许 NULL（未 attach）
+    # 或已 attach（若 fake 在 POST 返回前完成回调）——两态都证明行已在
+    assert seen["binding"]["histopilot_session_id"] in (None, "sess-pend")
+    # 响应完成后 attach 完成
+    assert budget_store.get_run_binding(rid)["histopilot_session_id"] == "sess-pend"
+
+
+@pg_only
+def test_hard_mode_pending_write_failure_fails_closed_503(monkeypatch):
+    """0028 阶段 1 fail-closed：pending 绑定写入失败 → 503
+    run_binding_unavailable，**零 sidecar 调用**（绝不放无主体绑定的 run）。"""
+    import spend_store
+    spend_store.set_enforcement_mode("all")
+    _setup_platform()
+    u = _make_user("user")
+    _touch("pendfail.svs")
+    _own("pendfail.svs", u["user_id"])
+    fake = _install_fake()
+    fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
+    c = _client()
+    _login(c, "user", u["user_id"])
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("binding store down")
+    monkeypatch.setattr(budget_store, "ensure_run_binding_pending", _boom)
+    r = _run_ok(c, "pendfail.svs", _rid())
+    assert r.status_code == 503
+    body = r.get_json()
+    assert body.get("code") == "run_binding_unavailable"
+    assert fake.calls == []  # 不转发 sidecar
 
 
 # --------------------------------------------------------------------------- #
@@ -806,7 +868,7 @@ def test_ui_budget_card_and_max_steps_sync_present():
     assert '"/api/admin/v1/settings/runtime", "PUT"' in bridge_js
     manifest = json.loads((REPO_ROOT / "plugins" / "pathtogether-admin"
                            / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["pluginVersion"] == "0.3.0"
+    assert manifest["pluginVersion"] == "0.3.1"
     assert "admin:turn-budgets:write" not in manifest["adminPermissions"]
     assert "admin:turn-budgets:read" in manifest["adminPermissions"]
     app_js = (REPO_ROOT / "static" / "app.js").read_text(encoding="utf-8")

@@ -572,11 +572,14 @@ def _resolve_usage_subject(cur, event, installation_id):
     settle 链上的事件与它必须一致）。注意 authorize 伪 event 不带 call_id
     （此时 call_id 尚无 hold 行），⓪ 自然落空——行为与批次 F 之前等价。
 
-    ① ``request_id → ai_run_bindings``（0027，金额时代主源）：session 匹配
-    才 resolve；**不匹配不 resolve、继续下落**（与旧 reservation 语义一致：
-    换 session 的迟到事件不能冒领别的主体）。绑定在 HistoPilot 2xx 接受后
-    写入（app 层 on_accepted → budget_store.record_run_binding），故尚未接受
-    的 run 的事件落到后续步骤。
+    ① ``request_id → ai_run_bindings``（0027，金额时代主源；0028 起两阶段）：
+    **pending 行（histopilot_session_id IS NULL，起跑前阶段 1 已写入主体）
+    按 request_id 命中即 resolve**——允许 HistoPilot 在 on_accepted attach
+    session 之前的 authorizeHold / usage event 解析成功；已 attach 的行仍
+    **session 匹配才 resolve**，不匹配不 resolve、继续下落（与旧 reservation
+    语义一致：换 session 的迟到事件不能冒领别的主体）。绑定写入分两阶段
+    （app 层：``ensure_run_binding_pending`` → 起跑前；``attach_run_binding_
+    session`` → on_accepted），阶段 1 失败即 503 fail-closed 不转发 sidecar。
 
     ①legacy ``request_id → ai_budget_reservations``（pre-F 历史回退，查询
     原样保留）：要求 state='consumed' 且 histopilot_session_id 与事件
@@ -624,8 +627,9 @@ def _resolve_usage_subject(cur, event, installation_id):
                     resolved=(hold["subject_type"], hold["subject_id"]))
             resolved = (hold["subject_type"], hold["subject_id"])
 
-    # -- ① request_id → ai_run_bindings（0027 金额时代主源；session 匹配
-    #    才 resolve，不匹配不阻断、继续下落——与旧 reservation 语义一致） --
+    # -- ① request_id → ai_run_bindings（0027 金额时代主源；0028 起 pending
+    #    行（session NULL）按 request_id 命中即 resolve；已 attach 的行仍要求
+    #    session 匹配，不匹配不阻断、继续下落——与旧 reservation 语义一致） --
     if resolved is None:
         request_id = event.get("request_id")
         binding = None
@@ -634,8 +638,12 @@ def _resolve_usage_subject(cur, event, installation_id):
                 "SELECT subject_type, subject_id, histopilot_session_id "
                 "FROM ai_run_bindings WHERE request_id=%s", (request_id,))
             binding = cur.fetchone()
-        if binding is not None \
-                and binding["histopilot_session_id"] == session_id:
+        if binding is not None and (
+                binding["histopilot_session_id"] is None
+                or binding["histopilot_session_id"] == session_id):
+            # pending（NULL）：阶段 1（起跑前）已写入主体、session 尚未
+            # attach——按 request_id 命中即 resolve，允许 HistoPilot 在
+            # attach 前的 authorizeHold / usage event 解析成功（0028）。
             resolved = (binding["subject_type"], binding["subject_id"])
 
     # -- ①legacy request_id → ai_budget_reservations（pre-F 历史回退，原样） --

@@ -14,6 +14,7 @@ import ipaddress
 import json
 import math
 import os
+import queue
 import re
 import secrets
 import shutil
@@ -9400,6 +9401,37 @@ def _plugin_rate_limited_response(message, retry_after, details=None):
     return resp
 
 
+def _billing_plugin_error(status: int, code: str, message: str,
+                          retryable=None, details=None):
+    """billing 机器通道（usage-events / billing holds）错误信封（0028 P1-2）。
+
+    在 ``error.details`` 附加当前 spend enforcement 模式与能力探测字段（与
+    成功 2xx 顶层 ``enforcement_mode`` / ``capabilities`` 同值同源）：
+    ``details.enforcement_mode = "shadow"|"registered"|"all"``，
+    ``details.capabilities = {"spend_enforcement": <mode>,
+    "settle_with_usage_event": true}``。
+
+    背景：冷启动 HistoPilot（无 billing-enforcement-state.json）收到 409
+    usage_subject_not_ready 时无法区分服务端是否 shadow——不带模式会被当
+    unknown mode 走 shadow advisory 继续调 provider。错误信封带模式后客户端
+    据此正确选择 await/deny。**只用于 billing 两端点**（不要把 mode 塞进
+    所有 plugin 错误）；读模式失败（如 json 后端 503 本就没有 PG）则不附加，
+    保持 ``_plugin_error`` 原样。
+    """
+    try:
+        mode = spend_store.enforcement_mode()
+    except Exception:
+        return _plugin_error(status, code, message, retryable=retryable,
+                             details=details)
+    merged = dict(details or {})
+    merged.setdefault("enforcement_mode", mode)
+    merged.setdefault("capabilities",
+                      {"spend_enforcement": mode,
+                       "settle_with_usage_event": True})
+    return _plugin_error(status, code, message, retryable=retryable,
+                         details=merged)
+
+
 # --------------------------------------------------------------------------- #
 # Stage 4-2：像素预算 + 速率限制 + 并发闸（进程内，仅保护 /api/plugin/v1 通道）
 #
@@ -10120,9 +10152,11 @@ def _ai_reserve_run_budget(user_ctx, request_id):
       起全主体 all 模式）：**完全跳过** budget_store.reserve_turn——不写
       reservations、不做 usage 平移、不查任何 turn 闸（消费额度由金额闸
       独占，§7.3「禁止双关/避免双重计费」）。request_id 幂等与跨主体拒绝
-      改由 ai_run_bindings 承担：此处做只读预检（已有绑定行且主体不一致 →
-      409 request_id_subject_conflict，与旧 reservation 行为/HTTP 映射一致）；
-      绑定行的写入在 _ai_budget_lifecycle.on_accepted（携带 HP session id）。
+      改由 ai_run_bindings 承担，绑定写入两阶段化（0028，P1-2）：此处
+      **先写 pending 行**（``ensure_run_binding_pending``：subject 一致幂等 /
+      跨主体 409 request_id_subject_conflict / 其它写库失败 503
+      run_binding_unavailable fail-closed 不转发 sidecar）；session 的 attach
+      在 _ai_budget_lifecycle.on_accepted（``attach_run_binding_session``）。
     - 软闸回退（shadow / registered 下 demo）：现有 reserve_turn 行为**逐字
       保留**（owner 的 reset 回退底板）——预占/超限 429/ai_access 闸全不变。
 
@@ -10147,20 +10181,30 @@ def _ai_reserve_run_budget(user_ctx, request_id):
         mode = _spend_mode_snapshot()
         if spend_store.mode_is_hard(mode, subject_type):
             # 金额硬闸分支：turn 消费闸关闭（不写 reservations、不做 usage
-            # 平移、不查任何 turn 闸）。只做 run binding 的主体预检（只读，
-            # 不是 turn 闸）——跨主体复用同一 request_id 必须确定性拒绝
-            # （409，与旧 reservation 路径同码）。
+            # 平移、不查任何 turn 闸）。绑定两阶段化（0028，P1-2 fail-closed）：
+            # 阶段 1 在调用 HistoPilot **之前**写 pending 绑定行（subject +
+            # request_id，session NULL）——HistoPilot 返回 session 后立刻后台
+            # driveMain 的第一次 authorizeHold / usage event 也能按 request_id
+            # 解析主体，不再落入 not_ready 窗口。INSERT + 冲突回读一次承担
+            # 旧 GET 预检的跨主体拒绝（同 request_id 换主体 → 409，同码）；
+            # 写入失败 → 503 fail-closed **不转发 sidecar**（绝不放无主体
+            # 绑定的 run 去花真钱）。
             try:
-                binding = budget_store.get_run_binding(request_id)
-            except budget_store.BudgetError as exc:
+                budget_store.ensure_run_binding_pending(
+                    request_id, subject_type, subject_id,
+                    installation_id=((_HISTOPILOT_INSTALLATION or {}).get(
+                        "installation_id")))
+            except budget_store.RequestIdSubjectConflict as exc:
                 return None, _budget_error_response(exc, 409), None
-            if binding is not None and (
-                    binding["subject_type"] != subject_type
-                    or binding["subject_id"] != subject_id):
-                return None, _budget_error_response(
-                    budget_store.RequestIdSubjectConflict(
-                        "request_id 已被其他主体使用，不能复用",
-                        request_id=request_id), 409), None
+            except Exception:
+                app.logger.exception(
+                    "AI run pending 绑定写入失败（request_id=%s，fail-closed "
+                    "503，不转发 sidecar）", request_id)
+                return None, (
+                    jsonify(error="AI run 绑定暂不可用，请稍后重试",
+                            code="run_binding_unavailable"),
+                    503,
+                ), None
             return None, None, {"hard": True, "mode": mode,
                                 "subject_type": subject_type,
                                 "subject_id": subject_id}
@@ -10219,11 +10263,14 @@ def _ai_budget_lifecycle(request_id, reservation, hard_ctx=None):
       on_accepted(session_id) → consume（2xx 已接受，计 1 次；幂等）；
       on_rejected() → release（未接受不扣额度；已 consumed 拒绝释放防误退款）；
     - 硬闸（hard_ctx 非 None）：turn 闸已关闭，无 reservation 可消费——
-      on_accepted(session_id) → ``budget_store.record_run_binding``（写入
-      ai_run_bindings：request_id 幂等 + 主体绑定，供 usage/hold 解析第①步；
-      replayed=重试命中）。吞异常记 log（记账失败不打断流式响应，与旧
-      consume 同策略——绑定缺失时事件按 usage_subject_not_ready 进重试，
-      对账兜底）；on_rejected → no-op（无预占可退）。
+      on_accepted(session_id) → ``budget_store.attach_run_binding_session``
+      （阶段 2：把阶段 1 的 pending 绑定行 attach 上 HP session；无行时
+      补偿插入完整绑定）。失败不打断流式响应（与旧 consume 同策略），但
+      **不再假装「对账兜底」**：瞬时失败进内存重试队列（daemon 线程有限次
+      指数退避重试，见 _attach_run_binding_with_retry）；确定性冲突（跨主体/
+      跨 session）重试无意义，直接 warning + audit 终局。pending 行留在库内
+      （session NULL 仍可被解析第①步命中）即补偿态；on_rejected → no-op
+      （无预占可退；pending 行留给同 request_id 重试幂等命中）。
 
     consume/release 带上本请求 reserve 时的 attempt。在途 reserved 重放
     （reservation.replayed）失败不得 release；后来的 replay 会递增
@@ -10238,22 +10285,13 @@ def _ai_budget_lifecycle(request_id, reservation, hard_ctx=None):
 
     def on_accepted(session_id):
         if hard:
-            # 硬闸分支：写 run→主体权威绑定（不是消费记账）。installation_id
-            # 取 histopilot installation（未引导时 None，仅审计上下文）
-            try:
-                budget_store.record_run_binding(
-                    request_id, session_id or "",
-                    hard_ctx["subject_type"], hard_ctx["subject_id"],
-                    installation_id=((_HISTOPILOT_INSTALLATION or {}).get(
-                        "installation_id")))
-            except budget_store.BudgetError:
-                app.logger.warning(
-                    "AI run binding 记录冲突（request_id=%s，交由对账兜底）",
-                    request_id, exc_info=True)
-            except Exception:
-                app.logger.warning(
-                    "AI run binding 记录失败（request_id=%s，交由对账兜底）",
-                    request_id, exc_info=True)
+            # 硬闸分支阶段 2：attach session（不是消费记账）。installation_id
+            # 与阶段 1 同源（histopilot installation，未引导时 None，仅审计）
+            _attach_run_binding_with_retry(
+                request_id, session_id or "",
+                hard_ctx["subject_type"], hard_ctx["subject_id"],
+                installation_id=((_HISTOPILOT_INSTALLATION or {}).get(
+                    "installation_id")))
             return
         if reservation is None:
             return
@@ -10292,6 +10330,138 @@ def _ai_budget_lifecycle(request_id, reservation, hard_ctx=None):
                 exc_info=True)
 
     return on_accepted, on_rejected
+
+
+# --------------------------------------------------------------------------- #
+# 金额硬闸绑定阶段 2 attach 重试（0028，P1-2：绑定失败窗口 fail-closed 的
+# 服务端补偿——阶段 1 的 pending 行保证解析可用，attach 只补 session 维度）
+# --------------------------------------------------------------------------- #
+#: on_accepted attach 失败的内存重试队列。条目 =
+#: (request_id, session_id, subject_type, subject_id, installation_id,
+#:   attempts)。进程重启即丢：pending 行仍在库内（session NULL 可被解析
+#: 第①步命中），attach 缺失只影响迟到事件的 session 匹配，可重试补齐。
+_BINDING_ATTACH_QUEUE = queue.Queue()
+
+#: 单条目最大重试次数与指数退避封顶（秒）
+_BINDING_ATTACH_MAX_ATTEMPTS = 8
+_BINDING_ATTACH_BACKOFF_MAX_SECONDS = 30.0
+
+
+def _binding_attach_final_failure(item, reason):
+    """attach 重试终局失败：warning + 可选 audit（无敏感信息，可保留
+    request_id/主体标识；不含 session 全文/密码/prompt）。pending 行留着。"""
+    request_id, _session_id, subject_type, subject_id, _inst, _n = item
+    app.logger.warning(
+        "AI run binding attach 重试终局失败（request_id=%s subject=%s:%s "
+        "reason=%s；pending 行保留，session 维度待人工核查）",
+        request_id, subject_type, subject_id, reason)
+    try:
+        share_store.record_audit(
+            "ai_run_binding.attach_failed", actor_role="system",
+            target_type="ai_run_binding", target_id=request_id,
+            detail={"reason": reason, "subject_type": subject_type,
+                    "subject_id": subject_id})
+    except Exception:
+        app.logger.warning("AI run binding attach 失败 audit 写入失败",
+                           exc_info=True)
+
+
+def _attach_run_binding_with_retry(request_id, session_id, subject_type,
+                                    subject_id, installation_id=None):
+    """on_accepted 的阶段 2 入口：attach 绑定 session；失败按类型分流。
+
+    - 成功 → 返回（含补偿插入：pending 行丢失但 run 已开始）；
+    - ValueError（session 空，非 SSE 2xx 罕见形态）→ 无 session 可 attach，
+      pending 行保持可解析，记 warning 不重试；
+    - BudgetError（跨主体/跨 session 确定性冲突）→ 重试不会成功，直接
+      warning + audit 终局；
+    - 其它异常（写库抖动）→ warning + 推入内存重试队列（daemon 线程
+      有限次指数退避重试）。
+    """
+    try:
+        budget_store.attach_run_binding_session(
+            request_id, session_id, subject_type, subject_id,
+            installation_id=installation_id)
+    except ValueError:
+        app.logger.warning(
+            "AI run binding attach 缺少 session（request_id=%s，pending 行"
+            "保留）", request_id, exc_info=True)
+    except budget_store.BudgetError:
+        _binding_attach_final_failure(
+            (request_id, session_id, subject_type, subject_id,
+             installation_id, 0), "conflict")
+    except Exception:
+        app.logger.warning(
+            "AI run binding attach 失败（request_id=%s，已入重试队列）",
+            request_id, exc_info=True)
+        _BINDING_ATTACH_QUEUE.put(
+            (request_id, session_id, subject_type, subject_id,
+             installation_id, 0))
+
+
+def _start_binding_attach_retry_thread():
+    """postgres 后端启动绑定 attach 重试线程（对齐 _start_budget_reclaim_thread）。
+
+    - ``AI_BINDING_ATTACH_RETRY_INTERVAL_SECONDS``：基础退避秒数（缺省 2）；
+      ``0`` 或负数 = 关闭（测试隔离，与 ``AI_BUDGET_RECLAIM_INTERVAL_SECONDS``
+      同规则）；
+    - 队列条目最多 ``_BINDING_ATTACH_MAX_ATTEMPTS`` 次重试，指数退避封顶
+      ``_BINDING_ATTACH_BACKOFF_MAX_SECONDS``；终局失败走
+      ``_binding_attach_final_failure``（warning + audit）；
+    - pytest（``app.config['TESTING']``）下条目直接丢弃：异步重试会跨用例
+      写库，破坏每用例 TRUNCATE 隔离；attach 语义由 store 层测试覆盖；
+    - daemon 线程：进程退出即结束，不阻塞停机。
+    """
+    if not platform_features.budget_features_available():
+        return None
+    try:
+        interval = float(
+            os.environ.get("AI_BINDING_ATTACH_RETRY_INTERVAL_SECONDS") or 2)
+    except (TypeError, ValueError):
+        interval = 2.0
+    if interval <= 0:
+        return None
+
+    def _retry(item):
+        request_id, session_id, subject_type, subject_id, inst, attempts = item
+        try:
+            budget_store.attach_run_binding_session(
+                request_id, session_id, subject_type, subject_id,
+                installation_id=inst)
+            app.logger.info(
+                "AI run binding attach 重试成功（request_id=%s）", request_id)
+        except ValueError:
+            pass  # 空 session 条目：丢弃（同 _attach_run_binding_with_retry）
+        except budget_store.BudgetError:
+            _binding_attach_final_failure(item, "conflict")
+        except Exception:
+            if attempts + 1 >= _BINDING_ATTACH_MAX_ATTEMPTS:
+                _binding_attach_final_failure(item, "retry_exhausted")
+            else:
+                time.sleep(min(interval * (2 ** attempts),
+                               _BINDING_ATTACH_BACKOFF_MAX_SECONDS))
+                _BINDING_ATTACH_QUEUE.put(
+                    (request_id, session_id, subject_type, subject_id, inst,
+                     attempts + 1))
+
+    def _loop():
+        while True:
+            try:
+                item = _BINDING_ATTACH_QUEUE.get(timeout=interval)
+            except queue.Empty:
+                continue
+            if app.config.get("TESTING"):
+                continue  # pytest 隔离：丢弃（见 docstring）
+            try:
+                _retry(item)
+            except Exception:
+                app.logger.warning("AI run binding attach 重试线程异常",
+                                   exc_info=True)
+
+    th = threading.Thread(target=_loop, name="ai-binding-attach-retry",
+                          daemon=True)
+    th.start()
+    return th
 
 
 # --------------------------------------------------------------------------- #
@@ -10753,6 +10923,9 @@ def _start_budget_reclaim_thread():
 
 
 _BUDGET_RECLAIM_THREAD = _start_budget_reclaim_thread()
+
+#: 0028 绑定 attach 重试线程（与 reclaim 同款 daemon；env 可调/关闭）
+_BINDING_ATTACH_RETRY_THREAD = _start_binding_attach_retry_thread()
 
 
 def _start_acquisition_retention_thread():
@@ -13118,6 +13291,10 @@ def plugin_v1_usage_events():
                                           按退避重试）；
       503 pg_backend_required         —— json/dual 后端 fail-closed。
 
+    错误信封（0028 P1-2）的 ``error.details`` 附带当前 ``enforcement_mode`` +
+    ``capabilities``（与成功 2xx 顶层同值；读模式失败不附加）——冷启动客户端
+    不再把 not_ready 误判为 unknown mode=shadow 继续调 provider。
+
     成功返回 ``{ok, event_id, duplicate, status, priced}``；duplicate=true 时
     返回原行语义（status/priced 为首次入库结果，价格版本不重算）。
     """
@@ -13125,20 +13302,20 @@ def plugin_v1_usage_events():
     if err is not None:
         return err
     if (claims.get("plugin_id") or "") not in _USAGE_INGEST_PLUGIN_IDS:
-        return _plugin_error(403, "forbidden",
+        return _billing_plugin_error(403, "forbidden",
                              "仅 HistoPilot 插件安装可投递用量事件")
     if not platform_features.usage_ingest_available():
         # json/dual fail-closed（§6.1）：不降级进程内余额/计数
-        return _plugin_error(
+        return _billing_plugin_error(
             503, "pg_backend_required",
             "用量计费要求 STORAGE_BACKEND=postgres（当前 %r），fail-closed"
             % platform_features.current_backend())
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
-        return _plugin_error(400, "invalid_request", "request body 需为 JSON object")
+        return _billing_plugin_error(400, "invalid_request", "request body 需为 JSON object")
     idem = (request.headers.get("Idempotency-Key") or "").strip()
     if not idem or idem != body.get("event_id"):
-        return _plugin_error(400, "invalid_request",
+        return _billing_plugin_error(400, "invalid_request",
                              "Idempotency-Key 头必须与 body event_id 一致")
     installation_id = claims.get("sub") or ""
     try:
@@ -13148,24 +13325,24 @@ def plugin_v1_usage_events():
             max_age_days=billing_store.occurred_at_max_age_days())
     except billing_store.InvalidUsageEventError as exc:
         # details 只含字段级校验信息（字段名/规则），不含请求体内容
-        return _plugin_error(400, "invalid_request", "usage event 校验失败",
+        return _billing_plugin_error(400, "invalid_request", "usage event 校验失败",
                              details={"errors": exc.errors[:10]})
     except billing_store.UsageEventConflictError:
-        return _plugin_error(409, "usage_event_conflict",
+        return _billing_plugin_error(409, "usage_event_conflict",
                              "同 event_id/call_id 的 payload 与原记录不一致")
     except billing_store.UsageSubjectConflictError:
-        return _plugin_error(409, "usage_subject_conflict",
+        return _billing_plugin_error(409, "usage_subject_conflict",
                              "事件主体 assertion 与权威绑定不一致")
     except billing_store.UsageSubjectNotReadyError:
-        return _plugin_error(409, "usage_subject_not_ready",
+        return _billing_plugin_error(409, "usage_subject_not_ready",
                              "权威主体绑定尚未就绪，请退避后重试", retryable=True)
     except platform_features.PgFeatureUnavailable:
-        return _plugin_error(503, "pg_backend_required",
+        return _billing_plugin_error(503, "pg_backend_required",
                              "用量计费要求 STORAGE_BACKEND=postgres")
     except Exception:
         app.logger.exception("usage event ingest 失败（event_id=%s）",
                              body.get("event_id"))
-        return _plugin_error(500, "internal", "内部错误", retryable=True)
+        return _billing_plugin_error(500, "internal", "内部错误", retryable=True)
     # capabilities（批次 C §3.4）：客户端能力探测——settle 可携带完整
     # usage_event；spend_enforcement 为当前金额 enforcement 模式（hard 模式
     # 下旧 {event_id} settle body 会被明确拒绝，客户端据此切换新协议）。
@@ -13245,6 +13422,9 @@ def plugin_v1_billing_hold_authorize():
       503 spend_window_unavailable —— 窗口不可用（hard fail-closed，同上）；
       503 pg_backend_required      —— json/dual fail-closed。
 
+    错误信封（0028 P1-2）的 ``error.details`` 附带当前 ``enforcement_mode`` +
+    ``capabilities``（与成功 2xx 顶层同值；读模式失败不附加）。
+
     成功返回 ``{ok, authorized:true, hold_id, call_id, duplicate, status,
     subject_type, model, estimated_nano_cny, balance_nano_cny,
     open_holds_nano_cny, would_deny, denial_reason, enforcement_mode,
@@ -13256,57 +13436,57 @@ def plugin_v1_billing_hold_authorize():
     if err is not None:
         return err
     if (claims.get("plugin_id") or "") not in _USAGE_INGEST_PLUGIN_IDS:
-        return _plugin_error(403, "forbidden",
+        return _billing_plugin_error(403, "forbidden",
                              "仅 HistoPilot 插件安装可预授权计费 hold")
     if not platform_features.billing_features_available():
         # json/dual fail-closed（§6.1）：不降级进程内估算
-        return _plugin_error(
+        return _billing_plugin_error(
             503, "pg_backend_required",
             "billing hold 要求 STORAGE_BACKEND=postgres（当前 %r），fail-closed"
             % platform_features.current_backend())
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
-        return _plugin_error(400, "invalid_request", "request body 需为 JSON object")
+        return _billing_plugin_error(400, "invalid_request", "request body 需为 JSON object")
     try:
         result = billing_store.authorize_hold(
             body, installation_id=claims.get("sub") or "",
             plugin_id=claims.get("plugin_id") or "")
     except billing_store.InvalidHoldRequestError as exc:
         # details 只含字段级校验信息，不含请求体内容
-        return _plugin_error(400, "invalid_request", "hold 请求校验失败",
+        return _billing_plugin_error(400, "invalid_request", "hold 请求校验失败",
                              details={"errors": exc.errors[:10]})
     except billing_store.HoldConflictError:
-        return _plugin_error(409, "hold_conflict",
+        return _billing_plugin_error(409, "hold_conflict",
                              "同 call_id 的 hold 请求与原记录不一致")
     except billing_store.UsageSubjectConflictError:
-        return _plugin_error(409, "usage_subject_conflict",
+        return _billing_plugin_error(409, "usage_subject_conflict",
                              "hold 主体 assertion 与权威绑定不一致")
     except billing_store.UsageSubjectNotReadyError:
-        return _plugin_error(409, "usage_subject_not_ready",
+        return _billing_plugin_error(409, "usage_subject_not_ready",
                              "权威主体绑定尚未就绪，请退避后重试", retryable=True)
     except billing_store.HoldPricingUnavailableError:
-        return _plugin_error(503, "pricing_unavailable",
+        return _billing_plugin_error(503, "pricing_unavailable",
                              "无可用价格（hard 模式 fail-closed），价目补齐后重试",
                              retryable=True)
     except spend_store.SpendBudgetExhaustedError:
         # 429 选型理由见本端点 docstring（配额用尽族，非付费/权限语义）
-        return _plugin_error(429, "spend_budget_exhausted",
+        return _billing_plugin_error(429, "spend_budget_exhausted",
                              "金额窗口额度不足（spent+reserved+estimate > limit）")
     except spend_store.SpendPolicyMissingError:
-        return _plugin_error(503, "spend_policy_missing",
+        return _billing_plugin_error(503, "spend_policy_missing",
                              "无有效金额策略（hard 模式 fail-closed）",
                              retryable=True)
     except spend_store.SpendWindowUnavailableError:
-        return _plugin_error(503, "spend_window_unavailable",
+        return _billing_plugin_error(503, "spend_window_unavailable",
                              "金额窗口不可用（hard 模式 fail-closed）",
                              retryable=True)
     except platform_features.PgFeatureUnavailable:
-        return _plugin_error(503, "pg_backend_required",
+        return _billing_plugin_error(503, "pg_backend_required",
                              "billing hold 要求 STORAGE_BACKEND=postgres")
     except Exception:
         app.logger.exception("billing hold authorize 失败（call_id=%s）",
                              body.get("call_id"))
-        return _plugin_error(500, "internal", "内部错误", retryable=True)
+        return _billing_plugin_error(500, "internal", "内部错误", retryable=True)
     mode = result.get("enforcement_mode") or "shadow"
     return jsonify(
         ok=True,
@@ -13395,7 +13575,7 @@ def plugin_v1_billing_hold_settle(hold_id):
         return _plugin_error(409, "usage_subject_conflict",
                              "事件主体 assertion 与权威绑定不一致")
     except billing_store.UsageSubjectNotReadyError:
-        return _plugin_error(409, "usage_subject_not_ready",
+        return _billing_plugin_error(409, "usage_subject_not_ready",
                              "权威主体绑定尚未就绪，请退避后重试", retryable=True)
     except spend_store.SpendWindowUnavailableError:
         # 结算链归还 reserved 时窗口行缺失（数据异常）：可重试，整体已回滚

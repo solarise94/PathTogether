@@ -165,6 +165,10 @@ def test_schema_migrations_recorded(conn):
         # run→主体权威绑定 + ai_safety.* 安全参数 backfill，docs
         # ai-money-budget-bugfix-and-simplification-plan.md §7.3 阶段 2）。
         "0027_ai_run_bindings.sql",
+        # P1-2 追加 0028_ai_run_bindings_pending_session.sql（绑定两阶段化：
+        # histopilot_session_id 放宽为可空，NULL = pending 行——起跑前已写主体、
+        # on_accepted 后 attach session；金额硬闸绑定失败窗口 fail-closed）。
+        "0028_ai_run_bindings_pending_session.sql",
     ]
 
 
@@ -230,6 +234,42 @@ def test_migration_0027_backfills_ai_safety_keys(conn):
                 "VALUES ('req_chk', 'demo', 'dmo_x', 'sess_x')")
             conn.commit()
         conn.rollback()
+
+
+# --------------------------------------------------------------------------- #
+# 1c. 0028：ai_run_bindings.histopilot_session_id 可空（阶段 1 pending 行）
+# --------------------------------------------------------------------------- #
+def test_migration_0028_session_nullable_pending_rows(conn):
+    """0028 冒烟：histopilot_session_id is_nullable=YES；可插入 session=NULL
+    的 pending 行（阶段 1：起跑前已写主体、尚未 attach session）。
+
+    0027 语义不变的部分一并守卫：subject_type 仍仅 owner/user（demo 归
+    demo_runs，CHECK 拒绝）。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT is_nullable FROM information_schema.columns "
+            "WHERE table_name='ai_run_bindings' "
+            "AND column_name='histopilot_session_id'")
+        assert cur.fetchone()[0] == "YES"
+        # pending 行可插入（session NULL）
+        cur.execute(
+            "INSERT INTO ai_run_bindings (request_id, subject_type, subject_id)"
+            " VALUES ('req_pending_0028', 'owner', 'usr_own')")
+        conn.commit()
+        cur.execute(
+            "SELECT subject_type, subject_id, histopilot_session_id "
+            "FROM ai_run_bindings WHERE request_id='req_pending_0028'")
+        row = cur.fetchone()
+        assert row == ("owner", "usr_own", None)
+    # 0027 CHECK 保留：demo 不入本表
+    with pytest.raises(psycopg.errors.CheckViolation):
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO ai_run_bindings (request_id, subject_type, "
+                "subject_id) VALUES ('req_pending_0028b', 'demo', 'dmo_x')")
+            conn.commit()
+    conn.rollback()
 
 
 # --------------------------------------------------------------------------- #

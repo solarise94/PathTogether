@@ -1002,7 +1002,10 @@ def test_expiry_sweep_releases_reserved_and_late_usage_records_cost():
     expired = _hold_row(hold_id=hold["hold_id"])
     assert expired["status"] == "expired"
     win_after_sweep = _window(win["window_id"])
-    assert win_after_sweep["reserved_nano_cny"] == est  # 只有 hold2 的预占
+    # 与 hold2 预占同时刻复算（later=T0+1h 可能跨 peak/off_peak 时段带——
+    # 拿 T0 的 est 断言 later 的 reserved 是按墙钟碰运气，CI 已实炸）
+    assert win_after_sweep["reserved_nano_cny"] == \
+        _expected_estimate(later)  # 只有 hold2 的预占
     # 显式 release hold2 → 窗口 reserved 精确归零
     out2 = _settle(hold2["hold_id"], None, now=later)
     assert out2["status"] == "released"

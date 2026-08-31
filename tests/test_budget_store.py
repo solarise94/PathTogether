@@ -464,6 +464,78 @@ def test_run_binding_validates_subject_types():
         budget_store.record_run_binding(_req(), "", "owner", "usr_own")
 
 
+# --------------------------------------------------------------------------- #
+# 0028：两阶段绑定（阶段 1 pending / 阶段 2 attach，P1-2 fail-closed）
+# --------------------------------------------------------------------------- #
+def test_run_binding_pending_insert_idempotent_and_conflicts():
+    rid = _req()
+    row = budget_store.ensure_run_binding_pending(rid, "user", "usr_a")
+    assert row["request_id"] == rid
+    assert row["subject_type"] == "user"
+    assert row["subject_id"] == "usr_a"
+    assert row["histopilot_session_id"] is None  # pending：session 未 attach
+    assert row["replayed"] is False
+    # 同主体重试 → 幂等命中（pending 行不变，不产生第二行）
+    again = budget_store.ensure_run_binding_pending(rid, "user", "usr_a")
+    assert again["replayed"] is True
+    assert again["histopilot_session_id"] is None
+    # attach 之后再 ensure（同主体）→ 幂等命中且 **不得**把已 attach 的
+    # session 改回 NULL（网络重试不回退阶段）
+    budget_store.attach_run_binding_session(rid, "sess_p1", "user", "usr_a")
+    third = budget_store.ensure_run_binding_pending(rid, "user", "usr_a")
+    assert third["replayed"] is True
+    assert third["histopilot_session_id"] == "sess_p1"
+    # 跨主体复用 → RequestIdSubjectConflict（409 语义）
+    with pytest.raises(budget_store.RequestIdSubjectConflict):
+        budget_store.ensure_run_binding_pending(rid, "owner", "usr_a")
+    with pytest.raises(budget_store.RequestIdSubjectConflict):
+        budget_store.ensure_run_binding_pending(rid, "user", "usr_b")
+    # 参数校验：demo 不入本表 / 空主体
+    with pytest.raises(ValueError):
+        budget_store.ensure_run_binding_pending(_req(), "demo", "dmo_cap")
+    with pytest.raises(ValueError):
+        budget_store.ensure_run_binding_pending("", "user", "usr_a")
+    with pytest.raises(ValueError):
+        budget_store.ensure_run_binding_pending(_req(), "user", "")
+
+
+def test_run_binding_attach_semantics():
+    rid = _req()
+    budget_store.ensure_run_binding_pending(rid, "owner", "usr_own")
+    # NULL → session（首次 attach）
+    out = budget_store.attach_run_binding_session(
+        rid, "sess_a", "owner", "usr_own")
+    assert out["histopilot_session_id"] == "sess_a"
+    assert out["replayed"] is False
+    # 同 session 重放 → 幂等命中（replayed=True，不产生第二行）
+    replay = budget_store.attach_run_binding_session(
+        rid, "sess_a", "owner", "usr_own")
+    assert replay["replayed"] is True
+    assert budget_store.get_run_binding(rid)["histopilot_session_id"] == "sess_a"
+    # 跨 session（同 request_id 二次执行绑定别的 HP session）→ 冲突
+    with pytest.raises(budget_store.RequestIdSubjectConflict):
+        budget_store.attach_run_binding_session(
+            rid, "sess_b", "owner", "usr_own")
+    # 跨主体 attach → 冲突
+    with pytest.raises(budget_store.RequestIdSubjectConflict):
+        budget_store.attach_run_binding_session(
+            rid, "sess_a", "user", "usr_other")
+    # 无行 → 补偿插入完整绑定（pending 丢失但 run 已开始的兜底路径）
+    rid2 = _req()
+    comp = budget_store.attach_run_binding_session(
+        rid2, "sess_c", "user", "usr_u2")
+    assert comp["replayed"] is False
+    assert comp["histopilot_session_id"] == "sess_c"
+    assert budget_store.get_run_binding(rid2)["histopilot_session_id"] == "sess_c"
+    # 空 session / 空 request_id / demo → ValueError（与 record 同口径）
+    with pytest.raises(ValueError):
+        budget_store.attach_run_binding_session(_req(), "", "owner", "usr_own")
+    with pytest.raises(ValueError):
+        budget_store.attach_run_binding_session("", "sess_x", "owner", "usr_own")
+    with pytest.raises(ValueError):
+        budget_store.attach_run_binding_session(_req(), "sess_x", "demo", "dmo_x")
+
+
 def test_usage_report_shape():
     r1 = budget_store.reserve_turn(_req(), "user", "usr_a", "platform")
     budget_store.reserve_turn(_req(), "demo", "dmo_1", "platform")

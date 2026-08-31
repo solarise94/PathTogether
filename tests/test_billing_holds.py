@@ -57,6 +57,7 @@ PG = pytest.mark.skipif(BACKEND != "postgres",
 
 if BACKEND == "postgres":
     import _billing_helpers as bh  # noqa: E402
+    import budget_store  # noqa: E402
     import spend_store  # noqa: E402
     import user_store  # noqa: E402
 
@@ -635,6 +636,76 @@ def test_subject_conflict_and_not_ready():
     with pytest.raises(billing_store.UsageSubjectNotReadyError):
         _authorize(body2)
     assert _count("billing_holds") == 0
+
+
+@PG
+def test_not_ready_error_envelope_carries_enforcement_mode():
+    """0028 P1-2：not_ready 错误信封 error.details 附带当前 enforcement 模式
+    + capabilities（冷启动 HistoPilot 不再把 not_ready 误判为 unknown mode
+    =shadow 继续调 provider）。"""
+    inst = _bootstrap()
+    token = _token_for(inst)
+    bh.seed_price_books_with_history()
+    spend_store.set_enforcement_mode("all")
+    user = _user_with_account("hold-mode@x.com", grant_nano=1_000_000)
+    client = _client()
+    # 无任何权威绑定行 → 409 not_ready，details 带当前模式（all）
+    call_id, session_id, _ = _ids()
+    body = _hold_body("user", user["user_id"], session_id=session_id,
+                      call_id=call_id, user_id=user["user_id"])
+    r = _post_hold(token, body, client=client)
+    err = _assert_envelope(r, 409, "usage_subject_not_ready", retryable=True)
+    assert err["details"]["enforcement_mode"] == "all"
+    assert err["details"]["capabilities"] == {
+        "spend_enforcement": "all", "settle_with_usage_event": True}
+    # 主体冲突（确定性 409，pending 行解析出的主体与 body assertion 不一致）
+    # 同样携带模式（同一路由信封纪律）
+    other = user_store.create_user("hold-mode2@x.com", "pass123456789012")
+    call2, sess2, req2 = _ids()
+    pending = budget_store.ensure_run_binding_pending(
+        req2, "user", user["user_id"])
+    assert pending["histopilot_session_id"] is None
+    body2 = _hold_body("user", other["user_id"], session_id=sess2,
+                       request_id=req2, call_id=call2,
+                       user_id=other["user_id"])
+    r2 = _post_hold(token, body2, client=client)
+    err2 = _assert_envelope(r2, 409, "usage_subject_conflict", retryable=False)
+    assert err2["details"]["enforcement_mode"] == "all"
+
+
+@PG
+def test_pending_binding_authorize_resolves_2xx():
+    """0028 阶段 1 pending 绑定（session NULL）：匹配 request_id 的 authorize
+    直接 resolve → 2xx（不再 not_ready——HistoPilot 返回 session 后立刻
+    driveMain 的第一次 authorizeHold 不再被绑定失败窗口卡住）。"""
+    inst = _bootstrap()
+    token = _token_for(inst)
+    bh.seed_price_books_with_history()
+    user = _user_with_account("hold-pend@x.com", grant_nano=1_000_000)
+    client = _client()
+    # 阶段 1：起跑前写 pending 行（app 层 _ai_reserve_run_budget）
+    call_id, session_id, request_id = _ids()
+    pending = budget_store.ensure_run_binding_pending(
+        request_id, "user", user["user_id"])
+    assert pending["histopilot_session_id"] is None
+    body = _hold_body("user", user["user_id"], session_id=session_id,
+                      request_id=request_id, call_id=call_id,
+                      user_id=user["user_id"])
+    r = _post_hold(token, body, client=client)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    out = r.get_json()
+    assert out["ok"] is True and out["authorized"] is True
+    assert out["subject_type"] == "user"
+    # 旧语义回归对照：session 已 attach 但不匹配 → 不 resolve、继续下落，
+    # 无其他来源即 not_ready（迟到事件不能冒领别的 session）
+    budget_store.attach_run_binding_session(
+        request_id, "sess_attached_other", "user", user["user_id"])
+    call_late, sess_late, _ = _ids()
+    body_late = _hold_body("user", user["user_id"], session_id=sess_late,
+                           request_id=request_id, call_id=call_late,
+                           user_id=user["user_id"])
+    r_late = _post_hold(token, body_late, client=client)
+    _assert_envelope(r_late, 409, "usage_subject_not_ready", retryable=True)
 
 
 # --------------------------------------------------------------------------- #

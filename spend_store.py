@@ -455,6 +455,41 @@ def get_or_create_window(subject_type, subject_id, at=None):
         conn.close()
 
 
+def peek_current_window(subject_type, subject_id, at=None):
+    """只读解析当前窗口（**不建行**，批次 F：/api/demo/config 的 spend 段）。
+
+    与 :func:`get_or_create_window` 同一套「策略解析 → 边界 → 定位」逻辑，
+    但窗口行不存在时直接返回 None（公开匿名端点不得因一次配置读取就落
+    窗口行）。策略缺失同样返回 None（调用方按「不可用」呈现，不 fail-closed
+    整页——config 端点其余字段照常返回）。
+    """
+    platform_features.require_pg_backend("spend")
+    at = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
+    if subject_type not in WINDOW_SUBJECT_TYPES:
+        raise InvalidSpendRequestError(
+            "subject_type 需为 %s" % (WINDOW_SUBJECT_TYPES,),
+            subject_type=subject_type)
+    if subject_type == "demo":
+        subject_id = DEMO_GLOBAL_SUBJECT
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                policy = _resolve_policy_tx(cur, subject_type, subject_id, at)
+                if policy is None:
+                    return None
+                start, end = window_bounds(policy["period_kind"], at)
+                cur.execute(
+                    "SELECT " + _WINDOW_SEL + " FROM ai_spend_windows "
+                    "WHERE subject_type=%s AND subject_id=%s "
+                    "AND window_start=%s AND window_end=%s",
+                    (subject_type, subject_id, start, end))
+                row = cur.fetchone()
+                return _window_out(row) if row is not None else None
+    finally:
+        conn.close()
+
+
 def get_window(window_id):
     """按 window_id 读窗口；不存在返回 None。"""
     platform_features.require_pg_backend("spend")
@@ -952,11 +987,21 @@ def enforcement_mode() -> str:
 # --------------------------------------------------------------------------- #
 # §7.3 enforcement 写入口（批次 D：admin v1 owner-only 路由专用）
 # --------------------------------------------------------------------------- #
+#: 批次 F（§7.3 阶段 2）派生关系：**主体 S 的 turn 消费闸生效 ⟺ 金额闸对
+#: S 非硬**（``not mode_is_hard(mode, S)``）。单一事实源 =
+#: spend_enforcement_mode，在 app 层调用点分流（shadow → 全主体 turn 闸开；
+#: registered → 仅 demo 开；all → 全关），不引入新存储键，结构性满足
+#: §7.3「禁止双关」（同主体不会既吃金额硬闸又吃 turn 闸 = 不双重计费）。
+#: 因此 ``legacy_turn_guard_enabled`` 的语义收敛为「金额非硬主体的 turn 闸
+#: 恒开」——由模式推导，reset 两跳（all → shadow 逐级回退）时 turn 闸随
+#: 模式自动恢复，无需独立开关；本键仍无写路径（恒开），保留为防手工 SQL
+#: 误配 ``shadow + legacy_turn_guard_enabled=false``（两道闸全关）的兜底。
 def _legacy_turn_guard_enabled_tx(cur) -> bool:
     """同事务读旧 turn 闸兼容开关（缺省/非法 → True=闸开）。
 
-    当前平台**没有**任何写 ``legacy_turn_guard_enabled`` 的路径（旧 turn 闸
-    恒开，批次 F 才退役）：本读取只为 §7.3 的无保护配置校验留可扩展挂钩。
+    当前平台**没有**任何写 ``legacy_turn_guard_enabled`` 的路径（turn 闸
+    生效与否由 spend_enforcement_mode 按主体派生，见上方批次 F 注释）：
+    本读取只为 §7.3 的无保护配置校验留手工误配兜底。
     """
     cur.execute("SELECT value FROM platform_settings WHERE key=%s",
                 (LEGACY_TURN_GUARD_KEY,))

@@ -9,8 +9,10 @@
   用例显式调用本函数重建）；
 - ``seed_legacy_price_books_only``：只重放 0018（单位修复**前**的错误状态，
   供 cutover/legacy 用例构造历史区间）；
-- ``bind_reservation`` / ``bind_demo_session``：直接写权威绑定行
-  （ai_budget_reservations / demo_sessions），构造 §7.2 四步解析的前置态。
+- ``bind_reservation`` / ``bind_run_binding`` / ``bind_demo_session`` /
+  ``bind_demo_run``：直接写权威绑定行（ai_budget_reservations ①legacy 回退 /
+  ai_run_bindings ①主源（批次 F）/ demo_runs+demo_sessions ②），构造 §7.2
+  解析矩阵的前置态。
 
 仅 PG 后端可用（RUN_PG_TESTS=1；json 模式下调用方自行 skip）。
 """
@@ -207,6 +209,29 @@ def bind_reservation(request_id, session_id, subject_type, subject_id,
                     (request_id, period["id"], subject_type, subject_id,
                      credential_source, state,
                      session_id if state == "consumed" else None))
+    finally:
+        if own:
+            conn.close()
+
+
+def bind_run_binding(request_id, session_id, subject_type, subject_id,
+                     conn=None):
+    """直接插一条 ai_run_bindings（0027 金额时代 owner/user run 绑定，复现
+    app.py _ai_budget_lifecycle.on_accepted → budget_store.record_run_binding
+    的终态；批次 F 硬闸主体的解析第①步主源）。"""
+    own = conn is None
+    if own:
+        conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO ai_run_bindings "
+                "(request_id, subject_type, subject_id, histopilot_session_id) "
+                "VALUES (%s,%s,%s,%s) "
+                "ON CONFLICT (request_id) DO UPDATE SET "
+                "histopilot_session_id=EXCLUDED.histopilot_session_id",
+                (request_id, subject_type, subject_id, session_id))
+        conn.commit()
     finally:
         if own:
             conn.close()

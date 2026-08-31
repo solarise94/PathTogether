@@ -447,7 +447,10 @@ describe("pathtogether-admin plugin UI — workbench KPI + drawer (§9, 包 E)",
 					cache_miss_input_tokens: 100, charge_nano_cny: "12500000000",
 					unpriced_count: 0,
 				},
-				turn_budget: { available: true, period_id: 1 },
+				turn_budget: {
+					available: true, period_id: 1, legacy: true,
+					note: "turn 消费闸已于批次 F 退役，以下为冻结历史",
+				},
 			},
 		});
 		await ticks(4);
@@ -458,6 +461,15 @@ describe("pathtogether-admin plugin UI — workbench KPI + drawer (§9, 包 E)",
 		expect(texts).toContain("缓存命中率");
 		expect(texts).toContain("PR6 模拟软扣费口径");
 		expect(texts).toContain("unpriced 事件（本周期）");
+		// 批次 F：overview 的 turn 卡带 legacy 徽标（静态标记，读源断言）
+		const { readFileSync } = await import("node:fs");
+		const { dirname, resolve } = await import("node:path");
+		const { fileURLToPath } = await import("node:url");
+		const pluginHtml = readFileSync(
+			resolve(dirname(fileURLToPath(import.meta.url)),
+				"../../plugins/pathtogether-admin/ui/index.html"), "utf8");
+		expect(pluginHtml).toContain('id="adm-ov-turn-legacy"');
+		expect(pluginHtml).toContain("已退役 · 冻结历史");
 		// 页级状态进入 ready
 		const st = bus.els["adm-state-overview"];
 		expect(st.getAttribute("data-page-state")).toBe("ready");
@@ -480,7 +492,7 @@ describe("pathtogether-admin plugin UI — workbench KPI + drawer (§9, 包 E)",
 					user_id: "u1", display_name: "张三", login_id_masked: "z***@x.com",
 					role: "user", enabled: true, ai_access: true,
 					created_at: 1700000000, registration_method: "invite",
-					turn_used: 3, turn_limit: 50,
+					// 批次 F：turn_used/turn_limit 字段已随 turn 消费闸退役删除
 					billing: { balance_nano: "100", soft_spend_cap_nano: null, hard_spend_cap_nano: null },
 					last_ai_call_at: 1700000100,
 				}],

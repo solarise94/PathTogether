@@ -409,8 +409,9 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 		// admin:billing:read：只抓取供应商自身余额，不触碰用户数据）+ PR5
 		// 修订补的 4 个 UI parity 方法（users.startPreview / plugins.*）+
 		// 批次 D 的 4 个统一设置页方法（settings.get/update /
-		// spend.currentWindow.adjust / users.setSpendOverride）
-		expect(Object.keys(table)).toHaveLength(31);
+		// spend.currentWindow.adjust / users.setSpendOverride）+ 批次 F 的
+		// settings.runtime.update（turnBudgets.update/newPeriod 已退役删除）
+		expect(Object.keys(table)).toHaveLength(30);
 		expect(table["admin.auth.get"]).toBe("admin:overview:read");
 		expect(table["admin.overview.get"]).toBe("admin:overview:read");
 		expect(table["admin.users.list"]).toBe("admin:users:read");
@@ -421,9 +422,10 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 		expect(table["admin.invites.list"]).toBe("admin:invites:read");
 		expect(table["admin.invites.create"]).toBe("admin:invites:write");
 		expect(table["admin.invites.revoke"]).toBe("admin:invites:write");
+		// 批次 F：turn 消费额度写方法退役（服务端 410）；只读 get 保留
 		expect(table["admin.turnBudgets.get"]).toBe("admin:turn-budgets:read");
-		expect(table["admin.turnBudgets.update"]).toBe("admin:turn-budgets:write");
-		expect(table["admin.turnBudgets.newPeriod"]).toBe("admin:turn-budgets:write");
+		expect(table["admin.turnBudgets.update"]).toBeUndefined();
+		expect(table["admin.turnBudgets.newPeriod"]).toBeUndefined();
 		expect(table["admin.billing.account.get"]).toBe("admin:billing:read");
 		expect(table["admin.billing.account.updateCaps"]).toBe("admin:billing:write");
 		expect(table["admin.billing.adjust"]).toBe("admin:billing:write");
@@ -446,6 +448,8 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 		expect(table["admin.settings.update"]).toBe("admin:settings:write");
 		expect(table["admin.spend.currentWindow.adjust"]).toBe("admin:settings:write");
 		expect(table["admin.users.setSpendOverride"]).toBe("admin:users:write");
+		// 批次 F：运行时安全参数写（settings/runtime，替代退役的 turn-budgets PUT）
+		expect(table["admin.settings.runtime.update"]).toBe("admin:settings:write");
 	});
 
 	it("declares param schemas for every PR3b read method (whitelist + types)", () => {
@@ -466,6 +470,8 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			"admin.billing.providerBalance.refresh",
 			"admin.audit.list",
 			"admin.turnBudgets.get",
+			// 批次 F：运行时安全参数写 schema（五参数子集白名单）
+			"admin.settings.runtime.update",
 		]) {
 			expect(schemas[method], method).toBeTruthy();
 			// 附加属性一律拒绝（iframe 不能借桥传任意字段）
@@ -745,7 +751,9 @@ describe("AdminBridge host — PR4 acquisition read backend proxy (§9 Admin API
 describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () => {
 	const ALL_WRITE = [
 		"admin:users:write", "admin:invites:read", "admin:invites:write",
-		"admin:turn-budgets:write", "admin:billing:write",
+		// 批次 F：turn-budgets:write 已从桥上移除（服务端 410）；runtime 写
+		// 走 admin:settings:write
+		"admin:settings:write", "admin:billing:write",
 	];
 
 	function makeWriteHost(
@@ -892,37 +900,39 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		});
 	});
 
-	it("admin.turnBudgets.update PUTs whitelisted fields; newPeriod forces confirm=true", async () => {
+	it("admin.settings.runtime.update PUTs whitelisted safety fields (batch F)", async () => {
 		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
 		const { handle, posted, contentWindow } = makeWriteHost(async (url, o) => {
 			calls.push({
 				url, method: (o as { method?: string } | undefined)?.method,
 				body: JSON.parse(String((o as { body?: string }).body)),
 			});
-			return { status: 200, ok: true, body: { period_id: 2 } };
+			return { status: 200, ok: true, body: { limits: {} } };
 		});
 		handle._handleIframeLoad();
 		const nonce = nonce0(posted);
 		handle._handleWindowMessage({
 			source: contentWindow,
-			data: requestEnv(nonce, "r1", "admin.turnBudgets.update", {
-				platform_turn_limit: 500, demo_enabled: false,
+			data: requestEnv(nonce, "r1", "admin.settings.runtime.update", {
+				platform_task_max_steps: 40, demo_enabled: false,
 			}),
-		});
-		handle._handleWindowMessage({
-			source: contentWindow,
-			data: requestEnv(nonce, "r2", "admin.turnBudgets.newPeriod", {}),
 		});
 		await ticks();
 		expect(calls[0]).toEqual({
-			url: "/api/admin/v1/turn-budgets", method: "PUT",
-			body: { platform_turn_limit: 500, demo_enabled: false },
+			url: "/api/admin/v1/settings/runtime", method: "PUT",
+			body: { platform_task_max_steps: 40, demo_enabled: false },
 		});
-		// confirm 由桥层固定补 true（二次确认在插件 UI 层做，§3.3）
-		expect(calls[1]).toEqual({
-			url: "/api/admin/v1/turn-budgets/new-period", method: "POST",
-			body: { confirm: true, limits: undefined },
+		// 退役方法在桥上不存在：未知 method 稳定拒绝
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r2", "admin.turnBudgets.update", {
+				platform_turn_limit: 500,
+			}),
 		});
+		await ticks();
+		const rs = responses(posted, "r2");
+		expect(rs[0].env.ok).toBe(false);
+		expect((rs[0].env.error as { code: string }).code).toBe("unknown_method");
 	});
 
 	it("admin.billing.account.updateCaps PUTs caps with version; adjust POSTs adjustment", async () => {
@@ -979,9 +989,10 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 			["admin.invites.create", { ttl_hours: 9999 }],                        // max 720
 			["admin.invites.create", { evil: 1 }],                                // 未声明字段
 			["admin.invites.revoke", {}],                                         // 缺 invite_id
-			["admin.turnBudgets.update", { platform_turn_limit: 1.5 }],          // integer
-			["admin.turnBudgets.update", { platform_turn_limit: 0 }],            // min 1
-			["admin.turnBudgets.newPeriod", { limits: [] }],                      // object
+			// 批次 F：runtime 安全参数校验（integer / min 1 / 未声明字段）
+			["admin.settings.runtime.update", { platform_task_max_steps: 1.5 }], // integer
+			["admin.settings.runtime.update", { platform_task_max_steps: 0 }],   // min 1
+			["admin.settings.runtime.update", { platform_turn_limit: 5 }],       // 未声明字段
 			["admin.billing.account.updateCaps", { user_id: "u1", version: 1 }], // 缺 caps 键
 			// §5 v0.3（P2）：金额只接受十进制字符串——JSON number / 负 cap /
 			// 小数 / 超 19 位 / 零值形态（nonZero）一律桥层拒绝
@@ -1408,9 +1419,10 @@ describe("AdminBridge host — 批次 D：统一设置页方法（§6.1/§6.5）
 		const result = rs[0].env.result as { applied: unknown[]; failed: null };
 		expect(result.failed).toBeNull();
 		expect(result.applied).toHaveLength(4);
-		// runtime 参数聚合为一个 turn-budgets PUT（demo_enabled 一并携带）
+		// 批次 F：runtime 参数聚合为一个 settings/runtime PUT（原 turn-budgets
+		// PUT 已 410 turn_budgets_retired；demo_enabled 一并携带）
 		expect(calls[3]).toEqual({
-			url: "/api/admin/v1/turn-budgets", method: "PUT",
+			url: "/api/admin/v1/settings/runtime", method: "PUT",
 			body: {
 				platform_task_max_steps: 60, demo_task_max_steps: 20,
 				own_task_max_steps_limit: 40, demo_max_concurrency: 2,

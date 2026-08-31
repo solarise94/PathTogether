@@ -215,10 +215,12 @@ def test_json_overview_segmented_availability():
     # 用户段任何后端都真实可用
     assert body["users"]["total"] >= 2
     assert body["users"]["active"] >= 2
-    # billing / turn_budget 分段标记（不整体 503，也不伪造数据）
+    # billing / turn_budget 分段标记（不整体 503，也不伪造数据）；
+    # turn_budget 段另带 legacy=True（批次 F：turn 消费闸退役，冻结历史）
     for seg in ("billing", "turn_budget"):
         assert body[seg]["available"] is False
         assert body[seg]["code"] == "pg_backend_required"
+    assert body["turn_budget"]["legacy"] is True
     assert scan_sensitive(body) == []
 
 
@@ -233,7 +235,8 @@ def test_json_users_list_null_billing_fields():
     assert len(body["items"]) == 3
     for item in body["items"]:
         assert item["billing"] is None
-        assert item["turn_used"] is None and item["turn_limit"] is None
+        # 批次 F：turn_used/turn_limit 字段已随 turn 消费闸退役删除
+        assert "turn_used" not in item and "turn_limit" not in item
         assert item["last_ai_call_at"] is None
         assert item["campaign"] is None and item["source"] is None
 
@@ -610,7 +613,8 @@ def test_users_row_joins_turn_billing_last_call(monkeypatch):
     assert item["login_id_masked"] == "u***@x.com"
     assert item["role"] == "user" and item["enabled"] is True
     assert item["registration_method"] == "manual"  # owner 直接创建
-    assert item["turn_used"] == 3 and item["turn_limit"] is not None
+    # 批次 F：turn_used/turn_limit 已删（用量断言移至 turn-budgets 只读端点）
+    assert "turn_used" not in item and "turn_limit" not in item
     assert item["billing"]["balance_nano"] == "3000000000"
     assert item["billing"]["soft_spend_cap_nano"] is None
     assert item["last_ai_call_at"] is not None
@@ -628,11 +632,81 @@ def test_turn_budgets_readonly_shape():
     r = _login(_client(), owner).get("/api/admin/v1/turn-budgets")
     assert r.status_code == 200
     body = r.get_json()
+    # 批次 F：只读 + legacy 标记（冻结历史）
+    assert body["legacy"] is True
+    assert "退役" in body["note"]
     assert body["period"]["id"] is not None
     assert "user_turn_limit" in body["limits"]
     for key in ("platform", "demo", "owner", "user_pool", "per_user", "own"):
         assert key in body["usage"]
     assert scan_sensitive(body) == []
+
+
+@PG
+def test_turn_budgets_write_endpoints_retired_410():
+    """批次 F：PUT / new-period → 410 turn_budgets_retired + audit 尝试。"""
+    owner, _u = _setup_users()
+    c = _login(_client(), owner)
+    r = c.put("/api/admin/v1/turn-budgets", json={"platform_turn_limit": 99})
+    assert r.status_code == 410
+    assert r.get_json()["error"]["code"] == "turn_budgets_retired"
+    assert "金额预算" in r.get_json()["error"]["message"]
+    r2 = c.post("/api/admin/v1/turn-budgets/new-period", json={"confirm": True})
+    assert r2.status_code == 410
+    assert r2.get_json()["error"]["code"] == "turn_budgets_retired"
+    # 退役尝试落 audit
+    actions = [e.get("action") for e in
+               app_mod.share_store.list_audit(limit=20)]
+    assert "turn_budgets.retired_write" in actions
+    # 周期行不受影响（写入口没了，冻结历史不动）
+    assert budget_store.get_current_period()["platform_turn_limit"] == 30
+
+
+@PG
+def test_settings_runtime_endpoint_reads_and_writes_ai_safety():
+    """批次 F：PUT /api/admin/v1/settings/runtime（五安全参数子集）。
+
+    - GET settings 的 runtime 段改读 settings_store（ai_safety.*）；
+    - 部分更新合法、未知/越界字段 400；
+    - 写入 + audit（action=ai_safety.settings_update）同事务；
+    - demo_enabled 生效（_demo_public_mode 换源后的读路径）。
+    """
+    import settings_store
+    owner, _u = _setup_users()
+    c = _login(_client(), owner)
+    # 初始：GET runtime 段读新源（缺省回落常量）
+    body = c.get("/api/admin/v1/settings").get_json()
+    assert body["runtime"]["available"] is True
+    assert body["runtime"]["limits"]["demo_enabled"] is False
+    assert body["runtime"]["limits"]["demo_task_max_steps"] == 20
+    assert body["runtime"]["limits"]["demo_max_concurrency"] == 2
+    # 部分更新（允许子集）
+    r = c.put("/api/admin/v1/settings/runtime", json={
+        "demo_task_max_steps": 25, "demo_enabled": True})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    limits = r.get_json()["limits"]
+    assert limits["demo_task_max_steps"] == 25
+    assert limits["demo_enabled"] is True
+    assert limits["demo_max_concurrency"] == 2  # 未提交项沿用
+    # 读取换源生效
+    assert settings_store.get_ai_safety_settings()["demo_task_max_steps"] == 25
+    assert app_mod._demo_task_max_steps() == 25
+    assert app_mod._demo_public_mode() is True
+    # 校验：未知字段 / 非正整数 / 非布尔 / 空对象
+    assert c.put("/api/admin/v1/settings/runtime",
+                 json={"no_such": 1}).status_code == 400
+    assert c.put("/api/admin/v1/settings/runtime",
+                 json={"demo_max_concurrency": 0}).status_code == 400
+    assert c.put("/api/admin/v1/settings/runtime",
+                 json={"demo_enabled": "yes"}).status_code == 400
+    assert c.put("/api/admin/v1/settings/runtime",
+                 json={}).status_code == 400
+    assert c.put("/api/admin/v1/settings/runtime",
+                 json={"demo_max_concurrency": 1_000_001}).status_code == 400
+    # audit 同事务落库
+    actions = [e.get("action") for e in
+               app_mod.share_store.list_audit(limit=20)]
+    assert "ai_safety.settings_update" in actions
 
 
 # --------------------------------------------------------------------------- #

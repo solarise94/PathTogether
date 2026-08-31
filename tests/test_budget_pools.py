@@ -16,7 +16,13 @@
   - 邀请模板 ai_access：受邀用户默认 False，owner 显式授予后放行
     （app 层 _ai_reserve_run_budget 403 ai_access_required）；
   - owner PUT 校验：周期口径子池（user_pool+owner_reserve）之和不可超过
-    总池；demo_turn_limit 为每日口径不参与该约束。
+    总池；demo_turn_limit 为每日口径不参与该约束（批次 F 起 HTTP PUT 已
+    退役 410，校验语义由 budget_store._validate 系与 store 直连用例锁定）。
+
+批次 F（§7.3 阶段 2）：池隔离属 turn 消费闸——本文件锁定**软闸回退路径**
+（spend_enforcement_mode=shadow，测试缺省即 shadow；直连 budget_store
+原语，不经 app 层硬闸分流）下闸仍生效。金额硬闸主体的调用点分流见
+test_ai_budget_wiring.test_hard_mode_run_skips_reservations_and_writes_binding。
 
 仅 RUN_PG_TESTS=1 时真跑（conftest 已起 pgserver；每用例 TRUNCATE 重置周期）。
 """
@@ -311,9 +317,11 @@ def test_ai_access_gate_blocks_and_grants(monkeypatch):
         app_mod, "_resolve_ai_credentials",
         lambda ctx: ("platform", {"base_url": "http://127.0.0.1:9/v1",
                                   "api_key": "k", "model": "m"}))
+    # 批次 F：返回值扩为 (reservation, error, hard_ctx) 三元组（测试缺省
+    # shadow 模式 → 软闸路径，resv 形态不变）
     with app_mod.app.test_request_context():
         rid = _req()
-        resv, err = app_mod._ai_reserve_run_budget(
+        resv, err, _hard = app_mod._ai_reserve_run_budget(
             {"role": "user", "user_id": denied_user["user_id"]}, rid)
         assert resv is None
         assert err is not None and err[1] == 403
@@ -322,16 +330,16 @@ def test_ai_access_gate_blocks_and_grants(monkeypatch):
     # owner 授予后放行（重新预占新 request_id）
     granted = user_store_pg.set_user_ai_access(denied_user["user_id"], True)
     assert granted["ai_access"] is True
-    resv2, err2 = app_mod._ai_reserve_run_budget(
+    resv2, err2, _h2 = app_mod._ai_reserve_run_budget(
         {"role": "user", "user_id": denied_user["user_id"]}, _req())
     assert err2 is None and resv2["state"] == "reserved"
     # 授予前 ai_access=true 的受邀用户不受影响
-    resv3, err3 = app_mod._ai_reserve_run_budget(
+    resv3, err3, _h3 = app_mod._ai_reserve_run_budget(
         {"role": "user", "user_id": ok_user["user_id"]}, _req())
     assert err3 is None and resv3["state"] == "reserved"
     # owner 不经过 ai_access 闸
     owner = _mk_owner()
-    resv4, err4 = app_mod._ai_reserve_run_budget(
+    resv4, err4, _h4 = app_mod._ai_reserve_run_budget(
         {"role": "owner", "user_id": owner["user_id"]}, _req())
     assert err4 is None and resv4["state"] == "reserved"
 
@@ -350,7 +358,7 @@ def test_ai_access_gate_read_error_fails_closed(monkeypatch):
 
     monkeypatch.setattr(user_store, "get_user", _boom)
     with app_mod.app.test_request_context():
-        resv, err = app_mod._ai_reserve_run_budget(
+        resv, err, _hard = app_mod._ai_reserve_run_budget(
             {"role": "user", "user_id": u["user_id"]}, _req())
         assert resv is None
         assert err is not None and err[1] == 503
@@ -385,8 +393,10 @@ def test_ai_access_admin_api(monkeypatch):
 
 
 def test_budget_put_validates_pool_sum():
-    """owner PUT：周期口径子池（user_pool+owner_reserve）之和不可超过
-    platform；demo_turn_limit 为每日滚动 24h 口径，不参与该约束。"""
+    """批次 F：HTTP PUT 已退役（410 turn_budgets_retired）；软闸回退路径的
+    池拆分校验由 store 原语锁定——周期口径子池（user_pool+owner_reserve）
+    之和不可超过 platform；demo_turn_limit 为每日滚动 24h 口径，不参与该
+    约束。HTTP 退役行为见 test_ai_budget_wiring。"""
     from _pt_helpers import csrf_client
     owner = _mk_owner()
     app_mod.app.config["TESTING"] = True
@@ -396,23 +406,27 @@ def test_budget_put_validates_pool_sum():
         s.update({"auth_user": "o", "user_id": owner["user_id"],
                   "role": "owner",
                   "auth_version": owner.get("auth_version", 1)})
-    r = client.put("/api/admin/settings/ai-budget", json={
+    # 退役端点：410 + 稳定 code（owner 仍先过鉴权）
+    retired = client.put("/api/admin/settings/ai-budget", json={
         "owner_reserved_turn_limit": 25, "user_pool_turn_limit": 15})
-    assert r.status_code == 400
-    assert "不可超过" in r.get_json()["error"]
-    # demo 每日口径与周期总量不再可比：demo_turn_limit > platform 允许保存
-    r_demo = client.put("/api/admin/settings/ai-budget", json={
+    assert retired.status_code == 410
+    assert retired.get_json().get("code") == "turn_budgets_retired"
+    # store 直连：子池之和越界拒绝（update_period_limits → _validate_limits
+    # 之上的关系校验在 app 层 _validate_budget_settings，此处锁 store 级口径）
+    with pytest.raises(ValueError):
+        budget_store.update_period_limits({"platform_turn_limit": -1})
+    p = budget_store.update_period_limits({
+        "owner_reserved_turn_limit": 12, "user_pool_turn_limit": 13,
         "demo_turn_limit": 40})
-    assert r_demo.status_code == 200, r_demo.get_data(as_text=True)
-    assert r_demo.get_json()["limits"]["demo_turn_limit"] == 40
-    r2 = client.put("/api/admin/settings/ai-budget", json={
-        "owner_reserved_turn_limit": 12, "user_pool_turn_limit": 13})
-    assert r2.status_code == 200, r2.get_data(as_text=True)
-    limits = r2.get_json()["limits"]
-    assert limits["owner_reserved_turn_limit"] == 12
-    assert limits["user_pool_turn_limit"] == 13
-    # 未重提交的 demo_turn_limit 沿用现值（40），不参与周期加和判定
-    assert limits["demo_turn_limit"] == 40
+    assert p["owner_reserved_turn_limit"] == 12
+    assert p["user_pool_turn_limit"] == 13
+    # demo 每日口径与周期总量不再可比：40 > platform 30 允许保存
+    assert p["demo_turn_limit"] == 40
+    # app 层关系校验（软闸回退路径的调用点校验，仍可用）
+    validated, err = app_mod._validate_budget_settings(
+        {"owner_reserved_turn_limit": 25, "user_pool_turn_limit": 15},
+        {k: p.get(k) for k in app_mod._BUDGET_SETTINGS_FIELDS})
+    assert validated is None and err and "不可超过" in err
 
 
 def test_concurrent_user_pool_exact_limit():

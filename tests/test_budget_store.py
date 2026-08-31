@@ -12,7 +12,8 @@ period id 每用例从 1 起）。缺 pgserver/psycopg 时整模块 skip。
   - demo 每日子额度（缺省 50，滚动 24h）与平台总量 30 的组合超限场景；
   - own 凭据不扣平台总量但落可观测用量；
   - consume / release 的状态机与幂等、consumed 拒绝释放；
-  - reclaim_expired 只按时间回收并回退 usage；
+  - 批次 F：record_run_binding 幂等 / 跨主体与跨 session 冲突 / demo 拒绝
+    （金额时代 run→主体绑定；reclaim_expired 原语已随确认式对账删除）；
   - update_period_limits 只改行不清用量、调低后新请求立即被拒；
   - reset_period 关旧开新、旧周期行与 usage 保留、新周期用量归零；
   - usage_report 形状（总量 / 构成 / 每 user 明细）。
@@ -367,20 +368,6 @@ def test_release_refunds_usage_and_rejects_consumed():
     assert budget_store.usage_report()["platform"]["total"] == 1
 
 
-def test_reclaim_expired_only_by_time():
-    rid = _req()
-    budget_store.reserve_turn(rid, "demo", "dmo_1", "platform", ttl_seconds=60)
-    # 未过期：不回收
-    assert budget_store.reclaim_expired() == []
-    # 时间前进 120 秒后回收（本函数只按时间回收，对账顺延语义在上层）
-    reclaimed = budget_store.reclaim_expired(time.time() + 120)
-    assert [r["request_id"] for r in reclaimed] == [rid]
-    assert reclaimed[0]["state"] == "released"
-    assert budget_store.usage_report()["platform"]["total"] == 0  # usage 回退
-    with pytest.raises(ValueError):
-        budget_store.consume(rid, "hp_sess")  # released 不可消费
-
-
 # --------------------------------------------------------------------------- #
 # 限制更新 / 周期重置
 # --------------------------------------------------------------------------- #
@@ -438,6 +425,45 @@ def test_reset_period_closes_old_keeps_history_zeroes_usage(pg_conn):
 # --------------------------------------------------------------------------- #
 # usage_report 形状
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# 批次 F：run→主体绑定（ai_run_bindings）
+# --------------------------------------------------------------------------- #
+def test_run_binding_insert_idempotent_and_conflicts():
+    rid = _req()
+    row = budget_store.record_run_binding(rid, "sess_hp_1", "owner", "usr_own")
+    assert row["request_id"] == rid
+    assert row["subject_type"] == "owner"
+    assert row["subject_id"] == "usr_own"
+    assert row["histopilot_session_id"] == "sess_hp_1"
+    assert row["replayed"] is False
+    # 同主体同 session 重试 → 幂等命中（replayed=True，不产生第二行）
+    again = budget_store.record_run_binding(rid, "sess_hp_1", "owner", "usr_own")
+    assert again["replayed"] is True
+    assert budget_store.get_run_binding(rid)["request_id"] == rid
+    # 跨主体复用 → 409 语义冲突（RequestIdSubjectConflict）
+    with pytest.raises(budget_store.RequestIdSubjectConflict):
+        budget_store.record_run_binding(rid, "sess_hp_1", "user", "usr_other")
+    with pytest.raises(budget_store.RequestIdSubjectConflict):
+        budget_store.record_run_binding(rid, "sess_hp_1", "owner", "usr_own2")
+    # 同主体换 session（同 request_id 二次执行绑定别的 HP session）→ 冲突
+    with pytest.raises(budget_store.RequestIdSubjectConflict):
+        budget_store.record_run_binding(rid, "sess_hp_2", "owner", "usr_own")
+    # 不存在 → None
+    assert budget_store.get_run_binding(_req()) is None
+
+
+def test_run_binding_validates_subject_types():
+    # demo 不入本表（绑定归 demo_runs，0026）
+    with pytest.raises(ValueError):
+        budget_store.record_run_binding(_req(), "sess_x", "demo", "dmo_cap")
+    with pytest.raises(ValueError):
+        budget_store.record_run_binding(_req(), "sess_x", "guest", "g1")
+    with pytest.raises(ValueError):
+        budget_store.record_run_binding("", "sess_x", "owner", "usr_own")
+    with pytest.raises(ValueError):
+        budget_store.record_run_binding(_req(), "", "owner", "usr_own")
+
+
 def test_usage_report_shape():
     r1 = budget_store.reserve_turn(_req(), "user", "usr_a", "platform")
     budget_store.reserve_turn(_req(), "demo", "dmo_1", "platform")

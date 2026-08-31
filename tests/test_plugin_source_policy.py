@@ -77,7 +77,8 @@ def test_sample_manifest_validates_and_policy_pin_matches():
     admin = json.loads(admin_manifest.read_text(encoding="utf-8"))
     assert M.validate_manifest(admin) == []
     assert admin["ui"]["slots"] == ["admin.workspace"]
-    assert len(admin["adminPermissions"]) == len(M.MANIFEST_ADMIN_PERMISSIONS)
+    # 批次 F：manifest 移除 admin:turn-budgets:write（词汇表兼容保留）
+    assert len(admin["adminPermissions"]) == len(M.MANIFEST_ADMIN_PERMISSIONS) - 1
     # sample-tma-score 的 provides 声明须通过校验器（能力注册表登记前置）
     tma = json.loads(TMA_MANIFEST.read_text(encoding="utf-8"))
     assert M.validate_manifest(tma) == []

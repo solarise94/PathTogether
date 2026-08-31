@@ -213,3 +213,140 @@ def set_registration_mode(mode, updated_by=None) -> str:
             "invite_only（收到 %r）" % (mode,))
     set_setting(REGISTRATION_MODE_KEY, str(mode), updated_by=updated_by)
     return str(mode)
+
+
+# --------------------------------------------------------------------------- #
+# ai_safety.*：运行时安全参数（批次 F，docs §7.3 阶段 2）
+#
+# demo_enabled / demo_task_max_steps / platform_task_max_steps /
+# own_task_max_steps_limit / demo_max_concurrency 从 ai_budget_periods 列迁居
+# platform_settings（0027 backfill 已搬当前周期值）。缺省回落 budget_store
+# DEFAULT_* 常量（fail-closed 风格：非法/缺失值不放大权限——demo_enabled
+# 回落 False、步数回落保守值）。
+# --------------------------------------------------------------------------- #
+#: 安全参数 → platform_settings 键（值均为 JSONB 标量）
+AI_SAFETY_KEYS = {
+    "demo_enabled": "ai_safety.demo_enabled",
+    "demo_task_max_steps": "ai_safety.demo_task_max_steps",
+    "platform_task_max_steps": "ai_safety.platform_task_max_steps",
+    "own_task_max_steps_limit": "ai_safety.own_task_max_steps_limit",
+    "demo_max_concurrency": "ai_safety.demo_max_concurrency",
+}
+
+#: set_ai_safety_settings 的同事务 audit action（参照 spend_store
+#: ENFORCEMENT_MODE_AUDIT_ACTION 模式）
+AI_SAFETY_AUDIT_ACTION = "ai_safety.settings_update"
+
+
+def _ai_safety_defaults() -> dict:
+    """缺省值（与 budget_store.DEFAULT_* 常量同源；demo 关闭、步数保守）。"""
+    import budget_store
+    return {
+        "demo_enabled": budget_store.DEFAULT_DEMO_ENABLED,
+        "demo_task_max_steps": budget_store.DEFAULT_DEMO_TASK_MAX_STEPS,
+        "platform_task_max_steps":
+            budget_store.DEFAULT_PLATFORM_TASK_MAX_STEPS,
+        "own_task_max_steps_limit":
+            budget_store.DEFAULT_OWN_TASK_MAX_STEPS_LIMIT,
+        "demo_max_concurrency": budget_store.DEFAULT_DEMO_MAX_CONCURRENCY,
+    }
+
+
+def _read_ai_safety_tx(cur):
+    """同事务读五键（缺省/非法值回落默认，get_registration_mode 同款风格）。"""
+    out = _ai_safety_defaults()
+    cur.execute(
+        "SELECT key, value FROM platform_settings WHERE key = ANY(%s)",
+        (sorted(AI_SAFETY_KEYS.values()),))
+    by_key = {row["key"]: row["value"] for row in cur.fetchall()}
+    for field, key in AI_SAFETY_KEYS.items():
+        if key not in by_key:
+            continue
+        raw = by_key[key]
+        if field == "demo_enabled":
+            if isinstance(raw, bool):
+                out[field] = raw
+            else:
+                _log.warning("platform_settings.%s 存量值非法（%r），按默认"
+                             "（False）处理", key, raw)
+            continue
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            _log.warning("platform_settings.%s 存量值非法（%r），按默认处理",
+                         key, raw)
+            continue
+        if raw < 0:
+            _log.warning("platform_settings.%s 存量值为负（%r），按默认处理",
+                         key, raw)
+            continue
+        out[field] = int(raw)
+    return out
+
+
+def get_ai_safety_settings() -> dict:
+    """读全部 ai_safety.* 安全参数（单事务五键）。
+
+    - PG：逐键回落默认（缺失/类型非法/负值 → :data:`_ai_safety_defaults`，
+      fail-closed：不放大权限）；
+    - json/dual：直接返回默认值（platform_settings 不可用，上层按
+      ``settings_writable()`` fail-closed）。
+    """
+    if not settings_writable():
+        return _ai_safety_defaults()
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                return _read_ai_safety_tx(cur)
+    finally:
+        conn.close()
+
+
+def set_ai_safety_settings(validated, actor_user_id=None, updated_by=None):
+    """写 ai_safety.* 安全参数（UPSERT + 同事务 audit，批次 F）。
+
+    ``validated`` 为**已通过 app 层校验**的字段子集 dict（键必须在
+    :data:`AI_SAFETY_KEYS` 内；允许部分更新——与 settings.update 逐项提交
+    模式对齐）。写入与审计（action=``ai_safety.settings_update``，detail 只
+    含字段名与前后值等非敏感标量）**同一事务**，任一失败整体回滚（参照
+    spend_store.set_enforcement_mode；CAS 省略——单一 owner 写入口，无并发
+    覆盖面）。返回写入后的全量五键快照。
+    """
+    if not settings_writable():
+        platform_features.require_pg_backend("platform_settings")
+    if not isinstance(validated, dict) or not validated:
+        raise ValueError("validated 需为非空 dict（五安全参数的子集）")
+    unknown = set(validated) - set(AI_SAFETY_KEYS)
+    if unknown:
+        raise ValueError("未知安全参数字段：%s（允许 %s）"
+                         % (sorted(unknown), sorted(AI_SAFETY_KEYS)))
+    import psycopg.types.json as _pgjson
+    import share_store_pg
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                current = _read_ai_safety_tx(cur)
+                for field, value in validated.items():
+                    cur.execute(
+                        "INSERT INTO platform_settings "
+                        "(key, value, updated_at, updated_by) "
+                        "VALUES (%s, %s, now(), %s) "
+                        "ON CONFLICT (key) DO UPDATE SET "
+                        "value=EXCLUDED.value, updated_at=now(), "
+                        "updated_by=EXCLUDED.updated_by",
+                        (AI_SAFETY_KEYS[field], _pgjson.Jsonb(value),
+                         updated_by))
+                after = _read_ai_safety_tx(cur)
+                share_store_pg.record_audit_tx(
+                    cur, AI_SAFETY_AUDIT_ACTION,
+                    actor_user_id=actor_user_id, actor_role="owner",
+                    target_type="platform_settings",
+                    target_id="ai_safety",
+                    detail={
+                        "fields": sorted(validated),
+                        "previous": {k: current[k] for k in validated},
+                        "updated": {k: after[k] for k in validated},
+                    })
+                return after
+    finally:
+        conn.close()

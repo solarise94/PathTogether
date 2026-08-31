@@ -602,7 +602,12 @@ def test_admin_manifest_v1_1_validates():
     data = json.loads(ADMIN_MANIFEST.read_text(encoding="utf-8"))
     assert M.validate_manifest(data) == []
     assert M.check_manifest_schema_supported(data["manifestSchemaVersion"]) is True
-    assert sorted(data["adminPermissions"]) == sorted(M.MANIFEST_ADMIN_PERMISSIONS)
+    # 批次 F：manifest 移除 admin:turn-budgets:write（桥方法与服务端写端点
+    # 均已退役）；词汇表仍保留该串（存量 0.2.x manifest 的兼容词表），故
+    # 断言改为「子集且不含退役项」
+    assert set(data["adminPermissions"]) <= set(M.MANIFEST_ADMIN_PERMISSIONS)
+    assert "admin:turn-budgets:write" not in data["adminPermissions"]
+    assert "admin:turn-budgets:read" in data["adminPermissions"]
 
 
 def test_admin_permissions_enum_and_type_enforced():
@@ -889,7 +894,7 @@ def test_admin_manifest_plugin_version_bumped_with_hashes():
     全部可服务 UI 文件（manifest 的入口/资源不得游离声明之外）。批次 D 起
     manifest 申请 admin:settings:read/write（统一设置页，§6.5）。"""
     data = json.loads(ADMIN_MANIFEST.read_text(encoding="utf-8"))
-    assert data["pluginVersion"] == "0.2.0"
+    assert data["pluginVersion"] == "0.3.0"  # 批次 F：turn 写面退役
     assert "admin:settings:read" in data["adminPermissions"]
     assert "admin:settings:write" in data["adminPermissions"]
     hashes = data["ui"]["fileHashes"]

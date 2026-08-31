@@ -12,6 +12,9 @@ json 模式（默认）：
   - owner 预算 API json fail-closed 503 + CSRF 回归。
 
 PG 模式（RUN_PG_TESTS=1）追加：
+  - 批次 F：mode=all 下官方 run 跳过 reserve_turn（零 reservations）+
+    ai_run_bindings 绑定/跨主体 409；429 消费断言显式 seed shadow（软闸
+    回退语义）；owner 预算 API 写端点 410 turn_budgets_retired；
   - 同 request_id 重试不双扣（reserve 幂等 + consume 幂等）；
   - user 第 11 次平台 AI 被拒（429 user_budget_exhausted）；
   - 平台总量耗尽后 owner/user 均拒（429 platform_ai_budget_exhausted）；
@@ -429,10 +432,13 @@ def test_budget_api_json_backend_fail_closed():
     r = c.get("/api/admin/settings/ai-budget")
     assert r.status_code == 503
     assert r.get_json().get("code") == "pg_backend_required"
+    # 批次 F：写端点退役（410 turn_budgets_retired）——退役判定先于后端
     r2 = c.put("/api/admin/settings/ai-budget", json={"platform_turn_limit": 5})
-    assert r2.status_code == 503
+    assert r2.status_code == 410
+    assert r2.get_json().get("code") == "turn_budgets_retired"
     r3 = c.post("/api/admin/settings/ai-budget/reset", json={"confirm": True})
-    assert r3.status_code == 503
+    assert r3.status_code == 410
+    assert r3.get_json().get("code") == "turn_budgets_retired"
     # user 一律 403
     u = _make_user("user")
     cu = _client()
@@ -441,19 +447,22 @@ def test_budget_api_json_backend_fail_closed():
 
 
 @pg_only
-def test_budget_api_owner_get_put_reset():
+def test_budget_api_owner_get_legacy_and_writes_retired():
+    """批次 F：GET 保留（冻结历史 + legacy 标记）；PUT/reset 410 + audit 尝试。"""
     _setup_platform()
     o = _make_user("owner")
     u = _make_user("user")
-    # 预造用量：user 1 次平台 + 1 次 own
+    # 预造用量：user 1 次平台 + 1 次 own（软闸路径直连 store）
     budget_store.reserve_turn(_rid(), "user", u["user_id"], "platform")
     budget_store.reserve_turn(_rid(), "user", u["user_id"], "own")
     c = _client()
     _login(c, "owner", o["user_id"])
-    # GET：用量 / 限制 / 构成 / 每用户
+    # GET：用量 / 限制 / 构成 / 每用户 + legacy 标记
     r = c.get("/api/admin/settings/ai-budget")
     assert r.status_code == 200
     j = r.get_json()
+    assert j["legacy"] is True
+    assert "退役" in j["note"]
     assert j["usage"]["platform"]["total"] == 1
     assert j["usage"]["platform"]["limit"] == 30
     assert j["usage"]["own"]["total"] == 1
@@ -465,71 +474,40 @@ def test_budget_api_owner_get_put_reset():
     assert j["demo_runs"]["total"] == 0
     assert j["demo_runs"]["active"] == 0
     assert "demo_sessions" not in j
-    # PUT：改限制不清用量；负值/未知字段拒绝
-    r2 = c.put("/api/admin/settings/ai-budget", json={
-        "platform_turn_limit": 50, "user_turn_limit": 12,
-        "platform_task_max_steps": 25, "own_task_max_steps_limit": 400})
-    assert r2.status_code == 200, r2.get_data(as_text=True)
-    assert r2.get_json()["limits"]["platform_turn_limit"] == 50
-    assert budget_store.usage_report()["platform"]["total"] == 1  # 用量保留
-    assert budget_store.usage_report()["platform"]["limit"] == 50
-    # demo_turn_limit 为每日滚动 24h 口径（0014 起），与周期总量不再可比：
-    # demo（60）> platform（50）允许保存（此前 400）
-    assert c.put("/api/admin/settings/ai-budget",
-                 json={"demo_turn_limit": 60}).status_code == 200
-    # 周期口径加和约束仍在：user_pool + owner_reserve > platform 拒绝
-    assert c.put("/api/admin/settings/ai-budget",
-                 json={"owner_reserved_turn_limit": 40,
-                       "user_pool_turn_limit": 20}).status_code == 400
-    assert c.put("/api/admin/settings/ai-budget",
-                 json={"user_turn_limit": -1}).status_code == 400
-    assert c.put("/api/admin/settings/ai-budget",
-                 json={"no_such": 1}).status_code == 400
-    assert c.put("/api/admin/settings/ai-budget", json={}).status_code == 400
-    # reset：缺二次确认 400；confirm=true 开新周期用量归零、audit 落库
-    assert c.post("/api/admin/settings/ai-budget/reset",
-                  json={}).status_code == 400
-    r3 = c.post("/api/admin/settings/ai-budget/reset", json={"confirm": True})
-    assert r3.status_code == 200
-    assert r3.get_json()["demo_runs_reset"] == 0
-    report = budget_store.usage_report()
-    assert report["platform"]["total"] == 0
-    assert report["platform"]["limit"] == 50  # 限制沿用
+    # PUT/reset：退役（410 turn_budgets_retired），并 audit 这次尝试
+    for bad in (c.put("/api/admin/settings/ai-budget",
+                      json={"platform_turn_limit": 50}),
+                c.post("/api/admin/settings/ai-budget/reset",
+                       json={"confirm": True})):
+        assert bad.status_code == 410
+        assert bad.get_json().get("code") == "turn_budgets_retired"
     actions = [e.get("action") for e in app_mod.share_store.list_audit(limit=20)]
-    assert "ai_budget.reset" in actions
-    assert "ai_budget.update" in actions
+    assert "turn_budgets.retired_write" in actions
+    # 用量保留（写入口没了，冻结历史不受影响）
+    assert budget_store.usage_report()["platform"]["total"] == 1
 
 
 @pg_only
 def test_budget_reset_expires_inflight_demo_runs():
-    """一键重置：在途 demo run 转 expired 终态（capability 立即可再开）。
-
-    批次 E：每浏览器累计闸与 24h 成功次数 IP 桶已退役（无对象可清）；预算
-    reservation 不随 reset 盲动（确认式对账定局）。
+    """reset_demo_runs 原语回归：在途 demo run 转 expired 终态（capability
+    立即可再开）。批次 F 起 HTTP reset 端点已退役（410），本用例直连 store
+    锁定残余语义（管理面不再暴露，线程侧/运维仍可用）。
     """
     _setup_platform()
-    o = _make_user("owner")
+    o = _make_user("owner")  # noqa: F841 — 登录态不再需要（无 HTTP 入口）
     demo_store.create_capability("dmo_rst", "hash_rst", ip_prefix_hash="ipp_rst")
     run = demo_store.reserve_run("dmo_rst", "req_rst", "sld_a", "rev_1",
                                  ip_prefix_hash="ipp_rst")
     assert run is not None
-    c = _client()
-    _login(c, "owner", o["user_id"])
-    got = c.get("/api/admin/settings/ai-budget").get_json()
-    assert got["demo_runs"]["active"] == 1
-    assert got["demo_runs"]["reserved"] == 1
-    r = c.post("/api/admin/settings/ai-budget/reset", json={"confirm": True})
-    assert r.status_code == 200
-    assert r.get_json()["demo_runs_reset"] == 1
+    assert demo_store.count_run_states()["active"] == 1
+    reset_ids = demo_store.reset_demo_runs()
+    assert reset_ids == [run["demo_run_id"]]
     assert demo_store.get_run(run["demo_run_id"])["state"] == "expired"
     assert demo_store.count_run_states()["active"] == 0
     # capability 立即可再开（不使 cookie 失效）
     nxt = demo_store.reserve_run("dmo_rst", "req_rst2", "sld_a", "rev_1")
     assert nxt is not None and nxt["state"] == "reserved"
-    after = c.get("/api/admin/settings/ai-budget").get_json()
-    assert after["demo_runs"]["total"] == 2  # 流水保留（append-only）
-    assert after["demo_runs"]["active"] == 1
-    assert after["usage"]["platform"]["total"] == 0
+    assert demo_store.count_run_states()["total"] == 2  # 流水保留（append-only）
 
 
 # --------------------------------------------------------------------------- #
@@ -559,6 +537,8 @@ def test_same_request_id_retry_no_double_charge():
 
 @pg_only
 def test_user_11th_platform_run_rejected():
+    import spend_store
+    spend_store.set_enforcement_mode("shadow")  # 批次 F：软闸回退语义
     _setup_platform()
     # P0-B §3.7：单 user 默认初始额度收紧为 3；本用例验证每 user 上限机制，
     # 显式恢复 10 以保留原语义（第 11 次拒）。
@@ -592,6 +572,8 @@ def test_user_11th_platform_run_rejected():
 
 @pg_only
 def test_platform_total_exhausted_rejects_owner_and_user():
+    import spend_store
+    spend_store.set_enforcement_mode("shadow")  # 批次 F：软闸回退语义
     _setup_platform()
     budget_store.update_period_limits({"platform_turn_limit": 2})
     o = _make_user("owner")
@@ -621,6 +603,8 @@ def test_platform_total_exhausted_rejects_owner_and_user():
 def test_legacy_own_credentials_are_not_quota_escape_hatch():
     """自带 API 通道下线：存量 own 凭据不再是平台配额的逃生通道——
     平台总量打满后，即使 user 存量 use_platform=False 也按平台凭据拒（429）。"""
+    import spend_store
+    spend_store.set_enforcement_mode("shadow")  # 批次 F：软闸回退语义
     _setup_platform()
     budget_store.update_period_limits({"platform_turn_limit": 1})
     u = _make_user("user")
@@ -712,13 +696,64 @@ def test_reclaim_expired_reservations_removed():
     其语义（按 expires_at 到期即退款）被确认式对账明确否定：HistoPilot
     不可达/未确认的过期预占必须顺延，盲回收会把已接受的执行误退款。守卫
     断言 app 层符号不存在，防止未来误接回；budget_store.reclaim_expired
-    原语本身保留（其直接单测在 test_budget_store.py）。
+    原语本身也已随批次 F 删除（无生产调用方，见 test_budget_store 的
+    record_run_binding 用例替代）。
     """
     assert not hasattr(app_mod, "reclaim_expired_reservations")
     assert "def reclaim_expired_reservations" not in inspect.getsource(app_mod)
+    assert not hasattr(budget_store, "reclaim_expired")
+    # 软闸回退底板仍在：reserve_turn 原语保留（shadow 路径调用）
+    assert hasattr(budget_store, "reserve_turn")
     # 后台线程只走确认式对账（源码守卫）
     loop_src = inspect.getsource(app_mod._start_budget_reclaim_thread)
     assert "reconcile_expired_reservations()" in loop_src.split("def _loop")[1]
+
+
+@pg_only
+def test_hard_mode_run_skips_reservations_and_writes_binding():
+    """批次 F 核心分流：mode=all 下官方 run 200 且**不写** ai_budget_reservations。
+
+    - 不预占/不消费/不释放（usage 平移为零）；
+    - request_id 幂等与主体绑定由 ai_run_bindings 承担：2xx 后写入绑定行
+      （session 匹配），重复同 rid run 仍 200（replayed）；
+    - 跨主体复用同 request_id → 409 request_id_subject_conflict（预检）。
+    """
+    import spend_store
+    spend_store.set_enforcement_mode("all")
+    _setup_platform()
+    u = _make_user("user")
+    _touch("hard.svs")
+    _own("hard.svs", u["user_id"])
+    fake = _install_fake()
+    fake.register("POST", "/run", lambda b, q, h, k: _sse_ok("sess-hard"))
+    c = _client()
+    _login(c, "user", u["user_id"])
+    rid = _rid()
+    r = _run_ok(c, "hard.svs", rid)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    # 零 reservations / 零 usage（硬闸主体不写消费闸）
+    assert budget_store.get_reservation(rid) is None
+    assert _platform_report() == 0
+    assert (budget_store.usage_report()["own"]["total"]) == 0
+    # 绑定行在 2xx 接受后写入（session 匹配）
+    binding = budget_store.get_run_binding(rid)
+    assert binding is not None
+    assert binding["subject_type"] == "user"
+    assert binding["subject_id"] == u["user_id"]
+    assert binding["histopilot_session_id"] == "sess-hard"
+    # 同 rid 重试（同主体）→ 200（幂等由绑定行承担）
+    assert _run_ok(c, "hard.svs", rid).status_code == 200
+    # 跨主体复用同 rid → 409（预检拒绝，且不转发）
+    o = _make_user("owner")
+    co = _client()
+    _login(co, "owner", o["user_id"])
+    fake.calls.clear()
+    r_conflict = co.post("/api/ai/run", json={"slide": "hard.svs",
+                                              "request_id": rid})
+    assert r_conflict.status_code == 409
+    assert r_conflict.get_json().get("code") == "request_id_subject_conflict"
+    assert fake.calls == []  # 预检在转发之前拒绝
+    assert budget_store.get_reservation(rid) is None  # 全程零 reservation
 
 
 # --------------------------------------------------------------------------- #
@@ -728,12 +763,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_ui_budget_card_and_max_steps_sync_present():
-    """PR5 UI 迁移后：「AI 预算」管理卡片只在 admin 插件内交付。
+    """批次 F UI 退役守卫：turn 预算管理 UI 降级为只读 legacy 卡。
 
     Viewer 侧栏的 users/plugins/aibudget 三个管理 section 已删（方案 §13
-    PR5「完成 UI parity 后删除」）；turn 预算的用量展示/限制编辑/保存/开新
-    周期全部在 plugins/pathtogether-admin/ui/。平台侧保留的只有 user
-    max_steps 只读同步（syncAiMaxStepsInput，§8.3）。
+    PR5）；批次 F 起 admin 插件内的 turn 编辑表单/保存/开新周期/二次确认
+    一并移除（服务端写端点 410 turn_budgets_retired），只保留 GET 冻结
+    历史展示卡（adm-billing-turn）与 overview 的 legacy 徽标。平台侧保留
+    user max_steps 只读同步（syncAiMaxStepsInput，§8.3）。
     """
     index = (REPO_ROOT / "templates" / "index.html").read_text(encoding="utf-8")
     shell = (REPO_ROOT / "templates" / "_app_shell.html").read_text(encoding="utf-8")
@@ -741,22 +777,38 @@ def test_ui_budget_card_and_max_steps_sync_present():
                  / "index.html").read_text(encoding="utf-8")
     plugin_js = (REPO_ROOT / "plugins" / "pathtogether-admin" / "ui"
                  / "main.js").read_text(encoding="utf-8")
+    bridge_js = (REPO_ROOT / "static" / "admin-host.js").read_text(
+        encoding="utf-8")
     assert '{% include "_app_shell.html" %}' in index
     # 旧侧栏管理块已删（含指向 /admin/registration 的链接）
     assert "aibudget-mgr-section" not in shell
     assert "users-mgr-section" not in shell
     assert "plugins-mgr-section" not in shell
     assert "admin/registration" not in shell
-    # turn 预算管理 UI 交付物迁入 admin 插件（限制编辑 + 保存 + 开新周期）
-    assert 'id="adm-turn-edit-form"' in plugin_ui
-    assert 'id="adm-turn-save-btn"' in plugin_ui
-    assert 'id="adm-turn-newperiod-btn"' in plugin_ui
-    assert 'id="adm-turn-demosteps"' in plugin_ui
-    assert 'id="adm-turn-perbrowser"' in plugin_ui
-    assert 'id="adm-turn-concurrency"' in plugin_ui
-    assert 'id="adm-turn-demo-enabled"' in plugin_ui
-    assert "admin.turnBudgets.update" in plugin_js
-    assert "admin.turnBudgets.newPeriod" in plugin_js
+    # 只读 legacy 卡保留（GET 数据展示 + 已退役标记）；编辑入口全部移除
+    assert 'id="adm-billing-turn"' in plugin_ui
+    assert 'id="adm-turn-legacy-card"' in plugin_ui
+    assert "已退役" in plugin_ui
+    assert 'id="adm-ov-turn-legacy"' in plugin_ui
+    for gone in ("adm-turn-edit-form", "adm-turn-save-btn",
+                 "adm-turn-newperiod-btn", "adm-turn-confirm",
+                 "adm-turn-demosteps", "adm-turn-perbrowser",
+                 "adm-turn-concurrency", "adm-turn-demo-enabled",
+                 "adm-turn-platform", "adm-turn-demo"):
+        assert gone not in plugin_ui, gone
+    assert "admin.turnBudgets.update" not in plugin_js
+    assert "admin.turnBudgets.newPeriod" not in plugin_js
+    assert "admin.turnBudgets.get" in plugin_js  # 只读保留
+    # 桥层：update/newPeriod 的权限映射与 schema 已删；runtime 写改打新端点
+    assert '"admin.turnBudgets.update"' not in bridge_js
+    assert '"admin.turnBudgets.newPeriod"' not in bridge_js
+    assert '"admin.turnBudgets.get": "admin:turn-budgets:read"' in bridge_js
+    assert '"/api/admin/v1/settings/runtime", "PUT"' in bridge_js
+    manifest = json.loads((REPO_ROOT / "plugins" / "pathtogether-admin"
+                           / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["pluginVersion"] == "0.3.0"
+    assert "admin:turn-budgets:write" not in manifest["adminPermissions"]
+    assert "admin:turn-budgets:read" in manifest["adminPermissions"]
     app_js = (REPO_ROOT / "static" / "app.js").read_text(encoding="utf-8")
     assert "syncAiMaxStepsInput" in app_js  # 平台 AI 步数只读同步（§8.3）
     assert "showAiBudgetMgr" not in app_js  # 旧侧栏实现已删

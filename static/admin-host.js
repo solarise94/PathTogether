@@ -64,9 +64,9 @@
     "admin.invites.list": "admin:invites:read",
     "admin.invites.create": "admin:invites:write",
     "admin.invites.revoke": "admin:invites:write",
+    // 批次 F：turn 消费额度写方法退役（服务端 410 turn_budgets_retired）；
+    // 只读 get 保留（GET /api/admin/v1/turn-budgets 冻结历史展示）。
     "admin.turnBudgets.get": "admin:turn-budgets:read",
-    "admin.turnBudgets.update": "admin:turn-budgets:write",
-    "admin.turnBudgets.newPeriod": "admin:turn-budgets:write",
     "admin.billing.account.get": "admin:billing:read",
     "admin.billing.account.updateCaps": "admin:billing:write",
     "admin.billing.adjust": "admin:billing:write",
@@ -95,6 +95,9 @@
     // users 写方法同权限域）。服务端对每个端点独立 owner/CSRF 复核。
     "admin.settings.get": "admin:settings:read",
     "admin.settings.update": "admin:settings:write",
+    // 批次 F：运行时安全参数写（与 settings.update 同权限域；服务端
+    // PUT /api/admin/v1/settings/runtime）
+    "admin.settings.runtime.update": "admin:settings:write",
     "admin.spend.currentWindow.adjust": "admin:settings:write",
     "admin.users.setSpendOverride": "admin:users:write",
   };
@@ -222,27 +225,16 @@
       required: ["invite_id"],
       additionalProperties: false,
     },
-    // turn 预算限制字段（与服务端 _BUDGET_SETTINGS_FIELDS 同源；0 仅对
-    // demo_turn_limit/owner_reserved_turn_limit/user_pool_turn_limit 合法=关闭子池）
-    "admin.turnBudgets.update": {
+    // 批次 F：运行时安全参数（与 settings.update 的 runtime 步骤同源；
+    // 写端点 PUT /api/admin/v1/settings/runtime，替代已退役的 turn-budgets PUT）
+    "admin.settings.runtime.update": {
       properties: {
-        platform_turn_limit: _budgetIntSpec(1),
-        demo_turn_limit: _budgetIntSpec(0),
-        user_turn_limit: _budgetIntSpec(1),
-        owner_reserved_turn_limit: _budgetIntSpec(0),
-        user_pool_turn_limit: _budgetIntSpec(0),
-        platform_task_max_steps: _budgetIntSpec(1),
-        own_task_max_steps_limit: _budgetIntSpec(1),
-        demo_task_max_steps: _budgetIntSpec(1),
         demo_enabled: { type: "boolean" },
-        demo_per_browser_limit: _budgetIntSpec(1),
+        platform_task_max_steps: _budgetIntSpec(1),
+        demo_task_max_steps: _budgetIntSpec(1),
+        own_task_max_steps_limit: _budgetIntSpec(1),
         demo_max_concurrency: _budgetIntSpec(1),
       },
-      additionalProperties: false,
-    },
-    // confirm 由桥层固定置 true（插件的危险操作二次确认在 UI 层做，§3.3）
-    "admin.turnBudgets.newPeriod": {
-      properties: { limits: { type: "object", nullable: true } },
       additionalProperties: false,
     },
     "admin.billing.account.updateCaps": {
@@ -809,15 +801,10 @@
       return jsonWrite(url, "POST", {})(ctx);
     },
 
-    "admin.turnBudgets.update": function (ctx, payload) {
-      // schema 已白名单限制为 _BUDGET_SETTINGS_FIELDS 子集，原样透传
-      return jsonWrite("/api/admin/v1/turn-budgets", "PUT", payload)(ctx);
-    },
-
-    "admin.turnBudgets.newPeriod": function (ctx, payload) {
-      return jsonWrite("/api/admin/v1/turn-budgets/new-period", "POST", {
-        confirm: true, limits: payload.limits,
-      })(ctx);
+    // 批次 F：运行时安全参数写（settings.update 的 runtime 步骤实际打点；
+    // 原 turn-budgets PUT 已 410 turn_budgets_retired）
+    "admin.settings.runtime.update": function (ctx, payload) {
+      return jsonWrite("/api/admin/v1/settings/runtime", "PUT", payload)(ctx);
     },
 
     "admin.billing.account.updateCaps": function (ctx, payload) {
@@ -924,8 +911,9 @@
         runtime.demo_enabled = !!payload.demo_enabled;
       }
       if (Object.keys(runtime).length) {
+        // 批次 F：runtime 参数改打 settings/runtime（原 turn-budgets PUT 410）
         steps.push(["runtime_limits", function () {
-          return jsonWrite("/api/admin/v1/turn-budgets", "PUT", runtime)(ctx);
+          return jsonWrite("/api/admin/v1/settings/runtime", "PUT", runtime)(ctx);
         }]);
       }
       if (!steps.length) {

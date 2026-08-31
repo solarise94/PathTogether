@@ -185,7 +185,9 @@ def _setup_platform():
 
 
 def _enable_demo_period():
-    budget_store.update_period_limits({"demo_enabled": True})
+    # 批次 F：demo_enabled 自周期列迁居 settings_store（ai_safety.*）
+    import settings_store
+    settings_store.set_ai_safety_settings({"demo_enabled": True})
 
 
 def _catalog_add(name):
@@ -334,6 +336,17 @@ def test_capability_issuance_and_config():
     assert cfg["task_max_steps"] == budget_store.DEFAULT_DEMO_TASK_MAX_STEPS
     assert cfg["task_max_chars"] == 300
     assert cfg["budget"]["demo_limit"] == budget_store.DEFAULT_DEMO_TURN_LIMIT
+    # 批次 F：turn 口径 budget 段带 legacy 标记；新增金额口径 spend 段
+    # （十进制字符串 nano-CNY；无窗口不建行 → 数值取策略面值、未耗尽）
+    assert cfg["budget"]["legacy"] is True
+    assert set(cfg["spend"].keys()) == {
+        "week_limit_nano_cny", "week_spent_nano_cny",
+        "week_reserved_nano_cny", "demo_exhausted"}
+    for key in ("week_limit_nano_cny", "week_spent_nano_cny",
+                "week_reserved_nano_cny"):
+        assert isinstance(cfg["spend"][key], str)
+        assert cfg["spend"][key].isdigit(), key
+    assert cfg["spend"]["demo_exhausted"] is False
     # 批次 E：每浏览器累计次数闸退役，config 不再有 per_browser_* 字段
     assert "per_browser_limit" not in cfg
     assert "per_browser_used" not in cfg
@@ -650,7 +663,14 @@ def test_slide_delete_revokes_demo():
 
 
 @pg_only
-def test_demo_budget_exhausted_releases_run():
+def test_demo_soft_fallback_turn_budget_exhausted_releases_run():
+    """软闸回退（mode=shadow）回归：Demo 每日 turn 子额度耗尽 → 429 + run 回滚。
+
+    批次 F：金额硬闸（mode=all）下该 turn 闸关闭（消费额度由金额窗口独占）；
+    本用例显式回落 shadow，锁定回退底板行为不变。
+    """
+    import spend_store
+    spend_store.set_enforcement_mode("shadow")
     _enable_demo_period()
     budget_store.update_period_limits({"demo_turn_limit": 1})
     _setup_platform()
@@ -667,22 +687,6 @@ def test_demo_budget_exhausted_releases_run():
     assert c2.get("/api/demo/config").get_json()["run_state"] == "released"
     assert _demo_usage_total() == 1
     assert len(fake.calls_of("POST", "/run")) == 1
-
-
-@pg_only
-def test_platform_budget_exhausted():
-    _enable_demo_period()
-    budget_store.update_period_limits({"platform_turn_limit": 1})
-    _setup_platform()
-    fake = FakeSidecar()._install()
-    slide_id = _catalog_add(_touch("run10.svs"))
-    c1 = _fresh_capability(fake)
-    assert c1.post("/api/demo/ai/run", json={"slide_id": slide_id}).status_code == 200
-    c2 = _fresh_capability(fake)
-    r = c2.post("/api/demo/ai/run", json={"slide_id": slide_id})
-    assert r.status_code == 429
-    assert (r.get_json() or {}).get("code") == "platform_ai_budget_exhausted"
-    assert c2.get("/api/demo/config").get_json()["run_state"] == "released"
 
 
 @pg_only
@@ -964,6 +968,10 @@ def test_reconcile_abandoned_stale_attempt_does_not_release_newer_try():
 def test_catalog_remove_reconciles_reservations_not_blind_release():
     """目录撤销：found+已接受 → consume；missing → release；未接受 → 顺延。"""
     _setup_platform()
+    # 批次 F：并发闸双源——demo_store 新闸读 ai_safety.*（本测试要 3 个并发
+    # 在途 run），budget 旧闸仍读周期列（软闸回退路径）
+    import settings_store
+    settings_store.set_ai_safety_settings({"demo_max_concurrency": 8})
     budget_store.update_period_limits({"demo_max_concurrency": 8})
     slide_id = _catalog_add(_touch("rev-cat.svs"))
     cap_ok, rid_ok, run_ok = _reserve_pending_run(slide_id)
@@ -1074,15 +1082,19 @@ def test_demo_ip_request_rate_limit_blocks_flood(monkeypatch):
     _setup_platform()
     fake = FakeSidecar()._install()
     slide_id = _catalog_add(_touch("ip-rate.svs"))
-    # 同 IP 前缀第 1、2 个请求放行（不同浏览器=不同 capability）
+    # 同 IP 前缀第 1、2 个请求放行（不同浏览器=不同 capability）。
+    # 批次 F：全局并发闸按 demo_runs reserved+accepted 计数——耗尽流让
+    # run 转 finished 释放并发槽（真实浏览器行为），后续新浏览器不再撞闸
     c1 = _fresh_capability(fake)
     r1 = c1.post("/api/demo/ai/run", json={"slide_id": slide_id},
                  environ_base={"REMOTE_ADDR": "203.0.113.10"})
     assert r1.status_code == 200, r1.get_json()
+    assert r1.get_data()
     c2 = _fresh_capability(fake)
     r2 = c2.post("/api/demo/ai/run", json={"slide_id": slide_id},
                  environ_base={"REMOTE_ADDR": "203.0.113.200"})
     assert r2.status_code == 200, r2.get_json()
+    assert r2.get_data()
     # 第 3 个请求（同 /24，新浏览器）→ 429 + Retry-After（请求速率，非成功次数）
     c3 = _fresh_capability(fake)
     r3 = c3.post("/api/demo/ai/run", json={"slide_id": slide_id},
@@ -1094,11 +1106,12 @@ def test_demo_ip_request_rate_limit_blocks_flood(monkeypatch):
     assert 0 < int(body.get("retry_after_seconds") or 0) <= 60
     assert c3.get("/api/demo/config").get_json()["run_state"] is None
     assert len(fake.calls_of("POST", "/run")) == 2  # 被拒请求未转发
-    # 不同 /24 不受该桶限制
+    # 不同 /24 不受该桶限制（c1/c2 已 finish，并发槽已释放）
     c4 = _fresh_capability(fake)
     r4 = c4.post("/api/demo/ai/run", json={"slide_id": slide_id},
                  environ_base={"REMOTE_ADDR": "203.0.114.1"})
     assert r4.status_code == 200, r4.get_json()
+    assert r4.get_data()
     # 多次成功本身不触发 IP 阻断（旧 24h 成功桶语义已删除）
     monkeypatch.setenv("DEMO_IP_RATE_PER_MINUTE", "0")
     c5 = _fresh_capability(fake)
@@ -1110,29 +1123,74 @@ def test_demo_ip_request_rate_limit_blocks_flood(monkeypatch):
 
 
 @pg_only
-def test_demo_max_concurrency_gate_still_enforced():
-    """批次 E 回归：全站 demo_max_concurrency 安全闸仍生效。
+def test_demo_hard_mode_skips_turn_reservation_and_binding():
+    """批次 F：mode=all（demo 金额硬闸）→ demo run 完全跳过 turn 消费闸。
 
-    闸的口径是「在途 reserved 预占数」（HistoPilot 接受后转 consumed 不再占
-    并发，与批次 B 语义一致）：store 层预占一个未接受的 run 占满并发后，
-    其它浏览器的 API run → 429 demo_concurrency_exceeded，且不转发 HP。
+    - 不写 ai_budget_reservations（软闸回退路径才有预占）；
+    - 不写 ai_run_bindings（demo 主体绑定恒归 demo_runs.histopilot_session_id）；
+    - 被拒（4xx）时无预占可释放（_rollback_all 的 budget 分支为 no-op）。
     """
+    import spend_store
+    spend_store.set_enforcement_mode("all")
     _enable_demo_period()
-    budget_store.update_period_limits({"demo_max_concurrency": 1,
-                                       "demo_turn_limit": 50})
+    _setup_platform()
+    FakeSidecar()._install()
+    slide_id = _catalog_add(_touch("hard-demo.svs"))
+    client = _client()
+    client.get("/api/demo/config")
+    rid = "req_demo_hard_1"
+    r = client.post("/api/demo/ai/run", json={"slide_id": slide_id,
+                                              "request_id": rid})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.get_data()
+    # 零 reservation / 零 binding；run 绑定在 demo_runs
+    assert budget_store.get_reservation(rid) is None
+    assert budget_store.get_run_binding(rid) is None
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT capability_id, state FROM demo_runs "
+                        "WHERE request_id=%s", (rid,))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    assert row is not None and row["state"] == "finished"
+    # 金额侧计量主体仍可解析（demo_runs.capability_id，resolver 第②步）
+    cfg = client.get("/api/demo/config").get_json()
+    assert cfg["budget"]["legacy"] is True
+    assert cfg["spend"]["demo_exhausted"] is False
+
+
+@pg_only
+def test_demo_max_concurrency_gate_still_enforced():
+    """批次 F 迁居回归：全站 demo_max_concurrency 安全闸在 demo_store 生效。
+
+    闸从 budget_store.reserve_turn 事务内迁到 demo_store.reserve_run（安全
+    参数独立于已退役的 turn 消费闸存活），上限读 settings_store
+    ai_safety.demo_max_concurrency：占满在途（reserved/accepted）后，其它
+    浏览器的 API run → 429 demo_concurrency_exceeded，且不转发 HP、不留
+    run 流水行（拒绝发生在预占事务内，整体回滚）。
+    """
+    import settings_store
+    settings_store.set_ai_safety_settings({"demo_max_concurrency": 1})
+    _enable_demo_period()
     _setup_platform()
     fake = FakeSidecar()._install()
     slide_id = _catalog_add(_touch("conc.svs"))
     cap = demo_store.create_capability(
         "dcp_" + uuid.uuid4().hex[:8], "hash_" + uuid.uuid4().hex[:12])
     demo_store.reserve_run(cap["id"], "req_conc_stub", slide_id, "rev-stub")
-    budget_store.reserve_turn("req_conc_stub", "demo", cap["id"], "platform")
     c2 = _fresh_capability(fake)  # 新浏览器（绕过单 capability 闸）
     r2 = c2.post("/api/demo/ai/run", json={"slide_id": slide_id})
     assert r2.status_code == 429
     assert (r2.get_json() or {}).get("code") == "demo_concurrency_exceeded"
-    assert c2.get("/api/demo/config").get_json()["run_state"] == "released"
+    # 拒绝发生在 demo_store.reserve_run 事务内：不留流水行（run_state=None）
+    assert c2.get("/api/demo/config").get_json()["run_state"] is None
     assert fake.calls_of("POST", "/run") == []  # 被拒未转发
+    # 放宽后同一浏览器可再跑（闸读的是设置源，非周期列）
+    settings_store.set_ai_safety_settings({"demo_max_concurrency": 3})
+    r3 = c2.post("/api/demo/ai/run", json={"slide_id": slide_id})
+    assert r3.status_code == 200, r3.get_json()
 
 
 @pg_only
@@ -1147,6 +1205,8 @@ def test_demo_ip_request_rate_env_zero_disables_bucket(monkeypatch):
         r = c.post("/api/demo/ai/run", json={"slide_id": slide_id},
                    environ_base={"REMOTE_ADDR": "203.0.113.77"})
         assert r.status_code == 200, r.get_json()
+        # 批次 F：耗尽流释放全局并发槽（顺序体验语义）
+        assert r.get_data()
 
 
 # --------------------------------------------------------------------------- #
@@ -1249,9 +1309,11 @@ def test_demo_html_owner_admin_reset_bar_not_in_product_ui():
     assert 'id="demo-admin-reset"' not in demo
     assert 'id="demo-admin-usage"' not in demo
     assert 'id="demo-admin-bar"' not in shell
-    # 旧侧栏 AI 预算区已删（PR5 UI parity 完成）；开新周期按钮只在 admin 插件
+    # 旧侧栏 AI 预算区已删（PR5 UI parity 完成）；批次 F 起开新周期按钮随
+    # turn 消费闸退役一并移除（admin 插件内只剩只读 legacy 卡）
     assert 'id="aibudget-reset-btn"' not in shell
-    assert 'id="adm-turn-newperiod-btn"' in plugin_ui
+    assert 'id="adm-turn-newperiod-btn"' not in plugin_ui
+    assert 'id="adm-turn-save-btn"' not in plugin_ui
 
 
 def test_demo_uses_shared_shell_not_separate_product():

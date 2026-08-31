@@ -60,9 +60,10 @@
             <h2>当前身份</h2>
             <dl id="adm-actor-info" class="adm-kv"></dl>
           </section>
+          <!-- 批次 F：turn 消费闸退役——概览卡加 legacy 徽标（数据保留只读） -->
           <section class="adm-card">
-            <h2>对话额度（turn budget · 本周期）</h2>
-            <p class="adm-note">按次计的 Agent 对话额度，与金额余额是两种不同额度（§10.1）。</p>
+            <h2>对话额度（turn budget · 本周期）<span class="adm-badge" id="adm-ov-turn-legacy">已退役 · 冻结历史</span></h2>
+            <p class="adm-note">turn 消费闸已于批次 F 随金额硬闸退役（金额预算接管消费控制）；以下为冻结历史用量，只读。</p>
             <dl id="adm-ov-turn" class="adm-kv"></dl>
           </section>
           <section class="adm-card">
@@ -291,26 +292,13 @@
             <p class="adm-note">价格单位修复（批次 A cutover）之前的用量按旧错误价格计价，属历史影子数据：不参与任何当前金额额度/窗口/余额，不与修复后的金额混合汇总。当前周期金额请看「设置」页的金额策略与当前窗口。</p>
             <dl id="adm-legacy-info" class="adm-kv"></dl>
           </section>
-          <section class="adm-card">
-            <h2>对话额度（turn budget · 当前周期）</h2>
+          <!-- 批次 F：turn 消费闸退役——本卡降级为只读 legacy 说明卡（冻结
+               历史用量展示 + 已退役标记）；编辑/保存/开新周期入口全部移除，
+               金额预算请用「设置」页与 /api/admin/v1/spend/*。 -->
+          <section class="adm-card adm-error-card" id="adm-turn-legacy-card">
+            <h2>对话额度（turn budget · 已退役，冻结历史）</h2>
+            <p class="adm-note" id="adm-turn-legacy-note">turn 消费闸已于批次 F 随金额硬闸退役，金额预算接管消费控制；以下为冻结历史用量（只读）。当前额度请看「设置」页的金额策略与当前窗口。</p>
             <dl id="adm-billing-turn" class="adm-kv"></dl>
-            <div class="adm-form adm-form--grid" id="adm-turn-edit-form">
-              <input type="number" id="adm-turn-platform" min="1" max="1000000" placeholder="平台总对话上限">
-              <input type="number" id="adm-turn-demo" min="0" max="1000000" placeholder="Demo 每日额度（24h 滚动）">
-              <input type="number" id="adm-turn-user" min="1" max="1000000" placeholder="每用户对话上限">
-              <input type="number" id="adm-turn-owner-reserve" min="0" max="1000000" placeholder="owner 保留池（0=关闭）">
-              <input type="number" id="adm-turn-user-pool" min="0" max="1000000" placeholder="用户共享池（0=关闭）">
-              <input type="number" id="adm-turn-psteps" min="1" max="1000000" placeholder="平台单次任务步骤">
-              <input type="number" id="adm-turn-ownsteps" min="1" max="1000000" placeholder="自带 API 步数硬上限">
-              <input type="number" id="adm-turn-demosteps" min="1" max="1000000" placeholder="Demo 单次任务步骤">
-              <input type="number" id="adm-turn-perbrowser" min="1" max="1000000" placeholder="Demo 每浏览器次数">
-              <input type="number" id="adm-turn-concurrency" min="1" max="1000000" placeholder="Demo 最大并发">
-              <label class="adm-check"><input type="checkbox" id="adm-turn-demo-enabled"> 开放公开 Demo</label>
-              <button type="button" id="adm-turn-save-btn">保存限制（不清空用量）</button>
-              <button type="button" id="adm-turn-newperiod-btn" class="adm-btn-danger">开启新周期</button>
-            </div>
-            <div class="adm-confirm" id="adm-turn-confirm" hidden></div>
-            <p class="adm-status" id="adm-turn-edit-status"></p>
           </section>
           <section class="adm-card">
             <h2>金额账户（caps 与人工调整 · nano-CNY）</h2>

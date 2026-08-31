@@ -80,6 +80,8 @@ def test_ensure_schema_idempotent(conn):
         "platform_settings", "auth_rate_limits", "ai_budget_periods",
         "ai_budget_usage", "ai_budget_reservations", "demo_sessions",
         "demo_catalog",
+        # 0027：金额时代 run→主体绑定（批次 F）
+        "ai_run_bindings",
         # 0017：Upload V2 分片任务表
         "upload_tasks",
     }
@@ -159,7 +161,75 @@ def test_schema_migrations_recorded(conn):
         "0024_billing_holds_spend_strong_settle.sql",
         "0025_invite_monthly_limit.sql",
         "0026_demo_runs.sql",
+        # 批次 F 追加 0027_ai_run_bindings.sql（ai_run_bindings 表：金额时代
+        # run→主体权威绑定 + ai_safety.* 安全参数 backfill，docs
+        # ai-money-budget-bugfix-and-simplification-plan.md §7.3 阶段 2）。
+        "0027_ai_run_bindings.sql",
     ]
+
+
+# --------------------------------------------------------------------------- #
+# 1b. 0027 backfill：ai_budget_periods 安全参数 → platform_settings（ai_safety.*）
+# --------------------------------------------------------------------------- #
+def test_migration_0027_backfills_ai_safety_keys(conn):
+    """批次 F 迁移回归：当前开放周期行的五个安全参数搬入 ai_safety.* 键。
+
+    - 无周期行时不写键（读取侧回落 DEFAULT_* 常量）；
+    - 有周期行时按行值 backfill；重放（文件幂等）不覆盖已有键
+      （ON CONFLICT DO NOTHING——owner 已改过的设置不被迁移回写）。
+    """
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM platform_settings WHERE key LIKE 'ai_safety.%'")
+        cur.execute("DELETE FROM ai_budget_periods")
+        conn.commit()
+        # 先重放一次（无周期行）：不写任何 ai_safety 键
+        sql = (pg_store.migrations_dir() / "0027_ai_run_bindings.sql").read_text(
+            encoding="utf-8")
+        cur.execute(sql)
+        conn.commit()
+        cur.execute(
+            "SELECT count(*) FROM platform_settings "
+            "WHERE key LIKE 'ai_safety.%'")
+        assert cur.fetchone()[0] == 0
+        # 造一个开放周期行（带非缺省安全参数值）再重放：五键按行值写入
+        cur.execute(
+            "INSERT INTO ai_budget_periods "
+            "(started_at, demo_task_max_steps, platform_task_max_steps, "
+            " own_task_max_steps_limit, demo_enabled, demo_max_concurrency) "
+            "VALUES (now(), 33, 44, 555, TRUE, 7)")
+        conn.commit()
+        cur.execute(sql)
+        conn.commit()
+        cur.execute(
+            "SELECT key, value FROM platform_settings "
+            "WHERE key LIKE 'ai_safety.%' ORDER BY key")
+        rows = dict(cur.fetchall())
+        assert rows == {
+            "ai_safety.demo_enabled": True,
+            "ai_safety.demo_max_concurrency": 7,
+            "ai_safety.demo_task_max_steps": 33,
+            "ai_safety.own_task_max_steps_limit": 555,
+            "ai_safety.platform_task_max_steps": 44,
+        }
+        # owner 已手工改过的键不被重放覆盖（ON CONFLICT DO NOTHING）
+        cur.execute(
+            "UPDATE platform_settings SET value='99'::jsonb "
+            "WHERE key='ai_safety.demo_max_concurrency'")
+        conn.commit()
+        cur.execute(sql)
+        conn.commit()
+        cur.execute(
+            "SELECT value FROM platform_settings "
+            "WHERE key='ai_safety.demo_max_concurrency'")
+        assert cur.fetchone()[0] == 99
+        # ai_run_bindings 表约束：subject_type 仅 owner/user（demo 归 demo_runs）
+        with pytest.raises(psycopg.errors.CheckViolation):
+            cur.execute(
+                "INSERT INTO ai_run_bindings (request_id, subject_type, "
+                "subject_id, histopilot_session_id) "
+                "VALUES ('req_chk', 'demo', 'dmo_x', 'sess_x')")
+            conn.commit()
+        conn.rollback()
 
 
 # --------------------------------------------------------------------------- #

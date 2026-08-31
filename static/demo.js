@@ -498,7 +498,15 @@
         label = t("demo.ai.run.running");
         setQuotaChip(label);
         break;
+      case "spend_budget_exhausted":
+        // 批次 F：金额口径置灰（Demo 周金额窗口耗尽，下周一 0 点重置）
+        if (btn) btn.disabled = true;
+        label = t("demo.ai.run.spend.exhausted");
+        setQuotaChip(label);
+        if (status) status.innerHTML = '<a href="/login">' + esc(t("demo.footer.login")) + "</a>";
+        break;
       case "demo_budget_exhausted":
+        // 软闸回退期兼容（turn 口径；金额硬闸模式下不再出现）
         if (btn) btn.disabled = true;
         label = t("demo.ai.run.demo.exhausted");
         setQuotaChip(label);
@@ -553,6 +561,11 @@
     if (!cfg.ai_available) {
       setAiButton("unavailable");
       return;
+    }
+    // 批次 F：优先金额口径（spend 段，周窗口）；缺 spend 段回退 turn 口径
+    // budget 段（软闸回退期前端兼容）
+    if (cfg.spend && cfg.spend.demo_exhausted) {
+      setAiButton("spend_budget_exhausted"); return;
     }
     if (cfg.budget && cfg.budget.demo_exhausted) {
       setAiButton("demo_budget_exhausted"); return;
@@ -1073,7 +1086,8 @@
           resp.status === 400 || resp.status === 503) {
         return resp.json().then(function (body) {
           var code = body && body.code;
-          if (code === "demo_budget_exhausted") setAiButton("demo_budget_exhausted");
+          if (code === "spend_budget_exhausted") setAiButton("spend_budget_exhausted");
+          else if (code === "demo_budget_exhausted") setAiButton("demo_budget_exhausted");
           else if (code === "demo_ip_request_rate_limited") setAiButton("demo_ip_request_rate_limited");
           else if (code === "platform_ai_budget_exhausted") setAiButton("platform_ai_budget_exhausted");
           else if (code === "demo_run_in_progress") setAiButton("demo_run_in_progress");

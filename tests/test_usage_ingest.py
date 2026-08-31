@@ -7,8 +7,10 @@ json 模式（无 PG）：鉴权链 + fail-closed——
   - json 后端 → 503 pg_backend_required（稳定 code，不降级）。
 
 PG 模式（RUN_PG_TESTS=1）：schema 正例、幂等重放、payload/call_id 冲突、
-主体绑定各路径（reservation 匹配 / demo session / run grant 仅交叉校验不
-补位、assertion 冲突 / not_ready 可重试）、未知模型与缺价格 unpriced、时钟 skew
+主体绑定各路径（批次 F 解析链 ⓪holds → ①ai_run_bindings → ①legacy
+reservations → ②demo → ③grant 仅交叉校验不补位 → ④assertion；矩阵见
+test_subject_resolution_batch_f_matrix 与 test_subject_resolution_paths）、
+未知模型与缺价格 unpriced、时钟 skew
 两条（含 BILLING_OCCURRED_AT_MAX_AGE_DAYS 可配）、算术不符 unpriced、
 PR6 模拟扣费语义（demo 主体不入 ledger/不开户；正向路径见
 test_billing_sim_debit.py）、敏感字段不出现在响应与 audit。
@@ -364,6 +366,96 @@ def test_call_id_conflict_409():
     _bind_for(other)
     r = _post(other, token=token)
     _assert_envelope(r, 409, "usage_event_conflict", retryable=False)
+
+
+@PG
+def test_subject_resolution_batch_f_matrix():
+    """批次 F 解析矩阵：⓪holds 命中/冲突、①bindings 命中/失配下落。
+
+    - ⓪ call_id 已有 hold 且 session 匹配 → 以 hold 主体入账（settle 链）；
+    - ⓪ hold 的 session 与事件不一致 → 409 usage_subject_conflict；
+    - ① request_id → ai_run_bindings 且 session 匹配 → resolve；
+    - ① binding 的 session 与事件不一致 → **不 resolve 继续下落**（换
+      session 的迟到事件不能冒领别的主体）→ 无其他来源即 not_ready。
+    """
+    inst = _bootstrap()
+    token = _token_for(inst)
+    bh.seed_price_books_with_history()
+    bh.seed_spend_policies()
+    import billing_store
+
+    # ① bindings 命中（owner/user 主源）
+    event = _fresh(bh.load_event("01_owner_priced_flash_peak.json"))
+    event["request_id"] = "req_bind_hit_case"
+    bh.bind_run_binding(event["request_id"], event["session_id"],
+                        "owner", event["subject_id"])
+    r = _post(event, token=token)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    row = billing_store.get_usage_event(event["event_id"])
+    assert (row["subject_type"], row["subject_id"]) == (
+        "owner", event["subject_id"])
+
+    # ① bindings 失配下落：binding 的 session 与事件不一致 → 不 resolve
+    fall = _fresh(bh.load_event("01_owner_priced_flash_peak.json"))
+    fall = dict(fall, event_id="use_" + "1b" * 16, call_id="call_" + "2b" * 16,
+                request_id="req_bind_miss_case",
+                session_id="sess-other-session")
+    bh.bind_run_binding("req_bind_miss_case", "sess-binding-other",
+                        "owner", fall["subject_id"])
+    r = _post(fall, token=token)
+    _assert_envelope(r, 409, "usage_subject_not_ready", retryable=True)
+
+    # ⓪ holds 命中：authorize 一个 hold（同 session）→ 事件按 hold 主体解析。
+    # authorize 自身经 ① bindings 解析主体（伪 event 无 call_id，⓪ 自然落空）
+    import user_store
+    creator = user_store.create_user("holdcase@x.com", "pass123456789012")
+    held = _fresh(bh.load_event("02_user_priced_pro_offpeak_reasoning.json"))
+    held["subject_type"] = "user"
+    held["subject_id"] = creator["user_id"]
+    held["user_id"] = creator["user_id"]
+    held["request_id"] = held.get("request_id") or "req_hold_hit_case"
+    bh.bind_run_binding(held["request_id"], held["session_id"],
+                        "user", creator["user_id"])
+    hold = billing_store.authorize_hold({
+        "call_id": held["call_id"], "session_id": held["session_id"],
+        "request_id": held["request_id"],
+        "subject_type": "user", "subject_id": creator["user_id"],
+        "user_id": creator["user_id"], "provider": held["provider"],
+        "model": held["model"], "estimated_input_tokens": 100,
+        "max_output_tokens": 100,
+    }, installation_id=inst["installation_id"])
+    assert hold["status"] == "open"
+    r = _post(held, token=token)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    row = billing_store.get_usage_event(held["event_id"])
+    assert (row["subject_type"], row["subject_id"]) == (
+        "user", creator["user_id"])
+
+    # ⓪ holds 冲突：authorize 一个**未投递事件**的 hold（call_id 不在
+    # ai_usage_events，避开 ingest 的 call_id 绑定检查），再投一个同 call_id
+    # 但不同 session 的事件 → 确定性 409（不能借他人 hold 的 call 冒领主体）
+    other = _fresh(bh.load_event("03_user_priced_vision_exp_peak.json"))
+    other["subject_type"] = "user"
+    other["subject_id"] = creator["user_id"]
+    other["user_id"] = creator["user_id"]
+    other["request_id"] = "req_hold_clash_case"
+    bh.bind_run_binding(other["request_id"], other["session_id"],
+                        "user", creator["user_id"])
+    hold2 = billing_store.authorize_hold({
+        "call_id": other["call_id"], "session_id": other["session_id"],
+        "request_id": other["request_id"],
+        "subject_type": "user", "subject_id": creator["user_id"],
+        "user_id": creator["user_id"], "provider": other["provider"],
+        "model": other["model"], "estimated_input_tokens": 100,
+        "max_output_tokens": 100,
+    }, installation_id=inst["installation_id"])
+    assert hold2["status"] == "open"
+    clash = dict(other, session_id="sess-hijack-attempt",
+                 request_id="req_hijacker")
+    bh.bind_run_binding("req_hijacker", "sess-hijack-attempt",
+                        "user", creator["user_id"])
+    r = _post(clash, token=token)
+    _assert_envelope(r, 409, "usage_subject_conflict", retryable=False)
 
 
 @PG
@@ -865,7 +957,9 @@ def test_billing_subject_demo_dispatch_matches_resolution():
     app_mod._save_ai_config({
         "base_url": "http://platform.example/v1",
         "api_key": "sk-platform-123456", "model": "gpt-p"})
-    budget_store.update_period_limits({"demo_enabled": True})
+    # 批次 F：demo_enabled 已迁居 settings_store（ai_safety.*）
+    import settings_store
+    settings_store.set_ai_safety_settings({"demo_enabled": True})
 
     name = "e2e-demo.svs"
     p = _Path(app_mod.UPLOAD_DIR) / name

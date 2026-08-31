@@ -76,6 +76,8 @@ if _RUN_PG:
         # 会重置 ai_budget_periods 的 serial，保证 period id 从 1 起可预测）
         "platform_settings", "auth_rate_limits",
         "ai_budget_usage", "ai_budget_reservations", "ai_budget_periods",
+        # 0027 起：金额时代 run→主体权威绑定（无 FK，显式列出防跨用例残留）
+        "ai_run_bindings",
         "demo_sessions", "demo_catalog",
         # 0026 起：Demo run 流水 + IP 短窗口请求速率桶（批次 E）。demo_runs
         # 无 FK（capability 行不删除），必须显式列出防跨用例残留

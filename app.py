@@ -2909,8 +2909,10 @@ def _demo_require_open():
 
 
 def _demo_public_mode() -> bool:
-    """公开 Demo 是否开启：PUBLIC_DEMO_ENABLED=1 或当前预算周期 demo_enabled。
+    """公开 Demo 是否开启：PUBLIC_DEMO_ENABLED=1 或 ai_safety.demo_enabled。
 
+    批次 F：demo_enabled 自 ai_budget_periods 列迁居 platform_settings
+    （settings_store.get_ai_safety_settings，0027 backfill 已搬值）。
     PG 不可读时 fail-closed（False）。
     """
     if platform_features.public_demo_enabled():
@@ -2918,20 +2920,21 @@ def _demo_public_mode() -> bool:
     if not platform_features.demo_features_available():
         return False
     try:
-        period = budget_store.get_current_period()
-        return bool(period and period.get("demo_enabled"))
+        return bool(settings_store.get_ai_safety_settings()["demo_enabled"])
     except Exception:
         app.logger.warning("读取 Demo 开关失败（按关闭处理）", exc_info=True)
         return False
 
 
 def _demo_task_max_steps() -> int:
-    """Demo 单次任务步骤（周期 demo_task_max_steps，默认 20；docs §4.1/§5.3）。"""
-    period = _current_budget_period_or_none() or {}
+    """Demo 单次任务步骤（ai_safety.demo_task_max_steps，默认 20；docs §4.1/§5.3）。
+
+    批次 F：自周期列迁居 platform_settings（settings_store 统一设置源）。
+    """
     try:
-        v = int(period.get("demo_task_max_steps")
-                or budget_store.DEFAULT_DEMO_TASK_MAX_STEPS)
-    except (TypeError, ValueError):
+        raw = settings_store.get_ai_safety_settings()["demo_task_max_steps"]
+        v = int(raw)
+    except Exception:
         v = budget_store.DEFAULT_DEMO_TASK_MAX_STEPS
     return max(1, min(v, _MAX_STEPS_LIMIT))
 
@@ -3137,6 +3140,10 @@ def api_demo_config():
     分离；同 capability 顺序多次 run，无每浏览器累计上限）。``run_state`` ∈
     reserved|accepted（在途）| finished|released|expired（终态）| None（未跑过）；
     ``histopilot_session_id`` / ``session_reconnect_until`` 取最近一次已接受 run。
+
+    批次 F：``spend`` 段为金额口径（Demo 周金额窗口 limit/spent/reserved，
+    十进制字符串 nano-CNY + demo_exhausted），只读不建窗；``budget`` 段为
+    turn 口径冻结历史（legacy=true，软闸回退期前端兜底）。
     """
     err = _demo_require_pg()
     if err is not None:
@@ -3185,6 +3192,9 @@ def api_demo_config():
         demo_total = report["demo"]["total"]
         plat_total = report["platform"]["total"]
         payload["budget"] = {
+            # 批次 F：turn 口径已随消费闸退役失真（mode=all 时不再更新），
+            # legacy 标记提示前端优先读 spend 段（软闸回退期仍作兜底）
+            "legacy": True,
             "demo_used": demo_total,
             "demo_limit": report["demo"]["limit"],
             "demo_exhausted": demo_total + 1 > report["demo"]["limit"],
@@ -3196,6 +3206,40 @@ def api_demo_config():
         raise
     except Exception:
         app.logger.warning("Demo 额度状态读取失败", exc_info=True)
+    # 批次 F：金额口径 spend 段（Demo 周金额窗口，十进制字符串 nano-CNY）。
+    # 只读不建窗（peek_current_window）：无窗口时 exhausted=false、数值 "0"，
+    # 上限回落策略面值（demo_global 默认 50 CNY）；读失败不阻断 config。
+    payload["spend"] = {
+        "week_limit_nano_cny": "0",
+        "week_spent_nano_cny": "0",
+        "week_reserved_nano_cny": "0",
+        "demo_exhausted": False,
+    }
+    try:
+        window = spend_store.peek_current_window(
+            "demo", spend_store.DEMO_GLOBAL_SUBJECT)
+        if window is not None:
+            limit_nano = int(window["limit_nano_snapshot"])
+            spent_nano = int(window["spent_nano_cny"])
+            reserved_nano = int(window["reserved_nano_cny"])
+        else:
+            policy = spend_store.resolve_policy(
+                "demo", spend_store.DEMO_GLOBAL_SUBJECT)
+            limit_nano = int(policy["limit_nano_cny"]) if policy else 0
+            spent_nano = 0
+            reserved_nano = 0
+        payload["spend"] = {
+            "week_limit_nano_cny": str(limit_nano),
+            "week_spent_nano_cny": str(spent_nano),
+            "week_reserved_nano_cny": str(reserved_nano),
+            "demo_exhausted": bool(
+                limit_nano > 0
+                and spent_nano + reserved_nano >= limit_nano),
+        }
+    except platform_features.PgFeatureUnavailable:
+        raise
+    except Exception:
+        app.logger.warning("Demo 金额窗口状态读取失败", exc_info=True)
     issued_token = None
     if cap is None and _demo_public_mode():
         try:
@@ -3410,7 +3454,8 @@ def api_demo_ai_run():
         app.logger.warning("Demo 预占前惰性对账失败（不阻断）", exc_info=True)
 
     # 3) run 预占：demo_runs 流水（capability 行锁内：过期校验 + 惰性终态 +
-    #    同 ID 幂等 + 单 active 冲突；DB 部分唯一索引兜底并发）
+    #    同 ID 幂等 + 单 active 冲突 + 全局并发闸（批次 F 迁入，上限读
+    #    ai_safety.demo_max_concurrency）；DB 部分唯一索引兜底并发）
     try:
         run = demo_store.reserve_run(
             cap["id"], rid, slide_id, _legacy_slide_revision(safe),
@@ -3425,6 +3470,9 @@ def api_demo_ai_run():
     except demo_store.DemoRunFinalConflict as exc:
         return (jsonify(error="该请求已结束，请重新发起体验",
                         code="demo_run_request_final"), 409)
+    except demo_store.DemoConcurrencyExceeded as exc:
+        # 批次 F：并发闸迁居 demo_store（安全参数，独立于已退役的 turn 消费闸）
+        return _budget_error_response(exc, 429)
     except platform_features.PgFeatureUnavailable as exc:
         return _budget_error_response(exc, 503, code="pg_backend_required")
     if run is None:
@@ -3456,42 +3504,55 @@ def api_demo_ai_run():
         except Exception:
             app.logger.warning("Demo run 回滚失败：%s", reason, exc_info=True)
 
-    # 4) Demo 子额度 + 平台总预算原子预占（超限释放 run，不回退其它凭据）
-    try:
-        resv = budget_store.reserve_turn(rid, "demo", cap["id"], "platform")
-    except budget_store.DemoConcurrencyExceeded as exc:
-        _rollback_demo_run("demo_concurrency_exceeded", expected_attempt=run_attempt,
-                           expected_request_id=rid,
-                           expected_rollback_epoch=run_rollback_epoch)
-        return _budget_error_response(exc, 429)
-    except budget_store.DemoBudgetExhausted as exc:
-        _rollback_demo_run("demo_budget_exhausted", expected_attempt=run_attempt,
-                           expected_request_id=rid,
-                           expected_rollback_epoch=run_rollback_epoch)
-        return _budget_error_response(exc, 429)
-    except budget_store.PlatformBudgetExhausted as exc:
-        _rollback_demo_run("platform_ai_budget_exhausted", expected_attempt=run_attempt,
-                           expected_request_id=rid,
-                           expected_rollback_epoch=run_rollback_epoch)
-        return _budget_error_response(exc, 429)
-    except budget_store.BudgetError as exc:
-        _rollback_demo_run("budget_error", expected_attempt=run_attempt,
-                           expected_request_id=rid,
-                           expected_rollback_epoch=run_rollback_epoch)
-        return _budget_error_response(exc, 409)
-    except platform_features.PgFeatureUnavailable as exc:
-        _rollback_demo_run("pg_backend_required", expected_attempt=run_attempt,
-                           expected_request_id=rid,
-                           expected_rollback_epoch=run_rollback_epoch)
-        return _budget_error_response(exc, 503, code="pg_backend_required")
+    # 4) 消费闸分流（批次 F §7.3 阶段 2）：demo 主体绑定本就在
+    #    demo_runs.histopilot_session_id，**不写 ai_run_bindings**。金额硬闸
+    #    （mode=all，demo 硬）→ 完全跳过 budget_store.reserve_turn（turn 消费
+    #    闸关闭，消费额度由 Demo 周金额窗口独占）；软闸回退（shadow/
+    #    registered）→ Demo 子额度 + 平台总预算原子预占（超限释放 run，不
+    #    回退其它凭据）——既有行为逐字保留。
+    spend_hard_demo = spend_store.mode_is_hard(_spend_mode_snapshot(), "demo")
+    if spend_hard_demo:
+        resv = None
+    else:
+        try:
+            resv = budget_store.reserve_turn(rid, "demo", cap["id"], "platform")
+        except budget_store.DemoConcurrencyExceeded as exc:
+            _rollback_demo_run("demo_concurrency_exceeded",
+                               expected_attempt=run_attempt,
+                               expected_request_id=rid,
+                               expected_rollback_epoch=run_rollback_epoch)
+            return _budget_error_response(exc, 429)
+        except budget_store.DemoBudgetExhausted as exc:
+            _rollback_demo_run("demo_budget_exhausted", expected_attempt=run_attempt,
+                               expected_request_id=rid,
+                               expected_rollback_epoch=run_rollback_epoch)
+            return _budget_error_response(exc, 429)
+        except budget_store.PlatformBudgetExhausted as exc:
+            _rollback_demo_run("platform_ai_budget_exhausted",
+                               expected_attempt=run_attempt,
+                               expected_request_id=rid,
+                               expected_rollback_epoch=run_rollback_epoch)
+            return _budget_error_response(exc, 429)
+        except budget_store.BudgetError as exc:
+            _rollback_demo_run("budget_error", expected_attempt=run_attempt,
+                               expected_request_id=rid,
+                               expected_rollback_epoch=run_rollback_epoch)
+            return _budget_error_response(exc, 409)
+        except platform_features.PgFeatureUnavailable as exc:
+            _rollback_demo_run("pg_backend_required", expected_attempt=run_attempt,
+                               expected_request_id=rid,
+                               expected_rollback_epoch=run_rollback_epoch)
+            return _budget_error_response(exc, 503, code="pg_backend_required")
 
-    resv_attempt = resv.get("attempt")
-    resv_rollback_epoch = int(resv.get("rollback_epoch") or 0)
+    resv_attempt = (resv or {}).get("attempt")
+    resv_rollback_epoch = int((resv or {}).get("rollback_epoch") or 0)
 
     def _rollback_all(reason):
         _rollback_demo_run(reason, expected_attempt=run_attempt,
                            expected_request_id=rid,
                            expected_rollback_epoch=run_rollback_epoch)
+        if resv is None:
+            return  # 硬闸分支无预占可退（turn 闸已关闭）
         if resv.get("replayed"):
             app.logger.info("Demo 在途预算重放失败，不释放原预占：%s", rid)
             return
@@ -3556,6 +3617,10 @@ def api_demo_ai_run():
                                exc_info=True)
         except Exception:
             app.logger.warning("Demo run accept 失败（对账兜底）", exc_info=True)
+        if spend_hard_demo:
+            # 硬闸分支：无 reservation 可 consume（turn 闸已关闭；demo 主体
+            # 绑定已在 accept_run 写入 demo_runs.histopilot_session_id）
+            return
         try:
             budget_store.consume(rid, sid, expected_attempt=resv_attempt)
         except budget_store.ReservationAttemptConflict:
@@ -4763,10 +4828,11 @@ def _validate_budget_settings(body, current_limits):
 
 @app.route("/api/admin/settings/ai-budget", methods=["GET"])
 def api_admin_ai_budget_get():
-    """当前周期用量与限制（owner 后台「AI 预算」卡片数据源，docs §4.2）。
+    """当前周期用量与限制（冻结历史，批次 F 起只读 + legacy 标记）。
 
-    返回：period、limits、usage（platform/demo/构成/每用户/own）、
-    demo_sessions（未过期 capability 按状态计数）、concurrency。
+    turn 消费闸已随金额硬闸退役（§7.3 阶段 2）：本端点保留一个兼容版本供
+    只读报表（ai_budget_* 表不删），响应带 ``legacy: true`` 与中文说明。
+    返回：period、limits、usage、demo_runs、concurrency。
     json/dual → 503 pg_backend_required。
     """
     auth = _require_owner()
@@ -4799,6 +4865,8 @@ def api_admin_ai_budget_get():
     except Exception:
         app.logger.warning("读取 Demo run 用量失败", exc_info=True)
     return jsonify(
+        legacy=True,
+        note="turn 消费闸已于批次 F 退役，以下为冻结历史",
         period={
             "id": period["id"],
             "started_at": period["started_at"],
@@ -4820,90 +4888,40 @@ def api_admin_ai_budget_get():
     )
 
 
+#: 批次 F：turn 消费额度管理写端点的统一退役响应（410 Gone + 稳定 code +
+#: 中文指引）。读取端点保留（冻结历史）。
+_TURN_BUDGETS_RETIRED_NOTE = (
+    "turn 消费额度已退役，金额预算请用 /api/admin/v1/spend/* 与设置页")
+
+
+def _turn_budgets_retired_response():
+    """退役写端点统一出口：410 + code + 指引文案，并 audit 这次尝试。"""
+    _audit("turn_budgets.retired_write", target_type="ai_budget_period",
+           target_id=None,
+           detail={"endpoint": request.method + " " + request.path})
+    return (jsonify(error=_TURN_BUDGETS_RETIRED_NOTE,
+                    code="turn_budgets_retired"), 410)
+
+
 @app.route("/api/admin/settings/ai-budget", methods=["PUT"])
 def api_admin_ai_budget_put():
-    """修改当前周期限制（不清空已有用量，docs §4.2）。
-
-    body 为限制字段子集；校验见 _validate_budget_settings。调低到小于已用量时
-    现有运行不取消、新请求立即被拒（budget_store 判定语义）。
-    """
+    """已退役（批次 F §7.3 阶段 2）：turn 消费闸随金额硬闸关闭，周期限制不再
+    可写。安全参数（demo_enabled/步数/并发）迁 settings_store
+    （PUT /api/admin/v1/settings/runtime）；金额额度走 /api/admin/v1/spend/*。"""
     auth = _require_owner()
     if auth:
         return auth
-    err, _ = _budget_require_pg()
-    if err is not None:
-        return err
-    body = request.get_json(silent=True) or {}
-    if not isinstance(body, dict) or not body:
-        return jsonify(error="缺少预算限制字段"), 400
-    try:
-        current = budget_store.get_current_period()
-    except platform_features.PgFeatureUnavailable as exc:
-        return _budget_error_response(exc, 503, code=exc.code)
-    current_limits = {k: current.get(k) for k in _BUDGET_SETTINGS_FIELDS}
-    validated, verr = _validate_budget_settings(body, current_limits)
-    if verr:
-        return jsonify(error=verr), 400
-    try:
-        period = budget_store.update_period_limits(validated)
-    except ValueError as exc:
-        return jsonify(error=str(exc)), 400
-    except platform_features.PgFeatureUnavailable as exc:
-        return _budget_error_response(exc, 503, code=exc.code)
-    _audit("ai_budget.update", target_type="ai_budget_period",
-           target_id=str(period["id"]), detail={"fields": sorted(validated)})
-    limits = {k: period.get(k) for k in _BUDGET_SETTINGS_FIELDS}
-    return jsonify(period_id=period["id"], limits=limits)
+    return _turn_budgets_retired_response()
 
 
 @app.route("/api/admin/settings/ai-budget/reset", methods=["POST"])
 def api_admin_ai_budget_reset():
-    """开启新预算周期并把在途 Demo run 置为终态（二次确认 + audit）。
-
-    body: {confirm: true, limits?}。旧周期 closed_at=now() 且行/用量保留（排查
-    用）；新周期用量归零。批次 E 后每浏览器累计闸与 24h 成功次数 IP 桶已退役，
-    reset 的残余语义是把 reserved/accepted 的在途 demo run 转 expired 终态
-    （卡死的 capability 立即可再开；预算 reservation 不在此动，由确认式对账
-    按 HistoPilot 反查定局，避免误退款）。limits 可选（未给沿用旧值）。
-    """
+    """已退役（批次 F）：开新预算周期随 turn 消费闸退役。在途 Demo run 的
+    解锁请用 demo_store.reset_demo_runs（管理面不再暴露）。"""
     auth = _require_owner()
     if auth:
         return auth
-    err, _ = _budget_require_pg()
-    if err is not None:
-        return err
-    body = request.get_json(silent=True) or {}
-    if body.get("confirm") is not True:
-        return jsonify(error="需二次确认：confirm=true 才能开启新的预算周期"), 400
-    new_limits = body.get("limits")
-    if new_limits is not None:
-        if not isinstance(new_limits, dict):
-            return jsonify(error="limits 需为对象"), 400
-        try:
-            current = budget_store.get_current_period()
-        except platform_features.PgFeatureUnavailable as exc:
-            return _budget_error_response(exc, 503, code=exc.code)
-        current_limits = {k: current.get(k) for k in _BUDGET_SETTINGS_FIELDS}
-        validated, verr = _validate_budget_settings(new_limits, current_limits)
-        if verr:
-            return jsonify(error=verr), 400
-        new_limits = validated
-    try:
-        period = budget_store.reset_period(
-            new_limits, created_by=current_identity().get("user_id"))
-        demo_reset_ids = demo_store.reset_demo_runs()
-    except ValueError as exc:
-        return jsonify(error=str(exc)), 400
-    except platform_features.PgFeatureUnavailable as exc:
-        return _budget_error_response(exc, 503, code=exc.code)
-    _audit("ai_budget.reset", target_type="ai_budget_period",
-           target_id=str(period["id"]),
-           detail={"closed_previous": True,
-                   "demo_runs_reset": len(demo_reset_ids)})
-    limits = {k: period.get(k) for k in _BUDGET_SETTINGS_FIELDS}
-    return jsonify(period_id=period["id"], limits=limits,
-                   started_at=period["started_at"],
-                   demo_runs_reset=len(demo_reset_ids))
+    return _turn_budgets_retired_response()
 
 
 # --------------------------------------------------------------------------- #
@@ -5484,7 +5502,8 @@ def admin_v1_overview():
 
     if not platform_features.billing_features_available():
         billing_section = {"available": False, "code": "pg_backend_required"}
-        turn_section = {"available": False, "code": "pg_backend_required"}
+        turn_section = {"available": False, "code": "pg_backend_required",
+                        "legacy": True}
     else:
         try:
             period_start = None
@@ -5530,7 +5549,9 @@ def admin_v1_overview():
                 "provider_balance_snapshot": snapshot,
                 "provider_balance_age_seconds": age,
             })
-            turn_section = {"available": True}
+            # 批次 F：turn 消费闸退役——段保留（冻结历史只读）+ legacy 标记
+            turn_section = {"available": True, "legacy": True,
+                            "note": "turn 消费闸已于批次 F 退役，以下为冻结历史"}
             if report is not None:
                 period = report["period"]
                 turn_section.update({
@@ -5564,9 +5585,9 @@ def admin_v1_users():
     """用户列表（§10.2 只读）：cursor(offset) 分页 + 搜索 + enabled/ai_access 筛选。
 
     每行：display name、login ID 掩码、role、enabled、ai_access、创建时间、
-    注册方式、turn 使用/上限（json 后端 null）、金额余额/caps（未开户 null；
-    json 后端 null）、最近 AI 调用时间（json 后端 null）、campaign/source
-    留位 null（PR4）。
+    注册方式、金额余额/caps（未开户 null；json 后端 null）、最近 AI 调用
+    时间（json 后端 null）、campaign/source 留位 null（PR4）。turn 使用/
+    上限字段已随批次 F turn 消费闸退役删除。
     """
     auth = _require_owner_admin_v1()
     if auth:
@@ -5598,7 +5619,7 @@ def admin_v1_users():
     user_ids = [u.get("user_id") for u in page]
 
     billing_ok = platform_features.billing_features_available()
-    accounts = last_calls = turn_by_user = {}
+    accounts = last_calls = {}
     reg_methods = _admin_v1_registration_methods(user_ids)
     # PR4 来源归因填充（campaign/source 留位）；PG 侧 best-effort（展示用途，
     # 与 reg_methods 同口径：失败按 None 展示，不 fail-closed 整页 500）
@@ -5623,8 +5644,6 @@ def admin_v1_users():
         try:
             accounts = billing_store.admin_account_summaries(user_ids)
             last_calls = billing_store.admin_last_ai_call_by_user()
-            per_user = budget_store.usage_report().get("per_user") or []
-            turn_by_user = {p["subject_id"]: p for p in per_user}
         except platform_features.PgFeatureUnavailable:
             return _admin_v1_pg_required()
         except Exception:
@@ -5634,7 +5653,6 @@ def admin_v1_users():
     items = []
     for u in page:
         uid = str(u.get("user_id") or "")
-        turn = turn_by_user.get(uid)
         acq = acq_by_user.get(uid) or {}
         spend = spend_by_user.get(uid)
         if spend is not None:
@@ -5659,9 +5677,8 @@ def admin_v1_users():
             # PR4：user_acquisition 归因（无行 = 未归因，保持 null）
             "campaign": acq.get("campaign_id"),
             "source": acq.get("source_code"),
-            # 对话额度（turn budget；json 后端无预算权威来源 → null）
-            "turn_used": int(turn["total"]) if turn else None,
-            "turn_limit": int(turn["limit"]) if turn else None,
+            # 批次 F：turn_used/turn_limit 字段删除（turn 消费闸退役；
+            # 金额侧见 billing/spend 字段）
             # 金额余额（billing；未开户 null，绝不伪造 0 余额账户；金额字段
             # 十进制字符串化，§5 v0.3）
             "billing": _admin_v1_nano_out(accounts.get(uid))
@@ -5945,11 +5962,11 @@ def admin_v1_audit():
 
 @app.route("/api/admin/v1/turn-budgets", methods=["GET"])
 def admin_v1_turn_budgets():
-    """现有 turn 预算读取（§9 GET /api/admin/v1/turn-budgets 只读版）。
+    """turn 预算读取（冻结历史，批次 F 起只读 + legacy 标记）。
 
     返回与旧 GET /api/admin/settings/ai-budget 同源的 period/limits/usage
-    （budget_store.usage_report 权威原语）；写方法（update/new-period）属
-    PR5，本批不实现。
+    （budget_store.usage_report 权威原语）；写方法（update/new-period）已随
+    turn 消费闸退役（410 turn_budgets_retired）。
     """
     auth = _require_owner_admin_v1()
     if auth:
@@ -5969,6 +5986,8 @@ def admin_v1_turn_budgets():
     period = report["period"]
     limits = {k: period.get(k) for k in _BUDGET_SETTINGS_FIELDS}
     return jsonify(
+        legacy=True,
+        note="turn 消费闸已于批次 F 退役，以下为冻结历史",
         period={"id": period["id"],
                 "started_at": period["started_at"],
                 "closed_at": period["closed_at"]},
@@ -6336,84 +6355,30 @@ def admin_v1_invites_revoke(invite_id):
 
 @app.route("/api/admin/v1/turn-budgets", methods=["PUT"])
 def admin_v1_turn_budgets_update():
-    """修改当前周期限制（镜像旧 4417：全部 _BUDGET_SETTINGS_FIELDS 可调字段）。"""
+    """已退役（批次 F §7.3 阶段 2）：turn 消费闸随金额硬闸关闭，周期限制不再
+    可写。安全参数迁 PUT /api/admin/v1/settings/runtime；金额额度走
+    /api/admin/v1/spend/*。410 + turn_budgets_retired + audit 尝试。"""
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.budget_features_available():
-        return _admin_v1_pg_required()
-    body = request.get_json(silent=True) or {}
-    if not isinstance(body, dict) or not body:
-        return _admin_v1_error(400, "invalid_request", "缺少预算限制字段")
-    try:
-        current = budget_store.get_current_period()
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
-    except Exception:
-        app.logger.exception("admin v1 turn budgets 读取当前周期失败")
-        return _admin_v1_error(500, "internal", "turn 预算读取失败")
-    current_limits = {k: current.get(k) for k in _BUDGET_SETTINGS_FIELDS}
-    validated, verr = _validate_budget_settings(body, current_limits)
-    if verr:
-        return _admin_v1_error(400, "invalid_request", verr)
-    try:
-        period = budget_store.update_period_limits(validated)
-    except ValueError as exc:
-        return _admin_v1_error(400, "invalid_request", str(exc))
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
-    _audit("ai_budget.update", target_type="ai_budget_period",
-           target_id=str(period["id"]), detail={"fields": sorted(validated)})
-    limits = {k: period.get(k) for k in _BUDGET_SETTINGS_FIELDS}
-    return jsonify(period_id=period["id"], limits=limits)
+    _audit("turn_budgets.retired_write", target_type="ai_budget_period",
+           target_id=None,
+           detail={"endpoint": "PUT /api/admin/v1/turn-budgets"})
+    return _admin_v1_error(410, "turn_budgets_retired",
+                           _TURN_BUDGETS_RETIRED_NOTE)
 
 
 @app.route("/api/admin/v1/turn-budgets/new-period", methods=["POST"])
 def admin_v1_turn_budgets_new_period():
-    """开启新预算周期（镜像旧 4453 reset：confirm 二次确认 + 可选 limits）。
-
-    批次 E 后 reset 的 Demo 侧残余语义：在途 demo run 转 expired 终态
-    （每浏览器累计闸与 24h 成功次数 IP 桶已退役；预算 reservation 由确认式
-    对账定局）。
-    """
+    """已退役（批次 F）：开新预算周期随 turn 消费闸退役。410 + audit 尝试。"""
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.budget_features_available():
-        return _admin_v1_pg_required()
-    body = request.get_json(silent=True) or {}
-    if body.get("confirm") is not True:
-        return _admin_v1_error(400, "confirm_required",
-                               "需二次确认：confirm=true 才能开启新的预算周期")
-    new_limits = body.get("limits")
-    if new_limits is not None:
-        if not isinstance(new_limits, dict):
-            return _admin_v1_error(400, "invalid_request", "limits 需为对象")
-        try:
-            current = budget_store.get_current_period()
-        except platform_features.PgFeatureUnavailable:
-            return _admin_v1_pg_required()
-        current_limits = {k: current.get(k) for k in _BUDGET_SETTINGS_FIELDS}
-        validated, verr = _validate_budget_settings(new_limits, current_limits)
-        if verr:
-            return _admin_v1_error(400, "invalid_request", verr)
-        new_limits = validated
-    try:
-        period = budget_store.reset_period(
-            new_limits, created_by=current_identity().get("user_id"))
-        demo_reset_ids = demo_store.reset_demo_runs()
-    except ValueError as exc:
-        return _admin_v1_error(400, "invalid_request", str(exc))
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
-    _audit("ai_budget.reset", target_type="ai_budget_period",
-           target_id=str(period["id"]),
-           detail={"closed_previous": True,
-                   "demo_runs_reset": len(demo_reset_ids)})
-    limits = {k: period.get(k) for k in _BUDGET_SETTINGS_FIELDS}
-    return jsonify(period_id=period["id"], limits=limits,
-                   started_at=period["started_at"],
-                   demo_runs_reset=len(demo_reset_ids))
+    _audit("turn_budgets.retired_write", target_type="ai_budget_period",
+           target_id=None,
+           detail={"endpoint": "POST /api/admin/v1/turn-budgets/new-period"})
+    return _admin_v1_error(410, "turn_budgets_retired",
+                           _TURN_BUDGETS_RETIRED_NOTE)
 
 
 @app.route("/api/admin/v1/billing/accounts/<user_id>/caps", methods=["PUT"])
@@ -6917,13 +6882,47 @@ def admin_v1_users_spend_override_clear(user_id):
 # --------------------------------------------------------------------------- #
 # 批次 D：设置聚合（§6.1/§6.5 admin.settings.get 的数据源，只读）
 # --------------------------------------------------------------------------- #
-#: 运行时安全参数（§1.2「继续保留并统一到运行时设置」的子集；与
-#: _BUDGET_SETTINGS_FIELDS 同源——demo_per_browser_limit/demo_turn_limit 等
-#: 消费类次数额度属批次 F 退役对象，不在设置页展示）
+#: 运行时安全参数（§1.2「继续保留并统一到运行时设置」的子集；批次 F 起
+#: 权威源 = platform_settings 的 ai_safety.* 键（settings_store），0027 backfill
+#: 已从 ai_budget_periods 列搬值；消费类次数额度属批次 F 退役对象，不在
+#: 设置页展示）
 _SETTINGS_RUNTIME_FIELDS = (
     "demo_enabled", "platform_task_max_steps", "demo_task_max_steps",
     "own_task_max_steps_limit", "demo_max_concurrency",
 )
+
+
+def _validate_runtime_settings(body):
+    """校验 runtime 安全参数子集（批次 F；规则照抄 _validate_budget_settings：
+    整数为 >0 且 ≤ _BUDGET_LIMIT_MAX，demo_enabled 布尔）。
+
+    返回 (validated, None) 或 (None, err)。允许部分更新（与 settings.update
+    逐项提交模式对齐）；空对象 / 未知字段拒绝。
+    """
+    if not isinstance(body, dict) or not body:
+        return None, "缺少运行时安全参数字段"
+    unknown = set(body.keys()) - set(_SETTINGS_RUNTIME_FIELDS)
+    if unknown:
+        return None, "未知字段：{}".format(", ".join(sorted(unknown)))
+    validated = {}
+    for field in _SETTINGS_RUNTIME_FIELDS:
+        if field not in body:
+            continue
+        raw = body.get(field)
+        if field == "demo_enabled":
+            if not isinstance(raw, bool):
+                return None, "demo_enabled 需为布尔值"
+            validated[field] = raw
+            continue
+        iv, err = _coerce_tuning_int(raw, field)
+        if err:
+            return None, err
+        if iv <= 0:
+            return None, "{} 需为正整数（> 0）".format(field)
+        if iv > _BUDGET_LIMIT_MAX:
+            return None, "{} 不可超过 {}".format(field, _BUDGET_LIMIT_MAX)
+        validated[field] = iv
+    return validated, None
 
 
 @app.route("/api/admin/v1/settings", methods=["GET"])
@@ -6999,10 +6998,13 @@ def admin_v1_settings():
             app.logger.exception("admin v1 settings spend 段读取失败")
             payload["spend"] = {"available": False, "code": "internal"}
         try:
-            period = budget_store.get_current_period()
+            # 批次 F：运行时安全参数自 ai_budget_periods 列迁居
+            # platform_settings（settings_store.get_ai_safety_settings，
+            # 0027 backfill 已搬值；缺省回落 DEFAULT_* 常量）
+            safety = settings_store.get_ai_safety_settings()
             payload["runtime"] = {
                 "available": True,
-                "limits": {k: period.get(k) for k in _SETTINGS_RUNTIME_FIELDS},
+                "limits": {k: safety.get(k) for k in _SETTINGS_RUNTIME_FIELDS},
                 # Demo IP 短窗口请求速率现状（只读观测：批次 E 起 env 配置
                 # DEMO_IP_RATE_PER_MINUTE，≤0 关闭；admin 可写入口不在本批）
                 "demo_ip_request_rate_per_minute": demo_store.ip_rate_limit(),
@@ -7040,6 +7042,39 @@ def admin_v1_settings_registration_put():
         status, code, message = err
         return _admin_v1_error(status, code, message)
     return jsonify(**payload)
+
+
+@app.route("/api/admin/v1/settings/runtime", methods=["PUT"])
+def admin_v1_settings_runtime_put():
+    """更新运行时安全参数（批次 F：替代已退役的 PUT /api/admin/v1/turn-budgets）。
+
+    body 为五安全参数子集（demo_enabled / platform_task_max_steps /
+    demo_task_max_steps / own_task_max_steps_limit / demo_max_concurrency）；
+    校验同 _SETTINGS_RUNTIME_FIELDS 口径（照抄 _validate_budget_settings：
+    正整数 ≤ _BUDGET_LIMIT_MAX、demo_enabled 布尔）。写入
+    settings_store.set_ai_safety_settings（UPSERT + **同事务 audit**
+    action=ai_safety.settings_update），返回写入后的全量五键。
+    json/dual → 503 pg_backend_required（platform_settings 不可写）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    body = request.get_json(silent=True) or {}
+    validated, verr = _validate_runtime_settings(body)
+    if verr:
+        return _admin_v1_error(400, "invalid_request", verr)
+    try:
+        after = settings_store.set_ai_safety_settings(
+            validated, actor_user_id=actor_identity().get("user_id"),
+            updated_by=current_identity().get("user_id"))
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    except Exception:
+        app.logger.exception("admin v1 runtime 安全参数更新失败")
+        return _admin_v1_error(500, "internal", "运行时安全参数更新失败")
+    return jsonify(limits={k: after.get(k) for k in _SETTINGS_RUNTIME_FIELDS})
 
 
 # --------------------------------------------------------------------------- #
@@ -9959,38 +9994,28 @@ def _parse_client_request_id(body):
     return rid, None
 
 
-def _current_budget_period_or_none():
-    """读当前预算周期；postgres 之外 / 读失败 → None（按常量默认值降级取步数）。
-
-    注意 PG 下首次调用会创建默认周期行（get_or_create 语义，幂等）。
-    """
-    if not platform_features.budget_features_available():
-        return None
-    try:
-        return budget_store.get_current_period()
-    except Exception:
-        app.logger.warning("读取 AI 预算周期失败，步数按默认值注入", exc_info=True)
-        return None
-
-
 def _platform_task_max_steps() -> int:
-    """注册用户平台 AI 单次任务步骤（周期 platform_task_max_steps，默认 20）。"""
-    period = _current_budget_period_or_none()
-    raw = (period or {}).get("platform_task_max_steps")
+    """注册用户平台 AI 单次任务步骤（ai_safety.platform_task_max_steps，默认 20）。
+
+    批次 F：自周期列迁居 platform_settings（settings_store 统一设置源）；
+    周期行仅在软闸回退路径（reserve_turn）与冻结报表中继续存在。
+    """
     try:
+        raw = settings_store.get_ai_safety_settings()[
+            "platform_task_max_steps"]
         v = int(raw)
-    except (TypeError, ValueError):
+    except Exception:
         v = budget_store.DEFAULT_PLATFORM_TASK_MAX_STEPS
     return max(1, min(v, _MAX_STEPS_LIMIT))
 
 
 def _own_task_max_steps_limit() -> int:
-    """自带 API 可设置的步数硬上限（周期 own_task_max_steps_limit，默认 500）。"""
-    period = _current_budget_period_or_none()
-    raw = (period or {}).get("own_task_max_steps_limit")
+    """自带 API 可设置的步数硬上限（ai_safety.own_task_max_steps_limit，默认 500）。"""
     try:
+        raw = settings_store.get_ai_safety_settings()[
+            "own_task_max_steps_limit"]
         v = int(raw)
-    except (TypeError, ValueError):
+    except Exception:
         v = budget_store.DEFAULT_OWN_TASK_MAX_STEPS_LIMIT
     return max(1, min(v, _MAX_STEPS_LIMIT))
 
@@ -10068,64 +10093,112 @@ def _user_ai_access_denied(user_id):
     return None
 
 
-def _ai_reserve_run_budget(user_ctx, request_id):
-    """起跑前预占一次 AI 对话额度（docs §5.3/§9.4 + P0-B §3.7）。
+def _spend_mode_snapshot():
+    """读一次当前 spend enforcement 模式（批次 F：请求内快照，防止中途切换撕裂）。
 
-    返回 (reservation|None, error_response|None)：
-      - platform 凭据 + postgres：ai_access 闸（user 默认 false 需 owner 授予）
-        → 原子预占（owner/user 分别计入对应维度：总量 / owner 保留保护 /
-        user 共享池 / 每 user）；超限映射 429 + 稳定 code
-        （platform_ai_budget_exhausted / user_budget_exhausted /
-        user_pool_budget_exhausted / owner_reserve_protected /
-        demo_budget_exhausted），不回退其它凭据；
+    读失败回落 ``shadow``（= turn 消费闸照旧生效的软闸语义，fail-safe：
+    不知道金额闸是否硬，就不关闭既有消费保护）。json/dual 后端不会走到本
+    函数（_ai_reserve_run_budget 的 PG 守卫先行）。
+    """
+    try:
+        return spend_store.enforcement_mode()
+    except platform_features.PgFeatureUnavailable:
+        raise
+    except Exception:
+        app.logger.warning("读取 spend enforcement 模式失败（按 shadow 处理）",
+                           exc_info=True)
+        return spend_store.DEFAULT_ENFORCEMENT_MODE
+
+
+def _ai_reserve_run_budget(user_ctx, request_id):
+    """起跑前的消费闸分流（docs §5.3/§9.4 + 批次 F §7.3 阶段 2）。
+
+    返回 (reservation|None, error_response|None)。**模式快照**在本函数开头
+    读一次并经返回值/闭包传递（同一请求内不重读，避免中途切模式撕裂）：
+
+    - 金额硬闸（``spend_store.mode_is_hard(mode, subject_type)`` 为真，批次 F
+      起全主体 all 模式）：**完全跳过** budget_store.reserve_turn——不写
+      reservations、不做 usage 平移、不查任何 turn 闸（消费额度由金额闸
+      独占，§7.3「禁止双关/避免双重计费」）。request_id 幂等与跨主体拒绝
+      改由 ai_run_bindings 承担：此处做只读预检（已有绑定行且主体不一致 →
+      409 request_id_subject_conflict，与旧 reservation 行为/HTTP 映射一致）；
+      绑定行的写入在 _ai_budget_lifecycle.on_accepted（携带 HP session id）。
+    - 软闸回退（shadow / registered 下 demo）：现有 reserve_turn 行为**逐字
+      保留**（owner 的 reset 回退底板）——预占/超限 429/ai_access 闸全不变。
+
+    其余分支与既有语义一致：
       - platform 凭据 + json/dual：生产 fail-closed（503 pg_backend_required）；
         仅 TESTING bypass 放行（不预占）；
       - own 凭据：postgres 记可观测用量（不扣平台总量）；json 放行不记账；
-      - 凭据缺失（None）：交由 _build_sidecar_config 的 400 分支处理，这里直放。
+      - 凭据缺失（None）：交由 _build_sidecar_config 的 400 分支处理。
     """
     source, _cred = _resolve_ai_credentials(user_ctx)
     if source is None:
-        return None, None
+        return None, None, None
     subject_type, subject_id = _ai_budget_subject(user_ctx)
     if subject_type == "user":
         denied = _user_ai_access_denied(subject_id)
         if denied is not None:
-            return None, denied
+            return None, denied, None
+    mode = None
+    if platform_features.budget_features_available():
+        # 模式快照只在 PG 后端读（json/dual 的 fail-closed 守卫在下方先行
+        # 返回）；同一请求内不重读，避免中途切模式撕裂
+        mode = _spend_mode_snapshot()
+        if spend_store.mode_is_hard(mode, subject_type):
+            # 金额硬闸分支：turn 消费闸关闭（不写 reservations、不做 usage
+            # 平移、不查任何 turn 闸）。只做 run binding 的主体预检（只读，
+            # 不是 turn 闸）——跨主体复用同一 request_id 必须确定性拒绝
+            # （409，与旧 reservation 路径同码）。
+            try:
+                binding = budget_store.get_run_binding(request_id)
+            except budget_store.BudgetError as exc:
+                return None, _budget_error_response(exc, 409), None
+            if binding is not None and (
+                    binding["subject_type"] != subject_type
+                    or binding["subject_id"] != subject_id):
+                return None, _budget_error_response(
+                    budget_store.RequestIdSubjectConflict(
+                        "request_id 已被其他主体使用，不能复用",
+                        request_id=request_id), 409), None
+            return None, None, {"hard": True, "mode": mode,
+                                "subject_type": subject_type,
+                                "subject_id": subject_id}
     if not platform_features.budget_features_available():
         if source == "own":
-            return None, None  # json：own 放行但不记账（docs §4.3）
+            return None, None, None  # json：own 放行但不记账（docs §4.3）
         if _budget_testing_bypass():
-            return None, None  # 仅 pytest（见 _budget_testing_bypass 注释）
+            return None, None, None  # 仅 pytest（见 _budget_testing_bypass 注释）
         return None, (
             jsonify(error="平台 AI 需要启用预算（STORAGE_BACKEND=postgres）；"
                           "当前后端不支持无配额放行",
                     code=platform_features.PgFeatureUnavailable.code),
             503,
-        )
+        ), None
     try:
         resv = budget_store.reserve_turn(request_id, subject_type, subject_id, source)
-        return resv, None
+        return resv, None, None
     except budget_store.PlatformBudgetExhausted as exc:
-        return None, _budget_error_response(exc, 429)
+        return None, _budget_error_response(exc, 429), None
     except budget_store.UserBudgetExhausted as exc:
-        return None, _budget_error_response(exc, 429)
+        return None, _budget_error_response(exc, 429), None
     except budget_store.UserPoolBudgetExhausted as exc:
-        return None, _budget_error_response(exc, 429)
+        return None, _budget_error_response(exc, 429), None
     except budget_store.OwnerReserveProtected as exc:
-        return None, _budget_error_response(exc, 429)
+        return None, _budget_error_response(exc, 429), None
     except budget_store.DemoConcurrencyExceeded as exc:
-        return None, _budget_error_response(exc, 429)
+        return None, _budget_error_response(exc, 429), None
     except budget_store.DemoBudgetExhausted as exc:
-        return None, _budget_error_response(exc, 429)
+        return None, _budget_error_response(exc, 429), None
     except budget_store.BudgetError as exc:
-        return None, _budget_error_response(exc, 409)
+        return None, _budget_error_response(exc, 409), None
     except platform_features.PgFeatureUnavailable:
         # 双重保险：budget_features_available 与 store 守卫口径一致，正常不可达
         if source == "own":
-            return None, None
+            return None, None, None
         return None, _budget_error_response(
             platform_features.PgFeatureUnavailable(), 503,
-            code="pg_backend_required")
+            code="pg_backend_required"), None
 
 
 def _budget_error_response(exc, status, code=None):
@@ -10136,14 +10209,22 @@ def _budget_error_response(exc, status, code=None):
     )
 
 
-def _ai_budget_lifecycle(request_id, reservation):
+def _ai_budget_lifecycle(request_id, reservation, hard_ctx=None):
     """构造 (on_accepted, on_rejected) 回调（_proxy_sse 在拿到 HistoPilot 结果时调）。
 
-    - on_accepted(session_id)：2xx → consume（HistoPilot 已接受执行，计 1 次；
-      幂等：已 consumed 直接返回）；
-    - on_rejected()：4xx/5xx/连接失败 → release（未接受不扣额度；已 consumed
-      的拒绝释放，防误退款——budget_store.release 内保证）。
-    回调内部吞异常（记账失败不打断流式响应，只记 log 交由对账兜底）。
+    批次 F 双分支（``hard_ctx`` 为 _ai_reserve_run_budget 的硬闸上下文快照，
+    含 mode/subject_type/subject_id；软闸路径传 None）：
+
+    - 软闸（reservation 非 None）：行为与批次 F 之前**逐字保留**——
+      on_accepted(session_id) → consume（2xx 已接受，计 1 次；幂等）；
+      on_rejected() → release（未接受不扣额度；已 consumed 拒绝释放防误退款）；
+    - 硬闸（hard_ctx 非 None）：turn 闸已关闭，无 reservation 可消费——
+      on_accepted(session_id) → ``budget_store.record_run_binding``（写入
+      ai_run_bindings：request_id 幂等 + 主体绑定，供 usage/hold 解析第①步；
+      replayed=重试命中）。吞异常记 log（记账失败不打断流式响应，与旧
+      consume 同策略——绑定缺失时事件按 usage_subject_not_ready 进重试，
+      对账兜底）；on_rejected → no-op（无预占可退）。
+
     consume/release 带上本请求 reserve 时的 attempt。在途 reserved 重放
     （reservation.replayed）失败不得 release；后来的 replay 会递增
     rollback_epoch，原请求即使用捕获到的 replayed=false 去 release，
@@ -10153,8 +10234,27 @@ def _ai_budget_lifecycle(request_id, reservation):
     rollback_epoch = None if reservation is None else int(
         reservation.get("rollback_epoch") or 0)
     replayed = bool(reservation and reservation.get("replayed"))
+    hard = bool(hard_ctx and hard_ctx.get("hard"))
 
     def on_accepted(session_id):
+        if hard:
+            # 硬闸分支：写 run→主体权威绑定（不是消费记账）。installation_id
+            # 取 histopilot installation（未引导时 None，仅审计上下文）
+            try:
+                budget_store.record_run_binding(
+                    request_id, session_id or "",
+                    hard_ctx["subject_type"], hard_ctx["subject_id"],
+                    installation_id=((_HISTOPILOT_INSTALLATION or {}).get(
+                        "installation_id")))
+            except budget_store.BudgetError:
+                app.logger.warning(
+                    "AI run binding 记录冲突（request_id=%s，交由对账兜底）",
+                    request_id, exc_info=True)
+            except Exception:
+                app.logger.warning(
+                    "AI run binding 记录失败（request_id=%s，交由对账兜底）",
+                    request_id, exc_info=True)
+            return
         if reservation is None:
             return
         try:
@@ -10170,6 +10270,8 @@ def _ai_budget_lifecycle(request_id, reservation):
                 exc_info=True)
 
     def on_rejected():
+        if hard:
+            return  # 硬闸分支无预占可退（turn 闸已关闭）
         if reservation is None:
             return
         if replayed:
@@ -10332,7 +10434,7 @@ def _ai_run_prepare(user_ctx, body, slide, need_grant):
     # 插件能力注入（docs §5.1）：官方模式专用——demo 路径（/api/demo/ai/run）
     # 直接用 _build_sidecar_config 组装，不经本函数，零改动。
     injected = _inject_agent_extra_tools(user_ctx, slide, config)
-    resv, budget_err = _ai_reserve_run_budget(user_ctx, rid)
+    resv, budget_err, hard_ctx = _ai_reserve_run_budget(user_ctx, rid)
     if budget_err is not None:
         # 形状防御：err 必须是 Flask (body, status) tuple（曾因包裹层级错误
         # 产生裸 int 导致 500），异常形状按内部错误处理而非透传。
@@ -10342,7 +10444,7 @@ def _ai_run_prepare(user_ctx, body, slide, need_grant):
         # §3.10 P0-C：预算拒绝 → 已签发的 grant 立即撤销（不留给 TTL）。
         _revoke_grant_in_config(config, reason="run_rejected")
         return budget_err
-    on_accepted, on_rejected = _ai_budget_lifecycle(rid, resv)
+    on_accepted, on_rejected = _ai_budget_lifecycle(rid, resv, hard_ctx=hard_ctx)
     # §3.10 P0-C：grant 生命周期回调——run 被拒（4xx/5xx/连接失败）→ 撤销本轮
     # grant；run 结束（上游 SSE 正常关流）→ 撤销绑定到该 session 的 grant。
     grant_id = ((config.get("run_grant") or {}).get("grant_id")) or ""
@@ -12983,7 +13085,7 @@ def plugin_v1_run_grant_verify():
 # usage ingestion（admin-billing 方案 §7.5；批次 C 起为 hold settle 的孪生链）
 #
 # HistoPilot durable usage outbox 的投递端点：每次真实 provider 调用一个事件，
-# 单事务完成 dedup（payload_hash 比对）→ §7.2 四步权威主体解析 → 时钟/算术
+# 单事务完成 dedup（payload_hash 比对）→ §7.2 权威主体解析 → 时钟/算术
 # 校验 → 双 price book 计价写回（或 unpriced+reason）→ debit（shadow=PR6 模拟
 # 软扣费 best-effort；registered/all × user/owner=真实 debit 强一致）→ 窗口
 # spent 投影（§3.2/§3.4.5）→ 无敏感信息 audit。demo 主体只计量、不开户。

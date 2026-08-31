@@ -30,8 +30,14 @@
     已 released → 重新预占（上次尝试已退款，重试属新执行尝试，attempt+1）；
   - release/consume 可带 expected_attempt 做 CAS；release 还可带
     expected_rollback_epoch，使后来的 reserved 重放令旧 rollback 失败；
-  - reclaim_expired 只按时间回收（state=reserved 且过期）；
-    「HistoPilot 不可达不释放、顺延」的对账语义由上层调用方负责。
+  - 「HistoPilot 不可达不释放、顺延」的对账语义由上层调用方负责（历史上
+    曾有按时间盲回收的 reclaim_expired 原语，已随确认式对账删除）。
+
+批次 F（docs §7.3 阶段 2）：金额硬闸（spend_enforcement_mode）覆盖的主体
+其 turn 消费闸在**调用点**分流关闭——mode_is_hard(mode, subject) 为真时
+app 层不再调用 reserve_turn（软闸回退路径逐字保留），本模块内部逻辑不变；
+owner/user 的 run→主体权威绑定改由 ai_run_bindings（record_run_binding /
+get_run_binding）承担。ai_budget_* 表/列全部保留（冻结历史 + 只读报表兼容）。
 
 json/dual 后端：全部公共入口经 platform_features.require_pg_backend fail-closed
 （不静默退化内存计数）。本模块不接 Flask 路由。
@@ -275,7 +281,7 @@ def _count_reserved(cur, period_id, subject_type=None) -> int:
 _DEMO_WINDOW_HOURS = 24
 
 #: 计入 Demo 每日窗口的 reservation 状态：consumed（已消费）+ reserved（预占中）。
-#: released（含显式释放与 reclaim_expired 过期回收）已退款，不计入。
+#: released（显式释放；盲时间回收原语已删除）已退款，不计入。
 _DEMO_WINDOW_STATES = ("consumed", "reserved")
 
 
@@ -768,36 +774,100 @@ def release(request_id, expected_attempt=None, expected_rollback_epoch=None):
         conn.close()
 
 
-def reclaim_expired(now=None):
-    """惰性回收过期预占：state=reserved 且 reservation_expires_at < now → released。
+# --------------------------------------------------------------------------- #
+# run→主体绑定（批次 F：金额时代 ai_run_bindings，替代 reservations 的绑定角色）
+# --------------------------------------------------------------------------- #
+#: ai_run_bindings 出口列（时间为 epoch 秒 float，对齐仓库惯例）
+_RUN_BINDING_SEL = (
+    "request_id, subject_type, subject_id, histopilot_session_id, "
+    "installation_id, extract(epoch from created_at)::float8 AS created_at"
+)
 
-    回收同时回退 usage（reserved-1）。返回本次回收的 reservation 列表。
-    注意：本函数**只按时间回收**；「HistoPilot 不可达不释放、顺延过期」的
-    对账语义由上层调用方负责（对账逻辑不在数据层）。
+#: 允许入 ai_run_bindings 的主体（demo 绑定归 demo_runs.histopilot_session_id，
+#: 0026；本表不覆盖 demo——CHECK 约束同口径）
+_RUN_BINDING_SUBJECT_TYPES = ("owner", "user")
+
+
+def record_run_binding(request_id, session_id, subject_type, subject_id,
+                       installation_id=None):
+    """记录一条金额时代的 run→主体权威绑定（批次 F，docs §7.3 阶段 2）。
+
+    金额硬闸（spend_enforcement_mode 覆盖 owner/user）下起跑不再写
+    ai_budget_reservations：run 的 request_id 幂等与计费主体归属由
+    ai_run_bindings 承担。本函数在 HistoPilot 2xx 接受后调用（on_accepted
+    携带 histopilot_session_id），供随后到达的 usage event / hold authorize
+    做 §7.2 第①步解析。
+
+    幂等/冲突语义对齐旧 reserve_turn 的 request_id 行为：
+      - 首次写入 → 返回行，``replayed=False``；
+      - 已有行且 subject_type/subject_id/histopilot_session_id 一致 → 原样
+        返回并标 ``replayed=True``（网络重试不产生第二行）；
+      - 已有行但主体或 session 不一致 → :class:`RequestIdSubjectConflict`
+        （禁止跨主体复用同一 request_id；HTTP 映射 409，与旧路径一致）；
+      - subject_type 仅接受 owner/user（demo 不入本表，ValueError）。
     """
     platform_features.require_pg_backend("ai_budget")
-    ts = float(now if now is not None else time.time())
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError("request_id 不能为空")
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id 不能为空")
+    if subject_type not in _RUN_BINDING_SUBJECT_TYPES:
+        raise ValueError("subject_type 需为 %s（demo 绑定归 demo_runs）"
+                         % (_RUN_BINDING_SUBJECT_TYPES,))
+    if not isinstance(subject_id, str) or not subject_id:
+        raise ValueError("subject_id 不能为空")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT " + _RESERVATION_SEL +
-                    " FROM ai_budget_reservations "
-                    "WHERE state='reserved' AND reservation_expires_at < "
-                    "to_timestamp(%s) ORDER BY reserved_at FOR UPDATE", (ts,))
-                rows = cur.fetchall()
-                out = []
-                for row in rows:
-                    cur.execute(
-                        "UPDATE ai_budget_reservations SET state='released', "
-                        "updated_at=now() WHERE request_id=%s",
-                        (row["request_id"],))
-                    _shift_usage(cur, row, accepted_delta=0, reserved_delta=-1)
-                    r = _reservation_out(row)
-                    r["state"] = "released"
-                    out.append(r)
+                    "INSERT INTO ai_run_bindings "
+                    "(request_id, subject_type, subject_id, "
+                    " histopilot_session_id, installation_id) "
+                    "VALUES (%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (request_id) DO NOTHING "
+                    "RETURNING " + _RUN_BINDING_SEL,
+                    (request_id, subject_type, subject_id, session_id,
+                     installation_id))
+                row = cur.fetchone()
+                if row is not None:
+                    out = dict(row)
+                    out["replayed"] = False
+                    return out
+                # 冲突回读：主体一致性在返回前校验（与 reserve_turn 的
+                # 「所有状态分支之前校验主体」同一安全属性）
+                cur.execute(
+                    "SELECT " + _RUN_BINDING_SEL +
+                    " FROM ai_run_bindings WHERE request_id=%s",
+                    (request_id,))
+                existing = cur.fetchone()
+                if (existing["subject_type"] != subject_type
+                        or existing["subject_id"] != subject_id
+                        or existing["histopilot_session_id"] != session_id):
+                    raise RequestIdSubjectConflict(
+                        "request_id 已被其他主体或会话使用，不能复用",
+                        request_id=request_id)
+                out = dict(existing)
+                out["replayed"] = True
                 return out
+    finally:
+        conn.close()
+
+
+def get_run_binding(request_id):
+    """按 request_id 读 run 绑定（只读）；不存在返回 None。"""
+    platform_features.require_pg_backend("ai_budget")
+    if not isinstance(request_id, str) or not request_id:
+        return None
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT " + _RUN_BINDING_SEL +
+                    " FROM ai_run_bindings WHERE request_id=%s", (request_id,))
+                row = cur.fetchone()
+        return dict(row) if row is not None else None
     finally:
         conn.close()
 
@@ -823,8 +893,8 @@ def list_reserved_expired(now=None):
     """列出 reserved 且 reservation_expires_at < now 的预占（对账用，不改状态）。
 
     上层按 request_id 经 HistoPilot /session/by-request/<rid> 反查确认终态后，
-    再决定 consume / release / 顺延（docs §5.3-6；reclaim_expired 的盲时间回收
-    会把 HistoPilot 已接受的执行误退款）。
+    再决定 consume / release / 顺延（docs §5.3-6；历史上的盲时间回收原语
+    reclaim_expired 已删除——它会把 HistoPilot 已接受的执行误退款）。
     """
     platform_features.require_pg_backend("ai_budget")
     ts = float(now if now is not None else time.time())

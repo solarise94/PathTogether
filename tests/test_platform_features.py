@@ -61,8 +61,11 @@ def test_budget_store_fail_closed_on_json_and_dual(monkeypatch, backend):
         budget_store.consume("req_x", "hp_sess")
     with pytest.raises(platform_features.PgFeatureUnavailable):
         budget_store.release("req_x")
+    # 批次 F：ai_run_bindings 原语（盲时间回收 reclaim_expired 已删除）
     with pytest.raises(platform_features.PgFeatureUnavailable):
-        budget_store.reclaim_expired()
+        budget_store.record_run_binding("req_x", "sess_x", "owner", "usr_1")
+    with pytest.raises(platform_features.PgFeatureUnavailable):
+        budget_store.get_run_binding("req_x")
     with pytest.raises(platform_features.PgFeatureUnavailable):
         budget_store.usage_report()
     with pytest.raises(platform_features.PgFeatureUnavailable):

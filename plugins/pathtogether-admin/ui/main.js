@@ -752,9 +752,7 @@
     kvRow(dl, "AI access", u.ai_access ? "是" : "否");
     kvRow(dl, "创建时间", fmtTs(u.created_at));
     kvRow(dl, "注册方式", u.registration_method);
-    kvRow(dl, "对话额度（用/上限）",
-          u.turn_used === null || u.turn_used === undefined
-          ? "—" : (u.turn_used + " / " + u.turn_limit));
+    // 批次 F：对话额度（turn_used/turn_limit）字段已随 turn 消费闸退役删除
     // 金额余额：null = 尚未开户（不显示 0）
     kvRow(dl, "金额余额", u.billing ? fmtNano(u.billing.balance_nano) : "未开户");
     kvRow(dl, "soft/hard cap（兼容字段，非当前月额度）", u.billing
@@ -1722,15 +1720,18 @@
     });
   }
 
+  // 批次 F：turn 消费闸退役——本卡降级为只读 legacy 展示（GET 冻结历史）；
+  // 编辑/保存/开新周期的桥方法已删除（服务端写端点 410 turn_budgets_
+  // retired），仅保留只读 get。
   function loadTurnBudgetCard() {
     var dl = $("adm-billing-turn");
     request("admin.turnBudgets.get", {}).then(function (res) {
       hideError();
-      prefillTurnEditForm(res.limits || {});
       if (!dl) return;
       dl.textContent = "";
       var period = res.period || {};
       var usage = res.usage || {};
+      kvRow(dl, "状态", "已退役（金额预算接管）");
       kvRow(dl, "周期", "#" + fmtNum(period.id) + "（" + fmtTs(period.started_at) + " 起）");
       kvRow(dl, "平台（用/上限）",
             fmtNum(usage.platform && usage.platform.total) + " / " +
@@ -1738,7 +1739,6 @@
       kvRow(dl, "用户共享池（用/上限）",
             fmtNum(usage.user_pool && usage.user_pool.total) + " / " +
             fmtNum(usage.user_pool && usage.user_pool.limit));
-      kvRow(dl, "用户单人额度上限", fmtNum(res.limits && res.limits.user_turn_limit));
       kvRow(dl, "Demo（24h 窗口/日上限）",
             fmtNum(usage.demo && usage.demo.total) + " / " + fmtNum(usage.demo && usage.demo.limit));
       kvRow(dl, "owner 保留池（用/保留）",
@@ -1750,77 +1750,6 @@
       if (dl) { dl.textContent = ""; kvRow(dl, "可用性", errText(err)); }
       else handleErr(err, null);
     });
-  }
-
-  // turn 预算限制编辑（PR5）：输入框 id → 限制字段映射（与服务端
-  // _BUDGET_SETTINGS_FIELDS 同源）；保存不清空用量，未填字段沿用现值。
-  var _TURN_FIELDS = [
-    ["adm-turn-platform", "platform_turn_limit"],
-    ["adm-turn-demo", "demo_turn_limit"],
-    ["adm-turn-user", "user_turn_limit"],
-    ["adm-turn-owner-reserve", "owner_reserved_turn_limit"],
-    ["adm-turn-user-pool", "user_pool_turn_limit"],
-    ["adm-turn-psteps", "platform_task_max_steps"],
-    ["adm-turn-ownsteps", "own_task_max_steps_limit"],
-    ["adm-turn-demosteps", "demo_task_max_steps"],
-    ["adm-turn-perbrowser", "demo_per_browser_limit"],
-    ["adm-turn-concurrency", "demo_max_concurrency"],
-  ];
-
-  function prefillTurnEditForm(limits) {
-    _TURN_FIELDS.forEach(function (pair) {
-      var el = $(pair[0]);
-      if (el && limits[pair[1]] !== null && limits[pair[1]] !== undefined) {
-        el.value = String(limits[pair[1]]);
-      }
-    });
-    var demoEnabled = $("adm-turn-demo-enabled");
-    if (demoEnabled) demoEnabled.checked = !!limits.demo_enabled;
-  }
-
-  function saveTurnBudget() {
-    var payload = {};
-    for (var i = 0; i < _TURN_FIELDS.length; i++) {
-      var el = $(_TURN_FIELDS[i][0]);
-      var raw = el ? String(el.value || "").trim() : "";
-      if (!raw) continue; // 未填字段沿用现值（服务端按子集合并校验）
-      var v = Number(raw);
-      if (!Number.isSafeInteger(v) || v < 0) {
-        setStatus("adm-turn-edit-status",
-                  _TURN_FIELDS[i][1] + " 需为非负整数");
-        return;
-      }
-      payload[_TURN_FIELDS[i][1]] = v;
-    }
-    var demoEnabled = $("adm-turn-demo-enabled");
-    payload.demo_enabled = !!(demoEnabled && demoEnabled.checked);
-    setStatus("adm-turn-edit-status", "保存中…");
-    request("admin.turnBudgets.update", payload).then(function (res) {
-      setStatus("adm-turn-edit-status",
-        "已保存（周期 #" + fmtNum(res && res.period_id) + "，用量保留）");
-      loadTurnBudgetCard();
-    }).catch(function (err) {
-      showError(err && err.code, err && err.message);
-      setStatus("adm-turn-edit-status", errText(err));
-    });
-  }
-
-  function startNewTurnPeriod() {
-    askConfirm($("adm-turn-confirm"),
-      "确认开启新的预算周期？本周期用量归零（旧行保留供排查），Demo 每浏览器/" +
-      "IP 辅闸一并放开。此操作不可撤销。",
-      function () {
-        setStatus("adm-turn-edit-status", "开新周期中…");
-        request("admin.turnBudgets.newPeriod", {}).then(function (res) {
-          setStatus("adm-turn-edit-status",
-            "已开启周期 #" + fmtNum(res && res.period_id) +
-            "（重置 Demo runs " + fmtNum(res && res.demo_runs_reset) + "）");
-          loadTurnBudgetCard();
-        }).catch(function (err) {
-          showError(err && err.code, err && err.message);
-          setStatus("adm-turn-edit-status", errText(err));
-        });
-      });
   }
 
   // ------------------------------------------------------------------
@@ -2434,8 +2363,6 @@
       windowSubjectSelect.addEventListener("change", renderWindowInfo);
     }
     // turn 预算 / 金额账户写操作（PR5）
-    onClick("adm-turn-save-btn", saveTurnBudget);
-    onClick("adm-turn-newperiod-btn", startNewTurnPeriod);
     onClick("adm-acct-load-btn", loadBillingAccount);
     onClick("adm-caps-save-btn", saveCaps);
     onClick("adm-adjust-btn", submitAdjustment);

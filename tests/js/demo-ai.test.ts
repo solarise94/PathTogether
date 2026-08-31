@@ -318,6 +318,86 @@ describe("demo.js 终态 session 不循环重连", () => {
 	});
 });
 
+// =========================================================================
+// 批次 F：金额口径置灰（spend 段优先，缺省回退 turn 口径 budget 段）
+// =========================================================================
+describe("demo.js 金额口径 spend 置灰（批次 F）", () => {
+	function configFetch(cfg: Record<string, unknown>) {
+		return vi.fn((url: string) => {
+			const u = String(url);
+			if (u.includes("/api/demo/config")) {
+				return jsonResponse(cfg);
+			}
+			return jsonResponse({});
+		}) as unknown as typeof fetch;
+	}
+
+	function runButton(w: ReturnType<typeof loadDemo>) {
+		return (globalThis as { document: { getElementById: (id: string) => { disabled: boolean; textContent: string } } })
+			.document.getElementById("ai-run-btn");
+	}
+
+	it("spend.demo_exhausted=true → spend_budget_exhausted 置灰", async () => {
+		const w = loadDemo(configFetch({
+			demo_enabled: true, ai_available: true, run_state: null,
+			budget: { demo_used: 1, demo_limit: 10, demo_exhausted: false, legacy: true },
+			spend: {
+				week_limit_nano_cny: "50000000000",
+				week_spent_nano_cny: "50000000000",
+				week_reserved_nano_cny: "0",
+				demo_exhausted: true,
+			},
+		}));
+		await w.HP_DEMO.loadConfig();
+		const btn = runButton(w);
+		expect(btn.disabled).toBe(true);
+		expect(btn.textContent).toBe("demo.ai.run.spend.exhausted");
+	});
+
+	it("spend 段未耗尽时不置灰（金额充足）", async () => {
+		const w = loadDemo(configFetch({
+			demo_enabled: true, ai_available: true, run_state: null,
+			budget: { demo_used: 1, demo_limit: 10, demo_exhausted: false },
+			spend: {
+				week_limit_nano_cny: "50000000000",
+				week_spent_nano_cny: "1000000000",
+				week_reserved_nano_cny: "0",
+				demo_exhausted: false,
+			},
+		}));
+		await w.HP_DEMO.loadConfig();
+		const btn = runButton(w);
+		expect(btn.disabled).toBe(false);
+		expect(btn.textContent).toBe("demo.ai.run.available");
+	});
+
+	it("缺 spend 段回退 turn 口径 budget 段（软闸回退期兼容）", async () => {
+		const w = loadDemo(configFetch({
+			demo_enabled: true, ai_available: true, run_state: null,
+			budget: { demo_used: 10, demo_limit: 10, demo_exhausted: true, legacy: true },
+		}));
+		await w.HP_DEMO.loadConfig();
+		const btn = runButton(w);
+		expect(btn.disabled).toBe(true);
+		expect(btn.textContent).toBe("demo.ai.run.demo.exhausted");
+	});
+
+	it("spend 耗尽优先于 budget 段未耗尽", async () => {
+		const w = loadDemo(configFetch({
+			demo_enabled: true, ai_available: true, run_state: null,
+			budget: { demo_used: 1, demo_limit: 10, demo_exhausted: false },
+			spend: {
+				week_limit_nano_cny: "1000000000",
+				week_spent_nano_cny: "1000000000",
+				week_reserved_nano_cny: "0",
+				demo_exhausted: true,
+			},
+		}));
+		await w.HP_DEMO.loadConfig();
+		expect(runButton(w).textContent).toBe("demo.ai.run.spend.exhausted");
+	});
+});
+
 describe("demo.js 恢复流断线后重连", () => {
 	const calls: string[] = [];
 

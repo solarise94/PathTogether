@@ -49,6 +49,7 @@ PG = pytest.mark.skipif(BACKEND != "postgres",
 
 if BACKEND == "postgres":
     import psycopg  # noqa: E402
+    import budget_store  # noqa: E402
 
 app_mod.UPLOAD_DIR = Path(UPLOAD_DIR)
 app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -227,10 +228,6 @@ def test_json_pg_only_write_endpoints_fail_closed():
             ("GET", "/api/admin/v1/invites", None),
             ("POST", "/api/admin/v1/invites", {}),
             ("POST", "/api/admin/v1/invites/inv_x/revoke", {}),
-            ("PUT", "/api/admin/v1/turn-budgets",
-             {"platform_turn_limit": 10}),
-            ("POST", "/api/admin/v1/turn-budgets/new-period",
-             {"confirm": True}),
             ("PUT", "/api/admin/v1/billing/accounts/%s/caps" % usera["user_id"],
              {"soft_cap_nano_cny": None, "hard_cap_nano_cny": None,
               "version": 1}),
@@ -240,6 +237,16 @@ def test_json_pg_only_write_endpoints_fail_closed():
         r = getattr(c, method.lower())(path, json=body)
         assert r.status_code == 503, "%s %s -> %s" % (method, path, r.status_code)
         assert r.get_json()["error"]["code"] == "pg_backend_required"
+    # 批次 F：turn-budgets 写端点已退役——json 后端同样 410（退役判定先于
+    # PG 守卫，行为与后端无关）
+    for method, path, body in (
+            ("PUT", "/api/admin/v1/turn-budgets",
+             {"platform_turn_limit": 10}),
+            ("POST", "/api/admin/v1/turn-budgets/new-period",
+             {"confirm": True})):
+        r = getattr(c, method.lower())(path, json=body)
+        assert r.status_code == 410, "%s %s -> %s" % (method, path, r.status_code)
+        assert r.get_json()["error"]["code"] == "turn_budgets_retired"
 
 
 # --------------------------------------------------------------------------- #
@@ -750,35 +757,26 @@ def test_invites_revoke_semantics():
 
 
 # --------------------------------------------------------------------------- #
-# 9. turn-budgets 写（PG）：字段校验 + confirm
+# 9. turn-budgets 写（批次 F）：已退役（410 turn_budgets_retired + audit）
 # --------------------------------------------------------------------------- #
 @PG
-def test_turn_budgets_update_validation_and_apply():
+def test_turn_budgets_write_endpoints_retired():
     owner, _u = _setup_users()
     c = _login(_client(), owner)
-    # 未知字段 / 非法关系 → 400
-    assert c.put("/api/admin/v1/turn-budgets",
-                 json={"unknown_field": 1}).status_code == 400
-    assert c.put("/api/admin/v1/turn-budgets",
-                 json={"platform_turn_limit": 10, "user_pool_turn_limit": 20}
-                 ).status_code == 400
-    r = c.put("/api/admin/v1/turn-budgets",
-              json={"platform_turn_limit": 500, "user_turn_limit": 50,
-                    "demo_enabled": True, "demo_max_concurrency": 3})
-    assert r.status_code == 200, r.get_json()
-    limits = r.get_json()["limits"]
-    assert limits["platform_turn_limit"] == 500
-    assert limits["demo_enabled"] in (True, 1)
-    # 保存不清空用量（读取端由既有测试覆盖）
-
-
-@PG
-def test_turn_budgets_new_period_requires_confirm():
-    owner, _u = _setup_users()
-    c = _login(_client(), owner)
-    r = c.post("/api/admin/v1/turn-budgets/new-period", json={})
-    assert r.status_code == 400
-    assert r.get_json()["error"]["code"] == "confirm_required"
-    r = c.post("/api/admin/v1/turn-budgets/new-period", json={"confirm": True})
-    assert r.status_code == 200, r.get_json()
-    assert r.get_json()["period_id"]
+    # 任意载荷（含历史合法形态与 confirm）一律 410；不再做字段校验
+    for r in (c.put("/api/admin/v1/turn-budgets", json={"unknown_field": 1}),
+              c.put("/api/admin/v1/turn-budgets",
+                    json={"platform_turn_limit": 10, "user_pool_turn_limit": 20}),
+              c.put("/api/admin/v1/turn-budgets",
+                    json={"platform_turn_limit": 500, "demo_enabled": True}),
+              c.post("/api/admin/v1/turn-budgets/new-period", json={}),
+              c.post("/api/admin/v1/turn-budgets/new-period",
+                     json={"confirm": True})):
+        assert r.status_code == 410, r.get_data(as_text=True)
+        assert r.get_json()["error"]["code"] == "turn_budgets_retired"
+        assert "金额预算" in r.get_json()["error"]["message"]
+    # 退役尝试落 audit；周期行不受影响（冻结历史）
+    actions = [e.get("action") for e in
+               app_mod.share_store.list_audit(limit=20)]
+    assert "turn_budgets.retired_write" in actions
+    assert budget_store.get_current_period()["platform_turn_limit"] == 30

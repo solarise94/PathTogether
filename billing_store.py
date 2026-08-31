@@ -11,7 +11,8 @@ fail-closed（json/dual 返回稳定 ``pg_backend_required``，不降级进程�
   - canonical payload_hash（18 字段，规则以
     tests/fixtures/usage_events/README.md 为唯一依据，PR0 互锁用例校验）；
   - :func:`_ingest_usage_event_tx`：ingest 事务内核（§7.5 全部步骤）——
-    dedup 比对 payload_hash → §7.2 四步权威主体解析 → 时钟偏差/算术校验 →
+    dedup 比对 payload_hash → §7.2 权威主体解析（批次 F：⓪holds→①bindings
+    →①legacy reservations→②demo→③④，见 _resolve_usage_subject） → 时钟偏差/算术校验 →
     双 price book 计价写回（或 unpriced+reason）→ debit（shadow=PR6 模拟
     软扣费 SAVEPOINT best-effort；hard=真实 debit 无 SAVEPOINT 强一致）→
     窗口 spent 投影（§3.2/§3.4.5）→ 同事务无敏感信息 audit。
@@ -555,35 +556,49 @@ def canonical_payload_hash(event) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# §7.2 权威主体四步解析
+# §7.2 权威主体解析（批次 F：⓪holds → ①bindings → ①legacy → ②demo → ③④）
 # --------------------------------------------------------------------------- #
 def _resolve_usage_subject(cur, event, installation_id):
-    """按 §7.2 四步解析权威计费主体，返回 (subject_type, subject_id)。
+    """按 §7.2 解析权威计费主体，返回 (subject_type, subject_id)。
 
-    ① request_id → ai_budget_reservations：要求 state='consumed' 且
-    histopilot_session_id 与事件 session_id 一致，以 reservation 的
-    subject_type/subject_id 为准。生命周期核查结论（budget_store.consume/
-    release + app.py _ai_budget_lifecycle）：histopilot_session_id **只在
-    consume()（HistoPilot 2xx 接受后）写入**，release()/reclaim_expired()/
-    重新预占都不写或显式置 NULL——因此 released 行结构上不可能带 session id，
-    「released 且 session 匹配」分支不存在。abort/中断（已接受后中断，如
-    fixture 04）的终态是 consumed（带 session），可正常解析；reserved（尚未
-    确认）与 released（已退款，可能随后被重试重新 consume 并带 session）都
-    落到后续步骤，最终无权威来源时按 usage_subject_not_ready 可重试。
+    批次 F（docs §7.3 阶段 2）起解析顺序（两个调用方自动受益：ingest 与
+    hold authorize 的步骤 4 共用本函数）：
+
+    ⓪ ``call_id → billing_holds``（0020 起 call_id UNIQUE，批次 F 新增的第
+    一步）：命中且 ``hold.session_id != event.session_id`` →
+    :class:`UsageSubjectConflictError`（同一 call 的 hold 与事件分属不同
+    session，确定性冲突）；命中且匹配 → 以 hold 行的
+    subject_type/subject_id 为准（hold 授权事务已按 ①-④ 解析过主体并落行，
+    settle 链上的事件与它必须一致）。注意 authorize 伪 event 不带 call_id
+    （此时 call_id 尚无 hold 行），⓪ 自然落空——行为与批次 F 之前等价。
+
+    ① ``request_id → ai_run_bindings``（0027，金额时代主源）：session 匹配
+    才 resolve；**不匹配不 resolve、继续下落**（与旧 reservation 语义一致：
+    换 session 的迟到事件不能冒领别的主体）。绑定在 HistoPilot 2xx 接受后
+    写入（app 层 on_accepted → budget_store.record_run_binding），故尚未接受
+    的 run 的事件落到后续步骤。
+
+    ①legacy ``request_id → ai_budget_reservations``（pre-F 历史回退，查询
+    原样保留）：要求 state='consumed' 且 histopilot_session_id 与事件
+    session_id 一致。生命周期核查结论（budget_store.consume/release +
+    app.py _ai_budget_lifecycle）：histopilot_session_id **只在 consume()
+    （HistoPilot 2xx 接受后）写入**，release()/重新预占都不写或显式置 NULL
+    ——因此 released 行结构上不可能带 session id。批次 F 起硬闸主体不再写
+    reservations（新事件走 ⓪/①），本步服务 outbox 重放的 pre-F 历史事件。
 
     ② session_id → demo 主体绑定行（0026 起 demo_runs.histopilot_session_id，
     回退 demo_sessions.histopilot_session_id 读 0026 前的历史行）：恢复 demo
     subject（capability id）。不过滤过期：计量归属是历史事实，过期 capability
     的事件仍应入账（只计量、不开户、不写 ledger）。批次 E 的顺序多次 run 使
     同一 capability 可先后绑定多个 HP session——各 run 流水行独立携带自己的
-    histopilot_session_id，互不覆盖。
+    histopilot_session_id，互不覆盖。demo 主体绑定永不入 ai_run_bindings。
 
     ③ run_grants **仅交叉校验**（§7.2 步骤 3 原文：run grant 只覆盖需要写
     能力的 run，不能作为只读调用唯一的主体来源）：取该 session 绑定、且
     属于当前 installation 的 grant——同 session 多 grant 创建者不一致 →
-    确定性冲突；①② 已解析出 owner/user 主体时 grant 创建者必须一致。查询
+    确定性冲突；⓪①② 已解析出 owner/user 主体时 grant 创建者必须一致。查询
     不过滤过期/撤销 grant（失效行仍记录着 run 创建者，历史事件的交叉校验
-    依赖它），但**绝不**用 grant 创建者补位充当权威主体：①② 均未命中 →
+    依赖它），但**绝不**用 grant 创建者补位充当权威主体：⓪①② 均未命中 →
     usage_subject_not_ready（可重试），不按 grant 或 body 入账。
 
     ④ body 的 subject_type/subject_id/user_id 只是 assertion：与权威解析
@@ -593,18 +608,52 @@ def _resolve_usage_subject(cur, event, installation_id):
     session_id = event["session_id"]
     resolved = None
 
-    request_id = event.get("request_id")
-    reservation = None
-    if request_id:
+    # -- ⓪ call_id → billing_holds（settle 链权威；session 必须一致） --
+    call_id = event.get("call_id")
+    if call_id:
         cur.execute(
-            "SELECT subject_type, subject_id, state, histopilot_session_id "
-            "FROM ai_budget_reservations WHERE request_id=%s", (request_id,))
-        reservation = cur.fetchone()
-    if reservation is not None \
-            and reservation["state"] == "consumed" \
-            and reservation["histopilot_session_id"] == session_id:
-        resolved = (reservation["subject_type"], reservation["subject_id"])
+            "SELECT subject_type, subject_id, session_id "
+            "FROM billing_holds WHERE call_id=%s", (call_id,))
+        hold = cur.fetchone()
+        if hold is not None:
+            if hold["session_id"] != session_id:
+                raise UsageSubjectConflictError(
+                    "call_id 已绑定其他 session 的 hold（事件 session 与"
+                    " hold 不一致）",
+                    asserted=(event["subject_type"], event["subject_id"]),
+                    resolved=(hold["subject_type"], hold["subject_id"]))
+            resolved = (hold["subject_type"], hold["subject_id"])
 
+    # -- ① request_id → ai_run_bindings（0027 金额时代主源；session 匹配
+    #    才 resolve，不匹配不阻断、继续下落——与旧 reservation 语义一致） --
+    if resolved is None:
+        request_id = event.get("request_id")
+        binding = None
+        if request_id:
+            cur.execute(
+                "SELECT subject_type, subject_id, histopilot_session_id "
+                "FROM ai_run_bindings WHERE request_id=%s", (request_id,))
+            binding = cur.fetchone()
+        if binding is not None \
+                and binding["histopilot_session_id"] == session_id:
+            resolved = (binding["subject_type"], binding["subject_id"])
+
+    # -- ①legacy request_id → ai_budget_reservations（pre-F 历史回退，原样） --
+    if resolved is None:
+        request_id = event.get("request_id")
+        reservation = None
+        if request_id:
+            cur.execute(
+                "SELECT subject_type, subject_id, state, histopilot_session_id "
+                "FROM ai_budget_reservations WHERE request_id=%s", (request_id,))
+            reservation = cur.fetchone()
+        if reservation is not None \
+                and reservation["state"] == "consumed" \
+                and reservation["histopilot_session_id"] == session_id:
+            resolved = (reservation["subject_type"],
+                        reservation["subject_id"])
+
+    # -- ② demo 主体绑定（demo_runs 主源 / demo_sessions 历史回退） --
     if resolved is None:
         cur.execute(
             "SELECT capability_id FROM demo_runs "
@@ -624,7 +673,7 @@ def _resolve_usage_subject(cur, event, installation_id):
 
     # ③ 交叉校验（只校验、不补位）：失效/撤销 grant 也在查询范围内——过期
     # 不改变「谁创建过这个 run」的历史事实，删掉会让迟到的 usage 事件失去
-    # 冲突检测维度。PR5 修订：删除「无 ①② 来源时以 grant 创建者当主体」的
+    # 冲突检测维度。PR5 修订：删除「无 ⓪①② 来源时以 grant 创建者当主体」的
     # 回退（§7.2：run grant 只覆盖写能力 run，不能作为只读调用的主体来源）。
     cur.execute(
         "SELECT grant_id, installation_id, created_by_user_id "
@@ -645,8 +694,8 @@ def _resolve_usage_subject(cur, event, installation_id):
 
     if resolved is None:
         raise UsageSubjectNotReadyError(
-            "权威主体绑定行不存在或未就绪（reservation/demo session；"
-            "run grant 仅交叉校验不构成主体来源）",
+            "权威主体绑定行不存在或未就绪（hold/run binding/reservation/"
+            "demo session；run grant 仅交叉校验不构成主体来源）",
             session_id=session_id)
     if (event["subject_type"], event["subject_id"]) != resolved:
         raise UsageSubjectConflictError(
@@ -1558,7 +1607,8 @@ def authorize_hold(body, *, installation_id, plugin_id="histopilot", now=None):
       3. call_id dedup：已有行 → request_hash 一致返回原行（duplicate=True，
          不重新解析主体/重算；expired 行同样幂等返回）；不一致 → 409
          hold_conflict（确定性）；
-      4. §7.2 四步权威主体解析（与 ingest 同一实现）；**demo 不再 skip**
+      4. §7.2 权威主体解析（与 ingest 同一实现，批次 F 起为 ⓪→①→①legacy
+         →②→③④ 链，见 _resolve_usage_subject）；**demo 不再 skip**
          （§4.2）：所有模式都写 hold 行 + 进 demo_global 周窗口投影；
       5. 最坏价估算（customer_charge，时刻=now）；hard 无价 fail-closed；
       6. 策略解析 + get_or_create 窗口（§3.2）+ ``FOR UPDATE`` 锁窗口行
@@ -1646,7 +1696,8 @@ def _authorize_hold_tx(cur, body, *, installation_id, plugin_id, now,
         return row
 
     # -- 步骤 4：§7.2 权威主体（与 ingest 同一解析器：伪 event 只携带解析
-    #    所需键，绝不影响 ingest 行为）；demo 不再 skip（§4.2） --
+    #    所需键、**不带 call_id**（此时 call_id 尚无 hold 行，⓪ 自然落空），
+    #    绝不影响 ingest 行为）；demo 不再 skip（§4.2） --
     subject_type, subject_id = _resolve_usage_subject(
         cur,
         {"session_id": body["session_id"],

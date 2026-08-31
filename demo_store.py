@@ -124,6 +124,46 @@ class DemoRunFinalConflict(Exception):
     code = "demo_run_request_final"
 
 
+class DemoConcurrencyExceeded(Exception):
+    """全站在途 Demo run（reserved/accepted）达到 demo_max_concurrency。
+
+    批次 F（§7.3 阶段 2）：并发上限是**安全参数**，从 budget_store.reserve_turn
+    的事务内迁居本模块（金额硬闸主体不再走 reserve_turn，闸必须独立于消费闸
+    存活）；code 沿用既有字符串 ``demo_concurrency_exceeded``，app 层 HTTP
+    映射（429）不变。上限读 settings_store ai_safety.demo_max_concurrency。
+    context kwargs（limit/used）供路由/日志携带非敏感上下文。
+    """
+
+    code = "demo_concurrency_exceeded"
+
+    def __init__(self, message=None, **context):
+        self.context = dict(context)
+        super().__init__(message or self.__class__.__name__)
+
+
+#: 全局 Demo 并发计数串行化 advisory key（事务级；"DMCC"）。并发计数跨
+#: capability，无法靠 capability 行锁串行化——Demo 低 QPS，全局锁可接受。
+_DEMO_CONCURRENCY_LOCK_KEY = 0x444D4343
+
+
+def _demo_max_concurrency() -> int:
+    """读 Demo 全局并发上限（settings_store ai_safety.*，缺省回落常量）。
+
+    读取失败按缺省（2）处理：安全参数读取异常不放大并发（fail-closed）。
+    json/dual 由调用方 fail-closed（reserve_run 的 PG 守卫先行）。
+    """
+    import settings_store
+    try:
+        return int(settings_store.get_ai_safety_settings()["demo_max_concurrency"])
+    except Exception:  # pragma: no cover - settings 读取异常的保守回退
+        return DEFAULT_DEMO_MAX_CONCURRENCY
+
+
+#: Demo 全局并发上限缺省（与 budget_store.DEFAULT_DEMO_MAX_CONCURRENCY 同值；
+#: 本地副本避免 demo_store 反向依赖 budget_store）
+DEFAULT_DEMO_MAX_CONCURRENCY = 2
+
+
 def _connect():
     """建连接并设 dict_row（本模块所有查询按列名访问）。"""
     conn = pg_store.connect()
@@ -278,7 +318,12 @@ def reserve_run(capability_id, request_id, slide_id, asset_revision,
          （该请求已定局，客户端应换新 request_id）；
     4. 其它 active run 在途 → 抛 :class:`DemoRunActiveConflict`
        （同 capability 同时最多一个 active run）；
-    5. INSERT 新流水行（state=reserved，expires_at=now+ttl）。
+    5. 全局并发闸（批次 F 迁入）：在途 run（reserved/accepted，跨全部
+       capability）达到 demo_max_concurrency → 抛
+       :class:`DemoConcurrencyExceeded`（429；上限读 settings_store
+       ai_safety.*）。全局计数用事务级 advisory lock 串行化（跨 capability，
+       capability 行锁覆盖不到；Demo 低 QPS 可接受）；
+    6. INSERT 新流水行（state=reserved，expires_at=now+ttl）。
     """
     platform_features.require_pg_backend("demo_sessions")
     conn = _connect()
@@ -338,23 +383,14 @@ def reserve_run(capability_id, request_id, slide_id, asset_revision,
                         out["replayed"] = True
                         return out
                     if row["state"] == RUN_STATE_RELEASED:
-                        cur.execute(
-                            "UPDATE demo_runs SET state='reserved', "
-                            "attempt=attempt+1, rollback_epoch=0, "
-                            "slide_id=%s, asset_revision=%s, "
-                            "histopilot_session_id=NULL, accepted_at=NULL, "
-                            "finished_at=NULL, "
-                            "expires_at=now() + (%s * interval '1 second'), "
-                            "updated_at=now(), "
-                            "ip_prefix_hash=COALESCE(%s, ip_prefix_hash) "
-                            "WHERE demo_run_id=%s "
-                            "RETURNING " + _RUN_SEL,
-                            (slide_id, asset_revision, float(ttl_seconds),
-                             ip_prefix_hash, row["demo_run_id"]))
-                        return _run_out(cur.fetchone())
-                    raise DemoRunFinalConflict(
-                        "该 request_id 的 run 已终态（%s），请换新 request_id"
-                        % row["state"])
+                        # released 复位属新执行尝试（attempt+1，防 ABA）：
+                        # 与全新 INSERT 同样先过 active/全局并发闸（见下），
+                        # 不提前 return，保证闸覆盖重试路径
+                        pass
+                    else:
+                        raise DemoRunFinalConflict(
+                            "该 request_id 的 run 已终态（%s），请换新 "
+                            "request_id" % row["state"])
                 # 确定性 active 检查（capability 行锁已串行化；部分唯一索引兜底）
                 cur.execute(
                     "SELECT demo_run_id FROM demo_runs WHERE capability_id=%s "
@@ -364,6 +400,38 @@ def reserve_run(capability_id, request_id, slide_id, asset_revision,
                     raise DemoRunActiveConflict(
                         "该浏览器已有进行中的 Demo 体验（同 capability 同时"
                         "最多一个 run）")
+                # 全局并发闸（批次 F 迁入）：跨 capability 的在途 run 合计。
+                # advisory xact lock 串行化「读计数 → 写入」窗口，杜绝并发
+                # 超限；上限读 settings_store（ai_safety.demo_max_concurrency）。
+                max_cc = _demo_max_concurrency()
+                if max_cc > 0:
+                    cur.execute("SELECT pg_advisory_xact_lock(%s)",
+                                (_DEMO_CONCURRENCY_LOCK_KEY,))
+                    cur.execute(
+                        "SELECT COUNT(*)::int AS n FROM demo_runs "
+                        "WHERE state = ANY(%s)",
+                        (list(RUN_ACTIVE_STATES),))
+                    in_flight = int(cur.fetchone()["n"])
+                    if in_flight + 1 > max_cc:
+                        raise DemoConcurrencyExceeded(
+                            "Demo 并发已达上限（%d/%d）" % (in_flight, max_cc),
+                            limit=max_cc, used=in_flight)
+                if row is not None:
+                    # released 复位（上方已过闸）：UPDATE 回 reserved
+                    cur.execute(
+                        "UPDATE demo_runs SET state='reserved', "
+                        "attempt=attempt+1, rollback_epoch=0, "
+                        "slide_id=%s, asset_revision=%s, "
+                        "histopilot_session_id=NULL, accepted_at=NULL, "
+                        "finished_at=NULL, "
+                        "expires_at=now() + (%s * interval '1 second'), "
+                        "updated_at=now(), "
+                        "ip_prefix_hash=COALESCE(%s, ip_prefix_hash) "
+                        "WHERE demo_run_id=%s "
+                        "RETURNING " + _RUN_SEL,
+                        (slide_id, asset_revision, float(ttl_seconds),
+                         ip_prefix_hash, row["demo_run_id"]))
+                    return _run_out(cur.fetchone())
                 cur.execute(
                     "INSERT INTO demo_runs "
                     "(demo_run_id, capability_id, request_id, state, slide_id, "

@@ -337,7 +337,10 @@ def _expected_estimate(at, est_in=1_000_000, max_out=200_000,
     finally:
         conn.close()
     assert book is not None, "测试价格书应覆盖该时刻/模型"
-    return billing_pricing.price_tokens_nano(0, est_in, max_out, book)
+    # 镜像 billing_store 步骤 5 的 output 封顶（estimate_output_token_cap）
+    cap = billing_store.estimate_output_token_cap()
+    est_out = max_out if cap <= 0 else min(max_out, cap)
+    return billing_pricing.price_tokens_nano(0, est_in, est_out, book)
 
 
 def _expected_charge(at, tokens, model="deepseek-v4-flash"):
@@ -800,8 +803,8 @@ def test_settle_actual_vs_estimate_three_cases():
         win = _window(win0["window_id"])
         return out, est, actual, (win["spent_nano_cny"] - spent0), win, ver0
 
-    # ① actual == estimate
-    out, est, actual, d_spent, win, _ = _run((0, 1_000_000, 200_000))
+    # ① actual == estimate（output 取封顶值 4096：≤cap 时估计不 clamp，两侧同口径）
+    out, est, actual, d_spent, win, _ = _run((0, 1_000_000, 4096))
     assert actual == est
     assert out["status"] == "settled"
     assert out["actual_nano_cny"] == actual

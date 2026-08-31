@@ -171,7 +171,10 @@ def _expected_estimate(at, est_in=1_000_000, max_out=200_000,
     finally:
         conn.close()
     assert book is not None
-    return billing_pricing.price_tokens_nano(0, est_in, max_out, book)
+    # 镜像 billing_store 步骤 5 的 output 封顶（estimate_output_token_cap）
+    cap = billing_store.estimate_output_token_cap()
+    est_out = max_out if cap <= 0 else min(max_out, cap)
+    return billing_pricing.price_tokens_nano(0, est_in, est_out, book)
 
 
 def _expected_charge(at, tokens, model="deepseek-v4-flash"):
@@ -296,7 +299,9 @@ def test_new_week_gets_fresh_demo_window():
     assert w_next["window_id"] != w_this["window_id"]
     assert w_next["window_start"] == float(end.timestamp())
     assert w_next["spent_nano_cny"] == 0
-    assert w_next["reserved_nano_cny"] == est
+    # 与预占同时刻复算（T0 与下周一 00:00 可能跨 peak/off_peak 时段带——
+    # 拿 T0 的 est 断言 next_week 的 reserved 是按墙钟碰运气）
+    assert w_next["reserved_nano_cny"] == _expected_estimate(next_week)
     # 一周后旧 hold 已过 TTL：authorize 的惰性回收把旧窗口 reserved 归还
     # （§3.4.6/7：TTL 回收还 reserved；真实成本由迟到结算照记）
     w_after = spend_store.get_window(w_this["window_id"])
@@ -326,7 +331,10 @@ def test_demo_priced_and_limited_without_billing_account():
     h1 = _authorize(b1, now=T0)
     assert h1["status"] == "open" and h1["subject_type"] == "demo"
     # settle 带完整 usage event → priced 入库 + 周窗口 spent 投影
-    tokens = (0, 1_000_000, 200_000)
+    # （output 取估计封顶值 4096：actual==est，2.5×est 的窗口恰好容纳
+    #   「已结算一次 + 在途一次」、第三次拒绝——200k output 的 actual 约
+    #   1.58×clamp 后 est，该窗口装不下，属测试构造而非语义）
+    tokens = (0, 1_000_000, 4096)
     event = _usage_event(b1, occurred=T0, tokens=tokens)
     settle = _settle(h1["hold_id"], {"usage_event": event}, now=T0)
     assert settle["status"] == "settled"

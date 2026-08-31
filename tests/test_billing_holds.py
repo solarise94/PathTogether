@@ -284,7 +284,10 @@ def _expected_estimated(now, model, est_in, max_out):
     finally:
         conn.close()
     assert book is not None, "种子价格书应覆盖该时刻/模型"
-    return billing_pricing.price_tokens_nano(0, est_in, max_out, book)
+    # 镜像 billing_store 步骤 5 的 output 封顶（estimate_output_token_cap）
+    cap = billing_store.estimate_output_token_cap()
+    est_out = max_out if cap <= 0 else min(max_out, cap)
+    return billing_pricing.price_tokens_nano(0, est_in, est_out, book)
 
 
 def _hold_row(hold_id=None, call_id=None):
@@ -375,9 +378,11 @@ def test_authorize_estimate_matches_cny_conversion_independent():
         + billing_pricing.price_component_nano(
             1_000_000, billing_pricing.parse_balance_to_nano(cny[1]))
         + billing_pricing.price_component_nano(
-            200_000, billing_pricing.parse_balance_to_nano(cny[2])))
-    # 量级护栏：peak 3+1.8=4.8 CNY、off_peak 1.5+0.9=2.4 CNY
-    assert expected >= 2_400_000_000, "疑似 legacy 错误量级（CNY×1000）"
+            min(200_000, billing_store.DEFAULT_ESTIMATE_OUTPUT_TOKEN_CAP),
+            billing_pricing.parse_balance_to_nano(cny[2])))
+    # 量级护栏：peak 3+0.037≈3.04 CNY、off_peak 1.5+0.018≈1.52 CNY
+    # （output 分量默认 4096 封顶后 miss 主导）；legacy 错误量级仅 ~1.7e4 nano
+    assert expected >= 1_500_000_000, "疑似 legacy 错误量级（CNY×1000）"
     call_id, session_id, request_id = _ids()
     body = _hold_body("user", user["user_id"], session_id=session_id,
                       request_id=request_id, call_id=call_id,
@@ -385,7 +390,66 @@ def test_authorize_estimate_matches_cny_conversion_independent():
     bh.bind_reservation(request_id, session_id, "user", user["user_id"])
     result = _authorize(body, now=occurred)
     assert result["estimated_nano_cny"] == expected
-    assert result["estimated_nano_cny"] >= 2_400_000_000
+    assert result["estimated_nano_cny"] >= 1_500_000_000
+
+
+def _cap_authorize(email, *, max_out, est_in=1_000_000):
+    """cap 用例共用夹具：种子价目 + user + bind + authorize，返回 (result, book)。"""
+    bh.seed_price_books_with_history()
+    user = _user_with_account(email, grant_nano=1_000_000_000)
+    occurred = bh.pricing_cutover() + timedelta(seconds=1)
+    call_id, session_id, request_id = _ids()
+    body = _hold_body("user", user["user_id"], session_id=session_id,
+                      request_id=request_id, call_id=call_id,
+                      user_id=user["user_id"], est_in=est_in, max_out=max_out)
+    bh.bind_reservation(request_id, session_id, "user", user["user_id"])
+    result = _authorize(body, now=occurred)
+    conn = bh.connect()
+    try:
+        with conn.cursor() as cur:
+            book = billing_pricing.find_active_rate(
+                cur, "customer_charge", "deepseek", "deepseek-v4-flash",
+                occurred)
+    finally:
+        conn.close()
+    assert book is not None
+    return result, book
+
+
+@PG
+def test_authorize_estimate_output_capped_by_default():
+    """默认 4096 封顶：body max_output_tokens=200k 时 output 分量只按 4096 估。"""
+    result, book = _cap_authorize("hold-cap-dft@x.com", max_out=200_000)
+    capped = billing_pricing.price_tokens_nano(0, 1_000_000, 4096, book)
+    uncapped = billing_pricing.price_tokens_nano(0, 1_000_000, 200_000, book)
+    assert result["estimated_nano_cny"] == capped
+    assert capped < uncapped  # 夹具自证：封顶确实生效（不恒等）
+
+
+@PG
+def test_authorize_estimate_output_cap_env_override(monkeypatch):
+    """env 覆盖封顶值（1000）：output 分量按覆盖值估。"""
+    monkeypatch.setenv("BILLING_ESTIMATE_OUTPUT_TOKEN_CAP", "1000")
+    result, book = _cap_authorize("hold-cap-ovr@x.com", max_out=200_000)
+    assert result["estimated_nano_cny"] == billing_pricing.price_tokens_nano(
+        0, 1_000_000, 1000, book)
+
+
+@PG
+def test_authorize_estimate_output_cap_zero_disables(monkeypatch):
+    """封顶 ≤0 = 不封顶：恢复按 max_output_tokens 全额估价的最坏情形。"""
+    monkeypatch.setenv("BILLING_ESTIMATE_OUTPUT_TOKEN_CAP", "0")
+    result, book = _cap_authorize("hold-cap-off@x.com", max_out=200_000)
+    assert result["estimated_nano_cny"] == billing_pricing.price_tokens_nano(
+        0, 1_000_000, 200_000, book)
+
+
+@PG
+def test_authorize_estimate_output_below_cap_unchanged():
+    """max_output_tokens 低于封顶值时估计不变（封顶不虚增小请求）。"""
+    result, book = _cap_authorize("hold-cap-low@x.com", max_out=1000)
+    assert result["estimated_nano_cny"] == billing_pricing.price_tokens_nano(
+        0, 1_000_000, 1000, book)
 
 
 @PG

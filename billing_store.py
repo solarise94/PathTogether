@@ -1289,6 +1289,13 @@ def ingest_usage_event(event, *, installation_id, plugin_id="histopilot",
 #: hold TTL 缺省 300 秒（5 分钟：单次 model call 最坏时长 + 投递余量）
 DEFAULT_HOLD_TTL_SECONDS = 300
 
+#: 预授权估计的 output 分量封顶（2026-08-31 实测收紧）：max_output_tokens 是
+#: provider 上限（384k），不是单次调用的现实产出——按它全额估价会把保留额推到
+#: 实际消费的 100–300×，hard 模式下窗口余量被保留额虚占。生产实测单次调用
+#: output 介于数十至约 1.3k tokens，4096 留 3× 以上余量。≤0 = 不封顶（回到
+#: 按 max_output_tokens 全额估价的最坏情形语义）。
+DEFAULT_ESTIMATE_OUTPUT_TOKEN_CAP = 4096
+
 #: holds audit 动作名（detail 无敏感字段；session_id 不落——与 ingest audit 纪律对齐）
 HOLD_AUTHORIZE_AUDIT_ACTION = "billing.hold_authorize"
 HOLD_SETTLE_AUDIT_ACTION = "billing.hold_settle"
@@ -1344,6 +1351,21 @@ def hold_ttl_seconds() -> int:
     except ValueError:
         return DEFAULT_HOLD_TTL_SECONDS
     return val if val > 0 else DEFAULT_HOLD_TTL_SECONDS
+
+
+def estimate_output_token_cap() -> int:
+    """读取 ``BILLING_ESTIMATE_OUTPUT_TOKEN_CAP``（缺省 4096）。
+
+    非法值回退缺省；**≤0 有意保留**（= 不封顶，恢复按 max_output_tokens
+    全额估价的最坏情形），与一般「非正回退缺省」的 env 语义不同。
+    """
+    raw = (os.environ.get("BILLING_ESTIMATE_OUTPUT_TOKEN_CAP") or "").strip()
+    if not raw:
+        return DEFAULT_ESTIMATE_OUTPUT_TOKEN_CAP
+    try:
+        return int(raw)
+    except ValueError:
+        return DEFAULT_ESTIMATE_OUTPUT_TOKEN_CAP
 
 
 def validate_hold_authorize_body(body) -> list:
@@ -1646,9 +1668,13 @@ def _authorize_hold_tx(cur, body, *, installation_id, plugin_id, now,
     estimated = None
     denial_reason = None
     if charge_book is not None:
+        # output 分量按 estimate_output_token_cap() 封顶：max_output_tokens 是
+        # provider 上限（384k），按它全额估价 = 保留额虚占窗口（见常量注释）。
+        cap = estimate_output_token_cap()
+        est_out = body["max_output_tokens"] if cap <= 0 else min(
+            body["max_output_tokens"], cap)
         estimated = billing_pricing.price_tokens_nano(
-            0, body["estimated_input_tokens"],
-            body["max_output_tokens"], charge_book)
+            0, body["estimated_input_tokens"], est_out, charge_book)
     elif hard:
         raise HoldPricingUnavailableError(
             "无 active customer_charge 价目（hard 模式 fail-closed）",

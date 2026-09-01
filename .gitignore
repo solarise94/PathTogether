@@ -24,9 +24,11 @@ certs/
 # 系统
 .DS_Store
 
-# 自写运维/配置文档：含环境与账号信息，仅保留本地，不推 GitHub
+# 自写运维/配置/设计文档：含环境与账号信息或仅本地规格，不推 GitHub
 docs/demo-deployment.md
 docs/deepseek-files-api-research.md
 docs/open-registration-security-remediation.md
+docs/ai-money-budget-bugfix-and-simplification-plan.md
+docs/histopilot-neutral-prompt-and-nuclei-plugin-design.md
 test-results/
 playwright-report/

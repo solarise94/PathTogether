@@ -1,7 +1,8 @@
-/* pathtogether-admin 插件 UI 样式（PR3 骨架 + 包 E 工作台化，
-   docs/admin-workbench-ci-one-shot-remediation-plan.md §9）。
+/* pathtogether-admin 插件 UI 样式（PR3 骨架 + 包 E 工作台化 +
+   2026-09-01 评审升级：表单 field 组件、按钮语义层、金额 raw 展开区、
+   用量堆叠条、legacy 中性卡、紧凑握手状态点，review-2026-09-01-admin-ui.md §5）。
    运行在 opaque iframe 内；只允许外链同源 CSS（响应 CSP style-src <origin>，
-   无内联样式）。
+   无内联样式——可变宽度一律用预置宽度桶类，不写 style 属性）。
 
    布局：桌面 240px 侧栏 + 流式主内容（max 1280px）；平板（<1024px）侧栏收窄
    为图标条；手机（<768px）侧栏收成顶部抽屉（#adm-nav-toggle 切换）。
@@ -20,10 +21,13 @@
   --text-2: #86868b;
   --separator: rgba(0, 0, 0, 0.08);
   --accent: #007AFF;
+  --accent-hover: #0062CC;
   --accent-soft: rgba(0, 122, 255, 0.08);
   --ok: #1d7a34;
+  --ok-dot: #34c759;
   --warn: #B25000;
   --danger: #FF3B30;
+  --danger-hover: #E0342B;
   --danger-soft: rgba(255, 59, 48, 0.06);
   --radius: 10px;
   --sidebar-w: 240px;
@@ -50,11 +54,24 @@ body {
 }
 .adm-page-title { font-size: 17px; font-weight: 700; }
 .adm-sub { font-size: 12px; color: var(--text-2); }
+.adm-actor-line { margin-top: 6px; }
 .adm-nav-toggle {
   display: none; font-size: 13px; padding: 6px 12px; border-radius: 8px;
   border: 1px solid var(--separator); background: var(--card);
   color: var(--text); cursor: pointer;
 }
+
+/* §4.9：健康握手 = 绿色状态点 +「已连接」；protocolVersion/权限数在 details */
+.adm-status-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  margin-right: 5px; background: var(--text-2); vertical-align: middle;
+}
+.adm-status-dot--ok { background: var(--ok-dot); }
+.adm-handshake-detail { display: inline-block; margin-left: 6px; }
+.adm-handshake-detail summary {
+  cursor: pointer; font-size: 12px; color: var(--text-2); display: inline-block;
+}
+.adm-handshake-detail summary:hover { color: var(--accent); }
 
 .adm-shell-body { display: flex; flex: 1 1 auto; align-items: stretch; }
 
@@ -118,6 +135,7 @@ body {
   border: 1px solid var(--separator); background: var(--card);
   color: var(--text); cursor: pointer;
 }
+.adm-state button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* KPI 卡网格（§9.1 概览） */
 .adm-kpis {
@@ -133,28 +151,45 @@ body {
 .adm-kpi-note { font-size: 11px; color: var(--text-2); margin-top: 2px; }
 .adm-kpi--danger .adm-kpi-value { color: var(--danger); }
 
+/* dd 允许在 → 两侧换行（§4.8 禁止对日期 break-all）；超长 id 用
+   overflow-wrap 兜底 */
 .adm-kv { display: grid; grid-template-columns: 180px 1fr; row-gap: 8px; column-gap: 12px; }
 .adm-kv dt { font-size: 12px; color: var(--text-2); align-self: center; }
-.adm-kv dd { font-size: 13px; word-break: break-all; }
+.adm-kv dd { font-size: 13px; word-break: normal; overflow-wrap: anywhere; }
 
 .adm-note { font-size: 12px; color: var(--text-2); margin-top: 12px; line-height: 1.7; }
+
+/* §4.8：时间/边界单元格——整词换行，绝不对日期 break-all */
+.adm-cell-time { word-break: normal; white-space: normal; overflow-wrap: anywhere; }
+.adm-boundary { word-break: normal; overflow-wrap: anywhere; }
 
 .adm-error-card { border: 1px solid rgba(255, 59, 48, 0.35); }
 .adm-error-text { font-size: 13px; color: var(--danger); line-height: 1.7; word-break: break-all; }
 
-.adm-filters { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 14px; }
+/* §4.6：legacy 中性卡（冻结历史、只读）——默认折叠，无 error 红边 */
+.adm-legacy-card { border: 1px solid var(--separator); box-shadow: var(--shadow); }
+.adm-legacy-card > summary {
+  font-size: 15px; font-weight: 600; cursor: pointer; padding: 2px 0;
+}
+.adm-legacy-card > summary:hover { color: var(--text-2); }
+.adm-legacy-card[open] > summary { margin-bottom: 10px; }
+
+.adm-filters { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 14px; align-items: flex-end; }
+.adm-filters .adm-field { flex: 0 1 200px; min-width: 140px; }
+.adm-filters .adm-field--actions { flex: 0 0 auto; }
 .adm-filters input, .adm-filters select {
   font-size: 13px; padding: 6px 10px; border-radius: 8px;
   border: 1px solid var(--separator); background: #fff; color: var(--text);
-  max-width: 240px;
+  width: 100%; min-width: 0;
 }
 .adm-filters button {
   font-size: 13px; padding: 6px 14px; border-radius: 8px;
-  border: 1px solid var(--accent); background: var(--accent); color: #fff;
+  border: 1px solid var(--separator); background: var(--card); color: var(--text);
   cursor: pointer;
 }
 
-/* 大表（§9.1）：sticky header + 最小宽度 + 横向滚动容器 */
+/* 大表（§9.1）：横向滚动容器；2026-09-01 移除 sticky header——本容器没有
+   纵向滚动（页面整体滚动），sticky 无有效支撑且在移动端产生错误冻结（§4.8） */
 .adm-table-wrap {
   overflow-x: auto; border: 1px solid var(--separator);
   border-radius: var(--radius); background: var(--card);
@@ -164,7 +199,6 @@ body {
   text-align: left; font-weight: 600; color: var(--text-2);
   padding: 8px 10px; border-bottom: 1px solid var(--separator);
   white-space: nowrap; background: var(--card);
-  position: sticky; top: 0; z-index: 1;
 }
 .adm-table td {
   padding: 8px 10px; border-bottom: 1px solid var(--separator);
@@ -199,11 +233,27 @@ body {
   border-radius: var(--radius); padding: 14px 16px; margin: 10px 0;
 }
 
+/* ---- §4.1 表单 field 组件：真实 label + 控件 + help（aria-describedby）---- */
+.adm-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.adm-field-label { font-size: 12px; font-weight: 600; color: var(--text); line-height: 1.5; }
+.adm-field-help { font-size: 11px; color: var(--text-2); line-height: 1.5; }
+.adm-field input, .adm-field select {
+  font-size: 13px; padding: 6px 10px; border-radius: 8px;
+  border: 1px solid var(--separator); background: #fff; color: var(--text);
+  width: 100%; min-width: 0;
+}
+.adm-field input:focus-visible, .adm-field select:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 1px;
+}
+.adm-field input[aria-invalid="true"] { border-color: var(--danger); }
+.adm-field--actions { justify-content: flex-end; }
+
 /* ---- 表单 / 行内按钮 / 页内确认条 / 一次性 token ---- */
-.adm-form { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+.adm-form { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; align-items: flex-start; }
 .adm-form--grid {
-  display: grid; gap: 8px;
+  display: grid; gap: 10px;
   grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  align-items: start;
 }
 .adm-form input, .adm-form select {
   font-size: 13px; padding: 6px 10px; border-radius: 8px;
@@ -211,20 +261,149 @@ body {
   min-width: 180px; flex: 0 1 auto; width: 100%;
 }
 .adm-form--grid input, .adm-form--grid select { min-width: 0; }
-.adm-form button, .adm-confirm button, .adm-actions-cell button {
+
+/* §4.5 按钮语义层：primary / secondary / danger / danger-outline。
+   未带语义类的散置按钮（如旧入口）保持中性次要样式。 */
+.adm-form button, .adm-confirm button, .adm-actions-cell button,
+.adm-btn-primary, .adm-btn-secondary, .adm-btn-danger, .adm-btn-danger-outline {
   font-size: 13px; padding: 6px 14px; border-radius: 8px;
-  border: 1px solid var(--accent); background: var(--accent); color: #fff;
-  cursor: pointer; white-space: nowrap;
+  cursor: pointer; white-space: nowrap; font-family: inherit; line-height: 1.4;
+}
+.adm-form button, .adm-confirm button, .adm-actions-cell button {
+  border: 1px solid var(--separator); background: var(--card); color: var(--text);
 }
 .adm-form--grid button { align-self: start; }
-.adm-btn-danger {
-  border-color: var(--danger) !important; background: var(--danger) !important;
+.adm-btn-primary {
+  border: 1px solid var(--accent); background: var(--accent); color: #fff;
 }
+.adm-btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.adm-btn-secondary {
+  border: 1px solid var(--separator); background: var(--card); color: var(--text);
+}
+.adm-btn-secondary:hover { background: var(--accent-soft); }
+.adm-btn-danger {
+  border: 1px solid var(--danger); background: var(--danger); color: #fff;
+}
+.adm-btn-danger:hover { background: var(--danger-hover); border-color: var(--danger-hover); }
+.adm-btn-danger-outline {
+  border: 1px solid var(--danger); background: var(--card); color: var(--danger);
+}
+.adm-btn-danger-outline:hover { background: var(--danger-soft); }
+.adm-btn-primary:focus-visible, .adm-btn-secondary:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 1px;
+}
+.adm-btn-danger:focus-visible, .adm-btn-danger-outline:focus-visible {
+  outline: 2px solid var(--danger); outline-offset: 1px;
+}
+.adm-btn-primary:disabled, .adm-btn-secondary:disabled,
+.adm-btn-danger:disabled, .adm-btn-danger-outline:disabled {
+  opacity: 0.45; cursor: default;
+}
+.adm-btn-primary:disabled:hover, .adm-btn-secondary:disabled:hover,
+.adm-btn-danger:disabled:hover, .adm-btn-danger-outline:disabled:hover {
+  background: var(--card);
+}
+.adm-btn-primary:disabled { background: var(--accent); border-color: var(--accent); }
+.adm-btn-danger:disabled { background: var(--danger); border-color: var(--danger); }
+
+/* §4.7：保存按钮位于分组底部（独立动作行），不与输入挤同一行 */
+.adm-form-actions { display: flex; gap: 8px; align-items: center; }
+
+/* §4.7：enforcement 独立区（不与普通金额输入等权混排）+ 警示卡 */
+.adm-enforcement {
+  margin-top: 14px; padding: 12px 14px;
+  border: 1px dashed rgba(178, 80, 0, 0.45); border-radius: var(--radius);
+}
+.adm-enforcement .adm-field-label { color: var(--warn); }
+.adm-warning-card {
+  margin-top: 8px; padding: 10px 12px; border-radius: var(--radius);
+  background: rgba(178, 80, 0, 0.08); border: 1px solid rgba(178, 80, 0, 0.35);
+  color: var(--warn); font-size: 12px; line-height: 1.7;
+}
+
+/* §4.7：当前窗口小型摘要卡网格 */
+.adm-summary-grid {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  margin-top: 10px;
+}
+.adm-summary-card {
+  border: 1px solid var(--separator); border-radius: var(--radius);
+  padding: 12px 14px; background: rgba(0, 0, 0, 0.015);
+}
+.adm-summary-card h3 { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+.adm-summary-card .adm-kv { grid-template-columns: 130px 1fr; }
+
+/* §4.2：原始 nano 可展开运维区（可复制十进制字符串） */
+.adm-raw-values {
+  margin-top: 10px; font-size: 12px; color: var(--text-2);
+  border-top: 1px dashed var(--separator); padding-top: 6px;
+}
+.adm-raw-values summary { cursor: pointer; font-size: 12px; }
+.adm-raw-values summary:hover { color: var(--accent); }
+.adm-raw-values-row {
+  display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;
+  padding: 3px 0;
+}
+.adm-raw-values-key { flex: 0 0 auto; min-width: 150px; }
+.adm-raw-values code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  word-break: break-all; background: rgba(0, 0, 0, 0.04);
+  padding: 1px 6px; border-radius: 6px;
+}
+.adm-raw-values button { font-size: 11px; padding: 2px 8px; }
+
+/* §4.5：抽屉/页面的危险操作独立区 */
+.adm-actions { display: flex; flex-direction: column; gap: 8px; align-items: stretch; }
+.adm-danger-zone {
+  border: 1px dashed rgba(255, 59, 48, 0.4); border-radius: var(--radius);
+  padding: 10px 12px; display: flex; flex-direction: column; gap: 8px;
+}
+.adm-danger-zone--page { margin-top: 14px; }
+.adm-danger-zone-title { font-size: 12px; font-weight: 600; color: var(--danger); }
+.adm-danger-zone .adm-form { margin: 0; }
+
 .adm-check {
   display: inline-flex; align-items: center; gap: 6px;
   font-size: 13px; color: var(--text-2);
 }
 .adm-check input { min-width: 0; width: auto; }
+.adm-field-span { grid-column: 1 / -1; }
+
+/* ---- §4.3 用户行用量：两段堆叠迷你条（CSP 禁内联样式 → 5% 宽度桶类）---- */
+.adm-usage-note { font-size: 12px; color: var(--warn); }
+.adm-usage-overage { color: var(--danger); font-weight: 600; }
+/* 移动端堆叠补行（P0-2）：桌面有独立列（AI access/剩余）时隐藏；
+   ≤767px 在状态格/用量格内以块级补行显示，凑成 4 列布局 */
+.adm-stack-mobile { display: none; }
+.adm-usage-meter {
+  display: flex; width: 120px; max-width: 100%; height: 8px;
+  margin-top: 4px; border-radius: 4px; overflow: hidden;
+  background: rgba(0, 0, 0, 0.08);
+}
+.adm-usage-meter-spent { background: var(--accent); height: 100%; }
+.adm-usage-meter-reserved { background: var(--warn); height: 100%; }
+.adm-usage-w0 { width: 0%; }
+.adm-usage-w5 { width: 5%; }
+.adm-usage-w10 { width: 10%; }
+.adm-usage-w15 { width: 15%; }
+.adm-usage-w20 { width: 20%; }
+.adm-usage-w25 { width: 25%; }
+.adm-usage-w30 { width: 30%; }
+.adm-usage-w35 { width: 35%; }
+.adm-usage-w40 { width: 40%; }
+.adm-usage-w45 { width: 45%; }
+.adm-usage-w50 { width: 50%; }
+.adm-usage-w55 { width: 55%; }
+.adm-usage-w60 { width: 60%; }
+.adm-usage-w65 { width: 65%; }
+.adm-usage-w70 { width: 70%; }
+.adm-usage-w75 { width: 75%; }
+.adm-usage-w80 { width: 80%; }
+.adm-usage-w85 { width: 85%; }
+.adm-usage-w90 { width: 90%; }
+.adm-usage-w95 { width: 95%; }
+.adm-usage-w100 { width: 100%; }
 
 /* 页内二次确认条（sandbox 无 allow-modals，window.confirm 不可用） */
 .adm-confirm {
@@ -232,15 +411,17 @@ body {
   background: var(--danger-soft); border: 1px solid rgba(255, 59, 48, 0.35);
   border-radius: var(--radius); padding: 10px 12px; margin: 10px 0;
 }
+.adm-danger-zone .adm-confirm { margin: 0; }
 .adm-confirm-text { font-size: 13px; color: var(--danger); word-break: break-all; }
 .adm-confirm input {
   font-size: 13px; padding: 6px 10px; border-radius: 8px;
   border: 1px solid var(--separator); background: #fff; min-width: 200px;
 }
+/* 确认条内嵌 field 组件（如重置密码输入）时占整行，不与按钮挤同一行 */
+.adm-confirm .adm-field { flex: 1 1 100%; }
 
 .adm-actions-cell button {
   font-size: 12px; padding: 3px 8px; margin: 2px 4px 2px 0;
-  border: 1px solid var(--separator); background: var(--card); color: var(--text);
   white-space: nowrap;
 }
 
@@ -255,7 +436,19 @@ body {
   font-size: 13px; word-break: break-all;
 }
 
-/* ---- 用户详情抽屉（§9.1：余额/来源/状态/操作收纳） ---- */
+/* ---- §4.4 低频创建表单：默认折叠的 details 入口 ---- */
+.adm-collapsible-form { padding: 14px 18px; }
+.adm-collapsible-form > summary {
+  font-size: 14px; font-weight: 600; cursor: pointer; padding: 2px 0;
+  list-style-position: inside;
+}
+.adm-collapsible-form > summary:hover { color: var(--accent); }
+.adm-collapsible-form > summary:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+.adm-collapsible-form[open] > summary { margin-bottom: 6px; }
+
+/* ---- 用户详情抽屉（§9.1 + §4.10 焦点管理） ---- */
 .adm-drawer-mask {
   position: fixed; inset: 0; background: rgba(0, 0, 0, 0.25); z-index: 20;
 }
@@ -269,16 +462,23 @@ body {
   padding: 14px 18px; border-bottom: 1px solid var(--separator);
 }
 .adm-drawer-head h2 { font-size: 15px; font-weight: 600; }
-.adm-drawer-head button {
-  font-size: 13px; padding: 6px 14px; border-radius: 8px;
-  border: 1px solid var(--separator); background: var(--card);
-  color: var(--text); cursor: pointer;
-}
 .adm-drawer-body { padding: 16px 18px; overflow-y: auto; flex: 1 1 auto; }
 .adm-drawer-body .adm-kv { margin-bottom: 14px; }
-.adm-drawer-actions { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.adm-drawer-body .adm-field { margin-bottom: 10px; }
+.adm-drawer-actions { display: flex; flex-direction: column; gap: 8px; align-items: stretch; }
+.adm-drawer-actions .adm-actions button { text-align: left; }
+/* P0-3：抽屉内页内确认条——固定在抽屉底部（body 内滚动之上），位于
+   遮罩之上、Tab 圈定之内；closeUserDrawer 时由 clearConfirm 复位 */
+.adm-drawer-confirm {
+  flex: 0 0 auto; margin: 0 18px 16px;
+}
 
-/* ---- 响应式（§9.3） ---- */
+/* §4.8：audit detail 人类摘要 + 原始详情折叠区 */
+.adm-audit-summary { line-height: 1.7; margin-bottom: 4px; overflow-wrap: anywhere; }
+.adm-cell-detail { word-break: normal; white-space: normal; overflow-wrap: anywhere; min-width: 220px; }
+.adm-cell-detail .adm-raw-values { border-top: none; padding-top: 0; }
+
+/* ---- 响应式（§9.3 + §4.3 移动端列适配） ---- */
 @media (max-width: 1023px) {
   .adm-nav { width: 64px; padding: 12px 6px; }
   .adm-nav-btn { font-size: 0; padding: 10px 0; text-align: center; }
@@ -300,8 +500,32 @@ body {
   }
   .adm-nav.adm-nav--open { display: flex; flex-wrap: wrap; }
   .adm-nav-btn { font-size: 14px; padding: 8px 12px; flex: 1 1 auto; text-align: center; }
-  .adm-nav-btn::before { content: none; }
+  /* 平板图标字符规则带 [data-page]（特异性 0,2,1），通用 ::before 复位
+     （0,1,1）压不过它——390px 同时命中两个媒体查询时必须按同特异性逐页
+     复位，否则出现「概概览/户用户」首字符重复（P0-1 回归） */
+  .adm-nav-btn[data-page="overview"]::before,
+  .adm-nav-btn[data-page="users"]::before,
+  .adm-nav-btn[data-page="invites"]::before,
+  .adm-nav-btn[data-page="settings"]::before,
+  .adm-nav-btn[data-page="billing"]::before,
+  .adm-nav-btn[data-page="plugins"]::before,
+  .adm-nav-btn[data-page="audit"]::before {
+    content: none;
+  }
   .adm-root { padding: 12px; }
   .adm-card { padding: 16px; }
   .adm-kv { grid-template-columns: 120px 1fr; }
+  /* §4.3：390px 保留 显示名/状态/AI/本月用量/剩余/详情；角色、登录账号、
+     最近调用收进详情抽屉——不靠无限横向滚动适配 */
+  .adm-table { min-width: 0; }
+  .adm-table td, .adm-table th { white-space: normal; }
+  .adm-table td { word-break: normal; overflow-wrap: anywhere; }
+  .adm-table--users .adm-col-secondary { display: none; }
+  /* P0-2：390px 用户表收成 4 列 = 显示名 / 状态+AI（堆叠）/
+     本月用量+剩余（堆叠）/ 操作——AI access 与剩余独立列只在桌面显示 */
+  .adm-table--users .adm-col-desktop { display: none; }
+  .adm-table--users .adm-stack-mobile { display: block; }
+  /* 首列给最小宽度，避免显示名逐字符竖排（仍不产生页面级横向滚动） */
+  .adm-table--users td:first-child, .adm-table--users th:first-child { min-width: 96px; }
+  .adm-usage-meter { width: 72px; }
 }

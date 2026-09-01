@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
 """Stage 5-2：sample-annotator 示例插件 manifest 校验 + 平台加载/路由测试。
 
-覆盖（对应任务书第 4 节）：
+覆盖（对应任务书第 4 节；2026-09-01 产品前台已退役注入）：
   (a) plugins/sample-annotator/manifest.json 通过 validate_manifest + negotiate_versions
       不抛（service.baseUrl 填 "/" 占位以满足非空校验，README 已说明）；
-  (b) SAMPLE_PLUGIN_ENABLED 未设时：index 不含 sample-annotator 脚本；
-      /plugins/sample-annotator/ui/main.js 仍可服务（静态文件始终可服务，仅 index.html
-      注入受 flag 控制——推荐方案）；
-  (c) SAMPLE_PLUGIN_ENABLED=1 且 manifest 存在：index 注入 SVS_PLUGIN_PERMISSIONS
-      与 main.js 脚本标签；
+  (b) index 永不注入 sample-annotator 脚本（含 SAMPLE_PLUGIN_ENABLED=1）；
+      /plugins/sample-annotator/ui/main.js 仍可服务（SDK 契约测试用静态资源）；
+  (c) sample_plugin_context() 始终 disabled，忽略 SAMPLE_PLUGIN_ENABLED；
   (d) 路径穿越：/plugins/../app.py 等 → 非 200、不泄露源码；
   (e) 通用插件路由：非 .js/.css 扩展名 403、不存在 .js 404。
 
@@ -83,36 +81,30 @@ def test_index_hides_sample_when_flag_off():
 
 
 def test_sample_asset_served_even_when_flag_off():
-    """静态文件始终可服务，仅 index.html 注入受 SAMPLE_PLUGIN_ENABLED 控制。"""
+    """静态文件始终可服务；产品 index 不再注入该插件。"""
     r = _client().get("/plugins/sample-annotator/ui/main.js")
     assert r.status_code == 200
     assert r.data
 
 
 # =========================================================================== #
-# (c) 开启：注入权限表 + 脚本
+# (c) 产品前台退役：flag=1 也不注入
 # =========================================================================== #
-def test_index_injects_sample_when_enabled(monkeypatch):
+def test_index_never_injects_sample_even_when_flag_on(monkeypatch):
     monkeypatch.setenv("SAMPLE_PLUGIN_ENABLED", "1")
     r = _client().get("/")
     assert r.status_code == 200
     body = r.get_data(as_text=True)
-    assert "/plugins/sample-annotator/ui/main.js" in body
-    assert "/plugins/sdk/ui/bridge-client.js" in body
-    # 权限表：sample-annotator 键存在且含声明权限
-    assert "SVS_PLUGIN_PERMISSIONS" in body
-    assert "sample-annotator" in body
-    assert "slide:metadata:read" in body
-    # histopilot 不在权限表内（内置特权插件，host 端全放行）
-    assert "SVS_PLUGIN_PERMISSIONS = {\"sample-annotator\"" in body
+    assert "/plugins/sample-annotator/ui/main.js" not in body
+    assert "SVS_PLUGIN_PERMISSIONS" not in body
 
 
-def test_sample_context_flag_and_permissions(monkeypatch):
+def test_sample_context_always_disabled(monkeypatch):
     assert app_mod.sample_plugin_context()["enabled"] is False
     monkeypatch.setenv("SAMPLE_PLUGIN_ENABLED", "1")
     ctx = app_mod.sample_plugin_context()
-    assert ctx["enabled"] is True
-    assert "annotation:write" in ctx["permissions"]
+    assert ctx["enabled"] is False
+    assert ctx["permissions"] == []
 
 
 # =========================================================================== #

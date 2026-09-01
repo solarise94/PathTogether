@@ -91,7 +91,7 @@ Python tests cover the platform and compatibility gateway. The small Vitest
 suite owns the platform-side HostBridge, permission gate, and plugin SDK
 contracts that moved out of HistoPilot during the repository split.
 
-插件协议定义位于 `plugins/manifest.schema.json` 和 `plugins/sdk/`。`plugins/sample-annotator/` 是不依赖 HistoPilot 的最小示例插件。
+插件协议定义位于 `plugins/manifest.schema.json` 和 `plugins/sdk/`。`plugins/sample-annotator/` 是不依赖 HistoPilot 的最小示例插件夹具（2026-09-01 起不再注入产品 Viewer）。
 
 ## License
 

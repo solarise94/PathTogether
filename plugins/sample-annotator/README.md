@@ -1,5 +1,8 @@
 # Sample Annotator（示例插件，Stage 5-2）
 
+> **产品前台已退役（2026-09-01）**：Viewer `/` 不再注入本插件；
+> `SAMPLE_PLUGIN_ENABLED` 被忽略。本目录只作为 PluginSDK / manifest 契约夹具保留。
+
 一个**完全不依赖 HistoPilot 源码**的最小示例插件，演示通用插件 SDK
 `plugins/sdk/ui/bridge-client.js`（`window.PluginSDK.createPluginBridge`）与平台 bridge
 权限门（`static/plugin-permissions.js`）。

@@ -175,13 +175,15 @@ histopilot 安装在启动时由 `_bootstrap_plugin_installations()` 自动创�
 
 ---
 
-## 5. 示例插件开关
+## 5. 示例插件（已退役）
 
-`SAMPLE_PLUGIN_ENABLED`：示例插件 `sample-annotator` 的总开关（默认 `0` 关闭）。设 `1`
-开启后，index 注入示例插件 bundle + 权限表（仍需来源策略放行 + manifest 可读，任一不满足
-视同关闭）。histopilot 是内置特权插件，开关为 `HISTOPILOT_UI_ENABLED`（默认 `1` 开启）。
+`sample-annotator` 已从产品前台退役（2026-09-01）。`/` 不再注入示例插件脚本或
+权限表；`SAMPLE_PLUGIN_ENABLED` **被忽略**，设 `1` 也不会打开 Viewer 浮层。
+插件目录与 `source-policy.json` pin 仍保留，供 SDK/manifest 契约测试和静态资源
+路由使用，不是给终端用户的功能。
+
+histopilot 是内置特权插件，开关为 `HISTOPILOT_UI_ENABLED`（默认 `1` 开启）：
 
 ```
-SAMPLE_PLUGIN_ENABLED=1     # 开示例插件
 HISTOPILOT_UI_ENABLED=0     # 关 histopilot UI（人工读片静默降级）
 ```

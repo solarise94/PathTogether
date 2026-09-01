@@ -1674,28 +1674,14 @@ def plugin_source_allowed(plugin_id):
 
 
 def sample_plugin_context():
-    """Sample Annotator 示例插件上下文（Stage 5-2，受 SAMPLE_PLUGIN_ENABLED 控制）。
+    """Sample Annotator 已从产品前台退役（2026-09-01）。
 
-    默认关闭。仅当 env ``SAMPLE_PLUGIN_ENABLED`` 非 "0" **且** manifest.json 存在可
-    解析 **且** 来源策略放行（Stage 5-3 sha256 pin）时返回
-    ``{"enabled": True, "permissions": [...]}``；否则返回
-    ``{"enabled": False, "permissions": []}``——manifest 缺失/损坏/来源拒绝时视同关闭，
-    index 模板不渲染插件脚本与权限表（渲染端把 sample_plugin_enabled 当 False 处理）。
+    始终返回 ``{"enabled": False, "permissions": []}``：``/`` 不再注入示例插件
+    脚本与权限表。``SAMPLE_PLUGIN_ENABLED`` 被忽略，避免部署回滚配方把浮层
+    重新打开。插件目录、source-policy pin 与静态 ``/plugins/sample-annotator/ui/*``
+    仍保留，供 SDK/manifest 契约测试使用。
     """
-    enabled = os.environ.get("SAMPLE_PLUGIN_ENABLED", "0") != "0"
-    permissions = []
-    if enabled:
-        allowed, _reason = plugin_source_allowed("sample-annotator")
-        if not allowed:
-            enabled = False  # 来源策略拒绝 → 视同关闭，index 不注入脚本
-        else:
-            mf = SAMPLE_PLUGIN_DIR / "manifest.json"
-            try:
-                data = json.loads(mf.read_text(encoding="utf-8"))
-                permissions = data.get("permissions") or []
-            except (OSError, ValueError):
-                enabled = False  # manifest 缺失/损坏 → 视同关闭
-    return {"enabled": enabled, "permissions": permissions}
+    return {"enabled": False, "permissions": []}
 
 
 # --------------------------------------------------------------------------- #

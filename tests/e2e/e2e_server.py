@@ -12,6 +12,7 @@
 运行：python3 tests/e2e/e2e_server.py --port 8907
 """
 import argparse
+import atexit
 import json
 import os
 import secrets
@@ -22,6 +23,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "tests"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import pg_reap  # noqa: E402  (path 就绪后再 import，不依赖脚本目录恰为 sys.path[0])
 
 
 def main():
@@ -40,9 +44,20 @@ def main():
     import pgserver
     import psycopg
     import pg_store
-    srv = pgserver.get_server(os.path.join(tmp, "pgdata"))
+    pgdata = os.path.join(tmp, "pgdata")
+    srv = pgserver.get_server(pgdata)
     os.environ["DATABASE_URL"] = srv.get_uri()
     os.environ["STORAGE_BACKEND"] = "postgres"
+
+    # postmaster 是守护进程（独立进程组），webServer 的 SIGKILL 打不到它；
+    # 写 marker 给父进程（playwright.config.ts 的 exit 兜底）收割用，不含凭据。
+    marker = pg_reap.marker_path_for(args.port)
+    pg_reap.write_marker(marker, pgdata=pgdata, tmp=tmp)
+    cleanup = pg_reap.make_cleanup(pgdata, tmp, marker, lambda: srv)
+    atexit.register(cleanup)
+    # SIGTERM -> 正常退出路径，保证 finally/atexit 里的清理执行
+    pg_reap.install_signal_handlers()
+
     conn = psycopg.connect(os.environ["DATABASE_URL"])
     try:
         pg_store.ensure_schema(conn)
@@ -80,7 +95,11 @@ def main():
         "userPassword": user_pw,
     }), encoding="utf-8")
 
-    app_mod.app.run(host="127.0.0.1", port=args.port, threaded=True)
+    try:
+        app_mod.app.run(host="127.0.0.1", port=args.port, threaded=True)
+    finally:
+        cleanup()
+        atexit.unregister(cleanup)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,19 @@
       - sandbox 无 allow-modals：window.confirm/prompt 被浏览器静默吞掉，
         危险操作的二次确认一律用页内确认条（§3.3 红线不因此放松）。
 
+    2026-09-01 金额简化（review-2026-09-01-admin-money-simplify.md §5）：
+      - 用户表收敛 5 列：显示名/角色（次要列）/状态/本月剩余/操作；
+        本月剩余一个数字（剩余/已用尽/超支/不可用），不再摊开用量条；
+      - 用户抽屉金额主视图 3 行（本月剩余/本月额度/额度来源），
+        spent/reserved/余额/nano 收进默认折叠的「技术细节」；
+        单一的「每月额度（CNY）」编辑器：保存 = setSpendOverride +
+        立即改当前窗口（两步、确认条、CAS）；
+      - 设置页删除「调整当前窗口」用户下拉卡；Demo/Owner 各自折叠的
+        「立即调整当前周期」；enforcement 危险开关默认折叠；
+      - 账单页降级为运维页：第一屏只留供应商余额 + 人工调整
+        （类型收敛 grant/manual_adjustment），其余默认折叠（打开才加载）；
+      - 创建用户/创建邀请的「每月金额覆盖」放进默认折叠的「高级：单独月额度」。
+
     2026-09-01 升级要点（不改 API/写操作/权限语义）：
       - 所有非复选框 input/select 用真实 <label for> + .adm-field 组件；
         placeholder 只放示例，字段名/必填/单位/后果在 label 或 help（aria-describedby）；
@@ -26,8 +39,6 @@
         「新建用户」「新建邀请」）；创建成功的一次性 token 不会被自动折叠；
       - 按钮语义：.adm-btn-primary/secondary/danger/danger-outline，
         每个区域最多一个实心 danger，次要危险（轮换凭证）用 outline；
-      - 用户表新增「本月用量」「剩余」两列（spent/reserved 堆叠迷你条），
-        角色/登录账号/最近调用为次要列（窄屏隐藏，详情抽屉仍可见）；
       - legacy（turn budget）卡降级：中性 adm-legacy-card、默认折叠、页尾；
       - 危险操作有独立「危险操作」区；人工调整先查主体才启用。
 
@@ -97,7 +108,7 @@
           </section>
         </section>
 
-        <!-- 用户：创建默认折叠为「新建用户」；列表直接回答本月用量/剩余 -->
+        <!-- 用户：创建默认折叠为「新建用户」；列表只回答能不能用 AI、本月剩多少 -->
         <section class="adm-page" id="adm-page-users" hidden>
           <div class="adm-state" id="adm-state-users" data-page-state="idle" role="status" aria-live="polite"></div>
           <details class="adm-card adm-collapsible-form" id="adm-users-create-box">
@@ -119,11 +130,15 @@
                 <input type="password" id="adm-users-new-password" placeholder="至少 15 位" minlength="15" maxlength="200" autocomplete="new-password" aria-describedby="adm-users-new-password-help">
                 <small class="adm-field-help" id="adm-users-new-password-help">≥15 位；创建后由 owner 线下告知用户</small>
               </div>
-              <div class="adm-field">
-                <label class="adm-field-label" for="adm-users-new-limit">每月金额覆盖（CNY，可选）</label>
-                <input type="text" id="adm-users-new-limit" placeholder="如 20 或 12.5" autocomplete="off" aria-describedby="adm-users-new-limit-help">
-                <small class="adm-field-help" id="adm-users-new-limit-help">留空 = 继承全局默认；最多 9 位小数；与建号同一事务生效</small>
-              </div>
+              <!-- 2026-09-01 金额简化 §5.6：月额度覆盖降级为高级折叠项（默认表单不含金额） -->
+              <details class="adm-field-span" id="adm-users-new-limit-box">
+                <summary>高级：单独月额度</summary>
+                <div class="adm-field">
+                  <label class="adm-field-label" for="adm-users-new-limit">每月金额覆盖（CNY，可选）</label>
+                  <input type="text" id="adm-users-new-limit" placeholder="如 20 或 12.5" autocomplete="off" aria-describedby="adm-users-new-limit-help">
+                  <small class="adm-field-help" id="adm-users-new-limit-help">留空 = 继承全局默认；最多 9 位小数；与建号同一事务生效；建号后也可在用户抽屉单独改</small>
+                </div>
+              </details>
               <div class="adm-form-actions">
                 <button type="button" id="adm-users-create-btn" class="adm-btn-primary">创建用户</button>
               </div>
@@ -132,7 +147,7 @@
           </details>
           <section class="adm-card">
             <h2>用户</h2>
-            <p class="adm-note">「本月用量 / 剩余」为当前月金额窗口快照；余额、注册方式、caps 与全部行操作在「详情」抽屉；owner 行不提供禁用/重置（break-glass 不变量，服务端同样拒绝）。</p>
+            <p class="adm-note">「本月剩余」为当前月金额窗口的一个数字（不可用会写明原因）；登录账号、注册方式、已消费/预占等技术细节在「详情」抽屉；owner 行不提供禁用/重置（break-glass 不变量，服务端同样拒绝）。</p>
             <div class="adm-filters" id="adm-users-filters">
               <div class="adm-field">
                 <label class="adm-field-label" for="adm-users-q">搜索用户</label>
@@ -163,13 +178,9 @@
                 <thead>
                   <tr>
                     <th>显示名</th>
-                    <th class="adm-col-secondary">登录账号</th>
                     <th class="adm-col-secondary">角色</th>
                     <th>状态</th>
-                    <th class="adm-col-desktop">AI access</th>
-                    <th>本月用量</th>
-                    <th class="adm-col-desktop">剩余</th>
-                    <th class="adm-col-secondary">最近 AI 调用</th>
+                    <th>本月剩余</th>
                     <th>操作</th>
                   </tr>
                 </thead>
@@ -207,11 +218,15 @@
                 <input type="number" id="adm-invite-ttl" placeholder="如 168" min="1" max="720" value="168" aria-describedby="adm-invite-ttl-help">
                 <small class="adm-field-help" id="adm-invite-ttl-help">1–720 小时，默认 168（7 天）</small>
               </div>
-              <div class="adm-field">
-                <label class="adm-field-label" for="adm-invite-limit">兑换用户每月金额覆盖（CNY，可选）</label>
-                <input type="text" id="adm-invite-limit" placeholder="如 20 或 12.5" autocomplete="off" aria-describedby="adm-invite-limit-help">
-                <small class="adm-field-help" id="adm-invite-limit-help">留空 = 兑换后继承全局默认；最多 9 位小数</small>
-              </div>
+              <!-- 2026-09-01 金额简化 §5.6：月额度模板降级为高级折叠项 -->
+              <details class="adm-field-span" id="adm-invite-limit-box">
+                <summary>高级：单独月额度</summary>
+                <div class="adm-field">
+                  <label class="adm-field-label" for="adm-invite-limit">兑换用户每月金额覆盖（CNY，可选）</label>
+                  <input type="text" id="adm-invite-limit" placeholder="如 20 或 12.5" autocomplete="off" aria-describedby="adm-invite-limit-help">
+                  <small class="adm-field-help" id="adm-invite-limit-help">留空 = 兑换后继承全局默认；最多 9 位小数</small>
+                </div>
+              </details>
               <div class="adm-field">
                 <label class="adm-field-label" for="adm-invite-cohort">cohort（可选）</label>
                 <input type="text" id="adm-invite-cohort" placeholder="如 beta" maxlength="64" autocomplete="off">
@@ -304,8 +319,8 @@
           </section>
         </section>
 
-        <!-- 设置：注册模式 / 金额策略（三个额度字段 + 独立 enforcement 区）/
-             当前窗口摘要卡 / 运行时安全参数 / 调整当前窗口（§4.7） -->
+        <!-- 设置：注册模式 / 金额策略（三个额度字段 + Demo/Owner 立即调整折叠 +
+             enforcement 折叠危险开关）/ 当前窗口摘要卡（Demo/Owner）/ 运行时参数 -->
         <section class="adm-page" id="adm-page-settings" hidden>
           <div class="adm-state" id="adm-state-settings" data-page-state="idle" role="status" aria-live="polite"></div>
           <section class="adm-card">
@@ -330,7 +345,7 @@
           </section>
           <section class="adm-card">
             <h2>金额策略（输入按 CNY 精确换算为 nano wire）</h2>
-            <p class="adm-note">默认修改只影响<b>之后新建</b>的窗口（已开窗口额度固定）；要立即影响当前周期，用下方「调整当前窗口」（独立操作 + 二次确认 + 审计）。金额输入/输出均为十进制字符串换算，超过 JS 安全整数也不失真。</p>
+            <p class="adm-note">默认修改只影响<b>之后新建</b>的窗口（已开窗口额度固定）；要对 Demo / Owner 的当前周期立即改额度，用下方各自折叠的「立即调整当前周期」。金额输入/输出均为十进制字符串换算，超过 JS 安全整数也不失真。</p>
             <div class="adm-form adm-form--grid" id="adm-spend-form">
               <div class="adm-field">
                 <label class="adm-field-label" for="adm-spend-demo-week">Demo 每周金额（CNY，可选）</label>
@@ -348,17 +363,54 @@
                 <small class="adm-field-help">owner 独立策略，不与用户共池</small>
               </div>
             </div>
-            <!-- §4.7：enforcement 是独立的危险开关区（带警示卡），不与金额输入等权混排 -->
-            <div class="adm-field adm-enforcement" id="adm-spend-enforcement">
-              <label class="adm-field-label" for="adm-spend-mode">enforcement 模式（危险开关）</label>
-              <select id="adm-spend-mode" aria-describedby="adm-spend-mode-help">
-                <option value="shadow">shadow（金额只观测，不拒绝调用）</option>
-                <option value="registered">registered（注册用户金额硬闸）</option>
-                <option value="all">all（含 Demo 金额硬闸）</option>
-              </select>
-              <small class="adm-field-help" id="adm-spend-mode-help">registered/all 开启金额硬拒绝（余额/额度不足时 provider 调用被拒）；只应在金额硬闸验收后切换</small>
-              <div class="adm-warning-card" id="adm-spend-mode-warning" hidden></div>
-            </div>
+            <!-- 2026-09-01 金额简化 §5.5：当前周期的立即调整收敛为 Demo/Owner 两个
+                 固定主体的折叠入口（不再枚举每个用户；单个用户的月额度改用其抽屉） -->
+            <details class="adm-win-adjust" id="adm-win-demo-box">
+              <summary>Demo：立即调整当前周期</summary>
+              <p class="adm-note">只改当前周窗口的额度快照：已消费/预占不回退；调低到低于已消费后，下一次预占即被拒绝。需二次确认并写审计；窗口版本冲突（409）时刷新后重试。</p>
+              <div class="adm-form" id="adm-win-demo-form">
+                <div class="adm-field">
+                  <label class="adm-field-label" for="adm-win-demo-limit">Demo 当前周期新额度（CNY，必填）</label>
+                  <input type="text" id="adm-win-demo-limit" placeholder="如 30.5" autocomplete="off" aria-describedby="adm-win-demo-help">
+                  <small class="adm-field-help" id="adm-win-demo-help">最多 9 位小数；立即生效并写审计；改默认值用上方「Demo 每周金额」</small>
+                </div>
+                <div class="adm-form-actions">
+                  <button type="button" id="adm-win-demo-adjust-btn" class="adm-btn-danger">调整 Demo 当前周期</button>
+                </div>
+              </div>
+              <p class="adm-status" id="adm-win-demo-status"></p>
+              <div class="adm-confirm" id="adm-win-demo-confirm" hidden></div>
+            </details>
+            <details class="adm-win-adjust" id="adm-win-owner-box">
+              <summary>Owner：立即调整当前周期</summary>
+              <p class="adm-note">只改当前月窗口的额度快照：已消费/预占不回退。需二次确认并写审计；窗口版本冲突（409）时刷新后重试。</p>
+              <div class="adm-form" id="adm-win-owner-form">
+                <div class="adm-field">
+                  <label class="adm-field-label" for="adm-win-owner-limit">Owner 当前周期新额度（CNY，必填）</label>
+                  <input type="text" id="adm-win-owner-limit" placeholder="如 1000" autocomplete="off" aria-describedby="adm-win-owner-help">
+                  <small class="adm-field-help" id="adm-win-owner-help">最多 9 位小数；立即生效并写审计；改默认值用上方「Owner 策略额度」</small>
+                </div>
+                <div class="adm-form-actions">
+                  <button type="button" id="adm-win-owner-adjust-btn" class="adm-btn-danger">调整 Owner 当前周期</button>
+                </div>
+              </div>
+              <p class="adm-status" id="adm-win-owner-status"></p>
+              <div class="adm-confirm" id="adm-win-owner-confirm" hidden></div>
+            </details>
+            <!-- §4.7：enforcement 是独立的危险开关（默认折叠，不与金额输入等权混排） -->
+            <details class="adm-enforcement-box" id="adm-spend-enforcement-box">
+              <summary>危险开关：enforcement 模式（默认折叠）</summary>
+              <div class="adm-field adm-enforcement" id="adm-spend-enforcement">
+                <label class="adm-field-label" for="adm-spend-mode">enforcement 模式（危险开关）</label>
+                <select id="adm-spend-mode" aria-describedby="adm-spend-mode-help">
+                  <option value="shadow">shadow（金额只观测，不拒绝调用）</option>
+                  <option value="registered">registered（注册用户金额硬闸）</option>
+                  <option value="all">all（含 Demo 金额硬闸）</option>
+                </select>
+                <small class="adm-field-help" id="adm-spend-mode-help">registered/all 开启金额硬拒绝（余额/额度不足时 provider 调用被拒）；只应在金额硬闸验收后切换</small>
+                <div class="adm-warning-card" id="adm-spend-mode-warning" hidden></div>
+              </div>
+            </details>
             <div class="adm-form-actions">
               <button type="button" id="adm-spend-save-btn" class="adm-btn-primary">保存金额策略</button>
             </div>
@@ -369,7 +421,7 @@
           </section>
           <section class="adm-card">
             <h2>当前金额窗口（摘要）</h2>
-            <p class="adm-note">当前周期的额度快照与消耗（demo 周 / owner 月）；调整当前窗口是独立操作，见下方卡片。原始 nano 在各卡可展开区。</p>
+            <p class="adm-note">当前周期的额度与剩余（Demo 周 / Owner 月）；要对当前周期立即改额度，用上方金额策略卡里各自折叠的「立即调整当前周期」。原始 nano 在「详情」抽屉与 raw 展开区。</p>
             <div class="adm-summary-grid" id="adm-window-summaries"></div>
           </section>
           <section class="adm-card">
@@ -404,40 +456,26 @@
             <p class="adm-status" id="adm-rt-status"></p>
             <dl id="adm-rt-info" class="adm-kv"></dl>
           </section>
-          <section class="adm-card">
-            <h2>调整当前窗口（立即生效的单独操作）</h2>
-            <p class="adm-note">调整只改当前窗口的额度快照：已消费/预占不回退；调低到低于已消费后，下一次预占即被拒绝。需二次确认并写审计；窗口版本冲突（409）时刷新后重试。</p>
-            <div class="adm-form adm-form--grid" id="adm-window-form">
-              <div class="adm-field">
-                <label class="adm-field-label" for="adm-window-subject">选择主体（必选）</label>
-                <select id="adm-window-subject" aria-describedby="adm-window-boundary"></select>
-                <small class="adm-field-help">Demo 周 / Owner 月 / 各用户月窗口</small>
-              </div>
-              <div class="adm-field">
-                <label class="adm-field-label" for="adm-window-newlimit">新额度（CNY，必填）</label>
-                <input type="text" id="adm-window-newlimit" placeholder="如 30.5" autocomplete="off" aria-describedby="adm-window-newlimit-help">
-                <small class="adm-field-help" id="adm-window-newlimit-help">最多 9 位小数；立即生效并写审计</small>
-              </div>
-              <div class="adm-form-actions">
-                <button type="button" id="adm-window-adjust-btn" class="adm-btn-danger">调整当前窗口</button>
-              </div>
-            </div>
-            <p class="adm-status" id="adm-window-status"></p>
-            <div class="adm-confirm" id="adm-window-confirm" hidden></div>
-            <dl id="adm-window-info" class="adm-kv"></dl>
-            <!-- 窗口边界：→ 两侧可换行，禁止对日期 break-all（§4.8） -->
-            <p class="adm-note adm-boundary" id="adm-window-boundary" hidden></p>
-            <div id="adm-window-raw"></div>
-          </section>
         </section>
 
-        <!-- 额度与账单：当前金额账户最先（§4.6）→ 供应商 → 告警/明细/账本 →
-             历史影子 → turn legacy（页尾折叠中性卡） -->
+        <!-- 额度与账单（2026-09-01 金额简化 §5.7：低频运维页）——第一屏只留
+             供应商余额 + 人工调整；caps/用量明细/账本/历史影子/turn legacy
+             全部默认折叠（打开才加载） -->
         <section class="adm-page" id="adm-page-billing" hidden>
           <div class="adm-state" id="adm-state-billing" data-page-state="idle" role="status" aria-live="polite"></div>
-          <section class="adm-card" id="adm-acct-card">
-            <h2>金额账户（caps 与人工调整）</h2>
-            <p class="adm-note">余额 = 账本有符号合计；未开户用户显示 account:null（绝不伪造 0 余额）。caps 更新带版本号 CAS：他人先改会得到 409，需刷新后重填。人工调整必须填写原因；冲正只能追加新条目，账本不可编辑。</p>
+          <section class="adm-card" id="adm-billing-provider-card">
+            <h2>供应商余额（DeepSeek · 平台成本监控）</h2>
+            <p class="adm-note">DeepSeek 总余额是平台供应商余额，只作成本监控，不等于任何用户余额（§10.1）。</p>
+            <dl id="adm-billing-provider" class="adm-kv"></dl>
+            <div id="adm-billing-provider-raw"></div>
+            <p class="adm-pager">
+              <button type="button" id="adm-balance-refresh-btn" class="adm-btn-secondary">手动刷新余额</button>
+              <span id="adm-balance-refresh-status" class="adm-status"></span>
+            </p>
+          </section>
+          <section class="adm-card" id="adm-adjust-card">
+            <h2>人工调整（赠送 grant / 冲正 manual_adjustment）</h2>
+            <p class="adm-note">先精确查询 user_id 才启用调整区；原因必填并写入账本与审计；冲正用负数 manual_adjustment 追加新账目，账本不可编辑。</p>
             <div class="adm-form" id="adm-acct-lookup-form">
               <div class="adm-field">
                 <label class="adm-field-label" for="adm-acct-user">user_id（必填，精确匹配）</label>
@@ -448,24 +486,6 @@
                 <button type="button" id="adm-acct-load-btn" class="adm-btn-secondary">查询账户</button>
               </div>
             </div>
-            <dl id="adm-acct-info" class="adm-kv"></dl>
-            <div id="adm-acct-raw"></div>
-            <div class="adm-form adm-form--grid" id="adm-caps-form" hidden>
-              <div class="adm-field">
-                <label class="adm-field-label" for="adm-caps-soft">soft cap（CNY，留空=清除）</label>
-                <input type="text" id="adm-caps-soft" placeholder="如 12.5" autocomplete="off">
-                <small class="adm-field-help">兼容字段，非当前月额度；最多 9 位小数</small>
-              </div>
-              <div class="adm-field">
-                <label class="adm-field-label" for="adm-caps-hard">hard cap（CNY，留空=清除）</label>
-                <input type="text" id="adm-caps-hard" placeholder="如 100" autocomplete="off">
-                <small class="adm-field-help">兼容字段，非当前月额度；不可低于 soft cap</small>
-              </div>
-              <div class="adm-form-actions">
-                <button type="button" id="adm-caps-save-btn" class="adm-btn-secondary">保存 caps</button>
-              </div>
-            </div>
-            <p class="adm-status" id="adm-caps-status"></p>
             <!-- §4.5：人工调整是危险操作——独立危险区；先成功查询目标用户才启用，
                  user_id 变更即失效再禁用（服务端仍是权威校验） -->
             <div class="adm-danger-zone adm-danger-zone--page" id="adm-adjust-zone">
@@ -476,9 +496,7 @@
                   <label class="adm-field-label" for="adm-adjust-kind">调整类型</label>
                   <select id="adm-adjust-kind">
                     <option value="grant">grant（赠送，正数）</option>
-                    <option value="topup">topup（充值，正数）</option>
-                    <option value="refund">refund（退款，正数）</option>
-                    <option value="manual_adjustment">manual_adjustment（人工调整，非零，可为负）</option>
+                    <option value="manual_adjustment">manual_adjustment（冲正/人工调整，非零，可为负）</option>
                   </select>
                 </div>
                 <div class="adm-field">
@@ -497,30 +515,31 @@
               <p class="adm-status" id="adm-adjust-status"></p>
             </div>
           </section>
-          <section class="adm-card">
-            <h2>供应商余额（DeepSeek · 平台成本监控）</h2>
-            <dl id="adm-billing-provider" class="adm-kv"></dl>
-            <div id="adm-billing-provider-raw"></div>
-            <p class="adm-pager">
-              <button type="button" id="adm-balance-refresh-btn" class="adm-btn-secondary">手动刷新余额</button>
-              <span id="adm-balance-refresh-status" class="adm-status"></span>
-            </p>
-          </section>
-          <section class="adm-card adm-error-card" id="adm-unpriced-card" hidden>
-            <h2>Unpriced 事件告警</h2>
-            <p class="adm-note">未计价事件不等于 0 元调用（§10.4 红线）：以下事件缺少可用的最终价格或 usage，需单独排查。</p>
-            <div class="adm-table-wrap">
-              <table class="adm-table">
-                <thead><tr><th>时间</th><th>模型</th><th>原因</th><th>event</th></tr></thead>
-                <tbody id="adm-unpriced-tbody"></tbody>
-              </table>
+          <!-- 以下均为运维明细：默认折叠，首次展开才发对应请求（§5.7） -->
+          <details class="adm-card adm-collapsible-form" id="adm-billing-acct-box">
+            <summary>金额账户 caps（已不参与授权，仅兼容）</summary>
+            <p class="adm-note">余额 = 账本有符号合计；未开户用户显示 account:null（绝不伪造 0 余额）。caps 已不参与授权（当前月额度看用户抽屉），仅兼容保留；caps 更新带版本号 CAS：他人先改会得到 409，需刷新后重填。</p>
+            <dl id="adm-acct-info" class="adm-kv"></dl>
+            <div id="adm-acct-raw"></div>
+            <div class="adm-form adm-form--grid" id="adm-caps-form" hidden>
+              <div class="adm-field">
+                <label class="adm-field-label" for="adm-caps-soft">soft cap（CNY，留空=清除）</label>
+                <input type="text" id="adm-caps-soft" placeholder="如 12.5" autocomplete="off">
+                <small class="adm-field-help">兼容字段，已不参与授权；最多 9 位小数</small>
+              </div>
+              <div class="adm-field">
+                <label class="adm-field-label" for="adm-caps-hard">hard cap（CNY，留空=清除）</label>
+                <input type="text" id="adm-caps-hard" placeholder="如 100" autocomplete="off">
+                <small class="adm-field-help">兼容字段，已不参与授权；不可低于 soft cap</small>
+              </div>
+              <div class="adm-form-actions">
+                <button type="button" id="adm-caps-save-btn" class="adm-btn-secondary">保存 caps</button>
+              </div>
             </div>
-            <div class="adm-pager">
-              <button type="button" id="adm-unpriced-more-btn" class="adm-btn-secondary">加载更多</button>
-            </div>
-          </section>
-          <section class="adm-card">
-            <h2>用量明细（usage events）</h2>
+            <p class="adm-status" id="adm-caps-status"></p>
+          </details>
+          <details class="adm-card adm-collapsible-form" id="adm-billing-usage-box">
+            <summary>用量明细（usage events）</summary>
             <div class="adm-filters" id="adm-usage-filters">
               <div class="adm-field">
                 <label class="adm-field-label" for="adm-usage-model">模型（精确）</label>
@@ -557,9 +576,9 @@
               <button type="button" id="adm-usage-more-btn" class="adm-btn-secondary">加载更多</button>
               <span id="adm-usage-status" class="adm-status"></span>
             </div>
-          </section>
-          <section class="adm-card">
-            <h2>账本（ledger · 只读不可变）</h2>
+          </details>
+          <details class="adm-card adm-collapsible-form" id="adm-billing-ledger-box">
+            <summary>账本（ledger · 只读不可变）</summary>
             <p class="adm-note">账本只读；冲正通过新条目追加，不提供编辑/删除（§10.4）。金额列为原始 nano wire 记录。</p>
             <div class="adm-table-wrap">
               <table class="adm-table">
@@ -572,13 +591,26 @@
             <div class="adm-pager">
               <button type="button" id="adm-ledger-more-btn" class="adm-btn-secondary">加载更多</button>
             </div>
-          </section>
+          </details>
+          <details class="adm-card adm-error-card" id="adm-unpriced-card">
+            <summary>Unpriced 事件告警</summary>
+            <p class="adm-note">未计价事件不等于 0 元调用（§10.4 红线）：以下事件缺少可用的最终价格或 usage，需单独排查。</p>
+            <div class="adm-table-wrap">
+              <table class="adm-table">
+                <thead><tr><th>时间</th><th>模型</th><th>原因</th><th>event</th></tr></thead>
+                <tbody id="adm-unpriced-tbody"></tbody>
+              </table>
+            </div>
+            <div class="adm-pager">
+              <button type="button" id="adm-unpriced-more-btn" class="adm-btn-secondary">加载更多</button>
+            </div>
+          </details>
           <!-- 历史影子数据：仅确有 legacy 计价事件时出现（真实异常才用红卡） -->
-          <section class="adm-card adm-error-card" id="adm-legacy-card" hidden>
-            <h2>历史影子数据（不参与硬额度）</h2>
+          <details class="adm-card adm-error-card" id="adm-legacy-card" hidden>
+            <summary>历史影子数据（不参与硬额度）</summary>
             <p class="adm-note">价格单位修复（批次 A cutover）之前的用量按旧错误价格计价，属历史影子数据：不参与任何当前金额额度/窗口/余额，不与修复后的金额混合汇总。当前周期金额请看「设置」页的金额策略与当前窗口。</p>
             <dl id="adm-legacy-info" class="adm-kv"></dl>
-          </section>
+          </details>
           <!-- 批次 F + 2026-09-01 §4.6：turn 卡降级为页尾折叠的中性 legacy 卡
                （只读冻结历史展示 + 已退役标记）；编辑/保存/开新周期入口全部
                移除，金额预算请用「设置」页与 /api/admin/v1/spend/* -->

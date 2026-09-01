@@ -248,14 +248,15 @@ describe("pathtogether-admin plugin UI bootstrap (PR5)", () => {
 		// settings 在白名单内（宿主深链 /admin#settings）
 		const a = loadPluginUi("#settings");
 		expect(a.client).toBeTruthy();
-		// 设置页 section 装配期注册；bindNav 对设置页按钮/主体选择器做了
-		// 可选探测绑定（缺省 DOM 下不抛错即装配完成）
+		// 设置页 section 装配期注册；bindNav 对设置页按钮做了可选探测绑定
+		// （缺省 DOM 下不抛错即装配完成）。2026-09-01 金额简化：Demo/Owner
+		// 立即调整按钮取代旧「调整当前窗口」下拉
 		expect(a.els["adm-page-settings"]).toBeTruthy();
 		expect(a.els["adm-regmode-save-btn"]).toBeTruthy();
 		expect(a.els["adm-spend-save-btn"]).toBeTruthy();
 		expect(a.els["adm-rt-save-btn"]).toBeTruthy();
-		expect(a.els["adm-window-adjust-btn"]).toBeTruthy();
-		expect(a.els["adm-window-subject"]).toBeTruthy();
+		expect(a.els["adm-win-demo-adjust-btn"]).toBeTruthy();
+		expect(a.els["adm-win-owner-adjust-btn"]).toBeTruthy();
 	});
 });
 
@@ -575,12 +576,13 @@ describe("pathtogether-admin plugin UI — workbench KPI + drawer (§9, 包 E)",
 			},
 		});
 		await ticks(4);
-		const texts = Object.values(bus.els).map((el) => el.textContent).join("\n");
-		// 高频列在表内
-		expect(texts).toContain("张三");
-		expect(texts).toContain("z***@x.com");
-		// 低频字段不进表格行（余额/caps/注册方式只在抽屉里出现）
-		// —— 直接验证抽屉可打开且包含完整字段
+		const tbody = bus.els["adm-users-tbody"].textContent;
+		// 2026-09-01 金额简化 §5.3：表内只剩显示名/角色/状态/本月剩余/操作
+		expect(tbody).toContain("张三");
+		expect(tbody).toContain("user");
+		expect(tbody).toContain("启用");
+		// 低频字段不进表格行（掩码登录账号/余额/注册方式只在抽屉里出现）
+		expect(tbody).not.toContain("z***@x.com");
 		expect(bus.els["adm-user-drawer"]).toBeTruthy();
 	});
 
@@ -685,8 +687,9 @@ describe("UI 升级 2026-09-01 — 批次A 锁定（review spec §4）", () => {
 		expect(texts).not.toContain("12500000000");
 	});
 
-	// §4.3 用户行用量：spent/reserved/remaining、0、overage、不可用
-	it("批次A-2: 用户行展示已消费/预占/剩余；额度 0、超支、不可用边界正确", async () => {
+	// §5.3 用户行「本月剩余」：一个数字的短文案 + 5 列几何（不再有
+	// spent/reserved 双行与迷你条）
+	it("批次A-2: 用户行只回答本月剩余（短文案）；0 额度、超支、不可用边界正确", async () => {
 		const bus = loadPluginUiWithBus();
 		boot(bus);
 		bus.client!.showPage("users");
@@ -745,64 +748,58 @@ describe("UI 升级 2026-09-01 — 批次A 锁定（review spec §4）", () => {
 		});
 		await ticks(4);
 		const tbody = bus.els["adm-users-tbody"].textContent;
-		expect(tbody).toContain("已消费 3.42 CNY");
-		expect(tbody).toContain("预占 0.5 CNY");
+		// 短文案四态（§5.3）：不写「下次预占将被拒绝」、不拆 spent/reserved
 		expect(tbody).toContain("剩余 16.08 CNY");
-		expect(tbody).toContain("额度为 0");
+		expect(tbody).toContain("已用尽");
 		expect(tbody).toContain("超支 2.5 CNY");
 		// 不可用：非敏感错误摘要；绝不伪造 0 或空白
 		expect(tbody).toContain("不可用");
 		expect(tbody).toContain("pg_backend_required");
-		// remaining_nano = null 的窗口：显式「不可用（remaining 缺失）」
 		expect(tbody).toContain("不可用（remaining 缺失）");
-		// 移动端堆叠补行（P0-2）：正常户的用量格内堆叠剩余语义、状态格内堆叠 AI
-		const stacks = bus.created.filter((el) =>
-			String(el.className).includes("adm-stack-mobile"));
-		const stackTexts = stacks.map((el) => el.textContent).join("\n");
-		expect(stackTexts).toContain("剩余 16.08 CNY");
-		expect(stackTexts).toContain("AI");
-		expect(stacks.every((el) => String(el.className).includes("adm-stack-mobile"))).toBe(true);
-		const rows = tbody.split("无窗口")[1] || "";
-		void rows;
-		// 堆叠迷你条：spent 主段 + reserved 警示段（宽度桶类，CSP 无内联样式）
+		expect(tbody).not.toContain("下次预占将被拒绝");
+		expect(tbody).not.toContain("已消费");
+		expect(tbody).not.toContain("预占");
+		// 不再渲染用量迷你条（.adm-usage-meter 已随金额简化退役）
 		const meters = bus.created.filter((el) =>
 			String(el.className).includes("adm-usage-meter"));
-		expect(meters.length).toBeGreaterThanOrEqual(2);
-		const allSegs = bus.created.filter((el) =>
-			String(el.className).includes("adm-usage-meter-spent"));
-		expect(allSegs.length).toBeGreaterThanOrEqual(2);
-		// 正常户：spent 17.1% → 桶 w15；overage 行：条宽 clamp 到 100%
-		expect(String(allSegs[0].className)).toContain("adm-usage-w15");
-		const overageSegs = bus.created.filter((el) =>
-			String(el.className).includes("adm-usage-w100"));
-		expect(overageSegs.length).toBeGreaterThanOrEqual(1);
+		expect(meters).toHaveLength(0);
+		// 每行 5 个单元格（显示名/角色/状态/本月剩余/操作）；角色为次要列
+		const rowCount = (tbody.match(/详情/g) || []).length;
+		expect(rowCount).toBe(6);
+		// 状态格内仍有移动端 AI 堆叠补行（≤767px 4 列几何用）
+		const stacks = bus.created.filter((el) =>
+			String(el.className).includes("adm-stack-mobile"));
+		expect(stacks.length).toBeGreaterThanOrEqual(1);
+		expect(stacks.map((el) => el.textContent).join("\n")).toContain("AI");
 	});
 
-	// §4.4 折叠创建表单
+	// §4.4 折叠创建表单（§5.6 后表单内还嵌套「高级：单独月额度」折叠）
 	it("批次A-3: 创建用户/邀请默认折叠为入口，token 区在展开区内", () => {
-		// users 创建卡
+		// users 创建卡（块尾 = 下一个 <section>，因表单内嵌套了 details）
 		const usersBox = htmlSrc.indexOf('id="adm-users-create-box"');
 		expect(usersBox).toBeGreaterThan(-1);
 		const usersTag = htmlSrc.slice(htmlSrc.lastIndexOf("<details", usersBox),
 			htmlSrc.indexOf(">", usersBox) + 1);
 		expect(usersTag).not.toMatch(/\sopen[\s>]/); // 默认折叠
-		const usersEnd = htmlSrc.indexOf("</details>", usersBox);
+		const usersEnd = htmlSrc.indexOf("<section", usersBox);
 		const usersBlock = htmlSrc.slice(usersBox, usersEnd);
 		expect(usersBlock).toContain("新建用户");
 		expect(usersBlock).toContain('id="adm-users-create-form"');
 		expect(usersBlock).toContain('id="adm-users-create-btn"');
+		expect(usersBlock).toContain("高级：单独月额度");
 		// invites 创建卡（token 一次性展示区同在 details 内，创建后不被自动折叠）
 		const invBox = htmlSrc.indexOf('id="adm-invite-create-box"');
 		expect(invBox).toBeGreaterThan(-1);
 		const invTag = htmlSrc.slice(htmlSrc.lastIndexOf("<details", invBox),
 			htmlSrc.indexOf(">", invBox) + 1);
 		expect(invTag).not.toMatch(/\sopen[\s>]/);
-		const invEnd = htmlSrc.indexOf("</details>", invBox);
+		const invEnd = htmlSrc.indexOf("<section", invBox);
 		const invBlock = htmlSrc.slice(invBox, invEnd);
 		expect(invBlock).toContain("新建邀请");
 		expect(invBlock).toContain('id="adm-invite-create-form"');
 		expect(invBlock).toContain('id="adm-invite-create-btn"');
 		expect(invBlock).toContain('id="adm-invite-token-box"');
+		expect(invBlock).toContain("高级：单独月额度");
 	});
 
 	// §4.1 持久 label
@@ -817,11 +814,11 @@ describe("UI 升级 2026-09-01 — 批次A 锁定（review spec §4）", () => {
 			"adm-invite-login", "adm-invite-ttl", "adm-invite-limit",
 			"adm-invite-cohort", "adm-invite-note", "adm-invite-source",
 			"adm-invite-campaign",
-			// 设置：注册模式 / 金额策略 / enforcement / 运行时 / 调整窗口
+			// 设置：注册模式 / 金额策略 / enforcement / 运行时 / Demo+Owner 立即调整
 			"adm-regmode-select", "adm-spend-demo-week", "adm-spend-user-month",
 			"adm-spend-owner-month", "adm-spend-mode",
 			"adm-rt-psteps", "adm-rt-demosteps", "adm-rt-ownsteps", "adm-rt-concurrency",
-			"adm-window-subject", "adm-window-newlimit",
+			"adm-win-demo-limit", "adm-win-owner-limit",
 			// 额度与账单：账户 / caps / 人工调整
 			"adm-acct-user", "adm-caps-soft", "adm-caps-hard",
 			"adm-adjust-kind", "adm-adjust-amount", "adm-adjust-reason",
@@ -1003,16 +1000,41 @@ describe("UI 升级 2026-09-01 — 批次A 锁定（review spec §4）", () => {
 		expect(okBtn!.className).toBe("adm-btn-danger");
 	});
 
-	// §4.6 legacy 降级
-	it("批次A-6: 账单页金额账户在前；turn legacy 卡中性、折叠、位于页尾", () => {
+	// §4.6 legacy 降级 + §5.7 账单页降级（2026-09-01 金额简化）
+	it("批次A-6: 账单页第一屏=供应商+人工调整；caps/用量/账本默认折叠；turn legacy 页尾", () => {
 		const billingStart = htmlSrc.indexOf('id="adm-page-billing"');
 		const billingEnd = htmlSrc.indexOf('id="adm-page-plugins"');
 		const billing = htmlSrc.slice(billingStart, billingEnd);
-		// 当前金额账户卡在账单页第一个卡片位置（在 legacy 卡之前）
-		const acctIdx = billing.indexOf('id="adm-acct-card"');
+		// 第一屏：供应商余额在前、人工调整随后，均位于折叠运维明细之前
+		const providerIdx = billing.indexOf('id="adm-billing-provider-card"');
+		const adjustIdx = billing.indexOf('id="adm-adjust-card"');
+		const acctIdx = billing.indexOf('id="adm-billing-acct-box"');
+		const usageIdx = billing.indexOf('id="adm-billing-usage-box"');
+		const ledgerIdx = billing.indexOf('id="adm-billing-ledger-box"');
 		const turnIdx = billing.indexOf('id="adm-turn-legacy-card"');
-		expect(acctIdx).toBeGreaterThan(-1);
-		expect(turnIdx).toBeGreaterThan(acctIdx);
+		expect(providerIdx).toBeGreaterThan(-1);
+		expect(adjustIdx).toBeGreaterThan(providerIdx);
+		expect(acctIdx).toBeGreaterThan(adjustIdx);
+		expect(usageIdx).toBeGreaterThan(acctIdx);
+		expect(ledgerIdx).toBeGreaterThan(usageIdx);
+		expect(turnIdx).toBeGreaterThan(ledgerIdx);
+		// caps 卡标题写明「已不参与授权，仅兼容」；caps 表单留在折叠区内
+		const acctSummary = billing.slice(acctIdx, billing.indexOf("</summary>", acctIdx));
+		expect(acctSummary).toContain("已不参与授权，仅兼容");
+		expect(billing.indexOf('id="adm-caps-form"')).toBeGreaterThan(acctIdx);
+		// 调整类型收敛：grant + manual_adjustment 两个；topup/refund 不在 UI 陈列
+		expect(billing).toContain('value="grant"');
+		expect(billing).toContain('value="manual_adjustment"');
+		expect(billing).not.toContain('value="topup"');
+		expect(billing).not.toContain('value="refund"');
+		// 运维明细默认折叠（caps/用量/账本/unpriced 的 details 均无 open）
+		for (const id of ["adm-billing-acct-box", "adm-billing-usage-box",
+			"adm-billing-ledger-box", "adm-unpriced-card"]) {
+			const idx = billing.indexOf(`id="${id}"`);
+			const tag = billing.slice(billing.lastIndexOf("<details", idx),
+				billing.indexOf(">", idx) + 1);
+			expect(tag, `${id} must be collapsed by default`).not.toMatch(/\sopen[\s>]/);
+		}
 		// turn legacy 卡：details 默认折叠 + 中性 legacy 样式（非 error 红卡）
 		const turnTag = billing.slice(billing.lastIndexOf("<details", turnIdx),
 			billing.indexOf(">", turnIdx) + 1);
@@ -1027,11 +1049,11 @@ describe("UI 升级 2026-09-01 — 批次A 锁定（review spec §4）", () => {
 		const ovEnd = htmlSrc.indexOf('id="adm-page-users"');
 		const ov = htmlSrc.slice(ovStart, ovEnd);
 		const billingIdx = ov.indexOf('id="adm-ov-billing"');
-		const usageIdx = ov.indexOf('id="adm-ov-usage"');
+		const usageOvIdx = ov.indexOf('id="adm-ov-usage"');
 		const ovTurnIdx = ov.indexOf('id="adm-ov-turn-box"');
 		expect(ovTurnIdx).toBeGreaterThan(-1);
 		expect(ovTurnIdx).toBeGreaterThan(billingIdx);
-		expect(ovTurnIdx).toBeGreaterThan(usageIdx);
+		expect(ovTurnIdx).toBeGreaterThan(usageOvIdx);
 		const ovTurnTag = ov.slice(ov.lastIndexOf("<details", ovTurnIdx),
 			ov.indexOf(">", ovTurnIdx) + 1);
 		expect(ovTurnTag).not.toMatch(/\sopen[\s>]/);
@@ -1046,8 +1068,9 @@ describe("UI 升级 2026-09-01 — 批次A 锁定（review spec §4）", () => {
 		expect(cssSrc).toMatch(/\.adm-btn-danger\s*{/);
 		expect(cssSrc).toMatch(/\.adm-btn-danger-outline\s*{/);
 		expect(cssSrc).toMatch(/\.adm-btn[^{]*:focus-visible/);
-		// 账单页两个既有实心 danger 保留（窗口调整/人工调整提交）
-		expect(htmlSrc).toMatch(/id="adm-window-adjust-btn"[^>]*class=["'][^"']*adm-btn-danger/);
+		// 账单页人工调整提交 + 设置页 Demo/Owner 立即调整均为实心 danger
+		expect(htmlSrc).toMatch(/id="adm-win-demo-adjust-btn"[^>]*class=["'][^"']*adm-btn-danger/);
+		expect(htmlSrc).toMatch(/id="adm-win-owner-adjust-btn"[^>]*class=["'][^"']*adm-btn-danger/);
 		expect(htmlSrc).toMatch(/id="adm-adjust-btn"[^>]*class=["'][^"']*adm-btn-danger/);
 		// 轮换凭证：次要危险 → danger-outline（不再中性化）
 		expect(src).toMatch(/actionBtn\("轮换凭证"[\s\S]{0,600}?"danger-outline"/);
@@ -1081,31 +1104,32 @@ describe("UI 升级 2026-09-01 — 批次A 锁定（review spec §4）", () => {
 		expect(bus.els["adm-adjust-btn"].disabled).toBe(true);
 	});
 
-	// §4.3/§4.8 390px 列适配（CSS 断言；真实视口在批次 E Chromium 验收）
-	it("批次A-8: 次要/桌面列可隐藏、关键列保留、移动堆叠补行、日期不 break-all", () => {
-		// 用户表次要列（角色/登录账号/最近调用）带隐藏标记
-		expect(htmlSrc).toMatch(/<th[^>]*adm-col-secondary[^>]*>登录账号</);
-		expect(htmlSrc).toMatch(/<th[^>]*adm-col-secondary[^>]*>角色</);
-		expect(htmlSrc).toMatch(/<th[^>]*adm-col-secondary[^>]*>最近 AI 调用</);
-		// P0-2：AI access 与剩余为桌面列（≤767px 隐藏，由堆叠补行接管）
-		expect(htmlSrc).toMatch(/<th[^>]*adm-col-desktop[^>]*>AI access</);
-		expect(htmlSrc).toMatch(/<th[^>]*adm-col-desktop[^>]*>剩余</);
-		expect(htmlSrc).toContain("<th>显示名</th>");
-		expect(htmlSrc).toContain("<th>本月用量</th>");
-		expect(htmlSrc).toContain("<th>状态</th>");
-		expect(htmlSrc).toContain("<th>操作</th>");
-		// 窄屏媒体查询隐藏次要列与桌面列，显示堆叠补行（4 列 = 显示名/状态+AI/
-		// 用量+剩余/操作），不靠横向滚动
+	// §5.3/§4.8 390px 列适配（CSS 断言；真实视口在批次 E Chromium 验收）
+	it("批次A-8: 次要列可隐藏、5 列表头（窄屏 4 列）、移动堆叠补行、日期不 break-all", () => {
+		// 断言范围限定在用户页（邀请/来源页仍有自己的登录账号列）
+		const usersPage = htmlSrc.slice(htmlSrc.indexOf('id="adm-page-users"'),
+			htmlSrc.indexOf('id="adm-page-invites"'));
+		// 用户表 5 列表头：角色为次要列；登录账号/最近 AI 调用不再是列
+		expect(usersPage).toMatch(/<th[^>]*adm-col-secondary[^>]*>角色</);
+		expect(usersPage).not.toMatch(/<th[^>]*>登录账号</);
+		expect(usersPage).not.toMatch(/<th[^>]*>最近 AI 调用</);
+		expect(usersPage).not.toMatch(/<th[^>]*>本月用量</);
+		expect(usersPage).not.toMatch(/<th[^>]*adm-col-desktop/);
+		expect(usersPage).toContain("<th>显示名</th>");
+		expect(usersPage).toContain("<th>状态</th>");
+		expect(usersPage).toContain("<th>本月剩余</th>");
+		expect(usersPage).toContain("<th>操作</th>");
+		// 窄屏媒体查询隐藏次要列、显示堆叠补行（4 列 = 显示名/状态+AI/
+		// 本月剩余/操作），不靠横向滚动
 		expect(cssSrc).toMatch(/@media \(max-width:\s*767px\)[\s\S]*\.adm-col-secondary\s*{[^}]*display:\s*none/);
-		expect(cssSrc).toMatch(/@media \(max-width:\s*767px\)[\s\S]*\.adm-table--users \.adm-col-desktop\s*{[^}]*display:\s*none/);
 		expect(cssSrc).toMatch(/@media \(max-width:\s*767px\)[\s\S]*\.adm-table--users \.adm-stack-mobile\s*{[^}]*display:\s*block/);
-		// 堆叠补行桌面默认隐藏（桌面显示独立列）
+		// 堆叠补行桌面默认隐藏
 		expect(cssSrc).toMatch(/\.adm-stack-mobile\s*{[^}]*display:\s*none/);
-		// 移动端迷你条收窄（~72px），避免挤掉剩余文字
-		expect(cssSrc).toMatch(/@media \(max-width:\s*767px\)[\s\S]*\.adm-usage-meter\s*{[^}]*width:\s*7[0-9]px/);
 		// 日期单元格不允许 break-all（窗口边界在 → 两侧换行）
 		expect(cssSrc).toMatch(/\.adm-cell-time\s*{[^}]*word-break:\s*normal/);
-		expect(htmlSrc).toMatch(/id="adm-window-boundary"/);
+		// 抽屉技术细节 / Demo/Owner 立即调整的折叠入口样式存在
+		expect(cssSrc).toMatch(/\.adm-drawer-tech\s*{/);
+		expect(cssSrc).toMatch(/\.adm-win-adjust\s*{/);
 	});
 
 	// P0-1 回归：390px 导航完整标签——平板图标字符规则（特异性 0,2,1）必须
@@ -1199,8 +1223,8 @@ describe("UI 升级 2026-09-01 — 批次A 锁定（review spec §4）", () => {
 		expect(tbody).toContain("调整前：40；调整后：50");
 	});
 
-	// §4.7 设置页窗口摘要卡
-	it("批次A-12: 设置页当前窗口拆成摘要卡（额度/已消费/预占/剩余/版本 + raw）", async () => {
+	// §5.5 设置页窗口摘要卡：只回答额度/剩余；且不再拉用户列表拼主体下拉
+	it("批次A-12: 设置页当前窗口摘要卡只有 Demo/Owner 两张（额度/剩余）；不发 users.list", async () => {
 		const bus = loadPluginUiWithBus();
 		bus.dispatch(bus.parent, {
 			kind: "init", bridge: "admin", protocolVersion: "1.0.0",
@@ -1229,22 +1253,389 @@ describe("UI 升级 2026-09-01 — 批次A 锁定（review spec §4）", () => {
 				runtime: { available: true, limits: { demo_enabled: true } },
 			},
 		});
-		replyMethod(bus, NONCE, "admin.users.list", {
-			ok: true, result: { items: [], next_cursor: null },
-		});
 		await ticks(6);
+		// 金额简化 §5.5：设置页不再请求 users.list（没有「每个用户」下拉）
+		const requested = bus.parentPosted
+			.filter((p) => p.env.kind === "request")
+			.map((p) => String(p.env.method));
+		expect(requested).not.toContain("admin.users.list");
 		const cards = bus.created.filter((el) =>
 			String(el.className).includes("adm-summary-card"));
-		expect(cards.length).toBeGreaterThanOrEqual(1);
+		// 只渲染 Demo、Owner 两张（current_windows 缺 owner → 可用性占位）
+		expect(cards.length).toBe(2);
 		const cardText = cards.map((el) => el.textContent).join("\n");
-		expect(cardText).toContain("已消费（spent）21.3 CNY");
-		expect(cardText).toContain("预占（reserved）2.5 CNY");
-		expect(cardText).toContain("剩余（remaining）26.2 CNY");
-		expect(cardText).toContain("v3");
-		// 原始 nano 在可展开 raw 区
-		const rawText = bus.created.filter((el) =>
-			String(el.className).includes("adm-raw-values"))
-			.map((el) => el.textContent).join("\n");
-		expect(rawText).toContain("21300000000");
+		expect(cardText).toContain("额度");
+		expect(cardText).toContain("50 CNY");
+		expect(cardText).toContain("剩余");
+		expect(cardText).toContain("26.2 CNY");
+		// 摘要卡不再摊开 spent/reserved/版本
+		expect(cardText).not.toContain("已消费");
+		expect(cardText).not.toContain("预占");
+		expect(cardText).not.toContain("v3");
 	});
+});
+
+// --------------------------------------------------------------------------- //
+// 2026-09-01 金额简化回归（review-2026-09-01-admin-money-simplify.md §5）。
+// 锁定：抽屉金额主视图三行 + 技术细节折叠、单一「每月额度」编辑器的两步保存
+// （override → 当前窗口 CAS）与部分失败如实呈现、恢复默认读 settings 默认值、
+// 设置页 Demo/Owner 固定主体立即调整、账单页折叠区首次展开才加载。
+// --------------------------------------------------------------------------- //
+describe("金额简化 2026-09-01 — 抽屉单一月额度动作（§5.4）", () => {
+	const NONCE = "m5".repeat(32);
+
+	function boot(bus: ReturnType<typeof loadPluginUiWithBus>) {
+		bus.dispatch(bus.parent, {
+			kind: "init", bridge: "admin", protocolVersion: "1.0.0",
+			nonce: NONCE, adminPermissions: ["admin:users:read", "admin:users:write",
+				"admin:settings:read"],
+		});
+		expect(bus.client!.handshakeState().ready).toBe(true);
+	}
+
+	const WINDOW_USER = {
+		user_id: "u1", display_name: "张三", login_id_masked: "z***@x.com",
+		role: "user", enabled: true, ai_access: true,
+		billing: { balance_nano: "-1200000000", soft_spend_cap_nano: "10000000000",
+			hard_spend_cap_nano: "20000000000" },
+		spend: {
+			policy_scope: "user_default",
+			window: {
+				window_id: "w1", window_start: 1700000000, window_end: 1702588800,
+				limit_nano_snapshot: "20000000000", spent_nano_cny: "3420000000",
+				reserved_nano_cny: "500000000", remaining_nano: "16080000000",
+				version: 3,
+			},
+		},
+	};
+
+	async function openDrawer(bus: ReturnType<typeof loadPluginUiWithBus>, user: unknown) {
+		bus.client!.showPage("users");
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.users.list", {
+			ok: true, result: { items: [user], next_cursor: null },
+		});
+		await ticks(4);
+		const detailBtn = bus.created.find((el) => el.textContent === "详情" &&
+			el._listeners && el._listeners.click);
+		expect(detailBtn).toBeTruthy();
+		detailBtn!._fire("click", {});
+		expect(bus.els["adm-user-drawer"].hidden).toBe(false);
+	}
+
+	function drawerStatus(bus: ReturnType<typeof loadPluginUiWithBus>) {
+		return bus.created.filter((el) =>
+			String(el.className).includes("adm-status"))
+			.map((el) => el.textContent).join("\n");
+	}
+
+	it("M-1: 抽屉金额主视图只有三行；spent/reserved/余额/nano 收进折叠技术细节", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		await openDrawer(bus, WINDOW_USER);
+		const body = bus.els["adm-drawer-body"].textContent;
+		// 主视图三行：剩余（短文案）/ 额度 / 额度来源（人话，不输出英文枚举）
+		// （假 DOM 的 dt/dd 文本直接拼接，空格断言交给 e2e）
+		expect(body).toContain("本月剩余");
+		expect(body).toContain("16.08 CNY");
+		expect(body).toContain("本月额度");
+		expect(body).toContain("20 CNY");
+		expect(body).toContain("额度来源");
+		expect(body).toContain("默认");
+		expect(body).not.toContain("user_default");
+		expect(body).not.toContain("user_override");
+		// 主视图不再有：金额余额 / soft/hard cap / 已消费 / 预占 / 窗口边界
+		const techIdx = body.indexOf("技术细节");
+		expect(techIdx).toBeGreaterThan(-1);
+		const mainView = body.slice(0, techIdx);
+		expect(mainView).not.toContain("金额余额");
+		expect(mainView).not.toContain("soft/hard cap");
+		expect(mainView).not.toContain("已消费");
+		expect(mainView).not.toContain("预占");
+		expect(mainView).not.toContain("窗口边界");
+		expect(mainView).not.toContain("3420000000");
+		// 技术细节区承载排障字段与 raw nano
+		const tech = body.slice(techIdx);
+		expect(tech).toContain("已消费");
+		expect(tech).toContain("预占");
+		expect(tech).toContain("窗口边界");
+		expect(tech).toContain("3420000000");
+		expect(tech).toContain("-1200000000");
+		// 「打开账本」已随金额简化移除
+		expect(body).not.toContain("打开账本");
+	}, 10000);
+
+	it("M-2: 覆盖用户主视图显示「单独覆盖」（不输出 policy_id）", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		await openDrawer(bus, {
+			...WINDOW_USER,
+			spend: { ...WINDOW_USER.spend, policy_scope: "user_override",
+				policy_id: "pol_1" },
+		});
+		const body = bus.els["adm-drawer-body"].textContent;
+		expect(body).toContain("单独覆盖");
+		expect(body).not.toContain("pol_1");
+	}, 10000);
+
+	it("M-3: 保存每月额度走确认条 + 两步桥调用（setSpendOverride → currentWindow.adjust CAS）", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		await openDrawer(bus, WINDOW_USER);
+		const input = bus.created.find((el) => el.id === "adm-override-limit-input");
+		expect(input).toBeTruthy();
+		const label = bus.created.find((el) => el.htmlFor === "adm-override-limit-input");
+		expect(String(label!.textContent)).toContain("每月额度");
+		input!.value = "2.5";
+		// 人话说明在编辑器里
+		const note = bus.created.find((el) =>
+			String(el.className).includes("adm-drawer-override"));
+		expect(note!.textContent).toContain("对这个用户单独设每月额度");
+		expect(note!.textContent).toContain("保存后立即改当前月");
+		const saveBtn = bus.created.find((el) => el.textContent === "保存" &&
+			el._listeners && el._listeners.click);
+		expect(saveBtn).toBeTruthy();
+		saveBtn!._fire("click", {});
+		// 页内确认条（非 window.confirm）
+		const box = bus.els["adm-drawer-confirm"];
+		expect(box.hidden).toBe(false);
+		expect(box.textContent).toContain("2.5 CNY（2500000000 nano）");
+		expect(box.textContent).toContain("立即改当前月");
+		const okBtn = bus.created.filter((el) => el.textContent === "确认执行").at(-1);
+		okBtn!._fire("click", {});
+		await ticks(2);
+		// 第 1 步：覆盖（nano 十进制字符串，禁 JSON number）
+		const overrideReq = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.users.setSpendOverride")
+			.at(-1);
+		expect(overrideReq).toBeTruthy();
+		expect((overrideReq!.env.payload as Record<string, unknown>).monthly_limit_nano_cny)
+			.toBe("2500000000");
+		replyMethod(bus, NONCE, "admin.users.setSpendOverride", { ok: true, result: {} });
+		await ticks(4);
+		// 第 2 步：立即改当前窗口（window_id + version CAS，同 nano）
+		const adjustReq = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.spend.currentWindow.adjust")
+			.at(-1);
+		expect(adjustReq).toBeTruthy();
+		expect(adjustReq!.env.payload).toEqual({
+			window_id: "w1", limit_nano_snapshot: "2500000000", version: 3,
+		});
+		replyMethod(bus, NONCE, "admin.spend.currentWindow.adjust", {
+			ok: true, result: { window: { version: 4 } },
+		});
+		await ticks(4);
+		const status = drawerStatus(bus);
+		expect(status).toContain("已设为单独每月额度 2.5 CNY");
+		expect(status).toContain("当前月已立即生效");
+		// 确认条已清空复位
+		expect(box.hidden).toBe(true);
+	}, 10000);
+
+	it("M-4: 覆盖已保存但当前窗口未改（第 2 步失败）→ 必须如实写明，禁止假装成功", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		await openDrawer(bus, WINDOW_USER);
+		const input = bus.created.find((el) => el.id === "adm-override-limit-input");
+		input!.value = "2.5";
+		const saveBtn = bus.created.find((el) => el.textContent === "保存" &&
+			el._listeners && el._listeners.click);
+		saveBtn!._fire("click", {});
+		const okBtn = bus.created.filter((el) => el.textContent === "确认执行").at(-1);
+		okBtn!._fire("click", {});
+		await ticks(2);
+		replyMethod(bus, NONCE, "admin.users.setSpendOverride", { ok: true, result: {} });
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.spend.currentWindow.adjust", {
+			ok: false, error: { code: "version_conflict", message: "窗口已被他人调整" },
+		});
+		await ticks(4);
+		const status = drawerStatus(bus);
+		expect(status).toContain("覆盖已保存，但当前窗口未改，请刷新后重试");
+		expect(status).not.toContain("当前月已立即生效");
+	}, 10000);
+
+	it("M-5: 恢复默认 = 清覆盖 + 当前窗口调回 settings 注册用户默认月额度", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		await openDrawer(bus, WINDOW_USER);
+		const restoreBtn = bus.created.find((el) => el.textContent === "恢复默认" &&
+			el._listeners && el._listeners.click);
+		expect(restoreBtn).toBeTruthy();
+		restoreBtn!._fire("click", {});
+		await ticks(4);
+		// 先读 settings 的 user_default 默认月额度
+		replyMethod(bus, NONCE, "admin.settings.get", {
+			ok: true,
+			result: { spend: { available: true, policies: {
+				user_default: { policy_id: "pd", version: 2,
+					limit_nano_cny: "20000000000", effective_from: 1700000000 } },
+			} } },
+		);
+		await ticks(4);
+		expect(bus.els["adm-drawer-confirm"].textContent).toContain("恢复默认 20 CNY");
+		const okBtn = bus.created.filter((el) => el.textContent === "确认执行").at(-1);
+		okBtn!._fire("click", {});
+		await ticks(2);
+		const overrideReq = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.users.setSpendOverride")
+			.at(-1);
+		expect((overrideReq!.env.payload as Record<string, unknown>).monthly_limit_nano_cny)
+			.toBeNull();
+		replyMethod(bus, NONCE, "admin.users.setSpendOverride", { ok: true, result: {} });
+		await ticks(4);
+		const adjustReq = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.spend.currentWindow.adjust")
+			.at(-1);
+		expect(adjustReq!.env.payload).toEqual({
+			window_id: "w1", limit_nano_snapshot: "20000000000", version: 3,
+		});
+		replyMethod(bus, NONCE, "admin.spend.currentWindow.adjust", {
+			ok: true, result: { window: { version: 5 } },
+		});
+		await ticks(4);
+		expect(drawerStatus(bus)).toContain("已恢复默认每月额度 20 CNY");
+	}, 10000);
+
+	it("M-6: settings 拿不到默认月额度 → 只清覆盖，并明确告知当前窗口未改", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		await openDrawer(bus, WINDOW_USER);
+		const restoreBtn = bus.created.find((el) => el.textContent === "恢复默认" &&
+			el._listeners && el._listeners.click);
+		restoreBtn!._fire("click", {});
+		await ticks(4);
+		// settings 有响应但没有可用的 user_default 额度
+		replyMethod(bus, NONCE, "admin.settings.get", {
+			ok: true, result: { spend: { available: true, policies: {} } } },
+		);
+		await ticks(4);
+		expect(bus.els["adm-drawer-confirm"].textContent).toContain("当前窗口将保持不变");
+		const okBtn = bus.created.filter((el) => el.textContent === "确认执行").at(-1);
+		okBtn!._fire("click", {});
+		await ticks(2);
+		replyMethod(bus, NONCE, "admin.users.setSpendOverride", { ok: true, result: {} });
+		await ticks(4);
+		// 没有当前窗口调整调用
+		const adjustReqs = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.spend.currentWindow.adjust");
+		expect(adjustReqs).toHaveLength(0);
+		const status = drawerStatus(bus);
+		expect(status).toContain("已清除单独月额度覆盖");
+		expect(status).toContain("当前窗口未改，请刷新后重试");
+	}, 10000);
+});
+
+describe("金额简化 2026-09-01 — 设置页固定主体立即调整 + 账单页折叠加载（§5.5/§5.7）", () => {
+	const NONCE = "m7".repeat(32);
+
+	function boot(bus: ReturnType<typeof loadPluginUiWithBus>, perms: string[]) {
+		bus.dispatch(bus.parent, {
+			kind: "init", bridge: "admin", protocolVersion: "1.0.0",
+			nonce: NONCE, adminPermissions: perms,
+		});
+	}
+
+	const SETTINGS = {
+		registration: { mode: "closed", stored_mode: "closed",
+			precondition_failures: [], supported_modes: ["closed"] },
+		spend: {
+			available: true, enforcement_mode: "shadow", policies: {},
+			current_windows: {
+				demo: { window_id: "wd1", window_start: 1700000000,
+					window_end: 1702588800, limit_nano_snapshot: "50000000000",
+					spent_nano_cny: "0", reserved_nano_cny: "0",
+					remaining_nano: "50000000000", version: 2 },
+				owner: { window_id: "wo1", window_start: 1700000000,
+					window_end: 1702588800, limit_nano_snapshot: "1000000000000",
+					spent_nano_cny: "0", reserved_nano_cny: "0",
+					remaining_nano: "1000000000000", version: 6 },
+			},
+		},
+		runtime: { available: true, limits: {} },
+	};
+
+	it("M-7: Demo 立即调整当前周期：固定主体 + CAS 载荷；确认条含影响与新剩余", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus, ["admin:settings:read", "admin:settings:write"]);
+		bus.client!.showPage("settings");
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.settings.get", { ok: true, result: SETTINGS });
+		await ticks(4);
+		bus.doc.getElementById("adm-win-demo-limit")!.value = "52";
+		bus.els["adm-win-demo-adjust-btn"]._fire("click", {});
+		const box = bus.els["adm-win-demo-confirm"];
+		expect(box.hidden).toBe(false);
+		expect(box.textContent).toContain("Demo（全站共享周窗口）");
+		expect(box.textContent).toContain("已消费 0 / 预占 0 不回退");
+		expect(box.textContent).toContain("新剩余 52 CNY");
+		const okBtn = bus.created.filter((el) => el.textContent === "确认执行").at(-1);
+		okBtn!._fire("click", {});
+		await ticks(2);
+		const req = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.spend.currentWindow.adjust")
+			.at(-1);
+		expect(req!.env.payload).toEqual({
+			window_id: "wd1", limit_nano_snapshot: "52000000000", version: 2,
+		});
+		replyMethod(bus, NONCE, "admin.spend.currentWindow.adjust", {
+			ok: true, result: { window: { version: 3 } },
+		});
+		await ticks(4);
+		expect(bus.els["adm-win-demo-status"].textContent).toContain("已调整");
+	}, 10000);
+
+	it("M-8: Owner 立即调整走同一桥方法（window_id=wo1）", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus, ["admin:settings:read", "admin:settings:write"]);
+		bus.client!.showPage("settings");
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.settings.get", { ok: true, result: SETTINGS });
+		await ticks(4);
+		bus.doc.getElementById("adm-win-owner-limit")!.value = "1200";
+		bus.els["adm-win-owner-adjust-btn"]._fire("click", {});
+		const okBtn = bus.created.filter((el) => el.textContent === "确认执行").at(-1);
+		okBtn!._fire("click", {});
+		await ticks(2);
+		const req = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.spend.currentWindow.adjust")
+			.at(-1);
+		expect(req!.env.payload).toEqual({
+			window_id: "wo1", limit_nano_snapshot: "1200000000000", version: 6,
+		});
+	}, 10000);
+
+	it("M-9: 账单页第一屏只发供应商请求；折叠区首次展开才加载用量/账本/turn", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus, ["admin:billing:read", "admin:billing:write"]);
+		bus.client!.showPage("billing");
+		await ticks(4);
+		const methods = () => bus.parentPosted
+			.filter((p) => p.env.kind === "request")
+			.map((p) => String(p.env.method));
+		expect(methods()).toContain("admin.billing.providerBalance.get");
+		expect(methods()).not.toContain("admin.billing.usage.list");
+		expect(methods()).not.toContain("admin.billing.ledger.list");
+		expect(methods()).not.toContain("admin.turnBudgets.get");
+		replyMethod(bus, NONCE, "admin.billing.providerBalance.get", {
+			ok: true, result: { provider: "deepseek", snapshot: null },
+		});
+		await ticks(4);
+		expect(bus.els["adm-state-billing"].getAttribute("data-page-state")).toBe("ready");
+		// 展开用量明细 → 才发 usage 请求
+		bus.els["adm-billing-usage-box"].open = true;
+		bus.els["adm-billing-usage-box"]._fire("toggle", {});
+		await ticks(4);
+		expect(methods()).toContain("admin.billing.usage.list");
+		// 展开账本 → 才发 ledger 请求
+		bus.els["adm-billing-ledger-box"].open = true;
+		bus.els["adm-billing-ledger-box"]._fire("toggle", {});
+		await ticks(4);
+		expect(methods()).toContain("admin.billing.ledger.list");
+		// 展开 turn legacy → 才发 turnBudgets.get（只读冻结历史）
+		bus.els["adm-turn-legacy-card"].open = true;
+		bus.els["adm-turn-legacy-card"]._fire("toggle", {});
+		await ticks(4);
+		expect(methods()).toContain("admin.turnBudgets.get");
+	}, 10000);
 });

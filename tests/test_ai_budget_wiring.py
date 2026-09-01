@@ -868,7 +868,7 @@ def test_ui_budget_card_and_max_steps_sync_present():
     assert '"/api/admin/v1/settings/runtime", "PUT"' in bridge_js
     manifest = json.loads((REPO_ROOT / "plugins" / "pathtogether-admin"
                            / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["pluginVersion"] == "0.3.2"
+    assert manifest["pluginVersion"] == "0.3.3"
     assert "admin:turn-budgets:write" not in manifest["adminPermissions"]
     assert "admin:turn-budgets:read" in manifest["adminPermissions"]
     app_js = (REPO_ROOT / "static" / "app.js").read_text(encoding="utf-8")

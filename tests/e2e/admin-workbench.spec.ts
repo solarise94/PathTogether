@@ -147,14 +147,15 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		await frame.locator('.adm-nav-btn[data-page="users"]').click();
 		await expect(frame.locator("#adm-users-tbody")).toContainText(
 			"E2E 普通用户", { timeout: 10_000 });
-		// 关键字段：掩码登录账号、角色、启用状态
-		await expect(frame.locator("#adm-users-tbody")).toContainText("e***@pt.test");
+		// 关键字段：角色（次要列）、启用状态；掩码登录账号已收进抽屉（§5.3）
 		await expect(frame.locator("#adm-users-tbody")).toContainText("user");
 		await expect(frame.locator("#adm-users-tbody")).toContainText("启用");
-		// 详情抽屉可打开且包含低频字段（余额未开户语义）
+		await expect(frame.locator("#adm-users-table")).toContainText("本月剩余");
+		// 详情抽屉可打开且技术细节含低频字段（余额未开户语义）
 		await frame.locator("#adm-users-tbody button", { hasText: "详情" }).first().click();
 		await expect(frame.locator("#adm-user-drawer")).toBeVisible();
 		await expect(frame.locator("#adm-drawer-body")).toContainText("未开户");
+		await expect(frame.locator("#adm-drawer-body")).toContainText("技术细节");
 		await frame.locator("#adm-drawer-close").click();
 		await expect(frame.locator("#adm-user-drawer")).toBeHidden();
 	});
@@ -271,7 +272,7 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		await expect(spendRaw).toContainText("51000000000");
 	});
 
-	test("10c. 设置页：调整当前窗口（独立按钮 + 二次确认 + 影响展示）", async ({ page }) => {
+	test("10c. 设置页：Demo/Owner 立即调整当前周期（固定主体 + 二次确认 + 影响展示）", async ({ page }) => {
 		await login(page, CREDS.ownerLogin, CREDS.ownerPassword);
 		await page.goto("/admin");
 		await expect(hostStatus(page)).toHaveAttribute(
@@ -282,35 +283,49 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 			.poll(async () =>
 				frame.locator("#adm-state-settings").getAttribute("data-page-state"))
 			.toBe("ready", { timeout: 10_000 });
-		// Demo 主体（第一项）：当前窗口额度仍是策略更新前的快照 50 CNY
-		// （默认修改不追溯已开窗口，§1.1），剩余 50 CNY
-		await expect(frame.locator("#adm-window-info"))
+		// 窗口摘要只有 Demo/Owner 两张：Demo 当前窗口额度仍是策略更新前的
+		// 快照 50 CNY（默认修改不追溯已开窗口，§1.1），剩余 50 CNY
+		const summaries = frame.locator("#adm-window-summaries");
+		await expect(summaries).toBeVisible();
+		await expect(summaries).toContainText("Demo（周窗口）");
+		await expect(summaries).toContainText("Owner（月窗口）");
+		// 摘要卡 kv 行文本相邻拼接（dt「额度」+ dd「50 CNY」）
+		await expect(summaries).toContainText("额度50 CNY");
+		await expect(summaries).toContainText("剩余50 CNY");
+		// Demo「立即调整当前周期」默认折叠：展开后填新额度 52 → 页内二次确认
+		await expect(frame.locator("#adm-win-demo-form")).toBeHidden();
+		await frame.locator("#adm-win-demo-box").locator("summary").click();
+		await expect(frame.locator("#adm-win-demo-form")).toBeVisible();
+		await frame.locator("#adm-win-demo-limit").fill("52");
+		await frame.locator("#adm-win-demo-adjust-btn").click();
+		await expect(frame.locator("#adm-win-demo-confirm")).toBeVisible();
+		await expect(frame.locator("#adm-win-demo-confirm"))
 			.toContainText("Demo（全站共享周窗口）");
-		await expect(frame.locator("#adm-window-info")).toContainText("50 CNY");
-		// 新额度 52 → 独立按钮触发页内二次确认（影响：已消费/预占/新剩余）
-		await frame.locator("#adm-window-newlimit").fill("52");
-		await frame.locator("#adm-window-adjust-btn").click();
-		await expect(frame.locator("#adm-window-confirm")).toBeVisible();
-		await expect(frame.locator("#adm-window-confirm"))
+		await expect(frame.locator("#adm-win-demo-confirm"))
 			.toContainText("已消费 0 / 预占 0 不回退");
-		await expect(frame.locator("#adm-window-confirm"))
+		await expect(frame.locator("#adm-win-demo-confirm"))
 			.toContainText("新剩余 52 CNY");
-		// 确认执行 → 成功态 + 信息区 52 CNY（立即生效，不等下个窗口）
-		await frame.locator("#adm-window-confirm button", { hasText: "确认执行" }).click();
-		await expect(frame.locator("#adm-window-status"))
+		// 确认执行 → 成功态；摘要卡立即刷新为 52 CNY（不等下个窗口）
+		await frame.locator("#adm-win-demo-confirm button", { hasText: "确认执行" }).click();
+		await expect(frame.locator("#adm-win-demo-status"))
 			.toContainText("已调整", { timeout: 10_000 });
-		await expect(frame.locator("#adm-window-info"))
-			.toContainText("52 CNY", { timeout: 10_000 });
-		// 窗口边界上海时区主显示（§4.8）
-		await expect(frame.locator("#adm-window-boundary"))
-			.toContainText("GMT+8", { timeout: 10_000 });
-		const windowRaw = frame.locator("#adm-window-raw")
-			.locator("details.adm-raw-values").first();
-		await windowRaw.locator("summary").click();
-		await expect(windowRaw).toContainText("52000000000");
+		await expect(summaries)
+			.toContainText("额度52 CNY", { timeout: 10_000 });
+		// Owner 同一桥方法：展开 Owner 折叠区，调 1002 → 确认 → 成功
+		await frame.locator("#adm-win-owner-box").locator("summary").click();
+		await frame.locator("#adm-win-owner-limit").fill("1002");
+		await frame.locator("#adm-win-owner-adjust-btn").click();
+		await expect(frame.locator("#adm-win-owner-confirm")).toBeVisible();
+		await expect(frame.locator("#adm-win-owner-confirm"))
+			.toContainText("Owner（月窗口）");
+		await frame.locator("#adm-win-owner-confirm button", { hasText: "确认执行" }).click();
+		await expect(frame.locator("#adm-win-owner-status"))
+			.toContainText("已调整", { timeout: 10_000 });
+		await expect(summaries)
+			.toContainText("额度1002 CNY", { timeout: 10_000 });
 	});
 
-	test("10d. 用户页：新增用户带月额度覆盖 + 详情窗口 + 覆盖设置/清除", async ({ page }) => {
+	test("10d. 用户页：建号覆盖进高级折叠 + 抽屉「保存后立即改当前月」", async ({ page }) => {
 		await login(page, CREDS.ownerLogin, CREDS.ownerPassword);
 		await page.goto("/admin");
 		await expect(hostStatus(page)).toHaveAttribute(
@@ -321,10 +336,14 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 			.toContainText("E2E 普通用户", { timeout: 10_000 });
 		// §4.4：创建用户默认折叠——入口 summary 可见、表单隐藏，展开后填写
 		const createBox = frame.locator("#adm-users-create-box");
-		await expect(createBox.locator("summary")).toBeVisible();
+		await expect(createBox.locator("summary").first()).toBeVisible();
 		await expect(frame.locator("#adm-users-create-form")).toBeHidden();
-		await createBox.locator("summary").click();
+		await createBox.locator("summary").first().click();
 		await expect(frame.locator("#adm-users-create-form")).toBeVisible();
+		// §5.6：月额度覆盖在默认折叠的「高级：单独月额度」里
+		await expect(frame.locator("#adm-users-new-limit")).toBeHidden();
+		await frame.locator("#adm-users-new-limit-box").locator("summary").click();
+		await expect(frame.locator("#adm-users-new-limit")).toBeVisible();
 		// 创建带 3.5 CNY 月额度覆盖的用户（建号 + override + audit 同事务）
 		await frame.locator("#adm-users-new-login").fill("e2e-limited@pt.test");
 		await frame.locator("#adm-users-new-display").fill("E2E 限额用户");
@@ -333,71 +352,71 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		await frame.locator("#adm-users-create-btn").click();
 		await expect(frame.locator("#adm-users-create-status"))
 			.toContainText("月额度覆盖 3.5 CNY", { timeout: 10_000 });
-		// 详情抽屉：当前月 limit/spent/reserved/remaining（CNY 主视图）+ 覆盖状态
+		// 详情抽屉：金额主视图三行（剩余/额度/来源），短文案、无人话之外的英文
 		const row = frame.locator("#adm-users-tbody tr", { hasText: "E2E 限额用户" });
 		await row.locator("button", { hasText: "详情" }).click();
 		await expect(frame.locator("#adm-user-drawer")).toBeVisible();
-		await expect(frame.locator("#adm-drawer-body"))
-			.toContainText("本月额度（limit snapshot）");
-		await expect(frame.locator("#adm-drawer-body"))
-			.toContainText("3.5 CNY");
-		await expect(frame.locator("#adm-drawer-body"))
-			.toContainText("用户覆盖（user_override");
-		// 原始 nano 在抽屉 raw 展开区（§4.2）
-		const drawerRaw = frame.locator("#adm-drawer-body")
-			.locator("details.adm-raw-values").first();
-		await drawerRaw.locator("summary").click();
-		await expect(drawerRaw).toContainText("3500000000");
-		// 旧 lifetime caps 标注为兼容字段（不是当前月额度）
-		await expect(frame.locator("#adm-drawer-body"))
-			.toContainText("兼容字段，非当前月额度");
-		// 抽屉内覆盖编辑（统一 field/label 组件）：改为 2.5 CNY（下个窗口起生效）
+		await expect(frame.locator("#adm-drawer-body")).toContainText("本月剩余");
+		await expect(frame.locator("#adm-drawer-body")).toContainText("剩余 3.5 CNY");
+		await expect(frame.locator("#adm-drawer-body")).toContainText("本月额度");
+		await expect(frame.locator("#adm-drawer-body")).toContainText("3.5 CNY");
+		await expect(frame.locator("#adm-drawer-body")).toContainText("单独覆盖");
+		// 原始 nano 在抽屉「技术细节」折叠区（§5.4）
+		await frame.locator("#adm-drawer-body details.adm-drawer-tech")
+			.locator("summary").click();
+		await expect(frame.locator("#adm-drawer-body details.adm-drawer-tech"))
+			.toContainText("3500000000");
+		// 抽屉内唯一金额动作「每月额度（CNY）」：保存 = 覆盖 + 立即改当前月
 		await frame.locator("#adm-override-limit-input").fill("2.5");
-		await frame.locator("#adm-drawer-body button", { hasText: "设置/更新覆盖" }).click();
-		await expect(frame.locator("#adm-users-status"))
-			.toContainText("已设置月额度覆盖 2.5 CNY", { timeout: 10_000 });
-		// 覆盖清除（DELETE；下个窗口回退全局默认）
-		const row2 = frame.locator("#adm-users-tbody tr", { hasText: "E2E 限额用户" });
-		await row2.locator("button", { hasText: "详情" }).click();
+		await frame.locator("#adm-drawer-body button", { hasText: "保存" }).click();
+		await expect(frame.locator("#adm-drawer-confirm")).toBeVisible();
+		await expect(frame.locator("#adm-drawer-confirm"))
+			.toContainText("2.5 CNY（2500000000 nano）");
+		await expect(frame.locator("#adm-drawer-confirm"))
+			.toContainText("立即改当前月");
+		await frame.locator("#adm-drawer-confirm button", { hasText: "确认执行" }).click();
 		await expect(frame.locator("#adm-drawer-body"))
-			.toContainText("用户覆盖（user_override", { timeout: 10_000 });
-		await frame.locator("#adm-drawer-body button", { hasText: "清除覆盖" }).click();
-		await expect(frame.locator("#adm-users-status"))
-			.toContainText("已清除月额度覆盖", { timeout: 10_000 });
+			.toContainText("已设为单独每月额度 2.5 CNY", { timeout: 10_000 });
+		await expect(frame.locator("#adm-drawer-body"))
+			.toContainText("当前月已立即生效", { timeout: 10_000 });
+		await frame.locator("#adm-drawer-close").click();
+		await expect(frame.locator("#adm-user-drawer")).toBeHidden();
+		// 表内剩余列同步刷新为 2.5 CNY（立即改当前窗口的结果）
+		const row2 = frame.locator("#adm-users-tbody tr", { hasText: "E2E 限额用户" });
+		await expect(row2).toContainText("剩余 2.5 CNY", { timeout: 10_000 });
 	});
 
-	test("10e. 金额用尽后的可见状态：当前窗口调到 0 → 剩余显示已用尽", async ({ page }) => {
+	test("10e. 金额用尽后的可见状态：抽屉把每月额度存为 0 → 剩余显示已用尽", async ({ page }) => {
 		await login(page, CREDS.ownerLogin, CREDS.ownerPassword);
 		await page.goto("/admin");
 		await expect(hostStatus(page)).toHaveAttribute(
 			"data-admin-host-state", "ready", { timeout: 5000 });
 		const frame = page.frameLocator("#admin-plugin-frame");
-		await frame.locator('.adm-nav-btn[data-page="settings"]').click();
-		await expect
-			.poll(async () =>
-				frame.locator("#adm-state-settings").getAttribute("data-page-state"))
-			.toBe("ready", { timeout: 10_000 });
-		// 选「E2E 限额用户」月窗口，把当前窗口额度调到 0（二次确认含影响）
-		await frame.locator("#adm-window-subject")
-			.selectOption({ label: "E2E 限额用户（月窗口）" });
-		await expect(frame.locator("#adm-window-info"))
-			.toContainText("E2E 限额用户");
-		await frame.locator("#adm-window-newlimit").fill("0");
-		await frame.locator("#adm-window-adjust-btn").click();
-		await expect(frame.locator("#adm-window-confirm")).toBeVisible();
-		await expect(frame.locator("#adm-window-confirm"))
-			.toContainText("新剩余 0 CNY（已用尽");
-		await frame.locator("#adm-window-confirm button", { hasText: "确认执行" }).click();
-		await expect(frame.locator("#adm-window-status"))
-			.toContainText("已调整", { timeout: 10_000 });
-		// 用户详情抽屉展示「已用尽」可见状态
 		await frame.locator('.adm-nav-btn[data-page="users"]').click();
 		await expect(frame.locator("#adm-users-tbody"))
 			.toContainText("E2E 限额用户", { timeout: 10_000 });
+		// 抽屉编辑器把每月额度存为 0（两步：覆盖 + 立即改当前窗口）
 		const row = frame.locator("#adm-users-tbody tr", { hasText: "E2E 限额用户" });
 		await row.locator("button", { hasText: "详情" }).click();
+		await expect(frame.locator("#adm-user-drawer")).toBeVisible();
+		await frame.locator("#adm-override-limit-input").fill("0");
+		await frame.locator("#adm-drawer-body button", { hasText: "保存" }).click();
+		await expect(frame.locator("#adm-drawer-confirm")).toBeVisible();
+		await frame.locator("#adm-drawer-confirm button", { hasText: "确认执行" }).click();
 		await expect(frame.locator("#adm-drawer-body"))
-			.toContainText("0 CNY（已用尽：下次预占将被拒绝）", { timeout: 10_000 });
+			.toContainText("已设为单独每月额度 0 CNY", { timeout: 10_000 });
+		await frame.locator("#adm-drawer-close").click();
+		// 用户表「本月剩余」列显示短文案「已用尽」——不再有长拒绝说明
+		const row2 = frame.locator("#adm-users-tbody tr", { hasText: "E2E 限额用户" });
+		await expect(row2).toContainText("已用尽", { timeout: 10_000 });
+		// 抽屉金额主视图同样「已用尽」
+		await row2.locator("button", { hasText: "详情" }).click();
+		await expect(frame.locator("#adm-user-drawer")).toBeVisible();
+		await expect(frame.locator("#adm-drawer-body"))
+			.toContainText("已用尽", { timeout: 10_000 });
+		await expect(frame.locator("#adm-drawer-body"))
+			.not.toContainText("下次预占将被拒绝");
+		await frame.locator("#adm-drawer-close").click();
 	});
 
 	test("10f. 邀请页：月额度模板创建 + 明文码仅一次 + 列表展示", async ({ page }) => {
@@ -411,11 +430,14 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 			.poll(async () =>
 				frame.locator("#adm-state-invites").getAttribute("data-page-state"))
 			.not.toBe("loading", { timeout: 10_000 });
-		// §4.4：创建邀请默认折叠——展开入口后填写
+		// §4.4：创建邀请默认折叠——展开入口后填写；§5.6：月额度模板在高级折叠里
 		const inviteBox = frame.locator("#adm-invite-create-box");
 		await expect(frame.locator("#adm-invite-create-form")).toBeHidden();
-		await inviteBox.locator("summary").click();
+		await inviteBox.locator("summary").first().click();
 		await expect(frame.locator("#adm-invite-create-form")).toBeVisible();
+		await expect(frame.locator("#adm-invite-limit")).toBeHidden();
+		await frame.locator("#adm-invite-limit-box").locator("summary").click();
+		await expect(frame.locator("#adm-invite-limit")).toBeVisible();
 		await frame.locator("#adm-invite-login").fill("e2e-inv@pt.test");
 		await frame.locator("#adm-invite-limit").fill("2.5");
 		await frame.locator("#adm-invite-create-btn").click();
@@ -579,7 +601,7 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
     await shot(page, "after-1440-overview.png");
   });
 
-  test("13. users: 用量列表列 + 终态 ready + 创建折叠；限额户展示已用尽", async ({ page }) => {
+  test("13. users: 5 列表头 + 本月剩余单列 + 创建折叠；限额户展示已用尽", async ({ page }) => {
     await gotoAdminReady(page);
     const frame = page.frameLocator("#admin-plugin-frame");
     await frame.locator('.adm-nav-btn[data-page="users"]').click();
@@ -588,30 +610,30 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
       .poll(async () => frame.locator("#adm-state-users").getAttribute("data-page-state"))
       .toBe("ready", { timeout: 10_000 });
     const table = frame.locator("#adm-users-table");
-    await expect(table).toContainText("本月用量");
-    await expect(table).toContainText("剩余");
+    await expect(table).toContainText("本月剩余");
+    await expect(table).not.toContainText("本月用量");
     await expect(frame.locator("#adm-users-tbody"))
       .toContainText("E2E 普通用户", { timeout: 10_000 });
-    // 剩余列覆盖边界语义之一（10e 已把限额户窗口调 0 → 已用尽）
+    // 剩余列覆盖边界语义之一（10e 已把限额户额度存 0 → 已用尽）
     const limited = frame.locator("#adm-users-tbody tr", { hasText: "E2E 限额用户" });
     await expect(limited).toContainText("已用尽");
-    // 堆叠迷你条真实断言：每行都回答「本月用量」语义（堆叠条或边界文案），
-    // 且每条堆叠条结构完整（spent 主段 + reserved 警示段）
-    const usageRows = await frame.locator("#adm-users-tbody").evaluate((tbody) =>
+    // §5.3：每行只回答「本月剩余」一个数字语义；5 个单元格、无用量条、
+    // 无已消费/预占双行
+    const rows = await frame.locator("#adm-users-tbody").evaluate((tbody) =>
       Array.from(tbody.querySelectorAll("tr")).map((tr) => ({
         text: tr.textContent || "",
-        meters: Array.from(tr.querySelectorAll(".adm-usage-meter")).map((m) => ({
-          spent: m.querySelector(".adm-usage-meter-spent") !== null,
-          reserved: m.querySelector(".adm-usage-meter-reserved") !== null,
-        })),
+        cells: tr.querySelectorAll("td").length,
+        meters: tr.querySelectorAll(".adm-usage-meter").length,
       })));
-    expect(usageRows.length).toBeGreaterThan(0);
-    for (const row of usageRows) {
-      expect(row.text, "user row must answer 本月用量 semantics")
-        .toMatch(/已消费|不可用/);
-      for (const meter of row.meters) {
-        expect(meter.spent && meter.reserved, "meter segments").toBe(true);
-      }
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      expect(row.text, "user row must answer 本月剩余 semantics")
+        .toMatch(/剩余|已用尽|超支|不可用/);
+      expect(row.cells, "desktop users table has exactly 5 columns").toBe(5);
+      expect(row.meters, "no usage meter in simplified table").toBe(0);
+      expect(row.text).not.toContain("已消费");
+      expect(row.text).not.toContain("预占");
+      expect(row.text).not.toContain("下次预占将被拒绝");
     }
     // 创建用户默认折叠
     await expect(frame.locator("#adm-users-create-form")).toBeHidden();
@@ -642,9 +664,17 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
       });
       expect(inside, `tab cycle ${i}`).toBe(true);
     }
-    // 抽屉内按钮语义：普通操作在前，危险操作独立区（§4.5）
+    // 抽屉内按钮语义：普通操作在前，危险操作独立区（§4.5）；§5.4 后
+    // 不再有「打开账本」，金额主视图三行 + 折叠技术细节
     const drawerHtml = await frame.locator("#adm-drawer-body").innerHTML();
-    expect(drawerHtml.indexOf("打开账本")).toBeLessThan(drawerHtml.indexOf("危险操作"));
+    expect(drawerHtml).not.toContain("打开账本");
+    expect(drawerHtml.indexOf("身份预览")).toBeLessThan(drawerHtml.indexOf("危险操作"));
+    expect(drawerHtml.indexOf("本月剩余")).toBeLessThan(drawerHtml.indexOf("技术细节"));
+    expect(drawerHtml).toContain("本月额度");
+    expect(drawerHtml).toContain("额度来源");
+    // 技术细节默认折叠：details 未展开时其内容不可见
+    await expect(frame.locator("#adm-drawer-body details.adm-drawer-tech")
+      .locator("dl").first()).toBeHidden();
     // 抽屉打开状态截图（P1-5：统一 form/label、窗口边界换行、raw 详情、危险区）
     await assertNoHorizontalOverflow(page, "drawer-1440");
     await shot(page, "after-1440-user-drawer.png");
@@ -661,7 +691,7 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
     await expect(detailBtn).toBeFocused();
   });
 
-  test("15. settings: label 可定位、enforcement 独立区、窗口摘要卡、保存置底", async ({ page }) => {
+  test("15. settings: label 可定位、enforcement 折叠危险开关、窗口摘要卡、保存置底", async ({ page }) => {
     await gotoAdminReady(page);
     const frame = page.frameLocator("#admin-plugin-frame");
     await frame.locator('.adm-nav-btn[data-page="settings"]').click();
@@ -672,15 +702,18 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
     await expect(frame.getByLabel("Demo 每周金额（CNY，可选）")).toBeVisible();
     await expect(frame.getByLabel("注册用户默认每月金额（CNY，可选）")).toBeVisible();
     await expect(frame.getByLabel("Owner 策略额度（CNY / 月，可选）")).toBeVisible();
-    await expect(frame.getByLabel("enforcement 模式（危险开关）")).toBeVisible();
     await expect(frame.getByLabel("平台单任务最大步骤（可选）")).toBeVisible();
-    // §4.7：当前窗口摘要卡（额度/已消费/预占/剩余/版本）
-    const grid = frame.locator("#adm-window-summaries");
-    await expect(grid).toBeVisible();
-    await expect(grid).toContainText("已消费（spent）");
-    await expect(grid).toContainText("预占（reserved）");
-    await expect(grid).toContainText("剩余（remaining）");
-    // §4.7：enforcement 独立区警示卡（切到 all 时出现）
+    // §5.5：Demo/Owner「立即调整当前周期」折叠入口（默认折叠，无用户下拉）
+    await expect(frame.locator("#adm-win-demo-box summary")).toBeVisible();
+    await expect(frame.locator("#adm-win-owner-box summary")).toBeVisible();
+    await expect(frame.locator("#adm-win-demo-form")).toBeHidden();
+    await expect(frame.locator("#adm-win-owner-form")).toBeHidden();
+    expect(await frame.locator("#adm-window-subject").count()).toBe(0);
+    // §5.5：enforcement 危险开关默认折叠，展开后才可见
+    await expect(frame.getByLabel("enforcement 模式（危险开关）")).toBeHidden();
+    await frame.locator("#adm-spend-enforcement-box").locator("summary").click();
+    await expect(frame.getByLabel("enforcement 模式（危险开关）")).toBeVisible();
+    // 切到 all 出警示卡、切回 shadow 隐藏
     await frame.locator("#adm-spend-mode").selectOption("all");
     await expect(frame.locator("#adm-spend-mode-warning")).toBeVisible();
     await frame.locator("#adm-spend-mode").selectOption("shadow");
@@ -693,7 +726,7 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
     await shot(page, "after-1440-settings.png");
   });
 
-  test("16. billing: 账户卡在前、调整区先查后启用、legacy 中性折叠页尾", async ({ page }) => {
+  test("16. billing: 第一屏供应商+人工调整、先查后启用、运维明细折叠页尾", async ({ page }) => {
     await gotoAdminReady(page);
     const frame = page.frameLocator("#admin-plugin-frame");
     await frame.locator('.adm-nav-btn[data-page="billing"]').click();
@@ -701,11 +734,25 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
       .poll(async () => frame.locator("#adm-state-billing").getAttribute("data-page-state"))
       .toMatch(/ready|error/, { timeout: 10_000 });
     const pageHtml = await frame.locator("#adm-page-billing").innerHTML();
-    // §4.6：金额账户卡在最前；turn legacy 卡在页尾、中性、默认折叠
-    expect(pageHtml.indexOf('id="adm-acct-card"')).toBeLessThan(pageHtml.indexOf('id="adm-turn-legacy-card"'));
-    // details 未展开时其内容不可见
+    // §5.7：第一屏 = 供应商余额 → 人工调整；caps/用量/账本等运维明细折叠在后
+    expect(pageHtml.indexOf('id="adm-billing-provider-card"'))
+      .toBeLessThan(pageHtml.indexOf('id="adm-adjust-card"'));
+    expect(pageHtml.indexOf('id="adm-adjust-card"'))
+      .toBeLessThan(pageHtml.indexOf('id="adm-billing-acct-box"'));
+    expect(pageHtml.indexOf('id="adm-billing-acct-box"'))
+      .toBeLessThan(pageHtml.indexOf('id="adm-turn-legacy-card"'));
+    // caps 卡标题「已不参与授权，仅兼容」；details 未展开时内容不可见
+    await expect(frame.locator("#adm-billing-acct-box summary"))
+      .toContainText("已不参与授权，仅兼容");
+    expect(await frame.locator("#adm-billing-acct-box").getAttribute("open")).toBeNull();
+    await expect(frame.locator("#adm-acct-info")).toBeHidden();
+    // turn legacy 卡：中性、默认折叠（details 未展开时其内容不可见）
     await expect(frame.locator("#adm-billing-turn")).toBeHidden();
     expect(pageHtml).toContain("adm-legacy-card");
+    // 调整类型收敛：grant / manual_adjustment 两个（topup/refund 不再陈列）
+    expect(await frame.locator("#adm-adjust-kind option").count()).toBe(2);
+    await expect(frame.locator("#adm-adjust-kind")).toContainText("grant");
+    await expect(frame.locator("#adm-adjust-kind")).toContainText("manual_adjustment");
     // §4.5：人工调整区先查后启用
     const adjustBtn = frame.locator("#adm-adjust-btn");
     await expect(adjustBtn).toBeDisabled();
@@ -883,7 +930,7 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
     await expect(frame.locator("#adm-page-users")).toBeVisible();
   });
 
-  test("21. 390 users: 4 列布局、用量/剩余与详情均在视口内、无水平溢出", async ({ page }) => {
+  test("21. 390 users: 4 列布局（名/状态/剩余/详情）、剩余在视口内、无水平溢出", async ({ page }) => {
     await gotoAdminReady(page);
     const frame = page.frameLocator("#admin-plugin-frame");
     await frame.locator('#adm-nav-toggle').click();
@@ -893,13 +940,12 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
       .toBe("ready", { timeout: 10_000 });
     const row = frame.locator("#adm-users-tbody tr", { hasText: "E2E 普通用户" });
     await expect(row).toBeVisible();
-    // §4.3：关键信息在行内可见——用量/剩余语义（含不可用）与详情操作
-    await expect(row).toContainText(/已消费|不可用|剩余|已用尽|额度为 0|超支/);
+    // §5.3：关键信息在行内可见——本月剩余语义（含不可用）与详情操作
+    await expect(row).toContainText(/剩余|已用尽|超支|不可用/);
     await expect(row.locator("button", { hasText: "详情" })).toBeVisible();
-    // 列头（本月用量/剩余）在表中（桌面列头仍在 DOM，移动端隐藏）
-    await expect(frame.locator("#adm-users-table")).toContainText("本月用量");
-    await expect(frame.locator("#adm-users-table")).toContainText("剩余");
-    // 次要列（角色/登录账号/最近调用）与桌面列（AI access/剩余）在 390px 隐藏
+    // 列头（本月剩余）在表中
+    await expect(frame.locator("#adm-users-table")).toContainText("本月剩余");
+    // 次要列（角色）在 390px 隐藏；角色已无独立桌面列
     const hiddenCols = await frame.locator("#adm-users-table").evaluate((t) => {
       const disp = (sel: string) => {
         const th = t.querySelector(sel);
@@ -907,14 +953,14 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
       };
       return {
         secondary: disp("th.adm-col-secondary"),
-        desktop: disp("th.adm-col-desktop"),
+        desktop: t.querySelector("th.adm-col-desktop") === null,
       };
     });
     expect(hiddenCols.secondary).toBe(true);
     expect(hiddenCols.desktop).toBe(true);
     // P0-2：几何断言（iframe 文档视口）——toBeVisible 不足以防截断。
-    // DOM 列序固定：td[0]=显示名 td[3]=状态(+AI 堆叠) td[5]=用量(+剩余堆叠)
-    // td[8]=操作(详情)；关键单元格 right 边必须落在 iframe 视口内。
+    // DOM 列序固定：td[0]=显示名 td[1]=角色(隐藏) td[2]=状态(+AI 堆叠)
+    // td[3]=本月剩余 td[4]=操作(详情)；关键单元格 right 边必须落在视口内。
     const geo = await row.evaluate((tr) => {
       const vw = document.documentElement.clientWidth;
       const box = (el: Element | null | undefined) => {
@@ -923,8 +969,6 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
         return { left: r.left, right: r.right, width: r.width };
       };
       const tds = Array.from(tr.querySelectorAll("td"));
-      const inView = (b: { left: number; right: number; width: number } | null) =>
-        b !== null && b.width > 0 && b.left >= -1 && b.right <= vw + 1;
       const stacks = Array.from(tr.querySelectorAll(".adm-stack-mobile")).map((el) => ({
         text: el.textContent || "",
         display: getComputedStyle(el).display,
@@ -935,8 +979,8 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
         iframeOverflow: document.documentElement.scrollWidth -
           document.documentElement.clientWidth,
         name: box(tds[0]),
-        status: box(tds[3]),
-        usage: box(tds[5]),
+        status: box(tds[2]),
+        remaining: box(tds[3]),
         detail: box(Array.from(tr.querySelectorAll("button"))
           .find((b) => (b.textContent || "").includes("详情"))),
         stacks,
@@ -945,21 +989,16 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
     });
     expect(geo.iframeOverflow, "users-390 iframe overflow").toBeLessThanOrEqual(1);
     for (const [key, b] of [["name", geo.name], ["status", geo.status],
-      ["usage", geo.usage], ["detail", geo.detail]] as const) {
+      ["remaining", geo.remaining], ["detail", geo.detail]] as const) {
       expect(b && b.width, `${key} cell rendered`).toBeGreaterThan(0);
       expect(b && b.right !== undefined && b.right <= geo.vw + 1,
         `${key} cell right edge within iframe viewport`).toBe(true);
     }
-    // 4 列布局：可见单元格恰为 4（显示名/状态/用量/操作）
+    // 4 列布局：可见单元格恰为 4（显示名/状态/本月剩余/操作）
     expect(geo.visibleCells, "390px users table shows exactly 4 columns").toBe(4);
-    // 状态格堆叠了 AI 补行；用量格堆叠了剩余语义补行（剩余/已用尽/超支/不可用）
+    // 状态格堆叠了 AI 补行（窄屏堆叠补行唯一保留处）
     const aiStack = geo.stacks.find((s) => /AI/.test(s.text));
-    const remainStack = geo.stacks.find((s) =>
-      /剩余|已用尽|超支|额度为 0|不可用/.test(s.text));
     expect(aiStack && aiStack.display).toBe("block");
-    expect(remainStack && remainStack.display).toBe("block");
-    expect(remainStack && remainStack.box && remainStack.box.right <= geo.vw + 1,
-      "remaining stack in view").toBe(true);
     // 创建表单折叠
     await expect(frame.locator("#adm-users-create-form")).toBeHidden();
     await assertNoHorizontalOverflow(page, "users-390");

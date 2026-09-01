@@ -1,6 +1,9 @@
 /* pathtogether-admin 插件 UI 样式（PR3 骨架 + 包 E 工作台化 +
    2026-09-01 评审升级：表单 field 组件、按钮语义层、金额 raw 展开区、
-   用量堆叠条、legacy 中性卡、紧凑握手状态点，review-2026-09-01-admin-ui.md §5）。
+   legacy 中性卡、紧凑握手状态点，review-2026-09-01-admin-ui.md §5 +
+   2026-09-01 金额简化：用户表 5 列（窄屏 4 列）、抽屉技术细节折叠、
+   Demo/Owner 立即调整折叠入口、账单页运维明细折叠，
+   review-2026-09-01-admin-money-simplify.md §5）。
    运行在 opaque iframe 内；只允许外链同源 CSS（响应 CSP style-src <origin>，
    无内联样式——可变宽度一律用预置宽度桶类，不写 style 属性）。
 
@@ -309,11 +312,36 @@ body {
 /* §4.7：保存按钮位于分组底部（独立动作行），不与输入挤同一行 */
 .adm-form-actions { display: flex; gap: 8px; align-items: center; }
 
-/* §4.7：enforcement 独立区（不与普通金额输入等权混排）+ 警示卡 */
+/* §5.5：enforcement 独立区（默认折叠的危险开关）+ 警示卡 */
 .adm-enforcement {
   margin-top: 14px; padding: 12px 14px;
   border: 1px dashed rgba(178, 80, 0, 0.45); border-radius: var(--radius);
 }
+.adm-enforcement-box { margin-top: 12px; }
+.adm-enforcement-box > summary {
+  font-size: 13px; font-weight: 600; color: var(--warn);
+  cursor: pointer; padding: 2px 0;
+}
+.adm-enforcement-box > summary:hover { color: var(--danger); }
+.adm-enforcement-box > summary:focus-visible {
+  outline: 2px solid var(--warn); outline-offset: 2px;
+}
+.adm-enforcement-box[open] > summary { margin-bottom: 6px; }
+
+/* §5.5：Demo/Owner「立即调整当前周期」折叠入口（危险操作，默认折叠） */
+.adm-win-adjust {
+  margin-top: 12px; padding: 10px 14px;
+  border: 1px dashed rgba(255, 59, 48, 0.4); border-radius: var(--radius);
+}
+.adm-win-adjust > summary {
+  font-size: 13px; font-weight: 600; cursor: pointer; padding: 2px 0;
+}
+.adm-win-adjust > summary:hover { color: var(--danger); }
+.adm-win-adjust > summary:focus-visible {
+  outline: 2px solid var(--danger); outline-offset: 2px;
+}
+.adm-win-adjust[open] > summary { margin-bottom: 6px; }
+.adm-win-adjust .adm-form { margin: 8px 0; }
 .adm-enforcement .adm-field-label { color: var(--warn); }
 .adm-warning-card {
   margin-top: 8px; padding: 10px 12px; border-radius: var(--radius);
@@ -370,40 +398,11 @@ body {
 .adm-check input { min-width: 0; width: auto; }
 .adm-field-span { grid-column: 1 / -1; }
 
-/* ---- §4.3 用户行用量：两段堆叠迷你条（CSP 禁内联样式 → 5% 宽度桶类）---- */
-.adm-usage-note { font-size: 12px; color: var(--warn); }
+/* ---- §5.3 用户行剩余/超支颜色 + 移动端堆叠补行 ---- */
 .adm-usage-overage { color: var(--danger); font-weight: 600; }
-/* 移动端堆叠补行（P0-2）：桌面有独立列（AI access/剩余）时隐藏；
-   ≤767px 在状态格/用量格内以块级补行显示，凑成 4 列布局 */
+/* 移动端堆叠补行（P0-2）：桌面隐藏；≤767px 在状态格内以块级补行显示，
+   4 列 = 显示名 / 状态+AI（堆叠）/ 本月剩余 / 操作 */
 .adm-stack-mobile { display: none; }
-.adm-usage-meter {
-  display: flex; width: 120px; max-width: 100%; height: 8px;
-  margin-top: 4px; border-radius: 4px; overflow: hidden;
-  background: rgba(0, 0, 0, 0.08);
-}
-.adm-usage-meter-spent { background: var(--accent); height: 100%; }
-.adm-usage-meter-reserved { background: var(--warn); height: 100%; }
-.adm-usage-w0 { width: 0%; }
-.adm-usage-w5 { width: 5%; }
-.adm-usage-w10 { width: 10%; }
-.adm-usage-w15 { width: 15%; }
-.adm-usage-w20 { width: 20%; }
-.adm-usage-w25 { width: 25%; }
-.adm-usage-w30 { width: 30%; }
-.adm-usage-w35 { width: 35%; }
-.adm-usage-w40 { width: 40%; }
-.adm-usage-w45 { width: 45%; }
-.adm-usage-w50 { width: 50%; }
-.adm-usage-w55 { width: 55%; }
-.adm-usage-w60 { width: 60%; }
-.adm-usage-w65 { width: 65%; }
-.adm-usage-w70 { width: 70%; }
-.adm-usage-w75 { width: 75%; }
-.adm-usage-w80 { width: 80%; }
-.adm-usage-w85 { width: 85%; }
-.adm-usage-w90 { width: 90%; }
-.adm-usage-w95 { width: 95%; }
-.adm-usage-w100 { width: 100%; }
 
 /* 页内二次确认条（sandbox 无 allow-modals，window.confirm 不可用） */
 .adm-confirm {
@@ -465,6 +464,12 @@ body {
 .adm-drawer-body { padding: 16px 18px; overflow-y: auto; flex: 1 1 auto; }
 .adm-drawer-body .adm-kv { margin-bottom: 14px; }
 .adm-drawer-body .adm-field { margin-bottom: 10px; }
+/* §5.4：抽屉底部默认折叠的「技术细节」（spent/reserved/余额/nano） */
+.adm-drawer-tech { border-top: 1px dashed var(--separator); }
+.adm-drawer-override {
+  margin-top: 14px; padding-top: 10px;
+  border-top: 1px dashed var(--separator);
+}
 .adm-drawer-actions { display: flex; flex-direction: column; gap: 8px; align-items: stretch; }
 .adm-drawer-actions .adm-actions button { text-align: left; }
 /* P0-3：抽屉内页内确认条——固定在抽屉底部（body 内滚动之上），位于
@@ -522,10 +527,8 @@ body {
   .adm-table td { word-break: normal; overflow-wrap: anywhere; }
   .adm-table--users .adm-col-secondary { display: none; }
   /* P0-2：390px 用户表收成 4 列 = 显示名 / 状态+AI（堆叠）/
-     本月用量+剩余（堆叠）/ 操作——AI access 与剩余独立列只在桌面显示 */
-  .adm-table--users .adm-col-desktop { display: none; }
+     本月剩余 / 操作——角色次要列隐藏，剩余列必须保留 */
   .adm-table--users .adm-stack-mobile { display: block; }
   /* 首列给最小宽度，避免显示名逐字符竖排（仍不产生页面级横向滚动） */
   .adm-table--users td:first-child, .adm-table--users th:first-child { min-width: 96px; }
-  .adm-usage-meter { width: 72px; }
 }

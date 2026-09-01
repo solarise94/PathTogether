@@ -54,10 +54,10 @@
     // adjustIdem 生成时的表单指纹（user/kind/金额/reason 四元组）：指纹变化
     // = 用户改了载荷 = 新的逻辑提交 → 下次提交前换新 key。
     adjustFingerprint: null,
-    // 设置页快照（批次 D §6.1）：admin.settings.get 的响应 + 「调整当前窗口」
-    // 的主体列表（demo/owner/各用户当前窗口，含 CAS version）——仅内存。
+    // 设置页快照（批次 D §6.1）：admin.settings.get 的响应（含 spend
+    // current_windows 的 demo/owner 窗口 CAS version）——仅内存。
+    // 2026-09-01 金额简化：不再缓存「调整当前窗口」的用户主体列表。
     settingsSnapshot: null,
-    windowSubjects: [],
   };
 
   // 深链起始页（PR5 /admin#invites 兼容）：宿主把父页 hash 透传到本 iframe
@@ -210,17 +210,6 @@
   // 「已更新（…）」等当前时刻文案：同一上海格式（单元测试用固定 epoch 锁定）
   function nowText() {
     return fmtTs(Math.floor(Date.now() / 1000));
-  }
-
-  // 最近调用的相对时间（列表列）；绝对上海时间经 title / 详情抽屉补充（§4.8）
-  function relTime(epoch) {
-    if (epoch === null || epoch === undefined) return "—";
-    var diff = Math.floor(Date.now() / 1000) - Number(epoch);
-    if (diff < 0) diff = 0;
-    if (diff < 60) return diff + " 秒前";
-    if (diff < 3600) return Math.floor(diff / 60) + " 分钟前";
-    if (diff < 86400) return Math.floor(diff / 3600) + " 小时前";
-    return Math.floor(diff / 86400) + " 天前";
   }
 
   function fmtNum(v) {
@@ -810,20 +799,17 @@
     });
   }
 
-  // §9.1 包 E + 2026-09-01 §4.3：表格高频列 = 显示名/登录账号/角色/状态/
-  // AI access/本月用量/剩余/最近 AI 调用/操作；余额、来源、注册方式、caps
-  // 与全部行操作收纳进详情抽屉。角色/登录账号/最近调用为次要列、AI access
-  // 与剩余为桌面列（.adm-col-desktop）——≤767px 全部隐藏，状态格/用量格内
-  // 以 .adm-stack-mobile 堆叠补行凑成 4 列（显示名/状态+AI/用量+剩余/详情），
-  // 不靠横向滚动（P0-2）。
+  // 2026-09-01 金额简化 §5.3：用户表 5 列（桌面）= 显示名/角色（次要列）/
+  // 状态/本月剩余/操作；登录账号、AI access、本月用量明细、最近调用收进
+  // 详情抽屉。角色为次要列（窄屏隐藏）——≤767px 收成 4 列（显示名/状态+AI
+  // 堆叠/本月剩余/详情），不靠横向滚动（P0-2）。
   var drawerUser = null;
   // 触发抽屉的「详情」按钮（§4.10：关闭后焦点恢复到这里）
   var drawerTrigger = null;
 
   // ------------------------------------------------------------------
-  // 用户行「本月用量 / 剩余」（§4.3）：金额运算全程 BigInt；只在计算最终
-  // 显示百分比时转换安全的小整数；视觉宽度 clamp 0–100%（CSP 禁内联样式，
-  // 用 5% 步进宽度桶类近似，精确数字在文本中）。
+  // 用户行「本月剩余」（§5.3）：金额运算全程 BigInt；窗口缺失/错误 =
+  // 不可用（原因），绝不伪造 0。
   // ------------------------------------------------------------------
   function userUsage(u) {
     var s = u && u.spend;
@@ -847,56 +833,9 @@
     }
   }
 
-  // used / limit → 0–100 的小数百分比；limit<=0 返回 null（不除零）
-  function usagePct(used, limit) {
-    var n = used < 0n ? 0n : used;
-    if (limit <= 0n) return null;
-    var pct = Number(n * 10000n / limit) / 100; // 万分比 → 百分比（安全小整数）
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-    return pct;
-  }
-
-  function usageBucketClass(pct) {
-    var bucket = Math.round(pct / 5) * 5;
-    if (bucket < 0) bucket = 0;
-    if (bucket > 100) bucket = 100;
-    return "adm-usage-w" + bucket;
-  }
-
-  // 两段堆叠迷你条：已消费为主色、预占为警示色（§4.3）
-  function buildUsageMeter(spent, reserved, limit) {
-    var meter = document.createElement("div");
-    meter.className = "adm-usage-meter";
-    meter.setAttribute("role", "img");
-    var spentPct = usagePct(spent, limit) || 0;
-    var reservedPct = usagePct(reserved, limit) || 0;
-    if (spentPct + reservedPct > 100) {
-      // clamp 总宽 100%：优先保留 spent 段，压缩 reserved 段
-      reservedPct = Math.max(0, 100 - spentPct);
-      if (spentPct > 100) spentPct = 100;
-    }
-    meter.setAttribute("aria-label",
-      "已用 " + (Math.round((spentPct + reservedPct) * 10) / 10) + "%");
-    var spentSeg = document.createElement("div");
-    spentSeg.className = "adm-usage-meter-spent " + usageBucketClass(spentPct);
-    var reservedSeg = document.createElement("div");
-    reservedSeg.className = "adm-usage-meter-reserved " +
-      usageBucketClass(reservedPct);
-    meter.appendChild(spentSeg);
-    meter.appendChild(reservedSeg);
-    return meter;
-  }
-
-  function unavailableCell(reason, cls) {
-    var cell = document.createElement("td");
-    if (cls) cell.className = cls;
-    cell.textContent = "不可用（" + reason + "）";
-    return cell;
-  }
-
-  // 剩余状态的统一呈现（§4.3）：桌面「剩余」列与移动端用量格内的堆叠补行
-  // 共用同一语义，绝不伪造 0；remaining 缺失/错误 = 不可用（P0-2）
+  // 剩余状态的统一呈现（§5.3）：用户表「本月剩余」列与抽屉金额主视图共用。
+  // 短文案四态：剩余 X CNY / 已用尽 / 超支 X CNY / 不可用（原因）——
+  // 不写「下次预占将被拒绝」、不拆 spent/reserved 双行。
   function remainingInfo(u) {
     var use = userUsage(u);
     if (!use.available) {
@@ -906,54 +845,20 @@
       return { text: "不可用（remaining 缺失）", danger: false };
     }
     // remaining 不需要除法，优先于「额度为 0」判定：limit=0 且 remaining=0
-    // 是真实的「已用尽」观测（下次预占同样被拒绝），不与 0 额度混淆（§4.3）
+    // 是真实的「已用尽」观测；负 remaining = overage 观测（danger 色）
     if (use.remaining < 0n) {
-      // overage 观测：danger 语义；条宽仍 clamp 100%（§3.4 不截断成 0）
       return { text: "超支 " + fmtCny(-use.remaining), danger: true };
     }
     if (use.remaining === 0n) {
       return { text: "已用尽", danger: false };
     }
-    if (use.limit === 0n) {
-      // limit=0 但 remaining>0（矛盾数据）：不除法，按 0 额度呈现
-      return { text: "额度为 0", danger: false };
-    }
     return { text: "剩余 " + fmtCny(use.remaining), danger: false };
-  }
-
-  function renderUsageCell(u) {
-    var use = userUsage(u);
-    if (!use.available) return unavailableCell(use.reason);
-    var cell = document.createElement("td");
-    var line = document.createElement("div");
-    // 已消费必有值（可能是 0）；预占仅在有值时显示——不与不可用混淆
-    line.textContent = "已消费 " + fmtCny(use.spent) +
-      (use.reserved > 0n ? "，预占 " + fmtCny(use.reserved) : "");
-    cell.appendChild(line);
-    if (use.limit === 0n) {
-      // §4.3：limit_snapshot=0 不做除法
-      var zero = document.createElement("div");
-      zero.className = "adm-usage-note";
-      zero.textContent = "额度为 0";
-      cell.appendChild(zero);
-      return cell;
-    }
-    cell.appendChild(buildUsageMeter(use.spent, use.reserved, use.limit));
-    // P0-2：移动端把剩余状态堆叠进同一格（桌面 .adm-stack-mobile 隐藏）
-    var info = remainingInfo(u);
-    var stack = document.createElement("div");
-    stack.className = "adm-stack-mobile" +
-      (info.danger ? " adm-usage-overage" : "");
-    stack.textContent = info.text;
-    cell.appendChild(stack);
-    return cell;
   }
 
   function renderRemainCell(u) {
     var info = remainingInfo(u);
     var cell = document.createElement("td");
-    // P0-2：剩余独立列只在桌面显示（移动端堆叠进用量格）
-    cell.className = "adm-col-desktop" + (info.danger ? " adm-usage-overage" : "");
+    cell.className = "adm-cell-remaining" + (info.danger ? " adm-usage-overage" : "");
     cell.textContent = info.text;
     return cell;
   }
@@ -965,9 +870,8 @@
     items.forEach(function (u) {
       var tr = document.createElement("tr");
       tr.appendChild(td(u.display_name));
-      tr.appendChild(td(u.login_id_masked, "adm-col-secondary"));
       tr.appendChild(td(u.role, "adm-col-secondary"));
-      // 状态 + AI（P0-2）：桌面两列；≤767px 状态格内堆叠 AI 补行，凑成 4 列
+      // 状态 + AI（P0-2）：桌面一列；≤767px 状态格内堆叠 AI 补行，凑成 4 列
       var statusCell = document.createElement("td");
       statusCell.appendChild(document.createTextNode(u.enabled ? "启用" : "禁用"));
       var aiStack = document.createElement("div");
@@ -975,20 +879,7 @@
       aiStack.textContent = u.ai_access ? "AI" : "无 AI";
       statusCell.appendChild(aiStack);
       tr.appendChild(statusCell);
-      tr.appendChild(td(u.ai_access ? "是" : "否", "adm-col-desktop"));
-      tr.appendChild(renderUsageCell(u));
       tr.appendChild(renderRemainCell(u));
-      // 最近 AI 调用：相对时间为主，title 提供上海绝对时间（§4.8）
-      var lastCell = document.createElement("td");
-      lastCell.className = "adm-col-secondary adm-cell-time";
-      if (u.last_ai_call_at === null || u.last_ai_call_at === undefined) {
-        lastCell.textContent = "—";
-      } else {
-        lastCell.textContent = relTime(u.last_ai_call_at);
-        lastCell.setAttribute("title",
-          fmtTs(u.last_ai_call_at) + "（Asia/Shanghai）");
-      }
-      tr.appendChild(lastCell);
       var cell = document.createElement("td");
       cell.className = "adm-actions-cell";
       var detailBtn = actionBtn("详情", function () {
@@ -1000,35 +891,43 @@
     });
   }
 
-  // 剩余额度的可见状态（§6.2/E2E）：负值 = overage 观测（下次预占拒绝）；
-  // 0 = 已用尽；正值正常展示。金额全程字符串/BigInt，不经 Number。
+  // 剩余额度的短文案（§5.3/§5.4）：「剩余 X CNY / 已用尽 / 超支 X CNY」；
+  // 长解释（overage 观测、拒绝说明）只允许出现在危险确认条，不进主视图。
   function remainingText(remainingNano) {
     if (remainingNano === null || remainingNano === undefined) return "—";
-    var neg = false;
     var b = BigInt(remainingNano);
-    if (b < 0n) { neg = true; b = -b; }
-    var cny = nanoToCnyString((neg ? "-" : "") + b.toString());
-    if (neg) return "超支 " + cny + " CNY（overage 观测；下次预占将被拒绝）";
-    if (b === 0n) return "0 CNY（已用尽：下次预占将被拒绝）";
-    return cny + " CNY";
+    if (b < 0n) return "超支 " + nanoToCnyString((-b).toString()) + " CNY";
+    if (b === 0n) return "已用尽";
+    return "剩余 " + nanoToCnyString(b.toString()) + " CNY";
   }
 
-  // 月额度覆盖编辑器（§6.2/§4.10）：输入 CNY → nano 十进制字符串；空值提交=
-  // 清除（DELETE，下个窗口回退全局默认）。owner 无覆盖语义（服务端同样拒绝）。
-  // 复用统一 form/label/button 组件类；校验失败保留输入与焦点。
+  // 该用户当前月金额窗口（可能缺失：json 后端 / 尚未开窗 / 出错）
+  function currentUserWindow(u) {
+    return u && u.spend && u.spend.window && !u.spend.error
+      ? u.spend.window : null;
+  }
+
+  // 月额度编辑器（2026-09-01 金额简化 §5.4）：非 owner 唯一金额动作——
+  // 「每月额度（CNY）」+ 保存 + 恢复默认。保存 = 两步：
+  //   1) admin.users.setSpendOverride（覆盖以后每个窗口）
+  //   2) 若该用户已有当前月窗口，再 admin.spend.currentWindow.adjust
+  //      （立即改当前窗口 snapshot，window_id + version CAS）
+  // 第 1 步成功、第 2 步失败必须写明「覆盖已保存，但当前窗口未改」，
+  // 禁止假装成功。恢复默认 = 清覆盖 + 当前窗口调回注册用户默认月额度。
+  // 两次操作都走抽屉内页内确认条（#adm-drawer-confirm）。
   function renderOverrideEditor(u) {
     var wrap = document.createElement("div");
     wrap.className = "adm-drawer-override";
     var title = document.createElement("p");
     title.className = "adm-note";
-    title.textContent = "月额度覆盖（calendar_month）：设置只影响之后新建的窗口；清除后下个窗口回退全局默认。";
+    title.textContent = "对这个用户单独设每月额度。保存后立即改当前月，并作为以后每个月的覆盖值。";
     var field = document.createElement("div");
     field.className = "adm-field";
     var label = document.createElement("label");
     label.className = "adm-field-label";
     var inputId = "adm-override-limit-input";
     label.htmlFor = inputId;
-    label.textContent = "新覆盖额度（CNY，选填）";
+    label.textContent = "每月额度（CNY，必填）";
     var input = document.createElement("input");
     input.type = "text";
     input.id = inputId;
@@ -1038,54 +937,185 @@
     var help = document.createElement("small");
     help.className = "adm-field-help";
     help.id = "adm-override-limit-help";
-    help.textContent = "最多 9 位小数；留空提交不修改";
+    help.textContent = "最多 9 位小数；要恢复全局默认请用「恢复默认」";
     field.appendChild(label);
     field.appendChild(input);
     field.appendChild(help);
+    // 编辑器局部状态行：成功/部分失败结果都写在这里（抽屉保持打开可见），
+    // 同时镜像到页级 #adm-users-status（关闭抽屉后仍可见）
+    var statusEl = document.createElement("p");
+    statusEl.className = "adm-status";
     var actions = document.createElement("div");
     actions.className = "adm-form-actions";
-    var setBtn = actionBtn("设置/更新覆盖", function () {
+
+    function editorStatus(text) {
+      statusEl.textContent = text;
+      setStatus("adm-users-status", text);
+    }
+
+    function markLimitInvalid(message) {
+      input.setAttribute("aria-invalid", "true");
+      if (input.focus) input.focus();
+      statusEl.textContent = message;
+    }
+
+    // 两步保存链（override → 当前窗口 CAS）。恢复默认时 override 为 null、
+    // 当前窗口调到 settings 里的注册用户默认月额度（adjustNano）
+    function applyMonthlyLimit(overrideNano, adjustNano, okText) {
+      editorStatus("保存中…");
+      request("admin.users.setSpendOverride", {
+        user_id: u.user_id,
+        monthly_limit_nano_cny: overrideNano,
+      }).then(function () {
+        var w = currentUserWindow(u);
+        if (!w) {
+          editorStatus(okText + "（该用户暂无当前月窗口，从下个窗口起生效）");
+          loadUsers(false);
+          return;
+        }
+        request("admin.spend.currentWindow.adjust", {
+          window_id: w.window_id,
+          limit_nano_snapshot: adjustNano,
+          version: w.version,
+        }).then(function () {
+          editorStatus(okText + "（当前月已立即生效，以后每月沿用）");
+          loadUsers(false);
+        }).catch(function (err) {
+          // 第 1 步已成功、第 2 步失败：如实写明，禁止假装成功
+          editorStatus("覆盖已保存，但当前窗口未改，请刷新后重试");
+          showError(err && err.code, err && err.message);
+          loadUsers(false);
+        });
+      }).catch(function (err) {
+        editorStatus(errText(err));
+        showError(err && err.code, err && err.message);
+      });
+    }
+
+    var saveBtn = actionBtn("保存", function () {
       var text = (input.value || "").trim();
       var limit = text ? cnyToNano(text) : null;
-      if (text && limit === null) {
-        markInvalid(input, "覆盖金额非法（CNY，最多 9 位小数）", "adm-users-status");
+      if (!text || limit === null) {
+        markLimitInvalid("每月额度非法（CNY，最多 9 位小数，如 30.5）");
         return;
       }
       clearInvalid(input);
-      request("admin.users.setSpendOverride", {
-        user_id: u.user_id,
-        monthly_limit_nano_cny: limit,
-      }).then(function () {
-        setStatus("adm-users-status", limit === null
-          ? "已清除月额度覆盖（下个窗口起回退全局默认）"
-          : "已设置月额度覆盖 " + nanoToCnyString(limit) + " CNY（下个窗口起生效）");
-        loadUsers(false);
-        closeUserDrawer();
-      }).catch(function (err) {
-        showError(err && err.code, err && err.message);
-        setStatus("adm-users-status", errText(err));
-      });
+      askConfirm($("adm-drawer-confirm"),
+        "确认把 " + (u.display_name || u.user_id) + " 的每月额度设为 " +
+        nanoToCnyString(limit) + " CNY（" + limit + " nano）？" +
+        "保存后立即改当前月，并作为以后每个月的覆盖值。",
+        function () {
+          applyMonthlyLimit(limit, limit,
+            "已设为单独每月额度 " + nanoToCnyString(limit) + " CNY");
+        });
     }, "primary");
-    var clearBtn = actionBtn("清除覆盖", function () {
-      request("admin.users.setSpendOverride", {
-        user_id: u.user_id, monthly_limit_nano_cny: null,
-      }).then(function (res) {
-        setStatus("adm-users-status", (res && res.cleared
-          ? "已清除月额度覆盖" : "本无覆盖（无变化）") +
-          "（下个窗口起回退全局默认）");
-        loadUsers(false);
-        closeUserDrawer();
+
+    // 恢复默认：清覆盖；若有当前窗口，把 snapshot 调回注册用户默认月额度
+    // （settings 里的 user_default_monthly_limit）。读不到默认时只清覆盖，
+    // 并明确告知当前窗口未改。
+    var restoreBtn = actionBtn("恢复默认", function () {
+      statusEl.textContent = "读取注册用户默认月额度…";
+      request("admin.settings.get", {}).then(function (settings) {
+        var spend = (settings || {}).spend || {};
+        var policy = (spend.policies || {}).user_default;
+        var defNano = policy && policy.limit_nano_cny !== null &&
+          policy.limit_nano_cny !== undefined
+          ? String(policy.limit_nano_cny) : null;
+        var w = currentUserWindow(u);
+        if (defNano && w) {
+          askConfirm($("adm-drawer-confirm"),
+            "确认清除单独月额度并恢复默认 " + nanoToCnyString(defNano) +
+            " CNY？当前月窗口将立即调整为该额度。",
+            function () {
+              applyMonthlyLimit(null, defNano, "已恢复默认每月额度 " +
+                nanoToCnyString(defNano) + " CNY");
+            });
+        } else {
+          var why = !w ? "该用户暂无当前月窗口，清除后从下个窗口起回退默认。"
+            : "未能读取默认月额度，当前窗口将保持不变。";
+          askConfirm($("adm-drawer-confirm"),
+            "确认清除单独月额度、恢复全局默认？" + why,
+            function () {
+              editorStatus("已清除单独月额度覆盖" +
+                (!w ? "（下个窗口起回退全局默认）"
+                    : "；当前窗口未改，请刷新后重试"));
+              request("admin.users.setSpendOverride", {
+                user_id: u.user_id, monthly_limit_nano_cny: null,
+              }).then(function () {
+                loadUsers(false);
+              }).catch(function (err) {
+                editorStatus(errText(err));
+                showError(err && err.code, err && err.message);
+              });
+            });
+        }
       }).catch(function (err) {
+        editorStatus("默认月额度读取失败（" + errText(err) +
+          "）；未做任何修改，请刷新后重试");
         showError(err && err.code, err && err.message);
-        setStatus("adm-users-status", errText(err));
       });
     }, "secondary");
-    actions.appendChild(setBtn);
-    if (u.role !== "owner") actions.appendChild(clearBtn);
+
+    actions.appendChild(saveBtn);
+    actions.appendChild(restoreBtn);
     wrap.appendChild(title);
     wrap.appendChild(field);
     wrap.appendChild(actions);
+    wrap.appendChild(statusEl);
     return wrap;
+  }
+
+  // 抽屉底部默认折叠的「技术细节」（§5.4）：spent/reserved/窗口边界/余额/
+  // caps/raw nano 只在这里，主视图不出现
+  function drawerTechDetails(u) {
+    var details = document.createElement("details");
+    details.className = "adm-raw-values adm-drawer-tech";
+    var summary = document.createElement("summary");
+    summary.textContent = "技术细节（排障用）";
+    details.appendChild(summary);
+    var dl = document.createElement("dl");
+    dl.className = "adm-kv";
+    kvRow(dl, "金额余额", u.billing ? fmtCny(u.billing.balance_nano) : "未开户");
+    kvRow(dl, "soft/hard cap（兼容，已不参与授权）", u.billing
+          ? ((u.billing.soft_spend_cap_nano === null ? "—" : fmtCny(u.billing.soft_spend_cap_nano)) +
+             " / " +
+             (u.billing.hard_spend_cap_nano === null ? "—" : fmtCny(u.billing.hard_spend_cap_nano)))
+          : "—");
+    var rawRows = [
+      ["balance_nano", u.billing && u.billing.balance_nano],
+    ];
+    var w = currentUserWindow(u);
+    if (w) {
+      kvRow(dl, "本月已消费（spent）", fmtCny(w.spent_nano_cny));
+      kvRow(dl, "本月预占（reserved）", fmtCny(w.reserved_nano_cny));
+      var boundary = document.createElement("span");
+      boundary.className = "adm-boundary";
+      boundary.textContent = fmtTs(w.window_start) + " → " + fmtTs(w.window_end) +
+        "（上海时区自然月/周）";
+      kvRowNode(dl, "窗口边界", boundary);
+      rawRows = rawRows.concat([
+        ["limit_nano_snapshot", w.limit_nano_snapshot],
+        ["spent_nano_cny", w.spent_nano_cny],
+        ["reserved_nano_cny", w.reserved_nano_cny],
+        ["remaining_nano", w.remaining_nano],
+      ]);
+    }
+    details.appendChild(dl);
+    // 原始 nano（wire 十进制字符串）逐行可复制
+    rawRows.forEach(function (row) {
+      if (row[1] === null || row[1] === undefined || row[1] === "") return;
+      var line = document.createElement("div");
+      line.className = "adm-raw-values-row";
+      var key = document.createElement("span");
+      key.className = "adm-raw-values-key";
+      key.textContent = row[0];
+      var code = document.createElement("code");
+      code.textContent = String(row[1]);
+      line.appendChild(key);
+      line.appendChild(code);
+      details.appendChild(line);
+    });
+    return details;
   }
 
   function openUserDrawer(u, trigger) {
@@ -1093,6 +1123,7 @@
     drawerUser = u;
     drawerTrigger = trigger || null;
     els.drawerBody.textContent = "";
+    // 身份字段（§5.4 主视图保留）
     var dl = document.createElement("dl");
     dl.className = "adm-kv";
     kvRow(dl, "user_id", u.user_id);
@@ -1103,51 +1134,26 @@
     kvRow(dl, "AI access", u.ai_access ? "是" : "否");
     kvRow(dl, "创建时间", fmtTs(u.created_at));
     kvRow(dl, "注册方式", u.registration_method);
-    // 批次 F：对话额度（turn_used/turn_limit）字段已随 turn 消费闸退役删除
-    // 金额余额：null = 尚未开户（不显示 0）；主视图 CNY，raw 在展开区（§4.2）
-    kvRow(dl, "金额余额", u.billing ? fmtCny(u.billing.balance_nano) : "未开户");
-    kvRow(dl, "soft/hard cap（兼容字段，非当前月额度）", u.billing
-          ? ((u.billing.soft_spend_cap_nano === null ? "—" : fmtCny(u.billing.soft_spend_cap_nano)) +
-             " / " +
-             (u.billing.hard_spend_cap_nano === null ? "—" : fmtCny(u.billing.hard_spend_cap_nano)))
-          : "—");
-    // 当前月金额窗口 + 默认/覆盖状态（§6.2，批次 D）
-    var windowRawRows = null;
-    if (u.spend && u.spend.window && !u.spend.error) {
-      var w = u.spend.window;
-      kvRow(dl, "本月额度（limit snapshot）", fmtCny(w.limit_nano_snapshot));
-      kvRow(dl, "本月已消费（spent）", fmtCny(w.spent_nano_cny));
-      kvRow(dl, "本月预占（reserved）", fmtCny(w.reserved_nano_cny));
-      kvRow(dl, "本月剩余（remaining）", remainingText(w.remaining_nano));
-      var boundary = document.createElement("span");
-      boundary.className = "adm-boundary";
-      boundary.textContent = fmtTs(w.window_start) + " → " + fmtTs(w.window_end) +
-        "（上海时区自然月/周）";
-      kvRowNode(dl, "窗口边界", boundary);
-      windowRawRows = [
-        ["limit_nano_snapshot", w.limit_nano_snapshot],
-        ["spent_nano_cny", w.spent_nano_cny],
-        ["reserved_nano_cny", w.reserved_nano_cny],
-        ["remaining_nano", w.remaining_nano],
-        ["balance_nano", u.billing && u.billing.balance_nano],
-      ];
-    } else if (u.spend && u.spend.error) {
-      kvRow(dl, "本月金额窗口", "不可用（" + u.spend.error + "）");
-    } else {
-      kvRow(dl, "本月金额窗口", "不可用（要求 PostgreSQL 后端）");
-    }
-    kvRow(dl, "月额度策略",
-          u.role === "owner" ? "owner 独立策略（不与用户共池）"
-          : (u.spend && u.spend.policy_scope === "user_override")
-            ? "用户覆盖（user_override，policy " + (u.spend.policy_id || "?") + "）"
-            : "继承全局默认（user_default）");
     kvRow(dl, "最近 AI 调用", u.last_ai_call_at === null || u.last_ai_call_at === undefined
           ? "—" : fmtTs(u.last_ai_call_at) + "（Asia/Shanghai）");
-    els.drawerBody.appendChild(dl);
-    // 原始 nano 展开区放在全部字段之后（§4.2：抽屉主视图 CNY-only）
-    if (windowRawRows) {
-      els.drawerBody.appendChild(rawValuesDetails(windowRawRows));
+    // 金额主视图只有三行：本月剩余 / 本月额度 / 额度来源（§5.4）
+    var w = currentUserWindow(u);
+    if (w) {
+      kvRow(dl, "本月剩余", remainingText(w.remaining_nano));
+      kvRow(dl, "本月额度", fmtCny(w.limit_nano_snapshot));
+    } else {
+      var reason = u.spend && u.spend.error
+        ? String(u.spend.error) : "窗口数据缺失（要求 PostgreSQL 后端）";
+      kvRow(dl, "本月剩余", "不可用（" + reason + "）");
+      kvRow(dl, "本月额度", "—");
     }
+    kvRow(dl, "额度来源",
+          u.role === "owner" ? "默认（owner 独立策略）"
+          : (u.spend && u.spend.policy_scope === "user_override")
+            ? "单独覆盖" : "默认");
+    els.drawerBody.appendChild(dl);
+    // 低频技术细节默认折叠在底部
+    els.drawerBody.appendChild(drawerTechDetails(u));
     var actions = document.createElement("div");
     actions.className = "adm-drawer-actions";
     actions.appendChild(renderUserActions(u));
@@ -1177,8 +1183,9 @@
     if (trigger && trigger.focus) trigger.focus();
   }
 
-  // 行内操作（§10.2）：身份预览 / 启停 / AI access / 重置密码（仅普通用户）/
-  // 打开账本。§4.10：本函数只服务抽屉，返回真实 div（表格行自行用 td 容器）。
+  // 行内操作（§10.2）：授予/收回 AI / 身份预览 / 启停 / 重置密码（仅普通用户）。
+  // 2026-09-01 金额简化 §5.4：去掉「打开账本」（低频，去账单页自己查）。
+  // §4.10：本函数只服务抽屉，返回真实 div（表格行自行用 td 容器）。
   // §4.5：普通操作在前，禁用/重置密码等危险操作放独立「危险操作」区、
   // 不排在普通操作最前；owner 行不提供禁用与重置（break-glass 不变量，
   // 服务端同样 409）。禁用、重置密码与身份预览为危险操作，走页内确认条。
@@ -1190,9 +1197,6 @@
     var isOwner = u.role === "owner";
     wrap.appendChild(actionBtn(u.ai_access ? "收回 AI" : "授予 AI", function () {
       setAiAccess(u, !u.ai_access);
-    }, "secondary"));
-    wrap.appendChild(actionBtn("打开账本", function () {
-      openLedgerForUser(u.user_id);
     }, "secondary"));
     wrap.appendChild(actionBtn("身份预览", function () {
       askConfirm($("adm-drawer-confirm"),
@@ -1319,16 +1323,6 @@
     box.appendChild(ok);
     box.appendChild(cancel);
     if (input.focus) input.focus();
-  }
-
-  // 行内「打开账本」→ 额度与账单页：usage 明细按该 user_id 过滤 + 账户卡带入
-  function openLedgerForUser(userId) {
-    state.filters.usage = { model: "", user_id: userId, status: "" };
-    var input = $("adm-usage-user");
-    if (input) input.value = userId;
-    var acct = $("adm-acct-user");
-    if (acct) acct.value = userId;
-    showPage("billing");
   }
 
   function submitCreateUser() {
@@ -1700,20 +1694,16 @@
   function loadSettingsPage() {
     setPageState("settings", "loading");
     var seq = state.listSeq;
+    // 2026-09-01 金额简化 §5.5：不再拉用户列表拼「调整当前窗口」主体下拉；
+    // 当前周期的立即调整只针对 Demo / Owner 两个固定主体
     request("admin.settings.get", {}).then(function (settings) {
       if (seq !== state.listSeq) return;
       hideError();
       state.settingsSnapshot = settings;
       renderSettings(settings);
-      // 「调整当前窗口」主体 = demo 周 + owner 月（settings 聚合）+ 各用户月
-      // 窗口（users 列表的 spend 字段，服务端单事务批量解析）
-      return request("admin.users.list", { limit: 50 }).then(function (res) {
-        if (seq !== state.listSeq) return;
-        buildWindowSubjects(settings, (res && res.items) || []);
-        setPageState("settings", "ready", {
-          message: "已更新（" +
-            nowText() + "）",
-        });
+      setPageState("settings", "ready", {
+        message: "已更新（" +
+          nowText() + "）",
       });
     }).catch(function (err) {
       if (seq !== state.listSeq) return;
@@ -1725,7 +1715,7 @@
     });
   }
 
-  // §4.7：当前窗口小型摘要卡（额度/已消费/预占/剩余/版本 + 原始 nano 展开区）
+  // §5.5：当前窗口小型摘要卡只回答「额度 / 剩余」（Demo 一张、Owner 一张）
   function windowSummaryCard(title, w) {
     var card = document.createElement("div");
     card.className = "adm-summary-card";
@@ -1734,26 +1724,17 @@
     card.appendChild(h);
     var dl = document.createElement("dl");
     dl.className = "adm-kv";
-    var rawRows = null;
     if (!w) {
       kvRow(dl, "可用性", "—");
     } else if (w.error) {
       kvRow(dl, "可用性", "不可用（" + w.error + "）");
     } else {
-      kvRow(dl, "额度（limit snapshot）", fmtCny(w.limit_nano_snapshot));
-      kvRow(dl, "已消费（spent）", fmtCny(w.spent_nano_cny));
-      kvRow(dl, "预占（reserved）", fmtCny(w.reserved_nano_cny));
-      kvRow(dl, "剩余（remaining）", remainingText(w.remaining_nano));
-      kvRow(dl, "版本", "v" + w.version);
-      rawRows = [
-        ["limit_nano_snapshot", w.limit_nano_snapshot],
-        ["spent_nano_cny", w.spent_nano_cny],
-        ["reserved_nano_cny", w.reserved_nano_cny],
-        ["remaining_nano", w.remaining_nano],
-      ];
+      // 行首已是「剩余」标签，值直接给数字（短文案的「剩余 X CNY」给抽屉/列表用）
+      kvRow(dl, "额度", fmtCny(w.limit_nano_snapshot));
+      kvRow(dl, "剩余",
+        fmtCny(w.remaining_nano));
     }
     card.appendChild(dl);
-    if (rawRows) card.appendChild(rawValuesDetails(rawRows));
     return card;
   }
 
@@ -1832,8 +1813,8 @@
                                fmtTs(bounds.user_month[1])) : "—");
       }
     }
-    // §4.7：当前 demo/owner 窗口拆成小型摘要卡（额度/已消费/预占/剩余/版本，
-    // 原始 nano 在各卡 raw 展开区）；调整仍是下方独立操作
+    // §5.5：当前 demo/owner 窗口拆成小型摘要卡（只回答额度/剩余）；
+    // 立即调整入口在金额策略卡里各自折叠的「立即调整当前周期」
     var grid = $("adm-window-summaries");
     if (grid) {
       grid.textContent = "";
@@ -2019,128 +2000,70 @@
     });
   }
 
-  // 「调整当前窗口」主体列表：demo 周 + owner 月 + 各用户月窗口
-  function buildWindowSubjects(settings, users) {
-    var subjects = [];
-    var spend = settings.spend || {};
-    var wins = spend.current_windows || {};
-    if (wins.demo && !wins.demo.error) {
-      subjects.push({ key: "demo", label: "Demo（全站共享周窗口）",
-                      window: wins.demo });
-    }
-    if (wins.owner && !wins.owner.error) {
-      subjects.push({ key: "owner", label: "Owner（月窗口）",
-                      window: wins.owner });
-    }
-    users.forEach(function (u) {
-      var s = u.spend;
-      if (s && s.window && !s.error) {
-        subjects.push({
-          key: "user:" + u.user_id,
-          label: (u.display_name || u.user_id) + "（月窗口）",
-          window: s.window,
-        });
-      }
-    });
-    state.windowSubjects = subjects;
-    var select = $("adm-window-subject");
-    if (!select) return;
-    select.textContent = "";
-    subjects.forEach(function (s, i) {
-      var opt = document.createElement("option");
-      opt.value = String(i);
-      opt.textContent = s.label;
-      select.appendChild(opt);
-    });
-    renderWindowInfo();
+  // ------------------------------------------------------------------
+  // 「立即调整当前周期」（2026-09-01 金额简化 §5.5）：主体固定 Demo / Owner，
+  // 调用同一个 admin.spend.currentWindow.adjust（window_id + limit CAS）。
+  // 不再枚举普通用户——单个用户的月额度改用其详情抽屉。
+  // ------------------------------------------------------------------
+
+  // 剩余金额的确认条用语（确认条允许细节，但不输出长拒绝说明）
+  function remainingPhrase(nanoStr) {
+    var b = BigInt(nanoStr);
+    if (b < 0n) return "超支 " + nanoToCnyString((-b).toString()) + " CNY";
+    if (b === 0n) return "0 CNY（已用尽）";
+    return nanoToCnyString(b.toString()) + " CNY";
   }
 
-  function currentWindowSubject() {
-    var select = $("adm-window-subject");
-    var idx = select ? parseInt(select.value, 10) : 0;
-    return state.windowSubjects[idx] || state.windowSubjects[0] || null;
-  }
-
-  function renderWindowInfo() {
-    var dl = $("adm-window-info");
-    if (!dl) return;
-    dl.textContent = "";
-    var rawBox = $("adm-window-raw");
-    if (rawBox) rawBox.textContent = "";
-    var boundaryEl = $("adm-window-boundary");
-    if (boundaryEl) { boundaryEl.hidden = true; boundaryEl.textContent = ""; }
-    var subject = currentWindowSubject();
-    if (!subject) {
-      kvRow(dl, "主体", "无可用窗口（策略缺失或后端不可用）");
+  function adjustFixedWindow(subjectKey) {
+    var isDemo = subjectKey === "demo";
+    var inputId = isDemo ? "adm-win-demo-limit" : "adm-win-owner-limit";
+    var statusId = isDemo ? "adm-win-demo-status" : "adm-win-owner-status";
+    var confirmId = isDemo ? "adm-win-demo-confirm" : "adm-win-owner-confirm";
+    var label = isDemo ? "Demo（全站共享周窗口）" : "Owner（月窗口）";
+    var spend = (state.settingsSnapshot || {}).spend || {};
+    if (spend.available === false) {
+      setStatus(statusId, "金额策略要求 PostgreSQL 后端");
       return;
     }
-    var w = subject.window;
-    kvRow(dl, "主体", subject.label);
-    kvRow(dl, "当前额度（limit snapshot）", fmtCny(w.limit_nano_snapshot));
-    kvRow(dl, "已消费（spent）", fmtCny(w.spent_nano_cny));
-    kvRow(dl, "预占（reserved）", fmtCny(w.reserved_nano_cny));
-    kvRow(dl, "剩余（remaining）", remainingText(w.remaining_nano));
-    kvRow(dl, "窗口 version（CAS）", String(w.version));
-    kvRow(dl, "window_id", w.window_id);
-    // §4.8：窗口边界在 → 两侧可换行（禁 break-all）；上海时区主显示
-    if (boundaryEl) {
-      boundaryEl.hidden = false;
-      boundaryEl.textContent = "窗口边界：" + fmtTs(w.window_start) + " → " +
-        fmtTs(w.window_end) + "（上海时区自然月/周）";
-    }
-    if (rawBox) {
-      rawBox.appendChild(rawValuesDetails([
-        ["limit_nano_snapshot", w.limit_nano_snapshot],
-        ["spent_nano_cny", w.spent_nano_cny],
-        ["reserved_nano_cny", w.reserved_nano_cny],
-        ["remaining_nano", w.remaining_nano],
-      ]));
-    }
-  }
-
-  function adjustCurrentWindow() {
-    var subject = currentWindowSubject();
-    if (!subject || !subject.window) {
-      setStatus("adm-window-status", "无可用窗口可调整");
+    var w = (spend.current_windows || {})[subjectKey];
+    if (!w || w.error) {
+      setStatus(statusId, "当前窗口不可用（策略缺失或后端不可用）");
       return;
     }
-    var w = subject.window;
-    var text = ($("adm-window-newlimit") &&
-                $("adm-window-newlimit").value || "").trim();
+    var text = ($(inputId) && $(inputId).value || "").trim();
     var limit = text ? cnyToNano(text) : null;
     if (limit === null) {
-      setStatus("adm-window-status",
-                "新额度非法（CNY，最多 9 位小数，如 30.5）");
+      setStatus(statusId, "新额度非法（CNY，最多 9 位小数，如 30.5）");
       return;
     }
     var newRemaining = (BigInt(limit) - BigInt(w.spent_nano_cny) -
                         BigInt(w.reserved_nano_cny)).toString();
-    askConfirm($("adm-window-confirm"),
-      "确认调整 " + subject.label + " 的当前窗口额度？" +
+    askConfirm($(confirmId),
+      "确认调整 " + label + " 的当前周期额度？" +
       "当前额度 " + nanoToCnyString(w.limit_nano_snapshot) + " CNY → 新额度 " +
       nanoToCnyString(limit) + " CNY（" + limit + " nano）。影响：已消费 " +
       nanoToCnyString(w.spent_nano_cny) + " / 预占 " +
       nanoToCnyString(w.reserved_nano_cny) + " 不回退；新剩余 " +
-      remainingText(newRemaining) + "。操作立即生效并写审计，不等下个窗口。",
+      remainingPhrase(newRemaining) + "。操作立即生效并写审计，不等下个窗口。",
       function () {
-        setStatus("adm-window-status", "调整中…");
+        setStatus(statusId, "调整中…");
         request("admin.spend.currentWindow.adjust", {
           window_id: w.window_id,
           limit_nano_snapshot: limit,
           version: w.version,
         }).then(function (res) {
-          setStatus("adm-window-status",
+          setStatus(statusId,
             "已调整（窗口 version " +
             ((res && res.window && res.window.version) || "?") + "）");
-          if ($("adm-window-newlimit")) $("adm-window-newlimit").value = "";
+          if ($(inputId)) $(inputId).value = "";
           loadSettingsPage();
         }).catch(function (err) {
           if (err && err.code === "version_conflict") {
-            setStatus("adm-window-status",
-              "窗口已被他人调整（409 version_conflict），已刷新，请重选后重试");
+            setStatus(statusId,
+              "窗口已被他人调整（409 version_conflict），已刷新，请重试");
             loadSettingsPage();
           } else {
-            setStatus("adm-window-status", errText(err));
+            setStatus(statusId, errText(err));
           }
           showError(err && err.code, err && err.message);
         });
@@ -2148,25 +2071,34 @@
   }
 
   // ------------------------------------------------------------------
-  // 额度与账单（§10.4 只读部分）
+  // 额度与账单（§10.4 + 2026-09-01 金额简化 §5.7）：低频运维页。
+  // 第一屏只留供应商余额 + 人工调整；用量明细/账本/turn legacy 等运维明细
+  // 默认折叠，首次展开（toggle）才发对应请求。
   // ------------------------------------------------------------------
+  var BILLING_LAZY_BOXES = [
+    ["adm-billing-usage-box", function () { loadUsage(false); loadUnpriced(false); }],
+    ["adm-billing-ledger-box", function () { loadLedger(false); }],
+    ["adm-turn-legacy-card", function () { loadTurnBudgetCard(); }],
+  ];
+
+  // 折叠区首次打开才加载；进入页面时已处于展开状态的区块也补一次加载
+  function ensureOpenBillingDetailsLoaded() {
+    BILLING_LAZY_BOXES.forEach(function (plan) {
+      var box = $(plan[0]);
+      if (box && box.open) plan[1]();
+    });
+  }
+
   function loadBillingPage() {
     setPageState("billing", "loading");
     var seq = state.listSeq;
-    Promise.all([
-      new Promise(function (res, rej) {
-        request("admin.turnBudgets.get", {}).then(
-          function (r) { res(r); }, function (e) { rej(e); });
-      }),
-      new Promise(function (res, rej) {
-        request("admin.billing.usage.list", { limit: 1 }).then(
-          function (r) { res(r); }, function (e) { rej(e); });
-      }),
-    ]).then(function () {
+    loadLegacyPricingCard();
+    loadProviderBalanceCard().then(function () {
       if (seq !== state.listSeq) return;
       setPageState("billing", "ready", {
         message: "已更新（" + nowText() + "）",
       });
+      ensureOpenBillingDetailsLoaded();
     }, function (err) {
       if (seq !== state.listSeq) return;
       setPageState("billing", "error", {
@@ -2174,12 +2106,6 @@
         retry: function () { loadBillingPage(); },
       });
     });
-    loadTurnBudgetCard();
-    loadLegacyPricingCard();
-    loadProviderBalanceCard();
-    loadUsage(false);
-    loadUnpriced(false);
-    loadLedger(false);
   }
 
   // 批次 A 遗留口径（§7.2）：cutover 前旧错误价格的影子数据单独标记展示，
@@ -2502,13 +2428,14 @@
   }
 
   function loadProviderBalanceCard() {
-    request("admin.billing.providerBalance.get", {}).then(function (payload) {
+    return request("admin.billing.providerBalance.get", {}).then(function (payload) {
       hideError();
       renderProviderBalance(payload);
     }).catch(function (err) {
       var dl = $("adm-billing-provider");
       if (dl) { dl.textContent = ""; kvRow(dl, "可用性", errText(err)); }
       else handleErr(err, null);
+      throw err; // 交给 loadBillingPage 决定页面终态
     });
   }
 
@@ -2986,15 +2913,23 @@
     });
     // 账单页
     onClick("adm-balance-refresh-btn", refreshProviderBalance);
-    // 设置页（批次 D）
+    // §5.7：运维明细折叠区首次展开才加载对应数据
+    BILLING_LAZY_BOXES.forEach(function (plan) {
+      var box = $(plan[0]);
+      if (!box || !box.addEventListener || box.getAttribute("data-lazy-bound")) {
+        return;
+      }
+      box.setAttribute("data-lazy-bound", "1");
+      box.addEventListener("toggle", function () {
+        if (box.open) plan[1]();
+      });
+    });
+    // 设置页（批次 D + 2026-09-01 金额简化 §5.5）
     onClick("adm-regmode-save-btn", saveRegistrationMode);
     onClick("adm-spend-save-btn", saveSpendPolicies);
     onClick("adm-rt-save-btn", saveRuntimeLimits);
-    onClick("adm-window-adjust-btn", adjustCurrentWindow);
-    var windowSubjectSelect = $("adm-window-subject");
-    if (windowSubjectSelect && windowSubjectSelect.addEventListener) {
-      windowSubjectSelect.addEventListener("change", renderWindowInfo);
-    }
+    onClick("adm-win-demo-adjust-btn", function () { adjustFixedWindow("demo"); });
+    onClick("adm-win-owner-adjust-btn", function () { adjustFixedWindow("owner"); });
     // turn 预算 / 金额账户写操作（PR5）
     onClick("adm-acct-load-btn", loadBillingAccount);
     // §4.5：人工调整区初始禁用（运行时态，不依赖 HTML 属性），查询成功后才启用

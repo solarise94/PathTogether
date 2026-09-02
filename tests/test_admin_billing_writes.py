@@ -676,7 +676,8 @@ def test_ai_access_set_and_unset():
 
 
 # --------------------------------------------------------------------------- #
-# 8. invites（PG）：创建校验 / token 仅一次 / 撤销
+# 8. invites（PG）：创建校验 / token 仅一次 / 撤销（Batch B wave 2：来源字段
+#    退役 400 retired_invite_field；初始金额字段 total_limit_nano_cny）
 # --------------------------------------------------------------------------- #
 @PG
 def test_invites_create_token_once_and_slug_validation():
@@ -684,7 +685,7 @@ def test_invites_create_token_once_and_slug_validation():
     c = _login(_client(), owner)
     r = c.post("/api/admin/v1/invites", json={
         "login_id": "invitee@x.com", "ttl_hours": 24, "ai_access": True,
-        "cohort": "c1", "note": "n", "source_code": "mywebpage"})
+        "note": "n"})
     assert r.status_code == 200, r.get_json()
     invite = r.get_json()["invite"]
     assert invite["token"]  # 明文仅此一次
@@ -696,11 +697,22 @@ def test_invites_create_token_once_and_slug_validation():
     assert len(items) == 1
     assert "token" not in items[0] and "token_hash" not in items[0]
     assert items[0]["login_id_masked"]
-    # slug 校验：非法 source_code / 未登记 campaign → 400
-    assert c.post("/api/admin/v1/invites",
-                  json={"source_code": "Bad Slug!"}).status_code == 400
-    assert c.post("/api/admin/v1/invites",
-                  json={"campaign_id": "no_such_campaign"}).status_code == 400
+    # Batch D1 13（§4.4）：来源字段退役——slug 校验随字段一并退役，任何
+    # source_code/campaign_id/cohort 出现在请求体 → 400 retired_invite_field
+    for field in ("source_code", "campaign_id", "cohort"):
+        r_ret = c.post("/api/admin/v1/invites", json={field: "Bad Slug!"})
+        assert r_ret.status_code == 400, field
+        assert r_ret.get_json()["error"]["code"] == "retired_invite_field"
+    # 初始总额度模板：JSON number 拒绝；十进制字符串接受
+    assert c.post("/api/admin/v1/invites", json={
+        "total_limit_nano_cny": 5}).status_code == 400
+    assert c.post("/api/admin/v1/invites", json={
+        "total_limit_nano_cny": "5"}).status_code == 200
+    # 新旧金额字段同传 → 400 ambiguous_spend_limit
+    r_amb = c.post("/api/admin/v1/invites", json={
+        "total_limit_nano_cny": "5", "monthly_limit_nano_cny": "5"})
+    assert r_amb.status_code == 400
+    assert r_amb.get_json()["error"]["code"] == "ambiguous_spend_limit"
     # ttl 边界（0 会回退默认 TTL——与旧端点 `or 默认值` 语义一致；负数/超限 400）
     assert c.post("/api/admin/v1/invites",
                   json={"ttl_hours": -5}).status_code == 400

@@ -33,6 +33,7 @@ import pytest  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import upload_guard  # noqa: E402
+import slide_io  # noqa: E402
 import app as app_mod  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
 from _pt_helpers import isolate_app, clear_upload_dir  # noqa: E402
@@ -56,7 +57,9 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(app_mod, "ZIP_MAX_TOTAL_BYTES",
                         2 * upload_guard.UPLOAD_MAX_REQUEST_BYTES)
     monkeypatch.setattr(app_mod, "ZIP_MAX_COMPRESSION_RATIO", 100.0)
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    # A0 异常契约：放行 stub 返回 None，签名兼容 format_hint 关键字
+    monkeypatch.setattr(app_mod, "_validate_slide_file",
+                        lambda p, **_: None)
     clear_upload_dir(UPLOAD_DIR)
     yield
 

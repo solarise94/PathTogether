@@ -74,7 +74,13 @@ DEFAULT_USER_TURN_LIMIT = _int_env("BUDGET_DEFAULT_USER_TURNS", 3)
 DEFAULT_OWNER_RESERVED_TURN_LIMIT = _int_env(
     "BUDGET_DEFAULT_OWNER_RESERVED_TURNS", 10)
 DEFAULT_USER_POOL_TURN_LIMIT = _int_env("BUDGET_DEFAULT_USER_POOL_TURNS", 15)
-DEFAULT_PLATFORM_TASK_MAX_STEPS = 20
+# Batch C（docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
+# §Batch C 实现要求 1 / §4.5）：注册 user 单任务步数的**默认值与硬上限一致
+# （均 500）**——max_steps 只是异常循环熔断（>100 记一次异常观测、达到 500
+# 暂停），不是业务额度；旧值 20 会让缺配置/旧服务端/接线回归时的 user run
+# 20 步即停。字段级 1..500 校验见 app.py（禁止把共享 _BUDGET_LIMIT_MAX 改 500）；
+# 遗留 >500 值由 migrations/0031_max_steps_normalize.sql 显式归一并审计。
+DEFAULT_PLATFORM_TASK_MAX_STEPS = 500
 DEFAULT_OWN_TASK_MAX_STEPS_LIMIT = 500
 DEFAULT_DEMO_TASK_MAX_STEPS = 20
 DEFAULT_DEMO_ENABLED = False

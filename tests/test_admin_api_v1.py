@@ -215,12 +215,11 @@ def test_json_overview_segmented_availability():
     # 用户段任何后端都真实可用
     assert body["users"]["total"] >= 2
     assert body["users"]["active"] >= 2
-    # billing / turn_budget 分段标记（不整体 503，也不伪造数据）；
-    # turn_budget 段另带 legacy=True（批次 F：turn 消费闸退役，冻结历史）
-    for seg in ("billing", "turn_budget"):
-        assert body[seg]["available"] is False
-        assert body[seg]["code"] == "pg_backend_required"
-    assert body["turn_budget"]["legacy"] is True
+    # billing 分段标记（不整体 503，也不伪造数据）
+    assert body["billing"]["available"] is False
+    assert body["billing"]["code"] == "pg_backend_required"
+    # 批次 D1（§4.2）：turn 预算历史已移出概览（无 turn_budget 段）
+    assert "turn_budget" not in body
     assert scan_sensitive(body) == []
 
 
@@ -237,8 +236,10 @@ def test_json_users_list_null_billing_fields():
         assert item["billing"] is None
         # 批次 F：turn_used/turn_limit 字段已随 turn 消费闸退役删除
         assert "turn_used" not in item and "turn_limit" not in item
+        # 批次 D1 14（§4.4）：campaign/source 用户级归因键整键删除
+        assert "campaign" not in item and "source" not in item
         assert item["last_ai_call_at"] is None
-        assert item["campaign"] is None and item["source"] is None
+        assert item["spend"] is None  # json 后端无 spend 投影
 
 
 # --------------------------------------------------------------------------- #
@@ -395,7 +396,8 @@ def _make_arithmetic_bad(event):
 
 @PG
 def test_overview_dual_quota_semantics():
-    """概览必须同时含「对话额度」（turn）与「金额余额」（billing）两段（§10.1）。"""
+    """概览：用户段 + 金额 KPI（unpriced 计数保持）；turn 历史不再进概览
+    （批次 D1 §4.2：turn-budgets 不再进 overview payload）。"""
     import billing_pricing
     owner, usera = _setup_users()
     bh.seed_price_books_with_history()
@@ -411,7 +413,8 @@ def test_overview_dual_quota_semantics():
     _seed_event("02_user_priced_pro_offpeak_reasoning.json", "user",
                 usera["user_id"], occurred=today_local + timedelta(minutes=30))
     # 周期在事件之后才创建（bind_reservation 首次触发）——把起点回拨到事件
-    # 之前，使「本周期」窗口覆盖种子事件（金额聚合断言才有意义）
+    # 之前，使「周期」窗口覆盖种子事件（billing 的 model_calls_period/
+    # provider_cost 聚合断言才有意义；与 turn 无关，概览已不含 turn 段）
     conn = bh.connect()
     try:
         with conn.cursor() as cur:
@@ -426,12 +429,8 @@ def test_overview_dual_quota_semantics():
     # 用户段
     assert body["users"]["total"] == 2
     assert body["users"]["active"] == 2
-    # 对话额度段（turn budget）
-    turn = body["turn_budget"]
-    assert turn["available"] is True
-    assert isinstance(turn["platform"]["total"], int)
-    assert isinstance(turn["platform"]["limit"], int)
-    assert turn["period_id"] is not None
+    # turn 历史聚合已移出概览（批次 D1 §4.2；冻结历史只读端点保留兼容）
+    assert "turn_budget" not in body
     # 金额余额段（billing）
     billing = body["billing"]
     assert billing["available"] is True
@@ -443,11 +442,9 @@ def test_overview_dual_quota_semantics():
     assert int(billing["provider_cost_nano_cny"]) > 0
     assert billing["cache_hit_ratio"] is None or 0 <= billing["cache_hit_ratio"] <= 1
     assert billing["provider_balance_snapshot"] is None  # 尚无快照
+    # unpriced KPI 逻辑保持（计数可用；>0 才告警是 UI 侧条件渲染）
     assert isinstance(billing["unpriced_count"], int)
     assert isinstance(billing["ingestion_lag_seconds_max"], float)
-    # 两段键不互相混淆（turn 无金额、billing 无次数上限语义）
-    assert "charge_nano_cny" not in turn
-    assert "platform_turn_limit" not in billing
     assert scan_sensitive(body) == []
 
 
@@ -585,6 +582,7 @@ def test_users_row_joins_turn_billing_last_call(monkeypatch):
     monkeypatch.setenv("BILLING_SIMULATED_DEBIT", "0")
     owner, usera = _setup_users(1)
     bh.seed_price_books_with_history()
+    bh.seed_spend_policies()
     _seed_event("02_user_priced_pro_offpeak_reasoning.json", "user",
                 usera["user_id"])
     # 直接写一条 ai_budget_usage 行（usage_report 的 per_user 数据源）
@@ -618,12 +616,22 @@ def test_users_row_joins_turn_billing_last_call(monkeypatch):
     assert item["billing"]["balance_nano"] == "3000000000"
     assert item["billing"]["soft_spend_cap_nano"] is None
     assert item["last_ai_call_at"] is not None
-    assert item["campaign"] is None and item["source"] is None
+    # 批次 D1 14：campaign/source 用户级归因键整键删除
+    assert "campaign" not in item and "source" not in item
+    # Batch B wave 2：cutover 前 target=window → 互斥 window 形态
+    assert "total" not in item["spend"]
+    assert item["spend"]["policy_scope"] == "user_default"
+    assert item["spend"]["window"]["limit_nano_snapshot"] is not None
+    assert isinstance(item["spend"]["window"]["limit_nano_snapshot"], str)
     assert scan_sensitive(r) == []
     # owner 行未开户 → billing null（不伪造）
     r = _login(_client(), owner).get(
         "/api/admin/v1/users?q=owner@x.com").get_json()
-    assert r["items"][0]["billing"] is None
+    owner_item = r["items"][0]
+    assert owner_item["billing"] is None
+    # owner 行为 window 形态（绝不出现 total allowance，§4.3 互斥形态）
+    assert "total" not in owner_item["spend"]
+    assert owner_item["spend"]["window"] is not None
 
 
 @PG

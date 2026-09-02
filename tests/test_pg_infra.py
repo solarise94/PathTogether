@@ -169,6 +169,19 @@ def test_schema_migrations_recorded(conn):
         # histopilot_session_id 放宽为可空，NULL = pending 行——起跑前已写主体、
         # on_accepted 后 attach session；金额硬闸绑定失败窗口 fail-closed）。
         "0028_ai_run_bindings_pending_session.sql",
+        # Batch B 追加 0029_user_total_allowances_and_denials.sql（注册 user
+        # 一次性总额度三表 + billing_holds.spend_total_allowance_id + 邀请
+        # total_limit_nano_cny 列 + user_spend_target/ai_dispatch_maintenance
+        # 种子 + 金额拒绝事件表，docs
+        # review-2026-09-02-upload-user-limits-admin-ui-cleanup.md §Batch B）。
+        "0029_user_total_allowances_and_denials.sql",
+        # Batch D2 追加 0030_site_visit_events.sql（匿名站点访问统计事件表，
+        # 90 天过期 + 去重唯一约束；docs 同上 §Batch D2 / §4.4）。
+        "0030_site_visit_events.sql",
+        # Batch C 追加 0031_max_steps_normalize.sql（遗留 >500 的
+        # ai_safety.platform_task_max_steps / own_task_max_steps_limit 显式
+        # 归一为 500 并写审计；§Batch C 实现要求 4）。
+        "0031_max_steps_normalize.sql",
     ]
 
 

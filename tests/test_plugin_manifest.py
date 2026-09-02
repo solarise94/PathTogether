@@ -374,6 +374,50 @@ def test_capability_tool_name_mangling():
 
 
 # --------------------------------------------------------------------------- #
+# wave 2（2026-09-03，review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
+# Batch C5-6/D1/E-3）：adminPermissions 枚举收敛——三个宿主常量同源，不得漂移。
+# --------------------------------------------------------------------------- #
+def test_manifest_admin_permissions_enum_wave2_locked():
+    """SDK 词表精确等于 wave 2 的 11 项；turn/acquisition/billing:write 全退。"""
+    assert M.MANIFEST_ADMIN_PERMISSIONS == (
+        "admin:overview:read",
+        "admin:users:read",
+        "admin:users:write",
+        "admin:invites:read",
+        "admin:invites:write",
+        "admin:billing:read",
+        "admin:audit:read",
+        "admin:plugins:read",
+        "admin:plugins:write",
+        "admin:settings:read",
+        "admin:settings:write",
+    )
+
+
+def test_manifest_admin_permissions_enum_no_retired_entries():
+    """turn read/write、acquisition read、billing write 不在枚举（含死枚举）。"""
+    for retired in ("admin:turn-budgets:read", "admin:turn-budgets:write",
+                    "admin:acquisition:read", "admin:billing:write"):
+        assert retired not in M.MANIFEST_ADMIN_PERMISSIONS
+    # 枚举含 settings read/write（此前 manifest.schema.json 漂移缺失的两项）
+    assert "admin:settings:read" in M.MANIFEST_ADMIN_PERMISSIONS
+    assert "admin:settings:write" in M.MANIFEST_ADMIN_PERMISSIONS
+
+
+def test_manifest_schema_json_admin_enum_in_sync_with_sdk():
+    """manifest.schema.json 的 adminPermissions enum 与 SDK 词表完全一致。"""
+    import json
+    schema_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "plugins", "manifest.schema.json")
+    with open(schema_path, "r", encoding="utf-8") as f:
+        schema = json.load(f)
+    enum = schema["properties"]["adminPermissions"]["items"]["enum"]
+    assert set(enum) == set(M.MANIFEST_ADMIN_PERMISSIONS)
+    assert len(enum) == len(M.MANIFEST_ADMIN_PERMISSIONS)
+
+
+# --------------------------------------------------------------------------- #
 # 5. capabilities 端点（需要 app + plugin JWT）
 # --------------------------------------------------------------------------- #
 @pytest.fixture(autouse=True)

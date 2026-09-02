@@ -27,6 +27,7 @@ BILLING_DIR = REPO_ROOT / "tests" / "fixtures" / "billing"
 _MIGRATION_0018 = REPO_ROOT / "migrations" / "0018_billing.sql"
 _MIGRATION_0022 = REPO_ROOT / "migrations" / "0022_billing_price_unit_fix.sql"
 _MIGRATION_0023 = REPO_ROOT / "migrations" / "0023_spend_policies_windows.sql"
+_MIGRATION_0029 = REPO_ROOT / "migrations" / "0029_user_total_allowances_and_denials.sql"
 
 #: 0023 种子策略（占位默认额度：demo 周池 50 CNY / 用户默认月 20 CNY /
 #: owner 月 1000 CNY；面值是 owner 待决策的占位默认，后台可改）
@@ -114,6 +115,51 @@ def seed_spend_policies(conn=None):
         conn = connect()
     try:
         _replay(conn, _MIGRATION_0023)
+    finally:
+        if own:
+            conn.close()
+
+
+def seed_spend_settings(conn=None):
+    """幂等重放 0029 种子（Batch B）：user_spend_target="window" +
+    ai_dispatch_maintenance=false（ai_spend_total_allowances/denial_events/
+    total_defaults 表结构无种子——面值由 cutover 写入）。
+
+    conftest 每用例 TRUNCATE platform_settings 会清掉这两个键；需要显式
+    target/维护闸状态的用例调用本函数（迁移文件是种子的唯一权威来源）。"""
+    own = conn is None
+    if own:
+        conn = connect()
+    try:
+        _replay(conn, _MIGRATION_0029)
+    finally:
+        if own:
+            conn.close()
+
+
+def set_user_spend_target(target, conn=None):
+    """【测试专用】直接写 platform_settings.user_spend_target。
+
+    生产路径只能走 settings_store.compare_and_set_setting（CAS；cutover
+    脚本），绝不允许无版本的 last-write-wins——本辅助绕过 CAS 仅用于测试
+    固定前置态（conftest TRUNCATE 后 seed 缺失时也用它快速置 target）。
+    """
+    import psycopg
+    import pg_store
+    if target not in ("window", "total_allowance"):
+        raise ValueError("target 需为 'window'|'total_allowance'")
+    own = conn is None
+    if own:
+        conn = connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO platform_settings (key, value, updated_at, "
+                    "updated_by) VALUES ('user_spend_target', %s, now(), "
+                    "'pytest') ON CONFLICT (key) DO UPDATE SET "
+                    "value=EXCLUDED.value, updated_at=now()",
+                    (psycopg.types.json.Jsonb(target),))
     finally:
         if own:
             conn.close()

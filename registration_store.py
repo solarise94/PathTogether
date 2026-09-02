@@ -44,14 +44,14 @@ from werkzeug.security import generate_password_hash
 import pg_store
 import platform_features
 import user_store
-# PR4 来源归因（docs/admin-billing-plugin-implementation-plan.md §11.2）：
-# 邀请可带 source_code/campaign_id；兑换事务内由 acquisition_store 写
-# user_acquisition（同 cursor 原子，见 redeem_invite）。
-import acquisition_store
-# 批次 D（docs ai-money-budget-bugfix-and-simplification-plan.md §5.2）：
-# 邀请模板可带 monthly_limit_nano_cny；兑换事务内为新用户建 user_override
-# 金额策略（spend_store.set_user_override_tx，同 cursor 原子）。spend_store
-# 不回依赖本模块，无循环导入。
+# Batch B（docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
+# §Batch B 数据模型 6）：来源归因与注册解耦——兑换事务**不再**调用
+# acquisition_store（user_acquisition 写路径冻结，站点统计故障绝不能阻断
+# 注册）；历史查询函数保留。旧 pt_acq cookie 不再被本模块读取。
+# 邀请模板金额字段从 monthly_limit_nano_cny 迁移为 total_limit_nano_cny：
+# 兑换事务内在同一 cursor 为新用户建一次性总额度
+# （spend_store.create_user_total_allowance_tx，source="invite"），
+# **不再创建 user_override**。spend_store 不回依赖本模块，无循环导入。
 import spend_store
 
 _log = logging.getLogger("svs.registration")
@@ -206,8 +206,11 @@ _INVITE_SEL = (
     "extract(epoch from consumed_at)::float8 AS consumed_at, "
     "consumed_by_user_id, extract(epoch from revoked_at)::float8 AS revoked_at, "
     "ai_access, cohort, note, source_code, campaign_id, "
-    "monthly_limit_nano_cny"
+    "monthly_limit_nano_cny, total_limit_nano_cny"
 )
+#: Batch B 起新邀请不再写入的退役列（列保留读取历史行；值为迁移前遗留）
+_RETIRED_INVITE_FIELDS = ("cohort", "source_code", "campaign_id",
+                          "monthly_limit_nano_cny")
 
 
 def _invite_out(row) -> dict:
@@ -215,11 +218,13 @@ def _invite_out(row) -> dict:
     out["ai_access"] = bool(out.get("ai_access"))
     if out.get("monthly_limit_nano_cny") is not None:
         out["monthly_limit_nano_cny"] = int(out["monthly_limit_nano_cny"])
+    if out.get("total_limit_nano_cny") is not None:
+        out["total_limit_nano_cny"] = int(out["total_limit_nano_cny"])
     return out
 
 
 def _validate_monthly_limit(monthly_limit_nano_cny):
-    """邀请模板月额度校验：None（继承默认）或非负整数 nano-CNY（bool 拒绝）。"""
+    """邀请模板月额度校验（Batch B 起仅为旧 wire 兼容读取；None/非负 int）。"""
     if monthly_limit_nano_cny is None:
         return None
     if isinstance(monthly_limit_nano_cny, bool) \
@@ -230,50 +235,65 @@ def _validate_monthly_limit(monthly_limit_nano_cny):
     return int(monthly_limit_nano_cny)
 
 
+def _validate_total_limit(total_limit_nano_cny):
+    """邀请模板总额度校验：None（由 cutover/默认处理）或非负整数 nano。"""
+    if total_limit_nano_cny is None:
+        return None
+    if isinstance(total_limit_nano_cny, bool) \
+            or not isinstance(total_limit_nano_cny, int) \
+            or total_limit_nano_cny < 0:
+        raise ValueError(
+            "total_limit_nano_cny 需为非负整数（nano-CNY）或 null")
+    return int(total_limit_nano_cny)
+
+
 def create_invite(created_by_user_id, login_id=None,
                   ttl_seconds=DEFAULT_INVITE_TTL_SECONDS,
                   ai_access=False, cohort="", note="",
                   source_code="", campaign_id=None,
-                  monthly_limit_nano_cny=None):
+                  monthly_limit_nano_cny=None,
+                  total_limit_nano_cny=None):
     """创建一次性邀请码。返回 dict：含**明文 token**（唯一出现处）与行信息。
+
+    Batch B（§4.4/§Batch B 数据模型 6）：邀请只负责注册——绑定登录账号、
+    有效期、AI access、初始 user 总额度、备注、状态；**不再携带来源**：
+
+    - ``source_code``/``campaign_id``/``cohort`` 参数**兼容保留但忽略并
+      弃用**（app.py wave 2 才改调用方；本波保持旧签名可调用）：不做 slug/
+      campaign 存在性校验，也**不写入 DB**（新邀请行三列为空/NULL）；
+    - ``total_limit_nano_cny``（新）：初始一次性总额度（nano-CNY 整数，
+      wire 层十进制字符串，路由层换算）；None = 该用户由 cutover 回填或
+      首个显式额度操作处理，兑换不建总额度行；
+    - ``monthly_limit_nano_cny``（旧）：兼容保留一个发布周期；与新字段
+      **同时传抛稳定 ValueError ``ambiguous_spend_limit``**（路由层映射
+      400）。值写入 total_limit 列（旧月窗口语义退役，面值按总额度兑现）。
 
     - token：``secrets.token_urlsafe(32)``；库内只存 invite_token_hash(token)；
     - login_id 给出时按 normalize_login_id 绑定——语义为「允许兑换的登录账号
-      login_id」（docs §8.2；原批次 B 参数名 email，批次 C 收口改名）；
-      None = 不绑定（owner 明确选择的高风险选项，UI 需标注）；
-    - ai_access/cohort/note 为邀请模板：兑换时决定新用户平台 AI 权限与分组；
-    - monthly_limit_nano_cny（批次 D §5.2）：None = 兑换用户继承全局
-      user_default；非 None = 兑换事务内为新用户建 user_override 月额度
-      （nano-CNY 整数，wire 层是十进制字符串，路由层换算）；
-    - source_code/campaign_id（PR4 §11.2）：邀请显式来源。campaign_id 必须是
-      已存在的 acquisition_campaigns 行（slug 校验 + 存在性检查，未知值
-      ValueError——owner API 应显式失败，不静默丢）；source_code 为可选 slug
-      （空 = 未指定）。两者参与兑换归因优先级最高（邀请码显式 campaign）。
+      login_id」（docs §8.2）；None = 不绑定（owner 明确选择的高风险选项）；
+    - ai_access/note 为邀请模板：兑换时决定新用户平台 AI 权限。
     """
     platform_features.require_pg_backend("registration_invites")
     if not isinstance(created_by_user_id, str) or not created_by_user_id:
         raise ValueError("created_by_user_id 不能为空")
     bound = normalize_login_id(login_id) if login_id else ""
     if login_id and not bound:
-        raise ValueError("绑定登录账号不能为空白")
+        raise ValueError("绑定登录账号不能为空")
     try:
         ttl = int(ttl_seconds)
     except (TypeError, ValueError):
         raise ValueError("ttl_seconds 需为整数")
     if ttl <= 0:
         raise ValueError("ttl_seconds 需为正整数")
-    cohort = str(cohort or "").strip()[:64]
     note = str(note or "").strip()[:200]
-    source_code = str(source_code or "").strip()
-    if source_code and not acquisition_store.valid_slug(source_code):
-        raise ValueError("source_code 需匹配 [a-z0-9_-]{1,64}")
-    campaign_id = (campaign_id or "").strip() or None
-    if campaign_id is not None:
-        if not acquisition_store.valid_slug(campaign_id):
-            raise ValueError("campaign_id 需匹配 [a-z0-9_-]{1,64}")
-        if acquisition_store.get_campaign(campaign_id) is None:
-            raise ValueError("campaign 不存在：%s" % campaign_id)
     monthly_limit = _validate_monthly_limit(monthly_limit_nano_cny)
+    total_limit = _validate_total_limit(total_limit_nano_cny)
+    if monthly_limit is not None and total_limit is not None:
+        raise ValueError(
+            "ambiguous_spend_limit：monthly_limit_nano_cny 与 "
+            "total_limit_nano_cny 只能传其一（旧月额度字段已退役）")
+    # 兼容期：旧字段面值按总额度兑现（月窗口语义退役）
+    effective_total = total_limit if total_limit is not None else monthly_limit
 
     for _ in range(5):  # token_hash 撞唯一键概率可忽略，重试兜底
         token = secrets.token_urlsafe(INVITE_TOKEN_BYTES)
@@ -287,26 +307,24 @@ def create_invite(created_by_user_id, login_id=None,
                         "INSERT INTO registration_invites "
                         "(invite_id, token_hash, login_id_normalized, "
                         " created_by_user_id, created_at, expires_at, "
-                        " max_uses, use_count, ai_access, cohort, note, "
-                        " source_code, campaign_id, monthly_limit_nano_cny) "
+                        " max_uses, use_count, ai_access, note, "
+                        " total_limit_nano_cny) "
                         "VALUES (%s,%s,%s,%s, now(), "
-                        " now() + (%s * interval '1 second'), 1, 0, %s, %s, "
-                        " %s, %s, %s, %s) "
+                        " now() + (%s * interval '1 second'), 1, 0, %s, "
+                        " %s, %s) "
                         "RETURNING " + _INVITE_SEL,
                         (invite_id, token_hash, bound or None,
-                         created_by_user_id, ttl, bool(ai_access), cohort,
-                         note, source_code, campaign_id, monthly_limit),
+                         created_by_user_id, ttl, bool(ai_access),
+                         note, effective_total),
                     )
                     row = cur.fetchone()
                     _insert_audit(
                         cur, "registration.invite_create", created_by_user_id,
                         "registration_invite", invite_id,
                         {"email_bound": bool(bound), "ai_access":
-                         bool(ai_access), "cohort": cohort,
+                         bool(ai_access),
                          "ttl_seconds": ttl,
-                         "source_code": source_code,
-                         "campaign_bound": campaign_id is not None,
-                         "monthly_limit_nano_cny": monthly_limit})
+                         "total_limit_nano_cny": effective_total})
         except psycopg.errors.UniqueViolation:
             continue  # finally 先关连接再重试
         finally:
@@ -398,18 +416,18 @@ def redeem_invite(token, login_id, password, display_name=None, acq=None):
     ``login_id`` 参数为兑换人自选的**登录账号**（docs §8.2；原批次 B 参数名
     email，批次 C 收口改名）。
 
-    ``acq``（PR4 §11.2，可选 dict）：注册请求携带的来源上下文
-    ``{visitor_id, utm_source, utm_medium, utm_campaign, referrer_domain}``
-    （路由层从已验签 pt_acq cookie 与请求头组装，值已 sanitize）。本事务内
-    经 acquisition_store.insert_user_acquisition 写 user_acquisition——
-    优先级：邀请码显式 campaign > 有效 pt_acq 触点 > sanitized referrer/UTM
-    > direct/unknown；**绝不**事后按 IP/login ID/邮箱模糊匹配。归因插入失败
-    与兑换同事务回滚（用户也不创建）。``acq=None`` 仍会写 direct 归因行
-    （老调用兼容）。
+    Batch B（§4.4/§Batch B 数据模型 6）：
 
-    批次 D §5.2：邀请模板 ``monthly_limit_nano_cny`` 非 NULL 时，本事务内
-    为新用户创建 user_override 月额度策略（None = 继承全局 user_default）。
-    override 写入失败同样整体回滚（invite 不消费、用户不创建）。
+    - ``acq`` 参数**兼容保留但忽略并弃用**（app.py wave 2 才改调用方）：本
+      事务不读取 pt_acq cookie 上下文、不调用 acquisition_store、**不写
+      user_acquisition**（写路径冻结）——站点统计故障绝不能阻断注册；
+    - 邀请模板金额非 NULL 时（新 ``total_limit_nano_cny`` 列；旧
+      ``monthly_limit_nano_cny`` 面值兼容读取），本事务内为新用户创建
+      **一次性总额度**行（spend_store.create_user_total_allowance_tx，
+      source=``invite``）——**不再创建 user_override**；写入失败同样整体
+      回滚（invite 不消费、用户不创建）；
+    - 新兑换 audit（registration.redeem）不含 source/campaign/cohort/acq
+      字段（历史 audit 不可变，照旧保留）。
 
     失败一律抛 ``InviteRedeemError``（对外统一 code
     ``invite_invalid_or_unavailable``）：
@@ -420,8 +438,10 @@ def redeem_invite(token, login_id, password, display_name=None, acq=None):
       - users 登录账号已存在（email_taken；此时 invite 未消费——检查先于
         UPDATE）；
     成功返回 ``{"user": <新用户公共 dict>, "invite_id": ..., "login_id": ...,
-    "acquisition": <归因行 dict|None>}``
-    （login_id 键即规范化登录账号；批次 C 起不再返回 "email" 键）。
+    "total_allowance": <总额度行 dict|None>, "acquisition": None,
+    "spend_override_policy": None}``
+    （login_id 键即规范化登录账号；``acquisition``/``spend_override_policy``
+    为兼容旧调用方形状的恒 None 弃用键，一个发布周期后移除）。
     成功审计在同一事务内（registration.redeem，actor=被创建 user_id）；失败审计
     在独立 best-effort 事务（主事务已随异常回滚），detail 只含 invite_id/status。
     """
@@ -446,7 +466,8 @@ def redeem_invite(token, login_id, password, display_name=None, acq=None):
                     "SELECT invite_id, token_hash, login_id_normalized, "
                     "extract(epoch from expires_at)::float8 AS expires_at, "
                     "max_uses, use_count, consumed_at, revoked_at, ai_access, "
-                    "cohort, source_code, campaign_id, monthly_limit_nano_cny "
+                    "cohort, source_code, campaign_id, monthly_limit_nano_cny,"
+                    " total_limit_nano_cny "
                     "FROM registration_invites WHERE token_hash=%s "
                     "FOR UPDATE",
                     (token_hash,))
@@ -492,41 +513,33 @@ def redeem_invite(token, login_id, password, display_name=None, acq=None):
                 if (cur.rowcount or 0) != 1:
                     # FOR UPDATE 下不可达；防御性回滚（CAS 失败=状态已变）
                     raise _RedeemFail("consumed")
-                # PR4 §11.2：user_acquisition 与兑换/建号/invite 消费同事务
-                # （同 cursor）。插入失败 → 整体回滚（用户也不创建）。
-                try:
-                    acquisition = acquisition_store.insert_user_acquisition(
-                        cur, user_id=user["user_id"], invite_id=invite_id,
-                        invite_campaign_id=row["campaign_id"],
-                        invite_source_code=row["source_code"] or "",
-                        acq=acq)
-                except Exception:
-                    _log.warning(
-                        "user_acquisition 写入失败（整体回滚，不建号）",
-                        exc_info=True)
-                    raise
-                # 批次 D §5.2：邀请模板带月额度时，override 策略也在**同一
-                # 事务**内创建（spend_store.set_user_override_tx 同 cursor；
-                # 其 audit 与本事务共提交）。失败 → 整体回滚（invite 不消费、
-                # 用户不创建）。None = 继承全局 user_default，不建行。
-                override_policy = None
-                if row["monthly_limit_nano_cny"] is not None:
+                # Batch B：邀请模板带初始额度时，一次性总额度也在**同一事务**
+                # 内创建（spend_store.create_user_total_allowance_tx 同
+                # cursor；其 audit 与本事务共提交）。失败 → 整体回滚（invite
+                # 不消费、用户不创建）。None = 不建行（由 cutover/默认处理）。
+                # 旧 monthly 列面值兼容读取（退役字段只读一个发布周期）。
+                invite_limit = (row["total_limit_nano_cny"]
+                                if row["total_limit_nano_cny"] is not None
+                                else row["monthly_limit_nano_cny"])
+                allowance = None
+                if invite_limit is not None:
                     try:
-                        override_policy = spend_store.set_user_override_tx(
-                            cur, user["user_id"],
-                            int(row["monthly_limit_nano_cny"]),
+                        allowance = spend_store.create_user_total_allowance_tx(
+                            cur, user["user_id"], int(invite_limit),
+                            source="invite",
                             updated_by="invite:" + invite_id)
                     except Exception:
                         _log.warning(
-                            "邀请模板月额度 override 写入失败（整体回滚，"
-                            "不建号不消费邀请）", exc_info=True)
+                            "邀请模板总额度写入失败（整体回滚，不建号不消费"
+                            "邀请）", exc_info=True)
                         raise
                 _audit_redeem(cur, invite_id, "success",
                               created_user_id=user["user_id"])
         return {"user": user, "invite_id": invite_id,
                 "login_id": norm_login,
-                "acquisition": acquisition,
-                "spend_override_policy": override_policy}
+                "total_allowance": allowance,
+                "acquisition": None,          # Batch B：归因退役，恒 None
+                "spend_override_policy": None}  # Batch B：override 退役，恒 None
     except _RedeemFail as exc:
         _audit_redeem_best_effort(fail_invite_id, exc.reason)
         raise InviteRedeemError(exc.reason)

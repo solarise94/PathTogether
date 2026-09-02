@@ -31,17 +31,29 @@ os.environ["ADMIN_PASSWORD"] = ""
 import pytest  # noqa: E402
 
 import share_store  # noqa: E402
+import slide_io  # noqa: E402
 import user_store  # noqa: E402
 import upload_guard  # noqa: E402
 import app as app_mod  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
 from _pt_helpers import csrf_client, install_json_login_limits, isolate_app, clear_upload_dir # noqa: E402
+from _tiff_fixtures import make_ome_tiff_bytes, make_tiff_bytes  # noqa: E402
 
 
 pg_only = pytest.mark.skipif(
     BACKEND != "postgres", reason="上传配额需 PG（RUN_PG_TESTS=1）")
 json_only = pytest.mark.skipif(
     BACKEND != "json", reason="json 后端 fail-closed 行为仅在 json 模式断言")
+
+
+# A0 异常契约后的验证 stub：成功返回 None / 失败抛 SlideValidationError，
+# 签名兼容 format_hint 关键字（替代旧 lambda p: True/False 布尔契约）
+def _validate_ok(path, **_):
+    return None
+
+
+def _validate_bad(path, **_):
+    raise slide_io.SlideValidationError("invalid_slide", "无效的切片文件")
 
 
 @pytest.fixture(autouse=True)
@@ -143,7 +155,7 @@ def test_disk_watermark_check():
 # 2. 端点（json/postgres 共同行为：单请求上限 + 原子提升 + 统一 409 + 水位）
 # =========================================================================== #
 def test_upload_success_uses_uploading_tmp_then_atomic(monkeypatch):
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     r = _upload(_client(), name="ok.svs", size=128)
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.get_json()["name"] == "ok.svs"
@@ -163,7 +175,7 @@ def test_upload_stream_over_limit_413_no_residue(monkeypatch):
 
 def test_upload_werkzeug_layer_413(monkeypatch):
     """第一层（MAX_CONTENT_LENGTH）：CL 超限在读体前/中即拒，稳定 JSON 信封。"""
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     monkeypatch.setitem(app_mod.app.config, "MAX_CONTENT_LENGTH", 1000)
     r = _upload(_client(), name="big2.svs", size=5000)
     assert r.status_code == 413
@@ -173,7 +185,7 @@ def test_upload_werkzeug_layer_413(monkeypatch):
 
 def test_upload_conflict_unified_409_no_name_leak(monkeypatch):
     """目标已存在 → 统一「名称不可用」，不回显冲突文件名（docs §3.12）。"""
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     (Path(UPLOAD_DIR) / "dup.svs").write_bytes(b"existing")
     r = _upload(_client(), name="dup.svs", size=10)
     assert r.status_code == 409
@@ -184,15 +196,41 @@ def test_upload_conflict_unified_409_no_name_leak(monkeypatch):
 
 
 def test_upload_invalid_slide_cleans_up(monkeypatch):
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: False)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_bad)
     r = _upload(_client(), name="bad.svs", size=32)
     assert r.status_code == 400
+    assert r.get_json()["code"] == "invalid_slide"  # A0 稳定机器码
     assert not (Path(UPLOAD_DIR) / "bad.svs").exists()
     assert _residue() == []
 
 
+# =========================================================================== #
+# 2.5 真 TIFF 端到端（A0：V1 验证不 monkeypatch，真实字节走 .part+hint）
+# =========================================================================== #
+def test_upload_real_tiff_end_to_end_no_monkeypatch():
+    """真 TIFF 经 V1（.part 临时名 + 净化名 hint）真验证后提升，中文空格名。"""
+    tiff = make_tiff_bytes()
+    name = "0702-L2-2 鼠奥球.tiff"
+    r = _upload(_client(), name=name, content=tiff)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.get_json()["name"] == name
+    dest = Path(UPLOAD_DIR) / name
+    assert dest.read_bytes() == tiff
+    assert _residue() == []
+
+
+def test_upload_real_garbage_tiff_rejected_with_stable_code():
+    """垃圾字节伪装 .tif：真验证（无 monkeypatch）→ 400 invalid_slide，清理。"""
+    r = _upload(_client(), name="junk.tif", content=b"\x00not-a-tiff" * 8)
+    assert r.status_code == 400
+    j = r.get_json()
+    assert j["code"] == "invalid_slide"
+    assert not (Path(UPLOAD_DIR) / "junk.tif").exists()
+    assert _residue() == []
+
+
 def test_upload_disk_watermark_507(monkeypatch):
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 10 ** 15)
     r = _upload(_client(), name="wm.svs", size=16)
     assert r.status_code == 507
@@ -202,7 +240,7 @@ def test_upload_disk_watermark_507(monkeypatch):
 
 def test_upload_owner_role_skips_quota(monkeypatch):
     """owner（有 user_id）不走配额——两种后端一致（本地开发语义不变）。"""
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client(auth=True)
     _user_session(c, role="owner")
     r = _upload(c, name="own.svs", size=32)
@@ -343,7 +381,7 @@ def test_expired_reservation_reclaimed_on_next_reserve(monkeypatch):
 def test_endpoint_quota_denied_and_released(monkeypatch):
     uid = user_store.create_user("q8@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid, 1000)
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client(auth=True)
     with c.session_transaction() as sess:
         sess["auth_user"] = True
@@ -364,7 +402,7 @@ def test_endpoint_quota_denied_and_released(monkeypatch):
 def test_endpoint_success_consumes_actual_bytes(monkeypatch):
     uid = user_store.create_user("q9@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid, 10 ** 7)
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client(auth=True)
     with c.session_transaction() as sess:
         sess["auth_user"] = True
@@ -387,7 +425,7 @@ def test_endpoint_inflight_429(monkeypatch):
     # 在途上限压到 1，并预先占满名额
     monkeypatch.setattr(upload_guard, "UPLOAD_MAX_INFLIGHT", 1)
     upload_guard.reserve_upload(uid, 100)
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client(auth=True)
     with c.session_transaction() as sess:
         sess["auth_user"] = True
@@ -408,7 +446,7 @@ def test_endpoint_zip_failure_releases_reservation(monkeypatch):
     import zipfile
     uid = user_store.create_user("q11@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid, 10 ** 9)
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client(auth=True)
     with c.session_transaction() as sess:
         sess["auth_user"] = True
@@ -433,7 +471,7 @@ def test_endpoint_zip_failure_releases_reservation(monkeypatch):
 @json_only
 def test_json_backend_user_upload_fail_closed(monkeypatch):
     """json 后端 + role=user：配额不可用 → 503（与 POST /login 同哲学）。"""
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client(auth=True)
     _user_session(c, role="user")
     r = _upload(c, name="j.svs", size=16)

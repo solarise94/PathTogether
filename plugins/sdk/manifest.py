@@ -46,11 +46,11 @@ MANIFEST_PERMISSIONS = (
 # 可选 ``adminPermissions`` 数组的枚举——admin 插件申请的管理能力，与
 # AdminBridge method→permission 映射表一一对应（app.py 与
 # static/admin-host.js 各自持有同源常量，三处不得漂移）。
-# PR5 修订补入 admin:plugins:read/write（§10.2 身份预览入口与插件管理页的
-# parity 恢复：插件列表/健康/启停/凭证轮换走独立权限，不复用 users/billing）。
-# 批次 D（docs ai-money-budget-bugfix-and-simplification-plan.md §6.5）补入
-# admin:settings:read/write（统一设置页：注册模式/金额策略额度/enforcement
-# 模式/运行时安全参数的读取与受审计写入）。
+# 2026-09-03 wave 2（review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
+# §4/Batch C5-6/D1）：删除 admin:turn-budgets:read、admin:turn-budgets:write
+#（早已无 manifest 消费者的死枚举）、admin:billing:write（人工调账/caps 写
+# 入口退役）与 admin:acquisition:read（用户归因退役）；站点访问/Demo 周统计
+# 复用 admin:overview:read，不再扩权限域。
 # 注意：申请不建立信任——admin 插件信任由 PRIVILEGED_ADMIN_PLUGIN_IDS 白名单 +
 # source-policy 显式 sha256 pin + manifest hash 精确匹配 + installation enabled
 # 共同判定，永远 fail-closed（app.py _admin_plugin_trusted）。
@@ -60,11 +60,7 @@ MANIFEST_ADMIN_PERMISSIONS = (
     "admin:users:write",
     "admin:invites:read",
     "admin:invites:write",
-    "admin:turn-budgets:read",
-    "admin:turn-budgets:write",
     "admin:billing:read",
-    "admin:billing:write",
-    "admin:acquisition:read",
     "admin:audit:read",
     "admin:plugins:read",
     "admin:plugins:write",
@@ -437,7 +433,7 @@ def validate_manifest(d):
 
     # ---- adminPermissions（可选，Manifest v1.1，docs §8.2）----
     # 未声明 → 完全不受影响（旧 manifest 零迁移）；声明则必须是数组且逐项落在
-    # 13 项管理枚举内。admin 权限与普通 permissions 分开声明，避免 viewer 插件
+    # 11 项管理枚举内。admin 权限与普通 permissions 分开声明，避免 viewer 插件
     # 语义混杂；申请本身不建立信任（见 MANIFEST_ADMIN_PERMISSIONS 注释）。
     admin_perms = d.get("adminPermissions")
     if admin_perms is not None:

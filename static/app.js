@@ -30,6 +30,9 @@
     "upload.err.state_conflict": { zh: "上传任务状态冲突，请刷新页面后重试", en: "Upload task state conflict, please refresh and retry" },
     "upload.err.use_legacy": { zh: "ZIP/MRXS 请使用单请求上传", en: "ZIP/MRXS must use the single-request upload" },
     "upload.err.invalid_slide": { zh: "文件校验失败：不是有效的切片文件", en: "Validation failed: not a valid slide file" },
+    // 上传修复 A0：新增稳定机器码的中文文案（保留机器码供排障）
+    "upload.err.slide_open_unsupported": { zh: "文件格式不受支持：服务端无法按切片格式打开该文件", en: "Unsupported format: the server cannot open this file as a slide" },
+    "upload.err.slide_open_failed": { zh: "切片解析失败：文件可能损坏或不完整，请重试上传", en: "Slide parsing failed: the file may be corrupted or incomplete, please retry" },
     "upload.err.commit_retry": { zh: "服务端校验暂时失败，请稍后重试提交", en: "Server validation failed temporarily, retry commit later" },
     "upload.err.size_mismatch": { zh: "文件大小与声明不符，请重新上传", en: "File size mismatch, please re-upload" },
     "upload.err.resume": { zh: "上传中断；刷新页面后将从断点续传", en: "Upload interrupted; refresh to resume from breakpoint" },
@@ -3504,6 +3507,8 @@
     if (code === "upload_state_conflict") return tt("upload.err.state_conflict");
     if (code === "use_legacy_upload") return tt("upload.err.use_legacy");
     if (code === "invalid_slide") return tt("upload.err.invalid_slide");
+    if (code === "slide_open_unsupported") return tt("upload.err.slide_open_unsupported");
+    if (code === "slide_open_failed") return tt("upload.err.slide_open_failed");
     if (code === "commit_retryable") return tt("upload.err.commit_retry");
     if (code === "size_mismatch") return tt("upload.err.size_mismatch");
     if (code === "upload_too_large" || status === 413) return tt("upload.err.too_large");
@@ -3585,11 +3590,24 @@
   }
 
   // ---------- Upload V2：分片续传（U3；docs/upload-resumable-fix-plan §3） ----------
-  // 阈值与后端 UPLOAD_CHUNK_THRESHOLD 默认对齐（128MiB）；ZIP/MRXS 留旧接口
-  // （§3.4 首版只支持单文件 WSI）。分片严格串行单并发（§3.2.2），每片算
+  // 阈值唯一权威来源是服务端 UPLOAD_V2_THRESHOLD_BYTES，经模板 bootstrap
+  // （HP_APP_BOOTSTRAP.capabilities.upload_v2_threshold_bytes）下发（上传修复
+  // A1，替换旧前端 128MiB 硬编码双来源）；解析失败回落 16MiB。ZIP/MRXS 留旧
+  // 接口（§3.4 首版只支持单文件 WSI）。分片严格串行单并发（§3.2.2），每片算
   // SHA-256（Web Crypto 对该片 ArrayBuffer，不整文件入内存）；offset 以服务端
   // confirmed_offset 为权威，offset_mismatch 时对齐重传（§3.2.1）。
-  var UPLOAD_V2_THRESHOLD = 128 * 1024 * 1024;
+  var UPLOAD_V2_THRESHOLD_FALLBACK = 16 * 1024 * 1024;
+
+  function resolveUploadV2Threshold() {
+    try {
+      var caps = window.HP_APP_BOOTSTRAP && window.HP_APP_BOOTSTRAP.capabilities;
+      var n = caps && Number(caps.upload_v2_threshold_bytes);
+      if (typeof n === "number" && isFinite(n) && n > 0) return n;
+    } catch (e) { /* bootstrap 缺失/畸形：回落 */ }
+    return UPLOAD_V2_THRESHOLD_FALLBACK;
+  }
+
+  var UPLOAD_V2_THRESHOLD = resolveUploadV2Threshold();
 
   function shouldChunkUpload(file) {
     if (!file || typeof file.size !== "number") return false;
@@ -3757,9 +3775,11 @@
       } else {
         msg = uploadErrorMessage({ status: status }, data);
       }
-      // 确定性失败（§3.1）：原任务不可再用，清恢复记录（下次全新上传）
+      // 确定性失败（§3.1）：原任务不可再用，清恢复记录（下次全新上传）；
+      // A0 新增 slide_open_* 稳定码同属确定性失败
       var code = data && data.code;
       if (code === "hash_mismatch" || code === "invalid_slide" ||
+          code === "slide_open_unsupported" || code === "slide_open_failed" ||
           code === "name_unavailable" || code === "size_mismatch") {
         try { localStorage.removeItem(key); } catch (e) { /* 同上 */ }
       }

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """切片 I/O 抽象层。
 
-提供 ``open_slide(path)`` 工厂：优先用 OpenSlide 打开厂商格式
+提供 ``open_slide(path, *, format_hint=None)`` 工厂：优先用 OpenSlide 打开厂商格式
 （SVS/NDPI/MRXS 等）；失败且为 TIFF 类（含 OME-TIFF）时回退到
 ``TiffFileSlide``（基于 tifffile + zarr<3 实现 OpenSlide API 子集）。
 
@@ -29,14 +29,122 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-# TIFF 扩展名（含 OME-TIFF 前缀）
-_TIFF_EXTS = {".tif", ".tiff", ".ome.tif", ".ome.tiff"}
+# --------------------------------------------------------------------------- #
+# 逻辑格式识别与稳定错误契约（上传修复 A0）
+# --------------------------------------------------------------------------- #
+#: 逻辑扩展名词表。与 app.SUPPORTED_EXTS 同集（slide_io 是底层模块，不反向
+#: import app，故此处自带常量；两处需同步维护）。**按长度降序**排列以保证
+#: 最长匹配（``x.ome.tiff`` 识别为 ``.ome.tiff`` 而非 ``.tiff``）。
+LOGICAL_EXTS = (
+    ".ome.tiff", ".ome.tif",
+    ".svslide",
+    ".tiff", ".ndpi", ".mrxs",
+    ".svs", ".vms", ".vmu", ".scn", ".bif", ".tif",
+)
+
+#: 其中的 TIFF 类（走 OME 优先 / TiffFileSlide fallback 的子集）
+_TIFF_LOGICAL_EXTS = frozenset((".ome.tiff", ".ome.tif", ".tiff", ".tif"))
+
+#: SlideValidationError.code 的固定词表
+VALID_SLIDE_ERROR_CODES = frozenset((
+    "invalid_slide", "slide_open_unsupported", "slide_open_failed",
+))
+
+
+class SlideValidationError(ValueError):
+    """切片验证失败（携带稳定机器码，供路由映射统一的 HTTP/JSON 契约）。
+
+    code 固定为 :data:`VALID_SLIDE_ERROR_CODES` 之一：
+      - ``invalid_slide``：逻辑格式不在允许列表，或字节明显无效
+        （tifffile 拒绝把字节当 TIFF 解析等）；
+      - ``slide_open_unsupported``：OpenSlide 与允许的 TIFF fallback 都明确
+        表示不支持该格式；
+      - ``slide_open_failed``：解析器/IO 在允许格式内异常（损坏、截断、
+        读取失败、未知异常等）。
+
+    ``cause_type`` 是底层异常类型名（只进日志，不透出给前端）。
+    兼容历史：继承 ValueError，脚本型调用方（import_slides）按 ValueError
+    捕获仍成立。
+    """
+
+    def __init__(self, code, message=None, *, cause_type=None):
+        super().__init__(message or code)
+        self.code = code if code in VALID_SLIDE_ERROR_CODES else "slide_open_failed"
+        self.cause_type = cause_type or ""
+
+
+def logical_format_ext(name) -> str:
+    """从逻辑文件名识别支持的切片扩展名（最长匹配）；不支持返回 ``""``。
+
+    只做**字符串级**判定，不触碰文件系统：输入通常是已净化的 basename
+    （V1 ``safe`` / V2 ``safe_name``），也可以是完整路径（取最后一段 basename，
+    供 ZIP 成员的真实相对路径/绝对路径使用）。显式拒绝：NUL 字节、URL
+    （``scheme://``）、目录样式（以路径分隔符结尾）、MIME 字符串
+    （形如 ``image/tiff``——basename 无点后缀，天然不匹配）。
+    """
+    if name is None:
+        return ""
+    s = str(name)
+    if not s or "\x00" in s or "://" in s:
+        return ""
+    if s.endswith("/") or s.endswith("\\"):
+        return ""  # 目录样式
+    base = s.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    for ext in LOGICAL_EXTS:  # 已按长度降序：最长匹配优先
+        if base.endswith(ext):
+            return ext
+    return ""
 
 
 def _suffix_tiff(path) -> bool:
     """判断路径是否为 TIFF 类（含 .ome.tif/.ome.tiff）。"""
-    p = str(path).lower()
-    return any(p.endswith(ext) for ext in _TIFF_EXTS)
+    return logical_format_ext(path) in _TIFF_LOGICAL_EXTS
+
+
+# 底层异常 → 稳定错误码的分类信号 ------------------------------------------------
+def _exc_kind(e) -> str:
+    """把底层打开异常归类为 ``unsupported`` / ``invalid_bytes`` / ``other``。
+
+    - openslide 的 ``OpenSlideUnsupportedFormatError``（按类型名识别，避免
+      依赖 openslide 已安装）：解析器明确不支持该格式；
+    - tifffile 的 ``TiffFileError``：字节根本无法按 TIFF 解析 → 字节明显无效；
+    - 其余（IOError、stub/缺库、解析中途损坏等）：other。
+    """
+    cls = type(e)
+    name = cls.__name__
+    mod = (getattr(cls, "__module__", "") or "").lower()
+    if "openslide" in mod and "unsupportedformat" in name.lower():
+        return "unsupported"
+    if "tifffile" in mod and name == "TiffFileError":
+        return "invalid_bytes"
+    return "other"
+
+
+def _classify_open_failure(verdicts):
+    """全部打开尝试失败后的稳定错误码裁定。
+
+    ``verdicts`` 是 ``[(kind, exc), ...]``。规则（与 SlideValidationError
+    docstring 的码表一致）：
+      1. 任一尝试给出"字节明显无效"信号 → ``invalid_slide``；
+      2. 至少一次尝试且全部是"明确不支持"→ ``slide_open_unsupported``；
+      3. 其余（损坏/截断/IO/缺库/未知）→ ``slide_open_failed``。
+    ``cause_type`` 取分类信号最强（invalid_bytes > unsupported > other）的
+    首个异常类型名；只进日志，不透出给前端。返回 ``(code, cause_type)``。
+    """
+    kinds = [k for k, _e in verdicts]
+    cause = ""
+    for priority in ("invalid_bytes", "unsupported", "other"):
+        for k, e in verdicts:
+            if k == priority and e is not None:
+                cause = type(e).__name__
+                break
+        if cause:
+            break
+    if "invalid_bytes" in kinds:
+        return "invalid_slide", cause
+    if verdicts and all(k == "unsupported" for k in kinds):
+        return "slide_open_unsupported", cause
+    return "slide_open_failed", cause
 
 
 def _is_ome_tiff(path) -> bool:
@@ -50,7 +158,7 @@ def _is_ome_tiff(path) -> bool:
         return False
 
 
-def open_slide(path):
+def open_slide(path, *, format_hint=None):
     """工厂函数：打开切片，返回 OpenSlide 或 TiffFileSlide。
 
     策略（TIFF 类文件，含 .ome.tif/.ome.tiff）：
@@ -60,30 +168,50 @@ def open_slide(path):
     2. 其余 TIFF 先试 openslide.OpenSlide（lazy import，使无 openslide
        库的机器也能单独使用 TiffFileSlide），失败回退 TiffFileSlide；
     3. OME-TIFF 若 TiffFileSlide 失败（异形 axes 等），回退 OpenSlide 保底。
-    都失败抛出最后一个异常。
-    """
-    last_exc = None
 
-    if _suffix_tiff(path) and _is_ome_tiff(path):
+    上传修复 A0：
+    - **实际字节永远从 ``path`` 读取**；``format_hint`` 只参与逻辑格式判定
+      （V1 把文件暂存为 ``.uploading-*.part``：调用方传净化后的原始 basename；
+      V2 传 task 的 ``safe_name``。``.part`` 后缀本身永远不参与判定）。
+    - OME 优先分支与普通 TIFF fallback **都**按 ``format_hint or path`` 的
+      逻辑扩展名判定（修复只看 ``.part`` 后缀导致两个 TIFF 分支都被跳过、
+      仅剩 OpenSlide 尝试的问题）。
+    - 失败抛 :class:`SlideValidationError`（稳定机器码，见其 docstring），
+      不再透出裸底层异常；分类规则见 :func:`_classify_open_failure`。
+    """
+    ext = logical_format_ext(format_hint if format_hint else path)
+    if not ext:
+        raise SlideValidationError(
+            "invalid_slide", "不支持的切片格式（按逻辑文件名判定）",
+            cause_type="LogicalFormatRejected")
+    if os.path.isdir(str(path)):
+        raise SlideValidationError(
+            "invalid_slide", "切片路径是目录", cause_type="IsADirectoryError")
+
+    verdicts = []  # [(kind, exc)]：每次失败尝试的分类信号
+
+    if ext in _TIFF_LOGICAL_EXTS and _is_ome_tiff(str(path)):
         try:
             return TiffFileSlide(path)
         except Exception as e:  # noqa: BLE001
-            last_exc = e
+            verdicts.append((_exc_kind(e), e))
 
     try:
         import openslide  # lazy import
 
         return openslide.OpenSlide(str(path))
     except Exception as e:  # noqa: BLE001  OpenSlide 可能抛各种底层异常
-        last_exc = e
+        verdicts.append((_exc_kind(e), e))
 
-    if _suffix_tiff(path):
+    if ext in _TIFF_LOGICAL_EXTS:
         try:
             return TiffFileSlide(path)
         except Exception as e:  # noqa: BLE001
-            last_exc = e
+            verdicts.append((_exc_kind(e), e))
 
-    raise last_exc
+    code, cause = _classify_open_failure(verdicts)
+    raise SlideValidationError(
+        code, "切片打开失败（%s）" % code, cause_type=cause)
 
 
 # --------------------------------------------------------------------------- #

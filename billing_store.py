@@ -368,6 +368,22 @@ def _spend():
     return spend_store
 
 
+def _resolve_spend_target_tx(cur, spend, subject_type) -> str:
+    """主体 → 预算目标种类（Batch B：明确的 spend_target 抽象）。
+
+    - ``owner`` / ``demo``：恒 ``"window"``（owner 独立月策略、demo 周窗口，
+      不受 user_spend_target 影响，§3.1）；
+    - ``user``：读 ``platform_settings.user_spend_target``（缺/非法回退
+      "window"，见 spend_store.get_user_spend_target_tx）。
+
+    authorize / ingest 投影 / settle 归还共用本解析；settle/release/expire
+    归还仍以 hold 行上保存的目标列为准（本函数只决定**新**授权落哪类目标）。
+    """
+    if subject_type == "user":
+        return spend.get_user_spend_target_tx(cur)
+    return "window"
+
+
 def _connect():
     """建连接并设 dict_row（本模块所有查询按列名访问）。"""
     conn = pg_store.connect()
@@ -1019,17 +1035,21 @@ def _apply_real_usage_debit_tx(cur, event, *, subject_type, user_id, status,
 
 def _project_window_spent_tx(cur, *, subject_type, subject_id, occurred,
                              charge):
-    """窗口 spent 投影（§3.2/§3.4.4/§3.4.5，批次 C）。
+    """预算目标 spent 投影（§3.2/§3.4.4/§3.4.5，批次 C；Batch B 扩展）。
 
-    priced 事件的 charge 计入**事件发生时刻**所属窗口（与对账器
-    ``reconcile_spend_windows`` 的 expected 口径一致：spent 按事件归窗，
-    不按 authorize 归窗——月界/周边界附近二者可能不同，reserved 归还才用
-    hold.spend_window_id 快照）。demo 主体经 ``_get_or_create_window_tx``
-    归一到 demo_global 周窗口。
+    priced 事件的 charge 计入**事件发生时刻**所属预算目标（与对账器
+    ``reconcile_spend_windows`` / ``reconcile_total_allowances`` 的 expected
+    口径一致：spent 按事件归目标，不按 authorize 归目标——边界附近二者可能
+    不同，reserved 归还才用 hold 上的目标快照）。demo 主体经
+    ``_get_or_create_window_tx`` 归一到 demo_global 周窗口；user 主体按
+    ``user_spend_target`` 分流：``total_allowance`` → 记入该 user 的
+    ai_spend_total_allowances 行（无窗口边界、不轮换），``window`` → 窗口
+    路径（cutover 前语义不变）。
 
-    **失败语义**：策略缺失/窗口异常只记 warning + 返回 None，**不阻断计量**
-    （真实成本不得因投影问题丢失，§3.4.7 精神）——窗口欠计由对账器报 drift。
-    事件级幂等由调用方（ingest 内核 dedup）保证：同一事件行只投影一次。
+    **失败语义**：策略缺失/窗口/总额度行异常只记 warning + 返回 None，
+    **不阻断计量**（真实成本不得因投影问题丢失，§3.4.7 精神）——投影欠计
+    由对账器报 drift。事件级幂等由调用方（ingest 内核 dedup）保证：同一
+    事件行只投影一次。
     """
     spend = _spend()
     if charge is None or int(charge) == 0:
@@ -1048,6 +1068,18 @@ def _project_window_spent_tx(cur, *, subject_type, subject_id, occurred,
                 _LOG.warning("[billing-window] cutover 前旧价格事件跳过窗口"
                              "投影 subject_type=%s", subject_type)
                 return None
+        if subject_type == "user" and _resolve_spend_target_tx(
+                cur, spend, subject_type) == "total_allowance":
+            cur.execute(
+                "SELECT allowance_id FROM ai_spend_total_allowances "
+                "WHERE subject_id=%s", (subject_id,))
+            arow = cur.fetchone()
+            if arow is None:
+                _LOG.warning("[billing-window] 总额度行缺失，spent 投影跳过"
+                             " subject_id=%s", subject_id)
+                return None
+            return spend.total_allowance_add_spent_tx(
+                cur, arow["allowance_id"], int(charge))
         window = spend._get_or_create_window_tx(
             cur, subject_type, subject_id, occurred)
         return spend.window_add_spent_tx(cur, window["window_id"],
@@ -1253,8 +1285,14 @@ def _ingest_usage_event_tx(cur, event, *, installation_id, plugin_id,
     }
     audit_detail.update(debit_detail)
     if window_projection is not None:
+        # Batch B：投影目标可为窗口（window_id）或总额度行（allowance_id）；
+        # audit 统一记 target_id/target_kind，窗口形态保留 window_id 键兼容
         audit_detail["window_projection"] = {
-            "window_id": window_projection["window_id"],
+            "window_id": (window_projection.get("window_id")
+                          if "window_id" in window_projection else None),
+            "allowance_id": (window_projection.get("allowance_id")
+                             if "allowance_id" in window_projection
+                             else None),
             "spent_nano_cny": int(window_projection["spent_nano_cny"]),
         }
     cur.execute(
@@ -1377,8 +1415,8 @@ _HOLD_SEL = (
     "hold_id, call_id, account_id, subject_type, subject_id, installation_id, "
     "session_id, model, estimated_nano_cny, balance_nano_cny, would_deny, "
     "status, event_id, created_at, settled_at, expires_at, metadata, "
-    "spend_window_id, reserved_nano_cny, actual_nano_cny, enforcement_mode, "
-    "denial_reason"
+    "spend_window_id, spend_total_allowance_id, reserved_nano_cny, "
+    "actual_nano_cny, enforcement_mode, denial_reason"
 )
 
 #: authorize/settle 事务内惰性回收的过期计数指标（单行 JSON 日志，仿
@@ -1541,21 +1579,26 @@ def _hold_out(row) -> dict:
 
 def _expire_stale_holds_tx(cur, now):
     """同事务惰性回收（§12.3 + 批次 C §3.4.7）：过期 open hold 标 expired
-    并**归还其窗口预占**（reserved_nano_cny → 所属窗口 reserved -=，夹 0）。
+    并**归还其预算目标预占**（reserved_nano_cny → 按 hold 上保存的目标
+    归还——spend_window_id 走窗口、spend_total_allowance_id 走总额度，
+    不按当前策略重新解析，Batch B §Batch B 原子授权与结算 2；夹 0）。
 
     - 没有 daemon——回收挂在每次 authorize/settle 的事务上（量级足够；
       索引 idx_billing_holds_expiry 支撑该扫描）；
     - 先按 hold_id **有序** FOR UPDATE 锁待回收行再逐行终局化：两个并发
       回收事务以相同顺序拿锁，避免批量 UPDATE 乱序死锁；
-    - 0024 之前的旧行（spend_window_id/reserved NULL）只改状态不动窗口；
-    - 归还用 :func:`spend_store.window_release_tx`（clamped，保 reserved>=0
-      并对漂移记指标）；本函数是「安全副作用」——挂在业务 SAVEPOINT 之外，
-      业务拒绝不连带回滚回收（幂等，与批次 B 纪律一致）；
+    - 0024/0029 之前的旧行（spend_window_id/spend_total_allowance_id/
+      reserved NULL）只改状态不动投影；
+    - 归还用 :func:`spend_store.window_release_tx` /
+      :func:`spend_store.total_allowance_release_tx`（clamped，保
+      reserved>=0 并对漂移记指标）；本函数是「安全副作用」——挂在业务
+      SAVEPOINT 之外，业务拒绝不连带回滚回收（幂等，与批次 B 纪律一致）；
     - 回收后迟到的合法 usage event 仍由 settle 的 expired 分支记实际消费
       （§3.4.7：真实成本不因 hold 过期被丢弃，且不二次归还 reserved）。
     """
     cur.execute(
-        "SELECT hold_id, spend_window_id, reserved_nano_cny "
+        "SELECT hold_id, spend_window_id, spend_total_allowance_id, "
+        "reserved_nano_cny "
         "FROM billing_holds WHERE status='open' AND expires_at < %s "
         "ORDER BY hold_id FOR UPDATE", (now,))
     stale = cur.fetchall()
@@ -1566,11 +1609,15 @@ def _expire_stale_holds_tx(cur, now):
         cur.execute(
             "UPDATE billing_holds SET status='expired' "
             "WHERE hold_id=%s AND status='open'", (row["hold_id"],))
-        if row["spend_window_id"] is not None \
-                and row["reserved_nano_cny"] is not None \
-                and int(row["reserved_nano_cny"]) > 0:
-            spend.window_release_tx(cur, row["spend_window_id"],
-                                    int(row["reserved_nano_cny"]))
+        if row["reserved_nano_cny"] is None \
+                or int(row["reserved_nano_cny"]) <= 0:
+            continue
+        reserved = int(row["reserved_nano_cny"])
+        if row["spend_window_id"] is not None:
+            spend.window_release_tx(cur, row["spend_window_id"], reserved)
+        elif row["spend_total_allowance_id"] is not None:
+            spend.total_allowance_release_tx(
+                cur, row["spend_total_allowance_id"], reserved)
     return len(stale)
 
 
@@ -1678,11 +1725,53 @@ def authorize_hold(body, *, installation_id, plugin_id="histopilot", now=None):
                                     "installation_id": installation_id,
                                     "plugin_id": plugin_id},
                             ts=now.timestamp())
+                        # Batch B（§4.6）：金额硬拒绝事件（append-only）。
+                        # **必须**在 ROLLBACK TO SAVEPOINT 之后、外层事务提交
+                        # 之前写（不能在 _authorize_hold_tx 内插入后抛错——
+                        # 记录会随 savepoint 一起回滚）；(call_id, reason)
+                        # 唯一，客户端重试不重复计数。估算额从异常 context
+                        # 提取（pricing_unavailable 等无估算 → NULL）。
+                        # HoldConflictError（409 客户端冲突）不属金额拒绝，
+                        # 不落本表；数据库整体不可用类失败根本到不了这里
+                        #（连接/语句异常直接抛出），只进外部 metric。
+                        _record_denial_event_tx(
+                            cur, call_id=body["call_id"],
+                            subject_type=body["subject_type"],
+                            subject_id=body["subject_id"], reason=exc.code,
+                            estimated_nano_cny=(
+                                exc.context.get("estimated_nano")
+                                if isinstance(exc, spend.SpendError) else None),
+                            occurred_at=now)
         if business_error is not None:
             raise business_error
         return result
     finally:
         conn.close()
+
+
+#: 金额硬拒绝事件 id 前缀（ai_spend_denial_events；0029）
+_DENIAL_ID_PREFIX = "den_"
+
+
+def _record_denial_event_tx(cur, *, call_id, subject_type, subject_id, reason,
+                            estimated_nano_cny, occurred_at):
+    """事务内写一条金额硬拒绝事件（0029；ON CONFLICT DO NOTHING 幂等）。
+
+    仅金额类稳定拒绝码落表（HoldPricingUnavailableError /
+    spend.SpendError）；任何写失败随外层事务回滚（本函数不吞错——事件丢失
+    等价于拒绝未发生，宁可 500 重试也不静默）。
+    """
+    cur.execute(
+        "INSERT INTO ai_spend_denial_events "
+        "(denial_id, call_id, subject_type, subject_id, reason, "
+        " estimated_nano_cny, occurred_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (call_id, reason) DO NOTHING",
+        (_DENIAL_ID_PREFIX + secrets.token_hex(12), call_id, subject_type,
+         subject_id, reason,
+         (int(estimated_nano_cny)
+          if estimated_nano_cny is not None else None),
+         occurred_at))
 
 
 def _authorize_hold_tx(cur, body, *, installation_id, plugin_id, now,
@@ -1741,18 +1830,39 @@ def _authorize_hold_tx(cur, body, *, installation_id, plugin_id, now,
     else:
         denial_reason = "pricing_unavailable"
 
-    # -- 步骤 6：策略解析 + get_or_create 窗口（§3.2）。hard 缺策略/窗口
-    #    不可用 fail-closed（稳定码透传）；shadow 只观测。 --
+    # -- 步骤 6：预算目标解析 + 投影行 get_or_create / 锁定（§3.2 + Batch B）。
+    #    spend_target 抽象：owner 恒窗口、demo 恒周窗口、user 按
+    #    platform_settings.user_spend_target 分流（不允许多调用点复制 if/else，
+    #    §Batch B 原子授权与结算 4）。total_allowance 路径只锁既有行——绝不
+    #    为无行 user 隐式建行（fail-closed：hard 抛稳定 missing；shadow 只
+    #    观测），缺行代表建号/兑换/迁移链路出了 bug。 --
+    spend_target = _resolve_spend_target_tx(cur, spend, subject_type)
     window = None
+    allowance = None
     try:
-        window = spend._get_or_create_window_tx(
-            cur, subject_type, subject_id, now)
+        if spend_target == "total_allowance":
+            cur.execute(
+                "SELECT " + spend._ALLOWANCE_SEL + " FROM "
+                "ai_spend_total_allowances WHERE subject_id=%s FOR UPDATE",
+                (subject_id,))
+            arow = cur.fetchone()
+            if arow is not None:
+                allowance = spend._allowance_out(arow)
+            else:
+                raise spend.SpendTotalAllowanceMissingError(
+                    "该用户无总额度行（hard fail-closed）",
+                    subject_id=subject_id)
+        else:
+            window = spend._get_or_create_window_tx(
+                cur, subject_type, subject_id, now)
     except spend.SpendError as exc:
         if hard:
             raise
         if denial_reason is None:
-            denial_reason = exc.code  # spend_policy_missing / spend_window_unavailable
+            denial_reason = exc.code  # spend_policy_missing / spend_window_unavailable / spend_total_allowance_missing
     window_id = window["window_id"] if window is not None else None
+    allowance_id = (allowance["allowance_id"]
+                    if allowance is not None else None)
 
     # -- legacy 余额快照（user/owner；demo 无账户面，恒 NULL 全套） --
     account_id = None
@@ -1791,14 +1901,30 @@ def _authorize_hold_tx(cur, body, *, installation_id, plugin_id, now,
     duplicate = False
     cur.execute("SAVEPOINT sp_hold_insert")
     try:
-        # -- 步骤 7（§3.2）：锁窗口行 + spent+reserved+estimated 检查 + 预占。
-        #    hard 由 window_reserve_tx 强制额度（超限抛 spend_budget_
-        #    exhausted，不改数、不写行）；shadow enforce_limit=False 照常
-        #    累加（投影真实占用），would_deny 换算窗口口径（无窗口/无估算
-        #    回退 legacy 余额口径，兼容批次 B 观测）。 --
+        # -- 步骤 7（§3.2 + Batch B）：锁目标行 + spent+reserved+estimated
+        #    检查 + 预占。hard 由 window_reserve_tx / total_allowance_reserve_tx
+        #    强制额度（超限抛 spend_budget_exhausted，不改数、不写行）；
+        #    shadow enforce_limit=False 照常累加（投影真实占用），would_deny
+        #    换算目标口径（无目标/无估算回退 legacy 余额口径，兼容批次 B
+        #    观测）。 --
         reserved_nano = None
         would_deny = None
-        if window_id is not None and estimated is not None:
+        if allowance_id is not None and estimated is not None:
+            over = (int(allowance["spent_nano_cny"])
+                    + int(allowance["reserved_nano_cny"]) + estimated
+                    > int(allowance["limit_nano_cny"]))
+            if hard:
+                spend.total_allowance_reserve_tx(cur, allowance_id, estimated,
+                                                 enforce_limit=True)
+                would_deny = False  # 能写行的 hard 授权必已过闸
+            else:
+                spend.total_allowance_reserve_tx(cur, allowance_id, estimated,
+                                                 enforce_limit=False)
+                would_deny = over
+                if over and denial_reason is None:
+                    denial_reason = "spend_budget_exhausted"
+            reserved_nano = estimated
+        elif window_id is not None and estimated is not None:
             locked = spend._fetch_window_locked(cur, window_id)
             over = (int(locked["spent_nano_cny"])
                     + int(locked["reserved_nano_cny"]) + estimated
@@ -1822,15 +1948,16 @@ def _authorize_hold_tx(cur, body, *, installation_id, plugin_id, now,
             "(hold_id, call_id, account_id, subject_type, subject_id, "
             " installation_id, session_id, model, estimated_nano_cny, "
             " balance_nano_cny, would_deny, status, expires_at, metadata, "
-            " spend_window_id, reserved_nano_cny, enforcement_mode, "
-            " denial_reason) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open',%s,%s,%s,%s,%s,%s)"
+            " spend_window_id, spend_total_allowance_id, reserved_nano_cny, "
+            " enforcement_mode, denial_reason) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open',%s,%s,%s,%s,%s,"
+            "%s,%s)"
             " RETURNING " + _HOLD_SEL,
             (hold_id, body["call_id"], account_id, subject_type, subject_id,
              installation_id, body["session_id"], body["model"], estimated,
              balance, would_deny, now + timedelta(seconds=ttl),
-             psycopg.types.json.Jsonb(metadata), window_id, reserved_nano,
-             mode, denial_reason))
+             psycopg.types.json.Jsonb(metadata), window_id, allowance_id,
+             reserved_nano, mode, denial_reason))
         inserted = cur.fetchone()
     except psycopg.errors.UniqueViolation as exc:
         name = (getattr(getattr(exc, "diag", None), "constraint_name", "")
@@ -1870,6 +1997,7 @@ def _authorize_hold_tx(cur, body, *, installation_id, plugin_id, now,
                     "status": row["status"],
                     "enforcement_mode": mode,
                     "denial_reason": denial_reason,
+                    "spend_target": spend_target,
                     "installation_id": installation_id,
                     "plugin_id": plugin_id},
             ts=now.timestamp())
@@ -2009,21 +2137,28 @@ def _payload_event_id(payload_kind, payload):
     return None
 
 
-def _release_window_reserved_tx(cur, row):
-    """按 hold 快照归还窗口预占（release/旧 body settle 共用；0024 前旧行
-    无窗口则 no-op）。返回归还额（无窗口 → None）。"""
-    if row["spend_window_id"] is None or row["reserved_nano_cny"] is None:
-        return None
-    reserved = int(row["reserved_nano_cny"])
-    if reserved <= 0:
-        return 0
-    _spend().window_release_tx(cur, row["spend_window_id"], reserved)
-    return reserved
+def _release_hold_reserved_tx(cur, row):
+    """按 hold 快照归还预占（release/旧 body settle 共用；Batch B：按 hold 上
+    保存的目标归还——spend_window_id 走窗口、spend_total_allowance_id 走总
+    额度，**不按当前策略重新解析**，§Batch B 原子授权与结算 2；0024/0029 前
+    旧行无目标则 no-op）。返回归还额（无目标 → None）。"""
+    reserved = row["reserved_nano_cny"]
+    if reserved is None or int(reserved) <= 0:
+        return None if reserved is None else 0
+    reserved = int(reserved)
+    if row["spend_window_id"] is not None:
+        _spend().window_release_tx(cur, row["spend_window_id"], reserved)
+        return reserved
+    if row["spend_total_allowance_id"] is not None:
+        _spend().total_allowance_release_tx(
+            cur, row["spend_total_allowance_id"], reserved)
+        return reserved
+    return None
 
 
 def _release_hold_tx(cur, row, *, installation_id, now):
     """release（§3.4.6）：只减 reserved + hold open→released，无金额入账。"""
-    released_nano = _release_window_reserved_tx(cur, row)
+    released_nano = _release_hold_reserved_tx(cur, row)
     cur.execute(
         "UPDATE billing_holds SET status='released', settled_at=%s "
         "WHERE hold_id=%s AND status='open' RETURNING " + _HOLD_SEL,
@@ -2055,7 +2190,7 @@ def _settle_legacy_tx(cur, row, event_id, *, installation_id, now):
     预占，不还会永久虚占）。event_id 只做格式与终态一致性校验，不校验事件
     已入库（billing_holds 无 FK，outbox 乱序容忍悬空引用）。
     """
-    released_nano = _release_window_reserved_tx(cur, row)
+    released_nano = _release_hold_reserved_tx(cur, row)
     cur.execute(
         "UPDATE billing_holds SET status='settled', event_id=%s, "
         "settled_at=%s WHERE hold_id=%s AND status='open' "
@@ -2113,7 +2248,7 @@ def _settle_with_usage_tx(cur, row, event, *, hard, mode, installation_id,
 
     released_nano = None
     if not late_after_expiry:
-        released_nano = _release_window_reserved_tx(cur, row)
+        released_nano = _release_hold_reserved_tx(cur, row)
         reserved = int(row["reserved_nano_cny"] or 0)
         if actual is not None and actual > reserved:
             # §3.4.8：估算不足指标（真实成本已按 actual 入账，不拒绝）

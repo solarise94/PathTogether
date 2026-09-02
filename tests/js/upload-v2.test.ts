@@ -2,10 +2,10 @@
  * uploadFile / Upload V2 分片上传器（上传修复 U3 / test-review P3-18）。
  *
  * 用 loadApp harness（同 upload-csrf.test.ts）驱动**真实** app.js：
- *  - 大文件（size ≥ 128MiB，非 ZIP/MRXS）走 V2：先 POST /api/uploads 创建任务
- *    （apiFetch → fetch，请求头带 X-CSRF-Token），再逐片 PUT
- *    /api/uploads/<id>/chunk（裸 XHR，同样带头 + offset/sha256 query），
- *    最后 POST commit；
+ *  - 大文件（size ≥ 阈值（A1 起为服务端下发的 16MiB），非 ZIP/MRXS）走 V2：
+ *    先 POST /api/uploads 创建任务（apiFetch → fetch，请求头带 X-CSRF-Token），
+ *    再逐片 PUT /api/uploads/<id>/chunk（裸 XHR，同样带头 + offset/sha256
+ *    query），最后 POST commit；
  *  - 分片串行推进以服务端 confirmed_offset 为准；offset_mismatch 409 对齐重传；
  *  - 刷新恢复：localStorage 记录 (name,size,lastModified)→upload_id，续传从
  *    confirmed_offset 起；
@@ -20,7 +20,9 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const appSrc = readFileSync(resolve(here, "../../static/app.js"), "utf8");
 
-const THRESHOLD = 128 * 1024 * 1024;
+// 上传修复 A1：路由阈值唯一权威是服务端 UPLOAD_V2_THRESHOLD_BYTES（16MiB），
+// 经 HP_APP_BOOTSTRAP.capabilities 下发；前端解析失败回落 16MiB。
+const THRESHOLD = 16 * 1024 * 1024;
 
 /** 可计数的元素 stub（appendChild/removeChild 记录 children，可断言多进度行） */
 function el() {
@@ -97,7 +99,7 @@ function fakeLocalStorage() {
 
 type FetchCall = { url: string; opts: RequestInit & { headers?: Record<string, string> } };
 
-function loadApp(fetchImpl?: typeof fetch) {
+function loadApp(fetchImpl?: typeof fetch, bootstrap?: unknown) {
 	const storage = fakeLocalStorage();
 	const els: Record<string, ReturnType<typeof el | typeof toastContainer>> = {};
 	const toast = toastContainer();
@@ -118,6 +120,7 @@ function loadApp(fetchImpl?: typeof fetch) {
 		location: loc,
 		OpenSeadragon: undefined,
 	};
+	if (bootstrap !== undefined) w.HP_APP_BOOTSTRAP = bootstrap;
 	const doc = {
 		readyState: "loading",
 		cookie: "csrf_token=tok",
@@ -142,6 +145,7 @@ function loadApp(fetchImpl?: typeof fetch) {
 	return {
 		uploadFile: (w.HP_UPLOAD as { uploadFile: (f: unknown) => void }).uploadFile,
 		shouldChunkUpload: (w.HP_UPLOAD as { shouldChunkUpload: (f: unknown) => boolean }).shouldChunkUpload,
+		threshold: (w.HP_UPLOAD as { UPLOAD_V2_THRESHOLD: number }).UPLOAD_V2_THRESHOLD,
 		fetchCalls: () => ((theFetch as unknown as { mock?: { calls: FetchCall[][] } }).mock
 			? ((theFetch as unknown as vi.Mock).mock.calls as unknown as FetchCall[][]).map(
 				([url, opts]) => ({ url, opts: opts || {} }))
@@ -174,14 +178,47 @@ afterEach(() => {
 	FakeXHR.instances = [];
 });
 
-describe("shouldChunkUpload 阈值与类型裁定", () => {
-	it("≥128MiB 的 WSI 走 V2；ZIP/MRXS 与小文件走旧接口", () => {
+describe("shouldChunkUpload 阈值与类型裁定（A1：16MiB 唯一权威）", () => {
+	it("无 bootstrap 时回落 16MiB：<16MiB false，=16MiB true，>16MiB true", () => {
 		const h = loadApp();
-		expect(h.shouldChunkUpload({ name: "a.svs", size: THRESHOLD })).toBe(true);
+		expect(h.threshold).toBe(THRESHOLD);
 		expect(h.shouldChunkUpload({ name: "a.svs", size: THRESHOLD - 1 })).toBe(false);
+		expect(h.shouldChunkUpload({ name: "a.svs", size: THRESHOLD })).toBe(true);
+		expect(h.shouldChunkUpload({ name: "a.svs", size: THRESHOLD + 1 })).toBe(true);
 		expect(h.shouldChunkUpload({ name: "a.svs", size: 3 })).toBe(false);
+	});
+
+	it("ZIP/MRXS 例外：任意大小都走旧接口（阈值不影响）", () => {
+		const h = loadApp();
 		expect(h.shouldChunkUpload({ name: "a.zip", size: THRESHOLD * 2 })).toBe(false);
 		expect(h.shouldChunkUpload({ name: "a.mrxs", size: THRESHOLD * 2 })).toBe(false);
+	});
+
+	it("bootstrap 下发阈值时以其为准（服务端唯一权威）", () => {
+		const h = loadApp(undefined, {
+			mode: "official",
+			capabilities: { upload_v2_threshold_bytes: 32 * 1024 * 1024 },
+		});
+		expect(h.threshold).toBe(32 * 1024 * 1024);
+		expect(h.shouldChunkUpload({ name: "a.svs", size: 16 * 1024 * 1024 })).toBe(false);
+		expect(h.shouldChunkUpload({ name: "a.svs", size: 32 * 1024 * 1024 })).toBe(true);
+	});
+
+	it("bootstrap 缺失 key / 非法值回落 16MiB", () => {
+		const h1 = loadApp(undefined, { mode: "official", capabilities: {} });
+		expect(h1.threshold).toBe(THRESHOLD);
+		const h2 = loadApp(undefined, {
+			mode: "official",
+			capabilities: { upload_v2_threshold_bytes: "garbage" },
+		});
+		expect(h2.threshold).toBe(THRESHOLD);
+		const h3 = loadApp(undefined, {
+			mode: "official",
+			capabilities: { upload_v2_threshold_bytes: -5 },
+		});
+		expect(h3.threshold).toBe(THRESHOLD);
+		const h4 = loadApp(undefined, { mode: "official" }); // capabilities 缺失
+		expect(h4.threshold).toBe(THRESHOLD);
 	});
 });
 

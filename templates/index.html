@@ -12,6 +12,8 @@
 </head>
 <body class="app-mode-official" data-app-mode="official">
   <script>
+    // 上传修复 A1：capabilities 内含非敏感的 upload_v2_threshold_bytes
+    // （服务端 UPLOAD_V2_THRESHOLD_BYTES 唯一权威；前端解析失败回落 16MiB）
     window.HP_APP_BOOTSTRAP = {
       mode: "official",
       capabilities: {{ capabilities | tojson }}

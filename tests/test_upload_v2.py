@@ -42,18 +42,30 @@ os.environ["ADMIN_PASSWORD"] = ""
 import pytest  # noqa: E402
 
 import share_store  # noqa: E402
+import slide_io  # noqa: E402
 import upload_guard  # noqa: E402
 import upload_task_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
 from _pt_helpers import csrf_client, install_json_login_limits, isolate_app, clear_upload_dir # noqa: E402
+from _tiff_fixtures import make_ome_tiff_bytes, make_tiff_bytes  # noqa: E402
 
 
 pg_only = pytest.mark.skipif(
     BACKEND != "postgres", reason="配额/续租需 PG（RUN_PG_TESTS=1）")
 json_only = pytest.mark.skipif(
     BACKEND != "json", reason="json 后端 fail-closed 行为仅在 json 模式断言")
+
+
+# A0 异常契约后的验证 stub：成功返回 None / 失败抛 SlideValidationError，
+# 签名兼容 format_hint 关键字（替代旧 lambda p: True/False 布尔契约）
+def _validate_ok(path, **_):
+    return None
+
+
+def _validate_bad(path, **_):
+    raise slide_io.SlideValidationError("invalid_slide", "无效的切片文件")
 
 
 @pytest.fixture(autouse=True)
@@ -369,7 +381,7 @@ def test_concurrent_distinct_put_one_wins():
 # 4. commit 三段式（§3.2.5）
 # =========================================================================== #
 def test_commit_happy_path(monkeypatch):
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client()
     uid = _create(c, name="ok.svs", size=200).get_json()["upload_id"]
     data = os.urandom(200)
@@ -385,9 +397,63 @@ def test_commit_happy_path(monkeypatch):
     assert upload_task_store.get_task(uid)["state"] == "committed"
 
 
+def test_commit_real_tiff_end_to_end_no_monkeypatch():
+    """真 TIFF：create→多 chunk→commit 全程真验证（A0，无 monkeypatch）。
+
+    中文空格文件名随 safe_name 作 format_hint 传给 slide_io（.part 临时名
+    不参与格式判定）；commit 成功后 .part 清理、任务终态 committed。
+    """
+    tiff = make_tiff_bytes()
+    name = "0702-L2-2 鼠奥球.tiff"
+    c = _client()
+    uid = _create(c, name=name, size=len(tiff)).get_json()["upload_id"]
+    assert upload_task_store.get_task(uid)["safe_name"] == name
+    _upload_full(c, uid, tiff, chunk=4096)  # 多片（片小于整文件）
+    r = c.post("/api/uploads/%s/commit" % uid)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    j = r.get_json()
+    assert j["state"] == "committed"
+    assert j["sha256"] == hashlib.sha256(tiff).hexdigest()
+    dest = Path(UPLOAD_DIR) / name
+    assert dest.read_bytes() == tiff
+    assert not _part(uid).exists()
+    assert upload_task_store.get_task(uid)["state"] == "committed"
+
+
+def test_commit_real_ome_tiff_end_to_end_no_monkeypatch():
+    """真 OME-TIFF 同通道可过验证（OME 优先分支在 .part+hint 下生效）。"""
+    ome = make_ome_tiff_bytes()
+    c = _client()
+    uid = _create(c, name="ome-slide.ome.tiff", size=len(ome)).get_json()["upload_id"]
+    _upload_full(c, uid, ome, chunk=4096)
+    r = c.post("/api/uploads/%s/commit" % uid)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert (Path(UPLOAD_DIR) / "ome-slide.ome.tiff").read_bytes() == ome
+    assert not _part(uid).exists()
+
+
+def test_commit_real_garbage_tiff_stable_code_and_cleanup():
+    """垃圾字节伪装 .tif：真验证失败 → 稳定码 failed；DELETE 清理 .part。"""
+    junk = b"\x00definitely-not-tiff" * 8
+    c = _client()
+    uid = _create(c, name="junk.tif", size=len(junk)).get_json()["upload_id"]
+    _upload_full(c, uid, junk, chunk=64)
+    r = c.post("/api/uploads/%s/commit" % uid)
+    assert r.status_code == 409
+    j = r.get_json()
+    assert j["code"] == "invalid_slide"
+    assert j["state"] == "failed"
+    assert not (Path(UPLOAD_DIR) / "junk.tif").exists()  # 未提升
+    assert upload_task_store.get_task(uid)["state"] == "failed"
+    assert _part(uid).exists()  # failed 保留临时文件（证据），DELETE 清理
+    r = c.delete("/api/uploads/%s" % uid)
+    assert r.status_code == 200 and r.get_json()["state"] == "cancelled"
+    assert not _part(uid).exists()
+
+
 def test_recover_ownership_failure_keeps_committing(monkeypatch):
     """ownership 失败不得 finish_commit：保持 committing，文件仍在，下次可自愈。"""
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client()
     uid = _create(c, name="own.svs", size=100).get_json()["upload_id"]
     data = b"o" * 100
@@ -419,7 +485,7 @@ def test_recover_ownership_failure_keeps_committing(monkeypatch):
 
 def test_maintain_heals_committed_missing_owner(monkeypatch):
     """GET 路径仅在 slide_meta 缺 owner 时校正归属。"""
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client()
     uid = _create(c, name="heal.svs", size=80).get_json()["upload_id"]
     _upload_full(c, uid, b"h" * 80, chunk=40)
@@ -446,7 +512,7 @@ def test_maintain_heals_committed_missing_owner(monkeypatch):
 
 def test_recover_commit_does_not_commit_when_settle_fails(monkeypatch):
     """崩溃恢复：入账失败不得留下 committed 文件。"""
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client()
     uid = _create(c, name="rc.svs", size=100).get_json()["upload_id"]
     data = b"r" * 100
@@ -468,7 +534,7 @@ def test_commit_validates_before_promotion(monkeypatch):
     """§2.3 纠正：_validate_slide_file 必须在原子提升**之前**调用。"""
     calls = []
 
-    def fake_validate(path):
+    def fake_validate(path, **_):
         calls.append((str(path), (Path(UPLOAD_DIR) / "vbp.svs").exists()))
         return True
 
@@ -484,7 +550,7 @@ def test_commit_validates_before_promotion(monkeypatch):
 
 
 def test_commit_hash_mismatch_deterministic_failure(monkeypatch):
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client()
     uid = _create(c, name="hm.svs", size=100,
                   sha=hashlib.sha256(b"other").hexdigest()).get_json()["upload_id"]
@@ -507,7 +573,7 @@ def test_commit_hash_mismatch_deterministic_failure(monkeypatch):
 
 
 def test_commit_size_mismatch_400_keeps_active(monkeypatch):
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client()
     uid = _create(c, name="sm.svs", size=200).get_json()["upload_id"]
     _upload_full(c, uid, b"x" * 100, chunk=64)  # 只传一半
@@ -524,7 +590,7 @@ def test_commit_size_mismatch_400_keeps_active(monkeypatch):
 
 
 def test_commit_invalid_slide_failed(monkeypatch):
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: False)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_bad)
     c = _client()
     uid = _create(c, name="bad.svs", size=100).get_json()["upload_id"]
     _upload_full(c, uid, b"q" * 100, chunk=64)
@@ -537,7 +603,7 @@ def test_commit_invalid_slide_failed(monkeypatch):
 
 
 def test_commit_name_taken_failed(monkeypatch):
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     (Path(UPLOAD_DIR) / "nt.svs").write_bytes(b"taken")
     c = _client()
     uid = _create(c, name="nt2.svs", size=100).get_json()["upload_id"]
@@ -552,7 +618,7 @@ def test_commit_name_taken_failed(monkeypatch):
 
 
 def test_commit_idempotent_replay_returns_committed(monkeypatch):
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client()
     uid = _create(c, name="idem.svs", size=100).get_json()["upload_id"]
     _upload_full(c, uid, b"i" * 100, chunk=64)
@@ -566,7 +632,7 @@ def test_cancel_during_commit_returns_409(monkeypatch):
     """commit 与 cancel 竞态：验证阶段（无行锁）收到 DELETE → 409 不等待。"""
     started, release = threading.Event(), threading.Event()
 
-    def fake_validate(path):
+    def fake_validate(path, **_):
         started.set()
         release.wait(5)
         return True
@@ -694,7 +760,7 @@ def test_noauth_identity_owner_semantics_unchanged():
 # 7. 旧接口并存
 # =========================================================================== #
 def test_legacy_upload_still_works(monkeypatch):
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client()
     r = c.post("/api/upload",
                data={"file": (io.BytesIO(b"legacy"), "old.svs")},
@@ -709,7 +775,7 @@ def test_legacy_upload_still_works(monkeypatch):
 @pg_only
 def test_create_reserves_quota_before_any_put(monkeypatch):
     """初始化即预占（§3.3）：任务创建时 reserved_bytes == declared_size。"""
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client(auth=True)
     uid_user = _user_session(c, role="user", login="p1@x.com")
     _set_quota(uid_user, 10 ** 9)
@@ -738,7 +804,7 @@ def test_put_renews_reservation():
 
 @pg_only
 def test_commit_consumes_reservation(monkeypatch):
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client(auth=True)
     uid_user = _user_session(c, role="user", login="p3@x.com")
     _set_quota(uid_user, 10 ** 9)
@@ -789,7 +855,7 @@ def test_commit_hash_mismatch_releases_reservation():
 @pg_only
 def test_expired_reservation_reclaimed_rejects_old_put_and_commit(monkeypatch):
     """过期预占被新任务回收后，旧任务 PUT/commit fail-closed，不得无记账提交。"""
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client(auth=True)
     uid_user = _user_session(c, role="user", login="p6@x.com")
     _set_quota(uid_user, 5000)

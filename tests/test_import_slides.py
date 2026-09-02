@@ -16,7 +16,8 @@ def _iso(monkeypatch, tmp_path):
     from _pt_helpers import isolate_app
     import upload_guard
     isolate_app(monkeypatch, tmp_path, tmp_path / "uploads")
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    # A0 异常契约：放行 stub 返回 None，签名兼容 format_hint 关键字
+    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p, **_: None)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
     return tmp_path
 

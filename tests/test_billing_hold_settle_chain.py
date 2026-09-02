@@ -1200,10 +1200,11 @@ def test_hard_settle_injection_full_rollback(monkeypatch):
     monkeypatch.undo()
     _assert_clean(hold["hold_id"])
 
-    # ③ window reserved 归还：失败连带全链回滚
+    # ③ window reserved 归还：失败连带全链回滚（Batch B 起按 hold 保存
+    # 的目标归还，helper 改名 _release_hold_reserved_tx）
     hold, event = _prepare()
     _rollback_case(monkeypatch,
-                   (billing_store, "_release_window_reserved_tx"), _boom)
+                   (billing_store, "_release_hold_reserved_tx"), _boom)
     with pytest.raises(RuntimeError):
         _settle(hold["hold_id"], {"usage_event": event},
                 now=T0 + timedelta(seconds=60))

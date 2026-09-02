@@ -104,6 +104,13 @@ if _RUN_PG:
         # 重放 migrations/0023_spend_policies_windows.sql（迁移文件是种子
         # 的唯一权威来源，与 seed_price_books 同约定）
         "ai_spend_windows", "ai_spend_policies",
+        # 0029 起：Batch B user 一次性总额度 + 金额拒绝事件。ai_spend_total_
+        # defaults 无迁移种子（面值由 cutover 写入）；user_spend_target/
+        # ai_dispatch_maintenance 两个 platform_settings 键随 platform_settings
+        # 清掉——需要它们的用例用 _billing_helpers.seed_spend_settings()
+        # 幂等重放 migrations/0029_user_total_allowances_and_denials.sql
+        "ai_spend_total_allowances", "ai_spend_denial_events",
+        "ai_spend_total_defaults",
         # 0019 起：来源归因（admin-billing §11）。user_acquisition 引用
         # users/registration_invites/acquisition_visits，acquisition_visits 引用
         # acquisition_campaigns——显式列出保证跨用例无残留

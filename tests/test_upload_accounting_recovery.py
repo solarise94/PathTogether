@@ -66,7 +66,8 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(app_mod, "ZIP_MAX_TOTAL_BYTES",
                         2 * upload_guard.UPLOAD_MAX_REQUEST_BYTES)
     monkeypatch.setattr(app_mod, "ZIP_MAX_COMPRESSION_RATIO", 100.0)
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file",
+                        lambda p, **_: None)  # A0 异常契约
     monkeypatch.setitem(app_mod.app.config, "MAX_CONTENT_LENGTH", None)
     # G8 secret 节流状态复位（防跨用例吞掉本用例想断言的告警）
     monkeypatch.setattr(app_mod, "_secret_warn_last", {})
@@ -241,7 +242,8 @@ def test_v1_single_file_consumes_exact_bytes():
 
 def test_owner_upload_no_quota_task_machine_still_works(monkeypatch):
     """owner（AUTH_ENABLED=True）：无配额主体，但状态机照常收口（不回归）。"""
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p: True)
+    monkeypatch.setattr(app_mod, "_validate_slide_file",
+                        lambda p, **_: None)  # A0 异常契约
     c = _client(auth=True)
     _user_session(c, role="owner", login="own@x.com")
     r = _upload(c, name="own.svs", content=b"owner-bytes")

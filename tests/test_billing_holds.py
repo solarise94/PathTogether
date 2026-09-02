@@ -1091,6 +1091,8 @@ def test_hold_audit_written_without_sensitive_fields():
                     "estimated_nano_cny", "balance_nano_cny",
                     "open_holds_nano_cny", "would_deny", "status",
                     "enforcement_mode", "denial_reason", "skipped",
+                    # Batch B：授权落哪个预算目标（window|total_allowance）
+                    "spend_target",
                     "installation_id", "plugin_id"}
     settle_allowed = {"call_id_suffix", "status", "event_id",
                       "enforcement_mode", "reserved_released_nano_cny",

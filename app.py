@@ -103,6 +103,16 @@ import crop_guard
 import upload_guard
 import upload_task_store
 
+# Batch D2（§Batch D2 1/2，docs review-2026-09-02-upload-user-limits-admin-
+# ui-cleanup.md §4.4）：匿名站点访问统计——独立 store（site_visit_events；
+# after_request best-effort 采集 + 后台 worker + owner-only 只读聚合）。
+# import 容错（镜像外源码树容错，§Batch D2 与 A0/B/C/D1 解耦）：store 未随
+# 镜像发布时采集跳过、/api/admin/v1/site-stats 返回 404，其余功能不受影响。
+try:
+    import site_stats_store
+except ImportError:  # pragma: no cover - 仅在 store 缺失的构建里触达
+    site_stats_store = None
+
 # Stage 5-1：插件 manifest 版本常量单一来源（plugins/sdk/manifest.py）。
 # plugins/ 与 plugins/sdk/ 各有 __init__.py（plugins/histopilot/ 不加，保持静态目录）。
 from plugins.sdk.manifest import (  # noqa: E402
@@ -1154,6 +1164,61 @@ def _mirror_csrf_cookie(resp):
     return resp
 
 
+# --------------------------------------------------------------------------- #
+# Batch D2（§4.4 / §Batch D2 1/2）：匿名站点访问统计——after_request best-effort
+# 采集。约定（spec 红线）：
+#   - 仅响应 2xx/3xx 且 Content-Type 为 HTML 时构造事件（allowlist / 公开页 /
+#     非 API 非资源判定都在 site_stats_store.build_event 内，返回 None = 不采）；
+#   - enqueue 为有界队列 put_nowait：满即丢，绝不等待/重试，绝不改变原响应；
+#   - 任何异常只允许记节流 warning（site-stats 故障绝不影响页面响应）；
+#   - 不记录完整 IP/UA/query/token/资源 ID——build_event 只拿原始请求上下文
+#     用于即时派生（前缀 hash / hostname-only / bot 分类），派生后即弃。
+# --------------------------------------------------------------------------- #
+_SITE_STATS_WARN_INTERVAL_SECONDS = 300
+_site_stats_warn_last = {"ts": 0.0}
+
+
+def _warn_site_stats_throttled(message: str) -> None:
+    """站点统计故障节流 warning（同类一条/5 分钟；不含 IP/UA 等原始值）。"""
+    now = time.monotonic()
+    if now - _site_stats_warn_last["ts"] < _SITE_STATS_WARN_INTERVAL_SECONDS:
+        return
+    _site_stats_warn_last["ts"] = now
+    app.logger.warning("[site-stats] %s", message)
+
+
+@app.after_request
+def _collect_site_visit(resp):
+    """公开 HTML 页面访问 best-effort 采集（Batch D2；见节注释红线）。"""
+    if site_stats_store is None:
+        return resp
+    try:
+        # 仅 GET 采集（build_event 契约无 method 参数，由调用点过滤）；
+        # POST/PUT/DELETE 等写请求与 HEAD/OPTIONS 一律不产生事件
+        if request.method != "GET":
+            return resp
+        if resp.status_code < 200 or resp.status_code > 399:
+            return resp
+        content_type = resp.headers.get("Content-Type", "")
+        if "html" not in content_type.lower():
+            return resp
+        evt = site_stats_store.build_event(
+            path=request.path,
+            query_string=request.query_string.decode("utf-8", "ignore"),
+            referrer=request.headers.get("Referer", ""),
+            remote_addr=request.remote_addr or "",
+            user_agent=request.headers.get("User-Agent", ""),
+            status_code=resp.status_code,
+            content_type=content_type,
+            signed_in=bool(session.get("user_id")),
+            now=None)
+        if evt is not None:
+            site_stats_store.enqueue_visit(evt)  # put_nowait，满则丢
+    except Exception:
+        _warn_site_stats_throttled("访问采集失败（best-effort 丢弃，不影响响应）")
+    return resp
+
+
 def _safe_next_path(candidate) -> str:
     """登录 next 白名单校验：只允许站内绝对路径。
 
@@ -1569,6 +1634,9 @@ def _app_capabilities(mode):
         "ai_run": True,
         "view_tools": True,
         "ai_panel": True,
+        # 上传修复 A1：V2 分片路由阈值（非敏感，随 bootstrap 下发；前端解析
+        # 失败回落同值。ZIP/MRXS 例外不随此值变化）
+        "upload_v2_threshold_bytes": int(UPLOAD_V2_THRESHOLD_BYTES),
     }
 
 
@@ -2543,116 +2611,56 @@ def api_account_password():
 
 
 # =========================================================================== #
-# PR4 用户来源归因（docs/admin-billing-plugin-implementation-plan.md §11）
+# PR4 用户来源归因 → Batch D1 退役（docs/admin-billing-plugin-implementation-
+# plan.md §11 / review-2026-09-02 §4.4）
 #
-# /r/<source_code> 匿名跳转入口 + pt_acq cookie（§11.1）：
-#   - slug 只允许 [a-z0-9_-]{1,64}；非法 → 302 到 /（安全兜底，不报错不泄露）；
-#   - cookie 签名复用 Flask secret_key（itsdangerous URLSafeTimedSerializer，
-#     独立 salt 域分离——session payload 与 pt_acq payload 不可互相移植）；
-#     HttpOnly + Secure（随 SESSION_COOKIE_SECURE）+ SameSite=Lax + 90 天；
-#   - landing 只允许固定 allowlist（/demo、/register、/）；query 里任何
-#     redirect/next 参数一律忽略（禁止开放重定向）；
-#   - 触点写入故障（含 json/dual 后端）→ warning + 安全 302 照常（§16.2）。
+# Batch D1 wave 2 起归因写路径与读取路径全部退役：
+#   - /r/<source_code> 仅做无记录、无 cookie 写入的安全 302（兼容外部 CTA，
+#     响应用与原属性匹配的过期指令清除旧 pt_acq）；
+#   - 注册兑换不再读取 pt_acq cookie / Referer / UTM（redeem_invite 不传
+#     acq）；pt_acq 的签名/验签 helper（_acq_cookie_serializer/_acq_cookie_
+#     payload）与 90 天 TTL 常量随之删除；
+#   - 触点/归因数据表冻结（0019 已应用迁移不改写；历史行只读，待消费者
+#     审计后另立迁移删除）。
 # =========================================================================== #
-#: 匿名访客 cookie 名（§11.1）
+#: 匿名访客 cookie 名（§11.1；仅用于兼容清除，不再签发/读取）
 ACQ_COOKIE_NAME = "pt_acq"
-#: cookie 保留期（与匿名触点 expires_at 默认 90 天同步，§11.3）
-ACQ_COOKIE_TTL_SECONDS = 90 * 86400
-#: cookie 签名域分离 salt（itsdangerous；密钥与 Flask session 同源）
-_ACQ_COOKIE_SALT = "pt-acq-cookie-v1"
 #: /r/ landing allowlist（与 acquisition_store.LANDING_ALLOWLIST 同源）
 ACQ_LANDING_ALLOWLIST = ("/demo", "/register", "/")
 
 
-def _acq_cookie_serializer():
-    """pt_acq cookie 签名器：itsdangerous URLSafeTimedSerializer。
-
-    密钥 = Flask secret_key（复用既有 session 签名密钥，不另造密钥文件）；
-    独立 salt 使 session 与 pt_acq 的签名 payload 域分离。时间戳签名自带
-    签发时间，loads(max_age=...) 即过期校验。
-    """
-    import itsdangerous
-    return itsdangerous.URLSafeTimedSerializer(
-        str(app.secret_key), salt=_ACQ_COOKIE_SALT)
-
-
-def _acq_cookie_payload():
-    """读取并验签 pt_acq cookie → dict；缺失/篡改/过期/形态非法一律 None。"""
-    raw = request.cookies.get(ACQ_COOKIE_NAME)
-    if not raw or not isinstance(raw, str):
-        return None
-    import itsdangerous
-    try:
-        data = _acq_cookie_serializer().loads(
-            raw, max_age=ACQ_COOKIE_TTL_SECONDS)
-    except itsdangerous.BadData:
-        return None
-    if not isinstance(data, dict):
-        return None
-    if not acquisition_store.valid_visitor_id(data.get("v")):
-        return None
-    return data
-
-
 @app.route("/r/<source_code>", methods=["GET"])
 def acquisition_redirect(source_code):
-    """来源跳转入口（§11.1）。mywebpage 产品 CTA 形如::
+    """来源跳转入口（兼容 302；Batch D1 16 / §4.4：不再落记录、不再写 cookie）。
 
-        /r/mywebpage?campaign=<slug>&utm_medium=<...>
+    Batch D1 wave 2 语义（§4.4「旧归因退役」）：
 
     - slug 校验（[a-z0-9_-]{1,64}）：非法 → 302 /（不报错，不泄露判定）；
-    - visitor_id：读 pt_acq cookie（验签 + 90 天过期），无效则新生成高熵 id；
-    - 落**一个不可变触点**（acquisition_store.record_visit）：referrer 只留
-      hostname、UTM 限长清控制字符、IP 只存前缀 hash（ACQ_IP_SALT 未配置则
-      不采集）；campaign 未知/非 active 落 NULL 不报错（slug 经 utm_campaign
-      保留）；landing 只接受 allowlist；
-    - 302 目标规则：query ``to`` 与 allowlist 精确匹配才采用，缺省
-      ``/register``（campaign 行不携带 landing 配置——§11.2 字典表无该列）；
-      **redirect/next 等重定向参数一律忽略**（禁止开放重定向）；
+    - **不**调用 acquisition_store.record_visit（触点写路径冻结：零新增
+      acquisition_visits 行，test_acquisition 以数据库行数断言证明）；
+    - **不**读取 UTM/Referer/campaign 参数（open-redirect 防线保留：query
+      ``to`` 与 allowlist 精确匹配才采用，缺省 ``/register``；redirect/next
+      等重定向参数一律忽略）；
+    - 兼容响应用与原 cookie 完全匹配的属性（``path=/``、HttpOnly、
+      SameSite=Lax、Secure=SESSION_COOKIE_SECURE）+ 过去时间**清除**旧
+      ``pt_acq``；不设置任何替代访客 cookie；
     - 邀请码绝不进 CTA URL/query/日志/referrer（§11.1 末段）。
     """
     if not acquisition_store.valid_slug(source_code):
-        return redirect("/")
-    campaign_raw = (request.args.get("campaign") or "").strip()
-    utm_source = acquisition_store.sanitize_text(request.args.get("utm_source"))
-    utm_medium = acquisition_store.sanitize_text(request.args.get("utm_medium"))
-    # campaign 参数同时充当 utm_campaign 缺省值（mywebpage CTA 契约）：
-    # 未登记 campaign 的 slug 不丢——campaign_id 落 NULL，utm_campaign 保留。
-    utm_campaign = acquisition_store.sanitize_text(
-        request.args.get("utm_campaign")) \
-        or acquisition_store.sanitize_text(campaign_raw)
-    referrer_domain = acquisition_store.sanitize_referrer_domain(
-        request.referrer or "")
-    # allowlist 之外（含缺省）一律回 /register；next/redirect 参数从不读取
-    landing = acquisition_store.sanitize_landing_path(
-        request.args.get("to")) or "/register"
-
-    payload = _acq_cookie_payload() or {}
-    visitor_id = payload.get("v") or acquisition_store.new_visitor_id()
-
-    if platform_features.current_backend() == "postgres":
-        try:
-            acquisition_store.record_visit(
-                visitor_id=visitor_id, source_code=source_code,
-                campaign_id=campaign_raw,
-                referrer_domain=referrer_domain, landing_path=landing,
-                utm_source=utm_source, utm_medium=utm_medium,
-                utm_campaign=utm_campaign,
-                ip=request.remote_addr or "")
-        except Exception:
-            # §16.2 来源故障降级：安全 302 照常（只记 warning），不影响注册
-            app.logger.warning("/r/%s 触点写入失败（降级为仅跳转）",
-                               source_code, exc_info=True)
-
-    resp = redirect(landing)
+        resp = redirect("/")
+    else:
+        # allowlist 之外（含缺省）一律回 /register；next/redirect 参数从不读取。
+        # 旧 UTM/campaign/visitor 逻辑已随归因退役删除（to 之外的 query 全部
+        # 忽略）。
+        landing = acquisition_store.sanitize_landing_path(
+            request.args.get("to")) or "/register"
+        resp = redirect(landing)
+    # 按原属性清除 pt_acq（expires=过去时间）；path/HttpOnly/SameSite/Secure
+    # 与旧写入属性完全匹配（浏览器才会正确删除），不引入替代 cookie
     resp.set_cookie(
-        ACQ_COOKIE_NAME,
-        _acq_cookie_serializer().dumps({
-            "v": visitor_id, "us": utm_source, "um": utm_medium,
-            "uc": utm_campaign, "rd": referrer_domain}),
-        max_age=ACQ_COOKIE_TTL_SECONDS, httponly=True, samesite="Lax",
+        ACQ_COOKIE_NAME, "", path="/", httponly=True, samesite="Lax",
         secure=bool(app.config.get("SESSION_COOKIE_SECURE", False)),
-        path="/")
+        expires=0)
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -2749,21 +2757,12 @@ def register():
         return _register_form_error(form_error, "invalid")
 
     # 原子兑换（docs §4.3）：失败统一文案（无细分状态），计数到限流桶。
-    # PR4 §11.2：注册来源上下文——已验签 pt_acq cookie（visitor_id + 末次
-    # sanitized UTM/referrer）+ 本请求 Referer hostname 兜底；归因在
-    # redeem_invite 的同一事务内完成，绝不事后按 IP/账号/邮箱模糊匹配。
-    acq_payload = _acq_cookie_payload() or {}
-    acq = {
-        "visitor_id": acq_payload.get("v"),
-        "utm_source": acq_payload.get("us") or "",
-        "utm_medium": acq_payload.get("um") or "",
-        "utm_campaign": acq_payload.get("uc") or "",
-        "referrer_domain": acquisition_store.sanitize_referrer_domain(
-            request.referrer or "") or acq_payload.get("rd") or "",
-    }
+    # 批次 D1 13 / Batch B wave 2（§4.4）：注册兑换**不再读取** pt_acq
+    # cookie、Referer 或 UTM——兑换事务与来源上下文彻底解耦（站点统计故障
+    # 绝不能阻断注册）；redeem_invite 的 acq 参数已退役，不再传。
     try:
         result = registration_store.redeem_invite(
-            invite_token, login_id, password, display_name or None, acq=acq)
+            invite_token, login_id, password, display_name or None)
     except registration_store.InviteRedeemError:
         try:
             auth_limit_store.record_registration_failure(ip_hash, invite_hash)
@@ -4375,12 +4374,24 @@ def _registration_invite_owner_hash():
         uid.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+#: 批次 D1（§4.4）：邀请不再携带来源——owner API 视图删除的退役键
+#:（列保留只读历史行；新邀请行三列为空/NULL，见 registration_store）
+_INVITE_RETIRED_VIEW_FIELDS = ("cohort", "source_code", "campaign_id",
+                               "monthly_limit_nano_cny", "acq",
+                               "spend_override_policy")
+
+
 def _invite_public_view(invite: dict) -> dict:
     """邀请行 → owner API 视图（掩码登录账号 + 状态；绝不含 token/token_hash）。
 
     批次 C（docs §4.2/§8.2）：邀请绑定字段语义为「允许兑换的登录账号
     （login_id）」。视图只输出 "login_id_masked"（批次 B 的 "email_masked"
     deprecated 同值键已删除）——掩码口径不变（不外泄完整绑定值）。
+
+    批次 D1（§4.4）/ Batch B wave 2：视图删除 source_code/campaign_id/cohort
+    回显（邀请只负责注册，不携带来源）；初始金额字段改用
+    ``total_limit_nano_cny``（monthly_limit_nano_cny 旧键一并从视图移除，
+    旧列面值已由 store 按总额度兑现）。
     """
     now = time.time()
     out = dict(invite)
@@ -4388,6 +4399,8 @@ def _invite_public_view(invite: dict) -> dict:
     out.pop("token", None)
     bound = out.pop("login_id_normalized", None)
     out["login_id_masked"] = registration_store.mask_login_id(bound)
+    for key in _INVITE_RETIRED_VIEW_FIELDS:
+        out.pop(key, None)
     if out.get("revoked_at") is not None:
         out["status"] = "revoked"
     elif out.get("consumed_at") is not None:
@@ -4479,12 +4492,17 @@ def api_admin_registration_settings_put():
 @app.route("/api/admin/registration-invites", methods=["POST"])
 def api_admin_registration_invites_create():
     """创建一次性邀请码（owner）。body: {login_id?, ttl_hours?, ai_access?,
-    cohort?, note?}。
+    total_limit_nano_cny?, note?}。
 
     批次 C（docs §4.2/§8.2）：绑定字段语义为「允许兑换的登录账号 login_id」
     （非已验证邮箱）；只接受 ``login_id`` 入参——批次 B 的 ``email`` 兼容入参
     已删除，body 仍带 email 键一律显式 400（绝不静默降级为不绑定邀请）。
     响应只携带 login_id_masked（email_masked 已删除）。
+
+    批次 D1 13 / Batch B wave 2（§4.4）：邀请与来源解耦——body 带
+    ``source_code``/``campaign_id``/``cohort`` 一律 400 retired_invite_field；
+    初始金额字段为 ``total_limit_nano_cny``（旧 monthly 单独传兼容一个发布
+    周期，同传 400 ambiguous_spend_limit）。
 
     仅本响应返回明文 code（Cache-Control: no-store，刷新即失）；库内只存带盐
     hash。owner 创建频率受每分钟/每日上限。绑定值省略 = 不绑定（高风险，
@@ -4513,6 +4531,18 @@ def api_admin_registration_invites_create():
     # 仍出现说明是旧客户端——显式 400，绝不静默降级为不绑定邀请（高风险）。
     if "email" in body:
         return jsonify(error="email 入参已随批次 C 移除，绑定登录账号请改用 login_id"), 400
+    # 批次 D1 13（§4.4）：来源字段退役——接受即 400（不静默忽略）
+    retired = [k for k in ("source_code", "campaign_id", "cohort")
+               if body.get(k) is not None]
+    if retired:
+        return jsonify(error="邀请不再携带来源字段：%s（§4.4 邀请与来源解耦）"
+                             % ", ".join(sorted(retired)),
+                        code="retired_invite_field"), 400
+    if body.get("monthly_limit_nano_cny") is not None \
+            and body.get("total_limit_nano_cny") is not None:
+        return (jsonify(error="monthly_limit_nano_cny 与 total_limit_nano_cny "
+                              "只能传其一（旧月额度字段已退役）",
+                        code="ambiguous_spend_limit"), 400)
     login_id = body.get("login_id")
     if login_id is not None:
         login_id = str(login_id).strip()
@@ -4531,39 +4561,35 @@ def api_admin_registration_invites_create():
     ai_access = body.get("ai_access")
     if ai_access is not None and not isinstance(ai_access, bool):
         return jsonify(error="ai_access 需为布尔值"), 400
-    cohort = body.get("cohort")
-    if cohort is not None and (not isinstance(cohort, str)
-                               or len(cohort) > 64):
-        return jsonify(error="cohort 需为 ≤64 字符的字符串"), 400
     note = body.get("note")
     if note is not None and (not isinstance(note, str) or len(note) > 200):
         return jsonify(error="note 需为 ≤200 字符的字符串"), 400
-    # PR4 §11.2：邀请显式来源。campaign_id 必须已登记（owner API 显式失败，
-    # 不静默丢）；source_code 为可选 slug；两者缺省不传 = 兼容旧调用。
-    source_code = body.get("source_code")
-    if source_code is not None and (not isinstance(source_code, str)
-                                    or len(source_code) > 64):
-        return jsonify(error="source_code 需为 ≤64 字符的字符串"), 400
-    campaign_id = body.get("campaign_id")
-    if campaign_id is not None and (not isinstance(campaign_id, str)
-                                    or len(campaign_id) > 64):
-        return jsonify(error="campaign_id 需为 ≤64 字符的字符串"), 400
+    # Batch B wave 2：初始**总额度**模板（十进制字符串 nano-CNY | null=不建行）；
+    # 旧 monthly 字段单独传按面值兼容落总额度（store 语义）
+    try:
+        total_limit = _admin_v1_amount_in(
+            body.get("total_limit_nano_cny")
+            if body.get("total_limit_nano_cny") is not None
+            else body.get("monthly_limit_nano_cny"),
+            "total_limit_nano_cny")
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
 
     try:
         auth_limit_store.record_owner_invite_creation(owner_hash)
         invite = registration_store.create_invite(
             current_identity().get("user_id"), login_id=login_id,
             ttl_seconds=ttl_hours * 3600,
-            ai_access=bool(ai_access), cohort=cohort or "",
+            ai_access=bool(ai_access),
             note=note or "",
-            source_code=source_code or "", campaign_id=campaign_id or None)
+            total_limit_nano_cny=total_limit)
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
     except platform_features.PgFeatureUnavailable:
         return _registration_unavailable_response()
     except registration_store.RegistrationStoreError as exc:
         return jsonify(error=str(exc)), 500
-    out = _invite_public_view(invite)
+    out = _admin_v1_nano_out(_invite_public_view(invite))
     out["token"] = invite["token"]  # 明文码仅此一次
     resp = jsonify(out)
     resp.headers["Cache-Control"] = "no-store"
@@ -4587,7 +4613,8 @@ def api_admin_registration_invites_list():
     except Exception:
         app.logger.exception("邀请码列表读取失败")
         return jsonify(error="邀请码列表读取失败"), 500
-    return jsonify(invites=[_invite_public_view(i) for i in invites],
+    return jsonify(invites=[_admin_v1_nano_out(_invite_public_view(i))
+                            for i in invites],
                    mode=_effective_registration_mode(),
                    cache_control_note="token 已在创建时一次性返回，不可再查询")
 
@@ -4610,7 +4637,7 @@ def api_admin_registration_invites_revoke(invite_id):
         return jsonify(error=str(exc)), 409
     except platform_features.PgFeatureUnavailable:
         return _registration_unavailable_response()
-    return jsonify(_invite_public_view(invite))
+    return jsonify(_admin_v1_nano_out(_invite_public_view(invite)))
 
 
 @app.route("/api/admin/users/<user_id>/ai-access", methods=["POST"])
@@ -5165,10 +5192,11 @@ def api_admin_audit():
 #     token / 完整 IP / outbox 路径 / credential fingerprint；
 #   - billing 系端点 PG-only：json/dual 稳定 503 pg_backend_required（与
 #     billing_store §6.1 fail-closed 语义一致，不降级进程内数据）。
-#   - overview 在 json/dual 下**分段标记**（用户段可用；billing/turn_budget
-#     段返回 {available:false, code:"pg_backend_required"}），而非整体 503
+#   - overview 在 json/dual 下**分段标记**（用户段可用；billing 段返回
+#     {available:false, code:"pg_backend_required"}），而非整体 503
 #     ——选择分段是因为概览的用户计数在任何后端都真实可用，整体 503 会让
-#     管理页连基本用户概况都失去（偏离选择见 PR3b 总结）。
+#     管理页连基本用户概况都失去（偏离选择见 PR3b 总结）。批次 D1 起
+#     turn_budget 段移出概览。
 # =========================================================================== #
 #: admin v1 列表缺省/最大 limit
 _ADMIN_V1_DEFAULT_LIMIT = 50
@@ -5297,6 +5325,11 @@ _ADMIN_V1_NANO_OUT_KEYS = frozenset((
     # 批次 D（§5.1/§5.2）：用户月额度覆盖与邀请码月额度模板（nano-CNY，
     # 库内 BIGINT → wire 十进制字符串）
     "monthly_limit_nano_cny",
+    # 批次 B wave 2（§Batch B API/bridge 契约）：一次性总额度形态与邀请
+    # total 模板、三键拆分的 spend 设置值（同样 BIGINT → 十进制字符串）
+    "total_limit_nano_cny", "opening_spent_nano_cny",
+    "default_limit_nano_cny", "user_default_total_limit_nano_cny",
+    "demo_weekly_limit_nano_cny", "owner_monthly_limit_nano_cny",
 ))
 
 
@@ -5466,13 +5499,16 @@ def _admin_v1_uploads_section():
 
 @app.route("/api/admin/v1/overview", methods=["GET"])
 def admin_v1_overview():
-    """概览（§10.1）：用户计数 + billing 用量/余额 + turn 预算（双额度并列）。
+    """概览（§10.1）：用户计数 + billing 用量/余额 + uploads 收口观测。
 
-    json/dual：用户段可用；billing / turn_budget 段各自
-    ``{available:false, code:"pg_backend_required"}``（分段标记，见节注释）。
+    json/dual：用户段可用；billing 段 ``{available:false,
+    code:"pg_backend_required"}``（分段标记，见节注释）。
     PG：billing 段含 model calls（今日/周期）、cache token 合计与命中率、
     provider cost / charge 合计（nano）、unpriced 数、ingestion lag、DeepSeek
-    最新余额快照与年龄；turn_budget 段为周期预算摘要（usage_report 原语）。
+    最新余额快照与年龄。
+    批次 D1（§4.2）：turn 预算历史聚合移出概览（turn 消费闸早已退役，
+    turn-budgets 只读端点暂留兼容但不再进 overview payload，插件不渲染；
+    确认一个发布周期无消费者后另批删除 GET）。
     uploads 段（G7）：V1/ZIP 收口 committing/backlog 计数与最老年龄
     （json/PG 双后端可观测；只含聚合计数，不暴露路径/文件名/用户）。
     """
@@ -5489,16 +5525,16 @@ def admin_v1_overview():
 
     if not platform_features.billing_features_available():
         billing_section = {"available": False, "code": "pg_backend_required"}
-        turn_section = {"available": False, "code": "pg_backend_required",
-                        "legacy": True}
     else:
         try:
             period_start = None
-            report = None
             try:
                 report = budget_store.usage_report()
                 period_start = report["period"].get("started_at")
             except Exception:
+                # 「周期起点」只是金额聚合的窗口收窄优化；budget 周期读取
+                # 失败按全量窗口继续（unpriced/今日等 KPI 不因冻结历史缺
+                # 失而缺席）
                 app.logger.warning("概览读取预算周期失败（按全量窗口）",
                                    exc_info=True)
             # 「今日」按计价时区（Asia/Shanghai）零点，与价格时段同口径
@@ -5536,20 +5572,6 @@ def admin_v1_overview():
                 "provider_balance_snapshot": snapshot,
                 "provider_balance_age_seconds": age,
             })
-            # 批次 F：turn 消费闸退役——段保留（冻结历史只读）+ legacy 标记
-            turn_section = {"available": True, "legacy": True,
-                            "note": "turn 消费闸已于批次 F 退役，以下为冻结历史"}
-            if report is not None:
-                period = report["period"]
-                turn_section.update({
-                    "period_id": period.get("id"),
-                    "period_started_at": period.get("started_at"),
-                    "platform": report["platform"],
-                    "demo": report["demo"],
-                    "owner": report["owner"],
-                    "user_pool": report["user_pool"],
-                    "by_subject_type": report["by_subject_type"],
-                })
         except platform_features.PgFeatureUnavailable:
             return _admin_v1_pg_required()
         except Exception:
@@ -5559,8 +5581,8 @@ def admin_v1_overview():
     return jsonify(
         users=users_section,
         billing=billing_section,
-        # 「对话额度」（turn budget）与「金额余额」必须并列展示（§10.1）
-        turn_budget=turn_section,
+        # 批次 D1（§4.2）：turn_budget 段已移出概览（冻结历史仍在
+        # /api/admin/v1/turn-budgets 只读兼容，插件不再渲染）
         # G7：V1/ZIP 收口状态机的 committing 积压观测（只含计数与年龄）
         uploads=_admin_v1_uploads_section(),
         backend=platform_features.current_backend(),
@@ -5573,8 +5595,16 @@ def admin_v1_users():
 
     每行：display name、login ID 掩码、role、enabled、ai_access、创建时间、
     注册方式、金额余额/caps（未开户 null；json 后端 null）、最近 AI 调用
-    时间（json 后端 null）、campaign/source 留位 null（PR4）。turn 使用/
-    上限字段已随批次 F turn 消费闸退役删除。
+    时间（json 后端 null）。turn 使用/上限字段已随批次 F turn 消费闸退役
+    删除；campaign/source 用户级归因已随批次 D1（§4.4）整键删除（用户列表
+    不再查询/返回任何来源字段）。
+
+    spend 字段（Batch B wave 2，§Batch B API/bridge 契约）：按角色 + target
+    返回**互斥**形态原样透传——role=user 且 target=total_allowance →
+    ``spend.total={allowance_id,total_limit_nano_cny,spent_nano_cny,...}``
+    （无 window 键）；role=owner 或 cutover 前 target=window → 现 window
+    形态（policy_* + window）。缺行/策略缺失等单主体失败带稳定 ``error``
+    code。前端两种形态同时出现必须报契约错误，不得任选其一（§4.3）。
     """
     auth = _require_owner_admin_v1()
     if auth:
@@ -5608,24 +5638,18 @@ def admin_v1_users():
     billing_ok = platform_features.billing_features_available()
     accounts = last_calls = {}
     reg_methods = _admin_v1_registration_methods(user_ids)
-    # PR4 来源归因填充（campaign/source 留位）；PG 侧 best-effort（展示用途，
-    # 与 reg_methods 同口径：失败按 None 展示，不 fail-closed 整页 500）
-    acq_by_user = {}
-    # 批次 D（§6.2）：每用户当前月窗口 + 默认/覆盖状态（单事务批量解析）
+    # 批次 D（§6.2）→ Batch B wave 2：每用户 spend 投影（owner/user 按
+    # target 互斥形态；单事务批量解析）。PR4 的 user_acquisition 归因查询
+    # 已随批次 D1 删除（用户列表不再触达归因表）。
     spend_by_user = {}
     if platform_features.current_backend() == "postgres":
-        try:
-            acq_by_user = acquisition_store.user_acquisition_by_ids(user_ids)
-        except Exception:
-            app.logger.warning("admin v1 users 来源归因查询失败（按空展示）",
-                               exc_info=True)
         try:
             spend_by_user = spend_store.admin_users_spend_summaries([
                 ("owner" if u.get("role") == user_store.ROLE_OWNER
                  else "user", str(u.get("user_id") or ""))
                 for u in page if u.get("user_id")])
         except Exception:
-            app.logger.warning("admin v1 users 金额窗口查询失败（按空展示）",
+            app.logger.warning("admin v1 users 金额投影查询失败（按空展示）",
                                exc_info=True)
     if billing_ok:
         try:
@@ -5640,17 +5664,9 @@ def admin_v1_users():
     items = []
     for u in page:
         uid = str(u.get("user_id") or "")
-        acq = acq_by_user.get(uid) or {}
         spend = spend_by_user.get(uid)
         if spend is not None:
-            win = spend.get("window")
-            spend = {
-                "policy_scope": spend.get("policy_scope"),
-                "policy_id": spend.get("policy_id"),
-                "error": spend.get("error"),
-                "window": _admin_v1_spend_window_summary(win)
-                if win is not None else None,
-            }
+            spend = _admin_v1_spend_summary_out(spend)
         items.append({
             "user_id": uid,
             "display_name": u.get("display_name"),
@@ -5661,17 +5677,16 @@ def admin_v1_users():
             "ai_access": bool(u.get("ai_access")),
             "created_at": u.get("created_at"),
             "registration_method": reg_methods.get(uid, "manual"),
-            # PR4：user_acquisition 归因（无行 = 未归因，保持 null）
-            "campaign": acq.get("campaign_id"),
-            "source": acq.get("source_code"),
+            # 批次 D1（§4.4）：campaign/source 用户级归因字段整键删除
+            #（历史数据仍冻结在 user_acquisition 表，仅审计工具可达）
             # 批次 F：turn_used/turn_limit 字段删除（turn 消费闸退役；
             # 金额侧见 billing/spend 字段）
             # 金额余额（billing；未开户 null，绝不伪造 0 余额账户；金额字段
             # 十进制字符串化，§5 v0.3）
             "billing": _admin_v1_nano_out(accounts.get(uid))
             if billing_ok else None,
-            # 批次 D §6.2：当前月金额窗口 + 默认/覆盖状态（json 后端 null）
-            "spend": _admin_v1_nano_out(spend) if spend is not None else None,
+            # Batch B wave 2：按角色/target 互斥的金额投影（json 后端 null）
+            "spend": spend,
             "last_ai_call_at": last_calls.get(uid) if billing_ok else None,
         })
     next_cursor = None
@@ -6016,13 +6031,17 @@ def admin_v1_users_create():
     校验/错误码镜像旧 POST /api/admin/users（login_id 唯一冲突 409；密码
     15..200）；audit 动作与旧端点一致（user.create）。
 
-    批次 D（§5.1）扩展可选字段：
-      - ``monthly_limit_nano_cny``：十进制字符串 nano-CNY | null（缺省）。
-        null/缺省 = 继承全局 user_default；非 null = 同一 PG 事务内为新用户
-        建 user_override 月额度策略（user 插入 + override + audit 任一失败
-        整体回滚，user_store_pg.create_user_with_spend_override）；
+    批次 B wave 2（§Batch B 数据模型 6 / §4.3）扩展可选字段：
+      - ``total_limit_nano_cny``：十进制字符串 nano-CNY | null（缺省）。
+        null/缺省 = 不建总额度行（该用户由 cutover 回填或首个显式
+        total-limit 操作处理，不伪造 0 额度）；非 null = 同一 PG 事务内为
+        新用户建**一次性总额度**行（user 插入 + allowance + audit 任一失败
+        整体回滚，user_store_pg.create_user_with_total_allowance，source=
+        admin_create；**不再创建 user_override 月策略**）；
+      - ``monthly_limit_nano_cny``（旧 wire 名）兼容保留一个发布周期：单独
+        传按面值落总额度；与 total 同传 → 400 ambiguous_spend_limit；
       - ``ai_access``：bool（缺省 True，与 users.ai_access 列默认一致）。
-    两个新字段要求 PG（json/dual 稳定 503，不降级）。
+    带金额字段时要求 PG（json/dual 稳定 503，不降级）。
     """
     auth = _require_owner_admin_v1()
     if auth:
@@ -6050,15 +6069,25 @@ def admin_v1_users_create():
     if ai_access is not None and not isinstance(ai_access, bool):
         return _admin_v1_error(400, "invalid_request",
                                "ai_access 需为布尔值")
-    # 金额 wire：只接受 ^-?[0-9]{1,19}$ 十进制字符串（JSON number 一律 400）
+    # 金额 wire：只接受 ^-?[0-9]{1,19}$ 十进制字符串（JSON number 一律 400）；
+    # Batch B：total（新）与 monthly（旧兼容名）同传 → 稳定 400 ambiguous
+    if body.get("monthly_limit_nano_cny") is not None \
+            and body.get("total_limit_nano_cny") is not None:
+        return _admin_v1_error(
+            400, "ambiguous_spend_limit",
+            "monthly_limit_nano_cny 与 total_limit_nano_cny 只能传其一"
+            "（旧月额度字段已退役，请在兼容期内只传 total_limit_nano_cny）")
     try:
-        monthly_limit = _admin_v1_amount_in(body.get("monthly_limit_nano_cny"),
-                                            "monthly_limit_nano_cny")
+        total_limit = _admin_v1_amount_in(
+            body.get("total_limit_nano_cny")
+            if body.get("total_limit_nano_cny") is not None
+            else body.get("monthly_limit_nano_cny"),
+            "total_limit_nano_cny")
     except ValueError as exc:
         return _admin_v1_error(400, "invalid_request", str(exc))
 
     actor = actor_identity().get("user_id")
-    if monthly_limit is None and ai_access is None:
+    if total_limit is None and ai_access is None:
         # 无新字段：保持既有路径（json 后端也可建号；audit 与建号分离与旧
         # 端点一致）
         try:
@@ -6073,30 +6102,32 @@ def admin_v1_users_create():
         _audit("user.create", target_type="user", target_id=user.get("user_id"))
         return jsonify(user=_admin_v1_user_out(user))
 
-    # 带新字段：user 插入 + override + audit 必须同一 PG 事务（§5.1）
+    # 带新字段：user 插入 + 一次性总额度 + audit 必须同一 PG 事务（§5.1）
     if platform_features.current_backend() != "postgres":
         return _admin_v1_pg_required()
     import user_store_pg
     try:
-        user, override = user_store_pg.create_user_with_spend_override(
+        user, allowance = user_store_pg.create_user_with_total_allowance(
             login_id, password, display_name=display_name,
             ai_access=True if ai_access is None else ai_access,
-            monthly_limit_nano_cny=monthly_limit, actor_user_id=actor)
+            total_limit_nano_cny=total_limit, actor_user_id=actor)
     except ValueError as e:
         msg = str(e)
+        if "ambiguous_spend_limit" in msg:
+            return _admin_v1_error(400, "ambiguous_spend_limit", msg)
         if "已存在" in msg:
             return _admin_v1_error(409, "login_id_conflict", msg)
         return _admin_v1_error(400, "invalid_request", msg)
     except platform_features.PgFeatureUnavailable:
         return _admin_v1_pg_required()
     except Exception:
-        # 单事务组合原语（建号+override+audit）任一失败已整体回滚——
+        # 单事务组合原语（建号+总额度+audit）任一失败已整体回滚——
         # 统一 500，不暴露内部错误细节
-        app.logger.exception("admin v1 users create（含月额度覆盖）失败")
+        app.logger.exception("admin v1 users create（含总额度）失败")
         return _admin_v1_error(500, "internal",
                                "用户创建失败（事务已整体回滚，无半创建状态）")
     return jsonify(user=_admin_v1_user_out(user),
-                   spend_override=_admin_v1_nano_out(override))
+                   total_allowance=_admin_v1_nano_out(allowance))
 
 
 def _admin_v1_set_user_enabled(user_id, enabled):
@@ -6217,7 +6248,7 @@ def admin_v1_invites_list():
     next_cursor = None
     if has_more:
         next_cursor = _admin_v1_encode_cursor({"o": offset + limit})
-    # 金额字段（monthly_limit_nano_cny）十进制字符串化（§5 v0.3）
+    # 金额字段（total_limit_nano_cny，Batch B wave 2）十进制字符串化（§5 v0.3）
     return jsonify(invites=[_admin_v1_nano_out(_invite_public_view(i))
                             for i in page],
                    next_cursor=next_cursor, limit=limit)
@@ -6225,11 +6256,16 @@ def admin_v1_invites_list():
 
 @app.route("/api/admin/v1/invites", methods=["POST"])
 def admin_v1_invites_create():
-    """创建一次性邀请码（镜像旧 4026：限流 + source_code/campaign_id 校验）。
+    """创建一次性邀请码（owner；限流 + 字段校验）。
 
-    明文 code 仅本响应返回一次（no-store）。批次 D §5.2 扩展可选
-    ``monthly_limit_nano_cny``（十进制字符串 nano-CNY | null=继承默认）：
-    兑换事务内为新用户建 user_override 月额度（见 registration_store）。
+    明文 code 仅本响应返回一次（no-store）。Batch B wave 2（§Batch B 数据
+    模型 6 / §Batch D1 13）：可选 ``total_limit_nano_cny``（十进制字符串
+    nano-CNY | null=不建额度行，兑换用户由 cutover/默认处理）——兑换事务内
+    为新用户建一次性总额度（registration_store，source="invite"；不再建
+    user_override）。旧 ``monthly_limit_nano_cny`` 单独传兼容一个发布周期
+    （面值按总额度兑现）；与 total 同传 → 400 ambiguous_spend_limit。
+    邀请不再携带来源：``source_code``/``campaign_id``/``cohort`` 出现在
+    body 一律 400 retired_invite_field（D1 13；§4.4）。
     """
     auth = _require_owner_admin_v1()
     if auth:
@@ -6250,6 +6286,21 @@ def admin_v1_invites_create():
                 429, {"Retry-After": str(max(1, int(retry)))})
 
     body = request.get_json(silent=True) or {}
+    # 批次 D1 13（§4.4）：来源字段退役——接受即 400（不再静默忽略，
+    # 防止旧调用方误以为来源仍被记录）
+    retired = [k for k in ("source_code", "campaign_id", "cohort")
+               if body.get(k) is not None]
+    if retired:
+        return _admin_v1_error(
+            400, "retired_invite_field",
+            "邀请不再携带来源字段：%s（§4.4 邀请与来源解耦）"
+            % ", ".join(sorted(retired)))
+    if body.get("monthly_limit_nano_cny") is not None \
+            and body.get("total_limit_nano_cny") is not None:
+        return _admin_v1_error(
+            400, "ambiguous_spend_limit",
+            "monthly_limit_nano_cny 与 total_limit_nano_cny 只能传其一"
+            "（旧月额度字段已退役，请在兼容期内只传 total_limit_nano_cny）")
     login_id = body.get("login_id")
     if login_id is not None:
         login_id = str(login_id).strip()
@@ -6272,28 +6323,18 @@ def admin_v1_invites_create():
     ai_access = body.get("ai_access")
     if ai_access is not None and not isinstance(ai_access, bool):
         return _admin_v1_error(400, "invalid_request", "ai_access 需为布尔值")
-    cohort = body.get("cohort")
-    if cohort is not None and (not isinstance(cohort, str) or len(cohort) > 64):
-        return _admin_v1_error(400, "invalid_request",
-                               "cohort 需为 ≤64 字符的字符串")
     note = body.get("note")
     if note is not None and (not isinstance(note, str) or len(note) > 200):
         return _admin_v1_error(400, "invalid_request",
                                "note 需为 ≤200 字符的字符串")
-    source_code = body.get("source_code")
-    if source_code is not None and (not isinstance(source_code, str)
-                                    or len(source_code) > 64):
-        return _admin_v1_error(400, "invalid_request",
-                               "source_code 需为 ≤64 字符的字符串")
-    campaign_id = body.get("campaign_id")
-    if campaign_id is not None and (not isinstance(campaign_id, str)
-                                    or len(campaign_id) > 64):
-        return _admin_v1_error(400, "invalid_request",
-                               "campaign_id 需为 ≤64 字符的字符串")
-    # 批次 D §5.2：可选月额度覆盖模板（十进制字符串 nano-CNY | null=继承默认）
+    # Batch B wave 2：初始**总额度**模板（十进制字符串 nano-CNY | null=不建行）；
+    # 旧 monthly 字段单独传按面值兼容落总额度（store 语义）
     try:
-        monthly_limit = _admin_v1_amount_in(
-            body.get("monthly_limit_nano_cny"), "monthly_limit_nano_cny")
+        total_limit = _admin_v1_amount_in(
+            body.get("total_limit_nano_cny")
+            if body.get("total_limit_nano_cny") is not None
+            else body.get("monthly_limit_nano_cny"),
+            "total_limit_nano_cny")
     except ValueError as exc:
         return _admin_v1_error(400, "invalid_request", str(exc))
 
@@ -6302,12 +6343,14 @@ def admin_v1_invites_create():
         invite = registration_store.create_invite(
             current_identity().get("user_id"), login_id=login_id,
             ttl_seconds=ttl_hours * 3600,
-            ai_access=bool(ai_access), cohort=cohort or "",
+            ai_access=bool(ai_access),
             note=note or "",
-            source_code=source_code or "", campaign_id=campaign_id or None,
-            monthly_limit_nano_cny=monthly_limit)
+            total_limit_nano_cny=total_limit)
     except ValueError as exc:
-        return _admin_v1_error(400, "invalid_request", str(exc))
+        msg = str(exc)
+        code = ("ambiguous_spend_limit"
+                if "ambiguous_spend_limit" in msg else "invalid_request")
+        return _admin_v1_error(400, code, msg)
     except platform_features.PgFeatureUnavailable:
         return _admin_v1_pg_required()
     except registration_store.RegistrationStoreError as exc:
@@ -6337,7 +6380,7 @@ def admin_v1_invites_revoke(invite_id):
         return _admin_v1_error(409, "invite_not_revocable", str(exc))
     except platform_features.PgFeatureUnavailable:
         return _admin_v1_pg_required()
-    return jsonify(invite=_invite_public_view(invite))
+    return jsonify(invite=_admin_v1_nano_out(_invite_public_view(invite)))
 
 
 @app.route("/api/admin/v1/turn-budgets", methods=["PUT"])
@@ -6525,6 +6568,28 @@ def _admin_v1_spend_window_summary(window):
     return out
 
 
+def _admin_v1_spend_summary_out(spend_item):
+    """admin_users_spend_summaries 单主体项 → admin v1 wire 形态（互斥）。
+
+    - ``total`` 形态（user + total_allowance）：原样透传，金额键经
+      ``_admin_v1_nano_out`` 字符串化（remaining/overage 由 store 计算，
+      remaining=max(0, limit-spent-reserved)、overage=max(0, spent+reserved-
+      limit)，§Batch B API/bridge 契约）；**不**合成/补写 window 键；
+    - window 形态（owner / cutover 前 user）：policy_* + window 摘要
+      （remaining_nano 重算字符串化）；
+    - ``error``（spend_total_allowance_missing / spend_policy_missing 等）
+      原样透传——管理页需要看到「谁没有有效额度投影」。
+    前端两种形态同时出现必须报契约错误（§4.3）；本出口只透传，不做任一
+    形态的兼容合成。
+    """
+    out = dict(spend_item)
+    if out.get("total") is not None:
+        out["total"] = _admin_v1_nano_out(dict(out["total"]))
+    if out.get("window") is not None:
+        out["window"] = _admin_v1_spend_window_summary(out["window"])
+    return out
+
+
 def _admin_v1_spend_window_subject(subject_type, subject_id):
     """单主体当前窗口（get_or_create；策略解析失败降级为 error 项不拖垮整页）。"""
     try:
@@ -6543,7 +6608,12 @@ def admin_v1_spend_policies():
 
     resolved 为 demo_global / user_default / owner 三个 scope 当前时刻的
     有效策略（或 None）；enforcement_mode 本批恒 shadow（0023 种子）。
-    金额字段（limit_nano_cny 等）十进制字符串化（§5 v0.3 修订）。
+    Batch B wave 2（§Batch B API/bridge 契约）：响应追加三键拆分
+    ——admin_spend_settings_values()（user_default_total_limit /
+    demo_weekly_limit / owner_monthly_limit，金额 nano 十进制字符串化，
+    **扁平合并进响应顶层**，供设置页直接读取），取代含混的「统一周期
+    额度」；既有 items/resolved/enforcement_mode 字段保留兼容一个发布
+    周期。
     """
     auth = _require_owner_admin_v1()
     if auth:
@@ -6552,6 +6622,7 @@ def admin_v1_spend_policies():
         return _admin_v1_pg_required()
     try:
         result = spend_store.admin_list_policies()
+        spend_settings = spend_store.admin_spend_settings_values()
     except platform_features.PgFeatureUnavailable:
         return _admin_v1_pg_required()
     except Exception:
@@ -6560,6 +6631,7 @@ def admin_v1_spend_policies():
     return jsonify(items=_admin_v1_nano_out(result["items"]),
                    resolved=_admin_v1_nano_out(result["resolved"]),
                    enforcement_mode=result["enforcement_mode"],
+                   **_admin_v1_nano_out(spend_settings),
                    backend=platform_features.current_backend())
 
 
@@ -6787,15 +6859,66 @@ def admin_v1_spend_window_adjust(window_id):
     return jsonify(window=_admin_v1_spend_window_summary(window))
 
 
+#: 批次 B wave 2（§Batch B API/bridge 契约）：旧月额度覆盖端点统一退役响应
+#: （410 Gone + 稳定 code + 指向新 total-limit 端点的中文指引）。
+_SPEND_OVERRIDE_RETIRED_NOTE = (
+    "用户月额度覆盖已退役：注册 user 的消费控制改为一次性总额度，请使用 "
+    "PUT /api/admin/v1/spend/users/<user_id>/total-limit（设置绝对总上限）"
+    "与 POST /api/admin/v1/spend/users/<user_id>/restore-default（恢复默认）")
+
+
+def _spend_override_retired_response(method):
+    """旧 spend-override 端点统一出口：410 + code + 指引，并 audit 尝试。"""
+    _audit("spend.override_retired_write", target_type="user",
+           target_id=None,
+           detail={"endpoint": "%s /api/admin/v1/users/<user_id>"
+                              "/spend-override" % method})
+    return _admin_v1_error(410, "spend_override_deprecated",
+                           _SPEND_OVERRIDE_RETIRED_NOTE)
+
+
 @app.route("/api/admin/v1/users/<user_id>/spend-override", methods=["PUT"])
 def admin_v1_users_spend_override_set(user_id):
-    """设置/更新用户月额度覆盖（§5.1；body: {monthly_limit_nano_cny}）。
+    """已退役（Batch B wave 2，§Batch B API/bridge 契约）：月额度覆盖随
+    user 消费控制迁移为一次性总额度而关闭。410 + spend_override_deprecated +
+    audit 尝试；新写端点 PUT .../spend/users/<id>/total-limit。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    return _spend_override_retired_response("PUT")
 
-    - 金额入参十进制字符串（JSON number 400；>2^53 不失真）；
-    - owner 目标拒绝：owner 主体解析独立 owner 策略，不存在用户覆盖语义
-      （§3.1「Owner 不与普通用户共用金额池」的镜像约束）；
-    - 覆盖只影响**之后新建**的窗口（当前已开窗口 snapshot 不变，§1.1）；
-    - set 与 audit 同一事务（spend_store.set_user_override）。清除走 DELETE。
+
+@app.route("/api/admin/v1/users/<user_id>/spend-override", methods=["DELETE"])
+def admin_v1_users_spend_override_clear(user_id):
+    """已退役（Batch B wave 2）：清除月额度覆盖随总额度迁移关闭。410 +
+    spend_override_deprecated + audit 尝试；恢复默认走
+    POST .../spend/users/<id>/restore-default。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    return _spend_override_retired_response("DELETE")
+
+
+# --------------------------------------------------------------------------- #
+# Batch B wave 2（§Batch B API/bridge 契约 / §4.3）：user 一次性总额度写端点
+#
+# 与既有 spend 写端点同口径：owner 门控（_require_owner_admin_v1，预览态
+# 403）+ 全局 CSRF；PG-only；金额入参十进制字符串（_admin_v1_amount_in，
+# JSON number 一律 400），出口经 _admin_v1_nano_out；CAS 版本冲突 → 409
+# version_conflict；业务写入与 audit 同一事务（spend_store 各原语内实现）。
+# 语义红线（§3.1 / §Batch B 迁移与额度语义 7）：X 是**绝对总上限**，绝不是
+# `limit += X` 加款；改 X / 恢复默认都绝不清零 spent/reserved；owner 主体
+# 一律 400（owner 走独立月窗口，绝不出现 total allowance）。
+# --------------------------------------------------------------------------- #
+@app.route("/api/admin/v1/spend/users/<user_id>/total-limit", methods=["PUT"])
+def admin_v1_spend_user_total_limit_set(user_id):
+    """设置用户绝对总额度 X（CAS；body: {total_limit_nano_cny, expected_version}）。
+
+    - ``total_limit_nano_cny`` 为**绝对值语义**（十进制字符串；改小到低于
+      已用加预占时 remaining 显示 0、overage 明示超额，后续授权全部拒绝）；
+    - ``expected_version`` CAS 未命中 → 409 version_conflict；
+    - role=user 才有总额度：owner → 400，用户不存在 → 404；
+    - audit（spend.total_allowance_update）与写入同一事务。
     """
     auth = _require_owner_admin_v1()
     if auth:
@@ -6806,38 +6929,53 @@ def admin_v1_users_spend_override_set(user_id):
         return _admin_v1_error(400, "invalid_request", "user_id 非法")
     body = request.get_json(silent=True) or {}
     try:
-        limit = _admin_v1_amount_in(body.get("monthly_limit_nano_cny"),
-                                    "monthly_limit_nano_cny")
+        new_limit = _admin_v1_amount_in(body.get("total_limit_nano_cny"),
+                                        "total_limit_nano_cny")
     except ValueError as exc:
         return _admin_v1_error(400, "invalid_request", str(exc))
-    if limit is None:
+    if new_limit is None:
         return _admin_v1_error(
             400, "invalid_request",
-            "缺少 monthly_limit_nano_cny（十进制字符串；清除覆盖请用 DELETE）")
+            "缺少 total_limit_nano_cny（十进制字符串；X 是绝对总上限，"
+            "不做加款语义）")
+    expected_version = body.get("expected_version")
+    if isinstance(expected_version, bool) \
+            or not isinstance(expected_version, int) or expected_version < 1:
+        return _admin_v1_error(400, "invalid_request",
+                               "expected_version 需为正整数")
     target = user_store.get_user(user_id)
     if target is None:
         return _admin_v1_error(404, "user_not_found", "用户不存在")
     if target.get("role") == user_store.ROLE_OWNER:
         return _admin_v1_error(
             400, "invalid_request",
-            "owner 使用独立 owner 策略，不设用户月额度覆盖（§3.1）")
+            "owner 使用独立月窗口策略，无一次性总额度（§4.3 互斥形态）")
     try:
-        override = spend_store.set_user_override(
-            user_id, limit, updated_by=actor_identity().get("user_id"),
-            actor_user_id=actor_identity().get("user_id"))
+        allowance = spend_store.set_user_total_limit(
+            user_id, new_limit, expected_version,
+            actor_user_id=actor_identity().get("user_id"),
+            updated_by=current_identity().get("user_id"))
     except spend_store.SpendError as exc:
         return _admin_v1_spend_error_response(exc)
     except platform_features.PgFeatureUnavailable:
         return _admin_v1_pg_required()
     except Exception:
-        app.logger.exception("admin v1 user spend override 设置失败")
-        return _admin_v1_error(500, "internal", "用户月额度覆盖设置失败")
-    return jsonify(user_id=user_id, override=_admin_v1_nano_out(override))
+        app.logger.exception("admin v1 user total limit 设置失败")
+        return _admin_v1_error(500, "internal", "用户总额度设置失败")
+    return jsonify(user_id=user_id,
+                   total_allowance=_admin_v1_nano_out(allowance))
 
 
-@app.route("/api/admin/v1/users/<user_id>/spend-override", methods=["DELETE"])
-def admin_v1_users_spend_override_clear(user_id):
-    """清除用户月额度覆盖（下个窗口起回退 user_default，§9.2）。"""
+@app.route("/api/admin/v1/spend/users/<user_id>/restore-default",
+           methods=["POST"])
+def admin_v1_spend_user_total_limit_restore(user_id):
+    """「恢复默认」：把该用户绝对总上限显式改为**当时**默认 X
+    （body: {expected_version}；CAS；不清零 spent/reserved，§3.1）。
+
+    默认解析：ai_spend_total_defaults 缺行回退当时有效 user_default 策略
+    面值（source 标明来源）；两者皆缺 → 404 spend_policy_missing
+    （fail-closed 不猜值）。
+    """
     auth = _require_owner_admin_v1()
     if auth:
         return auth
@@ -6845,25 +6983,119 @@ def admin_v1_users_spend_override_clear(user_id):
         return _admin_v1_pg_required()
     if "/" in user_id:
         return _admin_v1_error(400, "invalid_request", "user_id 非法")
+    body = request.get_json(silent=True) or {}
+    expected_version = body.get("expected_version")
+    if isinstance(expected_version, bool) \
+            or not isinstance(expected_version, int) or expected_version < 1:
+        return _admin_v1_error(400, "invalid_request",
+                               "expected_version 需为正整数")
     target = user_store.get_user(user_id)
     if target is None:
         return _admin_v1_error(404, "user_not_found", "用户不存在")
     if target.get("role") == user_store.ROLE_OWNER:
         return _admin_v1_error(
             400, "invalid_request",
-            "owner 使用独立 owner 策略，无用户月额度覆盖可清除（§3.1）")
+            "owner 使用独立月窗口策略，无一次性总额度（§4.3 互斥形态）")
     try:
-        cleared = spend_store.clear_user_override(
-            user_id, updated_by=actor_identity().get("user_id"),
-            actor_user_id=actor_identity().get("user_id"))
+        allowance = spend_store.restore_user_total_default(
+            user_id, expected_version,
+            actor_user_id=actor_identity().get("user_id"),
+            updated_by=current_identity().get("user_id"))
     except spend_store.SpendError as exc:
         return _admin_v1_spend_error_response(exc)
     except platform_features.PgFeatureUnavailable:
         return _admin_v1_pg_required()
     except Exception:
-        app.logger.exception("admin v1 user spend override 清除失败")
-        return _admin_v1_error(500, "internal", "用户月额度覆盖清除失败")
-    return jsonify(user_id=user_id, cleared=cleared)
+        app.logger.exception("admin v1 user total limit 恢复默认失败")
+        return _admin_v1_error(500, "internal", "用户总额度恢复默认失败")
+    return jsonify(user_id=user_id,
+                   total_allowance=_admin_v1_nano_out(allowance))
+
+
+@app.route("/api/admin/v1/spend/user-default-total-limit", methods=["PUT"])
+def admin_v1_spend_user_default_total_limit():
+    """设置全局「新 user 默认总额度 X」（body: {limit_nano_cny,
+    expected_version}；CAS 写 ai_spend_total_defaults 单例）。
+
+    默认 X 只用于新用户首次开户，修改不追溯既有用户（§3.1）；行不存在时
+    expected_version 必须为 1（首个写入者）。settings.get 响应的
+    ``user_default_total_limit_source == "total_defaults"`` 时管理插件
+    走本端点；``"user_default_policy"``（cutover 前回退源）时仍走
+    PUT /api/admin/v1/spend/policies/<policy_id> 兼容路径。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.billing_features_available():
+        return _admin_v1_pg_required()
+    body = request.get_json(silent=True) or {}
+    limit = body.get("limit_nano_cny")
+    expected_version = body.get("expected_version")
+    if isinstance(expected_version, bool) \
+            or not isinstance(expected_version, int) or expected_version < 1:
+        return _admin_v1_error(400, "invalid_request",
+                               "expected_version 需为正整数")
+    try:
+        limit_nano = int(limit)
+    except (TypeError, ValueError):
+        return _admin_v1_error(400, "invalid_request",
+                               "limit_nano_cny 需为十进制整数字符串")
+    if limit_nano < 0:
+        return _admin_v1_error(400, "invalid_request",
+                               "limit_nano_cny 不得为负")
+    try:
+        out = spend_store.set_total_default(
+            limit_nano, expected_version,
+            actor_user_id=actor_identity().get("user_id"),
+            updated_by=current_identity().get("user_id"))
+    except spend_store.SpendError as exc:
+        return _admin_v1_spend_error_response(exc)
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 默认总额度设置失败")
+        return _admin_v1_error(500, "internal", "默认总额度设置失败")
+    return jsonify(user_default_total=_admin_v1_nano_out(out))
+
+
+@app.route("/api/admin/v1/spend/demo-stats", methods=["GET"])
+def admin_v1_spend_demo_stats():
+    """Demo 周消费统计（§4.6；owner-only 只读聚合，无写副作用）。
+
+    query 仅接受 ``window=current|previous``（缺省 current；边界取服务端
+    demo_global 周窗口，Asia/Shanghai 周一 00:00）——客户端不得传任意金额
+    或主体参数，出现任何其他 query 参数一律 400 invalid_request。响应原样
+    透传 spend_store.admin_demo_spend_stats（limit/spent/reserved/remaining、
+    priced/unpriced 调用数、token、hold 分状态计数、denials 按 reason 聚合；
+    金额 nano 十进制字符串化）。统计口**只读**：调用前后业务表行数不变
+    （§4.6 测试验收口）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not platform_features.billing_features_available():
+        return _admin_v1_pg_required()
+    window = (request.args.get("window") or "current").strip()
+    if window not in ("current", "previous"):
+        return _admin_v1_error(400, "invalid_request",
+                               "window 需为 current|previous（缺省 current；"
+                               "不接受任意时间/金额/主体参数）")
+    # 客户端不得传任意金额/主体（§4.6）：白名单外 query 参数一律拒绝
+    extra = set(request.args.keys()) - {"window"}
+    if extra:
+        return _admin_v1_error(
+            400, "invalid_request",
+            "不接受额外参数：%s（窗口边界由服务端决定）" % ",".join(sorted(extra)))
+    try:
+        stats = spend_store.admin_demo_spend_stats(window)
+    except spend_store.SpendError as exc:
+        return _admin_v1_spend_error_response(exc)
+    except platform_features.PgFeatureUnavailable:
+        return _admin_v1_pg_required()
+    except Exception:
+        app.logger.exception("admin v1 spend demo stats 读取失败")
+        return _admin_v1_error(500, "internal", "Demo 消费统计读取失败")
+    return jsonify(_admin_v1_nano_out(stats))
 
 
 # --------------------------------------------------------------------------- #
@@ -6878,10 +7110,32 @@ _SETTINGS_RUNTIME_FIELDS = (
     "own_task_max_steps_limit", "demo_max_concurrency",
 )
 
+#: Batch C 8/9（§4.5）：user 步数字段级 1..500 边界——默认值与硬上限都是
+#: 500，API 对 >500 返回稳定 400（不再「保存成功、运行时静默截回 500」，
+#: 遗留 >500 值由迁移 0031 显式归一并审计）。共享 _BUDGET_LIMIT_MAX 保持
+#: 1_000_000 不动（demo 步数/并发等字段各自边界由回归测试锁定）。
+_USER_STEP_LIMIT_FIELDS = frozenset((
+    "platform_task_max_steps", "own_task_max_steps_limit"))
+_USER_STEP_LIMIT_MAX = 500
+
+
+def _validate_user_step_limit_field(field, value):
+    """user 步数字段（1.._USER_STEP_LIMIT_MAX）校验；非法返回错误文案。"""
+    if not 1 <= value <= _USER_STEP_LIMIT_MAX:
+        return "{} 需在 1–{} 之间（注册用户单任务安全上限的默认与最高值均为 " \
+               "{}；消费额度由总金额控制）".format(field, _USER_STEP_LIMIT_MAX,
+                                                  _USER_STEP_LIMIT_MAX)
+    return None
+
 
 def _validate_runtime_settings(body):
     """校验 runtime 安全参数子集（批次 F；规则照抄 _validate_budget_settings：
     整数为 >0 且 ≤ _BUDGET_LIMIT_MAX，demo_enabled 布尔）。
+
+    Batch C（§Batch C 实现要求 1/9）：``platform_task_max_steps`` 与
+    ``own_task_max_steps_limit`` 使用字段级 1..500 边界（越界稳定 400）；
+    demo_task_max_steps / demo_max_concurrency 等其他字段维持各自现有边界
+    （正整数 ≤ _BUDGET_LIMIT_MAX）。
 
     返回 (validated, None) 或 (None, err)。允许部分更新（与 settings.update
     逐项提交模式对齐）；空对象 / 未知字段拒绝。
@@ -6906,7 +7160,11 @@ def _validate_runtime_settings(body):
             return None, err
         if iv <= 0:
             return None, "{} 需为正整数（> 0）".format(field)
-        if iv > _BUDGET_LIMIT_MAX:
+        if field in _USER_STEP_LIMIT_FIELDS:
+            err = _validate_user_step_limit_field(field, iv)
+            if err:
+                return None, err
+        elif iv > _BUDGET_LIMIT_MAX:
             return None, "{} 不可超过 {}".format(field, _BUDGET_LIMIT_MAX)
         validated[field] = iv
     return validated, None
@@ -6935,6 +7193,11 @@ def admin_v1_settings():
             demo_resolved = result["resolved"].get("demo_global")
             user_resolved = result["resolved"].get("user_default")
             owner_resolved = result["resolved"].get("owner")
+            # Batch B wave 2（§4.5 设置页）：三键拆分的额度设置值
+            # （user_default_total_limit / demo_weekly_limit /
+            # owner_monthly_limit；金额 nano 十进制字符串化；
+            # **扁平合并进 spend 顶层**，管理插件按 spend.<key> 直读）
+            spend_settings = spend_store.admin_spend_settings_values()
             # 下个窗口边界由服务端按 Asia/Shanghai 计算（§1.1；不创建窗口行）
             now_dt = datetime.now(timezone.utc)
             demo_bounds = spend_store.week_window_bounds(now_dt) \
@@ -6966,6 +7229,7 @@ def admin_v1_settings():
                     "user_default": user_resolved,
                     "owner": owner_resolved,
                 },
+                **spend_settings,
                 "current_windows": {
                     "demo": _window_or_error(
                         "demo", spend_store.DEMO_GLOBAL_SUBJECT),
@@ -7065,72 +7329,67 @@ def admin_v1_settings_runtime_put():
 
 
 # --------------------------------------------------------------------------- #
-# PR4 Admin API v1 来源归因（§9 表末两行 / §10.3 / §11.3 脱敏红线）
+# 批次 D1 15（§4.4）：来源归因 Admin API v1 退役——稳定 410 user_attribution_
+# retired（数据表冻结只读；一个发布周期消费者审计后另批删除路由）。owner 门控
+# 保持在 410 之前（匿名 401 / 非 owner 403 语义不变，不向未授权方泄露端点状态）。
 # --------------------------------------------------------------------------- #
+_ACQUISITION_RETIRED_NOTE = (
+    "用户来源归因已退役（§4.4 邀请与站点访问统计解耦）：来源漏斗与用户来源"
+    "明细不再提供；站点访问趋势请用 GET /api/admin/v1/site-stats")
+
+
 @app.route("/api/admin/v1/acquisition/summary", methods=["GET"])
 def admin_v1_acquisition_summary():
-    """来源漏斗汇总（§10.3）：每 source/campaign 的访问 → 注册 → 首次 AI。
-
-    首次 AI = ai_usage_events 每用户最早 occurred_at 是否存在（不重复计数）。
-    附注册模式（§10.3「注册模式显示」）。脱敏红线（§9）：无完整 IP、无
-    referrer query、无 visitor hash（汇总只有计数与 slug）。
-    """
+    """已退役（批次 D1 15）：410 user_attribution_retired（owner 门控后）。"""
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.budget_features_available():
-        return _admin_v1_pg_required()
-    try:
-        summary = acquisition_store.admin_funnel_summary()
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
-    except Exception:
-        app.logger.exception("admin v1 acquisition summary 读取失败")
-        return _admin_v1_error(500, "internal", "来源汇总读取失败")
-    return jsonify(
-        registration_mode=_effective_registration_mode(),
-        backend=platform_features.current_backend(),
-        **summary)
+    _audit("acquisition.retired_read", target_type="acquisition",
+           target_id=None,
+           detail={"endpoint": "GET /api/admin/v1/acquisition/summary"})
+    return _admin_v1_error(410, "user_attribution_retired",
+                           _ACQUISITION_RETIRED_NOTE)
 
 
 @app.route("/api/admin/v1/acquisition/users", methods=["GET"])
 def admin_v1_acquisition_users():
-    """用户来源明细分页（§10.3：first touch 与 last touch 分开显示）。
-
-    cursor 分页（(attributed_at, user_id) keyset 降序）。脱敏红线（§9）：
-    login ID 只出掩码；visitor 只给 hash 前缀 8 hex；无完整 IP（触点行本就
-    只有前缀 hash 且不导出）；referrer 只有 hostname（触点写入时已剥 query）。
-    """
+    """已退役（批次 D1 15）：410 user_attribution_retired（owner 门控后）。"""
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.budget_features_available():
-        return _admin_v1_pg_required()
-    limit = _admin_v1_limit_arg()
-    raw_cursor = _admin_v1_decode_cursor(request.args.get("cursor"))
-    cursor = None
-    if raw_cursor and "k" in raw_cursor and isinstance(raw_cursor["k"], list) \
-            and len(raw_cursor["k"]) == 2:
-        cursor = (raw_cursor["k"][0], raw_cursor["k"][1])
+    _audit("acquisition.retired_read", target_type="acquisition",
+           target_id=None,
+           detail={"endpoint": "GET /api/admin/v1/acquisition/users"})
+    return _admin_v1_error(410, "user_attribution_retired",
+                           _ACQUISITION_RETIRED_NOTE)
+
+
+# --------------------------------------------------------------------------- #
+# Batch D2（§4.4 / §Batch D2 7）：匿名站点访问统计——owner-only 只读端点。
+# 固定返回 today/d7/d30、daily、top referrers/pages/countries、recent、
+# visitor_kinds 与 geo_configured；不提供 user/campaign/invite 过滤参数；
+# 查询不创建事件、不调用清理、不改任何业务表（§Batch D2 2）。
+# 复用 admin:overview:read 门控口径（_require_owner_admin_v1）；store 未随
+# 镜像发布（import 容错 None）→ 404 site_stats_unavailable。
+# --------------------------------------------------------------------------- #
+@app.route("/api/admin/v1/site-stats", methods=["GET"])
+def admin_v1_site_stats():
+    """站点访问统计（Batch D2；owner-only 只读透传 site_stats_store.dashboard_stats）。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if site_stats_store is None:
+        return _admin_v1_error(404, "site_stats_unavailable",
+                               "站点访问统计未随本镜像发布")
     try:
-        page = acquisition_store.admin_user_acquisition_page(
-            cursor=cursor, limit=limit)
-    except ValueError as exc:
-        return _admin_v1_error(400, "invalid_request", str(exc))
+        stats = site_stats_store.dashboard_stats()
     except platform_features.PgFeatureUnavailable:
         return _admin_v1_pg_required()
     except Exception:
-        app.logger.exception("admin v1 acquisition users 读取失败")
-        return _admin_v1_error(500, "internal", "用户来源明细读取失败")
-    for item in page["items"]:
-        # login ID 掩码（§9：原始账号不回显）
-        item["login_id_masked"] = registration_store.mask_login_id(
-            item.pop("login_id", None) or "")
-    next_cursor = None
-    if page["next_cursor"] is not None:
-        next_cursor = _admin_v1_encode_cursor(
-            {"k": list(page["next_cursor"])})
-    return jsonify(items=page["items"], next_cursor=next_cursor, limit=limit)
+        app.logger.exception("admin v1 site stats 读取失败")
+        return _admin_v1_error(500, "internal", "站点访问统计读取失败")
+    # 原样透传（聚合形态由 store 契约钉死）；无写副作用
+    return jsonify(stats)
 
 
 @app.route("/api/slides")
@@ -7195,17 +7454,39 @@ ZIP_MAX_COMPRESSION_RATIO = float(
 ZIP_WATERMARK_CHECK_BYTES = 64 * 1024 * 1024
 
 
-def _validate_slide_file(path: Path):
-    """验证单个切片文件能否被 slide_io 打开（成功返回 True，否则 False）。"""
+def _validate_slide_file(path: Path, *, format_hint=None):
+    """验证单个切片文件能否被 slide_io 打开（上传修复 A0 异常契约）。
+
+    成功返回 ``None``；失败抛 :class:`slide_io.SlideValidationError`（稳定
+    机器码：``invalid_slide`` / ``slide_open_unsupported`` / ``slide_open_failed``）。
+    实际字节始终从 ``path`` 读取；``format_hint`` 只参与逻辑格式判定——
+    V1 调用方传净化后的原始 basename（``.uploading-*.part`` 临时名不参与
+    判定），V2 传 task 的 ``safe_name``；ZIP 成员带真实后缀可单参数调用。
+
+    slide_io 未识别的底层异常在此收敛为 ``slide_open_failed``：先按稳定
+    阶段/机器码/异常类型/逻辑扩展名记一条不含完整路径与内容的日志再抛出，
+    保证路由层只需捕获 SlideValidationError 一种异常。
+    """
     try:
-        osr = slide_io.open_slide(path)
-    except Exception:
-        return False
+        osr = slide_io.open_slide(path, format_hint=format_hint)
+    except slide_io.SlideValidationError:
+        raise
+    except Exception as e:  # noqa: BLE001  未知异常按契约收敛，不泄露细节
+        try:
+            logical = slide_io.logical_format_ext(format_hint or path)
+        except Exception:  # noqa: BLE001
+            logical = ""
+        app.logger.warning(
+            "upload.validate_failed stage=slide_open code=slide_open_failed"
+            " exc=%s ext=%s", type(e).__name__, logical)
+        raise slide_io.SlideValidationError(
+            "slide_open_failed", "切片验证失败",
+            cause_type=type(e).__name__) from e
     try:
         osr.close()
     except Exception:
         pass
-    return True
+    return None
 
 
 def _prepare_zip_bundle(src_zip: Path, reservation=None):
@@ -7401,12 +7682,23 @@ def _prepare_zip_bundle(src_zip: Path, reservation=None):
         _cleanup_all()
         return "磁盘空间不足", 507
 
-    # 内容验证在提升之前（G7）：切片文件逐个试开，一个都打不开 → 整体拒绝
+    # 内容验证在提升之前（G7）：切片文件逐个试开，一个都打不开 → 整体拒绝。
+    # A0：成员带真实后缀，单参数调用；失败成员按 SlideValidationError 稳定
+    # 机器码记日志后跳过（日志不含成员完整路径），全失败仍整体 400。
     valid = []
     for abs_p, rel in entries:
         ext = rel.as_posix().rsplit(".", 1)[-1].lower() if "." in rel.as_posix() else ""
-        if ext in SUPPORTED_EXTS and _validate_slide_file(abs_p):
-            valid.append(rel.as_posix())
+        if ext not in SUPPORTED_EXTS:
+            continue
+        try:
+            _validate_slide_file(abs_p)
+        except slide_io.SlideValidationError as e:
+            app.logger.warning(
+                "upload.validate_failed stage=zip_member code=%s exc=%s ext=%s",
+                e.code, e.cause_type,
+                slide_io.logical_format_ext(rel.name))
+            continue
+        valid.append(rel.as_posix())
     if not valid:
         _cleanup_all()
         return "压缩包内未找到可打开的有效切片文件", 400
@@ -7831,11 +8123,19 @@ def api_upload():
         return jsonify(error=f"保存失败: {e}"), 400
 
     # ---- 内容验证在提升之前（G7：验证通过才有 manifest / 受理）----
-    if not _validate_slide_file(tmp):
+    # A0：传净化后的原始 basename 作 format_hint（.part 临时名不参与格式判定）；
+    # 只捕获 SlideValidationError，按稳定机器码返回 400（未知异常已在
+    # _validate_slide_file 内收敛为 slide_open_failed）。
+    try:
+        _validate_slide_file(tmp, format_hint=safe)
+    except slide_io.SlideValidationError as e:
         tmp.unlink(missing_ok=True)
         _upload_release_quietly(reservation)
+        app.logger.warning(
+            "upload.validate_failed stage=v1 code=%s exc=%s ext=%s",
+            e.code, e.cause_type, slide_io.logical_format_ext(safe))
         hint = "MRXS 需连同数据目录打包为 zip 上传" if safe.lower().endswith(".mrxs") else "无效的切片文件"
-        return jsonify(error=hint), 400
+        return jsonify(error=hint, code=e.code), 400
     try:
         file_sha = _sha256_file(tmp)
     except OSError as e:
@@ -8019,10 +8319,13 @@ def _api_upload_zip(file, filename, safe, ident, reservation):
 # CSRF：/api/* 只认 X-CSRF-Token 头（U1 契约），无 token 的 PUT/POST/DELETE 在
 # 消费 body 之前即 400 csrf_required。
 # =========================================================================== #
-#: 前端切分片阈值（§3.4；U3 前端使用，本波先落服务端常量/env）：
-#: file.size >= 该值走 V2 分片，小文件继续旧单请求上传。
-UPLOAD_CHUNK_THRESHOLD = int(
-    os.environ.get("UPLOAD_CHUNK_THRESHOLD") or 128 * 1024 * 1024)
+#: 前端切分片阈值（上传修复 A1）：普通单文件切片（非 ZIP/MRXS）size >= 该值
+#: 走 V2 分片，小文件继续旧单请求上传；ZIP/MRXS 始终走旧接口。本常量是唯一
+#: 权威路由阈值，经 :func:`_app_capabilities` → 模板 HP_APP_BOOTSTRAP 下发，
+#: 前端解析失败才回落同值；不再保留旧的 128 MiB 前端硬编码与未使用的
+#: UPLOAD_CHUNK_THRESHOLD env 双来源。注意 upload_task_store.UPLOAD_CHUNK_SIZE
+#: （16 MiB）只是每片大小，与本路由阈值无关，不得混用。
+UPLOAD_V2_THRESHOLD_BYTES = 16 * 1024 * 1024
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -8621,11 +8924,19 @@ def api_uploads_commit(upload_id):
             "hash_mismatch", "整文件 SHA-256 与期望不符", sha=sha_actual)
 
     # ---- 事务外 3：OpenSlide 试开验证（**在提升之前**，§2.3 纠正）----
-    if not _validate_slide_file(part):
+    # A0：传 task 的 safe_name 作 format_hint（.part 临时名不参与格式判定）；
+    # 验证失败 → _deterministic_fail 携同一稳定机器码（预占释放，终态幂等）。
+    try:
+        _validate_slide_file(part, format_hint=task["safe_name"])
+    except slide_io.SlideValidationError as e:
+        app.logger.warning(
+            "upload.validate_failed stage=v2_commit code=%s upload=%s exc=%s"
+            " ext=%s", e.code, upload_id, e.cause_type,
+            slide_io.logical_format_ext(task["safe_name"]))
         return _deterministic_fail(
-            "invalid_slide",
+            e.code,
             "无效的切片文件" + ("（MRXS 需打包 zip 走旧 /api/upload）"
-                              if task["safe_name"].lower().endswith(".mrxs") else ""))
+                            if task["safe_name"].lower().endswith(".mrxs") else ""))
 
     # ---- 事务外 4：原子 no-clobber 提升（提升后 .part 仍在，收口失败可回退）----
     try:
@@ -10013,10 +10324,14 @@ def _parse_client_request_id(body):
 
 
 def _platform_task_max_steps() -> int:
-    """注册用户平台 AI 单次任务步骤（ai_safety.platform_task_max_steps，默认 20）。
+    """注册用户平台 AI 单次任务步骤（ai_safety.platform_task_max_steps，默认 500）。
 
     批次 F：自周期列迁居 platform_settings（settings_store 统一设置源）；
     周期行仅在软闸回退路径（reserve_turn）与冻结报表中继续存在。
+    Batch C（§Batch C 实现要求 1）：默认值与硬上限均为 500——缺值/读取失败
+    回落 budget_store.DEFAULT_PLATFORM_TASK_MAX_STEPS（=500），不再回退 20；
+    运行时仍钳制到 _MAX_STEPS_LIMIT，但保存路径已改为字段级 1..500 稳定
+    400（不再「保存成功、运行时静默截回」），>500 存量由迁移 0031 显式归一。
     """
     try:
         raw = settings_store.get_ai_safety_settings()[
@@ -10028,7 +10343,12 @@ def _platform_task_max_steps() -> int:
 
 
 def _own_task_max_steps_limit() -> int:
-    """自带 API 可设置的步数硬上限（ai_safety.own_task_max_steps_limit，默认 500）。"""
+    """自带 API 可设置的步数硬上限（ai_safety.own_task_max_steps_limit，默认 500）。
+
+    Batch C：缺值回落 DEFAULT_OWN_TASK_MAX_STEPS_LIMIT（=500）；字段级
+    1..500 校验见 _validate_runtime_settings（自带 API 通道已退役，字段本批
+    兼容保留）。
+    """
     try:
         raw = settings_store.get_ai_safety_settings()[
             "own_task_max_steps_limit"]
@@ -10551,10 +10871,36 @@ def _inject_agent_extra_tools(user_ctx, slide, config):
     return True
 
 
+def _ai_dispatch_maintenance_active() -> bool:
+    """cutover 维护闸是否开启（Batch B §Batch B 迁移与额度语义 1）。
+
+    读 platform_settings 的 ``ai_dispatch_maintenance``（JSONB bool，0029
+    seed false）。仅 /api/ai/run|continue|ask|branch 在预备阶段（创建 hold /
+    grant / 预算预占之前）读取；true → 稳定 503 ai_dispatch_maintenance。
+    /api/demo/ai/run **不闸**（cutover 的停写要求只有 user open hold=0；
+    demo 是否同时维护由 runbook 显式选择，spec §Batch B 1）。
+
+    读失败 fail-closed（按「维护中」处理返回 True）：维护闸的目的是 cutover
+    期间保证 quiescence，漏放行的代价（在线重绑窗口出现新 hold）远大于误
+    503；且 hard mode 下设置存储不可用时后续 hold 授权本就 fail-closed，
+    这里提前拒绝只是把失败前移到更便宜的检查点。与 ``_demo_public_mode``
+    「读失败不放大权限」的既有容错惯例一致。
+    """
+    try:
+        return bool(settings_store.get_setting(
+            settings_store.AI_DISPATCH_MAINTENANCE_KEY, False))
+    except Exception:
+        app.logger.warning("ai_dispatch_maintenance 读取失败（fail-closed "
+                           "按维护中处理）", exc_info=True)
+        return True
+
+
 def _ai_run_prepare(user_ctx, body, slide, need_grant):
     """run/continue/ask/branch 起跑公共准备（docs §5.3/§9.2/§11.1-1）。
 
     顺序（失败即返回，绝不部分推进）：
+      0. cutover 维护闸（Batch B §Batch B 迁移与额度语义 1）：维护中稳定
+         503 ai_dispatch_maintenance（在 request_id/grant/预占之前，零副作用）；
       1. request_id 校验/生成（1–128，[A-Za-z0-9_-]；缺省服务端生成）；
       2. sidecar config 组装（含 max_steps 注入规则；凭据缺失 → 400）+
          billing_subject 计费主体断言注入（PR2 §7.2，与预占主体同源）；
@@ -10568,6 +10914,9 @@ def _ai_run_prepare(user_ctx, body, slide, need_grant):
     tuple。on_accepted/on_accepted 供 _proxy_sse 在 HistoPilot 应答后回调
     （2xx→consume，4xx/5xx/连接失败→release）。
     """
+    if _ai_dispatch_maintenance_active():
+        return (jsonify(error="AI 派发维护中，请稍后重试",
+                        code="ai_dispatch_maintenance"), 503)
     rid, rid_err = _parse_client_request_id(body)
     if rid_err is not None:
         return rid_err
@@ -10956,6 +11305,28 @@ def _start_acquisition_retention_thread():
 _ACQUISITION_RETENTION_THREAD = _start_acquisition_retention_thread()
 
 
+def _start_site_stats_worker():
+    """Batch D2：启动站点统计后台写入 worker（§Batch D2 2/7）。
+
+    - store 未随镜像发布（import 容错 None）→ 不启动（采集同步跳过、端点
+      404，§Batch D2 与 A0/B/C/D1 解耦）；
+    - 非 postgres 后端由 store 自行 no-op（不建线程、不落事件）；
+    - 只启一次：本模块每进程只 import 一次（Flask debug reloader 的子进程
+      重新 import 属新进程，各自启动一次是正确语义）；store 内部再兜底幂等。
+    """
+    if site_stats_store is None:
+        return None
+    try:
+        return site_stats_store.start_worker()
+    except Exception:  # 统计故障绝不阻断应用启动
+        app.logger.warning("site stats worker 启动失败（统计停用，页面服务"
+                           "不受影响）", exc_info=True)
+        return None
+
+
+_SITE_STATS_WORKER = _start_site_stats_worker()
+
+
 # --------------------------------------------------------------------------- #
 # AI 会话调优默认参数（内联自 ai_session.py；config 端点 + sidecar config 注入共用）
 # --------------------------------------------------------------------------- #
@@ -10973,7 +11344,9 @@ _ACQUISITION_RETENTION_THREAD = _start_acquisition_retention_thread()
 DEFAULT_MAX_TOKENS = 384000
 
 DEFAULT_CONFIG = {
-    "max_steps": 50,
+    # Batch C（§Batch C 实现要求 1 / §4.5）：max_steps 默认与硬上限统一 500
+    #（异常循环熔断，不是业务额度；HistoPilot 兼容默认同步 500，不再 ?? 50）
+    "max_steps": 500,
     # §9.2.1：窗口与视觉预算改由 window_tier（默认 balanced=400k/60000）推导；
     # None = 未显式设置，sidecar 按档位推导。显式覆盖仍优先。
     "context_window_tokens": None,
@@ -11383,10 +11756,13 @@ def _build_sidecar_config(user_ctx=None, demo_capability_id=None) -> dict:
     demo_capability_id 仅 demo 路径（/api/demo/ai/run）传入：匿名 Demo 的
     DeepSeek user_id 隔离 scope = "demo:" + capability_id（§4.2）。
     tuning 调优字段始终来自平台 ai_config.json（user 无独立调优）。
-    max_steps 注入规则（docs §9.2 / §12.3）：
-      - owner：平台 ai_config.json 值（现状不变，owner 自担）；
-      - user：一律平台模式，注入周期 platform_task_max_steps（默认 20），
-        忽略用户曾保存的自带 API 步数（注入只读已保存配置，请求体不可绕过）。
+    max_steps 注入规则（docs §9.2 / §12.3；Batch C §4.5）：
+      - owner：平台 ai_config.json 值（现状不变，owner 自担；缺省 500）；
+      - user：一律平台模式，始终注入 platform_task_max_steps（默认/上限
+        500，budget_store.DEFAULT_PLATFORM_TASK_MAX_STEPS；字段级 1..500
+        校验，>500 不再静默截断），忽略用户曾保存的自带 API 步数（注入只
+        读已保存配置，请求体不可绕过）。_build_sidecar_config 对 role=user
+        始终输出 config.max_steps（回归测试锁定）。
     返回的 dict 直接作为 sidecar body 的 `config` 字段。
     """
     source, cred_cfg = _resolve_ai_credentials(user_ctx)
@@ -11404,7 +11780,7 @@ def _build_sidecar_config(user_ctx=None, demo_capability_id=None) -> dict:
     if (user_ctx is not None
             and user_ctx.get("role") == user_store.ROLE_USER
             and user_ctx.get("user_id")):
-        # user 恒平台模式：注入周期 platform_task_max_steps（默认 20）
+        # user 恒平台模式：注入 platform_task_max_steps（默认/上限 500）
         out["max_steps"] = _platform_task_max_steps()
     # 运行时再守一次：即使加载迁移未持久化，注入 sidecar 的值也不能 <128。
     _apply_legacy_reserve_migration(out)

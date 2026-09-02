@@ -31,6 +31,22 @@ REGISTRATION_OPEN_KEY = "registration_open"
 #: P0-B 起 §4.1 的运行时权威值）
 REGISTRATION_MODE_KEY = "registration_mode"
 
+# --------------------------------------------------------------------------- #
+# Batch B（docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
+# §Batch B 数据模型 4）：user 消费控制目标 + cutover 维护闸。
+# --------------------------------------------------------------------------- #
+#: user 消费控制目标（JSONB 字符串，只允许 "window"|"total_allowance"）。
+#: 只控制 role=user；demo/owner 的窗口语义不受它影响。0029 幂等 seed
+#: "window"（部署初期双目标代码并存但行为不变），受控 cutover 以 CAS 切
+#: "total_allowance"；回滚走 rollback-plan CAS 切回。
+USER_SPEND_TARGET_KEY = "user_spend_target"
+USER_SPEND_TARGETS = ("window", "total_allowance")
+
+#: cutover 维护闸（JSONB bool，0029 seed false）：true 时所有 AI dispatch
+#: 端点在创建 hold 前稳定返回 503 ai_dispatch_maintenance（wave 2 app.py
+#: 接线）。cutover apply 先 CAS false→true，提交后 CAS true→false。
+AI_DISPATCH_MAINTENANCE_KEY = "ai_dispatch_maintenance"
+
 #: 合法模式（public 本阶段路由不支持，仅允许出现在存量值中由路由统一拒绝）
 REGISTRATION_MODES = ("closed", "invite_only", "public")
 
@@ -94,6 +110,68 @@ def set_setting(key, value, updated_by=None):
                     (key, psycopg.types.json.Jsonb(value), updated_by),
                 )
                 row = cur.fetchone()
+        return row["value"]
+    finally:
+        conn.close()
+
+
+class SettingsVersionConflictError(Exception):
+    """CAS 更新未命中：key 不存在或当前值与 expected 不符（409 语义）。
+
+    仿 spend_store.SpendVersionConflictError 模式：``code`` 稳定，供路由层
+    映射 409 错误信封；context 只含 key 与 expected/current 等非敏感标量。
+    """
+
+    code = "settings_version_conflict"
+
+    def __init__(self, message=None, **context):
+        self.context = dict(context)
+        super().__init__(message or self.__class__.__name__)
+
+
+def compare_and_set_setting(key, expected, value, updated_by=None):
+    """CAS 写设置值（Batch B 数据模型 4）：当前值精确等于 expected 才写入。
+
+    单条 ``UPDATE platform_settings SET value=%s::jsonb, updated_at=now(),
+    updated_by=%s WHERE key=%s AND value=%s::jsonb RETURNING key``——比较与
+    写入原子，无 last-write-wins 窗口；未命中（key 不存在或当前值 != expected）
+    抛 :class:`SettingsVersionConflictError`（稳定 409 语义，不做 upsert）。
+
+    用途红线：``user_spend_target`` 与 ``ai_dispatch_maintenance`` 的切换
+    **必须**走本函数（cutover 脚本）；无版本的 :func:`set_setting` 是
+    last-write-wins，禁止用于 cutover 键（spec §Batch B 数据模型 4）。
+
+    json/dual 后端不可写：抛 ``PgFeatureUnavailable``（与其他写路径一致
+    fail-closed）。返回写入后的值。
+    """
+    if not settings_writable():
+        platform_features.require_pg_backend("platform_settings")
+    if not isinstance(key, str) or not key:
+        raise ValueError("settings key 不能为空")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE platform_settings SET value=%s::jsonb, "
+                    "updated_at=now(), updated_by=%s "
+                    "WHERE key=%s AND value=%s::jsonb RETURNING value",
+                    (psycopg.types.json.Jsonb(value), updated_by, key,
+                     psycopg.types.json.Jsonb(expected)),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    cur.execute(
+                        "SELECT value FROM platform_settings WHERE key=%s",
+                        (key,))
+                    current_row = cur.fetchone()
+                    raise SettingsVersionConflictError(
+                        "设置已被他人修改（CAS 未命中，请刷新后重试）",
+                        key=key,
+                        expected=expected,
+                        key_exists=current_row is not None,
+                        current=(current_row["value"]
+                                 if current_row is not None else None))
         return row["value"]
     finally:
         conn.close()

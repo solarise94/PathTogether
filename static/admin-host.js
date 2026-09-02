@@ -24,17 +24,26 @@
        向 iframe 暴露 CSRF token / session 内容 / 通用 fetch 能力。
 
    PR3a 只实现 admin.auth.get；PR3b 补齐只读方法：overview.get /
-   users.list / billing.account.get / billing.usage.list / billing.ledger.list /
-   billing.providerBalance.get(+refresh) / audit.list / turnBudgets.get。
+   users.list / billing.usage.list / billing.ledger.list /
+   billing.providerBalance.get(+refresh) / audit.list。
    PR5（本版）补齐全部写方法的后端映射与参数 schema：users.create/
    setEnabled/setAiAccess/resetPassword、invites.list/create/revoke、
-   turnBudgets.update/newPeriod、billing.account.updateCaps、billing.adjust
+   billing.usage/ledger 只读与 providerBalance.refresh
    （路径参数拒绝含 "/"；POST/PUT 均带 CSRF 双提交）。PR5 修订再补 UI parity
    四方法：users.startPreview（§10.2 身份预览，admin:users:write）与
    plugins.list/setEnabled/rotateSecret（插件管理页，admin:plugins:read|write；
    运行时 /install 不上桥——§16 发布走版本化 releases）。owner 回查带 5s 短
    TTL 缓存（见 makeOwnerGuard——缓存只是省一次每消息 HTTP，服务端每 API
    独立复核不受影响；401 登出仍立即作废整个桥会话）。
+   2026-09-03 wave 2（review-2026-09-02-upload-user-limits-admin-ui-cleanup.md）：
+   删除 admin.turnBudgets.get / admin.billing.account.get /
+   admin.billing.account.updateCaps / admin.billing.adjust /
+   admin.acquisition.summary / admin.acquisition.list /
+   admin.users.setSpendOverride（turn/caps/人工调账/用户归因/月额度覆盖全部
+   退役，已删方法稳定 unknown_method）；新增 admin.spend.demoStats.get、
+   admin.siteStats.get（只读统计）与 admin.spend.userTotalLimit.set /
+   admin.spend.userTotalLimit.restoreDefault（user 一次性总额度 CAS 写）；
+   邀请与建号的金额字段切为 total_limit_nano_cny、邀请有效期切为 ttl_seconds。
    ========================================================================= */
 (function () {
   "use strict";
@@ -64,12 +73,12 @@
     "admin.invites.list": "admin:invites:read",
     "admin.invites.create": "admin:invites:write",
     "admin.invites.revoke": "admin:invites:write",
-    // 批次 F：turn 消费额度写方法退役（服务端 410 turn_budgets_retired）；
-    // 只读 get 保留（GET /api/admin/v1/turn-budgets 冻结历史展示）。
-    "admin.turnBudgets.get": "admin:turn-budgets:read",
-    "admin.billing.account.get": "admin:billing:read",
-    "admin.billing.account.updateCaps": "admin:billing:write",
-    "admin.billing.adjust": "admin:billing:write",
+    // 2026-09-03 wave 2（review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
+    // §4/Batch C5-6/D1）：误导性桥方法整行删除——turn 冻结历史（turn-budgets:read）、
+    // billing account 读取/caps 写入/人工调账（billing:write）、用户归因
+    // （acquisition:read）、旧月额度覆盖（setSpendOverride）。已删方法不在本表
+    // → dispatch 门按既有语义稳定回 unknown_method；旧 REST 兼容端点的 410 由
+    // 服务端负责，桥层不再出现这些名字。
     "admin.billing.usage.list": "admin:billing:read",
     "admin.billing.ledger.list": "admin:billing:read",
     "admin.billing.providerBalance.get": "admin:billing:read",
@@ -77,9 +86,15 @@
     // 不触碰任何用户数据，与 get 同级（admin:billing:read）；服务端有独立
     // 节流 + owner/CSRF 复核。
     "admin.billing.providerBalance.refresh": "admin:billing:read",
-    "admin.acquisition.summary": "admin:acquisition:read",
-    "admin.acquisition.list": "admin:acquisition:read",
     "admin.audit.list": "admin:audit:read",
+    // Batch D1/D2 新增只读聚合：Demo 周窗口消耗统计与匿名站点访问统计。
+    // 两者都归 admin:overview:read——不为只读站长/统计卡再扩权限域。
+    "admin.spend.demoStats.get": "admin:overview:read",
+    "admin.siteStats.get": "admin:overview:read",
+    // Batch B：注册 user 一次性总额度的两个写动作（绝对 limit、CAS、审计）。
+    // 替代已删除的 users.setSpendOverride（月额度覆盖语义）。
+    "admin.spend.userTotalLimit.set": "admin:users:write",
+    "admin.spend.userTotalLimit.restoreDefault": "admin:users:write",
     // PR5 修订（UI parity 恢复旧侧栏功能面）：身份预览（§10.2 用户行操作）
     // 走 admin:users:write（服务端 /api/admin/preview/start 是写 session 的
     // owner-only 操作）；插件管理（列表/健康/启停/凭证轮换）用独立的
@@ -91,15 +106,13 @@
     // 批次 D（docs ai-money-budget-bugfix-and-simplification-plan.md §6.5）：
     // 统一设置页。settings.get 聚合只读（注册模式 + 金额策略/窗口边界 +
     // 运行时安全参数）；settings.update / currentWindow.adjust 归
-    // admin:settings:write；用户月额度覆盖归 admin:users:write（与既有
-    // users 写方法同权限域）。服务端对每个端点独立 owner/CSRF 复核。
+    // admin:settings:write。服务端对每个端点独立 owner/CSRF 复核。
     "admin.settings.get": "admin:settings:read",
     "admin.settings.update": "admin:settings:write",
     // 批次 F：运行时安全参数写（与 settings.update 同权限域；服务端
     // PUT /api/admin/v1/settings/runtime）
     "admin.settings.runtime.update": "admin:settings:write",
     "admin.spend.currentWindow.adjust": "admin:settings:write",
-    "admin.users.setSpendOverride": "admin:users:write",
   };
 
   // 参数 schema（§14.1：每方法白名单 + 类型/长度/枚举/范围；未声明属性
@@ -109,7 +122,6 @@
   var _cursorSpec = { type: "string", maxLength: 512, nullable: true };
   var _limitSpec = { type: "integer", min: 1, max: 200 };
   var _userIdSpec = { type: "string", minLength: 1, maxLength: 128 };
-  var _slugSpec = { type: "string", maxLength: 64, nullable: true };
   var _budgetIntSpec = function (min) {
     return { type: "integer", min: min, max: 1000000 };
   };
@@ -124,10 +136,6 @@
         enabled: { type: "boolean" },
         ai_access: { type: "boolean" },
       },
-      additionalProperties: false,
-    },
-    "admin.billing.account.get": {
-      properties: { user_id: { type: "string", maxLength: 128, nullable: true } },
       additionalProperties: false,
     },
     "admin.billing.usage.list": {
@@ -158,13 +166,15 @@
       },
       additionalProperties: false,
     },
-    // PR4 来源归因（§9 GET /api/admin/v1/acquisition/*；只读）
-    "admin.acquisition.summary": { properties: {}, additionalProperties: false },
-    "admin.acquisition.list": {
-      properties: { cursor: _cursorSpec, limit: _limitSpec },
+    // Batch D1/D2：Demo 周统计与站点访问统计（只读；客户端不得传任意金额/
+    // 主体/过滤参数——demo-stats 仅允许窗口选择，site-stats 完全无参数）。
+    "admin.spend.demoStats.get": {
+      properties: {
+        window: { type: "string", enum: ["current", "previous"] },
+      },
       additionalProperties: false,
     },
-    "admin.turnBudgets.get": { properties: {}, additionalProperties: false },
+    "admin.siteStats.get": { properties: {}, additionalProperties: false },
 
     // ---- PR5 写方法（§9 Admin API v1 写端点；服务端 owner/CSRF 复核权威）----
     "admin.users.create": {
@@ -172,9 +182,9 @@
         login_id: { type: "string", minLength: 1, maxLength: 120 },
         password: { type: "string", minLength: 1, maxLength: 200 },
         display_name: { type: "string", maxLength: 120, nullable: true },
-        // 批次 D §5.1：可选月额度覆盖（十进制字符串 nano；null/缺省=继承默认；
-        // 建号+覆盖+audit 服务端同一事务）
-        monthly_limit_nano_cny: {
+        // Batch B：可选初始总额度（十进制字符串 nano；null/缺省=继承全局默认；
+        // 建号+allowance+audit 服务端同一事务）。旧 monthly_limit_nano_cny 已删。
+        total_limit_nano_cny: {
           type: "string", pattern: "^[0-9]{1,19}$", nullable: true,
         },
         ai_access: { type: "boolean" },
@@ -207,14 +217,13 @@
     "admin.invites.create": {
       properties: {
         login_id: { type: "string", maxLength: 120, nullable: true },
-        ttl_hours: { type: "integer", min: 1, max: 720 },
+        // wave 2（§3.4/§4.4）：邀请只负责注册——新契约 {login_id?, ttl_seconds?,
+        // ai_access, total_limit_nano_cny?, note?}；source_code/campaign_id/
+        // cohort/monthly_limit_nano_cny 全部移除（桥层即拒，不发归因字段）。
+        ttl_seconds: { type: "integer", min: 60, max: 2592000 },
         ai_access: { type: "boolean" },
-        cohort: { type: "string", maxLength: 64, nullable: true },
         note: { type: "string", maxLength: 200, nullable: true },
-        source_code: _slugSpec,
-        campaign_id: _slugSpec,
-        // 批次 D §5.2：可选月额度模板（兑换事务内为新用户建 override）
-        monthly_limit_nano_cny: {
+        total_limit_nano_cny: {
           type: "string", pattern: "^[0-9]{1,19}$", nullable: true,
         },
       },
@@ -237,44 +246,24 @@
       },
       additionalProperties: false,
     },
-    "admin.billing.account.updateCaps": {
+    // Batch B：注册 user 一次性总额度（绝对 limit，CAS，不清零已用）。
+    // expected_version 来自 users.list 快照（spend.total.version；切换前
+    // window 形态用 spend.window.version），409=version 冲突需刷新重试。
+    "admin.spend.userTotalLimit.set": {
       properties: {
         user_id: _userIdSpec,
-        // §5 v0.3（P2）：金额 wire 为十进制字符串（null = 清除该上限，
-        // §9）；JSON number 在桥层即拒（JS Number 超 2^53 静默失真）
-        soft_cap_nano_cny: {
-          type: "string", pattern: "^[0-9]{1,19}$", nullable: true,
-        },
-        hard_cap_nano_cny: {
-          type: "string", pattern: "^[0-9]{1,19}$", nullable: true,
-        },
-        version: { type: "integer", min: 1 },
+        total_limit_nano_cny: { type: "string", pattern: "^[0-9]{1,19}$" },
+        expected_version: { type: "integer", min: 1 },
       },
-      required: ["user_id", "soft_cap_nano_cny", "hard_cap_nano_cny", "version"],
+      required: ["user_id", "total_limit_nano_cny", "expected_version"],
       additionalProperties: false,
     },
-    "admin.billing.adjust": {
+    "admin.spend.userTotalLimit.restoreDefault": {
       properties: {
         user_id: _userIdSpec,
-        kind: {
-          type: "string",
-          enum: ["grant", "topup", "refund", "manual_adjustment"],
-        },
-        // §5 v0.3（P2）：十进制字符串（manual_adjustment 可为负）；桥层
-        // nonZero 拒 "0"/"-0"/"00" 等零值形态，kind 符号语义由服务端复核
-        amount_nano_cny: {
-          type: "string", pattern: "^-?[0-9]{1,19}$", nonZero: true,
-        },
-        reason: { type: "string", minLength: 1, maxLength: 500 },
-        // §6.5 PR5 修订：幂等键必须由调用方（插件 UI）生成，桥层与服务端
-        // 双重 required——服务端已入账 + 浏览器超时的重试必须带同一 key 命中
-        // duplicate，缺失/空串在桥层即拒绝（不再 nullable）。
-        idempotency_key: {
-          type: "string", minLength: 1, maxLength: 128,
-        },
+        expected_version: { type: "integer", min: 1 },
       },
-      required: ["user_id", "kind", "amount_nano_cny", "reason",
-                 "idempotency_key"],
+      required: ["user_id", "expected_version"],
       additionalProperties: false,
     },
 
@@ -321,7 +310,10 @@
         },
         demo_enabled: { type: "boolean" },
         demo_weekly_limit: { type: "object" },
-        user_default_monthly_limit: { type: "object" },
+        // Batch B：user 默认额度键从 user_default_monthly_limit 拆分为
+        // user_default_total_limit（一次性总额度语义；值仍为
+        // {policy_id, version, limit_nano_cny} CAS 对象）。
+        user_default_total_limit: { type: "object" },
         owner_monthly_limit: { type: "object" },
         spend_enforcement_mode: {
           type: "string", enum: ["shadow", "registered", "all"],
@@ -347,17 +339,6 @@
         version: { type: "integer", min: 1 },
       },
       required: ["window_id", "limit_nano_snapshot", "version"],
-      additionalProperties: false,
-    },
-    // null = 清除覆盖（DELETE，下个窗口起回退全局默认）；十进制字符串设置
-    "admin.users.setSpendOverride": {
-      properties: {
-        user_id: _userIdSpec,
-        monthly_limit_nano_cny: {
-          type: "string", pattern: "^[0-9]{1,19}$", nullable: true,
-        },
-      },
-      required: ["user_id", "monthly_limit_nano_cny"],
       additionalProperties: false,
     },
   };
@@ -668,15 +649,6 @@
       });
     },
 
-    "admin.billing.account.get": function (ctx, payload) {
-      var uid = String(payload.user_id || "");
-      var url = "/api/admin/v1/billing/accounts/" + encodeURIComponent(uid);
-      return ctx.fetchJson(url).then(function (res) {
-        if (!res.ok) throw backendError(url, res);
-        return res.body;
-      });
-    },
-
     "admin.billing.usage.list": function (ctx, payload) {
       var url = "/api/admin/v1/billing/usage-events" + buildQuery({
         cursor: payload.cursor, limit: payload.limit, model: payload.model,
@@ -721,23 +693,20 @@
       });
     },
 
-    "admin.turnBudgets.get": jsonGet("/api/admin/v1/turn-budgets"),
-
-    // PR4 来源归因（§9/§10.3 只读）：漏斗汇总 + 用户来源明细（first/last
-    // touch 分开）；json/dual 后端 503 pg_backend_required 由 backendError
-    // 透传（插件页显示「不可用」，不降级伪造数据）。
-    "admin.acquisition.summary":
-      jsonGet("/api/admin/v1/acquisition/summary"),
-
-    "admin.acquisition.list": function (ctx, payload) {
-      var url = "/api/admin/v1/acquisition/users" + buildQuery({
-        cursor: payload.cursor, limit: payload.limit,
+    // Batch D1/D2 只读聚合：Demo 周统计（window=current|previous）与匿名站点
+    // 访问统计。两者均 GET、无副作用；404/not_implemented 由插件 UI 做
+    // 「功能未发布」降级（siteStats 整卡隐藏、demo 卡中性空态）。
+    "admin.spend.demoStats.get": function (ctx, payload) {
+      var url = "/api/admin/v1/spend/demo-stats" + buildQuery({
+        window: payload.window,
       });
       return ctx.fetchJson(url).then(function (res) {
         if (!res.ok) throw backendError(url, res);
         return res.body;
       });
     },
+
+    "admin.siteStats.get": jsonGet("/api/admin/v1/site-stats"),
 
     // ---- PR5 写方法 → Admin API v1 写端点（POST/PUT 走 makeFetchJson 的
     // CSRF 双提交；路径参数必须 encodeURIComponent 且拒绝含 "/" 的值，防止
@@ -747,8 +716,8 @@
         login_id: payload.login_id,
         password: payload.password,
         display_name: payload.display_name,
-        // 批次 D §5.1：可选月额度覆盖 + ai_access（缺省沿用服务端默认）
-        monthly_limit_nano_cny: payload.monthly_limit_nano_cny,
+        // Batch B：可选初始总额度 + ai_access（缺省沿用服务端默认）
+        total_limit_nano_cny: payload.total_limit_nano_cny,
         ai_access: payload.ai_access,
       })(ctx);
     },
@@ -784,14 +753,11 @@
     "admin.invites.create": function (ctx, payload) {
       return jsonWrite("/api/admin/v1/invites", "POST", {
         login_id: payload.login_id,
-        ttl_hours: payload.ttl_hours,
+        ttl_seconds: payload.ttl_seconds,
         ai_access: payload.ai_access,
-        cohort: payload.cohort,
         note: payload.note,
-        source_code: payload.source_code,
-        campaign_id: payload.campaign_id,
-        // 批次 D §5.2：可选月额度模板（十进制字符串 | null=继承默认）
-        monthly_limit_nano_cny: payload.monthly_limit_nano_cny,
+        // Batch B/D1：可选初始总额度模板（兑换事务内为新 user 建 allowance）
+        total_limit_nano_cny: payload.total_limit_nano_cny,
       })(ctx);
     },
 
@@ -805,26 +771,6 @@
     // 原 turn-budgets PUT 已 410 turn_budgets_retired）
     "admin.settings.runtime.update": function (ctx, payload) {
       return jsonWrite("/api/admin/v1/settings/runtime", "PUT", payload)(ctx);
-    },
-
-    "admin.billing.account.updateCaps": function (ctx, payload) {
-      var url = "/api/admin/v1/billing/accounts/" +
-          pathId(payload.user_id, "user_id") + "/caps";
-      return jsonWrite(url, "PUT", {
-        soft_cap_nano_cny: payload.soft_cap_nano_cny,
-        hard_cap_nano_cny: payload.hard_cap_nano_cny,
-        version: payload.version,
-      })(ctx);
-    },
-
-    "admin.billing.adjust": function (ctx, payload) {
-      return jsonWrite("/api/admin/v1/billing/adjustments", "POST", {
-        user_id: payload.user_id,
-        kind: payload.kind,
-        amount_nano_cny: payload.amount_nano_cny,
-        reason: payload.reason,
-        idempotency_key: payload.idempotency_key,
-      })(ctx);
     },
 
     // ---- PR5 修订（UI parity）：身份预览 + 插件管理（旧 /api/admin/* 端点，
@@ -874,7 +820,6 @@
       }
       var policyFields = [
         ["demo_weekly_limit", "demo_weekly_limit"],
-        ["user_default_monthly_limit", "user_default_monthly_limit"],
         ["owner_monthly_limit", "owner_monthly_limit"],
       ];
       policyFields.forEach(function (pair) {
@@ -890,6 +835,30 @@
             })(ctx);
         }]);
       });
+      // Batch B：user 默认总额度 X 的权威存储是 ai_spend_total_defaults
+      // 单例（settings.get 响应 user_default_total_limit_source 标明）；
+      // source=total_defaults 走专用 CAS 端点，source=user_default_policy
+      // （cutover 前回退源）走 policies 兼容路径。
+      var userDefaultUpdate = payload.user_default_total_limit;
+      if (userDefaultUpdate !== undefined && userDefaultUpdate !== null) {
+        steps.push(["user_default_total_limit", function () {
+          if (userDefaultUpdate.source === "total_defaults") {
+            return jsonWrite(
+              "/api/admin/v1/spend/user-default-total-limit", "PUT", {
+                limit_nano_cny: userDefaultUpdate.limit_nano_cny,
+                expected_version: userDefaultUpdate.version,
+              })(ctx);
+          }
+          return jsonWrite(
+            "/api/admin/v1/spend/policies/" +
+              pathId(userDefaultUpdate.policy_id,
+                     "user_default_total_limit.policy_id"),
+            "PUT", {
+              limit_nano_cny: userDefaultUpdate.limit_nano_cny,
+              version: userDefaultUpdate.version,
+            })(ctx);
+        }]);
+      }
       if (payload.spend_enforcement_mode !== undefined &&
           payload.spend_enforcement_mode !== null) {
         steps.push(["spend_enforcement_mode", function () {
@@ -959,16 +928,26 @@
       })(ctx);
     },
 
-    // null = 清除（DELETE，下个窗口回退全局默认）；字符串 = 设置/更新
-    "admin.users.setSpendOverride": function (ctx, payload) {
-      var base = "/api/admin/v1/users/" +
-          pathId(payload.user_id, "user_id") + "/spend-override";
-      if (payload.monthly_limit_nano_cny === null ||
-          payload.monthly_limit_nano_cny === undefined) {
-        return jsonWrite(base, "DELETE", {})(ctx);
-      }
-      return jsonWrite(base, "PUT", {
-        monthly_limit_nano_cny: payload.monthly_limit_nano_cny,
+    // ---- Batch B：注册 user 一次性总额度写动作 ----
+    // 设置绝对总上限（PUT .../total-limit，expected_version CAS；409=
+    // version 冲突由服务端回 version_conflict）；只改 limit、绝不清零
+    // spent/reserved——语义约束由服务端权威执行。
+    "admin.spend.userTotalLimit.set": function (ctx, payload) {
+      var url = "/api/admin/v1/spend/users/" +
+          pathId(payload.user_id, "user_id") + "/total-limit";
+      return jsonWrite(url, "PUT", {
+        total_limit_nano_cny: payload.total_limit_nano_cny,
+        expected_version: payload.expected_version,
+      })(ctx);
+    },
+
+    // 恢复默认：把该 user 的绝对总上限显式改为当时全局默认 X
+    //（已用金额保留）；POST .../restore-default，同 expected_version CAS。
+    "admin.spend.userTotalLimit.restoreDefault": function (ctx, payload) {
+      var url = "/api/admin/v1/spend/users/" +
+          pathId(payload.user_id, "user_id") + "/restore-default";
+      return jsonWrite(url, "POST", {
+        expected_version: payload.expected_version,
       })(ctx);
     },
   };

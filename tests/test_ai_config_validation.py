@@ -427,7 +427,8 @@ def test_omitted_fields_keep_defaults():
     reset_config()
     code, j = put({"base_url": "http://x/v1"})
     check("只提交 base_url → 200", code == 200, "got %s %r" % (code, j))
-    check("max_steps 回填默认 50", j.get("max_steps") == 50,
+    check("max_steps 回填默认 500（Batch C §4.5：默认与硬上限一致）",
+          j.get("max_steps") == 500,
           "got %r" % j.get("max_steps"))
     check("context_window_tokens 缺省保持 None（由档位推导）",
           j.get("context_window_tokens") is None,

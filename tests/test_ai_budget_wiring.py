@@ -285,9 +285,10 @@ def test_user_put_any_field_rejected_400():
 
 
 def test_user_get_effective_max_steps_platform_readonly():
-    """user GET 只读：using 恒 platform（平台已配）；生效步数=周期平台步数；
-    存量 own 步数仅作回显（own_max_steps），无写入通道。"""
-    _setup_platform()  # 平台 ai_config.json 的 max_steps 用默认 50
+    """user GET 只读：using 恒 platform（平台已配）；生效步数=平台
+    platform_task_max_steps（Batch C：默认/上限 500）；存量 own 步数仅作回显
+    （own_max_steps），无写入通道。"""
+    _setup_platform()  # 平台 ai_config.json 的 max_steps 用默认 500
     u = _make_user("user")
     _own_credentials(u["user_id"], steps=OWN_STEPS)
     c = _client()
@@ -295,21 +296,24 @@ def test_user_get_effective_max_steps_platform_readonly():
     r = c.get("/api/ai/config")
     j = r.get_json()
     assert j["using"] == "platform"
-    # 平台模式：生效步数=周期 platform_task_max_steps（默认 20），忽略存量 OWN_STEPS
-    assert j["max_steps"] == 20
-    assert j["effective_max_steps"] == 20
+    # 平台模式：生效步数=platform_task_max_steps（Batch C 默认 500，不再 20），
+    # 忽略存量 OWN_STEPS
+    assert j["max_steps"] == 500
+    assert j["effective_max_steps"] == 500
     assert j["own_max_steps"] == OWN_STEPS  # 存量回显：值是本测试写入的种子，不是生效步数
-    assert j["own_task_max_steps_limit"] >= 20
+    assert j["own_task_max_steps_limit"] >= 500
     # 切回 own 的 PUT 已下线：use_platform=false 同样 400
     r2 = c.put("/api/ai/config", json={"use_platform": False})
     assert r2.status_code == 400
     j3 = c.get("/api/ai/config").get_json()
     assert j3["using"] == "platform"
-    assert j3["effective_max_steps"] == 20
+    assert j3["effective_max_steps"] == 500
 
 
 def test_max_steps_injection_rules_for_sidecar_config():
-    """user 恒平台模式：注入周期 20；存量 own 步数（use_platform=False）被忽略。"""
+    """Batch C（§Batch C 实现要求 1）：user 恒平台模式，_build_sidecar_config
+    对 role=user **始终输出** max_steps=500（缺配置回退 budget_store 常量，
+    不再 20/50）；存量 own 步数被忽略。"""
     _setup_platform()
     u = _make_user("user")
     _own_credentials(u["user_id"], steps=7)  # use_platform=False + steps=7
@@ -322,9 +326,20 @@ def test_max_steps_injection_rules_for_sidecar_config():
     r = _run_ok(c, "inj.svs")
     assert r.status_code == 200
     cfg = fake.calls[-1]["body"]["config"]
-    assert cfg["max_steps"] == 20  # 平台周期步数，忽略存量 own 7
+    assert cfg["max_steps"] == 500  # 平台步数（Batch C 契约），忽略存量 own 7
     assert cfg["base_url"] == "http://platform.example/v1"  # 平台凭据
     assert cfg.get("ssrf_guard") is not True
+    # 回归（§Batch C 1）：平台配置缺 max_steps 时注入仍恒为 500（不对 sidecar
+    # 缺省 50 兜底）——拔掉 ai_config.json 里的显式值再跑一次
+    u2 = _make_user("user")
+    _own_credentials(u2["user_id"], steps=9)
+    _touch("inj2.svs")
+    _own("inj2.svs", u2["user_id"])
+    c2 = _client()
+    _login(c2, "user", u2["user_id"])
+    assert _run_ok(c2, "inj2.svs").status_code == 200
+    cfg2 = fake.calls[-1]["body"]["config"]
+    assert cfg2["max_steps"] == 500
 
 
 def test_run_body_cannot_smuggle_tuning_fields():
@@ -346,7 +361,7 @@ def test_run_body_cannot_smuggle_tuning_fields():
     })
     assert r.status_code == 200
     cfg = fake.calls[-1]["body"]["config"]
-    assert cfg["max_steps"] == 20         # 平台周期步数（存量 own 9 被忽略）
+    assert cfg["max_steps"] == 500        # 平台步数（存量 own 9 被忽略）
     assert cfg["api_key"] == "sk-platform-123456"  # 平台 key，请求体整体被忽略
 
 
@@ -825,13 +840,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_ui_budget_card_and_max_steps_sync_present():
-    """批次 F UI 退役守卫：turn 预算管理 UI 降级为只读 legacy 卡。
-
-    Viewer 侧栏的 users/plugins/aibudget 三个管理 section 已删（方案 §13
-    PR5）；批次 F 起 admin 插件内的 turn 编辑表单/保存/开新周期/二次确认
-    一并移除（服务端写端点 410 turn_budgets_retired），只保留 GET 冻结
-    历史展示卡（adm-billing-turn）与 overview 的 legacy 徽标。平台侧保留
-    user max_steps 只读同步（syncAiMaxStepsInput，§8.3）。
+    """批次 C/D1 UI 退役守卫（§4.2/§4.6/§Batch C 5/6）：turn 预算 UI 整体
+    删除（概览 legacy 徽标、费用页 legacy 卡、加载/渲染函数），bridge 的
+    turnBudgets 方法与权限一并退役；runtime 写走 settings/runtime；
+    user max_steps 只读同步保留（syncAiMaxStepsInput，§8.3）。
+    （插件 manifest / ui / bridge 文件由管理 UI 批次维护；本用例锁定其
+    「无 turn 入口 + max_steps 同步仍在」的交付契约。）
     """
     index = (REPO_ROOT / "templates" / "index.html").read_text(encoding="utf-8")
     shell = (REPO_ROOT / "templates" / "_app_shell.html").read_text(encoding="utf-8")
@@ -847,30 +861,31 @@ def test_ui_budget_card_and_max_steps_sync_present():
     assert "users-mgr-section" not in shell
     assert "plugins-mgr-section" not in shell
     assert "admin/registration" not in shell
-    # 只读 legacy 卡保留（GET 数据展示 + 已退役标记）；编辑入口全部移除
-    assert 'id="adm-billing-turn"' in plugin_ui
-    assert 'id="adm-turn-legacy-card"' in plugin_ui
-    assert "已退役" in plugin_ui
-    assert 'id="adm-ov-turn-legacy"' in plugin_ui
-    for gone in ("adm-turn-edit-form", "adm-turn-save-btn",
-                 "adm-turn-newperiod-btn", "adm-turn-confirm",
-                 "adm-turn-demosteps", "adm-turn-perbrowser",
-                 "adm-turn-concurrency", "adm-turn-demo-enabled",
-                 "adm-turn-platform", "adm-turn-demo"):
+    # 批次 C 5/D1（§4.6）：turn 预算 UI 整体删除——概览徽标、legacy 卡与
+    # 全部编辑入口都不再存在
+    for gone in ("adm-billing-turn", "adm-turn-legacy-card",
+                 "adm-ov-turn-legacy", "adm-turn-edit-form",
+                 "adm-turn-save-btn", "adm-turn-newperiod-btn",
+                 "adm-turn-confirm", "adm-turn-demosteps",
+                 "adm-turn-perbrowser", "adm-turn-concurrency",
+                 "adm-turn-demo-enabled", "adm-turn-platform",
+                 "adm-turn-demo"):
         assert gone not in plugin_ui, gone
-    assert "admin.turnBudgets.update" not in plugin_js
-    assert "admin.turnBudgets.newPeriod" not in plugin_js
-    assert "admin.turnBudgets.get" in plugin_js  # 只读保留
-    # 桥层：update/newPeriod 的权限映射与 schema 已删；runtime 写改打新端点
+    assert "admin.turnBudgets" not in plugin_js
+    # 桥层：turnBudgets 方法/schema/权限映射全删；runtime 写改打新端点
+    assert '"admin.turnBudgets.get"' not in bridge_js
     assert '"admin.turnBudgets.update"' not in bridge_js
     assert '"admin.turnBudgets.newPeriod"' not in bridge_js
-    assert '"admin.turnBudgets.get": "admin:turn-budgets:read"' in bridge_js
+    assert '"admin:turn-budgets:read"' not in bridge_js
     assert '"/api/admin/v1/settings/runtime", "PUT"' in bridge_js
     manifest = json.loads((REPO_ROOT / "plugins" / "pathtogether-admin"
                            / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["pluginVersion"] == "0.3.3"
-    assert "admin:turn-budgets:write" not in manifest["adminPermissions"]
-    assert "admin:turn-budgets:read" in manifest["adminPermissions"]
+    # 批次 E：插件版本已从 0.3.3 递补（本批 0.3.4）；turn/acquisition/billing
+    # write 权限全部退役（§Batch E 1 / §Batch C 6 / §Batch D1 4/15）
+    assert manifest["pluginVersion"] == "0.3.4"
+    for perm in ("admin:turn-budgets:read", "admin:turn-budgets:write",
+                 "admin:acquisition:read", "admin:billing:write"):
+        assert perm not in manifest["adminPermissions"], perm
     app_js = (REPO_ROOT / "static" / "app.js").read_text(encoding="utf-8")
     assert "syncAiMaxStepsInput" in app_js  # 平台 AI 步数只读同步（§8.3）
     assert "showAiBudgetMgr" not in app_js  # 旧侧栏实现已删

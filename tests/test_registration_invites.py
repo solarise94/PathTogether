@@ -480,17 +480,23 @@ def test_owner_invite_api_lifecycle(monkeypatch):
     app_mod.AUTH_ENABLED = True
     client = _client()
     _owner_session(client, owner)
-    # 创建：token 仅出现一次 + no-store
+    # 创建：token 仅出现一次 + no-store；初始总额度字段 total_limit_nano_cny
+    #（Batch B wave 2）；cohort/source/campaign 不再出现在请求或响应
     r = client.post("/api/admin/registration-invites",
                     json={"login_id": "flow@x.com", "ai_access": False,
-                          "cohort": "c1", "note": "n1"})
+                          "note": "n1",
+                          "total_limit_nano_cny": "3000000000"})
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.headers.get("Cache-Control") == "no-store"
     body = r.get_json()
     assert body["token"]
     invite_id = body["invite_id"]
     assert "token_hash" not in body
-    # 列表：无 token/token_hash，邮箱掩码
+    assert body["total_limit_nano_cny"] == "3000000000"
+    for retired in ("cohort", "source_code", "campaign_id",
+                    "monthly_limit_nano_cny"):
+        assert retired not in body, retired
+    # 列表：无 token/token_hash，登录账号掩码，无来源字段
     r2 = client.get("/api/admin/registration-invites")
     assert r2.status_code == 200
     items = r2.get_json()["invites"]
@@ -499,7 +505,11 @@ def test_owner_invite_api_lifecycle(monkeypatch):
     assert "token" not in it and "token_hash" not in it
     assert it["login_id_masked"] == "f***@x.com"
     assert it["status"] == "open"
-    assert it["ai_access"] is False and it["cohort"] == "c1"
+    assert it["ai_access"] is False
+    assert it["total_limit_nano_cny"] == "3000000000"
+    for retired in ("cohort", "source_code", "campaign_id",
+                    "monthly_limit_nano_cny"):
+        assert retired not in it, retired
     # 撤销
     r3 = client.post("/api/admin/registration-invites/%s/revoke" % invite_id,
                      json={})
@@ -632,54 +642,59 @@ def test_registration_mode_env_and_invalid_values():
 
 
 # =========================================================================== #
-# 3. PG 数据层（PR4 §11.2）：邀请显式 source/campaign 与兑换归因
+# 3. PG 数据层（Batch D1 13 / Batch B wave 2）：来源字段退役与兑换解耦
 # =========================================================================== #
-def _seed_campaign(cid, source, status="active"):
-    import acquisition_store as acq_store
+@pg_only
+def test_create_invite_retired_source_fields_ignored_not_written():
+    """Batch B §4.4：邀请只负责注册——source/campaign/cohort 参数兼容接受
+    但忽略（不校验不写库，app.py wave 2 才改调用方）；不做 campaign 校验。"""
+    owner = _mk_owner()
+    inv = registration_store.create_invite(
+        owner["user_id"], login_id="sc1@x.com", source_code="Bad Slug!",
+        campaign_id="no-such-campaign", cohort="c1")
+    # 返回/落库三退役字段均为空（新邀请不再写入）
+    assert inv["source_code"] in ("", None)
+    assert inv["campaign_id"] in ("", None)
+    assert inv["cohort"] in ("", None)
     conn = _pg_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO acquisition_campaigns "
-                "(campaign_id, source_code, name, status, created_by) "
-                "VALUES (%s,%s,%s,%s,'test') "
-                "ON CONFLICT (campaign_id) DO UPDATE SET status=%s",
-                (cid, source, "camp-" + cid, status, status))
-        conn.commit()
+            cur.execute("SELECT source_code, campaign_id, cohort, "
+                        "total_limit_nano_cny FROM registration_invites "
+                        "WHERE invite_id=%s", (inv["invite_id"],))
+            row = cur.fetchone()
     finally:
         conn.close()
-    return acq_store.get_campaign(cid)
-
-
-@pg_only
-def test_create_invite_with_source_and_campaign_validation():
-    owner = _mk_owner()
-    _seed_campaign("camp-ok", "src-ok")
-    # 合法：campaign 已登记
-    inv = registration_store.create_invite(
-        owner["user_id"], login_id="sc1@x.com", source_code="mywebpage",
-        campaign_id="camp-ok")
-    assert inv["source_code"] == "mywebpage"
-    assert inv["campaign_id"] == "camp-ok"
-    # 兼容旧调用：不传两字段 → 空/NULL
-    inv2 = registration_store.create_invite(owner["user_id"],
-                                            login_id="sc2@x.com")
-    assert inv2["source_code"] == "" and inv2["campaign_id"] is None
-    # 非法 slug / 未知 campaign → ValueError（不静默丢）
-    with pytest.raises(ValueError):
-        registration_store.create_invite(owner["user_id"],
-                                         login_id="sc3@x.com",
-                                         source_code="Bad Slug")
-    with pytest.raises(ValueError):
-        registration_store.create_invite(owner["user_id"],
-                                         login_id="sc4@x.com",
-                                         campaign_id="no-such-campaign")
+    assert row["source_code"] == "" and row["campaign_id"] is None
+    assert row["cohort"] == ""
+    # create audit 不再携带 source/campaign/cohort/acq 字段（历史 audit 不变）
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT detail FROM audit_events WHERE action="
+                        "'registration.invite_create' AND target_id=%s",
+                        (inv["invite_id"],))
+            detail = cur.fetchone()["detail"]
+    finally:
+        conn.close()
+    assert not ({"source_code", "campaign_id", "cohort", "acq",
+                 "campaign_bound"} & set(detail))
+    # 新字段：total_limit_nano_cny 落列；新旧同传稳定 ambiguous_spend_limit
+    inv2 = registration_store.create_invite(
+        owner["user_id"], login_id="sc2@x.com", total_limit_nano_cny=10 ** 9)
+    assert inv2["total_limit_nano_cny"] == 10 ** 9
+    with pytest.raises(ValueError, match="ambiguous_spend_limit"):
+        registration_store.create_invite(
+            owner["user_id"], login_id="sc3@x.com",
+            monthly_limit_nano_cny=10 ** 9, total_limit_nano_cny=10 ** 9)
 
 
 @pg_only
 def test_invite_list_exposes_source_campaign_and_owner_api(monkeypatch):
+    """Batch D1 13 / Batch B wave 2：来源字段退役——owner API 带 source/
+    campaign/cohort 请求一律 400 retired_invite_field（不再校验 slug/campaign
+    存在性）；响应不回显来源字段；初始总额度字段可用。"""
     _satisfy_preconditions(monkeypatch)
-    _seed_campaign("camp-api", "src-api")
     owner = _mk_owner()
     app_mod.AUTH_ENABLED = True
     client = _client()
@@ -687,45 +702,55 @@ def test_invite_list_exposes_source_campaign_and_owner_api(monkeypatch):
     r = client.post("/api/admin/registration-invites", json={
         "login_id": "apisrc@x.com", "source_code": "src-api",
         "campaign_id": "camp-api"})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    body = r.get_json()
-    assert body["source_code"] == "src-api"
-    assert body["campaign_id"] == "camp-api"
-    # 未知 campaign → 400（owner API 显式失败，不静默丢）
-    r2 = client.post("/api/admin/registration-invites", json={
-        "login_id": "apibad@x.com", "campaign_id": "ghost"})
-    assert r2.status_code == 400
-    # 非法 slug → 400
+    assert r.status_code == 400
+    assert r.get_json()["code"] == "retired_invite_field"
+    # 非法 slug / 未知 campaign / cohort 同样 400 retired_invite_field
+    for payload in ({"source_code": "NOT A SLUG"},
+                    {"campaign_id": "ghost"}, {"cohort": "c1"}):
+        r2 = client.post("/api/admin/registration-invites", json=payload)
+        assert r2.status_code == 400, payload
+        assert r2.get_json()["code"] == "retired_invite_field", payload
+    # 新契约：创建带初始总额度 → 响应 total_limit_nano_cny、无来源字段
     r3 = client.post("/api/admin/registration-invites", json={
-        "login_id": "apibad2@x.com", "source_code": "NOT A SLUG"})
-    assert r3.status_code == 400
-    # 列表暴露两字段；掩码规则不变（login_id_masked，无 token/hash）
+        "login_id": "apitotal@x.com", "total_limit_nano_cny": "7000000000"})
+    assert r3.status_code == 200, r3.get_data(as_text=True)
+    body = r3.get_json()
+    assert body["total_limit_nano_cny"] == "7000000000"
+    for retired in ("source_code", "campaign_id", "cohort"):
+        assert retired not in body
+    # 列表同样无来源字段；掩码规则不变（login_id_masked，无 token/hash）
     r4 = client.get("/api/admin/registration-invites").get_json()
     it = next(i for i in r4["invites"] if i["invite_id"] == body["invite_id"])
-    assert it["source_code"] == "src-api" and it["campaign_id"] == "camp-api"
+    for retired in ("source_code", "campaign_id", "cohort"):
+        assert retired not in it
     assert it["login_id_masked"] == "a***@x.com"
     assert "token" not in it and "token_hash" not in it
 
 
 @pg_only
-def test_redeem_without_acq_writes_direct_attribution():
-    """老调用（acq=None）也写 user_acquisition：direct/unknown，行完整。"""
+def test_redeem_writes_no_user_acquisition_but_allowance():
+    """Batch B：兑换不再写 user_acquisition（归因写路径冻结）；带初始额度
+    的邀请在同事务建一次性总额度；返回键含弃用兼容的恒 None 字段。"""
     owner = _mk_owner()
     inv = registration_store.create_invite(owner["user_id"],
                                            login_id="legacy@x.com")
     out = registration_store.redeem_invite(inv["token"], "legacy@x.com",
-                                           "longpassword123")
-    assert out["acquisition"]["attribution_method"] == "direct"
-    assert out["acquisition"]["source_code"] == "unknown"
+                                           "pass123456789012")
+    assert out["acquisition"] is None          # 兼容键恒 None（退役）
+    assert out["spend_override_policy"] is None  # 兼容键恒 None（退役）
+    assert out["total_allowance"] is None  # 无初始额度 → 不建行
     conn = _pg_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT count(*)::int AS n FROM user_acquisition "
                 "WHERE user_id=%s", (out["user"]["user_id"],))
-            assert cur.fetchone()["n"] == 1
+            assert cur.fetchone()["n"] == 0
+            cur.execute("SELECT count(*)::int AS n FROM user_acquisition")
+            total_after = cur.fetchone()["n"]
     finally:
         conn.close()
+    assert total_after == 0  # 全表零新增（兑换全链路不再触达归因）
 
 
 if __name__ == "__main__":

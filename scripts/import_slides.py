@@ -100,8 +100,16 @@ def import_one(src: Path, upload_dir: Path, owner_user_id, requester_role,
     upload_guard.check_disk_watermark(upload_dir)
 
     # 先在原地校验（不复制）；通过后再 link。跨设备则 copy+validate 后再 replace。
-    if not app_mod._validate_slide_file(src):
-        raise ValueError("无效的切片文件：%s" % name)
+    # A0 异常契约：_validate_slide_file 失败抛 SlideValidationError（稳定机器码）；
+    # 传净化后的原始 basename 作 format_hint（src 若是 .part 之类的临时名也不
+    # 影响判定）。为兼容 run() 的 ValueError 汇总通道，转成带机器码的 ValueError。
+    import slide_io
+
+    try:
+        app_mod._validate_slide_file(src, format_hint=safe)
+    except slide_io.SlideValidationError as e:
+        raise ValueError(
+            "无效的切片文件（code=%s）：%s" % (e.code, name)) from e
 
     try:
         app_mod._promote_no_clobber(src, dest)

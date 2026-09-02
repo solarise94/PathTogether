@@ -72,6 +72,7 @@ import billing_pricing
 import billing_store
 import pg_store
 import platform_features
+import settings_store
 import share_store_pg
 
 _LOG = logging.getLogger(__name__)
@@ -89,6 +90,22 @@ WINDOW_SUBJECT_TYPES = ("demo", "user", "owner")
 
 #: demo 主体的窗口 subject_id（所有浏览器/capability 归同一周窗口）
 DEMO_GLOBAL_SUBJECT = "demo_global"
+
+# --------------------------------------------------------------------------- #
+# Batch B：user 消费控制目标（platform_settings.user_spend_target，0029 seed
+# "window"）。只控制 role=user；demo/owner 恒窗口。键常量的唯一权威定义在
+# settings_store（spend_store 只 import，不重复定义）。
+# --------------------------------------------------------------------------- #
+USER_SPEND_TARGET_KEY = settings_store.USER_SPEND_TARGET_KEY
+USER_SPEND_TARGETS = settings_store.USER_SPEND_TARGETS
+DEFAULT_USER_SPEND_TARGET = "window"
+
+#: cutover 维护闸键（wave 2 app.py 在创建 hold 前读取；true → 503）
+AI_DISPATCH_MAINTENANCE_KEY = settings_store.AI_DISPATCH_MAINTENANCE_KEY
+
+#: Demo 统计（admin_demo_spend_stats）响应内固定标注：数据库整体不可用类
+#: 拒绝只进外部 metric、不在 DB 聚合内（§4.6）
+DEMO_STATS_DB_UNAVAILABLE_NOTE = "数据库整体不可用类拒绝不在 DB 聚合内（仅外部 metric）"
 
 #: enforcement 开关（§7.3；0023 种子固定 "shadow"）。批次 D 起 admin v1
 #: 提供受审计的写入口 set_enforcement_mode（owner-only + CAS + §7.3 校验）；
@@ -111,10 +128,18 @@ _POLICY_LOCK_KEY = 0x53505057
 _OVERRIDE_ID_PREFIX = "spp_uo_"
 _WINDOW_ID_PREFIX = "spw_"
 
+#: 总额度 id 前缀（Batch B：ai_spend_total_allowances）
+_ALLOWANCE_ID_PREFIX = "sta_"
+
 #: audit 动作名（detail 只含非敏感字段）
 POLICY_UPDATE_AUDIT_ACTION = "spend.policy_update"
 WINDOW_ADJUST_AUDIT_ACTION = "spend.window_adjust"
 ENFORCEMENT_MODE_AUDIT_ACTION = "spend.enforcement_mode_update"
+TOTAL_ALLOWANCE_AUDIT_ACTION = "spend.total_allowance_update"
+TOTAL_DEFAULT_AUDIT_ACTION = "spend.total_default_update"
+
+#: Batch B（§3.1）：注册 user 一次性总额度的建行来源词表（0029 CHECK 同款）
+TOTAL_ALLOWANCE_SOURCES = ("cutover", "invite", "admin_create")
 
 #: 0022 写入的 cutover 标志键（对账器只接纳 occurred_at >= cutover 的用量）
 _PRICING_CUTOVER_KEY = billing_store.PRICING_V2_CUTOVER_SETTING_KEY
@@ -185,6 +210,19 @@ class InvalidSpendRequestError(SpendError):
     """参数校验失败（400 invalid_request）。"""
 
     code = "invalid_request"
+
+
+class SpendTotalAllowanceMissingError(SpendError):
+    """user 目标为总额度但权威 ai_spend_total_allowances 行不存在
+    （fail-closed：绝不悄悄回退窗口或按 0 额度处理，§3.1）。"""
+
+    code = "spend_total_allowance_missing"
+
+
+class SpendTotalAllowanceExistsError(SpendError):
+    """该 user 已存在总额度行（每 user 唯一，重复建行是调用方 bug）。"""
+
+    code = "spend_total_allowance_exists"
 
 
 def _connect():
@@ -1124,6 +1162,621 @@ def mode_is_hard(mode, subject_type) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Batch B（§3.1）：注册 user 一次性总额度（ai_spend_total_allowances）
+#
+# 与 window_* 投影原语对称：``SELECT ... FOR UPDATE`` 锁行 + version 自增，
+# 并发安全是硬性要求。授权不等式 ``spent + reserved + estimated <= limit``；
+# X 是绝对总上限——修改只改 limit，绝不清 zero spent/reserved（§3.1 红线）。
+# 无周期、无轮换、无月初重建（§Batch B 迁移与额度语义 8）。
+# --------------------------------------------------------------------------- #
+_ALLOWANCE_SEL = (
+    "allowance_id, subject_type, subject_id, limit_nano_cny, "
+    "opening_spent_nano_cny, spent_nano_cny, reserved_nano_cny, source, "
+    "default_version, version, "
+    "extract(epoch from cutover_at)::float8 AS cutover_at, "
+    "source_window_id, source_window_version, "
+    "extract(epoch from created_at)::float8 AS created_at, "
+    "extract(epoch from updated_at)::float8 AS updated_at, updated_by"
+)
+
+_ALLOWANCE_INT_KEYS = (
+    "limit_nano_cny", "opening_spent_nano_cny", "spent_nano_cny",
+    "reserved_nano_cny", "default_version", "version",
+    "source_window_version",
+)
+_ALLOWANCE_EPOCH_KEYS = ("cutover_at", "created_at", "updated_at")
+
+
+def _allowance_out(row) -> dict:
+    out = dict(row)
+    for key in _ALLOWANCE_INT_KEYS:
+        if out.get(key) is not None:
+            out[key] = int(out[key])
+    for key in _ALLOWANCE_EPOCH_KEYS:
+        if out.get(key) is not None:
+            out[key] = float(out[key])
+    return out
+
+
+def total_allowance_remaining_nano(allowance) -> int:
+    """剩余额度 = max(0, limit - spent - reserved)（§4.3 API 形态口径）。"""
+    raw = (int(allowance["limit_nano_cny"]) - int(allowance["spent_nano_cny"])
+           - int(allowance["reserved_nano_cny"]))
+    return max(0, raw)
+
+
+def total_allowance_overage_nano(allowance) -> int:
+    """超额 = max(0, spent + reserved - limit)（X 低于已用时明示）。"""
+    return max(0, int(allowance["spent_nano_cny"])
+               + int(allowance["reserved_nano_cny"])
+               - int(allowance["limit_nano_cny"]))
+
+
+def _validate_user_subject_id(subject_id):
+    if not isinstance(subject_id, str) or not subject_id.strip():
+        raise InvalidSpendRequestError("user_id 需为非空字符串")
+    return subject_id
+
+
+def _fetch_total_allowance_locked(cur, subject_id) -> dict:
+    """按 subject_id 锁总额度行（FOR UPDATE）；不存在抛稳定 missing。"""
+    _validate_user_subject_id(subject_id)
+    cur.execute(
+        "SELECT " + _ALLOWANCE_SEL + " FROM ai_spend_total_allowances "
+        "WHERE subject_id=%s FOR UPDATE", (subject_id,))
+    row = cur.fetchone()
+    if row is None:
+        raise SpendTotalAllowanceMissingError(
+            "该用户无总额度行（fail-closed，不回退窗口/不按 0 额度处理）",
+            subject_id=subject_id)
+    return _allowance_out(row)
+
+
+def _fetch_total_allowance_read(cur, subject_id):
+    """只读总额度行；不存在返回 None（admin 查询/统计用，不抛错）。"""
+    _validate_user_subject_id(subject_id)
+    cur.execute(
+        "SELECT " + _ALLOWANCE_SEL + " FROM ai_spend_total_allowances "
+        "WHERE subject_id=%s", (subject_id,))
+    row = cur.fetchone()
+    return _allowance_out(row) if row is not None else None
+
+
+def get_user_spend_target_tx(cur) -> str:
+    """同事务读 ``platform_settings.user_spend_target``（Batch B 数据模型 4）。
+
+    缺键/非法值一律回退 ``"window"``（fail-safe：0029 seed 缺失或手工乱值时
+    行为与部署前完全一致，绝不放大额度）。只控制 role=user——调用方须自行
+    保证 subject_type（owner/demo 恒窗口，见 billing_store 的 target 解析）。
+    """
+    cur.execute("SELECT value FROM platform_settings WHERE key=%s",
+                (USER_SPEND_TARGET_KEY,))
+    row = cur.fetchone()
+    value = row["value"] if row is not None else None
+    if isinstance(value, str) and value in USER_SPEND_TARGETS:
+        return value
+    if value is not None:
+        _LOG.warning("platform_settings.%s 存量值非法（%r），按 %r 处理",
+                     USER_SPEND_TARGET_KEY, value, DEFAULT_USER_SPEND_TARGET)
+    return DEFAULT_USER_SPEND_TARGET
+
+
+def user_spend_target() -> str:
+    """独立事务版：读 user 消费控制目标（缺/非法 → "window"）。"""
+    platform_features.require_pg_backend("spend")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                return get_user_spend_target_tx(cur)
+    finally:
+        conn.close()
+
+
+def get_total_allowance(user_id):
+    """只读某 user 的总额度行；不存在返回 None（admin 查询/投影）。"""
+    platform_features.require_pg_backend("spend")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                return _fetch_total_allowance_read(cur, user_id)
+    finally:
+        conn.close()
+
+
+def total_allowance_reserve_tx(cur, allowance_id, estimated_nano, *,
+                               enforce_limit=True):
+    """总额度预占（事务内变体；与 :func:`window_reserve_tx` 对称）。
+
+    - ``enforce_limit=True``（hard）：锁行后检查 ``spent + reserved +
+      estimated <= limit``，超限抛 :class:`SpendBudgetExhaustedError`
+      （稳定拒绝，**不改任何数**）；
+    - ``enforce_limit=False``（shadow 观测）：不做额度检查照常
+      ``reserved += estimated``（投影真实占用）；
+    - 无窗口状态可言（不轮换）：不存在 status 检查；
+    - 成功 ``reserved += estimated``、version+1（FOR UPDATE 串行化，两个
+      并发 reserve 合计只有额度内的能越过临界点——不超卖）。
+    """
+    estimated = _validate_nano(estimated_nano, "estimated_nano")
+    cur.execute(
+        "SELECT " + _ALLOWANCE_SEL + " FROM ai_spend_total_allowances "
+        "WHERE allowance_id=%s FOR UPDATE", (allowance_id,))
+    row = cur.fetchone()
+    if row is None:
+        raise SpendTotalAllowanceMissingError(
+            "总额度行不存在", allowance_id=allowance_id)
+    allowance = _allowance_out(row)
+    if enforce_limit:
+        spent = int(allowance["spent_nano_cny"])
+        reserved = int(allowance["reserved_nano_cny"])
+        limit = int(allowance["limit_nano_cny"])
+        if spent + reserved + estimated > limit:
+            _metric("spend_reserve_denied_total", subject_type="user",
+                    target="total_allowance")
+            raise SpendBudgetExhaustedError(
+                "总额度不足：spent+reserved+estimated > limit_nano_cny",
+                allowance_id=allowance_id, subject_id=allowance["subject_id"],
+                spent_nano_cny=spent, reserved_nano_cny=reserved,
+                estimated_nano=estimated, limit_nano_cny=limit)
+    cur.execute(
+        "UPDATE ai_spend_total_allowances SET "
+        "reserved_nano_cny = reserved_nano_cny + %s, "
+        "version = version + 1, updated_at = now() "
+        "WHERE allowance_id=%s RETURNING " + _ALLOWANCE_SEL,
+        (estimated, allowance_id))
+    return _allowance_out(cur.fetchone())
+
+
+def total_allowance_release_tx(cur, allowance_id, estimated_nano):
+    """释放总额度预占（与 :func:`window_release_tx` 对称）。
+
+    ``reserved -= estimated``（estimated 超过当前 reserved 时夹 0 并记指标
+    ——重放/乱序由 hold 状态机吸收，本原语只保证 ``reserved >= 0`` 不变量）。
+    """
+    estimated = _validate_nano(estimated_nano, "estimated_nano")
+    cur.execute(
+        "SELECT " + _ALLOWANCE_SEL + " FROM ai_spend_total_allowances "
+        "WHERE allowance_id=%s FOR UPDATE", (allowance_id,))
+    row = cur.fetchone()
+    if row is None:
+        raise SpendTotalAllowanceMissingError(
+            "总额度行不存在", allowance_id=allowance_id)
+    reserved = int(row["reserved_nano_cny"])
+    release = estimated
+    if estimated > reserved:
+        _metric("spend_release_clamp_total", target="total_allowance",
+                requested_nano=estimated, reserved_nano=reserved)
+        release = reserved
+    cur.execute(
+        "UPDATE ai_spend_total_allowances SET "
+        "reserved_nano_cny = reserved_nano_cny - %s, "
+        "version = version + 1, updated_at = now() "
+        "WHERE allowance_id=%s RETURNING " + _ALLOWANCE_SEL,
+        (release, allowance_id))
+    return _allowance_out(cur.fetchone())
+
+
+def total_allowance_settle_tx(cur, allowance_id, estimated_nano, actual_nano):
+    """总额度结算（与 :func:`window_settle_tx` 对称）。
+
+    ``reserved -= estimated``、``spent += actual``；``actual > estimated``
+    允许（真实成本照记，overage 记指标）——之后剩余为 0、新调用由不等式
+    自然拒绝（§Batch B 原子授权与结算 2）。
+    """
+    estimated = _validate_nano(estimated_nano, "estimated_nano")
+    actual = _validate_nano(actual_nano, "actual_nano")
+    cur.execute(
+        "SELECT " + _ALLOWANCE_SEL + " FROM ai_spend_total_allowances "
+        "WHERE allowance_id=%s FOR UPDATE", (allowance_id,))
+    row = cur.fetchone()
+    if row is None:
+        raise SpendTotalAllowanceMissingError(
+            "总额度行不存在", allowance_id=allowance_id)
+    reserved = int(row["reserved_nano_cny"])
+    overage = max(0, actual - estimated)
+    release = estimated
+    if estimated > reserved:
+        _metric("spend_settle_release_clamp_total", target="total_allowance",
+                requested_nano=estimated, reserved_nano=reserved)
+        release = reserved
+    if overage > 0:
+        _metric("spend_settle_overage_total", overage_nano=overage)
+    cur.execute(
+        "UPDATE ai_spend_total_allowances SET "
+        "reserved_nano_cny = reserved_nano_cny - %s, "
+        "spent_nano_cny = spent_nano_cny + %s, "
+        "version = version + 1, updated_at = now() "
+        "WHERE allowance_id=%s RETURNING " + _ALLOWANCE_SEL,
+        (release, actual, allowance_id))
+    out = _allowance_out(cur.fetchone())
+    out["overage_nano"] = overage
+    return out
+
+
+def total_allowance_add_spent_tx(cur, allowance_id, actual_nano):
+    """只累加 spent 的事务内投影原语（Batch B usage 投影专用；对称
+    :func:`window_add_spent_tx`）——priced 事件已成事实的成本记进所属
+    allow­ance，reserved 归还由 hold release 半步单独完成。"""
+    actual = _validate_nano(actual_nano, "actual_nano")
+    cur.execute(
+        "UPDATE ai_spend_total_allowances SET "
+        "spent_nano_cny = spent_nano_cny + %s, "
+        "version = version + 1, updated_at = now() "
+        "WHERE allowance_id=%s RETURNING " + _ALLOWANCE_SEL,
+        (actual, allowance_id))
+    row = cur.fetchone()
+    if row is None:
+        raise SpendTotalAllowanceMissingError(
+            "总额度行不存在", allowance_id=allowance_id)
+    return _allowance_out(row)
+
+
+def total_allowance_reserve(allowance, estimated_nano):
+    """独立事务版预占（连接壳；语义见 :func:`total_allowance_reserve_tx`）。"""
+    platform_features.require_pg_backend("spend")
+    estimated = _validate_nano(estimated_nano, "estimated_nano")
+    allowance_id = _allowance_arg_id(allowance)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                return total_allowance_reserve_tx(cur, allowance_id, estimated)
+    finally:
+        conn.close()
+
+
+def total_allowance_release(allowance, estimated_nano):
+    """独立事务版释放（连接壳；语义见 :func:`total_allowance_release_tx`）。"""
+    platform_features.require_pg_backend("spend")
+    estimated = _validate_nano(estimated_nano, "estimated_nano")
+    allowance_id = _allowance_arg_id(allowance)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                return total_allowance_release_tx(cur, allowance_id, estimated)
+    finally:
+        conn.close()
+
+
+def total_allowance_settle(allowance, estimated_nano, actual_nano):
+    """独立事务版结算（连接壳；语义见 :func:`total_allowance_settle_tx`）。"""
+    platform_features.require_pg_backend("spend")
+    estimated = _validate_nano(estimated_nano, "estimated_nano")
+    actual = _validate_nano(actual_nano, "actual_nano")
+    allowance_id = _allowance_arg_id(allowance)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                return total_allowance_settle_tx(cur, allowance_id, estimated,
+                                                 actual)
+    finally:
+        conn.close()
+
+
+def _allowance_arg_id(allowance):
+    """allowance 参数归一：dict 或 allowance_id 字符串 → allowance_id。"""
+    aid = (allowance.get("allowance_id")
+           if isinstance(allowance, dict) else allowance)
+    if not isinstance(aid, str) or not aid:
+        raise InvalidSpendRequestError("allowance 需为额度 dict 或 allowance_id")
+    return aid
+
+
+def create_user_total_allowance_tx(cur, user_id, limit_nano, *, source,
+                                   default_version=None, actor_user_id=None,
+                                   updated_by=None, opening_spent_nano=0,
+                                   cutover_at=None, source_window_id=None,
+                                   source_window_version=None, audit=True):
+    """在调用方事务 cursor 内为 user 建总额度行（每 user 唯一；不提交）。
+
+    供三组合路径共用（同一事务原子性是硬性要求）：
+
+    - owner 建号（user_store_pg，source=``admin_create``）；
+    - 邀请码兑换（registration_store，source=``invite``）；
+    - cutover 迁移（scripts/cutover_user_total_allowances.py，
+      source=``cutover``，携带 source_window_id/version 与 cutover_at）。
+
+    ``opening_spent_nano`` 是迁移基线（仅 cutover 非 0），建行后不再变化。
+    user 已有行 → 抛 :class:`SpendTotalAllowanceExistsError`（唯一约束在
+    DB 层兜底）。审计 action=``spend.total_allowance_create`` 与写入同事务。
+    """
+    limit = _validate_nano(limit_nano, "limit_nano")
+    opening = _validate_nano(opening_spent_nano, "opening_spent_nano")
+    _validate_user_subject_id(user_id)
+    if source not in TOTAL_ALLOWANCE_SOURCES:
+        raise InvalidSpendRequestError(
+            "source 需为 %s" % (TOTAL_ALLOWANCE_SOURCES,), source=source)
+    allowance_id = _ALLOWANCE_ID_PREFIX + secrets.token_hex(12)
+    cur.execute(
+        "INSERT INTO ai_spend_total_allowances "
+        "(allowance_id, subject_type, subject_id, limit_nano_cny, "
+        " opening_spent_nano_cny, spent_nano_cny, reserved_nano_cny, "
+        " source, default_version, cutover_at, source_window_id, "
+        " source_window_version, updated_by) "
+        "VALUES (%s,'user',%s,%s,%s,%s,0,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (subject_id) DO NOTHING RETURNING " + _ALLOWANCE_SEL,
+        (allowance_id, user_id, limit, opening, opening, source,
+         default_version, cutover_at, source_window_id,
+         source_window_version, updated_by or actor_user_id))
+    row = cur.fetchone()
+    if row is None:
+        raise SpendTotalAllowanceExistsError(
+            "该用户已存在总额度行（每 user 唯一）", subject_id=user_id)
+    out = _allowance_out(row)
+    if audit:
+        share_store_pg.record_audit_tx(
+            cur, "spend.total_allowance_create",
+            actor_user_id=actor_user_id, actor_role="owner",
+            target_type="spend_total_allowance", target_id=allowance_id,
+            detail={
+                "op": "create_user_total_allowance",
+                "user_id": user_id,
+                "source": source,
+                "limit_nano_cny": limit,
+                "opening_spent_nano_cny": opening,
+                "default_version": (int(default_version)
+                                    if default_version is not None else None),
+                "source_window_id": source_window_id,
+                "source_window_version": (
+                    int(source_window_version)
+                    if source_window_version is not None else None),
+            })
+    return out
+
+
+def set_user_total_limit(user_id, new_limit_nano_cny, expected_version, *,
+                         actor_user_id=None, updated_by=None,
+                         audit_detail=None):
+    """设置用户绝对总额度 X（CAS + 同事务 audit）。
+
+    - ``new_limit_nano_cny`` 是**绝对值**：绝不允许 ``limit += X`` 语义
+      （§Batch B 迁移与额度语义 7）； spent/reserved 一概不动（改小到低于
+      已用加预占时，remaining 显示 0、overage 明示超额，后续授权全部拒绝
+      ——由不等式自然成立，本函数不拒绝）；
+    - ``expected_version`` 未命中抛 :class:`SpendVersionConflictError`
+      （409 语义，不做 last-write-wins）；
+    - audit action=``spend.total_allowance_update``（同事务，失败整体回滚）。
+    """
+    platform_features.require_pg_backend("spend")
+    new_limit = _validate_nano(new_limit_nano_cny, "new_limit_nano_cny")
+    _validate_expected_version(expected_version)
+    _validate_user_subject_id(user_id)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                allowance = _fetch_total_allowance_locked(cur, user_id)
+                cur.execute(
+                    "UPDATE ai_spend_total_allowances SET "
+                    "limit_nano_cny=%s, version=version+1, "
+                    "updated_at=now(), updated_by=%s "
+                    "WHERE allowance_id=%s AND version=%s "
+                    "RETURNING " + _ALLOWANCE_SEL,
+                    (new_limit, updated_by or actor_user_id,
+                     allowance["allowance_id"], expected_version))
+                row = cur.fetchone()
+                if row is None:
+                    raise SpendVersionConflictError(
+                        "总额度版本冲突（数据已被他人修改，请刷新后重试）",
+                        user_id=user_id, expected_version=expected_version)
+                out = _allowance_out(row)
+                detail = dict(audit_detail or {})
+                detail.update({
+                    "op": "set_user_total_limit",
+                    "user_id": user_id,
+                    "allowance_id": allowance["allowance_id"],
+                    "previous_limit_nano_cny":
+                        int(allowance["limit_nano_cny"]),
+                    "new_limit_nano_cny": new_limit,
+                    "previous_version": expected_version,
+                    "new_version": out["version"],
+                    "spent_nano_cny": int(out["spent_nano_cny"]),
+                    "reserved_nano_cny": int(out["reserved_nano_cny"]),
+                })
+                share_store_pg.record_audit_tx(
+                    cur, TOTAL_ALLOWANCE_AUDIT_ACTION,
+                    actor_user_id=actor_user_id, actor_role="owner",
+                    target_type="spend_total_allowance",
+                    target_id=allowance["allowance_id"], detail=detail)
+                return out
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# Batch B（§3.1/数据模型 1）：全局默认总额度 X（仅新 user 开户模板）
+# --------------------------------------------------------------------------- #
+_TOTAL_DEFAULT_SEL = (
+    "singleton, default_limit_nano_cny, version, "
+    "extract(epoch from created_at)::float8 AS created_at, "
+    "extract(epoch from updated_at)::float8 AS updated_at, updated_by"
+)
+
+
+def _total_default_out(row) -> dict:
+    out = dict(row)
+    for key in ("default_limit_nano_cny", "version"):
+        if out.get(key) is not None:
+            out[key] = int(out[key])
+    for key in ("created_at", "updated_at"):
+        if out.get(key) is not None:
+            out[key] = float(out[key])
+    return out
+
+
+def _resolve_total_default_tx(cur, at) -> "tuple[int | None, str | None]":
+    """解析「新 user 默认总额度 X」→ ``(limit_nano, source)``。
+
+    - ``ai_spend_total_defaults`` 有行 → ``(面值, "total_defaults")``；
+    - 缺行（0029 刚应用、cutover 尚未跑）→ 回退当时有效 ``user_default``
+      策略面值 ``(面值, "user_default_policy")``——**fail-safe**：保持
+      「无配置时新 user 仍有明确额度」的旧语义，不放大也不拒绝开户模板
+      读取（回退来源在审计/响应里标明，cutover 会把它固化为权威行）；
+    - 两者皆缺 → ``(None, None)``（调用方按「无默认」裁决）。
+
+    修改默认不追溯既有 user（§3.1）；owner/demo 不读本表。
+    """
+    cur.execute("SELECT " + _TOTAL_DEFAULT_SEL +
+                " FROM ai_spend_total_defaults WHERE singleton='global'")
+    row = cur.fetchone()
+    if row is not None:
+        out = _total_default_out(row)
+        return int(out["default_limit_nano_cny"]), "total_defaults"
+    policy = _resolve_policy_tx(cur, "user", "__no_such_user__", at)
+    if policy is not None:
+        return int(policy["limit_nano_cny"]), "user_default_policy"
+    return None, None
+
+
+def get_total_default():
+    """读全局默认总额度（缺行回退 user_default 策略面值；见上）。"""
+    platform_features.require_pg_backend("spend")
+    at = datetime.now(timezone.utc)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                limit, source = _resolve_total_default_tx(cur, at)
+        if limit is None:
+            return None
+        return {"default_limit_nano_cny": limit, "source": source}
+    finally:
+        conn.close()
+
+
+def set_total_default(new_limit_nano_cny, expected_version, *,
+                      actor_user_id=None, updated_by=None):
+    """CAS 写全局默认总额度 X（新 user 开户模板；不追溯既有 user）。
+
+    - 行已存在：``version=expected_version`` 命中才更新（409 语义冲突）；
+    - 行不存在：``expected_version`` 必须为 1（首个写入者），否则 409；
+    - audit action=``spend.total_default_update`` 与写入同事务。
+    """
+    platform_features.require_pg_backend("spend")
+    new_limit = _validate_nano(new_limit_nano_cny, "new_limit_nano_cny")
+    _validate_expected_version(expected_version)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT " + _TOTAL_DEFAULT_SEL + " FROM "
+                    "ai_spend_total_defaults WHERE singleton='global' "
+                    "FOR UPDATE")
+                row = cur.fetchone()
+                if row is None:
+                    if expected_version != 1:
+                        raise SpendVersionConflictError(
+                            "默认总额度尚未初始化（expected_version 需为 1）",
+                            expected_version=expected_version)
+                    cur.execute(
+                        "INSERT INTO ai_spend_total_defaults "
+                        "(singleton, default_limit_nano_cny, version, "
+                        " updated_by) VALUES ('global',%s,1,%s) "
+                        "RETURNING " + _TOTAL_DEFAULT_SEL,
+                        (new_limit, updated_by or actor_user_id))
+                    out = _total_default_out(cur.fetchone())
+                    previous = None
+                else:
+                    current = _total_default_out(row)
+                    if int(current["version"]) != expected_version:
+                        raise SpendVersionConflictError(
+                            "默认总额度版本冲突（数据已被他人修改，请刷新"
+                            "后重试）", expected_version=expected_version)
+                    cur.execute(
+                        "UPDATE ai_spend_total_defaults SET "
+                        "default_limit_nano_cny=%s, version=version+1, "
+                        "updated_at=now(), updated_by=%s "
+                        "WHERE singleton='global' RETURNING "
+                        + _TOTAL_DEFAULT_SEL,
+                        (new_limit, updated_by or actor_user_id))
+                    out = _total_default_out(cur.fetchone())
+                    previous = current
+                share_store_pg.record_audit_tx(
+                    cur, TOTAL_DEFAULT_AUDIT_ACTION,
+                    actor_user_id=actor_user_id, actor_role="owner",
+                    target_type="ai_spend_total_defaults",
+                    target_id="global",
+                    detail={
+                        "op": "set_total_default",
+                        "previous_limit_nano_cny": (
+                            int(previous["default_limit_nano_cny"])
+                            if previous else None),
+                        "new_limit_nano_cny": new_limit,
+                        "previous_version": (
+                            int(previous["version"]) if previous else None),
+                        "new_version": out["version"],
+                    })
+                return out
+    finally:
+        conn.close()
+
+
+def restore_user_total_default(user_id, expected_version, *,
+                               actor_user_id=None, updated_by=None):
+    """「恢复默认」：把该用户的绝对总上限显式改为**当时**默认 X。
+
+    与 :func:`set_user_total_limit` 同款 CAS + 同事务 audit；spent/reserved
+    一概不动（§3.1：恢复默认也绝不清零已用/预占）。默认解析见
+    :func:`_resolve_total_default_tx`（缺行回退 user_default 策略面值）。
+    audit detail 追加 ``op=restore_user_total_default`` 与默认来源。
+    """
+    platform_features.require_pg_backend("spend")
+    _validate_expected_version(expected_version)
+    _validate_user_subject_id(user_id)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                allowance = _fetch_total_allowance_locked(cur, user_id)
+                at = datetime.now(timezone.utc)
+                default_limit, default_source = _resolve_total_default_tx(
+                    cur, at)
+                if default_limit is None:
+                    raise SpendPolicyMissingError(
+                        "无可用默认总额度（defaults 表缺行且 user_default "
+                        "策略未配置，fail-closed 不猜值）", user_id=user_id)
+                cur.execute(
+                    "UPDATE ai_spend_total_allowances SET "
+                    "limit_nano_cny=%s, version=version+1, "
+                    "updated_at=now(), updated_by=%s "
+                    "WHERE allowance_id=%s AND version=%s "
+                    "RETURNING " + _ALLOWANCE_SEL,
+                    (default_limit, updated_by or actor_user_id,
+                     allowance["allowance_id"], expected_version))
+                row = cur.fetchone()
+                if row is None:
+                    raise SpendVersionConflictError(
+                        "总额度版本冲突（数据已被他人修改，请刷新后重试）",
+                        user_id=user_id, expected_version=expected_version)
+                out = _allowance_out(row)
+                share_store_pg.record_audit_tx(
+                    cur, TOTAL_ALLOWANCE_AUDIT_ACTION,
+                    actor_user_id=actor_user_id, actor_role="owner",
+                    target_type="spend_total_allowance",
+                    target_id=allowance["allowance_id"],
+                    detail={
+                        "op": "restore_user_total_default",
+                        "user_id": user_id,
+                        "allowance_id": allowance["allowance_id"],
+                        "default_source": default_source,
+                        "previous_limit_nano_cny":
+                            int(allowance["limit_nano_cny"]),
+                        "new_limit_nano_cny": default_limit,
+                        "previous_version": expected_version,
+                        "new_version": out["version"],
+                        "spent_nano_cny": int(out["spent_nano_cny"]),
+                        "reserved_nano_cny": int(out["reserved_nano_cny"]),
+                    })
+                return out
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
 # 对账器（§9.7：报告 drift，不自动修）
 # --------------------------------------------------------------------------- #
 def _reconcile_window_tx(cur, window, cutover, now):
@@ -1248,6 +1901,108 @@ def reconcile_spend_windows(*, at=None):
         conn.close()
 
 
+def reconcile_total_allowances(*, at=None):
+    """总额度对账（§Batch B 原子授权与结算 3）：只报告 drift，不自动修。
+
+    口径（每条 ai_spend_total_allowances 行）：
+
+      - ``expected_spent = opening_spent + cutover 后 priced usage``：
+        ai_usage_events 中 priced、``subject_type='user' AND subject_id=
+        行主体``、``occurred_at >= max(基线时刻, pricing_v2_cutover_at)``
+        的 ``charge_nano_cny`` 合计。基线时刻 = ``cutover_at``（cutover 行）
+        或 ``created_at``（invite/admin_create 行）——opening_spent 本身来自
+        cutover 前窗口快照，不得重复计入；pricing cutover 前的旧错误价格
+        影子数据照旧排除（§7.2 口径与窗口对账一致）；
+      - ``expected_reserved = 当前 open holds``：billing_holds 中
+        ``status='open' AND expires_at >= at AND spend_total_allowance_id=
+        行 id`` 且 estimated 非空的合计（按 hold 上保存的目标，不按当前
+        策略重解析）；
+      - **只报告不修账**（修数必须走人工/强一致路径）。
+
+    返回 ``{"checked", "drift_allowances", "items", "pricing_cutover_epoch",
+    "user_spend_target"}``。
+    """
+    platform_features.require_pg_backend("spend")
+    at_dt = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT allowance_id, subject_id, limit_nano_cny, "
+                    "opening_spent_nano_cny, spent_nano_cny, "
+                    "reserved_nano_cny, source, version, cutover_at, "
+                    "created_at FROM ai_spend_total_allowances "
+                    "ORDER BY subject_id")
+                rows = cur.fetchall()
+                items = []
+                marker = None
+                cur.execute(
+                    "SELECT value FROM platform_settings WHERE key=%s",
+                    (_PRICING_CUTOVER_KEY,))
+                m = cur.fetchone()
+                if m is not None and m["value"] is not None:
+                    marker = datetime.fromtimestamp(float(m["value"]),
+                                                    tz=timezone.utc)
+                for row in rows:
+                    baseline = row["cutover_at"] or row["created_at"]
+                    effective_from = baseline
+                    cutover_missing = False
+                    if marker is not None:
+                        effective_from = max(effective_from, marker)
+                    else:
+                        cutover_missing = True
+                    cur.execute(
+                        "SELECT COALESCE(SUM(charge_nano_cny), 0)::bigint "
+                        "AS spent FROM ai_usage_events "
+                        "WHERE status='priced' AND subject_type='user' "
+                        "AND subject_id=%s AND occurred_at >= %s",
+                        (row["subject_id"], effective_from))
+                    expected_spent = (int(row["opening_spent_nano_cny"])
+                                      + int(cur.fetchone()["spent"]))
+                    cur.execute(
+                        "SELECT COALESCE(SUM(estimated_nano_cny), 0)::bigint "
+                        "AS reserved FROM billing_holds "
+                        "WHERE status='open' AND expires_at >= %s "
+                        "AND spend_total_allowance_id=%s "
+                        "AND estimated_nano_cny IS NOT NULL",
+                        (at_dt, row["allowance_id"]))
+                    expected_reserved = int(cur.fetchone()["reserved"])
+                    actual_spent = int(row["spent_nano_cny"])
+                    actual_reserved = int(row["reserved_nano_cny"])
+                    item = {
+                        "allowance_id": row["allowance_id"],
+                        "subject_id": row["subject_id"],
+                        "source": row["source"],
+                        "limit_nano_cny": int(row["limit_nano_cny"]),
+                        "expected_spent_nano": expected_spent,
+                        "actual_spent_nano": actual_spent,
+                        "spent_drift_nano": actual_spent - expected_spent,
+                        "expected_reserved_nano": expected_reserved,
+                        "actual_reserved_nano": actual_reserved,
+                        "reserved_drift_nano":
+                            actual_reserved - expected_reserved,
+                    }
+                    if cutover_missing:
+                        item["pricing_cutover_missing"] = True
+                    item["matches"] = (item["spent_drift_nano"] == 0
+                                       and item["reserved_drift_nano"] == 0)
+                    items.append(item)
+                mode = _enforcement_mode_tx(cur)
+                target = get_user_spend_target_tx(cur)
+        return {
+            "checked": len(items),
+            "drift_allowances": sum(1 for i in items if not i["matches"]),
+            "items": items,
+            "pricing_cutover_epoch":
+                marker.timestamp() if marker is not None else None,
+            "user_spend_target": target,
+            "enforcement_mode": mode,
+        }
+    finally:
+        conn.close()
+
+
 # --------------------------------------------------------------------------- #
 # admin 只读查询（Admin API v1 数据源；金额出口十进制字符串化在 app 层）
 # --------------------------------------------------------------------------- #
@@ -1283,16 +2038,27 @@ def admin_list_policies(*, at=None):
 
 
 def admin_users_spend_summaries(subjects, *, at=None):
-    """每用户当前月窗口 + 策略解析结果（§6.2 用户详情数据源；单事务批量）。
+    """每用户当前 spend 投影（§6.2 / §4.3 用户页数据源；单事务批量）。
 
     ``subjects`` 为 ``(subject_type, user_id)`` 可迭代（owner 用户传
-    ``("owner", user_id)``，普通用户 ``("user", user_id)``）。每项返回：
+    ``("owner", user_id)``，普通用户 ``("user", user_id)``）。按角色 +
+    ``user_spend_target`` 返回**互斥**形态（前端两种形态同时出现必须报
+    契约错误，§4.3）：
 
-    - ``policy_scope``：当前时刻解析到的策略 scope（user_override=覆盖生效 /
-      user_default=继承默认 / owner=独立策略；解析失败 None+error）；
-    - ``window``：当前窗口（get_or_create，含 limit/spent/reserved/边界/
-      version）；单主体失败（如 user_default 被禁用）带稳定 ``error`` code，
-      不拖垮整页（与 admin v1 windows/current 同口径）。
+    - ``role=user``：已有 allowance 行 → ``total`` 形态
+      （``{allowance_id, total_limit_nano_cny, spent_nano_cny,
+      reserved_nano_cny, remaining_nano, overage_nano, source, version,
+      cutover_at, opening_spent_nano_cny}``；remaining=max(0,
+      limit-spent-reserved)、overage=max(0, spent+reserved-limit)；
+      opening_spent 只进技术详情；**不含** window/policy_* 键）；
+      无 allowance 行时：target=``"total_allowance"`` → 稳定
+      ``error=spend_total_allowance_missing``，target=``"window"``
+      （cutover 前存量用户）→ 回退 window 形态如实展示现行授权面；
+    - ``role=owner`` → 现有 window 形态（policy_scope/policy_id/
+      policy_version/window，get_or_create）。
+
+    单主体失败（如缺 allowance 行、user_default 被禁用）带稳定 ``error``
+    code，不拖垮整页（与 admin v1 windows/current 同口径）。
     """
     platform_features.require_pg_backend("spend")
     at_dt = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
@@ -1300,24 +2066,252 @@ def admin_users_spend_summaries(subjects, *, at=None):
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
+                target = get_user_spend_target_tx(cur)
                 out = {}
                 for subject_type, subject_id in subjects:
                     item = {"subject_type": subject_type,
-                            "subject_id": subject_id}
+                            "subject_id": subject_id,
+                            "spend_target": (target if subject_type == "user"
+                                             else "window")}
                     try:
-                        policy = _resolve_policy_tx(cur, subject_type,
-                                                    subject_id, at_dt)
-                        item["policy_scope"] = (policy["scope_type"]
-                                                if policy else None)
-                        item["policy_id"] = (policy["policy_id"]
-                                             if policy else None)
-                        item["policy_version"] = (policy["version"]
-                                                  if policy else None)
-                        item["window"] = _get_or_create_window_tx(
-                            cur, subject_type, subject_id, at_dt)
+                        if subject_type == "user" and (
+                                target == "total_allowance"
+                                or _fetch_total_allowance_read(
+                                    cur, subject_id) is not None):
+                            item["total"] = total_allowance_summary_tx(
+                                cur, subject_id)
+                        else:
+                            policy = _resolve_policy_tx(cur, subject_type,
+                                                        subject_id, at_dt)
+                            item["policy_scope"] = (policy["scope_type"]
+                                                    if policy else None)
+                            item["policy_id"] = (policy["policy_id"]
+                                                 if policy else None)
+                            item["policy_version"] = (policy["version"]
+                                                      if policy else None)
+                            item["window"] = _get_or_create_window_tx(
+                                cur, subject_type, subject_id, at_dt)
                     except SpendError as exc:
                         item["error"] = exc.code
                     out[subject_id] = item
         return out
+    finally:
+        conn.close()
+
+
+def total_allowance_summary_tx(cur, subject_id) -> dict:
+    """user 总额度形态汇总（cursor 注入；缺行抛稳定 missing）。"""
+    a = _fetch_total_allowance_read(cur, subject_id)
+    if a is None:
+        raise SpendTotalAllowanceMissingError(
+            "该用户无总额度行", subject_id=subject_id)
+    return {
+        "allowance_id": a["allowance_id"],
+        "total_limit_nano_cny": int(a["limit_nano_cny"]),
+        "spent_nano_cny": int(a["spent_nano_cny"]),
+        "reserved_nano_cny": int(a["reserved_nano_cny"]),
+        "remaining_nano": total_allowance_remaining_nano(a),
+        "overage_nano": total_allowance_overage_nano(a),
+        "source": a["source"],
+        "version": int(a["version"]),
+        "cutover_at": a["cutover_at"],
+        # 技术详情字段（§4.3：opening_spent 只进技术详情）
+        "opening_spent_nano_cny": int(a["opening_spent_nano_cny"]),
+        "default_version": a["default_version"],
+        "source_window_id": a["source_window_id"],
+        "source_window_version": a["source_window_version"],
+        "updated_at": a["updated_at"],
+        "updated_by": a["updated_by"],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Batch B（§4.6）：Demo 消费统计只读聚合（owner-only 端点数据源；wave 2）
+# --------------------------------------------------------------------------- #
+def admin_demo_spend_stats(window="current", *, at=None):
+    """Demo 周消费统计（**纯只读**：绝不 INSERT/UPDATE 任何业务表）。
+
+    - ``window``：``"current"``（默认）|``"previous"``。边界取服务端
+      ``demo_global`` 周窗口（:func:`week_window_bounds`，Asia/Shanghai 周一
+      00:00）；客户端不得传任意金额或主体。previous = at 所在周的上一周；
+    - 只用 :func:`peek_current_window` 语义（策略解析 → 边界 → SELECT，不建
+      行）：current 无窗口行时按有效 policy 边界返回**全 0 虚拟摘要**
+      （``virtual=True``，limit 取策略面值）；previous 同样只读既有行；
+    - 聚合口径：usage 按 ``subject_type='demo'`` **宽匹配**（所有 capability
+      主体同池，绝不按单个 subject_id 误当总池）；hold 按 demo 主体在窗口内
+      created_at 分状态计数（hard 拒绝不落行，denied 计数来自
+      ai_spend_denial_events 按 reason 聚合）；金额投影以 demo_global 窗口
+      行为准；
+    - 响应内固定标注：数据库整体不可用类拒绝不在 DB 聚合内（仅外部 metric）；
+    - 调用接口前后任何业务表行数不变（测试验收口 §4.6）。
+    """
+    platform_features.require_pg_backend("spend")
+    if window not in ("current", "previous"):
+        raise InvalidSpendRequestError(
+            "window 需为 'current'|'previous'", window=window)
+    at_dt = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
+    if window == "previous":
+        bounds_at = at_dt - timedelta(days=7)
+    else:
+        bounds_at = at_dt
+    start, end = week_window_bounds(bounds_at)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                policy = _resolve_policy_tx(cur, "demo", DEMO_GLOBAL_SUBJECT,
+                                            at_dt)
+                cur.execute(
+                    "SELECT " + _WINDOW_SEL + " FROM ai_spend_windows "
+                    "WHERE subject_type='demo' AND subject_id=%s "
+                    "AND window_start=%s AND window_end=%s",
+                    (DEMO_GLOBAL_SUBJECT, start, end))
+                row = cur.fetchone()
+                win = _window_out(row) if row is not None else None
+                limit_nano = (int(win["limit_nano_snapshot"]) if win else
+                              (int(policy["limit_nano_cny"])
+                               if policy else 0))
+                spent = int(win["spent_nano_cny"]) if win else 0
+                reserved = int(win["reserved_nano_cny"]) if win else 0
+                # usage 聚合：demo 主体宽匹配（status × token × 成本）
+                cur.execute(
+                    "SELECT status, count(*)::int AS calls, "
+                    "COALESCE(SUM(charge_nano_cny), 0)::bigint AS charge, "
+                    "COALESCE(SUM(provider_cost_nano_cny), 0)::bigint AS pcost,"
+                    " COALESCE(SUM(cache_hit_input_tokens), 0)::bigint AS hit,"
+                    " COALESCE(SUM(cache_miss_input_tokens), 0)::bigint AS miss,"
+                    " COALESCE(SUM(output_tokens), 0)::bigint AS out_tok, "
+                    "COALESCE(SUM(reasoning_tokens), 0)::bigint AS reason_tok "
+                    "FROM ai_usage_events "
+                    "WHERE subject_type='demo' AND occurred_at >= %s "
+                    "AND occurred_at < %s GROUP BY status",
+                    (start, end))
+                usage = {r["status"]: dict(r) for r in cur.fetchall()}
+                priced = usage.get("priced", {})
+                unpriced = usage.get("unpriced", {})
+                # hold 分状态计数（窗口内创建的 demo 主体 hold）
+                cur.execute(
+                    "SELECT status, count(*)::int AS n FROM billing_holds "
+                    "WHERE subject_type='demo' AND created_at >= %s "
+                    "AND created_at < %s GROUP BY status", (start, end))
+                holds = {r["status"]: int(r["n"])
+                         for r in cur.fetchall()}
+                # denial 事件按稳定 reason 聚合（同一 (call_id, reason) 只一条）
+                cur.execute(
+                    "SELECT reason, count(*)::int AS n FROM "
+                    "ai_spend_denial_events WHERE subject_type='demo' "
+                    "AND occurred_at >= %s AND occurred_at < %s "
+                    "GROUP BY reason ORDER BY reason", (start, end))
+                denials = [{"reason": r["reason"], "count": int(r["n"])}
+                           for r in cur.fetchall()]
+        return {
+            "window": window,
+            "subject_type": "demo",
+            "subject_id": DEMO_GLOBAL_SUBJECT,
+            "window_start": start.timestamp(),
+            "window_end": end.timestamp(),
+            "window_id": win["window_id"] if win else None,
+            "window_version": int(win["version"]) if win else None,
+            "virtual": win is None,
+            "policy_id": policy["policy_id"] if policy else None,
+            "policy_version": int(policy["version"]) if policy else None,
+            "limit_nano_cny": limit_nano,
+            "spent_nano_cny": spent,
+            "reserved_nano_cny": reserved,
+            "remaining_nano": max(0, limit_nano - spent - reserved),
+            "overage_nano": max(0, spent + reserved - limit_nano),
+            "priced_calls": int(priced.get("calls", 0)),
+            "unpriced_calls": int(unpriced.get("calls", 0)),
+            "charge_nano_cny": int(priced.get("charge", 0)),
+            "provider_cost_nano_cny": int(priced.get("pcost", 0)),
+            "cache_hit_input_tokens": int(priced.get("hit", 0))
+            + int(unpriced.get("hit", 0)),
+            "cache_miss_input_tokens": int(priced.get("miss", 0))
+            + int(unpriced.get("miss", 0)),
+            "output_tokens": int(priced.get("out_tok", 0))
+            + int(unpriced.get("out_tok", 0)),
+            "reasoning_tokens": int(priced.get("reason_tok", 0))
+            + int(unpriced.get("reason_tok", 0)),
+            "holds": {
+                "authorized": sum(holds.values()),
+                "open": holds.get("open", 0),
+                "settled": holds.get("settled", 0),
+                "released": holds.get("released", 0),
+                "expired": holds.get("expired", 0),
+            },
+            "denials": denials,
+            "denials_total": sum(d["count"] for d in denials),
+            "db_unavailable_denials_included": False,
+            "note": DEMO_STATS_DB_UNAVAILABLE_NOTE,
+        }
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# Batch B（§4.6 API 契约）：spend settings 拆分读取（供 wave 2 settings API）
+# --------------------------------------------------------------------------- #
+def admin_spend_settings_values(*, at=None):
+    """解析三个拆分后的额度设置值（避免再出现含混的「统一周期额度」）。
+
+    返回（金额均为 nano-CNY int 或 None=未配置）：
+
+    - ``user_default_total_limit_nano_cny`` + ``..._source``：新 user 默认
+      总额度 X（ai_spend_total_defaults 缺行时回退 user_default 策略面值，
+      source 标明来源，见 :func:`_resolve_total_default_tx`）；写路径 CAS
+      上下文随源给出：source=``"total_defaults"`` →
+      ``user_default_total_limit_version``（ai_spend_total_defaults.version，
+      写 PUT .../spend/user-default-total-limit）；source=
+      ``"user_default_policy"`` → ``user_default_total_policy_id`` +
+      ``..._version``（写 PUT .../spend/policies/<policy_id> 兼容路径）；
+    - ``demo_weekly_limit_nano_cny``：demo_global 周策略当前面值；
+    - ``owner_monthly_limit_nano_cny``：owner 月策略当前面值。
+    """
+    platform_features.require_pg_backend("spend")
+    at_dt = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT " + _TOTAL_DEFAULT_SEL + " FROM "
+                    "ai_spend_total_defaults WHERE singleton='global'")
+                default_row = cur.fetchone()
+                user_fallback_policy = None
+                if default_row is not None:
+                    default_out = _total_default_out(default_row)
+                    total_limit = int(default_out["default_limit_nano_cny"])
+                    total_source = "total_defaults"
+                    total_version = int(default_out["version"])
+                    total_policy_id = None
+                else:
+                    user_fallback_policy = _resolve_policy_tx(
+                        cur, "user", "__no_such_user__", at_dt)
+                    if user_fallback_policy is not None:
+                        total_limit = int(
+                            user_fallback_policy["limit_nano_cny"])
+                        total_source = "user_default_policy"
+                        total_version = int(user_fallback_policy["version"])
+                        total_policy_id = user_fallback_policy["policy_id"]
+                    else:
+                        total_limit = None
+                        total_source = None
+                        total_version = None
+                        total_policy_id = None
+                demo = _resolve_policy_tx(cur, "demo", DEMO_GLOBAL_SUBJECT,
+                                          at_dt)
+                owner = _resolve_policy_tx(cur, "owner", "", at_dt)
+        return {
+            "user_default_total_limit_nano_cny": total_limit,
+            "user_default_total_limit_source": total_source,
+            "user_default_total_limit_version": total_version,
+            "user_default_total_policy_id": total_policy_id,
+            "demo_weekly_limit_nano_cny": (int(demo["limit_nano_cny"])
+                                           if demo else None),
+            "demo_weekly_policy_id": demo["policy_id"] if demo else None,
+            "owner_monthly_limit_nano_cny": (int(owner["limit_nano_cny"])
+                                             if owner else None),
+            "owner_monthly_policy_id": owner["policy_id"] if owner else None,
+        }
     finally:
         conn.close()

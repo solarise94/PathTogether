@@ -405,13 +405,15 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 	it("matches the documented table", () => {
 		const { AdminBridgeHost } = loadModule();
 		const table = AdminBridgeHost.METHOD_PERMISSIONS;
-		// 22 个 §8.4 表方法 + PR3b 扩展的 providerBalance.refresh（与 get 同级
-		// admin:billing:read：只抓取供应商自身余额，不触碰用户数据）+ PR5
-		// 修订补的 4 个 UI parity 方法（users.startPreview / plugins.*）+
-		// 批次 D 的 4 个统一设置页方法（settings.get/update /
-		// spend.currentWindow.adjust / users.setSpendOverride）+ 批次 F 的
-		// settings.runtime.update（turnBudgets.update/newPeriod 已退役删除）
-		expect(Object.keys(table)).toHaveLength(30);
+		// wave 2（2026-09-03，review-2026-09-02-upload-user-limits-admin-ui-
+		// cleanup.md Batch C5-6/D1）：删除 7 个误导方法（turnBudgets.get /
+		// billing.account.get / billing.account.updateCaps / billing.adjust /
+		// acquisition.summary / acquisition.list / users.setSpendOverride）
+		// 后余 27 个；新增 spend.demoStats.get 与 siteStats.get（只读统计，
+		// 复用 admin:overview:read，不再扩权限域）与
+		// spend.userTotalLimit.set / restoreDefault（user 一次性总额度 CAS 写，
+		// admin:users:write）
+		expect(Object.keys(table)).toHaveLength(27);
 		expect(table["admin.auth.get"]).toBe("admin:overview:read");
 		expect(table["admin.overview.get"]).toBe("admin:overview:read");
 		expect(table["admin.users.list"]).toBe("admin:users:read");
@@ -422,19 +424,10 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 		expect(table["admin.invites.list"]).toBe("admin:invites:read");
 		expect(table["admin.invites.create"]).toBe("admin:invites:write");
 		expect(table["admin.invites.revoke"]).toBe("admin:invites:write");
-		// 批次 F：turn 消费额度写方法退役（服务端 410）；只读 get 保留
-		expect(table["admin.turnBudgets.get"]).toBe("admin:turn-budgets:read");
-		expect(table["admin.turnBudgets.update"]).toBeUndefined();
-		expect(table["admin.turnBudgets.newPeriod"]).toBeUndefined();
-		expect(table["admin.billing.account.get"]).toBe("admin:billing:read");
-		expect(table["admin.billing.account.updateCaps"]).toBe("admin:billing:write");
-		expect(table["admin.billing.adjust"]).toBe("admin:billing:write");
 		expect(table["admin.billing.usage.list"]).toBe("admin:billing:read");
 		expect(table["admin.billing.ledger.list"]).toBe("admin:billing:read");
 		expect(table["admin.billing.providerBalance.get"]).toBe("admin:billing:read");
 		expect(table["admin.billing.providerBalance.refresh"]).toBe("admin:billing:read");
-		expect(table["admin.acquisition.summary"]).toBe("admin:acquisition:read");
-		expect(table["admin.acquisition.list"]).toBe("admin:acquisition:read");
 		expect(table["admin.audit.list"]).toBe("admin:audit:read");
 		// PR5 修订（UI parity）：身份预览（写 owner session，归 users:write）+
 		// 插件管理（独立 plugins:read/write，不复用 users/billing）
@@ -443,16 +436,31 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 		expect(table["admin.plugins.setEnabled"]).toBe("admin:plugins:write");
 		expect(table["admin.plugins.rotateSecret"]).toBe("admin:plugins:write");
 		// 批次 D（§6.5）：统一设置页（settings 独立权限；金额窗口调整归
-		// settings:write；用户月额度覆盖归 users:write）
+		// settings:write）
 		expect(table["admin.settings.get"]).toBe("admin:settings:read");
 		expect(table["admin.settings.update"]).toBe("admin:settings:write");
 		expect(table["admin.spend.currentWindow.adjust"]).toBe("admin:settings:write");
-		expect(table["admin.users.setSpendOverride"]).toBe("admin:users:write");
-		// 批次 F：运行时安全参数写（settings/runtime，替代退役的 turn-budgets PUT）
+		// 批次 F：运行时安全参数写（settings/runtime）
 		expect(table["admin.settings.runtime.update"]).toBe("admin:settings:write");
+		// wave 2 新增只读统计（复用 overview:read）
+		expect(table["admin.spend.demoStats.get"]).toBe("admin:overview:read");
+		expect(table["admin.siteStats.get"]).toBe("admin:overview:read");
+		// wave 2 新增 user 一次性总额度 CAS 写（users:write）
+		expect(table["admin.spend.userTotalLimit.set"]).toBe("admin:users:write");
+		expect(table["admin.spend.userTotalLimit.restoreDefault"]).toBe("admin:users:write");
+		// wave 2 已删方法：不在表内 → dispatch 门按既有语义回 unknown_method
+		//（旧 REST 兼容端点的 410 由服务端负责，桥层不再出现这些名字）
+		expect(table["admin.turnBudgets.get"]).toBeUndefined();
+		expect(table["admin.turnBudgets.update"]).toBeUndefined();
+		expect(table["admin.billing.account.get"]).toBeUndefined();
+		expect(table["admin.billing.account.updateCaps"]).toBeUndefined();
+		expect(table["admin.billing.adjust"]).toBeUndefined();
+		expect(table["admin.acquisition.summary"]).toBeUndefined();
+		expect(table["admin.acquisition.list"]).toBeUndefined();
+		expect(table["admin.users.setSpendOverride"]).toBeUndefined();
 	});
 
-	it("declares param schemas for every PR3b read method (whitelist + types)", () => {
+	it("declares param schemas for every read method (whitelist + types)", () => {
 		const { AdminBridgeHost } = loadModule();
 		const schemas = (
 			AdminBridgeHost as unknown as {
@@ -463,13 +471,14 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			"admin.auth.get",
 			"admin.overview.get",
 			"admin.users.list",
-			"admin.billing.account.get",
 			"admin.billing.usage.list",
 			"admin.billing.ledger.list",
 			"admin.billing.providerBalance.get",
 			"admin.billing.providerBalance.refresh",
 			"admin.audit.list",
-			"admin.turnBudgets.get",
+			// wave 2：Demo 周统计（仅 current|previous）与站点访问统计（无参数）
+			"admin.spend.demoStats.get",
+			"admin.siteStats.get",
 			// 批次 F：运行时安全参数写 schema（五参数子集白名单）
 			"admin.settings.runtime.update",
 		]) {
@@ -482,7 +491,7 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 
 describe("AdminBridge host — PR3b read backend proxy (§9 Admin API v1)", () => {
 	const ALL_READ = [
-		"admin:overview:read", "admin:users:read", "admin:turn-budgets:read",
+		"admin:overview:read", "admin:users:read",
 		"admin:billing:read", "admin:audit:read",
 	];
 
@@ -544,20 +553,34 @@ describe("AdminBridge host — PR3b read backend proxy (§9 Admin API v1)", () =
 		expect(responses(posted, "r1")[0].env.ok).toBe(true);
 	});
 
-	it("admin.billing.account.get URL-encodes user_id", async () => {
+	it("admin.siteStats.get proxies GET /api/admin/v1/site-stats verbatim (wave 2)", async () => {
+		const stats = {
+			generated_at: 1700000000,
+			today: { visits: 3, unique_visitors: 2, bots: 0 },
+			d30: { visits: 90, unique_visitors: 40, bots: 5 },
+			daily: [], top_referrers: [], top_pages: [], top_countries: [],
+			recent: [], visitor_kinds: { anonymous_human: 60, signed_in_human: 25, suspected_bot: 5 },
+			geo_configured: false,
+		};
 		const { handle, posted, contentWindow } = makeReadHost(async (url) => {
-			expect(url).toBe("/api/admin/v1/billing/accounts/usr_abc%2Fdef");
-			return { status: 200, ok: true, body: { account: null, balance_nano: null } };
+			expect(url).toBe("/api/admin/v1/site-stats");
+			return { status: 200, ok: true, body: stats };
 		});
 		handle._handleIframeLoad();
 		handle._handleWindowMessage({
-			source: contentWindow,
-			data: requestEnv(nonce0(posted), "r1", "admin.billing.account.get", {
-				user_id: "usr_abc/def",
-			}),
+			source: contentWindow, data: requestEnv(nonce0(posted), "r1", "admin.siteStats.get"),
 		});
 		await ticks();
-		expect(responses(posted, "r1")[0].env.ok).toBe(true);
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(true);
+		expect(rs[0].env.result).toEqual(stats);
+		// 无参数白名单：带任何参数一律桥层拒绝（不提供 user/campaign 过滤）
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r2", "admin.siteStats.get", { user_id: "x" }),
+		});
+		await ticks();
+		expect((responses(posted, "r2")[0].env.error as { code: string }).code).toBe("invalid_params");
 	});
 
 	it("admin.billing.providerBalance.refresh issues POST and maps server error codes", async () => {
@@ -600,7 +623,7 @@ describe("AdminBridge host — PR3b read backend proxy (§9 Admin API v1)", () =
 		}));
 		handle._handleIframeLoad();
 		handle._handleWindowMessage({
-			source: contentWindow, data: requestEnv(nonce0(posted), "r1", "admin.turnBudgets.get"),
+			source: contentWindow, data: requestEnv(nonce0(posted), "r1", "admin.overview.get"),
 		});
 		await ticks();
 		const rs = responses(posted, "r1");
@@ -620,7 +643,8 @@ describe("AdminBridge host — PR3b read backend proxy (§9 Admin API v1)", () =
 			["admin.users.list", { q: 123 }],                         // 类型：string
 			["admin.billing.usage.list", { status: "free" }],         // 枚举
 			["admin.billing.usage.list", { csrfToken: "leak" }],      // 未声明字段
-			["admin.billing.account.get", { user_id: 123 }],         // 类型：string
+			["admin.spend.demoStats.get", { window: "next" }],        // 枚举（wave 2）
+			["admin.spend.demoStats.get", { user_id: "x" }],          // 未声明字段
 			["admin.audit.list", { action: true }],                   // 类型
 			["admin.overview.get", { anything: 1 }],                   // 空白名单
 		];
@@ -681,69 +705,112 @@ describe("AdminBridge host — PR3b read backend proxy (§9 Admin API v1)", () =
 	});
 });
 
-describe("AdminBridge host — PR4 acquisition read backend proxy (§9 Admin API v1)", () => {
-	it("admin.acquisition.summary proxies GET /api/admin/v1/acquisition/summary", async () => {
-		const summary = {
-			registration_mode: "invite_only",
-			items: [{ source_code: "mywebpage", campaign_id: null, visits: 3,
-				registrations: 1, first_ai_count: 1 }],
-			totals: { visits: 3, registrations: 1, first_ai_count: 1 },
-		};
+describe("AdminBridge host — wave 2 只读聚合（Demo 周统计 / 站点访问 / 已删方法）", () => {
+	it("admin.spend.demoStats.get maps window=current|previous into the query string", async () => {
+		const calls: string[] = [];
 		const { handle, posted, contentWindow } = makeHost({
-			permissions: ["admin:acquisition:read"],
+			permissions: ["admin:overview:read"],
 			fetchJson: async (url) => {
-				expect(url).toBe("/api/admin/v1/acquisition/summary");
-				return { status: 200, ok: true, body: summary };
+				calls.push(url);
+				return {
+					status: 200, ok: true,
+					body: {
+						window: "current", window_id: "spw_d1", window_version: 2,
+						virtual: false, window_start: 1700000000, window_end: 1700604800,
+						limit_nano_cny: "50000000000", spent_nano_cny: "21300000000",
+						reserved_nano_cny: "2500000000", remaining_nano_cny: "26200000000",
+						overage_nano_cny: "0", priced_calls: 9, unpriced_calls: 0,
+						denials: [], denials_total: 0,
+						db_unavailable_denials_included: false,
+					},
+				};
 			},
-		});
-		handle._handleIframeLoad();
-		handle._handleWindowMessage({
-			source: contentWindow,
-			data: requestEnv(nonce0(posted), "r1", "admin.acquisition.summary"),
-		});
-		await ticks();
-		const rs = responses(posted, "r1");
-		expect(rs[0].env.ok).toBe(true);
-		expect(rs[0].env.result).toEqual(summary);
-	});
-
-	it("admin.acquisition.list maps cursor/limit into the users query string", async () => {
-		const { handle, posted, contentWindow } = makeHost({
-			permissions: ["admin:acquisition:read"],
-			fetchJson: async (url) => {
-				expect(url).toBe("/api/admin/v1/acquisition/users?cursor=k1&limit=25");
-				return { status: 200, ok: true, body: { items: [], next_cursor: null } };
-			},
-		});
-		handle._handleIframeLoad();
-		handle._handleWindowMessage({
-			source: contentWindow,
-			data: requestEnv(nonce0(posted), "r1", "admin.acquisition.list", {
-				cursor: "k1", limit: 25,
-			}),
-		});
-		await ticks();
-		expect(responses(posted, "r1")[0].env.ok).toBe(true);
-	});
-
-	it("rejects undeclared params on acquisition methods (schema gate)", async () => {
-		const { handle, posted, contentWindow } = makeHost({
-			permissions: ["admin:acquisition:read"],
-			fetchJson: async () => ({ status: 200, ok: true, body: {} }),
 		});
 		handle._handleIframeLoad();
 		const nonce = nonce0(posted);
 		handle._handleWindowMessage({
 			source: contentWindow,
-			data: requestEnv(nonce, "b1", "admin.acquisition.list", { q: "evil" }),
+			data: requestEnv(nonce, "r1", "admin.spend.demoStats.get", { window: "current" }),
 		});
 		handle._handleWindowMessage({
 			source: contentWindow,
-			data: requestEnv(nonce, "b2", "admin.acquisition.summary", { user_id: "x" }),
+			data: requestEnv(nonce, "r2", "admin.spend.demoStats.get", { window: "previous" }),
+		});
+		// 缺省 window 也放行（客户端默认本周）
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r3", "admin.spend.demoStats.get", {}),
 		});
 		await ticks();
-		expect((responses(posted, "b1")[0].env.error as { code: string }).code).toBe("invalid_params");
-		expect((responses(posted, "b2")[0].env.error as { code: string }).code).toBe("invalid_params");
+		expect(responses(posted, "r1")[0].env.ok).toBe(true);
+		expect(responses(posted, "r2")[0].env.ok).toBe(true);
+		expect(responses(posted, "r3")[0].env.ok).toBe(true);
+		expect(calls).toEqual([
+			"/api/admin/v1/spend/demo-stats?window=current",
+			"/api/admin/v1/spend/demo-stats?window=previous",
+			"/api/admin/v1/spend/demo-stats",
+		]);
+	});
+
+	it("admin.spend.demoStats.get rejects non-enum window values at the schema gate", async () => {
+		const calls: string[] = [];
+		const { handle, posted, contentWindow } = makeHost({
+			permissions: ["admin:overview:read"],
+			fetchJson: async (url) => {
+				calls.push(url);
+				return { status: 200, ok: true, body: {} };
+			},
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.spend.demoStats.get", {
+				window: "2026-01-01", limit_nano_cny: "1",
+			}),
+		});
+		await ticks();
+		expect((responses(posted, "r1")[0].env.error as { code: string }).code)
+			.toBe("invalid_params");
+		expect(calls).toEqual([]); // 客户端不得传任意金额或窗口
+	});
+
+	it("deleted legacy methods respond with the stable unknown_method semantics", async () => {
+		const calls: string[] = [];
+		const { handle, posted, contentWindow } = makeHost({
+			permissions: [
+				"admin:overview:read", "admin:billing:read",
+			],
+			fetchJson: async (url) => {
+				calls.push(url);
+				return { status: 200, ok: true, body: {} };
+			},
+		});
+		handle._handleIframeLoad();
+		const nonce = nonce0(posted);
+		const deleted: Array<[string, string]> = [
+			["d1", "admin.turnBudgets.get"],
+			["d2", "admin.billing.account.get"],
+			["d3", "admin.billing.account.updateCaps"],
+			["d4", "admin.billing.adjust"],
+			["d5", "admin.acquisition.summary"],
+			["d6", "admin.acquisition.list"],
+			["d7", "admin.users.setSpendOverride"],
+		];
+		for (const [rid, method] of deleted) {
+			handle._handleWindowMessage({
+				source: contentWindow,
+				data: requestEnv(nonce, rid, method, { user_id: "usr_1" }),
+			});
+		}
+		await ticks();
+		for (const [rid] of deleted) {
+			const rs = responses(posted, rid);
+			expect(rs, rid).toHaveLength(1);
+			expect(rs[0].env.ok).toBe(false);
+			expect((rs[0].env.error as { code: string }).code).toBe("unknown_method");
+		}
+		// 桥层不再为已删方法发任何 HTTP（旧 REST 410 由服务端负责）
+		expect(calls).toEqual([]);
 		expect(handle.stats().handled).toBe(0);
 	});
 });
@@ -752,8 +819,9 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 	const ALL_WRITE = [
 		"admin:users:write", "admin:invites:read", "admin:invites:write",
 		// 批次 F：turn-budgets:write 已从桥上移除（服务端 410）；runtime 写
-		// 走 admin:settings:write
-		"admin:settings:write", "admin:billing:write",
+		// 走 admin:settings:write。wave 2：billing:write 已随人工调账/caps
+		// 退役一并删除
+		"admin:settings:write",
 	];
 
 	function makeWriteHost(
@@ -857,7 +925,7 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		});
 	});
 
-	it("admin.invites.list/create/revoke map to the v1 invite endpoints", async () => {
+	it("admin.invites.list/create/revoke map to the v1 invite endpoints (wave 2 contract)", async () => {
 		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
 		const { handle, posted, contentWindow } = makeWriteHost(async (url, o) => {
 			calls.push({
@@ -879,7 +947,7 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		handle._handleWindowMessage({
 			source: contentWindow,
 			data: requestEnv(nonce, "r2", "admin.invites.create", {
-				ttl_hours: 48, ai_access: true, source_code: "mywebpage",
+				ttl_seconds: 604800, ai_access: true, total_limit_nano_cny: "2500000000",
 			}),
 		});
 		handle._handleWindowMessage({
@@ -891,8 +959,8 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		expect(calls[1]).toEqual({
 			url: "/api/admin/v1/invites", method: "POST",
 			body: {
-				login_id: undefined, ttl_hours: 48, ai_access: true, cohort: undefined,
-				note: undefined, source_code: "mywebpage", campaign_id: undefined,
+				login_id: undefined, ttl_seconds: 604800, ai_access: true,
+				note: undefined, total_limit_nano_cny: "2500000000",
 			},
 		});
 		expect(calls[2]).toEqual({
@@ -935,43 +1003,50 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		expect((rs[0].env.error as { code: string }).code).toBe("unknown_method");
 	});
 
-	it("admin.billing.account.updateCaps PUTs caps with version; adjust POSTs adjustment", async () => {
+	it("admin.spend.userTotalLimit.set PUTs the absolute limit with CAS; restoreDefault POSTs", async () => {
 		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
 		const { handle, posted, contentWindow } = makeWriteHost(async (url, o) => {
 			calls.push({
 				url, method: (o as { method?: string } | undefined)?.method,
 				body: JSON.parse(String((o as { body?: string }).body)),
 			});
-			return { status: 200, ok: true, body: { ok: true } };
+			return { status: 200, ok: true, body: { spend: { total: { version: 7 } } } };
 		});
 		handle._handleIframeLoad();
 		const nonce = nonce0(posted);
-		// §5 v0.3（P2）：金额 wire 为十进制字符串（桥层 pattern 限定 1..19 位）
+		// 金额 wire 为十进制字符串（桥层 pattern 限定 1..19 位）
 		handle._handleWindowMessage({
 			source: contentWindow,
-			data: requestEnv(nonce, "r1", "admin.billing.account.updateCaps", {
-				user_id: "usr_3", soft_cap_nano_cny: null, hard_cap_nano_cny: "200", version: 4,
+			data: requestEnv(nonce, "r1", "admin.spend.userTotalLimit.set", {
+				user_id: "usr_3", total_limit_nano_cny: "20000000000", expected_version: 4,
 			}),
 		});
 		handle._handleWindowMessage({
 			source: contentWindow,
-			data: requestEnv(nonce, "r2", "admin.billing.adjust", {
-				user_id: "usr_3", kind: "grant", amount_nano_cny: "1000",
-				reason: "welcome", idempotency_key: "adj_x1",
+			data: requestEnv(nonce, "r2", "admin.spend.userTotalLimit.restoreDefault", {
+				user_id: "usr_3", expected_version: 4,
 			}),
 		});
 		await ticks();
 		expect(calls[0]).toEqual({
-			url: "/api/admin/v1/billing/accounts/usr_3/caps", method: "PUT",
-			body: { soft_cap_nano_cny: null, hard_cap_nano_cny: "200", version: 4 },
+			url: "/api/admin/v1/spend/users/usr_3/total-limit", method: "PUT",
+			body: { total_limit_nano_cny: "20000000000", expected_version: 4 },
 		});
 		expect(calls[1]).toEqual({
-			url: "/api/admin/v1/billing/adjustments", method: "POST",
-			body: {
-				user_id: "usr_3", kind: "grant", amount_nano_cny: "1000",
-				reason: "welcome", idempotency_key: "adj_x1",
-			},
+			url: "/api/admin/v1/spend/users/usr_3/restore-default", method: "POST",
+			body: { expected_version: 4 },
 		});
+		// user_id 含 "/" → 桥层 invalid_params，后端零调用（pathId 防护）
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r3", "admin.spend.userTotalLimit.set", {
+				user_id: "usr/../admin", total_limit_nano_cny: "1", expected_version: 1,
+			}),
+		});
+		await ticks();
+		expect((responses(posted, "r3")[0].env.error as { code: string }).code)
+			.toBe("invalid_params");
+		expect(calls).toHaveLength(2);
 	});
 
 	it("rejects schema-invalid write params (required / types / enums / nonZero)", async () => {
@@ -986,54 +1061,33 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 			["admin.users.setEnabled", { user_id: "u1" }],                        // 缺 enabled
 			["admin.users.setEnabled", { user_id: "u1", enabled: "yes" }],       // boolean
 			["admin.users.resetPassword", { user_id: "u1", password: "" }],      // minLength
-			["admin.invites.create", { ttl_hours: 9999 }],                        // max 720
+			["admin.invites.create", { ttl_seconds: 999999999 }],                 // max 2592000
+			["admin.invites.create", { ttl_seconds: 604800, cohort: "beta" }],    // 未声明字段（wave 2 归因字段删除）
 			["admin.invites.create", { evil: 1 }],                                // 未声明字段
 			["admin.invites.revoke", {}],                                         // 缺 invite_id
 			// 批次 F：runtime 安全参数校验（integer / min 1 / 未声明字段）
 			["admin.settings.runtime.update", { platform_task_max_steps: 1.5 }], // integer
 			["admin.settings.runtime.update", { platform_task_max_steps: 0 }],   // min 1
 			["admin.settings.runtime.update", { platform_turn_limit: 5 }],       // 未声明字段
-			["admin.billing.account.updateCaps", { user_id: "u1", version: 1 }], // 缺 caps 键
-			// §5 v0.3（P2）：金额只接受十进制字符串——JSON number / 负 cap /
-			// 小数 / 超 19 位 / 零值形态（nonZero）一律桥层拒绝
-			["admin.billing.account.updateCaps", {
-				user_id: "u1", soft_cap_nano_cny: 10, hard_cap_nano_cny: "20", version: 1,
+			// wave 2：user 一次性总额度（required / 金额形态 / CAS 版本）
+			["admin.spend.userTotalLimit.set", { user_id: "u1", total_limit_nano_cny: "1" }], // 缺 expected_version
+			["admin.spend.userTotalLimit.set", {
+				user_id: "u1", total_limit_nano_cny: 10, expected_version: 1,
 			}],                                                                    // number 型金额
-			["admin.billing.account.updateCaps", {
-				user_id: "u1", soft_cap_nano_cny: "-5", hard_cap_nano_cny: "20", version: 1,
+			["admin.spend.userTotalLimit.set", {
+				user_id: "u1", total_limit_nano_cny: "-5", expected_version: 1,
 			}],                                                                    // pattern 非负
-			["admin.billing.account.updateCaps", {
-				user_id: "u1", soft_cap_nano_cny: "1.5", hard_cap_nano_cny: "20", version: 1,
+			["admin.spend.userTotalLimit.set", {
+				user_id: "u1", total_limit_nano_cny: "1.5", expected_version: 1,
 			}],                                                                    // pattern 整数
-			["admin.billing.account.updateCaps", {
-				user_id: "u1", soft_cap_nano_cny: "12345678901234567890",
-				hard_cap_nano_cny: "20", version: 1,
+			["admin.spend.userTotalLimit.set", {
+				user_id: "u1", total_limit_nano_cny: "12345678901234567890",
+				expected_version: 1,
 			}],                                                                    // 超 19 位
-			["admin.billing.account.updateCaps", {
-				user_id: "u1", soft_cap_nano_cny: "1", hard_cap_nano_cny: null, version: 0,
+			["admin.spend.userTotalLimit.set", {
+				user_id: "u1", total_limit_nano_cny: "1", expected_version: 0,
 			}],                                                                    // version min 1
-			["admin.billing.adjust", { user_id: "u1", kind: "usage_debit",
-				amount_nano_cny: "-5", reason: "r" }],                              // 枚举
-			["admin.billing.adjust", { user_id: "u1", kind: "grant",
-				amount_nano_cny: 0, reason: "r" }],                                // number 型金额
-			["admin.billing.adjust", { user_id: "u1", kind: "grant",
-				amount_nano_cny: "0", reason: "r" }],                               // nonZero（零值字符串）
-			["admin.billing.adjust", { user_id: "u1", kind: "grant",
-				amount_nano_cny: "-0", reason: "r" }],                              // nonZero（负零形态）
-			["admin.billing.adjust", { user_id: "u1", kind: "grant",
-				amount_nano_cny: "1.5", reason: "r" }],                             // pattern 整数
-			["admin.billing.adjust", { user_id: "u1", kind: "grant",
-				amount_nano_cny: "9" + "0".repeat(19), reason: "r" }],              // 超 19 位
-			["admin.billing.adjust", { user_id: "u1", kind: "grant",
-				amount_nano_cny: "5", reason: "" }],                                // reason minLength
-			// §6.5 PR5 修订：幂等键必须由调用方生成——缺失/null/空串在桥层即拒
-			//（纯空白的 trim 语义归服务端，见 test_admin_billing_writes.py）
-			["admin.billing.adjust", { user_id: "u1", kind: "grant",
-				amount_nano_cny: 5, reason: "r" }],                               // 缺 idempotency_key
-			["admin.billing.adjust", { user_id: "u1", kind: "grant",
-				amount_nano_cny: 5, reason: "r", idempotency_key: null }],       // 不再 nullable
-			["admin.billing.adjust", { user_id: "u1", kind: "grant",
-				amount_nano_cny: 5, reason: "r", idempotency_key: "" }],        // minLength 1
+			["admin.spend.userTotalLimit.restoreDefault", { user_id: "u1" }],      // 缺 expected_version
 			["admin.invites.list", { q: "evil" }],                                // 未声明字段
 		];
 		for (let i = 0; i < bad.length; i++) {
@@ -1067,9 +1121,8 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		});
 		handle._handleWindowMessage({
 			source: contentWindow,
-			data: requestEnv(nonce, "r2", "admin.billing.adjust",
-				{ user_id: "u1", kind: "grant", amount_nano_cny: "1", reason: "r",
-					idempotency_key: "adj_retry_same_key" }),
+			data: requestEnv(nonce, "r2", "admin.spend.userTotalLimit.set",
+				{ user_id: "u1", total_limit_nano_cny: "1", expected_version: 1 }),
 		});
 		await ticks();
 		expect((responses(posted, "r1")[0].env.error as { code: string }).code)
@@ -1079,7 +1132,7 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		expect(handle.stats().handled).toBe(0);
 	});
 
-	it("maps 409 version_conflict envelopes from caps updates", async () => {
+	it("maps 409 version_conflict envelopes from total-limit CAS updates", async () => {
 		const { handle, posted, contentWindow } = makeWriteHost(async () => ({
 			status: 409, ok: false,
 			body: { error: { code: "version_conflict", message: "stale" } },
@@ -1087,8 +1140,8 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		handle._handleIframeLoad();
 		handle._handleWindowMessage({
 			source: contentWindow,
-			data: requestEnv(nonce0(posted), "r1", "admin.billing.account.updateCaps", {
-				user_id: "u1", soft_cap_nano_cny: "1", hard_cap_nano_cny: "2", version: 1,
+			data: requestEnv(nonce0(posted), "r1", "admin.spend.userTotalLimit.set", {
+				user_id: "u1", total_limit_nano_cny: "1", expected_version: 1,
 			}),
 		});
 		await ticks();
@@ -1397,7 +1450,7 @@ describe("AdminBridge host — 批次 D：统一设置页方法（§6.1/§6.5）
 		handle._handleWindowMessage({
 			source: contentWindow,
 			data: requestEnv(nonce0(posted), "r1", "admin.settings.update", {
-				user_default_monthly_limit: {
+				user_default_total_limit: {
 					policy_id: "spp_user_default", version: 1,
 					limit_nano_cny: "20000000000",
 				},
@@ -1429,6 +1482,64 @@ describe("AdminBridge host — 批次 D：统一设置页方法（§6.1/§6.5）
 				demo_enabled: true,
 			},
 		});
+	});
+
+	it("settings.update routes user default by source: total_defaults → 单例 CAS 端点", async () => {
+		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+		const { handle, posted, contentWindow } = makeDHost(async (url, o) => {
+			calls.push({
+				url, method: (o as { method?: string } | undefined)?.method,
+				body: JSON.parse(String((o as { body?: string }).body)),
+			});
+			return { status: 200, ok: true, body: {} };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.settings.update", {
+				user_default_total_limit: {
+					source: "total_defaults", version: 3,
+					limit_nano_cny: "30000000000",
+				},
+			}),
+		});
+		await ticks(6);
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(true);
+		// source=total_defaults → PUT /api/admin/v1/spend/user-default-total-limit
+		//（ai_spend_total_defaults 单例 CAS；不打 policies 兼容路径）
+		expect(calls).toEqual([{
+			url: "/api/admin/v1/spend/user-default-total-limit", method: "PUT",
+			body: { limit_nano_cny: "30000000000", expected_version: 3 },
+		}]);
+	});
+
+	it("settings.update routes user default by source: user_default_policy → policies 兼容路径", async () => {
+		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+		const { handle, posted, contentWindow } = makeDHost(async (url, o) => {
+			calls.push({
+				url, method: (o as { method?: string } | undefined)?.method,
+				body: JSON.parse(String((o as { body?: string }).body)),
+			});
+			return { status: 200, ok: true, body: {} };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.settings.update", {
+				user_default_total_limit: {
+					source: "user_default_policy", policy_id: "spp_user_default",
+					version: 7, limit_nano_cny: "20000000000",
+				},
+			}),
+		});
+		await ticks(6);
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(true);
+		expect(calls).toEqual([{
+			url: "/api/admin/v1/spend/policies/spp_user_default", method: "PUT",
+			body: { limit_nano_cny: "20000000000", version: 7 },
+		}]);
 	});
 
 	it("settings.update with no fields rejects invalid_params (no backend call)", async () => {
@@ -1485,56 +1596,41 @@ describe("AdminBridge host — 批次 D：统一设置页方法（§6.1/§6.5）
 		expect(calls).toHaveLength(1);
 	});
 
-	it("setSpendOverride: string → PUT, null → DELETE (decimal string only)", async () => {
+	it("userTotalLimit.set forwards decimal-string nano + integer CAS version (wave 2)", async () => {
 		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
 		const { handle, posted, contentWindow } = makeDHost(async (url, o) => {
 			calls.push({
 				url, method: (o as { method?: string } | undefined)?.method,
 				body: JSON.parse(String((o as { body?: string }).body)),
 			});
-			return { status: 200, ok: true, body: { cleared: false } };
+			return { status: 200, ok: true, body: { spend: { total: { version: 2 } } } };
 		});
 		handle._handleIframeLoad();
 		const nonce = nonce0(posted);
 		handle._handleWindowMessage({
 			source: contentWindow,
-			data: requestEnv(nonce, "r1", "admin.users.setSpendOverride", {
-				user_id: "usr_9", monthly_limit_nano_cny: "30500000000",
-			}),
-		});
-		handle._handleWindowMessage({
-			source: contentWindow,
-			data: requestEnv(nonce, "r2", "admin.users.setSpendOverride", {
-				user_id: "usr_9", monthly_limit_nano_cny: null,
+			data: requestEnv(nonce, "r1", "admin.spend.userTotalLimit.set", {
+				user_id: "usr_9", total_limit_nano_cny: "30500000000", expected_version: 3,
 			}),
 		});
 		await ticks();
-		expect(calls).toEqual([
-			{ url: "/api/admin/v1/users/usr_9/spend-override", method: "PUT",
-				body: { monthly_limit_nano_cny: "30500000000" } },
-			{ url: "/api/admin/v1/users/usr_9/spend-override", method: "DELETE",
-				body: {} },
-		]);
-	});
-
-	it("setSpendOverride rejects JSON number amounts at the schema gate", async () => {
-		const calls: string[] = [];
-		const { handle, posted, contentWindow } = makeDHost(async (url) => {
-			calls.push(url);
-			return { status: 200, ok: true, body: {} };
-		});
-		handle._handleIframeLoad();
+		expect(responses(posted, "r1")[0].env.ok).toBe(true);
+		expect(calls).toEqual([{
+			url: "/api/admin/v1/spend/users/usr_9/total-limit", method: "PUT",
+			body: { total_limit_nano_cny: "30500000000", expected_version: 3 },
+		}]);
+		// JSON number 金额在 schema 门即拒（§5 v0.3 wire 纪律）
 		handle._handleWindowMessage({
 			source: contentWindow,
-			data: requestEnv(nonce0(posted), "r1", "admin.users.setSpendOverride", {
-				user_id: "usr_9", monthly_limit_nano_cny: 30500000000,
+			data: requestEnv(nonce, "r2", "admin.spend.userTotalLimit.set", {
+				user_id: "usr_9", total_limit_nano_cny: 30500000000, expected_version: 3,
 			}),
 		});
 		await ticks();
-		const rs = responses(posted, "r1");
+		const rs = responses(posted, "r2");
 		expect(rs[0].env.ok).toBe(false);
 		expect((rs[0].env.error as { code: string }).code).toBe("invalid_params");
-		expect(calls).toEqual([]);
+		expect(calls).toHaveLength(1);
 	});
 
 	it("settings.update rejects unknown fields (additionalProperties:false)", async () => {
@@ -1570,8 +1666,8 @@ describe("AdminBridge host — 批次 D：统一设置页方法（§6.1/§6.5）
 	});
 });
 
-describe("AdminBridge host — 批次 D：users/invites 月额度字段过桥（§5.1/§5.2）", () => {
-	it("admin.users.create forwards monthly_limit_nano_cny + ai_access", async () => {
+describe("AdminBridge host — wave 2：users/invites 总额度字段过桥（Batch B/D1）", () => {
+	it("admin.users.create forwards total_limit_nano_cny + ai_access", async () => {
 		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
 		const { handle, posted, contentWindow } = makeHost({
 			permissions: ["admin:users:write"],
@@ -1588,7 +1684,7 @@ describe("AdminBridge host — 批次 D：users/invites 月额度字段过桥（
 			source: contentWindow,
 			data: requestEnv(nonce0(posted), "r1", "admin.users.create", {
 				login_id: "a@x.com", password: "longpass-12345",
-				monthly_limit_nano_cny: "3500000000", ai_access: false,
+				total_limit_nano_cny: "3500000000", ai_access: false,
 			}),
 		});
 		await ticks();
@@ -1598,7 +1694,7 @@ describe("AdminBridge host — 批次 D：users/invites 月额度字段过桥（
 			body: {
 				login_id: "a@x.com", password: "longpass-12345",
 				display_name: undefined,
-				monthly_limit_nano_cny: "3500000000", ai_access: false,
+				total_limit_nano_cny: "3500000000", ai_access: false,
 			},
 		}]);
 		// JSON number 金额在 schema 门即拒（§5 v0.3 wire 纪律）
@@ -1606,16 +1702,26 @@ describe("AdminBridge host — 批次 D：users/invites 月额度字段过桥（
 			source: contentWindow,
 			data: requestEnv(nonce0(posted), "r2", "admin.users.create", {
 				login_id: "b@x.com", password: "longpass-12345",
-				monthly_limit_nano_cny: 3500000000,
+				total_limit_nano_cny: 3500000000,
+			}),
+		});
+		// 旧 monthly 字段已删除：携带即桥层拒绝（管理插件不得再发旧字段）
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r3", "admin.users.create", {
+				login_id: "c@x.com", password: "longpass-12345",
+				monthly_limit_nano_cny: "3500000000",
 			}),
 		});
 		await ticks();
 		expect((responses(posted, "r2")[0].env.error as { code: string }).code)
 			.toBe("invalid_params");
+		expect((responses(posted, "r3")[0].env.error as { code: string }).code)
+			.toBe("invalid_params");
 		expect(calls).toHaveLength(1);
 	});
 
-	it("admin.invites.create forwards monthly_limit_nano_cny template", async () => {
+	it("admin.invites.create forwards total_limit_nano_cny + ttl_seconds (no attribution fields)", async () => {
 		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
 		const { handle, posted, contentWindow } = makeHost({
 			permissions: ["admin:invites:write"],
@@ -1631,23 +1737,33 @@ describe("AdminBridge host — 批次 D：users/invites 月额度字段过桥（
 		handle._handleWindowMessage({
 			source: contentWindow,
 			data: requestEnv(nonce0(posted), "r1", "admin.invites.create", {
-				ttl_hours: 24, ai_access: true,
-				monthly_limit_nano_cny: "2500000000",
+				ttl_seconds: 86400, ai_access: true,
+				total_limit_nano_cny: "2500000000",
 			}),
 		});
 		await ticks();
 		expect(responses(posted, "r1")[0].env.ok).toBe(true);
 		const body = calls[0].body as Record<string, unknown>;
-		expect(body.monthly_limit_nano_cny).toBe("2500000000");
+		expect(body.total_limit_nano_cny).toBe("2500000000");
+		expect(body.ttl_seconds).toBe(86400);
 		// 负数/小数形态拒绝（pattern ^[0-9]{1,19}$）
 		handle._handleWindowMessage({
 			source: contentWindow,
 			data: requestEnv(nonce0(posted), "r2", "admin.invites.create", {
-				ttl_hours: 24, monthly_limit_nano_cny: "-5",
+				ttl_seconds: 86400, total_limit_nano_cny: "-5",
+			}),
+		});
+		// source_code/campaign_id/cohort 已随归因退役删除：携带即拒
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r3", "admin.invites.create", {
+				ttl_seconds: 86400, source_code: "mywebpage",
 			}),
 		});
 		await ticks();
 		expect((responses(posted, "r2")[0].env.error as { code: string }).code)
+			.toBe("invalid_params");
+		expect((responses(posted, "r3")[0].env.error as { code: string }).code)
 			.toBe("invalid_params");
 	});
 });

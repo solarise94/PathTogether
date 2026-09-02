@@ -119,6 +119,10 @@ _NEW_ENDPOINTS = (
     ("POST", "/api/admin/v1/spend/windows/spw_x/adjust"),
     ("PUT", "/api/admin/v1/users/usr_x/spend-override"),
     ("DELETE", "/api/admin/v1/users/usr_x/spend-override"),
+    ("PUT", "/api/admin/v1/spend/users/usr_x/total-limit"),
+    ("POST", "/api/admin/v1/spend/users/usr_x/restore-default"),
+    ("GET", "/api/admin/v1/spend/demo-stats"),
+    ("GET", "/api/admin/v1/site-stats"),
     ("GET", "/api/admin/v1/settings"),
     ("GET", "/api/admin/v1/settings/registration"),
     ("PUT", "/api/admin/v1/settings/registration"),
@@ -205,14 +209,20 @@ def test_json_backend_new_spend_endpoints_503():
             ("PUT", "/api/admin/v1/spend/enforcement-mode",
              {"mode": "shadow"}),
             ("POST", "/api/admin/v1/spend/windows/spw_x/adjust",
-             {"limit_nano_snapshot": "1", "version": 1, "confirm": True}),
-            ("PUT", "/api/admin/v1/users/usr_x/spend-override",
-             {"monthly_limit_nano_cny": "1"}),
-            ("DELETE", "/api/admin/v1/users/usr_x/spend-override", None)):
+             {"limit_nano_snapshot": "1", "version": 1, "confirm": True})):
         r = c.open(path, method=method, json=body)
         assert r.status_code == 503, "%s %s -> %s" % (method, path,
                                                       r.status_code)
         assert r.get_json()["error"]["code"] == "pg_backend_required"
+    # 已退役端点在 pg 检查**之前**即 410（两个后端一致的退役语义）
+    for method, path, body in (
+            ("PUT", "/api/admin/v1/users/usr_x/spend-override",
+             {"monthly_limit_nano_cny": "1"}),
+            ("DELETE", "/api/admin/v1/users/usr_x/spend-override", None)):
+        r = c.open(path, method=method, json=body)
+        assert r.status_code == 410, "%s %s -> %s" % (method, path,
+                                                      r.status_code)
+        assert r.get_json()["error"]["code"] == "spend_override_deprecated"
     # settings 聚合在 json 后端分段标记（注册段真实；spend/runtime 不可用）
     r = c.get("/api/admin/v1/settings")
     assert r.status_code == 200
@@ -470,81 +480,167 @@ def test_window_adjust_lower_than_spent_rejects_next_reserve():
 
 
 # --------------------------------------------------------------------------- #
-# 6. 用户月额度覆盖 PUT/DELETE
+# 6. 用户一次性总额度 PUT/restore-default（Batch B wave 2，§Batch B API/bridge
+#    契约）；旧月额度覆盖端点 → 410 spend_override_deprecated
 # --------------------------------------------------------------------------- #
 @PG
-def test_user_spend_override_set_clear_and_semantics():
+def test_user_total_limit_set_restore_and_old_override_retired():
     bh.seed_spend_policies()
+    # cutover 后形态（target=total_allowance）：user 走互斥 total 形态
+    bh.set_user_spend_target("total_allowance")
     owner, usera = _setup_users()
     c = _login(_client(), owner)
-    # 覆盖前先开当前窗口（snapshot 固定为 user_default 种子 20 CNY）
-    before = spend_store.get_or_create_window("user", usera["user_id"])
-    assert before["limit_nano_snapshot"] == 20 * 10 ** 9
-    base = "/api/admin/v1/users/%s/spend-override" % usera["user_id"]
-    # JSON number 拒绝
-    assert c.put(base, json={"monthly_limit_nano_cny": 100}).status_code == 400
-    # 缺字段拒绝（清除必须走 DELETE，不靠空 PUT）
-    assert c.put(base, json={}).status_code == 400
-    # 设置覆盖（>2^53 十进制字符串）
-    r = c.put(base, json={"monthly_limit_nano_cny": OVER_2E53_NANO})
-    assert r.status_code == 200
-    assert r.get_json()["override"]["limit_nano_cny"] == OVER_2E53_NANO
-    resolved = spend_store.resolve_policy("user", usera["user_id"])
-    assert resolved["scope_type"] == "user_override"
-    assert resolved["limit_nano_cny"] == int(OVER_2E53_NANO)
-    # 已开窗口不追溯：同一窗口 snapshot 仍是 20 CNY（§1.1 默认只影响新周期）
-    after = spend_store.get_window(before["window_id"])
-    assert after["limit_nano_snapshot"] == 20 * 10 ** 9
-    # users 列表带 spend 段（默认/覆盖状态 + 当前窗口）
+    # 旧月额度覆盖端点已退役：任意载荷一律 410 spend_override_deprecated
+    base_old = "/api/admin/v1/users/%s/spend-override" % usera["user_id"]
+    r_old = c.put(base_old, json={"monthly_limit_nano_cny": "100"})
+    assert r_old.status_code == 410
+    assert r_old.get_json()["error"]["code"] == "spend_override_deprecated"
+    assert "total-limit" in r_old.get_json()["error"]["message"]
+    assert c.delete(base_old).status_code == 410
+
+    # 建号带初始总额度（同一事务建行）
+    r = c.post("/api/admin/v1/users", json={
+        "login_id": "total@x.com", "password": "password-123456",
+        "total_limit_nano_cny": "9007199254740993"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    uid = r.get_json()["user"]["user_id"]
+    assert r.get_json()["total_allowance"]["limit_nano_cny"] == \
+        OVER_2E53_NANO
+
+    # JSON number 拒绝 / 缺字段拒绝 / 非法 version 拒绝
+    base = "/api/admin/v1/spend/users/%s/total-limit" % uid
+    assert c.put(base, json={"total_limit_nano_cny": 100,
+                             "expected_version": 1}).status_code == 400
+    assert c.put(base, json={"expected_version": 1}).status_code == 400
+    assert c.put(base, json={"total_limit_nano_cny": "100"}).status_code == 400
+    # 绝对值语义：设置 X=5 CNY（不改 spent/reserved，绝不 +=）
+    r = c.put(base, json={"total_limit_nano_cny": "5000000000",
+                          "expected_version": 1})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    body = r.get_json()
+    assert body["total_allowance"]["limit_nano_cny"] == "5000000000"
+    assert body["total_allowance"]["version"] == 2
+    cur = bh.connect()
+    try:
+        with cur.cursor() as qcur:
+            qcur.execute("SELECT limit_nano_cny, version FROM "
+                         "ai_spend_total_allowances WHERE subject_id=%s",
+                         (uid,))
+            row = qcur.fetchone()
+    finally:
+        cur.close()
+    assert row["limit_nano_cny"] == 5 * 10 ** 9 and row["version"] == 2
+    # CAS 冲突：旧 version 再写 → 409
+    r_conflict = c.put(base, json={"total_limit_nano_cny": "6000000000",
+                                   "expected_version": 1})
+    assert r_conflict.status_code == 409
+    assert r_conflict.get_json()["error"]["code"] == "version_conflict"
+    # users 列表：user 行 spend.total 互斥形态（无 window/policy 键）
     item = [u for u in c.get("/api/admin/v1/users").get_json()["items"]
-            if u["user_id"] == usera["user_id"]][0]
-    assert item["spend"]["policy_scope"] == "user_override"
-    assert item["spend"]["window"]["limit_nano_snapshot"] == str(20 * 10 ** 9)
-    # 清除 → 解析回退 user_default（下个窗口）
-    rd = c.delete(base)
-    assert rd.status_code == 200
-    assert rd.get_json()["cleared"] is True
-    resolved2 = spend_store.resolve_policy("user", usera["user_id"])
-    assert resolved2["scope_type"] == "user_default"
-    # 再次清除：幂等 cleared=false
-    assert c.delete(base).get_json()["cleared"] is False
-    # owner 目标：400（owner 走独立策略，无覆盖语义）
-    r_owner = c.put("/api/admin/v1/users/%s/spend-override" % owner["user_id"],
-                    json={"monthly_limit_nano_cny": "100"})
+            if u["user_id"] == uid][0]
+    assert "window" not in item["spend"]
+    assert item["spend"]["total"]["total_limit_nano_cny"] == "5000000000"
+    assert item["spend"]["total"]["remaining_nano"] == "5000000000"
+    assert item["spend"]["total"]["overage_nano"] == "0"
+    # owner 行仍为 window 形态（绝不出现在 user 上的 total 键）
+    owner_item = [u for u in c.get("/api/admin/v1/users").get_json()["items"]
+                  if u["user_id"] == owner["user_id"]][0]
+    assert "total" not in owner_item["spend"]
+    assert owner_item["spend"]["window"]["limit_nano_snapshot"] is not None
+    # 恢复默认：面值取 user_default 种子 20 CNY（total_defaults 缺行回退）；
+    # CAS version 沿用当前 version=2
+    rd = c.post("/api/admin/v1/spend/users/%s/restore-default" % uid,
+                json={"expected_version": 2})
+    assert rd.status_code == 200, rd.get_data(as_text=True)
+    assert rd.get_json()["total_allowance"]["limit_nano_cny"] == \
+        str(20 * 10 ** 9)
+    # 恢复默认不清零 spent/reserved：注入 spent 后恢复，spent 保留
+    conn = bh.connect()
+    try:
+        with conn.cursor() as qcur:
+            qcur.execute(
+                "UPDATE ai_spend_total_allowances SET spent_nano_cny=%s "
+                "WHERE subject_id=%s", (3 * 10 ** 9, uid))
+        conn.commit()
+    finally:
+        conn.close()
+    rd2 = c.post("/api/admin/v1/spend/users/%s/restore-default" % uid,
+                 json={"expected_version": 3})
+    assert rd2.status_code == 200
+    assert rd2.get_json()["total_allowance"]["spent_nano_cny"] == \
+        str(3 * 10 ** 9)
+    # owner 目标 400 / 不存在用户 404
+    r_owner = c.put("/api/admin/v1/spend/users/%s/total-limit"
+                    % owner["user_id"],
+                    json={"total_limit_nano_cny": "100",
+                          "expected_version": 1})
     assert r_owner.status_code == 400
-    # 不存在用户 404
-    assert c.put("/api/admin/v1/users/usr_nope/spend-override",
-                 json={"monthly_limit_nano_cny": "100"}).status_code == 404
+    assert c.post("/api/admin/v1/spend/users/%s/restore-default"
+                  % owner["user_id"],
+                  json={"expected_version": 1}).status_code == 400
+    assert c.put("/api/admin/v1/spend/users/usr_nope/total-limit",
+                 json={"total_limit_nano_cny": "100",
+                       "expected_version": 1}).status_code == 404
+    assert c.post("/api/admin/v1/spend/users/usr_nope/restore-default",
+                  json={"expected_version": 1}).status_code == 404
     # audit 无敏感字段
-    events = _audit_actions("spend.policy_update")
-    assert any(e["detail"].get("op") == "clear_user_override"
+    events = _audit_actions("spend.total_allowance_update")
+    assert any(e["detail"].get("op") == "set_user_total_limit"
+               for e in events)
+    assert any(e["detail"].get("op") == "restore_user_total_default"
                for e in events)
     blob = json.dumps([e["detail"] for e in events], ensure_ascii=False)
     assert "password" not in blob and "token" not in blob
 
 
 # --------------------------------------------------------------------------- #
-# 7. 用户创建扩展（同事务 override + 继承默认 + 注入失败回滚）
+# 7. 用户创建扩展（同事务一次性总额度 + 不带额度不建行 + 注入失败回滚）
 # --------------------------------------------------------------------------- #
 @PG
 def test_users_create_with_monthly_limit_override_atomic():
+    """Batch B wave 2：建号带 total_limit_nano_cny → 同事务建一次性总额度
+    （不再建 user_override 月策略）；旧 monthly 字段同传 400 ambiguous。"""
     bh.seed_spend_policies()
     owner, _u = _setup_users()
     c = _login(_client(), owner)
     r = c.post("/api/admin/v1/users", json={
         "login_id": "limited@x.com", "password": "password-123456",
-        "display_name": "Limited", "monthly_limit_nano_cny": "30500000000"})
+        "display_name": "Limited", "total_limit_nano_cny": "30500000000"})
     assert r.status_code == 200, r.get_data(as_text=True)
     body = r.get_json()
     uid = body["user"]["user_id"]
-    assert body["spend_override"]["limit_nano_cny"] == "30500000000"
-    resolved = spend_store.resolve_policy("user", uid)
-    assert resolved["scope_type"] == "user_override"
-    assert resolved["limit_nano_cny"] == 305 * 10 ** 8
-    # audit 记录 user.create 且 detail 无敏感字段
+    assert body["total_allowance"]["limit_nano_cny"] == "30500000000"
+    allowance = spend_store.get_total_allowance(uid)
+    assert allowance is not None
+    assert allowance["limit_nano_cny"] == 305 * 10 ** 8
+    assert allowance["source"] == "admin_create"
+    # user_override 月策略不再创建（月窗口对 user 退役）
+    conn = bh.connect()
+    try:
+        with conn.cursor() as qcur:
+            qcur.execute("SELECT count(*)::int AS n FROM ai_spend_policies "
+                         "WHERE scope_type='user_override'")
+            assert qcur.fetchone()["n"] == 0
+    finally:
+        conn.close()
+    # audit 记录 user.create 且 detail 无敏感字段（金额键改 total）
     events = _audit_actions("user.create")
     mine = [e for e in events if e["target_id"] == uid]
-    assert mine and mine[0]["detail"]["monthly_limit_nano_cny"] == 305 * 10 ** 8
+    assert mine and mine[0]["detail"]["total_limit_nano_cny"] == 305 * 10 ** 8
+    # 新旧字段同传 → 稳定 400 ambiguous_spend_limit
+    r_amb = c.post("/api/admin/v1/users", json={
+        "login_id": "amb@x.com", "password": "password-123456",
+        "total_limit_nano_cny": "1000000000",
+        "monthly_limit_nano_cny": "1000000000"})
+    assert r_amb.status_code == 400
+    assert r_amb.get_json()["error"]["code"] == "ambiguous_spend_limit"
+    # 旧字段单独传（兼容期）：面值按总额度兑现
+    r_legacy = c.post("/api/admin/v1/users", json={
+        "login_id": "legacyfld@x.com", "password": "password-123456",
+        "monthly_limit_nano_cny": "2000000000"})
+    assert r_legacy.status_code == 200
+    assert r_legacy.get_json()["total_allowance"]["limit_nano_cny"] == \
+        "2000000000"
 
 
 @PG
@@ -555,32 +651,57 @@ def test_users_create_without_limit_inherits_default():
     r = c.post("/api/admin/v1/users", json={
         "login_id": "inherits@x.com", "password": "password-123456"})
     assert r.status_code == 200
-    assert r.get_json().get("spend_override") is None
+    # 不带金额 = 不建总额度行（由 cutover 回填或首个显式 set/restore 处理）
+    assert r.get_json().get("total_allowance") is None
     uid = r.get_json()["user"]["user_id"]
-    resolved = spend_store.resolve_policy("user", uid)
-    assert resolved["scope_type"] == "user_default"
-    assert resolved["limit_nano_cny"] == 20 * 10 ** 9
+    assert spend_store.get_total_allowance(uid) is None
+    # cutover 前（target=window）：无 allowance 行也照常展示 window 形态
+    item = [u for u in c.get("/api/admin/v1/users").get_json()["items"]
+            if u["user_id"] == uid][0]
+    assert "total" not in item["spend"]
+    assert item["spend"]["policy_scope"] == "user_default"
+    assert item["spend"]["window"]["limit_nano_snapshot"] == str(20 * 10 ** 9)
+
+
+@PG
+def test_users_list_spend_total_mode_missing_row_reports_stable_error():
+    """Batch B wave 2：target=total_allowance 且无 allowance 行 → 互斥形态
+    的稳定 error code（spend_total_allowance_missing），不拖垮整页。"""
+    bh.seed_spend_policies()
+    bh.set_user_spend_target("total_allowance")
+    owner, usera = _setup_users()
+    c = _login(_client(), owner)
+    items = c.get("/api/admin/v1/users").get_json()["items"]
+    by_id = {u["user_id"]: u for u in items}
+    assert by_id[usera["user_id"]]["spend"]["error"] == \
+        "spend_total_allowance_missing"
+    assert "window" not in by_id[usera["user_id"]]["spend"]
+    assert "total" not in by_id[usera["user_id"]]["spend"]
+    # owner 行不受 target 影响：仍为 window 形态
+    assert "total" not in by_id[owner["user_id"]]["spend"]
+    assert by_id[owner["user_id"]]["spend"]["window"] is not None
 
 
 @PG
 def test_users_create_override_failure_rolls_back_user():
-    """单事务证据：override 写入失败 → 用户不创建（§5.1）。"""
+    """单事务证据：总额度行写入失败 → 用户不创建（§5.1；allowance 注入目标）。"""
     bh.seed_spend_policies()
     owner, _u = _setup_users()
     c = _login(_client(), owner)
-    orig = spend_store.set_user_override_tx
+    orig = spend_store.create_user_total_allowance_tx
 
     def boom(*_a, **_k):
-        raise RuntimeError("override down")
-    spend_store.set_user_override_tx = boom
+        raise RuntimeError("allowance down")
+    spend_store.create_user_total_allowance_tx = boom
     try:
         r = c.post("/api/admin/v1/users", json={
             "login_id": "rollback@x.com", "password": "password-123456",
-            "monthly_limit_nano_cny": "1000000000"})
+            "total_limit_nano_cny": "1000000000"})
         assert r.status_code == 500
     finally:
-        spend_store.set_user_override_tx = orig
+        spend_store.create_user_total_allowance_tx = orig
     assert user_store.get_user_by_login_id("rollback@x.com") is None
+    assert spend_store.get_total_allowance("rollback@x.com") is None
 
 
 @PG
@@ -594,60 +715,109 @@ def test_users_create_rejects_owner_and_bad_amount():
     for bad in (5, "1.5", "9" * 20):
         rb = c.post("/api/admin/v1/users", json={
             "login_id": "bad@x.com", "password": "password-123456",
-            "monthly_limit_nano_cny": bad})
+            "total_limit_nano_cny": bad})
         assert rb.status_code == 400, "limit=%r 应 400" % (bad,)
+    # 旧字段（兼容期）坏值同样 400
+    rb = c.post("/api/admin/v1/users", json={
+        "login_id": "bad2@x.com", "password": "password-123456",
+        "monthly_limit_nano_cny": 5})
+    assert rb.status_code == 400
 
 
 # --------------------------------------------------------------------------- #
-# 8. 邀请码月额度模板 + 兑换事务内 override
+# 8. 邀请码总额度模板 + 兑换事务内一次性总额度（Batch B wave 2）
 # --------------------------------------------------------------------------- #
 @PG
 def test_invite_create_with_monthly_limit_template():
+    """Batch B wave 2：邀请初始金额字段为 total_limit_nano_cny（wire 十进制
+    字符串）；旧 monthly 单独传按面值落总额度；同传 400 ambiguous；来源字段
+    接受即 400 retired_invite_field。"""
     bh.seed_spend_policies()
     owner, _u = _setup_users()
     c = _login(_client(), owner)
     r = c.post("/api/admin/v1/invites", json={
         "login_id": "inv1@x.com", "ttl_hours": 24, "ai_access": True,
-        "monthly_limit_nano_cny": "25000000000"})
+        "total_limit_nano_cny": "25000000000"})
     assert r.status_code == 200, r.get_data(as_text=True)
     invite = r.get_json()["invite"]
     # wire 十进制字符串；明文 token 仅此一次 + no-store
-    assert invite["monthly_limit_nano_cny"] == "25000000000"
+    assert invite["total_limit_nano_cny"] == "25000000000"
+    assert "monthly_limit_nano_cny" not in invite
     assert invite["token"]
     assert r.headers.get("Cache-Control") == "no-store"
-    # 列表：token 永不回显；金额保持十进制字符串
+    # 列表：token 永不回显；金额保持十进制字符串；无来源字段回显
     lst = c.get("/api/admin/v1/invites").get_json()["invites"]
     mine = [i for i in lst if i["invite_id"] == invite["invite_id"]][0]
     assert "token" not in mine
-    assert mine["monthly_limit_nano_cny"] == "25000000000"
+    assert mine["total_limit_nano_cny"] == "25000000000"
+    for retired in ("source_code", "campaign_id", "cohort"):
+        assert retired not in mine
     # 金额 JSON number 拒绝
     assert c.post("/api/admin/v1/invites", json={
-        "monthly_limit_nano_cny": 100}).status_code == 400
+        "total_limit_nano_cny": 100}).status_code == 400
+    # 旧 monthly 字段单独传（兼容期）：面值按总额度兑现
+    r_legacy = c.post("/api/admin/v1/invites", json={
+        "login_id": "invlegacy@x.com",
+        "monthly_limit_nano_cny": "18000000000"})
+    assert r_legacy.status_code == 200
+    assert r_legacy.get_json()["invite"]["total_limit_nano_cny"] == \
+        "18000000000"
+    # 新旧同传 → 稳定 400 ambiguous_spend_limit
+    r_amb = c.post("/api/admin/v1/invites", json={
+        "total_limit_nano_cny": "1000000000",
+        "monthly_limit_nano_cny": "1000000000"})
+    assert r_amb.status_code == 400
+    assert r_amb.get_json()["error"]["code"] == "ambiguous_spend_limit"
+    # 来源字段退役：接受即 400 retired_invite_field（不静默忽略）
+    for field in ("source_code", "campaign_id", "cohort"):
+        r_ret = c.post("/api/admin/v1/invites", json={field: "whatever"})
+        assert r_ret.status_code == 400, field
+        assert r_ret.get_json()["error"]["code"] == "retired_invite_field"
+    # 创建 audit 无来源字段（store 层保证，wave 2 锁定 API 行为）
+    events = _audit_actions("registration.invite_create")
+    blob = json.dumps([e["detail"] for e in events], ensure_ascii=False)
+    for retired in ("source_code", "campaign_id", "cohort"):
+        assert retired not in blob
 
 
 @PG
 def test_invite_redeem_creates_override_same_transaction():
+    """Batch B wave 2：兑换在同一事务内建一次性总额度（source=invite），
+    不再创建 user_override；兼容键 acquisition/spend_override_policy 恒 None。"""
     bh.seed_spend_policies()
     owner, _u = _setup_users()
     c = _login(_client(), owner)
     r = c.post("/api/admin/v1/invites", json={
-        "login_id": "redeem@x.com", "monthly_limit_nano_cny": "15000000000"})
+        "login_id": "redeem@x.com", "total_limit_nano_cny": "15000000000"})
     token = r.get_json()["invite"]["token"]
     invite_id = r.get_json()["invite"]["invite_id"]
     result = registration_store.redeem_invite(
         token, "redeem@x.com", "password-123456")
     uid = result["user"]["user_id"]
-    assert result["spend_override_policy"]["limit_nano_cny"] == 15 * 10 ** 9
-    resolved = spend_store.resolve_policy("user", uid)
-    assert resolved["scope_type"] == "user_override"
-    assert resolved["limit_nano_cny"] == 15 * 10 ** 9
+    assert result["total_allowance"]["limit_nano_cny"] == 15 * 10 ** 9
+    assert result["total_allowance"]["source"] == "invite"
+    assert result["acquisition"] is None          # 兼容键恒 None（退役）
+    assert result["spend_override_policy"] is None  # 兼容键恒 None（退役）
+    allowance = spend_store.get_total_allowance(uid)
+    assert allowance is not None
+    assert allowance["limit_nano_cny"] == 15 * 10 ** 9
+    # user_override 月策略不再创建
+    conn = bh.connect()
+    try:
+        with conn.cursor() as qcur:
+            qcur.execute("SELECT count(*)::int AS n FROM ai_spend_policies "
+                         "WHERE scope_type='user_override'")
+            assert qcur.fetchone()["n"] == 0
+    finally:
+        conn.close()
     # 邀请已消费
     row = registration_store.get_invite(invite_id)
     assert row["consumed_at"] is not None
-    # override 审计在（同事务的）spend.policy_update 流里
-    events = _audit_actions("spend.policy_update")
+    # 总额度审计在（同事务）spend.total_allowance_create 流里
+    events = _audit_actions("spend.total_allowance_create")
     assert any(e["detail"].get("user_id") == uid and
-               e["detail"].get("op") == "set_user_override" for e in events)
+               e["detail"].get("op") == "create_user_total_allowance"
+               for e in events)
 
 
 @PG
@@ -660,30 +830,31 @@ def test_invite_without_limit_redeem_inherits_default():
         r["token"], "plain@x.com", "password-123456")
     uid = result["user"]["user_id"]
     assert result["spend_override_policy"] is None
-    resolved = spend_store.resolve_policy("user", uid)
-    assert resolved["scope_type"] == "user_default"
+    assert result["total_allowance"] is None  # 无初始额度 → 不建行
+    assert spend_store.get_total_allowance(uid) is None
 
 
 @PG
 def test_invite_redeem_override_failure_rolls_back_everything():
-    """单事务证据：override 写入失败 → 邀请不消费、用户不创建（§5.2）。"""
+    """单事务证据：总额度写入失败 → 邀请不消费、用户不创建（allowance 注入
+    目标；§5.2）。"""
     bh.seed_spend_policies()
     owner, _u = _setup_users()
     invite = registration_store.create_invite(
         owner["user_id"], login_id="rb@x.com",
-        monthly_limit_nano_cny=10 ** 9)
-    orig = spend_store.set_user_override_tx
+        total_limit_nano_cny=10 ** 9)
+    orig = spend_store.create_user_total_allowance_tx
 
     def boom(*_a, **_k):
-        raise RuntimeError("override down")
-    spend_store.set_user_override_tx = boom
+        raise RuntimeError("allowance down")
+    spend_store.create_user_total_allowance_tx = boom
     try:
         with pytest.raises(Exception):
             registration_store.redeem_invite(
                 invite["token"], "rb@x.com", "password-123456")
     finally:
-        spend_store.set_user_override_tx = orig
-    # 整体回滚：用户不存在、邀请未消费
+        spend_store.create_user_total_allowance_tx = orig
+    # 整体回滚：用户不存在、邀请未消费、无半创建 allowance 行
     assert user_store.get_user_by_login_id("rb@x.com") is None
     row = registration_store.get_invite(invite["invite_id"])
     assert row["consumed_at"] is None and row["use_count"] == 0
@@ -717,6 +888,16 @@ def test_settings_aggregate_sections_and_decimal_strings():
     demo_win = spend["current_windows"]["demo"]
     assert demo_win["limit_nano_snapshot"] == str(50 * 10 ** 9)
     assert demo_win["remaining_nano"] == str(50 * 10 ** 9)
+    # Batch B wave 2（§4.5 设置页）：三键拆分**扁平**进 spend 顶层
+    # （金额十进制字符串；user 默认额度附带 CAS 上下文 version/policy_id）
+    assert spend["user_default_total_limit_nano_cny"] == str(20 * 10 ** 9)
+    assert spend["user_default_total_limit_source"] == "user_default_policy"
+    assert int(spend["user_default_total_limit_version"]) >= 1
+    assert spend["user_default_total_policy_id"]
+    assert spend["demo_weekly_limit_nano_cny"] == str(50 * 10 ** 9)
+    assert spend["demo_weekly_policy_id"]
+    assert spend["owner_monthly_limit_nano_cny"] == str(1000 * 10 ** 9)
+    assert spend["owner_monthly_policy_id"]
     # runtime 段：安全参数 + Demo IP 短窗口请求速率现状（批次 E 起只读观测）
     rt = body["runtime"]
     assert rt["available"] is True

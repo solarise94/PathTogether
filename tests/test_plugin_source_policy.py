@@ -77,8 +77,17 @@ def test_sample_manifest_validates_and_policy_pin_matches():
     admin = json.loads(admin_manifest.read_text(encoding="utf-8"))
     assert M.validate_manifest(admin) == []
     assert admin["ui"]["slots"] == ["admin.workspace"]
-    # 批次 F：manifest 移除 admin:turn-budgets:write（词汇表兼容保留）
-    assert len(admin["adminPermissions"]) == len(M.MANIFEST_ADMIN_PERMISSIONS) - 1
+    # 批次 D1（2026-09-03）：退役权限（turn read/write、acquisition read、billing write）
+    # 已从 manifest 与 SDK 词汇表同步移除，二者精确一致，不再有兼容保留项
+    assert set(admin["adminPermissions"]) == set(M.MANIFEST_ADMIN_PERMISSIONS)
+    retired = {
+        "admin:turn-budgets:read",
+        "admin:turn-budgets:write",
+        "admin:acquisition:read",
+        "admin:billing:write",
+    }
+    assert retired.isdisjoint(M.MANIFEST_ADMIN_PERMISSIONS)
+    assert retired.isdisjoint(admin["adminPermissions"])
     # sample-tma-score 的 provides 声明须通过校验器（能力注册表登记前置）
     tma = json.loads(TMA_MANIFEST.read_text(encoding="utf-8"))
     assert M.validate_manifest(tma) == []

@@ -1,5 +1,7 @@
 /* =========================================================================
-   pathtogether-admin 桥接客户端 + 业务页面（PR3b 只读 + PR5 写操作）
+   pathtogether-admin 桥接客户端 + 业务页面（PR3b 只读 + PR5 写操作 +
+   2026-09-03 wave 2 收敛，review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
+   §4 / Batch C5-6 / D1 / D2-3）
 
    docs/admin-billing-plugin-implementation-plan.md §8.3/§8.4/§10：
      - 本页运行在 /admin 宿主页的 opaque iframe（sandbox="allow-scripts"）内；
@@ -12,13 +14,22 @@
        frame/窗口无法向本页伪造响应；
      - 响应按 requestId 配对；超时（15s）与拒绝都有稳定错误码；
      - opaque origin：不能读写 localStorage/cookie，全部页面状态（当前页/
-       筛选/分页游标/账户卡缓存）只在内存；
+       筛选/分页游标）只在内存；
      - sandbox 无 allow-modals：window.confirm/prompt 被静默吞掉，危险操作
-       二次确认一律用页内确认条（§3.3）；
-     - PR5 写操作：创建用户、启停/AI access/重置密码、邀请创建/撤销、turn
-       预算编辑与开新周期、caps 编辑（CAS）、人工调账（CNY→nano 全字符串
-       换算，禁 float；幂等键由本端生成并在同一逻辑提交的重试间复用，§6.5）。
-       表单校验只是体验层，权威校验在服务端。
+       二次确认一律用页内确认条（§3.3）。表单校验只是体验层，权威校验在服务端。
+
+   wave 2 页面契约：
+     - 注册 user = 一次性总额度（spend.total），owner = 月窗口（spend.window）；
+       两种形态同时出现 = 契约错误（显式报错，不任选其一）；
+     - user 抽屉唯一金额动作 = 设置总额度 / 恢复默认（CAS，绝不重置已用）；
+       owner / 切换前 user = 既有 currentWindow.adjust，不出现 total 动作；
+     - turn 冻结历史 / 人工调整 / caps / 历史影子 / 来源归因入口全部删除；
+     - 费用页 = KPI + [仅异常]告警条 + Demo 消耗卡 + 三页内标签明细
+       （只有当前标签发请求；切换时代际递增，迟到旧响应一律丢弃）；
+     - 概览下半部「站点访问」匿名统计卡：siteStats 桥不可达（D2 未发布）时
+       整卡隐藏，绝不显示为错误；
+     - 面向人的 CNY 统一两位小数（formatCny2：十进制字符串/BigInt 半分进位，
+       不经 JS Number）；原始 nano 只在技术详情/原始值展开区。
    渲染只用 textContent / createElement（不拼 HTML，插件数据永不进标记）。
  ========================================================================= */
 (function () {
@@ -42,22 +53,16 @@
     listSeq: 0,
     // 分页游标（每列表独立；仅内存）
     cursors: { users: null, usage: null, unpriced: null, ledger: null,
-               audit: null, acqUsers: null, invites: null },
+               audit: null, invites: null },
     filters: { users: {}, usage: {}, audit: {} },
-    // 金额账户卡当前查询结果（caps 编辑器提交 CAS version 用；仅内存）
-    account: null,
-    // 人工调账幂等键（§6.5 PR5 修订：必须由调用方生成，服务端缺失即 400）。
-    // 一次逻辑提交（用户点确认执行那一刻）生成一个 key，失败重试复用同 key
-    // （服务端已入账 + 浏览器超时的场景，重试必须命中 duplicate 而不是二次
-    // 入账）；成功或表单任一字段（user/kind/金额/reason）被修改后才换新 key。
-    adjustIdem: null,
-    // adjustIdem 生成时的表单指纹（user/kind/金额/reason 四元组）：指纹变化
-    // = 用户改了载荷 = 新的逻辑提交 → 下次提交前换新 key。
-    adjustFingerprint: null,
     // 设置页快照（批次 D §6.1）：admin.settings.get 的响应（含 spend
     // current_windows 的 demo/owner 窗口 CAS version）——仅内存。
-    // 2026-09-01 金额简化：不再缓存「调整当前窗口」的用户主体列表。
     settingsSnapshot: null,
+    // 费用页数据快照（KPI/告警条聚合用；仅内存）
+    billOverview: null,
+    billProviderBalance: null,
+    billProviderBalanceError: null,
+    billDemo: null,
   };
 
   // 深链起始页（PR5 /admin#invites 兼容）：宿主把父页 hash 透传到本 iframe
@@ -74,9 +79,11 @@
 
   function $(id) { return document.getElementById(id); }
 
+  // wave 2：顶级页名收敛（「邀请与来源」→「邀请」、「额度与账单」→「费用」）；
+  // slug 保持不变，宿主深链 #invites/#billing 兼容。
   var PAGE_TITLES = {
-    overview: "概览", users: "用户", invites: "邀请与来源",
-    settings: "设置", billing: "额度与账单", plugins: "插件", audit: "审计",
+    overview: "概览", users: "用户", invites: "邀请",
+    settings: "设置", billing: "费用", plugins: "插件", audit: "审计",
   };
 
   var els = {
@@ -178,7 +185,6 @@
   // ---- 格式化 ----
   // §4.8：绝对时间统一按 Asia/Shanghai 显示并明确 GMT+8，不再以 ISO UTC 为主
   // 显示（epoch 秒是安全整数，Number 转换只发生在时间轴上，与金额无关）。
-  // Intl 在 opaque sandbox 与 jsdom 假环境下都可用（纯 JS 内建）。
   var SHANGHAI_FMT = null;
   function shanghaiParts(d) {
     if (!SHANGHAI_FMT) {
@@ -218,14 +224,45 @@
     return v.toLocaleString("en-US");
   }
 
-  // nano-CNY（1e9 = 1 CNY）：BigInt 精确换算，全程不经 Number——wire 金额是
-  // 十进制字符串（§5 v0.3），>2^53 的值经 Number 会静默失真。
-  //
-  // §4.2 金额显示拆分：
-  //   - fmtCny(v)：主视图专用，仅输出精确「x CNY」；null/缺失 →「—」；
-  //     非法值显式回显原值（不吞错、绝不伪造 0）；
-  //   - fmtNano(v)：保留给原始 wire 语境（adm-raw-values 展开区、人工调整
-  //     二次确认等同时需要 CNY + nano 的地方）。
+  function fmtRatio(v) {
+    if (v === null || v === undefined) return "—";
+    return (Math.round(v * 1000) / 10) + "%";
+  }
+
+  // ------------------------------------------------------------------
+  // 金额格式化（§4.7 wave 2 统一口径）
+  //   - formatCny2(nano)：十进制字符串/BigInt → 恰好两位小数的 CNY 字符串；
+  //     「半分进位、绝对值方向舍入」（half away from zero），全程不经
+  //     JS Number/toFixed——wire 金额是十进制字符串（§5 v0.3），>2^53 的
+  //     值经 Number 会静默失真。非法/空值返回 null（调用方回显原值）。
+  //     验收锚点：17806450800→"17.81"、17804000000→"17.80"、
+  //     -1235000000→"-1.24"。
+  //   - fmtCny(v)：所有面向人的 CNY 展示唯一出口（计费策略/总额度/已用/
+  //     预占/剩余/Demo 统计/供应商余额/usage/ledger）= formatCny2 + " CNY"；
+  //     null/缺失 →「—」；非法值显式回显原值（不吞错、绝不伪造 0）。
+  //     「耗尽/超额/告警色」仍按原始 nano 判断（见 remainingInfo 等）。
+  //   - fmtNano/nanoToCnyString：保留给技术详情（原始值展开区）与输入框
+  //     回显，不再用于常规展示。
+  // ------------------------------------------------------------------
+  function formatCny2(v) {
+    if (v === null || v === undefined || v === "") return null;
+    var b;
+    try { b = BigInt(v); } catch (e) { return null; }
+    var neg = b < 0n;
+    if (neg) b = -b;
+    // 1 分 = 1e7 nano；+5e6 后整除 = 半分进位（away from zero）
+    var cents = (b + 5000000n) / 10000000n;
+    var whole = cents / 100n;
+    var frac = (cents % 100n).toString().padStart(2, "0");
+    return (neg && cents !== 0n ? "-" : "") + whole.toString() + "." + frac;
+  }
+
+  function fmtCny(v) {
+    if (v === null || v === undefined || v === "") return "—";
+    var s = formatCny2(v);
+    return s === null ? String(v) : s + " CNY";
+  }
+
   function cnyFromNano(v) {
     if (v === null || v === undefined) return null;
     try {
@@ -241,22 +278,11 @@
     }
   }
 
-  function fmtCny(v) {
-    if (v === null || v === undefined || v === "") return "—";
-    var cny = cnyFromNano(v);
-    return cny === null ? String(v) : cny + " CNY";
-  }
-
   function fmtNano(v) {
     if (v === null || v === undefined) return "—";
     var cny = cnyFromNano(v);
     if (cny === null) return String(v);
     return cny + " CNY（" + String(v) + " nano）";
-  }
-
-  function fmtRatio(v) {
-    if (v === null || v === undefined) return "—";
-    return (Math.round(v * 1000) / 10) + "%";
   }
 
   function kvRow(dl, key, value) {
@@ -286,9 +312,8 @@
   }
 
   // ---- CNY ↔ nano 换算（§5：1 CNY = 1e9 nano；全程字符串/BigInt，禁 float）----
-  // "12.345678901" → "12345678901"；小数最多 9 位；允许负号（manual_adjustment）。
-  // 返回**字符串** nano（§5 v0.3：wire 金额是十进制字符串；去前导零后超 19
-  // 位即非法——与桥/服务端 pattern 上限一致）。非法形态返回 null。
+  // "12.345678901" → "12345678901"；小数最多 9 位；允许负号。
+  // 返回**字符串** nano（§5 v0.3：wire 金额是十进制字符串）。非法形态 null。
   function cnyToNano(text) {
     var s = String(text == null ? "" : text).trim();
     if (!/^-?\d{1,15}(\.\d{1,9})?$/.test(s)) return null;
@@ -302,7 +327,8 @@
     return neg ? "-" + digits : digits;
   }
 
-  // 精确 nano → CNY 字符串（cap/金额输入框回显用；BigInt 运算，不经 Number）
+  // 精确 nano → CNY 字符串（输入框回显/技术详情用；BigInt 运算，不经
+  // Number；输出长尾小数——只允许出现在编辑回显与原始值区，不做常规展示）
   function nanoToCnyString(n) {
     if (n === null || n === undefined || n === "") return "";
     try {
@@ -318,8 +344,6 @@
   }
 
   // ---- 页内确认条（§3.3 危险操作二次确认）----
-  // sandbox 无 allow-modals：window.confirm 会被浏览器静默吞掉（恒 false），
-  // 因此禁用/重置密码/revoke/调账/开新周期一律走页内两步确认。
   function clearConfirm(box) {
     if (box) { box.hidden = true; box.textContent = ""; }
   }
@@ -333,7 +357,6 @@
     msg.textContent = text;
     var ok = document.createElement("button");
     ok.type = "button";
-    // 确认执行是该危险操作真正的提交点：区域内的那一个实心 danger
     ok.className = "adm-btn-danger";
     ok.textContent = "确认执行";
     var cancel = document.createElement("button");
@@ -357,10 +380,8 @@
     if (el) el.textContent = text || "";
   }
 
-  // 分页提示（「还有更多/已到底」）与操作反馈共用同一 status 元素时的
-  // 竞态防护：操作成功文案（如「已清除月额度覆盖」）不得被紧随的列表
-  // 刷新覆盖——仅当元素为空或当前就是分页提示时才写分页提示；操作反馈
-  // 由下一次操作自行替换。错误路径不经过本函数（错误必须始终可见）。
+  // 分页提示与操作反馈共用同一 status 元素时的竞态防护：操作成功文案不得
+  // 被紧随的列表刷新覆盖——仅当元素为空或当前就是分页提示时才写分页提示。
   function setPageHint(el, text) {
     if (!el) return;
     var cur = el.textContent || "";
@@ -369,9 +390,7 @@
   }
 
   // §4.5 按钮语义：primary（组内主提交）/ secondary（普通操作默认）/
-  // danger（实心危险，每区域最多一个）/ danger-outline（次要危险，如轮换
-  // 凭证）。旧调用点传 truthy（= danger）保持兼容；未指定一律 secondary，
-  // 普通操作不再默认品牌蓝实心。
+  // danger（实心危险，每区域最多一个）/ danger-outline（次要危险）。
   function actionBtn(label, handler, variant) {
     var btn = document.createElement("button");
     btn.type = "button";
@@ -476,8 +495,7 @@
     });
   }
 
-  // 常数时间字符串比较（与宿主 admin-host.js 同款；nonce 高熵值下主要是
-  // 防侥幸短路，双方值都在各自内存中）
+  // 常数时间字符串比较（与宿主 admin-host.js 同款）
   function timingSafeEqual(a, b) {
     if (typeof a !== "string" || typeof b !== "string") return false;
     if (a.length !== b.length) return false;
@@ -488,30 +506,23 @@
 
   function onMessage(event) {
     // 来源认证第一道（§8.3 P2 修订，与宿主对称）：只接受宿主 window.parent。
-    // opaque origin 读不出宿主 origin，event.origin 恒 "null" 不能用于鉴权；
-    // init 本身即 nonce 的下发通道，因此 init 只依赖 source 认证。
     if (event.source !== window.parent) return;
     var env = event.data;
     if (!env || typeof env !== "object" || env.bridge !== BRIDGE) return;
 
     if (env.kind === "init") {
-      // 握手：宿主每次 load 重新下发 nonce —— 直接覆盖旧值并丢弃旧在途请求
       state.nonce = typeof env.nonce === "string" ? env.nonce : null;
       state.protocolVersion = env.protocolVersion || PROTOCOL_FALLBACK;
       state.granted = Array.isArray(env.adminPermissions) ? env.adminPermissions.slice() : [];
       state.dead = false;
       setHandshakeConnected();
       resetLists();
-      // 深链（/admin#invites 等旧入口 302）：宿主把父页 hash 透传到本 iframe
-      // 的 URL，握手后直接落到目标页；无 hash 时回概览（showPage 自带加载）
+      // 深链（/admin#invites 等旧入口 302）：握手后直接落到目标页
       showPage(initialPage);
       return;
     }
 
     if (env.kind === "response") {
-      // §8.3 P2 修订：init 之后所有响应必须携带与 init 收到的 session nonce
-      // 相等的 nonce（恒时间比较）——不符（其他 frame/窗口伪造、旧 load 残留
-      // 回包）一律静默丢弃；requestId 必须命中在途表（防重放/孤儿响应）。
       if (!state.nonce || !timingSafeEqual(env.nonce, state.nonce)) return;
       var p = state.pending[env.requestId];
       if (!p) return; // 未知/已超时/已作废的响应：静默丢弃
@@ -526,8 +537,6 @@
     }
 
     if (env.kind === "event" && env.type === "bridge_invalidated") {
-      // 宿主作废（reload/登出/插件切换）：立即停止一切请求（本消息的来源
-      // 认证即上面的 window.parent 检查——只有宿主能发出）
       state.dead = true;
       state.nonce = null;
       failAllPending({ code: "bridge_invalidated", message: env.message || "宿主已作废桥接会话" });
@@ -553,8 +562,9 @@
   }
 
   // ------------------------------------------------------------------
-  // 概览（§10.1）——「对话额度」与「金额余额」必须并列、不得只显示一个
-  // 模糊「额度」；json/dual 后端 billing/turn 段标记不可用。
+  // 概览（§4.2 wave 2）：首屏只保留用户/AI、user 累计已用、今日/近 7 天
+  // 调用、cache hit、供应商余额+快照年龄；告警条仅在 unpriced>0、供应商余额
+  // 不可用/过旧、reconcile 不一致时出现。turn 冻结历史卡已删除。
   // ------------------------------------------------------------------
   function loadOverview() {
     setPageState("overview", "loading");
@@ -579,10 +589,12 @@
         { code: err && err.code, message: err && err.message,
           retry: function () { loadOverview(); } });
     });
+    // 站点访问（匿名统计）：独立降级——任何错误（含 unknown_method /
+    // not_implemented / 404 / permission_denied，即 D2 未发布）整卡隐藏。
+    loadSiteStats();
   }
 
-  // KPI 卡（§9.1 包 E）：用户 / 活跃 / 模型调用 / 缓存命中 / 模拟扣费 /
-  // unpriced —— billing 段不可用（json/dual）时只渲染用户侧 KPI 并说明。
+  // KPI 卡（§9.1 包 E）
   function kpiCard(label, value, note, danger) {
     var card = document.createElement("div");
     card.className = danger ? "adm-kpi adm-kpi--danger" : "adm-kpi";
@@ -618,9 +630,8 @@
       wrap.appendChild(kpiCard("缓存命中率", fmtRatio(b.cache_hit_ratio),
         "命中 " + fmtNum(b.cache_hit_input_tokens) + " / 未命中 " +
         fmtNum(b.cache_miss_input_tokens) + " tokens"));
-      // §4.2：KPI 主视图只显示 CNY（原始 nano 在下方 raw 展开区）
-      wrap.appendChild(kpiCard("用户 charge 合计（本周期）", fmtCny(b.charge_nano_cny),
-        "PR6 模拟软扣费口径"));
+      wrap.appendChild(kpiCard("User 累计已用", fmtCny(b.charge_nano_cny),
+        "本周期 charge 合计"));
       wrap.appendChild(kpiCard("unpriced 事件（本周期）", fmtNum(b.unpriced_count),
         "未计价 ≠ 0 元", Number(b.unpriced_count) > 0));
     } else {
@@ -629,39 +640,33 @@
     }
   }
 
+  // 概览告警条（§4.2）：只在真实、当前、可行动的异常出现——unpriced>0 /
+  // 供应商余额不可用或过旧 / 金额 reconcile 不一致；正常状态无告警卡。
+  function overviewAlerts(b) {
+    var alerts = [];
+    if (!b || b.available === false) return alerts;
+    if (Number(b.unpriced_count) > 0) {
+      alerts.push("本周期有 " + b.unpriced_count + " 条 unpriced 事件（未计价 ≠ 0 元），见「费用」页告警区与计费异常标签");
+    }
+    if (b.reconcile_drift === true) {
+      alerts.push("金额对账（reconcile）发现不一致：系统只报告不自动修账，请结合「费用」页账务流水排查");
+    }
+    var snapAge = b.provider_balance_age_seconds;
+    if (b.provider_balance_snapshot) {
+      if (snapAge !== null && snapAge !== undefined && Number(snapAge) > 86400) {
+        alerts.push("DeepSeek 余额快照已超过 24 小时未更新（" +
+                    Math.round(Number(snapAge) / 3600) + " 小时）");
+      }
+    } else {
+      alerts.push("DeepSeek 供应商余额暂无快照（余额不可用，成本监控缺失）");
+    }
+    return alerts;
+  }
+
   function renderOverview(ov) {
     renderOverviewKpis(ov);
-    var usersDl = $("adm-ov-users");
-    if (usersDl) {
-      usersDl.textContent = "";
-      var u = ov.users || {};
-      kvRow(usersDl, "总用户数", fmtNum(u.total));
-      kvRow(usersDl, "启用中", fmtNum(u.active));
-      kvRow(usersDl, "已禁用", fmtNum(u.disabled));
-      kvRow(usersDl, "AI access 用户", fmtNum(u.ai_access));
-    }
 
-    // 对话额度（turn budget）
-    var turnDl = $("adm-ov-turn");
-    if (turnDl) {
-      turnDl.textContent = "";
-      var t = ov.turn_budget || {};
-      if (t.available === false) {
-        kvRow(turnDl, "可用性", "不可用（" + (t.code || "pg_backend_required") + "）");
-      } else {
-        kvRow(turnDl, "周期", "#" + fmtNum(t.period_id) + "（" + fmtTs(t.period_started_at) + " 起）");
-        kvRow(turnDl, "平台总额度（用/上限）",
-              fmtNum(t.platform && t.platform.total) + " / " + fmtNum(t.platform && t.platform.limit));
-        kvRow(turnDl, "用户共享池（用/上限）",
-              fmtNum(t.user_pool && t.user_pool.total) + " / " + fmtNum(t.user_pool && t.user_pool.limit));
-        kvRow(turnDl, "Demo（24h 窗口/日上限）",
-              fmtNum(t.demo && t.demo.total) + " / " + fmtNum(t.demo && t.demo.limit));
-        kvRow(turnDl, "owner 保留池（用/保留）",
-              fmtNum(t.owner && t.owner.total) + " / " + fmtNum(t.owner && t.owner.reserved_limit));
-      }
-    }
-
-    // 金额余额（billing）：主视图 CNY；原始 nano 收进 raw 展开区（§4.2）
+    // 供应商余额（billing）：主视图 CNY；原始 nano 收进 raw 展开区（§4.2）
     var billDl = $("adm-ov-billing");
     var billRaw = $("adm-ov-billing-raw");
     if (billRaw) billRaw.textContent = "";
@@ -672,17 +677,13 @@
         kvRow(billDl, "可用性", "不可用（" + (b.code || "pg_backend_required") + "）");
       } else {
         kvRow(billDl, "provider 成本合计（本周期）", fmtCny(b.provider_cost_nano_cny));
-        kvRow(billDl, "用户 charge 合计（本周期）", fmtCny(b.charge_nano_cny));
+        kvRow(billDl, "User 累计已用（本周期）", fmtCny(b.charge_nano_cny));
         var snap = b.provider_balance_snapshot;
         kvRow(billDl, "DeepSeek 总余额",
           snap ? fmtCny(snap.total_balance_nano) : "（暂无快照）");
         kvRow(billDl, "余额快照年龄",
               b.provider_balance_age_seconds === null || b.provider_balance_age_seconds === undefined
                 ? "—" : Math.round(b.provider_balance_age_seconds) + " 秒前");
-        kvRow(billDl, "unpriced 事件数（本周期）", fmtNum(b.unpriced_count));
-        kvRow(billDl, "usage 入库滞后（最大/均值）",
-              Math.round(b.ingestion_lag_seconds_max || 0) + "s / " +
-              Math.round(b.ingestion_lag_seconds_avg || 0) + "s");
         if (billRaw) {
           billRaw.appendChild(rawValuesDetails([
             ["provider_cost_nano_cny", b.provider_cost_nano_cny],
@@ -709,28 +710,12 @@
       }
     }
 
-    // 告警区（unpriced 单独告警，不混入 0 元）
+    // 告警区：仅真实异常（unpriced / 余额不可用或过旧 / reconcile）
     var alertCard = $("adm-ov-alert-card");
     var alertList = $("adm-ov-alerts");
     if (alertCard && alertList) {
       alertList.textContent = "";
-      var b3 = ov.billing || {};
-      var alerts = [];
-      if (b3.available !== false) {
-        if (Number(b3.unpriced_count) > 0) {
-          alerts.push("本周期有 " + b3.unpriced_count + " 条 unpriced 事件（未计价 ≠ 0 元，见「额度与账单」页告警区）");
-        }
-        var maxLag = Number(b3.ingestion_lag_seconds_max || 0);
-        if (maxLag > 900) {
-          alerts.push("usage 入库滞后最大 " + Math.round(maxLag) + "s（>15 分钟，检查 HistoPilot outbox 投递）");
-        }
-        var snapAge = b3.provider_balance_age_seconds;
-        if (b3.provider_balance_snapshot && snapAge !== null && snapAge !== undefined
-            && Number(snapAge) > 86400) {
-          alerts.push("DeepSeek 余额快照已超过 24 小时未更新（" +
-                      Math.round(Number(snapAge) / 3600) + " 小时）");
-        }
-      }
+      var alerts = overviewAlerts(ov.billing || {});
       alertCard.hidden = alerts.length === 0;
       alerts.forEach(function (text) {
         var li = document.createElement("li");
@@ -741,15 +726,141 @@
   }
 
   // ------------------------------------------------------------------
-  // 用户（§10.2 只读）
+  // 站点访问（匿名统计，§4.2/D2-3）：低频站长工具，独立降级。任何错误
+  // （D2 未发布的 unknown_method/not_implemented/404/permission_denied，
+  // 以及网络/后端错误）都整卡隐藏——绝不显示成错误，也不阻塞概览。
+  // 禁止出现用户/邀请/注册/首次 AI/first·last touch/转化率任何内容。
+  // ------------------------------------------------------------------
+  function loadSiteStats() {
+    var card = $("adm-site-card");
+    request("admin.siteStats.get", {}).then(function (res) {
+      if (!card) return;
+      card.hidden = false;
+      renderSiteStats(res || {});
+    }).catch(function () {
+      if (card) card.hidden = true;
+    });
+  }
+
+  function siteKindLabel(kind, botName) {
+    if (kind === "signed_in_human") return "已登录";
+    if (kind === "suspected_bot") {
+      return "疑似爬虫" + (botName ? "（" + botName + "）" : "");
+    }
+    return "匿名访客";
+  }
+
+  function renderSiteStats(res) {
+    var card = $("adm-site-card");
+    if (!card) return;
+    var empty = $("adm-site-empty");
+    var today = res.today || {};
+    var d7 = res.d7 || {};
+    var d30 = res.d30 || {};
+    var totalVisits = Number((d30 && d30.visits) || 0) +
+      Number((d7 && d7.visits) || 0) + Number((today && today.visits) || 0);
+    var hasData = totalVisits > 0 || (res.daily || []).length > 0;
+    if (empty) {
+      empty.hidden = hasData;
+      empty.textContent = "当前没有站点访问记录（仅统计公开页面的匿名访问）。";
+    }
+
+    var kpis = $("adm-site-kpis");
+    if (kpis) {
+      kpis.textContent = "";
+      if (hasData) {
+        kpis.appendChild(kpiCard("今日访问", fmtNum(today.visits)));
+        kpis.appendChild(kpiCard("近 7 天访问", fmtNum(d7.visits)));
+        kpis.appendChild(kpiCard("近 30 天访问", fmtNum(d30.visits)));
+        // 日轮换 hash 不能跨日识别同一个人：禁止命名为「独立用户数」
+        kpis.appendChild(kpiCard("匿名访客日去重次数（30 天累计）",
+          fmtNum(d30.unique_visitors), "按日去重的近似次数，不是独立用户数"));
+        kpis.appendChild(kpiCard("疑似爬虫（30 天）", fmtNum(d30.bots),
+          "观测标签，不是封禁依据"));
+      }
+    }
+
+    var dailyBody = $("adm-site-daily-tbody");
+    if (dailyBody) {
+      dailyBody.textContent = "";
+      (res.daily || []).forEach(function (d) {
+        var tr = document.createElement("tr");
+        tr.appendChild(td(d.date));
+        tr.appendChild(td(fmtNum(d.visits)));
+        tr.appendChild(td(fmtNum(d.unique_visitors)));
+        tr.appendChild(td(fmtNum(d.bots)));
+        dailyBody.appendChild(tr);
+      });
+    }
+
+    function fillTop(tbodyId, rows, keyFn, valFn) {
+      var tbody = $(tbodyId);
+      if (!tbody) return;
+      tbody.textContent = "";
+      (rows || []).slice(0, 10).forEach(function (r) {
+        var tr = document.createElement("tr");
+        tr.appendChild(td(keyFn(r)));
+        tr.appendChild(td(fmtNum(valFn(r))));
+        tbody.appendChild(tr);
+      });
+    }
+    fillTop("adm-site-referrers-tbody", res.top_referrers,
+      function (r) { return r.domain || "（直接）"; },
+      function (r) { return r.visits; });
+    fillTop("adm-site-pages-tbody", res.top_pages,
+      function (r) { return r.page_key; },
+      function (r) { return r.visits; });
+
+    // 国家/地区：仅在本机离线库已配置且存在非 unknown 数据时显示
+    var countriesBlock = $("adm-site-countries-block");
+    if (countriesBlock) {
+      var rows = res.top_countries || [];
+      var meaningful = res.geo_configured === true &&
+        rows.some(function (r) { return r.country_code && r.country_code !== "unknown"; });
+      countriesBlock.hidden = !meaningful;
+      if (meaningful) {
+        fillTop("adm-site-countries-tbody", rows,
+          function (r) { return r.country_code; },
+          function (r) { return r.visits; });
+      }
+    }
+
+    var kindsDl = $("adm-site-kinds");
+    if (kindsDl) {
+      kindsDl.textContent = "";
+      var vk = res.visitor_kinds || {};
+      if (hasData) {
+        kvRow(kindsDl, "匿名人类访问（30 天）", fmtNum(vk.anonymous_human));
+        kvRow(kindsDl, "已登录访问（30 天）", fmtNum(vk.signed_in_human));
+        kvRow(kindsDl, "疑似爬虫（30 天）", fmtNum(vk.suspected_bot));
+        kvRow(kindsDl, "统计生成时间", fmtTs(res.generated_at));
+      }
+    }
+
+    var recentBody = $("adm-site-recent-tbody");
+    if (recentBody) {
+      recentBody.textContent = "";
+      (res.recent || []).slice(0, 20).forEach(function (r) {
+        var tr = document.createElement("tr");
+        tr.appendChild(td(fmtTs(r.occurred_at), "adm-cell-time"));
+        tr.appendChild(td(r.page_key));
+        tr.appendChild(td(r.referrer_domain || "（直接）"));
+        tr.appendChild(td(r.country_code && r.country_code !== "unknown"
+          ? r.country_code : "—"));
+        tr.appendChild(td(siteKindLabel(r.visitor_kind, r.bot_name)));
+        recentBody.appendChild(tr);
+      });
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // 用户（§4.3 wave 2）：列表 5 列不变；额度列按角色/形态渲染。
   // ------------------------------------------------------------------
   function resetLists() {
     state.cursors = { users: null, usage: null, unpriced: null, ledger: null,
-                      audit: null, acqUsers: null, invites: null };
-    state.account = null;
+                      audit: null, invites: null };
     ["adm-users-tbody", "adm-usage-tbody", "adm-unpriced-tbody",
      "adm-ledger-tbody", "adm-audit-tbody", "adm-invites-tbody",
-     "adm-acq-funnel-tbody", "adm-acq-users-tbody",
      "adm-plugins-tbody"].forEach(function (id) {
       var el = $(id);
       if (el) el.textContent = "";
@@ -799,60 +910,98 @@
     });
   }
 
-  // 2026-09-01 金额简化 §5.3：用户表 5 列（桌面）= 显示名/角色（次要列）/
-  // 状态/本月剩余/操作；登录账号、AI access、本月用量明细、最近调用收进
-  // 详情抽屉。角色为次要列（窄屏隐藏）——≤767px 收成 4 列（显示名/状态+AI
-  // 堆叠/本月剩余/详情），不靠横向滚动（P0-2）。
   var drawerUser = null;
   // 触发抽屉的「详情」按钮（§4.10：关闭后焦点恢复到这里）
   var drawerTrigger = null;
 
   // ------------------------------------------------------------------
-  // 用户行「本月剩余」（§5.3）：金额运算全程 BigInt；窗口缺失/错误 =
-  // 不可用（原因），绝不伪造 0。
+  // spend 双形态解析（§4.3/§Batch B 契约）：
+  //   - role=user 且已切总额度 → spend.total（一次性总额度投影）；
+  //   - owner（及切换前 user）→ spend.window（月窗口，现形态）；
+  //   - 两种形态同时出现 = 契约错误：显式报错态，绝不任选其一渲染；
+  //   - 数据缺失/错误 = 不可用（原因），绝不伪造 0。金额运算全程 BigInt。
   // ------------------------------------------------------------------
-  function userUsage(u) {
+  function userSpendInfo(u) {
     var s = u && u.spend;
     if (!s || s.error) {
-      return { available: false,
-               reason: s && s.error ? String(s.error) : "窗口数据缺失" };
+      return { shape: "unavailable",
+               reason: s && s.error ? String(s.error) : "额度数据缺失" };
     }
-    if (!s.window) return { available: false, reason: "窗口数据缺失" };
+    var t = s.total;
     var w = s.window;
-    try {
-      return {
-        available: true,
-        limit: BigInt(w.limit_nano_snapshot),
-        spent: BigInt(w.spent_nano_cny),
-        reserved: BigInt(w.reserved_nano_cny),
-        remaining: (w.remaining_nano === null || w.remaining_nano === undefined)
-          ? null : BigInt(w.remaining_nano),
-      };
-    } catch (e) {
-      return { available: false, reason: "窗口字段非法" };
+    var hasTotal = !!(t && t.total_limit_nano_cny !== null &&
+                      t.total_limit_nano_cny !== undefined);
+    var hasWindow = !!w;
+    if (hasTotal && hasWindow) return { shape: "invalid" };
+    if (hasTotal) {
+      try {
+        return {
+          shape: "total",
+          limit: BigInt(t.total_limit_nano_cny),
+          spent: BigInt(t.spent_nano_cny),
+          reserved: BigInt(t.reserved_nano_cny),
+          remaining: (t.remaining_nano === null || t.remaining_nano === undefined)
+            ? null : BigInt(t.remaining_nano),
+          overage: (t.overage_nano === null || t.overage_nano === undefined)
+            ? null : BigInt(t.overage_nano),
+          raw: t,
+        };
+      } catch (e) {
+        return { shape: "unavailable", reason: "总额度字段非法" };
+      }
     }
+    if (hasWindow) {
+      try {
+        return {
+          shape: "window",
+          limit: BigInt(w.limit_nano_snapshot),
+          spent: BigInt(w.spent_nano_cny),
+          reserved: BigInt(w.reserved_nano_cny),
+          remaining: (w.remaining_nano === null || w.remaining_nano === undefined)
+            ? null : BigInt(w.remaining_nano),
+          raw: w,
+        };
+      } catch (e) {
+        return { shape: "unavailable", reason: "窗口字段非法" };
+      }
+    }
+    return { shape: "unavailable", reason: "额度数据缺失" };
   }
 
-  // 剩余状态的统一呈现（§5.3）：用户表「本月剩余」列与抽屉金额主视图共用。
-  // 短文案四态：剩余 X CNY / 已用尽 / 超支 X CNY / 不可用（原因）——
-  // 不写「下次预占将被拒绝」、不拆 spent/reserved 双行。
+  // 剩余状态的统一呈现：短文案四态——剩余 X CNY / 已用尽 / 超支 X CNY /
+  // 不可用（原因）+ 契约错误。耗尽/超额/告警色全部按**原始 nano**判断，
+  // 不按四舍五入后的 0.00 判断（0 < remaining < 0.005 显示「剩余 0.00 CNY」
+  // 但状态仍是非耗尽）。
   function remainingInfo(u) {
-    var use = userUsage(u);
-    if (!use.available) {
-      return { text: "不可用（" + use.reason + "）", danger: false };
+    var info = userSpendInfo(u);
+    if (info.shape === "invalid") {
+      return { text: "契约错误（total 与 window 同时返回）", danger: true };
     }
-    if (use.remaining === null) {
+    if (info.shape === "unavailable") {
+      return { text: "不可用（" + info.reason + "）", danger: false };
+    }
+    if (info.remaining === null) {
       return { text: "不可用（remaining 缺失）", danger: false };
     }
-    // remaining 不需要除法，优先于「额度为 0」判定：limit=0 且 remaining=0
-    // 是真实的「已用尽」观测；负 remaining = overage 观测（danger 色）
-    if (use.remaining < 0n) {
-      return { text: "超支 " + fmtCny(-use.remaining), danger: true };
+    if (info.shape === "total") {
+      // total 形态：remaining = max(0, limit-spent-reserved)，恒非负；
+      // 超额由 overage 明示
+      if (info.overage !== null && info.overage > 0n) {
+        return { text: "超支 " + fmtCny(info.overage), danger: true };
+      }
+      if (info.remaining === 0n) {
+        return { text: "已用尽", danger: false };
+      }
+      return { text: "剩余 " + fmtCny(info.remaining), danger: false };
     }
-    if (use.remaining === 0n) {
+    // window 形态：负 remaining = overage 观测（danger 色）
+    if (info.remaining < 0n) {
+      return { text: "超支 " + fmtCny(-info.remaining), danger: true };
+    }
+    if (info.remaining === 0n) {
       return { text: "已用尽", danger: false };
     }
-    return { text: "剩余 " + fmtCny(use.remaining), danger: false };
+    return { text: "剩余 " + fmtCny(info.remaining), danger: false };
   }
 
   function renderRemainCell(u) {
@@ -871,7 +1020,7 @@
       var tr = document.createElement("tr");
       tr.appendChild(td(u.display_name));
       tr.appendChild(td(u.role, "adm-col-secondary"));
-      // 状态 + AI（P0-2）：桌面一列；≤767px 状态格内堆叠 AI 补行，凑成 4 列
+      // 状态 + AI（P0-2）：桌面一列；≤767px 状态格内堆叠 AI 补行
       var statusCell = document.createElement("td");
       statusCell.appendChild(document.createTextNode(u.enabled ? "启用" : "禁用"));
       var aiStack = document.createElement("div");
@@ -891,58 +1040,75 @@
     });
   }
 
-  // 剩余额度的短文案（§5.3/§5.4）：「剩余 X CNY / 已用尽 / 超支 X CNY」；
-  // 长解释（overage 观测、拒绝说明）只允许出现在危险确认条，不进主视图。
-  function remainingText(remainingNano) {
-    if (remainingNano === null || remainingNano === undefined) return "—";
-    var b = BigInt(remainingNano);
-    if (b < 0n) return "超支 " + nanoToCnyString((-b).toString()) + " CNY";
-    if (b === 0n) return "已用尽";
-    return "剩余 " + nanoToCnyString(b.toString()) + " CNY";
-  }
-
-  // 该用户当前月金额窗口（可能缺失：json 后端 / 尚未开窗 / 出错）
+  // 该用户当前月金额窗口（window 形态；可能缺失：json 后端 / 尚未开窗）
   function currentUserWindow(u) {
     return u && u.spend && u.spend.window && !u.spend.error
       ? u.spend.window : null;
   }
 
-  // 月额度编辑器（2026-09-01 金额简化 §5.4）：非 owner 唯一金额动作——
-  // 「每月额度（CNY）」+ 保存 + 恢复默认。保存 = 两步：
-  //   1) admin.users.setSpendOverride（覆盖以后每个窗口）
-  //   2) 若该用户已有当前月窗口，再 admin.spend.currentWindow.adjust
-  //      （立即改当前窗口 snapshot，window_id + version CAS）
-  // 第 1 步成功、第 2 步失败必须写明「覆盖已保存，但当前窗口未改」，
-  // 禁止假装成功。恢复默认 = 清覆盖 + 当前窗口调回注册用户默认月额度。
-  // 两次操作都走抽屉内页内确认条（#adm-drawer-confirm）。
-  function renderOverrideEditor(u) {
+  // 剩余额度的短文案（window 形态抽屉主视图用）：「剩余 X CNY / 已用尽 /
+  // 超支 X CNY」；状态判断按原始 nano，显示值统一两位小数。
+  function remainingText(remainingNano) {
+    if (remainingNano === null || remainingNano === undefined) return "—";
+    var b = BigInt(remainingNano);
+    if (b < 0n) return "超支 " + fmtCny((-b).toString());
+    if (b === 0n) return "已用尽";
+    return "剩余 " + fmtCny(b.toString());
+  }
+
+  // CAS 版本：total 形态用 allowance version；window 形态（切换前 user）用
+  // 窗口 version。缺版本 = 拒绝盲写（禁用动作并说明）。
+  function spendVersionOf(u) {
+    var info = userSpendInfo(u);
+    if (info.raw && info.raw.version !== null && info.raw.version !== undefined) {
+      var v = Number(info.raw.version);
+      if (Number.isSafeInteger(v) && v >= 1) return v;
+    }
+    return null;
+  }
+
+  function allowanceSourceText(source) {
+    if (source === null || source === undefined || source === "") return "默认";
+    if (source === "invite" || source === "invite_template") return "邀请初始额度";
+    if (source === "default" || source === "restore_default") return "全局默认";
+    if (source === "admin" || source === "manual" || source === "set") return "管理员设置";
+    return String(source);
+  }
+
+  // ------------------------------------------------------------------
+  // user 抽屉金额编辑器（wave 2 §4.3）：唯一两个金额动作——
+  //   「设置总额度」admin.spend.userTotalLimit.set（绝对 limit + CAS）
+  //   「恢复默认」  admin.spend.userTotalLimit.restoreDefault
+  // 两者只修改绝对总上限，绝不重置已用/预占；确认条明示该语义。
+  // ------------------------------------------------------------------
+  function renderTotalLimitEditor(u) {
+    var info = userSpendInfo(u);
+    var version = spendVersionOf(u);
     var wrap = document.createElement("div");
     wrap.className = "adm-drawer-override";
     var title = document.createElement("p");
     title.className = "adm-note";
-    title.textContent = "对这个用户单独设每月额度。保存后立即改当前月，并作为以后每个月的覆盖值。";
+    title.textContent = "对这个用户设置一次性总额度（绝对总上限）：只改额度、绝不重置已用金额；额度不按月刷新。";
     var field = document.createElement("div");
     field.className = "adm-field";
     var label = document.createElement("label");
     label.className = "adm-field-label";
-    var inputId = "adm-override-limit-input";
+    var inputId = "adm-total-limit-input";
     label.htmlFor = inputId;
-    label.textContent = "每月额度（CNY，必填）";
+    label.textContent = "总额度（CNY，必填）";
     var input = document.createElement("input");
     input.type = "text";
     input.id = inputId;
     input.placeholder = "如 30.5";
     input.autocomplete = "off";
-    input.setAttribute("aria-describedby", "adm-override-limit-help");
+    input.setAttribute("aria-describedby", "adm-total-limit-help");
     var help = document.createElement("small");
     help.className = "adm-field-help";
-    help.id = "adm-override-limit-help";
-    help.textContent = "最多 9 位小数；要恢复全局默认请用「恢复默认」";
+    help.id = "adm-total-limit-help";
+    help.textContent = "最多 9 位小数；调低到低于已用+预占时剩余显示 0 并进入超额，后续调用被拒";
     field.appendChild(label);
     field.appendChild(input);
     field.appendChild(help);
-    // 编辑器局部状态行：成功/部分失败结果都写在这里（抽屉保持打开可见），
-    // 同时镜像到页级 #adm-users-status（关闭抽屉后仍可见）
     var statusEl = document.createElement("p");
     statusEl.className = "adm-status";
     var actions = document.createElement("div");
@@ -959,103 +1125,86 @@
       statusEl.textContent = message;
     }
 
-    // 两步保存链（override → 当前窗口 CAS）。恢复默认时 override 为 null、
-    // 当前窗口调到 settings 里的注册用户默认月额度（adjustNano）
-    function applyMonthlyLimit(overrideNano, adjustNano, okText) {
-      editorStatus("保存中…");
-      request("admin.users.setSpendOverride", {
-        user_id: u.user_id,
-        monthly_limit_nano_cny: overrideNano,
-      }).then(function () {
-        var w = currentUserWindow(u);
-        if (!w) {
-          editorStatus(okText + "（该用户暂无当前月窗口，从下个窗口起生效）");
-          loadUsers(false);
-          return;
-        }
-        request("admin.spend.currentWindow.adjust", {
-          window_id: w.window_id,
-          limit_nano_snapshot: adjustNano,
-          version: w.version,
-        }).then(function () {
-          editorStatus(okText + "（当前月已立即生效，以后每月沿用）");
-          loadUsers(false);
-        }).catch(function (err) {
-          // 第 1 步已成功、第 2 步失败：如实写明，禁止假装成功
-          editorStatus("覆盖已保存，但当前窗口未改，请刷新后重试");
-          showError(err && err.code, err && err.message);
-          loadUsers(false);
-        });
-      }).catch(function (err) {
-        editorStatus(errText(err));
-        showError(err && err.code, err && err.message);
-      });
-    }
-
-    var saveBtn = actionBtn("保存", function () {
+    var saveBtn = actionBtn("设置总额度", function () {
       var text = (input.value || "").trim();
       var limit = text ? cnyToNano(text) : null;
       if (!text || limit === null) {
-        markLimitInvalid("每月额度非法（CNY，最多 9 位小数，如 30.5）");
+        markLimitInvalid("总额度非法（CNY，最多 9 位小数，如 30.5）");
         return;
       }
       clearInvalid(input);
       askConfirm($("adm-drawer-confirm"),
-        "确认把 " + (u.display_name || u.user_id) + " 的每月额度设为 " +
-        nanoToCnyString(limit) + " CNY（" + limit + " nano）？" +
-        "保存后立即改当前月，并作为以后每个月的覆盖值。",
+        "确认把 " + (u.display_name || u.user_id) + " 的总额度设为 " +
+        fmtCny(limit) + "（" + limit + " nano）？" +
+        "这是绝对总上限：已用/预占不清零、不重置；若低于已用+预占，剩余将显示 0.00 并按原始值判定超额。",
         function () {
-          applyMonthlyLimit(limit, limit,
-            "已设为单独每月额度 " + nanoToCnyString(limit) + " CNY");
+          editorStatus("保存中…");
+          request("admin.spend.userTotalLimit.set", {
+            user_id: u.user_id,
+            total_limit_nano_cny: limit,
+            expected_version: version,
+          }).then(function () {
+            editorStatus("已设置总额度 " + fmtCny(limit) +
+              "（不重置已用金额；不按月刷新）");
+            input.value = "";
+            loadUsers(false);
+          }).catch(function (err) {
+            if (err && err.code === "version_conflict") {
+              editorStatus("额度已被他人修改（409 version_conflict），已刷新，请重试");
+              loadUsers(false);
+            } else {
+              editorStatus(errText(err));
+            }
+            showError(err && err.code, err && err.message);
+          });
         });
     }, "primary");
 
-    // 恢复默认：清覆盖；若有当前窗口，把 snapshot 调回注册用户默认月额度
-    // （settings 里的 user_default_monthly_limit）。读不到默认时只清覆盖，
-    // 并明确告知当前窗口未改。
+    // 恢复默认：把该用户的绝对总上限显式改为当时全局默认总额度；
+    // 已用金额保留。默认值只从 spend 设置响应的新键读取。
     var restoreBtn = actionBtn("恢复默认", function () {
-      statusEl.textContent = "读取注册用户默认月额度…";
+      editorStatus("读取全局默认总额度…");
       request("admin.settings.get", {}).then(function (settings) {
         var spend = (settings || {}).spend || {};
-        var policy = (spend.policies || {}).user_default;
-        var defNano = policy && policy.limit_nano_cny !== null &&
-          policy.limit_nano_cny !== undefined
-          ? String(policy.limit_nano_cny) : null;
-        var w = currentUserWindow(u);
-        if (defNano && w) {
-          askConfirm($("adm-drawer-confirm"),
-            "确认清除单独月额度并恢复默认 " + nanoToCnyString(defNano) +
-            " CNY？当前月窗口将立即调整为该额度。",
-            function () {
-              applyMonthlyLimit(null, defNano, "已恢复默认每月额度 " +
-                nanoToCnyString(defNano) + " CNY");
-            });
-        } else {
-          var why = !w ? "该用户暂无当前月窗口，清除后从下个窗口起回退默认。"
-            : "未能读取默认月额度，当前窗口将保持不变。";
-          askConfirm($("adm-drawer-confirm"),
-            "确认清除单独月额度、恢复全局默认？" + why,
-            function () {
-              editorStatus("已清除单独月额度覆盖" +
-                (!w ? "（下个窗口起回退全局默认）"
-                    : "；当前窗口未改，请刷新后重试"));
-              request("admin.users.setSpendOverride", {
-                user_id: u.user_id, monthly_limit_nano_cny: null,
-              }).then(function () {
-                loadUsers(false);
-              }).catch(function (err) {
-                editorStatus(errText(err));
-                showError(err && err.code, err && err.message);
-              });
-            });
+        var defNano = spend.user_default_total_limit_nano_cny;
+        if (defNano === null || defNano === undefined || defNano === "") {
+          editorStatus("未能读取全局默认总额度；未做任何修改，请刷新后重试");
+          return;
         }
+        askConfirm($("adm-drawer-confirm"),
+          "确认把总额度恢复为全局默认 " + fmtCny(defNano) +
+          "？这是绝对总上限的显式修改：已用金额保留，不会清零、不会重置。",
+          function () {
+            editorStatus("保存中…");
+            request("admin.spend.userTotalLimit.restoreDefault", {
+              user_id: u.user_id,
+              expected_version: version,
+            }).then(function () {
+              editorStatus("已恢复默认总额度 " + fmtCny(defNano) +
+                "（已用金额保留）");
+              loadUsers(false);
+            }).catch(function (err) {
+              if (err && err.code === "version_conflict") {
+                editorStatus("额度已被他人修改（409 version_conflict），已刷新，请重试");
+                loadUsers(false);
+              } else {
+                editorStatus(errText(err));
+              }
+              showError(err && err.code, err && err.message);
+            });
+          });
       }).catch(function (err) {
-        editorStatus("默认月额度读取失败（" + errText(err) +
-          "）；未做任何修改，请刷新后重试");
+        editorStatus("默认总额度读取失败（" + errText(err) + "）；未做任何修改");
         showError(err && err.code, err && err.message);
       });
     }, "secondary");
 
+    if (version === null) {
+      // 拒绝盲写：读不到 CAS 版本就不提供动作
+      saveBtn.disabled = true;
+      restoreBtn.disabled = true;
+      editorStatus("额度版本缺失（无法安全提交 CAS），请刷新列表后重试");
+    }
     actions.appendChild(saveBtn);
     actions.appendChild(restoreBtn);
     wrap.appendChild(title);
@@ -1065,8 +1214,108 @@
     return wrap;
   }
 
-  // 抽屉底部默认折叠的「技术细节」（§5.4）：spent/reserved/窗口边界/余额/
-  // caps/raw nano 只在这里，主视图不出现
+  // ------------------------------------------------------------------
+  // window 形态抽屉编辑器（owner / 切换前 user）：既有 currentWindow.adjust
+  // CAS——只改当前窗口额度快照；不出现 total 动作。
+  // ------------------------------------------------------------------
+  function renderWindowAdjustEditor(u) {
+    var w = currentUserWindow(u);
+    var wrap = document.createElement("div");
+    wrap.className = "adm-drawer-override";
+    var title = document.createElement("p");
+    title.className = "adm-note";
+    title.textContent = u.role === "owner"
+      ? "对 Owner 当前月窗口立即调整额度快照：已消费/预占不回退；调低到低于已消费后，下一次预占即被拒绝。"
+      : "该用户尚未切换到一次性总额度（仍为月窗口）：可立即调整当前月窗口的额度快照；已消费/预占不回退。";
+    var field = document.createElement("div");
+    field.className = "adm-field";
+    var label = document.createElement("label");
+    label.className = "adm-field-label";
+    var inputId = "adm-window-adjust-input";
+    label.htmlFor = inputId;
+    label.textContent = "当前窗口新额度（CNY，必填）";
+    var input = document.createElement("input");
+    input.type = "text";
+    input.id = inputId;
+    input.placeholder = "如 30.5";
+    input.autocomplete = "off";
+    input.setAttribute("aria-describedby", "adm-window-adjust-help");
+    var help = document.createElement("small");
+    help.className = "adm-field-help";
+    help.id = "adm-window-adjust-help";
+    help.textContent = "最多 9 位小数；立即生效并写审计；窗口版本冲突（409）时刷新后重试";
+    field.appendChild(label);
+    field.appendChild(input);
+    field.appendChild(help);
+    var statusEl = document.createElement("p");
+    statusEl.className = "adm-status";
+    var actions = document.createElement("div");
+    actions.className = "adm-form-actions";
+
+    function editorStatus(text) {
+      statusEl.textContent = text;
+      setStatus("adm-users-status", text);
+    }
+
+    var saveBtn = actionBtn("调整当前窗口", function () {
+      if (!w || w.error) {
+        editorStatus("当前窗口不可用，无法调整");
+        return;
+      }
+      var text = (input.value || "").trim();
+      var limit = text ? cnyToNano(text) : null;
+      if (!text || limit === null) {
+        input.setAttribute("aria-invalid", "true");
+        if (input.focus) input.focus();
+        editorStatus("新额度非法（CNY，最多 9 位小数，如 30.5）");
+        return;
+      }
+      clearInvalid(input);
+      var newRemaining = (BigInt(limit) - BigInt(w.spent_nano_cny) -
+                          BigInt(w.reserved_nano_cny)).toString();
+      askConfirm($("adm-drawer-confirm"),
+        "确认调整 " + (u.display_name || u.user_id) + " 的当前窗口额度？" +
+        "当前额度 " + fmtCny(w.limit_nano_snapshot) + " → 新额度 " + fmtCny(limit) +
+        "（" + limit + " nano）。影响：已消费 " + fmtCny(w.spent_nano_cny) +
+        " / 预占 " + fmtCny(w.reserved_nano_cny) + " 不回退；新剩余 " +
+        remainingPhrase(newRemaining) + "。操作立即生效并写审计，不等下个窗口。",
+        function () {
+          editorStatus("调整中…");
+          request("admin.spend.currentWindow.adjust", {
+            window_id: w.window_id,
+            limit_nano_snapshot: limit,
+            version: w.version,
+          }).then(function (res) {
+            editorStatus("已调整（窗口 version " +
+              ((res && res.window && res.window.version) || "?") + "）");
+            input.value = "";
+            loadUsers(false);
+          }).catch(function (err) {
+            if (err && err.code === "version_conflict") {
+              editorStatus("窗口已被他人调整（409 version_conflict），已刷新，请重试");
+              loadUsers(false);
+            } else {
+              editorStatus(errText(err));
+            }
+            showError(err && err.code, err && err.message);
+          });
+        });
+    }, "primary");
+
+    if (!w || w.error) saveBtn.disabled = true;
+    actions.appendChild(saveBtn);
+    wrap.appendChild(title);
+    wrap.appendChild(field);
+    wrap.appendChild(actions);
+    wrap.appendChild(statusEl);
+    return wrap;
+  }
+
+  // 抽屉底部默认折叠的「技术细节」（§4.3 wave 2）：
+  //   - user（total 形态）：allowance id/version、cutover 时间、opening spent、
+  //     原始 nano；
+  //   - owner / 切换前 user（window 形态）：window id/version、起止、原始 nano。
+  // 金额余额、soft/hard caps 及一切暗示账户余额控制可用额度的文字已删除。
   function drawerTechDetails(u) {
     var details = document.createElement("details");
     details.className = "adm-raw-values adm-drawer-tech";
@@ -1075,30 +1324,41 @@
     details.appendChild(summary);
     var dl = document.createElement("dl");
     dl.className = "adm-kv";
-    kvRow(dl, "金额余额", u.billing ? fmtCny(u.billing.balance_nano) : "未开户");
-    kvRow(dl, "soft/hard cap（兼容，已不参与授权）", u.billing
-          ? ((u.billing.soft_spend_cap_nano === null ? "—" : fmtCny(u.billing.soft_spend_cap_nano)) +
-             " / " +
-             (u.billing.hard_spend_cap_nano === null ? "—" : fmtCny(u.billing.hard_spend_cap_nano)))
-          : "—");
-    var rawRows = [
-      ["balance_nano", u.billing && u.billing.balance_nano],
-    ];
-    var w = currentUserWindow(u);
-    if (w) {
-      kvRow(dl, "本月已消费（spent）", fmtCny(w.spent_nano_cny));
-      kvRow(dl, "本月预占（reserved）", fmtCny(w.reserved_nano_cny));
+    var info = userSpendInfo(u);
+    var rawRows = [];
+    if (info.shape === "total") {
+      var t = info.raw;
+      kvRow(dl, "allowance id", t.allowance_id);
+      kvRow(dl, "allowance version", t.version);
+      kvRow(dl, "切换时间（cutover_at）", fmtTs(t.cutover_at));
+      kvRow(dl, "迁移基线已用（opening_spent）", fmtNano(t.opening_spent_nano_cny));
+      rawRows = [
+        ["total_limit_nano_cny", t.total_limit_nano_cny],
+        ["spent_nano_cny", t.spent_nano_cny],
+        ["reserved_nano_cny", t.reserved_nano_cny],
+        ["remaining_nano", t.remaining_nano],
+        ["overage_nano", t.overage_nano],
+        ["opening_spent_nano_cny", t.opening_spent_nano_cny],
+      ];
+    } else if (info.shape === "window") {
+      var w = info.raw;
+      kvRow(dl, "window id", w.window_id);
+      kvRow(dl, "window version", w.version);
       var boundary = document.createElement("span");
       boundary.className = "adm-boundary";
       boundary.textContent = fmtTs(w.window_start) + " → " + fmtTs(w.window_end) +
         "（上海时区自然月/周）";
       kvRowNode(dl, "窗口边界", boundary);
-      rawRows = rawRows.concat([
+      rawRows = [
         ["limit_nano_snapshot", w.limit_nano_snapshot],
         ["spent_nano_cny", w.spent_nano_cny],
         ["reserved_nano_cny", w.reserved_nano_cny],
         ["remaining_nano", w.remaining_nano],
-      ]);
+      ];
+    } else if (info.shape === "invalid") {
+      kvRow(dl, "契约状态", "total 与 window 同时返回（服务端契约破坏）");
+    } else {
+      kvRow(dl, "额度数据", "不可用（" + info.reason + "）");
     }
     details.appendChild(dl);
     // 原始 nano（wire 十进制字符串）逐行可复制
@@ -1123,7 +1383,7 @@
     drawerUser = u;
     drawerTrigger = trigger || null;
     els.drawerBody.textContent = "";
-    // 身份字段（§5.4 主视图保留）
+    // 身份字段（§4.3 主视图保留）
     var dl = document.createElement("dl");
     dl.className = "adm-kv";
     kvRow(dl, "user_id", u.user_id);
@@ -1136,21 +1396,29 @@
     kvRow(dl, "注册方式", u.registration_method);
     kvRow(dl, "最近 AI 调用", u.last_ai_call_at === null || u.last_ai_call_at === undefined
           ? "—" : fmtTs(u.last_ai_call_at) + "（Asia/Shanghai）");
-    // 金额主视图只有三行：本月剩余 / 本月额度 / 额度来源（§5.4）
-    var w = currentUserWindow(u);
-    if (w) {
-      kvRow(dl, "本月剩余", remainingText(w.remaining_nano));
-      kvRow(dl, "本月额度", fmtCny(w.limit_nano_snapshot));
+    // 金额主视图按形态渲染（§4.3）
+    var info = userSpendInfo(u);
+    if (info.shape === "total") {
+      kvRow(dl, "总额度", fmtCny(info.limit));
+      kvRow(dl, "累计已用", fmtCny(info.spent));
+      kvRow(dl, "预占", fmtCny(info.reserved));
+      var avail = remainingInfo(u);
+      kvRow(dl, "可用金额", avail.text);
+      kvRow(dl, "额度来源", allowanceSourceText(info.raw && info.raw.source));
+    } else if (info.shape === "window") {
+      kvRow(dl, "本月额度", fmtCny(info.limit));
+      kvRow(dl, "本月已用", fmtCny(info.spent));
+      kvRow(dl, "本月预占", fmtCny(info.reserved));
+      kvRow(dl, "本月剩余", remainingText(info.remaining));
+      kvRow(dl, "额度来源",
+            u.role === "owner" ? "默认（owner 独立策略）"
+            : (u.spend && u.spend.policy_scope === "user_override")
+              ? "单独覆盖" : "默认");
+    } else if (info.shape === "invalid") {
+      kvRow(dl, "额度", "契约错误：total 与 window 同时返回（服务端契约破坏，已禁止操作）");
     } else {
-      var reason = u.spend && u.spend.error
-        ? String(u.spend.error) : "窗口数据缺失（要求 PostgreSQL 后端）";
-      kvRow(dl, "本月剩余", "不可用（" + reason + "）");
-      kvRow(dl, "本月额度", "—");
+      kvRow(dl, "额度", "不可用（" + info.reason + "）");
     }
-    kvRow(dl, "额度来源",
-          u.role === "owner" ? "默认（owner 独立策略）"
-          : (u.spend && u.spend.policy_scope === "user_override")
-            ? "单独覆盖" : "默认");
     els.drawerBody.appendChild(dl);
     // 低频技术细节默认折叠在底部
     els.drawerBody.appendChild(drawerTechDetails(u));
@@ -1158,8 +1426,12 @@
     actions.className = "adm-drawer-actions";
     actions.appendChild(renderUserActions(u));
     els.drawerBody.appendChild(actions);
-    if (u.role !== "owner") {
-      els.drawerBody.appendChild(renderOverrideEditor(u));
+    // 金额动作按形态二选一（互斥）：total → 总额度编辑器；window → 既有
+    // 当前窗口调整；invalid → 不提供任何金额动作（显式报错态）
+    if (info.shape === "total") {
+      els.drawerBody.appendChild(renderTotalLimitEditor(u));
+    } else if (info.shape === "window") {
+      els.drawerBody.appendChild(renderWindowAdjustEditor(u));
     }
     els.drawer.hidden = false;
     if (els.drawerMask) els.drawerMask.hidden = false;
@@ -1168,8 +1440,6 @@
   }
 
   function closeUserDrawer() {
-    // 已关闭时是 no-op（切页调用不得抢走焦点）；关闭时焦点恢复到触发
-    // 该抽屉的「详情」按钮（§4.10）；并清空抽屉内页内确认条（P0-3）
     if (!els.drawer || els.drawer.hidden) {
       drawerUser = null;
       return;
@@ -1184,13 +1454,8 @@
   }
 
   // 行内操作（§10.2）：授予/收回 AI / 身份预览 / 启停 / 重置密码（仅普通用户）。
-  // 2026-09-01 金额简化 §5.4：去掉「打开账本」（低频，去账单页自己查）。
-  // §4.10：本函数只服务抽屉，返回真实 div（表格行自行用 td 容器）。
-  // §4.5：普通操作在前，禁用/重置密码等危险操作放独立「危险操作」区、
-  // 不排在普通操作最前；owner 行不提供禁用与重置（break-glass 不变量，
-  // 服务端同样 409）。禁用、重置密码与身份预览为危险操作，走页内确认条。
-  // P0-3：确认条一律挂抽屉内的 #adm-drawer-confirm——页级 #adm-users-confirm
-  // 在遮罩之后的用户卡里，抽屉打开时不可达也不在 Tab 圈定内。
+  // §4.5：普通操作在前，禁用/重置密码等危险操作放独立「危险操作」区；
+  // owner 行不提供禁用与重置（break-glass 不变量，服务端同样 409）。
   function renderUserActions(u) {
     var wrap = document.createElement("div");
     wrap.className = "adm-actions";
@@ -1228,10 +1493,7 @@
     return wrap;
   }
 
-  // 身份预览（§10.2，PR5 修订恢复入口）：进入后宿主页 effective subject 变为
-  // 目标用户。本 iframe 是 opaque origin（sandbox 无 allow-top-navigation），
-  // 不能也不应把宿主导航到 Viewer——只提示 owner 手动切换标签页；停止按钮
-  // 在宿主页右上角的预览横幅（app.js），不经桥。
+  // 身份预览（§10.2，PR5 修订恢复入口）
   function startPreviewFor(u) {
     request("admin.users.startPreview", { user_id: u.user_id })
       .then(function (res) {
@@ -1278,8 +1540,6 @@
   }
 
   // 重置密码：页内输入新密码（sandbox 下 window.prompt 不可用）+ 确认执行。
-  // P0-3：确认条挂抽屉内 #adm-drawer-confirm；P1：输入有真实 <label for>
-  // （.adm-field 组件），placeholder 只放格式示例，minLength 15 保持不变。
   function askResetPassword(u) {
     var box = $("adm-drawer-confirm");
     if (!box) return;
@@ -1330,7 +1590,6 @@
     var display = ($("adm-users-new-display") && $("adm-users-new-display").value || "").trim();
     var password = $("adm-users-new-password") ? $("adm-users-new-password").value : "";
     var limitText = ($("adm-users-new-limit") && $("adm-users-new-limit").value || "").trim();
-    // §4.4：校验失败保留输入与焦点（aria-invalid + focus），不自动折叠表单
     if (!loginId) {
       markInvalid($("adm-users-new-login"), "缺少登录账号", "adm-users-create-status");
       return;
@@ -1343,17 +1602,17 @@
     }
     var payload = { login_id: loginId, password: password };
     if (display) payload.display_name = display;
-    // 批次 D §5.1：可选月额度覆盖（CNY 输入 → nano 十进制字符串；留空 =
-    // 继承全局默认，不建 override；建号+覆盖+audit 服务端同一事务）
+    // Batch B：可选初始总额度（CNY → nano 十进制字符串；留空 = 继承全局
+    // 默认；建号+allowance+audit 服务端同一事务）。旧 monthly 字段不再发送。
     if (limitText) {
       var limit = cnyToNano(limitText);
       if (limit === null) {
         markInvalid($("adm-users-new-limit"),
-          "每月金额覆盖非法（CNY，最多 9 位小数，如 20 或 12.5）",
+          "初始总额度非法（CNY，最多 9 位小数，如 20 或 12.5）",
           "adm-users-create-status");
         return;
       }
-      payload.monthly_limit_nano_cny = limit;
+      payload.total_limit_nano_cny = limit;
     }
     setStatus("adm-users-create-status", "创建中…");
     request("admin.users.create", payload).then(function (res) {
@@ -1363,9 +1622,9 @@
       });
       setStatus("adm-users-create-status",
         "已创建 " + ((res && res.user && res.user.user_id) || loginId) +
-        (payload.monthly_limit_nano_cny
-          ? "（月额度覆盖 " + nanoToCnyString(payload.monthly_limit_nano_cny) + " CNY）"
-          : "（继承默认月额度）"));
+        (payload.total_limit_nano_cny
+          ? "（初始总额度 " + fmtCny(payload.total_limit_nano_cny) + "）"
+          : "（继承全局默认总额度）"));
       loadUsers(false);
     }).catch(function (err) {
       showError(err && err.code, err && err.message);
@@ -1374,42 +1633,15 @@
   }
 
   // ------------------------------------------------------------------
-  // 邀请与来源（§10.3 只读部分，PR4）：注册模式 + campaign 漏斗 +
-  // 用户来源明细（first/last touch 分列）。邀请创建/撤销按钮属 PR5。
+  // 邀请（§4.4 wave 2）：注册模式只读摘要 + 创建/列表/撤销。
+  // 来源漏斗 / 用户来源明细 / source·campaign·cohort 全部退役；
+  // 注册模式只在设置页可写，本页仅展示 + 跳转。
   // ------------------------------------------------------------------
-  // 来源空状态（§9.2 包 E 前置）：零数据必须解释「仅覆盖上线后的有效访问
-  // 触点、历史用户尚未回填」，且 permission_denied / 网络失败 / handshake
-  // 失败绝不渲染成这个 empty 状态（错误走 handleErr 的错误呈现）。
-  var ACQ_EMPTY_TEXT = "暂无来源归因数据。来源统计仅覆盖功能上线后的有效访问触点，历史用户尚未回填。";
-
-  function setAcqEmpty(show) {
-    // 子区块只留简短提示；完整空态文案（含「历史用户尚未回填」说明）由
-    // 页级状态条统一展示一次（复核 P2：两处重复展示长文案属冗余）
-    var funnelEmpty = $("adm-acq-empty");
-    if (funnelEmpty) {
-      funnelEmpty.hidden = !show;
-      if (show) funnelEmpty.textContent = "本周期暂无来源访问记录。";
-    }
-    var usersEmpty = $("adm-acq-users-empty");
-    if (usersEmpty) {
-      usersEmpty.hidden = !show;
-      if (show) usersEmpty.textContent = "暂无已归因用户。";
-    }
-  }
-
-  // 来源页聚合加载（复核 P2 2026-08-29：三个首屏请求由协调器统一计算
-  // 页面终态——此前没有任何一处写入 ready/empty/error，生产零数据场景
-  // 永久停留「加载中…」）。语义：
-  //   - 任一请求有数据 → ready（部分失败时附 partial 提示）；
-  //   - 三组都成功且都无数据 → empty（完整说明文案只在此展示一次）；
-  //   - 全部失败 → error（含重试）。
-  function loadAcquisitionPage() {
+  function loadInvitesPage() {
     var seq = state.listSeq;
     setPageState("invites", "loading");
-    loadAcqModeCard();
     var settled = Promise.allSettled([
-      loadAcqFunnel(),
-      loadAcqUsers(false),
+      loadInviteMode(),
       loadInvites(false),
     ]);
     settled.then(function (results) {
@@ -1422,124 +1654,36 @@
         var err = results[0].reason;
         setPageState("invites", "error", {
           code: err && err.code, message: err && err.message,
-          retry: function () { loadAcquisitionPage(); },
+          retry: function () { loadInvitesPage(); },
         });
         return;
       }
-      var anyData = ok.some(function (r) { return r.value === true; });
-      if (anyData) {
-        setPageState("invites", "ready", {
-          message: "已更新（" +
-            nowText() + "）" +
-            (failed.length ? "（部分数据加载失败，可刷新重试）" : ""),
-        });
-      } else {
-        setPageState("invites", "empty", { message: ACQ_EMPTY_TEXT });
-      }
+      setPageState("invites", "ready", {
+        message: "已更新（" + nowText() + "）" +
+          (failed.length ? "（部分数据加载失败，可刷新重试）" : ""),
+      });
     });
   }
 
-  function loadAcqModeCard() {
-    // 注册模式随漏斗汇总一并返回；失败时单独给出错误卡内容
-    var dl = $("adm-acq-mode");
-    if (!dl) return;
-    dl.textContent = "";
-    kvRow(dl, "可用性", "等待漏斗汇总加载…");
+  // 注册模式只读摘要：来自 admin.settings.get（旧 acquisition summary 已删）
+  function loadInviteMode() {
+    return request("admin.settings.get", {}).then(function (settings) {
+      renderInviteMode(((settings || {}).registration || {}).mode);
+      return true;
+    }).catch(function (err) {
+      var dl = $("adm-invite-mode");
+      if (dl) { dl.textContent = ""; kvRow(dl, "可用性", errText(err)); }
+      throw err; // 交给协调器计数（partial-error 语义）
+    });
   }
 
-  function renderAcqMode(mode) {
-    var dl = $("adm-acq-mode");
+  function renderInviteMode(mode) {
+    var dl = $("adm-invite-mode");
     if (!dl) return;
     dl.textContent = "";
     kvRow(dl, "当前模式", mode || "—");
   }
 
-  function loadAcqFunnel() {
-    var seq = state.listSeq;
-    return request("admin.acquisition.summary", {}).then(function (res) {
-      if (seq !== state.listSeq) return;
-      hideError();
-      setAcqEmpty(!(res.items && res.items.length));
-      renderAcqMode(res.registration_mode);
-      var tbody = $("adm-acq-funnel-tbody");
-      if (tbody) {
-        tbody.textContent = "";
-        (res.items || []).forEach(function (row) {
-          var tr = document.createElement("tr");
-          tr.appendChild(td(row.source_code));
-          tr.appendChild(td(row.campaign_id));
-          tr.appendChild(td(row.campaign_id === null ? "—" : (row.campaign_status || "—")));
-          tr.appendChild(td(fmtNum(row.visits)));
-          tr.appendChild(td(fmtNum(row.visitors)));
-          tr.appendChild(td(fmtNum(row.registrations)));
-          tr.appendChild(td(fmtNum(row.first_ai_count)));
-          tbody.appendChild(tr);
-        });
-      }
-      var totals = $("adm-acq-totals");
-      if (totals) {
-        totals.textContent = "";
-        var t = res.totals || {};
-        kvRow(totals, "合计", "访问 " + fmtNum(t.visits) + " · 注册 " +
-              fmtNum(t.registrations) + " · 首次 AI " + fmtNum(t.first_ai_count));
-      }
-      return !!(res.items && res.items.length); // 供协调器计算终态
-    }).catch(function (err) {
-      if (seq !== state.listSeq) throw err;
-      setAcqEmpty(false); // 错误不是空状态
-      var dl = $("adm-acq-mode");
-      if (dl) { dl.textContent = ""; kvRow(dl, "可用性", errText(err)); }
-      handleErr(err, null);
-      throw err; // 交给协调器计数（partial-error 语义）
-    });
-  }
-
-  // 触点列：source/campaign + 时间（visitor 只给 hash 前缀；无完整 IP/query）
-  function acqTouchText(touch) {
-    if (!touch) return "—（无触点）";
-    var label = (touch.source_code || "?") +
-      (touch.campaign_id ? (" / " + touch.campaign_id) : "");
-    return label + "（" + fmtTs(touch.touched_at) + "）";
-  }
-
-  function loadAcqUsers(append) {
-    var seq = state.listSeq;
-    var payload = { limit: 50, cursor: append ? state.cursors.acqUsers : null };
-    var status = $("adm-acq-status");
-    return request("admin.acquisition.list", payload).then(function (res) {
-      if (seq !== state.listSeq) return;
-      hideError();
-      var usersEmpty = $("adm-acq-users-empty");
-      if (usersEmpty) usersEmpty.hidden = !!(res.items && res.items.length);
-      var tbody = $("adm-acq-users-tbody");
-      if (!tbody) return;
-      if (!append) tbody.textContent = "";
-      (res.items || []).forEach(function (u) {
-        var tr = document.createElement("tr");
-        tr.appendChild(td(u.display_name));
-        tr.appendChild(td(u.login_id_masked));
-        tr.appendChild(td(u.source_code));
-        tr.appendChild(td(u.campaign_id));
-        tr.appendChild(td(u.attribution_method));
-        tr.appendChild(td(acqTouchText(u.first_touch), "adm-cell-time"));
-        tr.appendChild(td(acqTouchText(u.last_touch), "adm-cell-time"));
-        tr.appendChild(td(fmtTs(u.attributed_at), "adm-cell-time"));
-        tbody.appendChild(tr);
-      });
-      state.cursors.acqUsers = res.next_cursor || null;
-      var more = $("adm-acq-more-btn");
-      if (more) more.disabled = !res.next_cursor;
-      setPageHint(status, res.next_cursor ? "还有更多" : "已到底");
-      return !!(res.items && res.items.length); // 供协调器计算终态
-    }).catch(function (err) {
-      if (seq === state.listSeq) handleErr(err, status);
-      throw err;
-    });
-  }
-
-  // ------------------------------------------------------------------
-  // 邀请管理（§10.3，PR5 写部分）：列表 + 创建（token 仅一次）+ 撤销。
-  // ------------------------------------------------------------------
   function inviteStatusLabel(inv) {
     if (inv.revoked_at) return "已撤销";
     if (inv.consumed_at) return "已消费";
@@ -1553,23 +1697,22 @@
     var payload = { limit: 50, cursor: append ? state.cursors.invites : null };
     var status = $("adm-invites-status");
     return request("admin.invites.list", payload).then(function (res) {
-      if (seq !== state.listSeq) return;
+      if (seq !== state.listSeq) return false;
       hideError();
       var tbody = $("adm-invites-tbody");
-      if (!tbody) return;
+      if (!tbody) return false;
       if (!append) tbody.textContent = "";
-      (res.invites || []).forEach(function (inv) {
+      var invites = res.invites || [];
+      invites.forEach(function (inv) {
         var tr = document.createElement("tr");
         tr.appendChild(td(inv.invite_id));
         tr.appendChild(td(inv.login_id_masked || "（不绑定）"));
         tr.appendChild(td(inv.ai_access ? "开" : "关"));
-        // 月额度模板（批次 D §5.2）：null=兑换继承默认；nano → CNY 精确换算
-        tr.appendChild(td(inv.monthly_limit_nano_cny === null ||
-                          inv.monthly_limit_nano_cny === undefined
-          ? "默认" : nanoToCnyString(inv.monthly_limit_nano_cny) + " CNY"));
-        tr.appendChild(td(inv.cohort));
-        tr.appendChild(td((inv.source_code || "—") +
-                          (inv.campaign_id ? (" / " + inv.campaign_id) : "")));
+        // 初始总额度模板（Batch B/D1）：null=兑换继承默认；两位小数 CNY
+        tr.appendChild(td(inv.total_limit_nano_cny === null ||
+                          inv.total_limit_nano_cny === undefined
+          ? "默认" : fmtCny(inv.total_limit_nano_cny)));
+        tr.appendChild(td(inv.note));
         tr.appendChild(td(inviteStatusLabel(inv)));
         tr.appendChild(td(fmtTs(inv.expires_at), "adm-cell-time"));
         var cell = document.createElement("td");
@@ -1584,11 +1727,14 @@
         tr.appendChild(cell);
         tbody.appendChild(tr);
       });
+      if (!append && !invites.length) {
+        setPageHint(status, "暂无邀请；可在上方「新建邀请」创建。");
+      }
       state.cursors.invites = res.next_cursor || null;
       var more = $("adm-invites-more-btn");
       if (more) more.disabled = !res.next_cursor;
       setPageHint(status, res.next_cursor ? "还有更多" : "已到底");
-      return !!(res.invites && res.invites.length); // 供协调器计算终态
+      return invites.length > 0;
     }).catch(function (err) {
       if (seq === state.listSeq) handleErr(err, status);
       throw err;
@@ -1617,43 +1763,39 @@
     var ttlRaw = $("adm-invite-ttl") ? $("adm-invite-ttl").value : "";
     var ai = $("adm-invite-ai") ? !!$("adm-invite-ai").checked : false;
     var limitText = ($("adm-invite-limit") && $("adm-invite-limit").value || "").trim();
-    var cohort = ($("adm-invite-cohort") && $("adm-invite-cohort").value || "").trim();
     var note = ($("adm-invite-note") && $("adm-invite-note").value || "").trim();
-    var source = ($("adm-invite-source") && $("adm-invite-source").value || "").trim();
-    var campaign = ($("adm-invite-campaign") && $("adm-invite-campaign").value || "").trim();
-    var ttl = parseInt(ttlRaw, 10);
-    if (!ttl || ttl < 1 || ttl > 720) {
-      // §4.4：校验失败保留输入与焦点
+    var ttlHours = parseInt(ttlRaw, 10);
+    if (!ttlHours || ttlHours < 1 || ttlHours > 720) {
       markInvalid($("adm-invite-ttl"), "有效期需为 1–720 小时",
         "adm-invite-create-status");
       return;
     }
-    var payload = { ttl_hours: ttl, ai_access: ai };
-    // 批次 D §5.2：可选月额度模板（兑换时同事务为新用户建 override）
+    // 新契约（§3.4）：{login_id?, ttl_seconds?, ai_access, total_limit_nano_cny?, note?}
+    // ——不再有 source_code/campaign_id/cohort/monthly_limit_nano_cny。
+    var payload = {
+      ttl_seconds: ttlHours * 3600,
+      ai_access: ai,
+    };
     if (limitText) {
       var limit = cnyToNano(limitText);
       if (limit === null) {
         markInvalid($("adm-invite-limit"),
-          "月额度模板非法（CNY，最多 9 位小数，如 20 或 12.5）",
+          "初始总额度非法（CNY，最多 9 位小数，如 20 或 12.5）",
           "adm-invite-create-status");
         return;
       }
-      payload.monthly_limit_nano_cny = limit;
+      payload.total_limit_nano_cny = limit;
     }
     if (loginId) payload.login_id = loginId;
-    if (cohort) payload.cohort = cohort;
     if (note) payload.note = note;
-    if (source) payload.source_code = source;
-    if (campaign) payload.campaign_id = campaign;
     setStatus("adm-invite-create-status", "创建中…");
     request("admin.invites.create", payload).then(function (res) {
       setStatus("adm-invite-create-status",
         "已创建 " + ((res && res.invite && res.invite.invite_id) || "?") +
         "；明文邀请码只显示这一次：");
       showInviteTokenOnce((res && res.invite && res.invite.token) || "");
-      ["adm-invite-login", "adm-invite-limit", "adm-invite-cohort",
-       "adm-invite-note", "adm-invite-source", "adm-invite-campaign"].forEach(
-        function (id) {
+      ["adm-invite-login", "adm-invite-limit", "adm-invite-note"]
+        .forEach(function (id) {
           var el = $(id);
           if (el) el.value = "";
         });
@@ -1665,15 +1807,20 @@
   }
 
   // ------------------------------------------------------------------
-  // 设置（§6.1，批次 D）：注册模式 + 金额策略 + enforcement + 运行时安全
-  // 参数 + 「调整当前窗口」（独立按钮 + 二次确认 + 影响展示）。
-  // 金额输入（CNY）→ wire 十进制字符串（cnyToNano/nanoToCnyString 全程
-  // BigInt，>2^53 不失真）；策略额度更新携带 CAS（policy_id + version）。
+  // 设置（§6.1 批次 D + wave 2 §4.5）：注册模式 + 消费额度策略（三键拆分）+
+  // enforcement + 运行时安全参数 + Demo/Owner「立即调整当前周期」。
+  // 金额输入（CNY）→ wire 十进制字符串（cnyToNano 全程 BigInt，禁 float）。
   // ------------------------------------------------------------------
+  // 三键拆分（Batch B）：user 默认额度键改为 user_default_total_limit；
+  // 回显值只读 spend 响应的新键（*_nano_cny）；CAS 上下文（policy_id+version）
+  // 短期仍从 policies 兼容字段读取——缺上下文拒绝保存（不盲写）。
   var SPEND_POLICY_FIELDS = [
-    ["adm-spend-demo-week", "demo_global", "demo_weekly_limit"],
-    ["adm-spend-user-month", "user_default", "user_default_monthly_limit"],
-    ["adm-spend-owner-month", "owner", "owner_monthly_limit"],
+    ["adm-spend-user-total", "user_default", "user_default_total_limit",
+     "user_default_total_limit_nano_cny"],
+    ["adm-spend-demo-week", "demo_global", "demo_weekly_limit",
+     "demo_weekly_limit_nano_cny"],
+    ["adm-spend-owner-month", "owner", "owner_monthly_limit",
+     "owner_monthly_limit_nano_cny"],
   ];
 
   function settingsUpdateResult(res, statusId, okText) {
@@ -1694,8 +1841,6 @@
   function loadSettingsPage() {
     setPageState("settings", "loading");
     var seq = state.listSeq;
-    // 2026-09-01 金额简化 §5.5：不再拉用户列表拼「调整当前窗口」主体下拉；
-    // 当前周期的立即调整只针对 Demo / Owner 两个固定主体
     request("admin.settings.get", {}).then(function (settings) {
       if (seq !== state.listSeq) return;
       hideError();
@@ -1729,10 +1874,8 @@
     } else if (w.error) {
       kvRow(dl, "可用性", "不可用（" + w.error + "）");
     } else {
-      // 行首已是「剩余」标签，值直接给数字（短文案的「剩余 X CNY」给抽屉/列表用）
       kvRow(dl, "额度", fmtCny(w.limit_nano_snapshot));
-      kvRow(dl, "剩余",
-        fmtCny(w.remaining_nano));
+      kvRow(dl, "剩余", fmtCny(w.remaining_nano));
     }
     card.appendChild(dl);
     return card;
@@ -1745,7 +1888,7 @@
     if (!sel || !warn) return;
     if (sel.value === "registered") {
       warn.hidden = false;
-      warn.textContent = "警示：registered 将对注册用户开启金额硬拒绝（额度/余额不足时 provider 调用被拒）。切换写审计、可切回 shadow；只应在金额硬闸验收后执行。";
+      warn.textContent = "警示：registered 将对注册用户开启金额硬拒绝（额度不足时 provider 调用被拒）。切换写审计、可切回 shadow；只应在金额硬闸验收后执行。";
     } else if (sel.value === "all") {
       warn.hidden = false;
       warn.textContent = "警示：all 将连 Demo 一起开启金额硬拒绝（Demo 调用同样会被拒）。切换写审计、可切回 shadow；只应在金额硬闸验收后执行。";
@@ -1772,20 +1915,19 @@
       kvRow(regDl, "支持的模式", (reg.supported_modes || []).join(" / ") +
         "（public 本阶段不支持）");
     }
-    // 金额策略卡
+    // 消费额度策略卡（三键拆分）
     var spend = settings.spend || {};
     var modeSelect = $("adm-spend-mode");
     if (spend.available !== false) {
       if (modeSelect) modeSelect.value = spend.enforcement_mode || "shadow";
-      SPEND_POLICY_FIELDS.forEach(function (pair) {
-        var el = $(pair[0]);
-        var policy = (spend.policies || {})[pair[1]];
-        if (el && policy && policy.limit_nano_cny !== null &&
-            policy.limit_nano_cny !== undefined) {
-          el.value = nanoToCnyString(policy.limit_nano_cny);
-        } else if (el && !policy) {
+      SPEND_POLICY_FIELDS.forEach(function (quadruple) {
+        var el = $(quadruple[0]);
+        // 回显只读新键（旧 policies 字段短期仍在，但不再用于回显）
+        var v = spend[quadruple[3]];
+        if (el && v !== null && v !== undefined && v !== "") {
+          el.value = nanoToCnyString(v);
+        } else if (el) {
           el.value = "";
-          el.placeholder = "（无有效策略：" + pair[1] + "）";
         }
       });
     }
@@ -1797,24 +1939,19 @@
       } else {
         kvRow(spendDl, "enforcement 模式", spend.enforcement_mode +
           "（registered/all 只应在金额硬闸验收后切换）");
-        SPEND_POLICY_FIELDS.forEach(function (pair) {
-          var policy = (spend.policies || {})[pair[1]];
-          kvRow(spendDl, pair[1] + " 策略", policy
-            ? ("额度 " + fmtCny(policy.limit_nano_cny) + "；版本 v" +
-               policy.version + "；生效自 " + fmtTs(policy.effective_from))
-            : "无有效策略（fail-closed）");
+        SPEND_POLICY_FIELDS.forEach(function (quadruple) {
+          var v = spend[quadruple[3]];
+          kvRow(spendDl, quadruple[1] + " 额度",
+            (v !== null && v !== undefined && v !== "")
+              ? fmtCny(v) : "未设置");
         });
         var bounds = spend.next_window_bounds || {};
         kvRow(spendDl, "Demo 下个周期边界",
           bounds.demo_week ? (fmtTs(bounds.demo_week[0]) + " → " +
                               fmtTs(bounds.demo_week[1])) : "—");
-        kvRow(spendDl, "用户月度下个周期边界",
-          bounds.user_month ? (fmtTs(bounds.user_month[0]) + " → " +
-                               fmtTs(bounds.user_month[1])) : "—");
       }
     }
-    // §5.5：当前 demo/owner 窗口拆成小型摘要卡（只回答额度/剩余）；
-    // 立即调整入口在金额策略卡里各自折叠的「立即调整当前周期」
+    // §5.5：当前 demo/owner 窗口拆成小型摘要卡（只回答额度/剩余）
     var grid = $("adm-window-summaries");
     if (grid) {
       grid.textContent = "";
@@ -1829,21 +1966,18 @@
     if (spendRaw) {
       spendRaw.textContent = "";
       if (spend.available !== false) {
-        var policyRows = [];
-        SPEND_POLICY_FIELDS.forEach(function (pair) {
-          var policy = (spend.policies || {})[pair[1]];
-          if (policy) {
-            policyRows.push([pair[1] + ".limit_nano_cny", policy.limit_nano_cny]);
-          }
+        var rawRows = SPEND_POLICY_FIELDS.map(function (quadruple) {
+          return [quadruple[3], spend[quadruple[3]]];
+        }).filter(function (row) {
+          return row[1] !== null && row[1] !== undefined && row[1] !== "";
         });
-        if (policyRows.length) spendRaw.appendChild(rawValuesDetails(policyRows));
+        if (rawRows.length) spendRaw.appendChild(rawValuesDetails(rawRows));
       }
     }
     updateEnforcementWarning();
-    // 记录「加载时回显值」：保存只提交被修改的字段（未改字段沿用现值——
-    // 与 turn 预算编辑器「未填沿用现值」同一语义；预填表单不能每次全量提交）
-    SPEND_POLICY_FIELDS.forEach(function (pair) {
-      var el = $(pair[0]);
+    // 记录「加载时回显值」：保存只提交被修改的字段
+    SPEND_POLICY_FIELDS.forEach(function (quadruple) {
+      var el = $(quadruple[0]);
       if (el && el.setAttribute) {
         el.setAttribute("data-loaded", String(el.value || "").trim());
       }
@@ -1854,9 +1988,10 @@
     if (rt.available !== false) {
       var limits = rt.limits || {};
       if (demoEnabled) demoEnabled.checked = !!limits.demo_enabled;
+      // 自带 API 步数上限（own_task_max_steps_limit）已从 UI 移除
+      //（后端字段兼容保留）；注册用户步数字段统一 1..500。
       [["adm-rt-psteps", "platform_task_max_steps"],
        ["adm-rt-demosteps", "demo_task_max_steps"],
-       ["adm-rt-ownsteps", "own_task_max_steps_limit"],
        ["adm-rt-concurrency", "demo_max_concurrency"]].forEach(
         function (pair) {
           var el = $(pair[0]);
@@ -1871,7 +2006,6 @@
       if (rt.available === false) {
         kvRow(rtDl, "可用性", "不可用（" + (rt.code || "pg_backend_required") + "）");
       } else {
-        // 批次 E 起：IP 保护为每分钟请求数短窗口（防刷/防 DoS，env 配置只读）
         kvRow(rtDl, "Demo IP 短窗口请求速率（只读，env 配置）",
           rt.demo_ip_request_rate_per_minute + " 次 / " +
           Math.round((rt.demo_ip_request_rate_window_seconds || 60) / 60) +
@@ -1899,13 +2033,13 @@
   function saveSpendPolicies() {
     var spend = (state.settingsSnapshot || {}).spend || {};
     if (spend.available === false) {
-      setStatus("adm-spend-status", "金额策略要求 PostgreSQL 后端");
+      setStatus("adm-spend-status", "额度策略要求 PostgreSQL 后端");
       return;
     }
     var payload = {};
     try {
-      SPEND_POLICY_FIELDS.forEach(function (pair) {
-        var el = $(pair[0]);
+      SPEND_POLICY_FIELDS.forEach(function (quadruple) {
+        var el = $(quadruple[0]);
         var text = el ? String(el.value || "").trim() : "";
         if (!text) return;
         // 未修改的字段沿用现值（与加载回显一致时不重复提交）
@@ -1913,13 +2047,30 @@
         if (text === loaded) return;
         var limit = cnyToNano(text);
         if (limit === null) {
-          throw { message: pair[1] + " 金额非法（CNY，最多 9 位小数）" };
+          throw { message: quadruple[1] + " 金额非法（CNY，最多 9 位小数）" };
         }
-        var policy = (spend.policies || {})[pair[1]];
+        // CAS 上下文：demo/owner 来自 policies 兼容字段（policy_id+version）；
+        // user 默认总额度来自 settings 响应扁平新键（source=total_defaults →
+        // 专用单例端点；source=user_default_policy → policies 兼容路径）。
+        // 缺上下文拒绝保存，绝不盲写
+        if (quadruple[1] === "user_default") {
+          var udVersion = spend.user_default_total_limit_version;
+          if (udVersion === null || udVersion === undefined) {
+            throw { message: quadruple[1] + " 缺少默认总额度 CAS 上下文，无法更新额度（请刷新后重试）" };
+          }
+          payload[quadruple[2]] = {
+            limit_nano_cny: limit,
+            version: udVersion,
+            source: spend.user_default_total_limit_source || "user_default_policy",
+            policy_id: spend.user_default_total_policy_id || undefined,
+          };
+          return;
+        }
+        var policy = (spend.policies || {})[quadruple[1]];
         if (!policy || !policy.policy_id) {
-          throw { message: pair[1] + " 无有效策略，无法更新额度" };
+          throw { message: quadruple[1] + " 缺少策略 CAS 上下文，无法更新额度（请刷新后重试）" };
         }
-        payload[pair[2]] = {
+        payload[quadruple[2]] = {
           policy_id: policy.policy_id,
           version: policy.version,
           limit_nano_cny: limit,
@@ -1942,7 +2093,7 @@
     setStatus("adm-spend-status", "保存中…");
     var doSave = function () {
       request("admin.settings.update", payload).then(function (res) {
-        settingsUpdateResult(res, "adm-spend-status", "金额策略已提交");
+        settingsUpdateResult(res, "adm-spend-status", "额度策略已提交");
         loadSettingsPage();
       }).catch(function (err) {
         showError(err && err.code, err && err.message);
@@ -1954,8 +2105,8 @@
       askConfirm($("adm-spend-confirm"),
         "确认把金额 enforcement 模式从 " + spend.enforcement_mode +
         " 切换为 " + payload.spend_enforcement_mode +
-        "？该操作开启金额硬拒绝（余额不足时 provider 调用被拒），" +
-        "只应在批次 C2 验收后执行；切换写审计，可切回 shadow。",
+        "？该操作开启金额硬拒绝（额度不足时 provider 调用被拒），" +
+        "只应在金额硬闸验收后执行；切换写审计，可切回 shadow。",
         doSave);
       return;
     }
@@ -1970,19 +2121,21 @@
     }
     var payload = {};
     try {
-      [["adm-rt-psteps", "platform_task_max_steps"],
-       ["adm-rt-demosteps", "demo_task_max_steps"],
-       ["adm-rt-ownsteps", "own_task_max_steps_limit"],
-       ["adm-rt-concurrency", "demo_max_concurrency"]].forEach(
-        function (pair) {
-          var el = $(pair[0]);
+      // 注册用户单任务安全上限：1..500（默认/最高 500；>100 为异常长任务
+      // 观测线，500 为安全暂停线；消费额度由总金额控制）。
+      // Demo 步数/并发沿用各自现有边界；自带 API 步数上限已从 UI 移除。
+      [["adm-rt-psteps", "platform_task_max_steps", 1, 500],
+       ["adm-rt-demosteps", "demo_task_max_steps", 1, 1000000],
+       ["adm-rt-concurrency", "demo_max_concurrency", 1, 1000000]].forEach(
+        function (triple) {
+          var el = $(triple[0]);
           var raw = el ? String(el.value || "").trim() : "";
           if (!raw) return;
           var v = Number(raw);
-          if (!Number.isSafeInteger(v) || v < 1 || v > 1000000) {
-            throw { message: pair[1] + " 需为 1–1000000 整数" };
+          if (!Number.isSafeInteger(v) || v < triple[2] || v > triple[3]) {
+            throw { message: triple[1] + " 需为 " + triple[2] + "–" + triple[3] + " 整数" };
           }
-          payload[pair[1]] = v;
+          payload[triple[1]] = v;
         });
     } catch (e) {
       setStatus("adm-rt-status", (e && e.message) || "参数输入非法");
@@ -2001,17 +2154,16 @@
   }
 
   // ------------------------------------------------------------------
-  // 「立即调整当前周期」（2026-09-01 金额简化 §5.5）：主体固定 Demo / Owner，
-  // 调用同一个 admin.spend.currentWindow.adjust（window_id + limit CAS）。
-  // 不再枚举普通用户——单个用户的月额度改用其详情抽屉。
+  // 「立即调整当前周期」（§5.5）：主体固定 Demo / Owner，调用同一个
+  // admin.spend.currentWindow.adjust（window_id + limit CAS）。
   // ------------------------------------------------------------------
 
   // 剩余金额的确认条用语（确认条允许细节，但不输出长拒绝说明）
   function remainingPhrase(nanoStr) {
     var b = BigInt(nanoStr);
-    if (b < 0n) return "超支 " + nanoToCnyString((-b).toString()) + " CNY";
-    if (b === 0n) return "0 CNY（已用尽）";
-    return nanoToCnyString(b.toString()) + " CNY";
+    if (b < 0n) return "超支 " + fmtCny((-b).toString());
+    if (b === 0n) return "0.00 CNY（已用尽）";
+    return fmtCny(b.toString());
   }
 
   function adjustFixedWindow(subjectKey) {
@@ -2022,7 +2174,7 @@
     var label = isDemo ? "Demo（全站共享周窗口）" : "Owner（月窗口）";
     var spend = (state.settingsSnapshot || {}).spend || {};
     if (spend.available === false) {
-      setStatus(statusId, "金额策略要求 PostgreSQL 后端");
+      setStatus(statusId, "额度策略要求 PostgreSQL 后端");
       return;
     }
     var w = (spend.current_windows || {})[subjectKey];
@@ -2040,10 +2192,9 @@
                         BigInt(w.reserved_nano_cny)).toString();
     askConfirm($(confirmId),
       "确认调整 " + label + " 的当前周期额度？" +
-      "当前额度 " + nanoToCnyString(w.limit_nano_snapshot) + " CNY → 新额度 " +
-      nanoToCnyString(limit) + " CNY（" + limit + " nano）。影响：已消费 " +
-      nanoToCnyString(w.spent_nano_cny) + " / 预占 " +
-      nanoToCnyString(w.reserved_nano_cny) + " 不回退；新剩余 " +
+      "当前额度 " + fmtCny(w.limit_nano_snapshot) + " → 新额度 " + fmtCny(limit) +
+      "（" + limit + " nano）。影响：已消费 " + fmtCny(w.spent_nano_cny) +
+      " / 预占 " + fmtCny(w.reserved_nano_cny) + " 不回退；新剩余 " +
       remainingPhrase(newRemaining) + "。操作立即生效并写审计，不等下个窗口。",
       function () {
         setStatus(statusId, "调整中…");
@@ -2071,370 +2222,460 @@
   }
 
   // ------------------------------------------------------------------
-  // 额度与账单（§10.4 + 2026-09-01 金额简化 §5.7）：低频运维页。
-  // 第一屏只留供应商余额 + 人工调整；用量明细/账本/turn legacy 等运维明细
-  // 默认折叠，首次展开（toggle）才发对应请求。
+  // 费用页（§4.6 wave 2）：KPI → [仅异常]计费异常条 → Demo 消耗卡 →
+  // 费用明细（三个页内标签、单一内容区、只有当前标签发请求）。
   // ------------------------------------------------------------------
-  var BILLING_LAZY_BOXES = [
-    ["adm-billing-usage-box", function () { loadUsage(false); loadUnpriced(false); }],
-    ["adm-billing-ledger-box", function () { loadLedger(false); }],
-    ["adm-turn-legacy-card", function () { loadTurnBudgetCard(); }],
-  ];
-
-  // 折叠区首次打开才加载；进入页面时已处于展开状态的区块也补一次加载
-  function ensureOpenBillingDetailsLoaded() {
-    BILLING_LAZY_BOXES.forEach(function (plan) {
-      var box = $(plan[0]);
-      if (box && box.open) plan[1]();
-    });
-  }
+  var BILL_TABS = ["usage", "ledger", "unpriced"];
+  var billTab = "usage";
+  // 标签激活代际：每次切换 ++；迟到的旧标签响应按代际丢弃（§4.6：
+  // 切换标签时取消/忽略旧请求结果，防止迟到响应覆盖当前视图）
+  var billTabSeq = 0;
 
   function loadBillingPage() {
     setPageState("billing", "loading");
     var seq = state.listSeq;
-    loadLegacyPricingCard();
-    loadProviderBalanceCard().then(function () {
+    state.billOverview = null;
+    state.billProviderBalance = null;
+    state.billProviderBalanceError = null;
+    state.billDemo = null;
+    // 页内标签复位到「模型调用」，并激活（触发首屏请求）
+    setBillingTab("usage");
+    var settled = Promise.allSettled([
+      loadBillOverview(),
+      loadProviderBalanceCard(),
+      loadDemoStats("current"),
+    ]);
+    settled.then(function (results) {
       if (seq !== state.listSeq) return;
-      setPageState("billing", "ready", {
-        message: "已更新（" + nowText() + "）",
+      var ok = [], failed = [];
+      results.forEach(function (r) {
+        (r.status === "fulfilled" ? ok : failed).push(r);
       });
-      ensureOpenBillingDetailsLoaded();
-    }, function (err) {
-      if (seq !== state.listSeq) return;
-      setPageState("billing", "error", {
-        code: err && err.code, message: err && err.message,
-        retry: function () { loadBillingPage(); },
-      });
-    });
-  }
-
-  // 批次 A 遗留口径（§7.2）：cutover 前旧错误价格的影子数据单独标记展示，
-  // 不与修复后的金额混排；legacy_priced_events=0 时隐藏整卡。
-  function loadLegacyPricingCard() {
-    request("admin.overview.get", {}).then(function (ov) {
-      var b = ov && ov.billing;
-      var card = $("adm-legacy-card");
-      var dl = $("adm-legacy-info");
-      if (!card || !dl) return;
-      var legacyCount = b ? Number(b.legacy_priced_events || 0) : 0;
-      if (!b || b.available === false || legacyCount === 0) {
-        card.hidden = true;
-        return;
-      }
-      card.hidden = false;
-      dl.textContent = "";
-      kvRow(dl, "legacy 计价事件数（cutover 前）", String(legacyCount));
-      kvRow(dl, "价格 cutover 时间",
-        b.pricing_cutover_epoch ? fmtTs(b.pricing_cutover_epoch) : "—");
-      kvRow(dl, "口径", b.legacy_pricing_note ||
-        "legacy pricing scale invalid; excluded from hard enforcement");
-    }).catch(function () {
-      var card = $("adm-legacy-card");
-      if (card) card.hidden = true;
-    });
-  }
-
-  // 批次 F：turn 消费闸退役——本卡降级为只读 legacy 展示（GET 冻结历史）；
-  // 编辑/保存/开新周期的桥方法已删除（服务端写端点 410 turn_budgets_
-  // retired），仅保留只读 get。
-  function loadTurnBudgetCard() {
-    var dl = $("adm-billing-turn");
-    request("admin.turnBudgets.get", {}).then(function (res) {
-      hideError();
-      if (!dl) return;
-      dl.textContent = "";
-      var period = res.period || {};
-      var usage = res.usage || {};
-      kvRow(dl, "状态", "已退役（金额预算接管）");
-      kvRow(dl, "周期", "#" + fmtNum(period.id) + "（" + fmtTs(period.started_at) + " 起）");
-      kvRow(dl, "平台（用/上限）",
-            fmtNum(usage.platform && usage.platform.total) + " / " +
-            fmtNum(usage.platform && usage.platform.limit));
-      kvRow(dl, "用户共享池（用/上限）",
-            fmtNum(usage.user_pool && usage.user_pool.total) + " / " +
-            fmtNum(usage.user_pool && usage.user_pool.limit));
-      kvRow(dl, "Demo（24h 窗口/日上限）",
-            fmtNum(usage.demo && usage.demo.total) + " / " + fmtNum(usage.demo && usage.demo.limit));
-      kvRow(dl, "owner 保留池（用/保留）",
-            fmtNum(usage.owner && usage.owner.total) + " / " +
-            fmtNum(usage.owner && usage.owner.reserved_limit));
-      var per = (usage.per_user || []).length;
-      kvRow(dl, "本周期有用量的用户数", fmtNum(per));
-    }).catch(function (err) {
-      if (dl) { dl.textContent = ""; kvRow(dl, "可用性", errText(err)); }
-      else handleErr(err, null);
-    });
-  }
-
-  // ------------------------------------------------------------------
-  // 金额账户管理（§10.4，PR5）：caps 编辑器（版本 CAS）+ 人工调整。
-  // 当前查询到的账户缓存在内存 state.account（含 version，供 CAS 提交）。
-  // ------------------------------------------------------------------
-  // 调用方生成幂等键（§6.5 PR5 修订：服务端不再代生成）：16 字节随机 →
-  // "adj_" + 32 hex。用 crypto.getRandomValues（opaque sandbox 内可用），
-  // 不依赖 randomUUID 的 secure-context 假设；熵源缺失时宁可拒绝提交也
-  // 不退化为 Math.random（弱 key 会破坏「重试不重复入账」保证）。
-  function newAdjustIdemKey() {
-    var cryptoObj = window.crypto;
-    if (!cryptoObj || typeof cryptoObj.getRandomValues !== "function") {
-      return null;
-    }
-    var buf = new Uint8Array(16);
-    cryptoObj.getRandomValues(buf);
-    var hex = "";
-    for (var i = 0; i < buf.length; i++) {
-      hex += ("0" + buf[i].toString(16)).slice(-2);
-    }
-    return "adj_" + hex;
-  }
-
-  // 当前调整表单指纹：任一字段变化即视为新的逻辑提交（换新幂等键）
-  function adjustFingerprint(uid, kind, amount, reason) {
-    return [uid, kind, amount, reason].join("\u0000");
-  }
-
-  // §4.5：人工调整区只有在成功查询到目标用户后才启用；user_id 输入变化必须
-  // 使旧查询失效并再次禁用（防止对旧主体误操作）。account:null 的已存在用户
-  // 也允许启用（首次 grant/topup 会自动开户）。服务端仍是权威校验。
-  function setAdjustZoneEnabled(on) {
-    ["adm-adjust-kind", "adm-adjust-amount", "adm-adjust-reason", "adm-adjust-btn"]
-      .forEach(function (id) {
-        var el = $(id);
-        if (el) el.disabled = !on;
-      });
-  }
-
-  function invalidateAccountLookup() {
-    state.account = null;
-    state.adjustIdem = null;
-    state.adjustFingerprint = null;
-    setAdjustZoneEnabled(false);
-    clearConfirm($("adm-adjust-confirm"));
-    var dl = $("adm-acct-info");
-    if (dl) dl.textContent = "";
-    var rawBox = $("adm-acct-raw");
-    if (rawBox) rawBox.textContent = "";
-    var capsForm = $("adm-caps-form");
-    if (capsForm) capsForm.hidden = true;
-  }
-
-  function loadBillingAccount() {
-    var uid = ($("adm-acct-user") && $("adm-acct-user").value || "").trim();
-    var dl = $("adm-acct-info");
-    if (!uid) {
-      setStatus("adm-caps-status", "请输入 user_id");
-      return;
-    }
-    request("admin.billing.account.get", { user_id: uid }).then(function (res) {
-      hideError();
-      state.account = { user_id: uid, account: res.account || null,
-                        balance_nano: res.balance_nano };
-      // 查询成功（含 account:null）即允许人工调整（grant/topup 自动开户）
-      setAdjustZoneEnabled(true);
-      if (!dl) return;
-      dl.textContent = "";
-      var rawBox = $("adm-acct-raw");
-      if (rawBox) rawBox.textContent = "";
-      if (!res.account) {
-        kvRow(dl, "user_id", uid);
-        kvRow(dl, "账户", "尚未开户（account:null；首次 grant/topup 会自动开户）");
-        var closedForm = $("adm-caps-form");
-        if (closedForm) closedForm.hidden = true;
-        return;
-      }
-      var acct = res.account;
-      kvRow(dl, "user_id", uid);
-      kvRow(dl, "account_id", acct.account_id);
-      kvRow(dl, "状态", acct.status);
-      kvRow(dl, "version", acct.version);
-      kvRow(dl, "余额", fmtCny(res.balance_nano));
-      kvRow(dl, "当前 soft cap",
-            acct.soft_spend_cap_nano === null ? "（未设置）"
-            : fmtCny(acct.soft_spend_cap_nano));
-      kvRow(dl, "当前 hard cap",
-            acct.hard_spend_cap_nano === null ? "（未设置）"
-            : fmtCny(acct.hard_spend_cap_nano));
-      if (rawBox) {
-        rawBox.appendChild(rawValuesDetails([
-          ["balance_nano", res.balance_nano],
-          ["soft_spend_cap_nano", acct.soft_spend_cap_nano],
-          ["hard_spend_cap_nano", acct.hard_spend_cap_nano],
-        ]));
-      }
-      var capsForm = $("adm-caps-form");
-      if (capsForm) capsForm.hidden = false;
-      var softInput = $("adm-caps-soft");
-      var hardInput = $("adm-caps-hard");
-      if (softInput) {
-        softInput.value = acct.soft_spend_cap_nano === null
-          ? "" : nanoToCnyString(acct.soft_spend_cap_nano);
-      }
-      if (hardInput) {
-        hardInput.value = acct.hard_spend_cap_nano === null
-          ? "" : nanoToCnyString(acct.hard_spend_cap_nano);
-      }
-    }).catch(function (err) {
-      state.account = null;
-      setAdjustZoneEnabled(false);
-      if (dl) { dl.textContent = ""; kvRow(dl, "可用性", errText(err)); }
-      else handleErr(err, null);
-    });
-  }
-
-  function saveCaps() {
-    var acctState = state.account;
-    if (!acctState || !acctState.account) {
-      setStatus("adm-caps-status", "请先查询已开户用户");
-      return;
-    }
-    var softText = ($("adm-caps-soft") && $("adm-caps-soft").value || "").trim();
-    var hardText = ($("adm-caps-hard") && $("adm-caps-hard").value || "").trim();
-    // 留空 = 清除该上限（null）；填值按 CNY 字符串精确换算 nano（禁 float）
-    var soft = softText ? cnyToNano(softText) : null;
-    var hard = hardText ? cnyToNano(hardText) : null;
-    if (softText && soft === null) {
-      setStatus("adm-caps-status", "soft cap 金额非法（最多 9 位小数，如 12.5）");
-      return;
-    }
-    if (hardText && hard === null) {
-      setStatus("adm-caps-status", "hard cap 金额非法（最多 9 位小数，如 12.5）");
-      return;
-    }
-    if (soft !== null && hard !== null && BigInt(soft) > BigInt(hard)) {
-      setStatus("adm-caps-status", "soft cap 不可大于 hard cap（客户端拦截；服务端同样校验）");
-      return;
-    }
-    setStatus("adm-caps-status", "保存中…");
-    request("admin.billing.account.updateCaps", {
-      user_id: acctState.user_id,
-      soft_cap_nano_cny: soft,
-      hard_cap_nano_cny: hard,
-      version: acctState.account.version,
-    }).then(function (res) {
-      setStatus("adm-caps-status",
-        "已保存（新 version " + ((res && res.account && res.account.version) || "?") + "）");
-      loadBillingAccount();
-    }).catch(function (err) {
-      if (err && err.code === "version_conflict") {
-        setStatus("adm-caps-status",
-          "数据已被他人修改（409 version_conflict），请重新查询后重填");
-      } else {
-        setStatus("adm-caps-status", errText(err));
-      }
-      showError(err && err.code, err && err.message);
-    });
-  }
-
-  function submitAdjustment() {
-    var uid = ($("adm-acct-user") && $("adm-acct-user").value || "").trim();
-    if (!uid) { setStatus("adm-adjust-status", "请先在上方输入 user_id"); return; }
-    // §4.5：客户端预检「已查询且查询结果仍对应当前 user_id」；服务端仍是权威
-    if (!state.account || state.account.user_id !== uid) {
-      setStatus("adm-adjust-status", "请先查询该 user_id 的账户（调整区未启用）");
-      return;
-    }
-    var kind = $("adm-adjust-kind") ? $("adm-adjust-kind").value : "";
-    var amountText = ($("adm-adjust-amount") && $("adm-adjust-amount").value || "").trim();
-    var reason = ($("adm-adjust-reason") && $("adm-adjust-reason").value || "").trim();
-    var amount = amountText ? cnyToNano(amountText) : null;
-    if (amount === null) {
-      setStatus("adm-adjust-status",
-        "金额非法：最多 9 位小数的 CNY 数值（如 12.5；manual_adjustment 可为负）");
-      return;
-    }
-    if (kind !== "manual_adjustment" && BigInt(amount) <= 0n) {
-      setStatus("adm-adjust-status", kind + " 金额必须为正数");
-      return;
-    }
-    if (!reason) {
-      setStatus("adm-adjust-status", "原因必填（≤500 字符）");
-      return;
-    }
-    // 幂等键生命周期（§6.5 PR5 修订，调用方生成）：
-    //   - 表单指纹与上次不同（首次提交或用户改过任一字段）→ 换新 key；
-    //   - 指纹相同（同一逻辑提交的失败重试）→ 复用旧 key，服务端按 duplicate
-    //     幂等重放，绝不二次入账；
-    //   - 成功后清空，下次提交重新生成。
-    var fingerprint = adjustFingerprint(uid, kind, amount, reason);
-    if (!state.adjustIdem || state.adjustFingerprint !== fingerprint) {
-      var fresh = newAdjustIdemKey();
-      if (!fresh) {
-        setStatus("adm-adjust-status",
-          "浏览器不支持 crypto.getRandomValues，无法生成幂等键（拒绝提交以防重复入账）");
-        return;
-      }
-      state.adjustIdem = fresh;
-      state.adjustFingerprint = fingerprint;
-    }
-    var idemKey = state.adjustIdem;
-    askConfirm($("adm-adjust-confirm"),
-      "确认对用户 " + uid + " 入账 " + kind + " " + amountText + " CNY（" +
-      amount + " nano）？原因：" + reason,
-      function () {
-        setStatus("adm-adjust-status", "提交中…（失败后可直接重试：将复用同一幂等键，不会重复入账）");
-        request("admin.billing.adjust", {
-          user_id: uid, kind: kind,
-          amount_nano_cny: amount, reason: reason,
-          idempotency_key: idemKey,
-        }).then(function (res) {
-          // 成功：作废当前 key（下次提交是新的逻辑操作，换新 key）
-          state.adjustIdem = null;
-          state.adjustFingerprint = null;
-          setStatus("adm-adjust-status",
-            (res && res.duplicate ? "幂等重放（未重复入账）" : "已入账") +
-            "：" + ((res && res.entry && res.entry.kind) || kind) + " " +
-            fmtCny((res && res.entry && res.entry.amount_nano_cny) || amount) +
-            "，余额 " + fmtCny(res && res.balance_nano));
-          if ($("adm-adjust-amount")) $("adm-adjust-amount").value = "";
-          if ($("adm-adjust-reason")) $("adm-adjust-reason").value = "";
-          loadBillingAccount();
-          loadLedger(false);
-        }).catch(function (err) {
-          // 失败：保留 key + 指纹 → 用户重试（表单未动）时复用同一幂等键
-          setStatus("adm-adjust-status",
-            errText(err) + "（重试将使用同一幂等键，不会重复入账）");
-          showError(err && err.code, err && err.message);
+      if (!ok.length) {
+        var err = results[0].reason;
+        setPageState("billing", "error", {
+          code: err && err.code, message: err && err.message,
+          retry: function () { loadBillingPage(); },
         });
+        return;
+      }
+      setPageState("billing", "ready", {
+        message: "已更新（" + nowText() + "）" +
+          (failed.length ? "（部分数据加载失败，可刷新重试）" : ""),
+      });
+    });
+  }
+
+  // KPI 聚合（overview 已有聚合 + 供应商余额 + Demo 周统计；禁止逐用户拼表）
+  function loadBillOverview() {
+    return request("admin.overview.get", {}).then(function (ov) {
+      state.billOverview = ov || {};
+      renderBillKpis();
+      renderBillAlert();
+      return true;
+    });
+  }
+
+  function renderBillKpis() {
+    var wrap = $("adm-bill-kpis");
+    if (!wrap) return;
+    wrap.textContent = "";
+    var b = (state.billOverview || {}).billing || {};
+    // 供应商余额
+    var pb = state.billProviderBalance;
+    if (pb && pb.snapshot) {
+      wrap.appendChild(kpiCard("供应商余额", fmtCny(pb.snapshot.total_balance_nano),
+        "快照 " + fmtTs(pb.snapshot.observed_at)));
+    } else {
+      wrap.appendChild(kpiCard("供应商余额", "—", "暂无快照"));
+    }
+    // User 累计已用
+    wrap.appendChild(kpiCard("User 累计已用",
+      b.available === false ? "不可用" : fmtCny(b.charge_nano_cny),
+      "本周期 charge 合计"));
+    // Demo 本周已用
+    var demo = state.billDemo;
+    wrap.appendChild(kpiCard("Demo 本周已用",
+      demo ? fmtCny(demo.spent_nano_cny) : "—",
+      demo ? (demo.virtual ? "本周暂无记录（按策略边界的空统计）" : "自然周窗口")
+           : "统计暂不可用"));
+    // 未计价
+    wrap.appendChild(kpiCard("未计价事件",
+      b.available === false ? "不可用" : fmtNum(b.unpriced_count),
+      "未计价 ≠ 0 元", Number(b.unpriced_count) > 0));
+  }
+
+  // [仅异常]计费异常条：unpriced=0 时不渲染红框；>0 或余额/reconcile 异常
+  // 才出现，且「查看未计价明细」可跳到计费异常标签。
+  function renderBillAlert() {
+    var card = $("adm-bill-alert");
+    var list = $("adm-bill-alert-list");
+    var gotoBtn = $("adm-bill-alert-goto");
+    if (!card || !list) return;
+    list.textContent = "";
+    var alerts = [];
+    var b = (state.billOverview || {}).billing;
+    if (b && b.available !== false) {
+      if (Number(b.unpriced_count) > 0) {
+        alerts.push("有 " + b.unpriced_count + " 条未计价事件（未计价 ≠ 0 元）：点下方按钮查看明细。");
+      }
+      if (b.reconcile_drift === true) {
+        alerts.push("金额对账（reconcile）发现不一致：系统只报告不自动修账，请结合账务流水排查。");
+      }
+    }
+    var pb = state.billProviderBalance;
+    if (pb && pb.snapshot) {
+      var age = pb.age_seconds;
+      if (age !== null && age !== undefined && Number(age) > 86400) {
+        alerts.push("供应商余额快照已超过 24 小时未更新（" +
+          Math.round(Number(age) / 3600) + " 小时）。");
+      }
+    } else if (state.billProviderBalanceError) {
+      alerts.push("供应商余额不可用（" +
+        (state.billProviderBalanceError.code || "error") + "）。");
+    }
+    card.hidden = alerts.length === 0;
+    alerts.forEach(function (text) {
+      var li = document.createElement("li");
+      li.textContent = text;
+      list.appendChild(li);
+    });
+    if (gotoBtn) gotoBtn.hidden = !(b && b.available !== false &&
+      Number(b.unpriced_count) > 0);
+  }
+
+  // Demo 消耗卡（§4.6 统计口径）：admin.spend.demoStats.get（只读，无副作用）。
+  // 无数据中性空态；unpriced>0 或统计不完整（db_unavailable_denials_included）
+  // 才用异常色。
+  function loadDemoStats(windowKey) {
+    var status = $("adm-demo-status");
+    return request("admin.spend.demoStats.get", { window: windowKey || "current" })
+      .then(function (res) {
+        state.billDemo = res || null;
+        renderDemoStats(res || {});
+        if (status) status.textContent = "已更新（" + nowText() + "）";
+        renderBillKpis();
+        return true;
+      }).catch(function (err) {
+        state.billDemo = null;
+        renderDemoStats(null);
+        if (status) {
+          status.textContent = "Demo 统计暂不可用（" + errText(err) + "）";
+        }
+        renderBillKpis();
+        throw err; // 交给 loadBillingPage 的协调器计 partial
       });
   }
 
-  function renderProviderBalance(payload) {
-    var dl = $("adm-billing-provider");
+  function renderDemoStats(res) {
+    var dl = $("adm-demo-info");
+    var empty = $("adm-demo-empty");
+    var rawBox = $("adm-demo-raw");
+    var card = $("adm-demo-card");
     if (!dl) return;
     dl.textContent = "";
-    var rawBox = $("adm-billing-provider-raw");
     if (rawBox) rawBox.textContent = "";
-    var snap = payload.snapshot;
-    kvRow(dl, "供应商", payload.provider);
-    if (!snap) {
-      kvRow(dl, "最新快照", "（暂无；可点下方按钮抓取）");
+    if (card) card.classList.remove("adm-card--anomaly");
+    var hasStat = res && res.limit_nano_cny !== null &&
+      res.limit_nano_cny !== undefined;
+    if (!hasStat) {
+      // 中性空态：统计不可用/无数据不是异常
+      if (empty) {
+        empty.hidden = false;
+        empty.textContent = "暂无 Demo 消耗统计（功能未发布或本周期尚无数据）。";
+      }
       return;
     }
-    kvRow(dl, "总余额", fmtCny(snap.total_balance_nano));
-    kvRow(dl, "赠送余额", fmtCny(snap.granted_balance_nano));
-    kvRow(dl, "充值余额", fmtCny(snap.topped_up_balance_nano));
-    kvRow(dl, "可用状态", snap.is_available ? "可用" : "不可用");
-    kvRow(dl, "快照时间", fmtTs(snap.observed_at));
-    kvRow(dl, "快照年龄",
-          payload.age_seconds === null || payload.age_seconds === undefined
-          ? "—" : Math.round(payload.age_seconds) + " 秒前");
+    if (empty) empty.hidden = true;
+    var anomaly = Number(res.unpriced_calls || 0) > 0 ||
+      res.db_unavailable_denials_included === true ||
+      (res.overage_nano_cny !== null && res.overage_nano_cny !== undefined &&
+       BigInt(res.overage_nano_cny) > 0n);
+    if (anomaly && card) card.classList.add("adm-card--anomaly");
+    var winLabel = (res.window === "previous" ? "上周" : "本周") +
+      "（" + fmtTs(res.window_start) + " → " + fmtTs(res.window_end) + "）" +
+      (res.virtual ? " · 本周暂无窗口记录（按策略边界计算的空统计）" : "");
+    kvRow(dl, "统计窗口", winLabel);
+    kvRow(dl, "周额度", fmtCny(res.limit_nano_cny));
+    kvRow(dl, "已用", fmtCny(res.spent_nano_cny));
+    kvRow(dl, "预占", fmtCny(res.reserved_nano_cny));
+    kvRow(dl, "剩余", fmtCny(res.remaining_nano_cny));
+    if (res.overage_nano_cny !== null && res.overage_nano_cny !== undefined &&
+        BigInt(res.overage_nano_cny) > 0n) {
+      kvRow(dl, "超额", fmtCny(res.overage_nano_cny));
+    }
+    kvRow(dl, "调用（已计价/未计价）",
+      fmtNum(res.priced_calls) + " / " + fmtNum(res.unpriced_calls));
+    kvRow(dl, "输入 tokens（cache 命中/未命中）",
+      fmtNum(res.cache_hit_tokens) + " / " + fmtNum(res.cache_miss_tokens));
+    kvRow(dl, "输出 tokens", fmtNum(res.output_tokens));
+    if (res.reasoning_tokens !== null && res.reasoning_tokens !== undefined) {
+      kvRow(dl, "推理 tokens", fmtNum(res.reasoning_tokens));
+    }
+    kvRow(dl, "用户费用（charge）", fmtCny(res.charge_nano_cny));
+    kvRow(dl, "供应商成本", fmtCny(res.provider_cost_nano_cny));
+    var holds = res.holds || {};
+    kvRow(dl, "hold（授权中/在途/已结算/已释放/已过期）",
+      fmtNum(holds.authorized) + " / " + fmtNum(holds.open) + " / " +
+      fmtNum(holds.settled) + " / " + fmtNum(holds.released) + " / " +
+      fmtNum(holds.expired));
+    kvRow(dl, "hold 拒绝（按原因聚合）", fmtNum(res.denials_total) +
+      (res.denials && res.denials.length
+        ? "（" + res.denials.map(function (d) {
+            return d.reason + " × " + d.count;
+          }).join("，") + "）" : ""));
+    if (res.db_unavailable_denials_included === true) {
+      kvRow(dl, "统计口径提示", "数据库不可用期间的拒绝只进外部 metric，未计入以上 DB 聚合");
+    }
     if (rawBox) {
       rawBox.appendChild(rawValuesDetails([
-        ["total_balance_nano", snap.total_balance_nano],
-        ["granted_balance_nano", snap.granted_balance_nano],
-        ["topped_up_balance_nano", snap.topped_up_balance_nano],
+        ["limit_nano_cny", res.limit_nano_cny],
+        ["spent_nano_cny", res.spent_nano_cny],
+        ["reserved_nano_cny", res.reserved_nano_cny],
+        ["remaining_nano_cny", res.remaining_nano_cny],
+        ["charge_nano_cny", res.charge_nano_cny],
+        ["provider_cost_nano_cny", res.provider_cost_nano_cny],
       ]));
     }
+  }
+
+  // ---- 页内标签（§4.6）：aria-selected / 键盘方向键 / 可见焦点 ----
+  function setBillingTab(name) {
+    if (BILL_TABS.indexOf(name) === -1) name = "usage";
+    billTab = name;
+    billTabSeq++;
+    var seq = billTabSeq;
+    BILL_TABS.forEach(function (t) {
+      var btn = $("adm-tab-" + t);
+      if (btn) {
+        btn.setAttribute("aria-selected", t === name ? "true" : "false");
+        btn.setAttribute("tabindex", t === name ? "0" : "-1");
+      }
+    });
+    var panel = $("adm-tabpanel-detail");
+    if (panel) panel.setAttribute("aria-labelledby", "adm-tab-" + name);
+    var sections = { usage: "adm-usage-section", ledger: "adm-ledger-section",
+                     unpriced: "adm-unpriced-section" };
+    Object.keys(sections).forEach(function (t) {
+      var sec = $(sections[t]);
+      if (sec) sec.hidden = t !== name;
+    });
+    // 只有当前标签发请求；同一激活代际内的迟到旧响应按代际丢弃
+    if (name === "usage") loadUsage(false, seq);
+    else if (name === "ledger") loadLedger(false, seq);
+    else loadUnpriced(false, seq);
+  }
+
+  function billingTabKeydown(ev) {
+    var key = ev && ev.key;
+    var idx = BILL_TABS.indexOf(billTab);
+    var next = null;
+    if (key === "ArrowRight" || key === "ArrowDown") next = BILL_TABS[(idx + 1) % BILL_TABS.length];
+    else if (key === "ArrowLeft" || key === "ArrowUp") next = BILL_TABS[(idx - 1 + BILL_TABS.length) % BILL_TABS.length];
+    else if (key === "Home") next = BILL_TABS[0];
+    else if (key === "End") next = BILL_TABS[BILL_TABS.length - 1];
+    if (next) {
+      ev.preventDefault();
+      setBillingTab(next);
+      var btn = $("adm-tab-" + next);
+      if (btn && btn.focus) btn.focus();
+    }
+  }
+
+  // ---- 费用明细：模型调用（usage events）----
+  // 默认列：时间/用户/模型/状态/输入/输出 token/用户费用；
+  // provider 成本、cache hit/miss、event_id 放行详情（行详情折叠区）。
+  function loadUsage(append, seqGuard) {
+    var seq = seqGuard !== undefined ? seqGuard : billTabSeq;
+    var f = state.filters.usage || {};
+    var payload = { limit: 50, cursor: append ? state.cursors.usage : null };
+    if (f.model) payload.model = f.model;
+    if (f.user_id) payload.user_id = f.user_id;
+    if (f.status) payload.status = f.status;
+    var status = $("adm-usage-status");
+    request("admin.billing.usage.list", payload).then(function (res) {
+      if (seq !== billTabSeq) return; // 标签已切换：迟到旧响应一律丢弃
+      hideError();
+      renderUsage(res.items || [], append);
+      state.cursors.usage = res.next_cursor || null;
+      var more = $("adm-usage-more-btn");
+      if (more) more.disabled = !res.next_cursor;
+      setPageHint(status, res.next_cursor ? "还有更多" : "已到底");
+    }).catch(function (err) {
+      if (seq !== billTabSeq) return; // 旧标签的迟到失败也忽略
+      handleErr(err, status);
+    });
+  }
+
+  // 行详情折叠区：单行「详情」按钮切换（colspan 全宽子行）
+  function toggleDetailRow(tr, buildContent) {
+    var tbody = tr.parentNode;
+    var next = tr.nextSibling;
+    if (next && next.className && next.className.indexOf("adm-detail-row") !== -1) {
+      tbody.removeChild(next);
+      return;
+    }
+    var sub = document.createElement("tr");
+    sub.className = "adm-detail-row";
+    var cell = document.createElement("td");
+    cell.colSpan = tr.children.length;
+    cell.appendChild(buildContent());
+    sub.appendChild(cell);
+    if (next) tbody.insertBefore(sub, next);
+    else tbody.appendChild(sub);
+  }
+
+  function detailDl(rows) {
+    var dl = document.createElement("dl");
+    dl.className = "adm-kv adm-detail-kv";
+    rows.forEach(function (row) {
+      kvRow(dl, row[0], row[1] === null || row[1] === undefined ? "—" : String(row[1]));
+    });
+    return dl;
+  }
+
+  function renderUsage(items, append) {
+    var tbody = $("adm-usage-tbody");
+    if (!tbody) return;
+    if (!append) tbody.textContent = "";
+    items.forEach(function (e) {
+      var tr = document.createElement("tr");
+      tr.appendChild(td(fmtTs(e.occurred_at), "adm-cell-time"));
+      tr.appendChild(td(e.user_id || (e.subject_type === "demo" ? "Demo" : e.subject_type)));
+      tr.appendChild(td(e.model));
+      tr.appendChild(td(e.status === "priced" ? "已计价" : "未计价"));
+      tr.appendChild(td(fmtNum((Number(e.cache_hit_input_tokens) || 0) +
+                               (Number(e.cache_miss_input_tokens) || 0))));
+      tr.appendChild(td(fmtNum(e.output_tokens)));
+      // §4.7：用户费用两位小数 CNY；unpriced 金额保持 null 呈现「—」，
+      // 绝不显示成 0 元
+      tr.appendChild(td(e.charge_nano_cny === null || e.charge_nano_cny === undefined
+        ? "—" : fmtCny(e.charge_nano_cny), "adm-cell-time"));
+      var cell = document.createElement("td");
+      cell.className = "adm-actions-cell";
+      var btn = actionBtn("详情", function () {
+        toggleDetailRow(tr, function () {
+          return detailDl([
+            ["event_id", e.event_id],
+            ["主体", e.subject_type + (e.user_id ? " · " + e.user_id : "")],
+            ["provider 成本", e.provider_cost_nano_cny === null ||
+              e.provider_cost_nano_cny === undefined
+              ? "—" : fmtCny(e.provider_cost_nano_cny)],
+            ["cache 命中/未命中 tokens",
+              fmtNum(e.cache_hit_input_tokens) + " / " + fmtNum(e.cache_miss_input_tokens)],
+            ["未计价原因", e.unpriced_reason],
+            ["原始 nano（charge）", e.charge_nano_cny],
+          ]);
+        });
+      }, "secondary");
+      cell.appendChild(btn);
+      tr.appendChild(cell);
+      tbody.appendChild(tr);
+    });
+  }
+
+  // ---- 费用明细：账务流水（ledger，只读不可变）----
+  // 默认列：时间/用户/类型/金额（CNY）/原因；account_id/entry_id/nano/
+  // metadata 放行详情。
+  function loadLedger(append, seqGuard) {
+    var seq = seqGuard !== undefined ? seqGuard : billTabSeq;
+    var payload = { limit: 50, cursor: append ? state.cursors.ledger : null };
+    var status = $("adm-ledger-status");
+    request("admin.billing.ledger.list", payload).then(function (res) {
+      if (seq !== billTabSeq) return;
+      hideError();
+      var tbody = $("adm-ledger-tbody");
+      if (!tbody) return;
+      if (!append) tbody.textContent = "";
+      (res.items || []).forEach(function (e) {
+        var tr = document.createElement("tr");
+        tr.appendChild(td(fmtTs(e.created_at), "adm-cell-time"));
+        tr.appendChild(td(e.user_id || e.account_id));
+        var kindCell = td(e.kind);
+        // PR6 模拟扣费条目：metadata.simulated=true → kind 旁加「模拟」徽标
+        if (e.metadata && e.metadata.simulated === true) {
+          var badge = document.createElement("span");
+          badge.className = "adm-badge";
+          badge.textContent = "模拟";
+          kindCell.appendChild(document.createTextNode(" "));
+          kindCell.appendChild(badge);
+        }
+        tr.appendChild(kindCell);
+        tr.appendChild(td(fmtCny(e.amount_nano_cny), "adm-cell-time"));
+        tr.appendChild(td(e.reason));
+        var cell = document.createElement("td");
+        cell.className = "adm-actions-cell";
+        var btn = actionBtn("详情", function () {
+          toggleDetailRow(tr, function () {
+            return detailDl([
+              ["account_id", e.account_id],
+              ["entry_id", e.entry_id],
+              ["金额（原始 nano）", e.amount_nano_cny],
+              ["metadata", e.metadata ? JSON.stringify(e.metadata) : null],
+            ]);
+          });
+        }, "secondary");
+        cell.appendChild(btn);
+        tr.appendChild(cell);
+        tbody.appendChild(tr);
+      });
+      state.cursors.ledger = res.next_cursor || null;
+      var more = $("adm-ledger-more-btn");
+      if (more) more.disabled = !res.next_cursor;
+      setPageHint(status, res.next_cursor ? "还有更多" : "已到底");
+    }).catch(function (err) {
+      if (seq !== billTabSeq) return;
+      handleErr(err, status);
+    });
+  }
+
+  // ---- 费用明细：计费异常（unpriced）----
+  // 0 条 = 中性空态（无红框红边）；>0 的主告警在页级告警条与概览各一处。
+  function loadUnpriced(append, seqGuard) {
+    var seq = seqGuard !== undefined ? seqGuard : billTabSeq;
+    var payload = { limit: 50, status: "unpriced", cursor: append ? state.cursors.unpriced : null };
+    request("admin.billing.usage.list", payload).then(function (res) {
+      if (seq !== billTabSeq) return;
+      var empty = $("adm-unpriced-empty");
+      var tbody = $("adm-unpriced-tbody");
+      if (!tbody) return;
+      if (!append) tbody.textContent = "";
+      var items = res.items || [];
+      items.forEach(function (e) {
+        var tr = document.createElement("tr");
+        tr.appendChild(td(fmtTs(e.occurred_at), "adm-cell-time"));
+        tr.appendChild(td(e.model));
+        tr.appendChild(td(e.unpriced_reason));
+        tr.appendChild(td(e.event_id));
+        tbody.appendChild(tr);
+      });
+      if (empty) empty.hidden = items.length > 0 || Boolean(res.next_cursor);
+      state.cursors.unpriced = res.next_cursor || null;
+      var more = $("adm-unpriced-more-btn");
+      if (more) more.disabled = !res.next_cursor;
+    }).catch(function () {
+      // json 后端等：保持中性空态文案（不渲染红框），错误只进全局错误条
+      var empty = $("adm-unpriced-empty");
+      if (empty) { empty.hidden = false; }
+    });
+  }
+
+  // 供应商余额卡（KPI + 异常条数据源）
+  function renderProviderBalanceSnapshot(payload) {
+    state.billProviderBalance = payload || null;
+    renderBillKpis();
+    renderBillAlert();
   }
 
   function loadProviderBalanceCard() {
     return request("admin.billing.providerBalance.get", {}).then(function (payload) {
       hideError();
-      renderProviderBalance(payload);
+      state.billProviderBalanceError = null;
+      renderProviderBalanceSnapshot(payload);
+      return true;
     }).catch(function (err) {
-      var dl = $("adm-billing-provider");
-      if (dl) { dl.textContent = ""; kvRow(dl, "可用性", errText(err)); }
-      else handleErr(err, null);
+      state.billProviderBalanceError = err;
+      renderProviderBalanceSnapshot(null);
       throw err; // 交给 loadBillingPage 决定页面终态
     });
   }
@@ -2447,7 +2688,8 @@
     request("admin.billing.providerBalance.refresh", {}).then(function (res) {
       if (btn) btn.disabled = false;
       if (status) status.textContent = "已更新（" + fmtTs(res.snapshot && res.snapshot.observed_at) + "）";
-      renderProviderBalance({
+      state.billProviderBalanceError = null;
+      renderProviderBalanceSnapshot({
         provider: res.provider,
         snapshot: res.snapshot,
         age_seconds: res.age_seconds,
@@ -2458,139 +2700,23 @@
     });
   }
 
-  function loadUsage(append) {
-    var seq = state.listSeq;
-    var f = state.filters.usage || {};
-    var payload = { limit: 50, cursor: append ? state.cursors.usage : null };
-    if (f.model) payload.model = f.model;
-    if (f.user_id) payload.user_id = f.user_id;
-    if (f.status) payload.status = f.status;
-    var status = $("adm-usage-status");
-    request("admin.billing.usage.list", payload).then(function (res) {
-      if (seq !== state.listSeq) return;
-      hideError();
-      renderUsage(res.items || [], append);
-      state.cursors.usage = res.next_cursor || null;
-      var more = $("adm-usage-more-btn");
-      if (more) more.disabled = !res.next_cursor;
-      setPageHint(status, res.next_cursor ? "还有更多" : "已到底");
-    }).catch(function (err) { if (seq === state.listSeq) handleErr(err, status); });
-  }
-
-  function renderUsage(items, append) {
-    var tbody = $("adm-usage-tbody");
-    if (!tbody) return;
-    if (!append) tbody.textContent = "";
-    items.forEach(function (e) {
-      var tr = document.createElement("tr");
-      tr.appendChild(td(fmtTs(e.occurred_at), "adm-cell-time"));
-      tr.appendChild(td(e.model));
-      tr.appendChild(td(e.subject_type + (e.user_id ? "" : "（无用户镜像）")));
-      tr.appendChild(td(e.status === "priced" ? "priced" : ("unpriced：" + (e.unpriced_reason || "?"))));
-      tr.appendChild(td(fmtNum(e.cache_hit_input_tokens) + " / " +
-                        fmtNum(e.cache_miss_input_tokens) + " / " +
-                        fmtNum(e.output_tokens)));
-      // §4.2：主视图 CNY；unpriced 金额保持 null 呈现「—」，绝不显示成 0 元
-      var costCell = document.createElement("td");
-      costCell.className = "adm-cell-time";
-      costCell.textContent = e.provider_cost_nano_cny === null
-        ? "—" : fmtCny(e.provider_cost_nano_cny);
-      if (e.provider_cost_nano_cny !== null) {
-        costCell.setAttribute("title", String(e.provider_cost_nano_cny) + " nano");
-      }
-      tr.appendChild(costCell);
-      var chargeCell = document.createElement("td");
-      chargeCell.className = "adm-cell-time";
-      chargeCell.textContent = e.charge_nano_cny === null ? "—" : fmtCny(e.charge_nano_cny);
-      if (e.charge_nano_cny !== null) {
-        chargeCell.setAttribute("title", String(e.charge_nano_cny) + " nano");
-      }
-      tr.appendChild(chargeCell);
-      tr.appendChild(td(e.event_id));
-      tbody.appendChild(tr);
-    });
-  }
-
-  function loadUnpriced(append) {
-    var seq = state.listSeq;
-    var payload = { limit: 50, status: "unpriced", cursor: append ? state.cursors.unpriced : null };
-    request("admin.billing.usage.list", payload).then(function (res) {
-      if (seq !== state.listSeq) return;
-      var card = $("adm-unpriced-card");
-      var tbody = $("adm-unpriced-tbody");
-      if (!tbody) return;
-      if (!append) tbody.textContent = "";
-      (res.items || []).forEach(function (e) {
-        var tr = document.createElement("tr");
-        tr.appendChild(td(fmtTs(e.occurred_at), "adm-cell-time"));
-        tr.appendChild(td(e.model));
-        tr.appendChild(td(e.unpriced_reason));
-        tr.appendChild(td(e.event_id));
-        tbody.appendChild(tr);
-      });
-      state.cursors.unpriced = res.next_cursor || null;
-      var more = $("adm-unpriced-more-btn");
-      if (more) more.disabled = !res.next_cursor;
-      if (card) card.hidden = false; // 有无条目都显示告警区（明确「当前 0 条」）
-      if (!res.next_cursor && !res.items) tbody.textContent = "";
-    }).catch(function () {
-      // json 后端：告警区静默隐藏（概览页已给出 pg_backend_required 说明）
-      var card = $("adm-unpriced-card");
-      if (card) card.hidden = true;
-    });
-  }
-
-  function loadLedger(append) {
-    var seq = state.listSeq;
-    var payload = { limit: 50, cursor: append ? state.cursors.ledger : null };
-    request("admin.billing.ledger.list", payload).then(function (res) {
-      if (seq !== state.listSeq) return;
-      hideError();
-      var tbody = $("adm-ledger-tbody");
-      if (!tbody) return;
-      if (!append) tbody.textContent = "";
-      (res.items || []).forEach(function (e) {
-        var tr = document.createElement("tr");
-        tr.appendChild(td(fmtTs(e.created_at), "adm-cell-time"));
-        tr.appendChild(td(e.account_id));
-        var kindCell = td(e.kind);
-        // PR6 模拟扣费条目：metadata.simulated=true → kind 旁加「模拟」徽标
-        // （真实扣费落地后该徽标即自然消失；metadata 为服务端受控写入的
-        // 非敏感字段，此处只读渲染）
-        if (e.metadata && e.metadata.simulated === true) {
-          var badge = document.createElement("span");
-          badge.className = "adm-badge";
-          badge.textContent = "模拟";
-          kindCell.appendChild(document.createTextNode(" "));
-          kindCell.appendChild(badge);
-        }
-        tr.appendChild(kindCell);
-        tr.appendChild(td(e.amount_nano_cny));
-        tr.appendChild(td(e.reason));
-        tr.appendChild(td(e.entry_id));
-        tbody.appendChild(tr);
-      });
-      state.cursors.ledger = res.next_cursor || null;
-      var more = $("adm-ledger-more-btn");
-      if (more) more.disabled = !res.next_cursor;
-    }).catch(function (err) { if (seq === state.listSeq) handleErr(err, null); });
-  }
-
   // ------------------------------------------------------------------
   // 审计（§10.5）
   // ------------------------------------------------------------------
-  // §4.8：audit detail 对已知 action/键出人类可读键值摘要；未知字段完整保留
-  // 在「原始详情」折叠区（JSON 全量，绝不丢数据）。
   var AUDIT_KEY_LABELS = {
     from_cny: "调整前", to_cny: "调整后",
     from_limit_nano_cny: "原额度（nano）", to_limit_nano_cny: "新额度（nano）",
     limit_nano_cny: "额度（nano）", amount_nano_cny: "金额（nano）",
-    monthly_limit_nano_cny: "月额度模板（nano）",
-    soft_cap_nano_cny: "soft cap（nano）", hard_cap_nano_cny: "hard cap（nano）",
+    monthly_limit_nano_cny: "月额度模板（nano，历史）",
+    total_limit_nano_cny: "总额度（nano）",
+    expected_version: "预期版本", version: "版本",
+    soft_cap_nano_cny: "soft cap（nano，历史）",
+    hard_cap_nano_cny: "hard cap（nano，历史）",
     login_id_masked: "登录账号（掩码）", registration_mode: "注册模式",
     spend_enforcement_mode: "enforcement 模式",
-    demo_weekly_limit: "Demo 周额度", user_default_monthly_limit: "用户默认月额度",
-    owner_monthly_limit: "Owner 月额度",
+    demo_weekly_limit_nano_cny: "Demo 周额度（nano）",
+    user_default_total_limit_nano_cny: "用户默认总额度（nano）",
+    owner_monthly_limit_nano_cny: "Owner 月额度（nano）",
     enabled: "启用", ai_access: "AI access", reason: "原因",
     user_id: "user_id", invite_id: "invite_id", kind: "类型",
     password: "（已脱敏）", token: "（已脱敏）", secret: "（已脱敏）",
@@ -2670,9 +2796,7 @@
   }
 
   // ------------------------------------------------------------------
-  // 插件管理（PR5 修订：恢复旧侧栏插件管理功能面）。运行时安装/更新不上
-  // UI——§16 的发布方向是版本化 releases + 原子切换（宿主机动作），本页只
-  // 做：列表 + sidecar 健康提示 + 启停 + 凭证轮换（secret 仅一次展示）。
+  // 插件管理（PR5 修订：恢复旧侧栏插件管理功能面）
   // ------------------------------------------------------------------
   function pluginHealthText(h) {
     if (h === "reachable") return "可达";
@@ -2706,7 +2830,7 @@
         cell.className = "adm-actions-cell";
         var enabled = !!inst.enabled;
         // §4.5：每行最多一个实心 danger（停用）；轮换凭证是次要危险 →
-        // danger-outline，不再中性化也不再加一个实心红
+        // danger-outline
         cell.appendChild(actionBtn(enabled ? "停用" : "启用", function () {
           if (enabled) {
             askConfirm($("adm-plugins-confirm"),
@@ -2747,8 +2871,7 @@
       .catch(function (err) { handleErr(err, $("adm-plugins-status")); });
   }
 
-  // 轮换凭证：响应里的新明文 secret 只在此处展示一次（内存 DOM），不落
-  // localStorage/cookie（opaque origin 本也写不了）——与邀请码同款一次性语义
+  // 轮换凭证：响应里的新明文 secret 只在此处展示一次（内存 DOM）
   function rotatePluginSecret(inst) {
     request("admin.plugins.rotateSecret",
             { installation_id: inst.installation_id })
@@ -2772,6 +2895,7 @@
   function showPage(name) {
     state.page = name;
     state.listSeq++; // 作废在途列表响应（§8.2：晚到响应不写回新页面）
+    billTabSeq++;    // 作废在途费用明细响应（跨页迟到不写回）
     closeUserDrawer();
     if (els.pageTitle) els.pageTitle.textContent = PAGE_TITLES[name] || name;
     // 手机端：切页后收起导航抽屉
@@ -2805,7 +2929,7 @@
     }
     if (name === "overview") loadOverview();
     else if (name === "users") loadUsers(false);
-    else if (name === "invites") loadAcquisitionPage();
+    else if (name === "invites") loadInvitesPage();
     else if (name === "settings") loadSettingsPage();
     else if (name === "billing") loadBillingPage();
     else if (name === "plugins") loadPlugins();
@@ -2869,7 +2993,6 @@
       });
     }
     // 用户详情抽屉：关闭按钮 / 遮罩 / Esc / Tab 圈定（§4.10 焦点管理）。
-    // 抽屉打开期间背景内容不可键盘达（焦点被圈定在抽屉内）。
     if (els.drawerClose && els.drawerClose.addEventListener) {
       els.drawerClose.addEventListener("click", closeUserDrawer);
     }
@@ -2902,50 +3025,48 @@
     onClick("adm-users-more-btn", function () { loadUsers(true); });
     // 用户页写操作（PR5）
     onClick("adm-users-create-btn", submitCreateUser);
-    // 邀请与来源页
-    onClick("adm-acq-more-btn", function () { loadAcqUsers(true); });
-    // 邀请写操作（PR5）
+    // 邀请页（wave 2：注册模式只读 + 跳设置）
+    onClick("adm-invite-goto-settings-btn", function () { showPage("settings"); });
     onClick("adm-invite-create-btn", submitCreateInvite);
     onClick("adm-invites-more-btn", function () { loadInvites(true); });
     onClick("adm-invite-token-copy", function () {
       var code = $("adm-invite-token");
       if (code) copyToClipboard(code.textContent || "");
     });
-    // 账单页
-    onClick("adm-balance-refresh-btn", refreshProviderBalance);
-    // §5.7：运维明细折叠区首次展开才加载对应数据
-    BILLING_LAZY_BOXES.forEach(function (plan) {
-      var box = $(plan[0]);
-      if (!box || !box.addEventListener || box.getAttribute("data-lazy-bound")) {
-        return;
-      }
-      box.setAttribute("data-lazy-bound", "1");
-      box.addEventListener("toggle", function () {
-        if (box.open) plan[1]();
-      });
-    });
-    // 设置页（批次 D + 2026-09-01 金额简化 §5.5）
+    // 设置页（批次 D + wave 2）
     onClick("adm-regmode-save-btn", saveRegistrationMode);
     onClick("adm-spend-save-btn", saveSpendPolicies);
     onClick("adm-rt-save-btn", saveRuntimeLimits);
     onClick("adm-win-demo-adjust-btn", function () { adjustFixedWindow("demo"); });
     onClick("adm-win-owner-adjust-btn", function () { adjustFixedWindow("owner"); });
-    // turn 预算 / 金额账户写操作（PR5）
-    onClick("adm-acct-load-btn", loadBillingAccount);
-    // §4.5：人工调整区初始禁用（运行时态，不依赖 HTML 属性），查询成功后才启用
-    setAdjustZoneEnabled(false);
-    // §4.5：user_id 输入变化 → 旧查询结果失效并再次禁用人工调整区
-    var acctInput = $("adm-acct-user");
-    if (acctInput && acctInput.addEventListener) {
-      acctInput.addEventListener("input", invalidateAccountLookup);
-    }
-    onClick("adm-caps-save-btn", saveCaps);
-    onClick("adm-adjust-btn", submitAdjustment);
     // §4.7：enforcement 模式切换的即时警示卡
     var spendModeSelect = $("adm-spend-mode");
     if (spendModeSelect && spendModeSelect.addEventListener) {
       spendModeSelect.addEventListener("change", updateEnforcementWarning);
     }
+    // 费用页（wave 2）：KPI 刷新 / Demo 统计 / 页内标签
+    onClick("adm-balance-refresh-btn", refreshProviderBalance);
+    var demoSelect = $("adm-demo-window");
+    if (demoSelect && demoSelect.addEventListener) {
+      demoSelect.addEventListener("change", function () {
+        loadDemoStats(demoSelect.value || "current").catch(function () { /* 已在卡内中性呈现 */ });
+      });
+    }
+    onClick("adm-demo-refresh-btn", function () {
+      var sel = $("adm-demo-window");
+      loadDemoStats(sel ? sel.value : "current").catch(function () { /* 已在卡内中性呈现 */ });
+    });
+    onClick("adm-bill-alert-goto", function () { setBillingTab("unpriced"); });
+    BILL_TABS.forEach(function (t) {
+      onClick("adm-tab-" + t, function () { setBillingTab(t); });
+    });
+    // 角色化键盘导航：在三个标签按钮上挂同一 keydown（方向键/Home/End）
+    BILL_TABS.forEach(function (t) {
+      var btn = $("adm-tab-" + t);
+      if (btn && btn.addEventListener) {
+        btn.addEventListener("keydown", billingTabKeydown);
+      }
+    });
     onClick("adm-usage-search-btn", function () {
       state.filters.usage = {
         model: ($("adm-usage-model") && $("adm-usage-model").value || "").trim(),
@@ -2953,7 +3074,6 @@
         status: $("adm-usage-status") ? $("adm-usage-status").value : "",
       };
       state.cursors.usage = null;
-      state.listSeq++;
       loadUsage(false);
     });
     onClick("adm-usage-more-btn", function () { loadUsage(true); });
@@ -2981,12 +3101,14 @@
   bindNav();
 
   // 导出（仅调试/测试用；不含 nonce 读取器）。金额换算函数一并导出供
-  // tests/js/admin-plugin-ui.test.ts 锁定「字符串进、字符串出」契约。
+  // tests/js/admin-plugin-ui.test.ts 锁定「字符串进、字符串出」契约与
+  // 两位小数口径（formatCny2）。
   window.PathTogetherAdminClient = {
     request: request,
     showPage: showPage,
     cnyToNano: cnyToNano,
     nanoToCnyString: nanoToCnyString,
+    formatCny2: formatCny2,
     fmtNano: fmtNano,
     fmtCny: fmtCny,
     fmtTs: fmtTs,

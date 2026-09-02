@@ -1,19 +1,34 @@
 # -*- coding: utf-8 -*-
 """用户来源归因存储层（admin-billing 方案 §11，PR4）。
 
+**Batch B 写路径冻结（docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
+§4.4/§Batch B）**：来源归因与注册/邀请解耦——
+
+- ``registration_store.redeem_invite`` **不再调用** ``insert_user_acquisition``
+  （归因写失败曾会让合法兑换整体回滚；站点统计绝不能阻断注册）；
+- ``record_visit`` 不再从注册/邀请链路调用（app.py wave 2 移除 `/r/` 落记录）；
+- 邀请不再携带/写入 source_code/campaign_id/cohort。
+
+本模块函数本体**保留**：历史行查询（admin 汇总、retention 清理）与已落库
+数据的排障读取不变；除 wave 2 前的存量调用方外，不得新增任何写路径调用。
+旧归因表（user_acquisition/acquisition_campaigns/acquisition_visits）先冻结
+与备份，经一个发布周期消费者审计后另立迁移删除（§3.2 数据保留）。
+
 PG-only：全部公共入口经 ``platform_features.require_pg_backend("acquisition")``
 fail-closed（json/dual 稳定 ``pg_backend_required``）。**例外**是纯计算辅助
 （slug/UTM/referrer/IP 前缀 hash 清理函数）——它们不接库，供路由层在任意
 后端复用（/r/ 在 json 后端也要能做安全 302 与 cookie 清理，§16.2）。
 
 内容：
-  - 触点写入 ``record_visit``：每次 /r/<source_code> 跳转一个**不可变事件行**
-    （不按 visitor upsert，不折叠 first/last_seen，§11.2 行粒度红线）；
-  - 注册归因 ``insert_user_acquisition``：在 ``registration_store.redeem_invite``
-    的**同一事务 cursor** 内调用（兑换 + 建号 + invite 消费 + 归因原子）；
-    优先级严格按 §11.2：邀请码显式 campaign > 有效 pt_acq 触点（未过期，按
-    touched_at/acquisition_id 稳定选 first/last）> sanitized referrer/UTM >
-    direct/unknown；``attribution_method`` 记录走了哪条路径；
+  - 触点写入 ``record_visit``（**已冻结**）：每次 /r/<source_code> 跳转一个
+    **不可变事件行**（不按 visitor upsert，不折叠 first/last_seen，§11.2
+    行粒度红线）；
+  - 注册归因 ``insert_user_acquisition``（**已冻结**，仅历史查询兼容保留）：
+    原语义是在 ``registration_store.redeem_invite`` 的**同一事务 cursor** 内
+    调用（兑换 + 建号 + invite 消费 + 归因原子）；优先级严格按 §11.2：邀请码
+    显式 campaign > 有效 pt_acq 触点（未过期，按 touched_at/acquisition_id
+    稳定选 first/last）> sanitized referrer/UTM > direct/unknown；
+    ``attribution_method`` 记录走了哪条路径；
   - 匿名触点 90 天清理 ``run_visit_retention``（§11.3）：过期未引用行删除、
     过期已归因行保留骨架但脱敏（IP/referrer/UTM/landing/visitor hash 全部
     置空，只留 source/campaign/时间）；由 app.py 的 acquisition retention
@@ -349,7 +364,11 @@ def _now_epoch(cur):
 def insert_user_acquisition(cur, *, user_id, invite_id=None,
                             invite_campaign_id=None, invite_source_code="",
                             acq=None):
-    """在调用方事务 cursor 内解析优先级并写 user_acquisition（不提交）。
+    """【Batch B 冻结】在调用方事务 cursor 内解析优先级并写 user_acquisition。
+
+    **写路径已冻结**：registration_store.redeem_invite 自 Batch B 起不再
+    调用本函数（归因写失败曾阻断注册）；函数本体仅保留供历史查询/测试
+    直调，禁止新增业务写路径调用（见模块 docstring）。
 
     必须与「兑换 + users 插入 + invite 消费」同事务（§11.2 原子性）：本函数
     抛错时调用方整体回滚（用户也不创建）。**绝不**事后按 IP/login ID/邮箱

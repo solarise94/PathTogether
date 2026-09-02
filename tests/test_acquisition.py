@@ -93,19 +93,16 @@ def _owner_session(client, owner):
                   "role": "owner", "auth_version": owner.get("auth_version", 1)})
 
 
-def _cookie_payload_from(client):
-    """从 test client 读 pt_acq 并验签 → payload dict|None。"""
+def _cookie_state(client):
+    """读 test client 的 pt_acq cookie 原始形态 → (存在, value, attrs)。
+
+    Batch D1 16 起 /r/ 不再签发 cookie，只输出**过期清除**指令——断言用
+    Set-Cookie 的属性（path/HttpOnly/SameSite/Secure/Expires）而非 payload。
+    """
     c = client.get_cookie("pt_acq", domain="localhost", path="/")
-    raw = c.value if c is not None else None
-    if not raw:
-        return None
-    import itsdangerous
-    try:
-        data = app_mod._acq_cookie_serializer().loads(
-            raw, max_age=app_mod.ACQ_COOKIE_TTL_SECONDS)
-    except itsdangerous.BadData:
-        return None
-    return data if isinstance(data, dict) else None
+    if c is None:
+        return False, None, None
+    return True, c.value, c
 
 
 def _mk_invite(owner_uid, login_id=None, **kw):
@@ -186,20 +183,29 @@ def test_visitor_id_hash_is_salted_domain_separated():
 
 
 # =========================================================================== #
-# 2. /r/ 路由（json/PG 双跑；json 后端 = §16.2 安全降级）
+# 2. /r/ 路由（json/PG 双跑；Batch D1 16：兼容 302、零记录、清 cookie）
 # =========================================================================== #
 def test_r_valid_slug_sets_cookie_and_redirects():
+    """Batch D1 16：合法 slug 安全 302 到 allowlist landing；响应按原属性
+    （path=/、HttpOnly、SameSite=Lax、Secure 随配置）+ 过期时间**清除**
+    pt_acq，不设置任何替代 cookie；不落任何触点记录。"""
     app_mod.AUTH_ENABLED = True
     client = _client()
     r = client.get("/r/mywebpage?campaign=summer24&utm_medium=cta")
     assert r.status_code == 302
     assert r.headers["Location"] == "/register"  # 缺省 landing
-    cookie = client.get_cookie("pt_acq", domain="localhost", path="/")
-    assert cookie is not None
-    payload = _cookie_payload_from(client)
-    assert acq_store.valid_visitor_id(payload["v"])
-    assert payload["uc"] == "summer24"
-    assert payload["um"] == "cta"
+    # 清除指令：value 为空 + Expires 过去（epoch 0）+ 与原写入属性完全匹配
+    set_cookie = r.headers.get("Set-Cookie", "")
+    assert 'pt_acq="";' in set_cookie or "pt_acq=;" in set_cookie
+    assert "Expires=Thu, 01 Jan 1970" in set_cookie
+    assert "Path=/" in set_cookie
+    assert "HttpOnly" in set_cookie and "SameSite=Lax" in set_cookie
+    # 浏览器语义：清除指令后 cookie 从 jar 消失（或至多残留空值）——
+    # 绝不再携带可验签 payload
+    exists, value, _c = _cookie_state(client)
+    assert (not exists) or value == ""
+    # 不设置任何替代访客 cookie（响应只有该清除指令一条 Set-Cookie 相关行）
+    assert "visitor" not in set_cookie.lower()
 
 
 def test_r_landing_allowlist_and_open_redirect_rejected():
@@ -228,94 +234,82 @@ def test_r_malicious_slug_safe_fallback(slug):
     client = _client()
     r = client.get("/r/" + slug)
     # 安全兜底：不 500、不泄露判定细节。带 / 的多段路径按 Flask 404
-    # （未匹配路由，无信息量）；其余非法 slug 302 到 /。
+    # （未匹配路由，无信息量）；其余非法 slug 302 到 /
     assert r.status_code in (302, 404), (slug, r.status_code)
     if r.status_code == 302:
         assert r.headers["Location"] == "/"
 
 
-def test_r_reuses_valid_cookie_and_rotates_on_tamper(monkeypatch):
+def test_r_never_sets_new_cookie_and_never_records(monkeypatch):
+    """Batch D1 17（§4.4）：/r/ 与触点写路径零耦合——全新 client 访问 /r/
+    不会得到任何访客 cookie（只有清除指令）；record_visit 注入失败也不影响
+    跳转（根本不再调用）。"""
     app_mod.AUTH_ENABLED = True
     client = _client()
-    client.get("/r/src1")
-    v1 = _cookie_payload_from(client)["v"]
-    # 有效 cookie：visitor_id 复用（同一访客多次跳转）
-    client.get("/r/src2")
-    assert _cookie_payload_from(client)["v"] == v1
-    # 篡改 cookie → 验签失败 → 新 visitor_id
-    raw = client.get_cookie("pt_acq", domain="localhost", path="/").value
-    client.set_cookie(
-        "pt_acq",
-        raw[:-2] + ("aa" if not raw.endswith("aa") else "bb"),
-        domain="localhost")
-    client.get("/r/src3")
-    assert _cookie_payload_from(client)["v"] != v1
+    r = client.get("/r/src1")
+    assert r.status_code == 302
+    exists, value, _c = _cookie_state(client)
+    assert (not exists) or value == ""  # 仅清除指令，不是新签发
 
-
-def test_r_expired_cookie_gets_new_visitor(monkeypatch):
-    app_mod.AUTH_ENABLED = True
-    client = _client()
-    client.get("/r/src1")
-    v1 = _cookie_payload_from(client)["v"]
-    # TTL 视为已过（服务端 max_age 校验）：旧 cookie 无效 → 新 visitor
-    monkeypatch.setattr(app_mod, "ACQ_COOKIE_TTL_SECONDS", -1)
-    client.get("/r/src2")
-    monkeypatch.setattr(app_mod, "ACQ_COOKIE_TTL_SECONDS", 90 * 86400)
-    v2 = _cookie_payload_from(client)["v"]
-    assert v2 != v1
+    def _boom(*a, **kw):
+        raise RuntimeError("record_visit must not be called from /r/")
+    monkeypatch.setattr(acq_store, "record_visit", _boom)
+    r2 = client.get("/r/src2?to=/demo")
+    assert r2.status_code == 302
+    assert r2.headers["Location"] == "/demo"
 
 
 def test_r_json_backend_never_500s():
-    if BACKEND == "postgres":
-        pytest.skip("json 后端专用降级用例（PG 模式走触点写入正向路径）")
     app_mod.AUTH_ENABLED = True
     client = _client()
     r = client.get("/r/mywebpage?campaign=c1")
     assert r.status_code == 302
     assert r.headers["Location"] == "/register"
-    assert _cookie_payload_from(client) is not None
+    exists, value, _c = _cookie_state(client)
+    assert (not exists) or value == ""  # 旧 cookie 清除（不签发新 payload）
 
 
 # =========================================================================== #
-# 3. admin v1 acquisition 门控 + json fail-closed
+# 3. admin v1 acquisition 门控 + 退役 410（Batch D1 15）
 # =========================================================================== #
 def _plain_user():
     return user_store.create_user("plain-acq@x.com", "userpass1234567",
                                   role="user")
 
 
+_ACQ_ENDPOINTS = ("/api/admin/v1/acquisition/summary",
+                  "/api/admin/v1/acquisition/users")
+
+
 def test_admin_acquisition_owner_gate():
     owner = _mk_owner()
     app_mod.AUTH_ENABLED = True
     client = _client()
-    # 匿名 → 401
-    for path in ("/api/admin/v1/acquisition/summary",
-                 "/api/admin/v1/acquisition/users"):
+    # 匿名 → 401；非 owner → 403（门控保持在 410 之前）
+    for path in _ACQ_ENDPOINTS:
         r = client.get(path)
         assert r.status_code == 401, path
-    # 非 owner → 403
     u = _plain_user()
     with client.session_transaction() as s:
         s.update({"auth_user": "p", "user_id": u["user_id"], "role": "user",
                   "auth_version": u.get("auth_version", 1)})
-    for path in ("/api/admin/v1/acquisition/summary",
-                 "/api/admin/v1/acquisition/users"):
+    for path in _ACQ_ENDPOINTS:
         r = client.get(path)
         assert r.status_code == 403, path
 
 
-def test_admin_acquisition_json_backend_pg_required():
-    if BACKEND == "postgres":
-        pytest.skip("json 后端专用 fail-closed 用例")
+def test_acquisition_endpoints_retired_410():
+    """Batch D1 15（§4.4）：owner 请求 → 稳定 410 user_attribution_retired
+    （两个后端一致，不再有 json 503 分支）。"""
     owner = _mk_owner()
     app_mod.AUTH_ENABLED = True
     client = _client()
     _owner_session(client, owner)
-    for path in ("/api/admin/v1/acquisition/summary",
-                 "/api/admin/v1/acquisition/users"):
+    for path in _ACQ_ENDPOINTS:
         r = client.get(path)
-        assert r.status_code == 503, path
-        assert r.get_json()["error"]["code"] == "pg_backend_required"
+        assert r.status_code == 410, path
+        assert r.get_json()["error"]["code"] == "user_attribution_retired"
+        assert "site-stats" in r.get_json()["error"]["message"]
 
 
 # =========================================================================== #
@@ -365,6 +359,56 @@ if BACKEND == "postgres":
                             (user_id,))
                 row = cur.fetchone()
             return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def _acq_total():
+        conn = _pg_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*)::int AS n FROM user_acquisition")
+                return int(cur.fetchone()["n"])
+        finally:
+            conn.close()
+
+    def _visits_total():
+        """acquisition_visits 全表行数（Batch D1 16：/r/ 不再新增触点行）。"""
+        conn = _pg_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT count(*)::int AS n FROM acquisition_visits")
+                return int(cur.fetchone()["n"])
+        finally:
+            conn.close()
+
+    def _count_override_rows():
+        """user_override 月额度策略行数（Batch B 起新注册不再创建）。"""
+        conn = _pg_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*)::int AS n FROM ai_spend_policies "
+                            "WHERE scope_type='user_override'")
+                return int(cur.fetchone()["n"])
+        finally:
+            conn.close()
+
+    def _insert_historical_attribution(user_id, visit_id, campaign=None):
+        """直接 SQL 造一条 user_acquisition（模拟冻结前的**历史**归因行——
+        Batch B 起写路径已冻结，仅历史数据读取/清理语义仍需覆盖）。"""
+        conn = _pg_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO user_acquisition (user_id, "
+                    "first_acquisition_id, last_acquisition_id, invite_id, "
+                    "source_code, campaign_id, attributed_at, "
+                    "attribution_method) VALUES (%s,%s,%s,NULL,%s,%s,now(),"
+                    "'visit')",
+                    (user_id, visit_id["acquisition_id"],
+                     visit_id["acquisition_id"], visit_id["source_code"],
+                     campaign))
+            conn.commit()
         finally:
             conn.close()
 
@@ -456,132 +500,62 @@ def test_visit_rows_are_immutable_events_not_upserted():
 
 
 @pg_only
-def test_attribution_priority_invite_campaign_first():
+def test_redeem_writes_no_user_acquisition_but_total_allowance():
+    """Batch B §4.4/§Batch B：兑换与归因解耦——无论触点/UTM/邀请来源如何，
+    兑换成功但 user_acquisition **零新增**；带初始额度的邀请同事务建一次性
+    总额度（不再建 user_override）。"""
     owner = _mk_owner()
-    _seed_campaign("camp-inv", "invsrc")
     _seed_campaign("camp-web", "websrc")
+    _seed_campaign("camp-inv", "invsrc")
     vid = acq_store.new_visitor_id()
     acq_store.record_visit(visitor_id=vid, source_code="websrc",
                            campaign_id="camp-web")
-    inv = _mk_invite(owner["user_id"], campaign_id="camp-inv")
+    before = _acq_total()
+    inv = _mk_invite(owner["user_id"], campaign_id="camp-inv",
+                     total_limit_nano_cny=12 * 10 ** 9)
     out = _redeem(inv, "prio1@x.com",
                   acq={"visitor_id": vid, "utm_source": "ignored"})
-    ua = _ua(out["user"]["user_id"])
-    assert ua["attribution_method"] == "invite_campaign"
-    assert ua["campaign_id"] == "camp-inv"
-    assert ua["source_code"] == "invsrc"
-    # 触点仍保留 first/last id（完整路径不丢）
-    assert ua["first_acquisition_id"] is not None
-    assert ua["last_acquisition_id"] is not None
-    assert ua["invite_id"] == inv["invite_id"]
-
-
-@pg_only
-def test_attribution_priority_invite_source_then_visit():
-    owner = _mk_owner()
-    _seed_campaign("camp-web", "websrc")
-    vid = acq_store.new_visitor_id()
-    acq_store.record_visit(visitor_id=vid, source_code="websrc",
-                           campaign_id="camp-web")
-    # 邀请只有 source（无 campaign）→ 仍高于触点
-    inv = _mk_invite(owner["user_id"], source_code="invsrc2")
-    out = _redeem(inv, "prio2@x.com", acq={"visitor_id": vid})
-    ua = _ua(out["user"]["user_id"])
-    assert ua["attribution_method"] == "invite_source"
-    assert ua["source_code"] == "invsrc2"
-    assert ua["campaign_id"] is None
-    # 无邀请来源 → 触点路径（last touch 记 source/campaign）
+    # 注册成功 + allowance 建成；归因零新增
+    assert user_store.get_user_by_login_id("prio1@x.com") is not None
+    assert out["total_allowance"]["limit_nano_cny"] == 12 * 10 ** 9
+    assert out["total_allowance"]["source"] == "invite"
+    assert out["acquisition"] is None  # 兼容键恒 None（退役）
+    assert _acq_total() == before
+    assert _ua(out["user"]["user_id"]) is None
+    assert _count_override_rows() == 0
+    # 无初始额度的邀请：不建行（由 cutover/首开授权处理）
     inv2 = _mk_invite(owner["user_id"])
-    out2 = _redeem(inv2, "prio3@x.com", acq={"visitor_id": vid})
-    ua2 = _ua(out2["user"]["user_id"])
-    assert ua2["attribution_method"] == "visit"
-    assert ua2["source_code"] == "websrc"
-    assert ua2["campaign_id"] == "camp-web"
+    out2 = _redeem(inv2, "prio2@x.com", acq={"visitor_id": vid})
+    assert out2["total_allowance"] is None
+    assert _acq_total() == before
 
 
 @pg_only
-def test_attribution_first_last_touch_across_campaigns_not_collapsed():
-    owner = _mk_owner()
-    _seed_campaign("camp-a", "srca")
-    _seed_campaign("camp-b", "srcb")
-    vid = acq_store.new_visitor_id()
-    v1 = acq_store.record_visit(visitor_id=vid, source_code="srca",
-                                campaign_id="camp-a")
-    time.sleep(0.01)
-    v2 = acq_store.record_visit(visitor_id=vid, source_code="srcb",
-                                campaign_id="camp-b")
-    inv = _mk_invite(owner["user_id"])
-    out = _redeem(inv, "fl@x.com", acq={"visitor_id": vid})
-    ua = _ua(out["user"]["user_id"])
-    assert ua["first_acquisition_id"] == v1["acquisition_id"]
-    assert ua["last_acquisition_id"] == v2["acquisition_id"]
-    assert ua["source_code"] == "srcb"  # last touch（转化触点）
-    assert ua["campaign_id"] == "camp-b"
-
-
-@pg_only
-def test_attribution_priority_referrer_utm_then_direct():
-    owner = _mk_owner()
-    _seed_campaign("camp-uc", "ucsrc")
-    # utm_campaign 命中已知 active campaign → campaign 归因
-    inv = _mk_invite(owner["user_id"])
-    out = _redeem(inv, "ru1@x.com", acq={
-        "utm_campaign": "camp-uc", "utm_source": "ignored"})
-    ua = _ua(out["user"]["user_id"])
-    assert ua["attribution_method"] == "referrer_utm"
-    assert ua["campaign_id"] == "camp-uc" and ua["source_code"] == "ucsrc"
-    # 无 utm_campaign → utm_source slug
-    inv2 = _mk_invite(owner["user_id"])
-    out2 = _redeem(inv2, "ru2@x.com", acq={"utm_source": "newsletter"})
-    ua2 = _ua(out2["user"]["user_id"])
-    assert ua2["attribution_method"] == "referrer_utm"
-    assert ua2["source_code"] == "newsletter" and ua2["campaign_id"] is None
-    # 再无 utm_source → referrer hostname（不是原始 query）
-    inv3 = _mk_invite(owner["user_id"])
-    out3 = _redeem(inv3, "ru3@x.com", acq={
-        "referrer_domain": "https://blog.example.com/lp?x=1"})
-    ua3 = _ua(out3["user"]["user_id"])
-    assert ua3["attribution_method"] == "referrer_utm"
-    assert ua3["source_code"] == "blog.example.com"
-    # 无任何信号 → direct/unknown（acq=None 老调用兼容）
-    inv4 = _mk_invite(owner["user_id"])
-    out4 = _redeem(inv4, "ru4@x.com")
-    ua4 = _ua(out4["user"]["user_id"])
-    assert ua4["attribution_method"] == "direct"
-    assert ua4["source_code"] == "unknown"
-
-
-@pg_only
-def test_expired_visits_not_used_for_attribution():
+def test_expired_visits_and_tampered_visitor_are_ignored_frozen():
+    """Batch B：触点过期/visitor 不匹配语义随写路径冻结一并退役——兑换根本
+    不读取触点；本用例锁定「兑换后归因行仍为零」。"""
     owner = _mk_owner()
     vid = acq_store.new_visitor_id()
     acq_store.record_visit(visitor_id=vid, source_code="expired-src")
     _expire_all_visits()
+    before = _acq_total()
     inv = _mk_invite(owner["user_id"])
     out = _redeem(inv, "exp@x.com", acq={"visitor_id": vid})
-    ua = _ua(out["user"]["user_id"])
-    assert ua["attribution_method"] == "direct"  # 过期触点不参与
-    assert ua["first_acquisition_id"] is None
-    assert ua["last_acquisition_id"] is None
-
-
-@pg_only
-def test_cookie_tampered_visitor_not_matched():
-    owner = _mk_owner()
-    vid = acq_store.new_visitor_id()
-    acq_store.record_visit(visitor_id=vid, source_code="s")
-    # visitor_id 与 cookie 不匹配（另一访客）→ 不归因到该触点
+    assert out["acquisition"] is None
+    assert _acq_total() == before
+    # visitor 不匹配（另一访客）同样无关紧要——不读取
     other = acq_store.new_visitor_id()
     assert other != vid
-    inv = _mk_invite(owner["user_id"])
-    out = _redeem(inv, "tamper@x.com", acq={"visitor_id": other})
-    ua = _ua(out["user"]["user_id"])
-    assert ua["attribution_method"] == "direct"
+    out2 = _redeem(_mk_invite(owner["user_id"]), "tamper@x.com",
+                   acq={"visitor_id": other})
+    assert out2["acquisition"] is None
+    assert _acq_total() == before
 
 
 @pg_only
-def test_redeem_atomic_user_acquisition_failure_rolls_back(monkeypatch):
-    """故障注入：user_acquisition 写入失败 → 用户不创建、邀请不消费。"""
+def test_redeem_succeeds_even_if_acquisition_store_broken(monkeypatch):
+    """Batch B 红线：站点统计故障绝不能阻断注册——归因已不在兑换事务内，
+    insert_user_acquisition 注入失败不再影响兑换（用户创建、邀请消费）。"""
     owner = _mk_owner()
     inv = _mk_invite(owner["user_id"], login_id="boom@x.com")
 
@@ -589,30 +563,21 @@ def test_redeem_atomic_user_acquisition_failure_rolls_back(monkeypatch):
         raise RuntimeError("injected acquisition failure")
 
     monkeypatch.setattr(acq_store, "insert_user_acquisition", _boom)
-    with pytest.raises(RuntimeError):
-        registration_store.redeem_invite(inv["token"], "boom@x.com",
-                                         "longpassword123",
-                                         acq={"utm_source": "x"})
-    assert user_store.get_user_by_login_id("boom@x.com") is None
+    out = registration_store.redeem_invite(inv["token"], "boom@x.com",
+                                           "longpassword123",
+                                           acq={"utm_source": "x"})
+    assert user_store.get_user_by_login_id("boom@x.com") is not None
     row = registration_store.get_invite(inv["invite_id"])
-    assert row["use_count"] == 0 and row["consumed_at"] is None
-    # 无 user_acquisition 残留
-    conn = _pg_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT count(*)::int AS n FROM user_acquisition")
-            assert cur.fetchone()["n"] == 0
-    finally:
-        conn.close()
-    # 注入解除后同一邀请可正常兑换（含归因）
-    monkeypatch.undo()
-    out = _redeem(inv, "boom@x.com", acq={"utm_source": "x"})
-    assert _ua(out["user"]["user_id"])["source_code"] == "x"
+    assert row["use_count"] == 1 and row["consumed_at"] is not None
+    assert _acq_total() == 0  # 全程零归因写入
 
 
 @pg_only
 def test_visit_retention_deletes_scrubs_and_is_idempotent(monkeypatch):
-    """§11.3 PR5：过期引用行脱敏、未引用行删除、未到期不动、计数正确。"""
+    """§11.3 PR5：过期引用行脱敏、未引用行删除、未到期不动、计数正确。
+
+    Batch B 起兑换不再写归因——「被引用」行用直接 SQL 造的**历史**归因行
+    （冻结前数据），引用/清理语义照旧覆盖。"""
     monkeypatch.setenv("ACQ_IP_SALT", "salt-ret")   # 让 ip_prefix_hash 非空
     owner = _mk_owner()
     _seed_campaign("keep-camp", "keep")
@@ -627,8 +592,11 @@ def test_visit_retention_deletes_scrubs_and_is_idempotent(monkeypatch):
     fresh = acq_store.record_visit(
         visitor_id=acq_store.new_visitor_id(), source_code="fresh",
         utm_source="stay", ip="198.51.100.9")
-    inv = _mk_invite(owner["user_id"])
-    _redeem(inv, "clean@x.com", acq={"visitor_id": vid})
+    # 历史归因行（冻结写路径前的形态）：引用 referenced 触点
+    attr_user = user_store.create_user("retention-hist@x.com",
+                                       "userpass1234567")
+    _insert_historical_attribution(attr_user["user_id"], referenced,
+                                   campaign="keep-camp")
     # 只把 stale 与 referenced 标过期
     conn = _pg_conn()
     try:
@@ -704,7 +672,8 @@ def test_acquisition_retention_daemon_switch(monkeypatch):
 
 @pg_only
 def test_register_route_full_acquisition_flow(monkeypatch):
-    """全链路：/r/ 设 cookie → 落触点 → /register POST 事务内归因。"""
+    """Batch D1 16/17 全链路：/r/ 只做安全 302（零触点行、清 cookie）、注册
+    成功且 user_acquisition **零新增**（注册与归因彻底解耦）。"""
     _satisfy_preconditions(monkeypatch)
     _seed_campaign("camp-flow", "mywebpage")
     owner = _mk_owner()
@@ -716,73 +685,70 @@ def test_register_route_full_acquisition_flow(monkeypatch):
     inv = client.post("/api/admin/registration-invites",
                       json={"login_id": "flow-acq@x.com"}).get_json()
     anon = _client()
-    # 访客从 mywebpage CTA 进入（campaign 已登记 → 触点关联；utm_medium 一并落）
+    before = _acq_total()
+    # 访客从旧 mywebpage CTA 进入：安全 302，触点表零新增、旧 cookie 被清除
     r = anon.get("/r/mywebpage?campaign=camp-flow&utm_medium=cta&next=evil")
     assert r.status_code == 302 and r.headers["Location"] == "/register"
+    assert "Expires=Thu, 01 Jan 1970" in r.headers.get("Set-Cookie", "")
+    assert _visits_total() == 0  # record_visit 不再被 /r/ 调用
     anon.get("/register")
     r2 = anon.post("/register", data={
         "invite_token": inv["token"], "login_id": "flow-acq@x.com",
         "password": "longpassword123", "password_confirm": "longpassword123"})
     assert r2.status_code == 302, r2.get_data(as_text=True)
     user = user_store.get_user_by_login_id("flow-acq@x.com")
-    ua = _ua(user["user_id"])
-    # 邀请无 campaign/source → 走触点路径（last touch = mywebpage/camp-flow）
-    assert ua["attribution_method"] == "visit"
-    assert ua["source_code"] == "mywebpage"
-    assert ua["campaign_id"] == "camp-flow"
-    assert ua["invite_id"] == inv["invite_id"]
-    # 邀请码绝不进 URL/query（CTA 与注册请求都只有 POST body 携带）
+    assert user is not None  # 注册成功（不再被归因写路径阻断）
+    assert _ua(user["user_id"]) is None and _acq_total() == before
+    # 兑换 audit 不携带来源/归因字段
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT detail::text AS d FROM audit_events WHERE "
+                        "action='registration.user_created'")
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    assert rows  # app 层审计在（字段本就不含来源）
+    # 邀请码绝不进 URL/query
     assert inv["token"] not in r2.get_data(as_text=True)
 
 
 @pg_only
-def test_admin_summary_funnel_counts_with_first_ai():
+def test_admin_summary_funnel_reads_frozen_history_only():
+    """Batch B：漏斗汇总继续可读**历史**行；新注册不再进入漏斗
+    （registrations 不因兑换增长）。"""
     owner = _mk_owner()
     _seed_campaign("camp-f1", "srcf1")
-    _seed_campaign("camp-f2", "srcf2")
-    # 访客 A：两次不同 campaign 跳转（first=c1 last=c2）→ 注册 → 有 AI 事件
-    vid_a = acq_store.new_visitor_id()
-    acq_store.record_visit(visitor_id=vid_a, source_code="srcf1",
+    vid = acq_store.new_visitor_id()
+    acq_store.record_visit(visitor_id=vid, source_code="srcf1",
                            campaign_id="camp-f1")
-    time.sleep(0.01)
-    acq_store.record_visit(visitor_id=vid_a, source_code="srcf2",
-                           campaign_id="camp-f2")
-    out_a = _redeem(_mk_invite(owner["user_id"]), "funa@x.com",
-                    acq={"visitor_id": vid_a})
-    _insert_usage_event(out_a["user"]["user_id"], hours_back=2)
-    # 访客 B：仅 c1 跳转 → 注册 → 无 AI 事件
-    vid_b = acq_store.new_visitor_id()
-    acq_store.record_visit(visitor_id=vid_b, source_code="srcf1",
-                           campaign_id="camp-f1")
-    _redeem(_mk_invite(owner["user_id"]), "funb@x.com",
-            acq={"visitor_id": vid_b})
-    # 访客 C：仅跳转未注册
-    acq_store.record_visit(visitor_id=acq_store.new_visitor_id(),
-                           source_code="srcf2", campaign_id="camp-f2")
-
+    v = _visits(vid)[0]
+    attr_user = user_store.create_user("funnel-hist@x.com",
+                                       "userpass1234567")
+    _insert_historical_attribution(attr_user["user_id"], v,
+                                   campaign="camp-f1")
+    _insert_usage_event(attr_user["user_id"], hours_back=2)
+    # 兑换不再产生归因：新用户不进漏斗
+    _redeem(_mk_invite(owner["user_id"]), "funnew@x.com")
     summary = acq_store.admin_funnel_summary()
     rows = {(r["source_code"], r["campaign_id"]): r for r in summary["items"]}
     c1 = rows[("srcf1", "camp-f1")]
-    c2 = rows[("srcf2", "camp-f2")]
-    assert c1["visits"] == 2 and c1["visitors"] == 2
-    assert c1["registrations"] == 1        # B 归因到 c1（last touch）
-    assert c1["first_ai_count"] == 0
-    assert c2["visits"] == 2 and c2["visitors"] == 2
-    assert c2["registrations"] == 1        # A 归因到 c2（last touch）
-    assert c2["first_ai_count"] == 1
-    assert summary["totals"]["visits"] == 4
-    assert summary["totals"]["registrations"] == 2
-    assert summary["totals"]["first_ai_count"] == 1
-    assert {c["campaign_id"] for c in summary["campaigns"]} >= \
-        {"camp-f1", "camp-f2"}
+    assert c1["visits"] == 1 and c1["visitors"] == 1
+    assert c1["registrations"] == 1       # 仅历史归因行
+    assert c1["first_ai_count"] == 1      # 历史 user 的 AI 事件可读
+    assert summary["totals"]["registrations"] == 1
 
 
 @pg_only
-def test_admin_users_endpoint_pagination_and_masking(monkeypatch):
-    """明细分页 + 脱敏（login 掩码、visitor 前缀、first/last 分列）。"""
+def test_admin_users_endpoint_no_new_attribution_but_masking_kept(monkeypatch):
+    """Batch D1 15/17：acquisition/users 明细端点退役（410）；写路径冻结用
+    数据库行数断言——新注册零归因行；历史归因行（SQL 造的冻结前形态）仍
+    只能经审计工具/SQL 读取（脱敏红线由表结构保证，不再有 API 出口）。"""
     _satisfy_preconditions(monkeypatch)
     owner = _mk_owner()
     app_mod.AUTH_ENABLED = True
+    client = _client()
+    _owner_session(client, owner)
     vid = acq_store.new_visitor_id()
     first = acq_store.record_visit(visitor_id=vid, source_code="s1",
                                    referrer_domain="https://a.example.com/x?q=1")
@@ -792,64 +758,32 @@ def test_admin_users_endpoint_pagination_and_masking(monkeypatch):
         _mk_invite(owner["user_id"], login_id="Maskme@x.com")["token"],
         "maskme@x.com", "longpassword123", "Masked User",
         acq={"visitor_id": vid})
-    # 第二个归因用户（direct）制造分页
-    out2 = _redeem(_mk_invite(owner["user_id"]), "second-acq@x.com")
-    client = _client()
-    _owner_session(client, owner)
-
-    seen = []
-    cursor = None
-    pages = 0
-    while True:
-        url = "/api/admin/v1/acquisition/users?limit=1"
-        if cursor:
-            url += "&cursor=" + cursor
-        r = client.get(url)
-        assert r.status_code == 200, r.get_data(as_text=True)
-        body = r.get_json()
-        pages += 1
-        seen.extend(i["user_id"] for i in body["items"])
-        cursor = body["next_cursor"]
-        if not cursor:
-            break
-    assert pages == 2 and len(seen) == 2 and len(set(seen)) == 2
-    assert {out["user"]["user_id"], out2["user"]["user_id"]} == set(seen)
-
-    body = client.get("/api/admin/v1/acquisition/users?limit=10").get_json()
-    item = next(i for i in body["items"]
-                if i["user_id"] == out["user"]["user_id"])
-    raw = json.dumps(body)
-    # 脱敏红线：原始账号不回显；visitor 只给前缀；无 IP；无 referrer query
-    assert item["login_id_masked"] == "m***@x.com"
-    assert "login_id" not in item
-    vhash = acq_store.visitor_id_hash(vid)
-    assert vhash not in raw
-    assert len(item["first_touch"]["visitor_hash_prefix"]) == 8
-    assert item["first_touch"]["referrer_domain"] == "a.example.com"
-    assert "ip_prefix" not in raw and "?q=" not in raw
-    # first/last 分列
-    assert item["first_touch"]["acquisition_id"] == first["acquisition_id"]
-    assert item["first_touch"]["source_code"] == "s1"
-    assert item["last_touch"]["acquisition_id"] == last["acquisition_id"]
-    assert item["last_touch"]["source_code"] == "s2"
-    assert item["source_code"] == "s2"
-    assert item["attribution_method"] == "visit"
-    # 损坏 cursor → 当作第一页（不 500）
-    r2 = client.get("/api/admin/v1/acquisition/users?cursor=%% %%bad")
-    assert r2.status_code == 200
-    # summary 端点同门控（owner 已登录）
-    r3 = client.get("/api/admin/v1/acquisition/summary")
-    assert r3.status_code == 200
-    sbody = r3.get_json()
-    assert sbody["registration_mode"] in ("closed", "invite_only")
-    assert any(i["source_code"] == "s2" and i["visits"] == 1
-               for i in sbody["items"])
-    sraw = json.dumps(sbody)
-    assert "ip_prefix" not in sraw and "?q=" not in sraw
+    # 明细端点退役：owner 请求稳定 410（不再有任何来源明细出口）
+    r = client.get("/api/admin/v1/acquisition/users?limit=10")
+    assert r.status_code == 410
+    assert r.get_json()["error"]["code"] == "user_attribution_retired"
+    # 新兑换零归因：直接 SQL 证明明细数据不存在
+    assert _ua(out["user"]["user_id"]) is None
+    # 历史归因行（冻结前形态）仍可写历史读（表冻结 ≠ 数据消失）
+    _insert_historical_attribution(out["user"]["user_id"], first)
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT first_acquisition_id, last_acquisition_id "
+                        "FROM user_acquisition WHERE user_id=%s",
+                        (out["user"]["user_id"],))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row["first_acquisition_id"] == first["acquisition_id"]
+    assert row["last_acquisition_id"] == first["acquisition_id"]
 
 
 @pg_only
-def test_admin_v1_users_row_fills_campaign_source(monkeypatch):
+def test_admin_v1_users_row_attribution_frozen_to_null(monkeypatch):
+    """Batch D1 14（§4.4）：users 列表行**整键删除** campaign/source（不再
+    查询归因表）；registration_method 仍为 invite。"""
     _satisfy_preconditions(monkeypatch)
     owner = _mk_owner()
     app_mod.AUTH_ENABLED = True
@@ -861,8 +795,9 @@ def test_admin_v1_users_row_fills_campaign_source(monkeypatch):
     r = client.get("/api/admin/v1/users?q=campfill@x.com").get_json()
     assert len(r["items"]) == 1
     item = r["items"][0]
-    assert item["source"] == "srcfill"
-    assert item["campaign"] is None
+    # 归因键整键删除（不是留位 null）——历史行存在与否都不再回显
+    assert "source" not in item
+    assert "campaign" not in item
     assert item["registration_method"] == "invite"
 
 

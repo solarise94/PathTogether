@@ -236,8 +236,8 @@ def _insert_user_tx(cur, uid, norm_login, name, password, role, now,
                     ai_access=True):
     """在调用方事务的 cursor 内插入用户行，返回公共列 dict（不提交）。
 
-    供 :func:`create_user` 与 :func:`create_user_with_spend_override` 共用
-    （后者要求 user 行与 override 策略/audit 同一事务）。ai_access 缺省
+    供 :func:`create_user` 与 :func:`create_user_with_total_allowance`
+    共用（后者要求 user 行与总额度/audit 同一事务）。ai_access 缺省
     True 与 users.ai_access 列默认一致（保持 create_user 既有行为；邀请
     兑换路径经 registration_store 的显式模板值，不经本函数）。
     """
@@ -253,22 +253,28 @@ def _insert_user_tx(cur, uid, norm_login, name, password, role, now,
     return cur.fetchone()
 
 
-def create_user_with_spend_override(login_id, password, display_name=None,
-                                    ai_access=True,
-                                    monthly_limit_nano_cny=None,
-                                    actor_user_id=None):
-    """**单个 PostgreSQL 事务**内：创建 role=user 用户 + 可选月额度覆盖 + audit。
+def create_user_with_total_allowance(login_id, password, display_name=None,
+                                     ai_access=True,
+                                     total_limit_nano_cny=None,
+                                     actor_user_id=None):
+    """**单个 PostgreSQL 事务**内：创建 role=user 用户 + 可选一次性总额度 + audit。
 
-    批次 D（docs ai-money-budget-bugfix-and-simplification-plan.md §5.1）：
-    owner 经 admin v1 建号时可选 ``monthly_limit_nano_cny``（nano-CNY 整数；
-    None = 继承全局 user_default，不建 override 行）。user 插入、override
-    策略（spend_store.set_user_override_tx）与 ``user.create`` 审计
-    （share_store_pg.record_audit_tx，不吞错）全部同一事务，任一失败整体
-    回滚（用户不存在半创建状态）。
+    Batch B（docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
+    §Batch B 数据模型 6 / 迁移与额度语义 14）：owner 经 admin v1 建号时可选
+    ``total_limit_nano_cny``（nano-CNY 整数）。wire 语义：**带 X 才建行**，
+    不带则不建（该用户由 cutover 回填或首个显式 set/restore-default 处理，
+    不在无金额时伪造 0 额度）。user 插入、总额度行
+    （spend_store.create_user_total_allowance_tx，source=``admin_create``）
+    与 ``user.create`` 审计（share_store_pg.record_audit_tx，不吞错）全部
+    同一事务，任一失败整体回滚（用户不存在半创建状态）。
+
+    **停止创建 user_override 月额度策略**（Batch B：月窗口对 user 退役；
+    旧 user_override 策略 cutover 后只读保留）。audit detail 的金额键为
+    ``total_limit_nano_cny``。
 
     本入口只创建普通用户（role=user；owner 建号走主机侧 break-glass，docs
     §3.2 不变量 5）。登录账号冲突抛 ValueError（与 create_user 同文案）。
-    返回 ``(user_dict, override_policy_dict_or_None)``。
+    返回 ``(user_dict, allowance_dict_or_None)``。
     """
     norm_login = _normalize_login_id(login_id)
     if not norm_login:
@@ -288,12 +294,13 @@ def create_user_with_spend_override(login_id, password, display_name=None,
                     row = _insert_user_tx(
                         cur, uid, norm_login, name, password, ROLE_USER, now,
                         ai_access=ai_access)
-                    override = None
-                    if monthly_limit_nano_cny is not None:
-                        override = spend_store.set_user_override_tx(
-                            cur, uid, monthly_limit_nano_cny,
-                            updated_by=actor_user_id or "admin",
-                            actor_user_id=actor_user_id)
+                    allowance = None
+                    if total_limit_nano_cny is not None:
+                        allowance = spend_store.create_user_total_allowance_tx(
+                            cur, uid, total_limit_nano_cny,
+                            source="admin_create",
+                            actor_user_id=actor_user_id,
+                            updated_by=actor_user_id or "admin")
                     # 审计 detail 只含非敏感字段（§9.6：无密码/token/IP）
                     share_store_pg.record_audit_tx(
                         cur, "user.create", actor_user_id=actor_user_id,
@@ -302,15 +309,42 @@ def create_user_with_spend_override(login_id, password, display_name=None,
                         detail={
                             "role": ROLE_USER,
                             "ai_access": bool(ai_access),
-                            "monthly_limit_nano_cny":
-                                None if override is None
-                                else int(override["limit_nano_cny"]),
+                            "total_limit_nano_cny":
+                                None if allowance is None
+                                else int(allowance["limit_nano_cny"]),
                         })
         except psycopg.errors.UniqueViolation as exc:
             raise ValueError(_unique_violation_message(exc)) from exc
-        return _public(row), override
+        return _public(row), allowance
     finally:
         conn.close()
+
+
+def create_user_with_spend_override(login_id, password, display_name=None,
+                                    ai_access=True,
+                                    monthly_limit_nano_cny=None,
+                                    actor_user_id=None, *,
+                                    total_limit_nano_cny=None):
+    """兼容壳（Batch B）：旧名保留供 wave 2 前的 app.py 调用，内部转新实现。
+
+    - ``total_limit_nano_cny``（新名）与 ``monthly_limit_nano_cny``（旧 wire
+      名，一个兼容发布周期内可读）二选一；**同时传两者抛稳定 ValueError
+      ``ambiguous_spend_limit``**（路由层映射 400，§Batch B 数据模型 6）；
+    - 月额度覆盖语义已退役：携带的金额一律按**一次性总额度**创建
+      （不再写 user_override，月策略对 user 不再是新语义的载体）；
+    - 其余语义见 :func:`create_user_with_total_allowance`。
+    """
+    if monthly_limit_nano_cny is not None and total_limit_nano_cny is not None:
+        raise ValueError(
+            "ambiguous_spend_limit：monthly_limit_nano_cny 与 "
+            "total_limit_nano_cny 只能传其一（旧月额度字段已退役，请在兼容"
+            "期内只传 total_limit_nano_cny）")
+    return create_user_with_total_allowance(
+        login_id, password, display_name=display_name, ai_access=ai_access,
+        total_limit_nano_cny=(total_limit_nano_cny
+                              if total_limit_nano_cny is not None
+                              else monthly_limit_nano_cny),
+        actor_user_id=actor_user_id)
 
 
 def _unique_violation_message(exc):

@@ -1,9 +1,7 @@
 /* pathtogether-admin 插件 UI 样式（PR3 骨架 + 包 E 工作台化 +
-   2026-09-01 评审升级：表单 field 组件、按钮语义层、金额 raw 展开区、
-   legacy 中性卡、紧凑握手状态点，review-2026-09-01-admin-ui.md §5 +
-   2026-09-01 金额简化：用户表 5 列（窄屏 4 列）、抽屉技术细节折叠、
-   Demo/Owner 立即调整折叠入口、账单页运维明细折叠，
-   review-2026-09-01-admin-money-simplify.md §5）。
+   2026-09-01 评审升级 + 2026-09-03 wave 2 收敛：
+   费用明细页内标签、行详情折叠区、Demo 异常色卡、概览站点访问卡，
+   review-2026-09-02-upload-user-limits-admin-ui-cleanup.md §4）。
    运行在 opaque iframe 内；只允许外链同源 CSS（响应 CSP style-src <origin>，
    无内联样式——可变宽度一律用预置宽度桶类，不写 style 属性）。
 
@@ -482,6 +480,41 @@ body {
 .adm-audit-summary { line-height: 1.7; margin-bottom: 4px; overflow-wrap: anywhere; }
 .adm-cell-detail { word-break: normal; white-space: normal; overflow-wrap: anywhere; min-width: 220px; }
 .adm-cell-detail .adm-raw-values { border-top: none; padding-top: 0; }
+
+/* ---- wave 2（§4.6）：费用明细页内标签（键盘可达：方向键切换 +
+   aria-selected + 可见焦点；单一内容区由 JS 切换） ---- */
+.adm-tabs {
+  display: flex; gap: 4px; flex-wrap: wrap;
+  border-bottom: 1px solid var(--separator); margin: 10px 0 14px;
+}
+.adm-tab {
+  font-size: 13px; padding: 7px 14px; cursor: pointer;
+  border: 1px solid transparent; border-bottom: none;
+  background: transparent; color: var(--text-2);
+  border-radius: 8px 8px 0 0; white-space: nowrap; font-family: inherit;
+}
+.adm-tab:hover { color: var(--accent); background: var(--accent-soft); }
+.adm-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.adm-tab[aria-selected="true"] {
+  background: var(--accent); border-color: var(--accent);
+  color: #fff; font-weight: 600;
+}
+.adm-tabpanel { min-width: 0; }
+
+/* ---- wave 2：usage/ledger 行详情折叠区（放行字段收进全宽子行） ---- */
+.adm-detail-row > td {
+  background: rgba(0, 0, 0, 0.015); white-space: normal;
+  word-break: normal; overflow-wrap: anywhere;
+}
+.adm-detail-kv { grid-template-columns: 180px 1fr; margin: 6px 0; }
+
+/* ---- wave 2：Demo 消耗卡异常色（仅 unpriced>0 / 统计不完整 / 超额才加） ---- */
+.adm-card--anomaly { border: 1px solid rgba(255, 59, 48, 0.35); }
+.adm-card--anomaly h2 { color: var(--danger); }
+
+/* ---- wave 2（§4.2）：概览「站点访问」匿名统计卡 ---- */
+.adm-site-h3 { font-size: 13px; font-weight: 600; margin: 16px 0 8px; }
+.adm-site-grid { margin-top: 4px; }
 
 /* ---- 响应式（§9.3 + §4.3 移动端列适配） ---- */
 @media (max-width: 1023px) {

@@ -602,12 +602,18 @@ def test_admin_manifest_v1_1_validates():
     data = json.loads(ADMIN_MANIFEST.read_text(encoding="utf-8"))
     assert M.validate_manifest(data) == []
     assert M.check_manifest_schema_supported(data["manifestSchemaVersion"]) is True
-    # 批次 F：manifest 移除 admin:turn-budgets:write（桥方法与服务端写端点
-    # 均已退役）；词汇表仍保留该串（存量 0.2.x manifest 的兼容词表），故
-    # 断言改为「子集且不含退役项」
-    assert set(data["adminPermissions"]) <= set(M.MANIFEST_ADMIN_PERMISSIONS)
-    assert "admin:turn-budgets:write" not in data["adminPermissions"]
-    assert "admin:turn-budgets:read" in data["adminPermissions"]
+    # wave 2（2026-09-03，review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
+    # Batch C5-6/D1）：manifest adminPermissions 删除 turn read / billing write /
+    # acquisition read；SDK 词表同步删除（含早已无 manifest 消费者的
+    # turn-budgets:write 死枚举），断言改为「精确等于新 11 项词表」
+    assert set(data["adminPermissions"]) == set(M.MANIFEST_ADMIN_PERMISSIONS)
+    for retired in ("admin:turn-budgets:read", "admin:turn-budgets:write",
+                    "admin:billing:write", "admin:acquisition:read"):
+        assert retired not in data["adminPermissions"]
+    # 站点访问 / Demo 周统计复用 admin:overview:read（不新增权限域）
+    assert "admin:overview:read" in data["adminPermissions"]
+    assert "admin:settings:read" in data["adminPermissions"]
+    assert "admin:settings:write" in data["adminPermissions"]
 
 
 def test_admin_permissions_enum_and_type_enforced():
@@ -890,11 +896,12 @@ def test_manifest_validator_enforces_filehashes_structure():
 
 
 def test_admin_manifest_plugin_version_bumped_with_hashes():
-    """复核收口：pluginVersion 0.2.0 与 release 目录对齐，fileHashes 覆盖
+    """复核收口：pluginVersion 与 release 目录对齐，fileHashes 覆盖
     全部可服务 UI 文件（manifest 的入口/资源不得游离声明之外）。批次 D 起
-    manifest 申请 admin:settings:read/write（统一设置页，§6.5）。"""
+    manifest 申请 admin:settings:read/write（统一设置页，§6.5）。wave 2
+    （2026-09-03）升 0.3.4：UI 收敛 + adminPermissions 削减，hashes/pin 同步。"""
     data = json.loads(ADMIN_MANIFEST.read_text(encoding="utf-8"))
-    assert data["pluginVersion"] == "0.3.3"  # 2026-09-01 金额简化：UI 收敛，hashes/pin 同步
+    assert data["pluginVersion"] == "0.3.4"  # wave 2：UI 收敛，hashes/pin 同步
     assert "admin:settings:read" in data["adminPermissions"]
     assert "admin:settings:write" in data["adminPermissions"]
     hashes = data["ui"]["fileHashes"]

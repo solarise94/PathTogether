@@ -115,6 +115,9 @@ if _RUN_PG:
         # users/registration_invites/acquisition_visits，acquisition_visits 引用
         # acquisition_campaigns——显式列出保证跨用例无残留
         "user_acquisition", "acquisition_visits", "acquisition_campaigns",
+        # 0030 起：Batch D2 站点匿名访问事件（无用户外键、无 IP/UA/query/
+        # token/资源 ID 列；worker 批量写跨用例必残留，显式列出清空）
+        "site_visit_events",
     )
 
     @pytest.fixture(scope="session")

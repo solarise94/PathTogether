@@ -275,6 +275,14 @@ def _user_with_account(email, grant_nano=None):
     return user
 
 
+def _squeeze_total_limit(user_id, limit_nano):
+    """把 user 总额度压到指定面值（建号默认 20 CNY、version=1）——
+    单轨后 user 的 would_deny/拒绝口径是 ai_spend_total_allowances。"""
+    import spend_store
+    return spend_store.set_user_total_limit(
+        user_id, int(limit_nano), 1, actor_user_id="pytest")
+
+
 def _expected_estimated(now, model, est_in, max_out):
     """与 authorize_hold 同口径复算最坏价（customer_charge，时刻=authorize now）。"""
     conn = bh.connect()
@@ -345,8 +353,11 @@ def test_authorize_estimated_balance_would_deny_deterministic():
     assert result["open_holds_nano_cny"] == expected  # 含本次
     assert result["call_id"] == call_id
 
-    # 余额不足（1 nano < estimated）→ would_deny True，但行照写（永不拒绝）
+    # 总额度不足（1 nano < estimated）→ would_deny True，但行照写（永不
+    # 拒绝）。单轨后 user 的观测口径是 ai_spend_total_allowances（余额快照
+    # 列照记，但不再驱动 would_deny）
     poor = _user_with_account("hold-poor@x.com", grant_nano=1)
+    _squeeze_total_limit(poor["user_id"], 1)
     call2, sess2, req2 = _ids()
     body2 = _hold_body("user", poor["user_id"], session_id=sess2,
                        request_id=req2, call_id=call2, user_id=poor["user_id"])
@@ -526,7 +537,8 @@ def test_demo_subject_writes_hold_and_week_window():
 @PG
 def test_subject_without_account_row_written_null_balance():
     """主体有 users 行但未开户 → 行写入 account_id/balance NULL（影子期不
-    强制开户），would_deny 因余额未知为 NULL；估算照常。"""
+    强制开户）；单轨后 would_deny 按总额度口径（allowance 恒在场、默认
+    面值充足 → False），不再因「余额未知」为 NULL；估算照常。"""
     bh.seed_price_books_with_history()
     user = user_store.create_user("hold-noacct@x.com", "pass123456789012")
     now = datetime.now(timezone.utc)
@@ -538,7 +550,7 @@ def test_subject_without_account_row_written_null_balance():
     result = _authorize(body, now=now)
     assert result["account_id"] is None
     assert result["balance_nano_cny"] is None
-    assert result["would_deny"] is None
+    assert result["would_deny"] is False  # 总额度口径（默认 20 CNY 充足）
     expected = _expected_estimated(now, "deepseek-v4-flash", 1_000_000, 200_000)
     assert result["estimated_nano_cny"] == expected
     assert result["open_holds_nano_cny"] is None
@@ -555,8 +567,10 @@ def test_open_holds_accumulate_into_would_deny():
     bh.seed_price_books_with_history()
     now = datetime.now(timezone.utc)
     est = _expected_estimated(now, "deepseek-v4-flash", 1_000_000, 200_000)
-    # 余额 = 两笔最坏价之和 - 1：第一笔放行、第二笔在最坏占用下不足
+    # 总额度 = 两笔最坏价之和 - 1：第一笔放行、第二笔在占用叠加下不足
+    # （单轨：spent+reserved+estimated > limit 的观测口径）
     user = _user_with_account("hold-stack@x.com", grant_nano=2 * est - 1)
+    _squeeze_total_limit(user["user_id"], 2 * est - 1)
 
     call1, sess1, req1 = _ids()
     body1 = _hold_body("user", user["user_id"], session_id=sess1,
@@ -572,7 +586,7 @@ def test_open_holds_accumulate_into_would_deny():
                        request_id=req2, call_id=call2, user_id=user["user_id"])
     bh.bind_reservation(req2, sess2, "user", user["user_id"])
     r2 = _authorize(body2, now=now)
-    # balance - open(E) = E-1 < E → 第二笔 would_deny True（若硬额度开启）
+    # reserved(E) + est(E) > 2E-1 → 第二笔 would_deny True（若硬额度开启）
     assert r2["would_deny"] is True
     assert r2["open_holds_nano_cny"] == 2 * est
     assert r2["status"] == "open"  # 影子期仍放行
@@ -912,7 +926,8 @@ def test_wire_amounts_strings_or_null():
     assert out2["estimated_nano_cny"].isdigit()
     assert out2["balance_nano_cny"] is None
     assert out2["open_holds_nano_cny"] is None
-    assert out2["would_deny"] is None
+    # 单轨：would_deny 按总额度口径（allowance 在场、充足 → False）
+    assert out2["would_deny"] is False
 
     # 无价目：estimated null、would_deny null（balance 仍字符串；该用户无
     # 其他 open hold → open_holds "0"）

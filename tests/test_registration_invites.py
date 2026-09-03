@@ -736,16 +736,18 @@ def test_invite_list_exposes_source_campaign_and_owner_api(monkeypatch):
 
 @pg_only
 def test_redeem_writes_no_user_acquisition_but_allowance():
-    """Batch B：兑换不再写 user_acquisition（归因写路径冻结）；window 过渡
-    期（缺省 target）无初始额度的邀请不建任何额度面（两兼容键皆 None）。"""
+    """Batch B：兑换不再写 user_acquisition（归因写路径冻结）；R3 Wave1-Money
+    单轨后无初始额度的邀请也**恒建** allowance 行（defaults 默认解析），
+    spend_override_policy 兼容键恒 None。"""
     owner = _mk_owner()
     inv = registration_store.create_invite(owner["user_id"],
                                            login_id="legacy@x.com")
     out = registration_store.redeem_invite(inv["token"], "legacy@x.com",
                                            "pass123456789012")
     assert out["acquisition"] is None            # 兼容键恒 None（退役）
-    assert out["spend_override_policy"] is None  # 无初始额度 → 无过渡 override
-    assert out["total_allowance"] is None  # 无初始额度 → 不建行
+    assert out["spend_override_policy"] is None  # 兼容键恒 None（单轨）
+    assert out["total_allowance"] is not None    # 无面值 → defaults 解析建行
+    assert out["total_allowance"]["source"] == "invite"
     conn = _pg_conn()
     try:
         with conn.cursor() as cur:

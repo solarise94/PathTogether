@@ -52,10 +52,11 @@ _OWNER_PW = "ownerpass123456"
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch, tmp_path):
-    """每用例：目录隔离 + 0029 种子（target=window + 闸=false）。
+    """每用例：目录隔离 + 单轨种子（策略 + 闸=false + defaults 默认额度行）。
 
-    platform_settings 在 conftest 的 _BUSINESS_TABLES TRUNCATE 清单内，闸值
-    不会跨用例串扰（每用例先 TRUNCATE 再由本 fixture 重播种）。"""
+    platform_settings / ai_spend_total_defaults 在 conftest 的 _BUSINESS_TABLES
+    TRUNCATE 清单内，闸值与默认额度不会跨用例串扰（每用例先 TRUNCATE 再由
+    本 fixture 重播种；conftest 亦会恢复一条 20 CNY defaults 基线行）。"""
     isolate_app(monkeypatch, tmp_path, clear_stores=True)
     app_mod.app.config["TESTING"] = True
     if BACKEND == "postgres":
@@ -81,8 +82,8 @@ def _set_gate(expected, value):
 @PG
 def test_cutover_session_lock_blocks_provisioning_until_unlock(pg_uri):
     """conn A 持会话级 pg_advisory_lock(开通键) → 子线程建号阻塞（0.5s 时点
-    仍 blocked、用户行未落地）；A 解锁 → 子线程完成且结果正确（window 目标
-    无 X：无 allowance 行）。锁释放走 finally（断言失败也不残留会话锁）。"""
+    仍 blocked、用户行未落地）；A 解锁 → 子线程完成且结果正确（单轨恒建
+    allowance 行）。锁释放走 finally（断言失败也不残留会话锁）。"""
     _mk_owner()
     conn = psycopg.connect(pg_uri, autocommit=True)
     try:
@@ -114,9 +115,10 @@ def test_cutover_session_lock_blocks_provisioning_until_unlock(pg_uri):
         assert "error" not in outcome, outcome.get("error")
         user, allowance = outcome["result"]
         assert user["login_id"] == "locked@x.com"
-        # window 目标（0029 种子）+ 无 X：不建 allowance 行（不造 dormant 行）
-        assert allowance is None
-        assert spend_store.get_total_allowance(user["user_id"]) is None
+        # 单轨：无 X 建号走 defaults 解析（fixture 种子 = 20 CNY）恒建行
+        assert allowance is not None
+        assert spend_store.get_total_allowance(user["user_id"]) is not None
+        assert int(allowance["limit_nano_cny"]) == 20 * 10 ** 9
     finally:
         # 收尾清理：关连接即释放会话级锁（xact 锁随各事务早已终结）
         conn.close()
@@ -177,15 +179,16 @@ def test_maintenance_gate_blocks_create_and_redeem_then_recovers():
     assert user_store.get_user_by_login_id("gated@x.com") is None
     row = registration_store.get_invite(inv["invite_id"])
     assert row["consumed_at"] is None and row["use_count"] == 0
-    # 关闸恢复：invite 仍可兑换（成功路径走 window 种子：无额度行）。
+    # 关闸恢复：invite 仍可兑换（成功路径单轨恒建 allowance 行）。
     # compare_and_set_setting 返回**写入后的值**——关闸写入 False，未抛
     # SettingsVersionConflictError 即 CAS 命中
     _set_gate(True, False)
     user, allowance = user_store_pg.create_user_with_total_allowance(
         "aftergate@x.com", _PW)
-    assert user["login_id"] == "aftergate@x.com" and allowance is None
+    assert user["login_id"] == "aftergate@x.com" and allowance is not None
     out = registration_store.redeem_invite(inv["token"], "gated@x.com", _PW)
     assert out["user"]["login_id"] == "gated@x.com"
+    assert out["total_allowance"] is not None
     assert registration_store.get_invite(inv["invite_id"])["use_count"] == 1
 
 

@@ -368,20 +368,19 @@ def _spend():
     return spend_store
 
 
-def _resolve_spend_target_tx(cur, spend, subject_type) -> str:
-    """主体 → 预算目标种类（Batch B：明确的 spend_target 抽象）。
+def _spend_target_for(subject_type) -> str:
+    """主体 → 预算目标种类（R3 Wave1-Money 单轨，纯角色驱动）。
 
-    - ``owner`` / ``demo``：恒 ``"window"``（owner 独立月策略、demo 周窗口，
-      不受 user_spend_target 影响，§3.1）；
-    - ``user``：读 ``platform_settings.user_spend_target``（缺/非法回退
-      "window"，见 spend_store.get_user_spend_target_tx）。
+    - ``user``：恒 ``"total_allowance"``（一次性总额度行；原
+      ``platform_settings.user_spend_target`` 运行时读取已拆除——缺行 =
+      数据损坏 fail-closed，绝不回退窗口）；
+    - ``owner`` / ``demo``：恒 ``"window"``（owner 独立月策略、demo 周窗口）。
 
-    authorize / ingest 投影 / settle 归还共用本解析；settle/release/expire
-    归还仍以 hold 行上保存的目标列为准（本函数只决定**新**授权落哪类目标）。
+    authorize 的目标解析与 audit 标注共用本函数；settle/release/expire
+    归还仍以 hold 行上保存的目标列为准（本函数只决定**新**授权落哪类
+    目标）。
     """
-    if subject_type == "user":
-        return spend.get_user_spend_target_tx(cur)
-    return "window"
+    return "total_allowance" if subject_type == "user" else "window"
 
 
 def _connect():
@@ -1041,10 +1040,10 @@ def _project_window_spent_tx(cur, *, subject_type, subject_id, occurred,
     ``reconcile_spend_windows`` / ``reconcile_total_allowances`` 的 expected
     口径一致：spent 按事件归目标，不按 authorize 归目标——边界附近二者可能
     不同，reserved 归还才用 hold 上的目标快照）。demo 主体经
-    ``_get_or_create_window_tx`` 归一到 demo_global 周窗口；user 主体按
-    ``user_spend_target`` 分流：``total_allowance`` → 记入该 user 的
-    ai_spend_total_allowances 行（无窗口边界、不轮换），``window`` → 窗口
-    路径（cutover 前语义不变）。
+    ``_get_or_create_window_tx`` 归一到 demo_global 周窗口；R3 Wave1-Money
+    单轨起 user 主体**恒**记入该 user 的 ai_spend_total_allowances 行
+    （无窗口边界、不轮换；缺行 = 数据损坏，投影跳过记 warning 由对账器
+    报 drift，绝不阻断计量）；owner 主体走窗口路径（每月窗口）。
 
     **失败语义**：策略缺失/窗口/总额度行异常只记 warning + 返回 None，
     **不阻断计量**（真实成本不得因投影问题丢失，§3.4.7 精神）——投影欠计
@@ -1068,8 +1067,7 @@ def _project_window_spent_tx(cur, *, subject_type, subject_id, occurred,
                 _LOG.warning("[billing-window] cutover 前旧价格事件跳过窗口"
                              "投影 subject_type=%s", subject_type)
                 return None
-        if subject_type == "user" and _resolve_spend_target_tx(
-                cur, spend, subject_type) == "total_allowance":
+        if _spend_target_for(subject_type) == "total_allowance":
             cur.execute(
                 "SELECT allowance_id FROM ai_spend_total_allowances "
                 "WHERE subject_id=%s", (subject_id,))
@@ -1831,12 +1829,12 @@ def _authorize_hold_tx(cur, body, *, installation_id, plugin_id, now,
         denial_reason = "pricing_unavailable"
 
     # -- 步骤 6：预算目标解析 + 投影行 get_or_create / 锁定（§3.2 + Batch B）。
-    #    spend_target 抽象：owner 恒窗口、demo 恒周窗口、user 按
-    #    platform_settings.user_spend_target 分流（不允许多调用点复制 if/else，
-    #    §Batch B 原子授权与结算 4）。total_allowance 路径只锁既有行——绝不
-    #    为无行 user 隐式建行（fail-closed：hard 抛稳定 missing；shadow 只
-    #    观测），缺行代表建号/兑换/迁移链路出了 bug。 --
-    spend_target = _resolve_spend_target_tx(cur, spend, subject_type)
+    #    R3 Wave1-Money 单轨：owner 恒月窗口、demo 恒周窗口、user 恒总额度
+    #    （纯角色驱动，原 platform_settings.user_spend_target 运行时分流已
+    #    拆除，不允许多调用点复制 if/else）。total_allowance 路径只锁既有行
+    #    ——绝不为无行 user 隐式建行（fail-closed：hard 抛稳定 missing；
+    #    shadow 只观测），缺行代表建号/兑换/迁移链路出了 bug。 --
+    spend_target = _spend_target_for(subject_type)
     window = None
     allowance = None
     try:

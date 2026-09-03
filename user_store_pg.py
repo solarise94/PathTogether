@@ -211,9 +211,9 @@ def create_user(login_id, password, role=ROLE_USER, display_name=None):
 
     review R2-F2（取消双轨运行时分支）：``role=user`` 时**委托**
     :func:`create_user_with_total_allowance`（取返回 tuple 的 user 部分返回）
-    ——PG 上所有 role=user 建号都走「目标感知 + cutover 串行化 + 维护闸」的
-    单轨原子原语，不再存在「绕过 user_spend_target 直接插行」的旁路（否则
-    total 模式会经本函数建出无 allowance 行的用户）。委托语义下本函数同样
+    ——PG 上所有 role=user 建号都走「恒建总额度 + cutover 串行化 + 维护闸」
+    的单轨原子原语，不再存在「绕过组合原语直接插行」的旁路（否则会建出无
+    allowance 行的用户——缺行 = 授权面数据损坏）。委托语义下本函数同样
     会抛 ProvisioningMaintenanceError（维护闸）并受开通 advisory 锁串行化；
     UniqueViolation 仍译回同一 ``_unique_violation_message`` 文案（「该登录
     账号已存在」等，兼容既有调用方按「已存在」匹配 409 的约定）。
@@ -273,35 +273,28 @@ def create_user_with_total_allowance(login_id, password, display_name=None,
                                      ai_access=True,
                                      total_limit_nano_cny=None,
                                      actor_user_id=None):
-    """**单个 PostgreSQL 事务**内：创建 role=user 用户 + 按目标建授权面 + audit。
+    """**单个 PostgreSQL 事务**内：创建 role=user 用户 + 建总额度行 + audit。
 
-    Batch B（docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
-    §Batch B 数据模型 6 / 迁移与额度语义 14）+ cutover 契约修订：owner 经
-    admin v1 建号时可选 ``total_limit_nano_cny``（nano-CNY 整数），同一事务
-    内读 ``platform_settings.user_spend_target`` 并按目标分叉：
+    R3 Wave1-Money 单轨：原 ``platform_settings.user_spend_target`` 建号
+    分叉已拆除——**每个 role=user 用户建号时必须**同事务建一次性总额度行
+    （spend_store.create_user_total_allowance_tx，source=``admin_create``）：
 
-    - target=``total_allowance``：每个 user **必须**有总额度行
-      （spend_store.create_user_total_allowance_tx，source=``admin_create``）
-      ——显式 X 按面值建行（default_version=None）；无 X 解析默认
-      （ai_spend_total_defaults 行 → user_default 策略回退，
-      default_version=默认版本）；两者皆无 → ValueError
-      ``total_default_missing``（路由层 400）：绝不建出无额度行的用户，
-      否则授权面永久 fail-closed；
-    - target=``window``（cutover 前；缺键/非法值回退同此）：**不建**
-      allowance 行（dormant 行形成双真相，且 cutover apply 会因限额不一致
-      abort）；显式 X 同步建等值 ``user_override`` 过渡策略
-      （spend_store.set_user_override_tx，calendar_month），如实展示现行
-      授权面；allowance 返回 None。
+    - 显式 ``total_limit_nano_cny``（nano-CNY 整数）→ 按面值建行
+      （default_version=None——显式决策不锚定任何默认版本）；
+    - 无 X → 解析全局默认（**只查** ai_spend_total_defaults 表，
+      default_version=默认行版本）；
+    - defaults 缺行 → ValueError ``total_default_missing``（路由层 400）：
+      绝不建出无额度行的用户（缺行 = 授权面永久 fail-closed 的数据损坏）。
 
-    user 插入、授权面写入与 ``user.create`` 审计（share_store_pg
+    user 插入、总额度写入与 ``user.create`` 审计（share_store_pg
     .record_audit_tx，不吞错）全部同一事务，任一失败整体回滚（用户不存在
-    半创建状态）。audit detail 只含非敏感字段，带 ``spend_target`` /
-    ``effective_limit_nano_cny`` / ``limit_surface`` 与原
-    ``total_limit_nano_cny``（allowance 面值或 None）。
+    半创建状态）。audit detail 只含非敏感字段，带 ``spend_target``（恒
+    ``total_allowance``，wire 兼容标注）/ ``total_limit_nano_cny`` /
+    ``effective_limit_nano_cny`` / ``limit_surface``。
 
     本入口只创建普通用户（role=user；owner 建号走主机侧 break-glass，docs
     §3.2 不变量 5）。登录账号冲突抛 ValueError（与 create_user 同文案）。
-    返回 ``(user_dict, allowance_dict_or_None)``（window 模式恒 None）。
+    返回 ``(user_dict, allowance_dict)``（allowance 恒非 None——单轨）。
 
     review R2-F2（与 cutover 串行化 + 维护闸）：事务内 cursor 就绪后先查
     cutover 维护闸（spend_store.is_dispatch_maintenance_tx：缺键按开闸、
@@ -340,41 +333,24 @@ def create_user_with_total_allowance(login_id, password, display_name=None,
                     row = _insert_user_tx(
                         cur, uid, norm_login, name, password, ROLE_USER, now,
                         ai_access=ai_access)
-                    # 消费控制目标与建行/审计同事务读取（缺键/非法值回退
-                    # window，见 get_user_spend_target_tx），保证授权面与
-                    # 用户行原子共生
-                    target = spend_store.get_user_spend_target_tx(cur)
-                    at = datetime.now(timezone.utc)
-                    allowance = None
-                    effective_limit = None
-                    limit_surface = "default_window_policy"
-                    if target == "total_allowance":
-                        if total_limit_nano_cny is not None:
-                            limit, dver = int(total_limit_nano_cny), None
-                        else:
-                            limit, _src, dver = \
-                                spend_store._resolve_total_default_tx(
-                                    cur, at)
-                            if limit is None:
-                                raise ValueError(
-                                    "total_default_missing: 总额度模式下无可用默认总额度"
-                                    "（ai_spend_total_defaults 缺行且 user_default 策略未配置）；"
-                                    "请先配置默认或显式传 total_limit_nano_cny")
-                        allowance = spend_store.create_user_total_allowance_tx(
-                            cur, uid, limit, source="admin_create",
-                            default_version=dver,
-                            actor_user_id=actor_user_id,
-                            updated_by=actor_user_id or "admin")
-                        effective_limit = int(allowance["limit_nano_cny"])
-                        limit_surface = "total_allowance"
+                    # 单轨：恒建总额度行（显式 X 按面值；无 X 走 defaults
+                    # 表；缺默认 fail-closed 拒绝建号），授权面与用户行
+                    # 原子共生
+                    if total_limit_nano_cny is not None:
+                        limit, dver = int(total_limit_nano_cny), None
                     else:
-                        # window：不建 allowance；显式 X 建等值过渡 override
-                        if total_limit_nano_cny is not None:
-                            override = spend_store.set_user_override_tx(
-                                cur, uid, int(total_limit_nano_cny),
-                                updated_by=actor_user_id or "admin")
-                            effective_limit = int(override["limit_nano_cny"])
-                            limit_surface = "user_override"
+                        limit, _src, dver = spend_store._resolve_total_default_tx(
+                            cur, datetime.now(timezone.utc))
+                        if limit is None:
+                            raise ValueError(
+                                "total_default_missing: 无可用默认总额度"
+                                "（ai_spend_total_defaults 缺行）；"
+                                "请先配置默认或显式传 total_limit_nano_cny")
+                    allowance = spend_store.create_user_total_allowance_tx(
+                        cur, uid, limit, source="admin_create",
+                        default_version=dver,
+                        actor_user_id=actor_user_id,
+                        updated_by=actor_user_id or "admin")
                     # 审计 detail 只含非敏感字段（§9.6：无密码/token/IP）
                     share_store_pg.record_audit_tx(
                         cur, "user.create", actor_user_id=actor_user_id,
@@ -383,46 +359,19 @@ def create_user_with_total_allowance(login_id, password, display_name=None,
                         detail={
                             "role": ROLE_USER,
                             "ai_access": bool(ai_access),
-                            "spend_target": target,
+                            # wire 兼容标注（单轨恒 total_allowance）
+                            "spend_target": "total_allowance",
                             "total_limit_nano_cny":
-                                None if allowance is None
-                                else int(allowance["limit_nano_cny"]),
-                            "effective_limit_nano_cny": effective_limit,
-                            "limit_surface": limit_surface,
+                                int(allowance["limit_nano_cny"]),
+                            "effective_limit_nano_cny":
+                                int(allowance["limit_nano_cny"]),
+                            "limit_surface": "total_allowance",
                         })
         except psycopg.errors.UniqueViolation as exc:
             raise ValueError(_unique_violation_message(exc)) from exc
         return _public(row), allowance
     finally:
         conn.close()
-
-
-def create_user_with_spend_override(login_id, password, display_name=None,
-                                    ai_access=True,
-                                    monthly_limit_nano_cny=None,
-                                    actor_user_id=None, *,
-                                    total_limit_nano_cny=None):
-    """兼容壳（Batch B）：旧名保留供 wave 2 前的 app.py 调用，内部转新实现。
-
-    - ``total_limit_nano_cny``（新名）与 ``monthly_limit_nano_cny``（旧 wire
-      名，一个兼容发布周期内可读）二选一；**同时传两者抛稳定 ValueError
-      ``ambiguous_spend_limit``**（路由层映射 400，§Batch B 数据模型 6）；
-    - 携带的金额面值一律交 :func:`create_user_with_total_allowance` 按
-      ``user_spend_target`` 兑现（total=一次性总额度行；window=等值
-      user_override 过渡策略），语义随 target，不在本壳内二次裁决；
-    - 其余语义见 :func:`create_user_with_total_allowance`。
-    """
-    if monthly_limit_nano_cny is not None and total_limit_nano_cny is not None:
-        raise ValueError(
-            "ambiguous_spend_limit：monthly_limit_nano_cny 与 "
-            "total_limit_nano_cny 只能传其一（旧月额度字段已退役，请在兼容"
-            "期内只传 total_limit_nano_cny）")
-    return create_user_with_total_allowance(
-        login_id, password, display_name=display_name, ai_access=ai_access,
-        total_limit_nano_cny=(total_limit_nano_cny
-                              if total_limit_nano_cny is not None
-                              else monthly_limit_nano_cny),
-        actor_user_id=actor_user_id)
 
 
 def _unique_violation_message(exc):

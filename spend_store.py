@@ -25,11 +25,14 @@ CAS + §7.3 无保护配置校验），但把模式切到 registered/all 仍是�
   00:00（不含）。输入任意 tz-aware datetime / RFC3339 / epoch 秒，naive 输入
   拒绝（无法判定口径）；输出 UTC 边界。边界永远由服务端生成，客户端不得
   提交任意 window_start/window_end；
-- 策略解析（§3.1）：user → 先 ``user_override(user_id)`` 无则回退
-  ``user_default``；demo → 唯一 ``demo_global``（多 capability 全归同一周
-  窗口，subject_id 归一为 ``demo_global``）；owner → 独立 ``owner`` 策略，
-  不与用户/Demo 共池。解析考虑 enabled 与 [effective_from, effective_to)
-  区间；同 scope 同刻多条有效策略由 0023 部分唯一索引在 DB 层禁止；
+- 策略解析（§3.1；R3 Wave1-Money 起单轨）：demo → 唯一 ``demo_global``
+  （多 capability 全归同一周窗口，subject_id 归一为 ``demo_global``）；
+  owner → 独立 ``owner`` 策略（每月窗口），不与用户/Demo 共池；
+  **role=user 的授权面恒为一次性总额度（ai_spend_total_allowances）**，
+  不再参与策略/窗口解析（历史 user_override 行只读保留，仅 cutover
+  物化零消费窗时仍按解析口径取策略）。解析考虑 enabled 与
+  [effective_from, effective_to) 区间；同 scope 同刻多条有效策略由 0023
+  部分唯一索引在 DB 层禁止；
 - ``get_or_create_window``（§3.2）：按当前时刻解析策略 → 算边界 →
   UNIQUE(subject_type, subject_id, window_start, window_end) + ON CONFLICT
   兜底并发插入（并发只产生一行）；``limit_nano_snapshot`` 固定创建时刻的
@@ -44,8 +47,9 @@ CAS + §7.3 无保护配置校验），但把模式切到 registered/all 仍是�
   - ``window_settle``：``reserved -= estimated``、``spent += actual``；
     ``actual > estimated`` 允许并按真实成本入账（overage 记指标）；
 - 策略管理：``update_policy_limit``（version/CAS，冲突 409 语义；默认更新
-  只影响新窗口）、``set_user_override`` / ``clear_user_override``（收口旧行
-  + 新行，保留历史，满足部分唯一索引）；
+  只影响新窗口）。R3 Wave1-Money 起用户级 override 写 API（原
+  ``set_user_override`` / ``clear_user_override``）已删除——user 授权面
+  单轨为总额度，历史 user_override 行只读保留；
 - ``adjust_current_window``（§1.1「调整当前周期」）：只改
   ``limit_nano_snapshot``，CAS + audit（写 audit_events），不取消已完成
   消费；调低到低于 spent 后，下一次 ``window_reserve`` 必须拒绝（由
@@ -92,13 +96,12 @@ WINDOW_SUBJECT_TYPES = ("demo", "user", "owner")
 DEMO_GLOBAL_SUBJECT = "demo_global"
 
 # --------------------------------------------------------------------------- #
-# Batch B：user 消费控制目标（platform_settings.user_spend_target，0029 seed
-# "window"）。只控制 role=user；demo/owner 恒窗口。键常量的唯一权威定义在
-# settings_store（spend_store 只 import，不重复定义）。
+# R3 Wave1-Money：user 消费控制目标双轨已拆除——role=user 的授权面恒为
+# 一次性总额度（ai_spend_total_allowances），原 platform_settings.
+# user_spend_target 键的运行时读取（get_user_spend_target_tx /
+# user_spend_target）与常量重导出一并删除；demo=每周窗口、owner=每月窗口
+# 的窗口语义不受影响。0032 迁移删除该设定行（cutover 脚本不再读写）。
 # --------------------------------------------------------------------------- #
-USER_SPEND_TARGET_KEY = settings_store.USER_SPEND_TARGET_KEY
-USER_SPEND_TARGETS = settings_store.USER_SPEND_TARGETS
-DEFAULT_USER_SPEND_TARGET = "window"
 
 #: cutover 维护闸键（wave 2 app.py 在创建 hold 前读取；true → 503）
 AI_DISPATCH_MAINTENANCE_KEY = settings_store.AI_DISPATCH_MAINTENANCE_KEY
@@ -121,11 +124,8 @@ DEFAULT_ENFORCEMENT_MODE = "shadow"
 #: 见 :func:`_assert_not_unprotected_tx`）。
 LEGACY_TURN_GUARD_KEY = "legacy_turn_guard_enabled"
 
-#: 策略写路径串行化 advisory key（事务级；稳定 bigint "SPPW"）
-_POLICY_LOCK_KEY = 0x53505057
-
-#: 策略/窗口 id 前缀
-_OVERRIDE_ID_PREFIX = "spp_uo_"
+#: 策略/窗口 id 前缀（原 _OVERRIDE_ID_PREFIX 随 user_override 写 API 一并
+#: 删除——历史 override 行只读保留，不再产生新行）
 _WINDOW_ID_PREFIX = "spw_"
 
 #: 总额度 id 前缀（Batch B：ai_spend_total_allowances）
@@ -874,124 +874,13 @@ def update_policy_limit(policy_id, new_limit_nano_cny, expected_version, *,
         conn.close()
 
 
-def _close_open_policies_tx(cur, scope_type, scope_id, at, updated_by):
-    """收口该 scope 当前所有 enabled 未收口策略（effective_to=at）。
-
-    写路径在固定 key ``pg_advisory_xact_lock`` 内执行（与 price book 激活
-    同思路）：0023 部分唯一索引是并发硬兜底，锁内收口让「新行
-    effective_from = 旧行 effective_to」的接班边界成为常规路径而非冲突路径。
-    """
-    cur.execute("SELECT pg_advisory_xact_lock(%s)", (_POLICY_LOCK_KEY,))
-    cur.execute(
-        "UPDATE ai_spend_policies SET effective_to=%s, updated_at=now(), "
-        "updated_by=%s WHERE scope_type=%s AND scope_id IS NOT DISTINCT FROM %s "
-        "  AND enabled AND effective_to IS NULL",
-        (at, updated_by, scope_type, scope_id))
-    return cur.rowcount
-
-
-def set_user_override(user_id, limit_nano_cny, *, updated_by=None, at=None,
-                      audit=True, actor_user_id=None):
-    """设置/替换某用户的月额度覆盖（user_override，calendar_month）。
-
-    实现：收口该用户现有 open 覆盖（保留历史行，effective_to=at）+ 插入新
-    覆盖行（version=1，effective_from=at）。新覆盖只影响**之后新建**的窗口
-    ——当前已开月窗口的 limit_nano_snapshot 不变（§1.1 默认只影响新周期）。
-    独立事务版；单事务组合路径（建号+覆盖+audit）见
-    :func:`set_user_override_tx`。
-    """
-    platform_features.require_pg_backend("spend")
-    limit = _validate_nano(limit_nano_cny, "limit_nano_cny")
-    at = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
-    conn = _connect()
-    try:
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
-                return set_user_override_tx(
-                    cur, user_id, limit, updated_by=updated_by, at=at,
-                    audit=audit, actor_user_id=actor_user_id)
-    finally:
-        conn.close()
-
-
-def set_user_override_tx(cur, user_id, limit_nano_cny, *, updated_by=None,
-                         at=None, audit=True, actor_user_id=None):
-    """设置/替换用户月额度覆盖（cursor 注入变体，调用方事务内提交）。
-
-    语义与 :func:`set_user_override` 完全一致（§5.1：owner 直接建号/邀请码
-    兑换等「user 行 + override 策略 + audit 必须同一事务」的组合路径共用本
-    原语）；at 缺省按当前时刻解析。
-    """
-    limit = _validate_nano(limit_nano_cny, "limit_nano_cny")
-    if not isinstance(user_id, str) or not user_id.strip():
-        raise InvalidSpendRequestError("user_id 需为非空字符串")
-    at = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
-    policy_id = _OVERRIDE_ID_PREFIX + secrets.token_hex(10)
-    closed = _close_open_policies_tx(cur, "user_override", user_id, at,
-                                     updated_by)
-    cur.execute(
-        "INSERT INTO ai_spend_policies "
-        "(policy_id, scope_type, scope_id, period_kind, "
-        " limit_nano_cny, enabled, effective_from, effective_to, "
-        " version, updated_by) "
-        "VALUES (%s,'user_override',%s,'calendar_month',%s,true,"
-        "%s,NULL,1,%s) RETURNING " + _POLICY_SEL,
-        (policy_id, user_id, limit, at, updated_by))
-    out = _policy_out(cur.fetchone())
-    if audit:
-        share_store_pg.record_audit_tx(
-            cur, POLICY_UPDATE_AUDIT_ACTION,
-            actor_user_id=actor_user_id, actor_role="owner",
-            target_type="spend_policy", target_id=policy_id,
-            detail={
-                "op": "set_user_override",
-                "user_id": user_id,
-                "limit_nano_cny": limit,
-                "replaced_open_policies": int(closed),
-            })
-    return out
-
-
-def clear_user_override(user_id, *, updated_by=None, at=None, audit=True,
-                        actor_user_id=None):
-    """清除某用户的月额度覆盖：收口 open 覆盖行（保留历史）。
-
-    清除后：当前已开窗口不受影响（snapshot 不变），**下一个**窗口解析回退
-    user_default（§9.2）。返回是否确有行被收口。独立事务版；单事务组合路径
-    见 :func:`clear_user_override_tx`。
-    """
-    platform_features.require_pg_backend("spend")
-    at = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
-    conn = _connect()
-    try:
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
-                return clear_user_override_tx(
-                    cur, user_id, updated_by=updated_by, at=at, audit=audit,
-                    actor_user_id=actor_user_id)
-    finally:
-        conn.close()
-
-
-def clear_user_override_tx(cur, user_id, *, updated_by=None, at=None,
-                           audit=True, actor_user_id=None):
-    """清除用户月额度覆盖（cursor 注入变体；语义同独立事务版）。"""
-    if not isinstance(user_id, str) or not user_id.strip():
-        raise InvalidSpendRequestError("user_id 需为非空字符串")
-    at = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
-    closed = _close_open_policies_tx(cur, "user_override", user_id, at,
-                                     updated_by)
-    if audit:
-        share_store_pg.record_audit_tx(
-            cur, POLICY_UPDATE_AUDIT_ACTION,
-            actor_user_id=actor_user_id, actor_role="owner",
-            target_type="spend_policy", target_id=None,
-            detail={
-                "op": "clear_user_override",
-                "user_id": user_id,
-                "replaced_open_policies": int(closed),
-            })
-    return bool(closed)
+# --------------------------------------------------------------------------- #
+# R3 Wave1-Money：用户级月额度覆盖写 API（set_user_override /
+# set_user_override_tx / clear_user_override / clear_user_override_tx 及其
+# 收口原语 _close_open_policies_tx）已整体删除——user 授权面单轨为一次性
+# 总额度（set_user_total_limit / restore_user_total_default），历史
+# user_override 策略行只读保留（admin 策略列表仍可见，不再有新写入口）。
+# --------------------------------------------------------------------------- #
 
 
 # --------------------------------------------------------------------------- #
@@ -1305,37 +1194,6 @@ def _fetch_total_allowance_read(cur, subject_id):
         "WHERE subject_id=%s", (subject_id,))
     row = cur.fetchone()
     return _allowance_out(row) if row is not None else None
-
-
-def get_user_spend_target_tx(cur) -> str:
-    """同事务读 ``platform_settings.user_spend_target``（Batch B 数据模型 4）。
-
-    缺键/非法值一律回退 ``"window"``（fail-safe：0029 seed 缺失或手工乱值时
-    行为与部署前完全一致，绝不放大额度）。只控制 role=user——调用方须自行
-    保证 subject_type（owner/demo 恒窗口，见 billing_store 的 target 解析）。
-    """
-    cur.execute("SELECT value FROM platform_settings WHERE key=%s",
-                (USER_SPEND_TARGET_KEY,))
-    row = cur.fetchone()
-    value = row["value"] if row is not None else None
-    if isinstance(value, str) and value in USER_SPEND_TARGETS:
-        return value
-    if value is not None:
-        _LOG.warning("platform_settings.%s 存量值非法（%r），按 %r 处理",
-                     USER_SPEND_TARGET_KEY, value, DEFAULT_USER_SPEND_TARGET)
-    return DEFAULT_USER_SPEND_TARGET
-
-
-def user_spend_target() -> str:
-    """独立事务版：读 user 消费控制目标（缺/非法 → "window"）。"""
-    platform_features.require_pg_backend("spend")
-    conn = _connect()
-    try:
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
-                return get_user_spend_target_tx(cur)
-    finally:
-        conn.close()
 
 
 def get_total_allowance(user_id):
@@ -1675,19 +1533,20 @@ def _total_default_out(row) -> dict:
 def _resolve_total_default_tx(cur, at) -> "tuple[int | None, str | None, int | None]":
     """解析「新 user 默认总额度 X」→ ``(limit_nano, source, version)``。
 
-    - ``ai_spend_total_defaults`` 有行 → ``(面值, "total_defaults", 该行
-      version)``；
-    - 缺行（0029 刚应用、cutover 尚未跑）→ 回退当时有效 ``user_default``
-      策略面值 ``(面值, "user_default_policy", 该策略 version)``——
-      **fail-safe**：保持「无配置时新 user 仍有明确额度」的旧语义，不放大
-      也不拒绝开户模板读取（回退来源在审计/响应里标明，cutover 会把它固化
-      为权威行）；
-    - 两者皆缺 → ``(None, None, None)``（调用方按「无默认」裁决）。
+    R3 Wave1-Money 单轨：**只查** ``ai_spend_total_defaults`` 表——
+
+    - 有行 → ``(面值, "total_defaults", 该行 version)``；
+    - 缺行 → ``(None, None, None)``（调用方按「无默认」裁决：建号/兑换
+      fail-closed 抛 ``total_default_missing``，绝不猜值）。原「缺行回退
+      user_default 策略面值」的兼容分支已删除：0032 迁移把当时有效的
+      user_default 策略面值物化为 defaults 权威行（已有行不覆盖），此后
+      defaults 表是唯一事实源。
 
     version 随面值一起返回：建 allowance 行时固化为 ``default_version``
     （允许显式 X 时传 None；审计可对账面值是哪个版本的默认）。
 
-    修改默认不追溯既有 user（§3.1）；owner/demo 不读本表。
+    修改默认不追溯既有 user（§3.1）；owner/demo 不读本表。``at`` 参数保留
+    仅为调用方签名兼容（单表查询不再需要时刻）。
     """
     cur.execute("SELECT " + _TOTAL_DEFAULT_SEL +
                 " FROM ai_spend_total_defaults WHERE singleton='global'")
@@ -1696,15 +1555,11 @@ def _resolve_total_default_tx(cur, at) -> "tuple[int | None, str | None, int | N
         out = _total_default_out(row)
         return (int(out["default_limit_nano_cny"]), "total_defaults",
                 int(out["version"]))
-    policy = _resolve_policy_tx(cur, "user", "__no_such_user__", at)
-    if policy is not None:
-        return int(policy["limit_nano_cny"]), "user_default_policy", \
-            int(policy["version"])
     return None, None, None
 
 
 def get_total_default():
-    """读全局默认总额度（缺行回退 user_default 策略面值；见上）。"""
+    """读全局默认总额度（只查 defaults 表；缺行返回 None）。"""
     platform_features.require_pg_backend("spend")
     at = datetime.now(timezone.utc)
     conn = _connect()
@@ -1793,7 +1648,7 @@ def restore_user_total_default(user_id, expected_version, *,
 
     与 :func:`set_user_total_limit` 同款 CAS + 同事务 audit；spent/reserved
     一概不动（§3.1：恢复默认也绝不清零已用/预占）。默认解析见
-    :func:`_resolve_total_default_tx`（缺行回退 user_default 策略面值）。
+    :func:`_resolve_total_default_tx`（单轨后只查 defaults 表）。
     audit detail 追加 ``op=restore_user_total_default`` 与默认来源。
     """
     platform_features.require_pg_backend("spend")
@@ -1809,8 +1664,8 @@ def restore_user_total_default(user_id, expected_version, *,
                     _resolve_total_default_tx(cur, at)
                 if default_limit is None:
                     raise SpendPolicyMissingError(
-                        "无可用默认总额度（defaults 表缺行且 user_default "
-                        "策略未配置，fail-closed 不猜值）", user_id=user_id)
+                        "无可用默认总额度（ai_spend_total_defaults 缺行，"
+                        "fail-closed 不猜值）", user_id=user_id)
                 cur.execute(
                     "UPDATE ai_spend_total_allowances SET "
                     "limit_nano_cny=%s, version=version+1, "
@@ -1992,7 +1847,7 @@ def reconcile_total_allowances(*, at=None):
       - **只报告不修账**（修数必须走人工/强一致路径）。
 
     返回 ``{"checked", "drift_allowances", "items", "pricing_cutover_epoch",
-    "user_spend_target"}``。
+    "enforcement_mode"}``（原 ``user_spend_target`` 键随双轨拆除移除）。
     """
     platform_features.require_pg_backend("spend")
     at_dt = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
@@ -2061,14 +1916,12 @@ def reconcile_total_allowances(*, at=None):
                                        and item["reserved_drift_nano"] == 0)
                     items.append(item)
                 mode = _enforcement_mode_tx(cur)
-                target = get_user_spend_target_tx(cur)
         return {
             "checked": len(items),
             "drift_allowances": sum(1 for i in items if not i["matches"]),
             "items": items,
             "pricing_cutover_epoch":
                 marker.timestamp() if marker is not None else None,
-            "user_spend_target": target,
             "enforcement_mode": mode,
         }
     finally:
@@ -2113,26 +1966,25 @@ def admin_users_spend_summaries(subjects, *, at=None):
     """每用户当前 spend 投影（§6.2 / §4.3 用户页数据源；单事务批量）。
 
     ``subjects`` 为 ``(subject_type, user_id)`` 可迭代（owner 用户传
-    ``("owner", user_id)``，普通用户 ``("user", user_id)``）。形态**纯由
-    ``user_spend_target`` 驱动**（展示面与授权面同源同靶，绝不允许有
-    allowance 行就翻成 total 展示的双轨形态；dormant/legacy 行由 cutover
-    apply 的 existing-row 分支处理）：
+    ``("owner", user_id)``，普通用户 ``("user", user_id)``）。R3 Wave1-Money
+    起单轨——形态**纯由主体角色驱动**（原 ``user_spend_target`` 双轨分支
+    已拆除，展示面与授权面同源同靶）：
 
-    - ``role=user`` 且 target=``"total_allowance"`` → ``total`` 形态
+    - ``role=user`` → 恒 ``total`` 形态
       （``{allowance_id, total_limit_nano_cny, spent_nano_cny,
       reserved_nano_cny, remaining_nano, overage_nano, source, version,
       cutover_at, opening_spent_nano_cny}``；remaining=max(0,
       limit-spent-reserved)、overage=max(0, spent+reserved-limit)；
       opening_spent 只进技术详情；**不含** window/policy_* 键）；缺行 →
-      稳定 ``error=spend_total_allowance_missing``（该 user 无授权面，
-      fail-closed 如实上报，不伪造窗口）；
-    - ``role=user`` 且 target=``"window"`` → 现有 window 形态
-      （policy_scope/policy_id/policy_version/window，get_or_create）——
-      **即使该 user 存在 allowance 行也按 window 展示**（cutover 前
-      dormant/legacy 行不翻成 total 展示）；
-    - ``role=owner`` → 现有 window 形态（不变；owner 恒窗口）。
+      稳定 ``error=spend_total_allowance_missing``（该 user 无授权面 =
+      数据损坏，fail-closed 如实上报，不伪造窗口）；
+    - ``role=owner`` → 现有 window 形态（不变；owner 恒每月窗口）。
 
-    单主体失败（如缺 allowance 行、user_default 被禁用）带稳定 ``error``
+    wire 兼容：item 的 ``spend_target`` 键保留（user 恒
+    ``"total_allowance"``、owner/demo 恒 ``"window"``，纯展示标注，
+    不再参与任何运行时分支）。
+
+    单主体失败（如缺 allowance 行、owner 策略被禁用）带稳定 ``error``
     code，不拖垮整页（与 admin v1 windows/current 同口径）。
     """
     platform_features.require_pg_backend("spend")
@@ -2141,16 +1993,15 @@ def admin_users_spend_summaries(subjects, *, at=None):
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                target = get_user_spend_target_tx(cur)
                 out = {}
                 for subject_type, subject_id in subjects:
                     item = {"subject_type": subject_type,
                             "subject_id": subject_id,
-                            "spend_target": (target if subject_type == "user"
+                            "spend_target": ("total_allowance"
+                                             if subject_type == "user"
                                              else "window")}
                     try:
-                        if subject_type == "user" and \
-                                target == "total_allowance":
+                        if subject_type == "user":
                             item["total"] = total_allowance_summary_tx(
                                 cur, subject_id)
                         else:

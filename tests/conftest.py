@@ -127,7 +127,16 @@ if _RUN_PG:
 
     @pytest.fixture(autouse=True)
     def _truncate_pg_before_each():
-        """每用例前清空业务表（RESTART IDENTITY CASCADE），保证隔离。"""
+        """每用例前清空业务表（RESTART IDENTITY CASCADE），保证用例隔离。
+
+        R3 Wave1-Money 单轨：TRUNCATE 后恢复一条基线种子——
+        ai_spend_total_defaults 全局默认行（20 CNY = 0023 种子 user_default
+        策略面值，与 0032 迁移物化同值）。单轨后 role=user 建号（user_store
+        .create_user / create_user_with_total_allowance / redeem_invite）无
+        显式面值时**必须**解析到默认行，缺行会 total_default_missing 拒绝建号
+        ——不恢复该行会让大量与 target 无关的既有用例在建号处失败。
+        需要构造「缺默认」场景的用例自行 DELETE 该行（已有先例：维护闸
+        缺键用例）。幂等（ON CONFLICT DO NOTHING，不覆盖用例自定义面值）。"""
         conn = psycopg.connect(_SERVER.get_uri(), autocommit=True)
         try:
             with conn.cursor() as cur:
@@ -135,6 +144,12 @@ if _RUN_PG:
                     "TRUNCATE %s RESTART IDENTITY CASCADE"
                     % ", ".join(_BUSINESS_TABLES)
                 )
+                cur.execute(
+                    "INSERT INTO ai_spend_total_defaults "
+                    "(singleton, default_limit_nano_cny, version, updated_by) "
+                    "VALUES ('global', %s, 1, 'conftest-baseline') "
+                    "ON CONFLICT (singleton) DO NOTHING",
+                    (20 * 10 ** 9,))
         finally:
             conn.close()
         yield

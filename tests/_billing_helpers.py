@@ -28,6 +28,7 @@ _MIGRATION_0018 = REPO_ROOT / "migrations" / "0018_billing.sql"
 _MIGRATION_0022 = REPO_ROOT / "migrations" / "0022_billing_price_unit_fix.sql"
 _MIGRATION_0023 = REPO_ROOT / "migrations" / "0023_spend_policies_windows.sql"
 _MIGRATION_0029 = REPO_ROOT / "migrations" / "0029_user_total_allowances_and_denials.sql"
+_MIGRATION_0032 = REPO_ROOT / "migrations" / "0032_user_total_allowance_single_track.sql"
 
 #: 0023 种子策略（占位默认额度：demo 周池 50 CNY / 用户默认月 20 CNY /
 #: owner 月 1000 CNY；面值是 owner 待决策的占位默认，后台可改）
@@ -121,45 +122,28 @@ def seed_spend_policies(conn=None):
 
 
 def seed_spend_settings(conn=None):
-    """幂等重放 0029 种子（Batch B）：user_spend_target="window" +
-    ai_dispatch_maintenance=false（ai_spend_total_allowances/denial_events/
-    total_defaults 表结构无种子——面值由 cutover 写入）。
+    """幂等重放 0023 + 0029 + 0032 种子（R3 Wave1-Money 单轨基线）：
 
-    conftest 每用例 TRUNCATE platform_settings 会清掉这两个键；需要显式
-    target/维护闸状态的用例调用本函数（迁移文件是种子的唯一权威来源）。"""
+    - 0023：三条默认策略（demo 周池 50 CNY / user_default 月 20 CNY / owner
+      月 1000 CNY）+ spend_enforcement_mode=shadow——0032 的 defaults 物化
+      需要 user_default 策略在场，故内部先重放 0023（幂等，不覆盖）；
+    - 0029：ai_dispatch_maintenance=false 种子（user_spend_target 行随
+      0032 删除）；
+    - 0032：删除 user_spend_target/registration_open 旧行 + 把当时有效
+      user_default 策略面值（0023 种子 = 20 CNY）物化为
+      ai_spend_total_defaults 权威行（已有行不覆盖）——单轨后建号/兑换
+      的「无显式面值 → 解析默认」依赖该行。
+
+    conftest 每用例 TRUNCATE platform_settings/ai_spend_total_defaults 会
+    清掉闸键与 defaults 行；需要「闸关 + 默认总额度在场」基线的用例调用
+    本函数（迁移文件是种子的唯一权威来源）。"""
     own = conn is None
     if own:
         conn = connect()
     try:
+        _replay(conn, _MIGRATION_0023)
         _replay(conn, _MIGRATION_0029)
-    finally:
-        if own:
-            conn.close()
-
-
-def set_user_spend_target(target, conn=None):
-    """【测试专用】直接写 platform_settings.user_spend_target。
-
-    生产路径只能走 settings_store.compare_and_set_setting（CAS；cutover
-    脚本），绝不允许无版本的 last-write-wins——本辅助绕过 CAS 仅用于测试
-    固定前置态（conftest TRUNCATE 后 seed 缺失时也用它快速置 target）。
-    """
-    import psycopg
-    import pg_store
-    if target not in ("window", "total_allowance"):
-        raise ValueError("target 需为 'window'|'total_allowance'")
-    own = conn is None
-    if own:
-        conn = connect()
-    try:
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO platform_settings (key, value, updated_at, "
-                    "updated_by) VALUES ('user_spend_target', %s, now(), "
-                    "'pytest') ON CONFLICT (key) DO UPDATE SET "
-                    "value=EXCLUDED.value, updated_at=now()",
-                    (psycopg.types.json.Jsonb(target),))
+        _replay(conn, _MIGRATION_0032)
     finally:
         if own:
             conn.close()

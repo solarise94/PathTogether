@@ -33,15 +33,13 @@ REGISTRATION_MODE_KEY = "registration_mode"
 
 # --------------------------------------------------------------------------- #
 # Batch B（docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
-# §Batch B 数据模型 4）：user 消费控制目标 + cutover 维护闸。
+# §Batch B 数据模型 4）：cutover 维护闸。
+#
+# R3 Wave1-Money：原 user 消费控制目标键（USER_SPEND_TARGET_KEY /
+# USER_SPEND_TARGETS）已删除——role=user 授权面单轨为一次性总额度，
+# 不再有运行时目标读取；0029 种子的 ``user_spend_target`` 行由 0032 迁移
+# 删除（历史 audit 行只读保留）。
 # --------------------------------------------------------------------------- #
-#: user 消费控制目标（JSONB 字符串，只允许 "window"|"total_allowance"）。
-#: 只控制 role=user；demo/owner 的窗口语义不受它影响。0029 幂等 seed
-#: "window"（部署初期双目标代码并存但行为不变），受控 cutover 以 CAS 切
-#: "total_allowance"；回滚走 rollback-plan CAS 切回。
-USER_SPEND_TARGET_KEY = "user_spend_target"
-USER_SPEND_TARGETS = ("window", "total_allowance")
-
 #: cutover 维护闸（JSONB bool，0029 seed false）：true 时所有 AI dispatch
 #: 端点在创建 hold 前稳定返回 503 ai_dispatch_maintenance（wave 2 app.py
 #: 接线）。cutover apply 先 CAS false→true，提交后 CAS true→false。
@@ -137,9 +135,10 @@ def compare_and_set_setting(key, expected, value, updated_by=None):
     写入原子，无 last-write-wins 窗口；未命中（key 不存在或当前值 != expected）
     抛 :class:`SettingsVersionConflictError`（稳定 409 语义，不做 upsert）。
 
-    用途红线：``user_spend_target`` 与 ``ai_dispatch_maintenance`` 的切换
-    **必须**走本函数（cutover 脚本）；无版本的 :func:`set_setting` 是
-    last-write-wins，禁止用于 cutover 键（spec §Batch B 数据模型 4）。
+    用途红线：``ai_dispatch_maintenance`` 的切换**必须**走本函数（cutover
+    脚本）；无版本的 :func:`set_setting` 是 last-write-wins，禁止用于
+    cutover 键（spec §Batch B 数据模型 4；原 ``user_spend_target`` 键已随
+    R3 Wave1-Money 单轨拆除）。
 
     json/dual 后端不可写：抛 ``PgFeatureUnavailable``（与其他写路径一致
     fail-closed）。返回写入后的值。

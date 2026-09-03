@@ -358,7 +358,44 @@ def _expected_charge(at, tokens, model="deepseek-v4-flash"):
 
 
 def _user(email):
-    return user_store.create_user(email, "pass123456789012")
+    """建 role=user（组合原语恒建 allowance，默认 20 CNY）并把总额度提到
+    远高于任何估算/累计消费（10^8 CNY 量级）——单轨后 hard 用例与多次
+    settle 累计不被默认额度卡死；低额度场景用 set_user_total_limit 自压。"""
+    user = user_store.create_user(email, "pass123456789012")
+    row = _allowance(user["user_id"])
+    assert row is not None, "单轨建号必须带 allowance 行"
+    spend_store.set_user_total_limit(
+        user["user_id"], 10 ** 17, int(row["version"]), actor_user_id="pytest")
+    return user
+
+
+def _allowance(user_id):
+    """读 user 的总额度原始行（不存在返回 None）。"""
+    conn = bh.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM ai_spend_total_allowances "
+                        "WHERE subject_id=%s", (user_id,))
+            r = cur.fetchone()
+            return dict(r) if r else None
+    finally:
+        conn.close()
+
+
+def _owner(login):
+    """建 role=owner（不走组合原语：无 allowance、无维护闸）——窗口语义
+    （每月窗口）载体，用于策略/窗口投影类用例。"""
+    return user_store.create_user(login, "pass123456789012", role="owner")
+
+
+def _bound_owner_hold(owner):
+    """owner 主体 + 绑定行 + authorize body。"""
+    call_id, session_id, request_id = _ids()
+    body = _hold_body("owner", owner["user_id"], session_id=session_id,
+                      request_id=request_id, call_id=call_id,
+                      user_id=owner["user_id"])
+    bh.bind_reservation(request_id, session_id, "owner", owner["user_id"])
+    return body
 
 
 def _bound_user_hold(user, now=None, model="deepseek-v4-flash",
@@ -565,9 +602,9 @@ def test_legacy_hold_rows_behave_as_shadow_compatible():
 def test_shadow_never_denies_but_projects_reserved():
     _seed_all()
     user = _user("shadow-proj@x.com")
-    # 额度压到远低于估算：shadow 仍放行，但 reserved 照常累加 + would_deny
-    spend_store.set_user_override(user["user_id"], 1000,  # 1000 nano
-                              at=T0 - timedelta(days=1))
+    # 总额度压到远低于估算：shadow 仍放行，但 reserved 照常累加 + would_deny
+    spend_store.set_user_total_limit(user["user_id"], 1000, 2,  # 1000 nano
+                                     actor_user_id="pytest")
     body = _bound_user_hold(user)
     est = _expected_estimate(T0)
     assert est > 1000
@@ -575,14 +612,16 @@ def test_shadow_never_denies_but_projects_reserved():
     assert result["status"] == "open"
     assert result["enforcement_mode"] == "shadow"
     assert result["denial_reason"] == "spend_budget_exhausted"
-    assert result["would_deny"] is True        # 窗口口径的观测
+    assert result["would_deny"] is True        # 总额度口径的观测
     row = _hold_row(call_id=body["call_id"])
-    assert row["spend_window_id"] is not None
+    assert row["spend_total_allowance_id"] is not None
+    assert row["spend_window_id"] is None
     assert row["reserved_nano_cny"] == est
-    win = _window(row["spend_window_id"])
-    assert win["reserved_nano_cny"] == est     # 投影真实占用（超限也投影）
-    assert win["spent_nano_cny"] == 0
-    assert spend_store.window_remaining_nano(win) < 0  # overage 可观测
+    allowance = _allowance(user["user_id"])
+    assert int(allowance["reserved_nano_cny"]) == est  # 投影真实占用（超限也投影）
+    assert int(allowance["spent_nano_cny"]) == 0
+    assert spend_store.total_allowance_remaining_nano(allowance) == 0
+    assert spend_store.total_allowance_overage_nano(allowance) > 0
 
 
 @PG
@@ -591,34 +630,35 @@ def test_registered_hard_denials_stable_codes_no_write():
     _set_mode("registered")
     # ① spend_budget_exhausted：不写行、不写 reserved
     user = _user("hard-exhaust@x.com")
-    spend_store.set_user_override(user["user_id"], 1000,
-                              at=T0 - timedelta(days=1))
+    spend_store.set_user_total_limit(user["user_id"], 1000, 2,
+                                     actor_user_id="pytest")
     body = _bound_user_hold(user)
     est = _expected_estimate(T0)
     with pytest.raises(spend_store.SpendBudgetExhaustedError) as exc:
         _authorize(body, now=T0)
     assert exc.value.code == "spend_budget_exhausted"
     assert _hold_row(call_id=body["call_id"]) is None
-    win = spend_store.get_or_create_window("user", user["user_id"], at=T0)
-    assert win["reserved_nano_cny"] == 0      # 拒绝不动数（§3.3 步骤 7）
-    assert win["spent_nano_cny"] == 0
+    allowance = _allowance(user["user_id"])
+    assert int(allowance["reserved_nano_cny"]) == 0  # 拒绝不动数（§3.3 步骤 7）
+    assert int(allowance["spent_nano_cny"]) == 0
     # ② pricing_unavailable：未知模型 hard fail-closed
     user2 = _user("hard-noprice@x.com")
     body2 = _bound_user_hold(user2, model="deepseek-v4-unknown")
     with pytest.raises(billing_store.HoldPricingUnavailableError):
         _authorize(body2, now=T0)
     assert _hold_row(call_id=body2["call_id"]) is None
-    # ③ spend_policy_missing：无策略 hard fail-closed
-    user3 = _user("hard-nopolicy@x.com")
+    # ③ spend_policy_missing：无策略 hard fail-closed（owner 走策略解析；
+    #    单轨 user 恒 allowance，缺行语义是 spend_total_allowance_missing）
+    owner3 = _owner("hard-nopolicy@x.com")
     conn = bh.connect()
     try:
         with conn.cursor() as cur:
             cur.execute("UPDATE ai_spend_policies SET enabled=false "
-                        "WHERE policy_id='spp_user_default'")
+                        "WHERE policy_id='spp_owner'")
         conn.commit()
     finally:
         conn.close()
-    body3 = _bound_user_hold(user3)
+    body3 = _bound_owner_hold(owner3)
     with pytest.raises(spend_store.SpendPolicyMissingError):
         _authorize(body3, now=T0)
     assert _hold_row(call_id=body3["call_id"]) is None
@@ -703,8 +743,8 @@ def test_concurrent_two_calls_only_one_crosses_limit():
     _set_mode("registered")
     user = _user("race-limit@x.com")
     est = _expected_estimate(T0)
-    spend_store.set_user_override(user["user_id"], est + est // 2,  # 1.5×est
-                              at=T0 - timedelta(days=1))
+    spend_store.set_user_total_limit(  # 1.5×est：第二个必拒
+        user["user_id"], est + est // 2, 2, actor_user_id="pytest")
     b1 = _bound_user_hold(user)
     b2 = _bound_user_hold(user)
     barrier = threading.Barrier(2)
@@ -726,9 +766,9 @@ def test_concurrent_two_calls_only_one_crosses_limit():
     assert len(results) == 2
     assert sum(1 for kind, _ in results if kind == "ok") == 1
     assert sum(1 for kind, _ in results if kind == "denied") == 1
-    win = spend_store.get_or_create_window("user", user["user_id"], at=T0)
-    assert win["reserved_nano_cny"] == est        # 只有赢家占上
-    assert win["spent_nano_cny"] == 0
+    allowance = _allowance(user["user_id"])
+    assert int(allowance["reserved_nano_cny"]) == est   # 只有赢家占上
+    assert int(allowance["spent_nano_cny"]) == 0
     assert _count("billing_holds") == 1           # 输家不写行
 
 
@@ -737,7 +777,8 @@ def test_concurrent_same_call_single_hold_and_single_reserve():
     """同 call_id 同 payload 并发：恰一行 hold，且**窗口预占不双份**（输家
     的 reserve 随 SAVEPOINT 撤销）。"""
     _seed_all()
-    body = _bound_user_hold(_user("race-call@x.com"))
+    race_user = _user("race-call@x.com")
+    body = _bound_user_hold(race_user)
     est = _expected_estimate(T0)
     barrier = threading.Barrier(2)
 
@@ -752,8 +793,8 @@ def test_concurrent_same_call_single_hold_and_single_reserve():
     assert len({r["hold_id"] for r in results}) == 1
     assert _count("billing_holds") == 1
     row = _hold_row(call_id=body["call_id"])
-    win = _window(row["spend_window_id"])
-    assert win["reserved_nano_cny"] == est        # 不是 2×est
+    allowance = _allowance(race_user["user_id"])
+    assert int(allowance["reserved_nano_cny"]) == est   # 不是 2×est
     assert row["reserved_nano_cny"] == est
 
 
@@ -791,8 +832,7 @@ def test_settle_actual_vs_estimate_three_cases():
         body = _bound_user_hold(user)
         est = _expected_estimate(T0)
         hold = _authorize(body, now=T0)
-        win0 = _window(_hold_row(hold_id=hold["hold_id"])["spend_window_id"])
-        spent0, ver0 = win0["spent_nano_cny"], win0["version"]
+        spent0 = int(_allowance(user["user_id"])["spent_nano_cny"])
         event = _usage_event(body["call_id"], body["session_id"], "user",
                              user["user_id"], occurred=T0, tokens=tokens,
                              request_id=body["request_id"],
@@ -800,30 +840,31 @@ def test_settle_actual_vs_estimate_three_cases():
         out = _settle(hold["hold_id"], {"usage_event": event},
                       now=T0 + timedelta(seconds=60))
         actual = _expected_charge(T0, tokens)
-        win = _window(win0["window_id"])
-        return out, est, actual, (win["spent_nano_cny"] - spent0), win, ver0
+        allowance = _allowance(user["user_id"])
+        return (out, est, actual,
+                int(allowance["spent_nano_cny"]) - spent0, allowance)
 
     # ① actual == estimate（output 取封顶值 4096：≤cap 时估计不 clamp，两侧同口径）
-    out, est, actual, d_spent, win, _ = _run((0, 1_000_000, 4096))
+    out, est, actual, d_spent, allowance = _run((0, 1_000_000, 4096))
     assert actual == est
     assert out["status"] == "settled"
     assert out["actual_nano_cny"] == actual
     assert out["usage_duplicate"] is False
     assert d_spent == actual
-    assert win["reserved_nano_cny"] == 0
+    assert int(allowance["reserved_nano_cny"]) == 0
     # ② actual < estimate：差额随 reserved 归还自然释放
-    out, est, actual, d_spent, win, _ = _run((0, 500_000, 100_000))
+    out, est, actual, d_spent, allowance = _run((0, 500_000, 100_000))
     assert actual < est
     assert d_spent == actual
-    assert win["reserved_nano_cny"] == 0
+    assert int(allowance["reserved_nano_cny"]) == 0
     # ③ actual > estimate：按真实成本入账 + 估算不足指标
     before = billing_store.hold_metrics_snapshot().get(
         "hold_settle_estimate_short_total", 0)
-    out, est, actual, d_spent, win, _ = _run((0, 1_200_000, 400_000))
+    out, est, actual, d_spent, allowance = _run((0, 1_200_000, 400_000))
     assert actual > est
     assert out["actual_nano_cny"] == actual
     assert d_spent == actual                     # 不拒绝已发生的真实成本
-    assert win["reserved_nano_cny"] == 0
+    assert int(allowance["reserved_nano_cny"]) == 0
     assert billing_store.hold_metrics_snapshot().get(
         "hold_settle_estimate_short_total", 0) == before + 1
     # 真实 debit：每事件恰一条、金额=-actual、simulated=false、幂等键固定
@@ -889,15 +930,15 @@ def test_settle_replay_after_commit_no_double_debit():
     body_settle = {"usage_event": event}
     first = _settle(hold["hold_id"], body_settle, now=T0 + timedelta(seconds=60))
     assert first["duplicate"] is False
-    win = _window(_hold_row(hold_id=hold["hold_id"])["spend_window_id"])
-    spent, debits = win["spent_nano_cny"], _debits()
+    spent = int(_allowance(user["user_id"])["spent_nano_cny"])
+    debits = _debits()
     # 重试（同 event 同 payload）
     again = _settle(hold["hold_id"], body_settle,
                     now=T0 + timedelta(seconds=120))
     assert again["duplicate"] is True
     assert again["status"] == "settled"
     assert again["event_id"] == event["event_id"]
-    assert _window(win["window_id"])["spent_nano_cny"] == spent
+    assert int(_allowance(user["user_id"])["spent_nano_cny"]) == spent
     assert len(_debits()) == len(debits)
     assert _count("ai_usage_events") == 1
 
@@ -919,13 +960,13 @@ def test_outbox_settle_ordering_both_directions_single_consume():
                          user_id=user["user_id"])
     _settle(hold["hold_id"], {"usage_event": event},
             now=T0 + timedelta(seconds=60))
-    win = _window(_hold_row(hold_id=hold["hold_id"])["spend_window_id"])
-    spent_a, n_debits_a = win["spent_nano_cny"], len(_debits())
+    spent_a = int(_allowance(user["user_id"])["spent_nano_cny"])
+    n_debits_a = len(_debits())
     outbox = billing_store.ingest_usage_event(
         event, installation_id=INSTALLATION,
         now=T0 + timedelta(seconds=90))
     assert outbox["duplicate"] is True
-    assert _window(win["window_id"])["spent_nano_cny"] == spent_a
+    assert int(_allowance(user["user_id"])["spent_nano_cny"]) == spent_a
     assert len(_debits()) == n_debits_a
 
     # 方向 B：outbox 先入（真实 debit + spent 投影），settle 后到 → 只做
@@ -934,7 +975,6 @@ def test_outbox_settle_ordering_both_directions_single_consume():
     body2 = _bound_user_hold(user2)
     hold2 = _authorize(body2, now=T0)
     row2 = _hold_row(hold_id=hold2["hold_id"])
-    win2 = _window(row2["spend_window_id"])
     event2 = _usage_event(body2["call_id"], body2["session_id"], "user",
                           user2["user_id"], occurred=T0,
                           request_id=body2["request_id"],
@@ -944,16 +984,16 @@ def test_outbox_settle_ordering_both_directions_single_consume():
         now=T0 + timedelta(seconds=30))
     assert first["duplicate"] is False and first["priced"] is True
     actual2 = _expected_charge(T0, (0, 1_000_000, 200_000))
-    assert _window(win2["window_id"])["spent_nano_cny"] == actual2
-    assert _window(win2["window_id"])["reserved_nano_cny"] == \
+    assert int(_allowance(user2["user_id"])["spent_nano_cny"]) == actual2
+    assert int(_allowance(user2["user_id"])["reserved_nano_cny"]) == \
         row2["reserved_nano_cny"]  # outbox 不动 reserved
     out2 = _settle(hold2["hold_id"], {"usage_event": event2},
                    now=T0 + timedelta(seconds=60))
     assert out2["usage_duplicate"] is True       # 事件已由 outbox 入库
     assert out2["actual_nano_cny"] == actual2
-    final2 = _window(win2["window_id"])
-    assert final2["spent_nano_cny"] == actual2   # 没有重复加 spent
-    assert final2["reserved_nano_cny"] == 0      # reserved 恰好归还一次
+    final2 = _allowance(user2["user_id"])
+    assert int(final2["spent_nano_cny"]) == actual2   # 没有重复加 spent
+    assert int(final2["reserved_nano_cny"]) == 0      # reserved 恰好归还一次
     assert len([d for d in _debits() if d["event_id"] == event2["event_id"]]) == 1
 
 
@@ -964,17 +1004,16 @@ def test_release_releases_reserved_and_replay_idempotent():
     body = _bound_user_hold(user)
     est = _expected_estimate(T0)
     hold = _authorize(body, now=T0)
-    win = _window(_hold_row(hold_id=hold["hold_id"])["spend_window_id"])
-    assert win["reserved_nano_cny"] == est
+    assert int(_allowance(user["user_id"])["reserved_nano_cny"]) == est
     out = _settle(hold["hold_id"], None, now=T0 + timedelta(seconds=30))
     assert out["status"] == "released" and out["event_id"] is None
-    assert _window(win["window_id"])["reserved_nano_cny"] == 0
-    assert _window(win["window_id"])["spent_nano_cny"] == 0
+    assert int(_allowance(user["user_id"])["reserved_nano_cny"]) == 0
+    assert int(_allowance(user["user_id"])["spent_nano_cny"]) == 0
     # release 重放幂等（§9.3）：duplicate=True，不重复归还
     again = _settle(hold["hold_id"], None, now=T0 + timedelta(seconds=60))
     assert again["duplicate"] is True
     assert again["status"] == "released"
-    assert _window(win["window_id"])["reserved_nano_cny"] == 0
+    assert int(_allowance(user["user_id"])["reserved_nano_cny"]) == 0
     # released 后不能改 settle 成 settled
     with pytest.raises(billing_store.HoldNotOpenError):
         _settle(hold["hold_id"], {"event_id": "use_" + "2" * 32},
@@ -991,25 +1030,23 @@ def test_expiry_sweep_releases_reserved_and_late_usage_records_cost():
     body = _bound_user_hold(user)
     est = _expected_estimate(T0)
     hold = _authorize(body, now=T0)   # TTL 默认 300s
-    win = _window(_hold_row(hold_id=hold["hold_id"])["spend_window_id"])
-    assert win["reserved_nano_cny"] == est
+    assert int(_allowance(user["user_id"])["reserved_nano_cny"]) == est
     later = T0 + timedelta(seconds=3600)
 
     # later 时刻的新 authorize：其事务先惰性回收（hold1 过期 + 归还 est），
-    # 再为本次调用预占 est → 窗口 reserved 恰为一份（不是两份）
+    # 再为本次调用预占 est → 总额度 reserved 恰为一份（不是两份）
     body2 = _bound_user_hold(user)
     hold2 = _authorize(body2, now=later)
     expired = _hold_row(hold_id=hold["hold_id"])
     assert expired["status"] == "expired"
-    win_after_sweep = _window(win["window_id"])
     # 与 hold2 预占同时刻复算（later=T0+1h 可能跨 peak/off_peak 时段带——
     # 拿 T0 的 est 断言 later 的 reserved 是按墙钟碰运气，CI 已实炸）
-    assert win_after_sweep["reserved_nano_cny"] == \
+    assert int(_allowance(user["user_id"])["reserved_nano_cny"]) == \
         _expected_estimate(later)  # 只有 hold2 的预占
-    # 显式 release hold2 → 窗口 reserved 精确归零
+    # 显式 release hold2 → 总额度 reserved 精确归零
     out2 = _settle(hold2["hold_id"], None, now=later)
     assert out2["status"] == "released"
-    assert _window(win["window_id"])["reserved_nano_cny"] == 0
+    assert int(_allowance(user["user_id"])["reserved_nano_cny"]) == 0
 
     # 迟到的合法 usage：真实成本照记 + hold 转 settled（不二次归还）
     before = billing_store.hold_metrics_snapshot().get(
@@ -1022,9 +1059,9 @@ def test_expiry_sweep_releases_reserved_and_late_usage_records_cost():
     assert out["status"] == "settled"
     assert out["actual_nano_cny"] == _expected_charge(T0, (0, 1_000_000,
                                                            200_000))
-    final = _window(win["window_id"])
-    assert final["spent_nano_cny"] == out["actual_nano_cny"]  # 成本没丢
-    assert final["reserved_nano_cny"] == 0                    # 没有二次归还
+    final = _allowance(user["user_id"])
+    assert int(final["spent_nano_cny"]) == out["actual_nano_cny"]  # 成本没丢
+    assert int(final["reserved_nano_cny"]) == 0                    # 没有二次归还
     assert billing_store.hold_metrics_snapshot().get(
         "hold_late_usage_after_expiry_total", 0) == before + 1
     # audit 带 late_after_expiry 标记
@@ -1047,11 +1084,11 @@ def test_expiry_sweep_releases_reserved_and_late_usage_records_cost():
     with pytest.raises(billing_store.HoldNotOpenError):
         _settle(hold3["hold_id"], None, now=later)
 
-    # overage 后阻断后续新调用：把窗口额度调到已消费之下 → 窗口检查拒绝
-    final_win = _window(win["window_id"])
-    spend_store.adjust_current_window(
-        win["window_id"], final_win["spent_nano_cny"] - 1,
-        final_win["version"], actor_user_id="pytest")
+    # overage 后阻断后续新调用：把总额度压到已消费之下 → 不等式拒绝
+    final_allowance = _allowance(user["user_id"])
+    spend_store.set_user_total_limit(
+        user["user_id"], int(final_allowance["spent_nano_cny"]) - 1,
+        int(final_allowance["version"]), actor_user_id="pytest")
     body4 = _bound_user_hold(user)
     with pytest.raises(spend_store.SpendBudgetExhaustedError):
         _authorize(body4, now=later)
@@ -1070,13 +1107,12 @@ def test_settle_body_compat_matrix_shadow_ok_hard_rejected():
     body = _bound_user_hold(user)
     est = _expected_estimate(T0)
     hold = _authorize(body, now=T0)
-    win = _window(_hold_row(hold_id=hold["hold_id"])["spend_window_id"])
     out = _settle(hold["hold_id"], {"event_id": "use_" + "4" * 32},
                   now=T0 + timedelta(seconds=60))
     assert out["status"] == "settled"
     assert out["event_id"] == "use_" + "4" * 32
-    assert _window(win["window_id"])["reserved_nano_cny"] == 0   # 归还
-    assert _window(win["window_id"])["spent_nano_cny"] == 0      # 金额走 outbox
+    assert int(_allowance(user["user_id"])["reserved_nano_cny"]) == 0  # 归还
+    assert int(_allowance(user["user_id"])["spent_nano_cny"]) == 0     # 金额走 outbox
     # settled + 同 event 重放 → duplicate；异 event → 409
     dup = _settle(hold["hold_id"], {"event_id": "use_" + "4" * 32},
                   now=T0 + timedelta(seconds=90))
@@ -1166,16 +1202,16 @@ def test_hard_settle_injection_full_rollback(monkeypatch):
         assert _hold_row(hold_id=hold_id)["status"] == "open"
         assert _count("ai_usage_events") == 0
         assert len(_debits()) == 0
-        # 窗口回到只有预占的状态
+        # 总额度回到只有预占的状态（spent 基线 0）
         conn = bh.connect()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT spent_nano_cny, reserved_nano_cny "
-                            "FROM ai_spend_windows")
+                cur.execute("SELECT spent_nano_cny "
+                            "FROM ai_spend_total_allowances")
                 rows = [dict(r) for r in cur.fetchall()]
         finally:
             conn.close()
-        assert all(r["spent_nano_cny"] == 0 for r in rows)
+        assert all(int(r["spent_nano_cny"]) == 0 for r in rows)
 
     def _boom(*a, **kw):
         raise RuntimeError("injected")
@@ -1249,9 +1285,9 @@ def test_unknown_price_shadow_observed_hard_rejected():
     assert r["estimated_nano_cny"] is None
     assert r["denial_reason"] == "pricing_unavailable"
     row = _hold_row(call_id=body["call_id"])
-    assert row["spend_window_id"] is not None   # 策略有效仍关联窗口（可观测）
+    assert row["spend_total_allowance_id"] is not None  # 授权面已锁（可观测）
     assert row["reserved_nano_cny"] is None     # 无估算不预占
-    assert _window(row["spend_window_id"])["reserved_nano_cny"] == 0
+    assert int(_allowance(user["user_id"])["reserved_nano_cny"]) == 0
     # registered：pricing_unavailable（fail-closed）
     _set_mode("registered")
     user2 = _user("noprice2@x.com")
@@ -1375,10 +1411,9 @@ def test_usage_events_window_projection_and_capabilities():
     assert out["enforcement_mode"] == "shadow"
     assert out["capabilities"] == {"settle_with_usage_event": True,
                                    "spend_enforcement": "shadow"}
-    # 窗口投影：user 月窗口 spent += charge
+    # 总额度投影：user allowance spent += charge
     actual = _expected_charge(T0, (0, 1_000_000, 200_000))
-    win = spend_store.get_or_create_window("user", user["user_id"], at=T0)
-    assert win["spent_nano_cny"] == actual
+    assert int(_allowance(user["user_id"])["spent_nano_cny"]) == actual
     # demo 事件 → demo_global 周窗口
     _, demo_sess, _ = _ids()
     cap = bh.bind_demo_session(demo_sess)
@@ -1391,8 +1426,9 @@ def test_usage_events_window_projection_and_capabilities():
     assert r2.status_code == 200
     demo_win = spend_store.get_or_create_window("demo", "demo_global", at=T0)
     assert demo_win["spent_nano_cny"] == actual
-    # 策略缺失（enabled=false，不物理删除——窗口行有 policy FK）：投影跳过
-    # 但不阻断计量（§3.4.7 精神：不丢事件）
+    # 策略缺失（enabled=false，不物理删除——窗口行有 policy FK）：owner
+    # 主体（策略解析路径）投影跳过但不阻断计量（§3.4.7 精神：不丢事件）；
+    # 单轨 user 恒 allowance，不依赖策略
     conn = bh.connect()
     try:
         with conn.cursor() as cur:
@@ -1401,11 +1437,11 @@ def test_usage_events_window_projection_and_capabilities():
     finally:
         conn.close()
     _, sess3, req3 = _ids()
-    user3 = _user("nopolicy-proj@x.com")
-    bh.bind_reservation(req3, sess3, "user", user3["user_id"])
-    event3 = _usage_event("call_" + uuid.uuid4().hex, sess3, "user",
-                          user3["user_id"], occurred=T0, request_id=req3,
-                          user_id=user3["user_id"])
+    owner3 = _owner("nopolicy-proj@x.com")
+    bh.bind_reservation(req3, sess3, "owner", owner3["user_id"])
+    event3 = _usage_event("call_" + uuid.uuid4().hex, sess3, "owner",
+                          owner3["user_id"], occurred=T0, request_id=req3,
+                          user_id=owner3["user_id"])
     r3 = client.post("/api/plugin/v1/usage-events",
                      headers=dict(_bearer(token),
                                   **{"Idempotency-Key": event3["event_id"]}),
@@ -1424,8 +1460,8 @@ def test_route_envelopes_and_capability_fields():
     _seed_all()
     client = _client()
     user = _user("route-hard@x.com")
-    spend_store.set_user_override(user["user_id"], 1000,
-                              at=T0 - timedelta(days=1))
+    spend_store.set_user_total_limit(user["user_id"], 1000, 2,
+                                     actor_user_id="pytest")
     body = _bound_user_hold(user)
     # shadow 下先成功一次拿能力字段
     ok_body = _bound_user_hold(user)
@@ -1481,19 +1517,22 @@ def test_reconcile_matches_after_settle_chain():
     无 drift）。"""
     _seed_all()
     _set_mode("registered")
-    user = _user("reconcile@x.com")
+    # owner 主体（每月窗口）承载窗口对账语义；单轨 user 走 allowance，
+    # 其对账由 reconcile_total_allowances 覆盖（test_spend_total_allowances）
+    owner = _owner("reconcile@x.com")
     for tokens in ((0, 1_000_000, 200_000), (0, 400_000, 50_000)):
-        body = _bound_user_hold(user)
+        body = _bound_owner_hold(owner)
         hold = _authorize(body, now=T0)
-        event = _usage_event(body["call_id"], body["session_id"], "user",
-                             user["user_id"], occurred=T0,
+        event = _usage_event(body["call_id"], body["session_id"], "owner",
+                             owner["user_id"], occurred=T0,
                              request_id=body["request_id"],
-                             user_id=user["user_id"], tokens=tokens)
+                             user_id=owner["user_id"], tokens=tokens)
         _settle(hold["hold_id"], {"usage_event": event},
                 now=T0 + timedelta(seconds=60))
     result = spend_store.reconcile_spend_windows(at=T0 + timedelta(hours=2))
-    items = [i for i in result["items"] if i["subject_id"] == user["user_id"]]
-    assert items, "应有该用户的窗口"
+    items = [i for i in result["items"] if i["subject_id"] ==
+             owner["user_id"]]
+    assert items, "应有该 owner 的窗口"
     for item in items:
         assert item["matches"] is True, item
     # 全局也没有其它 drift 窗口

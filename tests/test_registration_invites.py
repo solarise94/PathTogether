@@ -28,7 +28,6 @@ import pytest  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
-import platform_features  # noqa: E402
 import registration_store  # noqa: E402
 import settings_store  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
@@ -71,9 +70,8 @@ def _set_mode(monkeypatch, mode):
 def _satisfy_preconditions(monkeypatch):
     """env 前置条件（HTTPS + Secure Cookie）。
 
-    注意**不**伪造 platform_features.STORAGE_BACKEND：json 后端下存储语义必须
-    保持真实（前置条件判定会如实报「非 postgres」）。需要在 json 后端打开路由
-    闸的用例改用 _open_route_gate（只 patch 判定函数）。
+    PostgreSQL 唯一后端，无 json/dual storage 前置判定；postgres 后端天然满足
+    storage 前置，仅需满足 HTTPS / Secure Cookie 两个 env 前置。
     """
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://path.example.com")
     monkeypatch.setenv("ADMIN_SESSION_COOKIE_SECURE", "1")
@@ -158,7 +156,7 @@ def test_invite_only_degraded_without_preconditions(monkeypatch, caplog):
 
 
 @pytest.mark.parametrize("missing", [
-    "PUBLIC_BASE_URL", "ADMIN_SESSION_COOKIE_SECURE", "BACKEND",
+    "PUBLIC_BASE_URL", "ADMIN_SESSION_COOKIE_SECURE",
 ])
 def test_precondition_failures_detected(monkeypatch, missing):
     _satisfy_preconditions(monkeypatch)
@@ -166,8 +164,6 @@ def test_precondition_failures_detected(monkeypatch, missing):
         monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
     elif missing == "ADMIN_SESSION_COOKIE_SECURE":
         monkeypatch.delenv("ADMIN_SESSION_COOKIE_SECURE", raising=False)
-    else:  # BACKEND：降级为 json
-        monkeypatch.setattr(platform_features, "STORAGE_BACKEND", "json")
     failures = app_mod._registration_precondition_failures()
     assert failures, "前置条件缺失未被检测到（%s）" % missing
     _set_mode(monkeypatch, "invite_only")

@@ -243,7 +243,6 @@ def reservation_is_active(out) -> bool:
 
 def get_quota_row(user_id):
     """读取配额行（不存在则按 env 默认建行）；调试/测试用。"""
-    platform_features.require_pg_backend("upload_quota")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -275,7 +274,6 @@ def reserve_upload(user_id, nbytes, *, inflight_limit=None, hourly_limit=None):
     配额条件判定 → 插入 reservation + 累加 reserved_bytes。任一判定失败
     整体回滚（不会先扣一个维度再失败）。
     """
-    platform_features.require_pg_backend("upload_quota")
     nbytes = int(nbytes)
     if nbytes <= 0:
         raise ValueError("nbytes 需为正整数")
@@ -365,7 +363,6 @@ def topup_reservation(reservation_id, extra_bytes):
     锁序恒为 reservation → quota（reserve_upload 只锁 quota，无环）。
     配额不足抛 QuotaExceeded，整体回滚。
     """
-    platform_features.require_pg_backend("upload_quota")
     extra_bytes = int(extra_bytes)
     if extra_bytes <= 0:
         return get_reservation(reservation_id)
@@ -414,7 +411,6 @@ def topup_reservation(reservation_id, extra_bytes):
 
 def get_reservation(reservation_id):
     """读取 reservation 行（不存在返回 None）。"""
-    platform_features.require_pg_backend("upload_quota")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -444,7 +440,6 @@ def renew_reservation(reservation_id, ttl_seconds=None):
     - ``consumed`` / ``released`` → 幂等 no-op，返回当前行；
     - 不存在 → None。
     """
-    platform_features.require_pg_backend("upload_quota")
     ttl = (UPLOAD_RESERVATION_TTL_SECONDS if ttl_seconds is None
            else int(ttl_seconds))
     conn = _connect()
@@ -480,7 +475,6 @@ def release_reservation(reservation_id):
 
     已 consumed/released 的行幂等 no-op（返回其状态）。
     """
-    platform_features.require_pg_backend("upload_quota")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -551,7 +545,6 @@ def consume_reservation(reservation_id, actual_bytes):
 
     幂等：已 consumed 的行再次 consume 返回现状，不重复累计。
     """
-    platform_features.require_pg_backend("upload_quota")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:

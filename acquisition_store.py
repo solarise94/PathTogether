@@ -14,10 +14,10 @@
 旧归因表（user_acquisition/acquisition_campaigns/acquisition_visits）先冻结
 与备份，经一个发布周期消费者审计后另立迁移删除（§3.2 数据保留）。
 
-PG-only：全部公共入口经 ``platform_features.require_pg_backend("acquisition")``
-fail-closed（json/dual 稳定 ``pg_backend_required``）。**例外**是纯计算辅助
-（slug/UTM/referrer/IP 前缀 hash 清理函数）——它们不接库，供路由层在任意
-后端复用（/r/ 在 json 后端也要能做安全 302 与 cookie 清理，§16.2）。
+PostgreSQL 为唯一后端；旧 json/dual 的 ``require_pg_backend("acquisition")``
+fail-closed 门（pg_backend_required）已随 R3 Wave3 退役。纯计算辅助
+（slug/UTM/referrer/IP 前缀 hash 清理函数）不接库，供路由层在任意后端复用
+（/r/ 始终能做安全 302 与 cookie 清理，§16.2）。
 
 内容：
   - 触点写入 ``record_visit``（**已冻结**）：每次 /r/<source_code> 跳转一个
@@ -61,7 +61,6 @@ from urllib.parse import urlparse
 import psycopg
 
 import pg_store
-import platform_features
 
 _log = logging.getLogger("svs.acquisition")
 
@@ -239,7 +238,6 @@ def create_campaign(campaign_id, source_code, name, created_by=None):
     本批无 owner CRUD API（§13 PR4 范围外；§10.3 的创建/撤销按钮属 PR5）：
     行由 owner SQL 或测试/种子脚本经本函数写入。
     """
-    platform_features.require_pg_backend("acquisition")
     if not valid_slug(campaign_id):
         raise ValueError("campaign_id 需匹配 [a-z0-9][a-z0-9_-]{0,63}")
     if not valid_slug(source_code):
@@ -263,7 +261,6 @@ def create_campaign(campaign_id, source_code, name, created_by=None):
 
 def get_campaign(campaign_id):
     """按 campaign_id 取行；不存在返回 None（owner 校验用）。"""
-    platform_features.require_pg_backend("acquisition")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -276,7 +273,6 @@ def get_campaign(campaign_id):
 
 def list_campaigns(limit=200):
     """campaign 列表（owner 视图；无敏感字段）。"""
-    platform_features.require_pg_backend("acquisition")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -306,7 +302,6 @@ def record_visit(*, visitor_id, source_code, campaign_id=None,
       前缀 hash 或空串）；
     - landing_path 只接受 allowlist（/demo、/register、/），否则空串。
     """
-    platform_features.require_pg_backend("acquisition")
     if not valid_visitor_id(visitor_id):
         raise ValueError("visitor_id 非法")
     if not valid_slug(source_code):
@@ -471,7 +466,6 @@ def insert_user_acquisition(cur, *, user_id, invite_id=None,
 def user_acquisition_by_ids(user_ids):
     """一批用户的归因摘要 ``{user_id: {source_code, campaign_id,
     attribution_method}}``（admin v1 users 行填充；无行用户不在 dict）。"""
-    platform_features.require_pg_backend("acquisition")
     ids = [str(u) for u in (user_ids or []) if u]
     if not ids:
         return {}
@@ -520,7 +514,6 @@ def run_visit_retention():
     互斥（引用与否），多实例重叠调度安全（无需 advisory lock）。返回
     ``(deleted, scrubbed)`` 计数。
     """
-    platform_features.require_pg_backend("acquisition")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -572,7 +565,6 @@ def admin_funnel_summary():
     FULL OUTER 语义在 Python 侧合并：只有注册无触点（invite/referrer 归因）
     与只有触点无注册的组都各自成行。
     """
-    platform_features.require_pg_backend("acquisition")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -642,7 +634,6 @@ def admin_user_acquisition_page(*, cursor=None, limit=50):
     （触点行本就只有前缀 hash，不导出）、无 referrer query（只 hostname）、
     visitor 只给 hash 前缀 8 hex（够 owner 肉眼对齐，不足以复原/碰撞查询）。
     """
-    platform_features.require_pg_backend("acquisition")
     limit = max(1, min(int(limit or 50), 200))
     where, params = "", []
     if cursor is not None:

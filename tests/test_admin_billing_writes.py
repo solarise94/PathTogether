@@ -6,12 +6,12 @@ R3 wave1 起 billing caps/adjustments、turn-budgets 与 /admin/registration
 兼容重定向端点已物理删除（bridge 侧无调用方；billing_store 写原语由
 tests/test_billing_store.py 在 store 级锁定），本文件只覆盖仍在线的写面：
 
-json 模式（无 PG）：
+pg 模式（RUN_PG_TESTS=1）：
   - 全部写端点 owner 门控：匿名 401 / user 403 / owner 预览态 403；
   - users 写端点（create/enable/disable/password-reset）与 break-glass
     不变量（owner 不可禁用/启用/重置密码 → 409；disable 推进 auth_version）；
-  - PG-only 写端点（ai-access/invites）稳定
-    503 pg_backend_required（不降级）。
+  - ai-access/invites 写端点 PG 语义（PostgreSQL 唯一后端；旧 json/dual
+    pg_backend_required 门已随 R3 Wave3 退役）。
 
 PG 模式（RUN_PG_TESTS=1）：
   - invites：创建（含 source_code/campaign slug 校验）token 仅一次 + 列表
@@ -189,7 +189,7 @@ def test_users_password_reset_validation():
     assert "password" not in r.get_json()["user"]
 
 # --------------------------------------------------------------------------- #
-# 3. json/dual fail-closed（PG-only 写端点稳定 503）
+# 3. 旧 json/dual fail-closed（PG-only 写端点稳定 503）已随 R3 Wave3 退役
 # --------------------------------------------------------------------------- #
 
 # --------------------------------------------------------------------------- #

@@ -82,11 +82,7 @@ def get_setting(key, default=None):
 
 def set_setting(key, value, updated_by=None):
     """写一个设置值（任意 JSON 可序列化值，UPSERT）；返回写入后的值。
-
-    json/dual 后端不可写：抛 ``PgFeatureUnavailable``（fail-closed，不静默丢弃）。
     """
-    if not settings_writable():
-        platform_features.require_pg_backend("platform_settings")
     if not isinstance(key, str) or not key:
         raise ValueError("settings key 不能为空")
     conn = _connect()
@@ -134,11 +130,8 @@ def compare_and_set_setting(key, expected, value, updated_by=None):
     cutover 键（spec §Batch B 数据模型 4；原 ``user_spend_target`` 键已随
     R3 Wave1-Money 单轨拆除）。
 
-    json/dual 后端不可写：抛 ``PgFeatureUnavailable``（与其他写路径一致
-    fail-closed）。返回写入后的值。
+    返回写入后的值。
     """
-    if not settings_writable():
-        platform_features.require_pg_backend("platform_settings")
     if not isinstance(key, str) or not key:
         raise ValueError("settings key 不能为空")
     conn = _connect()
@@ -221,11 +214,9 @@ def get_registration_mode() -> str:
 def set_registration_mode(mode, updated_by=None) -> str:
     """写注册模式。本阶段只接受 closed / invite_only（public 拒绝）。
 
-    返回写入后的模式。json/dual 后端不可写（PgFeatureUnavailable fail-closed）。
-    前置条件（HTTPS / Secure Cookie / PG）由调用方（app 层）先行校验。
+    返回写入后的模式。
+    前置条件（HTTPS / Secure Cookie）由调用方（app 层）先行校验。
     """
-    if not settings_writable():
-        platform_features.require_pg_backend("platform_settings")
     if mode not in ("closed", "invite_only"):
         raise ValueError(
             "public_registration_not_supported：本阶段仅支持 closed / "
@@ -330,8 +321,6 @@ def set_ai_safety_settings(validated, actor_user_id=None, updated_by=None):
     spend_store.set_enforcement_mode；CAS 省略——单一 owner 写入口，无并发
     覆盖面）。返回写入后的全量五键快照。
     """
-    if not settings_writable():
-        platform_features.require_pg_backend("platform_settings")
     if not isinstance(validated, dict) or not validated:
         raise ValueError("validated 需为非空 dict（五安全参数的子集）")
     unknown = set(validated) - set(AI_SAFETY_KEYS)

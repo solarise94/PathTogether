@@ -75,7 +75,6 @@ import psycopg
 import billing_pricing
 import billing_store
 import pg_store
-import platform_features
 import settings_store
 import share_store_pg
 
@@ -431,7 +430,6 @@ def _resolve_policy_tx(cur, subject_type, subject_id, at) -> "dict | None":
 
 def resolve_policy(subject_type, subject_id, at=None):
     """独立事务版：解析 at 时刻的有效策略；无则 None（调用方裁决）。"""
-    platform_features.require_pg_backend("spend")
     at = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
     conn = _connect()
     try:
@@ -545,7 +543,6 @@ def get_or_create_window(subject_type, subject_id, at=None):
     ``limit_nano_snapshot`` 固定创建时刻的策略额度（策略后续修改不追溯，
     §3.2）；新用户/新主体的首个窗口拿完整额度（不按剩余天数折算，§1.1）。
     """
-    platform_features.require_pg_backend("spend")
     at = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
     conn = _connect()
     try:
@@ -565,7 +562,6 @@ def peek_current_window(subject_type, subject_id, at=None):
     窗口行）。策略缺失同样返回 None（调用方按「不可用」呈现，不 fail-closed
     整页——config 端点其余字段照常返回）。
     """
-    platform_features.require_pg_backend("spend")
     at = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
     if subject_type not in WINDOW_SUBJECT_TYPES:
         raise InvalidSpendRequestError(
@@ -594,7 +590,6 @@ def peek_current_window(subject_type, subject_id, at=None):
 
 def get_window(window_id):
     """按 window_id 读窗口；不存在返回 None。"""
-    platform_features.require_pg_backend("spend")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -755,7 +750,6 @@ def window_reserve(window, estimated_nano):
     签名/行为与批次 B 完全一致（独立事务版）；事务内核心见
     :func:`window_reserve_tx`。
     """
-    platform_features.require_pg_backend("spend")
     estimated = _validate_nano(estimated_nano, "estimated_nano")
     window_id = _window_arg_id(window)
     conn = _connect()
@@ -779,7 +773,6 @@ def window_release(window, estimated_nano):
     签名/行为与批次 B 完全一致（独立事务版）；事务内核心见
     :func:`window_release_tx`。
     """
-    platform_features.require_pg_backend("spend")
     estimated = _validate_nano(estimated_nano, "estimated_nano")
     window_id = _window_arg_id(window)
     conn = _connect()
@@ -804,7 +797,6 @@ def window_settle(window, estimated_nano, actual_nano):
     签名/行为与批次 B 完全一致（独立事务版）；事务内核心见
     :func:`window_settle_tx`。
     """
-    platform_features.require_pg_backend("spend")
     estimated = _validate_nano(estimated_nano, "estimated_nano")
     actual = _validate_nano(actual_nano, "actual_nano")
     window_id = _window_arg_id(window)
@@ -836,7 +828,6 @@ def update_policy_limit(policy_id, new_limit_nano_cny, expected_version, *,
     :func:`adjust_current_window`，那是独立事务 + 审计 + 二次确认的显式操作）。
     审计 action=``spend.policy_update``（同事务，失败整体回滚）。
     """
-    platform_features.require_pg_backend("spend")
     new_limit = _validate_nano(new_limit_nano_cny, "new_limit_nano_cny")
     _validate_expected_version(expected_version)
     conn = _connect()
@@ -899,7 +890,6 @@ def adjust_current_window(window_id, new_limit_nano_cny, expected_version, *,
       audit detail（不在这里裁决）；
     - audit action=``spend.window_adjust``（同事务，失败整体回滚）。
     """
-    platform_features.require_pg_backend("spend")
     new_limit = _validate_nano(new_limit_nano_cny, "new_limit_nano_cny")
     _validate_expected_version(expected_version)
     conn = _connect()
@@ -965,7 +955,6 @@ def _enforcement_mode_tx(cur) -> str:
 
 def enforcement_mode() -> str:
     """读 ``platform_settings.spend_enforcement_mode``（缺省/非法 → shadow）。"""
-    platform_features.require_pg_backend("spend")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -1003,7 +992,6 @@ def set_enforcement_mode(mode, expected=None, *, updated_by=None,
     注意：把模式切到 registered/all 是批次 C2 验收门（§11）之后的运维动作；
     本函数只负责受审计的写原语，不做批次门槛判定（路由层文档同步说明）。
     """
-    platform_features.require_pg_backend("spend")
     if mode not in SPEND_ENFORCEMENT_MODES:
         raise InvalidSpendRequestError(
             "mode 需为 %s" % (SPEND_ENFORCEMENT_MODES,), mode=mode)
@@ -1141,7 +1129,6 @@ def _fetch_total_allowance_read(cur, subject_id):
 
 def get_total_allowance(user_id):
     """只读某 user 的总额度行；不存在返回 None（admin 查询/投影）。"""
-    platform_features.require_pg_backend("spend")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -1280,7 +1267,6 @@ def total_allowance_add_spent_tx(cur, allowance_id, actual_nano):
 
 def total_allowance_reserve(allowance, estimated_nano):
     """独立事务版预占（连接壳；语义见 :func:`total_allowance_reserve_tx`）。"""
-    platform_features.require_pg_backend("spend")
     estimated = _validate_nano(estimated_nano, "estimated_nano")
     allowance_id = _allowance_arg_id(allowance)
     conn = _connect()
@@ -1294,7 +1280,6 @@ def total_allowance_reserve(allowance, estimated_nano):
 
 def total_allowance_release(allowance, estimated_nano):
     """独立事务版释放（连接壳；语义见 :func:`total_allowance_release_tx`）。"""
-    platform_features.require_pg_backend("spend")
     estimated = _validate_nano(estimated_nano, "estimated_nano")
     allowance_id = _allowance_arg_id(allowance)
     conn = _connect()
@@ -1308,7 +1293,6 @@ def total_allowance_release(allowance, estimated_nano):
 
 def total_allowance_settle(allowance, estimated_nano, actual_nano):
     """独立事务版结算（连接壳；语义见 :func:`total_allowance_settle_tx`）。"""
-    platform_features.require_pg_backend("spend")
     estimated = _validate_nano(estimated_nano, "estimated_nano")
     actual = _validate_nano(actual_nano, "actual_nano")
     allowance_id = _allowance_arg_id(allowance)
@@ -1406,7 +1390,6 @@ def set_user_total_limit(user_id, new_limit_nano_cny, expected_version, *,
       （409 语义，不做 last-write-wins）；
     - audit action=``spend.total_allowance_update``（同事务，失败整体回滚）。
     """
-    platform_features.require_pg_backend("spend")
     new_limit = _validate_nano(new_limit_nano_cny, "new_limit_nano_cny")
     _validate_expected_version(expected_version)
     _validate_user_subject_id(user_id)
@@ -1503,7 +1486,6 @@ def _resolve_total_default_tx(cur, at) -> "tuple[int | None, str | None, int | N
 
 def get_total_default():
     """读全局默认总额度（只查 defaults 表；缺行返回 None）。"""
-    platform_features.require_pg_backend("spend")
     at = datetime.now(timezone.utc)
     conn = _connect()
     try:
@@ -1525,7 +1507,6 @@ def set_total_default(new_limit_nano_cny, expected_version, *,
     - 行不存在：``expected_version`` 必须为 1（首个写入者），否则 409；
     - audit action=``spend.total_default_update`` 与写入同事务。
     """
-    platform_features.require_pg_backend("spend")
     new_limit = _validate_nano(new_limit_nano_cny, "new_limit_nano_cny")
     _validate_expected_version(expected_version)
     conn = _connect()
@@ -1594,7 +1575,6 @@ def restore_user_total_default(user_id, expected_version, *,
     :func:`_resolve_total_default_tx`（单轨后只查 defaults 表）。
     audit detail 追加 ``op=restore_user_total_default`` 与默认来源。
     """
-    platform_features.require_pg_backend("spend")
     _validate_expected_version(expected_version)
     _validate_user_subject_id(user_id)
     conn = _connect()
@@ -1726,7 +1706,6 @@ def reconcile_spend_windows(*, at=None):
     返回 ``{"checked", "drift_windows", "items", "pricing_cutover_epoch",
     "enforcement_mode"}``。
     """
-    platform_features.require_pg_backend("spend")
     at_dt = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
     conn = _connect()
     try:
@@ -1792,7 +1771,6 @@ def reconcile_total_allowances(*, at=None):
     返回 ``{"checked", "drift_allowances", "items", "pricing_cutover_epoch",
     "enforcement_mode"}``（原 ``user_spend_target`` 键随双轨拆除移除）。
     """
-    platform_features.require_pg_backend("spend")
     at_dt = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
     conn = _connect()
     try:
@@ -1881,7 +1859,6 @@ def admin_list_policies(*, at=None):
     resolved 键为 demo_global / user_default / owner（user_default 用不可能
     存在覆盖的哨兵 subject 解析，保证走回退分支）。
     """
-    platform_features.require_pg_backend("spend")
     at_dt = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
     conn = _connect()
     try:
@@ -1930,7 +1907,6 @@ def admin_users_spend_summaries(subjects, *, at=None):
     单主体失败（如缺 allowance 行、owner 策略被禁用）带稳定 ``error``
     code，不拖垮整页（与 admin v1 windows/current 同口径）。
     """
-    platform_features.require_pg_backend("spend")
     at_dt = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
     conn = _connect()
     try:
@@ -2012,7 +1988,6 @@ def admin_demo_spend_stats(window="current", *, at=None):
     - 响应内固定标注：数据库整体不可用类拒绝不在 DB 聚合内（仅外部 metric）；
     - 调用接口前后任何业务表行数不变（测试验收口 §4.6）。
     """
-    platform_features.require_pg_backend("spend")
     if window not in ("current", "previous"):
         raise InvalidSpendRequestError(
             "window 需为 'current'|'previous'", window=window)
@@ -2133,7 +2108,6 @@ def admin_spend_settings_values(*, at=None):
     - ``demo_weekly_limit_nano_cny``：demo_global 周策略当前面值；
     - ``owner_monthly_limit_nano_cny``：owner 月策略当前面值。
     """
-    platform_features.require_pg_backend("spend")
     at_dt = _as_aware_at(at if at is not None else datetime.now(timezone.utc))
     conn = _connect()
     try:

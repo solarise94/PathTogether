@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """PR7 billing holds 测试（admin-billing 方案 §12.3 / §19 v0.5，advisory 影子）。
 
-json 模式（无 PG 也跑）：
+PostgreSQL 唯一后端：
   - 鉴权链：无 Bearer → 401 统一信封（authorize/settle 两端点）；
-  - json 后端 → 503 pg_backend_required（fail-closed 不降级，两端点）；
+    （旧 json 后端 → 503 pg_backend_required 门已随 R3 Wave3 退役）；
   - 纯函数：TTL env 解析（缺省 300，非法/非正回退）、authorize/settle
     request 校验词表（必填/额外字段/call_id 格式/2^53-1 上限）。
 
-PG 模式（RUN_PG_TESTS=1）：
+PG 行为（RUN_PG_TESTS=1）：
   - 正常 authorize：有账户主体 → estimated（customer_charge 最坏价：输入全按
     cache-miss + max_output）/balance/would_deny 确定性断言（注入 now，期望值用
     同一 price book 查询复算）；余额充足 False、不足 True（行照写、永不拒绝）；

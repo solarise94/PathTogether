@@ -2,14 +2,12 @@
 """批次 D：后台设置、用户覆盖与邀请码模板测试（docs
 ai-money-budget-bugfix-and-simplification-plan.md §5/§6/§8 批次 D/§9.6/§9.7）。
 
-json 模式（无 PG）：
+pg 模式（RUN_PG_TESTS=1）：
   - 新端点 owner 门控：匿名 401 / user 403 / owner 预览态 403（§14.1 同口径）；
-  - PG-only 写端点（spend policies/enforcement-mode/window adjust/
-    settings 聚合）稳定 503 pg_backend_required；
   - 注册模式 v1 PUT 校验（public 400 / 非法值 400 / invite_only 前置条件
-    400；旧路由已随 R3 wave1 删除，service 语义由 v1 独守）。
-
-PG 模式（RUN_PG_TESTS=1）：
+    400；旧路由已随 R3 wave1 删除，service 语义由 v1 独守）；
+  - spend policies/enforcement-mode/window adjust/settings 聚合 PG 语义
+    （PostgreSQL 唯一后端；旧 json/dual pg_backend_required 门已退役）。
   - spend policies PUT：CAS 版本冲突 409 / JSON number 金额 400 / >2^53
     十进制字符串精确落库 / audit（spend.policy_update）同事务；
   - enforcement-mode PUT：词表外 400 / CAS 409 / audit（§7.3 无保护配置由

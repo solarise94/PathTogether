@@ -21,9 +21,9 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -r requirements.txt -r requirements-dev.txt
-      # 覆盖率（test-review P3-19）：fail-under=44 —— 单轨 PG 度量产品代码，
-      # 阈值宁可偏低，不让套件变红到不可用（re-baseline 留 Batch D）。
-      - run: python -m pytest tests -q --cov=. --cov-report=term --cov-report=xml --cov-fail-under=44
+      # 覆盖率（test-review P3-19）：fail-under=72 —— 本机 PG 全量 TOTAL 82%，
+      # 减 10 点余量（原 json 54%−10=44 的同口径）。Batch D re-baseline。
+      - run: python -m pytest tests -q --cov=. --cov-report=term --cov-report=xml --cov-fail-under=72
         env:
           RUN_PG_TESTS: "1"
 

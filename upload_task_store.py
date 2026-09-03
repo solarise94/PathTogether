@@ -33,7 +33,6 @@ import secrets
 import time
 
 import pg_store
-import platform_features
 
 # --------------------------------------------------------------------------- #
 # env 可调常量（import 期一次性读取；测试用 monkeypatch 改模块属性）
@@ -279,7 +278,6 @@ _PG_COLS = ", ".join(_TASK_FIELDS)
 
 def _pg_connect():
     import psycopg
-    platform_features.require_pg_backend("upload_tasks")
     conn = pg_store.connect()
     conn.row_factory = psycopg.rows.dict_row
     return conn

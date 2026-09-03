@@ -51,7 +51,6 @@ import time
 import psycopg
 
 import pg_store
-import platform_features
 
 #: capability 默认 24 小时到期（docs §5.2）
 DEMO_CAPABILITY_TTL_HOURS = 24
@@ -235,7 +234,6 @@ def create_capability(capability_id, token_hash, ttl_hours=DEMO_CAPABILITY_TTL_H
     存在时抛 ValueError。返回新 capability dict（run 字段不再有意义：run 状态
     自 0026 起在 demo_runs）。
     """
-    platform_features.require_pg_backend("demo_sessions")
     if not isinstance(capability_id, str) or not capability_id:
         raise ValueError("capability_id 不能为空")
     if not isinstance(token_hash, str) or not token_hash:
@@ -264,7 +262,6 @@ def create_capability(capability_id, token_hash, ttl_hours=DEMO_CAPABILITY_TTL_H
 
 def get_valid_capability(token_hash):
     """按 token_hash 取有效 capability；不存在或已过期返回 None。"""
-    platform_features.require_pg_backend("demo_sessions")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -280,7 +277,6 @@ def get_valid_capability(token_hash):
 
 def get_session(session_id):
     """按 capability id 取 session 行（任意状态；不存在返回 None）。"""
-    platform_features.require_pg_backend("demo_sessions")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -325,7 +321,6 @@ def reserve_run(capability_id, request_id, slide_id, asset_revision,
        capability 行锁覆盖不到；Demo 低 QPS 可接受）；
     6. INSERT 新流水行（state=reserved，expires_at=now+ttl）。
     """
-    platform_features.require_pg_backend("demo_sessions")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -487,7 +482,6 @@ def accept_run(demo_run_id, histopilot_session_id,
     直接返回；session 不一致抛 :class:`RunAttemptConflict`（一个 run 只绑一个
     HP session）。终态拒绝（ValueError）。run 不存在返回 None。
     """
-    platform_features.require_pg_backend("demo_sessions")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -530,7 +524,6 @@ def finish_run(demo_run_id):
     终态不做状态变更（返回原行；reserved 交由确认式对账定局）。
     run 不存在返回 None。
     """
-    platform_features.require_pg_backend("demo_sessions")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -559,7 +552,6 @@ def release_run(demo_run_id, expected_attempt=None, expected_request_id=None,
     已 **accepted 拒绝释放**（防误退款——模型已开始执行不退额度）。
     run 不存在返回 None。
     """
-    platform_features.require_pg_backend("demo_sessions")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -588,7 +580,6 @@ def expire_run(demo_run_id):
     幂等：终态直接返回。run 不存在返回 None。**只动 run 状态**——对应预算
     reservation 由上层确认式对账定局（accepted 的额度已消费，不得退款）。
     """
-    platform_features.require_pg_backend("demo_sessions")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -611,7 +602,6 @@ def extend_run_reservation(demo_run_id,
                            ttl_seconds=DEMO_RUN_RESERVATION_TTL_SECONDS):
     """顺延 reserved run 的预占过期时间（对账时 HistoPilot 不可达 → 不释放、
     顺延）。仅 reserved 可顺延；返回更新后的 run dict 或 None（不存在）。"""
-    platform_features.require_pg_backend("demo_sessions")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -630,7 +620,6 @@ def extend_run_reservation(demo_run_id,
 
 def get_run(demo_run_id):
     """按 demo_run_id 读流水行（任意状态；不存在返回 None）。"""
-    platform_features.require_pg_backend("demo_sessions")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -646,7 +635,6 @@ def get_run(demo_run_id):
 
 def get_run_by_request(capability_id, request_id):
     """按 (capability_id, request_id) 读流水行；不存在返回 None。"""
-    platform_features.require_pg_backend("demo_sessions")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -666,7 +654,6 @@ def latest_run_for_capability(capability_id):
 
     供 /api/demo/config 呈现按钮态与重连信息。
     """
-    platform_features.require_pg_backend("demo_sessions")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -688,7 +675,6 @@ def get_run_for_session(capability_id, histopilot_session_id):
     只匹配 accepted/finished（reserved 未绑定 session；released/expired 不再
     可读）。返回最新一行或 None。
     """
-    platform_features.require_pg_backend("demo_sessions")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -709,7 +695,6 @@ def list_active_expired(now):
     """列出 active（reserved/accepted）且 expires_at < now 的 run（对账用，
     不改状态）。上层按 request_id 经 HistoPilot /session/by-request/<rid>
     反查确认终态后再 accept/release/expire/顺延（直接盲终态会误退款）。"""
-    platform_features.require_pg_backend("demo_sessions")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -732,7 +717,6 @@ def count_run_states():
     "active", "total"}``（active = reserved + accepted，即占用 capability 的
     在途数；0026 前 demo_sessions.run_state 口径已退役）。
     """
-    platform_features.require_pg_backend("demo_sessions")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -762,7 +746,6 @@ def reset_demo_runs():
     确认式对账按 HistoPilot 反查定局，避免把已接受的执行误退款）。
     返回被终态化的 demo_run_id 列表。
     """
-    platform_features.require_pg_backend("demo_sessions")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -805,7 +788,6 @@ def revoke_by_slide(slide_id):
     返回 ``{"expired_capabilities": 0, "terminated_runs": [run dict...]}``；
     terminated_runs 供上层对账释放/消费对应预算 reservation。
     """
-    platform_features.require_pg_backend("demo_sessions")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -832,7 +814,6 @@ def hit_ip_request_rate(ip_prefix_hash, limit=None,
     ``limit`` 缺省读 env（:func:`ip_rate_limit`）。本函数只计数不判定开关：
     调用方需先按 ``ip_rate_limit() <= 0`` 判定桶已关闭（关闭时不计数）。
     """
-    platform_features.require_pg_backend("demo_sessions")
     key = ip_prefix_hash if (isinstance(ip_prefix_hash, str)
                              and ip_prefix_hash) else "unknown"
     lim = int(limit if limit is not None else ip_rate_limit())
@@ -902,7 +883,6 @@ def catalog_add(slide_id, display_name=None, description=None, sort_order=0,
     校验 slide_id 在 slides 表存在（Demo allowlist 只接受已入库的稳定切片
     身份），不存在抛 ValueError。返回条目 dict。
     """
-    platform_features.require_pg_backend("demo_catalog")
     if not isinstance(slide_id, str) or not slide_id:
         raise ValueError("slide_id 不能为空")
     conn = _connect()
@@ -936,7 +916,6 @@ def catalog_remove(slide_id):
 
     返回 None（条目不存在）或 ``{"entry": 条目dict, "revoke": {...}}``。
     """
-    platform_features.require_pg_backend("demo_catalog")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -955,7 +934,6 @@ def catalog_remove(slide_id):
 
 def catalog_list_ordered():
     """按 sort_order、added_at、slide_id 返回 Demo 目录条目列表。"""
-    platform_features.require_pg_backend("demo_catalog")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -971,7 +949,6 @@ def catalog_list_ordered():
 
 def catalog_get(slide_id):
     """取单个 Demo 目录条目；不在目录内返回 None（allowlist 校验用）。"""
-    platform_features.require_pg_backend("demo_catalog")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -991,7 +968,6 @@ def resolve_slide_filename(slide_id):
     Demo 目录 API 只接受 slide_id；服务瓦片/info 时反查稳定映射。行缺失或
     legacy_filename 为 NULL → None（上层 fail-closed 拒绝，绝不按文件名猜）。
     """
-    platform_features.require_pg_backend("demo_catalog")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -1007,7 +983,6 @@ def resolve_slide_filename(slide_id):
 
 def catalog_set_default(slide_id):
     """设置默认 Demo 切片（唯一默认：先清旧再置）。不在目录内抛 ValueError。"""
-    platform_features.require_pg_backend("demo_catalog")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:

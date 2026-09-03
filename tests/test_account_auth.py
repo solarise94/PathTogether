@@ -189,13 +189,6 @@ def test_startup_no_owner_but_users_refuses(monkeypatch):
     with pytest.raises(SystemExit):
         app_mod._resolve_owner_at_startup({})
 
-def test_startup_requires_pg_backend(monkeypatch):
-    """REQUIRE_ADMIN_AUTH=1 且后端非 postgres → 拒绝启动（docs §9.1）。"""
-    monkeypatch.setattr(share_store, "STORAGE_BACKEND", "json")
-    with pytest.raises(SystemExit) as ei:
-        app_mod._resolve_owner_at_startup({"REQUIRE_ADMIN_AUTH": "1"})
-    check("文案指明 postgres 要求", "postgres" in str(ei.value))
-
 def test_startup_empty_db_require_auth_no_secret_refuses(monkeypatch):
     """空库 + REQUIRE_ADMIN_AUTH=1 + 无秘密 → 拒绝启动（fail-closed）。"""
     _fake_pg_backend(monkeypatch)

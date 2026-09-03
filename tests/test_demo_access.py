@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """PT-4：匿名 Demo 完整链路测试（docs §5/§9.1/§9.3/§12.1）。
 
-json 模式（默认）：
-  - /demo 公开 200（json 渲染 PG 前置降级页，不加载写操作脚本）；
-  - /api/demo/* 一律 503 pg_backend_required（fail-closed，不退化内存计数）；
+PostgreSQL 唯一后端（RUN_PG_TESTS=1）：
+  - /demo 公开 200（服务端渲染 demo 模式，按 PUBLIC_DEMO_ENABLED 降级）；
   - Demo POST 不要求登录 CSRF（capability 通道独立，docs §10.13）；
   - Demo cookie 调 /api/ai/* 等登录态端点 → 401（capability 只放行 /api/demo/*）；
-  - PUBLIC_DEMO 模式下 /internal/ai/annotate 写通道 403（docs §5.4-1）。
+  - PUBLIC_DEMO 模式下 /internal/ai/annotate 写通道 403（docs §5.4-1）；
+  - 旧 json/dual 一律 503 pg_backend_required 门已随 R3 Wave3 退役。
 
-PG 模式（RUN_PG_TESTS=1）追加（mock sidecar）：
+追加（mock sidecar）：
   - capability 签发（cookie 属性）与 /api/demo/config 状态；
   - /api/demo/ai/run 全链路：security envelope（demo-readonly-v1、无 run_grant、
     session_owner 不可反推）、max_steps=周期值、consume/release 时序；
@@ -44,7 +44,6 @@ import share_store  # noqa: E402
 import user_store  # noqa: E402
 import budget_store  # noqa: E402
 import demo_store  # noqa: E402
-import platform_features  # noqa: E402
 import app as app_mod  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app, FakeResponse # noqa: E402
@@ -1117,13 +1116,6 @@ def test_admin_demo_catalog_crud_and_access_control():
     r2 = admin.delete("/api/admin/demo-catalog?slide=" + name)
     assert r2.status_code == 200
     assert admin.get("/api/admin/demo-catalog").get_json()["slides"] == []
-
-def test_public_demo_env_json_refuses_startup(monkeypatch):
-    """（已有启动闸回归）PUBLIC_DEMO_ENABLED=1 + 非 PG → SystemExit。"""
-    monkeypatch.setattr(platform_features, "STORAGE_BACKEND", "json")
-    with pytest.raises(SystemExit):
-        app_mod._check_public_demo_backend_or_exit(
-            {"PUBLIC_DEMO_ENABLED": "1"})
 
 def test_demo_js_event_reset_uses_snapshot_not_second_stream():
     text = (Path(__file__).resolve().parent.parent / "static" / "demo.js") \

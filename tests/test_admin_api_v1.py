@@ -2,14 +2,12 @@
 """PR3b：Admin API v1 只读子集测试（docs/admin-billing-plugin-implementation-plan.md
 §9/§10/§14.1）。
 
-json 模式（无 PG）：
-  - 全部端点 owner 门控：匿名 401 / user 403 / **owner 预览态 403**
+json 模式（无 PG）：已随 R3 Wave3 退役——PostgreSQL 为唯一后端，不再有
+  json/dual fail-closed 的 503 pg_backend_required 分支。原 json 侧关注：
+  全部端点 owner 门控：匿名 401 / user 403 / **owner 预览态 403**
     （与 PR3a /admin 宿主页同口径，§14.1「preview subject 不能访问 admin」）；
-  - json/dual fail-closed：billing 系 + turn-budgets → 503 pg_backend_required
-    （稳定 code，不降级进程内数据）；overview 分段标记（billing/turn_budget
-    available:false，用户段可用）；users 附属字段 null + billing_available:false；
-  - audit 分页 + detail 出口脱敏（敏感键丢弃、idempotency_key 后缀）；
-  - users 分页/搜索/筛选 + login ID 只出掩码（原始账号不回显）。
+  audit 分页 + detail 出口脱敏（敏感键丢弃、idempotency_key 后缀）；
+  users 分页/搜索/筛选 + login ID 只出掩码（原始账号不回显）。
 
 PG 模式（RUN_PG_TESTS=1）：
   - overview「双额度」语义：turn_budget（对话额度）与 billing（金额余额）

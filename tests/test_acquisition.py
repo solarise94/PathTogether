@@ -2,15 +2,15 @@
 """PR4 用户来源归因测试（docs/admin-billing-plugin-implementation-plan.md
 §11/§14.1「来源」「隐私」「降级」行）。
 
-json 模式（无 PG，双跑段）：
+PostgreSQL 唯一后端：
   - 纯清理函数：UTM 控制字符/限长、referrer 只留 hostname、slug 边界；
   - IP 前缀 hash：盐缺失不存、盐存在同前缀同 hash/不同前缀不同 hash、
     IPv4 /24 / IPv6 /48 分组、盐轮换换 hash；
   - /r/ 路由：合法 slug 302 allowlist + 签名 cookie（HttpOnly/SameSite）；
     恶意/超长 slug 安全兜底 302 /；?next=evil 与 ?to=evil 被拒；cookie
-    篡改/过期换新 visitor_id；json 后端不 500（§16.2 降级）；
-  - admin v1 acquisition：owner 门控（匿名 401 / user 403）与 json 后端
-    503 pg_backend_required。
+    篡改/过期换新 visitor_id；
+  - admin v1 acquisition：owner 门控（匿名 401 / user 403）。
+  （旧 json/dual 503 pg_backend_required 门已随 R3 Wave3 退役。）
 
 PG 模式（RUN_PG_TESTS=1）：
   - 触点行：不可变行粒度、未知 campaign 落 NULL 不报错、active campaign 关联、

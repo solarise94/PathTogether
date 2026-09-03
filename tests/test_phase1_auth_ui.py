@@ -38,7 +38,6 @@ UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
-import platform_features  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
 from _pt_helpers import csrf_client, install_json_login_limits, isolate_app # noqa: E402
 
@@ -496,28 +495,6 @@ def test_demo_landing_placeholder_public():
     assert "Demo" in body
     assert 'href="/login"' in body
     assert "仅用于研究、教学和软件演示" in body
-
-# =========================================================================== #
-# 8. 启动期 PUBLIC_DEMO_ENABLED 检查（docs §4.3）
-# =========================================================================== #
-def test_public_demo_env_non_pg_refuses_to_start(monkeypatch):
-    monkeypatch.setattr(platform_features, "STORAGE_BACKEND", "json")
-    with pytest.raises(SystemExit):
-        app_mod._check_public_demo_backend_or_exit(
-            {"PUBLIC_DEMO_ENABLED": "1"})
-    monkeypatch.setattr(platform_features, "STORAGE_BACKEND", "dual")
-    with pytest.raises(SystemExit):
-        app_mod._check_public_demo_backend_or_exit(
-            {"PUBLIC_DEMO_ENABLED": "true"})
-
-def test_public_demo_env_pg_or_disabled_passes(monkeypatch):
-    monkeypatch.setattr(platform_features, "STORAGE_BACKEND", "postgres")
-    # 不抛
-    app_mod._check_public_demo_backend_or_exit({"PUBLIC_DEMO_ENABLED": "1"})
-    # 未开启：任何后端都放行
-    monkeypatch.setattr(platform_features, "STORAGE_BACKEND", "json")
-    app_mod._check_public_demo_backend_or_exit({"PUBLIC_DEMO_ENABLED": "0"})
-    app_mod._check_public_demo_backend_or_exit({})
 
 # =========================================================================== #
 # 9. 前端文案 / UI 守卫（§8.3 / §12.2）

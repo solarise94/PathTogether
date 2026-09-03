@@ -24,7 +24,6 @@ import time
 import psycopg
 
 import pg_store
-import platform_features
 
 # --------------------------------------------------------------------------- #
 # 常量（顶部定义，可 env 覆盖；docs §9.5 建议值：IP 前缀 5 次/窗、账号 10 次/窗）
@@ -162,7 +161,6 @@ def record_auth_failure(account_hash, ip_prefix_hash,
     "scopes": {"account": {...}, "ip_prefix": {...}}}``（未提供的桶不出现在
     scopes 中）。两个桶按固定顺序（account → ip_prefix）加锁，天然无死锁。
     """
-    platform_features.require_pg_backend("auth_rate_limits")
     a_limit = AUTH_ACCOUNT_FAILURE_LIMIT if account_limit is None else int(account_limit)
     i_limit = AUTH_IP_FAILURE_LIMIT if ip_limit is None else int(ip_limit)
     w_sec = AUTH_WINDOW_SECONDS if window_seconds is None else int(window_seconds)
@@ -204,7 +202,6 @@ def check_auth_locked(account_hash, ip_prefix_hash):
     ``{"locked": bool, "retry_after_seconds": int, "locked_until": epoch|None,
     "scopes": {...}}``；未提供的桶不出现在 scopes 中。
     """
-    platform_features.require_pg_backend("auth_rate_limits")
     now = time.time()
     conn = _connect()
     try:
@@ -247,7 +244,6 @@ def check_auth_locked(account_hash, ip_prefix_hash):
 
 def clear_auth_failures(account_hash, ip_prefix_hash):
     """成功登录后清理该账号与来源 IP 前缀两条记录（不影响其他主体）。"""
-    platform_features.require_pg_backend("auth_rate_limits")
     clauses = []
     params = []
     for scope, subject_hash in (
@@ -279,7 +275,6 @@ def check_registration_locked(ip_prefix_hash, invite_hash=None):
 
     覆盖 reg_ip_short / reg_ip_daily / reg_invite（invite_hash 未给时跳过该桶）。
     """
-    platform_features.require_pg_backend("auth_rate_limits")
     now = time.time()
     conn = _connect()
     try:
@@ -309,7 +304,6 @@ def record_registration_attempt(ip_prefix_hash):
     """记录一次注册 POST 尝试（24 小时桶，成功也计；达 30 次锁 24h）。
 
     返回锁定剩余秒数（0=未锁）。"""
-    platform_features.require_pg_backend("auth_rate_limits")
     now = time.time()
     conn = _connect()
     try:
@@ -332,7 +326,6 @@ def record_registration_failure(ip_prefix_hash, invite_hash=None):
     """记录一次注册失败：IP 前缀短窗桶 + invite token_hash 桶（同事务）。
 
     任一桶达到阈值即锁定（返回锁定剩余秒数，0=未锁）。"""
-    platform_features.require_pg_backend("auth_rate_limits")
     now = time.time()
     conn = _connect()
     try:
@@ -363,7 +356,6 @@ def record_registration_failure(ip_prefix_hash, invite_hash=None):
 
 def check_owner_invite_creation_locked(owner_hash):
     """owner 邀请码创建限流：达到每分钟/每日上限时返回剩余锁定秒数（0=可建）。"""
-    platform_features.require_pg_backend("auth_rate_limits")
     now = time.time()
     conn = _connect()
     try:
@@ -386,7 +378,6 @@ def check_owner_invite_creation_locked(owner_hash):
 
 def record_owner_invite_creation(owner_hash):
     """记录一次邀请码创建（每分钟/每日两桶）；返回锁定剩余秒数（0=未锁）。"""
-    platform_features.require_pg_backend("auth_rate_limits")
     now = time.time()
     conn = _connect()
     try:

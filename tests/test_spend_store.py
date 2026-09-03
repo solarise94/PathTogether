@@ -14,7 +14,7 @@ ai-money-budget-bugfix-and-simplification-plan.md §9.2 全量 + §9.3 窗口投
     证明实现不做固定偏移假设）；
   - naive datetime 拒绝（无法判定周期口径）；epoch/RFC3339/datetime
     三种输入等价；period_kind=none 显式拒绝；
-  - json/dual 后端 fail-closed（pg_backend_required）。
+  （旧 json/dual fail-closed pg_backend_required 门已随 R3 Wave3 退役。）
 
 PG 部分（RUN_PG_TESTS=1；conftest 每用例 TRUNCATE 后由
 _billing_helpers.seed_spend_policies 幂等重放 0023 种子）：

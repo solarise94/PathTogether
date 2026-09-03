@@ -2,8 +2,8 @@
 """金额计费存储层（admin-billing 方案 §6/§7；批次 C 起为强一致 usage/hold
 协议，docs ai-money-budget-bugfix-and-simplification-plan.md §3.3/§3.4/§4.2）。
 
-PG-only：全部公共入口经 ``platform_features.require_pg_backend("billing")``
-fail-closed（json/dual 返回稳定 ``pg_backend_required``，不降级进程内余额）。
+PostgreSQL 为唯一后端；旧 json/dual 的 ``require_pg_backend`` fail-closed 门
+（pg_backend_required）已随 R3 Wave3 退役，不再降级进程内余额。
 
 内容：
   - usage event 严格校验器（手写，语义与 tests/fixtures/usage_events/
@@ -52,7 +52,6 @@ import psycopg
 
 import billing_pricing
 import pg_store
-import platform_features
 import share_store_pg
 
 #: 本模块日志（模拟扣费 best-effort 失败的 warning/指标行走这里；消息只含
@@ -182,8 +181,7 @@ def simulated_debit_enabled() -> bool:
 
     ``0/false/off``（大小写不敏感、允许首尾空白）关闭，其余（含未设置）启用。
     每次调用现读 env（与 :func:`occurred_at_max_age_days` 同风格，测试
-    monkeypatch.setenv 即时生效）。json/dual 后端天然 no-op——ingest 入口本就
-    ``require_pg_backend("billing")`` fail-closed，开关只在 PG 路径有意义。
+    monkeypatch.setenv 即时生效）。PostgreSQL 唯一后端，开关始终有意义。
     """
     raw = (os.environ.get("BILLING_SIMULATED_DEBIT") or "").strip().lower()
     return raw not in _SIM_DEBIT_OFF_VALUES
@@ -760,7 +758,6 @@ def _event_out(row) -> dict:
 
 def get_usage_event(event_id):
     """按 event_id 读取 usage event 行；不存在返回 None。"""
-    platform_features.require_pg_backend("billing")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -1335,7 +1332,6 @@ def ingest_usage_event(event, *, installation_id, plugin_id="histopilot",
     ``now`` 为 received_at（测试注入口；缺省当前 UTC 时间）。计价时段与时钟
     偏差判定都用 occurred_at——服务端不得为「能计价」静默换用 received_at。
     """
-    platform_features.require_pg_backend("billing")
     errors = validate_usage_event_body(event)
     if errors:
         raise InvalidUsageEventError(errors)
@@ -1682,7 +1678,6 @@ def authorize_hold(body, *, installation_id, plugin_id="histopilot", now=None):
     非 Business 异常（基础设施错误）整体回滚 → 路由 500 retryable（hard
     语义 fail-closed：authorize 不成功即不得调用 provider）。
     """
-    platform_features.require_pg_backend("billing")
     errors = validate_hold_authorize_body(body)
     if errors:
         raise InvalidHoldRequestError(errors)
@@ -2037,7 +2032,6 @@ def settle_hold(hold_id, body, *, installation_id, plugin_id="histopilot",
 
     事件的 call_id 必须等于 hold 的 call_id（改绑 → 409 hold_conflict）。
     """
-    platform_features.require_pg_backend("billing")
     errors = validate_hold_settle_body(body)
     if errors:
         raise InvalidHoldRequestError(errors)
@@ -2314,7 +2308,6 @@ def create_price_book(kind, rates, effective_from, effective_to=None, *,
     output_nano_per_million}（schedule 固定记录 peak 窗口定义）。
     返回 book dict（不含行；行经 list_rates 查询）。
     """
-    platform_features.require_pg_backend("billing")
     if kind not in billing_pricing.PRICE_BOOK_KINDS:
         raise ValueError("kind 需为 %s" % (billing_pricing.PRICE_BOOK_KINDS,))
     if not isinstance(rates, list) or not rates:
@@ -2376,7 +2369,6 @@ def activate_price_book(price_book_id, *, actor=None, supersede=False):
     重叠拒绝。方案 §6.3 未细化接班机制，此为其最小可运维实现（见 PR2
     总结：偏离点）。
     """
-    platform_features.require_pg_backend("billing")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -2436,7 +2428,6 @@ def activate_price_book(price_book_id, *, actor=None, supersede=False):
 
 def get_price_book(price_book_id):
     """按 id 读价格书（含行数）；不存在返回 None。"""
-    platform_features.require_pg_backend("billing")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -2470,7 +2461,6 @@ _LEDGER_ENTRY_ID_PREFIX = "ble_"
 def create_billing_account(user_id, *, account_id=None, actor=None):
     """为注册用户开户（首次 grant/topup 或启用受控 debit 时显式创建；
     demo 主体永不调用本函数）。已开户抛 BillingAccountExistsError。"""
-    platform_features.require_pg_backend("billing")
     acct = account_id or ("bac_" + secrets.token_hex(12))
     conn = _connect()
     try:
@@ -2493,7 +2483,6 @@ def create_billing_account(user_id, *, account_id=None, actor=None):
 
 def get_billing_account_by_user(user_id):
     """按 user_id 读账户；未开户返回 None（不伪造 0 余额账户）。"""
-    platform_features.require_pg_backend("billing")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -2519,7 +2508,6 @@ def append_ledger_entry(account_id, kind, amount_nano_cny, idempotency_key, *,
     :func:`ingest_usage_event` 事务内**内联**实现（本函数自开连接，无法参与
     ingest 事务）；本函数保留供人工调账入口与测试验证符号/幂等约束。
     """
-    platform_features.require_pg_backend("billing")
     if kind == "usage_debit" and (not event_id
                                   or idempotency_key != "usage:%s" % event_id):
         raise ValueError("usage_debit 必须携带 event_id 且幂等键固定为 "
@@ -2565,7 +2553,6 @@ def append_ledger_entry(account_id, kind, amount_nano_cny, idempotency_key, *,
 
 def account_balance_nano(account_id):
     """权威可用余额 = 该账户 ledger 有符号金额合计（无账户 → None）。"""
-    platform_features.require_pg_backend("billing")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -2631,7 +2618,6 @@ def update_account_caps(user_id, soft_cap_nano, hard_cap_nano, expected_version,
 
     返回 ``{"account": <更新后账户行>, "balance_nano": <同事务余额合计>}``。
     """
-    platform_features.require_pg_backend("billing")
     soft = _validate_cap_value(soft_cap_nano, "soft_cap_nano_cny")
     hard = _validate_cap_value(hard_cap_nano, "hard_cap_nano_cny")
     if soft is not None and hard is not None and soft > hard:
@@ -2717,7 +2703,6 @@ def apply_billing_adjustment(user_id, kind, amount_nano_cny, reason,
     返回 ``{"entry": <entry 行>, "duplicate": bool, "balance_nano": int,
     "account": <账户行>}``。
     """
-    platform_features.require_pg_backend("billing")
     if kind not in ADJUSTMENT_KINDS:
         raise ValueError("kind 需为 %s" % (ADJUSTMENT_KINDS,))
     if isinstance(amount_nano_cny, bool) or not isinstance(amount_nano_cny, int):
@@ -2847,7 +2832,6 @@ def insert_provider_balance_snapshot(provider, currency, total_balance_nano,
                                      is_available, observed_at,
                                      *, snapshot_id=None):
     """插入 provider 总余额快照（金额须已由 parse_balance_to_nano 精确换算）。"""
-    platform_features.require_pg_backend("billing")
     snap = snapshot_id or ("pbs_" + secrets.token_hex(12))
     conn = _connect()
     try:
@@ -2873,7 +2857,6 @@ def insert_provider_balance_snapshot(provider, currency, total_balance_nano,
 
 def latest_provider_balance_snapshot(provider):
     """该 provider 最新余额快照；无则 None。"""
-    platform_features.require_pg_backend("billing")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -2928,7 +2911,6 @@ def admin_usage_events_page(*, cursor=None, limit=50, model=None, user_id=None,
     （subject_type/subject_id 仍保留在行内供归因展示）。
     返回 ``{"items": [...], "next_cursor": str|None}``。
     """
-    platform_features.require_pg_backend("billing")
     limit = max(1, min(int(limit or 50), 200))
     where, params = [], []
     if model is not None:
@@ -2990,7 +2972,6 @@ def admin_ledger_page(*, cursor=None, limit=50):
     插件 UI 用 ``metadata.simulated`` 渲染「模拟」徽标。metadata 的写入侧
     即红线边界（不落 prompt/key/IP/请求体），出口不再二次脱敏。
     """
-    platform_features.require_pg_backend("billing")
     limit = max(1, min(int(limit or 50), 200))
     where, params = "", []
     if cursor is not None:
@@ -3051,7 +3032,6 @@ def pricing_v2_cutover():
 
     返回 None 表示标志缺失（0022 未应用）。只读查询，不改任何价格数据。
     """
-    platform_features.require_pg_backend("billing")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -3089,7 +3069,6 @@ def admin_overview_usage_stats(period_start=None, today_start=None):
     窗口参数接受 epoch 秒 / RFC3339 字符串 / datetime（budget_store 的
     usage_report 周期起点是 epoch float）。
     """
-    platform_features.require_pg_backend("billing")
     period_start = _as_aware_dt(period_start)
     today_start = _as_aware_dt(today_start)
     conn = _connect()
@@ -3171,7 +3150,6 @@ def admin_account_summaries(user_ids):
     0 余额账户）。返回 ``{user_id: {account_id, status, currency, version,
     soft_spend_cap_nano, hard_spend_cap_nano, balance_nano}}``。
     """
-    platform_features.require_pg_backend("billing")
     ids = [str(u) for u in (user_ids or []) if u]
     if not ids:
         return {}
@@ -3212,7 +3190,6 @@ def admin_last_ai_call_by_user():
 
     返回 ``{user_id: epoch 秒}``；无任何事件的用户不在 dict 中。
     """
-    platform_features.require_pg_backend("billing")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:

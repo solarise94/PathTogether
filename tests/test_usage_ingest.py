@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """PR2 用量投递端点测试：POST /api/plugin/v1/usage-events（§7.2/§7.5）。
 
-json 模式（无 PG）：鉴权链 + fail-closed——
+PostgreSQL 唯一后端：鉴权链 + 投递语义——
   - 无 Bearer / 错误 aud 的 token / 停用 installation → 401 统一信封；
-  - 非 HistoPilot 插件安装 → 403；
-  - json 后端 → 503 pg_backend_required（稳定 code，不降级）。
+  - 非 HistoPilot 插件安装 → 403。
+  （旧 json 后端 → 503 pg_backend_required 门已随 R3 Wave3 退役。）
 
-PG 模式（RUN_PG_TESTS=1）：schema 正例、幂等重放、payload/call_id 冲突、
+schema 正例、幂等重放、payload/call_id 冲突、
 主体绑定各路径（批次 F 解析链 ⓪holds → ①ai_run_bindings → ①legacy
 reservations → ②demo → ③grant 仅交叉校验不补位 → ④assertion；矩阵见
 test_subject_resolution_batch_f_matrix 与 test_subject_resolution_paths）、

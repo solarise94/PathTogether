@@ -12,7 +12,7 @@
     07 冲突 hash 不同、raw_usage 不参与、缺省≡null、时间偏移归一；
   - 手写严格校验器：7 个正例通过 + 负例拒绝；
   - 余额 Decimal 解析（≤9 位小数，禁 float）；
-  - json/dual 后端 fail-closed（pg_backend_required）。
+  （旧 json/dual fail-closed pg_backend_required 门已随 R3 Wave3 退役。）
 
 PG 部分（RUN_PG_TESTS=1；conftest 每用例 TRUNCATE billing 表）：
   - 0018+0022 种子两代书：legacy（错误 CNY×1000 量级，收口保留）与
@@ -1114,8 +1114,7 @@ def test_admin_overview_legacy_pricing_split_marker():
         "legacy pricing scale invalid; excluded from hard enforcement")
     assert stats["legacy_priced_events"] == 1
     assert stats["model_calls_period"] == 2
-    # billing_store.pricing_v2_cutover 与标志一致；json 后端 fail-closed 已由
-    # 既有 pg_backend_required 用例覆盖
+    # billing_store.pricing_v2_cutover 与标志一致（旧 json fail-closed 门已退役）
     assert billing_store.pricing_v2_cutover() == cutover
 
 if __name__ == "__main__":

@@ -3,15 +3,15 @@
 
 覆盖（docs demo-access-auth-ui-design §4/§4.1–4.3/§5.3/§9.2/§9.4/§12.3）：
 
-json 模式（默认）：
+PostgreSQL 唯一后端：
   - request_id 贯通：非法 400 / 客户端提供原样转发 / 缺省服务端生成；
-  - json 后端生产路径 fail-closed：TESTING 关闭后平台 run 503
-    pg_backend_required；own 凭据放行（不记账，docs §4.3）；
+    （旧 json 后端生产 503 pg_backend_required 门已随 R3 Wave3 退役；own
+    凭据放行不记账）；
   - user max_steps：PUT 越界 400、合法持久化、平台模式 GET 返回只读生效步数、
     注入规则（平台=周期 20 / own=已保存值）、请求体临时塞 tuning 不生效；
-  - owner 预算 API json fail-closed 503 + CSRF 回归。
+  - owner 预算 API + CSRF 回归。
 
-PG 模式（RUN_PG_TESTS=1）追加：
+追加（RUN_PG_TESTS=1）：
   - 批次 F：mode=all 下官方 run 跳过 reserve_turn（零 reservations）+
     ai_run_bindings 绑定/跨主体 409；429 消费断言显式 seed shadow（软闸
     回退语义）；owner 预算 API 写端点 410 turn_budgets_retired；

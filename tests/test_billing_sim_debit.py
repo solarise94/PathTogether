@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """PR6 模拟软扣费测试（admin-billing 方案 §12.2 Phase B / §19 v0.4）。
 
-json 模式（无 PG 也跑）：
+PostgreSQL 唯一后端：
   - ``BILLING_SIMULATED_DEBIT`` 开关解析：缺省启用；``0/false/off``（大小写
-    不敏感、允许首尾空白）关闭。ingest 本身 PG-only，json/dual 无行为变化
-    （pg_backend_required，见 test_usage_ingest.py / test_billing_store.py）。
+    不敏感、允许首尾空白）关闭。
 
-PG 模式（RUN_PG_TESTS=1；conftest 每用例 TRUNCATE billing 表）：
+PG 行为（RUN_PG_TESTS=1；conftest 每用例 TRUNCATE billing 表）：
   - priced user 事件 → 同事务自动开户 + 一条 usage_debit（负的 customer_charge、
     幂等键 ``usage:<event_id>``、metadata.simulated=true、actor NULL）+ 余额
     为负；

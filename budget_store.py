@@ -49,7 +49,6 @@ import time
 import psycopg
 
 import pg_store
-import platform_features
 
 
 def _int_env(name, default):
@@ -313,7 +312,6 @@ def _demo_window_used(cur, hours=_DEMO_WINDOW_HOURS) -> int:
 
 def subject_turn_total(subject_type, subject_id, credential_source="platform"):
     """当前周期该主体已用对话数（accepted + reserved）。"""
-    platform_features.require_pg_backend("ai_budget")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -375,7 +373,6 @@ def get_or_create_current_period(conn, created_by=None):
 
 def get_current_period():
     """独立事务版：取当前开放周期（无则创建默认周期）。"""
-    platform_features.require_pg_backend("ai_budget")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -390,7 +387,6 @@ def update_period_limits(new_limits):
     new_limits 为限制字段 dict（白名单见 _PERIOD_LIMIT_COLUMNS）；无开放周期时
     先按默认值创建再更新。返回更新后的周期 dict。
     """
-    platform_features.require_pg_backend("ai_budget")
     vals = _validate_limits(new_limits)
     if not vals:
         raise ValueError("new_limits 不能为空")
@@ -417,7 +413,6 @@ def reset_period(new_limits=None, created_by=None):
     - 用量归零来自「新周期无 usage 行」，不物理删除旧数据。
     返回新周期 dict。
     """
-    platform_features.require_pg_backend("ai_budget")
     limits_overlay = _validate_limits(new_limits)
     conn = _connect()
     try:
@@ -479,7 +474,6 @@ def reserve_turn(request_id, subject_type, subject_id, credential_source,
     - credential_source=own：不扣平台总量（无超限判定），仍落
       reservation/usage 供可观测。
     """
-    platform_features.require_pg_backend("ai_budget")
     if not isinstance(request_id, str) or not request_id:
         raise ValueError("request_id 不能为空")
     if subject_type not in SUBJECT_TYPES:
@@ -691,7 +685,6 @@ def consume(request_id, histopilot_session_id, expected_attempt=None):
     expected_attempt 给出时按 attempt CAS：版本落后则
     ReservationAttemptConflict（对账不得消费已被新尝试接替的行）。
     """
-    platform_features.require_pg_backend("ai_budget")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -738,7 +731,6 @@ def release(request_id, expected_attempt=None, expected_rollback_epoch=None):
     expected_rollback_epoch 给出时按 rollback_epoch CAS：在途重放已 +1 则
     原请求的即时退款失败（确认式对账不传本参数，仍可在 missing 后释放）。
     """
-    platform_features.require_pg_backend("ai_budget")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -812,7 +804,6 @@ def record_run_binding(request_id, session_id, subject_type, subject_id,
         （禁止跨主体复用同一 request_id；HTTP 映射 409，与旧路径一致）；
       - subject_type 仅接受 owner/user（demo 不入本表，ValueError）。
     """
-    platform_features.require_pg_backend("ai_budget")
     if not isinstance(request_id, str) or not request_id:
         raise ValueError("request_id 不能为空")
     if not isinstance(session_id, str) or not session_id:
@@ -879,7 +870,6 @@ def ensure_run_binding_pending(request_id, subject_type, subject_id,
       - subject_type 仅接受 owner/user（demo 绑定归 demo_runs，ValueError）；
       - request_id / subject_id 非空（ValueError）。
     """
-    platform_features.require_pg_backend("ai_budget")
     if not isinstance(request_id, str) or not request_id:
         raise ValueError("request_id 不能为空")
     if subject_type not in _RUN_BINDING_SUBJECT_TYPES:
@@ -937,7 +927,6 @@ def attach_run_binding_session(request_id, session_id, subject_type,
         :class:`RequestIdSubjectConflict`（HTTP 409）；
       - session_id 非空字符串（ValueError，与 record_run_binding 同口径）。
     """
-    platform_features.require_pg_backend("ai_budget")
     if not isinstance(request_id, str) or not request_id:
         raise ValueError("request_id 不能为空")
     if not isinstance(session_id, str) or not session_id:
@@ -997,7 +986,6 @@ def attach_run_binding_session(request_id, session_id, subject_type,
 
 def get_run_binding(request_id):
     """按 request_id 读 run 绑定（只读）；不存在返回 None。"""
-    platform_features.require_pg_backend("ai_budget")
     if not isinstance(request_id, str) or not request_id:
         return None
     conn = _connect()
@@ -1015,7 +1003,6 @@ def get_run_binding(request_id):
 
 def get_reservation(request_id):
     """按 request_id 查预占（只读）；不存在返回 None。"""
-    platform_features.require_pg_backend("ai_budget")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -1037,7 +1024,6 @@ def list_reserved_expired(now=None):
     再决定 consume / release / 顺延（docs §5.3-6；历史上的盲时间回收原语
     reclaim_expired 已删除——它会把 HistoPilot 已接受的执行误退款）。
     """
-    platform_features.require_pg_backend("ai_budget")
     ts = float(now if now is not None else time.time())
     conn = _connect()
     try:
@@ -1059,7 +1045,6 @@ def extend_reservation(request_id, ttl_seconds=DEFAULT_RESERVATION_TTL_SECONDS):
 
     仅 reserved 状态可顺延；返回更新后的 reservation dict 或 None（不存在）。
     """
-    platform_features.require_pg_backend("ai_budget")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -1088,7 +1073,6 @@ def usage_report():
     故 total != accepted + reserved（窗口会把 24h 外的周期用量滚出）。
     其余区段（platform/user_pool/owner/per_user/own）保持周期累计口径。
     """
-    platform_features.require_pg_backend("ai_budget")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:

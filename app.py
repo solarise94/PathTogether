@@ -76,12 +76,11 @@ import demo_store
 import registration_store
 # PR4 用户来源归因（docs/admin-billing-plugin-implementation-plan.md §11）：
 # acquisition_store 提供 /r/<source_code> 触点写入、注册归因（redeem_invite
-# 同事务）、匿名触点 90 天清理与 admin 漏斗/明细汇总。PG-only（json/dual
-# 由 /r/* 降级安全 302、admin API 稳定 pg_backend_required，§16.2）。
+# 同事务）、匿名触点 90 天清理与 admin 漏斗/明细汇总。PostgreSQL 唯一后端。
 import acquisition_store
 # PR2 金额计费（docs/admin-billing-plugin-implementation-plan.md §6/§7）：
-# billing_store 提供价格表 / 用量事件计价 / 账本原语（PG-only，json/dual 稳定
-# pg_backend_required）。本阶段只影子计价——不写 usage_debit，demo 不开户。
+# billing_store 提供价格表 / 用量事件计价 / 账本原语（PostgreSQL 唯一后端）。
+# 本阶段只影子计价——不写 usage_debit，demo 不开户。
 # billing_pricing：纯计算（时段判定 / RFC3339 / 余额十进制字符串→nano 的
 # Decimal 精确换算），Admin API v1 的 provider balance refresh 复用。
 import billing_store
@@ -89,8 +88,8 @@ import billing_pricing
 # 批次 B 金额额度 policy/window 数据层（docs
 # ai-money-budget-bugfix-and-simplification-plan.md §3.1/§3.2/§8）：spend_store
 # 提供周/月窗口边界、策略解析（override→default 回退）、get_or_create 窗口与
-# FOR UPDATE 原子 reserve/release/settle 投影（PG-only，json/dual 稳定
-# pg_backend_required）。本批仍为 shadow：不接入 run/hold/usage 请求路径
+# FOR UPDATE 原子 reserve/release/settle 投影（PostgreSQL 唯一后端）。
+# 本批仍为 shadow：不接入 run/hold/usage 请求路径
 # （接进 billing_holds 链路是批次 C），admin 只读出口见 /api/admin/v1/spend/*。
 import spend_store
 # P0-A 资源防护（docs/open-registration-security-remediation §3.3/§3.4/§3.5）：
@@ -296,7 +295,6 @@ def _resolve_owner_at_startup(environ=None):
     返回 owner dict（含 user_id）或 None（本地免认证开发态：无 owner、无
     bootstrap 秘密且未开 REQUIRE_ADMIN_AUTH）。以下情况一律 SystemExit
     fail-fast（消息只说明阶段与修复动作，不输出敏感内容）：
-      - REQUIRE_ADMIN_AUTH=1 但后端非 postgres（docs §9.1）；
       - enabled owner 多于 1 个（禁止选「第一个」）；
       - 有用户行但没有任何 enabled owner（不静默建号，docs §7.3）；
       - REQUIRE_ADMIN_AUTH=1 但空库且无 bootstrap 秘密；
@@ -310,13 +308,6 @@ def _resolve_owner_at_startup(environ=None):
     """
     env = os.environ if environ is None else environ
     require_auth = _env_truthy(env, "REQUIRE_ADMIN_AUTH")
-
-    backend = getattr(share_store, "STORAGE_BACKEND", "json")
-    if require_auth and backend != "postgres":
-        raise SystemExit(
-            "[startup] REQUIRE_ADMIN_AUTH=1 要求 STORAGE_BACKEND=postgres"
-            "（当前 %r）：json/dual 不提供生产认证的一致性保证，拒绝启动。"
-            % backend)
 
     login_id, password = _resolve_bootstrap_config(env)
 
@@ -469,32 +460,10 @@ _ensure_pg_schema_or_exit()
 
 
 # --------------------------------------------------------------------------- #
-# PUBLIC_DEMO_ENABLED 启动期前置检查（docs §4.3）
-#
-# 公开 Demo（/demo、/api/demo/*）依赖 PostgreSQL 一致事务（capability、跨 worker
-# 预算与登录锁定）；配置 PUBLIC_DEMO_ENABLED=1 但后端不是 postgres 时拒绝启动，
-# 不允许 json/dual 静默退化到进程内计数。
-# --------------------------------------------------------------------------- #
-def _check_public_demo_backend_or_exit(environ=None):
-    """PUBLIC_DEMO_ENABLED=1 且后端非 postgres → SystemExit（fail-closed）。"""
-    env = os.environ if environ is None else environ
-    if not _env_truthy(env, "PUBLIC_DEMO_ENABLED"):
-        return
-    backend = platform_features.current_backend()
-    if backend != "postgres":
-        raise SystemExit(
-            "PUBLIC_DEMO_ENABLED=1 要求 STORAGE_BACKEND=postgres（当前 %r）："
-            "json/dual 不提供公开 Demo 的一致性保证，拒绝启动。" % backend)
-
-
-_check_public_demo_backend_or_exit()
-
-
-# ---------------------------------------------------------------------------
 # owner 启动接线（账户系统批次 A，docs §5.2）：无论本次是否执行 bootstrap，
 # 都从数据库解析 owner 并注入资源默认归属（share_store.set_owner_user_id），
 # 保证旧式 set_slide_meta / project / ROI 写路径不会静默落成空归属。
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 def _inject_owner_into_share_store(owner):
     """把启动解析出的 owner 注入资源默认归属（幂等；owner=None 清空注入）。
 
@@ -770,19 +739,10 @@ def _require_internal():
 # env 覆盖），任一桶达到阈值即锁定并保存 locked_until；两个 gunicorn worker
 # 看到同一失败次数与锁定截止时间；UI 倒计时来自服务端权威 retry_after。
 #
-# json/dual 后端：auth_limit_store 的存储原语 fail-closed（PgFeatureUnavailable）。
-# 设计 §6.3 要求「存储不可用时保守拒绝登录写操作，不能退化为无防爆破」——因此
-# AUTH_ENABLED=True 且非 postgres 时 POST /login 直接 503，绝不退回 per-worker
-# 内存字典（旧 _auth_attempts 已删除）。本地 AUTH_ENABLED=False（免登录）不受影响。
-#
 # subject 只存带盐 hash（盐来自 AUTH_SUBJECT_HASH_SALT env 或 SECRET_KEY）：
 # 账号 lower+strip 后哈希；IP 取 /24（IPv4）或 /64（IPv6）前缀再哈希。
 # 原始密码与完整明文 IP 不写日志、不入库。
 # --------------------------------------------------------------------------- #
-_LOGIN_LIMITS_UNAVAILABLE_MSG = (
-    "登录暂不可用：跨 worker 登录防爆破需要 PostgreSQL 后端"
-    "（当前 STORAGE_BACKEND 非 postgres），已按安全策略暂停登录。"
-    "请联系管理员配置 postgres 后端。")
 
 
 def _auth_hash_salt() -> str:
@@ -819,11 +779,6 @@ def _ip_prefix_hash(ip: str) -> str:
     return hmac.new(
         ("ipp:" + _auth_hash_salt()).encode("utf-8"),
         prefix.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-def _login_limits_available() -> bool:
-    """登录防爆破权威存储是否可用（仅 postgres；docs §4.3 前置条件）。"""
-    return platform_features.budget_features_available()
 
 
 def _check_login_locked(account_hash, ip_prefix_hash) -> int:
@@ -2427,15 +2382,6 @@ def login():
     account_hash = _auth_subject_hash(username)
     ip_prefix_hash = _ip_prefix_hash(request.remote_addr or "")
 
-    # 跨 worker 锁定存储不可用（json/dual）：保守拒绝登录写操作（docs §6.3）
-    if not _login_limits_available():
-        app.logger.warning(
-            "POST /login 拒绝（503）：登录防爆破需要 postgres 后端（当前 %r）",
-            platform_features.current_backend())
-        return _login_page(
-            error=_LOGIN_LIMITS_UNAVAILABLE_MSG, error_code="unavailable",
-            next_url=post_next, status=503)
-
     retry = _check_login_locked(account_hash, ip_prefix_hash)
     if retry > 0:
         return _login_page(
@@ -2519,13 +2465,15 @@ def api_account_password():
     if not uid:
         return jsonify(error="auth_required"), 401
 
-    # 跨 worker 锁定存储不可用（json/dual 无登录写通道）：与 POST /login 同口径
-    if not _login_limits_available():
-        app.logger.warning(
-            "POST /api/account/password 拒绝（503）：改密防爆破需要 postgres "
-            "后端（当前 %r）", platform_features.current_backend())
-        resp = jsonify(error=_LOGIN_LIMITS_UNAVAILABLE_MSG, code="unavailable")
-        return resp, 503
+    user = user_store.get_user(uid)
+    if user is None or user.get("disabled"):
+        # _require_auth 正常已拦截；此处防御并发禁用/删除
+        session.clear()
+        return jsonify(error="auth_required"), 401
+
+    body = request.get_json(silent=True) or {}
+    current_password = body.get("current_password")
+    new_password = body.get("new_password")
 
     user = user_store.get_user(uid)
     if user is None or user.get("disabled"):
@@ -2702,8 +2650,6 @@ def register():
         if retry <= 0:
             # 24 小时尝试桶：成功也计（先记尝试，处理结果不再重复计）
             retry = auth_limit_store.record_registration_attempt(ip_hash)
-    except platform_features.PgFeatureUnavailable:
-        return _registration_unavailable_response()
     except Exception:
         app.logger.exception("注册限流存储不可用，fail-closed 503")
         return _registration_unavailable_response()
@@ -2756,8 +2702,6 @@ def register():
         return _register_form_error(
             "邀请码无效或当前不可用；请核对后重试，或联系管理员",
             "invite_invalid_or_unavailable", status=403)
-    except platform_features.PgFeatureUnavailable:
-        return _registration_unavailable_response()
     except Exception:
         app.logger.exception("邀请码兑换异常（统一错误，不外泄细节）")
         return _register_form_error(
@@ -2798,7 +2742,8 @@ def _registration_unavailable_response():
 # 结构原则（fail-closed，逐条对设计）：
 #   - /api/demo/* 绝不调用 current_identity()（无 role→owner 归一）；身份一律
 #     来自独立 Demo capability cookie（demo_capability → demo_sessions token_hash）；
-#   - json/dual 后端一律 503 pg_backend_required（platform_features 守卫）；
+#   - PostgreSQL 唯一后端：/api/demo/* 不依赖 json/dual 判定的 503（旧
+#     pg_backend_required 门已随 R3 Wave3 退役）；
 #   - 公开 Demo 模式（PUBLIC_DEMO_ENABLED=1 或周期 demo_enabled=true）下，HistoPilot
 #     healthz 的 adapter 必须是 plugin-contract；探测失败/legacy → /demo AI 与
 #     /api/demo/ai/run fail-closed（§5.4-1）；同时禁用 /internal/ai/annotate 写通道；
@@ -2854,24 +2799,8 @@ def _demo_subject(token_hash: str) -> str:
     return "demo_" + (token_hash or "")[:16]
 
 
-def _demo_require_pg():
-    """json/dual 后端：Demo API 一律 fail-closed（503 pg_backend_required）。"""
-    if platform_features.demo_features_available():
-        return None
-    return (
-        jsonify(
-            error="Demo 需要 STORAGE_BACKEND=postgres（当前 json/dual 后端不提供"
-                  "跨 worker 一致性保证，fail-closed）",
-            code=platform_features.PgFeatureUnavailable.code),
-        503,
-    )
-
-
 def _demo_require_open():
-    """PG 后端 + 公开 Demo 已开启；否则 503 / 403（切片与 AI 一并拒绝）。"""
-    err = _demo_require_pg()
-    if err is not None:
-        return err
+    """公开 Demo 已开启；否则 403（切片与 AI 一并拒绝）。"""
     if not _demo_public_mode():
         return (jsonify(error="Demo 当前未开放", code="demo_disabled"), 403)
     return None
@@ -2882,12 +2811,9 @@ def _demo_public_mode() -> bool:
 
     批次 F：demo_enabled 自 ai_budget_periods 列迁居 platform_settings
     （settings_store.get_ai_safety_settings，0027 backfill 已搬值）。
-    PG 不可读时 fail-closed（False）。
     """
     if platform_features.public_demo_enabled():
         return True
-    if not platform_features.demo_features_available():
-        return False
     try:
         return bool(settings_store.get_ai_safety_settings()["demo_enabled"])
     except Exception:
@@ -2971,8 +2897,6 @@ def _demo_current_capability():
         return None, "missing"
     try:
         cap = demo_store.get_valid_capability(_demo_token_hash(token))
-    except platform_features.PgFeatureUnavailable:
-        raise
     except Exception:
         app.logger.warning("Demo capability 读取失败", exc_info=True)
         return None, "invalid"
@@ -2988,10 +2912,7 @@ def _demo_require_capability():
     cookie 存在但无效/过期/已撤销 → 410 capability_expired（docs §5.2：过期或
     退出后不能继续查看 AI session）。
     """
-    try:
-        cap, why = _demo_current_capability()
-    except platform_features.PgFeatureUnavailable:
-        raise
+    cap, why = _demo_current_capability()
     if cap is not None:
         return cap, None
     if why == "missing":
@@ -3056,8 +2977,6 @@ def _demo_catalog_slide(slide_id):
         if entry is None:
             return None, None
         filename = demo_store.resolve_slide_filename(slide_id)
-    except platform_features.PgFeatureUnavailable:
-        raise
     except Exception:
         app.logger.warning("Demo 目录读取失败", exc_info=True)
         return None, None
@@ -3073,12 +2992,9 @@ def _demo_catalog_slide(slide_id):
 def demo_landing():
     """Demo 只读 Viewer 入口（Phase 2，docs §5.6）。
 
-    服务端渲染明确的 demo 模式（非 CSS 隐藏）：json/dual 明确提示不满足 PG
-    前置；PG 下顺带签发 capability cookie（首次访问，docs §5.2）并探测 adapter
-    mode 供页面初始化降级提示。
+    服务端渲染明确的 demo 模式（非 CSS 隐藏）：PostgreSQL 为唯一后端。
     """
-    pg_ok = platform_features.demo_features_available()
-    enabled = bool(pg_ok and _demo_public_mode())
+    enabled = bool(_demo_public_mode())
     adapter_mode = _histopilot_adapter_mode() if enabled else None
     # 仅模板渲染用登录态（已登录访问 /demo 时 CTA 切换为“打开完整版”）；
     # /api/demo/* 面仍不读 identity，capability 安全设计不变
@@ -3088,16 +3004,13 @@ def demo_landing():
         app_mode="demo",
         capabilities=_app_capabilities("demo"),
         histopilot_ui_enabled=False,
-        demo_available=pg_ok,
+        demo_available=True,
         demo_enabled=enabled,
         adapter_mode=adapter_mode,
         logged_in=logged_in,
     ))
     if enabled:
-        try:
-            _demo_set_capability_cookie(resp)
-        except platform_features.PgFeatureUnavailable:
-            pass  # json/dual：页面已按 demo_available=False 提示
+        _demo_set_capability_cookie(resp)
     return resp
 
 
@@ -3114,9 +3027,6 @@ def api_demo_config():
     十进制字符串 nano-CNY + demo_exhausted），只读不建窗；``budget`` 段为
     turn 口径冻结历史（legacy=true，软闸回退期前端兜底）。
     """
-    err = _demo_require_pg()
-    if err is not None:
-        return err
     payload = {
         "demo_enabled": _demo_public_mode(),
         "task_max_chars": DEMO_TASK_MAX_CHARS,
@@ -3136,8 +3046,6 @@ def api_demo_config():
     # 本浏览器最近一次 run + 平台/Demo 预算余量（读失败不阻断 config）
     try:
         cap, _why = _demo_current_capability()
-    except platform_features.PgFeatureUnavailable:
-        raise
     except Exception:
         cap = None
     if cap is not None:
@@ -3171,8 +3079,6 @@ def api_demo_config():
             "platform_limit": report["platform"]["limit"],
             "platform_exhausted": plat_total + 1 > report["platform"]["limit"],
         }
-    except platform_features.PgFeatureUnavailable:
-        raise
     except Exception:
         app.logger.warning("Demo 额度状态读取失败", exc_info=True)
     # 批次 F：金额口径 spend 段（Demo 周金额窗口，十进制字符串 nano-CNY）。
@@ -3205,8 +3111,6 @@ def api_demo_config():
                 limit_nano > 0
                 and spent_nano + reserved_nano >= limit_nano),
         }
-    except platform_features.PgFeatureUnavailable:
-        raise
     except Exception:
         app.logger.warning("Demo 金额窗口状态读取失败", exc_info=True)
     issued_token = None
@@ -3243,8 +3147,6 @@ def api_demo_slides():
             item = dict(entry)
             item["name"] = filename
             items.append(item)
-    except platform_features.PgFeatureUnavailable:
-        raise
     except Exception:
         app.logger.warning("Demo 目录读取失败", exc_info=True)
         return jsonify(error="demo catalog 不可用"), 503
@@ -3349,8 +3251,6 @@ def _demo_ip_request_rate_gate():
     ip_hash = _ip_prefix_hash(request.remote_addr or "") or "unknown"
     try:
         usage = demo_store.hit_ip_request_rate(ip_hash, limit=limit)
-    except platform_features.PgFeatureUnavailable:
-        raise
     except Exception:
         app.logger.warning("Demo IP 请求速率计数失败（fail-closed）",
                            exc_info=True)
@@ -3442,8 +3342,6 @@ def api_demo_ai_run():
     except demo_store.DemoConcurrencyExceeded as exc:
         # 批次 F：并发闸迁居 demo_store（安全参数，独立于已退役的 turn 消费闸）
         return _budget_error_response(exc, 429)
-    except platform_features.PgFeatureUnavailable as exc:
-        return _budget_error_response(exc, 503, code="pg_backend_required")
     if run is None:
         # capability 在守卫与预占之间消失（撤销/过期竞态）：按失效处理
         return (jsonify(error="Demo capability 已失效或过期",
@@ -3507,11 +3405,6 @@ def api_demo_ai_run():
                                expected_request_id=rid,
                                expected_rollback_epoch=run_rollback_epoch)
             return _budget_error_response(exc, 409)
-        except platform_features.PgFeatureUnavailable as exc:
-            _rollback_demo_run("pg_backend_required", expected_attempt=run_attempt,
-                               expected_request_id=rid,
-                               expected_rollback_epoch=run_rollback_epoch)
-            return _budget_error_response(exc, 503, code="pg_backend_required")
 
     resv_attempt = (resv or {}).get("attempt")
     resv_rollback_epoch = int((resv or {}).get("rollback_epoch") or 0)
@@ -3659,8 +3552,6 @@ def _demo_session_access(session_id):
     run = None
     try:
         run = demo_store.get_run_for_session(cap["id"], session_id)
-    except platform_features.PgFeatureUnavailable:
-        raise
     except Exception:
         app.logger.warning("Demo run 会话绑定读取失败", exc_info=True)
         return _denied()
@@ -4128,9 +4019,6 @@ def _registration_precondition_failures(environ=None) -> list:
         failures.append("PUBLIC_BASE_URL 未配置为 https:// 入口")
     if not _env_truthy(env, "ADMIN_SESSION_COOKIE_SECURE"):
         failures.append("ADMIN_SESSION_COOKIE_SECURE 未启用（Secure Cookie）")
-    if platform_features.current_backend() != "postgres":
-        failures.append("STORAGE_BACKEND 非 postgres（当前 %r）"
-                        % platform_features.current_backend())
     return failures
 
 
@@ -4190,7 +4078,7 @@ _check_registration_preconditions_or_warn()
 # P0-B 邀请注册管理（docs §4.6 / §4.2 / §3.7）
 #
 # 全部 owner-only + Cookie session + 统一 CSRF（before_request）；PG-only
-# （json/dual 503 pg_backend_required，绝不退化）。安全要点：
+# （旧 json/dual 503 pg_backend_required 门已随 R3 Wave3 退役）。安全要点：
 #   - 创建接口**仅首次响应**返回明文邀请码，且 Cache-Control: no-store；
 #   - 列表/审计/日志永不返回 token / token_hash；owner 列表只显示邮箱掩码、
 #     过期时间与状态；
@@ -4286,8 +4174,6 @@ def _set_registration_mode_service(mode, actor_user_id):
                           "注册前置条件不满足：" + "；".join(failures))
     try:
         settings_store.set_registration_mode(mode, updated_by=actor_user_id)
-    except platform_features.PgFeatureUnavailable as exc:
-        return None, (503, exc.code, str(exc))
     except ValueError as exc:
         return None, (400, "invalid_request", str(exc))
     _audit("registration.mode_update", target_type="platform_settings",
@@ -4528,9 +4414,6 @@ def _revoke_demo_slide(slide_id):
     删除切片时目录条目一并移除（避免悬空条目指向已删除文件）；移出目录与
     删除切片共享 revoke_by_slide 语义（§9.3）。
     """
-    if not platform_features.demo_features_available():
-        return {"expired_capabilities": 0, "terminated_runs": [],
-                "released_reservations": []}
     try:
         result = demo_store.catalog_remove(slide_id)
         if result is not None:
@@ -4549,13 +4432,10 @@ def _revoke_demo_slide(slide_id):
 
 @app.route("/api/admin/demo-catalog", methods=["GET"])
 def api_admin_demo_catalog_list():
-    """列出 Demo 目录（owner）。json/dual → 503 pg_backend_required。"""
+    """列出 Demo 目录（owner）。"""
     auth = _require_owner()
     if auth:
         return auth
-    err = _demo_require_pg()
-    if err is not None:
-        return err
     items = []
     for entry in demo_store.catalog_list_ordered():
         item = dict(entry)
@@ -4575,9 +4455,6 @@ def api_admin_demo_catalog_put():
     auth = _require_owner()
     if auth:
         return auth
-    err = _demo_require_pg()
-    if err is not None:
-        return err
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
     if not isinstance(slide, str) or not slide:
@@ -4610,8 +4487,6 @@ def api_admin_demo_catalog_put():
             entry = demo_store.catalog_set_default(slide_id)
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
-    except platform_features.PgFeatureUnavailable as exc:
-        return _budget_error_response(exc, 503, code=exc.code)
     _audit("demo_catalog.add", target_type="demo_catalog", target_id=slide_id,
            slide=slide)
     entry = dict(entry)
@@ -4629,9 +4504,6 @@ def api_admin_demo_catalog_delete():
     auth = _require_owner()
     if auth:
         return auth
-    err = _demo_require_pg()
-    if err is not None:
-        return err
     body = request.get_json(silent=True) or {}
     slide = body.get("slide") or request.args.get("slide")
     slide_id = body.get("slide_id") or request.args.get("slide_id")
@@ -4642,10 +4514,7 @@ def api_admin_demo_catalog_delete():
             return jsonify(error="切片不存在或从未入库：%s" % slide), 404
     if not slide_id:
         return jsonify(error="缺少 slide 或 slide_id"), 400
-    try:
-        result = demo_store.catalog_remove(slide_id)
-    except platform_features.PgFeatureUnavailable as exc:
-        return _budget_error_response(exc, 503, code=exc.code)
+    result = demo_store.catalog_remove(slide_id)
     if result is None:
         return jsonify(error="切片不在 Demo 目录内"), 404
     released = _release_budget_for_terminated_runs(
@@ -4673,12 +4542,11 @@ def api_admin_demo_catalog_delete():
 #   - 列表一律 cursor/limit（keyset 或显式 offset 游标），禁止全量返回；
 #   - 敏感字段红线（§9）：响应绝不出现 password_hash / api_key / 完整邀请
 #     token / 完整 IP / outbox 路径 / credential fingerprint；
-#   - billing 系端点 PG-only：json/dual 稳定 503 pg_backend_required（与
-#     billing_store §6.1 fail-closed 语义一致，不降级进程内数据）。
-#   - overview 在 json/dual 下**分段标记**（用户段可用；billing 段返回
-#     {available:false, code:"pg_backend_required"}），而非整体 503
-#     ——选择分段是因为概览的用户计数在任何后端都真实可用，整体 503 会让
-#     管理页连基本用户概况都失去（偏离选择见 PR3b 总结）。批次 D1 起
+#   - billing 系端点 PG-only（旧 json/dual 稳定 503 pg_backend_required 门
+#     已随 R3 Wave3 退役；billing_store §6.1 fail-closed 语义不再触发）。
+#   - overview 分段标记（用户段可用；billing 段失败时
+#     {available:false, code:"...internal"}）——选择分段是因为概览的用户计数
+#     始终真实可用，整体 503 会让管理页连基本用户概况都失去。批次 D1 起
 #     turn_budget 段移出概览。
 # =========================================================================== #
 #: admin v1 列表缺省/最大 limit
@@ -4724,14 +4592,6 @@ def _require_owner_admin_v1():
 def _admin_v1_error(status, code, message):
     """admin v1 统一错误信封（code 稳定、message 无敏感信息）。"""
     return jsonify(error={"code": code, "message": message}), status
-
-
-def _admin_v1_pg_required():
-    """json/dual 后端的 billing 端点稳定 503（不降级进程内数据）。"""
-    return _admin_v1_error(
-        503, "pg_backend_required",
-        "该能力要求 STORAGE_BACKEND=postgres（当前 %r），fail-closed"
-        % platform_features.current_backend())
 
 
 def _admin_v1_encode_cursor(obj):
@@ -4982,9 +4842,7 @@ def _admin_v1_uploads_section():
 def admin_v1_overview():
     """概览（§10.1）：用户计数 + billing 用量/余额 + uploads 收口观测。
 
-    json/dual：用户段可用；billing 段 ``{available:false,
-    code:"pg_backend_required"}``（分段标记，见节注释）。
-    PG：billing 段含 model calls（今日/周期）、cache token 合计与命中率、
+    billing 段含 model calls（今日/周期）、cache token 合计与命中率、
     provider cost / charge 合计（nano）、unpriced 数、ingestion lag、DeepSeek
     最新余额快照与年龄。
     批次 D1（§4.2）：turn 预算历史聚合移出概览（turn 消费闸早已退役，
@@ -5004,60 +4862,55 @@ def admin_v1_overview():
         "ai_access": sum(1 for u in users if u.get("ai_access")),
     }
 
-    if not platform_features.billing_features_available():
-        billing_section = {"available": False, "code": "pg_backend_required"}
-    else:
+    try:
+        period_start = None
         try:
-            period_start = None
-            try:
-                report = budget_store.usage_report()
-                period_start = report["period"].get("started_at")
-            except Exception:
-                # 「周期起点」只是金额聚合的窗口收窄优化；budget 周期读取
-                # 失败按全量窗口继续（unpriced/今日等 KPI 不因冻结历史缺
-                # 失而缺席）
-                app.logger.warning("概览读取预算周期失败（按全量窗口）",
-                                   exc_info=True)
-            # 「今日」按计价时区（Asia/Shanghai）零点，与价格时段同口径
-            now_local = datetime.now(tz=billing_pricing.PRICING_TIMEZONE)
-            today_start = now_local.replace(
-                hour=0, minute=0, second=0, microsecond=0).isoformat()
-            stats = billing_store.admin_overview_usage_stats(
-                period_start=period_start, today_start=today_start)
-            snapshot = billing_store.latest_provider_balance_snapshot(
-                BILLING_BALANCE_PROVIDER)
-            age = None
-            if snapshot is not None:
-                age = max(0.0, time.time() - float(snapshot["observed_at"]))
-            billing_section = _admin_v1_nano_out({
-                "available": True,
-                "provider": BILLING_BALANCE_PROVIDER,
-                "model_calls_today": stats["model_calls_today"],
-                "model_calls_period": stats["model_calls_period"],
-                "cache_hit_input_tokens": stats["cache_hit_input_tokens"],
-                "cache_miss_input_tokens": stats["cache_miss_input_tokens"],
-                "output_tokens": stats["output_tokens"],
-                "cache_hit_ratio": stats["cache_hit_ratio"],
-                "provider_cost_nano_cny": stats["provider_cost_nano_cny"],
-                "charge_nano_cny": stats["charge_nano_cny"],
-                "unpriced_count": stats["unpriced_count"],
-                "ingestion_lag_seconds_max":
-                    stats["ingestion_lag_seconds_max"],
-                "ingestion_lag_seconds_avg":
-                    stats["ingestion_lag_seconds_avg"],
-                # §7.2 批次 A 只读口径：cutover 前旧错误价格影子数据
-                # 区分展示（legacy_pricing_note 固定说明，不参与硬额度）
-                "pricing_cutover_epoch": stats["pricing_cutover_epoch"],
-                "legacy_priced_events": stats["legacy_priced_events"],
-                "legacy_pricing_note": stats["legacy_pricing_note"],
-                "provider_balance_snapshot": snapshot,
-                "provider_balance_age_seconds": age,
-            })
-        except platform_features.PgFeatureUnavailable:
-            return _admin_v1_pg_required()
+            report = budget_store.usage_report()
+            period_start = report["period"].get("started_at")
         except Exception:
-            app.logger.exception("admin v1 overview billing 段读取失败")
-            return _admin_v1_error(500, "internal", "概览读取失败")
+            # 「周期起点」只是金额聚合的窗口收窄优化；budget 周期读取
+            # 失败按全量窗口继续（unpriced/今日等 KPI 不因冻结历史缺
+            # 失而缺席）
+            app.logger.warning("概览读取预算周期失败（按全量窗口）",
+                               exc_info=True)
+        # 「今日」按计价时区（Asia/Shanghai）零点，与价格时段同口径
+        now_local = datetime.now(tz=billing_pricing.PRICING_TIMEZONE)
+        today_start = now_local.replace(
+            hour=0, minute=0, second=0, microsecond=0).isoformat()
+        stats = billing_store.admin_overview_usage_stats(
+            period_start=period_start, today_start=today_start)
+        snapshot = billing_store.latest_provider_balance_snapshot(
+            BILLING_BALANCE_PROVIDER)
+        age = None
+        if snapshot is not None:
+            age = max(0.0, time.time() - float(snapshot["observed_at"]))
+        billing_section = _admin_v1_nano_out({
+            "available": True,
+            "provider": BILLING_BALANCE_PROVIDER,
+            "model_calls_today": stats["model_calls_today"],
+            "model_calls_period": stats["model_calls_period"],
+            "cache_hit_input_tokens": stats["cache_hit_input_tokens"],
+            "cache_miss_input_tokens": stats["cache_miss_input_tokens"],
+            "output_tokens": stats["output_tokens"],
+            "cache_hit_ratio": stats["cache_hit_ratio"],
+            "provider_cost_nano_cny": stats["provider_cost_nano_cny"],
+            "charge_nano_cny": stats["charge_nano_cny"],
+            "unpriced_count": stats["unpriced_count"],
+            "ingestion_lag_seconds_max":
+                stats["ingestion_lag_seconds_max"],
+            "ingestion_lag_seconds_avg":
+                stats["ingestion_lag_seconds_avg"],
+            # §7.2 批次 A 只读口径：cutover 前旧错误价格影子数据
+            # 区分展示（legacy_pricing_note 固定说明，不参与硬额度）
+            "pricing_cutover_epoch": stats["pricing_cutover_epoch"],
+            "legacy_priced_events": stats["legacy_priced_events"],
+            "legacy_pricing_note": stats["legacy_pricing_note"],
+            "provider_balance_snapshot": snapshot,
+            "provider_balance_age_seconds": age,
+        })
+    except Exception:
+        app.logger.exception("admin v1 overview billing 段读取失败")
+        return _admin_v1_error(500, "internal", "概览读取失败")
 
     return jsonify(
         users=users_section,
@@ -5116,31 +4969,26 @@ def admin_v1_users():
     page = page[:limit]
     user_ids = [u.get("user_id") for u in page]
 
-    billing_ok = platform_features.billing_features_available()
     accounts = last_calls = {}
     reg_methods = _admin_v1_registration_methods(user_ids)
     # 批次 D（§6.2）→ Batch B wave 2：每用户 spend 投影（owner/user 按
     # target 互斥形态；单事务批量解析）。PR4 的 user_acquisition 归因查询
     # 已随批次 D1 删除（用户列表不再触达归因表）。
     spend_by_user = {}
-    if platform_features.current_backend() == "postgres":
-        try:
-            spend_by_user = spend_store.admin_users_spend_summaries([
-                ("owner" if u.get("role") == user_store.ROLE_OWNER
-                 else "user", str(u.get("user_id") or ""))
-                for u in page if u.get("user_id")])
-        except Exception:
-            app.logger.warning("admin v1 users 金额投影查询失败（按空展示）",
-                               exc_info=True)
-    if billing_ok:
-        try:
-            accounts = billing_store.admin_account_summaries(user_ids)
-            last_calls = billing_store.admin_last_ai_call_by_user()
-        except platform_features.PgFeatureUnavailable:
-            return _admin_v1_pg_required()
-        except Exception:
-            app.logger.exception("admin v1 users 附属数据读取失败")
-            return _admin_v1_error(500, "internal", "用户列表读取失败")
+    try:
+        spend_by_user = spend_store.admin_users_spend_summaries([
+            ("owner" if u.get("role") == user_store.ROLE_OWNER
+             else "user", str(u.get("user_id") or ""))
+            for u in page if u.get("user_id")])
+    except Exception:
+        app.logger.warning("admin v1 users 金额投影查询失败（按空展示）",
+                           exc_info=True)
+    try:
+        accounts = billing_store.admin_account_summaries(user_ids)
+        last_calls = billing_store.admin_last_ai_call_by_user()
+    except Exception:
+        app.logger.exception("admin v1 users 附属数据读取失败")
+        return _admin_v1_error(500, "internal", "用户列表读取失败")
 
     items = []
     for u in page:
@@ -5164,17 +5012,16 @@ def admin_v1_users():
             # 金额侧见 billing/spend 字段）
             # 金额余额（billing；未开户 null，绝不伪造 0 余额账户；金额字段
             # 十进制字符串化，§5 v0.3）
-            "billing": _admin_v1_nano_out(accounts.get(uid))
-            if billing_ok else None,
-            # Batch B wave 2：按角色/target 互斥的金额投影（json 后端 null）
+            "billing": _admin_v1_nano_out(accounts.get(uid)),
+            # Batch B wave 2：按角色/target 互斥的金额投影
             "spend": spend,
-            "last_ai_call_at": last_calls.get(uid) if billing_ok else None,
+            "last_ai_call_at": last_calls.get(uid),
         })
     next_cursor = None
     if has_more:
         next_cursor = _admin_v1_encode_cursor({"o": offset + limit})
     return jsonify(items=items, next_cursor=next_cursor, limit=limit,
-                   billing_available=billing_ok)
+                   billing_available=True)
 
 
 
@@ -5188,8 +5035,6 @@ def admin_v1_billing_usage_events():
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.billing_features_available():
-        return _admin_v1_pg_required()
     limit = _admin_v1_limit_arg()
     raw_cursor = _admin_v1_decode_cursor(request.args.get("cursor"))
     cursor = None
@@ -5210,8 +5055,6 @@ def admin_v1_billing_usage_events():
             status=status)
     except ValueError as exc:
         return _admin_v1_error(400, "invalid_request", str(exc))
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except Exception:
         app.logger.exception("admin v1 usage events 读取失败")
         return _admin_v1_error(500, "internal", "用量明细读取失败")
@@ -5229,8 +5072,6 @@ def admin_v1_billing_ledger():
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.billing_features_available():
-        return _admin_v1_pg_required()
     limit = _admin_v1_limit_arg()
     raw_cursor = _admin_v1_decode_cursor(request.args.get("cursor"))
     cursor = None
@@ -5241,8 +5082,6 @@ def admin_v1_billing_ledger():
         page = billing_store.admin_ledger_page(cursor=cursor, limit=limit)
     except ValueError as exc:
         return _admin_v1_error(400, "invalid_request", str(exc))
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except Exception:
         app.logger.exception("admin v1 ledger 读取失败")
         return _admin_v1_error(500, "internal", "账本读取失败")
@@ -5274,12 +5113,8 @@ def admin_v1_billing_provider_balance():
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.billing_features_available():
-        return _admin_v1_pg_required()
     try:
         return jsonify(**_admin_v1_provider_balance_payload())
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except Exception:
         app.logger.exception("admin v1 provider balance 读取失败")
         return _admin_v1_error(500, "internal", "供应商余额读取失败")
@@ -5303,8 +5138,6 @@ def admin_v1_billing_provider_balance_refresh():
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.billing_features_available():
-        return _admin_v1_pg_required()
     with _provider_balance_refresh_lock:
         now = time.time()
         if now - _provider_balance_refresh_state["last_ok_attempt"] < \
@@ -5379,8 +5212,6 @@ def admin_v1_billing_provider_balance_refresh():
         snapshot = billing_store.insert_provider_balance_snapshot(
             BILLING_BALANCE_PROVIDER, "CNY", total, granted, topped,
             is_available, datetime.now(timezone.utc))
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except Exception:
         app.logger.exception("provider balance 快照写入失败")
         return _admin_v1_error(500, "internal", "余额快照写入失败")
@@ -5503,27 +5334,8 @@ def admin_v1_users_create():
         return _admin_v1_error(400, "invalid_request", str(exc))
 
     actor = actor_identity().get("user_id")
-    if total_limit is None and ai_access is None and \
-            platform_features.current_backend() != "postgres":
-        # 无新字段且非 postgres：保持既有路径（json 后端也可建号；audit 与
-        # 建号分离与旧端点一致）。postgres 后端即使无新字段也走下方同事务
-        # 组合原语——total 模式下无额度默认时须 400 fail-closed，绝不允许
-        # 旁路建出无额度行的用户（review finding 1 建号变体收口）
-        try:
-            user = user_store.create_user(
-                login_id, password, role=user_store.ROLE_USER,
-                display_name=display_name)
-        except ValueError as e:
-            msg = str(e)
-            if "已存在" in msg:
-                return _admin_v1_error(409, "login_id_conflict", msg)
-            return _admin_v1_error(400, "invalid_request", msg)
-        _audit("user.create", target_type="user", target_id=user.get("user_id"))
-        return jsonify(user=_admin_v1_user_out(user))
 
-    # postgres：user 插入 + 按目标建授权面 + audit 必须同一 PG 事务（§5.1）
-    if platform_features.current_backend() != "postgres":
-        return _admin_v1_pg_required()
+    # user 插入 + 按目标建授权面 + audit 必须同一 PG 事务（§5.1）
     import user_store_pg
     try:
         user, allowance = user_store_pg.create_user_with_total_allowance(
@@ -5543,8 +5355,6 @@ def admin_v1_users_create():
         if "已存在" in msg:
             return _admin_v1_error(409, "login_id_conflict", msg)
         return _admin_v1_error(400, "invalid_request", msg)
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except Exception:
         # 单事务组合原语（建号+总额度+audit）任一失败已整体回滚——
         # 统一 500，不暴露内部错误细节
@@ -5595,8 +5405,6 @@ def admin_v1_users_ai_access(user_id):
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if platform_features.current_backend() != "postgres":
-        return _admin_v1_pg_required()
     body = request.get_json(silent=True) or {}
     if not isinstance(body.get("enabled"), bool):
         return _admin_v1_error(400, "invalid_request", "缺少 enabled 布尔字段")
@@ -5651,8 +5459,6 @@ def admin_v1_invites_list():
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.budget_features_available():
-        return _admin_v1_pg_required()
     limit = _admin_v1_limit_arg()
     cur = _admin_v1_decode_cursor(request.args.get("cursor"))
     offset = int(cur.get("o") or 0) if cur else 0
@@ -5663,8 +5469,6 @@ def admin_v1_invites_list():
         # 「取 offset+limit+1 再切片」实现，邀请规模远小于上限，足够
         invites = registration_store.list_invites(
             limit=min(offset + limit + 1, 1000))
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except Exception:
         app.logger.exception("admin v1 invites 读取失败")
         return _admin_v1_error(500, "internal", "邀请列表读取失败")
@@ -5695,15 +5499,13 @@ def admin_v1_invites_create():
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.budget_features_available():
-        return _admin_v1_pg_required()
     import auth_limit_store
     owner_hash = _registration_invite_owner_hash()
     try:
         retry = auth_limit_store.check_owner_invite_creation_locked(owner_hash)
     except Exception:
         app.logger.exception("邀请码创建限流存储不可用，fail-closed 503")
-        return _admin_v1_pg_required()
+        return _admin_v1_error(500, "internal", "邀请码创建拒绝")
     if retry > 0:
         return (jsonify(error={"code": "rate_limited",
                                "message": "邀请码创建过于频繁，请稍后再试",
@@ -5775,8 +5577,6 @@ def admin_v1_invites_create():
             total_limit_nano_cny=total_limit)
     except ValueError as exc:
         return _admin_v1_error(400, "invalid_request", str(exc))
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except registration_store.RegistrationStoreError as exc:
         return _admin_v1_error(500, "internal", str(exc))
     out = _admin_v1_nano_out(_invite_public_view(invite))
@@ -5793,8 +5593,6 @@ def admin_v1_invites_revoke(invite_id):
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.budget_features_available():
-        return _admin_v1_pg_required()
     try:
         invite = registration_store.revoke_invite(
             invite_id, current_identity().get("user_id"))
@@ -5802,8 +5600,6 @@ def admin_v1_invites_revoke(invite_id):
         return _admin_v1_error(404, "invite_not_found", "邀请码不存在")
     except registration_store.RegistrationStoreError as exc:
         return _admin_v1_error(409, "invite_not_revocable", str(exc))
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     return jsonify(invite=_admin_v1_nano_out(_invite_public_view(invite)))
 
 
@@ -5814,7 +5610,7 @@ def admin_v1_invites_revoke(invite_id):
 # 本批**只读**：不做写 API（策略修改/调整当前窗口/用户覆盖是批次 D 的
 # AdminBridge + UI）；不接 enforcement（spend_enforcement_mode 恒 shadow）。
 # 三端点与 billing 系同口径：owner-only（_require_owner_admin_v1 含预览态
-# 拒绝）、json/dual 稳定 503 pg_backend_required、金额十进制字符串出线。
+# 拒绝）、金额十进制字符串出线（旧 json/dual 503 门已随 R3 Wave3 退役）。
 # --------------------------------------------------------------------------- #
 def _admin_v1_spend_window_summary(window):
     """窗口行 → admin v1 摘要（limit/spent/reserved/remaining/边界/版本）。"""
@@ -5874,13 +5670,9 @@ def admin_v1_spend_policies():
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.billing_features_available():
-        return _admin_v1_pg_required()
     try:
         result = spend_store.admin_list_policies()
         spend_settings = spend_store.admin_spend_settings_values()
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except Exception:
         app.logger.exception("admin v1 spend policies 读取失败")
         return _admin_v1_error(500, "internal", "金额策略读取失败")
@@ -5904,8 +5696,6 @@ def admin_v1_spend_windows_current():
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.billing_features_available():
-        return _admin_v1_pg_required()
     try:
         demo = _admin_v1_spend_window_subject(
             "demo", spend_store.DEMO_GLOBAL_SUBJECT)
@@ -5918,8 +5708,6 @@ def admin_v1_spend_windows_current():
                             else "user")
             users.append(_admin_v1_spend_window_subject(subject_type, uid))
         mode = spend_store.enforcement_mode()
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except Exception:
         app.logger.exception("admin v1 spend windows 读取失败")
         return _admin_v1_error(500, "internal", "当前窗口读取失败")
@@ -5938,12 +5726,8 @@ def admin_v1_spend_reconcile():
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.billing_features_available():
-        return _admin_v1_pg_required()
     try:
         result = spend_store.reconcile_spend_windows()
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except Exception:
         app.logger.exception("admin v1 spend reconcile 失败")
         return _admin_v1_error(500, "internal", "窗口对账失败")
@@ -5961,7 +5745,7 @@ def admin_v1_spend_reconcile():
 #
 # 统一口径（与上方只读端点/PR5 写端点一致）：
 #   - owner 门控 _require_owner_admin_v1（预览态 403）+ 全局 CSRF 双提交；
-#   - PG-only（json/dual 稳定 503 pg_backend_required）；
+#   - PG-only（旧 json/dual 稳定 503 pg_backend_required 门已随 R3 Wave3 退役）；
 #   - 金额入参十进制字符串（_admin_v1_amount_in；JSON number 一律 400），
 #     出口经 _admin_v1_nano_out（>2^53 不失真）；
 #   - CAS 版本冲突 → 409 version_conflict（不做 last-write-wins）；
@@ -5995,8 +5779,6 @@ def admin_v1_spend_policy_update(policy_id):
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.billing_features_available():
-        return _admin_v1_pg_required()
     for _p in spend_store.admin_list_policies()["items"]:
         if _p["policy_id"] == policy_id:
             if _p["scope_type"] in ("user_default", "user_override"):
@@ -6025,8 +5807,6 @@ def admin_v1_spend_policy_update(policy_id):
             actor_user_id=actor_identity().get("user_id"))
     except spend_store.SpendError as exc:
         return _admin_v1_spend_error_response(exc)
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except Exception:
         app.logger.exception("admin v1 spend policy 更新失败")
         return _admin_v1_error(500, "internal", "金额策略更新失败")
@@ -6052,8 +5832,6 @@ def admin_v1_spend_enforcement_mode():
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.billing_features_available():
-        return _admin_v1_pg_required()
     body = request.get_json(silent=True) or {}
     mode = body.get("mode")
     expected = body.get("expected")
@@ -6069,8 +5847,6 @@ def admin_v1_spend_enforcement_mode():
             actor_user_id=actor_identity().get("user_id"))
     except spend_store.SpendError as exc:
         return _admin_v1_spend_error_response(exc)
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except Exception:
         app.logger.exception("admin v1 enforcement mode 更新失败")
         return _admin_v1_error(500, "internal", "enforcement 模式更新失败")
@@ -6094,8 +5870,6 @@ def admin_v1_spend_window_adjust(window_id):
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.billing_features_available():
-        return _admin_v1_pg_required()
     body = request.get_json(silent=True) or {}
     if body.get("confirm") is not True:
         return _admin_v1_error(
@@ -6119,8 +5893,6 @@ def admin_v1_spend_window_adjust(window_id):
             actor_user_id=actor_identity().get("user_id"), confirm=True)
     except spend_store.SpendError as exc:
         return _admin_v1_spend_error_response(exc)
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except Exception:
         app.logger.exception("admin v1 spend window adjust 失败")
         return _admin_v1_error(500, "internal", "当前窗口调整失败")
@@ -6151,8 +5923,6 @@ def admin_v1_spend_user_total_limit_set(user_id):
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.billing_features_available():
-        return _admin_v1_pg_required()
     if "/" in user_id:
         return _admin_v1_error(400, "invalid_request", "user_id 非法")
     body = request.get_json(silent=True) or {}
@@ -6185,8 +5955,6 @@ def admin_v1_spend_user_total_limit_set(user_id):
             updated_by=current_identity().get("user_id"))
     except spend_store.SpendError as exc:
         return _admin_v1_spend_error_response(exc)
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except Exception:
         app.logger.exception("admin v1 user total limit 设置失败")
         return _admin_v1_error(500, "internal", "用户总额度设置失败")
@@ -6207,8 +5975,6 @@ def admin_v1_spend_user_total_limit_restore(user_id):
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.billing_features_available():
-        return _admin_v1_pg_required()
     if "/" in user_id:
         return _admin_v1_error(400, "invalid_request", "user_id 非法")
     body = request.get_json(silent=True) or {}
@@ -6231,8 +5997,6 @@ def admin_v1_spend_user_total_limit_restore(user_id):
             updated_by=current_identity().get("user_id"))
     except spend_store.SpendError as exc:
         return _admin_v1_spend_error_response(exc)
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except Exception:
         app.logger.exception("admin v1 user total limit 恢复默认失败")
         return _admin_v1_error(500, "internal", "用户总额度恢复默认失败")
@@ -6254,8 +6018,6 @@ def admin_v1_spend_user_default_total_limit():
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.billing_features_available():
-        return _admin_v1_pg_required()
     body = request.get_json(silent=True) or {}
     limit = body.get("limit_nano_cny")
     expected_version = body.get("expected_version")
@@ -6278,8 +6040,6 @@ def admin_v1_spend_user_default_total_limit():
             updated_by=current_identity().get("user_id"))
     except spend_store.SpendError as exc:
         return _admin_v1_spend_error_response(exc)
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except Exception:
         app.logger.exception("admin v1 默认总额度设置失败")
         return _admin_v1_error(500, "internal", "默认总额度设置失败")
@@ -6301,8 +6061,6 @@ def admin_v1_spend_demo_stats():
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not platform_features.billing_features_available():
-        return _admin_v1_pg_required()
     window = (request.args.get("window") or "current").strip()
     if window not in ("current", "previous"):
         return _admin_v1_error(400, "invalid_request",
@@ -6318,8 +6076,6 @@ def admin_v1_spend_demo_stats():
         stats = spend_store.admin_demo_spend_stats(window)
     except spend_store.SpendError as exc:
         return _admin_v1_spend_error_response(exc)
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except Exception:
         app.logger.exception("admin v1 spend demo stats 读取失败")
         return _admin_v1_error(500, "internal", "Demo 消费统计读取失败")
@@ -6402,100 +6158,87 @@ def _validate_runtime_settings(body):
 def admin_v1_settings():
     """设置页聚合（§6.1，只读）：注册模式 + 金额策略/窗口边界 + 运行时参数。
 
-    分段可用性：registration 段任何后端都真实（json 后端模式恒 closed）；
-    spend 段（策略/窗口/enforcement）PG-only；runtime 段（turn 预算的安全
-    参数）PG-only。分段失败 ``{available:false, code}``，不拖垮整页。
+    分段失败 ``{available:false, code}``，不拖垮整页。
     """
     auth = _require_owner_admin_v1()
     if auth:
         return auth
     payload = {"registration": _registration_settings_payload()}
-    if not platform_features.billing_features_available():
-        payload["spend"] = {"available": False,
-                            "code": "pg_backend_required"}
-        payload["runtime"] = {"available": False,
-                              "code": "pg_backend_required"}
-    else:
-        try:
-            result = spend_store.admin_list_policies()
-            demo_resolved = result["resolved"].get("demo_global")
-            user_resolved = result["resolved"].get("user_default")
-            owner_resolved = result["resolved"].get("owner")
-            # Batch B wave 2（§4.5 设置页）：三键拆分的额度设置值
-            # （user_default_total_limit / demo_weekly_limit /
-            # owner_monthly_limit；金额 nano 十进制字符串化；
-            # **扁平合并进 spend 顶层**，管理插件按 spend.<key> 直读）
-            spend_settings = spend_store.admin_spend_settings_values()
-            # 下个窗口边界由服务端按 Asia/Shanghai 计算（§1.1；不创建窗口行）
-            now_dt = datetime.now(timezone.utc)
-            demo_bounds = spend_store.week_window_bounds(now_dt) \
-                if demo_resolved else None
-            month_bounds = spend_store.month_window_bounds(now_dt)
-            # 当前 demo/owner 窗口（按需 get_or_create，幂等）——「调整当前
-            # 窗口」的影响展示数据源；各用户月窗口在 users 列表的 spend 字段
-            # （owner 窗口 subject_id = owner 的 user_id，与 windows/current
-            # 同口径）
-            owner_uid = ""
-            for _u in user_store.list_users():
-                if _u.get("role") == user_store.ROLE_OWNER:
-                    owner_uid = str(_u.get("user_id") or "")
-                    break
+    try:
+        result = spend_store.admin_list_policies()
+        demo_resolved = result["resolved"].get("demo_global")
+        user_resolved = result["resolved"].get("user_default")
+        owner_resolved = result["resolved"].get("owner")
+        # Batch B wave 2（§4.5 设置页）：三键拆分的额度设置值
+        # （user_default_total_limit / demo_weekly_limit /
+        # owner_monthly_limit；金额 nano 十进制字符串化；
+        # **扁平合并进 spend 顶层**，管理插件按 spend.<key> 直读）
+        spend_settings = spend_store.admin_spend_settings_values()
+        # 下个窗口边界由服务端按 Asia/Shanghai 计算（§1.1；不创建窗口行）
+        now_dt = datetime.now(timezone.utc)
+        demo_bounds = spend_store.week_window_bounds(now_dt) \
+            if demo_resolved else None
+        month_bounds = spend_store.month_window_bounds(now_dt)
+        # 当前 demo/owner 窗口（按需 get_or_create，幂等）——「调整当前
+        # 窗口」的影响展示数据源；各用户月窗口在 users 列表的 spend 字段
+        # （owner 窗口 subject_id = owner 的 user_id，与 windows/current
+        # 同口径）
+        owner_uid = ""
+        for _u in user_store.list_users():
+            if _u.get("role") == user_store.ROLE_OWNER:
+                owner_uid = str(_u.get("user_id") or "")
+                break
 
-            def _window_or_error(subject_type, subject_id):
-                try:
-                    return _admin_v1_spend_window_summary(
-                        spend_store.get_or_create_window(
-                            subject_type, subject_id, now_dt))
-                except spend_store.SpendError as exc:
-                    return {"subject_type": subject_type,
-                            "subject_id": subject_id, "error": exc.code}
-            payload["spend"] = _admin_v1_nano_out({
-                "available": True,
-                "enforcement_mode": result["enforcement_mode"],
-                "policies": {
-                    "demo_global": demo_resolved,
-                    "user_default": user_resolved,
-                    "owner": owner_resolved,
-                },
-                **spend_settings,
-                "current_windows": {
-                    "demo": _window_or_error(
-                        "demo", spend_store.DEMO_GLOBAL_SUBJECT),
-                    "owner": (_window_or_error("owner", owner_uid)
-                              if owner_uid else None),
-                },
-                "next_window_bounds": {
-                    "demo_week": [b.timestamp() for b in demo_bounds]
-                    if demo_bounds else None,
-                    "user_month": [b.timestamp() for b in month_bounds],
-                    "owner_month": [b.timestamp() for b in month_bounds],
-                },
-            })
-        except platform_features.PgFeatureUnavailable:
-            return _admin_v1_pg_required()
-        except Exception:
-            app.logger.exception("admin v1 settings spend 段读取失败")
-            payload["spend"] = {"available": False, "code": "internal"}
-        try:
-            # 批次 F：运行时安全参数自 ai_budget_periods 列迁居
-            # platform_settings（settings_store.get_ai_safety_settings，
-            # 0027 backfill 已搬值；缺省回落 DEFAULT_* 常量）
-            safety = settings_store.get_ai_safety_settings()
-            payload["runtime"] = {
-                "available": True,
-                "limits": {k: safety.get(k) for k in _SETTINGS_RUNTIME_FIELDS},
-                # Demo IP 短窗口请求速率现状（只读观测：批次 E 起 env 配置
-                # DEMO_IP_RATE_PER_MINUTE，≤0 关闭；admin 可写入口不在本批）
-                "demo_ip_request_rate_per_minute": demo_store.ip_rate_limit(),
-                "demo_ip_request_rate_window_seconds":
-                    demo_store.ip_rate_window_seconds(),
-            }
-        except platform_features.PgFeatureUnavailable:
-            payload["runtime"] = {"available": False,
-                                  "code": "pg_backend_required"}
-        except Exception:
-            app.logger.exception("admin v1 settings runtime 段读取失败")
-            payload["runtime"] = {"available": False, "code": "internal"}
+        def _window_or_error(subject_type, subject_id):
+            try:
+                return _admin_v1_spend_window_summary(
+                    spend_store.get_or_create_window(
+                        subject_type, subject_id, now_dt))
+            except spend_store.SpendError as exc:
+                return {"subject_type": subject_type,
+                        "subject_id": subject_id, "error": exc.code}
+        payload["spend"] = _admin_v1_nano_out({
+            "available": True,
+            "enforcement_mode": result["enforcement_mode"],
+            "policies": {
+                "demo_global": demo_resolved,
+                "user_default": user_resolved,
+                "owner": owner_resolved,
+            },
+            **spend_settings,
+            "current_windows": {
+                "demo": _window_or_error(
+                    "demo", spend_store.DEMO_GLOBAL_SUBJECT),
+                "owner": (_window_or_error("owner", owner_uid)
+                          if owner_uid else None),
+            },
+            "next_window_bounds": {
+                "demo_week": [b.timestamp() for b in demo_bounds]
+                if demo_bounds else None,
+                "user_month": [b.timestamp() for b in month_bounds],
+                "owner_month": [b.timestamp() for b in month_bounds],
+            },
+        })
+    except Exception:
+        app.logger.exception("admin v1 settings spend 段读取失败")
+        payload["spend"] = {"available": False, "code": "internal"}
+    try:
+        # 批次 F：运行时安全参数自 ai_budget_periods 列迁居
+        # platform_settings（settings_store.get_ai_safety_settings，
+        # 0027 backfill 已搬值；缺省回落 DEFAULT_* 常量）
+        safety = settings_store.get_ai_safety_settings()
+        payload["runtime"] = {
+            "available": True,
+            "limits": {k: safety.get(k) for k in _SETTINGS_RUNTIME_FIELDS},
+            # Demo IP 短窗口请求速率现状（只读观测：批次 E 起 env 配置
+            # DEMO_IP_RATE_PER_MINUTE，≤0 关闭；admin 可写入口不在本批）
+            "demo_ip_request_rate_per_minute": demo_store.ip_rate_limit(),
+            "demo_ip_request_rate_window_seconds":
+                demo_store.ip_rate_window_seconds(),
+        }
+    except Exception:
+        app.logger.exception("admin v1 settings runtime 段读取失败")
+        payload["runtime"] = {"available": False, "code": "internal"}
     return jsonify(**payload)
 
 
@@ -6524,7 +6267,6 @@ def admin_v1_settings_runtime_put():
     正整数 ≤ _BUDGET_LIMIT_MAX、demo_enabled 布尔）。写入
     settings_store.set_ai_safety_settings（UPSERT + **同事务 audit**
     action=ai_safety.settings_update），返回写入后的全量五键。
-    json/dual → 503 pg_backend_required（platform_settings 不可写）。
     """
     auth = _require_owner_admin_v1()
     if auth:
@@ -6537,8 +6279,6 @@ def admin_v1_settings_runtime_put():
         after = settings_store.set_ai_safety_settings(
             validated, actor_user_id=actor_identity().get("user_id"),
             updated_by=current_identity().get("user_id"))
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except ValueError as exc:
         return _admin_v1_error(400, "invalid_request", str(exc))
     except Exception:
@@ -6566,8 +6306,6 @@ def admin_v1_site_stats():
                                "站点访问统计未随本镜像发布")
     try:
         stats = site_stats_store.dashboard_stats()
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
     except Exception:
         app.logger.exception("admin v1 site stats 读取失败")
         return _admin_v1_error(500, "internal", "站点访问统计读取失败")
@@ -8203,14 +7941,13 @@ def api_slide_delete(name):
         return _denied()
     safe = _safe_name(name)
     # Demo 撤销必须在文件删除前（revoke 后旧 capability 立即不可读，无悬空窗口）
-    if platform_features.demo_features_available():
-        try:
-            slide_id = share_store.get_slide_id(safe)
-            if slide_id:
-                _revoke_demo_slide(slide_id)
-        except Exception:
-            app.logger.warning("切片删除的 Demo 撤销联动失败：%s", safe,
-                               exc_info=True)
+    try:
+        slide_id = share_store.get_slide_id(safe)
+        if slide_id:
+            _revoke_demo_slide(slide_id)
+    except Exception:
+        app.logger.warning("切片删除的 Demo 撤销联动失败：%s", safe,
+                           exc_info=True)
     _close_slide(safe)
     try:
         (UPLOAD_DIR / safe).unlink()
@@ -9472,15 +9209,11 @@ def _revoke_grant_in_config(config, reason="run_rejected"):
 # branch）；SSE 重连、查看历史、cancel、读取 session 不预占；cancel 不退已
 # consume 的额度。时序：
 #   1. 解析凭据来源（_resolve_ai_credentials）；
-#   2. credential_source=platform 且预算可用 → reserve_turn 原子预占
-#      （超限映射稳定 code，不回退其它凭据）；own → PG 下记可观测用量
-#      （不扣平台总量），json 下放行不记账（docs §4.3）；
+#   2. credential_source=platform → reserve_turn 原子预占（超限映射稳定 code，
+#      不回退其它凭据）；own → 记可观测用量（不扣平台总量）；
 #   3. HistoPilot 2xx 且拿到 session（X-AI-Session-ID / 非 SSE 2xx）→ consume；
 #      4xx/5xx / 连接失败 → release；同一 request_id 重试命中已有 reservation
 #      不重复扣（budget_store 幂等）。
-# json/dual + platform 凭据：fail-closed 拒绝（pg_backend_required），生产路径
-# 绝不无配额放行；仅 pytest（app.config["TESTING"]，生产不可能设置）放行以保
-# 留 json 模式下的代理层回归测试。
 # --------------------------------------------------------------------------- #
 #: request_id 幂等键格式（与 HistoPilot isValidRequestId 同口径：1–128，[A-Za-z0-9_-]）
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -9539,16 +9272,6 @@ def _own_task_max_steps_limit() -> int:
     except Exception:
         v = budget_store.DEFAULT_OWN_TASK_MAX_STEPS_LIMIT
     return max(1, min(v, _MAX_STEPS_LIMIT))
-
-
-def _budget_testing_bypass() -> bool:
-    """仅 pytest 测试放行 json 后端的平台 AI run（生产路径绝不能 bypass）。
-
-    Flask 的 TESTING 只能由测试代码显式设置（不受 env 影响，生产容器不会设），
-    现有 json 模式 AI 代理回归测试全部依赖它。fail-closed 语义由单独测试锁定
-    （TESTING 关闭时平台 run 仍被拒）。
-    """
-    return bool(app.config.get("TESTING"))
 
 
 def _ai_budget_subject(user_ctx):
@@ -9623,8 +9346,6 @@ def _spend_mode_snapshot():
     """
     try:
         return spend_store.enforcement_mode()
-    except platform_features.PgFeatureUnavailable:
-        raise
     except Exception:
         app.logger.warning("读取 spend enforcement 模式失败（按 shadow 处理）",
                            exc_info=True)
@@ -9650,9 +9371,9 @@ def _ai_reserve_run_budget(user_ctx, request_id):
       保留**（owner 的 reset 回退底板）——预占/超限 429/ai_access 闸全不变。
 
     其余分支与既有语义一致：
-      - platform 凭据 + json/dual：生产 fail-closed（503 pg_backend_required）；
-        仅 TESTING bypass 放行（不预占）；
-      - own 凭据：postgres 记可观测用量（不扣平台总量）；json 放行不记账；
+      - platform 凭据：reserve_turn 原子预占（PostgreSQL 唯一后端，无
+        json/dual 503 分支）；
+      - own 凭据：postgres 记可观测用量（不扣平台总量）；
       - 凭据缺失（None）：交由 _build_sidecar_config 的 400 分支处理。
     """
     source, _cred = _resolve_ai_credentials(user_ctx)
@@ -9664,50 +9385,37 @@ def _ai_reserve_run_budget(user_ctx, request_id):
         if denied is not None:
             return None, denied, None
     mode = None
-    if platform_features.budget_features_available():
-        # 模式快照只在 PG 后端读（json/dual 的 fail-closed 守卫在下方先行
-        # 返回）；同一请求内不重读，避免中途切模式撕裂
-        mode = _spend_mode_snapshot()
-        if spend_store.mode_is_hard(mode, subject_type):
-            # 金额硬闸分支：turn 消费闸关闭（不写 reservations、不做 usage
-            # 平移、不查任何 turn 闸）。绑定两阶段化（0028，P1-2 fail-closed）：
-            # 阶段 1 在调用 HistoPilot **之前**写 pending 绑定行（subject +
-            # request_id，session NULL）——HistoPilot 返回 session 后立刻后台
-            # driveMain 的第一次 authorizeHold / usage event 也能按 request_id
-            # 解析主体，不再落入 not_ready 窗口。INSERT + 冲突回读一次承担
-            # 旧 GET 预检的跨主体拒绝（同 request_id 换主体 → 409，同码）；
-            # 写入失败 → 503 fail-closed **不转发 sidecar**（绝不放无主体
-            # 绑定的 run 去花真钱）。
-            try:
-                budget_store.ensure_run_binding_pending(
-                    request_id, subject_type, subject_id,
-                    installation_id=((_HISTOPILOT_INSTALLATION or {}).get(
-                        "installation_id")))
-            except budget_store.RequestIdSubjectConflict as exc:
-                return None, _budget_error_response(exc, 409), None
-            except Exception:
-                app.logger.exception(
-                    "AI run pending 绑定写入失败（request_id=%s，fail-closed "
-                    "503，不转发 sidecar）", request_id)
-                return None, (
-                    jsonify(error="AI run 绑定暂不可用，请稍后重试",
-                            code="run_binding_unavailable"),
-                    503,
-                ), None
-            return None, None, {"hard": True, "mode": mode,
-                                "subject_type": subject_type,
-                                "subject_id": subject_id}
-    if not platform_features.budget_features_available():
-        if source == "own":
-            return None, None, None  # json：own 放行但不记账（docs §4.3）
-        if _budget_testing_bypass():
-            return None, None, None  # 仅 pytest（见 _budget_testing_bypass 注释）
-        return None, (
-            jsonify(error="平台 AI 需要启用预算（STORAGE_BACKEND=postgres）；"
-                          "当前后端不支持无配额放行",
-                    code=platform_features.PgFeatureUnavailable.code),
-            503,
-        ), None
+    # 模式快照；同一请求内不重读，避免中途切模式撕裂
+    mode = _spend_mode_snapshot()
+    if spend_store.mode_is_hard(mode, subject_type):
+        # 金额硬闸分支：turn 消费闸关闭（不写 reservations、不做 usage
+        # 平移、不查任何 turn 闸）。绑定两阶段化（0028，P1-2 fail-closed）：
+        # 阶段 1 在调用 HistoPilot **之前**写 pending 绑定行（subject +
+        # request_id，session NULL）——HistoPilot 返回 session 后立刻后台
+        # driveMain 的第一次 authorizeHold / usage event 也能按 request_id
+        # 解析主体，不再落入 not_ready 窗口。INSERT + 冲突回读一次承担
+        # 旧 GET 预检的跨主体拒绝（同 request_id 换主体 → 409，同码）；
+        # 写入失败 → 503 fail-closed **不转发 sidecar**（绝不放无主体
+        # 绑定的 run 去花真钱）。
+        try:
+            budget_store.ensure_run_binding_pending(
+                request_id, subject_type, subject_id,
+                installation_id=((_HISTOPILOT_INSTALLATION or {}).get(
+                    "installation_id")))
+        except budget_store.RequestIdSubjectConflict as exc:
+            return None, _budget_error_response(exc, 409), None
+        except Exception:
+            app.logger.exception(
+                "AI run pending 绑定写入失败（request_id=%s，fail-closed "
+                "503，不转发 sidecar）", request_id)
+            return None, (
+                jsonify(error="AI run 绑定暂不可用，请稍后重试",
+                        code="run_binding_unavailable"),
+                503,
+            ), None
+        return None, None, {"hard": True, "mode": mode,
+                            "subject_type": subject_type,
+                            "subject_id": subject_id}
     try:
         resv = budget_store.reserve_turn(request_id, subject_type, subject_id, source)
         return resv, None, None
@@ -9725,13 +9433,6 @@ def _ai_reserve_run_budget(user_ctx, request_id):
         return None, _budget_error_response(exc, 429), None
     except budget_store.BudgetError as exc:
         return None, _budget_error_response(exc, 409), None
-    except platform_features.PgFeatureUnavailable:
-        # 双重保险：budget_features_available 与 store 守卫口径一致，正常不可达
-        if source == "own":
-            return None, None, None
-        return None, _budget_error_response(
-            platform_features.PgFeatureUnavailable(), 503,
-            code="pg_backend_required"), None
 
 
 def _budget_error_response(exc, status, code=None):
@@ -9901,8 +9602,6 @@ def _start_binding_attach_retry_thread():
       写库，破坏每用例 TRUNCATE 隔离；attach 语义由 store 层测试覆盖；
     - daemon 线程：进程退出即结束，不阻塞停机。
     """
-    if not platform_features.budget_features_available():
-        return None
     try:
         interval = float(
             os.environ.get("AI_BINDING_ATTACH_RETRY_INTERVAL_SECONDS") or 2)
@@ -10252,11 +9951,9 @@ def reconcile_expired_reservations(now=None):
     顺延；过期 accepted → expired 终态（解锁 capability）。
 
     返回摘要 dict：``{"demo": [{"id","request_id","action"}...],
-    "budget": [{"request_id","action"}...]}``（可测）。json/dual 后端
-    ``{"skipped": "pg_backend_required"}``。异常不抛（单条失败记 log 下轮再试）。
+    "budget": [{"request_id","action"}...]}``（可测）。异常不抛（单条失败记
+    log 下轮再试）。
     """
-    if not platform_features.budget_features_available():
-        return {"skipped": "pg_backend_required"}
     ts = float(time.time() if now is None else now)
     summary = {"demo": [], "budget": []}
 
@@ -10418,8 +10115,6 @@ def _start_budget_reclaim_thread():
       时间回收：否则 consume/extend 失败后仍过期的 reservation 会被误退款。
     - daemon 线程：进程退出即结束，不阻塞停机。
     """
-    if not platform_features.budget_features_available():
-        return None
     try:
         interval = float(os.environ.get("AI_BUDGET_RECLAIM_INTERVAL_SECONDS") or 300)
     except (TypeError, ValueError):
@@ -10503,8 +10198,6 @@ def _start_acquisition_retention_thread():
     - 线程名沿用 ``acquisition-retention`` 不改（避免运维图谱漂移）；
     - daemon 线程：循环内异常吞掉记日志（下一轮重试），不杀线程、不阻塞停机。
     """
-    if not platform_features.budget_features_available():
-        return None
     try:
         interval = float(
             os.environ.get("ACQ_RETENTION_INTERVAL_SECONDS") or 86400)
@@ -12911,8 +12604,7 @@ def plugin_v1_usage_events():
       409 usage_subject_conflict      —— body 主体 assertion 与权威解析不一致
                                           （确定性，进 dead + P0 告警）；
       409 usage_subject_not_ready     —— 权威绑定行未提交（retryable=true，
-                                          按退避重试）；
-      503 pg_backend_required         —— json/dual 后端 fail-closed。
+                                          按退避重试）。
 
     错误信封（0028 P1-2）的 ``error.details`` 附带当前 ``enforcement_mode`` +
     ``capabilities``（与成功 2xx 顶层同值；读模式失败不附加）——冷启动客户端
@@ -12927,12 +12619,6 @@ def plugin_v1_usage_events():
     if (claims.get("plugin_id") or "") not in _USAGE_INGEST_PLUGIN_IDS:
         return _billing_plugin_error(403, "forbidden",
                              "仅 HistoPilot 插件安装可投递用量事件")
-    if not platform_features.usage_ingest_available():
-        # json/dual fail-closed（§6.1）：不降级进程内余额/计数
-        return _billing_plugin_error(
-            503, "pg_backend_required",
-            "用量计费要求 STORAGE_BACKEND=postgres（当前 %r），fail-closed"
-            % platform_features.current_backend())
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return _billing_plugin_error(400, "invalid_request", "request body 需为 JSON object")
@@ -12959,9 +12645,6 @@ def plugin_v1_usage_events():
     except billing_store.UsageSubjectNotReadyError:
         return _billing_plugin_error(409, "usage_subject_not_ready",
                              "权威主体绑定尚未就绪，请退避后重试", retryable=True)
-    except platform_features.PgFeatureUnavailable:
-        return _billing_plugin_error(503, "pg_backend_required",
-                             "用量计费要求 STORAGE_BACKEND=postgres")
     except Exception:
         app.logger.exception("usage event ingest 失败（event_id=%s）",
                              body.get("event_id"))
@@ -13016,7 +12699,7 @@ def plugin_v1_billing_hold_authorize():
 
     鉴权：Bearer scoped JWT（_require_plugin_token）+ plugin_id 白名单
     （复用 _USAGE_INGEST_PLUGIN_IDS，仅 HistoPilot 安装——同一机器通道）。
-    json/dual → 503 pg_backend_required（fail-closed，不降级）。
+    PostgreSQL 唯一后端（旧 json/dual 503 pg_backend_required 门已退役）。
 
     模式（spend_enforcement_mode 快照进 hold 行，§7.3）：shadow（及
     registered 下的 demo）永不因金额拒绝、照常投影；registered 下 user/
@@ -13042,8 +12725,7 @@ def plugin_v1_billing_hold_authorize():
                                       retryable=true）。503 与 pg_backend_
                                       required 同族：服务端金额前置条件缺失，
                                       客户端退避重试或放弃，绝不无额度放行；
-      503 spend_window_unavailable —— 窗口不可用（hard fail-closed，同上）；
-      503 pg_backend_required      —— json/dual fail-closed。
+      503 spend_window_unavailable —— 窗口不可用（hard fail-closed，同上）。
 
     错误信封（0028 P1-2）的 ``error.details`` 附带当前 ``enforcement_mode`` +
     ``capabilities``（与成功 2xx 顶层同值；读模式失败不附加）。
@@ -13061,12 +12743,6 @@ def plugin_v1_billing_hold_authorize():
     if (claims.get("plugin_id") or "") not in _USAGE_INGEST_PLUGIN_IDS:
         return _billing_plugin_error(403, "forbidden",
                              "仅 HistoPilot 插件安装可预授权计费 hold")
-    if not platform_features.billing_features_available():
-        # json/dual fail-closed（§6.1）：不降级进程内估算
-        return _billing_plugin_error(
-            503, "pg_backend_required",
-            "billing hold 要求 STORAGE_BACKEND=postgres（当前 %r），fail-closed"
-            % platform_features.current_backend())
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return _billing_plugin_error(400, "invalid_request", "request body 需为 JSON object")
@@ -13103,9 +12779,6 @@ def plugin_v1_billing_hold_authorize():
         return _billing_plugin_error(503, "spend_window_unavailable",
                              "金额窗口不可用（hard 模式 fail-closed）",
                              retryable=True)
-    except platform_features.PgFeatureUnavailable:
-        return _billing_plugin_error(503, "pg_backend_required",
-                             "billing hold 要求 STORAGE_BACKEND=postgres")
     except Exception:
         app.logger.exception("billing hold authorize 失败（call_id=%s）",
                              body.get("call_id"))
@@ -13159,11 +12832,6 @@ def plugin_v1_billing_hold_settle(hold_id):
     if (claims.get("plugin_id") or "") not in _USAGE_INGEST_PLUGIN_IDS:
         return _plugin_error(403, "forbidden",
                              "仅 HistoPilot 插件安装可结算计费 hold")
-    if not platform_features.billing_features_available():
-        return _plugin_error(
-            503, "pg_backend_required",
-            "billing hold 要求 STORAGE_BACKEND=postgres（当前 %r），fail-closed"
-            % platform_features.current_backend())
     body = request.get_json(silent=True)
     if body is not None and not isinstance(body, dict):
         return _plugin_error(400, "invalid_request",
@@ -13204,9 +12872,6 @@ def plugin_v1_billing_hold_settle(hold_id):
         # 结算链归还 reserved 时窗口行缺失（数据异常）：可重试，整体已回滚
         return _plugin_error(503, "spend_window_unavailable",
                              "金额窗口不可用，结算未生效，请重试", retryable=True)
-    except platform_features.PgFeatureUnavailable:
-        return _plugin_error(503, "pg_backend_required",
-                             "billing hold 要求 STORAGE_BACKEND=postgres")
     except Exception:
         app.logger.exception("billing hold settle 失败（hold_id=%s）", hold_id)
         return _plugin_error(500, "internal", "内部错误", retryable=True)

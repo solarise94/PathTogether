@@ -43,7 +43,6 @@ import psycopg
 from werkzeug.security import generate_password_hash
 
 import pg_store
-import platform_features
 import user_store
 # Batch B（docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
 # §Batch B 数据模型 6）：来源归因与注册解耦——兑换事务**不再**调用
@@ -264,7 +263,6 @@ def create_invite(created_by_user_id, login_id=None,
       login_id」（docs §8.2）；None = 不绑定（owner 明确选择的高风险选项）；
     - ai_access/note 为邀请模板：兑换时决定新用户平台 AI 权限。
     """
-    platform_features.require_pg_backend("registration_invites")
     if not isinstance(created_by_user_id, str) or not created_by_user_id:
         raise ValueError("created_by_user_id 不能为空")
     bound = normalize_login_id(login_id) if login_id else ""
@@ -321,7 +319,6 @@ def create_invite(created_by_user_id, login_id=None,
 
 def list_invites(limit=200):
     """列出邀请（**不含 token_hash**；最新在前）。邮箱掩码由路由层做。"""
-    platform_features.require_pg_backend("registration_invites")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -338,7 +335,6 @@ def list_invites(limit=200):
 
 def get_invite(invite_id):
     """按 invite_id 取行（不含 token_hash）；不存在返回 None。"""
-    platform_features.require_pg_backend("registration_invites")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -355,7 +351,6 @@ def get_invite(invite_id):
 
 def revoke_invite(invite_id, revoked_by_user_id):
     """撤销未消费的邀请（幂等：已撤销原样返回；已消费拒绝撤销）。"""
-    platform_features.require_pg_backend("registration_invites")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -439,7 +434,6 @@ def redeem_invite(token, login_id, password, display_name=None):
     原样上抛——注册端点的 generic Exception→503「注册暂不可用」兜底对其
     语义正确（邀请行未被读取、FOR UPDATE 未加锁、invite 必未消费）。
     """
-    platform_features.require_pg_backend("registration_invites")
     tok = (token or "").strip()
     norm_login = normalize_login_id(login_id)
     if not tok or not isinstance(password, str) or not norm_login \

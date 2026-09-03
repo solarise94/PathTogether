@@ -13,7 +13,7 @@
 
 提供：
   - ``SHARE_DATA_DIR`` / ``UPLOAD_DIR``：session 级临时目录（mkdtemp），并写入
-    对应 env（app.py / share_server.py / share_store_json.py / user_store_json.py
+    对应 env（app.py / share_server.py / share_store.py / user_store.py
     在 import 期读取这些 env）；per-test 隔离由 ``_pt_helpers.isolate_app`` 负责。
   - openslide 不可 import 时注册一次 stub（``OpenSlide = object`` +
     ``openslide.deepzoom.DeepZoomGenerator = object``）。生产代码只用到这两个

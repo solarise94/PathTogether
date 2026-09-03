@@ -212,8 +212,8 @@ def test_containerfile_ships_plugin_framework_not_histopilot_source():
 def test_containerfile_ships_app_modules():
     """app.py/share_server.py 依赖的仓库内模块（传递闭包）必须全部进镜像。
 
-    Stage 3a-1 曾漏 COPY user_store.py、3b-3 曾漏 COPY share_store_json.py（后者
-    被 share_store.py dispatcher import，app.py 顶层扫不到）→ demo 重建后 worker
+    Stage 3a-1 曾漏 COPY user_store.py、3b-3 曾漏 COPY share_shared.py（后者
+    被 share_store_pg.py 引用，app.py 顶层扫不到）→ demo 重建后 worker
     ModuleNotFoundError。故从 app.py + share_server.py 出发做 BFS：凡 repo 根有
     同名 .py 的模块（含函数内 import，抓全 ``import x`` / ``from x import`` 两种
     形态，不限行首）都必须在 Containerfile 的 COPY 行里。

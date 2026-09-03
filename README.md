@@ -56,13 +56,17 @@ PathTogether 容器只运行平台。HistoPilot 使用自己的镜像、进程�
 
 ## 关键环境变量
 
+> PostgreSQL 是唯一运行时后端：`STORAGE_BACKEND` 仅接受 `postgres`（缺省即
+> postgres）。旧 `json` / `dual` 文件后端已退役，`migrate_json_to_pg.py` 仅作为
+> 离线迁移工具保留。
+
 | 变量 | 默认值 | 用途 |
 |---|---|---|
 | `PORT` | `8000` | 管理端端口 |
 | `UPLOAD_DIR` | `~/svs-viewer/uploads` | WSI 文件目录 |
 | `SHARE_DATA_DIR` | `~/svs-viewer/share-data` | 平台数据目录 |
 | `PLUGIN_BUNDLES_DIR` | `${SHARE_DATA_DIR}/plugins` | 独立插件 release bundle 安装目录 |
-| `STORAGE_BACKEND` | `json` | `json` / `postgres` / `dual` |
+| `STORAGE_BACKEND` | `postgres` | `postgres`（唯一后端） |
 | `DATABASE_URL` | — | PostgreSQL 连接串 |
 | `BOOTSTRAP_OWNER_LOGIN_ID` | — | 空库首建 owner 的登录账号 |
 | `BOOTSTRAP_OWNER_PASSWORD_FILE` | — | 空库首建 owner 的 secret 文件路径 |

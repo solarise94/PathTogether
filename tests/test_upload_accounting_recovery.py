@@ -49,8 +49,6 @@ from _pt_helpers import csrf_client, isolate_app, clear_upload_dir  # noqa: E402
 def _isolate(tmp_path, monkeypatch):
     """每用例：独立存储 + 上传防护复位 + _validate_slide_file 放行 + 清空。"""
     isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
-    monkeypatch.setattr(upload_task_store, "UPLOAD_TASK_FILE",
-                        tmp_path / "upload_tasks.json")
     monkeypatch.setattr(upload_guard, "UPLOAD_MAX_REQUEST_BYTES", 10 * 1024 ** 3)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
     monkeypatch.setattr(upload_task_store, "UPLOAD_TASK_TTL_SECONDS", 24 * 3600)

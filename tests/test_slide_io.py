@@ -313,8 +313,6 @@ def test_validate_slide_file_unknown_exception_becomes_slide_open_failed(
 def _iso(tmp_path, monkeypatch):
     """存储隔离（真验证用例不得 monkeypatch _validate_slide_file）。"""
     isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
-    monkeypatch.setattr(upload_task_store, "UPLOAD_TASK_FILE",
-                        tmp_path / "upload_tasks.json")
     monkeypatch.setattr(upload_guard, "UPLOAD_MAX_REQUEST_BYTES", 10 * 1024 ** 3)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
     monkeypatch.setattr(upload_task_store, "UPLOAD_TASK_TTL_SECONDS", 24 * 3600)

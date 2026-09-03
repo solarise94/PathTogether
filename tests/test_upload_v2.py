@@ -62,8 +62,6 @@ def _validate_bad(path, **_):
 def _isolate(tmp_path, monkeypatch):
     """每用例：独立存储 + 无登录限制 mock + 防护参数复位 + 清空 uploads。"""
     isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
-    monkeypatch.setattr(upload_task_store, "UPLOAD_TASK_FILE",
-                        tmp_path / "upload_tasks.json")
     # 防护/TTL 参数复位（防其它用例污染；水印 0 使本机磁盘不干扰）
     monkeypatch.setattr(upload_guard, "UPLOAD_MAX_REQUEST_BYTES", 10 * 1024 ** 3)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)

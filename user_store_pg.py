@@ -813,12 +813,3 @@ def has_enabled_users():
                 return bool(cur.fetchone()["exists"])
     finally:
         conn.close()
-
-
-# --------------------------------------------------------------------------- #
-# user 侧 dual 后端镜像原语（_mirror_user）与启动修复
-# repair_empty_password_hashes_from_json 已随账户系统批次 C 删除
-# （docs §9.2/§9.3）：user_store dispatcher 不再安装 dual；历史空 hash
-# 修复迁至 scripts/repair_pg_user_password_hashes.py（默认 dry-run 的
-# 主机侧一次性命令）。share 侧 dual 机制不受影响（share_store.py）。
-# --------------------------------------------------------------------------- #

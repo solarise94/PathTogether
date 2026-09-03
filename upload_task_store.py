@@ -1,17 +1,10 @@
 # -*- coding: utf-8 -*-
 """Upload V2 分片续传任务存储（docs/upload-resumable-fix-plan.md §3.1，U2）。
 
-双后端（dual-backend 约定，同 user_store/share_store）：
-
-  - ``STORAGE_BACKEND=postgres``：``upload_tasks`` 表（migrations/0017）。
-    状态转移在**短事务**内 ``SELECT ... FOR UPDATE`` 锁任务行（§3.1 跨 worker
-    锁）；整文件哈希 / OpenSlide 验证 / 文件提升**不在行锁内**（§3.2.5 三段式，
-    由 app.py 编排，本模块只提供状态原语）。
-  - ``json`` / ``dual``：等价文件记录 ``SHARE_DATA_DIR/upload_tasks.json``
-    （0600，fcntl 排他文件锁，写盘 fsync，风格同 user_store_json）。json 形态
-    的等价锁 = 同一把文件锁（跨进程互斥；进程内请求线程天然需先抢锁）。
-    AUTH_ENABLED=False 的本地上传跑 json 后端：owner / 免认证跳过配额
-    （upload_guard.quota_applies），但任务状态机照常工作、可测。
+PostgreSQL 唯一后端：``upload_tasks`` 表（migrations/0017）。状态转移在
+**短事务**内 ``SELECT ... FOR UPDATE`` 锁任务行（§3.1 跨 worker 锁）；整文件
+哈希 / OpenSlide 验证 / 文件提升**不在行锁内**（§3.2.5 三段式，由 app.py
+编排，本模块只提供状态原语）。json/dual 文件后端已删除。
 
 状态机（§3.1，严格串行 offset）：
 
@@ -41,7 +34,6 @@ import time
 
 import pg_store
 import platform_features
-import locked_atomic_json
 
 # --------------------------------------------------------------------------- #
 # env 可调常量（import 期一次性读取；测试用 monkeypatch 改模块属性）
@@ -239,7 +231,7 @@ def _artifacts_to_db(v):
 
 
 def _artifacts_from_db(v):
-    """PG TEXT 列 / json 后端内存值 → list（V2 任务为 None）。
+    """PG TEXT 列 → list（V2 任务为 None）。
 
     损坏（非法 JSON / 非数组）返回 **[]**（空列表）：与 None（=V2 任务）区分，
     调用方按「manifest 丢失但任务是 V1」的证据冲突 fail-closed，绝不猜。
@@ -274,77 +266,9 @@ def _new_task_id():
     return "upt_" + secrets.token_hex(12)
 
 
-def _use_pg():
-    return platform_features.current_backend() == "postgres"
-
-
 def _epoch_to_dt(v):
     import datetime
     return datetime.datetime.fromtimestamp(float(v), tz=datetime.timezone.utc)
-
-
-# --------------------------------------------------------------------------- #
-# json 文件后端（等价文件记录；fcntl 排他锁 = 状态转移互斥）
-# --------------------------------------------------------------------------- #
-#: json 后端数据文件路径（monkeypatch 目标；None = 按 SHARE_DATA_DIR env 现算）
-UPLOAD_TASK_FILE = None
-
-
-def _task_file():
-    """json 后端数据文件路径（UPLOAD_TASK_FILE 未设时按 env 现算，测试友好）。"""
-    base = os.environ.get("SHARE_DATA_DIR")
-    if not base:
-        base = os.path.join(os.path.expanduser("~"), "svs-viewer", "share-data")
-    return os.path.join(base, "upload_tasks.json")
-
-
-def _path():
-    return UPLOAD_TASK_FILE or _task_file()
-
-
-def _with_lock(fn):
-    """在 upload_tasks.json 的稳定锁（upload_tasks.json.lock）内执行 fn(session)。
-
-    review 10.2：与 shares 共用 ``locked_atomic_json`` 的 IO/锁原语（稳定
-    lock file + tmp/fsync/replace）；本 store 的 schema/异常语义不变。
-    """
-    return locked_atomic_json.with_locked_file(_path(), fn)
-
-
-def _load_locked(f):
-    raw = f.read_bytes()
-    if not raw:
-        return {"tasks": {}, "meta": {"schema_version": 1}}
-    data = json.loads(raw)
-    if not isinstance(data, dict) or not isinstance(data.get("tasks"), dict):
-        raise UploadTaskError("upload_tasks.json 结构损坏")
-    return data
-
-
-def _save_locked(f, data):
-    payload = json.dumps(data, ensure_ascii=False, indent=2)
-    f.write_bytes(payload.encode("utf-8"))
-
-
-def _json_apply(upload_id, mutate):
-    """文件锁内：读任务 → mutate(task)→(fields, result) → 落盘。
-
-    返回 (task_after, result)；任务不存在返回 (None, None)。
-    """
-
-    def _do(f):
-        data = _load_locked(f)
-        task = data["tasks"].get(upload_id)
-        if task is None:
-            return None, None
-        fields, result = mutate(task)
-        if fields:
-            task.update(fields)
-            task["updated_at"] = time.time()
-            _save_locked(f, data)
-        return task, result
-
-    return _with_lock(_do)
 
 
 # --------------------------------------------------------------------------- #
@@ -426,10 +350,8 @@ def _pg_apply(upload_id, mutate):
 
 
 def _apply(upload_id, mutate):
-    """双后端统一的「锁内读-判-写」入口（见 _json_apply/_pg_apply 契约）。"""
-    if _use_pg():
-        return _pg_apply(upload_id, mutate)
-    return _json_apply(upload_id, mutate)
+    """PG-only：FOR UPDATE 短事务内「锁内读-判-写」入口（见 _pg_apply 契约）。"""
+    return _pg_apply(upload_id, mutate)
 
 
 # --------------------------------------------------------------------------- #
@@ -480,17 +402,8 @@ def create_task(owner_user_id, filename, safe_name, declared_size, chunk_size,
         "updated_at": now,
         "v1_artifacts": None,
     }
-    if _use_pg():
-        _pg_insert(task)
-        return task
-
-    def _do(f):
-        data = _load_locked(f)
-        data["tasks"][task["upload_id"]] = task
-        _save_locked(f, data)
-        return task
-
-    return _with_lock(_do)
+    _pg_insert(task)
+    return task
 
 
 def begin_legacy_commit(owner_user_id, filename, safe_name, artifacts,
@@ -500,8 +413,8 @@ def begin_legacy_commit(owner_user_id, filename, safe_name, artifacts,
     与 V2「create_task → 分片 → begin_commit」不同：V1 无分片阶段，请求字节
     在受理前已全部落盘并通过内容验证，故「建任务 + 受理 commit（committing +
     commit_token + artifact manifest + reservation 绑定）」合并为**一次原子
-    写**（json 文件锁内单次落盘 / PG 单条 INSERT 短事务）——崩溃只见完整
-    旧/新版，不会留下无人认领的 active 任务，也无需第二张补偿表。
+    写**（PG 单条 INSERT 短事务）——崩溃只见完整旧/新版，不会留下无人认领的
+    active 任务，也无需第二张补偿表。
 
     artifacts 为**提升之前**持久化的 manifest（_encode_artifacts 校验归一）；
     declared_size = confirmed_offset = settle_bytes = Σsize（提升后转实占的
@@ -535,78 +448,48 @@ def begin_legacy_commit(owner_user_id, filename, safe_name, artifacts,
         "updated_at": now,
         "v1_artifacts": arts,
     }
-    if _use_pg():
-        _pg_insert(task)
-        return task["upload_id"], task["commit_token"], task
-
-    def _do(f):
-        data = _load_locked(f)
-        data["tasks"][task["upload_id"]] = task
-        _save_locked(f, data)
-        return task
-
-    t = _with_lock(_do)
-    return t["upload_id"], t["commit_token"], t
+    _pg_insert(task)
+    return task["upload_id"], task["commit_token"], task
 
 
 def list_tasks(*, owner_user_id=None, state=None):
     """任务快照列举（不加锁读；恢复扫描与 admin 观测用，§10.4 G7）。
 
     过滤条件相与；owner_user_id="" 匹配本地免登录 owner 归一后的任务。
-    返回 list[task]（created_at 升序 + upload_id tie-break，双后端同序）。
+    返回 list[task]（created_at 升序 + upload_id tie-break）。
     """
-    if _use_pg():
-        sql = "SELECT %s FROM upload_tasks" % _PG_COLS
-        conds, params = [], []
-        if owner_user_id is not None:
-            conds.append("owner_user_id = %s")
-            params.append(str(owner_user_id))
-        if state is not None:
-            conds.append("state = %s")
-            params.append(str(state))
-        if conds:
-            sql += " WHERE " + " AND ".join(conds)
-        sql += " ORDER BY created_at, upload_id"
-        conn = _pg_connect()
-        try:
-            with pg_store.transaction(conn):
-                with conn.cursor() as cur:
-                    cur.execute(sql, tuple(params))
-                    return [_norm_row(r) for r in cur.fetchall()]
-        finally:
-            conn.close()
-
-    def _do(f):
-        tasks = list(_load_locked(f)["tasks"].values())
-        if owner_user_id is not None:
-            tasks = [t for t in tasks
-                     if str(t.get("owner_user_id") or "") == str(owner_user_id)]
-        if state is not None:
-            tasks = [t for t in tasks if t.get("state") == state]
-        tasks.sort(key=lambda t: (float(t.get("created_at") or 0),
-                                  str(t.get("upload_id") or "")))
-        return tasks
-
-    return _with_lock(_do)
+    sql = "SELECT %s FROM upload_tasks" % _PG_COLS
+    conds, params = [], []
+    if owner_user_id is not None:
+        conds.append("owner_user_id = %s")
+        params.append(str(owner_user_id))
+    if state is not None:
+        conds.append("state = %s")
+        params.append(str(state))
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY created_at, upload_id"
+    conn = _pg_connect()
+    try:
+        with pg_store.transaction(conn):
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(params))
+                return [_norm_row(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
 
 
 def get_task(upload_id):
     """读任务（不加锁的快照读）。不存在返回 None。"""
-    if _use_pg():
-        conn = _pg_connect()
-        try:
-            with pg_store.transaction(conn):
-                with conn.cursor() as cur:
-                    cur.execute("SELECT %s FROM upload_tasks WHERE upload_id = %%s"
-                                % _PG_COLS, (upload_id,))
-                    return _norm_row(cur.fetchone())
-        finally:
-            conn.close()
-
-    def _do(f):
-        return _load_locked(f)["tasks"].get(upload_id)
-
-    return _with_lock(_do)
+    conn = _pg_connect()
+    try:
+        with pg_store.transaction(conn):
+            with conn.cursor() as cur:
+                cur.execute("SELECT %s FROM upload_tasks WHERE upload_id = %%s"
+                            % _PG_COLS, (upload_id,))
+                return _norm_row(cur.fetchone())
+    finally:
+        conn.close()
 
 
 def append_chunk(upload_id, offset, length, sha256, *, ttl_seconds=None):
@@ -671,28 +554,13 @@ def finish_commit(upload_id, commit_token, sha256_actual, *, settle_bytes=None):
     token 不匹配 / 状态已变 → StateConflict（进程外崩溃后的惰性恢复凭同一
     token 收口；过时 worker 的收口被拒）。
 
-    PG 且任务绑定 reservation 时，``settle_bytes`` 把配额转实占放进**同一事务**
-    （任务 committed 与 used_bytes 同时提交 / 同时回滚）。json 后端无配额。
-    预占失效抛 ``upload_guard.ReservationInvalid``，任务行保持 committing。
+    任务绑定 reservation 时，``settle_bytes`` 把配额转实占放进**同一事务**
+    （任务 committed 与 used_bytes 同时提交 / 同时回滚）。预占失效抛
+    ``upload_guard.ReservationInvalid``，任务行保持 committing。
     """
 
-    def _mutate(task):
-        if (task["state"] != STATE_COMMITTING
-                or task.get("commit_token") != commit_token):
-            raise StateConflict(
-                "commit 收口失败：任务已不在受理态或 token 不匹配（state=%r）"
-                % task["state"], task)
-        return {"state": STATE_COMMITTED,
-                "sha256_actual": sha256_actual or None}, None
-
-    if _use_pg():
-        return _pg_finish_commit(upload_id, commit_token, sha256_actual,
-                                 settle_bytes=settle_bytes)
-
-    task, _ = _apply(upload_id, _mutate)
-    if task is None:
-        raise TaskNotFound("上传任务不存在：%r" % upload_id)
-    return task
+    return _pg_finish_commit(upload_id, commit_token, sha256_actual,
+                             settle_bytes=settle_bytes)
 
 
 def _pg_finish_commit(upload_id, commit_token, sha256_actual, *, settle_bytes=None):

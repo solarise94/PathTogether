@@ -4,8 +4,9 @@
 覆盖：
   1. 默认后端为 postgres：create_share/list_shares 与 create_user/verify_user 冒烟
     走通 PG 实现（经 dispatcher，不经任何调用方改动）；
-  2. STORAGE_BACKEND 非法值在 import 期报错；
-  3. dispatcher 公共名与 json impl 源码声明的公共名集合一致（防漏 export）；
+  2. STORAGE_BACKEND 非法值在 import 期报错（json/dual/mysql 均为非法）；
+  3. dispatcher 公共名与 PG 实现（share_store_pg/user_store_pg）公共名一致
+    （防漏 export）；
   4. PG 后端公共名接线（re-export，不再抛 RuntimeError）；
   5. PG 后端不得拉入 json 实现（share_store_pg 源码级断言）。
 
@@ -33,10 +34,6 @@ import pytest  # noqa: E402
 
 import share_store  # noqa: E402  默认 postgres dispatcher
 import user_store  # noqa: E402
-import share_store_json  # noqa: E402  json 实现（仅作 export 对比源）
-import user_store_json  # noqa: E402
-
-DISPATCHER_INFRA_NAMES = {"STORAGE_BACKEND"}  # dispatcher 自身额外暴露的非业务公共名
 
 
 # --------------------------------------------------------------------------- #
@@ -60,11 +57,6 @@ def _declared_public_names(source_path):
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             names.add(node.target.id)
     return {n for n in names if not n.startswith("_")}
-
-
-def _module_public_attrs(mod):
-    """模块运行时实际暴露的公共属性名（__dict__ 键，非下划线开头）。"""
-    return {n for n in vars(mod) if not n.startswith("_")}
 
 
 def _load_fresh(source_path, mod_name):
@@ -119,8 +111,6 @@ import importlib.util as _ilu  # noqa: E402
 _PSYCOPG_AVAILABLE = _ilu.find_spec("psycopg") is not None
 
 
-@pytest.mark.skipif(
-    not _PSYCOPG_AVAILABLE, reason="缺 psycopg：postgres 后端 import 需该依赖")
 def test_postgres_backend_exports_public_names(monkeypatch):
     monkeypatch.setenv("STORAGE_BACKEND", "postgres")
     mod = _load_fresh(_REPO_ROOT / "share_store.py", "ss_pg_test")
@@ -143,31 +133,35 @@ def test_postgres_backend_user_store_exports(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# 3. dispatcher 公共名 == json impl 源码声明的公共名（防漏 export）
+# 3. dispatcher 公共名 == PG 实现源码声明的公共名（防漏 export）
+#    公共名 tuple 已由 dispatcher 显式枚举；这里以 PG 实现源码作对偶校验。
+#    __getattr__ 无法被 vars() 捕获，故同时断言 _PUBLIC_NAMES 完整性。
 # --------------------------------------------------------------------------- #
-def test_share_store_export_matches_json_impl():
-    declared = _declared_public_names(_REPO_ROOT / "share_store_json.py")
-    exposed = _module_public_attrs(share_store) - DISPATCHER_INFRA_NAMES
-    assert exposed == declared, (
-        "dispatcher 与 share_store_json 公共名不一致：\n"
-        "  仅 dispatcher 有: %s\n  仅 json 实现有: %s"
-        % (sorted(exposed - declared), sorted(declared - exposed))
+def test_share_store_export_matches_pg_impl():
+    import share_store_pg
+
+    declared = _declared_public_names(_REPO_ROOT / "share_store_pg.py")
+    assert set(share_store._PUBLIC_NAMES) <= declared, (
+        "dispatcher 公共名超出 share_store_pg：%s"
+        % sorted(set(share_store._PUBLIC_NAMES) - declared)
     )
-    # 显式计数码条
-    assert len(declared) == len(share_store._JSON_PUBLIC_NAMES)
-    assert set(share_store._JSON_PUBLIC_NAMES) == declared
+    # 全部公共名已 re-export 进模块 __dict__（不再依赖 __getattr__）
+    for n in share_store._PUBLIC_NAMES:
+        assert n in vars(share_store), "未接线公共名 %r" % n
+        assert hasattr(share_store_pg, n)
 
 
-def test_user_store_export_matches_json_impl():
-    declared = _declared_public_names(_REPO_ROOT / "user_store_json.py")
-    exposed = _module_public_attrs(user_store) - DISPATCHER_INFRA_NAMES
-    assert exposed == declared, (
-        "dispatcher 与 user_store_json 公共名不一致：\n"
-        "  仅 dispatcher 有: %s\n  仅 json 实现有: %s"
-        % (sorted(exposed - declared), sorted(declared - exposed))
+def test_user_store_export_matches_pg_impl():
+    import user_store_pg
+
+    declared = _declared_public_names(_REPO_ROOT / "user_store_pg.py")
+    assert set(user_store._PUBLIC_NAMES) <= declared, (
+        "dispatcher 公共名超出 user_store_pg：%s"
+        % sorted(set(user_store._PUBLIC_NAMES) - declared)
     )
-    assert len(declared) == len(user_store._JSON_PUBLIC_NAMES)
-    assert set(user_store._JSON_PUBLIC_NAMES) == declared
+    for n in user_store._PUBLIC_NAMES:
+        assert n in vars(user_store), "未接线公共名 %r" % n
+        assert hasattr(user_store_pg, n)
 
 
 def test_share_store_pg_has_no_json_import():
@@ -184,9 +178,14 @@ def test_share_store_pg_has_no_json_import():
 
 
 # --------------------------------------------------------------------------- #
-# 4. STORAGE_BACKEND 非法值 import 期报错
+# 4. STORAGE_BACKEND 非法值 import 期报错（postgres 是唯一合法值；
+#    json/dual/mysql 等一律 ValueError）
 # --------------------------------------------------------------------------- #
-def test_invalid_backend_raises_at_import(monkeypatch):
-    monkeypatch.setenv("STORAGE_BACKEND", "mysql")
+@pytest.mark.parametrize("bad", ["mysql", "json", "dual"])
+def test_invalid_backend_raises_at_import(monkeypatch, bad):
+    monkeypatch.setenv("STORAGE_BACKEND", bad)
     with pytest.raises(ValueError):
-        _load_fresh(_REPO_ROOT / "share_store.py", "ss_bad_test")
+        _load_fresh(_REPO_ROOT / "share_store.py", "ss_bad_%s" % bad)
+    monkeypatch.setenv("STORAGE_BACKEND", bad)
+    with pytest.raises(ValueError):
+        _load_fresh(_REPO_ROOT / "user_store.py", "us_bad_%s" % bad)

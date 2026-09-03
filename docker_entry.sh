@@ -37,10 +37,8 @@ if [ -n "$_boot_pw_file" ]; then
   esac
 fi
 
-_backend="$(printf '%s' "${STORAGE_BACKEND:-json}" | tr '[:upper:]' '[:lower:]')"
-case "$_backend" in
-  postgres|dual)
-    python3 -c '
+# PostgreSQL 为唯一后端；启动时 apply schema（幂等）。
+python3 -c '
 import pg_store
 conn = pg_store.connect()
 try:
@@ -48,8 +46,6 @@ try:
 finally:
     conn.close()
 '
-    ;;
-esac
 
 mkdir -p "${UPLOAD_DIR:-/data/uploads}" "${SHARE_DATA_DIR:-/data/share}" "${PLUGIN_BUNDLES_DIR:-/data/plugins}"
 

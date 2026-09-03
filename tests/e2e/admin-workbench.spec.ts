@@ -151,10 +151,16 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		await expect(frame.locator("#adm-users-tbody")).toContainText("user");
 		await expect(frame.locator("#adm-users-tbody")).toContainText("启用");
 		await expect(frame.locator("#adm-users-table")).toContainText("额度剩余");
-		// 详情抽屉可打开：额度主视图（total/window 形态）+ 技术细节折叠区
-		await frame.locator("#adm-users-tbody button", { hasText: "详情" }).first().click();
+		// r3-wave2 单轨：user 行恒 total 形态——抽屉主视图是总额度字段，
+		// 不出现 window 形态（本月额度）与已删的「切换前」过渡文案
+		const userRow = frame.locator("#adm-users-tbody tr", { hasText: "E2E 普通用户" });
+		await userRow.locator("button", { hasText: "详情" }).click();
 		await expect(frame.locator("#adm-user-drawer")).toBeVisible();
+		await expect(frame.locator("#adm-drawer-body")).toContainText("总额度");
+		await expect(frame.locator("#adm-drawer-body")).toContainText("累计已用");
 		await expect(frame.locator("#adm-drawer-body")).toContainText("额度来源");
+		await expect(frame.locator("#adm-drawer-body")).not.toContainText("本月额度");
+		await expect(frame.locator("#adm-drawer-body")).not.toContainText("尚未切换到一次性总额度");
 		await expect(frame.locator("#adm-drawer-body")).toContainText("技术细节");
 		await frame.locator("#adm-drawer-close").click();
 		await expect(frame.locator("#adm-user-drawer")).toBeHidden();
@@ -509,7 +515,7 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 			body: await page.screenshot({ fullPage: true }),
 			contentType: "image/png",
 		});
-		// 用户详情抽屉（当前月 limit/spent/reserved/remaining + 覆盖编辑器）
+		// 用户详情抽屉（单轨：总额度/累计已用/预占/可用金额 + 设置总额度编辑器）
 		await frame.locator('.adm-nav-btn[data-page="users"]').click();
 		await expect(frame.locator("#adm-users-tbody"))
 			.toContainText("E2E 普通用户", { timeout: 10_000 });

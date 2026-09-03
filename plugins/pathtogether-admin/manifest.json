@@ -11,8 +11,8 @@
       "admin.workspace"
     ],
     "fileHashes": {
-      "ui/index.html": "5b27503ee9f00161bae91a705b0f413fbc29d997ad5b2c9c799f3c424fa4f6df",
-      "ui/main.js": "8ba3dc28a093d1bedca15feacfe084839fcb39d1d12eb63f1fcc1362e3a82658",
+      "ui/index.html": "1d481af0e3f2ab70c517083dfcf8f16e3c2bf475e83ef4d2aa289cea7d33dc0f",
+      "ui/main.js": "f8557120c183ce747f9dbb96c74bf3ba9a6045aba635a6ba4852110dca3dba7e",
       "ui/style.css": "2a26a469fe5f7be783589dc06a6d3c32ea7f79903a234626e693100937e89fd0"
     }
   },

@@ -24,7 +24,8 @@
       - 概览：删除 turn 冻结历史卡；告警条仅在 unpriced>0 / 供应商余额不可用
         或过旧 / reconcile 不一致时出现；下半部新增匿名「站点访问」卡
         （D2 未发布/桥不可达时整卡隐藏）；
-      - 用户：注册 user 为一次性总额度（spend.total），owner 为月窗口
+      - 用户（r3-wave2 单轨）：注册 user 恒为一次性总额度（spend.total；
+        spend_target 恒 "total_allowance" 纯展示标注），owner 恒为月窗口
         （spend.window）；两种形态同时出现 = 契约错误（显式报错，不任选其一）；
         抽屉金额动作：user=设置总额度/恢复默认（CAS，不重置已用），
         owner=既有 currentWindow.adjust；余额/caps 一律不再出现；

@@ -197,7 +197,8 @@
     }
   }
 
-  // 退出登录：POST /logout + CSRF（docs §10.14；GET /logout 已废弃为短期兼容）
+  // 退出登录：POST /logout + CSRF（docs §10.14；GET /logout 入口已随
+  // r3-wave1 物理删除——仅存 POST，无兼容期）
   // 产品语义：只有服务端确认退出成功才跳登录页；网络/HTTP 失败留在当前页并提示。
   function doLogout() {
     apiFetch("/logout", { method: "POST" }).then(function (resp) {

@@ -1,26 +1,21 @@
 # -*- coding: utf-8 -*-
-"""PR5：Admin API v1 写端点 + billing caps/adjustments 测试（docs
-admin-billing-plugin-implementation-plan.md §9/§12.2/§13 PR5/§14.1）。
+"""Admin API v1 写端点测试（docs admin-billing-plugin-implementation-plan.md
+§9/§12.2/§13 PR5/§14.1）。
+
+R3 wave1 起 billing caps/adjustments、turn-budgets 与 /admin/registration
+兼容重定向端点已物理删除（bridge 侧无调用方；billing_store 写原语由
+tests/test_billing_store.py 在 store 级锁定），本文件只覆盖仍在线的写面：
 
 json 模式（无 PG）：
   - 全部写端点 owner 门控：匿名 401 / user 403 / owner 预览态 403；
   - users 写端点（create/enable/disable/password-reset）与 break-glass
     不变量（owner 不可禁用/启用/重置密码 → 409；disable 推进 auth_version）；
-  - PG-only 写端点（ai-access/invites/turn-budgets/caps/adjustments）稳定
-    503 pg_backend_required（不降级）；
-  - /admin/registration 302 → /admin#invites（旧独立页已删，方案 §13 PR5）。
+  - PG-only 写端点（ai-access/invites）稳定
+    503 pg_backend_required（不降级）。
 
 PG 模式（RUN_PG_TESTS=1）：
-  - caps：未开户 404 / CAS 版本冲突 409 / null 清除 / soft>hard 400 /
-    非 NEG 400 / 与 audit 同事务（强制 audit 失败 → caps 未落库）；
-  - adjustments：kind 符号 400（grant 负数、manual_adjustment 0）/
-    reason 空 400 / 缺 idempotency_key 400（§6.5 PR5 修订：调用方生成，
-    服务端不代生成）/ grant 未开户自动开户 / refund 未开户 404 / 幂等键
-    重放 duplicate:true 不重复入账 / audit 同事务回滚（ledger 无残留）；
   - invites：创建（含 source_code/campaign slug 校验）token 仅一次 + 列表
     永不回 token / 撤销 / 已消费拒绝撤销 / 不存在 404；
-  - turn-budgets：PUT 全字段校验（未知字段 400、子池和 > platform 400），
-    new-period 需 confirm=true；
   - ai-access：设置/收回 + 不存在 404。
 
 运行：cd 项目根 && python3 -m pytest tests/test_admin_billing_writes.py -q
@@ -100,7 +95,7 @@ def _pg_count(table, where="", args=()):
 
 
 # --------------------------------------------------------------------------- #
-# 1. owner 门控（匿名 / user / preview）——全部 13 个写端点
+# 1. owner 门控（匿名 / user / preview）——全部写端点
 # --------------------------------------------------------------------------- #
 _WRITE_ENDPOINTS = [
     ("POST", "/api/admin/v1/users"),
@@ -111,10 +106,6 @@ _WRITE_ENDPOINTS = [
     ("GET", "/api/admin/v1/invites"),
     ("POST", "/api/admin/v1/invites"),
     ("POST", "/api/admin/v1/invites/inv_x/revoke"),
-    ("PUT", "/api/admin/v1/turn-budgets"),
-    ("POST", "/api/admin/v1/turn-budgets/new-period"),
-    ("PUT", "/api/admin/v1/billing/accounts/u_x/caps"),
-    ("POST", "/api/admin/v1/billing/adjustments"),
 ]
 
 
@@ -227,433 +218,14 @@ def test_json_pg_only_write_endpoints_fail_closed():
              {"enabled": True}),
             ("GET", "/api/admin/v1/invites", None),
             ("POST", "/api/admin/v1/invites", {}),
-            ("POST", "/api/admin/v1/invites/inv_x/revoke", {}),
-            ("PUT", "/api/admin/v1/billing/accounts/%s/caps" % usera["user_id"],
-             {"soft_cap_nano_cny": None, "hard_cap_nano_cny": None,
-              "version": 1}),
-            ("POST", "/api/admin/v1/billing/adjustments",
-             {"user_id": usera["user_id"], "kind": "grant",
-              "amount_nano_cny": "1", "reason": "x"})):
+            ("POST", "/api/admin/v1/invites/inv_x/revoke", {})):
         r = getattr(c, method.lower())(path, json=body)
         assert r.status_code == 503, "%s %s -> %s" % (method, path, r.status_code)
         assert r.get_json()["error"]["code"] == "pg_backend_required"
-    # 批次 F：turn-budgets 写端点已退役——json 后端同样 410（退役判定先于
-    # PG 守卫，行为与后端无关）
-    for method, path, body in (
-            ("PUT", "/api/admin/v1/turn-budgets",
-             {"platform_turn_limit": 10}),
-            ("POST", "/api/admin/v1/turn-budgets/new-period",
-             {"confirm": True})):
-        r = getattr(c, method.lower())(path, json=body)
-        assert r.status_code == 410, "%s %s -> %s" % (method, path, r.status_code)
-        assert r.get_json()["error"]["code"] == "turn_budgets_retired"
 
 
 # --------------------------------------------------------------------------- #
-# 4. /admin/registration 302 兼容（PR5：独立页删除，重定向一个版本）
 # --------------------------------------------------------------------------- #
-def test_admin_registration_redirects_to_admin_invites():
-    owner, _u = _setup_users()
-    c = _login(_client(), owner)
-    r = c.get("/admin/registration")
-    assert r.status_code == 302
-    assert r.headers["Location"].endswith("/admin#invites")
-    # 匿名仍先走登录闸（_require_auth 页面路径统一 302 /login）
-    assert _client().get("/admin/registration").status_code == 302
-
-
-# --------------------------------------------------------------------------- #
-# 5. billing caps（§9 规则逐条；仅 PG）
-# --------------------------------------------------------------------------- #
-@PG
-def test_caps_unopened_account_404_no_implicit_open():
-    owner, usera = _setup_users()
-    c = _login(_client(), owner)
-    r = c.put("/api/admin/v1/billing/accounts/%s/caps" % usera["user_id"],
-              json={"soft_cap_nano_cny": "100", "hard_cap_nano_cny": "200",
-                    "version": 1})
-    assert r.status_code == 404
-    assert r.get_json()["error"]["code"] == "billing_account_not_found"
-    # 不得伪造开户：账户表仍无行
-    assert _pg_count("billing_accounts", "WHERE user_id=%s",
-                     (usera["user_id"],)) == 0
-    # 用户不存在（区别于未开户）
-    r = c.put("/api/admin/v1/billing/accounts/ghost/caps",
-              json={"soft_cap_nano_cny": "100", "hard_cap_nano_cny": "200",
-                    "version": 1})
-    assert r.status_code == 404
-    assert r.get_json()["error"]["code"] == "user_not_found"
-
-
-@PG
-def test_caps_cas_version_conflict_and_update():
-    owner, usera = _setup_users()
-    c = _login(_client(), owner)
-    acct = billing_store.create_billing_account(usera["user_id"])
-    # 旧 version → 409 version_conflict（不做 last-write-wins）
-    r = c.put("/api/admin/v1/billing/accounts/%s/caps" % usera["user_id"],
-              json={"soft_cap_nano_cny": "1", "hard_cap_nano_cny": "2",
-                    "version": acct["version"] - 1 if acct["version"] > 1 else 99})
-    assert r.status_code == 409
-    assert r.get_json()["error"]["code"] == "version_conflict"
-    # 正确 version → 200 + version 递增 + 新值生效（§5 v0.3：字符串金额）
-    r = c.put("/api/admin/v1/billing/accounts/%s/caps" % usera["user_id"],
-              json={"soft_cap_nano_cny": "1500000000",
-                    "hard_cap_nano_cny": "2000000000",
-                    "version": acct["version"]})
-    assert r.status_code == 200, r.get_json()
-    body = r.get_json()
-    assert body["account"]["version"] == acct["version"] + 1
-    assert body["account"]["soft_spend_cap_nano"] == "1500000000"
-    assert body["balance_nano"] == "0"
-    # null=清除该上限（§9）
-    r = c.put("/api/admin/v1/billing/accounts/%s/caps" % usera["user_id"],
-              json={"soft_cap_nano_cny": None,
-                    "hard_cap_nano_cny": "2000000000",
-                    "version": body["account"]["version"]})
-    assert r.status_code == 200
-    assert r.get_json()["account"]["soft_spend_cap_nano"] is None
-
-
-@PG
-def test_caps_validation_errors():
-    owner, usera = _setup_users()
-    c = _login(_client(), owner)
-    acct = billing_store.create_billing_account(usera["user_id"])
-    # soft > hard → 400
-    r = c.put("/api/admin/v1/billing/accounts/%s/caps" % usera["user_id"],
-              json={"soft_cap_nano_cny": "300", "hard_cap_nano_cny": "200",
-                    "version": acct["version"]})
-    assert r.status_code == 400
-    # 负字符串 / 小数 / 布尔 / 数字型 / 超长 / 缺字段 / 坏 version → 400
-    for body in (
-            {"soft_cap_nano_cny": "-1", "hard_cap_nano_cny": "200",
-             "version": acct["version"]},
-            {"soft_cap_nano_cny": "1.5", "hard_cap_nano_cny": "200",
-             "version": acct["version"]},
-            {"soft_cap_nano_cny": True, "hard_cap_nano_cny": "200",
-             "version": acct["version"]},
-            {"soft_cap_nano_cny": 100, "hard_cap_nano_cny": "200",
-             "version": acct["version"]},
-            {"soft_cap_nano_cny": "1" * 20, "hard_cap_nano_cny": "200",
-             "version": acct["version"]},
-            {"hard_cap_nano_cny": "200", "version": acct["version"]},
-            {"soft_cap_nano_cny": "1", "hard_cap_nano_cny": "200",
-             "version": 0},
-            {"soft_cap_nano_cny": "1", "hard_cap_nano_cny": "200",
-             "version": "3"},
-    ):
-        r = c.put("/api/admin/v1/billing/accounts/%s/caps" % usera["user_id"],
-                  json=body)
-        assert r.status_code == 400, body
-    # 校验失败不产生任何写入或 audit
-    assert _pg_count("audit_events", "WHERE action='billing.caps_update'") == 0
-
-
-@PG
-def test_caps_amount_wire_decimal_string_only():
-    """§5 v0.3（P2）：caps 金额 wire 只接受十进制字符串，JSON number 一律 400。
-
-    错误消息写明「金额须为十进制字符串（防 float 失真）」；19 位内但超出
-    PG BIGINT 的值同样确定性 400（不是 INSERT 500）。
-    """
-    owner, usera = _setup_users()
-    c = _login(_client(), owner)
-    acct = billing_store.create_billing_account(usera["user_id"])
-    url = "/api/admin/v1/billing/accounts/%s/caps" % usera["user_id"]
-    # JSON number（bool 排除后的 int/float）→ 400 + 统一提示
-    for bad in (1_500_000_000, 1.5):
-        r = c.put(url, json={"soft_cap_nano_cny": bad,
-                             "hard_cap_nano_cny": "2000000000",
-                             "version": acct["version"]})
-        assert r.status_code == 400, bad
-        assert "金额须为十进制字符串" in r.get_json()["error"]["message"]
-    # 合法 19 位但溢出 BIGINT → 400（确定性，不进 INSERT）
-    r = c.put(url, json={"soft_cap_nano_cny": "9223372036854775808",
-                         "hard_cap_nano_cny": "9223372036854775808",
-                         "version": acct["version"]})
-    assert r.status_code == 400
-    assert "BIGINT" in r.get_json()["error"]["message"]
-    assert _pg_count("audit_events", "WHERE action='billing.caps_update'") == 0
-
-
-@PG
-def test_caps_audit_same_transaction_rollback(monkeypatch):
-    """强制 audit 失败 → caps 更新随事务回滚（§9：更新与 audit 必须同事务）。"""
-    owner, usera = _setup_users()
-    c = _login(_client(), owner)
-    acct = billing_store.create_billing_account(usera["user_id"])
-
-    def _boom(*a, **k):
-        raise RuntimeError("audit down")
-
-    monkeypatch.setattr(share_store_pg, "record_audit_tx", _boom)
-    r = c.put("/api/admin/v1/billing/accounts/%s/caps" % usera["user_id"],
-              json={"soft_cap_nano_cny": "123", "hard_cap_nano_cny": "456",
-                    "version": acct["version"]})
-    assert r.status_code == 500
-    # caps 未落库（version/值保持原样）→ 证明业务写与 audit 同一事务
-    after = billing_store.get_billing_account_by_user(usera["user_id"])
-    assert after["version"] == acct["version"]
-    assert after["soft_spend_cap_nano"] is None
-
-
-# --------------------------------------------------------------------------- #
-# 6. billing adjustments（§9 + §12.2 Phase B；仅 PG）
-# --------------------------------------------------------------------------- #
-def _adjust(client, body):
-    return client.post("/api/admin/v1/billing/adjustments", json=body)
-
-
-@PG
-def test_adjustment_kind_sign_and_reason_validation():
-    owner, usera = _setup_users()
-    billing_store.create_billing_account(usera["user_id"])
-    c = _login(_client(), owner)
-    uid = usera["user_id"]
-    # kind 符号：grant/topup/refund 必须 >0（400，而非 DB CHECK 的 500）
-    assert _adjust(c, {"user_id": uid, "kind": "grant",
-                       "amount_nano_cny": "-5", "reason": "r"}).status_code == 400
-    assert _adjust(c, {"user_id": uid, "kind": "topup",
-                       "amount_nano_cny": "0", "reason": "r"}).status_code == 400
-    assert _adjust(c, {"user_id": uid, "kind": "refund",
-                       "amount_nano_cny": "-1", "reason": "r"}).status_code == 400
-    # manual_adjustment ≠ 0（正负皆可）
-    assert _adjust(c, {"user_id": uid, "kind": "manual_adjustment",
-                       "amount_nano_cny": "0", "reason": "r"}).status_code == 400
-    # 非法 kind / 非十进制字符串金额
-    assert _adjust(c, {"user_id": uid, "kind": "usage_debit",
-                       "amount_nano_cny": "-5", "reason": "r"}).status_code == 400
-    assert _adjust(c, {"user_id": uid, "kind": "grant",
-                       "amount_nano_cny": "1.5", "reason": "r"}).status_code == 400
-    # reason 必填非空（trim 后 ≥1）
-    for bad in (None, "", "   ", "x" * 501):
-        r = _adjust(c, {"user_id": uid, "kind": "grant",
-                        "amount_nano_cny": "5", "reason": bad})
-        assert r.status_code == 400, repr(bad)
-    # 校验失败零写入
-    assert _pg_count("billing_ledger_entries") == 0
-
-
-@PG
-def test_adjustment_amount_wire_decimal_string_only():
-    """§5 v0.3（P2）：调账金额 wire 只接受十进制字符串，JSON number 一律 400。"""
-    owner, usera = _setup_users()
-    billing_store.create_billing_account(usera["user_id"])
-    c = _login(_client(), owner)
-    uid = usera["user_id"]
-    # JSON number（int/float）/ 缺字段 / 超长字符串 → 400，消息含统一提示
-    for bad in (5_000_000_000, 1.5, None, "9" * 20):
-        body = {"user_id": uid, "kind": "grant", "reason": "r",
-                "idempotency_key": "adj_wire_%r" % (bad,)}
-        if bad is not None:
-            body["amount_nano_cny"] = bad
-        r = _adjust(c, body)
-        assert r.status_code == 400, repr(bad)
-        if isinstance(bad, (int, float)):
-            # JSON number 专属提示（缺失字段走「需为十进制整数字符串」消息）
-            assert "金额须为十进制字符串" in r.get_json()["error"]["message"]
-    # 19 位但溢出 PG BIGINT → 确定性 400（不是 INSERT 500）
-    r = _adjust(c, {"user_id": uid, "kind": "manual_adjustment",
-                    "amount_nano_cny": "-9223372036854775809", "reason": "r",
-                    "idempotency_key": "adj_overflow"})
-    assert r.status_code == 400
-    assert "BIGINT" in r.get_json()["error"]["message"]
-    assert _pg_count("billing_ledger_entries") == 0
-
-
-@PG
-def test_adjustment_grant_auto_opens_account_and_balances():
-    owner, usera = _setup_users()
-    c = _login(_client(), owner)
-    uid = usera["user_id"]
-    # grant：未开户 → 同事务显式开户后入账（§9「首次 grant/topup 显式创建」）
-    r = _adjust(c, {"user_id": uid, "kind": "grant",
-                    "amount_nano_cny": "5000000000", "reason": "新用户体验金",
-                    "idempotency_key": "adj_test_grant_1"})
-    assert r.status_code == 200, r.get_json()
-    body = r.get_json()
-    assert body["duplicate"] is False
-    assert body["entry"]["kind"] == "grant"
-    # §5 v0.3（P2）：金额字段一律十进制字符串
-    assert body["entry"]["amount_nano_cny"] == "5000000000"
-    assert body["balance_nano"] == "5000000000"
-    # topup 追加 + manual_adjustment 可为负
-    assert _adjust(c, {"user_id": uid, "kind": "topup",
-                       "amount_nano_cny": "1000000000",
-                       "reason": "充值",
-                       "idempotency_key": "adj_test_topup_1"}).status_code == 200
-    r = _adjust(c, {"user_id": uid, "kind": "manual_adjustment",
-                    "amount_nano_cny": "-500000000", "reason": "冲正多充",
-                    "idempotency_key": "adj_test_manual_1"})
-    assert r.status_code == 200
-    assert r.get_json()["balance_nano"] == "5500000000"
-    # 余额 = ledger SUM（权威口径）
-    acct = billing_store.get_billing_account_by_user(uid)
-    assert billing_store.account_balance_nano(acct["account_id"]) == 5_500_000_000
-
-
-@PG
-def test_adjustment_refund_requires_existing_account():
-    owner, usera = _setup_users()
-    c = _login(_client(), owner)
-    uid = usera["user_id"]
-    # refund / manual_adjustment 未开户 → 404（不隐式开户）
-    r = _adjust(c, {"user_id": uid, "kind": "refund",
-                    "amount_nano_cny": "100", "reason": "r",
-                    "idempotency_key": "adj_refund_no_acct"})
-    assert r.status_code == 404
-    assert r.get_json()["error"]["code"] == "billing_account_not_found"
-    r = _adjust(c, {"user_id": uid, "kind": "manual_adjustment",
-                    "amount_nano_cny": "-100", "reason": "r",
-                    "idempotency_key": "adj_manual_no_acct"})
-    assert r.status_code == 404
-    assert _pg_count("billing_accounts") == 0
-    # 用户不存在 → user_not_found
-    r = _adjust(c, {"user_id": "ghost", "kind": "grant",
-                    "amount_nano_cny": "1", "reason": "r",
-                    "idempotency_key": "adj_ghost_user"})
-    assert r.status_code == 404
-    assert r.get_json()["error"]["code"] == "user_not_found"
-
-
-@PG
-def test_adjustment_idempotent_replay():
-    owner, usera = _setup_users()
-    c = _login(_client(), owner)
-    uid = usera["user_id"]
-    key = "adj_replay_key_1"
-    r1 = _adjust(c, {"user_id": uid, "kind": "grant",
-                     "amount_nano_cny": "2000000000", "reason": "一次就好",
-                     "idempotency_key": key})
-    assert r1.status_code == 200
-    # UI 语义（PR5 §6.5 修订）：插件在「一次逻辑提交」内生成一个 key，服务端
-    # 已入账但浏览器超时后管理员直接重试（表单未动 → 复用同 key 同载荷），
-    # 必须命中 duplicate 而不是二次入账。
-    r2 = _adjust(c, {"user_id": uid, "kind": "grant",
-                     "amount_nano_cny": "2000000000", "reason": "一次就好",
-                     "idempotency_key": key})
-    assert r2.status_code == 200  # 重放 200（非 4xx）
-    body = r2.get_json()
-    assert body["duplicate"] is True
-    assert body["entry"]["entry_id"] == r1.get_json()["entry"]["entry_id"]
-    # 不重复入账：仍只有一条 entry，余额不变（字符串金额，§5 v0.3）
-    assert _pg_count("billing_ledger_entries") == 1
-    assert body["balance_nano"] == "2000000000"
-    # 同一 key 被其他账户占用 → 409（不是重放）
-    userb = user_store.create_user("userb@x.com", "userpassbb-abcdef",
-                                   role="user")
-    billing_store.create_billing_account(userb["user_id"])
-    r3 = _adjust(c, {"user_id": userb["user_id"], "kind": "grant",
-                     "amount_nano_cny": "5", "reason": "撞 key",
-                     "idempotency_key": key})
-    assert r3.status_code == 409
-    assert r3.get_json()["error"]["code"] == "idempotency_key_conflict"
-    # 同一 key + 同一账户但载荷不同（金额/kind/reason 任一不一致）→ 409：
-    # 真重放必须逐项一致，否则是客户端 bug 或伪造重放，不得静默返回原行
-    for mutated in ({"amount_nano_cny": "3000000000"},
-                    {"kind": "topup"},
-                    {"reason": "换个理由"}):
-        payload = {"user_id": uid, "kind": "grant",
-                   "amount_nano_cny": "2000000000", "reason": "一次就好",
-                   "idempotency_key": key}
-        payload.update(mutated)
-        r4 = _adjust(c, payload)
-        assert r4.status_code == 409, mutated
-        assert r4.get_json()["error"]["code"] == "idempotency_key_conflict"
-    # 冲突请求均未入账：仍只有最初一条 entry
-    assert _pg_count("billing_ledger_entries") == 1
-
-
-@PG
-def test_adjustment_audit_same_transaction_rollback(monkeypatch):
-    """强制 audit 失败 → ledger 入账随事务回滚（§6.5：入账与 audit 同事务）。"""
-    owner, usera = _setup_users()
-    billing_store.create_billing_account(usera["user_id"])
-    c = _login(_client(), owner)
-
-    def _boom(*a, **k):
-        raise RuntimeError("audit down")
-
-    monkeypatch.setattr(share_store_pg, "record_audit_tx", _boom)
-    r = _adjust(c, {"user_id": usera["user_id"], "kind": "grant",
-                    "amount_nano_cny": "7000000000", "reason": "会被回滚",
-                    "idempotency_key": "adj_rollback_1"})
-    assert r.status_code == 500
-    # ledger 无残留（自动开户场景同样适用：开户 + 入账 + audit 同事务）
-    assert _pg_count("billing_ledger_entries") == 0
-    acct = billing_store.get_billing_account_by_user(usera["user_id"])
-    assert billing_store.account_balance_nano(acct["account_id"]) == 0
-    assert _pg_count("audit_events", "WHERE action='billing.adjust'") == 0
-
-
-@PG
-def test_adjustment_requires_caller_generated_idempotency_key():
-    """§6.5 PR5 修订：幂等键必须由调用方生成——缺失/空白一律 400，不代生成。
-
-    服务端代生成会让「已入账 + 浏览器超时 + 重试」以新 key 产出第二笔账，
-    因此这里锁定：缺 key 的合法载荷也绝不入账。
-    """
-    owner, usera = _setup_users()
-    c = _login(_client(), owner)
-    uid = usera["user_id"]
-    billing_store.create_billing_account(uid)
-    # 缺 key / None / 空白 / 全空格 / 超长 → 400 invalid_request（旧版会代生成）
-    for bad in (None, "", "  ", "x" * 129):
-        body = {"user_id": uid, "kind": "topup",
-                "amount_nano_cny": "100", "reason": "r"}
-        if bad is not None:
-            body["idempotency_key"] = bad
-        r = _adjust(c, body)
-        assert r.status_code == 400, repr(bad)
-        assert r.get_json()["error"]["code"] == "invalid_request"
-    assert _pg_count("billing_ledger_entries") == 0
-    # 带调用方生成的 key → 正常入账
-    r = _adjust(c, {"user_id": uid, "kind": "topup", "amount_nano_cny": "100",
-                    "reason": "r", "idempotency_key": "adj_caller_gen_1"})
-    assert r.status_code == 200, r.get_json()
-    assert _pg_count("billing_ledger_entries") == 1
-
-
-@PG
-def test_audit_detail_amounts_serialized_as_decimal_strings():
-    """审计 detail 金额镜像同样字符串化（owner 复审 P2 遗留）。
-
-    >2^53 的金额若以 JSON number 出审计接口，浏览器 JSON.parse 会静默失真
-    （9007199254740993 → 9007199254740992）。锁定：调账的 amount_nano_cny/
-    balance_after_nano 与 caps 的 soft_cap_nano/hard_cap_nano 在
-    /api/admin/v1/audit 出口均为精确十进制字符串。
-    """
-    owner, usera = _setup_users()
-    billing_store.create_billing_account(usera["user_id"])
-    c = _login(_client(), owner)
-    uid = usera["user_id"]
-    big = str(2 ** 53 + 1)  # 9007199254740993：JS number 不可精确表示
-    r = _adjust(c, {"user_id": uid, "kind": "grant", "amount_nano_cny": big,
-                    "reason": "大额精度", "idempotency_key": "adj_big_1"})
-    assert r.status_code == 200, r.get_json()
-    acct = billing_store.get_billing_account_by_user(uid)
-    r = c.put("/api/admin/v1/billing/accounts/%s/caps" % uid,
-              json={"soft_cap_nano_cny": big, "hard_cap_nano_cny": None,
-                    "version": acct["version"]})
-    assert r.status_code == 200, r.get_json()
-
-    r = c.get("/api/admin/v1/audit?limit=50")
-    assert r.status_code == 200
-    items = r.get_json()["items"]
-    adjust_ev = next(e for e in items if e["action"] == "billing.adjust")
-    assert adjust_ev["detail"]["amount_nano_cny"] == big
-    assert isinstance(adjust_ev["detail"]["amount_nano_cny"], str)
-    assert adjust_ev["detail"]["balance_after_nano"] == big
-    caps_ev = next(e for e in items if e["action"] == "billing.caps_update")
-    assert caps_ev["detail"]["soft_cap_nano"] == big
-    assert isinstance(caps_ev["detail"]["soft_cap_nano"], str)
-    # wire 级锁定：原始报文里必须是带引号的字符串形态（不是裸 number；
-    # Flask jsonify 用紧凑分隔符，键值间无空格）
-    assert ('"amount_nano_cny":"%s"' % big) in r.get_data(as_text=True)
-    assert ('"soft_cap_nano":"%s"' % big) in r.get_data(as_text=True)
-
-
 # --------------------------------------------------------------------------- #
 # 7. ai-access（PG）
 # --------------------------------------------------------------------------- #
@@ -768,27 +340,3 @@ def test_invites_revoke_semantics():
     assert r.status_code == 409
 
 
-# --------------------------------------------------------------------------- #
-# 9. turn-budgets 写（批次 F）：已退役（410 turn_budgets_retired + audit）
-# --------------------------------------------------------------------------- #
-@PG
-def test_turn_budgets_write_endpoints_retired():
-    owner, _u = _setup_users()
-    c = _login(_client(), owner)
-    # 任意载荷（含历史合法形态与 confirm）一律 410；不再做字段校验
-    for r in (c.put("/api/admin/v1/turn-budgets", json={"unknown_field": 1}),
-              c.put("/api/admin/v1/turn-budgets",
-                    json={"platform_turn_limit": 10, "user_pool_turn_limit": 20}),
-              c.put("/api/admin/v1/turn-budgets",
-                    json={"platform_turn_limit": 500, "demo_enabled": True}),
-              c.post("/api/admin/v1/turn-budgets/new-period", json={}),
-              c.post("/api/admin/v1/turn-budgets/new-period",
-                     json={"confirm": True})):
-        assert r.status_code == 410, r.get_data(as_text=True)
-        assert r.get_json()["error"]["code"] == "turn_budgets_retired"
-        assert "金额预算" in r.get_json()["error"]["message"]
-    # 退役尝试落 audit；周期行不受影响（冻结历史）
-    actions = [e.get("action") for e in
-               app_mod.share_store.list_audit(limit=20)]
-    assert "turn_budgets.retired_write" in actions
-    assert budget_store.get_current_period()["platform_turn_limit"] == 30

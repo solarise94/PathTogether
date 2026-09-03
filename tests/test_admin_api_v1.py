@@ -136,13 +136,11 @@ def _endpoints(owner_id):
     return [
         "/api/admin/v1/overview",
         "/api/admin/v1/users",
-        "/api/admin/v1/billing/accounts/" + owner_id,
         "/api/admin/v1/billing/usage-events",
         "/api/admin/v1/billing/ledger",
         "/api/admin/v1/billing/provider-balance",
         "/api/admin/v1/billing/provider-balance/refresh",
         "/api/admin/v1/audit",
-        "/api/admin/v1/turn-budgets",
         # 批次 B：金额 policy/window 只读出口（owner-only + PG-only）
         "/api/admin/v1/spend/policies",
         "/api/admin/v1/spend/windows/current",
@@ -195,8 +193,6 @@ def test_json_billing_endpoints_pg_backend_required():
                  "/api/admin/v1/billing/ledger",
                  "/api/admin/v1/billing/provider-balance",
                  "/api/admin/v1/billing/provider-balance/refresh",
-                 "/api/admin/v1/billing/accounts/" + owner["user_id"],
-                 "/api/admin/v1/turn-budgets",
                  "/api/admin/v1/spend/policies",
                  "/api/admin/v1/spend/windows/current",
                  "/api/admin/v1/spend/reconcile"):
@@ -549,34 +545,6 @@ def test_ledger_pagination_readonly():
 
 
 @PG
-def test_account_null_when_not_opened_and_balance_when_opened():
-    owner, _u = _setup_users()
-    c = _login(_client(), owner)
-    # 未开户：account:null（不伪造 0 余额）
-    r = c.get("/api/admin/v1/billing/accounts/" + owner["user_id"])
-    assert r.status_code == 200
-    assert r.get_json() == {"user_id": owner["user_id"],
-                            "account": None, "balance_nano": None}
-    # 开户 + 两条 entry：余额 = ledger 合计
-    account = billing_store.create_billing_account(owner["user_id"])
-    billing_store.append_ledger_entry(
-        account["account_id"], "grant", 5_000_000_000, "adj:grant-1",
-        reason="赠送")
-    billing_store.append_ledger_entry(
-        account["account_id"], "topup", 2_000_000_000, "adj:topup-1",
-        reason="充值")
-    r = c.get("/api/admin/v1/billing/accounts/" + owner["user_id"]).get_json()
-    assert r["account"]["account_id"] == account["account_id"]
-    assert r["account"]["soft_spend_cap_nano"] is None
-    # §5 v0.3（P2）：余额为十进制字符串
-    assert r["balance_nano"] == "7000000000"
-    assert isinstance(r["balance_nano"], str)
-    # 用户不存在 → 404
-    r = c.get("/api/admin/v1/billing/accounts/usr_missing000")
-    assert r.status_code == 404
-
-
-@PG
 def test_users_row_joins_turn_billing_last_call(monkeypatch):
     # 本用例聚焦 users 行联结展示；关闭 PR6 模拟扣费，避免 _seed_event 的
     # priced 事件自动开户/入账改变下方「开户 + 余额」断言的账面（模拟扣费
@@ -613,7 +581,7 @@ def test_users_row_joins_turn_billing_last_call(monkeypatch):
     assert item["login_id_masked"] == "u***@x.com"
     assert item["role"] == "user" and item["enabled"] is True
     assert item["registration_method"] == "manual"  # owner 直接创建
-    # 批次 F：turn_used/turn_limit 已删（用量断言移至 turn-budgets 只读端点）
+    # 批次 F：turn_used/turn_limit 已删（用量口径由 budget_store usage_report 锁定）
     assert "turn_used" not in item and "turn_limit" not in item
     assert item["billing"]["balance_nano"] == "3000000000"
     assert item["billing"]["soft_spend_cap_nano"] is None
@@ -634,42 +602,6 @@ def test_users_row_joins_turn_billing_last_call(monkeypatch):
     # owner 行为 window 形态（绝不出现 total allowance，§4.3 互斥形态）
     assert "total" not in owner_item["spend"]
     assert owner_item["spend"]["window"] is not None
-
-
-@PG
-def test_turn_budgets_readonly_shape():
-    owner, _u = _setup_users()
-    r = _login(_client(), owner).get("/api/admin/v1/turn-budgets")
-    assert r.status_code == 200
-    body = r.get_json()
-    # 批次 F：只读 + legacy 标记（冻结历史）
-    assert body["legacy"] is True
-    assert "退役" in body["note"]
-    assert body["period"]["id"] is not None
-    assert "user_turn_limit" in body["limits"]
-    for key in ("platform", "demo", "owner", "user_pool", "per_user", "own"):
-        assert key in body["usage"]
-    assert scan_sensitive(body) == []
-
-
-@PG
-def test_turn_budgets_write_endpoints_retired_410():
-    """批次 F：PUT / new-period → 410 turn_budgets_retired + audit 尝试。"""
-    owner, _u = _setup_users()
-    c = _login(_client(), owner)
-    r = c.put("/api/admin/v1/turn-budgets", json={"platform_turn_limit": 99})
-    assert r.status_code == 410
-    assert r.get_json()["error"]["code"] == "turn_budgets_retired"
-    assert "金额预算" in r.get_json()["error"]["message"]
-    r2 = c.post("/api/admin/v1/turn-budgets/new-period", json={"confirm": True})
-    assert r2.status_code == 410
-    assert r2.get_json()["error"]["code"] == "turn_budgets_retired"
-    # 退役尝试落 audit
-    actions = [e.get("action") for e in
-               app_mod.share_store.list_audit(limit=20)]
-    assert "turn_budgets.retired_write" in actions
-    # 周期行不受影响（写入口没了，冻结历史不动）
-    assert budget_store.get_current_period()["platform_turn_limit"] == 30
 
 
 @PG

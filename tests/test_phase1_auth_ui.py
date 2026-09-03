@@ -248,21 +248,19 @@ def test_logout_post_without_csrf_rejected():
         assert s.get("auth_user") == "o"
 
 
-def test_logout_get_short_term_compat_with_warning(caplog):
-    """GET /logout 短期兼容仍可退出（已登录），但记录 warning（docs §10.14）。"""
+def test_logout_get_rejected_405(caplog):
+    """GET /logout 已随 R3 wave1 物理删除（CSRF 加固，docs §10.14）：405。"""
     app_mod.AUTH_ENABLED = True
     owner, _u = _setup_owner_and_user()
     client = _raw_client()
     with client.session_transaction() as s:
         s.update({"auth_user": "o", "user_id": owner["user_id"], "role": "owner",
                   "auth_version": owner.get("auth_version", 1)})
-    with caplog.at_level("WARNING"):
-        r = client.get("/logout")
-    assert r.status_code == 302
-    assert r.headers["Location"].endswith("/login")
-    assert any("GET /logout" in rec.getMessage() for rec in caplog.records)
+    r = client.get("/logout")
+    assert r.status_code == 405
+    # session 未被 GET 触碰（登出只能经 POST + CSRF）
     with client.session_transaction() as s:
-        assert not s.get("auth_user")
+        assert s.get("auth_user") == "o"
 
 
 def test_login_success_clears_old_session(monkeypatch):
@@ -505,7 +503,7 @@ def test_register_post_always_rejected_phase1():
 
 
 def test_registration_mode_reads_settings_store(monkeypatch):
-    """/api/admin/users 的 registration_mode 来自 settings_store（PG 权威）。"""
+    """v1 settings 聚合 registration 段的 mode 来自 settings_store（PG 权威）。"""
     app_mod.AUTH_ENABLED = True
     owner, _u = _setup_owner_and_user()
     client = _client()
@@ -517,14 +515,13 @@ def test_registration_mode_reads_settings_store(monkeypatch):
                         lambda environ=None: [])
     monkeypatch.setattr(app_mod.settings_store, "get_registration_mode",
                         lambda: "invite_only")
-    body = client.get("/api/admin/users").get_json()
-    assert body["registration_mode"] == "invite_only"
-    # 旧 UI 兼容字段
+    body = client.get("/api/admin/v1/settings").get_json()["registration"]
+    assert body["mode"] == "invite_only"
     assert body["registration_open"] is True
     monkeypatch.setattr(app_mod.settings_store, "get_registration_mode",
                         lambda: "closed")
-    body2 = client.get("/api/admin/users").get_json()
-    assert body2["registration_mode"] == "closed"
+    body2 = client.get("/api/admin/v1/settings").get_json()["registration"]
+    assert body2["mode"] == "closed"
     assert body2["registration_open"] is False
 
 

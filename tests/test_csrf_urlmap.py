@@ -108,7 +108,7 @@ def test_csrf_traversal_collects_nontrivial_routes():
     paths = {r.rule for r, _m, _p in cases}
     assert len(cases) >= 40, "url_map 遍历收集到的写路由过少：%d" % len(cases)
     for must in ("/api/upload", "/api/uploads", "/api/share/create",
-                 "/api/annotation", "/api/ai/run", "/api/admin/users",
+                 "/api/annotation", "/api/ai/run", "/api/admin/v1/users",
                  "/api/admin/preview/start", "/api/admin/preview/stop",
                  "/api/ai/session/<session_id>/archive"):
         assert must in paths, "缺写路由 %s（遍历断言面不完整）" % must

@@ -366,7 +366,7 @@ def test_ai_access_gate_read_error_fails_closed(monkeypatch):
 
 
 def test_ai_access_admin_api(monkeypatch):
-    """POST /api/admin/users/<id>/ai-access：owner-only + CSRF + 持久化。"""
+    """POST /api/admin/v1/users/<id>/ai-access：owner-only + CSRF + 持久化。"""
     from _pt_helpers import csrf_client
     owner = _mk_owner()
     u, _inv = _redeem_new_user("api-ai@x.com", ai_access=False)
@@ -377,23 +377,23 @@ def test_ai_access_admin_api(monkeypatch):
         s.update({"auth_user": "o", "user_id": owner["user_id"],
                   "role": "owner",
                   "auth_version": owner.get("auth_version", 1)})
-    r = client.post("/api/admin/users/%s/ai-access" % u["user_id"],
+    r = client.post("/api/admin/v1/users/%s/ai-access" % u["user_id"],
                     json={"enabled": True})
     assert r.status_code == 200, r.get_data(as_text=True)
-    assert r.get_json()["ai_access"] is True
+    assert r.get_json()["user"]["ai_access"] is True
     assert user_store.get_user(u["user_id"])["ai_access"] is True
     # 非 owner 403
     c2 = csrf_client(app_mod.app.test_client())
     with c2.session_transaction() as s:
         s.update({"auth_user": "g", "user_id": u["user_id"], "role": "user",
                   "auth_version": u.get("auth_version", 1)})
-    r2 = c2.post("/api/admin/users/%s/ai-access" % u["user_id"],
+    r2 = c2.post("/api/admin/v1/users/%s/ai-access" % u["user_id"],
                  json={"enabled": False})
     assert r2.status_code == 403
 
 
 def test_budget_put_validates_pool_sum():
-    """批次 F：HTTP PUT 已退役（410 turn_budgets_retired）；软闸回退路径的
+    """R3 wave1 起旧 PUT /api/admin/settings/ai-budget 已物理删除；软闸回退路径的
     池拆分校验由 store 原语锁定——周期口径子池（user_pool+owner_reserve）
     之和不可超过 platform；demo_turn_limit 为每日滚动 24h 口径，不参与该
     约束。HTTP 退役行为见 test_ai_budget_wiring。"""
@@ -406,11 +406,6 @@ def test_budget_put_validates_pool_sum():
         s.update({"auth_user": "o", "user_id": owner["user_id"],
                   "role": "owner",
                   "auth_version": owner.get("auth_version", 1)})
-    # 退役端点：410 + 稳定 code（owner 仍先过鉴权）
-    retired = client.put("/api/admin/settings/ai-budget", json={
-        "owner_reserved_turn_limit": 25, "user_pool_turn_limit": 15})
-    assert retired.status_code == 410
-    assert retired.get_json().get("code") == "turn_budgets_retired"
     # store 直连：子池之和越界拒绝（update_period_limits → _validate_limits
     # 之上的关系校验在 app 层 _validate_budget_settings，此处锁 store 级口径）
     with pytest.raises(ValueError):

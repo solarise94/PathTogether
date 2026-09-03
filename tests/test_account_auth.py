@@ -381,7 +381,7 @@ def test_owner_reset_user_password_invalidates_session():
 
     oc = make_client()
     login(oc, "admin", OWNER_PW)
-    r = oc.post("/api/admin/users/%s/password" % u["user_id"],
+    r = oc.post("/api/admin/v1/users/%s/password-reset" % u["user_id"],
                 json={"password": NEW_PW})
     check("owner 重置 user 200", r.status_code == 200, "got %s" % r.status_code)
     check("响应不回显密码", "password" not in json.loads(r.data))
@@ -409,9 +409,9 @@ def test_disable_then_enable_still_invalidates():
 
     oc = make_client()
     login(oc, "admin", OWNER_PW)
-    assert oc.post("/api/admin/users/%s/disable" % u["user_id"]).status_code == 200
+    assert oc.post("/api/admin/v1/users/%s/disable" % u["user_id"]).status_code == 200
     # 禁用期间用户不发请求；直接重新启用（store 层双向递增 auth_version）
-    assert oc.post("/api/admin/users/%s/enable" % u["user_id"]).status_code == 200
+    assert oc.post("/api/admin/v1/users/%s/enable" % u["user_id"]).status_code == 200
     check("enable 后旧 cookie 仍 401（版本不匹配）",
           uc.get("/api/projects").status_code == 401)
     check("重新登录恢复访问", relogin(uc, "u@x.com", USER_PW).status_code == 302
@@ -426,7 +426,7 @@ def test_disable_invalidates_immediately():
     login(uc, "u@x.com", USER_PW)
     oc = make_client()
     login(oc, "admin", OWNER_PW)
-    assert oc.post("/api/admin/users/%s/disable" % u["user_id"]).status_code == 200
+    assert oc.post("/api/admin/v1/users/%s/disable" % u["user_id"]).status_code == 200
     check("禁用后旧 cookie 401", uc.get("/api/projects").status_code == 401)
 
 
@@ -627,11 +627,11 @@ def test_admin_reset_owner_password_409():
     """重置 owner → 409（提示本人改密或 break-glass）。"""
     owner = make_owner("admin", OWNER_PW)
     c = _owner_client()
-    r = c.post("/api/admin/users/%s/password" % owner["user_id"],
+    r = c.post("/api/admin/v1/users/%s/password-reset" % owner["user_id"],
                json={"password": NEW_PW})
     check("重置 owner 409", r.status_code == 409, "got %s" % r.status_code)
     check("文案提示替代路径",
-          "owner" in json.loads(r.data).get("error", ""))
+          "owner" in json.dumps(json.loads(r.data).get("error"), ensure_ascii=False))
     check("owner 密码未被改动",
           user_store.verify_user("admin", OWNER_PW) is not None)
 
@@ -640,9 +640,9 @@ def test_admin_disable_owner_409():
     """禁用 owner → 409；启用 owner 同口径 409。"""
     owner = make_owner("admin", OWNER_PW)
     c = _owner_client()
-    r = c.post("/api/admin/users/%s/disable" % owner["user_id"])
+    r = c.post("/api/admin/v1/users/%s/disable" % owner["user_id"])
     check("禁用 owner 409", r.status_code == 409)
-    r2 = c.post("/api/admin/users/%s/enable" % owner["user_id"])
+    r2 = c.post("/api/admin/v1/users/%s/enable" % owner["user_id"])
     check("启用 owner 409", r2.status_code == 409)
 
 
@@ -663,45 +663,17 @@ def test_admin_create_user_password_policy():
     check("15 位密码可建号", ok is not None and ok.get("login_id") == "n@x.com")
 
 
-def test_admin_users_create_endpoint_retired_410():
-    """review R2-F1：旧建号端点 POST /api/admin/users 无条件 410
-    admin_users_create_deprecated（total 模式下它会建出无 allowance 行的
-    用户）。owner 门控保持在 410 之前：匿名 / 普通 user 仍 403，不向未授权
-    方泄露端点存活性差异（与 user_attribution_retired 同一顺序惯例）。"""
-    make_owner("admin", OWNER_PW)
-    c = _owner_client()
-    r = c.post("/api/admin/users",
-               json={"login_id": "n@x.com", "password": USER_PW})
-    check("owner 请求 410", r.status_code == 410,
-          "got %s" % r.status_code)
-    body = r.get_json()
-    check("稳定 code", body.get("code") == "admin_users_create_deprecated")
-    check("指引新端点", "/api/admin/v1/users" in body.get("error", ""))
-    check("未建号", user_store.get_user_by_login_id("n@x.com") is None)
-    # 门控顺序：410 只给 owner；匿名 401（认证层）、普通 user 403，均先于 410
-    anon = make_client()
-    ra = anon.post("/api/admin/users",
-                   json={"login_id": "a@x.com", "password": USER_PW})
-    check("匿名 401（先于 410）", ra.status_code == 401,
-          "got %s" % ra.status_code)
-    user_store.create_user("u@x.com", USER_PW, role="user")
-    uc = make_client()
-    login(uc, "u@x.com", USER_PW)
-    ru = uc.post("/api/admin/users",
-                 json={"login_id": "b@x.com", "password": USER_PW})
-    check("普通 user 403（先于 410）", ru.status_code == 403,
-          "got %s" % ru.status_code)
-
 
 def test_admin_reset_whitespace_password_400():
     """管理员重置普通用户密码：全空白 400（P2：与创建/CLI 策略一致）。"""
     make_owner("admin", OWNER_PW)
     u = user_store.create_user("u@x.com", USER_PW, role="user")
     c = _owner_client()
-    r = c.post("/api/admin/users/%s/password" % u["user_id"],
+    r = c.post("/api/admin/v1/users/%s/password-reset" % u["user_id"],
                json={"password": " " * 15})
     check("全空白 400", r.status_code == 400, "got %s" % r.status_code)
-    check("全空白文案", "全空白" in json.loads(r.data).get("error", ""))
+    check("全空白文案",
+          "全空白" in json.dumps(json.loads(r.data).get("error"), ensure_ascii=False))
     check("原密码未变", user_store.verify_user("u@x.com", USER_PW) is not None)
 
 
@@ -709,12 +681,12 @@ def test_no_web_endpoint_can_demote_or_delete_owner():
     """不变量锁定：无任何 Web 端点可改 owner 角色或删除用户行（§3.2-5）。"""
     rules = list(app_mod.app.url_map.iter_rules())
     user_rules = [r for r in rules
-                  if r.rule.lower().startswith("/api/admin/users")]
+                  if r.rule.lower().startswith("/api/admin/v1/users")]
     check("存在用户管理端点（供遍历）", len(user_rules) > 0)
     for rule in user_rules:
         # 用户行级端点只允许 password/disable/enable/ai-access 四类操作：
         # 不允许出现 role/delete/remove/demote 等降级/删除语义
-        tail = rule.rule.lower().rsplit("/api/admin/users", 1)[1]
+        tail = rule.rule.lower().rsplit("/api/admin/v1/users", 1)[1]
         forbidden = any(k in tail for k in ("role", "delete", "remove", "demote"))
         check("用户端点 %s 不含降级/删除语义" % rule.rule, not forbidden)
         check("用户端点 %s 无 DELETE 方法" % rule.rule,

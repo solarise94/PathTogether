@@ -5,9 +5,9 @@ ai-money-budget-bugfix-and-simplification-plan.md §5/§6/§8 批次 D/§9.6/§9
 json 模式（无 PG）：
   - 新端点 owner 门控：匿名 401 / user 403 / owner 预览态 403（§14.1 同口径）；
   - PG-only 写端点（spend policies/enforcement-mode/window adjust/
-    spend-override/settings 聚合）稳定 503 pg_backend_required；
-  - 注册模式 v1 路由与旧路由同语义（public 400 / 非法值 400 / invite_only
-    前置条件 400 / GET payload 同构——§5.3「同一 service 不复制校验」）。
+    settings 聚合）稳定 503 pg_backend_required；
+  - 注册模式 v1 PUT 校验（public 400 / 非法值 400 / invite_only 前置条件
+    400；旧路由已随 R3 wave1 删除，service 语义由 v1 独守）。
 
 PG 模式（RUN_PG_TESTS=1）：
   - spend policies PUT：CAS 版本冲突 409 / JSON number 金额 400 / >2^53
@@ -129,14 +129,11 @@ _NEW_ENDPOINTS = (
     ("PUT", "/api/admin/v1/spend/policies/spp_demo_global"),
     ("PUT", "/api/admin/v1/spend/enforcement-mode"),
     ("POST", "/api/admin/v1/spend/windows/spw_x/adjust"),
-    ("PUT", "/api/admin/v1/users/usr_x/spend-override"),
-    ("DELETE", "/api/admin/v1/users/usr_x/spend-override"),
     ("PUT", "/api/admin/v1/spend/users/usr_x/total-limit"),
     ("POST", "/api/admin/v1/spend/users/usr_x/restore-default"),
     ("GET", "/api/admin/v1/spend/demo-stats"),
     ("GET", "/api/admin/v1/site-stats"),
     ("GET", "/api/admin/v1/settings"),
-    ("GET", "/api/admin/v1/settings/registration"),
     ("PUT", "/api/admin/v1/settings/registration"),
 )
 
@@ -193,8 +190,6 @@ def test_new_write_endpoints_require_csrf():
         "/api/admin/v1/spend/enforcement-mode": {"mode": "shadow"},
         "/api/admin/v1/spend/windows/spw_x/adjust":
             {"limit_nano_snapshot": "1000", "version": 1, "confirm": True},
-        "/api/admin/v1/users/usr_x/spend-override":
-            {"monthly_limit_nano_cny": "1000"},
         "/api/admin/v1/settings/registration": {"mode": "closed"},
         "/api/admin/v1/users": {"login_id": "x@y.com",
                                 "password": "password-123456"},
@@ -226,15 +221,6 @@ def test_json_backend_new_spend_endpoints_503():
         assert r.status_code == 503, "%s %s -> %s" % (method, path,
                                                       r.status_code)
         assert r.get_json()["error"]["code"] == "pg_backend_required"
-    # 已退役端点在 pg 检查**之前**即 410（两个后端一致的退役语义）
-    for method, path, body in (
-            ("PUT", "/api/admin/v1/users/usr_x/spend-override",
-             {"monthly_limit_nano_cny": "1"}),
-            ("DELETE", "/api/admin/v1/users/usr_x/spend-override", None)):
-        r = c.open(path, method=method, json=body)
-        assert r.status_code == 410, "%s %s -> %s" % (method, path,
-                                                      r.status_code)
-        assert r.get_json()["error"]["code"] == "spend_override_deprecated"
     # settings 聚合在 json 后端分段标记（注册段真实；spend/runtime 不可用）
     r = c.get("/api/admin/v1/settings")
     assert r.status_code == 200
@@ -246,40 +232,24 @@ def test_json_backend_new_spend_endpoints_503():
 
 
 # --------------------------------------------------------------------------- #
-# 2. 注册模式：v1 与旧路由同一 service（§5.3）
+# 2. 注册模式：v1 settings/registration PUT（旧路由已随 R3 wave1 删除）
 # --------------------------------------------------------------------------- #
-def test_registration_v1_get_payload_matches_legacy_shape():
+def test_registration_v1_put_validates():
     owner, _u = _setup_users()
     c = _login(_client(), owner)
-    v1 = c.get("/api/admin/v1/settings/registration").get_json()
-    old = c.get("/api/admin/settings/registration").get_json()
-    assert v1 == old
-    assert v1["supported_modes"] == ["closed", "invite_only"]
-    assert v1["mode"] == v1["stored_mode"]
-
-
-def test_registration_v1_put_validates_like_legacy():
-    owner, _u = _setup_users()
-    c = _login(_client(), owner)
-    # public 一律 400（v1 与旧路由同 code）
+    # public 一律 400
     r1 = c.put("/api/admin/v1/settings/registration", json={"mode": "public"})
     assert r1.status_code == 400
     assert r1.get_json()["error"]["code"] == "public_registration_not_supported"
-    r1b = c.put("/api/admin/settings/registration", json={"mode": "public"})
-    assert r1b.status_code == 400
-    assert r1b.get_json()["code"] == "public_registration_not_supported"
     # 非法值 400
     assert c.put("/api/admin/v1/settings/registration",
                  json={"mode": "oops"}).status_code == 400
     # json 后端 invite_only 前置条件不满足 → 400（PG 模式同理：PUBLIC_BASE_URL
-    # 非 https）；两路由错误一致
+    # 非 https）
     r2 = c.put("/api/admin/v1/settings/registration",
                json={"mode": "invite_only"})
-    r2b = c.put("/api/admin/settings/registration",
-                json={"mode": "invite_only"})
-    assert r2.status_code == r2b.status_code == 400
+    assert r2.status_code == 400
     assert "前置条件" in r2.get_json()["error"]["message"]
-    assert "前置条件" in r2b.get_json()["error"]
 
 
 @PG
@@ -493,23 +463,15 @@ def test_window_adjust_lower_than_spent_rejects_next_reserve():
 
 # --------------------------------------------------------------------------- #
 # 6. 用户一次性总额度 PUT/restore-default（Batch B wave 2，§Batch B API/bridge
-#    契约）；旧月额度覆盖端点 → 410 spend_override_deprecated
+#    契约）；旧月额度覆盖端点已随 R3 wave1 物理删除
 # --------------------------------------------------------------------------- #
 @PG
-def test_user_total_limit_set_restore_and_old_override_retired():
+def test_user_total_limit_set_and_restore():
     bh.seed_spend_policies()
     # cutover 后形态（target=total_allowance）：user 走互斥 total 形态
     bh.set_user_spend_target("total_allowance")
     owner, usera = _setup_users()
     c = _login(_client(), owner)
-    # 旧月额度覆盖端点已退役：任意载荷一律 410 spend_override_deprecated
-    base_old = "/api/admin/v1/users/%s/spend-override" % usera["user_id"]
-    r_old = c.put(base_old, json={"monthly_limit_nano_cny": "100"})
-    assert r_old.status_code == 410
-    assert r_old.get_json()["error"]["code"] == "spend_override_deprecated"
-    assert "total-limit" in r_old.get_json()["error"]["message"]
-    assert c.delete(base_old).status_code == 410
-
     # 建号带初始总额度（同一事务建行）
     r = c.post("/api/admin/v1/users", json={
         "login_id": "total@x.com", "password": "password-123456",

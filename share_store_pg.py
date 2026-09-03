@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """切片分享 —— 共享存储层 PostgreSQL 后端实现（Stage 3b-2）。
 
-逐函数对照 `share_store_json` 语义移植（44 个公共名全实现 + 稳定 slide 身份）。
+逐函数对照 JSON 实现语义移植（44 个公共名全实现 + 稳定 slide 身份；共有常量/纯
+函数取自 IO-free 的 `share_shared`）。
 调用方仍经 `share_store` dispatcher 访问（`STORAGE_BACKEND=postgres` 时 re-export
 本模块），app.py / share_server.py / tests 一行不改。
 
@@ -40,7 +41,8 @@ import uuid
 import psycopg
 
 import pg_store
-from share_store_json import (
+from share_shared import (
+    ADMIN_TOKEN,
     DEFAULT_PERMISSIONS,
     PERMISSION_VIEW,
     PERMISSION_ANNOTATE,
@@ -101,11 +103,11 @@ SHARE_FILE = None
 # 兼容测试里 `SHARE_FILE.write_text(...)` 等文件调用：PG 后端这些测试会被标记跳过，
 # 故这里保持 None 即可（见 tests/pg_compat.json_only）。
 
-# 常量（re-export 自 json impl，dispatcher 公共名需要）
+# 常量（re-export 自 share_shared，dispatcher 公共名需要）
 ROI_TYPES = ROI_TYPES
 ALLOWED_ROI_SIZES = ALLOWED_ROI_SIZES
 DEFAULT_ROI_SIZES = DEFAULT_ROI_SIZES
-ADMIN_TOKEN = "admin"
+ADMIN_TOKEN = ADMIN_TOKEN
 PERMISSION_VIEW = PERMISSION_VIEW
 PERMISSION_ANNOTATE = PERMISSION_ANNOTATE
 PERMISSION_DOWNLOAD = PERMISSION_DOWNLOAD

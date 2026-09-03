@@ -193,6 +193,19 @@ def test_user_store_export_matches_json_impl():
     assert set(user_store._JSON_PUBLIC_NAMES) == declared
 
 
+def test_share_store_pg_has_no_json_import():
+    """PG 后端不得再拉入 json 实现（r3 wave3 拆分验收）。
+
+    源码级断言：share_store_pg.py 全文不得出现 `share_store_json`（import 语句、
+    注释、docstring 一概不许），否则 import 期会执行 json 模块（mkdir
+    SHARE_DATA_DIR 等 IO）。import 语句不可见（ImportFrom 不被 AST 计数），故
+    用源码字符串精确匹配。
+    """
+    src = (_REPO_ROOT / "share_store_pg.py").read_text(encoding="utf-8")
+    assert "share_store_json" not in src
+    assert "from share_shared import" in src
+
+
 # --------------------------------------------------------------------------- #
 # 4. STORAGE_BACKEND 非法值 import 期报错
 # --------------------------------------------------------------------------- #

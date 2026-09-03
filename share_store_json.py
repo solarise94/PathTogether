@@ -26,6 +26,45 @@ from pathlib import Path
 
 import locked_atomic_json
 
+from share_shared import (
+    ROI_TYPES,
+    ALLOWED_ROI_SIZES,
+    DEFAULT_ROI_SIZES,
+    ADMIN_TOKEN,
+    PERMISSION_VIEW,
+    PERMISSION_ANNOTATE,
+    PERMISSION_DOWNLOAD,
+    DEFAULT_PERMISSIONS,
+    _PERMISSION_ALL,
+    _normalize_permissions,
+    _share_permissions,
+    _grant_permissions_of,
+    _cap_claim_permissions,
+    _reject_guest_write,
+    _roi_shared_compat,
+    _normalize_roi_sizes,
+    _share_roi_sizes,
+    _is_finite_num,
+    _is_active,
+    _status_of,
+    _grant_out,
+    _validate_geom,
+    _clean_note,
+    _clean_comment_body,
+    _norm_label,
+    _hash_installation_secret,
+    _installation_out,
+)
+# AST 公共名扫描（test_backend_dispatch）只认 Assign，须再绑一次
+ROI_TYPES = ROI_TYPES
+ALLOWED_ROI_SIZES = ALLOWED_ROI_SIZES
+DEFAULT_ROI_SIZES = DEFAULT_ROI_SIZES
+ADMIN_TOKEN = ADMIN_TOKEN
+PERMISSION_VIEW = PERMISSION_VIEW
+PERMISSION_ANNOTATE = PERMISSION_ANNOTATE
+PERMISSION_DOWNLOAD = PERMISSION_DOWNLOAD
+DEFAULT_PERMISSIONS = DEFAULT_PERMISSIONS
+
 # 数据目录与文件路径
 SHARE_DATA_DIR = Path(
     os.environ.get("SHARE_DATA_DIR") or (Path.home() / "svs-viewer" / "share-data")
@@ -50,18 +89,6 @@ _EMPTY = {
     # Stage 4-1a：run grant（起跑授权，slide 级、默认 2h、可撤销；无 org，docs §7.6）
     "run_grants": [],
 }
-
-# 支持的标注类型
-ROI_TYPES = ("rect", "arrow", "freehand")
-
-# 分享可选的 ROI 矩形标记尺寸（mm），以 float 存储为子集
-ALLOWED_ROI_SIZES = (6.0, 6.5)
-# 默认标记尺寸子集（未指定时）
-DEFAULT_ROI_SIZES = [6.0, 6.5]
-
-# 管理员标注使用的固定 token
-ADMIN_TOKEN = "admin"
-
 
 # --------------------------------------------------------------------------- #
 # Stage 3c-1：revision CAS（并发编辑不静默覆盖）
@@ -104,89 +131,7 @@ class ShareStoreUnavailable(Exception):
 
 
 # --------------------------------------------------------------------------- #
-# Stage 3a-2a：分享权限档位与认领（docs §5.4）
-#
-# 分享权限三档：view / annotate / download。旧分享无 permissions 字段时一律视为
-# ["view","annotate"]（严格等价旧行为：分享页本来就能看能标，不能下载切片文件）。
-# download 控制未来文件下载端点；本节点只落地字段 + 在标注写入端点判定 annotate。
-# --------------------------------------------------------------------------- #
-PERMISSION_VIEW = "view"
-PERMISSION_ANNOTATE = "annotate"
-PERMISSION_DOWNLOAD = "download"
-_PERMISSION_ALL = (PERMISSION_VIEW, PERMISSION_ANNOTATE, PERMISSION_DOWNLOAD)
-# 旧分享 / 未指定时的默认权限（等价拆分前的"能看就能标"）
-DEFAULT_PERMISSIONS = [PERMISSION_VIEW, PERMISSION_ANNOTATE]
-
-
-def _normalize_permissions(perms):
-    """归一化分享权限档位：返回去重保序的合法子集 list。
-
-    None 或空 → DEFAULT_PERMISSIONS（["view","annotate"]，等价旧行为）。
-    非数组 / 含非法值抛 ValueError。
-    """
-    if perms is None:
-        return list(DEFAULT_PERMISSIONS)
-    if not isinstance(perms, list):
-        raise ValueError("permissions 需为数组")
-    if not perms:
-        return list(DEFAULT_PERMISSIONS)
-    out = []
-    for p in perms:
-        if p not in _PERMISSION_ALL:
-            raise ValueError("permissions 仅支持 view/annotate/download")
-        if p not in out:
-            out.append(p)
-    return out
-
-
-def _share_permissions(share):
-    """从 share dict 读取归一化权限；旧分享无该字段时返回默认 view+annotate。"""
-    perms = share.get("permissions") if isinstance(share, dict) else None
-    if not isinstance(perms, list) or not perms:
-        return list(DEFAULT_PERMISSIONS)
-    # 兜底过滤脏数据（未知值剔除后为空则回默认）
-    clean = [p for p in perms if p in _PERMISSION_ALL]
-    return clean if clean else list(DEFAULT_PERMISSIONS)
-
-
-def _grant_permissions_of(g):
-    """grant.permissions；旧 grant 无该字段时等同 DEFAULT（view+annotate）。"""
-    perms = g.get("permissions") if isinstance(g, dict) else None
-    if not isinstance(perms, list) or not perms:
-        return list(DEFAULT_PERMISSIONS)
-    clean = [p for p in perms if p in _PERMISSION_ALL]
-    return clean if clean else list(DEFAULT_PERMISSIONS)
-
-
-def _cap_claim_permissions(requested, allowed):
-    """认领权限必须是分享权限的子集。None/空 → 使用分享权限（而非全局 DEFAULT）。"""
-    allowed = list(allowed)
-    if requested is None or requested == []:
-        return allowed
-    if not isinstance(requested, list):
-        raise ValueError("permissions 需为数组")
-    out = []
-    for p in requested:
-        if p not in _PERMISSION_ALL:
-            raise ValueError("permissions 仅支持 view/annotate/download")
-        if p not in allowed:
-            raise ValueError("permissions 超出分享权限")
-        if p not in out:
-            out.append(p)
-    return out if out else allowed
-
-
-def _reject_guest_write(requester_role):
-    """仓储边界（docs §5.1.1）：显式传 guest 角色时拒绝图库写操作。
-
-    requester_role 默认 None = 内部调用（如 share_server 的 /s/* 标注流程、
-    internal AI 回调）不限制；显式传 "guest"（== user_store.ROLE_GUEST）时 raise
-    PermissionError。app.py 调用处传入当前 role，作为应用层之外的 defense-in-depth。
-    """
-    if requester_role == "guest":
-        raise PermissionError("guest 无权进行图库写操作")
-
-# 数据归属（Stage 3a 身份基础）：懒迁移用「首个 owner 的 user_id」。
+# Stage 3c-1：revision CAS（并发编辑不静默覆盖）
 # 由 app.py 在启动（owner 引导）后调用 set_owner_user_id() 注入；share_server.py
 # 不注入（保持其读路径无归属迁移）。_ensure_owner_refs 在 _load_locked 中对
 # projects/slide_meta/rois 补 owner_user_id 字段（本节点只落地字段，不做按字段
@@ -222,73 +167,6 @@ def _ensure_owner_refs(data):
             roi["owner_user_id"] = _OWNER_USER_ID
             migrated = True
     return migrated
-
-
-def _roi_shared_compat(roi):
-    """读取 roi 的 shared 字段并做旧数据兼容。
-
-    缺失 "shared" 字段时：
-      - token == "admin" 视为 True（管理员标注此前对分享用户全可见，保持不突变）
-      - 其他用户 token 视为 False（此前对其他用户本就不可见）
-    存在但非布尔时按真值判断；最终统一返回 bool。
-    """
-    if not isinstance(roi, dict):
-        return False
-    if "shared" in roi:
-        return bool(roi.get("shared"))
-    # 旧数据兼容
-    return roi.get("token") == ADMIN_TOKEN
-
-
-def _normalize_roi_sizes(roi_sizes):
-    """校验并归一化 roi_sizes：统一转 float，去重保序，且必须是
-    ALLOWED_ROI_SIZES 的子集。返回 list[float]；非法抛 ValueError。
-    None 时返回 DEFAULT_ROI_SIZES 的副本。
-    """
-    if roi_sizes is None:
-        return list(DEFAULT_ROI_SIZES)
-    if not isinstance(roi_sizes, (list, tuple)):
-        raise ValueError("roi_sizes 需为数组")
-    allowed = set(ALLOWED_ROI_SIZES)
-    out = []
-    seen = set()
-    for s in roi_sizes:
-        if isinstance(s, bool) or not isinstance(s, (int, float)):
-            raise ValueError("roi_sizes 元素需为数值")
-        import math
-        if not math.isfinite(float(s)):
-            raise ValueError("roi_sizes 元素需为有限数值")
-        v = float(s)
-        if v not in allowed:
-            raise ValueError("roi_sizes 仅允许 6 或 6.5")
-        if v not in seen:
-            seen.add(v)
-            out.append(v)
-    if not out:
-        raise ValueError("roi_sizes 不能为空")
-    return out
-
-
-def _share_roi_sizes(share):
-    """从 share dict 读取归一化的 roi_sizes；旧分享无该字段时返回默认。"""
-    rs = share.get("roi_sizes") if isinstance(share, dict) else None
-    if not isinstance(rs, list) or not rs:
-        return list(DEFAULT_ROI_SIZES)
-    # 兜底过滤：脏数据（非数字/越界）统一回默认
-    try:
-        return _normalize_roi_sizes(rs)
-    except ValueError:
-        return list(DEFAULT_ROI_SIZES)
-
-
-def _is_finite_num(v):
-    """判断 v 是否为有限数值（int/float，非 NaN/Inf）。"""
-    if isinstance(v, bool):
-        return False
-    if not isinstance(v, (int, float)):
-        return False
-    import math
-    return math.isfinite(v)
 
 
 #: 顶层容器字段的合法类型（shape 校验；缺失字段仍按 setdefault 兼容旧文件，
@@ -673,16 +551,6 @@ def create_share(slides, expires_hours, roi_sizes=None, permissions=None,
     return _with_lock("r+", _do)
 
 
-def _is_active(share):
-    """判断 share dict 是否仍有效（未撤销且未过期）。"""
-    if share.get("revoked"):
-        return False
-    exp = share.get("expires_at")
-    if exp is not None and exp < time.time():
-        return False
-    return True
-
-
 def get_share(token):
     """获取有效分享；不存在/已撤销/已过期返回 None。
 
@@ -702,15 +570,6 @@ def get_share(token):
         return out
 
     return _with_lock("r+", _do)
-
-
-def _status_of(share):
-    if share.get("revoked"):
-        return "revoked"
-    exp = share.get("expires_at")
-    if exp is not None and exp < time.time():
-        return "expired"
-    return "active"
 
 
 def list_shares():
@@ -754,14 +613,6 @@ def revoke_share(token):
 # share 被撤销/过期后 grant 自动失效（判定时检查 share active，见
 # claimed_active_slides_for_user）。
 # --------------------------------------------------------------------------- #
-def _grant_out(g):
-    """导出 grant 副本（确保字段齐全）。"""
-    out = dict(g)
-    out.setdefault("permissions", list(DEFAULT_PERMISSIONS))
-    out.setdefault("revoked_at", None)
-    return out
-
-
 def claim_share(token, user_id, permissions=None):
     """user 认领分享链接（幂等）。
 
@@ -873,103 +724,6 @@ def list_grants_for_user(user_id):
         return out
 
     return _with_lock("r+", _do)
-
-
-def _validate_geom(typ, geom):
-    """校验几何字段，返回归一化后的几何 dict（不含 type/label/token/slide/ts）。
-
-    - rect：x, y, side_px, size_mm（side_px 1~40000）
-    - arrow：x1, y1, x2, y2（两端点距离 > 0）
-    - freehand：points: [[x,y],...]（3~500 点，坐标 ≥0 且有限）
-    坐标均要求 ≥0 且数值有限；x/y/side_px 等兼容字段据此计算。
-    校验失败抛 ValueError。
-    """
-    if typ == "rect":
-        x = geom.get("x")
-        y = geom.get("y")
-        side_px = geom.get("side_px")
-        size_mm = geom.get("size_mm")
-        if not (_is_finite_num(x) and _is_finite_num(y) and _is_finite_num(side_px)):
-            raise ValueError("几何参数需为数值")
-        x = int(x); y = int(y)
-        side_px = int(side_px)
-        if x < 0 or y < 0:
-            raise ValueError("坐标需 ≥0")
-        if side_px < 1 or side_px > 40000:
-            raise ValueError("side_px 需在 1~40000 之间")
-        size_mm_v = float(size_mm) if _is_finite_num(size_mm) else 0.0
-        return {
-            "type": "rect",
-            "x": x, "y": y,
-            "side_px": side_px,
-            "size_mm": size_mm_v,
-        }
-
-    if typ == "arrow":
-        x1 = geom.get("x1"); y1 = geom.get("y1")
-        x2 = geom.get("x2"); y2 = geom.get("y2")
-        if not all(_is_finite_num(v) for v in (x1, y1, x2, y2)):
-            raise ValueError("几何参数需为数值")
-        x1 = int(x1); y1 = int(y1); x2 = int(x2); y2 = int(y2)
-        if any(v < 0 for v in (x1, y1, x2, y2)):
-            raise ValueError("坐标需 ≥0")
-        dist2 = (x1 - x2) ** 2 + (y1 - y2) ** 2
-        if dist2 <= 0:
-            raise ValueError("箭头两端点不能重合")
-        # 中点存 x/y，side_px 留 0（兼容旧查询，无意义）
-        cx = (x1 + x2) // 2
-        cy = (y1 + y2) // 2
-        return {
-            "type": "arrow",
-            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-            "x": cx, "y": cy,
-            "side_px": 0,
-            "size_mm": 0.0,
-        }
-
-    if typ == "freehand":
-        pts = geom.get("points")
-        if not isinstance(pts, list) or len(pts) < 3 or len(pts) > 500:
-            raise ValueError("描图需 3~500 个点")
-        clean = []
-        for p in pts:
-            if (not isinstance(p, (list, tuple))) or len(p) != 2:
-                raise ValueError("points 元素需为 [x,y]")
-            px, py = p
-            if not (_is_finite_num(px) and _is_finite_num(py)):
-                raise ValueError("坐标需为数值")
-            px = int(px); py = int(py)
-            if px < 0 or py < 0:
-                raise ValueError("坐标需 ≥0")
-            clean.append([px, py])
-        xs = [p[0] for p in clean]
-        ys = [p[1] for p in clean]
-        minx = min(xs); miny = min(ys)
-        side = max(max(xs) - minx, max(ys) - miny)
-        return {
-            "type": "freehand",
-            "points": clean,
-            "x": minx, "y": miny,
-            "side_px": int(side),
-            "size_mm": 0.0,
-        }
-
-    raise ValueError("未知标注类型")
-
-
-def _clean_note(note):
-    """归一化备注文本：非 str 视为空串；strip 后长度 ≤ 500，否则抛 ValueError。
-
-    None → ""；非字符串 → ""。返回清洗后的字符串。
-    """
-    if note is None:
-        return ""
-    if not isinstance(note, str):
-        return ""
-    n = note.strip()
-    if len(n) > 500:
-        raise ValueError("备注过长")
-    return n
 
 
 def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note="", visitor=None,
@@ -1496,18 +1250,6 @@ def list_shared_rois_for_slides(slides):
 # created_at/updated_at、change_seq（变更流用）。
 # 增删 bump change_seq（per-slide 计数器，同 rois），list_changes 以 type=comment 返回。
 # --------------------------------------------------------------------------- #
-def _clean_comment_body(body):
-    """归一化评论正文：非 str → ""；strip 后 ≤2000，否则抛 ValueError。"""
-    if body is None:
-        return ""
-    if not isinstance(body, str):
-        return ""
-    b = body.strip()
-    if len(b) > 2000:
-        raise ValueError("评论正文过长（≤2000 字）")
-    return b
-
-
 def add_comment(annotation_id, slide, token, body, author_user_id=None,
                 author_label="", parent_id=None, requester_role=None):
     """新增评论；返回 comment dict（含 comment_id/change_seq）。
@@ -1923,13 +1665,6 @@ def archived_slide_names():
 # --------------------------------------------------------------------------- #
 # 标注（annotations）汇总 —— 把 rois 按 slide/label 聚合，供管理员查看
 # --------------------------------------------------------------------------- #
-def _norm_label(label):
-    """读旧 roi 缺 label 时视为「未署名」。"""
-    if isinstance(label, str) and label.strip():
-        return label.strip()
-    return "未署名"
-
-
 def annotations_by_slide():
     """把全部 rois 按 slide 分组聚合。
 
@@ -2126,25 +1861,6 @@ def list_audit(limit=50, offset=0, action=None):
 # 本实体是平台运行时状态，但 json 仍是默认后端（AUTH_ENABLED=False 内网零
 # 依赖红线），故与 pg 双实现（见 share_store_pg / migrations/0005_plugin.sql）。
 # --------------------------------------------------------------------------- #
-def _hash_installation_secret(secret: str) -> str:
-    """安装凭证明文 → sha256 hex（存储形态）。"""
-    return hashlib.sha256((secret or "").encode("utf-8")).hexdigest()
-
-
-def _installation_out(row: dict) -> dict:
-    """installation 导出副本：剥离 secret_hash（hash 不出存储层）。
-
-    capabilities（插件能力注册表，docs §4.1）缺省补 []——旧安装行没有该字段，
-    读侧一律拿到 list（兼容 0011 迁移前的旧行）。
-    """
-    out = dict(row)
-    out.pop("secret_hash", None)
-    out["enabled"] = bool(row.get("enabled"))
-    caps = out.get("capabilities")
-    out["capabilities"] = [c for c in caps if isinstance(c, dict)] if isinstance(caps, list) else []
-    return out
-
-
 def create_plugin_installation(plugin_id, version="", secret=None,
                                capabilities=None):
     """创建插件安装行，返回 {**installation, "secret": 明文}（仅此一次）。

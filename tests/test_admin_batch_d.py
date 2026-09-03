@@ -72,6 +72,13 @@ def _isolated(tmp_path, monkeypatch):
     """每用例独立存储 + AUTH_ENABLED=True（owner 门控有真实意义）。"""
     isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
+    if BACKEND == "postgres":
+        # review R2-F2：PG 上建号/兑换统一走「维护闸 + 开通锁」组合原语，
+        # 闸 fail-closed（platform_settings 缺 ai_dispatch_maintenance 即
+        # 拒绝）。conftest TRUNCATE 清掉 0029 种子，每用例幂等重放
+        # （target=window + 闸=false）；需要其他 target 的用例在用例体内
+        # 再 bh.set_user_spend_target 覆盖。
+        bh.seed_spend_settings()
     yield
 
 
@@ -679,10 +686,16 @@ def test_users_create_without_limit_inherits_default():
 @PG
 def test_users_list_spend_total_mode_missing_row_reports_stable_error():
     """target=total_allowance 且无 allowance 行 → 互斥形态的稳定 error code
-    （spend_total_allowance_missing），不拖垮整页。"""
+    （spend_total_allowance_missing），不拖垮整页。
+
+    review R2-F2 后「无行 user」的合法构造法：先在 window（cutover 前）建
+    用户、再切 total——R2 单轨化后建号在 total 模式缺默认时直接 fail-closed
+    拒绝（绝不建出无额度行的用户），旧「先切 total 再经 legacy 旁路建无行
+    用户」的前置构造已不存在。这也正是生产 cutover 的时序：切 target 时
+    存量用户尚无 allowance 行。"""
     bh.seed_spend_policies()
-    bh.set_user_spend_target("total_allowance")
     owner, usera = _setup_users()
+    bh.set_user_spend_target("total_allowance")
     c = _login(_client(), owner)
     items = c.get("/api/admin/v1/users").get_json()["items"]
     by_id = {u["user_id"]: u for u in items}

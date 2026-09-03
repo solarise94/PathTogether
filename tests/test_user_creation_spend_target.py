@@ -200,7 +200,12 @@ def test_total_target_without_any_default_rejected_and_rolled_back():
 def test_window_target_explicit_limit_creates_override_not_allowance():
     """window 模式（cutover 前）+ 显式 X → **不建** allowance 行；建等值
     user_override 过渡策略（calendar_month），如实展示现行授权面。"""
-    bh.seed_spend_policies()   # target 不 seed = window（缺省回退）
+    bh.seed_spend_policies()
+    # review R2-F2：建号入口接 cutover 维护闸（fail-closed，缺键即拒绝），
+    # 「缺键回退 window」不再能经建号端到端观察（闸先拒绝）——target=window
+    # 由 0029 种子显式固定；缺键/开闸的 fail-closed 行为见
+    # tests/test_provisioning_lock.py（维护闸矩阵）
+    bh.seed_spend_settings()
     user, allowance = user_store_pg.create_user_with_total_allowance(
         "window-x@x.com", "password-123456",
         total_limit_nano_cny=7 * 10 ** 9)
@@ -223,6 +228,7 @@ def test_window_target_explicit_limit_creates_override_not_allowance():
 def test_window_target_without_limit_creates_no_spend_surface():
     """window 模式 + 无 X → 无 allowance、无 override（不造 dormant 行）。"""
     bh.seed_spend_policies()
+    bh.seed_spend_settings()   # target=window（0029 种子；见 R2-F2 维护闸说明）
     user, allowance = user_store_pg.create_user_with_total_allowance(
         "window-plain@x.com", "password-123456")
     assert allowance is None
@@ -280,6 +286,7 @@ def test_redeem_window_target_with_limit_creates_override_not_allowance():
     """兑换 window 模式带模板面值 → 不建 allowance；建等值 user_override
     过渡策略；返回 spend_override_policy 如实带面值（原恒 None 占位复用）。"""
     bh.seed_spend_policies()
+    bh.seed_spend_settings()   # 兑换同接维护闸（R2-F2）；target=window 种子
     owner = _mk_owner()
     inv = registration_store.create_invite(
         owner["user_id"], login_id="r-window@x.com",

@@ -478,17 +478,19 @@ def test_admin_users_owner_vs_user(monkeypatch):
     check("返回 users 数组", isinstance(body.get("users"), list))
     check("返回 registration_open", "registration_open" in body)
     check("list 不含 hash", all("password_hash" not in u for u in body["users"]))
-    # 创建 user
-    r2 = client.post("/api/admin/users", json={"login_id": "new@x.com", "password": PW2})
+    # 创建 user（旧建号端点已 410 退役，review R2-F1——创建契约迁至
+    # POST /api/admin/v1/users，响应包 user 键；最小改动：仅换端点与解包）
+    r2 = client.post("/api/admin/v1/users", json={"login_id": "new@x.com", "password": PW2})
     check("owner 创建用户 200", r2.status_code == 200)
-    check("新用户 role=user", json.loads(r2.data).get("role") == "user")
+    check("新用户 role=user",
+          (json.loads(r2.data).get("user") or {}).get("role") == "user")
     check("创建响应无 email 键（批次 C）",
           "email" not in json.loads(r2.data))
     # 冲突
-    r3 = client.post("/api/admin/users", json={"login_id": "u@x.com", "password": PW2})
+    r3 = client.post("/api/admin/v1/users", json={"login_id": "u@x.com", "password": PW2})
     check("创建冲突 409", r3.status_code == 409, "got %s" % r3.status_code)
-    # 短密码（store 层 15..200 统一策略；app 层 8 位旧校验也仍拦）
-    r4 = client.post("/api/admin/users", json={"login_id": "s@x.com", "password": "short"})
+    # 短密码（store 层 15..200 统一策略；v1 端点同样拦）
+    r4 = client.post("/api/admin/v1/users", json={"login_id": "s@x.com", "password": "short"})
     check("短密码创建 400", r4.status_code == 400)
 
     # user 角色登录 → 403

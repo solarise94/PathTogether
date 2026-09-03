@@ -37,6 +37,7 @@ import app as app_mod  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 from _pt_helpers import csrf_client, install_json_login_limits, isolate_app, FakeRequests # noqa: E402
+from pg_compat import BACKEND  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +50,12 @@ def _isolate(tmp_path, monkeypatch):
     for child in up_dir.iterdir():
         if child.is_file():
             child.unlink()
+    if BACKEND == "postgres":
+        # review R2-F2：PG 上 role=user 建号统一走「维护闸 + 开通锁」组合
+        # 原语（闸 fail-closed），conftest TRUNCATE 清掉 0029 种子——每用例
+        # 幂等重放（target=window + 闸=false）
+        import _billing_helpers as bh
+        bh.seed_spend_settings()
     yield
 
 
@@ -156,9 +163,9 @@ def test_require_owner_checks_actor_not_subject():
     # actor 仍是 owner → 管理端点 GET 不因预览被拒
     r = oc.get("/api/admin/users")
     assert r.status_code == 200, r.get_json()
-    # 但写（POST /api/admin/users）被 preview write guard 拦
-    r = oc.post("/api/admin/users",
-                json={"login_id": "n@x.com", "password": "password1password1"})
+    # 但写（POST .../disable，写探针端点——旧建号端点已 410 退役，review
+    # R2-F1）被 preview write guard 拦
+    r = oc.post("/api/admin/users/%s/disable" % _b["user_id"])
     assert r.status_code == 403
     assert r.get_json().get("code") == "preview_readonly"
 
@@ -198,9 +205,9 @@ def test_write_guard_allows_stop_and_get():
     assert oc.get("/api/slides").status_code == 200
     r = oc.post("/api/admin/preview/stop")
     assert r.status_code == 200, r.get_json()
-    # 退出后写恢复（owner 身份）
-    r = oc.post("/api/admin/users",
-                json={"login_id": "n@x.com", "password": "password1password1"})
+    # 退出后写恢复（owner 身份）。写探针端点用 disable（旧建号端点已 410
+    # 退役，review R2-F1；disable 幂等返回 200，与后端无关）
+    r = oc.post("/api/admin/users/%s/disable" % userb["user_id"])
     assert r.status_code == 200, r.get_json()
 
 
@@ -285,9 +292,10 @@ def test_preview_ttl_expires_and_auto_exits():
         pv = dict(s[app_mod.PREVIEW_SESSION_KEY])
         pv["expires_at"] = time.time() - 1
         s[app_mod.PREVIEW_SESSION_KEY] = pv
-    r = oc.post("/api/admin/users",
-                json={"login_id": "n@x.com", "password": "password1password1"})
-    assert r.status_code == 200, r.get_json()  # 过期自动退出 → 写放行
+    # 写探针端点用 disable（旧建号端点已 410 退役，review R2-F1；disable
+    # 幂等返回 200，与后端无关）——过期自动退出 → 写放行
+    r = oc.post("/api/admin/users/%s/disable" % userb["user_id"])
+    assert r.status_code == 200, r.get_json()
     with oc.session_transaction() as s:
         assert app_mod.PREVIEW_SESSION_KEY not in s
 

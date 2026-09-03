@@ -24,9 +24,11 @@ store 级（默认全跑；PG-only 用例 RUN_PG_TESTS=1）：
     三分类互不混入（爬虫不进入匿名访客近似数）；只读——调用前后业务表与
     site 表行数不变、不触发清理；90 天窗口外事件不计入；
   - purge_expired 只删 expires_at 到期行；
-  - F4 每日保留任务接线：app._run_daily_retention_once 的 acquisition 段与
-    site stats 段各自独立 try/except（互不拖垮）、store 缺失（None）时
-    site stats 段静默跳过（双跑纯单元，monkeypatch 注入）。
+  - F4/R2-F5 每日保留任务接线（双跑纯单元，monkeypatch 注入）：R2-F5 拆分
+    后 acquisition 段（_run_daily_retention_once）与 site stats 段
+    （_run_site_stats_retention_once）为独立函数/线程/开关——各自独立
+    try/except 互不拖垮；store 缺失（None）时 site stats 段静默跳过；
+    ACQ 间隔=0（归因退役）不影响 site stats 段；
 
 app.py 接线契约测试（``site_stats_app_wiring`` 标记，**默认启用、不 skip**；
 app.py 接线由并行代理实施，接线落地前这些用例红属预期）：
@@ -118,6 +120,11 @@ def _isolate(tmp_path, monkeypatch):
             conn.commit()
         finally:
             conn.close()
+        # review R2-F2：app 接线用例会经 HTTP 建 owner/user（PG 上 role=user
+        # 建号走「维护闸 + 开通锁」组合原语，闸 fail-closed）——conftest
+        # TRUNCATE 清掉 0029 种子，每用例幂等重放（target=window + 闸=false）
+        import _billing_helpers as bh
+        bh.seed_spend_settings()
     yield
     sss.stop_worker()
 
@@ -838,22 +845,46 @@ def test_app_after_request_records_public_html_get(secret, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# 11. F4：每日保留任务接线（app._run_daily_retention_once；双跑纯单元）
+# 11. F4 + review R2-F5：每日保留任务接线（双跑纯单元）。
+# R2-F5 拆分后 acquisition 段（_run_daily_retention_once）与 site stats 段
+# （_run_site_stats_retention_once）各自独立函数/线程/开关，互不牵连
 # --------------------------------------------------------------------------- #
-def test_run_daily_retention_once_runs_both_segments(monkeypatch):
-    """单轮任务：acquisition 段与 site stats 段都被执行（store 非 None）。"""
+def test_run_daily_retention_once_runs_acquisition_segment(monkeypatch):
+    """acquisition 段：_run_daily_retention_once 只做来源触点清理
+    （R2-F5 拆分后不再连带 site stats）。"""
     calls = []
     monkeypatch.setattr(app_mod.acquisition_store, "run_visit_retention",
-                        lambda: (3, 2))
+                        lambda: calls.append("acq") or (3, 2))
+
+    def _unexpected():
+        raise AssertionError("R2-F5 拆分后 site stats 段不应被 "
+                             "_run_daily_retention_once 调用")
+
+    monkeypatch.setattr(sss, "purge_expired", _unexpected)
+    monkeypatch.setattr(app_mod, "site_stats_store", sss)
+    app_mod._run_daily_retention_once()
+    assert calls == ["acq"]
+
+
+def test_run_site_stats_retention_once_runs_purge(monkeypatch):
+    """site stats 段：_run_site_stats_retention_once 只跑 purge_expired
+    （store 非 None），不做 acquisition 清理。"""
+    calls = []
     monkeypatch.setattr(sss, "purge_expired",
                         lambda: calls.append("purge") or 5)
     monkeypatch.setattr(app_mod, "site_stats_store", sss)
-    app_mod._run_daily_retention_once()
+
+    def _unexpected():
+        raise AssertionError("R2-F5 拆分后 acquisition 段不应被 "
+                             "_run_site_stats_retention_once 调用")
+
+    monkeypatch.setattr(app_mod.acquisition_store, "run_visit_retention",
+                        _unexpected)
+    app_mod._run_site_stats_retention_once()
     assert calls == ["purge"]
 
 
-def test_run_daily_retention_once_segments_do_not_take_each_other_down(
-        monkeypatch):
+def test_retention_segments_do_not_take_each_other_down(monkeypatch):
     """互不拖垮：任一段异常不外泄、另一段照常执行（各段独立 try/except）。"""
     calls = []
 
@@ -866,6 +897,7 @@ def test_run_daily_retention_once_segments_do_not_take_each_other_down(
                         lambda: calls.append("purge") or 4)
     monkeypatch.setattr(app_mod, "site_stats_store", sss)
     app_mod._run_daily_retention_once()          # acquisition 异常被吞
+    app_mod._run_site_stats_retention_once()
     assert calls == ["purge"]
     # 反向：site stats 段异常，acquisition 段照常执行
     calls.clear()
@@ -876,21 +908,48 @@ def test_run_daily_retention_once_segments_do_not_take_each_other_down(
     monkeypatch.setattr(app_mod.acquisition_store, "run_visit_retention",
                         lambda: calls.append("acq") or (1, 0))
     monkeypatch.setattr(sss, "purge_expired", _purge_boom)
-    app_mod._run_daily_retention_once()          # purge 异常被吞
+    app_mod._run_daily_retention_once()
+    app_mod._run_site_stats_retention_once()    # purge 异常被吞
     assert calls == ["acq"]
 
 
-def test_run_daily_retention_once_skips_missing_store(monkeypatch):
-    """store 未随镜像发布（import 容错 None）：site stats 段静默跳过，
-    acquisition 段照常执行——与 _start_site_stats_worker 同口径。"""
-    calls = []
-    monkeypatch.setattr(app_mod.acquisition_store, "run_visit_retention",
-                        lambda: calls.append("acq") or (0, 0))
+def test_run_site_stats_retention_once_skips_missing_store(monkeypatch):
+    """store 未随镜像发布（import 容错 None）：site stats 段静默跳过——
+    与 _start_site_stats_worker 同口径。"""
 
     def _unexpected():
         raise AssertionError("store 为 None 时 purge_expired 不应被调用")
 
     monkeypatch.setattr(sss, "purge_expired", _unexpected)
     monkeypatch.setattr(app_mod, "site_stats_store", None)
-    app_mod._run_daily_retention_once()
-    assert calls == ["acq"]
+    app_mod._run_site_stats_retention_once()    # 不抛即通过
+
+
+def test_acq_interval_zero_does_not_affect_site_stats_segment(monkeypatch):
+    """review R2-F5 核心契约：运维把 ACQ 间隔设 0（归因已退役的合理操作）
+    只关掉 acquisition 调度线程，site stats 段开关/执行完全独立（R2-F5 拆分
+    理由）。函数级验证：monkeypatch 后直接调 _run_site_stats_retention_once，
+    不依赖 import 期线程。"""
+    calls = []
+
+    def _no_acq():
+        raise AssertionError("site stats 段不应做 acquisition 清理")
+
+    monkeypatch.setenv("ACQ_RETENTION_INTERVAL_SECONDS", "0")
+    # ACQ 间隔=0 → acquisition 调度线程不启动（budget 特性不可用时本就 None）
+    if app_mod.platform_features.budget_features_available():
+        assert app_mod._start_acquisition_retention_thread() is None
+    # 同一 env 前提下，site stats 单轮清理照常执行（独立函数，不触 acquisition）
+    monkeypatch.setattr(app_mod.acquisition_store, "run_visit_retention",
+                        _no_acq)
+    monkeypatch.setattr(sss, "purge_expired",
+                        lambda: calls.append("purge") or 7)
+    monkeypatch.setattr(app_mod, "site_stats_store", sss)
+    app_mod._run_site_stats_retention_once()
+    assert calls == ["purge"]
+    # site stats 自己的开关独立生效：间隔=0 关闭；正间隔以契约线程名启动
+    monkeypatch.setenv("SITE_STATS_RETENTION_INTERVAL_SECONDS", "0")
+    assert app_mod._start_site_stats_retention_thread() is None
+    monkeypatch.setenv("SITE_STATS_RETENTION_INTERVAL_SECONDS", "86400")
+    th = app_mod._start_site_stats_retention_thread()
+    assert th is not None and th.name == "site-stats-retention" and th.daemon

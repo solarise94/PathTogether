@@ -4219,44 +4219,38 @@ def api_admin_users_list():
 _check_registration_preconditions_or_warn()
 
 
+#: review R2-F1：旧建号端点统一退役响应（410 Gone + 稳定 code + 中文指引；
+#: 惯例同 _turn_budgets_retired_response / _spend_override_retired_response）。
+#: total 模式下本端点会建出无 allowance 行的用户（授权面永久 fail-closed），
+#: 故无条件退役，建号一律走 v1 组合原语或邀请兑换。
+_ADMIN_USERS_CREATE_RETIRED_NOTE = (
+    "旧建号端点已退役：请改用 POST /api/admin/v1/users（同事务建号+额度面）"
+    "或邀请兑换")
+
+
+def _admin_users_create_retired_response():
+    """退役建号端点统一出口：410 + code + 指引文案，并 audit 这次尝试。"""
+    _audit("users.retired_write", target_type="user",
+           target_id=None,
+           detail={"endpoint": request.method + " " + request.path})
+    return (jsonify(error=_ADMIN_USERS_CREATE_RETIRED_NOTE,
+                    code="admin_users_create_deprecated"), 410)
+
+
 @app.route("/api/admin/users", methods=["POST"])
 def api_admin_users_create():
-    """创建 user 角色账户。仅 owner。JSON: {login_id, password, display_name?}。
+    """已退役（review R2-F1）：无条件 410 admin_users_create_deprecated。
 
-    批次 C（docs §4.2/§8.1）：登录账号字段只接受 ``login_id``（批次 B 的
-    ``email`` 兼容入参已删除——只传 email 不给 login_id 一律 400）。冲突 409；
-    密码统一 15..200（user_store.PASSWORD_MIN/MAX_LENGTH，账户系统批次 A
-    docs §3.3）。返回新用户（不含 hash，只带 login_id 键）。
-    初始密码由 owner 线下告知用户（本节点不做邮件发送）。
+    旧实现直调 ``user_store.create_user``——user_spend_target=total_allowance
+    （cutover 后）时会建出无总额度行的用户，授权面随即永久 fail-closed，
+    不可保留。owner 门控保持在 410 之前（匿名 401 / 非 owner 403 语义不变，
+    不向未授权方泄露端点存活性差异——与 user_attribution_retired /
+    turn_budgets_retired 同一顺序惯例）。
     """
     auth = _require_owner()
     if auth:
         return auth
-    body = request.get_json(silent=True) or {}
-    login_id = body.get("login_id")
-    password = body.get("password")
-    display_name = body.get("display_name")
-    if not isinstance(login_id, str) or not login_id.strip():
-        return jsonify(error="缺少登录账号"), 400
-    if not isinstance(password, str) or not password:
-        return jsonify(error="缺少密码"), 400
-    if (len(password) < user_store.PASSWORD_MIN_LENGTH
-            or len(password) > user_store.PASSWORD_MAX_LENGTH):
-        return jsonify(error=(
-            "密码长度须在 %d..%d 字符之间（当前 %d 字符）"
-            % (user_store.PASSWORD_MIN_LENGTH, user_store.PASSWORD_MAX_LENGTH,
-               len(password)))), 400
-    try:
-        user = user_store.create_user(
-            login_id, password, role=user_store.ROLE_USER,
-            display_name=display_name)
-    except ValueError as e:
-        msg = str(e)
-        if "已存在" in msg:
-            return jsonify(error=msg), 409
-        return jsonify(error=msg), 400
-    _audit("user.create", target_type="user", target_id=user.get("user_id"))
-    return jsonify(user)
+    return _admin_users_create_retired_response()
 
 
 @app.route("/api/admin/users/<user_id>/disable", methods=["POST"])
@@ -6005,9 +5999,11 @@ def admin_v1_turn_budgets():
 # 统一口径：
 #   - owner 门控 = _require_owner_admin_v1（_require_owner + 预览态一律 403，
 #     与只读端点/宿主页同口径 §14.1）；CSRF 沿用 before_request 全局闸；
-#   - 旧写端点（/api/admin/users 等）**保留不删**（§9 迁移期兼容），本节复用
-#     其校验与 store 调用、break-glass 不变量原样镜像（owner 禁用/重置一律
-#     409，disable/enable 同事务推进 auth_version）；
+#   - 旧建号端点 POST /api/admin/users 已 410 退役（review R2-F1：total 模式
+#     下会建出无 allowance 行的用户；门控惯例同 turn_budgets_retired），建号
+#     统一走本节 POST /api/admin/v1/users 同事务组合原语；本节复用其校验与
+#     store 调用、break-glass 不变量原样镜像（owner 禁用/重置一律 409，
+#     disable/enable 同事务推进 auth_version）；
 #   - billing 写（caps/adjustments）：仅 PG；CAS 版本冲突 409、未开户 404
 #     （不伪造账户）、符号/reason 校验 400；**业务写入与 audit 同一事务**
 #     （billing_store.update_account_caps / apply_billing_adjustment 内经
@@ -6115,6 +6111,12 @@ def admin_v1_users_create():
             login_id, password, display_name=display_name,
             ai_access=True if ai_access is None else ai_access,
             total_limit_nano_cny=total_limit, actor_user_id=actor)
+    except spend_store.ProvisioningMaintenanceError:
+        # cutover 维护闸开启（或平台设置读不出，fail-closed）期间禁止建号：
+        # 与 AI dispatch 同款稳定 503 ai_dispatch_maintenance（闸关闭后重试；
+        # 组合原语在用户行插入前检查，无半创建状态）
+        return _admin_v1_error(503, "ai_dispatch_maintenance",
+                               "系统维护中（cutover），暂禁止建号；请稍后重试")
     except ValueError as e:
         msg = str(e)
         if "ambiguous_spend_limit" in msg:
@@ -11270,11 +11272,13 @@ _BINDING_ATTACH_RETRY_THREAD = _start_binding_attach_retry_thread()
 
 
 def _run_daily_retention_once():
-    """单轮每日保留清理：来源触点 90 天保留 + 站点统计事件 90 天保留。
+    """单轮每日保留清理：只做来源触点段（90 天保留，§11.3）。
 
-    两段各自独立 try/except（互不拖垮：任一 store 故障只影响本段，另一段
-    照常执行；异常记日志、下一轮重试）。site stats 段在 store 未随镜像发布
-    （import 容错 None）时静默跳过——与 _start_site_stats_worker 同口径。
+    review R2-F5 拆分：site stats 清理段已移入独立的
+    :func:`_run_site_stats_retention_once`（独立开关/线程）。此前两段共用
+    本线程与 ``ACQ_RETENTION_INTERVAL_SECONDS``——运维把 ACQ 间隔设 0（归因
+    已退役后的合理操作）会连带永久停掉 site_visit_events 清理；retention
+    开关不得受退役归因开关牵连。异常记日志、下一轮重试。
     """
     # 来源触点段（§11.3，PR5）：过期未引用行删除 + 过期已归因行脱敏（幂等）
     try:
@@ -11286,30 +11290,42 @@ def _run_daily_retention_once():
     except Exception:
         app.logger.warning(
             "acquisition retention 执行失败（下一轮重试）", exc_info=True)
-    # 站点统计段（Batch D2）：只删 expires_at 到期的 site_visit_events 行
-    if site_stats_store is not None:
-        try:
-            purged = site_stats_store.purge_expired()
-            if purged:
-                app.logger.info(
-                    "site stats retention：删除过期访问统计事件 %d 行", purged)
-        except Exception:
-            app.logger.warning(
-                "site stats retention 执行失败（下一轮重试）", exc_info=True)
+
+
+def _run_site_stats_retention_once():
+    """单轮站点统计保留清理（review R2-F5 拆分后的独立段）。
+
+    只跑 ``site_stats_store.purge_expired``（只删 expires_at 到期的
+    site_visit_events 行，幂等，多实例重叠调度安全）。拆分理由：retention
+    开关不得受退役归因开关牵连——归因退役后运维常把
+    ``ACQ_RETENTION_INTERVAL_SECONDS`` 置 0，若两段仍共用一线程/一间隔会
+    连带永久停掉站点统计清理。store 未随镜像发布（import 容错 None）时
+    静默跳过——与 _start_site_stats_worker 同口径；异常记日志、下一轮重试
+    （purge 幂等，漏跑一轮无副作用）。
+    """
+    if site_stats_store is None:
+        return
+    try:
+        purged = site_stats_store.purge_expired()
+        if purged:
+            app.logger.info(
+                "site stats retention：删除过期访问统计事件 %d 行", purged)
+    except Exception:
+        app.logger.warning(
+            "site stats retention 执行失败（下一轮重试）", exc_info=True)
 
 
 def _start_acquisition_retention_thread():
-    """postgres 后端启动每日保留调度线程（F4：触点 + 站点统计，§11.3/§Batch D2）。
+    """postgres 后端启动每日保留调度线程（来源触点段；§11.3）。
 
     - ``ACQ_RETENTION_INTERVAL_SECONDS``：间隔秒数（默认 86400 = 每日）；
       ``0`` 或负数 = 关闭（测试可显式置 0 隔离）；
     - 每轮执行 :func:`_run_daily_retention_once`：来源触点 90 天保留
       （``acquisition_store.run_visit_retention``：过期未引用行删除 + 过期
-      已归因行脱敏，单事务幂等）+ 站点统计事件 90 天保留
-      （``site_stats_store.purge_expired``；store 未随镜像发布时跳过）——
-      多实例重叠调度安全（删除/脱敏均幂等，无需 advisory lock）；
-    - 线程名沿用 ``acquisition-retention`` 不改（避免运维图谱漂移），本函数
-      docstring 注明：现同时兼顾站点统计事件清理；
+      已归因行脱敏，单事务幂等）——多实例重叠调度安全（删除/脱敏均幂等，
+      无需 advisory lock）；站点统计清理已拆出到独立线程
+      （:func:`_start_site_stats_retention_thread`，review R2-F5）；
+    - 线程名沿用 ``acquisition-retention`` 不改（避免运维图谱漂移）；
     - daemon 线程：循环内异常吞掉记日志（下一轮重试），不杀线程、不阻塞停机。
     """
     if not platform_features.budget_features_available():
@@ -11336,6 +11352,41 @@ def _start_acquisition_retention_thread():
 _ACQUISITION_RETENTION_THREAD = _start_acquisition_retention_thread()
 
 
+def _start_site_stats_retention_thread():
+    """站点统计保留独立调度线程（review R2-F5 拆分；§Batch D2）。
+
+    - ``SITE_STATS_RETENTION_INTERVAL_SECONDS``：间隔秒数（默认 86400 =
+      每日）；``0`` 或负数 = 关闭（测试可显式置 0 隔离）；
+    - 每轮执行 :func:`_run_site_stats_retention_once`
+      （``site_stats_store.purge_expired``；store 未随镜像发布时不启动）；
+    - 启动条件 ``site_stats_store is not None``：purge_expired 在非 postgres
+      后端是 store 内部 no-op（与 worker 同口径），无需在此重复判后端；
+    - 拆分理由：归因退役后运维可把 ACQ 间隔置 0，retention 开关必须与
+      退役归因开关互不牵连（review R2-F5）；
+    - 线程名 ``site-stats-retention``、daemon：循环内异常吞掉记日志（下一
+      轮重试），不杀线程、不阻塞停机。
+    """
+    if site_stats_store is None:
+        return None
+    try:
+        interval = float(os.environ.get(
+            "SITE_STATS_RETENTION_INTERVAL_SECONDS") or 86400)
+    except (TypeError, ValueError):
+        interval = 86400.0
+    if interval <= 0:
+        return None
+
+    def _loop():
+        while True:
+            time.sleep(interval)
+            _run_site_stats_retention_once()
+
+    th = threading.Thread(target=_loop, name="site-stats-retention",
+                          daemon=True)
+    th.start()
+    return th
+
+
 def _start_site_stats_worker():
     """Batch D2：启动站点统计后台写入 worker（§Batch D2 2/7）。
 
@@ -11356,6 +11407,10 @@ def _start_site_stats_worker():
 
 
 _SITE_STATS_WORKER = _start_site_stats_worker()
+
+#: 站点统计保留独立线程（review R2-F5；紧跟 worker 之后启动，与
+#: acquisition-retention 线程互不牵连——ACQ 间隔置 0 不影响本段）
+_SITE_STATS_RETENTION_THREAD = _start_site_stats_retention_thread()
 
 
 # --------------------------------------------------------------------------- #

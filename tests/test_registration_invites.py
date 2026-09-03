@@ -49,6 +49,13 @@ def _isolate(monkeypatch):
     monkeypatch.setattr(app_mod, "_registration_gate_warned", {"flag": False})
     for name in ("PUBLIC_BASE_URL", "ADMIN_SESSION_COOKIE_SECURE"):
         monkeypatch.delenv(name, raising=False)
+    if BACKEND == "postgres":
+        # review R2-F2：兑换（redeem_invite）与建号统一走「维护闸 + 开通锁」
+        # 组合原语，闸 fail-closed（platform_settings 缺 ai_dispatch_maintenance
+        # 即拒绝）。conftest TRUNCATE 清掉 0029 种子，每用例幂等重放
+        # （target=window + 闸=false）；维护闸矩阵用例自行覆盖闸值。
+        import _billing_helpers as bh
+        bh.seed_spend_settings()
     yield
 
 

@@ -225,6 +225,71 @@ class SpendTotalAllowanceExistsError(SpendError):
     code = "spend_total_allowance_exists"
 
 
+class ProvisioningMaintenanceError(SpendError):
+    """cutover/维护闸开启期间禁止注册与建号（review R2：与 AI dispatch
+    同闸；503 语义，闸关闭后重试）。"""
+
+    code = "ai_dispatch_maintenance"
+    retryable = True
+
+
+#: 用户开通（建号/邀请兑换）与 cutover 脚本共用的 advisory lock 键
+#: （review R2 竞态修复）：建号/兑换事务内 ``pg_advisory_xact_lock``；
+#: cutover apply/rollback 持同键**会话级** ``pg_advisory_lock`` 全程——
+#: 两侧互斥串行，堵住「建号读 window → cutover 扫描不到未提交用户 →
+#: 建号提交 override」的竞态。键为固定 64 位常量（本仓唯一用途，勿复用）。
+USER_PROVISIONING_ADVISORY_LOCK_KEY = 729451068230974041
+
+#: 建号/兑换等短事务内取 advisory 锁的等待上限（秒）：cutover 迁移事务
+#: 是秒级短事务，超限说明异常（如脚本异常持有会话锁）——宁可报错也不
+#: 让 HTTP worker 无限挂起（LockNotAvailable → ProvisioningMaintenanceError）。
+USER_PROVISIONING_LOCK_TIMEOUT_SECONDS = 15
+
+
+def acquire_user_provisioning_lock_tx(cur):
+    """在调用方事务 cursor 内取用户开通 advisory 锁（xact 级，提交即释放）。
+
+    与 cutover 脚本的会话级锁同键互斥；等待超过
+    ``USER_PROVISIONING_LOCK_TIMEOUT_SECONDS`` 抛
+    :class:`ProvisioningMaintenanceError`（调用方映射 503）。
+    """
+    # 注意：SET LOCAL 是 utility 语句，不接受绑定参数（extended protocol 下
+    # $1 直接语法错误）；psycopg3 占位符又只认 %s/%b/%t——秒数经 int() 收紧
+    # 后内插进 SQL 文本（review R2 修复；锁有效性证明见
+    # tests/test_provisioning_lock.py）
+    _lock_timeout = int(USER_PROVISIONING_LOCK_TIMEOUT_SECONDS)
+    cur.execute("SET LOCAL lock_timeout = '%ds'" % _lock_timeout)
+    try:
+        cur.execute("SELECT pg_advisory_xact_lock(%s)",
+                    (USER_PROVISIONING_ADVISORY_LOCK_KEY,))
+    except psycopg.errors.LockNotAvailable as exc:
+        raise ProvisioningMaintenanceError(
+            "用户开通锁等待超时（cutover 进行中或锁异常持有）；请稍后重试") \
+            from exc
+
+
+def is_dispatch_maintenance_tx(cur) -> bool:
+    """事务内读取 cutover 维护闸（platform_settings.ai_dispatch_maintenance）。
+
+    与 app.py ``_ai_dispatch_maintenance_active`` 同口径：缺键按 False
+    （0029 种子保证生产恒有行；缺键时 cutover apply 的闸 CAS 会失败、
+    开通 advisory 锁仍保证与 cutover 互斥）；**读取异常**按 True
+    fail-closed（维护状态读不出来时，注册/建号宁停勿放）。
+    """
+    try:
+        cur.execute(
+            "SELECT value FROM platform_settings WHERE key=%s",
+            (AI_DISPATCH_MAINTENANCE_KEY,))
+        row = cur.fetchone()
+        return bool(row["value"]) if row is not None else False
+    except Exception:
+        return True
+        row = cur.fetchone()
+        return row is None or row["value"] is not False
+    except Exception:
+        return True
+
+
 def _connect():
     """建连接并设 dict_row（本模块所有查询按列名访问）。"""
     conn = pg_store.connect()

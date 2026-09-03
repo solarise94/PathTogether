@@ -88,6 +88,13 @@ def _isolate(monkeypatch):
     """每用例：隔离目录 / 清空用户库 / 归属注入清空 / json 登录限流 mock。"""
     isolate_app(monkeypatch, DATA_DIR, login_limits=True, clear_stores=True)
     _reset_users_file()
+    if conftest.BACKEND == "postgres":
+        # review R2-F2：PG 上 role=user 建号/兑换统一走「维护闸 + 开通锁」
+        # 组合原语，闸 fail-closed（platform_settings 缺 ai_dispatch_maintenance
+        # 即拒绝）。conftest TRUNCATE 清掉 0029 种子，这里每用例幂等重放
+        # （target=window + 闸=false），需要其他前置态的用例自行覆盖。
+        import _billing_helpers as bh
+        bh.seed_spend_settings()
     yield
     # AUTH_ENABLED 的还原已由 isolate_app 的还原护栏接管（防泄漏登记）
 
@@ -640,21 +647,50 @@ def test_admin_disable_owner_409():
 
 
 def test_admin_create_user_password_policy():
-    """创建用户：短密码 400（统一 15..200，无硬编码 8）；全空白 400。"""
+    """统一 15..200 密码策略（store 级）：短密码 400/全空白拒绝、文案与 CLI
+    一致。旧建号 HTTP 端点已 410 退役（review R2-F1），入参校验内聚在
+    store 与 POST /api/admin/v1/users，本用例改为直测 store 原语。"""
     make_owner("admin", OWNER_PW)
-    c = _owner_client()
-    r = c.post("/api/admin/users", json={"login_id": "n@x.com", "password": "short14chars__x"[:13]})
-    check("14 位密码 400", r.status_code == 400)
-    check("长度文案统一（15..200）", "15" in json.loads(r.data).get("error", ""))
-    r_ws = c.post("/api/admin/users", json={"login_id": "n@x.com",
-                                            "password": " " * 15})
-    check("全空白密码 400（与 CLI 一致）", r_ws.status_code == 400,
-          "got %s" % r_ws.status_code)
-    check("全空白文案", "全空白" in json.loads(r_ws.data).get("error", ""))
+    with pytest.raises(ValueError) as ei:
+        user_store.create_user("n@x.com", "short14chars__x"[:13], role="user")
+    check("14 位密码拒绝（15..200 文案）", "15" in str(ei.value))
+    with pytest.raises(ValueError) as ei_ws:
+        user_store.create_user("n@x.com", " " * 15, role="user")
+    check("全空白密码拒绝（与 CLI 一致）", "全空白" in str(ei_ws.value))
     check("全空白未建号",
           user_store.get_user_by_login_id("n@x.com") is None)
-    r2 = c.post("/api/admin/users", json={"login_id": "n@x.com", "password": USER_PW})
-    check("15 位密码 200", r2.status_code == 200, "got %s" % r2.status_code)
+    ok = user_store.create_user("n@x.com", USER_PW, role="user")
+    check("15 位密码可建号", ok is not None and ok.get("login_id") == "n@x.com")
+
+
+def test_admin_users_create_endpoint_retired_410():
+    """review R2-F1：旧建号端点 POST /api/admin/users 无条件 410
+    admin_users_create_deprecated（total 模式下它会建出无 allowance 行的
+    用户）。owner 门控保持在 410 之前：匿名 / 普通 user 仍 403，不向未授权
+    方泄露端点存活性差异（与 user_attribution_retired 同一顺序惯例）。"""
+    make_owner("admin", OWNER_PW)
+    c = _owner_client()
+    r = c.post("/api/admin/users",
+               json={"login_id": "n@x.com", "password": USER_PW})
+    check("owner 请求 410", r.status_code == 410,
+          "got %s" % r.status_code)
+    body = r.get_json()
+    check("稳定 code", body.get("code") == "admin_users_create_deprecated")
+    check("指引新端点", "/api/admin/v1/users" in body.get("error", ""))
+    check("未建号", user_store.get_user_by_login_id("n@x.com") is None)
+    # 门控顺序：410 只给 owner；匿名 401（认证层）、普通 user 403，均先于 410
+    anon = make_client()
+    ra = anon.post("/api/admin/users",
+                   json={"login_id": "a@x.com", "password": USER_PW})
+    check("匿名 401（先于 410）", ra.status_code == 401,
+          "got %s" % ra.status_code)
+    user_store.create_user("u@x.com", USER_PW, role="user")
+    uc = make_client()
+    login(uc, "u@x.com", USER_PW)
+    ru = uc.post("/api/admin/users",
+                 json={"login_id": "b@x.com", "password": USER_PW})
+    check("普通 user 403（先于 410）", ru.status_code == 403,
+          "got %s" % ru.status_code)
 
 
 def test_admin_reset_whitespace_password_400():

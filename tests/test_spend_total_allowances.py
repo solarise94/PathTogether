@@ -23,8 +23,10 @@ review-2026-09-02-upload-user-limits-admin-ui-cleanup.md §Batch B / §3.1 /
   - admin_users_spend_summaries target 驱动互斥形态（total vs window
     四象限：user×target 纯分支，owner 恒 window）；
   - admin_demo_spend_stats 只读聚合（前后业务表行数不变）；
-  - cutover 脚本：preflight（target 非 window 硬失败、allowance/窗口限额
-    不一致预检）/ apply（含 open hold 中止保持维护态）/ rollback-plan
+  - cutover 脚本：preflight（apply 静态前置完整镜像：target 行缺失/值非
+    window、维护闸已开、默认总额度不可解析、物化名单无策略——逐一硬失败；
+    allowance/窗口限额不一致预检）/ apply（含 open hold 中止保持维护态、
+    无当前窗口 user 的零消费窗物化+审计）/ rollback-plan
     （月感快照：新窗 spent=当月 priced usage、limit 令 remaining 守恒、
     reconcile 零 drift、跨月/同月/用尽变体、维护闸保持）。
 
@@ -34,6 +36,7 @@ import json
 import os
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -162,7 +165,26 @@ def _count(table, where="1=1", params=()):
 
 
 def _user(login):
-    return user_store.create_user(login, "pass123456789012")
+    """直接插入 user 行（绕开建号组合原语）。
+
+    review R2 起 PG role=user 的 user_store.create_user 委托
+    create_user_with_total_allowance：total 目标下会自动按默认建 allowance
+    行，与本文件「手工建行/设定特定 spent/opening 基线」的夹具语义冲突
+    （唯一约束 SpendTotalAllowanceExistsError）。本文件测的是 allowance
+    机制本身；开通串行化/维护闸/自动建行由 test_provisioning_lock.py 与
+    test_user_creation_spend_target.py 覆盖。
+    """
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            row = user_store_pg._insert_user_tx(
+                cur, user_store_pg._user_id(),
+                user_store_pg._normalize_login_id(login), login,
+                "pass123456789012", user_store_pg.ROLE_USER, time.time())
+        conn.commit()
+        return user_store_pg._public(row)
+    finally:
+        conn.close()
 
 
 def _mk_owner():
@@ -1187,9 +1209,10 @@ def test_cutover_preflight_apply_and_rollback():
     assert [i for i in recon["items"] if not i["matches"]] == []
 
 
-def test_preflight_hard_fails_when_target_not_window(capsys):
-    """F5a：target != 'window' 且零 problems 也必须非零退出——不允许
-    「problems 为空但 target 不对」时打印「preflight 通过」并 exit 0。"""
+def test_preflight_flags_target_not_window(capsys):
+    """F5a + R2-F3：target != 'window' 显式进 problems（不再只靠 ok 公式
+    隐式拦截）——「problems 为空但 target 不对」的假绿自此不存在，且
+    仍必须非零退出、绝不打印「preflight 通过」。"""
     script = _load_cutover_script()
     _seed_all()
     user = _mk_user_with_window("pf-clean@x.com", limit=20 * 10 ** 9)
@@ -1205,12 +1228,88 @@ def test_preflight_hard_fails_when_target_not_window(capsys):
     assert "preflight 通过" not in out          # 假绿提示绝不打印
     report = json.loads(out)
     assert report["ok"] is False
-    assert report["problems"] == []            # 失败纯因 target 非 window
+    assert report["problems"] == [{"problem": "target_not_window",
+                                   "user_spend_target": "total_allowance"}]
     assert report["user_spend_target"] == "total_allowance"
     # per_user 顺带携带 existing_allowance 投影（无行 → None）
     per = next(p for p in report["per_user"]
                if p["user_id"] == user["user_id"])
     assert per["existing_allowance_limit_nano_cny"] is None
+    assert per["window_materialize_required"] is False
+
+
+def test_preflight_flags_target_setting_missing(capsys):
+    """R2-F3：``user_spend_target`` 设置行整体缺失（非「行在值不对」）——
+    apply 的 CAS ``WHERE value='window'`` 无法命中，preflight 必须报
+    target_setting_missing；report 字段如实为 null（不回退 "window"）。"""
+    script = _load_cutover_script()
+    _seed_all()
+    _mk_user_with_window("pf-notarget@x.com", limit=20 * 10 ** 9)
+    _exec("DELETE FROM platform_settings WHERE key='user_spend_target'")
+    conn = script._connect()
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            script.preflight(conn, actor="usr_owner_pf")
+    finally:
+        conn.close()
+    assert exc_info.value.code != 0
+    out = capsys.readouterr().out
+    assert "preflight 通过" not in out
+    report = json.loads(out)
+    assert report["ok"] is False
+    assert report["problems"] == [{"problem": "target_setting_missing"}]
+    assert report["user_spend_target"] is None
+
+
+def test_preflight_flags_maintenance_active(capsys):
+    """R2-F3：维护闸已开（ai_dispatch_maintenance=true）→ apply 的闸 CAS
+    false→true 必然失败，preflight 报 maintenance_active 硬失败。"""
+    script = _load_cutover_script()
+    _seed_all()
+    _mk_user_with_window("pf-maint@x.com", limit=20 * 10 ** 9)
+    settings_store.compare_and_set_setting(
+        settings_store.AI_DISPATCH_MAINTENANCE_KEY, False, True,
+        updated_by="pytest")
+    conn = script._connect()
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            script.preflight(conn, actor="usr_owner_pf")
+    finally:
+        conn.close()
+    assert exc_info.value.code != 0
+    out = capsys.readouterr().out
+    assert "preflight 通过" not in out
+    report = json.loads(out)
+    assert report["ok"] is False
+    assert report["problems"] == [{"problem": "maintenance_active",
+                                   "current": True}]
+    assert report["ai_dispatch_maintenance"] is True
+
+
+def test_preflight_flags_total_default_unresolvable(capsys):
+    """R2-F3：默认总额度不可解析（defaults 表缺行且 user_default 策略
+    禁用、无 override）→ apply 会 _die「无可用默认总额度」，preflight
+    报 total_default_unresolvable 硬失败。"""
+    script = _load_cutover_script()
+    _seed_all()
+    _mk_user_with_window("pf-nodefault@x.com", limit=20 * 10 ** 9)
+    _exec("UPDATE ai_spend_policies SET enabled=false "
+          "WHERE scope_type='user_default'")
+    conn = script._connect()
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            script.preflight(conn, actor="usr_owner_pf")
+    finally:
+        conn.close()
+    assert exc_info.value.code != 0
+    out = capsys.readouterr().out
+    assert "preflight 通过" not in out
+    report = json.loads(out)
+    assert report["ok"] is False
+    assert report["problems"] == [{"problem": "total_default_unresolvable"}]
+    assert report["total_default_nano_cny"] is None
+    assert report["total_default_source"] is None
+    assert report["total_default_version"] is None
 
 
 def test_preflight_flags_allowance_window_limit_mismatch(capsys):
@@ -1243,6 +1342,108 @@ def test_preflight_flags_allowance_window_limit_mismatch(capsys):
     per = next(p for p in report["per_user"]
                if p["user_id"] == user["user_id"])
     assert per["existing_allowance_limit_nano_cny"] == 25 * 10 ** 9
+
+
+def test_cutover_materializes_windowless_user_preflight_and_apply():
+    """R2-F1 owner 方向 #3：window 模式建号无 X 的 user 无任何 spend 行
+    （无窗口/allowance/override）——不再被 current_window_missing 阻断：
+    preflight ok 且标 materialize；apply 在迁移事务内先按有效策略物化
+    零消费窗口（写审计）再走正常迁移：allowance limit=策略面值、
+    opening=spent=0、reconcile_total_allowances 无 drift。"""
+    script = _load_cutover_script()
+    _seed_all()  # target=window、维护闸关、user_default 20 CNY 生效
+    # window 模式建号不传 X：只有 user 行（+user.create 审计），无 spend 行
+    user, allowance = user_store_pg.create_user_with_total_allowance(
+        "mat@x.com", "pass123456789012", actor_user_id="usr_owner_mat")
+    assert allowance is None
+    uid = user["user_id"]
+    assert _count("ai_spend_windows", "subject_id=%s", (uid,)) == 0
+    assert _allowance_row(uid) is None
+    assert _count("ai_spend_policies", "scope_type='user_override'") == 0
+
+    # preflight：ok=True、windows_to_materialize=1、条目标 materialize
+    conn = script._connect()
+    try:
+        report = script.preflight(conn, actor="usr_owner_mat")
+    finally:
+        conn.close()
+    assert report["ok"] is True
+    assert report["windows_to_materialize"] == 1
+    assert report["problems"] == []
+    per = next(p for p in report["per_user"] if p["user_id"] == uid)
+    assert per["window_materialize_required"] is True
+    assert per["window_id"] is None
+    assert per["remaining_nano"] is None
+
+    # apply：物化零消费窗 → 正常迁移（remaining 守恒）
+    conn = script._connect()
+    try:
+        report = script.apply_cutover(conn, actor="usr_owner_mat")
+    finally:
+        conn.close()
+    assert settings_store.get_setting(
+        settings_store.USER_SPEND_TARGET_KEY) == "total_allowance"
+    assert settings_store.get_setting(
+        settings_store.AI_DISPATCH_MAINTENANCE_KEY) is False
+    assert report["windows_materialized"] == [uid]
+    row = _allowance_row(uid)
+    assert row is not None
+    assert int(row["limit_nano_cny"]) == 20 * 10 ** 9  # user_default 面值
+    assert int(row["opening_spent_nano_cny"]) == 0
+    assert int(row["spent_nano_cny"]) == 0
+    assert int(row["reserved_nano_cny"]) == 0
+    assert row["source"] == "cutover"
+    # 物化出的窗口行：恰好一个、零消费、快照=策略面值
+    wins = _sql_one(
+        "SELECT * FROM ai_spend_windows WHERE subject_type='user' "
+        "AND subject_id=%s", (uid,))
+    assert len(wins) == 1
+    assert wins[0]["status"] == "open"
+    assert int(wins[0]["spent_nano_cny"]) == 0
+    assert int(wins[0]["reserved_nano_cny"]) == 0
+    assert int(wins[0]["limit_nano_snapshot"]) == 20 * 10 ** 9
+    # 审计留痕：spend.cutover_window_materialize（窗口字段齐备）
+    audits = _sql_one(
+        "SELECT detail FROM audit_events WHERE action="
+        "'spend.cutover_window_materialize' AND target_id=%s",
+        (wins[0]["window_id"],))
+    assert audits
+    detail = audits[0]["detail"]
+    assert detail["user_id"] == uid
+    assert detail["window_id"] == wins[0]["window_id"]
+    assert detail["policy_id"] == "spp_user_default"
+    assert int(detail["policy_version"]) == int(wins[0]["policy_version"])
+    assert int(detail["limit_nano_snapshot"]) == 20 * 10 ** 9
+    # reconcile 无 drift（opening=spent=0 且 cutover 后无 usage）
+    recon = spend_store.reconcile_total_allowances()
+    assert [i for i in recon["items"] if not i["matches"]] == []
+
+
+def test_cutover_preflight_flags_window_materialize_no_policy(capsys):
+    """R2-F1 物化前置：无当前窗口且无 override、user_default 也禁用 →
+    物化不了零消费窗，preflight 报 window_materialize_no_policy 硬失败
+    （apply 的对应 _die 分支兜底，不在此重复验证）。"""
+    script = _load_cutover_script()
+    _seed_all()
+    user, allowance = user_store_pg.create_user_with_total_allowance(
+        "matnp@x.com", "pass123456789012")
+    assert allowance is None
+    _exec("UPDATE ai_spend_policies SET enabled=false "
+          "WHERE scope_type='user_default'")
+    conn = script._connect()
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            script.preflight(conn, actor="usr_owner_mat")
+    finally:
+        conn.close()
+    assert exc_info.value.code != 0
+    out = capsys.readouterr().out
+    assert "preflight 通过" not in out
+    report = json.loads(out)
+    assert report["ok"] is False
+    assert report["windows_to_materialize"] == 1
+    assert {"problem": "window_materialize_no_policy",
+            "user_id": user["user_id"]} in report["problems"]
 
 
 def test_rollback_plan_month_aware_snapshot_cross_month_and_variants():

@@ -454,6 +454,16 @@ def redeem_invite(token, login_id, password, display_name=None, acq=None):
     期复用：建立了过渡 override 时填面值，否则 None）。
     成功审计在同一事务内（registration.redeem，actor=被创建 user_id）；失败审计
     在独立 best-effort 事务（主事务已随异常回滚），detail 只含 invite_id/status。
+
+    review R2-F2（与 cutover 串行化 + 维护闸）：事务内 cursor 就绪后、读
+    invite 行之前，与建号同款三段式——先查 cutover 维护闸
+    （spend_store.is_dispatch_maintenance_tx：缺键按开闸、读取异常 fail-closed）→
+    取用户开通 advisory 锁（spend_store.acquire_user_provisioning_lock_tx，
+    与 cutover 脚本会话级同键锁互斥串行）→ 复查维护闸（等锁期间闸可能
+    开启）。维护中抛 spend_store.ProvisioningMaintenanceError
+    （code=ai_dispatch_maintenance）：本异常**不**译成 InviteRedeemError，
+    原样上抛——注册端点的 generic Exception→503「注册暂不可用」兜底对其
+    语义正确（邀请行未被读取、FOR UPDATE 未加锁、invite 必未消费）。
     """
     platform_features.require_pg_backend("registration_invites")
     tok = (token or "").strip()
@@ -472,6 +482,16 @@ def redeem_invite(token, login_id, password, display_name=None, acq=None):
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
+                # review R2-F2 三段式（顺序固定，先于读 invite 行/FOR UPDATE）：
+                # 闸检查 → 开通锁 → 复查闸，与 create_user_with_total_allowance
+                # 同序，保证建号/兑换两入口与 cutover 三方互斥串行
+                if spend_store.is_dispatch_maintenance_tx(cur):
+                    raise spend_store.ProvisioningMaintenanceError(
+                        "系统维护中（cutover），暂停止注册；请稍后重试")
+                spend_store.acquire_user_provisioning_lock_tx(cur)
+                if spend_store.is_dispatch_maintenance_tx(cur):
+                    raise spend_store.ProvisioningMaintenanceError(
+                        "系统维护中（cutover），暂停止注册；请稍后重试")
                 cur.execute(
                     "SELECT invite_id, token_hash, login_id_normalized, "
                     "extract(epoch from expires_at)::float8 AS expires_at, "

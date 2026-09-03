@@ -155,7 +155,10 @@ def test_csrf_api_write_endpoints_enforced():
 
 
 def test_csrf_admin_users_post_enforced():
-    """POST /api/admin/users（Cookie 会话写端点）纳入 CSRF。"""
+    """POST /api/admin/v1/users（Cookie 会话写端点）纳入 CSRF。
+
+    旧 POST /api/admin/users 已 410 退役（review R2-F1），CSRF 探针换到
+    v1 建号端点（同为 Cookie 会话写端点，闸层一致）。"""
     app_mod.AUTH_ENABLED = True
     owner, _u = _setup_owner_and_user()
     client = _client()
@@ -163,12 +166,12 @@ def test_csrf_admin_users_post_enforced():
         s.update({"auth_user": "o", "user_id": owner["user_id"], "role": "owner",
                   "auth_version": owner.get("auth_version", 1)})
     # 先摘掉 wrapper 注入：直接用底层 client 发（有 session、无 token）
-    r = client._base.post("/api/admin/users",
+    r = client._base.post("/api/admin/v1/users",
                           json={"login_id": "n@x.com", "password": "password1password1"})
     assert r.status_code == 400
     assert r.get_json()["error"] == "csrf_required"
     # wrapper 自动带 token → 通过 CSRF（业务 200/400 由参数决定）
-    r2 = client.post("/api/admin/users",
+    r2 = client.post("/api/admin/v1/users",
                      json={"login_id": "n@x.com", "password": "password1password1"})
     assert r2.status_code == 200, r2.get_data(as_text=True)
 

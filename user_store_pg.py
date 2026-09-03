@@ -208,9 +208,24 @@ def create_user(login_id, password, role=ROLE_USER, display_name=None):
     密码统一执行 15..200 策略（无旁路参数；批次 A docs §3.3）。
     在 PG 上创建第二个 enabled owner 会被 users_single_enabled_owner_key
     部分唯一索引（0015）拦下，同样抛 ValueError。
+
+    review R2-F2（取消双轨运行时分支）：``role=user`` 时**委托**
+    :func:`create_user_with_total_allowance`（取返回 tuple 的 user 部分返回）
+    ——PG 上所有 role=user 建号都走「目标感知 + cutover 串行化 + 维护闸」的
+    单轨原子原语，不再存在「绕过 user_spend_target 直接插行」的旁路（否则
+    total 模式会经本函数建出无 allowance 行的用户）。委托语义下本函数同样
+    会抛 ProvisioningMaintenanceError（维护闸）并受开通 advisory 锁串行化；
+    UniqueViolation 仍译回同一 ``_unique_violation_message`` 文案（「该登录
+    账号已存在」等，兼容既有调用方按「已存在」匹配 409 的约定）。
+    ``role != user``（owner bootstrap 等）保持既有直连路径，不闸不断号
+    （owner 走主机侧 break-glass，不受注册面维护闸牵连）。
     """
     if role not in VALID_ROLES:
         raise ValueError("非法角色")
+    if role == ROLE_USER:
+        user, _allowance = create_user_with_total_allowance(
+            login_id, password, display_name=display_name)
+        return user
     norm_login = _normalize_login_id(login_id)
     if not norm_login:
         raise ValueError("登录账号不能为空")
@@ -287,6 +302,15 @@ def create_user_with_total_allowance(login_id, password, display_name=None,
     本入口只创建普通用户（role=user；owner 建号走主机侧 break-glass，docs
     §3.2 不变量 5）。登录账号冲突抛 ValueError（与 create_user 同文案）。
     返回 ``(user_dict, allowance_dict_or_None)``（window 模式恒 None）。
+
+    review R2-F2（与 cutover 串行化 + 维护闸）：事务内 cursor 就绪后先查
+    cutover 维护闸（spend_store.is_dispatch_maintenance_tx：缺键按开闸、
+    读取异常 fail-closed 按维护中处理）→ 取用户开通 advisory 锁
+    （spend_store.acquire_user_provisioning_lock_tx，xact 级，与 cutover
+    脚本的会话级同键锁互斥串行）→ **再查一次**维护闸（等锁期间闸可能被
+    运维打开）。维护中抛 spend_store.ProvisioningMaintenanceError
+    （code=ai_dispatch_maintenance，路由层映射 503）；此时用户行尚未插入，
+    零副作用。
     """
     norm_login = _normalize_login_id(login_id)
     if not norm_login:
@@ -303,6 +327,16 @@ def create_user_with_total_allowance(login_id, password, display_name=None,
         try:
             with pg_store.transaction(conn) as c:
                 with c.cursor() as cur:
+                    # review R2-F2 三段式（顺序固定）：闸检查 → 开通锁 →
+                    # 复查闸。先查再等锁，避免维护中还在锁上排队；等锁
+                    # 后复查，堵住「排队期间闸打开」的竞态窗口。
+                    if spend_store.is_dispatch_maintenance_tx(cur):
+                        raise spend_store.ProvisioningMaintenanceError(
+                            "系统维护中（cutover），暂禁止建号；请稍后重试")
+                    spend_store.acquire_user_provisioning_lock_tx(cur)
+                    if spend_store.is_dispatch_maintenance_tx(cur):
+                        raise spend_store.ProvisioningMaintenanceError(
+                            "系统维护中（cutover），暂禁止建号；请稍后重试")
                     row = _insert_user_tx(
                         cur, uid, norm_login, name, password, ROLE_USER, now,
                         ai_access=ai_access)

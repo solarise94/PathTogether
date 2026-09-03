@@ -13,8 +13,10 @@ account-system-simplification-fix-plan.md §4.2 / §6.1 / §11.2 矩阵）。
   - 登录防爆破主体：大小写变体与正确值共用同一账号桶（_auth_subject_hash
     规范化直接断言 + 混合大小写连续失败触发 429 的功能断言）；
   - 统一失败文案「账号或密码错误」，不泄露账号存在性；
-  - 管理 API：/api/admin/users 列表/创建/重置/禁用响应无 email 键；创建
-    **只接受 login_id**（只传 email 不给 login_id → 400，批次 C 删兼容入参）；
+  - 管理 API：/api/admin/users 列表/重置/禁用响应无 email 键；旧「创建」
+    端点已 410 退役（review R2-F1），创建契约（只接受 login_id，只传 email
+    不给 login_id → 400，批次 C 删兼容入参）迁至 POST /api/admin/v1/users
+    （响应包 user 键）；
   - 邀请管理 API（仅 PG，registration_invites 为 PG-only 能力）：创建只接受
     login_id 入参，响应只携带 login_id_masked（email_masked 已删除），绑定
     语义为「允许兑换的登录账号」；redeem_invite 返回 login_id 键。
@@ -62,6 +64,12 @@ OWNER_PW = "owner-pass-123456"
 def _isolate(monkeypatch):
     """每用例前把常量 / env 指回本模块临时目录，并清空 users.json。"""
     isolate_app(monkeypatch, DATA_DIR, login_limits=True, clear_stores=True)
+    if BACKEND == "postgres":
+        # review R2-F2：PG 上 role=user 建号/兑换统一走「维护闸 + 开通锁」
+        # 组合原语（闸 fail-closed），conftest TRUNCATE 清掉 0029 种子——
+        # 每用例幂等重放（target=window + 闸=false）
+        import _billing_helpers as bh
+        bh.seed_spend_settings()
     yield
 
 
@@ -265,8 +273,9 @@ def test_case_variants_share_account_lockout_bucket(monkeypatch):
 # 4. 管理 API 单键输出与 login_id-only 入参（docs §4.2/§8.1，批次 C）
 # =========================================================================== #
 def test_admin_users_api_login_id_only(monkeypatch):
-    """列表/创建/重置/禁用响应无 email 键；创建只接受 login_id（email 入参
-    已删除——只传 email 不给 login_id 一律 400）。"""
+    """列表/重置/禁用响应无 email 键；创建只接受 login_id（email 入参
+    已删除——只传 email 不给 login_id 一律 400）。旧建号端点已 410 退役
+    （review R2-F1），创建契约改在 POST /api/admin/v1/users 上验证。"""
     monkeypatch.setenv("ADMIN_PASSWORD", "")
     make_owner()
     user_store.create_user("u@x.com", PW2, role="user")
@@ -282,27 +291,29 @@ def test_admin_users_api_login_id_only(monkeypatch):
           all(u.get("login_id") and "password_hash" not in u
               and "email" not in u for u in users))
 
-    # 创建：login_id 入参
-    r2 = client.post("/api/admin/users",
+    # 创建：login_id 入参（旧建号端点已 410 退役，review R2-F1；契约在 v1）
+    r2 = client.post("/api/admin/v1/users",
                      json={"login_id": "New@X.com", "password": PW})
     check("login_id 入参创建 200", r2.status_code == 200,
           "got %s %s" % (r2.status_code, r2.get_data(as_text=True)))
-    body2 = r2.get_json()
+    body2 = r2.get_json().get("user") or {}
     check("创建响应 login_id==规范化值",
           body2.get("login_id") == "new@x.com")
     check("创建响应无 email 键", "email" not in body2)
 
     # 批次 C：email 兼容入参已删除——只传 email 不给 login_id → 400
-    r3 = client.post("/api/admin/users",
+    r3 = client.post("/api/admin/v1/users",
                      json={"email": "legacy@x.com", "password": PW})
     check("email 入参不再被接受（400）", r3.status_code == 400,
           "got %s" % r3.status_code)
-    check("错误文案为缺登录账号", "登录账号" in r3.get_json().get("error", ""))
+    check("错误文案为缺登录账号",
+          "登录账号" in r3.get_json()["error"].get("message", ""))
 
     # 两个都没给 → 400（登录账号缺失）
-    r4 = client.post("/api/admin/users", json={"password": PW})
+    r4 = client.post("/api/admin/v1/users", json={"password": PW})
     check("缺登录账号 400", r4.status_code == 400)
-    check("缺登录账号文案", "登录账号" in r4.get_json().get("error", ""))
+    check("缺登录账号文案",
+          "登录账号" in r4.get_json()["error"].get("message", ""))
 
     # 重置密码 / 禁用 / 启用响应同样单键
     uid = user_store.get_user_by_login_id("u@x.com")["user_id"]

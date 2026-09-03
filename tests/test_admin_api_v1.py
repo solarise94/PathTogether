@@ -332,9 +332,11 @@ def test_audit_pagination_and_sanitization():
         cursor = body["next_cursor"]
         if not cursor:
             break
-    # 最新在前、无重无漏
-    assert len(seen) == 5 and len(set(seen)) == 5
-    assert seen[0] == "test.admin_v1.4"
+    # 最新在前、无重无漏（R2 起 PG 建号经组合原语会写 user.create 审计；
+    # 只校验本测试写入的 5 条 probe 分页无重无漏）
+    probes = [a for a in seen if a.startswith("test.admin_v1.")]
+    assert len(probes) == 5 and len(set(probes)) == 5
+    assert probes[0] == "test.admin_v1.4"
     # action 精确筛选
     r = c.get("/api/admin/v1/audit?action=test.admin_v1.0").get_json()
     assert [item["action"] for item in r["items"]] == ["test.admin_v1.0"]

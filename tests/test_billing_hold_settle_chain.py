@@ -59,9 +59,6 @@ import spend_store  # noqa: E402
 
 from pg_compat import BACKEND  # noqa: E402
 
-PG = pytest.mark.skipif(BACKEND != "postgres",
-                        reason="强一致 usage/hold 链路需 PG（RUN_PG_TESTS=1）")
-
 if BACKEND == "postgres":
     import psycopg  # noqa: E402
     import _billing_helpers as bh  # noqa: E402
@@ -464,7 +461,6 @@ def _settle_event(body, event, now):
 # =========================================================================== #
 # 迁移（§9.7）：fresh 全量 + 幂等 + legacy 行 + demo 放行 + audit 标志
 # =========================================================================== #
-@PG
 def test_fresh_migration_to_0024_idempotent_with_legacy_rows():
     pytest.importorskip("pgserver")
     import tempfile
@@ -566,7 +562,6 @@ def test_fresh_migration_to_0024_idempotent_with_legacy_rows():
         srv.cleanup()
 
 
-@PG
 def test_legacy_hold_rows_behave_as_shadow_compatible():
     """0024 之前的 hold 行（enforcement_mode NULL）：settle 按影子兼容路径
     （旧 body 允许、模拟 debit），不受新模式影响。"""
@@ -598,7 +593,6 @@ def test_legacy_hold_rows_behave_as_shadow_compatible():
 # =========================================================================== #
 # 模式矩阵（§7.3）：shadow 观测 / registered 硬拒 demo 放行 / all 全硬
 # =========================================================================== #
-@PG
 def test_shadow_never_denies_but_projects_reserved():
     _seed_all()
     user = _user("shadow-proj@x.com")
@@ -624,7 +618,6 @@ def test_shadow_never_denies_but_projects_reserved():
     assert spend_store.total_allowance_overage_nano(allowance) > 0
 
 
-@PG
 def test_registered_hard_denials_stable_codes_no_write():
     _seed_all()
     _set_mode("registered")
@@ -680,7 +673,6 @@ def test_registered_hard_denials_stable_codes_no_write():
                           "provider", "installation_id", "plugin_id"}
 
 
-@PG
 def test_registered_demo_still_observed_all_mode_hard_denies_demo():
     _seed_all()
     _, session_id, _ = _ids()
@@ -708,7 +700,6 @@ def test_registered_demo_still_observed_all_mode_hard_denies_demo():
     assert _hold_row(call_id=body2["call_id"]) is None
 
 
-@PG
 def test_mode_snapshot_written_and_settle_uses_snapshot():
     """模式快照进 hold 行；全局模式翻转后，settle 仍按该 hold 的授权快照裁决。"""
     _seed_all()
@@ -735,7 +726,6 @@ def test_mode_snapshot_written_and_settle_uses_snapshot():
 # =========================================================================== #
 # 授权并发（§9.3）：临界点 / 同 call 单行 / 异 payload 409
 # =========================================================================== #
-@PG
 def test_concurrent_two_calls_only_one_crosses_limit():
     """两个不同 call 同时预占（各 = 2/3 额度）：FOR UPDATE 串行化后合计只有
     一个越过临界点；输家稳定拒绝且不动数。"""
@@ -772,7 +762,6 @@ def test_concurrent_two_calls_only_one_crosses_limit():
     assert _count("billing_holds") == 1           # 输家不写行
 
 
-@PG
 def test_concurrent_same_call_single_hold_and_single_reserve():
     """同 call_id 同 payload 并发：恰一行 hold，且**窗口预占不双份**（输家
     的 reserve 随 SAVEPOINT 撤销）。"""
@@ -798,7 +787,6 @@ def test_concurrent_same_call_single_hold_and_single_reserve():
     assert row["reserved_nano_cny"] == est
 
 
-@PG
 def test_same_call_conflicting_payload_409_route():
     inst = _bootstrap()
     token = _token_for(inst)
@@ -819,7 +807,6 @@ def test_same_call_conflicting_payload_409_route():
 # =========================================================================== #
 # 结算链（§3.4）：actual<=>estimate 三档 / 幂等 / 乱序 / release / 过期
 # =========================================================================== #
-@PG
 def test_settle_actual_vs_estimate_three_cases():
     """actual < estimate / == estimate / > estimate（registered 真实 debit）：
     reserved 按 estimate 归还、spent 按 actual 累加、actual>estimate 记真实
@@ -876,7 +863,6 @@ def test_settle_actual_vs_estimate_three_cases():
         assert d["idempotency_key"] == "usage:%s" % d["event_id"]
 
 
-@PG
 def test_settle_hard_real_debit_and_auto_open_no_account_needed():
     """hard 模式：未开户主体 settle 自动开户 + 真实 debit；demo 只进窗口
     spent、永不写 ledger（§14.1 红线延续）。"""
@@ -914,7 +900,6 @@ def test_settle_hard_real_debit_and_auto_open_no_account_needed():
     assert _count("billing_accounts", "user_id=%s", (cap,)) == 0
 
 
-@PG
 def test_settle_replay_after_commit_no_double_debit():
     """settle 已提交但响应丢失 → 客户端重试：duplicate=True，不重复 debit /
     不重复加 spent（§3.4.5/§9.3）。"""
@@ -943,7 +928,6 @@ def test_settle_replay_after_commit_no_double_debit():
     assert _count("ai_usage_events") == 1
 
 
-@PG
 def test_outbox_settle_ordering_both_directions_single_consume():
     """outbox /usage-events 与同步 settle 双向乱序：同一事件只计一次价/扣一
     次账/加一次窗口 spent（§3.4.5）。"""
@@ -997,7 +981,6 @@ def test_outbox_settle_ordering_both_directions_single_consume():
     assert len([d for d in _debits() if d["event_id"] == event2["event_id"]]) == 1
 
 
-@PG
 def test_release_releases_reserved_and_replay_idempotent():
     _seed_all()
     user = _user("release@x.com")
@@ -1020,7 +1003,6 @@ def test_release_releases_reserved_and_replay_idempotent():
                 now=T0 + timedelta(seconds=90))
 
 
-@PG
 def test_expiry_sweep_releases_reserved_and_late_usage_records_cost():
     """§3.4.7：TTL 回收归还 reserved；过期后迟到的合法 usage event 仍记实际
     消费（窗口允许 overage、后续新调用被窗口检查阻断），不二次归还。"""
@@ -1097,7 +1079,6 @@ def test_expiry_sweep_releases_reserved_and_late_usage_records_cost():
 # =========================================================================== #
 # 新旧 settle body 兼容矩阵（§3.4 滚动升级）
 # =========================================================================== #
-@PG
 def test_settle_body_compat_matrix_shadow_ok_hard_rejected():
     """旧 body：shadow 快照兼容（状态终局化 + 归还 reserved + outbox 链补
     金额）；registered/all 快照明确 400 settle_payload_required。"""
@@ -1135,7 +1116,6 @@ def test_settle_body_compat_matrix_shadow_ok_hard_rejected():
     assert out2["status"] == "released"
 
 
-@PG
 def test_settle_usage_event_call_id_mismatch_conflict():
     _seed_all()
     user = _user("mismatch@x.com")
@@ -1150,7 +1130,6 @@ def test_settle_usage_event_call_id_mismatch_conflict():
     assert _hold_row(hold_id=hold["hold_id"])["status"] == "open"
 
 
-@PG
 def test_settle_usage_event_schema_invalid_400_route():
     inst = _bootstrap()
     token = _token_for(inst)
@@ -1181,7 +1160,6 @@ def _rollback_case(monkeypatch, target, raiser):
     monkeypatch.setattr(target[0], target[1], raiser)
 
 
-@PG
 def test_hard_settle_injection_full_rollback(monkeypatch):
     """ledger / window（投影与归还）/ usage / hold / audit 任一关键写失败：
     整个 settle 事务回滚（事件、debit、窗口、hold 全部无痕），可重试。"""
@@ -1274,7 +1252,6 @@ def test_hard_settle_injection_full_rollback(monkeypatch):
 # =========================================================================== #
 # fail-closed（§9.3）：unknown price shadow vs hard；DB 不可用
 # =========================================================================== #
-@PG
 def test_unknown_price_shadow_observed_hard_rejected():
     _seed_all()
     user = _user("noprice@x.com")
@@ -1297,7 +1274,6 @@ def test_unknown_price_shadow_observed_hard_rejected():
     assert _hold_row(call_id=body2["call_id"]) is None
 
 
-@PG
 def test_db_unavailable_hard_fail_closed_route(monkeypatch):
     """DB 连接不可用：hard 模式 authorize 稳定 500 retryable——客户端拿不到
     authorized 即不得调用 provider（fail-closed），无部分写入。"""
@@ -1323,7 +1299,6 @@ def test_db_unavailable_hard_fail_closed_route(monkeypatch):
 # =========================================================================== #
 # 窗口：get_or_create 重读为空的稳定异常（批次 B 已知坑修复）
 # =========================================================================== #
-@PG
 def test_get_or_create_window_reread_none_stable_exception():
     """ON CONFLICT DO NOTHING 后重读为空（赢家行随后消失，如赢家回滚后被
     并发清理）→ 稳定 spend_window_unavailable（批次 B 为 _window_out(None)
@@ -1388,7 +1363,6 @@ def test_get_or_create_window_reread_none_stable_exception():
 # =========================================================================== #
 # /usage-events 窗口投影 + 能力探测字段（§3.4/§3.4.5）
 # =========================================================================== #
-@PG
 def test_usage_events_window_projection_and_capabilities():
     inst = _bootstrap()
     token = _token_for(inst)
@@ -1450,7 +1424,6 @@ def test_usage_events_window_projection_and_capabilities():
     assert r3.get_json()["status"] == "priced"
 
 
-@PG
 def test_route_envelopes_and_capability_fields():
     """路由层稳定码映射：429 spend_budget_exhausted（配额用尽族惯例）、503
     pricing_unavailable（fail-closed 前置条件缺失族）、400
@@ -1511,7 +1484,6 @@ def test_route_envelopes_and_capability_fields():
     assert out5["usage_duplicate"] is False
 
 
-@PG
 def test_reconcile_matches_after_settle_chain():
     """§9.7 相关：强一致链跑完后窗口投影与 usage/holds 重建口径一致（对账器
     无 drift）。"""

@@ -57,9 +57,6 @@ import spend_store  # noqa: E402
 
 from pg_compat import BACKEND  # noqa: E402
 
-PG = pytest.mark.skipif(BACKEND != "postgres",
-                        reason="spend 数据层需 PG（RUN_PG_TESTS=1）")
-
 CNY = billing_pricing.parse_balance_to_nano  # 独立 CNY→nano 换算入口
 SH = ZoneInfo("Asia/Shanghai")
 UTC = timezone.utc
@@ -70,11 +67,9 @@ SEED_DEMO_WEEK_CNY = "50"
 SEED_USER_MONTH_CNY = "20"
 SEED_OWNER_MONTH_CNY = "1000"
 
-
 def _sh(y, m, d, hh=0, mm=0, ss=0, micro=0):
     """上海本地时刻 → aware datetime。"""
     return datetime(y, m, d, hh, mm, ss, micro, tzinfo=SH)
-
 
 def _backdate_seed_policies():
     """把三条种子策略的 effective_from 提前到 2020（种子默认 now()——用固定
@@ -88,7 +83,6 @@ def _backdate_seed_policies():
         conn.commit()
     finally:
         conn.close()
-
 
 # =========================================================================== #
 # 1. 周边界（§1.1 / §9.2）
@@ -104,7 +98,6 @@ def test_week_boundary_sunday_night_vs_monday_midnight():
     assert start == datetime(2026, 8, 30, 16, 0, tzinfo=UTC)
     assert end == datetime(2026, 9, 6, 16, 0, tzinfo=UTC)
 
-
 def test_week_bounds_utc_input_conversion():
     """UTC 输入与上海输入同刻等价（15:59:59Z = 23:59:59+08 周日）。"""
     sunday_utc = datetime(2026, 8, 30, 15, 59, 59, tzinfo=UTC)
@@ -115,7 +108,6 @@ def test_week_bounds_utc_input_conversion():
     # 其他偏移输入（+05:30）同样先归上海再取周界
     ist = monday_utc.astimezone(ZoneInfo("Asia/Kolkata"))
     assert spend_store.week_window_bounds(ist)[0] == monday_utc
-
 
 def test_week_sweep_always_local_monday_midnight():
     """全年逐 6 小时扫描：起点恒为当地周一 00:00，跨度恒 7×24h（上海无
@@ -131,13 +123,11 @@ def test_week_sweep_always_local_monday_midnight():
         assert start <= at.astimezone(UTC) < end
         at += timedelta(hours=6)
 
-
 def test_week_epoch_and_rfc3339_inputs_equivalent():
     dt = _sh(2026, 8, 30, 12, 0, 0)
     assert spend_store.week_window_bounds(dt) == \
         spend_store.week_window_bounds(dt.timestamp()) == \
         spend_store.week_window_bounds(dt.isoformat())
-
 
 # =========================================================================== #
 # 2. 月边界（§1.1 / §9.2：月末/月初、2 月、闰年、跨年）
@@ -149,7 +139,6 @@ def test_month_boundary_end_and_start_of_month():
     start, end = spend_store.month_window_bounds(_sh(2026, 2, 1))
     assert start == datetime(2026, 1, 31, 16, 0, tzinfo=UTC)
     assert end == datetime(2026, 2, 28, 16, 0, tzinfo=UTC)     # 2026 非闰年：3 月 1 日 00:00+08
-
 
 def test_month_february_non_leap_and_leap_year():
     # 2026（非闰）：2 月 28 日仍属 2 月，次日直落 3 月（3/1 00:00+08 = 2/28 16:00Z）
@@ -164,7 +153,6 @@ def test_month_february_non_leap_and_leap_year():
     assert start == datetime(2024, 1, 31, 16, 0, tzinfo=UTC)
     assert end == datetime(2024, 2, 29, 16, 0, tzinfo=UTC)
 
-
 def test_month_december_to_january_rollover():
     start, end = spend_store.month_window_bounds(_sh(2026, 12, 31, 23, 59, 59))
     assert start == datetime(2026, 11, 30, 16, 0, tzinfo=UTC)
@@ -172,7 +160,6 @@ def test_month_december_to_january_rollover():
     start, end = spend_store.month_window_bounds(_sh(2027, 1, 1))
     assert start == datetime(2026, 12, 31, 16, 0, tzinfo=UTC)
     assert end == datetime(2027, 1, 31, 16, 0, tzinfo=UTC)
-
 
 def test_month_sweep_always_local_first_day_midnight():
     """逐日扫描两年：起点恒为当地当月 1 日 00:00、终点为次月 1 日 00:00，
@@ -190,7 +177,6 @@ def test_month_sweep_always_local_first_day_midnight():
         assert start <= at < end
         at += timedelta(days=1)
 
-
 def test_dst_timezone_week_bounds_use_local_calendar(monkeypatch):
     """DST 无关性：换成有夏令时的 Europe/Berlin，含 2026-03-29 春令时的周
     仍按当地日历取周一 00:00（UTC 跨度 167h）——证明实现不假设固定偏移。"""
@@ -199,7 +185,6 @@ def test_dst_timezone_week_bounds_use_local_calendar(monkeypatch):
         datetime(2026, 3, 25, 12, tzinfo=UTC))
     assert start.astimezone(ZoneInfo("Europe/Berlin")).weekday() == 0
     assert end - start == timedelta(hours=167)  # 周内少一小时（03-29 02:00→03:00）
-
 
 # =========================================================================== #
 # 3. 输入归一与纯函数防御（§1.1）
@@ -214,47 +199,16 @@ def test_naive_datetime_rejected():
     with pytest.raises(ValueError):
         spend_store.month_window_bounds(True)
 
-
 def test_period_kind_none_has_no_window_semantics():
     with pytest.raises(spend_store.InvalidSpendRequestError):
         spend_store.window_bounds("none", datetime(2026, 8, 30, tzinfo=UTC))
 
-
-# =========================================================================== #
-# 4. json/dual 后端 fail-closed（不降级进程内数据）
-# =========================================================================== #
-@pytest.mark.skipif(BACKEND == "postgres",
-                    reason="json 后端专用 fail-closed 反向用例")
-def test_json_backend_fail_closed():
-    assert platform_features.current_backend() == "json"
-    for call in (
-        lambda: spend_store.get_or_create_window("user", "u1"),
-        lambda: spend_store.window_reserve("spw_x", 1),
-        lambda: spend_store.window_release("spw_x", 1),
-        lambda: spend_store.window_settle("spw_x", 1, 1),
-        lambda: spend_store.resolve_policy("user", "u1"),
-        lambda: spend_store.enforcement_mode(),
-        lambda: spend_store.reconcile_spend_windows(),
-        lambda: spend_store.admin_list_policies(),
-        lambda: spend_store.update_policy_limit("spp_x", 1, 1),
-        lambda: spend_store.adjust_current_window("spw_x", 1, 1),
-        lambda: spend_store.set_enforcement_mode("shadow"),
-        lambda: spend_store.admin_users_spend_summaries([("user", "u1")]),
-    ):
-        with pytest.raises(platform_features.PgFeatureUnavailable) as exc:
-            call()
-        assert exc.value.code == "pg_backend_required"
-
-
 # =========================================================================== #
 # 5. PG：种子、shadow 开关与迁移幂等（§9.7）
 # =========================================================================== #
-if BACKEND == "postgres":
-    import psycopg  # noqa: E402
-    import _billing_helpers as bh  # noqa: E402
+import psycopg  # noqa: E402
+import _billing_helpers as bh  # noqa: E402
 
-
-@PG
 def test_seed_policies_shadow_flag_and_partial_unique():
     """0023 种子：三条默认策略（独立 CNY→nano 换算断言）、shadow 开关、
     部分唯一索引在 DB 层拒绝同 scope 第二条 enabled 未收口行。"""
@@ -320,8 +274,6 @@ def test_seed_policies_shadow_flag_and_partial_unique():
     finally:
         conn.close()
 
-
-@PG
 def test_fresh_database_full_migration_to_0023_idempotent():
     """fresh PG 全量迁移 0001→0025：种子与 shadow 开关就位；ensure_schema
     重跑幂等（种子不翻倍、开关不被改写、0025 邀请列存在）。"""
@@ -364,11 +316,9 @@ def test_fresh_database_full_migration_to_0023_idempotent():
     finally:
         srv.cleanup()
 
-
 # =========================================================================== #
 # 6. PG：策略解析（§3.1 / §9.2）
 # =========================================================================== #
-@PG
 def test_resolution_default_and_subject_kinds():
     """R3 单轨：user_override 写面已删，解析只剩各主体默认策略。"""
     bh.seed_spend_policies()
@@ -382,8 +332,6 @@ def test_resolution_default_and_subject_kinds():
     assert spend_store.resolve_policy("owner", "usr_owner")["policy_id"] == \
         "spp_owner"
 
-
-@PG
 def test_resolution_honors_enabled_flag():
     """enabled=false → 回退/拒绝（R3 单轨后 override 区间用例删除：override
     写面已退役；策略 effective 区间由 update_policy_limit 收口另测）。"""
@@ -416,11 +364,9 @@ def test_resolution_honors_enabled_flag():
     with pytest.raises(spend_store.SpendPolicyMissingError):
         spend_store.get_or_create_window("demo", "cap_x")
 
-
 # =========================================================================== #
 # 7. PG：窗口语义（§3.2 / §9.2）
 # =========================================================================== #
-@PG
 def test_new_user_full_month_limit_not_prorated():
     """月中注册的新用户拿完整月额度（不按剩余天数折算，§1.1）。"""
     bh.seed_spend_policies()
@@ -435,8 +381,6 @@ def test_new_user_full_month_limit_not_prorated():
                                          tzinfo=UTC).timestamp()
     assert win["policy_id"] == "spp_user_default"
 
-
-@PG
 def test_policy_update_cas_and_no_retroaction():
     """默认策略修改只影响新窗口；CAS 冲突 → 409 语义异常。"""
     bh.seed_spend_policies()
@@ -464,8 +408,6 @@ def test_policy_update_cas_and_no_retroaction():
     assert w2["limit_nano_snapshot"] == CNY("30")
     assert w2["policy_version"] == 2
 
-
-@PG
 def test_adjust_current_window_cas_audit_and_denial():
     """显式调整当前窗口：CAS、audit、不取消已完成消费、调低后拒绝新预占。"""
     bh.seed_spend_policies()
@@ -513,8 +455,6 @@ def test_adjust_current_window_cas_audit_and_denial():
     assert detail["new_limit_nano_snapshot"] == CNY("2.5")
     assert detail["spent_nano_cny"] == CNY("2")
 
-
-@PG
 def test_demo_subjects_share_one_week_window():
     bh.seed_spend_policies()
     _backdate_seed_policies()
@@ -537,8 +477,6 @@ def test_demo_subjects_share_one_week_window():
     assert nxt["limit_nano_snapshot"] == CNY(SEED_DEMO_WEEK_CNY)
     assert nxt["spent_nano_cny"] == 0
 
-
-@PG
 def test_two_users_independent_month_windows():
     bh.seed_spend_policies()
     _backdate_seed_policies()
@@ -553,8 +491,6 @@ def test_two_users_independent_month_windows():
         spend_store.get_window(w1["window_id"])) == \
         CNY(SEED_USER_MONTH_CNY) - CNY("3")
 
-
-@PG
 def test_owner_window_uses_owner_policy():
     bh.seed_spend_policies()
     _backdate_seed_policies()
@@ -565,11 +501,9 @@ def test_owner_window_uses_owner_policy():
     assert win["window_start"] == datetime(2026, 7, 31, 16, 0,
                                            tzinfo=UTC).timestamp()
 
-
 # =========================================================================== #
 # 8. PG：原子投影数值语义（§3.2 / §9.3）
 # =========================================================================== #
-@PG
 def test_reserve_boundary_exact_limit_and_one_nano_over():
     bh.seed_spend_policies()
     _backdate_seed_policies()
@@ -590,8 +524,6 @@ def test_reserve_boundary_exact_limit_and_one_nano_over():
     assert spend_store.metrics_snapshot().get(
         "spend_reserve_denied_total", 0) == before + 1
 
-
-@PG
 def test_release_settle_numerics_and_overage():
     bh.seed_spend_policies()
     _backdate_seed_policies()
@@ -632,8 +564,6 @@ def test_release_settle_numerics_and_overage():
         with pytest.raises(spend_store.InvalidSpendRequestError):
             spend_store.window_reserve(wid, bad)
 
-
-@PG
 def test_reserve_on_missing_or_closed_window_rejected():
     bh.seed_spend_policies()
     _backdate_seed_policies()
@@ -655,11 +585,9 @@ def test_reserve_on_missing_or_closed_window_rejected():
     out = spend_store.window_settle(win["window_id"], 0, 5)
     assert out["spent_nano_cny"] == 5
 
-
 # =========================================================================== #
 # 9. PG：真实并发（§9.3：多连接 + 屏障，禁 mock）
 # =========================================================================== #
-@PG
 def test_concurrent_reserves_cannot_overdraw_window():
     """两个并发 reserve（各 = 全额度）：FOR UPDATE 串行化后只能一个越过
     临界点；另一个稳定拒绝；最终 reserved == limit。"""
@@ -692,8 +620,6 @@ def test_concurrent_reserves_cannot_overdraw_window():
     assert final["spent_nano_cny"] == 0
     assert spend_store.window_remaining_nano(final) == 0
 
-
-@PG
 def test_concurrent_get_or_create_window_single_row():
     """并发创建同一窗口：UNIQUE 兜底，DB 里只有一行，各线程拿到同一 id。"""
     bh.seed_spend_policies()
@@ -725,7 +651,6 @@ def test_concurrent_get_or_create_window_single_row():
     finally:
         conn.close()
 
-
 # =========================================================================== #
 # 10. PG：对账器（§9.7 / §8 批次 B「对账器与指标」）
 # =========================================================================== #
@@ -747,7 +672,6 @@ def _insert_priced_event(cur, hex32, subject_type, subject_id, occurred_at,
          occurred_at, occurred_at, occurred_at, bh.CORRECTED_BOOK_IDS[0],
          bh.CORRECTED_BOOK_IDS[1], charge_nano, charge_nano))
 
-
 def _insert_open_hold(cur, hex32, subject_type, subject_id, estimated_nano,
                       created_at):
     cur.execute(
@@ -757,7 +681,6 @@ def _insert_open_hold(cur, hex32, subject_type, subject_id, estimated_nano,
         "'sess_rc','deepseek-v4-flash',%s,'open',%s + interval '1 hour',%s)",
         ("hold_" + hex32[:20], "call_" + hex32, subject_type, subject_id,
          estimated_nano, created_at, created_at))
-
 
 def _set_cutover(conn, when):
     """把 pricing_v2_cutover_at 固定为测试给定时刻（对账器只读该设置，
@@ -771,8 +694,6 @@ def _set_cutover(conn, when):
             (psycopg.types.json.Jsonb(when.timestamp()),))
     conn.commit()
 
-
-@PG
 def test_reconcile_reports_drift_without_fixing():
     bh.seed_price_books()  # priced CHECK 需要真实价格书 id
     bh.seed_spend_policies()
@@ -846,8 +767,6 @@ def test_reconcile_reports_drift_without_fixing():
     assert all(i["matches"] for i in result["items"])
     assert result["drift_windows"] == 0
 
-
-@PG
 def test_reconcile_demo_window_counts_all_demo_subjects():
     """demo 窗口对账把所有 demo 主体的事件都计入同一周窗口（固定时刻，避免
     真实时钟跨过周日 00:00 边界时事件落到窗口外）。"""
@@ -873,11 +792,9 @@ def test_reconcile_demo_window_counts_all_demo_subjects():
     assert item["actual_spent_nano"] == 0
     assert item["matches"] is False
 
-
 # =========================================================================== #
 # 11. 批次 D：enforcement 写入口（§7.3）+ override tx 变体（§5.1/§5.2）
 # =========================================================================== #
-@PG
 def test_set_enforcement_mode_vocab_cas_and_audit():
     """词表校验、CAS（expected 不符 409 语义）、audit 与写入同事务。"""
     bh.seed_spend_policies()
@@ -914,8 +831,6 @@ def test_set_enforcement_mode_vocab_cas_and_audit():
         ["registered", "all", "shadow"]
     assert details[0]["previous_mode"] == "shadow"
 
-
-@PG
 def test_admin_users_spend_summaries_batch():
     """admin_users_spend_summaries（R3 单轨）：user 恒 total 形态（缺行稳定
     error=spend_total_allowance_missing）、owner 窗口形态、批量混查。"""

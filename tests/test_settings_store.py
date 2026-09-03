@@ -16,11 +16,6 @@ import platform_features
 import settings_store
 from pg_compat import BACKEND
 
-pg_only = pytest.mark.skipif(
-    BACKEND != "postgres",
-    reason="platform_settings 读写需 PG（RUN_PG_TESTS=1）",
-)
-
 
 # --------------------------------------------------------------------------- #
 # json/dual：不可写 + fallback default（上层 fail-closed 判定依据）
@@ -47,7 +42,6 @@ def test_get_setting_returns_default_on_json_backend(monkeypatch):
 # --------------------------------------------------------------------------- #
 # PG：读写 + CAS + registration_mode fail-closed 解析
 # --------------------------------------------------------------------------- #
-@pg_only
 def test_set_and_get_setting_roundtrip():
     assert settings_store.settings_writable() is True
     assert settings_store.set_setting(
@@ -63,7 +57,6 @@ def test_set_and_get_setting_roundtrip():
     assert settings_store.get_setting("k_bool") is True
 
 
-@pg_only
 def test_registration_mode_missing_row_bootstraps_closed():
     """R3 Wave2-Compat：mode 键缺行 → fail-closed 降级 closed 并 bootstrap
     回写（旧布尔 registration_open / REGISTRATION_OPEN env 均已删除）。"""

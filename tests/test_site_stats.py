@@ -60,10 +60,6 @@ import user_store  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
 
-pg_only = pytest.mark.skipif(
-    BACKEND != "postgres",
-    reason="site_visit_events 数据层需真实 PG（RUN_PG_TESTS=1）")
-
 # app.py 接线由并行代理实施；依赖它的用例打此标记但**默认启用**（不 skip），
 # 接线未就绪时红属预期，不得删除。
 site_stats_app_wiring = pytest.mark.site_stats_app_wiring
@@ -450,7 +446,6 @@ def test_secret_readable_event_built(secret):
 # --------------------------------------------------------------------------- #
 # 5. 迁移 0030（真实 PG）
 # --------------------------------------------------------------------------- #
-@pg_only
 def test_migration_0030_applied_idempotent_and_minimal():
     import pg_store
     # ensure_schema 按 tuple 行访问（row[0]），必须用默认 row_factory 连接
@@ -500,7 +495,6 @@ def test_migration_0030_applied_idempotent_and_minimal():
 # --------------------------------------------------------------------------- #
 # 6. 去重桶与落库形态（真实 PG）
 # --------------------------------------------------------------------------- #
-@pg_only
 def test_dedup_bucket_unique_and_cross_bucket_new_row(secret):
     ev = _ev()
     _flush([ev, _ev()])                      # 同 hash+page+桶 → 冲突丢弃
@@ -511,7 +505,6 @@ def test_dedup_bucket_unique_and_cross_bucket_new_row(secret):
     assert _site_count() == 3
 
 
-@pg_only
 def test_persisted_row_minimized_shape(secret):
     ev = _ev(query_string="?utm_source=n", referrer="https://news.example.com",
              user_agent="curl/8.4.0", signed_in=True)
@@ -542,7 +535,6 @@ def test_persisted_row_minimized_shape(secret):
 # --------------------------------------------------------------------------- #
 # 7. retention 清理（真实 PG）
 # --------------------------------------------------------------------------- #
-@pg_only
 def test_purge_expired_deletes_only_expired_rows(secret):
     old = _ev(now=BASE_TIME - timedelta(days=100))     # 到期 10 天前
     fresh = _ev()
@@ -586,7 +578,6 @@ def test_dashboard_stats_contract_shape_without_postgres(monkeypatch):
     assert sss.purge_expired(now=BASE_TIME) == 0
 
 
-@pg_only
 def test_dashboard_stats_counts_and_readonly(secret):
     anon = _ev(remote_addr="203.0.113.1")
     # 同 /24 同日 → 同哈希；不同 page 落新行，但去重计数仍只算 1 个访客
@@ -646,7 +637,6 @@ def test_dashboard_stats_counts_and_readonly(secret):
     assert _business_counts() == before
 
 
-@pg_only
 def test_dashboard_stats_excludes_expired_window_and_never_purges(secret):
     outside = _ev(now=BASE_TIME - timedelta(days=40))
     fresh = _ev()
@@ -819,7 +809,6 @@ def test_app_admin_site_stats_owner_only(monkeypatch):
 
 
 @site_stats_app_wiring
-@pg_only
 def test_app_after_request_records_public_html_get(secret, monkeypatch):
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
     sss.start_worker()                       # 幂等；若 app 启动已起则 no-op

@@ -44,9 +44,6 @@ from pg_compat import BACKEND  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app, clear_upload_dir  # noqa: E402
 
 
-pg_only = pytest.mark.skipif(
-    BACKEND != "postgres", reason="配额 consume/恢复需 PG（RUN_PG_TESTS=1）")
-
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
@@ -192,7 +189,6 @@ def test_v1_zip_success_records_manifest_and_ownership():
     assert _residue() == []
 
 
-@pg_only
 def test_v1_zip_companion_files_in_manifest_not_slides():
     """MRXS bundle：manifest 含伴侣目录文件（slide=False，只提升不入归属），
     settle_bytes = 全部提升文件字节总和。"""
@@ -220,7 +216,6 @@ def test_v1_zip_companion_files_in_manifest_not_slides():
     assert row["reserved_bytes"] == 0
 
 
-@pg_only
 def test_v1_single_file_consumes_exact_bytes():
     """user 成功上传：consume 与 committed 同事务（used=实际字节，reserved=0）。"""
     uid = user_store.create_user("q1@x.com", "pass1234pass1234", role="user")["user_id"]
@@ -283,7 +278,6 @@ def test_no_promotion_before_task_intent_zip(monkeypatch):
     assert _tasks() == []
 
 
-@pg_only
 def test_intent_failure_releases_reservation(monkeypatch):
     uid = user_store.create_user("q2@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid, 10 ** 7)
@@ -306,7 +300,6 @@ def test_intent_failure_releases_reservation(monkeypatch):
 # =========================================================================== #
 # 3. PG 故障点与幂等恢复（G7 核心）
 # =========================================================================== #
-@pg_only
 def test_finish_crash_then_scan_settles_once(monkeypatch):
     """finish_commit 崩溃（consume 未发生）→ 文件已提升、任务 committing；
     committing 扫描幂等补账，重复恢复 used_bytes 只增加一次。"""
@@ -344,7 +337,6 @@ def test_finish_crash_then_scan_settles_once(monkeypatch):
     assert row["reserved_bytes"] == 0
 
 
-@pg_only
 def test_consume_crash_same_transaction_no_partial_settle(monkeypatch):
     """consume 在 finish 事务内失败 → 整体回滚（任务仍 committing、used 不动），
     恢复后一次性补账。"""
@@ -426,7 +418,6 @@ def _write_artifact(name, data):
             "slide": True}
 
 
-@pg_only
 def test_recovery_absent_promotes_nothing_releases(monkeypatch):
     """全不存在 → rollback + 取消 + 释放预占（安全回退，无配额泄漏）。"""
     uid = user_store.create_user("q5@x.com", "pass1234pass1234", role="user")["user_id"]
@@ -447,7 +438,6 @@ def test_recovery_absent_promotes_nothing_releases(monkeypatch):
     assert row["used_bytes"] == 0
 
 
-@pg_only
 def test_recovery_absent_respects_commit_timeout_window(monkeypatch):
     """未超 commit 超时的 committing 不被扫描动（恢复必须凭超时窗口，不凭
     TTL 盲动）。"""
@@ -462,7 +452,6 @@ def test_recovery_absent_respects_commit_timeout_window(monkeypatch):
     assert upload_guard.get_quota_row(uid)["reserved_bytes"] == 1000
 
 
-@pg_only
 def test_recovery_partial_promote_fail_closed_no_blind_release(monkeypatch):
     """部分提升 → 保持 committing + 预占不释放（绝不按过期时间盲 release）。"""
     uid = user_store.create_user("q7@x.com", "pass1234pass1234", role="user")["user_id"]
@@ -485,7 +474,6 @@ def test_recovery_partial_promote_fail_closed_no_blind_release(monkeypatch):
     assert row["used_bytes"] == 0
 
 
-@pg_only
 def test_recovery_size_mismatch_conflict_fail_closed(monkeypatch):
     """目标名被同名不同内容文件占用（大小不符）→ 证据冲突，保持 committing。"""
     uid = user_store.create_user("q8@x.com", "pass1234pass1234", role="user")["user_id"]
@@ -501,7 +489,6 @@ def test_recovery_size_mismatch_conflict_fail_closed(monkeypatch):
     assert upload_guard.get_quota_row(uid)["reserved_bytes"] == 1000
 
 
-@pg_only
 def test_recovery_promoted_finishes_idempotently_zip(monkeypatch):
     """全已提升（含伴侣目录文件）→ 幂等 finish：used 增加恰好一次，ownership
     补齐；再次扫描不双扣。"""

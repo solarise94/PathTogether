@@ -49,12 +49,6 @@ import user_store  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
 
-pg_only = pytest.mark.skipif(
-    BACKEND != "postgres",
-    reason="acquisition 数据层需 PG（RUN_PG_TESTS=1）",
-)
-
-
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
     """每用例：json 路径隔离 + 清理 acquisition 相关 env/cookie。"""
@@ -72,32 +66,26 @@ def _isolate(monkeypatch):
         bh.seed_spend_settings()
     yield
 
-
 def _raw_client(auth=True):
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = auth
     return app_mod.app.test_client()
 
-
 def _client(auth=True):
     return csrf_client(_raw_client(auth))
-
 
 def _satisfy_preconditions(monkeypatch):
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://path.example.com")
     monkeypatch.setenv("ADMIN_SESSION_COOKIE_SECURE", "1")
 
-
 def _mk_owner():
     return user_store.create_user("acq-owner@x.com", "ownerpass123456",
                                   role="owner")
-
 
 def _owner_session(client, owner):
     with client.session_transaction() as s:
         s.update({"auth_user": "o", "user_id": owner["user_id"],
                   "role": "owner", "auth_version": owner.get("auth_version", 1)})
-
 
 def _cookie_state(client):
     """读 test client 的 pt_acq cookie 原始形态 → (存在, value, attrs)。
@@ -110,15 +98,12 @@ def _cookie_state(client):
         return False, None, None
     return True, c.value, c
 
-
 def _mk_invite(owner_uid, login_id=None, **kw):
     return registration_store.create_invite(owner_uid, login_id=login_id, **kw)
-
 
 def _redeem(inv, login_id):
     return registration_store.redeem_invite(
         inv["token"], login_id, "longpassword123")
-
 
 # =========================================================================== #
 # 1. 纯清理函数（json/PG 双跑）
@@ -129,7 +114,6 @@ def test_sanitize_text_strips_control_chars_and_truncates():
     assert acq_store.sanitize_text("x" * 300) == "x" * acq_store.MAX_UTM_LEN
     assert acq_store.sanitize_text(None) == ""
     assert acq_store.sanitize_text(123) == ""
-
 
 def test_sanitize_referrer_keeps_hostname_only():
     assert acq_store.sanitize_referrer_domain(
@@ -142,7 +126,6 @@ def test_sanitize_referrer_keeps_hostname_only():
     assert acq_store.sanitize_referrer_domain("") == ""
     assert acq_store.sanitize_referrer_domain(None) == ""
 
-
 def test_valid_slug_boundaries():
     assert acq_store.valid_slug("mywebpage")
     assert acq_store.valid_slug("a-b_c9")
@@ -150,7 +133,6 @@ def test_valid_slug_boundaries():
     for bad in ("", "-abc", "ABC", "a b", "a/b", "x" * 65, None, 123,
                 "a.b", "中文"):
         assert not acq_store.valid_slug(bad), bad
-
 
 def test_ip_prefix_hash_salt_and_prefix_semantics(monkeypatch):
     # 盐缺失 → 空串（不采集，§11.3 实现决策）
@@ -176,7 +158,6 @@ def test_ip_prefix_hash_salt_and_prefix_semantics(monkeypatch):
     monkeypatch.setenv("ACQ_IP_SALT", "salt-2")
     assert acq_store.ip_prefix_hash("203.0.113.7") != h1
 
-
 def test_visitor_id_hash_is_salted_domain_separated():
     a = acq_store.visitor_id_hash("visitor-one")
     b = acq_store.visitor_id_hash("visitor-one")
@@ -186,7 +167,6 @@ def test_visitor_id_hash_is_salted_domain_separated():
     vid = acq_store.new_visitor_id()
     assert acq_store.valid_visitor_id(vid)
     assert not acq_store.valid_visitor_id("short")
-
 
 # =========================================================================== #
 # 2. /r/ 路由（json/PG 双跑；Batch D1 16：兼容 302、零记录、清 cookie）
@@ -213,7 +193,6 @@ def test_r_valid_slug_sets_cookie_and_redirects():
     # 不设置任何替代访客 cookie（响应只有该清除指令一条 Set-Cookie 相关行）
     assert "visitor" not in set_cookie.lower()
 
-
 def test_r_landing_allowlist_and_open_redirect_rejected():
     app_mod.AUTH_ENABLED = True
     client = _client()
@@ -231,7 +210,6 @@ def test_r_landing_allowlist_and_open_redirect_rejected():
         "/r/src1?next=https://evil.example.com&redirect=/admin"
     ).headers["Location"] == "/register"
 
-
 @pytest.mark.parametrize("slug", [
     "Bad-Slug", "a b", "a/b", "..", "x" * 65, "%41bc", "中文",
 ])
@@ -244,7 +222,6 @@ def test_r_malicious_slug_safe_fallback(slug):
     assert r.status_code in (302, 404), (slug, r.status_code)
     if r.status_code == 302:
         assert r.headers["Location"] == "/"
-
 
 def test_r_never_sets_new_cookie_and_never_records(monkeypatch):
     """Batch D1 17（§4.4）：/r/ 与触点写路径零耦合——全新 client 访问 /r/
@@ -264,7 +241,6 @@ def test_r_never_sets_new_cookie_and_never_records(monkeypatch):
     assert r2.status_code == 302
     assert r2.headers["Location"] == "/demo"
 
-
 def test_r_json_backend_never_500s():
     app_mod.AUTH_ENABLED = True
     client = _client()
@@ -274,11 +250,9 @@ def test_r_json_backend_never_500s():
     exists, value, _c = _cookie_state(client)
     assert (not exists) or value == ""  # 旧 cookie 清除（不签发新 payload）
 
-
 # =========================================================================== #
 # 3. admin v1 acquisition 端点已随 R3 wave1 物理删除（原 410 退役面）
 # =========================================================================== #
-
 
 # =========================================================================== #
 # 4. PG：触点写入与归因数据层
@@ -413,8 +387,6 @@ if BACKEND == "postgres":
         finally:
             conn.close()
 
-
-@pg_only
 def test_record_visit_row_shape_and_sanitization(monkeypatch):
     monkeypatch.setenv("ACQ_IP_SALT", "test-salt")
     _seed_campaign("camp-active", "mywebpage")
@@ -440,8 +412,6 @@ def test_record_visit_row_shape_and_sanitization(monkeypatch):
     assert vid not in json.dumps(v, default=str)
     assert v["expires_at"] > v["touched_at"]
 
-
-@pg_only
 def test_record_visit_unknown_campaign_null_no_error():
     _seed_campaign("camp-paused", "src", status="paused")
     vid = acq_store.new_visitor_id()
@@ -456,8 +426,6 @@ def test_record_visit_unknown_campaign_null_no_error():
                                  landing_path="/admin")
     assert row["landing_path"] == ""
 
-
-@pg_only
 def test_visit_rows_are_immutable_events_not_upserted():
     vid = acq_store.new_visitor_id()
     acq_store.record_visit(visitor_id=vid, source_code="a")
@@ -467,8 +435,6 @@ def test_visit_rows_are_immutable_events_not_upserted():
     assert len(visits) == 3  # 每次跳转一行，不折叠（§11.2 行粒度）
     assert {v["source_code"] for v in visits} == {"a", "b"}
 
-
-@pg_only
 def test_redeem_writes_no_user_acquisition_but_total_allowance():
     """Batch B §4.4/§Batch B + R3 单轨：兑换与归因解耦——无论触点/UTM/邀请
     来源如何，兑换成功但 user_acquisition **零新增**；额度面恒为一次性总额度：
@@ -498,8 +464,6 @@ def test_redeem_writes_no_user_acquisition_but_total_allowance():
     assert _count_override_rows() == 0
     assert _acq_total() == before
 
-
-@pg_only
 def test_expired_visits_and_tampered_visitor_are_ignored_frozen():
     """Batch B：触点过期/visitor 不匹配语义随写路径冻结一并退役——兑换根本
     不读取触点；本用例锁定「兑换后归因行仍为零」。"""
@@ -517,8 +481,6 @@ def test_expired_visits_and_tampered_visitor_are_ignored_frozen():
     out2 = _redeem(_mk_invite(owner["user_id"]), "tamper@x.com")
     assert _acq_total() == before
 
-
-@pg_only
 def test_redeem_succeeds_even_if_acquisition_store_broken(monkeypatch):
     """Batch B 红线：站点统计故障绝不能阻断注册——归因已不在兑换事务内，
     insert_user_acquisition 注入失败不再影响兑换（用户创建、邀请消费）。"""
@@ -536,8 +498,6 @@ def test_redeem_succeeds_even_if_acquisition_store_broken(monkeypatch):
     assert row["use_count"] == 1 and row["consumed_at"] is not None
     assert _acq_total() == 0  # 全程零归因写入
 
-
-@pg_only
 def test_visit_retention_deletes_scrubs_and_is_idempotent(monkeypatch):
     """§11.3 PR5：过期引用行脱敏、未引用行删除、未到期不动、计数正确。
 
@@ -605,37 +565,18 @@ def test_visit_retention_deletes_scrubs_and_is_idempotent(monkeypatch):
     # 幂等：再跑一轮两类计数均为 0（脱敏 UPDATE 带 <>'' 条件）
     assert acq_store.run_visit_retention() == (0, 0)
 
-
-def test_visit_retention_requires_pg_backend():
-    """json/dual 后端：retention 入口 fail-closed（不静默跳过）。"""
-    if BACKEND == "postgres":
-        pytest.skip("json 后端专用反向用例（PG 模式跑正向路径）")
-    import platform_features
-    with pytest.raises(platform_features.PgFeatureUnavailable):
-        acq_store.run_visit_retention()
-    # 兼容包装同源 fail-closed
-    with pytest.raises(platform_features.PgFeatureUnavailable):
-        acq_store.cleanup_expired_visits()
-
-
 def test_acquisition_retention_daemon_switch(monkeypatch):
-    """retention daemon：非 PG 不启动；env ≤0 关闭；PG + 正间隔才起线程。"""
-    if BACKEND != "postgres":
-        # json/dual：导入期即不启动（fail-closed）
-        assert app_mod._ACQUISITION_RETENTION_THREAD is None
+    """retention daemon：env ≤0 关闭；PG + 正间隔才起线程；导入期即启动。"""
     # 开关：0 / 负数 → None（不建线程）
     monkeypatch.setenv("ACQ_RETENTION_INTERVAL_SECONDS", "0")
     assert app_mod._start_acquisition_retention_thread() is None
     monkeypatch.setenv("ACQ_RETENTION_INTERVAL_SECONDS", "-5")
     assert app_mod._start_acquisition_retention_thread() is None
-    if BACKEND == "postgres":
-        monkeypatch.setenv("ACQ_RETENTION_INTERVAL_SECONDS", "3600")
-        th = app_mod._start_acquisition_retention_thread()
-        assert th is not None and th.name == "acquisition-retention" \
-            and th.daemon is True
+    monkeypatch.setenv("ACQ_RETENTION_INTERVAL_SECONDS", "3600")
+    th = app_mod._start_acquisition_retention_thread()
+    assert th is not None and th.name == "acquisition-retention" \
+        and th.daemon is True
 
-
-@pg_only
 def test_register_route_full_acquisition_flow(monkeypatch):
     """Batch D1 16/17 全链路：/r/ 只做安全 302（零触点行、清 cookie）、注册
     成功且 user_acquisition **零新增**（注册与归因彻底解耦）。"""
@@ -677,8 +618,6 @@ def test_register_route_full_acquisition_flow(monkeypatch):
     # 邀请码绝不进 URL/query
     assert inv["token"] not in r2.get_data(as_text=True)
 
-
-@pg_only
 def test_admin_summary_funnel_reads_frozen_history_only():
     """Batch B：漏斗汇总继续可读**历史**行；新注册不再进入漏斗
     （registrations 不因兑换增长）。"""
@@ -703,8 +642,6 @@ def test_admin_summary_funnel_reads_frozen_history_only():
     assert c1["first_ai_count"] == 1      # 历史 user 的 AI 事件可读
     assert summary["totals"]["registrations"] == 1
 
-
-@pg_only
 def test_admin_users_endpoint_no_new_attribution_but_masking_kept(monkeypatch):
     """Batch D1 15/17 + R3 wave1：acquisition/users 明细端点物理删除（404；
     410 stub 不留）。写路径冻结用数据库行数断言——新注册零归因行；历史归因
@@ -743,8 +680,6 @@ def test_admin_users_endpoint_no_new_attribution_but_masking_kept(monkeypatch):
     assert row["first_acquisition_id"] == first["acquisition_id"]
     assert row["last_acquisition_id"] == first["acquisition_id"]
 
-
-@pg_only
 def test_admin_v1_users_row_attribution_frozen_to_null(monkeypatch):
     """Batch D1 14（§4.4）：users 列表行**整键删除** campaign/source（不再
     查询归因表）；registration_method 仍为 invite。"""
@@ -763,7 +698,6 @@ def test_admin_v1_users_row_attribution_frozen_to_null(monkeypatch):
     assert "source" not in item
     assert "campaign" not in item
     assert item["registration_method"] == "invite"
-
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

@@ -17,11 +17,6 @@ from conftest import BACKEND  # noqa: E402
 
 import share_store  # noqa: E402
 
-pytestmark = pytest.mark.skipif(
-    BACKEND != "postgres",
-    reason="稳定 slide 身份仅在 PostgreSQL 后端（share_store_pg）实现",
-)
-
 if BACKEND == "postgres":
     import psycopg  # noqa: E402
 else:

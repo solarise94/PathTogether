@@ -53,9 +53,6 @@ import user_store  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
 
-PG = pytest.mark.skipif(BACKEND != "postgres",
-                        reason="spend/invite 写路径需 PG（RUN_PG_TESTS=1）")
-
 if BACKEND == "postgres":
     import _billing_helpers as bh  # noqa: E402
 
@@ -64,7 +61,6 @@ app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 #: >2^53 的 nano 金额（JS Number 读到即失真；wire 十进制字符串须精确）
 OVER_2E53_NANO = "9007199254740993"
-
 
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
@@ -79,17 +75,14 @@ def _isolated(tmp_path, monkeypatch):
         bh.seed_spend_settings()
     yield
 
-
 def _client():
     app_mod.app.config["TESTING"] = True
     return csrf_client(app_mod.app.test_client())
-
 
 def _raw_client():
     """不带 CSRF 包装的裸 client（缺 CSRF 用例）。"""
     app_mod.app.config["TESTING"] = True
     return app_mod.app.test_client()
-
 
 def _login(client, user):
     with client.session_transaction() as s:
@@ -98,7 +91,6 @@ def _login(client, user):
         s["role"] = user.get("role") or "user"
         s["auth_version"] = user.get("auth_version", 1)
     return client
-
 
 def _setup_users(n_extra=1):
     owner = user_store.create_user(
@@ -110,7 +102,6 @@ def _setup_users(n_extra=1):
             display_name="User %d" % i))
     return tuple([owner] + users)
 
-
 if BACKEND == "postgres":
     def _audit_actions(action):
         import share_store
@@ -118,7 +109,6 @@ if BACKEND == "postgres":
 else:
     def _audit_actions(action):
         return []
-
 
 # --------------------------------------------------------------------------- #
 # 1. owner 门控 + CSRF + json 后端 fail-closed（两后端都跑）
@@ -135,7 +125,6 @@ _NEW_ENDPOINTS = (
     ("PUT", "/api/admin/v1/settings/registration"),
 )
 
-
 def test_anonymous_401_on_new_endpoints():
     _setup_users()
     for method, path in _NEW_ENDPOINTS:
@@ -144,7 +133,6 @@ def test_anonymous_401_on_new_endpoints():
                                                       r.status_code)
         assert r.get_json()["error"] == "auth_required"
 
-
 def test_plain_user_403_on_new_endpoints():
     owner, usera = _setup_users()
     c = _login(_client(), usera)
@@ -152,7 +140,6 @@ def test_plain_user_403_on_new_endpoints():
         r = c.open(path, method=method)
         assert r.status_code == 403, "%s %s -> %s" % (method, path,
                                                       r.status_code)
-
 
 def test_preview_owner_403_on_new_endpoints():
     owner, usera = _setup_users()
@@ -169,7 +156,6 @@ def test_preview_owner_403_on_new_endpoints():
             else (body.get("error") or {}).get("code")
         assert code in ("preview_forbidden", "preview_readonly"), \
             "%s %s -> %r" % (method, path, body)
-
 
 def test_new_write_endpoints_require_csrf():
     """写方法缺 X-CSRF-Token 一律 400（before_request 全局闸；§9.6）。"""
@@ -202,33 +188,6 @@ def test_new_write_endpoints_require_csrf():
         assert "CSRF" in r.get_data(as_text=True) or \
             r.get_json().get("error") == "csrf_required"
 
-
-def test_json_backend_new_spend_endpoints_503():
-    if BACKEND == "postgres":
-        pytest.skip("json 后端专用反向用例（PG 模式跑正向路径）")
-    owner, _u = _setup_users()
-    c = _login(_client(), owner)
-    for method, path, body in (
-            ("PUT", "/api/admin/v1/spend/policies/spp_demo_global",
-             {"limit_nano_cny": "1", "version": 1}),
-            ("PUT", "/api/admin/v1/spend/enforcement-mode",
-             {"mode": "shadow"}),
-            ("POST", "/api/admin/v1/spend/windows/spw_x/adjust",
-             {"limit_nano_snapshot": "1", "version": 1, "confirm": True})):
-        r = c.open(path, method=method, json=body)
-        assert r.status_code == 503, "%s %s -> %s" % (method, path,
-                                                      r.status_code)
-        assert r.get_json()["error"]["code"] == "pg_backend_required"
-    # settings 聚合在 json 后端分段标记（注册段真实；spend/runtime 不可用）
-    r = c.get("/api/admin/v1/settings")
-    assert r.status_code == 200
-    body = r.get_json()
-    assert body["registration"]["mode"] == "closed"
-    for seg in ("spend", "runtime"):
-        assert body[seg]["available"] is False
-        assert body[seg]["code"] == "pg_backend_required"
-
-
 # --------------------------------------------------------------------------- #
 # 2. 注册模式：v1 settings/registration PUT（旧路由已随 R3 wave1 删除）
 # --------------------------------------------------------------------------- #
@@ -249,8 +208,6 @@ def test_registration_v1_put_validates():
     assert r2.status_code == 400
     assert "前置条件" in r2.get_json()["error"]["message"]
 
-
-@PG
 def test_registration_v1_put_closed_writes_and_audits():
     owner, _u = _setup_users()
     c = _login(_client(), owner)
@@ -264,11 +221,9 @@ def test_registration_v1_put_closed_writes_and_audits():
     events = _audit_actions("registration.mode_update")
     assert events and events[0]["detail"].get("mode") == "closed"
 
-
 # --------------------------------------------------------------------------- #
 # 3. spend policies PUT（CAS + 金额 wire + audit）
 # --------------------------------------------------------------------------- #
-@PG
 def test_spend_policy_update_cas_and_decimal_string():
     bh.seed_spend_policies()
     owner, _u = _setup_users()
@@ -306,8 +261,6 @@ def test_spend_policy_update_cas_and_decimal_string():
                  json={"limit_nano_cny": "1", "version": 1})
     assert r404.status_code == 409
 
-
-@PG
 def test_spend_policy_update_audited_same_transaction():
     """audit 写入失败 → 策略更新整体回滚（不落半更新状态）。"""
     bh.seed_spend_policies()
@@ -330,11 +283,9 @@ def test_spend_policy_update_audited_same_transaction():
     resolved = spend_store.resolve_policy("demo", spend_store.DEMO_GLOBAL_SUBJECT)
     assert resolved["limit_nano_cny"] == 50 * 10 ** 9
 
-
 # --------------------------------------------------------------------------- #
 # 4. enforcement-mode PUT（词表 + CAS + §7.3 无保护配置校验）
 # --------------------------------------------------------------------------- #
-@PG
 def test_enforcement_mode_validation_cas_audit():
     bh.seed_spend_policies()
     owner, _u = _setup_users()
@@ -357,11 +308,9 @@ def test_enforcement_mode_validation_cas_audit():
     events = _audit_actions("spend.enforcement_mode_update")
     assert events and events[0]["detail"]["changed"] is False
 
-
 # --------------------------------------------------------------------------- #
 # 5. 调整当前窗口（confirm + CAS + 只改 snapshot）
 # --------------------------------------------------------------------------- #
-@PG
 def test_window_adjust_confirm_cas_and_snapshot_only():
     bh.seed_spend_policies()
     owner, usera = _setup_users()
@@ -410,8 +359,6 @@ def test_window_adjust_confirm_cas_and_snapshot_only():
                       "version": win["version"] + 1, "confirm": True})
     assert r3.status_code == 400
 
-
-@PG
 def test_window_adjust_lower_than_spent_rejects_next_reserve():
     """调低到低于 spent：本操作成功，下一次预占被拒（§3.2）。"""
     bh.seed_spend_policies()
@@ -429,12 +376,10 @@ def test_window_adjust_lower_than_spent_rejects_next_reserve():
     with pytest.raises(spend_store.SpendBudgetExhaustedError):
         spend_store.window_reserve(win["window_id"], 1)
 
-
 # --------------------------------------------------------------------------- #
 # 6. 用户一次性总额度 PUT/restore-default（Batch B wave 2，§Batch B API/bridge
 #    契约）；旧月额度覆盖端点已随 R3 wave1 物理删除
 # --------------------------------------------------------------------------- #
-@PG
 def test_user_total_limit_set_and_restore():
     bh.seed_spend_policies()
     # R3 单轨：user 恒走互斥 total 形态（无 target 可切）
@@ -534,11 +479,9 @@ def test_user_total_limit_set_and_restore():
     blob = json.dumps([e["detail"] for e in events], ensure_ascii=False)
     assert "password" not in blob and "token" not in blob
 
-
 # --------------------------------------------------------------------------- #
 # 7. 用户创建扩展（同事务一次性总额度 + 不带额度不建行 + 注入失败回滚）
 # --------------------------------------------------------------------------- #
-@PG
 def test_users_create_with_total_limit_atomic():
     """建号带 total_limit_nano_cny → 同事务建一次性总额度（source=admin_create，
     default_version=None；不建 user_override 月策略——写面已随 R3 单轨删除）；
@@ -587,8 +530,6 @@ def test_users_create_with_total_limit_atomic():
     assert r_ret2.status_code == 400
     assert r_ret2.get_json()["error"]["code"] == "retired_spend_field"
 
-
-@PG
 def test_users_create_without_limit_inherits_default():
     """R3 单轨：无金额建号 → 同事务按 ai_spend_total_defaults 权威行（20 CNY）
     建 allowance（source=admin_create，default_version 锚定默认行版本）。"""
@@ -614,8 +555,6 @@ def test_users_create_without_limit_inherits_default():
     assert item["spend"]["total"]["total_limit_nano_cny"] == str(20 * 10 ** 9)
     assert "window" not in item["spend"]
 
-
-@PG
 def test_users_list_spend_total_mode_missing_row_reports_stable_error():
     """user 无 allowance 行 → 互斥形态的稳定 error code
     （spend_total_allowance_missing），不拖垮整页。
@@ -644,8 +583,6 @@ def test_users_list_spend_total_mode_missing_row_reports_stable_error():
     assert "total" not in by_id[owner["user_id"]]["spend"]
     assert by_id[owner["user_id"]]["spend"]["window"] is not None
 
-
-@PG
 def test_users_list_spend_display_single_track_locked():
     """R3 单轨形态锁定（取代四象限 target 驱动裁定）：user+有行 → 恒 total
     形态；user+无行 → 稳定 error（fail-closed 不伪造窗口）；owner/demo 恒
@@ -685,21 +622,12 @@ def test_users_list_spend_display_single_track_locked():
     assert "total" not in spend
     assert spend["window"] is not None
 
-
-@PG
 def test_users_create_pg_always_atomic_and_total_default_gate():
     """finding 1 建号变体收口：postgres 后端**不带金额字段**也走同事务组合
     原语——R3 单轨后 defaults 表无可用默认时 400 total_default_missing
-    （绝不建出无额度行的用户）；defaults 恢复后照常 200 并建行；
-    json 后端保留 legacy 旁路（无金额可建号）。"""
+    （绝不建出无额度行的用户）；defaults 恢复后照常 200 并建行。"""
     owner, _u = _setup_users()
     c = _login(_client(), owner)
-    if BACKEND != "postgres":
-        r = c.post("/api/admin/v1/users", json={
-            "login_id": "plain@x.com", "password": "password-123456"})
-        assert r.status_code == 200, r.get_data(as_text=True)
-        assert user_store.get_user_by_login_id("plain@x.com") is not None
-        pytest.skip("json 后端 legacy 旁路已验证")
     bh.seed_spend_policies()
     # 构造「defaults 缺行」→ 无可用默认（策略回退已删，唯一来源是 defaults 表）
     conn = bh.connect()
@@ -726,8 +654,6 @@ def test_users_create_pg_always_atomic_and_total_default_gate():
     assert spend_store.get_total_allowance(
         r2.get_json()["user"]["user_id"]) is not None
 
-
-@PG
 def test_users_create_override_failure_rolls_back_user():
     """单事务证据：总额度行写入失败 → 用户不创建（§5.1；allowance 注入目标，
     单轨恒触达 allowance 原语）。"""
@@ -749,8 +675,6 @@ def test_users_create_override_failure_rolls_back_user():
     assert user_store.get_user_by_login_id("rollback@x.com") is None
     assert spend_store.get_total_allowance("rollback@x.com") is None
 
-
-@PG
 def test_users_create_rejects_owner_and_bad_amount():
     bh.seed_spend_policies()
     owner, _u = _setup_users()
@@ -770,11 +694,9 @@ def test_users_create_rejects_owner_and_bad_amount():
     assert rb.status_code == 400
     assert rb.get_json()["error"]["code"] == "retired_spend_field"
 
-
 # --------------------------------------------------------------------------- #
 # 8. 邀请码总额度模板 + 兑换事务内一次性总额度（Batch B wave 2）
 # --------------------------------------------------------------------------- #
-@PG
 def test_invite_create_with_total_limit_template():
     """Batch B wave 2 + R3 Wave2-Compat：邀请初始金额字段为
     total_limit_nano_cny（wire 十进制字符串）；旧 monthly 字段退役——body 带
@@ -826,8 +748,6 @@ def test_invite_create_with_total_limit_template():
     for retired in ("source_code", "campaign_id", "cohort"):
         assert retired not in blob
 
-
-@PG
 def test_invite_redeem_creates_total_allowance_same_transaction():
     """兑换带模板面值：同一事务内建一次性总额度（source=invite，
     default_version=None），不建 user_override（写面已删）；恒 None 兼容键
@@ -870,8 +790,6 @@ def test_invite_redeem_creates_total_allowance_same_transaction():
                e["detail"].get("op") == "create_user_total_allowance"
                for e in events)
 
-
-@PG
 def test_invite_without_limit_redeem_uses_default():
     """R3 单轨：兑换无模板面值 → 同事务按 ai_spend_total_defaults 权威行
     （20 CNY）建 allowance（source=invite，default_version 锚定）；兼容键
@@ -890,8 +808,6 @@ def test_invite_without_limit_redeem_uses_default():
     assert allowance["source"] == "invite"
     assert allowance["default_version"] is not None  # 锚定默认行版本
 
-
-@PG
 def test_invite_redeem_override_failure_rolls_back_everything():
     """单事务证据：总额度写入失败 → 邀请不消费、用户不创建（allowance 注入
     目标；§5.2，单轨恒触达 allowance 原语）。"""
@@ -916,11 +832,9 @@ def test_invite_redeem_override_failure_rolls_back_everything():
     row = registration_store.get_invite(invite["invite_id"])
     assert row["consumed_at"] is None and row["use_count"] == 0
 
-
 # --------------------------------------------------------------------------- #
 # 9. settings 聚合（§6.1/§6.5 admin.settings.get 数据源）
 # --------------------------------------------------------------------------- #
-@PG
 def test_settings_aggregate_sections_and_decimal_strings():
     bh.seed_spend_policies()
     owner, _u = _setup_users()

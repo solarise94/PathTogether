@@ -38,9 +38,6 @@ from pg_compat import BACKEND  # noqa: E402
 from _pt_helpers import isolate_app, clear_upload_dir  # noqa: E402
 
 
-pg_only = pytest.mark.skipif(
-    BACKEND != "postgres", reason="配额 topup 需 PG（RUN_PG_TESTS=1）")
-
 SVS = b"fake-svs-content-0123456789"
 
 
@@ -366,7 +363,6 @@ else:
         raise RuntimeError("PG only")
 
 
-@pg_only
 def test_zip_expansion_topup_success():
     """zip 体小（CL 小）但展开大：move 前 topup 补占，成功后可 consume。"""
     uid = user_store.create_user("z1@x.com", "pass1234pass1234", role="user")["user_id"]
@@ -385,7 +381,6 @@ def test_zip_expansion_topup_success():
     assert (Path(UPLOAD_DIR) / "S.mrxs").exists()
 
 
-@pg_only
 def test_zip_expansion_topup_quota_exceeded():
     uid = user_store.create_user("z2@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid, 3000)  # 展开总量 5005 超配额

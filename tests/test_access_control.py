@@ -32,9 +32,8 @@ import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
 import share_server as share_srv  # noqa: E402
-from pg_compat import json_only, BACKEND  # noqa: E402
+from pg_compat import BACKEND  # noqa: E402
 from _pt_helpers import csrf_client, install_json_login_limits, isolate_app # noqa: E402
-
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
@@ -52,7 +51,6 @@ def _isolate(monkeypatch):
             child.unlink()
     yield
 
-
 # --------------------------------------------------------------------------- #
 # 辅助
 # --------------------------------------------------------------------------- #
@@ -61,17 +59,14 @@ def _client():
     app_mod.AUTH_ENABLED = True
     return csrf_client(app_mod.app.test_client())
 
-
 def _client_noauth():
     """AUTH_ENABLED=False 内网模式客户端。"""
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = False
     return csrf_client(app_mod.app.test_client())
 
-
 def _login(client, login_id, password):
     return client.post("/login", data={"username": login_id, "password": password})
-
 
 def _touch(name="demo.svs"):
     """在 UPLOAD_DIR 下放一个占位切片文件（_safe_name 要求文件存在）。"""
@@ -80,11 +75,9 @@ def _touch(name="demo.svs"):
     p.write_bytes(b"svs-stub")
     return name
 
-
 def _own(name, user_id):
     """设置切片归属（slide_meta.owner_user_id）。"""
     share_store.set_slide_meta(name, owner_user_id=user_id)
-
 
 def _setup_users():
     """创建 owner + userA + userB，注入 owner 归属，返回三元组 user dict。"""
@@ -93,7 +86,6 @@ def _setup_users():
     userB = user_store.create_user("b@x.com", "userBpass123456", role="user")
     share_store.set_owner_user_id(owner["user_id"])
     return owner, userA, userB
-
 
 # =========================================================================== #
 # 1. 仓储边界：guest 写操作被拒（PermissionError）
@@ -120,7 +112,6 @@ def test_guest_rejected_at_store_boundary():
     # requester_role=None（内部调用，如 share_server / internal AI）不限制
     share_store.create_project("p2")  # 不抛
     share_store.set_slide_meta("g.svs", alias="ok")  # 不抛
-
 
 # =========================================================================== #
 # 2. 跨用户图库读取被拒
@@ -152,7 +143,6 @@ def test_cross_user_gallery_read_denied():
     r = cb.get("/api/slide/%s/thumbnail" % sa)
     assert r.status_code == 403
 
-
 def test_cross_user_not_in_slides_list():
     owner, userA, userB = _setup_users()
     sa = _touch("a.svs")
@@ -167,7 +157,6 @@ def test_cross_user_not_in_slides_list():
     assert sb in names           # 自己的可见
     assert sa not in names       # userA 的不可见
 
-
 def test_owner_sees_all_slides():
     owner, userA, userB = _setup_users()
     sa = _touch("a.svs")
@@ -178,7 +167,6 @@ def test_owner_sees_all_slides():
     _login(co, "owner@x.com", "ownerpass123456")
     names = {i["name"] for i in co.get("/api/slides").get_json()}
     assert sa in names and sb in names
-
 
 # =========================================================================== #
 # 3. 越权 ID 枚举：不存在与无权切片行为一致（均 403，从 user 视角）
@@ -197,7 +185,6 @@ def test_unauthorized_id_enumeration_consistent():
     assert r1.status_code == 403
     assert r2.status_code == 403  # 与无权一致，不泄露存在性差异
 
-
 # =========================================================================== #
 # 4. 标注写入/删除越权
 # =========================================================================== #
@@ -206,7 +193,6 @@ def _post_anno(client, slide):
         "slide": slide, "type": "rect", "label": "L",
         "x": 0, "y": 0, "side_px": 100, "size_mm": 6.0,
     })
-
 
 def test_annotation_write_authorization():
     owner, userA, userB = _setup_users()
@@ -234,7 +220,6 @@ def test_annotation_write_authorization():
     r = ca.delete("/api/annotation/admin/%d" % idx_a)
     assert r.status_code == 200
 
-
 def test_owner_can_delete_any_annotation():
     owner, userA, _b = _setup_users()
     sa = _touch("a.svs")
@@ -249,7 +234,6 @@ def test_owner_can_delete_any_annotation():
     # owner 删 userA 创建的标注 → 200
     r = co.delete("/api/annotation/admin/%d" % idx)
     assert r.status_code == 200
-
 
 # =========================================================================== #
 # 5. 公开切片：对 user 可见；public 仅 owner 可设置
@@ -274,7 +258,6 @@ def test_public_slide_visible_to_user():
     r = cb.get("/api/slide/%s/info" % sa)
     assert r.status_code != 403
 
-
 def test_public_only_owner_can_set():
     owner, userA, _b = _setup_users()
     sa = _touch("a.svs")
@@ -296,7 +279,6 @@ def test_public_only_owner_can_set():
     r = ca.post("/api/slide/%s/meta" % sb, json={"alias": "hack"})
     assert r.status_code == 403
 
-
 # =========================================================================== #
 # 6. 分享权限三档（share_server）
 # =========================================================================== #
@@ -304,11 +286,9 @@ def _share_client():
     share_srv.app.config["TESTING"] = True
     return share_srv.app.test_client()
 
-
 def _valid_roi_body(slide):
     return {"slide": slide, "type": "rect", "label": "L",
             "x": 0, "y": 0, "side_px": 100, "size_mm": 6.0}
-
 
 def test_share_view_only_blocks_annotate():
     _setup_users()
@@ -323,29 +303,6 @@ def test_share_view_only_blocks_annotate():
     # PATCH / DELETE 也 403
     r2 = c.post("/s/%s/api/roi" % token, json=_valid_roi_body("demo.svs"))  # 仍 403，无标注被建
     assert r2.status_code == 403
-
-
-@json_only  # 直接写 shares.json 文件构造旧分享（PG 后端无文件 patch 语义）
-def test_old_share_without_permissions_unchanged():
-    """旧分享（无 permissions 字段）行为不变：默认含 annotate，可落标。"""
-    _setup_users()
-    _touch("demo.svs")
-    # 直接写一份无 permissions 字段的旧分享
-    old = {
-        "shares": {"tok_old": {"slides": ["demo.svs"], "created_at": 1.0,
-                               "expires_at": 1e12, "revoked": False}},
-        "rois": [], "projects": {}, "slide_meta": {}, "change_seq_by_slide": {},
-        "grants": [],
-    }
-    share_store.SHARE_FILE.write_text(json.dumps(old), encoding="utf-8")
-    c = _share_client()
-    r = c.post("/s/tok_old/api/roi", json=_valid_roi_body("demo.svs"))
-    assert r.status_code == 200, r.get_data(as_text=True)
-    # 默认权限读取为 view+annotate
-    sh = share_store.get_share("tok_old")
-    assert sh is not None
-    assert "annotate" in sh["permissions"] and "view" in sh["permissions"]
-
 
 def test_share_create_with_permissions_and_default():
     owner, userA, _b = _setup_users()
@@ -363,7 +320,6 @@ def test_share_create_with_permissions_and_default():
     r2 = ca.post("/api/share/create", json={"slides": [sa], "expires_hours": 1})
     assert r2.status_code == 200
     assert sorted(r2.get_json()["permissions"]) == ["annotate", "view"]
-
 
 # =========================================================================== #
 # 7. claim 流程
@@ -408,7 +364,6 @@ def test_claim_grants_visibility_and_revocation_revokes():
     assert so not in names
     assert cb2.get("/api/slide/%s/info" % so).status_code == 403
 
-
 def test_claim_invalid_share_404():
     _setup_users()
     userB = user_store.get_user_by_login_id("b@x.com")
@@ -416,7 +371,6 @@ def test_claim_invalid_share_404():
     _login(cb, "b@x.com", "userBpass123456")
     r = cb.post("/api/share/nope/claim")
     assert r.status_code == 404
-
 
 def test_claim_view_only_cannot_escalate_or_annotate():
     """view-only 分享：客户端不可自行提升为 annotate；认领后也不能落标。"""
@@ -443,7 +397,6 @@ def test_claim_view_only_cannot_escalate_or_annotate():
     r2 = _post_anno(cb, so)
     assert r2.status_code == 403
 
-
 def test_share_visitor_cannot_impersonate_via_copied_id():
     """分享端 ROI 响应不含 visitor；复制明文 cookie 不能冒用他人私有标注。"""
     _setup_users()
@@ -465,7 +418,6 @@ def test_share_visitor_cannot_impersonate_via_copied_id():
                    for item in listed2)
     r2 = c2.patch("/s/%s/api/roi/%s" % (token, idx), json={"note": "pwn"})
     assert r2.status_code in (403, 404)
-
 
 def test_legacy_plaintext_visitor_reclaim_then_blocks_copy():
     """升级前明文 visitor：原设备 unsigned cookie 可认领；认领后复制无法再冒用。"""
@@ -494,7 +446,6 @@ def test_legacy_plaintext_visitor_reclaim_then_blocks_copy():
                    for item in listed2)
     r2 = attacker.patch("/s/%s/api/roi/%s" % (token, idx), json={"note": "pwn"})
     assert r2.status_code in (403, 404)
-
 
 def test_legacy_reclaim_migrates_all_tokens_not_just_current():
     """认领 A 时同步哈希 B；攻击者不能借未迁移的 B 重铸同一签名身份。"""
@@ -533,11 +484,9 @@ def test_legacy_reclaim_migrates_all_tokens_not_just_current():
         "/s/%s/api/roi/%s" % (token_a, roi_a["index"]), json={"note": "pwn"}
     ).status_code in (403, 404)
 
-
 def _cookie_val(client, name):
     c = client.get_cookie(name, domain="localhost", path="/s")
     return None if c is None else c.value
-
 
 def _expire_share(token):
     """把 share 的 expires_at 拨到过去（JSON 写文件 / PG 更新行）。"""
@@ -560,7 +509,6 @@ def _expire_share(token):
         data["shares"][token]["expires_at"] = 1.0
         path.write_text(json.dumps(data), encoding="utf-8")
 
-
 def _two_shares_same_visitor():
     _setup_users()
     _touch("demo.svs")
@@ -574,7 +522,6 @@ def _two_shares_same_visitor():
         token_b, "demo.svs", "L", type="rect", x=10, y=10, side_px=100, size_mm=6.0,
         visitor="legacy-device-1")
     return token_a, token_b, roi_a, roi_b
-
 
 def _assert_inactive_token_does_not_reclaim(
         inactive_token, live_token, live_roi, status=404, inactive_roi=None):
@@ -605,7 +552,6 @@ def _assert_inactive_token_does_not_reclaim(
         "/s/%s/api/roi/%s" % (live_token, live_roi["index"]), json={"note": "pwn"}
     ).status_code in (403, 404)
 
-
 def test_revoked_share_cannot_reclaim_visitor():
     """已撤销链接返回 404，当场不得全局迁移（另开客户端只带 v2）。"""
     token_a, token_b, roi_a, roi_b = _two_shares_same_visitor()
@@ -613,14 +559,12 @@ def test_revoked_share_cannot_reclaim_visitor():
     _assert_inactive_token_does_not_reclaim(
         token_a, token_b, roi_b, inactive_roi=roi_a)
 
-
 def test_expired_share_cannot_reclaim_visitor():
     """过期链接返回 404，当场不得全局迁移（另开客户端只带 v2）。"""
     token_a, token_b, roi_a, roi_b = _two_shares_same_visitor()
     _expire_share(token_a)
     _assert_inactive_token_does_not_reclaim(
         token_a, token_b, roi_b, inactive_roi=roi_a)
-
 
 def test_missing_share_cannot_reclaim_visitor():
     """不存在的 token 返回 404，当场不得迁移；只复制 v2 不能编辑有效链接。"""
@@ -632,7 +576,6 @@ def test_missing_share_cannot_reclaim_visitor():
         token_b, "demo.svs", "L", type="rect", x=10, y=10, side_px=100, size_mm=6.0,
         visitor="legacy-device-1")
     _assert_inactive_token_does_not_reclaim("not-a-real-token", token_b, roi_b)
-
 
 def test_revoked_share_same_client_fcfs_on_valid_token():
     """无效链接保留 mig cookie：同一客户端随后访问仍有效的 token 可先到先得认领。"""
@@ -651,7 +594,6 @@ def test_revoked_share_same_client_fcfs_on_valid_token():
     ).status_code == 200
     assert share_store.get_roi(token_b, roi_b["index"])["visitor"].startswith("h1.")
     assert _cookie_val(c, "svs_visitor_mig") in (None, "")
-
 
 def test_legacy_mig_cookie_survives_s_then_reclaims():
     """先访问 /s 不得销毁旧身份；随后正确链接仍可认领。"""
@@ -678,7 +620,6 @@ def test_legacy_mig_cookie_survives_s_then_reclaims():
     assert share_store.get_roi(token, idx)["visitor"].startswith("h1.")
     assert _cookie_val(c, "svs_visitor_mig") in (None, "")
 
-
 def test_legacy_mig_cookie_survives_wrong_token_then_reclaims():
     """错误 token / 过期链接覆盖签名 cookie 后，mig 凭据仍能在正确链接认领。"""
     _setup_users()
@@ -701,7 +642,6 @@ def test_legacy_mig_cookie_survives_wrong_token_then_reclaims():
     listed = c.get("/s/%s/api/rois" % token_a).get_json()
     assert any(item.get("index") == idx and item.get("source") == "me" for item in listed)
     assert c.patch("/s/%s/api/roi/%s" % (token_a, idx), json={"note": "still mine"}).status_code == 200
-
 
 def test_reclaim_keeps_v2_identity_and_interim_roi_ownership():
     """错误 token 上用随机 v2 新建的 ROI，认领后仍可编辑（不切换主 cookie）。"""
@@ -743,7 +683,6 @@ def test_reclaim_keeps_v2_identity_and_interim_roi_ownership():
         "/s/%s/api/roi/%s" % (token_b, new_idx), json={"note": "new still mine"}
     ).status_code == 200
 
-
 def test_visitor_hmac_secret_locked_create_is_stable():
     """多线程首次创建 visitor_hmac.key 得到同一密钥。"""
     import threading
@@ -764,7 +703,6 @@ def test_visitor_hmac_secret_locked_create_is_stable():
     assert len(results) == 8
     assert len(set(results)) == 1
     assert secret_file.is_file()
-
 
 # =========================================================================== #
 # 8. AUTH_ENABLED=False 内网模式：全部旧行为不变
@@ -789,7 +727,6 @@ def test_internal_mode_no_filtering():
     assert c.get("/api/auth/info").get_json()["role"] is None
     assert c.get("/api/auth/info").get_json()["auth_enabled"] is False
 
-
 # =========================================================================== #
 # 9. user 只能分享/删除自己切片
 # =========================================================================== #
@@ -812,7 +749,6 @@ def test_user_can_only_share_own_slides():
     r = ca.post("/api/share/create", json={"slides": [sa, sb], "expires_hours": 1})
     assert r.status_code == 403
 
-
 def test_user_can_only_delete_own_slides():
     owner, userA, userB = _setup_users()
     sa = _touch("a.svs")
@@ -828,7 +764,6 @@ def test_user_can_only_delete_own_slides():
     # 删自己的 → 200
     r = ca.delete("/api/slide/%s" % sa)
     assert r.status_code == 200
-
 
 def test_share_list_revoke_owner_vs_user():
     owner, userA, _b = _setup_users()
@@ -866,7 +801,6 @@ def test_share_list_revoke_owner_vs_user():
     r = ca.post("/api/share/revoke", json={"token": tok_a})
     assert r.status_code == 200
 
-
 # =========================================================================== #
 # 10. project 隔离
 # =========================================================================== #
@@ -901,7 +835,6 @@ def test_project_isolation():
     _login(co, "owner@x.com", "ownerpass123456")
     assert co.get("/api/project/%s" % pid_a).status_code == 200
 
-
 def test_annotations_filtered_for_user():
     owner, userA, userB = _setup_users()
     sa = _touch("a.svs")
@@ -925,7 +858,6 @@ def test_annotations_filtered_for_user():
     assert cb.get("/api/annotations?slide=a.svs").status_code == 403
     # userB 拉 b.svs 标注 → 200
     assert cb.get("/api/annotations?slide=b.svs").status_code == 200
-
 
 # =========================================================================== #
 # 11. current_identity 单元（owner 语义兜底）

@@ -37,9 +37,6 @@ from plugins.sdk import manifest as M  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
 
-PG = pytest.mark.skipif(BACKEND != "postgres",
-                        reason="advisory lock 并发回归需 PG（RUN_PG_TESTS=1）")
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ADMIN_PLUGIN_DIR = REPO_ROOT / "plugins" / "pathtogether-admin"
 ADMIN_MANIFEST = ADMIN_PLUGIN_DIR / "manifest.json"
@@ -516,7 +513,6 @@ def test_bootstrap_creates_enabled_installation_idempotently():
     assert "admin-plugin-frame" in r.get_data(as_text=True)
 
 
-@PG
 def test_bootstrap_serialized_concurrent_pg():
     """多 worker 首启竞态回归（2026-08-28 生产双行事故）：两个线程同时进入带
     advisory lock 的引导，最终只有一条安装行，且两次返回同一 installation_id。

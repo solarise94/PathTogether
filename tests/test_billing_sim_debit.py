@@ -37,9 +37,6 @@ import billing_store  # noqa: E402
 
 from pg_compat import BACKEND  # noqa: E402
 
-PG = pytest.mark.skipif(BACKEND != "postgres",
-                        reason="模拟扣费数据路径需 PG（RUN_PG_TESTS=1）")
-
 if BACKEND == "postgres":
     import _billing_helpers as bh  # noqa: E402
     import user_store  # noqa: E402
@@ -131,7 +128,6 @@ def _count(table):
         conn.close()
 
 
-@PG
 def test_priced_user_auto_account_and_debit():
     """priced user 事件：自动开户 + 一条负金额 usage_debit + 余额为负。"""
     bh.seed_price_books_with_history()
@@ -182,7 +178,6 @@ def test_priced_user_auto_account_and_debit():
     assert item["amount_nano_cny"] == -charge
 
 
-@PG
 def test_replay_same_event_single_debit():
     bh.seed_price_books_with_history()
     user = user_store.create_user("simdeb-u2@x.com", "pass123456789012")
@@ -208,7 +203,6 @@ def test_replay_same_event_single_debit():
     _ingest_audit_detail(event["event_id"])
 
 
-@PG
 def test_owner_subject_debited():
     bh.seed_price_books_with_history()
     owner = user_store.create_user("simdeb-owner@x.com", "pass123456789012",
@@ -225,7 +219,6 @@ def test_owner_subject_debited():
         == -result["row"]["charge_nano_cny"]
 
 
-@PG
 def test_demo_subject_never_debited():
     """§14.1 红线回归：demo 主体 priced 也不开户、不写 ledger。"""
     bh.seed_price_books_with_history()
@@ -239,7 +232,6 @@ def test_demo_subject_never_debited():
     assert detail["simulated_debit_skipped"] == "demo_subject"
 
 
-@PG
 def test_unpriced_event_no_debit():
     bh.seed_price_books_with_history()
     user = user_store.create_user("simdeb-u3@x.com", "pass123456789012")
@@ -254,7 +246,6 @@ def test_unpriced_event_no_debit():
     assert detail["simulated_debit_skipped"] == "unpriced"
 
 
-@PG
 def test_disabled_flag_skips_debit(monkeypatch):
     monkeypatch.setenv("BILLING_SIMULATED_DEBIT", "0")
     bh.seed_price_books_with_history()
@@ -268,7 +259,6 @@ def test_disabled_flag_skips_debit(monkeypatch):
     assert detail["simulated_debit_skipped"] == "disabled"
 
 
-@PG
 def test_user_row_missing_skips_debit():
     """owner/user 主体在 users 无行：不伪造用户行也不开户（FK 保护）。"""
     bh.seed_price_books_with_history()
@@ -287,7 +277,6 @@ def test_user_row_missing_skips_debit():
     assert detail["simulated_debit_skipped"] == "user_missing"
 
 
-@PG
 def test_zero_charge_skips_debit():
     """全 0 token 的 priced 事件 charge=0：usage_debit 符号 CHECK 要求严格
     负数，0 元不入账（≠ 0 元冒充扣费）。"""
@@ -305,7 +294,6 @@ def test_zero_charge_skips_debit():
     assert detail["simulated_debit_skipped"] == "zero_charge"
 
 
-@PG
 def test_suspended_account_skips_debit():
     bh.seed_price_books_with_history()
     user = user_store.create_user("simdeb-u6@x.com", "pass123456789012")
@@ -327,7 +315,6 @@ def test_suspended_account_skips_debit():
     assert detail["simulated_debit_skipped"] == "account_suspended"
 
 
-@PG
 def test_debit_failure_does_not_block_ingest(monkeypatch, caplog):
     """best-effort 纪律：扣费段抛错 → SAVEPOINT 回滚，事件照常入库。"""
     bh.seed_price_books_with_history()
@@ -358,7 +345,6 @@ def test_debit_failure_does_not_block_ingest(monkeypatch, caplog):
             '"value":%d}' % (before + 1)) == metric
 
 
-@PG
 def test_ingest_audit_wire_amount_decimal_string():
     """admin v1 出口：simulated_debit.amount_nano_cny 为十进制字符串。
 
@@ -391,7 +377,6 @@ def test_ingest_audit_wire_amount_decimal_string():
     assert wired["balance_nano"].startswith("-")
 
 
-@PG
 def test_concurrent_delivery_single_debit():
     """两线程并发投递同 event：一条事件一条 debit（唯一索引/幂等键兜底）。"""
     from concurrent.futures import ThreadPoolExecutor

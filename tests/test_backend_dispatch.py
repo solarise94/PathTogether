@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
-"""Stage 3b-1 dispatcher 拆分测试。
+"""Dispatcher 拆分测试（R3 Wave 3：默认即 PostgreSQL）。
 
-覆盖（验收红线：零行为变化）：
-  1. 默认 json 后端可用：create_share/list_shares 与 create_user/verify_user 冒烟走通
-     JSON 实现（经 dispatcher，不经任何调用方改动）；
-  2. STORAGE_BACKEND=postgres 时 getattr 任一公共名抛 RuntimeError（3b-2 才接入）；
+覆盖：
+  1. 默认后端为 postgres：create_share/list_shares 与 create_user/verify_user 冒烟
+    走通 PG 实现（经 dispatcher，不经任何调用方改动）；
+  2. STORAGE_BACKEND 非法值在 import 期报错；
   3. dispatcher 公共名与 json impl 源码声明的公共名集合一致（防漏 export）；
-  4. STORAGE_BACKEND 非法值在 import 期报错。
+  4. PG 后端公共名接线（re-export，不再抛 RuntimeError）；
+  5. PG 后端不得拉入 json 实现（share_store_pg 源码级断言）。
 
 隔离：独立临时 SHARE_DATA_DIR，绝不触碰真实数据。dispatcher 读 STORAGE_BACKEND 时机
 在 import 期，故 postgres/非法值场景用 importlib 加载**全新**模块实例（独立模块名），
-不污染进程内默认的 json dispatcher。
+不污染进程内默认的 postgres dispatcher。
 """
 import ast
 import importlib.util
@@ -30,11 +31,10 @@ os.makedirs(os.environ["SHARE_DATA_DIR"], exist_ok=True)
 
 import pytest  # noqa: E402
 
-import share_store  # noqa: E402  默认 json dispatcher
+import share_store  # noqa: E402  默认 postgres dispatcher
 import user_store  # noqa: E402
-import share_store_json  # noqa: E402  json 实现
+import share_store_json  # noqa: E402  json 实现（仅作 export 对比源）
 import user_store_json  # noqa: E402
-import conftest  # noqa: E402  （RUN_PG_TESTS=1 时提供 BACKEND）
 
 DISPATCHER_INFRA_NAMES = {"STORAGE_BACKEND"}  # dispatcher 自身额外暴露的非业务公共名
 
@@ -85,36 +85,23 @@ def _load_fresh(source_path, mod_name):
 
 
 # --------------------------------------------------------------------------- #
-# 1. 默认 json 后端冒烟（经 dispatcher）
+# 1. 默认 postgres 后端冒烟（经 dispatcher）
 # --------------------------------------------------------------------------- #
-def test_default_backend_is_json():
-    if conftest.BACKEND == "postgres":
-        pytest.skip("RUN_PG_TESTS=1 下默认后端为 postgres（json-only 断言）")
-    assert share_store.STORAGE_BACKEND == "json"
-    assert user_store.STORAGE_BACKEND == "json"
+def test_default_backend_is_postgres():
+    assert share_store.STORAGE_BACKEND == "postgres"
+    assert user_store.STORAGE_BACKEND == "postgres"
 
 
-def test_json_smoke_share_store(monkeypatch, tmp_path):
-    """create_share → list_shares 走通 json 实现。"""
-    sf = tmp_path / "shares.json"
-    monkeypatch.setattr(share_store, "SHARE_DATA_DIR", tmp_path)
-    monkeypatch.setattr(share_store, "SHARE_FILE", sf)
-    # dispatcher 的 __setattr__ 镜像会同步到 share_store_json
-    assert share_store_json.SHARE_FILE == sf
-
+def test_postgres_smoke_share_store():
+    """create_share → list_shares 走通 postgres 实现（conftest 已起内嵌 PG）。"""
     token = share_store.create_share(slides=["demo.svs"], expires_hours=1)
     assert token and token.get("token")
     listed = share_store.list_shares()
     assert any(s["token"] == token["token"] for s in listed)
 
 
-def test_json_smoke_user_store(monkeypatch, tmp_path):
-    """create_user → verify_user 走通 json 实现（密码满足批次 A 15..200 策略）。"""
-    uf = tmp_path / "users.json"
-    monkeypatch.setattr(user_store, "SHARE_DATA_DIR", tmp_path)
-    monkeypatch.setattr(user_store, "USER_FILE", uf)
-    assert user_store_json.USER_FILE == uf
-
+def test_postgres_smoke_user_store():
+    """create_user → verify_user 走通 postgres 实现（密码满足批次 A 15..200 策略）。"""
     login_id = "alice@example.com"
     password = "Password12345678"  # 16 字符（≥ PASSWORD_MIN_LENGTH=15）
     created = user_store.create_user(login_id, password, role="user")
@@ -125,17 +112,15 @@ def test_json_smoke_user_store(monkeypatch, tmp_path):
 
 # --------------------------------------------------------------------------- #
 # 2. STORAGE_BACKEND=postgres/dual 时公共名已接线（re-export，不再抛 RuntimeError）
-#    需 psycopg（share_store_pg/user_store_pg import 期依赖）；缺依赖的裸解释器
-#    整组 skip（与 test_pg_infra 同理，不 fail）。
+#    active dispatcher 即 postgres；再以独立模块名加载验证 re-export 与非法值。
 # --------------------------------------------------------------------------- #
 import importlib.util as _ilu  # noqa: E402
 
 _PSYCOPG_AVAILABLE = _ilu.find_spec("psycopg") is not None
-_pg_only = pytest.mark.skipif(
+
+
+@pytest.mark.skipif(
     not _PSYCOPG_AVAILABLE, reason="缺 psycopg：postgres 后端 import 需该依赖")
-
-
-@_pg_only
 def test_postgres_backend_exports_public_names(monkeypatch):
     monkeypatch.setenv("STORAGE_BACKEND", "postgres")
     mod = _load_fresh(_REPO_ROOT / "share_store.py", "ss_pg_test")
@@ -148,21 +133,13 @@ def test_postgres_backend_exports_public_names(monkeypatch):
         mod.this_does_not_exist
 
 
-@_pg_only
+@pytest.mark.skipif(
+    not _PSYCOPG_AVAILABLE, reason="缺 psycopg：postgres 后端 import 需该依赖")
 def test_postgres_backend_user_store_exports(monkeypatch):
     monkeypatch.setenv("STORAGE_BACKEND", "postgres")
     mod = _load_fresh(_REPO_ROOT / "user_store.py", "us_pg_test")
     assert "verify_user" in vars(mod)
     assert callable(mod.verify_user)
-
-
-@_pg_only
-def test_dual_backend_exports_json_read_names(monkeypatch):
-    monkeypatch.setenv("STORAGE_BACKEND", "dual")
-    mod = _load_fresh(_REPO_ROOT / "share_store.py", "ss_dual_test")
-    assert "list_shares" in vars(mod)  # 读路径 re-export json
-    assert callable(mod.list_shares)
-    assert mod.STORAGE_BACKEND == "dual"
 
 
 # --------------------------------------------------------------------------- #

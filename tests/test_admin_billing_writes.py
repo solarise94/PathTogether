@@ -38,16 +38,12 @@ import user_store  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
 
-PG = pytest.mark.skipif(BACKEND != "postgres",
-                        reason="billing/invite/budget 写路径需 PG（RUN_PG_TESTS=1）")
-
 if BACKEND == "postgres":
     import psycopg  # noqa: E402
     import budget_store  # noqa: E402
 
 app_mod.UPLOAD_DIR = Path(UPLOAD_DIR)
 app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
 
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
@@ -56,11 +52,9 @@ def _isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
     yield
 
-
 def _client():
     app_mod.app.config["TESTING"] = True
     return csrf_client(app_mod.app.test_client())
-
 
 def _login(client, user):
     with client.session_transaction() as s:
@@ -69,7 +63,6 @@ def _login(client, user):
         s["role"] = user.get("role") or "user"
         s["auth_version"] = user.get("auth_version", 1)
     return client
-
 
 def _setup_users(n_extra=1):
     owner = user_store.create_user(
@@ -81,7 +74,6 @@ def _setup_users(n_extra=1):
             display_name="User %d" % i))
     return tuple([owner] + users)
 
-
 def _pg_count(table, where="", args=()):
     """直连计数（同事务回滚断言用：entry/caps 均未落库）。"""
     conn = billing_store._connect()
@@ -91,7 +83,6 @@ def _pg_count(table, where="", args=()):
             return int(cur.fetchone()["n"])
     finally:
         conn.close()
-
 
 # --------------------------------------------------------------------------- #
 # 1. owner 门控（匿名 / user / preview）——全部写端点
@@ -107,7 +98,6 @@ _WRITE_ENDPOINTS = [
     ("POST", "/api/admin/v1/invites/inv_x/revoke"),
 ]
 
-
 def test_anonymous_gets_401_on_every_write_endpoint():
     _setup_users()
     for method, path in _WRITE_ENDPOINTS:
@@ -115,14 +105,12 @@ def test_anonymous_gets_401_on_every_write_endpoint():
         assert r.status_code == 401, "%s %s -> %s" % (method, path, r.status_code)
         assert r.get_json()["error"] == "auth_required"
 
-
 def test_user_gets_403_on_every_write_endpoint():
     owner, usera = _setup_users()
     c = _login(_client(), usera)
     for method, path in _WRITE_ENDPOINTS:
         r = getattr(c, method.lower())(path, json={})
         assert r.status_code == 403, "%s %s -> %s" % (method, path, r.status_code)
-
 
 def test_preview_owner_rejected_on_every_write_endpoint():
     """owner 预览成 user：管理写端点一律 403（§14.1 权限行）。"""
@@ -133,7 +121,6 @@ def test_preview_owner_rejected_on_every_write_endpoint():
     for method, path in _WRITE_ENDPOINTS:
         r = getattr(c, method.lower())(path, json={})
         assert r.status_code == 403, "%s %s -> %s" % (method, path, r.status_code)
-
 
 # --------------------------------------------------------------------------- #
 # 2. users 写端点（两种后端同语义；break-glass 镜像旧端点）
@@ -163,7 +150,6 @@ def test_users_create_basic_and_guards():
         "login_id": "owner@x.com", "password": "longpassword-12345"
     }).status_code == 409
 
-
 def test_users_disable_enable_auth_version_and_break_glass():
     owner, usera = _setup_users()
     c = _login(_client(), owner)
@@ -190,7 +176,6 @@ def test_users_disable_enable_auth_version_and_break_glass():
     assert r.status_code == 200
     assert int(r.get_json()["user"]["auth_version"]) == before + 2
 
-
 def test_users_password_reset_validation():
     owner, usera = _setup_users()
     c = _login(_client(), owner)
@@ -203,32 +188,15 @@ def test_users_password_reset_validation():
     assert r.status_code == 200
     assert "password" not in r.get_json()["user"]
 
-
 # --------------------------------------------------------------------------- #
 # 3. json/dual fail-closed（PG-only 写端点稳定 503）
 # --------------------------------------------------------------------------- #
-def test_json_pg_only_write_endpoints_fail_closed():
-    if BACKEND == "postgres":
-        pytest.skip("json 后端专用反向用例（PG 模式跑正向路径）")
-    owner, usera = _setup_users()
-    c = _login(_client(), owner)
-    for method, path, body in (
-            ("POST", "/api/admin/v1/users/%s/ai-access" % usera["user_id"],
-             {"enabled": True}),
-            ("GET", "/api/admin/v1/invites", None),
-            ("POST", "/api/admin/v1/invites", {}),
-            ("POST", "/api/admin/v1/invites/inv_x/revoke", {})):
-        r = getattr(c, method.lower())(path, json=body)
-        assert r.status_code == 503, "%s %s -> %s" % (method, path, r.status_code)
-        assert r.get_json()["error"]["code"] == "pg_backend_required"
-
 
 # --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
 # 7. ai-access（PG）
 # --------------------------------------------------------------------------- #
-@PG
 def test_ai_access_set_and_unset():
     owner, usera = _setup_users()
     c = _login(_client(), owner)
@@ -245,12 +213,10 @@ def test_ai_access_set_and_unset():
     assert c.post("/api/admin/v1/users/%s/ai-access" % usera["user_id"],
                   json={"enabled": "yes"}).status_code == 400
 
-
 # --------------------------------------------------------------------------- #
 # 8. invites（PG）：创建校验 / token 仅一次 / 撤销（Batch B wave 2：来源字段
 #    退役 400 retired_invite_field；初始金额字段 total_limit_nano_cny）
 # --------------------------------------------------------------------------- #
-@PG
 def test_invites_create_token_once_and_slug_validation():
     owner, _u = _setup_users()
     c = _login(_client(), owner)
@@ -295,8 +261,6 @@ def test_invites_create_token_once_and_slug_validation():
     assert c.post("/api/admin/v1/invites",
                   json={"ttl_hours": 721}).status_code == 400
 
-
-@PG
 def test_invites_pagination():
     owner, _u = _setup_users()
     c = _login(_client(), owner)
@@ -312,8 +276,6 @@ def test_invites_pagination():
     seen = {i["invite_id"] for i in body["invites"] + body2["invites"]}
     assert len(seen) == 4  # 无重复
 
-
-@PG
 def test_invites_revoke_semantics():
     owner, _u = _setup_users()
     c = _login(_client(), owner)
@@ -342,5 +304,4 @@ def test_invites_revoke_semantics():
         conn.close()
     r = c.post("/api/admin/v1/invites/%s/revoke" % consumed["invite_id"])
     assert r.status_code == 409
-
 

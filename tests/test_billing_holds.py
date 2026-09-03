@@ -52,9 +52,6 @@ import billing_store  # noqa: E402
 
 from pg_compat import BACKEND  # noqa: E402
 
-PG = pytest.mark.skipif(BACKEND != "postgres",
-                        reason="billing holds 数据路径需 PG（RUN_PG_TESTS=1）")
-
 if BACKEND == "postgres":
     import _billing_helpers as bh  # noqa: E402
     import budget_store  # noqa: E402
@@ -67,7 +64,6 @@ app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 #: 数据层直调用的 installation 标识（行内记录，无跨表校验）
 INSTALLATION = "pin_hold_test"
 
-
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
     """每用例独立存储 + AUTH_ENABLED=False（内网 json 模式不变量）。"""
@@ -79,7 +75,6 @@ def _isolated(tmp_path, monkeypatch):
                             app_mod._PLUGIN_RATE_LIMIT_PER_MIN))
     yield
 
-
 # --------------------------------------------------------------------------- #
 # 端点基建（与 test_usage_ingest 同款机器通道引导）
 # --------------------------------------------------------------------------- #
@@ -88,7 +83,6 @@ def _bootstrap():
     assert inst is not None
     app_mod._HISTOPILOT_INSTALLATION = inst
     return inst
-
 
 def _file_secret():
     f = Path(os.environ["SHARE_DATA_DIR"]) / "plugin-secret-histopilot.txt"
@@ -101,11 +95,9 @@ def _file_secret():
         pass
     return raw
 
-
 def _client():
     app_mod.app.config["TESTING"] = True
     return app_mod.app.test_client()
-
 
 def _token_for(inst):
     r = _client().post("/api/plugin/v1/auth/token",
@@ -114,15 +106,12 @@ def _token_for(inst):
     assert r.status_code == 200, r.get_json()
     return r.get_json()["access_token"]
 
-
 def _bearer(token):
     return {"Authorization": "Bearer " + token}
-
 
 def _post_hold(token, body, client=None):
     return (client or _client()).post(
         "/api/plugin/v1/billing/holds", headers=_bearer(token), json=body)
-
 
 def _settle(token, hold_id, body=None, client=None):
     """settle：body=None → 不发 JSON（release）；dict → 带 event_id。"""
@@ -130,7 +119,6 @@ def _settle(token, hold_id, body=None, client=None):
     return (client or _client()).post(
         "/api/plugin/v1/billing/holds/%s/settle" % hold_id,
         headers=_bearer(token), **kwargs)
-
 
 def _assert_envelope(r, status, code, retryable=None):
     assert r.status_code == status, "got %s body=%r" % (
@@ -144,7 +132,6 @@ def _assert_envelope(r, status, code, retryable=None):
         assert err["retryable"] is retryable
     return err
 
-
 # --------------------------------------------------------------------------- #
 # 载荷构造（PG 数据层 + json 纯校验共用）
 # --------------------------------------------------------------------------- #
@@ -152,7 +139,6 @@ def _ids():
     hex32 = uuid.uuid4().hex
     return ("call_" + hex32, "sess_" + uuid.uuid4().hex[:16],
             "req_" + uuid.uuid4().hex[:16])
-
 
 def _hold_body(subject_type, subject_id, *, session_id, request_id=None,
                call_id=None, model="deepseek-v4-flash", est_in=1_000_000,
@@ -174,11 +160,9 @@ def _hold_body(subject_type, subject_id, *, session_id, request_id=None,
         body["user_id"] = user_id
     return body
 
-
 def _authorize(body, now=None):
     return billing_store.authorize_hold(
         body, installation_id=INSTALLATION, plugin_id="histopilot", now=now)
-
 
 # --------------------------------------------------------------------------- #
 # json 模式：鉴权 + fail-closed + 纯函数
@@ -190,26 +174,6 @@ def test_no_token_401_envelope():
     r = _client().post("/api/plugin/v1/billing/holds/hold_deadbeef/settle", json={})
     _assert_envelope(r, 401, "unauthorized", retryable=False)
 
-
-def test_json_backend_pg_backend_required():
-    if BACKEND == "postgres":
-        pytest.skip("PG 后端专用反向用例（json 模式才返回 pg_backend_required）")
-    inst = _bootstrap()
-    token = _token_for(inst)
-    client = _client()
-    call_id, session_id, _ = _ids()
-    body = _hold_body("user", "usr_jsonmode", session_id=session_id,
-                      call_id=call_id)
-    r = _post_hold(token, body, client=client)
-    _assert_envelope(r, 503, "pg_backend_required", retryable=False)
-    r = _settle(token, "hold_" + "0" * 24, body={"event_id": "use_" + "0" * 32},
-                client=client)
-    _assert_envelope(r, 503, "pg_backend_required", retryable=False)
-    # release 形态（空 body）同样 fail-closed
-    r = _settle(token, "hold_" + "1" * 24, client=client)
-    _assert_envelope(r, 503, "pg_backend_required", retryable=False)
-
-
 def test_hold_ttl_seconds_env_parsing(monkeypatch):
     monkeypatch.delenv("BILLING_HOLD_TTL_SECONDS", raising=False)
     assert billing_store.hold_ttl_seconds() == 300  # 缺省 5 分钟
@@ -218,7 +182,6 @@ def test_hold_ttl_seconds_env_parsing(monkeypatch):
     for bad in ("abc", "0", "-5", "  ", "3.5", "+"):
         monkeypatch.setenv("BILLING_HOLD_TTL_SECONDS", bad)
         assert billing_store.hold_ttl_seconds() == 300, bad
-
 
 def test_validate_hold_authorize_body_wordlist():
     call_id, session_id, request_id = _ids()
@@ -248,7 +211,6 @@ def test_validate_hold_authorize_body_wordlist():
                for e in billing_store.validate_hold_authorize_body(
                    dict(good, estimated_input_tokens=True)))
 
-
 def test_validate_hold_settle_body_wordlist():
     assert billing_store.validate_hold_settle_body(None) == []  # 空 = release
     assert billing_store.validate_hold_settle_body({}) == []
@@ -259,7 +221,6 @@ def test_validate_hold_settle_body_wordlist():
         {"event_id": "use_short"}))
     assert any("额外字段" in e for e in
                billing_store.validate_hold_settle_body({"foo": 1}))
-
 
 # --------------------------------------------------------------------------- #
 # PG：authorize 语义
@@ -274,14 +235,12 @@ def _user_with_account(email, grant_nano=None):
             "adj_" + uuid.uuid4().hex, actor_user_id=None)
     return user
 
-
 def _squeeze_total_limit(user_id, limit_nano):
     """把 user 总额度压到指定面值（建号默认 20 CNY、version=1）——
     单轨后 user 的 would_deny/拒绝口径是 ai_spend_total_allowances。"""
     import spend_store
     return spend_store.set_user_total_limit(
         user_id, int(limit_nano), 1, actor_user_id="pytest")
-
 
 def _expected_estimated(now, model, est_in, max_out):
     """与 authorize_hold 同口径复算最坏价（customer_charge，时刻=authorize now）。"""
@@ -297,7 +256,6 @@ def _expected_estimated(now, model, est_in, max_out):
     cap = billing_store.estimate_output_token_cap()
     est_out = max_out if cap <= 0 else min(max_out, cap)
     return billing_pricing.price_tokens_nano(0, est_in, est_out, book)
-
 
 def _hold_row(hold_id=None, call_id=None):
     conn = bh.connect()
@@ -315,7 +273,6 @@ def _hold_row(hold_id=None, call_id=None):
     assert len(rows) <= 1, "同 call_id 至多一行"
     return rows[0] if rows else None
 
-
 def _count(table):
     conn = bh.connect()
     try:
@@ -325,8 +282,6 @@ def _count(table):
     finally:
         conn.close()
 
-
-@PG
 def test_authorize_estimated_balance_would_deny_deterministic():
     """有账户主体：estimated=最坏价（输入全按 cache-miss）、balance=grant 合计、
     would_deny 余额充足 False / 不足 True（行照写、永不拒绝——影子语义）。"""
@@ -368,8 +323,6 @@ def test_authorize_estimated_balance_would_deny_deterministic():
     assert r2["would_deny"] is True
     assert r2["status"] == "open" and r2["duplicate"] is False
 
-
-@PG
 def test_authorize_estimate_matches_cny_conversion_independent():
     """authorize 估算与「CNY 面值 ×1e9」独立复算一致（批次 A §9.1）。
 
@@ -404,7 +357,6 @@ def test_authorize_estimate_matches_cny_conversion_independent():
     assert result["estimated_nano_cny"] == expected
     assert result["estimated_nano_cny"] >= 1_500_000_000
 
-
 def _cap_authorize(email, *, max_out, est_in=1_000_000):
     """cap 用例共用夹具：种子价目 + user + bind + authorize，返回 (result, book)。"""
     bh.seed_price_books_with_history()
@@ -427,8 +379,6 @@ def _cap_authorize(email, *, max_out, est_in=1_000_000):
     assert book is not None
     return result, book
 
-
-@PG
 def test_authorize_estimate_output_capped_by_default():
     """默认 4096 封顶：body max_output_tokens=200k 时 output 分量只按 4096 估。"""
     result, book = _cap_authorize("hold-cap-dft@x.com", max_out=200_000)
@@ -437,8 +387,6 @@ def test_authorize_estimate_output_capped_by_default():
     assert result["estimated_nano_cny"] == capped
     assert capped < uncapped  # 夹具自证：封顶确实生效（不恒等）
 
-
-@PG
 def test_authorize_estimate_output_cap_env_override(monkeypatch):
     """env 覆盖封顶值（1000）：output 分量按覆盖值估。"""
     monkeypatch.setenv("BILLING_ESTIMATE_OUTPUT_TOKEN_CAP", "1000")
@@ -446,8 +394,6 @@ def test_authorize_estimate_output_cap_env_override(monkeypatch):
     assert result["estimated_nano_cny"] == billing_pricing.price_tokens_nano(
         0, 1_000_000, 1000, book)
 
-
-@PG
 def test_authorize_estimate_output_cap_zero_disables(monkeypatch):
     """封顶 ≤0 = 不封顶：恢复按 max_output_tokens 全额估价的最坏情形。"""
     monkeypatch.setenv("BILLING_ESTIMATE_OUTPUT_TOKEN_CAP", "0")
@@ -455,16 +401,12 @@ def test_authorize_estimate_output_cap_zero_disables(monkeypatch):
     assert result["estimated_nano_cny"] == billing_pricing.price_tokens_nano(
         0, 1_000_000, 200_000, book)
 
-
-@PG
 def test_authorize_estimate_output_below_cap_unchanged():
     """max_output_tokens 低于封顶值时估计不变（封顶不虚增小请求）。"""
     result, book = _cap_authorize("hold-cap-low@x.com", max_out=1000)
     assert result["estimated_nano_cny"] == billing_pricing.price_tokens_nano(
         0, 1_000_000, 1000, book)
 
-
-@PG
 def test_authorize_unknown_model_estimated_null():
     """无价目（未知 model）→ estimated/would_deny NULL（未知不裁决）。"""
     bh.seed_price_books_with_history()
@@ -482,8 +424,6 @@ def test_authorize_unknown_model_estimated_null():
     assert result["status"] == "open"
     assert result["open_holds_nano_cny"] == 0  # 无估算即无占用
 
-
-@PG
 def test_demo_subject_writes_hold_and_week_window():
     """批次 C §4.2：demo 不再 skip——所有模式都写 hold 行 + 进 demo_global
     周窗口投影（此处 shadow 模式：策略已种 → 窗口预占照常；无策略时只记
@@ -533,8 +473,6 @@ def test_demo_subject_writes_hold_and_week_window():
     assert r2["estimated_nano_cny"] is not None
     assert _hold_row(call_id=call2)["spend_window_id"] is None
 
-
-@PG
 def test_subject_without_account_row_written_null_balance():
     """主体有 users 行但未开户 → 行写入 account_id/balance NULL（影子期不
     强制开户）；单轨后 would_deny 按总额度口径（allowance 恒在场、默认
@@ -559,8 +497,6 @@ def test_subject_without_account_row_written_null_balance():
     row = _hold_row(call_id=call_id)
     assert row["account_id"] is None and row["balance_nano_cny"] is None
 
-
-@PG
 def test_open_holds_accumulate_into_would_deny():
     """open 占用叠加：第二个 hold 的 would_deny 计入第一个的 estimated，
     open_holds_nano_cny 为两笔合计（含本次）。"""
@@ -591,8 +527,6 @@ def test_open_holds_accumulate_into_would_deny():
     assert r2["open_holds_nano_cny"] == 2 * est
     assert r2["status"] == "open"  # 影子期仍放行
 
-
-@PG
 def test_call_id_idempotent_replay_same_and_conflict():
     """同 call_id 同 payload → duplicate=True 原行；异 payload → 409 确定性。"""
     bh.seed_price_books_with_history()
@@ -625,8 +559,6 @@ def test_call_id_idempotent_replay_same_and_conflict():
         _authorize(dict(body, max_output_tokens=body["max_output_tokens"] + 1000))
     assert _count("billing_holds") == 1
 
-
-@PG
 def test_subject_conflict_and_not_ready():
     """主体解析复用 §7.2：assertion 不一致 → 409 usage_subject_conflict；
     无权威绑定 → 409 usage_subject_not_ready（retryable）。"""
@@ -651,8 +583,6 @@ def test_subject_conflict_and_not_ready():
         _authorize(body2)
     assert _count("billing_holds") == 0
 
-
-@PG
 def test_not_ready_error_envelope_carries_enforcement_mode():
     """0028 P1-2：not_ready 错误信封 error.details 附带当前 enforcement 模式
     + capabilities（冷启动 HistoPilot 不再把 not_ready 误判为 unknown mode
@@ -686,8 +616,6 @@ def test_not_ready_error_envelope_carries_enforcement_mode():
     err2 = _assert_envelope(r2, 409, "usage_subject_conflict", retryable=False)
     assert err2["details"]["enforcement_mode"] == "all"
 
-
-@PG
 def test_pending_binding_authorize_resolves_2xx():
     """0028 阶段 1 pending 绑定（session NULL）：匹配 request_id 的 authorize
     直接 resolve → 2xx（不再 not_ready——HistoPilot 返回 session 后立刻
@@ -721,11 +649,9 @@ def test_pending_binding_authorize_resolves_2xx():
     r_late = _post_hold(token, body_late, client=client)
     _assert_envelope(r_late, 409, "usage_subject_not_ready", retryable=True)
 
-
 # --------------------------------------------------------------------------- #
 # PG：settle 状态机
 # --------------------------------------------------------------------------- #
-@PG
 def test_settle_lifecycle_route():
     """open→settled（带 event_id）/released（空 body）；settled 同 event
     duplicate、异 event 409；released 后 409 hold_not_open；未知 hold 404。"""
@@ -786,8 +712,6 @@ def test_settle_lifecycle_route():
     r = _settle(token, h2["hold_id"], body={"event_id": "bad"}, client=client)
     _assert_envelope(r, 400, "invalid_request", retryable=False)
 
-
-@PG
 def test_settle_cross_installation_404():
     """不属于该 installation 的 hold 与不存在统一 404（不泄露存在性）。"""
     bh.seed_price_books_with_history()
@@ -804,11 +728,9 @@ def test_settle_cross_installation_404():
             installation_id="pin_other_installation")
     assert _hold_row(hold_id=result["hold_id"])["status"] == "open"
 
-
 # --------------------------------------------------------------------------- #
 # PG：TTL 惰性回收
 # --------------------------------------------------------------------------- #
-@PG
 def test_ttl_lazy_expiry_and_expired_settle_409(monkeypatch):
     monkeypatch.setenv("BILLING_HOLD_TTL_SECONDS", "1")
     bh.seed_price_books_with_history()
@@ -861,11 +783,9 @@ def test_ttl_lazy_expiry_and_expired_settle_409(monkeypatch):
     assert _hold_row(call_id=call4)["status"] == "open"
     assert _hold_row(call_id=call2)["status"] == "open"
 
-
 # --------------------------------------------------------------------------- #
 # PG：并发（同 call_id authorize → 恰一行）
 # --------------------------------------------------------------------------- #
-@PG
 def test_concurrent_authorize_single_row():
     bh.seed_price_books_with_history()
     user = _user_with_account("hold-conc@x.com", grant_nano=1_000_000)
@@ -885,11 +805,9 @@ def test_concurrent_authorize_single_row():
     assert _count("billing_holds") == 1
     assert _hold_row(call_id=call_id)["status"] == "open"
 
-
 # --------------------------------------------------------------------------- #
 # PG：wire 纪律（金额十进制字符串或 null；时间 RFC3339）
 # --------------------------------------------------------------------------- #
-@PG
 def test_wire_amounts_strings_or_null():
     inst = _bootstrap()
     token = _token_for(inst)
@@ -969,8 +887,6 @@ def test_wire_amounts_strings_or_null():
     billing_pricing.parse_rfc3339(settled["settled_at"])
     billing_pricing.parse_rfc3339(settled["expires_at"])
 
-
-@PG
 def test_route_validation_and_subject_errors():
     inst = _bootstrap()
     token = _token_for(inst)
@@ -1011,11 +927,9 @@ def test_route_validation_and_subject_errors():
     r = _post_hold(other_token, body, client=client)
     _assert_envelope(r, 403, "forbidden", retryable=False)
 
-
 # --------------------------------------------------------------------------- #
 # PG：与 ingest 联动（影子期两条链解耦）
 # --------------------------------------------------------------------------- #
-@PG
 def test_ingest_after_hold_chains_decoupled():
     """hold 的 call_id 对应事件随后照常 ingest：模拟 debit 不受 hold 影响，
     settle 不写 ledger、也不要求事件先入库（event_id 无 FK）。"""
@@ -1067,11 +981,9 @@ def test_ingest_after_hold_chains_decoupled():
     assert billing_store.account_balance_nano(
         acct["account_id"]) == balance_before - charge
 
-
 # --------------------------------------------------------------------------- #
 # PG：audit 纪律（无敏感字段；session_id/完整 call_id 不落）
 # --------------------------------------------------------------------------- #
-@PG
 def test_hold_audit_written_without_sensitive_fields():
     bh.seed_price_books_with_history()
     user = _user_with_account("hold-audit@x.com", grant_nano=1_000_000)
@@ -1143,7 +1055,6 @@ def test_hold_audit_written_without_sensitive_fields():
     for r in demo_rows:
         assert "skipped" not in r["detail"]
         assert r["detail"]["subject_type"] == "demo"
-
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

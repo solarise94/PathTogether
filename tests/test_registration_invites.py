@@ -34,11 +34,6 @@ import settings_store  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app # noqa: E402
 
-pg_only = pytest.mark.skipif(
-    BACKEND != "postgres",
-    reason="registration_invites 数据层需 PG（RUN_PG_TESTS=1）",
-)
-
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
@@ -278,7 +273,6 @@ def _pg_conn():
     return c
 
 
-@pg_only
 def test_create_invite_stores_only_hash():
     owner = _mk_owner()
     inv = registration_store.create_invite(owner["user_id"],
@@ -300,7 +294,6 @@ def test_create_invite_stores_only_hash():
     assert row["max_uses"] == 1 and row["use_count"] == 0
 
 
-@pg_only
 def test_list_invites_never_returns_token_or_hash():
     owner = _mk_owner()
     inv = registration_store.create_invite(owner["user_id"], login_id="a@x.com")
@@ -311,7 +304,6 @@ def test_list_invites_never_returns_token_or_hash():
     assert "token_hash" not in items[0]
 
 
-@pg_only
 def test_redeem_success_consumes_invite_and_creates_user():
     owner = _mk_owner()
     inv = registration_store.create_invite(owner["user_id"], login_id="bob@x.com",
@@ -334,7 +326,6 @@ def test_redeem_success_consumes_invite_and_creates_user():
     assert ei.value.code == "invite_invalid_or_unavailable"
 
 
-@pg_only
 def test_redeem_failures_all_unified():
     owner = _mk_owner()
     msgs = set()
@@ -372,7 +363,6 @@ def test_redeem_failures_all_unified():
     assert e3.value.reason == "revoked"
 
 
-@pg_only
 def test_redeem_email_normalization_and_mismatch():
     owner = _mk_owner()
     inv = registration_store.create_invite(owner["user_id"],
@@ -393,7 +383,6 @@ def test_redeem_email_normalization_and_mismatch():
         "consumed_at"] is None
 
 
-@pg_only
 def test_redeem_email_conflict_leaves_invite_unconsumed():
     owner = _mk_owner()
     user_store.create_user("taken@x.com", "existingpass1234", role="user")
@@ -408,7 +397,6 @@ def test_redeem_email_conflict_leaves_invite_unconsumed():
     assert row["consumed_at"] is None
 
 
-@pg_only
 def test_concurrent_redeem_same_invite_single_winner():
     """§6.1：同一邀请码 20 路并发兑换仅一个成功，users/invite 状态一致。"""
     owner = _mk_owner()
@@ -442,7 +430,6 @@ def test_concurrent_redeem_same_invite_single_winner():
     assert u["user_id"] == winner_uid
 
 
-@pg_only
 def test_token_never_in_audit_or_exceptions():
     owner = _mk_owner()
     inv = registration_store.create_invite(owner["user_id"], login_id="aud@x.com")
@@ -479,7 +466,6 @@ def test_token_never_in_audit_or_exceptions():
         assert inv["token"] not in str(ei)
 
 
-@pg_only
 def test_owner_invite_api_lifecycle(monkeypatch):
     _satisfy_preconditions(monkeypatch)
     owner = _mk_owner()
@@ -535,7 +521,6 @@ def test_owner_invite_api_lifecycle(monkeypatch):
     assert r4.get_json()["error"] == "csrf_required"
 
 
-@pg_only
 def test_register_route_full_flow(monkeypatch):
     """invite_only 全链路：创建 → 表单兑换 → 清 session 轮换 CSRF → 跳登录。"""
     _satisfy_preconditions(monkeypatch)
@@ -577,7 +562,6 @@ def test_register_route_full_flow(monkeypatch):
     assert r4.status_code == 200
 
 
-@pg_only
 def test_redeem_invite_whitespace_password_bad_input():
     """兑换防御层（P2）：全空白密码（长度达标）→ bad_input，不建号不消费。"""
     owner = _mk_owner()
@@ -590,7 +574,6 @@ def test_redeem_invite_whitespace_password_bad_input():
     assert row["use_count"] == 0 and row["consumed_at"] is None
 
 
-@pg_only
 def test_register_route_whitespace_password_rejected(monkeypatch):
     """注册表单（P2）：全空白密码 → 表单错误回显，不建号不消费邀请码。"""
     _satisfy_preconditions(monkeypatch)
@@ -618,7 +601,6 @@ def test_register_route_whitespace_password_rejected(monkeypatch):
     assert r2.status_code == 302
 
 
-@pg_only
 def test_registration_mode_missing_row_fails_closed(monkeypatch):
     """§4.1 + R3 Wave2-Compat：旧布尔 registration_open 开关已删除——mode 键
     缺行直接降级 closed 并 bootstrap 回写（fail-closed，不读任何旧键）。"""
@@ -631,7 +613,6 @@ def test_registration_mode_missing_row_fails_closed(monkeypatch):
     assert settings_store.get_registration_mode() == "invite_only"
 
 
-@pg_only
 def test_registration_mode_env_and_invalid_values():
     assert settings_store.get_registration_mode() == "closed"  # bootstrap
     settings_store.set_setting(settings_store.REGISTRATION_MODE_KEY,
@@ -649,7 +630,6 @@ def test_registration_mode_env_and_invalid_values():
 # =========================================================================== #
 # 3. PG 数据层（Batch D1 13 / Batch B wave 2）：来源字段退役与兑换解耦
 # =========================================================================== #
-@pg_only
 def test_create_invite_retired_source_fields_ignored_not_written():
     """Batch B §4.4：邀请只负责注册——source/campaign/cohort 参数兼容接受
     但忽略（不校验不写库，app.py wave 2 才改调用方）；不做 campaign 校验。"""
@@ -695,7 +675,6 @@ def test_create_invite_retired_source_fields_ignored_not_written():
             monthly_limit_nano_cny=10 ** 9, total_limit_nano_cny=10 ** 9)
 
 
-@pg_only
 def test_invite_list_exposes_source_campaign_and_owner_api(monkeypatch):
     """Batch D1 13 / Batch B wave 2：来源字段退役——owner API 带 source/
     campaign/cohort 请求一律 400 retired_invite_field（不再校验 slug/campaign
@@ -733,7 +712,6 @@ def test_invite_list_exposes_source_campaign_and_owner_api(monkeypatch):
     assert "token" not in it and "token_hash" not in it
 
 
-@pg_only
 def test_redeem_writes_no_user_acquisition_but_allowance():
     """Batch B：兑换不再写 user_acquisition（归因写路径冻结）；R3 Wave1-Money
     单轨后无初始额度的邀请也**恒建** allowance 行（defaults 默认解析）；

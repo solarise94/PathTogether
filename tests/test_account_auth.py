@@ -34,10 +34,8 @@ DATA_DIR = _bootstrap.SHARE_DATA_DIR
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
-import conftest  # noqa: E402
-from pg_compat import json_only  # noqa: E402
 # check()：_pt_helpers 统一带守卫实现；PASS/FAIL 计数仍落在本模块
-from _pt_helpers import check, csrf_client, install_json_login_limits, isolate_app # noqa: E402
+from _pt_helpers import check, csrf_client, isolate_app # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -48,73 +46,35 @@ USER_PW = "user-pass-1234567"
 NEW_PW = "new-pass-12345678"
 OTHER_PW = "other-pass-123456"
 
-
-def _share_impl():
-    """当前后端的 share_store 实现模块（读 _OWNER_USER_ID 注入状态用）。"""
-    if conftest.BACKEND == "postgres":
-        import share_store_pg
-        return share_store_pg
-    import share_store_json
-    return share_store_json
-
-
 def _share_owner_uid():
-    return getattr(_share_impl(), "_OWNER_USER_ID", "")
-
-
-def _reset_users_file():
-    """json 后端：清空 users.json（每用例隔离）；PG 后端由 conftest truncate。"""
-    if conftest.BACKEND != "json":
-        return
-    p = user_store.USER_FILE
-    if p.exists():
-        p.unlink()
-
-
-def _write_json_users(users: dict):
-    """json 后端：直写 users.json（构造多 owner / 空 hash 等非常规状态）。"""
-    assert conftest.BACKEND == "json"
-    user_store.USER_FILE.write_text(
-        json.dumps({"users": users, "meta": {"schema_version": 1}},
-                   ensure_ascii=False), encoding="utf-8")
-
-
-def _read_json_users() -> dict:
-    assert conftest.BACKEND == "json"
-    return json.loads(user_store.USER_FILE.read_text(encoding="utf-8"))["users"]
-
+    import share_store_pg
+    return getattr(share_store_pg, "_OWNER_USER_ID", "")
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
     """每用例：隔离目录 / 清空用户库 / 归属注入清空 / json 登录限流 mock。"""
     isolate_app(monkeypatch, DATA_DIR, login_limits=True, clear_stores=True)
-    _reset_users_file()
-    if conftest.BACKEND == "postgres":
-        # review R2-F2：PG 上 role=user 建号/兑换统一走「维护闸 + 开通锁」
-        # 组合原语，闸 fail-closed（platform_settings 缺 ai_dispatch_maintenance
-        # 即拒绝）。conftest TRUNCATE 清掉 0029 种子，这里每用例幂等重放
-        # （target=window + 闸=false），需要其他前置态的用例自行覆盖。
-        import _billing_helpers as bh
-        bh.seed_spend_settings()
+    # review R2-F2：PG 上 role=user 建号/兑换统一走「维护闸 + 开通锁」
+    # 组合原语，闸 fail-closed（platform_settings 缺 ai_dispatch_maintenance
+    # 即拒绝）。conftest TRUNCATE 清掉 0029 种子，这里每用例幂等重放
+    # （target=window + 闸=false），需要其他前置态的用例自行覆盖。
+    import _billing_helpers as bh
+    bh.seed_spend_settings()
     yield
     # AUTH_ENABLED 的还原已由 isolate_app 的还原护栏接管（防泄漏登记）
-
 
 def _fake_pg_backend(monkeypatch):
     """json 模式下把 share_store.STORAGE_BACKEND 伪造成 postgres，使
     REQUIRE_ADMIN_AUTH=1 的后端前置检查放行（PG 模式本身即是 postgres）。"""
     monkeypatch.setattr(share_store, "STORAGE_BACKEND", "postgres")
 
-
 def make_client():
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = True
     return csrf_client(app_mod.app.test_client())
 
-
 def login(client, username, password):
     return client.post("/login", data={"username": username, "password": password})
-
 
 def relogin(client, username, password):
     """模拟真实浏览器「被登出 → 跳登录页 → 再提交」流程再登录。
@@ -126,18 +86,15 @@ def relogin(client, username, password):
     client.get("/login")
     return login(client, username, password)
 
-
 def make_owner(login_id="admin", password=OWNER_PW):
     """空库首建 owner（store 线契约）。返回 owner dict（含 hash/auth_version）。"""
     return user_store.create_bootstrap_owner(login_id, password)
-
 
 def _write_pw_file(tmp_path, content):
     """写 bootstrap secret 文件（BOOTSTRAP_OWNER_PASSWORD_FILE 语义），返回路径。"""
     p = tmp_path / "boot-secret.txt"
     p.write_text(content, encoding="utf-8")
     return str(p)
-
 
 # =========================================================================== #
 # 1. 启动状态机（docs §5.2 / §11.1）
@@ -156,7 +113,6 @@ def test_startup_bootstrap_creates_owner_and_login(tmp_path):
     check("库中恰一个 enabled owner", len(user_store.list_enabled_owners()) == 1)
     check("可用该密码登录", user_store.verify_user("browser_admin", OWNER_PW) is not None)
 
-
 def test_startup_bootstrap_legacy_alias_ignored(monkeypatch):
     """R3 Wave2-Compat：一版兼容别名 ADMIN_USERNAME/ADMIN_PASSWORD 读取路径
     已删除——空库 + 仅提供别名 + REQUIRE_ADMIN_AUTH=1 → fail-closed 拒启
@@ -170,7 +126,6 @@ def test_startup_bootstrap_legacy_alias_ignored(monkeypatch):
         })
     check("别名不建 owner（库仍空）",
           not user_store.list_enabled_owners())
-
 
 def test_startup_existing_owner_env_password_not_reconciled(tmp_path):
     """已有 owner + bootstrap secret 文件内容不同 → 启动后 DB hash 不变、
@@ -189,7 +144,6 @@ def test_startup_existing_owner_env_password_not_reconciled(tmp_path):
     check("文件密码不能登录（未写入）",
           user_store.verify_user("admin", "totally-different-pw-123") is None)
 
-
 def test_startup_existing_owner_without_env(monkeypatch):
     """已有 owner + 无 bootstrap 秘密 → 正常启动可登录（§11.1-3）。"""
     make_owner("admin", OWNER_PW)
@@ -201,7 +155,6 @@ def test_startup_existing_owner_without_env(monkeypatch):
     client = make_client()
     r = login(client, "admin", OWNER_PW)
     check("无 env 时 owner 可登录", r.status_code == 302, "got %s" % r.status_code)
-
 
 def test_startup_bootstrap_login_id_change_only_warns(monkeypatch, caplog,
                                                       tmp_path):
@@ -223,7 +176,6 @@ def test_startup_bootstrap_login_id_change_only_warns(monkeypatch, caplog,
     check("记录一次引导配置忽略告警", warned,
           "records=%r" % [r.message for r in caplog.records])
 
-
 def test_startup_no_owner_but_users_refuses(monkeypatch):
     """无 owner 但已有普通 user → REQUIRE_ADMIN_AUTH=1 拒绝启动（指明逃生路径）。"""
     _fake_pg_backend(monkeypatch)
@@ -237,7 +189,6 @@ def test_startup_no_owner_but_users_refuses(monkeypatch):
     with pytest.raises(SystemExit):
         app_mod._resolve_owner_at_startup({})
 
-
 def test_startup_requires_pg_backend(monkeypatch):
     """REQUIRE_ADMIN_AUTH=1 且后端非 postgres → 拒绝启动（docs §9.1）。"""
     monkeypatch.setattr(share_store, "STORAGE_BACKEND", "json")
@@ -245,14 +196,12 @@ def test_startup_requires_pg_backend(monkeypatch):
         app_mod._resolve_owner_at_startup({"REQUIRE_ADMIN_AUTH": "1"})
     check("文案指明 postgres 要求", "postgres" in str(ei.value))
 
-
 def test_startup_empty_db_require_auth_no_secret_refuses(monkeypatch):
     """空库 + REQUIRE_ADMIN_AUTH=1 + 无秘密 → 拒绝启动（fail-closed）。"""
     _fake_pg_backend(monkeypatch)
     with pytest.raises(SystemExit) as ei:
         app_mod._resolve_owner_at_startup({"REQUIRE_ADMIN_AUTH": "1"})
     check("文案指明 bootstrap 秘密缺失", "bootstrap" in str(ei.value).lower())
-
 
 def test_startup_placeholder_secret_treated_as_unconfigured(monkeypatch,
                                                             tmp_path):
@@ -274,47 +223,28 @@ def test_startup_placeholder_secret_treated_as_unconfigured(monkeypatch,
                 tmp_path, "<still-a-placeholder>"),
         })
 
-
-@json_only  # PG 下 0015 部分唯一索引使 >1 enabled owner 不可构造（store 线已覆盖）
-def test_startup_multiple_enabled_owners_refuses():
-    """2 个 enabled owner（json 直插构造）→ 拒绝启动，禁止选「第一个」。"""
-    make_owner("admin", OWNER_PW)
-    user_store.create_user("o2@x.com", OTHER_PW, role="owner")
-    with pytest.raises(SystemExit) as ei:
-        app_mod._resolve_owner_at_startup({})
-    check("文案含 multiple_enabled_owners 语义",
-          "owner" in str(ei.value), "msg=%r" % ei.value)
-
-
 def test_startup_owner_empty_hash_refuses():
     """owner password_hash 为空 → 拒绝启动（提示 useradmin 修复）。"""
     owner = make_owner("admin", OWNER_PW)
-    if conftest.BACKEND == "json":
-        users = _read_json_users()
-        users[owner["user_id"]]["password_hash"] = ""
-        _write_json_users(users)
-    else:
-        import pg_store
-        conn = pg_store.connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE users SET password_hash='' WHERE user_id=%s",
-                            (owner["user_id"],))
-            conn.commit()
-        finally:
-            conn.close()
+    import pg_store
+    conn = pg_store.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET password_hash='' WHERE user_id=%s",
+                        (owner["user_id"],))
+        conn.commit()
+    finally:
+        conn.close()
     with pytest.raises(SystemExit) as ei:
         app_mod._resolve_owner_at_startup({})
     check("文案提示 useradmin 修复", "useradmin" in str(ei.value),
           "msg=%r" % ei.value)
-
 
 def test_startup_dev_mode_no_owner_no_secret():
     """空库 + 无秘密 + 未开 REQUIRE_ADMIN_AUTH → owner=None（本地免认证开发态）。"""
     owner = app_mod._resolve_owner_at_startup({})
     check("返回 None", owner is None)
     check("AUTH_ENABLED=False", app_mod._resolve_auth_enabled({}) is False)
-
 
 def test_startup_concurrent_loser_re_resolves(monkeypatch, tmp_path):
     """并发首建败者（users_table_not_empty）→ 重走解析正常启动（docs §5.3）。"""
@@ -335,13 +265,11 @@ def test_startup_concurrent_loser_re_resolves(monkeypatch, tmp_path):
     check("create_bootstrap_owner 确被调用过（模拟并发）",
           real_create is not None)
 
-
 # =========================================================================== #
 # 2. session auth_version 失效矩阵（docs §6.2 / §11.3）
 # =========================================================================== #
 def _audits(action):
     return share_store.list_audit(limit=50, action=action)
-
 
 def test_change_own_password_invalidates_all_sessions():
     """本人改密：当前 cookie + 另一浏览器 cookie 均 401；新密码可登录。"""
@@ -364,7 +292,6 @@ def test_change_own_password_invalidates_all_sessions():
     check("旧密码不能再登录", relogin(c2, "u@x.com", USER_PW).status_code == 401)
     check("新密码可登录", relogin(c2, "u@x.com", NEW_PW).status_code == 302)
 
-
 def test_change_password_audit_no_secrets():
     """改密 audit：action/actor/target 正确且 detail 无密码特征。"""
     make_owner("admin", OWNER_PW)
@@ -385,7 +312,6 @@ def test_change_password_audit_no_secrets():
     blob = json.dumps(ev, ensure_ascii=False, default=str)
     check("audit 无明文/hag 特征",
           USER_PW not in blob and NEW_PW not in blob and "hash" not in blob)
-
 
 def test_owner_reset_user_password_invalidates_session():
     """owner 重置普通用户密码后该用户旧 cookie 401；audit 正确；版本递增。"""
@@ -414,7 +340,6 @@ def test_owner_reset_user_password_invalidates_session():
           ev.get("detail") == {"sessions_revoked": True}
           and NEW_PW not in json.dumps(ev, default=str))
 
-
 def test_disable_then_enable_still_invalidates():
     """disable 后未访问再 enable，旧 cookie 仍 401（版本不匹配，docs §6.2）。"""
     make_owner("admin", OWNER_PW)
@@ -433,7 +358,6 @@ def test_disable_then_enable_still_invalidates():
     check("重新登录恢复访问", relogin(uc, "u@x.com", USER_PW).status_code == 302
           and uc.get("/api/projects").status_code == 200)
 
-
 def test_disable_invalidates_immediately():
     """disable 后旧 cookie 401（基础路径）。"""
     make_owner("admin", OWNER_PW)
@@ -444,7 +368,6 @@ def test_disable_invalidates_immediately():
     login(oc, "admin", OWNER_PW)
     assert oc.post("/api/admin/v1/users/%s/disable" % u["user_id"]).status_code == 200
     check("禁用后旧 cookie 401", uc.get("/api/projects").status_code == 401)
-
 
 def test_legacy_cookie_without_auth_version_rejected():
     """旧版本 cookie（无 auth_version 键）→ 首次请求即 401，不回填复活。"""
@@ -462,7 +385,6 @@ def test_legacy_cookie_without_auth_version_rejected():
     with c.session_transaction() as s:
         check("session 已清理无 auth_version", "auth_version" not in s)
 
-
 # =========================================================================== #
 # 3. POST /api/account/password（docs §7.1）
 # =========================================================================== #
@@ -472,7 +394,6 @@ def _login_user_client():
     c = make_client()
     login(c, "u@x.com", USER_PW)
     return c
-
 
 def test_change_password_requires_login():
     """未登录（AUTH_ENABLED=True）→ 401 auth_required。"""
@@ -484,7 +405,6 @@ def test_change_password_requires_login():
     check("未登录 401", r.status_code == 401)
     check("错误码 auth_required", r.get_json().get("error") == "auth_required")
 
-
 def test_change_password_dev_mode_401():
     """AUTH_ENABLED=False 本地开发态（无登录 session）→ 401。"""
     app_mod.AUTH_ENABLED = False
@@ -494,7 +414,6 @@ def test_change_password_dev_mode_401():
     check("开发态无 session 401", r.status_code == 401)
     check("错误码 auth_required", r.get_json().get("error") == "auth_required")
 
-
 def test_change_password_csrf_required():
     """CSRF 缺失 → 400 csrf_required（统一 before_request，非豁免路径）。"""
     c = _login_user_client()
@@ -503,7 +422,6 @@ def test_change_password_csrf_required():
         "current_password": USER_PW, "new_password": NEW_PW})
     check("缺 CSRF 400", r.status_code == 400, "got %s" % r.status_code)
     check("错误码 csrf_required", r.get_json().get("error") == "csrf_required")
-
 
 def test_change_password_wrong_current_400():
     """当前密码错误 → 400 invalid_current_password（不写密码特征）。"""
@@ -515,18 +433,12 @@ def test_change_password_wrong_current_400():
           r.get_json().get("error") == "invalid_current_password")
     check("session 未被清除（仍可访问）", c.get("/api/projects").status_code == 200)
 
-
 def test_change_password_brute_force_lockout(monkeypatch):
     """当前密码连续错误计入登录失败桶 → 触限后 429 + Retry-After。"""
-    if conftest.BACKEND == "json":
-        # json mock 桶阈值调低（3 次）加速用例；PG 用真实 auth_limit_limits
-        install_json_login_limits(monkeypatch, account_limit=3, ip_limit=99)
-        limit = 3
-    else:
-        import auth_limit_store
-        # 两个桶独立计数、任一触限即锁；同源 IP 连续失败先撞 IP 前缀桶
-        limit = min(auth_limit_store.AUTH_ACCOUNT_FAILURE_LIMIT,
-                    auth_limit_store.AUTH_IP_FAILURE_LIMIT)
+    import auth_limit_store
+    # 两个桶独立计数、任一触限即锁；同源 IP 连续失败先撞 IP 前缀桶
+    limit = min(auth_limit_store.AUTH_ACCOUNT_FAILURE_LIMIT,
+                auth_limit_store.AUTH_IP_FAILURE_LIMIT)
     c = _login_user_client()
     statuses = []
     for i in range(limit - 1):
@@ -546,7 +458,6 @@ def test_change_password_brute_force_lockout(monkeypatch):
     r_even_correct = c.post("/api/account/password", json={
         "current_password": USER_PW, "new_password": NEW_PW})
     check("锁定期内正确密码也 429", r_even_correct.status_code == 429)
-
 
 def test_change_password_validation_rejections():
     """新密码 <15 / >200 / 全空白 / 与当前相同 → 400。"""
@@ -570,7 +481,6 @@ def test_change_password_validation_rejections():
     check("新密码与当前相同 → 400", r_same.status_code == 400,
           "got %s" % r_same.status_code)
     check("同密码文案", "相同" in r_same.get_json().get("error", ""))
-
 
 def test_change_password_concurrent_reset_returns_409(monkeypatch):
     """P1 TOCTOU：请求期间管理员重置先提交 → 409 冲突，绝不覆盖新密码。"""
@@ -600,7 +510,6 @@ def test_change_password_concurrent_reset_returns_409(monkeypatch):
           user_store.verify_user("u@x.com", NEW_PW) is None)
     check("冲突路径不写 audit", len(_audits("user.password_change")) == 0)
 
-
 def test_change_password_success_clears_session():
     """成功改密：200 + ok、session 清空、登录页 password_changed 提示可用。"""
     c = _login_user_client()
@@ -616,7 +525,6 @@ def test_change_password_success_clears_session():
     check("无提示参数不渲染提示",
           "密码已修改" not in c.get("/login").get_data(as_text=True))
 
-
 def test_owner_can_use_change_password_endpoint():
     """owner 同样可用本人改密端点（docs §7.1：owner 与 user 通用）。"""
     make_owner("admin", OWNER_PW)
@@ -628,7 +536,6 @@ def test_owner_can_use_change_password_endpoint():
     check("owner 旧 cookie 401", c.get("/api/projects").status_code == 401)
     check("owner 新密码可登录", relogin(c, "admin", NEW_PW).status_code == 302)
 
-
 # =========================================================================== #
 # 4. 管理端点收紧（docs §7.2 / §3.2 不变量 5）
 # =========================================================================== #
@@ -637,7 +544,6 @@ def _owner_client():
     c = make_client()
     assert login(c, "admin", OWNER_PW).status_code == 302
     return c
-
 
 def test_admin_reset_owner_password_409():
     """重置 owner → 409（提示本人改密或 break-glass）。"""
@@ -651,7 +557,6 @@ def test_admin_reset_owner_password_409():
     check("owner 密码未被改动",
           user_store.verify_user("admin", OWNER_PW) is not None)
 
-
 def test_admin_disable_owner_409():
     """禁用 owner → 409；启用 owner 同口径 409。"""
     owner = make_owner("admin", OWNER_PW)
@@ -660,7 +565,6 @@ def test_admin_disable_owner_409():
     check("禁用 owner 409", r.status_code == 409)
     r2 = c.post("/api/admin/v1/users/%s/enable" % owner["user_id"])
     check("启用 owner 409", r2.status_code == 409)
-
 
 def test_admin_create_user_password_policy():
     """统一 15..200 密码策略（store 级）：短密码 400/全空白拒绝、文案与 CLI
@@ -678,8 +582,6 @@ def test_admin_create_user_password_policy():
     ok = user_store.create_user("n@x.com", USER_PW, role="user")
     check("15 位密码可建号", ok is not None and ok.get("login_id") == "n@x.com")
 
-
-
 def test_admin_reset_whitespace_password_400():
     """管理员重置普通用户密码：全空白 400（P2：与创建/CLI 策略一致）。"""
     make_owner("admin", OWNER_PW)
@@ -691,7 +593,6 @@ def test_admin_reset_whitespace_password_400():
     check("全空白文案",
           "全空白" in json.dumps(json.loads(r.data).get("error"), ensure_ascii=False))
     check("原密码未变", user_store.verify_user("u@x.com", USER_PW) is not None)
-
 
 def test_no_web_endpoint_can_demote_or_delete_owner():
     """不变量锁定：无任何 Web 端点可改 owner 角色或删除用户行（§3.2-5）。"""
@@ -707,7 +608,6 @@ def test_no_web_endpoint_can_demote_or_delete_owner():
         check("用户端点 %s 不含降级/删除语义" % rule.rule, not forbidden)
         check("用户端点 %s 无 DELETE 方法" % rule.rule,
               "DELETE" not in rule.methods)
-
 
 # =========================================================================== #
 # 5. 回查次数：普通请求只有一次用户 DB 查询（docs §6.2/§11.3）
@@ -730,7 +630,6 @@ def test_single_user_lookup_per_request(monkeypatch):
     r = c.get("/api/projects")
     check("请求成功", r.status_code == 200, "got %s" % r.status_code)
     check("恰好一次 get_user 回查", calls["n"] == 1, "calls=%d" % calls["n"])
-
 
 # =========================================================================== #
 # 6. 汇总

@@ -36,12 +36,8 @@ from pg_compat import BACKEND  # noqa: E402
 import _billing_helpers as bh  # noqa: E402
 import billing_store  # noqa: E402
 
-PG = pytest.mark.skipif(BACKEND != "postgres",
-                        reason="usage ingest 数据路径需 PG（RUN_PG_TESTS=1）")
-
 app_mod.UPLOAD_DIR = Path(os.environ["UPLOAD_DIR"])
 app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
 
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
@@ -54,13 +50,11 @@ def _isolated(tmp_path, monkeypatch):
                             app_mod._PLUGIN_RATE_LIMIT_PER_MIN))
     yield
 
-
 def _bootstrap():
     inst = app_mod._bootstrap_plugin_installations()
     assert inst is not None
     app_mod._HISTOPILOT_INSTALLATION = inst
     return inst
-
 
 def _file_secret():
     f = Path(os.environ["SHARE_DATA_DIR"]) / "plugin-secret-histopilot.txt"
@@ -73,11 +67,9 @@ def _file_secret():
         pass
     return raw
 
-
 def _client():
     app_mod.app.config["TESTING"] = True
     return app_mod.app.test_client()
-
 
 def _token_for(inst):
     r = _client().post("/api/plugin/v1/auth/token",
@@ -86,10 +78,8 @@ def _token_for(inst):
     assert r.status_code == 200, r.get_json()
     return r.get_json()["access_token"]
 
-
 def _bearer(token):
     return {"Authorization": "Bearer " + token}
-
 
 def _post(event, token=None, *, idem=None, client=None):
     """投递一条事件（Idempotency-Key 缺省取 event_id）。"""
@@ -97,7 +87,6 @@ def _post(event, token=None, *, idem=None, client=None):
     headers["Idempotency-Key"] = idem if idem is not None else event["event_id"]
     return (client or _client()).post(
         "/api/plugin/v1/usage-events", headers=headers, json=event)
-
 
 def _assert_envelope(r, status, code, retryable=None):
     assert r.status_code == status, "got %s body=%r" % (
@@ -111,7 +100,6 @@ def _assert_envelope(r, status, code, retryable=None):
         assert err["retryable"] is retryable
     return err
 
-
 # --------------------------------------------------------------------------- #
 # 鉴权与 fail-closed（json 模式也跑）
 # --------------------------------------------------------------------------- #
@@ -121,7 +109,6 @@ def test_no_token_401_envelope():
     r = _post(event, token=None)
     _assert_envelope(r, 401, "unauthorized", retryable=False)
 
-
 def test_wrong_audience_token_401():
     _bootstrap()
     event = bh.load_event("01_owner_priced_flash_peak.json")
@@ -130,7 +117,6 @@ def test_wrong_audience_token_401():
     r = _post(event, token=token)
     _assert_envelope(r, 401, "unauthorized", retryable=False)
 
-
 def test_disabled_installation_401():
     inst = _bootstrap()
     token = _token_for(inst)
@@ -138,7 +124,6 @@ def test_disabled_installation_401():
     event = bh.load_event("01_owner_priced_flash_peak.json")
     r = _post(event, token=token)
     _assert_envelope(r, 401, "unauthorized", retryable=False)
-
 
 def test_non_histopilot_plugin_forbidden():
     inst = _bootstrap()  # noqa: F841 — histopilot 引导占位
@@ -152,18 +137,6 @@ def test_non_histopilot_plugin_forbidden():
     r = _post(event, token=token)
     _assert_envelope(r, 403, "forbidden", retryable=False)
 
-
-def test_json_backend_pg_backend_required():
-    if BACKEND == "postgres":
-        pytest.skip("PG 后端专用反向用例（json 模式才返回 pg_backend_required）")
-    inst = _bootstrap()
-    token = _token_for(inst)
-    event = bh.load_event("01_owner_priced_flash_peak.json")
-    r = _post(event, token=token)
-    err = _assert_envelope(r, 503, "pg_backend_required", retryable=False)
-    assert "STORAGE_BACKEND" in err["message"] or err["message"]
-
-
 # --------------------------------------------------------------------------- #
 # PG：端到端投递路径
 # --------------------------------------------------------------------------- #
@@ -174,7 +147,6 @@ def _bind_for(event):
                             event["subject_type"], event["subject_id"])
     elif event["subject_type"] == "demo":
         bh.bind_demo_session(event["session_id"], event["subject_id"])
-
 
 def _fresh(event, hours_back=1):
     """把 occurred_at/enqueued_at 平移到相对当前时刻（默认 1 小时前）。
@@ -192,8 +164,6 @@ def _fresh(event, hours_back=1):
                           ).isoformat().replace("+00:00", "Z")
     return out
 
-
-@PG
 def test_idempotency_key_must_match_event_id():
     inst = _bootstrap()
     token = _token_for(inst)
@@ -207,8 +177,6 @@ def test_idempotency_key_must_match_event_id():
                     headers=_bearer(token), json=event)
     _assert_envelope(r, 400, "invalid_request", retryable=False)
 
-
-@PG
 def test_schema_positives_accepted_and_shape():
     inst = _bootstrap()
     token = _token_for(inst)
@@ -242,8 +210,6 @@ def test_schema_positives_accepted_and_shape():
         assert body["capabilities"] == {"settle_with_usage_event": True,
                                         "spend_enforcement": "shadow"}
 
-
-@PG
 def test_schema_negative_rejected_400():
     inst = _bootstrap()
     token = _token_for(inst)
@@ -257,8 +223,6 @@ def test_schema_negative_rejected_400():
     # 响应不含请求体内容（details 只有字段级错误文本）
     assert "raw_usage" not in r.get_data(as_text=True)
 
-
-@PG
 def test_token_count_upper_bound_deterministic_400():
     """§7.1 v0.3（P2）：token 计数上限 2^53-1——超限确定性 400 不进库。
 
@@ -297,8 +261,6 @@ def test_token_count_upper_bound_deterministic_400():
     finally:
         conn.close()
 
-
-@PG
 def test_duplicate_replay_returns_original():
     inst = _bootstrap()
     token = _token_for(inst)
@@ -326,8 +288,6 @@ def test_duplicate_replay_returns_original():
     rows = billing_store.get_usage_event(event["event_id"])
     assert rows["event_id"] == event["event_id"]
 
-
-@PG
 def test_payload_conflict_409():
     inst = _bootstrap()
     token = _token_for(inst)
@@ -352,8 +312,6 @@ def test_payload_conflict_409():
     assert r.status_code == 200
     assert r.get_json()["status"] == "priced"
 
-
-@PG
 def test_call_id_conflict_409():
     inst = _bootstrap()
     token = _token_for(inst)
@@ -367,8 +325,6 @@ def test_call_id_conflict_409():
     r = _post(other, token=token)
     _assert_envelope(r, 409, "usage_event_conflict", retryable=False)
 
-
-@PG
 def test_subject_resolution_batch_f_matrix():
     """批次 F 解析矩阵：⓪holds 命中/冲突、①bindings 命中/失配下落。
 
@@ -457,8 +413,6 @@ def test_subject_resolution_batch_f_matrix():
     r = _post(clash, token=token)
     _assert_envelope(r, 409, "usage_subject_conflict", retryable=False)
 
-
-@PG
 def test_subject_resolution_paths():
     inst = _bootstrap()
     installation_id = inst["installation_id"]
@@ -515,8 +469,6 @@ def test_subject_resolution_paths():
     r = _post(reserved, token=token)
     _assert_envelope(r, 409, "usage_subject_not_ready", retryable=True)
 
-
-@PG
 def test_subject_run_grant_cross_check_only_no_fallback():
     """§7.2 步骤 3（PR5 修订锁定）：run grant 只做交叉校验，不做主体来源。
 
@@ -581,8 +533,6 @@ def test_subject_run_grant_cross_check_only_no_fallback():
     r = _post(clash, token=token)
     _assert_envelope(r, 409, "usage_subject_conflict", retryable=False)
 
-
-@PG
 def test_unknown_model_and_missing_price_unpriced():
     inst = _bootstrap()
     token = _token_for(inst)
@@ -620,8 +570,6 @@ def test_unknown_model_and_missing_price_unpriced():
     assert billing_store.get_usage_event(event2["event_id"])[
         "unpriced_reason"] == "no_active_price_book"
 
-
-@PG
 def test_clock_skew_paths(monkeypatch):
     inst = _bootstrap()
     token = _token_for(inst)
@@ -691,8 +639,6 @@ def test_clock_skew_paths(monkeypatch):
     r = _post(small_skew, token=token, client=client)
     assert r.get_json()["status"] == "priced"
 
-
-@PG
 def test_arithmetic_mismatch_unpriced():
     inst = _bootstrap()
     token = _token_for(inst)
@@ -708,8 +654,6 @@ def test_arithmetic_mismatch_unpriced():
     assert row["unpriced_reason"] == "arithmetic_mismatch"
     assert row["output_tokens"] is None  # CHECK 兜底：token 列不存坏值
 
-
-@PG
 def test_pr6_sim_debit_semantics_and_demo_red_line():
     """PR6 模拟软扣费（§12.2/§19 v0.4）：owner/user priced 扣、demo 永不。
 
@@ -763,8 +707,6 @@ def test_pr6_sim_debit_semantics_and_demo_red_line():
     finally:
         conn.close()
 
-
-@PG
 def test_no_sensitive_data_in_response_or_audit():
     inst = _bootstrap()
     token = _token_for(inst)
@@ -800,8 +742,6 @@ def test_no_sensitive_data_in_response_or_audit():
                             event["session_id"]):
             assert secret_like not in dumped, "审计泄漏：%s" % secret_like
 
-
-@PG
 def test_csrf_exempt_machine_channel():
     """usage-events 属 /api/plugin/ 机器通道：无 CSRF token 亦可（Bearer 鉴权）。"""
     inst = _bootstrap()
@@ -816,7 +756,6 @@ def test_csrf_exempt_machine_channel():
                              "Idempotency-Key": event["event_id"]},
                     json=event)
     assert r.status_code == 200
-
 
 # --------------------------------------------------------------------------- #
 # PG：billing_subject 三条派发路径 → ingest 端到端一致性（PR2 review #3/#4）
@@ -840,12 +779,10 @@ def _fake_sidecar(session_id):
     app_mod.requests = fake
     return fake
 
-
 def _run_call_body(fake):
     calls = [c for c in fake.calls if c["method"] == "POST" and c["path"] == "/run"]
     assert len(calls) == 1, "应恰好一次 /run 转发"
     return calls[0]["body"]
-
 
 def _usage_event_from_dispatch(fixture_name, subject, request_id, session_id,
                                tag):
@@ -860,8 +797,6 @@ def _usage_event_from_dispatch(fixture_name, subject, request_id, session_id,
                 subject_id=subject["subject_id"],
                 user_id=subject.get("user_id"))
 
-
-@PG
 def test_billing_subject_owner_user_dispatch_matches_resolution():
     """官方 /api/ai/run：owner 与 user 的 config.billing_subject 与 ingest
     权威解析（reservation 行）逐字节一致 → 喂回 ingest 无 409。"""
@@ -941,8 +876,6 @@ def test_billing_subject_owner_user_dispatch_matches_resolution():
     assert result2["duplicate"] is False and result2["status"] == "priced"
     app_mod.AUTH_ENABLED = False
 
-
-@PG
 def test_billing_subject_demo_dispatch_matches_resolution():
     """demo /api/demo/ai/run：config.billing_subject = {demo, capability id,
     null}，与 resolver 第②步（0026 起 demo_runs.capability_id）同值 → 喂回
@@ -1010,7 +943,6 @@ def test_billing_subject_demo_dispatch_matches_resolution():
             assert cur.fetchone()["n"] == 0
     finally:
         conn.close()
-
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

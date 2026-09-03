@@ -32,11 +32,9 @@ DATA_DIR = _bootstrap.SHARE_DATA_DIR
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app, FakeRequests, FakeResponse # noqa: E402
-from pg_compat import json_only  # noqa: E402
 
 import ipaddress  # noqa: E402
 import pytest  # noqa: E402
-
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch, tmp_path):
@@ -47,7 +45,6 @@ def _isolate(monkeypatch, tmp_path):
     """
     isolate_app(monkeypatch, tmp_path)
     yield
-
 
 @pytest.fixture(autouse=True)
 def _ssrf_dns(monkeypatch):
@@ -65,12 +62,10 @@ def _ssrf_dns(monkeypatch):
         return [ipaddress.ip_address("93.184.216.34")]
     monkeypatch.setattr(app_mod, "_host_ips", fake_ips)
 
-
 def _client(auth=True):
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = auth
     return csrf_client(app_mod.app.test_client())
-
 
 def _login(client, role, user_id):
     """用 session_transaction 直接注入身份（等价登录成功后的 session 状态）。
@@ -85,17 +80,14 @@ def _login(client, role, user_id):
         row = user_store.get_user(user_id) if user_id else None
         sess["auth_version"] = (row or {}).get("auth_version", 1)
 
-
 def _touch(name="demo.svs"):
     p = Path(app_mod.UPLOAD_DIR) / name
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(b"svs-stub")
     return name
 
-
 def _own(name, user_id):
     app_mod.share_store.set_slide_meta(name, owner_user_id=user_id)
-
 
 def _reset_config():
     p = app_mod._ai_config_path()
@@ -106,36 +98,17 @@ def _reset_config():
     if uf.exists():
         uf.unlink()
 
-
 def _setup_platform(base_url="http://platform/v1", key="sk-platform-123456", model="gpt-p"):
     app_mod._save_ai_config({"base_url": base_url, "api_key": key, "model": model})
-
 
 def _install_fake():
     fake = FakeRequests()
     app_mod.requests = fake
     return fake
 
-
 # =========================================================================== #
 # 1. per-user api_key 加密落盘
 # =========================================================================== #
-@json_only  # 断言 users.json 原文（PG 后端加密态在库里，无 json 文件）
-def test_user_api_key_encrypted_on_disk():
-    _reset_config()
-    u = user_store.create_user("u@x.com", "password1password1", role="user")
-    # app 侧负责在落盘前加密（_encrypt_api_key）；store 层原样存储。
-    enc = app_mod._encrypt_api_key("sk-user-secret-abcdef")
-    assert enc.startswith("enc:")
-    user_store.set_user_ai_config(u["user_id"], {"api_key": enc})
-    # users.json 原文不得含明文
-    raw = user_store.USER_FILE.read_text(encoding="utf-8")
-    assert "sk-user-secret-abcdef" not in raw, "users.json 泄漏明文 api_key！"
-    assert "enc:" in raw, "users.json 应存 Fernet 加密密文"
-    # 读回应解密为明文
-    cfg = user_store.get_user_ai_config(u["user_id"])
-    assert app_mod._decrypt_api_key(cfg["api_key"]) == "sk-user-secret-abcdef"
-
 
 # =========================================================================== #
 # 2. 凭据解析决策表（_build_sidecar_config user_ctx）
@@ -151,7 +124,6 @@ def test_resolve_use_platform_when_platform_configured():
     assert cfg["api_key"] == "sk-platform-123456"
     assert cfg["model"] == "gpt-p"
     assert cfg.get("ssrf_guard") is not True
-
 
 def test_resolve_user_ignores_legacy_own_credentials():
     """user 自带 API 通道已下线：use_platform=False + 自带凭据齐备仍走平台。"""
@@ -170,7 +142,6 @@ def test_resolve_user_ignores_legacy_own_credentials():
     assert cfg["base_url"] == "http://platform/v1"
     assert cfg.get("ssrf_guard") is not True  # 平台 URL 不受 SSRF 限制
 
-
 def test_resolve_platform_missing_returns_none_even_with_own():
     """平台未配置 → user 不可用（自带凭据齐备也不作为回退）。"""
     _reset_config()  # 平台未配
@@ -184,14 +155,12 @@ def test_resolve_platform_missing_returns_none_even_with_own():
     cfg = app_mod._build_sidecar_config({"role": "user", "user_id": u["user_id"]})
     assert cfg is None
 
-
 def test_resolve_own_missing_key_returns_none():
     _reset_config()  # 平台未配
     u = user_store.create_user("u@x.com", "password1password1", role="user")
     user_store.set_user_ai_config(u["user_id"], {"base_url": "http://own/v1", "model": "gpt-own"})
     cfg = app_mod._build_sidecar_config({"role": "user", "user_id": u["user_id"]})
     assert cfg is None
-
 
 def test_resolve_owner_uses_platform():
     _reset_config()
@@ -202,7 +171,6 @@ def test_resolve_owner_uses_platform():
     assert cfg["base_url"] == "http://platform/v1"
     assert cfg["api_key"] == "sk-platform-123456"
 
-
 def test_resolve_no_auth_uses_platform():
     """AUTH_ENABLED=False：current_identity 归一 owner → 平台配置。"""
     _reset_config()
@@ -210,7 +178,6 @@ def test_resolve_no_auth_uses_platform():
     cfg = app_mod._build_sidecar_config(None)
     assert cfg is not None
     assert cfg["base_url"] == "http://platform/v1"
-
 
 # =========================================================================== #
 # 3. /api/ai/config 角色化
@@ -248,7 +215,6 @@ def test_user_config_get_masked_and_platform_fields():
     # tuning 字段从平台值回显
     assert j["model"] == "gpt-own"
 
-
 def test_user_put_tuning_differs_returns_400():
     """user PUT 任何字段一律 400（tuning 与 max_steps 同样拒绝）。"""
     _reset_config()
@@ -262,30 +228,6 @@ def test_user_put_tuning_differs_returns_400():
         assert r.status_code == 400, body
         assert "平台统一提供" in (r.get_json() or {}).get("error", "")
 
-
-@json_only  # 断言 users.json 原文不落盘（PG 后端无 json 文件）
-def test_user_put_credentials_rejected_and_not_persisted():
-    """user 凭据四字段一律 400；存量数据不被改写、新数据不落盘。"""
-    _reset_config()
-    _setup_platform()
-    u = user_store.create_user("u@x.com", "password1password1", role="user")
-    c = _client()
-    _login(c, "user", u["user_id"])
-    r = c.put("/api/ai/config", json={
-        "use_platform": False, "base_url": "http://own/v1",
-        "model": "gpt-own", "api_key": "sk-own-secret-abcdef"})
-    assert r.status_code == 400
-    assert "平台统一提供" in (r.get_json() or {}).get("error", "")
-    # 空负载同样拒绝（user 无任何可写字段）
-    r_empty = c.put("/api/ai/config", json={})
-    assert r_empty.status_code == 400
-    # 未落盘：users.json 无新增凭据
-    raw = user_store.USER_FILE.read_text(encoding="utf-8")
-    assert "sk-own-secret-abcdef" not in raw
-    cfg = user_store.get_user_ai_config(u["user_id"]) or {}
-    assert not cfg.get("base_url")
-
-
 def test_owner_config_get_uses_platform():
     _reset_config()
     _setup_platform()
@@ -298,7 +240,6 @@ def test_owner_config_get_uses_platform():
     assert j["base_url"] == "http://platform/v1"
     assert j["using"] == "platform"
 
-
 def test_owner_put_tuning_ok():
     _reset_config()
     o = user_store.create_user("o@x.com", "password1password1", role="owner")
@@ -308,7 +249,6 @@ def test_owner_put_tuning_ok():
     assert r.status_code == 200, r.get_data(as_text=True)
     j = r.get_json()
     assert j["max_steps"] == 60
-
 
 # =========================================================================== #
 # 4. AI 端点资源鉴权 + 凭据缺失
@@ -327,7 +267,6 @@ def test_ai_run_unauthorized_slide_403():
     assert r.status_code == 403
     assert fake.calls == []  # 未转发到 sidecar
 
-
 def test_ai_run_public_readonly_403():
     """公共只读切片可 view 但不可 annotate，不得起跑并签发写 grant。"""
     _reset_config()
@@ -344,7 +283,6 @@ def test_ai_run_public_readonly_403():
     assert r.status_code == 403
     assert fake.calls == []
 
-
 def test_ai_run_no_credentials_400():
     _reset_config()  # 平台未配
     u = user_store.create_user("u@x.com", "password1password1", role="user")
@@ -357,7 +295,6 @@ def test_ai_run_no_credentials_400():
     j = r.get_json()
     assert j and "平台 AI 未配置" in (j.get("error") or "")
     assert "联系管理员" in (j.get("error") or "")
-
 
 def test_ai_run_authorized_proxies_with_owner():
     _reset_config()
@@ -380,7 +317,6 @@ def test_ai_run_authorized_proxies_with_owner():
     cfg = sent.get("config") or {}
     assert cfg.get("session_owner") == u["user_id"]
     assert cfg.get("base_url") == "http://platform/v1"
-
 
 # =========================================================================== #
 # 5. sessions 按归属过滤 / session 详情越权
@@ -413,7 +349,6 @@ def test_sessions_user_filter_owner_all():
     co.get("/api/ai/sessions?slide=s.svs")
     assert fake.calls and fake.calls[-1]["params"] == {"slide": "s.svs"}
 
-
 def test_session_detail_owner_check():
     _reset_config()
     _setup_platform()
@@ -437,7 +372,6 @@ def test_session_detail_owner_check():
     r2 = co.get("/api/ai/session/s-a")
     assert r2.status_code == 200
     assert r2.get_json()["session"]["id"] == "s-a"
-
 
 # =========================================================================== #
 # 6. AUTH_ENABLED=False 全兼容
@@ -464,7 +398,6 @@ def test_no_auth_full_compat():
     c.get("/api/ai/sessions?slide=x.svs")
     assert fake.calls and fake.calls[-1]["params"] == {"slide": "x.svs"}
 
-
 def test_owner_run_does_not_inject_session_owner():
     """role=owner 起跑不注入 session_owner（owner 全量可见、可续跑任意会话，
     sidecar acquire 归属守卫对无 owner 注入的 run 不生效）；owner 名下会话保持
@@ -486,7 +419,6 @@ def test_owner_run_does_not_inject_session_owner():
     cfg = sent.get("config") or {}
     assert "session_owner" not in cfg
 
-
 def test_user_put_loopback_base_url_rejected():
     """user PUT 凭据字段整包 400（不再进入 SSRF 校验——无写入通道）。"""
     _reset_config()
@@ -500,7 +432,6 @@ def test_user_put_loopback_base_url_rejected():
     assert r.status_code == 400
     assert "平台统一提供" in (r.get_json() or {}).get("error", "")
 
-
 def test_user_put_link_local_metadata_base_url_rejected():
     _reset_config()
     _setup_platform()
@@ -511,7 +442,6 @@ def test_user_put_link_local_metadata_base_url_rejected():
         "use_platform": False, "base_url": "http://169.254.169.254/latest/meta-data/",
         "model": "m", "api_key": "sk-x"})
     assert r.status_code == 400
-
 
 def test_build_sidecar_ignores_private_own_url():
     """存量私网 own base_url 不再进入 sidecar（user 恒平台）；平台未配 → None。"""

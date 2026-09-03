@@ -39,15 +39,8 @@ DATA_DIR = _bootstrap.SHARE_DATA_DIR
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
-import conftest  # noqa: E402
-from pg_compat import BACKEND, json_only  # noqa: E402
 # check()：_pt_helpers 统一带守卫实现；PASS/FAIL 计数仍落在本模块
-from _pt_helpers import check, csrf_client, install_json_login_limits, isolate_app # noqa: E402
-
-pg_only = pytest.mark.skipif(
-    BACKEND != "postgres",
-    reason="registration_invites 数据层需 PG（RUN_PG_TESTS=1）",
-)
+from _pt_helpers import check, csrf_client, isolate_app # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -58,35 +51,29 @@ PW2 = "password1password1"
 PW3 = "newpass99newpass99"
 OWNER_PW = "owner-pass-123456"
 
-
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
     """每用例前把常量 / env 指回本模块临时目录，并清空 users.json。"""
     isolate_app(monkeypatch, DATA_DIR, login_limits=True, clear_stores=True)
-    if BACKEND == "postgres":
-        # review R2-F2：PG 上 role=user 建号/兑换统一走「维护闸 + 开通锁」
-        # 组合原语（闸 fail-closed），conftest TRUNCATE 清掉 0029 种子——
-        # 每用例幂等重放（target=window + 闸=false）
-        import _billing_helpers as bh
-        bh.seed_spend_settings()
+    # review R2-F2：PG 上 role=user 建号/兑换统一走「维护闸 + 开通锁」
+    # 组合原语（闸 fail-closed），conftest TRUNCATE 清掉 0029 种子——
+    # 每用例幂等重放（target=window + 闸=false）
+    import _billing_helpers as bh
+    bh.seed_spend_settings()
     yield
-
 
 def make_client():
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = True
     return csrf_client(app_mod.app.test_client())
 
-
 def login(client, username, password):
     return client.post("/login", data={"username": username, "password": password})
-
 
 def make_owner(login_id="admin", password=OWNER_PW):
     owner = user_store.create_bootstrap_owner(login_id, password)
     assert owner and owner.get("role") == "owner"
     return owner
-
 
 # =========================================================================== #
 # 1. 单键输出（docs §4.2 物理收口：email 键不再出现）
@@ -129,19 +116,6 @@ def test_user_dicts_login_id_only_no_email_key():
           p is not None and p.get("login_id") == "alice@example.com"
           and "email" not in p)
 
-
-@json_only  # 直读 users.json 物理文件；PG 后端无该文件
-def test_login_id_is_physical_key_in_json_store():
-    """批次 C：json 物理记录键即 login_id（不再落 email 键、不双写）。"""
-    u = user_store.create_user("persist@x.com", PW, role="user")
-    raw = json.loads(user_store.USER_FILE.read_text(encoding="utf-8"))
-    rec = raw["users"][u["user_id"]]
-    check("物理记录 login_id 键", rec.get("login_id") == "persist@x.com")
-    check("物理记录不落 email 键", "email" not in rec)
-    got = user_store.get_user(u["user_id"])
-    check("读出口同值", got.get("login_id") == "persist@x.com")
-
-
 # =========================================================================== #
 # 2. 登录只认 login_id（docs §6.1 / §11.2 矩阵）
 # =========================================================================== #
@@ -161,7 +135,6 @@ def test_login_id_case_and_space_insensitive():
           user_store.verify_user("MIXED@CASE.COM", PW)["user_id"]
           == u["user_id"])
 
-
 def test_display_name_cannot_login():
     """display_name 与 login_id 不同：只用 display_name 登录失败。"""
     user_store.create_user("alice@x.com", PW, role="user",
@@ -177,7 +150,6 @@ def test_display_name_cannot_login():
           "got %s" % r.status_code)
     check("失败文案统一（不泄露账号存在性）",
           "账号或密码错误" in r.get_data(as_text=True))
-
 
 def test_duplicate_display_names_both_can_login():
     """两人同 display_name：各自 login_id 均可登录，互不影响。"""
@@ -199,7 +171,6 @@ def test_duplicate_display_names_both_can_login():
     c2 = make_client()
     check("u2 路由登录 302", login(c2, "a2@x.com", PW2).status_code == 302)
 
-
 def test_display_name_equal_to_other_login_id():
     """A 的 display_name == B 的 login_id：该字符串只能登进 B（docs §2.5/§11.2）。"""
     a = user_store.create_user("aaa@x.com", PW, role="user", display_name="bbb")
@@ -218,7 +189,6 @@ def test_display_name_equal_to_other_login_id():
     with client.session_transaction() as s:
         check("session user_id 归属 B", s.get("user_id") == b["user_id"])
 
-
 def test_login_unified_error_no_account_enumeration():
     """错误账号与错误密码返回同一状态码与同一文案，不泄露账号存在性。"""
     user_store.create_user("real@x.com", PW, role="user")
@@ -234,7 +204,6 @@ def test_login_unified_error_no_account_enumeration():
     check("不存在/未注册类泄露文案不出现",
           "不存在" not in t_ghost and "未注册" not in t_ghost)
 
-
 # =========================================================================== #
 # 3. 登录防爆破主体：规范化值共用同一账号桶（docs §6.1 末段）
 # =========================================================================== #
@@ -247,17 +216,12 @@ def test_auth_subject_hash_normalizes_case_and_space():
     check("None/空串同摘要（空主体）", h(None) == h(""))
     check("不同账号摘要不同", h("alice") != h("bob"))
 
-
 def test_case_variants_share_account_lockout_bucket(monkeypatch):
     """混合大小写连续失败与正确值共用同一账号桶：第 3 次（=阈值）触发 429。"""
     user_store.create_user("bucket@x.com", PW, role="user")
-    if conftest.BACKEND == "json":
-        # json mock：账号桶阈值 3、IP 桶 99（隔离账号桶语义）
-        install_json_login_limits(monkeypatch, account_limit=3, ip_limit=99)
-    else:
-        import auth_limit_store
-        monkeypatch.setattr(auth_limit_store, "AUTH_ACCOUNT_FAILURE_LIMIT", 3)
-        monkeypatch.setattr(auth_limit_store, "AUTH_IP_FAILURE_LIMIT", 99)
+    import auth_limit_store
+    monkeypatch.setattr(auth_limit_store, "AUTH_ACCOUNT_FAILURE_LIMIT", 3)
+    monkeypatch.setattr(auth_limit_store, "AUTH_IP_FAILURE_LIMIT", 99)
     client = make_client()
     variants = ["BUCKET@X.COM", " Bucket@X.com ", "bucket@x.COM"]
     statuses = [login(client, v, "wrong-password-%d" % i).status_code
@@ -266,7 +230,6 @@ def test_case_variants_share_account_lockout_bucket(monkeypatch):
           "statuses=%r" % statuses)
     check("第三次（阈值）触发 429", statuses[2] == 429,
           "statuses=%r" % statuses)
-
 
 # =========================================================================== #
 # 4. 管理 API 单键输出与 login_id-only 入参（docs §4.2/§8.1，批次 C）
@@ -327,8 +290,6 @@ def test_admin_users_api_login_id_only(monkeypatch):
     r7 = client.post("/api/admin/v1/users/%s/enable" % uid)
     check("启用响应单键", "email" not in r7.get_json().get("user", {}))
 
-
-@pg_only
 def test_invite_admin_api_login_id_only(monkeypatch):
     """邀请管理 API：只接受 login_id 入参（email 兼容入参已删除）；响应只带
     login_id_masked（email_masked 已删除）；redeem_invite 返回 login_id 键；
@@ -408,7 +369,6 @@ def test_invite_admin_api_login_id_only(monkeypatch):
     check("不绑定邀请任意登录账号兑换成功",
           out_unbound.get("login_id") == "freepick@x.com")
 
-
 # =========================================================================== #
 # 收尾
 # =========================================================================== #
@@ -419,11 +379,9 @@ def _finish():
         print("\nall %d checks passed" % PASS)
     return 1 if FAIL else 0
 
-
 def test_run_summary():
     # 该函数只是让每个 check 标记为已执行；真正的统计在模块收尾 print 里。
     pass
-
 
 if __name__ == "__main__":
     raise SystemExit(_finish())

@@ -33,11 +33,6 @@ from pg_compat import BACKEND  # noqa: E402
 from _pt_helpers import isolate_app  # noqa: E402
 from _pt_helpers import csrf_client  # noqa: E402
 
-pytestmark = pytest.mark.skipif(
-    BACKEND != "postgres",
-    reason="注册限流需 PG 权威计数（RUN_PG_TESTS=1）",
-)
-
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch, tmp_path):

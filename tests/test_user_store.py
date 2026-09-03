@@ -29,10 +29,8 @@ DATA_DIR = _bootstrap.SHARE_DATA_DIR
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
-import conftest  # noqa: E402
-from pg_compat import json_only  # noqa: E402
 # check()：_pt_helpers 统一带守卫实现；PASS/FAIL 计数仍落在本模块
-from _pt_helpers import check, csrf_client, install_json_login_limits, isolate_app # noqa: E402
+from _pt_helpers import check, csrf_client, isolate_app # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -43,7 +41,6 @@ PW2 = "password1password1"
 PW3 = "newpass99newpass99"
 OWNER_PW = "owner-pass-123456"
 
-
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
     """每用例前把常量 / env 指回本模块临时目录，并清空 users.json。"""
@@ -51,30 +48,13 @@ def _isolate(monkeypatch):
     isolate_app(monkeypatch, DATA_DIR, login_limits=True, clear_stores=True)
     yield
 
-
-def reset_users_file():
-    p = user_store.USER_FILE
-    if p.exists():
-        p.unlink()
-
-
-def _read_users_raw():
-    """读 users.json 原文（用于断言无明文密码）。"""
-    p = user_store.USER_FILE
-    if not p.exists():
-        return None
-    return json.loads(p.read_text(encoding="utf-8"))
-
-
 def make_client():
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = True
     return csrf_client(app_mod.app.test_client())
 
-
 def login(client, username, password):
     return client.post("/login", data={"username": username, "password": password})
-
 
 def make_owner(login_id="admin", password=OWNER_PW):
     """批次 A owner 引导：空库经 create_bootstrap_owner 建 owner（替代已删除的
@@ -83,66 +63,9 @@ def make_owner(login_id="admin", password=OWNER_PW):
     assert owner and owner.get("role") == "owner"
     return owner
 
-
 # =========================================================================== #
 # user_store CRUD
 # =========================================================================== #
-@json_only  # 断言 users.json 原文（无明文/含 pbkdf2 hash）
-def test_user_crud_and_login_id_unique():
-    u = user_store.create_user("Alice@Example.COM", PW, role="user",
-                               display_name="Alice")
-    check("创建用户返回不含 hash", "password_hash" not in u)
-    check("login_id 小写规范化", u["login_id"] == "alice@example.com")
-    check("批次 C：返回 dict 无 email 键", "email" not in u)
-    check("display_name 保留", u["display_name"] == "Alice")
-    check("user_id 前缀", u["user_id"].startswith("usr_"))
-    check("新用户 auth_version=1", u.get("auth_version") == 1)
-
-    got = user_store.get_user(u["user_id"])
-    check("get_user 命中", got is not None
-          and got["login_id"] == "alice@example.com")
-    check("get_user 无 email 键", "email" not in got)
-    check("get_user 含 hash", "password_hash" in got)
-    check("get_user 带 auth_version", got.get("auth_version") == 1)
-
-    dup = None
-    try:
-        user_store.create_user("ALICE@example.com", PW)
-    except ValueError:
-        dup = "raised"
-    check("login_id 唯一（大小写不敏感）", dup == "raised")
-
-    by_login = user_store.get_user_by_login_id("alice@example.com")
-    check("get_user_by_login_id 命中", by_login is not None)
-    check("get_user_by_login_id 带 auth_version",
-          by_login.get("auth_version") == 1)
-    # 批次 B（docs §6.1）：get_user_by_display_name 已删除（原唯一调用方是
-    # verify_user 的 display_name 登录 fallback）；dispatcher 不再导出该名
-    check("get_user_by_display_name 已从 dispatcher 删除",
-          not hasattr(user_store, "get_user_by_display_name"))
-    # 批次 C（docs §4.2）：get_user_by_email 随物理列改名删除
-    check("get_user_by_email 已从 dispatcher 删除",
-          not hasattr(user_store, "get_user_by_email"))
-
-    listed = user_store.list_users()
-    check("list_users 不含 hash", listed and "password_hash" not in listed[0])
-    check("list_users 带 auth_version",
-          listed and listed[0].get("auth_version") == 1)
-
-    v = user_store.verify_user("alice@example.com", PW)
-    check("verify_user 密码正确", v is not None and v["user_id"] == u["user_id"])
-    check("verify_user 带 auth_version", v.get("auth_version") == 1)
-    check("verify_user 错误密码 None", user_store.verify_user("alice@example.com", "wrong") is None)
-
-    # 明文密码不得落盘
-    raw = _read_users_raw()
-    assert raw is not None
-    raw_text = json.dumps(raw, ensure_ascii=False)
-    check("users.json 无明文密码", PW not in raw_text and "pass9999" not in raw_text)
-    # werkzeug 3.x 默认哈希已从 pbkdf2 切到 scrypt，两者都是合法 werkzeug 格式
-    check("users.json 含 werkzeug hash（pbkdf2/scrypt）",
-          "pbkdf2" in raw_text or "scrypt" in raw_text)
-
 
 def test_set_disabled_and_password():
     u = user_store.create_user("bob@ex.com", PW2, role="user")
@@ -164,7 +87,6 @@ def test_set_disabled_and_password():
           user_store.set_user_password("usr_nope", PW3) is None)
     check("set_user_disabled 目标不存在 None",
           user_store.set_user_disabled("usr_nope", True) is None)
-
 
 def test_password_policy_bounds():
     """统一密码策略 15..200（docs §3.3）：边界含 15/200，两侧拒绝。"""
@@ -201,7 +123,6 @@ def test_password_policy_bounds():
         bypassed = False
     check("create_user 无 _enforce_min_length 旁路", bypassed is False)
 
-
 def test_short_password_rejected():
     raised = False
     try:
@@ -212,7 +133,6 @@ def test_short_password_rejected():
     check("策略常量导出",
           user_store.PASSWORD_MIN_LENGTH == 15
           and user_store.PASSWORD_MAX_LENGTH == 200)
-
 
 # =========================================================================== #
 # owner bootstrap 新契约（批次 A docs §5.3：create_bootstrap_owner /
@@ -233,7 +153,6 @@ def test_create_bootstrap_owner_empty_store():
     check("resolve_primary_owner 命中同一 user_id",
           user_store.resolve_primary_owner()["user_id"] == owner["user_id"])
 
-
 def test_create_bootstrap_owner_refuses_existing_owner():
     """已有 owner 行 → OwnerInvariantError，绝不静默建号/对账改密。"""
     first = make_owner()
@@ -250,7 +169,6 @@ def test_create_bootstrap_owner_refuses_existing_owner():
     check("原 owner 不被改动（hash 不变，仍可登录）",
           again["password_hash"] == first["password_hash"]
           and user_store.verify_user("admin", OWNER_PW) is not None)
-
 
 def test_create_bootstrap_owner_refuses_when_only_users():
     """库内只有普通 user（无 owner 行）→ 同样拒绝：bootstrap 只认空库。"""
@@ -270,17 +188,13 @@ def test_create_bootstrap_owner_refuses_when_only_users():
         raised3 = True
     check("bootstrap 密码统一 15..200 策略", raised3)
 
-
 def test_create_bootstrap_owner_concurrent_pg():
     """PG 并发首建（多线程同时调）：恰好一个成功，库内恰好一行 owner。
 
     串行化由 create_bootstrap_owner 事务内的专用 advisory lock
     （0x53564F57 'SVOW'，不复用 schema 的 0x53565347）保证；0015 部分唯一
-    索引为数据库层兜底。json 后端无对应并发语义（flock 文件锁已由实现保证，
-    不在本用例重复验证），仅 PG 跑。
+    索引为数据库层兜底。并发语义仅 PG 成立。
     """
-    if conftest.BACKEND != "postgres":
-        pytest.skip("并发首建语义验证需 PG advisory lock（RUN_PG_TESTS=1）")
     results = []
     errors = []
 
@@ -303,13 +217,11 @@ def test_create_bootstrap_owner_concurrent_pg():
     check("成功行即库里唯一 owner", owners[0]["user_id"] == results[0])
     check("全部用户恰 1 行", len(user_store.list_users()) == 1)
 
-
 def test_resolve_primary_owner_invariants():
     """恰好 1 个 enabled → 返回；0 个 → no_owner；>1 个 → multiple_enabled_owners。
 
     >1 enabled 场景在 PG 下无法经 SQL 构造（0015 部分唯一索引拦截），由索引
-    与启动检查双重防御；本用例在 json 后端验证 multiple 分支的解析语义，
-    在 PG 后端验证索引拦截 + no_owner 分支。
+    与启动检查双重防御；本用例验证索引拦截 + no_owner 分支。
     """
     # 0 个 owner（空库）
     raised = None
@@ -320,112 +232,44 @@ def test_resolve_primary_owner_invariants():
     check("空库 resolve 拒绝（no_owner）", raised is not None
           and "no_owner" in raised)
 
-    if conftest.BACKEND == "json":
-        # json 无部分唯一索引，可构造 2 个 enabled owner 验证 multiple 分支
-        user_store.create_user("o1@x.com", PW2, role="owner")
+    # PG：第二个 enabled owner 被 0015 索引拦截（create_user → ValueError）
+    user_store.create_user("o1@x.com", PW2, role="owner")
+    blocked = None
+    try:
         user_store.create_user("o2@x.com", PW2, role="owner")
-        raised2 = None
-        try:
-            user_store.resolve_primary_owner()
-        except user_store.OwnerInvariantError as e:
-            raised2 = str(e)
-        check("2 个 enabled owner 拒绝（multiple_enabled_owners）",
-              raised2 is not None and "multiple_enabled_owners" in raised2)
-        check("list_enabled_owners 返回 2 行（按 created_at,user_id 排序）",
-              len(user_store.list_enabled_owners()) == 2)
-    else:
-        # PG：第二个 enabled owner 被 0015 索引拦截（create_user → ValueError）
-        user_store.create_user("o1@x.com", PW2, role="owner")
-        blocked = None
-        try:
-            user_store.create_user("o2@x.com", PW2, role="owner")
-        except ValueError as e:
-            blocked = str(e)
-        check("PG 第二个 enabled owner 被索引拦截", blocked is not None)
-        check("拦截消息指向单 owner 不变量", "owner" in (blocked or ""))
-        # disable 后 0 个 enabled → no_owner（走 store 层，绕过 app 的最后 owner 保护）
-        o1 = user_store.list_enabled_owners()[0]
-        user_store.set_user_disabled(o1["user_id"], True)
-        raised3 = None
-        try:
-            user_store.resolve_primary_owner()
-        except user_store.OwnerInvariantError as e:
-            raised3 = str(e)
-        check("唯一 owner 被禁用后 resolve 拒绝（no_owner）",
-              raised3 is not None and "no_owner" in raised3)
-        # list_owners 仍能看到 disabled owner 行（含 hash 与 auth_version）
-        all_owners = user_store.list_owners()
-        check("list_owners 含 disabled 行", len(all_owners) == 1
-              and all_owners[0]["disabled"] is True)
-        check("list_owners 行带 hash 与 auth_version",
-              bool(all_owners[0].get("password_hash"))
-              and all_owners[0].get("auth_version") == 2)
-
+    except ValueError as e:
+        blocked = str(e)
+    check("PG 第二个 enabled owner 被索引拦截", blocked is not None)
+    check("拦截消息指向单 owner 不变量", "owner" in (blocked or ""))
+    # disable 后 0 个 enabled → no_owner（走 store 层，绕过 app 的最后 owner 保护）
+    o1 = user_store.list_enabled_owners()[0]
+    user_store.set_user_disabled(o1["user_id"], True)
+    raised3 = None
+    try:
+        user_store.resolve_primary_owner()
+    except user_store.OwnerInvariantError as e:
+        raised3 = str(e)
+    check("唯一 owner 被禁用后 resolve 拒绝（no_owner）",
+          raised3 is not None and "no_owner" in raised3)
+    # list_owners 仍能看到 disabled owner 行（含 hash 与 auth_version）
+    all_owners = user_store.list_owners()
+    check("list_owners 含 disabled 行", len(all_owners) == 1
+          and all_owners[0]["disabled"] is True)
+    check("list_owners 行带 hash 与 auth_version",
+          bool(all_owners[0].get("password_hash"))
+          and all_owners[0].get("auth_version") == 2)
 
 def test_empty_admin_password_no_owner_disables_auth(monkeypatch):
-    reset_users_file()
+    # conftest 每用例 TRUNCATE，空库即此场景
     # 批次 A：旧 _bootstrap_owner（env 对账式引导）已删除，改走启动状态机
     # 纯函数（docs §5.2）：空库 + 无秘密 → owner=None（本地免认证开发态）
     owner = app_mod._resolve_owner_at_startup({})
     check("无 bootstrap 秘密不建 owner", owner is None)
     check("无用户 → AUTH_ENABLED False", app_mod._resolve_auth_enabled() is False)
 
-
 def test_auth_enabled_when_user_exists(monkeypatch):
     user_store.create_user("u@x.com", PW2, role="user")
     check("存在 user → AUTH_ENABLED True", app_mod._resolve_auth_enabled() is True)
-
-
-@json_only  # 损坏 users.json 文件语义；PG 后端无该文件
-def test_corrupt_users_json_refuses_fail_open():
-    """users.json 损坏不得当成空库关闭鉴权。"""
-    p = user_store.USER_FILE
-    p.write_text("{not-json", encoding="utf-8")
-    with pytest.raises(user_store.UserStoreCorrupt):
-        user_store.has_enabled_users()
-    bak = p.with_suffix(".json.bak")
-    check("损坏文件已备份", bak.is_file())
-    with pytest.raises(SystemExit):
-        app_mod._resolve_auth_enabled()
-
-
-@json_only  # 直写旧格式 users.json（无 auth_version 字段）；PG 无该文件
-def test_legacy_json_without_auth_version_reads_as_one():
-    """旧 json 数据缺 auth_version 字段：读路径按 1 处理；写路径递增从 1 起。"""
-    now = 1700000000.0
-    legacy = {
-        "users": {
-            "usr_legacy": {
-                "user_id": "usr_legacy", "email": "legacy@x.com",
-                "display_name": "Legacy", "password_hash": "pbkdf2:fake",
-                "role": "user", "created_at": now, "disabled": False,
-                # 无 auth_version 字段（0015 之前的存量数据）
-            },
-        },
-        "meta": {"schema_version": 1},
-    }
-    user_store.USER_FILE.write_text(json.dumps(legacy), encoding="utf-8")
-    got = user_store.get_user("usr_legacy")
-    check("旧数据读 auth_version=1", got.get("auth_version") == 1)
-    check("旧数据 list_users 读 auth_version=1",
-          user_store.list_users()[0].get("auth_version") == 1)
-    v = user_store.get_user_by_login_id("legacy@x.com")
-    check("get_user_by_login_id 旧数据 auth_version=1",
-          v.get("auth_version") == 1)
-    p = user_store.set_user_password("usr_legacy", PW3)
-    check("旧数据改密递增 1→2", p.get("auth_version") == 2)
-    d = user_store.set_user_disabled("usr_legacy", True)
-    check("旧数据禁用递增 2→3", d.get("auth_version") == 3)
-    # 落盘后的记录带上了 auth_version 字段（写路径携带）
-    raw = _read_users_raw()
-    check("写路径落盘携带 auth_version",
-          raw["users"]["usr_legacy"].get("auth_version") == 3)
-    # 非法值（0/负数/脏数据）也按 1 起算，防御损坏文件
-    legacy["users"]["usr_legacy"]["auth_version"] = "garbage"
-    user_store.USER_FILE.write_text(json.dumps(legacy), encoding="utf-8")
-    check("脏 auth_version 读为 1",
-          user_store.get_user("usr_legacy").get("auth_version") == 1)
-
 
 # =========================================================================== #
 # 登录
@@ -444,7 +288,6 @@ def test_login_success_sets_role(monkeypatch):
     check("auth/info 返回 role", info.get("role") == "owner")
     check("auth/info 返回 user_id", info.get("user_id") is not None)
 
-
 def test_login_wrong_password_and_lock():
     user_store.create_user("carol@ex.com", PW2, role="user")
     client = make_client()
@@ -456,7 +299,6 @@ def test_login_wrong_password_and_lock():
     rl = login(client, "carol@ex.com", PW2)
     check("锁定期内正确密码也 429", rl.status_code == 429)
     check("429 带 Retry-After", int(rl.headers.get("Retry-After") or 0) > 0)
-
 
 # =========================================================================== #
 # /api/admin/v1/users 权限与保护（旧面已随 R3 wave1 删除）
@@ -493,7 +335,6 @@ def test_admin_users_owner_vs_user(monkeypatch):
     r5 = client2.get("/api/admin/v1/users")
     check("user GET /api/admin/v1/users 403", r5.status_code == 403)
 
-
 def test_last_owner_protection(monkeypatch):
     owner = make_owner()
     user_store.create_user("u@x.com", PW2, role="user")
@@ -512,14 +353,6 @@ def test_last_owner_protection(monkeypatch):
     uid = user_store.get_user_by_login_id("u@x.com")["user_id"]
     r2 = client.post("/api/admin/v1/users/%s/disable" % uid)
     check("禁用 user 200", r2.status_code == 200)
-    # 多 owner（json 后端可直插构造）：同样 409；PG 下 0015 部分唯一索引
-    # 使该场景不可达（>1 enabled owner 由索引与启动检查双重防御）。
-    if conftest.BACKEND == "json":
-        user_store.create_user("o2@x.com", PW2, role="owner", display_name="o2")
-        o2 = user_store.get_user_by_login_id("o2@x.com")["user_id"]
-        r3 = client.post("/api/admin/v1/users/%s/disable" % o2)
-        check("多 owner 时禁用其一也 409", r3.status_code == 409)
-
 
 def test_admin_reset_password(monkeypatch):
     make_owner()
@@ -534,7 +367,6 @@ def test_admin_reset_password(monkeypatch):
     r_short = client.post("/api/admin/v1/users/%s/password-reset" % uid,
                           json={"password": "short"})
     check("重置短密码 400（统一 15..200）", r_short.status_code == 400)
-
 
 def test_disable_invalidates_existing_session(monkeypatch):
     """禁用用户后，已有 Flask session 立刻失效（不能再打 /api/*）。"""
@@ -562,41 +394,11 @@ def test_disable_invalidates_existing_session(monkeypatch):
     check("禁用期间无法再登录", r3.status_code == 401,
           "got %s" % r3.status_code)
 
-
 # =========================================================================== #
 # 懒迁移：旧 shares.json 读一次后补 owner_user_id
 # =========================================================================== #
-@json_only  # 直写旧格式 shares.json 并断言 JSON 懒迁移落盘；PG 后端无该文件
 # （一次性修复包 G：该用例曾连续六次污染 PG job——json-only 语义在
 #  STORAGE_BACKEND=postgres 下不成立，属标记缺失而非测试缺陷）
-def test_lazy_migration_owner_refs(monkeypatch):
-    owner = make_owner()
-    owner_id = owner["user_id"]
-    # 注入归属（模拟 app 启动时的 set_owner_user_id）
-    share_store.set_owner_user_id(owner_id)
-    # 构造旧格式 shares.json（无 owner_user_id）
-    old = {
-        "shares": {},
-        "rois": [{"token": "admin", "slide": "s.svs", "label": "a", "ts": 1}],
-        "projects": {"p1": {"name": "P", "note": "", "slides": [], "created_at": 1}},
-        "slide_meta": {"s.svs": {"alias": "A", "note": ""}},
-        "change_seq_by_slide": {},
-    }
-    share_store.SHARE_FILE.write_text(json.dumps(old, ensure_ascii=False),
-                                      encoding="utf-8")
-    # 读一次（list_projects 等读路径触发迁移）
-    share_store.list_projects()
-    share_store.get_slide_meta("s.svs")
-    share_store.annotations_by_slide()
-    # 落盘后断言字段
-    raw = json.loads(share_store.SHARE_FILE.read_text(encoding="utf-8"))
-    check("rois 补 owner_user_id",
-          raw["rois"] and raw["rois"][0].get("owner_user_id") == owner_id)
-    check("projects 补 owner_user_id",
-          raw["projects"]["p1"].get("owner_user_id") == owner_id)
-    check("slide_meta 补 owner_user_id",
-          raw["slide_meta"]["s.svs"].get("owner_user_id") == owner_id)
-
 
 # =========================================================================== #
 # 统一密码策略：全空白拒绝（P2：Web 写入口与 useradmin CLI 一致）
@@ -623,7 +425,6 @@ def test_password_policy_rejects_all_whitespace():
     check("含空格长口令可登录",
           user_store.verify_user("ws-ok@x.com", "pass word 123456 ok") is not None)
 
-
 # =========================================================================== #
 # change_own_password CAS 原语（P1：消除本人改密「先验后写」TOCTOU 覆盖窗口）
 # =========================================================================== #
@@ -631,7 +432,6 @@ def _cas_user():
     u = user_store.create_user("cas-user@x.com", PW)
     assert u is not None
     return u
-
 
 def test_change_own_password_success_bumps_version():
     """成功路径：hash 更新 + auth_version+1；旧密码失效、新密码可登录。"""
@@ -647,7 +447,6 @@ def test_change_own_password_success_bumps_version():
     check("旧密码失效", user_store.verify_user("cas-user@x.com", PW) is None)
     check("新密码可登录", user_store.verify_user("cas-user@x.com", PW2) is not None)
 
-
 def test_change_own_password_wrong_current_rejected():
     """当前密码错误 → PasswordChangeConflict(invalid_current_password)，不写库。"""
     u = _cas_user()
@@ -662,7 +461,6 @@ def test_change_own_password_wrong_current_rejected():
     check("未写库（版本不变）", row["auth_version"] == u["auth_version"])
     check("未写库（旧密码仍可登录）",
           user_store.verify_user("cas-user@x.com", PW) is not None)
-
 
 def test_change_own_password_stale_version_conflict():
     """P1 核心：expected 版本落后（管理员重置已先发生）→ 冲突且绝不覆盖。"""
@@ -682,7 +480,6 @@ def test_change_own_password_stale_version_conflict():
     check("本请求的新密码未生效",
           user_store.verify_user("cas-user@x.com", PW2) is None)
     check("版本保持重置后的值", row["auth_version"] == u["auth_version"] + 1)
-
 
 def test_change_own_password_same_policy_disabled_missing():
     """同密码 / 策略违规 / 并发禁用 / 用户不存在的可区分失败。"""
@@ -713,7 +510,6 @@ def test_change_own_password_same_policy_disabled_missing():
     except user_store.PasswordChangeConflict as e:
         check("reason=user_missing", e.reason == "user_missing", e.reason)
 
-
 # =========================================================================== #
 # 收尾
 # =========================================================================== #
@@ -724,11 +520,9 @@ def _finish():
         print("\nall %d checks passed" % PASS)
     return 1 if FAIL else 0
 
-
 def test_run_summary():
     # 该函数只是让每个 check 标记为已执行；真正的统计在模块收尾 print 里。
     pass
-
 
 if __name__ == "__main__":
     raise SystemExit(_finish())

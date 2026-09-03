@@ -24,14 +24,8 @@ import pytest
 pytest.importorskip("pgserver")
 pytest.importorskip("psycopg")
 
-import conftest  # noqa: E402
 import psycopg  # noqa: E402
 import pg_store  # noqa: E402
-
-pytestmark = pytest.mark.skipif(
-    conftest.BACKEND != "postgres",
-    reason="迁移工具需 PG（RUN_PG_TESTS=1）",
-)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 

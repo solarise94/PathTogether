@@ -38,9 +38,6 @@ import user_store  # noqa: E402
 from _pt_helpers import FakeRequests, FakeResponse, csrf_client, isolate_app  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
 
-PG = pytest.mark.skipif(BACKEND != "postgres",
-                        reason="spend/设置写路径需 PG（RUN_PG_TESTS=1）")
-
 if BACKEND == "postgres":
     import _billing_helpers as bh  # noqa: E402
 
@@ -188,7 +185,6 @@ def test_maintenance_gate_not_applied_to_demo(monkeypatch):
     assert "ai_dispatch_maintenance" not in err_text, (r.status_code, err)
 
 
-@PG
 def test_maintenance_gate_reads_real_setting(monkeypatch):
     """PG：闸经 settings_store 的 CAS 写入生效（cutover 脚本路径）；切回后
     放行。读失败 fail-closed（按维护中处理）。"""
@@ -223,7 +219,6 @@ def test_maintenance_gate_reads_real_setting(monkeypatch):
 # --------------------------------------------------------------------------- #
 # 2. GET /api/admin/v1/spend/demo-stats（§4.6）
 # --------------------------------------------------------------------------- #
-@PG
 def test_demo_stats_readonly_no_side_effects():
     """owner-only；current/previous 边界由服务端 demo_global 周窗口决定；
     调用前后业务表行数不变（纯只读聚合，§4.6 验收口）。"""
@@ -266,7 +261,6 @@ def test_demo_stats_readonly_no_side_effects():
     assert before == after  # 调用前后任何业务表行数不变
 
 
-@PG
 def test_demo_stats_rejects_extra_params_and_bad_window():
     bh.seed_spend_policies()
     owner, usera = _setup_users()
@@ -360,7 +354,6 @@ def test_runtime_step_validator_field_level_bounds():
     assert app_mod._USER_STEP_LIMIT_MAX == 500
 
 
-@PG
 def test_runtime_step_settings_api_and_demo_independence():
     """PUT settings/runtime：user 步数 >500 稳定 400、500 落库；demo 步数
     独立默认 20 不继承 user 值（§Batch C 8）。"""
@@ -399,7 +392,6 @@ def test_runtime_step_settings_api_and_demo_independence():
 # --------------------------------------------------------------------------- #
 # 5. PUT /api/admin/v1/spend/user-default-total-limit（§Batch B：默认 X 单例 CAS）
 # --------------------------------------------------------------------------- #
-@PG
 def test_user_default_total_limit_endpoint_cas():
     """settings.get 扁平三键 + CAS 上下文；R3 单轨后 defaults 行恒在场
     （迁移/conftest 基线物化，source 恒 total_defaults，策略回退源已删除），

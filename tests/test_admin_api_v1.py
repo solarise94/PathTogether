@@ -44,9 +44,6 @@ from _pt_helpers import (FakeRequests, FakeResponse, csrf_client,  # noqa: E402
                          isolate_app)
 from pg_compat import BACKEND  # noqa: E402
 
-PG = pytest.mark.skipif(BACKEND != "postgres",
-                        reason="billing/budget 数据路径需 PG（RUN_PG_TESTS=1）")
-
 if BACKEND == "postgres":
     import _billing_helpers as bh  # noqa: E402
     import billing_store  # noqa: E402
@@ -54,7 +51,6 @@ if BACKEND == "postgres":
 
 app_mod.UPLOAD_DIR = Path(UPLOAD_DIR)
 app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
 
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
@@ -66,11 +62,9 @@ def _isolated(tmp_path, monkeypatch):
                         {"last_ok_attempt": 0.0})
     yield
 
-
 def _client():
     app_mod.app.config["TESTING"] = True
     return csrf_client(app_mod.app.test_client())
-
 
 def _login(client, user):
     with client.session_transaction() as s:
@@ -79,7 +73,6 @@ def _login(client, user):
         s["role"] = user.get("role") or "user"
         s["auth_version"] = user.get("auth_version", 1)
     return client
-
 
 def _setup_users(n_extra=1):
     owner = user_store.create_user(
@@ -91,7 +84,6 @@ def _setup_users(n_extra=1):
             display_name="User %d" % i))
     return tuple([owner] + users)
 
-
 # --------------------------------------------------------------------------- #
 # 敏感字段红线扫描（§9：递归键名 + 值形态）
 # --------------------------------------------------------------------------- #
@@ -99,7 +91,6 @@ _SENSITIVE_KEY_FRAGMENTS = (
     "password", "api_key", "apikey", "token", "secret", "credential",
     "fingerprint",
 )
-
 
 def scan_sensitive(obj, violations=None, path="$"):
     """递归扫描响应体：敏感键名 / api-key 形态值 / Fernet 密文形态值。
@@ -129,7 +120,6 @@ def scan_sensitive(obj, violations=None, path="$"):
             violations.append("%s = enc:***（Fernet 密文形态值）" % path)
     return violations
 
-
 def _endpoints(owner_id):
     """全部 v1 端点（accounts 路径用 owner id 占位）。"""
     return [
@@ -146,7 +136,6 @@ def _endpoints(owner_id):
         "/api/admin/v1/spend/reconcile",
     ]
 
-
 # --------------------------------------------------------------------------- #
 # 1. owner 门控（匿名 / user / preview）
 # --------------------------------------------------------------------------- #
@@ -157,14 +146,12 @@ def test_anonymous_gets_401_on_every_endpoint():
         assert r.status_code == 401, "%s -> %s" % (path, r.status_code)
         assert r.get_json()["error"] == "auth_required"
 
-
 def test_user_gets_403_on_every_endpoint():
     owner, usera = _setup_users()
     c = _login(_client(), usera)
     for path in _endpoints(owner["user_id"]):
         r = c.get(path) if "refresh" not in path else c.post(path)
         assert r.status_code == 403, "%s -> %s" % (path, r.status_code)
-
 
 def test_preview_owner_rejected_on_every_endpoint():
     """owner 预览成 user：actor 虽是 owner，管理 API 一律 403（§14.1）。"""
@@ -179,63 +166,9 @@ def test_preview_owner_rejected_on_every_endpoint():
             body = r.get_json()
             assert body["error"]["code"] in ("preview_forbidden", "preview_readonly")
 
-
 # --------------------------------------------------------------------------- #
 # 2. json/dual 后端 fail-closed 语义
 # --------------------------------------------------------------------------- #
-def test_json_billing_endpoints_pg_backend_required():
-    if BACKEND == "postgres":
-        pytest.skip("json 后端专用反向用例（PG 模式跑正向路径）")
-    owner, _u = _setup_users()
-    c = _login(_client(), owner)
-    for path in ("/api/admin/v1/billing/usage-events",
-                 "/api/admin/v1/billing/ledger",
-                 "/api/admin/v1/billing/provider-balance",
-                 "/api/admin/v1/billing/provider-balance/refresh",
-                 "/api/admin/v1/spend/policies",
-                 "/api/admin/v1/spend/windows/current",
-                 "/api/admin/v1/spend/reconcile"):
-        r = c.get(path) if "refresh" not in path else c.post(path)
-        assert r.status_code == 503, "%s -> %s" % (path, r.status_code)
-        assert r.get_json()["error"]["code"] == "pg_backend_required"
-
-
-def test_json_overview_segmented_availability():
-    if BACKEND == "postgres":
-        pytest.skip("json 后端专用分段标记用例")
-    owner, _u = _setup_users()
-    r = _login(_client(), owner).get("/api/admin/v1/overview")
-    assert r.status_code == 200
-    body = r.get_json()
-    # 用户段任何后端都真实可用
-    assert body["users"]["total"] >= 2
-    assert body["users"]["active"] >= 2
-    # billing 分段标记（不整体 503，也不伪造数据）
-    assert body["billing"]["available"] is False
-    assert body["billing"]["code"] == "pg_backend_required"
-    # 批次 D1（§4.2）：turn 预算历史已移出概览（无 turn_budget 段）
-    assert "turn_budget" not in body
-    assert scan_sensitive(body) == []
-
-
-def test_json_users_list_null_billing_fields():
-    if BACKEND == "postgres":
-        pytest.skip("json 后端专用附属字段用例")
-    owner, _ua, _ub = _setup_users(2)
-    r = _login(_client(), owner).get("/api/admin/v1/users")
-    assert r.status_code == 200
-    body = r.get_json()
-    assert body["billing_available"] is False
-    assert len(body["items"]) == 3
-    for item in body["items"]:
-        assert item["billing"] is None
-        # 批次 F：turn_used/turn_limit 字段已随 turn 消费闸退役删除
-        assert "turn_used" not in item and "turn_limit" not in item
-        # 批次 D1 14（§4.4）：campaign/source 用户级归因键整键删除
-        assert "campaign" not in item and "source" not in item
-        assert item["last_ai_call_at"] is None
-        assert item["spend"] is None  # json 后端无 spend 投影
-
 
 # --------------------------------------------------------------------------- #
 # 3. users 列表（两后端通用部分）
@@ -288,7 +221,6 @@ def test_users_pagination_search_and_filters():
     assert all(item["ai_access"] is False for item in r["items"])
     assert scan_sensitive(r) == []
 
-
 # --------------------------------------------------------------------------- #
 # 4. audit 分页 + 出口脱敏（两后端）
 # --------------------------------------------------------------------------- #
@@ -307,7 +239,6 @@ def _write_audit_events(n=5):
                 "ip_prefix_hash": "should-drop",
                 "nested": {"secret": "x", "keep": 1},
             })
-
 
 def test_audit_pagination_and_sanitization():
     owner, _u = _setup_users()
@@ -348,7 +279,6 @@ def test_audit_pagination_and_sanitization():
         assert banned not in raw
     assert scan_sensitive(r) == []
 
-
 # --------------------------------------------------------------------------- #
 # 5. PG：overview 双额度 / usage / ledger / account
 # --------------------------------------------------------------------------- #
@@ -383,15 +313,12 @@ def _seed_event(name, subject_type, subject_id, *, hours_back=1,
         event, installation_id="inst_test", now=now)
     return result["event_id"], result["status"]
 
-
 def _make_arithmetic_bad(event):
     """构造算术不符（total != hit+miss+output）→ unpriced(arithmetic_mismatch)。"""
     event["total_tokens"] = (event["cache_hit_input_tokens"]
                              + event["cache_miss_input_tokens"]
                              + event["output_tokens"] + 7)
 
-
-@PG
 def test_overview_dual_quota_semantics():
     """概览：用户段 + 金额 KPI（unpriced 计数保持）；turn 历史不再进概览
     （批次 D1 §4.2：turn-budgets 不再进 overview payload）。"""
@@ -444,8 +371,6 @@ def test_overview_dual_quota_semantics():
     assert isinstance(billing["ingestion_lag_seconds_max"], float)
     assert scan_sensitive(body) == []
 
-
-@PG
 def test_usage_events_pagination_and_filters():
     owner, usera = _setup_users()
     bh.seed_price_books_with_history()
@@ -509,8 +434,6 @@ def test_usage_events_pagination_and_filters():
     assert r.status_code == 200
     assert scan_sensitive(r.get_json()) == []
 
-
-@PG
 def test_ledger_pagination_readonly():
     owner, _u = _setup_users()
     account = billing_store.create_billing_account(owner["user_id"])
@@ -542,8 +465,6 @@ def test_ledger_pagination_readonly():
     assert all(isinstance(a, str) for a in amounts)
     assert scan_sensitive(r0) == []
 
-
-@PG
 def test_users_row_joins_turn_billing_last_call(monkeypatch):
     # 本用例聚焦 users 行联结展示；关闭 PR6 模拟扣费，避免 _seed_event 的
     # priced 事件自动开户/入账改变下方「开户 + 余额」断言的账面（模拟扣费
@@ -602,8 +523,6 @@ def test_users_row_joins_turn_billing_last_call(monkeypatch):
     assert "total" not in owner_item["spend"]
     assert owner_item["spend"]["window"] is not None
 
-
-@PG
 def test_settings_runtime_endpoint_reads_and_writes_ai_safety():
     """批次 F：PUT /api/admin/v1/settings/runtime（五安全参数子集）。
 
@@ -649,7 +568,6 @@ def test_settings_runtime_endpoint_reads_and_writes_ai_safety():
                app_mod.share_store.list_audit(limit=20)]
     assert "ai_safety.settings_update" in actions
 
-
 # --------------------------------------------------------------------------- #
 # 6. PG：provider balance GET / refresh（mock HTTP）
 # --------------------------------------------------------------------------- #
@@ -664,12 +582,10 @@ def _write_ai_config(monkeypatch, key="sk-official-key-123456",
     p.write_text(json.dumps(cfg), encoding="utf-8")
     return cfg
 
-
 def _fake_requests(monkeypatch):
     fake = FakeRequests()
     monkeypatch.setattr(app_mod, "requests", fake)
     return fake
-
 
 _BALANCE_OK = {
     "is_available": True,
@@ -679,8 +595,6 @@ _BALANCE_OK = {
     }],
 }
 
-
-@PG
 def test_provider_balance_get_empty_then_snapshot_after_refresh(monkeypatch):
     owner, _u = _setup_users()
     c = _login(_client(), owner)
@@ -710,8 +624,6 @@ def test_provider_balance_get_empty_then_snapshot_after_refresh(monkeypatch):
     assert r["age_seconds"] is not None and r["age_seconds"] < 60
     assert scan_sensitive(r) == []
 
-
-@PG
 def test_provider_balance_refresh_4xx_no_fake_zero(monkeypatch):
     owner, _u = _setup_users()
     _write_ai_config(monkeypatch)
@@ -725,8 +637,6 @@ def test_provider_balance_refresh_4xx_no_fake_zero(monkeypatch):
     # 失败不写伪造零余额
     assert billing_store.latest_provider_balance_snapshot("deepseek") is None
 
-
-@PG
 def test_provider_balance_refresh_non_json_body(monkeypatch):
     """HTTP 200 但 body 不是 JSON → provider_error，不写快照。"""
     owner, _u = _setup_users()
@@ -740,8 +650,6 @@ def test_provider_balance_refresh_non_json_body(monkeypatch):
     assert r.get_json()["error"]["code"] == "provider_error"
     assert billing_store.latest_provider_balance_snapshot("deepseek") is None
 
-
-@PG
 def test_provider_balance_refresh_network_failure(monkeypatch):
     owner, _u = _setup_users()
     _write_ai_config(monkeypatch)
@@ -753,8 +661,6 @@ def test_provider_balance_refresh_network_failure(monkeypatch):
     assert r.get_json()["error"]["code"] == "provider_unreachable"
     assert billing_store.latest_provider_balance_snapshot("deepseek") is None
 
-
-@PG
 def test_provider_balance_refresh_invalid_decimal(monkeypatch):
     owner, _u = _setup_users()
     _write_ai_config(monkeypatch)
@@ -769,8 +675,6 @@ def test_provider_balance_refresh_invalid_decimal(monkeypatch):
     assert r.get_json()["error"]["code"] == "invalid_balance_response"
     assert billing_store.latest_provider_balance_snapshot("deepseek") is None
 
-
-@PG
 def test_provider_balance_refresh_throttled(monkeypatch):
     owner, _u = _setup_users()
     _write_ai_config(monkeypatch)
@@ -782,8 +686,6 @@ def test_provider_balance_refresh_throttled(monkeypatch):
     assert r.status_code == 429
     assert r.get_json()["error"]["code"] == "refresh_throttled"
 
-
-@PG
 def test_provider_balance_refresh_not_configured(monkeypatch):
     owner, _u = _setup_users()
     _fake_requests(monkeypatch)
@@ -798,11 +700,9 @@ def test_provider_balance_refresh_not_configured(monkeypatch):
     assert r.status_code == 400
     assert r.get_json()["error"]["code"] == "provider_not_configured"
 
-
 # --------------------------------------------------------------------------- #
 # 批次 B：金额 policy/window 只读出口（/api/admin/v1/spend/*）
 # --------------------------------------------------------------------------- #
-@PG
 def test_spend_endpoints_readonly_owner_only():
     """PG：三端点 200；金额十进制字符串；窗口含 demo 周池 + 每用户月窗口；
     普通用户 403（批次 B 不做写 API——POST 不存在路由，Flask 405）。"""
@@ -876,8 +776,6 @@ def test_spend_endpoints_readonly_owner_only():
     # 批次 B 无写 API：POST 未注册路由 → 405
     assert c.post("/api/admin/v1/spend/policies").status_code == 405
 
-
-@PG
 def test_spend_windows_current_reports_policy_missing_per_subject():
     """user_default 被禁用时：单主体降级为稳定 error 项，整页仍 200（管理页
     需要看到「谁没有有效策略」，而不是整页失败）。"""

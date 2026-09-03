@@ -47,14 +47,8 @@ import app as app_mod  # noqa: E402
 import budget_store  # noqa: E402
 import demo_store  # noqa: E402
 import platform_features  # noqa: E402
-from pg_compat import BACKEND, json_only  # noqa: E402
+from pg_compat import BACKEND  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app, FakeRequests, FakeResponse # noqa: E402
-
-pg_only = pytest.mark.skipif(
-    BACKEND != "postgres",
-    reason="AI 预算 API 接线需 PG 原子预占（RUN_PG_TESTS=1）",
-)
-
 
 # --------------------------------------------------------------------------- #
 # 公共基建
@@ -75,7 +69,6 @@ def _ssrf_dns(monkeypatch):
         return [ipaddress.ip_address("93.184.216.34")]
     monkeypatch.setattr(app_mod, "_host_ips", fake_ips)
 
-
 @pytest.fixture(autouse=True)
 def _reset_stores(monkeypatch, tmp_path):
     """每用例：独立存储目录（ai_config/用户库/json share 全部落本用例私有目录）。
@@ -86,12 +79,10 @@ def _reset_stores(monkeypatch, tmp_path):
     isolate_app(monkeypatch, tmp_path)
     yield
 
-
 def _install_fake():
     fake = FakeRequests()
     app_mod.requests = fake
     return fake
-
 
 def _sse_ok(session_id="sess-fake-1"):
     """2xx SSE handler（X-AI-Session-ID 头）= HistoPilot 已接受执行。"""
@@ -99,12 +90,10 @@ def _sse_ok(session_id="sess-fake-1"):
                         ctype="text/event-stream",
                         headers={"X-AI-Session-ID": session_id})
 
-
 def _client(auth=True):
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = auth
     return csrf_client(app_mod.app.test_client())
-
 
 def _login(client, role, user_id):
     with client.session_transaction() as sess:
@@ -115,36 +104,29 @@ def _login(client, role, user_id):
         row = user_store.get_user(user_id)
         sess["auth_version"] = (row or {}).get("auth_version", 1)
 
-
 def _touch(name="s.svs"):
     p = Path(app_mod.UPLOAD_DIR) / name
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(b"svs-stub")
     return name
 
-
 def _own(name, user_id):
     app_mod.share_store.set_slide_meta(name, owner_user_id=user_id)
-
 
 def _setup_platform(base_url="http://platform.example/v1",
                     key="sk-platform-123456", model="gpt-p"):
     app_mod._save_ai_config({"base_url": base_url, "api_key": key, "model": model})
 
-
 def _make_user(role="user"):
     return user_store.create_user(
         "u-%s@x.com" % uuid.uuid4().hex[:8], "password1password1", role=role)
 
-
 def _rid():
     return "req_" + uuid.uuid4().hex
-
 
 #: 存量 own 凭据步数种子（test-review P3-17 magic 值收敛）：33 不是 app 里的
 #: 「官方值」，只是本文件写进存量凭据、再断言 GET 回显一致的同一常量。
 OWN_STEPS = 33
-
 
 def _own_credentials(uid, steps=None, base_url="http://own.example/v1"):
     cfg = {"use_platform": False, "base_url": base_url,
@@ -153,18 +135,15 @@ def _own_credentials(uid, steps=None, base_url="http://own.example/v1"):
         cfg["max_steps"] = steps
     user_store.set_user_ai_config(uid, cfg)
 
-
 def _run_ok(client, slide, request_id=None):
     body = {"slide": slide}
     if request_id:
         body["request_id"] = request_id
     return client.post("/api/ai/run", json=body)
 
-
 def _platform_report():
     r = budget_store.usage_report()
     return r["platform"]["total"]
-
 
 # --------------------------------------------------------------------------- #
 # 1. request_id 贯通（json / PG 双跑）
@@ -182,7 +161,6 @@ def test_request_id_invalid_rejected_400():
         assert r.status_code == 400, bad
         assert "request_id" in (r.get_json() or {}).get("error", "")
     assert fake.calls == []  # 未转发
-
 
 def test_request_id_client_provided_forwarded_and_generated_when_absent():
     _setup_platform()
@@ -202,57 +180,9 @@ def test_request_id_client_provided_forwarded_and_generated_when_absent():
     gen = fake.calls[-1]["body"].get("request_id")
     assert isinstance(gen, str) and gen
 
-
 # --------------------------------------------------------------------------- #
 # 2. json 生产路径 fail-closed（TESTING bypass 只限 pytest）
 # --------------------------------------------------------------------------- #
-@json_only  # PG 后端预算可用，平台 run 合法放行（本用例锁 json 生产语义）
-def test_json_backend_platform_run_fail_closed_without_testing():
-    _setup_platform()
-    fake = _install_fake()
-    fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
-    o = _make_user("owner")
-    _touch("fc.svs")
-    c = _client()
-    _login(c, "owner", o["user_id"])
-    # TESTING bypass 放行（pytest 专属；生产不可能设置 TESTING）
-    assert _run_ok(c, "fc.svs").status_code == 200
-    # 关闭 TESTING → 生产路径：平台凭据 fail-closed（不得无配额放行）
-    fake.calls.clear()
-    app_mod.app.config["TESTING"] = False
-    try:
-        r = _run_ok(c, "fc.svs")
-        assert r.status_code == 503
-        body = r.get_json()
-        assert body.get("code") == "pg_backend_required"
-        assert fake.calls == []  # 未转发 HistoPilot
-    finally:
-        app_mod.app.config["TESTING"] = True
-
-
-@json_only  # PG 后端 own 存量凭据同样被忽略走平台；本用例锁 json 放行语义
-def test_json_backend_legacy_own_credentials_now_platform():
-    """自带 API 通道下线：存量 own 凭据（use_platform=False）不再放行——
-    user 恒走平台凭据，json 生产路径 fail-closed（503 pg_backend_required）。"""
-    _setup_platform()  # 平台已配，但用户存量 use_platform=False + 自带凭据
-    u = _make_user("user")
-    _own_credentials(u["user_id"])
-    _touch("own.svs")
-    _own("own.svs", u["user_id"])
-    fake = _install_fake()
-    fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
-    c = _client()
-    _login(c, "user", u["user_id"])
-    app_mod.app.config["TESTING"] = False
-    try:
-        # json 下平台凭据 fail-closed（own 存量凭据不再是无配额逃生通道）
-        r = _run_ok(c, "own.svs")
-        assert r.status_code == 503
-        assert r.get_json().get("code") == "pg_backend_required"
-        assert fake.calls == []  # 未转发 HistoPilot
-    finally:
-        app_mod.app.config["TESTING"] = True
-
 
 # --------------------------------------------------------------------------- #
 # 3. user PUT 全拒 + GET 只读形态（json / PG 双跑）
@@ -283,7 +213,6 @@ def test_user_put_any_field_rejected_400():
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.get_json()["max_steps"] == 60
 
-
 def test_user_get_effective_max_steps_platform_readonly():
     """user GET 只读：using 恒 platform（平台已配）；生效步数=平台
     platform_task_max_steps（Batch C：默认/上限 500）；存量 own 步数仅作回显
@@ -308,7 +237,6 @@ def test_user_get_effective_max_steps_platform_readonly():
     j3 = c.get("/api/ai/config").get_json()
     assert j3["using"] == "platform"
     assert j3["effective_max_steps"] == 500
-
 
 def test_max_steps_injection_rules_for_sidecar_config():
     """Batch C（§Batch C 实现要求 1）：user 恒平台模式，_build_sidecar_config
@@ -341,7 +269,6 @@ def test_max_steps_injection_rules_for_sidecar_config():
     cfg2 = fake.calls[-1]["body"]["config"]
     assert cfg2["max_steps"] == 500
 
-
 def test_run_body_cannot_smuggle_tuning_fields():
     """浏览器不能靠请求体临时塞未保存的调优值（注入只读已保存配置）。"""
     _setup_platform()
@@ -363,7 +290,6 @@ def test_run_body_cannot_smuggle_tuning_fields():
     cfg = fake.calls[-1]["body"]["config"]
     assert cfg["max_steps"] == 500        # 平台步数（存量 own 9 被忽略）
     assert cfg["api_key"] == "sk-platform-123456"  # 平台 key，请求体整体被忽略
-
 
 # --------------------------------------------------------------------------- #
 # 4. run grant fail-closed（json / PG 双跑）
@@ -387,7 +313,6 @@ def test_run_grant_failure_rejects_run(monkeypatch):
     if platform_features.budget_features_available():
         assert _platform_report() == 0  # 不扣额度（grant 在预占之前失败）
 
-
 def test_ask_does_not_require_run_grant(monkeypatch):
     """/ask 为 lite fork 无写工具：不签发也不因缺 grant 被拒（docs §5.4-5）。"""
     _setup_platform()
@@ -408,7 +333,6 @@ def test_ask_does_not_require_run_grant(monkeypatch):
     sent = fake.calls[-1]["body"]
     assert "run_grant" not in sent["config"]
     assert sent["request_id"]
-
 
 # --------------------------------------------------------------------------- #
 # 5. CSRF 回归（新写接口；json / PG 双跑——CSRF 层先于业务）
@@ -435,14 +359,12 @@ def test_csrf_required_on_budget_and_ai_write_endpoints():
     assert r3.status_code == 400
     assert r3.get_json()["error"] == "csrf_required"
 
-
 # --------------------------------------------------------------------------- #
 # 6. owner 预算 API（json fail-closed / PG 全量）
 # --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
 # 7. PG：预占 / 消费 / 释放 时序
 # --------------------------------------------------------------------------- #
-@pg_only
 def test_same_request_id_retry_no_double_charge():
     _setup_platform()
     u = _make_user("user")
@@ -463,8 +385,6 @@ def test_same_request_id_retry_no_double_charge():
     assert resv["state"] == "consumed"
     assert resv["histopilot_session_id"] == "sess-idem"
 
-
-@pg_only
 def test_user_11th_platform_run_rejected():
     import spend_store
     spend_store.set_enforcement_mode("shadow")  # 批次 F：软闸回退语义
@@ -498,8 +418,6 @@ def test_user_11th_platform_run_rejected():
     _login(c2, "user", u2["user_id"])
     assert _run_ok(c2, "u11b.svs").status_code == 200
 
-
-@pg_only
 def test_platform_total_exhausted_rejects_owner_and_user():
     import spend_store
     spend_store.set_enforcement_mode("shadow")  # 批次 F：软闸回退语义
@@ -527,8 +445,6 @@ def test_platform_total_exhausted_rejects_owner_and_user():
     assert r_o.get_json().get("code") == "platform_ai_budget_exhausted"
     assert fake.calls == []
 
-
-@pg_only
 def test_legacy_own_credentials_are_not_quota_escape_hatch():
     """自带 API 通道下线：存量 own 凭据不再是平台配额的逃生通道——
     平台总量打满后，即使 user 存量 use_platform=False 也按平台凭据拒（429）。"""
@@ -556,8 +472,6 @@ def test_legacy_own_credentials_are_not_quota_escape_hatch():
     assert report["platform"]["total"] == 1
     assert report["own"]["total"] == 0  # own 维度不再产生用量
 
-
-@pg_only
 def test_histopilot_4xx_releases_reservation():
     _setup_platform()
     u = _make_user("user")
@@ -579,8 +493,6 @@ def test_histopilot_4xx_releases_reservation():
     report = budget_store.usage_report()
     assert report["platform"]["total"] == 0
 
-
-@pg_only
 def test_histopilot_unreachable_releases_reservation():
     _setup_platform()
     u = _make_user("user")
@@ -597,8 +509,6 @@ def test_histopilot_unreachable_releases_reservation():
     assert budget_store.get_reservation(rid)["state"] == "released"
     assert _platform_report() == 0
 
-
-@pg_only
 def test_stream_reconnect_and_cancel_do_not_reserve():
     """SSE 重连 / session 读取 / cancel 不预占（docs §4.1）。"""
     _setup_platform()
@@ -618,7 +528,6 @@ def test_stream_reconnect_and_cancel_do_not_reserve():
     assert c.post("/api/ai/cancel", json={"session_id": "sess-x"}).status_code == 200
     assert _platform_report() == 0
 
-
 def test_reclaim_expired_reservations_removed():
     """盲时间回收钩子已删除（review 2026-08-29 §10.3 阶段 5）。
 
@@ -637,8 +546,6 @@ def test_reclaim_expired_reservations_removed():
     loop_src = inspect.getsource(app_mod._start_budget_reclaim_thread)
     assert "reconcile_expired_reservations()" in loop_src.split("def _loop")[1]
 
-
-@pg_only
 def test_hard_mode_run_skips_reservations_and_writes_binding():
     """批次 F 核心分流：mode=all 下官方 run 200 且**不写** ai_budget_reservations。
 
@@ -687,8 +594,6 @@ def test_hard_mode_run_skips_reservations_and_writes_binding():
     assert fake.calls == []  # 预检在转发之前拒绝
     assert budget_store.get_reservation(rid) is None  # 全程零 reservation
 
-
-@pg_only
 def test_hard_mode_pending_binding_exists_before_sidecar_call():
     """0028 阶段 1（P1-2）：fake sidecar /run handler 被调用时 pending 绑定行
     必须已经存在（attach 在 2xx 头之后，此时 session 可能仍 NULL——以实际
@@ -721,8 +626,6 @@ def test_hard_mode_pending_binding_exists_before_sidecar_call():
     # 响应完成后 attach 完成
     assert budget_store.get_run_binding(rid)["histopilot_session_id"] == "sess-pend"
 
-
-@pg_only
 def test_hard_mode_pending_write_failure_fails_closed_503(monkeypatch):
     """0028 阶段 1 fail-closed：pending 绑定写入失败 → 503
     run_binding_unavailable，**零 sidecar 调用**（绝不放无主体绑定的 run）。"""
@@ -746,12 +649,10 @@ def test_hard_mode_pending_write_failure_fails_closed_503(monkeypatch):
     assert body.get("code") == "run_binding_unavailable"
     assert fake.calls == []  # 不转发 sidecar
 
-
 # --------------------------------------------------------------------------- #
 # 8. UI 交付物守卫（owner 预算卡片 + user 步数只读；docs §4.2/§8.3）
 # --------------------------------------------------------------------------- #
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
 
 def test_ui_budget_card_and_max_steps_sync_present():
     """批次 C/D1 UI 退役守卫（§4.2/§4.6/§Batch C 5/6）：turn 预算 UI 整体

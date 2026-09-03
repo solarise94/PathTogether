@@ -56,10 +56,6 @@ import user_store_pg  # noqa: E402
 
 from pg_compat import BACKEND  # noqa: E402
 
-pytestmark = pytest.mark.skipif(
-    BACKEND != "postgres",
-    reason="总额度语义需真实 PG（RUN_PG_TESTS=1）；关键用例 skip 不算通过")
-
 if BACKEND == "postgres":
     import psycopg  # noqa: E402
     import _billing_helpers as bh  # noqa: E402

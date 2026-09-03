@@ -38,11 +38,7 @@ import pytest
 import billing_pricing
 import billing_store
 
-from pg_compat import BACKEND  # noqa: E402
 import _billing_helpers as bh  # noqa: E402
-
-PG = pytest.mark.skipif(BACKEND != "postgres",
-                        reason="billing 数据层需 PG（RUN_PG_TESTS=1）")
 
 README_PATH = bh.USAGE_DIR / "README.md"
 
@@ -61,7 +57,6 @@ def _fresh(event, hours_back=1):
                           ).isoformat().replace("+00:00", "Z")
     return out
 
-
 def _bind_for(event):
     """只绑定权威行不 ingest（并发竞态用例：A/B 各自的 dedup 都要通过）。"""
     if event.get("request_id"):
@@ -70,13 +65,11 @@ def _bind_for(event):
     elif event["subject_type"] == "demo":
         bh.bind_demo_session(event["session_id"], event["subject_id"])
 
-
 def _readme_hashes():
     text = README_PATH.read_text(encoding="utf-8")
     documented = re.search(r"payload_hash = ([0-9a-f]{64})", text).group(1)
     all_hashes = re.findall(r"`([0-9a-f]{64})`", text)
     return documented, all_hashes
-
 
 # =========================================================================== #
 # 1. 计价数学（§5：三分项 ceil，整数运算，禁 float；§9.1 批次 A 单位点）
@@ -87,7 +80,6 @@ _RATES_OFFPEAK_FLASH = {
     "cache_miss_nano_per_million": 1_500_000_000,
     "output_nano_per_million": 4_500_000_000,
 }
-
 
 def test_price_unit_required_examples():
     """§9.1 批次 A 必测点（独立断言，不从迁移/夹具复制常量自证）。
@@ -114,7 +106,6 @@ def test_price_unit_required_examples():
     assert _RATES_OFFPEAK_FLASH["output_nano_per_million"] == \
         billing_pricing.parse_balance_to_nano("4.5")
 
-
 def test_price_component_ceil_rounds_up_each_term():
     # ceil 语义用非 1e6 倍数的合成 rate 验证（corrected 价全是 1e6 倍数、
     # 恰好整除，测不出向上取整）：
@@ -129,7 +120,6 @@ def test_price_component_ceil_rounds_up_each_term():
     # 3 tokens × 27 CNY/百万 = 3×27e9/1e6 = 81,000 nano
     assert billing_pricing.price_component_nano(3, 27_000_000_000) == 81_000
 
-
 def test_price_hit_zero_and_output_zero():
     assert billing_pricing.price_component_nano(0, 50_000_000) == 0
     assert billing_pricing.price_tokens_nano(0, 0, 0, _RATES_OFFPEAK_FLASH) == 0
@@ -140,7 +130,6 @@ def test_price_hit_zero_and_output_zero():
     # output=0：reasoning 已含在 output 内，不再单独计价
     assert billing_pricing.price_tokens_nano(
         512, 512, 0, _RATES_OFFPEAK_FLASH) == 512 * 50 + 512 * 1500 + 0
-
 
 def test_price_tokens_mixed_sum_of_three_components():
     """峰时（flash peak 0.1/3.0/9.0 CNY）fixture 01 的 token 量独立复算。
@@ -162,13 +151,11 @@ def test_price_tokens_mixed_sum_of_three_components():
     assert billing_pricing.price_tokens_nano(1_000_000, 2_000_000, 500_000,
                                              rates) == 10_600_000_000
 
-
 def test_price_math_rejects_negative_and_float_paths():
     with pytest.raises(ValueError):
         billing_pricing.price_component_nano(-1, 50_000_000)
     with pytest.raises(ValueError):
         billing_pricing.price_component_nano(1, -50_000_000)
-
 
 def test_time_band_weekend_all_off_peak():
     """周末全天 off_peak（§9.1）：2026-09-05/06 为周六/周日。"""
@@ -184,7 +171,6 @@ def test_time_band_weekend_all_off_peak():
     assert billing_pricing.time_band_for(
         "2026-09-07T04:00:00+00:00") == "off_peak"  # 周一 12:00（不含）
 
-
 # =========================================================================== #
 # 2. 时段边界（§4：Asia/Shanghai 工作日双窗左闭右开，周末全天 off_peak）
 # =========================================================================== #
@@ -198,13 +184,11 @@ def test_time_band_all_fixture_cases():
                 case["input"], case["expected_time_band"], got,
                 case.get("note", "")))
 
-
 def test_time_band_accepts_datetime_and_rejects_naive():
     peak = datetime.fromisoformat("2026-09-07T01:00:00+00:00")
     assert billing_pricing.time_band_for(peak) == "peak"
     with pytest.raises(ValueError):
         billing_pricing.time_band_for(datetime(2026, 9, 7, 9, 0))
-
 
 # =========================================================================== #
 # 3. canonical payload_hash（PR0 README 为唯一依据；互锁）
@@ -218,7 +202,6 @@ def test_canonical_hash_fixture_01_matches_readme():
     conflict_hash = billing_store.canonical_payload_hash(conflict)
     assert conflict_hash in all_hashes
     assert conflict_hash != documented
-
 
 def test_canonical_hash_exclusions_and_normalization():
     event = bh.load_event("01_owner_priced_flash_peak.json")
@@ -242,7 +225,6 @@ def test_canonical_hash_exclusions_and_normalization():
                   enqueued_at="2026-09-07t02:30:13.12z")
     assert billing_store.canonical_payload_hash(offset) == baseline
 
-
 # =========================================================================== #
 # 4. 手写严格校验器（语义 == schema_v1.json）
 # =========================================================================== #
@@ -256,11 +238,9 @@ FIXTURE_FILES = (
     "07_replay_conflict_of_01.json",
 )
 
-
 def test_validator_accepts_all_sample_events():
     for name in FIXTURE_FILES:
         assert not billing_store.validate_usage_event_body(bh.load_event(name)), name
-
 
 def test_validator_rejects_invalid_bodies():
     base = bh.load_event("01_owner_priced_flash_peak.json")
@@ -308,7 +288,6 @@ def test_validator_rejects_invalid_bodies():
             errors = bad(mutate)
         assert errors, "校验器应拒绝：%s" % label
 
-
 # =========================================================================== #
 # 5. 余额十进制解析（§6.6：Decimal 精确，≤9 位小数，禁 float 中转）
 # =========================================================================== #
@@ -320,7 +299,6 @@ def test_parse_balance_to_nano_exact():
     assert billing_pricing.parse_balance_to_nano("0") == 0
     assert billing_pricing.parse_balance_to_nano(" 12 ") == 12_000_000_000
 
-
 def test_parse_balance_rejects_bad_inputs():
     for bad_value in ("0.0000000001", "1.2.3", "", "  ", "abc", "1e5", "NaN",
                       "Infinity", 110.5, None):
@@ -329,29 +307,9 @@ def test_parse_balance_rejects_bad_inputs():
     with pytest.raises(ValueError):
         billing_pricing.parse_balance_to_nano("1.5", currency="USD")
 
-
-# =========================================================================== #
-# 6. json/dual fail-closed（pg_backend_required）
-# =========================================================================== #
-@pytest.mark.skipif(BACKEND == "postgres",
-                    reason="json 后端专用（PG 模式下本用例无意义）")
-def test_json_backend_fail_closed():
-    import platform_features
-    with pytest.raises(platform_features.PgFeatureUnavailable) as exc_info:
-        billing_store.ingest_usage_event(
-            bh.load_event("01_owner_priced_flash_peak.json"),
-            installation_id="pin_test")
-    assert exc_info.value.code == "pg_backend_required"
-    with pytest.raises(platform_features.PgFeatureUnavailable):
-        billing_store.get_usage_event("use_" + "0" * 32)
-    assert platform_features.billing_features_available() is False
-    assert platform_features.usage_ingest_available() is False
-
-
 # =========================================================================== #
 # 7. PG：迁移种子 / 价格版本 / 并发激活 / 账本约束 / ingest 路径
 # =========================================================================== #
-@PG
 def test_migration_seed_matches_price_fixture():
     """种子两代书：legacy（0018 错误换算，已收口）+ corrected v2（0022）。
 
@@ -438,14 +396,12 @@ def test_migration_seed_matches_price_fixture():
                 assert v2["cache_hit_nano_per_million"] == \
                     legacy["cache_hit_nano_per_million"] * 1_000_000
 
-
 def _ingest(event, *, installation="pin_test", **kwargs):
     """store 级 ingest 便捷封装（绑定 reservation 后调用）。"""
     bh.bind_reservation(event["request_id"], event["session_id"],
                         event["subject_type"], event["subject_id"])
     return billing_store.ingest_usage_event(
         event, installation_id=installation, **kwargs)
-
 
 def _flash_peak_rates(band):
     """flash/vision-exp corrected 单价（按时段），parse_balance_to_nano 独立换算。"""
@@ -454,12 +410,9 @@ def _flash_peak_rates(band):
         "off_peak": ("0.05", "1.5", "4.5"),
     }[band]
 
-
 def _iso(dt):
     return dt.isoformat().replace("+00:00", "Z")
 
-
-@PG
 def test_price_version_fixed_after_rate_change():
     """cutover 后事件 → corrected v2 计价；调价 supersede 后历史不重算。
 
@@ -560,8 +513,6 @@ def test_price_version_fixed_after_rate_change():
         + billing_pricing.price_component_nano(
             640, billing_pricing.parse_balance_to_nano(cny_new[2]) * 10))
 
-
-@PG
 def test_concurrent_price_book_activation_single_winner():
     from concurrent.futures import ThreadPoolExecutor
     bh.seed_price_books()
@@ -589,7 +540,6 @@ def test_concurrent_price_book_activation_single_winner():
                 for bid in book_ids}
     assert set(statuses.values()) == {"active", "draft"}
 
-
 def _try_activate(book_id):
     try:
         billing_store.activate_price_book(book_id, actor="pytest")
@@ -597,8 +547,6 @@ def _try_activate(book_id):
     except billing_store.PriceBookOverlapError:
         return "overlap"
 
-
-@PG
 def test_ledger_sign_check_and_usage_debit_unique():
     import psycopg
     import user_store
@@ -666,8 +614,6 @@ def test_ledger_sign_check_and_usage_debit_unique():
         "usage:%s" % event["event_id"], event_id=event["event_id"])
     assert replay["duplicate"] is True
 
-
-@PG
 def test_account_balance_is_ledger_sum():
     import user_store
     user = user_store.create_user("balance@x.com", "pass123456789012")
@@ -684,8 +630,6 @@ def test_account_balance_is_ledger_sum():
     assert billing_store.account_balance_nano(account["account_id"]) == 1350
     assert billing_store.account_balance_nano("bac_missing") is None
 
-
-@PG
 def test_provider_balance_snapshot_roundtrip():
     from decimal import Decimal
     observed = datetime.now(timezone.utc)
@@ -705,8 +649,6 @@ def test_provider_balance_snapshot_roundtrip():
         "total_balance_nano"] == 5
     assert billing_store.latest_provider_balance_snapshot("openai") is None
 
-
-@PG
 def test_usage_event_duplicate_and_conflicts():
     bh.seed_price_books()
     event = bh.load_event("01_owner_priced_flash_peak.json")
@@ -735,8 +677,6 @@ def test_usage_event_duplicate_and_conflicts():
         billing_store.ingest_usage_event(
             other, installation_id="pin_test", now=datetime.now(timezone.utc))
 
-
-@PG
 def test_unpriced_paths_and_no_received_at_substitution():
     bh.seed_price_books_with_history()
     now = datetime.now(timezone.utc)
@@ -819,8 +759,6 @@ def test_unpriced_paths_and_no_received_at_substitution():
         + billing_pricing.price_component_nano(
             1204, rates06["output_nano_per_million"]))
 
-
-@PG
 def test_concurrent_insert_race_savepoint_paths(monkeypatch):
     """并发投递竞态的确定性复现（§7.5 步骤 2；SAVEPOINT 修复的回归测试）。
 
@@ -903,8 +841,6 @@ def test_concurrent_insert_race_savepoint_paths(monkeypatch):
     # B 的行仍在（A 的事务回滚不影响已提交的 B）
     assert billing_store.get_usage_event(b3["event_id"]) is not None
 
-
-@PG
 def test_sim_debit_disabled_never_writes_ledger(monkeypatch):
     """PR6 kill-switch（§19 v0.4）：BILLING_SIMULATED_DEBIT=0 → 回到纯计量。
 
@@ -947,7 +883,6 @@ def test_sim_debit_disabled_never_writes_ledger(monkeypatch):
     finally:
         conn.close()
 
-
 # =========================================================================== #
 # 8. PG：批次 A 价格单位修复（§7.1/§7.2/§9.1）
 # =========================================================================== #
@@ -960,15 +895,12 @@ def _next_time_with_band(start, band):
         t += timedelta(hours=1)
     raise AssertionError("一周内找不到 %s 时段" % band)
 
-
 def _cny_of(snap, model, band):
     values = snap["models"][model][band]
     return (str(values["cache_hit_cny_per_million"]),
             str(values["cache_miss_cny_per_million"]),
             str(values["output_cny_per_million"]))
 
-
-@PG
 def test_all_supported_models_two_kinds_corrected_prices():
     """所有 supported model × 峰/谷 × provider_cost/customer_charge 两套价。
 
@@ -1029,8 +961,6 @@ def test_all_supported_models_two_kinds_corrected_prices():
             legacy_hit = cur.fetchone()["cache_hit_nano_per_million"]
     assert legacy_hit == int(Decimal("0.05") * 1000)  # = 50（历史错误量级）
 
-
-@PG
 def test_cutover_boundary_picks_book_by_occurred_at_and_replay_stable():
     """cutover 前后各取正确版本；旧 event 重放不重算（§9.1/§7.1）。
 
@@ -1102,8 +1032,6 @@ def test_cutover_boundary_picks_book_by_occurred_at_and_replay_stable():
     # 量级护栏：corrected 金额是 nano「元」级；同量级 legacy 只会算出个位数
     assert r_new["row"]["provider_cost_nano_cny"] >= 1_000_000
 
-
-@PG
 def test_fresh_database_full_migration_current_price_is_corrected_v2():
     """fresh PG 依次跑 0001→0022 后：当前生效价 = corrected v2（§9.7）。
 
@@ -1164,8 +1092,6 @@ def test_fresh_database_full_migration_current_price_is_corrected_v2():
     finally:
         srv.cleanup()
 
-
-@PG
 def test_admin_overview_legacy_pricing_split_marker():
     """§7.2 只读口径：cutover/legacy 计数/固定说明，旧影子数据可区分。"""
     bh.seed_price_books_with_history()
@@ -1191,7 +1117,6 @@ def test_admin_overview_legacy_pricing_split_marker():
     # billing_store.pricing_v2_cutover 与标志一致；json 后端 fail-closed 已由
     # 既有 pg_backend_required 用例覆盖
     assert billing_store.pricing_v2_cutover() == cutover
-
 
 if __name__ == "__main__":
     import sys

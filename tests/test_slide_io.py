@@ -45,7 +45,6 @@ import slide_io  # noqa: E402
 import upload_guard  # noqa: E402
 import upload_task_store  # noqa: E402
 import app as app_mod  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app, clear_upload_dir  # noqa: E402
 from _tiff_fixtures import make_ome_tiff_bytes, make_tiff_bytes  # noqa: E402
 
@@ -415,8 +414,6 @@ def test_v2_real_invalid_tiff_commit_stable_code():
 
 def test_v2_quota_cleanup_on_real_invalid_commit_pg(monkeypatch):
     """PG 后端：真验证失败的确定性失败仍释放预占（无 reservation 泄漏）。"""
-    if BACKEND != "postgres":
-        pytest.skip("需 PG（RUN_PG_TESTS=1）")
     import psycopg
     import user_store
 

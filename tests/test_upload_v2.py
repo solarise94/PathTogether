@@ -50,22 +50,13 @@ from pg_compat import BACKEND  # noqa: E402
 from _pt_helpers import csrf_client, install_json_login_limits, isolate_app, clear_upload_dir # noqa: E402
 from _tiff_fixtures import make_ome_tiff_bytes, make_tiff_bytes  # noqa: E402
 
-
-pg_only = pytest.mark.skipif(
-    BACKEND != "postgres", reason="配额/续租需 PG（RUN_PG_TESTS=1）")
-json_only = pytest.mark.skipif(
-    BACKEND != "json", reason="json 后端 fail-closed 行为仅在 json 模式断言")
-
-
 # A0 异常契约后的验证 stub：成功返回 None / 失败抛 SlideValidationError，
 # 签名兼容 format_hint 关键字（替代旧 lambda p: True/False 布尔契约）
 def _validate_ok(path, **_):
     return None
 
-
 def _validate_bad(path, **_):
     raise slide_io.SlideValidationError("invalid_slide", "无效的切片文件")
-
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
@@ -82,12 +73,10 @@ def _isolate(tmp_path, monkeypatch):
     clear_upload_dir(UPLOAD_DIR)
     yield
 
-
 def _client(auth=False):
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = auth
     return csrf_client(app_mod.app.test_client())
-
 
 def _user_session(client, role="user", login="v2@x.com"):
     u = user_store.create_user(login, "pass1234pass1234", role=role)
@@ -99,14 +88,12 @@ def _user_session(client, role="user", login="v2@x.com"):
             "auth_version", 1)
     return u["user_id"]
 
-
 def _create(client, name="a.svs", size=1000, sha=None, **extra):
     body = {"filename": name, "declared_size": size}
     if sha:
         body["sha256_expected"] = sha
     body.update(extra)
     return client.post("/api/uploads", json=body)
-
 
 def _put(client, upload_id, offset, data, sha=None):
     """PUT 一个分片（sha 缺省按数据现算——模拟正确客户端）。"""
@@ -116,10 +103,8 @@ def _put(client, upload_id, offset, data, sha=None):
                       % (upload_id, offset, sha),
                       data=data, content_type="application/octet-stream")
 
-
 def _part(upload_id):
     return Path(UPLOAD_DIR) / (".uploading-%s.part" % upload_id)
-
 
 def _upload_full(client, upload_id, data, chunk=64):
     """按 chunk 顺序传完全部数据，返回最后一个响应。"""
@@ -128,7 +113,6 @@ def _upload_full(client, upload_id, data, chunk=64):
         r = _put(client, upload_id, off, data[off:off + chunk])
         assert r.status_code == 200, r.get_data(as_text=True)
     return r
-
 
 if BACKEND == "postgres":
     import psycopg
@@ -172,7 +156,6 @@ else:
     def _reservation_row(rid):  # pragma: no cover
         raise RuntimeError("PG only")
 
-
 # =========================================================================== #
 # 1. 创建任务（预校验 + 初始化即预占）
 # =========================================================================== #
@@ -187,7 +170,6 @@ def test_create_returns_initial_state():
     assert j["chunk_size"] == upload_task_store.UPLOAD_CHUNK_SIZE
     assert j["expires_at"] > 0
 
-
 def test_create_zip_and_mrxs_guided_to_legacy():
     c = _client()
     r = _create(c, name="bundle.zip", size=100)
@@ -197,7 +179,6 @@ def test_create_zip_and_mrxs_guided_to_legacy():
     assert r.status_code == 400
     assert r.get_json()["code"] == "use_legacy_upload"
 
-
 def test_create_unsupported_ext_and_bad_args():
     c = _client()
     assert _create(c, name="a.txt", size=10).status_code == 400
@@ -206,20 +187,17 @@ def test_create_unsupported_ext_and_bad_args():
     r = _create(c, name="a.svs", size=10, sha="not-a-hash")
     assert r.status_code == 400
 
-
 def test_create_over_limit_413(monkeypatch):
     monkeypatch.setattr(upload_guard, "UPLOAD_MAX_REQUEST_BYTES", 1000)
     r = _create(_client(), name="big.svs", size=2000)
     assert r.status_code == 413
     assert r.get_json()["code"] == "upload_too_large"
 
-
 def test_create_name_conflict_409():
     (Path(UPLOAD_DIR) / "dup.svs").write_bytes(b"existing")
     r = _create(_client(), name="dup.svs", size=10)
     assert r.status_code == 409
     assert r.get_json()["code"] == "name_unavailable"
-
 
 # =========================================================================== #
 # 2. PUT 分片：串行 offset / 幂等 / 哈希 / 单次落盘
@@ -241,7 +219,6 @@ def test_put_chunk_roundtrip_and_get_progress():
     assert j["chunk_size"] == upload_task_store.UPLOAD_CHUNK_SIZE
     assert j["expires_at"] > 0
 
-
 def test_serial_offset_gap_409():
     c = _client()
     uid = _create(c, name="a.svs", size=300).get_json()["upload_id"]
@@ -251,7 +228,6 @@ def test_serial_offset_gap_409():
     assert j["code"] == "offset_mismatch"
     assert j["confirmed_offset"] == 0  # 带当前进度供客户端对齐
     assert not _part(uid).exists() or _part(uid).stat().st_size == 0
-
 
 def test_put_chunk_hash_mismatch_rolls_back(monkeypatch):
     c = _client()
@@ -268,7 +244,6 @@ def test_put_chunk_hash_mismatch_rolls_back(monkeypatch):
     # 正确重试成功
     assert _put(c, uid, 80, b"y" * 40).status_code == 200
     assert _part(uid).stat().st_size == 120
-
 
 def test_duplicate_put_idempotent():
     c = _client()
@@ -287,7 +262,6 @@ def test_duplicate_put_idempotent():
     assert after["expires_at"] >= before["expires_at"]  # TTL 刷新（§3.2.4）
     assert _part(uid).read_bytes() == data
 
-
 def test_duplicate_put_mismatch_409():
     c = _client()
     uid = _create(c, name="a.svs", size=200).get_json()["upload_id"]
@@ -295,7 +269,6 @@ def test_duplicate_put_mismatch_409():
     r = _put(c, uid, 0, b"b" * 50)  # 同 offset 不同内容
     assert r.status_code == 409
     assert r.get_json()["code"] == "chunk_conflict"
-
 
 def test_earlier_chunk_replay_returns_progress():
     c = _client()
@@ -310,7 +283,6 @@ def test_earlier_chunk_replay_returns_progress():
     assert j["confirmed_offset"] == 100  # 只回当前进度，不声称哈希比对
     assert _part(uid).stat().st_size == 100
 
-
 def test_chunk_beyond_declared_413():
     c = _client()
     uid = _create(c, name="a.svs", size=100).get_json()["upload_id"]
@@ -318,7 +290,6 @@ def test_chunk_beyond_declared_413():
     assert r.status_code == 413
     assert r.get_json()["code"] == "chunk_too_large"
     assert not _part(uid).exists() or _part(uid).stat().st_size == 0
-
 
 # =========================================================================== #
 # 3. 并发（行锁/文件锁串行化）
@@ -348,7 +319,6 @@ def test_concurrent_identical_put_single_advance():
     assert t["confirmed_offset"] == len(data)  # 只推进一次，无重复累计
     assert _part(uid).read_bytes() == data
 
-
 def test_concurrent_distinct_put_one_wins():
     """同 offset 不同内容并发：恰好一个 advanced，其余 409 chunk_conflict。"""
     c = _client()
@@ -375,7 +345,6 @@ def test_concurrent_distinct_put_one_wins():
     assert hashlib.sha256(part).hexdigest() == t["last_chunk_sha256"]
     assert part in payloads
 
-
 # =========================================================================== #
 # 4. commit 三段式（§3.2.5）
 # =========================================================================== #
@@ -394,7 +363,6 @@ def test_commit_happy_path(monkeypatch):
     assert dest.read_bytes() == data
     assert not _part(uid).exists()  # 临时文件已清
     assert upload_task_store.get_task(uid)["state"] == "committed"
-
 
 def test_commit_real_tiff_end_to_end_no_monkeypatch():
     """真 TIFF：create→多 chunk→commit 全程真验证（A0，无 monkeypatch）。
@@ -418,7 +386,6 @@ def test_commit_real_tiff_end_to_end_no_monkeypatch():
     assert not _part(uid).exists()
     assert upload_task_store.get_task(uid)["state"] == "committed"
 
-
 def test_commit_real_ome_tiff_end_to_end_no_monkeypatch():
     """真 OME-TIFF 同通道可过验证（OME 优先分支在 .part+hint 下生效）。"""
     ome = make_ome_tiff_bytes()
@@ -429,7 +396,6 @@ def test_commit_real_ome_tiff_end_to_end_no_monkeypatch():
     assert r.status_code == 200, r.get_data(as_text=True)
     assert (Path(UPLOAD_DIR) / "ome-slide.ome.tiff").read_bytes() == ome
     assert not _part(uid).exists()
-
 
 def test_commit_real_garbage_tiff_stable_code_and_cleanup():
     """垃圾字节伪装 .tif：真验证失败 → 稳定码 failed；DELETE 清理 .part。"""
@@ -448,7 +414,6 @@ def test_commit_real_garbage_tiff_stable_code_and_cleanup():
     r = c.delete("/api/uploads/%s" % uid)
     assert r.status_code == 200 and r.get_json()["state"] == "cancelled"
     assert not _part(uid).exists()
-
 
 def test_recover_ownership_failure_keeps_committing(monkeypatch):
     """ownership 失败不得 finish_commit：保持 committing，文件仍在，下次可自愈。"""
@@ -481,7 +446,6 @@ def test_recover_ownership_failure_keeps_committing(monkeypatch):
     assert out2["state"] == "committed"
     assert finish_calls == [1]
 
-
 def test_maintain_heals_committed_missing_owner(monkeypatch):
     """GET 路径仅在 slide_meta 缺 owner 时校正归属。"""
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
@@ -508,7 +472,6 @@ def test_maintain_heals_committed_missing_owner(monkeypatch):
     app_mod._upload_v2_maintain(task)
     assert healed == []
 
-
 def test_recover_commit_does_not_commit_when_settle_fails(monkeypatch):
     """崩溃恢复：入账失败不得留下 committed 文件。"""
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
@@ -528,7 +491,6 @@ def test_recover_commit_does_not_commit_when_settle_fails(monkeypatch):
     assert out["state"] == "failed"
     assert not dest.exists()
 
-
 def test_commit_validates_before_promotion(monkeypatch):
     """§2.3 纠正：_validate_slide_file 必须在原子提升**之前**调用。"""
     calls = []
@@ -546,7 +508,6 @@ def test_commit_validates_before_promotion(monkeypatch):
     assert len(calls) == 1
     assert calls[0][1] is False, "验证发生时目标文件不应已提升"
     assert (Path(UPLOAD_DIR) / "vbp.svs").exists()
-
 
 def test_commit_hash_mismatch_deterministic_failure(monkeypatch):
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
@@ -570,7 +531,6 @@ def test_commit_hash_mismatch_deterministic_failure(monkeypatch):
     assert r.status_code == 200 and r.get_json()["state"] == "cancelled"
     assert not _part(uid).exists()
 
-
 def test_commit_size_mismatch_400_keeps_active(monkeypatch):
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client()
@@ -587,7 +547,6 @@ def test_commit_size_mismatch_400_keeps_active(monkeypatch):
     assert r.status_code == 200
     assert c.post("/api/uploads/%s/commit" % uid).status_code == 200
 
-
 def test_commit_invalid_slide_failed(monkeypatch):
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_bad)
     c = _client()
@@ -599,7 +558,6 @@ def test_commit_invalid_slide_failed(monkeypatch):
     assert j["code"] == "invalid_slide" and j["state"] == "failed"
     assert not (Path(UPLOAD_DIR) / "bad.svs").exists()
     assert upload_task_store.get_task(uid)["state"] == "failed"
-
 
 def test_commit_name_taken_failed(monkeypatch):
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
@@ -615,7 +573,6 @@ def test_commit_name_taken_failed(monkeypatch):
     assert upload_task_store.get_task(uid)["state"] == "failed"
     assert (Path(UPLOAD_DIR) / "nt2.svs").read_bytes() == b"taken"  # 未覆盖
 
-
 def test_commit_idempotent_replay_returns_committed(monkeypatch):
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client()
@@ -625,7 +582,6 @@ def test_commit_idempotent_replay_returns_committed(monkeypatch):
     r = c.post("/api/uploads/%s/commit" % uid)  # 重放
     assert r.status_code == 200
     assert r.get_json()["state"] == "committed"
-
 
 def test_cancel_during_commit_returns_409(monkeypatch):
     """commit 与 cancel 竞态：验证阶段（无行锁）收到 DELETE → 409 不等待。"""
@@ -659,7 +615,6 @@ def test_cancel_during_commit_returns_409(monkeypatch):
     assert out["r"].status_code == 200
     assert upload_task_store.get_task(uid)["state"] == "committed"
 
-
 # =========================================================================== #
 # 5. DELETE / TTL / 过期
 # =========================================================================== #
@@ -676,7 +631,6 @@ def test_cancel_active_cleans_part_and_state():
     assert g.status_code == 200 and g.get_json()["state"] == "cancelled"
     assert c.delete("/api/uploads/%s" % uid).status_code == 200  # 幂等
 
-
 def test_put_refreshes_task_ttl(monkeypatch):
     c = _client()
     uid = _create(c, name="ttl.svs", size=200).get_json()["upload_id"]
@@ -685,7 +639,6 @@ def test_put_refreshes_task_ttl(monkeypatch):
     assert _put(c, uid, 0, b"t" * 10).status_code == 200
     e1 = upload_task_store.get_task(uid)["expires_at"]
     assert e1 > e0  # PUT 刷新 expires_at（§3.2.4）
-
 
 def test_expiry_lazy_cleanup(monkeypatch):
     """TTL 到期：下次访问惰性转 expired，清临时文件并释放预占。"""
@@ -702,7 +655,6 @@ def test_expiry_lazy_cleanup(monkeypatch):
     # 过期后 PUT → 409（任务不可写入）
     r = _put(c, uid, 100, b"f" * 100)
     assert r.status_code == 409
-
 
 # =========================================================================== #
 # 6. CSRF / 权限 / 身份
@@ -725,7 +677,6 @@ def test_csrf_required_for_writes_bare_client():
     # 任务未被创建（CSRF 在 body 消费/落库之前拒绝）
     assert upload_task_store.get_task("upt_x") is None
 
-
 def test_cross_user_task_binding_403():
     """他人任务与不存在任务统一 403（不泄露存在性）。owner（运维）可见。"""
     c_owner = _client(auth=True)
@@ -746,14 +697,12 @@ def test_cross_user_task_binding_403():
     # 本人（owner）照常
     assert c_owner.get("/api/uploads/%s" % uid).status_code == 200
 
-
 def test_noauth_identity_owner_semantics_unchanged():
     """AUTH_ENABLED=False：current_identity 归一 owner，V2 创建/写入不破。"""
     c = _client(auth=False)
     uid = _create(c, name="na.svs", size=50).get_json()["upload_id"]
     assert upload_task_store.get_task(uid)["owner_user_id"] == ""
     assert _put(c, uid, 0, b"n" * 50).status_code == 200
-
 
 # =========================================================================== #
 # 7. 旧接口并存
@@ -767,11 +716,9 @@ def test_legacy_upload_still_works(monkeypatch):
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.get_json()["name"] == "old.svs"
 
-
 # =========================================================================== #
 # 8. PG 权威：初始化预占 / 续租 / 转实占 / 释放（RUN_PG_TESTS=1）
 # =========================================================================== #
-@pg_only
 def test_create_reserves_quota_before_any_put(monkeypatch):
     """初始化即预占（§3.3）：任务创建时 reserved_bytes == declared_size。"""
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
@@ -786,8 +733,6 @@ def test_create_reserves_quota_before_any_put(monkeypatch):
     st, _ = _reservation_row(task["reservation_id"])
     assert st == "reserved"
 
-
-@pg_only
 def test_put_renews_reservation():
     """续租（§3.2.4）：PUT 成功后 reservation 的 expires_at 后移。"""
     c = _client(auth=True)
@@ -800,8 +745,6 @@ def test_put_renews_reservation():
     _, t1 = _reservation_row(rid)
     assert t1 > t0
 
-
-@pg_only
 def test_commit_consumes_reservation(monkeypatch):
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client(auth=True)
@@ -815,8 +758,6 @@ def test_commit_consumes_reservation(monkeypatch):
     assert used == 300 and reserved == 0
     assert _reservation_row(rid)[0] == "consumed"
 
-
-@pg_only
 def test_cancel_and_expiry_release_reservation(monkeypatch):
     c = _client(auth=True)
     uid_user = _user_session(c, role="user", login="p4@x.com")
@@ -837,8 +778,6 @@ def test_cancel_and_expiry_release_reservation(monkeypatch):
     assert _quota_row(uid_user)[1] == 0
     assert _reservation_row(rid2)[0] == "released"
 
-
-@pg_only
 def test_commit_hash_mismatch_releases_reservation():
     c = _client(auth=True)
     uid_user = _user_session(c, role="user", login="p5@x.com")
@@ -850,8 +789,6 @@ def test_commit_hash_mismatch_releases_reservation():
     assert r.status_code == 409
     assert _quota_row(uid_user)[1] == 0  # 确定性失败即释放（不占额度）
 
-
-@pg_only
 def test_expired_reservation_reclaimed_rejects_old_put_and_commit(monkeypatch):
     """过期预占被新任务回收后，旧任务 PUT/commit fail-closed，不得无记账提交。"""
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
@@ -877,37 +814,3 @@ def test_expired_reservation_reclaimed_rejects_old_put_and_commit(monkeypatch):
     dest = Path(UPLOAD_DIR) / "old.svs"
     assert not dest.exists()
 
-
-@json_only
-def test_json_backend_user_create_fail_closed():
-    """json 后端 + role=user：配额不可用 → 503（与旧 /api/upload 同哲学）。"""
-    c = _client(auth=True)
-    _user_session(c, role="user", login="j1@x.com")
-    r = _create(c, name="j.svs", size=100)
-    assert r.status_code == 503
-    assert r.get_json()["code"] == "upload_guard_unavailable"
-
-
-@json_only
-def test_json_backend_store_equivalent_records():
-    """json 后端等价文件记录：原子写盘结构可读、字段与 PG 模型同名。"""
-    c = _client()
-    uid = _create(c, name="js.svs", size=100).get_json()["upload_id"]
-    assert _put(c, uid, 0, b"j" * 60).status_code == 200
-    path = upload_task_store._path()
-    assert os.path.exists(path)
-    with open(path, encoding="utf-8") as f:
-        data = _json.load(f)
-    rec = data["tasks"][uid]
-    for key in ("upload_id", "owner_user_id", "safe_name", "declared_size",
-                "chunk_size", "confirmed_offset", "last_chunk_offset",
-                "last_chunk_length", "last_chunk_sha256", "sha256_expected",
-                "sha256_actual", "reservation_id", "state", "commit_token",
-                "expires_at"):
-        assert key in rec, "等价文件记录缺字段 %s" % key
-    assert rec["confirmed_offset"] == 60
-    assert rec["last_chunk_sha256"] == hashlib.sha256(b"j" * 60).hexdigest()
-
-
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-q"]))

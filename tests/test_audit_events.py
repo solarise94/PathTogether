@@ -28,7 +28,6 @@ import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest
 DATA_DIR = _bootstrap.SHARE_DATA_DIR
 UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 os.environ["AI_INTERNAL_TOKEN"] = "test-internal-token"
-from pg_compat import BACKEND  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
@@ -366,8 +365,6 @@ def test_share_access_log_dedup():
 # =========================================================================== #
 # 6. usage ingest 审计（PR2 admin-billing §7.5：无敏感内容）
 # =========================================================================== #
-@pytest.mark.skipif(BACKEND != "postgres",
-                    reason="usage ingest 数据路径需 PG（RUN_PG_TESTS=1）")
 def test_usage_ingest_audit_no_sensitive_content(monkeypatch):
     """投递一条 usage event → audit 落 usage.ingest，detail 只含白名单键。
 

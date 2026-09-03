@@ -33,11 +33,6 @@ import budget_store  # noqa: E402
 import pg_store  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
 
-pytestmark = pytest.mark.skipif(
-    BACKEND != "postgres",
-    reason="ai_budget 原语需 PG（RUN_PG_TESTS=1）",
-)
-
 
 def _req():
     return "req_" + uuid.uuid4().hex

@@ -52,11 +52,6 @@ import app as app_mod  # noqa: E402
 import platform_features  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
 
-pytestmark = pytest.mark.skipif(
-    BACKEND != "postgres",
-    reason="AI 预算池隔离需 PG（RUN_PG_TESTS=1）",
-)
-
 
 def _req():
     return "req_" + uuid.uuid4().hex

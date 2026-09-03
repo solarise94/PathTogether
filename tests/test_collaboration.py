@@ -32,7 +32,6 @@ import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
 from _pt_helpers import csrf_client, install_json_login_limits, isolate_app # noqa: E402
 import share_server as share_srv  # noqa: E402
-from pg_compat import json_only  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

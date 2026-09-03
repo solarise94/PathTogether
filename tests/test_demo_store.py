@@ -33,11 +33,6 @@ pytest.importorskip("psycopg")
 import demo_store  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
 
-pytestmark = pytest.mark.skipif(
-    BACKEND != "postgres",
-    reason="Demo 数据层原语需 PG（RUN_PG_TESTS=1）",
-)
-
 
 @pytest.fixture
 def pg_conn(pg_uri):

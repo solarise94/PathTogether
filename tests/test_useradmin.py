@@ -38,14 +38,8 @@ pytest.importorskip("psycopg")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import conftest  # noqa: E402
 import psycopg  # noqa: E402
 import user_store_pg  # noqa: E402
-
-pytestmark = pytest.mark.skipif(
-    conftest.BACKEND != "postgres",
-    reason="break-glass CLI 需直连 PostgreSQL（RUN_PG_TESTS=1）",
-)
 
 import useradmin  # noqa: E402  （PG 可用后再 import：依赖 psycopg/pg_store）
 

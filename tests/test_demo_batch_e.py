@@ -39,9 +39,6 @@ import spend_store  # noqa: E402
 import pg_store  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
 
-PG = pytest.mark.skipif(BACKEND != "postgres",
-                        reason="批次 E 金额窗口用例需 PG（RUN_PG_TESTS=1）")
-
 if BACKEND == "postgres":
     import psycopg  # noqa: E402
     import _billing_helpers as bh  # noqa: E402
@@ -251,7 +248,6 @@ def _demo_batch_e_env(tmp_path, monkeypatch):
 # =========================================================================== #
 # §9.5：多浏览器累计到 Demo 周金额上限后统一拒绝（mode=all 验证，收尾恢复）
 # =========================================================================== #
-@PG
 def test_multi_browser_demo_week_pool_exhaustion_denies_all():
     _seed_all()
     _set_mode("all")  # 测试内切 all 验证（fixture 收尾恢复 shadow）
@@ -290,7 +286,6 @@ def test_multi_browser_demo_week_pool_exhaustion_denies_all():
 # =========================================================================== #
 # §9.5：新周自动获得新窗口
 # =========================================================================== #
-@PG
 def test_new_week_gets_fresh_demo_window():
     _seed_all()
     _set_mode("all")
@@ -335,7 +330,6 @@ def test_new_week_gets_fresh_demo_window():
 # =========================================================================== #
 # §9.5：Demo 无 billing account 也可完整计价 + 限制（无 ledger 行）
 # =========================================================================== #
-@PG
 def test_demo_priced_and_limited_without_billing_account():
     _seed_all()
     _set_mode("all")
@@ -382,7 +376,6 @@ def test_demo_priced_and_limited_without_billing_account():
 # =========================================================================== #
 # §9.5：Demo 周额度用尽不影响注册用户 / Owner（窗口隔离）
 # =========================================================================== #
-@PG
 def test_demo_exhaustion_does_not_affect_user_or_owner():
     _seed_all()
     _set_mode("all")
@@ -430,7 +423,6 @@ def test_demo_exhaustion_does_not_affect_user_or_owner():
 # =========================================================================== #
 # §7.2 主体解析第②步：demo_runs 主源 + demo_sessions 历史回退
 # =========================================================================== #
-@PG
 def test_usage_subject_resolution_prefers_demo_runs():
     _seed_all()
     b = _demo_body_for_browser("res")  # bind_demo_run：只建 demo_runs 绑定
@@ -455,7 +447,6 @@ def test_usage_subject_resolution_prefers_demo_runs():
     assert legacy["n"] is True  # 老表无绑定 → 解析确实来自 demo_runs
 
 
-@PG
 def test_usage_subject_resolution_legacy_demo_sessions_fallback():
     """0026 前的历史行（demo_sessions.histopilot_session_id）仍可解析。"""
     _seed_all()
@@ -476,7 +467,6 @@ def test_usage_subject_resolution_legacy_demo_sessions_fallback():
     assert (row["subject_type"], row["subject_id"]) == ("demo", cap)
 
 
-@PG
 def test_sequential_demo_runs_bind_distinct_sessions():
     """同 capability 顺序两次 run 绑定两个 HP session：各自 usage 都正确归属。"""
     _seed_all()
@@ -497,7 +487,6 @@ def test_sequential_demo_runs_bind_distinct_sessions():
 # =========================================================================== #
 # §9.7 迁移：fresh 全量 0001→0026 在位 + ensure_schema / 0026 SQL 重放幂等
 # =========================================================================== #
-@PG
 def test_migration_0026_tables_constraints_and_idempotent_replay(pg_uri):
     import psycopg
     # conftest session 起始已对 fresh PG 全量应用 0001→0026；这里校验在位

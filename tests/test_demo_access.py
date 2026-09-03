@@ -37,7 +37,6 @@ DATA_DIR = _bootstrap.SHARE_DATA_DIR
 UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 os.environ.setdefault("AI_BUDGET_RECLAIM_INTERVAL_SECONDS", "0")  # 关后台线程
 
-
 import pytest  # noqa: E402
 import requests as real_requests  # noqa: E402
 
@@ -47,14 +46,8 @@ import budget_store  # noqa: E402
 import demo_store  # noqa: E402
 import platform_features  # noqa: E402
 import app as app_mod  # noqa: E402
-from pg_compat import BACKEND, json_only  # noqa: E402
+from pg_compat import BACKEND  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app, FakeResponse # noqa: E402
-
-pg_only = pytest.mark.skipif(
-    BACKEND != "postgres",
-    reason="Demo API 全链路需 PG capability/预算（RUN_PG_TESTS=1）",
-)
-
 
 # --------------------------------------------------------------------------- #
 # 公共基建
@@ -70,7 +63,6 @@ def _reset_stores(monkeypatch, tmp_path):
     isolate_app(monkeypatch, tmp_path)
     app_mod._ADAPTER_MODE_CACHE.update(ts=0.0, mode=None)
     yield
-
 
 class FakeSidecar:
     """HistoPilot mock：精确 + 前缀路由；记录全部调用；可切换不可达。"""
@@ -138,22 +130,18 @@ class FakeSidecar:
     def post(self, url, **kwargs):
         return self._dispatch("POST", url, **kwargs)
 
-
 def _sse_ok(session_id="sess-demo-1"):
     return FakeResponse(
         200, "id: 1\nevent: security_profile_applied\ndata: {}\n\n",
         ctype="text/event-stream", headers={"X-AI-Session-ID": session_id})
 
-
 def _json_err(status, code):
     return FakeResponse(status, {"error": code, "code": code})
-
 
 def _client(auth=True):
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = auth
     return csrf_client(app_mod.app.test_client())
-
 
 def _login(client, role, user_id):
     with client.session_transaction() as sess:
@@ -164,11 +152,9 @@ def _login(client, role, user_id):
         row = user_store.get_user(user_id)
         sess["auth_version"] = (row or {}).get("auth_version", 1)
 
-
 def _make_user(role="owner"):
     return user_store.create_user(
         "u-%s@x.com" % uuid.uuid4().hex[:8], "password1password1", role=role)
-
 
 def _touch(name="demo1.svs"):
     # 经 app_mod.UPLOAD_DIR 写入（其它测试模块可能改写过该常量）
@@ -177,18 +163,15 @@ def _touch(name="demo1.svs"):
     p.write_bytes(b"svs-stub")
     return name
 
-
 def _setup_platform():
     app_mod._save_ai_config({
         "base_url": "http://platform.example/v1",
         "api_key": "sk-platform-123456", "model": "gpt-p"})
 
-
 def _enable_demo_period():
     # 批次 F：demo_enabled 自周期列迁居 settings_store（ai_safety.*）
     import settings_store
     settings_store.set_ai_safety_settings({"demo_enabled": True})
-
 
 def _catalog_add(name):
     """直连 store 造目录条目（绕开 admin API），返回 slide_id。"""
@@ -197,14 +180,11 @@ def _catalog_add(name):
     demo_store.catalog_add(slide_id, added_by="owner-test")
     return slide_id
 
-
 def _demo_usage_total():
     return budget_store.usage_report()["demo"]["total"]
 
-
 def _platform_usage_total():
     return budget_store.usage_report()["platform"]["total"]
-
 
 def _fresh_capability(fake):
     """新浏览器：发 config 拿 capability cookie，返回 client。"""
@@ -213,7 +193,6 @@ def _fresh_capability(fake):
     assert r.status_code == 200, r.get_json()
     return client
 
-
 def _pg_conn():
     import psycopg
     import pg_store
@@ -221,56 +200,9 @@ def _pg_conn():
     conn.row_factory = psycopg.rows.dict_row
     return conn
 
-
 # --------------------------------------------------------------------------- #
 # json 后端：fail-closed 与通道隔离
 # --------------------------------------------------------------------------- #
-@json_only  # PG 下 /demo 渲染 Viewer（capability/Viewer 测试另见 pg_only 用例）
-def test_demo_page_public_json_backend():
-    """/demo 公开 200；json 渲染降级页（不加载 demo.js 写入口，不靠 CSS 隐藏）。"""
-    app_mod.AUTH_ENABLED = True
-    client = _client()
-    r = client.get("/demo")
-    assert r.status_code == 200
-    body = r.get_data(as_text=True)
-    assert "PostgreSQL" in body
-    assert "仅用于研究、教学和软件演示" in body
-    assert 'href="/login"' in body
-    # 降级页不加载 Viewer/AI 脚本（无写操作入口可言）
-    assert "demo.js" not in body and "app.js" not in body
-
-
-@json_only  # PG 下 Demo API 正常开放（全链路见 pg_only 用例）
-def test_json_backend_demo_api_fail_closed():
-    """json/dual：全部 /api/demo/* 一律 503 pg_backend_required（docs §4.3）。"""
-    client = _client()
-    checks = [
-        ("GET", "/api/demo/config", None),
-        ("GET", "/api/demo/slides", None),
-        ("GET", "/api/demo/slides/sld_x/info", None),
-        ("GET", "/api/demo/slides/sld_x.dzi", None),
-        ("GET", "/api/demo/slides/sld_x_files/0/0_0.jpeg", None),
-        ("GET", "/api/demo/ai/session/s1/stream", None),
-        ("GET", "/api/demo/ai/session/s1", None),
-        ("POST", "/api/demo/ai/run", {"slide_id": "sld_x"}),
-    ]
-    for method, path, body in checks:
-        r = client.open(path, method=method, json=body)
-        assert r.status_code == 503, (method, path, r.status_code)
-        assert (r.get_json() or {}).get("code") == "pg_backend_required", path
-
-
-@json_only  # 锁 json 语义：无 CSRF 头也到达视图（PG 下视图正常处理）
-def test_demo_post_does_not_require_login_csrf():
-    """Demo POST 用 capability 通道：不带登录 CSRF 也应到达视图（json 下 503
-    pg_backend_required，而非 400 csrf_required）。"""
-    client = app_mod.app.test_client()  # 裸 client：不注入 X-CSRF-Token
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = True
-    r = client.post("/api/demo/ai/run", json={"slide_id": "sld_x"})
-    assert r.status_code == 503
-    assert (r.get_json() or {}).get("code") == "pg_backend_required"
-
 
 def test_demo_cookie_cannot_call_normal_api():
     """伪造/真实 Demo cookie 调 /api/ai/*、/api/slide/* → 401（capability 只放行
@@ -283,8 +215,6 @@ def test_demo_cookie_cannot_call_normal_api():
     assert client.get("/api/slide/a.svs/info").status_code == 401
     assert client.get("/api/slides").status_code == 401
 
-
-@json_only  # PG 下由 by-request 反查对账测试覆盖写通道语义
 def test_public_demo_env_disables_internal_annotate(monkeypatch):
     """PUBLIC_DEMO 模式（env）：internal 写通道 403（docs §5.4-1）。"""
     _touch("a.svs")
@@ -305,11 +235,9 @@ def test_public_demo_env_disables_internal_annotate(monkeypatch):
                      headers={"X-AI-Internal-Token": tok})
     assert r2.status_code != 403
 
-
 # --------------------------------------------------------------------------- #
 # PG：capability / config / 目录
 # --------------------------------------------------------------------------- #
-@pg_only
 def test_capability_issuance_and_config():
     _enable_demo_period()
     _setup_platform()
@@ -358,8 +286,6 @@ def test_capability_issuance_and_config():
     client2.set_cookie("demo_capability", "not-a-real-token", domain="localhost")
     assert client2.get("/api/demo/slides").status_code == 410
 
-
-@pg_only
 def test_demo_disabled_blocks_anonymous_slides_and_viewer():
     """demo_enabled=false：不渲染 Viewer、不签发 cookie，切片/瓦片 403。"""
     _setup_platform()
@@ -378,8 +304,6 @@ def test_demo_disabled_blocks_anonymous_slides_and_viewer():
     assert (client.get("/api/demo/slides").get_json() or {}).get("code") == \
         "demo_disabled"
 
-
-@pg_only
 def test_demo_slides_listing_and_catalog_outside_rejected(monkeypatch):
     _enable_demo_period()
     _setup_platform()
@@ -420,8 +344,6 @@ def test_demo_slides_listing_and_catalog_outside_rejected(monkeypatch):
     tr = client.get("/api/demo/slides/%s_files/0/0_0.jpeg" % inside)
     assert tr.status_code == 200 and tr.data == b"JPEGBYTES"
 
-
-@pg_only
 def test_demo_cookie_cannot_read_normal_slides_pg():
     _enable_demo_period()
     _setup_platform()
@@ -432,11 +354,9 @@ def test_demo_cookie_cannot_read_normal_slides_pg():
     assert client.get("/api/slide/%s/info" % name).status_code == 401
     assert client.get("/api/slides").status_code == 401
 
-
 # --------------------------------------------------------------------------- #
 # PG：/api/demo/ai/run 全链路
 # --------------------------------------------------------------------------- #
-@pg_only
 def test_demo_run_full_flow_and_security_envelope():
     _enable_demo_period()
     _setup_platform()
@@ -487,8 +407,6 @@ def test_demo_run_full_flow_and_security_envelope():
     assert _demo_usage_total() == 2  # 每次成功 run 各计一次
     assert demo_store.count_run_states()["total"] == 2
 
-
-@pg_only
 def test_demo_run_double_click_only_one_succeeds():
     _enable_demo_period()
     _setup_platform()
@@ -508,8 +426,6 @@ def test_demo_run_double_click_only_one_succeeds():
     assert _demo_usage_total() == 1  # 同 ID 重放不双扣
     assert demo_store.count_run_states()["total"] == 1  # 单条 run 流水
 
-
-@pg_only
 def test_demo_run_retry_same_request_id_no_double_charge():
     _enable_demo_period()
     _setup_platform()
@@ -539,8 +455,6 @@ def test_demo_run_retry_same_request_id_no_double_charge():
     assert client.get("/api/demo/config").get_json()["histopilot_session_id"] == \
         "sess-retry"
 
-
-@pg_only
 def test_demo_run_rejected_releases_reservation():
     """HistoPilot 4xx（非 security 场景）同样 release：run 可再来、预算归零。"""
     _enable_demo_period()
@@ -555,8 +469,6 @@ def test_demo_run_rejected_releases_reservation():
     assert client.get("/api/demo/config").get_json()["run_state"] == "released"
     assert _demo_usage_total() == 0
 
-
-@pg_only
 def test_demo_sse_reconnect_no_extra_charge():
     _enable_demo_period()
     _setup_platform()
@@ -583,8 +495,6 @@ def test_demo_sse_reconnect_no_extra_charge():
     assert client.get(
         "/api/demo/ai/session/sess-other/stream").status_code == 403
 
-
-@pg_only
 def test_capability_expired_stream_410():
     _enable_demo_period()
     _setup_platform()
@@ -606,8 +516,6 @@ def test_capability_expired_stream_410():
     assert r.status_code == 410
     assert (r.get_json() or {}).get("code") == "capability_expired"
 
-
-@pg_only
 def test_slide_removed_from_catalog_terminates_active_run():
     _enable_demo_period()
     _setup_platform()
@@ -640,8 +548,6 @@ def test_slide_removed_from_catalog_terminates_active_run():
     client3.get("/api/demo/config")
     assert client3.get("/api/demo/slides").get_json()["slides"] == []
 
-
-@pg_only
 def test_slide_delete_revokes_demo():
     _enable_demo_period()
     _setup_platform()
@@ -661,8 +567,6 @@ def test_slide_delete_revokes_demo():
     assert client.get(
         "/api/demo/ai/session/sess-demo-1/stream").status_code == 403
 
-
-@pg_only
 def test_demo_soft_fallback_turn_budget_exhausted_releases_run():
     """软闸回退（mode=shadow）回归：Demo 每日 turn 子额度耗尽 → 429 + run 回滚。
 
@@ -688,8 +592,6 @@ def test_demo_soft_fallback_turn_budget_exhausted_releases_run():
     assert _demo_usage_total() == 1
     assert len(fake.calls_of("POST", "/run")) == 1
 
-
-@pg_only
 def test_legacy_adapter_and_unreachable_fail_closed():
     _enable_demo_period()
     _setup_platform()
@@ -716,8 +618,6 @@ def test_legacy_adapter_and_unreachable_fail_closed():
     assert _demo_usage_total() == 0
     assert client.get("/api/demo/config").get_json()["run_state"] is None
 
-
-@pg_only
 def test_task_too_long_rejected():
     _enable_demo_period()
     _setup_platform()
@@ -731,8 +631,6 @@ def test_task_too_long_rejected():
     assert (r.get_json() or {}).get("code") == "task_too_long"
     assert client.get("/api/demo/config").get_json()["run_state"] is None
 
-
-@pg_only
 def test_run_disabled_when_demo_off():
     _setup_platform()
     FakeSidecar()._install()
@@ -742,7 +640,6 @@ def test_run_disabled_when_demo_off():
     r = client.post("/api/demo/ai/run", json={"slide_id": slide_id})
     assert r.status_code == 403
     assert (r.get_json() or {}).get("code") == "demo_disabled"
-
 
 # --------------------------------------------------------------------------- #
 # PG：确认式对账（by-request 反查 → consume / release / 顺延）
@@ -758,7 +655,6 @@ def _reserve_pending_run(slide_id):
     budget_store.reserve_turn(rid, "demo", cap["id"], "platform")
     return cap, rid, run
 
-
 def _expire_everything():
     conn = _pg_conn()
     try:
@@ -773,8 +669,6 @@ def _expire_everything():
     finally:
         conn.close()
 
-
-@pg_only
 def test_reconcile_found_consumes_missing_releases_unavailable_extends():
     _setup_platform()
     FakeSidecar()._install()
@@ -836,8 +730,6 @@ def test_reconcile_found_consumes_missing_releases_unavailable_extends():
     assert not [e for e in summary2["demo"]
                 if e["id"] == run_c["demo_run_id"]]
 
-
-@pg_only
 def test_reconcile_consume_failed_extends_instead_of_blind_release(monkeypatch):
     """HistoPilot 已接受但 consume 失败：顺延，不得留给盲回收退款。"""
     _setup_platform()
@@ -872,8 +764,6 @@ def test_reconcile_consume_failed_extends_instead_of_blind_release(monkeypatch):
     assert "reconcile_expired_reservations()" in loop_src.split("def _loop")[1]
     assert not hasattr(app_mod, "reclaim_expired_reservations")
 
-
-@pg_only
 def test_reconcile_found_without_accepted_extends():
     """session 已创建但尚未接受（安全确认前崩溃）→ 顺延，不得 consume/release。"""
     _setup_platform()
@@ -898,8 +788,6 @@ def test_reconcile_found_without_accepted_extends():
     assert budget_store.get_reservation(rid)["state"] == "reserved"
     assert budget_store.get_reservation(rid)["reservation_expires_at"] > time.time()
 
-
-@pg_only
 def test_reconcile_abandoned_releases():
     """启动恢复标记 abandoned 的未接受动作：对账释放，不得 consume/顺延。"""
     _setup_platform()
@@ -925,8 +813,6 @@ def test_reconcile_abandoned_releases():
     assert demo_store.get_run(run["demo_run_id"])["state"] == "released"
     assert budget_store.get_reservation(rid)["state"] == "released"
 
-
-@pg_only
 def test_reconcile_abandoned_stale_attempt_does_not_release_newer_try():
     """abandoned 确认退款后重新预占才换代；旧 attempt 对账不得退新尝试。"""
     _setup_platform()
@@ -963,8 +849,6 @@ def test_reconcile_abandoned_stale_attempt_does_not_release_newer_try():
     assert demo_store.get_run_by_request(cap["id"], rid)["state"] == "reserved"
     assert budget_store.get_reservation(rid)["state"] == "reserved"
 
-
-@pg_only
 def test_catalog_remove_reconciles_reservations_not_blind_release():
     """目录撤销：found+已接受 → consume；missing → release；未接受 → 顺延。"""
     _setup_platform()
@@ -1013,8 +897,6 @@ def test_catalog_remove_reconciles_reservations_not_blind_release():
     for run in (run_ok, run_miss, run_pend):
         assert demo_store.get_run(run["demo_run_id"])["state"] == "expired"
 
-
-@pg_only
 def test_demo_sequential_runs_unlimited_via_ui():
     """批次 E §4.1：同 capability 顺序多次 run，无累计次数上限。"""
     _enable_demo_period()
@@ -1036,8 +918,6 @@ def test_demo_sequential_runs_unlimited_via_ui():
     assert demo_store.count_run_states()["total"] == 5
     assert _demo_usage_total() == 5
 
-
-@pg_only
 def test_demo_second_run_blocked_while_first_active():
     """批次 E §9.5：同 capability 同时第二个 run 被并发闸拒绝（409）。"""
     _enable_demo_period()
@@ -1068,8 +948,6 @@ def test_demo_second_run_blocked_while_first_active():
     r4 = client.post("/api/demo/ai/run", json={"slide_id": slide_id})
     assert r4.status_code == 200, r4.get_json()
 
-
-@pg_only
 def test_demo_ip_request_rate_limit_blocks_flood(monkeypatch):
     """批次 E §9.5：短窗口请求速率仍拒绝刷请求（429 + Retry-After）。
 
@@ -1121,8 +999,6 @@ def test_demo_ip_request_rate_limit_blocks_flood(monkeypatch):
         assert rx.status_code == 200, rx.get_json()
         assert rx.get_data()  # finished → 可顺序再跑
 
-
-@pg_only
 def test_demo_hard_mode_skips_turn_reservation_and_binding():
     """批次 F：mode=all（demo 金额硬闸）→ demo run 完全跳过 turn 消费闸。
 
@@ -1160,8 +1036,6 @@ def test_demo_hard_mode_skips_turn_reservation_and_binding():
     assert cfg["budget"]["legacy"] is True
     assert cfg["spend"]["demo_exhausted"] is False
 
-
-@pg_only
 def test_demo_max_concurrency_gate_still_enforced():
     """批次 F 迁居回归：全站 demo_max_concurrency 安全闸在 demo_store 生效。
 
@@ -1192,8 +1066,6 @@ def test_demo_max_concurrency_gate_still_enforced():
     r3 = c2.post("/api/demo/ai/run", json={"slide_id": slide_id})
     assert r3.status_code == 200, r3.get_json()
 
-
-@pg_only
 def test_demo_ip_request_rate_env_zero_disables_bucket(monkeypatch):
     monkeypatch.setenv("DEMO_IP_RATE_PER_MINUTE", "0")
     _enable_demo_period()
@@ -1208,11 +1080,9 @@ def test_demo_ip_request_rate_env_zero_disables_bucket(monkeypatch):
         # 批次 F：耗尽流释放全局并发槽（顺序体验语义）
         assert r.get_data()
 
-
 # --------------------------------------------------------------------------- #
 # PG：owner demo-catalog 管理
 # --------------------------------------------------------------------------- #
-@pg_only
 def test_admin_demo_catalog_crud_and_access_control():
     _setup_platform()
     FakeSidecar()._install()
@@ -1248,15 +1118,12 @@ def test_admin_demo_catalog_crud_and_access_control():
     assert r2.status_code == 200
     assert admin.get("/api/admin/demo-catalog").get_json()["slides"] == []
 
-
-@pg_only
 def test_public_demo_env_json_refuses_startup(monkeypatch):
     """（已有启动闸回归）PUBLIC_DEMO_ENABLED=1 + 非 PG → SystemExit。"""
     monkeypatch.setattr(platform_features, "STORAGE_BACKEND", "json")
     with pytest.raises(SystemExit):
         app_mod._check_public_demo_backend_or_exit(
             {"PUBLIC_DEMO_ENABLED": "1"})
-
 
 def test_demo_js_event_reset_uses_snapshot_not_second_stream():
     text = (Path(__file__).resolve().parent.parent / "static" / "demo.js") \
@@ -1297,7 +1164,6 @@ def test_demo_js_event_reset_uses_snapshot_not_second_stream():
     assert i18n.count('"demo.ai.run.available.n":') == 2
     assert i18n.count('"demo.ai.run.ip.limited":') == 2
 
-
 def test_demo_html_owner_admin_reset_bar_not_in_product_ui():
     """黑色 Admin 用量栏不得进入普通 Demo；owner 诊断已迁入 admin 插件（PR5）。"""
     root = Path(__file__).resolve().parent.parent
@@ -1314,7 +1180,6 @@ def test_demo_html_owner_admin_reset_bar_not_in_product_ui():
     assert 'id="aibudget-reset-btn"' not in shell
     assert 'id="adm-turn-newperiod-btn"' not in plugin_ui
     assert 'id="adm-turn-save-btn"' not in plugin_ui
-
 
 def test_demo_uses_shared_shell_not_separate_product():
     """Demo 是 demo/readonly 运行模式：共享外壳 + adapter，不加载正式 app.js。"""
@@ -1348,7 +1213,6 @@ def test_demo_uses_shared_shell_not_separate_product():
     assert official["upload"] is True
     assert official["readonly_badge"] is False
 
-
 def test_demo_available_template_hides_write_ops():
     """服务端按 capabilities 不渲染写入口（不只靠 CSS 隐藏）。"""
     from flask import render_template
@@ -1375,7 +1239,6 @@ def test_demo_available_template_hides_write_ops():
     assert 'src="/static/demo.js' in html
     assert 'src="/static/app.js' not in html
     assert "/plugins/histopilot/" not in html
-
 
 def test_demo_landing_login_cta_switches_for_logged_in_users(monkeypatch):
     """/demo 已登录用户 CTA 切换「打开完整版」，匿名保持登录/注册（docs B2）。
@@ -1421,7 +1284,6 @@ def test_demo_landing_login_cta_switches_for_logged_in_users(monkeypatch):
         .read_text(encoding="utf-8")
     assert i18n.count('"demo.open.full":') == 2
 
-
 def test_official_template_keeps_write_ops_and_budget_diag():
     from flask import render_template
     with app_mod.app.app_context():
@@ -1440,7 +1302,6 @@ def test_official_template_keeps_write_ops_and_budget_diag():
     assert 'src="/static/app.js' in html
     assert 'data-i18n="demo.badge"' not in html
 
-
 def test_demo_js_finish_run_does_not_auto_reconnect_terminal_session():
     """终态 finishRun 刷新 config 时禁止自动重连，避免 agent_finished 循环。"""
     text = (Path(__file__).resolve().parent.parent / "static" / "demo.js") \
@@ -1455,7 +1316,6 @@ def test_demo_js_finish_run_does_not_auto_reconnect_terminal_session():
     assert "loadConfig({ restore: true })" in text
     assert "sessionAttached" in text
     assert "opts.restore" in text or "opts && opts.restore" in text
-
 
 def test_demo_js_text_delta_and_paused_are_terminal():
     """Demo 必须展示 text_delta，且 agent_paused 结束本轮不得重连。"""

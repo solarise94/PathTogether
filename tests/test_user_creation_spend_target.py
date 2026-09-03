@@ -39,9 +39,6 @@ import user_store  # noqa: E402
 import user_store_pg  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
 
-PG = pytest.mark.skipif(BACKEND != "postgres",
-                        reason="spend/invite 写路径需 PG（RUN_PG_TESTS=1）")
-
 if BACKEND == "postgres":
     import _billing_helpers as bh  # noqa: E402
 
@@ -122,7 +119,6 @@ def _mk_owner(login="sp-target-owner@x.com"):
 # --------------------------------------------------------------------------- #
 # 1. 建号恒建 allowance（user_store_pg.create_user_with_total_allowance）
 # --------------------------------------------------------------------------- #
-@PG
 def test_explicit_limit_creates_allowance():
     """显式 X → 同事务建 allowance 行（source=admin_create，
     default_version=None——面值是显式决策，不锚定任何默认版本）。"""
@@ -147,7 +143,6 @@ def test_explicit_limit_creates_allowance():
     assert detail["limit_surface"] == "total_allowance"
 
 
-@PG
 def test_no_limit_resolves_total_defaults_row():
     """无 X + ai_spend_total_defaults 有行 → allowance=默认面值（0032 物化
     0023 user_default = 20 CNY），default_version=默认行版本。"""
@@ -163,7 +158,6 @@ def test_no_limit_resolves_total_defaults_row():
     assert detail["limit_surface"] == "total_allowance"
 
 
-@PG
 def test_no_limit_ignores_user_default_policy_without_defaults_row():
     """defaults 缺行时**不**回退 user_default 策略面值（兼容分支已删）——
     即使有效策略在场也拒绝：唯一事实源是 defaults 表。"""
@@ -178,7 +172,6 @@ def test_no_limit_ignores_user_default_policy_without_defaults_row():
     assert user_store.get_user_by_login_id("no-fallback@x.com") is None
 
 
-@PG
 def test_without_any_default_rejected_and_rolled_back():
     """无 X + defaults 缺行 → ValueError total_default_missing；整体回滚
     （用户不存在、无半创建行）。绝不建出无额度行的用户（授权面永久
@@ -200,7 +193,6 @@ def test_without_any_default_rejected_and_rolled_back():
         conn.close()
 
 
-@PG
 def test_create_user_delegate_always_builds_allowance():
     """create_user（role=user 委托）同样恒建行：无 X 走 defaults 面值；
     旧名 create_user_with_spend_override 已删除（兼容壳随单轨退役）。"""
@@ -215,7 +207,6 @@ def test_create_user_delegate_always_builds_allowance():
 # --------------------------------------------------------------------------- #
 # 2. 兑换恒建 allowance（registration_store.redeem_invite）
 # --------------------------------------------------------------------------- #
-@PG
 def test_redeem_without_limit_resolves_default():
     """兑换无模板面值 → 解析默认建行（source=invite，default_version=默认
     版本；旧 monthly 列运行时不再读取——0032 已回填 total 列）。"""
@@ -234,7 +225,6 @@ def test_redeem_without_limit_resolves_default():
     assert _override_rows() == 0
 
 
-@PG
 def test_redeem_with_explicit_limit_creates_allowance():
     """兑换带模板面值 → 按面值建行（default_version=None），不建 override。"""
     bh.seed_spend_settings()
@@ -253,7 +243,6 @@ def test_redeem_with_explicit_limit_creates_allowance():
     assert _override_rows(out["user"]["user_id"]) == 0
 
 
-@PG
 def test_redeem_without_any_default_fails_closed():
     """兑换且 defaults 缺行 → ValueError total_default_missing；整体回滚
     （用户不创建、邀请不消费）。"""

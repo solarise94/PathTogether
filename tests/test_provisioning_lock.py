@@ -37,11 +37,6 @@ import user_store_pg  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
 
-PG = pytest.mark.skipif(
-    BACKEND != "postgres",
-    reason="advisory lock / 维护闸矩阵需真实 PG（RUN_PG_TESTS=1）",
-)
-
 if BACKEND == "postgres":
     import _billing_helpers as bh  # noqa: E402
 
@@ -78,7 +73,6 @@ def _set_gate(expected, value):
 # --------------------------------------------------------------------------- #
 # 1. 串行化证明：cutover 会话锁阻塞建号，解锁后放行
 # --------------------------------------------------------------------------- #
-@PG
 def test_cutover_session_lock_blocks_provisioning_until_unlock(pg_uri):
     """conn A 持会话级 pg_advisory_lock(开通键) → 子线程建号阻塞（0.5s 时点
     仍 blocked、用户行未落地）；A 解锁 → 子线程完成且结果正确（单轨恒建
@@ -123,7 +117,6 @@ def test_cutover_session_lock_blocks_provisioning_until_unlock(pg_uri):
         conn.close()
 
 
-@PG
 def test_lock_helper_maps_timeout_to_provisioning_maintenance(pg_uri):
     """锁等待超时（lock_timeout）映射为 ProvisioningMaintenanceError：
     conn A 持会话锁不释放 → 子线程建号在 15s 上限处报错而非无限挂起。"""
@@ -160,7 +153,6 @@ def test_lock_helper_maps_timeout_to_provisioning_maintenance(pg_uri):
 # --------------------------------------------------------------------------- #
 # 2. 维护闸：开闸暂停建号/兑换（零副作用），关闸恢复；缺键按开闸
 # --------------------------------------------------------------------------- #
-@PG
 def test_maintenance_gate_blocks_create_and_redeem_then_recovers():
     """开闸（CAS false→true，生产同款路径）：建号与兑换各抛
     ProvisioningMaintenanceError；用户未建、invite 未消费（关闸后仍可用）。
@@ -191,7 +183,6 @@ def test_maintenance_gate_blocks_create_and_redeem_then_recovers():
     assert registration_store.get_invite(inv["invite_id"])["use_count"] == 1
 
 
-@PG
 def test_missing_maintenance_setting_treated_open():
     """缺键按开闸（与 app 层 _ai_dispatch_maintenance_active 同口径；0029
     种子保证生产恒有行，缺键时 cutover apply 的闸 CAS 会失败、advisory
@@ -212,7 +203,6 @@ def test_missing_maintenance_setting_treated_open():
 # --------------------------------------------------------------------------- #
 # 3. 端点层：维护中 POST /api/admin/v1/users → 503 ai_dispatch_maintenance
 # --------------------------------------------------------------------------- #
-@PG
 def test_v1_users_create_returns_503_while_gate_on():
     """开闸时 v1 建号端点稳定 503（code=ai_dispatch_maintenance，与 AI
     dispatch 同款文案口径），且不产生半创建用户。"""

@@ -10,8 +10,9 @@ permissions:
   contents: read
 
 jobs:
-  # 必需 job 1/5：JSON 后端全量（python-json）
-  python-json:
+  # 必需 job 1/4：PG 后端全量（python-pg；conftest 无条件起内嵌 PostgreSQL）。
+  # json 后端已退役（R3 Wave 3），不再有 python-json job。
+  python-pg:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -20,13 +21,15 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -r requirements.txt -r requirements-dev.txt
-      # 覆盖率（test-review P3-19）：fail-under=44 —— 本机 json 模式度量产品代码
-      # TOTAL 54% 减 10 点；阈值宁可偏低，不让套件变红到不可用。
+      # 覆盖率（test-review P3-19）：fail-under=44 —— 单轨 PG 度量产品代码，
+      # 阈值宁可偏低，不让套件变红到不可用（re-baseline 留 Batch D）。
       - run: python -m pytest tests -q --cov=. --cov-report=term --cov-report=xml --cov-fail-under=44
+        env:
+          RUN_PG_TESTS: "1"
 
-  # 必需 job 2/5：PG canary 独立必需 job（一次性修复包 G §11.2）。
+  # 必需 job 2/4：PG canary 独立必需 job（一次性修复包 G §11.2）。
   # 拆出独立 job 并先于全量收敛语义：canary 只证明「runner 真的启动了
-  # PostgreSQL 且 RUN_PG_TESTS 生效」；全量失败时 canary 不再被连坐 skip。
+  # PostgreSQL 且 conftest 生效」；全量失败时 canary 不再被连坐 skip。
   python-pg-canary:
     runs-on: ubuntu-latest
     steps:
@@ -41,32 +44,15 @@ jobs:
           set -o pipefail
           python -m pytest tests/test_pg_backend_canary.py -q -rA | tee canary-out.txt
           if grep -qiE "skipped|no tests ran" canary-out.txt; then
-            echo "::error::PG canary 被 skip——pgserver/psycopg 缺失或 RUN_PG_TESTS 未生效"
+            echo "::error::PG canary 被 skip——pgserver/psycopg 缺失或 env 未生效"
             exit 1
           fi
           grep -q "passed" canary-out.txt || {
             echo "::error::PG canary 没有 passed 输出（未真实执行）"
             exit 1
           }
-        env:
-          RUN_PG_TESTS: "1"
 
-  # 必需 job 3/5：PG 后端全量（python-pg；conftest 起内嵌 PostgreSQL）
-  python-pg:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-      - run: python -m pip install -r requirements.txt -r requirements-dev.txt
-      # PG 模式覆盖率天然更高（pg 各 store 被真实执行）；阈值与 json job 一致。
-      - run: python -m pytest tests -q --cov=. --cov-report=term --cov-report=xml --cov-fail-under=44
-        env:
-          RUN_PG_TESTS: "1"
-
-  # 必需 job 4/5：HostBridge / 插件 JS 单元（Vitest）
+  # 必需 job 3/4：HostBridge / 插件 JS 单元（Vitest）
   host-bridge-unit:
     runs-on: ubuntu-latest
     steps:
@@ -78,7 +64,7 @@ jobs:
       - run: npm ci
       - run: npm run test:js
 
-  # 必需 job 5/5：管理工作台真实 Chromium E2E（一次性修复包 F §10）。
+  # 必需 job 4/4：管理工作台真实 Chromium E2E（一次性修复包 F §10）。
   # webServer 起临时目录 + 内嵌 PostgreSQL + 一次性凭据的被测应用；
   # 凭据只经临时文件传递，不写日志/artifact；截图仅测试虚构数据。
   admin-browser-e2e:

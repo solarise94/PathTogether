@@ -656,6 +656,19 @@ def test_start_worker_without_storage_backend_env(monkeypatch):
         sss.stop_worker()
 
 
+def test_dashboard_stats_queries_table_without_storage_backend_env(
+        monkeypatch, secret):
+    """缺 STORAGE_BACKEND 时 dashboard 也必须真实查表（回归：afc1210 以前
+    缺键直接返回全零空形状）。"""
+    monkeypatch.delenv("STORAGE_BACKEND", raising=False)
+    _flush([_ev(remote_addr="203.0.113.1")])
+    stats = sss.dashboard_stats(now=BASE_TIME)
+    assert stats["today"]["visits"] == 1
+    assert stats["today"]["unique_visitors"] == 1
+    assert len(stats["recent"]) == 1
+    assert sss.purge_expired(now=BASE_TIME) == 0  # 未到期的行仍在
+
+
 def test_start_stop_worker_idempotent(monkeypatch):
     monkeypatch.setattr(sss, "_flush_batch", lambda batch: None)
     sss.start_worker()

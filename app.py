@@ -6033,13 +6033,14 @@ def admin_v1_users_create():
 
     批次 B wave 2（§Batch B 数据模型 6 / §4.3）扩展可选字段：
       - ``total_limit_nano_cny``：十进制字符串 nano-CNY | null（缺省）。
-        null/缺省 = 不建总额度行（该用户由 cutover 回填或首个显式
-        total-limit 操作处理，不伪造 0 额度）；非 null = 同一 PG 事务内为
-        新用户建**一次性总额度**行（user 插入 + allowance + audit 任一失败
-        整体回滚，user_store_pg.create_user_with_total_allowance，source=
-        admin_create；**不再创建 user_override 月策略**）；
+        postgres 后端一律走同事务组合原语（user_store_pg
+        .create_user_with_total_allowance），按 ``user_spend_target`` 分叉：
+        total 模式显式 X 同事务建**一次性总额度**行（source=admin_create），
+        无 X 解析默认，皆缺 → 400 ``total_default_missing``（绝不建出无额度
+        行的用户）；window 模式不建 allowance 行，显式 X 建等值
+        user_override 过渡策略（响应 total_allowance=null）；
       - ``monthly_limit_nano_cny``（旧 wire 名）兼容保留一个发布周期：单独
-        传按面值落总额度；与 total 同传 → 400 ambiguous_spend_limit；
+        传按面值落同上语义；与 total 同传 → 400 ambiguous_spend_limit；
       - ``ai_access``：bool（缺省 True，与 users.ai_access 列默认一致）。
     带金额字段时要求 PG（json/dual 稳定 503，不降级）。
     """
@@ -6087,9 +6088,12 @@ def admin_v1_users_create():
         return _admin_v1_error(400, "invalid_request", str(exc))
 
     actor = actor_identity().get("user_id")
-    if total_limit is None and ai_access is None:
-        # 无新字段：保持既有路径（json 后端也可建号；audit 与建号分离与旧
-        # 端点一致）
+    if total_limit is None and ai_access is None and \
+            platform_features.current_backend() != "postgres":
+        # 无新字段且非 postgres：保持既有路径（json 后端也可建号；audit 与
+        # 建号分离与旧端点一致）。postgres 后端即使无新字段也走下方同事务
+        # 组合原语——total 模式下无额度默认时须 400 fail-closed，绝不允许
+        # 旁路建出无额度行的用户（review finding 1 建号变体收口）
         try:
             user = user_store.create_user(
                 login_id, password, role=user_store.ROLE_USER,
@@ -6102,7 +6106,7 @@ def admin_v1_users_create():
         _audit("user.create", target_type="user", target_id=user.get("user_id"))
         return jsonify(user=_admin_v1_user_out(user))
 
-    # 带新字段：user 插入 + 一次性总额度 + audit 必须同一 PG 事务（§5.1）
+    # postgres：user 插入 + 按目标建授权面 + audit 必须同一 PG 事务（§5.1）
     if platform_features.current_backend() != "postgres":
         return _admin_v1_pg_required()
     import user_store_pg
@@ -6115,6 +6119,8 @@ def admin_v1_users_create():
         msg = str(e)
         if "ambiguous_spend_limit" in msg:
             return _admin_v1_error(400, "ambiguous_spend_limit", msg)
+        if "total_default_missing" in msg:
+            return _admin_v1_error(400, "total_default_missing", msg)
         if "已存在" in msg:
             return _admin_v1_error(409, "login_id_conflict", msg)
         return _admin_v1_error(400, "invalid_request", msg)
@@ -11263,14 +11269,47 @@ _BUDGET_RECLAIM_THREAD = _start_budget_reclaim_thread()
 _BINDING_ATTACH_RETRY_THREAD = _start_binding_attach_retry_thread()
 
 
+def _run_daily_retention_once():
+    """单轮每日保留清理：来源触点 90 天保留 + 站点统计事件 90 天保留。
+
+    两段各自独立 try/except（互不拖垮：任一 store 故障只影响本段，另一段
+    照常执行；异常记日志、下一轮重试）。site stats 段在 store 未随镜像发布
+    （import 容错 None）时静默跳过——与 _start_site_stats_worker 同口径。
+    """
+    # 来源触点段（§11.3，PR5）：过期未引用行删除 + 过期已归因行脱敏（幂等）
+    try:
+        deleted, scrubbed = acquisition_store.run_visit_retention()
+        if deleted or scrubbed:
+            app.logger.info(
+                "acquisition retention：删除过期触点 %d 行，脱敏已归因触点 %d 行",
+                deleted, scrubbed)
+    except Exception:
+        app.logger.warning(
+            "acquisition retention 执行失败（下一轮重试）", exc_info=True)
+    # 站点统计段（Batch D2）：只删 expires_at 到期的 site_visit_events 行
+    if site_stats_store is not None:
+        try:
+            purged = site_stats_store.purge_expired()
+            if purged:
+                app.logger.info(
+                    "site stats retention：删除过期访问统计事件 %d 行", purged)
+        except Exception:
+            app.logger.warning(
+                "site stats retention 执行失败（下一轮重试）", exc_info=True)
+
+
 def _start_acquisition_retention_thread():
-    """postgres 后端启动来源触点 90 天保留调度线程（§11.3，PR5）。
+    """postgres 后端启动每日保留调度线程（F4：触点 + 站点统计，§11.3/§Batch D2）。
 
     - ``ACQ_RETENTION_INTERVAL_SECONDS``：间隔秒数（默认 86400 = 每日）；
       ``0`` 或负数 = 关闭（测试可显式置 0 隔离）；
-    - 每轮执行 ``acquisition_store.run_visit_retention``（过期未引用行删除
-      + 过期已归因行脱敏，单事务幂等）——多实例重叠调度安全（删除/脱敏均
-      幂等，无需 advisory lock）；
+    - 每轮执行 :func:`_run_daily_retention_once`：来源触点 90 天保留
+      （``acquisition_store.run_visit_retention``：过期未引用行删除 + 过期
+      已归因行脱敏，单事务幂等）+ 站点统计事件 90 天保留
+      （``site_stats_store.purge_expired``；store 未随镜像发布时跳过）——
+      多实例重叠调度安全（删除/脱敏均幂等，无需 advisory lock）；
+    - 线程名沿用 ``acquisition-retention`` 不改（避免运维图谱漂移），本函数
+      docstring 注明：现同时兼顾站点统计事件清理；
     - daemon 线程：循环内异常吞掉记日志（下一轮重试），不杀线程、不阻塞停机。
     """
     if not platform_features.budget_features_available():
@@ -11286,15 +11325,7 @@ def _start_acquisition_retention_thread():
     def _loop():
         while True:
             time.sleep(interval)
-            try:
-                deleted, scrubbed = acquisition_store.run_visit_retention()
-                if deleted or scrubbed:
-                    app.logger.info(
-                        "acquisition retention：删除过期触点 %d 行，脱敏已归因触点 %d 行",
-                        deleted, scrubbed)
-            except Exception:
-                app.logger.warning(
-                    "acquisition retention 执行失败（下一轮重试）", exc_info=True)
+            _run_daily_retention_once()
 
     th = threading.Thread(target=_loop, name="acquisition-retention",
                           daemon=True)

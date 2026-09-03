@@ -37,6 +37,7 @@ import hmac
 import logging
 import secrets
 import time
+from datetime import datetime, timezone
 
 import psycopg
 from werkzeug.security import generate_password_hash
@@ -49,9 +50,11 @@ import user_store
 # acquisition_store（user_acquisition 写路径冻结，站点统计故障绝不能阻断
 # 注册）；历史查询函数保留。旧 pt_acq cookie 不再被本模块读取。
 # 邀请模板金额字段从 monthly_limit_nano_cny 迁移为 total_limit_nano_cny：
-# 兑换事务内在同一 cursor 为新用户建一次性总额度
-# （spend_store.create_user_total_allowance_tx，source="invite"），
-# **不再创建 user_override**。spend_store 不回依赖本模块，无循环导入。
+# 兑换事务按 user_spend_target 分叉——total 模式为新用户建一次性总额度
+# （spend_store.create_user_total_allowance_tx，source="invite"；无面值解析
+# 默认，皆缺 fail-closed 拒绝兑换）；window 模式（cutover 前）不建行，模板
+# 带面值时建等值 user_override 过渡策略。spend_store 不回依赖本模块，无
+# 循环导入。
 import spend_store
 
 _log = logging.getLogger("svs.registration")
@@ -236,7 +239,8 @@ def _validate_monthly_limit(monthly_limit_nano_cny):
 
 
 def _validate_total_limit(total_limit_nano_cny):
-    """邀请模板总额度校验：None（由 cutover/默认处理）或非负整数 nano。"""
+    """邀请模板总额度校验：None（按 user_spend_target 分叉，见 redeem_invite）
+    或非负整数 nano。"""
     if total_limit_nano_cny is None:
         return None
     if isinstance(total_limit_nano_cny, bool) \
@@ -262,8 +266,9 @@ def create_invite(created_by_user_id, login_id=None,
       弃用**（app.py wave 2 才改调用方；本波保持旧签名可调用）：不做 slug/
       campaign 存在性校验，也**不写入 DB**（新邀请行三列为空/NULL）；
     - ``total_limit_nano_cny``（新）：初始一次性总额度（nano-CNY 整数，
-      wire 层十进制字符串，路由层换算）；None = 该用户由 cutover 回填或
-      首个显式额度操作处理，兑换不建总额度行；
+      wire 层十进制字符串，路由层换算）；None = 兑换时按 user_spend_target
+      解析（total 模式走默认解析/缺默认拒绝，window 模式不建任何额度面），
+      语义见 redeem_invite；
     - ``monthly_limit_nano_cny``（旧）：兼容保留一个发布周期；与新字段
       **同时传抛稳定 ValueError ``ambiguous_spend_limit``**（路由层映射
       400）。值写入 total_limit 列（旧月窗口语义退役，面值按总额度兑现）。
@@ -421,11 +426,15 @@ def redeem_invite(token, login_id, password, display_name=None, acq=None):
     - ``acq`` 参数**兼容保留但忽略并弃用**（app.py wave 2 才改调用方）：本
       事务不读取 pt_acq cookie 上下文、不调用 acquisition_store、**不写
       user_acquisition**（写路径冻结）——站点统计故障绝不能阻断注册；
-    - 邀请模板金额非 NULL 时（新 ``total_limit_nano_cny`` 列；旧
-      ``monthly_limit_nano_cny`` 面值兼容读取），本事务内为新用户创建
-      **一次性总额度**行（spend_store.create_user_total_allowance_tx，
-      source=``invite``）——**不再创建 user_override**；写入失败同样整体
-      回滚（invite 不消费、用户不创建）；
+    - 额度面按 ``user_spend_target`` 分叉（与建号同契约，cutover 前后一致）：
+      target=``total_allowance`` 时模板金额非 NULL（新 ``total_limit_nano_cny``
+      列；旧 ``monthly_limit_nano_cny`` 面值兼容读取）按面值建**一次性总额
+      度**行，无面值则解析默认（ai_spend_total_defaults → user_default 策略
+      回退，default_version=默认版本），皆缺 → ValueError
+      ``total_default_missing``（注册端点统一兜底，兑换整体回滚）——绝不建出
+      无额度行的用户；target=``window``（cutover 前）不建 allowance 行，模板
+      金额非 NULL 时建等值 ``user_override`` 过渡策略（calendar_month）；
+      写入失败同样整体回滚（invite 不消费、用户不创建）；
     - 新兑换 audit（registration.redeem）不含 source/campaign/cohort/acq
       字段（历史 audit 不可变，照旧保留）。
 
@@ -439,9 +448,10 @@ def redeem_invite(token, login_id, password, display_name=None, acq=None):
         UPDATE）；
     成功返回 ``{"user": <新用户公共 dict>, "invite_id": ..., "login_id": ...,
     "total_allowance": <总额度行 dict|None>, "acquisition": None,
-    "spend_override_policy": None}``
-    （login_id 键即规范化登录账号；``acquisition``/``spend_override_policy``
-    为兼容旧调用方形状的恒 None 弃用键，一个发布周期后移除）。
+    "spend_override_policy": <{"limit_nano_cny": ...}|None>}``
+    （login_id 键即规范化登录账号；``acquisition`` 为兼容旧调用方形状的恒
+    None 弃用键；``spend_override_policy`` 原 Batch B 弃用占位，window 过渡
+    期复用：建立了过渡 override 时填面值，否则 None）。
     成功审计在同一事务内（registration.redeem，actor=被创建 user_id）；失败审计
     在独立 best-effort 事务（主事务已随异常回滚），detail 只含 invite_id/status。
     """
@@ -513,33 +523,60 @@ def redeem_invite(token, login_id, password, display_name=None, acq=None):
                 if (cur.rowcount or 0) != 1:
                     # FOR UPDATE 下不可达；防御性回滚（CAS 失败=状态已变）
                     raise _RedeemFail("consumed")
-                # Batch B：邀请模板带初始额度时，一次性总额度也在**同一事务**
-                # 内创建（spend_store.create_user_total_allowance_tx 同
-                # cursor；其 audit 与本事务共提交）。失败 → 整体回滚（invite
-                # 不消费、用户不创建）。None = 不建行（由 cutover/默认处理）。
-                # 旧 monthly 列面值兼容读取（退役字段只读一个发布周期）。
+                # 额度面按消费控制目标分叉（与建号同契约）：target 与建行/
+                # 审计同事务读取（缺键/非法值回退 window）。旧 monthly 列
+                # 面值兼容读取（退役字段只读一个发布周期）。
                 invite_limit = (row["total_limit_nano_cny"]
                                 if row["total_limit_nano_cny"] is not None
                                 else row["monthly_limit_nano_cny"])
+                target = spend_store.get_user_spend_target_tx(cur)
                 allowance = None
-                if invite_limit is not None:
-                    try:
+                override_policy = None
+                try:
+                    if target == "total_allowance":
+                        # 总额度模式：每个 user 必须有 allowance 行；模板
+                        # 带面值直接建行，无面值解析默认（defaults 行 →
+                        # user_default 策略回退），皆缺 → fail-closed 拒绝
+                        # 兑换（绝不建出无额度行的用户）
+                        if invite_limit is not None:
+                            limit, dver = int(invite_limit), None
+                        else:
+                            limit, _src, dver = \
+                                spend_store._resolve_total_default_tx(
+                                    cur, datetime.now(timezone.utc))
+                            if limit is None:
+                                raise ValueError(
+                                    "total_default_missing: 总额度模式下无可用默认总额度"
+                                    "（ai_spend_total_defaults 缺行且 user_default 策略未配置）；"
+                                    "请先配置邀请面值或设置默认")
                         allowance = spend_store.create_user_total_allowance_tx(
-                            cur, user["user_id"], int(invite_limit),
-                            source="invite",
+                            cur, user["user_id"], limit, source="invite",
+                            default_version=dver,
                             updated_by="invite:" + invite_id)
-                    except Exception:
-                        _log.warning(
-                            "邀请模板总额度写入失败（整体回滚，不建号不消费"
-                            "邀请）", exc_info=True)
-                        raise
+                    else:
+                        # window（cutover 前）：不建 allowance 行（dormant 行
+                        # 形成双真相）；模板带面值时建等值 user_override
+                        # 过渡策略，如实展示现行授权面
+                        if invite_limit is not None:
+                            override_policy = spend_store.set_user_override_tx(
+                                cur, user["user_id"], int(invite_limit),
+                                updated_by="invite:" + invite_id)
+                except Exception:
+                    _log.warning(
+                        "邀请模板额度写入失败（整体回滚，不建号不消费邀请）",
+                        exc_info=True)
+                    raise
                 _audit_redeem(cur, invite_id, "success",
                               created_user_id=user["user_id"])
         return {"user": user, "invite_id": invite_id,
                 "login_id": norm_login,
                 "total_allowance": allowance,
                 "acquisition": None,          # Batch B：归因退役，恒 None
-                "spend_override_policy": None}  # Batch B：override 退役，恒 None
+                # Batch B 原恒 None 弃用占位；window 过渡期复用（additive）：
+                # 建立了过渡 override 时如实返回面值
+                "spend_override_policy": (
+                    {"limit_nano_cny": int(override_policy["limit_nano_cny"])}
+                    if override_policy is not None else None)}
     except _RedeemFail as exc:
         _audit_redeem_best_effort(fail_invite_id, exc.reason)
         raise InviteRedeemError(exc.reason)

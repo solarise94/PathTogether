@@ -1607,15 +1607,20 @@ def _total_default_out(row) -> dict:
     return out
 
 
-def _resolve_total_default_tx(cur, at) -> "tuple[int | None, str | None]":
-    """解析「新 user 默认总额度 X」→ ``(limit_nano, source)``。
+def _resolve_total_default_tx(cur, at) -> "tuple[int | None, str | None, int | None]":
+    """解析「新 user 默认总额度 X」→ ``(limit_nano, source, version)``。
 
-    - ``ai_spend_total_defaults`` 有行 → ``(面值, "total_defaults")``；
+    - ``ai_spend_total_defaults`` 有行 → ``(面值, "total_defaults", 该行
+      version)``；
     - 缺行（0029 刚应用、cutover 尚未跑）→ 回退当时有效 ``user_default``
-      策略面值 ``(面值, "user_default_policy")``——**fail-safe**：保持
-      「无配置时新 user 仍有明确额度」的旧语义，不放大也不拒绝开户模板
-      读取（回退来源在审计/响应里标明，cutover 会把它固化为权威行）；
-    - 两者皆缺 → ``(None, None)``（调用方按「无默认」裁决）。
+      策略面值 ``(面值, "user_default_policy", 该策略 version)``——
+      **fail-safe**：保持「无配置时新 user 仍有明确额度」的旧语义，不放大
+      也不拒绝开户模板读取（回退来源在审计/响应里标明，cutover 会把它固化
+      为权威行）；
+    - 两者皆缺 → ``(None, None, None)``（调用方按「无默认」裁决）。
+
+    version 随面值一起返回：建 allowance 行时固化为 ``default_version``
+    （允许显式 X 时传 None；审计可对账面值是哪个版本的默认）。
 
     修改默认不追溯既有 user（§3.1）；owner/demo 不读本表。
     """
@@ -1624,11 +1629,13 @@ def _resolve_total_default_tx(cur, at) -> "tuple[int | None, str | None]":
     row = cur.fetchone()
     if row is not None:
         out = _total_default_out(row)
-        return int(out["default_limit_nano_cny"]), "total_defaults"
+        return (int(out["default_limit_nano_cny"]), "total_defaults",
+                int(out["version"]))
     policy = _resolve_policy_tx(cur, "user", "__no_such_user__", at)
     if policy is not None:
-        return int(policy["limit_nano_cny"]), "user_default_policy"
-    return None, None
+        return int(policy["limit_nano_cny"]), "user_default_policy", \
+            int(policy["version"])
+    return None, None, None
 
 
 def get_total_default():
@@ -1639,7 +1646,7 @@ def get_total_default():
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                limit, source = _resolve_total_default_tx(cur, at)
+                limit, source, _version = _resolve_total_default_tx(cur, at)
         if limit is None:
             return None
         return {"default_limit_nano_cny": limit, "source": source}
@@ -1733,8 +1740,8 @@ def restore_user_total_default(user_id, expected_version, *,
             with c.cursor() as cur:
                 allowance = _fetch_total_allowance_locked(cur, user_id)
                 at = datetime.now(timezone.utc)
-                default_limit, default_source = _resolve_total_default_tx(
-                    cur, at)
+                default_limit, default_source, _default_version = \
+                    _resolve_total_default_tx(cur, at)
                 if default_limit is None:
                     raise SpendPolicyMissingError(
                         "无可用默认总额度（defaults 表缺行且 user_default "
@@ -2041,21 +2048,24 @@ def admin_users_spend_summaries(subjects, *, at=None):
     """每用户当前 spend 投影（§6.2 / §4.3 用户页数据源；单事务批量）。
 
     ``subjects`` 为 ``(subject_type, user_id)`` 可迭代（owner 用户传
-    ``("owner", user_id)``，普通用户 ``("user", user_id)``）。按角色 +
-    ``user_spend_target`` 返回**互斥**形态（前端两种形态同时出现必须报
-    契约错误，§4.3）：
+    ``("owner", user_id)``，普通用户 ``("user", user_id)``）。形态**纯由
+    ``user_spend_target`` 驱动**（展示面与授权面同源同靶，绝不允许有
+    allowance 行就翻成 total 展示的双轨形态；dormant/legacy 行由 cutover
+    apply 的 existing-row 分支处理）：
 
-    - ``role=user``：已有 allowance 行 → ``total`` 形态
+    - ``role=user`` 且 target=``"total_allowance"`` → ``total`` 形态
       （``{allowance_id, total_limit_nano_cny, spent_nano_cny,
       reserved_nano_cny, remaining_nano, overage_nano, source, version,
       cutover_at, opening_spent_nano_cny}``；remaining=max(0,
       limit-spent-reserved)、overage=max(0, spent+reserved-limit)；
-      opening_spent 只进技术详情；**不含** window/policy_* 键）；
-      无 allowance 行时：target=``"total_allowance"`` → 稳定
-      ``error=spend_total_allowance_missing``，target=``"window"``
-      （cutover 前存量用户）→ 回退 window 形态如实展示现行授权面；
-    - ``role=owner`` → 现有 window 形态（policy_scope/policy_id/
-      policy_version/window，get_or_create）。
+      opening_spent 只进技术详情；**不含** window/policy_* 键）；缺行 →
+      稳定 ``error=spend_total_allowance_missing``（该 user 无授权面，
+      fail-closed 如实上报，不伪造窗口）；
+    - ``role=user`` 且 target=``"window"`` → 现有 window 形态
+      （policy_scope/policy_id/policy_version/window，get_or_create）——
+      **即使该 user 存在 allowance 行也按 window 展示**（cutover 前
+      dormant/legacy 行不翻成 total 展示）；
+    - ``role=owner`` → 现有 window 形态（不变；owner 恒窗口）。
 
     单主体失败（如缺 allowance 行、user_default 被禁用）带稳定 ``error``
     code，不拖垮整页（与 admin v1 windows/current 同口径）。
@@ -2074,10 +2084,8 @@ def admin_users_spend_summaries(subjects, *, at=None):
                             "spend_target": (target if subject_type == "user"
                                              else "window")}
                     try:
-                        if subject_type == "user" and (
-                                target == "total_allowance"
-                                or _fetch_total_allowance_read(
-                                    cur, subject_id) is not None):
+                        if subject_type == "user" and \
+                                target == "total_allowance":
                             item["total"] = total_allowance_summary_tx(
                                 cur, subject_id)
                         else:

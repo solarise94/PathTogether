@@ -20,13 +20,17 @@ review-2026-09-02-upload-user-limits-admin-ui-cleanup.md §Batch B / §3.1 /
   - CAS：set_user_total_limit / set_total_default / compare_and_set_setting
     409 语义；restore-default 不清 spent；
   - reconcile_total_allowances 报 drift 不修账；
-  - admin_users_spend_summaries 互斥形态（total vs window）；
+  - admin_users_spend_summaries target 驱动互斥形态（total vs window
+    四象限：user×target 纯分支，owner 恒 window）；
   - admin_demo_spend_stats 只读聚合（前后业务表行数不变）；
-  - cutover 脚本：preflight / apply（含 open hold 中止保持维护态）/
-    rollback-plan（新窗 spent==冻结 allowance spent、维护闸保持）。
+  - cutover 脚本：preflight（target 非 window 硬失败、allowance/窗口限额
+    不一致预检）/ apply（含 open hold 中止保持维护态）/ rollback-plan
+    （月感快照：新窗 spent=当月 priced usage、limit 令 remaining 守恒、
+    reconcile 零 drift、跨月/同月/用尽变体、维护闸保持）。
 
 运行：RUN_PG_TESTS=1 python3 -m pytest tests/test_spend_total_allowances.py -q
 """
+import json
 import os
 import sys
 import threading
@@ -375,6 +379,7 @@ def test_billing_holds_target_mutex_check():
 # =========================================================================== #
 def test_create_user_total_allowance_atomic_and_no_override():
     _seed_all()
+    _total_target()  # 建号建 allowance 面：按 target 分叉，本用例钉 total 模式
     owner = _mk_owner()
     user, allowance = user_store_pg.create_user_with_total_allowance(
         "created@x.com", "pass123456789012", total_limit_nano_cny=30 * 10 ** 9,
@@ -414,6 +419,7 @@ def test_create_user_total_allowance_atomic_and_no_override():
 
 def test_redeem_invite_creates_allowance_atomically():
     _seed_all()
+    _total_target()  # 兑换建 allowance 面：按 target 分叉，本用例钉 total 模式
     owner = _mk_owner()
     inv = registration_store.create_invite(
         owner["user_id"], login_id="redeem@x.com", ai_access=True,
@@ -450,6 +456,7 @@ def test_redeem_invite_creates_allowance_atomically():
 
 def test_invite_retired_fields_ignored_and_legacy_monthly_becomes_total():
     _seed_all()
+    _total_target()  # 旧 monthly 面值按总额度兑现：仅 total 模式语义
     owner = _mk_owner()
     # 退役参数：兼容接受但不校验不写库（app.py wave 2 才改调用方）
     inv = registration_store.create_invite(
@@ -876,10 +883,18 @@ def test_reconcile_total_allowances_reports_drift_only():
     assert item["matches"] is True
 
 
-def test_admin_summaries_mutex_forms():
+def test_admin_summaries_target_driven_forms():
+    """§4.3 互斥形态按 ``user_spend_target`` 纯 target 分支驱动（四象限）：
+
+    - user && target=total_allowance → total 形态；缺行 → 稳定
+      ``error=spend_total_allowance_missing``；
+    - user && target=window → window 形态（**即使有 allowance 行**）；
+    - owner → 恒 window 形态；
+    - total/window 两形态键互斥。"""
     _seed_all()
     bh.set_user_spend_target("total_allowance")
-    user = _user("summary@x.com")
+    user = _user("summary@x.com")       # 有 allowance 行
+    ghost = _user("ghost@x.com")        # 无 allowance 行
     owner = _user("summary-owner@x.com")
     _exec("UPDATE users SET role='owner' WHERE user_id=%s",
           (owner["user_id"],))
@@ -891,35 +906,30 @@ def test_admin_summaries_mutex_forms():
         conn.commit()
     finally:
         conn.close()
+    # target=total_allowance：user 有行 → total 形态；user 无行 → 稳定
+    # error code（不拖垮整页）；owner → window 形态
     summaries = spend_store.admin_users_spend_summaries(
-        [("user", user["user_id"]), ("owner", owner["user_id"])])
+        [("user", user["user_id"]), ("user", ghost["user_id"]),
+         ("owner", owner["user_id"])])
     total = summaries[user["user_id"]]
     assert "total" in total and "window" not in total  # 互斥
     assert total["total"]["total_limit_nano_cny"] == 10 ** 10
     assert total["total"]["remaining_nano"] == 10 ** 10
     assert total["total"]["overage_nano"] == 0
     assert total["total"]["source"] == "invite"
+    assert summaries[ghost["user_id"]].get("error") == \
+        "spend_total_allowance_missing"
+    assert "total" not in summaries[ghost["user_id"]]
+    assert "window" not in summaries[ghost["user_id"]]
     win = summaries[owner["user_id"]]
     assert "window" in win and "total" not in win  # 互斥
-    # target=window（cutover 前）：有 allowance 行的 user（部署后新建）
-    # 仍按 §4.3 展示 total 形态（互斥不变）；无行的存量 user 才回退 window
+    # target=window：user 即使有 allowance 行也回 window 形态（回滚后
+    # 现行授权面如实展示；allowance 行退为非授权投影）
     bh.set_user_spend_target("window")
     summaries = spend_store.admin_users_spend_summaries(
         [("user", user["user_id"])])
-    assert "total" in summaries[user["user_id"]]
-    assert "window" not in summaries[user["user_id"]]
-    legacy = _user("legacy@x.com")
-    summaries = spend_store.admin_users_spend_summaries(
-        [("user", legacy["user_id"])])
-    assert "window" in summaries[legacy["user_id"]]
-    assert "total" not in summaries[legacy["user_id"]]
-    # target=total 但无 allowance 行 → 稳定 error code（单主体降级）
-    bh.set_user_spend_target("total_allowance")
-    ghost = _user("ghost@x.com")
-    summaries = spend_store.admin_users_spend_summaries(
-        [("user", ghost["user_id"])])
-    assert summaries[ghost["user_id"]].get("error") == \
-        "spend_total_allowance_missing"
+    assert "window" in summaries[user["user_id"]]
+    assert "total" not in summaries[user["user_id"]]
 
 
 def test_admin_demo_spend_stats_readonly_aggregates():
@@ -996,7 +1006,8 @@ def _mk_user_with_window(login, *, limit=None, spent=0, reserved=0):
     return user
 
 
-def test_cutover_preflight_apply_and_rollback(tmp_path, monkeypatch):
+def _load_cutover_script():
+    """按真实脚本文件加载 cutover 模块（真 PG、真 _die/sys.exit 语义）。"""
     import importlib.util
     script_path = os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "scripts",
@@ -1005,6 +1016,57 @@ def test_cutover_preflight_apply_and_rollback(tmp_path, monkeypatch):
         "cutover_user_total_allowances", script_path)
     script = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(script)
+    return script
+
+
+def _seed_priced_usage_with_ledger(user_id, occurred_at, charge_nano, *,
+                                   account_id=None):
+    """priced usage event + 配套 ``'usage:'||event_id`` usage_debit ledger
+    （镜像 ingest 补账：rollback 前置双扣检测要求每个 priced event 恰一条
+    usage ledger）。返回 account_id（同 user 多笔复用同一账户）。"""
+    hex32 = uuid.uuid4().hex
+    if account_id is None:
+        account_id = billing_store.create_billing_account(
+            user_id, actor="pytest")["account_id"]
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            _insert_priced_event(cur, hex32, "user", user_id, occurred_at,
+                                 charge_nano)
+            cur.execute(
+                "INSERT INTO billing_ledger_entries (entry_id, account_id, "
+                "event_id, kind, amount_nano_cny, idempotency_key, reason, "
+                "metadata) VALUES (%s,%s,'use_'||%s,'usage_debit',%s,"
+                "'usage:'||'use_'||%s,'pytest-synthetic','{}'::jsonb)",
+                ("ble_" + uuid.uuid4().hex[:20], account_id, hex32,
+                 -int(charge_nano), hex32))
+        conn.commit()
+    finally:
+        conn.close()
+    return account_id
+
+
+def _seed_cutover_state(user_id, *, limit, spent, cutover_at):
+    """固定「cutover 已发生」前置态：source='cutover' 的 allowance 行
+    （opening=spent 承接全部历史；cutover_at 晚于全部已造事件 →
+    reconcile_total_allowances expected=opening+0 无 drift，满足回滚
+    前置检查）+ user_spend_target='total_allowance'。不建窗口行。"""
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            spend_store.create_user_total_allowance_tx(
+                cur, user_id, limit, source="cutover",
+                opening_spent_nano=spent, cutover_at=cutover_at,
+                source_window_id="spw_seed_" + uuid.uuid4().hex[:12],
+                source_window_version=1)
+        conn.commit()
+    finally:
+        conn.close()
+    bh.set_user_spend_target("total_allowance")
+
+
+def test_cutover_preflight_apply_and_rollback():
+    script = _load_cutover_script()
     _seed_all()
     u1 = _mk_user_with_window("cut1@x.com", limit=20 * 10 ** 9)
     u2 = _mk_user_with_window("cut2@x.com", limit=20 * 10 ** 9)
@@ -1019,27 +1081,10 @@ def test_cutover_preflight_apply_and_rollback(tmp_path, monkeypatch):
     assert report["ok"] is True
     assert len(report["per_user"]) == 2
 
-    # 给 u1 造「有真实依据」的消费与预占（priced event 与窗口 spent 一致，
-    # drift 恒 0；open hold 用于验证中止路径）
+    # 给 u1 造「有真实依据」的消费（priced event + 配套 usage ledger，窗口
+    # spent 同步刷新 → drift 恒 0；open hold 用于验证中止路径）
     now = datetime.now(UTC)
-    acct = billing_store.create_billing_account(u1["user_id"], actor="pytest")
-    conn = _conn()
-    try:
-        with conn.cursor() as cur:
-            _insert_priced_event(cur, "e" * 32, "user", u1["user_id"], now,
-                                 3 * 10 ** 9)
-            # 镜像 ingest 的 usage_debit（双扣检测要求每个 priced event 恰
-            # 一条 'usage:'||event_id ledger；直接 SQL 造事件需一并补账）
-            cur.execute(
-                "INSERT INTO billing_ledger_entries (entry_id, account_id, "
-                "event_id, kind, amount_nano_cny, idempotency_key, reason, "
-                "metadata) VALUES (%s,%s,'use_'||%s,'usage_debit',%s,"
-                "'usage:'||'use_'||%s,'pytest-synthetic','{}'::jsonb)",
-                ("ble_" + uuid.uuid4().hex[:20], acct["account_id"],
-                 "e" * 32, -3 * 10 ** 9, "e" * 32))
-        conn.commit()
-    finally:
-        conn.close()
+    _seed_priced_usage_with_ledger(u1["user_id"], now, 3 * 10 ** 9)
     _exec("UPDATE ai_spend_windows SET spent_nano_cny=%s "
           "WHERE subject_id=%s", (3 * 10 ** 9, u1["user_id"]))
 
@@ -1098,7 +1143,10 @@ def test_cutover_preflight_apply_and_rollback(tmp_path, monkeypatch):
     assert _count("ai_spend_windows", "subject_id=%s",
                   (u1["user_id"],)) == 1
 
-    # rollback-plan：无 open total hold → 建新窗 + 切回 + 保持维护态
+    # rollback-plan：无 open total hold → 建新窗 + 切回 + 保持维护态。
+    # 同月回滚（cutover 与 rollback 同月）：月感公式退化出与旧口径等价的值
+    # （当月 priced usage 即全部 usage → spent'=allowance.spent、
+    # limit'=allowance.limit）
     conn = script._connect()
     try:
         report = script.rollback_plan(conn, actor=actor)
@@ -1108,9 +1156,11 @@ def test_cutover_preflight_apply_and_rollback(tmp_path, monkeypatch):
         settings_store.USER_SPEND_TARGET_KEY) == "window"
     assert settings_store.get_setting(
         settings_store.AI_DISPATCH_MAINTENANCE_KEY) is True  # 保持开启
-    for uid in (u1["user_id"], u2["user_id"]):
+    rep = {r["user_id"]: r for r in report["users"]}
+    for uid, month_spent in ((u1["user_id"], 3 * 10 ** 9),
+                             (u2["user_id"], 0)):
         # 同月回滚：冻结旧窗被就地重快照（UNIQUE 拒绝第二行）→ 每 user 恰
-        # 一个窗口行，值等于冻结 allowance 快照
+        # 一个窗口行，值等于冻结 allowance 快照（月感公式同月退化形态）
         wins = _sql_one(
             "SELECT * FROM ai_spend_windows WHERE subject_type='user' "
             "AND subject_id=%s", (uid,))
@@ -1123,6 +1173,184 @@ def test_cutover_preflight_apply_and_rollback(tmp_path, monkeypatch):
         assert int(wins[0]["reserved_nano_cny"]) == 0
         assert wins[0]["status"] == "open"
         assert int(frozen["reserved_nano_cny"]) == 0
+        # 月感报告字段：mode/当月/ Lifetime 值如实入报告
+        entry = rep[uid]
+        assert entry["rolled_mode"] == "in_place_resnapshot"
+        assert entry["month_spent_nano_cny"] == month_spent
+        assert entry["lifetime_spent_nano_cny"] == \
+            int(frozen["spent_nano_cny"])
+        assert entry["new_window_spent_nano_cny"] == month_spent
+        assert entry["new_window_limit_nano_cny"] == \
+            int(frozen["limit_nano_cny"])
+    # 同月回滚零 drift（reconcile 口径 = 窗口界内 priced usage）
+    recon = spend_store.reconcile_spend_windows()
+    assert [i for i in recon["items"] if not i["matches"]] == []
+
+
+def test_preflight_hard_fails_when_target_not_window(capsys):
+    """F5a：target != 'window' 且零 problems 也必须非零退出——不允许
+    「problems 为空但 target 不对」时打印「preflight 通过」并 exit 0。"""
+    script = _load_cutover_script()
+    _seed_all()
+    user = _mk_user_with_window("pf-clean@x.com", limit=20 * 10 ** 9)
+    bh.set_user_spend_target("total_allowance")
+    conn = script._connect()
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            script.preflight(conn, actor="usr_owner_pf")
+    finally:
+        conn.close()
+    assert exc_info.value.code != 0
+    out = capsys.readouterr().out
+    assert "preflight 通过" not in out          # 假绿提示绝不打印
+    report = json.loads(out)
+    assert report["ok"] is False
+    assert report["problems"] == []            # 失败纯因 target 非 window
+    assert report["user_spend_target"] == "total_allowance"
+    # per_user 顺带携带 existing_allowance 投影（无行 → None）
+    per = next(p for p in report["per_user"]
+               if p["user_id"] == user["user_id"])
+    assert per["existing_allowance_limit_nano_cny"] is None
+
+
+def test_preflight_flags_allowance_window_limit_mismatch(capsys):
+    """F5b：已有 allowance 行限额与当前窗口快照不一致 → preflight 即报
+    allowance_limit_mismatch 并非零退出（不等到 apply 在维护窗内才中止）。"""
+    script = _load_cutover_script()
+    _seed_all()
+    user = _mk_user_with_window("pf-mismatch@x.com", limit=20 * 10 ** 9)
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            spend_store.create_user_total_allowance_tx(
+                cur, user["user_id"], 25 * 10 ** 9, source="invite")
+        conn.commit()
+    finally:
+        conn.close()
+    conn = script._connect()
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            script.preflight(conn, actor="usr_owner_pf")
+    finally:
+        conn.close()
+    assert exc_info.value.code != 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["ok"] is False
+    assert {"problem": "allowance_limit_mismatch",
+            "user_id": user["user_id"],
+            "allowance_limit_nano": 25 * 10 ** 9,
+            "window_limit_nano": 20 * 10 ** 9} in report["problems"]
+    per = next(p for p in report["per_user"]
+               if p["user_id"] == user["user_id"])
+    assert per["existing_allowance_limit_nano_cny"] == 25 * 10 ** 9
+
+
+def test_rollback_plan_month_aware_snapshot_cross_month_and_variants():
+    """F3 月感快照（跨月回滚真实 PG）：cutover 已发生（target=total），
+    上月 priced usage=a、本月=b、allowance.spent=a+b → 回滚后新月窗
+    spent==b、limit==spent+max(0, 原剩余)（remaining 跨月守恒）、
+    reserved==0；reconcile 零 drift；allowance 冻结投影保留（version+1）；
+    target CAS 回 window；维护闸保持开启。
+
+    同批复变体：b==0（本月无消费 → spent'=0、limit'=L-a）；已用尽/超支
+    （a+b>=L → limit'==spent'==b）；同月回归（全部 usage 在当月 → 与旧
+    口径等价：spent'==a+b、limit'==L）。"""
+    script = _load_cutover_script()
+    _seed_all()
+    at_dt = datetime.now(UTC)
+    start_cur, end_cur = spend_store.month_window_bounds(at_dt)
+    start_prev, end_prev = spend_store.month_window_bounds(
+        start_cur - timedelta(seconds=1))
+    assert end_prev == start_cur
+    # 当月事件取「月初→now」中点（恒早于 rollback at_dt，不依赖当月已
+    # 流逝时长）；上月事件取上月月中。
+    cur_occurred = start_cur + (at_dt - start_cur) / 2
+    prev_occurred = start_prev + (end_prev - start_prev) / 2
+
+    def _mk_case(login, *, limit, prev_nano, cur_nano):
+        user = _user(login)
+        acct = _seed_priced_usage_with_ledger(
+            user["user_id"], prev_occurred, prev_nano) \
+            if prev_nano else None
+        if cur_nano:
+            acct = _seed_priced_usage_with_ledger(
+                user["user_id"], cur_occurred, cur_nano, account_id=acct)
+        _seed_cutover_state(user["user_id"], limit=limit,
+                            spent=prev_nano + cur_nano,
+                            cutover_at=at_dt + timedelta(seconds=5))
+        return user
+
+    L_norm, a_norm, b_norm = 50 * 10 ** 9, 12 * 10 ** 9, 7 * 10 ** 9
+    L_nob, a_nob = 20 * 10 ** 9, 5 * 10 ** 9                   # b=0
+    L_ex, a_ex, b_ex = 40 * 10 ** 9, 30 * 10 ** 9, 25 * 10 ** 9  # a+b>L
+    L_same, b_same = 30 * 10 ** 9, 9 * 10 ** 9                 # 同月回归
+    u_norm = _mk_case("roll-norm@x.com", limit=L_norm, prev_nano=a_norm,
+                      cur_nano=b_norm)
+    u_nob = _mk_case("roll-nob@x.com", limit=L_nob, prev_nano=a_nob,
+                     cur_nano=0)
+    u_ex = _mk_case("roll-exhaust@x.com", limit=L_ex, prev_nano=a_ex,
+                    cur_nano=b_ex)
+    u_same = _mk_case("roll-same@x.com", limit=L_same, prev_nano=0,
+                      cur_nano=b_same)
+
+    conn = script._connect()
+    try:
+        report = script.rollback_plan(conn, actor="usr_owner_rb",
+                                      at_dt=at_dt)
+    finally:
+        conn.close()
+    assert settings_store.get_setting(
+        settings_store.USER_SPEND_TARGET_KEY) == "window"
+    assert settings_store.get_setting(
+        settings_store.AI_DISPATCH_MAINTENANCE_KEY) is True  # 保持开启
+    # 期望值按 F3 公式：spent'=当月 usage；remaining'=max(0, L-a-b) 守恒 →
+    # limit'=spent'+remaining'；已用尽/超支 → 零剩余饱和窗。
+    expected = {
+        u_norm["user_id"]: (b_norm, L_norm - a_norm, b_norm),
+        u_nob["user_id"]: (0, L_nob - a_nob, 0),
+        u_ex["user_id"]: (b_ex, b_ex, b_ex),
+        u_same["user_id"]: (b_same, L_same, b_same),  # 旧行为等价形态
+    }
+    rep = {r["user_id"]: r for r in report["users"]}
+    for uid, (exp_spent, exp_limit, exp_month) in expected.items():
+        wins = _sql_one(
+            "SELECT * FROM ai_spend_windows WHERE subject_type='user' "
+            "AND subject_id=%s", (uid,))
+        assert len(wins) == 1
+        win = wins[0]
+        assert win["window_start"] == start_cur
+        assert win["window_end"] == end_cur
+        assert int(win["spent_nano_cny"]) == exp_spent
+        assert int(win["limit_nano_snapshot"]) == exp_limit
+        assert int(win["reserved_nano_cny"]) == 0
+        assert win["status"] == "open"
+        entry = rep[uid]
+        assert entry["rolled_mode"] == "new_window"
+        assert entry["new_window_spent_nano_cny"] == exp_spent
+        assert entry["new_window_limit_nano_cny"] == exp_limit
+        assert entry["month_spent_nano_cny"] == exp_month
+        # 冻结 allowance 投影保留：行在、spent/limit 不清、reserved=0、
+        # version+1（seed 1 → rollback 2）
+        frozen = _allowance_row(uid)
+        assert frozen is not None
+        assert int(frozen["spent_nano_cny"]) == entry[
+            "lifetime_spent_nano_cny"]
+        assert int(frozen["reserved_nano_cny"]) == 0
+        assert int(frozen["version"]) == 2
+    assert int(_allowance_row(u_norm["user_id"])["limit_nano_cny"]) == L_norm
+    assert int(_allowance_row(u_norm["user_id"])["spent_nano_cny"]) == \
+        a_norm + b_norm
+    # 月感快照的可验收推论：reconcile 全部 open 窗零 drift
+    recon = spend_store.reconcile_spend_windows()
+    assert [i for i in recon["items"] if not i["matches"]] == []
+    # 审计留痕：月感字段进 spend.rollback_window detail
+    audits = _sql_one(
+        "SELECT detail FROM audit_events WHERE action="
+        "'spend.rollback_window' AND target_id=%s",
+        (rep[u_norm["user_id"]]["new_window_id"],))
+    assert audits
+    assert audits[0]["detail"]["month_spent_nano_cny"] == b_norm
+    assert audits[0]["detail"]["lifetime_spent_nano_cny"] == a_norm + b_norm
 
 
 if __name__ == "__main__":

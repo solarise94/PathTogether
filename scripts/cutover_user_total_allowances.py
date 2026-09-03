@@ -43,14 +43,19 @@ remaining_before != remaining_after。
 rollback-plan（§8.2；不是切 flag）：
   1. 保持维护态（CAS false→true；已 true 幂等通过）；
   2. 前置检查：reconcile_total_allowances 无 drift、open total holds=0、
-     每个 priced event 恰一条 usage ledger（双扣检测）、hold 单目标；
+     open 的 user 窗口目标 hold=0（否则回滚后 reserved=0 与 reconcile 的
+     expected_reserved 不一致）、每个 priced event 恰一条 usage ledger
+     （双扣检测）、hold 单目标；
   3. 同一 SERIALIZABLE 事务内：锁 users(role='user')，为每个 user 生成
      **新的**月窗口（边界由服务端 ``window_bounds("calendar_month",
      rollback_at)`` Asia/Shanghai 计算——rollback_at 恒取服务器当前时刻，
-     不接受客户端任意时间；不复用已关闭旧窗）：快照 limit=allowance.limit、
-     spent=allowance.spent、reserved=0；随后 CAS ``user_spend_target``
-     "total_allowance"→"window"（allowance 冻结为非授权审计投影——行保留，
-     仅随 target 切换退出授权路径，不做 DELETE/清零）→ 提交；
+     不接受客户端任意时间；不复用已关闭旧窗）——**月感快照**：
+     spent=当月 priced usage、limit=spent+max(0, allowance 原剩余)
+     （remaining 跨月守恒；已用尽用户压成零剩余饱和窗；当月 priced
+     usage > lifetime spent 即数据异常中止）；随后 CAS
+     ``user_spend_target`` "total_allowance"→"window"（allowance 冻结为
+     非授权审计投影——行保留，仅随 target 切换退出授权路径，不做
+     DELETE/清零）→ 提交；
   4. 维护闸**保持开启**：回滚事务提交后需人工验收（reconcile 窗口无
      drift）再显式 CAS 关闸——本脚本不代关（回滚宁保守）。
 
@@ -248,6 +253,21 @@ def preflight(conn, *, actor, at_dt=None):
                 if unpriced != 0:
                     problems.append({"problem": "unpriced_usage",
                                      "user_id": uid, "count": unpriced})
+                # F5b 前置预检：已有总额度行的限额必须与当前窗口快照一致
+                # （apply 的 existing-allowance 分支同样校验——那时已进维护
+                # 窗，preflight 就该把不一致暴露出来）
+                existing = spend_store._fetch_total_allowance_read(cur, uid)
+                if existing is not None and \
+                        int(existing["limit_nano_cny"]) != \
+                        int(win["limit_nano_snapshot"]):
+                    problems.append({
+                        "problem": "allowance_limit_mismatch",
+                        "user_id": uid,
+                        "allowance_limit_nano":
+                            int(existing["limit_nano_cny"]),
+                        "window_limit_nano":
+                            int(win["limit_nano_snapshot"]),
+                    })
                 per_user.append({
                     "user_id": uid,
                     "window_id": win["window_id"],
@@ -257,9 +277,12 @@ def preflight(conn, *, actor, at_dt=None):
                     "remaining_nano": (int(win["limit_nano_snapshot"])
                                        - int(win["spent_nano_cny"])
                                        - int(win["reserved_nano_cny"])),
+                    "existing_allowance_limit_nano_cny": (
+                        int(existing["limit_nano_cny"])
+                        if existing is not None else None),
                 })
-            default_limit, default_source = spend_store._resolve_total_default_tx(
-                cur, at_dt)
+            default_limit, default_source, default_version = \
+                spend_store._resolve_total_default_tx(cur, at_dt)
     report = {
         "mode": "preflight",
         "actor": actor,
@@ -270,13 +293,15 @@ def preflight(conn, *, actor, at_dt=None):
         "pricing_cutover": cutover.isoformat() if cutover else None,
         "total_default_nano_cny": default_limit,
         "total_default_source": default_source,
+        "total_default_version": default_version,
         "per_user": per_user,
         "problems": problems,
         "ok": not problems and target == "window",
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    if problems:
-        _die("preflight 发现 %d 个中止条件（见 problems）" % len(problems))
+    if not report["ok"]:
+        _die("preflight 未通过（problems=%d，user_spend_target=%r；需为空 problems "
+             "且 target='window'）" % (len(problems), target))
     _note("preflight 通过：user_spend_target=%s，%d 个 user 全部就绪"
           % (target, len(user_ids)))
     return report
@@ -319,7 +344,10 @@ def apply_cutover(conn, *, actor, at_dt=None):
                 user_ids, windows, problems = _current_user_windows(cur, at_dt)
                 if problems:
                     _die("当前月窗口检查失败：%s" % problems)
-                default_limit, default_source = \
+                # 三元组解包（解析出的 version 仅用于报告/日志；allowance 行
+                # 的 default_version 仍以「INSERT ON CONFLICT DO NOTHING
+                # 固化后读行 version」的物化值为准——物化行才是权威模板）
+                default_limit, default_source, default_resolved_version = \
                     spend_store._resolve_total_default_tx(cur, at_dt)
                 if default_limit is None:
                     _die("无可用默认总额度（defaults 表缺行且 user_default "
@@ -442,6 +470,7 @@ def apply_cutover(conn, *, actor, at_dt=None):
         "actor": actor,
         "at": at_dt.isoformat(),
         "users_migrated": len(per_user),
+        "total_default_resolved_version": default_resolved_version,
         "per_user": per_user,
         "user_spend_target": "total_allowance",
         "maintenance_closed": maintenance_closed,
@@ -528,6 +557,24 @@ def rollback_plan(conn, *, actor, at_dt=None):
                 if open_total:
                     _die("存在 %d 个 open 总额度 hold（回滚前必须为 0）：%s"
                          % (len(open_total), open_total))
+                # open 的 user 窗口目标 hold 也必须为 0：回滚后新窗
+                # reserved 恒 0，此类行会让 reconcile 的 expected_reserved
+                # 非 0（必然 drift）。holds 只经 spend_window_id 关联窗口
+                # 表（无窗口主体列），join ai_spend_windows 判定 user 窗口；
+                # total 模式下此类行不应存在（user hold 只绑 allowance），
+                # 查询结果应为空集——作为防御性中止条件保留。
+                cur.execute(
+                    "SELECT h.hold_id FROM billing_holds h "
+                    "JOIN ai_spend_windows w "
+                    "ON w.window_id = h.spend_window_id "
+                    "WHERE h.status='open' AND h.spend_window_id IS NOT NULL "
+                    "AND w.subject_type='user' ORDER BY h.hold_id")
+                open_window_user = [r["hold_id"] for r in cur.fetchall()]
+                if open_window_user:
+                    _die("存在 %d 个 open 的 user 窗口目标 hold（回滚后新窗 "
+                         "reserved=0 将与 reconcile expected_reserved 不一致"
+                         "；回滚前必须为 0）：%s"
+                         % (len(open_window_user), open_window_user[:5]))
                 problems = _double_spend_checks(cur)
                 if problems:
                     _die("双扣/缺账检测发现 %d 个异常（禁止自动修）：%s"
@@ -537,6 +584,13 @@ def rollback_plan(conn, *, actor, at_dt=None):
             with c.cursor() as cur:
                 cur.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
                 start, end = spend_store.month_window_bounds(at_dt)
+                # 月感快照的 usage 下限与 reconcile 口径对齐：
+                # max(窗口起点, pricing cutover)——旧错误价格的影子事件不进
+                # 窗口对账（spend_store._reconcile_window_tx 同口径），否则
+                # 回滚月与 pricing cutover 同月且窗内有旧价事件时必然 drift
+                pricing_cutover = _read_pricing_cutover(cur)
+                spend_from = (max(start, pricing_cutover)
+                              if pricing_cutover is not None else start)
                 cur.execute(
                     "SELECT user_id FROM users WHERE role='user' "
                     "ORDER BY user_id FOR UPDATE")
@@ -557,13 +611,13 @@ def rollback_plan(conn, *, actor, at_dt=None):
                     allowance = spend_store._allowance_out(arow)
                     if int(allowance["reserved_nano_cny"]) != 0:
                         _die("user %s allowance reserved 非 0（中止）" % uid)
-                    # 新月窗口一次性快照：limit=allowance.limit、
-                    # spent=allowance.spent、reserved=0；边界由服务端
-                    # window_bounds("calendar_month", rollback_at) 计算。
-                    # 同月回滚时与冻结旧窗边界重合（UNIQUE 拒绝第二行）：
-                    # 此时对既有行做受审计的就地快照更新（它从未 closed、
-                    # 也不是复用已关闭旧窗——值刷新为 allowance 快照并
-                    # version+1 留痕）；跨月回滚则插入全新行。
+                    # 新月窗口月感快照（值见下方 F3 公式）：reserved=0；
+                    # 边界由服务端 window_bounds("calendar_month",
+                    # rollback_at) 计算。同月回滚时与冻结旧窗边界重合
+                    # （UNIQUE 拒绝第二行）：此时对既有行做受审计的就地
+                    # 快照更新（它从未 closed、也不是复用已关闭旧窗——值
+                    # 刷新为月感快照并 version+1 留痕）；跨月回滚则插入
+                    # 全新行。两分支共用同一月感公式。
                     policy = spend_store._resolve_policy_tx(
                         cur, "user", uid, at_dt)
                     if policy is None:
@@ -576,8 +630,33 @@ def rollback_plan(conn, *, actor, at_dt=None):
                         "AND window_start=%s AND window_end=%s FOR UPDATE",
                         (uid, start, end))
                     existing_win = cur.fetchone()
-                    target_spent = int(allowance["spent_nano_cny"])
-                    target_limit = int(allowance["limit_nano_cny"])
+                    # 月感快照（F3）：新月窗口 spent=当月 priced usage、
+                    # limit=spent+max(0, allowance 原剩余)——回滚后
+                    # reconcile_spend_windows 只 SUM 窗口界内 priced usage，
+                    # 整体照抄 lifetime 值跨月必现 drift。remaining
+                    # （target_limit - target_spent = max(0, 原剩余)）跨月
+                    # 守恒；已用尽/超支用户压成零剩余饱和窗。同月回滚时当月
+                    # usage 即全部 usage，结果与「整体照抄」旧口径一致。
+                    cur.execute(
+                        "SELECT COALESCE(SUM(charge_nano_cny),0)::bigint AS s "
+                        "FROM ai_usage_events WHERE status='priced' AND "
+                        "subject_type='user' AND subject_id=%s "
+                        "AND occurred_at >= %s AND occurred_at < %s",
+                        (uid, spend_from, end))
+                    month_spent = int(cur.fetchone()["s"])
+                    life_spent = int(allowance["spent_nano_cny"])
+                    life_limit = int(allowance["limit_nano_cny"])
+                    if life_spent < month_spent:
+                        _die("user %s 数据异常：当月 priced usage(%d) > "
+                             "allowance lifetime spent(%d)——人工核查"
+                             % (uid, month_spent, life_spent))
+                    remaining = life_limit - life_spent
+                    if remaining > 0:
+                        target_limit = life_limit - (life_spent - month_spent)
+                        target_spent = month_spent
+                    else:
+                        target_limit = month_spent
+                        target_spent = month_spent
                     if existing_win is not None:
                         if existing_win["status"] != "open":
                             _die("user %s 回滚目标月存在已关闭旧窗（禁止"
@@ -622,15 +701,22 @@ def rollback_plan(conn, *, actor, at_dt=None):
                             "allowance_id": allowance["allowance_id"],
                             "limit_nano_cny": target_limit,
                             "spent_nano_cny": target_spent,
+                            "month_spent_nano_cny": month_spent,
+                            "lifetime_spent_nano_cny": life_spent,
                         })
-                    # 双扣检测口径：新窗初始 spent 必须精确等于冻结 allowance
-                    # spent（不等即中止，不自动加减修复）
+                    # 双扣检测口径：新窗初始 spent/limit 必须精确等于月感
+                    # 快照目标（读回两列复核；不等即中止，不自动加减修复）
                     cur.execute(
-                        "SELECT spent_nano_cny FROM ai_spend_windows "
-                        "WHERE window_id=%s", (new_window_id,))
-                    if int(cur.fetchone()["spent_nano_cny"]) != target_spent:
-                        _die("user %s 新窗 spent != 冻结 allowance spent"
-                             "（中止）" % uid)
+                        "SELECT spent_nano_cny, limit_nano_snapshot "
+                        "FROM ai_spend_windows WHERE window_id=%s",
+                        (new_window_id,))
+                    win_row = cur.fetchone()
+                    if (int(win_row["spent_nano_cny"]) != target_spent
+                            or int(win_row["limit_nano_snapshot"])
+                            != target_limit):
+                        _die("user %s 新窗 spent/limit != 月感快照目标"
+                             "（spent 目标 %d，limit 目标 %d；中止）"
+                             % (uid, target_spent, target_limit))
                     # 冻结 allowance 为审计投影：reserved 归零（前置已保证
                     # open total hold=0）、version+1 记账；不 DELETE、不清
                     # opening/spent（历史事实保留）
@@ -645,10 +731,10 @@ def rollback_plan(conn, *, actor, at_dt=None):
                         "allowance_id": allowance["allowance_id"],
                         "new_window_id": new_window_id,
                         "rolled_mode": rolled_mode,
-                        "new_window_limit_nano_cny":
-                            int(allowance["limit_nano_cny"]),
-                        "new_window_spent_nano_cny":
-                            int(allowance["spent_nano_cny"]),
+                        "new_window_limit_nano_cny": target_limit,
+                        "new_window_spent_nano_cny": target_spent,
+                        "month_spent_nano_cny": month_spent,
+                        "lifetime_spent_nano_cny": life_spent,
                     })
                 cur.execute(
                     "UPDATE platform_settings SET value=%s::jsonb, "

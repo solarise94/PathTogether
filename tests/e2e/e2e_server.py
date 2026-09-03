@@ -81,9 +81,20 @@ def main():
     import _bootstrap  # noqa: F401
     import app as app_mod  # 启动期自动：owner 首建 + admin 插件 installation 引导
 
-    import user_store
-    user_store.create_user("e2e-user@pt.test", user_pw, role="user",
-                           display_name="E2E 普通用户")
+    # Batch B review 修复后的形态：注册用户授权面由 user_spend_target 决定。
+    # 10d/10e/10f（建号/抽屉 CAS/邀请模板）验收的是 cutover 后的总额度形态，
+    # 故种子：target CAS 到 total_allowance + 全局默认总额度 50 CNY
+    # （version=1 首写），预建普通用户经建号组合原语自动获得默认额度行。
+    import settings_store
+    import spend_store
+    settings_store.compare_and_set_setting(
+        settings_store.USER_SPEND_TARGET_KEY, "window", "total_allowance",
+        updated_by="e2e-seed")
+    spend_store.set_total_default(50_000_000_000, 1, updated_by="e2e-seed")
+
+    import user_store_pg
+    user_store_pg.create_user_with_total_allowance(
+        "e2e-user@pt.test", user_pw, display_name="E2E 普通用户")
 
     creds_path = os.environ.get("E2E_CREDS_FILE") or os.path.join(
         tempfile.gettempdir(), "pt-e2e-creds-%d.json" % args.port)

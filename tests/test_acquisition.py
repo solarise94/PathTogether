@@ -383,7 +383,8 @@ if BACKEND == "postgres":
             conn.close()
 
     def _count_override_rows():
-        """user_override 月额度策略行数（Batch B 起新注册不再创建）。"""
+        """user_override 月额度策略行数（cutover 契约：window 过渡期显式
+        额度会建过渡 override；total 模式不建）。"""
         conn = _pg_conn()
         try:
             with conn.cursor() as cur:
@@ -501,9 +502,13 @@ def test_visit_rows_are_immutable_events_not_upserted():
 
 @pg_only
 def test_redeem_writes_no_user_acquisition_but_total_allowance():
-    """Batch B §4.4/§Batch B：兑换与归因解耦——无论触点/UTM/邀请来源如何，
-    兑换成功但 user_acquisition **零新增**；带初始额度的邀请同事务建一次性
-    总额度（不再建 user_override）。"""
+    """Batch B §4.4/§Batch B + cutover 契约：兑换与归因解耦——无论触点/UTM/
+    邀请来源如何，兑换成功但 user_acquisition **零新增**；额度面按
+    user_spend_target 分叉：window（cutover 前缺省）带初始额度邀请建等值
+    user_override 过渡策略、不建 allowance 行；切 total 模式后同事务建一次
+    性总额度（source=invite）。"""
+    import _billing_helpers as bh
+    import spend_store
     owner = _mk_owner()
     _seed_campaign("camp-web", "websrc")
     _seed_campaign("camp-inv", "invsrc")
@@ -515,18 +520,35 @@ def test_redeem_writes_no_user_acquisition_but_total_allowance():
                      total_limit_nano_cny=12 * 10 ** 9)
     out = _redeem(inv, "prio1@x.com",
                   acq={"visitor_id": vid, "utm_source": "ignored"})
-    # 注册成功 + allowance 建成；归因零新增
+    # window（缺省 target）：注册成功、归因零新增；不建 allowance 行，建
+    # 等值 user_override 过渡策略，响应 spend_override_policy 如实带面值
     assert user_store.get_user_by_login_id("prio1@x.com") is not None
-    assert out["total_allowance"]["limit_nano_cny"] == 12 * 10 ** 9
-    assert out["total_allowance"]["source"] == "invite"
+    assert out["total_allowance"] is None
     assert out["acquisition"] is None  # 兼容键恒 None（退役）
+    assert out["spend_override_policy"] == {"limit_nano_cny": 12 * 10 ** 9}
     assert _acq_total() == before
     assert _ua(out["user"]["user_id"]) is None
-    assert _count_override_rows() == 0
-    # 无初始额度的邀请：不建行（由 cutover/首开授权处理）
+    assert _count_override_rows() == 1
+    policy = spend_store.resolve_policy("user", out["user"]["user_id"])
+    assert policy["scope_type"] == "user_override"
+    assert policy["period_kind"] == "calendar_month"
+    assert policy["limit_nano_cny"] == 12 * 10 ** 9
+    # window 无初始额度的邀请：不建任何额度面（不造 dormant 行）
     inv2 = _mk_invite(owner["user_id"])
     out2 = _redeem(inv2, "prio2@x.com", acq={"visitor_id": vid})
     assert out2["total_allowance"] is None
+    assert out2["spend_override_policy"] is None
+    assert _count_override_rows() == 1
+    assert _acq_total() == before
+    # 切 total 模式：带初始额度的邀请同事务建一次性总额度（source=invite）
+    bh.set_user_spend_target("total_allowance")
+    inv3 = _mk_invite(owner["user_id"], campaign_id="camp-inv",
+                      total_limit_nano_cny=12 * 10 ** 9)
+    out3 = _redeem(inv3, "prio3@x.com", acq={"visitor_id": vid})
+    assert out3["total_allowance"]["limit_nano_cny"] == 12 * 10 ** 9
+    assert out3["total_allowance"]["source"] == "invite"
+    assert out3["spend_override_policy"] is None
+    assert _count_override_rows() == 1  # total 模式不再新增 override
     assert _acq_total() == before
 
 

@@ -23,7 +23,10 @@ store 级（默认全跑；PG-only 用例 RUN_PG_TESTS=1）：
   - dashboard_stats：形状与钉死契约逐键一致；visits/unique_visitors/bots
     三分类互不混入（爬虫不进入匿名访客近似数）；只读——调用前后业务表与
     site 表行数不变、不触发清理；90 天窗口外事件不计入；
-  - purge_expired 只删 expires_at 到期行。
+  - purge_expired 只删 expires_at 到期行；
+  - F4 每日保留任务接线：app._run_daily_retention_once 的 acquisition 段与
+    site stats 段各自独立 try/except（互不拖垮）、store 缺失（None）时
+    site stats 段静默跳过（双跑纯单元，monkeypatch 注入）。
 
 app.py 接线契约测试（``site_stats_app_wiring`` 标记，**默认启用、不 skip**；
 app.py 接线由并行代理实施，接线落地前这些用例红属预期）：
@@ -832,3 +835,62 @@ def test_app_after_request_records_public_html_get(secret, monkeypatch):
         assert _site_count() == n
     finally:
         sss.stop_worker()
+
+
+# --------------------------------------------------------------------------- #
+# 11. F4：每日保留任务接线（app._run_daily_retention_once；双跑纯单元）
+# --------------------------------------------------------------------------- #
+def test_run_daily_retention_once_runs_both_segments(monkeypatch):
+    """单轮任务：acquisition 段与 site stats 段都被执行（store 非 None）。"""
+    calls = []
+    monkeypatch.setattr(app_mod.acquisition_store, "run_visit_retention",
+                        lambda: (3, 2))
+    monkeypatch.setattr(sss, "purge_expired",
+                        lambda: calls.append("purge") or 5)
+    monkeypatch.setattr(app_mod, "site_stats_store", sss)
+    app_mod._run_daily_retention_once()
+    assert calls == ["purge"]
+
+
+def test_run_daily_retention_once_segments_do_not_take_each_other_down(
+        monkeypatch):
+    """互不拖垮：任一段异常不外泄、另一段照常执行（各段独立 try/except）。"""
+    calls = []
+
+    def _acq_boom():
+        raise RuntimeError("acq down")
+
+    monkeypatch.setattr(app_mod.acquisition_store, "run_visit_retention",
+                        _acq_boom)
+    monkeypatch.setattr(sss, "purge_expired",
+                        lambda: calls.append("purge") or 4)
+    monkeypatch.setattr(app_mod, "site_stats_store", sss)
+    app_mod._run_daily_retention_once()          # acquisition 异常被吞
+    assert calls == ["purge"]
+    # 反向：site stats 段异常，acquisition 段照常执行
+    calls.clear()
+
+    def _purge_boom():
+        raise RuntimeError("stats down")
+
+    monkeypatch.setattr(app_mod.acquisition_store, "run_visit_retention",
+                        lambda: calls.append("acq") or (1, 0))
+    monkeypatch.setattr(sss, "purge_expired", _purge_boom)
+    app_mod._run_daily_retention_once()          # purge 异常被吞
+    assert calls == ["acq"]
+
+
+def test_run_daily_retention_once_skips_missing_store(monkeypatch):
+    """store 未随镜像发布（import 容错 None）：site stats 段静默跳过，
+    acquisition 段照常执行——与 _start_site_stats_worker 同口径。"""
+    calls = []
+    monkeypatch.setattr(app_mod.acquisition_store, "run_visit_retention",
+                        lambda: calls.append("acq") or (0, 0))
+
+    def _unexpected():
+        raise AssertionError("store 为 None 时 purge_expired 不应被调用")
+
+    monkeypatch.setattr(sss, "purge_expired", _unexpected)
+    monkeypatch.setattr(app_mod, "site_stats_store", None)
+    app_mod._run_daily_retention_once()
+    assert calls == ["acq"]

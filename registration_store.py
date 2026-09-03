@@ -240,8 +240,8 @@ def _validate_monthly_limit(monthly_limit_nano_cny):
 
 
 def _validate_total_limit(total_limit_nano_cny):
-    """邀请模板总额度校验：None（按 user_spend_target 分叉，见 redeem_invite）
-    或非负整数 nano。"""
+    """邀请模板总额度校验：None（兑换时按 ai_spend_total_defaults 默认建行，
+    见 redeem_invite）或非负整数 nano。"""
     if total_limit_nano_cny is None:
         return None
     if isinstance(total_limit_nano_cny, bool) \

@@ -5468,11 +5468,10 @@ def admin_v1_users_create():
     批次 B wave 2（§Batch B 数据模型 6 / §4.3）扩展可选字段：
       - ``total_limit_nano_cny``：十进制字符串 nano-CNY | null（缺省）。
         postgres 后端一律走同事务组合原语（user_store_pg
-        .create_user_with_total_allowance），按 ``user_spend_target`` 分叉：
-        total 模式显式 X 同事务建**一次性总额度**行（source=admin_create），
-        无 X 解析默认，皆缺 → 400 ``total_default_missing``（绝不建出无额度
-        行的用户）；window 模式不建 allowance 行，显式 X 建等值
-        user_override 过渡策略（响应 total_allowance=null）；
+        .create_user_with_total_allowance）。R3 单轨：恒建**一次性总额度**
+        行——显式 X 按面值（source=admin_create），无 X 解析
+        ai_spend_total_defaults 权威默认，皆缺 → 400 ``total_default_missing``
+        （绝不建出无额度行的用户；缺行 = 数据损坏 fail-closed）；
       - ``monthly_limit_nano_cny``（旧 wire 名）兼容保留一个发布周期：单独
         传按面值落同上语义；与 total 同传 → 400 ambiguous_spend_limit；
       - ``ai_access``：bool（缺省 True，与 users.ai_access 列默认一致）。
@@ -5732,6 +5731,13 @@ def admin_v1_invites_create():
                 429, {"Retry-After": str(max(1, int(retry)))})
 
     body = request.get_json(silent=True) or {}
+    # 绑定登录账号只接受 login_id（批次 C 删除 email 兼容入参；旧端点删除时
+    # 本校验随 R3 wave1 迁入）：email 键仍出现说明是旧客户端——显式 400，
+    # 绝不静默降级为不绑定邀请（高风险形态）。
+    if "email" in body:
+        return _admin_v1_error(
+            400, "invalid_request",
+            "email 入参已随批次 C 移除，绑定登录账号请改用 login_id")
     # 批次 D1 13（§4.4）：来源字段退役——接受即 400（不再静默忽略，
     # 防止旧调用方误以为来源仍被记录）
     retired = [k for k in ("source_code", "campaign_id", "cohort")

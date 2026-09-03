@@ -399,7 +399,7 @@ def test_invite_admin_api_login_id_only(monkeypatch):
     check("绑定邀请创建 200", r_bound.status_code == 200)
     try:
         registration_store.redeem_invite(
-            r_bound.get_json()["token"], "someone-else@x.com", PW)
+            r_bound.get_json()["invite"]["token"], "someone-else@x.com", PW)
         redeemed_wrong = True
     except registration_store.InviteRedeemError:
         redeemed_wrong = False

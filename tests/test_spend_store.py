@@ -237,8 +237,6 @@ def test_json_backend_fail_closed():
         lambda: spend_store.reconcile_spend_windows(),
         lambda: spend_store.admin_list_policies(),
         lambda: spend_store.update_policy_limit("spp_x", 1, 1),
-        lambda: spend_store.set_user_override("u1", 1),
-        lambda: spend_store.clear_user_override("u1"),
         lambda: spend_store.adjust_current_window("spw_x", 1, 1),
         lambda: spend_store.set_enforcement_mode("shadow"),
         lambda: spend_store.admin_users_spend_summaries([("user", "u1")]),
@@ -370,26 +368,13 @@ def test_fresh_database_full_migration_to_0023_idempotent():
 # 6. PG：策略解析（§3.1 / §9.2）
 # =========================================================================== #
 @PG
-def test_resolution_default_override_and_fallback():
+def test_resolution_default_and_subject_kinds():
+    """R3 单轨：user_override 写面已删，解析只剩各主体默认策略。"""
     bh.seed_spend_policies()
     _backdate_seed_policies()
-    uid = "usr_resolve_1"
-    # 默认：无覆盖 → user_default
-    p = spend_store.resolve_policy("user", uid)
+    p = spend_store.resolve_policy("user", "usr_resolve_1")
     assert p["policy_id"] == "spp_user_default"
     assert p["limit_nano_cny"] == CNY(SEED_USER_MONTH_CNY)
-    # 覆盖优先
-    override = spend_store.set_user_override(uid, CNY("5"))
-    assert override["scope_type"] == "user_override"
-    p = spend_store.resolve_policy("user", uid)
-    assert p["policy_id"] == override["policy_id"]
-    assert p["limit_nano_cny"] == CNY("5")
-    # 清除 → 回退默认
-    assert spend_store.clear_user_override(uid) is True
-    assert spend_store.resolve_policy("user", uid)["policy_id"] == \
-        "spp_user_default"
-    # 再清一次：无 open 覆盖可收口
-    assert spend_store.clear_user_override(uid) is False
     # demo → 唯一 demo_global；owner → 独立 owner
     assert spend_store.resolve_policy("demo", "cap_whatever")["policy_id"] == \
         "spp_demo_global"
@@ -398,29 +383,13 @@ def test_resolution_default_override_and_fallback():
 
 
 @PG
-def test_resolution_honors_enabled_and_effective_interval():
+def test_resolution_honors_enabled_flag():
+    """enabled=false → 回退/拒绝（R3 单轨后 override 区间用例删除：override
+    写面已退役；策略 effective 区间由 update_policy_limit 收口另测）。"""
     bh.seed_spend_policies()
     _backdate_seed_policies()
     uid = "usr_resolve_2"
-    t0 = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
-    spend_store.set_user_override(uid, CNY("7"), at=t0)
-    # t0 之前：覆盖尚未生效 → 默认
-    assert spend_store.resolve_policy("user", uid, at=t0 - timedelta(
-        seconds=1))["policy_id"] == "spp_user_default"
-    # t0 起生效
-    assert spend_store.resolve_policy("user", uid, at=t0)["limit_nano_cny"] \
-        == CNY("7")
-    # enabled=false → 回退默认（直接 SQL 关闭，模拟管理员禁用）
-    conn = bh.connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE ai_spend_policies SET enabled=false "
-                        "WHERE scope_type='user_override' AND scope_id=%s",
-                        (uid,))
-        conn.commit()
-    finally:
-        conn.close()
-    assert spend_store.resolve_policy("user", uid, at=t0)["policy_id"] == \
+    assert spend_store.resolve_policy("user", uid)["policy_id"] == \
         "spp_user_default"
     # user_default 整体禁用 → user 无有效策略（fail-closed，不落无额度窗口）
     conn = bh.connect()
@@ -493,28 +462,6 @@ def test_policy_update_cas_and_no_retroaction():
     assert w2["window_id"] != w1["window_id"]
     assert w2["limit_nano_snapshot"] == CNY("30")
     assert w2["policy_version"] == 2
-
-
-@PG
-def test_override_cleared_next_window_back_to_default():
-    bh.seed_spend_policies()
-    _backdate_seed_policies()
-    uid = "usr_ov_clear"
-    spend_store.set_user_override(uid, CNY("5"), at=_sh(2026, 8, 10))
-    w_aug = spend_store.get_or_create_window("user", uid,
-                                             at=_sh(2026, 8, 15, 12))
-    assert w_aug["limit_nano_snapshot"] == CNY("5")
-    assert w_aug["policy_id"] != "spp_user_default"
-    spend_store.clear_user_override(uid, at=_sh(2026, 8, 20))
-    # 同月已开窗口不动（snapshot 固定）
-    assert spend_store.get_or_create_window("user", uid,
-                                            at=_sh(2026, 8, 25))["window_id"] \
-        == w_aug["window_id"]
-    # 下个窗口恢复默认
-    w_sep = spend_store.get_or_create_window("user", uid,
-                                             at=_sh(2026, 9, 5))
-    assert w_sep["policy_id"] == "spp_user_default"
-    assert w_sep["limit_nano_snapshot"] == CNY(SEED_USER_MONTH_CNY)
 
 
 @PG
@@ -1000,58 +947,27 @@ def test_set_enforcement_mode_unprotected_config_extensible_check():
 
 
 @PG
-def test_override_tx_variants_commit_with_caller_transaction():
-    """set/clear_user_override_tx 在调用方事务内生效（外部事务组合原语）。"""
-    import pg_store
+def test_admin_users_spend_summaries_batch():
+    """admin_users_spend_summaries（R3 单轨）：user 恒 total 形态（缺行稳定
+    error=spend_total_allowance_missing）、owner 窗口形态、批量混查。"""
     bh.seed_spend_policies()
     conn = bh.connect()
     try:
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
-                p1 = spend_store.set_user_override_tx(
-                    cur, "usr_tx_1", 15 * 10 ** 9, updated_by="tester")
-                p2 = spend_store.set_user_override_tx(
-                    cur, "usr_tx_2", 25 * 10 ** 9, updated_by="tester")
-        assert p1["scope_type"] == "user_override"
-        assert p1["limit_nano_cny"] == 15 * 10 ** 9
-        assert p2["limit_nano_cny"] == 25 * 10 ** 9
-        # 事务回滚路径：tx 内抛错 → 覆盖行不留
-        with pytest.raises(RuntimeError):
-            with pg_store.transaction(conn) as c:
-                with c.cursor() as cur:
-                    spend_store.set_user_override_tx(
-                        cur, "usr_tx_3", 35 * 10 ** 9, updated_by="tester")
-                    raise RuntimeError("boom")
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
-                cleared = spend_store.clear_user_override_tx(
-                    cur, "usr_tx_1", updated_by="tester")
-        assert cleared is True
+        with conn.cursor() as cur:
+            spend_store.create_user_total_allowance_tx(
+                cur, "usr_s_1", 42 * 10 ** 9, source="admin_create")
+        conn.commit()
     finally:
         conn.close()
-    assert spend_store.resolve_policy("user", "usr_tx_1")["scope_type"] \
-        == "user_default"
-    assert spend_store.resolve_policy("user", "usr_tx_2")["scope_type"] \
-        == "user_override"
-    assert spend_store.resolve_policy("user", "usr_tx_3") is None or \
-        spend_store.resolve_policy("user", "usr_tx_3")["scope_type"] \
-        == "user_default"
-
-
-@PG
-def test_admin_users_spend_summaries_batch():
-    """admin_users_spend_summaries：批量窗口 + 默认/覆盖状态 + 单主体降级。"""
-    bh.seed_spend_policies()
-    spend_store.set_user_override("usr_s_1", 42 * 10 ** 9)
     summaries = spend_store.admin_users_spend_summaries(
         [("user", "usr_s_1"), ("user", "usr_s_2"),
          ("owner", "usr_s_owner")])
-    assert summaries["usr_s_1"]["policy_scope"] == "user_override"
-    assert summaries["usr_s_1"]["window"]["subject_type"] == "user"
-    assert summaries["usr_s_1"]["window"]["limit_nano_snapshot"] == \
-        42 * 10 ** 9
-    assert summaries["usr_s_2"]["policy_scope"] == "user_default"
-    assert summaries["usr_s_2"]["window"]["limit_nano_snapshot"] == 20 * 10 ** 9
+    assert summaries["usr_s_1"]["spend_target"] == "total_allowance"
+    assert summaries["usr_s_1"]["total"]["total_limit_nano_cny"] == 42 * 10 ** 9
+    assert summaries["usr_s_1"]["total"]["remaining_nano"] == 42 * 10 ** 9
+    assert summaries["usr_s_2"]["spend_target"] == "total_allowance"
+    assert summaries["usr_s_2"]["error"] == "spend_total_allowance_missing"
+    assert summaries["usr_s_owner"]["spend_target"] == "window"
     assert summaries["usr_s_owner"]["policy_scope"] == "owner"
     assert summaries["usr_s_owner"]["window"]["subject_type"] == "owner"
     assert summaries["usr_s_owner"]["window"]["limit_nano_snapshot"] == \

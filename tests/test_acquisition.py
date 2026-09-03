@@ -471,13 +471,10 @@ def test_visit_rows_are_immutable_events_not_upserted():
 
 @pg_only
 def test_redeem_writes_no_user_acquisition_but_total_allowance():
-    """Batch B §4.4/§Batch B + cutover 契约：兑换与归因解耦——无论触点/UTM/
-    邀请来源如何，兑换成功但 user_acquisition **零新增**；额度面按
-    user_spend_target 分叉：window（cutover 前缺省）带初始额度邀请建等值
-    user_override 过渡策略、不建 allowance 行；切 total 模式后同事务建一次
-    性总额度（source=invite）。"""
-    import _billing_helpers as bh
-    import spend_store
+    """Batch B §4.4/§Batch B + R3 单轨：兑换与归因解耦——无论触点/UTM/邀请
+    来源如何，兑换成功但 user_acquisition **零新增**；额度面恒为一次性总额度：
+    带初始面值邀请同事务建行（source=invite），无面值邀请按 defaults 基线
+    建行；user_override 过渡策略已随单轨删除（恒零新增）。"""
     owner = _mk_owner()
     _seed_campaign("camp-web", "websrc")
     _seed_campaign("camp-inv", "invsrc")
@@ -489,35 +486,21 @@ def test_redeem_writes_no_user_acquisition_but_total_allowance():
                      total_limit_nano_cny=12 * 10 ** 9)
     out = _redeem(inv, "prio1@x.com",
                   acq={"visitor_id": vid, "utm_source": "ignored"})
-    # window（缺省 target）：注册成功、归因零新增；不建 allowance 行，建
-    # 等值 user_override 过渡策略，响应 spend_override_policy 如实带面值
+    # 单轨：注册成功、归因零新增；同事务建 allowance（source=invite）
     assert user_store.get_user_by_login_id("prio1@x.com") is not None
-    assert out["total_allowance"] is None
     assert out["acquisition"] is None  # 兼容键恒 None（退役）
-    assert out["spend_override_policy"] == {"limit_nano_cny": 12 * 10 ** 9}
+    assert out["spend_override_policy"] is None  # 兼容键恒 None（写面已删）
+    assert out["total_allowance"]["limit_nano_cny"] == 12 * 10 ** 9
+    assert out["total_allowance"]["source"] == "invite"
     assert _acq_total() == before
     assert _ua(out["user"]["user_id"]) is None
-    assert _count_override_rows() == 1
-    policy = spend_store.resolve_policy("user", out["user"]["user_id"])
-    assert policy["scope_type"] == "user_override"
-    assert policy["period_kind"] == "calendar_month"
-    assert policy["limit_nano_cny"] == 12 * 10 ** 9
-    # window 无初始额度的邀请：不建任何额度面（不造 dormant 行）
+    assert _count_override_rows() == 0
+    # 无初始面值的邀请：按 defaults 基线（20 CNY）建行
     inv2 = _mk_invite(owner["user_id"])
     out2 = _redeem(inv2, "prio2@x.com", acq={"visitor_id": vid})
-    assert out2["total_allowance"] is None
     assert out2["spend_override_policy"] is None
-    assert _count_override_rows() == 1
-    assert _acq_total() == before
-    # 切 total 模式：带初始额度的邀请同事务建一次性总额度（source=invite）
-    bh.set_user_spend_target("total_allowance")
-    inv3 = _mk_invite(owner["user_id"], campaign_id="camp-inv",
-                      total_limit_nano_cny=12 * 10 ** 9)
-    out3 = _redeem(inv3, "prio3@x.com", acq={"visitor_id": vid})
-    assert out3["total_allowance"]["limit_nano_cny"] == 12 * 10 ** 9
-    assert out3["total_allowance"]["source"] == "invite"
-    assert out3["spend_override_policy"] is None
-    assert _count_override_rows() == 1  # total 模式不再新增 override
+    assert out2["total_allowance"]["limit_nano_cny"] == 20 * 10 ** 9
+    assert _count_override_rows() == 0
     assert _acq_total() == before
 
 
@@ -732,9 +715,10 @@ def test_admin_summary_funnel_reads_frozen_history_only():
 
 @pg_only
 def test_admin_users_endpoint_no_new_attribution_but_masking_kept(monkeypatch):
-    """Batch D1 15/17：acquisition/users 明细端点退役（410）；写路径冻结用
-    数据库行数断言——新注册零归因行；历史归因行（SQL 造的冻结前形态）仍
-    只能经审计工具/SQL 读取（脱敏红线由表结构保证，不再有 API 出口）。"""
+    """Batch D1 15/17 + R3 wave1：acquisition/users 明细端点物理删除（404；
+    410 stub 不留）。写路径冻结用数据库行数断言——新注册零归因行；历史归因
+    行（SQL 造的冻结前形态）只能经审计工具/SQL 读取（脱敏红线由表结构保证，
+    不再有 API 出口）。"""
     _satisfy_preconditions(monkeypatch)
     owner = _mk_owner()
     app_mod.AUTH_ENABLED = True
@@ -749,10 +733,9 @@ def test_admin_users_endpoint_no_new_attribution_but_masking_kept(monkeypatch):
         _mk_invite(owner["user_id"], login_id="Maskme@x.com")["token"],
         "maskme@x.com", "longpassword123", "Masked User",
         acq={"visitor_id": vid})
-    # 明细端点退役：owner 请求稳定 410（不再有任何来源明细出口）
+    # 明细端点物理删除：路由不存在（404）即无任何来源明细出口
     r = client.get("/api/admin/v1/acquisition/users?limit=10")
-    assert r.status_code == 410
-    assert r.get_json()["error"]["code"] == "user_attribution_retired"
+    assert r.status_code == 404
     # 新兑换零归因：直接 SQL 证明明细数据不存在
     assert _ua(out["user"]["user_id"]) is None
     # 历史归因行（冻结前形态）仍可写历史读（表冻结 ≠ 数据消失）

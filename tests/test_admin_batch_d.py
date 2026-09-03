@@ -74,10 +74,9 @@ def _isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
     if BACKEND == "postgres":
         # review R2-F2：PG 上建号/兑换统一走「维护闸 + 开通锁」组合原语，
-        # 闸 fail-closed（platform_settings 缺 ai_dispatch_maintenance 即
-        # 拒绝）。conftest TRUNCATE 清掉 0029 种子，每用例幂等重放
-        # （target=window + 闸=false）；需要其他 target 的用例在用例体内
-        # 再 bh.set_user_spend_target 覆盖。
+        # 闸 fail-closed。conftest TRUNCATE 清掉迁移种子，每用例幂等重放
+        # （0023+0029+0032：闸=false + defaults 物化基线 20 CNY）。R3 单轨后
+        # 无 user_spend_target 可切——user 授权恒 allowance。
         bh.seed_spend_settings()
     yield
 
@@ -468,8 +467,7 @@ def test_window_adjust_lower_than_spent_rejects_next_reserve():
 @PG
 def test_user_total_limit_set_and_restore():
     bh.seed_spend_policies()
-    # cutover 后形态（target=total_allowance）：user 走互斥 total 形态
-    bh.set_user_spend_target("total_allowance")
+    # R3 单轨：user 恒走互斥 total 形态（无 target 可切）
     owner, usera = _setup_users()
     c = _login(_client(), owner)
     # 建号带初始总额度（同一事务建行）
@@ -521,7 +519,7 @@ def test_user_total_limit_set_and_restore():
                   if u["user_id"] == owner["user_id"]][0]
     assert "total" not in owner_item["spend"]
     assert owner_item["spend"]["window"]["limit_nano_snapshot"] is not None
-    # 恢复默认：面值取 user_default 种子 20 CNY（total_defaults 缺行回退）；
+    # 恢复默认：面值取 ai_spend_total_defaults 权威行（20 CNY 基线）；
     # CAS version 沿用当前 version=2
     rd = c.post("/api/admin/v1/spend/users/%s/restore-default" % uid,
                 json={"expected_version": 2})
@@ -572,13 +570,10 @@ def test_user_total_limit_set_and_restore():
 # --------------------------------------------------------------------------- #
 @PG
 def test_users_create_with_monthly_limit_override_atomic():
-    """建号带 total_limit_nano_cny（target=total_allowance）→ 同事务建一次性
-    总额度（source=admin_create，default_version=None；不建 user_override 月
-    策略）；旧 monthly 字段同传 400 ambiguous。window 模式的建号分叉见
-    test_user_creation_spend_target.py。"""
+    """建号带 total_limit_nano_cny → 同事务建一次性总额度（source=admin_create，
+    default_version=None；不建 user_override 月策略——写面已随 R3 单轨删除）；
+    旧 monthly 字段同传 400 ambiguous。"""
     bh.seed_spend_policies()
-    # cutover 后形态：total 模式显式 X 必须建 allowance 行
-    bh.set_user_spend_target("total_allowance")
     owner, _u = _setup_users()
     c = _login(_client(), owner)
     r = c.post("/api/admin/v1/users", json={
@@ -593,7 +588,7 @@ def test_users_create_with_monthly_limit_override_atomic():
     assert allowance["limit_nano_cny"] == 305 * 10 ** 8
     assert allowance["source"] == "admin_create"
     assert allowance["default_version"] is None  # 显式 X 不锚定默认版本
-    # user_override 月策略不再创建（total 模式；window 模式才建过渡 override）
+    # user_override 月策略不再创建（写面已删）
     conn = bh.connect()
     try:
         with conn.cursor() as qcur:
@@ -606,7 +601,7 @@ def test_users_create_with_monthly_limit_override_atomic():
     events = _audit_actions("user.create")
     mine = [e for e in events if e["target_id"] == uid]
     assert mine and mine[0]["detail"]["total_limit_nano_cny"] == 305 * 10 ** 8
-    assert mine[0]["detail"]["spend_target"] == "total_allowance"
+    assert mine[0]["detail"]["spend_target"] == "total_allowance"  # wire 兼容标注
     assert mine[0]["detail"]["limit_surface"] == "total_allowance"
     # 新旧字段同传 → 稳定 400 ambiguous_spend_limit
     r_amb = c.post("/api/admin/v1/users", json={
@@ -626,38 +621,49 @@ def test_users_create_with_monthly_limit_override_atomic():
 
 @PG
 def test_users_create_without_limit_inherits_default():
+    """R3 单轨：无金额建号 → 同事务按 ai_spend_total_defaults 权威行（20 CNY）
+    建 allowance（source=admin_create，default_version 锚定默认行版本）。"""
     bh.seed_spend_policies()
     owner, _u = _setup_users()
     c = _login(_client(), owner)
     r = c.post("/api/admin/v1/users", json={
         "login_id": "inherits@x.com", "password": "password-123456"})
     assert r.status_code == 200
-    # window（cutover 前缺省 target）+ 无金额 = 不建 allowance 行也不建
-    # override（不造 dormant 行；响应 total_allowance=null）
-    assert r.get_json().get("total_allowance") is None
+    # 单轨恒建行：响应携带 total_allowance（默认 20 CNY）
+    assert r.get_json()["total_allowance"]["limit_nano_cny"] == \
+        str(20 * 10 ** 9)
     uid = r.get_json()["user"]["user_id"]
-    assert spend_store.get_total_allowance(uid) is None
-    # 无 allowance 行也照常展示 window 形态（现行授权面）
+    allowance = spend_store.get_total_allowance(uid)
+    assert allowance is not None
+    assert allowance["limit_nano_cny"] == 20 * 10 ** 9
+    assert allowance["source"] == "admin_create"
+    assert allowance["default_version"] is not None  # 锚定默认行版本
+    # users 列表：total 形态（现行唯一授权面）
     item = [u for u in c.get("/api/admin/v1/users").get_json()["items"]
             if u["user_id"] == uid][0]
-    assert "total" not in item["spend"]
-    assert item["spend"]["policy_scope"] == "user_default"
-    assert item["spend"]["window"]["limit_nano_snapshot"] == str(20 * 10 ** 9)
+    assert item["spend"]["spend_target"] == "total_allowance"
+    assert item["spend"]["total"]["total_limit_nano_cny"] == str(20 * 10 ** 9)
+    assert "window" not in item["spend"]
 
 
 @PG
 def test_users_list_spend_total_mode_missing_row_reports_stable_error():
-    """target=total_allowance 且无 allowance 行 → 互斥形态的稳定 error code
+    """user 无 allowance 行 → 互斥形态的稳定 error code
     （spend_total_allowance_missing），不拖垮整页。
 
-    review R2-F2 后「无行 user」的合法构造法：先在 window（cutover 前）建
-    用户、再切 total——R2 单轨化后建号在 total 模式缺默认时直接 fail-closed
-    拒绝（绝不建出无额度行的用户），旧「先切 total 再经 legacy 旁路建无行
-    用户」的前置构造已不存在。这也正是生产 cutover 的时序：切 target 时
-    存量用户尚无 allowance 行。"""
+    R3 单轨后「无行 user」= 数据损坏形态（建号恒建行，正常路径造不出来），
+    用 SQL 直删 allowance 行构造。这也正是 owner 钦定语义：切换后任何 user
+    缺 allowance 都视为数据损坏并 fail-closed。"""
     bh.seed_spend_policies()
     owner, usera = _setup_users()
-    bh.set_user_spend_target("total_allowance")
+    conn = bh.connect()
+    try:
+        with conn.cursor() as qcur:
+            qcur.execute("DELETE FROM ai_spend_total_allowances "
+                         "WHERE subject_id=%s", (usera["user_id"],))
+        conn.commit()
+    finally:
+        conn.close()
     c = _login(_client(), owner)
     items = c.get("/api/admin/v1/users").get_json()["items"]
     by_id = {u["user_id"]: u for u in items}
@@ -665,72 +671,57 @@ def test_users_list_spend_total_mode_missing_row_reports_stable_error():
         "spend_total_allowance_missing"
     assert "window" not in by_id[usera["user_id"]]["spend"]
     assert "total" not in by_id[usera["user_id"]]["spend"]
-    # owner 行不受 target 影响：仍为 window 形态
+    # owner 行恒 window 形态
     assert "total" not in by_id[owner["user_id"]]["spend"]
     assert by_id[owner["user_id"]]["spend"]["window"] is not None
 
 
 @PG
-def test_users_list_spend_display_is_target_driven_four_quadrants():
-    """review 裁定：users 列表 spend 形态**纯由 target 驱动**（展示面与授权面
-    同源同靶），四象限锁定——window+有 allowance 行也必须 window 形态（绝不
-    翻成 total 展示；dormant/legacy 行由 cutover apply 的 existing-row 分支
-    处理，展示面不双轨）。"""
-    import pg_store
+def test_users_list_spend_display_single_track_locked():
+    """R3 单轨形态锁定（取代四象限 target 驱动裁定）：user+有行 → 恒 total
+    形态；user+无行 → 稳定 error（fail-closed 不伪造窗口）；owner/demo 恒
+    window。spend_target 为纯展示标注（user 恒 total_allowance）。"""
     bh.seed_spend_policies()
-    bh.seed_spend_settings()   # target=window（0029 种子）
     owner, usera = _setup_users()
-    # window+有行：直接造一条 dormant allowance 行（cutover 前的 legacy 形态；
-    # source=cutover 须带完整 provenance——0029 CHECK 约束）
+    naked = user_store.create_user("naked@x.com", "userpass123456-xx",
+                                   role="user")
+    # 数据损坏形态：直删 naked 的 allowance 行
     conn = bh.connect()
     try:
-        with pg_store.transaction(conn) as tconn:
-            with tconn.cursor() as cur:
-                spend_store.create_user_total_allowance_tx(
-                    cur, usera["user_id"], 12 * 10 ** 9,
-                    source="cutover", updated_by="pytest-dormant",
-                    cutover_at=datetime.now(timezone.utc),
-                    source_window_id="spw_pytest_dormant",
-                    source_window_version=1)
+        with conn.cursor() as qcur:
+            qcur.execute("DELETE FROM ai_spend_total_allowances "
+                         "WHERE subject_id=%s", (naked["user_id"],))
+        conn.commit()
     finally:
         conn.close()
-    naked = user_store.create_user("naked@x.com", "userpass123456-xx",
-                                   role="user")  # total 象限的无行 user
     c = _login(_client(), owner)
 
     def _spend(uid):
         items = c.get("/api/admin/v1/users").get_json()["items"]
         return {u["user_id"]: u for u in items}[uid]["spend"]
 
-    # 象限 1：window + 有行 → window 形态（有行不许翻 total）
-    spend = _spend(usera["user_id"])
-    assert spend["spend_target"] == "window"
-    assert "total" not in spend and "error" not in spend
-    assert spend["policy_scope"] == "user_default"
-    assert spend["window"]["limit_nano_snapshot"] == str(20 * 10 ** 9)
-    # 象限 2：window + 无行 → window 形态
-    spend = _spend(naked["user_id"])
-    assert spend["spend_target"] == "window"
-    assert "total" not in spend and "error" not in spend
-    assert spend["window"] is not None
-    # 切 total：象限 3：total + 有行 → total 形态
-    bh.set_user_spend_target("total_allowance")
+    # user + 有行 → total 形态
     spend = _spend(usera["user_id"])
     assert spend["spend_target"] == "total_allowance"
-    assert "window" not in spend
-    assert spend["total"]["total_limit_nano_cny"] == str(12 * 10 ** 9)
-    # 象限 4：total + 无行 → 稳定 error（fail-closed，不伪造窗口）
+    assert "window" not in spend and "error" not in spend
+    assert spend["total"]["total_limit_nano_cny"] == str(20 * 10 ** 9)
+    # user + 无行 → 稳定 error（fail-closed，不伪造窗口）
     spend = _spend(naked["user_id"])
     assert spend["spend_target"] == "total_allowance"
     assert spend["error"] == "spend_total_allowance_missing"
     assert "window" not in spend and "total" not in spend
+    # owner 恒 window
+    spend = _spend(owner["user_id"])
+    assert spend["spend_target"] == "window"
+    assert "total" not in spend
+    assert spend["window"] is not None
 
 
 @PG
 def test_users_create_pg_always_atomic_and_total_default_gate():
     """finding 1 建号变体收口：postgres 后端**不带金额字段**也走同事务组合
-    原语——total 模式无默认时 400 total_default_missing（旧旁路会无条件建出
-    无额度行的用户）；window 模式照常 200（total_allowance=null）；
+    原语——R3 单轨后 defaults 表无可用默认时 400 total_default_missing
+    （绝不建出无额度行的用户）；defaults 恢复后照常 200 并建行；
     json 后端保留 legacy 旁路（无金额可建号）。"""
     owner, _u = _setup_users()
     c = _login(_client(), owner)
@@ -741,14 +732,12 @@ def test_users_create_pg_always_atomic_and_total_default_gate():
         assert user_store.get_user_by_login_id("plain@x.com") is not None
         pytest.skip("json 后端 legacy 旁路已验证")
     bh.seed_spend_policies()
-    bh.seed_spend_settings()
-    bh.set_user_spend_target("total_allowance")
-    # 构造「defaults 缺行且 user_default 策略被禁」→ 无可用默认
+    # 构造「defaults 缺行」→ 无可用默认（策略回退已删，唯一来源是 defaults 表）
     conn = bh.connect()
     try:
         with conn.cursor() as cur:
-            cur.execute("UPDATE ai_spend_policies SET enabled=false "
-                        "WHERE policy_id='spp_user_default'")
+            cur.execute("DELETE FROM ai_spend_total_defaults "
+                        "WHERE singleton='global'")
         conn.commit()
     finally:
         conn.close()
@@ -758,24 +747,22 @@ def test_users_create_pg_always_atomic_and_total_default_gate():
     assert r.get_json()["error"]["code"] == "total_default_missing"
     # 整体回滚：不留无额度行的用户
     assert user_store.get_user_by_login_id("gate@x.com") is None
-    # 切回 window：无金额字段照常建号（无 allowance 行、响应 total_allowance=null）
-    bh.set_user_spend_target("window")
+    # defaults 恢复（重放 0032 物化）→ 无金额字段照常建号并按默认建行
+    bh.seed_spend_settings()
     r2 = c.post("/api/admin/v1/users", json={
         "login_id": "plain-pg@x.com", "password": "password-123456"})
     assert r2.status_code == 200, r2.get_data(as_text=True)
-    assert r2.get_json().get("total_allowance") is None
+    assert r2.get_json()["total_allowance"]["limit_nano_cny"] == \
+        str(20 * 10 ** 9)
     assert spend_store.get_total_allowance(
-        r2.get_json()["user"]["user_id"]) is None
+        r2.get_json()["user"]["user_id"]) is not None
 
 
 @PG
 def test_users_create_override_failure_rolls_back_user():
-    """单事务证据：总额度行写入失败 → 用户不创建（§5.1；allowance 注入目标）。
-
-    前置切 total_allowance：window 模式显式 X 走 user_override 过渡策略、
-    不触达 allowance 原语（回滚语义由同一事务机制保证）。"""
+    """单事务证据：总额度行写入失败 → 用户不创建（§5.1；allowance 注入目标，
+    单轨恒触达 allowance 原语）。"""
     bh.seed_spend_policies()
-    bh.set_user_spend_target("total_allowance")
     owner, _u = _setup_users()
     c = _login(_client(), owner)
     orig = spend_store.create_user_total_allowance_tx
@@ -872,12 +859,10 @@ def test_invite_create_with_monthly_limit_template():
 
 @PG
 def test_invite_redeem_creates_total_allowance_same_transaction():
-    """兑换 total 模式带模板面值：同一事务内建一次性总额度（source=invite，
-    default_version=None），不建 user_override；兼容键 acquisition/
-    spend_override_policy 恒 None。window 模式带面值走过渡 override（见
-    test_user_creation_spend_target.py）。"""
+    """兑换带模板面值：同一事务内建一次性总额度（source=invite，
+    default_version=None），不建 user_override（写面已删）；兼容键
+    acquisition/spend_override_policy 恒 None。"""
     bh.seed_spend_policies()
-    bh.set_user_spend_target("total_allowance")
     owner, _u = _setup_users()
     c = _login(_client(), owner)
     r = c.post("/api/admin/v1/invites", json={
@@ -891,7 +876,7 @@ def test_invite_redeem_creates_total_allowance_same_transaction():
     assert result["total_allowance"]["source"] == "invite"
     assert result["total_allowance"]["default_version"] is None
     assert result["acquisition"] is None          # 兼容键恒 None（退役）
-    assert result["spend_override_policy"] is None  # total 模式不建 override
+    assert result["spend_override_policy"] is None  # 兼容键恒 None（写面已删）
     allowance = spend_store.get_total_allowance(uid)
     assert allowance is not None
     assert allowance["limit_nano_cny"] == 15 * 10 ** 9
@@ -915,9 +900,10 @@ def test_invite_redeem_creates_total_allowance_same_transaction():
 
 
 @PG
-def test_invite_without_limit_redeem_window_creates_nothing():
-    """兑换 window 模式（cutover 前缺省 target）无模板面值 → 不建 allowance
-    也不建 override（响应两键皆 None）。"""
+def test_invite_without_limit_redeem_uses_default():
+    """R3 单轨：兑换无模板面值 → 同事务按 ai_spend_total_defaults 权威行
+    （20 CNY）建 allowance（source=invite，default_version 锚定）；兼容键
+    spend_override_policy 恒 None。"""
     bh.seed_spend_policies()
     owner, _u = _setup_users()
     r = registration_store.create_invite(owner["user_id"],
@@ -926,16 +912,18 @@ def test_invite_without_limit_redeem_window_creates_nothing():
         r["token"], "plain@x.com", "password-123456")
     uid = result["user"]["user_id"]
     assert result["spend_override_policy"] is None
-    assert result["total_allowance"] is None  # 无初始额度 → 不建任何额度面
-    assert spend_store.get_total_allowance(uid) is None
+    assert result["total_allowance"]["limit_nano_cny"] == 20 * 10 ** 9
+    allowance = spend_store.get_total_allowance(uid)
+    assert allowance is not None
+    assert allowance["source"] == "invite"
+    assert allowance["default_version"] is not None  # 锚定默认行版本
 
 
 @PG
 def test_invite_redeem_override_failure_rolls_back_everything():
     """单事务证据：总额度写入失败 → 邀请不消费、用户不创建（allowance 注入
-    目标；§5.2）。前置切 total_allowance 命中 allowance 原语。"""
+    目标；§5.2，单轨恒触达 allowance 原语）。"""
     bh.seed_spend_policies()
-    bh.set_user_spend_target("total_allowance")
     owner, _u = _setup_users()
     invite = registration_store.create_invite(
         owner["user_id"], login_id="rb@x.com",
@@ -988,9 +976,11 @@ def test_settings_aggregate_sections_and_decimal_strings():
     # Batch B wave 2（§4.5 设置页）：三键拆分**扁平**进 spend 顶层
     # （金额十进制字符串；user 默认额度附带 CAS 上下文 version/policy_id）
     assert spend["user_default_total_limit_nano_cny"] == str(20 * 10 ** 9)
-    assert spend["user_default_total_limit_source"] == "user_default_policy"
+    # R3 单轨：defaults 行恒在场（迁移/conftest 物化），source 恒
+    # total_defaults，策略回退源已删（policy_id 不再关联）
+    assert spend["user_default_total_limit_source"] == "total_defaults"
     assert int(spend["user_default_total_limit_version"]) >= 1
-    assert spend["user_default_total_policy_id"]
+    assert spend["user_default_total_policy_id"] is None
     assert spend["demo_weekly_limit_nano_cny"] == str(50 * 10 ** 9)
     assert spend["demo_weekly_policy_id"]
     assert spend["owner_monthly_limit_nano_cny"] == str(1000 * 10 ** 9)

@@ -402,22 +402,22 @@ def test_runtime_step_settings_api_and_demo_independence():
 # --------------------------------------------------------------------------- #
 @PG
 def test_user_default_total_limit_endpoint_cas():
-    """settings.get 扁平三键 + CAS 上下文；source=user_default_policy 时
-    专用端点首次写入（expected_version=1）建 ai_spend_total_defaults 行，
-    source 随即切 total_defaults；版本不符 409；非法输入 400。"""
+    """settings.get 扁平三键 + CAS 上下文；R3 单轨后 defaults 行恒在场
+    （迁移/conftest 基线物化，source 恒 total_defaults，策略回退源已删除），
+    CAS 按行版本递增；版本不符 409；非法输入 400。"""
     bh.seed_spend_policies()
     bh.seed_spend_settings()
     owner, _u = _setup_users()
     c = _login(_client(), owner)
 
-    # 缺行：settings.get 的扁平键来自 user_default 策略回退源
+    # 单轨基线：defaults 行恒在场（20 CNY / version 1 / 权威源）
     r = c.get("/api/admin/v1/settings")
     assert r.status_code == 200, r.get_data(as_text=True)
     spend = r.get_json()["spend"]
     assert spend["user_default_total_limit_nano_cny"] == str(20 * 10 ** 9)
-    assert spend["user_default_total_limit_source"] == "user_default_policy"
-    assert int(spend["user_default_total_limit_version"]) >= 1
-    assert spend["user_default_total_policy_id"]
+    assert spend["user_default_total_limit_source"] == "total_defaults"
+    assert int(spend["user_default_total_limit_version"]) == 1
+    assert spend["user_default_total_policy_id"] is None
 
     # 匿名 401 / 非 owner 403
     assert _client().put("/api/admin/v1/spend/user-default-total-limit",
@@ -428,34 +428,34 @@ def test_user_default_total_limit_endpoint_cas():
                   json={"limit_nano_cny": "1",
                         "expected_version": 1}).status_code == 403
 
-    # 行不存在且 expected_version != 1 → 409
+    # 行版本与 expected_version 不符 → 409
     r = c.put("/api/admin/v1/spend/user-default-total-limit",
               json={"limit_nano_cny": str(30 * 10 ** 9),
                     "expected_version": 7})
     assert r.status_code == 409
 
-    # 首次写入（expected_version=1）建行；金额只作开户模板不追溯
+    # CAS 命中（version=1）改写成功；金额只作开户模板不追溯
     r = c.put("/api/admin/v1/spend/user-default-total-limit",
               json={"limit_nano_cny": str(30 * 10 ** 9),
                     "expected_version": 1})
     assert r.status_code == 200, r.get_data(as_text=True)
     out = r.get_json()["user_default_total"]
     assert out["default_limit_nano_cny"] == str(30 * 10 ** 9)
-    assert int(out["version"]) == 1
+    assert int(out["version"]) == 2
 
-    # settings.get 现在反映 total_defaults 权威源
+    # settings.get 仍反映 total_defaults 权威源
     spend = c.get("/api/admin/v1/settings").get_json()["spend"]
     assert spend["user_default_total_limit_nano_cny"] == str(30 * 10 ** 9)
     assert spend["user_default_total_limit_source"] == "total_defaults"
-    assert int(spend["user_default_total_limit_version"]) == 1
+    assert int(spend["user_default_total_limit_version"]) == 2
     assert spend["user_default_total_policy_id"] is None
 
     # CAS 命中续写成功；旧版本 409
     r = c.put("/api/admin/v1/spend/user-default-total-limit",
               json={"limit_nano_cny": str(35 * 10 ** 9),
-                    "expected_version": 1})
+                    "expected_version": 2})
     assert r.status_code == 200
-    assert int(r.get_json()["user_default_total"]["version"]) == 2
+    assert int(r.get_json()["user_default_total"]["version"]) == 3
     r = c.put("/api/admin/v1/spend/user-default-total-limit",
               json={"limit_nano_cny": str(36 * 10 ** 9),
                     "expected_version": 1})
@@ -464,7 +464,7 @@ def test_user_default_total_limit_endpoint_cas():
     # 非法输入：负金额 / 缺版本
     assert c.put("/api/admin/v1/spend/user-default-total-limit",
                  json={"limit_nano_cny": "-1",
-                       "expected_version": 2}).status_code == 400
+                       "expected_version": 3}).status_code == 400
     assert c.put("/api/admin/v1/spend/user-default-total-limit",
                  json={"limit_nano_cny": "1"}).status_code == 400
 

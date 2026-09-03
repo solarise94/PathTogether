@@ -182,6 +182,10 @@ def test_schema_migrations_recorded(conn):
         # ai_safety.platform_task_max_steps / own_task_max_steps_limit 显式
         # 归一为 500 并写审计；§Batch C 实现要求 4）。
         "0031_max_steps_normalize.sql",
+        # R3 Wave1 追加 0032_user_total_allowance_single_track.sql（删
+        # user_spend_target/legacy registration_open 设定行、邀请
+        # monthly→total 回填、user_default 物化为 defaults 权威行）。
+        "0032_user_total_allowance_single_track.sql",
     ]
 
 

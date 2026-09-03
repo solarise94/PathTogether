@@ -109,8 +109,10 @@ def test_audit_record_list_filter_owner_only():
     assert r.status_code == 200
     body = r.get_json()
     assert body["limit"] == 50
-    # R2 起 PG 建号经组合原语会写 user.create 审计（夹具 userA 一条）
-    events = [e for e in body["items"] if e["action"] != "user.create"]
+    # 建号审计（夹具 userA）：R2 起写 user.create，R3 单轨起另写
+    # spend.total_allowance_create（恒建 allowance），均非本用例关注点
+    events = [e for e in body["items"]
+              if e["action"] not in ("user.create", "spend.total_allowance_create")]
     assert len(events) == 2
     assert events[0]["action"] == "user.disable"  # 最新在前
     # action 过滤

@@ -588,11 +588,11 @@ def test_users_row_joins_turn_billing_last_call(monkeypatch):
     assert item["last_ai_call_at"] is not None
     # 批次 D1 14：campaign/source 用户级归因键整键删除
     assert "campaign" not in item and "source" not in item
-    # Batch B wave 2：cutover 前 target=window → 互斥 window 形态
-    assert "total" not in item["spend"]
-    assert item["spend"]["policy_scope"] == "user_default"
-    assert item["spend"]["window"]["limit_nano_snapshot"] is not None
-    assert isinstance(item["spend"]["window"]["limit_nano_snapshot"], str)
+    # R3 单轨：user 授权恒 total 形态（建号即按默认 20 CNY 建 allowance 行；
+    # window 形态仅 owner/demo）
+    assert item["spend"]["spend_target"] == "total_allowance"
+    assert "window" not in item["spend"]
+    assert item["spend"]["total"]["total_limit_nano_cny"] == str(20 * 10 ** 9)
     assert scan_sensitive(r) == []
     # owner 行未开户 → billing null（不伪造）
     r = _login(_client(), owner).get(

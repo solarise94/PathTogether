@@ -203,6 +203,20 @@ def _window_of_hold(call_id):
     return spend_store.get_window(row["spend_window_id"])
 
 
+def _allowance_of_hold(call_id):
+    """R3 单轨：user hold 绑 allowance（spend_window_id 恒 NULL）。"""
+    conn = bh.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT spend_total_allowance_id FROM billing_holds "
+                        "WHERE call_id=%s", (call_id,))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    assert row is not None and row["spend_total_allowance_id"]
+    return row["spend_total_allowance_id"]
+
+
 def _count(table, where="1=1", params=()):
     conn = bh.connect()
     try:
@@ -380,7 +394,7 @@ def test_demo_exhaustion_does_not_affect_user_or_owner():
     with pytest.raises(spend_store.SpendBudgetExhaustedError):
         _authorize(b_demo2, now=T0)
     demo_win = _window_of_hold(b_demo["call_id"])
-    # 注册用户：自己的月窗口（user_default 默认额度），不受 demo 周池影响
+    # 注册用户：自己的一次性总额度（单轨默认 20 CNY），不受 demo 周池影响
     user = user_store.create_user("iso-user@x.com", "pass123456789012")
     u_sess = "sess_user_%s" % uuid.uuid4().hex[:8]
     bh.bind_reservation("req_iso_user", u_sess, "user", user["user_id"])
@@ -390,10 +404,10 @@ def test_demo_exhaustion_does_not_affect_user_or_owner():
     b_user["user_id"] = user["user_id"]
     hu = _authorize(b_user, now=T0)
     assert hu["status"] == "open"
-    u_win = _window_of_hold(b_user["call_id"])
-    assert u_win["subject_type"] == "user"
-    assert u_win["subject_id"] == user["user_id"]
-    assert u_win["window_id"] != demo_win["window_id"]
+    u_allowance_id = _allowance_of_hold(b_user["call_id"])
+    u_allow = spend_store.get_total_allowance(user["user_id"])
+    assert u_allow["allowance_id"] == u_allowance_id
+    assert u_allow["reserved_nano_cny"] is not None
     # owner：独立策略窗口，同样不受影响
     owner = user_store.create_user("iso-owner@x.com", "pass123456789012",
                                    role="owner")
@@ -407,7 +421,7 @@ def test_demo_exhaustion_does_not_affect_user_or_owner():
     assert ho["status"] == "open"
     o_win = _window_of_hold(b_owner["call_id"])
     assert o_win["subject_type"] == "owner"
-    assert o_win["window_id"] not in (demo_win["window_id"], u_win["window_id"])
+    assert o_win["window_id"] != demo_win["window_id"]
     # demo 池仍是唯一被耗尽的窗口
     assert spend_store.get_window(demo_win["window_id"])["reserved_nano_cny"] \
         == est

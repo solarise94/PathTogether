@@ -117,12 +117,11 @@ SPEND_ENFORCEMENT_MODE_KEY = "spend_enforcement_mode"
 SPEND_ENFORCEMENT_MODES = ("shadow", "registered", "all")
 DEFAULT_ENFORCEMENT_MODE = "shadow"
 
-#: §7.3 迁移期兼容开关 legacy_turn_guard_enabled（platform_settings 键）。
-#: **当前不存在该键**（旧 turn 闸恒开、无关闭入口，批次 F 才退役）；写函数
-#: 的无保护配置校验仍读取它并按「缺省 = 闸开」判定，保证未来引入该开关时
-#: 「金额 hard 未就绪 + 旧 turn 闸关闭」的组合在保存时即被拒绝（可扩展形式，
-#: 见 :func:`_assert_not_unprotected_tx`）。
-LEGACY_TURN_GUARD_KEY = "legacy_turn_guard_enabled"
+#: §7.3 迁移期幽灵开关 legacy_turn_guard_enabled（platform_settings 键）已随
+#: R3 Wave2-Compat 删除：该键从未有正式写入口（旧 turn 闸生效与否由
+#: spend_enforcement_mode 按主体派生），其参与的无保护配置校验
+#: （_assert_not_unprotected_tx / UnprotectedSpendConfigError）一并拆除，
+#: 不再读取该键。
 
 #: 策略/窗口 id 前缀（原 _OVERRIDE_ID_PREFIX 随 user_override 写 API 一并
 #: 删除——历史 override 行只读保留，不再产生新行）
@@ -984,63 +983,10 @@ def enforcement_mode() -> str:
 #: spend_enforcement_mode，在 app 层调用点分流（shadow → 全主体 turn 闸开；
 #: registered → 仅 demo 开；all → 全关），不引入新存储键，结构性满足
 #: §7.3「禁止双关」（同主体不会既吃金额硬闸又吃 turn 闸 = 不双重计费）。
-#: 因此 ``legacy_turn_guard_enabled`` 的语义收敛为「金额非硬主体的 turn 闸
-#: 恒开」——由模式推导，reset 两跳（all → shadow 逐级回退）时 turn 闸随
-#: 模式自动恢复，无需独立开关；本键仍无写路径（恒开），保留为防手工 SQL
-#: 误配 ``shadow + legacy_turn_guard_enabled=false``（两道闸全关）的兜底。
-def _legacy_turn_guard_enabled_tx(cur) -> bool:
-    """同事务读旧 turn 闸兼容开关（缺省/非法 → True=闸开）。
-
-    当前平台**没有**任何写 ``legacy_turn_guard_enabled`` 的路径（turn 闸
-    生效与否由 spend_enforcement_mode 按主体派生，见上方批次 F 注释）：
-    本读取只为 §7.3 的无保护配置校验留手工误配兜底。
-    """
-    cur.execute("SELECT value FROM platform_settings WHERE key=%s",
-                (LEGACY_TURN_GUARD_KEY,))
-    row = cur.fetchone()
-    if row is None or row["value"] is None:
-        return True
-    value = row["value"]
-    if isinstance(value, bool):
-        return value
-    _LOG.warning("platform_settings.%s 存量值非法（%r），按闸开处理",
-                 LEGACY_TURN_GUARD_KEY, value)
-    return True
-
-
-class UnprotectedSpendConfigError(SpendError):
-    """§7.3 无保护配置：金额硬闸未就绪且旧 turn 消费闸也已关闭。"""
-
-    code = "unprotected_spend_config"
-
-
-def _assert_not_unprotected_tx(cur, mode):
-    """§7.3 写入前校验：禁止保存「两道消费保护都关闭」的配置。
-
-    可扩展形式（当前与未来的判定口径一致）：
-
-    - ``mode in ("registered", "all")``：金额硬闸至少覆盖注册用户（all 覆盖
-      全部主体）——无论旧 turn 闸状态如何，都存在有效消费保护，放行；
-    - ``mode == "shadow"``：金额硬闸**未就绪**（任何主体都只观测）。此时若
-      旧 turn 消费闸（legacy_turn_guard_enabled）已关闭，则两道闸全部失效
-      ——这正是 §7.3「不能关闭最后一个有效消费保护」的禁止形态，抛
-      :class:`UnprotectedSpendConfigError`（400 语义）。
-
-    当前 ``legacy_turn_guard_enabled`` 键不存在（缺省闸开），所以 shadow
-    总是可保存的；未来引入该开关（批次 F 前的退役步骤）时，本函数无需改动
-    即拒绝 ``shadow + legacy_turn_guard_enabled=false`` 的组合。
-    """
-    if mode in ("registered", "all"):
-        return
-    legacy_guard_on = _legacy_turn_guard_enabled_tx(cur)
-    if not legacy_guard_on:
-        raise UnprotectedSpendConfigError(
-            "无保护配置：金额硬闸未就绪（mode=shadow）且旧 turn 消费闸已"
-            "关闭（legacy_turn_guard_enabled=false）；至少保留一道有效"
-            "消费保护（§7.3）", mode=mode,
-            legacy_turn_guard_enabled=False)
-
-
+#: 旧 turn 闸独立开关 legacy_turn_guard_enabled 从未有正式写入口（幽灵键），
+#: 其参与的「无保护配置」写入校验（原 _assert_not_unprotected_tx /
+#: UnprotectedSpendConfigError）已随 R3 Wave2-Compat 删除：shadow 下全主体
+#: turn 闸由模式派生恒开，「最后一个有效消费保护」结构性不可关闭。
 def set_enforcement_mode(mode, expected=None, *, updated_by=None,
                          actor_user_id=None):
     """写 ``platform_settings.spend_enforcement_mode``（批次 D）。
@@ -1050,8 +996,6 @@ def set_enforcement_mode(mode, expected=None, *, updated_by=None,
     - ``expected``（可选）：CAS 防并发覆盖——与当前值不符抛
       :class:`SpendVersionConflictError`（409 语义）。None = 不做 CAS
       （首个设置者/无人竞争的运维路径）；
-    - §7.3 校验：``_assert_not_unprotected_tx``（见其 docstring；当前旧
-      turn 闸恒开，shadow 总可保存，校验以可扩展形式落地）；
     - 写入与审计（action=``spend.enforcement_mode_update``，detail 只含
       前后模式与操作者标识等非敏感字段）**同一事务**，任一失败整体回滚；
     - 返回 ``{"previous_mode", "mode"}``。
@@ -1073,7 +1017,6 @@ def set_enforcement_mode(mode, expected=None, *, updated_by=None,
                         "enforcement 模式已被他人修改（expected=%r, "
                         "current=%r），请刷新后重试" % (expected, current),
                         expected_mode=expected, current_mode=current)
-                _assert_not_unprotected_tx(cur, mode)
                 if mode != current:
                     cur.execute(
                         "INSERT INTO platform_settings "

@@ -439,20 +439,26 @@ def test_require_admin_auth_fail_closed(tmp_path):
     - owner 身份经 env/secret 引导进数据库，代码不再内置默认用户名（隐私整改）。
     """
     print("== bootstrap 秘密解析 fail-closed ==")
-    login, pw, legacy = app_mod._resolve_bootstrap_config({})
+    login, pw = app_mod._resolve_bootstrap_config({})
     check("无配置 → 未配置（本地开发态）",
-          pw is None and login == "" and legacy is False,
-          "login=%r pw=%r legacy=%r" % (login, pw, legacy))
-    login, pw, legacy = app_mod._resolve_bootstrap_config(
+          pw is None and login == "",
+          "login=%r pw=%r" % (login, pw))
+    login, pw = app_mod._resolve_bootstrap_config(
         {"ADMIN_PASSWORD": "s3cret-password-x"})
-    check("兼容 ADMIN_PASSWORD → 读到秘密且标记 legacy",
-          pw == "s3cret-password-x" and legacy is True,
-          "pw=%r legacy=%r" % (pw, legacy))
-    login, pw, legacy = app_mod._resolve_bootstrap_config(
+    check("一版兼容别名 ADMIN_PASSWORD 已删除（直接忽略，不读秘密）",
+          pw is None and login == "",
+          "login=%r pw=%r" % (login, pw))
+    login, pw = app_mod._resolve_bootstrap_config(
+        {"ADMIN_USERNAME": "legacy_admin",
+         "ADMIN_PASSWORD": "s3cret-password-x"})
+    check("一版兼容别名 ADMIN_USERNAME 已删除（直接忽略）",
+          pw is None and login == "",
+          "login=%r pw=%r" % (login, pw))
+    login, pw = app_mod._resolve_bootstrap_config(
         {"BOOTSTRAP_OWNER_LOGIN_ID": "boss",
          "BOOTSTRAP_OWNER_PASSWORD_FILE": ""})
     check("新变量名不影响无秘密判定",
-          pw is None and login == "boss" and legacy is False)
+          pw is None and login == "boss")
     raised = False
     try:
         app_mod._resolve_bootstrap_config(
@@ -475,11 +481,11 @@ def test_require_admin_auth_fail_closed(tmp_path):
     assert raised
     real = tmp_path / "real.secret"
     real.write_text("  file-secret-12345  \n", encoding="utf-8")
-    login, pw, legacy = app_mod._resolve_bootstrap_config(
+    login, pw = app_mod._resolve_bootstrap_config(
         {"BOOTSTRAP_OWNER_LOGIN_ID": "boss",
          "BOOTSTRAP_OWNER_PASSWORD_FILE": str(real)})
-    check("secret 文件读取成功（strip）且不算 legacy",
-          pw == "file-secret-12345" and login == "boss" and legacy is False,
+    check("secret 文件读取成功（strip）",
+          pw == "file-secret-12345" and login == "boss",
           "pw=%r" % (pw,))
     sentinel = app_mod.ADMIN_PASSWORD_PLACEHOLDER_SENTINEL
     docs = Path(__file__).resolve().parents[1] / "docs" / "demo-deployment.md"
@@ -492,7 +498,7 @@ def test_require_admin_auth_fail_closed(tmp_path):
           app_mod._is_placeholder_admin_password(sentinel) is True)
     ph = tmp_path / "ph.secret"
     ph.write_text(sentinel, encoding="utf-8")
-    _login2, pw2, _legacy2 = app_mod._resolve_bootstrap_config(
+    _login2, pw2 = app_mod._resolve_bootstrap_config(
         {"BOOTSTRAP_OWNER_PASSWORD_FILE": str(ph)})
     check("secret 文件内容为占位符 → 视为未配置", pw2 is None)
     check("尖括号占位符判定",

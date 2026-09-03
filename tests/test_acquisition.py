@@ -40,7 +40,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
 DATA_DIR = _bootstrap.SHARE_DATA_DIR
 UPLOAD_DIR = _bootstrap.UPLOAD_DIR
-os.environ["ADMIN_PASSWORD"] = ""
 import pytest  # noqa: E402
 
 import app as app_mod  # noqa: E402
@@ -116,9 +115,9 @@ def _mk_invite(owner_uid, login_id=None, **kw):
     return registration_store.create_invite(owner_uid, login_id=login_id, **kw)
 
 
-def _redeem(inv, login_id, acq=None):
+def _redeem(inv, login_id):
     return registration_store.redeem_invite(
-        inv["token"], login_id, "longpassword123", acq=acq)
+        inv["token"], login_id, "longpassword123")
 
 
 # =========================================================================== #
@@ -484,12 +483,9 @@ def test_redeem_writes_no_user_acquisition_but_total_allowance():
     before = _acq_total()
     inv = _mk_invite(owner["user_id"], campaign_id="camp-inv",
                      total_limit_nano_cny=12 * 10 ** 9)
-    out = _redeem(inv, "prio1@x.com",
-                  acq={"visitor_id": vid, "utm_source": "ignored"})
+    out = _redeem(inv, "prio1@x.com")
     # 单轨：注册成功、归因零新增；同事务建 allowance（source=invite）
     assert user_store.get_user_by_login_id("prio1@x.com") is not None
-    assert out["acquisition"] is None  # 兼容键恒 None（退役）
-    assert out["spend_override_policy"] is None  # 兼容键恒 None（写面已删）
     assert out["total_allowance"]["limit_nano_cny"] == 12 * 10 ** 9
     assert out["total_allowance"]["source"] == "invite"
     assert _acq_total() == before
@@ -497,8 +493,7 @@ def test_redeem_writes_no_user_acquisition_but_total_allowance():
     assert _count_override_rows() == 0
     # 无初始面值的邀请：按 defaults 基线（20 CNY）建行
     inv2 = _mk_invite(owner["user_id"])
-    out2 = _redeem(inv2, "prio2@x.com", acq={"visitor_id": vid})
-    assert out2["spend_override_policy"] is None
+    out2 = _redeem(inv2, "prio2@x.com")
     assert out2["total_allowance"]["limit_nano_cny"] == 20 * 10 ** 9
     assert _count_override_rows() == 0
     assert _acq_total() == before
@@ -514,15 +509,12 @@ def test_expired_visits_and_tampered_visitor_are_ignored_frozen():
     _expire_all_visits()
     before = _acq_total()
     inv = _mk_invite(owner["user_id"])
-    out = _redeem(inv, "exp@x.com", acq={"visitor_id": vid})
-    assert out["acquisition"] is None
+    out = _redeem(inv, "exp@x.com")
     assert _acq_total() == before
     # visitor 不匹配（另一访客）同样无关紧要——不读取
     other = acq_store.new_visitor_id()
     assert other != vid
-    out2 = _redeem(_mk_invite(owner["user_id"]), "tamper@x.com",
-                   acq={"visitor_id": other})
-    assert out2["acquisition"] is None
+    out2 = _redeem(_mk_invite(owner["user_id"]), "tamper@x.com")
     assert _acq_total() == before
 
 
@@ -538,8 +530,7 @@ def test_redeem_succeeds_even_if_acquisition_store_broken(monkeypatch):
 
     monkeypatch.setattr(acq_store, "insert_user_acquisition", _boom)
     out = registration_store.redeem_invite(inv["token"], "boom@x.com",
-                                           "longpassword123",
-                                           acq={"utm_source": "x"})
+                                           "longpassword123")
     assert user_store.get_user_by_login_id("boom@x.com") is not None
     row = registration_store.get_invite(inv["invite_id"])
     assert row["use_count"] == 1 and row["consumed_at"] is not None
@@ -731,8 +722,7 @@ def test_admin_users_endpoint_no_new_attribution_but_masking_kept(monkeypatch):
     last = acq_store.record_visit(visitor_id=vid, source_code="s2")
     out = registration_store.redeem_invite(
         _mk_invite(owner["user_id"], login_id="Maskme@x.com")["token"],
-        "maskme@x.com", "longpassword123", "Masked User",
-        acq={"visitor_id": vid})
+        "maskme@x.com", "longpassword123", "Masked User")
     # 明细端点物理删除：路由不存在（404）即无任何来源明细出口
     r = client.get("/api/admin/v1/acquisition/users?limit=10")
     assert r.status_code == 404

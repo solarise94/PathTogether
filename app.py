@@ -58,8 +58,8 @@ import slide_io
 import user_store
 # PT-1 数据层（docs demo-access-auth-ui-design §4.3/§7.3/§9.5）：
 # platform_features 判定 PG 前置条件；settings_store 提供 registration_mode
-# 运行时权威读取（PG platform_settings；旧布尔 registration_open 已 fail-closed
-# 迁移为 closed，P0-B docs §4.1）。
+# 运行时权威读取（PG platform_settings；旧布尔 registration_open 开关已随
+# 0032/Wave2-Compat 删除，mode 键缺行直接降级 closed，P0-B docs §4.1）。
 import platform_features
 import settings_store
 # PT-3 平台 AI 预算接线（docs §4.1/§4.2/§5.3/§9.4）：budget_store 提供 PG 原子
@@ -215,8 +215,8 @@ SHARE_BASE_URL = os.environ.get(
 #     任一不满足即拒绝启动（fail-closed）；
 #   - BOOTSTRAP_OWNER_LOGIN_ID / BOOTSTRAP_OWNER_PASSWORD_FILE：首建引导
 #     （secret 文件被显式指定但不存在/为空 → 拒绝启动）；
-#   - ADMIN_USERNAME / ADMIN_PASSWORD：一版兼容别名（deprecated，仅空库首建时
-#     读取并告警一次）。
+#   - 一版兼容别名 ADMIN_USERNAME / ADMIN_PASSWORD 已随 R3 Wave2-Compat 删除
+#     （不再有任何读取路径；部署配置残留旧变量时会被直接忽略）。
 # 数据库已有 owner 时任何 bootstrap 秘密都只告警、绝不参与对账/改密
 # （旧「env 密码覆盖 DB hash」行为已删除，docs §2.1/§5.2）。
 # 与 docs/demo-deployment.md 中 admin.env 示例的 sentinel 完全一致；
@@ -261,30 +261,23 @@ def _read_bootstrap_password_file(path):
 
 
 def _resolve_bootstrap_config(environ=None):
-    """解析 bootstrap 引导配置。返回 (login_id, password, legacy_used)。
+    """解析 bootstrap 引导配置。返回 (login_id, password)。
 
-    - password 优先读 BOOTSTRAP_OWNER_PASSWORD_FILE，缺省回退一版兼容的
-      ADMIN_PASSWORD；login_id 同理（BOOTSTRAP_OWNER_LOGIN_ID → ADMIN_USERNAME）；
-    - 占位符形态（sentinel / <...>）视为未配置（password=None）；
-    - legacy_used 表示读取了 ADMIN_* 兼容名（调用方据此记 deprecated 告警）；
+    - password 读 BOOTSTRAP_OWNER_PASSWORD_FILE（文件路径语义；内容为占位符
+      形态 sentinel / <...> 视为未配置，password=None）；login_id 读
+      BOOTSTRAP_OWNER_LOGIN_ID。一版兼容名 ADMIN_USERNAME / ADMIN_PASSWORD
+      已随 R3 Wave2-Compat 删除，不再有回退读取；
     - 本函数只取值不落库，environ 可注入，便于单测。
     """
     env = os.environ if environ is None else environ
-    login_id = (env.get("BOOTSTRAP_OWNER_LOGIN_ID")
-                or env.get("ADMIN_USERNAME") or "").strip()
+    login_id = (env.get("BOOTSTRAP_OWNER_LOGIN_ID") or "").strip()
     pw_file = (env.get("BOOTSTRAP_OWNER_PASSWORD_FILE") or "").strip()
-    legacy_pw = (env.get("ADMIN_PASSWORD") or "").strip()
-    legacy_used = bool(login_id and not (
-        env.get("BOOTSTRAP_OWNER_LOGIN_ID") or "").strip()) or \
-        bool(legacy_pw and not pw_file)
     password = None
     if pw_file:
         password = _read_bootstrap_password_file(pw_file)
-    elif legacy_pw and not _is_placeholder_admin_password(legacy_pw):
-        password = legacy_pw
-    if password is not None and _is_placeholder_admin_password(password):
-        password = None  # secret 文件内容是占位符：视为未配置
-    return login_id, password, legacy_used
+        if _is_placeholder_admin_password(password):
+            password = None  # secret 文件内容是占位符：视为未配置
+    return login_id, password
 
 
 def _validate_owner_hash_or_exit(owner):
@@ -325,7 +318,7 @@ def _resolve_owner_at_startup(environ=None):
             "（当前 %r）：json/dual 不提供生产认证的一致性保证，拒绝启动。"
             % backend)
 
-    login_id, password, legacy_used = _resolve_bootstrap_config(env)
+    login_id, password = _resolve_bootstrap_config(env)
 
     # 1) 解析 enabled owner 集合（DB 异常 fail-fast）
     try:
@@ -351,10 +344,10 @@ def _resolve_owner_at_startup(environ=None):
                 "[startup] 解析 primary owner 失败（%s）：请检查用户库后重启。"
                 % exc) from exc
         # 已有 owner：bootstrap 秘密一律忽略（不对账、不覆盖密码），仅告警
-        if password is not None or legacy_used:
+        if password is not None:
             app.logger.warning(
-                "数据库已有 owner，BOOTSTRAP/ADMIN_* 引导配置被忽略"
-                "（deprecated：不对账、不覆盖密码）；请从部署配置中移除。")
+                "数据库已有 owner，BOOTSTRAP_OWNER_* 引导配置被忽略"
+                "（不对账、不覆盖密码）；请从部署配置中移除。")
         _validate_owner_hash_or_exit(owner)
         return owner
 
@@ -381,12 +374,7 @@ def _resolve_owner_at_startup(environ=None):
         if not login_id:
             raise SystemExit(
                 "[startup] 提供 bootstrap 秘密但缺少登录账号：请设置 "
-                "BOOTSTRAP_OWNER_LOGIN_ID（或兼容的 ADMIN_USERNAME）后重启。")
-        if legacy_used:
-            app.logger.warning(
-                "ADMIN_USERNAME/ADMIN_PASSWORD 已 deprecated：仅在空库首建 "
-                "owner 时作为兼容别名读取；请迁移到 BOOTSTRAP_OWNER_LOGIN_ID "
-                "/ BOOTSTRAP_OWNER_PASSWORD_FILE。")
+                "BOOTSTRAP_OWNER_LOGIN_ID 后重启。")
         try:
             user_store.create_bootstrap_owner(login_id, password)
         except user_store.OwnerInvariantError as exc:
@@ -426,7 +414,7 @@ def _resolve_owner_at_startup(environ=None):
     if require_auth:
         raise SystemExit(
             "[startup] REQUIRE_ADMIN_AUTH=1 但用户库为空且未提供 bootstrap "
-            "秘密（BOOTSTRAP_OWNER_PASSWORD_FILE 或兼容的 ADMIN_PASSWORD）："
+            "秘密（BOOTSTRAP_OWNER_LOGIN_ID + BOOTSTRAP_OWNER_PASSWORD_FILE）："
             "拒绝以无 owner 的认证态启动。")
     app.logger.info(
         "[startup] 本地免认证开发态：无 owner、无 bootstrap 秘密"
@@ -2752,9 +2740,9 @@ def register():
         return _register_form_error(form_error, "invalid")
 
     # 原子兑换（docs §4.3）：失败统一文案（无细分状态），计数到限流桶。
-    # 批次 D1 13 / Batch B wave 2（§4.4）：注册兑换**不再读取** pt_acq
+    # 批次 D1 13 / Batch B wave 2（§4.4）：注册兑换**不读取** pt_acq
     # cookie、Referer 或 UTM——兑换事务与来源上下文彻底解耦（站点统计故障
-    # 绝不能阻断注册）；redeem_invite 的 acq 参数已退役，不再传。
+    # 绝不能阻断注册）；redeem_invite 的 acq 形参已随 R3 Wave2-Compat 物理删除。
     try:
         result = registration_store.redeem_invite(
             invite_token, login_id, password, display_name or None)
@@ -4111,8 +4099,8 @@ def _archived_slide_names():
 # owner 用户管理（Stage 3a 身份基础；P0-B 起注册模式为 registration_mode）
 # --------------------------------------------------------------------------- #
 # 注册模式（docs §4.1，P0-B）：settings_store.get_registration_mode 为运行时权威
-# （PG platform_settings；旧布尔 registration_open=true 已 fail-closed 迁移为
-# closed，不自动映射为 invite_only/public）。模式生效还需通过 §3.2 末段的前置
+# （PG platform_settings；旧布尔 registration_open 开关已随 0032/Wave2-Compat
+# 删除，mode 键缺行直接降级 closed，不放大注册面）。模式生效还需通过 §3.2 末段的前置
 # 条件闸（HTTPS / Secure Cookie / postgres），未满足一律按 closed 处理并告警。
 # --------------------------------------------------------------------------- #
 def _registration_mode_stored() -> str:
@@ -4223,10 +4211,9 @@ def _registration_invite_owner_hash():
 
 
 #: 批次 D1（§4.4）：邀请不再携带来源——owner API 视图删除的退役键
-#:（列保留只读历史行；新邀请行三列为空/NULL，见 registration_store）
-_INVITE_RETIRED_VIEW_FIELDS = ("cohort", "source_code", "campaign_id",
-                               "monthly_limit_nano_cny", "acq",
-                               "spend_override_policy")
+#:（列保留只读历史行；新邀请行三列为空/NULL，见 registration_store。
+#: 旧 monthly_limit_nano_cny 键已随 R3 Wave2-Compat 从 SELECT 一并移除）
+_INVITE_RETIRED_VIEW_FIELDS = ("cohort", "source_code", "campaign_id")
 
 
 def _invite_public_view(invite: dict) -> dict:
@@ -4238,8 +4225,8 @@ def _invite_public_view(invite: dict) -> dict:
 
     批次 D1（§4.4）/ Batch B wave 2：视图删除 source_code/campaign_id/cohort
     回显（邀请只负责注册，不携带来源）；初始金额字段改用
-    ``total_limit_nano_cny``（monthly_limit_nano_cny 旧键一并从视图移除，
-    旧列面值已由 store 按总额度兑现）。
+    ``total_limit_nano_cny``（monthly_limit_nano_cny 旧键已随 R3 Wave2-Compat
+    从视图与 store SELECT 一并移除）。
     """
     now = time.time()
     out = dict(invite)
@@ -4818,10 +4805,8 @@ _ADMIN_V1_NANO_OUT_KEYS = frozenset((
     "expected_reserved_nano", "actual_reserved_nano", "reserved_drift_nano",
     "previous_limit_nano_snapshot", "new_limit_nano_snapshot",
     "estimated_nano", "actual_nano",
-    # 批次 D（§5.1/§5.2）：用户月额度覆盖与邀请码月额度模板（nano-CNY，
-    # 库内 BIGINT → wire 十进制字符串）
-    "monthly_limit_nano_cny",
-    # 批次 B wave 2（§Batch B API/bridge 契约）：一次性总额度形态与邀请
+    # 批次 D（§5.1/§5.2）原用户月额度/邀请月额度模板键已随 R3 Wave2-Compat
+    # 退役；批次 B wave 2（§Batch B API/bridge 契约）：一次性总额度形态与邀请
     # total 模板、三键拆分的 spend 设置值（同样 BIGINT → 十进制字符串）
     "total_limit_nano_cny", "opening_spent_nano_cny",
     "default_limit_nano_cny", "user_default_total_limit_nano_cny",
@@ -5472,9 +5457,9 @@ def admin_v1_users_create():
         行——显式 X 按面值（source=admin_create），无 X 解析
         ai_spend_total_defaults 权威默认，皆缺 → 400 ``total_default_missing``
         （绝不建出无额度行的用户；缺行 = 数据损坏 fail-closed）；
-      - ``monthly_limit_nano_cny``（旧 wire 名）兼容保留一个发布周期：单独
-        传按面值落同上语义；与 total 同传 → 400 ambiguous_spend_limit；
       - ``ai_access``：bool（缺省 True，与 users.ai_access 列默认一致）。
+    旧 wire 名 ``monthly_limit_nano_cny`` 已随 R3 Wave2-Compat 退役：body 带
+    该键一律 400 ``retired_spend_field``（绝不静默忽略）。
     带金额字段时要求 PG（json/dual 稳定 503，不降级）。
     """
     auth = _require_owner_admin_v1()
@@ -5503,20 +5488,17 @@ def admin_v1_users_create():
     if ai_access is not None and not isinstance(ai_access, bool):
         return _admin_v1_error(400, "invalid_request",
                                "ai_access 需为布尔值")
-    # 金额 wire：只接受 ^-?[0-9]{1,19}$ 十进制字符串（JSON number 一律 400）；
-    # Batch B：total（新）与 monthly（旧兼容名）同传 → 稳定 400 ambiguous
-    if body.get("monthly_limit_nano_cny") is not None \
-            and body.get("total_limit_nano_cny") is not None:
+    # R3 Wave2-Compat：旧月额度字段退役——body 带该键一律 400（与来源字段
+    # retired_invite_field 同模式，绝不静默忽略）
+    if body.get("monthly_limit_nano_cny") is not None:
         return _admin_v1_error(
-            400, "ambiguous_spend_limit",
-            "monthly_limit_nano_cny 与 total_limit_nano_cny 只能传其一"
-            "（旧月额度字段已退役，请在兼容期内只传 total_limit_nano_cny）")
+            400, "retired_spend_field",
+            "monthly_limit_nano_cny 已退役（R3 单轨为一次性总额度）："
+            "请改用 total_limit_nano_cny")
+    # 金额 wire：只接受 ^-?[0-9]{1,19}$ 十进制字符串（JSON number 一律 400）
     try:
         total_limit = _admin_v1_amount_in(
-            body.get("total_limit_nano_cny")
-            if body.get("total_limit_nano_cny") is not None
-            else body.get("monthly_limit_nano_cny"),
-            "total_limit_nano_cny")
+            body.get("total_limit_nano_cny"), "total_limit_nano_cny")
     except ValueError as exc:
         return _admin_v1_error(400, "invalid_request", str(exc))
 
@@ -5556,8 +5538,6 @@ def admin_v1_users_create():
                                "系统维护中（cutover），暂禁止建号；请稍后重试")
     except ValueError as e:
         msg = str(e)
-        if "ambiguous_spend_limit" in msg:
-            return _admin_v1_error(400, "ambiguous_spend_limit", msg)
         if "total_default_missing" in msg:
             return _admin_v1_error(400, "total_default_missing", msg)
         if "已存在" in msg:
@@ -5707,8 +5687,8 @@ def admin_v1_invites_create():
     模型 6 / §Batch D1 13）：可选 ``total_limit_nano_cny``（十进制字符串
     nano-CNY | null=不建额度行，兑换用户由 cutover/默认处理）——兑换事务内
     为新用户建一次性总额度（registration_store，source="invite"；不再建
-    user_override）。旧 ``monthly_limit_nano_cny`` 单独传兼容一个发布周期
-    （面值按总额度兑现）；与 total 同传 → 400 ambiguous_spend_limit。
+    user_override）。旧 ``monthly_limit_nano_cny`` 已随 R3 Wave2-Compat 退役：
+    body 带该键一律 400 retired_spend_field（绝不静默忽略）。
     邀请不再携带来源：``source_code``/``campaign_id``/``cohort`` 出现在
     body 一律 400 retired_invite_field（D1 13；§4.4）。
     """
@@ -5747,12 +5727,11 @@ def admin_v1_invites_create():
             400, "retired_invite_field",
             "邀请不再携带来源字段：%s（§4.4 邀请与来源解耦）"
             % ", ".join(sorted(retired)))
-    if body.get("monthly_limit_nano_cny") is not None \
-            and body.get("total_limit_nano_cny") is not None:
+    if body.get("monthly_limit_nano_cny") is not None:
         return _admin_v1_error(
-            400, "ambiguous_spend_limit",
-            "monthly_limit_nano_cny 与 total_limit_nano_cny 只能传其一"
-            "（旧月额度字段已退役，请在兼容期内只传 total_limit_nano_cny）")
+            400, "retired_spend_field",
+            "monthly_limit_nano_cny 已退役（R3 单轨为一次性总额度）："
+            "请改用 total_limit_nano_cny")
     login_id = body.get("login_id")
     if login_id is not None:
         login_id = str(login_id).strip()
@@ -5779,14 +5758,10 @@ def admin_v1_invites_create():
     if note is not None and (not isinstance(note, str) or len(note) > 200):
         return _admin_v1_error(400, "invalid_request",
                                "note 需为 ≤200 字符的字符串")
-    # Batch B wave 2：初始**总额度**模板（十进制字符串 nano-CNY | null=不建行）；
-    # 旧 monthly 字段单独传按面值兼容落总额度（store 语义）
+    # Batch B wave 2：初始**总额度**模板（十进制字符串 nano-CNY | null=不建行）
     try:
         total_limit = _admin_v1_amount_in(
-            body.get("total_limit_nano_cny")
-            if body.get("total_limit_nano_cny") is not None
-            else body.get("monthly_limit_nano_cny"),
-            "total_limit_nano_cny")
+            body.get("total_limit_nano_cny"), "total_limit_nano_cny")
     except ValueError as exc:
         return _admin_v1_error(400, "invalid_request", str(exc))
 
@@ -5799,10 +5774,7 @@ def admin_v1_invites_create():
             note=note or "",
             total_limit_nano_cny=total_limit)
     except ValueError as exc:
-        msg = str(exc)
-        code = ("ambiguous_spend_limit"
-                if "ambiguous_spend_limit" in msg else "invalid_request")
-        return _admin_v1_error(400, code, msg)
+        return _admin_v1_error(400, "invalid_request", str(exc))
     except platform_features.PgFeatureUnavailable:
         return _admin_v1_pg_required()
     except registration_store.RegistrationStoreError as exc:
@@ -6001,8 +5973,6 @@ def _admin_v1_spend_error_response(exc):
     status = 400
     if isinstance(exc, spend_store.SpendVersionConflictError):
         status = 409
-    elif isinstance(exc, spend_store.UnprotectedSpendConfigError):
-        status = 400
     elif isinstance(exc, (spend_store.SpendPolicyMissingError,
                           spend_store.SpendWindowUnavailableError)):
         status = 404
@@ -6057,9 +6027,9 @@ def admin_v1_spend_enforcement_mode():
 
     - ``expected`` 为 CAS 位：与当前模式不符 → 409 version_conflict（防两个
       管理员并发覆盖）；
-    - §7.3 校验：保存前拒绝「金额硬闸未就绪（shadow）且旧 turn 消费闸也已
-      关闭」的无保护配置（当前 legacy_turn_guard_enabled 键不存在=闸恒开，
-      校验以可扩展形式落地，见 spend_store._assert_not_unprotected_tx）；
+    - §7.3「禁止无保护配置」由模式派生结构性保证（shadow 下全主体 turn 闸
+      恒开；旧 legacy_turn_guard_enabled 幽灵键校验已随 R3 Wave2-Compat
+      删除）；
     - 写入与 audit（spend.enforcement_mode_update）同一事务；
     - **运维门槛**：registered/all 只应在批次 C2 验收（§11 门）之后由 owner
       手工切换；端点本身不做批次判定（文档化而非硬编码——回滚到 shadow

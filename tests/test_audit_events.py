@@ -28,7 +28,6 @@ import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest
 DATA_DIR = _bootstrap.SHARE_DATA_DIR
 UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 os.environ["AI_INTERNAL_TOKEN"] = "test-internal-token"
-os.environ["ADMIN_PASSWORD"] = ""  # 默认无 owner 引导；各用例手动建用户
 from pg_compat import BACKEND  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402

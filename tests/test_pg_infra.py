@@ -186,6 +186,10 @@ def test_schema_migrations_recorded(conn):
         # user_spend_target/legacy registration_open 设定行、邀请
         # monthly→total 回填、user_default 物化为 defaults 权威行）。
         "0032_user_total_allowance_single_track.sql",
+        # R3 Wave2-Compat 追加 0033_drop_invite_monthly_limit.sql（物理删除
+        # registration_invites.monthly_limit_nano_cny 旧列：0032 已回填面值、
+        # Wave1 代码停读、Wave2 删除 monthly 形参与 SELECT 列）。
+        "0033_drop_invite_monthly_limit.sql",
     ]
 
 

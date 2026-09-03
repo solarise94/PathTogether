@@ -8,7 +8,7 @@
   - PG 数据层（仅 RUN_PG_TESTS=1）：token 只存 hash、明文只在创建返回一次；
     无/随机/过期/撤销/已消费统一失败；邮箱规范化与不匹配；20 路并发兑换仅一个
     成功；邮箱唯一冲突时邀请码未消费；token 不出现在列表/审计/异常文本；
-    旧布尔 registration_open=true 的 fail-closed 迁移；owner 管理 API。
+    旧布尔 registration_open 开关已删（mode 键缺行降级 closed）；owner 管理 API。
 """
 import os
 import sys
@@ -23,7 +23,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
 DATA_DIR = _bootstrap.SHARE_DATA_DIR
 UPLOAD_DIR = _bootstrap.UPLOAD_DIR
-os.environ["ADMIN_PASSWORD"] = ""
 import pytest  # noqa: E402
 
 import share_store  # noqa: E402
@@ -620,10 +619,9 @@ def test_register_route_whitespace_password_rejected(monkeypatch):
 
 
 @pg_only
-def test_legacy_registration_open_true_fails_closed(monkeypatch):
-    """§4.1：旧布尔 true 不自动映射为开放模式；读取即固化 closed。"""
-    settings_store.set_setting(settings_store.REGISTRATION_OPEN_KEY, True,
-                               updated_by="test")
+def test_registration_mode_missing_row_fails_closed(monkeypatch):
+    """§4.1 + R3 Wave2-Compat：旧布尔 registration_open 开关已删除——mode 键
+    缺行直接降级 closed 并 bootstrap 回写（fail-closed，不读任何旧键）。"""
     mode = settings_store.get_registration_mode()
     assert mode == "closed"
     # 固化后 PG 权威为 closed；owner 显式切 invite_only 才能开放
@@ -686,11 +684,12 @@ def test_create_invite_retired_source_fields_ignored_not_written():
         conn.close()
     assert not ({"source_code", "campaign_id", "cohort", "acq",
                  "campaign_bound"} & set(detail))
-    # 新字段：total_limit_nano_cny 落列；新旧同传稳定 ambiguous_spend_limit
+    # 新字段：total_limit_nano_cny 落列；旧 monthly 形参已物理删除
+    # （R3 Wave2-Compat；传入即 TypeError）
     inv2 = registration_store.create_invite(
         owner["user_id"], login_id="sc2@x.com", total_limit_nano_cny=10 ** 9)
     assert inv2["total_limit_nano_cny"] == 10 ** 9
-    with pytest.raises(ValueError, match="ambiguous_spend_limit"):
+    with pytest.raises(TypeError):
         registration_store.create_invite(
             owner["user_id"], login_id="sc3@x.com",
             monthly_limit_nano_cny=10 ** 9, total_limit_nano_cny=10 ** 9)
@@ -737,15 +736,16 @@ def test_invite_list_exposes_source_campaign_and_owner_api(monkeypatch):
 @pg_only
 def test_redeem_writes_no_user_acquisition_but_allowance():
     """Batch B：兑换不再写 user_acquisition（归因写路径冻结）；R3 Wave1-Money
-    单轨后无初始额度的邀请也**恒建** allowance 行（defaults 默认解析），
-    spend_override_policy 兼容键恒 None。"""
+    单轨后无初始额度的邀请也**恒建** allowance 行（defaults 默认解析）；
+    恒 None 兼容键 acquisition/spend_override_policy 已随 R3 Wave2-Compat
+    物理删除（不在返回 dict 中）。"""
     owner = _mk_owner()
     inv = registration_store.create_invite(owner["user_id"],
                                            login_id="legacy@x.com")
     out = registration_store.redeem_invite(inv["token"], "legacy@x.com",
                                            "pass123456789012")
-    assert out["acquisition"] is None            # 兼容键恒 None（退役）
-    assert out["spend_override_policy"] is None  # 兼容键恒 None（单轨）
+    assert "acquisition" not in out              # 兼容键已物理删除
+    assert "spend_override_policy" not in out    # 兼容键已物理删除
     assert out["total_allowance"] is not None    # 无面值 → defaults 解析建行
     assert out["total_allowance"]["source"] == "invite"
     conn = _pg_conn()

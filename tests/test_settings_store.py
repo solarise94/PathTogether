@@ -3,9 +3,10 @@
 
 两段：
   - json/dual 行为（双模式都跑，后端用 monkeypatch 模拟）：不可写、读取
-    fallback env、get_registration_open 读 REGISTRATION_OPEN；
-  - PG 行为（仅 RUN_PG_TESTS=1）：UPSERT 读写、registration_open 的
-    「PG 有值优先 / env 只作 bootstrap 并回写」解析顺序。
+    fallback default（旧布尔 registration_open 开关与 REGISTRATION_OPEN env
+    bootstrap 已随 R3 Wave2-Compat 删除）；
+  - PG 行为（仅 RUN_PG_TESTS=1）：UPSERT 读写、CAS、registration_mode 解析
+    （mode 键缺行 → fail-closed bootstrap closed）。
 
 PG 侧表由 conftest 每用例 TRUNCATE（platform_settings 在清单内）。
 """
@@ -22,7 +23,7 @@ pg_only = pytest.mark.skipif(
 
 
 # --------------------------------------------------------------------------- #
-# json/dual：不可写 + env fallback（上层 fail-closed 判定依据）
+# json/dual：不可写 + fallback default（上层 fail-closed 判定依据）
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("backend", ["json", "dual"])
 def test_settings_not_writable_on_json_and_dual(monkeypatch, backend):
@@ -34,27 +35,17 @@ def test_settings_not_writable_on_json_and_dual(monkeypatch, backend):
 def test_set_setting_fail_closed_on_json_and_dual(monkeypatch, backend):
     monkeypatch.setattr(platform_features, "STORAGE_BACKEND", backend)
     with pytest.raises(platform_features.PgFeatureUnavailable):
-        settings_store.set_setting("registration_open", True)
+        settings_store.set_setting("k_bool", True)
 
 
 def test_get_setting_returns_default_on_json_backend(monkeypatch):
     monkeypatch.setattr(platform_features, "STORAGE_BACKEND", "json")
-    assert settings_store.get_setting("registration_open", default="v") == "v"
-    assert settings_store.get_setting("registration_open") is None
-
-
-@pytest.mark.parametrize("backend", ["json", "dual"])
-def test_get_registration_open_env_fallback_on_json_and_dual(
-        monkeypatch, backend):
-    monkeypatch.setattr(platform_features, "STORAGE_BACKEND", backend)
-    monkeypatch.delenv("REGISTRATION_OPEN", raising=False)
-    assert settings_store.get_registration_open() is False
-    monkeypatch.setenv("REGISTRATION_OPEN", "1")
-    assert settings_store.get_registration_open() is True
+    assert settings_store.get_setting("k_bool", default="v") == "v"
+    assert settings_store.get_setting("k_bool") is None
 
 
 # --------------------------------------------------------------------------- #
-# PG：读写 + bootstrap 语义
+# PG：读写 + CAS + registration_mode fail-closed 解析
 # --------------------------------------------------------------------------- #
 @pg_only
 def test_set_and_get_setting_roundtrip():
@@ -67,36 +58,18 @@ def test_set_and_get_setting_roundtrip():
     # UPSERT 覆盖
     assert settings_store.set_setting("k1", [1, 2]) == [1, 2]
     assert settings_store.get_setting("k1") == [1, 2]
-    # 布尔（registration_open 形态）
-    settings_store.set_setting(settings_store.REGISTRATION_OPEN_KEY, True)
-    assert settings_store.get_setting(settings_store.REGISTRATION_OPEN_KEY) \
-        is True
+    # 布尔（任意 JSON 标量形态）
+    settings_store.set_setting("k_bool", True)
+    assert settings_store.get_setting("k_bool") is True
 
 
 @pg_only
-def test_registration_open_env_bootstrap_then_pg_authoritative(monkeypatch):
-    """解析顺序：PG 有值 → 用 PG；否则 env 作 bootstrap 默认并回写 PG。"""
-    monkeypatch.delenv("REGISTRATION_OPEN", raising=False)
-    # PG 无值 → env 默认 False，且首次读取回写 PG
-    assert settings_store.get_registration_open() is False
-    assert settings_store.get_setting(settings_store.REGISTRATION_OPEN_KEY) \
-        is False
-    # env 之后翻转不影响：PG 已是权威（env 只作 bootstrap）
-    monkeypatch.setenv("REGISTRATION_OPEN", "1")
-    assert settings_store.get_registration_open() is False
-    # owner 在 PG 上打开 → 立即权威
-    settings_store.set_setting(
-        settings_store.REGISTRATION_OPEN_KEY, True, updated_by="usr_owner")
-    assert settings_store.get_registration_open() is True
-
-
-@pg_only
-def test_registration_open_bootstrap_true_when_env_true(monkeypatch):
-    monkeypatch.setenv("REGISTRATION_OPEN", "true")
-    assert settings_store.get_registration_open() is True
-    # bootstrap 值 True 也回写 PG
-    assert settings_store.get_setting(settings_store.REGISTRATION_OPEN_KEY) \
-        is True
-    # env 撤掉后仍以 PG 为准
-    monkeypatch.delenv("REGISTRATION_OPEN", raising=False)
-    assert settings_store.get_registration_open() is True
+def test_registration_mode_missing_row_bootstraps_closed():
+    """R3 Wave2-Compat：mode 键缺行 → fail-closed 降级 closed 并 bootstrap
+    回写（旧布尔 registration_open / REGISTRATION_OPEN env 均已删除）。"""
+    assert settings_store.get_registration_mode() == "closed"
+    assert settings_store.get_setting(settings_store.REGISTRATION_MODE_KEY) \
+        == "closed"
+    # owner 显式切换后立即权威
+    settings_store.set_registration_mode("invite_only", updated_by="usr_owner")
+    assert settings_store.get_registration_mode() == "invite_only"

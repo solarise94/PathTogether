@@ -352,12 +352,13 @@ def test_fresh_database_full_migration_to_0023_idempotent():
                 cur.execute("SELECT count(*) AS n FROM audit_events WHERE "
                             "event_id='aud_migration_0023_spend_windows'")
                 assert cur.fetchone()["n"] == 1
-                # 0025：邀请月额度模板列存在且可空（幂等 ADD COLUMN IF NOT EXISTS）
+                # 0033（R3 Wave2-Compat）：0025 曾加的邀请月额度模板列被
+                # 物理删除（全量迁移跑完后列不存在）
                 cur.execute("SELECT count(*) AS n FROM information_schema"
                             ".columns WHERE table_name="
                             "'registration_invites' AND column_name="
                             "'monthly_limit_nano_cny'")
-                assert cur.fetchone()["n"] == 1
+                assert cur.fetchone()["n"] == 0
         finally:
             conn.close()
     finally:
@@ -912,38 +913,6 @@ def test_set_enforcement_mode_vocab_cas_and_audit():
     assert [d["mode"] for d in details] == \
         ["registered", "all", "shadow"]
     assert details[0]["previous_mode"] == "shadow"
-
-
-@PG
-def test_set_enforcement_mode_unprotected_config_extensible_check():
-    """§7.3 可扩展校验：shadow（金额硬闸未就绪）+ 旧 turn 闸关闭 = 拒绝。
-
-    当前平台没有写 legacy_turn_guard_enabled 的路径（旧 turn 闸恒开）；本用例
-    注入该键验证「未来引入开关」后的拒绝分支无需改判定代码（§9.7）。
-    """
-    bh.seed_spend_policies()
-    import settings_store
-    settings_store.set_setting(spend_store.LEGACY_TURN_GUARD_KEY, False)
-    with pytest.raises(spend_store.UnprotectedSpendConfigError):
-        spend_store.set_enforcement_mode("shadow", expected="shadow")
-    assert spend_store.enforcement_mode() == "shadow"  # 未被改写
-    # registered/all 金额硬闸就绪 → 可保存
-    out = spend_store.set_enforcement_mode("registered", expected="shadow")
-    assert out["mode"] == "registered"
-    # 键缺失（缺省=闸开）时 shadow 总可保存
-    settings_store.set_setting(spend_store.LEGACY_TURN_GUARD_KEY, True)
-    assert spend_store.set_enforcement_mode("shadow",
-                                            expected="registered")["mode"] \
-        == "shadow"
-    conn = bh.connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM platform_settings WHERE key=%s",
-                        (spend_store.LEGACY_TURN_GUARD_KEY,))
-        conn.commit()
-    finally:
-        conn.close()
-    assert spend_store.set_enforcement_mode("shadow")["mode"] == "shadow"
 
 
 @PG

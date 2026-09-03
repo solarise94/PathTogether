@@ -2,9 +2,11 @@
 """平台运行时设置存储（platform_settings，docs §7.3）。
 
 目标状态：``platform_settings.registration_mode``（closed|invite_only|public，
-P0-B §4.1）为运行时权威值；旧布尔 ``registration_open`` 仅保留做 fail-closed
-迁移判定（旧 true 不自动映射为开放模式，降级 closed + 告警）。json/dual 后端
-platform_settings 不可写，读取 fallback（模式一律 closed，邀请注册 PG-only）。
+P0-B §4.1）为运行时权威值。旧布尔 ``registration_open``（设置键与
+REGISTRATION_OPEN env bootstrap）已随 R3 Wave2-Compat 删除——0032 迁移已删
+设定行，mode 键缺行时直接降级 closed（fail-closed，不放大注册面）。json/dual
+后端 platform_settings 不可写，读取 fallback（模式一律 closed，邀请注册
+PG-only）。
 
 后端语义（对齐 platform_features，json/dual fail-closed）：
 
@@ -16,16 +18,11 @@ platform_settings 不可写，读取 fallback（模式一律 closed，邀请注�
 """
 
 import logging
-import os
 
 import psycopg
 
 import pg_store
 import platform_features
-
-#: registration_open 的设置键（value 为 JSONB 布尔；**旧布尔**，已被
-#: registration_mode 取代，仅保留做 fail-closed 迁移判定与兼容读取）
-REGISTRATION_OPEN_KEY = "registration_open"
 
 #: registration_mode 的设置键（value 为 JSONB 字符串 closed|invite_only|public；
 #: P0-B 起 §4.1 的运行时权威值）
@@ -47,9 +44,6 @@ AI_DISPATCH_MAINTENANCE_KEY = "ai_dispatch_maintenance"
 
 #: 合法模式（public 本阶段路由不支持，仅允许出现在存量值中由路由统一拒绝）
 REGISTRATION_MODES = ("closed", "invite_only", "public")
-
-#: registration_open 的 bootstrap env 名（仅 PG 无值时生效，读到后回写 PG）
-_REGISTRATION_OPEN_ENV = "REGISTRATION_OPEN"
 
 _log = logging.getLogger("svs.settings")
 
@@ -176,45 +170,6 @@ def compare_and_set_setting(key, expected, value, updated_by=None):
         conn.close()
 
 
-def get_registration_open() -> bool:
-    """注册开关权威解析（docs §7.3）。
-
-    解析顺序：
-      1. PG platform_settings 有值 → 用 PG（运行时权威）；
-      2. 否则 env REGISTRATION_OPEN 作 bootstrap 默认，并 best-effort 回写 PG
-         （此后 env 不再参与，做到「env 只作 bootstrap」；回写失败不影响返回）；
-      3. json/dual 后端：platform_settings 不可用，直接 fallback env。
-
-    P0-B 起权威开关是 ``registration_mode``（get_registration_mode）；本函数保留
-    供旧调用方/测试读取旧布尔键。
-    """
-    if not settings_writable():
-        return platform_features._truthy(os.environ.get(_REGISTRATION_OPEN_ENV))
-    conn = _connect()
-    try:
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
-                cur.execute(
-                    "SELECT value FROM platform_settings WHERE key=%s",
-                    (REGISTRATION_OPEN_KEY,))
-                row = cur.fetchone()
-                if row is not None:
-                    return bool(row["value"])
-                # PG 无值：env 作 bootstrap 默认并回写（同一事务，避免并发双写竞争）
-                default = platform_features._truthy(
-                    os.environ.get(_REGISTRATION_OPEN_ENV))
-                cur.execute(
-                    "INSERT INTO platform_settings (key, value, updated_at, "
-                    "updated_by) VALUES (%s, %s, now(), 'bootstrap') "
-                    "ON CONFLICT (key) DO NOTHING",
-                    (REGISTRATION_OPEN_KEY,
-                     psycopg.types.json.Jsonb(default)),
-                )
-                return default
-    finally:
-        conn.close()
-
-
 # --------------------------------------------------------------------------- #
 # registration_mode（P0-B，docs §4.1）：closed | invite_only | public
 # --------------------------------------------------------------------------- #
@@ -222,10 +177,9 @@ def get_registration_mode() -> str:
     """注册模式权威解析（closed|invite_only|public）。
 
     - PG：读 ``registration_mode``（JSONB 字符串）；
-      * 无该键但旧布尔 ``registration_open=true`` → **fail-closed**：持久化并
-        返回 ``closed``（旧 true 绝不自动映射为 invite_only/public，由 owner
-        显式切换）+ 告警日志；
-      * 无该键且旧布尔缺失/false → bootstrap 为 ``closed`` 并回写；
+      * 无该键 → bootstrap 为 ``closed`` 并回写（fail-closed：旧布尔
+        ``registration_open`` 已随 0032/Wave2-Compat 删除，缺行绝不放大
+        注册面，由 owner 显式切换）；
       * 存量值非法（含手写的 public 之外的乱值）→ 按关闭处理返回 ``closed``；
         合法存量 ``public`` 原样返回（路由层统一 503 public_registration_not_
         supported，本阶段不支持公开注册）。
@@ -252,19 +206,7 @@ def get_registration_mode() -> str:
                         "platform_settings.%s 存量值非法（%r），按 closed 处理",
                         REGISTRATION_MODE_KEY, val)
                     return "closed"
-                # 无 mode 键：检查旧布尔（true 绝不映射为开放模式）
-                cur.execute(
-                    "SELECT value FROM platform_settings WHERE key=%s",
-                    (REGISTRATION_OPEN_KEY,))
-                legacy = cur.fetchone()
-                legacy_true = bool(
-                    legacy is not None and legacy["value"] is True)
-                if legacy_true:
-                    _log.warning(
-                        "检测到旧 registration_open=true：不自动映射为"
-                        " invite_only/public（fail-closed 降级为 closed），"
-                        "请 owner 显式切换 registration_mode")
-                # bootstrap 写 closed（无论 legacy true/false；幂等）
+                # 无 mode 键：bootstrap 写 closed（幂等；fail-closed 降级）
                 cur.execute(
                     "INSERT INTO platform_settings (key, value, updated_at, "
                     "updated_by) VALUES (%s, %s, now(), 'bootstrap') "

@@ -5,25 +5,16 @@ set -eu
 
 # ---------------------------------------------------------------------------
 # 账户引导 footgun 守护（账户系统批次 A，docs §5.1/§10）：
-#   - 「REQUIRE_ADMIN_AUTH=1 必须有 ADMIN_PASSWORD」的硬性拒启已移除——
+#   - 「REQUIRE_ADMIN_AUTH=1 必须有 bootstrap 秘密」的硬性拒启已移除——
 #     数据库已有 owner 时无需 bootstrap 秘密即可启动；空库/无 owner 等状态
 #     由应用启动状态机 fail-fast（错误消息更可读，见 app.py §5.2）；
-#   - 显式提供的 ADMIN_PASSWORD 为占位符/空 → 拒启（复制 admin.env 未替换）；
-#   - BOOTSTRAP_OWNER_PASSWORD_FILE 被设置但文件不存在/为空 → 拒启；
-#     存在则原样传给应用（应用读文件内容，entry 不展开进环境）。
+#   - BOOTSTRAP_OWNER_PASSWORD_FILE 被设置但文件不存在/为空/内容为占位符
+#     → 拒启（复制 admin.env 未替换）；存在且非占位符则原样传给应用
+#     （应用读文件内容，entry 不展开进环境）。
+#   - 一版兼容别名 ADMIN_USERNAME / ADMIN_PASSWORD 已随 R3 Wave2-Compat
+#     删除：entry 不再检查旧变量，残留配置被直接忽略。
 # ---------------------------------------------------------------------------
-_ADMIN_PASSWORD_SENTINEL="<REPLACE_WITH_STRONG_PASSWORD>"
-if [ "${ADMIN_PASSWORD+x}" = "x" ]; then
-  # 显式提供（设置过该变量，即使值为空）才做 footgun 守护；未设置则完全
-  # 交给应用状态机（数据库已有 owner 时无需任何 bootstrap 秘密，docs §5.2）。
-  case "$ADMIN_PASSWORD" in
-    ""|"$_ADMIN_PASSWORD_SENTINEL"|\<*\>)
-      echo "[entry] ADMIN_PASSWORD is set but empty or a placeholder; refusing to start" >&2
-      exit 1
-      ;;
-  esac
-fi
-
+_BOOTSTRAP_PASSWORD_SENTINEL="<REPLACE_WITH_STRONG_PASSWORD>"
 _boot_pw_file="${BOOTSTRAP_OWNER_PASSWORD_FILE:-}"
 if [ -n "$_boot_pw_file" ]; then
   if [ ! -f "$_boot_pw_file" ]; then
@@ -34,6 +25,16 @@ if [ -n "$_boot_pw_file" ]; then
     echo "[entry] BOOTSTRAP_OWNER_PASSWORD_FILE=$_boot_pw_file is empty; refusing to start" >&2
     exit 1
   fi
+  # 占位符内容（精确 sentinel / <...> 包裹）= 复制 admin.env 未替换：
+  # 与应用层 _is_placeholder_admin_password 同口径，提前拒启（fail-fast）。
+  # 命令替换已去除尾部换行；真密码不含 <...> 包裹形态。
+  _boot_pw="$(cat "$_boot_pw_file")"
+  case "$_boot_pw" in
+    "$_BOOTSTRAP_PASSWORD_SENTINEL"|\<*\>)
+      echo "[entry] BOOTSTRAP_OWNER_PASSWORD_FILE=$_boot_pw_file contains a placeholder; refusing to start" >&2
+      exit 1
+      ;;
+  esac
 fi
 
 _backend="$(printf '%s' "${STORAGE_BACKEND:-json}" | tr '[:upper:]' '[:lower:]')"

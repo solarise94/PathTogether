@@ -29,7 +29,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
 UPLOAD_DIR = _bootstrap.UPLOAD_DIR
-os.environ["ADMIN_PASSWORD"] = ""
 import pytest  # noqa: E402
 
 import app as app_mod  # noqa: E402
@@ -280,11 +279,16 @@ def test_invites_create_token_once_and_slug_validation():
         "total_limit_nano_cny": 5}).status_code == 400
     assert c.post("/api/admin/v1/invites", json={
         "total_limit_nano_cny": "5"}).status_code == 200
-    # 新旧金额字段同传 → 400 ambiguous_spend_limit
+    # R3 Wave2-Compat：旧 monthly 字段退役——body 带该键（含与 total 同传）
+    # 一律 400 retired_spend_field（绝不静默忽略）
     r_amb = c.post("/api/admin/v1/invites", json={
         "total_limit_nano_cny": "5", "monthly_limit_nano_cny": "5"})
     assert r_amb.status_code == 400
-    assert r_amb.get_json()["error"]["code"] == "ambiguous_spend_limit"
+    assert r_amb.get_json()["error"]["code"] == "retired_spend_field"
+    r_ret = c.post("/api/admin/v1/invites", json={
+        "monthly_limit_nano_cny": "5"})
+    assert r_ret.status_code == 400
+    assert r_ret.get_json()["error"]["code"] == "retired_spend_field"
     # ttl 边界（0 会回退默认 TTL——与旧端点 `or 默认值` 语义一致；负数/超限 400）
     assert c.post("/api/admin/v1/invites",
                   json={"ttl_hours": -5}).status_code == 400

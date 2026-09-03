@@ -29,6 +29,7 @@ _MIGRATION_0022 = REPO_ROOT / "migrations" / "0022_billing_price_unit_fix.sql"
 _MIGRATION_0023 = REPO_ROOT / "migrations" / "0023_spend_policies_windows.sql"
 _MIGRATION_0029 = REPO_ROOT / "migrations" / "0029_user_total_allowances_and_denials.sql"
 _MIGRATION_0032 = REPO_ROOT / "migrations" / "0032_user_total_allowance_single_track.sql"
+_MIGRATION_0033 = REPO_ROOT / "migrations" / "0033_drop_invite_monthly_limit.sql"
 
 #: 0023 种子策略（占位默认额度：demo 周池 50 CNY / 用户默认月 20 CNY /
 #: owner 月 1000 CNY；面值是 owner 待决策的占位默认，后台可改）
@@ -136,14 +137,27 @@ def seed_spend_settings(conn=None):
 
     conftest 每用例 TRUNCATE platform_settings/ai_spend_total_defaults 会
     清掉闸键与 defaults 行；需要「闸关 + 默认总额度在场」基线的用例调用
-    本函数（迁移文件是种子的唯一权威来源）。"""
+    本函数（迁移文件是种子的唯一权威来源）。
+
+    R3 Wave2-Compat 起全量 schema 已含 0033（DROP registration_invites.
+    monthly_limit_nano_cny）；0032 文件的回填 UPDATE 引用该列，故重放 0032
+    前先防御性补建空列（ADD COLUMN IF NOT EXISTS，重放后由 0033 再删，
+    helper 结束时 schema 与全量迁移一致）。"""
     own = conn is None
     if own:
         conn = connect()
     try:
         _replay(conn, _MIGRATION_0023)
         _replay(conn, _MIGRATION_0029)
+        # 0032 可重放守卫：列已随 0033 删除时先补回空列（无历史面值行，
+        # 回填 UPDATE 命中 0 行；全新 schema 上列本就存在，此处 no-op）
+        with conn.cursor() as cur:
+            cur.execute(
+                "ALTER TABLE registration_invites ADD COLUMN IF NOT EXISTS "
+                "monthly_limit_nano_cny BIGINT")
+        conn.commit()
         _replay(conn, _MIGRATION_0032)
+        _replay(conn, _MIGRATION_0033)
     finally:
         if own:
             conn.close()

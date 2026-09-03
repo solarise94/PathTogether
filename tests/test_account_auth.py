@@ -4,8 +4,10 @@
 
 覆盖（json 默认 + RUN_PG_TESTS=1 双跑）：
   - 启动状态机纯函数（_resolve_bootstrap_config / _resolve_owner_at_startup）：
-    空库首建、已有 owner 不对账、兼容别名 deprecated 告警、无 owner 拒启、
-    多 owner 拒启（json-only 直插构造）、空 hash 拒启、owner 归属注入；
+    空库首建、已有 owner 不对账、引导配置被忽略告警、无 owner 拒启、
+    多 owner 拒启（json-only 直插构造）、空 hash 拒启、owner 归属注入、
+    一版兼容别名 ADMIN_USERNAME/ADMIN_PASSWORD 不再参与引导（R3
+    Wave2-Compat 删除读取路径）；
   - session auth_version 失效矩阵：本人改密/管理重置/disable→enable/旧 Cookie；
   - POST /api/account/password：401/CSRF/invalid_current_password/429 防爆破/
     长度与同密码拒绝/成功清 session；
@@ -29,7 +31,6 @@ import pytest  # noqa: E402
 
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
 DATA_DIR = _bootstrap.SHARE_DATA_DIR
-os.environ["ADMIN_PASSWORD"] = ""
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
@@ -131,14 +132,22 @@ def make_owner(login_id="admin", password=OWNER_PW):
     return user_store.create_bootstrap_owner(login_id, password)
 
 
+def _write_pw_file(tmp_path, content):
+    """写 bootstrap secret 文件（BOOTSTRAP_OWNER_PASSWORD_FILE 语义），返回路径。"""
+    p = tmp_path / "boot-secret.txt"
+    p.write_text(content, encoding="utf-8")
+    return str(p)
+
+
 # =========================================================================== #
 # 1. 启动状态机（docs §5.2 / §11.1）
 # =========================================================================== #
-def test_startup_bootstrap_creates_owner_and_login():
-    """空库 + bootstrap 秘密 → 建 owner（规范化 login_id）且可登录。"""
+def test_startup_bootstrap_creates_owner_and_login(tmp_path):
+    """空库 + bootstrap 秘密（正名 BOOTSTRAP_OWNER_* 文件路径语义）→ 建 owner
+    （规范化 login_id）且可登录。"""
     owner = app_mod._resolve_owner_at_startup({
         "BOOTSTRAP_OWNER_LOGIN_ID": "  Browser_Admin  ",
-        "ADMIN_PASSWORD": OWNER_PW,
+        "BOOTSTRAP_OWNER_PASSWORD_FILE": _write_pw_file(tmp_path, OWNER_PW),
     })
     check("首建返回 owner dict", isinstance(owner, dict) and owner.get("role") == "owner")
     check("login_id 规范化（trim+lower）",
@@ -148,40 +157,41 @@ def test_startup_bootstrap_creates_owner_and_login():
     check("可用该密码登录", user_store.verify_user("browser_admin", OWNER_PW) is not None)
 
 
-def test_startup_bootstrap_legacy_alias():
-    """空库 + 兼容别名（ADMIN_USERNAME/ADMIN_PASSWORD）同样可引导（§11.1-1）。
+def test_startup_bootstrap_legacy_alias_ignored(monkeypatch):
+    """R3 Wave2-Compat：一版兼容别名 ADMIN_USERNAME/ADMIN_PASSWORD 读取路径
+    已删除——空库 + 仅提供别名 + REQUIRE_ADMIN_AUTH=1 → fail-closed 拒启
+    （别名绝不参与引导）。"""
+    _fake_pg_backend(monkeypatch)
+    with pytest.raises(SystemExit):
+        app_mod._resolve_owner_at_startup({
+            "REQUIRE_ADMIN_AUTH": "1",
+            "ADMIN_USERNAME": "legacy_admin",
+            "ADMIN_PASSWORD": OWNER_PW,
+        })
+    check("别名不建 owner（库仍空）",
+          not user_store.list_enabled_owners())
 
-    独立用例：首建只允许空库一次（json 靠 _isolate 清文件、PG 靠 conftest
-    每用例 TRUNCATE 获得干净起点）。
-    """
-    owner2 = app_mod._resolve_owner_at_startup({
-        "ADMIN_USERNAME": "legacy_admin",
-        "ADMIN_PASSWORD": OWNER_PW,
-    })
-    check("兼容别名空库可引导", owner2 is not None
-          and owner2.get("login_id") == "legacy_admin")
-    check("兼容别名引导后可登录",
-          user_store.verify_user("legacy_admin", OWNER_PW) is not None)
 
-
-def test_startup_existing_owner_env_password_not_reconciled():
-    """已有 owner + env 密码不同 → 启动后 DB hash 不变、绝不对账覆盖。"""
+def test_startup_existing_owner_env_password_not_reconciled(tmp_path):
+    """已有 owner + bootstrap secret 文件内容不同 → 启动后 DB hash 不变、
+    绝不对账覆盖。"""
     make_owner("admin", OWNER_PW)
     hash_before = user_store.list_enabled_owners()[0]["password_hash"]
     owner = app_mod._resolve_owner_at_startup({
-        "ADMIN_USERNAME": "admin",
-        "ADMIN_PASSWORD": "totally-different-pw-123",
+        "BOOTSTRAP_OWNER_LOGIN_ID": "admin",
+        "BOOTSTRAP_OWNER_PASSWORD_FILE": _write_pw_file(
+            tmp_path, "totally-different-pw-123"),
     })
     check("正常解析已有 owner", owner is not None and owner.get("login_id") == "admin")
     hash_after = user_store.list_enabled_owners()[0]["password_hash"]
     check("DB hash 不变（无对账覆盖）", hash_before == hash_after)
     check("原密码仍可登录", user_store.verify_user("admin", OWNER_PW) is not None)
-    check("env 密码不能登录（未写入）",
+    check("文件密码不能登录（未写入）",
           user_store.verify_user("admin", "totally-different-pw-123") is None)
 
 
 def test_startup_existing_owner_without_env(monkeypatch):
-    """已有 owner + 无 ADMIN_PASSWORD → 正常启动可登录（§11.1-3）。"""
+    """已有 owner + 无 bootstrap 秘密 → 正常启动可登录（§11.1-3）。"""
     make_owner("admin", OWNER_PW)
     owner = app_mod._resolve_owner_at_startup({})
     check("无 env 正常解析", owner is not None and owner.get("login_id") == "admin")
@@ -193,22 +203,24 @@ def test_startup_existing_owner_without_env(monkeypatch):
     check("无 env 时 owner 可登录", r.status_code == 302, "got %s" % r.status_code)
 
 
-def test_startup_admin_username_change_only_warns(monkeypatch, caplog):
-    """已有 owner + 改动 ADMIN_USERNAME → 不改 DB login_id，仅 deprecated 告警。"""
+def test_startup_bootstrap_login_id_change_only_warns(monkeypatch, caplog,
+                                                      tmp_path):
+    """已有 owner + 改动 BOOTSTRAP_OWNER_LOGIN_ID → 不改 DB login_id，仅
+    「引导配置被忽略」告警（不对账、不覆盖）。"""
     make_owner("admin", OWNER_PW)
     with caplog.at_level(logging.WARNING):
         owner = app_mod._resolve_owner_at_startup({
-            "ADMIN_USERNAME": "someone-else",
-            "ADMIN_PASSWORD": "whatever-password-1",
+            "BOOTSTRAP_OWNER_LOGIN_ID": "someone-else",
+            "BOOTSTRAP_OWNER_PASSWORD_FILE": _write_pw_file(
+                tmp_path, "whatever-password-1"),
         })
     check("仍解析原 owner", owner is not None and owner.get("login_id") == "admin")
     check("DB login_id 未被改动",
           user_store.list_enabled_owners()[0]["login_id"] == "admin")
     warned = any(
-        ("忽略" in rec.message or "deprecated" in rec.message)
-        and ("ADMIN" in rec.message or "BOOTSTRAP" in rec.message)
+        "忽略" in rec.message and "BOOTSTRAP" in rec.message
         for rec in caplog.records)
-    check("记录一次忽略/deprecated 告警", warned,
+    check("记录一次引导配置忽略告警", warned,
           "records=%r" % [r.message for r in caplog.records])
 
 
@@ -242,20 +254,24 @@ def test_startup_empty_db_require_auth_no_secret_refuses(monkeypatch):
     check("文案指明 bootstrap 秘密缺失", "bootstrap" in str(ei.value).lower())
 
 
-def test_startup_placeholder_secret_treated_as_unconfigured(monkeypatch):
-    """占位符 ADMIN_PASSWORD 视为未配置：REQUIRE_ADMIN_AUTH=1 → 拒启。"""
+def test_startup_placeholder_secret_treated_as_unconfigured(monkeypatch,
+                                                            tmp_path):
+    """占位符 secret 文件内容（sentinel / <...>）视为未配置：
+    REQUIRE_ADMIN_AUTH=1 → 拒启。"""
     _fake_pg_backend(monkeypatch)
     with pytest.raises(SystemExit):
         app_mod._resolve_owner_at_startup({
             "REQUIRE_ADMIN_AUTH": "1",
-            "ADMIN_USERNAME": "admin",
-            "ADMIN_PASSWORD": app_mod.ADMIN_PASSWORD_PLACEHOLDER_SENTINEL,
+            "BOOTSTRAP_OWNER_LOGIN_ID": "admin",
+            "BOOTSTRAP_OWNER_PASSWORD_FILE": _write_pw_file(
+                tmp_path, app_mod.ADMIN_PASSWORD_PLACEHOLDER_SENTINEL),
         })
     with pytest.raises(SystemExit):
         app_mod._resolve_owner_at_startup({
             "REQUIRE_ADMIN_AUTH": "1",
-            "ADMIN_USERNAME": "admin",
-            "ADMIN_PASSWORD": "<still-a-placeholder>",
+            "BOOTSTRAP_OWNER_LOGIN_ID": "admin",
+            "BOOTSTRAP_OWNER_PASSWORD_FILE": _write_pw_file(
+                tmp_path, "<still-a-placeholder>"),
         })
 
 
@@ -300,7 +316,7 @@ def test_startup_dev_mode_no_owner_no_secret():
     check("AUTH_ENABLED=False", app_mod._resolve_auth_enabled({}) is False)
 
 
-def test_startup_concurrent_loser_re_resolves(monkeypatch):
+def test_startup_concurrent_loser_re_resolves(monkeypatch, tmp_path):
     """并发首建败者（users_table_not_empty）→ 重走解析正常启动（docs §5.3）。"""
     make_owner("admin", OWNER_PW)  # 模拟另一 worker 已建号
     real_create = user_store.create_bootstrap_owner
@@ -313,7 +329,7 @@ def test_startup_concurrent_loser_re_resolves(monkeypatch):
     monkeypatch.setattr(user_store, "create_bootstrap_owner", _raise_table_not_empty)
     owner = app_mod._resolve_owner_at_startup({
         "BOOTSTRAP_OWNER_LOGIN_ID": "admin",
-        "ADMIN_PASSWORD": OWNER_PW,
+        "BOOTSTRAP_OWNER_PASSWORD_FILE": _write_pw_file(tmp_path, OWNER_PW),
     })
     check("并发败者重解析成功", owner is not None and owner.get("login_id") == "admin")
     check("create_bootstrap_owner 确被调用过（模拟并发）",

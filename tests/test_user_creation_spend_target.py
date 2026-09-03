@@ -230,7 +230,7 @@ def test_redeem_without_limit_resolves_default():
     assert allowance["source"] == "invite"
     assert allowance["limit_nano_cny"] == 20 * 10 ** 9
     assert allowance["default_version"] == _defaults_version()
-    assert out["spend_override_policy"] is None   # 兼容键恒 None（单轨）
+    assert "spend_override_policy" not in out  # 兼容键已物理删除（Wave2）
     assert _override_rows() == 0
 
 
@@ -249,7 +249,7 @@ def test_redeem_with_explicit_limit_creates_allowance():
     assert allowance["limit_nano_cny"] == 9 * 10 ** 9
     assert allowance["source"] == "invite"
     assert allowance["default_version"] is None
-    assert out["spend_override_policy"] is None
+    assert "spend_override_policy" not in out  # 兼容键已物理删除（Wave2）
     assert _override_rows(out["user"]["user_id"]) == 0
 
 

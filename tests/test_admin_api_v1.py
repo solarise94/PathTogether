@@ -35,7 +35,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
 UPLOAD_DIR = _bootstrap.UPLOAD_DIR
-os.environ["ADMIN_PASSWORD"] = ""
 import pytest  # noqa: E402
 
 import app as app_mod  # noqa: E402

@@ -36,7 +36,6 @@ import pytest  # noqa: E402
 
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
 DATA_DIR = _bootstrap.SHARE_DATA_DIR
-os.environ["ADMIN_PASSWORD"] = ""
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
@@ -276,7 +275,6 @@ def test_admin_users_api_login_id_only(monkeypatch):
     """列表/重置/禁用响应无 email 键；创建只接受 login_id（email 入参
     已删除——只传 email 不给 login_id 一律 400）。旧建号端点已 410 退役
     （review R2-F1），创建契约改在 POST /api/admin/v1/users 上验证。"""
-    monkeypatch.setenv("ADMIN_PASSWORD", "")
     make_owner()
     user_store.create_user("u@x.com", PW2, role="user")
     client = make_client()

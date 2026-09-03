@@ -52,8 +52,6 @@ HISTOPILOT_INTERNAL_TOKEN=<shared-random-token>
 
 HistoPilot 侧设置同一个 `HISTOPILOT_INTERNAL_TOKEN`。生产部署应把两个服务放进私有容器网络，不直接发布 HistoPilot 的内部端口。
 
-`AI_SIDECAR_URL` 与 `AI_INTERNAL_TOKEN` 只保留为旧一体仓迁移别名。
-
 ## 4. 升级与回滚
 
 - 平台和插件分别使用 SemVer。

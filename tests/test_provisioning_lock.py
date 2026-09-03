@@ -25,7 +25,6 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
-os.environ["ADMIN_PASSWORD"] = ""
 import psycopg  # noqa: E402
 import pytest  # noqa: E402
 

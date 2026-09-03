@@ -10,8 +10,9 @@ review-2026-09-02-upload-user-limits-admin-ui-cleanup.md §Batch B / §3.1 /
     subject/source CHECK；
   - 原子性：建号/邀请兑换同事务建 allowance（注入失败整体回滚：用户不创建、
     邀请不消费、user_acquisition 零新增、不建 user_override）；
-  - 旧 monthly 邀请面值兼容读取（按总额度兑现）；新旧字段同传
-    ambiguous_spend_limit；退役 source/campaign/cohort 参数忽略不写库；
+  - 旧 monthly 邀请面值形参已物理删除（R3 Wave2-Compat；传入即
+    TypeError，0033 亦 DROP 列）；退役 source/campaign/cohort 参数
+    忽略不写库；
   - 原子授权：并发 2 hold 竞同一 user 最后额度只有满足不等式的成功
     （多连接 + Barrier，禁 mock；不超卖）；settle/release/expire 投影准确；
     X<已用时拒绝且 overage 正确、新调用 fail-closed；
@@ -494,16 +495,13 @@ def test_invite_retired_fields_ignored_and_legacy_monthly_becomes_total():
     assert audits
     assert not ({"source_code", "campaign_id", "cohort", "acq",
                  "campaign_bound"} & set(audits[0]["detail"]))
-    # 旧 monthly 参数：兼容一个周期；面值按总额度兑现
-    inv2 = registration_store.create_invite(
-        owner["user_id"], login_id="legacy@x.com",
-        monthly_limit_nano_cny=7 * 10 ** 9)
-    assert inv2["total_limit_nano_cny"] == 7 * 10 ** 9
-    out = registration_store.redeem_invite(inv2["token"], "legacy@x.com",
-                                           "pass123456789012")
-    assert out["total_allowance"]["limit_nano_cny"] == 7 * 10 ** 9
-    # 新旧同传 → 稳定 ambiguous_spend_limit
-    with pytest.raises(ValueError, match="ambiguous_spend_limit"):
+    # R3 Wave2-Compat：旧 monthly 形参已物理删除（传入即 TypeError；
+    # 0033 亦 DROP 列，total_limit_nano_cny 为唯一金额模板面）
+    with pytest.raises(TypeError):
+        registration_store.create_invite(
+            owner["user_id"], login_id="legacy@x.com",
+            monthly_limit_nano_cny=7 * 10 ** 9)
+    with pytest.raises(TypeError):
         registration_store.create_invite(
             owner["user_id"], login_id="amb@x.com",
             monthly_limit_nano_cny=10 ** 9, total_limit_nano_cny=10 ** 9)

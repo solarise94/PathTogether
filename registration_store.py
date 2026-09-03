@@ -49,8 +49,10 @@ import user_store
 # §Batch B 数据模型 6）：来源归因与注册解耦——兑换事务**不再**调用
 # acquisition_store（user_acquisition 写路径冻结，站点统计故障绝不能阻断
 # 注册）；历史查询函数保留。旧 pt_acq cookie 不再被本模块读取。
-# R3 Wave1-Money 单轨：邀请模板金额只读 total_limit_nano_cny（0032 已把
-# 旧 monthly_limit_nano_cny 面值回填进该列；monthly 列物理删除在 Wave 2）；
+# R3 Wave1-Money 单轨：邀请模板金额只读 total_limit_nano_cny；R3 Wave2-
+# Compat 收口：旧 monthly_limit_nano_cny 形参/列（0032 已把面值回填进
+# total 列，0033 物理删列）、redeem_invite 的 acq 形参与「接受但忽略」
+# 兼容响应键（acquisition/spend_override_policy）一并删除；
 # 兑换事务**恒**为新用户建一次性总额度（spend_store
 # .create_user_total_allowance_tx，source="invite"）——模板带面值按面值建行，
 # 无面值解析全局默认（只查 ai_spend_total_defaults），皆缺 fail-closed 拒绝
@@ -210,33 +212,19 @@ _INVITE_SEL = (
     "extract(epoch from consumed_at)::float8 AS consumed_at, "
     "consumed_by_user_id, extract(epoch from revoked_at)::float8 AS revoked_at, "
     "ai_access, cohort, note, source_code, campaign_id, "
-    "monthly_limit_nano_cny, total_limit_nano_cny"
+    "total_limit_nano_cny"
 )
-#: Batch B 起新邀请不再写入的退役列（列保留读取历史行；值为迁移前遗留）
-_RETIRED_INVITE_FIELDS = ("cohort", "source_code", "campaign_id",
-                          "monthly_limit_nano_cny")
+#: Batch B 起新邀请不再写入的退役列（列保留读取历史行；值为迁移前遗留。
+#: 旧 monthly_limit_nano_cny 列已随 R3 Wave2-Compat 的 0033 迁移物理删除）
+_RETIRED_INVITE_FIELDS = ("cohort", "source_code", "campaign_id")
 
 
 def _invite_out(row) -> dict:
     out = dict(row)
     out["ai_access"] = bool(out.get("ai_access"))
-    if out.get("monthly_limit_nano_cny") is not None:
-        out["monthly_limit_nano_cny"] = int(out["monthly_limit_nano_cny"])
     if out.get("total_limit_nano_cny") is not None:
         out["total_limit_nano_cny"] = int(out["total_limit_nano_cny"])
     return out
-
-
-def _validate_monthly_limit(monthly_limit_nano_cny):
-    """邀请模板月额度校验（Batch B 起仅为旧 wire 兼容读取；None/非负 int）。"""
-    if monthly_limit_nano_cny is None:
-        return None
-    if isinstance(monthly_limit_nano_cny, bool) \
-            or not isinstance(monthly_limit_nano_cny, int) \
-            or monthly_limit_nano_cny < 0:
-        raise ValueError(
-            "monthly_limit_nano_cny 需为非负整数（nano-CNY）或 null")
-    return int(monthly_limit_nano_cny)
 
 
 def _validate_total_limit(total_limit_nano_cny):
@@ -256,7 +244,6 @@ def create_invite(created_by_user_id, login_id=None,
                   ttl_seconds=DEFAULT_INVITE_TTL_SECONDS,
                   ai_access=False, cohort="", note="",
                   source_code="", campaign_id=None,
-                  monthly_limit_nano_cny=None,
                   total_limit_nano_cny=None):
     """创建一次性邀请码。返回 dict：含**明文 token**（唯一出现处）与行信息。
 
@@ -266,13 +253,11 @@ def create_invite(created_by_user_id, login_id=None,
     - ``source_code``/``campaign_id``/``cohort`` 参数**兼容保留但忽略并
       弃用**（app.py wave 2 才改调用方；本波保持旧签名可调用）：不做 slug/
       campaign 存在性校验，也**不写入 DB**（新邀请行三列为空/NULL）；
-    - ``total_limit_nano_cny``（新）：初始一次性总额度（nano-CNY 整数，
-      wire 层十进制字符串，路由层换算）；None = 兑换时按 user_spend_target
-      解析（total 模式走默认解析/缺默认拒绝，window 模式不建任何额度面），
-      语义见 redeem_invite；
-    - ``monthly_limit_nano_cny``（旧）：兼容保留一个发布周期；与新字段
-      **同时传抛稳定 ValueError ``ambiguous_spend_limit``**（路由层映射
-      400）。值写入 total_limit 列（旧月窗口语义退役，面值按总额度兑现）。
+    - ``total_limit_nano_cny``：初始一次性总额度（nano-CNY 整数，wire 层
+      十进制字符串，路由层换算）；None = 兑换时按 ai_spend_total_defaults
+      解析全局默认（皆缺 fail-closed 拒绝兑换），语义见 redeem_invite。
+      旧 ``monthly_limit_nano_cny`` 形参已随 R3 Wave2-Compat 删除（路由层
+      对 body 带该键一律 400 retired_spend_field）。
 
     - token：``secrets.token_urlsafe(32)``；库内只存 invite_token_hash(token)；
     - login_id 给出时按 normalize_login_id 绑定——语义为「允许兑换的登录账号
@@ -292,14 +277,7 @@ def create_invite(created_by_user_id, login_id=None,
     if ttl <= 0:
         raise ValueError("ttl_seconds 需为正整数")
     note = str(note or "").strip()[:200]
-    monthly_limit = _validate_monthly_limit(monthly_limit_nano_cny)
-    total_limit = _validate_total_limit(total_limit_nano_cny)
-    if monthly_limit is not None and total_limit is not None:
-        raise ValueError(
-            "ambiguous_spend_limit：monthly_limit_nano_cny 与 "
-            "total_limit_nano_cny 只能传其一（旧月额度字段已退役）")
-    # 兼容期：旧字段面值按总额度兑现（月窗口语义退役）
-    effective_total = total_limit if total_limit is not None else monthly_limit
+    effective_total = _validate_total_limit(total_limit_nano_cny)
 
     for _ in range(5):  # token_hash 撞唯一键概率可忽略，重试兜底
         token = secrets.token_urlsafe(INVITE_TOKEN_BYTES)
@@ -416,20 +394,21 @@ class _RedeemFail(Exception):
         super().__init__(reason)
 
 
-def redeem_invite(token, login_id, password, display_name=None, acq=None):
+def redeem_invite(token, login_id, password, display_name=None):
     """兑换邀请码并在**同一事务**内创建 role=user 账号。
 
     ``login_id`` 参数为兑换人自选的**登录账号**（docs §8.2；原批次 B 参数名
     email，批次 C 收口改名）。
 
-    Batch B（§4.4/§Batch B 数据模型 6）+ R3 Wave1-Money 单轨：
+    Batch B（§4.4/§Batch B 数据模型 6）+ R3 Wave1-Money 单轨 + Wave2-Compat：
 
-    - ``acq`` 参数**兼容保留但忽略并弃用**（app.py wave 2 才改调用方）：本
-      事务不读取 pt_acq cookie 上下文、不调用 acquisition_store、**不写
-      user_acquisition**（写路径冻结）——站点统计故障绝不能阻断注册；
+    - 归因与注册彻底解耦：本事务不读取 pt_acq cookie 上下文、不调用
+      acquisition_store、**不写 user_acquisition**（写路径冻结）——站点统计
+      故障绝不能阻断注册。原 ``acq``「接受但忽略」形参与恒 None 的兼容响应
+      键（acquisition/spend_override_policy）已随 R3 Wave2-Compat 物理删除；
     - 额度面**恒**为一次性总额度（与建号同契约，原 ``user_spend_target``
       分叉已拆除）：模板金额非 NULL（``total_limit_nano_cny`` 列；0032 已把
-      旧 monthly 面值回填，运行时不再读 monthly 列）按面值建行，无面值则
+      旧 monthly 面值回填，0033 物理删列）按面值建行，无面值则
       解析全局默认（**只查** ai_spend_total_defaults，default_version=默认
       版本），皆缺 → ValueError ``total_default_missing``（注册端点统一兜
       底，兑换整体回滚）——绝不建出无额度行的用户；写入失败同样整体回滚
@@ -446,11 +425,7 @@ def redeem_invite(token, login_id, password, display_name=None, acq=None):
       - users 登录账号已存在（email_taken；此时 invite 未消费——检查先于
         UPDATE）；
     成功返回 ``{"user": <新用户公共 dict>, "invite_id": ..., "login_id": ...,
-    "total_allowance": <总额度行 dict>, "acquisition": None,
-    "spend_override_policy": None}``
-    （login_id 键即规范化登录账号；``acquisition`` 为兼容旧调用方形状的恒
-    None 弃用键；``spend_override_policy`` 兼容键保留但恒 None——物理删键在
-    Wave 2）。
+    "total_allowance": <总额度行 dict>}``（login_id 键即规范化登录账号）。
     成功审计在同一事务内（registration.redeem，actor=被创建 user_id）；失败审计
     在独立 best-effort 事务（主事务已随异常回滚），detail 只含 invite_id/status。
 
@@ -544,7 +519,7 @@ def redeem_invite(token, login_id, password, display_name=None, acq=None):
                     raise _RedeemFail("consumed")
                 # 额度面恒为一次性总额度（与建号同契约，单轨）：模板带
                 # total_limit_nano_cny 面值直接建行（0032 已回填旧 monthly
-                # 面值，运行时不读 monthly 列），无面值解析全局默认（只查
+                # 面值并随 0033 物理删列），无面值解析全局默认（只查
                 # defaults 表），皆缺 → fail-closed 拒绝兑换（绝不建出无
                 # 额度行的用户）
                 invite_limit = row["total_limit_nano_cny"]
@@ -573,11 +548,7 @@ def redeem_invite(token, login_id, password, display_name=None, acq=None):
                               created_user_id=user["user_id"])
         return {"user": user, "invite_id": invite_id,
                 "login_id": norm_login,
-                "total_allowance": allowance,
-                "acquisition": None,          # Batch B：归因退役，恒 None
-                # 兼容键保留但恒 None（window 过渡 override 已随单轨拆除；
-                # 物理删键在 Wave 2）
-                "spend_override_policy": None}
+                "total_allowance": allowance}
     except _RedeemFail as exc:
         _audit_redeem_best_effort(fail_invite_id, exc.reason)
         raise InviteRedeemError(exc.reason)

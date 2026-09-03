@@ -25,8 +25,7 @@ import pytest  # noqa: E402
 
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
 DATA_DIR = _bootstrap.SHARE_DATA_DIR
-# 默认无 ADMIN_PASSWORD → 认证由用户是否存在决定；各用例按需覆盖
-os.environ["ADMIN_PASSWORD"] = ""
+# 默认无 bootstrap 秘密 → 认证由用户是否存在决定；各用例按需覆盖
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
@@ -364,17 +363,15 @@ def test_resolve_primary_owner_invariants():
 
 
 def test_empty_admin_password_no_owner_disables_auth(monkeypatch):
-    monkeypatch.setenv("ADMIN_PASSWORD", "")
     reset_users_file()
     # 批次 A：旧 _bootstrap_owner（env 对账式引导）已删除，改走启动状态机
     # 纯函数（docs §5.2）：空库 + 无秘密 → owner=None（本地免认证开发态）
     owner = app_mod._resolve_owner_at_startup({})
-    check("空 ADMIN_PASSWORD 不建 owner", owner is None)
+    check("无 bootstrap 秘密不建 owner", owner is None)
     check("无用户 → AUTH_ENABLED False", app_mod._resolve_auth_enabled() is False)
 
 
 def test_auth_enabled_when_user_exists(monkeypatch):
-    monkeypatch.setenv("ADMIN_PASSWORD", "")
     user_store.create_user("u@x.com", PW2, role="user")
     check("存在 user → AUTH_ENABLED True", app_mod._resolve_auth_enabled() is True)
 
@@ -434,7 +431,6 @@ def test_legacy_json_without_auth_version_reads_as_one():
 # 登录
 # =========================================================================== #
 def test_login_success_sets_role(monkeypatch):
-    monkeypatch.setenv("ADMIN_PASSWORD", "")
     make_owner()
     client = make_client()
     r = login(client, "admin", OWNER_PW)
@@ -466,7 +462,6 @@ def test_login_wrong_password_and_lock():
 # /api/admin/v1/users 权限与保护（旧面已随 R3 wave1 删除）
 # =========================================================================== #
 def test_admin_users_owner_vs_user(monkeypatch):
-    monkeypatch.setenv("ADMIN_PASSWORD", "")
     make_owner()
     user_store.create_user("u@x.com", PW2, role="user")
     client = make_client()
@@ -500,7 +495,6 @@ def test_admin_users_owner_vs_user(monkeypatch):
 
 
 def test_last_owner_protection(monkeypatch):
-    monkeypatch.setenv("ADMIN_PASSWORD", "")
     owner = make_owner()
     user_store.create_user("u@x.com", PW2, role="user")
     client = make_client()
@@ -528,7 +522,6 @@ def test_last_owner_protection(monkeypatch):
 
 
 def test_admin_reset_password(monkeypatch):
-    monkeypatch.setenv("ADMIN_PASSWORD", "")
     make_owner()
     user_store.create_user("u@x.com", PW2, role="user")
     uid = user_store.get_user_by_login_id("u@x.com")["user_id"]
@@ -545,7 +538,6 @@ def test_admin_reset_password(monkeypatch):
 
 def test_disable_invalidates_existing_session(monkeypatch):
     """禁用用户后，已有 Flask session 立刻失效（不能再打 /api/*）。"""
-    monkeypatch.setenv("ADMIN_PASSWORD", "")
     make_owner()
     u = user_store.create_user("u@x.com", PW2, role="user")
     user_client = make_client()
@@ -578,7 +570,6 @@ def test_disable_invalidates_existing_session(monkeypatch):
 # （一次性修复包 G：该用例曾连续六次污染 PG job——json-only 语义在
 #  STORAGE_BACKEND=postgres 下不成立，属标记缺失而非测试缺陷）
 def test_lazy_migration_owner_refs(monkeypatch):
-    monkeypatch.setenv("ADMIN_PASSWORD", "")
     owner = make_owner()
     owner_id = owner["user_id"]
     # 注入归属（模拟 app 启动时的 set_owner_user_id）

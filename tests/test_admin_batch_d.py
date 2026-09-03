@@ -12,9 +12,9 @@ json 模式（无 PG）：
 PG 模式（RUN_PG_TESTS=1）：
   - spend policies PUT：CAS 版本冲突 409 / JSON number 金额 400 / >2^53
     十进制字符串精确落库 / audit（spend.policy_update）同事务；
-  - enforcement-mode PUT：词表外 400 / CAS 409 / audit；§7.3 无保护配置
-    （shadow + legacy_turn_guard_enabled=false）不能保存、registered/all 可
-    保存（可扩展校验的现行形态）；
+  - enforcement-mode PUT：词表外 400 / CAS 409 / audit（§7.3 无保护配置由
+    模式派生结构性保证；旧 legacy_turn_guard_enabled 幽灵键校验已随 R3
+    Wave2-Compat 删除）；
   - window adjust：缺 confirm → 400 confirm_required / 成功只改 snapshot
     （spent/reserved 不动）/ 409 CAS / audit；
   - 用户月额度覆盖 PUT/DELETE：设置后解析到 user_override、清除后下个窗口
@@ -43,7 +43,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
 UPLOAD_DIR = _bootstrap.UPLOAD_DIR
-os.environ["ADMIN_PASSWORD"] = ""
 import pytest  # noqa: E402
 
 import app as app_mod  # noqa: E402
@@ -354,40 +353,6 @@ def test_enforcement_mode_validation_cas_audit():
     assert events and events[0]["detail"]["changed"] is False
 
 
-@PG
-def test_enforcement_mode_unprotected_config_rejected():
-    """§7.3：金额硬闸未就绪（shadow）+ 旧 turn 闸关闭 = 无保护配置不能保存。
-
-    当前平台没有写 legacy_turn_guard_enabled 的路径（旧 turn 闸恒开），本用例
-    直接注入该键复现「未来引入开关」后的拒绝分支（校验写成可扩展形式，
-    见 spend_store._assert_not_unprotected_tx）。
-    """
-    bh.seed_spend_policies()
-    owner, _u = _setup_users()
-    c = _login(_client(), owner)
-    settings_store.set_setting(spend_store.LEGACY_TURN_GUARD_KEY, False)
-    # shadow（金额闸未就绪）被拒
-    r = c.put("/api/admin/v1/spend/enforcement-mode",
-              json={"mode": "shadow", "expected": "shadow"})
-    assert r.status_code == 400
-    assert r.get_json()["error"]["code"] == "unprotected_spend_config"
-    assert spend_store.enforcement_mode() == "shadow"  # 未变
-    # registered/all（金额硬闸就绪）可保存
-    r2 = c.put("/api/admin/v1/spend/enforcement-mode",
-               json={"mode": "registered", "expected": "shadow"})
-    assert r2.status_code == 200
-    assert spend_store.enforcement_mode() == "registered"
-    # 回滚到 shadow（仍在无保护态）再次被拒——恢复闸开后可回
-    r3 = c.put("/api/admin/v1/spend/enforcement-mode",
-               json={"mode": "shadow", "expected": "registered"})
-    assert r3.status_code == 400
-    settings_store.set_setting(spend_store.LEGACY_TURN_GUARD_KEY, True)
-    r4 = c.put("/api/admin/v1/spend/enforcement-mode",
-               json={"mode": "shadow", "expected": "registered"})
-    assert r4.status_code == 200
-    assert spend_store.enforcement_mode() == "shadow"
-
-
 # --------------------------------------------------------------------------- #
 # 5. 调整当前窗口（confirm + CAS + 只改 snapshot）
 # --------------------------------------------------------------------------- #
@@ -569,10 +534,10 @@ def test_user_total_limit_set_and_restore():
 # 7. 用户创建扩展（同事务一次性总额度 + 不带额度不建行 + 注入失败回滚）
 # --------------------------------------------------------------------------- #
 @PG
-def test_users_create_with_monthly_limit_override_atomic():
+def test_users_create_with_total_limit_atomic():
     """建号带 total_limit_nano_cny → 同事务建一次性总额度（source=admin_create，
     default_version=None；不建 user_override 月策略——写面已随 R3 单轨删除）；
-    旧 monthly 字段同传 400 ambiguous。"""
+    旧 monthly 字段退役：body 带该键一律 400 retired_spend_field。"""
     bh.seed_spend_policies()
     owner, _u = _setup_users()
     c = _login(_client(), owner)
@@ -603,20 +568,19 @@ def test_users_create_with_monthly_limit_override_atomic():
     assert mine and mine[0]["detail"]["total_limit_nano_cny"] == 305 * 10 ** 8
     assert mine[0]["detail"]["spend_target"] == "total_allowance"  # wire 兼容标注
     assert mine[0]["detail"]["limit_surface"] == "total_allowance"
-    # 新旧字段同传 → 稳定 400 ambiguous_spend_limit
-    r_amb = c.post("/api/admin/v1/users", json={
+    # R3 Wave2-Compat：旧 monthly 字段退役——body 带该键一律 400
+    # retired_spend_field（绝不静默忽略），不再有「兼容落总额度」路径
+    r_ret = c.post("/api/admin/v1/users", json={
         "login_id": "amb@x.com", "password": "password-123456",
         "total_limit_nano_cny": "1000000000",
         "monthly_limit_nano_cny": "1000000000"})
-    assert r_amb.status_code == 400
-    assert r_amb.get_json()["error"]["code"] == "ambiguous_spend_limit"
-    # 旧字段单独传（兼容期）：面值按总额度兑现
-    r_legacy = c.post("/api/admin/v1/users", json={
+    assert r_ret.status_code == 400
+    assert r_ret.get_json()["error"]["code"] == "retired_spend_field"
+    r_ret2 = c.post("/api/admin/v1/users", json={
         "login_id": "legacyfld@x.com", "password": "password-123456",
         "monthly_limit_nano_cny": "2000000000"})
-    assert r_legacy.status_code == 200
-    assert r_legacy.get_json()["total_allowance"]["limit_nano_cny"] == \
-        "2000000000"
+    assert r_ret2.status_code == 400
+    assert r_ret2.get_json()["error"]["code"] == "retired_spend_field"
 
 
 @PG
@@ -794,21 +758,23 @@ def test_users_create_rejects_owner_and_bad_amount():
             "login_id": "bad@x.com", "password": "password-123456",
             "total_limit_nano_cny": bad})
         assert rb.status_code == 400, "limit=%r 应 400" % (bad,)
-    # 旧字段（兼容期）坏值同样 400
+    # 旧字段（已退役）：坏值同样 400 retired_spend_field（键出现即拒绝）
     rb = c.post("/api/admin/v1/users", json={
         "login_id": "bad2@x.com", "password": "password-123456",
         "monthly_limit_nano_cny": 5})
     assert rb.status_code == 400
+    assert rb.get_json()["error"]["code"] == "retired_spend_field"
 
 
 # --------------------------------------------------------------------------- #
 # 8. 邀请码总额度模板 + 兑换事务内一次性总额度（Batch B wave 2）
 # --------------------------------------------------------------------------- #
 @PG
-def test_invite_create_with_monthly_limit_template():
-    """Batch B wave 2：邀请初始金额字段为 total_limit_nano_cny（wire 十进制
-    字符串）；旧 monthly 单独传按面值落总额度；同传 400 ambiguous；来源字段
-    接受即 400 retired_invite_field。"""
+def test_invite_create_with_total_limit_template():
+    """Batch B wave 2 + R3 Wave2-Compat：邀请初始金额字段为
+    total_limit_nano_cny（wire 十进制字符串）；旧 monthly 字段退役——body 带
+    该键一律 400 retired_spend_field（绝不静默忽略）；来源字段接受即 400
+    retired_invite_field。"""
     bh.seed_spend_policies()
     owner, _u = _setup_users()
     c = _login(_client(), owner)
@@ -832,19 +798,18 @@ def test_invite_create_with_monthly_limit_template():
     # 金额 JSON number 拒绝
     assert c.post("/api/admin/v1/invites", json={
         "total_limit_nano_cny": 100}).status_code == 400
-    # 旧 monthly 字段单独传（兼容期）：面值按总额度兑现
-    r_legacy = c.post("/api/admin/v1/invites", json={
-        "login_id": "invlegacy@x.com",
-        "monthly_limit_nano_cny": "18000000000"})
-    assert r_legacy.status_code == 200
-    assert r_legacy.get_json()["invite"]["total_limit_nano_cny"] == \
-        "18000000000"
-    # 新旧同传 → 稳定 400 ambiguous_spend_limit
-    r_amb = c.post("/api/admin/v1/invites", json={
-        "total_limit_nano_cny": "1000000000",
-        "monthly_limit_nano_cny": "1000000000"})
-    assert r_amb.status_code == 400
-    assert r_amb.get_json()["error"]["code"] == "ambiguous_spend_limit"
+    # R3 Wave2-Compat：旧 monthly 字段退役——单独传 / 与 total 同传 /
+    # 坏值，一律 400 retired_spend_field（不再有「兼容落总额度」路径）
+    for payload in (
+            {"login_id": "invlegacy@x.com",
+             "monthly_limit_nano_cny": "18000000000"},
+            {"total_limit_nano_cny": "1000000000",
+             "monthly_limit_nano_cny": "1000000000"},
+            {"monthly_limit_nano_cny": 5}):
+        r_ret = c.post("/api/admin/v1/invites", json=payload)
+        assert r_ret.status_code == 400, payload
+        assert r_ret.get_json()["error"]["code"] == "retired_spend_field", \
+            payload
     # 来源字段退役：接受即 400 retired_invite_field（不静默忽略）
     for field in ("source_code", "campaign_id", "cohort"):
         r_ret = c.post("/api/admin/v1/invites", json={field: "whatever"})
@@ -860,8 +825,9 @@ def test_invite_create_with_monthly_limit_template():
 @PG
 def test_invite_redeem_creates_total_allowance_same_transaction():
     """兑换带模板面值：同一事务内建一次性总额度（source=invite，
-    default_version=None），不建 user_override（写面已删）；兼容键
-    acquisition/spend_override_policy 恒 None。"""
+    default_version=None），不建 user_override（写面已删）；恒 None 兼容键
+    acquisition/spend_override_policy 已随 R3 Wave2-Compat 物理删除（不在
+    返回 dict 中）。"""
     bh.seed_spend_policies()
     owner, _u = _setup_users()
     c = _login(_client(), owner)
@@ -875,8 +841,9 @@ def test_invite_redeem_creates_total_allowance_same_transaction():
     assert result["total_allowance"]["limit_nano_cny"] == 15 * 10 ** 9
     assert result["total_allowance"]["source"] == "invite"
     assert result["total_allowance"]["default_version"] is None
-    assert result["acquisition"] is None          # 兼容键恒 None（退役）
-    assert result["spend_override_policy"] is None  # 兼容键恒 None（写面已删）
+    # 兼容键已物理删除（不是恒 None，是整键不在）
+    assert "acquisition" not in result
+    assert "spend_override_policy" not in result
     allowance = spend_store.get_total_allowance(uid)
     assert allowance is not None
     assert allowance["limit_nano_cny"] == 15 * 10 ** 9
@@ -903,7 +870,7 @@ def test_invite_redeem_creates_total_allowance_same_transaction():
 def test_invite_without_limit_redeem_uses_default():
     """R3 单轨：兑换无模板面值 → 同事务按 ai_spend_total_defaults 权威行
     （20 CNY）建 allowance（source=invite，default_version 锚定）；兼容键
-    spend_override_policy 恒 None。"""
+    spend_override_policy 已随 R3 Wave2-Compat 物理删除。"""
     bh.seed_spend_policies()
     owner, _u = _setup_users()
     r = registration_store.create_invite(owner["user_id"],
@@ -911,7 +878,7 @@ def test_invite_without_limit_redeem_uses_default():
     result = registration_store.redeem_invite(
         r["token"], "plain@x.com", "password-123456")
     uid = result["user"]["user_id"]
-    assert result["spend_override_policy"] is None
+    assert "spend_override_policy" not in result
     assert result["total_allowance"]["limit_nano_cny"] == 20 * 10 ** 9
     allowance = spend_store.get_total_allowance(uid)
     assert allowance is not None

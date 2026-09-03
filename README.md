@@ -64,10 +64,12 @@ PathTogether 容器只运行平台。HistoPilot 使用自己的镜像、进程�
 | `PLUGIN_BUNDLES_DIR` | `${SHARE_DATA_DIR}/plugins` | 独立插件 release bundle 安装目录 |
 | `STORAGE_BACKEND` | `json` | `json` / `postgres` / `dual` |
 | `DATABASE_URL` | — | PostgreSQL 连接串 |
-| `ADMIN_PASSWORD` | — | owner 初始密码 |
-| `REGISTRATION_OPEN` | `0` | 自助注册开关 |
+| `BOOTSTRAP_OWNER_LOGIN_ID` | — | 空库首建 owner 的登录账号 |
+| `BOOTSTRAP_OWNER_PASSWORD_FILE` | — | 空库首建 owner 的 secret 文件路径 |
 | `HISTOPILOT_URL` | `http://127.0.0.1:8055` | HistoPilot 兼容网关目标；仅安装插件时需要 |
 | `HISTOPILOT_INTERNAL_TOKEN` | 自动生成 | PathTogether 与 HistoPilot 的服务间令牌 |
+
+注册模式（closed / invite_only）由 owner 后台的 `platform_settings.registration_mode` 运行时管理，不再有环境变量开关。
 
 ## 仓库边界
 
@@ -77,7 +79,7 @@ PathTogether 容器只运行平台。HistoPilot 使用自己的镜像、进程�
 
 两边只通过版本化 HTTP Plugin Contract 通信。HistoPilot 不直接读取 WSI 文件或平台数据库；PathTogether 不读取 HistoPilot canonical session。
 
-旧变量 `AI_SIDECAR_URL`、`AI_INTERNAL_TOKEN` 在迁移期仍可用，但新部署应使用上表中的正式名称。
+部署配置请使用上表中的正式名称（HISTOPILOT 系）。
 
 ## 开发与测试
 

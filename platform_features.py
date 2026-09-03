@@ -24,7 +24,8 @@ STORAGE_BACKEND = (os.environ.get("STORAGE_BACKEND") or "json").strip()
 
 
 def _truthy(value) -> bool:
-    """env 值 → 布尔（与 app.py REGISTRATION_OPEN / _env_truthy 口径一致）。"""
+    """env 值 → 布尔（与 app.py _env_truthy 口径一致；REGISTRATION_OPEN env
+    已随 R3 Wave2-Compat 删除，本 helper 仅服务于 PUBLIC_DEMO_ENABLED）。"""
     return (value or "").strip().lower() in _TRUTHY
 
 

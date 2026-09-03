@@ -243,11 +243,11 @@ def test_owner_invite_create_rate_limited_via_api(monkeypatch):
                   "role": "owner",
                   "auth_version": owner.get("auth_version", 1)})
     for _ in range(2):
-        r = client.post("/api/admin/registration-invites", json={})
+        r = client.post("/api/admin/v1/invites", json={})
         assert r.status_code == 200
-    r3 = client.post("/api/admin/registration-invites", json={})
+    r3 = client.post("/api/admin/v1/invites", json={})
     assert r3.status_code == 429
-    assert r3.get_json()["code"] == "rate_limited"
+    assert r3.get_json()["error"]["code"] == "rate_limited"
 
 
 if __name__ == "__main__":

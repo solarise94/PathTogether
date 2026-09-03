@@ -463,7 +463,7 @@ def test_login_wrong_password_and_lock():
 
 
 # =========================================================================== #
-# /api/admin/users 权限与保护
+# /api/admin/v1/users 权限与保护（旧面已随 R3 wave1 删除）
 # =========================================================================== #
 def test_admin_users_owner_vs_user(monkeypatch):
     monkeypatch.setenv("ADMIN_PASSWORD", "")
@@ -472,12 +472,11 @@ def test_admin_users_owner_vs_user(monkeypatch):
     client = make_client()
     # owner 登录
     login(client, "admin", OWNER_PW)
-    r = client.get("/api/admin/users")
+    r = client.get("/api/admin/v1/users")
     body = json.loads(r.data)
-    check("owner GET /api/admin/users 200", r.status_code == 200)
-    check("返回 users 数组", isinstance(body.get("users"), list))
-    check("返回 registration_open", "registration_open" in body)
-    check("list 不含 hash", all("password_hash" not in u for u in body["users"]))
+    check("owner GET /api/admin/v1/users 200", r.status_code == 200)
+    check("返回 items 数组", isinstance(body.get("items"), list))
+    check("list 不含 hash", all("password_hash" not in u for u in body["items"]))
     # 创建 user（旧建号端点已 410 退役，review R2-F1——创建契约迁至
     # POST /api/admin/v1/users，响应包 user 键；最小改动：仅换端点与解包）
     r2 = client.post("/api/admin/v1/users", json={"login_id": "new@x.com", "password": PW2})
@@ -496,8 +495,8 @@ def test_admin_users_owner_vs_user(monkeypatch):
     # user 角色登录 → 403
     client2 = make_client()
     login(client2, "u@x.com", PW2)
-    r5 = client2.get("/api/admin/users")
-    check("user GET /api/admin/users 403", r5.status_code == 403)
+    r5 = client2.get("/api/admin/v1/users")
+    check("user GET /api/admin/v1/users 403", r5.status_code == 403)
 
 
 def test_last_owner_protection(monkeypatch):
@@ -508,22 +507,23 @@ def test_last_owner_protection(monkeypatch):
     login(client, "admin", OWNER_PW)
     # owner 不可经 Web 禁用（批次 A docs §3.2 不变量 5/§7.2）：任何 owner
     # target 一律 409（旧「最后 owner 400 / 多 owner 可禁用」语义已废除）
-    r = client.post("/api/admin/users/%s/disable" % owner["user_id"])
+    r = client.post("/api/admin/v1/users/%s/disable" % owner["user_id"])
     check("禁用 owner 409", r.status_code == 409, "got %s" % r.status_code)
     check("错误文案提示 owner 保护",
-          "owner" in json.loads(r.data).get("error", ""))
-    r_enable = client.post("/api/admin/users/%s/enable" % owner["user_id"])
+          "owner" in json.dumps(json.loads(r.data).get("error"),
+                                ensure_ascii=False))
+    r_enable = client.post("/api/admin/v1/users/%s/enable" % owner["user_id"])
     check("启用 owner 409（同口径）", r_enable.status_code == 409)
     # 仍可禁用 user
     uid = user_store.get_user_by_login_id("u@x.com")["user_id"]
-    r2 = client.post("/api/admin/users/%s/disable" % uid)
+    r2 = client.post("/api/admin/v1/users/%s/disable" % uid)
     check("禁用 user 200", r2.status_code == 200)
     # 多 owner（json 后端可直插构造）：同样 409；PG 下 0015 部分唯一索引
     # 使该场景不可达（>1 enabled owner 由索引与启动检查双重防御）。
     if conftest.BACKEND == "json":
         user_store.create_user("o2@x.com", PW2, role="owner", display_name="o2")
         o2 = user_store.get_user_by_login_id("o2@x.com")["user_id"]
-        r3 = client.post("/api/admin/users/%s/disable" % o2)
+        r3 = client.post("/api/admin/v1/users/%s/disable" % o2)
         check("多 owner 时禁用其一也 409", r3.status_code == 409)
 
 
@@ -534,11 +534,11 @@ def test_admin_reset_password(monkeypatch):
     uid = user_store.get_user_by_login_id("u@x.com")["user_id"]
     client = make_client()
     login(client, "admin", OWNER_PW)
-    r = client.post("/api/admin/users/%s/password" % uid, json={"password": PW3})
+    r = client.post("/api/admin/v1/users/%s/password-reset" % uid, json={"password": PW3})
     check("owner 重置密码 200", r.status_code == 200)
     check("新密码可登录", user_store.verify_user("u@x.com", PW3) is not None)
     check("重置递增 auth_version", user_store.get_user(uid)["auth_version"] == 2)
-    r_short = client.post("/api/admin/users/%s/password" % uid,
+    r_short = client.post("/api/admin/v1/users/%s/password-reset" % uid,
                           json={"password": "short"})
     check("重置短密码 400（统一 15..200）", r_short.status_code == 400)
 
@@ -555,7 +555,7 @@ def test_disable_invalidates_existing_session(monkeypatch):
 
     owner_client = make_client()
     login(owner_client, "admin", OWNER_PW)
-    rd = owner_client.post("/api/admin/users/%s/disable" % u["user_id"])
+    rd = owner_client.post("/api/admin/v1/users/%s/disable" % u["user_id"])
     check("禁用 user 200", rd.status_code == 200)
 
     r2 = user_client.get("/api/projects")

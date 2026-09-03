@@ -2483,18 +2483,13 @@ def login():
         next_url=post_next, status=401)
 
 
-@app.route("/logout", methods=["GET", "POST"])
+@app.route("/logout", methods=["POST"])
 def logout():
     """登出：清 session，跳登录页。
 
-    推荐路径是 POST + CSRF（docs §10.14）；GET 保留为**短期兼容**（记 warning）。
-    兼容窗口仍开放：开发阶段不移除 GET，也不改产品语义。后续单独窗口结束后
-    再删路由、测试与文档分支。AUTH_ENABLED=False（本地免登录）时 GET 行为与旧版一致。
+    仅接受 POST + CSRF（docs §10.14）；GET /logout 已随 R3 wave1 物理删除
+    （GET 登出可被跨站标签触发，不符合 CSRF 加固口径），GET 请求现按 405 拒绝。
     """
-    if request.method == "GET":
-        app.logger.warning(
-            "GET /logout 已废弃（CSRF 加固，docs §10.14）：短期兼容保留，请改用"
-            " POST /logout + CSRF token；后续版本将移除 GET。")
     session.clear()
     return redirect("/login")
 
@@ -4198,150 +4193,9 @@ def _check_registration_preconditions_or_warn(environ=None):
             mode, "；".join(failures))
 
 
-@app.route("/api/admin/users", methods=["GET"])
-def api_admin_users_list():
-    """列出全部用户（不含 hash）与注册模式。仅 owner。
-
-    批次 C（docs §4.2）：每个用户 dict 只带 "login_id"（规范登录账号），
-    不再携带 deprecated 的 "email" 同值键。
-    """
-    auth = _require_owner()
-    if auth:
-        return auth
-    mode = _effective_registration_mode()
-    return jsonify(users=user_store.list_users(),
-                   registration_mode=mode,
-                   # 旧 UI 兼容字段：invite_only 视为「开放」
-                   registration_open=(mode == "invite_only"))
-
-
 # 启动期 fail-closed 检查（§3.2 末段；在定义处就近执行，模块加载即告警一次）
 _check_registration_preconditions_or_warn()
 
-
-#: review R2-F1：旧建号端点统一退役响应（410 Gone + 稳定 code + 中文指引；
-#: 惯例同 _turn_budgets_retired_response / _spend_override_retired_response）。
-#: total 模式下本端点会建出无 allowance 行的用户（授权面永久 fail-closed），
-#: 故无条件退役，建号一律走 v1 组合原语或邀请兑换。
-_ADMIN_USERS_CREATE_RETIRED_NOTE = (
-    "旧建号端点已退役：请改用 POST /api/admin/v1/users（同事务建号+额度面）"
-    "或邀请兑换")
-
-
-def _admin_users_create_retired_response():
-    """退役建号端点统一出口：410 + code + 指引文案，并 audit 这次尝试。"""
-    _audit("users.retired_write", target_type="user",
-           target_id=None,
-           detail={"endpoint": request.method + " " + request.path})
-    return (jsonify(error=_ADMIN_USERS_CREATE_RETIRED_NOTE,
-                    code="admin_users_create_deprecated"), 410)
-
-
-@app.route("/api/admin/users", methods=["POST"])
-def api_admin_users_create():
-    """已退役（review R2-F1）：无条件 410 admin_users_create_deprecated。
-
-    旧实现直调 ``user_store.create_user``——user_spend_target=total_allowance
-    （cutover 后）时会建出无总额度行的用户，授权面随即永久 fail-closed，
-    不可保留。owner 门控保持在 410 之前（匿名 401 / 非 owner 403 语义不变，
-    不向未授权方泄露端点存活性差异——与 user_attribution_retired /
-    turn_budgets_retired 同一顺序惯例）。
-    """
-    auth = _require_owner()
-    if auth:
-        return auth
-    return _admin_users_create_retired_response()
-
-
-@app.route("/api/admin/users/<user_id>/disable", methods=["POST"])
-def api_admin_users_disable(user_id):
-    """禁用用户。仅 owner。target 为 owner → 409（owner 不可经 Web 禁用）。
-
-    账户系统批次 A（docs §3.2 不变量 5 / §7.2）：owner 的禁用/恢复只能走
-    主机侧 break-glass CLI；disable 在 store 层同事务递增 auth_version，
-    该用户全部旧 session 立即失效。
-    """
-    auth = _require_owner()
-    if auth:
-        return auth
-    target = user_store.get_user(user_id)
-    if target is None:
-        return jsonify(error="用户不存在"), 404
-    if target.get("role") == user_store.ROLE_OWNER:
-        return jsonify(error=(
-            "不能经 Web 禁用 owner（docs §3.2 不变量 5）；如需恢复 owner 访问"
-            "请使用本人改密或主机侧 break-glass CLI（useradmin）")), 409
-    user = user_store.set_user_disabled(user_id, True)
-    _audit("user.disable", target_type="user", target_id=user_id)
-    return jsonify(user)
-
-
-@app.route("/api/admin/users/<user_id>/enable", methods=["POST"])
-def api_admin_users_enable(user_id):
-    """启用用户。仅 owner。target 为 owner → 409（与 disable 同口径）。
-
-    enable 同样在 store 层同事务递增 auth_version（docs §6.2：防止禁用期间
-    未发请求的旧 Cookie 在重新启用后被激活）。
-    """
-    auth = _require_owner()
-    if auth:
-        return auth
-    target = user_store.get_user(user_id)
-    if target is None:
-        return jsonify(error="用户不存在"), 404
-    if target.get("role") == user_store.ROLE_OWNER:
-        return jsonify(error=(
-            "不能经 Web 启用/禁用 owner（docs §3.2 不变量 5）；owner 恢复"
-            "请使用主机侧 break-glass CLI（useradmin --enable）")), 409
-    user = user_store.set_user_disabled(user_id, False)
-    _audit("user.enable", target_type="user", target_id=user_id)
-    return jsonify(user)
-
-
-@app.route("/api/admin/users/<user_id>/password", methods=["POST"])
-def api_admin_users_password(user_id):
-    """重置普通用户密码。仅 owner。JSON: {password}。
-
-    账户系统批次 A（docs §7.2）：
-      - target 必须存在且 role='user'；owner target → 409（提示走本人改密
-        或主机侧 break-glass CLI；旧「env ADMIN_PASSWORD 兜底可重置」的说法
-        已废除——env 不再参与已有账号的密码对账，docs §5.1）；
-      - 新密码统一 15..200（user_store 常量，不再硬编码 8）；
-      - hash 更新与 auth_version+1 同事务（store 层），该用户全部旧 session
-        立即失效；响应只回公共用户 dict，不回显密码/hash；
-      - 写 user.password_reset audit（actor=操作者、target、detail 只含
-        sessions_revoked=true）。
-    """
-    auth = _require_owner()
-    if auth:
-        return auth
-    target = user_store.get_user(user_id)
-    if target is None:
-        return jsonify(error="用户不存在"), 404
-    if target.get("role") == user_store.ROLE_OWNER:
-        return jsonify(error=(
-            "不能经 Web 重置 owner 密码（docs §3.2 不变量 5）：owner 请用"
-            "「修改我的密码」自助修改；失联恢复走主机侧 break-glass CLI"
-            "（useradmin reset-owner-password）")), 409
-    body = request.get_json(silent=True) or {}
-    new_password = body.get("password")
-    if not isinstance(new_password, str) or not new_password:
-        return jsonify(error="缺少密码"), 400
-    if (len(new_password) < user_store.PASSWORD_MIN_LENGTH
-            or len(new_password) > user_store.PASSWORD_MAX_LENGTH):
-        return jsonify(error=(
-            "密码长度须在 %d..%d 字符之间（当前 %d 字符）"
-            % (user_store.PASSWORD_MIN_LENGTH, user_store.PASSWORD_MAX_LENGTH,
-               len(new_password)))), 400
-    try:
-        user = user_store.set_user_password(user_id, new_password)
-    except ValueError as e:
-        return jsonify(error=str(e)), 400
-    if user is None:
-        return jsonify(error="用户不存在"), 404
-    _audit("user.password_reset", target_type="user", target_id=user_id,
-           detail={"sessions_revoked": True})
-    return jsonify(user)
 
 
 # =========================================================================== #
@@ -4454,212 +4308,6 @@ def _set_registration_mode_service(mode, actor_user_id):
     return {"mode": mode}, None
 
 
-@app.route("/api/admin/settings/registration", methods=["GET"])
-def api_admin_registration_settings_get():
-    """注册模式与前置条件状态（owner；兼容旧路由，逻辑见 service）。"""
-    auth = _require_owner()
-    if auth:
-        return auth
-    return jsonify(**_registration_settings_payload())
-
-
-@app.route("/api/admin/settings/registration", methods=["PUT"])
-def api_admin_registration_settings_put():
-    """切换注册模式（owner；兼容旧路由，逻辑见 service）。
-
-    - public 一律 400 public_registration_not_supported（本阶段无回退路径）；
-    - 切 invite_only 前置条件不满足（非 HTTPS / 非 Secure Cookie / 非 PG）→
-      400 列出原因（fail-closed，不允许写入一个不会生效的模式值）。
-    """
-    auth = _require_owner()
-    if auth:
-        return auth
-    body = request.get_json(silent=True) or {}
-    payload, err = _set_registration_mode_service(
-        body.get("mode"), current_identity().get("user_id"))
-    if err:
-        status, code, message = err
-        return jsonify(error=message, code=code), status
-    return jsonify(**payload)
-
-
-@app.route("/api/admin/registration-invites", methods=["POST"])
-def api_admin_registration_invites_create():
-    """创建一次性邀请码（owner）。body: {login_id?, ttl_hours?, ai_access?,
-    total_limit_nano_cny?, note?}。
-
-    批次 C（docs §4.2/§8.2）：绑定字段语义为「允许兑换的登录账号 login_id」
-    （非已验证邮箱）；只接受 ``login_id`` 入参——批次 B 的 ``email`` 兼容入参
-    已删除，body 仍带 email 键一律显式 400（绝不静默降级为不绑定邀请）。
-    响应只携带 login_id_masked（email_masked 已删除）。
-
-    批次 D1 13 / Batch B wave 2（§4.4）：邀请与来源解耦——body 带
-    ``source_code``/``campaign_id``/``cohort`` 一律 400 retired_invite_field；
-    初始金额字段为 ``total_limit_nano_cny``（旧 monthly 单独传兼容一个发布
-    周期，同传 400 ambiguous_spend_limit）。
-
-    仅本响应返回明文 code（Cache-Control: no-store，刷新即失）；库内只存带盐
-    hash。owner 创建频率受每分钟/每日上限。绑定值省略 = 不绑定（高风险，
-    UI 需提示）。
-    """
-    auth = _require_owner()
-    if auth:
-        return auth
-    if not platform_features.budget_features_available():
-        return _registration_unavailable_response()
-    import auth_limit_store
-    owner_hash = _registration_invite_owner_hash()
-    try:
-        retry = auth_limit_store.check_owner_invite_creation_locked(owner_hash)
-    except Exception:
-        app.logger.exception("邀请码创建限流存储不可用，fail-closed 503")
-        return _registration_unavailable_response()
-    if retry > 0:
-        return (jsonify(error="邀请码创建过于频繁，请稍后再试",
-                        code="rate_limited",
-                        retry_after_seconds=max(1, int(retry))),
-                429, {"Retry-After": str(max(1, int(retry)))})
-
-    body = request.get_json(silent=True) or {}
-    # 绑定登录账号：只接受 login_id（批次 C 删除 email 兼容入参）。email 键
-    # 仍出现说明是旧客户端——显式 400，绝不静默降级为不绑定邀请（高风险）。
-    if "email" in body:
-        return jsonify(error="email 入参已随批次 C 移除，绑定登录账号请改用 login_id"), 400
-    # 批次 D1 13（§4.4）：来源字段退役——接受即 400（不静默忽略）
-    retired = [k for k in ("source_code", "campaign_id", "cohort")
-               if body.get(k) is not None]
-    if retired:
-        return jsonify(error="邀请不再携带来源字段：%s（§4.4 邀请与来源解耦）"
-                             % ", ".join(sorted(retired)),
-                        code="retired_invite_field"), 400
-    if body.get("monthly_limit_nano_cny") is not None \
-            and body.get("total_limit_nano_cny") is not None:
-        return (jsonify(error="monthly_limit_nano_cny 与 total_limit_nano_cny "
-                              "只能传其一（旧月额度字段已退役）",
-                        code="ambiguous_spend_limit"), 400)
-    login_id = body.get("login_id")
-    if login_id is not None:
-        login_id = str(login_id).strip()
-        if not login_id:
-            return jsonify(error="绑定登录账号传空字符串请改传 null（不绑定）"), 400
-        if len(login_id) > 120:
-            return jsonify(error="绑定登录账号过长（≤120 字符）"), 400
-        if any(ch.isspace() for ch in login_id):
-            return jsonify(error="绑定登录账号不能包含空白字符"), 400
-    try:
-        ttl_hours = int(body.get("ttl_hours") or _INVITE_DEFAULT_TTL_HOURS)
-    except (TypeError, ValueError):
-        return jsonify(error="ttl_hours 需为整数小时"), 400
-    if not 1 <= ttl_hours <= _INVITE_MAX_TTL_HOURS:
-        return jsonify(error="ttl_hours 需在 1–%d 之间" % _INVITE_MAX_TTL_HOURS), 400
-    ai_access = body.get("ai_access")
-    if ai_access is not None and not isinstance(ai_access, bool):
-        return jsonify(error="ai_access 需为布尔值"), 400
-    note = body.get("note")
-    if note is not None and (not isinstance(note, str) or len(note) > 200):
-        return jsonify(error="note 需为 ≤200 字符的字符串"), 400
-    # Batch B wave 2：初始**总额度**模板（十进制字符串 nano-CNY | null=不建行）；
-    # 旧 monthly 字段单独传按面值兼容落总额度（store 语义）
-    try:
-        total_limit = _admin_v1_amount_in(
-            body.get("total_limit_nano_cny")
-            if body.get("total_limit_nano_cny") is not None
-            else body.get("monthly_limit_nano_cny"),
-            "total_limit_nano_cny")
-    except ValueError as exc:
-        return jsonify(error=str(exc)), 400
-
-    try:
-        auth_limit_store.record_owner_invite_creation(owner_hash)
-        invite = registration_store.create_invite(
-            current_identity().get("user_id"), login_id=login_id,
-            ttl_seconds=ttl_hours * 3600,
-            ai_access=bool(ai_access),
-            note=note or "",
-            total_limit_nano_cny=total_limit)
-    except ValueError as exc:
-        return jsonify(error=str(exc)), 400
-    except platform_features.PgFeatureUnavailable:
-        return _registration_unavailable_response()
-    except registration_store.RegistrationStoreError as exc:
-        return jsonify(error=str(exc)), 500
-    out = _admin_v1_nano_out(_invite_public_view(invite))
-    out["token"] = invite["token"]  # 明文码仅此一次
-    resp = jsonify(out)
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers["Pragma"] = "no-cache"
-    return resp
-
-
-@app.route("/api/admin/registration-invites", methods=["GET"])
-def api_admin_registration_invites_list():
-    """列出邀请（owner）：绑定登录账号掩码 + 过期时间 + 状态；永不返回
-    token/hash（批次 C 起只输出 login_id_masked）。"""
-    auth = _require_owner()
-    if auth:
-        return auth
-    if not platform_features.budget_features_available():
-        return _registration_unavailable_response()
-    try:
-        invites = registration_store.list_invites()
-    except platform_features.PgFeatureUnavailable:
-        return _registration_unavailable_response()
-    except Exception:
-        app.logger.exception("邀请码列表读取失败")
-        return jsonify(error="邀请码列表读取失败"), 500
-    return jsonify(invites=[_admin_v1_nano_out(_invite_public_view(i))
-                            for i in invites],
-                   mode=_effective_registration_mode(),
-                   cache_control_note="token 已在创建时一次性返回，不可再查询")
-
-
-@app.route("/api/admin/registration-invites/<invite_id>/revoke",
-           methods=["POST"])
-def api_admin_registration_invites_revoke(invite_id):
-    """撤销邀请码（owner，幂等；已消费的拒绝撤销）。"""
-    auth = _require_owner()
-    if auth:
-        return auth
-    if not platform_features.budget_features_available():
-        return _registration_unavailable_response()
-    try:
-        invite = registration_store.revoke_invite(
-            invite_id, current_identity().get("user_id"))
-    except registration_store.InviteNotFoundError:
-        return jsonify(error="邀请码不存在"), 404
-    except registration_store.RegistrationStoreError as exc:
-        return jsonify(error=str(exc)), 409
-    except platform_features.PgFeatureUnavailable:
-        return _registration_unavailable_response()
-    return jsonify(_admin_v1_nano_out(_invite_public_view(invite)))
-
-
-@app.route("/api/admin/users/<user_id>/ai-access", methods=["POST"])
-def api_admin_users_ai_access(user_id):
-    """授予/收回注册用户的平台 AI 访问（owner；docs §3.7 显式授予）。
-
-    body: {enabled: bool}。受邀用户默认 ai_access=false。PG-only（users.ai_access
-    列随 0012 迁移；json/dual 后端 503）。
-    """
-    auth = _require_owner()
-    if auth:
-        return auth
-    if platform_features.current_backend() != "postgres":
-        return _registration_unavailable_response()
-    body = request.get_json(silent=True) or {}
-    if not isinstance(body.get("enabled"), bool):
-        return jsonify(error="缺少 enabled 布尔字段"), 400
-    import user_store_pg
-    user = user_store_pg.set_user_ai_access(user_id, bool(body["enabled"]))
-    if user is None:
-        return jsonify(error="用户不存在"), 404
-    _audit("user.ai_access", target_type="user", target_id=user_id,
-           detail={"enabled": bool(body["enabled"])})
-    out = dict(user)
-    out.pop("password_hash", None)
-    return jsonify(out)
-
-
 # --------------------------------------------------------------------------- #
 # S4 管理员只读身份预览：进入 / 退出（session-isolation-fix-plan §3.4）
 #
@@ -4736,17 +4384,6 @@ def api_admin_preview_stop():
     return jsonify(ok=True, preview=None)
 
 
-@app.route("/admin/registration")
-def admin_registration_page():
-    """PR5 迁移兼容：独立邀请注册页已并入 admin 插件「邀请与来源」页。
-
-    旧 URL 保留一个版本做 302 → /admin#invites（方案 §13 PR5「保留一个版本的
-    重定向兼容，再删除独立模板」）；管理动作全部改在 admin 插件内完成。非
-    owner 不强制在此判权——目标 /admin 自带 owner 门控（§8.1）。
-    """
-    return redirect("/admin#invites", code=302)
-
-
 # --------------------------------------------------------------------------- #
 # owner AI 预算设置 / 用量（docs §4.2 / §9.2，PT-3）
 #
@@ -4767,19 +4404,6 @@ _BUDGET_SETTINGS_FIELDS = (
 #: 允许 0 的限制字段（0=关闭该子池：Demo 子额度 / owner 保留 / user 共享池）
 _BUDGET_ZEROABLE_FIELDS = frozenset((
     "demo_turn_limit", "owner_reserved_turn_limit", "user_pool_turn_limit"))
-
-
-def _budget_require_pg():
-    """json/dual 后端访问预算 API → (error_response, None)；否则 (None, None)。"""
-    if not platform_features.budget_features_available():
-        return (
-            (jsonify(error="AI 预算需要 STORAGE_BACKEND=postgres；json/dual 后端"
-                           "不提供跨 worker 预算",
-                     code=platform_features.PgFeatureUnavailable.code),
-             503),
-            None,
-        )
-    return None, None
 
 
 def _validate_budget_settings(body, current_limits):
@@ -4832,104 +4456,6 @@ def _validate_budget_settings(body, current_limits):
                 user_pool, owner_reserve,
                 user_pool + owner_reserve, platform))
     return validated, None
-
-
-@app.route("/api/admin/settings/ai-budget", methods=["GET"])
-def api_admin_ai_budget_get():
-    """当前周期用量与限制（冻结历史，批次 F 起只读 + legacy 标记）。
-
-    turn 消费闸已随金额硬闸退役（§7.3 阶段 2）：本端点保留一个兼容版本供
-    只读报表（ai_budget_* 表不删），响应带 ``legacy: true`` 与中文说明。
-    返回：period、limits、usage、demo_runs、concurrency。
-    json/dual → 503 pg_backend_required。
-    """
-    auth = _require_owner()
-    if auth:
-        return auth
-    err, _ = _budget_require_pg()
-    if err is not None:
-        return err
-    try:
-        report = budget_store.usage_report()
-    except platform_features.PgFeatureUnavailable as exc:
-        return _budget_error_response(exc, 503, code=exc.code)
-    except Exception:
-        app.logger.exception("读取 AI 预算用量失败")
-        return jsonify(error="读取 AI 预算用量失败"), 500
-    period = report["period"]
-    limits = {k: period.get(k) for k in _BUDGET_SETTINGS_FIELDS}
-    # 当前运行数：无独立并发计数器，用在途 reserved（已预占未终态）作近似；
-    # 上限取周期配置的并发字段（本阶段唯一并发上限）。
-    concurrency = {
-        "current": int(report["platform"]["reserved"]) + int(report["own"]["reserved"]),
-        "max": int(period.get("demo_max_concurrency") or 0),
-    }
-    demo_runs = {"reserved": 0, "accepted": 0, "finished": 0, "released": 0,
-                 "expired": 0, "active": 0, "total": 0}
-    try:
-        # 批次 E：run 状态权威在 demo_runs（0026）；demo_sessions.run_state
-        # 一次性状态机已退役，不再计数
-        demo_runs = demo_store.count_run_states()
-    except Exception:
-        app.logger.warning("读取 Demo run 用量失败", exc_info=True)
-    return jsonify(
-        legacy=True,
-        note="turn 消费闸已于批次 F 退役，以下为冻结历史",
-        period={
-            "id": period["id"],
-            "started_at": period["started_at"],
-            "closed_at": period["closed_at"],
-        },
-        limits=limits,
-        usage={
-            "platform": report["platform"],
-            "demo": report["demo"],
-            "owner": report["owner"],
-            "user_pool": report["user_pool"],
-            "by_subject_type": report["by_subject_type"],
-            "per_user": report["per_user"],
-            "own": report["own"],
-        },
-        demo_runs=demo_runs,
-        concurrency=concurrency,
-        backend=platform_features.current_backend(),
-    )
-
-
-#: 批次 F：turn 消费额度管理写端点的统一退役响应（410 Gone + 稳定 code +
-#: 中文指引）。读取端点保留（冻结历史）。
-_TURN_BUDGETS_RETIRED_NOTE = (
-    "turn 消费额度已退役，金额预算请用 /api/admin/v1/spend/* 与设置页")
-
-
-def _turn_budgets_retired_response():
-    """退役写端点统一出口：410 + code + 指引文案，并 audit 这次尝试。"""
-    _audit("turn_budgets.retired_write", target_type="ai_budget_period",
-           target_id=None,
-           detail={"endpoint": request.method + " " + request.path})
-    return (jsonify(error=_TURN_BUDGETS_RETIRED_NOTE,
-                    code="turn_budgets_retired"), 410)
-
-
-@app.route("/api/admin/settings/ai-budget", methods=["PUT"])
-def api_admin_ai_budget_put():
-    """已退役（批次 F §7.3 阶段 2）：turn 消费闸随金额硬闸关闭，周期限制不再
-    可写。安全参数（demo_enabled/步数/并发）迁 settings_store
-    （PUT /api/admin/v1/settings/runtime）；金额额度走 /api/admin/v1/spend/*。"""
-    auth = _require_owner()
-    if auth:
-        return auth
-    return _turn_budgets_retired_response()
-
-
-@app.route("/api/admin/settings/ai-budget/reset", methods=["POST"])
-def api_admin_ai_budget_reset():
-    """已退役（批次 F）：开新预算周期随 turn 消费闸退役。在途 Demo run 的
-    解锁请用 demo_store.reset_demo_runs（管理面不再暴露）。"""
-    auth = _require_owner()
-    if auth:
-        return auth
-    return _turn_budgets_retired_response()
 
 
 # --------------------------------------------------------------------------- #
@@ -5146,36 +4672,12 @@ def api_admin_demo_catalog_delete():
     )
 
 
-@app.route("/api/admin/audit", methods=["GET"])
-def api_admin_audit():
-    """读取协作操作审计日志（Stage 3c-2）。仅 owner。
-
-    query: limit（缺省 50）、offset（缺省 0）、action（可选精确过滤）。
-    返回 {events: [...], limit, offset}，最新在前。
-    """
-    auth = _require_owner()
-    if auth:
-        return auth
-    try:
-        limit = int(request.args.get("limit", "50") or "50")
-    except (TypeError, ValueError):
-        limit = 50
-    try:
-        offset = int(request.args.get("offset", "0") or "0")
-    except (TypeError, ValueError):
-        offset = 0
-    limit = min(max(limit, 0), 500)
-    offset = max(offset, 0)
-    action = request.args.get("action") or None
-    events = share_store.list_audit(limit=limit, offset=offset, action=action)
-    return jsonify(events=events, limit=limit, offset=offset)
-
-
 # =========================================================================== #
 # Admin API v1 —— 只读子集（PR3b，docs/admin-billing-plugin-implementation-plan.md §9）
 #
 # 面向 admin.workspace 插件（经 AdminBridge → apiFetch/CSRF 调用）的分页、
-# 可版本化管理 API；旧 /api/admin/* 在迁移期保留不动（PR5 才迁 UI）。
+# 可版本化管理 API；旧非 v1 /api/admin/* 管理面已随 R3 wave1 物理删除，
+# v1 是唯一活面（preview / demo-catalog / plugins 等专用端点除外）。
 #
 # 本批只做**只读**（+ provider balance refresh 这一个受控动作）：
 #   - 全部端点 `_require_owner()`（actor 判定——预览态 actor 仍是 owner，但
@@ -5575,8 +5077,8 @@ def admin_v1_overview():
     return jsonify(
         users=users_section,
         billing=billing_section,
-        # 批次 D1（§4.2）：turn_budget 段已移出概览（冻结历史仍在
-        # /api/admin/v1/turn-budgets 只读兼容，插件不再渲染）
+        # 批次 D1（§4.2）：turn_budget 段已移出概览（R3 wave1 起旧
+        # /api/admin/v1/turn-budgets 只读兼容端点亦已删除，插件不渲染）
         # G7：V1/ZIP 收口状态机的 committing 积压观测（只含计数与年龄）
         uploads=_admin_v1_uploads_section(),
         backend=platform_features.current_backend(),
@@ -5689,31 +5191,6 @@ def admin_v1_users():
     return jsonify(items=items, next_cursor=next_cursor, limit=limit,
                    billing_available=billing_ok)
 
-
-@app.route("/api/admin/v1/billing/accounts/<user_id>", methods=["GET"])
-def admin_v1_billing_account(user_id):
-    """单用户账户+余额+caps（§9：未开户 account:null，不伪造 0 余额）。"""
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    if not platform_features.billing_features_available():
-        return _admin_v1_pg_required()
-    target = user_store.get_user(user_id)
-    if target is None:
-        return _admin_v1_error(404, "user_not_found", "用户不存在")
-    try:
-        account = billing_store.get_billing_account_by_user(user_id)
-        if account is None:
-            return jsonify(user_id=user_id, account=None, balance_nano=None)
-        balance = billing_store.account_balance_nano(account["account_id"])
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
-    except Exception:
-        app.logger.exception("admin v1 billing account 读取失败")
-        return _admin_v1_error(500, "internal", "账户读取失败")
-    out = _admin_v1_nano_out(dict(account))
-    return jsonify(user_id=user_id, account=out,
-                   balance_nano=_admin_v1_nano_str(balance))
 
 
 @app.route("/api/admin/v1/billing/usage-events", methods=["GET"])
@@ -5956,58 +5433,19 @@ def admin_v1_audit():
                    next_cursor=next_cursor, limit=limit)
 
 
-@app.route("/api/admin/v1/turn-budgets", methods=["GET"])
-def admin_v1_turn_budgets():
-    """turn 预算读取（冻结历史，批次 F 起只读 + legacy 标记）。
-
-    返回与旧 GET /api/admin/settings/ai-budget 同源的 period/limits/usage
-    （budget_store.usage_report 权威原语）；写方法（update/new-period）已随
-    turn 消费闸退役（410 turn_budgets_retired）。
-    """
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    if not platform_features.budget_features_available():
-        return _admin_v1_error(
-            503, "pg_backend_required",
-            "turn 预算要求 STORAGE_BACKEND=postgres（当前 %r），fail-closed"
-            % platform_features.current_backend())
-    try:
-        report = budget_store.usage_report()
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
-    except Exception:
-        app.logger.exception("admin v1 turn budgets 读取失败")
-        return _admin_v1_error(500, "internal", "turn 预算读取失败")
-    period = report["period"]
-    limits = {k: period.get(k) for k in _BUDGET_SETTINGS_FIELDS}
-    return jsonify(
-        legacy=True,
-        note="turn 消费闸已于批次 F 退役，以下为冻结历史",
-        period={"id": period["id"],
-                "started_at": period["started_at"],
-                "closed_at": period["closed_at"]},
-        limits=limits,
-        usage=report,
-        backend=platform_features.current_backend(),
-    )
-
-
 # --------------------------------------------------------------------------- #
 # PR5：Admin API v1 写端点（§9 表写行 / §12.2 Phase B 调账 / §13 PR5 批次）
 #
 # 统一口径：
 #   - owner 门控 = _require_owner_admin_v1（_require_owner + 预览态一律 403，
 #     与只读端点/宿主页同口径 §14.1）；CSRF 沿用 before_request 全局闸；
-#   - 旧建号端点 POST /api/admin/users 已 410 退役（review R2-F1：total 模式
-#     下会建出无 allowance 行的用户；门控惯例同 turn_budgets_retired），建号
-#     统一走本节 POST /api/admin/v1/users 同事务组合原语；本节复用其校验与
-#     store 调用、break-glass 不变量原样镜像（owner 禁用/重置一律 409，
+#   - 旧建号端点 POST /api/admin/users 曾 410 退役（review R2-F1：total 模式
+#     下会建出无 allowance 行的用户），R3 wave1 已随旧管理面一并物理删除；
+#     建号统一走本节 POST /api/admin/v1/users 同事务组合原语；
+#     break-glass 不变量原样保持（owner 禁用/重置一律 409，
 #     disable/enable 同事务推进 auth_version）；
-#   - billing 写（caps/adjustments）：仅 PG；CAS 版本冲突 409、未开户 404
-#     （不伪造账户）、符号/reason 校验 400；**业务写入与 audit 同一事务**
-#     （billing_store.update_account_caps / apply_billing_adjustment 内经
-#     share_store_pg.record_audit_tx 实现，audit 失败整体回滚）；
+#   - billing 写（caps/adjustments）端点已随 R3 wave1 下线（bridge 侧早已
+#     无调用方；billing_store 写原语保留，供调账工具链使用）；
 #   - 响应红线与只读端点一致：绝不含 password_hash / ai_config（内含 enc:
 #     密文形态）/ 完整邀请 token（创建邀请的明文码仅首次响应返回 + no-store）
 #     / 完整 IP。
@@ -6024,8 +5462,8 @@ def _admin_v1_user_out(user):
 def admin_v1_users_create():
     """创建普通用户（§9：仅 role=user，禁止经此创建 owner）。
 
-    校验/错误码镜像旧 POST /api/admin/users（login_id 唯一冲突 409；密码
-    15..200）；audit 动作与旧端点一致（user.create）。
+    login_id 唯一冲突 409；密码 15..200；audit 动作 user.create（口径承自
+    已删除的旧 POST /api/admin/users）。
 
     批次 B wave 2（§Batch B 数据模型 6 / §4.3）扩展可选字段：
       - ``total_limit_nano_cny``：十进制字符串 nano-CNY | null（缺省）。
@@ -6391,174 +5829,6 @@ def admin_v1_invites_revoke(invite_id):
     return jsonify(invite=_admin_v1_nano_out(_invite_public_view(invite)))
 
 
-@app.route("/api/admin/v1/turn-budgets", methods=["PUT"])
-def admin_v1_turn_budgets_update():
-    """已退役（批次 F §7.3 阶段 2）：turn 消费闸随金额硬闸关闭，周期限制不再
-    可写。安全参数迁 PUT /api/admin/v1/settings/runtime；金额额度走
-    /api/admin/v1/spend/*。410 + turn_budgets_retired + audit 尝试。"""
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    _audit("turn_budgets.retired_write", target_type="ai_budget_period",
-           target_id=None,
-           detail={"endpoint": "PUT /api/admin/v1/turn-budgets"})
-    return _admin_v1_error(410, "turn_budgets_retired",
-                           _TURN_BUDGETS_RETIRED_NOTE)
-
-
-@app.route("/api/admin/v1/turn-budgets/new-period", methods=["POST"])
-def admin_v1_turn_budgets_new_period():
-    """已退役（批次 F）：开新预算周期随 turn 消费闸退役。410 + audit 尝试。"""
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    _audit("turn_budgets.retired_write", target_type="ai_budget_period",
-           target_id=None,
-           detail={"endpoint": "POST /api/admin/v1/turn-budgets/new-period"})
-    return _admin_v1_error(410, "turn_budgets_retired",
-                           _TURN_BUDGETS_RETIRED_NOTE)
-
-
-@app.route("/api/admin/v1/billing/accounts/<user_id>/caps", methods=["PUT"])
-def admin_v1_billing_caps(user_id):
-    """更新 soft/hard spend cap（§9：null=清除；非空为非负十进制字符串；
-    同存 soft<=hard；version CAS 冲突 409；未开户 404 不伪造；caps 写与
-    audit 同一事务）。
-
-    金额 wire 规则（§5 v0.3 修订）：``soft_cap_nano_cny`` /
-    ``hard_cap_nano_cny`` 只接受 ``^[0-9]{1,19}$`` 十进制字符串（JSON
-    number 一律 400——JS Number 超 2^53 静默失真）；null=清除语义保留。
-    """
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    if not platform_features.billing_features_available():
-        return _admin_v1_pg_required()
-    body = request.get_json(silent=True) or {}
-    for field in ("soft_cap_nano_cny", "hard_cap_nano_cny", "version"):
-        if field not in body:
-            return _admin_v1_error(400, "invalid_request",
-                                   "缺少 %s 字段" % field)
-    try:
-        soft = _admin_v1_amount_in(body.get("soft_cap_nano_cny"),
-                                   "soft_cap_nano_cny")
-        hard = _admin_v1_amount_in(body.get("hard_cap_nano_cny"),
-                                   "hard_cap_nano_cny")
-    except ValueError as exc:
-        return _admin_v1_error(400, "invalid_request", str(exc))
-    if soft is not None and hard is not None and soft > hard:
-        return _admin_v1_error(
-            400, "invalid_request", "soft_cap_nano_cny 不可大于 hard_cap_nano_cny")
-    version = body.get("version")
-    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
-        return _admin_v1_error(400, "invalid_request", "version 需为正整数")
-    if user_store.get_user(user_id) is None:
-        return _admin_v1_error(404, "user_not_found", "用户不存在")
-    try:
-        result = billing_store.update_account_caps(
-            user_id, soft, hard, version,
-            actor_user_id=actor_identity().get("user_id"))
-    except billing_store.BillingAccountNotFoundError:
-        return _admin_v1_error(404, "billing_account_not_found",
-                               "该用户尚未开户（读取账户后才能设置 caps）")
-    except billing_store.BillingCapsVersionConflictError:
-        return _admin_v1_error(409, "version_conflict",
-                               "数据已被他人修改，请刷新后重试")
-    except ValueError as exc:
-        return _admin_v1_error(400, "invalid_request", str(exc))
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
-    except Exception:
-        app.logger.exception("admin v1 billing caps 更新失败")
-        return _admin_v1_error(500, "internal", "caps 更新失败")
-    return jsonify(account=_admin_v1_nano_out(result["account"]),
-                   balance_nano=_admin_v1_nano_str(result["balance_nano"]))
-
-
-@app.route("/api/admin/v1/billing/adjustments", methods=["POST"])
-def admin_v1_billing_adjustments():
-    """人工调账（§9 + §12.2 Phase B：grant/topup/refund/manual_adjustment）。
-
-    - grant/topup：未开户**同事务显式开户**后入账；refund/manual_adjustment
-      未开户 404（不隐式开户）；
-    - 符号先在路由层校验（400，不靠 DB CHECK 500）；reason 必填（trim ≥1，
-      ≤500）；idempotency_key 必须由调用方生成（§6.5 PR5 修订）：缺失/空白
-      一律 400 invalid_request，服务端**不再代生成**——否则「服务端已入账 +
-      浏览器超时 + 管理员重试」会以新 key 产出第二笔账；
-    - 入账 + audit 同一事务；幂等键重放返回原 entry + duplicate:true（200）。
-    """
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    if not platform_features.billing_features_available():
-        return _admin_v1_pg_required()
-    body = request.get_json(silent=True) or {}
-    user_id = body.get("user_id")
-    if not isinstance(user_id, str) or not user_id.strip():
-        return _admin_v1_error(400, "invalid_request", "缺少 user_id 字段")
-    user_id = user_id.strip()
-    kind = body.get("kind")
-    if kind not in billing_store.ADJUSTMENT_KINDS:
-        return _admin_v1_error(
-            400, "invalid_request",
-            "kind 需为 %s" % (billing_store.ADJUSTMENT_KINDS,))
-    # 金额 wire 规则（§5 v0.3 修订）：只接受 ^-?[0-9]{1,19}$ 十进制字符串
-    #（manual_adjustment 可为负），JSON number 一律 400（防 float 失真）
-    try:
-        amount = _admin_v1_amount_in(body.get("amount_nano_cny"),
-                                     "amount_nano_cny", allow_negative=True)
-    except ValueError as exc:
-        return _admin_v1_error(400, "invalid_request", str(exc))
-    if amount is None:
-        return _admin_v1_error(400, "invalid_request",
-                               "amount_nano_cny 需为十进制整数字符串（nano-CNY）")
-    if kind in ("grant", "topup", "refund") and amount <= 0:
-        return _admin_v1_error(400, "invalid_request",
-                               "%s 金额必须为正数（nano-CNY）" % kind)
-    if kind == "manual_adjustment" and amount == 0:
-        return _admin_v1_error(400, "invalid_request",
-                               "manual_adjustment 金额不可为 0")
-    reason = body.get("reason")
-    if not isinstance(reason, str) or not reason.strip():
-        return _admin_v1_error(400, "invalid_request", "reason 必填（不可为空白）")
-    if len(reason.strip()) > billing_store.ADJUSTMENT_REASON_MAX_LENGTH:
-        return _admin_v1_error(
-            400, "invalid_request",
-            "reason 上限 %d 字符" % billing_store.ADJUSTMENT_REASON_MAX_LENGTH)
-    idem = body.get("idempotency_key")
-    if not isinstance(idem, str) or not idem.strip() or len(idem) > 128:
-        # §6.5 PR5 修订：幂等键必须由调用方生成；缺失/空白/超长一律 400，
-        # 服务端绝不代生成（代生成会让超时重试绕过幂等去重）。
-        return _admin_v1_error(
-            400, "invalid_request",
-            "缺少 idempotency_key（调用方生成；同一逻辑提交的重试必须复用同 key）")
-    idem = idem.strip()
-    if user_store.get_user(user_id) is None:
-        return _admin_v1_error(404, "user_not_found", "用户不存在")
-    try:
-        result = billing_store.apply_billing_adjustment(
-            user_id, kind, amount, reason.strip(), idem,
-            actor_user_id=actor_identity().get("user_id"))
-    except billing_store.BillingAccountNotFoundError:
-        return _admin_v1_error(
-            404, "billing_account_not_found",
-            "该用户尚未开户（%s 不隐式开户）" % kind)
-    except billing_store.BillingIdempotencyKeyConflictError:
-        return _admin_v1_error(409, "idempotency_key_conflict",
-                               "idempotency_key 已被其他调账使用")
-    except ValueError as exc:
-        return _admin_v1_error(400, "invalid_request", str(exc))
-    except platform_features.PgFeatureUnavailable:
-        return _admin_v1_pg_required()
-    except Exception:
-        app.logger.exception("admin v1 billing adjustment 失败")
-        return _admin_v1_error(500, "internal", "调账入账失败")
-    return jsonify(ok=True, entry=_admin_v1_nano_out(result["entry"]),
-                   duplicate=result["duplicate"],
-                   balance_nano=_admin_v1_nano_str(result["balance_nano"]),
-                   account=_admin_v1_nano_out(result["account"]))
-
-
 # --------------------------------------------------------------------------- #
 # 批次 B：金额 policy/window 只读出口（docs
 # ai-money-budget-bugfix-and-simplification-plan.md §8 批次 B / §6.1-§6.2）
@@ -6865,46 +6135,6 @@ def admin_v1_spend_window_adjust(window_id):
         app.logger.exception("admin v1 spend window adjust 失败")
         return _admin_v1_error(500, "internal", "当前窗口调整失败")
     return jsonify(window=_admin_v1_spend_window_summary(window))
-
-
-#: 批次 B wave 2（§Batch B API/bridge 契约）：旧月额度覆盖端点统一退役响应
-#: （410 Gone + 稳定 code + 指向新 total-limit 端点的中文指引）。
-_SPEND_OVERRIDE_RETIRED_NOTE = (
-    "用户月额度覆盖已退役：注册 user 的消费控制改为一次性总额度，请使用 "
-    "PUT /api/admin/v1/spend/users/<user_id>/total-limit（设置绝对总上限）"
-    "与 POST /api/admin/v1/spend/users/<user_id>/restore-default（恢复默认）")
-
-
-def _spend_override_retired_response(method):
-    """旧 spend-override 端点统一出口：410 + code + 指引，并 audit 尝试。"""
-    _audit("spend.override_retired_write", target_type="user",
-           target_id=None,
-           detail={"endpoint": "%s /api/admin/v1/users/<user_id>"
-                              "/spend-override" % method})
-    return _admin_v1_error(410, "spend_override_deprecated",
-                           _SPEND_OVERRIDE_RETIRED_NOTE)
-
-
-@app.route("/api/admin/v1/users/<user_id>/spend-override", methods=["PUT"])
-def admin_v1_users_spend_override_set(user_id):
-    """已退役（Batch B wave 2，§Batch B API/bridge 契约）：月额度覆盖随
-    user 消费控制迁移为一次性总额度而关闭。410 + spend_override_deprecated +
-    audit 尝试；新写端点 PUT .../spend/users/<id>/total-limit。"""
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    return _spend_override_retired_response("PUT")
-
-
-@app.route("/api/admin/v1/users/<user_id>/spend-override", methods=["DELETE"])
-def admin_v1_users_spend_override_clear(user_id):
-    """已退役（Batch B wave 2）：清除月额度覆盖随总额度迁移关闭。410 +
-    spend_override_deprecated + audit 尝试；恢复默认走
-    POST .../spend/users/<id>/restore-default。"""
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    return _spend_override_retired_response("DELETE")
 
 
 # --------------------------------------------------------------------------- #
@@ -7279,15 +6509,6 @@ def admin_v1_settings():
     return jsonify(**payload)
 
 
-@app.route("/api/admin/v1/settings/registration", methods=["GET"])
-def admin_v1_settings_registration_get():
-    """注册模式（Admin API v1；逻辑与旧路由同一 service，§5.3）。"""
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    return jsonify(**_registration_settings_payload())
-
-
 @app.route("/api/admin/v1/settings/registration", methods=["PUT"])
 def admin_v1_settings_registration_put():
     """切换注册模式（Admin API v1；与旧路由同一 service，§5.3 不复制校验）。"""
@@ -7334,42 +6555,6 @@ def admin_v1_settings_runtime_put():
         app.logger.exception("admin v1 runtime 安全参数更新失败")
         return _admin_v1_error(500, "internal", "运行时安全参数更新失败")
     return jsonify(limits={k: after.get(k) for k in _SETTINGS_RUNTIME_FIELDS})
-
-
-# --------------------------------------------------------------------------- #
-# 批次 D1 15（§4.4）：来源归因 Admin API v1 退役——稳定 410 user_attribution_
-# retired（数据表冻结只读；一个发布周期消费者审计后另批删除路由）。owner 门控
-# 保持在 410 之前（匿名 401 / 非 owner 403 语义不变，不向未授权方泄露端点状态）。
-# --------------------------------------------------------------------------- #
-_ACQUISITION_RETIRED_NOTE = (
-    "用户来源归因已退役（§4.4 邀请与站点访问统计解耦）：来源漏斗与用户来源"
-    "明细不再提供；站点访问趋势请用 GET /api/admin/v1/site-stats")
-
-
-@app.route("/api/admin/v1/acquisition/summary", methods=["GET"])
-def admin_v1_acquisition_summary():
-    """已退役（批次 D1 15）：410 user_attribution_retired（owner 门控后）。"""
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    _audit("acquisition.retired_read", target_type="acquisition",
-           target_id=None,
-           detail={"endpoint": "GET /api/admin/v1/acquisition/summary"})
-    return _admin_v1_error(410, "user_attribution_retired",
-                           _ACQUISITION_RETIRED_NOTE)
-
-
-@app.route("/api/admin/v1/acquisition/users", methods=["GET"])
-def admin_v1_acquisition_users():
-    """已退役（批次 D1 15）：410 user_attribution_retired（owner 门控后）。"""
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    _audit("acquisition.retired_read", target_type="acquisition",
-           target_id=None,
-           detail={"endpoint": "GET /api/admin/v1/acquisition/users"})
-    return _admin_v1_error(410, "user_attribution_retired",
-                           _ACQUISITION_RETIRED_NOTE)
 
 
 # --------------------------------------------------------------------------- #

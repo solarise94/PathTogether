@@ -104,26 +104,29 @@ def test_audit_record_list_filter_owner_only():
     share_store.record_audit("user.disable", actor_user_id=owner["user_id"],
                              actor_role="owner", target_type="user",
                              target_id="usr_x", detail={})
-    # owner 可读
-    r = c.get("/api/admin/audit")
+    # owner 可读（旧 /api/admin/audit 已随 R3 wave1 删除，读面走 v1）
+    r = c.get("/api/admin/v1/audit")
     assert r.status_code == 200
     body = r.get_json()
     assert body["limit"] == 50
     # R2 起 PG 建号经组合原语会写 user.create 审计（夹具 userA 一条）
-    events = [e for e in body["events"] if e["action"] != "user.create"]
+    events = [e for e in body["items"] if e["action"] != "user.create"]
     assert len(events) == 2
     assert events[0]["action"] == "user.disable"  # 最新在前
     # action 过滤
-    r = c.get("/api/admin/audit?action=share.create")
-    evs = r.get_json()["events"]
+    r = c.get("/api/admin/v1/audit?action=share.create")
+    evs = r.get_json()["items"]
     assert len(evs) == 1 and evs[0]["action"] == "share.create"
-    # 分页
-    r = c.get("/api/admin/audit?limit=1&offset=1")
-    assert len(r.get_json()["events"]) == 1
+    # cursor 翻页（limit=1 + next_cursor）
+    r = c.get("/api/admin/v1/audit?limit=1")
+    page1 = r.get_json()
+    assert len(page1["items"]) == 1
+    r = c.get("/api/admin/v1/audit?limit=1&cursor=" + page1["next_cursor"])
+    assert len(r.get_json()["items"]) == 1
     # 非 owner 403
     ca = _client()
     _login(ca, "a@x.com", "userApass123456")
-    assert ca.get("/api/admin/audit").status_code == 403
+    assert ca.get("/api/admin/v1/audit").status_code == 403
 
 
 def test_audit_redaction_no_secrets():
@@ -136,9 +139,9 @@ def test_audit_redaction_no_secrets():
                              detail={"mode": "run"})
     share_store.record_audit("share.create", actor_role="owner", target_type="share",
                              target_id="tok_x", detail={"slide_count": 1})
-    # 全量扫 detail，断言不含敏感串
-    r = c.get("/api/admin/audit?limit=500")
-    for ev in r.get_json()["events"]:
+    # 全量扫 detail，断言不含敏感串（v1 limit 上限 200）
+    r = c.get("/api/admin/v1/audit?limit=200")
+    for ev in r.get_json()["items"]:
         d = ev.get("detail") or {}
         for k, v in d.items():
             assert "api_key" not in str(k).lower()
@@ -352,11 +355,11 @@ def test_share_access_log_dedup():
     assert resp.status_code == 200
     # 连续两次同 token+visitor → 5 分钟窗口内去重只记一条
     sc.get("/s/%s" % token)
-    evs = c.get("/api/admin/audit?action=share.access").get_json()["events"]
+    evs = c.get("/api/admin/v1/audit?action=share.access").get_json()["items"]
     assert len(evs) == 1
     d = evs[0]["detail"]
     assert d["visitor"]  # 有 visitor 前段
-    assert "*" in d["ip"]  # IP 已脱敏
+    assert "ip" not in d  # v1 出口整键丢弃完整 IP（§10.5 红线）
 
 
 # =========================================================================== #

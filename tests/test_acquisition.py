@@ -277,46 +277,8 @@ def test_r_json_backend_never_500s():
 
 
 # =========================================================================== #
-# 3. admin v1 acquisition 门控 + 退役 410（Batch D1 15）
+# 3. admin v1 acquisition 端点已随 R3 wave1 物理删除（原 410 退役面）
 # =========================================================================== #
-def _plain_user():
-    return user_store.create_user("plain-acq@x.com", "userpass1234567",
-                                  role="user")
-
-
-_ACQ_ENDPOINTS = ("/api/admin/v1/acquisition/summary",
-                  "/api/admin/v1/acquisition/users")
-
-
-def test_admin_acquisition_owner_gate():
-    owner = _mk_owner()
-    app_mod.AUTH_ENABLED = True
-    client = _client()
-    # 匿名 → 401；非 owner → 403（门控保持在 410 之前）
-    for path in _ACQ_ENDPOINTS:
-        r = client.get(path)
-        assert r.status_code == 401, path
-    u = _plain_user()
-    with client.session_transaction() as s:
-        s.update({"auth_user": "p", "user_id": u["user_id"], "role": "user",
-                  "auth_version": u.get("auth_version", 1)})
-    for path in _ACQ_ENDPOINTS:
-        r = client.get(path)
-        assert r.status_code == 403, path
-
-
-def test_acquisition_endpoints_retired_410():
-    """Batch D1 15（§4.4）：owner 请求 → 稳定 410 user_attribution_retired
-    （两个后端一致，不再有 json 503 分支）。"""
-    owner = _mk_owner()
-    app_mod.AUTH_ENABLED = True
-    client = _client()
-    _owner_session(client, owner)
-    for path in _ACQ_ENDPOINTS:
-        r = client.get(path)
-        assert r.status_code == 410, path
-        assert r.get_json()["error"]["code"] == "user_attribution_retired"
-        assert "site-stats" in r.get_json()["error"]["message"]
 
 
 # =========================================================================== #
@@ -709,10 +671,10 @@ def test_register_route_full_acquisition_flow(monkeypatch):
     app_mod.AUTH_ENABLED = True
     client = _client()
     _owner_session(client, owner)
-    assert client.put("/api/admin/settings/registration",
+    assert client.put("/api/admin/v1/settings/registration",
                       json={"mode": "invite_only"}).status_code == 200
-    inv = client.post("/api/admin/registration-invites",
-                      json={"login_id": "flow-acq@x.com"}).get_json()
+    inv = client.post("/api/admin/v1/invites",
+                      json={"login_id": "flow-acq@x.com"}).get_json()["invite"]
     anon = _client()
     before = _acq_total()
     # 访客从旧 mywebpage CTA 进入：安全 302，触点表零新增、旧 cookie 被清除

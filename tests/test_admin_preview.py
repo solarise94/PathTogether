@@ -160,12 +160,12 @@ def test_require_owner_checks_actor_not_subject():
     oc = _login(_client(), owner)
     assert oc.post("/api/admin/preview/start",
                    json={"user_id": usera["user_id"]}).status_code == 200
-    # actor 仍是 owner → 管理端点 GET 不因预览被拒
-    r = oc.get("/api/admin/users")
+    # actor 仍是 owner → 只读 GET 不因预览被拒（旧 /api/admin/users 列表
+    # 已随 R3 wave1 删除，探针换 /api/slides）
+    r = oc.get("/api/slides")
     assert r.status_code == 200, r.get_json()
-    # 但写（POST .../disable，写探针端点——旧建号端点已 410 退役，review
-    # R2-F1）被 preview write guard 拦
-    r = oc.post("/api/admin/users/%s/disable" % _b["user_id"])
+    # 但写（POST .../disable 写探针，v1 面端点）被 preview write guard 拦
+    r = oc.post("/api/admin/v1/users/%s/disable" % _b["user_id"])
     assert r.status_code == 403
     assert r.get_json().get("code") == "preview_readonly"
 
@@ -205,9 +205,9 @@ def test_write_guard_allows_stop_and_get():
     assert oc.get("/api/slides").status_code == 200
     r = oc.post("/api/admin/preview/stop")
     assert r.status_code == 200, r.get_json()
-    # 退出后写恢复（owner 身份）。写探针端点用 disable（旧建号端点已 410
-    # 退役，review R2-F1；disable 幂等返回 200，与后端无关）
-    r = oc.post("/api/admin/users/%s/disable" % userb["user_id"])
+    # 退出后写恢复（owner 身份）。写探针用 v1 disable（旧面已删；幂等
+    # 返回 200，与后端无关）
+    r = oc.post("/api/admin/v1/users/%s/disable" % userb["user_id"])
     assert r.status_code == 200, r.get_json()
 
 
@@ -292,9 +292,8 @@ def test_preview_ttl_expires_and_auto_exits():
         pv = dict(s[app_mod.PREVIEW_SESSION_KEY])
         pv["expires_at"] = time.time() - 1
         s[app_mod.PREVIEW_SESSION_KEY] = pv
-    # 写探针端点用 disable（旧建号端点已 410 退役，review R2-F1；disable
-    # 幂等返回 200，与后端无关）——过期自动退出 → 写放行
-    r = oc.post("/api/admin/users/%s/disable" % userb["user_id"])
+    # 写探针用 v1 disable（旧面已删；幂等返回 200）——过期自动退出 → 写放行
+    r = oc.post("/api/admin/v1/users/%s/disable" % userb["user_id"])
     assert r.status_code == 200, r.get_json()
     with oc.session_transaction() as s:
         assert app_mod.PREVIEW_SESSION_KEY not in s

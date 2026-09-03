@@ -423,10 +423,12 @@ def test_csrf_required_on_budget_and_ai_write_endpoints():
         s.update({"auth_user": "o", "user_id": o["user_id"], "role": "owner",
                   "auth_version": o.get("auth_version", 1)})
     # 无 token → 400 csrf_required（统一 before_request）
-    r = raw.put("/api/admin/settings/ai-budget", json={"platform_turn_limit": 30})
+    r = raw.put("/api/admin/v1/settings/registration", json={"mode": "closed"})
     assert r.status_code == 400
     assert r.get_json()["error"] == "csrf_required"
-    r2 = raw.post("/api/admin/settings/ai-budget/reset", json={"confirm": True})
+    r2 = raw.post("/api/admin/v1/users",
+                  json={"login_id": "csrfprobe@x.com",
+                        "password": "password-123456"})
     assert r2.status_code == 400
     assert r2.get_json()["error"] == "csrf_required"
     r3 = raw.post("/api/ai/run", json={"slide": "x.svs"})
@@ -437,94 +439,6 @@ def test_csrf_required_on_budget_and_ai_write_endpoints():
 # --------------------------------------------------------------------------- #
 # 6. owner 预算 API（json fail-closed / PG 全量）
 # --------------------------------------------------------------------------- #
-def test_budget_api_json_backend_fail_closed():
-    if platform_features.budget_features_available():
-        pytest.skip("PG 后端预算可用（503 语义仅 json/dual）")
-    _setup_platform()
-    o = _make_user("owner")
-    c = _client()
-    _login(c, "owner", o["user_id"])
-    r = c.get("/api/admin/settings/ai-budget")
-    assert r.status_code == 503
-    assert r.get_json().get("code") == "pg_backend_required"
-    # 批次 F：写端点退役（410 turn_budgets_retired）——退役判定先于后端
-    r2 = c.put("/api/admin/settings/ai-budget", json={"platform_turn_limit": 5})
-    assert r2.status_code == 410
-    assert r2.get_json().get("code") == "turn_budgets_retired"
-    r3 = c.post("/api/admin/settings/ai-budget/reset", json={"confirm": True})
-    assert r3.status_code == 410
-    assert r3.get_json().get("code") == "turn_budgets_retired"
-    # user 一律 403
-    u = _make_user("user")
-    cu = _client()
-    _login(cu, "user", u["user_id"])
-    assert cu.get("/api/admin/settings/ai-budget").status_code == 403
-
-
-@pg_only
-def test_budget_api_owner_get_legacy_and_writes_retired():
-    """批次 F：GET 保留（冻结历史 + legacy 标记）；PUT/reset 410 + audit 尝试。"""
-    _setup_platform()
-    o = _make_user("owner")
-    u = _make_user("user")
-    # 预造用量：user 1 次平台 + 1 次 own（软闸路径直连 store）
-    budget_store.reserve_turn(_rid(), "user", u["user_id"], "platform")
-    budget_store.reserve_turn(_rid(), "user", u["user_id"], "own")
-    c = _client()
-    _login(c, "owner", o["user_id"])
-    # GET：用量 / 限制 / 构成 / 每用户 + legacy 标记
-    r = c.get("/api/admin/settings/ai-budget")
-    assert r.status_code == 200
-    j = r.get_json()
-    assert j["legacy"] is True
-    assert "退役" in j["note"]
-    assert j["usage"]["platform"]["total"] == 1
-    assert j["usage"]["platform"]["limit"] == 30
-    assert j["usage"]["own"]["total"] == 1
-    assert j["usage"]["by_subject_type"]["user"]["total"] == 1
-    assert j["usage"]["per_user"][0]["subject_id"] == u["user_id"]
-    assert j["limits"]["platform_turn_limit"] == 30
-    assert j["concurrency"]["current"] >= 1
-    # 批次 E：run 用量卡片改为 demo_runs 流水计数（demo_sessions 键退役）
-    assert j["demo_runs"]["total"] == 0
-    assert j["demo_runs"]["active"] == 0
-    assert "demo_sessions" not in j
-    # PUT/reset：退役（410 turn_budgets_retired），并 audit 这次尝试
-    for bad in (c.put("/api/admin/settings/ai-budget",
-                      json={"platform_turn_limit": 50}),
-                c.post("/api/admin/settings/ai-budget/reset",
-                       json={"confirm": True})):
-        assert bad.status_code == 410
-        assert bad.get_json().get("code") == "turn_budgets_retired"
-    actions = [e.get("action") for e in app_mod.share_store.list_audit(limit=20)]
-    assert "turn_budgets.retired_write" in actions
-    # 用量保留（写入口没了，冻结历史不受影响）
-    assert budget_store.usage_report()["platform"]["total"] == 1
-
-
-@pg_only
-def test_budget_reset_expires_inflight_demo_runs():
-    """reset_demo_runs 原语回归：在途 demo run 转 expired 终态（capability
-    立即可再开）。批次 F 起 HTTP reset 端点已退役（410），本用例直连 store
-    锁定残余语义（管理面不再暴露，线程侧/运维仍可用）。
-    """
-    _setup_platform()
-    o = _make_user("owner")  # noqa: F841 — 登录态不再需要（无 HTTP 入口）
-    demo_store.create_capability("dmo_rst", "hash_rst", ip_prefix_hash="ipp_rst")
-    run = demo_store.reserve_run("dmo_rst", "req_rst", "sld_a", "rev_1",
-                                 ip_prefix_hash="ipp_rst")
-    assert run is not None
-    assert demo_store.count_run_states()["active"] == 1
-    reset_ids = demo_store.reset_demo_runs()
-    assert reset_ids == [run["demo_run_id"]]
-    assert demo_store.get_run(run["demo_run_id"])["state"] == "expired"
-    assert demo_store.count_run_states()["active"] == 0
-    # capability 立即可再开（不使 cookie 失效）
-    nxt = demo_store.reserve_run("dmo_rst", "req_rst2", "sld_a", "rev_1")
-    assert nxt is not None and nxt["state"] == "reserved"
-    assert demo_store.count_run_states()["total"] == 2  # 流水保留（append-only）
-
-
 # --------------------------------------------------------------------------- #
 # 7. PG：预占 / 消费 / 释放 时序
 # --------------------------------------------------------------------------- #

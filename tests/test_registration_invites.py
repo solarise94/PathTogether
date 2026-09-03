@@ -200,17 +200,17 @@ def test_put_registration_mode_validates(monkeypatch):
     app_mod.AUTH_ENABLED = True
     client = _client()
     _owner_session(client, owner)
-    # public 拒绝
-    r = client.put("/api/admin/settings/registration", json={"mode": "public"})
+    # public 拒绝（v1；旧路由已随 R3 wave1 删除）
+    r = client.put("/api/admin/v1/settings/registration", json={"mode": "public"})
     assert r.status_code == 400
-    assert r.get_json()["code"] == "public_registration_not_supported"
+    assert r.get_json()["error"]["code"] == "public_registration_not_supported"
     # invite_only 前置条件不满足 → 400（json 后端）
-    r2 = client.put("/api/admin/settings/registration",
+    r2 = client.put("/api/admin/v1/settings/registration",
                     json={"mode": "invite_only"})
     assert r2.status_code == 400
-    assert "前置条件" in r2.get_json()["error"]
+    assert "前置条件" in r2.get_json()["error"]["message"]
     # 非法值
-    r3 = client.put("/api/admin/settings/registration", json={"mode": "oops"})
+    r3 = client.put("/api/admin/v1/settings/registration", json={"mode": "oops"})
     assert r3.status_code == 400
 
 
@@ -220,7 +220,7 @@ def test_put_registration_mode_invite_only_with_preconditions(monkeypatch):
     app_mod.AUTH_ENABLED = True
     client = _client()
     _owner_session(client, owner)
-    r = client.put("/api/admin/settings/registration",
+    r = client.put("/api/admin/v1/settings/registration",
                    json={"mode": "invite_only"})
     if BACKEND == "postgres":
         assert r.status_code == 200, r.get_data(as_text=True)
@@ -230,11 +230,11 @@ def test_put_registration_mode_invite_only_with_preconditions(monkeypatch):
     else:
         # json 后端：前置条件如实判定失败（STORAGE_BACKEND 非 postgres）→ 400
         assert r.status_code == 400
-        assert "前置条件" in r.get_json()["error"]
-    # GET settings 反映模式与前置条件
-    g = client.get("/api/admin/settings/registration")
+        assert "前置条件" in r.get_json()["error"]["message"]
+    # GET settings 聚合反映模式与前置条件（旧专用 GET 已删除）
+    g = client.get("/api/admin/v1/settings")
     assert g.status_code == 200
-    body = g.get_json()
+    body = g.get_json()["registration"]
     assert body["supported_modes"] == ["closed", "invite_only"]
 
 
@@ -255,15 +255,15 @@ def test_admin_registration_apis_require_owner(monkeypatch):
     _satisfy_preconditions(monkeypatch)
     app_mod.AUTH_ENABLED = True
     client = _client()
-    # 未登录（AUTH_ENABLED=True）→ 401
-    assert client.get("/api/admin/registration-invites").status_code == 401
+    # 未登录（AUTH_ENABLED=True）→ 401（v1；旧 invites 路由已删除）
+    assert client.get("/api/admin/v1/invites").status_code == 401
     # 非 owner → 403
     u = user_store.create_user("plain@x.com", "userpass1234567", role="user")
     with client.session_transaction() as s:
         s.update({"auth_user": "p", "user_id": u["user_id"], "role": "user",
                   "auth_version": u.get("auth_version", 1)})
-    assert client.get("/api/admin/registration-invites").status_code == 403
-    assert client.post("/api/admin/registration-invites",
+    assert client.get("/api/admin/v1/invites").status_code == 403
+    assert client.post("/api/admin/v1/invites",
                        json={}).status_code == 403
 
 
@@ -489,13 +489,13 @@ def test_owner_invite_api_lifecycle(monkeypatch):
     _owner_session(client, owner)
     # 创建：token 仅出现一次 + no-store；初始总额度字段 total_limit_nano_cny
     #（Batch B wave 2）；cohort/source/campaign 不再出现在请求或响应
-    r = client.post("/api/admin/registration-invites",
+    r = client.post("/api/admin/v1/invites",
                     json={"login_id": "flow@x.com", "ai_access": False,
                           "note": "n1",
                           "total_limit_nano_cny": "3000000000"})
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.headers.get("Cache-Control") == "no-store"
-    body = r.get_json()
+    body = r.get_json()["invite"]
     assert body["token"]
     invite_id = body["invite_id"]
     assert "token_hash" not in body
@@ -504,7 +504,7 @@ def test_owner_invite_api_lifecycle(monkeypatch):
                     "monthly_limit_nano_cny"):
         assert retired not in body, retired
     # 列表：无 token/token_hash，登录账号掩码，无来源字段
-    r2 = client.get("/api/admin/registration-invites")
+    r2 = client.get("/api/admin/v1/invites")
     assert r2.status_code == 200
     items = r2.get_json()["invites"]
     assert len(items) == 1
@@ -518,20 +518,20 @@ def test_owner_invite_api_lifecycle(monkeypatch):
                     "monthly_limit_nano_cny"):
         assert retired not in it, retired
     # 撤销
-    r3 = client.post("/api/admin/registration-invites/%s/revoke" % invite_id,
+    r3 = client.post("/api/admin/v1/invites/%s/revoke" % invite_id,
                      json={})
     assert r3.status_code == 200
-    assert r3.get_json()["status"] == "revoked"
+    assert r3.get_json()["invite"]["status"] == "revoked"
     # 再撤销（幂等）仍 200；已消费的撤销 409
     assert client.post(
-        "/api/admin/registration-invites/%s/revoke" % invite_id,
+        "/api/admin/v1/invites/%s/revoke" % invite_id,
         json={}).status_code == 200
     # 不存在 404
     assert client.post(
-        "/api/admin/registration-invites/inv_missing/revoke",
+        "/api/admin/v1/invites/inv_missing/revoke",
         json={}).status_code == 404
     # CSRF 缺失 400
-    r4 = client._base.post("/api/admin/registration-invites", json={})
+    r4 = client._base.post("/api/admin/v1/invites", json={})
     assert r4.status_code == 400
     assert r4.get_json()["error"] == "csrf_required"
 
@@ -545,11 +545,11 @@ def test_register_route_full_flow(monkeypatch):
     app_mod.AUTH_ENABLED = True
     client = _client()
     _owner_session(client, owner)
-    r = client.put("/api/admin/settings/registration",
+    r = client.put("/api/admin/v1/settings/registration",
                    json={"mode": "invite_only"})
     assert r.status_code == 200, r.get_data(as_text=True)
-    inv = client.post("/api/admin/registration-invites",
-                      json={"login_id": "flow2@x.com"}).get_json()
+    inv = client.post("/api/admin/v1/invites",
+                      json={"login_id": "flow2@x.com"}).get_json()["invite"]
     # 匿名 client 兑换
     anon = _client()
     anon.get("/register")
@@ -574,7 +574,7 @@ def test_register_route_full_flow(monkeypatch):
     assert "邀请码无效或当前不可用" in body
     assert inv["token"] not in body
     # 切回 closed
-    r4 = client.put("/api/admin/settings/registration", json={"mode": "closed"})
+    r4 = client.put("/api/admin/v1/settings/registration", json={"mode": "closed"})
     assert r4.status_code == 200
 
 
@@ -599,10 +599,10 @@ def test_register_route_whitespace_password_rejected(monkeypatch):
     app_mod.AUTH_ENABLED = True
     client = _client()
     _owner_session(client, owner)
-    assert client.put("/api/admin/settings/registration",
+    assert client.put("/api/admin/v1/settings/registration",
                       json={"mode": "invite_only"}).status_code == 200
-    inv = client.post("/api/admin/registration-invites",
-                      json={"login_id": "wsform@x.com"}).get_json()
+    inv = client.post("/api/admin/v1/invites",
+                      json={"login_id": "wsform@x.com"}).get_json()["invite"]
     anon = _client()
     anon.get("/register")
     r = anon.post("/register", data={
@@ -706,27 +706,27 @@ def test_invite_list_exposes_source_campaign_and_owner_api(monkeypatch):
     app_mod.AUTH_ENABLED = True
     client = _client()
     _owner_session(client, owner)
-    r = client.post("/api/admin/registration-invites", json={
+    r = client.post("/api/admin/v1/invites", json={
         "login_id": "apisrc@x.com", "source_code": "src-api",
         "campaign_id": "camp-api"})
     assert r.status_code == 400
-    assert r.get_json()["code"] == "retired_invite_field"
+    assert r.get_json()["error"]["code"] == "retired_invite_field"
     # 非法 slug / 未知 campaign / cohort 同样 400 retired_invite_field
     for payload in ({"source_code": "NOT A SLUG"},
                     {"campaign_id": "ghost"}, {"cohort": "c1"}):
-        r2 = client.post("/api/admin/registration-invites", json=payload)
+        r2 = client.post("/api/admin/v1/invites", json=payload)
         assert r2.status_code == 400, payload
-        assert r2.get_json()["code"] == "retired_invite_field", payload
+        assert r2.get_json()["error"]["code"] == "retired_invite_field", payload
     # 新契约：创建带初始总额度 → 响应 total_limit_nano_cny、无来源字段
-    r3 = client.post("/api/admin/registration-invites", json={
+    r3 = client.post("/api/admin/v1/invites", json={
         "login_id": "apitotal@x.com", "total_limit_nano_cny": "7000000000"})
     assert r3.status_code == 200, r3.get_data(as_text=True)
-    body = r3.get_json()
+    body = r3.get_json()["invite"]
     assert body["total_limit_nano_cny"] == "7000000000"
     for retired in ("source_code", "campaign_id", "cohort"):
         assert retired not in body
     # 列表同样无来源字段；掩码规则不变（login_id_masked，无 token/hash）
-    r4 = client.get("/api/admin/registration-invites").get_json()
+    r4 = client.get("/api/admin/v1/invites").get_json()
     it = next(i for i in r4["invites"] if i["invite_id"] == body["invite_id"])
     for retired in ("source_code", "campaign_id", "cohort"):
         assert retired not in it

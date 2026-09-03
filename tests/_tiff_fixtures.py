@@ -32,12 +32,18 @@ def _require_tifffile():
 
 
 def make_tiff_bytes(h=64, w=96):
-    """普通（非 OME）单条带 TIFF 字节。"""
+    """普通（非 OME）tiled TIFF 字节。
+
+    tile=(32,32)：真 openslide（CI 经 openslide-bin 安装）的 generic-tiff
+    driver 只接受 tiled 图，条带式会被判 OpenSlideUnsupportedFormatError；
+    tifffile/PIL/TiffFileSlide 对 tiled 兼容，其余消费方不受影响。
+    """
     _require_tifffile()
     import tifffile
 
     buf = io.BytesIO()
-    tifffile.imwrite(buf, _gradient_rgb(h, w), photometric="rgb")
+    tifffile.imwrite(buf, _gradient_rgb(h, w), photometric="rgb",
+                     tile=(32, 32))
     return buf.getvalue()
 
 

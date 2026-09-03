@@ -5986,12 +5986,26 @@ def admin_v1_spend_policy_update(policy_id):
     body: ``{limit_nano_cny: <十进制字符串>, version: <正整数>}``；version
     未命中 → 409 version_conflict（数据已被他人修改）。要立即影响当前周期
     走独立的「调整当前窗口」端点（POST .../windows/<id>/adjust）。
+
+    R3 单轨：user 级策略（user_default / user_override）不再参与授权——
+    经本端点改写一律 400 ``user_spend_policy_retired``（user 默认总额度唯一
+    写口是 PUT .../spend/user-default-total-limit；user_override 为历史
+    只读数据）。demo_global / owner 策略不受影响。
     """
     auth = _require_owner_admin_v1()
     if auth:
         return auth
     if not platform_features.billing_features_available():
         return _admin_v1_pg_required()
+    for _p in spend_store.admin_list_policies()["items"]:
+        if _p["policy_id"] == policy_id:
+            if _p["scope_type"] in ("user_default", "user_override"):
+                return _admin_v1_error(
+                    400, "user_spend_policy_retired",
+                    "user 级金额策略已随单轨退役：user 默认总额度请走 "
+                    "PUT /api/admin/v1/spend/user-default-total-limit"
+                    "（user_override 为历史只读数据）")
+            break
     body = request.get_json(silent=True) or {}
     try:
         new_limit = _admin_v1_amount_in(body.get("limit_nano_cny"),

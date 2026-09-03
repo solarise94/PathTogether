@@ -995,12 +995,15 @@ def test_admin_spend_settings_values_split():
     # conftest/seed 基线已物化 defaults 行（0032 同款 20 CNY）→ 权威来源
     assert values["user_default_total_limit_nano_cny"] == 20 * 10 ** 9
     assert values["user_default_total_limit_source"] == "total_defaults"
-    # 展示面兼容回退（app.py 冻结、wave 2 收口）：defaults 行被手工删除时
-    # 回退 user_default 策略面值（fail-safe，source 标明）
+    # 单轨无回退（wave 2 收口）：defaults 行被手工删除 = 数据损坏，
+    # 展示面同源同靶地报「未配置」（全 None），不再回退 user_default 策略面值
     _exec("DELETE FROM ai_spend_total_defaults")
     values = spend_store.admin_spend_settings_values()
-    assert values["user_default_total_limit_nano_cny"] == 20 * 10 ** 9
-    assert values["user_default_total_limit_source"] == "user_default_policy"
+    assert values["user_default_total_limit_nano_cny"] is None
+    assert values["user_default_total_limit_source"] is None
+    assert values["user_default_total_limit_version"] is None
+    assert values["user_default_total_policy_id"] is None
+    # 首个写入者以 expected_version=1 重建 defaults 行
     spend_store.set_total_default(30 * 10 ** 9, 1, updated_by="pytest")
     values = spend_store.admin_spend_settings_values()
     assert values["user_default_total_limit_nano_cny"] == 30 * 10 ** 9

@@ -2124,13 +2124,12 @@ def admin_spend_settings_values(*, at=None):
     返回（金额均为 nano-CNY int 或 None=未配置）：
 
     - ``user_default_total_limit_nano_cny`` + ``..._source``：新 user 默认
-      总额度 X（ai_spend_total_defaults 缺行时回退 user_default 策略面值，
-      source 标明来源，见 :func:`_resolve_total_default_tx`）；写路径 CAS
-      上下文随源给出：source=``"total_defaults"`` →
-      ``user_default_total_limit_version``（ai_spend_total_defaults.version，
-      写 PUT .../spend/user-default-total-limit）；source=
-      ``"user_default_policy"`` → ``user_default_total_policy_id`` +
-      ``..._version``（写 PUT .../spend/policies/<policy_id> 兼容路径）；
+      总额度 X。R3 单轨：**只查** ai_spend_total_defaults 权威表——缺行 =
+      未配置（全 None），不回退 user_default 策略面值（展示面与授权面
+      同源同靶；策略回退分支已随 _resolve_total_default_tx 一并删除）。
+      CAS 上下文：``user_default_total_limit_version``（写 PUT
+      .../spend/user-default-total-limit）；``user_default_total_policy_id``
+      wire 键保留恒 None（策略写路径已退役）；
     - ``demo_weekly_limit_nano_cny``：demo_global 周策略当前面值；
     - ``owner_monthly_limit_nano_cny``：owner 月策略当前面值。
     """
@@ -2144,27 +2143,16 @@ def admin_spend_settings_values(*, at=None):
                     "SELECT " + _TOTAL_DEFAULT_SEL + " FROM "
                     "ai_spend_total_defaults WHERE singleton='global'")
                 default_row = cur.fetchone()
-                user_fallback_policy = None
                 if default_row is not None:
                     default_out = _total_default_out(default_row)
                     total_limit = int(default_out["default_limit_nano_cny"])
                     total_source = "total_defaults"
                     total_version = int(default_out["version"])
-                    total_policy_id = None
                 else:
-                    user_fallback_policy = _resolve_policy_tx(
-                        cur, "user", "__no_such_user__", at_dt)
-                    if user_fallback_policy is not None:
-                        total_limit = int(
-                            user_fallback_policy["limit_nano_cny"])
-                        total_source = "user_default_policy"
-                        total_version = int(user_fallback_policy["version"])
-                        total_policy_id = user_fallback_policy["policy_id"]
-                    else:
-                        total_limit = None
-                        total_source = None
-                        total_version = None
-                        total_policy_id = None
+                    total_limit = None
+                    total_source = None
+                    total_version = None
+                total_policy_id = None
                 demo = _resolve_policy_tx(cur, "demo", DEMO_GLOBAL_SUBJECT,
                                           at_dt)
                 owner = _resolve_policy_tx(cur, "owner", "", at_dt)

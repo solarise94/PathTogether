@@ -273,7 +273,12 @@ def test_spend_policy_update_cas_and_decimal_string():
     bh.seed_spend_policies()
     owner, _u = _setup_users()
     c = _login(_client(), owner)
-    r = c.put("/api/admin/v1/spend/policies/spp_user_default",
+    # R3 单轨：user 级策略写拒绝（授权唯一写口是 user-default-total-limit）
+    r_ret = c.put("/api/admin/v1/spend/policies/spp_user_default",
+                  json={"limit_nano_cny": "1", "version": 1})
+    assert r_ret.status_code == 400
+    assert r_ret.get_json()["error"]["code"] == "user_spend_policy_retired"
+    r = c.put("/api/admin/v1/spend/policies/spp_demo_global",
               json={"limit_nano_cny": OVER_2E53_NANO, "version": 1})
     assert r.status_code == 200, r.get_data(as_text=True)
     body = r.get_json()["policy"]
@@ -281,13 +286,13 @@ def test_spend_policy_update_cas_and_decimal_string():
     assert body["limit_nano_cny"] == OVER_2E53_NANO
     assert body["version"] == 2
     # 再用旧 version 更新 → 409 version_conflict
-    r2 = c.put("/api/admin/v1/spend/policies/spp_user_default",
+    r2 = c.put("/api/admin/v1/spend/policies/spp_demo_global",
                json={"limit_nano_cny": "1", "version": 1})
     assert r2.status_code == 409
     assert r2.get_json()["error"]["code"] == "version_conflict"
     # 金额 JSON number / 小数 / 超长一律 400
     for bad in (123, 1.5, "12.5", "", "9" * 20, "-5"):
-        rb = c.put("/api/admin/v1/spend/policies/spp_user_default",
+        rb = c.put("/api/admin/v1/spend/policies/spp_demo_global",
                    json={"limit_nano_cny": bad, "version": 2})
         assert rb.status_code == 400, "limit=%r 应 400" % (bad,)
     # audit 同事务：spend.policy_update 落库且不含敏感字段
@@ -296,7 +301,7 @@ def test_spend_policy_update_cas_and_decimal_string():
     detail = json.dumps(events[0]["detail"], ensure_ascii=False)
     assert "password" not in detail and "token" not in detail
     assert events[0]["detail"]["limit_nano_cny"] == int(OVER_2E53_NANO)
-    # 不存在的策略 → 404（CAS 未命中语义收敛为 version_conflict 之外的场景）
+    # 不存在的策略 → 409（CAS 未命中语义）
     r404 = c.put("/api/admin/v1/spend/policies/spp_missing",
                  json={"limit_nano_cny": "1", "version": 1})
     assert r404.status_code == 409

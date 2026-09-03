@@ -247,8 +247,8 @@
       additionalProperties: false,
     },
     // Batch B：注册 user 一次性总额度（绝对 limit，CAS，不清零已用）。
-    // expected_version 来自 users.list 快照（spend.total.version；切换前
-    // window 形态用 spend.window.version），409=version 冲突需刷新重试。
+    // expected_version 来自 users.list 快照（spend.total.version——user 恒
+    // total 形态，单轨后无 window 形态版本），409=version 冲突需刷新重试。
     "admin.spend.userTotalLimit.set": {
       properties: {
         user_id: _userIdSpec,
@@ -838,7 +838,7 @@
       // Batch B：user 默认总额度 X 的权威存储是 ai_spend_total_defaults
       // 单例（settings.get 响应 user_default_total_limit_source 标明）；
       // source=total_defaults 走专用 CAS 端点，source=user_default_policy
-      // （cutover 前回退源）走 policies 兼容路径。
+      // （单例缺行时的服务端回退源）走 policies 兼容路径。
       var userDefaultUpdate = payload.user_default_total_limit;
       if (userDefaultUpdate !== undefined && userDefaultUpdate !== null) {
         steps.push(["user_default_total_limit", function () {

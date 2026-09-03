@@ -18,11 +18,12 @@
      - sandbox 无 allow-modals：window.confirm/prompt 被静默吞掉，危险操作
        二次确认一律用页内确认条（§3.3）。表单校验只是体验层，权威校验在服务端。
 
-   wave 2 页面契约：
-     - 注册 user = 一次性总额度（spend.total），owner = 月窗口（spend.window）；
+   wave 2 页面契约（r3-wave2 单轨收口）：
+     - 注册 user 恒为一次性总额度（spend.total；spend_target 恒
+       "total_allowance"，纯展示标注），owner 恒为月窗口（spend.window）；
        两种形态同时出现 = 契约错误（显式报错，不任选其一）；
      - user 抽屉唯一金额动作 = 设置总额度 / 恢复默认（CAS，绝不重置已用）；
-       owner / 切换前 user = 既有 currentWindow.adjust，不出现 total 动作；
+       owner = 既有 currentWindow.adjust，不出现 total 动作；
      - turn 冻结历史 / 人工调整 / caps / 历史影子 / 来源归因入口全部删除；
      - 费用页 = KPI + [仅异常]告警条 + Demo 消耗卡 + 三页内标签明细
        （只有当前标签发请求；切换时代际递增，迟到旧响应一律丢弃）；
@@ -915,9 +916,10 @@
   var drawerTrigger = null;
 
   // ------------------------------------------------------------------
-  // spend 双形态解析（§4.3/§Batch B 契约）：
-  //   - role=user 且已切总额度 → spend.total（一次性总额度投影）；
-  //   - owner（及切换前 user）→ spend.window（月窗口，现形态）；
+  // spend 形态解析（§4.3；R3 Wave1-Money 起单轨，形态纯由主体角色驱动）：
+  //   - role=user → 恒 spend.total（一次性总额度投影；user_spend_target
+  //     双轨已拆除，不存在「切换前」user 的窗口形态）；
+  //   - role=owner → 恒 spend.window（月窗口）；
   //   - 两种形态同时出现 = 契约错误：显式报错态，绝不任选其一渲染；
   //   - 数据缺失/错误 = 不可用（原因），绝不伪造 0。金额运算全程 BigInt。
   // ------------------------------------------------------------------
@@ -1040,7 +1042,8 @@
     });
   }
 
-  // 该用户当前月金额窗口（window 形态；可能缺失：json 后端 / 尚未开窗）
+  // owner 当前月金额窗口（window 形态；可能缺失：owner 策略被禁用 / 后端异常。
+  // 单轨后 user 行不再出现 window 形态，此读取仅服务 owner 抽屉与窗口调整）
   function currentUserWindow(u) {
     return u && u.spend && u.spend.window && !u.spend.error
       ? u.spend.window : null;
@@ -1056,8 +1059,8 @@
     return "剩余 " + fmtCny(b.toString());
   }
 
-  // CAS 版本：total 形态用 allowance version；window 形态（切换前 user）用
-  // 窗口 version。缺版本 = 拒绝盲写（禁用动作并说明）。
+  // CAS 版本：total 形态（user 恒）用 allowance version；window 形态
+  // （owner 恒）用窗口 version。缺版本 = 拒绝盲写（禁用动作并说明）。
   function spendVersionOf(u) {
     var info = userSpendInfo(u);
     if (info.raw && info.raw.version !== null && info.raw.version !== undefined) {
@@ -1215,8 +1218,9 @@
   }
 
   // ------------------------------------------------------------------
-  // window 形态抽屉编辑器（owner / 切换前 user）：既有 currentWindow.adjust
-  // CAS——只改当前窗口额度快照；不出现 total 动作。
+  // window 形态抽屉编辑器（owner 恒 window——单轨后不存在「切换前 user」，
+  // 该过渡分支已删）：既有 currentWindow.adjust CAS——只改当前窗口额度
+  // 快照；不出现 total 动作。
   // ------------------------------------------------------------------
   function renderWindowAdjustEditor(u) {
     var w = currentUserWindow(u);
@@ -1224,9 +1228,7 @@
     wrap.className = "adm-drawer-override";
     var title = document.createElement("p");
     title.className = "adm-note";
-    title.textContent = u.role === "owner"
-      ? "对 Owner 当前月窗口立即调整额度快照：已消费/预占不回退；调低到低于已消费后，下一次预占即被拒绝。"
-      : "该用户尚未切换到一次性总额度（仍为月窗口）：可立即调整当前月窗口的额度快照；已消费/预占不回退。";
+    title.textContent = "对 Owner 当前月窗口立即调整额度快照：已消费/预占不回退；调低到低于已消费后，下一次预占即被拒绝。";
     var field = document.createElement("div");
     field.className = "adm-field";
     var label = document.createElement("label");
@@ -1312,9 +1314,9 @@
   }
 
   // 抽屉底部默认折叠的「技术细节」（§4.3 wave 2）：
-  //   - user（total 形态）：allowance id/version、cutover 时间、opening spent、
-  //     原始 nano；
-  //   - owner / 切换前 user（window 形态）：window id/version、起止、原始 nano。
+  //   - user（恒 total 形态）：allowance id/version、cutover 时间、
+  //     opening spent、原始 nano；
+  //   - owner（恒 window 形态）：window id/version、起止、原始 nano。
   // 金额余额、soft/hard caps 及一切暗示账户余额控制可用额度的文字已删除。
   function drawerTechDetails(u) {
     var details = document.createElement("details");
@@ -1406,14 +1408,13 @@
       kvRow(dl, "可用金额", avail.text);
       kvRow(dl, "额度来源", allowanceSourceText(info.raw && info.raw.source));
     } else if (info.shape === "window") {
+      // window 形态仅 owner（单轨后 user 行恒 total）——月窗口显示保留
       kvRow(dl, "本月额度", fmtCny(info.limit));
       kvRow(dl, "本月已用", fmtCny(info.spent));
       kvRow(dl, "本月预占", fmtCny(info.reserved));
       kvRow(dl, "本月剩余", remainingText(info.remaining));
-      kvRow(dl, "额度来源",
-            u.role === "owner" ? "默认（owner 独立策略）"
-            : (u.spend && u.spend.policy_scope === "user_override")
-              ? "单独覆盖" : "默认");
+      // 旧 user_override/policy_scope 覆盖分支已随 user 窗口形态一起退役
+      kvRow(dl, "额度来源", "默认（owner 独立策略）");
     } else if (info.shape === "invalid") {
       kvRow(dl, "额度", "契约错误：total 与 window 同时返回（服务端契约破坏，已禁止操作）");
     } else {

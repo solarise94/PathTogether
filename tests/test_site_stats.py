@@ -19,7 +19,7 @@ store 级（默认全跑；PG-only 用例 RUN_PG_TESTS=1）：
     （公开页面仍成功由 app.py 接线代理测；此处只证 store 不抛）；
     secret 绝不复用 session secret（SECRET_KEY 无回退）；
   - worker：未启动 enqueue False；队列满 False 不抛；DB 故障注入丢批不抛；
-    start/stop 幂等；非 postgres 后端 start_worker no-op；
+    start/stop 幂等；缺 STORAGE_BACKEND 时仍起 worker（Wave 3 后 PG 唯一）；
   - dashboard_stats：形状与钉死契约逐键一致；visits/unique_visitors/bots
     三分类互不混入（爬虫不进入匿名访客近似数）；只读——调用前后业务表与
     site 表行数不变、不触发清理；90 天窗口外事件不计入；
@@ -96,8 +96,8 @@ SITE_COLUMNS = [
 def _isolate(tmp_path, monkeypatch):
     """每用例：存储隔离 + 采集 env 清理 + worker/告警节流状态复位。
 
-    worker 跨用例必须停掉——上一个用例的 monkeypatch（如 STORAGE_BACKEND、
-    _flush_batch 桩）在 teardown 已还原，残留线程会带着旧状态写库。
+    worker 跨用例必须停掉——上一个用例的 monkeypatch（如 _flush_batch 桩）
+    在 teardown 已还原，残留线程会带着旧状态写库。
     """
     isolate_app(monkeypatch, tmp_path, clear_stores=True)
     for name in ("SITE_STATS_HMAC_SECRET_FILE", "PUBLIC_BASE_URL",
@@ -553,31 +553,8 @@ def test_purge_expired_deletes_only_expired_rows(secret):
 
 
 # --------------------------------------------------------------------------- #
-# 8. dashboard_stats：形状 / 三分类互斥 / 只读（真实 PG + json 空形状）
+# 8. dashboard_stats：形状 / 三分类互斥 / 只读
 # --------------------------------------------------------------------------- #
-def test_dashboard_stats_contract_shape_without_postgres(monkeypatch):
-    monkeypatch.setenv("STORAGE_BACKEND", "json")
-    stats = sss.dashboard_stats(now=BASE_TIME)
-    assert set(stats.keys()) == DASHBOARD_KEYS
-    for key in ("today", "d7", "d30"):
-        assert set(stats[key].keys()) == WINDOW_KEYS
-        assert stats[key] == {"visits": 0, "unique_visitors": 0, "bots": 0}
-    assert len(stats["daily"]) == 30
-    for row in stats["daily"]:
-        assert set(row.keys()) == DAILY_KEYS
-        assert row == {"date": row["date"], "visits": 0,
-                       "unique_visitors": 0, "bots": 0}
-    assert stats["daily"][-1]["date"] == BASE_DAY
-    assert stats["top_referrers"] == []
-    assert stats["top_pages"] == []
-    assert stats["top_countries"] == []
-    assert stats["recent"] == []
-    assert stats["visitor_kinds"] == {
-        "anonymous_human": 0, "signed_in_human": 0, "suspected_bot": 0}
-    assert stats["geo_configured"] is False
-    assert sss.purge_expired(now=BASE_TIME) == 0
-
-
 def test_dashboard_stats_counts_and_readonly(secret):
     anon = _ev(remote_addr="203.0.113.1")
     # 同 /24 同日 → 同哈希；不同 page 落新行，但去重计数仍只算 1 个访客
@@ -666,16 +643,20 @@ def test_enqueue_without_worker_returns_false():
     assert sss.enqueue_visit(None) is False
 
 
-def test_start_worker_noop_without_postgres(monkeypatch):
-    monkeypatch.setenv("STORAGE_BACKEND", "json")
+def test_start_worker_without_storage_backend_env(monkeypatch):
+    """缺 STORAGE_BACKEND 仍起 worker（Wave 3：不再把缺键当 json）。"""
+    monkeypatch.delenv("STORAGE_BACKEND", raising=False)
+    monkeypatch.setattr(sss, "_flush_batch", lambda batch: None)
     sss.start_worker()
-    assert sss._WORKER is None
-    assert sss.enqueue_visit(_fake_event()) is False
-    sss.stop_worker()
+    try:
+        assert sss._WORKER is not None
+        assert sss._WORKER["thread"].is_alive()
+        assert sss.enqueue_visit(_fake_event()) is True
+    finally:
+        sss.stop_worker()
 
 
 def test_start_stop_worker_idempotent(monkeypatch):
-    monkeypatch.setenv("STORAGE_BACKEND", "postgres")
     monkeypatch.setattr(sss, "_flush_batch", lambda batch: None)
     sss.start_worker()
     thread = sss._WORKER["thread"]
@@ -690,7 +671,6 @@ def test_start_stop_worker_idempotent(monkeypatch):
 
 
 def test_enqueue_rejects_non_minimized_payloads(monkeypatch):
-    monkeypatch.setenv("STORAGE_BACKEND", "postgres")
     monkeypatch.setattr(sss, "_flush_batch", lambda batch: None)
     sss.start_worker()
     try:
@@ -705,7 +685,6 @@ def test_enqueue_rejects_non_minimized_payloads(monkeypatch):
 
 
 def test_queue_full_returns_false_without_raise(monkeypatch):
-    monkeypatch.setenv("STORAGE_BACKEND", "postgres")
     monkeypatch.setattr(sss, "_QUEUE_CAPACITY", 2)
     monkeypatch.setattr(sss, "_BATCH_SIZE", 1)
     release = threading.Event()
@@ -730,7 +709,6 @@ def test_queue_full_returns_false_without_raise(monkeypatch):
 
 
 def test_db_failure_drops_batch_without_raise(monkeypatch, caplog):
-    monkeypatch.setenv("STORAGE_BACKEND", "postgres")
     monkeypatch.setattr(sss, "_WARN_INTERVAL_SECONDS", 0.0)
     attempts = []
 

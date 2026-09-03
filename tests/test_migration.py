@@ -220,7 +220,8 @@ def test_apply_verify_idempotent_rollback(mig, args_ns, fixture_dir, pg_uri,
     out, err = capsys.readouterr()
     assert rc == 0, "rollback 应成功：%s" % err
     assert (sdd / "shares.json").read_text(encoding="utf-8") == orig_shares
-    assert "STORAGE_BACKEND=json" in out
+    assert "恢复迁移前的数据库备份" in out
+    assert "STORAGE_BACKEND=json" in out  # 明确禁止对 Wave 3 镜像设置
 
 
 # --------------------------------------------------------------------------- #

@@ -880,10 +880,12 @@ def cmd_rollback(args):
     if uf_bak.exists():
         shutil.copy2(uf_bak, _users_file(share_data_dir))
     sys.stdout.write("已把备份 json 拷回 %s\n" % share_data_dir)
-    sys.stdout.write("\n回滚指引：\n")
-    sys.stdout.write("  1. STORAGE_BACKEND=json（或取消该 env）\n")
-    sys.stdout.write("  2. 重启服务（gunicorn / docker）\n")
-    sys.stdout.write("  3. PG 中的导入数据仍保留；如需清空可手动 TRUNCATE 业务表\n")
+    sys.stdout.write("\n回滚指引（本命令只还原离线 JSON 备份文件，不能把当前\n")
+    sys.stdout.write("Wave 3 镜像切回 json 运行时——STORAGE_BACKEND=json 会在\n")
+    sys.stdout.write("import 期 ValueError）：\n")
+    sys.stdout.write("  1. 恢复迁移前的数据库备份\n")
+    sys.stdout.write("  2. 启动对应的旧镜像（支持 json 后端的版本）\n")
+    sys.stdout.write("  3. 切勿对 Wave 3+ 镜像设置 STORAGE_BACKEND=json\n")
     return 0
 
 

@@ -17,8 +17,7 @@ docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md §3.4 / §4.4 /
   query/token/资源 ID——原始值在本函数内计算派生后即丢弃）；
 - ``enqueue_visit(event) -> bool``：有界进程内队列 put_nowait；队列满 /
   worker 未启动 / 后端不可用 → False（丢该条），**永不抛异常**；
-- ``start_worker()``：后台批量写线程，幂等；``STORAGE_BACKEND != postgres``
-  时 no-op；
+- ``start_worker()``：后台批量写线程，幂等（PostgreSQL 为唯一后端）；
 - ``stop_worker()``：幂等；进程退出允许丢队列残余（统计允许少计，绝不阻塞
   页面响应）；
 - ``dashboard_stats(*, now=None) -> dict``：owner-only 只读固定聚合，
@@ -36,8 +35,6 @@ secret 文件未配置/缺失/权限过宽/为空        build_event → None（
                                             止）+ 节流 warning
 remote_addr 缺失/不可解析                   build_event → None（无法算
                                             日轮换匿名哈希）
-STORAGE_BACKEND != postgres                 start_worker no-op；enqueue
-                                            恒 False
 worker 未启动                               enqueue False
 队列满（容量 _QUEUE_CAPACITY）              enqueue False（丢该条）
 DB 连接失败 / 超时 / 写失败                 丢整批 + 节流 warning，worker
@@ -489,19 +486,12 @@ _WORKER = None          # {"thread": Thread, "queue": Queue, "stop": Event}
 _WORKER_LOCK = threading.Lock()
 
 
-def _backend_is_postgres():
-    return (os.environ.get("STORAGE_BACKEND") or "").strip() == "postgres"
-
-
 def start_worker():
-    """启动后台批量写线程（幂等）。STORAGE_BACKEND != postgres 时 no-op
-    （json/dual 后端无 site_visit_events 表，enqueue 恒 False）。"""
+    """启动后台批量写线程（幂等）。PostgreSQL 为唯一后端，不再读
+    ``STORAGE_BACKEND``——缺键也必须起 worker（Wave 3 后 json/dual 不可达）。"""
     global _WORKER
     with _WORKER_LOCK:
         if _WORKER is not None and _WORKER["thread"].is_alive():
-            return
-        if not _backend_is_postgres():
-            _WORKER = None
             return
         queue_obj = queue.Queue(maxsize=_QUEUE_CAPACITY)
         stop_event = threading.Event()
@@ -530,8 +520,6 @@ def enqueue_visit(event) -> bool:
     永不抛异常——页面响应路径绝不因统计而等待或报错。"""
     try:
         if not isinstance(event, dict) or not _EVENT_KEYS.issubset(event):
-            return False
-        if not _backend_is_postgres():
             return False
         with _WORKER_LOCK:
             worker = _WORKER
@@ -793,14 +781,9 @@ def _visitor_kind_counts(start_utc, end_utc):
     return {kind: grouped.get(kind, 0) for kind in VISITOR_KINDS}
 
 
-def _empty_window():
-    return {"visits": 0, "unique_visitors": 0, "bots": 0}
-
-
 def dashboard_stats(*, now=None):
     """owner-only 只读固定聚合（契约形状，一字不差）。只读 site_visit_events，
-    不联任何业务表、不创建事件、不调清理；STORAGE_BACKEND != postgres 时
-    返回全零空形状（页面渲染中性空状态；json 后端无本表）。
+    不联任何业务表、不创建事件、不调清理。
 
     geo_configured 恒 False（D2 country_code 恒 unknown，未配置离线定位库）。
     """
@@ -812,24 +795,6 @@ def dashboard_stats(*, now=None):
     today_end = today_start + timedelta(days=1)
     d7_start = _day_start_utc(moment_utc, _DASHBOARD_DAYS_BACK["d7"])
     d30_start = _day_start_utc(moment_utc, _DASHBOARD_DAYS_BACK["d30"])
-    if not _backend_is_postgres():
-        return {
-            "generated_at": moment_utc.isoformat(),
-            "today": _empty_window(),
-            "d7": _empty_window(),
-            "d30": _empty_window(),
-            "daily": [{
-                "date": (today_start.astimezone(_STATS_TIMEZONE).date()
-                         - timedelta(days=i)).isoformat(),
-                "visits": 0, "unique_visitors": 0, "bots": 0,
-            } for i in range(29, -1, -1)],
-            "top_referrers": [],
-            "top_pages": [],
-            "top_countries": [],
-            "recent": [],
-            "visitor_kinds": {k: 0 for k in VISITOR_KINDS},
-            "geo_configured": False,
-        }
     windows = {}
     for key in _DASHBOARD_WINDOW_KEYS:
         start = d30_start if key == "d30" else (
@@ -858,13 +823,11 @@ def dashboard_stats(*, now=None):
 
 def purge_expired(*, now=None):
     """显式 retention 清理：只删 expires_at 到期的 site_visit_events 行，
-    返回删除行数。不碰任何业务表；json 后端无表，恒 0。"""
+    返回删除行数。不碰任何业务表。"""
     moment = now if now is not None else datetime.now(timezone.utc)
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
     moment_utc = moment.astimezone(timezone.utc)
-    if not _backend_is_postgres():
-        return 0
     conn = pg_store.connect()
     try:
         with conn.transaction():

@@ -7,7 +7,15 @@ docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md §Batch B
 「迁移与额度语义 1-8」。
 
 用法（只接受显式 actor；数据库 DSN 只从环境变量读——DATABASE_URL 或
-PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE，脚本绝不接受 --dsn）::
+PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE，脚本绝不接受 --dsn）。
+
+**编排（R3 review 停服口径，与脚本内部维护闸 CAS 不是同一层）**：
+本脚本的 ``apply`` **要求** ``ai_dispatch_maintenance`` 当前为 false，并以
+CAS false→true 自己开闸、成功后 true→false 自己关闸。因此**不能**按「先手工
+开维护闸再跑 preflight/apply」——preflight 会把已开闸判为 ``maintenance_active``。
+正确顺序是完整停服（停入口流量 + 停旧 Web）后，在无流量窗口对库跑
+preflight → apply；脚本内部短暂开/关维护标记不暴露给用户。详见规格文档
+§8.1 与 docs/demo-deployment.md「金额单轨 cutover」。
 
     export DATABASE_URL="postgresql://..."
     python3 scripts/cutover_user_total_allowances.py --mode preflight --actor usr_owner_x

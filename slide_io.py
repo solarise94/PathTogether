@@ -11,13 +11,22 @@
 ``read_region((x,y), level, (w,h))``，外加 ``get_thumbnail``、``close``。
 
 设计取舍：
-- tifffile.aszarr 方案：用 ``tf.aszarr(series=0)`` 整体打开，金字塔时得到
+- tifffile.aszarr 方案：用 ``tf.aszarr(series=...)`` 整体打开，金字塔时得到
   zarr Group（key '0','1',... 为各级），单级时得到 zarr Array。这样无需
   为每级单独持有 store，统一在 close 时释放，简化生命周期。注意需配
   zarr<3（tifffile 较新版本要求 zarr>=3，本项目锁定兼容版本）。
-- axes 处理：series.axes 可能是 'YXS'、'CYX'、'TCYX'、'QYX' 等。读取时
-  按 axes 顺序构造索引：Y/X 取 slice，S（样本/通道）取 slice（默认全部
-  再裁前 3 通道），其余维度（T/C/Q/P...）一律取 0。
+- axes 处理（Batch 2 起）：
+  * series 选择按 ``Y*X`` 主空间面积 + 有效金字塔层数（不再按含 C/T/Z 的
+    全 shape 乘积，避免小空间高通道辅助 series 抢主图）；
+  * ``S`` 仅在 photometric=RGB 且 samples=3/4 时当原生 RGB(A)；逻辑 ``C``
+    单独处理，多通道读取走 :meth:`TiffFileSlide.read_region_channels`
+    （zarr 索引保留 Y/X slice 与所选通道标量，不整面加载）；
+  * 旧 :meth:`TiffFileSlide.read_region` 保持 OpenSlide duck-type 与
+    legacy-first-plane 语义（除 Y/X/S 外取 0）；
+  * 每个 pyramid level 以该 level 自己的 axes/shape 建索引，level 间
+    C/T/Z 尺寸必须一致（``validate_level_axes_consistency``）；
+  * multi-file OME（外部 UUID/缺失 plane）以
+    ``SlideRenderError("unsupported_multifile_ome")`` 稳定拒绝。
 """
 
 from __future__ import annotations
@@ -49,6 +58,38 @@ _TIFF_LOGICAL_EXTS = frozenset((".ome.tiff", ".ome.tif", ".tiff", ".tif"))
 VALID_SLIDE_ERROR_CODES = frozenset((
     "invalid_slide", "slide_open_unsupported", "slide_open_failed",
 ))
+
+
+#: SlideRenderError.code 的固定词表（多通道渲染/读取语义，规格 §7.4；
+#: Batch 3 由路由映射为稳定 HTTP 契约，本批以异常 class + .code 暴露）
+VALID_RENDER_ERROR_CODES = frozenset((
+    "invalid_render_context", "render_channel_out_of_range",
+    "render_channel_limit", "unsupported_multifile_ome",
+    "unsupported_plane_selection",
+))
+
+
+class SlideRenderError(ValueError):
+    """多通道渲染/读取语义错误（携带稳定机器码，供路由映射统一契约）。
+
+    code 固定为 :data:`VALID_RENDER_ERROR_CODES` 之一：
+      - ``invalid_render_context``：render context 结构/取值非法；
+      - ``render_channel_out_of_range``：通道索引越界（解码前拒绝）；
+      - ``render_channel_limit``：一次启用的通道数超过上限（8）；
+      - ``unsupported_multifile_ome``：检测到 multi-file OME（外部 UUID/
+        缺失 plane），禁止悄悄显示不完整数据；
+      - ``unsupported_plane_selection``：请求了首版不支持的 T/Z 平面
+        （首版固定 T=0,Z=0，policy ``first-plane-v1``）。
+
+    兼容历史：继承 ValueError（调用方按 ValueError 捕获仍成立）。
+    注意：该异常从 :func:`open_slide` **直通**，不会被吞掉去 fallback
+    OpenSlide——否则 multi-file OME 会以残缺数据静默打开。
+    """
+
+    def __init__(self, code, message=None):
+        super().__init__(message or code)
+        self.code = code if code in VALID_RENDER_ERROR_CODES else \
+            "invalid_render_context"
 
 
 class SlideValidationError(ValueError):
@@ -193,6 +234,8 @@ def open_slide(path, *, format_hint=None):
     if ext in _TIFF_LOGICAL_EXTS and _is_ome_tiff(str(path)):
         try:
             return TiffFileSlide(path)
+        except SlideRenderError:
+            raise  # multi-file OME 等：直通稳定码，禁止 fallback 打开残缺数据
         except Exception as e:  # noqa: BLE001
             verdicts.append((_exc_kind(e), e))
 
@@ -206,6 +249,8 @@ def open_slide(path, *, format_hint=None):
     if ext in _TIFF_LOGICAL_EXTS:
         try:
             return TiffFileSlide(path)
+        except SlideRenderError:
+            raise  # 同上：稳定渲染语义错误直通（BytesIO 等无嗅探路径也覆盖）
         except Exception as e:  # noqa: BLE001
             verdicts.append((_exc_kind(e), e))
 
@@ -286,6 +331,104 @@ def _to_float(v):
 
 
 # --------------------------------------------------------------------------- #
+# Batch 2：多通道 OME 元数据与 level 一致性（供 slide_render 复用）
+# --------------------------------------------------------------------------- #
+def _parse_ome_channels(ome_xml, series_index):
+    """解析 OME-XML 中第 ``series_index`` 个 Image 的 Channel 元数据。
+
+    返回 ``[{"id": str|None, "name": str|None, "color": str|None}, ...]``
+    （属性为**原始字符串**，颜色解析由 slide_render.parse_ome_channel_color
+    按 §5.1 语义处理）；XML 缺失/不可解析/没有对应 Image 时返回 None。
+    调用方需自行校验条目数与像素 SizeC 是否一致（不一致按缺失 + warning）。
+    """
+    if not ome_xml:
+        return None
+    try:
+        root = ET.fromstring(ome_xml)
+    except ET.ParseError:
+        return None
+    ns = ""
+    if root.tag.startswith("{"):
+        ns = root.tag.split("}", 1)[0] + "}"
+    images = root.findall(f".//{ns}Image")
+    if series_index < 0 or series_index >= len(images):
+        return None
+    pixels = images[series_index].find(f"{ns}Pixels")
+    if pixels is None:
+        return None
+    out = []
+    for ch in pixels.findall(f"{ns}Channel"):
+        out.append({
+            "id": ch.get("ID"),
+            "name": ch.get("Name"),
+            "color": ch.get("Color"),
+        })
+    return out or None
+
+
+def validate_level_axes_consistency(base_axes, base_shape, level_axes_shapes):
+    """校验金字塔各 level 的 C/T/Z 尺寸与基级一致（§7.2，fail clearly）。
+
+    ``level_axes_shapes`` 是 ``[(axes, shape), ...]``。允许 level 省略
+    **尺寸为 1** 的轴（tifffile 2024.5.22 真实行为：TCZYX(Z=1) 的 level
+    axes 为 'TCYX'）；基级尺寸 >1 的轴在某 level 缺失、或同级尺寸不一致
+    时抛 :class:`SlideValidationError`（``slide_open_failed``，
+    cause_type=``LevelAxesMismatch``），绝不带病继续读。
+    """
+    base = {}
+    for ax in ("T", "C", "Z"):
+        if ax in (base_axes or ""):
+            try:
+                base[ax] = int(base_shape[(base_axes or "").index(ax)])
+            except (IndexError, TypeError, ValueError):
+                base[ax] = 1
+    for li, (laxes, lshape) in enumerate(level_axes_shapes):
+        laxes = laxes or ""
+        for ax, bsize in base.items():
+            if ax in laxes:
+                try:
+                    lsize = int(lshape[laxes.index(ax)])
+                except (IndexError, TypeError, ValueError):
+                    lsize = None
+                if lsize != bsize:
+                    raise SlideValidationError(
+                        "slide_open_failed",
+                        "金字塔 level %d 的 %s 尺寸(%s)与基级(%d)不一致"
+                        % (li, ax, lsize, bsize),
+                        cause_type="LevelAxesMismatch")
+            elif bsize != 1:
+                raise SlideValidationError(
+                    "slide_open_failed",
+                    "金字塔 level %d 缺少基级尺寸 %d 的 %s 轴"
+                    % (li, bsize, ax),
+                    cause_type="LevelAxesMismatch")
+
+
+def build_channel_index(axes, channel, t, z, ys, xs):
+    """构造「按逻辑通道取单个 plane 区域」的 zarr 索引元组。
+
+    Y/X 接收调用方给定的 slice（保留空间切片、不整面加载）；C（或退化
+    当通道用的 S）取标量 → zarr 只解码所选通道 plane（§7.2：不得先加载
+    所有 plane 再裁）。T/Z 取标量（首版固定 0）；其余未知轴取 0。
+    """
+    idx = []
+    for ax in (axes or ""):
+        if ax == "Y":
+            idx.append(ys)
+        elif ax == "X":
+            idx.append(xs)
+        elif ax in ("C", "S"):
+            idx.append(int(channel))
+        elif ax == "T":
+            idx.append(int(t))
+        elif ax == "Z":
+            idx.append(int(z))
+        else:
+            idx.append(0)
+    return tuple(idx) if idx else (slice(None),)
+
+
+# --------------------------------------------------------------------------- #
 # TiffFileSlide
 # --------------------------------------------------------------------------- #
 class TiffFileSlide:
@@ -297,9 +440,14 @@ class TiffFileSlide:
 
     VENDOR = "generic-tiff"
 
+    #: TIFF PHOTOMETRIC.RGB（tifffile Photometric.RGB 的整数值）
+    _PHOTOMETRIC_RGB = 2
+
     def __init__(self, path):
         import tifffile  # lazy import
 
+        # path 可为文件路径或二进制流（BytesIO 等，供测试/内存场景直接使用）
+        self._pathobj = path
         self._path = str(path)
         # 先置默认值，确保 close()/__del__ 在初始化中途异常时也安全
         self._tf = None
@@ -311,24 +459,87 @@ class TiffFileSlide:
         self._level_dims = []
         self._level_ds = []
         self.properties = {}
+        # Batch 2 结构化元数据（§7.2）
+        self._series_index = 0
+        self._shape = ()
+        self._level_axes = ()
+        self._level_shapes = ()
+        self._plane_sizes = {"size_c": 0, "size_t": 1, "size_z": 1}
+        self._channel_count = 0
+        self._channel_axis = None
+        self._is_native_rgb = False
+        self._ome_channels = None
+        self._channel_manifest = None
+        self._dtype = ""
 
-        self._tf = tifffile.TiffFile(self._path)
-        # 选像素数最多的 series（多 series TIFF 取主图）
-        self._series = max(
-            self._tf.series,
-            key=lambda s: int(np.prod(s.shape)) if s.shape else 0,
+        self._tf = tifffile.TiffFile(
+            self._pathobj if hasattr(self._pathobj, "read") else self._path)
+        # 选主图 series：按 Y*X 主空间面积（不按含 C/T/Z 的全 shape 乘积，
+        # 避免小空间高通道辅助 series 抢主图）+ 有效金字塔层数；同分时按
+        # series 顺序（max 取首个）确定性 tie-break（§7.2）。
+        self._series_index = max(
+            range(len(self._tf.series)),
+            key=lambda i: self._series_score(self._tf.series[i]),
         )
+        self._series = self._tf.series[self._series_index]
+
+        # multi-file OME 检测：必须在任何像素访问前稳定拒绝（§3.2/§7.2），
+        # 禁止悄悄显示不完整数据（tifffile 2024.5.22 对缺 plane 的 multi-file
+        # 会退化为 generic series 并以 0 填充——正好作为外引用不可解析的信号）。
+        self._check_multifile_ome()
+
         self._levels = self._series.levels or [self._series]
         self._axes = self._series.axes or "YXS"
+        self._shape = tuple(int(v) for v in (self._series.shape or ()))
+        # 每个 pyramid level 用该 level 自己的 axes/shape（size-1 轴会被
+        # tifffile 从 level axes 省略）；level 间 C/T/Z 尺寸必须一致。
+        self._level_axes = tuple((lv.axes or self._axes) or "YXS"
+                                 for lv in self._levels)
+        self._level_shapes = tuple(
+            tuple(int(v) for v in (lv.shape or ())) for lv in self._levels)
+        validate_level_axes_consistency(
+            self._axes, self._shape,
+            list(zip(self._level_axes, self._level_shapes)))
+
+        # 原生 RGB 判定：S 仅在 photometric=RGB 且 samples=3/4 时当原生
+        # RGB(A)；逻辑 C 单独处理（§7.2）。
+        has_c = "C" in self._axes
+        has_s = "S" in self._axes
+        samples = 1
+        if has_s:
+            try:
+                samples = int(self._shape[self._axes.index("S")])
+            except (IndexError, TypeError, ValueError):
+                samples = 1
+        photometric = self._series_photometric()
+        self._is_native_rgb = (
+            (not has_c) and has_s and samples in (3, 4)
+            and photometric == self._PHOTOMETRIC_RGB)
+        # 逻辑通道轴：优先 C；无 C 且非原生 RGB 的 S 退化按逻辑通道处理；
+        # 原生 RGB 无逻辑通道（count=0），纯灰度 YX 视为单通道。
+        if has_c:
+            self._channel_axis = "C"
+            try:
+                self._channel_count = int(self._shape[self._axes.index("C")])
+            except (IndexError, TypeError, ValueError):
+                self._channel_count = 0
+        elif has_s and not self._is_native_rgb:
+            self._channel_axis = "S"
+            self._channel_count = samples
+        elif self._is_native_rgb:
+            self._channel_axis = None
+            self._channel_count = 0
+        else:
+            self._channel_axis = None
+            self._channel_count = 1
+        self._plane_sizes = {
+            "size_c": int(self._channel_count),
+            "size_t": self._axis_size("T"),
+            "size_z": self._axis_size("Z"),
+        }
 
         # 打开 zarr store：金字塔 → Group（key '0'/'1'/...），单级 → Array
-        # 定位所选 series 在 tf.series 中的序号（避免依赖对象的 ==/hash）
-        sidx = 0
-        for i, s in enumerate(self._tf.series):
-            if s is self._series:
-                sidx = i
-                break
-        self._store = self._tf.aszarr(series=sidx)
+        self._store = self._tf.aszarr(series=self._series_index)
         import zarr  # lazy import
 
         self._zroot = zarr.open(self._store, mode="r")
@@ -340,6 +551,18 @@ class TiffFileSlide:
                 self._zarrays.append(arr)
         else:
             self._zarrays = [self._zroot]
+        if self._zarrays:
+            self._dtype = str(self._zarrays[0].dtype)
+
+        # OME-XML 通道元数据（原始字符串；颜色语义解析在 slide_render）
+        try:
+            ome_xml = self._tf.ome_metadata
+        except Exception:  # noqa: BLE001
+            ome_xml = None
+        self._ome_xml = ome_xml
+        self._ome_channels = (
+            _parse_ome_channels(ome_xml, self._series_index)
+            if ome_xml else None)
 
         # 尺寸与降采样
         self._level_dims = []
@@ -353,6 +576,167 @@ class TiffFileSlide:
 
         # properties（OpenSlide 风格）
         self.properties = self._build_properties()
+
+    # ---------- Batch 2：series 选择 / 结构化元数据 ----------
+    @staticmethod
+    def _series_score(series):
+        """series 评分：(Y*X 主空间面积, 有效金字塔层数)。"""
+        axes = series.axes or ""
+        shape = series.shape or ()
+        area = 0
+        if "Y" in axes and "X" in axes:
+            try:
+                area = int(shape[axes.index("Y")]) * int(shape[axes.index("X")])
+            except (IndexError, TypeError, ValueError):
+                area = 0
+        if area <= 0 and len(shape) >= 2:
+            # 兜底：末两维 (H, W)
+            try:
+                area = int(shape[-2]) * int(shape[-1])
+            except (IndexError, TypeError, ValueError):
+                area = 0
+        try:
+            nlevels = len(series.levels) if series.levels else 1
+        except Exception:  # noqa: BLE001
+            nlevels = 1
+        return (int(area), int(nlevels))
+
+    def _axis_size(self, ax):
+        """基级 axes/shape 中某轴尺寸；轴不存在返回 1。"""
+        if ax in self._axes:
+            try:
+                return int(self._shape[self._axes.index(ax)])
+            except (IndexError, TypeError, ValueError):
+                return 1
+        return 1
+
+    def _series_photometric(self):
+        """所选 series 首页的 photometric 整数（不可得返回 0）。"""
+        try:
+            page = self._series.pages[0]
+            return int(getattr(page, "photometric", 0) or 0)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _check_multifile_ome(self):
+        """检测 multi-file OME（外部 UUID FileName 引用）并稳定拒绝。
+
+        判定（保守，避免把改名后的单文件 master 误杀）：
+        - 收集 OME-XML 中全部 ``TiffData/UUID@FileName``；
+        - 引用了 **多个** 外部文件名 → 必是 multi-file，拒绝；
+        - 引用了 **一个** 与当前文件名不同的外部文件：tifffile 能建成 OME
+          series（kind=='ome'，plane 齐全）→ 按改名后的单文件 master 放行；
+          建不成（kind 非 ome，plane 缺失）→ multi-file，拒绝。
+        """
+        tf = self._tf
+        if not getattr(tf, "is_ome", False):
+            return
+        try:
+            ome_xml = tf.ome_metadata
+        except Exception:  # noqa: BLE001
+            ome_xml = None
+        if not ome_xml:
+            return
+        try:
+            root = ET.fromstring(ome_xml)
+        except ET.ParseError:
+            return
+        files = set()
+        for elem in root.iter():
+            tag = elem.tag.rsplit("}", 1)[-1]
+            if tag != "TiffData":
+                continue
+            for child in elem:
+                if child.tag.rsplit("}", 1)[-1] == "UUID":
+                    fn = child.get("FileName")
+                    if fn:
+                        files.add(fn)
+        if not files:
+            return
+        own = ""
+        try:
+            own = os.path.basename(getattr(tf, "filename", "") or "")
+        except Exception:  # noqa: BLE001
+            own = ""
+        external = {f for f in files if f != own}
+        if not external:
+            return
+        kind = (getattr(self._series, "kind", "") or "").lower()
+        if len(external) > 1 or kind != "ome":
+            raise SlideRenderError(
+                "unsupported_multifile_ome",
+                "检测到 multi-file OME-TIFF（外部文件引用：%s）；本版本仅"
+                "支持单文件 OME-TIFF" % ", ".join(sorted(external)[:4]))
+
+    # ---------- 结构化只读属性（§7.2） ----------
+    @property
+    def axes(self):
+        """主 series 基级 axes 字符串（如 'CYX'/'TCZYX'/'YXS'）。"""
+        return self._axes
+
+    @property
+    def shape(self):
+        """主 series 基级 shape（与 :attr:`axes` 一一对应）。"""
+        return self._shape
+
+    @property
+    def series_index(self):
+        """所选主图 series 在 ``tf.series`` 中的序号。"""
+        return self._series_index
+
+    @property
+    def plane_sizes(self):
+        """``{"size_c", "size_t", "size_z"}``（轴缺失记 1，原生 RGB C=0）。"""
+        return dict(self._plane_sizes)
+
+    @property
+    def channel_count(self):
+        """逻辑通道数（原生 RGB 为 0；纯灰度 YX 为 1）。"""
+        return self._channel_count
+
+    @property
+    def channel_axis(self):
+        """逻辑通道对应轴（'C' / 退化 'S' / 无）。"""
+        return self._channel_axis
+
+    @property
+    def is_native_rgb(self):
+        """是否原生 RGB(A)（photometric=RGB 且 S=3/4 且无逻辑 C）。"""
+        return self._is_native_rgb
+
+    @property
+    def level_axes(self):
+        """各 pyramid level 自己的 axes 元组。"""
+        return self._level_axes
+
+    @property
+    def level_shapes(self):
+        """各 pyramid level 自己的 shape 元组。"""
+        return self._level_shapes
+
+    @property
+    def level_arrays(self):
+        """各 pyramid level 的 zarr 数组（只读用途；顺序与 level 一致）。"""
+        return tuple(self._zarrays) if self._zarrays else ()
+
+    @property
+    def dtype(self):
+        """基级像素 dtype 字符串（如 'uint16'/'float32'）。"""
+        return self._dtype
+
+    @property
+    def ome_channels(self):
+        """OME-XML 原始通道元数据列表，或 None（非 OME/解析失败）。"""
+        return self._ome_channels
+
+    @property
+    def channel_manifest(self):
+        """通道 manifest（延迟构建并缓存于本实例；见 slide_render）。"""
+        if self._channel_manifest is None:
+            import slide_render  # 延迟导入避免模块级环
+
+            self._channel_manifest = slide_render.build_channel_manifest(self)
+        return self._channel_manifest
 
     # ---------- axes / 形状辅助 ----------
     def _axes_shape_hw(self, axes, shape):
@@ -489,6 +873,80 @@ class TiffFileSlide:
         out.paste(region_img, (paste_x, paste_y))
         return out
 
+    def read_region_channels(self, location, level, size, channel_indices,
+                             *, t=0, z=0):
+        """只读指定逻辑通道的区域（多通道合成专用，§7.2）。
+
+        返回 ``(planes, geometry)``：
+          - ``planes``：``np.float64`` 数组，形状 ``(len(channel_indices),
+            valid_h, valid_w)``；保留 NaN/Inf（由合成层按 0 处理并计数）；
+          - ``geometry``：``{"paste_x","paste_y","valid_w","valid_h",
+            "width","height","level"}``，与 :meth:`read_region` 的越界/padding
+            语义一致（完全越界 → 空 plane + valid 0）。
+
+        zarr 索引保留 Y/X slice 与所选通道标量——只解码所选 plane，不先
+        加载整面再裁；T/Z 首版固定 0（请求其它平面抛
+        ``unsupported_plane_selection``）；通道越界抛
+        ``render_channel_out_of_range``。每次读取用该 level 自己的 axes。
+        """
+        x0, y0 = location
+        w, h = size
+        level = int(level)
+        if level < 0 or level >= len(self._level_dims):
+            level = max(0, min(level, len(self._level_dims) - 1))
+
+        t = int(t)
+        z = int(z)
+        # 首版固定首平面（policy first-plane-v1）：任何非 0 的 T/Z 请求都
+        # 以稳定码拒绝（§3.2/§6.2），而不是静默回退到首平面。
+        if t != 0 or z != 0:
+            raise SlideRenderError(
+                "unsupported_plane_selection",
+                "首版仅支持 T=0,Z=0（policy first-plane-v1，请求 t=%d,z=%d）"
+                % (t, z))
+
+        # 通道校验（解码前；重复索引去重保序）
+        req = []
+        for c in channel_indices:
+            c = int(c)
+            if c < 0 or c >= self._channel_count:
+                raise SlideRenderError(
+                    "render_channel_out_of_range",
+                    "通道索引 %d 越界（逻辑通道数 %d）"
+                    % (c, self._channel_count))
+            if c not in req:
+                req.append(c)
+
+        lw, lh = self._level_dims[level]
+        ds = self._level_ds[level] if level < len(self._level_ds) else 1.0
+        lx = int(x0 / ds) if ds else int(x0)
+        ly = int(y0 / ds) if ds else int(y0)
+        sx = max(0, lx)
+        sy = max(0, ly)
+        ex = min(lw, lx + int(w))
+        ey = min(lh, ly + int(h))
+        valid_w = max(0, ex - sx)
+        valid_h = max(0, ey - sy)
+
+        planes = np.empty((len(req), valid_h, valid_w), dtype=np.float64)
+        if valid_w > 0 and valid_h > 0 and req:
+            arr = self._zarrays[level]
+            axes = self._level_axes[level]
+            for i, c in enumerate(req):
+                idx = build_channel_index(axes, c, t, z,
+                                          slice(sy, ey), slice(sx, ex))
+                planes[i] = np.asarray(arr[idx], dtype=np.float64)
+        geometry = {
+            "paste_x": int(sx - lx),
+            "paste_y": int(sy - ly),
+            "valid_w": int(valid_w),
+            "valid_h": int(valid_h),
+            "width": int(w),
+            "height": int(h),
+            "level": int(level),
+        }
+        return planes, geometry
+
     def _to_rgb_u8(self, arr, axes):
         """把读取到的 numpy 数组归一化为 (H, W, 3) uint8 RGB。
 
@@ -581,7 +1039,8 @@ class TiffFileSlide:
     # ---------- 生命周期 ----------
     def close(self):
         """释放 zarr store 与 tifffile 句柄。顺序：先 store 再 TiffFile。"""
-        # 释放对 zarr array/group 的引用
+        # 释放派生缓存与对 zarr array/group 的引用
+        self._channel_manifest = None
         self._zarrays = None
         self._zroot = None
         if self._store is not None:

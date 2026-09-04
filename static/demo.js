@@ -42,6 +42,7 @@
     rebuilding: false,    // event_reset 正在拉 snapshot
     pendingEvents: [],    // 重建期间缓存的原流事件，完成后按序回放
     liveBubble: null,     // 当前可续写的 text_delta 回答区域
+    channelCtrl: null,    // 多通道通道着色控制器（Batch 4，channel-controls.js 共用）
   };
 
   // ---------- 小工具 ----------
@@ -441,11 +442,53 @@
       .then(function (r) { return r.json(); })
       .then(function (info) {
         state.info = info;
-        if (state.viewer) state.viewer.open(api.dziUrl(slideId));
+        // 多通道通道着色（Batch 4）：共用组件按 info 决定 inline custom
+        // TileSource（携带 render token）或原 DZI。render 计划的 viewer.open
+        // 由控制器经 opts.open 完成；本函数只负责 legacy 打开。
+        var plan = null;
+        if (window.HP_Channels) {
+          state.channelCtrl = state.channelCtrl || initChannelController();
+          plan = state.channelCtrl.handleInfo(info, {
+            id: info.slide_id || slideId,
+            scope: "demo",
+          });
+        }
+        if (state.viewer && (!plan || plan.kind !== "render")) {
+          state.viewer.open(api.dziUrl(slideId));
+        }
         resizeObsCanvas();
         updateZoomBadge();
       })
       .catch(function (e) { toast(t("demo.slide.open.fail", { e: e })); });
+  }
+
+  // ---------- 多通道通道着色（Batch 4；channel-controls.js 三页面共用） ----------
+  // Demo 只读：adapter 用 demoApi（/api/demo/*，capability cookie 鉴权）；
+  // 无缩略图层/导出端点，setThumbnail 不接（控制器跳过）
+  function initChannelController() {
+    return window.HP_Channels.createChannelController({
+      adapter: demoApi(),
+      viewer: state.viewer,
+      button: $("channel-btn"),
+      badge: $("rgb-badge"),
+      panelHost: $("channel-panel"),
+      t: t,
+      toast: function (msg) { toast(msg); },
+      storage: window.localStorage,
+      // 通道重开（同一切片换配色）：demo 的 open 处理只刷徽章/重绘观察框，
+      // 幂等，无需跳过；重开后补一次观察框重绘
+      onReopened: function () { drawObservations(); },
+      // render 计划的打开统一由控制器发起（含 409 刷新 info 重建路径）
+      open: function (plan) {
+        if (state.viewer && plan && plan.tileSource) state.viewer.open(plan.tileSource);
+      },
+      // 409 slide_revision_conflict：只刷新 info 并重建一次（§6.3）
+      refreshInfo: function () {
+        var id = state.current && state.current.slide_id;
+        if (!id) return Promise.resolve(null);
+        return demoApi().slideInfo(id).then(function (r) { return r.json(); });
+      },
+    });
   }
 
   // ---------- AI 面板状态机（按钮文案 docs §5.6） ----------

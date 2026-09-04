@@ -27,13 +27,52 @@
     return encodeURIComponent(id == null ? "" : id);
   }
 
+  // CSRF 双提交（与 app.js apiFetch 同一设施）：非安全方法附 X-CSRF-Token。
+  // Demo 走 capability cookie（/api/demo/* 在 app.py CSRF 豁免前缀内），不带。
+  function csrfToken() {
+    var m = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+    return m ? decodeURIComponent(m[1]) : "";
+  }
+
+  // 瓦片/缩略图/crop 的 render 查询串（§6.3 资源端点 ?render=<token>）。
+  // token 为空（RGB/legacy）时返回 ""，URL 与旧路径完全一致。
+  function renderQuery(renderToken) {
+    return renderToken ? "?render=" + encodeURIComponent(renderToken) : "";
+  }
+
   function officialAdapter() {
     return {
       mode: "official",
       listSlides: function () { return credFetch("/api/slides"); },
       slideInfoUrl: function (id) { return "/api/slide/" + enc(id) + "/info"; },
       dziUrl: function (id) { return "/api/slide/" + enc(id) + ".dzi"; },
-      thumbnailUrl: function (id) { return "/api/slide/" + enc(id) + "/thumbnail"; },
+      thumbnailUrl: function (id, renderToken) {
+        return "/api/slide/" + enc(id) + "/thumbnail" + renderQuery(renderToken);
+      },
+      // ---- Batch 4 多通道（§8.2 adapter 扩展；HP_Channels 消费）----
+      // 服务端规范化（§6.2）：POST render-context，返回 canonical context +
+      // fingerprint + render_token。flag 关时端点 403 multichannel_disabled，
+      // 通道 UI 不会走到这里（info 无 render_context_endpoint 能力）。
+      normalizeRenderContext: function (id, body) {
+        var headers = { "Content-Type": "application/json" };
+        var tok = csrfToken();
+        if (tok) headers["X-CSRF-Token"] = tok;
+        return credFetch("/api/slide/" + enc(id) + "/render-context", {
+          method: "POST",
+          headers: headers,
+          body: JSON.stringify(body || {}),
+        });
+      },
+      tileUrl: function (id, level, x, y, renderToken) {
+        return "/api/slide/" + enc(id) + "_files/" + level + "/" + x + "_" + y +
+          ".jpeg" + renderQuery(renderToken);
+      },
+      cropUrl: function (id, x, y, size, renderToken) {
+        // crop 已带 query（x/y/size），render 参数用 & 追加
+        return "/api/slide/" + enc(id) + "/crop?x=" + x + "&y=" + y +
+          "&size=" + size +
+          (renderToken ? "&render=" + encodeURIComponent(renderToken) : "");
+      },
     };
   }
 
@@ -46,6 +85,20 @@
       slideInfoUrl: function (id) { return "/api/demo/slides/" + enc(id) + "/info"; },
       dziUrl: function (id) { return "/api/demo/slides/" + enc(id) + ".dzi"; },
       thumbnailUrl: function () { return ""; },
+      // ---- Batch 4 多通道（§8.2）：Demo 面向匿名 capability cookie，
+      // /api/demo/* 不套 CSRF（与 aiRun 同一鉴权语义）----
+      normalizeRenderContext: function (id, body) {
+        return credFetch("/api/demo/slides/" + enc(id) + "/render-context", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body || {}),
+        });
+      },
+      tileUrl: function (id, level, x, y, renderToken) {
+        return "/api/demo/slides/" + enc(id) + "_files/" + level + "/" + x + "_" + y +
+          ".jpeg" + renderQuery(renderToken);
+      },
+      // Demo 无缩略图/导出端点（thumbnailUrl 恒空、无 cropUrl）
       aiRun: function (body, opts) {
         opts = opts || {};
         return credFetch("/api/demo/ai/run", {

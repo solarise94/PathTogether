@@ -32,10 +32,14 @@ from flask import (
 from werkzeug.utils import secure_filename
 
 from openslide import OpenSlide
+from openslide.deepzoom import DeepZoomGenerator
 
 import share_store
 import slide_cache
 import slide_io
+# 多通道伪彩渲染（规格 §7.1 共享模块）：颜色/签名/校验算法全部在
+# slide_render——本文件只做 Flask 侧粘合，禁止复制第二份实现。
+import slide_render
 # P0-A §3.5：与主站 app.py 共用的 crop 像素闸（同一实现，防两份逻辑漂移）
 import crop_guard
 
@@ -189,6 +193,158 @@ def _read_metadata(osr: OpenSlide, path: Path) -> dict:
         "objective": objective_f,
         "mpp_source": mpp_source,
     }
+
+
+# --------------------------------------------------------------------------- #
+# 多通道 render context（Batch 3，规格 §6.1/§6.2/§6.3/§7.3）
+#
+# 颜色/签名/校验算法全部在 slide_render（与 app.py 共用）；本区块只做
+# Flask 侧粘合：secret 读取、generation 命名空间、瓦片缓存键、稳定错误映射。
+# 日志只记安全标识（safe 名 / fingerprint 前缀 / 通道数 / 错误码），不记
+# token 全文与图像内容。
+# --------------------------------------------------------------------------- #
+_RENDER_SECRET_CACHE = None
+
+
+def _render_secret() -> str:
+    """render_token 签名 secret：与主站 app.py 同一来源。
+
+    优先 SECRET_KEY env；否则读/创建 SHARE_DATA_DIR/flask_secret.key
+    （0600，与 flask secret 同文件——同一部署共享 secret，split 部署下本服务
+    首个 worker 负责创建）。派生 key 在 slide_render.derive_render_key：
+    多 worker / 双进程无共享内存也可互相验证。
+    """
+    global _RENDER_SECRET_CACHE
+    env_key = os.environ.get("SECRET_KEY")
+    if env_key:
+        return env_key
+    data_dir = Path(os.environ.get("SHARE_DATA_DIR")
+                    or (Path.home() / "svs-viewer" / "share-data"))
+    data_dir.mkdir(parents=True, exist_ok=True)
+    secret_file = data_dir / "flask_secret.key"
+    path_key = str(secret_file)
+    cached = _RENDER_SECRET_CACHE
+    if cached and cached[0] == path_key:
+        return cached[1]
+
+    def _read_or_create_locked():
+        if secret_file.is_file():
+            try:
+                raw = secret_file.read_text(encoding="utf-8").strip()
+                if raw:
+                    return raw
+            except OSError:
+                pass
+        key = secrets.token_hex(32)
+        tmp = secret_file.with_name(secret_file.name + ".tmp")
+        tmp.write_text(key, encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, secret_file)
+        try:
+            os.chmod(secret_file, 0o600)
+        except OSError:
+            pass
+        return key
+
+    try:
+        import fcntl
+
+        with open(str(secret_file) + ".lock", "a+") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                key = _read_or_create_locked()
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    except (ImportError, OSError):
+        key = _read_or_create_locked()
+    _RENDER_SECRET_CACHE = (path_key, key)
+    return key
+
+
+def _multichannel_enabled() -> bool:
+    """feature flag PATHTOGETHER_MULTICHANNEL_ENABLED（默认关闭，§15.2）。"""
+    return slide_render.multichannel_enabled()
+
+
+def _ctx_scope(safe: str, generation) -> str:
+    """统计缓存 scope："<safe>#<generation>"（与主站同一命名空间约定）。"""
+    return "%s#%s" % (safe, generation)
+
+
+def _legacy_revision(safe: str) -> str:
+    """切片 asset revision（mtime:size，与主站 _legacy_slide_revision 同源）。"""
+    try:
+        st = os.stat(UPLOAD_DIR / safe)
+        return "{}:{}".format(st.st_mtime_ns, st.st_size)
+    except OSError:
+        return ""
+
+
+def _resolve_pair(pair, safe: str, *, token="", body=None, flag=True):
+    """在当前借出的 pair 上解析 render context（§6.3；解码前拒绝）。
+
+    返回 (context|None, fingerprint)；context None → native/legacy 路径。
+    """
+    gen_scope = _ctx_scope(safe, pair.get("gen"))
+    ctx, fp = slide_render.resolve_render_context(
+        pair["osr"], safe=safe, expected_revision=_legacy_revision(safe),
+        token=token, token_secret=_render_secret(), body=body,
+        asset_generation=gen_scope, flag_enabled=flag)
+    if ctx is None:
+        fp = slide_render.NATIVE_RGB_FINGERPRINT
+    return ctx, fp or slide_render.NATIVE_RGB_FINGERPRINT
+
+
+def _region_view(pair, ctx, fp):
+    """按需包装当前借出的 osr（RenderedSlideView 不跨 borrow 缓存，§7.3）。"""
+    if ctx is None:
+        return pair["osr"]
+    return slide_render.RenderedSlideView(pair["osr"], ctx, fingerprint=fp)
+
+
+def _render_error(e):
+    """SlideRenderError / RenderRequestError → 稳定 JSON 契约（§7.4）。"""
+    status = getattr(e, "status", None) \
+        or slide_render.RENDER_ERROR_HTTP.get(getattr(e, "code", ""), 400)
+    return jsonify(error=str(e), code=getattr(e, "code",
+                                              "invalid_render_context")), status
+
+
+def _tile_fp_key(safe: str, generation, fp, level, x, y, fmt="jpeg"):
+    """瓦片缓存键（§7.3）：(safe, generation, fingerprint, level, x, y,
+    format, quality)——与主站同一形状。"""
+    return (safe, generation, fp, int(level), int(x), int(y), fmt,
+            JPEG_QUALITY)
+
+
+def _render_info_fields(safe: str) -> dict:
+    """分享端 info 的 render additive 字段（§6.1；与主站同一实现）。"""
+    entry = _get_slide(safe)
+
+    def _read(pair):
+        fields = slide_render.build_render_info(
+            pair["osr"], asset_revision=_legacy_revision(safe),
+            asset_generation=_ctx_scope(safe, pair.get("gen")),
+            secret=_render_secret(), slide_name=safe,
+            flag_enabled=_multichannel_enabled())
+        try:
+            z_dims = pair.get("dz").level_dimensions
+            fields["deepzoom"] = {
+                "width": int(z_dims[-1][0]),
+                "height": int(z_dims[-1][1]),
+                "tile_size": DZ_TILE_SIZE,
+                "overlap": DZ_OVERLAP,
+                "min_level": 0,
+                "max_level": len(z_dims) - 1,
+            }
+        except Exception:  # noqa: BLE001
+            pass
+        return fields
+
+    return slide_cache.read_stable(entry, _read)[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -631,6 +787,17 @@ def share_slides(token):
                     "mpp_source": "missing",
                     "error": str(getattr(e, "description", e)),
                 })
+            else:
+                # Batch 3（§6.1）：render additive 字段（flag 开才带通道面板；
+                # 打开失败的条目保持 error 分支不加，单个失败不阻塞整个列表）
+                try:
+                    info.update(_render_info_fields(safe))
+                except slide_cache.SlideFileChanged:
+                    pass
+                except (slide_render.RenderRequestError,
+                        slide_io.SlideRenderError) as e:
+                    info["render_error_code"] = getattr(
+                        e, "code", "invalid_render_context")
         else:
             info.update({
                 "width": None, "height": None,
@@ -683,6 +850,79 @@ def share_slide_dzi(token, name):
     return resp
 
 
+@app.route("/s/<token>/api/slide/<name>/info")
+def share_slide_info(token, name):
+    """分享端单切片 info（Batch 3 additive）：render 字段与主站同一实现。"""
+    share = _require_share(token)
+    safe = _require_slide(share, name)
+    path = UPLOAD_DIR / safe
+    info = {"name": safe, "exists": path.is_file()}
+    sm = share_store.get_slide_meta_full(safe)
+    info["alias"] = sm.get("alias", "")
+    info["note"] = sm.get("note", "")
+    if not path.is_file():
+        info["error"] = "文件不存在"
+        return jsonify(info)
+    try:
+        entry = _get_slide(safe)
+        with slide_cache.borrow_pair(entry) as pair:
+            info.update(_read_metadata(pair["osr"], path))
+    except Exception as e:  # noqa: BLE001  与列表端点同形
+        info.update({
+            "width": None, "height": None,
+            "mpp_x": None, "mpp_y": None,
+            "mpp_source": "missing",
+            "error": str(getattr(e, "description", e)),
+        })
+        return jsonify(info)
+    try:
+        info.update(_render_info_fields(safe))
+    except slide_cache.SlideFileChanged:
+        return jsonify(error="slide_file_changed",
+                       code="slide_file_changed"), 503
+    except (slide_render.RenderRequestError, slide_io.SlideRenderError) as e:
+        return _render_error(e)
+    return jsonify(info)
+
+
+@app.route("/s/<token>/api/slide/<name>/render-context", methods=["POST"])
+def share_slide_render_context(token, name):
+    """分享端渲染上下文规范化（§6.2，不落库）：share token 先行鉴权。"""
+    share = _require_share(token)
+    safe = _require_slide(share, name)
+    if not _multichannel_enabled():
+        return jsonify(error="多通道渲染未启用",
+                       code="multichannel_disabled"), 403
+    body = request.get_json(silent=True)
+    entry = _get_slide(safe)
+
+    def _build(pair):
+        canonical, fp = slide_render.resolve_render_context(
+            pair["osr"], safe=safe, expected_revision=_legacy_revision(safe),
+            body=body if isinstance(body, dict) else {},
+            asset_generation=_ctx_scope(safe, pair.get("gen")),
+            flag_enabled=True)
+        tok = slide_render.issue_render_token(
+            canonical, fp, _legacy_revision(safe), _render_secret(),
+            slide=safe)
+        return canonical, fp, tok
+
+    try:
+        canonical, fp, tok = slide_cache.read_stable(entry, _build)[0]
+    except (slide_render.RenderRequestError, slide_io.SlideRenderError) as e:
+        return _render_error(e)
+    app.logger.info("[render-context] share slide=%s fp=%s channels=%d",
+                    safe, fp[:8], len(canonical.get("active_channels") or []))
+    return jsonify({
+        # 与 info.default_render_context 同构：canonical + 内嵌 fingerprint
+        "render_context": dict(canonical, fingerprint=fp),
+        "render_context_fingerprint": fp,
+        "render_token": tok,
+        "asset_revision": _legacy_revision(safe),
+        "warnings": [],
+    })
+
+
 @app.route("/s/<token>/api/slide/<name>_files/<int:level>/<int:x>_<int:y>.jpeg")
 def share_slide_tile(token, name, level, x, y):
     """返回 Deep Zoom 单张瓦片 JPEG（512×512、baseline、q82，带 LRU+TTL 缓存）。
@@ -690,26 +930,45 @@ def share_slide_tile(token, name, level, x, y):
     review G3（CACHE-1）：瓦片缓存键含 generation——同名重传/原地改写后旧代
     键不再命中（不再依赖 TTL 兜底服务旧图），generation 由 slide_cache 的
     文件签名（dev/ino/size/mtime_ns）统一驱动，与句柄/info 同一套换代。
+    Batch 3（§6.3/§7.3）：接受 ``?render=<token>``；缓存键升级为
+    (safe, generation, render fingerprint, level, x, y, format, quality)。
     """
     share = _require_share(token)
     safe = _require_slide(share, name)
     entry = _get_slide(safe)
+    render_tok = request.args.get("render") or ""
+    flag = _multichannel_enabled()
 
     gen = slide_cache.refresh_generation(entry)
-    key = (safe, gen, level, x, y)
-    cached = _tile_cache_get(key)
-    if cached is not None:
-        buf = io.BytesIO(cached)
-    else:
+    fp_pre = None
+    if not flag:
+        fp_pre = slide_render.NATIVE_RGB_FINGERPRINT
+    elif render_tok:
+        payload = slide_render.verify_render_token(render_tok, _render_secret())
+        if payload is not None and payload.get("slide") in ("", safe) \
+                and payload.get("rev") == _legacy_revision(safe):
+            fp_pre = payload.get("fp")
+    key = _tile_fp_key(safe, gen, fp_pre, level, x, y) \
+        if fp_pre is not None else None
+    cached = _tile_cache_get(key) if key is not None else None
+    if cached is None:
         def _decode(pair):
-            tile = pair["dz"].get_tile(level, (x, y))
+            ctx, fp = _resolve_pair(pair, safe, token=render_tok, flag=flag)
+            if ctx is None:
+                tile = pair["dz"].get_tile(level, (x, y))
+            else:
+                view = slide_render.RenderedSlideView(pair["osr"], ctx,
+                                                      fingerprint=fp)
+                dzg = DeepZoomGenerator(view, tile_size=DZ_TILE_SIZE,
+                                        overlap=DZ_OVERLAP, limit_bounds=True)
+                tile = dzg.get_tile(level, (x, y))
             if tile.mode != "RGB":
                 tile = tile.convert("RGB")
-            return tile
+            return tile, fp
 
         # 按代读取：读取前后签名变化则换代重读一次（SlideFileChanged → 503）
-        tile, tile_gen = slide_cache.read_stable(entry, _decode)
-        key = (safe, tile_gen, level, x, y)
+        (tile, fp), tile_gen = slide_cache.read_stable(entry, _decode)
+        key = _tile_fp_key(safe, tile_gen, fp, level, x, y)
 
         buf = io.BytesIO()
         # baseline JPEG：省掉 progressive/optimize 的编码开销（快 3–5×）；
@@ -721,6 +980,8 @@ def share_slide_tile(token, name, level, x, y):
         )
         _tile_cache_put(key, buf.getvalue())
         buf.seek(0)
+    else:
+        buf = io.BytesIO(cached)
 
     resp = send_file(buf, mimetype="image/jpeg")
     # 瓦片内容不变，长期不可变缓存
@@ -736,10 +997,13 @@ def share_slide_crop(token, name):
     防两份逻辑漂移）。read_region 之前按 clamp 后实际 size2² 过三道闸：
     像素硬闸 413 / 每分钟像素预算 429（按 share capability 即 token 计）/
     并发闸 429；任何解码前拒绝。分享端无需登录，闸主体是 token。
+    Batch 3（§6.3/§7.4）：接受 ``?render=<token>``；像素预算按真实成本×
+    启用通道数计；下载文件名加入 render fingerprint 前 8 位（§4.4）。
     """
     share = _require_share(token)
     safe = _require_slide(share, name)
     entry = _get_slide(safe)
+    render_tok = request.args.get("render") or ""
 
     def _parse_int(key):
         try:
@@ -756,7 +1020,14 @@ def share_slide_crop(token, name):
         return jsonify(error="参数越界（0<=x,y，0<size<=40000）"), 400
 
     with slide_cache.borrow_pair(entry) as pair:
-        osr = pair["osr"]
+        # context 解析在解码前（§7.4）；失败 → 稳定 4xx/409
+        try:
+            ctx, fp = _resolve_pair(pair, safe, token=render_tok,
+                                    flag=_multichannel_enabled())
+        except (slide_render.RenderRequestError,
+                slide_io.SlideRenderError) as e:
+            return _render_error(e)
+        osr = _region_view(pair, ctx, fp)
         width, height = osr.dimensions
         x2 = min(x, max(0, width - 1))
         y2 = min(y, max(0, height - 1))
@@ -771,8 +1042,11 @@ def share_slide_crop(token, name):
         except crop_guard.CropTooLargeError as e:
             return jsonify(error=str(e), code=e.code,
                            max_pixels=crop_guard.CROP_MAX_PIXELS), 413
-        # 每分钟像素预算（按 share capability）+ 并发闸：read_region 前
-        allowed, retry_after = crop_guard.admit_pixels(token, size2 * size2)
+        # 每分钟像素预算（按 share capability）+ 并发闸：read_region 前。
+        # 真实成本 = 像素量 × 启用通道数（§7.4）
+        n_channels = len(ctx.get("active_channels") or ()) if ctx else 1
+        allowed, retry_after = crop_guard.admit_pixels(
+            token, size2 * size2 * max(1, n_channels))
         if not allowed:
             resp = jsonify(error="crop 请求过于频繁，请稍后重试",
                            code="crop_rate_limited", retry_after=retry_after)
@@ -792,7 +1066,9 @@ def share_slide_crop(token, name):
     buf.seek(0)
 
     stem = Path(safe).stem
-    download_name = f"{stem}_{x2}_{y2}_{size2}px.png"
+    fp_suffix = ("_%s" % str(fp)[:8]) \
+        if (_multichannel_enabled() and fp) else ""
+    download_name = "%s_%d_%d_%dpx%s.png" % (stem, x2, y2, size2, fp_suffix)
     return send_file(
         buf,
         mimetype="image/png",
@@ -803,13 +1079,23 @@ def share_slide_crop(token, name):
 
 @app.route("/s/<token>/api/slide/<name>/thumbnail")
 def share_slide_thumbnail(token, name):
-    """返回缩略图 JPEG（用作查看器底图预览，慢网下避免瓦片未到区域变白）。"""
+    """返回缩略图 JPEG（用作查看器底图预览，慢网下避免瓦片未到区域变白）。
+
+    Batch 3（§6.3）：接受 ``?render=<token>``；缩略图与最低层同 context。
+    """
     share = _require_share(token)
     safe = _require_slide(share, name)
     entry = _get_slide(safe)
+    render_tok = request.args.get("render") or ""
     with slide_cache.borrow_pair(entry) as pair:
-        osr = pair["osr"]
-        thumb = osr.get_thumbnail((400, 400))
+        try:
+            ctx, fp = _resolve_pair(pair, safe, token=render_tok,
+                                    flag=_multichannel_enabled())
+        except (slide_render.RenderRequestError,
+                slide_io.SlideRenderError) as e:
+            return _render_error(e)
+        src = _region_view(pair, ctx, fp)
+        thumb = src.get_thumbnail((400, 400))
     if thumb.mode != "RGB":
         thumb = thumb.convert("RGB")
     buf = io.BytesIO()

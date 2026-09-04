@@ -46,7 +46,13 @@ import upload_guard  # noqa: E402
 import upload_task_store  # noqa: E402
 import app as app_mod  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app, clear_upload_dir  # noqa: E402
-from _tiff_fixtures import make_ome_tiff_bytes, make_tiff_bytes  # noqa: E402
+from _tiff_fixtures import (  # noqa: E402
+    make_ome_multifile_bytes,
+    make_ome_multiseries_bytes,
+    make_ome_tczyx_bytes,
+    make_ome_tiff_bytes,
+    make_tiff_bytes,
+)
 
 
 TIFF_NAME = "0702-L2-2 鼠奥球.tiff"  # 中文 + 空格 + 连字符（spec 必测场景）
@@ -444,3 +450,209 @@ def test_v2_quota_cleanup_on_real_invalid_commit_pg(monkeypatch):
                         "FROM upload_user_quotas WHERE user_id=%s", (uid_user,))
             reserved, used = cur.fetchone()
     assert reserved == 0 and used == 0  # 预占释放、无实占
+
+
+# --------------------------------------------------------------------------- #
+# 6. Batch 2：多通道 OME（series 选择 / 结构化元数据 / 通道区域读取 / 拒绝）
+# --------------------------------------------------------------------------- #
+# 以下用例不依赖 Flask（不使用 _iso fixture 的 app 隔离），直接字节级打开。
+def test_slide_render_error_code_vocabulary():
+    """SlideRenderError：封闭码表 + 稳定 .code（供 Batch 3 路由映射 HTTP）。"""
+    assert slide_io.VALID_RENDER_ERROR_CODES == frozenset((
+        "invalid_render_context", "render_channel_out_of_range",
+        "render_channel_limit", "unsupported_multifile_ome",
+        "unsupported_plane_selection"))
+    e = slide_io.SlideRenderError("unsupported_multifile_ome", "x")
+    assert e.code == "unsupported_multifile_ome"
+    assert isinstance(e, ValueError)
+
+
+def test_series_selection_prefers_main_spatial_area():
+    """多 series：按 Y*X 主空间面积选主图，不被高 C 小图抢占（§7.2）。
+
+    辅助 series（CYX 12ch 32x32）全 shape 乘积 12288 > 主图 6144——旧
+    np.prod 选法会选错；主空间面积选法必须选主图。
+    """
+    slide = slide_io.TiffFileSlide(io.BytesIO(make_ome_multiseries_bytes()))
+    try:
+        assert slide.series_index == 0
+        assert slide.axes == "YX"
+        assert slide.dimensions == (96, 64)
+    finally:
+        slide.close()
+
+
+def test_structured_metadata_cyx_and_tczyx():
+    """暴露结构化 axes/shape/series_index/plane_sizes/channel_count。"""
+    slide = slide_io.TiffFileSlide(io.BytesIO(
+        make_ome_tczyx_bytes(t=2, c=3, z=2, h=32, w=40)))
+    try:
+        assert slide.axes == "TCZYX"
+        assert slide.shape == (2, 3, 2, 32, 40)
+        assert slide.series_index == 0
+        assert slide.plane_sizes == {"size_c": 3, "size_t": 2, "size_z": 2}
+        assert slide.channel_count == 3
+        assert slide.is_native_rgb is False
+        assert slide.level_axes == ("TCZYX",)
+        assert slide.level_shapes == ((2, 3, 2, 32, 40),)
+    finally:
+        slide.close()
+
+
+def test_structured_metadata_native_rgb_flag():
+    slide = slide_io.TiffFileSlide(io.BytesIO(make_ome_tiff_bytes()))
+    try:
+        assert slide.is_native_rgb is True
+        assert slide.axes == "YXS"
+        assert slide.channel_count == 0  # 原生 RGB 无逻辑通道
+    finally:
+        slide.close()
+
+
+def test_read_region_channels_reads_only_selected_planes():
+    """通道区域读取：返回所选通道 plane，其余不解码（§7.2）。"""
+    import numpy as np
+
+    slide = slide_io.TiffFileSlide(io.BytesIO(
+        make_ome_multiseries_bytes()))  # 占位避免误删导入
+    slide.close()
+    from _tiff_fixtures import make_ome_cyx_bytes
+    data = make_ome_cyx_bytes(c=4, h=64, w=96)
+    slide = slide_io.TiffFileSlide(io.BytesIO(data))
+    try:
+        planes, geom = slide.read_region_channels((0, 0), 0, (96, 64), [1, 3])
+        assert planes.shape == (2, 64, 96)
+        assert geom == {"paste_x": 0, "paste_y": 0, "valid_w": 96,
+                        "valid_h": 64, "width": 96, "height": 64,
+                        "level": 0}
+        # plane 内容与 fixture 数据一致（base + 1500*c）
+        yy, xx = np.indices((64, 96))
+        expect1 = ((xx + 3 * yy + 1500) % 65536).astype(np.uint16)
+        assert np.array_equal(planes[0], expect1)
+        # 完全越界：空 plane + valid 0
+        planes2, geom2 = slide.read_region_channels((500, 500), 0, (8, 8),
+                                                    [0])
+        assert planes2.shape == (1, 0, 0)
+        assert geom2["valid_w"] == 0 and geom2["valid_h"] == 0
+        # 重复索引去重
+        planes3, _ = slide.read_region_channels((0, 0), 0, (96, 64), [2, 2])
+        assert planes3.shape == (1, 64, 96)
+    finally:
+        slide.close()
+
+
+def test_read_region_channels_guards():
+    """通道越界 → render_channel_out_of_range；T/Z≠0 → 不可选（首版固定 0）。"""
+    from _tiff_fixtures import make_ome_cyx_bytes
+    slide = slide_io.TiffFileSlide(io.BytesIO(
+        make_ome_cyx_bytes(c=2, h=32, w=40)))
+    try:
+        with pytest.raises(slide_io.SlideRenderError) as ei:
+            slide.read_region_channels((0, 0), 0, (8, 8), [5])
+        assert ei.value.code == "render_channel_out_of_range"
+        with pytest.raises(slide_io.SlideRenderError) as ei2:
+            slide.read_region_channels((0, 0), 0, (8, 8), [-1])
+        assert ei2.value.code == "render_channel_out_of_range"
+    finally:
+        slide.close()
+    slide2 = slide_io.TiffFileSlide(io.BytesIO(
+        make_ome_tczyx_bytes(t=2, c=2, z=2, h=32, w=40)))
+    try:
+        with pytest.raises(slide_io.SlideRenderError) as ei3:
+            slide2.read_region_channels((0, 0), 0, (40, 32), [0], t=1)
+        assert ei3.value.code == "unsupported_plane_selection"
+    finally:
+        slide2.close()
+
+
+def test_read_region_legacy_cyx_first_channel_unchanged():
+    """旧 read_region 在 CYX 上仍取 C=0（legacy-first-plane 语义不回归）。"""
+    import numpy as np
+
+    from _tiff_fixtures import make_ome_cyx_bytes
+    slide = slide_io.TiffFileSlide(io.BytesIO(
+        make_ome_cyx_bytes(c=4, h=64, w=96)))
+    try:
+        img = slide.read_region((0, 0), 0, (96, 64))
+        assert img.mode == "RGBA" and img.size == (96, 64)
+        arr = np.asarray(img)
+        yy, xx = np.indices((64, 96))
+        plane0 = ((xx + 3 * yy) % 65536).astype(np.uint16)
+        expect = np.repeat((plane0 >> 8).astype(np.uint8)[..., None], 3, 2)
+        assert np.array_equal(arr[..., :3], expect)
+        assert (arr[..., 3] == 255).all()
+    finally:
+        slide.close()
+
+
+def test_read_region_legacy_rgb_baseline_pixels():
+    """RGB OME：read_region 像素与旧基线（直接解码的渐变图）一致。"""
+    import numpy as np
+    from PIL import Image as PILImage
+
+    slide = slide_io.TiffFileSlide(io.BytesIO(make_ome_tiff_bytes()))
+    try:
+        img = slide.read_region((0, 0), 0, (96, 64)).convert("RGB")
+        yy, xx = np.indices((64, 96))
+        g = ((xx + yy) % 256).astype(np.uint8)
+        expect = np.stack([g, g[::-1], g[:, ::-1]], axis=-1)
+        assert np.array_equal(np.asarray(img), expect)
+        del PILImage
+    finally:
+        slide.close()
+
+
+def test_multifile_ome_rejected_before_any_pixels():
+    """multi-file OME（外部 UUID FileName）：稳定拒绝，不悄悄显示不完整数据。"""
+    data = make_ome_multifile_bytes()
+    with pytest.raises(slide_io.SlideRenderError) as ei:
+        slide_io.TiffFileSlide(io.BytesIO(data))
+    assert ei.value.code == "unsupported_multifile_ome"
+    # open_slide 直通该错误（不得 fallback OpenSlide 打开残缺 series）
+    with pytest.raises(slide_io.SlideRenderError) as ei2:
+        slide_io.open_slide(io.BytesIO(data), format_hint="m.ome.tiff")
+    assert ei2.value.code == "unsupported_multifile_ome"
+    # 上传校验路径收敛为稳定码（不透出裸异常）
+    with pytest.raises(slide_io.SlideValidationError) as ei3:
+        app_mod._validate_slide_file(io.BytesIO(data), format_hint="m.ome.tiff")
+    assert ei3.value.code in ("invalid_slide", "slide_open_failed")
+
+
+def test_level_axes_consistency_validation():
+    """金字塔 level 间 C/T/Z 尺寸必须一致：一致通过、不一致 fail clearly。"""
+    # 一致：正常金字塔（level 可省略 size-1 轴）
+    slide_io.validate_level_axes_consistency(
+        "CYX", (2, 64, 64),
+        [("CYX", (2, 64, 64)), ("CYX", (2, 32, 32))])
+    # 一致：基级有 Z=1 而 level 省略 Z（tifffile 真实行为）
+    slide_io.validate_level_axes_consistency(
+        "TCZYX", (2, 3, 1, 64, 64),
+        [("TCZYX", (2, 3, 1, 64, 64)), ("TCYX", (2, 3, 64, 64))])
+    # 不一致：level 的 C 尺寸与基级不同 → 明确失败
+    with pytest.raises(slide_io.SlideValidationError):
+        slide_io.validate_level_axes_consistency(
+            "CYX", (2, 64, 64),
+            [("CYX", (2, 64, 64)), ("CYX", (3, 32, 32))])
+    # 不一致：基级 T=2 而 level 缺 T 轴（>1 轴被丢弃即异常）
+    with pytest.raises(slide_io.SlideValidationError):
+        slide_io.validate_level_axes_consistency(
+            "TCYX", (2, 3, 64, 64),
+            [("TCYX", (2, 3, 64, 64)), ("CYX", (3, 32, 32))])
+
+
+def test_open_slide_still_works_for_existing_fixtures(tmp_path):
+    """回归护栏：既有 TIFF/OME fixture 打开路径与尺寸不受重构影响。"""
+    p = tmp_path / "plain.tiff"
+    p.write_bytes(make_tiff_bytes())
+    osr = slide_io.open_slide(p)
+    try:
+        assert osr.dimensions == (96, 64)
+    finally:
+        osr.close()
+    p2 = tmp_path / "slide.ome.tiff"
+    p2.write_bytes(make_ome_tiff_bytes())
+    osr2 = slide_io.open_slide(p2)
+    try:
+        assert osr2.dimensions == (96, 64)
+    finally:
+        osr2.close()

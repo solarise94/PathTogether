@@ -64,6 +64,13 @@
       <button id="ai-btn" class="tool-btn ai-btn" data-i18n-title="tb.ai.title" {% if mode != 'demo' %}disabled {% endif %}title="AI 读片助手"><span data-i18n="tb.ai">✨ AI</span></button>
       {% endif %}
 
+      {# 多通道通道着色（Batch 4）：默认隐藏，info 带 multichannel 能力才由
+         channel-controls.js 显示；RGB 切片最多显示灰色「原始 RGB」小标识 #}
+      <span id="rgb-badge" class="rgb-mode-badge" hidden data-i18n="channel.rgb.badge">原始 RGB</span>
+      <button id="channel-btn" class="tool-btn channel-btn" type="button" hidden
+              data-i18n="channel.entry" data-i18n-title="channel.entry.title"
+              aria-haspopup="dialog" aria-expanded="false">通道</button>
+
       {% if C.annotate %}
       <button id="anno-all-btn" class="tool-btn" data-i18n="tb.anno.show.all" disabled>显示全部标记</button>
       {% endif %}
@@ -228,6 +235,9 @@
 
     <main id="viewer-wrap">
       <div id="viewer"></div>
+      {# 通道着色说明卡（Batch 4）：channel-controls.js 渲染；正式版与 Demo 共用 #}
+      <div id="channel-panel" class="channel-panel" hidden role="dialog"
+           aria-label="通道着色（显示映射）" data-i18n-aria="channel.panel.aria"></div>
       {% if mode == 'demo' %}
       <canvas id="obs-canvas" class="anno-canvas"></canvas>
       {% else %}

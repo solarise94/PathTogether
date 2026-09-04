@@ -18,6 +18,81 @@
   }
   var API = "/s/" + encodeURIComponent(TOKEN);
 
+  // ---------- 多通道通道着色 adapter（Batch 4；channel-controls.js 共用组件） ----------
+  // share.js 不加载 app-mode.js：分享页鉴权 = URL 内 share token（capability），
+  // 自建同接口 adapter（normalizeRenderContext/tileUrl/thumbnailUrl/dziUrl），
+  // 算法全部在 channel-controls.js，不复制（§8.1）。
+  function strHash(s) {
+    // djb2：localStorage 作用域里只放 share token 的指纹，不落 token 原文
+    var h = 5381;
+    s = String(s || "");
+    for (var i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+    return h.toString(16);
+  }
+  function shareChannelAdapter() {
+    function renderQuery(renderToken) {
+      return renderToken ? "?render=" + encodeURIComponent(renderToken) : "";
+    }
+    return {
+      mode: "share",
+      normalizeRenderContext: function (id, body) {
+        return fetch(API + "/api/slide/" + encodeURIComponent(id) + "/render-context", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body || {}),
+        });
+      },
+      tileUrl: function (id, level, x, y, renderToken) {
+        return API + "/api/slide/" + encodeURIComponent(id) + "_files/" + level +
+          "/" + x + "_" + y + ".jpeg" + renderQuery(renderToken);
+      },
+      thumbnailUrl: function (id, renderToken) {
+        return API + "/api/slide/" + encodeURIComponent(id) + "/thumbnail" +
+          renderQuery(renderToken);
+      },
+      dziUrl: function (id) {
+        return API + "/api/slide/" + encodeURIComponent(id) + ".dzi";
+      },
+    };
+  }
+  function initChannelController() {
+    return window.HP_Channels.createChannelController({
+      adapter: shareChannelAdapter(),
+      viewer: viewer,
+      button: $("channel-btn"),
+      badge: $("rgb-badge"),
+      panelHost: $("channel-panel"),
+      t: t,
+      toast: function (msg, type) { toast(msg, type); },
+      storage: window.localStorage,
+      // 通道重开（同一切片换配色）：open 处理跳过绘制/标注重置，仅补重绘
+      onReopening: function () { state.channelReopening = true; },
+      onReopened: function () { syncBaseThumb(); redrawAnnoCanvas(); },
+      // render 计划的打开统一由控制器发起（含 409 刷新 info 重建路径）
+      open: function (plan) {
+        if (viewer && plan && plan.tileSource) viewer.open(plan.tileSource);
+      },
+      // 底图缩略图与屏幕瓦片同 token（§4.4）；viewer.close 清掉后这里重建
+      setThumbnail: function (url) {
+        if (!url) return;
+        if (!baseThumbEl && viewer && viewer.container) {
+          baseThumbEl = document.createElement("img");
+          baseThumbEl.className = "osd-base-thumb";
+          baseThumbEl.alt = "";
+          viewer.container.insertBefore(baseThumbEl, viewer.canvas);
+          applyBaseThumbFlip();
+        }
+        if (baseThumbEl) baseThumbEl.src = url;
+      },
+      // 409 slide_revision_conflict：只刷新 info 并重建一次（§6.3）
+      refreshInfo: function () {
+        if (!state.slide) return Promise.resolve(null);
+        return fetch(API + "/api/slide/" + encodeURIComponent(state.slide.name) + "/info")
+          .then(function (r) { return r.json(); });
+      },
+    });
+  }
+
   // ---------- 全局状态 ----------
   var state = {
     slides: [],          // 该分享的切片集
@@ -31,6 +106,8 @@
     showAnno: true,      // 默认始终显示（用户需要看到管理员标记）
     focusAnno: null,     // null=显示全部；否则只显示该条标注（currentRois 中的引用）
     roiSizes: [6, 6.5],  // 本次分享允许的矩形标记尺寸（fetch config 后填充）
+    channelReopening: false, // 通道配色重开（同一切片换 TileSource，非新切片）
+    channelCtrl: null,   // 多通道通道着色控制器（Batch 4，channel-controls.js 共用）
   };
 
   var viewer = null;
@@ -159,6 +236,12 @@
     viewer.addHandler("zoom", function () { updateZoomBadge(); syncBaseThumb(); });
     viewer.addHandler("open", function () {
       updateZoomBadge(); syncBaseThumb();
+      // 通道配色重开（同一切片换 TileSource，§8.2）：走轻量路径，不重置
+      // 绘制/标注状态（viewport 恢复由控制器负责）
+      if (state.channelReopening) {
+        state.channelReopening = false;
+        return;
+      }
       exitDrawMode();
       resizeAnnoCanvas();
       // 打开后加载标注并重绘
@@ -350,14 +433,28 @@
     });
 
     // 创建底图缩略图层：铺在瓦片 canvas 之前（下层），慢网下透出模糊预览
+    // （src 由通道控制器 setThumbnail 或 legacy 路径填充）
     baseThumbEl = document.createElement("img");
     baseThumbEl.className = "osd-base-thumb";
-    baseThumbEl.src = API + "/api/slide/" + encodeURIComponent(name) + "/thumbnail";
     baseThumbEl.alt = "";
     viewer.container.insertBefore(baseThumbEl, viewer.canvas);
     applyBaseThumbFlip();
 
-    viewer.open(API + "/api/slide/" + encodeURIComponent(name) + ".dzi");
+    // 多通道通道着色（Batch 4）：分享列表条目自带 render additive 字段
+    // （share_server /api/slides 已并入）。render 计划的 viewer.open 由控制器
+    // 经 opts.open 完成；本函数只负责 legacy 打开。
+    var plan = null;
+    if (window.HP_Channels) {
+      state.channelCtrl = state.channelCtrl || initChannelController();
+      plan = state.channelCtrl.handleInfo(info, {
+        id: info.name,
+        scope: "share:" + strHash(TOKEN),
+      });
+    }
+    if (!plan || plan.kind !== "render") {
+      baseThumbEl.src = API + "/api/slide/" + encodeURIComponent(name) + "/thumbnail";
+      viewer.open(API + "/api/slide/" + encodeURIComponent(name) + ".dzi");
+    }
   }
 
   // ---------- mpp 设置区显示控制 ----------
@@ -693,9 +790,16 @@
     if (!state.slide || state.roiMode == null) return;
     var r = state.roi;
     var name = state.slide.name;
+    // Batch 4（§4.4）：多通道切片 crop 与屏幕瓦片同 render_token；RGB/legacy
+    // 不带参数
+    var token = (state.channelCtrl && state.channelCtrl.isMultichannel())
+      ? state.channelCtrl.getToken() : null;
+    var multi = !!token;
     var url = API + "/api/slide/" + encodeURIComponent(name) +
       "/crop?x=" + Math.round(r.x) + "&y=" + Math.round(r.y) +
-      "&size=" + Math.round(r.side);
+      "&size=" + Math.round(r.side) +
+      (multi ? "&render=" + encodeURIComponent(token) : "");
+    var fp8 = ((state.channelCtrl && state.channelCtrl.getFingerprint()) || "").slice(0, 8);
 
     var originalText = els.exportBtn.textContent;
     els.exportBtn.textContent = t("export.busy");
@@ -712,8 +816,10 @@
       })
       .then(function (blob) {
         var stem = name.replace(/\.[^.]+$/, "");
+        // 与后端 Content-Disposition 同形：多通道带 fp 前 8 位（§4.4）
         var fname = stem + "_" + state.roiMode + "mm_x" + Math.round(r.x) +
-          "_y" + Math.round(r.y) + ".png";
+          "_y" + Math.round(r.y) +
+          (multi && fp8 ? "_fp" + fp8 : "") + ".png";
         var a = document.createElement("a");
         var objUrl = URL.createObjectURL(blob);
         a.href = objUrl;
@@ -722,7 +828,10 @@
         a.click();
         document.body.removeChild(a);
         setTimeout(function () { URL.revokeObjectURL(objUrl); }, 1000);
-        toast(t("export.done", { name: fname }), "success");
+        // 确认文案明确「导出当前伪彩合成图」，不冒充原始数据（§3.2/§4.4）
+        toast(multi
+          ? t("export.pseudo.done", { name: fname })
+          : t("export.done", { name: fname }), "success");
       })
       .catch(function (e) { toast(t("export.fail2", { s: e.message }), "error"); })
       .finally(function () {

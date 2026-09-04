@@ -1170,6 +1170,152 @@ button {
 .picker-count { font-size: 12px; color: var(--text-2); }
 
 /* =========================================================================
+   通道着色说明卡（Batch 4；channel-controls.js 渲染，正式版与 Demo 共用）
+   面板宿主 #channel-panel 位于 #viewer-wrap 内（与 .anno-panel 同一锚定）；
+   控件不只靠颜色传达状态：勾选态 + 文本 + 焦点样式 + aria-label。
+   ========================================================================= */
+.rgb-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--text-3);
+  background: var(--seg-bg);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.rgb-mode-badge[hidden] { display: none; }
+
+.channel-panel {
+  position: absolute;
+  right: 14px;
+  top: 14px;
+  width: 300px;
+  max-width: calc(100% - 28px);
+  max-height: calc(100% - 28px);
+  background: rgba(255, 255, 255, 0.94);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border-radius: var(--r-panel);
+  box-shadow: var(--shadow-float);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  z-index: 56;
+  font-size: 12px;
+}
+.channel-panel[hidden] { display: none; }
+.ch-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 0.5px solid var(--separator);
+  font-size: 13px;
+  font-weight: 600;
+}
+.ch-title { color: var(--text); }
+.ch-close {
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--text-3);
+  cursor: pointer;
+  border-radius: var(--r-btn);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.ch-close:hover { background: var(--hover); color: var(--text); }
+/* 键盘可达（§4.2）：焦点态不只靠颜色，还有描边 */
+.ch-close:focus-visible,
+.channel-panel input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.ch-subtitle {
+  margin: 0;
+  padding: 8px 12px 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+.ch-plane-warn {
+  margin: 8px 12px 0;
+  padding: 6px 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--seg-bg);
+  border-radius: var(--r-btn);
+}
+.ch-count { padding: 8px 12px 0; font-size: 12px; font-weight: 600; color: var(--text); }
+.ch-meta { padding: 2px 12px 0; font-size: 11px; color: var(--text-2); }
+.ch-ai-badge {
+  margin: 8px 12px 0;
+  padding: 6px 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-2);
+  background: var(--accent-fill);
+  border-radius: var(--r-btn);
+}
+.ch-ai-badge[hidden] { display: none; }
+.ch-list { overflow-y: auto; padding: 6px 6px 10px; }
+.ch-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: var(--r-btn);
+}
+.ch-row:hover { background: var(--hover); }
+.ch-row input[type="checkbox"] {
+  flex-shrink: 0;
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.ch-label {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  cursor: pointer;
+}
+.ch-name {
+  color: var(--text);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ch-index { color: var(--text-3); font-family: var(--mono); font-size: 10px; }
+.ch-color {
+  flex-shrink: 0;
+  width: 26px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--separator-strong);
+  border-radius: 5px;
+  background: none;
+  cursor: pointer;
+}
+.ch-origin { flex-shrink: 0; font-size: 10px; color: var(--text-2); }
+.ch-row-disabled .ch-name,
+.ch-row-disabled .ch-origin { color: var(--text-3); }
+
+/* 移动端（325px 宽）：说明卡贴满查看器宽度 */
+@media (max-width: 480px) {
+  .channel-panel { right: 8px; left: 8px; top: 8px; width: auto; max-width: none; }
+}
+
+/* =========================================================================
    标注面板（macOS 浮动面板风）
    ========================================================================= */
 .anno-panel {
@@ -2899,7 +3045,11 @@ button {
   color: var(--text-2);
   line-height: 1.5;
 }
-.ai-status {
+/* Demo 面板级状态条（demo.html：#ai-status 是 .demo-ai-panel 的直接子元素）。
+   §11 Bug B：旧版写成通用 `.ai-status { min-height: 0 }`，会让主轨迹
+   .ai-trace（flex column）里的状态行被压缩、长文本溢出盖住下一条消息——
+   现收窄为仅 Demo 面板子元素生效，不再覆盖主轨迹组件。 */
+.demo-ai-panel > .ai-status {
   margin: 6px 12px 0;
   font-size: 12px;
   color: var(--text-2);
@@ -2908,6 +3058,12 @@ button {
 }
 .ai-status.error { color: var(--danger); }
 .ai-status a { color: var(--accent); }
+/* §11 Bug B 防御：主轨迹内的状态行不参与 flex 收缩，保持内容自然高度
+   （长总结在场时状态行/短状态也不得压扁、溢出覆盖下一条消息）。 */
+.ai-trace > .ai-status {
+  flex-shrink: 0;
+  min-height: auto;
+}
 .ai-panel-header .ai-state {
   margin-left: auto;
   font-size: 11px;

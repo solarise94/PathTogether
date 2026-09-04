@@ -67,6 +67,12 @@
       <button id="anno-all-btn" class="tool-btn active" data-i18n-title="share.roi.panel.toggle.title" data-i18n="share.roi.panel.toggle">标记</button>
 
       <div class="spacer"></div>
+      {# 多通道通道着色（Batch 4）：默认隐藏，info 带 multichannel 能力才由
+         channel-controls.js 显示；RGB 切片最多显示灰色「原始 RGB」小标识 #}
+      <span id="rgb-badge" class="rgb-mode-badge" hidden data-i18n="channel.rgb.badge">原始 RGB</span>
+      <button id="channel-btn" class="tool-btn channel-btn" type="button" hidden
+              data-i18n="channel.entry" data-i18n-title="channel.entry.title"
+              aria-haspopup="dialog" aria-expanded="false">通道</button>
       <span id="zoom-badge" class="zoom-badge">—</span>
     </div>
 
@@ -101,6 +107,9 @@
 
   <!-- 选区面板：底部抽屉（macOS sheet 风） -->
   <div id="roi-panel-mask" class="roi-panel-mask" style="display:none;"></div>
+  {# 通道着色说明卡（Batch 4）：channel-controls.js 渲染 #}
+  <div id="channel-panel" class="channel-panel" hidden role="dialog"
+       aria-label="通道着色（显示映射）" data-i18n-aria="channel.panel.aria"></div>
   <div id="roi-panel" class="roi-panel" style="display:none;">
     <div class="roi-panel-handle"></div>
     <div class="roi-panel-header">
@@ -125,6 +134,8 @@
   </script>
   <!-- 共享 viewer 核心（倍率徽章唯一口径 HP_ViewerCore.zoomText；必须在 share.js 之前加载，G8） -->
   <script src="/static/viewer-core.js?v=20260818shell1"></script>
-  <script src="/static/share.js?v=20260829zoom1"></script>
+  <!-- 多通道通道着色（Batch 4）：三页面共用组件，须先于 share.js 加载 -->
+  <script src="/static/channel-controls.js?v=20260904batch4"></script>
+  <script src="/static/share.js?v=20260904batch4"></script>
 </body>
 </html>

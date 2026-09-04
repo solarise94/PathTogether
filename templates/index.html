@@ -40,8 +40,10 @@
   <script src="/plugins/histopilot/ui/sessions.js?v=20260827view"></script>
   <script src="/plugins/histopilot/ui/main.js?v=20260827view"></script>
   {% endif %}
-  <script src="/static/app-mode.js?v=20260818shell1"></script>
+  <script src="/static/app-mode.js?v=20260904batch4"></script>
   <script src="/static/viewer-core.js?v=20260818shell1"></script>
-  <script src="/static/app.js?v=20260827view"></script>
+  <!-- 多通道通道着色（Batch 4）：三页面共用组件，须先于 app.js 加载 -->
+  <script src="/static/channel-controls.js?v=20260904batch4"></script>
+  <script src="/static/app.js?v=20260904batch4"></script>
 </body>
 </html>

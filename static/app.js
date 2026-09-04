@@ -63,6 +63,7 @@
     drawMode: null,       // null | "arrow" | "freehand"（与 roiMode 互斥）
     showAnno: false,      // 是否在画布层显示已保存标注
     focusAnno: null,      // null=显示全部；否则只显示该条标注（flatItems 中的引用）
+    channelReopening: false, // 通道配色重开（同一切片换 TileSource，非新切片）
   };
 
   // ---------- 401 认证处理 ----------
@@ -506,12 +507,20 @@
     annoPanelList: $("anno-panel-list"),
     // AI 读片助手（Stage 2：仅保留触发按钮；面板 DOM 与逻辑归插件 bundle）
     aiBtn: $("ai-btn"),
+    // 多通道通道着色（Batch 4；元素在 _app_shell.html，RGB/flag 关时保持隐藏）
+    channelBtn: $("channel-btn"),
+    rgbBadge: $("rgb-badge"),
+    channelPanelHost: $("channel-panel"),
   };
 
   var roiBox = null;
   var dragInfo = null;
   // 底图缩略图层：铺在瓦片层后面的模糊预览，慢网下避免瓦片未到区域变白
   var baseThumbEl = null;
+
+  // 多通道通道着色控制器（Batch 4；channel-controls.js 三页面共用，本页只接
+  // adapter/权限。RGB 或 flag 关时 handleInfo 返回 legacy，行为与旧版一致）
+  var channelCtrl = null;
 
   // ---------- 工具函数 ----------
   function toast(msg, type) {
@@ -657,6 +666,15 @@
   }
 
   function onViewerOpen() {
+    // 通道配色重开（同一切片换 TileSource，§8.2）：走轻量路径——只同步倍率
+    // 徽章与底图缩略图；不退绘制模式、不重置标注/AI 面板、不向插件重发
+    // slide.opened（避免换色清空 AI 会话 UI）。viewport 恢复由控制器负责。
+    if (state.channelReopening) {
+      state.channelReopening = false;
+      updateZoomBadge();
+      syncBaseThumb();
+      return;
+    }
     updateZoomBadge();
     // 打开后把底图缩略图对齐到当前视口
     syncBaseThumb();
@@ -788,6 +806,55 @@
     } catch (e) {}
   }
 
+  // ---------- 多通道通道着色（Batch 4；channel-controls.js 三页面共用） ----------
+  // localStorage 用户作用域（§8.3）：登录用户区分（预览中为被预览用户），
+  // 本机免登录统一 local
+  function userScope() {
+    return "official:" + (currentUserId || "local");
+  }
+
+  function createChannelController() {
+    return HP_Channels.createChannelController({
+      adapter: window.HP_API,
+      viewer: viewer,
+      button: els.channelBtn,
+      badge: els.rgbBadge,
+      panelHost: els.channelPanelHost,
+      t: t,
+      toast: toast,
+      storage: window.localStorage,
+      // 通道重开（同一切片换配色，§8.2）：onViewerOpen 走轻量路径
+      onReopening: function () { state.channelReopening = true; },
+      onReopened: function () { syncBaseThumb(); redrawAnnoCanvas(); },
+      // render 计划的打开统一由控制器发起（含 409 刷新 info 重建路径）；
+      // legacy 计划由 openSlide 走原 DZI 路径
+      open: function (plan) {
+        if (viewer && plan && plan.tileSource) viewer.open(plan.tileSource);
+      },
+      // 底图缩略图与屏幕瓦片同 token（§4.4）；viewer.close 清掉后这里重建
+      setThumbnail: function (url) {
+        if (!url) return;
+        if (!baseThumbEl && viewer && viewer.container) {
+          baseThumbEl = document.createElement("img");
+          baseThumbEl.className = "osd-base-thumb";
+          baseThumbEl.alt = "";
+          viewer.container.insertBefore(baseThumbEl, viewer.canvas);
+          applyBaseThumbFlip();
+        }
+        if (baseThumbEl) baseThumbEl.src = url;
+      },
+      // 409 slide_revision_conflict：只刷新 info 并重建一次（§6.3）
+      refreshInfo: function () {
+        if (!state.slide) return Promise.resolve(null);
+        var adapter = window.HP_API;
+        var url = (adapter && adapter.slideInfoUrl)
+          ? adapter.slideInfoUrl(state.slide.name)
+          : "/api/slide/" + encodeURIComponent(state.slide.name) + "/info";
+        return apiFetch(url).then(function (r) { return r.json(); });
+      },
+    });
+  }
+
   // ---------- 打开切片 ----------
   function openSlide(name) {
     // 切换切片前移除旧底图
@@ -815,17 +882,32 @@
         updateMppSetterVisibility();
         exitRoi();
         // 创建底图缩略图层：铺在瓦片 canvas 之前（下层），慢网下透出模糊预览
+        // （src 由通道控制器 setThumbnail 或 legacy 路径填充）
         baseThumbEl = document.createElement("img");
         baseThumbEl.className = "osd-base-thumb";
-        baseThumbEl.src = (adapter && adapter.thumbnailUrl)
-          ? adapter.thumbnailUrl(name)
-          : "/api/slide/" + encodeURIComponent(name) + "/thumbnail";
         baseThumbEl.alt = "";
         viewer.container.insertBefore(baseThumbEl, viewer.canvas);
         applyBaseThumbFlip();
-        viewer.open((adapter && adapter.dziUrl)
-          ? adapter.dziUrl(name)
-          : "/api/slide/" + encodeURIComponent(name) + ".dzi");
+        // 多通道通道着色：共用组件按 info 决定 inline custom TileSource（携带
+        // render token）或原 DZI 路径；RGB / flag 关返回 legacy，行为不变。
+        // render 计划的 viewer.open 由控制器经 opts.open 完成（409 刷新等
+        // 路径同入口）；本函数只负责 legacy 打开。
+        var plan = null;
+        if (window.HP_Channels) {
+          channelCtrl = channelCtrl || createChannelController();
+          plan = channelCtrl.handleInfo(info, {
+            id: info.slide_id || info.name,
+            scope: userScope(),
+          });
+        }
+        if (!plan || plan.kind !== "render") {
+          baseThumbEl.src = (adapter && adapter.thumbnailUrl)
+            ? adapter.thumbnailUrl(name)
+            : "/api/slide/" + encodeURIComponent(name) + "/thumbnail";
+          viewer.open((adapter && adapter.dziUrl)
+            ? adapter.dziUrl(name)
+            : "/api/slide/" + encodeURIComponent(name) + ".dzi");
+        }
         // 高亮列表项（未归类与项目切片行）
         document.querySelectorAll(".slide-row").forEach(function (it) {
           it.classList.toggle("active", it.dataset.name === name);
@@ -1098,9 +1180,19 @@
     if (!state.slide || state.roiMode == null) return;
     var r = state.roi;
     var name = state.slide.name;
-    var url = "/api/slide/" + encodeURIComponent(name) +
-      "/crop?x=" + Math.round(r.x) + "&y=" + Math.round(r.y) +
-      "&size=" + Math.round(r.side);
+    // Batch 4（§4.4）：多通道切片 crop 与屏幕瓦片同 render_token（服务端用同
+    // 一 context 合成，且像素预算按启用通道数计）；RGB/legacy 不带参数
+    var token = (channelCtrl && channelCtrl.isMultichannel())
+      ? channelCtrl.getToken() : null;
+    var adapter = window.HP_API;
+    var url = (adapter && adapter.cropUrl)
+      ? adapter.cropUrl(name, Math.round(r.x), Math.round(r.y), Math.round(r.side), token)
+      : "/api/slide/" + encodeURIComponent(name) +
+        "/crop?x=" + Math.round(r.x) + "&y=" + Math.round(r.y) +
+        "&size=" + Math.round(r.side) +
+        (token ? "&render=" + encodeURIComponent(token) : "");
+    var fp8 = ((channelCtrl && channelCtrl.getFingerprint()) || "").slice(0, 8);
+    var multi = !!(channelCtrl && channelCtrl.isMultichannel() && token);
     var originalText = els.saveBtn.textContent;
     els.saveBtn.textContent = t("export.busy");
     els.saveBtn.disabled = true;
@@ -1115,15 +1207,20 @@
       })
       .then(function (blob) {
         var stem = name.replace(/\.[^.]+$/, "");
+        // 下载文件名与后端 Content-Disposition 同形：多通道带 fp 前 8 位（§4.4）
         var fname = stem + "_" + state.roiMode + "mm_x" + Math.round(r.x) +
-          "_y" + Math.round(r.y) + ".png";
+          "_y" + Math.round(r.y) +
+          (multi && fp8 ? "_fp" + fp8 : "") + ".png";
         var a = document.createElement("a");
         var objUrl = URL.createObjectURL(blob);
         a.href = objUrl; a.download = fname;
         document.body.appendChild(a); a.click();
         document.body.removeChild(a);
         setTimeout(function () { URL.revokeObjectURL(objUrl); }, 1000);
-        toast(t("export.done", { name: fname }), "success");
+        // 确认文案明确「导出当前伪彩合成图」，不冒充原始科学数据（§3.2/§4.4）
+        toast(multi
+          ? t("export.pseudo.done", { name: fname })
+          : t("export.done", { name: fname }), "success");
       })
       .catch(function (e) { toast(t("export.fail2", { s: e.message }), "error"); })
       .finally(function () {

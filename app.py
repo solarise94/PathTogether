@@ -48,6 +48,7 @@ from flask.sessions import SecureCookieSessionInterface
 from werkzeug.utils import secure_filename
 
 from openslide import OpenSlide
+from openslide.deepzoom import DeepZoomGenerator
 from PIL import Image
 
 import requests
@@ -55,6 +56,10 @@ import requests
 import share_store
 import slide_cache
 import slide_io
+# 多通道伪彩渲染（规格 §7.1 共享模块）：manifest / canonical context /
+# HMAC render_token / 请求级解析 / RenderedSlideView 由 app.py 与
+# share_server.py 共用，禁止在本文件复制颜色/签名算法。
+import slide_render
 import user_store
 # PT-1 数据层（docs demo-access-auth-ui-design §4.3/§7.3/§9.5）：
 # platform_features 判定 PG 前置条件；settings_store 提供 registration_mode
@@ -179,6 +184,14 @@ app.config["MAX_CONTENT_LENGTH"] = (
 def _handle_413(e):
     """请求体超限（Werkzeug 层）：稳定 JSON 信封，不回显内部细节。"""
     return jsonify(error="请求体超过单请求字节上限", code="upload_too_large"), 413
+
+
+@app.errorhandler(slide_cache.SlideFileChanged)
+def _handle_slide_file_changed(e):
+    """读取期间切片被连续替换（重试后仍变）：fail-closed 503（与 share_server
+    同一语义，§6.3：连续变化沿用 SlideFileChanged -> 503）。"""
+    app.logger.warning("切片读取期间文件被连续替换：%s", e)
+    return jsonify(error="slide_file_changed", code="slide_file_changed"), 503
 
 # --------------------------------------------------------------------------- #
 # 图片派生图确定性规格常量（§6.3）
@@ -1215,11 +1228,107 @@ def _tile_cache_put(key, data):
 
 
 def _tile_cache_purge(name):
-    """切片删除时清掉其全部瓦片缓存。"""
+    """切片删除时清掉其全部瓦片缓存，并按 slide 淘汰统计缓存（§7.3）。"""
     with _tile_cache_lock:
         stale = [k for k in _tile_cache if k[0] == name]
         for k in stale:
             _tile_cache.pop(k, None)
+    # 统计缓存按 "<safe>#<generation>" 命名空间淘汰（与瓦片缓存独立容量）
+    try:
+        slide_render.purge_stats_for(name)
+    except Exception:  # noqa: BLE001  淘汰失败不影响正确性（generation 键不命中）
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# 多通道 render context 请求级辅助（Batch 3，规格 §6.2/§6.3/§7.3/§7.4）
+#
+# 颜色/签名/校验算法全部在 slide_render（app 与 share_server 共用）；本区块
+# 只做 Flask 侧粘合：flag 读取、稳定错误映射、generation 命名空间、瓦片
+# 缓存键 (safe, generation, fingerprint, level, x, y, format, quality)。
+# 日志只记安全标识（safe 名 / fingerprint 前缀 / 通道数 / 错误码），不记
+# token 全文与图像内容（§7.4）。
+# --------------------------------------------------------------------------- #
+def _multichannel_enabled() -> bool:
+    """feature flag PATHTOGETHER_MULTICHANNEL_ENABLED（默认关闭，§15.2）。"""
+    return slide_render.multichannel_enabled()
+
+
+def _render_error_response(e):
+    """SlideRenderError / RenderRequestError → 稳定 JSON 契约（§7.4）。"""
+    status = getattr(e, "status", None) \
+        or slide_render.RENDER_ERROR_HTTP.get(getattr(e, "code", ""), 400)
+    return jsonify(error=str(e), code=getattr(e, "code",
+                                              "invalid_render_context")), status
+
+
+# 默认 context fingerprint 的 per-(safe, generation) 缓存：让无 render 参数的
+# 瓦片请求能在借句柄**之前**命中瓦片缓存（fp 由首次解码路径回填）。
+_DEFAULT_FP_CACHE: "OrderedDict[tuple, str]" = OrderedDict()
+_DEFAULT_FP_CACHE_MAX = 4096
+_DEFAULT_FP_LOCK = threading.Lock()
+
+
+def _ctx_scope(safe: str, generation) -> str:
+    """统计缓存 scope："<safe>#<generation>"（跨切片不串统计，§5.3）。"""
+    return "%s#%s" % (safe, generation)
+
+
+def _default_fp_cached(safe: str, generation):
+    """读取已回填的默认 fingerprint（无则 None，解码路径回填）。"""
+    with _DEFAULT_FP_LOCK:
+        return _DEFAULT_FP_CACHE.get((safe, generation))
+
+
+def _default_fp_store(safe: str, generation, fp: str) -> None:
+    with _DEFAULT_FP_LOCK:
+        if len(_DEFAULT_FP_CACHE) >= _DEFAULT_FP_CACHE_MAX:
+            _DEFAULT_FP_CACHE.clear()
+        _DEFAULT_FP_CACHE[(safe, generation)] = fp
+
+
+def _tile_fp_key(safe: str, generation, fp, level, x, y, fmt="jpeg"):
+    """瓦片缓存键（§7.3）：(safe, generation, fingerprint, level, x, y,
+    format, quality)。同名替换换 generation、换配色换 fingerprint——旧键
+    永不命中。"""
+    return (safe, generation, fp, int(level), int(x), int(y), fmt,
+            JPEG_QUALITY)
+
+
+def _resolve_pair_context(pair, safe: str, *, token="", body=None,
+                          flag=True):
+    """在**当前借出的** pair 上解析 render context（不缓存 view/句柄）。
+
+    返回 (context|None, fingerprint)；context None → native/legacy 路径。
+    抛 RenderRequestError / SlideRenderError（稳定码，均为解码前拒绝）。
+    默认 context 的 fingerprint 回填 _DEFAULT_FP_CACHE（按 generation）。
+    """
+    osr = pair["osr"]
+    gen_scope = _ctx_scope(safe, pair.get("gen"))
+    ctx, fp = slide_render.resolve_render_context(
+        osr, safe=safe,
+        expected_revision=_legacy_slide_revision(safe),
+        token=token, token_secret=app.secret_key, body=body,
+        asset_generation=gen_scope, flag_enabled=flag)
+    if ctx is None:
+        fp = slide_render.NATIVE_RGB_FINGERPRINT
+    elif not token and body is None:
+        _default_fp_store(safe, pair.get("gen"), fp)
+    return ctx, fp or slide_render.NATIVE_RGB_FINGERPRINT
+
+
+def _region_view(pair, ctx, fp):
+    """按需包装当前借出的 osr（RenderedSlideView 不跨 borrow 缓存，§7.3）。"""
+    if ctx is None:
+        return pair["osr"]
+    return slide_render.RenderedSlideView(pair["osr"], ctx, fingerprint=fp)
+
+
+def _crop_download_name(safe, x2, y2, size2, fp):
+    """crop 下载文件名：带 render fingerprint 前 8 位（§4.4）。"""
+    stem = Path(safe).stem
+    suffix = ("_%s" % str(fp)[:8]) if fp else ""
+    return "%s_%d_%d_%dpx%s.png" % (stem, x2, y2, size2, suffix)
 
 
 # --------------------------------------------------------------------------- #
@@ -1411,6 +1520,78 @@ def _slide_info_dict(name: str) -> dict:
     base["note"] = sm.get("note", "")
     base["public"] = bool(sm.get("public"))
     return base
+
+
+def _slide_render_info_fields(safe: str, *, include_deepzoom=True) -> dict:
+    """info 响应的 render additive 字段（§6.1；flag 关只暴露探测能力）。
+
+    打开失败（info error 分支）时调用方不得调用本函数。读取按代稳定
+    （read_stable）：manifest/统计与瓦片同一套 generation 纪律。
+    """
+    entry = _get_slide(safe)
+
+    def _read(pair):
+        fields = slide_render.build_render_info(
+            pair["osr"], asset_revision=_legacy_slide_revision(safe),
+            asset_generation=_ctx_scope(safe, pair.get("gen")),
+            secret=app.secret_key, slide_name=safe,
+            flag_enabled=_multichannel_enabled())
+        if include_deepzoom:
+            try:
+                dz = pair.get("dz")
+                z_dims = dz.level_dimensions
+                fields["deepzoom"] = {
+                    "width": int(z_dims[-1][0]),
+                    "height": int(z_dims[-1][1]),
+                    "tile_size": DZ_TILE_SIZE,
+                    "overlap": DZ_OVERLAP,
+                    "min_level": 0,
+                    "max_level": len(z_dims) - 1,
+                }
+            except Exception:  # noqa: BLE001  deepzoom 元数据缺省不阻塞 info
+                pass
+        return fields
+
+    return slide_cache.read_stable(entry, _read)[0]
+
+
+def _render_context_post_response(safe: str, body):
+    """POST render-context 的共用实现（规范化 + 签发 token，§6.2）。
+
+    不落库；调用方已先完成各自访问面鉴权。flag 关 → 403
+    multichannel_disabled（RGB/多通道一致——旧客户端不走本端点）。
+    """
+    if not _multichannel_enabled():
+        return jsonify(error="多通道渲染未启用",
+                       code="multichannel_disabled"), 403
+    entry = _get_slide(safe)
+    try:
+        def _build(pair):
+            canonical, fp = slide_render.resolve_render_context(
+                pair["osr"], safe=safe,
+                expected_revision=_legacy_slide_revision(safe),
+                body=body if isinstance(body, dict) else {},
+                asset_generation=_ctx_scope(safe, pair.get("gen")),
+                flag_enabled=True)
+            token = slide_render.issue_render_token(
+                canonical, fp, _legacy_slide_revision(safe),
+                app.secret_key, slide=safe)
+            return canonical, fp, token
+
+        canonical, fp, token = slide_cache.read_stable(entry, _build)[0]
+    except (slide_render.RenderRequestError, slide_io.SlideRenderError) as e:
+        return _render_error_response(e)
+    resp = jsonify({
+        # 与 info.default_render_context 同构：canonical + 内嵌 fingerprint
+        "render_context": dict(canonical, fingerprint=fp),
+        "render_context_fingerprint": fp,
+        "render_token": token,
+        "asset_revision": _legacy_slide_revision(safe),
+        "warnings": [],
+    })
+    app.logger.info("[render-context] slide=%s fp=%s channels=%d",
+                    safe, fp[:8], len(canonical.get("active_channels") or []))
+    return resp
 
 
 def _rect_size_mm(safe, side_px):
@@ -3172,7 +3353,34 @@ def api_demo_slide_info(slide_id):
     if entry.get("description"):
         info["demo_description"] = entry["description"]
     info["demo_is_default"] = bool(entry.get("is_default"))
+    if not info.get("error"):
+        # Batch 3（§6.1）：render additive 字段与主站同一份 manifest/统计
+        try:
+            info.update(_slide_render_info_fields(info["name"]))
+        except (slide_render.RenderRequestError,
+                slide_io.SlideRenderError) as e:
+            return _render_error_response(e)
+        except slide_cache.SlideFileChanged:
+            return jsonify(error="slide_file_changed",
+                           code="slide_file_changed"), 503
     return jsonify(info)
+
+
+@app.route("/api/demo/slides/<slide_id>/render-context", methods=["POST"])
+def api_demo_slide_render_context(slide_id):
+    """Demo 渲染上下文规范化（§6.2）：Demo 开关 + capability + allowlist 先行。"""
+    err = _demo_require_open()
+    if err is not None:
+        return err
+    cap, cap_err = _demo_require_capability()
+    if cap_err is not None:
+        return cap_err
+    entry, filename = _demo_catalog_slide(slide_id)
+    if entry is None:
+        return jsonify(error="slide 不在 Demo 目录内", code="slide_not_in_catalog"), 404
+    safe = _safe_name(filename)
+    body = request.get_json(silent=True)
+    return _render_context_post_response(safe, body)
 
 
 @app.route("/api/demo/slides/<slide_id>.dzi")
@@ -3207,31 +3415,66 @@ def api_demo_slide_dzi(slide_id):
 
 @app.route("/api/demo/slides/<slide_id>_files/<int:level>/<int:x>_<int:y>.jpeg")
 def api_demo_slide_tile(slide_id, level, x, y):
-    """Demo 瓦片（复用主站 DZI/tile 管线 + LRU 缓存，allowlist 先行校验）。"""
+    """Demo 瓦片（复用主站 DZI/tile 管线 + LRU 缓存，allowlist 先行校验）。
+
+    Batch 3（§6.3）：接受 ``?render=<token>``，缺省用默认 context；缓存键与
+    主站同一形状（generation + render fingerprint aware）。
+    """
     err = _demo_require_open()
     if err is not None:
         return err
     cap, cap_err = _demo_require_capability()
     if cap_err is not None:
         return cap_err
-    entry, filename = _demo_catalog_slide(slide_id)
-    if entry is None:
+    catalog_entry, filename = _demo_catalog_slide(slide_id)
+    if catalog_entry is None:
         return jsonify(error="slide 不在 Demo 目录内", code="slide_not_in_catalog"), 404
     safe = _safe_name(filename)
-    key = (safe, level, x, y)
-    cached = _tile_cache_get(key)
-    if cached is not None:
-        buf = io.BytesIO(cached)
+    token = request.args.get("render") or ""
+    flag = _multichannel_enabled()
+    gen = slide_cache.refresh_generation(_get_slide(safe))
+
+    fp_pre = None
+    if not flag:
+        fp_pre = slide_render.NATIVE_RGB_FINGERPRINT
+    elif token:
+        payload = slide_render.verify_render_token(token, app.secret_key)
+        if payload is not None and payload.get("slide") in ("", safe) \
+                and payload.get("rev") == _legacy_slide_revision(safe):
+            fp_pre = payload.get("fp")
     else:
-        dz_entry = _get_slide(safe)
-        with slide_cache.borrow_pair(dz_entry) as pair:
-            tile = pair["dz"].get_tile(level, (x, y))
-        if tile.mode != "RGB":
-            tile = tile.convert("RGB")
+        fp_pre = _default_fp_cached(safe, gen)
+    key = _tile_fp_key(safe, gen, fp_pre, level, x, y) \
+        if fp_pre is not None else None
+    cached = _tile_cache_get(key) if key is not None else None
+    if cached is None:
+        def _decode(pair):
+            ctx, fp = _resolve_pair_context(pair, safe, token=token, flag=flag)
+            if ctx is None:
+                tile = pair["dz"].get_tile(level, (x, y))
+            else:
+                view = slide_render.RenderedSlideView(pair["osr"], ctx,
+                                                      fingerprint=fp)
+                dzg = DeepZoomGenerator(view, tile_size=DZ_TILE_SIZE,
+                                        overlap=DZ_OVERLAP, limit_bounds=True)
+                tile = dzg.get_tile(level, (x, y))
+            if tile.mode != "RGB":
+                tile = tile.convert("RGB")
+            return tile, fp
+
+        try:
+            (tile, fp), tile_gen = slide_cache.read_stable(
+                _get_slide(safe), _decode)
+        except (slide_render.RenderRequestError,
+                slide_io.SlideRenderError) as e:
+            return _render_error_response(e)
+        key = _tile_fp_key(safe, tile_gen, fp, level, x, y)
         buf = io.BytesIO()
         tile.save(buf, format="JPEG", quality=JPEG_QUALITY)
         _tile_cache_put(key, buf.getvalue())
         buf.seek(0)
+    else:
+        buf = io.BytesIO(cached)
     resp = send_file(buf, mimetype="image/jpeg")
     resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
     return resp
@@ -7969,10 +8212,40 @@ def api_slide_delete(name):
 
 @app.route("/api/slide/<name>/info")
 def api_slide_info(name):
-    """单个切片元数据。Stage 3a-2a：can_view_slide，无权 403。"""
+    """单个切片元数据。Stage 3a-2a：can_view_slide，无权 403。
+
+    Batch 3（§6.1）：additive 返回 image_mode / channels /
+    default_render_context / default_render_token / warnings / plane /
+    deepzoom / server_capability（flag 关只暴露探测字段）。所有新字段
+    optional，旧客户端忽略即可。
+    """
     if not can_view_slide(name):
         return _denied()
-    return jsonify(_slide_info_dict(name))
+    info = _slide_info_dict(name)
+    if info.get("error"):
+        return jsonify(info)
+    try:
+        info.update(_slide_render_info_fields(info["name"]))
+    except (slide_render.RenderRequestError, slide_io.SlideRenderError) as e:
+        return _render_error_response(e)
+    except slide_cache.SlideFileChanged:
+        return jsonify(error="slide_file_changed",
+                       code="slide_file_changed"), 503
+    return jsonify(info)
+
+
+@app.route("/api/slide/<name>/render-context", methods=["POST"])
+def api_slide_render_context(name):
+    """渲染上下文规范化（§6.2，不落库）：can_view_slide 先行鉴权。
+
+    请求只提交用户选择 active_channels[] / plane；服务端验证 + 绑定当前
+    asset revision，返回 canonical context + fingerprint + render_token。
+    """
+    if not can_view_slide(name):
+        return _denied()
+    safe = _safe_name(name)
+    body = request.get_json(silent=True)
+    return _render_context_post_response(safe, body)
 
 
 @app.route("/api/slide/<name>.dzi")
@@ -8006,24 +8279,58 @@ def api_slide_tile(name, level, x, y):
     """返回 Deep Zoom 单张瓦片 JPEG（512×512、baseline、q82，带 LRU 缓存）。
 
     Stage 3a-2a：can_view_slide，无权 403。
+    Batch 3（§6.3/§7.3）：接受 ``?render=<render_token>``；缺省用该切片当前
+    默认 context（多通道）/ 旧路径（RGB）。瓦片缓存键 generation-aware +
+    fingerprint-aware（(safe, generation, fingerprint, level, x, y, format,
+    quality)），读取走 read_stable（与分享服务同一套换代纪律）。
     """
     if not can_view_slide(name):
         return _denied()
     safe = _safe_name(name)
+    entry = _get_slide(safe)
+    token = request.args.get("render") or ""
+    flag = _multichannel_enabled()
 
-    key = (safe, level, x, y)
-    cached = _tile_cache_get(key)
-    if cached is not None:
-        buf = io.BytesIO(cached)
+    # 预解析（不触碰句柄）：token 验签或已回填的默认 fp 命中瓦片缓存
+    fp_pre = None
+    if not flag:
+        fp_pre = slide_render.NATIVE_RGB_FINGERPRINT
+    elif token:
+        payload = slide_render.verify_render_token(token, app.secret_key)
+        if payload is not None and payload.get("slide") in ("", safe) \
+                and payload.get("rev") == _legacy_slide_revision(safe):
+            fp_pre = payload.get("fp")
     else:
-        entry = _get_slide(safe)
-        with slide_cache.borrow_pair(entry) as pair:
-            dz = pair["dz"]
-            tile = dz.get_tile(level, (x, y))
+        fp_pre = _default_fp_cached(safe, slide_cache.refresh_generation(entry))
+    if fp_pre is not None:
+        cached = _tile_cache_get(
+            _tile_fp_key(safe, slide_cache.refresh_generation(entry),
+                         fp_pre, level, x, y))
+    else:
+        cached = None
 
-        # 含 alpha 通道时先转 RGB（JPEG 不支持透明度）
-        if tile.mode != "RGB":
-            tile = tile.convert("RGB")
+    if cached is None:
+        def _decode(pair):
+            ctx, fp = _resolve_pair_context(pair, safe, token=token, flag=flag)
+            if ctx is None:
+                tile = pair["dz"].get_tile(level, (x, y))
+            else:
+                # 只包装当前借出的 osr；DZG 参数与旧路径一致（overlap/tile_size）
+                view = slide_render.RenderedSlideView(pair["osr"], ctx,
+                                                      fingerprint=fp)
+                dzg = DeepZoomGenerator(view, tile_size=DZ_TILE_SIZE,
+                                        overlap=DZ_OVERLAP, limit_bounds=True)
+                tile = dzg.get_tile(level, (x, y))
+            if tile.mode != "RGB":
+                tile = tile.convert("RGB")
+            return tile, fp
+
+        try:
+            (tile, fp), tile_gen = slide_cache.read_stable(entry, _decode)
+        except (slide_render.RenderRequestError,
+                slide_io.SlideRenderError) as e:
+            return _render_error_response(e)
+        key = _tile_fp_key(safe, tile_gen, fp, level, x, y)
         buf = io.BytesIO()
         # baseline JPEG：省掉 progressive/optimize 的编码开销（快 3–5×）；
         # 模糊→清晰的渐进预览已由切片页 base-thumb 底图层负责，瓦片无需 progressive
@@ -8034,9 +8341,11 @@ def api_slide_tile(name, level, x, y):
         )
         _tile_cache_put(key, buf.getvalue())
         buf.seek(0)
+    else:
+        buf = io.BytesIO(cached)
 
     resp = send_file(buf, mimetype="image/jpeg")
-    # 瓦片内容不变，长期不可变缓存
+    # 瓦片内容不变，长期不可变缓存（URL 含 token → 浏览器缓存内容寻址）
     resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
     return resp
 
@@ -8048,11 +8357,15 @@ def api_slide_crop(name):
     P0-A §3.5：read_region 之前按 clamp 后实际 size2² 过 crop_guard 三道闸
     （像素硬闸 413 / 每分钟像素预算 429 / 并发闸 429），任何解码前拒绝。
     预算按 user_id 计（本地免登录统一 "local" 主体）。
+    Batch 3（§6.3/§7.4）：接受 ``?render=<token>``（缺省用默认 context）；
+    像素预算按**真实成本×启用通道数**计（8 通道不能当 1 通道计费）；下载
+    文件名加入 render fingerprint 前 8 位（§4.4）。
     """
     if not can_view_slide(name):
         return _denied()
     safe = _safe_name(name)
     entry = _get_slide(safe)
+    token = request.args.get("render") or ""
 
     def _parse_int(key):
         try:
@@ -8070,7 +8383,14 @@ def api_slide_crop(name):
 
     subject = _current_uid() or "local"
     with slide_cache.borrow_pair(entry) as pair:
-        osr = pair["osr"]
+        # context 解析（含 token 验签/revision 绑定）在解码前（§7.4）
+        try:
+            ctx, fp = _resolve_pair_context(pair, safe, token=token,
+                                            flag=_multichannel_enabled())
+        except (slide_render.RenderRequestError,
+                slide_io.SlideRenderError) as e:
+            return _render_error_response(e)
+        osr = _region_view(pair, ctx, fp)
         width, height = osr.dimensions
         # clamp 到图像边界
         x2 = min(x, max(0, width - 1))
@@ -8086,8 +8406,11 @@ def api_slide_crop(name):
         except crop_guard.CropTooLargeError as e:
             return jsonify(error=str(e), code=e.code,
                            max_pixels=crop_guard.CROP_MAX_PIXELS), 413
-        # 每分钟像素预算（按用户）+ 并发闸：read_region 前
-        allowed, retry_after = crop_guard.admit_pixels(subject, size2 * size2)
+        # 每分钟像素预算（按用户）+ 并发闸：read_region 前。
+        # 真实成本 = 像素量 × 启用通道数（§7.4：8 通道不能当 1 通道计费）
+        n_channels = len(ctx.get("active_channels") or ()) if ctx else 1
+        allowed, retry_after = crop_guard.admit_pixels(
+            subject, size2 * size2 * max(1, n_channels))
         if not allowed:
             resp = jsonify(error="crop 请求过于频繁，请稍后重试",
                            code="crop_rate_limited", retry_after=retry_after)
@@ -8106,8 +8429,9 @@ def api_slide_crop(name):
     region.save(buf, format="PNG")
     buf.seek(0)
 
-    stem = Path(safe).stem
-    download_name = f"{stem}_{x2}_{y2}_{size2}px.png"
+    download_name = _crop_download_name(
+        safe, x2, y2, size2,
+        fp if _multichannel_enabled() else None)
     return send_file(
         buf,
         mimetype="image/png",
@@ -8118,14 +8442,25 @@ def api_slide_crop(name):
 
 @app.route("/api/slide/<name>/thumbnail")
 def api_slide_thumbnail(name):
-    """返回缩略图 JPEG。Stage 3a-2a：can_view_slide，无权 403。"""
+    """返回缩略图 JPEG。Stage 3a-2a：can_view_slide，无权 403。
+
+    Batch 3（§6.3）：接受 ``?render=<token>``；缩略图与最低层同 context
+    （RenderedSlideView.get_thumbnail），缺省用该切片当前默认 context。
+    """
     if not can_view_slide(name):
         return _denied()
     safe = _safe_name(name)
     entry = _get_slide(safe)
+    token = request.args.get("render") or ""
     with slide_cache.borrow_pair(entry) as pair:
-        osr = pair["osr"]
-        thumb = osr.get_thumbnail((400, 400))
+        try:
+            ctx, fp = _resolve_pair_context(pair, safe, token=token,
+                                            flag=_multichannel_enabled())
+        except (slide_render.RenderRequestError,
+                slide_io.SlideRenderError) as e:
+            return _render_error_response(e)
+        src = _region_view(pair, ctx, fp)
+        thumb = src.get_thumbnail((400, 400))
     if thumb.mode != "RGB":
         thumb = thumb.convert("RGB")
     buf = io.BytesIO()
@@ -11128,16 +11463,20 @@ def api_slide_region(name):
     """裁剪 level-0 区域为 JPEG base64（非附件下载，供 AI/前端按需取图）。
 
     参数：x,y,w,h（level-0 整数，必填，x,y>=0，w,h>0）；
-         out_w,out_h 可选（默认保持宽高比、最长边 1568，上限各 4096）。
+         out_w,out_h 可选（默认保持宽高比、最长边 1568，上限各 4096）；
+         render 可选（render_token，§6.3；缺省用该切片当前默认 context）。
     返回 JSON：{image_base64, mime, width, height, src:{x,y,w,h}, magnification,
-              read_level}。src 是 clamp 到边界后的实际区域；read_level 为实际
-    解码金字塔层（W0 跨仓契约，向后兼容新增字段）。
+              read_level, render_context_fingerprint?}。src 是 clamp 到边界后
+              的实际区域；read_level 为实际解码金字塔层（W0 跨仓契约，向后
+              兼容新增字段）；render_context_fingerprint 仅在多通道 context
+              生效时返回（additive）。
     Stage 3a-2a：can_view_slide，无权 403（不泄露存在性差异，统一 403）。
     """
     if not can_view_slide(name):
         return _denied()
     safe = _safe_name(name)
     entry = _get_slide(safe)
+    token = request.args.get("render") or ""
 
     def _parse_int(key):
         try:
@@ -11158,7 +11497,14 @@ def api_slide_region(name):
     out_h = _parse_int("out_h")
 
     with slide_cache.borrow_pair(entry) as pair:
-        osr = pair["osr"]
+        # context 解析在解码前（§7.4）；失败 → 稳定 4xx/409
+        try:
+            ctx, fp = _resolve_pair_context(pair, safe, token=token,
+                                            flag=_multichannel_enabled())
+        except (slide_render.RenderRequestError,
+                slide_io.SlideRenderError) as e:
+            return _render_error_response(e)
+        osr = _region_view(pair, ctx, fp)
         width, height = osr.dimensions
         # clamp 到图像边界
         x2 = min(x, max(0, width - 1))
@@ -11218,7 +11564,7 @@ def api_slide_region(name):
     buf = io.BytesIO()
     region.save(buf, format="JPEG", quality=85)
     img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    return jsonify({
+    out = {
         "image_base64": img_b64,
         "mime": "image/jpeg",
         "width": ow,
@@ -11227,7 +11573,12 @@ def api_slide_region(name):
         "magnification": mag,
         # W0 契约：实际解码金字塔层（与 _read_region_b64 同式选层；向后兼容新增）
         "read_level": int(lvl),
-    })
+    }
+    # §6.3 additive：多通道 context 生效时回传 fingerprint（HistoPilot 记录用；
+    # 不是 asset_revision——两者独立）。RGB legacy 路径不加该字段。
+    if ctx is not None:
+        out["render_context_fingerprint"] = fp
+    return jsonify(out)
 
 
 @app.route("/api/ai/config", methods=["GET", "PUT"])
@@ -11630,8 +11981,107 @@ def _aspect_fit_size(w_src, h_src, max_long_edge):
     return ow, oh
 
 
+def _validated_wire_context(osr, ctx_body, safe):
+    """校验 wire render_context（plugin/internal 请求体形态，§6.3）。
+
+    - snake ``render_context`` 或 camel ``renderContext`` 由调用方解析；
+    - body 带 ``asset_revision`` 且与当前不符 → 409 ``slide_revision_conflict``；
+      缺省绑定当前 revision；
+    - canonicalize 绑定该切片逻辑通道数（OpenSlide 厂商格式为 0 → 仅接受
+      native-rgb）；任何结构/取值问题抛 SlideRenderError（稳定码，解码前）。
+
+    返回 ``(canonical, fingerprint)``。
+    """
+    if not isinstance(ctx_body, dict):
+        raise slide_io.SlideRenderError("invalid_render_context",
+                                        "render_context 必须是对象")
+    expected = _legacy_slide_revision(safe)
+    ctx = dict(ctx_body)
+    supplied = ctx.get("asset_revision")
+    if supplied is not None and str(supplied) != str(expected):
+        raise slide_render.RenderRequestError(
+            "slide_revision_conflict",
+            "render_context 绑定的切片资产已更新", 409)
+    ctx["asset_revision"] = expected
+    channel_count = 0
+    if isinstance(osr, slide_io.TiffFileSlide):
+        channel_count = int(getattr(osr, "channel_count", 0) or 0)
+    return slide_render.canonicalize_render_context(
+        ctx, channel_count=channel_count)
+
+
+def _ai_run_render_context(slide, body):
+    """AI run 入口的 render_context 服务端再校验（multichannel 任务书 §9.1）。
+
+    浏览器 run/continue/ask/branch body 可带 canonical ``render_context``
+    （snake_case wire 形态）。本代理**不信任**浏览器 fingerprint：
+
+      1. 按当前切片 revision 再绑定（revision 不一致 → 409
+         ``slide_revision_conflict``）；
+      2. ``slide_render.canonicalize_render_context`` 结构/取值校验
+         （非法 → 稳定码 4xx），并**服务端重算** fingerprint；
+      3. canonical 结果转 camelCase ``renderContext`` 注入 sidecar config。
+
+    返回 ``(camel_config_field, asset_revision, fingerprint)``；浏览器未带
+    render_context（旧 UI / flag 关闭）→ ``(None, None, None)``，sidecar 沿用
+    session 既有 context（不中途替换图片语义）。校验失败抛
+    RenderRequestError / SlideRenderError，由调用方映射稳定错误响应。
+    """
+    wire = None
+    if isinstance(body, dict):
+        wire = body.get("render_context")
+        if wire is None:
+            wire = body.get("renderContext")
+    if not isinstance(wire, dict):
+        return None, None, None
+    safe = _safe_name(slide)
+    revision = _legacy_slide_revision(safe)
+    ctx = dict(wire)
+    ctx.pop("fingerprint", None)  # 服务端重算，绝不采信浏览器值
+    supplied = ctx.get("asset_revision")
+    if supplied is not None and str(supplied) != str(revision):
+        raise slide_render.RenderRequestError(
+            "slide_revision_conflict",
+            "render_context 绑定的切片资产已更新", 409)
+    ctx["asset_revision"] = revision
+    canonical, fp = slide_render.canonicalize_render_context(ctx, channel_count=None)
+    camel = {
+        "version": canonical["version"],
+        "assetRevision": canonical["asset_revision"],
+        "plane": dict(canonical["plane"]),
+        "activeChannels": [dict(c) for c in canonical["active_channels"]],
+        "fingerprint": fp,
+    }
+    return camel, revision, fp
+
+
+def _ai_run_inject_render_context(payload, slide, body):
+    """`_ai_run_render_context` 的 inline 包装（四个 run 端点共用）。
+
+    成功 → camelCase ``renderContext`` 注入 ``payload["config"]``，返回审计
+    detail ``{"asset_revision":…, "render_fingerprint":…}``（无 context 时为
+    None；**不记 token**）。校验失败 → ``(None, error_response)``，调用方直接
+    return error_response。用法::
+
+        audit_rc, err = _ai_run_inject_render_context(payload, slide, body)
+        if err is not None:
+            return err
+    """
+    try:
+        camel, revision, fp = _ai_run_render_context(slide, body)
+    except (slide_render.RenderRequestError, slide_io.SlideRenderError) as e:
+        return None, _render_error_response(e)
+    if camel is None:
+        return None, None
+    config = payload.get("config")
+    if isinstance(config, dict):
+        config["renderContext"] = camel
+    return {"asset_revision": revision, "render_fingerprint": fp}, None
+
+
 def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
-                     max_long_edge=None, jpeg_quality=DERIVATIVE_JPEG_QUALITY):
+                     max_long_edge=None, jpeg_quality=DERIVATIVE_JPEG_QUALITY,
+                     render_context=None, render_fingerprint=None):
     """实际读 region → JPEG base64（与 /region 端点逻辑一致，供 AI 进程内调用）。
 
     输出尺寸规则（§6.1）：
@@ -11639,9 +12089,21 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
         max_long_edge（保持比例，限制 [1,4096]），忽略显式 out_w/out_h。
       - 否则：用显式 out_w/out_h（仍 clamp 到 [1,4096]），保持旧契约。
     LANCZOS resize 保持不变；JPEG 质量 jpeg_quality 默认 DERIVATIVE_JPEG_QUALITY(85)。
+    Batch 3（§6.3）：render_context 非 None 时为 wire 请求体形态（plugin v1 /
+    internal 通道），在本函数内借句柄后、**解码前** canonicalize + revision
+    绑定（稳定码拒绝）；成功按该 context 合成并在结果 dict 带
+    ``render_fingerprint``。渲染失败抛 SlideRenderError / RenderRequestError，
+    由调用方映射稳定错误信封。
     """
     with slide_cache.borrow_pair(entry) as pair:
         osr = pair["osr"]
+        if render_context is not None:
+            # 解码前校验（§7.4）：canonicalize + revision 绑定 + 通道范围
+            render_context, render_fingerprint = _validated_wire_context(
+                pair["osr"], render_context, safe)
+            # 只包装当前借出的 osr（不跨 borrow 缓存，§7.3）
+            osr = slide_render.RenderedSlideView(
+                pair["osr"], render_context, fingerprint=render_fingerprint)
         width, height = osr.dimensions
         x2 = max(0, min(x, max(0, width - 1)))
         y2 = max(0, min(y, max(0, height - 1)))
@@ -11695,6 +12157,8 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
         # （get_best_level_for_downsample 选出的金字塔层，非语义 state_level），
         # 向后兼容新增字段，供 snapshot_captured 事件标注 read_level。
         "read_level": int(lvl),
+        # §6.3 additive：render_context 生效时的 fingerprint（RGB legacy 为 None）
+        "render_fingerprint": render_fingerprint,
     }
 
 
@@ -11735,15 +12199,19 @@ def internal_ai_region():
     """sidecar 取 level-0 区域图（含青色坐标刻度尺）。
 
     body: {slide, x, y, w, h, out_w?, out_h?, max_long_edge?,
-           jpeg_quality?, expected_fingerprint?}（level-0 整数）。
+           jpeg_quality?, expected_fingerprint?, render_context?}（level-0 整数）。
     expected_fingerprint 为可选字符串：若非空且与当前切片指纹不一致，返回 409。
+    render_context（§6.3，Batch 3）：可选 wire context（snake；camel
+    ``renderContext`` 容错）——解码前 canonicalize + revision 绑定，稳定码拒绝；
+    **不要传 render token**（token 不落 HistoPilot 持久化）。
 
     输出尺寸（§6.1）：
       - max_long_edge（正整数，[1,4096]）：服务端按 bbox 原始宽高比计算 out_w/out_h
         （最长边 = max_long_edge，保持比例）。与显式 out_w/out_h 同时给出时，以
         max_long_edge 为准（保宽高比，避免固定拉伸）。
       - 仅 out_w/out_h：旧契约，强制到精确尺寸（不保宽高比），保持向后兼容。
-    返回 {image_base64, mime, width, height, src, magnification, read_level, encoder}
+    返回 {image_base64, mime, width, height, src, magnification, read_level, encoder,
+    render_context_fingerprint?}
     （encoder 含 id/version/resize/overlay_version/jpeg_quality，供 sidecar 校验派生
     规格 §6.3；read_level 为实际解码金字塔层——W0 跨仓契约，向后兼容新增）。
     """
@@ -11785,6 +12253,10 @@ def internal_ai_region():
         fp = _slide_fingerprint(safe)
         if fp != expected_fp:
             return jsonify(error="切片指纹不匹配（文件已变更）"), 409
+    # §6.3：wire render_context（snake / camel 容错）；不接收 token
+    wire_ctx = body.get("render_context")
+    if wire_ctx is None:
+        wire_ctx = body.get("renderContext")
     entry = _get_slide(safe)
     with slide_cache.borrow_pair(entry) as pair:
         osr = pair["osr"]
@@ -11796,9 +12268,19 @@ def internal_ai_region():
     if not out_h or out_h <= 0:
         out_h = 1568
     q = jpeg_quality if (jpeg_quality and jpeg_quality > 0) else DERIVATIVE_JPEG_QUALITY
-    r = _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
-                         max_long_edge=max_long_edge, jpeg_quality=q)
-    return jsonify({
+    try:
+        # 仅在带 render_context 时才用新 kwargs（旧 mock/调用形态保持不变）
+        if wire_ctx is not None:
+            r = _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
+                                 max_long_edge=max_long_edge, jpeg_quality=q,
+                                 render_context=wire_ctx)
+        else:
+            r = _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
+                                 max_long_edge=max_long_edge, jpeg_quality=q)
+    except (slide_render.RenderRequestError,
+            slide_io.SlideRenderError) as e:
+        return _render_error_response(e)
+    out = {
         "image_base64": r["image_base64"],
         "mime": r["mime"],
         "width": r["width"],
@@ -11808,7 +12290,10 @@ def internal_ai_region():
         # W0 契约：实际解码金字塔层（向后兼容新增；mock 兼容用 .get）
         "read_level": r.get("read_level"),
         "encoder": _derivative_encoder_info(q),
-    })
+    }
+    if r.get("render_fingerprint"):
+        out["render_context_fingerprint"] = r["render_fingerprint"]
+    return jsonify(out)
 
 
 @app.route("/internal/ai/annotate", methods=["POST"])
@@ -12224,13 +12709,24 @@ def plugin_v1_region(slide):
     if jpeg_quality is not None and (jpeg_quality < 1 or jpeg_quality > 100):
         return _plugin_error(400, "invalid_request", "jpeg_quality 需在 1..100")
 
+    # §6.3（Batch 3）：wire render_context（snake / camel 容错）。**不接收
+    # render token**——token 不转交 HistoPilot 持久化；实际校验（canonicalize +
+    # revision 绑定 + 通道范围）在 _read_region_b64 借句柄后、解码前进行。
+    wire_ctx = body.get("render_context")
+    if wire_ctx is None:
+        wire_ctx = body.get("renderContext")
+    if wire_ctx is not None and not isinstance(wire_ctx, dict):
+        return _plugin_error(400, "invalid_request", "render_context 必须是对象")
+
     # ---- 像素预算闸 1：单请求上限（纯算术，零磁盘；必须在读盘/解码前拒绝）---- #
-    # 计费口径 = 本次请求的真实成本：max(输出像素, 估算解码像素)。输出像素 =
-    # est_ow*est_oh（max_long_edge 给定时按保宽高比估算；否则用显式 out_w/out_h，
-    # 缺省 1568，clamp 4096）。解码估算与 _read_region_b64 的选层取数同式（零磁盘
-    # IO 的纯算术）：ds = max(w,h)/1568（max>1568 时，否则 1），est_decode =
-    # ceil(w/ds)*ceil(h/ds)（≈从金字塔层解码的 rw*rh 量级，长边 ≤1568；用整数
-    # 分式 w*1568/L 精确求 ceil，等价于 w/ds 且无浮点整除边界噪声）。
+    # 计费口径 = 本次请求的真实成本：max(输出像素, 估算解码像素 × 启用通道数)。
+    # §7.4：多通道真实解码成本随通道数线性增长——**8 通道不能当 1 通道计费**；
+    # 通道数取自请求 context（未校验前即按声明数计费，宁多勿少），上限 8。
+    # 输出像素 = est_ow*est_oh（max_long_edge 给定时按保宽高比估算；否则用显式
+    # out_w/out_h，缺省 1568，clamp 4096）。解码估算与 _read_region_b64 的选层
+    # 取数同式（零磁盘 IO 的纯算术）：ds = max(w,h)/1568（max>1568 时，否则 1），
+    # est_decode = ceil(w/ds)*ceil(h/ds)（≈从金字塔层解码的 rw*rh 量级，长边
+    # ≤1568；用整数分式 w*1568/L 精确求 ceil，等价于 w/ds 且无浮点整除边界噪声）。
     # 注意：**不按 level-0 bbox 面积 w*h 计费**——低放大层级的大视野小输出取景
     # （bbox 可达 8192²+，真实解码仅 ≈1568 长边）会被误杀；而输出被 clamp 4096，
     # 真正巨大的输出请求仍会被本闸拦下。
@@ -12247,12 +12743,19 @@ def plugin_v1_region(slide):
         est_dec_w, est_dec_h = int(w), int(h)
     est_decode_pixels = est_dec_w * est_dec_h
     out_pixels = int(est_ow) * int(est_oh)
-    pixels = max(out_pixels, est_decode_pixels)
+    _n_channels = 1
+    if isinstance(wire_ctx, dict) \
+            and wire_ctx.get("version") != slide_render.CONTEXT_VERSION_NATIVE_RGB:
+        _declared = wire_ctx.get("active_channels")
+        if isinstance(_declared, list) and _declared:
+            _n_channels = max(1, min(len(_declared),
+                                     slide_render.MAX_ACTIVE_CHANNELS))
+    pixels = max(out_pixels, est_decode_pixels * _n_channels)
     if pixels > _PLUGIN_REGION_MAX_PIXELS:
         # 文案按实际触发项区分（out_pixels >= est_decode_pixels 时输出为主因）：
         # 输出超限 → 引导缩输出尺寸；解码量超限（仅在 PLUGIN_REGION_MAX_PIXELS
         # 压到 <1568² 的部署下可能）→ 引导先放大层级缩小视野，避免误导模型。
-        if out_pixels >= est_decode_pixels:
+        if out_pixels >= est_decode_pixels * _n_channels:
             triggered_by = "output_pixels"
             message = ("单次 region 请求像素预算超限（估算 %d > 上限 %d），"
                        "请缩小输出尺寸（out_w/out_h/max_long_edge）后重试"
@@ -12260,14 +12763,17 @@ def plugin_v1_region(slide):
         else:
             triggered_by = "decode_pixels"
             message = ("单次 region 请求像素预算超限（估算 %d > 上限 %d），"
-                       "当前视野区域过大（解码估算 %d 像素），"
-                       "请先放大层级缩小视野范围，或缩小输出尺寸后重试"
-                       % (pixels, _PLUGIN_REGION_MAX_PIXELS, est_decode_pixels))
+                       "当前视野区域过大（解码估算 %d 像素 × %d 通道），"
+                       "请先放大层级缩小视野范围，或减少启用通道/缩小输出尺寸"
+                       "后重试"
+                       % (pixels, _PLUGIN_REGION_MAX_PIXELS, est_decode_pixels,
+                          _n_channels))
         return _plugin_rate_limited_response(
             message, 1,
             details={"pixels": pixels, "max_pixels": _PLUGIN_REGION_MAX_PIXELS,
                      "out_pixels": out_pixels,
                      "est_decode_pixels": est_decode_pixels,
+                     "channels": _n_channels,
                      "triggered_by": triggered_by,
                      "reason": "single_request_pixels"})
 
@@ -12310,8 +12816,24 @@ def plugin_v1_region(slide):
         if not out_h or out_h <= 0:
             out_h = 1568
         q = jpeg_quality if (jpeg_quality and jpeg_quality > 0) else DERIVATIVE_JPEG_QUALITY
-        r = _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
-                             max_long_edge=max_long_edge, jpeg_quality=q)
+        try:
+            # 仅在带 render_context 时才用新 kwargs（旧 mock/调用形态保持不变）
+            if wire_ctx is not None:
+                r = _read_region_b64(entry, x, y, w, h, out_w, out_h, safe,
+                                     mpp, max_long_edge=max_long_edge,
+                                     jpeg_quality=q, render_context=wire_ctx)
+            else:
+                r = _read_region_b64(entry, x, y, w, h, out_w, out_h, safe,
+                                     mpp, max_long_edge=max_long_edge,
+                                     jpeg_quality=q)
+        except (slide_render.RenderRequestError,
+                slide_io.SlideRenderError) as e:
+            # 解码前校验失败：稳定机器码信封（§7.4）
+            status = getattr(e, "status", None) \
+                or slide_render.RENDER_ERROR_HTTP.get(getattr(e, "code", ""), 400)
+            return _plugin_error(status, getattr(e, "code",
+                                                 "invalid_render_context"),
+                                 str(e))
         # Content-SHA256：对实际返回的 JPEG bytes 计算（两条传输路径共用）
         jpeg_bytes = base64.b64decode(r["image_base64"])
         content_sha = hashlib.sha256(jpeg_bytes).hexdigest()
@@ -12328,8 +12850,10 @@ def plugin_v1_region(slide):
             # W0 契约：实际解码金字塔层（与 JSON 路径的 read_level 同值）
             resp.headers["X-Region-Read-Level"] = json.dumps(r.get("read_level"))
             resp.headers["X-Region-Encoder"] = json.dumps(_derivative_encoder_info(q))
+            if r.get("render_fingerprint"):
+                resp.headers["X-Render-Fingerprint"] = r["render_fingerprint"]
             return resp
-        resp = jsonify({
+        payload = {
             "image_base64": r["image_base64"],
             "mime": r["mime"],
             "width": r["width"],
@@ -12340,7 +12864,12 @@ def plugin_v1_region(slide):
             "encoder": _derivative_encoder_info(q),
             "content_sha256": content_sha,
             "asset_revision": _legacy_slide_revision(safe),
-        })
+        }
+        # §6.3 additive：render_context 生效时的 fingerprint（与 asset_revision
+        # 独立）；HistoPilot 记入 image_ref/derivative key（Batch 5）。
+        if r.get("render_fingerprint"):
+            payload["render_context_fingerprint"] = r["render_fingerprint"]
+        resp = jsonify(payload)
         resp.headers["Content-SHA256"] = content_sha
         return resp
     finally:
@@ -13260,8 +13789,15 @@ def api_ai_run():
     # JSON body 与 query 双重兼容（前端历史上把 fresh=1 放在 query）
     if bool(body.get("fresh")) or request.args.get("fresh") == "1":
         payload["fresh"] = True
-    _audit("ai.run", target_type="session", slide=slide,
-           detail={"mode": "run", "request_id": prep["request_id"]})
+    # §9.1：浏览器 render_context 服务端再校验（revision 绑定 + fingerprint 重算）
+    # → camelCase 注入 config；审计带 asset revision + render fingerprint。
+    audit_rc, rc_err = _ai_run_inject_render_context(payload, slide, body)
+    if rc_err is not None:
+        return rc_err
+    audit_detail = {"mode": "run", "request_id": prep["request_id"]}
+    if audit_rc:
+        audit_detail.update(audit_rc)
+    _audit("ai.run", target_type="session", slide=slide, detail=audit_detail)
     return _proxy_sse("/run", payload, on_accepted=prep["on_accepted"],
                       on_rejected=prep["on_rejected"],
                       on_finished=prep.get("on_finished"))
@@ -13300,8 +13836,14 @@ def api_ai_continue():
     session_id = body.get("session_id")
     if isinstance(session_id, str) and session_id:
         payload["session_id"] = session_id
-    _audit("ai.run", target_type="session", slide=slide,
-           detail={"mode": "continue", "request_id": prep["request_id"]})
+    # §9.1：render_context 服务端再校验 + camelCase 注入（同 /run）。
+    audit_rc, rc_err = _ai_run_inject_render_context(payload, slide, body)
+    if rc_err is not None:
+        return rc_err
+    audit_detail = {"mode": "continue", "request_id": prep["request_id"]}
+    if audit_rc:
+        audit_detail.update(audit_rc)
+    _audit("ai.run", target_type="session", slide=slide, detail=audit_detail)
     return _proxy_sse("/continue", payload, on_accepted=prep["on_accepted"],
                       on_rejected=prep["on_rejected"],
                       on_finished=prep.get("on_finished"))
@@ -13341,8 +13883,15 @@ def api_ai_ask():
     question = body.get("question")
     if isinstance(question, str):
         payload["question"] = question
+    # §9.1：ask（fork）同 run/continue——render_context 服务端再校验 + 注入。
+    audit_rc, rc_err = _ai_run_inject_render_context(payload, slide, body)
+    if rc_err is not None:
+        return rc_err
+    audit_detail = {"mode": "ask", "request_id": prep["request_id"]}
+    if audit_rc:
+        audit_detail.update(audit_rc)
     _audit("ai.run", target_type="session", target_id=annotation_id, slide=slide,
-           detail={"mode": "ask", "request_id": prep["request_id"]})
+           detail=audit_detail)
     return _proxy_sse("/ask", payload, on_accepted=prep["on_accepted"],
                       on_rejected=prep["on_rejected"])
 
@@ -13380,8 +13929,15 @@ def api_ai_branch():
     question = body.get("question")
     if isinstance(question, str):
         payload["question"] = question
+    # §9.1：branch 同 run/continue/ask——render_context 服务端再校验 + 注入。
+    audit_rc, rc_err = _ai_run_inject_render_context(payload, slide, body)
+    if rc_err is not None:
+        return rc_err
+    audit_detail = {"mode": "branch", "request_id": prep["request_id"]}
+    if audit_rc:
+        audit_detail.update(audit_rc)
     _audit("ai.run", target_type="session", target_id=annotation_id, slide=slide,
-           detail={"mode": "branch", "request_id": prep["request_id"]})
+           detail=audit_detail)
     return _proxy_sse("/branch", payload, on_accepted=prep["on_accepted"],
                       on_rejected=prep["on_rejected"],
                       on_finished=prep.get("on_finished"))
@@ -13487,6 +14043,32 @@ def api_ai_session_detail(session_id):
     if auth is not None:
         return auth
     return _proxy_json("/session/" + session_id, None, method="GET")
+
+
+@app.route("/api/ai/session/by-request/<request_id>")
+def api_ai_session_by_request(request_id):
+    """按幂等 request_id 反查会话（前端 §10 断线对账用）。代理 sidecar
+    GET /session/by-request/<request_id>，命中后回源 GET /session/<id>。
+
+    鉴权与现有 AI 代理一致：登录用户（CSRF 对 GET 不强制）；反查到 session id
+    后按 ``_require_ai_session_owner`` 校验归属，user 越权与其他 AI 代理同样 403。
+    状态码语义（供前端状态机分支）：
+      200 → {session: {...}}（与 /session/<id> 同形）；
+      404 → sidecar 明确无该 request_id（或启动恢复已放弃）→ 前端按「提交结果
+            未知，可重试」处理（重试复用原 request_id）；
+      503 → sidecar 不可达 → 前端按「对账不可达，保守后台运行」处理。
+    注意：本代理只读，不改变 _proxy_sse「客户端断开不终止 sidecar run」语义。
+    """
+    verdict, sid, _accepted = _histopilot_lookup_request(request_id)
+    if verdict == "unavailable":
+        return _sidecar_unavailable_response()
+    if verdict not in ("found", "abandoned") or not sid:
+        # missing / abandoned（未接受且已放弃）：对前端一律 404（=未创建，可重试）
+        return jsonify(error="没有对应会话", code="not_found"), 404
+    auth = _require_ai_session_owner(sid)
+    if auth is not None:
+        return auth
+    return _proxy_json("/session/" + sid, None, method="GET")
 
 
 @app.route("/api/ai/session/<session_id>/archive", methods=["POST"])

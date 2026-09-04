@@ -387,6 +387,21 @@ def build_channel_manifest(slide, *, asset_generation=None,
     - ``SizeT>1`` 或 ``SizeZ>1`` → 结构化 warning ``first-plane-v1``。
     """
     t0 = time.perf_counter()
+    if not isinstance(slide, TiffFileSlide):
+        metrics_add("manifest_seconds", time.perf_counter() - t0)
+        metrics_inc("manifest_built")
+        return {
+            "image_mode": "native_rgb",
+            "series_index": 0,
+            "axes": "",
+            "shape": (),
+            "plane": {
+                "t": 0, "z": 0, "size_t": 1, "size_z": 1,
+                "policy": PLANE_POLICY,
+            },
+            "channels": [],
+            "warnings": [],
+        }
     plane_sizes = slide.plane_sizes or {}
     size_c = int(plane_sizes.get("size_c", 0) or 0)
     size_t = int(plane_sizes.get("size_t", 1) or 1)
@@ -1054,8 +1069,26 @@ def build_render_info(slide, *, asset_revision, asset_generation=None,
         "render_token": True,
         "render_context_endpoint": True,
     }
+    # OpenSlide 厂商格式（SVS/NDPI…）没有 plane_sizes：不得走 OME manifest。
+    if mode == "native_rgb":
+        out["channels"] = []
+        out["warnings"] = []
+        out["plane"] = {
+            "t": 0, "z": 0, "size_t": 1, "size_z": 1, "policy": PLANE_POLICY,
+        }
+        dctx = {
+            "version": CONTEXT_VERSION_NATIVE_RGB,
+            "asset_revision": str(asset_revision or ""),
+            "plane": {"t": 0, "z": 0},
+            "active_channels": [],
+        }
+        canonical, fp = canonicalize_render_context(dctx, channel_count=0)
+        out["default_render_context"] = dict(canonical, fingerprint=fp)
+        out["default_render_token"] = issue_render_token(
+            canonical, fp, asset_revision, secret, slide=slide_name)
+        return out
     manifest = build_channel_manifest(slide, asset_generation=asset_generation,
-                                      with_intensity=mode == "multichannel")
+                                      with_intensity=True)
     warnings = list(manifest.get("warnings", []))
     out["channels"] = manifest.get("channels", [])
     out["warnings"] = warnings

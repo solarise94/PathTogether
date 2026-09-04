@@ -804,3 +804,21 @@ def test_metrics_counters_present():
     assert snap["stats_computed"] >= 1
     assert "channels_decoded" in snap
     assert "nonfinite_pixels" in snap
+
+
+def test_build_render_info_openslide_native_rgb_flag_on():
+    """厂商 OpenSlide 句柄没有 plane_sizes；flag 开不得 500。"""
+    class _FakeOpenSlide:
+        pass
+
+    info = slide_render.build_render_info(
+        _FakeOpenSlide(), asset_revision="1:1", secret="unit-secret",
+        slide_name="a.svs", flag_enabled=True)
+    assert info["image_mode"] == "native_rgb"
+    assert info["channels"] == []
+    assert info["default_render_context"]["version"] == "native-rgb-v1"
+    assert info["default_render_token"]
+    assert info["server_capability"]["multichannel"] is False
+    man = slide_render.build_channel_manifest(_FakeOpenSlide())
+    assert man["channels"] == []
+    assert man["image_mode"] == "native_rgb"

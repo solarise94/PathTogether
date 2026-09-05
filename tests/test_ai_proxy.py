@@ -166,11 +166,26 @@ def test_run_proxies_with_decrypted_config_and_sse():
           "got %r" % fake.calls[-1]["body"].get("session_id"))
 
 
+
+def _grant_proxy_slide(client, uid="usr_proxy_owner", slide="s.svs"):
+    """读隔离（review P0 2026-09-05）后的代理机械测试 fixture。
+
+    no-auth 下 current_identity 的 user_id 为 None，owner 读判定恒拒——
+    本文件的用意是测「代理转发/透传」，不是鉴权，故给会话注入稳定
+    user_id（role 兜底 owner）并把目标切片归属该 uid，等价「稳定 owner
+    uid 部署形态」。
+    """
+    app_mod.share_store.set_slide_meta(slide, owner_user_id=uid)
+    with client.session_transaction() as s:
+        s["user_id"] = uid
+
+
 def test_continue_and_ask_proxy():
     print("== test_continue / test_ask: 代理 + config 注入 + 状态码透传 ==")
     fake = install_fake_requests()
     client = make_client()
     setup_ai_config()
+    _grant_proxy_slide(client)
 
     fake.register("POST", "/continue",
                   lambda b, q, h, k: FakeResponse(200, sse_frames=[b"x\n\n"],
@@ -313,6 +328,7 @@ def test_sessions_and_session_detail_proxy():
     fake = install_fake_requests()
     client = make_client()
     setup_ai_config()
+    _grant_proxy_slide(client)
 
     def sessions_handler(body, query, headers, kwargs):
         check("sessions query.slide 透传", query.get("slide") == "s.svs",
@@ -595,6 +611,7 @@ def test_official_run_injects_extra_tools_and_tool_token():
     fake = install_fake_requests()
     client = make_client()
     setup_ai_config()
+    _grant_proxy_slide(client)
     installation, err = app_mod.install_plugin_bundle("sample-tma-score")
     check("示例插件安装成功（登记能力注册表）", err is None and installation is not None,
           "err=%r" % (err,))

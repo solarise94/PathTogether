@@ -182,7 +182,11 @@ def _login(client, user):
 
 
 class TestShareRoisEndpoint:
-    """GET /api/share/rois：owner 全量；user 按可见切片过滤；未登录 401。"""
+    """GET /api/share/rois：owner 与 user 均按可见切片过滤；未登录 401。
+
+    review P0 2026-09-05 读隔离：owner 不再全量——默认仅自己的 ∪ public ∪
+    认领 ∪ 显式授权（slide_view_grants），管理台 inventory 是唯一「看全部」。
+    """
 
     def test_unauthenticated_401(self):
         app_mod.AUTH_ENABLED = True
@@ -191,7 +195,8 @@ class TestShareRoisEndpoint:
         assert r.status_code == 401
         assert r.get_json()["error"] == "auth_required"
 
-    def test_owner_sees_all_user_sees_visible_only(self):
+    def test_owner_visible_only_after_grant(self):
+        """owner 默认不见他人切片 ROI；显式授权后可见；收回后再次不可见。"""
         owner, usera, userb = _setup_users()
         sa = _touch("a.svs")
         sb = _touch("b.svs")
@@ -206,10 +211,34 @@ class TestShareRoisEndpoint:
 
         app_mod.AUTH_ENABLED = True
         oc = _login(csrf_client(app_mod.app.test_client()), owner)
+        # owner 默认：userA/userB 的切片均不可见 → 空
         r = oc.get("/api/share/rois")
         assert r.status_code == 200
-        assert {x["slide"] for x in r.get_json()} == {sa, sb}
+        assert {x["slide"] for x in r.get_json()} == set()
 
+        # 显式授权 a.svs 后可见（幂等：重复授权状态不变）
+        r = oc.post("/api/admin/v1/slides/%s/visibility" % sa,
+                    json={"granted": True})
+        assert r.status_code == 200, r.get_data(as_text=True)
+        r = oc.post("/api/admin/v1/slides/%s/visibility" % sa,
+                    json={"granted": True})
+        assert r.status_code == 200
+        assert r.get_json()["already_granted"] is True
+        r = oc.get("/api/share/rois")
+        assert {x["slide"] for x in r.get_json()} == {sa}
+
+        # 收回后再次不可见（幂等收回）
+        r = oc.post("/api/admin/v1/slides/%s/visibility" % sa,
+                    json={"granted": False})
+        assert r.status_code == 200
+        r = oc.post("/api/admin/v1/slides/%s/visibility" % sa,
+                    json={"granted": False})
+        assert r.status_code == 200
+        assert r.get_json()["existed"] is False
+        r = oc.get("/api/share/rois")
+        assert {x["slide"] for x in r.get_json()} == set()
+
+        # userA / userB 行为不变：仅自己的
         ac = _login(csrf_client(app_mod.app.test_client()), usera)
         r = ac.get("/api/share/rois")
         assert r.status_code == 200

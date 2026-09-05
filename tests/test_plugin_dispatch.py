@@ -126,9 +126,11 @@ def _client():
 
 def _tool_token(slide="demo.svs", capabilities=None, session_id="",
                 role="owner", user_id=None, ttl=None):
+    # 读隔离（review P0 2026-09-05）：dispatch ③ 的 view 能力按主体判定，
+    # owner 主体也需携带稳定 user_id 且对 slide 有 view 权（见 _give_view）。
     claims = {
         "sub": user_id or "owner",
-        "user_id": user_id or "",
+        "user_id": user_id or "owner",
         "role": role,
         "session_id": session_id,
         "slide": slide,
@@ -272,6 +274,7 @@ def test_dispatch_permission_denied_403_for_user_without_view():
 
 def test_dispatch_owner_principal_passes_permission():
     installation = _install_tma()
+    _give_view("owner")  # owner 主体需对 slide 有 view（读隔离）
     client = _client()
     stub = app_mod.requests
     r = _dispatch(client, _tool_token())
@@ -286,6 +289,7 @@ def test_dispatch_owner_principal_passes_permission():
 # --------------------------------------------------------------------------- #
 def test_dispatch_rate_limited_429(monkeypatch):
     _install_tma()
+    _give_view("owner")  # owner 主体需对 slide 有 view（读隔离）
     monkeypatch.setattr(app_mod, "_DISPATCH_RATE_LIMITER",
                         app_mod._PluginRateLimiter(1))
     client = _client()
@@ -306,6 +310,7 @@ def test_dispatch_rate_limited_429(monkeypatch):
 def test_dispatch_rate_limit_keyed_by_token_not_header(monkeypatch):
     """起跑 token（session 空串）按 jti 限流：不同 token 各自一桶。"""
     _install_tma()
+    _give_view("owner")  # owner 主体需对 slide 有 view（读隔离）
     monkeypatch.setattr(app_mod, "_DISPATCH_RATE_LIMITER",
                         app_mod._PluginRateLimiter(1))
     client = _client()
@@ -318,6 +323,7 @@ def test_dispatch_rate_limit_keyed_by_token_not_header(monkeypatch):
 def test_dispatch_rate_limit_shared_across_tokens_of_same_session(monkeypatch):
     """token 绑定 session 时按 session 维度：同 session 的新 token 也限流。"""
     _install_tma()
+    _give_view("owner")  # owner 主体需对 slide 有 view（读隔离）
     monkeypatch.setattr(app_mod, "_DISPATCH_RATE_LIMITER",
                         app_mod._PluginRateLimiter(1))
     client = _client()
@@ -347,6 +353,7 @@ def test_dispatch_forwards_principal_and_arguments():
 
 def test_dispatch_plugin_5xx_maps_capability_unavailable():
     _install_tma()
+    _give_view("owner")  # owner 主体需对 slide 有 view（读隔离）
     app_mod.requests.handler = lambda *a: _Resp(503, {"error": "boom"})
     r = _dispatch(_client(), _tool_token())
     _assert_envelope(r, 503, "capability_unavailable", retryable=True)
@@ -354,6 +361,7 @@ def test_dispatch_plugin_5xx_maps_capability_unavailable():
 
 def test_dispatch_plugin_timeout_maps_capability_unavailable():
     _install_tma()
+    _give_view("owner")  # owner 主体需对 slide 有 view（读隔离）
 
     def _timeout(*a):
         raise real_requests.Timeout("plugin too slow")
@@ -364,6 +372,7 @@ def test_dispatch_plugin_timeout_maps_capability_unavailable():
 
 def test_dispatch_plugin_unreachable_maps_capability_unavailable():
     _install_tma()
+    _give_view("owner")  # owner 主体需对 slide 有 view（读隔离）
 
     def _down(*a):
         raise real_requests.ConnectionError("plugin down")
@@ -374,6 +383,7 @@ def test_dispatch_plugin_unreachable_maps_capability_unavailable():
 
 def test_dispatch_plugin_4xx_passthrough_envelope():
     _install_tma()
+    _give_view("owner")  # owner 主体需对 slide 有 view（读隔离）
     app_mod.requests.handler = lambda *a: _Resp(
         400, {"error": {"code": "invalid_request", "message": "参数非法",
                         "retryable": False}})
@@ -384,6 +394,7 @@ def test_dispatch_plugin_4xx_passthrough_envelope():
 def test_dispatch_plugin_redirect_rejected_503():
     """插件 30x 不跟随：转发显式 allow_redirects=False，3xx → 503。"""
     _install_tma()
+    _give_view("owner")  # owner 主体需对 slide 有 view（读隔离）
     app_mod.requests.handler = lambda *a: _Resp(
         302, {}, )
     client = _client()
@@ -398,6 +409,7 @@ def test_dispatch_plugin_redirect_rejected_503():
 def test_dispatch_non_http_base_url_rejected_503():
     """历史登记行带非 http(s) base_url → 运行时兜底拒绝（不发请求）。"""
     installation = _install_tma()
+    _give_view("owner")  # owner 主体需对 slide 有 view（读隔离）
     caps = [dict(c) for c in installation["capabilities"]]
     caps[0]["base_url"] = "file:///etc/passwd"
     share_store.set_installation_capabilities(installation["installation_id"], caps)
@@ -410,6 +422,7 @@ def test_dispatch_non_http_base_url_rejected_503():
 
 def test_dispatch_result_truncated_over_64kb():
     _install_tma()
+    _give_view("owner")  # owner 主体需对 slide 有 view（读隔离）
     big = "x" * (app_mod._PLUGIN_DISPATCH_RESULT_MAX_BYTES + 4096)
     app_mod.requests.handler = lambda *a: _Resp(200, {"result": big})
     r = _dispatch(_client(), _tool_token())
@@ -425,6 +438,7 @@ def test_dispatch_result_truncated_over_64kb():
 
 def test_dispatch_result_structured_truncation_keeps_json_valid():
     _install_tma()
+    _give_view("owner")  # owner 主体需对 slide 有 view（读隔离）
     big = {"rows": [{"i": i, "pad": "y" * 512} for i in range(1000)]}
     app_mod.requests.handler = lambda *a: _Resp(200, {"result": big})
     r = _dispatch(_client(), _tool_token())

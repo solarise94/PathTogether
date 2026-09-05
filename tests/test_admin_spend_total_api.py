@@ -33,6 +33,7 @@ import pytest  # noqa: E402
 
 import app as app_mod  # noqa: E402
 import budget_store  # noqa: E402
+import share_store  # noqa: E402
 import settings_store  # noqa: E402
 import user_store  # noqa: E402
 from _pt_helpers import FakeRequests, FakeResponse, csrf_client, isolate_app  # noqa: E402
@@ -118,6 +119,8 @@ def test_maintenance_gate_off_runs_normally(monkeypatch):
     _setup_platform()
     owner, usera = _setup_users(1)
     fake = _install_fake(monkeypatch)
+    # 读隔离（review P0 2026-09-05）：ask/branch 走切片读闸，显式补 view 授权
+    share_store.grant_slide_view(owner["user_id"], "s.svs")
     fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
     fake.register("POST", "/ask", lambda b, q, h, k: _sse_ok())
     fake.register("POST", "/branch", lambda b, q, h, k: _sse_ok())
@@ -146,6 +149,8 @@ def test_maintenance_gate_blocks_four_routes(monkeypatch):
     """闸开：四路由在预备阶段（无 grant/预占/转发副作用）稳定 503。"""
     _setup_platform()
     owner, _u = _setup_users()
+    # 读隔离（review P0 2026-09-05）：ask/branch 走切片读闸，显式补 view 授权
+    share_store.grant_slide_view(owner["user_id"], "s.svs")
     fake = _install_fake(monkeypatch)
     c = _login(_client(), owner)
     monkeypatch.setattr(app_mod, "_ai_dispatch_maintenance_active",

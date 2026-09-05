@@ -316,6 +316,8 @@ def test_comment_parent_reply():
 def test_api_comments_crud_and_perms():
     _touch()
     owner, userA = _setup_users()
+    # 读隔离（review P0 2026-09-05）：评论列表/详情走切片读闸，先归 owner
+    _own("demo.svs", owner["user_id"])
     co = _client()
     _login(co, "owner@x.com", "ownerpass123456")
     idx = _post_anno(co, "demo.svs").get_json()["index"]
@@ -490,7 +492,9 @@ def test_history_tombstone_snapshot():
 
 def test_api_history_endpoint():
     _touch()
-    _setup_users()
+    owner, _userA = _setup_users()
+    # 读隔离（review P0 2026-09-05）：owner 只能读自己可见切片的历史
+    _own("demo.svs", owner["user_id"])
     co = _client()
     _login(co, "owner@x.com", "ownerpass123456")
     idx = _post_anno(co, "demo.svs").get_json()["index"]

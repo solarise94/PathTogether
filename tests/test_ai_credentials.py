@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
 DATA_DIR = _bootstrap.SHARE_DATA_DIR
 import user_store  # noqa: E402
+import share_store  # noqa: E402
 import app as app_mod  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app, FakeRequests, FakeResponse # noqa: E402
 
@@ -328,6 +329,9 @@ def test_sessions_user_filter_owner_all():
     o = user_store.create_user("o@x.com", "password1password1", role="owner")
     _touch("s.svs")
     _own("s.svs", u["user_id"])
+    # 读隔离（review P0 2026-09-05）：owner 不再默认可见他人切片——本用例
+    # 关注 sessions 过滤参数注入，显式补 view 授权让 owner 过切片读闸
+    share_store.grant_slide_view(o["user_id"], "s.svs")
 
     fake = _install_fake()
 
@@ -389,14 +393,16 @@ def test_no_auth_full_compat():
                   lambda b, q, h, k: FakeResponse(200, json.dumps({"sessions": []})))
 
     c = _client(auth=False)
-    # run：不注入 session_owner
+    # run：写路径 owner 语义不变，不注入 session_owner
     fake.calls.clear()
     r = c.post("/api/ai/run", json={"slide": "x.svs"})
     assert r.status_code == 200
-    # sessions：不过滤 owner
+    # sessions：读隔离（review P0 2026-09-05）——no-auth owner 无稳定
+    # user_id → 切片读闸拒绝（403，sidecar 不被调用），不再「不过滤全量」
     fake.calls.clear()
-    c.get("/api/ai/sessions?slide=x.svs")
-    assert fake.calls and fake.calls[-1]["params"] == {"slide": "x.svs"}
+    r = c.get("/api/ai/sessions?slide=x.svs")
+    assert r.status_code == 403
+    assert fake.calls == []
 
 def test_owner_run_does_not_inject_session_owner():
     """role=owner 起跑不注入 session_owner（owner 全量可见、可续跑任意会话，

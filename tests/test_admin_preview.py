@@ -131,16 +131,17 @@ def test_current_identity_returns_subject_actor_stays_admin():
 
 
 def test_subject_visibility_applies_during_preview():
-    """预览态切片可见性按 subject（user 只见自己的，owner 全量）。"""
+    """预览态切片可见性按 subject（读隔离后 owner 仅见自己的，subject 视角生效）。"""
     owner, usera, userb = _setup_users()
-    sa = _touch("a.svs")
+    so = _touch("owner.svs")
     sb = _touch("b.svs")
-    share_store.set_slide_meta(sa, owner_user_id=usera["user_id"])
+    share_store.set_slide_meta(so, owner_user_id=owner["user_id"])
     share_store.set_slide_meta(sb, owner_user_id=userb["user_id"])
 
     oc = _login(_client(), owner)
     r = oc.get("/api/slides")
-    assert {s["name"] for s in r.get_json()} == {sa, sb}
+    # owner 读隔离（review P0 2026-09-05）：仅见自己的 owner.svs
+    assert {s["name"] for s in r.get_json()} == {so}
 
     r = oc.post("/api/admin/preview/start", json={"user_id": userb["user_id"]})
     assert r.status_code == 200, r.get_json()
@@ -265,10 +266,13 @@ def test_cannot_preview_disabled_user():
     user_store.set_user_disabled(userb["user_id"], True)
     sb = _touch("b.svs")
     share_store.set_slide_meta(sb, owner_user_id=userb["user_id"])
-    # 预览已自动退出 → owner 视角全量可见
+    so = _touch("o.svs")
+    share_store.set_slide_meta(so, owner_user_id=owner["user_id"])
+    # 预览已自动退出 → 回 owner 自己的读隔离视角（仅 o.svs，不含 subject 的
+    # b.svs——同时证明不再以 subject 身份读列表）
     r = oc.get("/api/slides")
     assert r.status_code == 200
-    assert {s["name"] for s in r.get_json()} == {sb}
+    assert {s["name"] for s in r.get_json()} == {so}
     with oc.session_transaction() as s:
         assert app_mod.PREVIEW_SESSION_KEY not in s
 
@@ -384,6 +388,9 @@ def test_ai_session_filter_uses_subject_during_preview(fake_sidecar):
     owner, _a, userb = _setup_users()
     sa = _touch("coop.svs")
     share_store.set_slide_meta(sa, owner_user_id=userb["user_id"])
+    # 读隔离（review P0 2026-09-05）：owner 不再默认可见他人切片——本用例
+    # 关注 AI 会话过滤参数注入，显式补 view 授权让 owner 过切片读闸
+    share_store.grant_slide_view(owner["user_id"], sa)
     fake_sidecar.register_json(
         "GET", "/sessions", body=[{"session_id": "s1"}])
     oc = _login(_client(), owner)

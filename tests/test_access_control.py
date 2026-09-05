@@ -9,7 +9,11 @@
   - 公开切片对 user 可见；public 仅 owner 可设置（user 尝试 403）；
   - 分享三档：无 annotate 权限的 token POST 标注 403；旧 share（无 permissions）行为不变；
   - claim 流程：user 认领后可见受邀切片；share 撤销后 user 失去访问；
-  - AUTH_ENABLED=False 内网模式：全部旧行为不变（owner 语义全开）；
+  - owner 读隔离（review P0 2026-09-05）：owner 与 user 同一可见模型——
+    自己的 ∪ public ∪ 认领 ∪ 显式授权（管理台 visibility 端点）；写路径
+    （删除切片/标注、项目管理、分享撤销）owner 语义不变；
+  - AUTH_ENABLED=False 内网模式：写语义不变；读按「无稳定 owner user_id →
+    可见集为空」形态，不崩溃；
   - user 只能分享/删除自己切片；project 隔离。
 
 隔离：独立临时 SHARE_DATA_DIR / UPLOAD_DIR，monkeypatch 夺回常量与 env，
@@ -157,7 +161,13 @@ def test_cross_user_not_in_slides_list():
     assert sb in names           # 自己的可见
     assert sa not in names       # userA 的不可见
 
-def test_owner_sees_all_slides():
+def test_owner_read_isolation_default_denied_grant_then_revoke():
+    """owner 读隔离（review P0 2026-09-05）：默认不可见 user 切片。
+
+    列表 + info + region 直访均拒；显式授权（管理台 visibility 端点）后
+    可见；收回后再次不可见；重复授权幂等。写路径不受影响（见
+    test_owner_can_delete_any_annotation）。
+    """
     owner, userA, userB = _setup_users()
     sa = _touch("a.svs")
     sb = _touch("b.svs")
@@ -165,8 +175,169 @@ def test_owner_sees_all_slides():
     _own(sb, userB["user_id"])
     co = _client()
     _login(co, "owner@x.com", "ownerpass123456")
+
+    # 默认：列表不含 userA/userB 的切片
     names = {i["name"] for i in co.get("/api/slides").get_json()}
-    assert sa in names and sb in names
+    assert sa not in names and sb not in names
+    # info / region 直访均 403（统一不泄露存在性）
+    assert co.get("/api/slide/%s/info" % sa).status_code == 403
+    assert co.get(
+        "/api/slide/%s/region?x=0&y=0&w=10&h=10" % sa).status_code == 403
+
+    # 管理台显式授权 a.svs → 可见（列表 + info）
+    r = co.post("/api/admin/v1/slides/%s/visibility" % sa,
+                json={"granted": True})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.get_json()["granted"] is True
+    names = {i["name"] for i in co.get("/api/slides").get_json()}
+    assert sa in names and sb not in names
+    # info 不再 403（占位 stub 打不开真切片，info 出口自捕异常返回元数据）
+    assert co.get("/api/slide/%s/info" % sa).status_code != 403
+
+    # 幂等：重复授权仍成功且状态不变
+    r = co.post("/api/admin/v1/slides/%s/visibility" % sa,
+                json={"granted": True})
+    assert r.status_code == 200
+    assert r.get_json()["already_granted"] is True
+    names = {i["name"] for i in co.get("/api/slides").get_json()}
+    assert sa in names
+
+    # 收回 → 再次不可见；幂等收回（无授权）亦成功
+    r = co.post("/api/admin/v1/slides/%s/visibility" % sa,
+                json={"granted": False})
+    assert r.status_code == 200
+    assert r.get_json()["granted"] is False
+    r = co.post("/api/admin/v1/slides/%s/visibility" % sa,
+                json={"granted": False})
+    assert r.status_code == 200
+    assert r.get_json()["existed"] is False
+    names = {i["name"] for i in co.get("/api/slides").get_json()}
+    assert sa not in names
+    assert co.get("/api/slide/%s/info" % sa).status_code == 403
+
+
+def test_owner_still_sees_own_and_public_slides():
+    """owner 可见集含自己上传的与 public 切片（读隔离不误伤）。"""
+    owner, userA, _b = _setup_users()
+    so = _touch("owner.svs")
+    _own(so, owner["user_id"])
+    sa = _touch("a.svs")
+    _own(sa, userA["user_id"])
+
+    co = _client()
+    _login(co, "owner@x.com", "ownerpass123456")
+    names = {i["name"] for i in co.get("/api/slides").get_json()}
+    assert so in names and sa not in names
+
+    # userA 切片设为 public → owner 可见
+    assert co.post("/api/slide/%s/meta" % sa,
+                   json={"public": True}).status_code == 200
+    names = {i["name"] for i in co.get("/api/slides").get_json()}
+    assert sa in names
+
+
+def test_admin_visibility_endpoint_forbidden_and_csrf():
+    """越权与 CSRF 负例：user 打授权端点 403；未登录 401；CSRF 缺失 400。"""
+    owner, userA, _b = _setup_users()
+    sa = _touch("a.svs")
+    _own(sa, userA["user_id"])
+
+    app_mod.app.config["TESTING"] = True
+    app_mod.AUTH_ENABLED = True
+    # user → 403
+    ca = _client()
+    _login(ca, "a@x.com", "userApass123456")
+    r = ca.post("/api/admin/v1/slides/%s/visibility" % sa,
+                json={"granted": True})
+    assert r.status_code == 403, r.get_data(as_text=True)
+    # user → inventory 403
+    r = ca.get("/api/admin/v1/slides/inventory")
+    assert r.status_code == 403
+
+    # 未登录 → 401
+    anon = csrf_client(app_mod.app.test_client())
+    r = anon.get("/api/admin/v1/slides/inventory")
+    assert r.status_code == 401
+    r = anon.post("/api/admin/v1/slides/%s/visibility" % sa,
+                  json={"granted": True})
+    assert r.status_code == 401
+
+    # CSRF 负例：登录 owner 后，绕过包装（不带 X-CSRF-Token）的 /api 写 → 400
+    co_bare_login = _client()
+    _login(co_bare_login, "owner@x.com", "ownerpass123456")
+    r = co_bare_login._base.post("/api/admin/v1/slides/%s/visibility" % sa,
+                                 json={"granted": True})
+    assert r.status_code == 400, r.get_data(as_text=True)
+    assert r.get_json()["error"] == "csrf_required"
+
+
+def test_admin_inventory_lists_all_and_marks_grants():
+    """inventory：全量切片清单 + 授权/归属/公开/归档标注正确（含无主切片）。"""
+    owner, userA, _b = _setup_users()
+    sa = _touch("a.svs")
+    _own(sa, userA["user_id"])
+    so = _touch("owner.svs")
+    _own(so, owner["user_id"])
+    orphan = _touch("orphan.svs")  # 无主：owner_user_id 为空
+
+    co = _client()
+    _login(co, "owner@x.com", "ownerpass123456")
+    r = co.get("/api/admin/v1/slides/inventory")
+    assert r.status_code == 200, r.get_data(as_text=True)
+    body = r.get_json()
+    by_name = {i["name"]: i for i in body["items"]}
+    assert set(by_name) == {sa, so, orphan}
+    # owner 可见集默认不含 a.svs / orphan.svs（读隔离），但 inventory 全量
+    assert by_name[sa]["owner_user_id"] == userA["user_id"]
+    assert by_name[sa]["granted_to_owner"] is False
+    assert by_name[sa]["public"] is False
+    assert by_name[sa]["archived"] is False
+    assert by_name[orphan]["owner_user_id"] is None
+    assert by_name[so]["owner_user_id"] == owner["user_id"]
+    # 授权标注翻转
+    assert co.post("/api/admin/v1/slides/%s/visibility" % orphan,
+                   json={"granted": True}).status_code == 200
+    body = co.get("/api/admin/v1/slides/inventory").get_json()
+    by_name = {i["name"]: i for i in body["items"]}
+    assert by_name[orphan]["granted_to_owner"] is True
+    # 无主切片经授权恢复可见（孤儿切片可管理）
+    names = {i["name"] for i in co.get("/api/slides").get_json()}
+    assert orphan in names
+
+
+def test_admin_visibility_requires_body_and_existing_slide():
+    """参数校验：granted 非布尔 400；不存在的切片 404。"""
+    owner, _a, _b = _setup_users()
+    co = _client()
+    _login(co, "owner@x.com", "ownerpass123456")
+    r = co.post("/api/admin/v1/slides/nope.svs/visibility",
+                json={"granted": True})
+    assert r.status_code == 404
+    assert r.get_json()["error"]["code"] == "slide_not_found"
+    sa = _touch("a.svs")
+    r = co.post("/api/admin/v1/slides/%s/visibility" % sa, json={})
+    assert r.status_code == 400
+    assert r.get_json()["error"]["code"] == "invalid_request"
+
+
+def test_admin_visibility_audited():
+    """授权/收回写审计：admin.slide_visibility.grant / revoke。"""
+    owner, userA, _b = _setup_users()
+    sa = _touch("a.svs")
+    _own(sa, userA["user_id"])
+    co = _client()
+    _login(co, "owner@x.com", "ownerpass123456")
+    assert co.post("/api/admin/v1/slides/%s/visibility" % sa,
+                   json={"granted": True}).status_code == 200
+    assert co.post("/api/admin/v1/slides/%s/visibility" % sa,
+                   json={"granted": False}).status_code == 200
+    actions = [e["action"] for e in share_store.list_audit(limit=50)]
+    assert "admin.slide_visibility.grant" in actions
+    assert "admin.slide_visibility.revoke" in actions
+    ev = next(e for e in share_store.list_audit(limit=50)
+              if e["action"] == "admin.slide_visibility.grant")
+    assert ev["actor_user_id"] == owner["user_id"]
+    assert ev["slide"] == sa
 
 # =========================================================================== #
 # 3. 越权 ID 枚举：不存在与无权切片行为一致（均 403，从 user 视角）
@@ -705,9 +876,10 @@ def test_visitor_hmac_secret_locked_create_is_stable():
     assert secret_file.is_file()
 
 # =========================================================================== #
-# 8. AUTH_ENABLED=False 内网模式：全部旧行为不变
+# 8. AUTH_ENABLED=False 内网模式：写语义不变；读隔离按「无稳定 owner
+#    user_id → 可见集为空」形态（review P0 2026-09-05，不崩溃）
 # =========================================================================== #
-def test_internal_mode_no_filtering():
+def test_internal_mode_write_paths_unchanged_and_no_crash():
     owner, userA, _b = _setup_users()
     sa = _touch("a.svs")
     _own(sa, userA["user_id"])
@@ -715,12 +887,13 @@ def test_internal_mode_no_filtering():
     _own(sb, _b["user_id"])
 
     c = _client_noauth()  # 无登录、AUTH_ENABLED=False
-    # 全部切片可见（owner 语义全开，不做归属过滤）
+    # 本地免认证开发态 owner 无稳定 user_id → 可见集为空（不崩溃；管理台
+    # inventory 仍可清点，稳定 owner 账户部署可显式授权恢复）
     names = {i["name"] for i in c.get("/api/slides").get_json()}
-    assert sa in names and sb in names
-    # 读取不因归属被拒（info 非 403）
-    assert c.get("/api/slide/%s/info" % sa).status_code != 403
-    # 可落标（internal 模式不做 can_annotate 拦截）
+    assert sa not in names and sb not in names
+    # 读被拒与 user 同口径（统一 403）
+    assert c.get("/api/slide/%s/info" % sa).status_code == 403
+    # 可落标（写路径 owner 语义不变，internal 模式不做 can_annotate 拦截）
     r = _post_anno(c, sa)
     assert r.status_code == 200
     # /api/auth/info 如实返回未登录（role=None），不影响访问放行（current_identity 兜底）
@@ -784,10 +957,10 @@ def test_share_list_revoke_owner_vs_user():
     r_a = ca.post("/api/share/create", json={"slides": [sa], "expires_hours": 1})
     tok_a = r_a.get_json()["token"]
 
-    # owner list → 看到全部（至少 2 条）
+    # owner list → 读隔离（review P0 2026-09-05）：仅自己创建的分享
     o_list = co.get("/api/share/list").get_json()
     o_tokens = {s["token"] for s in o_list}
-    assert tok_o in o_tokens and tok_a in o_tokens
+    assert tok_o in o_tokens and tok_a not in o_tokens
 
     # userA list → 只看到自己创建的
     a_list = ca.get("/api/share/list").get_json()
@@ -830,10 +1003,20 @@ def test_project_isolation():
 
     # userA 能访问自己的项目
     assert ca.get("/api/project/%s" % pid_a).status_code == 200
-    # owner 能访问任意项目
+    # 项目读隔离（review P0 2026-09-05）：owner 不再任意读他人项目
+    # （详情含项目内切片的标注摘要）；项目**写/管理**路径 owner 语义不变
     co = _client()
     _login(co, "owner@x.com", "ownerpass123456")
-    assert co.get("/api/project/%s" % pid_a).status_code == 200
+    assert co.get("/api/project/%s" % pid_a).status_code == 403
+    assert co.get("/api/projects").get_json() == []
+    # owner 自己建项目 → 可读
+    r = co.post("/api/project/create", json={"name": "PO"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    pid_o = r.get_json()["pid"]
+    assert co.get("/api/project/%s" % pid_o).status_code == 200
+    # 写路径不变：owner 仍可管理 userA 的项目（patch → 200）
+    assert co.patch("/api/project/%s" % pid_a,
+                    json={"name": "renamed"}).status_code == 200
 
 def test_annotations_filtered_for_user():
     owner, userA, userB = _setup_users()
@@ -860,10 +1043,15 @@ def test_annotations_filtered_for_user():
     assert cb.get("/api/annotations?slide=b.svs").status_code == 200
 
 # =========================================================================== #
-# 11. current_identity 单元（owner 语义兜底）
+# 11. current_identity 单元（owner 角色兜底；读隔离按 uid 判定）
 # =========================================================================== #
 def test_current_identity_owner_when_no_role():
-    """current_identity() 在无 session role 时兜底为 owner（访问判定用，非 info 端点）。"""
+    """无 session role 时 current_identity() 兜底 role=owner（访问判定用）。
+
+    读隔离（review P0 2026-09-05）：owner 无稳定 user_id → 读判定 False
+    （可见集为空）；写路径（can_upload / can_annotate_slide / 删除）owner
+    语义不变。
+    """
     _setup_users()
     # 无 session（test_request_context 默认空 session）→ current_identity 返回 owner
     with app_mod.app.test_request_context("/api/anything"):
@@ -871,5 +1059,6 @@ def test_current_identity_owner_when_no_role():
         assert ident["role"] == "owner"
         assert ident["user_id"] is None
         assert app_mod._is_owner() is True
-        assert app_mod.can_view_slide("any.svs") is True
+        assert app_mod.can_view_slide("any.svs") is False
         assert app_mod.can_upload() is True
+        assert app_mod.can_annotate_slide("any.svs") is True

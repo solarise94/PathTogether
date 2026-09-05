@@ -159,6 +159,8 @@ def test_audit_redaction_no_secrets():
 def test_changes_cursor_advance_and_tombstone():
     owner, _ = _setup_users()
     _touch()
+    # 读隔离（review P0 2026-09-05）：owner 只能读自己可见切片的变更流
+    share_store.set_slide_meta("demo.svs", owner_user_id=owner["user_id"])
     c = _client()
     _login(c, "owner@x.com", "ownerpass123456")
     # 添加两条标注
@@ -188,6 +190,8 @@ def test_changes_cursor_advance_and_tombstone():
 def test_changes_reset_required_after_ahead():
     owner, _ = _setup_users()
     _touch()
+    # 读隔离（review P0 2026-09-05）：owner 只能读自己可见切片的变更流
+    share_store.set_slide_meta("demo.svs", owner_user_id=owner["user_id"])
     c = _client()
     _login(c, "owner@x.com", "ownerpass123456")
     share_store.add_roi(share_store.ADMIN_TOKEN, "demo.svs", "L",

@@ -3923,13 +3923,20 @@ def _require_owner():
 # =========================================================================== #
 # Stage 3a-2a：身份与资源级鉴权矩阵（docs §5.1.1）
 #
-# 关键不变量：AUTH_ENABLED=False（内网模式）或 session 无 role 时，current_identity
-# 返回 role=owner —— 此时所有 can_* 放行、所有过滤返回全量，**完全不影响现状**
-# （这是现有 88 个测试在 AUTH_ENABLED=False 下全绿的关键）。
+# 读隔离模型（review P0 2026-09-05）：owner 与 user 的**读**判定统一走
+# _user_can_view_slide —— 自己的 ∪ public ∪ 认领(view) ∪ 显式授权
+# （slide_view_grants，管理台 /api/admin/v1/slides/* 是唯一「看全部」出口）。
+# 写路径（can_delete_slide / can_annotate_slide / 项目管理 / 分享撤销 /
+# 标注删除）owner 语义**保持不变**——本次只做读隔离。
 #
-# owner：一切。
-# user：上传/维护自己的图库；查看 = 自己的 + 公开 + 受邀（认领过 active share）；
-#       标注 = 自己的 + 协作切片；删除标注 = 仅本人创建；创建分享 = 仅自己的切片。
+# AUTH_ENABLED=False（内网模式）或 session 无 role 时，current_identity 仍
+# 返回 role=owner，但读不再全量短路：本地免认证开发态 owner 无稳定 user_id，
+# 可见集为空（不崩溃；写语义不变）。稳定 owner 账户部署中，owner 看自己
+# 上传的切片不受影响，他人切片需显式授权。
+#
+# user：上传/维护自己的图库；查看 = 自己的 + 公开 + 受邀（认领过 active
+#       share）+ 显式授权；标注 = 自己的 + 协作切片；删除标注 = 仅本人创建；
+#       创建分享 = 仅自己的切片。
 # guest：不能上传/维护图库；标注按分享权限走 /s/* 流程（share_server）；不能创建分享。
 # =========================================================================== #
 # --------------------------------------------------------------------------- #
@@ -4074,15 +4081,20 @@ def can_upload(slide=None):
 
 
 def can_view_slide(name):
-    """owner 全量；user = 自己的 ∪ 公开 ∪ 认领且 grant 含 view 的协作切片。"""
+    """读隔离模型（review P0 2026-09-05）：自己的 ∪ 公开 ∪ 认领(view) ∪ 显式授权。
+
+    owner 不再全量短路——与 user 同一判定（_user_can_view_slide）。owner 的
+    「看全部」唯一出口是管理台 /api/admin/v1/slides/inventory（显式管理）。
+    写路径（can_delete_slide / can_annotate_slide）owner 语义**保持不变**：
+    本次只做读隔离。owner user_id 为空的部署形态（本地免认证开发态）可见集
+    为空：不崩溃，无主切片经管理台显式授权后恢复可见。
+    """
     ident = current_identity()
-    if ident["role"] == user_store.ROLE_OWNER:
-        return True
     return _user_can_view_slide(ident["user_id"], name)
 
 
 def _user_can_view_slide(uid, name):
-    """can_view_slide 的 user 主体判定（无 session 上下文，供 dispatch 复用）。"""
+    """can_view_slide 的主体判定（无 session 上下文，供 dispatch 复用）。"""
     if not uid:
         return False
     if _slide_owner(name) == uid:
@@ -4090,6 +4102,8 @@ def _user_can_view_slide(uid, name):
     if _slide_is_public(name):
         return True
     if name in _claimed_slides(uid, permission=share_store.PERMISSION_VIEW):
+        return True
+    if name in share_store.slide_view_grants_for_user(uid):
         return True
     return False
 
@@ -4148,17 +4162,21 @@ _CAPABILITY_ANNOTATE_GRANTS = frozenset(("annotation:write",))
 def _subject_slide_permissions(role, user_id, slide):
     """主体（role/user_id 显式传入，不依赖 session）对 slide 的权限集合。
 
-    owner → 全部 4 项；user → view/annotate 判定映射（§6.1 表）。归档切片对
-    所有身份只读（与 can_annotate_slide 同规则，annotate 侧不授予）。
+    读隔离模型（review P0 2026-09-05）：owner 与 user 的 view 能力同一判定
+    （_user_can_view_slide）——否则插件 dispatch 会成为 owner 绕过切片读
+    隔离的旁路；annotation:write 属写能力，owner 保持授予（与
+    can_annotate_slide 的 owner 语义不变一致，归档切片除外）。user →
+    view/annotate 判定映射（§6.1 表）。归档切片对所有身份只读（annotate
+    侧不授予）。
     """
-    if role == user_store.ROLE_OWNER:
-        if slide in _archived_slide_names():
-            return set(_CAPABILITY_VIEW_GRANTS)
-        return set(_CAPABILITY_VIEW_GRANTS) | set(_CAPABILITY_ANNOTATE_GRANTS)
     perms = set()
     if _user_can_view_slide(user_id, slide):
         perms |= _CAPABILITY_VIEW_GRANTS
-    if (slide not in _archived_slide_names()
+    if role == user_store.ROLE_OWNER:
+        # 写路径 owner 语义不变（读隔离不动写）；归档只读对 owner 亦生效
+        if user_id and slide not in _archived_slide_names():
+            perms |= _CAPABILITY_ANNOTATE_GRANTS
+    elif (slide not in _archived_slide_names()
             and _user_can_annotate_slide(user_id, slide)):
         perms |= _CAPABILITY_ANNOTATE_GRANTS
     return perms
@@ -4182,29 +4200,55 @@ def can_manage_share(slides):
 
 
 def _visible_slide_names():
-    """当前身份可见的切片文件名集合。owner=全量；user=可见集。"""
+    """当前身份可见的切片文件名集合（读隔离模型，owner 与 user 同一规则）。
+
+    可见集 = 自己上传的 ∪ public ∪ 认领(view 级 claim) ∪ 显式授权
+    （slide_view_grants，管理台建立）。owner 不再全量短路（review P0
+    2026-09-05）；无主切片（owner_user_id 为空）且非 public 对所有身份默认
+    不可见，经管理台显式授权后恢复可见（孤儿切片仍可管理）。owner user_id
+    为空（本地免认证开发态）→ 可见集为空（不崩溃）。
+    """
     ident = current_identity()
     all_names = {
         child.name for child in UPLOAD_DIR.iterdir()
         if child.is_file() and child.suffix.lower().lstrip(".") in SUPPORTED_EXTS
     }
-    if ident["role"] == user_store.ROLE_OWNER:
-        return all_names
     uid = ident["user_id"]
+    if not uid:
+        return set()
     meta_all = share_store.get_all_slide_meta_full()
     claimed = _claimed_slides(uid, permission=share_store.PERMISSION_VIEW)
+    granted = share_store.slide_view_grants_for_user(uid)
     visible = set()
     for name in all_names:
         m = meta_all.get(name, {})
-        if m.get("owner_user_id") == uid or m.get("public") or name in claimed:
+        if (m.get("owner_user_id") == uid or m.get("public")
+                or name in claimed or name in granted):
             visible.add(name)
     return visible
 
 
 def _can_access_project(pid):
-    """owner 任意；user 仅自己 owner_user_id 的项目（不存在视为无权）。"""
+    """owner 任意；user 仅自己 owner_user_id 的项目（不存在视为无权）。
+
+    项目**写/管理**路径（更新/增删切片/删除/归档）保持 owner 语义不变
+    （本次只做读隔离）；读路径见 _can_read_project。
+    """
     if _is_owner():
         return True
+    proj = share_store.get_project(pid)
+    if proj is None:
+        return False
+    return proj.get("owner_user_id") == _current_uid()
+
+
+def _can_read_project(pid):
+    """项目**读**访问（详情/标注投影）：owner 与 user 同一创建者口径。
+
+    review P0 2026-09-05：项目详情含项目内切片的标注摘要，owner 全量读
+    会经此旁路泄露他人切片的标注——读路径与切片可见集同模型。管理出口走
+    /api/admin/*（inventory 是唯一「看全部」）。
+    """
     proj = share_store.get_project(pid)
     if proj is None:
         return False
@@ -6577,9 +6621,166 @@ def admin_v1_site_stats():
     return jsonify(stats)
 
 
+# --------------------------------------------------------------------------- #
+# Admin API v1：切片可见性管理（review P0 2026-09-05 读隔离的显式管理出口）
+#
+# 背景：owner 不再默认可见全部切片（读隔离模型：自己的 ∪ public ∪ 认领 ∪
+# 显式授权）。本节是 owner-only 的「看全部」出口：
+#   - inventory：全量切片清单（含归属/公开/归档/授权标注；**不含切片图像
+#     内容**）；
+#   - visibility：按切片给 owner 建立/收回 view 授权（幂等，无主切片经此
+#     恢复可见/可管理）。
+# 惯例同 spend 等管理写端点：_require_owner_admin_v1（预览态一律拒绝）+
+# 全局 CSRF（before_request，POST 走 header 双提交）+ audit
+# （admin.slide_visibility.grant / revoke，经 _audit best-effort）。写路径
+# 语义不变：can_delete_slide / can_annotate_slide 的 owner 权限保持原样。
+# --------------------------------------------------------------------------- #
+def _admin_v1_owner_uid():
+    """actor（真实管理员）的稳定 user_id；本地免认证开发态为 None。"""
+    return actor_identity().get("user_id")
+
+
+@app.route("/api/admin/v1/slides/inventory", methods=["GET"])
+def admin_v1_slides_inventory():
+    """全量切片清单（管理台唯一「看全部」出口；不含切片图像内容）。
+
+    每行：name、size_bytes、owner_user_id、owner 展示名/掩码 login_id
+    （无归属 null）、public、alias、note、archived（归档项目只读保护）、
+    granted_to_owner（是否已显式授权给当前 actor-owner）、granted_at。
+    按 name 升序 cursor/limit 分页（管理列表禁全量返回的既有口径）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    limit = _admin_v1_limit_arg()
+    cur = _admin_v1_decode_cursor(request.args.get("cursor"))
+    offset = int(cur.get("o") or 0) if cur else 0
+    if offset < 0:
+        offset = 0
+
+    rows = []
+    for child in UPLOAD_DIR.iterdir():
+        if not child.is_file():
+            continue
+        if child.suffix.lower().lstrip(".") not in SUPPORTED_EXTS:
+            continue
+        rows.append(child.name)
+    rows.sort()
+
+    meta_all = share_store.get_all_slide_meta_full()
+    archived = _archived_slide_names()
+    grants_by_slide = {}
+    try:
+        for g in share_store.list_slide_view_grants():
+            grants_by_slide.setdefault(g["slide_name"], []).append(g)
+    except Exception:
+        app.logger.exception("admin v1 slides inventory 授权标注读取失败")
+        return _admin_v1_error(500, "internal", "切片清单读取失败")
+
+    owner_uid = _admin_v1_owner_uid()
+    # 归属展示名/掩码 login_id（无归属/未知用户 → null；与用户列表同口径
+    # 掩码，inventory 只用于清点，不额外放大 login_id 明文）
+    users_by_id = {}
+    try:
+        for u in user_store.list_users():
+            if u.get("user_id"):
+                users_by_id[str(u["user_id"])] = u
+    except Exception:
+        app.logger.warning("admin v1 slides inventory 用户投影读取失败",
+                           exc_info=True)
+
+    page = rows[offset:offset + limit + 1]
+    has_more = len(page) > limit
+    page = page[:limit]
+
+    items = []
+    for name in page:
+        meta = meta_all.get(name) or {}
+        slide_owner = meta.get("owner_user_id") or None
+        owner_user = users_by_id.get(str(slide_owner)) if slide_owner else None
+        grant = None
+        for g in grants_by_slide.get(name, []):
+            if owner_uid and g.get("user_id") == owner_uid:
+                grant = g
+                break
+        items.append({
+            "name": name,
+            "size_bytes": (UPLOAD_DIR / name).stat().st_size,
+            "owner_user_id": slide_owner,
+            "owner_display_name": (owner_user or {}).get("display_name"),
+            "owner_login_id_masked": (
+                registration_store.mask_login_id(
+                    (owner_user or {}).get("login_id") or "")
+                if owner_user else None),
+            "public": bool(meta.get("public")),
+            "alias": meta.get("alias", ""),
+            "note": meta.get("note", ""),
+            "archived": name in archived,
+            "granted_to_owner": grant is not None,
+            "granted_at": (grant or {}).get("granted_at"),
+        })
+    next_cursor = None
+    if has_more:
+        next_cursor = _admin_v1_encode_cursor({"o": offset + limit})
+    return jsonify(items=items, next_cursor=next_cursor, limit=limit,
+                   owner_user_id=owner_uid)
+
+
+@app.route("/api/admin/v1/slides/<path:name>/visibility", methods=["POST"])
+def admin_v1_slide_visibility(name):
+    """给 owner 建立/收回某切片的 view 授权（幂等）。body: {granted: bool}。
+
+    - granted=true：建立（已存在则幂等成功，audit 标 already_granted）；
+      granted=false：收回（无授权亦幂等成功，audit 标 existed）。
+    - 授权对象是当前 actor-owner（自授权；本地免认证开发态 owner 无稳定
+      user_id → 400 owner_uid_missing，可见集为空属预期形态）。
+    - 无主切片经此授权后恢复可见（孤儿切片可管理，不因读隔离失联）。
+    - audit：admin.slide_visibility.grant / revoke（best-effort，业务写后）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    safe = _sanitize_name(name)
+    if not safe or safe != name:
+        return _admin_v1_error(400, "invalid_request", "非法文件名")
+    if safe.split(".")[-1].lower() not in SUPPORTED_EXTS \
+            or not (UPLOAD_DIR / safe).is_file():
+        return _admin_v1_error(404, "slide_not_found", "切片不存在")
+    body = request.get_json(silent=True) or {}
+    granted = body.get("granted")
+    if not isinstance(granted, bool):
+        return _admin_v1_error(400, "invalid_request",
+                               "granted 需为布尔（true=授权，false=收回）")
+    owner_uid = _admin_v1_owner_uid()
+    if not owner_uid:
+        return _admin_v1_error(
+            400, "owner_uid_missing",
+            "当前部署 owner 无稳定 user_id（本地免认证开发态），"
+            "无法建立/收回显式授权")
+    if granted:
+        result = share_store.grant_slide_view(
+            owner_uid, safe, granted_by=owner_uid)
+        _audit("admin.slide_visibility.grant", target_type="slide",
+               target_id=safe, slide=safe,
+               detail={"granted_to": owner_uid,
+                       "already_granted": bool(result.get("already_granted"))})
+        return jsonify(name=safe, granted=True,
+                       already_granted=bool(result.get("already_granted")))
+    existed = share_store.revoke_slide_view(owner_uid, safe)
+    _audit("admin.slide_visibility.revoke", target_type="slide",
+           target_id=safe, slide=safe,
+           detail={"revoked_from": owner_uid, "existed": bool(existed)})
+    return jsonify(name=safe, granted=False, existed=bool(existed))
+
+
 @app.route("/api/slides")
 def api_slides():
-    """列出所有切片的元数据（owner 全量；user 仅可见集，docs §5.1.1）。"""
+    """列出所有切片的元数据（读隔离：owner 与 user 均仅可见集，docs §5.1.1）。
+
+    review P0 2026-09-05：owner 不再全量——可见集 = 自己的 ∪ public ∪
+    认领(view) ∪ 显式授权（_visible_slide_names）。全量清单唯一出口是
+    管理台 GET /api/admin/v1/slides/inventory。
+    """
     visible = _visible_slide_names()
     items = []
     for child in sorted(UPLOAD_DIR.iterdir()):
@@ -14434,12 +14635,14 @@ def api_share_create():
 
 @app.route("/api/share/list")
 def api_share_list():
-    """列出分享（owner 全量；user 仅自己创建的），附加 url 与 roi_count。"""
-    ident = current_identity()
-    shares = share_store.list_shares()
-    if ident["role"] != user_store.ROLE_OWNER:
-        uid = ident["user_id"]
-        shares = [s for s in shares if s.get("creator_user_id") == uid]
+    """列出分享（读隔离：owner 与 user 均仅自己创建的），附加 url 与 roi_count。
+
+    review P0 2026-09-05：分享行引用他人切片名与协作链接，owner 不再全量
+    返回；撤销他人分享（写路径）语义不变——仍按 token 精确撤销。
+    """
+    uid = _current_uid()
+    shares = [s for s in share_store.list_shares()
+              if s.get("creator_user_id") == uid]
     roi_counts = share_store.roi_count_by_token()
     for sh in shares:
         sh["url"] = SHARE_BASE_URL + "/s/" + sh["token"]
@@ -14476,10 +14679,13 @@ def api_share_revoke():
 
 @app.route("/api/share/rois")
 def api_share_rois():
-    """列出 ROI（owner 全量；user 仅可见切片的标注）。"""
+    """列出 ROI（读隔离：owner 与 user 均仅可见切片的标注）。
+
+    review P0 2026-09-05：owner 不再全量返回他人切片的标注——按
+    _visible_slide_names 过滤（自己的 ∪ public ∪ 认领 ∪ 显式授权）。管理
+    出口走 /api/admin/*（inventory 是唯一「看全部」）。
+    """
     rois = share_store.list_rois()
-    if _is_owner():
-        return jsonify(rois)
     visible = _visible_slide_names()
     return jsonify([r for r in rois if r.get("slide") in visible])
 
@@ -14564,12 +14770,14 @@ def api_project_create():
 
 @app.route("/api/projects")
 def api_projects():
-    """列出项目（owner 全量；user 仅自己 owner_user_id 的），附加 roi_count。"""
-    ident = current_identity()
-    projects = share_store.list_projects()
-    if ident["role"] != user_store.ROLE_OWNER:
-        uid = ident["user_id"]
-        projects = [p for p in projects if p.get("owner_user_id") == uid]
+    """列出项目（读隔离：owner 与 user 均仅自己 owner_user_id 的），附加 roi_count。
+
+    review P0 2026-09-05：项目列表引用他人切片名与标注计数，owner 不再
+    全量返回；全量清点走管理台 inventory。
+    """
+    uid = _current_uid()
+    projects = [p for p in share_store.list_projects()
+                if p.get("owner_user_id") == uid]
     # 一次性取 annotations_by_slide，按项目 slides 汇总
     by_slide = share_store.annotations_by_slide()
 
@@ -14590,8 +14798,13 @@ def api_projects():
 
 @app.route("/api/project/<pid>")
 def api_project_detail(pid):
-    """单个项目详情，含每张切片的标注摘要。Stage 3a-2a：owner 任意；user 仅自己。"""
-    if not _can_access_project(pid):
+    """单个项目详情，含每张切片的标注摘要。
+
+    读隔离（review P0 2026-09-05）：owner 与 user 均仅自己创建的项目
+    （_can_read_project）；项目写/管理路径仍走 _can_access_project（owner
+    语义不变）。
+    """
+    if not _can_read_project(pid):
         return _denied()
     proj = share_store.get_project(pid)
     if proj is None:
@@ -14709,7 +14922,9 @@ def api_annotations():
       - project=<pid>：只返回该项目内切片的标注
     同时传 slide 与 project 时，slide 优先（且需属于项目）。
     items 已含 type 与全部几何字段（经 store 自动带）。
-    Stage 3a-2a：owner 全量；user 仅可见切片的标注，越权 403。
+    读隔离模型（review P0 2026-09-05）：owner 与 user 均仅可见切片的标注
+    （默认分支按 _visible_slide_names 过滤；project 分支按创建者口径读），
+    越权 403；单 slide 分支鉴权同 can_view_slide。
     """
     slide = request.args.get("slide")
     project = request.args.get("project")
@@ -14724,15 +14939,13 @@ def api_annotations():
         return jsonify({"slide": safe, "annotations": by_slide.get(safe, [])})
 
     if project:
-        if not _can_access_project(project):
+        if not _can_read_project(project):
             return _denied()
         by_slide = share_store.annotations_by_project(project)
         return jsonify({"project": project, "by_slide": by_slide})
 
-    # 默认返回全部（user 按可见切片过滤）
+    # 默认返回全部（owner 与 user 均按可见切片过滤——owner 不再全量）
     by_slide = share_store.annotations_by_slide()
-    if _is_owner():
-        return jsonify({"by_slide": by_slide})
     visible = _visible_slide_names()
     filtered = {s: v for s, v in by_slide.items() if s in visible}
     return jsonify({"by_slide": filtered})
@@ -15023,7 +15236,10 @@ def _resolve_anno(token, index, require_annotate):
     slide = roi.get("slide") or ""
     ok = can_annotate_slide(slide) if require_annotate else can_view_slide(slide)
     if not ok:
-        return None, (_denied(),)
+        # _denied() 本身就是 (json, 403) 二元组；此前 owner 读恒放行使这个
+        # 分支不可达，读隔离后 owner 亦可被拒——多包一层 1-tuple 会让 Flask
+        # 以 TypeError 500 收场（review P0 2026-09-05 修复）。
+        return None, _denied()
     return roi, None
 
 

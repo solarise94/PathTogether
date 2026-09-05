@@ -12873,6 +12873,10 @@ def plugin_v1_region(slide):
             resp.headers["X-Region-Magnification"] = json.dumps(r["magnification"])
             # W0 契约：实际解码金字塔层（与 JSON 路径的 read_level 同值）
             resp.headers["X-Region-Read-Level"] = json.dumps(r.get("read_level"))
+            # W0 契约（additive）：out 是否超过源像素（放大；与 JSON 路径的
+            # upsampled 同值）。旧客户端/旧平台忽略未知头，向后兼容。
+            resp.headers["X-Region-Upsampled"] = json.dumps(
+                bool(r.get("upsampled")))
             resp.headers["X-Region-Encoder"] = json.dumps(_derivative_encoder_info(q))
             if r.get("render_fingerprint"):
                 resp.headers["X-Render-Fingerprint"] = r["render_fingerprint"]

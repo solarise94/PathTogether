@@ -606,6 +606,15 @@ X-JPEG-Quality: 85
 
 header 缺失、非法或与 bytes/hash 不一致时，`PathTogetherHttpClient` 将响应视为 `invalid_region_response`，不得把不完整结果放入 derivative cache。
 
+#### 7.3.1 现行 legacy transport 的 additive 字段（2026-09-05）
+
+Stage 4-2 起现行 Flask 实现的二进制 transport（`Accept: application/octet-stream` 或 `?format=binary`，`Content-Type: application/octet-stream`）以响应头携带元数据；本节字段均为 **additive 契约**——旧客户端 / 旧平台遇到未知头一律忽略，缺省视为 undefined，不构成破坏性变更：
+
+- `X-Region-Read-Level`：JSON 数字，实际解码的金字塔层（W0 跨仓契约）；
+- `X-Region-Upsampled`：JSON 布尔（`true`/`false`），输出分辨率是否超过所选层原生分辨率（即服务端做了放大）。HistoPilot 应把它记入 snapshot/导数 provenance——放大图不能当作原生分辨率证据使用。
+
+兼容语义：旧平台解析响应头时按既有字段读取，未知头缺省即忽略，无需版本协商。
+
 ### 7.4 事件流
 
 平台事件流使用 SSE：

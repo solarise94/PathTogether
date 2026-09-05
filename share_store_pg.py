@@ -530,6 +530,126 @@ def list_grants_for_user(user_id):
 
 
 # --------------------------------------------------------------------------- #
+# 切片可见性显式授权（slide_view_grants；review P0 2026-09-05 读隔离）
+#
+# 背景：owner 不再默认可见全部切片——读隔离模型与 user 一致（自己的 ∪
+# public ∪ 认领 view ∪ 本节直授）。不复用 share 认领（grants FK 绑定
+# shares.token，复用需伪造内部 share：污染分享列表、撤 share 即静默收回、
+# 权限被 share permissions 夹逼、有 expires_at TTL 陷阱）。本表持久、无
+# TTL、(slide_name, user_id) 主键天然幂等；授权可先于 slides meta 行存在
+# （无外键，同 rois.slide 理由，见 migrations/0034 注释）。当前唯一授予
+# 方向是管理台给 owner 自授权（app.py /api/admin/v1/slides/*）。
+# --------------------------------------------------------------------------- #
+def grant_slide_view(user_id, slide_name, granted_by=None):
+    """建立 view 授权（幂等）。返回 {"already_granted", "granted_at"}。
+
+    已存在同名授权时不动原行（保留首次 granted_at/granted_by），幂等语义
+    由主键冲突保证。user_id/slide_name 需非空字符串。
+    """
+    if not isinstance(user_id, str) or not user_id:
+        raise ValueError("user_id 不能为空")
+    if not isinstance(slide_name, str) or not slide_name:
+        raise ValueError("slide_name 不能为空")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO slide_view_grants (slide_name, user_id, "
+                    "granted_by) VALUES (%s,%s,%s) ON CONFLICT "
+                    "(slide_name, user_id) DO NOTHING",
+                    (slide_name, user_id, granted_by or None),
+                )
+                inserted = cur.rowcount > 0
+                if not inserted:
+                    cur.execute(
+                        "SELECT extract(epoch from granted_at)::float8 AS "
+                        "granted_at FROM slide_view_grants "
+                        "WHERE slide_name=%s AND user_id=%s",
+                        (slide_name, user_id),
+                    )
+                    row = cur.fetchone()
+                else:
+                    row = {"granted_at": time.time()}
+        return {
+            "user_id": user_id,
+            "slide_name": slide_name,
+            "granted_by": granted_by or None,
+            "already_granted": not inserted,
+            "granted_at": row["granted_at"] if row else None,
+        }
+    finally:
+        conn.close()
+
+
+def revoke_slide_view(user_id, slide_name):
+    """收回 view 授权（幂等）。返回是否确有授权被移除。"""
+    if not isinstance(user_id, str) or not user_id:
+        raise ValueError("user_id 不能为空")
+    if not isinstance(slide_name, str) or not slide_name:
+        raise ValueError("slide_name 不能为空")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM slide_view_grants "
+                    "WHERE slide_name=%s AND user_id=%s",
+                    (slide_name, user_id),
+                )
+                return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def slide_view_grants_for_user(user_id):
+    """返回该主体被显式授权可见的切片名集合（无则空集）。"""
+    if not user_id:
+        return set()
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT slide_name FROM slide_view_grants WHERE user_id=%s",
+                    (user_id,),
+                )
+                return {r["slide_name"] for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+
+def list_slide_view_grants():
+    """返回全部 view 授权行（inventory 标注「是否已授权给 owner」用）。
+
+    行形态 {slide_name, user_id, granted_by, granted_at(epoch)}；按授权时间
+    降序。表不存在前（迁移未跑）调用方会拿到编程错误——ensure_schema 在
+    app 启动期 fail-fast，运行期表必然存在。
+    """
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT slide_name, user_id, granted_by, "
+                    "extract(epoch from granted_at)::float8 AS granted_at "
+                    "FROM slide_view_grants ORDER BY granted_at DESC, "
+                    "slide_name, user_id",
+                )
+                return [
+                    {
+                        "slide_name": r["slide_name"],
+                        "user_id": r["user_id"],
+                        "granted_by": r["granted_by"],
+                        "granted_at": r["granted_at"],
+                    }
+                    for r in cur.fetchall()
+                ]
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
 # 标注（rois）
 # --------------------------------------------------------------------------- #
 def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note="", visitor=None,

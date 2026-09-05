@@ -86,6 +86,9 @@ _BUSINESS_TABLES = (
     # 0017 起：Upload V2 分片任务（无 users 外键——owner_user_id 允许空，
     # 不随 users CASCADE 清空，必须显式列出，否则跨用例残留串数据）
     "upload_tasks",
+    # 0034 起：切片可见性显式授权（owner 读隔离的直授表；无外键，显式
+    # 列出防跨用例残留授权）
+    "slide_view_grants",
     # 0018 起：金额计费（admin-billing §6）。billing_price_books 的迁移
     # 种子会随 TRUNCATE 清掉——需要种子的用例用 tests/_billing_helpers
     # .seed_price_books() 幂等重放 migrations/0018_billing.sql +

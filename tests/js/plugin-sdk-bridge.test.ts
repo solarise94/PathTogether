@@ -240,6 +240,7 @@ describe("PluginPermissions.checkPermission", () => {
 		expect(PluginPermissions.METHOD_PERMISSIONS["selection.getBbox"]).toBe("slide:metadata:read");
 		expect(PluginPermissions.METHOD_PERMISSIONS["viewer.navigate"]).toBe("viewer:navigate");
 		expect(PluginPermissions.METHOD_PERMISSIONS["viewer.highlight"]).toBe("viewer:navigate");
+		expect(PluginPermissions.METHOD_PERMISSIONS["viewer.applyRenderContext"]).toBe("viewer:navigate");
 		expect(PluginPermissions.METHOD_PERMISSIONS["annotation.create"]).toBe("annotation:write");
 		expect(PluginPermissions.METHOD_PERMISSIONS["annotation.focus"]).toBe("viewer:navigate");
 	});

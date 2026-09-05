@@ -4156,7 +4156,8 @@
     // 修复）——插件脚本先于 app.js 加载并立即握手时，等这里的 onRequest 注册会先
     // 收到 unknown_method（demo 实测）。业务方法才走下方注册表。
     // Plugin→Host request（被 gate 的方法：slide.getCurrent / selection.getBbox /
-    // viewer.navigate / viewer.highlight / annotation.create / annotation.read / annotation.focus）
+    // viewer.navigate / viewer.highlight / viewer.applyRenderContext /
+    // annotation.create / annotation.read / annotation.focus）
     host.onRequest("slide.getCurrent", gate("slide.getCurrent", function () {
       if (!state.slide) return null;
       return { name: state.slide.name, width: state.slide.width, height: state.slide.height,
@@ -4166,19 +4167,100 @@
     host.onRequest("viewer.navigate", gate("viewer.navigate", function (p) {
       // AI goto/snapshot 跳转：level-0 bbox → viewport.fitBounds。
       // （文档 {x,y,level} 在本阶段以 level-0 bbox 表达，agent 全程在图像坐标系工作）
-      try {
-        if (viewer && viewer.viewport && p && p.x != null && p.w) {
-          viewer.viewport.fitBounds(
-            viewer.viewport.imageToViewportRectangle(p.x, p.y, p.w, p.h));
-        }
-      } catch (e) {}
+      // R1（2026-09-05）：viewer 未就绪/几何非法回真实 error code，不再吞异常
+      // 仍报 ok:true；请求携带 slide 标识且与当前切片不符（过期操作）时拒绝
+      // （宽容缺省：旧插件不带 slide 时不拒绝）。
+      p = p || {};
+      if (p.slide && state.slide && String(p.slide) !== String(state.slide.name)) {
+        throw { code: "stale_slide", message: "导航请求属于另一切片", retryable: false };
+      }
+      if (!viewer || !viewer.viewport) {
+        throw { code: "viewer_not_ready", message: "查看器未就绪", retryable: true };
+      }
+      var nx = Number(p.x), ny = Number(p.y), nw = Number(p.w), nh = Number(p.h);
+      if (!isFinite(nx) || !isFinite(ny) || !isFinite(nw) || !isFinite(nh) || nw <= 0 || nh <= 0) {
+        throw { code: "invalid_geometry", message: "导航几何非法", retryable: false };
+      }
+      viewer.viewport.fitBounds(
+        viewer.viewport.imageToViewportRectangle(nx, ny, nw, nh));
       return { ok: true };
     }));
     host.onRequest("viewer.highlight", gate("viewer.highlight", function (p) {
-      // 插件叠加层：写入平台 aiOverlay 并重绘画布（替代插件直接写 aiOverlay/redrawAnnoCanvas）
-      aiOverlay = Array.isArray(p && p.boxes) ? p.boxes : [];
+      // 插件叠加层：写入平台 aiOverlay 并重绘画布（替代插件直接写 aiOverlay/redrawAnnoCanvas）。
+      // R1：逐框几何校验，非法回 invalid_geometry；slide 标识不符拒绝过期画框
+      // （宽容缺省：旧插件不带时不拒绝）。
+      p = p || {};
+      if (p.slide && state.slide && String(p.slide) !== String(state.slide.name)) {
+        throw { code: "stale_slide", message: "画框请求属于另一切片", retryable: false };
+      }
+      var boxes = Array.isArray(p.boxes) ? p.boxes : [];
+      for (var bi = 0; bi < boxes.length; bi++) {
+        var bb = boxes[bi] || {};
+        var bx = Number(bb.x), by = Number(bb.y), bw = Number(bb.w), bh = Number(bb.h);
+        if (!isFinite(bx) || !isFinite(by) || !isFinite(bw) || !isFinite(bh) || bw <= 0 || bh <= 0) {
+          throw { code: "invalid_geometry", message: "叠加框几何非法", retryable: false };
+        }
+      }
+      aiOverlay = boxes;
       redrawAnnoCanvas();
       return { ok: true };
+    }));
+    // 升级 E §8.2-3：历史配色恢复——插件把已持久化的 wire render_context
+    //（通道配置，无短期令牌）发回平台，由平台现有通道控制器经公开 setter
+    // 应用并按既有管线刷新显示令牌（只作用于人眼 Viewer，不触碰模型绑定）。
+    // 校验：slide 匹配、fingerprint 形态、通道 1..8、index/颜色合法；不通过
+    // 回 {ok:true, applied:false}，插件侧据此显示「历史配色未知」，不伪称一致。
+    host.onRequest("viewer.applyRenderContext", gate("viewer.applyRenderContext", function (p) {
+      p = p || {};
+      if (p.slide && state.slide && String(p.slide) !== String(state.slide.name)) {
+        throw { code: "stale_slide", message: "配色恢复请求属于另一切片", retryable: false };
+      }
+      var ctx = p.render_context;
+      if (!ctx || !ctx.fingerprint || !Array.isArray(ctx.active_channels) || !ctx.active_channels.length) {
+        return { ok: true, applied: false, reason: "no_context" };
+      }
+      if (!/^[0-9a-f]{64}$/i.test(String(ctx.fingerprint))) {
+        return { ok: true, applied: false, reason: "bad_fingerprint" };
+      }
+      var chans = ctx.active_channels;
+      if (chans.length > 8) return { ok: true, applied: false, reason: "too_many_channels" };
+      for (var ci = 0; ci < chans.length; ci++) {
+        var ch = chans[ci] || {};
+        if (!Number.isInteger(ch.index) || ch.index < 0) return { ok: true, applied: false, reason: "bad_channel" };
+        if (typeof ch.color !== "string" || !/^#[0-9a-fA-F]{6}$/.test(ch.color)) {
+          return { ok: true, applied: false, reason: "bad_color" };
+        }
+      }
+      if (!channelCtrl || !channelCtrl.isMultichannel || !channelCtrl.isMultichannel()) {
+        return { ok: true, applied: false, reason: "not_multichannel" };
+      }
+      // 平台当前显示已是同一 context（fingerprint 一致）→ 无需恢复。
+      var curFp = (channelCtrl.getFingerprint && channelCtrl.getFingerprint()) || null;
+      if (curFp && String(curFp).toLowerCase() === String(ctx.fingerprint).toLowerCase()) {
+        return { ok: true, applied: false, reason: "already_current" };
+      }
+      var wanted = {};
+      chans.forEach(function (ch) { wanted[ch.index] = ch; });
+      // 应用顺序（受服务端 1..8 约束）：先关掉不在目标的通道（至少保留 1 个，
+      // 剩余的等目标通道激活后再关），再激活目标通道，最后逐通道套历史颜色
+      //（经 setChannelColor 的 hex 校验）。任一通道被平台拒绝即视为未完全
+      // 应用 → 插件侧显示「历史配色未知」，不伪称一致。
+      var applied = true;
+      (channelCtrl.selection || []).slice().forEach(function (idx) {
+        if (!wanted[idx] && (channelCtrl.selection || []).length > 1) {
+          if (!channelCtrl.setChannelActive(idx, false)) applied = false;
+        }
+      });
+      chans.forEach(function (ch) {
+        if (!channelCtrl.setChannelActive(ch.index, true)) applied = false;
+      });
+      (channelCtrl.selection || []).slice().forEach(function (idx) {
+        if (!wanted[idx] && !channelCtrl.setChannelActive(idx, false)) applied = false;
+      });
+      chans.forEach(function (ch) {
+        if (!channelCtrl.setChannelColor(ch.index, ch.color)) applied = false;
+      });
+      return { ok: true, applied: applied };
     }));
     // Stage 5-2：通用 SDK 插件经 bridge 创建测试标注。gate 后复用平台现有
     // /api/annotation POST 路径（rect 类型，payload 带 slide/x/y/side_px/label=text），

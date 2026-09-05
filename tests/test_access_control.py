@@ -53,6 +53,13 @@ def _isolate(monkeypatch):
     for child in up_dir.iterdir():
         if child.is_file():
             child.unlink()
+    # 升级 C（§6.4）：分享 ROI 写入现在在服务端复核可信 MPP（preset 预设）与
+    # 真实切片边界。本模块的测试切片是字节 stub（打不开、无 MPP），而用例的
+    # 被测对象是鉴权/访客身份而非尺寸复核——注入与 _valid_roi_body 一致的
+    # 可信元数据（100000² @ mpp 60µm/px → side 100px = 6.0mm 预设）。
+    monkeypatch.setattr(
+        share_srv, "_slide_dims_and_mpp",
+        lambda safe: (100000, 100000, 60.0, 60.0))
     yield
 
 # --------------------------------------------------------------------------- #

@@ -35,6 +35,7 @@ from openslide import OpenSlide
 from openslide.deepzoom import DeepZoomGenerator
 
 import share_store
+import share_shared
 import slide_cache
 import slide_io
 # 多通道伪彩渲染（规格 §7.1 共享模块）：颜色/签名/校验算法全部在
@@ -653,6 +654,112 @@ def _share_has_annotate(share):
 
 
 # --------------------------------------------------------------------------- #
+# 升级 C（§6.4）：分享矩形策略（rect_policy）与真实几何校验
+# --------------------------------------------------------------------------- #
+#: preset_only 尺寸复核容差（比例）：服务端按可信 MPP 反算 mm 与自报 size_mm
+#: 比较，四舍五入像素误差在该容差内接受。
+_PRESET_MM_TOLERANCE = 0.02
+
+
+def _slide_dims_and_mpp(safe):
+    """读切片 level-0 尺寸与 MPP（读元数据，不解码像素）。
+
+    返回 (width, height, mpp_x, mpp_y)；任一不可读以 None 占位。
+    """
+    entry = _get_slide(safe)
+    try:
+        def _read(pair):
+            meta = _read_metadata(pair["osr"], UPLOAD_DIR / safe)
+            return (pair["osr"].dimensions, meta.get("mpp_x"),
+                    meta.get("mpp_y"))
+
+        (dims, mpp_x, mpp_y), _gen = slide_cache.read_stable(entry, _read)
+        def _finite(v):
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return None
+            return f if f == f and f not in (float("inf"), float("-inf")) \
+                and f > 0 else None
+        return (dims[0], dims[1], _finite(mpp_x), _finite(mpp_y))
+    except Exception:  # noqa: BLE001 - 读失败按缺尺寸/MPP 降级
+        return None, None, None, None
+
+
+def _rect_policy_of(share):
+    """分享 rect_policy（§6.4）：旧分享缺字段一律 preset_only。"""
+    return share_shared._share_rect_policy(share)
+
+
+def _reject_preset_rect(share, safe, geom):
+    """preset_only 分享的 rect 新增校验（§6.4，不能只查自报 size_mm=6）。
+
+    要求：
+      1. size_mm ∈ 该分享 roi_sizes 子集；
+      2. 几何必须是正方形（成对 w/h 相等，或旧 side_px）；
+      3. 切片有可信 MPP，且 side_px 反算的物理边长与 size_mm 一致（±2%）
+         ——防「自报 6mm 实画 60mm」绕过预设子集。
+
+    返回 None（通过）或 (message, http_status)。
+    """
+    allowed = share.get("roi_sizes") or list(share_store.DEFAULT_ROI_SIZES)
+    size_mm_v = geom.get("size_mm")
+    try:
+        smm = float(size_mm_v)
+    except (TypeError, ValueError):
+        smm = None
+    if smm is None or smm not in allowed:
+        label_str = " / ".join(_fmt_mm(v) for v in allowed)
+        return ("本次分享仅允许 " + label_str + " mm 标记", 403)
+    eff_w = geom.get("w")
+    eff_h = geom.get("h")
+    if eff_w is None or eff_h is None:
+        side = geom.get("side_px")
+        eff_w = side
+        eff_h = side
+    return _reject_preset_rect_mm(share, safe, eff_w, eff_h, declared_mm=smm)
+
+
+def _reject_preset_rect_mm(share, safe, w, h, declared_mm=None):
+    """preset_only 的真实几何校验：正方形 + 可信 MPP 反算 mm ∈ roi_sizes。
+
+    编辑路径用本函数（无需客户端 size_mm；按真实几何反算）。declared_mm
+    提供时（新增路径）还要求反算值与自报值一致。
+    返回 None（通过）或 (message, http_status)。
+    """
+    try:
+        w_i, h_i = int(w), int(h)
+    except (TypeError, ValueError):
+        return ("矩形几何非法", 400)
+    if w_i != h_i:
+        return ("本次分享仅允许正方形预设标记（6/6.5mm），不支持自定义矩形", 403)
+    allowed = [float(v) for v in
+               (share.get("roi_sizes") or list(share_store.DEFAULT_ROI_SIZES))]
+    label_str = " / ".join(_fmt_mm(v) for v in allowed)
+    _w, _h, mpp_x, _mpp_y = _slide_dims_and_mpp(safe)
+    if not mpp_x:
+        return ("该切片缺少可信 MPP，无法核验预设尺寸；请在主站校准后重试", 403)
+    real_mm = w_i * mpp_x / 1000.0
+    if declared_mm is not None:
+        smm = float(declared_mm)
+        if abs(real_mm - smm) > max(smm * _PRESET_MM_TOLERANCE, 0.01):
+            return ("标记实际尺寸（%.2fmm）与所选预设（%s mm）不符"
+                    % (real_mm, label_str), 403)
+        return None
+    for v in allowed:
+        if abs(real_mm - v) <= max(v * _PRESET_MM_TOLERANCE, 0.01):
+            return None
+    return ("标记实际尺寸（%.2fmm）不在本次分享允许的预设（%s mm）内"
+            % (real_mm, label_str), 403)
+
+
+def _reject_rect_out_of_bounds(safe, x, y, w, h):
+    """rect 写入的真实切片边界校验（§6.3-4，分享端路径入口）。None 或 message。"""
+    width, height, _mpp_x, _mpp_y = _slide_dims_and_mpp(safe)
+    return share_shared._validate_rect_bounds(x, y, w, h, width, height)
+
+
+# --------------------------------------------------------------------------- #
 # Stage 3c-2：分享访问日志 + 归档只读（docs §5.4/§v1.5）
 # --------------------------------------------------------------------------- #
 # 分享访问日志：/s/<token> 页面加载与 /s/<token>/api/* 关键调用记 audit
@@ -835,7 +942,11 @@ def share_config(token):
     旧分享无 roi_sizes 字段时默认两者皆可。
     """
     share = _require_share(token)
-    return jsonify({"roi_sizes": share.get("roi_sizes") or list(share_store.DEFAULT_ROI_SIZES)})
+    return jsonify({
+        "roi_sizes": share.get("roi_sizes") or list(share_store.DEFAULT_ROI_SIZES),
+        # 升级 C（§6.4）：矩形策略档位；旧分享缺字段按 preset_only 解释
+        "rect_policy": share_shared._share_rect_policy(share),
+    })
 
 
 @app.errorhandler(slide_cache.SlideFileChanged)
@@ -1005,11 +1116,15 @@ def share_slide_crop(token, name):
     """crop PNG 导出（分享端）。
 
     P0-A §3.5：与主站 /api/slide/<name>/crop 共用 crop_guard（同一实现，
-    防两份逻辑漂移）。read_region 之前按 clamp 后实际 size2² 过三道闸：
+    防两份逻辑漂移）。read_region 之前按实际 w×h 过三道闸：
     像素硬闸 413 / 每分钟像素预算 429（按 share capability 即 token 计）/
     并发闸 429；任何解码前拒绝。分享端无需登录，闸主体是 token。
     Batch 3（§6.3/§7.4）：接受 ``?render=<token>``；像素预算按真实成本×
     启用通道数计；下载文件名加入 render fingerprint 前 8 位（§4.4）。
+    升级 C（§6.3-5，E06 收窄口径）：本端点不受 roi_sizes 约束（roi_sizes
+    只管 ROI 写入）；支持 ``?x&y&w&h`` 通用矩形——输出 PNG 尺寸精确等于
+    请求合法 w/h（不 clamp）；``size`` 与 ``w/h`` 混用冲突 400；旧 ``size``
+    走兼容正方形分支（保留 clamp 语义）。
     """
     share = _require_share(token)
     safe = _require_slide(share, name)
@@ -1017,18 +1132,40 @@ def share_slide_crop(token, name):
     render_tok = request.args.get("render") or ""
 
     def _parse_int(key):
+        raw = request.args.get(key)
+        if raw is None or raw == "":
+            return None
         try:
-            return int(request.args.get(key, ""))
+            return int(raw)
         except (TypeError, ValueError):
             return None
 
     x = _parse_int("x")
     y = _parse_int("y")
     size = _parse_int("size")
-    if x is None or y is None or size is None:
-        return jsonify(error="x/y/size 参数需为整数"), 400
-    if x < 0 or y < 0 or size <= 0 or size > 40000:
-        return jsonify(error="参数越界（0<=x,y，0<size<=40000）"), 400
+    w = _parse_int("w")
+    h = _parse_int("h")
+    if x is None or y is None:
+        return jsonify(error="x/y 参数需为整数"), 400
+    if x < 0 or y < 0:
+        return jsonify(error="参数越界（0<=x,y）"), 400
+    has_size = size is not None
+    has_pair = w is not None or h is not None
+    if has_size and has_pair:
+        return jsonify(error="size 与 w/h 参数冲突，二者只能选其一"), 400
+    if has_pair:
+        if w is None or h is None:
+            return jsonify(error="w/h 参数需成对提供"), 400
+        if w < 1 or h < 1 or w > 40000 or h > 40000:
+            return jsonify(error="参数越界（0<=x,y，1<=w,h<=40000）"), 400
+        square = (w == h)
+    else:
+        if size is None:
+            return jsonify(error="缺少 size 或 w/h 参数"), 400
+        if size <= 0 or size > 40000:
+            return jsonify(error="参数越界（0<=x,y，0<size<=40000）"), 400
+        w = h = size
+        square = True
 
     with slide_cache.borrow_pair(entry) as pair:
         # context 解析在解码前（§7.4）；失败 → 稳定 4xx/409
@@ -1040,16 +1177,23 @@ def share_slide_crop(token, name):
             return _render_error(e)
         osr = _region_view(pair, ctx, fp)
         width, height = osr.dimensions
-        x2 = min(x, max(0, width - 1))
-        y2 = min(y, max(0, height - 1))
-        max_w = max(0, width - x2)
-        max_h = max(0, height - y2)
-        size2 = min(size, max_w, max_h)
-        if size2 <= 0:
-            return jsonify(error="裁剪区域超出图像边界"), 400
-        # 像素硬闸：clamp 后实际值，任何解码前拒绝（docs §3.5）
+        if square:
+            # 旧 size 兼容正方形分支：clamp 到图像边界（独立保留，§6.2）
+            x2 = min(x, max(0, width - 1))
+            y2 = min(y, max(0, height - 1))
+            max_w = max(0, width - x2)
+            max_h = max(0, height - y2)
+            w2 = h2 = min(w, max_w, max_h)
+            if w2 <= 0:
+                return jsonify(error="裁剪区域超出图像边界"), 400
+        else:
+            # v2 矩形：不 clamp——输出尺寸精确等于合法 w/h，出界直接拒绝
+            if x + w > width or y + h > height:
+                return jsonify(error="裁剪区域超出图像边界（w/h 不做自动裁剪）"), 400
+            x2, y2, w2, h2 = x, y, w, h
+        # 像素硬闸：真实 w*h，任何解码前拒绝（docs §3.5 / §6.2）
         try:
-            crop_guard.check_pixel_limit(size2, size2)
+            crop_guard.check_pixel_limit(w2, h2)
         except crop_guard.CropTooLargeError as e:
             return jsonify(error=str(e), code=e.code,
                            max_pixels=crop_guard.CROP_MAX_PIXELS), 413
@@ -1057,7 +1201,7 @@ def share_slide_crop(token, name):
         # 真实成本 = 像素量 × 启用通道数（§7.4）
         n_channels = len(ctx.get("active_channels") or ()) if ctx else 1
         allowed, retry_after = crop_guard.admit_pixels(
-            token, size2 * size2 * max(1, n_channels))
+            token, w2 * h2 * max(1, n_channels))
         if not allowed:
             resp = jsonify(error="crop 请求过于频繁，请稍后重试",
                            code="crop_rate_limited", retry_after=retry_after)
@@ -1068,7 +1212,7 @@ def share_slide_crop(token, name):
             return jsonify(error="crop 并发已达上限，请稍后重试",
                            code="crop_busy"), 429
         try:
-            region = osr.read_region((x2, y2), 0, (size2, size2)).convert("RGB")
+            region = osr.read_region((x2, y2), 0, (w2, h2)).convert("RGB")
         finally:
             crop_guard.release_slot(slot)
 
@@ -1079,7 +1223,11 @@ def share_slide_crop(token, name):
     stem = Path(safe).stem
     fp_suffix = ("_%s" % str(fp)[:8]) \
         if (_multichannel_enabled() and fp) else ""
-    download_name = "%s_%d_%d_%dpx%s.png" % (stem, x2, y2, size2, fp_suffix)
+    if w2 == h2:
+        download_name = "%s_%d_%d_%dpx%s.png" % (stem, x2, y2, w2, fp_suffix)
+    else:
+        download_name = "%s_x%d_y%d_%dx%dpx%s.png" % (
+            stem, x2, y2, w2, h2, fp_suffix)
     return send_file(
         buf,
         mimetype="image/png",
@@ -1144,25 +1292,35 @@ def share_roi_add(token):
     if _reject_archived_slide(share, safe):
         return jsonify(error="切片已归档只读"), 403
 
-    # 收集几何字段透传给 store 校验
+    # 收集几何字段透传给 store 校验。升级 C：rect 增加成对 w/h（v2）。
     geom = {}
-    for k in ("x", "y", "side_px", "size_mm", "x1", "y1", "x2", "y2", "points"):
+    for k in ("x", "y", "w", "h", "side_px", "size_mm", "x1", "y1", "x2", "y2",
+              "points"):
         if k in body:
             geom[k] = body[k]
 
-    # rect（含未指定默认 rect）需校验 size_mm ∈ 本次分享允许的尺寸子集；
-    # arrow / freehand 不受限。
+    # rect（含未指定默认 rect）需通过分享矩形策略 + 真实几何 + 可信 MPP 校验
+    # （§6.4：服务端不能只查客户端自报 size_mm=6；roi_sizes 只作用于
+    # preset_only 档，custom 档允许任意宽高但仍受几何/边界校验）。
     if typ == "rect":
-        allowed = share.get("roi_sizes") or list(share_store.DEFAULT_ROI_SIZES)
-        size_mm_v = geom.get("size_mm")
+        if _rect_policy_of(share) != "custom":
+            reject = _reject_preset_rect(share, safe, geom)
+            if reject is not None:
+                return jsonify(error=reject[0]), reject[1]
+        # 真实切片边界校验（不静默裁剪；store 纯数值校验之外的第二道）
         try:
-            smm = float(size_mm_v)
+            eff_w = int(geom.get("w") if geom.get("w") is not None
+                        else geom.get("side_px"))
+            eff_h = int(geom.get("h") if geom.get("h") is not None
+                        else geom.get("side_px"))
+            eff_x = int(geom.get("x"))
+            eff_y = int(geom.get("y"))
         except (TypeError, ValueError):
-            smm = None
-        if smm is None or smm not in allowed:
-            # 允许值拼接到友好的提示（如 "6 / 6.5"）
-            label_str = " / ".join(_fmt_mm(v) for v in allowed)
-            return jsonify(error="本次分享仅允许 " + label_str + " mm 标记"), 403
+            eff_w = eff_h = None
+        if eff_w is not None:
+            msg = _reject_rect_out_of_bounds(safe, eff_x, eff_y, eff_w, eff_h)
+            if msg:
+                return jsonify(error=msg), 400
 
     # note 可选（备注文本），透传给 store 校验/清洗
     note = body.get("note", "")
@@ -1206,6 +1364,25 @@ def share_roi_update(token, index):
         return jsonify(error="只能编辑自己创建的标记"), 403
     if _reject_archived_slide(share, r.get("slide")):
         return jsonify(error="切片已归档只读"), 403
+    # 升级 C（§6.4）：rect 几何编辑在服务端复核生效几何——
+    #   - preset_only 分享：编辑后仍须是 roi_sizes 预设正方形（真实几何 + 可信
+    #     MPP 反算，两条路径一致，不允许编辑绕过）；
+    #   - 真实切片边界校验（不静默裁剪）；
+    #   - 旧客户端只给 side_px 编辑 v2 非正方形 → 400（需升级后以 w/h 编辑）。
+    if geom is not None and (r.get("type") or "rect") == "rect":
+        safe_name = r.get("slide") or ""
+        try:
+            eff = share_shared._effective_rect_geometry(r, geom)
+        except ValueError as e:
+            return jsonify(error=str(e)), 400
+        if _rect_policy_of(share) != "custom":
+            reject = _reject_preset_rect_mm(share, safe_name, eff["w"], eff["h"])
+            if reject is not None:
+                return jsonify(error=reject[0]), reject[1]
+        msg = _reject_rect_out_of_bounds(
+            safe_name, eff["x"], eff["y"], eff["w"], eff["h"])
+        if msg:
+            return jsonify(error=msg), 400
     try:
         updated = share_store.update_roi(
             token, index, geom=geom, note=note, expected_revision=expected)

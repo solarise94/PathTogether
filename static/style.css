@@ -1095,6 +1095,65 @@ button {
 #roi-box .roi-corner.tr { top: -5px; right: -5px; }
 #roi-box .roi-corner.bl { bottom: -5px; left: -5px; }
 #roi-box .roi-corner.br { bottom: -5px; right: -5px; }
+/* 升级 C（§6.1）：四角（双轴）+ 四边中点（单轴）手柄 */
+#roi-box .roi-handle {
+  position: absolute;
+  width: 12px; height: 12px;
+  background: #FFD700;
+  border: 1.5px solid #fff;
+  border-radius: 2px;
+  box-shadow: 0 0 4px rgba(0, 0, 0, 0.4);
+  z-index: 1;
+}
+#roi-box .roi-handle.roi-tl { top: -6px; left: -6px; cursor: nwse-resize; }
+#roi-box .roi-handle.roi-tr { top: -6px; right: -6px; cursor: nesw-resize; }
+#roi-box .roi-handle.roi-bl { bottom: -6px; left: -6px; cursor: nesw-resize; }
+#roi-box .roi-handle.roi-br { bottom: -6px; right: -6px; cursor: nwse-resize; }
+#roi-box .roi-handle.roi-t { top: -6px; left: 50%; margin-left: -6px; cursor: ns-resize; }
+#roi-box .roi-handle.roi-b { bottom: -6px; left: 50%; margin-left: -6px; cursor: ns-resize; }
+#roi-box .roi-handle.roi-l { left: -6px; top: 50%; margin-top: -6px; cursor: ew-resize; }
+#roi-box .roi-handle.roi-r { right: -6px; top: 50%; margin-top: -6px; cursor: ew-resize; }
+/* 矩形工具入口 + 紧凑设置区（宽/高/单位/锁比例/预设） */
+.roi-rect-wrap { display: inline-flex; align-items: center; gap: 4px; }
+.roi-rect-btn.active { color: var(--accent); }
+.roi-settings {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 9px;
+  background: var(--seg-bg, rgba(0,0,0,0.05));
+  font-size: 12px;
+}
+.roi-settings[hidden] { display: none; }
+.roi-set-field { display: inline-flex; align-items: center; gap: 3px; color: var(--text-2, inherit); }
+.roi-settings .roi-num {
+  width: 68px;
+  height: 26px;
+  padding: 0 5px;
+  border: 1px solid rgba(0,0,0,0.15);
+  border-radius: 6px;
+  font-size: 12px;
+  background: transparent;
+  color: inherit;
+}
+.roi-settings .roi-unit,
+.roi-settings .roi-preset {
+  height: 26px;
+  border: 1px solid rgba(0,0,0,0.12);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+}
+.roi-set-lock {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+  color: var(--text-2, inherit);
+  white-space: nowrap;
+}
 #roi-box .roi-label {
   position: absolute;
   top: -24px;

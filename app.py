@@ -54,6 +54,7 @@ from PIL import Image
 import requests
 
 import share_store
+import share_shared
 import slide_cache
 import slide_io
 # 多通道伪彩渲染（规格 §7.1 共享模块）：manifest / canonical context /
@@ -1346,11 +1347,17 @@ def _region_view(pair, ctx, fp):
     return slide_render.RenderedSlideView(pair["osr"], ctx, fingerprint=fp)
 
 
-def _crop_download_name(safe, x2, y2, size2, fp):
-    """crop 下载文件名：带 render fingerprint 前 8 位（§4.4）。"""
+def _crop_download_name(safe, x2, y2, w2, h2, fp=None):
+    """crop 下载文件名：带 render fingerprint 前 8 位（§4.4）。
+
+    升级 C（§6.3-5）：非正方形输出名含宽高 ``_{w}x{h}px``；正方形保持旧
+    ``_{size}px`` 命名（与既有 Content-Disposition 兼容）。
+    """
     stem = Path(safe).stem
     suffix = ("_%s" % str(fp)[:8]) if fp else ""
-    return "%s_%d_%d_%dpx%s.png" % (stem, x2, y2, size2, suffix)
+    if w2 == h2:
+        return "%s_%d_%d_%dpx%s.png" % (stem, x2, y2, w2, suffix)
+    return "%s_x%d_y%d_%dx%dpx%s.png" % (stem, x2, y2, w2, h2, suffix)
 
 
 # --------------------------------------------------------------------------- #
@@ -1627,6 +1634,74 @@ def _rect_size_mm(safe, side_px):
     return 0.0
 
 
+def _rect_dims_size_mm(safe, w, h):
+    """v2 矩形的 size_mm 兼容值：仅真正方形给换算值；非正方形 0.0（§6.3）。
+
+    size_mm 是单值展示附属信息，非正方形不得用单值冒充宽高（width_mm/
+    height_mm 才是分轴展示口径，需要时由前端按 mpp_x/mpp_y 反算）。
+    """
+    try:
+        if w is not None and h is not None and int(w) == int(h):
+            return _rect_size_mm(safe, int(w))
+    except (TypeError, ValueError):
+        pass
+    return 0.0
+
+
+def _parse_rect_request_geom(body):
+    """解析请求 body 的 rect 几何形态（升级 C §6.3-2）。
+
+    返回 (x, y, w, h, side_px, err)：
+      - v2：成对 width/height_px（w/h）→ (x, y, w, h, None, None)；
+      - v1 兼容：只有 side_px → (x, y, side, side, side, None)；
+      - w/h 与 side_px 同给：仅一致正方形接受（side_px 归一进返回值）；
+      - 只给 w/h 其一、或矛盾组合 → err 为错误 message。
+    """
+    def _num(key):
+        v = body.get(key)
+        if v is None or v == "":
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        # NaN/Infinity 不在此过滤：交由 _validate_annotation_rect 统一产出
+        # 「需为有限数值」的可修正错误（与旧实现报错口径一致）
+        return f
+
+    x = _num("x")
+    y = _num("y")
+    if x is None or y is None:
+        return None, None, None, None, None, "x/y 参数需为数值"
+    w_raw = body.get("w", body.get("width_px"))
+    h_raw = body.get("h", body.get("height_px"))
+
+    def _int_or_none(key, v):
+        if v is None or v == "":
+            return None
+        try:
+            return int(float(v))
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    w = _int_or_none("w", w_raw)
+    h = _int_or_none("h", h_raw)
+    side = _int_or_none("side_px", body.get("side_px"))
+    has_pair = w is not None or h is not None
+    if has_pair:
+        if w is None or h is None:
+            return (None, None, None, None, None,
+                    "w/h（width_px/height_px）需成对提供")
+        if side is not None and not (side == w and side == h):
+            return (None, None, None, None, None,
+                    "side_px 与 w/h 冲突（矛盾几何）")
+        return x, y, w, h, (side if side is not None else None), None
+    if side is not None:
+        return x, y, side, side, side, None
+    return None, None, None, None, None, (
+        "rect 需成对 w/h（新接口）或 side_px（旧正方形兼容）")
+
+
 # --------------------------------------------------------------------------- #
 # AI 正式标注切片几何校验（docs/ai-viewport-observation-annotation-fix-plan.md
 # §6.1 / §9 批次 C 第 3 项）：/internal/ai/annotate 与
@@ -1661,14 +1736,13 @@ def _annotation_slide_bounds(safe):
     return None, None
 
 
-def _validate_annotation_rect(safe, x, y, side_px):
-    """AI 正式标注（正方形 rect）的统一切片几何校验（§6.1）。
+def _validate_annotation_rect(safe, x, y, w, h=None):
+    """正式标注矩形的统一切片几何校验（升级 C §6.2/§6.3-4，通用矩形）。
 
-    规则（/internal/ai/annotate 与 plugin v1 annotate 共用）：
-      - x/y 为有限数且 ≥0；side_px 为有限数且在 1..40000；
-      - x + side_px ≤ slide_width、y + side_px ≤ slide_height
-        （矩形右/下边界不得越出切片 level-0 边界；正方形时 x+side_px /
-        y+side_px 与 §6.1 的 x+w / y+h 同理）。
+    规则（/internal/ai/annotate、plugin v1 annotate 与 /api/annotation 共用）：
+      - x/y 为有限数且 ≥0；w/h 为有限数且在 1..40000（正方形调用 w=h=side_px）；
+      - x + w ≤ slide_width、y + h ≤ slide_height
+        （矩形右/下边界不得越出切片 level-0 边界）。
 
     返回 None 表示通过；否则返回 (message, details)：message 指明哪条边越界、
     超出多少与切片 level-0 尺寸，details 供 plugin v1 错误信封附带结构化字段。
@@ -1677,24 +1751,26 @@ def _validate_annotation_rect(safe, x, y, side_px):
     切片尺寸读不到（文件损坏/测试桩）时不做包含校验，与 _rect_size_mm 读不
     到 mpp 返回 0 的降级语义一致；有限性/范围校验不依赖切片尺寸，恒定执行。
     """
+    if h is None:
+        h = w  # 旧正方形调用形态兜底
     # 1) 有限性与范围（不依赖切片尺寸）
-    for name, v in (("x", x), ("y", y), ("side_px", side_px)):
+    for name, v in (("x", x), ("y", y), ("w", w), ("h", h)):
         if not isinstance(v, (int, float)) or isinstance(v, bool) \
                 or not math.isfinite(v):
-            return ("x/y/side_px 需为有限数值（%s=%r 非法）" % (name, v),
+            return ("x/y/w/h 需为有限数值（%s=%r 非法）" % (name, v),
                     {"field": name, "value": v})
     if x < 0 or y < 0:
         return ("坐标需 ≥0（x=%s, y=%s）" % (_fmt_level0(x), _fmt_level0(y)),
                 {"x": x, "y": y})
-    if side_px < 1 or side_px > _ANNOTATION_MAX_SIDE_PX:
-        return ("side_px 需在 1~%d 之间（当前 %s）"
-                % (_ANNOTATION_MAX_SIDE_PX, _fmt_level0(side_px)),
-                {"side_px": side_px})
-    # 2) 切片右/下边界包含校验（§6.1）
+    if w < 1 or h < 1 or w > _ANNOTATION_MAX_SIDE_PX or h > _ANNOTATION_MAX_SIDE_PX:
+        return ("w/h 需在 1~%d 之间（当前 %s×%s）"
+                % (_ANNOTATION_MAX_SIDE_PX, _fmt_level0(w), _fmt_level0(h)),
+                {"w": w, "h": h})
+    # 2) 切片右/下边界包含校验（§6.2）
     slide_w, slide_h = _annotation_slide_bounds(safe)
     if slide_w is None:
         return None  # 尺寸不可读 → 不做包含校验（见 docstring 降级语义）
-    right, bottom = x + side_px, y + side_px
+    right, bottom = x + w, y + h
     edges = []
     overshoot = {}
     if right > slide_w:
@@ -1707,21 +1783,21 @@ def _validate_annotation_rect(safe, x, y, side_px):
         return None
     parts = []
     if "right" in edges:
-        parts.append("右边界越界：x + side_px = %s > 切片宽 %s（超出 %s 像素）"
+        parts.append("右边界越界：x + w = %s > 切片宽 %s（超出 %s 像素）"
                      % (_fmt_level0(right), _fmt_level0(slide_w),
                         _fmt_level0(overshoot["right"])))
     if "bottom" in edges:
-        parts.append("下边界越界：y + side_px = %s > 切片高 %s（超出 %s 像素）"
+        parts.append("下边界越界：y + h = %s > 切片高 %s（超出 %s 像素）"
                      % (_fmt_level0(bottom), _fmt_level0(slide_h),
                         _fmt_level0(overshoot["bottom"])))
     msg = ("标注矩形越出切片边界，已拒绝（不自动裁剪）：%s。切片 level-0 尺寸 "
-           "%s×%s，提交 x=%s, y=%s, side_px=%s；请修正坐标后重试。"
+           "%s×%s，提交 x=%s, y=%s, w=%s, h=%s；请修正坐标后重试。"
            % ("；".join(parts), _fmt_level0(slide_w), _fmt_level0(slide_h),
-              _fmt_level0(x), _fmt_level0(y), _fmt_level0(side_px)))
+              _fmt_level0(x), _fmt_level0(y), _fmt_level0(w), _fmt_level0(h)))
     details = {
         "edges": edges,
         "overshoot_px": overshoot,
-        "submitted": {"x": x, "y": y, "side_px": side_px},
+        "submitted": {"x": x, "y": y, "w": w, "h": h},
         "slide_level0": {"width": slide_w, "height": slide_h},
     }
     return msg, details
@@ -8710,12 +8786,15 @@ def api_slide_tile(name, level, x, y):
 def api_slide_crop(name):
     """裁剪 level-0 原始像素区域的 PNG 图像并下载。Stage 3a-2a：can_view_slide。
 
-    P0-A §3.5：read_region 之前按 clamp 后实际 size2² 过 crop_guard 三道闸
+    P0-A §3.5：read_region 之前过 crop_guard 三道闸
     （像素硬闸 413 / 每分钟像素预算 429 / 并发闸 429），任何解码前拒绝。
     预算按 user_id 计（本地免登录统一 "local" 主体）。
     Batch 3（§6.3/§7.4）：接受 ``?render=<token>``（缺省用默认 context）；
     像素预算按**真实成本×启用通道数**计（8 通道不能当 1 通道计费）；下载
     文件名加入 render fingerprint 前 8 位（§4.4）。
+    升级 C（§6.3-5）：支持 ``?x&y&w&h`` 通用矩形——输出 PNG 尺寸精确等于
+    请求合法 w/h（不 clamp）；``size`` 与 ``w/h`` 混用冲突 400；旧 ``size``
+    走兼容正方形分支（保留既有 clamp 语义，独立于新矩形路径）。
     """
     if not can_view_slide(name):
         return _denied()
@@ -8724,18 +8803,40 @@ def api_slide_crop(name):
     token = request.args.get("render") or ""
 
     def _parse_int(key):
+        raw = request.args.get(key)
+        if raw is None or raw == "":
+            return None
         try:
-            return int(request.args.get(key, ""))
+            return int(raw)
         except (TypeError, ValueError):
             return None
 
     x = _parse_int("x")
     y = _parse_int("y")
     size = _parse_int("size")
-    if x is None or y is None or size is None:
-        return jsonify(error="x/y/size 参数需为整数"), 400
-    if x < 0 or y < 0 or size <= 0 or size > 40000:
-        return jsonify(error="参数越界（0<=x,y，0<size<=40000）"), 400
+    w = _parse_int("w")
+    h = _parse_int("h")
+    if x is None or y is None:
+        return jsonify(error="x/y 参数需为整数"), 400
+    if x < 0 or y < 0:
+        return jsonify(error="参数越界（0<=x,y）"), 400
+    has_size = size is not None
+    has_pair = w is not None or h is not None
+    if has_size and has_pair:
+        return jsonify(error="size 与 w/h 参数冲突，二者只能选其一"), 400
+    if has_pair:
+        if w is None or h is None:
+            return jsonify(error="w/h 参数需成对提供"), 400
+        if w < 1 or h < 1 or w > 40000 or h > 40000:
+            return jsonify(error="参数越界（0<=x,y，1<=w,h<=40000）"), 400
+        square = (w == h)
+    else:
+        if size is None:
+            return jsonify(error="缺少 size 或 w/h 参数"), 400
+        if size <= 0 or size > 40000:
+            return jsonify(error="参数越界（0<=x,y，0<size<=40000）"), 400
+        w = h = size
+        square = True
 
     subject = _current_uid() or "local"
     with slide_cache.borrow_pair(entry) as pair:
@@ -8748,17 +8849,23 @@ def api_slide_crop(name):
             return _render_error_response(e)
         osr = _region_view(pair, ctx, fp)
         width, height = osr.dimensions
-        # clamp 到图像边界
-        x2 = min(x, max(0, width - 1))
-        y2 = min(y, max(0, height - 1))
-        max_w = max(0, width - x2)
-        max_h = max(0, height - y2)
-        size2 = min(size, max_w, max_h)
-        if size2 <= 0:
-            return jsonify(error="裁剪区域超出图像边界"), 400
-        # 像素硬闸：clamp 后实际值，任何解码前拒绝（docs §3.5）
+        if square:
+            # 旧 size 兼容正方形分支：clamp 到图像边界（独立保留，§6.2）
+            x2 = min(x, max(0, width - 1))
+            y2 = min(y, max(0, height - 1))
+            max_w = max(0, width - x2)
+            max_h = max(0, height - y2)
+            w2 = h2 = min(w, max_w, max_h)
+            if w2 <= 0:
+                return jsonify(error="裁剪区域超出图像边界"), 400
+        else:
+            # v2 矩形：不 clamp——输出尺寸精确等于合法 w/h，出界直接拒绝
+            if x + w > width or y + h > height:
+                return jsonify(error="裁剪区域超出图像边界（w/h 不做自动裁剪）"), 400
+            x2, y2, w2, h2 = x, y, w, h
+        # 像素硬闸：真实 w*h，任何解码前拒绝（docs §3.5 / §6.2）
         try:
-            crop_guard.check_pixel_limit(size2, size2)
+            crop_guard.check_pixel_limit(w2, h2)
         except crop_guard.CropTooLargeError as e:
             return jsonify(error=str(e), code=e.code,
                            max_pixels=crop_guard.CROP_MAX_PIXELS), 413
@@ -8766,7 +8873,7 @@ def api_slide_crop(name):
         # 真实成本 = 像素量 × 启用通道数（§7.4：8 通道不能当 1 通道计费）
         n_channels = len(ctx.get("active_channels") or ()) if ctx else 1
         allowed, retry_after = crop_guard.admit_pixels(
-            subject, size2 * size2 * max(1, n_channels))
+            subject, w2 * h2 * max(1, n_channels))
         if not allowed:
             resp = jsonify(error="crop 请求过于频繁，请稍后重试",
                            code="crop_rate_limited", retry_after=retry_after)
@@ -8777,7 +8884,7 @@ def api_slide_crop(name):
             return jsonify(error="crop 并发已达上限，请稍后重试",
                            code="crop_busy"), 429
         try:
-            region = osr.read_region((x2, y2), 0, (size2, size2)).convert("RGB")
+            region = osr.read_region((x2, y2), 0, (w2, h2)).convert("RGB")
         finally:
             crop_guard.release_slot(slot)
 
@@ -8786,7 +8893,7 @@ def api_slide_crop(name):
     buf.seek(0)
 
     download_name = _crop_download_name(
-        safe, x2, y2, size2,
+        safe, x2, y2, w2, h2,
         fp if _multichannel_enabled() else None)
     return send_file(
         buf,
@@ -12680,10 +12787,12 @@ def internal_ai_region():
 def internal_ai_annotate():
     """sidecar 落矩形标注（写入标注库，管理员可见可编辑）。
 
-    body: {slide, label, x, y, side_px, note, effect_key, session_id}，可选
+    body: {slide, label, x, y, side_px | width_px+height_px, note, effect_key,
+    session_id}，可选
     溯源字段：plugin_id/plugin_version/run_id/model/provider/created_by_user_id/
     slide_asset_revision/expected_asset_revision（sidecar 本节点不改，Flask 侧
-    容忍缺省，缺的字段留空串）。
+    容忍缺省，缺的字段留空串）。升级 C：矩形接受成对 width_px/height_px（v2）
+    或仅 side_px（v1 正方形兼容）。
     调 share_store.add_roi(ADMIN_TOKEN, ...)（含 _effect_key 幂等、source="ai"）。
     返回 add_roi 的 roi dict（含 annotation_id/index）。
 
@@ -12726,14 +12835,21 @@ def internal_ai_annotate():
 
     x = _parse_num("x")
     y = _parse_num("y")
-    side_px = _parse_int("side_px")
-    if x is None or y is None or side_px is None:
-        return jsonify(error="x/y/side_px 参数需为数值"), 400
+    if x is None or y is None:
+        return jsonify(error="x/y 参数需为数值"), 400
+    # 升级 C（§6.3-2）：成对 width_px/height_px（v2）或 side_px（v1 正方形兼容）。
+    rx, ry, rw, rh, rside, gerr = _parse_rect_request_geom(body)
+    if gerr:
+        return jsonify(error=gerr), 400
+    if rx is not None:
+        x, y = rx, ry
+    w_px, h_px = rw, rh
+    side_px = rside
     # slide 文件名合法性（_safe_name 失败会 abort 400/404）
     safe = _safe_name(slide)
-    # 切片几何统一校验（§6.1，批次 C：矩形右/下边界不得越出切片 level-0
+    # 切片几何统一校验（§6.2，批次 4a：矩形右/下边界不得越出切片 level-0
     # 边界；与 plugin v1 annotate 共用同一套规则，越界 400 不静默裁剪）。
-    reject = _validate_annotation_rect(safe, x, y, side_px)
+    reject = _validate_annotation_rect(safe, x, y, w_px, h_px)
     if reject is not None:
         return jsonify(error=reject[0]), 400
     note = body.get("note") or ""
@@ -12766,8 +12882,9 @@ def internal_ai_annotate():
     try:
         roi = share_store.add_roi(
             share_store.ADMIN_TOKEN, safe, label, type="rect", note=note,
-            x=int(x), y=int(y), side_px=side_px,
-            size_mm=_rect_size_mm(safe, side_px),
+            x=int(x), y=int(y), w=int(w_px), h=int(h_px),
+            **({"side_px": int(side_px)} if side_px is not None else {}),
+            size_mm=_rect_dims_size_mm(safe, w_px, h_px),
             source="ai", created_by_session_id=session_id,
             _effect_key=effect_key or None,
             provenance=provenance,
@@ -13441,8 +13558,10 @@ def plugin_v1_annotate(slide):
       - provenance.created_by_user_id **从 grant 来**（不信任请求体——请求体
         的该字段被忽略）；plugin_id/plugin_version 回查 installation；
       - expected_asset_revision 不符 → 409 slide_revision_conflict 统一信封。
-    body: {label, x, y, side_px, note?, effect_key?, session_id?, run_id?,
-    model?, provider?/base_url?, expected_asset_revision?}。
+    body: {label, x, y, side_px | width_px+height_px, note?, effect_key?,
+    session_id?, run_id?, model?, provider?/base_url?, expected_asset_revision?}。
+    升级 C：矩形接受成对 width_px/height_px（v2 通用矩形）或仅 side_px
+    （v1 正方形兼容）；v2 与 side_px 冲突拒绝。
     """
     claims, err = _require_plugin_token("annotation:write")
     if err is not None:
@@ -13483,12 +13602,19 @@ def plugin_v1_annotate(slide):
 
     x = _parse_num("x")
     y = _parse_num("y")
-    side_px = _parse_int("side_px")
-    if x is None or y is None or side_px is None:
-        return _plugin_error(400, "invalid_request", "x/y/side_px 参数需为数值")
-    # 切片几何统一校验（§6.1，批次 C：矩形右/下边界不得越出切片 level-0
+    if x is None or y is None:
+        return _plugin_error(400, "invalid_request", "x/y 参数需为数值")
+    # 升级 C（§6.3-2）：成对 width_px/height_px（v2）或 side_px（v1 正方形兼容）。
+    rx, ry, rw, rh, rside, gerr = _parse_rect_request_geom(body)
+    if gerr:
+        return _plugin_error(400, "invalid_request", gerr)
+    if rx is not None:
+        x, y = rx, ry
+    w_px, h_px = rw, rh
+    side_px = rside
+    # 切片几何统一校验（§6.2，批次 4a：矩形右/下边界不得越出切片 level-0
     # 边界；与 /internal/ai/annotate 共用同一套规则，越界 400 不静默裁剪）。
-    reject = _validate_annotation_rect(safe, x, y, side_px)
+    reject = _validate_annotation_rect(safe, x, y, w_px, h_px)
     if reject is not None:
         return _plugin_error(400, "invalid_request", reject[0], details=reject[1])
     note = body.get("note") or ""
@@ -13526,8 +13652,9 @@ def plugin_v1_annotate(slide):
     try:
         roi = share_store.add_roi(
             share_store.ADMIN_TOKEN, safe, label, type="rect", note=note,
-            x=int(x), y=int(y), side_px=side_px,
-            size_mm=_rect_size_mm(safe, side_px),
+            x=int(x), y=int(y), w=int(w_px), h=int(h_px),
+            **({"side_px": int(side_px)} if side_px is not None else {}),
+            size_mm=_rect_dims_size_mm(safe, w_px, h_px),
             source="ai", created_by_session_id=session_id,
             _effect_key=effect_key or None,
             provenance=provenance,
@@ -14949,6 +15076,12 @@ def api_share_create():
             if float(s) not in share_store.ALLOWED_ROI_SIZES:
                 return jsonify(error="roi_sizes 仅允许 6 或 6.5"), 400
 
+    # 升级 C（§6.4）：rect_policy 可选（preset_only/custom）。缺省 preset_only
+    # ——新建分享不显式选择不放宽；旧分享缺字段在读写两侧都按 preset_only 解释。
+    rect_policy = body.get("rect_policy")
+    if rect_policy is not None and rect_policy not in ("preset_only", "custom"):
+        return jsonify(error="rect_policy 仅支持 preset_only 或 custom"), 400
+
     # permissions 可选：view/annotate/download 子集
     permissions = body.get("permissions")
     if permissions is not None:
@@ -14962,7 +15095,8 @@ def api_share_create():
     try:
         share = share_store.create_share(
             clean, expires_hours, roi_sizes=roi_sizes, permissions=permissions,
-            creator_user_id=ident["user_id"], requester_role=ident["role"])
+            creator_user_id=ident["user_id"], requester_role=ident["role"],
+            rect_policy=rect_policy)
     except (ValueError, PermissionError) as e:
         return jsonify(error=str(e)), 400
     url = SHARE_BASE_URL + "/s/" + share["token"]
@@ -14973,6 +15107,7 @@ def api_share_create():
         url=url,
         expires_at=share["expires_at"],
         roi_sizes=share.get("roi_sizes", list(share_store.DEFAULT_ROI_SIZES)),
+        rect_policy=share.get("rect_policy", "preset_only"),
         permissions=share.get("permissions", list(share_store.DEFAULT_PERMISSIONS)),
     )
 
@@ -15408,11 +15543,32 @@ def api_annotation_add():
     # note 可选（备注文本），透传给 store 校验/清洗
     note = body.get("note", "")
 
-    # 收集几何字段（透传给 add_roi 校验）
+    # 收集几何字段（透传给 add_roi 校验）。升级 C：rect 增加 w/h 成对字段
+    # （width_px/height_px 为别名，统一归一成 w/h）；v2 与 side_px 冲突由
+    # store 校验拒绝。
     geom = {}
-    for k in ("x", "y", "side_px", "size_mm", "x1", "y1", "x2", "y2", "points"):
+    for k in ("x", "y", "w", "h", "side_px", "size_mm", "x1", "y1", "x2", "y2",
+              "points"):
         if k in body:
             geom[k] = body[k]
+    if "w" not in geom and "h" not in geom:
+        if "width_px" in body:
+            geom["w"] = body["width_px"]
+        if "height_px" in body:
+            geom["h"] = body["height_px"]
+    if typ == "rect":
+        # 路径入口真实切片边界校验（§6.3-4：不依赖 store 的纯数值校验）
+        parse_body = dict(body)
+        if "w" in geom:
+            parse_body["w"] = geom["w"]
+        if "h" in geom:
+            parse_body["h"] = geom["h"]
+        rx, ry, rw, rh, _rs, gerr = _parse_rect_request_geom(parse_body)
+        if gerr:
+            return jsonify(error=gerr), 400
+        reject = _validate_annotation_rect(safe, rx, ry, rw, rh)
+        if reject is not None:
+            return jsonify(error=reject[0]), 400
     try:
         roi = share_store.add_roi(
             share_store.ADMIN_TOKEN, safe, label, type=typ, shared=shared, note=note,
@@ -15533,6 +15689,22 @@ def api_annotation_set_shared(token, index):
     if "geom" in body or "note" in body:
         geom = body.get("geom")
         note = body.get("note")
+        # 升级 C（§6.3-4）：rect 几何更新入口先做生效几何合并与真实切片
+        # 边界校验；旧客户端只给 side_px 编辑 v2 非正方形在此拒绝。
+        if geom is not None:
+            roi_for_geom = share_store.get_roi(token, index)
+            if roi_for_geom is not None and \
+                    (roi_for_geom.get("type") or "rect") == "rect":
+                try:
+                    eff = share_shared._effective_rect_geometry(roi_for_geom, geom)
+                except ValueError as e:
+                    return jsonify(error=str(e)), 400
+                slide_w, slide_h = _annotation_slide_bounds(
+                    roi_for_geom.get("slide") or "")
+                msg = share_shared._validate_rect_bounds(
+                    eff["x"], eff["y"], eff["w"], eff["h"], slide_w, slide_h)
+                if msg:
+                    return jsonify(error=msg), 400
         try:
             updated = share_store.update_roi(
                 token, index, geom=geom, note=note, expected_revision=expected)

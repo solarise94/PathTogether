@@ -58,13 +58,17 @@ from share_shared import (
     _hash_installation_secret,
     _installation_out,
     _is_active,
+    _effective_rect_geometry,
     _norm_label,
     _normalize_permissions,
     _normalize_roi_sizes,
+    _normalize_rect_policy,
+    _rect_read_compat,
     _reject_guest_write,
     _roi_shared_compat,
     _share_permissions,
     _share_roi_sizes,
+    _share_rect_policy,
     _status_of,
     _validate_geom,
 )
@@ -158,8 +162,10 @@ def set_owner_user_id(user_id: str) -> None:
 # --------------------------------------------------------------------------- #
 # 内部工具
 # --------------------------------------------------------------------------- #
-# roi 几何字段（存 data JSONB，镜像到 geom 列）
-_GEOM_KEYS = ("x", "y", "side_px", "size_mm", "x1", "y1", "x2", "y2", "points")
+# roi 几何字段（存 data JSONB，镜像到 geom 列）。升级 C（§6.3）：rect 的
+# w/h/geometry_version 一并承接（历史快照与 geom 投影同一白名单）。
+_GEOM_KEYS = ("x", "y", "side_px", "size_mm", "w", "h", "geometry_version",
+              "x1", "y1", "x2", "y2", "points")
 
 
 def _geom_of(roi: dict) -> dict:
@@ -210,6 +216,8 @@ def _roi_out(roi: dict, index=None, shared=None) -> dict:
     """ROI 导出副本：统一补 index/shared/note 兼容字段（与 json 一致）。
 
     tombstone（deleted=true）只保留最小字段；非 tombstone 补 review_status。
+    升级 C（§6.3-1）：旧 rect 只有 side_px → 读时归一 w=h=side_px（仅输出
+    副本，不改存储；不批量改 annotation_id/revision/change_seq 等）。
     """
     if roi.get("deleted"):
         out = {
@@ -225,7 +233,7 @@ def _roi_out(roi: dict, index=None, shared=None) -> dict:
         if index is not None:
             out["index"] = index
         return out
-    out = dict(roi)
+    out = dict(_rect_read_compat(dict(roi)))
     if index is not None:
         out["index"] = index
     if shared is not None:
@@ -291,11 +299,16 @@ def _bump_change_seq(cur, slide, token, annotation_id, op):
 # 分享（shares）
 # --------------------------------------------------------------------------- #
 def create_share(slides, expires_hours, roi_sizes=None, permissions=None,
-                 creator_user_id=None, requester_role=None):
-    """创建分享：生成 token、写入并返回 share dict（含 token 与 roi_sizes）。"""
+                 creator_user_id=None, requester_role=None, rect_policy=None):
+    """创建分享：生成 token、写入并返回 share dict（含 token/roi_sizes/rect_policy）。
+
+    升级 C（§6.4）：rect_policy ∈ preset_only|custom；缺省 preset_only
+    （新建分享不显式选择时不放宽为 custom）。
+    """
     _reject_guest_write(requester_role)
     roi_sizes_norm = _normalize_roi_sizes(roi_sizes)
     perms = _normalize_permissions(permissions)
+    policy = _normalize_rect_policy(rect_policy)
     creator = creator_user_id or None
     token = secrets.token_urlsafe(18)
     now = time.time()
@@ -307,13 +320,13 @@ def create_share(slides, expires_hours, roi_sizes=None, permissions=None,
             with c.cursor() as cur:
                 cur.execute(
                     "INSERT INTO shares "
-                    "(token, slides, permissions, roi_sizes, expires_at, revoked, "
-                    " creator_user_id) "
-                    "VALUES (%s,%s,%s,%s, to_timestamp(%s), FALSE, %s)",
+                    "(token, slides, permissions, roi_sizes, rect_policy, "
+                    " expires_at, revoked, creator_user_id) "
+                    "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), FALSE, %s)",
                     (token, psycopg.types.json.Jsonb(list(slides)),
                      psycopg.types.json.Jsonb(list(perms)),
                      psycopg.types.json.Jsonb(list(roi_sizes_norm)),
-                     expires_at, creator),
+                     policy, expires_at, creator),
                 )
         return {
             "slides": list(slides),
@@ -322,6 +335,7 @@ def create_share(slides, expires_hours, roi_sizes=None, permissions=None,
             "revoked": False,
             "token": token,
             "roi_sizes": list(roi_sizes_norm),
+            "rect_policy": policy,
             "permissions": list(perms),
             "creator_user_id": creator,
         }
@@ -331,6 +345,7 @@ def create_share(slides, expires_hours, roi_sizes=None, permissions=None,
 
 _SHARE_SEL = (
     "token, slides, permissions, roi_sizes, "
+    "COALESCE(rect_policy, 'preset_only') AS rect_policy, "
     "extract(epoch from expires_at)::float8 AS expires_at, revoked, "
     "creator_user_id, extract(epoch from created_at)::float8 AS created_at"
 )
@@ -355,6 +370,7 @@ def get_share(token):
         out = dict(share)
         out["token"] = token
         out["roi_sizes"] = _share_roi_sizes(share)
+        out["rect_policy"] = _share_rect_policy(share)
         out["permissions"] = _share_permissions(share)
         return out
     finally:
@@ -362,7 +378,7 @@ def get_share(token):
 
 
 def list_shares():
-    """返回全部分享（含 status 与 roi_sizes 字段），按 created_at 倒序。"""
+    """返回全部分享（含 status/roi_sizes/rect_policy 字段），按 created_at 倒序。"""
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -376,6 +392,7 @@ def list_shares():
             out = dict(sh)
             out["status"] = _status_of(sh)
             out["roi_sizes"] = _share_roi_sizes(sh)
+            out["rect_policy"] = _share_rect_policy(sh)
             out["permissions"] = _share_permissions(sh)
             items.append(out)
         return items
@@ -844,9 +861,25 @@ def update_roi(token, index, geom=None, note=None, expected_revision=None):
                     geom_full = dict(geom)
                     if orig_type == "rect" and "size_mm" not in geom_full:
                         geom_full["size_mm"] = roi.get("size_mm", 0.0)
+                    if orig_type == "rect":
+                        # 升级 C：PATCH 兼容性校验（w/h 成对；旧 side_px 编辑
+                        # v2 非正方形拒绝），并把 side_px 补丁归一到记录版本
+                        _effective_rect_geometry(roi, geom_full)
+                        if ("side_px" in geom_full and "w" not in geom_full
+                                and "h" not in geom_full
+                                and roi.get("geometry_version") == 2):
+                            side_val = geom_full.pop("side_px")
+                            geom_full["w"] = side_val
+                            geom_full["h"] = side_val
                     norm_g = _validate_geom(orig_type, geom_full)
                     norm_g["type"] = orig_type
                     roi.update(norm_g)
+                    # 升级 C：v1→v2 升级（成对 w/h）且新几何非正方形时，清掉
+                    # 遗留 side_px——非正方形不得保留 max/min 冒充的旧几何字段。
+                    if orig_type == "rect" \
+                            and norm_g.get("geometry_version") == 2 \
+                            and "side_px" not in norm_g:
+                        roi.pop("side_px", None)
                 if note_clean != "_UNSET_":
                     roi["note"] = note_clean
                 roi["revision"] = int(roi.get("revision") or 1) + 1
@@ -888,7 +921,7 @@ def list_rois(token=None):
         if token is not None:
             out = []
             for i, row in enumerate(rows):
-                r = dict(row["data"])
+                r = _rect_read_compat(dict(row["data"]))
                 r["index"] = i
                 r["shared"] = _roi_shared_compat(r)
                 r["note"] = r.get("note", "")
@@ -899,7 +932,7 @@ def list_rois(token=None):
         counters = defaultdict(int)
         out = []
         for row in rows:
-            r = dict(row["data"])
+            r = _rect_read_compat(dict(row["data"]))
             r["index"] = counters[r["token"]]
             counters[r["token"]] += 1
             r["shared"] = _roi_shared_compat(r)
@@ -923,7 +956,7 @@ def get_roi(token, index):
                 rows = cur.fetchall()
         if index < 0 or index >= len(rows):
             return None
-        r = dict(rows[index]["data"])
+        r = _rect_read_compat(dict(rows[index]["data"]))
         r["index"] = index
         r["shared"] = _roi_shared_compat(r)
         r["visitor"] = r.get("visitor", "") or ""
@@ -942,7 +975,7 @@ def get_roi_by_annotation_id(annotation_id):
                 cur.execute("SELECT data FROM rois WHERE annotation_id=%s",
                             (annotation_id,))
                 row = cur.fetchone()
-        return dict(row["data"]) if row else None
+        return _rect_read_compat(dict(row["data"])) if row else None
     finally:
         conn.close()
 
@@ -1217,7 +1250,7 @@ def list_shared_rois_for_slides(slides):
                 continue
             if not _roi_shared_compat(r):
                 continue
-            rr = dict(r)
+            rr = _rect_read_compat(dict(r))
             rr["index"] = idx
             rr["shared"] = True
             rr.setdefault("type", "rect")
@@ -1649,9 +1682,12 @@ def annotations_by_slide():
                 "review_status": r.get("review_status", "none"),
                 "visitor": (r.get("visitor") or "")[:8],
             }
-            for k in ("x1", "y1", "x2", "y2", "points"):
+            for k in ("w", "h", "geometry_version", "x1", "y1", "x2", "y2", "points"):
                 if k in r:
                     item[k] = r[k]
+            # 升级 C 读兼容：旧 rect 只有 side_px → 补 w/h（仅输出）
+            if item["type"] == "rect":
+                _rect_read_compat(item)
             grp["items"].append(item)
         result = {}
         for slide, grp_map in by_slide.items():

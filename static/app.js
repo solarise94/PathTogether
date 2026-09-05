@@ -57,6 +57,16 @@
     "upload.stage.validating": { zh: "服务端校验中", en: "Validating on server" },
     "upload.stage.done": { zh: "入库完成", en: "Completed" },
     "upload.stage.failed": { zh: "上传失败", en: "Upload failed" },
+    // 升级 C（§6.1）：矩形工具文案（i18n.js 为主源；此处兜底）
+    "roi.rect.tip": { zh: "矩形工具：在视野中拖出矩形，或输入宽高后点击中心放置；拖内部平移、边/角调整大小；Escape 取消",
+                      en: "Rectangle tool: drag in the view, or enter width/height then click to place; drag inside to move, edges/corners to resize; Escape cancels" },
+    "roi.cancelled": { zh: "已取消未保存的选区", en: "Unsaved selection cancelled" },
+    "roi.input.invalid": { zh: "矩形尺寸非法或超出图像范围，已保留上次的合法框",
+                           en: "Invalid rectangle size or out of image bounds; kept the last valid box" },
+    "roi.too.large": { zh: "矩形超过像素预算（{n} 像素），请缩小选区",
+                       en: "Rectangle exceeds the pixel budget ({n} px); please shrink the selection" },
+    "edit.conflict": { zh: "该标注已被他人修改（当前 revision {rev}），已显示当前版本；请基于最新版本重新编辑",
+                       en: "This annotation was modified by someone else (current revision {rev}); showing the current version — please re-edit on top of it" },
   };
   function tt(key) {
     try {
@@ -72,8 +82,13 @@
   var state = {
     slide: null,          // 当前切片 {name,width,height,mppX,mppY,mppSource}
     mppX: null,           // 当前生效的 µm/px
-    roiMode: null,        // null | 6 | 6.5
-    roi: { x: 0, y: 0, side: 0 },
+    // 升级 C（§6.1）：单一「矩形」入口。roiMode 为工具激活标志（null|"rect"）；
+    // 选区本身是 level-0 像素矩形 roi={x,y,w,h}（权威几何，§6.2）。
+    roiMode: null,        // null | "rect"
+    roi: { x: 0, y: 0, w: 0, h: 0 },
+    roiLockRatio: false,  // 锁定宽高比（默认不锁定）
+    roiUnit: "mm",        // 设置区单位：mm | um | px
+    roiPreset: "",        // "" | "6" | "6.5"（mm 预设只填数值不强制锁定）
     rotation: 0,
     flipped: false,       // 是否水平翻转（镜像）
     drawMode: null,       // null | "arrow" | "freehand"（与 roiMode 互斥）
@@ -429,8 +444,14 @@
     zoomOut: $("zoom-out"),
     rotateBtn: $("rotate-btn"),
     flipBtn: $("flip-btn"),
-    roi6: $("roi-6"),
-    roi65: $("roi-6-5"),
+    // 升级 C：单一矩形入口 + 紧凑设置区（旧 roi-6/roi-6-5/roi-box-btn 已移除）
+    roiRectBtn: $("roi-rect-btn"),
+    roiSettings: $("roi-settings"),
+    roiWInput: $("roi-w-input"),
+    roiHInput: $("roi-h-input"),
+    roiUnitSelect: $("roi-unit-select"),
+    roiLockRatio: $("roi-lock-ratio"),
+    roiPresetSelect: $("roi-preset-select"),
     saveBtn: $("save-btn"),
     saveAnnoBtn: $("save-anno-btn"),
     annoBtn: $("anno-btn"),
@@ -471,7 +492,6 @@
     changepwNew: $("changepw-new"),
     changepwConfirm: $("changepw-confirm"),
     changepwError: $("changepw-error"),
-    roiBoxBtn: $("roi-box-btn"),
     annoAllToggle: $("anno-all-toggle"),
     // 手机端侧栏抽屉
     menuBtn: $("menu-btn"),
@@ -501,6 +521,7 @@
     shareExpiresSelect: $("share-expires-select"),
     shareExpiresCustom: $("share-expires-custom"),
     shareRoiSizeSelect: $("share-roi-size-select"),
+    shareRectPolicySelect: $("share-rect-policy-select"),
     sharePermAnnotate: $("share-perm-annotate"),
     sharePermDownload: $("share-perm-download"),
     sharePermHint: $("share-perm-hint"),
@@ -1004,72 +1025,125 @@
     viewer.viewport.goHome(true);
   }
 
-  // ---------- ROI 功能 ----------
-  function roiSide(sizeMm) {
-    if (!state.mppX || state.mppX <= 0) return 0;
-    return Math.round((sizeMm * 1000) / state.mppX);
+  // ---------- 矩形工具（升级 C §6.1/§6.2） ----------
+  // 权威几何：level-0 像素 x/y/w/h（state.roi）。物理单位仅是输入/展示口径：
+  //   w_px = round(width × 1000 / mpp_x)、h_px = round(height × 1000 / mpp_y)
+  //   （μm 不乘 1000）；显示值按实际像素 + 分轴校准反算。
+  // 单边上限 40000px + w*h 像素预算（与后端同一口径）；出界保持上个合法框。
+
+  // rect 单边像素上限（与后端 RECT_MAX_SIDE_PX 一致）
+  var RECT_MAX_SIDE_PX = 40000;
+  // rect 像素预算（与后端 crop_guard.CROP_MAX_PIXELS 默认一致；服务端为权威）
+  var RECT_MAX_PIXELS = 4096 * 4096;
+
+  function rectToolActive() { return state.roiMode === "rect"; }
+  function roiW() { return state.roi ? state.roi.w : 0; }
+  function roiH() { return state.roi ? state.roi.h : 0; }
+
+  // 数值是否可用（有限且 > 0）
+  function posNum(v) { return typeof v === "number" && isFinite(v) && v > 0; }
+
+  // 当前单位 → 像素的换算系数（分轴 MPP，§6.2）。返回 [kx, ky]（px per unit）
+  // 或 null（物理单位缺任一轴可信 MPP：像素可用、物理单位需先校准）。
+  function unitToPxFactors(unit) {
+    if (unit === "px") return [1, 1];
+    var mx = Number(state.mppX);
+    var my = Number(state.slide && state.slide.mppY);
+    if (unit === "mm") { mx = mx / 1000; my = my / 1000; } // µm/px → mm/px
+    if (!posNum(mx) || !posNum(my)) return null;
+    return [1 / mx, 1 / my]; // px per (mm|µm)
   }
 
-  // 矩形物理边长（mm）。AI 落标只写 side_px、size_mm 常为 0；用 mpp 现算。
-  function rectSizeMm(it) {
-    if (!it || (it.type && it.type !== "rect")) return null;
-    var mm = Number(it.size_mm);
-    if (!(mm > 0) && it.side_px != null && state.mppX > 0) {
-      mm = Math.round(Number(it.side_px) * state.mppX / 1000 * 100) / 100;
+  // 把设置区数值（当前单位）换算为像素 w/h；非法/缺 MPP 返回 null（附错误文案 key）
+  function rectInputsToPx() {
+    var unit = state.roiUnit;
+    var wv = parseFloat(els.roiWInput && els.roiWInput.value);
+    var hv = parseFloat(els.roiHInput && els.roiHInput.value);
+    if (!isFinite(wv) || !isFinite(hv) || wv <= 0 || hv <= 0) return null;
+    if (unit === "px") return { w: Math.round(wv), h: Math.round(hv) };
+    var f = unitToPxFactors(unit);
+    if (!f) return null;
+    return { w: Math.round(wv * f[0]), h: Math.round(hv * f[1]) };
+  }
+
+  // 像素 → 物理展示串（分轴反算；mm 保留 2 位、μm 保留 1 位、px 原样）
+  function rectPhysicalText(w, h) {
+    var unit = state.roiUnit;
+    if (unit === "px") return w + " × " + h + " px";
+    var mx = Number(state.mppX), my = Number(state.slide && state.slide.mppY);
+    if (!posNum(mx) || !posNum(my)) return w + " × " + h + " px";
+    var wx = w * mx, hy = h * my; // µm
+    if (unit === "mm") {
+      return (wx / 1000).toFixed(2) + " × " + (hy / 1000).toFixed(2) + " mm";
     }
-    return (mm > 0) ? mm : null;
+    return wx.toFixed(1) + " × " + hy.toFixed(1) + " μm";
   }
 
-  function toggleRoi(sizeMm) {
+  // 矩形几何归一（§6.2）：负方向归一、整数、边界约束
+  // x>=0,y>=0,w>=1,h>=1,x+w<=W,y+h<=H。非法输入（NaN/Infinity/负值）返回 null。
+  // applyBudget=false 用于已存大标注的拖动编辑（像素预算是创建/导出闸，
+  // 不追溯限制既有合法记录的编辑）。
+  function normalizeRect(x0, y0, x1, y1, applyBudget) {
+    var W = state.slide.width, H = state.slide.height;
+    if (![x0, y0, x1, y1].every(isFinite)) return null;
+    var x = Math.max(0, Math.round(Math.min(x0, x1)));
+    var y = Math.max(0, Math.round(Math.min(y0, y1)));
+    var w = Math.round(Math.abs(x1 - x0));
+    var h = Math.round(Math.abs(y1 - y0));
+    w = Math.min(Math.max(w, 1), RECT_MAX_SIDE_PX);
+    h = Math.min(Math.max(h, 1), RECT_MAX_SIDE_PX);
+    x = Math.min(x, Math.max(0, W - w));
+    y = Math.min(y, Math.max(0, H - h));
+    if (x < 0 || y < 0 || w < 1 || h < 1 || x + w > W || y + h > H) return null;
+    if (applyBudget !== false && w * h > RECT_MAX_PIXELS) return null;
+    return { x: x, y: y, w: w, h: h };
+  }
+
+  // 已有矩形的等比换算（锁定比例时拖边/输数用）：按高度推宽度
+  function lockRatioAdjust(wPx, hPx) {
+    if (!state.roiLockRatio || !(state.roi.w > 0) || !(state.roi.h > 0)) {
+      return { w: wPx, h: hPx };
+    }
+    var ratio = state.roi.w / state.roi.h;
+    // 以较大变化轴为准推另一轴
+    if (Math.abs(hPx - state.roi.h) > Math.abs(wPx - state.roi.w)) {
+      return { w: Math.max(1, Math.round(hPx * ratio)), h: hPx };
+    }
+    return { w: wPx, h: Math.max(1, Math.round(wPx / ratio)) };
+  }
+
+  // 在给定中心放置 w×h（clamp 到切片内，保大小移到边缘）
+  function placeRectAtCenter(cx, cy, w, h) {
+    var W = state.slide.width, H = state.slide.height;
+    var x = clamp(Math.round(cx - w / 2), 0, Math.max(0, W - w));
+    var y = clamp(Math.round(cy - h / 2), 0, Math.max(0, H - h));
+    state.roi.x = x; state.roi.y = y; state.roi.w = w; state.roi.h = h;
+  }
+
+  // 进入/退出矩形工具（与箭头/自由手绘互斥；完成/取消后恢复导航）
+  function toggleRectTool() {
+    if (rectToolActive()) { exitRoi(); return; }
     if (!state.slide) { toast(t("roi.need.slide"), "error"); return; }
-    if (!state.mppX || state.mppX <= 0) {
+    var mx = Number(state.mppX), my = Number(state.slide.mppY);
+    if (state.roiUnit !== "px" && (!posNum(mx) || !posNum(my))) {
       toast(t("roi.need.mpp"), "error");
       return;
     }
-    // 进入 ROI 模式时退出箭头/描图绘制模式（互斥）
-    exitDrawMode();
     if (state.slide.mppSource === "estimated") {
       toast(t("roi.estimate.tip"), "info");
     }
-    if (state.roiMode === sizeMm) { exitRoi(); return; }
-
-    var newSide = roiSide(sizeMm);
-    if (newSide <= 0) { toast(t("roi.calc.fail"), "error"); return; }
-
-    var W0 = state.slide.width, H0 = state.slide.height;
-    if (newSide > W0 || newSide > H0) {
-      var physW = (W0 * state.mppX / 1000).toFixed(1);
-      var physH = (H0 * state.mppX / 1000).toFixed(1);
-      toast(t("roi.out.of.range", { w: physW, h: physH, s: sizeMm, mpp: state.mppX }), "info");
-    }
-
-    var W = state.slide.width, H = state.slide.height;
-    var cx, cy;
-    if (state.roiMode != null && state.roi.side > 0) {
-      cx = state.roi.x + state.roi.side / 2;
-      cy = state.roi.y + state.roi.side / 2;
-    } else {
-      cx = W / 2; cy = H / 2;
-      try {
-        var center = viewer.viewport.getCenter();
-        var imgPt = viewer.viewport.viewportToImageCoordinates(center);
-        cx = imgPt.x; cy = imgPt.y;
-      } catch (e) {}
-    }
-    var x = clamp(cx - newSide / 2, 0, Math.max(0, W - newSide));
-    var y = clamp(cy - newSide / 2, 0, Math.max(0, H - newSide));
-
-    state.roiMode = sizeMm;
-    state.roi.x = Math.round(x);
-    state.roi.y = Math.round(y);
-    state.roi.side = newSide;
-
-    createRoiBox();
-    updateRoiOverlay();
+    // 与 arrow/freehand 互斥
+    exitDrawMode();
+    state.roiMode = "rect";
+    state.roi = { x: 0, y: 0, w: 0, h: 0 };
+    els.annoCanvas.classList.add("drawing");
+    els.roiRectBtn.classList.add("active");
+    if (els.roiSettings) els.roiSettings.hidden = false;
+    els.roiRectBtn.setAttribute("aria-expanded", "true");
+    if (viewer) viewer.setMouseNavEnabled(false);
     updateRoiButtons();
-    els.saveBtn.disabled = false;
-    els.saveAnnoBtn.disabled = false;
     updateCtxBar();
+    toast(t("roi.rect.tip"), "info");
   }
 
   function exitRoi() {
@@ -1079,6 +1153,12 @@
     }
     if (roiBox && roiBox.parentNode) roiBox.parentNode.removeChild(roiBox);
     roiBox = null;
+    if (els.annoCanvas) els.annoCanvas.classList.remove("drawing");
+    if (els.roiRectBtn) {
+      els.roiRectBtn.classList.remove("active");
+      els.roiRectBtn.setAttribute("aria-expanded", "false");
+    }
+    if (viewer) viewer.setMouseNavEnabled(true);
     updateRoiButtons();
     els.saveBtn.disabled = true;
     els.saveAnnoBtn.disabled = true;
@@ -1086,45 +1166,73 @@
   }
 
   function updateRoiButtons() {
-    els.roi6.classList.toggle("active", state.roiMode === 6);
-    els.roi65.classList.toggle("active", state.roiMode === 6.5);
-    syncRoiSlider(); // 同步移动端滑块分段 + 滑动拇指
+    if (els.roiRectBtn) {
+      els.roiRectBtn.classList.toggle("active", rectToolActive());
+    }
+    syncRoiSettings();
   }
 
-  // ---------- 移动端 ROI 滑块分段（取代旧弹窗选择器） ----------
-  // 管理端固定 6 / 6.5 两段；#roi-box-btn 为分段容器，滑块拇指滑到激活段。
-  function syncRoiSlider() {
-    var box = els.roiBoxBtn;
-    if (!box) return;
-    var segs = box.querySelectorAll(".roi-slider-seg");
-    if (!segs.length) return;
-    var activeIdx = -1;
-    segs.forEach(function (seg, i) {
-      var sz = Number(seg.getAttribute("data-size"));
-      var on = state.roiMode === sz;
-      seg.classList.toggle("active", on);
-      if (on) activeIdx = i;
-    });
-    box.classList.toggle("active", activeIdx >= 0);
-    var thumb = box.querySelector(".roi-slider-thumb");
-    if (thumb) {
-      var n = segs.length || 1;
-      thumb.style.width = (100 / n) + "%";
-      thumb.style.transform = "translateX(" + (activeIdx >= 0 ? activeIdx * 100 : 0) + "%)";
-      thumb.style.opacity = activeIdx >= 0 ? "1" : "0";
+  // 紧凑设置区：数值随选区/单位同步（显示按实际像素反算，§6.2）
+  function syncRoiSettings() {
+    if (!els.roiWInput || !els.roiHInput) return;
+    if (!(state.roi.w > 0)) return; // 无选区时保留用户输入
+    var unit = state.roiUnit;
+    if (unit === "px") {
+      els.roiWInput.value = state.roi.w;
+      els.roiHInput.value = state.roi.h;
+      return;
     }
+    var mx = Number(state.mppX), my = Number(state.slide && state.slide.mppY);
+    if (!posNum(mx) || !posNum(my)) return;
+    if (unit === "mm") {
+      els.roiWInput.value = +(state.roi.w * mx / 1000).toFixed(2);
+      els.roiHInput.value = +(state.roi.h * my / 1000).toFixed(2);
+    } else {
+      els.roiWInput.value = +(state.roi.w * mx).toFixed(1);
+      els.roiHInput.value = +(state.roi.h * my).toFixed(1);
+    }
+  }
+
+  // 设置区数值确认（Enter/change）：以当前中心调整；出界保持上个合法框并提示
+  function applyRectInputs() {
+    if (!state.slide || !rectToolActive()) return;
+    var px = rectInputsToPx();
+    if (!px) {
+      var unit = state.roiUnit;
+      if (unit !== "px" && !unitToPxFactors(unit)) { toast(t("roi.need.mpp"), "error"); }
+      else { toast(t("roi.input.invalid"), "error"); }
+      syncRoiSettings();
+      return;
+    }
+    px = lockRatioAdjust(px.w, px.h);
+    var W = state.slide.width, H = state.slide.height;
+    if (px.w > W || px.h > H) { toast(t("roi.input.invalid"), "error"); syncRoiSettings(); return; }
+    if (px.w * px.h > RECT_MAX_PIXELS) {
+      toast(t("roi.too.large", { n: RECT_MAX_PIXELS }), "error");
+      syncRoiSettings();
+      return;
+    }
+    var cx = state.roi.x + state.roi.w / 2;
+    var cy = state.roi.y + state.roi.h / 2;
+    if (!(state.roi.w > 0)) { cx = W / 2; cy = H / 2; }
+    placeRectAtCenter(cx, cy, px.w, px.h);
+    createRoiBox();
+    updateRoiOverlay();
+    els.saveBtn.disabled = false;
+    els.saveAnnoBtn.disabled = false;
   }
 
   function createRoiBox() {
     if (roiBox) return;
     roiBox = document.createElement("div");
     roiBox.id = "roi-box";
-    var tl = document.createElement("div"); tl.className = "roi-corner tl";
-    var tr = document.createElement("div"); tr.className = "roi-corner tr";
-    var bl = document.createElement("div"); bl.className = "roi-corner bl";
-    var br = document.createElement("div"); br.className = "roi-corner br";
-    roiBox.appendChild(tl); roiBox.appendChild(tr);
-    roiBox.appendChild(bl); roiBox.appendChild(br);
+    // 四角（双轴）+ 四边（单轴）手柄（§6.1：边改单轴、角改双轴）
+    ["tl", "tr", "bl", "br", "t", "b", "l", "r"].forEach(function (id) {
+      var hd = document.createElement("div");
+      hd.className = "roi-handle roi-" + id;
+      hd.dataset.handle = id;
+      roiBox.appendChild(hd);
+    });
     var label = document.createElement("div");
     label.className = "roi-label";
     roiBox.appendChild(label);
@@ -1135,11 +1243,10 @@
   function updateRoiOverlay() {
     if (!roiBox || !state.slide) return;
     var r = state.roi;
-    if (r.side <= 0) return;
+    if (!(r.w > 0) || !(r.h > 0)) return;
     var label = roiBox.querySelector(".roi-label");
-    // 仅在 ROI 模式下刷新标签，避免 roiMode 为 null 时显示 "nullmm × nullmm"
-    if (label && state.roiMode != null) label.textContent = state.roiMode + "mm × " + state.roiMode + "mm";
-    var rect = viewer.viewport.imageToViewportRectangle(r.x, r.y, r.side, r.side);
+    if (label) label.textContent = rectPhysicalText(r.w, r.h);
+    var rect = viewer.viewport.imageToViewportRectangle(r.x, r.y, r.w, r.h);
     var existing = viewer.getOverlayById(roiBox);
     if (existing) {
       viewer.updateOverlay(roiBox, rect, OpenSeadragon.Placement.TOP_LEFT);
@@ -1152,17 +1259,21 @@
       }
       viewer.addOverlay(opts);
     }
+    syncRoiSettings();
   }
 
-  // ---------- ROI 拖拽 ----------
+  // ---------- 矩形拖拽：内部平移 / 四边单轴 / 四角双轴（pointer 捕获） ----------
   function onRoiPointerDown(e) {
     if (!state.slide) return;
     e.preventDefault(); e.stopPropagation();
     try { roiBox.setPointerCapture(e.pointerId); } catch (err) {}
+    var handle = null;
+    var t = e.target;
+    if (t && t.dataset && t.dataset.handle) handle = t.dataset.handle;
     dragInfo = {
       pointerId: e.pointerId,
-      startRoiX: state.roi.x,
-      startRoiY: state.roi.y,
+      handle: handle || "move",
+      startRoi: { x: state.roi.x, y: state.roi.y, w: state.roi.w, h: state.roi.h },
       startImg: viewer.viewport.viewerElementToImageCoordinates(
         new OpenSeadragon.Point(e.clientX - getViewerRect().left,
                                 e.clientY - getViewerRect().top)),
@@ -1179,17 +1290,42 @@
     var rect = getViewerRect();
     var curImg = viewer.viewport.viewerElementToImageCoordinates(
       new OpenSeadragon.Point(e.clientX - rect.left, e.clientY - rect.top));
-    var grabX = dragInfo.startImg.x - dragInfo.startRoiX;
-    var grabY = dragInfo.startImg.y - dragInfo.startRoiY;
-    var W = state.slide.width, H = state.slide.height, side = state.roi.side;
-    var nx = clamp(Math.round(curImg.x - grabX), 0, Math.max(0, W - side));
-    var ny = clamp(Math.round(curImg.y - grabY), 0, Math.max(0, H - side));
-    state.roi.x = nx; state.roi.y = ny;
+    var s = dragInfo.startRoi;
+    var handle = dragInfo.handle;
+    var W = state.slide.width, H = state.slide.height;
+    var nx = s.x, ny = s.y, nw = s.w, nh = s.h;
+    if (handle === "move") {
+      // 平移：保大小，clamp 到边界（到边缘保留大小）
+      var dx = Math.round(curImg.x - dragInfo.startImg.x);
+      var dy = Math.round(curImg.y - dragInfo.startImg.y);
+      nx = clamp(s.x + dx, 0, Math.max(0, W - s.w));
+      ny = clamp(s.y + dy, 0, Math.max(0, H - s.h));
+    } else {
+      // 边/角：锚定对边/对角，跟随指针（负方向随后归一，§6.2）
+      var anchorX = s.x + s.w, anchorY = s.y + s.h; // 默认锚右/下
+      var moveL = handle.indexOf("l") >= 0;
+      var moveR = handle.indexOf("r") >= 0;
+      var moveT = handle.indexOf("t") >= 0;
+      var moveB = handle.indexOf("b") >= 0;
+      if (moveL) anchorX = s.x + s.w;
+      else if (moveR) anchorX = s.x;
+      if (moveT) anchorY = s.y + s.h;
+      else if (moveB) anchorY = s.y;
+      var x0 = moveL || moveR ? anchorX : s.x;
+      var x1 = moveL || moveR ? curImg.x : s.x + s.w;
+      var y0 = moveT || moveB ? anchorY : s.y;
+      var y1 = moveT || moveB ? curImg.y : s.y + s.h;
+      var n = normalizeRect(x0, y0, x1, y1);
+      if (!n) return; // 非法（NaN/超预算）保持上帧
+      nx = n.x; ny = n.y; nw = n.w; nh = n.h;
+    }
+    state.roi.x = nx; state.roi.y = ny; state.roi.w = nw; state.roi.h = nh;
     viewer.updateOverlay(
       roiBox,
-      viewer.viewport.imageToViewportRectangle(nx, ny, side, side),
+      viewer.viewport.imageToViewportRectangle(nx, ny, nw, nh),
       OpenSeadragon.Placement.TOP_LEFT
     );
+    syncRoiSettings();
   }
 
   function onRoiPointerUp(e) {
@@ -1205,9 +1341,121 @@
 
   function getViewerRect() { return viewer.container.getBoundingClientRect(); }
 
+  // ---------- 画布层拖出矩形 / 点选中心放置（矩形工具激活时） ----------
+  var rectDrawInfo = null;
+
+  function onRectCanvasPointerDown(e) {
+    if (!rectToolActive() || !state.slide) return false;
+    e.preventDefault(); e.stopPropagation();
+    var c = els.annoCanvas;
+    try { c.setPointerCapture(e.pointerId); } catch (err) {}
+    var img0 = screenToImg(e);
+    rectDrawInfo = { pointerId: e.pointerId, x0: img0.x, y0: img0.y, x1: img0.x, y1: img0.y, moved: false };
+    viewer.setMouseNavEnabled(false);
+    return true;
+  }
+
+  function onRectCanvasPointerMove(e) {
+    if (!rectDrawInfo) return false;
+    e.preventDefault(); e.stopPropagation();
+    var img = screenToImg(e);
+    if (Math.abs(img.x - rectDrawInfo.x0) + Math.abs(img.y - rectDrawInfo.y0) > 2) {
+      rectDrawInfo.moved = true;
+    }
+    rectDrawInfo.x1 = img.x; rectDrawInfo.y1 = img.y;
+    if (rectDrawInfo.moved) {
+      var n = normalizeRect(rectDrawInfo.x0, rectDrawInfo.y0,
+                            rectDrawInfo.x1, rectDrawInfo.y1);
+      if (n) {
+        state.roi = n;
+        createRoiBox();
+        updateRoiOverlay();
+      }
+    }
+    return true;
+  }
+
+  function onRectCanvasPointerUp(e) {
+    if (!rectDrawInfo) return false;
+    e.preventDefault(); e.stopPropagation();
+    var c = els.annoCanvas;
+    try { c.releasePointerCapture(rectDrawInfo.pointerId); } catch (err) {}
+    var info = rectDrawInfo;
+    rectDrawInfo = null;
+    if (!info.moved) {
+      // 点击放置：需要设置区已给出有效宽/高（§6.1「先输入大小，再点击中心放置」）
+      var px = rectInputsToPx();
+      if (!px) {
+        var unit = state.roiUnit;
+        if (unit !== "px" && !unitToPxFactors(unit)) { toast(t("roi.need.mpp"), "error"); }
+        else { toast(t("roi.input.invalid"), "error"); }
+        viewer.setMouseNavEnabled(true);
+        return true;
+      }
+      px = lockRatioAdjust(px.w, px.h);
+      if (px.w > state.slide.width || px.h > state.slide.height ||
+          px.w * px.h > RECT_MAX_PIXELS) {
+        toast(t("roi.input.invalid"), "error");
+        viewer.setMouseNavEnabled(true);
+        return true;
+      }
+      var img = screenToImg(e);
+      placeRectAtCenter(img.x, img.y, px.w, px.h);
+      createRoiBox();
+      updateRoiOverlay();
+    }
+    if (state.roi.w > 0) {
+      els.saveBtn.disabled = false;
+      els.saveAnnoBtn.disabled = false;
+    }
+    viewer.setMouseNavEnabled(true);
+    return true;
+  }
+
+  // Escape 取消未保存选区（§6.1）：恢复 viewer 导航
+  function onRectKeydown(e) {
+    if (e.key !== "Escape") return;
+    if (rectDrawInfo) {
+      rectDrawInfo = null;
+      if (viewer) viewer.setMouseNavEnabled(true);
+      return;
+    }
+    if (rectToolActive()) {
+      e.preventDefault();
+      exitRoi();
+      toast(t("roi.cancelled"), "info");
+    }
+  }
+
+  // 已有矩形标注的 w/h 读取（升级 C：v2 w/h 权威；旧 side_px 正方形兼容）。
+  // 不重新正方形化：非正方形取各自轴，绝不 max/min 冒充。
+  function rectItemW(it) {
+    var w = Number(it.w);
+    if (isFinite(w) && w > 0) return w;
+    return Number(it.side_px) > 0 ? Number(it.side_px) : 0;
+  }
+  function rectItemH(it) {
+    var h = Number(it.h);
+    if (isFinite(h) && h > 0) return h;
+    return Number(it.side_px) > 0 ? Number(it.side_px) : 0;
+  }
+
+  // 标注的物理尺寸展示（分轴反算；AI 落标 size_mm 常为 0 → 用 mpp 现算）
+  function rectItemSizeText(it) {
+    var w = rectItemW(it), h = rectItemH(it);
+    if (!(w > 0) || !(h > 0)) return "";
+    var mx = Number(state.mppX), my = Number(state.slide && state.slide.mppY);
+    if (!posNum(mx) || !posNum(my)) {
+      var mm0 = Number(it.size_mm);
+      return (mm0 > 0 && w === h) ? (mm0 + "mm") : "";
+    }
+    var wx = w * mx, hy = h * my; // µm
+    return (wx / 1000).toFixed(2) + "×" + (hy / 1000).toFixed(2) + "mm";
+  }
+
   // ---------- 保存图片（裁剪） ----------
   function saveCrop() {
-    if (!state.slide || state.roiMode == null) return;
+    if (!state.slide || !rectToolActive()) return;
     var r = state.roi;
     var name = state.slide.name;
     // Batch 4（§4.4）：多通道切片 crop 与屏幕瓦片同 render_token（服务端用同
@@ -1215,11 +1463,12 @@
     var token = (channelCtrl && channelCtrl.isMultichannel())
       ? channelCtrl.getToken() : null;
     var adapter = window.HP_API;
+    // 升级 C（§6.3-5）：v2 矩形走 x/y/w/h（输出尺寸精确等于 w/h）
     var url = (adapter && adapter.cropUrl)
-      ? adapter.cropUrl(name, Math.round(r.x), Math.round(r.y), Math.round(r.side), token)
+      ? adapter.cropUrl(name, Math.round(r.x), Math.round(r.y), Math.round(r.w), token)
       : "/api/slide/" + encodeURIComponent(name) +
         "/crop?x=" + Math.round(r.x) + "&y=" + Math.round(r.y) +
-        "&size=" + Math.round(r.side) +
+        "&w=" + Math.round(r.w) + "&h=" + Math.round(r.h) +
         (token ? "&render=" + encodeURIComponent(token) : "");
     var fp8 = ((channelCtrl && channelCtrl.getFingerprint()) || "").slice(0, 8);
     var multi = !!(channelCtrl && channelCtrl.isMultichannel() && token);
@@ -1237,9 +1486,9 @@
       })
       .then(function (blob) {
         var stem = name.replace(/\.[^.]+$/, "");
-        // 下载文件名与后端 Content-Disposition 同形：多通道带 fp 前 8 位（§4.4）
-        var fname = stem + "_" + state.roiMode + "mm_x" + Math.round(r.x) +
-          "_y" + Math.round(r.y) +
+        // 下载文件名与后端 Content-Disposition 同形：含宽高 + 多通道 fp 前 8 位
+        var fname = stem + "_x" + Math.round(r.x) + "_y" + Math.round(r.y) +
+          "_" + Math.round(r.w) + "x" + Math.round(r.h) + "px" +
           (multi && fp8 ? "_fp" + fp8 : "") + ".png";
         var a = document.createElement("a");
         var objUrl = URL.createObjectURL(blob);
@@ -1255,13 +1504,13 @@
       .catch(function (e) { toast(t("export.fail2", { s: e.message }), "error"); })
       .finally(function () {
         els.saveBtn.textContent = originalText;
-        els.saveBtn.disabled = state.roiMode == null;
+        els.saveBtn.disabled = !rectToolActive();
       });
   }
 
-  // ---------- 保存矩形选区为标注（管理员 rect 标注） ----------
+  // ---------- 保存矩形选区为标注（管理员 rect 标注，v2 成对 w/h） ----------
   function saveAnno() {
-    if (!state.slide || state.roiMode == null) return;
+    if (!state.slide || !rectToolActive()) return;
     var r = state.roi;
     var label = (els.annoLabelInput.value || "").trim() || t("anno.default.user");
     var body = {
@@ -1270,8 +1519,8 @@
       label: label,
       x: Math.round(r.x),
       y: Math.round(r.y),
-      side_px: Math.round(r.side),
-      size_mm: state.roiMode,
+      w: Math.round(r.w),
+      h: Math.round(r.h),
       shared: false,
       note: "",
     };
@@ -1297,27 +1546,24 @@
       })
       .catch(function (e) { toast(t("save.fail2", { e: e.message }), "error"); })
       .finally(function () {
-        els.saveAnnoBtn.disabled = state.roiMode == null;
+        els.saveAnnoBtn.disabled = !rectToolActive();
       });
   }
 
-  // ---------- 手动设置 mpp ----------
+  // ---------- 手动设置 mpp（等轴校准：显式操作，来源标记 manual） ----------
   function setMpp() {
     var v = parseFloat(els.mppInput.value);
     if (!isFinite(v) || v <= 0) { toast(t("mpp.invalid"), "error"); return; }
     state.mppX = v;
-    if (state.slide) { state.slide.mppX = v; state.slide.mppSource = "manual"; }
-    if (state.roiMode != null) {
-      var newSide = roiSide(state.roiMode);
-      var W = state.slide.width, H = state.slide.height;
-      var cx = state.roi.x + state.roi.side / 2;
-      var cy = state.roi.y + state.roi.side / 2;
-      var x = clamp(cx - newSide / 2, 0, Math.max(0, W - newSide));
-      var y = clamp(cy - newSide / 2, 0, Math.max(0, H - newSide));
-      state.roi.x = Math.round(x); state.roi.y = Math.round(y);
-      state.roi.side = newSide;
-      updateRoiOverlay();
+    if (state.slide) {
+      state.slide.mppX = v;
+      // 升级 C（§6.2）：单一输入的等轴校准是显式选择——两轴同值并标 manual
+      state.slide.mppY = v;
+      state.slide.mppSource = "manual";
     }
+    // 升级 C（§6.2）：MPP/校准更新不重写已有标注（及当前选区）的像素范围，
+    // 只更新物理显示——refresh 显示层即可。
+    updateRoiOverlay();
     updateMppSetterVisibility();
     toast(t("mpp.set.ok", { v: v }), "success");
   }
@@ -1913,6 +2159,9 @@
     if (hours == null) { toast(t("share.need.hours"), "error"); return; }
     var roiSizes = getShareRoiSizes();
     var permissions = getSharePermissions();
+    // 升级 C（§6.4）：矩形策略档位（preset_only 缺省；custom 显式选择）
+    var rectPolicy = (els.shareRectPolicySelect && els.shareRectPolicySelect.value)
+      || "preset_only";
     els.shareCreateBtn.disabled = true;
     els.shareCreateBtn.textContent = t("share.creating");
     apiFetch("/api/share/create", {
@@ -1920,7 +2169,7 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         slides: slides, expires_hours: hours, roi_sizes: roiSizes,
-        permissions: permissions,
+        permissions: permissions, rect_policy: rectPolicy,
       }),
     })
       .then(function (r) {
@@ -2317,8 +2566,9 @@
     // AI 落标（进标注库 source=ai）给半透明青色填充，区别于人工标注（#3）
     var isAi = (it.source === "ai");
     if (typ === "rect") {
+      var w0 = rectItemW(it), h0 = rectItemH(it);
       var tl = imgToCanvas(it.x, it.y);
-      var br = imgToCanvas(it.x + it.side_px, it.y + it.side_px);
+      var br = imgToCanvas(it.x + w0, it.y + h0);
       var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
       var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
       // 半透明填充：AI 标注青色（更醒目），人工标注用 label 哈希淡色
@@ -2340,8 +2590,7 @@
       if (lbl) {
         // 有备注气泡时标签改画在框内左上，避免和框顶居中的 callout 叠在一起
         var hasNote = String(it.note || "").trim();
-        var mm = rectSizeMm(it);
-        var sizeTxt = (mm != null) ? (mm + "mm") : "";
+        var sizeTxt = rectItemSizeText(it);
         drawLabel(it.label, x, y, sizeTxt, null, !!hasNote);
       }
     } else if (typ === "arrow") {
@@ -2465,7 +2714,7 @@
     var typ = it.type || "rect";
     if (typ === "rect") {
       var tl = imgToCanvas(it.x, it.y);
-      var br = imgToCanvas(it.x + it.side_px, it.y + it.side_px);
+      var br = imgToCanvas(it.x + rectItemW(it), it.y + rectItemH(it));
       var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
       var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
       return { x: x + w / 2, y: y, minSide: Math.min(w, h) };
@@ -2589,7 +2838,7 @@
       var typ = it.type || "rect";
       if (typ === "rect") {
         var tl = imgToCanvas(it.x, it.y);
-        var br = imgToCanvas(it.x + it.side_px, it.y + it.side_px);
+        var br = imgToCanvas(it.x + rectItemW(it), it.y + rectItemH(it));
         var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
         var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
         if (sx >= x - 6 && sx <= x + w + 6 && sy >= y - 6 && sy <= y + h + 6) return it;
@@ -2612,7 +2861,7 @@
     var out = [];
     if (typ === "rect") {
       var tl = imgToCanvas(it.x, it.y);
-      var br = imgToCanvas(it.x + it.side_px, it.y + it.side_px);
+      var br = imgToCanvas(it.x + rectItemW(it), it.y + rectItemH(it));
       var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
       var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
       out = [
@@ -2735,6 +2984,11 @@
 
   function onAnnoPointerDown(e) {
     if (!state.slide) return;
+    // 矩形工具优先（升级 C：画布层拖出矩形/点击中心放置）
+    if (rectToolActive()) {
+      onRectCanvasPointerDown(e);
+      return;
+    }
     // 绘制模式优先
     if (state.drawMode) {
       e.preventDefault(); e.stopPropagation();
@@ -2773,6 +3027,11 @@
   }
 
   function onAnnoPointerMove(e) {
+    // 矩形工具：拖出预览（升级 C）
+    if (rectToolActive() && rectDrawInfo) {
+      onRectCanvasPointerMove(e);
+      return;
+    }
     if (state.drawMode && drawPreview) {
       e.preventDefault(); e.stopPropagation();
       var img = screenToImg(e);
@@ -2796,6 +3055,11 @@
   }
 
   function onAnnoPointerUp(e) {
+    // 矩形工具：完成拖出 / 点击放置（升级 C）
+    if (rectToolActive() && rectDrawInfo) {
+      onRectCanvasPointerUp(e);
+      return;
+    }
     if (state.drawMode && drawPreview) {
       e.preventDefault(); e.stopPropagation();
       finishDraw();
@@ -2822,7 +3086,10 @@
 
   function snapshotGeom(it) {
     var typ = it.type || "rect";
-    if (typ === "rect") return { x: it.x, y: it.y, side_px: it.side_px };
+    if (typ === "rect") {
+      return { x: it.x, y: it.y, w: rectItemW(it), h: rectItemH(it),
+               side_px: it.side_px };
+    }
     if (typ === "arrow") return { x1: it.x1, y1: it.y1, x2: it.x2, y2: it.y2 };
     if (typ === "freehand") return { points: (it.points || []).map(function (p) { return [p[0], p[1]]; }) };
     return {};
@@ -2838,28 +3105,28 @@
     var s = d.start;
 
     if (typ === "rect") {
+      // 升级 C（§6.1）：四角改双轴、四边改单轴——不再 max(w,h) 正方形化。
+      var W = state.slide.width, H = state.slide.height;
       if (d.handle === "move") {
-        it.x = Math.max(0, Math.round(s.x + dx));
-        it.y = Math.max(0, Math.round(s.y + dy));
+        it.x = clamp(Math.round(s.x + dx), 0, Math.max(0, W - s.w));
+        it.y = clamp(Math.round(s.y + dy), 0, Math.max(0, H - s.h));
       } else {
-        var anchorX;
-        if (d.handle === "tl" || d.handle === "bl" || d.handle === "l") anchorX = s.x + s.side_px;
-        else if (d.handle === "tr" || d.handle === "br" || d.handle === "r") anchorX = s.x;
-        else anchorX = s.x + s.side_px / 2;
-        var anchorY;
-        if (d.handle === "tl" || d.handle === "t" || d.handle === "tr") anchorY = s.y + s.side_px;
-        else if (d.handle === "bl" || d.handle === "b" || d.handle === "br") anchorY = s.y;
-        else anchorY = s.y + s.side_px / 2;
-        var spanX = Math.abs(cur.x - anchorX);
-        var spanY = Math.abs(cur.y - anchorY);
-        var side = clamp(Math.round(Math.max(spanX, spanY)), 1, 40000);
-        var nx = (cur.x <= anchorX) ? (anchorX - side) : anchorX;
-        var ny = (cur.y <= anchorY) ? (anchorY - side) : anchorY;
-        if (d.handle === "t" || d.handle === "b") nx = s.x + s.side_px / 2 - side / 2;
-        if (d.handle === "l" || d.handle === "r") ny = s.y + s.side_px / 2 - side / 2;
-        it.side_px = side;
-        it.x = Math.max(0, Math.round(nx));
-        it.y = Math.max(0, Math.round(ny));
+        var moveL = d.handle.indexOf("l") >= 0;
+        var moveR = d.handle.indexOf("r") >= 0;
+        var moveT = d.handle.indexOf("t") >= 0;
+        var moveB = d.handle.indexOf("b") >= 0;
+        var anchorX = moveL ? s.x + s.w : (moveR ? s.x : s.x);
+        if (!moveL && !moveR) anchorX = s.x; // t/b 不改 x 轴
+        var anchorY = moveT ? s.y + s.h : (moveB ? s.y : s.y);
+        if (!moveT && !moveB) anchorY = s.y;
+        var x0 = (moveL || moveR) ? anchorX : s.x;
+        var x1 = (moveL || moveR) ? cur.x : s.x + s.w;
+        var y0 = (moveT || moveB) ? anchorY : s.y;
+        var y1 = (moveT || moveB) ? cur.y : s.y + s.h;
+        var n = normalizeRect(x0, y0, x1, y1, false);
+        if (n) {
+          it.x = n.x; it.y = n.y; it.w = n.w; it.h = n.h;
+        }
       }
     } else if (typ === "arrow") {
       if (d.handle === "p1") {
@@ -3044,8 +3311,8 @@
         var typIcon = (it.type === "arrow") ? "↗" : (it.type === "freehand" ? "〰" : "▭");
         var sizeStr = "";
         if ((it.type || "rect") === "rect") {
-          var mm = rectSizeMm(it);
-          if (mm != null) sizeStr = " · " + mm + "mm";
+          var mmTxt = rectItemSizeText(it);
+          if (mmTxt) sizeStr = " · " + mmTxt;
         }
         else if (it.type === "arrow") sizeStr = " · (" + it.x1 + "," + it.y1 + ")→(" + it.x2 + "," + it.y2 + ")";
         else if (it.type === "freehand") sizeStr = " · " + t("anno.free.points", { n: (it.points ? it.points.length : 0) });
@@ -3304,7 +3571,9 @@
       side = Math.max(Math.max.apply(null, xs) - x, Math.max.apply(null, ys) - y);
       side = Math.max(side, 1);
     } else {
-      x = it.x; y = it.y; side = it.side_px;
+      // 升级 C：按真实 w/h 包围（不重新正方形化）
+      x = it.x; y = it.y;
+      side = Math.max(rectItemW(it), rectItemH(it));
     }
     // 扩 20% 边距
     var pad = side * 0.2;
@@ -3418,14 +3687,16 @@
     if (wrap) { wrap.innerHTML = ""; wrap.style.display = "none"; }
   }
 
-  // 收集编辑后几何（图片坐标，round 整数，clamp ≥0）
+  // 收集编辑后几何（图片坐标，round 整数，clamp ≥0）。升级 C：rect 以成对
+  // w/h 提交（v2 契约），附带 expected_revision（CAS，§6.1）。
   function buildEditGeom(it) {
     var typ = it.type || "rect";
     var g = {};
     if (typ === "rect") {
       g.x = Math.max(0, Math.round(it.x));
       g.y = Math.max(0, Math.round(it.y));
-      g.side_px = clamp(Math.round(it.side_px), 1, 40000);
+      g.w = clamp(Math.round(rectItemW(it)), 1, RECT_MAX_SIDE_PX);
+      g.h = clamp(Math.round(rectItemH(it)), 1, RECT_MAX_SIDE_PX);
     } else if (typ === "arrow") {
       g.x1 = Math.max(0, Math.round(it.x1));
       g.y1 = Math.max(0, Math.round(it.y1));
@@ -3439,15 +3710,17 @@
     return g;
   }
 
-  // 提交管理员编辑：PATCH geom + note（index 直接用 it.index，无则兜底反推）
+  // 提交管理员编辑：PATCH geom + note（index 直接用 it.index，无则兜底反推）。
+  // 升级 C（§6.1）：携带 expected_revision（CAS）；冲突（409）显示当前版本
+  // ——重新拉取服务端最新状态，不静默覆盖。
   function commitAdminEdit(it, noteVal) {
     var geom = buildEditGeom(it);
     var body = { geom: geom, note: noteVal };
-    // rect 的 size_mm 前端重算
-    if ((it.type || "rect") === "rect" && state.mppX && state.mppX > 0) {
-      body.geom.size_mm = Math.round(geom.side_px * state.mppX / 1000 * 100) / 100;
-    } else if ((it.type || "rect") === "rect") {
-      body.geom.size_mm = it.size_mm != null ? it.size_mm : 0;
+    if (Number(it.revision) > 0) body.expected_revision = Number(it.revision);
+    // rect 的 size_mm 前端重算（仅真正方形的兼容展示字段；v2 附属信息）
+    if ((it.type || "rect") === "rect" && geom.w === geom.h &&
+        state.mppX && state.mppX > 0) {
+      body.geom.size_mm = Math.round(geom.w * state.mppX / 1000 * 100) / 100;
     }
     resolveIndexFast(it)
       .then(function (index) {
@@ -3456,6 +3729,15 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         }).then(function (r) {
+          if (r.status === 409) {
+            // CAS 冲突：显示当前版本，不静默覆盖
+            return r.json().then(function (j) {
+              var err = new Error(j.error || "revision_conflict");
+              err.conflict = true;
+              err.currentRevision = j.current_revision;
+              throw err;
+            });
+          }
           if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("save.fail")); });
           return r.json();
         });
@@ -3471,7 +3753,18 @@
           renderUnfiled();
         });
       })
-      .catch(function (e) { toast(t("save.fail2", { e: e.message }), "error"); });
+      .catch(function (e) {
+        if (e && e.conflict) {
+          toast(t("edit.conflict", { rev: e.currentRevision != null ? e.currentRevision : "?" }), "error");
+          // 拉取当前版本并恢复显示（不保留本地未提交的几何修改）
+          editItem = null;
+          editing = false;
+          closeEditCard();
+          refreshCurrentAnnotations();
+        } else {
+          toast(t("save.fail2", { e: e.message }), "error");
+        }
+      });
   }
 
   function cancelAdminEdit(it) {
@@ -3998,8 +4291,6 @@
     els.rotateBtn.addEventListener("click", rotate);
     els.flipBtn.addEventListener("click", flip);
     els.resetBtn.addEventListener("click", reset);
-    els.roi6.addEventListener("click", function () { toggleRoi(6); });
-    els.roi65.addEventListener("click", function () { toggleRoi(6.5); });
     els.saveBtn.addEventListener("click", saveCrop);
     els.saveAnnoBtn.addEventListener("click", saveAnno);
     els.mppSetBtn.addEventListener("click", setMpp);
@@ -4023,16 +4314,40 @@
     if (els.annoAllToggle) els.annoAllToggle.addEventListener("click", toggleAnnoAll);
     els.annoArrowBtn.addEventListener("click", function () { toggleDrawMode("arrow"); });
     els.annoFreeBtn.addEventListener("click", function () { toggleDrawMode("freehand"); });
-    // 移动端 ROI 滑块分段：点一段切换该尺寸，再点同段退出
-    if (els.roiBoxBtn) {
-      els.roiBoxBtn.querySelectorAll(".roi-slider-seg").forEach(function (seg) {
-        seg.addEventListener("click", function () {
-          if (seg.classList.contains("disabled")) return;
-          toggleRoi(Number(seg.getAttribute("data-size")));
-        });
-      });
-      syncRoiSlider();
+    // 升级 C：单一矩形入口 + 紧凑设置区（旧 6/6.5 分段/滑块已移除）
+    if (els.roiRectBtn) {
+      els.roiRectBtn.addEventListener("click", toggleRectTool);
     }
+    if (els.roiUnitSelect) {
+      els.roiUnitSelect.addEventListener("change", function () {
+        state.roiUnit = els.roiUnitSelect.value;
+        syncRoiSettings();
+      });
+    }
+    if (els.roiLockRatio) {
+      els.roiLockRatio.addEventListener("change", function () {
+        state.roiLockRatio = !!els.roiLockRatio.checked;
+      });
+    }
+    if (els.roiPresetSelect) {
+      els.roiPresetSelect.addEventListener("change", function () {
+        state.roiPreset = els.roiPresetSelect.value;
+        if (!state.roiPreset) return;
+        // 预设只填入宽高数值（mm），不强制永远锁成正方形（§6.1）
+        state.roiUnit = "mm";
+        if (els.roiUnitSelect) els.roiUnitSelect.value = "mm";
+        els.roiWInput.value = state.roiPreset;
+        els.roiHInput.value = state.roiPreset;
+        applyRectInputs();
+      });
+    }
+    [els.roiWInput, els.roiHInput].forEach(function (inp) {
+      if (!inp) return;
+      inp.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") { e.preventDefault(); applyRectInputs(); }
+      });
+      inp.addEventListener("change", applyRectInputs);
+    });
 
     // 标注画布层绘制事件
     var c = els.annoCanvas;
@@ -4041,6 +4356,14 @@
     c.addEventListener("pointerup", onAnnoPointerUp);
     c.addEventListener("pointercancel", onAnnoPointerUp);
     window.addEventListener("resize", function () { resizeAnnoCanvas(); redrawAnnoCanvas(); });
+    // 升级 C（§6.1）：Escape 取消未保存矩形选区（无输入焦点时）
+    window.addEventListener("keydown", function (e) {
+      if (e.key !== "Escape") return;
+      var t = e.target;
+      var tag = t && t.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (rectToolActive()) onRectKeydown(e);
+    });
 
     // 手机端侧栏抽屉：菜单按钮切换、遮罩点击关闭
     if (els.menuBtn) {
@@ -4287,14 +4610,20 @@
         }
       }
       if (match) { jumpToAnno(match); return { ok: true, focused: true }; }
-      var side = Number(p.side_px) || 0;
-      if (viewer && viewer.viewport && p.x != null && side > 0) {
-        var pad = side * 0.2;
+      // 升级 C：聚焦兜底优先成对 w/h；旧 side_px = 正方形兼容（不 max/min 冒充）
+      var fw = Number(p.w) > 0 ? Number(p.w)
+        : (Number(p.width_px) > 0 ? Number(p.width_px)
+          : (Number(p.side_px) > 0 ? Number(p.side_px) : 0));
+      var fh = Number(p.h) > 0 ? Number(p.h)
+        : (Number(p.height_px) > 0 ? Number(p.height_px)
+          : (Number(p.side_px) > 0 ? Number(p.side_px) : 0));
+      if (viewer && viewer.viewport && p.x != null && fw > 0 && fh > 0) {
+        var padX = fw * 0.2, padY = fh * 0.2;
         try {
           viewer.viewport.fitBounds(
-            viewer.viewport.imageToViewportRectangle(p.x - pad, p.y - pad, side + pad * 2, side + pad * 2));
+            viewer.viewport.imageToViewportRectangle(p.x - padX, p.y - padY, fw + padX * 2, fh + padY * 2));
         } catch (e) {}
-        aiOverlay = [{ x: p.x, y: p.y, w: side, h: side, magnification: "" }];
+        aiOverlay = [{ x: p.x, y: p.y, w: fw, h: fh, magnification: "" }];
         redrawAnnoCanvas();
       }
       return { ok: true, focused: false };
@@ -4314,8 +4643,9 @@
     });
   }
 
-  // 通用插件 annotation.create 的 host 端实现（Stage 5-2）。入参 p: {text, x, y, w, h}
-  // （level-0 坐标）；rect 类型 side_px 取 max(w,h)（正方形侧边长，同平台 saveAnnotation）。
+  // 通用插件 annotation.create 的 host 端实现（Stage 5-2 / 升级 C）。入参
+  // p: {text, x, y, w, h}（level-0 坐标，v2 成对 w/h 直通）或旧形态
+  // {text, x, y, side_px}（正方形兼容）。**不再取 max(w,h) 正方形化**。
   // 复用 app.js 现有创建标注的 fetch 形态（见 saveAnnotation，POST /api/annotation，
   // body 含 slide/type/label + 几何字段），成功触发 refreshCurrentAnnotations +
   // loadAnnotationsIndex（与 saveAnnotation / 插件 annotation.changed 一致），
@@ -4323,16 +4653,27 @@
   function createPluginAnnotation(p) {
     if (!state.slide) throw { code: "annotation_create_failed", message: "当前无切片", retryable: false };
     p = p || {};
-    var side = Math.round(Math.max(Number(p.w) || 0, Number(p.h) || 0));
-    if (!(side >= 1)) throw { code: "annotation_create_failed", message: "标注尺寸非法", retryable: false };
     var body = {
       slide: state.slide.name,
       type: "rect",
       label: String(p.text != null ? p.text : "插件标注"),
       x: Math.round(Number(p.x) || 0),
       y: Math.round(Number(p.y) || 0),
-      side_px: side,
     };
+    var pw = Number(p.w), ph = Number(p.h), ps = Number(p.side_px);
+    if (isFinite(pw) && pw > 0 && isFinite(ph) && ph > 0) {
+      // v2：w/h 直通（插件的矩形不再被取 max 转正方形）
+      body.w = Math.round(pw);
+      body.h = Math.round(ph);
+      // v2 与 side_px 同给：仅一致正方形的冗余兼容，矛盾组合拒绝
+      if (isFinite(ps) && ps > 0 && !(Math.round(ps) === body.w && Math.round(ps) === body.h)) {
+        throw { code: "annotation_create_failed", message: "side_px 与 w/h 冲突", retryable: false };
+      }
+    } else if (isFinite(ps) && ps > 0) {
+      body.side_px = Math.round(ps); // 旧调用形态：正方形兼容
+    } else {
+      throw { code: "annotation_create_failed", message: "标注尺寸非法", retryable: false };
+    }
     return apiFetch("/api/annotation", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -4353,13 +4694,15 @@
     });
   }
 
-  // 当前选区 bbox（ROI 框 或 选中标注），供插件 selection.getBbox 使用
+  // 当前选区 bbox（ROI 矩形 或 选中标注），供插件 selection.getBbox 使用。
+  // 升级 C：level-0 {x,y,w,h}；不再以单边长冒充 w/h。
   function currentSelectionBbox() {
-    if (state.roi && state.roi.side > 0) {
-      return { x: state.roi.x, y: state.roi.y, w: state.roi.side, h: state.roi.side };
+    if (state.roi && state.roi.w > 0 && state.roi.h > 0) {
+      return { x: state.roi.x, y: state.roi.y, w: state.roi.w, h: state.roi.h };
     }
-    if (editItem && editItem.type === "rect" && editItem.side_px) {
-      return { x: editItem.x, y: editItem.y, w: editItem.side_px, h: editItem.side_px };
+    if (editItem && editItem.type === "rect" && rectItemW(editItem) > 0) {
+      return { x: editItem.x, y: editItem.y,
+               w: rectItemW(editItem), h: rectItemH(editItem) };
     }
     return null;
   }

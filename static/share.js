@@ -963,13 +963,28 @@
     });
   }
 
+  // 升级 C：rect 读取真实 w/h（v2 成对 w/h 权威；旧 side_px 正方形兼容）。
+  // 展示/命中/编辑不重新正方形化，非正方形不冒充。
+  function rectItemW(it) {
+    var w = Number(it && it.w);
+    if (isFinite(w) && w > 0) return w;
+    var s = Number(it && it.side_px);
+    return (isFinite(s) && s > 0) ? s : 0;
+  }
+  function rectItemH(it) {
+    var h = Number(it && it.h);
+    if (isFinite(h) && h > 0) return h;
+    var s = Number(it && it.side_px);
+    return (isFinite(s) && s > 0) ? s : 0;
+  }
+
   function drawAnnoItem(it, color, selected, showText) {
     var typ = it.type || "rect";
     var hlStroke = selected ? "#007AFF" : null;
     var lbl = showText ? it.label : null;
     if (typ === "rect") {
       var tl = imgToCanvas(it.x, it.y);
-      var br = imgToCanvas(it.x + it.side_px, it.y + it.side_px);
+      var br = imgToCanvas(it.x + rectItemW(it), it.y + rectItemH(it));
       var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
       var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
       // 选中高亮：先画一层加粗蓝边
@@ -985,7 +1000,7 @@
       [[x, y], [x + w, y], [x, y + h], [x + w, y + h]].forEach(function (p) {
         annoCtx.beginPath(); annoCtx.arc(p[0], p[1], 3, 0, Math.PI * 2); annoCtx.fill();
       });
-      if (lbl) drawLabel(it.label, x, y, it.size_mm != null ? (it.size_mm + "mm") : "");
+      if (lbl) drawLabel(it.label, x, y, (it.size_mm > 0 && rectItemW(it) === rectItemH(it)) ? (it.size_mm + "mm") : "");
     } else if (typ === "arrow") {
       drawArrow(it.x1, it.y1, it.x2, it.y2, hlStroke || color.stroke, lbl);
     } else if (typ === "freehand") {
@@ -1101,7 +1116,7 @@
     var typ = it.type || "rect";
     if (typ === "rect") {
       var tl = imgToCanvas(it.x, it.y);
-      var br = imgToCanvas(it.x + it.side_px, it.y + it.side_px);
+      var br = imgToCanvas(it.x + rectItemW(it), it.y + rectItemH(it));
       var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
       var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
       return { x: x + w / 2, y: y, minSide: Math.min(w, h) };
@@ -1265,7 +1280,7 @@
       var typ = it.type || "rect";
       if (typ === "rect") {
         var tl = imgToCanvas(it.x, it.y);
-        var br = imgToCanvas(it.x + it.side_px, it.y + it.side_px);
+        var br = imgToCanvas(it.x + rectItemW(it), it.y + rectItemH(it));
         var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
         var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
         if (sx >= x - 6 && sx <= x + w + 6 && sy >= y - 6 && sy <= y + h + 6) return it;
@@ -1296,7 +1311,7 @@
     var out = [];
     if (typ === "rect") {
       var tl = imgToCanvas(it.x, it.y);
-      var br = imgToCanvas(it.x + it.side_px, it.y + it.side_px);
+      var br = imgToCanvas(it.x + rectItemW(it), it.y + rectItemH(it));
       var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
       var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
       out = [
@@ -1457,9 +1472,11 @@
     var typ = it.type || "rect";
     var g = {};
     if (typ === "rect") {
+      // 升级 C：成对 w/h 提交（v2 契约；正方形 side_px 兼容由服务端归一）
       g.x = Math.max(0, Math.round(it.x));
       g.y = Math.max(0, Math.round(it.y));
-      g.side_px = clamp(Math.round(it.side_px), 1, 40000);
+      g.w = clamp(Math.round(rectItemW(it)), 1, 40000);
+      g.h = clamp(Math.round(rectItemH(it)), 1, 40000);
     } else if (typ === "arrow") {
       g.x1 = Math.max(0, Math.round(it.x1));
       g.y1 = Math.max(0, Math.round(it.y1));
@@ -1477,22 +1494,34 @@
   function commitEdit(it, noteVal) {
     var geom = buildEditGeom(it);
     var body = { geom: geom, note: noteVal };
-    // rect 的 size_mm 前端重算
-    if ((it.type || "rect") === "rect" && state.mppX && state.mppX > 0) {
-      body.geom.size_mm = Math.round(geom.side_px * state.mppX / 1000 * 100) / 100;
-    } else if ((it.type || "rect") === "rect") {
-      body.geom.size_mm = it.size_mm != null ? it.size_mm : 0;
+    // rect 的 size_mm 前端重算（仅真正方形的兼容展示字段）
+    if ((it.type || "rect") === "rect" && geom.w === geom.h && state.mppX && state.mppX > 0) {
+      body.geom.size_mm = Math.round(geom.w * state.mppX / 1000 * 100) / 100;
     }
+    // 升级 C（§6.1）：编辑已保存矩形遵守 revision/CAS；冲突显示当前版本
+    if (Number(it.revision) > 0) body.expected_revision = Number(it.revision);
     fetch(API + "/api/roi/" + it.index, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     })
       .then(function (r) {
-        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("save.fail")); });
+        if (r.status === 409) {
+          // CAS 冲突：重新拉取服务端当前版本，不静默覆盖
+          return r.json().then(function (j) {
+            toast(t("edit.conflict", { rev: j && j.current_revision != null ? j.current_revision : "?" }), "error");
+            editItem = null;
+            state.editing = false;
+            closeEditCard();
+            refreshRoisOnce();
+            return { conflict: true };
+          });
+        }
+        if (!r.ok) return r.json().then(function (j2) { throw new Error(j2.error || t("save.fail")); });
         return r.json();
       })
-      .then(function () {
+      .then(function (out) {
+        if (out && out.conflict) return;
         toast(t("edit.saved"), "success");
         editItem = null;
         state.editing = false;
@@ -1639,7 +1668,7 @@
   function snapshotGeom(it) {
     var typ = it.type || "rect";
     if (typ === "rect") {
-      return { x: it.x, y: it.y, side_px: it.side_px };
+      return { x: it.x, y: it.y, w: rectItemW(it), h: rectItemH(it) };
     } else if (typ === "arrow") {
       return { x1: it.x1, y1: it.y1, x2: it.x2, y2: it.y2 };
     } else if (typ === "freehand") {
@@ -1661,44 +1690,31 @@
 
     if (typ === "rect") {
       if (d.handle === "move") {
-        it.x = Math.max(0, Math.round(s.x + dx));
-        it.y = Math.max(0, Math.round(s.y + dy));
+        var Ws = state.slide.width, Hs = state.slide.height;
+        it.x = clamp(Math.round(s.x + dx), 0, Math.max(0, Ws - s.w));
+        it.y = clamp(Math.round(s.y + dy), 0, Math.max(0, Hs - s.h));
       } else {
-        // 角/边手柄：以对角/对边为锚，保持正方形 side = max(spanX, spanY)
-        // 锚点 X：handle 在左侧（含 l）→ 锚为右边 s.x+side；在右侧（含 r）→ 锚为左边 s.x；
-        //         纯上/下边（t/b）→ 锚为中心，x 围绕中心对称缩放
-        var anchorX;
-        if (d.handle === "tl" || d.handle === "bl" || d.handle === "l") {
-          anchorX = s.x + s.side_px;
-        } else if (d.handle === "tr" || d.handle === "br" || d.handle === "r") {
-          anchorX = s.x;
-        } else {
-          anchorX = s.x + s.side_px / 2;  // t / b
+        // 升级 C：角改双轴、边改单轴（不重新正方形化）
+        var moveL = d.handle.indexOf("l") >= 0;
+        var moveR = d.handle.indexOf("r") >= 0;
+        var moveT = d.handle.indexOf("t") >= 0;
+        var moveB = d.handle.indexOf("b") >= 0;
+        var anchorX = (moveL || moveR) ? (moveL ? s.x + s.w : s.x) : s.x;
+        var anchorY = (moveT || moveB) ? (moveT ? s.y + s.h : s.y) : s.y;
+        var x0 = (moveL || moveR) ? anchorX : s.x;
+        var x1 = (moveL || moveR) ? cur.x : s.x + s.w;
+        var y0 = (moveT || moveB) ? anchorY : s.y;
+        var y1 = (moveT || moveB) ? cur.y : s.y + s.h;
+        var W2 = state.slide.width, H2 = state.slide.height;
+        if ([x0, y0, x1, y1].every(isFinite)) {
+          var nxx = Math.max(0, Math.round(Math.min(x0, x1)));
+          var nyy = Math.max(0, Math.round(Math.min(y0, y1)));
+          var nw = Math.min(Math.max(Math.round(Math.abs(x1 - x0)), 1), 40000);
+          var nh = Math.min(Math.max(Math.round(Math.abs(y1 - y0)), 1), 40000);
+          nxx = Math.min(nxx, Math.max(0, W2 - nw));
+          nyy = Math.min(nyy, Math.max(0, H2 - nh));
+          it.x = nxx; it.y = nyy; it.w = nw; it.h = nh;
         }
-        var anchorY;
-        if (d.handle === "tl" || d.handle === "t" || d.handle === "tr") {
-          anchorY = s.y + s.side_px;
-        } else if (d.handle === "bl" || d.handle === "b" || d.handle === "br") {
-          anchorY = s.y;
-        } else {
-          anchorY = s.y + s.side_px / 2;  // l / r
-        }
-        var spanX = Math.abs(cur.x - anchorX);
-        var spanY = Math.abs(cur.y - anchorY);
-        var side = clamp(Math.round(Math.max(spanX, spanY)), 1, 40000);
-        // 新左上角：指针在锚左侧 → 左上角 = 锚 - side；右侧 → 左上角 = 锚
-        var nx = (cur.x <= anchorX) ? (anchorX - side) : anchorX;
-        var ny = (cur.y <= anchorY) ? (anchorY - side) : anchorY;
-        // 边手柄：保持中心轴不动（仅单轴缩放等效为整体居中）
-        if (d.handle === "t" || d.handle === "b") {
-          nx = s.x + s.side_px / 2 - side / 2;
-        }
-        if (d.handle === "l" || d.handle === "r") {
-          ny = s.y + s.side_px / 2 - side / 2;
-        }
-        it.side_px = side;
-        it.x = Math.max(0, Math.round(nx));
-        it.y = Math.max(0, Math.round(ny));
       }
     } else if (typ === "arrow") {
       if (d.handle === "p1") {
@@ -1919,7 +1935,7 @@
       // 尺寸/坐标摘要
       var szEl = document.createElement("span");
       szEl.className = "rpi-size";
-      if (typ === "rect") szEl.textContent = " · " + r.size_mm + "mm";
+      if (typ === "rect" && r.size_mm > 0 && rectItemW(r) === rectItemH(r)) szEl.textContent = " · " + r.size_mm + "mm";
       else if (typ === "arrow") szEl.textContent = " · (" + r.x1 + "," + r.y1 + ")";
       else szEl.textContent = " · " + t("anno.free.points", { n: (r.points ? r.points.length : 0) });
       title.appendChild(szEl);
@@ -2080,13 +2096,14 @@
       x = Math.min.apply(null, xs); y = Math.min.apply(null, ys);
       side = Math.max(Math.max.apply(null, xs) - x, Math.max.apply(null, ys) - y);
     } else {
-      x = r.x; y = r.y; side = r.side_px;
+      // 升级 C：真实 w/h 包围；非正方形不冒充 side_px
+      x = r.x; y = r.y; side = Math.max(rectItemW(r), rectItemH(r));
     }
     side = Math.max(side, 1);
     var pad = side * 0.2;
-    // rect 用 rebuildRoi 重建选区框；arrow/freehand 仅 fitBounds（画布层已显示）
-    if (typ === "rect") {
-      rebuildRoi(r.x, r.y, r.side_px, r.size_mm);
+    // rect 用 rebuildRoi 重建选区框（仅正方形预设可选回）；非正方形仅定位
+    if (typ === "rect" && rectItemW(r) === rectItemH(r)) {
+      rebuildRoi(r.x, r.y, rectItemW(r), r.size_mm);
     }
     try {
       var rect = viewer.viewport.imageToViewportRectangle(

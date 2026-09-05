@@ -41,14 +41,27 @@
       </div>
 
       {% if C.roi %}
-      <div class="seg-control roi-group" role="group" aria-label="ROI 分段" data-i18n-aria="tb.roi.group">
-        <button id="roi-6" class="seg roi-btn" data-size="6"><span class="tb-txt">ROI </span>6mm</button>
-        <button id="roi-6-5" class="seg roi-btn" data-size="6.5"><span class="tb-txt">ROI </span>6.5mm</button>
-      </div>
-      <div id="roi-box-btn" class="roi-slider" role="group" aria-label="矩形标记尺寸" data-i18n-aria="tb.roi.mark.group">
-        <span class="roi-slider-thumb" aria-hidden="true"></span>
-        <button type="button" class="roi-slider-seg" data-size="6" aria-label="6 毫米矩形标记" data-i18n-title="tb.roi.mark.6">6</button>
-        <button type="button" class="roi-slider-seg" data-size="6.5" aria-label="6.5 毫米矩形标记" data-i18n-title="tb.roi.mark.6.5">6.5</button>
+      {# 升级 C（§6.1）：两个固定 ROI 按钮替换为单个「矩形」入口 + 紧凑设置区
+         （宽/高/单位/锁定比例/预设；默认不锁定比例）。#}
+      <div class="roi-rect-wrap">
+        <button id="roi-rect-btn" class="tool-btn roi-rect-btn" aria-expanded="false" aria-controls="roi-settings" data-i18n-title="tb.rect.title"><span aria-hidden="true">▭</span><span class="tb-txt" data-i18n="tb.rect"> 矩形</span></button>
+        <div id="roi-settings" class="roi-settings" role="group" aria-label="矩形尺寸" data-i18n-aria="tb.rect.settings.aria" hidden>
+          <label class="roi-set-field"><span data-i18n="tb.rect.w">宽</span>
+            <input id="roi-w-input" class="roi-num" type="number" min="0" step="any" autocomplete="off" /></label>
+          <label class="roi-set-field"><span data-i18n="tb.rect.h">高</span>
+            <input id="roi-h-input" class="roi-num" type="number" min="0" step="any" autocomplete="off" /></label>
+          <select id="roi-unit-select" class="roi-unit" data-i18n-title="tb.rect.unit.title">
+            <option value="mm" data-i18n="tb.rect.unit.mm">mm</option>
+            <option value="um" data-i18n="tb.rect.unit.um">μm</option>
+            <option value="px" data-i18n="tb.rect.unit.px">px</option>
+          </select>
+          <label class="roi-set-lock" data-i18n-title="tb.rect.lock.title"><input id="roi-lock-ratio" type="checkbox" /><span data-i18n="tb.rect.lock">锁比例</span></label>
+          <select id="roi-preset-select" class="roi-preset" data-i18n-title="tb.rect.preset.title">
+            <option value="" data-i18n="tb.rect.preset.none">预设</option>
+            <option value="6" data-i18n="tb.rect.preset.6">6×6 mm</option>
+            <option value="6.5" data-i18n="tb.rect.preset.6.5">6.5×6.5 mm</option>
+          </select>
+        </div>
       </div>
       {% endif %}
 
@@ -195,6 +208,12 @@
                 <option value="both" selected data-i18n="sb.share.roi.both">标记：两者</option>
                 <option value="6" data-i18n="sb.share.roi.6">仅 6mm</option>
                 <option value="6.5" data-i18n="sb.share.roi.6.5">仅 6.5mm</option>
+              </select>
+              {# 升级 C（§6.4）：矩形策略档位。旧分享缺字段一律 preset_only；
+                   custom 仅在创建者显式选择时授予任意宽高矩形。#}
+              <select id="share-rect-policy-select" class="select" data-i18n-title="sb.share.rect.title" title="矩形标记策略">
+                <option value="preset_only" selected data-i18n="sb.share.rect.preset">矩形：仅预设 6/6.5mm</option>
+                <option value="custom" data-i18n="sb.share.rect.custom">矩形：允许自定义宽高</option>
               </select>
             </div>
             <div class="share-row share-perms" role="group" data-i18n-title="sb.share.perm.title" title="链接权限">

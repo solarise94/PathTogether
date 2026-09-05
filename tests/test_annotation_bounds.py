@@ -254,7 +254,9 @@ def test_plugin_v1_right_and_bottom_overflow_rejected():
     details = err.get("details") or {}
     assert details.get("edges") == ["right"]
     assert details.get("slide_level0", {}).get("width") == SLIDE_W
-    assert details.get("submitted", {}).get("side_px") == 100
+    # 升级 C：几何口径统一为 level-0 x/y/w/h（正方形 w=h=side_px）
+    assert details.get("submitted", {}).get("w") == 100
+    assert details.get("submitted", {}).get("h") == 100
     assert _db_state(slide) == before, "失败请求不得写库/记成功审计"
 
     with _slide_dims():

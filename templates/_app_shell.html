@@ -5,7 +5,12 @@
 
   <!-- 统一标题栏 + 工具栏（macOS unified titlebar-toolbar） -->
   <header id="app-header">
-    <button id="menu-btn" class="icon-btn menu-btn" aria-label="菜单" data-i18n-title="tb.menu">☰</button>
+    <!-- 升级 A：侧栏开合统一入口。桌面=收起/展开常显侧栏；手机=侧滑抽屉。
+         aria-expanded/aria-controls 由 app.js 按断点与状态维护 -->
+    <button id="menu-btn" class="icon-btn menu-btn" type="button"
+            aria-label="展开侧栏" data-i18n-aria="tb.sidebar.expand"
+            data-i18n-title="tb.sidebar.expand" title="展开侧栏"
+            aria-controls="sidebar" aria-expanded="false">☰</button>
     <div class="title-group">
       <span class="header-title" data-i18n="app.title">PathTogether</span>
       {% if C.readonly_badge %}
@@ -123,6 +128,9 @@
       <div class="sidebar-top demo-sidebar-top">
         <span class="demo-badge demo-badge-side">Demo</span>
         <div id="demo-quota-chip" class="demo-quota-chip" data-i18n="demo.quota.idle">AI 导航额度加载中…</div>
+        <input id="slide-search" type="search" class="slide-search" autocomplete="off"
+               placeholder="搜索切片…" data-i18n-ph="sb.search.ph"
+               aria-label="按名称过滤切片列表" data-i18n-aria="sb.search.aria" />
       </div>
       <div class="sidebar-scroll">
         <div class="section-head" data-i18n="sb.section.demo.slides">示例切片</div>
@@ -134,6 +142,10 @@
       </div>
       {% else %}
       <div class="sidebar-top">
+        <!-- 升级 A：切片搜索（空态「选择切片」展开侧栏后聚焦此框；纯前端过滤） -->
+        <input id="slide-search" type="search" class="slide-search" autocomplete="off"
+               placeholder="搜索切片…" data-i18n-ph="sb.search.ph"
+               aria-label="按名称过滤切片列表" data-i18n-aria="sb.search.aria" />
         <button id="upload-btn" class="btn primary block" data-i18n="sb.upload">上传切片</button>
         <button id="new-project-btn" class="btn secondary block" data-i18n="sb.new.project">＋ 新建项目</button>
         <input id="file-input" type="file"
@@ -238,6 +250,15 @@
 
     <main id="viewer-wrap">
       <div id="viewer"></div>
+      {# 升级 A：无切片空态（正式版与 Demo 共用）。侧栏默认收起后这里保留明显的
+         「选择切片」入口；app.js/demo.js 在切片打开后隐藏、未打开时显示。 #}
+      <div id="viewer-empty" class="viewer-empty">
+        <div class="viewer-empty-card">
+          <p class="viewer-empty-title" data-i18n="viewer.empty.title">未打开切片</p>
+          <p class="viewer-empty-sub" data-i18n="viewer.empty.sub">从左侧选择或上传一张切片开始读片</p>
+          <button type="button" id="viewer-empty-pick" class="btn primary" data-i18n="viewer.empty.pick">选择切片</button>
+        </div>
+      </div>
       {# 通道着色说明卡（Batch 4）：channel-controls.js 渲染；正式版与 Demo 共用 #}
       <div id="channel-panel" class="channel-panel" hidden role="dialog"
            aria-label="通道着色（显示映射）" data-i18n-aria="channel.panel.aria"></div>

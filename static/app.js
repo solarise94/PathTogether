@@ -4166,17 +4166,41 @@
     host.onRequest("viewer.navigate", gate("viewer.navigate", function (p) {
       // AI goto/snapshot 跳转：level-0 bbox → viewport.fitBounds。
       // （文档 {x,y,level} 在本阶段以 level-0 bbox 表达，agent 全程在图像坐标系工作）
-      try {
-        if (viewer && viewer.viewport && p && p.x != null && p.w) {
-          viewer.viewport.fitBounds(
-            viewer.viewport.imageToViewportRectangle(p.x, p.y, p.w, p.h));
-        }
-      } catch (e) {}
+      // R1（2026-09-05）：viewer 未就绪/几何非法回真实 error code，不再吞异常
+      // 仍报 ok:true；请求携带 slide 标识且与当前切片不符（过期操作）时拒绝
+      // （宽容缺省：旧插件不带 slide 时不拒绝）。
+      p = p || {};
+      if (p.slide && state.slide && String(p.slide) !== String(state.slide.name)) {
+        throw { code: "stale_slide", message: "导航请求属于另一切片", retryable: false };
+      }
+      if (!viewer || !viewer.viewport) {
+        throw { code: "viewer_not_ready", message: "查看器未就绪", retryable: true };
+      }
+      var nx = Number(p.x), ny = Number(p.y), nw = Number(p.w), nh = Number(p.h);
+      if (!isFinite(nx) || !isFinite(ny) || !isFinite(nw) || !isFinite(nh) || nw <= 0 || nh <= 0) {
+        throw { code: "invalid_geometry", message: "导航几何非法", retryable: false };
+      }
+      viewer.viewport.fitBounds(
+        viewer.viewport.imageToViewportRectangle(nx, ny, nw, nh));
       return { ok: true };
     }));
     host.onRequest("viewer.highlight", gate("viewer.highlight", function (p) {
-      // 插件叠加层：写入平台 aiOverlay 并重绘画布（替代插件直接写 aiOverlay/redrawAnnoCanvas）
-      aiOverlay = Array.isArray(p && p.boxes) ? p.boxes : [];
+      // 插件叠加层：写入平台 aiOverlay 并重绘画布（替代插件直接写 aiOverlay/redrawAnnoCanvas）。
+      // R1：逐框几何校验，非法回 invalid_geometry；slide 标识不符拒绝过期画框
+      // （宽容缺省：旧插件不带时不拒绝）。
+      p = p || {};
+      if (p.slide && state.slide && String(p.slide) !== String(state.slide.name)) {
+        throw { code: "stale_slide", message: "画框请求属于另一切片", retryable: false };
+      }
+      var boxes = Array.isArray(p.boxes) ? p.boxes : [];
+      for (var bi = 0; bi < boxes.length; bi++) {
+        var bb = boxes[bi] || {};
+        var bx = Number(bb.x), by = Number(bb.y), bw = Number(bb.w), bh = Number(bb.h);
+        if (!isFinite(bx) || !isFinite(by) || !isFinite(bw) || !isFinite(bh) || bw <= 0 || bh <= 0) {
+          throw { code: "invalid_geometry", message: "叠加框几何非法", retryable: false };
+        }
+      }
+      aiOverlay = boxes;
       redrawAnnoCanvas();
       return { ok: true };
     }));

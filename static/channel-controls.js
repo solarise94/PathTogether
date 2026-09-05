@@ -486,8 +486,11 @@
         var reason = active ? invisibleReason(effectiveChannel(ch), true) : null;
         if (active && reason && INVISIBLE_KEY[reason]) {
           row.className += " ch-invisible";
-          row.appendChild(el("span", "ch-invisible-reason",
-            t("channel.invisible." + INVISIBLE_KEY[reason])));
+          var reasonEl = el("span", "ch-invisible-reason",
+            t("channel.invisible." + INVISIBLE_KEY[reason]));
+          // 窄面板下警示文本按省略号截断（max-width 46%），hover 给全文
+          reasonEl.title = reasonEl.textContent;
+          row.appendChild(reasonEl);
         }
         if (ch.intensity && ch.intensity.status === "empty_or_constant") {
           row.title = t("channel.not.displayable");

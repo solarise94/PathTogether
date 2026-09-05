@@ -661,6 +661,8 @@ Bridge 方法到 manifest permission 的映射是代码级常量，未知方法�
 | `admin.users.startPreview`（PR5 修订：§10.2 身份预览入口；POST /api/admin/preview/start） | `admin:users:write` |
 | `admin.plugins.list`（PR5 修订：插件列表+健康；GET /api/admin/plugins） | `admin:plugins:read` |
 | `admin.plugins.setEnabled/rotateSecret`（PR5 修订：启停+凭证轮换，新 secret 仅一次透传；运行时 `/install` 不上桥——发布走 §16 版本化 releases） | `admin:plugins:write` |
+| `admin.slides.inventory`（2026-09-05 review P0 owner 读隔离：切片全量清点，唯一「看全部」出口；GET /api/admin/v1/slides/inventory） | `admin:slides:read` |
+| `admin.slides.setVisibility`（2026-09-05：给 owner 幂等建立/收回单切片 view 授权；POST /api/admin/v1/slides/<name>/visibility） | `admin:slides:write` |
 
 ## 9. Admin API v1
 
@@ -688,6 +690,8 @@ Bridge 方法到 manifest permission 的映射是代码级常量，未知方法�
 | GET | `/api/admin/v1/acquisition/summary` | 来源漏斗汇总 |
 | GET | `/api/admin/v1/acquisition/users` | 用户来源明细 |
 | GET | `/api/admin/v1/audit` | 审计分页 |
+| GET | `/api/admin/v1/slides/inventory` | 2026-09-05 读隔离：全量切片清单（元数据，cursor/limit；含归属/公开/归档/授权标注） |
+| POST | `/api/admin/v1/slides/<name>/visibility` | 2026-09-05：给 owner 幂等建立/收回 view 授权（audit：admin.slide_visibility.grant/revoke） |
 
 公共返回不得包含 `password_hash`、`ai_config.api_key`、完整邀请 token/hash、完整 IP、原始 referrer query、outbox 文件路径或 provider credential fingerprint。
 

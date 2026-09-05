@@ -69,6 +69,7 @@ __all__ = [
     "TILE_NATIVE_JPEG_QUALITY", "TILE_NATIVE_JPEG_SUBSAMPLING",
     "TILE_MULTICHANNEL_JPEG_QUALITY", "TILE_MULTICHANNEL_JPEG_SUBSAMPLING",
     "display_jpeg_params", "encode_display_jpeg", "image_mode_from_context",
+    "subsampling_label",
     # 指标与测试隔离
     "metrics_inc", "metrics_add", "metrics_snapshot", "reset_caches",
 ]
@@ -1347,3 +1348,16 @@ def encode_display_jpeg(img, *, image_mode, quality=None):
         "subsampling": subsampling,
         "encoder_version": TILE_ENCODER_VERSION,
     }
+
+
+#: Pillow subsampling 整数 → 色度抽样契约标签（encoder info 回显用；
+#: 与上面 TILE_*_SUBSAMPLING 常量同处一文件，避免两处漂移）
+SUBSAMPLING_LABELS = {0: "4:4:4", 1: "4:2:2", 2: "4:2:0"}
+
+
+def subsampling_label(subsampling):
+    """Pillow subsampling 整数 → 色度抽样标签（"4:4:4"/"4:2:2"/"4:2:0"）。
+
+    只做展示层映射；未知值如实回 "unknown"，不猜测。
+    """
+    return SUBSAMPLING_LABELS.get(int(subsampling), "unknown")

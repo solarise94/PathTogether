@@ -141,6 +141,8 @@ def _fake_region(jpeg_bytes, width=1568, height=1568):
         "src": {"x": 0, "y": 0, "w": 100, "h": 100}, "magnification": 20.0,
         "read_level": 1,  # W0 契约：实际解码金字塔层（mock 与真实返回同形）
         "upsampled": False,  # W0 契约：out 是否超过源像素（mock 与真实返回同形）
+        # P1-2：实际编码身份（mock 与真实返回同形）
+        "image_mode": "native_rgb", "subsampling": "4:2:0",
     }
 
 
@@ -187,6 +189,9 @@ def test_region_binary_via_accept_header():
     assert json.loads(r.headers["X-Region-Upsampled"]) is False
     enc = json.loads(r.headers["X-Region-Encoder"])
     assert enc["id"] == "pillow" and enc["resize"] == "LANCZOS" and enc["jpeg_quality"] == 85
+    # P1-2（additive）：encoder 携带本次实际编码身份
+    assert enc["image_mode"] == "native_rgb"
+    assert enc["subsampling"] == "4:2:0"
 
 
 def test_region_binary_via_query_format():
@@ -263,7 +268,8 @@ def test_region_binary_upsampled_header_true_and_false():
     upsampled 语义同 choose_read_level：请求分辨率高于所选层原生分辨率
     （max_ds<1）→ True。放大（True）与不放大（False）各一：
       - True：bbox 1000×500 请求 out 2000×1000 → level 0 + 放大；
-      - False：bbox 4096² 默认 out 1568 → ds=2 层够用（level 1），不放大。
+      - False：bbox 4096² 默认 out 1568 → ds=2 层够用（level 1），不放大；
+        同时验证无 context 时 encoder 身份 = native 4:2:0（真实编码路径）。
     """
     inst = _bootstrap()
     slide = _touch_slide()
@@ -291,6 +297,9 @@ def test_region_binary_upsampled_header_true_and_false():
     assert r_false.status_code == 200, r_false.get_data(as_text=True)
     assert json.loads(r_false.headers["X-Region-Upsampled"]) is False
     assert json.loads(r_false.headers["X-Region-Read-Level"]) == 1
+    enc = json.loads(r_false.headers["X-Region-Encoder"])
+    assert enc["image_mode"] == "native_rgb"
+    assert enc["subsampling"] == "4:2:0"
 
 
 # --------------------------------------------------------------------------- #

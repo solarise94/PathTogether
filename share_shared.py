@@ -24,19 +24,6 @@ GEOMETRY_VERSION = 2
 RECT_MAX_SIDE_PX = 40000
 
 
-def _rect_max_pixels():
-    """rect 标注的 w*h 像素预算上限（与 crop 单请求硬闸同源，§6.2）。
-
-    延迟 import：crop_guard 在 import 期读 env，收敛到调用期避免模块加载
-    顺序耦合；预算值与主站/分享 crop 共用同一实现（防两份漂移）。
-    """
-    try:
-        import crop_guard
-        return int(crop_guard.CROP_MAX_PIXELS)
-    except Exception:  # pragma: no cover - crop_guard 不可用时退化为同值常量
-        return 4096 ** 2
-
-
 def _int_px(v, name):
     """把 v 校验为有限数值并取整；非法抛 ValueError（bool 不算数值）。"""
     if not _is_finite_num(v):
@@ -226,7 +213,8 @@ def _validate_rect_geometry(geom):
 
     规则：
       - v2 写入：x/y/w/h（w/h 必须成对；只给其一直接拒绝）；
-        w/h ∈ 1..RECT_MAX_SIDE_PX，且 w*h ≤ rect 像素预算（同 crop 硬闸）；
+        w/h ∈ 1..RECT_MAX_SIDE_PX（矩形跨度与导出输出限制不是同一件事，
+        创建不设 w*h 面积闸；导出预算由 crop_guard 在 crop 请求时独立强制）；
         geometry_version 记 2。
       - v1 兼容写入：只给 side_px（旧客户端）→ 按旧正方形转换（w=h=side_px
         只在读取时归一，存储保持 v1 形态，不批量改写旧记录语义）。
@@ -254,10 +242,6 @@ def _validate_rect_geometry(geom):
         if w < 1 or h < 1 or w > RECT_MAX_SIDE_PX or h > RECT_MAX_SIDE_PX:
             raise ValueError(
                 "w/h 需在 1~%d 之间" % RECT_MAX_SIDE_PX)
-        max_px = _rect_max_pixels()
-        if w * h > max_px:
-            raise ValueError(
-                "矩形 %d×%d=%d 像素超过单标注预算 %d" % (w, h, w * h, max_px))
         out = {
             "type": "rect",
             "x": x, "y": y, "w": w, "h": h,
@@ -410,9 +394,8 @@ def _validate_rect_bounds(x, y, w, h, slide_w, slide_h):
         return "坐标需 ≥0（x=%s, y=%s）" % (x, y)
     if w < 1 or h < 1 or w > RECT_MAX_SIDE_PX or h > RECT_MAX_SIDE_PX:
         return ("w/h 需在 1~%d 之间（当前 %s×%s）" % (RECT_MAX_SIDE_PX, w, h))
-    max_px = _rect_max_pixels()
-    if w * h > max_px:
-        return "矩形 %d×%d=%d 像素超过单标注预算 %d" % (w, h, w * h, max_px)
+    # 不设 w*h 面积闸：矩形跨度与导出输出限制不是同一件事，创建只受
+    # 单边上限 + 切片边界约束；导出预算由 crop_guard 在 crop 请求时强制。
     if slide_w is None or slide_h is None:
         return None
     overshoot = {}

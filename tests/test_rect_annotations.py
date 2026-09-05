@@ -132,16 +132,18 @@ def test_geom_invalid_values_rejected():
             share_shared._validate_geom("rect", {"x": 0, "y": 0, "w": bad, "h": 10})
 
 
-def test_geom_v1_side_px_compat_and_pixel_budget():
+def test_geom_v1_side_px_compat_and_no_creation_area_budget():
     g = share_shared._validate_geom("rect", {"x": 1, "y": 2, "side_px": 300})
     assert g == {"type": "rect", "x": 1, "y": 2, "side_px": 300, "size_mm": 0.0}
-    # w*h 像素预算（与 crop 硬闸同源）：40001×40001 被单边上限挡；
-    # 40000×2000 超 4096² 预算被拒
+    # 单边上限仍生效：40001 被拒
     with pytest.raises(ValueError):
-        share_shared._validate_geom("rect", {"x": 0, "y": 0, "w": 40000, "h": 2000})
-    # 恰在预算内放行
-    g2 = share_shared._validate_geom("rect", {"x": 0, "y": 0, "w": 4096, "h": 4096})
-    assert g2["w"] == 4096 and g2["h"] == 4096
+        share_shared._validate_geom("rect", {"x": 0, "y": 0, "w": 40001, "h": 10})
+    # 创建不设 w*h 面积闸（矩形跨度与导出输出限制不是同一件事）：
+    # 40000×2000 = 80M px > 4096² 导出预算，创建放行（导出由 crop_guard 拦）
+    g2 = share_shared._validate_geom("rect", {"x": 0, "y": 0, "w": 40000, "h": 2000})
+    assert g2["w"] == 40000 and g2["h"] == 2000
+    g3 = share_shared._validate_geom("rect", {"x": 0, "y": 0, "w": 4096, "h": 4096})
+    assert g3["w"] == 4096 and g3["h"] == 4096
 
 
 # =========================================================================== #
@@ -289,6 +291,40 @@ def test_api_patch_v2_geom_with_cas():
     r4 = c.patch("/api/annotation/admin/%d" % idx,
                  json={"geom": {"x": 900, "y": 700, "w": 300, "h": 150}})
     assert r4.status_code == 400
+
+
+def test_create_6mm_square_at_0253_mpp_allowed_and_export_budgeted(monkeypatch):
+    """回归（批次 4 发布阻断）：0.253 mpp 常见切片上 6mm 标准 ROI = 23715px
+    边长（≈562M px，远超 4096² 导出预算）必须创建成功（旧主流工作流，
+    升级批次 4 曾误把导出预算套到创建路径导致一创建即被拒）。
+    面积预算只在 crop/导出请求时由 crop_guard 强制（413 明确报错）。"""
+    _touch()
+    _setup_owner()
+    # 0.253 µm/px 切片：level-0 足够大，6mm 方框完整落在切片内
+    monkeypatch.setattr(app_mod, "_annotation_slide_bounds",
+                        lambda safe: (100000.0, 100000.0))
+    c = _client()
+    side = int(round(6000 / 0.253))  # 6mm = 6000µm → 23715 px
+    assert side == 23715
+    assert side * side > 4096 ** 2  # ≈562M px，远超导出预算
+    r = c.post("/api/annotation", json={
+        "slide": "demo.svs", "type": "rect", "label": "6mm",
+        "x": 100, "y": 100, "w": side, "h": side,
+    })
+    assert r.status_code == 200, r.get_data(as_text=True)
+    idx = r.get_json()["index"]
+    item = share_store.annotations_by_slide()["demo.svs"][0]["items"][idx]
+    assert item["w"] == side and item["h"] == side
+    assert item["geometry_version"] == 2
+
+    # 同一几何走导出 → 413 crop_too_large（预算只在导出闸强制，报错明确）
+    p1, p2, p3, p4 = _mock_slide_read(app_mod, dims=(100000, 100000))
+    with p1, p2, p3, p4, \
+            mock.patch.object(crop_guard, "CROP_MAX_PIXELS", 4096 ** 2):
+        r2 = c.get("/api/slide/demo.svs/crop?x=100&y=100&w=%d&h=%d"
+                   % (side, side))
+        assert r2.status_code == 413
+        assert r2.get_json()["code"] == "crop_too_large"
 
 
 # =========================================================================== #

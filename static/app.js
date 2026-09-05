@@ -63,8 +63,6 @@
     "roi.cancelled": { zh: "已取消未保存的选区", en: "Unsaved selection cancelled" },
     "roi.input.invalid": { zh: "矩形尺寸非法或超出图像范围，已保留上次的合法框",
                            en: "Invalid rectangle size or out of image bounds; kept the last valid box" },
-    "roi.too.large": { zh: "矩形超过像素预算（{n} 像素），请缩小选区",
-                       en: "Rectangle exceeds the pixel budget ({n} px); please shrink the selection" },
     "edit.conflict": { zh: "该标注已被他人修改（当前 revision {rev}），已显示当前版本；请基于最新版本重新编辑",
                        en: "This annotation was modified by someone else (current revision {rev}); showing the current version — please re-edit on top of it" },
   };
@@ -1039,12 +1037,12 @@
   // 权威几何：level-0 像素 x/y/w/h（state.roi）。物理单位仅是输入/展示口径：
   //   w_px = round(width × 1000 / mpp_x)、h_px = round(height × 1000 / mpp_y)
   //   （μm 不乘 1000）；显示值按实际像素 + 分轴校准反算。
-  // 单边上限 40000px + w*h 像素预算（与后端同一口径）；出界保持上个合法框。
+  // 创建只受单边上限 40000px + 切片边界约束（出界保持上个合法框）；
+  // w*h 面积预算是导出/裁剪闸（saveCrop 交服务端 crop_guard，超限 413 明确
+  // 报错），与「矩形跨度」不是同一件事，创建不设面积闸（大 ROI 是旧主流工作流）。
 
   // rect 单边像素上限（与后端 RECT_MAX_SIDE_PX 一致）
   var RECT_MAX_SIDE_PX = 40000;
-  // rect 像素预算（与后端 crop_guard.CROP_MAX_PIXELS 默认一致；服务端为权威）
-  var RECT_MAX_PIXELS = 4096 * 4096;
 
   function rectToolActive() { return state.roiMode === "rect"; }
   function roiW() { return state.roi ? state.roi.w : 0; }
@@ -1091,9 +1089,9 @@
 
   // 矩形几何归一（§6.2）：负方向归一、整数、边界约束
   // x>=0,y>=0,w>=1,h>=1,x+w<=W,y+h<=H。非法输入（NaN/Infinity/负值）返回 null。
-  // applyBudget=false 用于已存大标注的拖动编辑（像素预算是创建/导出闸，
-  // 不追溯限制既有合法记录的编辑）。
-  function normalizeRect(x0, y0, x1, y1, applyBudget) {
+  // 不做 w*h 面积闸：创建/编辑必须保留用户真实几何，不得静默缩放或截停；
+  // 超预算只在导出/裁剪时由服务端 crop_guard 明确报错。
+  function normalizeRect(x0, y0, x1, y1) {
     var W = state.slide.width, H = state.slide.height;
     if (![x0, y0, x1, y1].every(isFinite)) return null;
     var x = Math.max(0, Math.round(Math.min(x0, x1)));
@@ -1105,7 +1103,6 @@
     x = Math.min(x, Math.max(0, W - w));
     y = Math.min(y, Math.max(0, H - h));
     if (x < 0 || y < 0 || w < 1 || h < 1 || x + w > W || y + h > H) return null;
-    if (applyBudget !== false && w * h > RECT_MAX_PIXELS) return null;
     return { x: x, y: y, w: w, h: h };
   }
 
@@ -1217,11 +1214,6 @@
     px = lockRatioAdjust(px.w, px.h);
     var W = state.slide.width, H = state.slide.height;
     if (px.w > W || px.h > H) { toast(t("roi.input.invalid"), "error"); syncRoiSettings(); return; }
-    if (px.w * px.h > RECT_MAX_PIXELS) {
-      toast(t("roi.too.large", { n: RECT_MAX_PIXELS }), "error");
-      syncRoiSettings();
-      return;
-    }
     var cx = state.roi.x + state.roi.w / 2;
     var cy = state.roi.y + state.roi.h / 2;
     if (!(state.roi.w > 0)) { cx = W / 2; cy = H / 2; }
@@ -1326,7 +1318,7 @@
       var y0 = moveT || moveB ? anchorY : s.y;
       var y1 = moveT || moveB ? curImg.y : s.y + s.h;
       var n = normalizeRect(x0, y0, x1, y1);
-      if (!n) return; // 非法（NaN/超预算）保持上帧
+      if (!n) return; // 非法（NaN）保持上帧
       nx = n.x; ny = n.y; nw = n.w; nh = n.h;
     }
     state.roi.x = nx; state.roi.y = ny; state.roi.w = nw; state.roi.h = nh;
@@ -1403,8 +1395,7 @@
         return true;
       }
       px = lockRatioAdjust(px.w, px.h);
-      if (px.w > state.slide.width || px.h > state.slide.height ||
-          px.w * px.h > RECT_MAX_PIXELS) {
+      if (px.w > state.slide.width || px.h > state.slide.height) {
         toast(t("roi.input.invalid"), "error");
         viewer.setMouseNavEnabled(true);
         return true;
@@ -3334,7 +3325,7 @@
         var x1 = (moveL || moveR) ? cur.x : s.x + s.w;
         var y0 = (moveT || moveB) ? anchorY : s.y;
         var y1 = (moveT || moveB) ? cur.y : s.y + s.h;
-        var n = normalizeRect(x0, y0, x1, y1, false);
+        var n = normalizeRect(x0, y0, x1, y1);
         if (n) {
           it.x = n.x; it.y = n.y; it.w = n.w; it.h = n.h;
         }

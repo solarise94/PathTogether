@@ -4086,10 +4086,13 @@ def can_view_slide(name):
     owner 不再全量短路——与 user 同一判定（_user_can_view_slide）。owner 的
     「看全部」唯一出口是管理台 /api/admin/v1/slides/inventory（显式管理）。
     写路径（can_delete_slide / can_annotate_slide）owner 语义**保持不变**：
-    本次只做读隔离。owner user_id 为空的部署形态（本地免认证开发态）可见集
-    为空：不崩溃，无主切片经管理台显式授权后恢复可见。
+    本次只做读隔离。例外：本地免认证单租户态（AUTH_ENABLED=False，owner 无
+    user_id）读恢复全量——该形态下不存在「其他用户」可隔离，维持读隔离前
+    的既有不变量（本地开发/测试依赖）；认证部署的 owner 隔离语义不受影响。
     """
     ident = current_identity()
+    if ident["role"] == user_store.ROLE_OWNER and not ident["user_id"]:
+        return True
     return _user_can_view_slide(ident["user_id"], name)
 
 
@@ -4167,8 +4170,13 @@ def _subject_slide_permissions(role, user_id, slide):
     隔离的旁路；annotation:write 属写能力，owner 保持授予（与
     can_annotate_slide 的 owner 语义不变一致，归档切片除外）。user →
     view/annotate 判定映射（§6.1 表）。归档切片对所有身份只读（annotate
-    侧不授予）。
+    侧不授予）。例外：本地免认证单租户态（owner 且无 user_id）恢复全量
+    4 项（can_view_slide 同款口径）。
     """
+    if role == user_store.ROLE_OWNER and not user_id:
+        if slide in _archived_slide_names():
+            return set(_CAPABILITY_VIEW_GRANTS)
+        return set(_CAPABILITY_VIEW_GRANTS) | set(_CAPABILITY_ANNOTATE_GRANTS)
     perms = set()
     if _user_can_view_slide(user_id, slide):
         perms |= _CAPABILITY_VIEW_GRANTS
@@ -4205,14 +4213,17 @@ def _visible_slide_names():
     可见集 = 自己上传的 ∪ public ∪ 认领(view 级 claim) ∪ 显式授权
     （slide_view_grants，管理台建立）。owner 不再全量短路（review P0
     2026-09-05）；无主切片（owner_user_id 为空）且非 public 对所有身份默认
-    不可见，经管理台显式授权后恢复可见（孤儿切片仍可管理）。owner user_id
-    为空（本地免认证开发态）→ 可见集为空（不崩溃）。
+    不可见，经管理台显式授权后恢复可见（孤儿切片仍可管理）。例外：本地
+    免认证单租户态（owner 无 user_id）恢复全量（can_view_slide 同款口径，
+    不存在「其他用户」可隔离）；其余无 uid 主体（guest）可见集为空。
     """
     ident = current_identity()
     all_names = {
         child.name for child in UPLOAD_DIR.iterdir()
         if child.is_file() and child.suffix.lower().lstrip(".") in SUPPORTED_EXTS
     }
+    if ident["role"] == user_store.ROLE_OWNER and not ident["user_id"]:
+        return all_names
     uid = ident["user_id"]
     if not uid:
         return set()

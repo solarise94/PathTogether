@@ -876,8 +876,8 @@ def test_visitor_hmac_secret_locked_create_is_stable():
     assert secret_file.is_file()
 
 # =========================================================================== #
-# 8. AUTH_ENABLED=False 内网模式：写语义不变；读隔离按「无稳定 owner
-#    user_id → 可见集为空」形态（review P0 2026-09-05，不崩溃）
+# 8. AUTH_ENABLED=False 内网模式：写语义不变；读恢复全量（单租户例外，
+#    review P0 2026-09-05 修正：该形态不存在「其他用户」可隔离）
 # =========================================================================== #
 def test_internal_mode_write_paths_unchanged_and_no_crash():
     owner, userA, _b = _setup_users()
@@ -887,12 +887,11 @@ def test_internal_mode_write_paths_unchanged_and_no_crash():
     _own(sb, _b["user_id"])
 
     c = _client_noauth()  # 无登录、AUTH_ENABLED=False
-    # 本地免认证开发态 owner 无稳定 user_id → 可见集为空（不崩溃；管理台
-    # inventory 仍可清点，稳定 owner 账户部署可显式授权恢复）
+    # 本地免认证单租户态：owner 无 user_id → 读恢复全量（无「其他用户」可
+    # 隔离，维持读隔离前的既有不变量；认证部署的 owner 隔离不受影响）
     names = {i["name"] for i in c.get("/api/slides").get_json()}
-    assert sa not in names and sb not in names
-    # 读被拒与 user 同口径（统一 403）
-    assert c.get("/api/slide/%s/info" % sa).status_code == 403
+    assert sa in names and sb in names
+    assert c.get("/api/slide/%s/info" % sa).status_code == 200
     # 可落标（写路径 owner 语义不变，internal 模式不做 can_annotate 拦截）
     r = _post_anno(c, sa)
     assert r.status_code == 200
@@ -1048,9 +1047,9 @@ def test_annotations_filtered_for_user():
 def test_current_identity_owner_when_no_role():
     """无 session role 时 current_identity() 兜底 role=owner（访问判定用）。
 
-    读隔离（review P0 2026-09-05）：owner 无稳定 user_id → 读判定 False
-    （可见集为空）；写路径（can_upload / can_annotate_slide / 删除）owner
-    语义不变。
+    读隔离（review P0 2026-09-05）：owner 无稳定 user_id = 本地免认证单租户
+    态 → 读恢复全量（不存在「其他用户」可隔离）；写路径（can_upload /
+    can_annotate_slide / 删除）owner 语义不变。
     """
     _setup_users()
     # 无 session（test_request_context 默认空 session）→ current_identity 返回 owner
@@ -1059,6 +1058,6 @@ def test_current_identity_owner_when_no_role():
         assert ident["role"] == "owner"
         assert ident["user_id"] is None
         assert app_mod._is_owner() is True
-        assert app_mod.can_view_slide("any.svs") is False
+        assert app_mod.can_view_slide("any.svs") is True
         assert app_mod.can_upload() is True
         assert app_mod.can_annotate_slide("any.svs") is True

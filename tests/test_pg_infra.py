@@ -190,6 +190,10 @@ def test_schema_migrations_recorded(conn):
         # registration_invites.monthly_limit_nano_cny 旧列：0032 已回填面值、
         # Wave1 代码停读、Wave2 删除 monthly 形参与 SELECT 列）。
         "0033_drop_invite_monthly_limit.sql",
+        # 读隔离（review P0 2026-09-05）追加 0034_slide_view_grants.sql
+        # （owner 显式可见授权直授表：持久无 TTL，管理台 /api/admin/v1/
+        # slides/* 为唯一出入口）。
+        "0034_slide_view_grants.sql",
     ]
 
 

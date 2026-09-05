@@ -895,9 +895,11 @@ def test_admin_manifest_plugin_version_bumped_with_hashes():
     全部可服务 UI 文件（manifest 的入口/资源不得游离声明之外）。批次 D 起
     manifest 申请 admin:settings:read/write（统一设置页，§6.5）。2026-09-05
     升 0.3.5：切片可见性管理页（review P0 owner 读隔离），申请
-    admin:slides:read/write，hashes/pin 同步。"""
+    admin:slides:read/write，hashes/pin 同步。2026-09-06 升 0.3.6：升级批次
+    0–5（owner 工作区收录语义：管理台切片页按「自有 ∪ 已授权」呈现），
+    hashes/pin 同步。"""
     data = json.loads(ADMIN_MANIFEST.read_text(encoding="utf-8"))
-    assert data["pluginVersion"] == "0.3.5"  # 切片可见性管理页，hashes/pin 同步
+    assert data["pluginVersion"] == "0.3.6"  # 升级批次 0–5 工作区收录语义，hashes/pin 同步
     assert "admin:settings:read" in data["adminPermissions"]
     assert "admin:settings:write" in data["adminPermissions"]
     assert "admin:slides:read" in data["adminPermissions"]

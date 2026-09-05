@@ -397,12 +397,12 @@ def test_no_auth_full_compat():
     fake.calls.clear()
     r = c.post("/api/ai/run", json={"slide": "x.svs"})
     assert r.status_code == 200
-    # sessions：读隔离（review P0 2026-09-05）——no-auth owner 无稳定
-    # user_id → 切片读闸拒绝（403，sidecar 不被调用），不再「不过滤全量」
+    # sessions：免认证单租户态（review P0 2026-09-05 修正）——no-auth owner
+    # 无 user_id 但不存在「其他用户」可隔离 → 切片读闸放行（恢复既有不变量；
+    # 认证部署的 owner 隔离语义不受影响）
     fake.calls.clear()
     r = c.get("/api/ai/sessions?slide=x.svs")
-    assert r.status_code == 403
-    assert fake.calls == []
+    assert r.status_code == 200
 
 def test_owner_run_does_not_inject_session_owner():
     """role=owner 起跑不注入 session_owner（owner 全量可见、可续跑任意会话，

@@ -208,6 +208,8 @@
   function initAuth() {
     apiFetch("/api/auth/info").then(function (r) { return r.json(); }).then(function (info) {
       applyAuthInfo(info);
+      // 升级 A：身份到位后按「站点:账号」重读侧栏偏好（无偏好保持默认收起）
+      if (sidebarCtrl) sidebarCtrl.onScopeReady();
     }).catch(function () { /* 忽略，不影响主功能 */ });
     if (els.previewStopBtn) {
       els.previewStopBtn.addEventListener("click", stopIdentityPreview);
@@ -477,6 +479,10 @@
     menuBtn: $("menu-btn"),
     sidebar: $("sidebar"),
     sidebarMask: $("sidebar-mask"),
+    // 升级 A：切片搜索 + 无切片空态入口
+    slideSearch: $("slide-search"),
+    viewerEmpty: $("viewer-empty"),
+    viewerEmptyPick: $("viewer-empty-pick"),
     // 项目
     newProjectBtn: $("new-project-btn"),
     newProjectForm: $("new-project-form"),
@@ -677,7 +683,12 @@
       redrawAnnoCanvas();
       updateRoiOverlay();
     });
-    viewer.addHandler("resize", redrawAnnoCanvas);
+    // 容器尺寸变化（窗口 resize、侧栏收起/展开、断点切换）：OSD 重算 viewport
+    // 后触发；先同步画布背衬尺寸再重绘，保证标注/AI overlay 与新容器对齐（§4.2）
+    viewer.addHandler("resize", function () {
+      resizeAnnoCanvas();
+      redrawAnnoCanvas();
+    });
     // 切片关闭时清理旧底图
     viewer.addHandler("close", clearBaseThumb);
   }
@@ -894,6 +905,8 @@
         };
         state.mppX = info.mpp_x;
         state.rotation = 0;
+        // 升级 A：切片已打开，隐藏无切片空态入口
+        updateViewerEmptyState();
         els.currentSlide.textContent = info.alias || info.name;
         els.currentSlide.title = info.name + (info.note ? " · " + info.note : "");
         updateMppSetterVisibility();
@@ -930,12 +943,9 @@
           it.classList.toggle("active", it.dataset.name === name);
         });
         // 手机端：打开切片后自动收起侧栏抽屉，让用户立刻看到查看器；
-        // 抽屉收起会改变 viewer 容器宽度，这里补一次画布尺寸同步。
-        if (isMobileWidth()) {
-          closeSidebarDrawer();
-          resizeAnnoCanvas();
-          redrawAnnoCanvas();
-        }
+        // 收起后走统一布局同步（抽屉关闭 + viewer resize 链，§4.2）。
+        // 桌面端保持当前收起/展开偏好，不打断读片。
+        if (isMobileWidth()) sidebarCtrl.closeDrawer();
       })
       .catch(function (e) { toast(t("open.info.fail", { e: e }), "error"); });
   }
@@ -1388,6 +1398,10 @@
       els.projectList.appendChild(empty);
       return;
     }
+    var renderTail = function () {
+      // 升级 A：列表重渲后重放当前搜索条件（搜索条件不因收起/重渲丢失）
+      if (els.slideSearch) applySlideFilter(els.slideSearch.value);
+    };
     projects.forEach(function (p) {
       var row = document.createElement("div");
       row.className = "proj-row";
@@ -1473,6 +1487,7 @@
 
       els.projectList.appendChild(row);
     });
+    renderTail();
   }
 
   // 切片行（项目展开体内 / 未归类）。unfiled=true 时显示复选框。
@@ -1728,6 +1743,8 @@
     unfiled.forEach(function (s) {
       els.unfiledList.appendChild(renderSlideRow(s.name, true));
     });
+    // 升级 A：列表重渲后重放当前搜索条件（搜索条件不因收起/重渲丢失）
+    if (els.slideSearch) applySlideFilter(els.slideSearch.value);
   }
 
   // ---------- 新建项目 ----------
@@ -2081,27 +2098,221 @@
   }
 
   // =========================================================================
-  // 手机端侧栏抽屉
+  // 侧栏开合控制器（升级 A §4.1/§4.2）
+  // -------------------------------------------------------------------------
+  // 桌面（>768px）：默认收起；顶部 #menu-btn 在展开/收起间切换。偏好按
+  // 「站点:账号」维度写 localStorage（pt.sb.v1| 前缀，与通道配色 pt.rc.v1 的
+  // userScope 同一身份口径）；读取失败/无偏好默认收起；存储不可用不阻塞。
+  // 手机（≤768px）：维持侧滑抽屉，默认关闭；桌面偏好不把抽屉自动打开。
+  // 纯逻辑集中在 createSidebarController(deps)：DOM/mq/storage 经 deps 注入，
+  // vitest（tests/js/sidebar-layout.test.ts）以假元素驱动真实决策逻辑。
   // =========================================================================
-  // 仅手机端（≤768px）启用抽屉行为；桌面端 sidebar 始终静态可见，
-  // open/close 在桌面下也是 no-op（CSS 不生效，DOM class 无副作用）。
+  var SIDEBAR_PREF_PREFIX = "pt.sb.v1|";
+  var SB_MOBILE_QUERY = "(max-width: 768px)";
+
+  function sidebarPrefKey(scope) {
+    return SIDEBAR_PREF_PREFIX + String(scope || "anonymous");
+  }
+  // 解析存储的偏好：结构不符/非 JSON 一律返回 null（调用方回落默认收起）
+  function parseSidebarPref(raw) {
+    if (raw == null) return null;
+    try {
+      var v = JSON.parse(raw);
+      if (v && typeof v === "object" && typeof v.collapsed === "boolean") {
+        return { collapsed: v.collapsed };
+      }
+    } catch (e) { /* 损坏数据视为无偏好 */ }
+    return null;
+  }
+  function readSidebarPref(storage, scope) {
+    if (!storage || typeof storage.getItem !== "function") return null;
+    try {
+      return parseSidebarPref(storage.getItem(sidebarPrefKey(scope)));
+    } catch (e) { return null; }  // 隐私模式等 getItem 抛错：无偏好
+  }
+  function writeSidebarPref(storage, scope, collapsed) {
+    if (!storage || typeof storage.setItem !== "function") return;
+    try {
+      storage.setItem(sidebarPrefKey(scope),
+        JSON.stringify({ collapsed: !!collapsed, t: Date.now() }));
+    } catch (e) { /* 配额/隐私模式写失败：仅失去持久化 */ }
+  }
+
+  function createSidebarController(deps) {
+    var sidebar = deps.sidebar;
+    var mask = deps.sidebarMask;
+    var btn = deps.menuBtn;
+    var collapsed = true;      // 桌面意图态（首次进入默认收起）
+    var userTouched = false;   // 身份到位回填偏好时不得覆盖用户已做的切换
+
+    function scopeName() {
+      return (typeof deps.scope === "function") ? deps.scope() : (deps.scope || "anonymous");
+    }
+    function isMobile() {
+      return !!(deps.mq && typeof deps.mq.matches === "boolean" && deps.mq.matches);
+    }
+    // 按钮 a11y 状态：桌面 expanded=侧栏可见；手机 expanded=抽屉打开
+    function setBtnState(expanded) {
+      if (!btn || !btn.setAttribute) return;
+      btn.setAttribute("aria-expanded", String(!!expanded));
+      var label = t(expanded ? "tb.sidebar.collapse" : "tb.sidebar.expand");
+      btn.setAttribute("aria-label", label);
+      btn.title = label;
+    }
+    function applyDesktop() {
+      if (sidebar && sidebar.classList) sidebar.classList.toggle("collapsed", collapsed);
+      setBtnState(!collapsed);
+      if (typeof deps.onLayoutChange === "function") deps.onLayoutChange();
+    }
+    function drawerOpen() {
+      return !!(sidebar && sidebar.classList && sidebar.classList.contains("open"));
+    }
+    function applyDrawer(open) {
+      open = !!open;
+      if (sidebar && sidebar.classList) sidebar.classList.toggle("open", open);
+      if (mask && mask.classList) mask.classList.toggle("open", open);
+      setBtnState(open);
+      // a11y：抽屉关闭后焦点若留在抽屉内（将被移出视口/不可达），回到触发按钮
+      var doc = deps.doc;
+      if (!open && doc && doc.activeElement && sidebar && sidebar.contains &&
+          sidebar.contains(doc.activeElement) && btn && typeof btn.focus === "function") {
+        btn.focus();
+      }
+      if (typeof deps.onLayoutChange === "function") deps.onLayoutChange();
+    }
+
+    return {
+      // 启动：按当前断点应用布局。手机抽屉固定默认关闭（桌面偏好不外溢）；
+      // 桌面读偏好（含启动时身份未知的 official:local 维度），无偏好/读取失败
+      // 默认收起（§4.1）
+      init: function () {
+        if (btn && btn.setAttribute) btn.setAttribute("aria-controls", "sidebar");
+        if (isMobile()) {
+          applyDrawer(false);
+        } else {
+          var pref = readSidebarPref(deps.storage, scopeName());
+          if (pref) collapsed = pref.collapsed;
+          applyDesktop();
+        }
+      },
+      isMobile: isMobile,
+      isDesktopCollapsed: function () { return collapsed; },
+      isDrawerOpen: drawerOpen,
+      // #menu-btn 点击：桌面=切换收起并持久化；手机=开关抽屉（不写偏好）
+      toggle: function () {
+        if (isMobile()) { applyDrawer(!drawerOpen()); return; }
+        collapsed = !collapsed;
+        userTouched = true;
+        applyDesktop();
+        writeSidebarPref(deps.storage, scopeName(), collapsed);
+      },
+      closeDrawer: function () {
+        if (drawerOpen()) applyDrawer(false);
+      },
+      // /api/auth/info 到位后按真实身份重读偏好（用户已手动操作则不覆盖）
+      onScopeReady: function () {
+        if (userTouched || isMobile()) return;
+        var pref = readSidebarPref(deps.storage, scopeName());
+        if (pref && pref.collapsed !== collapsed) {
+          collapsed = pref.collapsed;
+          applyDesktop();
+        }
+      },
+      // 断点切换：清理手机遮罩/抽屉与桌面收起类的残留，恢复当前设备布局状态
+      onBreakpointChange: function () {
+        if (sidebar && sidebar.classList) sidebar.classList.remove("open", "collapsed");
+        if (mask && mask.classList) mask.classList.remove("open");
+        if (isMobile()) applyDrawer(false);
+        else applyDesktop();
+      },
+      // 空态「选择切片」：展开侧栏（桌面同时持久化为展开）并聚焦搜索框（§4.1）
+      expandAndFocusSearch: function () {
+        if (isMobile()) {
+          if (!drawerOpen()) applyDrawer(true);
+        } else if (collapsed) {
+          collapsed = false;
+          userTouched = true;
+          applyDesktop();
+          writeSidebarPref(deps.storage, scopeName(), collapsed);
+        }
+        if (typeof deps.focusSearch === "function") deps.focusSearch();
+      },
+      // 语言切换后同步按钮文案/aria（状态不变，仅 label）
+      refreshButton: function () {
+        setBtnState(isMobile() ? drawerOpen() : !collapsed);
+      },
+    };
+  }
+
+  // 存储访问兜底：隐私模式下访问 window.localStorage 本身可能抛错
+  function safeLocalStorage() {
+    try {
+      var s = window.localStorage;
+      if (s && typeof s.getItem === "function") { s.getItem("pt.sb.probe"); return s; }
+    } catch (e) { /* 不可用：偏好不持久化，页面照常启动 */ }
+    return null;
+  }
+
+  var sidebarCtrl = null;   // init() 里创建（createSidebarController 装配真实依赖）
+
+  // 断点判定（控制器外的兜底路径沿用同一媒体查询口径）
   function isMobileWidth() {
-    return window.matchMedia && window.matchMedia("(max-width: 768px)").matches;
+    if (sidebarCtrl && typeof sidebarCtrl.isMobile === "function") return sidebarCtrl.isMobile();
+    return !!(window.matchMedia && window.matchMedia(SB_MOBILE_QUERY).matches);
   }
-  function openSidebarDrawer() {
-    if (!els.sidebar || !els.sidebarMask) return;
-    els.sidebar.classList.add("open");
-    els.sidebarMask.classList.add("open");
+
+  // ---------- 无切片空态（升级 A §4.1） ----------
+  // 侧栏默认收起后，空态保留明显的「选择切片」入口；切片打开后隐藏。
+  function updateViewerEmptyState() {
+    if (els.viewerEmpty) els.viewerEmpty.hidden = !!state.slide;
   }
-  function closeSidebarDrawer() {
-    if (!els.sidebar || !els.sidebarMask) return;
-    els.sidebar.classList.remove("open");
-    els.sidebarMask.classList.remove("open");
+
+  // ---------- 侧栏宽度变化 → Viewer resize 链（升级 A §4.2，几何验收核心） ----------
+  // 侧栏/抽屉宽度变化必须让 OSD 重算 viewport 再重绘叠加层，不能沿用旧容器
+  // 尺寸的画布坐标。OSD 5 的容器 ResizeObserver 在下一帧执行
+  // viewport.resize(preserveImageSizeOnResize) 并 panTo(原中心)——图像中心与
+  // 缩放保留、绝不 goHome；随后触发 viewer "resize" 事件 → 重绘标注/AI overlay。
+  // 这里在布局落定（下一帧）后补画布背衬尺寸同步与 ROI 框/底图缩略图对位。
+  function syncViewerLayoutNow() {
+    // forceResize 兜底：容器尺寸未越过 OSD 内部阈值或 observer 时机抖动时强制重算
+    try { if (viewer && viewer.forceResize) viewer.forceResize(); } catch (e) { /* 忽略 */ }
+    resizeAnnoCanvas();
+    redrawAnnoCanvas();
+    updateRoiOverlay();
+    syncBaseThumb();
   }
-  function toggleSidebarDrawer() {
+  function syncViewerLayoutAfterSidebar() {
+    // 等一帧：flex 布局/宽度过渡先落定，再按新容器尺寸同步
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(function () { syncViewerLayoutNow(); });
+    } else {
+      syncViewerLayoutNow();
+    }
+  }
+
+  // ---------- 切片搜索过滤（升级 A：纯前端；收起不丢搜索条件） ----------
+  // 匹配切片行 data-name 与行文本（别名优先）。项目行：名称命中整组显示，
+  // 否则任一切片命中则展开显示；无命中隐藏。列表重渲后需重放当前条件。
+  function applySlideFilter(raw) {
     if (!els.sidebar) return;
-    if (els.sidebar.classList.contains("open")) { closeSidebarDrawer(); }
-    else { openSidebarDrawer(); }
+    var q = String(raw == null ? "" : raw).trim().toLowerCase();
+    var rows = els.sidebar.querySelectorAll(".slide-row");
+    Array.prototype.forEach.call(rows, function (row) {
+      var hay = String(row.getAttribute("data-name") || row.textContent || "").toLowerCase();
+      row.style.display = (q && hay.indexOf(q) < 0) ? "none" : "";
+    });
+    Array.prototype.forEach.call(els.sidebar.querySelectorAll(".proj-row"), function (row) {
+      var nameEl = row.querySelector(".proj-name");
+      var nameHit = !!(q && nameEl &&
+        String(nameEl.textContent || "").toLowerCase().indexOf(q) >= 0);
+      var slideHit = false;
+      Array.prototype.forEach.call(row.querySelectorAll(".slide-row"), function (s) {
+        if (s.style.display !== "none") slideHit = true;
+      });
+      var show = !q || nameHit || slideHit;
+      row.style.display = show ? "" : "none";
+      if (q && show && !nameHit && row.classList) row.classList.add("expanded");
+    });
   }
 
   // ---------- 移动端上下文动作条显隐 ----------
@@ -3975,6 +4186,15 @@
     shouldChunkUpload: shouldChunkUpload,
     UPLOAD_V2_THRESHOLD: UPLOAD_V2_THRESHOLD,
   };
+  // 供测试（升级 A）：侧栏开合控制器与偏好存取的真实逻辑入口
+  window.HP_SIDEBAR = {
+    createSidebarController: createSidebarController,
+    sidebarPrefKey: sidebarPrefKey,
+    parseSidebarPref: parseSidebarPref,
+    readSidebarPref: readSidebarPref,
+    writeSidebarPref: writeSidebarPref,
+    syncViewerLayoutNow: syncViewerLayoutNow,
+  };
 
   // ---------- 拖拽上传 ----------
   function setupDragDrop() {
@@ -4042,12 +4262,31 @@
     c.addEventListener("pointercancel", onAnnoPointerUp);
     window.addEventListener("resize", function () { resizeAnnoCanvas(); redrawAnnoCanvas(); });
 
-    // 手机端侧栏抽屉：菜单按钮切换、遮罩点击关闭
+    // 侧栏开合（升级 A）：菜单按钮切换（桌面=收起/展开、手机=抽屉）、
+    // 遮罩点击关闭、Escape 关闭手机抽屉
     if (els.menuBtn) {
-      els.menuBtn.addEventListener("click", toggleSidebarDrawer);
+      els.menuBtn.addEventListener("click", function () { sidebarCtrl.toggle(); });
     }
     if (els.sidebarMask) {
-      els.sidebarMask.addEventListener("click", closeSidebarDrawer);
+      els.sidebarMask.addEventListener("click", function () { sidebarCtrl.closeDrawer(); });
+    }
+    document.addEventListener("keydown", function (e) {
+      if (e && e.key === "Escape" && sidebarCtrl.isMobile() && sidebarCtrl.isDrawerOpen()) {
+        sidebarCtrl.closeDrawer();
+      }
+    });
+
+    // 无切片空态「选择切片」：展开侧栏并聚焦搜索框（§4.1）
+    if (els.viewerEmptyPick) {
+      els.viewerEmptyPick.addEventListener("click", function () {
+        sidebarCtrl.expandAndFocusSearch();
+      });
+    }
+    // 切片搜索：输入即过滤；条件保留在输入框里，侧栏收起/展开不丢失
+    if (els.slideSearch) {
+      els.slideSearch.addEventListener("input", function () {
+        applySlideFilter(this.value);
+      });
     }
 
     // 移动端 ⋯ 溢出面板（AI 读片 + 缩放徽章）
@@ -4400,8 +4639,37 @@
   }
 
   // ---------- 启动 ----------
+  // 装配侧栏开合控制器（升级 A）：真实 DOM/媒体查询/storage/userScope 注入
+  function initSidebarController() {
+    var mq = window.matchMedia ? window.matchMedia(SB_MOBILE_QUERY) : null;
+    sidebarCtrl = createSidebarController({
+      sidebar: els.sidebar,
+      sidebarMask: els.sidebarMask,
+      menuBtn: els.menuBtn,
+      mq: mq,
+      storage: safeLocalStorage(),
+      scope: userScope,
+      doc: document,
+      onLayoutChange: syncViewerLayoutAfterSidebar,
+      focusSearch: function () {
+        if (els.slideSearch && typeof els.slideSearch.focus === "function") {
+          try { els.slideSearch.focus(); } catch (e) { /* 忽略聚焦失败 */ }
+        }
+      },
+    });
+    sidebarCtrl.init();
+    // 断点切换：清理手机遮罩、恢复当前设备布局状态（§4.1 末条）
+    var mq = window.matchMedia ? window.matchMedia(SB_MOBILE_QUERY) : null;
+    if (mq) {
+      var onMqChange = function () { sidebarCtrl.onBreakpointChange(); };
+      if (typeof mq.addEventListener === "function") mq.addEventListener("change", onMqChange);
+      else if (typeof mq.addListener === "function") mq.addListener(onMqChange);
+    }
+  }
+
   function init() {
     initViewer();
+    initSidebarController();
     bindEvents();
     setupDragDrop();
     initAuth();
@@ -4412,6 +4680,8 @@
     var shareSec = els.shareMgrBody.closest(".section");
     if (unfiledSec) unfiledSec.classList.remove("collapsed");
     if (shareSec) shareSec.classList.remove("collapsed");
+    // 升级 A：启动时无切片，显示空态入口（openSlide 成功后隐藏）
+    updateViewerEmptyState();
     loadAll();
   }
 
@@ -4436,6 +4706,8 @@
         renderAnnoPanel(currentAnnotations.annotations || []);
       }
     } catch (e) {}
+    // 升级 A：侧栏按钮文案/aria 随状态（展开↔收起）变化，切语言后重写
+    try { if (sidebarCtrl) sidebarCtrl.refreshButton(); } catch (e) {}
     // AI 配置摘要 / 会话切换器的语言重渲由 HistoPilot 插件 bundle 自行监听 hp-lang-change 处理。
   });
 })();

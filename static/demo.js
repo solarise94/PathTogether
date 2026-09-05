@@ -433,6 +433,9 @@
     var entry = state.slides.filter(function (s) { return s.slide_id === slideId; })[0];
     if (!entry) return;
     state.current = entry;
+    // 升级 A：切片已打开，隐藏无切片空态入口
+    var emptyState = $("viewer-empty");
+    if (emptyState) emptyState.hidden = true;
     // 切片切换：清空当前视角与临时观察高亮（§7.2.5）
     clearRunOverlays();
     renderDemoSlideList(slideId);
@@ -1168,23 +1171,114 @@
     panel.style.display = open ? "flex" : "none";
   }
 
-  function bindShellChrome() {
+  // ---------- 侧栏开合（升级 A；与 app.js 同款行为的轻量副本） ----------
+  // 桌面默认收起、#menu-btn 切换并持久化（demo 无账号，scope 固定 demo:local）；
+  // 手机维持侧滑抽屉默认关闭。侧栏宽度变化走 OSD resize 机制后重绘观察框。
+  var SB_KEY = "pt.sb.v1|demo:local";
+  var SB_MOBILE_QUERY = "(max-width: 768px)";
+  function sbIsMobile() {
+    return !!(window.matchMedia && window.matchMedia(SB_MOBILE_QUERY).matches);
+  }
+  function sbReadPref() {
+    try {
+      var v = JSON.parse(localStorage.getItem(SB_KEY) || "null");
+      if (v && typeof v === "object" && typeof v.collapsed === "boolean") return v.collapsed;
+    } catch (e) { /* 损坏/不可用：无偏好（默认收起） */ }
+    return null;
+  }
+  function sbWritePref(collapsed) {
+    try {
+      localStorage.setItem(SB_KEY, JSON.stringify({ collapsed: !!collapsed, t: Date.now() }));
+    } catch (e) { /* 只失去持久化 */ }
+  }
+  // §4.2 几何：宽度变化先让 OSD 重算 viewport（保留图像中心/缩放，不 goHome），
+  // 再同步观察框画布尺寸并重绘
+  function sbSyncViewer() {
+    try { if (state.viewer && state.viewer.forceResize) state.viewer.forceResize(); } catch (e) {}
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(function () { resizeObsCanvas(); drawObservations(); });
+    } else {
+      resizeObsCanvas();
+      drawObservations();
+    }
+  }
+  function bindSidebarChrome() {
     var menu = $("menu-btn");
     var sidebar = $("sidebar");
     var mask = $("sidebar-mask");
-    if (menu && sidebar) {
-      menu.addEventListener("click", function () {
-        var open = !sidebar.classList.contains("open");
-        sidebar.classList.toggle("open", open);
-        if (mask) mask.classList.toggle("open", open);
+    if (!menu || !sidebar) return;
+    function setBtn(expanded) {
+      menu.setAttribute("aria-expanded", String(expanded));
+      var label = t(expanded ? "tb.sidebar.collapse" : "tb.sidebar.expand");
+      menu.setAttribute("aria-label", label);
+      menu.title = label;
+    }
+    function applyDesktop(collapsed) {
+      sidebar.classList.toggle("collapsed", collapsed);
+      setBtn(!collapsed);
+      sbSyncViewer();
+    }
+    function drawerOpen() { return sidebar.classList.contains("open"); }
+    function applyDrawer(open) {
+      sidebar.classList.toggle("open", open);
+      if (mask) mask.classList.toggle("open", open);
+      setBtn(open);
+      // 关闭抽屉后焦点若留在抽屉内，回到触发按钮（a11y）
+      if (!open && document.activeElement && sidebar.contains(document.activeElement) &&
+          menu.focus) menu.focus();
+      sbSyncViewer();
+    }
+    menu.setAttribute("aria-controls", "sidebar");
+    menu.addEventListener("click", function () {
+      if (sbIsMobile()) { applyDrawer(!drawerOpen()); return; }
+      var collapsed = !sidebar.classList.contains("collapsed");
+      applyDesktop(collapsed);
+      sbWritePref(collapsed);
+    });
+    if (mask) mask.addEventListener("click", function () { applyDrawer(false); });
+    document.addEventListener("keydown", function (e) {
+      if (e && e.key === "Escape" && sbIsMobile() && drawerOpen()) applyDrawer(false);
+    });
+    // 无切片空态「选择切片」：展开侧栏并聚焦搜索框
+    var pick = $("viewer-empty-pick");
+    if (pick) {
+      pick.addEventListener("click", function () {
+        if (sbIsMobile()) {
+          if (!drawerOpen()) applyDrawer(true);
+        } else if (sidebar.classList.contains("collapsed")) {
+          applyDesktop(false);
+          sbWritePref(false);
+        }
+        var input = $("slide-search");
+        if (input && input.focus) input.focus();
       });
     }
-    if (mask && sidebar) {
-      mask.addEventListener("click", function () {
-        sidebar.classList.remove("open");
-        mask.classList.remove("open");
+    // 切片搜索：过滤示例切片列表
+    var search = $("slide-search");
+    if (search) {
+      search.addEventListener("input", function () {
+        var q = String(search.value || "").trim().toLowerCase();
+        var list = $("demo-slide-list");
+        if (!list) return;
+        Array.prototype.forEach.call(list.querySelectorAll(".slide-row"), function (row) {
+          var hay = String(row.textContent || "").toLowerCase();
+          row.style.display = (q && hay.indexOf(q) < 0) ? "none" : "";
+        });
       });
     }
+    // 启动布局：手机抽屉默认关闭（桌面偏好不外溢）；桌面无偏好默认收起
+    if (sbIsMobile()) applyDrawer(false);
+    else {
+      var pref = sbReadPref();
+      applyDesktop(pref === null ? true : pref);
+    }
+    // 语言切换后同步按钮文案/aria（状态不变，仅 label；与 app.js refreshButton 同义）
+    document.addEventListener("hp-lang-change", function () {
+      setBtn(sbIsMobile() ? drawerOpen() : !sidebar.classList.contains("collapsed"));
+    });
+  }
+
+  function bindShellChrome() {
     function toggleAiPanel() {
       var panel = $("ai-panel");
       if (!panel) return;
@@ -1220,6 +1314,8 @@
     initViewer();
     resizeObsCanvas();
     bindShellChrome();
+    // 升级 A：侧栏开合（桌面收起/展开 + 手机抽屉）与空态入口
+    bindSidebarChrome();
     setAiPanelOpen(true);
     loadConfig({ restore: true });
     loadSlides();

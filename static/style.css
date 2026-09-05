@@ -366,7 +366,37 @@ button {
   flex-direction: column;
   flex-shrink: 0;
   overflow: hidden;
+  /* 升级 A：桌面收起/展开的宽度过渡（手机抽屉仍走 transform 过渡）。
+     宽度变化由 OSD 容器 ResizeObserver + app.js 的 onLayoutChange 同步 Viewer */
+  transition: width 0.18s ease;
 }
+
+/* 升级 A（§4.1/§4.2）：桌面收起态——切片列表不占布局宽度，Viewer 用足释放空间。
+   收起内容 visibility:hidden：退出 tab 顺序与无障碍树，而非只移出视口。
+   只在桌面断点生效；手机抽屉由 ≤768px 媒体查询的 transform 规则接管 */
+@media (min-width: 769px) {
+  #sidebar.collapsed {
+    width: 0;
+    min-width: 0;
+    border-right-width: 0;
+    visibility: hidden;
+  }
+}
+
+/* 升级 A：切片搜索框（侧栏顶部，纯前端过滤；列表重渲后自动重放条件） */
+.slide-search {
+  width: 100%;
+  padding: 6px 10px;
+  border: 0.5px solid var(--separator-strong);
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: inherit;
+  background: #fff;
+  color: var(--text);
+  outline: none;
+}
+.slide-search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-fill); }
+.slide-search::placeholder { color: var(--text-3); }
 
 .sidebar-top {
   padding: 12px;
@@ -970,6 +1000,41 @@ button {
 }
 #viewer { width: 100%; height: 100%; }
 
+/* 升级 A：无切片空态（正式版与 Demo 共用）。只盖住 viewer 背景，
+   卡片外不拦截指针（拖拽上传等行为不受影响）；切片打开后由 JS 隐藏 */
+.viewer-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 2;
+}
+.viewer-empty[hidden] { display: none; }
+.viewer-empty-card {
+  pointer-events: auto;
+  text-align: center;
+  padding: 28px 36px;
+  border-radius: var(--r-panel);
+  background: rgba(255, 255, 255, 0.9);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  box-shadow: var(--shadow-float);
+  max-width: min(86%, 420px);
+}
+.viewer-empty-title {
+  margin: 0 0 4px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.viewer-empty-sub {
+  margin: 0 0 14px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
 /* 底图缩略图层 */
 .osd-base-thumb {
   position: absolute;
@@ -1129,9 +1194,10 @@ button {
   height: 24px;
   font-size: 18px;
 }
-/* 菜单按钮（汉堡）：仅手机端显示，用于打开侧栏抽屉；桌面默认隐藏 */
+/* 菜单按钮（升级 A）：全断点可见的侧栏开合入口——桌面=收起/展开侧栏，
+   手机=侧滑抽屉；状态文案（展开/收起侧栏）由 app.js 按断点同步 */
 .icon-btn.menu-btn {
-  display: none;
+  display: inline-flex;
   width: 32px;
   height: 32px;
   font-size: 18px;
@@ -3244,8 +3310,11 @@ button {
     flex-direction: row;
     align-items: center;
     gap: 8px;
+    flex-wrap: wrap;
   }
   .demo-sidebar-top .demo-quota-chip { flex: 1; min-width: 0; }
+  /* 窄屏 Demo：搜索框独占一行（徽章 + 额度 chip 一行放不下三个元素） */
+  .demo-sidebar-top .slide-search { flex: 1 0 100%; order: 3; }
   .demo-badge-side {
     display: inline-flex;
     flex-shrink: 0;

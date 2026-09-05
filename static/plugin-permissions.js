@@ -32,6 +32,7 @@
     "selection.getBbox": "slide:metadata:read",
     "viewer.navigate": "viewer:navigate",
     "viewer.highlight": "viewer:navigate",
+    "viewer.applyRenderContext": "viewer:navigate",
     "annotation.create": "annotation:write",
     "annotation.read": "annotation:read",
     "annotation.focus": "viewer:navigate",

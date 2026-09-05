@@ -4156,7 +4156,8 @@
     // 修复）——插件脚本先于 app.js 加载并立即握手时，等这里的 onRequest 注册会先
     // 收到 unknown_method（demo 实测）。业务方法才走下方注册表。
     // Plugin→Host request（被 gate 的方法：slide.getCurrent / selection.getBbox /
-    // viewer.navigate / viewer.highlight / annotation.create / annotation.read / annotation.focus）
+    // viewer.navigate / viewer.highlight / viewer.applyRenderContext /
+    // annotation.create / annotation.read / annotation.focus）
     host.onRequest("slide.getCurrent", gate("slide.getCurrent", function () {
       if (!state.slide) return null;
       return { name: state.slide.name, width: state.slide.width, height: state.slide.height,

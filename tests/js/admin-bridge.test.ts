@@ -413,7 +413,12 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 		// 复用 admin:overview:read，不再扩权限域）与
 		// spend.userTotalLimit.set / restoreDefault（user 一次性总额度 CAS 写，
 		// admin:users:write）
-		expect(Object.keys(table)).toHaveLength(27);
+		// 2026-09-05（review P0 owner 读隔离）：新增 slides.inventory /
+		// slides.setVisibility（切片可见性管理，独立 admin:slides:read/write
+		// 权限域），27 → 29
+		expect(Object.keys(table)).toHaveLength(29);
+		expect(table["admin.slides.inventory"]).toBe("admin:slides:read");
+		expect(table["admin.slides.setVisibility"]).toBe("admin:slides:write");
 		expect(table["admin.auth.get"]).toBe("admin:overview:read");
 		expect(table["admin.overview.get"]).toBe("admin:overview:read");
 		expect(table["admin.users.list"]).toBe("admin:users:read");

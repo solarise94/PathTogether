@@ -51,6 +51,9 @@ MANIFEST_PERMISSIONS = (
 #（早已无 manifest 消费者的死枚举）、admin:billing:write（人工调账/caps 写
 # 入口退役）与 admin:acquisition:read（用户归因退役）；站点访问/Demo 周统计
 # 复用 admin:overview:read，不再扩权限域。
+# 2026-09-05（review P0 owner 读隔离）：新增 admin:slides:read/write——
+# 切片可见性管理（inventory 全量清点 + 显式授权/收回），独立的 slides
+# 权限域，不与 users/settings 混用。
 # 注意：申请不建立信任——admin 插件信任由 PRIVILEGED_ADMIN_PLUGIN_IDS 白名单 +
 # source-policy 显式 sha256 pin + manifest hash 精确匹配 + installation enabled
 # 共同判定，永远 fail-closed（app.py _admin_plugin_trusted）。
@@ -58,6 +61,8 @@ MANIFEST_ADMIN_PERMISSIONS = (
     "admin:overview:read",
     "admin:users:read",
     "admin:users:write",
+    "admin:slides:read",
+    "admin:slides:write",
     "admin:invites:read",
     "admin:invites:write",
     "admin:billing:read",

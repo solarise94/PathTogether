@@ -695,9 +695,9 @@ def test_ui_budget_card_and_max_steps_sync_present():
     assert '"/api/admin/v1/settings/runtime", "PUT"' in bridge_js
     manifest = json.loads((REPO_ROOT / "plugins" / "pathtogether-admin"
                            / "manifest.json").read_text(encoding="utf-8"))
-    # 批次 E：插件版本已从 0.3.3 递补（本批 0.3.4）；turn/acquisition/billing
+    # 2026-09-05：插件版本 0.3.5（切片可见性管理页）；turn/acquisition/billing
     # write 权限全部退役（§Batch E 1 / §Batch C 6 / §Batch D1 4/15）
-    assert manifest["pluginVersion"] == "0.3.4"
+    assert manifest["pluginVersion"] == "0.3.5"
     for perm in ("admin:turn-budgets:read", "admin:turn-budgets:write",
                  "admin:acquisition:read", "admin:billing:write"):
         assert perm not in manifest["adminPermissions"], perm

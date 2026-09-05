@@ -70,6 +70,11 @@
     "admin.users.setEnabled": "admin:users:write",
     "admin.users.setAiAccess": "admin:users:write",
     "admin.users.resetPassword": "admin:users:write",
+    // 2026-09-05（review P0 owner 读隔离）：切片可见性管理——inventory 是
+    // owner 唯一「看全部」出口；setVisibility 给 owner 建立/收回单切片
+    // view 授权（幂等）。独立 slides 权限域，不与 users/settings 混用。
+    "admin.slides.inventory": "admin:slides:read",
+    "admin.slides.setVisibility": "admin:slides:write",
     "admin.invites.list": "admin:invites:read",
     "admin.invites.create": "admin:invites:write",
     "admin.invites.revoke": "admin:invites:write",
@@ -208,6 +213,21 @@
         password: { type: "string", minLength: 1, maxLength: 200 },
       },
       required: ["user_id", "password"],
+      additionalProperties: false,
+    },
+    // 2026-09-05：切片可见性管理。inventory 只允许游标/页大小；setVisibility
+    // 的 name 是切片文件名（服务端 _sanitize_name 权威校验，桥层只挡空值
+    // 与路径分隔符——pathId）。
+    "admin.slides.inventory": {
+      properties: { cursor: _cursorSpec, limit: _limitSpec },
+      additionalProperties: false,
+    },
+    "admin.slides.setVisibility": {
+      properties: {
+        name: { type: "string", minLength: 1, maxLength: 200 },
+        granted: { type: "boolean" },
+      },
+      required: ["name", "granted"],
       additionalProperties: false,
     },
     "admin.invites.list": {
@@ -647,6 +667,25 @@
         if (!res.ok) throw backendError(url, res);
         return res.body;
       });
+    },
+
+    // 2026-09-05：切片可见性管理（读隔离的唯一管理出口）。setVisibility 走
+    // POST（makeFetchJson 对非安全方法自动附 CSRF 双提交 header）；name 经
+    // pathId 防路径拼接（拒绝空值与 "/"、"?"）。
+    "admin.slides.inventory": function (ctx, payload) {
+      var url = "/api/admin/v1/slides/inventory" + buildQuery({
+        cursor: payload.cursor, limit: payload.limit,
+      });
+      return ctx.fetchJson(url).then(function (res) {
+        if (!res.ok) throw backendError(url, res);
+        return res.body;
+      });
+    },
+
+    "admin.slides.setVisibility": function (ctx, payload) {
+      var url = "/api/admin/v1/slides/" +
+        pathId(payload.name, "name") + "/visibility";
+      return jsonWrite(url, "POST", { granted: payload.granted })(ctx);
     },
 
     "admin.billing.usage.list": function (ctx, payload) {

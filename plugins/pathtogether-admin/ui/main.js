@@ -54,7 +54,7 @@
     listSeq: 0,
     // 分页游标（每列表独立；仅内存）
     cursors: { users: null, usage: null, unpriced: null, ledger: null,
-               audit: null, invites: null },
+               audit: null, invites: null, slides: null },
     filters: { users: {}, usage: {}, audit: {} },
     // 设置页快照（批次 D §6.1）：admin.settings.get 的响应（含 spend
     // current_windows 的 demo/owner 窗口 CAS version）——仅内存。
@@ -69,8 +69,8 @@
   // 深链起始页（PR5 /admin#invites 兼容）：宿主把父页 hash 透传到本 iframe
   // 自身 URL；只接受已知页面 slug，其余回概览。
   function initialPageFromHash() {
-    var pages = ["overview", "users", "invites", "settings", "billing",
-                 "plugins", "audit"];
+    var pages = ["overview", "users", "slides", "invites", "settings",
+                 "billing", "plugins", "audit"];
     var hash = "";
     try { hash = window.location.hash || ""; } catch (e) { hash = ""; }
     var name = hash.replace(/^#/, "");
@@ -83,7 +83,7 @@
   // wave 2：顶级页名收敛（「邀请与来源」→「邀请」、「额度与账单」→「费用」）；
   // slug 保持不变，宿主深链 #invites/#billing 兼容。
   var PAGE_TITLES = {
-    overview: "概览", users: "用户", invites: "邀请",
+    overview: "概览", users: "用户", slides: "切片可见性", invites: "邀请",
     settings: "设置", billing: "费用", plugins: "插件", audit: "审计",
   };
 
@@ -99,6 +99,7 @@
     pages: {
       overview: $("adm-page-overview"),
       users: $("adm-page-users"),
+      slides: $("adm-page-slides"),
       invites: $("adm-page-invites"),
       settings: $("adm-page-settings"),
       billing: $("adm-page-billing"),
@@ -859,10 +860,10 @@
   // ------------------------------------------------------------------
   function resetLists() {
     state.cursors = { users: null, usage: null, unpriced: null, ledger: null,
-                      audit: null, invites: null };
+                      audit: null, invites: null, slides: null };
     ["adm-users-tbody", "adm-usage-tbody", "adm-unpriced-tbody",
      "adm-ledger-tbody", "adm-audit-tbody", "adm-invites-tbody",
-     "adm-plugins-tbody"].forEach(function (id) {
+     "adm-plugins-tbody", "adm-slides-tbody"].forEach(function (id) {
       var el = $(id);
       if (el) el.textContent = "";
     });
@@ -2797,6 +2798,121 @@
   }
 
   // ------------------------------------------------------------------
+  // 切片可见性（2026-09-05，review P0 owner 读隔离）：
+  //   - inventory 是 owner 唯一「看全部」出口（切片元数据清点，不含图像
+  //     内容）；
+  //   - 每行「授权/收回」调用 admin.slides.setVisibility（幂等；view 级）；
+  //   - 归属列显示 owner 展示名 + 掩码 login_id（无归属显示「无主」——
+  //     无主切片不因读隔离失联，在此可授权恢复可见）。
+  // ------------------------------------------------------------------
+  function fmtBytes(n) {
+    if (n === null || n === undefined || typeof n !== "number" || !(n >= 0)) {
+      return "—";
+    }
+    var units = ["B", "KB", "MB", "GB", "TB"];
+    var v = n;
+    var i = 0;
+    while (v >= 1024 && i < units.length - 1) {
+      v /= 1024;
+      i++;
+    }
+    return (i === 0 ? String(v) : (Math.round(v * 10) / 10).toFixed(1)) +
+      " " + units[i];
+  }
+
+  function ownerCellText(item) {
+    if (!item.owner_user_id) return "无主";
+    var name = item.owner_display_name;
+    var masked = item.owner_login_id_masked;
+    if (name && masked) return name + "（" + masked + "）";
+    return name || masked || item.owner_user_id;
+  }
+
+  function grantStatusText(item) {
+    if (item.public && item.granted_to_owner) return "公开 + 已授权";
+    if (item.public) return "公开（默认可见）";
+    if (item.granted_to_owner) return "已授权给 owner";
+    return "未授权";
+  }
+
+  function loadSlides(append) {
+    var seq = state.listSeq;
+    var status = $("adm-slides-status");
+    setPageState("slides", "loading");
+    request("admin.slides.inventory", {
+      limit: 50,
+      cursor: append ? state.cursors.slides : null,
+    }).then(function (res) {
+      if (seq !== state.listSeq) return; // 页面已切换：晚到响应丢弃
+      hideError();
+      var items = (res && res.items) || [];
+      var tbody = $("adm-slides-tbody");
+      if (!append && tbody) tbody.textContent = "";
+      items.forEach(function (item) { renderSlideRow(item); });
+      if (!append && !items.length) {
+        setPageState("slides", "empty", {
+          message: "没有切片文件。上传切片后在此清点与授权。",
+        });
+      } else {
+        setPageState("slides", "ready", {
+          message: "已更新（" + nowText() + "）",
+        });
+      }
+      state.cursors.slides = (res && res.next_cursor) || null;
+      var more = $("adm-slides-more-btn");
+      if (more) more.disabled = !(res && res.next_cursor);
+      setPageHint(status, res && res.next_cursor ? "还有更多" : "已到底");
+    }).catch(function (err) {
+      if (seq !== state.listSeq) return;
+      handleErr(err, status);
+      setPageState("slides", "error", {
+        code: err && err.code, message: err && err.message,
+        retry: function () { loadSlides(false); },
+      });
+    });
+  }
+
+  function renderSlideRow(item) {
+    var tbody = $("adm-slides-tbody");
+    if (!tbody) return;
+    var tr = document.createElement("tr");
+    tr.appendChild(td(item.name));
+    tr.appendChild(td(ownerCellText(item)));
+    tr.appendChild(td(item.public ? "是" : "—"));
+    tr.appendChild(td(item.archived ? "是" : "—"));
+    tr.appendChild(td(fmtBytes(item.size_bytes)));
+    tr.appendChild(td(grantStatusText(item)));
+    var cell = document.createElement("td");
+    cell.className = "adm-actions-cell";
+    var granted = !!item.granted_to_owner;
+    cell.appendChild(actionBtn(granted ? "收回" : "授权", function () {
+      if (granted) {
+        askConfirm($("adm-slides-confirm"),
+          "确认收回对 " + item.name + " 的 view 授权？收回后 owner 默认视图" +
+          "不再可见该切片（归属者与公开状态不受影响）。",
+          function () { setSlideVisibility(item, false); });
+      } else {
+        setSlideVisibility(item, true);
+      }
+    }, granted ? "danger-outline" : "secondary"));
+    tr.appendChild(cell);
+    tbody.appendChild(tr);
+  }
+
+  function setSlideVisibility(item, granted) {
+    request("admin.slides.setVisibility",
+            { name: item.name, granted: granted })
+      .then(function (res) {
+        var already = res && granted && res.already_granted;
+        setStatus("adm-slides-status",
+          (granted ? "已授权 " : "已收回 ") + item.name +
+          (already ? "（此前已授权，幂等成功）" : ""));
+        loadSlides(false);
+      })
+      .catch(function (err) { handleErr(err, $("adm-slides-status")); });
+  }
+
+  // ------------------------------------------------------------------
   // 插件管理（PR5 修订：恢复旧侧栏插件管理功能面）
   // ------------------------------------------------------------------
   function pluginHealthText(h) {
@@ -2930,6 +3046,7 @@
     }
     if (name === "overview") loadOverview();
     else if (name === "users") loadUsers(false);
+    else if (name === "slides") loadSlides(false);
     else if (name === "invites") loadInvitesPage();
     else if (name === "settings") loadSettingsPage();
     else if (name === "billing") loadBillingPage();
@@ -3090,6 +3207,9 @@
       loadAudit(false);
     });
     onClick("adm-audit-more-btn", function () { loadAudit(true); });
+    // 切片可见性页（2026-09-05 读隔离）
+    onClick("adm-slides-refresh-btn", function () { loadSlides(false); });
+    onClick("adm-slides-more-btn", function () { loadSlides(true); });
     // 插件页（PR5 修订）
     onClick("adm-plugins-refresh-btn", function () { loadPlugins(); });
     onClick("adm-plugin-secret-copy", function () {

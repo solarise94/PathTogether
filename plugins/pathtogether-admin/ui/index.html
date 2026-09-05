@@ -49,7 +49,10 @@
     .adm-state 页级状态条（role=status aria-live=polite）承载；错误显示
     类别 + 本地请求序号（非敏感）+ 重试；空态解释为什么为空与下一步。
 
-    页面（7 页 IA）：概览 / 用户 / 邀请 / 设置 / 费用 / 插件 / 审计。
+    页面（8 页 IA）：概览 / 用户 / 切片 / 邀请 / 设置 / 费用 / 插件 / 审计。
+    「切片」（2026-09-05，review P0 owner 读隔离）= 切片可见性管理：
+    inventory 全量清点（唯一「看全部」出口，仅元数据）+ 对 owner 显式
+    授权/收回单切片 view 权限。
 
     只加载相对路径 style.css / main.js（owner-only 的
     /admin/plugin-assets/pathtogether-admin/ui/*）；不写内联样式/脚本（CSP）。
@@ -70,6 +73,7 @@
       <nav class="adm-nav" id="adm-nav" aria-label="管理页面">
         <button type="button" class="adm-nav-btn" data-page="overview">概览</button>
         <button type="button" class="adm-nav-btn" data-page="users">用户</button>
+        <button type="button" class="adm-nav-btn" data-page="slides">切片</button>
         <button type="button" class="adm-nav-btn" data-page="invites">邀请</button>
         <button type="button" class="adm-nav-btn" data-page="settings">设置</button>
         <button type="button" class="adm-nav-btn" data-page="billing">费用</button>
@@ -238,6 +242,39 @@
             <div class="adm-pager">
               <button type="button" id="adm-users-more-btn" class="adm-btn-secondary">加载更多</button>
               <span id="adm-users-status" class="adm-status"></span>
+            </div>
+          </section>
+        </section>
+
+        <!-- 切片可见性（review P0 2026-09-05 读隔离）：owner 不再默认可见
+             全部切片；本页是唯一「看全部」出口（inventory 元数据清点，不含
+             切片图像内容）+ 对 owner 显式授权/收回单切片 view 权限 -->
+        <section class="adm-page" id="adm-page-slides" hidden>
+          <div class="adm-state" id="adm-state-slides" data-page-state="idle" role="status" aria-live="polite"></div>
+          <section class="adm-card">
+            <h2>切片可见性</h2>
+            <p class="adm-note">读隔离模型：owner 与用户一致，默认只能看到自己上传的、公开的、受邀协作的切片；他人切片须在此显式授权后才可见（无主切片也在此清点并可授权恢复可见）。授权是 view 级（只读查看）；「已授权给 owner」列显示当前授权状态。本清单只含切片元数据，不含切片图像内容。</p>
+            <div class="adm-table-wrap">
+              <table class="adm-table" id="adm-slides-table">
+                <thead>
+                  <tr>
+                    <th>切片名</th>
+                    <th>归属</th>
+                    <th class="adm-col-secondary">公开</th>
+                    <th class="adm-col-secondary">归档只读</th>
+                    <th class="adm-col-secondary">大小</th>
+                    <th>授权状态</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="adm-slides-tbody"></tbody>
+              </table>
+            </div>
+            <div class="adm-confirm" id="adm-slides-confirm" hidden></div>
+            <div class="adm-pager">
+              <button type="button" id="adm-slides-refresh-btn" class="adm-btn-secondary">刷新列表</button>
+              <button type="button" id="adm-slides-more-btn" class="adm-btn-secondary">加载更多</button>
+              <span id="adm-slides-status" class="adm-status"></span>
             </div>
           </section>
         </section>

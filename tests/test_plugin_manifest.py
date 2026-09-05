@@ -374,15 +374,18 @@ def test_capability_tool_name_mangling():
 
 
 # --------------------------------------------------------------------------- #
-# wave 2（2026-09-03，review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
-# Batch C5-6/D1/E-3）：adminPermissions 枚举收敛——三个宿主常量同源，不得漂移。
+# adminPermissions 枚举——三个宿主常量同源，不得漂移。
+# wave 2（2026-09-03）收敛后，2026-09-05（review P0 owner 读隔离）新增
+# admin:slides:read/write（切片可见性管理：inventory 清点 + 显式授权/收回）。
 # --------------------------------------------------------------------------- #
-def test_manifest_admin_permissions_enum_wave2_locked():
-    """SDK 词表精确等于 wave 2 的 11 项；turn/acquisition/billing:write 全退。"""
+def test_manifest_admin_permissions_enum_locked():
+    """SDK 词表精确等于 13 项；turn/acquisition/billing:write 全退。"""
     assert M.MANIFEST_ADMIN_PERMISSIONS == (
         "admin:overview:read",
         "admin:users:read",
         "admin:users:write",
+        "admin:slides:read",
+        "admin:slides:write",
         "admin:invites:read",
         "admin:invites:write",
         "admin:billing:read",

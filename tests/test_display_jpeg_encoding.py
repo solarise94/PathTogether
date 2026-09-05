@@ -220,6 +220,48 @@ def test_image_mode_from_context_native_rgb_not_multichannel():
         {"version": "multichannel-additive-v1"}) == "multichannel"
 
 
+# --------------------------------------------------------------------------- #
+# 4. region encoder 身份回显（P1-2）：encoder.image_mode / encoder.subsampling
+# --------------------------------------------------------------------------- #
+def _internal_region_body(slide, **kw):
+    headers = {"X-AI-Internal-Token": app_mod.AI_INTERNAL_TOKEN}
+    r = _client().post("/internal/ai/region", headers=headers,
+                       json=dict({"slide": slide, "x": 0, "y": 0,
+                                  "w": 16, "h": 16}, **kw))
+    assert r.status_code == 200, r.get_data(as_text=True)
+    return r.get_json()
+
+
+def test_internal_region_encoder_identity_native(monkeypatch):
+    """无 context：encoder 如实回报 native_rgb/4:2:0，与实际色度抽样一致。"""
+    _flag_on(monkeypatch)
+    _write(RGB_NAME, make_ome_tiff_bytes())
+    body = _internal_region_body(RGB_NAME)
+    enc = body["encoder"]
+    assert enc["image_mode"] == "native_rgb"
+    assert enc["subsampling"] == "4:2:0"
+    # 回报身份 = 实际编码：解码后抽样确为 4:2:0
+    assert _sampling(base64.b64decode(body["image_base64"])) == 2
+    # 64×96 fixture 默认 out 1568 → 请求分辨率高于源 → upsampled=true
+    assert body["upsampled"] is True
+
+
+def test_internal_region_encoder_identity_multichannel(monkeypatch):
+    """multichannel context：encoder 如实回报 multichannel/4:4:4。"""
+    _flag_on(monkeypatch)
+    _write(CYX_NAME, make_ome_cyx_bytes(c=2))
+    r = _client().post("/api/slide/%s/render-context" % CYX_NAME,
+                       json={"active_channels": [{"index": 0}]})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    ctx = r.get_json()["render_context"]
+    body = _internal_region_body(CYX_NAME, render_context=ctx)
+    enc = body["encoder"]
+    assert enc["image_mode"] == "multichannel"
+    assert enc["subsampling"] == "4:4:4"
+    # 回报身份 = 实际编码：解码后抽样确为 4:4:4
+    assert _sampling(base64.b64decode(body["image_base64"])) == 0
+
+
 def test_rgb_tile_stays_420_when_flag_on(monkeypatch):
     """flag 开时 RGB 仍带 native-rgb-v1 context，不得误编 4:4:4。"""
     _flag_on(monkeypatch)

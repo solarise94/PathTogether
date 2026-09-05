@@ -613,6 +613,20 @@ X-JPEG-Quality: 85
 
 header 缺失、非法或与 bytes/hash 不一致时，`PathTogetherHttpClient` 将响应视为 `invalid_region_response`，不得把不完整结果放入 derivative cache。
 
+#### 7.3.1 现行 legacy transport 的 additive 字段（2026-09-05）
+
+Stage 4-2 起现行 Flask 实现的二进制 transport（`Accept: application/octet-stream` 或 `?format=binary`，`Content-Type: application/octet-stream`）以响应头携带元数据；本节字段均为 **additive 契约**——旧客户端 / 旧平台遇到未知头一律忽略，缺省视为 undefined，不构成破坏性变更：
+
+- `X-Region-Read-Level`：JSON 数字，实际解码的金字塔层（W0 跨仓契约）；
+- `X-Region-Upsampled`：JSON 布尔（`true`/`false`），输出分辨率是否超过所选层原生分辨率（即服务端做了放大）。HistoPilot 应把它记入 snapshot/导数 provenance——放大图不能当作原生分辨率证据使用；
+- `X-Region-Encoder`：JSON 对象（对应 JSON 路径的 `encoder` 字段），除既有 `id`/`version`/`resize`/`overlay_version`/`jpeg_quality` 外，additive 携带本次响应**实际**的编码身份：
+  - `image_mode`：`"multichannel"` 或 `"native_rgb"`；
+  - `subsampling`：色度抽样契约标签，`"4:4:4"`（multichannel）或 `"4:2:0"`（native）。
+
+兼容语义：旧平台解析 `X-Region-Encoder` / `encoder` 时按既有字段读取，新增两键缺省即忽略，无需版本协商。
+
+`encoder.image_mode` / `encoder.subsampling` 的用途（P1-2，2026-09-05）：HistoPilot 侧必须把编码版本 + 子采样方式纳入 region/derivative cache key 与检查点导数身份。荧光（multichannel）派生图自本版本起为 4:4:4，滚动升级期间新平台若不含子采样标识，可能把旧 4:2:0 缓存派生图误配给新 4:4:4 的缓存键、或使检查点哈希对同一逻辑导数误判为已变更；回报实际编码身份后（`encode_display_jpeg` 实际参数单一来源，不经 `render_context` 二次猜测），缓存与检查点可安全区分两代字节。
+
 ### 7.4 事件流
 
 平台事件流使用 SSE：

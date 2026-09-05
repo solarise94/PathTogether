@@ -5,8 +5,9 @@
   - 内容协商：Accept: application/octet-stream（与 ?format=binary）→ raw JPEG
     bytes + 元数据头；缺省（无 Accept）保持 JSON base64 兼容；
   - 二进制头齐全（Content-SHA256/X-Asset-Revision/X-Region-Bbox/X-Region-Out/
-    X-Region-Magnification/X-Region-Encoder）；二进制 body 与 JSON base64 解码
-    后字节逐字节一致（同参数两请求 sha256 相同）；
+    X-Region-Magnification/X-Region-Encoder/X-Region-Read-Level/
+    X-Region-Upsampled）；二进制 body 与 JSON base64 解码后字节逐字节一致
+    （同参数两请求 sha256 相同）；
   - 像素预算闸 1（单请求上限）：超限 → 429 rate_limited（retryable=true）+
     Retry-After，且**在读盘/解码前拒绝**（slide_cache.borrow_pair /
     _read_region_b64 未被调用）；
@@ -112,6 +113,18 @@ def _borrow_pair_ctx(pair):
 _FAKE_ENTRY = {"pool": None, "sem": None}
 
 
+class _FakeOsr:
+    """金字塔 [1,2,4,8]、dims 8192² 的 fake（同 test_region_read_level 形态，
+    不实现选层方法）。供真实 _read_region_b64 走完整选层/编码路径。"""
+
+    dimensions = (8192, 8192)
+    level_downsamples = (1.0, 2.0, 4.0, 8.0)
+
+    def read_region(self, loc, level, size):
+        from PIL import Image
+        return Image.new("RGB", size)
+
+
 def _slide_read_mocks(osr=None, mpp=0.5):
     """slide 读路径 mock 栈（dimensions + mpp），返回 (get_slide, borrow, metadata)。"""
     pair = {"osr": osr or mock.Mock(dimensions=(1000, 2000))}
@@ -127,6 +140,9 @@ def _fake_region(jpeg_bytes, width=1568, height=1568):
         "mime": "image/jpeg", "width": width, "height": height,
         "src": {"x": 0, "y": 0, "w": 100, "h": 100}, "magnification": 20.0,
         "read_level": 1,  # W0 契约：实际解码金字塔层（mock 与真实返回同形）
+        "upsampled": False,  # W0 契约：out 是否超过源像素（mock 与真实返回同形）
+        # P1-2：实际编码身份（mock 与真实返回同形）
+        "image_mode": "native_rgb", "subsampling": "4:2:0",
     }
 
 
@@ -169,8 +185,13 @@ def test_region_binary_via_accept_header():
     assert json.loads(r.headers["X-Region-Magnification"]) == 20.0
     # W0 契约：二进制路径以响应头回传实际解码层（int）
     assert json.loads(r.headers["X-Region-Read-Level"]) == 1
+    # W0 契约（additive）：X-Region-Upsampled 头 = bool（P1-1）
+    assert json.loads(r.headers["X-Region-Upsampled"]) is False
     enc = json.loads(r.headers["X-Region-Encoder"])
     assert enc["id"] == "pillow" and enc["resize"] == "LANCZOS" and enc["jpeg_quality"] == 85
+    # P1-2（additive）：encoder 携带本次实际编码身份
+    assert enc["image_mode"] == "native_rgb"
+    assert enc["subsampling"] == "4:2:0"
 
 
 def test_region_binary_via_query_format():
@@ -239,6 +260,46 @@ def test_region_binary_bytes_identical_to_json_base64():
     binary_sha = hashlib.sha256(rb.data).hexdigest()
     json_sha = hashlib.sha256(base64.b64decode(rj.get_json()["image_base64"])).hexdigest()
     assert binary_sha == json_sha == expected_sha
+
+
+def test_region_binary_upsampled_header_true_and_false():
+    """P1-1：二进制路径 X-Region-Upsampled 头（真实 _read_region_b64 选层）。
+
+    upsampled 语义同 choose_read_level：请求分辨率高于所选层原生分辨率
+    （max_ds<1）→ True。放大（True）与不放大（False）各一：
+      - True：bbox 1000×500 请求 out 2000×1000 → level 0 + 放大；
+      - False：bbox 4096² 默认 out 1568 → ds=2 层够用（level 1），不放大；
+        同时验证无 context 时 encoder 身份 = native 4:2:0（真实编码路径）。
+    """
+    inst = _bootstrap()
+    slide = _touch_slide()
+    token = _token_for(inst)
+    binary = {"Authorization": "Bearer " + token,
+              "Accept": "application/octet-stream"}
+
+    osr = _FakeOsr()
+    m1, m2, m3 = _slide_read_mocks(osr)
+    with m1, m2, m3:
+        r_true = _client().post(
+            "/api/plugin/v1/slides/%s/regions" % slide, headers=binary,
+            json={"x": 0, "y": 0, "w": 1000, "h": 500,
+                  "out_w": 2000, "out_h": 1000})
+    assert r_true.status_code == 200, r_true.get_data(as_text=True)
+    assert json.loads(r_true.headers["X-Region-Upsampled"]) is True
+    assert json.loads(r_true.headers["X-Region-Read-Level"]) == 0
+
+    osr = _FakeOsr()
+    m1, m2, m3 = _slide_read_mocks(osr)
+    with m1, m2, m3:
+        r_false = _client().post(
+            "/api/plugin/v1/slides/%s/regions" % slide, headers=binary,
+            json={"x": 0, "y": 0, "w": 4096, "h": 4096})
+    assert r_false.status_code == 200, r_false.get_data(as_text=True)
+    assert json.loads(r_false.headers["X-Region-Upsampled"]) is False
+    assert json.loads(r_false.headers["X-Region-Read-Level"]) == 1
+    enc = json.loads(r_false.headers["X-Region-Encoder"])
+    assert enc["image_mode"] == "native_rgb"
+    assert enc["subsampling"] == "4:2:0"
 
 
 # --------------------------------------------------------------------------- #

@@ -12299,7 +12299,9 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
       - 否则：用显式 out_w/out_h（仍 clamp 到 [1,4096]），保持旧契约。
     LANCZOS resize 保持不变；JPEG 质量 jpeg_quality 默认 DERIVATIVE_JPEG_QUALITY(85)，
     多通道 context 时 subsampling=0（4:4:4）。选层与 /region 端点共用
-    choose_read_level；返回 dict 另含 upsampled（out 是否超过源像素）。
+    choose_read_level；返回 dict 另含 upsampled（out 是否超过源像素）、
+    image_mode/subsampling（本次编码的实际身份，additive——subsampling 为
+    "4:4:4"/"4:2:0" 契约标签，取自 encode_display_jpeg 回传的实际参数）。
     Batch 3（§6.3）：render_context 非 None 时为 wire 请求体形态（plugin v1 /
     internal 通道），在本函数内借句柄后、**解码前** canonicalize + revision
     绑定（稳定码拒绝）；成功按该 context 合成并在结果 dict 带
@@ -12351,7 +12353,7 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
         if render_context is not None \
         and render_context.get("version") \
         == slide_render.CONTEXT_VERSION_MULTICHANNEL else "native_rgb"
-    jpeg_bytes, _params = slide_render.encode_display_jpeg(
+    jpeg_bytes, enc_params = slide_render.encode_display_jpeg(
         region, image_mode=image_mode, quality=int(jpeg_quality))
     img_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
     return {
@@ -12368,13 +12370,27 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
         "upsampled": bool(upsampled),
         # §6.3 additive：render_context 生效时的 fingerprint（RGB legacy 为 None）
         "render_fingerprint": render_fingerprint,
+        # P1-2（2026-09-05）additive：本次响应**实际**的编码身份（不凭
+        # render_context 二次猜测）——subsampling 标签单一来源是
+        # encode_display_jpeg 回传的实际参数；随 encoder info 透出后供
+        # HistoPilot 侧 region cache key / 检查点导数身份使用。
+        "image_mode": image_mode,
+        "subsampling": slide_render.subsampling_label(
+            enc_params["subsampling"]),
     }
 
 
-def _derivative_encoder_info(jpeg_quality=DERIVATIVE_JPEG_QUALITY):
+def _derivative_encoder_info(jpeg_quality=DERIVATIVE_JPEG_QUALITY,
+                             image_mode="native_rgb", subsampling="4:2:0"):
     """返回当前编码器环境信息（§6.3），随 region 响应回传供 sidecar 校验/记录。
 
-    jpeg_quality 必须传本次响应实际使用的质量，不能回传常量默认值。
+    三个编码参数都必须传本次响应**实际**使用的值，不能回传常量默认值。
+    P1-2（2026-09-05）additive：image_mode（"multichannel"|"native_rgb"）与
+    subsampling（"4:4:4"|"4:2:0" 契约标签）由 _read_region_b64 从
+    encode_display_jpeg 的实际编码参数透出，本函数不凭 render_context 二次
+    猜测；缺省值 = 旧 native 契约（4:2:0），仅为旧 mock/调用形态兜底。
+    滚动升级期 HistoPilot 侧把两值纳入 region cache key 与检查点导数身份，
+    防止旧 4:2:0 派生图被新 4:4:4 缓存键误复用。
     """
     try:
         pil_version = Image.__version__
@@ -12386,6 +12402,9 @@ def _derivative_encoder_info(jpeg_quality=DERIVATIVE_JPEG_QUALITY):
         "resize": DERIVATIVE_RESIZE_ALGORITHM,
         "overlay_version": OVERLAY_VERSION,
         "jpeg_quality": int(jpeg_quality),
+        # additive 编码身份（旧客户端/旧平台缺省视为 undefined/忽略）
+        "image_mode": str(image_mode),
+        "subsampling": str(subsampling),
     }
 
 
@@ -12421,8 +12440,10 @@ def internal_ai_region():
       - 仅 out_w/out_h：旧契约，强制到精确尺寸（不保宽高比），保持向后兼容。
     返回 {image_base64, mime, width, height, src, magnification, read_level, encoder,
     render_context_fingerprint?}
-    （encoder 含 id/version/resize/overlay_version/jpeg_quality，供 sidecar 校验派生
-    规格 §6.3；read_level 为实际解码金字塔层——W0 跨仓契约，向后兼容新增）。
+    （encoder 含 id/version/resize/overlay_version/jpeg_quality，另 additive 带
+    image_mode/subsampling 编码身份，供 sidecar 校验派生规格 §6.3；
+    read_level 为实际解码金字塔层、upsampled 为 out 是否超过源像素——均为
+    W0 跨仓契约，向后兼容新增）。
     """
     auth = _require_internal()
     if auth:
@@ -12500,7 +12521,10 @@ def internal_ai_region():
         "read_level": r.get("read_level"),
         # F1：out 是否超过源像素（mock 兼容用 .get，缺省 False）
         "upsampled": bool(r.get("upsampled")),
-        "encoder": _derivative_encoder_info(q),
+        "encoder": _derivative_encoder_info(
+            q,
+            image_mode=r.get("image_mode") or "native_rgb",
+            subsampling=r.get("subsampling") or "4:2:0"),
     }
     if r.get("render_fingerprint"):
         out["render_context_fingerprint"] = r["render_fingerprint"]
@@ -13074,7 +13098,17 @@ def plugin_v1_region(slide):
             resp.headers["X-Region-Magnification"] = json.dumps(r["magnification"])
             # W0 契约：实际解码金字塔层（与 JSON 路径的 read_level 同值）
             resp.headers["X-Region-Read-Level"] = json.dumps(r.get("read_level"))
-            resp.headers["X-Region-Encoder"] = json.dumps(_derivative_encoder_info(q))
+            # W0 契约（additive）：out 是否超过源像素（放大；与 JSON 路径的
+            # upsampled 同值）。旧客户端/旧平台忽略未知头，向后兼容。
+            resp.headers["X-Region-Upsampled"] = json.dumps(
+                bool(r.get("upsampled")))
+            # P1-2（2026-09-05）：编码身份随头透出（additive）——传本次响应
+            # 实际的 image_mode/subsampling，供 HistoPilot 缓存键/导数身份用
+            resp.headers["X-Region-Encoder"] = json.dumps(
+                _derivative_encoder_info(
+                    q,
+                    image_mode=r.get("image_mode") or "native_rgb",
+                    subsampling=r.get("subsampling") or "4:2:0"))
             if r.get("render_fingerprint"):
                 resp.headers["X-Render-Fingerprint"] = r["render_fingerprint"]
             return resp
@@ -13087,7 +13121,11 @@ def plugin_v1_region(slide):
             "magnification": r["magnification"],
             "read_level": r.get("read_level"),
             "upsampled": bool(r.get("upsampled")),
-            "encoder": _derivative_encoder_info(q),
+            # P1-2（2026-09-05）additive：encoder 携带本次实际的编码身份
+            "encoder": _derivative_encoder_info(
+                q,
+                image_mode=r.get("image_mode") or "native_rgb",
+                subsampling=r.get("subsampling") or "4:2:0"),
             "content_sha256": content_sha,
             "asset_revision": _legacy_slide_revision(safe),
         }

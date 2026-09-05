@@ -510,6 +510,52 @@ def test_plugin_v1_region_with_render_context(monkeypatch):
         "render_channel_out_of_range"
 
 
+def test_plugin_v1_region_encoder_identity_binary_and_json(monkeypatch):
+    """P1-2：encoder 携带本次响应**实际**编码身份，两条 transport 同源同值。
+
+    multichannel context → ("multichannel","4:4:4")；同请求去掉 context →
+    ("native_rgb","4:2:0")。X-Region-Upsampled 同头透出（小尺寸 fixture
+    默认 out 1568 超过源像素 → 放大 true）。
+    """
+    _flag_on(monkeypatch)
+    _write_cyx()
+    tok = _plugin_bootstrap()
+    ca = _ctx_from_selection([{"index": 0}])
+    body = {"x": 0, "y": 0, "w": 16, "h": 16,
+            "render_context": ca["render_context"]}
+    # 二进制路径：X-Region-Encoder / X-Region-Upsampled 头
+    rb = _client().post(
+        "/api/plugin/v1/slides/%s/regions" % CYX_NAME,
+        headers={"Authorization": "Bearer " + tok,
+                 "Accept": "application/octet-stream"},
+        json=body)
+    assert rb.status_code == 200, rb.get_data(as_text=True)
+    assert rb.headers["Content-Type"] == "application/octet-stream"
+    enc = json.loads(rb.headers["X-Region-Encoder"])
+    assert enc["image_mode"] == "multichannel"
+    assert enc["subsampling"] == "4:4:4"
+    assert json.loads(rb.headers["X-Region-Upsampled"]) is True
+    # 同参数 JSON 路径：encoder 字段与二进制头同值
+    rj = _client().post(
+        "/api/plugin/v1/slides/%s/regions" % CYX_NAME,
+        headers={"Authorization": "Bearer " + tok}, json=body)
+    assert rj.status_code == 200, rj.get_data(as_text=True)
+    jb = rj.get_json()
+    assert jb["encoder"]["image_mode"] == "multichannel"
+    assert jb["encoder"]["subsampling"] == "4:4:4"
+    assert jb["upsampled"] is True
+    # 同请求去掉 context：native 编码（真实编码路径，非猜测）
+    native = dict(body)
+    native.pop("render_context")
+    rn = _client().post(
+        "/api/plugin/v1/slides/%s/regions" % CYX_NAME,
+        headers={"Authorization": "Bearer " + tok}, json=native)
+    assert rn.status_code == 200, rn.get_data(as_text=True)
+    nb = rn.get_json()
+    assert nb["encoder"]["image_mode"] == "native_rgb"
+    assert nb["encoder"]["subsampling"] == "4:2:0"
+
+
 def test_plugin_region_pixel_budget_scales_with_channels(monkeypatch):
     """8 通道不能当 1 通道计费：小预算下 1 通道放行、8 通道 429。"""
     _flag_on(monkeypatch)

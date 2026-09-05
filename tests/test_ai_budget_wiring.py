@@ -43,6 +43,7 @@ UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 import pytest  # noqa: E402
 
 import user_store  # noqa: E402
+import share_store  # noqa: E402  # 升级 B：收录口径测试用
 import app as app_mod  # noqa: E402
 import budget_store  # noqa: E402
 import demo_store  # noqa: E402
@@ -154,6 +155,7 @@ def test_request_id_invalid_rejected_400():
     fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
     o = _make_user("owner")
     _touch("r1.svs")
+    _own("r1.svs", o["user_id"])  # 升级 B：上传即登记归属
     c = _client()
     _login(c, "owner", o["user_id"])
     for bad in ("bad id!", "x" * 129, "req/斜杠", 12345):
@@ -168,6 +170,7 @@ def test_request_id_client_provided_forwarded_and_generated_when_absent():
     fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
     o = _make_user("owner")
     _touch("r2.svs")
+    _own("r2.svs", o["user_id"])  # 升级 B：上传即登记归属
     c = _client()
     _login(c, "owner", o["user_id"])
     rid = _rid()
@@ -300,6 +303,7 @@ def test_run_grant_failure_rejects_run(monkeypatch):
     fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
     o = _make_user("owner")
     _touch("g.svs")
+    _own("g.svs", o["user_id"])  # 升级 B：上传即登记归属
     c = _client()
     _login(c, "owner", o["user_id"])
 
@@ -426,7 +430,10 @@ def test_platform_total_exhausted_rejects_owner_and_user():
     o = _make_user("owner")
     u = _make_user("user")
     _touch("p.svs")
-    _own("p.svs", u["user_id"])
+    _own("p.svs", u["user_id"])  # 升级 B：上传即登记归属（归属 user）
+    # owner 需显式收录他人切片才可起跑（升级 B R5/R6 同口径）
+    share_store.grant_slide_view(o["user_id"], "p.svs",
+                                 slide_id=share_store.get_slide_id("p.svs"))
     fake = _install_fake()
     fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
     co = _client()
@@ -513,6 +520,8 @@ def test_stream_reconnect_and_cancel_do_not_reserve():
     """SSE 重连 / session 读取 / cancel 不预占（docs §4.1）。"""
     _setup_platform()
     u = _make_user("user")
+    _touch("rc.svs")
+    _own("rc.svs", u["user_id"])
     fake = _install_fake()
     fake.register("GET", "/session/sess-x/stream",
                   lambda b, q, h, k: FakeResponse(200, b"id: 1\nevent: delta\ndata: {}\n\n",
@@ -520,7 +529,8 @@ def test_stream_reconnect_and_cancel_do_not_reserve():
     fake.register("POST", "/cancel", lambda b, q, h, k: FakeResponse(200, b'{"ok":true}'))
     fake.register("GET", "/session/sess-x",
                   lambda b, q, h, k: FakeResponse(200, json.dumps(
-                      {"session": {"id": "sess-x", "owner": u["user_id"]}})))
+                      {"session": {"id": "sess-x", "owner": u["user_id"],
+                                   "slide": "rc.svs"}})))
     c = _client()
     _login(c, "user", u["user_id"])
     assert c.get("/api/ai/session/sess-x/stream?after_seq=3").status_code == 200
@@ -582,8 +592,11 @@ def test_hard_mode_run_skips_reservations_and_writes_binding():
     # 同 rid 重试（同主体）→ 200（幂等由绑定行承担，session 不被回退 NULL）
     assert _run_ok(c, "hard.svs", rid).status_code == 200
     assert budget_store.get_run_binding(rid)["histopilot_session_id"] == "sess-hard"
-    # 跨主体复用同 rid → 409（阶段 1 写入预检拒绝，且不转发）
+    # 跨主体复用同 rid → 409（阶段 1 写入预检拒绝，且不转发）。切片归属
+    # user，owner 侧经管理口径收录以过内容权限闸（升级 B），落到 409 预检
     o = _make_user("owner")
+    share_store.grant_slide_view(o["user_id"], "hard.svs",
+                                 slide_id=share_store.get_slide_id("hard.svs"))
     co = _client()
     _login(co, "owner", o["user_id"])
     fake.calls.clear()

@@ -50,9 +50,9 @@
     类别 + 本地请求序号（非敏感）+ 重试；空态解释为什么为空与下一步。
 
     页面（8 页 IA）：概览 / 用户 / 切片 / 邀请 / 设置 / 费用 / 插件 / 审计。
-    「切片」（2026-09-05，review P0 owner 读隔离）= 切片可见性管理：
-    inventory 全量清点（唯一「看全部」出口，仅元数据）+ 对 owner 显式
-    授权/收回单切片 view 权限。
+    「切片」（2026-09-05，review P0 读隔离 × 升级 B 收录语义）= 切片可见性
+    管理：inventory 全量清点（唯一「看全部」出口，仅元数据）+ 把他人切片
+    显式加入/移出 owner 工作区（view 收录，资产生代绑定，撤销联动取消）。
 
     只加载相对路径 style.css / main.js（owner-only 的
     /admin/plugin-assets/pathtogether-admin/ui/*）；不写内联样式/脚本（CSP）。
@@ -246,14 +246,15 @@
           </section>
         </section>
 
-        <!-- 切片可见性（review P0 2026-09-05 读隔离）：owner 不再默认可见
-             全部切片；本页是唯一「看全部」出口（inventory 元数据清点，不含
-             切片图像内容）+ 对 owner 显式授权/收回单切片 view 权限 -->
+        <!-- 切片可见性 / 我的工作区收录（review P0 读隔离 × 升级 B 2026-09-05）：
+             owner 不再默认可见全部切片（public/协作也不自动计入）；本页是唯一
+             「看全部」出口（inventory 元数据清点，不含切片图像内容）+ 把他人
+             切片显式加入/移出 owner 工作区（view 收录，资产生代绑定） -->
         <section class="adm-page" id="adm-page-slides" hidden>
           <div class="adm-state" id="adm-state-slides" data-page-state="idle" role="status" aria-live="polite"></div>
           <section class="adm-card">
             <h2>切片可见性</h2>
-            <p class="adm-note">读隔离模型：owner 与用户一致，默认只能看到自己上传的、公开的、受邀协作的切片；他人切片须在此显式授权后才可见（无主切片也在此清点并可授权恢复可见）。授权是 view 级（只读查看）；「已授权给 owner」列显示当前授权状态。本清单只含切片元数据，不含切片图像内容。</p>
+            <p class="adm-note">升级后 owner 的工作区只包含本人上传与在此显式加入的切片——公开、协作受邀都不会自动进入 owner 视图（这些规则只对普通用户生效）。加入是 view 级收录（绑定当前文件版本：同名替换后旧授权失效，需重新加入）；移除后新请求立即拒绝，进行中的 AI 任务会被取消。无主切片也在此清点并可加入恢复可见。本清单只含切片元数据，不含切片图像内容。</p>
             <div class="adm-table-wrap">
               <table class="adm-table" id="adm-slides-table">
                 <thead>
@@ -263,7 +264,7 @@
                     <th class="adm-col-secondary">公开</th>
                     <th class="adm-col-secondary">归档只读</th>
                     <th class="adm-col-secondary">大小</th>
-                    <th>授权状态</th>
+                    <th>收录状态</th>
                     <th>操作</th>
                   </tr>
                 </thead>

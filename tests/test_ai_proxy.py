@@ -197,7 +197,12 @@ def test_continue_and_ask_proxy():
           (fake.calls[-1]["body"].get("config") or {}).get("api_key"))
     check("continue SSE 透传", r.data == b"x\n\n", "got %r" % r.data)
     check("continue X-AI-Session-ID", r.headers.get("X-AI-Session-ID") == "sess-c")
-    # session_id 透传（与 /run 同一 S2 前置契约）
+    # session_id 透传（与 /run 同一 S2 前置契约）。升级 B：显式 session_id
+    # 过会话守卫（归属 + 切片收录实时复查）——fake 里注册属主会话
+    fake.register("GET", "/session/sess-cont-7",
+                  lambda b, q, h, k: FakeResponse(200, json.dumps(
+                      {"session": {"owner": "usr_proxy_owner",
+                                   "slide": "s.svs"}}).encode()))
     client.post("/api/ai/continue",
                 json={"slide": "s.svs", "session_id": "sess-cont-7"})
     check("continue session_id 透传",
@@ -342,9 +347,14 @@ def test_sessions_and_session_detail_proxy():
     check("sessions 状态码 200", r.status_code == 200)
     check("sessions body 透传", json.loads(r.data) == {"sessions": [{"id": "m1"}]})
 
+    # 升级 B：会话守卫从服务端记录解析真实 owner/slide——fake 记录补齐
+    # 属主与切片（与真实 sidecar SessionData 形态一致）
     fake.register("GET", "/session/sess-d",
                   lambda b, q, h, k: FakeResponse(200,
-                   json.dumps({"session": {"id": "sess-d"}, "transcript": []}).encode(),
+                   json.dumps({"session": {"id": "sess-d",
+                                           "owner": "usr_proxy_owner",
+                                           "slide": "s.svs"},
+                               "transcript": []}).encode(),
                    headers={"Content-Type": "application/json"}))
     r2 = client.get("/api/ai/session/sess-d")
     check("session detail 路径转发 /session/sess-d",

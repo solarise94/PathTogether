@@ -2829,10 +2829,13 @@
   }
 
   function grantStatusText(item) {
-    if (item.public && item.granted_to_owner) return "公开 + 已授权";
-    if (item.public) return "公开（默认可见）";
-    if (item.granted_to_owner) return "已授权给 owner";
-    return "未授权";
+    // 升级 B（2026-09-05）：owner 工作区 = 本人 ∪ 显式添加——public 只对
+    // 普通用户默认可见，不再自动计入 owner 集合；included 以
+    // granted_to_owner 为准（资产生代失效的授权不计入）。
+    if (item.public && item.granted_to_owner) return "公开 + 已加入工作区";
+    if (item.public) return "公开（仅普通用户默认可见）";
+    if (item.granted_to_owner) return "已加入我的工作区";
+    return "未加入";
   }
 
   function loadSlides(append) {
@@ -2885,11 +2888,11 @@
     var cell = document.createElement("td");
     cell.className = "adm-actions-cell";
     var granted = !!item.granted_to_owner;
-    cell.appendChild(actionBtn(granted ? "收回" : "授权", function () {
+    cell.appendChild(actionBtn(granted ? "移除" : "加入", function () {
       if (granted) {
         askConfirm($("adm-slides-confirm"),
-          "确认收回对 " + item.name + " 的 view 授权？收回后 owner 默认视图" +
-          "不再可见该切片（归属者与公开状态不受影响）。",
+          "确认将 " + item.name + " 移出我的工作区？移除后新请求立即拒绝，" +
+          "进行中的 AI 任务会被取消，后续工具访问被拒（归属者与公开状态不受影响）。",
           function () { setSlideVisibility(item, false); });
       } else {
         setSlideVisibility(item, true);
@@ -2904,9 +2907,12 @@
             { name: item.name, granted: granted })
       .then(function (res) {
         var already = res && granted && res.already_granted;
+        var cancelled = (res && res.runs_cancelled || []).length;
         setStatus("adm-slides-status",
-          (granted ? "已授权 " : "已收回 ") + item.name +
-          (already ? "（此前已授权，幂等成功）" : ""));
+          (granted ? "已加入工作区 " : "已移出工作区 ") + item.name +
+          (already ? "（此前已加入，幂等成功）" : "") +
+          (!granted && cancelled
+            ? "（已请求取消 " + cancelled + " 个运行中任务）" : ""));
         loadSlides(false);
       })
       .catch(function (err) { handleErr(err, $("adm-slides-status")); });

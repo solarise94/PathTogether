@@ -103,10 +103,11 @@ WAYPOINTS = {
 # --------------------------------------------------------------------------- #
 def test_path_owner_200_and_query_passthrough(fake_sidecar):
     """属主 200：waypoints 透传 + after_seq/limit 原样转发到 sidecar。"""
-    owner, usera, _b, _slide = _setup()
+    owner, usera, _b, slide = _setup()
     fake = fake_sidecar
     fake.register_json("GET", "/session/sess-a", body={
-        "session": {"owner": usera["user_id"], "archived": True}})
+        "session": {"owner": usera["user_id"], "slide": slide,
+                    "archived": True}})
     fake.register_json("GET", "/session/sess-a/path", body=WAYPOINTS)
     ca = _login(_client(), usera)
     r = ca.get("/api/ai/session/sess-a/path?after_seq=3&limit=50")
@@ -120,10 +121,11 @@ def test_path_owner_200_and_query_passthrough(fake_sidecar):
 
 def test_path_owner_archived_session_readable(fake_sidecar):
     """archived session 属主仍可读 path（S5 契约；归属判定不看 archived）。"""
-    owner, usera, _b, _slide = _setup()
+    owner, usera, _b, slide = _setup()
     fake = fake_sidecar
     fake.register_json("GET", "/session/sess-arch", body={
-        "session": {"owner": usera["user_id"], "archived": True}})
+        "session": {"owner": usera["user_id"], "slide": slide,
+                    "archived": True}})
     fake.register_json("GET", "/session/sess-arch/path", body=WAYPOINTS)
     ca = _login(_client(), usera)
     r = ca.get("/api/ai/session/sess-arch/path")
@@ -133,10 +135,11 @@ def test_path_owner_archived_session_readable(fake_sidecar):
 
 def test_path_user_b_reads_a_gets_403_no_proxy(fake_sidecar):
     """user B 读 A 的 path → 403；sidecar 只收到归属查询，无 path 转发。"""
-    owner, usera, userb, _slide = _setup()
+    owner, usera, userb, slide = _setup()
     fake = fake_sidecar
     fake.register_json("GET", "/session/sess-a",
-                       body={"session": {"owner": usera["user_id"]}})
+                       body={"session": {"owner": usera["user_id"],
+                                         "slide": slide}})
     cb = _login(_client(), userb)
     r = cb.get("/api/ai/session/sess-a/path?after_seq=0&limit=100")
     assert r.status_code == 403, r.get_data(as_text=True)
@@ -145,26 +148,30 @@ def test_path_user_b_reads_a_gets_403_no_proxy(fake_sidecar):
     assert any(c["path"] == "/session/sess-a" for c in fake.calls)
 
 
-def test_path_owner_admin_any_session(fake_sidecar):
-    """owner（管理员）读任意 session 的 path → 200（_require_ai_session_owner）。"""
-    owner, _a, _b, _slide = _setup()
+def test_path_owner_other_session_denied(fake_sidecar):
+    """升级 B R6：owner 读他人（userA）会话 → 403（删除 owner 任意放行旁路；
+    添加切片不等于取得对方聊天记录或续跑权）。"""
+    owner, usera, _b, slide = _setup()
     fake = fake_sidecar
-    fake.register_json("GET", "/session/sess-x/path", body=WAYPOINTS)
+    fake.register_json("GET", "/session/sess-x",
+                       body={"session": {"owner": usera["user_id"],
+                                         "slide": slide}})
     co = _login(_client(), owner)
     r = co.get("/api/ai/session/sess-x/path")
-    assert r.status_code == 200
-    assert r.get_json()["waypoints"]
+    assert r.status_code == 403
+    assert not any(c["path"] == "/session/sess-x/path" for c in fake.calls)
 
 
 # --------------------------------------------------------------------------- #
 # P1-7：_require_ai_session_owner 四端点越权（B→A 403）
 # --------------------------------------------------------------------------- #
 def test_session_detail_foreign_user_403(fake_sidecar):
-    """GET session 详情：B 读 A → 403；A 读自己 → 200。"""
-    owner, usera, userb, _slide = _setup()
+    """GET session 详情：B 读 A → 403；A 读自己 → 200 且转发。"""
+    owner, usera, userb, slide = _setup()
     fake = fake_sidecar
     fake.register_json("GET", "/session/sess-a",
-                       body={"session": {"owner": usera["user_id"]},
+                       body={"session": {"owner": usera["user_id"],
+                                         "slide": slide},
                              "transcript": []})
     cb = _login(_client(), userb)
     r = cb.get("/api/ai/session/sess-a")
@@ -178,10 +185,11 @@ def test_session_detail_foreign_user_403(fake_sidecar):
 
 def test_session_stream_foreign_user_403(fake_sidecar):
     """GET stream：B 挂 A → 403（sidecar 无 stream 连接）；A → 200 SSE 透传。"""
-    owner, usera, userb, _slide = _setup()
+    owner, usera, userb, slide = _setup()
     fake = fake_sidecar
     fake.register_json("GET", "/session/sess-a",
-                       body={"session": {"owner": usera["user_id"]}})
+                       body={"session": {"owner": usera["user_id"],
+                                         "slide": slide}})
     fake.register_sse("GET", "/session/sess-a/stream",
                       [b"id: 1\nevent: delta\ndata: {\"t\":\"hi\"}\n\n"])
     cb = _login(_client(), userb)
@@ -196,10 +204,11 @@ def test_session_stream_foreign_user_403(fake_sidecar):
 
 def test_session_archive_unarchive_foreign_user_403(fake_sidecar):
     """POST archive/unarchive：B 对 A 的会话 → 403；A → 200 转发。"""
-    owner, usera, userb, _slide = _setup()
+    owner, usera, userb, slide = _setup()
     fake = fake_sidecar
     fake.register_json("GET", "/session/sess-a",
-                       body={"session": {"owner": usera["user_id"]}})
+                       body={"session": {"owner": usera["user_id"],
+                                         "slide": slide}})
     fake.register_json("POST", "/session/sess-a/archive",
                        body={"ok": True, "archived": True})
     fake.register_json("POST", "/session/sess-a/unarchive",

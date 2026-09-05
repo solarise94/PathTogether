@@ -216,9 +216,41 @@ def test_owner_read_isolation_default_denied_grant_then_revoke():
     assert co.get("/api/slide/%s/info" % sa).status_code == 403
 
 
-def test_owner_still_sees_own_and_public_slides():
-    """owner 可见集含自己上传的与 public 切片（读隔离不误伤）。"""
+def test_owner_content_channels_all_denied_without_grant():
+    """升级 B 矩阵：未添加时 owner 的全部内容读取通道统一拒绝（不泄漏）。"""
     owner, userA, _b = _setup_users()
+    sa = _touch("a.svs")
+    _own(sa, userA["user_id"])
+    co = _client()
+    _login(co, "owner@x.com", "ownerpass123456")
+    urls = [
+        "/api/slide/%s/info" % sa,
+        "/api/slide/%s.dzi" % sa,
+        "/api/slide/%s_files/0/0_0.jpeg" % sa,
+        "/api/slide/%s/region?x=0&y=0&w=10&h=10" % sa,
+        "/api/slide/%s/crop?x=0&y=0&size=10" % sa,
+        "/api/slide/%s/thumbnail" % sa,
+        "/api/annotations?slide=%s" % sa,
+    ]
+    for url in urls:
+        r = co.get(url)
+        assert r.status_code == 403, (url, r.status_code,
+                                      r.get_data(as_text=True)[:120])
+    # 聚合列表通道：share/rois 按可见集过滤（200 但不含他人切片标注）
+    assert co.get("/api/share/rois").get_json() == []
+    # 加入后内容通道放行（info 不再 403；stub 打不开真切片走元数据出口）
+    assert co.post("/api/admin/v1/slides/%s/visibility" % sa,
+                   json={"granted": True}).status_code == 200
+    assert co.get("/api/slide/%s/info" % sa).status_code != 403
+
+
+def test_owner_public_slide_not_auto_visible_user_still_sees():
+    """升级 B R5：public 不再自动计入认证 owner 集合；普通 user 语义不变。
+
+    owner 默认列表不含他人 public 切片；普通用户仍可见 public（规则只对
+    owner 工作区收紧，不放宽 user）。
+    """
+    owner, userA, userB = _setup_users()
     so = _touch("owner.svs")
     _own(so, owner["user_id"])
     sa = _touch("a.svs")
@@ -229,11 +261,78 @@ def test_owner_still_sees_own_and_public_slides():
     names = {i["name"] for i in co.get("/api/slides").get_json()}
     assert so in names and sa not in names
 
-    # userA 切片设为 public → owner 可见
+    # userA 的切片设为 public（owner 在管理域可设置）→ 普通用户可见，
+    # 但 owner 的普通工作区不再自动包含它
     assert co.post("/api/slide/%s/meta" % sa,
                    json={"public": True}).status_code == 200
+    assert share_store.get_slide_meta_full(sa)["public"] is True
+
+    names = {i["name"] for i in co.get("/api/slides").get_json()}
+    assert sa not in names
+    assert co.get("/api/slide/%s/info" % sa).status_code == 403
+
+    # 普通 user（B）语义不变：public 默认可见
+    cb = _client()
+    _login(cb, "b@x.com", "userBpass123456")
+    names_b = {i["name"] for i in cb.get("/api/slides").get_json()}
+    assert sa in names_b
+
+    # owner 显式加入后可见（管理台收录入口）
+    assert co.post("/api/admin/v1/slides/%s/visibility" % sa,
+                   json={"granted": True}).status_code == 200
     names = {i["name"] for i in co.get("/api/slides").get_json()}
     assert sa in names
+
+
+def test_owner_claimed_slide_not_auto_visible():
+    """升级 B R5：协作认领（claimed）不再自动计入认证 owner 集合。"""
+    owner, userA, _b = _setup_users()
+    sa = _touch("a.svs")
+    _own(sa, userA["user_id"])
+    share = share_store.create_share([sa], 24, permissions=["view", "annotate"],
+                                     creator_user_id=userA["user_id"])
+    co = _client()
+    _login(co, "owner@x.com", "ownerpass123456")
+    # owner 认领（认领本身允许），但集合不因 claimed 扩大
+    r = co.post("/api/share/%s/claim" % share["token"])
+    assert r.status_code == 200
+    names = {i["name"] for i in co.get("/api/slides").get_json()}
+    assert sa not in names
+    assert co.get("/api/slide/%s/info" % sa).status_code == 403
+
+    # 普通 user 认领后仍可见（user 语义不变）
+    cb = _client()
+    _login(cb, "b@x.com", "userBpass123456")
+    assert cb.post("/api/share/%s/claim" % share["token"]).status_code == 200
+    names_b = {i["name"] for i in cb.get("/api/slides").get_json()}
+    assert sa in names_b
+
+
+def test_owner_grant_scoped_per_account_o1_not_affect_o2():
+    """升级 B：收录按账号 uid 严格隔离（矩阵「O1 添加不影响 O2」）。
+
+    单 enabled owner 是 0015 DB 不变量（第二个 enabled owner 建号被索引拒
+    绝），O2 以 uid 形态表达：O1 的收录行不出现在任何其他主体集合中。
+    """
+    owner1 = user_store.create_user("owner@x.com", "ownerpass123456", role="owner")
+    userA = user_store.create_user("a@x.com", "userApass123456", role="user")
+    share_store.set_owner_user_id(owner1["user_id"])
+    sa = _touch("a.svs")
+    _own(sa, userA["user_id"])
+
+    co1 = _client()
+    _login(co1, "owner@x.com", "ownerpass123456")
+    assert co1.post("/api/admin/v1/slides/%s/visibility" % sa,
+                    json={"granted": True}).status_code == 200
+    # O1 收录生效
+    names1 = {i["name"] for i in co1.get("/api/slides").get_json()}
+    assert sa in names1
+    # 其他主体（合成 O2 uid / userA）集合不受影响；第二个 enabled owner 被
+    # 数据库不变量拒绝（应用层与索引双层兜底）
+    assert sa not in share_store.slide_view_grants_for_user(userA["user_id"])
+    assert sa not in share_store.slide_view_grants_for_user("usr_other_owner")
+    with pytest.raises(ValueError):
+        user_store.create_user("owner2@x.com", "owner2pass123456", role="owner")
 
 
 def test_admin_visibility_endpoint_forbidden_and_csrf():
@@ -390,6 +489,86 @@ def test_annotation_write_authorization():
     # 本人删除 OK（userA 删自己创建的）
     r = ca.delete("/api/annotation/admin/%d" % idx_a)
     assert r.status_code == 200
+
+def test_owner_annotation_write_scoped_to_workspace():
+    """升级 B R5：认证 owner 的标注写同样按收录集合（未添加不可读写）。
+
+    未添加 userA 的切片 → POST /api/annotation 403；显式加入后 → 200；
+    移除后 → 再次 403。归档切片对所有身份只读不变。
+    """
+    owner, userA, _b = _setup_users()
+    sa = _touch("a.svs")
+    _own(sa, userA["user_id"])
+    so = _touch("owner.svs")
+    _own(so, owner["user_id"])
+
+    co = _client()
+    _login(co, "owner@x.com", "ownerpass123456")
+    # 未添加：不可标注他人切片；自己的切片照常
+    assert _post_anno(co, sa).status_code == 403
+    assert _post_anno(co, so).status_code == 200
+
+    # 加入 → 标注生效（矩阵：添加后 owner 既有标注/AI 权限在该切片上生效）
+    assert co.post("/api/admin/v1/slides/%s/visibility" % sa,
+                   json={"granted": True}).status_code == 200
+    r = _post_anno(co, sa)
+    assert r.status_code == 200, r.get_data(as_text=True)
+
+    # 移除 → 再次 403（新请求立即拒绝）
+    assert co.post("/api/admin/v1/slides/%s/visibility" % sa,
+                   json={"granted": False}).status_code == 200
+    assert _post_anno(co, sa).status_code == 403
+
+
+def test_owner_ai_run_start_requires_workspace():
+    """升级 B R6：未加入私有切片不能起跑 AI run（仅 can_annotate 不够）。
+
+    run/continue/branch 在凭据/预算/grant 之前先做 view+annotate 双复核——
+    未收录切片直接 403，且不产生任何 sidecar/预算副作用。
+    """
+    owner, userA, _b = _setup_users()
+    sa = _touch("a.svs")
+    _own(sa, userA["user_id"])
+    so = _touch("owner.svs")
+    _own(so, owner["user_id"])
+
+    co = _client()
+    _login(co, "owner@x.com", "ownerpass123456")
+    # 未加入他人切片 → 403（run/continue/branch 三入口同口径）
+    assert co.post("/api/ai/run", json={"slide": sa}).status_code == 403
+    assert co.post("/api/ai/continue", json={"slide": sa}).status_code == 403
+    assert co.post(
+        "/api/ai/branch",
+        json={"slide": sa, "annotation_id": "a1"}).status_code == 403
+    # 匿名切片也不可见的 userA 切片对 owner 依旧 403（public 也不放行）
+    assert co.post("/api/slide/%s/meta" % sa,
+                   json={"public": True}).status_code == 200
+    assert co.post("/api/ai/run", json={"slide": sa}).status_code == 403
+
+    # 加入后进入后续流程（无凭据 → 400 配置指导，说明已通过权限闸）
+    assert co.post("/api/admin/v1/slides/%s/visibility" % sa,
+                   json={"granted": True}).status_code == 200
+    r = co.post("/api/ai/run", json={"slide": sa})
+    assert r.status_code in (400, 503), r.get_data(as_text=True)
+
+
+def test_user_annotation_and_public_unchanged():
+    """普通 user 语义不变回归：public 只读（不可标注）、协作 annotate 可写。"""
+    owner, userA, userB = _setup_users()
+    sa = _touch("a.svs")
+    _own(sa, userA["user_id"])
+    # public 仅 owner 可设置（既有约束）：owner 设 public → userB 可见
+    co = _client()
+    _login(co, "owner@x.com", "ownerpass123456")
+    assert co.post("/api/slide/%s/meta" % sa,
+                   json={"public": True}).status_code == 200
+    cb = _client()
+    _login(cb, "b@x.com", "userBpass123456")
+    # B 可见 public 切片但不可标注（纯公开只读）
+    names = {i["name"] for i in cb.get("/api/slides").get_json()}
+    assert sa in names
+    assert _post_anno(cb, sa).status_code == 403
+
 
 def test_owner_can_delete_any_annotation():
     owner, userA, _b = _setup_users()

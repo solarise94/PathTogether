@@ -388,15 +388,18 @@ def test_ai_session_filter_uses_subject_during_preview(fake_sidecar):
     owner, _a, userb = _setup_users()
     sa = _touch("coop.svs")
     share_store.set_slide_meta(sa, owner_user_id=userb["user_id"])
-    # 读隔离（review P0 2026-09-05）：owner 不再默认可见他人切片——本用例
-    # 关注 AI 会话过滤参数注入，显式补 view 授权让 owner 过切片读闸
-    share_store.grant_slide_view(owner["user_id"], sa)
+    # 读隔离（review P0 2026-09-05）× 升级 B：owner 不默认可见他人切片——
+    # 本用例关注 AI 会话过滤参数注入，经管理口径补收录（绑定资产生代）让
+    # owner 过切片读闸
+    share_store.grant_slide_view(owner["user_id"], sa,
+                                 slide_id=share_store.get_slide_id(sa))
     fake_sidecar.register_json(
         "GET", "/sessions", body=[{"session_id": "s1"}])
     oc = _login(_client(), owner)
-    # 非预览：owner → 不注入 owner query（全量）
+    # 非预览：subject=owner 本人 → 注入 owner=<owner uid>（升级 B：认证 owner
+    # 会话目录同样按 principal 过滤，不开放他人会话）
     assert oc.get("/api/ai/sessions?slide=%s" % sa).status_code == 200
-    assert fake_sidecar.calls[-1]["query"].get("owner") is None
+    assert fake_sidecar.calls[-1]["query"].get("owner") == owner["user_id"]
     # 预览 subject=b：过滤按 subject 注入
     assert oc.post("/api/admin/preview/start",
                    json={"user_id": userb["user_id"]}).status_code == 200

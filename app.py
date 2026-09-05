@@ -3923,16 +3923,20 @@ def _require_owner():
 # =========================================================================== #
 # Stage 3a-2a：身份与资源级鉴权矩阵（docs §5.1.1）
 #
-# 读隔离模型（review P0 2026-09-05）：owner 与 user 的**读**判定统一走
-# _user_can_view_slide —— 自己的 ∪ public ∪ 认领(view) ∪ 显式授权
-# （slide_view_grants，管理台 /api/admin/v1/slides/* 是唯一「看全部」出口）。
-# 写路径（can_delete_slide / can_annotate_slide / 项目管理 / 分享撤销 /
-# 标注删除）owner 语义**保持不变**——本次只做读隔离。
+# 读隔离模型（review P0 2026-09-05）× 升级 B 收紧（R5）：读判定按主体分域
+# ——_subject_can_view_slide 分发：
+#   user  = 自己的 ∪ public ∪ 认领(view) ∪ 显式授权（语义不变）；
+#   owner = 自己的 ∪ 显式添加（slide_view_grants 且资产生代匹配）——public
+#           与 claimed 不再自动计入；「看全部」唯一出口是管理台
+#           /api/admin/v1/slides/*（inventory + visibility）。
+# 写路径（升级 B）：can_annotate_slide 的认证 owner 同样按收录集合（未添加
+# 他人切片不可读写）；can_delete_slide / 项目管理写 / 分享撤销 / 标注删除
+# 的 owner 语义不变。
 #
 # AUTH_ENABLED=False（内网模式）或 session 无 role 时，current_identity 仍
-# 返回 role=owner，但读不再全量短路：本地免认证开发态 owner 无稳定 user_id，
-# 可见集为空（不崩溃；写语义不变）。稳定 owner 账户部署中，owner 看自己
-# 上传的切片不受影响，他人切片需显式授权。
+# 返回 role=owner：本地免认证开发态 owner 无稳定 user_id → 读/写全量（
+# §5.4 明确例外，不存在「其他用户」可隔离）。稳定 owner 账户部署中，owner
+# 看自己上传的切片不受影响，他人切片需系统管理显式添加。
 #
 # user：上传/维护自己的图库；查看 = 自己的 + 公开 + 受邀（认领过 active
 #       share）+ 显式授权；标注 = 自己的 + 协作切片；删除标注 = 仅本人创建；
@@ -4081,23 +4085,24 @@ def can_upload(slide=None):
 
 
 def can_view_slide(name):
-    """读隔离模型（review P0 2026-09-05）：自己的 ∪ 公开 ∪ 认领(view) ∪ 显式授权。
+    """读隔离模型（review P0 2026-09-05）× 升级 B 收紧（R5）。
 
-    owner 不再全量短路——与 user 同一判定（_user_can_view_slide）。owner 的
-    「看全部」唯一出口是管理台 /api/admin/v1/slides/inventory（显式管理）。
-    写路径（can_delete_slide / can_annotate_slide）owner 语义**保持不变**：
-    本次只做读隔离。例外：本地免认证单租户态（AUTH_ENABLED=False，owner 无
-    user_id）读恢复全量——该形态下不存在「其他用户」可隔离，维持读隔离前
-    的既有不变量（本地开发/测试依赖）；认证部署的 owner 隔离语义不受影响。
+    owner 不再全量短路——与 user 同一主体判定（_subject_can_view_slide）。
+    owner 的「看全部」唯一出口是管理台 /api/admin/v1/slides/inventory（显式
+    管理）。例外：本地免认证单租户态（AUTH_ENABLED=False，owner 无 user_id）
+    读恢复全量——该形态下不存在「其他用户」可隔离，维持读隔离前的既有不变
+    量（本地开发/测试依赖）；认证部署的 owner 隔离语义不受影响。
     """
     ident = current_identity()
-    if ident["role"] == user_store.ROLE_OWNER and not ident["user_id"]:
-        return True
-    return _user_can_view_slide(ident["user_id"], name)
+    return _subject_can_view_slide(ident["role"], ident["user_id"], name)
 
 
 def _user_can_view_slide(uid, name):
-    """can_view_slide 的主体判定（无 session 上下文，供 dispatch 复用）。"""
+    """普通 user 的 view 主体判定（无 session 上下文，供 dispatch 复用）。
+
+    user 集合：本人的 ∪ public ∪ 认领(view) ∪ 显式授权（普通 user 语义在
+    升级 B 中不变；owner 集合见 _owner_can_view_slide）。
+    """
     if not uid:
         return False
     if _slide_owner(name) == uid:
@@ -4111,6 +4116,34 @@ def _user_can_view_slide(uid, name):
     return False
 
 
+def _owner_can_view_slide(uid, name):
+    """认证 owner 的 view 集合（升级 B R5 收紧）。
+
+    集合 = 本人拥有 ∪ 本账号显式添加且仍有效（slide_view_grants，且资产生
+    代匹配）。public 与 claimed 不再自动计入——其他用户新增上传、公开标志
+    变化、新建项目都不能自动扩大 owner 的普通工作区（原文档 §5.1）。
+    """
+    if not uid:
+        return False
+    if _slide_owner(name) == uid:
+        return True
+    return name in share_store.slide_view_grants_for_user(uid)
+
+
+def _subject_can_view_slide(role, uid, name):
+    """主体级 view 判定（role/user_id 显式传入，owner × user 集合分域）。
+
+    - 本地免认证单租户态（owner 且无 uid）→ True（升级 B §5.4 明确例外）；
+    - 认证 owner → _owner_can_view_slide（本人 ∪ 显式添加）；
+    - 其余（user/guest）→ _user_can_view_slide（guest 无 uid 恒 False）。
+    """
+    if role == user_store.ROLE_OWNER:
+        if not uid:
+            return True
+        return _owner_can_view_slide(uid, name)
+    return _user_can_view_slide(uid, name)
+
+
 def can_delete_slide(name):
     """owner 任意；user 仅自己的。"""
     ident = current_identity()
@@ -4120,17 +4153,16 @@ def can_delete_slide(name):
 
 
 def can_annotate_slide(name):
-    """owner 全量；user = 自己的 ∪ 协作切片且 grant 含 annotate（不含纯公开只读）。
+    """标注/AI 写能力判定（升级 B 收紧 owner 语义）。
 
-    Stage 3c-2（docs §v1.5）：归档项目内的切片对**所有身份**（含 owner）只读——
-    命中归档切片返回 False（解除归档才可标注）。
+    升级 B：认证 owner 未添加他人切片不可读写——annotate 集合同 view 集合
+    （本人 ∪ 显式添加；授权切片上 owner 既有标注/AI 权限生效，归档项目仍
+    只读）。本地免认证单租户态（owner 无 user_id）保持全量（§5.4 例外）。
     """
     if name in _archived_slide_names():
         return False
     ident = current_identity()
-    if ident["role"] == user_store.ROLE_OWNER:
-        return True
-    return _user_can_annotate_slide(ident["user_id"], name)
+    return _subject_can_annotate_slide(ident["role"], ident["user_id"], name)
 
 
 def _user_can_annotate_slide(uid, name):
@@ -4142,6 +4174,20 @@ def _user_can_annotate_slide(uid, name):
     if name in _claimed_slides(uid, permission=share_store.PERMISSION_ANNOTATE):
         return True
     return False
+
+
+def _subject_can_annotate_slide(role, uid, name):
+    """主体级 annotate 判定（role/user_id 显式传入；归档检查由调用方先行）。
+
+    认证 owner：本人 ∪ 显式添加（_owner_can_view_slide 同集合——管理台显式
+    添加后 owner 在该切片的标注/AI 工具生效；未添加不可读写）。user 语义
+    不变；本地免认证单租户态（owner 且无 uid）→ True。
+    """
+    if role == user_store.ROLE_OWNER:
+        if not uid:
+            return True
+        return _owner_can_view_slide(uid, name)
+    return _user_can_annotate_slide(uid, name)
 
 
 # --------------------------------------------------------------------------- #
@@ -4165,12 +4211,12 @@ _CAPABILITY_ANNOTATE_GRANTS = frozenset(("annotation:write",))
 def _subject_slide_permissions(role, user_id, slide):
     """主体（role/user_id 显式传入，不依赖 session）对 slide 的权限集合。
 
-    读隔离模型（review P0 2026-09-05）：owner 与 user 的 view 能力同一判定
-    （_user_can_view_slide）——否则插件 dispatch 会成为 owner 绕过切片读
-    隔离的旁路；annotation:write 属写能力，owner 保持授予（与
-    can_annotate_slide 的 owner 语义不变一致，归档切片除外）。user →
-    view/annotate 判定映射（§6.1 表）。归档切片对所有身份只读（annotate
-    侧不授予）。例外：本地免认证单租户态（owner 且无 user_id）恢复全量
+    读隔离模型（review P0 2026-09-05）× 升级 B 收紧：owner 与 user 的 view
+    能力按 _subject_can_view_slide 分域判定（owner = 本人 ∪ 显式添加）——
+    否则插件 dispatch 会成为绕过收录关系的旁路。annotation:write 同样按
+    收录集合授予（升级 B：未添加他人切片不可读写；授权切片上 owner 既有
+    标注/AI 权限生效，归档切片除外）。user → view/annotate 判定映射
+    （§6.1 表）。例外：本地免认证单租户态（owner 且无 user_id）恢复全量
     4 项（can_view_slide 同款口径）。
     """
     if role == user_store.ROLE_OWNER and not user_id:
@@ -4178,14 +4224,10 @@ def _subject_slide_permissions(role, user_id, slide):
             return set(_CAPABILITY_VIEW_GRANTS)
         return set(_CAPABILITY_VIEW_GRANTS) | set(_CAPABILITY_ANNOTATE_GRANTS)
     perms = set()
-    if _user_can_view_slide(user_id, slide):
+    if _subject_can_view_slide(role, user_id, slide):
         perms |= _CAPABILITY_VIEW_GRANTS
-    if role == user_store.ROLE_OWNER:
-        # 写路径 owner 语义不变（读隔离不动写）；归档只读对 owner 亦生效
-        if user_id and slide not in _archived_slide_names():
-            perms |= _CAPABILITY_ANNOTATE_GRANTS
-    elif (slide not in _archived_slide_names()
-            and _user_can_annotate_slide(user_id, slide)):
+    if (slide not in _archived_slide_names()
+            and _subject_can_annotate_slide(role, user_id, slide)):
         perms |= _CAPABILITY_ANNOTATE_GRANTS
     return perms
 
@@ -4208,14 +4250,16 @@ def can_manage_share(slides):
 
 
 def _visible_slide_names():
-    """当前身份可见的切片文件名集合（读隔离模型，owner 与 user 同一规则）。
+    """当前身份可见的切片文件名集合（升级 B R5：owner × user 集合分域）。
 
-    可见集 = 自己上传的 ∪ public ∪ 认领(view 级 claim) ∪ 显式授权
-    （slide_view_grants，管理台建立）。owner 不再全量短路（review P0
-    2026-09-05）；无主切片（owner_user_id 为空）且非 public 对所有身份默认
-    不可见，经管理台显式授权后恢复可见（孤儿切片仍可管理）。例外：本地
-    免认证单租户态（owner 无 user_id）恢复全量（can_view_slide 同款口径，
-    不存在「其他用户」可隔离）；其余无 uid 主体（guest）可见集为空。
+    user 可见集 = 自己上传的 ∪ public ∪ 认领(view 级 claim) ∪ 显式授权
+    （slide_view_grants）——普通 user 语义不变。认证 owner 可见集收紧为
+    本人拥有 ∪ 本账号显式添加且资产生代有效（public 与 claimed 不再自动
+    计入；原文档 §5.1）。owner 不再全量短路（review P0 2026-09-05）；无主
+    切片（owner_user_id 为空）且非 public 对所有身份默认不可见，经管理台
+    显式授权后恢复可见（孤儿切片仍可管理）。例外：本地免认证单租户态
+    （owner 无 user_id）恢复全量（can_view_slide 同款口径，不存在「其他
+    用户」可隔离）；其余无 uid 主体（guest）可见集为空。
     """
     ident = current_identity()
     all_names = {
@@ -4228,6 +4272,14 @@ def _visible_slide_names():
     if not uid:
         return set()
     meta_all = share_store.get_all_slide_meta_full()
+    if ident["role"] == user_store.ROLE_OWNER:
+        # 升级 B R5：认证 owner = 本人 ∪ 显式添加（资产生代匹配的授权集合）
+        granted = share_store.slide_view_grants_for_user(uid)
+        return {
+            name for name in all_names
+            if meta_all.get(name, {}).get("owner_user_id") == uid
+            or name in granted
+        }
     claimed = _claimed_slides(uid, permission=share_store.PERMISSION_VIEW)
     granted = share_store.slide_view_grants_for_user(uid)
     visible = set()
@@ -6680,15 +6732,24 @@ def admin_v1_slides_inventory():
 
     meta_all = share_store.get_all_slide_meta_full()
     archived = _archived_slide_names()
-    grants_by_slide = {}
+    owner_uid = _admin_v1_owner_uid()
+    # 升级 B R7：included 状态与实际收录同口径——slide_view_grants_for_user
+    # 已按资产生代（slide_id）过滤，同名资产替换后失效的授权不再算已收录。
     try:
-        for g in share_store.list_slide_view_grants():
-            grants_by_slide.setdefault(g["slide_name"], []).append(g)
+        granted_names = share_store.slide_view_grants_for_user(owner_uid)
     except Exception:
         app.logger.exception("admin v1 slides inventory 授权标注读取失败")
         return _admin_v1_error(500, "internal", "切片清单读取失败")
+    # granted_at 仅在授权真实生效（included）时展示
+    grants_rows = {}
+    try:
+        for g in share_store.list_slide_view_grants():
+            if owner_uid and g.get("user_id") == owner_uid:
+                grants_rows.setdefault(g["slide_name"], g)
+    except Exception:
+        app.logger.warning("admin v1 slides inventory 授权时间读取失败",
+                           exc_info=True)
 
-    owner_uid = _admin_v1_owner_uid()
     # 归属展示名/掩码 login_id（无归属/未知用户 → null；与用户列表同口径
     # 掩码，inventory 只用于清点，不额外放大 login_id 明文）
     users_by_id = {}
@@ -6709,11 +6770,7 @@ def admin_v1_slides_inventory():
         meta = meta_all.get(name) or {}
         slide_owner = meta.get("owner_user_id") or None
         owner_user = users_by_id.get(str(slide_owner)) if slide_owner else None
-        grant = None
-        for g in grants_by_slide.get(name, []):
-            if owner_uid and g.get("user_id") == owner_uid:
-                grant = g
-                break
+        included = name in granted_names
         items.append({
             "name": name,
             "size_bytes": (UPLOAD_DIR / name).stat().st_size,
@@ -6727,8 +6784,9 @@ def admin_v1_slides_inventory():
             "alias": meta.get("alias", ""),
             "note": meta.get("note", ""),
             "archived": name in archived,
-            "granted_to_owner": grant is not None,
-            "granted_at": (grant or {}).get("granted_at"),
+            "granted_to_owner": included,
+            "granted_at": (grants_rows.get(name) or {}).get("granted_at")
+            if included else None,
         })
     next_cursor = None
     if has_more:
@@ -6769,28 +6827,85 @@ def admin_v1_slide_visibility(name):
             "当前部署 owner 无稳定 user_id（本地免认证开发态），"
             "无法建立/收回显式授权")
     if granted:
+        # 升级 B R7：授权行绑定当前资产生代（slide_id；孤儿切片允许 NULL）
+        cur_slide_id = share_store.get_slide_id(safe)
         result = share_store.grant_slide_view(
-            owner_uid, safe, granted_by=owner_uid)
+            owner_uid, safe, granted_by=owner_uid, slide_id=cur_slide_id)
         _audit("admin.slide_visibility.grant", target_type="slide",
                target_id=safe, slide=safe,
                detail={"granted_to": owner_uid,
+                       "slide_id": cur_slide_id,
                        "already_granted": bool(result.get("already_granted"))})
         return jsonify(name=safe, granted=True,
                        already_granted=bool(result.get("already_granted")))
     existed = share_store.revoke_slide_view(owner_uid, safe)
+    # 升级 B R6d：撤销联动——失效该切片上已失去收录关系的 run grants，并对
+    # 仍在运行的相关 run 走既有取消/收尾机制（不把前端关流当取消成功；费用
+    # hold 按既有结算机制处理，不提前释放）。
+    cancelled = _cancel_sidecar_runs_for_owners(
+        safe, [owner_uid], reason="visibility_revoked")
+    _revoke_stale_run_grants(slide=safe, reason="visibility_revoked")
     _audit("admin.slide_visibility.revoke", target_type="slide",
            target_id=safe, slide=safe,
-           detail={"revoked_from": owner_uid, "existed": bool(existed)})
-    return jsonify(name=safe, granted=False, existed=bool(existed))
+           detail={"revoked_from": owner_uid, "existed": bool(existed),
+                   "runs_cancelled": cancelled})
+    return jsonify(name=safe, granted=False, existed=bool(existed),
+                   runs_cancelled=cancelled)
+
+
+@app.route("/api/admin/v1/ai/unowned-sessions", methods=["GET"])
+def admin_v1_ai_unowned_sessions():
+    """空 principal（session_owner 为空）历史会话盘点（升级 B R6e / §5.4）。
+
+    可重跑的**只读**报告：?slide=<name> 必填，代理 sidecar GET /sessions 后
+    过滤 owner 为空的会话，仅返回最小元数据（id/title/status/时间）——不
+    读 transcript、不改聊天内容、不改 request_id/计费归属。每次执行写一条
+    审计（admin.ai_unowned_sessions.inventory，记 slide 与数量），供迁移
+    前可信归属评估；本接口不做任何归属迁移。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    slide = request.args.get("slide") or ""
+    safe = _sanitize_name(slide)
+    if not safe or safe != slide:
+        return _admin_v1_error(400, "invalid_request", "非法文件名")
+    try:
+        r = requests.get(AI_SIDECAR_URL + "/sessions", params={"slide": safe},
+                         timeout=_AI_SIDECAR_TIMEOUT,
+                         headers=_sidecar_auth_headers())
+    except (requests.ConnectionError, requests.Timeout):
+        return _sidecar_unavailable_response()
+    if r.status_code != 200:
+        return _admin_v1_error(502, "sidecar_error",
+                               "sidecar 返回 %d" % r.status_code)
+    unowned = []
+    try:
+        for sess in (r.json() or {}).get("sessions") or []:
+            if not isinstance(sess, dict) or (sess.get("owner") or ""):
+                continue
+            unowned.append({
+                "id": sess.get("id") or "",
+                "title": sess.get("title") or "",
+                "status": sess.get("status") or "",
+                "created_at": sess.get("created_at"),
+                "updated_at": sess.get("updated_at"),
+            })
+    except Exception:
+        return _admin_v1_error(502, "sidecar_error", "sidecar 响应解析失败")
+    _audit("admin.ai_unowned_sessions.inventory", target_type="slide",
+           target_id=safe, slide=safe, detail={"unowned_count": len(unowned)})
+    return jsonify(slide=safe, unowned_sessions=unowned,
+                   unowned_count=len(unowned))
 
 
 @app.route("/api/slides")
 def api_slides():
-    """列出所有切片的元数据（读隔离：owner 与 user 均仅可见集，docs §5.1.1）。
+    """列出所有切片的元数据（读隔离：可见集按主体分域，docs §5.1.1/§5.1）。
 
-    review P0 2026-09-05：owner 不再全量——可见集 = 自己的 ∪ public ∪
-    认领(view) ∪ 显式授权（_visible_slide_names）。全量清单唯一出口是
-    管理台 GET /api/admin/v1/slides/inventory。
+    user 可见集 = 自己的 ∪ public ∪ 认领(view) ∪ 显式授权；认证 owner（升级
+    B R5）= 自己的 ∪ 显式添加（public/claimed 不再自动计入）。全量清单唯一
+    出口是管理台 GET /api/admin/v1/slides/inventory。
     """
     visible = _visible_slide_names()
     items = []
@@ -8412,13 +8527,26 @@ def api_slide_delete(name):
     Stage 3a-2a：owner 任意；user 仅自己的切片。
     PT-4：切片在 Demo 目录内时联动撤销（capability 失效 + 未完成 run 终止 +
     对应预算预占释放，docs §9.3）。
+    升级 B R7：删除文件前清理该切片的全部 view 授权（按 legacy 名 + 旧
+    slide_id 残留，单事务）——同名再上传后旧授权不自动生效（失效语义），
+    需要系统管理重新添加；删除后无孤儿授权行残留。
     """
     if not can_delete_slide(name):
         return _denied()
     safe = _safe_name(name)
-    # Demo 撤销必须在文件删除前（revoke 后旧 capability 立即不可读，无悬空窗口）
     try:
         slide_id = share_store.get_slide_id(safe)
+    except Exception:
+        slide_id = None
+    # 授权清理必须在文件删除前（fail-closed：删除确认后授权立即失效，
+    # 无「文件已换、旧授权仍匹配」的窗口）
+    try:
+        share_store.revoke_slide_view_grants_for_slide(safe, slide_id=slide_id)
+    except Exception:
+        app.logger.warning("切片删除的 view 授权清理失败：%s", safe,
+                           exc_info=True)
+    # Demo 撤销必须在文件删除前（revoke 后旧 capability 立即不可读，无悬空窗口）
+    try:
         if slide_id:
             _revoke_demo_slide(slide_id)
     except Exception:
@@ -8440,6 +8568,9 @@ def api_slide_delete(name):
         else:
             if companion.is_dir():
                 shutil.rmtree(companion, ignore_errors=True)
+    _audit("slide.delete", target_type="slide", target_id=safe, slide=safe,
+           detail={"slide_id": slide_id,
+                   "view_grants_revoked": True})
     return jsonify(ok=True)
 
 
@@ -10372,9 +10503,12 @@ def _ai_run_prepare(user_ctx, body, slide, need_grant):
     # 的 subject 同源同参（_ai_budget_subject(user_ctx)），HistoPilot 据此生成
     # usage event 的主体 assertion；缺省回退会与权威解析 409 进 dead。
     config["billing_subject"] = _billing_subject_assertion(user_ctx)
-    # 仅 user 注入归属：role=owner 的会话保持无 owner（owner 全量可见、可续跑
-    # 任意会话；内网模式不注入）。
-    if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
+    # 会话真实 principal（升级 B R6e）：所有认证角色（有稳定 user_id）一律
+    # 注入 session_owner——含 owner（此前 owner 使用空 principal 槽，与真实
+    # 账号绑定要求不符）。空 principal 仅保留给 AUTH_ENABLED=False 本地模式
+    # 与历史会话（历史空 principal 会话按 §5.4 只盘点不迁移，见管理盘点
+    # 接口 /api/admin/v1/ai/unowned-sessions）。
+    if AUTH_ENABLED and user_ctx and user_ctx.get("user_id"):
         config["session_owner"] = user_ctx["user_id"]
     if need_grant and not _issue_run_grant(slide, user_ctx, config):
         return (jsonify(error="run grant 签发失败，已拒绝起跑（fail-closed）"), 503)
@@ -12760,10 +12894,13 @@ def _plugin_resolve_slide(slide):
 
 
 def _run_grant_creator_allowed(grant):
-    """§3.10 P0-C：复查 grant 创建者当前是否仍可 annotate 该切片。
+    """§3.10 P0-C × 升级 B R6：复查 grant 创建者当前是否仍可 annotate 该切片。
 
     每次写标注前（annotate 端点 + verify 端点）调用：创建者账号被删除/禁用、
-    或已失去该切片 annotate 权限（协作 share 撤销/过期、切片归档）→ False。
+    或已失去该切片 annotate 权限（协作 share 撤销/过期、切片归档、**owner
+    收录关系移除**）→ False。升级 B：owner 角色创建者不再按角色放行，与其
+    他主体一样按收录集合复查（本人 ∪ 显式添加，_subject_can_annotate_slide
+    ——收录撤销后下一次写工具派发即失败关闭）。
     created_by_user_id 为空（AUTH_ENABLED=False 归一 owner / 历史无主 grant）
     按 owner 内部语义放行（归档由归档检查单独拦）。
     """
@@ -12782,10 +12919,8 @@ def _run_grant_creator_allowed(grant):
         return False
     if u.get("disabled"):
         return False
-    if u.get("role") == user_store.ROLE_OWNER:
-        return slide not in _archived_slide_names()
-    return (slide not in _archived_slide_names()
-            and _user_can_annotate_slide(creator, slide))
+    # 升级 B R6：owner/user 统一按收录集合（归档只读对所有身份生效）
+    return _subject_can_annotate_slide(u.get("role") or "", creator, slide)
 
 
 def _verify_run_grant(grant_id, slide, installation_id, expect_session=None):
@@ -12885,6 +13020,56 @@ def _revoke_stale_run_grants(slide=None, reason="creator_recheck"):
                            exc_info=True)
 
 
+def _cancel_sidecar_runs_for_owners(slide, owner_uids, reason="visibility_revoked"):
+    """升级 B R6d：对指定主体在某切片上运行中的 run 发起既有取消/收尾。
+
+    从 sidecar GET /sessions?slide=<name> 解析真实会话（不信客户端），过滤
+    owner ∈ owner_uids 且 status=running 的会话，逐个 POST /cancel（sidecar
+    2xx 才视为已请求取消——不把前端关流当取消成功）。费用 hold 不在此触碰：
+    按既有结算机制（usage event / reconcile）收尾，绝不因撤销收录提前错误
+    释放。返回已发起取消的 session_id 列表（供审计）；sidecar 不可达返回
+    []（grant 已撤销兜底 fail-closed，不阻断 revoke 主流程）。
+    """
+    uids = {u for u in (owner_uids or []) if u}
+    if not slide or not uids:
+        return []
+    cancelled = []
+    try:
+        r = requests.get(AI_SIDECAR_URL + "/sessions",
+                         params={"slide": slide},
+                         timeout=_AI_SIDECAR_TIMEOUT,
+                         headers=_sidecar_auth_headers())
+        if r.status_code != 200:
+            return []
+        sessions = (r.json() or {}).get("sessions") or []
+    except Exception:
+        app.logger.warning("撤销联动的运行中 run 查询失败（%s）", slide,
+                           exc_info=True)
+        return []
+    for sess in sessions:
+        if not isinstance(sess, dict):
+            continue
+        if (sess.get("owner") or "") not in uids:
+            continue
+        if sess.get("status") != "running":
+            continue
+        sid = sess.get("id") or ""
+        if not sid:
+            continue
+        try:
+            cr = requests.post(AI_SIDECAR_URL + "/cancel",
+                               json={"session_id": sid},
+                               timeout=_AI_SIDECAR_TIMEOUT,
+                               headers=_sidecar_auth_headers())
+        except Exception:
+            app.logger.warning("撤销联动取消 run 失败（%s）", sid, exc_info=True)
+            continue
+        if cr.status_code < 400:
+            cancelled.append(sid)
+            _revoke_run_grants_for_session(sid, reason=reason)
+    return cancelled
+
+
 @app.route("/api/plugin/v1/slides/<slide>", methods=["GET"])
 def plugin_v1_slide_info(slide):
     """切片尺寸/金字塔/mpp/指纹 + asset revision + 多通道渲染信息（G1）。
@@ -12904,6 +13089,70 @@ def plugin_v1_slide_info(slide):
     with slide_cache.borrow_pair(entry) as pair:
         out = _ai_slide_info_payload(pair, safe)
     return jsonify(out)
+
+
+def _slide_in_demo_catalog(slide_name):
+    """切片是否在 Demo 目录（demo_catalog allowlist，按 legacy 文件名比对）。
+
+    仅插件 region 闸的「无 run grant」分流使用（demo run 无 grant 语义）；
+    读取失败 fail-closed 返回 False。
+    """
+    if not slide_name:
+        return False
+    try:
+        for entry in demo_store.catalog_list_ordered():
+            if demo_store.resolve_slide_filename(
+                    entry.get("slide_id") or "") == slide_name:
+                return True
+    except Exception:
+        app.logger.warning("Demo 目录比对失败（按不在目录处理）：%s",
+                           slide_name, exc_info=True)
+    return False
+
+
+def _plugin_slide_run_grant_gate(slide, claims):
+    """插件通道切片收录关系实时复核（升级 B R6，fail-closed）。
+
+    v1 能力端点（region 等）在 token/scope 验证后调用：按该 run grant 绑定
+    的**当前用户**复核其对切片的实时收录关系，失效即拒绝——
+      1. 请求带 X-Run-Grant → _verify_run_grant（slide/installation 匹配 +
+         创建者收录实时复查）；
+      2. 无 grant 头 → installation + slide 的活跃 run grants 逐个按创建者
+         复查：至少一个通过 → 放行（官方 run 进行中的正常形态）；存在但
+         全部失效 → 403；
+      3. 无任何活跃 grant：本地免认证态（AUTH_ENABLED=False）与 Demo 目录
+         切片放行（二者无 run grant 语义）；认证部署的其余切片 fail-closed
+         403（收录撤销后活跃 grants 已被撤销 → 落入本分支即拒）。
+    返回 None（放行）或错误响应。
+    """
+    grant_id = (request.headers.get("X-Run-Grant") or "").strip()
+    installation_id = (claims or {}).get("sub") or ""
+    if grant_id:
+        valid, reason = _verify_run_grant(grant_id, slide, installation_id)
+        if not valid:
+            return _plugin_error(403, "run_grant_invalid",
+                                 "run grant 无效：%s" % reason)
+        return None
+    try:
+        grants = [
+            g for g in share_store.list_run_grants(slide=slide)
+            if (g.get("installation_id") or "") == installation_id
+        ]
+    except Exception:
+        app.logger.warning("插件通道 run grant 复核读取失败（fail-closed）",
+                           exc_info=True)
+        return _plugin_error(403, "run_grant_invalid",
+                             "run grant 复核不可用，已拒绝")
+    if grants:
+        for g in grants:
+            if _run_grant_creator_allowed(g):
+                return None
+        return _plugin_error(403, "run_grant_invalid",
+                             "run 授权已失效，请重新发起会话")
+    if not AUTH_ENABLED or _slide_in_demo_catalog(slide):
+        return None
+    return _plugin_error(403, "forbidden",
+                         "当前主体对该切片无有效收录关系")
 
 
 @app.route("/api/plugin/v1/slides/<slide>/regions", methods=["POST"])
@@ -12927,6 +13176,9 @@ def plugin_v1_region(slide):
         超 PLUGIN_REGION_MAX_PIXELS 或滑窗预算 PLUGIN_REGION_PIXEL_BUDGET_PER_MIN
         → 429 rate_limited（**必须在读盘/解码前拒绝**，slide_cache 零触碰）。
       - 并发闸——PLUGIN_REGION_MAX_CONCURRENT 进程级信号量，超载 → 429。
+      - 升级 B R6——收录关系实时复核：token/scope 验证后按 run grant 绑定
+        的当前用户复查切片收录（_plugin_slide_run_grant_gate），失效
+        fail-closed 403（在读盘/解码之前拒绝）。
     """
     claims, err = _require_plugin_token("region:read")
     if err is not None:
@@ -12934,6 +13186,9 @@ def plugin_v1_region(slide):
     safe, serr = _plugin_resolve_slide(slide)
     if serr is not None:
         return serr
+    gerr = _plugin_slide_run_grant_gate(safe, claims)
+    if gerr is not None:
+        return gerr
     body = request.get_json(silent=True) or {}
     # bbox 契约形态 → 平铺（两者同给时以平铺为准，与 internal 端点语义对齐）
     bbox = body.get("bbox")
@@ -14039,9 +14294,18 @@ def api_ai_run():
     slide = body.get("slide")
     if not isinstance(slide, str) or not slide:
         return jsonify(error="缺少 slide"), 400
-    if not can_annotate_slide(slide):
+    # 升级 B R6：起跑前同时复核 view 与 annotate（仅 can_annotate 不够——
+    # 收录撤销后两者都必须立即拒绝；未添加他人切片不可读写）。
+    if not can_view_slide(slide) or not can_annotate_slide(slide):
         return _denied()
     user_ctx = current_identity()
+    # 显式 session_id（续写既有会话）按会话守卫复核归属与切片收录（fail-
+    # closed：不得向他人会话或已失去收录关系的切片投递消息）。
+    session_id = body.get("session_id")
+    if isinstance(session_id, str) and session_id:
+        auth = _require_ai_session_owner(session_id)
+        if auth is not None:
+            return auth
     prep = _ai_run_prepare(user_ctx, body, slide, need_grant=True)
     if not isinstance(prep, dict):
         return prep
@@ -14058,7 +14322,6 @@ def api_ai_run():
         payload["task"] = task
     # 会话隔离 S2 前置（纵深防御）：body 带非空字符串 session_id 时原样透传，
     # 让 sidecar 把消息发到用户当前选中的会话（归档/路由语义归 sidecar）
-    session_id = body.get("session_id")
     if isinstance(session_id, str) and session_id:
         payload["session_id"] = session_id
     # JSON body 与 query 双重兼容（前端历史上把 fresh=1 放在 query）
@@ -14093,9 +14356,16 @@ def api_ai_continue():
     slide = body.get("slide")
     if not isinstance(slide, str) or not slide:
         return jsonify(error="缺少 slide"), 400
-    if not can_annotate_slide(slide):
+    # 升级 B R6：continue 同 run——view + annotate 双复核；显式 session_id
+    # 过会话守卫（归属 + 切片收录实时复查）。
+    if not can_view_slide(slide) or not can_annotate_slide(slide):
         return _denied()
     user_ctx = current_identity()
+    session_id = body.get("session_id")
+    if isinstance(session_id, str) and session_id:
+        auth = _require_ai_session_owner(session_id)
+        if auth is not None:
+            return auth
     prep = _ai_run_prepare(user_ctx, body, slide, need_grant=True)
     if not isinstance(prep, dict):
         return prep
@@ -14108,7 +14378,6 @@ def api_ai_continue():
         payload["security"] = prep["security"]
     # 会话隔离 S2 前置（纵深防御）：与 /run 相同，非空字符串 session_id 原样
     # 透传给 sidecar（continue 目标会话由客户端显式指定）
-    session_id = body.get("session_id")
     if isinstance(session_id, str) and session_id:
         payload["session_id"] = session_id
     # §9.1：render_context 服务端再校验 + camelCase 注入（同 /run）。
@@ -14187,7 +14456,8 @@ def api_ai_branch():
         return jsonify(error="缺少 slide"), 400
     if not isinstance(annotation_id, str) or not annotation_id:
         return jsonify(error="缺少 annotation_id"), 400
-    if not can_annotate_slide(slide):
+    # 升级 B R6：branch 与 run/continue 同口径（view + annotate 双复核）。
+    if not can_view_slide(slide) or not can_annotate_slide(slide):
         return _denied()
     user_ctx = current_identity()
     prep = _ai_run_prepare(user_ctx, body, slide, need_grant=True)
@@ -14246,8 +14516,12 @@ def api_ai_cancel():
             return jsonify(error="缺少 slide"), 400
         # §3.8：slide 取消只保留给 owner / 内部兼容（AUTH_ENABLED=False 归一
         # owner）；can_view_slide 级别的授权不再允许取消他人 main run。
+        # 升级 B R6：认证 owner 需对真实切片仍有收录关系（撤销后按 slide
+        # 取消立即拒绝）；按 slide 只触达自己 principal 的 main 槽。
         if user_ctx["role"] != user_store.ROLE_OWNER:
             return _denied("仅 owner 可按切片取消会话；请使用 session_id 取消自己的会话")
+        if not can_view_slide(slide):
+            return _denied()
     else:
         return jsonify(error="缺少 session_id 或 slide"), 400
 
@@ -14293,8 +14567,10 @@ def api_ai_run_grant_revoke(grant_id):
 def api_ai_sessions():
     """列出某切片的 main + 活跃 forks。?slide= 必填。代理 sidecar GET /sessions。
 
-    Stage 3a-2b（AI 会话归属）：owner 全量；user 仅自己名下会话（按 session_owner
-    过滤，交由 sidecar ?owner=<user_id>）。AUTH_ENABLED=False → 不注入 owner（全量）。
+    Stage 3a-2b（AI 会话归属）：认证态按 session_owner 过滤——升级 B R6 起
+    认证 owner 同样注入 owner=<uid>（会话目录不因管理员角色开放他人会话，
+    矩阵 §5.1；历史空 owner 会话在 owner 过滤下不返回，盘点走管理接口）。
+    AUTH_ENABLED=False → 不注入 owner（全量）。
     """
     slide = request.args.get("slide")
     if not slide:
@@ -14303,7 +14579,7 @@ def api_ai_sessions():
         return _denied()
     user_ctx = current_identity()
     query = {"slide": slide}
-    if AUTH_ENABLED and user_ctx["role"] == user_store.ROLE_USER and user_ctx.get("user_id"):
+    if AUTH_ENABLED and user_ctx.get("user_id"):
         query["owner"] = user_ctx["user_id"]
     return _proxy_json("/sessions", None, method="GET", query=query)
 
@@ -14420,11 +14696,13 @@ def _sidecar_auth_headers(extra=None):
     return headers
 
 
-def _ai_session_owner(session_id: str):
-    """查询某会话的归属 owner（sidecar GET /session/<id> 的 session.owner）。
+def _ai_session_record(session_id: str):
+    """查询某会话的服务端记录（sidecar GET /session/<id> 的 session 字段）。
 
-    返回 owner 字符串（可能为 ""=历史/内网会话）；sidecar 不可达返回 None；
-    sidecar 返回 404（会话不存在）返回 None。仅用于归属判定，不发起代理响应。
+    返回 session dict（含 owner/slide/status 等）；sidecar 不可达返回 None；
+    sidecar 返回 404（会话不存在）返回 None。仅用于归属与切片判定，不发起
+    代理响应。升级 B R6：会话守卫必须从服务端记录解析**真实 slide 与
+    owner**，绝不相信客户端传入 slide。
     """
     url = AI_SIDECAR_URL + "/session/" + session_id
     try:
@@ -14438,25 +14716,42 @@ def _ai_session_owner(session_id: str):
         body = r.json()
     except Exception:
         return None
-    sess = (body or {}).get("session") or {}
-    return sess.get("owner") or ""
+    return (body or {}).get("session") or {}
 
 
 def _require_ai_session_owner(session_id):
-    """user 访问他人会话 → 403；owner 任意放行；AUTH_ENABLED=False 放行。
+    """AI 会话统一读闸（升级 B R6 收紧：删除 owner 直接放行旁路）。
 
-    归属读取自 sidecar（含 owner 字段，缺省 ""=历史会话）。越权统一 403，不区分
-    session 是否存在（避免泄露存在性差异）。
+    从服务端会话记录解析真实 slide 与 owner，再检查两项：
+      1. 当前主体有权读取/续跑这条会话——uid 必须等于 session.owner；
+         认证态下空 owner（历史）会话仅例外放行给 owner 角色且当前可查看
+         该切片的主体（§5.4：历史空 principal 会话只盘点不迁移，过渡期
+         owner 对自己历史会话的可达性以切片收录关系为闸）；
+      2. 当前主体仍可查看该切片（_subject_can_view_slide，收录撤销后立即
+         拒绝，不等 TTL）。
+    detail/stream/path/cancel/archive 全部同口径。本地免认证单租户态
+    （owner 无 uid）保持原有内网行为（含空 owner 会话）。sidecar 不可达或
+    会话不存在 → 保守 403（不泄露存在性）。
     """
-    user_ctx = current_identity()
-    if user_ctx["role"] == user_store.ROLE_OWNER:
-        return None  # owner 任意（含 AUTH_ENABLED=False 的归一 owner）
-    uid = user_ctx.get("user_id")
-    owner = _ai_session_owner(session_id)
-    if owner is None:
+    ident = current_identity()
+    role, uid = ident.get("role"), ident.get("user_id")
+    if role == user_store.ROLE_OWNER and not uid:
+        return None  # 本地免认证单租户态：内网行为不变
+    sess = _ai_session_record(session_id)
+    if not sess:
         # sidecar 不可达或会话不存在：保守 403（同 _denied 语义，不泄露）
         return _denied()
+    owner = sess.get("owner") or ""
+    slide = sess.get("slide") or ""
     if not uid or owner != uid:
+        # 空 owner（历史）会话：仅 owner 角色（有 uid）且对真实切片仍有
+        # view 权限时可达；user / 无收录主体一律拒绝。
+        if not (role == user_store.ROLE_OWNER and uid and not owner and slide
+                and _subject_can_view_slide(role, uid, slide)):
+            return _denied()
+    # 会话属主（或命中历史例外）也必须对真实切片仍有收录关系（fail-closed：
+    # 收录撤销/资产生替换后 detail/stream/path/cancel/archive 立即拒绝）
+    if not slide or not _subject_can_view_slide(role, uid, slide):
         return _denied()
     return None
 
@@ -14728,11 +15023,11 @@ def api_share_revoke():
 
 @app.route("/api/share/rois")
 def api_share_rois():
-    """列出 ROI（读隔离：owner 与 user 均仅可见切片的标注）。
+    """列出 ROI（读隔离：按 _visible_slide_names 主体分域过滤）。
 
-    review P0 2026-09-05：owner 不再全量返回他人切片的标注——按
-    _visible_slide_names 过滤（自己的 ∪ public ∪ 认领 ∪ 显式授权）。管理
-    出口走 /api/admin/*（inventory 是唯一「看全部」）。
+    review P0 2026-09-05 × 升级 B R5：owner 仅本人 ∪ 显式添加切片的标注；
+    user = 自己的 ∪ public ∪ 认领 ∪ 显式授权。管理出口走 /api/admin/*
+    （inventory 是唯一「看全部」）。
     """
     rois = share_store.list_rois()
     visible = _visible_slide_names()

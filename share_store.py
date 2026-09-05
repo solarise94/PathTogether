@@ -42,6 +42,7 @@ _PUBLIC_NAMES = (
     "list_grants_for_user",
     "grant_slide_view",
     "revoke_slide_view",
+    "revoke_slide_view_grants_for_slide",
     "slide_view_grants_for_user",
     "list_slide_view_grants",
     "add_roi",

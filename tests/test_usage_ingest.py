@@ -831,7 +831,8 @@ def test_billing_subject_owner_user_dispatch_matches_resolution():
                     auth_user="e2e-owner@x.com",
                     auth_version=owner.get("auth_version", 1))
     r = client.post("/api/ai/run",
-                    json={"slide": _slide_for("e2e-owner.svs"),
+                    json={"slide": _slide_for("e2e-owner.svs",
+                                          owner_user_id=owner["user_id"]),
                           "task": "look"})
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.headers.get("X-AI-Session-ID") == session_id

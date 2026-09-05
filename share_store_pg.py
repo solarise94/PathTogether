@@ -539,12 +539,22 @@ def list_grants_for_user(user_id):
 # TTL、(slide_name, user_id) 主键天然幂等；授权可先于 slides meta 行存在
 # （无外键，同 rois.slide 理由，见 migrations/0034 注释）。当前唯一授予
 # 方向是管理台给 owner 自授权（app.py /api/admin/v1/slides/*）。
+#
+# 资产生命周期（升级 B R7，0035 起）：行上追加 slide_id（授权建立时的资产
+# 代）。读取侧（slide_view_grants_for_user）要求行上 slide_id 与 slides 行
+# 当前值 IS NOT DISTINCT FROM 匹配——孤儿授权（双方皆 NULL）语义不变，而
+# 「删除 → 同名再上传」替换资产后，即使行未被清理也不再匹配新内容；删除
+# 路径（revoke_slide_view_grants_for_slide）按名 + slide_id 清理行。
 # --------------------------------------------------------------------------- #
-def grant_slide_view(user_id, slide_name, granted_by=None):
-    """建立 view 授权（幂等）。返回 {"already_granted", "granted_at"}。
+def grant_slide_view(user_id, slide_name, granted_by=None, slide_id=None):
+    """建立 view 授权（幂等 + 显式资产生代重绑定）。
 
-    已存在同名授权时不动原行（保留首次 granted_at/granted_by），幂等语义
-    由主键冲突保证。user_id/slide_name 需非空字符串。
+    返回 {"already_granted", "granted_at"}。行不存在 → 插入（绑定当前
+    slide_id）；已存在同名行 → 幂等成功（保留首次 granted_at/granted_by），
+    但当资产生代失配（行上 slide_id ≠ 本次给定值）时**更新为当前 slide_id**
+    ——升级 B R7 失效语义的另一半：同名替换后旧授权不自动生效，需要重新
+    添加；重新添加即显式重绑当前资产生代（COALESCE 允许孤儿切片以 NULL
+    授权行保持 NULL）。user_id/slide_name 需非空字符串。
     """
     if not isinstance(user_id, str) or not user_id:
         raise ValueError("user_id 不能为空")
@@ -554,14 +564,23 @@ def grant_slide_view(user_id, slide_name, granted_by=None):
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
+                # RETURNING (xmax = 0)：xmax=0 仅在真正 INSERT 的新行上成立
+                # （ON CONFLICT DO UPDATE 走更新路径 rowcount 同为 1，不能
+                # 用 rowcount 区分插入/幂等更新）。
                 cur.execute(
                     "INSERT INTO slide_view_grants (slide_name, user_id, "
-                    "granted_by) VALUES (%s,%s,%s) ON CONFLICT "
-                    "(slide_name, user_id) DO NOTHING",
-                    (slide_name, user_id, granted_by or None),
+                    "granted_by, slide_id) VALUES (%s,%s,%s,%s) ON CONFLICT "
+                    "(slide_name, user_id) DO UPDATE SET slide_id = "
+                    "COALESCE(EXCLUDED.slide_id, slide_view_grants.slide_id) "
+                    "RETURNING (xmax = 0) AS inserted, extract(epoch from "
+                    "granted_at)::float8 AS granted_at",
+                    (slide_name, user_id, granted_by or None,
+                     slide_id or None),
                 )
-                inserted = cur.rowcount > 0
+                row = cur.fetchone()
+                inserted = bool(row["inserted"])
                 if not inserted:
+                    # 幂等重放：granted_at 语义保留「首次授权时间」
                     cur.execute(
                         "SELECT extract(epoch from granted_at)::float8 AS "
                         "granted_at FROM slide_view_grants "
@@ -602,8 +621,44 @@ def revoke_slide_view(user_id, slide_name):
         conn.close()
 
 
+def revoke_slide_view_grants_for_slide(slide_name, slide_id=None):
+    """资产生命周期收口（升级 B R7）：删除某切片的全部 view 授权行。
+
+    按 legacy 名删除全部主体的授权；slide_id 给出时**同事务**再按资产生代
+    清一遍残留（防御同名行上残留旧代 slide_id 的形态）。切片文件删除
+    （app.py api_slide_delete）在 unlink 前调用——「删除 → 同名再上传」后
+    旧授权不自动生效（失效语义），需要重新添加。返回删除的行数。
+    """
+    if not isinstance(slide_name, str) or not slide_name:
+        raise ValueError("slide_name 不能为空")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM slide_view_grants WHERE slide_name=%s",
+                    (slide_name,),
+                )
+                deleted = cur.rowcount
+                if slide_id:
+                    cur.execute(
+                        "DELETE FROM slide_view_grants WHERE slide_id=%s "
+                        "AND slide_name <> %s",
+                        (slide_id, slide_name),
+                    )
+                    deleted += cur.rowcount
+                return deleted
+    finally:
+        conn.close()
+
+
 def slide_view_grants_for_user(user_id):
-    """返回该主体被显式授权可见的切片名集合（无则空集）。"""
+    """返回该主体被显式授权可见的切片名集合（无则空集）。
+
+    升级 B R7：要求授权行资产生代（slide_id）与 slides 行当前值一致
+    （IS NOT DISTINCT FROM，双方皆 NULL 的孤儿授权照常生效）——同名资产
+    替换后旧授权不再匹配新内容（配合删除路径的按名清理，失效语义双保险）。
+    """
     if not user_id:
         return set()
     conn = _connect()
@@ -611,7 +666,10 @@ def slide_view_grants_for_user(user_id):
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT slide_name FROM slide_view_grants WHERE user_id=%s",
+                    "SELECT g.slide_name FROM slide_view_grants g "
+                    "LEFT JOIN slides s ON s.legacy_filename = g.slide_name "
+                    "WHERE g.user_id=%s "
+                    "AND g.slide_id IS NOT DISTINCT FROM s.slide_id",
                     (user_id,),
                 )
                 return {r["slide_name"] for r in cur.fetchall()}
@@ -622,16 +680,16 @@ def slide_view_grants_for_user(user_id):
 def list_slide_view_grants():
     """返回全部 view 授权行（inventory 标注「是否已授权给 owner」用）。
 
-    行形态 {slide_name, user_id, granted_by, granted_at(epoch)}；按授权时间
-    降序。表不存在前（迁移未跑）调用方会拿到编程错误——ensure_schema 在
-    app 启动期 fail-fast，运行期表必然存在。
+    行形态 {slide_name, user_id, granted_by, granted_at(epoch), slide_id}；
+    按授权时间降序。表不存在前（迁移未跑）调用方会拿到编程错误——
+    ensure_schema 在 app 启动期 fail-fast，运行期表必然存在。
     """
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT slide_name, user_id, granted_by, "
+                    "SELECT slide_name, user_id, granted_by, slide_id, "
                     "extract(epoch from granted_at)::float8 AS granted_at "
                     "FROM slide_view_grants ORDER BY granted_at DESC, "
                     "slide_name, user_id",
@@ -641,6 +699,7 @@ def list_slide_view_grants():
                         "slide_name": r["slide_name"],
                         "user_id": r["user_id"],
                         "granted_by": r["granted_by"],
+                        "slide_id": r["slide_id"],
                         "granted_at": r["granted_at"],
                     }
                     for r in cur.fetchall()

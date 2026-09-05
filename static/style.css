@@ -319,6 +319,23 @@ button {
 /* 顶部栏缩放徽章：桌面隐藏（桌面用底栏 #zoom-badge），仅移动端显示 */
 .header-zoom-badge { display: none; }
 
+/* 1:1 原始像素按钮（F3）：紧贴倍率徽章的紧凑 pill，不撑破工具栏 */
+.zoom-native-btn {
+  flex-shrink: 0;
+  padding: 3px 8px;
+  font-size: 11px;
+  line-height: 1;
+  font-family: var(--mono);
+  color: var(--text);
+  background: #fff;
+  border: 0.5px solid var(--separator-strong);
+  border-radius: var(--r-pill);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+}
+.zoom-native-btn:hover { background: var(--hover); }
+.zoom-native-btn:active { background: var(--hover-strong); }
+
 /* =========================================================================
    主体布局
    ========================================================================= */
@@ -1309,6 +1326,20 @@ button {
 .ch-origin { flex-shrink: 0; font-size: 10px; color: var(--text-2); }
 .ch-row-disabled .ch-name,
 .ch-row-disabled .ch-origin { color: var(--text-3); }
+
+/* 有效不可见（F4）：勾选但对合成贡献为 0 的行——短文本标注原因，
+   不自动改色；虚线描边只提示色块本身尚未参与合成 */
+.ch-invisible .ch-color { outline: 1px dashed var(--separator-strong); }
+.ch-invisible-reason {
+  flex-shrink: 1;
+  min-width: 0;
+  font-size: 10px;
+  line-height: 1.3;
+  color: var(--danger);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* 移动端（325px 宽）：说明卡贴满查看器宽度 */
 @media (max-width: 480px) {

@@ -429,6 +429,7 @@
     mppSetBtn: $("mpp-set-btn"),
     zoomBadge: $("zoom-badge"),
     headerZoomBadge: $("header-zoom-badge"),
+    zoomNative: $("zoom-native"),
     tbbMoreBtn: $("tbb-more-btn"),
     tbbMore: $("tbb-more"),
     tbbMoreAi: $("tbb-more-ai"),
@@ -945,6 +946,19 @@
     if (!viewer || !viewer.viewport) return;
     viewer.viewport.zoomBy(1 / 1.4);
     viewer.viewport.applyConstraints();
+  }
+  // 1:1 原始像素（F3）：口径唯一在 HP_ViewerCore.zoomToNative；其未加载时才本地兜底
+  function zoomNative() {
+    if (window.HP_ViewerCore && HP_ViewerCore.zoomToNative) {
+      HP_ViewerCore.zoomToNative(viewer);
+      return;
+    }
+    try {
+      if (!viewer || !viewer.viewport || !viewer.source) return;
+      var vp = viewer.viewport;
+      vp.zoomTo(viewer.source.dimensions.x / vp.getContainerSize().x, vp.getCenter());
+      vp.applyConstraints();
+    } catch (e) { /* 忽略 */ }
   }
   function rotate() {
     if (!viewer || !viewer.viewport) return;
@@ -3964,6 +3978,7 @@
   function bindEvents() {
     els.zoomIn.addEventListener("click", zoomIn);
     els.zoomOut.addEventListener("click", zoomOut);
+    if (els.zoomNative) els.zoomNative.addEventListener("click", zoomNative);
     els.rotateBtn.addEventListener("click", rotate);
     els.flipBtn.addEventListener("click", flip);
     els.resetBtn.addEventListener("click", reset);

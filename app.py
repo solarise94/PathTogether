@@ -1287,12 +1287,34 @@ def _default_fp_store(safe: str, generation, fp: str) -> None:
         _DEFAULT_FP_CACHE[(safe, generation)] = fp
 
 
-def _tile_fp_key(safe: str, generation, fp, level, x, y, fmt="jpeg"):
-    """瓦片缓存键（§7.3）：(safe, generation, fingerprint, level, x, y,
-    format, quality)。同名替换换 generation、换配色换 fingerprint——旧键
-    永不命中。"""
+def _tile_fp_key(safe: str, generation, fp, level, x, y, fmt="jpeg",
+                 image_mode="native_rgb"):
+    """瓦片缓存键（§7.3 + F2）：(safe, generation, fingerprint, level, x, y,
+    format, quality, subsampling, encoder_version)。同名替换换 generation、
+    换配色换 fingerprint、换编码参数（native/multichannel）换键——旧键永不
+    命新字节。"""
+    quality, subsampling = slide_render.display_jpeg_params(image_mode)
     return (safe, generation, fp, int(level), int(x), int(y), fmt,
-            JPEG_QUALITY)
+            quality, subsampling, slide_render.TILE_ENCODER_VERSION)
+
+
+def _tile_cache_lookup(safe, generation, fp, level, x, y):
+    """预查时不知道 context version：两个编码键都试，避免 RGB native-rgb-v1
+    被当成荧光键导致永远 miss / 错码。"""
+    for mode in ("native_rgb", "multichannel"):
+        hit = _tile_cache_get(_tile_fp_key(
+            safe, generation, fp, level, x, y, image_mode=mode))
+        if hit is not None:
+            return hit
+    return None
+
+
+def _encode_tile_jpeg(tile, ctx):
+    """按 context version 选 native q82/4:2:0 或荧光 q95/4:4:4。"""
+    image_mode = slide_render.image_mode_from_context(ctx)
+    quality = None if image_mode == "multichannel" else JPEG_QUALITY
+    return slide_render.encode_display_jpeg(
+        tile, image_mode=image_mode, quality=quality)[0], image_mode
 
 
 def _resolve_pair_context(pair, safe: str, *, token="", body=None,
@@ -3444,9 +3466,8 @@ def api_demo_slide_tile(slide_id, level, x, y):
             fp_pre = payload.get("fp")
     else:
         fp_pre = _default_fp_cached(safe, gen)
-    key = _tile_fp_key(safe, gen, fp_pre, level, x, y) \
+    cached = _tile_cache_lookup(safe, gen, fp_pre, level, x, y) \
         if fp_pre is not None else None
-    cached = _tile_cache_get(key) if key is not None else None
     if cached is None:
         def _decode(pair):
             ctx, fp = _resolve_pair_context(pair, safe, token=token, flag=flag)
@@ -3460,19 +3481,19 @@ def api_demo_slide_tile(slide_id, level, x, y):
                 tile = dzg.get_tile(level, (x, y))
             if tile.mode != "RGB":
                 tile = tile.convert("RGB")
-            return tile, fp
+            return tile, fp, ctx
 
         try:
-            (tile, fp), tile_gen = slide_cache.read_stable(
+            (tile, fp, ctx), tile_gen = slide_cache.read_stable(
                 _get_slide(safe), _decode)
         except (slide_render.RenderRequestError,
                 slide_io.SlideRenderError) as e:
             return _render_error_response(e)
-        key = _tile_fp_key(safe, tile_gen, fp, level, x, y)
-        buf = io.BytesIO()
-        tile.save(buf, format="JPEG", quality=JPEG_QUALITY)
-        _tile_cache_put(key, buf.getvalue())
-        buf.seek(0)
+        tile_bytes, image_mode = _encode_tile_jpeg(tile, ctx)
+        key = _tile_fp_key(safe, tile_gen, fp, level, x, y,
+                           image_mode=image_mode)
+        _tile_cache_put(key, tile_bytes)
+        buf = io.BytesIO(tile_bytes)
     else:
         buf = io.BytesIO(cached)
     resp = send_file(buf, mimetype="image/jpeg")
@@ -8302,12 +8323,9 @@ def api_slide_tile(name, level, x, y):
             fp_pre = payload.get("fp")
     else:
         fp_pre = _default_fp_cached(safe, slide_cache.refresh_generation(entry))
-    if fp_pre is not None:
-        cached = _tile_cache_get(
-            _tile_fp_key(safe, slide_cache.refresh_generation(entry),
-                         fp_pre, level, x, y))
-    else:
-        cached = None
+    cached = _tile_cache_lookup(
+        safe, slide_cache.refresh_generation(entry), fp_pre, level, x, y) \
+        if fp_pre is not None else None
 
     if cached is None:
         def _decode(pair):
@@ -8323,24 +8341,19 @@ def api_slide_tile(name, level, x, y):
                 tile = dzg.get_tile(level, (x, y))
             if tile.mode != "RGB":
                 tile = tile.convert("RGB")
-            return tile, fp
+            return tile, fp, ctx
 
         try:
-            (tile, fp), tile_gen = slide_cache.read_stable(entry, _decode)
+            (tile, fp, ctx), tile_gen = slide_cache.read_stable(
+                entry, _decode)
         except (slide_render.RenderRequestError,
                 slide_io.SlideRenderError) as e:
             return _render_error_response(e)
-        key = _tile_fp_key(safe, tile_gen, fp, level, x, y)
-        buf = io.BytesIO()
-        # baseline JPEG：省掉 progressive/optimize 的编码开销（快 3–5×）；
-        # 模糊→清晰的渐进预览已由切片页 base-thumb 底图层负责，瓦片无需 progressive
-        tile.save(
-            buf,
-            format="JPEG",
-            quality=JPEG_QUALITY,
-        )
-        _tile_cache_put(key, buf.getvalue())
-        buf.seek(0)
+        tile_bytes, image_mode = _encode_tile_jpeg(tile, ctx)
+        key = _tile_fp_key(safe, tile_gen, fp, level, x, y,
+                           image_mode=image_mode)
+        _tile_cache_put(key, tile_bytes)
+        buf = io.BytesIO(tile_bytes)
     else:
         buf = io.BytesIO(cached)
 
@@ -11466,10 +11479,11 @@ def api_slide_region(name):
          out_w,out_h 可选（默认保持宽高比、最长边 1568，上限各 4096）；
          render 可选（render_token，§6.3；缺省用该切片当前默认 context）。
     返回 JSON：{image_base64, mime, width, height, src:{x,y,w,h}, magnification,
-              read_level, render_context_fingerprint?}。src 是 clamp 到边界后
-              的实际区域；read_level 为实际解码金字塔层（W0 跨仓契约，向后
-              兼容新增字段）；render_context_fingerprint 仅在多通道 context
-              生效时返回（additive）。
+              read_level, upsampled, render_context_fingerprint?}。src 是 clamp
+              到边界后的实际区域；read_level 为实际解码金字塔层、upsampled 为
+              out 是否超过源像素（F1，W0 跨仓契约，向后兼容新增）；
+              render_context_fingerprint 仅在多通道 context 生效时返回
+              （additive）。width/height 恒等于编码后 JPEG 实际像素。
     Stage 3a-2a：can_view_slide，无权 403（不泄露存在性差异，统一 403）。
     """
     if not can_view_slide(name):
@@ -11515,25 +11529,7 @@ def api_slide_region(name):
         h2 = min(h, max_h)
         if w2 <= 0 or h2 <= 0:
             return jsonify(error="裁剪区域超出图像边界"), 400
-        # 选最佳金字塔层（按 downsample）以加速 read_region。
-        # read_region 的 location 是 level-0 坐标，但 size 是该层像素尺寸，
-        # 故需把 level-0 尺寸 (w2,h2) 除以该层 downsample 得层内尺寸。
-        ds = max(w2, h2) / 1568.0 if max(w2, h2) > 1568 else 1.0
-        try:
-            lvl = osr.get_best_level_for_downsample(ds) if ds > 1 else 0
-        except Exception:
-            lvl = 0
-        try:
-            ds_lvl = float(osr.level_downsamples[lvl]) if lvl < len(osr.level_downsamples) else 1.0
-        except Exception:
-            ds_lvl = 1.0
-        rw = max(1, int(round(w2 / ds_lvl)))
-        rh = max(1, int(round(h2 / ds_lvl)))
-        region = osr.read_region((x2, y2), lvl, (rw, rh))
-        if region.mode != "RGB":
-            region = region.convert("RGB")
-
-        # 计算输出尺寸：默认保持宽高比、最长边 1568
+        # 计算输出尺寸：默认保持宽高比、最长边 1568（先有合法 out，再选层）
         if out_w and out_w > 0 and out_h and out_h > 0:
             ow = min(out_w, 4096)
             oh = min(out_h, 4096)
@@ -11545,7 +11541,17 @@ def api_slide_region(name):
                 scale = 1568.0 / longest
                 ow = max(1, int(round(w2 * scale)))
                 oh = max(1, int(round(h2 * scale)))
-        if (ow, oh) != (w2, h2):
+        # 选最佳金字塔层（F1：downsample<=min(w2/ow,h2/oh) 的最粗层，够用即
+        # 可、绝不再放大）。read_region 的 location 是 level-0 坐标，但 size
+        # 是该层像素尺寸，故需把 level-0 尺寸 (w2,h2) 除以该层 downsample。
+        lvl, ds_lvl, upsampled = slide_render.choose_read_level(
+            osr.level_downsamples, w2, h2, ow, oh)
+        rw = max(1, int(round(w2 / ds_lvl)))
+        rh = max(1, int(round(h2 / ds_lvl)))
+        region = osr.read_region((x2, y2), lvl, (rw, rh))
+        if region.mode != "RGB":
+            region = region.convert("RGB")
+        if region.size != (ow, oh):
             region = region.resize((ow, oh), Image.LANCZOS)
 
         # 读取 mpp 算放大倍率（供前端展示）
@@ -11553,26 +11559,28 @@ def api_slide_region(name):
         mpp = meta.get("mpp_x")
         mag = None
         if mpp and mpp > 0:
-            try:
-                level_ds = osr.level_downsamples
-                ds_lvl = float(level_ds[lvl]) if lvl < len(level_ds) else 1.0
-            except Exception:
-                ds_lvl = 1.0
             base = 10.0 / mpp
             mag = base / ds_lvl if ds_lvl > 0 else base
 
-    buf = io.BytesIO()
-    region.save(buf, format="JPEG", quality=85)
-    img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    # F2：多通道合成派生图 4:4:4（subsampling=0），quality 仍走网页 region 85
+    image_mode = "multichannel" \
+        if ctx is not None \
+        and ctx.get("version") == slide_render.CONTEXT_VERSION_MULTICHANNEL \
+        else "native_rgb"
+    jpeg_bytes, _params = slide_render.encode_display_jpeg(
+        region, image_mode=image_mode, quality=85)
+    img_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
     out = {
         "image_base64": img_b64,
         "mime": "image/jpeg",
-        "width": ow,
-        "height": oh,
+        # 诚实尺寸：等于编码后 JPEG 实际像素
+        "width": region.size[0],
+        "height": region.size[1],
         "src": {"x": x2, "y": y2, "w": w2, "h": h2},
         "magnification": mag,
-        # W0 契约：实际解码金字塔层（与 _read_region_b64 同式选层；向后兼容新增）
+        # W0 契约：实际解码金字塔层（与 _read_region_b64 共用 choose_read_level）
         "read_level": int(lvl),
+        "upsampled": bool(upsampled),
     }
     # §6.3 additive：多通道 context 生效时回传 fingerprint（HistoPilot 记录用；
     # 不是 asset_revision——两者独立）。RGB legacy 路径不加该字段。
@@ -12088,7 +12096,9 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
       - max_long_edge 非空时：按 bbox 原始宽高比计算 out_w/out_h，最长边 =
         max_long_edge（保持比例，限制 [1,4096]），忽略显式 out_w/out_h。
       - 否则：用显式 out_w/out_h（仍 clamp 到 [1,4096]），保持旧契约。
-    LANCZOS resize 保持不变；JPEG 质量 jpeg_quality 默认 DERIVATIVE_JPEG_QUALITY(85)。
+    LANCZOS resize 保持不变；JPEG 质量 jpeg_quality 默认 DERIVATIVE_JPEG_QUALITY(85)，
+    多通道 context 时 subsampling=0（4:4:4）。选层与 /region 端点共用
+    choose_read_level；返回 dict 另含 upsampled（out 是否超过源像素）。
     Batch 3（§6.3）：render_context 非 None 时为 wire 请求体形态（plugin v1 /
     internal 通道），在本函数内借句柄后、**解码前** canonicalize + revision
     绑定（稳定码拒绝）；成功按该 context 合成并在结果 dict 带
@@ -12111,52 +12121,50 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
         h2 = max(0, min(h, max(0, height - y2)))
         if w2 <= 0 or h2 <= 0:
             w2, h2 = 1, 1
-        ds = max(w2, h2) / 1568.0 if max(w2, h2) > 1568 else 1.0
-        try:
-            lvl = osr.get_best_level_for_downsample(ds) if ds > 1 else 0
-        except Exception:
-            lvl = 0
-        try:
-            ds_lvl = float(osr.level_downsamples[lvl]) if lvl < len(osr.level_downsamples) else 1.0
-        except Exception:
-            ds_lvl = 1.0
-        rw = max(1, int(round(w2 / ds_lvl)))
-        rh = max(1, int(round(h2 / ds_lvl)))
-        region = osr.read_region((x2, y2), lvl, (rw, rh))
-        if region.mode != "RGB":
-            region = region.convert("RGB")
         # 输出尺寸：max_long_edge 优先（保宽高比），否则用显式 out_w/out_h。
+        # 先有合法 out，再选层（F1）。
         if max_long_edge is not None and int(max_long_edge) > 0:
             ow, oh = _aspect_fit_size(w2, h2, max_long_edge)
         else:
             ow = max(1, min(out_w, 4096))
             oh = max(1, min(out_h, 4096))
-        if (ow, oh) != (w2, h2):
+        # F1：downsample<=min(w2/ow,h2/oh) 的最粗层，够用即可、绝不再放大
+        lvl, ds_lvl, upsampled = slide_render.choose_read_level(
+            osr.level_downsamples, w2, h2, ow, oh)
+        rw = max(1, int(round(w2 / ds_lvl)))
+        rh = max(1, int(round(h2 / ds_lvl)))
+        region = osr.read_region((x2, y2), lvl, (rw, rh))
+        if region.mode != "RGB":
+            region = region.convert("RGB")
+        if region.size != (ow, oh):
             region = region.resize((ow, oh), Image.LANCZOS)
         mag = None
         if mpp and mpp > 0:
-            try:
-                level_ds = osr.level_downsamples
-                ds_lvl = float(level_ds[lvl]) if lvl < len(level_ds) else 1.0
-            except Exception:
-                ds_lvl = 1.0
             base = 10.0 / mpp
             mag = base / ds_lvl if ds_lvl > 0 else base
     # AI 快照图像画 level-0 坐标刻度尺（视觉尺子，失败不影响出图）
     _overlay_coord_ticks(region, x2, y2, w2, h2)
-    buf = io.BytesIO()
-    region.save(buf, format="JPEG", quality=int(jpeg_quality))
-    img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    # F2：多通道 context 派生图 4:4:4（subsampling=0），quality 仍走调用方
+    # jpeg_quality；native 显式 4:2:0（与旧 Pillow 默认一致）
+    image_mode = "multichannel" \
+        if render_context is not None \
+        and render_context.get("version") \
+        == slide_render.CONTEXT_VERSION_MULTICHANNEL else "native_rgb"
+    jpeg_bytes, _params = slide_render.encode_display_jpeg(
+        region, image_mode=image_mode, quality=int(jpeg_quality))
+    img_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
     return {
         "image_base64": img_b64,
         "mime": "image/jpeg",
-        "width": ow, "height": oh,
+        # 诚实尺寸：等于编码后 JPEG 实际像素
+        "width": region.size[0], "height": region.size[1],
         "src": {"x": x2, "y": y2, "w": w2, "h": h2},
         "magnification": mag,
         # W0 跨仓契约（HistoPilot whole-slide-snapshot-fix-plan）：实际解码层
-        # （get_best_level_for_downsample 选出的金字塔层，非语义 state_level），
-        # 向后兼容新增字段，供 snapshot_captured 事件标注 read_level。
+        # （choose_read_level 选出的金字塔层，非语义 state_level），向后兼容
+        # 新增字段，供 snapshot_captured 事件标注 read_level。
         "read_level": int(lvl),
+        "upsampled": bool(upsampled),
         # §6.3 additive：render_context 生效时的 fingerprint（RGB legacy 为 None）
         "render_fingerprint": render_fingerprint,
     }
@@ -12289,6 +12297,8 @@ def internal_ai_region():
         "magnification": r["magnification"],
         # W0 契约：实际解码金字塔层（向后兼容新增；mock 兼容用 .get）
         "read_level": r.get("read_level"),
+        # F1：out 是否超过源像素（mock 兼容用 .get，缺省 False）
+        "upsampled": bool(r.get("upsampled")),
         "encoder": _derivative_encoder_info(q),
     }
     if r.get("render_fingerprint"):
@@ -12422,12 +12432,52 @@ def internal_ai_spots():
     return jsonify({"changes": changes, "current_seq": current_seq})
 
 
+def _ai_slide_info_payload(pair, safe: str) -> dict:
+    """AI slide info 载荷（G1，internal 与 plugin v1 两条路径共用实现）。
+
+    必须在**当前借出的** pair 上调用：几何（width/height/level_downsamples/
+    mpp）与 ``build_render_info``（image_mode/channels/warnings/plane/
+    default_render_context/server_capability）同一 generation 取数。flag 关时
+    build_render_info 只给探测字段（image_mode/server_capability），channels
+    等不下发。default_render_token 不入 AI 载荷（token 不是 AI 授权，§6.2）。
+    """
+    osr = pair["osr"]
+    width, height = osr.dimensions
+    try:
+        level_downsamples = tuple(osr.level_downsamples)
+    except Exception:  # noqa: BLE001
+        level_downsamples = (1.0,)
+    meta = _read_metadata(osr, UPLOAD_DIR / safe)
+    mpp = meta.get("mpp_x")
+    render_fields = slide_render.build_render_info(
+        osr, asset_revision=_legacy_slide_revision(safe),
+        asset_generation=_ctx_scope(safe, pair.get("gen")),
+        secret=app.secret_key, slide_name=safe,
+        flag_enabled=_multichannel_enabled())
+    out = {
+        "width": width,
+        "height": height,
+        "level_downsamples": list(level_downsamples),
+        "mpp": mpp,
+        "fingerprint": _slide_fingerprint(safe),
+        "asset_revision": render_fields.get("asset_revision")
+                          or _legacy_slide_revision(safe),
+        "image_mode": render_fields.get("image_mode"),
+    }
+    for key in ("channels", "warnings", "plane", "default_render_context",
+                "server_capability"):
+        if key in render_fields:
+            out[key] = render_fields[key]
+    return out
+
+
 @app.route("/internal/ai/slide_info", methods=["GET"])
 def internal_ai_slide_info():
-    """sidecar 取切片尺寸/金字塔/mpp/指纹。
+    """sidecar 取切片尺寸/金字塔/mpp/指纹 + 多通道渲染信息（G1）。
 
-    query: slide（必填）。复用 _ai_slide_ctx 的取数逻辑（width/height/
-    level_downsamples/mpp）与 _slide_fingerprint。slide 不存在 → 404。
+    query: slide（必填）。几何与 build_render_info 同一次 borrow 读取
+    （channels 与几何同一 generation）；不下发 default_render_token。
+    slide 不存在 → 404。
     """
     auth = _require_internal()
     if auth:
@@ -12438,22 +12488,8 @@ def internal_ai_slide_info():
     safe = _safe_name(slide)
     entry = _get_slide(safe)
     with slide_cache.borrow_pair(entry) as pair:
-        osr = pair["osr"]
-        width, height = osr.dimensions
-        try:
-            level_downsamples = tuple(osr.level_downsamples)
-        except Exception:  # noqa: BLE001
-            level_downsamples = (1.0,)
-        meta = _read_metadata(osr, UPLOAD_DIR / safe)
-        mpp = meta.get("mpp_x")
-    fingerprint = _slide_fingerprint(safe)
-    return jsonify({
-        "width": width,
-        "height": height,
-        "level_downsamples": list(level_downsamples),
-        "mpp": mpp,
-        "fingerprint": fingerprint,
-    })
+        out = _ai_slide_info_payload(pair, safe)
+    return jsonify(out)
 
 
 # =========================================================================== #
@@ -12615,10 +12651,12 @@ def _revoke_stale_run_grants(slide=None, reason="creator_recheck"):
 
 @app.route("/api/plugin/v1/slides/<slide>", methods=["GET"])
 def plugin_v1_slide_info(slide):
-    """切片尺寸/金字塔/mpp/指纹 + asset revision（对应 /internal/ai/slide_info）。
+    """切片尺寸/金字塔/mpp/指纹 + asset revision + 多通道渲染信息（G1）。
 
-    scope: slide:read。asset_revision 为 legacy mtime:size（Stage 3b 内容型
-    revision 的前身，仅供 region CAS 用）。
+    scope: slide:read。与 /internal/ai/slide_info 同一实现
+    （_ai_slide_info_payload）：几何与 channels 同一次 borrow（同一
+    generation）；asset_revision 为 legacy mtime:size（Stage 3b 内容型
+    revision 的前身，仅供 region CAS 用）；不下发 default_render_token。
     """
     claims, err = _require_plugin_token("slide:read")
     if err is not None:
@@ -12628,22 +12666,8 @@ def plugin_v1_slide_info(slide):
         return serr
     entry = _get_slide(safe)
     with slide_cache.borrow_pair(entry) as pair:
-        osr = pair["osr"]
-        width, height = osr.dimensions
-        try:
-            level_downsamples = tuple(osr.level_downsamples)
-        except Exception:  # noqa: BLE001
-            level_downsamples = (1.0,)
-        meta = _read_metadata(osr, UPLOAD_DIR / safe)
-        mpp = meta.get("mpp_x")
-    return jsonify({
-        "width": width,
-        "height": height,
-        "level_downsamples": list(level_downsamples),
-        "mpp": mpp,
-        "fingerprint": _slide_fingerprint(safe),
-        "asset_revision": _legacy_slide_revision(safe),
-    })
+        out = _ai_slide_info_payload(pair, safe)
+    return jsonify(out)
 
 
 @app.route("/api/plugin/v1/slides/<slide>/regions", methods=["POST"])
@@ -12861,6 +12885,7 @@ def plugin_v1_region(slide):
             "src": r["src"],
             "magnification": r["magnification"],
             "read_level": r.get("read_level"),
+            "upsampled": bool(r.get("upsampled")),
             "encoder": _derivative_encoder_info(q),
             "content_sha256": content_sha,
             "asset_revision": _legacy_slide_revision(safe),

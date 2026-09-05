@@ -1,23 +1,27 @@
 # -*- coding: utf-8 -*-
-"""W0 跨仓契约：region 响应携带 read_level（实际解码金字塔层）。
+"""F1 选层与尺寸诚实：choose_read_level 纯函数 + 两条 region 路由真实选层。
 
-HistoPilot whole-slide-snapshot-fix-plan W0：PathTogether region 响应增加
-``read_level``（``osr.get_best_level_for_downsample`` 实际选出的层，非语义
-state_level），向后兼容新增字段。本文件覆盖两条**不经 mock 替身**的真实选层
-计算路径（fake osr 逼真到足以驱动选层公式）：
+规格（review-2026-09-05 F1）：
+  - 先有合法 out 尺寸，再选层：max_ds = min(src_w/out_w, src_h/out_h)；<1 则
+    level 0 + upsampled=True；否则在 downsample<=max_ds 的层里选**最粗**层，
+    绝不选需要再放大的层（不把 OpenSlide get_best_level_for_downsample 当
+    权威——fake osr 干脆不实现它，实现若调用即 AttributeError）。
+  - resize 条件 region.size != (out_w,out_h)；响应 width/height == 编码后
+    JPEG 实际像素；JSON 增加 upsampled。
+  - 旧期望「2000 长边默认 → level 1」是 bug：默认最长边 1568 时 ds=1 的层
+    才够 1568px，应读 level 0（本文件改写该期望）。
 
-  - GET /api/slide/<name>/region（内联实现）：JSON 含 int read_level；
-  - POST /internal/ai/region（真实 _read_region_b64）：JSON 含 int read_level。
-
-plugin v1 两条 transport（JSON body + X-Region-Read-Level 头）的断言在
-test_plugin_v1_transport.py 现有 region 用例旁（不在此重复）。
+两条真实路由：GET /api/slide/<name>/region（内联实现）与
+POST /internal/ai/region（真实 _read_region_b64）。plugin v1 两条 transport
+的断言在 test_plugin_v1_transport.py 现有 region 用例旁（不在此重复）。
 
 运行：cd 项目根 && python3 -m pytest tests/test_region_read_level.py -q
 """
+import base64
 import contextlib
+import io
 import os
 import sys
-import tempfile
 from pathlib import Path
 from unittest import mock
 
@@ -29,6 +33,7 @@ os.environ["AI_INTERNAL_TOKEN"] = "test-internal-token-rlvl"
 from PIL import Image  # noqa: E402
 
 import app as app_mod  # noqa: E402
+import slide_render  # noqa: E402
 from _pt_helpers import isolate_app  # noqa: E402
 
 app_mod.UPLOAD_DIR = Path(os.environ["UPLOAD_DIR"])
@@ -40,22 +45,24 @@ _TOKEN = "test-internal-token-rlvl"
 
 
 class _FakeOsr:
-    """逼真 fake：dimensions / level_downsamples / 选层公式 / read_region。
+    """金字塔 [1,2,4,8]、dims 8192² 的 fake；**不实现**选层方法。"""
 
-    w=2000, h=1000 → longest=2000 > 1568 → ds=2000/1568≈1.276 → 选层公式
-    落在 level 1（get_best_level_for_downsample(1.276)=1），read_level 应为 1
-    （≠0 才能证明真的过了选层计算，不是缺省回填）。
-    """
+    dimensions = (8192, 8192)
+    level_downsamples = (1.0, 2.0, 4.0, 8.0)
+
+    def read_region(self, loc, level, size):
+        self.last_read = (loc, level, tuple(size))
+        return Image.new("RGB", size)
+
+
+class _FakeOsr2000:
+    """dims 2000×1000、金字塔 [1,2,4] 的 fake（旧用例形态）。"""
 
     dimensions = (2000, 1000)
     level_downsamples = (1.0, 2.0, 4.0)
 
-    def get_best_level_for_downsample(self, ds):
-        if ds <= 1.0:
-            return 0
-        return 2 if ds > 3.0 else 1
-
     def read_region(self, loc, level, size):
+        self.last_read = (loc, level, tuple(size))
         return Image.new("RGB", size)
 
 
@@ -87,30 +94,138 @@ def _touch_slide(name="demo.svs"):
     return name
 
 
-def _slide_mocks():
-    pair = {"osr": _FakeOsr()}
+def _slide_mocks(osr):
+    pair = {"osr": osr}
     return (mock.patch.object(app_mod, "_get_slide", return_value=_FAKE_ENTRY),
             mock.patch.object(app_mod.slide_cache, "borrow_pair",
                               side_effect=lambda _e: _borrow_pair_ctx(pair)),
-            mock.patch.object(app_mod, "_read_metadata", return_value={"mpp_x": 0.5}))
+            mock.patch.object(app_mod, "_read_metadata",
+                              return_value={"mpp_x": 0.5}))
 
 
-def test_main_region_json_has_int_read_level():
-    """GET /api/slide/<name>/region：JSON 含 read_level 且为 int（真实选层）。"""
+def _decode_jpeg(payload):
+    """响应 JSON → (PIL.Image, json)；断言 JPEG 实际像素 == width/height。"""
+    img = Image.open(io.BytesIO(base64.b64decode(payload["image_base64"])))
+    img.load()
+    assert img.size == (payload["width"], payload["height"]), \
+        "JSON width/height 必须等于编码后 JPEG 实际像素"
+    return img, payload
+
+
+# --------------------------------------------------------------------------- #
+# choose_read_level 纯函数
+# --------------------------------------------------------------------------- #
+def test_choose_read_level_picks_coarsest_within_budget():
+    """bbox 4096 请求 4096：max_ds=1 → level 0；bbox 8192 请求 4096 → level 1。"""
+    ds = (1.0, 2.0, 4.0, 8.0)
+    assert slide_render.choose_read_level(ds, 4096, 4096, 4096, 4096) \
+        == (0, 1.0, False)
+    assert slide_render.choose_read_level(ds, 8192, 8192, 4096, 4096) \
+        == (1, 2.0, False)
+    # 绝不选需要再放大的层：8192² bbox 请求 2048 → max_ds=4 → level 2 不是 3
+    assert slide_render.choose_read_level(ds, 8192, 8192, 2048, 2048)[0] == 2
+
+
+def test_choose_read_level_upsampled_when_out_exceeds_src():
+    """out 任一边大于 src（max_ds<1）→ level 0 + upsampled=True。"""
+    ds = (1.0, 2.0)
+    assert slide_render.choose_read_level(ds, 1000, 500, 2000, 1000) \
+        == (0, 1.0, True)
+    assert slide_render.choose_read_level(ds, 2000, 1000, 1568, 784) \
+        == (0, 1.0, False)
+    # 单层文件
+    assert slide_render.choose_read_level((1.0,), 640, 480, 1280, 960) \
+        == (0, 1.0, True)
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/slide/<name>/region（内联选层实现）
+# --------------------------------------------------------------------------- #
+def test_main_region_default_long_edge_reads_level0():
+    """默认最长边 1568、bbox 2000×1000 → level 0（旧期望 level 1 是 bug）。"""
     slide = _touch_slide()
-    m1, m2, m3 = _slide_mocks()
+    osr = _FakeOsr2000()
+    m1, m2, m3 = _slide_mocks(osr)
     with m1, m2, m3:
         r = _client().get("/api/slide/%s/region?x=0&y=0&w=2000&h=1000" % slide)
     assert r.status_code == 200, r.get_data(as_text=True)
-    j = r.get_json()
-    assert isinstance(j["read_level"], int)
-    assert j["read_level"] == 1  # 2000 长边 → ds≈1.276 → level 1
+    _, j = _decode_jpeg(r.get_json())
+    assert j["width"] == 1568 and j["height"] == 784
+    assert j["read_level"] == 0
+    assert j["upsampled"] is False
+    assert osr.last_read[1] == 0  # 实际 read_region 层
 
 
-def test_internal_region_json_has_int_read_level():
-    """POST /internal/ai/region（真实 _read_region_b64）：read_level 透传。"""
+def test_main_region_bbox4096_out4096_reads_level0_full_size():
+    """金字塔 [1,2,4,8]、bbox 4096 请求 4096 → level 0 且 JPEG 4096。"""
     slide = _touch_slide()
-    m1, m2, m3 = _slide_mocks()
+    osr = _FakeOsr()
+    m1, m2, m3 = _slide_mocks(osr)
+    with m1, m2, m3:
+        r = _client().get(
+            "/api/slide/%s/region?x=0&y=0&w=4096&h=4096"
+            "&out_w=4096&out_h=4096" % slide)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    _, j = _decode_jpeg(r.get_json())
+    assert (j["width"], j["height"]) == (4096, 4096)
+    assert j["read_level"] == 0 and j["upsampled"] is False
+    assert osr.last_read[1] == 0
+
+
+def test_main_region_bbox8192_out4096_reads_level1_not_level2():
+    """bbox 8192 请求 4096 → level 1（ds=2 够用），不要 level 2 再放大。"""
+    slide = _touch_slide()
+    osr = _FakeOsr()
+    m1, m2, m3 = _slide_mocks(osr)
+    with m1, m2, m3:
+        r = _client().get(
+            "/api/slide/%s/region?x=0&y=0&w=8192&h=8192"
+            "&out_w=4096&out_h=4096" % slide)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    _, j = _decode_jpeg(r.get_json())
+    assert (j["width"], j["height"]) == (4096, 4096)
+    assert j["read_level"] == 1 and j["upsampled"] is False
+    assert osr.last_read[1] == 1
+
+
+def test_main_region_out_over_4096_clamped_then_level0():
+    """bbox 4096 请求 8192：clamp 到 4096 后 out==src → level 0、不放大。"""
+    slide = _touch_slide()
+    osr = _FakeOsr()
+    m1, m2, m3 = _slide_mocks(osr)
+    with m1, m2, m3:
+        r = _client().get(
+            "/api/slide/%s/region?x=0&y=0&w=4096&h=4096"
+            "&out_w=8192&out_h=8192" % slide)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    _, j = _decode_jpeg(r.get_json())
+    assert (j["width"], j["height"]) == (4096, 4096)
+    assert j["read_level"] == 0 and j["upsampled"] is False
+
+
+def test_main_region_upsample_true_when_out_exceeds_src():
+    """bbox 1000×500 请求 2000×1000 → level 0 且 upsampled=True。"""
+    slide = _touch_slide()
+    osr = _FakeOsr()
+    m1, m2, m3 = _slide_mocks(osr)
+    with m1, m2, m3:
+        r = _client().get(
+            "/api/slide/%s/region?x=0&y=0&w=1000&h=500"
+            "&out_w=2000&out_h=1000" % slide)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    _, j = _decode_jpeg(r.get_json())
+    assert (j["width"], j["height"]) == (2000, 1000)
+    assert j["read_level"] == 0 and j["upsampled"] is True
+
+
+# --------------------------------------------------------------------------- #
+# POST /internal/ai/region（真实 _read_region_b64）
+# --------------------------------------------------------------------------- #
+def test_internal_region_json_has_int_read_level():
+    """_read_region_b64：max_long_edge=1024（bbox 2000×1000）→ level 0。"""
+    slide = _touch_slide()
+    osr = _FakeOsr2000()
+    m1, m2, m3 = _slide_mocks(osr)
     with m1, m2, m3:
         r = _client().post(
             "/internal/ai/region",
@@ -118,11 +233,28 @@ def test_internal_region_json_has_int_read_level():
             json={"slide": slide, "x": 0, "y": 0, "w": 2000, "h": 1000,
                   "max_long_edge": 1024})
     assert r.status_code == 200, r.get_data(as_text=True)
-    j = r.get_json()
-    assert isinstance(j["read_level"], int)
-    assert j["read_level"] == 1
-    # 顺手验证保比例输出（同一 fake 下的既有契约不回退）
+    _, j = _decode_jpeg(r.get_json())
+    assert j["read_level"] == 0 and j["upsampled"] is False
+    # 保比例输出契约不回退
     assert j["width"] == 1024 and j["height"] == 512
+    assert osr.last_read[1] == 0
+
+
+def test_internal_region_reports_upsampled():
+    """_read_region_b64：out 超过 src → upsampled=True 透传。"""
+    slide = _touch_slide()
+    osr = _FakeOsr()
+    m1, m2, m3 = _slide_mocks(osr)
+    with m1, m2, m3:
+        r = _client().post(
+            "/internal/ai/region",
+            headers={"X-AI-Internal-Token": _TOKEN, "Content-Type": "application/json"},
+            json={"slide": slide, "x": 0, "y": 0, "w": 1000, "h": 500,
+                  "out_w": 2000, "out_h": 1000})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    _, j = _decode_jpeg(r.get_json())
+    assert (j["width"], j["height"]) == (2000, 1000)
+    assert j["upsampled"] is True
 
 
 if __name__ == "__main__":

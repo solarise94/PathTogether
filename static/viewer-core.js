@@ -57,6 +57,15 @@
     return mag.toFixed(2) + "×";
   }
 
+  function uiLang() {
+    try {
+      if (root.HP_I18N && typeof root.HP_I18N.getLang === "function") {
+        return root.HP_I18N.getLang();
+      }
+    } catch (e) { /* i18n 未加载：中文默认 */ }
+    return "zh";
+  }
+
   function zoomText(viewer, mppX) {
     try {
       if (!viewer || !viewer.viewport || !viewer.source) return "—";
@@ -64,13 +73,34 @@
       var containerW = viewer.viewport.getContainerSize().x;
       var imgW = viewer.source.dimensions.x;
       var imageZoom = (zoom * containerW) / imgW;
+      // 倍率诚实（F3）：imageZoom>1 即 level-0 像素被拉伸显示（数字放大），
+      // 超出光学等效的 portion 如实标注，不冒充更高物镜
+      var suffix = imageZoom > 1.02 ? (uiLang() === "en" ? " digital" : " 数字放大") : "";
       var mpp = Number(mppX);
       if (mpp > 0 && imageZoom > 0) {
-        return formatMag(imageZoom * (10 / mpp));
+        return formatMag(imageZoom * (10 / mpp)) + suffix;
       }
-      return Math.round(imageZoom * 100) + "%";
+      return Math.round(imageZoom * 100) + "%" + suffix;
     } catch (e) {
       return "—";
+    }
+  }
+
+  // 1:1（F3）：imageZoom=1（1 CSS 像素 / 1 level-0 像素），保留视野中心。
+  // 不动 maxZoomPixelRatio/minPixelRatio；越界由 applyConstraints 收敛。
+  function zoomToNative(viewer) {
+    try {
+      if (!viewer || !viewer.viewport || !viewer.source) return false;
+      var vp = viewer.viewport;
+      var containerW = vp.getContainerSize().x;
+      var imgW = viewer.source.dimensions.x;
+      if (!(containerW > 0) || !(imgW > 0)) return false;
+      // imageZoom = zoom × containerW / imgW → imageZoom=1 ⇔ zoom = imgW/containerW
+      vp.zoomTo(imgW / containerW, vp.getCenter());
+      vp.applyConstraints();
+      return true;
+    } catch (e) {
+      return false;
     }
   }
 
@@ -103,6 +133,11 @@
         else viewer.viewport.setFlip(!viewer.viewport.getFlip());
       });
     }
+    if (els.zoomNative) {
+      els.zoomNative.addEventListener("click", function () {
+        zoomToNative(viewer);
+      });
+    }
     if (els.reset) {
       els.reset.addEventListener("click", function () {
         if (!viewer || !viewer.viewport) return;
@@ -120,6 +155,7 @@
     create: create,
     formatMag: formatMag,
     zoomText: zoomText,
+    zoomToNative: zoomToNative,
     bindViewTools: bindViewTools,
     osdDefaults: osdDefaults,
   };

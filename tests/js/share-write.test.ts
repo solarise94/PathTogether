@@ -155,12 +155,13 @@ const appSrc = readFileSync(resolve(here, "../../static/app.js"), "utf8");
 const demoSrc = readFileSync(resolve(here, "../../static/demo.js"), "utf8");
 const shareHtml = readFileSync(resolve(here, "../../templates/share.html"), "utf8");
 
-function loadViewerCore() {
-	const w: Record<string, unknown> = {};
+function loadViewerCore(overrides: Record<string, unknown> = {}) {
+	const w: Record<string, unknown> = { ...overrides };
 	new Function("window", viewerCoreSrc)(w);
 	return w.HP_ViewerCore as {
 		zoomText: (viewer: unknown, mppX: unknown) => string;
 		formatMag: (mag: number) => string;
+		zoomToNative: (viewer: unknown) => boolean;
 	};
 }
 
@@ -175,9 +176,11 @@ function fakeViewer(zoom: number) {
 }
 
 function magValue(text: string): number {
-	// "40×" / "1.2k×" / "3.4M×" / "57%" → 数值；"—" 视为 -Infinity
+	// "40×" / "1.2k×" / "3.4M×" / "57%" → 数值；"—" 视为 -Infinity；
+	// F3「数字放大 / digital」后缀只修饰展示，不参与数值单调比较
 	if (text === "—" || text === "") return -Infinity;
-	const m = String(text).match(/^([\d.]+)(k|M)?[%×]?$/);
+	const stripped = String(text).replace(/\s*(数字放大|digital)\s*$/, "");
+	const m = stripped.match(/^([\d.]+)(k|M)?[%×]?$/);
 	if (!m) throw new Error("unexpected zoomText output: " + text);
 	let v = parseFloat(m[1]);
 	if (m[2] === "k") v *= 1e3;
@@ -234,5 +237,44 @@ describe("G8 倍率徽章：唯一口径 viewer-core.zoomText（三页面同源 
 		expect(coreIdx).toBeGreaterThan(-1);
 		expect(shareIdx).toBeGreaterThan(coreIdx);
 		expect(shareHtml).toMatch(/viewer-core\.js\?v=/); // 与主站同 cache-bust 约定
+	});
+
+	it("F3 倍率诚实：imageZoom>1.02 追加数字放大后缀（zh/en），1:1 附近不标", () => {
+		// fakeViewer(zoom): containerW=1000, imgW=2000 → imageZoom = zoom/2
+		const core = loadViewerCore();
+		expect(core.zoomText(fakeViewer(2), 0.5)).toBe("20×"); // imageZoom=1：无后缀
+		expect(core.zoomText(fakeViewer(2.1), 0.5)).toMatch(/ 数字放大$/); // imageZoom=1.05
+		expect(core.zoomText(fakeViewer(2.1), null)).toMatch(/% 数字放大$/);
+		const coreEn = loadViewerCore({ HP_I18N: { getLang: () => "en" } });
+		expect(coreEn.zoomText(fakeViewer(2.1), 0.5)).toMatch(/ digital$/);
+		expect(coreEn.zoomText(fakeViewer(2), 0.5)).not.toContain("digital");
+	});
+
+	it("F3 zoomToNative：imageZoom=1（zoom=imgW/containerW），保留中心并 applyConstraints", () => {
+		const core = loadViewerCore();
+		const zoomCalls: Array<{ zoom: number; center: unknown }> = [];
+		let constrained = 0;
+		const viewer = {
+			viewport: {
+				getZoom: () => 8,
+				getContainerSize: () => ({ x: 1000 }),
+				getCenter: () => ({ x: 0.5, y: 0.5 }),
+				zoomTo: (z: number, c: unknown) => {
+					zoomCalls.push({ zoom: z, center: c });
+				},
+				applyConstraints: () => {
+					constrained += 1;
+				},
+			},
+			source: { dimensions: { x: 2000 } },
+		};
+		expect(core.zoomToNative(viewer)).toBe(true);
+		expect(zoomCalls.length).toBe(1);
+		expect(zoomCalls[0]!.zoom).toBe(2); // 2000/1000 → 1 CSS px / 1 level-0 px
+		expect(zoomCalls[0]!.center).toEqual({ x: 0.5, y: 0.5 });
+		expect(constrained).toBe(1);
+		// 无 viewer/viewport/source：安全返回 false，不抛
+		expect(core.zoomToNative(null)).toBe(false);
+		expect(core.zoomToNative({ viewport: {} })).toBe(false);
 	});
 });

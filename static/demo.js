@@ -75,6 +75,7 @@
       core.bindViewTools(state.viewer, {
         zoomIn: $("zoom-in"),
         zoomOut: $("zoom-out"),
+        zoomNative: $("zoom-native"),
         rotate: $("rotate-btn"),
         flip: $("flip-btn"),
         reset: $("reset-btn"),
@@ -92,6 +93,8 @@
       });
       if ($("zoom-in")) $("zoom-in").addEventListener("click", function () { state.viewer.viewport.zoomBy(1.4); });
       if ($("zoom-out")) $("zoom-out").addEventListener("click", function () { state.viewer.viewport.zoomBy(1 / 1.4); });
+      // 1:1 钮只在 HP_ViewerCore 路径绑定（zoomToNative 口径唯一在那里；
+      // 本兜底路径不做视口移动，遵守 demo 只读视角约束）
       if ($("rotate-btn")) $("rotate-btn").addEventListener("click", function () {
         state.viewer.viewport.setRotation(state.viewer.viewport.getRotation() + 90);
       });

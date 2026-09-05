@@ -155,6 +155,38 @@
   }
 
   // ------------------------------------------------------------------ #
+  // 有效不可见（F4）：勾选但对合成贡献为 0 的通道如实标注原因，
+  // 不自动改色（OME 黑色 DAPI 保持 #000000，用户可自行改色后变可见）。
+  // 优先级：disabled > alpha_zero > empty_window > black_mapping。
+  // 返回原因码或 null（可见）；ch 应为已合并用户覆盖后的有效通道。
+  // ------------------------------------------------------------------ #
+  function invisibleReason(ch, enabled) {
+    if (!enabled) return "disabled";
+    var inten = ch && ch.intensity && typeof ch.intensity === "object" ? ch.intensity : {};
+    var alpha = num(ch && ch.alpha);
+    if (alpha != null && alpha <= 0) return "alpha_zero";
+    var black = num(inten.black);
+    var white = num(inten.white);
+    if (inten.status === "empty_or_constant" ||
+        (black != null && white != null && white <= black)) {
+      return "empty_window";
+    }
+    if (String(ch && ch.color).toUpperCase() === "#000000") return "black_mapping";
+    return null;
+  }
+
+  function effectiveVisible(ch, enabled) {
+    return invisibleReason(ch, enabled) == null;
+  }
+
+  // 原因码 → i18n key 尾段（disabled 不出文案：未勾选的行不提示）
+  var INVISIBLE_KEY = {
+    alpha_zero: "alpha",
+    empty_window: "window",
+    black_mapping: "black",
+  };
+
+  // ------------------------------------------------------------------ #
   // 通道选择（§4.2：默认前 4 个有效通道；一次最多 8）
   // ------------------------------------------------------------------ #
   function isValidIndex(channels, idx) {
@@ -347,6 +379,18 @@
       return ch.nameMissing ? t("channel.n", { n: ch.index + 1 }) : ch.name;
     }
 
+    // 有效通道：manifest 数据 + 用户覆盖（改色会把 alpha 归 1，§5.1）。
+    // 有效不可见判定必须用这份合并结果，否则改色后原因不消失。
+    function effectiveChannel(ch) {
+      var ov = ctrl.overrides[ch.index] || {};
+      return {
+        index: ch.index,
+        color: ov.color || ch.color,
+        alpha: ov.alpha != null ? ov.alpha : ch.alpha,
+        intensity: ch.intensity,
+      };
+    }
+
     function renderPanel() {
       removePanel();
       var info = ctrl.info;
@@ -436,6 +480,15 @@
         row.appendChild(color);
 
         row.appendChild(el("span", "ch-origin", originText(ch)));
+        // 有效不可见（F4）：勾选但对合成贡献为 0 → 色块旁短文本标注原因；
+        // 不自动改色，checkbox 仍可勾选（用户改色后即变可见）
+        var active = ctrl.selection.indexOf(ch.index) >= 0;
+        var reason = active ? invisibleReason(effectiveChannel(ch), true) : null;
+        if (active && reason && INVISIBLE_KEY[reason]) {
+          row.className += " ch-invisible";
+          row.appendChild(el("span", "ch-invisible-reason",
+            t("channel.invisible." + INVISIBLE_KEY[reason])));
+        }
         if (ch.intensity && ch.intensity.status === "empty_or_constant") {
           row.title = t("channel.not.displayable");
         }
@@ -460,12 +513,17 @@
     function updateAiBadge() {
       var badgeEl = ctrl.panelEls && ctrl.panelEls.aiBadge;
       if (!badgeEl) return;
+      // 名称可用性与配色同步（fingerprint）是两件事（F4）：通道名称是否提供
+      // 由 manifest 决定，始终展示；fingerprint 同步态未知时只显示名称行
+      var lines = [];
+      var named = ctrl.info ? ctrl.info.namedCount : 0;
+      lines.push(named > 0 ? t("channel.ai.names_ready") : t("channel.ai.names_unknown"));
       var st = syncState(ctrl.renderFingerprint, ctrl.aiRenderFingerprint);
-      if (st === "unknown") { badgeEl.hidden = true; badgeEl.textContent = ""; return; }
+      if (st !== "unknown") {
+        lines.push(st === "synced" ? t("channel.ai.synced") : t("channel.ai.stale"));
+      }
       badgeEl.hidden = false;
-      badgeEl.textContent = st === "synced"
-        ? t("channel.ai.synced")
-        : t("channel.ai.stale");
+      badgeEl.textContent = lines.join(" ");
     }
 
     // Batch 5 桥接：HP UI 从 window.PathTogether.renderState 读当前配色，
@@ -481,6 +539,10 @@
           root.PathTogether.renderState = {
             renderContext: ctx,
             renderFingerprint: ctrl.renderFingerprint || ctx.fingerprint || null,
+            // 名称可用性与配色同步分开（F4）：不能用 render fingerprint
+            // 代替「通道名称已提供」
+            namedCount: ctrl.info ? ctrl.info.namedCount : 0,
+            channelSemanticsReady: !!(ctrl.info && ctrl.info.namedCount > 0),
           };
         }
         if (typeof root.dispatchEvent === "function" && typeof root.CustomEvent === "function") {
@@ -809,6 +871,8 @@
     createDeepZoomTileSource: createDeepZoomTileSource,
     sameFingerprint: sameFingerprint,
     syncState: syncState,
+    invisibleReason: invisibleReason,
+    effectiveVisible: effectiveVisible,
     defaultSelection: defaultSelection,
     clampSelection: clampSelection,
     buildRequestBody: buildRequestBody,

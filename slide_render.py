@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import io
 import json
 import math
 import os
@@ -63,6 +64,11 @@ __all__ = [
     "issue_render_token", "resolve_render_context",
     "canonicalize_selection", "RenderRequestError",
     "build_render_info",
+    # F1/F2：选层与显示 JPEG 编码
+    "choose_read_level", "TILE_ENCODER_VERSION",
+    "TILE_NATIVE_JPEG_QUALITY", "TILE_NATIVE_JPEG_SUBSAMPLING",
+    "TILE_MULTICHANNEL_JPEG_QUALITY", "TILE_MULTICHANNEL_JPEG_SUBSAMPLING",
+    "display_jpeg_params", "encode_display_jpeg", "image_mode_from_context",
     # 指标与测试隔离
     "metrics_inc", "metrics_add", "metrics_snapshot", "reset_caches",
 ]
@@ -1264,3 +1270,80 @@ class RenderedSlideView:
     def close(self):
         """no-op：不关闭借出的 slide（生命周期归借用方）。"""
         return None
+
+
+# --------------------------------------------------------------------------- #
+# F1 选层 + F2 显示 JPEG 编码（2026-09-05 批次；app.py / share_server.py 共用）
+# --------------------------------------------------------------------------- #
+def choose_read_level(level_downsamples, src_w, src_h, out_w, out_h):
+    """按输出尺寸诚实选金字塔层，返回 ``(level, downsample, upsampled)``。
+
+    - 先有合法 out 尺寸（调用方完成 clamp / 默认最长边），再选层；
+    - ``max_ds = min(src_w/out_w, src_h/out_h)``；小于 1 说明 out 比 src 还大
+      （要放大）→ level 0 + ``upsampled=True``；
+    - 否则在 ``downsample <= max_ds`` 的层里选**最粗**层（够用即可），绝不选
+      需要再放大的层。不把 OpenSlide ``get_best_level_for_downsample`` 当
+      权威（它可能偏向更大 downsample）。
+    """
+    downsamples = [max(1.0, float(d)) for d in (level_downsamples or (1.0,))]
+    ow = max(1, int(out_w))
+    oh = max(1, int(out_h))
+    max_ds = min(float(src_w) / ow, float(src_h) / oh)
+    if max_ds < 1.0:
+        return 0, downsamples[0], True
+    level = 0
+    for i, ds in enumerate(downsamples):
+        if ds <= max_ds:
+            level = i
+    return level, downsamples[level], False
+
+
+#: 显示编码器版本（公式/参数变化必须升版本；瓦片缓存键含此值）
+TILE_ENCODER_VERSION = "display-jpeg-v2"
+#: native（明场/RGB）瓦片：显式 4:2:0（Pillow subsampling=2）
+TILE_NATIVE_JPEG_QUALITY = 82
+TILE_NATIVE_JPEG_SUBSAMPLING = 2
+#: 多通道合成：显式 4:4:4（subsampling=0），高饱和细色线不被色度抽样糊掉
+TILE_MULTICHANNEL_JPEG_QUALITY = 95
+TILE_MULTICHANNEL_JPEG_SUBSAMPLING = 0
+
+
+def image_mode_from_context(ctx):
+    """瓦片/region 编码用的 image_mode：只有真正的多通道合成才走 4:4:4。
+
+    flag 打开时 RGB 切片仍带 ``native-rgb-v1`` context（ctx 非 None），不得
+    因此被当成荧光编码。
+    """
+    if isinstance(ctx, dict) and ctx.get("version") == CONTEXT_VERSION_MULTICHANNEL:
+        return "multichannel"
+    return "native_rgb"
+
+
+def display_jpeg_params(image_mode, quality=None):
+    """按 image_mode 返回显式 ``(quality, subsampling)``（禁止靠 Pillow 默认）。
+
+    ``quality`` 非空时覆盖该模式的默认 quality（region 派生图仍走调用方
+    jpeg_quality），subsampling 只由 image_mode 决定。
+    """
+    if image_mode == "multichannel":
+        q = TILE_MULTICHANNEL_JPEG_QUALITY if quality is None else int(quality)
+        return q, TILE_MULTICHANNEL_JPEG_SUBSAMPLING
+    q = TILE_NATIVE_JPEG_QUALITY if quality is None else int(quality)
+    return q, TILE_NATIVE_JPEG_SUBSAMPLING
+
+
+def encode_display_jpeg(img, *, image_mode, quality=None):
+    """display-jpeg-v2 编码，返回 ``(jpeg_bytes, params)``。
+
+    native：quality=82、subsampling=2（4:2:0）；multichannel：quality=95、
+    subsampling=0（4:4:4）。``params`` 回传实际参数（含 encoder_version），
+    供缓存键与响应回显。
+    """
+    q, subsampling = display_jpeg_params(image_mode, quality)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=q, subsampling=subsampling)
+    return buf.getvalue(), {
+        "quality": q,
+        "subsampling": subsampling,
+        "encoder_version": TILE_ENCODER_VERSION,
+    }

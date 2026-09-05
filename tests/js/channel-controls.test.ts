@@ -186,6 +186,20 @@ function loadModule(overrides: Record<string, unknown> = {}) {
 	return (w as { HP_Channels: Record<string, unknown> }).HP_Channels as never as Channels;
 }
 
+// 需要 读 window.PathTogether.renderState（publishRenderState 断言）时的变体
+function loadModuleAndWindow(overrides: Record<string, unknown> = {}) {
+	const w: Record<string, unknown> = {
+		document: fakeDoc(),
+		localStorage: memoryStorage(),
+		...overrides,
+	};
+	new Function("window", "document", src)(w, w.document);
+	return {
+		C: (w as { HP_Channels: Record<string, unknown> }).HP_Channels as never as Channels,
+		w: w as { PathTogether?: { renderState: Record<string, unknown> | null } },
+	};
+}
+
 interface Channels {
 	MAX_ACTIVE_CHANNELS: number;
 	DEFAULT_ACTIVE_CHANNELS: number;
@@ -198,6 +212,8 @@ interface Channels {
 	): Record<string, unknown>;
 	sameFingerprint(a: string | null, b: string | null): boolean;
 	syncState(a: string | null, b: string | null): string;
+	invisibleReason(ch: Record<string, unknown>, enabled: boolean): string | null;
+	effectiveVisible(ch: Record<string, unknown>, enabled: boolean): boolean;
 	defaultSelection(channels: Array<Record<string, unknown>>): number[];
 	clampSelection(channels: Array<Record<string, unknown>>, indexes: number[]): number[];
 	buildRequestBody(
@@ -534,38 +550,40 @@ describe("createDeepZoomTileSource（§8.1–8.2）", () => {
 	});
 });
 
+// ------------------------------------------------------------------ tests --
+// controller 共用 opts（F4 新增 describe 也在模块级复用）
+function baseOpts(adapter: Record<string, unknown>, viewer: Record<string, unknown>) {
+	const storage = memoryStorage();
+	const toasts: Array<{ msg: string; type?: string }> = [];
+	const host = fakeEl();
+	const button = fakeEl("button");
+	const badge = fakeEl("span");
+	return {
+		adapter,
+		viewer,
+		panelHost: host,
+		button,
+		badge,
+		storage,
+		toasts,
+		t: (key: string, vars?: Record<string, unknown>) =>
+			key + (vars && vars.n != null ? `:${vars.n}/${vars.m}` : ""),
+		toast: (msg: string, type?: string) => toasts.push({ msg, type }),
+		onReopening: vi.fn(),
+		onReopened: vi.fn(),
+		setThumbnail: vi.fn(),
+	};
+}
+
+function deferred<T>() {
+	let resolve!: (v: T) => void;
+	const promise = new Promise<T>((r) => {
+		resolve = r;
+	});
+	return { promise, resolve };
+}
+
 describe("controller：面板/flag/竞争/恢复 viewport", () => {
-	function baseOpts(adapter: Record<string, unknown>, viewer: Record<string, unknown>) {
-		const storage = memoryStorage();
-		const toasts: Array<{ msg: string; type?: string }> = [];
-		const host = fakeEl();
-		const button = fakeEl("button");
-		const badge = fakeEl("span");
-		return {
-			adapter,
-			viewer,
-			panelHost: host,
-			button,
-			badge,
-			storage,
-			toasts,
-			t: (key: string, vars?: Record<string, unknown>) =>
-				key + (vars && vars.n != null ? `:${vars.n}/${vars.m}` : ""),
-			toast: (msg: string, type?: string) => toasts.push({ msg, type }),
-			onReopening: vi.fn(),
-			onReopened: vi.fn(),
-			setThumbnail: vi.fn(),
-		};
-	}
-
-	function deferred<T>() {
-		let resolve!: (v: T) => void;
-		const promise = new Promise<T>((r) => {
-			resolve = r;
-		});
-		return { promise, resolve };
-	}
-
 	it("RGB：不出面板；flag 关：什么都不显示；两者都不发 render-context（§4.1/§15.2）", () => {
 		const C = loadModule();
 		const calls: string[] = [];
@@ -790,6 +808,183 @@ describe("controller：面板/flag/竞争/恢复 viewport", () => {
 		expect(ctrl.selection).toEqual([0, 1, 2]);
 		const brokenToasts = opts.toasts.filter((t) => t.msg.includes("channel.pref.broken"));
 		expect(brokenToasts.length).toBe(1);
+	});
+});
+
+// --------------------------------------------------------------------------- //
+// F4 有效不可见：勾选但对合成贡献为 0 的通道，行内如实标注原因；
+// 不自动改色（OME 黑色 DAPI 保持 #000000，用户改色后即变可见）。
+// --------------------------------------------------------------------------- //
+describe("F4 invisibleReason 优先级（disabled > alpha_zero > empty_window > black_mapping）", () => {
+	const C = loadModule();
+	const ok = { black: 1, white: 100, status: "ok" };
+
+	it("各原因码与有效可见性", () => {
+		expect(C.invisibleReason({ color: "#000000", alpha: 0, intensity: ok }, false)).toBe("disabled");
+		expect(C.invisibleReason({ color: "#000000", alpha: 0, intensity: ok }, true)).toBe("alpha_zero");
+		expect(
+			C.invisibleReason({ color: "#000000", alpha: 1, intensity: { black: 10, white: 5, status: "ok" } }, true)
+		).toBe("empty_window");
+		expect(
+			C.invisibleReason({ color: "#000000", alpha: 1, intensity: { status: "empty_or_constant" } }, true)
+		).toBe("empty_window");
+		expect(C.invisibleReason({ color: "#000000", alpha: 1, intensity: ok }, true)).toBe("black_mapping");
+		expect(C.invisibleReason({ color: "#00FFFF", alpha: 1, intensity: ok }, true)).toBeNull();
+		expect(C.effectiveVisible({ color: "#000000", alpha: 1, intensity: ok }, true)).toBe(false);
+		expect(C.effectiveVisible({ color: "#00FFFF", alpha: 1, intensity: ok }, true)).toBe(true);
+	});
+});
+
+describe("F4 通道行：勾选但有效不可见 → ch-invisible 行 + 原因文案，不自动改色", () => {
+	const noopAdapter = {
+		tileUrl: () => "",
+		thumbnailUrl: () => "",
+		normalizeRenderContext: () =>
+			Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ render_context: {}, render_context_fingerprint: "fp", render_token: "t" }) }),
+	};
+
+	function rowOf(ctrl: ChannelController, index: number): FakeEl {
+		const row = (ctrl.panelEls!.rows as FakeEl[]).find((r) => r.dataset.index === String(index));
+		if (!row) throw new Error("row not found: " + index);
+		return row;
+	}
+	function childByClass(row: FakeEl, cls: string): FakeEl | undefined {
+		return row.children.find((c) => String(c.className).split(" ").includes(cls));
+	}
+
+	it("黑色 DAPI：行出现 black 原因；颜色样例仍 #000000，checkbox 仍勾选可用", () => {
+		const C = loadModule();
+		const opts = baseOpts(noopAdapter, fakeViewerWithHandlers());
+		const ctrl = C.createChannelController(opts) as ChannelController;
+		ctrl.handleInfo(
+			multichannelInfo(4, {
+				channels: [
+					channelEntry(0, { name: "DAPI", color: "#000000" }),
+					channelEntry(1),
+					channelEntry(2),
+					channelEntry(3),
+				],
+			}),
+			{ id: "slide_a.ome.tiff", scope: "demo" }
+		);
+		expect(ctrl.selection).toContain(0); // 勾选态
+		const row = rowOf(ctrl, 0);
+		expect(String(row.className)).toContain("ch-invisible");
+		const reason = childByClass(row, "ch-invisible-reason");
+		expect(reason!.textContent).toContain("channel.invisible.black");
+		// 不自动改色：显示色保持 OME 原 #000000
+		expect(childByClass(row, "ch-color")!.value).toBe("#000000");
+		// checkbox 仍可勾选（用户改色后变可见）：未禁用、保持勾选
+		const cb = row.children[0]!;
+		expect(cb.checked).toBe(true);
+		expect(cb.disabled).toBe(false);
+		// 正常通道行没有原因文案
+		expect(String(rowOf(ctrl, 1).className)).not.toContain("ch-invisible");
+	});
+
+	it("alpha=0：勾选行显示 alpha 原因；white<=black：显示 window 原因", () => {
+		const C = loadModule();
+		const opts = baseOpts(noopAdapter, fakeViewerWithHandlers());
+		const ctrl = C.createChannelController(opts) as ChannelController;
+		ctrl.handleInfo(
+			multichannelInfo(4, {
+				channels: [
+					channelEntry(0),
+					channelEntry(1, { alpha: 0 }),
+					channelEntry(2, { intensity: { black: 50, white: 50, status: "ok" } }),
+					channelEntry(3),
+				],
+			}),
+			{ id: "slide_a.ome.tiff", scope: "demo" }
+		);
+		// defaultContext 勾选 0..3
+		expect(childByClass(rowOf(ctrl, 1), "ch-invisible-reason")!.textContent).toContain(
+			"channel.invisible.alpha"
+		);
+		expect(childByClass(rowOf(ctrl, 2), "ch-invisible-reason")!.textContent).toContain(
+			"channel.invisible.window"
+		);
+	});
+
+	it("用户改色后原因消失（覆盖层 alpha 归 1、颜色非黑）", () => {
+		const C = loadModule();
+		const opts = baseOpts(noopAdapter, fakeViewerWithHandlers());
+		const ctrl = C.createChannelController(opts) as ChannelController;
+		ctrl.handleInfo(
+			multichannelInfo(2, {
+				channels: [channelEntry(0, { name: "DAPI", color: "#000000" }), channelEntry(1)],
+			}),
+			{ id: "slide_a.ome.tiff", scope: "demo" }
+		);
+		expect(String(rowOf(ctrl, 0).className)).toContain("ch-invisible");
+		ctrl.setChannelColor(0, "#3366CC");
+		const row = rowOf(ctrl, 0);
+		expect(String(row.className)).not.toContain("ch-invisible");
+		expect(childByClass(row, "ch-color")!.value).toBe("#3366CC");
+	});
+});
+
+describe("F4 AI 徽章：名称可用性与配色同步分开，不用 fingerprint 代替名称", () => {
+	it("namedCount>0 → names_ready；名称缺失（通道 N）→ names_unknown；同步态独立追加", () => {
+		const C = loadModule();
+		const opts = baseOpts(
+			{
+				tileUrl: () => "",
+				thumbnailUrl: () => "",
+				normalizeRenderContext: () => Promise.resolve({ ok: true, json: () => Promise.resolve({}) }),
+			},
+			fakeViewerWithHandlers()
+		);
+		const ctrl = C.createChannelController(opts) as ChannelController;
+		ctrl.handleInfo(multichannelInfo(2), { id: "slide_a.ome.tiff", scope: "demo" });
+		const badge = ctrl.panelEls!.aiBadge;
+		expect(badge.hidden).toBe(false);
+		expect(badge.textContent).toContain("channel.ai.names_ready");
+		// fingerprint 未知（未 setAiFingerprint）→ 不显示同步态，但名称行仍在
+		expect(badge.textContent).not.toContain("channel.ai.synced");
+		ctrl.setAiFingerprint(ctrl.getFingerprint());
+		expect(badge.textContent).toContain("channel.ai.names_ready");
+		expect(badge.textContent).toContain("channel.ai.synced");
+
+		// 名称缺失（服务端回填「通道 N」形态）→ names_unknown
+		ctrl.handleInfo(
+			multichannelInfo(2, {
+				channels: [channelEntry(0, { name: "通道 1" }), channelEntry(1, { name: "通道 2" })],
+			}),
+			{ id: "slide_a.ome.tiff", scope: "demo" }
+		);
+		expect(ctrl.panelEls!.aiBadge.textContent).toContain("channel.ai.names_unknown");
+	});
+});
+
+describe("F4 publishRenderState：namedCount / channelSemanticsReady", () => {
+	it("renderState 与 fingerprint 一起下发名称可用性；名称缺失时 ready=false 但指纹仍在", () => {
+		const { C, w } = loadModuleAndWindow();
+		const opts = baseOpts(
+			{
+				tileUrl: () => "",
+				thumbnailUrl: () => "",
+				normalizeRenderContext: () => Promise.resolve({ ok: true, json: () => Promise.resolve({}) }),
+			},
+			fakeViewerWithHandlers()
+		);
+		const ctrl = C.createChannelController(opts) as ChannelController;
+		ctrl.handleInfo(multichannelInfo(2), { id: "slide_a.ome.tiff", scope: "demo" });
+		let rs = w.PathTogether!.renderState;
+		expect(typeof rs!.renderFingerprint).toBe("string");
+		expect(rs!.namedCount).toBe(2);
+		expect(rs!.channelSemanticsReady).toBe(true);
+
+		ctrl.handleInfo(
+			multichannelInfo(2, {
+				channels: [channelEntry(0, { name: "通道 1" }), channelEntry(1, { name: "通道 2" })],
+			}),
+			{ id: "slide_a.ome.tiff", scope: "demo" }
+		);
+		rs = w.PathTogether!.renderState;
+		expect(rs!.namedCount).toBe(0);
+		expect(rs!.channelSemanticsReady).toBe(false);
+		expect(typeof rs!.renderFingerprint).toBe("string"); // 两者独立
 	});
 });
 

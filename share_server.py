@@ -313,11 +313,29 @@ def _render_error(e):
                                               "invalid_render_context")), status
 
 
-def _tile_fp_key(safe: str, generation, fp, level, x, y, fmt="jpeg"):
-    """瓦片缓存键（§7.3）：(safe, generation, fingerprint, level, x, y,
-    format, quality)——与主站同一形状。"""
+def _tile_fp_key(safe: str, generation, fp, level, x, y, fmt="jpeg",
+                 image_mode="native_rgb"):
+    """瓦片缓存键（§7.3 + F2）：(safe, generation, fingerprint, level, x, y,
+    format, quality, subsampling, encoder_version)——与主站同一形状。"""
+    quality, subsampling = slide_render.display_jpeg_params(image_mode)
     return (safe, generation, fp, int(level), int(x), int(y), fmt,
-            JPEG_QUALITY)
+            quality, subsampling, slide_render.TILE_ENCODER_VERSION)
+
+
+def _tile_cache_lookup(safe, generation, fp, level, x, y):
+    for mode in ("native_rgb", "multichannel"):
+        hit = _tile_cache_get(_tile_fp_key(
+            safe, generation, fp, level, x, y, image_mode=mode))
+        if hit is not None:
+            return hit
+    return None
+
+
+def _encode_tile_jpeg(tile, ctx):
+    image_mode = slide_render.image_mode_from_context(ctx)
+    quality = None if image_mode == "multichannel" else JPEG_QUALITY
+    return slide_render.encode_display_jpeg(
+        tile, image_mode=image_mode, quality=quality)[0], image_mode
 
 
 def _render_info_fields(safe: str) -> dict:
@@ -948,9 +966,8 @@ def share_slide_tile(token, name, level, x, y):
         if payload is not None and payload.get("slide") in ("", safe) \
                 and payload.get("rev") == _legacy_revision(safe):
             fp_pre = payload.get("fp")
-    key = _tile_fp_key(safe, gen, fp_pre, level, x, y) \
+    cached = _tile_cache_lookup(safe, gen, fp_pre, level, x, y) \
         if fp_pre is not None else None
-    cached = _tile_cache_get(key) if key is not None else None
     if cached is None:
         def _decode(pair):
             ctx, fp = _resolve_pair(pair, safe, token=render_tok, flag=flag)
@@ -964,22 +981,16 @@ def share_slide_tile(token, name, level, x, y):
                 tile = dzg.get_tile(level, (x, y))
             if tile.mode != "RGB":
                 tile = tile.convert("RGB")
-            return tile, fp
+            return tile, fp, ctx
 
         # 按代读取：读取前后签名变化则换代重读一次（SlideFileChanged → 503）
-        (tile, fp), tile_gen = slide_cache.read_stable(entry, _decode)
-        key = _tile_fp_key(safe, tile_gen, fp, level, x, y)
-
-        buf = io.BytesIO()
-        # baseline JPEG：省掉 progressive/optimize 的编码开销（快 3–5×）；
-        # 模糊→清晰的渐进预览已由查看器 base-thumb 底图层负责，瓦片无需 progressive
-        tile.save(
-            buf,
-            format="JPEG",
-            quality=JPEG_QUALITY,
-        )
-        _tile_cache_put(key, buf.getvalue())
-        buf.seek(0)
+        (tile, fp, ctx), tile_gen = slide_cache.read_stable(
+            entry, _decode)
+        tile_bytes, image_mode = _encode_tile_jpeg(tile, ctx)
+        key = _tile_fp_key(safe, tile_gen, fp, level, x, y,
+                           image_mode=image_mode)
+        _tile_cache_put(key, tile_bytes)
+        buf = io.BytesIO(tile_bytes)
     else:
         buf = io.BytesIO(cached)
 

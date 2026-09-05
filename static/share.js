@@ -144,6 +144,7 @@
     mppInput: $("mpp-input"),
     mppSetBtn: $("mpp-set-btn"),
     zoomBadge: $("zoom-badge"),
+    zoomNative: $("zoom-native"),
     roiLabel: $("roi-label"),
     panelToggle: $("roi-panel-toggle"),
     panel: $("roi-panel"),
@@ -479,6 +480,11 @@
     if (!viewer || !viewer.viewport) return;
     viewer.viewport.zoomBy(1 / 1.4);
     viewer.viewport.applyConstraints();
+  }
+  // 1:1 原始像素（F3）：口径唯一在 HP_ViewerCore.zoomToNative（viewer-core 必加载）
+  function zoomNative() {
+    var core = window.HP_ViewerCore;
+    if (core && core.zoomToNative) core.zoomToNative(viewer);
   }
   function rotate() {
     if (!viewer || !viewer.viewport) return;
@@ -2112,6 +2118,7 @@
   function bindEvents() {
     els.zoomIn.addEventListener("click", zoomIn);
     els.zoomOut.addEventListener("click", zoomOut);
+    if (els.zoomNative) els.zoomNative.addEventListener("click", zoomNative);
     els.rotateBtn.addEventListener("click", rotate);
     els.flipBtn.addEventListener("click", flip);
     els.resetBtn.addEventListener("click", reset);

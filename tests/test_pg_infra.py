@@ -199,6 +199,9 @@ def test_schema_migrations_recorded(conn):
         # slide_id 资产生代列 + backfill 当前同名元数据；授权校验要求
         # slide_id 匹配（删除/同名替换后旧授权失效）。
         "0035_slide_view_grants_asset_generation.sql",
+        # 升级 C（通用矩形 §6.4）追加 0036_share_rect_policy.sql：shares 补
+        # rect_policy 可空列（NULL/缺省 = preset_only，旧分享语义不放宽）。
+        "0036_share_rect_policy.sql",
     ]
 
 

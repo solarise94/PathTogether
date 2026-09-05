@@ -151,8 +151,11 @@ def test_user_cancel_own_and_foreign_session(fake_sidecar):
     share_store.claim_share(share["token"], userb["user_id"])
 
     fake = fake_sidecar
-    # sidecar：/session/sess-a 的 owner = A；cancel 透传。
-    fake.register_json("GET", "/session/sess-a", body={"session": {"owner": usera["user_id"]}})
+    # sidecar：/session/sess-a 的 owner = A；cancel 透传。升级 B：会话守卫
+    # 同时解析真实 slide（fake 记录与 sidecar SessionData 形态一致）。
+    fake.register_json("GET", "/session/sess-a",
+                       body={"session": {"owner": usera["user_id"],
+                                         "slide": slide}})
     fake.register_json("POST", "/cancel", body={"ok": True, "session_id": "sess-a"})
 
     cb = _login(_client(auth_enabled=True), userb)
@@ -170,10 +173,10 @@ def test_user_cancel_own_and_foreign_session(fake_sidecar):
     cancel_call = [c for c in fake.calls if c["path"] == "/cancel"][-1]
     assert cancel_call["body"]["session_id"] == "sess-a"
 
-    # owner 可取消任意 session。
+    # 升级 B：owner 取消他人 session → 403（守卫删除 owner 直接放行旁路）。
     co = _login(_client(auth_enabled=True), owner)
     r = co.post("/api/ai/cancel", json={"session_id": "sess-a"})
-    assert r.status_code == 200
+    assert r.status_code == 403
 
 
 def test_cancel_slide_branch_owner_only(fake_sidecar):
@@ -191,8 +194,11 @@ def test_cancel_slide_branch_owner_only(fake_sidecar):
     # B 能查看/协作该切片，但不能按 slide 取消。
     cb = _login(_client(auth_enabled=True), userb)
     assert cb.post("/api/ai/cancel", json={"slide": slide}).status_code == 403
-    # owner 可以。
+    # 升级 B：认证 owner 按 slide 取消需对该切片有当前收录（未添加拒绝）。
     co = _login(_client(auth_enabled=True), owner)
+    assert co.post("/api/ai/cancel", json={"slide": slide}).status_code == 403
+    share_store.grant_slide_view(owner["user_id"], slide,
+                                 slide_id=share_store.get_slide_id(slide))
     assert co.post("/api/ai/cancel", json={"slide": slide}).status_code == 200
     # AUTH_ENABLED=False（归一 owner，内部兼容）也可以。
     ci = _client(auth_enabled=False)

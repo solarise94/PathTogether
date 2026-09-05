@@ -80,6 +80,10 @@ def _setup_users():
     owner = user_store.create_user("owner@x.com", "ownerpass123456", role="owner")
     userA = user_store.create_user("a@x.com", "userApass123456", role="user")
     share_store.set_owner_user_id(owner["user_id"])
+    # 升级 B：owner 标注/AI 写权限按收录集合——已建文件的 demo.svs 登记
+    # 为 owner 归属（等价上传完成的真实状态）
+    if (Path(UPLOAD_DIR) / "demo.svs").is_file():
+        share_store.set_slide_meta("demo.svs", owner_user_id=owner["user_id"])
     return owner, userA
 
 
@@ -296,6 +300,8 @@ def test_ai_annotate_revision_conflict_409():
 def test_archived_project_write_protected():
     owner, userA = _setup_users()
     _touch()
+    # 升级 B：_touch 在 _setup_users 之后建文件——这里补登记 owner 归属
+    share_store.set_slide_meta("demo.svs", owner_user_id=owner["user_id"])
     c = _client()
     _login(c, "owner@x.com", "ownerpass123456")
     proj = share_store.create_project("P", slides=["demo.svs"], owner_user_id=owner["user_id"])

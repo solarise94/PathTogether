@@ -119,8 +119,8 @@ def test_maintenance_gate_off_runs_normally(monkeypatch):
     _setup_platform()
     owner, usera = _setup_users(1)
     fake = _install_fake(monkeypatch)
-    # 读隔离（review P0 2026-09-05）：ask/branch 走切片读闸，显式补 view 授权
-    share_store.grant_slide_view(owner["user_id"], "s.svs")
+    # 升级 B：切片登记 owner 归属（等价上传完成），四路由权限闸放行
+    share_store.set_slide_meta("s.svs", owner_user_id=owner["user_id"])
     fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
     fake.register("POST", "/ask", lambda b, q, h, k: _sse_ok())
     fake.register("POST", "/branch", lambda b, q, h, k: _sse_ok())
@@ -149,8 +149,8 @@ def test_maintenance_gate_blocks_four_routes(monkeypatch):
     """闸开：四路由在预备阶段（无 grant/预占/转发副作用）稳定 503。"""
     _setup_platform()
     owner, _u = _setup_users()
-    # 读隔离（review P0 2026-09-05）：ask/branch 走切片读闸，显式补 view 授权
-    share_store.grant_slide_view(owner["user_id"], "s.svs")
+    # 升级 B：切片登记 owner 归属（等价上传完成），四路由权限闸放行
+    share_store.set_slide_meta("s.svs", owner_user_id=owner["user_id"])
     fake = _install_fake(monkeypatch)
     c = _login(_client(), owner)
     monkeypatch.setattr(app_mod, "_ai_dispatch_maintenance_active",
@@ -199,6 +199,12 @@ def test_maintenance_gate_reads_real_setting(monkeypatch):
     fake = _install_fake(monkeypatch)
     fake.register("POST", "/run", lambda b, q, h, k: _sse_ok())
     c = _login(_client(), owner)
+    # 升级 B：切片登记 owner 归属（等价上传完成），内容权限闸放行
+    from pathlib import Path as _P
+    _sp = _P(app_mod.UPLOAD_DIR) / "s.svs"
+    _sp.parent.mkdir(parents=True, exist_ok=True)
+    _sp.write_bytes(b"svs-stub")
+    share_store.set_slide_meta("s.svs", owner_user_id=owner["user_id"])
     body = dict(_run_bodies()["/api/ai/run"], request_id="req_gate_real")
     # seed false → 放行
     r = c.post("/api/ai/run", json=body)

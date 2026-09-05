@@ -194,6 +194,11 @@ def test_schema_migrations_recorded(conn):
         # （owner 显式可见授权直授表：持久无 TTL，管理台 /api/admin/v1/
         # slides/* 为唯一出入口）。
         "0034_slide_view_grants.sql",
+        # 升级 B（owner 工作区收录 × R7 资产生命周期）追加
+        # 0035_slide_view_grants_asset_generation.sql：slide_view_grants 补
+        # slide_id 资产生代列 + backfill 当前同名元数据；授权校验要求
+        # slide_id 匹配（删除/同名替换后旧授权失效）。
+        "0035_slide_view_grants_asset_generation.sql",
     ]
 
 

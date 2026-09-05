@@ -75,6 +75,10 @@ def _setup_users():
     owner = user_store.create_user("owner@x.com", "ownerpass123456", role="owner")
     userA = user_store.create_user("a@x.com", "userApass123456", role="user")
     share_store.set_owner_user_id(owner["user_id"])
+    # 升级 B：标注写权限按收录集合（本人 ∪ 显式添加）——已建文件的测试切片
+    # 登记为 owner 归属（等价上传完成的真实状态）
+    if (Path(UPLOAD_DIR) / "demo.svs").is_file():
+        share_store.set_slide_meta("demo.svs", owner_user_id=owner["user_id"])
     return owner, userA
 
 

@@ -329,9 +329,10 @@ def test_sessions_user_filter_owner_all():
     o = user_store.create_user("o@x.com", "password1password1", role="owner")
     _touch("s.svs")
     _own("s.svs", u["user_id"])
-    # 读隔离（review P0 2026-09-05）：owner 不再默认可见他人切片——本用例
-    # 关注 sessions 过滤参数注入，显式补 view 授权让 owner 过切片读闸
-    share_store.grant_slide_view(o["user_id"], "s.svs")
+    # 读隔离（review P0 2026-09-05）× 升级 B：owner 不默认可见他人切片——
+    # 本用例关注 sessions 过滤参数注入，经管理口径补收录（绑定资产生代）
+    share_store.grant_slide_view(o["user_id"], "s.svs",
+                                 slide_id=share_store.get_slide_id("s.svs"))
 
     fake = _install_fake()
 
@@ -346,12 +347,13 @@ def test_sessions_user_filter_owner_all():
     cu.get("/api/ai/sessions?slide=s.svs")
     assert fake.calls and fake.calls[-1]["params"] == {"slide": "s.svs", "owner": u["user_id"]}
 
-    # owner → 不过滤（只传 slide）
+    # owner → 升级 B：同样按 principal 过滤（不开放他人会话目录）
     co = _client()
     _login(co, "owner", o["user_id"])
     fake.calls.clear()
     co.get("/api/ai/sessions?slide=s.svs")
-    assert fake.calls and fake.calls[-1]["params"] == {"slide": "s.svs"}
+    assert fake.calls and fake.calls[-1]["params"] == {"slide": "s.svs",
+                                                       "owner": o["user_id"]}
 
 def test_session_detail_owner_check():
     _reset_config()
@@ -361,21 +363,29 @@ def test_session_detail_owner_check():
     fake = _install_fake()
 
     def detail_handler(body, query, headers, kwargs):
-        return FakeResponse(200, json.dumps({"session": {"id": "s-a", "owner": ua["user_id"]}}))
+        return FakeResponse(200, json.dumps({"session": {
+            "id": "s-a", "owner": ua["user_id"], "slide": "detail.svs"}}))
     fake.register("GET", "/session/s-a", detail_handler)
+    _touch("detail.svs")
+    _own("detail.svs", ua["user_id"])
 
     # userB 访问 userA 的会话 → 403
     cb = _client()
     _login(cb, "user", ub["user_id"])
     r = cb.get("/api/ai/session/s-a")
     assert r.status_code == 403
-    # owner 访问任意会话 → 放行（透传）
+    # 升级 B：owner 访问他人会话 → 403（添加切片≠取得对方聊天记录）
     o = user_store.create_user("o@x.com", "password1password1", role="owner")
     co = _client()
     _login(co, "owner", o["user_id"])
     r2 = co.get("/api/ai/session/s-a")
-    assert r2.status_code == 200
-    assert r2.get_json()["session"]["id"] == "s-a"
+    assert r2.status_code == 403
+    # 属主本人 → 200（透传）
+    ca = _client()
+    _login(ca, "user", ua["user_id"])
+    r3 = ca.get("/api/ai/session/s-a")
+    assert r3.status_code == 200
+    assert r3.get_json()["session"]["id"] == "s-a"
 
 # =========================================================================== #
 # 6. AUTH_ENABLED=False 全兼容
@@ -404,14 +414,15 @@ def test_no_auth_full_compat():
     r = c.get("/api/ai/sessions?slide=x.svs")
     assert r.status_code == 200
 
-def test_owner_run_does_not_inject_session_owner():
-    """role=owner 起跑不注入 session_owner（owner 全量可见、可续跑任意会话，
-    sidecar acquire 归属守卫对无 owner 注入的 run 不生效）；owner 名下会话保持
-    无 owner 字段，user 的 ?owner= 过滤自然看不到。"""
+def test_owner_run_injects_real_session_owner():
+    """升级 B R6e：认证 owner 起跑同样注入 session_owner=<真实 uid>（会话
+    principal 与账号绑定；空 principal 仅保留给 AUTH_ENABLED=False 本地模式
+    与历史会话）。切片归属 owner（上传登记），归属判定天然通过。"""
     _reset_config()
     _setup_platform()
     o = user_store.create_user("o2@x.com", "password1password1", role="owner")
     _touch("ownr.svs")
+    _own("ownr.svs", o["user_id"])
     fake = _install_fake()
 
     def handler(body, query, headers, kwargs):
@@ -423,7 +434,7 @@ def test_owner_run_does_not_inject_session_owner():
     assert r.status_code == 200
     sent = fake.calls[-1]["body"] or {}
     cfg = sent.get("config") or {}
-    assert "session_owner" not in cfg
+    assert cfg.get("session_owner") == o["user_id"]
 
 def test_user_put_loopback_base_url_rejected():
     """user PUT 凭据字段整包 400（不再进入 SSRF 校验——无写入通道）。"""

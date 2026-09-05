@@ -2467,7 +2467,34 @@ button {
   animation: ai-fade-in 0.25s ease;
   user-select: none;
 }
-.ai-trace-empty { color: var(--text-3); font-size: 13px; text-align: center; padding: 28px 8px; }
+/* AI 空状态（2026-09-05 人性化）：标题 + 引导语 + 建议提示条 */
+.ai-trace-empty { color: var(--text-3); text-align: center; padding: 26px 10px 20px; }
+.ai-empty-title { color: var(--text); font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+.ai-empty-sub { font-size: 12px; line-height: 1.6; margin: 0 auto 14px; max-width: 240px; }
+.ai-suggest-row { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+.ai-suggest-chip {
+  border: 1px solid var(--separator-strong);
+  background: var(--toolbar-bg);
+  color: var(--text-2);
+  font-size: 12px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.ai-suggest-chip:hover { border-color: var(--accent); color: var(--accent); }
+.ai-suggest-chip:active { background: var(--accent-fill); }
+
+/* AI 配色徽章（插件注入 #ai-render-sync）：低调信息条；仅「未同步」警示着色 */
+.ai-render-sync {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-3);
+  padding: 5px 12px 4px;
+  border-bottom: 1px dashed var(--separator);
+}
+.ai-render-sync.is-locked { color: var(--text-2); }
+.ai-render-sync.is-unsynced { color: var(--danger); border-bottom-color: var(--danger); }
 .ai-trace-row {
   font-size: 12px;
   line-height: 1.5;

@@ -4,6 +4,22 @@
 (function () {
   "use strict";
 
+  // AI 空状态建议提示条：点击只填入输入框（不自动发送——用户可改写后再发）。
+  // 委托绑定覆盖模板初始空状态与插件重渲的空状态两种来源。
+  document.addEventListener("click", function (e) {
+    var chip = e.target && e.target.closest ? e.target.closest(".ai-suggest-chip") : null;
+    if (!chip) return;
+    var key = chip.getAttribute("data-task-key");
+    var ta = document.getElementById("ai-task");
+    if (!ta || !key) return;
+    var v = t(key);
+    if (v && v !== key) {
+      ta.value = v;
+      ta.focus();
+      try { ta.dispatchEvent(new Event("input", { bubbles: true })); } catch (err) {}
+    }
+  });
+
   // 中英双语：i18n.js 在本脚本之前加载，提供 window.HP_I18N.t
   function t(key, vars) {
     return window.HP_I18N ? window.HP_I18N.t(key, vars) : key;

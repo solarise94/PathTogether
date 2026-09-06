@@ -239,6 +239,64 @@
     })();
   </script>
 
+  {% elif mode == "email_verify" %}
+  <!-- I 线（设计文档第 8 节）：邮箱优先——先验证邮箱，激活另需邀请码。
+       不填邀请码、不发额度；J：不再要求独立登录账号/显示名（验证成功后
+       以规范化邮箱为唯一用户名）。 -->
+  <main class="card">
+    <span class="badge">邮箱注册</span>
+    <h1 class="title">验证邮箱开始注册</h1>
+    <p class="desc">填写你的邮箱，我们会发送一封验证邮件（30 分钟内有效，链接只能使用一次）。<strong>验证邮箱后还需邀请码激活</strong>才能使用个人工作区；验证邮箱本身不授予任何工作区、AI 或额度权限。</p>
+
+    {% if error %}
+    <div class="error-box" role="alert">{{ error }}</div>
+    {% endif %}
+
+    <form method="POST" action="/register" id="email-verify-form" autocomplete="on">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+      <div class="field">
+        <label for="email">邮箱地址</label>
+        <input id="email" name="email" type="email" required maxlength="254"
+               autocomplete="email" spellcheck="false" autofocus
+               placeholder="you@example.com" />
+        <p class="hint">验证成功后，该邮箱将作为你的登录账号（唯一用户名）。</p>
+      </div>
+      <button class="btn primary" type="submit" id="email-verify-submit">发送验证邮件</button>
+    </form>
+
+    <a class="alt-link" href="/login">返回登录</a>
+    <p class="footer">仅用于研究、教学和软件演示，不用于临床诊断。</p>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+      var form = document.getElementById("email-verify-form");
+      var btn = document.getElementById("email-verify-submit");
+      if (form && btn) {
+        form.addEventListener("submit", function () {
+          if (form.dataset.submitting === "1") { return; }
+          form.dataset.submitting = "1";
+          btn.disabled = true;
+          btn.textContent = "发送中…";
+        });
+      }
+    })();
+  </script>
+
+  {% elif mode == "email_verify_done" %}
+  <!-- 统一完成页：已存在/未知/超限邮箱一律同一文案（无枚举信号） -->
+  <main class="card">
+    <span class="badge">邮箱注册</span>
+    <h1 class="title">请查收验证邮件</h1>
+    <p class="desc">如果该邮箱可用，验证邮件已发送，请在 30 分钟内点击邮件中的链接完成验证。没有收到？请稍后重试或检查垃圾邮件。<strong>验证邮箱后还需邀请码激活</strong>才能使用个人工作区。</p>
+    <div class="actions">
+      <a class="btn secondary" href="/register">重新填写邮箱</a>
+      <a class="btn secondary" href="/login">返回登录</a>
+    </div>
+    <p class="footer">仅用于研究、教学和软件演示，不用于临床诊断。</p>
+  </main>
+
   {% else %}
   <main class="card">
     <span class="badge" data-i18n="register.badge">邀请注册</span>

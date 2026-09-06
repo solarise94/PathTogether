@@ -204,11 +204,15 @@ def test_users_pagination_search_and_filters():
     r = c.get("/api/admin/v1/users?q=member 2").get_json()
     assert [item["display_name"] for item in r["items"]] == ["Member 2"]
     r = c.get("/api/admin/v1/users?q=u3@x.com").get_json()
-    # 命中按原始 login_id，但输出只给掩码
+    # 命中按原始 login_id；展示 J（owner 管理台）：主列=完整邮箱用户名
+    # （无已验证 email 时用 login_id），掩码键保留
     assert len(r["items"]) == 1
     assert r["items"][0]["login_id_masked"] == "u***@x.com"
+    assert r["items"][0]["identity"] == "u3@x.com"
+    assert r["items"][0]["identity_source"] == "login_id"
+    assert r["items"][0]["email"] is None
     raw = json.dumps(r)
-    assert "u3@x.com" not in raw  # 原始账号绝不回显
+    assert "password_hash" not in raw  # 凭据材料绝不回显（J：身份主列明文）
 
     # enabled / ai_access 筛选
     target = user_store.get_user_by_login_id("u1@x.com")

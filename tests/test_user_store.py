@@ -144,7 +144,8 @@ def test_create_bootstrap_owner_empty_store():
     check("首建 owner 返回 role=owner", owner.get("role") == "owner")
     check("login_id trim+lower 规范化",
           owner["login_id"] == "browser_admin")
-    check("owner dict 无 email 键（批次 C）", "email" not in owner)
+    check("owner dict email=None（无可信已验证邮箱；0037 J）",
+          owner.get("email") is None)
     check("display_name 同 login_id", owner["display_name"] == "browser_admin")
     check("含 password_hash", bool(owner.get("password_hash")))
     check("auth_version=1", owner.get("auth_version") == 1)
@@ -320,8 +321,8 @@ def test_admin_users_owner_vs_user(monkeypatch):
     check("owner 创建用户 200", r2.status_code == 200)
     check("新用户 role=user",
           (json.loads(r2.data).get("user") or {}).get("role") == "user")
-    check("创建响应无 email 键（批次 C）",
-          "email" not in json.loads(r2.data))
+    check("创建响应 user.email=None（未验证；0037 J）",
+          (json.loads(r2.data).get("user") or {}).get("email") is None)
     # 冲突
     r3 = client.post("/api/admin/v1/users", json={"login_id": "u@x.com", "password": PW2})
     check("创建冲突 409", r3.status_code == 409, "got %s" % r3.status_code)

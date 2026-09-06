@@ -81,7 +81,7 @@ def _open_route_gate(monkeypatch):
     """json 后端下打开路由层 invite_only 闸（仅 patch 前置条件判定函数）。"""
     _satisfy_preconditions(monkeypatch)
     monkeypatch.setattr(app_mod, "_registration_precondition_failures",
-                        lambda environ=None: [])
+                        lambda *a, **k: [])
 
 
 def _mk_owner():
@@ -225,7 +225,8 @@ def test_put_registration_mode_invite_only_with_preconditions(monkeypatch):
     g = client.get("/api/admin/v1/settings")
     assert g.status_code == 200
     body = g.get_json()["registration"]
-    assert body["supported_modes"] == ["closed", "invite_only"]
+    assert body["supported_modes"] == ["closed", "invite_only",
+                                        "email_verify_invite_activation"]
 
 
 def test_register_post_csrf_missing_400(monkeypatch):

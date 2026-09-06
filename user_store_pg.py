@@ -186,15 +186,22 @@ def _user_ai_config(user: dict) -> dict:
 # 公共 SELECT 列（created_at 转 epoch 浮点与 json 形状对齐；ai_access 为 P0-B
 # §3.7 新增列：受邀用户默认 FALSE，存量默认 TRUE，见 0012 迁移；auth_version 为
 # 0015 新增的 session 凭据版本列，读路径一律带出供 session 比对）。
+# 0037（I+J 身份线）：activation_state/activation_source 与 email 三元组随读
+# 路径带出（展示 J：主列=邮箱或 login_id；存量 backfill=active/legacy，
+# email 列对存量保持 NULL——无可信已验证邮箱绝不伪造）。
 _SEL_HASH = (
     "user_id, login_id, display_name, password_hash, role, "
     "extract(epoch from created_at)::float8 AS created_at, disabled, ai_config, "
-    "ai_access, auth_version"
+    "ai_access, auth_version, activation_state, activation_source, "
+    "email, email_normalized, "
+    "extract(epoch from email_verified_at)::float8 AS email_verified_at"
 )
 _SEL_PUBLIC = (
     "user_id, login_id, display_name, role, "
     "extract(epoch from created_at)::float8 AS created_at, disabled, ai_config, "
-    "ai_access, auth_version"
+    "ai_access, auth_version, activation_state, activation_source, "
+    "email, email_normalized, "
+    "extract(epoch from email_verified_at)::float8 AS email_verified_at"
 )
 
 
@@ -256,12 +263,17 @@ def _insert_user_tx(cur, uid, norm_login, name, password, role, now,
     共用（后者要求 user 行与总额度/audit 同一事务）。ai_access 缺省
     True 与 users.ai_access 列默认一致（保持 create_user 既有行为；邀请
     兑换路径经 registration_store 的显式模板值，不经本函数）。
+    0037：owner/admin 建号直接 active（activation_source='admin'）；
+    注册新形态（email_verify_invite_activation）经 registration_store
+    的 pending_activation 插入原语，不经本函数。
     """
     cur.execute(
         "INSERT INTO users "
         "(user_id, login_id, display_name, password_hash, "
-        " role, created_at, disabled, ai_access) "
-        "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), FALSE, %s) "
+        " role, created_at, disabled, ai_access, "
+        " activation_state, activation_source, activation_updated_at) "
+        "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), FALSE, %s, "
+        " 'active', 'admin', now()) "
         "RETURNING " + _SEL_PUBLIC,
         (uid, norm_login, name, generate_password_hash(password), role,
          now, bool(ai_access)),
@@ -764,8 +776,11 @@ def create_bootstrap_owner(login_id, password):
                     cur.execute(
                         "INSERT INTO users "
                         "(user_id, login_id, display_name, password_hash, "
-                        " role, created_at, disabled) "
-                        "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), FALSE) "
+                        " role, created_at, disabled, "
+                        " activation_state, activation_source, "
+                        " activation_updated_at) "
+                        "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), FALSE, "
+                        " 'active', 'admin', now()) "
                         "RETURNING " + _SEL_HASH,
                         (uid, norm_login, norm_login,
                          generate_password_hash(password), ROLE_OWNER, now),

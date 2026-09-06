@@ -64,7 +64,26 @@
     billProviderBalance: null,
     billProviderBalanceError: null,
     billDemo: null,
+    // 展示 J：user_id → 完整邮箱用户名（email 优先，否则 login_id）的
+    // 内存映射——用量/账单/额度等以 user_id 出线的表格统一换算身份主列
+    identityById: {},
   };
+
+  // 身份主列 helper（J）：user 行或 user_id → 完整邮箱用户名。
+  // 不再用 display_name 冒充身份；解析不到回退 user_id（次级技术详情）。
+  function identityText(u) {
+    if (!u) return "";
+    if (typeof u === "string") return state.identityById[u] || u;
+    return u.identity || u.email || u.login_id || u.user_id || "";
+  }
+  function rememberIdentities(items) {
+    (items || []).forEach(function (u) {
+      if (u && u.user_id) {
+        state.identityById[String(u.user_id)] =
+          u.identity || u.email || u.login_id || String(u.user_id);
+      }
+    });
+  }
 
   // 深链起始页（PR5 /admin#invites 兼容）：宿主把父页 hash 透传到本 iframe
   // 自身 URL；只接受已知页面 slug，其余回概览。
@@ -885,6 +904,7 @@
       if (seq !== state.listSeq) return; // 页面已切换/新筛选已发起：晚到响应丢弃
       hideError();
       var items = res.items || [];
+      rememberIdentities(items);
       renderUsers(items, append);
       if (!append && !items.length) {
         var f2 = state.filters.users || {};
@@ -1021,15 +1041,22 @@
     if (!append) tbody.textContent = "";
     items.forEach(function (u) {
       var tr = document.createElement("tr");
-      tr.appendChild(td(u.display_name));
+      // 展示 J：主列 = 完整邮箱用户名（email 优先，否则 login_id；不再用
+      // display_name 冒充身份）。user_id 为次级技术详情（drawer 内展示）。
+      tr.appendChild(td(identityText(u)));
       tr.appendChild(td(u.role, "adm-col-secondary"));
       // 状态 + AI（P0-2）：桌面一列；≤767px 状态格内堆叠 AI 补行
       var statusCell = document.createElement("td");
       statusCell.appendChild(document.createTextNode(u.enabled ? "启用" : "禁用"));
-      var aiStack = document.createElement("div");
-      aiStack.className = "adm-stack-mobile";
-      aiStack.textContent = u.ai_access ? "AI" : "无 AI";
-      statusCell.appendChild(aiStack);
+      var stateStack = document.createElement("div");
+      stateStack.className = "adm-stack-mobile";
+      var activationText = u.activation_state === "pending_activation"
+        ? "待激活" : (u.activation_state === "email_pending" ? "待验证" : "");
+      if (activationText) stateStack.textContent = activationText;
+      else {
+        stateStack.textContent = u.ai_access ? "AI" : "无 AI";
+      }
+      statusCell.appendChild(stateStack);
       tr.appendChild(statusCell);
       tr.appendChild(renderRemainCell(u));
       var cell = document.createElement("td");
@@ -1138,7 +1165,7 @@
       }
       clearInvalid(input);
       askConfirm($("adm-drawer-confirm"),
-        "确认把 " + (u.display_name || u.user_id) + " 的总额度设为 " +
+        "确认把 " + identityText(u) + " 的总额度设为 " +
         fmtCny(limit) + "（" + limit + " nano）？" +
         "这是绝对总上限：已用/预占不清零、不重置；若低于已用+预占，剩余将显示 0.00 并按原始值判定超额。",
         function () {
@@ -1277,7 +1304,7 @@
       var newRemaining = (BigInt(limit) - BigInt(w.spent_nano_cny) -
                           BigInt(w.reserved_nano_cny)).toString();
       askConfirm($("adm-drawer-confirm"),
-        "确认调整 " + (u.display_name || u.user_id) + " 的当前窗口额度？" +
+        "确认调整 " + identityText(u) + " 的当前窗口额度？" +
         "当前额度 " + fmtCny(w.limit_nano_snapshot) + " → 新额度 " + fmtCny(limit) +
         "（" + limit + " nano）。影响：已消费 " + fmtCny(w.spent_nano_cny) +
         " / 预占 " + fmtCny(w.reserved_nano_cny) + " 不回退；新剩余 " +
@@ -1386,10 +1413,15 @@
     drawerUser = u;
     drawerTrigger = trigger || null;
     els.drawerBody.textContent = "";
-    // 身份字段（§4.3 主视图保留）
+    // 身份字段（展示 J：主列=完整邮箱用户名；user_id/display_name 为次级
+    // 技术详情）
     var dl = document.createElement("dl");
     dl.className = "adm-kv";
+    kvRow(dl, "身份（邮箱用户名）", identityText(u));
     kvRow(dl, "user_id", u.user_id);
+    kvRow(dl, "已验证邮箱", u.email_verified ? (u.email || "是") : "无");
+    kvRow(dl, "激活状态", u.activation_state === "pending_activation"
+      ? "待激活" : (u.activation_state === "email_pending" ? "待验证" : "已激活"));
     kvRow(dl, "显示名", u.display_name);
     kvRow(dl, "登录账号（掩码）", u.login_id_masked);
     kvRow(dl, "角色", u.role);
@@ -1467,7 +1499,7 @@
     }, "secondary"));
     wrap.appendChild(actionBtn("身份预览", function () {
       askConfirm($("adm-drawer-confirm"),
-        "确认以 " + (u.display_name || u.user_id) + " 的身份进入只读预览？" +
+        "确认以 " + identityText(u) + " 的身份进入只读预览？" +
         "预览期间以该用户视角使用 Viewer；管理写操作仍要求真实 owner（被拒绝）。",
         function () { startPreviewFor(u); });
     }, "secondary"));
@@ -1481,7 +1513,7 @@
       zone.appendChild(actionBtn(u.enabled ? "禁用" : "启用", function () {
         if (u.enabled) {
           askConfirm($("adm-drawer-confirm"),
-            "确认禁用用户 " + (u.display_name || u.user_id) + "？其全部会话将立即失效。",
+            "确认禁用用户 " + identityText(u) + "？其全部会话将立即失效。",
             function () { setUserEnabled(u, false); });
         } else {
           setUserEnabled(u, true);
@@ -1552,7 +1584,7 @@
     var label = document.createElement("label");
     label.className = "adm-field-label";
     label.htmlFor = "adm-reset-password-input";
-    label.textContent = "为 " + (u.display_name || u.user_id) +
+    label.textContent = "为 " + identityText(u) +
       " 设置新密码（必填，≥15 位；确认后该用户全部会话立即退出）";
     var input = document.createElement("input");
     input.type = "password";
@@ -1708,7 +1740,8 @@
       invites.forEach(function (inv) {
         var tr = document.createElement("tr");
         tr.appendChild(td(inv.invite_id));
-        tr.appendChild(td(inv.login_id_masked || "（不绑定）"));
+        tr.appendChild(td(inv.bound_identity || inv.login_id_masked
+                  || "（不绑定）"));
         tr.appendChild(td(inv.ai_access ? "开" : "关"));
         // 初始总额度模板（Batch B/D1）：null=兑换继承默认；两位小数 CNY
         tr.appendChild(td(inv.total_limit_nano_cny === null ||
@@ -2543,7 +2576,8 @@
     items.forEach(function (e) {
       var tr = document.createElement("tr");
       tr.appendChild(td(fmtTs(e.occurred_at), "adm-cell-time"));
-      tr.appendChild(td(e.user_id || (e.subject_type === "demo" ? "Demo" : e.subject_type)));
+      tr.appendChild(td(e.user_id ? identityText(String(e.user_id))
+        : (e.subject_type === "demo" ? "Demo" : e.subject_type)));
       tr.appendChild(td(e.model));
       tr.appendChild(td(e.status === "priced" ? "已计价" : "未计价"));
       tr.appendChild(td(fmtNum((Number(e.cache_hit_input_tokens) || 0) +
@@ -2559,7 +2593,7 @@
         toggleDetailRow(tr, function () {
           return detailDl([
             ["event_id", e.event_id],
-            ["主体", e.subject_type + (e.user_id ? " · " + e.user_id : "")],
+            ["主体", e.subject_type + (e.user_id ? " · " + identityText(String(e.user_id)) : "")],
             ["provider 成本", e.provider_cost_nano_cny === null ||
               e.provider_cost_nano_cny === undefined
               ? "—" : fmtCny(e.provider_cost_nano_cny)],
@@ -2592,7 +2626,8 @@
       (res.items || []).forEach(function (e) {
         var tr = document.createElement("tr");
         tr.appendChild(td(fmtTs(e.created_at), "adm-cell-time"));
-        tr.appendChild(td(e.user_id || e.account_id));
+        tr.appendChild(td(e.user_id ? identityText(String(e.user_id))
+                      : (e.account_id || "—")));
         var kindCell = td(e.kind);
         // PR6 模拟扣费条目：metadata.simulated=true → kind 旁加「模拟」徽标
         if (e.metadata && e.metadata.simulated === true) {
@@ -2777,7 +2812,9 @@
       auditItems.forEach(function (e) {
         var tr = document.createElement("tr");
         tr.appendChild(td(fmtTs(e.ts), "adm-cell-time"));
-        tr.appendChild(td((e.actor_role || "") + (e.actor_user_id ? ("·" + e.actor_user_id) : "")));
+        tr.appendChild(td((e.actor_role || "")
+          + (e.actor_identity ? ("·" + e.actor_identity)
+            : (e.actor_user_id ? ("·" + e.actor_user_id) : ""))));
         tr.appendChild(td(e.action));
         tr.appendChild(td((e.target_type || "") + (e.target_id ? ("·" + e.target_id) : "")));
         tr.appendChild(auditDetailCell(e));
@@ -2822,10 +2859,11 @@
 
   function ownerCellText(item) {
     if (!item.owner_user_id) return "无主";
-    var name = item.owner_display_name;
+    // 展示 J：主列 = 完整邮箱用户名（owner_identity：email 优先，否则
+    // login_id）；display_name 不再冒充身份，user_id 为次级技术详情。
+    if (item.owner_identity) return item.owner_identity;
     var masked = item.owner_login_id_masked;
-    if (name && masked) return name + "（" + masked + "）";
-    return name || masked || item.owner_user_id;
+    return masked || item.owner_user_id;
   }
 
   function grantStatusText(item) {

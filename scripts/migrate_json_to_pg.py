@@ -358,11 +358,16 @@ def _import_users(cur, users):
             continue
         login_id = _login_id_of(u) or uid
         created = u.get("created_at") or time.time()
+        # 0037（I+J）：迁移导入的存量账号 backfill 口径——activation_state
+        # 走列默认 active，来源显式标 legacy；email 三列保持 NULL（无可信
+        # 已验证邮箱，绝不把带 @ 的 login_id 伪装成已验证）。
         cur.execute(
             "INSERT INTO users "
             "(user_id, login_id, display_name, password_hash, role, "
-            " created_at, disabled, ai_config) "
-            "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), %s, %s) "
+            " created_at, disabled, ai_config, "
+            " activation_state, activation_source, activation_updated_at) "
+            "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), %s, %s, "
+            " 'active', 'legacy', now()) "
             "ON CONFLICT (user_id) DO UPDATE SET "
             " login_id=EXCLUDED.login_id, display_name=EXCLUDED.display_name, "
             " password_hash=EXCLUDED.password_hash, role=EXCLUDED.role, "

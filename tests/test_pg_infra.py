@@ -202,6 +202,10 @@ def test_schema_migrations_recorded(conn):
         # 升级 C（通用矩形 §6.4）追加 0036_share_rect_policy.sql：shares 补
         # rect_policy 可空列（NULL/缺省 = preset_only，旧分享语义不放宽）。
         "0036_share_rect_policy.sql",
+        # I+J 身份线（设计文档第 8 节）：users 激活状态机/邮箱三元组 + 部分
+        # 唯一索引（pending+active）+ registration_mail_jobs 验证邮件队列
+        # （存量 backfill active/legacy；不回填 @ login_id 为已验证邮箱）。
+        "0037_identity_activation_email.sql",
     ]
 
 
@@ -353,7 +357,10 @@ def test_migration_0016_renamed_index_expression_follows_column(conn):
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_name='users'")
         cols = {r[0] for r in cur.fetchall()}
-        assert "login_id" in cols and "email" not in cols
+        # 0016：登录标识物理列为 login_id。0037（I+J 身份线）新增的 users.email
+        # 是**独立的可信已验证邮箱列**（email_verified_at 门控），不是 0016 时代
+        # 那个「登录标识别名」——两者语义不同，判定只锁 login_id 存在。
+        assert "login_id" in cols
         cur.execute(
             "SELECT indexdef FROM pg_indexes "
             "WHERE indexname='users_login_id_ci_key'")

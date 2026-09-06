@@ -167,9 +167,9 @@
             <p class="adm-note">初始密码 ≥15 位，由 owner 线下告知用户；经本表创建的账户与旧入口语义一致（不会创建 owner）。初始总额度留空 = 继承全局默认；填 CNY 值则与建号同一事务创建该用户的一次性总额度。</p>
             <div class="adm-form adm-form--grid" id="adm-users-create-form">
               <div class="adm-field">
-                <label class="adm-field-label" for="adm-users-new-login">登录账号（必填）</label>
-                <input type="text" id="adm-users-new-login" placeholder="如 user01" maxlength="120" autocomplete="off" aria-describedby="adm-users-new-login-help">
-                <small class="adm-field-help" id="adm-users-new-login-help">用户登录 ID，创建后不可更改</small>
+                <label class="adm-field-label" for="adm-users-new-login">邮箱用户名（必填）</label>
+                <input type="text" id="adm-users-new-login" placeholder="如 user@example.com" maxlength="120" autocomplete="off" aria-describedby="adm-users-new-login-help">
+                <small class="adm-field-help" id="adm-users-new-login-help">规范化邮箱即唯一用户名；创建后改绑需重新验证</small>
               </div>
               <div class="adm-field">
                 <label class="adm-field-label" for="adm-users-new-display">显示名（可选）</label>
@@ -202,7 +202,7 @@
             <div class="adm-filters" id="adm-users-filters">
               <div class="adm-field">
                 <label class="adm-field-label" for="adm-users-q">搜索用户</label>
-                <input type="search" id="adm-users-q" placeholder="login ID / 显示名" maxlength="128">
+                <input type="search" id="adm-users-q" placeholder="邮箱用户名" maxlength="128">
               </div>
               <div class="adm-field">
                 <label class="adm-field-label" for="adm-users-enabled">启用状态</label>
@@ -228,7 +228,7 @@
               <table class="adm-table adm-table--users" id="adm-users-table">
                 <thead>
                   <tr>
-                    <th>显示名</th>
+                    <th>邮箱用户名</th>
                     <th class="adm-col-secondary">角色</th>
                     <th>状态</th>
                     <th>额度剩余</th>

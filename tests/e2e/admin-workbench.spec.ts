@@ -146,14 +146,14 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		const frame = page.frameLocator("#admin-plugin-frame");
 		await frame.locator('.adm-nav-btn[data-page="users"]').click();
 		await expect(frame.locator("#adm-users-tbody")).toContainText(
-			"E2E 普通用户", { timeout: 10_000 });
+			"e2e-user@pt.test", { timeout: 10_000 });
 		// 关键字段：角色（次要列）、启用状态；掩码登录账号已收进抽屉（§4.3）
 		await expect(frame.locator("#adm-users-tbody")).toContainText("user");
 		await expect(frame.locator("#adm-users-tbody")).toContainText("启用");
 		await expect(frame.locator("#adm-users-table")).toContainText("额度剩余");
 		// r3-wave2 单轨：user 行恒 total 形态——抽屉主视图是总额度字段，
 		// 不出现 window 形态（本月额度）与已删的「切换前」过渡文案
-		const userRow = frame.locator("#adm-users-tbody tr", { hasText: "E2E 普通用户" });
+		const userRow = frame.locator("#adm-users-tbody tr", { hasText: "e2e-user@pt.test" });
 		await userRow.locator("button", { hasText: "详情" }).click();
 		await expect(frame.locator("#adm-user-drawer")).toBeVisible();
 		await expect(frame.locator("#adm-drawer-body")).toContainText("总额度");
@@ -352,7 +352,7 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		const frame = page.frameLocator("#admin-plugin-frame");
 		await frame.locator('.adm-nav-btn[data-page="users"]').click();
 		await expect(frame.locator("#adm-users-tbody"))
-			.toContainText("E2E 普通用户", { timeout: 10_000 });
+			.toContainText("e2e-user@pt.test", { timeout: 10_000 });
 		// §4.4：创建用户默认折叠——入口 summary 可见、表单隐藏，展开后填写
 		const createBox = frame.locator("#adm-users-create-box");
 		await expect(createBox.locator("summary").first()).toBeVisible();
@@ -372,7 +372,7 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		await expect(frame.locator("#adm-users-create-status"))
 			.toContainText("初始总额度 3.50 CNY", { timeout: 10_000 });
 		// 详情抽屉：金额主视图（总额度/累计已用/可用金额/额度来源），两位小数
-		const row = frame.locator("#adm-users-tbody tr", { hasText: "E2E 限额用户" });
+		const row = frame.locator("#adm-users-tbody tr", { hasText: "e2e-limited@pt.test" });
 		await row.locator("button", { hasText: "详情" }).click();
 		await expect(frame.locator("#adm-user-drawer")).toBeVisible();
 		await expect(frame.locator("#adm-drawer-body")).toContainText("总额度");
@@ -401,7 +401,7 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		await frame.locator("#adm-drawer-close").click();
 		await expect(frame.locator("#adm-user-drawer")).toBeHidden();
 		// 表内剩余列同步刷新为 2.50 CNY（绝对总上限已更新）
-		const row2 = frame.locator("#adm-users-tbody tr", { hasText: "E2E 限额用户" });
+		const row2 = frame.locator("#adm-users-tbody tr", { hasText: "e2e-limited@pt.test" });
 		await expect(row2).toContainText("剩余 2.50 CNY", { timeout: 10_000 });
 	});
 
@@ -413,9 +413,9 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		const frame = page.frameLocator("#admin-plugin-frame");
 		await frame.locator('.adm-nav-btn[data-page="users"]').click();
 		await expect(frame.locator("#adm-users-tbody"))
-			.toContainText("E2E 限额用户", { timeout: 10_000 });
+			.toContainText("e2e-limited@pt.test", { timeout: 10_000 });
 		// 抽屉编辑器把总额度存为 0（单次 CAS：只改 limit，不清零已用）
-		const row = frame.locator("#adm-users-tbody tr", { hasText: "E2E 限额用户" });
+		const row = frame.locator("#adm-users-tbody tr", { hasText: "e2e-limited@pt.test" });
 		await row.locator("button", { hasText: "详情" }).click();
 		await expect(frame.locator("#adm-user-drawer")).toBeVisible();
 		await frame.locator("#adm-total-limit-input").fill("0");
@@ -426,7 +426,7 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 			.toContainText("已设置总额度 0.00 CNY", { timeout: 10_000 });
 		await frame.locator("#adm-drawer-close").click();
 		// 用户表「额度剩余」列显示短文案「已用尽」——不再有长拒绝说明
-		const row2 = frame.locator("#adm-users-tbody tr", { hasText: "E2E 限额用户" });
+		const row2 = frame.locator("#adm-users-tbody tr", { hasText: "e2e-limited@pt.test" });
 		await expect(row2).toContainText("已用尽", { timeout: 10_000 });
 		// 抽屉金额主视图同样「已用尽」
 		await row2.locator("button", { hasText: "详情" }).click();
@@ -480,7 +480,7 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		const frame = page.frameLocator("#admin-plugin-frame");
 		await frame.locator('.adm-nav-btn[data-page="users"]').click();
 		await expect(frame.locator("#adm-users-tbody")).toContainText(
-			"E2E 普通用户", { timeout: 10_000 });
+			"e2e-user@pt.test", { timeout: 10_000 });
 		// reload：宿主状态回 loading → waiting_handshake → ready（新 nonce；
 		// 旧请求/旧 nonce 由宿主侧桥校验丢弃，单元层已锁定）。新 iframe 文档
 		// 回初始页（overview），重新进入用户页完成一次全新加载。
@@ -489,7 +489,7 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 			"data-admin-host-state", "ready", { timeout: 10_000 });
 		await frame.locator('.adm-nav-btn[data-page="users"]').click();
 		await expect(frame.locator("#adm-users-tbody")).toContainText(
-			"E2E 普通用户", { timeout: 10_000 });
+			"e2e-user@pt.test", { timeout: 10_000 });
 	});
 
 	test("11. desktop + mobile screenshots (CI artifacts, test-only data)", async ({ page }, testInfo) => {
@@ -518,8 +518,8 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		// 用户详情抽屉（单轨：总额度/累计已用/预占/可用金额 + 设置总额度编辑器）
 		await frame.locator('.adm-nav-btn[data-page="users"]').click();
 		await expect(frame.locator("#adm-users-tbody"))
-			.toContainText("E2E 普通用户", { timeout: 10_000 });
-		await frame.locator("#adm-users-tbody tr", { hasText: "E2E 普通用户" })
+			.toContainText("e2e-user@pt.test", { timeout: 10_000 });
+		await frame.locator("#adm-users-tbody tr", { hasText: "e2e-user@pt.test" })
 			.locator("button", { hasText: "详情" }).click();
 		await expect(frame.locator("#adm-user-drawer")).toBeVisible();
 		await testInfo.attach("admin-user-drawer-desktop-1440", {
@@ -641,9 +641,9 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
 		await expect(table).toContainText("额度剩余");
 		await expect(table).not.toContainText("本月用量");
 		await expect(frame.locator("#adm-users-tbody"))
-			.toContainText("E2E 普通用户", { timeout: 10_000 });
+			.toContainText("e2e-user@pt.test", { timeout: 10_000 });
 		// 剩余列覆盖边界语义之一（10e 已把限额户总额度存 0 → 已用尽）
-		const limited = frame.locator("#adm-users-tbody tr", { hasText: "E2E 限额用户" });
+		const limited = frame.locator("#adm-users-tbody tr", { hasText: "e2e-limited@pt.test" });
 		await expect(limited).toContainText("已用尽");
 		// §4.3：每行只回答「额度剩余」一个数字语义；5 个单元格、无用量条、
 		// 无已消费/预占双行
@@ -674,8 +674,8 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
 		const frame = page.frameLocator("#admin-plugin-frame");
 		await frame.locator('.adm-nav-btn[data-page="users"]').click();
 		await expect(frame.locator("#adm-users-tbody"))
-			.toContainText("E2E 普通用户", { timeout: 10_000 });
-		const detailBtn = frame.locator("#adm-users-tbody tr", { hasText: "E2E 普通用户" })
+			.toContainText("e2e-user@pt.test", { timeout: 10_000 });
+		const detailBtn = frame.locator("#adm-users-tbody tr", { hasText: "e2e-user@pt.test" })
 			.locator("button", { hasText: "详情" });
 		await detailBtn.click();
 		const drawer = frame.locator("#adm-user-drawer");
@@ -859,8 +859,8 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
     const frame = page.frameLocator("#admin-plugin-frame");
     await frame.locator('.adm-nav-btn[data-page="users"]').click();
     await expect(frame.locator("#adm-users-tbody"))
-      .toContainText("E2E 普通用户", { timeout: 10_000 });
-    await frame.locator("#adm-users-tbody tr", { hasText: "E2E 普通用户" })
+      .toContainText("e2e-user@pt.test", { timeout: 10_000 });
+    await frame.locator("#adm-users-tbody tr", { hasText: "e2e-user@pt.test" })
       .locator("button", { hasText: "详情" }).click();
     const drawer = frame.locator("#adm-user-drawer");
     await expect(drawer).toBeVisible();
@@ -898,7 +898,7 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
     // 取消（比真实禁用更安全的回归路径）→ 确认条清空、用户未被禁用
     await confirmBox.locator("button", { hasText: "取消" }).click();
     await expect(confirmBox).toBeHidden();
-    await expect(frame.locator("#adm-users-tbody tr", { hasText: "E2E 普通用户" }))
+    await expect(frame.locator("#adm-users-tbody tr", { hasText: "e2e-user@pt.test" }))
       .toContainText("启用", { timeout: 10_000 });
     // Esc 仍可关闭抽屉
     await page.keyboard.press("Escape");
@@ -947,7 +947,7 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
     await expect
       .poll(async () => frame.locator("#adm-state-users").getAttribute("data-page-state"))
       .toBe("ready", { timeout: 10_000 });
-    const row = frame.locator("#adm-users-tbody tr", { hasText: "E2E 普通用户" });
+    const row = frame.locator("#adm-users-tbody tr", { hasText: "e2e-user@pt.test" });
     await expect(row).toBeVisible();
     // §4.3：关键信息在行内可见——额度剩余语义（含不可用）与详情操作
     await expect(row).toContainText(/剩余|已用尽|超支|不可用|契约错误/);
@@ -1030,8 +1030,8 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
     await frame.locator("#adm-nav-toggle").click();
     await frame.locator('.adm-nav-btn[data-page="users"]').click();
     await expect(frame.locator("#adm-users-tbody"))
-      .toContainText("E2E 普通用户", { timeout: 10_000 });
-    const detailBtn = frame.locator("#adm-users-tbody tr", { hasText: "E2E 普通用户" })
+      .toContainText("e2e-user@pt.test", { timeout: 10_000 });
+    const detailBtn = frame.locator("#adm-users-tbody tr", { hasText: "e2e-user@pt.test" })
       .locator("button", { hasText: "详情" });
     await detailBtn.click();
     await expect(frame.locator("#adm-user-drawer")).toBeVisible();

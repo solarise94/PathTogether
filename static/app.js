@@ -93,6 +93,8 @@
     showAnno: false,      // 是否在画布层显示已保存标注
     focusAnno: null,      // null=显示全部；否则只显示该条标注（flatItems 中的引用）
     channelReopening: false, // 通道配色重开（同一切片换 TileSource，非新切片）
+    // 上次已发 slide.opened 的 "name|revision" 键：去重依据（见 emitSlideOpened）
+    lastSlideOpenedKey: null,
   };
 
   // ---------- 401 认证处理 ----------
@@ -712,14 +714,38 @@
     viewer.addHandler("close", clearBaseThumb);
   }
 
+  // slide.opened 发射（name|revision 去重）。语义是「插件应按此切片重置/恢复
+  // 状态」：键相同（同切片同 revision，如换配色重开）跳过——不重置插件 AI
+  // 会话；键变化（切换切片，或同名文件替换 → revision 变化）必然重发。
+  // 正常路径与 channelReopening 轻量路径都必须走这里：多通道切片带本地持久化
+  // 配色时，「首开默认 token → applySelection 同步 viewer.close() + 置位重开」
+  // 时序下第一次 open 事件被 close 吃掉、第二次 open 只会从轻量路径到达——
+  // 轻量路径若不发，插件停留旧切片（生产 bug：slide.opened 3/3 丢失，会话
+  // 恢复/切片替换保护全部失效）；发了则由键去重保证纯换配色不重发、且两次
+  // open 事件无论谁先到达都恰好送达一次。
+  function emitSlideOpened() {
+    if (!state.slide || !state.slide.name) return;
+    var key = state.slide.name + "|" + (state.slide.revision || "");
+    if (key === state.lastSlideOpenedKey) return;
+    state.lastSlideOpenedKey = key;
+    hpEmit("slide.opened", { slide: {
+      name: state.slide.name, width: state.slide.width, height: state.slide.height,
+      mppX: state.slide.mppX, mppY: state.slide.mppY,
+      // 资产 revision（服务端口径 = "mtime_ns:size"）：插件快照回看时比对
+      // view.slide_revision，检测切片被替换（宽容缺省 → null，保护退化为不拦截）
+      revision: state.slide.revision || null,
+    } });
+  }
+
   function onViewerOpen() {
     // 通道配色重开（同一切片换 TileSource，§8.2）：走轻量路径——只同步倍率
-    // 徽章与底图缩略图；不退绘制模式、不重置标注/AI 面板、不向插件重发
-    // slide.opened（避免换色清空 AI 会话 UI）。viewport 恢复由控制器负责。
+    // 徽章与底图缩略图；不退绘制模式、不重置标注/AI 面板。slide.opened 仍经
+    // emitSlideOpened 补发（键相同自动去重，见上），不再无条件吞掉。
     if (state.channelReopening) {
       state.channelReopening = false;
       updateZoomBadge();
       syncBaseThumb();
+      emitSlideOpened();
       return;
     }
     updateZoomBadge();
@@ -741,16 +767,7 @@
     // 平台侧清叠加层（切片隔离）。插件侧会话 UI/SSE/游标由 slide.opened event 触发其自行 reset+restore。
     aiOverlay = [];
     redrawAnnoCanvas();
-    var slideName = state.slide ? state.slide.name : null;
-    if (slideName && state.slide) {
-      hpEmit("slide.opened", { slide: {
-        name: slideName, width: state.slide.width, height: state.slide.height,
-        mppX: state.slide.mppX, mppY: state.slide.mppY,
-        // 资产 revision（服务端口径 = "mtime_ns:size"）：插件快照回看时比对
-        // view.slide_revision，检测切片被替换（宽容缺省 → null，保护退化为不拦截）
-        revision: state.slide.revision || null,
-      } });
-    }
+    emitSlideOpened();
     if (state.slide) {
       // 管理员标注工具在任意打开的切片上可用（箭头/描图不依赖 mpp）
       els.annoArrowBtn.disabled = false;

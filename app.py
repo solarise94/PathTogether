@@ -1880,6 +1880,45 @@ def _validate_annotation_rect(safe, x, y, w, h=None):
     return msg, details
 
 
+def _validate_annotation_points(safe, typ, body):
+    """H（AI 描绘）：polygon/freehand 点列的解析与切片边界校验。
+
+    typ 为 "polygon"（简单多边形：≥3 不同顶点、非零面积、拒绝自交）或
+    "freehand"（描图笔迹）。返回 (norm_geom, err)：
+      - norm_geom：share_shared._validate_geom 归一化结果（含 level-0 整数
+        points 与 x/y/side_px 兼容 bbox）；
+      - err 非 None 时为 (message, details)，调用方一律 400（绝不静默裁剪/
+        降采样/改点序）。
+    授权说明（review-2026-09-06 P1-1）：AI 描绘的会话级开关由 HistoPilot
+    裁剪+纵深拒绝（关闭时 sidecar 不组装工具、execute 再拒、不触达平台）；
+    平台侧按既有通道鉴权（internal token / plugin token + run grant 绑定
+    session）与几何校验放行，不做会话开关查询。
+    """
+    if body.get("width_px") is not None or body.get("height_px") is not None \
+            or body.get("side_px") is not None:
+        return None, ("点列请求与矩形几何字段互斥（width_px/height_px/side_px）",
+                      {"type": typ})
+    try:
+        norm = share_shared._validate_geom(typ, {"points": body.get("points")})
+    except ValueError as e:
+        return None, (str(e), {"type": typ})
+    points = norm.get("points") or []
+    # 切片边界：点列全部坐标不得越出 level-0 边界（尺寸不可读时降级为仅
+    # 非负校验——_validate_geom 已拒绝负坐标，与矩形路径同一降级语义）。
+    slide_w, slide_h = _annotation_slide_bounds(safe)
+    if slide_w is None:
+        return norm, None
+    for p in points:
+        if p[0] > slide_w or p[1] > slide_h:
+            return None, (
+                "描绘点列越出切片边界，已拒绝（不自动裁剪）：点 (%s, %s)；"
+                "切片 level-0 尺寸 %s×%s。"
+                % (p[0], p[1], _fmt_level0(slide_w), _fmt_level0(slide_h)),
+                {"point": p, "slide_level0": {"width": slide_w, "height": slide_h}},
+            )
+    return norm, None
+
+
 # --------------------------------------------------------------------------- #
 # 插件 UI 资源
 # --------------------------------------------------------------------------- #
@@ -13111,7 +13150,7 @@ def internal_ai_region():
 
 @app.route("/internal/ai/annotate", methods=["POST"])
 def internal_ai_annotate():
-    """sidecar 落矩形标注（写入标注库，管理员可见可编辑）。
+    """sidecar 落标注（写入标注库，管理员可见可编辑）。
 
     body: {slide, label, x, y, side_px | width_px+height_px, note, effect_key,
     session_id}，可选
@@ -13119,6 +13158,9 @@ def internal_ai_annotate():
     slide_asset_revision/expected_asset_revision（sidecar 本节点不改，Flask 侧
     容忍缺省，缺的字段留空串）。升级 C：矩形接受成对 width_px/height_px（v2）
     或仅 side_px（v1 正方形兼容）。
+    H（AI 描绘）：type=polygon|freehand 时改走点列（3~500 点；polygon 为简单
+    多边形校验），不再要求矩形字段；落库 source="ai" → review_status 默认
+    pending 待复核。
     调 share_store.add_roi(ADMIN_TOKEN, ...)（含 _effect_key 幂等、source="ai"）。
     返回 add_roi 的 roi dict（含 annotation_id/index）。
 
@@ -13144,6 +13186,8 @@ def internal_ai_annotate():
         return jsonify(error="slide 参数缺失"), 400
     if not isinstance(label, str) or not label.strip():
         return jsonify(error="label 参数缺失"), 400
+    # slide 文件名合法性（_safe_name 失败会 abort 400/404）
+    safe = _safe_name(slide)
 
     def _parse_num(key):
         v = body.get(key)
@@ -13159,25 +13203,34 @@ def internal_ai_annotate():
         except (TypeError, ValueError, OverflowError):
             return None
 
-    x = _parse_num("x")
-    y = _parse_num("y")
-    if x is None or y is None:
-        return jsonify(error="x/y 参数需为数值"), 400
-    # 升级 C（§6.3-2）：成对 width_px/height_px（v2）或 side_px（v1 正方形兼容）。
-    rx, ry, rw, rh, rside, gerr = _parse_rect_request_geom(body)
-    if gerr:
-        return jsonify(error=gerr), 400
-    if rx is not None:
-        x, y = rx, ry
-    w_px, h_px = rw, rh
-    side_px = rside
-    # slide 文件名合法性（_safe_name 失败会 abort 400/404）
-    safe = _safe_name(slide)
-    # 切片几何统一校验（§6.2，批次 4a：矩形右/下边界不得越出切片 level-0
-    # 边界；与 plugin v1 annotate 共用同一套规则，越界 400 不静默裁剪）。
-    reject = _validate_annotation_rect(safe, x, y, w_px, h_px)
-    if reject is not None:
-        return jsonify(error=reject[0]), 400
+    # H（AI 描绘）：type=polygon|freehand 时走点列路径（3~500 点；polygon 额外
+    # 做 ≥3 不同顶点/非零面积/拒绝自交校验），不再走矩形 parser。矩形路径保持
+    # 不变（既有 create_annotation 矩形工具继续走 x/y/w/h/side_px）。
+    body_type = body.get("type")
+    points_norm = None
+    if body_type in ("polygon", "freehand"):
+        points_norm, perr = _validate_annotation_points(safe, body_type, body)
+        if perr is not None:
+            return jsonify(error=perr[0]), 400
+
+    if points_norm is None:
+        x = _parse_num("x")
+        y = _parse_num("y")
+        if x is None or y is None:
+            return jsonify(error="x/y 参数需为数值"), 400
+        # 升级 C（§6.3-2）：成对 width_px/height_px（v2）或 side_px（v1 正方形兼容）。
+        rx, ry, rw, rh, rside, gerr = _parse_rect_request_geom(body)
+        if gerr:
+            return jsonify(error=gerr), 400
+        if rx is not None:
+            x, y = rx, ry
+        w_px, h_px = rw, rh
+        side_px = rside
+        # 切片几何统一校验（§6.2，批次 4a：矩形右/下边界不得越出切片 level-0
+        # 边界；与 plugin v1 annotate 共用同一套规则，越界 400 不静默裁剪）。
+        reject = _validate_annotation_rect(safe, x, y, w_px, h_px)
+        if reject is not None:
+            return jsonify(error=reject[0]), 400
     note = body.get("note") or ""
     effect_key = body.get("effect_key") or ""
     session_id = body.get("session_id") or ""
@@ -13206,19 +13259,32 @@ def internal_ai_annotate():
         "idempotency_key": effect_key or "",
     }
     try:
-        roi = share_store.add_roi(
-            share_store.ADMIN_TOKEN, safe, label, type="rect", note=note,
-            x=int(x), y=int(y), w=int(w_px), h=int(h_px),
-            **({"side_px": int(side_px)} if side_px is not None else {}),
-            size_mm=_rect_dims_size_mm(safe, w_px, h_px),
-            source="ai", created_by_session_id=session_id,
-            _effect_key=effect_key or None,
-            provenance=provenance,
-        )
+        if points_norm is not None:
+            # H（AI 描绘）点列落库：source="ai" → review_status 默认 pending
+            # 待复核（add_roi 统一语义）；effect_key 幂等沿用；x/y/side_px 兼容
+            # bbox 由 _validate_geom 按点列写入（add_roi 内部再次归一化）。
+            roi = share_store.add_roi(
+                share_store.ADMIN_TOKEN, safe, label, type=body_type, note=note,
+                points=points_norm["points"],
+                size_mm=0.0,
+                source="ai", created_by_session_id=session_id,
+                _effect_key=effect_key or None,
+                provenance=provenance,
+            )
+        else:
+            roi = share_store.add_roi(
+                share_store.ADMIN_TOKEN, safe, label, type="rect", note=note,
+                x=int(x), y=int(y), w=int(w_px), h=int(h_px),
+                **({"side_px": int(side_px)} if side_px is not None else {}),
+                size_mm=_rect_dims_size_mm(safe, w_px, h_px),
+                source="ai", created_by_session_id=session_id,
+                _effect_key=effect_key or None,
+                provenance=provenance,
+            )
     except ValueError as e:
         return jsonify(error="落标注失败：{}".format(e)), 400
     _audit("annotation.add", target_type="annotation", target_id=roi.get("annotation_id"),
-           slide=safe, detail={"source": "ai"})
+           slide=safe, detail={"source": "ai", "type": roi.get("type", "rect")})
     return jsonify(roi)
 
 
@@ -13888,6 +13954,9 @@ def plugin_v1_annotate(slide):
     session_id?, run_id?, model?, provider?/base_url?, expected_asset_revision?}。
     升级 C：矩形接受成对 width_px/height_px（v2 通用矩形）或仅 side_px
     （v1 正方形兼容）；v2 与 side_px 冲突拒绝。
+    H（AI 描绘）：type=polygon|freehand 时改走点列（3~500 点；polygon 为简单
+    多边形校验），授权仍走 run grant（绑定 session）；会话级开关由 HistoPilot
+    侧裁剪+纵深拒绝。
     """
     claims, err = _require_plugin_token("annotation:write")
     if err is not None:
@@ -13926,23 +13995,34 @@ def plugin_v1_annotate(slide):
         except (TypeError, ValueError, OverflowError):
             return None
 
-    x = _parse_num("x")
-    y = _parse_num("y")
-    if x is None or y is None:
-        return _plugin_error(400, "invalid_request", "x/y 参数需为数值")
-    # 升级 C（§6.3-2）：成对 width_px/height_px（v2）或 side_px（v1 正方形兼容）。
-    rx, ry, rw, rh, rside, gerr = _parse_rect_request_geom(body)
-    if gerr:
-        return _plugin_error(400, "invalid_request", gerr)
-    if rx is not None:
-        x, y = rx, ry
-    w_px, h_px = rw, rh
-    side_px = rside
-    # 切片几何统一校验（§6.2，批次 4a：矩形右/下边界不得越出切片 level-0
-    # 边界；与 /internal/ai/annotate 共用同一套规则，越界 400 不静默裁剪）。
-    reject = _validate_annotation_rect(safe, x, y, w_px, h_px)
-    if reject is not None:
-        return _plugin_error(400, "invalid_request", reject[0], details=reject[1])
+    # H（AI 描绘）：type=polygon|freehand 时走点列路径（3~500 点；polygon 额外
+    # 做 ≥3 不同顶点/非零面积/拒绝自交校验），不再走矩形 parser。授权仍由上方
+    # run grant（绑定 session）把关；会话级开关由 HistoPilot 侧裁剪+纵深拒绝。
+    body_type = body.get("type")
+    points_norm = None
+    if body_type in ("polygon", "freehand"):
+        points_norm, perr = _validate_annotation_points(safe, body_type, body)
+        if perr is not None:
+            return _plugin_error(400, "invalid_request", perr[0], details=perr[1])
+
+    if points_norm is None:
+        x = _parse_num("x")
+        y = _parse_num("y")
+        if x is None or y is None:
+            return _plugin_error(400, "invalid_request", "x/y 参数需为数值")
+        # 升级 C（§6.3-2）：成对 width_px/height_px（v2）或 side_px（v1 正方形兼容）。
+        rx, ry, rw, rh, rside, gerr = _parse_rect_request_geom(body)
+        if gerr:
+            return _plugin_error(400, "invalid_request", gerr)
+        if rx is not None:
+            x, y = rx, ry
+        w_px, h_px = rw, rh
+        side_px = rside
+        # 切片几何统一校验（§6.2，批次 4a：矩形右/下边界不得越出切片 level-0
+        # 边界；与 /internal/ai/annotate 共用同一套规则，越界 400 不静默裁剪）。
+        reject = _validate_annotation_rect(safe, x, y, w_px, h_px)
+        if reject is not None:
+            return _plugin_error(400, "invalid_request", reject[0], details=reject[1])
     note = body.get("note") or ""
     effect_key = body.get("effect_key") or body.get("idempotency_key") or ""
     # session_id 已在 verify 前解析：grant 绑定校验（expect_session）通过后，
@@ -13976,19 +14056,33 @@ def plugin_v1_annotate(slide):
         "idempotency_key": effect_key or "",
     }
     try:
-        roi = share_store.add_roi(
-            share_store.ADMIN_TOKEN, safe, label, type="rect", note=note,
-            x=int(x), y=int(y), w=int(w_px), h=int(h_px),
-            **({"side_px": int(side_px)} if side_px is not None else {}),
-            size_mm=_rect_dims_size_mm(safe, w_px, h_px),
-            source="ai", created_by_session_id=session_id,
-            _effect_key=effect_key or None,
-            provenance=provenance,
-        )
+        if points_norm is not None:
+            # H（AI 描绘）点列落库：source="ai" → review_status 默认 pending
+            # 待复核；effect_key 幂等沿用；created_by_user_id 从 grant 来
+            # （provenance 同矩形路径）。
+            roi = share_store.add_roi(
+                share_store.ADMIN_TOKEN, safe, label, type=body_type, note=note,
+                points=points_norm["points"],
+                size_mm=0.0,
+                source="ai", created_by_session_id=session_id,
+                _effect_key=effect_key or None,
+                provenance=provenance,
+            )
+        else:
+            roi = share_store.add_roi(
+                share_store.ADMIN_TOKEN, safe, label, type="rect", note=note,
+                x=int(x), y=int(y), w=int(w_px), h=int(h_px),
+                **({"side_px": int(side_px)} if side_px is not None else {}),
+                size_mm=_rect_dims_size_mm(safe, w_px, h_px),
+                source="ai", created_by_session_id=session_id,
+                _effect_key=effect_key or None,
+                provenance=provenance,
+            )
     except ValueError as e:
         return _plugin_error(400, "invalid_request", "落标注失败：{}".format(e))
     _audit("annotation.add", target_type="annotation", target_id=roi.get("annotation_id"),
            slide=safe, detail={"source": "ai", "via": "plugin_v1",
+                               "type": roi.get("type", "rect"),
                                "grant_id": grant_id})
     return jsonify(roi)
 
@@ -15095,6 +15189,22 @@ def api_ai_session_archive(session_id):
 
     return _proxy_json("/session/{}/{}".format(session_id, sub), body,
                        on_response=_on_response)
+
+
+@app.route("/api/ai/session/<session_id>/drawing", methods=["POST"])
+def api_ai_session_drawing(session_id):
+    """会话级「允许 AI 描绘」开关（H，review-2026-09-06 P1-1）。
+
+    代理 sidecar POST /session/<id>/drawing，body {enabled: bool}（严格布尔）。
+    开关默认关、只影响 HistoPilot 侧 draw_suspicious_region 的工具装配/执行，
+    不改变任何平台写权限（只读/Demo profile 仍由 sidecar 兜底拒绝）。
+    鉴权与 archive/unarchive 同款：owner 任意；user 仅自己名下会话。
+    """
+    auth = _require_ai_session_owner(session_id)
+    if auth is not None:
+        return auth
+    body = request.get_json(silent=True) or {}
+    return _proxy_json("/session/{}/drawing".format(session_id), body)
 
 
 @app.route("/api/ai/session/<session_id>/stream")

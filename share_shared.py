@@ -6,7 +6,9 @@ import time
 
 
 # 支持的标注类型
-ROI_TYPES = ("rect", "arrow", "freehand")
+# H（AI 描绘，review-2026-09-05 §5）：新增 polygon（简单多边形点列；AI 描绘
+# 落库复用 freehand 的点列语义，但要求 ≥3 个不同顶点、非零面积、拒绝自交）。
+ROI_TYPES = ("rect", "arrow", "freehand", "polygon")
 
 # 分享可选的 ROI 矩形标记尺寸（mm），以 float 存储为子集
 ALLOWED_ROI_SIZES = (6.0, 6.5)
@@ -424,6 +426,8 @@ def _validate_geom(typ, geom):
       v2 正方形保留一致 side_px 兼容字段，非正方形不伪造 side_px
     - arrow：x1, y1, x2, y2（两端点距离 > 0）
     - freehand：points: [[x,y],...]（3~500 点，坐标 ≥0 且有限）
+    - polygon：points: [[x,y],...]（H，AI 描绘；3~500 点，坐标 ≥0 且有限；
+      ≥3 个不同顶点、鞋带面积非零、拒绝自交；单环点列，不接受孔洞/多环）
     坐标均要求 ≥0 且数值有限。校验失败抛 ValueError。
     （rect 归一化见 _validate_rect_geometry；切片边界校验由路径入口经
     _validate_rect_bounds 承担。）
@@ -453,7 +457,7 @@ def _validate_geom(typ, geom):
             "size_mm": 0.0,
         }
 
-    if typ == "freehand":
+    if typ in ("freehand", "polygon"):
         pts = geom.get("points")
         if not isinstance(pts, list) or len(pts) < 3 or len(pts) > 500:
             raise ValueError("描图需 3~500 个点")
@@ -468,12 +472,30 @@ def _validate_geom(typ, geom):
             if px < 0 or py < 0:
                 raise ValueError("坐标需 ≥0")
             clean.append([px, py])
+        # polygon（H）：几何有效性在 freehand 描图规则之上收紧——先去闭合尾点
+        # 与连续重复点，再要求 ≥3 个不同顶点、面积非零、无自交（含共线触碰；
+        # 嵌套/多环输入在点列形态层即不成立，天然拒绝孔洞）。
+        if typ == "polygon":
+            ring = _collapse_ring(clean)
+            distinct = {(p[0], p[1]) for p in ring}
+            if len(ring) < 3 or len(distinct) < 3:
+                raise ValueError("多边形至少需要 3 个不同顶点")
+            area2 = 0
+            for i in range(len(ring)):
+                ax, ay = ring[i]
+                bx, by = ring[(i + 1) % len(ring)]
+                area2 += ax * by - bx * ay
+            if area2 == 0:
+                raise ValueError("多边形面积不能为零（顶点共线或退化）")
+            if _ring_self_intersects(ring):
+                raise ValueError("多边形存在自交；请提交简单多边形（不相交的单一闭合环）")
+            clean = ring
         xs = [p[0] for p in clean]
         ys = [p[1] for p in clean]
         minx = min(xs); miny = min(ys)
         side = max(max(xs) - minx, max(ys) - miny)
         return {
-            "type": "freehand",
+            "type": typ,
             "points": clean,
             "x": minx, "y": miny,
             "side_px": int(side),
@@ -481,6 +503,69 @@ def _validate_geom(typ, geom):
         }
 
     raise ValueError("未知标注类型")
+
+
+def _collapse_ring(points):
+    """polygon 环整形：去掉首尾重复的闭合尾点，合并连续重复点（不改顺序）。"""
+    pts = list(points)
+    if len(pts) >= 2 and pts[0] == pts[-1]:
+        pts.pop()
+    out = []
+    for p in pts:
+        if out and out[-1] == p:
+            continue
+        out.append(p)
+    return out
+
+
+def _seg_cross(ox, oy, ax, ay, bx, by):
+    """叉积 (a-o)×(b-o)。"""
+    return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox)
+
+
+def _seg_touches(o, a, b):
+    """退化判断：点/线段 o 是否落在线段 ab 上（共线且包围盒相交）。"""
+    return (min(a[0], b[0]) <= o[0] <= max(a[0], b[0])
+            and min(a[1], b[1]) <= o[1] <= max(a[1], b[1]))
+
+
+def _segments_intersect(p1, p2, p3, p4):
+    """线段 p1p2 与 p3p4 是否相交（含共线重叠与端点触碰）。"""
+    d1 = _seg_cross(p3[0], p3[1], p4[0], p4[1], p1[0], p1[1])
+    d2 = _seg_cross(p3[0], p3[1], p4[0], p4[1], p2[0], p2[1])
+    d3 = _seg_cross(p1[0], p1[1], p2[0], p2[1], p3[0], p3[1])
+    d4 = _seg_cross(p1[0], p1[1], p2[0], p2[1], p4[0], p4[1])
+    if ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and \
+            ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0)):
+        return True
+    if d1 == 0 and _seg_touches(p1, p3, p4):
+        return True
+    if d2 == 0 and _seg_touches(p2, p3, p4):
+        return True
+    if d3 == 0 and _seg_touches(p3, p1, p2):
+        return True
+    if d4 == 0 and _seg_touches(p4, p1, p2):
+        return True
+    return False
+
+
+def _ring_self_intersects(ring):
+    """闭合环自交检测（O(n²)：每对不相邻边做相交测试；首尾相接边与首边
+    共享端点属正常闭合，跳过）。n ≤ 500，最坏 ~125k 对，可接受。"""
+    n = len(ring)
+    if n < 3:
+        return False
+    for i in range(n):
+        a1 = ring[i]
+        a2 = ring[(i + 1) % n]
+        for j in range(i + 2, n):
+            if i == 0 and j == n - 1:
+                continue
+            b1 = ring[j]
+            b2 = ring[(j + 1) % n]
+            if _segments_intersect(a1, a2, b1, b2):
+                return True
+    return False
 
 
 def _clean_note(note):

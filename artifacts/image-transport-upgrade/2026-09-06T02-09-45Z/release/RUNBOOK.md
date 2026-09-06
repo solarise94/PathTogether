@@ -43,6 +43,7 @@ HP 无业务改动 → **不重部署 HistoPilot**，仅做对拍与在线终态
 性能预算持续超限 → 先退新 UI 到旧显示路径，不得降荧光 q 或改通道配色应急。
 
 ## 发布记录（B8 交付时点）
-- 发布头 SHA：`826f40b203d7056a70b91763db7625be641da9b4`（PathTogether wip/ser8-dev，本地提交未 push）
-- 部署命令：`./deploy.sh 826f40b203d7056a70b91763db7625be641da9b4`
+- 发布头 SHA：`cf3cf58`（完整 `git rev-parse HEAD` 于执行时复核；PathTogether wip/ser8-dev，本地提交未 push）
+- 主实现提交：`826f40b`；发布记录：`600c8e3`；交付摘要：`cf3cf58`
+- 部署命令：`./deploy.sh $(git -C ~/histopilot-suite/PathTogether rev-parse HEAD)`
 - HP：无生产代码变更，不重部署

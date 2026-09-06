@@ -1,0 +1,1250 @@
+{
+ "label": "baseline-standard-dpr1",
+ "dpr": 1,
+ "repeats": 3,
+ "viewport": {
+  "width": 1440,
+  "height": 900
+ },
+ "totalBytes_median": 378526,
+ "tileBytes_median": 350842,
+ "requests_median": 66,
+ "runs": [
+  {
+   "label": "baseline-standard-dpr1",
+   "dpr": 1,
+   "totalBytes": 378526,
+   "tileBytes": 350842,
+   "requests": 66,
+   "counts": {
+    "first-open": 33,
+    "reload": 33
+   },
+   "statuses": {
+    "200": 66
+   },
+   "urls": [
+    {
+     "u": "http://127.0.0.1:8932/api/auth/info",
+     "b": 425,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs/info",
+     "b": 750,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs.dzi",
+     "b": 556,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs/thumbnail",
+     "b": 12389,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/9/0_0.jpeg",
+     "b": 5815,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_1.jpeg",
+     "b": 1767,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_0.jpeg",
+     "b": 16876,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_1.jpeg",
+     "b": 24164,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_1.jpeg",
+     "b": 4391,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_0.jpeg",
+     "b": 31473,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_0.jpeg",
+     "b": 4634,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_2.jpeg",
+     "b": 2697,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_2.jpeg",
+     "b": 2029,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_2.jpeg",
+     "b": 58933,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_1.jpeg",
+     "b": 72720,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_2.jpeg",
+     "b": 6416,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_1.jpeg",
+     "b": 6685,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_2.jpeg",
+     "b": 18742,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_3.jpeg",
+     "b": 7027,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_1.jpeg",
+     "b": 9686,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_2.jpeg",
+     "b": 2476,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_3.jpeg",
+     "b": 6386,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_1.jpeg",
+     "b": 2476,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_3.jpeg",
+     "b": 7361,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_3.jpeg",
+     "b": 2476,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_0.jpeg",
+     "b": 25495,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_0.jpeg",
+     "b": 6969,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_4.jpeg",
+     "b": 4043,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_0.jpeg",
+     "b": 6794,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_4.jpeg",
+     "b": 3859,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_4.jpeg",
+     "b": 4028,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_0.jpeg",
+     "b": 2476,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_4.jpeg",
+     "b": 1948,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/auth/info",
+     "b": 425,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs/info",
+     "b": 750,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs.dzi",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/9/0_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs/thumbnail",
+     "b": 12389,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_2.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_2.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_2.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_2.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_2.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_3.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_3.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_2.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_3.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_3.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_4.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_4.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_4.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_4.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    }
+   ]
+  },
+  {
+   "label": "baseline-standard-dpr1",
+   "dpr": 1,
+   "totalBytes": 378526,
+   "tileBytes": 350842,
+   "requests": 66,
+   "counts": {
+    "first-open": 33,
+    "reload": 33
+   },
+   "statuses": {
+    "200": 66
+   },
+   "urls": [
+    {
+     "u": "http://127.0.0.1:8932/api/auth/info",
+     "b": 425,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs/info",
+     "b": 750,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs.dzi",
+     "b": 556,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/9/0_0.jpeg",
+     "b": 5815,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs/thumbnail",
+     "b": 12389,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_0.jpeg",
+     "b": 16876,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_1.jpeg",
+     "b": 1767,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_1.jpeg",
+     "b": 24164,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_1.jpeg",
+     "b": 4391,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_0.jpeg",
+     "b": 31473,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_0.jpeg",
+     "b": 4634,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_2.jpeg",
+     "b": 2697,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_2.jpeg",
+     "b": 2029,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_2.jpeg",
+     "b": 58933,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_1.jpeg",
+     "b": 72720,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_2.jpeg",
+     "b": 6416,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_1.jpeg",
+     "b": 6685,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_2.jpeg",
+     "b": 18742,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_3.jpeg",
+     "b": 7027,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_1.jpeg",
+     "b": 9686,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_3.jpeg",
+     "b": 6386,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_2.jpeg",
+     "b": 2476,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_3.jpeg",
+     "b": 7361,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_1.jpeg",
+     "b": 2476,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_0.jpeg",
+     "b": 25495,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_3.jpeg",
+     "b": 2476,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_0.jpeg",
+     "b": 6969,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_4.jpeg",
+     "b": 4043,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_0.jpeg",
+     "b": 6794,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_4.jpeg",
+     "b": 3859,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_4.jpeg",
+     "b": 4028,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_0.jpeg",
+     "b": 2476,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_4.jpeg",
+     "b": 1948,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/auth/info",
+     "b": 425,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs/info",
+     "b": 750,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs.dzi",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/9/0_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs/thumbnail",
+     "b": 12389,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_2.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_2.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_2.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_2.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_2.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_3.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_3.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_2.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_3.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_3.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_4.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_4.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_4.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_4.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    }
+   ]
+  },
+  {
+   "label": "baseline-standard-dpr1",
+   "dpr": 1,
+   "totalBytes": 378526,
+   "tileBytes": 350842,
+   "requests": 66,
+   "counts": {
+    "first-open": 33,
+    "reload": 33
+   },
+   "statuses": {
+    "200": 66
+   },
+   "urls": [
+    {
+     "u": "http://127.0.0.1:8932/api/auth/info",
+     "b": 425,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs/info",
+     "b": 750,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs.dzi",
+     "b": 556,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/9/0_0.jpeg",
+     "b": 5815,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs/thumbnail",
+     "b": 12389,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_0.jpeg",
+     "b": 16876,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_1.jpeg",
+     "b": 1767,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_1.jpeg",
+     "b": 24164,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_1.jpeg",
+     "b": 4391,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_0.jpeg",
+     "b": 31473,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_0.jpeg",
+     "b": 4634,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_2.jpeg",
+     "b": 2697,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_2.jpeg",
+     "b": 2029,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_2.jpeg",
+     "b": 58933,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_1.jpeg",
+     "b": 72720,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_2.jpeg",
+     "b": 6416,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_1.jpeg",
+     "b": 6685,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_2.jpeg",
+     "b": 18742,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_3.jpeg",
+     "b": 7027,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_1.jpeg",
+     "b": 9686,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_3.jpeg",
+     "b": 6386,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_2.jpeg",
+     "b": 2476,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_3.jpeg",
+     "b": 7361,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_1.jpeg",
+     "b": 2476,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_0.jpeg",
+     "b": 25495,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_3.jpeg",
+     "b": 2476,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_0.jpeg",
+     "b": 6969,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_4.jpeg",
+     "b": 4043,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_0.jpeg",
+     "b": 6794,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_4.jpeg",
+     "b": 3859,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_4.jpeg",
+     "b": 4028,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_0.jpeg",
+     "b": 2476,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_4.jpeg",
+     "b": 1948,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/auth/info",
+     "b": 425,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs/info",
+     "b": 750,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs.dzi",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/9/0_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs/thumbnail",
+     "b": 12389,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_2.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_2.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_2.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_2.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_2.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_3.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_3.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_2.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_3.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_1.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_3.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_4.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_4.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_4.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_0.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8932/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_4.jpeg",
+     "b": 0,
+     "s": 200,
+     "p": "reload"
+    }
+   ]
+  }
+ ]
+}

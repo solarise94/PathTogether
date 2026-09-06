@@ -1,0 +1,5 @@
+{
+  "label": "baseline-legacy",
+  "rgb": {"profile_id": "legacy", "quality": 82, "subsampling": 2, "optimize": false, "progressive": false},
+  "multichannel": {"profile_id": "legacy-mc-default-sampling", "quality": 90, "subsampling": 2, "optimize": false, "progressive": false}
+}

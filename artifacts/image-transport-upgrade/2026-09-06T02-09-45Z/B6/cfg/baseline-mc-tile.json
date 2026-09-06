@@ -1,0 +1,5 @@
+{
+  "label": "baseline-mc-tile-q95-444-noopt",
+  "rgb": {"profile_id": "legacy", "quality": 82, "subsampling": 2, "optimize": false, "progressive": false},
+  "multichannel": {"profile_id": "legacy-mc-tile", "quality": 95, "subsampling": 0, "optimize": false, "progressive": false}
+}

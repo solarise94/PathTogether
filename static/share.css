@@ -1158,3 +1158,37 @@ button {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* -----------------------------------------------------------------------
+   viewer 画质档（image-transport-upgrade §3.3）：与主站同一控件形态
+   ----------------------------------------------------------------------- */
+.viewer-quality-host { display: inline-flex; }
+.viewer-quality-host[hidden] { display: none; }
+.viewer-quality-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 8px;
+  padding: 2px;
+}
+.viewer-quality-btn {
+  border: none;
+  background: transparent;
+  color: #cfd4da;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.viewer-quality-btn:hover { color: #fff; }
+.viewer-quality-btn.active { background: #4d7cfe; color: #fff; }
+.viewer-quality-badge {
+  font-size: 12px;
+  color: #cfd4da;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 8px;
+  padding: 4px 10px;
+}

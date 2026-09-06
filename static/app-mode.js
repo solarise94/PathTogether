@@ -40,14 +40,28 @@
     return renderToken ? "?render=" + encodeURIComponent(renderToken) : "";
   }
 
+  // 瓦片 URL 查询串拼接（image-transport-upgrade §5.2）：画质 query 前置
+  // （?profile=&dv=），render 参数后置（&render=）；两者皆空 → 旧 URL。
+  function tileUrlQuery(renderToken, qualityQuery) {
+    var parts = [];
+    if (qualityQuery) {
+      parts.push(String(qualityQuery).replace(/^\?/, ""));
+    }
+    if (renderToken) {
+      parts.push("render=" + encodeURIComponent(renderToken));
+    }
+    return parts.length ? "?" + parts.join("&") : "";
+  }
+
   function officialAdapter() {
     return {
       mode: "official",
       listSlides: function () { return credFetch("/api/slides"); },
       slideInfoUrl: function (id) { return "/api/slide/" + enc(id) + "/info"; },
       dziUrl: function (id) { return "/api/slide/" + enc(id) + ".dzi"; },
-      thumbnailUrl: function (id, renderToken) {
-        return "/api/slide/" + enc(id) + "/thumbnail" + renderQuery(renderToken);
+      thumbnailUrl: function (id, renderToken, qualityQuery) {
+        return "/api/slide/" + enc(id) + "/thumbnail"
+          + tileUrlQuery(renderToken, qualityQuery);
       },
       // ---- Batch 4 多通道（§8.2 adapter 扩展；HP_Channels 消费）----
       // 服务端规范化（§6.2）：POST render-context，返回 canonical context +
@@ -63,9 +77,9 @@
           body: JSON.stringify(body || {}),
         });
       },
-      tileUrl: function (id, level, x, y, renderToken) {
+      tileUrl: function (id, level, x, y, renderToken, qualityQuery) {
         return "/api/slide/" + enc(id) + "_files/" + level + "/" + x + "_" + y +
-          ".jpeg" + renderQuery(renderToken);
+          ".jpeg" + tileUrlQuery(renderToken, qualityQuery);
       },
       cropUrl: function (id, x, y, size, renderToken) {
         // crop 已带 query（x/y/size），render 参数用 & 追加
@@ -94,9 +108,9 @@
           body: JSON.stringify(body || {}),
         });
       },
-      tileUrl: function (id, level, x, y, renderToken) {
+      tileUrl: function (id, level, x, y, renderToken, qualityQuery) {
         return "/api/demo/slides/" + enc(id) + "_files/" + level + "/" + x + "_" + y +
-          ".jpeg" + renderQuery(renderToken);
+          ".jpeg" + tileUrlQuery(renderToken, qualityQuery);
       },
       // Demo 无缩略图/导出端点（thumbnailUrl 恒空、无 cropUrl）
       aiRun: function (body, opts) {

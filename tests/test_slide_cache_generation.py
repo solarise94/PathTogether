@@ -366,8 +366,7 @@ def share_env(tmp_path, monkeypatch):
     with share_srv.app.test_client() as c:
         yield c, upload_dir, share["token"]
     # 清分享端瓦片缓存，避免跨用例键残留
-    with share_srv._tile_cache_lock:
-        share_srv._tile_cache.clear()
+    share_srv._tile_cache.clear()
 
 
 def test_share_server_tile_and_dzi_follow_generation(
@@ -393,9 +392,8 @@ def test_share_server_tile_and_dzi_follow_generation(
     assert r2.status_code == 200
     assert r2.data != body1, "换代后瓦片不得命中旧代 JPEG 缓存"
 
-    # 瓦片缓存键含 generation：旧代条目不再可达
-    with share_srv._tile_cache_lock:
-        gens = {k[1] for k in share_srv._tile_cache}
+    # 瓦片缓存键含 generation：旧代条目不再可达（tile_cache 模块 LRU）
+    gens = {k[1] for k in share_srv._tile_cache.keys()}
     assert len(gens) >= 2, "两代瓦片应各有键：%s" % gens
 
     # dzi 尺寸走新代句柄（假 dz level_dimensions 固定，只验证不抛错且 200）；
@@ -403,9 +401,8 @@ def test_share_server_tile_and_dzi_follow_generation(
     _replace_with(path, "v3")
     r3 = c.get(tile_url)
     assert r3.status_code == 200
-    with share_srv._tile_cache_lock:
-        assert any(k[1] not in gens for k in share_srv._tile_cache), \
-            "第三代理应有独立瓦片缓存键"
+    assert any(k[1] not in gens for k in share_srv._tile_cache.keys()), \
+        "第三代理应有独立瓦片缓存键"
 
 
 def test_share_server_slides_info_follows_signature(share_env, fake_pairs):
@@ -511,3 +508,169 @@ def test_cross_process_replacement_switches_generation(tmp_path):
     assert m1 == "v1"
     assert m2.startswith("v2"), "子进程仍读到旧代内容：%r" % (m2,)
     assert g2 > g1, "子进程未换代：gen %s -> %s" % (g1, g2)
+
+
+# --------------------------------------------------------------------------- #
+# image-transport-upgrade §6：bytes LRU + single-flight（tile_cache 模块）
+# --------------------------------------------------------------------------- #
+def test_tile_memory_cache_bytes_budget_eviction():
+    import tile_cache as tc
+
+    cache = tc.TileMemoryCache(max_entries=100, max_bytes=1000)
+    cache.put("a", b"x" * 400)
+    cache.put("b", b"y" * 400)
+    assert cache.stats()["bytes"] == 800
+    cache.put("a", b"z" * 100)          # 同 key 覆盖按差额记账
+    st = cache.stats()
+    assert st["bytes"] == 500, st
+    cache.put("c", b"w" * 400)          # 未超任一预算 → 三条共存
+    st = cache.stats()
+    assert st["bytes"] <= 1000, st
+    cache.put("d", b"v" * 300)          # 100+400+400+300=1200 > 1000 → 淘汰最旧
+    st = cache.stats()
+    assert st["bytes"] <= 1000 and st["evictions_entries"] >= 1, st
+    cache.put("big", b"q" * 2000)       # 单条超预算不缓存
+    assert cache.get("big") is None
+    assert cache.stats()["rejected_oversize"] == 1
+    for _ in range(50):                  # 竞争淘汰后计数不越界
+        cache.put("k%d" % _, b"v" * 60)
+    st = cache.stats()
+    assert st["bytes"] <= 1000 and st["evictions_entries"] > 0
+    assert st["bytes"] >= 0 and st["entries"] >= 0
+
+
+def test_single_flight_merges_same_key_only():
+    import tile_cache as tc
+
+    sf = tc.SingleFlight()
+    calls = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def leader():
+        calls.append("leader")
+        started.set()
+        release.wait(5)
+        return "ok"
+
+    leader_result = []
+    waiter_results = []
+
+    def waiter():
+        waiter_results.append(sf.run("k", lambda: (_ for _ in ()).throw(
+            AssertionError("waiter must not execute fn"))))
+
+    t = threading.Thread(
+        target=lambda: leader_result.append(sf.run("k", leader)))
+    t.start()
+    started.wait(5)
+    # 8 个等待者 join 同一 key，不执行 fn
+    threads = [threading.Thread(target=waiter) for _ in range(8)]
+    for th in threads:
+        th.start()
+    time.sleep(0.05)
+    release.set()
+    t.join(5)
+    for th in threads:
+        th.join(5)
+    assert calls == ["leader"], calls
+    assert leader_result == ["ok"]
+    assert waiter_results == ["ok"] * 8
+    assert sf.stats()["joins"] == 8
+
+
+def test_single_flight_different_keys_run_parallel():
+    import tile_cache as tc
+
+    sf = tc.SingleFlight()
+    gate1, gate2 = threading.Event(), threading.Event()
+    reached = threading.Barrier(2, timeout=5)
+    both_reached = threading.Event()
+    reached_count = []
+
+    def blocked(gate):
+        def fn():
+            reached.wait()      # 两个不同 key 同时在 fn 内 → 确证无串行
+            reached_count.append(1)
+            if len(reached_count) == 2:
+                both_reached.set()
+            gate.wait(5)
+            return "done"
+        return fn
+
+    t1 = threading.Thread(target=lambda: sf.run("k1", blocked(gate1)))
+    t2 = threading.Thread(target=lambda: sf.run("k2", blocked(gate2)))
+    t1.start()
+    t2.start()
+    # 只有真并行两个 fn 才能同时在 barrier 汇合（任一方串行等待则超时 broken）
+    assert both_reached.wait(5), "不同 key 必须可并行执行"
+    gate1.set()
+    gate2.set()
+    t1.join(5)
+    t2.join(5)
+    assert not t1.is_alive() and not t2.is_alive()
+
+
+def test_single_flight_exception_reaches_waiters_and_cleans_up():
+    import tile_cache as tc
+
+    sf = tc.SingleFlight()
+    boom = RuntimeError("encode failed")
+    started = threading.Event()
+
+    def fn():
+        started.set()
+        time.sleep(0.05)
+        raise boom
+
+    errs = []
+
+    def waiter():
+        try:
+            sf.run("k", fn)
+        except RuntimeError as e:
+            errs.append(e)
+
+    t = threading.Thread(target=waiter)
+    t2 = threading.Thread(target=waiter)
+    t.start()
+    started.wait(5)
+    t2.start()
+    t.join(5)
+    t2.join(5)
+    assert errs == [boom] * 2, "等待者必须收到 leader 异常"
+    assert sf.stats()["inflight"] == 0, "异常后不得留下悬挂 in-flight"
+    # 后续请求可正常成为新 leader（状态已清理）
+    assert sf.run("k", lambda: "fresh") == "fresh"
+
+
+def test_single_flight_waiter_bounded_timeout():
+    import tile_cache as tc
+
+    sf = tc.SingleFlight()
+    old = tc.SINGLE_FLIGHT_WAIT_TIMEOUT
+    tc.SINGLE_FLIGHT_WAIT_TIMEOUT = 0.05
+    try:
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow():
+            started.set()
+            release.wait(5)
+            return "late"
+
+        t = threading.Thread(target=lambda: sf.run("k", slow))
+        t.start()
+        started.wait(5)
+        try:
+            sf.run("k", lambda: "x")
+            raised = False
+        except tc.SingleFlightTimeout:
+            raised = True
+        finally:
+            release.set()
+            t.join(5)
+        assert raised, "等待者必须有界退出"
+    finally:
+        tc.SINGLE_FLIGHT_WAIT_TIMEOUT = old
+    assert sf.run("k", lambda: "fresh") == "fresh"

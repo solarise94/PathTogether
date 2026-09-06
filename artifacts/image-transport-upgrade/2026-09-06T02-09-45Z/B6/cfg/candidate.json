@@ -1,0 +1,5 @@
+{
+  "label": "candidate-viewer-v1",
+  "rgb": {"profile_id": "native-standard-v1", "quality": 82, "subsampling": 2, "optimize": true, "progressive": false},
+  "multichannel": {"profile_id": "fluorescence-preserve-v1", "quality": 95, "subsampling": 0, "optimize": true, "progressive": false}
+}

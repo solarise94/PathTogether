@@ -32,3 +32,8 @@ docs/ai-money-budget-bugfix-and-simplification-plan.md
 docs/histopilot-neutral-prompt-and-nuclei-plugin-design.md
 test-results/
 playwright-report/
+
+# image-review venv（本地基准环境，不进 git）
+.venv-image-review/
+artifacts/**/reference/
+artifacts/**/smoke/

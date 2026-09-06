@@ -1,0 +1,200 @@
+{
+ "summary": {
+  "old-q90-420-default-sampling": {
+   "n": 12,
+   "bytes_median": 4061.0,
+   "sampling": 2,
+   "edge_mae_median": 4.444901960784314,
+   "ssim_median": 0.9983616988160965
+  },
+  "fluorescence-thumb-v1-q95-444-opt": {
+   "n": 12,
+   "bytes_median": 5263.5,
+   "sampling": 0,
+   "edge_mae_median": 1.993223371081569,
+   "ssim_median": 0.9992979808673976
+  }
+ },
+ "rows": [
+  {
+   "roi": "e486497cdae5-L0-000",
+   "old-q90-420-default-sampling": {
+    "bytes": 21490,
+    "sampling": 2,
+    "edge_mae": 6.816336376456617,
+    "ssim": 0.9859229429846346
+   },
+   "fluorescence-thumb-v1-q95-444-opt": {
+    "bytes": 46825,
+    "sampling": 0,
+    "edge_mae": 2.2140577451198693,
+    "ssim": 0.9936141902004679
+   }
+  },
+  {
+   "roi": "e486497cdae5-L0-001",
+   "old-q90-420-default-sampling": {
+    "bytes": 15366,
+    "sampling": 2,
+    "edge_mae": 6.082964057114721,
+    "ssim": 0.9873151619934477
+   },
+   "fluorescence-thumb-v1-q95-444-opt": {
+    "bytes": 33125,
+    "sampling": 0,
+    "edge_mae": 2.046446742163138,
+    "ssim": 0.9945604681759435
+   }
+  },
+  {
+   "roi": "e486497cdae5-L0-002",
+   "old-q90-420-default-sampling": {
+    "bytes": 3127,
+    "sampling": 2,
+    "edge_mae": 0.0,
+    "ssim": 1.0
+   },
+   "fluorescence-thumb-v1-q95-444-opt": {
+    "bytes": 2159,
+    "sampling": 0,
+    "edge_mae": 0.0,
+    "ssim": 1.0
+   }
+  },
+  {
+   "roi": "e486497cdae5-L2-000",
+   "old-q90-420-default-sampling": {
+    "bytes": 3127,
+    "sampling": 2,
+    "edge_mae": 0.0,
+    "ssim": 1.0
+   },
+   "fluorescence-thumb-v1-q95-444-opt": {
+    "bytes": 2159,
+    "sampling": 0,
+    "edge_mae": 0.0,
+    "ssim": 1.0
+   }
+  },
+  {
+   "roi": "e486497cdae5-L2-001",
+   "old-q90-420-default-sampling": {
+    "bytes": 4599,
+    "sampling": 2,
+    "edge_mae": 4.3431372549019605,
+    "ssim": 0.9974848233705439
+   },
+   "fluorescence-thumb-v1-q95-444-opt": {
+    "bytes": 6950,
+    "sampling": 0,
+    "edge_mae": 2.052287581699346,
+    "ssim": 0.9989128298276752
+   }
+  },
+  {
+   "roi": "e486497cdae5-L2-002",
+   "old-q90-420-default-sampling": {
+    "bytes": 3341,
+    "sampling": 2,
+    "edge_mae": 4.546666666666667,
+    "ssim": 0.9996947447140414
+   },
+   "fluorescence-thumb-v1-q95-444-opt": {
+    "bytes": 2855,
+    "sampling": 0,
+    "edge_mae": 1.94,
+    "ssim": 0.9998464583608764
+   }
+  },
+  {
+   "roi": "e486497cdae5-L4-000",
+   "old-q90-420-default-sampling": {
+    "bytes": 3439,
+    "sampling": 2,
+    "edge_mae": 0.0,
+    "ssim": 0.9993854626646284
+   },
+   "fluorescence-thumb-v1-q95-444-opt": {
+    "bytes": 3297,
+    "sampling": 0,
+    "edge_mae": 0.0,
+    "ssim": 0.9997397273247337
+   }
+  },
+  {
+   "roi": "e486497cdae5-L4-001",
+   "old-q90-420-default-sampling": {
+    "bytes": 3462,
+    "sampling": 2,
+    "edge_mae": 0.0,
+    "ssim": 0.9993169792105931
+   },
+   "fluorescence-thumb-v1-q95-444-opt": {
+    "bytes": 3353,
+    "sampling": 0,
+    "edge_mae": 0.0,
+    "ssim": 0.9997045926894036
+   }
+  },
+  {
+   "roi": "e486497cdae5-L4-002",
+   "old-q90-420-default-sampling": {
+    "bytes": 3523,
+    "sampling": 2,
+    "edge_mae": 0.0,
+    "ssim": 0.9992385742616491
+   },
+   "fluorescence-thumb-v1-q95-444-opt": {
+    "bytes": 3577,
+    "sampling": 0,
+    "edge_mae": 0.0,
+    "ssim": 0.99968313190712
+   }
+  },
+  {
+   "roi": "e486497cdae5-L8-000",
+   "old-q90-420-default-sampling": {
+    "bytes": 6233,
+    "sampling": 2,
+    "edge_mae": 9.05820790850731,
+    "ssim": 0.9877838926399278
+   },
+   "fluorescence-thumb-v1-q95-444-opt": {
+    "bytes": 11402,
+    "sampling": 0,
+    "edge_mae": 2.2158925392458326,
+    "ssim": 0.9968002888969761
+   }
+  },
+  {
+   "roi": "e486497cdae5-L8-001",
+   "old-q90-420-default-sampling": {
+    "bytes": 6233,
+    "sampling": 2,
+    "edge_mae": 9.05820790850731,
+    "ssim": 0.9877838926399278
+   },
+   "fluorescence-thumb-v1-q95-444-opt": {
+    "bytes": 11402,
+    "sampling": 0,
+    "edge_mae": 2.2158925392458326,
+    "ssim": 0.9968002888969761
+   }
+  },
+  {
+   "roi": "e486497cdae5-L8-002",
+   "old-q90-420-default-sampling": {
+    "bytes": 6233,
+    "sampling": 2,
+    "edge_mae": 9.05820790850731,
+    "ssim": 0.9877838926399278
+   },
+   "fluorescence-thumb-v1-q95-444-opt": {
+    "bytes": 11402,
+    "sampling": 0,
+    "edge_mae": 2.2158925392458326,
+    "ssim": 0.9968002888969761
+   }
+  }
+ ]
+}

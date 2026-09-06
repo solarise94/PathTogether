@@ -618,8 +618,13 @@ def test_concurrent_default_context_stats_computed_once(monkeypatch):
     m = slide_render.metrics_snapshot()
     assert m["stats_computed"] == 4, "4 通道统计必须只各算一次：%s" % m
     assert m["stats_cache_miss"] == 4
-    # 后续并发借用必须复用统计（命中数依赖调度，但至少同 key 等待方复用）
-    assert m["stats_cache_hit"] >= 1
+    # image-transport-upgrade §6.4：同 key 并发 miss 由瓦片 single-flight 合并
+    # ——等待方在 flight 层复用 leader 结果（含已算好的统计），不再各自触发
+    # 统计缓存查询。原 stats_cache_hit>=1 断言属旧并发形状；新契约等价更强：
+    # 统计只算一次 + single-flight 有 join 记录。
+    assert app_mod._tile_single_flight.stats()["joins"] >= 1, \
+        "同 key 并发必须出现 single-flight join：%s" \
+        % app_mod._tile_single_flight.stats()
 
 
 # --------------------------------------------------------------------------- #

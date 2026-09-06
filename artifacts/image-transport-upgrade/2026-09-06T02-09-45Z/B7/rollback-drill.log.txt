@@ -1,0 +1,25 @@
+== 1. 旧服务端（回滚目标）legacy tile 响应头（升级前基线行为）==
+HTTP/1.1 200 OK
+Cache-Control: public, max-age=31536000, immutable
+
+== 2. 新服务端同 legacy URL（不带 profile/dv）：200 + private no-cache + ETag ==
+HTTP/1.1 200 OK
+Cache-Control: private, no-cache
+ETag: "d5efaff47c46bf8494cdb0606f3fef4517a840407db6fa90cddd77a182998945"
+
+== 3. If-None-Match → 304（鉴权与版本核验后）==
+status=304 size=0
+
+== 4. 版本化 URL：info 的 dv + tile 200 ==
+dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4b887d79637
+versioned tile status=200
+
+== 5. 过时 dv → 409 display_version_conflict（no-store）==
+HTTP/1.1 409 CONFLICT
+Cache-Control: no-store
+
+== 6. 回退：同版本化 URL 打到旧服务端（旧 worker 忽略未知 query）==
+old server versioned status=200 size=646
+
+== 7. 新旧 legacy tile 字节一致（回滚后画面不变化）==
+legacy tile bytes IDENTICAL

@@ -84,6 +84,9 @@
 
       {# 多通道通道着色（Batch 4）：默认隐藏，info 带 multichannel 能力才由
          channel-controls.js 显示；RGB 切片最多显示灰色「原始 RGB」小标识 #}
+      {# viewer 画质档（image-transport-upgrade）：能力存在才由
+         viewer-encoding.js 显示（RGB 标准/精细；多通道荧光保真标识） #}
+      <span id="quality-control" class="viewer-quality-host" hidden></span>
       <span id="rgb-badge" class="rgb-mode-badge" hidden data-i18n="channel.rgb.badge">原始 RGB</span>
       <button id="channel-btn" class="tool-btn channel-btn" type="button" hidden
               data-i18n="channel.entry" data-i18n-title="channel.entry.title"

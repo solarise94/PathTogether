@@ -1,0 +1,46 @@
+{
+ "region_rgb": {
+  "bytes_sha": "36887460dde07d470ad3031e7398cb528636d2f4f350b4d58efa7030f745f1ea",
+  "read_level": 0,
+  "upsampled": false,
+  "width": 32,
+  "height": 32
+ },
+ "region_mc_default": {
+  "bytes_sha": "15188bc9dbfda186e60a0e918eedbcd88fb4f111a8e50737c077e90c2cd3422f",
+  "read_level": 0,
+  "upsampled": false,
+  "fingerprint": "418018bee39ff5ad"
+ },
+ "render_context": {
+  "fingerprint": "418018bee39ff5ad3dd884f6856d39524494aee3193a9eb8996eeaece7c41b0f",
+  "token_sha": "540db43210878926227489d2c4c72758cb2196b648504e468aac6f844a487327"
+ },
+ "internal_ai_region_mc": {
+  "bytes_sha": "1e05aabc5dde23fd2ff2d35bc254f58867d057142757a01d551119a0298f04db",
+  "encoder": {
+   "id": "pillow",
+   "image_mode": "multichannel",
+   "jpeg_quality": 85,
+   "overlay_version": "v1",
+   "resize": "LANCZOS",
+   "subsampling": "4:4:4",
+   "version": "12.3.0"
+  },
+  "read_level": 0,
+  "upsampled": true
+ },
+ "internal_ai_region_rgb": {
+  "bytes_sha": "85e616d25c4d07edd1b295205e11aed4dfbebc7145cf36fca0365510eb94cdd2",
+  "encoder": {
+   "id": "pillow",
+   "image_mode": "native_rgb",
+   "jpeg_quality": 85,
+   "overlay_version": "v1",
+   "resize": "LANCZOS",
+   "subsampling": "4:2:0",
+   "version": "12.3.0"
+  }
+ },
+ "crop_png_sha": "f6bddb896cf8dad6539871c9fe1b48fd4329ea932aa0984b4b3fb897e2dac2fc"
+}

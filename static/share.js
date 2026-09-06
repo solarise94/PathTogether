@@ -33,6 +33,14 @@
     function renderQuery(renderToken) {
       return renderToken ? "?render=" + encodeURIComponent(renderToken) : "";
     }
+    // 画质 query 前置（?profile=&dv=）、render 后置（image-transport-upgrade
+    // §5.2；与 app-mode.js 同一拼接顺序，策略在 HP_ViewerEncoding）
+    function tileUrlQuery(renderToken, qualityQuery) {
+      var parts = [];
+      if (qualityQuery) parts.push(String(qualityQuery).replace(/^\?/, ""));
+      if (renderToken) parts.push("render=" + encodeURIComponent(renderToken));
+      return parts.length ? "?" + parts.join("&") : "";
+    }
     return {
       mode: "share",
       normalizeRenderContext: function (id, body) {
@@ -42,13 +50,13 @@
           body: JSON.stringify(body || {}),
         });
       },
-      tileUrl: function (id, level, x, y, renderToken) {
+      tileUrl: function (id, level, x, y, renderToken, qualityQuery) {
         return API + "/api/slide/" + encodeURIComponent(id) + "_files/" + level +
-          "/" + x + "_" + y + ".jpeg" + renderQuery(renderToken);
+          "/" + x + "_" + y + ".jpeg" + tileUrlQuery(renderToken, qualityQuery);
       },
-      thumbnailUrl: function (id, renderToken) {
+      thumbnailUrl: function (id, renderToken, qualityQuery) {
         return API + "/api/slide/" + encodeURIComponent(id) + "/thumbnail" +
-          renderQuery(renderToken);
+          tileUrlQuery(renderToken, qualityQuery);
       },
       dziUrl: function (id) {
         return API + "/api/slide/" + encodeURIComponent(id) + ".dzi";
@@ -2200,8 +2208,29 @@
   }
 
   // ---------- 启动 ----------
+  // viewer 画质档（image-transport-upgrade §3.3/§5.2）：三入口共用模块；
+  // 能力缺失/旧服务端时自动隐藏（RGB 走 legacy DZI 语义）
+  function initQualityControl() {
+    if (!window.HP_ViewerEncoding) return;
+    HP_ViewerEncoding.mount({
+      host: document.getElementById("quality-control"),
+      t: t,
+      toast: function (msg, type) { toast(msg, type); },
+      onQualityReopen: function () {
+        if (state.channelCtrl) state.channelCtrl.reopenForQuality();
+      },
+    });
+    HP_ViewerEncoding.installConflictRecovery({
+      viewer: viewer,
+      onConflict: function () {
+        if (state.channelCtrl) state.channelCtrl.recoverDisplayConflict();
+      },
+    });
+  }
+
   function init() {
     initViewer();
+    initQualityControl();
     bindEvents();
     // 先拉取分享配置（允许的 ROI 尺寸）再加载切片，确保工具栏按钮状态正确
     loadConfig().then(function () {

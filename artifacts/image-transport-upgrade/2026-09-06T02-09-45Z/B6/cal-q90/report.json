@@ -1,0 +1,3838 @@
+{
+ "version": "bench-report-v1",
+ "manifest_version": "bench-manifest-v1",
+ "runtime": {
+  "python": "3.12.2",
+  "pillow": "12.3.0"
+ },
+ "baseline_config": {
+  "label": "baseline-legacy",
+  "rgb": {
+   "profile_id": "legacy",
+   "quality": 82,
+   "subsampling": 2,
+   "optimize": false,
+   "progressive": false
+  },
+  "multichannel": {
+   "profile_id": "legacy-mc-default-sampling",
+   "quality": 90,
+   "subsampling": 2,
+   "optimize": false,
+   "progressive": false
+  }
+ },
+ "candidate_config": {
+  "label": "candidate-detail-q90",
+  "rgb": {
+   "profile_id": "native-detail-q90",
+   "quality": 90,
+   "subsampling": 0,
+   "optimize": true,
+   "progressive": false
+  },
+  "multichannel": {
+   "profile_id": "fluorescence-preserve-v1",
+   "quality": 95,
+   "subsampling": 0,
+   "optimize": true,
+   "progressive": false
+  }
+ },
+ "definitions": {
+  "ssim": {
+   "window": 8,
+   "sigma": 1.5,
+   "k1": 0.01,
+   "k2": 0.03,
+   "colorspace": "luma_bt601"
+  },
+  "edge_mask": {
+   "algo": "sobel3x3",
+   "threshold": 24,
+   "dilate": 1
+  },
+  "weak_signal": {
+   "low": 8,
+   "high": 48,
+   "tolerance": 10
+  }
+ },
+ "counts": {
+  "rgb_rois": 55,
+  "multichannel_rois": 0,
+  "rgb_samples": 6,
+  "multichannel_samples": 0
+ },
+ "summary": {
+  "rgb/baseline": {
+   "n": 55,
+   "bytes_median": 18435,
+   "bytes_p95": 30257,
+   "psnr_median": 44.22722726531629,
+   "ssim_median": 0.9911413443989605,
+   "edge_mae_median": 3.9382613510520486,
+   "weak_mae_median": 2.425913621262459,
+   "encode_ms_p95": 0.4507920239120722,
+   "decode_ms_p95": 0.5038329400122166
+  },
+  "rgb/candidate": {
+   "n": 55,
+   "bytes_median": 32463,
+   "bytes_p95": 51573,
+   "psnr_median": 47.648455590470185,
+   "ssim_median": 0.9952666321647963,
+   "edge_mae_median": 2.393964562569214,
+   "weak_mae_median": 1.8238290398126464,
+   "encode_ms_p95": 1.8321250099688768,
+   "decode_ms_p95": 0.7603330304846168
+  },
+  "rgb/ratio_candidate_vs_baseline": {
+   "bytes": 1.7609438567941416,
+   "edge_mae": 0.6078734622144113,
+   "ssim": 0.004125287765835761
+  }
+ },
+ "rows": [
+  {
+   "roi": "61ced09e1b64-L0-000",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 18599,
+   "encode_ms": 0.4465829115360975,
+   "decode_ms": 0.5038329400122166,
+   "psnr": 43.901100244666644,
+   "ssim": 0.9851041641701762,
+   "edge_mae": 4.898589065255732,
+   "channel_mae": [
+    1.2442817687988281,
+    0.9523582458496094,
+    1.3736457824707031
+   ],
+   "weak": {
+    "weak_pixels": 13,
+    "weak_mae": 9.179487179487179,
+    "weak_exceed": 0.46153846153846156
+   },
+   "output_sha256": "588ddb942b65ecaeb43ab635f03394064f194dfca6b77bbab654c33b279f7d73"
+  },
+  {
+   "roi": "61ced09e1b64-L0-000",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 33956,
+   "encode_ms": 1.753999968059361,
+   "decode_ms": 0.66708296071738,
+   "psnr": 47.52450138426565,
+   "ssim": 0.9901920168220779,
+   "edge_mae": 2.4056437389770724,
+   "channel_mae": [
+    0.7538642883300781,
+    0.6424446105957031,
+    0.76812744140625
+   ],
+   "weak": {
+    "weak_pixels": 13,
+    "weak_mae": 3.0,
+    "weak_exceed": 0.0
+   },
+   "output_sha256": "b45c6cc84e5100309047e765ffa68936122374bc364c738f4958a7e8f0d0ea16"
+  },
+  {
+   "roi": "61ced09e1b64-L0-001",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 18530,
+   "encode_ms": 0.45074999798089266,
+   "decode_ms": 0.4507920239120722,
+   "psnr": 44.057964062730484,
+   "ssim": 0.9853507891957887,
+   "edge_mae": 3.024858757062147,
+   "channel_mae": [
+    1.2451896667480469,
+    0.944671630859375,
+    1.3430328369140625
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "28802cbc41b5d76c4ee267e64dccac831e17e0bcbdc3339537cb60b6b1bffe15"
+  },
+  {
+   "roi": "61ced09e1b64-L0-001",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 34904,
+   "encode_ms": 1.7667919164523482,
+   "decode_ms": 0.8170000510290265,
+   "psnr": 47.52369939365611,
+   "ssim": 0.9904232756630375,
+   "edge_mae": 2.048587570621469,
+   "channel_mae": [
+    0.7482109069824219,
+    0.6403694152832031,
+    0.7810630798339844
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "6da23f07404fbceac53f30ca0c002e8371459ef35bcf1c1a0b35cac592935314"
+  },
+  {
+   "roi": "61ced09e1b64-L0-002",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 18652,
+   "encode_ms": 0.4228750476613641,
+   "decode_ms": 0.47574995551258326,
+   "psnr": 44.50331516837518,
+   "ssim": 0.98824613764666,
+   "edge_mae": 1.4137931034482758,
+   "channel_mae": [
+    1.1780281066894531,
+    0.8683700561523438,
+    1.2726593017578125
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "7007d527f2ce87f3a4c9a80c87f3b859b5e4afb5c4a60864d17f892a72fac42f"
+  },
+  {
+   "roi": "61ced09e1b64-L0-002",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 33183,
+   "encode_ms": 1.652583945542574,
+   "decode_ms": 0.6286250427365303,
+   "psnr": 48.78780707983496,
+   "ssim": 0.9931214899377183,
+   "edge_mae": 1.2988505747126438,
+   "channel_mae": [
+    0.6366500854492188,
+    0.5253524780273438,
+    0.6091461181640625
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "d0ae54dc64253d31ae241f75c438d74449777a0ab27e2e5d21382a8572b46576"
+  },
+  {
+   "roi": "61ced09e1b64-L2-000",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 6523,
+   "encode_ms": 0.37637504283338785,
+   "decode_ms": 0.3624579403549433,
+   "psnr": 51.184482092894584,
+   "ssim": 0.9966081468695879,
+   "edge_mae": 4.284722222222222,
+   "channel_mae": [
+    0.31063079833984375,
+    0.2856941223144531,
+    0.4594764709472656
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "d03e84f56c487d3c4987eee2e4435eb421276ce7c3d3bf5c26f110a232d9589f"
+  },
+  {
+   "roi": "61ced09e1b64-L2-000",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 10984,
+   "encode_ms": 1.3469579862430692,
+   "decode_ms": 0.4629159811884165,
+   "psnr": 54.42272290754617,
+   "ssim": 0.9977192936065163,
+   "edge_mae": 2.6458333333333335,
+   "channel_mae": [
+    0.17726898193359375,
+    0.16632080078125,
+    0.23058700561523438
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "83cf77418371f784b1c793c71ca968fcb37cb5fbf2fec96418e697b20b92003d"
+  },
+  {
+   "roi": "61ced09e1b64-L2-001",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 6375,
+   "encode_ms": 0.35624997690320015,
+   "decode_ms": 0.33079099375754595,
+   "psnr": 50.99120452568058,
+   "ssim": 0.9973465698478441,
+   "edge_mae": 5.514285714285714,
+   "channel_mae": [
+    0.2958564758300781,
+    0.2565650939941406,
+    0.4673881530761719
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "a990348972fba212833578212e4f27404028addd3ed561b6d5b84d4ed7c02e39"
+  },
+  {
+   "roi": "61ced09e1b64-L2-001",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 9588,
+   "encode_ms": 1.2763330014422536,
+   "decode_ms": 0.4776669666171074,
+   "psnr": 55.32554744205919,
+   "ssim": 0.9982067359182959,
+   "edge_mae": 3.704761904761905,
+   "channel_mae": [
+    0.1392822265625,
+    0.13189697265625,
+    0.17940139770507812
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "57f5f4d51274e877fd760e8ca5fea6a71387c889dafb68e0245a3db9317a0690"
+  },
+  {
+   "roi": "61ced09e1b64-L2-002",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 7034,
+   "encode_ms": 0.425333040766418,
+   "decode_ms": 0.3261250676587224,
+   "psnr": 51.111988201242426,
+   "ssim": 0.9970346171655187,
+   "edge_mae": 3.9382613510520486,
+   "channel_mae": [
+    0.21029281616210938,
+    0.22284317016601562,
+    0.2553672790527344
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "1ac93de00829166d5b02fd51730a5d10708d443d41f43d9d11d45653c90ace74"
+  },
+  {
+   "roi": "61ced09e1b64-L2-002",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 9755,
+   "encode_ms": 1.2525840429589152,
+   "decode_ms": 0.41262502782046795,
+   "psnr": 54.42982976004159,
+   "ssim": 0.997965560075212,
+   "edge_mae": 2.393964562569214,
+   "channel_mae": [
+    0.1347198486328125,
+    0.14328384399414062,
+    0.16034698486328125
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "42ea748f731d1f732bb744e6df994713d24f137786c3872751d46e9dfaadf1b8"
+  },
+  {
+   "roi": "61ced09e1b64-L4-000",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 27161,
+   "encode_ms": 0.4470410058274865,
+   "decode_ms": 0.4343340406194329,
+   "psnr": 37.85058833626483,
+   "ssim": 0.9876892147766547,
+   "edge_mae": 5.380233326934971,
+   "channel_mae": [
+    1.4451866149902344,
+    1.3212356567382812,
+    1.4516830444335938
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "0ca675897a13ac3c4799f20db8582c6a7d10a0188a90d8ca53b1988107bc1140"
+  },
+  {
+   "roi": "61ced09e1b64-L4-000",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 46708,
+   "encode_ms": 1.6557499766349792,
+   "decode_ms": 0.6767499726265669,
+   "psnr": 42.49042437561859,
+   "ssim": 0.993441729405259,
+   "edge_mae": 3.126253901223509,
+   "channel_mae": [
+    0.8077468872070312,
+    0.7789192199707031,
+    0.8360710144042969
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "9de2b12e58fc6ae8856e1bb7a6879f8294146c95ffd8e655f76100c3d5adb94b"
+  },
+  {
+   "roi": "61ced09e1b64-L4-001",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 27602,
+   "encode_ms": 0.40708400774747133,
+   "decode_ms": 0.4754170076921582,
+   "psnr": 37.82190124111689,
+   "ssim": 0.987292591295446,
+   "edge_mae": 5.325097933550272,
+   "channel_mae": [
+    1.4615631103515625,
+    1.3404502868652344,
+    1.4631004333496094
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "70ecfe7baf5ada2bb04cf22e1d0e9ef048dbb4f7819a1562ae800ecda4de96bd"
+  },
+  {
+   "roi": "61ced09e1b64-L4-001",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 47825,
+   "encode_ms": 1.6995000187307596,
+   "decode_ms": 0.6182909710332751,
+   "psnr": 42.33297578070376,
+   "ssim": 0.9931883150308038,
+   "edge_mae": 3.14840991840598,
+   "channel_mae": [
+    0.8285675048828125,
+    0.7967948913574219,
+    0.8627128601074219
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "20a09dc977bf829d446098a236b135c149acb5f32f6c66674d8275ed9e3318c3"
+  },
+  {
+   "roi": "61ced09e1b64-L4-002",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 28146,
+   "encode_ms": 0.4383750492706895,
+   "decode_ms": 0.4677500110119581,
+   "psnr": 37.92046714485876,
+   "ssim": 0.9875440624511471,
+   "edge_mae": 5.212679720110504,
+   "channel_mae": [
+    1.3954620361328125,
+    1.3121185302734375,
+    1.3902168273925781
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "f1f1078518c459aae67bdaa982da7e1f4fde7ef50cdf4c5aca57522391dfff86"
+  },
+  {
+   "roi": "61ced09e1b64-L4-002",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 47518,
+   "encode_ms": 1.687208074145019,
+   "decode_ms": 0.6234160391613841,
+   "psnr": 42.313166723619815,
+   "ssim": 0.9933370537348982,
+   "edge_mae": 3.113098478890659,
+   "channel_mae": [
+    0.8202400207519531,
+    0.8024826049804688,
+    0.8541831970214844
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "3bb443484cb30d5d1caf189dd25ec7bb52f40b13caa5822401ddfacd63624333"
+  },
+  {
+   "roi": "1c8269061e37-L0-000",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 73203,
+   "encode_ms": 0.5492909112945199,
+   "decode_ms": 0.7472919533029199,
+   "psnr": 32.44699123233323,
+   "ssim": 0.9802917319786029,
+   "edge_mae": 5.155012231387521,
+   "channel_mae": [
+    3.98150634765625,
+    3.4452972412109375,
+    5.246925354003906
+   ],
+   "weak": {
+    "weak_pixels": 1996,
+    "weak_mae": 6.79625918503674,
+    "weak_exceed": 0.15531062124248496
+   },
+   "output_sha256": "8cc116a3b1dcc23055ec56b8f935d009ea603bbf2b7c80a0aef8ac51f610286c"
+  },
+  {
+   "roi": "1c8269061e37-L0-000",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 131187,
+   "encode_ms": 2.744792029261589,
+   "decode_ms": 1.1486250441521406,
+   "psnr": 38.07987758506182,
+   "ssim": 0.9888185065630059,
+   "edge_mae": 2.70873692516325,
+   "channel_mae": [
+    2.194854736328125,
+    2.0064544677734375,
+    2.624561309814453
+   ],
+   "weak": {
+    "weak_pixels": 1996,
+    "weak_mae": 3.2037408149632594,
+    "weak_exceed": 0.00250501002004008
+   },
+   "output_sha256": "ea426faa7f3ec633ff6c3681e33d0dff1ea386ca7255a1fa5dccdc88c858dd22"
+  },
+  {
+   "roi": "1c8269061e37-L0-001",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 18334,
+   "encode_ms": 0.41987502481788397,
+   "decode_ms": 0.42924995068460703,
+   "psnr": 44.13778691997521,
+   "ssim": 0.985418202715517,
+   "edge_mae": 0.0,
+   "channel_mae": [
+    1.2139549255371094,
+    0.9331779479980469,
+    1.3662185668945312
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "98b07ce375d6bde172f71d54d7915dc698fc7992a6e996f8d68f9ba8f470822a"
+  },
+  {
+   "roi": "1c8269061e37-L0-001",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 34354,
+   "encode_ms": 1.6469580586999655,
+   "decode_ms": 0.6142919883131981,
+   "psnr": 47.51453744397238,
+   "ssim": 0.990406978597093,
+   "edge_mae": 0.0,
+   "channel_mae": [
+    0.7445564270019531,
+    0.6406898498535156,
+    0.8002815246582031
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "ff6ac67a681baee980cf79f8b988a3968f19f8b93dc45be83e67b992f1a2aebf"
+  },
+  {
+   "roi": "1c8269061e37-L0-002",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 18240,
+   "encode_ms": 0.4162079421803355,
+   "decode_ms": 0.45029097236692905,
+   "psnr": 44.43316127466807,
+   "ssim": 0.9880426077078105,
+   "edge_mae": 2.4728132387706854,
+   "channel_mae": [
+    1.1943397521972656,
+    0.8738441467285156,
+    1.2858047485351562
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "2bdd9484afecd2211ec1c35468ec79b9e6375095301dfc71b09908c703f1c51f"
+  },
+  {
+   "roi": "1c8269061e37-L0-002",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 31746,
+   "encode_ms": 1.7791669815778732,
+   "decode_ms": 0.6393329240381718,
+   "psnr": 48.73723533497277,
+   "ssim": 0.9929642332850759,
+   "edge_mae": 1.4278959810874705,
+   "channel_mae": [
+    0.6269187927246094,
+    0.5262718200683594,
+    0.6186599731445312
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "3dd31bea45d47822fbdc6745eb8f638da7352926af163d682e43517e102efc41"
+  },
+  {
+   "roi": "1c8269061e37-L2-000",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 43475,
+   "encode_ms": 0.46429201029241085,
+   "decode_ms": 0.5837500793859363,
+   "psnr": 35.41680866889627,
+   "ssim": 0.9856283131688106,
+   "edge_mae": 5.300401179941003,
+   "channel_mae": [
+    2.6399078369140625,
+    2.0813446044921875,
+    2.3851890563964844
+   ],
+   "weak": {
+    "weak_pixels": 6,
+    "weak_mae": 5.888888888888889,
+    "weak_exceed": 0.0
+   },
+   "output_sha256": "5a2cffbf4f6e119218c76d6dca90f27cce2e2a83a4f925f12cac5d00dda63824"
+  },
+  {
+   "roi": "1c8269061e37-L2-000",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 76196,
+   "encode_ms": 2.0865830592811108,
+   "decode_ms": 0.7603330304846168,
+   "psnr": 40.78509495156071,
+   "ssim": 0.9923095458136263,
+   "edge_mae": 2.8420648967551623,
+   "channel_mae": [
+    1.3462791442871094,
+    1.1982307434082031,
+    1.3261756896972656
+   ],
+   "weak": {
+    "weak_pixels": 6,
+    "weak_mae": 3.555555555555556,
+    "weak_exceed": 0.0
+   },
+   "output_sha256": "97e3242f93deae942010c3b1a33e7c9a97c77eeb8c5b321219dd1db20236fd68"
+  },
+  {
+   "roi": "1c8269061e37-L2-001",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 30257,
+   "encode_ms": 0.41433307342231274,
+   "decode_ms": 0.426042010076344,
+   "psnr": 36.36136994490946,
+   "ssim": 0.9890472038281384,
+   "edge_mae": 6.217461998033729,
+   "channel_mae": [
+    1.8203010559082031,
+    1.5080528259277344,
+    1.7086944580078125
+   ],
+   "weak": {
+    "weak_pixels": 77,
+    "weak_mae": 7.1991341991342015,
+    "weak_exceed": 0.24675324675324675
+   },
+   "output_sha256": "9d18dec8af84d6c5c7774e04f5fcae38bd8b1cd1b1377a1e3dd43e585547a766"
+  },
+  {
+   "roi": "1c8269061e37-L2-001",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 51573,
+   "encode_ms": 1.6767499037086964,
+   "decode_ms": 0.6362079875543714,
+   "psnr": 41.58046843638748,
+   "ssim": 0.9945454237258831,
+   "edge_mae": 3.3920567697698454,
+   "channel_mae": [
+    0.9262466430664062,
+    0.8651504516601562,
+    0.9428863525390625
+   ],
+   "weak": {
+    "weak_pixels": 77,
+    "weak_mae": 3.3982683982683985,
+    "weak_exceed": 0.0
+   },
+   "output_sha256": "6d189559cac737a30170e499b91cdc12c4dcd8868c66966babc750e318240116"
+  },
+  {
+   "roi": "1c8269061e37-L2-002",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 37512,
+   "encode_ms": 0.4425420193001628,
+   "decode_ms": 0.5092909559607506,
+   "psnr": 36.16747628309672,
+   "ssim": 0.9871298218272437,
+   "edge_mae": 5.276850087788113,
+   "channel_mae": [
+    2.2928123474121094,
+    1.8226737976074219,
+    2.043231964111328
+   ],
+   "weak": {
+    "weak_pixels": 6,
+    "weak_mae": 10.333333333333334,
+    "weak_exceed": 0.5
+   },
+   "output_sha256": "16480f72314ba4727cbf3a2589068e2db2eab0a511901e09cc0a680c990818c8"
+  },
+  {
+   "roi": "1c8269061e37-L2-002",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 66625,
+   "encode_ms": 1.9497920293360949,
+   "decode_ms": 0.757541973143816,
+   "psnr": 41.287691781389135,
+   "ssim": 0.9925177357930223,
+   "edge_mae": 2.910316037207217,
+   "channel_mae": [
+    1.1849021911621094,
+    1.068206787109375,
+    1.1787071228027344
+   ],
+   "weak": {
+    "weak_pixels": 6,
+    "weak_mae": 3.5,
+    "weak_exceed": 0.0
+   },
+   "output_sha256": "f54380db97632808b9d31efd0f8564bf352c34456fc2d0ccfe6904e29cb727e7"
+  },
+  {
+   "roi": "1c8269061e37-L4-000",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 22277,
+   "encode_ms": 0.4058330086991191,
+   "decode_ms": 0.4170419415459037,
+   "psnr": 38.373816570088294,
+   "ssim": 0.9920850477967289,
+   "edge_mae": 5.938102112642833,
+   "channel_mae": [
+    1.1461715698242188,
+    1.039398193359375,
+    1.1054115295410156
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "0d7c3e927a9af7993982e452641e02c0b6f0c0c908b7c23e5419d4a8b74fae3b"
+  },
+  {
+   "roi": "1c8269061e37-L4-000",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 38101,
+   "encode_ms": 1.7114999936893582,
+   "decode_ms": 0.6864580791443586,
+   "psnr": 43.23688045318871,
+   "ssim": 0.9958548295720504,
+   "edge_mae": 3.371566601560657,
+   "channel_mae": [
+    0.6540794372558594,
+    0.6001853942871094,
+    0.6462821960449219
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "b079147719e146a8169476033af489f2c8dbbb9277214cc9cb0245e8b5e4de41"
+  },
+  {
+   "roi": "1c8269061e37-L4-001",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 22830,
+   "encode_ms": 0.38374995347112417,
+   "decode_ms": 0.431500026024878,
+   "psnr": 38.684610699480906,
+   "ssim": 0.9927556875383251,
+   "edge_mae": 5.381494122108457,
+   "channel_mae": [
+    1.2401847839355469,
+    1.0648384094238281,
+    1.2114143371582031
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "8652417dffba293dd22fbe2b4566c19b4155c92b9e3e5ad03c92277b0ed43e8a"
+  },
+  {
+   "roi": "1c8269061e37-L4-001",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 39449,
+   "encode_ms": 1.5737079083919525,
+   "decode_ms": 0.5743330111727118,
+   "psnr": 43.6393854872893,
+   "ssim": 0.9960854627011853,
+   "edge_mae": 3.051125590374737,
+   "channel_mae": [
+    0.6599311828613281,
+    0.5938377380371094,
+    0.6531867980957031
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "2c78cbb8d02d621a9518bb9d4e841a6e1aa901474267efe60b71a82ec25ad7af"
+  },
+  {
+   "roi": "1c8269061e37-L4-002",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 21944,
+   "encode_ms": 0.4176250658929348,
+   "decode_ms": 0.4164589336141944,
+   "psnr": 38.98960422828076,
+   "ssim": 0.9931461303929174,
+   "edge_mae": 5.358214766050825,
+   "channel_mae": [
+    1.1251754760742188,
+    0.9743499755859375,
+    1.0457267761230469
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "8f664307cd1d59264c60b93c2a9cefad76daec1ba598d3a87b990ecffbb3d102"
+  },
+  {
+   "roi": "1c8269061e37-L4-002",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 37605,
+   "encode_ms": 1.5779159730300307,
+   "decode_ms": 0.5467500304803252,
+   "psnr": 43.70388649470914,
+   "ssim": 0.9962879544290963,
+   "edge_mae": 3.0907570609471224,
+   "channel_mae": [
+    0.6311912536621094,
+    0.5737724304199219,
+    0.6296310424804688
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "3257714f52406d743aaffb63e35f421dfa2f0d44272d8afc1411b1f05a7bb138"
+  },
+  {
+   "roi": "76b5fc46f2b2-L0-000",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 17062,
+   "encode_ms": 0.4137909272685647,
+   "decode_ms": 0.4474580055102706,
+   "psnr": 44.22722726531629,
+   "ssim": 0.9861853864663576,
+   "edge_mae": 3.0946327683615817,
+   "channel_mae": [
+    1.2520484924316406,
+    0.9117240905761719,
+    1.2566986083984375
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "2ed6f4c0554d8c489d27c7359e45e09b8676b263053a508af9b70b45d0f816f2"
+  },
+  {
+   "roi": "76b5fc46f2b2-L0-000",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 31861,
+   "encode_ms": 1.786750042811036,
+   "decode_ms": 0.6617499748244882,
+   "psnr": 47.648455590470185,
+   "ssim": 0.9908207508641999,
+   "edge_mae": 1.6144067796610169,
+   "channel_mae": [
+    0.7463493347167969,
+    0.6189804077148438,
+    0.7480888366699219
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "3da682c94df5c4663632cc90e7d10e575c7dc5e046b1d9913cce210b5947c5b0"
+  },
+  {
+   "roi": "76b5fc46f2b2-L0-001",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 4723,
+   "encode_ms": 0.3167500253766775,
+   "decode_ms": 0.23920799139887094,
+   "psnr": Infinity,
+   "ssim": 1.0,
+   "edge_mae": 0.0,
+   "channel_mae": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "034f36b2fc00788a7cfce869d32d324aa15204cef1714f96ea261e804c3701c7"
+  },
+  {
+   "roi": "76b5fc46f2b2-L0-001",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 3356,
+   "encode_ms": 1.0899589397013187,
+   "decode_ms": 0.35608396865427494,
+   "psnr": Infinity,
+   "ssim": 1.0,
+   "edge_mae": 0.0,
+   "channel_mae": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "31db3e228646aa900468b2fafb8ce9c00672e20797e90620ccdecbcad26c0dcb"
+  },
+  {
+   "roi": "76b5fc46f2b2-L0-002",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 4723,
+   "encode_ms": 0.3317079972475767,
+   "decode_ms": 0.2595830010250211,
+   "psnr": Infinity,
+   "ssim": 1.0,
+   "edge_mae": 0.0,
+   "channel_mae": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "034f36b2fc00788a7cfce869d32d324aa15204cef1714f96ea261e804c3701c7"
+  },
+  {
+   "roi": "76b5fc46f2b2-L0-002",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 3356,
+   "encode_ms": 1.0281250579282641,
+   "decode_ms": 0.37299992982298136,
+   "psnr": Infinity,
+   "ssim": 1.0,
+   "edge_mae": 0.0,
+   "channel_mae": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "31db3e228646aa900468b2fafb8ce9c00672e20797e90620ccdecbcad26c0dcb"
+  },
+  {
+   "roi": "76b5fc46f2b2-L2-000",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 6604,
+   "encode_ms": 0.3499999875202775,
+   "decode_ms": 0.35574997309595346,
+   "psnr": 51.37935998950211,
+   "ssim": 0.9965157342468484,
+   "edge_mae": 4.013745704467354,
+   "channel_mae": [
+    0.3088645935058594,
+    0.2965736389160156,
+    0.3673591613769531
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "314ac00b3da52e2600470bcefffca5f1df2da23a32937bd94fa6359b09394a58"
+  },
+  {
+   "roi": "76b5fc46f2b2-L2-000",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 10264,
+   "encode_ms": 1.3347079511731863,
+   "decode_ms": 0.460459035821259,
+   "psnr": 54.44790808222617,
+   "ssim": 0.9974299657686714,
+   "edge_mae": 2.2663230240549828,
+   "channel_mae": [
+    0.1659698486328125,
+    0.16637420654296875,
+    0.19423294067382812
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "8638823049bd80b3c4fabd6597a733eb58728f79807b48486d72cac4b24759e1"
+  },
+  {
+   "roi": "76b5fc46f2b2-L2-001",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 6134,
+   "encode_ms": 0.3643749514594674,
+   "decode_ms": 0.33566600177437067,
+   "psnr": 55.35214379764787,
+   "ssim": 0.9981352287068679,
+   "edge_mae": 2.4296724470134876,
+   "channel_mae": [
+    0.14733505249023438,
+    0.14339065551757812,
+    0.16203689575195312
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "1eb68de3ba990d91f9f6ced956155cb020a810fa8084fee7191e15da7856afdd"
+  },
+  {
+   "roi": "76b5fc46f2b2-L2-001",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 7738,
+   "encode_ms": 1.2172500137239695,
+   "decode_ms": 0.4144590348005295,
+   "psnr": 56.73940680578181,
+   "ssim": 0.9986878238355796,
+   "edge_mae": 1.7610789980732178,
+   "channel_mae": [
+    0.11932754516601562,
+    0.10318756103515625,
+    0.12862396240234375
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "e1928dd42bdfc547fcbef08de475366b52129f5fd016154fad146458f0861657"
+  },
+  {
+   "roi": "76b5fc46f2b2-L2-002",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 6155,
+   "encode_ms": 0.3541250480338931,
+   "decode_ms": 0.3317079972475767,
+   "psnr": 50.87730485331677,
+   "ssim": 0.9974380900947636,
+   "edge_mae": 3.041958041958042,
+   "channel_mae": [
+    0.3314094543457031,
+    0.2799263000488281,
+    0.4311332702636719
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "57caadca2b727acbf122c763658951691143f7b6619fbd3bd439e962d15ea510"
+  },
+  {
+   "roi": "76b5fc46f2b2-L2-002",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 7730,
+   "encode_ms": 1.2252910528331995,
+   "decode_ms": 0.4195829387754202,
+   "psnr": 55.120376640078675,
+   "ssim": 0.9981652221037087,
+   "edge_mae": 1.8694638694638694,
+   "channel_mae": [
+    0.1493072509765625,
+    0.13057708740234375,
+    0.17288589477539062
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "d7b9689bd362b41d59bce163c0f5b70e1c9b1bc24ddaf4431f38bb179bfa3465"
+  },
+  {
+   "roi": "76b5fc46f2b2-L4-000",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 26253,
+   "encode_ms": 0.39904098957777023,
+   "decode_ms": 0.4226249875500798,
+   "psnr": 37.80382663344455,
+   "ssim": 0.9884253855048941,
+   "edge_mae": 5.557353007535761,
+   "channel_mae": [
+    1.3719215393066406,
+    1.2559661865234375,
+    1.3729133605957031
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "f9afe137b4dd04d6d05c093aa78909da314000543532a75049c5e700b5ed9aa1"
+  },
+  {
+   "roi": "76b5fc46f2b2-L4-000",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 45116,
+   "encode_ms": 1.6372499521821737,
+   "decode_ms": 0.6159580079838634,
+   "psnr": 42.484580020411464,
+   "ssim": 0.9936626048935333,
+   "edge_mae": 3.225847209060963,
+   "channel_mae": [
+    0.7825698852539062,
+    0.7495231628417969,
+    0.7911834716796875
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "a6a7d4e055ef68f9c0de09f4d9db3a045182ab41cbcd8a4e1bd75e040e75ccce"
+  },
+  {
+   "roi": "76b5fc46f2b2-L4-001",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 27314,
+   "encode_ms": 0.4507920239120722,
+   "decode_ms": 0.4573339829221368,
+   "psnr": 37.97638232326286,
+   "ssim": 0.9889573037806287,
+   "edge_mae": 5.181850282485875,
+   "channel_mae": [
+    1.4401054382324219,
+    1.2752571105957031,
+    1.4199028015136719
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "a525016c358343ee9ce5fa510e2476fa5a02c47daba812402e57fec34800e257"
+  },
+  {
+   "roi": "76b5fc46f2b2-L4-001",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 47057,
+   "encode_ms": 1.7354580340906978,
+   "decode_ms": 0.576582970097661,
+   "psnr": 42.92141299985374,
+   "ssim": 0.9940750757358744,
+   "edge_mae": 2.923036446216905,
+   "channel_mae": [
+    0.7918472290039062,
+    0.7394676208496094,
+    0.8002204895019531
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "d1f56183efa91c92ce6556005846f25f5873855c32ea46e9a49d1c4a46c07a5c"
+  },
+  {
+   "roi": "76b5fc46f2b2-L4-002",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 27333,
+   "encode_ms": 0.3974169958382845,
+   "decode_ms": 0.48200006131082773,
+   "psnr": 38.25619189069116,
+   "ssim": 0.98987104586936,
+   "edge_mae": 4.970099781535279,
+   "channel_mae": [
+    1.4111518859863281,
+    1.2223320007324219,
+    1.3648529052734375
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "cd2075865365e9b447452bc18418afe0a10afea6e4b4e82315a2dfb0f88267f3"
+  },
+  {
+   "roi": "76b5fc46f2b2-L4-002",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 45749,
+   "encode_ms": 1.6247500898316503,
+   "decode_ms": 0.6013329839333892,
+   "psnr": 43.16453400269307,
+   "ssim": 0.9948085702383508,
+   "edge_mae": 2.8421917695642347,
+   "channel_mae": [
+    0.7631912231445312,
+    0.7023086547851562,
+    0.768524169921875
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "f3e9c4d4d888ef054cfa03993a3887b772338b83ae9a370cd187da28205da336"
+  },
+  {
+   "roi": "811bc9de3975-L0-000",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 4723,
+   "encode_ms": 0.3452079836279154,
+   "decode_ms": 0.2923329593613744,
+   "psnr": Infinity,
+   "ssim": 1.0,
+   "edge_mae": 0.0,
+   "channel_mae": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "034f36b2fc00788a7cfce869d32d324aa15204cef1714f96ea261e804c3701c7"
+  },
+  {
+   "roi": "811bc9de3975-L0-000",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 3356,
+   "encode_ms": 1.1167090851813555,
+   "decode_ms": 0.3164170775562525,
+   "psnr": Infinity,
+   "ssim": 1.0,
+   "edge_mae": 0.0,
+   "channel_mae": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "31db3e228646aa900468b2fafb8ce9c00672e20797e90620ccdecbcad26c0dcb"
+  },
+  {
+   "roi": "811bc9de3975-L0-001",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 17636,
+   "encode_ms": 0.4197909729555249,
+   "decode_ms": 0.43470808304846287,
+   "psnr": 44.15587671122792,
+   "ssim": 0.9855313476932303,
+   "edge_mae": 2.797900262467192,
+   "channel_mae": [
+    1.2639350891113281,
+    0.9324760437011719,
+    1.3063888549804688
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "9809db529cd3737d1468492f282f85599ba391410dce4dda42d335270614e1ab"
+  },
+  {
+   "roi": "811bc9de3975-L0-001",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 32349,
+   "encode_ms": 1.8149579409509897,
+   "decode_ms": 0.7283749291673303,
+   "psnr": 47.7033940800947,
+   "ssim": 0.9904715283271587,
+   "edge_mae": 1.7139107611548556,
+   "channel_mae": [
+    0.7531814575195312,
+    0.6291999816894531,
+    0.7353515625
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "41a116e9c6cefac75aec4a00616469887f13b228660b4b73dd42e091b151ed1e"
+  },
+  {
+   "roi": "811bc9de3975-L0-002",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 18872,
+   "encode_ms": 0.417000032030046,
+   "decode_ms": 0.46754092909395695,
+   "psnr": 44.050712561987666,
+   "ssim": 0.9848008044067278,
+   "edge_mae": 2.1989247311827955,
+   "channel_mae": [
+    1.2818984985351562,
+    0.9596061706542969,
+    1.3019752502441406
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "b6814994300ff7085be8bd89da5d0dc3a040f3d731c7413fb19efc845ce93873"
+  },
+  {
+   "roi": "811bc9de3975-L0-002",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 35003,
+   "encode_ms": 1.6746250912547112,
+   "decode_ms": 0.6549579557031393,
+   "psnr": 47.4547943017254,
+   "ssim": 0.9900760656291958,
+   "edge_mae": 1.7956989247311828,
+   "channel_mae": [
+    0.7753791809082031,
+    0.6553115844726562,
+    0.778656005859375
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "ea734a779ee8f5cbbbb48fad4b843dc8bc98a754dc3e43e8d47992cd800d303b"
+  },
+  {
+   "roi": "811bc9de3975-L2-000",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 6240,
+   "encode_ms": 0.37158303894102573,
+   "decode_ms": 0.3536250442266464,
+   "psnr": 51.30134413836878,
+   "ssim": 0.9980252429609794,
+   "edge_mae": 3.6396396396396398,
+   "channel_mae": [
+    0.24288177490234375,
+    0.21802520751953125,
+    0.43044281005859375
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "f0e459fa39a4dc3950c31b2e9593143a04c358425555ab1a24acf2157a5d182b"
+  },
+  {
+   "roi": "811bc9de3975-L2-000",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 7004,
+   "encode_ms": 1.3484579976648092,
+   "decode_ms": 0.5557090044021606,
+   "psnr": 56.74434007942671,
+   "ssim": 0.9986626905904077,
+   "edge_mae": 2.454954954954955,
+   "channel_mae": [
+    0.09663009643554688,
+    0.09153366088867188,
+    0.12198638916015625
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "5c1e116672d8f310362addc146a015e81af2336cbf98ec420af3adda39983ad2"
+  },
+  {
+   "roi": "811bc9de3975-L2-001",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 13062,
+   "encode_ms": 0.3635829780250788,
+   "decode_ms": 0.40616700425744057,
+   "psnr": 42.313759885127766,
+   "ssim": 0.9958475790591504,
+   "edge_mae": 5.337877373171491,
+   "channel_mae": [
+    0.8041648864746094,
+    0.6409149169921875,
+    0.6700248718261719
+   ],
+   "weak": {
+    "weak_pixels": 2,
+    "weak_mae": 9.666666666666666,
+    "weak_exceed": 0.5
+   },
+   "output_sha256": "49b3ae893833cd8540b5125962bd8c3d74999cd710fe22fa8de7abf3b9754857"
+  },
+  {
+   "roi": "811bc9de3975-L2-001",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 21578,
+   "encode_ms": 1.3953339075669646,
+   "decode_ms": 0.46208291314542294,
+   "psnr": 47.939706444331264,
+   "ssim": 0.9975282283745464,
+   "edge_mae": 2.8223259674240064,
+   "channel_mae": [
+    0.3272209167480469,
+    0.2939033508300781,
+    0.3127326965332031
+   ],
+   "weak": {
+    "weak_pixels": 2,
+    "weak_mae": 2.666666666666667,
+    "weak_exceed": 0.0
+   },
+   "output_sha256": "cb8c79618e3cd90f72c3decaab728bf97e505c4ab2223473d6a30e40e1f16bf6"
+  },
+  {
+   "roi": "811bc9de3975-L2-002",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 14322,
+   "encode_ms": 0.386166968382895,
+   "decode_ms": 0.41708291973918676,
+   "psnr": 40.70380790860149,
+   "ssim": 0.9951589557955389,
+   "edge_mae": 6.558029841770963,
+   "channel_mae": [
+    0.8527488708496094,
+    0.6995353698730469,
+    0.7032966613769531
+   ],
+   "weak": {
+    "weak_pixels": 36,
+    "weak_mae": 7.3425925925925934,
+    "weak_exceed": 0.16666666666666666
+   },
+   "output_sha256": "2ce84c21fac6764bf018be587d833531fc8af4e8e08e52342fae75b5259309cf"
+  },
+  {
+   "roi": "811bc9de3975-L2-002",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 23219,
+   "encode_ms": 1.4275000430643559,
+   "decode_ms": 0.44641701970249414,
+   "psnr": 46.02153936893519,
+   "ssim": 0.9972017491415206,
+   "edge_mae": 3.531777351824708,
+   "channel_mae": [
+    0.3913154602050781,
+    0.35953521728515625,
+    0.36768341064453125
+   ],
+   "weak": {
+    "weak_pixels": 36,
+    "weak_mae": 3.9166666666666665,
+    "weak_exceed": 0.0
+   },
+   "output_sha256": "7f2e896f2df25b0fe4f7a261ef188b56af92e699a273582cbfd1308ac95babb1"
+  },
+  {
+   "roi": "811bc9de3975-L4-000",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 19828,
+   "encode_ms": 0.39612501859664917,
+   "decode_ms": 0.42970897629857063,
+   "psnr": 39.687973936941965,
+   "ssim": 0.9943471985333209,
+   "edge_mae": 5.079034164569511,
+   "channel_mae": [
+    1.037384033203125,
+    0.8437232971191406,
+    1.0471763610839844
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "0740f8dfc01e41bda5fe22caf18fe9d98da08c4a19bf8b56335390006af6d6d8"
+  },
+  {
+   "roi": "811bc9de3975-L4-000",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 33630,
+   "encode_ms": 1.4863749966025352,
+   "decode_ms": 0.49662496894598007,
+   "psnr": 44.89584181533842,
+   "ssim": 0.9968221366088554,
+   "edge_mae": 2.791199572942881,
+   "channel_mae": [
+    0.5464096069335938,
+    0.4774971008300781,
+    0.5436744689941406
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "d38ee64e14c1c9cf3a0419850947b95ddbb0614b2b31462c7e9ca96a21b46f09"
+  },
+  {
+   "roi": "811bc9de3975-L4-001",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 20568,
+   "encode_ms": 0.41516695637255907,
+   "decode_ms": 0.42920897249132395,
+   "psnr": 39.14757229901181,
+   "ssim": 0.9934065604421929,
+   "edge_mae": 5.46925746524878,
+   "channel_mae": [
+    1.0526657104492188,
+    0.8999290466308594,
+    1.0368919372558594
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "3cc464c35471ce4948b7a819210c5dc404d4677025e3ec4131f169772a244c77"
+  },
+  {
+   "roi": "811bc9de3975-L4-001",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 34765,
+   "encode_ms": 1.5439579728990793,
+   "decode_ms": 0.5481250118464231,
+   "psnr": 44.04038223138707,
+   "ssim": 0.9963251739872501,
+   "edge_mae": 3.091865709036245,
+   "channel_mae": [
+    0.5880241394042969,
+    0.5317039489746094,
+    0.589385986328125
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "c76024c437a4a0515b72434f7de942c7de000b88202bbbd2a9ff3de3e243d4b9"
+  },
+  {
+   "roi": "811bc9de3975-L4-002",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 19506,
+   "encode_ms": 0.38124993443489075,
+   "decode_ms": 0.43987506069242954,
+   "psnr": 39.87326499946982,
+   "ssim": 0.9945476031564153,
+   "edge_mae": 5.070318456395519,
+   "channel_mae": [
+    0.9889945983886719,
+    0.81378173828125,
+    0.9812278747558594
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "6299e00abb107d1d2849b7b8be2f5b9112e89ad92a575670d6c94553bfbce023"
+  },
+  {
+   "roi": "811bc9de3975-L4-002",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 32463,
+   "encode_ms": 1.5382500132545829,
+   "decode_ms": 0.5197080317884684,
+   "psnr": 44.99087410195206,
+   "ssim": 0.9969415797595026,
+   "edge_mae": 2.8119367388031984,
+   "channel_mae": [
+    0.5224227905273438,
+    0.4608421325683594,
+    0.52239990234375
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "841ac3c15dfd87568bdf1e985f9458474b917679f64a317e8163f390ab6cfc0b"
+  },
+  {
+   "roi": "317823bedc4a-L0-000",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 18435,
+   "encode_ms": 0.4076249897480011,
+   "decode_ms": 0.4147080471739173,
+   "psnr": 44.12334149040206,
+   "ssim": 0.9853660592371093,
+   "edge_mae": 2.648854961832061,
+   "channel_mae": [
+    1.2397842407226562,
+    0.9372825622558594,
+    1.314971923828125
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "957ca4dc9efbc555fd57bf5cd0d80460322a7adf7c577223d507190c3a3c653a"
+  },
+  {
+   "roi": "317823bedc4a-L0-000",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 33966,
+   "encode_ms": 1.6817920841276646,
+   "decode_ms": 0.6431250367313623,
+   "psnr": 47.557327274055304,
+   "ssim": 0.9902662685285879,
+   "edge_mae": 1.6743002544529262,
+   "channel_mae": [
+    0.7477302551269531,
+    0.638031005859375,
+    0.7705612182617188
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "b1b30c571087a3ab4b883f23048ddcea88c15fab21853f7bb23d75bcb0dcaaac"
+  },
+  {
+   "roi": "317823bedc4a-L0-001",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 19295,
+   "encode_ms": 0.4184580175206065,
+   "decode_ms": 0.46199990902096033,
+   "psnr": 47.20317259583723,
+   "ssim": 0.9890881257048905,
+   "edge_mae": 1.5395189003436427,
+   "channel_mae": [
+    0.794219970703125,
+    0.6634368896484375,
+    0.7488174438476562
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "cb6ccd3496666aaeaa40951ad7fea2bb0395d6db0f149184dbf3b703768da6bf"
+  },
+  {
+   "roi": "317823bedc4a-L0-001",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 32614,
+   "encode_ms": 1.8063329625874758,
+   "decode_ms": 0.90637500397861,
+   "psnr": 48.57215354547769,
+   "ssim": 0.9929873902664395,
+   "edge_mae": 1.29553264604811,
+   "channel_mae": [
+    0.6464042663574219,
+    0.5290336608886719,
+    0.62225341796875
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "1ad452b5b862352f067cbc56e43ad634743d45e8814578fd59b5c6cb0a017176"
+  },
+  {
+   "roi": "317823bedc4a-L0-002",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 18872,
+   "encode_ms": 0.41804101783782244,
+   "decode_ms": 0.4777089925482869,
+   "psnr": 44.81215266986421,
+   "ssim": 0.9849011541585896,
+   "edge_mae": 2.5668662674650697,
+   "channel_mae": [
+    1.1310577392578125,
+    0.8990249633789062,
+    1.1132431030273438
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "792cc0b9fce81c7cab50eba7228f1a10f6f887b63212e6c2b3201c03742a001e"
+  },
+  {
+   "roi": "317823bedc4a-L0-002",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 34564,
+   "encode_ms": 1.68674997985363,
+   "decode_ms": 0.642166007310152,
+   "psnr": 47.43745033837969,
+   "ssim": 0.9900283783931828,
+   "edge_mae": 1.8323353293413174,
+   "channel_mae": [
+    0.7551002502441406,
+    0.651397705078125,
+    0.7920417785644531
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "006396689d1ae253613781f39eb512acff9e5560d85ab59d3c7a701324ffc252"
+  },
+  {
+   "roi": "317823bedc4a-L2-000",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 6299,
+   "encode_ms": 0.3852499648928642,
+   "decode_ms": 0.3411249490454793,
+   "psnr": 49.78468120321381,
+   "ssim": 0.9973643529428187,
+   "edge_mae": 4.170068027210885,
+   "channel_mae": [
+    0.3607673645019531,
+    0.3301048278808594,
+    0.6254653930664062
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "fde9580afea1129142f3962a01b1ba2dfb7443072204c0f09f6069a068e0f6bb"
+  },
+  {
+   "roi": "317823bedc4a-L2-000",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 9987,
+   "encode_ms": 1.3575420016422868,
+   "decode_ms": 0.5571250803768635,
+   "psnr": 54.643407037378644,
+   "ssim": 0.9980409885950432,
+   "edge_mae": 1.9931972789115646,
+   "channel_mae": [
+    0.16210174560546875,
+    0.15395736694335938,
+    0.21014022827148438
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "eb0e367ad493b66368724a9e7201981a204e73918ed22483c5585ebf144df48f"
+  },
+  {
+   "roi": "317823bedc4a-L2-001",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 10647,
+   "encode_ms": 0.36204198841005564,
+   "decode_ms": 0.3612919244915247,
+   "psnr": 44.92405910761452,
+   "ssim": 0.9954760454305762,
+   "edge_mae": 4.54145880574452,
+   "channel_mae": [
+    0.4950408935546875,
+    0.4046173095703125,
+    0.4725990295410156
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "d1ee6a5d7475275a413b13ecb4491bd0f814ecf714fef80ee08e9552a72682f2"
+  },
+  {
+   "roi": "317823bedc4a-L2-001",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 17558,
+   "encode_ms": 1.351166982203722,
+   "decode_ms": 0.4778339061886072,
+   "psnr": 49.11085591169709,
+   "ssim": 0.9971491745113596,
+   "edge_mae": 2.784882842025699,
+   "channel_mae": [
+    0.25140380859375,
+    0.24245071411132812,
+    0.27176666259765625
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "e801eca115bcd2493ce326b0b01925fbd5dd0903ef46cb43defc75708ddf398b"
+  },
+  {
+   "roi": "317823bedc4a-L2-002",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 6355,
+   "encode_ms": 0.3500418970361352,
+   "decode_ms": 0.32941706012934446,
+   "psnr": 53.70422525873292,
+   "ssim": 0.9978264224218152,
+   "edge_mae": 3.0789473684210527,
+   "channel_mae": [
+    0.16771697998046875,
+    0.15328598022460938,
+    0.28919219970703125
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "5a69fa0f7eb99226f196c34f2c1744d2b2f7bfb2b7a0c1a7bfc56d5cd2412ddd"
+  },
+  {
+   "roi": "317823bedc4a-L2-002",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 2,
+   "mag_band": "mid",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 9183,
+   "encode_ms": 1.2405409943312407,
+   "decode_ms": 0.4087910056114197,
+   "psnr": 55.7530802223489,
+   "ssim": 0.9985211207976376,
+   "edge_mae": 2.3947368421052633,
+   "channel_mae": [
+    0.10645294189453125,
+    0.097503662109375,
+    0.19477462768554688
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "483b21491e9b5ba52befe6527bbcc759ac8dfda73184cfdd7e3532af98595253"
+  },
+  {
+   "roi": "317823bedc4a-L4-000",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 27647,
+   "encode_ms": 0.4058750346302986,
+   "decode_ms": 0.433583976700902,
+   "psnr": 37.51684817385652,
+   "ssim": 0.9878926122781778,
+   "edge_mae": 5.499577631356648,
+   "channel_mae": [
+    1.4656295776367188,
+    1.3615379333496094,
+    1.55682373046875
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "128e2410a796523ad746d12dd3d038c24d004ef344812ab3518378cf8fd080a0"
+  },
+  {
+   "roi": "317823bedc4a-L4-000",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 47806,
+   "encode_ms": 1.72737508546561,
+   "decode_ms": 0.612374977208674,
+   "psnr": 42.222402170759814,
+   "ssim": 0.9935373504613316,
+   "edge_mae": 3.181523906065214,
+   "channel_mae": [
+    0.8197059631347656,
+    0.7984390258789062,
+    0.8695106506347656
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "8c9642c1a6c00e98108abbe9eb7828fa9797da126738ed55377dc75fd9be48a4"
+  },
+  {
+   "roi": "317823bedc4a-L4-001",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 25301,
+   "encode_ms": 0.38958305958658457,
+   "decode_ms": 0.42054092045873404,
+   "psnr": 38.385287755954906,
+   "ssim": 0.9911413443989605,
+   "edge_mae": 5.0777481812453455,
+   "channel_mae": [
+    1.3611297607421875,
+    1.1780204772949219,
+    1.4132461547851562
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "f35468e22e664ddcb6ad9edea62f7b74b708fe2d989da8b88b3501aa9678e5d8"
+  },
+  {
+   "roi": "317823bedc4a-L4-001",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 43263,
+   "encode_ms": 1.6255000373348594,
+   "decode_ms": 0.5737920291721821,
+   "psnr": 43.51034755013944,
+   "ssim": 0.9952666321647963,
+   "edge_mae": 2.803774989975368,
+   "channel_mae": [
+    0.7192192077636719,
+    0.6586875915527344,
+    0.7476463317871094
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "08d58865792e3744a925b2b8ecb4f733dcc75c92cf0f03df40420580b28f80fb"
+  },
+  {
+   "roi": "317823bedc4a-L4-002",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 26912,
+   "encode_ms": 0.4188750172033906,
+   "decode_ms": 0.4858339671045542,
+   "psnr": 37.83578121924504,
+   "ssim": 0.988671668941893,
+   "edge_mae": 5.357985016862941,
+   "channel_mae": [
+    1.4478797912597656,
+    1.3005104064941406,
+    1.5053253173828125
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "844dfd8400e19de349725384f474f56adc2454f16372ab60dabfd95d4a0fdceb"
+  },
+  {
+   "roi": "317823bedc4a-L4-002",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 4,
+   "mag_band": "high",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 46996,
+   "encode_ms": 1.8321250099688768,
+   "decode_ms": 0.6458340212702751,
+   "psnr": 42.58207613132839,
+   "ssim": 0.9937328168999287,
+   "edge_mae": 3.077230884060375,
+   "channel_mae": [
+    0.8013572692871094,
+    0.7635688781738281,
+    0.8444671630859375
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "ab9647bc7e026d7a77e5aa7a1df3e410f793ff629a0a9c59692d2d5c725e3825"
+  },
+  {
+   "roi": "e486497cdae5-L0-000",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 14696,
+   "encode_ms": 0.40324998553842306,
+   "decode_ms": 0.3798749530687928,
+   "psnr": 48.66819850834304,
+   "ssim": 0.9899781517276085,
+   "edge_mae": 1.9253877871588454,
+   "channel_mae": [
+    0.4911842346191406,
+    0.4911842346191406,
+    0.4911842346191406
+   ],
+   "weak": {
+    "weak_pixels": 41464,
+    "weak_mae": 0.9438307929770403,
+    "weak_exceed": 7.23519197376037e-05
+   },
+   "output_sha256": "a132d168a9e9dc3fdacd6b0a8f3417921c04ba7af8eb7f44176f7ac64f92ef16"
+  },
+  {
+   "roi": "e486497cdae5-L0-000",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 21278,
+   "encode_ms": 1.4772920403629541,
+   "decode_ms": 0.4657920217141509,
+   "psnr": 50.697284481142106,
+   "ssim": 0.9937191886817018,
+   "edge_mae": 1.4301983114078147,
+   "channel_mae": [
+    0.3683967590332031,
+    0.3683967590332031,
+    0.3683967590332031
+   ],
+   "weak": {
+    "weak_pixels": 41464,
+    "weak_mae": 0.713317576693035,
+    "weak_exceed": 2.4117306579201234e-05
+   },
+   "output_sha256": "6ebe050d3b33ad55fafbbc54fc620f9c87b4f9036bb69b763c7afebd146fff9e"
+  },
+  {
+   "roi": "e486497cdae5-L0-001",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 9581,
+   "encode_ms": 0.3757079830393195,
+   "decode_ms": 0.33229205291718245,
+   "psnr": 51.7642549493476,
+   "ssim": 0.9920706565039936,
+   "edge_mae": 2.3441734417344176,
+   "channel_mae": [
+    0.28897857666015625,
+    0.28897857666015625,
+    0.28897857666015625
+   ],
+   "weak": {
+    "weak_pixels": 13624,
+    "weak_mae": 0.8647974163241339,
+    "weak_exceed": 0.0001467997651203758
+   },
+   "output_sha256": "5951b90fdc3bdf7ca96e27a1b6f2f3a36d0761ba773e42c27b2f0b46c96ae4a1"
+  },
+  {
+   "roi": "e486497cdae5-L0-001",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 13141,
+   "encode_ms": 1.2180409394204617,
+   "decode_ms": 0.3842500736936927,
+   "psnr": 53.672931632440125,
+   "ssim": 0.9955040140854945,
+   "edge_mae": 1.7360433604336043,
+   "channel_mae": [
+    0.21416854858398438,
+    0.21416854858398438,
+    0.21416854858398438
+   ],
+   "weak": {
+    "weak_pixels": 13624,
+    "weak_mae": 0.6394597768643571,
+    "weak_exceed": 0.0
+   },
+   "output_sha256": "628474a4556a8ecff136aa4fe3e342461043cd5aae212ea3ba00ffa3310a905d"
+  },
+  {
+   "roi": "e486497cdae5-L0-002",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 4723,
+   "encode_ms": 0.3137919120490551,
+   "decode_ms": 0.32774999272078276,
+   "psnr": Infinity,
+   "ssim": 1.0,
+   "edge_mae": 0.0,
+   "channel_mae": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "67b31f77f8f519072f6640e088bb603db2056343dc8814679f04b3b4e1c85835"
+  },
+  {
+   "roi": "e486497cdae5-L0-002",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 3356,
+   "encode_ms": 1.1705420911312103,
+   "decode_ms": 0.37116697058081627,
+   "psnr": Infinity,
+   "ssim": 1.0,
+   "edge_mae": 0.0,
+   "channel_mae": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "weak": {
+    "weak_pixels": 0,
+    "weak_mae": null,
+    "weak_exceed": null
+   },
+   "output_sha256": "1156aa1d29ea99e29487c6c6f1162a389ff0b7430e7e63aa3043a3d83c02aa2c"
+  },
+  {
+   "roi": "e486497cdae5-L0-003",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 5346,
+   "encode_ms": 0.34449994564056396,
+   "decode_ms": 0.3066669451072812,
+   "psnr": 60.56108469456124,
+   "ssim": 0.9982407049755164,
+   "edge_mae": 2.014423076923077,
+   "channel_mae": [
+    0.0423736572265625,
+    0.0423736572265625,
+    0.0423736572265625
+   ],
+   "weak": {
+    "weak_pixels": 215,
+    "weak_mae": 2.2232558139534886,
+    "weak_exceed": 0.0
+   },
+   "output_sha256": "3a46c6ca3d2b13353eb54eedf1cd611d81bc77c91315b8a1b3cf433b70d5d256"
+  },
+  {
+   "roi": "e486497cdae5-L0-003",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 4624,
+   "encode_ms": 1.1080410331487656,
+   "decode_ms": 0.3705840790644288,
+   "psnr": 62.72865332950482,
+   "ssim": 0.9991485626461934,
+   "edge_mae": 1.3990384615384615,
+   "channel_mae": [
+    0.027435302734375,
+    0.027435302734375,
+    0.027435302734375
+   ],
+   "weak": {
+    "weak_pixels": 215,
+    "weak_mae": 1.6325581395348838,
+    "weak_exceed": 0.0
+   },
+   "output_sha256": "06106db705c40f7f234cb13b99b1634432b967f38ae0c1184a923d8b0ae66d1f"
+  },
+  {
+   "roi": "e486497cdae5-L0-004",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 5566,
+   "encode_ms": 0.34170900471508503,
+   "decode_ms": 0.3504169872030616,
+   "psnr": 57.80770969411882,
+   "ssim": 0.9962607945092579,
+   "edge_mae": 2.240740740740741,
+   "channel_mae": [
+    0.08961105346679688,
+    0.08961105346679688,
+    0.08961105346679688
+   ],
+   "weak": {
+    "weak_pixels": 244,
+    "weak_mae": 2.2172131147540983,
+    "weak_exceed": 0.0
+   },
+   "output_sha256": "689ab5f0a5f312ff4f5590f27a5dcacb4d6c20fdde054a4080044115c3e5ce0d"
+  },
+  {
+   "roi": "e486497cdae5-L0-004",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 5875,
+   "encode_ms": 1.3370000524446368,
+   "decode_ms": 0.4192920168861747,
+   "psnr": 59.37705541788469,
+   "ssim": 0.9979616381809784,
+   "edge_mae": 1.6058201058201058,
+   "channel_mae": [
+    0.06686782836914062,
+    0.06686782836914062,
+    0.06686782836914062
+   ],
+   "weak": {
+    "weak_pixels": 244,
+    "weak_mae": 1.6762295081967213,
+    "weak_exceed": 0.0
+   },
+   "output_sha256": "95460f12d6988ec5283ef6dc4245646aaeef4ff9a93873fad6d4a07b4db48b37"
+  },
+  {
+   "roi": "e486497cdae5-L0-005",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 21456,
+   "encode_ms": 0.4069999558851123,
+   "decode_ms": 0.41125004645437,
+   "psnr": 46.026482569749795,
+   "ssim": 0.988905497640424,
+   "edge_mae": 1.9130065775514535,
+   "channel_mae": [
+    0.7069053649902344,
+    0.7069053649902344,
+    0.7069053649902344
+   ],
+   "weak": {
+    "weak_pixels": 48366,
+    "weak_mae": 1.2580325021709466,
+    "weak_exceed": 0.0001033784063184882
+   },
+   "output_sha256": "8111677578fca6c58894232a8d6c766c6f5d9bf2ba4d2a9177140b42a9773570"
+  },
+  {
+   "roi": "e486497cdae5-L0-005",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 30393,
+   "encode_ms": 1.5003751032054424,
+   "decode_ms": 0.5637089489027858,
+   "psnr": 48.31713039451115,
+   "ssim": 0.9932094509800126,
+   "edge_mae": 1.4232669515928587,
+   "channel_mae": [
+    0.5259819030761719,
+    0.5259819030761719,
+    0.5259819030761719
+   ],
+   "weak": {
+    "weak_pixels": 48366,
+    "weak_mae": 0.9388620105032461,
+    "weak_exceed": 0.0
+   },
+   "output_sha256": "ffb0c3921ec983f52e16004bfb8e26dae9a64dc77d3d34648923b966439dc2c5"
+  },
+  {
+   "roi": "e486497cdae5-L0-006",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 4795,
+   "encode_ms": 0.3424169262871146,
+   "decode_ms": 0.30037504620850086,
+   "psnr": 70.28859595426371,
+   "ssim": 0.9998798284386995,
+   "edge_mae": 1.9863013698630136,
+   "channel_mae": [
+    0.003246307373046875,
+    0.003246307373046875,
+    0.003246307373046875
+   ],
+   "weak": {
+    "weak_pixels": 35,
+    "weak_mae": 2.6285714285714286,
+    "weak_exceed": 0.0
+   },
+   "output_sha256": "7a4aedd067d1195b7738855a5c801e1150a8b9146cecac1189235bc79c6df51d"
+  },
+  {
+   "roi": "e486497cdae5-L0-006",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 3524,
+   "encode_ms": 1.1182919843122363,
+   "decode_ms": 0.3451660741120577,
+   "psnr": 72.06724322712087,
+   "ssim": 0.9999294881422653,
+   "edge_mae": 1.6986301369863013,
+   "channel_mae": [
+    0.002513885498046875,
+    0.002513885498046875,
+    0.002513885498046875
+   ],
+   "weak": {
+    "weak_pixels": 35,
+    "weak_mae": 1.9714285714285715,
+    "weak_exceed": 0.0
+   },
+   "output_sha256": "f788787c6b5c1114c785141ca3fc894c92cf18df8c6f1d423caf0ff504c6b553"
+  },
+  {
+   "roi": "e486497cdae5-L0-007",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 24152,
+   "encode_ms": 0.452833017334342,
+   "decode_ms": 0.4232079954817891,
+   "psnr": 45.42371820584114,
+   "ssim": 0.9833713940207586,
+   "edge_mae": 2.279376024416436,
+   "channel_mae": [
+    0.9068756103515625,
+    0.9068756103515625,
+    0.9068756103515625
+   ],
+   "weak": {
+    "weak_pixels": 223709,
+    "weak_mae": 0.8457326258666392,
+    "weak_exceed": 6.70513926574255e-05
+   },
+   "output_sha256": "abd26904cc342ab3f03faf87da5ad3c1e4b3c99995d54b36b81748a198214ade"
+  },
+  {
+   "roi": "e486497cdae5-L0-007",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 35446,
+   "encode_ms": 1.5158751048147678,
+   "decode_ms": 0.5642910255119205,
+   "psnr": 47.531547976883076,
+   "ssim": 0.9890923561846343,
+   "edge_mae": 1.7175719210987397,
+   "channel_mae": [
+    0.6857986450195312,
+    0.6857986450195312,
+    0.6857986450195312
+   ],
+   "weak": {
+    "weak_pixels": 223709,
+    "weak_mae": 0.6421824781300708,
+    "weak_exceed": 4.470092843828366e-06
+   },
+   "output_sha256": "08b1e2eb491df444c93d318c0d041ed44b894485f9df9377ecb30a6ff7417618"
+  },
+  {
+   "roi": "e486497cdae5-L0-008",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 15733,
+   "encode_ms": 0.4087910056114197,
+   "decode_ms": 0.4104580730199814,
+   "psnr": 48.005541927981966,
+   "ssim": 0.9878627181455276,
+   "edge_mae": 2.108522114347357,
+   "channel_mae": [
+    0.5717735290527344,
+    0.5717735290527344,
+    0.5717735290527344
+   ],
+   "weak": {
+    "weak_pixels": 97715,
+    "weak_mae": 0.877685104641048,
+    "weak_exceed": 1.0233843319858773e-05
+   },
+   "output_sha256": "0f77221c793942d336a4e832851e896ced68142dea17d727d19e1a789f9f9e0b"
+  },
+  {
+   "roi": "e486497cdae5-L0-008",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 23381,
+   "encode_ms": 1.4106249436736107,
+   "decode_ms": 0.5018749507144094,
+   "psnr": 50.003036399100715,
+   "ssim": 0.9925462895618624,
+   "edge_mae": 1.60873786407767,
+   "channel_mae": [
+    0.4300537109375,
+    0.4300537109375,
+    0.4300537109375
+   ],
+   "weak": {
+    "weak_pixels": 97715,
+    "weak_mae": 0.6718211124187689,
+    "weak_exceed": 1.0233843319858773e-05
+   },
+   "output_sha256": "fff3b76d3c837d0b0943e29c221c962a08f601d67bfa4b770736ee4b35a9c10b"
+  },
+  {
+   "roi": "e486497cdae5-L0-009",
+   "config": "baseline",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "legacy",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 5405,
+   "encode_ms": 0.3320830874145031,
+   "decode_ms": 0.3102089976891875,
+   "psnr": 61.062691623048195,
+   "ssim": 0.9988318067942576,
+   "edge_mae": 2.096096096096096,
+   "channel_mae": [
+    0.03064727783203125,
+    0.03064727783203125,
+    0.03064727783203125
+   ],
+   "weak": {
+    "weak_pixels": 469,
+    "weak_mae": 1.8017057569296375,
+    "weak_exceed": 0.0
+   },
+   "output_sha256": "281f941fcb1c4e657c9b42d0900c469af8d12bb2c2ad4e74a8b6942e478fcea1"
+  },
+  {
+   "roi": "e486497cdae5-L0-009",
+   "config": "candidate",
+   "kind": "rgb",
+   "synthetic": false,
+   "profile_id": "native-detail-q90",
+   "level": 0,
+   "mag_band": "low",
+   "in_size": [
+    512,
+    512
+   ],
+   "out_size": [
+    512,
+    512
+   ],
+   "bytes": 4600,
+   "encode_ms": 1.1562079889699817,
+   "decode_ms": 0.33837498631328344,
+   "psnr": 63.003658764031584,
+   "ssim": 0.9994195524522547,
+   "edge_mae": 1.5855855855855856,
+   "channel_mae": [
+    0.02217864990234375,
+    0.02217864990234375,
+    0.02217864990234375
+   ],
+   "weak": {
+    "weak_pixels": 469,
+    "weak_mae": 1.3837953091684434,
+    "weak_exceed": 0.0
+   },
+   "output_sha256": "9145fcb9ab370d50fcdfe26d130de4de2c6250767baa02326a2e8484e62aabe4"
+  }
+ ]
+}

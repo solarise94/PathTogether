@@ -14,6 +14,8 @@
       compositeOperation: "source-over",
       minZoomImageRatio: 0.5,
       maxZoomPixelRatio: 10,
+      // minPixelRatio=0.4：屏幕 DPR 低于 0.4 才允许换更低层——策略**偏向高分
+      // 辨率**（多数场景按 DPR 选层），不是"省带宽"的降质手段；不改阈值。
       minPixelRatio: 0.4,
       defaultZoomLevel: 0,
       immediateRender: false,

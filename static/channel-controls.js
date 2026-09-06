@@ -118,15 +118,50 @@
   }
 
   // ------------------------------------------------------------------ #
+  // viewer 画质 query（image-transport-upgrade §3.3/§5.2）：由
+  // HP_ViewerEncoding 按当前模式偏好与 dv 拼装；模块缺失/能力缺失时返回
+  // ""（旧 URL 语义）。画质状态不进入 render context（§3.3 硬边界）。
+  // ------------------------------------------------------------------ #
+  function qualityTileQuery() {
+    try {
+      if (root.HP_ViewerEncoding && root.HP_ViewerEncoding.tileQuery) {
+        return root.HP_ViewerEncoding.tileQuery();
+      }
+    } catch (e) { /* 模块未加载：旧 URL */ }
+    return "";
+  }
+
+  function qualityThumbnailQuery() {
+    try {
+      if (root.HP_ViewerEncoding && root.HP_ViewerEncoding.thumbnailQuery) {
+        return root.HP_ViewerEncoding.thumbnailQuery();
+      }
+    } catch (e) { /* 模块未加载：旧 URL */ }
+    return "";
+  }
+
+  function handleDisplayCapability(rawInfo) {
+    try {
+      if (root.HP_ViewerEncoding && root.HP_ViewerEncoding.handleDisplay) {
+        return root.HP_ViewerEncoding.handleDisplay(rawInfo.display || null);
+      }
+    } catch (e) { /* 模块未加载：按能力缺失回退 */ }
+    return { available: false };
+  }
+
+  // ------------------------------------------------------------------ #
   // OpenSeadragon inline custom TileSource（§7.3/§8.1）
   // OSD Viewer.open(plainObject) 对带 getTileUrl 的对象走
   //   new OpenSeadragon.TileSource(obj) + 拷贝 getTileUrl（已核对 5.0.1 源码），
   // width/height/tileSize/tileOverlap/minLevel/maxLevel 全部生效，ready 立即置真。
-  // 瓦片 URL 由页面 adapter 拼接并携带 render token（缓存内容寻址，§7.3）。
+  // 瓦片 URL 由页面 adapter 拼接并携带 render token（缓存内容寻址，§7.3）；
+  // image-transport-upgrade 起可附加画质 query（?profile=&dv=，服务端声明
+  // display 能力时才有），adapter 负责与 render 参数的拼接顺序。
   // ------------------------------------------------------------------ #
   function createDeepZoomTileSource(info, adapter, renderToken) {
     var dz = info.deepzoom || {};
     var slideId = info.slideId || info.slide_id || info.name;
+    var qualityQuery = qualityTileQuery();
     return {
       width: dz.width,
       height: dz.height,
@@ -135,7 +170,8 @@
       minLevel: dz.min_level || 0,
       maxLevel: dz.max_level != null ? dz.max_level : 0,
       getTileUrl: function (level, x, y) {
-        return adapter.tileUrl(slideId, level, x, y, renderToken);
+        return adapter.tileUrl(slideId, level, x, y, renderToken,
+                               qualityQuery);
       },
     };
   }
@@ -614,10 +650,18 @@
           ctrl.renderFingerprint = res.data.render_context_fingerprint
             || (ctrl.renderContext && ctrl.renderContext.fingerprint) || null;
           ctrl.renderToken = res.data.render_token || null;
+          // 自定义 context 的显示身份（§5.2 additive）：画质档 dv 随 fp 更新；
+          // 只影响 URL 身份，不触发 hp-render-context-changed / AI 重绑
+          try {
+            if (root.HP_ViewerEncoding && root.HP_ViewerEncoding.handleDisplayVersions) {
+              root.HP_ViewerEncoding.handleDisplayVersions(res.data.display_versions);
+            }
+          } catch (e) { /* 模块未加载：跳过 */ }
           publishRenderState();
-          // 3) 换缩略图（缩略图与屏幕瓦片同 token，§4.4）
+          // 3) 换缩略图（缩略图与屏幕瓦片同 token，§4.4；附画质 query）
           if (opts.setThumbnail && adapter.thumbnailUrl && ctrl.renderToken) {
-            opts.setThumbnail(adapter.thumbnailUrl(id, ctrl.renderToken));
+            opts.setThumbnail(adapter.thumbnailUrl(id, ctrl.renderToken,
+                                                   qualityThumbnailQuery()));
           }
           // 4) 打开新 TileSource；5) open 后恢复 viewport；6) AI 徽章占位
           var ts = createDeepZoomTileSource(ctrl.info, adapter, ctrl.renderToken);
@@ -754,6 +798,60 @@
     ctrl.getFingerprint = function () { return ctrl.renderFingerprint; };
     ctrl.applySelectionForTest = function () { applySelection(); };
 
+    // ---------------- 画质档（image-transport-upgrade §3.3） ----------------
+    // 轻量重开（同通道重开路径）：不改 render context、不 POST 规范化、
+    // 不触发 hp-render-context-changed；TileSource 构建时经
+    // HP_ViewerEncoding.tileQuery() 读当前画质偏好与 dv。不动 ctrl.epoch
+    //（避免作废在途的通道规范化响应；channelReopening 轻量 open 路径由
+    // opts.onReopening 标记）。
+    ctrl.reopenForQuality = function () {
+      if (!ctrl.info || !ctrl.slideMeta || !viewer) return;
+      var snap = captureViewport();
+      try { if (viewer && viewer.close) viewer.close(); } catch (e) { /* 忽略 */ }
+      if (opts.onReopening) opts.onReopening();
+      var ts = createDeepZoomTileSource(ctrl.info, adapter, ctrl.renderToken);
+      var onOpen = function () {
+        restoreViewport(snap);
+        if (opts.onReopened) opts.onReopened();
+      };
+      if (viewer && viewer.addOnceHandler) viewer.addOnceHandler("open", onOpen);
+      try { viewer.open(ts); } catch (e) { /* 忽略：OSD 失败语义呈现 */ }
+    };
+
+    // 409 display_version_conflict 有界恢复（§5.2）：只刷新 info 并重建一次，
+    // 保留用户当前选择与视口；连续冲突由 HP_ViewerEncoding 计数并在第二次
+    // 停止自动重试（那里呈现可重试错误，不无限刷新）。
+    ctrl.recoverDisplayConflict = function () {
+      if (!ctrl.info || !ctrl.slideMeta
+          || typeof opts.refreshInfo !== "function") return;
+      var meta = ctrl.slideMeta;
+      var kept = ctrl.selection.slice();
+      var keptOv = ctrl.overrides;
+      var snap = captureViewport();
+      Promise.resolve()
+        .then(opts.refreshInfo)
+        .then(function (newInfo) {
+          if (!newInfo) { legacyOpen(); return; }
+          var plan = ctrl.handleInfo(newInfo, meta, {
+            keepSelection: kept,
+            keepOverrides: keptOv,
+          });
+          if (viewer && viewer.addOnceHandler) {
+            viewer.addOnceHandler("open", function () {
+              restoreViewport(snap);
+              if (opts.onReopened) opts.onReopened();
+            });
+          }
+          // RGB legacy 重建（能力缺失等）：handleInfo 返回 legacy 时不走
+          // opts.open，由这里兜底重开
+          if (plan && plan.kind !== "render") legacyOpen();
+        })
+        .catch(function () { legacyOpen(); });
+    };
+
+    ctrl.snapshotViewport = captureViewport;
+    ctrl.restoreViewport = restoreViewport;
+
     ctrl.destroy = function () {
       ctrl.epoch += 1;         // 作废在途响应
       ctrl.info = null;
@@ -776,6 +874,9 @@
     //    thumbnailUrl}
     ctrl.handleInfo = function (rawInfo, slideMeta, keep) {
       ctrl.destroy();
+      // display 能力（image-transport-upgrade）：无论模式先消费 info.display
+      // ——能力缺失时 HP_ViewerEncoding 回退旧 URL 语义并隐藏画质切换
+      var displayCap = handleDisplayCapability(rawInfo);
       var norm = normalizeChannelInfo(rawInfo);
       ctrl.info = norm;
       ctrl.slideMeta = slideMeta || { id: norm.slideId, scope: "anonymous" };
@@ -783,17 +884,43 @@
         ? clampSelection(norm.channels, keep.keepSelection) : null;
       var keptOverrides = (keep && keep.keepOverrides) || null;
 
-      // flag 关：保持原 viewer，不发新字段、不显示通道面板（§15.2）
-      if (!norm.flagEnabled) { hideChrome(); return { kind: "legacy" }; }
-      // RGB：不显示占空间的面板；工具栏最多灰色小标识「原始 RGB」（§4.1）
+      // RGB：不显示占空间的面板；工具栏最多灰色小标识「原始 RGB」（§4.1）。
+      // image-transport-upgrade：display 能力存在时改用 inline TileSource
+      //（无 render token——RGB 走 legacy 编码语义 + 画质 query），支持
+      // 标准/精细切换；能力缺失回退原 DZI（旧服务端行为不变）。
+      // 注意：RGB 画质路径与多通道 flag **无关**（§3.2 flag 只管多通道）；
+      // 但 flag 关且无 display 能力（旧服务端/旧 flag 组合）时保持**完全**
+      // 旧行为（无面板/无入口/无标识，§15.2）。
       if (!norm.multichannel) {
+        if (!norm.flagEnabled && !displayCap.available) {
+          hideChrome();
+          return { kind: "legacy" };
+        }
         if (opts.button) opts.button.hidden = true;
         if (opts.badge) {
           opts.badge.hidden = false;
           opts.badge.textContent = t("channel.rgb.badge");
         }
+        if (displayCap.available && norm.deepzoom) {
+          var rgbPlan = {
+            kind: "render",
+            renderToken: null,
+            tileSource: createDeepZoomTileSource(norm, adapter, null),
+            thumbnailUrl: adapter.thumbnailUrl
+              ? adapter.thumbnailUrl(ctrl.slideMeta.id, null,
+                                     qualityThumbnailQuery())
+              : null,
+          };
+          // 打开由控制器经 opts.open 负责（与多通道同一入口，§8.2）
+          if (typeof opts.open === "function") opts.open(rgbPlan);
+          return rgbPlan;
+        }
         return { kind: "legacy" };
       }
+      // flag 关（多通道）：保持原 viewer，不发新字段、不显示通道面板（§15.2；
+      // 旧请求保持 legacy 语义——tile ctx 解析不出 multichannel，display 也
+      // 不会提供 preserve 档）
+      if (!norm.flagEnabled) { hideChrome(); return { kind: "legacy" }; }
       if (opts.badge) opts.badge.hidden = true;
       if (opts.button) opts.button.hidden = false;
       // 多通道切片打开即展示说明卡（来源/完整性/T-Z 提示无需额外点击）；
@@ -842,7 +969,8 @@
         renderToken: norm.defaultToken,
         tileSource: createDeepZoomTileSource(norm, adapter, norm.defaultToken),
         thumbnailUrl: adapter.thumbnailUrl
-          ? adapter.thumbnailUrl(ctrl.slideMeta.id, norm.defaultToken)
+          ? adapter.thumbnailUrl(ctrl.slideMeta.id, norm.defaultToken,
+                                 qualityThumbnailQuery())
           : null,
       };
       if (typeof opts.open === "function") opts.open(plan);

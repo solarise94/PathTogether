@@ -555,6 +555,8 @@
     channelBtn: $("channel-btn"),
     rgbBadge: $("rgb-badge"),
     channelPanelHost: $("channel-panel"),
+    // viewer 画质档（image-transport-upgrade；能力存在才显示）
+    qualityControl: $("quality-control"),
   };
 
   var roiBox = null;
@@ -979,6 +981,10 @@
           viewer.open((adapter && adapter.dziUrl)
             ? adapter.dziUrl(name)
             : "/api/slide/" + encodeURIComponent(name) + ".dzi");
+        } else if (plan.thumbnailUrl && baseThumbEl && !baseThumbEl.src) {
+          // render 计划首开（多通道 / RGB 画质路径）：底图预览由计划提供
+          // （缩略图与瓦片同 context；仅当未设置过 src 时补设）
+          baseThumbEl.src = plan.thumbnailUrl;
         }
         // 高亮列表项（未归类与项目切片行）
         document.querySelectorAll(".slide-row").forEach(function (it) {
@@ -5024,8 +5030,31 @@
     }
   }
 
+  // viewer 画质档（image-transport-upgrade §3.3/§5.2）：三入口共用
+  // HP_ViewerEncoding；本页只注入宿主/文案与重开回调。画质切换走
+  // channelCtrl.reopenForQuality（轻量路径：不改 context、不重绑 AI）。
+  function initQualityControl() {
+    if (!window.HP_ViewerEncoding) return;
+    HP_ViewerEncoding.mount({
+      host: els.qualityControl,
+      t: t,
+      toast: function (msg, type) { toast(msg, type); },
+      onQualityReopen: function () {
+        if (channelCtrl) channelCtrl.reopenForQuality();
+      },
+    });
+    HP_ViewerEncoding.installConflictRecovery({
+      viewer: viewer,
+      onConflict: function () {
+        // 409 display_version_conflict：只刷新 info 并重建一次（保留选择/视口）
+        if (channelCtrl) channelCtrl.recoverDisplayConflict();
+      },
+    });
+  }
+
   function init() {
     initViewer();
+    initQualityControl();
     initSidebarController();
     bindEvents();
     setupDragDrop();

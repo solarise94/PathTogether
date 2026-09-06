@@ -1309,9 +1309,30 @@
   }
 
   // ---------- 启动 ----------
+  // viewer 画质档（image-transport-upgrade §3.3/§5.2）：三入口共用模块；
+  // Demo 能力缺失/旧服务端时自动隐藏（RGB 走 legacy DZI 语义）
+  function initQualityControl() {
+    if (!window.HP_ViewerEncoding) return;
+    HP_ViewerEncoding.mount({
+      host: document.getElementById("quality-control"),
+      t: t,
+      toast: function (msg) { toast(msg); },
+      onQualityReopen: function () {
+        if (state.channelCtrl) state.channelCtrl.reopenForQuality();
+      },
+    });
+    HP_ViewerEncoding.installConflictRecovery({
+      viewer: state.viewer,
+      onConflict: function () {
+        if (state.channelCtrl) state.channelCtrl.recoverDisplayConflict();
+      },
+    });
+  }
+
   document.addEventListener("DOMContentLoaded", function () {
     if (typeof OpenSeadragon === "undefined") return;
     initViewer();
+    initQualityControl();
     resizeObsCanvas();
     bindShellChrome();
     // 升级 A：侧栏开合（桌面收起/展开 + 手机抽屉）与空态入口

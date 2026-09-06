@@ -1,0 +1,5 @@
+{
+  "label": "candidate-detail-q90",
+  "rgb": {"profile_id": "native-detail-q90", "quality": 90, "subsampling": 0, "optimize": true, "progressive": false},
+  "multichannel": {"profile_id": "fluorescence-preserve-v1", "quality": 95, "subsampling": 0, "optimize": true, "progressive": false}
+}

@@ -1,0 +1,1403 @@
+{
+ "label": "mc-preserve-candidate-dpr1",
+ "dpr": 1,
+ "repeats": 3,
+ "viewport": {
+  "width": 1440,
+  "height": 900
+ },
+ "totalBytes_median": 4893033,
+ "tileBytes_median": 4837949,
+ "requests_median": 74,
+ "runs": [
+  {
+   "label": "mc-preserve-candidate-dpr1",
+   "dpr": 1,
+   "totalBytes": 4893033,
+   "tileBytes": 4837949,
+   "requests": 74,
+   "counts": {
+    "first-open": 16,
+    "zoom": 24,
+    "channel-switch": 16,
+    "reload": 18
+   },
+   "statuses": {
+    "200": 59,
+    "304": 15
+   },
+   "urls": [
+    {
+     "u": "http://127.0.0.1:8931/api/auth/info",
+     "b": 425,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif/info",
+     "b": 5040,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/9/0_0.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e8",
+     "b": 42291,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/1_0.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 47240,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/0_0.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 111027,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/0_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 16297,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/1_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 1681,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 195448,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_0.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 143615,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 145184,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 9473,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 132539,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_0.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 52507,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_0.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 55720,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 49636,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 5113,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/2_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 193703,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/2_3.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 155165,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/3_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 190221,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/3_3.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 171725,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/1_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 206910,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/1_3.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 152364,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/2_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 243789,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/3_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 227832,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/2_4.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 17426,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/3_4.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 14511,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/4_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 288690,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/4_3.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 147262,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/1_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 182951,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/1_4.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 96433,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/4_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 177107,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/0_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 82965,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/0_3.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 115363,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/4_4.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 11493,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/5_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 28007,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/5_3.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 13782,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/0_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 9222,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/0_4.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 71626,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/5_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 15633,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/5_4.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 3243,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif/render-context",
+     "b": 2054,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif/thumbnail?profile=fluorescence-thumb-v1&dv=bab92ac6fcee751ceadad521832453003da86e747300656a57b2",
+     "b": 39690,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/9/0_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae82",
+     "b": 42291,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/0_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 111027,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/1_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 47240,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/0_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 16297,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/1_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 1681,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 195448,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 143615,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 145184,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_2.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 9473,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 132539,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 52507,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 55720,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_2.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 49636,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_2.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 5113,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/auth/info",
+     "b": 425,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif/info",
+     "b": 5040,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif/render-context",
+     "b": 2054,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif/thumbnail?profile=fluorescence-thumb-v1&dv=bab92ac6fcee751ceadad521832453003da86e747300656a57b2",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/9/0_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae82",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/0_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/1_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/0_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/1_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_2.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_2.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_2.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    }
+   ]
+  },
+  {
+   "label": "mc-preserve-candidate-dpr1",
+   "dpr": 1,
+   "totalBytes": 4893033,
+   "tileBytes": 4837949,
+   "requests": 74,
+   "counts": {
+    "first-open": 16,
+    "zoom": 24,
+    "channel-switch": 16,
+    "reload": 18
+   },
+   "statuses": {
+    "200": 59,
+    "304": 15
+   },
+   "urls": [
+    {
+     "u": "http://127.0.0.1:8931/api/auth/info",
+     "b": 425,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif/info",
+     "b": 5040,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/9/0_0.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e8",
+     "b": 42291,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/0_0.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 111027,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/1_0.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 47240,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/0_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 16297,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/1_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 1681,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 195448,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_0.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 143615,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 145184,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 9473,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 132539,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_0.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 52507,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_0.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 55720,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 49636,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 5113,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/2_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 193703,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/2_3.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 155165,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/3_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 190221,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/3_3.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 171725,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/1_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 206910,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/1_3.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 152364,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/2_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 243789,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/3_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 227832,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/2_4.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 17426,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/3_4.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 14511,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/4_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 288690,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/4_3.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 147262,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/1_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 182951,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/1_4.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 96433,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/4_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 177107,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/0_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 82965,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/0_3.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 115363,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/4_4.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 11493,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/5_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 28007,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/5_3.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 13782,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/0_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 9222,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/0_4.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 71626,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/5_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 15633,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/5_4.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 3243,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif/render-context",
+     "b": 2054,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif/thumbnail?profile=fluorescence-thumb-v1&dv=bab92ac6fcee751ceadad521832453003da86e747300656a57b2",
+     "b": 39690,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/9/0_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae82",
+     "b": 42291,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/0_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 111027,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/1_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 47240,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/0_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 16297,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/1_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 1681,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 195448,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 143615,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 145184,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_2.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 9473,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 132539,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 52507,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 55720,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_2.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 49636,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_2.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 5113,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/auth/info",
+     "b": 425,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif/info",
+     "b": 5040,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif/render-context",
+     "b": 2054,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif/thumbnail?profile=fluorescence-thumb-v1&dv=bab92ac6fcee751ceadad521832453003da86e747300656a57b2",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/9/0_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae82",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/0_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/1_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/0_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/1_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_2.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_2.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_2.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    }
+   ]
+  },
+  {
+   "label": "mc-preserve-candidate-dpr1",
+   "dpr": 1,
+   "totalBytes": 4893033,
+   "tileBytes": 4837949,
+   "requests": 74,
+   "counts": {
+    "first-open": 16,
+    "zoom": 24,
+    "channel-switch": 16,
+    "reload": 18
+   },
+   "statuses": {
+    "200": 59,
+    "304": 15
+   },
+   "urls": [
+    {
+     "u": "http://127.0.0.1:8931/api/auth/info",
+     "b": 425,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif/info",
+     "b": 5040,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/9/0_0.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e8",
+     "b": 42291,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/0_0.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 111027,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/1_0.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 47240,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/0_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 16297,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/1_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 1681,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 195448,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_0.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 143615,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 145184,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 9473,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 132539,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_0.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 52507,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_0.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 55720,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 49636,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 5113,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/2_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 193703,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/2_3.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 155165,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/3_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 190221,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/3_3.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 171725,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/1_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 206910,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/1_3.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 152364,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/2_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 243789,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/3_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 227832,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/2_4.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 17426,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/3_4.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 14511,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/4_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 288690,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/4_3.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 147262,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/1_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 182951,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/1_4.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 96433,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/4_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 177107,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/0_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 82965,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/0_3.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 115363,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/4_4.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 11493,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/5_2.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 28007,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/5_3.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 13782,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/0_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 9222,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/0_4.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 71626,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/5_1.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 15633,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/12/5_4.jpeg?profile=fluorescence-preserve-v1&dv=8b3e3eed80111e83699544ee9f15805c3340d047e",
+     "b": 3243,
+     "s": 200,
+     "p": "zoom"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif/render-context",
+     "b": 2054,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif/thumbnail?profile=fluorescence-thumb-v1&dv=bab92ac6fcee751ceadad521832453003da86e747300656a57b2",
+     "b": 39690,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/9/0_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae82",
+     "b": 42291,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/0_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 111027,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/1_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 47240,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/0_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 16297,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/1_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 1681,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 195448,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 143615,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 145184,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_2.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 9473,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 132539,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 52507,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 55720,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_2.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 49636,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_2.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 5113,
+     "s": 200,
+     "p": "channel-switch"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/auth/info",
+     "b": 425,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif/info",
+     "b": 5040,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif/render-context",
+     "b": 2054,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif/thumbnail?profile=fluorescence-thumb-v1&dv=bab92ac6fcee751ceadad521832453003da86e747300656a57b2",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/9/0_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae82",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/0_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/1_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/0_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/10/1_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/1_2.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_1.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_0.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/0_2.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/E04260806007-LZM-Control.ome.tif_files/11/2_2.jpeg?profile=fluorescence-preserve-v1&dv=168b2f8f4175980dbce5bdc7db53613f17d368ae8",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    }
+   ]
+  }
+ ]
+}

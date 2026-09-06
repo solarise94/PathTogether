@@ -1,0 +1,1345 @@
+{
+ "label": "candidate-detail-dpr1",
+ "dpr": 1,
+ "repeats": 3,
+ "viewport": {
+  "width": 1440,
+  "height": 900
+ },
+ "totalBytes_median": 789590,
+ "tileBytes_median": 784994,
+ "requests_median": 71,
+ "runs": [
+  {
+   "label": "candidate-detail-dpr1",
+   "dpr": 1,
+   "totalBytes": 789590,
+   "tileBytes": 784994,
+   "requests": 71,
+   "counts": {
+    "first-open": 31,
+    "detail-toggle": 9,
+    "reload": 31
+   },
+   "statuses": {
+    "200": 62,
+    "304": 9
+   },
+   "urls": [
+    {
+     "u": "http://127.0.0.1:8931/api/auth/info",
+     "b": 425,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs/info",
+     "b": 1873,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/9/0_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4b",
+     "b": 5373,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 15872,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1073,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 23211,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 2362,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 30776,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 2617,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_2.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1486,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_2.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1143,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_2.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 58435,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 72220,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_2.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 3513,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 3821,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_2.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 17317,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_3.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 4174,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 7336,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_3.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 3476,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_2.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1280,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_3.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 4509,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1280,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 24454,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_3.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1280,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 4017,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_4.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 2026,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 3823,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_4.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1858,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_4.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 2025,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1280,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_4.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1082,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/9/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cde",
+     "b": 8157,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 24225,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1333,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 36381,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 3893,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 46911,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 4458,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 2163,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1488,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/auth/info",
+     "b": 425,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs/info",
+     "b": 1873,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/9/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cde",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 90628,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 111125,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 6568,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 7080,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 27514,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_3.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 7981,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 12382,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_3.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 6435,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1809,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_3.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 8559,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1809,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 38717,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_3.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1809,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 7569,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_4.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 3295,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 6953,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_4.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 2911,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_4.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 3297,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1809,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_4.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1412,
+     "s": 200,
+     "p": "reload"
+    }
+   ]
+  },
+  {
+   "label": "candidate-detail-dpr1",
+   "dpr": 1,
+   "totalBytes": 789590,
+   "tileBytes": 784994,
+   "requests": 71,
+   "counts": {
+    "first-open": 31,
+    "detail-toggle": 9,
+    "reload": 31
+   },
+   "statuses": {
+    "200": 62,
+    "304": 9
+   },
+   "urls": [
+    {
+     "u": "http://127.0.0.1:8931/api/auth/info",
+     "b": 425,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs/info",
+     "b": 1873,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/9/0_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4b",
+     "b": 5373,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 15872,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1073,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 23211,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 2362,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 30776,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 2617,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_2.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1486,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_2.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1143,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_2.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 58435,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 72220,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_2.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 3513,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 3821,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_2.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 17317,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_3.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 4174,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 7336,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_3.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 3476,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_2.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1280,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_3.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 4509,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1280,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 24454,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_3.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1280,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 4017,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_4.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 2026,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 3823,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_4.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1858,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_4.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 2025,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1280,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_4.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1082,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/9/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cde",
+     "b": 8157,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 24225,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1333,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 36381,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 3893,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 46911,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 4458,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 2163,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1488,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/auth/info",
+     "b": 425,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs/info",
+     "b": 1873,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/9/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cde",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 304,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 90628,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 111125,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 6568,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 7080,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 27514,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_3.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 7981,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 12382,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_3.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 6435,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1809,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_3.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 8559,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1809,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 38717,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_3.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1809,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 7569,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_4.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 3295,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 6953,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_4.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 2911,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_4.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 3297,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1809,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_4.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1412,
+     "s": 200,
+     "p": "reload"
+    }
+   ]
+  },
+  {
+   "label": "candidate-detail-dpr1",
+   "dpr": 1,
+   "totalBytes": 789590,
+   "tileBytes": 784994,
+   "requests": 71,
+   "counts": {
+    "first-open": 31,
+    "detail-toggle": 9,
+    "reload": 31
+   },
+   "statuses": {
+    "200": 71
+   },
+   "urls": [
+    {
+     "u": "http://127.0.0.1:8931/api/auth/info",
+     "b": 425,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs/info",
+     "b": 1873,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/9/0_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4b",
+     "b": 5373,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 15872,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1073,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 23211,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 2362,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 30776,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 2617,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_2.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1486,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_2.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1143,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_2.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 58435,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 72220,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_2.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 3513,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 3821,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_2.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 17317,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_3.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 4174,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 7336,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_3.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 3476,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_2.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1280,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_3.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 4509,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_1.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1280,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 24454,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_3.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1280,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 4017,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_4.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 2026,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 3823,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_4.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1858,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_4.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 2025,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_0.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1280,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_4.jpeg?profile=native-standard-v1&dv=3d0197bb5544ede3b13309d04414ec8bd45abf3d3093e3367f03b4",
+     "b": 1082,
+     "s": 200,
+     "p": "first-open"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/9/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cde",
+     "b": 8157,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 24225,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1333,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 36381,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 3893,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 46911,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 4458,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 2163,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1488,
+     "s": 200,
+     "p": "detail-toggle"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/auth/info",
+     "b": 425,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs/info",
+     "b": 1873,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/9/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cde",
+     "b": 356,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/10/0_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/0_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/11/1_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 356,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 90628,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 111125,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 6568,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 7080,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 27514,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_3.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 7981,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 12382,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_3.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 6435,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_2.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1809,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_3.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 8559,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_1.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1809,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 38717,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_3.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1809,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 7569,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/1_4.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 3295,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 6953,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/2_4.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 2911,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/0_4.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 3297,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_0.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1809,
+     "s": 200,
+     "p": "reload"
+    },
+    {
+     "u": "http://127.0.0.1:8931/api/slide/1-NC%E8%82%A0(1)%20HE.svs_files/12/3_4.jpeg?profile=native-detail-v1&dv=813ddf0e3bc0964f609a46ff8fd59c46d2d4c4ea1eb96380a142a6cd",
+     "b": 1412,
+     "s": 200,
+     "p": "reload"
+    }
+   ]
+  }
+ ]
+}

@@ -24,6 +24,7 @@ from flask import (
     abort,
     g,
     jsonify,
+    make_response,
     render_template,
     request,
     send_file,
@@ -43,6 +44,10 @@ import slide_io
 import slide_render
 # P0-A §3.5：与主站 app.py 共用的 crop 像素闸（同一实现，防两份逻辑漂移）
 import crop_guard
+# viewer 显示编码协议（image-transport-upgrade）：display 身份/参数校验与
+# 瓦片内存缓存（bytes LRU + single-flight + 指标）为共享实现，不复制策略。
+import tile_cache
+import viewer_display
 
 app = Flask(__name__)
 
@@ -57,44 +62,74 @@ SUPPORTED_EXTS = {
 # Deep Zoom 参数（512 瓦片降低公网请求数，渐进式 q82 JPEG 降体积并支持模糊→清晰预览）
 DZ_TILE_SIZE = 512
 DZ_OVERLAP = 1
-# JPEG 编码质量，可由环境变量 JPEG_QUALITY 覆盖（默认 82）
-JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY") or 82)
+# JPEG 编码质量，可由环境变量 JPEG_QUALITY 覆盖（默认 82；1..100 整数，
+# 非法配置启动即失败——image-transport-upgrade §3.2，与主站同一校验）
+JPEG_QUALITY = slide_render.validate_display_quality(
+    os.environ.get("JPEG_QUALITY") or 82)
 # 保留旧名（与主应用一致，实际值与 DZ_* 一致）
 TILE_SIZE = DZ_TILE_SIZE
 OVERLAP = DZ_OVERLAP
 
 # 切片句柄池与元数据缓存（与主应用共享 slide_cache 抽象，进程独立）
-# 瓦片内存缓存（LRU + TTL）：key=(name, generation, level, x, y)，value=(ts, JPEG bytes)
-# review G3：generation 由 slide_cache 的文件签名统一驱动——同名重传/原地改写后
-# 旧代键永不命中（TTL 只是容量兜底，不再承担正确性）。分享端只读不 evict，
-# 换代完全依赖借用时的跨进程签名检查。
+# 瓦片内存缓存（LRU + TTL）：image-transport-upgrade §6：数量上限 + 字节预算
+# （TILE_CACHE_MAX_BYTES，默认 192 MiB/worker）任一先到即淘汰；键含编码身份
+# （encoding_fingerprint，与编码同源）；并发 miss single-flight。TTL 只是容量
+# 兜底，不再承担正确性（generation 由 slide_cache 文件签名统一驱动）。分享端
+# 只读不 evict，换代完全依赖借用时的跨进程签名检查。
 TILE_CACHE_MAX = int(os.environ.get("TILE_CACHE_MAX") or 3000)
+TILE_CACHE_MAX_BYTES = int(os.environ.get("TILE_CACHE_MAX_BYTES")
+                           or (192 * 1024 * 1024))
 TILE_CACHE_TTL = float(os.environ.get("TILE_CACHE_TTL") or 3600)  # 秒
-_tile_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+_tile_cache = tile_cache.TileMemoryCache(
+    max_entries=TILE_CACHE_MAX, max_bytes=TILE_CACHE_MAX_BYTES,
+    sizer=lambda v: len(v[1]))
 _tile_cache_lock = threading.Lock()
+_tile_single_flight = tile_cache.SingleFlight()
+_viewer_metrics = tile_cache.ViewerMetrics()
+
+# 默认 context (fp, image_mode) 的 per-(safe, generation) 缓存（与主站同语义）：
+# 无 render 参数的瓦片请求在借句柄前命中缓存/精确 spec。
+_DEFAULT_FP_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_DEFAULT_FP_CACHE_MAX = 4096
+_DEFAULT_FP_LOCK = threading.Lock()
+
+
+def _ctx_scope(safe: str, generation) -> str:
+    return "%s#%s" % (safe, generation)
+
+
+def _default_fp_cached(safe: str, generation):
+    with _DEFAULT_FP_LOCK:
+        hit = _DEFAULT_FP_CACHE.get((safe, generation))
+    if hit is None:
+        return None
+    if isinstance(hit, tuple):
+        return hit
+    return hit, None
+
+
+def _default_fp_store(safe: str, generation, fp: str,
+                      image_mode=None) -> None:
+    with _DEFAULT_FP_LOCK:
+        if len(_DEFAULT_FP_CACHE) >= _DEFAULT_FP_CACHE_MAX:
+            _DEFAULT_FP_CACHE.clear()
+        _DEFAULT_FP_CACHE[(safe, generation)] = (fp, image_mode)
 
 
 def _tile_cache_get(key):
-    """LRU+TTL 命中：未过期才返回，过期剔除。"""
-    with _tile_cache_lock:
-        item = _tile_cache.get(key)
-        if item is None:
-            return None
-        ts, data = item
-        if time.time() - ts > TILE_CACHE_TTL:
-            _tile_cache.pop(key, None)
-            return None
-        _tile_cache.move_to_end(key)
-        return data
+    """LRU+TTL 命中：未过期才返回，过期条目按未命中处理（TTL 仅容量兜底）。"""
+    item = _tile_cache.get(key)
+    if item is None:
+        return None
+    ts, data = item
+    if time.time() - ts > TILE_CACHE_TTL:
+        return None
+    return data
 
 
 def _tile_cache_put(key, data):
-    """LRU 写入，超上限淘汰最久未用。"""
-    with _tile_cache_lock:
-        _tile_cache[key] = (time.time(), data)
-        _tile_cache.move_to_end(key)
-        while len(_tile_cache) > TILE_CACHE_MAX:
-            _tile_cache.popitem(last=False)
+    """LRU 写入（带写入时间戳作 TTL 兜底），数量/字节双预算淘汰。"""
+    _tile_cache.put(key, (time.time(), data))
 
 
 # --------------------------------------------------------------------------- #
@@ -288,6 +323,7 @@ def _resolve_pair(pair, safe: str, *, token="", body=None, flag=True):
     """在当前借出的 pair 上解析 render context（§6.3；解码前拒绝）。
 
     返回 (context|None, fingerprint)；context None → native/legacy 路径。
+    默认 context 的 (fp, image_mode) 回填 per-generation 缓存（与主站同语义）。
     """
     gen_scope = _ctx_scope(safe, pair.get("gen"))
     ctx, fp = slide_render.resolve_render_context(
@@ -296,6 +332,9 @@ def _resolve_pair(pair, safe: str, *, token="", body=None, flag=True):
         asset_generation=gen_scope, flag_enabled=flag)
     if ctx is None:
         fp = slide_render.NATIVE_RGB_FINGERPRINT
+    elif not token and body is None:
+        _default_fp_store(safe, pair.get("gen"), fp,
+                          slide_render.image_mode_from_context(ctx))
     return ctx, fp or slide_render.NATIVE_RGB_FINGERPRINT
 
 
@@ -314,16 +353,54 @@ def _render_error(e):
                                               "invalid_render_context")), status
 
 
+def _display_param_error_response(e):
+    """viewer 显示参数错误 → 400 invalid_display_profile，no-store（§5.2）。"""
+    resp = jsonify(error=str(e), code=getattr(e, "code",
+                                              "invalid_display_profile"))
+    resp.headers["Cache-Control"] = "no-store"
+    return resp, getattr(e, "status", 400)
+
+
+def _display_conflict_response(e):
+    """过时 display_version → 409 display_version_conflict，no-store。"""
+    resp = jsonify(error=str(e), code=getattr(e, "code",
+                                              "display_version_conflict"))
+    resp.headers["Cache-Control"] = "no-store"
+    return resp, getattr(e, "status", 409)
+
+
+def _tile_jpeg_response(data):
+    """瓦片/缩略图字节响应（§5.4）：private no-cache + 强 ETag + 条件 304。
+
+    与主站 app.py 同一策略（本函数形状一致，策略在 viewer_display/tile_cache
+    共享实现）；304 只在鉴权与版本核验之后到达。
+    """
+    tag = hashlib.sha256(data).hexdigest()
+    if tag in request.if_none_match:
+        resp = app.response_class(status=304)
+        resp.headers["Cache-Control"] = "private, no-cache"
+        resp.headers["ETag"] = '"%s"' % tag
+        return resp
+    resp = send_file(io.BytesIO(data), mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "private, no-cache"
+    resp.headers["ETag"] = '"%s"' % tag
+    return resp
+
+
 def _tile_fp_key(safe: str, generation, fp, level, x, y, fmt="jpeg",
-                 image_mode="native_rgb"):
-    """瓦片缓存键（§7.3 + F2）：(safe, generation, fingerprint, level, x, y,
-    format, quality, subsampling, encoder_version)——与主站同一形状。"""
-    quality, subsampling = slide_render.display_jpeg_params(image_mode)
+                 spec=None, image_mode="native_rgb"):
+    """瓦片缓存键（§7.3 + §3.1/§6.3）：与主站同一形状——encoding_fingerprint
+    由同一个规范化 EncodingSpec 派生（键与编码同源；legacy 按运行时
+    JPEG_QUALITY 解析）。"""
+    if spec is None:
+        spec = slide_render.resolve_viewer_encoding(
+            image_mode, "tile", None, quality_override=JPEG_QUALITY)
     return (safe, generation, fp, int(level), int(x), int(y), fmt,
-            quality, subsampling, slide_render.TILE_ENCODER_VERSION)
+            slide_render.viewer_encoding_fingerprint(spec))
 
 
 def _tile_cache_lookup(safe, generation, fp, level, x, y):
+    """legacy 预查不知道 context version：两个编码键都试（与主站同语义）。"""
     for mode in ("native_rgb", "multichannel"):
         hit = _tile_cache_get(_tile_fp_key(
             safe, generation, fp, level, x, y, image_mode=mode))
@@ -332,15 +409,30 @@ def _tile_cache_lookup(safe, generation, fp, level, x, y):
     return None
 
 
-def _encode_tile_jpeg(tile, ctx):
+def _tile_cache_lookup_spec(safe, generation, fp, level, x, y, spec):
+    return _tile_cache_get(_tile_fp_key(
+        safe, generation, fp, level, x, y, spec=spec))
+
+
+def _encode_tile_jpeg(tile, ctx, profile_id=None):
+    """按解析后的 context 选编码 spec 并编码（§3.1 viewer 三件套）。"""
     image_mode = slide_render.image_mode_from_context(ctx)
-    quality = None if image_mode == "multichannel" else JPEG_QUALITY
-    return slide_render.encode_display_jpeg(
-        tile, image_mode=image_mode, quality=quality)[0], image_mode
+    spec = slide_render.resolve_viewer_encoding(
+        image_mode, "tile", profile_id, quality_override=JPEG_QUALITY)
+    t0 = time.monotonic()
+    data, _actual = slide_render.encode_viewer_jpeg(tile, spec)
+    _viewer_metrics.observe_encode(spec.profile_id,
+                                   (time.monotonic() - t0) * 1000.0)
+    return data, spec
 
 
 def _render_info_fields(safe: str) -> dict:
-    """分享端 info 的 render additive 字段（§6.1；与主站同一实现）。"""
+    """分享端 info 的 render additive 字段（§6.1；与主站同一实现）。
+
+    image-transport-upgrade（§5.2）：同一次稳定读取 additive 返回
+    ``display`` 对象 + ``display_encoding_v1`` 能力位；分享端有 thumbnail
+    端点 → include_thumbnail=True。
+    """
     entry = _get_slide(safe)
 
     def _read(pair):
@@ -361,6 +453,19 @@ def _render_info_fields(safe: str) -> dict:
             }
         except Exception:  # noqa: BLE001
             pass
+        # flag 关：display 按 native_rgb 提供档位（tile 实际按 native 编码）
+        display_fields = dict(fields)
+        if not _multichannel_enabled():
+            display_fields["image_mode"] = "native_rgb"
+        try:
+            fields["display"] = viewer_display.build_display_info(
+                entry, display_fields, include_thumbnail=True,
+                quality_override=JPEG_QUALITY)
+            cap = fields.setdefault("server_capability", {})
+            cap["display_encoding_v1"] = True
+        except Exception:  # noqa: BLE001  显示身份不可得时保持旧 info 语义
+            app.logger.warning("[viewer-display] display 信息构建失败",
+                               exc_info=True)
         return fields
 
     return slide_cache.read_stable(entry, _read)[0]
@@ -881,7 +986,10 @@ def s_root():
 def share_page(token):
     share = _require_share(token)
     _log_share_access(token, detail={"via": "page"})
-    return render_template("share.html", token=token)
+    resp = make_response(render_template("share.html", token=token))
+    # 入口 HTML 可重新验证（§5.3）：普通刷新必须取得新 UI
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 @app.route("/s/<token>/api/slides")
@@ -1034,33 +1142,50 @@ def share_slide_render_context(token, name):
         tok = slide_render.issue_render_token(
             canonical, fp, _legacy_revision(safe), _render_secret(),
             slide=safe)
-        return canonical, fp, tok
+        # 自定义 context 的显示身份（§5.2 additive）
+        display_versions = None
+        try:
+            display_versions = \
+                viewer_display.display_versions_for_fingerprint(
+                    entry, fp,
+                    slide_render.image_mode_from_context(canonical),
+                    quality_override=JPEG_QUALITY)
+        except Exception:  # noqa: BLE001  additive 失败不阻塞规范化
+            display_versions = None
+        return canonical, fp, tok, display_versions
 
     try:
-        canonical, fp, tok = slide_cache.read_stable(entry, _build)[0]
+        canonical, fp, tok, display_versions = \
+            slide_cache.read_stable(entry, _build)[0]
     except (slide_render.RenderRequestError, slide_io.SlideRenderError) as e:
         return _render_error(e)
     app.logger.info("[render-context] share slide=%s fp=%s channels=%d",
                     safe, fp[:8], len(canonical.get("active_channels") or []))
-    return jsonify({
+    payload = {
         # 与 info.default_render_context 同构：canonical + 内嵌 fingerprint
         "render_context": dict(canonical, fingerprint=fp),
         "render_context_fingerprint": fp,
         "render_token": tok,
         "asset_revision": _legacy_revision(safe),
         "warnings": [],
-    })
+    }
+    if display_versions:
+        payload["display_versions"] = display_versions
+    return jsonify(payload)
 
 
 @app.route("/s/<token>/api/slide/<name>_files/<int:level>/<int:x>_<int:y>.jpeg")
 def share_slide_tile(token, name, level, x, y):
-    """返回 Deep Zoom 单张瓦片 JPEG（512×512、baseline、q82，带 LRU+TTL 缓存）。
+    """返回 Deep Zoom 单张瓦片 JPEG（512×512，LRU+TTL 缓存）。
 
     review G3（CACHE-1）：瓦片缓存键含 generation——同名重传/原地改写后旧代
-    键不再命中（不再依赖 TTL 兜底服务旧图），generation 由 slide_cache 的
-    文件签名（dev/ino/size/mtime_ns）统一驱动，与句柄/info 同一套换代。
-    Batch 3（§6.3/§7.3）：接受 ``?render=<token>``；缓存键升级为
-    (safe, generation, render fingerprint, level, x, y, format, quality)。
+    键不再命中，generation 由 slide_cache 的文件签名统一驱动。
+    Batch 3（§6.3/§7.3）：接受 ``?render=<token>``。
+    image-transport-upgrade（§5.2/§5.4/§6）：additive 版本化 URL
+    ``?profile=<id>&dv=<display_version>``（成对、白名单、409、错误 no-store）；
+    缓存键含 encoding_fingerprint（键与编码同源）；private no-cache + 强
+    ETag（304 在鉴权与版本核验之后）；single-flight；字节预算 LRU。
+    旧 URL（无 profile/dv）保持既有编码语义。
     """
     share = _require_share(token)
     safe = _require_slide(share, name)
@@ -1068,47 +1193,133 @@ def share_slide_tile(token, name, level, x, y):
     render_tok = request.args.get("render") or ""
     flag = _multichannel_enabled()
 
-    gen = slide_cache.refresh_generation(entry)
-    fp_pre = None
-    if not flag:
-        fp_pre = slide_render.NATIVE_RGB_FINGERPRINT
-    elif render_tok:
+    try:
+        req_profile, req_dv = viewer_display.parse_display_params(
+            request.args, "tile")
+    except viewer_display.DisplayParamError as e:
+        _viewer_metrics.observe_status("400")
+        return _display_param_error_response(e)
+
+    token_payload = None
+    if flag and render_tok:
         payload = slide_render.verify_render_token(render_tok, _render_secret())
         if payload is not None and payload.get("slide") in ("", safe) \
                 and payload.get("rev") == _legacy_revision(safe):
-            fp_pre = payload.get("fp")
-    cached = _tile_cache_lookup(safe, gen, fp_pre, level, x, y) \
-        if fp_pre is not None else None
-    if cached is None:
-        def _decode(pair):
-            ctx, fp = _resolve_pair(pair, safe, token=render_tok, flag=flag)
-            if ctx is None:
-                tile = pair["dz"].get_tile(level, (x, y))
-            else:
-                view = slide_render.RenderedSlideView(pair["osr"], ctx,
-                                                      fingerprint=fp)
-                dzg = DeepZoomGenerator(view, tile_size=DZ_TILE_SIZE,
-                                        overlap=DZ_OVERLAP, limit_bounds=True)
-                tile = dzg.get_tile(level, (x, y))
-            if tile.mode != "RGB":
-                tile = tile.convert("RGB")
-            return tile, fp, ctx
+            token_payload = payload
 
-        # 按代读取：读取前后签名变化则换代重读一次（SlideFileChanged → 503）
-        (tile, fp, ctx), tile_gen = slide_cache.read_stable(
-            entry, _decode)
-        tile_bytes, image_mode = _encode_tile_jpeg(tile, ctx)
-        key = _tile_fp_key(safe, tile_gen, fp, level, x, y,
-                           image_mode=image_mode)
-        _tile_cache_put(key, tile_bytes)
-        buf = io.BytesIO(tile_bytes)
+    gen = slide_cache.refresh_generation(entry)
+    fp_pre = None
+    mode_pre = None
+    if not flag:
+        fp_pre, mode_pre = slide_render.NATIVE_RGB_FINGERPRINT, "native_rgb"
+    elif token_payload is not None:
+        fp_pre = token_payload.get("fp")
+        mode_pre = "multichannel" \
+            if (token_payload.get("ctx") or {}).get("version") \
+            == slide_render.CONTEXT_VERSION_MULTICHANNEL else "native_rgb"
     else:
-        buf = io.BytesIO(cached)
+        cached_default = _default_fp_cached(safe, gen)
+        if cached_default is not None:
+            fp_pre, mode_pre = cached_default
 
-    resp = send_file(buf, mimetype="image/jpeg")
-    # 瓦片内容不变，长期不可变缓存
-    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-    return resp
+    pre_spec = None
+    if req_profile is not None and mode_pre is not None:
+        try:
+            pre_spec = slide_render.resolve_viewer_encoding(
+                mode_pre, "tile", req_profile, quality_override=JPEG_QUALITY)
+        except slide_render.RenderRequestError as e:
+            _viewer_metrics.observe_status("400")
+            return _render_error(e)
+
+    if fp_pre is not None and (pre_spec is not None or req_profile is None):
+        cached = _tile_cache_lookup_spec(
+            safe, gen, fp_pre, level, x, y, pre_spec) \
+            if pre_spec is not None \
+            else _tile_cache_lookup(safe, gen, fp_pre, level, x, y)
+        if cached is not None and req_dv is not None and pre_spec is not None:
+            try:
+                cur_dv = viewer_display.compute_display_version(
+                    entry, fp_pre, pre_spec)
+            except slide_cache.SlideFileChanged:
+                cached = None
+            else:
+                if cur_dv != req_dv:
+                    _viewer_metrics.observe_status("409")
+                    return _display_conflict_response(
+                        viewer_display.DisplayVersionConflict())
+                if not slide_cache.generation_is_current(entry, gen):
+                    cached = None
+        if cached is not None:
+            _viewer_metrics.observe_response(
+                mode_pre or "native_rgb", pre_spec.profile_id
+                if pre_spec is not None else "legacy", len(cached))
+            _viewer_metrics.observe_status("200")
+            return _tile_jpeg_response(cached)
+
+    flight_key = (safe, gen, fp_pre or "", int(level), int(x), int(y),
+                  req_profile or "legacy", "tile")
+
+    def _decode(pair):
+        ctx, fp = _resolve_pair(pair, safe, token=render_tok, flag=flag)
+        cur_mode = slide_render.image_mode_from_context(ctx)
+        # spec/版本核验在昂贵合成之前（§4.8）
+        try:
+            cur_spec = slide_render.resolve_viewer_encoding(
+                cur_mode, "tile", req_profile,
+                quality_override=JPEG_QUALITY) \
+                if req_profile is not None else None
+        except slide_render.RenderRequestError:
+            raise
+        if req_dv is not None:
+            cur_dv = viewer_display.compute_display_version(
+                entry, fp, cur_spec or slide_render.resolve_viewer_encoding(
+                    cur_mode, "tile", None, quality_override=JPEG_QUALITY))
+            if cur_dv != req_dv:
+                raise viewer_display.DisplayVersionConflict()
+        if ctx is None:
+            tile = pair["dz"].get_tile(level, (x, y))
+        else:
+            view = slide_render.RenderedSlideView(pair["osr"], ctx,
+                                                  fingerprint=fp)
+            dzg = DeepZoomGenerator(view, tile_size=DZ_TILE_SIZE,
+                                    overlap=DZ_OVERLAP, limit_bounds=True)
+            tile = dzg.get_tile(level, (x, y))
+        if tile.mode != "RGB":
+            tile = tile.convert("RGB")
+        return tile, fp, ctx
+
+    def _produce():
+        # 按代读取：读取前后签名变化则换代重读一次（SlideFileChanged → 503）
+        (tile, fp, ctx), tile_gen = slide_cache.read_stable(entry, _decode)
+        t0 = time.monotonic()
+        data, enc_spec = _encode_tile_jpeg(tile, ctx,
+                                           profile_id=req_profile)
+        _viewer_metrics.observe_decode((time.monotonic() - t0) * 1000.0)
+        return data, enc_spec, fp, ctx, tile_gen
+
+    try:
+        data, enc_spec, fp, ctx, tile_gen = _tile_single_flight.run(
+            flight_key, _produce)
+    except viewer_display.DisplayVersionConflict as e:
+        _viewer_metrics.observe_status("409")
+        return _display_conflict_response(e)
+    except (slide_render.RenderRequestError,
+            slide_io.SlideRenderError) as e:
+        _viewer_metrics.observe_status(
+            "400" if getattr(e, "status", 400) < 500 else "5xx")
+        if getattr(e, "code", "") == "invalid_display_profile":
+            return _display_param_error_response(e)  # 错误响应 no-store（§5.2）
+        return _render_error(e)
+    except tile_cache.SingleFlightTimeout:
+        _viewer_metrics.observe_status("5xx")
+        return jsonify(error="瓦片生成排队超时，请重试",
+                       code="tile_single_flight_timeout"), 503
+    key = _tile_fp_key(safe, tile_gen, fp, level, x, y, spec=enc_spec)
+    _tile_cache_put(key, data)
+    mode = slide_render.image_mode_from_context(ctx)
+    _viewer_metrics.observe_response(mode, enc_spec.profile_id, len(data))
+    _viewer_metrics.observe_status("200")
+    return _tile_jpeg_response(data)
 
 
 @app.route("/s/<token>/api/slide/<name>/crop")
@@ -1241,11 +1452,19 @@ def share_slide_thumbnail(token, name):
     """返回缩略图 JPEG（用作查看器底图预览，慢网下避免瓦片未到区域变白）。
 
     Batch 3（§6.3）：接受 ``?render=<token>``；缩略图与最低层同 context。
+    image-transport-upgrade（§3.2/§4.7/§5.2/§5.4）：与主站同一策略——按实际
+    渲染模式显式采样（荧光显式 4:4:4，不再依赖默认色度采样）；additive
+    ``?profile=&dv=``；private no-cache + 强 ETag。
     """
     share = _require_share(token)
     safe = _require_slide(share, name)
     entry = _get_slide(safe)
     render_tok = request.args.get("render") or ""
+    try:
+        req_profile, req_dv = viewer_display.parse_display_params(
+            request.args, "thumbnail")
+    except viewer_display.DisplayParamError as e:
+        return _display_param_error_response(e)
     with slide_cache.borrow_pair(entry) as pair:
         try:
             ctx, fp = _resolve_pair(pair, safe, token=render_tok,
@@ -1253,14 +1472,23 @@ def share_slide_thumbnail(token, name):
         except (slide_render.RenderRequestError,
                 slide_io.SlideRenderError) as e:
             return _render_error(e)
+        image_mode = slide_render.image_mode_from_context(ctx)
+        try:
+            spec = slide_render.resolve_viewer_encoding(
+                image_mode, "thumbnail", req_profile)
+        except slide_render.RenderRequestError as e:
+            return _render_error(e)
+        if req_dv is not None:
+            cur_dv = viewer_display.compute_display_version(entry, fp, spec)
+            if cur_dv != req_dv:
+                return _display_conflict_response(
+                    viewer_display.DisplayVersionConflict())
         src = _region_view(pair, ctx, fp)
         thumb = src.get_thumbnail((400, 400))
     if thumb.mode != "RGB":
         thumb = thumb.convert("RGB")
-    buf = io.BytesIO()
-    thumb.save(buf, format="JPEG", quality=90)
-    buf.seek(0)
-    return send_file(buf, mimetype="image/jpeg")
+    data, _actual = slide_render.encode_viewer_jpeg(thumb, spec)
+    return _tile_jpeg_response(data)
 
 
 @app.route("/s/<token>/api/roi", methods=["POST"])

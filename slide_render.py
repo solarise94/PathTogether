@@ -31,8 +31,10 @@ import os
 import re
 import threading
 import time
+from typing import NamedTuple
 
 import numpy as np
+import PIL
 from PIL import Image
 
 from slide_io import (  # noqa: F401  # 再导出：调用方 import slide_render 即可
@@ -1339,10 +1341,14 @@ def encode_display_jpeg(img, *, image_mode, quality=None):
     native：quality=82、subsampling=2（4:2:0）；multichannel：quality=95、
     subsampling=0（4:4:4）。``params`` 回传实际参数（含 encoder_version），
     供缓存键与响应回显。
+
+    字节契约红线（§3.1）：本函数服务 region/AI 导数路径，禁止为 viewer
+    优化改签名、默认参数或输出字节（optimize/progressive 显式 False）。
     """
     q, subsampling = display_jpeg_params(image_mode, quality)
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=q, subsampling=subsampling)
+    _jpeg_save(img, buf, quality=q, subsampling=subsampling,
+               optimize=False, progressive=False)
     return buf.getvalue(), {
         "quality": q,
         "subsampling": subsampling,
@@ -1361,3 +1367,325 @@ def subsampling_label(subsampling):
     只做展示层映射；未知值如实回 "unknown"，不猜测。
     """
     return SUBSAMPLING_LABELS.get(int(subsampling), "unknown")
+
+
+# =========================================================================== #
+# viewer 显示编码（image-transport-upgrade §3.1/§3.2）
+#
+# 与 region/AI 导数编码（encode_display_jpeg）**严格隔离**：
+#   - encode_display_jpeg 的签名、默认参数、输出字节、metadata、版本
+#     （TILE_ENCODER_VERSION）保持原样——region/派生图的 content_sha256
+#     契约不容漂移（§3.1 红线，golden 测试护栏）；
+#   - viewer 瓦片/缩略图走独立的 resolve_viewer_encoding → encode_viewer_jpeg
+#     → viewer_encoding_fingerprint 三件套；编码与缓存读同一 spec，禁止各处
+#     重新猜模式或质量。
+# =========================================================================== #
+
+#: viewer 编码实现版本（profile 参数/实现变化必须升版本；与 TILE_ENCODER_VERSION
+#: 独立命名，避免影响 region 的既有元数据契约）
+VIEWER_ENCODER_VERSION = "viewer-encoding-v1"
+#: 客户端 URL/协议管线版本（进 display_version 摘要；URL 形态变化时升）
+VIEWER_PIPELINE_VERSION = "viewer-pipeline-v1"
+
+#: 瓦片 profiles（§3.2 配置表）
+VIEWER_PROFILE_NATIVE_STANDARD = "native-standard-v1"
+VIEWER_PROFILE_NATIVE_DETAIL = "native-detail-v1"
+VIEWER_PROFILE_FLUORESCENCE = "fluorescence-preserve-v1"
+#: 缩略图 profiles（主站/分享）
+VIEWER_PROFILE_NATIVE_THUMB = "native-thumb-v1"
+VIEWER_PROFILE_FLUORESCENCE_THUMB = "fluorescence-thumb-v1"
+
+#: 服务端白名单（URL 提供之外的 profile 一律 400）
+VIEWER_TILE_PROFILES = (
+    VIEWER_PROFILE_NATIVE_STANDARD,
+    VIEWER_PROFILE_NATIVE_DETAIL,
+    VIEWER_PROFILE_FLUORESCENCE,
+)
+VIEWER_THUMBNAIL_PROFILES = (
+    VIEWER_PROFILE_NATIVE_THUMB,
+    VIEWER_PROFILE_FLUORESCENCE_THUMB,
+)
+
+#: 精细档标定质量（§7.2 规则：84/86/88/90 从低到高取**首个**同时满足
+#: "边缘 RGB MAE 中位数降低≥10%、SSIM 中位数不下降、总 tile bytes ≤标准
+#: 1.35 倍"的档位。真实样本基准（55 ROI，bench-samples 5 张 HE + 报告
+#: artifacts/.../B6/cal-q*）实测：q84 bytes=1.231、edge MAE 改善 16.4%、
+#: SSIM +0.001 → 全达标；q86 bytes=1.371 超预算 → 固定 84。
+VIEWER_DETAIL_CALIBRATED_QUALITY = 84
+#: 荧光 preserve 质量/采样（§3.2；与 TILE_MULTICHANNEL_JPEG_* 同值但独立常量，
+#: 独立演进：viewer 侧变化不改 region 字节契约）
+VIEWER_FLUORESCENCE_QUALITY = 95
+VIEWER_FLUORESCENCE_SUBSAMPLING = 0
+#: 缩略图质量（RGB thumb 与既有 save(quality=90) 同 q；荧光 thumb 用 preserve q95）
+VIEWER_THUMB_QUALITY = 90
+
+
+def validate_display_quality(value, name="JPEG_QUALITY"):
+    """JPEG 质量配置校验：1..100 整数，非法明确失败（不静默重置为 82）。
+
+    启动时（app.py / share_server.py import）调用；非法配置抛 ValueError
+    直接失败，保留合法的覆盖值。
+    """
+    try:
+        q = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("%s 必须是 1..100 的整数，当前值 %r" % (name, value))
+    if not 1 <= q <= 100:
+        raise ValueError("%s 必须是 1..100 的整数，当前值 %r" % (name, value))
+    return q
+
+
+class ViewerEncodingSpec(NamedTuple):
+    """不可变 viewer 编码 spec：编码、缓存键、display_version 三者同源。"""
+
+    profile_id: str        # 白名单 profile 或 "legacy"（旧 URL 无 profile 语义）
+    purpose: str           # "tile" | "thumbnail"
+    image_mode: str        # "native_rgb" | "multichannel"（解析后的 context 决定）
+    quality: int
+    subsampling: int
+    optimize: bool
+    progressive: bool
+    format: str            # 恒 "JPEG"
+    encoder_version: str   # VIEWER_ENCODER_VERSION（legacy spec 沿用 TILE_ 版本）
+    runtime_identity: tuple  # (pillow, jpeg_codec, viewer_encoder) 定型元组
+
+
+def _viewer_runtime_identity():
+    """实际 Pillow / JPEG 库版本 + viewer 编码实现版本（镜像升级会改显示身份）。
+
+    与 AI 导数编码无关：region 路径不读取本值，升级 Pillow 不会改变 region
+    字节，但会改变 viewer display_version（如实反映显示输出已变化）。
+    """
+    from PIL import features as _features
+
+    return (PIL.__version__, _features.version("jpg") or "unknown",
+            VIEWER_ENCODER_VERSION)
+
+
+_VIEWER_RUNTIME_CACHE = None
+
+
+def viewer_runtime_identity():
+    """模块级缓存的 runtime identity（值不可变，缓存安全）。"""
+    global _VIEWER_RUNTIME_CACHE
+    if _VIEWER_RUNTIME_CACHE is None:
+        _VIEWER_RUNTIME_CACHE = _viewer_runtime_identity()
+    return _VIEWER_RUNTIME_CACHE
+
+
+def _legacy_viewer_spec(image_mode, purpose, quality):
+    """旧 URL（无 profile）的精确 spec：编码现状原样（optimize/progressive 关）。
+
+    tile：quality 由调用方传运行时 JPEG_QUALITY（修复键 q82/字节 q<env> 缺陷
+    ——键与字节从此同源）；thumbnail RGB：q90（与既有 save(JPEG, quality=90)
+    字节一致）；荧光 thumbnail 走 preserve spec（§4.7 修复，不适用本函数）。
+    """
+    if image_mode == "multichannel":
+        subsampling = TILE_MULTICHANNEL_JPEG_SUBSAMPLING
+    else:
+        subsampling = TILE_NATIVE_JPEG_SUBSAMPLING
+    return ViewerEncodingSpec(
+        profile_id="legacy", purpose=purpose, image_mode=image_mode,
+        quality=int(quality), subsampling=subsampling,
+        optimize=False, progressive=False, format="JPEG",
+        encoder_version=TILE_ENCODER_VERSION,
+        runtime_identity=viewer_runtime_identity())
+
+
+def resolve_viewer_encoding(render_mode, purpose, profile_id=None, *,
+                            quality_override=None):
+    """按 render_mode + purpose + profile 解析不可变 EncodingSpec（§3.1）。
+
+    - ``profile_id=None``：旧 URL 的 legacy spec（保持既有参数语义）；
+    - 多通道资源只接受 preserve 档；RGB 档传给多通道资源抛
+      ``RenderRequestError("invalid_display_profile", status=400)``，不静默
+      按 4:2:0 输出；
+    - 模式判断以解析后的 context 为准（native-rgb-v1 不是多通道——调用方传
+      image_mode_from_context(ctx) 的结果，本函数不做"ctx 非空/颜色多"猜测）；
+    - 精细档质量 = max(标定质量, 质量覆盖)（§3.2：用户已配 q95 时精细不降质）。
+    ``quality_override``：标准档质量（服务端 JPEG_QUALITY 运行时值）。
+    """
+    if purpose not in ("tile", "thumbnail"):
+        raise ValueError("viewer purpose 仅支持 tile/thumbnail，收到 %r"
+                         % (purpose,))
+    if render_mode not in ("native_rgb", "multichannel"):
+        raise ValueError("viewer render_mode 仅支持 native_rgb/multichannel，"
+                         "收到 %r" % (render_mode,))
+    multichannel = render_mode == "multichannel"
+    if profile_id is None:
+        if purpose == "thumbnail" and multichannel:
+            # 荧光 thumbnail 修复（§4.7）：不再依赖 Pillow 默认色度采样
+            return ViewerEncodingSpec(
+                profile_id=VIEWER_PROFILE_FLUORESCENCE_THUMB,
+                purpose=purpose, image_mode=render_mode,
+                quality=VIEWER_FLUORESCENCE_QUALITY,
+                subsampling=VIEWER_FLUORESCENCE_SUBSAMPLING,
+                optimize=True, progressive=False, format="JPEG",
+                encoder_version=VIEWER_ENCODER_VERSION,
+                runtime_identity=viewer_runtime_identity())
+        return _legacy_viewer_spec(
+            render_mode, purpose,
+            VIEWER_THUMB_QUALITY if purpose == "thumbnail"
+            else (quality_override if quality_override is not None
+                  else TILE_NATIVE_JPEG_QUALITY))
+    if purpose == "tile":
+        if multichannel:
+            if profile_id != VIEWER_PROFILE_FLUORESCENCE:
+                raise RenderRequestError(
+                    "invalid_display_profile",
+                    "多通道资源仅接受 %s 档" % VIEWER_PROFILE_FLUORESCENCE,
+                    status=400)
+            return ViewerEncodingSpec(
+                profile_id=profile_id, purpose=purpose,
+                image_mode=render_mode,
+                quality=VIEWER_FLUORESCENCE_QUALITY,
+                subsampling=VIEWER_FLUORESCENCE_SUBSAMPLING,
+                optimize=True, progressive=False, format="JPEG",
+                encoder_version=VIEWER_ENCODER_VERSION,
+                runtime_identity=viewer_runtime_identity())
+        if profile_id == VIEWER_PROFILE_NATIVE_STANDARD:
+            q = int(quality_override) if quality_override is not None \
+                else TILE_NATIVE_JPEG_QUALITY
+            return ViewerEncodingSpec(
+                profile_id=profile_id, purpose=purpose,
+                image_mode=render_mode, quality=validate_display_quality(
+                    q, "viewer standard quality"),
+                subsampling=TILE_NATIVE_JPEG_SUBSAMPLING,
+                optimize=True, progressive=False, format="JPEG",
+                encoder_version=VIEWER_ENCODER_VERSION,
+                runtime_identity=viewer_runtime_identity())
+        if profile_id == VIEWER_PROFILE_NATIVE_DETAIL:
+            base = VIEWER_DETAIL_CALIBRATED_QUALITY
+            if quality_override is not None:
+                base = max(base, int(quality_override))
+            return ViewerEncodingSpec(
+                profile_id=profile_id, purpose=purpose,
+                image_mode=render_mode, quality=base,
+                subsampling=TILE_MULTICHANNEL_JPEG_SUBSAMPLING,  # 4:4:4
+                optimize=True, progressive=False, format="JPEG",
+                encoder_version=VIEWER_ENCODER_VERSION,
+                runtime_identity=viewer_runtime_identity())
+        raise RenderRequestError(
+            "invalid_display_profile", "未知显示 profile %r" % (profile_id,),
+            status=400)
+    # purpose == "thumbnail"
+    if multichannel:
+        if profile_id != VIEWER_PROFILE_FLUORESCENCE_THUMB:
+            raise RenderRequestError(
+                "invalid_display_profile",
+                "多通道缩略图仅接受 %s 档" % VIEWER_PROFILE_FLUORESCENCE_THUMB,
+                status=400)
+        return ViewerEncodingSpec(
+            profile_id=profile_id, purpose=purpose, image_mode=render_mode,
+            quality=VIEWER_FLUORESCENCE_QUALITY,
+            subsampling=VIEWER_FLUORESCENCE_SUBSAMPLING,
+            optimize=True, progressive=False, format="JPEG",
+            encoder_version=VIEWER_ENCODER_VERSION,
+            runtime_identity=viewer_runtime_identity())
+    if profile_id != VIEWER_PROFILE_NATIVE_THUMB:
+        raise RenderRequestError(
+            "invalid_display_profile",
+            "RGB 缩略图仅接受 %s 档" % VIEWER_PROFILE_NATIVE_THUMB,
+            status=400)
+    return ViewerEncodingSpec(
+        profile_id=profile_id, purpose=purpose, image_mode=render_mode,
+        quality=VIEWER_THUMB_QUALITY,
+        subsampling=TILE_NATIVE_JPEG_SUBSAMPLING,
+        optimize=True, progressive=False, format="JPEG",
+        encoder_version=VIEWER_ENCODER_VERSION,
+        runtime_identity=viewer_runtime_identity())
+
+
+def _jpeg_save(img, buf, *, quality, subsampling, optimize, progressive):
+    """显式参数的底层 JPEG save 原语（display 与 viewer 编码共享）。
+
+    encode_display_jpeg 以 optimize=False, progressive=False 调用本原语，
+    Pillow 调用形状与历史实现逐参一致（字节不变）。
+    """
+    img.save(buf, format="JPEG", quality=quality, subsampling=subsampling,
+             optimize=optimize, progressive=progressive)
+
+
+def encode_viewer_jpeg(img, spec):
+    """按 EncodingSpec 编码，返回 ``(jpeg_bytes, actual_encoding)``。
+
+    ``actual_encoding`` 回传实际参数（含 optimize 与 runtime），供缓存键、
+    ETag 与响应头回显；编码只读 spec，不做任何模式/质量二次猜测。
+    """
+    buf = io.BytesIO()
+    _jpeg_save(img, buf, quality=spec.quality, subsampling=spec.subsampling,
+               optimize=spec.optimize, progressive=spec.progressive)
+    return buf.getvalue(), {
+        "profile_id": spec.profile_id,
+        "purpose": spec.purpose,
+        "image_mode": spec.image_mode,
+        "quality": spec.quality,
+        "subsampling": spec.subsampling,
+        "optimize": bool(spec.optimize),
+        "progressive": bool(spec.progressive),
+        "format": spec.format,
+        "encoder_version": spec.encoder_version,
+        "runtime_identity": list(spec.runtime_identity),
+    }
+
+
+def viewer_encoding_fingerprint(spec):
+    """最终规范化 spec 的确定性摘要（SHA256，canonical JSON）。
+
+    profile 名称不变但参数/运行时变化 → 指纹变化：显示身份不能被 profile
+    名复用欺骗。digest 不含路径、token、坐标。
+    """
+    payload = {
+        "profile_id": spec.profile_id,
+        "purpose": spec.purpose,
+        "image_mode": spec.image_mode,
+        "quality": int(spec.quality),
+        "subsampling": int(spec.subsampling),
+        "optimize": bool(spec.optimize),
+        "progressive": bool(spec.progressive),
+        "format": spec.format,
+        "encoder_version": spec.encoder_version,
+        "runtime_identity": list(spec.runtime_identity),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                     ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def viewer_encoding_spec_for_test(image_mode, *, quality, subsampling,
+                                  optimize):
+    """测试辅助：直接构造 viewer spec（绕过 profile 白名单做纯函数断言）。"""
+    return ViewerEncodingSpec(
+        profile_id="test", purpose="tile", image_mode=image_mode,
+        quality=int(quality), subsampling=int(subsampling),
+        optimize=bool(optimize), progressive=False, format="JPEG",
+        encoder_version=VIEWER_ENCODER_VERSION,
+        runtime_identity=viewer_runtime_identity())
+
+
+def display_encoding_info(render_mode, purpose, *, quality_override=None):
+    """info 响应 ``display.profiles`` 的每档描述（§5.2；不泄露 cache key）。
+
+    按 render_mode 过滤白名单：荧光只出 preserve 档（§3.2），RGB 只出
+    standard/detail（缩略图同理），不列出会 400 的组合。
+    """
+    if render_mode == "multichannel":
+        pids = (VIEWER_PROFILE_FLUORESCENCE,) if purpose == "tile" \
+            else (VIEWER_PROFILE_FLUORESCENCE_THUMB,)
+    elif purpose == "tile":
+        pids = (VIEWER_PROFILE_NATIVE_STANDARD, VIEWER_PROFILE_NATIVE_DETAIL)
+    else:
+        pids = (VIEWER_PROFILE_NATIVE_THUMB,)
+    out = []
+    for pid in pids:
+        spec = resolve_viewer_encoding(render_mode, purpose, pid,
+                                       quality_override=quality_override)
+        out.append({
+            "profile_id": spec.profile_id,
+            "quality": spec.quality,
+            "subsampling": subsampling_label(spec.subsampling),
+            "optimize": bool(spec.optimize),
+            "encoder_version": spec.encoder_version,
+            "encoding_fingerprint": viewer_encoding_fingerprint(spec),
+        })
+    return out

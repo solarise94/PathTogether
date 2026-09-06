@@ -1,0 +1,18 @@
+B1 失败回归（先固定失败，再实现）
+命令：.venv-image-review/bin/python -m pytest tests/test_display_jpeg_encoding.py tests/test_viewer_encoding_protocol.py -q
+结果（实现前）：16 failed, 14 passed, 1 skipped
+- test_tile_cache_key_tracks_env_quality        （键 q82 / env q92 缺陷）
+- test_tile_cache_does_not_serve_stale_quality_bytes（q92 字节被 q82 键复用）
+- test_viewer_jpeg_optimize_decodes_identically （viewer 编码 API 尚不存在）
+- test_multichannel_thumbnail_is_explicit_444   （荧光 thumbnail 隐含 4:2:0）
+- test_info_advertises_display_encoding_capability（无 display 能力对象）
+- test_info_display_multichannel_profiles       （无荧光 preserve 档列表）
+- test_render_context_response_has_display_versions（自定义 context 无 dv）
+- test_versioned_tile_url_ok_and_cache_headers  （无 profile/dv 协议、无 ETag/private）
+- test_unknown_profile_rejected / test_duplicate_conflicting_params_rejected
+- test_stale_display_version_conflict_409       （无 409 display_version_conflict）
+- test_rgb_profile_on_multichannel_rejected     （RGB 档传荧光资源未拒绝）
+- test_legacy_tile_url_keeps_working            （旧 URL 仍 public immutable 无 ETag）
+- test_thumbnail_profile_url_and_headers / test_thumbnail_rejects_rgb_profile_for_multichannel
+- test_revoked_share_gets_no_304                （撤权后 ETag 未再验证）
+基线（实现前受影响套件）：115 passed / 0 failed（2026-09-06T02:1xZ）

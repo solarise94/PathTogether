@@ -39,6 +39,10 @@ import share_store
 import share_shared
 import slide_cache
 import slide_io
+# 展示 J（公开分享页红线）：登录用户作者身份在 /s/* 评论出口统一掩码
+# （email/login_id 经 mask_login_id，不外泄完整邮箱、不回退 display_name）。
+import registration_store
+import user_store
 # 多通道伪彩渲染（规格 §7.1 共享模块）：颜色/签名/校验算法全部在
 # slide_render——本文件只做 Flask 侧粘合，禁止复制第二份实现。
 import slide_render
@@ -1720,7 +1724,13 @@ def _resolve_anno_in_share(share, annotation_id):
 
 @app.route("/s/<token>/api/comments")
 def share_comments_list(token):
-    """列出某标注的评论（guest 视角，query: annotation_id）。share 有效即可查看。"""
+    """列出某标注的评论（guest 视角，query: annotation_id）。share 有效即可查看。
+
+    展示 J / 公开分享页红线：登录用户（author_user_id 非空）的作者身份一律
+    **掩码**展示（email/login_id 经 mask_login_id），绝不外泄完整邮箱，也
+    **不得**回退 display_name（历史行里的 author_label 快照同样替换）。
+    guest 评论（author_user_id 为空）保留访客自报 label。
+    """
     share = _require_share(token)
     annotation_id = request.args.get("annotation_id")
     if not annotation_id:
@@ -1728,7 +1738,27 @@ def share_comments_list(token):
     _roi, err = _resolve_anno_in_share(share, annotation_id)
     if err:
         return err
-    return jsonify({"comments": share_store.list_comments(annotation_id=annotation_id)})
+    comments = share_store.list_comments(annotation_id=annotation_id)
+    # 掩码投影：按 author_user_id 批量解析身份再掩码（查询失败按 None 处理，
+    # 降级为通用「成员」，绝不回退明文 label/display_name）
+    out = []
+    for c in comments:
+        c = dict(c)
+        author_uid = c.get("author_user_id")
+        if author_uid:
+            masked = None
+            try:
+                u = user_store.get_user(author_uid) or {}
+                identity = (u.get("email_normalized") or u.get("email")
+                            or u.get("login_id") or "")
+                if identity:
+                    masked = registration_store.mask_login_id(identity)
+            except Exception:
+                masked = None
+            c["author_label"] = masked or "成员"
+            c.pop("author_email", None)
+        out.append(c)
+    return jsonify({"comments": out})
 
 
 @app.route("/s/<token>/api/comments", methods=["POST"])

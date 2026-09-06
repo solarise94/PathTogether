@@ -462,7 +462,7 @@ def test_registration_mode_reads_settings_store(monkeypatch):
                   "auth_version": owner.get("auth_version", 1)})
     # json 后端下打开前置条件闸（PG 运行时三条件真实满足）
     monkeypatch.setattr(app_mod, "_registration_precondition_failures",
-                        lambda environ=None: [])
+                        lambda *a, **k: [])
     monkeypatch.setattr(app_mod.settings_store, "get_registration_mode",
                         lambda: "invite_only")
     body = client.get("/api/admin/v1/settings").get_json()["registration"]

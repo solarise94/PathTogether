@@ -83,7 +83,10 @@ import demo_store
 # P0-B 邀请注册（docs open-registration-security-remediation §4.2/§4.3）：
 # registration_store 提供一次性邀请码（只存 token_hash）与单事务原子兑换。
 # json/dual 后端 fail-closed（platform_features 守卫）。
+# I 线（设计文档第 8 节）：邮箱验证 + 邀请码激活——邮件发送统一经
+# registration_mail_worker 的 MailSender 适配边界（app 绝不直接外发）。
 import registration_store
+import registration_mail_worker
 # PR4 用户来源归因（docs/admin-billing-plugin-implementation-plan.md §11）：
 # acquisition_store 提供 /r/<source_code> 触点写入、注册归因（redeem_invite
 # 同事务）、匿名触点 90 天清理与 admin 漏斗/明细汇总。PostgreSQL 唯一后端。
@@ -864,16 +867,51 @@ def _auth_challenge():
     return redirect("/login?next=" + path)
 
 
+# I 线（设计文档第 8 节）：匿名注册通道（验证页 / 验证确认 / 重发）——
+# _require_auth 显式放行；「请求验证邮件」走表单 POST /register（模式内）。
+# 这些通道的 CSRF 仍由全局 before_request 闸覆盖（匿名 client 先 GET 公开页
+# 取 token，与 /register 同口径）。
+_REGISTRATION_PUBLIC_PATHS = frozenset({
+    "/verify-email",
+    "/api/registration/verify",
+    "/api/registration/resend",
+})
+
+#: enrollment 受限会话白名单（设计文档第 8 节 I-R4）：pending_activation
+#: 用户凭正确凭据只拿到 enrollment scope（独立键，不写 auth_user/role），
+#: 仅可触达激活页/激活 API/状态/受限重发/登出，其余一律拒绝。
+_ENROLLMENT_ALLOWED_PATHS = frozenset({
+    "/activate",
+    "/api/account/enrollment",
+    "/api/account/activate",
+    "/api/account/enrollment/resend",
+    "/api/registration/resend",
+    "/logout",
+})
+
+#: enrollment session 键（独立 scope；绝不写 auth_user/user_id/role 顶层键，
+#: 防止任何按 auth_user 判定登录态的旧路径误放行 pending 账号）
+ENROLLMENT_SESSION_KEY = "enrollment"
+
+
 @app.before_request
 def _require_auth():
-    """启用认证时拦截未登录 / 已禁用 / 已删除用户的请求。
+    """启用认证时拦截未登录 / 已禁用 / 已删除 / **未激活**用户的请求。
 
-    放行 /login、/register、/demo、/api/demo/*、/static/、/plugins/、/healthz、
-    /internal/、/api/plugin/；其余请求检查 session，并按 user_id 回查用户是否仍
-    存在且 enabled（禁用或删除立即失效，不等 cookie 过期）。
+    放行 /login、/register、/demo、/verify-email、/api/registration/{start,
+    verify,resend}、/api/demo/*、/static/、/plugins/、/healthz、/internal/、
+    /api/plugin/；其余请求检查 session，并按 user_id 回查用户是否仍存在且
+    enabled（禁用或删除立即失效，不等 cookie 过期）。
     /api/ 开头返回 401 jsonify(error="auth_required")，页面 302 到 /login。
     例外：未登录访问 ``/`` 不跳登录——由 index() 渲染入口分流页（docs §3.1，
     同一路由按认证状态分流，不做 302 /login）。
+
+    I-R4 统一 ``require_active_account`` 守卫（设计文档第 8 节，最危险项）：
+    auth_version 比对通过后再查 ``activation_state``——非 active（
+    pending_activation / email_pending）一律拒绝（403 account_pending），
+    enrollment 白名单路径除外。由此登录后业务 API、列表/瓦片/crop/上传/
+    AI run grant 创建与使用、SSE、插件业务资源、身份预览全部收口：pending
+    账号不可能经任何普通 session 触达业务面。
     """
     if not AUTH_ENABLED:
         return None
@@ -881,6 +919,9 @@ def _require_auth():
     path = request.path
     if (path in ("/login", "/register", "/demo") or path.startswith("/static/")
             or path.startswith("/plugins/")):
+        return None
+    # I 线匿名注册通道（验证页 + start/verify/resend；CSRF 仍由全局闸覆盖）
+    if path in _REGISTRATION_PUBLIC_PATHS:
         return None
     # /api/demo/* 由 Demo capability 独立校验（docs §5.2），不进登录 session
     if path.startswith("/api/demo/"):
@@ -908,6 +949,11 @@ def _require_auth():
         # 全员登出是预期行为（docs §12.2），不做任何回填兼容。
         if (user is not None and not user.get("disabled")
                 and session.get("auth_version") == user.get("auth_version")):
+            # I-R4：激活状态机硬闸（存量行 backfill=active，行为不变；
+            # pending 账号即使拿到普通 session 形态的 Cookie 也全拒）
+            if (user.get("activation_state") or "active") != "active":
+                session.clear()
+                return _pending_account_challenge()
             if user.get("role"):
                 session["role"] = user["role"]
             return None
@@ -915,10 +961,85 @@ def _require_auth():
         if path == "/":
             # 会话失效的首页访问：入口分流页（不制造到 /login 的多余跳转）
             return None
+    elif session.get(ENROLLMENT_SESSION_KEY):
+        # enrollment 受限 scope：仅白名单路径，且用户仍处于 pending_activation
+        # 且未禁用（禁用/激活完成/状态变化即失效）
+        if path in _ENROLLMENT_ALLOWED_PATHS:
+            enr = _enrollment_session_valid()
+            if enr is not None:
+                return None
+        session.clear()
+        if path == "/":
+            return None
+        return _auth_challenge()
     elif path == "/":
         # 未登录访问首页：入口分流页（docs §3.1，不 302 /login）
         return None
     return _auth_challenge()
+
+
+def _pending_account_challenge():
+    """pending 账号触达业务面的统一拒绝（I-R4）：/api 403 JSON，页面 302。"""
+    if request.path.startswith("/api/"):
+        return jsonify(error="account_pending",
+                       detail="账号尚未完成邀请码激活，请先完成激活"), 403
+    return redirect("/activate" if session.get(ENROLLMENT_SESSION_KEY)
+                    else "/login")
+
+
+def _enrollment_session_valid():
+    """校验 enrollment 受限会话：返回其 dict 或 None（无效即清 session）。
+
+    独立 scope 形态：``{user_id, email, purpose, issued_at, auth_version}``。
+    回查用户必须存在、未禁用、activation_state == pending_activation——
+    激活成功/被禁用/被删即自动失效。**绝不**因此写 auth_user/role。
+    """
+    enr = session.get(ENROLLMENT_SESSION_KEY)
+    if not isinstance(enr, dict):
+        return None
+    uid = enr.get("user_id")
+    if not uid:
+        return None
+    try:
+        user = user_store.get_user(uid)
+    except Exception:
+        app.logger.exception("enrollment user lookup failed")
+        return None
+    if user is None or user.get("disabled"):
+        session.clear()
+        return None
+    if (user.get("activation_state") or "active") != "pending_activation":
+        session.clear()
+        return None
+    if enr.get("auth_version") not in (None, user.get("auth_version")):
+        # 凭据版本被推进（管理员重置等）：enrollment 一并失效
+        session.clear()
+        return None
+    return enr
+
+
+def require_active_account():
+    """I-R4 命名守卫：当前普通 session 用户必须 active，否则权威拒绝响应。
+
+    _require_auth 已按 before_request 全量收口（含列表/瓦片/crop/上传/AI
+    run grant/SSE/插件资源/身份预览）；本函数供 enrollment 白名单视图与
+    任何需要二次确认的入口防御性调用。返回 None = 放行。
+    """
+    if not AUTH_ENABLED:
+        return None
+    uid = session.get("user_id")
+    if not uid:
+        return None  # 无普通 session：交由 _require_auth 的权威 401 分支
+    try:
+        user = user_store.get_user(uid)
+    except Exception:
+        app.logger.exception("require_active_account lookup failed")
+        return jsonify(error="auth_required"), 401
+    if user is None or user.get("disabled"):
+        return jsonify(error="auth_required"), 401
+    if (user.get("activation_state") or "active") != "active":
+        return jsonify(error="account_pending"), 403
+    return None
 
 
 @app.before_request
@@ -2754,8 +2875,23 @@ def login():
         # 防 session fixation：先清旧 session 再写新身份，并轮换 CSRF token。
         # auth_version（docs §6.2）：登录成功把当次凭据版本写进 session；
         # 改密/重置/禁用/启用都会递增版本，旧 Cookie 随即失效。
-        # auth_user 是展示名（docs §6.2：display_name 缺省回退 login_id）
+        # auth_user 是展示名（J：display_name 缺省回退 login_id；新形态用户
+        # display_name 默认即规范化邮箱，展示主列恒为邮箱口径）
         session.clear()
+        # I 线状态机（设计文档第 8 节）：pending_activation 凭据正确只发
+        # **enrollment 受限 session**（独立 scope，不写 auth_user/role/
+        # user_id 顶层键），跳激活页——普通登录态与业务面完全不可达。
+        if (user.get("activation_state") or "active") == "pending_activation":
+            session[ENROLLMENT_SESSION_KEY] = {
+                "user_id": user.get("user_id"),
+                "email": user.get("email_normalized")
+                or user.get("email") or "",
+                "purpose": "activation",
+                "issued_at": time.time(),
+                "auth_version": user.get("auth_version"),
+            }
+            rotate_csrf_token()
+            return redirect("/activate")
         session.permanent = True
         session["auth_user"] = user.get("display_name") or user.get("login_id")
         session["user_id"] = user.get("user_id")
@@ -2957,7 +3093,8 @@ def acquisition_redirect(source_code):
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
-    """注册页（P0-B：registration_mode = closed | invite_only | public，§4.1）。
+    """注册页（registration_mode = closed | invite_only |
+    email_verify_invite_activation | public，P0-B §4.1 + I 线设计文档第 8 节）。
 
     - closed：GET 渲染关闭态页（不 404、无可提交表单），POST 一律 403；
     - invite_only：GET 渲染邀请码/登录账号/显示名/密码表单（统一密码策略
@@ -2965,10 +3102,18 @@ def register():
       兑换（表单 login_id 字段为登录账号，批次 C docs §8.2；批次 B 的 email
       字段名已随物理收口删除）；成功**不自动登录**——清理匿名 session、
       轮换 CSRF 后 302 /login；
+    - email_verify_invite_activation（I 线）：注册页**先填邮箱**请求验证
+      邮件（不填邀请码、不发额度；文案写明「验证邮箱后还需邀请码激活」）。
+      POST 同事务入队 registration_mail_jobs（配额：同邮箱 60s 冷却、时 3、
+      日 5，应用日预算 40）；对已存在/未知邮箱/超限一律**同一文案**（无枚举
+      信号）。验证邮件含一次性链接 → GET /verify-email 只展示 →
+      POST /api/registration/verify 消费 token 并原子建 pending_activation
+      用户（密码在邮箱确认之后设置）；
     - public：本阶段不支持，GET/POST 均 503 public_registration_not_supported
       （无 public 回退路径）；
-    - 模式权威值还受 fail-closed 前置闸（_effective_registration_mode：非 HTTPS
-      / 非 Secure Cookie / 非 PG 一律按 closed 处理，docs §3.2 末段）。
+    - 模式权威值还受 fail-closed 前置闸（_effective_registration_mode：非
+      HTTPS / 非 Secure Cookie / 邮件通道未配置等一律按 closed 处理，docs
+      §3.2 末段 + I 线模式前置）。
 
     限流（§4.5，PostgreSQL 权威，不可用 503 不退化）：每 IP 前缀 15 分钟 10 次
     失败 + 24 小时 30 次尝试；每 invite hash 15 分钟 5 次失败短时锁定；IP 桶
@@ -2991,6 +3136,13 @@ def register():
                 200)
             resp.headers["Cache-Control"] = "no-store"
             return resp
+        if mode == "email_verify_invite_activation":
+            resp = Response(render_template(
+                "register.html", mode="email_verify",
+                csrf_token=ensure_csrf_token(), error=None, error_code=None),
+                200)
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
         return render_template("register.html", mode="closed",
                                registration_open=False)
 
@@ -2998,7 +3150,8 @@ def register():
     if mode == "closed":
         return jsonify(error="当前采用邀请注册，暂未开放自助注册"), 403
 
-    # invite_only：PG 权威限流先行（存储不可用 503，绝不退化进程内计数）
+    # IP 前缀限流（invite_only 与 email_verify 两形态共用 IP 桶；存储不可用
+    # 503 fail-closed，绝不退化进程内计数）
     import auth_limit_store
     ip_hash = _ip_prefix_hash(request.remote_addr or "")
     invite_token = (request.form.get("invite_token") or "").strip()
@@ -3014,7 +3167,9 @@ def register():
         return _registration_unavailable_response()
     if retry > 0:
         resp = Response(render_template(
-            "register.html", mode="invite_only",
+            "register.html",
+            mode=("email_verify" if mode == "email_verify_invite_activation"
+                  else "invite_only"),
             csrf_token=ensure_csrf_token(),
             error="尝试过于频繁，请稍后再试", error_code="locked",
             retry_after=int(retry)), 429)
@@ -3022,9 +3177,12 @@ def register():
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
-    # 表单校验（本地形状错误，非枚举信号；不回显邀请码）。login_id 字段为
-    # 登录账号（docs §8.2：邀请绑定的是「允许兑换的登录账号」；批次 C 起
-    # 表单字段名即 login_id，email 入参已删除）
+    if mode == "email_verify_invite_activation":
+        return _register_email_verify_post(ip_hash)
+
+    # invite_only：表单校验（本地形状错误，非枚举信号；不回显邀请码）。
+    # login_id 字段为登录账号（docs §8.2：邀请绑定的是「允许兑换的登录
+    # 账号」；批次 C 起表单字段名即 login_id，email 入参已删除）
     login_id = (request.form.get("login_id") or "").strip()
     display_name = (request.form.get("display_name") or "").strip()
     password = request.form.get("password") or ""
@@ -3078,10 +3236,54 @@ def register():
     return resp
 
 
-def _register_form_error(message, error_code, status=200):
+def _register_email_verify_post(ip_hash):
+    """email_verify_invite_activation 的 POST：邮箱验证请求（I 线流程 1）。
+
+    - 只收 email（不填邀请码、不发额度；J：注册页不再要求独立登录账号/
+      显示名——验证成功后以规范化邮箱为唯一用户名）；
+    - registration_store.enqueue_email_verification 同事务入队 + 配额
+      （60s 冷却 / 时 3 / 日 5 / 应用日预算 40）；
+    - **统一文案**：已存在/未知邮箱/超限/内部异常一律同一响应（反枚举；
+      超限不回 429——429 本身是「该邮箱活跃」的枚举信号）；
+    - 入队成功后 best-effort 即时排水（失败留 queued，worker 循环为权威
+      发送方）；异步排水不改变响应时序与文案。
+    """
+    email = (request.form.get("email") or "").strip()
+    try:
+        registration_store.enqueue_email_verification(
+            email, base_url=(os.environ.get("PUBLIC_BASE_URL") or "").strip())
+    except registration_store.EmailVerifyError as exc:
+        if exc.code == "bad_input":
+            # 本地形状错误可回显（与 invite_only 表单校验同口径；不泄露
+            # 任何账号存在性）
+            return _register_form_error(
+                "请输入有效的邮箱地址", "invalid", mode="email_verify")
+        # rate_limited / 其他：统一文案（无枚举信号）
+        app.logger.warning("邮箱验证请求被统一文案吸收（code=%s）", exc.code)
+    except Exception:
+        app.logger.exception("邮箱验证入队异常（统一文案）")
+    else:
+        try:
+            registration_mail_worker.drain_async()
+        except Exception:
+            app.logger.warning("验证邮件即时排水启动失败（留待 worker）",
+                               exc_info=True)
+    return _register_email_verify_done_page()
+
+
+def _register_email_verify_done_page():
+    """邮箱验证请求的统一完成页（已知/未知/超限同文案，no-store）。"""
+    resp = Response(render_template(
+        "register.html", mode="email_verify_done",
+        csrf_token=ensure_csrf_token(), error=None, error_code=None), 200)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _register_form_error(message, error_code, status=200, mode="invite_only"):
     """渲染注册表单错误（统一文案；不回显邀请码；no-store）。"""
     resp = Response(render_template(
-        "register.html", mode="invite_only", csrf_token=ensure_csrf_token(),
+        "register.html", mode=mode, csrf_token=ensure_csrf_token(),
         error=message, error_code=error_code), status)
     resp.headers["Cache-Control"] = "no-store"
     return resp
@@ -3093,6 +3295,237 @@ def _registration_unavailable_response():
                           "请稍后重试",
                     code="registration_unavailable"),
             503)
+
+
+# =========================================================================== #
+# I+J：邮箱验证 + 邀请码激活路由（设计文档第 8 节 + review J / P2-4）
+#
+# 流程红线：
+#   1. GET /verify-email **只展示不消费** token（消费仅 POST
+#      /api/registration/verify）；
+#   2. 密码在邮箱确认之后设置（POST /api/registration/verify 带
+#      token + CSRF + 密码，原子创建 pending_activation 用户）；
+#   3. 身份永远从 session 推导（enrollment scope 的 user_id/email），绝不信
+#      请求体里的身份字段；
+#   4. activate_registered_user 单事务（闸 → 锁 → CAS 消费邀请码 → active →
+#      按面值建一次性总额度 → 审计），绝不走会插入第二个用户的
+#      redeem_invite；already_active 不消费不充值。
+# =========================================================================== #
+def _verify_email_state_view(token):
+    """token → 模板视图（只读解析；state + 掩码邮箱，不消费）。"""
+    try:
+        return registration_store.check_verify_token(token)
+    except Exception:
+        app.logger.exception("verify token 解析失败（按未知处理）")
+        return {"state": "unknown", "email_masked": None}
+
+
+@app.route("/verify-email", methods=["GET"])
+def verify_email_page():
+    """邮箱验证落地页（一次性链接）。**GET 只展示不消费**（流程 2 红线）。
+
+    - token 有效 → 渲染设置密码表单（提交到 POST /api/registration/verify，
+      带 hidden token + CSRF）；
+    - 过期/已用/未知 → 渲染对应状态页（不泄露细分给非持有者以外的信号：
+      页面本身只能被持链接者触达）；
+    - 已登录（含 enrollment）访问：验证链接与登录态无关，照常渲染（GET 无
+      写副作用）。
+    """
+    token = (request.args.get("token") or "").strip()
+    view = _verify_email_state_view(token)
+    resp = Response(render_template(
+        "verify_email.html", state=view["state"],
+        email_masked=view.get("email_masked"), token=token if view[
+            "state"] == "valid" else "",
+        csrf_token=ensure_csrf_token()), 200)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/registration/verify", methods=["POST"])
+def api_registration_verify():
+    """消费验证 token + 设置密码，原子创建 pending_activation 用户（流程 2）。
+
+    - CSRF 走全局 before_request 闸（/api/* 只认 X-CSRF-Token 头）；
+    - body: {token, password, password_confirm?}；密码策略 15..200；
+    - registration_store.verify_email_create_user 单事务：token 一次性消费
+      + 建号（J：login_id=规范化邮箱；与存量 login_id 冲突进待补绑）；
+    - 错误统一 code：invalid_request（形状）/ invalid_or_expired /
+      email_taken（对外统一文案，不区分是已注册还是待激活占用）。
+    """
+    if request.is_json:
+        body = request.get_json(silent=True) or {}
+    else:
+        body = request.form
+    token = (body.get("token") or "").strip()
+    password = body.get("password") or ""
+    confirm = body.get("password_confirm")
+    if confirm is not None and confirm != password:
+        return jsonify(error="两次输入的密码不一致",
+                       code="password_mismatch"), 400
+    if not token:
+        return jsonify(error="缺少验证 token", code="invalid_request"), 400
+    if not isinstance(password, str) or not password.strip() \
+            or len(password) < registration_store.MIN_PASSWORD_LENGTH \
+            or len(password) > registration_store.MAX_PASSWORD_LENGTH:
+        return jsonify(
+            error="密码长度须在 %d..%d 字符之间且非全空白"
+                  % (registration_store.MIN_PASSWORD_LENGTH,
+                     registration_store.MAX_PASSWORD_LENGTH),
+            code="invalid_request"), 400
+    try:
+        result = registration_store.verify_email_create_user(token, password)
+    except registration_store.EmailVerifyError as exc:
+        if exc.code == "bad_input":
+            return jsonify(error="验证信息无效或已过期",
+                           code="invalid_or_expired"), 400
+        if exc.code == "email_taken":
+            return jsonify(error="该邮箱已被占用，请直接登录或联系管理员",
+                           code="email_taken"), 409
+        return jsonify(error="验证链接无效或已过期，请重新请求验证邮件",
+                       code="invalid_or_expired"), 400
+    except Exception:
+        app.logger.exception("邮箱验证建号异常（统一错误）")
+        return jsonify(error="注册暂不可用，请稍后重试",
+                       code="registration_unavailable"), 503
+    session.clear()
+    rotate_csrf_token()
+    _audit("registration.pending_user_created", target_type="user",
+           target_id=result["user"]["user_id"],
+           detail={"email_masked": registration_store.mask_login_id(
+               result["email"]),
+               "pending_bind": bool(result.get("pending_bind"))})
+    return jsonify(ok=True, next="/login", activation_required=True)
+
+
+def _require_enrollment():
+    """enrollment 受限会话守卫（激活面专用）。返回 (enr, None) 或 (None, resp)。
+
+    身份**只**从 session 推导（_enrollment_session_valid 已回查用户仍处于
+    pending_activation 且未禁用）；请求体里的任何身份字段一律忽略。
+    """
+    enr = _enrollment_session_valid()
+    if enr is None:
+        return None, (jsonify(error="auth_required"), 401)
+    return enr, None
+
+
+@app.route("/activate", methods=["GET"])
+def activate_page():
+    """激活页（enrollment 受限会话专用；未持会话 302 /login）。"""
+    if AUTH_ENABLED:
+        enr = _enrollment_session_valid()
+        if enr is None:
+            return redirect("/login")
+        email_masked = registration_store.mask_login_id(enr.get("email") or "")
+    else:
+        email_masked = ""
+    resp = Response(render_template(
+        "activate.html", email_masked=email_masked,
+        csrf_token=ensure_csrf_token()), 200)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/account/enrollment", methods=["GET"])
+def api_account_enrollment():
+    """enrollment 会话状态（激活页数据源）：掩码邮箱 + 状态。"""
+    if not AUTH_ENABLED:
+        return jsonify(error="enrollment 需要启用认证"), 400
+    enr, err = _require_enrollment()
+    if err:
+        return err
+    return jsonify(state="pending_activation",
+                   email_masked=registration_store.mask_login_id(
+                       enr.get("email") or ""),
+                   purpose=enr.get("purpose") or "activation")
+
+
+@app.route("/api/account/activate", methods=["POST"])
+def api_account_activate():
+    """邀请码激活（流程 5）：enrollment session + CSRF + 邀请码。
+
+    - 身份从 session 推导（_require_enrollment），不信请求身份字段；
+    - registration_store.activate_registered_user 单事务：锁序沿用
+      provisioning 闸 → CAS 消费邀请码 → activation_state=active → 按邀请
+      面值建一次性总额度 → 审计；**绝不**调用 redeem_invite；
+    - already_active：不消费、不充值 → 409；
+    - 邀请码无效/过期/撤销/已消费 → 403 统一
+      invite_invalid_or_unavailable；
+    - 成功：清 enrollment session，轮换 CSRF，客户端跳 /login 重新登录。
+    """
+    if not AUTH_ENABLED:
+        return jsonify(error="激活需要启用认证"), 400
+    enr, err = _require_enrollment()
+    if err:
+        return err
+    body = request.get_json(silent=True) or request.form
+    invite_token = (body.get("invite_code") or body.get("invite_token")
+                    or "").strip()
+    if not invite_token:
+        return jsonify(error="请填写邀请码", code="invalid_request"), 400
+    try:
+        result = registration_store.activate_registered_user(
+            enr["user_id"], invite_token)
+    except registration_store.ActivationError as exc:
+        if exc.code == "already_active":
+            # 不消费、不充值；会话已无激活事项可办
+            session.clear()
+            return jsonify(error="账号已激活，请直接登录",
+                           code="already_active"), 409
+        if exc.code in ("user_disabled", "user_missing", "not_pending"):
+            session.clear()
+            return jsonify(error="账号状态不可激活，请联系管理员",
+                           code="activation_unavailable"), 403
+        return jsonify(error="激活失败，请稍后重试",
+                       code="activation_failed"), 400
+    except registration_store.InviteRedeemError:
+        return jsonify(error="邀请码无效或当前不可用；请核对后重试，或联系管理员",
+                       code="invite_invalid_or_unavailable"), 403
+    except spend_store.ProvisioningMaintenanceError:
+        return jsonify(error="系统维护中（cutover），暂停激活；请稍后重试",
+                       code="ai_dispatch_maintenance"), 503
+    except Exception:
+        app.logger.exception("邀请码激活异常（统一错误）")
+        return jsonify(error="激活暂不可用，请稍后重试",
+                       code="activation_unavailable"), 503
+    session.clear()
+    rotate_csrf_token()
+    _audit("registration.activation_flow_done", target_type="user",
+           target_id=result["user"]["user_id"],
+           detail={"invite_id": result["invite_id"]})
+    return jsonify(ok=True, next="/login")
+
+
+@app.route("/api/registration/resend", methods=["POST"])
+def api_registration_resend():
+    """验证邮件重发（受限）：与 start 同事务入队 + 同配额 + 同一文案。
+
+    匿名可调（enrollment 白名单同样放行——pending 用户换邮箱重新走验证属
+    新请求）。body: {email}；对未知/已存在/超限邮箱一律同一响应（反枚举）。
+    """
+    if request.is_json:
+        body = request.get_json(silent=True) or {}
+    else:
+        body = request.form
+    email = (body.get("email") or "").strip()
+    try:
+        registration_store.enqueue_email_verification(
+            email, base_url=(os.environ.get("PUBLIC_BASE_URL") or "").strip())
+    except registration_store.EmailVerifyError as exc:
+        if exc.code == "bad_input":
+            return jsonify(error="请输入有效的邮箱地址",
+                           code="invalid_request"), 400
+        app.logger.warning("验证邮件重发被统一文案吸收（code=%s）", exc.code)
+    except Exception:
+        app.logger.exception("验证邮件重发入队异常（统一文案）")
+    else:
+        try:
+            registration_mail_worker.drain_async()
+        except Exception:
+            app.logger.warning("重发邮件即时排水启动失败（留待 worker）",
+                               exc_info=True)
+    return jsonify(ok=True)
 
 
 # =========================================================================== #
@@ -4090,7 +4523,9 @@ def api_auth_info():
         pv = _preview_state() or {}
         role = subject.get("role") or user_store.ROLE_USER
         user_id = subject.get("user_id") or ""
-        username = subject.get("login_id") or subject.get("display_name") or actor_username
+        username = (subject.get("email_normalized") or subject.get("email")
+                    or subject.get("login_id")
+                    or subject.get("display_name") or actor_username)
         preview = {
             "subject_user_id": user_id,
             "subject_role": role,
@@ -4613,13 +5048,19 @@ def _registration_mode_stored() -> str:
         return "closed"
 
 
-def _registration_precondition_failures(environ=None) -> list:
-    """invite_only 生效的前置条件（docs §3.2 末段，fail-closed）。
+def _registration_precondition_failures(environ=None, mode=None) -> list:
+    """开放注册形态生效的前置条件（docs §3.2 末段，fail-closed）。
 
-    registration_mode != closed 时要求：
+    invite_only 与 email_verify_invite_activation 要求：
       1. ``PUBLIC_BASE_URL`` 配置为 https://（公网入口 TLS 已终止）；
       2. ``ADMIN_SESSION_COOKIE_SECURE`` 启用（session cookie 带 Secure）；
       3. 存储后端为 postgres（邀请注册/限流整体 PG-only）。
+    email_verify_invite_activation 额外要求（I 线模式前置）：
+      4. 邮件发送通道已配置（registration_mail_worker.sender_configured，
+         ``fake`` 不计入生产通道）；
+      5. 邮件载荷加密密钥可用（含明文 token 的冻结正文必须加密落库）；
+      6. 验证 token 哈希盐非默认（生产口径：REGISTRATION_VERIFY_HASH_SALT /
+         AUTH_SUBJECT_HASH_SALT / SECRET_KEY 至少其一已配置）。
     任一不满足即拒绝启用注册功能（_effective_registration_mode 降级 closed）。
     """
     env = os.environ if environ is None else environ
@@ -4629,29 +5070,46 @@ def _registration_precondition_failures(environ=None) -> list:
         failures.append("PUBLIC_BASE_URL 未配置为 https:// 入口")
     if not _env_truthy(env, "ADMIN_SESSION_COOKIE_SECURE"):
         failures.append("ADMIN_SESSION_COOKIE_SECURE 未启用（Secure Cookie）")
+    if mode == "email_verify_invite_activation":
+        if not registration_mail_worker.sender_configured(env,
+                                                          production=True):
+            failures.append("邮件发送通道未配置（REGISTRATION_MAIL_SENDER；"
+                            "fake 不计入生产通道）")
+        if not registration_mail_worker.payload_key_available():
+            failures.append("邮件载荷加密密钥不可用（"
+                            "REGISTRATION_MAIL_PAYLOAD_KEY / SECRET_KEY）")
+        if not ((env.get("REGISTRATION_VERIFY_HASH_SALT") or "").strip()
+                or (env.get("AUTH_SUBJECT_HASH_SALT") or "").strip()
+                or (env.get("SECRET_KEY") or "").strip()):
+            failures.append("验证 token 哈希盐未配置（"
+                            "REGISTRATION_VERIFY_HASH_SALT / SECRET_KEY）")
     return failures
 
 
 _registration_gate_warned = {"flag": False}
 
+#: 需要 fail-closed 前置闸的开放注册形态（public 原样透传给路由层统一 503）
+_REGISTRATION_GATED_MODES = ("invite_only", "email_verify_invite_activation")
+
 
 def _effective_registration_mode() -> str:
     """生效注册模式：存储值 × 前置条件闸（未满足降级 closed，每进程告警一次）。
 
-    只降级 ``invite_only``（开放形态必须先满足 §3.2 前置条件）；``public``
-    原样透传给路由层统一 503 public_registration_not_supported（本阶段不支持，
-    也没有任何开放回退路径）。
+    降级对象为全部开放形态（invite_only 与 I 线的
+    email_verify_invite_activation；后者还叠加邮件通道/载荷密钥/哈希盐前置）；
+    ``public`` 原样透传给路由层统一 503 public_registration_not_supported
+    （本阶段不支持，也没有任何开放回退路径）。
     """
     mode = _registration_mode_stored()
-    if mode != "invite_only":
+    if mode not in _REGISTRATION_GATED_MODES:
         return mode
-    failures = _registration_precondition_failures()
+    failures = _registration_precondition_failures(mode=mode)
     if failures:
         if not _registration_gate_warned["flag"]:
             _registration_gate_warned["flag"] = True
             app.logger.warning(
                 "registration_mode=%r 但前置条件不满足（%s）：注册功能已"
-                " fail-closed 降级为 closed（docs §3.2 末段）",
+                " fail-closed 降级为 closed（docs §3.2 末段 + I 线模式前置）",
                 mode, "；".join(failures))
         return "closed"
     return mode
@@ -4668,14 +5126,14 @@ def _check_registration_preconditions_or_warn(environ=None):
         mode = settings_store.get_registration_mode()
     except Exception:
         return  # json/dual 或存储不可达：读取路径自身 fail-closed 为 closed
-    if mode != "invite_only":
+    if mode not in _REGISTRATION_GATED_MODES:
         return  # closed 无需检查；public 本阶段路由统一拒绝
-    failures = _registration_precondition_failures(environ)
+    failures = _registration_precondition_failures(environ, mode)
     if failures:
         app.logger.warning(
             "[startup] registration_mode=%r 前置条件不满足（%s）：注册功能"
-            "将按 closed 运行；请先完成 TLS/Secure Cookie/PG 配置，再由 owner "
-            "显式切换 invite_only",
+            "将按 closed 运行；请先完成 TLS/Secure Cookie/邮件通道等配置，"
+            "再由 owner 显式切换注册模式",
             mode, "；".join(failures))
 
 
@@ -4715,11 +5173,12 @@ _INVITE_RETIRED_VIEW_FIELDS = ("cohort", "source_code", "campaign_id")
 
 
 def _invite_public_view(invite: dict) -> dict:
-    """邀请行 → owner API 视图（掩码登录账号 + 状态；绝不含 token/token_hash）。
+    """邀请行 → owner API 视图（绑定身份 + 掩码 + 状态；绝不含 token/hash）。
 
     批次 C（docs §4.2/§8.2）：邀请绑定字段语义为「允许兑换的登录账号
-    （login_id）」。视图只输出 "login_id_masked"（批次 B 的 "email_masked"
-    deprecated 同值键已删除）——掩码口径不变（不外泄完整绑定值）。
+    （login_id）」。视图输出 ``login_id_masked``（掩码口径不变）与
+    ``bound_identity``（展示 J：owner 管理台主列 = 完整绑定值——owner-only
+    可信面，user_id 本就全量可见；公开面仍只出掩码）。
 
     批次 D1（§4.4）/ Batch B wave 2：视图删除 source_code/campaign_id/cohort
     回显（邀请只负责注册，不携带来源）；初始金额字段改用
@@ -4732,6 +5191,7 @@ def _invite_public_view(invite: dict) -> dict:
     out.pop("token", None)
     bound = out.pop("login_id_normalized", None)
     out["login_id_masked"] = registration_store.mask_login_id(bound)
+    out["bound_identity"] = bound or None
     for key in _INVITE_RETIRED_VIEW_FIELDS:
         out.pop(key, None)
     if out.get("revoked_at") is not None:
@@ -4756,9 +5216,11 @@ def _registration_settings_payload() -> dict:
     return {
         "mode": effective,
         "stored_mode": stored,
-        "supported_modes": ["closed", "invite_only"],
-        "precondition_failures": _registration_precondition_failures(),
-        "registration_open": effective == "invite_only",
+        "supported_modes": ["closed", "invite_only",
+                            "email_verify_invite_activation"],
+        "precondition_failures": _registration_precondition_failures(
+            mode=stored if stored in _REGISTRATION_GATED_MODES else None),
+        "registration_open": effective in _REGISTRATION_GATED_MODES,
         "backend": platform_features.current_backend(),
     }
 
@@ -4775,10 +5237,13 @@ def _set_registration_mode_service(mode, actor_user_id):
         return None, (400, "public_registration_not_supported",
                       "公开注册本阶段不支持（public_registration_not_"
                       "supported）")
-    if mode not in ("closed", "invite_only"):
-        return None, (400, "invalid_request", "mode 需为 closed 或 invite_only")
-    if mode == "invite_only":
-        failures = _registration_precondition_failures()
+    if mode not in ("closed", "invite_only",
+                    "email_verify_invite_activation"):
+        return None, (400, "invalid_request",
+                      "mode 需为 closed / invite_only / "
+                      "email_verify_invite_activation")
+    if mode in _REGISTRATION_GATED_MODES:
+        failures = _registration_precondition_failures(mode=mode)
         if failures:
             return None, (400, "registration_preconditions_failed",
                           "注册前置条件不满足：" + "；".join(failures))
@@ -5376,21 +5841,49 @@ def _admin_v1_sanitize_audit_detail(value, key=None):
 _ADMIN_V1_DROP = object()
 
 
-def _admin_v1_audit_event_out(event):
+def _admin_v1_identity_map(user_ids):
+    """批量 user_id → 完整邮箱用户名（email 优先，否则 login_id；展示 J）。
+
+    供 owner 管理台把审计 actor / 用量明细 / 额度 / 账单等以 user_id 出线的
+    位置统一映射为身份主列。查询失败返回空 map（展示降级，不 fail-closed）。
+    """
+    wanted = {str(u) for u in user_ids if u}
+    if not wanted:
+        return {}
+    out = {}
+    try:
+        for u in user_store.list_users():
+            uid = str(u.get("user_id") or "")
+            if uid in wanted:
+                email = str(u.get("email_normalized")
+                            or u.get("email") or "")
+                out[uid] = email or u.get("login_id") or uid
+    except Exception:
+        app.logger.warning("身份主列映射查询失败（按 user_id 展示）",
+                           exc_info=True)
+    return out
+
+
+def _admin_v1_audit_event_out(event, identity_map=None):
     """audit 行 → admin v1 导出形态（detail 脱敏；顶层键白名单）。
 
     detail 脱敏后再经 ``_admin_v1_nano_out``：审计 detail 里的金额镜像
     （caps 的 soft_cap_nano/hard_cap_nano、调账的 amount_nano_cny/
     balance_after_nano）同样字符串化——>2^53 的金额以 JSON number 出线，
     浏览器 JSON.parse 会静默失真（owner 复审 P2 遗留修复）。
+    展示 J：actor_identity = actor 的完整邮箱用户名（email 优先，否则
+    login_id）；user_id 保留为次级技术详情。
     """
     detail = event.get("detail")
     cleaned = _admin_v1_sanitize_audit_detail(
         detail if isinstance(detail, dict) else {})
+    actor_uid = str(event.get("actor_user_id") or "") or None
     return {
         "id": event.get("id"),
         "ts": event.get("ts"),
         "actor_user_id": event.get("actor_user_id"),
+        "actor_identity": (identity_map or {}).get(actor_uid)
+        if actor_uid else None,
         "actor_role": event.get("actor_role"),
         "action": event.get("action"),
         "target_type": event.get("target_type"),
@@ -5566,9 +6059,18 @@ def admin_v1_users():
     users.sort(key=lambda u: (float(u.get("created_at") or 0.0),
                               str(u.get("user_id") or "")))
     if search:
-        users = [u for u in users if search in (
-            str(u.get("login_id") or "").lower() + " " +
-            str(u.get("display_name") or "").lower())]
+        # 展示 J：搜索支持精确/模糊邮箱——q 含 @ 时按规范化邮箱精确匹配
+        # 命中，否则对 login_id/email/display_name 做子串（模糊）匹配
+        def _search_hit(u):
+            login = str(u.get("login_id") or "").lower()
+            email = str(u.get("email_normalized")
+                        or u.get("email") or "").lower()
+            name = str(u.get("display_name") or "").lower()
+            if "@" in search:
+                return search == email or search == login \
+                    or search in email or search in login
+            return search in login or search in email or search in name
+        users = [u for u in users if _search_hit(u)]
     if enabled_f is not None:
         users = [u for u in users if bool(u.get("disabled")) != enabled_f]
     if ai_f is not None:
@@ -5606,9 +6108,20 @@ def admin_v1_users():
         spend = spend_by_user.get(uid)
         if spend is not None:
             spend = _admin_v1_spend_summary_out(spend)
+        email_norm = str(u.get("email_normalized")
+                         or u.get("email") or "") or None
         items.append({
             "user_id": uid,
             "display_name": u.get("display_name"),
+            # 展示 J（owner 管理台）：主列 = 完整邮箱用户名（有已验证 email
+            # 用 email，否则 login_id；不再用随意 display_name 冒充身份）。
+            # user_id 为次级技术详情（drawer 内展示）。
+            "identity": email_norm or u.get("login_id") or uid,
+            "identity_source": "email" if email_norm else "login_id",
+            "email": u.get("email") or email_norm,
+            "email_verified": u.get("email_verified_at") is not None,
+            "activation_state": u.get("activation_state") or "active",
+            "activation_source": u.get("activation_source"),
             "login_id_masked": registration_store.mask_login_id(
                 u.get("login_id") or ""),
             "role": u.get("role"),
@@ -5855,8 +6368,11 @@ def admin_v1_audit():
     next_cursor = None
     if has_more:
         next_cursor = _admin_v1_encode_cursor({"o": offset + limit})
-    return jsonify(items=[_admin_v1_audit_event_out(e) for e in events],
-                   next_cursor=next_cursor, limit=limit)
+    identity_map = _admin_v1_identity_map(
+        [ev.get("actor_user_id") for ev in events])
+    return jsonify(
+        items=[_admin_v1_audit_event_out(e, identity_map) for e in events],
+        next_cursor=next_cursor, limit=limit)
 
 
 # --------------------------------------------------------------------------- #
@@ -7009,11 +7525,18 @@ def admin_v1_slides_inventory():
         meta = meta_all.get(name) or {}
         slide_owner = meta.get("owner_user_id") or None
         owner_user = users_by_id.get(str(slide_owner)) if slide_owner else None
+        owner_email = (str(owner_user.get("email_normalized")
+                           or owner_user.get("email") or "")
+                       if owner_user else "")
         included = name in granted_names
         items.append({
             "name": name,
             "size_bytes": (UPLOAD_DIR / name).stat().st_size,
             "owner_user_id": slide_owner,
+            # 展示 J：归属主列 = 完整邮箱用户名（email 优先，否则 login_id；
+            # display_name 不再冒充身份）；user_id 次级。
+            "owner_identity": (owner_email or (owner_user or {}).get(
+                "login_id") or None) if owner_user else None,
             "owner_display_name": (owner_user or {}).get("display_name"),
             "owner_login_id_masked": (
                 registration_store.mask_login_id(
@@ -16086,12 +16609,17 @@ def _resolve_anno(token, index, require_annotate):
 
 
 def _display_label(uid):
-    """取用户展示名快照（评论 author_label 用）；取不到回退 None。"""
+    """身份主列快照（评论/标注 author_label 用；展示 J）。
+
+    取 email（规范化）优先、login_id 次之；**不再**用随意 display_name 冒充
+    身份。取不到回退 None。公开分享页侧由 share_server 统一掩码后再展示。
+    """
     if not uid:
         return None
     try:
         u = user_store.get_user(uid) or {}
-        return u.get("display_name") or None
+        return (u.get("email_normalized") or u.get("email")
+                or u.get("login_id") or None)
     except Exception:
         return None
 

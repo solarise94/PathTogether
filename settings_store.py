@@ -42,8 +42,11 @@ REGISTRATION_MODE_KEY = "registration_mode"
 #: 接线）。cutover apply 先 CAS false→true，提交后 CAS true→false。
 AI_DISPATCH_MAINTENANCE_KEY = "ai_dispatch_maintenance"
 
-#: 合法模式（public 本阶段路由不支持，仅允许出现在存量值中由路由统一拒绝）
-REGISTRATION_MODES = ("closed", "invite_only", "public")
+#: 合法模式（I 线：email_verify_invite_activation 为「邮箱验证 + 邀请码激活」
+#: 两段式；public 本阶段路由不支持，仅允许出现在存量值中由路由统一拒绝；
+#: closed / invite_only 原义保留不变）
+REGISTRATION_MODES = ("closed", "invite_only",
+                      "email_verify_invite_activation", "public")
 
 _log = logging.getLogger("svs.settings")
 
@@ -212,15 +215,21 @@ def get_registration_mode() -> str:
 
 
 def set_registration_mode(mode, updated_by=None) -> str:
-    """写注册模式。本阶段只接受 closed / invite_only（public 拒绝）。
+    """写注册模式。本阶段接受 closed / invite_only /
+    email_verify_invite_activation（public 拒绝）。
 
     返回写入后的模式。
-    前置条件（HTTPS / Secure Cookie）由调用方（app 层）先行校验。
+    前置条件（HTTPS / Secure Cookie / 邮件 worker 配置）由调用方（app 层）
+    先行校验；存储层只做词表校验。
     """
-    if mode not in ("closed", "invite_only"):
+    if mode == "public":
         raise ValueError(
-            "public_registration_not_supported：本阶段仅支持 closed / "
-            "invite_only（收到 %r）" % (mode,))
+            "public_registration_not_supported：本阶段不支持 public（收到"
+            " %r）" % (mode,))
+    if mode not in REGISTRATION_MODES:
+        raise ValueError(
+            "registration_mode 需为 %s（收到 %r）"
+            % (tuple(m for m in REGISTRATION_MODES if m != "public"), mode))
     set_setting(REGISTRATION_MODE_KEY, str(mode), updated_by=updated_by)
     return str(mode)
 

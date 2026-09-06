@@ -326,7 +326,8 @@
     "admin.settings.update": {
       properties: {
         registration_mode: {
-          type: "string", enum: ["closed", "invite_only"],
+          type: "string",
+          enum: ["closed", "invite_only", "email_verify_invite_activation"],
         },
         demo_enabled: { type: "boolean" },
         demo_weekly_limit: { type: "object" },

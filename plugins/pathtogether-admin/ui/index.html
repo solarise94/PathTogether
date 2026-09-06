@@ -286,7 +286,7 @@
           <div class="adm-state" id="adm-state-invites" data-page-state="idle" role="status" aria-live="polite"></div>
           <section class="adm-card">
             <h2>注册模式</h2>
-            <p class="adm-note">当前生效的注册模式（closed / invite_only）。注册模式只在「设置」页可修改，本页仅展示状态。</p>
+            <p class="adm-note">当前生效的注册模式（closed / invite_only / email_verify_invite_activation）。注册模式只在「设置」页可修改，本页仅展示状态。</p>
             <dl id="adm-invite-mode" class="adm-kv"></dl>
             <div class="adm-form-actions">
               <button type="button" id="adm-invite-goto-settings-btn" class="adm-btn-secondary">去设置修改</button>
@@ -366,9 +366,10 @@
                 <select id="adm-regmode-select" aria-describedby="adm-regmode-help">
                   <option value="closed">closed（关闭注册）</option>
                   <option value="invite_only">invite_only（邀请码注册）</option>
+                  <option value="email_verify_invite_activation">email_verify_invite_activation（邮箱验证 + 邀请码激活）</option>
                   <option value="public" disabled>public（本阶段不支持）</option>
                 </select>
-                <small class="adm-field-help" id="adm-regmode-help">closed=关闭注册；invite_only=邀请码注册（需 HTTPS、Secure Cookie、PostgreSQL 前置条件）</small>
+                <small class="adm-field-help" id="adm-regmode-help">closed=关闭注册；invite_only=邀请码直接建号；email_verify_invite_activation=先验证邮箱再邀请码激活（需 HTTPS、Secure Cookie、PostgreSQL、邮件通道）；public 本阶段不支持</small>
               </div>
               <div class="adm-form-actions">
                 <button type="button" id="adm-regmode-save-btn" class="adm-btn-primary">保存注册模式</button>

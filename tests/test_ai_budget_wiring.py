@@ -709,8 +709,9 @@ def test_ui_budget_card_and_max_steps_sync_present():
     manifest = json.loads((REPO_ROOT / "plugins" / "pathtogether-admin"
                            / "manifest.json").read_text(encoding="utf-8"))
     # 2026-09-06：插件版本 0.3.6（升级批次 0–5 工作区收录语义）；turn/acquisition/billing
-    # write 权限全部退役（§Batch E 1 / §Batch C 6 / §Batch D1 4/15）
-    assert manifest["pluginVersion"] == "0.3.6"
+    # write 权限全部退役（§Batch E 1 / §Batch C 6 / §Batch D1 4/15）。
+    # 2026-09-07 升 0.4.0：展示 J（身份主列=完整邮箱用户名，main.js/pin 同步）。
+    assert manifest["pluginVersion"] == "0.4.0"
     for perm in ("admin:turn-budgets:read", "admin:turn-budgets:write",
                  "admin:acquisition:read", "admin:billing:write"):
         assert perm not in manifest["adminPermissions"], perm

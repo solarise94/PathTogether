@@ -790,8 +790,10 @@ describe("pathtogether-admin plugin UI — workbench KPI + drawer (§9, 包 E)",
 		});
 		await ticks(4);
 		const tbody = bus.els["adm-users-tbody"].textContent;
-		// 表内只剩显示名/角色/状态/额度剩余/操作
-		expect(tbody).toContain("张三");
+		// 展示 J：表内主列=完整邮箱用户名（无 identity 字段时回退 login_id）；
+		// display_name 不再冒充身份进表
+		expect(tbody).toContain("u1");
+		expect(tbody).not.toContain("张三");
 		expect(tbody).toContain("user");
 		expect(tbody).toContain("启用");
 		expect(tbody).toContain("剩余 16.08 CNY");
@@ -1170,7 +1172,7 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 		disableBtn!._fire("click", {});
 		const box = bus.els["adm-drawer-confirm"];
 		expect(box.hidden).toBe(false);
-		expect(box.textContent).toContain("确认禁用用户 张三");
+		expect(box.textContent).toContain("确认禁用用户 u1");
 		const okBtn = bus.created.filter((el) => el.textContent === "确认执行").at(-1);
 		expect(okBtn).toBeTruthy();
 		expect(okBtn!.className).toBe("adm-btn-danger");
@@ -1224,7 +1226,7 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 			el.htmlFor === "adm-reset-password-input");
 		expect(label).toBeTruthy();
 		expect(String(label!.className)).toContain("adm-field-label");
-		expect(label!.textContent).toContain("张三");
+		expect(label!.textContent).toContain("u1");
 		expect(label!.textContent).toContain("15 位");
 		expect(String(input!.placeholder)).not.toContain("密码");
 		const okBtn = bus.created.filter((el) => el.textContent === "确认重置").at(-1);
@@ -1438,7 +1440,9 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 			ok: true,
 			result: {
 				registration: { mode: "closed", stored_mode: "closed",
-					precondition_failures: [], supported_modes: ["closed", "invite_only"] },
+						precondition_failures: [],
+						supported_modes: ["closed", "invite_only",
+							"email_verify_invite_activation"] },
 				spend: {
 					available: true, enforcement_mode: "shadow",
 					user_default_total_limit_nano_cny: "20000000000",

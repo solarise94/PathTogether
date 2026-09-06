@@ -71,7 +71,10 @@ MIN_PASSWORD_LENGTH = user_store.PASSWORD_MIN_LENGTH
 #: 服务端密码最大长度（同上统一来源；兑换防御层补齐上限校验）
 MAX_PASSWORD_LENGTH = user_store.PASSWORD_MAX_LENGTH
 
-REGISTRATION_MODES = ("closed", "invite_only", "public")
+#: I 线（设计文档第 8 节）新增模式；settings_store.REGISTRATION_MODES 为权威
+#: 词表（本常量为本模块内防御性副本，保持同序语义）
+REGISTRATION_MODES = ("closed", "invite_only",
+                      "email_verify_invite_activation", "public")
 
 
 class RegistrationStoreError(RuntimeError):
@@ -168,14 +171,18 @@ def _insert_user_locked(cur, login_id_normalized, password, display_name,
     同事务使用）；users.lower(login_id) 唯一索引冲突时抛 psycopg
     UniqueViolation（由调用方在同一事务内翻译为统一错误并回滚）。返回 dict
     只带 "login_id" 键（批次 C 起无 "email" 别名，docs §4.2）。
+    0037：invite_only 直接兑换的账号即 active（activation_source='invite'）；
+    新形态 pending_activation 建号走 _insert_pending_user_tx，不经本函数。
     """
     uid = _new_user_id()
     name = str(display_name or "").strip() or login_id_normalized
     cur.execute(
         "INSERT INTO users "
         "(user_id, login_id, display_name, password_hash, role, created_at, "
-        " disabled, ai_config, ai_access) "
-        "VALUES (%s,%s,%s,%s,'user', now(), FALSE, '{}'::jsonb, %s) "
+        " disabled, ai_config, ai_access, "
+        " activation_state, activation_source, activation_updated_at) "
+        "VALUES (%s,%s,%s,%s,'user', now(), FALSE, '{}'::jsonb, %s, "
+        " 'active', 'invite', now()) "
         "RETURNING user_id, login_id, display_name, role, "
         "extract(epoch from created_at)::float8 AS created_at, disabled, "
         "ai_config, ai_access",
@@ -580,3 +587,539 @@ def _audit_redeem_best_effort(invite_id, status):
     except Exception:
         _log.warning("registration.redeem_attempt 审计写入失败（status=%s）",
                      status, exc_info=True)
+
+
+# =========================================================================== #
+# I+J：邮箱验证 + 邀请码激活（设计文档第 8 节 + review J / P2-4）
+#
+# 状态机：email_pending（无 users 行，物化为未消费 registration_mail_jobs）
+#   → pending_activation（POST /api/registration/verify 原子建号）
+#   → active（activate_registered_user 单事务）。disabled 与状态机正交。
+#
+# 安全不变量（与 redeem_invite 同款纪律）：
+#   - 验证 token：32 字节 CSPRNG（token_urlsafe）、30 分钟、一次性、只存
+#     域分离 HMAC（registration_mail_jobs.token_hash）；含明文 token 的冻结
+#     正文经 registration_mail_worker.encrypt_payload 加密后落库；
+#   - 验证邮箱**不授予** workspace / AI / 额度：verify 建号 ai_access=FALSE、
+#     不建 allowance、activation_state=pending_activation；只有邀请码激活
+#     事务才建一次性总额度；
+#   - J：新用户 login_id = 规范化邮箱（唯一用户名）；与存量 login_id 冲突时
+#     进「待补绑」——新行用合成不可投递 login_id，email 身份列照常落库
+#     （底层关联仍 user_id，切片/标注/会话/账单零丢失），owner 可后续补绑；
+#   - 邮箱身份唯一由 users_email_identity_key（0037 部分唯一索引，
+#     pending_activation+active 两态）兜底；同邮箱并发 verify 只有一行成功；
+#   - 激活事务锁序沿用 provisioning 闸三段式（闸检查 → advisory 锁 → 复查）
+#     → 锁 user 行 → 锁 invite 行 → CAS 消费；**绝不**调用 redeem_invite
+#     （它插入第二个用户）；
+#   - already_active 再提交另一码：不消费、不充值（先查状态后读 invite）。
+# =========================================================================== #
+import re as _re
+
+#: 验证 token 明文字节数（与邀请码同级 ≥32 字节 CSPRNG）
+VERIFY_TOKEN_BYTES = 32
+#: 验证 token 有效期（30 分钟，设计文档第 8 节）
+VERIFY_TOKEN_TTL_SECONDS = 30 * 60
+
+#: 配额（同邮箱维度，权威数据源 = registration_mail_jobs 行数）：
+#: 60s 冷却 / 每小时 3 / 每天 5；应用全局日预算 40。
+VERIFY_COOLDOWN_SECONDS = 60
+VERIFY_HOURLY_LIMIT = 3
+VERIFY_DAILY_LIMIT = 5
+VERIFY_APP_DAILY_BUDGET = 40
+
+#: 邮件用途（0037 CHECK 约束同词表）
+MAIL_PURPOSE_EMAIL_VERIFY = "email_verify"
+
+#: 宽松但可用的邮箱形态校验（注册端入口形状校验；唯一性以规范化值为准）
+_EMAIL_RE = _re.compile(
+    r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$")
+
+
+class EmailVerifyError(RegistrationStoreError):
+    """邮箱验证失败。``code`` 稳定：invalid_or_expired / email_taken /
+    bad_input / rate_limited。（对外文案统一由路由层决定。）"""
+
+    def __init__(self, code, message=None):
+        self.code = str(code)
+        super().__init__(message or self.code)
+
+
+class ActivationError(RegistrationStoreError):
+    """已注册用户激活失败。``code`` 稳定：user_missing / user_disabled /
+    not_pending / already_active（already_active 不消费不充值）。"""
+
+    code = "activation_failed"
+
+    def __init__(self, code, message=None):
+        self.code = str(code)
+        super().__init__(message or self.code)
+
+
+def normalize_email(email) -> str:
+    """邮箱规范化（J 唯一用户名口径）：strip + lower。与 login_id 同口径。"""
+    return str(email or "").strip().lower()
+
+
+def validate_email(email) -> str:
+    """注册入口邮箱校验：规范化后必须命中形态、长度 6..254、local ≤64。
+    返回规范化值；违规抛 EmailVerifyError('bad_input')。"""
+    norm = normalize_email(email)
+    if not norm or len(norm) > 254 or "@" not in norm:
+        raise EmailVerifyError("bad_input")
+    local = norm.split("@", 1)[0]
+    if not local or len(local) > 64:
+        raise EmailVerifyError("bad_input")
+    if not _EMAIL_RE.match(norm):
+        raise EmailVerifyError("bad_input")
+    return norm
+
+
+def _verify_hash_salt() -> str:
+    """验证 token 哈希盐（域分离；口径同 invite_token_hash 的盐链）。"""
+    import os
+    for name in ("REGISTRATION_VERIFY_HASH_SALT", "AUTH_SUBJECT_HASH_SALT",
+                 "SECRET_KEY"):
+        v = (os.environ.get(name) or "").strip()
+        if v:
+            return v
+    return "pt-registration-verify-v1"
+
+
+def verify_token_hash(token: str) -> str:
+    """验证 token 明文 → 域分离 HMAC-SHA-256（registration_mail_jobs.token_hash）。"""
+    msg = (token or "").strip()
+    return hmac.new(
+        ("regverify:" + _verify_hash_salt()).encode("utf-8"),
+        msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _new_verify_token() -> str:
+    return secrets.token_urlsafe(VERIFY_TOKEN_BYTES)
+
+
+# --------------------------------------------------------------------------- #
+# 入队（start / resend 同事务入队 + 配额）
+# --------------------------------------------------------------------------- #
+def _verify_quota_counts_tx(cur, email_norm):
+    """同事务读取该邮箱配额占用：(cooldown, hourly, daily, app_daily)。"""
+    cur.execute(
+        "SELECT "
+        " count(*) FILTER (WHERE created_at > now() - interval '"
+        + str(VERIFY_COOLDOWN_SECONDS) + " seconds') AS cooldown, "
+        " count(*) FILTER (WHERE created_at > now() - interval '1 hour') "
+        "   AS hourly, "
+        " count(*) FILTER (WHERE created_at > now() - interval '24 hours') "
+        "   AS daily "
+        "FROM registration_mail_jobs WHERE email_normalized=%s",
+        (email_norm,))
+    row = cur.fetchone()
+    cur.execute(
+        "SELECT count(*) AS app_daily FROM registration_mail_jobs "
+        "WHERE created_at > now() - interval '24 hours'")
+    return (int(row["cooldown"]), int(row["hourly"]), int(row["daily"]),
+            int(cur.fetchone()["app_daily"]))
+
+
+def enqueue_email_verification(email, base_url=None,
+                               ttl_seconds=VERIFY_TOKEN_TTL_SECONDS):
+    """请求邮箱验证（start/resend 共用）：配额 → 作废旧 token → 入队。
+
+    单个 PostgreSQL 事务内完成：
+      1. 配额检查（权威数据源 = registration_mail_jobs 行数；超限抛
+         EmailVerifyError('rate_limited')，路由层对外与成功**同一文案**）；
+      2. 该邮箱未消费旧作业全部作废（status='superseded'）——同邮箱任意
+         时刻至多一个可用 token（一次性语义的一部分）；
+      3. INSERT 新作业（token_hash + 加密冻结正文；明文 token 绝不落库）。
+
+    冻结正文由 registration_mail_worker.build_verify_email_body 构造（含
+    ``<base_url>/verify-email?token=<明文>`` 链接）并经 encrypt_payload 加密。
+
+    返回 ``{"job_id", "email", "token", "expires_at"}``——``token`` 明文
+    **只在返回值出现一次**（经邮件外发；绝不进日志/审计/URL 以外存储）。
+    """
+    import registration_mail_worker as mail_worker
+    email_norm = validate_email(email)
+    try:
+        ttl = int(ttl_seconds)
+    except (TypeError, ValueError):
+        raise ValueError("ttl_seconds 需为整数")
+    if ttl <= 0 or ttl > 24 * 3600:
+        raise ValueError("ttl_seconds 需在 (0, 86400] 内")
+    token = _new_verify_token()
+    subject, body = mail_worker.build_verify_email_body(
+        email_norm, token, base_url)
+    payload_enc = mail_worker.encrypt_payload(
+        {"subject": subject, "body": body, "purpose": MAIL_PURPOSE_EMAIL_VERIFY,
+         "email": email_norm})
+    token_hash = verify_token_hash(token)
+    job_id = "rmj_" + secrets.token_urlsafe(8)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cooldown, hourly, daily, app_daily = \
+                    _verify_quota_counts_tx(cur, email_norm)
+                if cooldown > 0 or hourly >= VERIFY_HOURLY_LIMIT \
+                        or daily >= VERIFY_DAILY_LIMIT \
+                        or app_daily >= VERIFY_APP_DAILY_BUDGET:
+                    raise EmailVerifyError("rate_limited")
+                # 作废同邮箱全部未消费旧 token（一次性 + 单活）
+                cur.execute(
+                    "UPDATE registration_mail_jobs SET status='superseded' "
+                    "WHERE email_normalized=%s AND purpose=%s "
+                    "AND consumed_at IS NULL "
+                    "AND status IN ('queued','sent')",
+                    (email_norm, MAIL_PURPOSE_EMAIL_VERIFY))
+                cur.execute(
+                    "INSERT INTO registration_mail_jobs "
+                    "(job_id, purpose, email_normalized, token_hash, "
+                    " payload_enc, status, expires_at) "
+                    "VALUES (%s,%s,%s,%s,%s,'queued', "
+                    " now() + (%s * interval '1 second')) "
+                    "RETURNING extract(epoch from expires_at)::float8 "
+                    "AS expires_at",
+                    (job_id, MAIL_PURPOSE_EMAIL_VERIFY, email_norm,
+                     token_hash, payload_enc, ttl))
+                expires_at = float(cur.fetchone()["expires_at"])
+    except psycopg.errors.UniqueViolation:
+        # token_hash 撞唯一键概率可忽略；防御性统一失败
+        raise EmailVerifyError("bad_input")
+    finally:
+        conn.close()
+    return {"job_id": job_id, "email": email_norm, "token": token,
+            "expires_at": expires_at}
+
+
+def check_verify_token(token):
+    """**只读**解析验证 token（GET /verify-email 用，绝不消费）。
+
+    返回 ``{"state": "valid"|"expired"|"consumed"|"unknown",
+    "email_masked": str|None}``——email 掩码展示（mask_login_id），页面不
+    全量回显。未知/非法 token 与过期统一可区分（持链接者本地状态展示），
+    但都不产生任何写副作用。
+    """
+    tok = (token or "").strip()
+    if not tok:
+        return {"state": "unknown", "email_masked": None}
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT email_normalized, status, consumed_at, "
+                    "extract(epoch from expires_at)::float8 AS expires_at "
+                    "FROM registration_mail_jobs "
+                    "WHERE token_hash=%s AND purpose=%s",
+                    (verify_token_hash(tok), MAIL_PURPOSE_EMAIL_VERIFY))
+                row = cur.fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return {"state": "unknown", "email_masked": None}
+    masked = mask_login_id(row["email_normalized"])
+    if row["consumed_at"] is not None or row["status"] == "consumed":
+        return {"state": "consumed", "email_masked": masked}
+    if row["status"] not in ("queued", "sent"):
+        return {"state": "unknown", "email_masked": masked}
+    if row["expires_at"] is not None and row["expires_at"] <= time.time():
+        return {"state": "expired", "email_masked": masked}
+    return {"state": "valid", "email_masked": masked}
+
+
+# --------------------------------------------------------------------------- #
+# 邮箱确认 → 原子创建 pending_activation 用户（密码在邮箱确认之后设置）
+# --------------------------------------------------------------------------- #
+def _pending_bind_login_id() -> str:
+    """login_id 冲突时的合成「待补绑」登录名：不可投递、唯一、可识别。"""
+    return "pending-" + secrets.token_hex(8) + "@bind.invalid"
+
+
+def _insert_pending_user_tx(cur, email_norm, email_raw, password):
+    """同事务插入 pending_activation 用户行（J：login_id=规范化邮箱）。
+
+    - login_id = 规范化邮箱；users_login_id_ci_key 冲突 → 合成待补绑
+      login_id 重试一次（**不**失败注册、**不**合并账号；email 身份唯一由
+      users_email_identity_key 保证，底层业务关联仍是 user_id）。冲突分类
+      在 SAVEPOINT 内完成（UniqueViolation 会中止事务，必须先
+      ROLLBACK TO SAVEPOINT 才能继续同事务插入）；
+    - users_email_identity_key 冲突 → EmailVerifyError('email_taken')
+      （pending_activation/active 两态内该邮箱已占用）；
+    - ai_access=FALSE、无 allowance：验证邮箱不授予任何权限（设计文档第 8 节）。
+    返回用户公共 dict。
+    """
+    uid = _new_user_id()
+    # display_name 默认同邮箱（J：展示主列是邮箱；显示名不冒充身份）
+    for attempt, login in ((1, email_norm),
+                           (2, _pending_bind_login_id())):
+        cur.execute("SAVEPOINT insert_pending_try")
+        try:
+            cur.execute(
+                "INSERT INTO users "
+                "(user_id, login_id, display_name, password_hash, role, "
+                " created_at, disabled, ai_config, ai_access, "
+                " activation_state, activation_source, activation_updated_at,"
+                " email, email_normalized, email_verified_at) "
+                "VALUES (%s,%s,%s,%s,'user', now(), FALSE, '{}'::jsonb, "
+                " FALSE, 'pending_activation', 'invite_activation', now(), "
+                " %s, %s, now()) "
+                "RETURNING user_id, login_id, display_name, role, "
+                "extract(epoch from created_at)::float8 AS created_at, "
+                "disabled, ai_config, ai_access, auth_version, "
+                "activation_state, activation_source, "
+                "extract(epoch from activation_updated_at)::float8 AS "
+                "activation_updated_at, email, email_normalized, "
+                "extract(epoch from email_verified_at)::float8 AS "
+                "email_verified_at",
+                (uid, login, email_norm,
+                 generate_password_hash(password), email_raw, email_norm))
+            row = dict(cur.fetchone())
+            cur.execute("RELEASE SAVEPOINT insert_pending_try")
+            return row
+        except psycopg.errors.UniqueViolation as exc:
+            cur.execute("ROLLBACK TO SAVEPOINT insert_pending_try")
+            name = getattr(getattr(exc, "diag", None),
+                           "constraint_name", "") or ""
+            text = str(exc)
+            if "users_email_identity_key" in name or \
+                    "users_email_identity_key" in text:
+                raise EmailVerifyError("email_taken") from exc
+            if attempt == 1 and ("users_login_id_ci_key" in name
+                                 or "users_login_id_ci_key" in text
+                                 or "login_id" in text):
+                # 存量同 login_id 账号：待补绑，不合并（review J 红线）
+                _log.warning(
+                    "verify 建号 login_id 冲突（email=%s 掩码待审）：进待"
+                    "补绑", mask_login_id(email_norm))
+                continue
+            raise
+    raise EmailVerifyError("bad_input")
+
+
+def verify_email_create_user(token, password, display_name=None):
+    """消费验证 token 并**原子创建** pending_activation 用户（同一事务）。
+
+    - token 一次性：``SELECT ... FOR UPDATE`` 后置 consumed_at；无效/过期/
+      已消费/已作废 → EmailVerifyError('invalid_or_expired')（统一，不泄露
+      细分）；
+    - 密码在**邮箱确认之后**由此调用设置（token 持有者本人在验证页设置）；
+      策略与兑换同款（15..200、非全空白）；
+    - J：login_id = 规范化邮箱（冲突进待补绑，见 _insert_pending_user_tx）；
+    - 成功审计 ``registration.email_verified``（同事务；detail 无 token/
+      密码/IP，email 只存掩码）；
+    - 返回 ``{"user": ..., "login_id": ..., "email": ..., "pending_bind":
+      bool}``。
+    """
+    tok = (token or "").strip()
+    if not tok:
+        raise EmailVerifyError("invalid_or_expired")
+    if not isinstance(password, str) or not password.strip() \
+            or len(password) < MIN_PASSWORD_LENGTH \
+            or len(password) > MAX_PASSWORD_LENGTH:
+        raise EmailVerifyError("bad_input")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT job_id, email_normalized, status, consumed_at, "
+                    "extract(epoch from expires_at)::float8 AS expires_at "
+                    "FROM registration_mail_jobs "
+                    "WHERE token_hash=%s AND purpose=%s FOR UPDATE",
+                    (verify_token_hash(tok), MAIL_PURPOSE_EMAIL_VERIFY))
+                job = cur.fetchone()
+                if job is None or job["consumed_at"] is not None \
+                        or job["status"] not in ("queued", "sent"):
+                    raise EmailVerifyError("invalid_or_expired")
+                if job["expires_at"] is not None \
+                        and job["expires_at"] <= time.time():
+                    raise EmailVerifyError("invalid_or_expired")
+                email_norm = normalize_email(job["email_normalized"])
+                # 同邮箱已有待激活/已激活账号 → 拒（唯一索引兜底；检查先于
+                # 消费，token 保留给真正未注册的后来者——与 redeem 同策略）
+                cur.execute(
+                    "SELECT 1 FROM users WHERE lower(email_normalized)=%s "
+                    "AND activation_state IN ('pending_activation','active') "
+                    "LIMIT 1", (email_norm,))
+                if cur.fetchone() is not None:
+                    raise EmailVerifyError("email_taken")
+                user = _insert_pending_user_tx(
+                    cur, email_norm, email_norm,
+                    password)  # email 列存规范化值（J：唯一用户名口径）
+                pending_bind = normalize_email(user["login_id"]) != email_norm
+                cur.execute(
+                    "UPDATE registration_mail_jobs SET status='consumed', "
+                    "consumed_at=now() WHERE job_id=%s AND "
+                    "consumed_at IS NULL", (job["job_id"],))
+                if (cur.rowcount or 0) != 1:
+                    raise EmailVerifyError("invalid_or_expired")
+                _insert_audit(
+                    cur, "registration.email_verified", user["user_id"],
+                    "user", user["user_id"],
+                    {"email_masked": mask_login_id(email_norm),
+                     "pending_bind": bool(pending_bind)})
+    except psycopg.errors.UniqueViolation as exc:
+        # 检查与插入之间的并发窗口（users_email_identity_key 兜底）
+        name = getattr(getattr(exc, "diag", None), "constraint_name", "") or ""
+        if "users_email_identity_key" in name or \
+                "users_email_identity_key" in str(exc):
+            raise EmailVerifyError("email_taken") from exc
+        raise EmailVerifyError("invalid_or_expired") from exc
+    finally:
+        conn.close()
+    return {"user": user, "login_id": user["login_id"], "email": email_norm,
+            "pending_bind": bool(pending_bind)}
+
+
+# --------------------------------------------------------------------------- #
+# 已注册用户激活（单事务；绝不走 redeem_invite——那会插入第二个用户）
+# --------------------------------------------------------------------------- #
+def activate_registered_user(user_id, invite_token):
+    """pending_activation 用户凭邀请码激活（**单个 PostgreSQL 事务**）。
+
+    锁序（与 redeem_invite / create_user_with_total_allowance 同款三段式，
+    保证建号/兑换/激活三方与 cutover 互斥串行、无死锁）：
+      闸检查 → acquire_user_provisioning_lock_tx → 复查闸
+      → SELECT users FOR UPDATE（锁 user 行、复查状态机）
+      → SELECT registration_invites FOR UPDATE（锁 invite 行）
+      → CAS 消费邀请码（use_count+1 / consumed_at / consumed_by_user_id，
+        WHERE consumed_at IS NULL AND revoked_at IS NULL——同码两人并发只有
+        一人成功）
+      → users.activation_state='active'、activation_source='invite'、
+        ai_access=邀请模板值、auth_version+1（权限面变化推进凭据版本）
+      → spend_store.create_user_total_allowance_tx（按邀请面值建一次性总额
+        度；无面值解析全局默认，皆缺 fail-closed 整体回滚）
+      → 审计 registration.activate（同事务）。
+
+    失败语义：
+      - 用户缺失/禁用/状态非 pending_activation → ActivationError
+        （already_active 时**邀请码未读未消费**：先查状态后读 invite）；
+      - 邀请码无效/过期/撤销/已消费 → InviteRedeemError（对外统一
+        ``invite_invalid_or_unavailable``；消费 CAS 未命中同样整体回滚）；
+      - 维护闸开启 → spend_store.ProvisioningMaintenanceError 原样上抛。
+
+    成功返回 ``{"user", "invite_id", "total_allowance"}``。
+    """
+    tok = (invite_token or "").strip()
+    if not tok or not isinstance(user_id, str) or not user_id.strip():
+        raise ActivationError("user_missing")
+    token_hash = invite_token_hash(tok)
+    fail_invite_id = None
+    fail_reason = "unknown"
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                if spend_store.is_dispatch_maintenance_tx(cur):
+                    raise spend_store.ProvisioningMaintenanceError(
+                        "系统维护中（cutover），暂停激活；请稍后重试")
+                spend_store.acquire_user_provisioning_lock_tx(cur)
+                if spend_store.is_dispatch_maintenance_tx(cur):
+                    raise spend_store.ProvisioningMaintenanceError(
+                        "系统维护中（cutover），暂停激活；请稍后重试")
+                # 1) 锁 user 行，先查状态机（already_active 不读 invite、
+                #    不消费、不充值——review J/P2-4 红线）
+                cur.execute(
+                    "SELECT user_id, login_id, email_normalized, disabled, "
+                    "activation_state, auth_version FROM users "
+                    "WHERE user_id=%s FOR UPDATE", (user_id,))
+                user = cur.fetchone()
+                if user is None:
+                    raise ActivationError("user_missing")
+                if user["disabled"]:
+                    raise ActivationError("user_disabled")
+                if user["activation_state"] == "active":
+                    raise ActivationError("already_active")
+                if user["activation_state"] != "pending_activation":
+                    raise ActivationError("not_pending")
+                # 2) 锁 invite 行 + 状态检查（时间列统一 epoch float，与
+                #    redeem_invite 同口径）
+                cur.execute(
+                    "SELECT invite_id, "
+                    "extract(epoch from expires_at)::float8 AS expires_at, "
+                    "max_uses, use_count, "
+                    "extract(epoch from consumed_at)::float8 AS consumed_at, "
+                    "extract(epoch from revoked_at)::float8 AS revoked_at, "
+                    "ai_access, total_limit_nano_cny "
+                    "FROM registration_invites "
+                    "WHERE token_hash=%s FOR UPDATE", (token_hash,))
+                invite = cur.fetchone()
+                if invite is None:
+                    fail_reason = "not_found"
+                    raise InviteRedeemError("not_found")
+                invite_id = fail_invite_id = invite["invite_id"]
+                fail_reason = "status_changed"
+                now = time.time()
+                if invite["revoked_at"] is not None:
+                    fail_reason = "revoked"
+                    raise InviteRedeemError("revoked")
+                if invite["expires_at"] is not None \
+                        and invite["expires_at"] <= now:
+                    fail_reason = "expired"
+                    raise InviteRedeemError("expired")
+                if invite["consumed_at"] is not None or \
+                        int(invite["use_count"] or 0) >= \
+                        int(invite["max_uses"] or 1):
+                    fail_reason = "consumed"
+                    raise InviteRedeemError("consumed")
+                # 3) CAS 消费（同码并发只有一人命中）
+                cur.execute(
+                    "UPDATE registration_invites SET use_count=use_count+1, "
+                    "consumed_at=now(), consumed_by_user_id=%s "
+                    "WHERE invite_id=%s AND consumed_at IS NULL "
+                    "AND revoked_at IS NULL",
+                    (user_id, invite_id))
+                if (cur.rowcount or 0) != 1:
+                    fail_reason = "consumed"
+                    raise InviteRedeemError("consumed")
+                # 4) 状态机推进 active + 邀请模板 AI 权限 + 凭据版本推进
+                cur.execute(
+                    "UPDATE users SET activation_state='active', "
+                    "activation_source='invite', activation_updated_at=now(),"
+                    " ai_access=%s, auth_version=auth_version+1 "
+                    "WHERE user_id=%s RETURNING user_id, login_id, "
+                    "display_name, role, extract(epoch from created_at)::float8"
+                    " AS created_at, disabled, ai_config, ai_access, "
+                    "auth_version, activation_state, activation_source, "
+                    "email, email_normalized",
+                    (bool(invite["ai_access"]), user_id))
+                updated = dict(cur.fetchone())
+                # 5) 按邀请面值建一次性总额度（单轨；无面值解析全局默认；
+                #    皆缺 fail-closed 整体回滚——invite 不消费、状态不推进）
+                invite_limit = invite["total_limit_nano_cny"]
+                try:
+                    if invite_limit is not None:
+                        limit, dver = int(invite_limit), None
+                    else:
+                        limit, _src, dver = \
+                            spend_store._resolve_total_default_tx(
+                                cur, datetime.now(timezone.utc))
+                        if limit is None:
+                            raise ValueError(
+                                "total_default_missing: 无可用默认总额度"
+                                "（ai_spend_total_defaults 缺行）")
+                    allowance = spend_store.create_user_total_allowance_tx(
+                        cur, user_id, limit, source="invite",
+                        default_version=dver,
+                        updated_by="invite:" + invite_id)
+                except Exception:
+                    _log.warning("激活建额度失败（整体回滚：invite 不消费、"
+                                 "状态不推进）", exc_info=True)
+                    raise
+                _insert_audit(
+                    cur, "registration.activate", user_id,
+                    "registration_invite", invite_id,
+                    {"status": "success",
+                     "user_id": user_id,
+                     "email_masked": mask_login_id(
+                         user["email_normalized"] or "")})
+        return {"user": updated, "invite_id": invite_id,
+                "total_allowance": allowance}
+    except InviteRedeemError as exc:
+        # 失败审计（独立 best-effort 小事务；主事务已回滚，invite 必未消费）
+        fail_reason = exc.reason if exc.reason != "bad_input" else fail_reason
+        _audit_redeem_best_effort(fail_invite_id, "activate:" + fail_reason)
+        raise
+    finally:
+        conn.close()

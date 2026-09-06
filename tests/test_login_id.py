@@ -79,42 +79,46 @@ def make_owner(login_id="admin", password=OWNER_PW):
 # 1. 单键输出（docs §4.2 物理收口：email 键不再出现）
 # =========================================================================== #
 def test_user_dicts_login_id_only_no_email_key():
-    """所有返回用户 dict 的路径只带 login_id；email 键不再出现（批次 C）。"""
+    """用户 dict 的 login_id 是登录键；email 键（0037 J 线）是**独立的可信
+    已验证邮箱字段**——存量/admin 建号未验证恒为 None（绝不把带 @ 的
+    login_id 伪装成已验证邮箱，批次 C 的「email 别名删除」语义由
+    email is None + login_id 唯一登录键延续）。"""
     owner = make_owner("Owner_One")
     check("create_bootstrap_owner login_id==规范化值",
           owner.get("login_id") == "owner_one")
-    check("create_bootstrap_owner 无 email 键", "email" not in owner)
+    check("create_bootstrap_owner email=None（无可信已验证邮箱）",
+          owner.get("email") is None)
     u = user_store.create_user("Alice@Example.COM", PW, role="user",
                                display_name="Alice")
     check("create_user login_id 规范化值",
           u.get("login_id") == "alice@example.com")
-    check("create_user 无 email 键", "email" not in u)
+    check("create_user email=None", u.get("email") is None)
 
     got = user_store.get_user(u["user_id"])
     check("get_user login_id 命中",
           got.get("login_id") == "alice@example.com")
-    check("get_user 无 email 键", "email" not in got)
+    check("get_user email=None", got.get("email") is None)
     by_login = user_store.get_user_by_login_id("alice@example.com")
-    check("get_user_by_login_id 命中且无 email 键",
+    check("get_user_by_login_id 命中且 email=None",
           by_login is not None and by_login.get("login_id")
-          == "alice@example.com" and "email" not in by_login)
+          == "alice@example.com" and by_login.get("email") is None)
     v = user_store.verify_user("ALICE@example.com", PW)
-    check("verify_user 命中本人且无 email 键",
+    check("verify_user 命中本人且 email=None",
           v is not None and v["user_id"] == u["user_id"]
-          and "email" not in v)
+          and v.get("email") is None)
     listed = user_store.list_users()
-    check("list_users 每行只有 login_id 键",
+    check("list_users 每行 login_id 键 + email=None",
           len(listed) == 2 and all(
-              x.get("login_id") and "email" not in x for x in listed))
+              x.get("login_id") and x.get("email") is None for x in listed))
     owners = user_store.list_enabled_owners()
-    check("list_enabled_owners 单键",
+    check("list_enabled_owners 单 owner、email=None",
           len(owners) == 1 and owners[0].get("login_id") == "owner_one"
-          and "email" not in owners[0])
-    # 写路径返回同样单键（set_user_password 递增 auth_version 后的公共 dict）
+          and owners[0].get("email") is None)
+    # 写路径返回同样口径（set_user_password 递增 auth_version 后的公共 dict）
     p = user_store.set_user_password(u["user_id"], PW3)
-    check("set_user_password 返回单键",
+    check("set_user_password 返回口径一致",
           p is not None and p.get("login_id") == "alice@example.com"
-          and "email" not in p)
+          and p.get("email") is None)
 
 # =========================================================================== #
 # 2. 登录只认 login_id（docs §6.1 / §11.2 矩阵）
@@ -248,9 +252,9 @@ def test_admin_users_api_login_id_only(monkeypatch):
     check("GET /api/admin/v1/users 200", r.status_code == 200)
     users = r.get_json().get("items") or []
     check("列表非空", len(users) == 2)
-    check("列表每行 login_id_masked 且无 hash 无 email 键",
+    check("列表每行 login_id_masked 且无 hash；email=None（未验证）",
           all(u.get("login_id_masked") and "password_hash" not in u
-              and "email" not in u for u in users))
+              and u.get("email") is None for u in users))
 
     # 创建：login_id 入参（旧建号端点已 410 退役，review R2-F1；契约在 v1）
     r2 = client.post("/api/admin/v1/users",
@@ -260,7 +264,7 @@ def test_admin_users_api_login_id_only(monkeypatch):
     body2 = r2.get_json().get("user") or {}
     check("创建响应 login_id==规范化值",
           body2.get("login_id") == "new@x.com")
-    check("创建响应无 email 键", "email" not in body2)
+    check("创建响应 email=None（未验证）", body2.get("email") is None)
 
     # 批次 C：email 兼容入参已删除——只传 email 不给 login_id → 400
     r3 = client.post("/api/admin/v1/users",
@@ -282,13 +286,15 @@ def test_admin_users_api_login_id_only(monkeypatch):
                      json={"password": PW3})
     check("重置密码 200", r5.status_code == 200)
     b5 = r5.get_json().get("user") or {}
-    check("重置响应单键", b5.get("login_id") == "u@x.com"
-          and "email" not in b5)
+    check("重置响应口径", b5.get("login_id") == "u@x.com"
+          and b5.get("email") is None)
     r6 = client.post("/api/admin/v1/users/%s/disable" % uid)
     check("禁用 200", r6.status_code == 200)
-    check("禁用响应单键", "email" not in r6.get_json().get("user", {}))
+    check("禁用响应 email=None",
+          r6.get_json().get("user", {}).get("email") is None)
     r7 = client.post("/api/admin/v1/users/%s/enable" % uid)
-    check("启用响应单键", "email" not in r7.get_json().get("user", {}))
+    check("启用响应 email=None",
+          r7.get_json().get("user", {}).get("email") is None)
 
 def test_invite_admin_api_login_id_only(monkeypatch):
     """邀请管理 API：只接受 login_id 入参（email 兼容入参已删除）；响应只带
@@ -309,9 +315,9 @@ def test_invite_admin_api_login_id_only(monkeypatch):
           body.get("login_id_masked") == "n***@x.com")
     check("创建响应无 email_masked 键（批次 C）",
           "email_masked" not in body)
-    check("响应不含完整绑定值与 token_hash",
-          "newuser@x.com" not in json.dumps(body)
-          and "token_hash" not in body)
+    check("响应不含 token_hash；J 后 owner 控制台带完整绑定值 bound_identity",
+          "token_hash" not in body
+          and body.get("bound_identity") == "newuser@x.com")
 
     # 批次 C：email 兼容入参已删除——body 仍带 email 键说明是旧客户端，
     # 显式 400（绝不静默降级为不绑定邀请这一高风险形态）。

@@ -841,7 +841,8 @@ def test_settings_aggregate_sections_and_decimal_strings():
     assert r.status_code == 200
     body = r.get_json()
     # 注册模式段（任何后端真实）
-    assert body["registration"]["supported_modes"] == ["closed", "invite_only"]
+    assert body["registration"]["supported_modes"] == [
+        "closed", "invite_only", "email_verify_invite_activation"]
     # spend 段：三条策略 + enforcement + 窗口边界（epoch）+ 当前 demo 窗口
     spend = body["spend"]
     assert spend["available"] is True

@@ -1560,7 +1560,6 @@
     els.annoFreeBtn.classList.toggle("active", mode === "freehand");
     els.annoCanvas.classList.add("drawing");
     if (viewer) viewer.setMouseNavEnabled(false);
-    state.showAnno = true;
     syncAnnoAllBtns();
     redrawAnnoCanvas();
     updateCtxBar();

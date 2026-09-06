@@ -10,8 +10,9 @@
  *   - 多通道恒 fluorescence-preserve-v1（荧光保真，无省流档），不持久化偏好；
  *   - tileQuery/thumbnailQuery 携带 profile+dv 成对参数；
  *   - render-context 的 display_versions 到达后 dv 更新（自定义 context）；
- *   - 409 有界恢复：合并并发失败瓦片（同窗口只诊断一次）；第二次冲突停止
- *     自动重试；401/403 不降级。
+	 *   - 409 有界恢复：真实 OSD tile.getUrl() 事件形状；合并并发失败瓦片
+	 *     （同窗口只诊断一次）；open 不清零；tile-loaded 才结束 episode；
+	 *     第二次冲突停止自动重试；401/403 不降级。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
@@ -186,69 +187,140 @@ describe("HP_ViewerEncoding", () => {
 		expect(hp.tileQuery()).toBe(`?profile=native-standard-v1&dv=${nv}`);
 	});
 
-	it("409 恢复：合并并发失败（一次诊断）；第二次冲突停止自动重试", async () => {
-		const fetched: string[] = [];
-		let status = 409;
-		const hp = loadModule({
-			fetchMock: (url: string) => {
-				fetched.push(url as string);
-				return Promise.resolve({ status });
-			},
-		});
-		hp.handleDisplay(RGB_DISPLAY);
-		const viewer = fakeViewer();
-		const onConflict = vi.fn();
-		hp.installConflictRecovery({ viewer, onConflict });
-		// 同窗口三张失败瓦片 → 只诊断一次
-		viewer.emit("tile-load-failed", {
-			source: { src: `/api/slide/x_files/0/0_0.jpeg?profile=native-standard-v1&dv=x` },
-		});
-		viewer.emit("tile-load-failed", {
-			source: { src: `/api/slide/x_files/0/0_1.jpeg?profile=native-standard-v1&dv=x` },
-		});
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(fetched.length).toBe(1);
-		expect(onConflict).toHaveBeenCalledTimes(1);
-		// 第二轮冲突（新窗口）：停止自动重试
-		await new Promise((r) => setTimeout(r, 1600));
-		viewer.emit("tile-load-failed", {
-			source: { src: `/api/slide/x_files/0/0_0.jpeg?profile=native-standard-v1&dv=x` },
-		});
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(onConflict).toHaveBeenCalledTimes(1); // 不再触发
-		expect(hp._state.conflictCount).toBe(2);
-	});
+		function failedTile(url: string) {
+			return { tile: { getUrl: () => url }, tiledImage: {}, time: 0, message: "fail", tileRequest: null };
+		}
 
-	it("401/403 不降级（不触发 onConflict）", async () => {
-		const fetched: string[] = [];
-		const hp = loadModule({
-			fetchMock: (url: string) => {
-				fetched.push(url as string);
-				return Promise.resolve({ status: 403 });
-			},
+		it("409 恢复：合并并发失败（一次诊断）；第二次冲突停止自动重试", async () => {
+			const fetched: string[] = [];
+			let status = 409;
+			const hp = loadModule({
+				fetchMock: (url: string) => {
+					fetched.push(url as string);
+					return Promise.resolve({ status });
+				},
+			});
+			hp.handleDisplay(RGB_DISPLAY);
+			const viewer = fakeViewer();
+			const onConflict = vi.fn();
+			hp.installConflictRecovery({ viewer, onConflict });
+			const u0 = `/api/slide/x_files/0/0_0.jpeg?profile=native-standard-v1&dv=x`;
+			const u1 = `/api/slide/x_files/0/0_1.jpeg?profile=native-standard-v1&dv=x`;
+			// 同窗口三张失败瓦片 → 只诊断一次
+			viewer.emit("tile-load-failed", failedTile(u0));
+			viewer.emit("tile-load-failed", failedTile(u1));
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(fetched.length).toBe(1);
+			expect(onConflict).toHaveBeenCalledTimes(1);
+			// 第二轮冲突（新窗口）：停止自动重试
+			await new Promise((r) => setTimeout(r, 1600));
+			viewer.emit("tile-load-failed", failedTile(u0));
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(onConflict).toHaveBeenCalledTimes(1); // 不再触发
+			expect(hp._state.conflictCount).toBe(2);
 		});
-		hp.handleDisplay(RGB_DISPLAY);
-		const viewer = fakeViewer();
-		const onConflict = vi.fn();
-		hp.installConflictRecovery({ viewer, onConflict });
-		viewer.emit("tile-load-failed", {
-			source: { src: `/api/slide/x_files/0/0_0.jpeg?profile=p&dv=x` },
-		});
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(fetched.length).toBe(1);
-		expect(onConflict).not.toHaveBeenCalled();
-	});
 
-	it("成功 open 事件重置连续冲突计数", () => {
-		const hp = loadModule();
-		hp.handleDisplay(RGB_DISPLAY);
-		const viewer = fakeViewer();
-		hp.installConflictRecovery({ viewer, onConflict: () => {} });
-		hp._state.conflictCount = 2;
-		viewer.emit("open", {});
-		expect(hp._state.conflictCount).toBe(0);
-	});
+		it("真实 OSD 事件缺 tile.getUrl 时不诊断", async () => {
+			const fetched: string[] = [];
+			const hp = loadModule({
+				fetchMock: (url: string) => {
+					fetched.push(url as string);
+					return Promise.resolve({ status: 409 });
+				},
+			});
+			hp.handleDisplay(RGB_DISPLAY);
+			const viewer = fakeViewer();
+			hp.installConflictRecovery({ viewer, onConflict: vi.fn() });
+			viewer.emit("tile-load-failed", {
+				source: { src: `/api/slide/x_files/0/0_0.jpeg?profile=native-standard-v1&dv=x` },
+			});
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(fetched.length).toBe(0);
+			expect(hp._state.conflictCount).toBe(0);
+		});
+
+		it("409 → open 重开不清零；第二次冲突停止", async () => {
+			const fetched: string[] = [];
+			const hp = loadModule({
+				fetchMock: (url: string) => {
+					fetched.push(url as string);
+					return Promise.resolve({ status: 409 });
+				},
+			});
+			hp.handleDisplay(RGB_DISPLAY);
+			const viewer = fakeViewer();
+			const onConflict = vi.fn();
+			hp.installConflictRecovery({ viewer, onConflict });
+			const u = `/api/slide/x_files/0/0_0.jpeg?profile=native-standard-v1&dv=x`;
+			viewer.emit("tile-load-failed", failedTile(u));
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(onConflict).toHaveBeenCalledTimes(1);
+			expect(hp._state.conflictCount).toBe(1);
+			viewer.emit("open", {});
+			expect(hp._state.conflictCount).toBe(1);
+			await new Promise((r) => setTimeout(r, 1600));
+			viewer.emit("tile-load-failed", failedTile(u));
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(onConflict).toHaveBeenCalledTimes(1);
+			expect(hp._state.conflictCount).toBe(2);
+		});
+
+		it("版本化 tile-loaded 结束 episode，后续冲突可再恢复一次", async () => {
+			const hp = loadModule({
+				fetchMock: () => Promise.resolve({ status: 409 }),
+			});
+			hp.handleDisplay(RGB_DISPLAY);
+			const viewer = fakeViewer();
+			const onConflict = vi.fn();
+			hp.installConflictRecovery({ viewer, onConflict });
+			const u = `/api/slide/x_files/0/0_0.jpeg?profile=native-standard-v1&dv=x`;
+			viewer.emit("tile-load-failed", failedTile(u));
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(onConflict).toHaveBeenCalledTimes(1);
+			viewer.emit("tile-loaded", failedTile(u));
+			expect(hp._state.conflictCount).toBe(0);
+			await new Promise((r) => setTimeout(r, 1600));
+			viewer.emit("tile-load-failed", failedTile(u));
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(onConflict).toHaveBeenCalledTimes(2);
+			expect(hp._state.conflictCount).toBe(1);
+		});
+
+		it("401/403 不降级（不触发 onConflict）", async () => {
+			const fetched: string[] = [];
+			const hp = loadModule({
+				fetchMock: (url: string) => {
+					fetched.push(url as string);
+					return Promise.resolve({ status: 403 });
+				},
+			});
+			hp.handleDisplay(RGB_DISPLAY);
+			const viewer = fakeViewer();
+			const onConflict = vi.fn();
+			hp.installConflictRecovery({ viewer, onConflict });
+			viewer.emit("tile-load-failed", {
+				tile: { getUrl: () => `/api/slide/x_files/0/0_0.jpeg?profile=p&dv=x` },
+			});
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(fetched.length).toBe(1);
+			expect(onConflict).not.toHaveBeenCalled();
+		});
+
+		it("open 事件本身不清零连续冲突计数", () => {
+			const hp = loadModule();
+			hp.handleDisplay(RGB_DISPLAY);
+			const viewer = fakeViewer();
+			hp.installConflictRecovery({ viewer, onConflict: () => {} });
+			hp._state.conflictCount = 2;
+			viewer.emit("open", {});
+			expect(hp._state.conflictCount).toBe(2);
+		});
 });

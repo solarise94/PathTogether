@@ -317,8 +317,15 @@ test.describe("viewer 画质档 UI（生产 JS/CSS，虚构数据）", () => {
 
 		const ctl = page.locator("#quality-control");
 		await expect(ctl).toBeVisible();
-		await expect(ctl.locator(".viewer-quality-badge")).toHaveText("荧光保真");
-		expect(ctl.locator(".viewer-quality-btn")).toHaveCount(0);
+			const badge = ctl.locator(".viewer-quality-badge");
+			await expect(badge).toHaveText("荧光保真 ✓");
+			await expect(badge).toHaveAttribute("role", "note");
+			expect(ctl.locator(".viewer-quality-btn")).toHaveCount(0);
+			await expect.poll(async () =>
+				badge.evaluate((el) => getComputedStyle(el).whiteSpace)).toBe("nowrap");
+			const box = await badge.boundingBox();
+			expect(box, "荧光保真 chip 必须可见").toBeTruthy();
+			expect(box!.height, "荧光保真不得竖排换行").toBeLessThanOrEqual(28);
 		expect(await lastOpenTileUrl(page)).toBe(
 			`/mock/fixture_demo.ome.tiff_files/0/0_0.jpeg?profile=fluorescence-preserve-v1&dv=${DV_PRESERVE}&render=tok-fixture-default`,
 		);

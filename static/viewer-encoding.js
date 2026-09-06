@@ -11,8 +11,10 @@
      display 能力）一律回退旧 URL 并隐藏画质切换（仅「成功 info 明确缺字段」
      才算旧服务端；网络错误/403/畸形不伪装）；
    - 409 display_version_conflict 有界恢复：合并同一 viewer 的并发失败瓦片，
-     错误路径单次带 credentials 诊断请求（正常请求绝不下载两遍）；第二次
-     冲突停止自动重试；401/403 不做能力降级。
+     错误路径单次带 credentials 诊断请求（正常请求绝不下载两遍）。episode
+     以「可见版本化瓦片成功」为界：viewer.open 本身不清零计数（恢复重开
+     会再发 open，但瓦片仍可能失败）；只有 tile-loaded 且 URL 含 profile=
+     才结束 episode。同一 episode 第二次 409 停止自动重试；401/403 不降级。
    ========================================================================= */
 (function (root) {
   "use strict";
@@ -144,6 +146,19 @@
 
   function modeClass() { return state.modeClass; }
 
+  /* 真实 OSD 5.0.1 tile-load-failed / tile-loaded 载荷是
+     { tile, tiledImage, time, message, tileRequest }，URL 在 tile.getUrl()。 */
+  function versionedTileUrl(ev) {
+    var tile = ev && ev.tile;
+    if (!tile || typeof tile.getUrl !== "function") return "";
+    try {
+      var url = tile.getUrl();
+      return typeof url === "string" ? url : "";
+    } catch (e) {
+      return "";
+    }
+  }
+
   /* 用户切换画质（仅 RGB 两档）。持久化偏好并请求轻量重开（不改 context）。 */
   function setPreference(profileId) {
     var allowed = state.profiles.map(function (p) { return p.profile_id; });
@@ -163,13 +178,13 @@
     if (!viewer || !viewer.addHandler) return;
     var episodeAt = 0;      // 合并窗口起点（同一 viewer 的并发失败只诊断一次）
     var diagnosing = false;
-    viewer.addHandler("open", function () {
-      // 成功开图重置连续冲突计数（换切片/重开都算新一轮）
-      state.conflictCount = 0;
+    viewer.addHandler("tile-loaded", function (ev) {
+      // 确认新版本瓦片已经可见后才结束当前 409 episode；open 本身不算成功。
+      var loaded = versionedTileUrl(ev);
+      if (loaded && loaded.indexOf("profile=") >= 0) state.conflictCount = 0;
     });
     viewer.addHandler("tile-load-failed", function (ev) {
-      var src = ev && ev.source;
-      var url = src && (typeof src.src === "string" ? src.src : "");
+      var url = versionedTileUrl(ev);
       if (!url || url.indexOf("profile=") < 0) return;  // 仅版本化 URL 适用
       var now = Date.now();
       if (diagnosing || now - episodeAt < 1500) return;  // 合并并发失败瓦片
@@ -232,8 +247,11 @@
       var badge = root.document.createElement("span");
       badge.className = "viewer-quality-badge";
       badge.setAttribute("data-i18n", "quality.mc.badge");
+      badge.setAttribute("role", "note");
+      badge.tabIndex = 0;
       badge.textContent = t("quality.mc.badge");
       badge.title = t("quality.mc.tip");
+      badge.setAttribute("aria-label", t("quality.mc.tip"));
       ctl.appendChild(badge);
       return;
     }

@@ -1194,6 +1194,7 @@
       els.roiRectBtn.classList.remove("active");
       els.roiRectBtn.setAttribute("aria-expanded", "false");
     }
+    if (els.roiSettings) els.roiSettings.hidden = true;
     if (viewer) viewer.setMouseNavEnabled(true);
     updateRoiButtons();
     els.saveBtn.disabled = true;
@@ -3189,7 +3190,6 @@
     var c = els.annoCanvas;
     c.classList.add("drawing");
     if (viewer) viewer.setMouseNavEnabled(false);
-    state.showAnno = true;
     syncAnnoAllBtns();
     redrawAnnoCanvas();
     updateCtxBar();

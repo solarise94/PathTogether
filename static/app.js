@@ -746,6 +746,9 @@
       hpEmit("slide.opened", { slide: {
         name: slideName, width: state.slide.width, height: state.slide.height,
         mppX: state.slide.mppX, mppY: state.slide.mppY,
+        // 资产 revision（服务端口径 = "mtime_ns:size"）：插件快照回看时比对
+        // view.slide_revision，检测切片被替换（宽容缺省 → null，保护退化为不拦截）
+        revision: state.slide.revision || null,
       } });
     }
     if (state.slide) {
@@ -921,6 +924,9 @@
           mppX: info.mpp_x,
           mppY: info.mpp_y,
           mppSource: info.mpp_source,
+          // info.asset_revision（"mtime_ns:size"）随 info 响应下发；边缘路径
+          // （render fields 读取失败等）可能缺键 → 宽容置 null
+          revision: info.asset_revision || null,
         };
         state.mppX = info.mpp_x;
         state.rotation = 0;

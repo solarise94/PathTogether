@@ -2593,27 +2593,36 @@
     document.body.classList.toggle("ctx-on", on);
   }
 
-  // ---------- 移动端 ⋯ 溢出面板（装 AI 读片 + 缩放徽章，避免挤爆底栏） ----------
+  // ---------- ⋯ 溢出菜单（移动端装 AI 读片；桌面端装 Reset/显示全部标记等低频操作） ----------
   function bindTbbMore() {
     if (!els.tbbMoreBtn || !els.tbbMore) return;
     var mask = $("tbb-more-mask");
     function closeMore() {
       els.tbbMore.classList.remove("open");
       if (mask) mask.classList.remove("open");
+      els.tbbMoreBtn.setAttribute("aria-expanded", "false");
     }
     function openMore() {
       els.tbbMore.classList.add("open");
       if (mask) mask.classList.add("open");
+      els.tbbMoreBtn.setAttribute("aria-expanded", "true");
     }
     els.tbbMoreBtn.addEventListener("click", function (e) {
       e.stopPropagation();
       if (els.tbbMore.classList.contains("open")) { closeMore(); } else { openMore(); }
     });
     if (mask) mask.addEventListener("click", closeMore);
-    // ⋯ 面板里的 AI 钮：转发给主 AI 钮（打开/关闭 AI 面板），并关闭 ⋯
+    // Esc 关菜单（HIG：弹出层必须可键盘退出）
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && els.tbbMore.classList.contains("open")) closeMore();
+    });
+    // 菜单项点击后收起菜单（各自的原处理逻辑不变）
+    els.tbbMore.addEventListener("click", function (e) {
+      if (e.target && e.target.closest && e.target.closest(".tool-btn")) closeMore();
+    });
+    // ⋯ 菜单里的 AI 钮：转发给主 AI 钮（打开/关闭 AI 面板）
     if (els.tbbMoreAi) {
       els.tbbMoreAi.addEventListener("click", function () {
-        closeMore();
         if (els.aiBtn && !els.aiBtn.disabled) els.aiBtn.click();
       });
     }

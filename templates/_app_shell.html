@@ -42,8 +42,9 @@
       <div class="btn-group view-tools">
         <button id="rotate-btn" class="icon-btn" data-i18n-title="tb.rotate" aria-label="旋转">↻</button>
         <button id="flip-btn" class="icon-btn" data-i18n-title="tb.flip" aria-label="镜像">⇋</button>
-        <button id="reset-btn" class="tool-btn" data-i18n-title="tb.reset" data-i18n="tb.reset.label">Reset</button>
       </div>
+
+      <span class="tb-sep" aria-hidden="true"></span>
 
       {% if C.roi %}
       {# 升级 C（§6.1）：两个固定 ROI 按钮替换为单个「矩形」入口 + 紧凑设置区
@@ -79,6 +80,7 @@
       {% endif %}
 
       {% if mode == 'demo' or histopilot_ui_enabled %}
+      <span class="tb-sep" aria-hidden="true"></span>
       <button id="ai-btn" class="tool-btn ai-btn" data-i18n-title="tb.ai.title" {% if mode != 'demo' %}disabled {% endif %}title="AI 读片助手"><span data-i18n="tb.ai">✨ AI</span></button>
       {% endif %}
 
@@ -92,11 +94,8 @@
               data-i18n="channel.entry" data-i18n-title="channel.entry.title"
               aria-haspopup="dialog" aria-expanded="false">通道</button>
 
-      {% if C.annotate %}
-      <button id="anno-all-btn" class="tool-btn" data-i18n="tb.anno.show.all" disabled>显示全部标记</button>
-      {% endif %}
-
       {% if C.annotate or C.save_image or C.mpp %}
+      <span class="tb-sep" aria-hidden="true"></span>
       <div class="tbb-context" id="tbb-context">
         {% if C.annotate %}
         <input id="anno-label-input" type="text" maxlength="40"
@@ -123,11 +122,16 @@
               data-i18n-title="tb.zoom.native" data-i18n-aria="tb.zoom.native"
               aria-label="1:1 原始像素">1:1</button>
 
-      <button id="tbb-more-btn" class="icon-btn tbb-more-btn" aria-label="更多" data-i18n-title="tb.more">⋯</button>
+      <button id="tbb-more-btn" class="icon-btn tbb-more-btn" aria-label="更多" data-i18n-title="tb.more"
+              aria-haspopup="menu" aria-expanded="false">⋯</button>
       <div id="tbb-more" class="tbb-more" role="menu">
         {% if mode == 'demo' or histopilot_ui_enabled %}
         <button id="tbb-more-ai" class="tool-btn" data-i18n-title="tb.ai.title" data-i18n="tb.ai.more">✨ AI 读片</button>
         {% endif %}
+        {% if C.annotate %}
+        <button id="anno-all-btn" class="tool-btn" role="menuitem" data-i18n="tb.anno.show.all" disabled>显示全部标记</button>
+        {% endif %}
+        <button id="reset-btn" class="tool-btn" role="menuitem" data-i18n-title="tb.reset" data-i18n="tb.reset.label">Reset</button>
       </div>
     </div>
   </header>

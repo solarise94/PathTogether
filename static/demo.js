@@ -1286,7 +1286,10 @@
       setAiPanelOpen(hidden);
     }
     if ($("ai-btn")) $("ai-btn").addEventListener("click", toggleAiPanel);
-    if ($("tbb-more-ai")) $("tbb-more-ai").addEventListener("click", toggleAiPanel);
+    if ($("tbb-more-ai")) $("tbb-more-ai").addEventListener("click", function () {
+      if (more) { more.classList.remove("open"); if (moreMask) moreMask.classList.remove("open"); }
+      toggleAiPanel();
+    });
     if ($("ai-panel-close")) {
       $("ai-panel-close").addEventListener("click", function () { setAiPanelOpen(false); });
     }

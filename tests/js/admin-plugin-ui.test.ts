@@ -1324,7 +1324,8 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 		expect(usersPage).not.toMatch(/<th[^>]*>登录账号</);
 		expect(usersPage).not.toMatch(/<th[^>]*>最近 AI 调用</);
 		expect(usersPage).not.toMatch(/<th[^>]*adm-col-desktop/);
-		expect(usersPage).toContain("<th>显示名</th>");
+			// J 批次（2026-09-07）：主列由「显示名」改为「邮箱用户名」（email 即唯一用户名）
+			expect(usersPage).toContain("<th>邮箱用户名</th>");
 		expect(usersPage).toContain("<th>状态</th>");
 		// wave 2：列名从「本月剩余」改为「额度剩余」（user 总额度/owner 月窗共用）
 		expect(usersPage).toContain("<th>额度剩余</th>");

@@ -295,7 +295,7 @@ button {
 
 .spacer { flex: 1; }
 
-/* 缩放百分比徽章（白底灰边 pill，等宽数字） */
+/* 缩放百分比徽章（白底灰边 pill，等宽数字；数字放大后缀不换行） */
 .zoom-badge {
   background: #fff;
   color: var(--text);
@@ -309,12 +309,75 @@ button {
   min-width: 56px;
   text-align: center;
   box-shadow: var(--shadow-sm);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
-/* ⋯ 溢出钮与面板：桌面隐藏，仅移动端出现（装 AI 读片） */
+/* 工具栏分组分隔线（HIG：功能组之间留白 + 细分隔符，形成视觉层级） */
+.tb-sep {
+  width: 0.5px;
+  height: 20px;
+  background: var(--separator-strong);
+  margin: 0 2px;
+  flex-shrink: 0;
+}
+
+/* 键盘焦点环（HIG 键盘导航可见性） */
+#toolbar .tool-btn:focus-visible,
+#toolbar .icon-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ⋯ 溢出钮与面板：默认隐藏；桌面（min-width:769px 块）与移动端各自启用 */
 .tbb-more-btn { display: none; }
 .tbb-more { display: none; }
 .tbb-more-mask { display: none; }
+
+/* ---------- 桌面端 ⋯ 溢出菜单（低频操作：Reset / 显示全部标记） ---------- */
+@media (min-width: 769px) {
+  #app-header { position: relative; }
+  #toolbar .tbb-more-btn {
+    display: inline-flex;
+    flex-shrink: 0;
+  }
+  /* macOS 菜单样式：半透明模糊底、圆角浮层、整行菜单项。
+     绝对定位于 header 正下方右侧；#toolbar 非定位元素，不会裁剪 */
+  #toolbar .tbb-more {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 12px;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 1px;
+    min-width: 168px;
+    padding: 5px;
+    background: var(--toolbar-bg);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    border: 0.5px solid var(--separator);
+    border-radius: 10px;
+    box-shadow: var(--shadow-float);
+    z-index: 500;
+  }
+  #toolbar .tbb-more.open { display: flex; }
+  #toolbar .tbb-more .tool-btn {
+    display: flex;
+    width: 100%;
+    justify-content: flex-start;
+    padding: 6px 10px;
+    font-size: 13px;
+    border-radius: 6px;
+  }
+  /* 桌面端工具栏已有 ✨AI 主钮，菜单里不再重复 */
+  #toolbar .tbb-more #tbb-more-ai { display: none; }
+  .tbb-more-mask {
+    position: fixed;
+    inset: 0;
+    z-index: 490;
+  }
+  .tbb-more-mask.open { display: block; }
+}
 
 /* 顶部栏缩放徽章：桌面隐藏（桌面用底栏 #zoom-badge），仅移动端显示 */
 .header-zoom-badge { display: none; }
@@ -2063,6 +2126,8 @@ button {
   #toolbar #zoom-in { display: none; }
   #toolbar .roi-group { display: none; }
   #toolbar #anno-all-btn { display: none; }
+  /* 桌面分组分隔线在底栏不占位 */
+  #toolbar .tb-sep { display: none; }
   /* 底栏不再用 spacer 撑开：元素紧凑靠左，避免中间大片留白 */
   #toolbar .spacer { display: none; }
 
@@ -2459,6 +2524,59 @@ button {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-fill);
 }
+
+/* 会话操作行（路径/查看视野/AI 描绘开关）：与小号按钮对齐 */
+.hp-session-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* 「允许 AI 描绘」：iOS 风格开关（input 隐去，轨道+滑钮纯 CSS） */
+.hp-drawing-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.hp-drawing-toggle input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.hp-drawing-toggle .hp-switch {
+  position: relative;
+  width: 32px;
+  height: 19px;
+  border-radius: 10px;
+  background: var(--separator-strong);
+  transition: background 0.18s ease;
+  flex-shrink: 0;
+}
+.hp-drawing-toggle .hp-switch::after {
+  content: "";
+  position: absolute;
+  top: 1.5px;
+  left: 1.5px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  transition: transform 0.18s ease;
+}
+.hp-drawing-toggle input:checked + .hp-switch { background: var(--accent); }
+.hp-drawing-toggle input:checked + .hp-switch::after { transform: translateX(13px); }
+.hp-drawing-toggle input:focus-visible + .hp-switch {
+  box-shadow: 0 0 0 3px var(--accent-fill);
+}
+.hp-drawing-toggle input:disabled + .hp-switch { opacity: 0.4; }
+.hp-drawing-toggle.hp-disabled { cursor: default; color: var(--text-3); }
+.hp-drawing-toggle .hp-switch-label { font-size: 11px; }
 
 /* 2. 底部输入（iMessage 输入栏：+ 圆钮 / pill 输入 / 蓝色发送圆钮） */
 .ai-composer {

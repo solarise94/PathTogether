@@ -723,7 +723,62 @@ def test_sender_configured_production_ignores_fake():
     env2 = {"REGISTRATION_MAIL_SENDER": "agent_mail_cli",
             "REGISTRATION_AGENT_MAIL_CLI": "/usr/bin/true"}
     assert registration_mail_worker.sender_configured(env2) is True
+    env3 = {"REGISTRATION_MAIL_SENDER": "smtp",
+            "REGISTRATION_SMTP_HOST": "smtp.example.test",
+            "REGISTRATION_SMTP_USER": "bot@example.test",
+            "REGISTRATION_SMTP_PASSWORD": "x"}
+    assert registration_mail_worker.sender_configured(env3) is True
+    assert registration_mail_worker.sender_configured({
+        "REGISTRATION_MAIL_SENDER": "smtp",
+        "REGISTRATION_SMTP_HOST": "smtp.example.test",
+    }) is False
     assert registration_mail_worker.sender_configured({}) is False
+
+
+class _FakeSmtp:
+    def __init__(self, *a, **k):
+        self.logged = None
+        self.sent = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def login(self, user, password):
+        self.logged = (user, password)
+
+    def sendmail(self, frm, to, msg):
+        type(self).last = {"from": frm, "to": list(to), "msg": msg}
+
+    def ehlo(self):
+        return None
+
+    def starttls(self, context=None):
+        return None
+
+
+def test_smtp_sender_sends_without_logging_password(monkeypatch):
+    import smtplib
+    monkeypatch.setattr(smtplib, "SMTP_SSL", _FakeSmtp)
+    sender = registration_mail_worker.SmtpMailSender({
+        "REGISTRATION_SMTP_HOST": "smtp.example.test",
+        "REGISTRATION_SMTP_PORT": "465",
+        "REGISTRATION_SMTP_USER": "bot@example.test",
+        "REGISTRATION_SMTP_PASSWORD": "secret-auth-code",
+        "REGISTRATION_SMTP_FROM": "bot@example.test",
+    })
+    sender.send("user@example.com", "PathTogether · 验证邮箱", "hello")
+    rec = _FakeSmtp.last
+    assert rec["from"] == "bot@example.test"
+    assert rec["to"] == ["user@example.com"]
+    assert "PathTogether" in rec["msg"]
+    assert "secret-auth-code" not in rec["msg"]
+    with pytest.raises(registration_mail_worker.MailSenderUnavailable):
+        registration_mail_worker.SmtpMailSender({
+            "REGISTRATION_SMTP_HOST": "smtp.example.test",
+        })
 
 
 # =========================================================================== #

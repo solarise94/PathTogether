@@ -13,6 +13,8 @@
         :class:`AgentMailCliSender`（Agent Mail CLI 适配器：exec 风格
         **参数数组**、无 shell、两步 confirmation_token；凭据由 CLI 自身
         配置/环境持有，不进本仓库、不进日志）；
+      * ``REGISTRATION_MAIL_SENDER=smtp`` → :class:`SmtpMailSender`
+        （SSL/STARTTLS SMTP；账号口令只从环境变量读取，日志不回传）；
       * 未配置 → ``None``：``email_verify_invite_activation`` 模式的前置
         检查（app 层）据此 fail-closed——sender 未配置时新模式**不能开启**。
   - 载荷安全：验证链接含**明文 token**，冻结正文在入队前经
@@ -234,6 +236,76 @@ class AgentMailCliSender:
         self._run(["send-confirm", "--confirmation-token", token])
 
 
+class SmtpMailSender:
+    """SSL/STARTTLS SMTP 发送器（163 等 IMAP/SMTP 授权码通道）。
+
+    环境变量（均 trim；口令绝不进日志/异常原文）：
+      REGISTRATION_SMTP_HOST / REGISTRATION_SMTP_PORT（默认 465）
+      REGISTRATION_SMTP_USER / REGISTRATION_SMTP_PASSWORD
+      REGISTRATION_SMTP_FROM（缺省=USER）
+      REGISTRATION_SMTP_STARTTLS=1 时走 587 STARTTLS，否则 SMTP_SSL。
+    """
+
+    def __init__(self, environ=None):
+        env = os.environ if environ is None else environ
+        self.host = (env.get("REGISTRATION_SMTP_HOST") or "").strip()
+        self.user = (env.get("REGISTRATION_SMTP_USER") or "").strip()
+        self.password = env.get("REGISTRATION_SMTP_PASSWORD") or ""
+        self.from_addr = ((env.get("REGISTRATION_SMTP_FROM") or "").strip()
+                          or self.user)
+        try:
+            self.port = int((env.get("REGISTRATION_SMTP_PORT") or "465").strip()
+                            or "465")
+        except ValueError as exc:
+            raise MailSenderUnavailable("registration_smtp_port_invalid") from exc
+        self.starttls = (env.get("REGISTRATION_SMTP_STARTTLS") or "").strip().lower() in (
+            "1", "true", "yes", "on")
+        if not self.host or not self.user or not self.password:
+            raise MailSenderUnavailable("registration_smtp_not_configured")
+
+    def send(self, to, subject, body):
+        import smtplib
+        import ssl
+        from email.header import Header
+        from email.mime.text import MIMEText
+        from email.utils import formataddr, formatdate, make_msgid
+
+        to_addr = str(to).strip()
+        if not to_addr or "\n" in to_addr or "\r" in to_addr:
+            raise MailSenderError("smtp_recipient_invalid")
+        msg = MIMEText(str(body), "plain", "utf-8")
+        msg["Subject"] = Header(str(subject), "utf-8")
+        msg["From"] = formataddr(("PathTogether", self.from_addr))
+        msg["To"] = to_addr
+        msg["Date"] = formatdate(localtime=True)
+        domain = self.from_addr.rsplit("@", 1)[-1] if "@" in self.from_addr else "localhost"
+        msg["Message-ID"] = make_msgid(domain=domain)
+        ctx = ssl.create_default_context()
+        try:
+            if self.starttls:
+                with smtplib.SMTP(self.host, self.port, timeout=30) as smtp:
+                    smtp.ehlo()
+                    smtp.starttls(context=ctx)
+                    smtp.ehlo()
+                    smtp.login(self.user, self.password)
+                    smtp.sendmail(self.from_addr, [to_addr], msg.as_string())
+            else:
+                with smtplib.SMTP_SSL(self.host, self.port, context=ctx,
+                                      timeout=30) as smtp:
+                    smtp.login(self.user, self.password)
+                    smtp.sendmail(self.from_addr, [to_addr], msg.as_string())
+        except MailSenderError:
+            raise
+        except smtplib.SMTPAuthenticationError as exc:
+            raise MailSenderError("smtp_auth_failed") from exc
+        except smtplib.SMTPException as exc:
+            raise MailSenderError(
+                "smtp_send_failed（%s）" % exc.__class__.__name__) from exc
+        except OSError as exc:
+            raise MailSenderError(
+                "smtp_connect_failed（%s）" % exc.__class__.__name__) from exc
+
+
 def sender_configured(environ=None, production=True) -> bool:
     """邮件发送通道是否已配置（email_verify_invite_activation 前置检查）。
 
@@ -248,6 +320,10 @@ def sender_configured(environ=None, production=True) -> bool:
         return not production
     if kind == "agent_mail_cli":
         return bool((env.get("REGISTRATION_AGENT_MAIL_CLI") or "").strip())
+    if kind == "smtp":
+        return bool((env.get("REGISTRATION_SMTP_HOST") or "").strip()
+                    and (env.get("REGISTRATION_SMTP_USER") or "").strip()
+                    and (env.get("REGISTRATION_SMTP_PASSWORD") or "").strip())
     return False
 
 
@@ -261,6 +337,11 @@ def get_sender(environ=None):
         return AgentMailCliSender(
             env.get("REGISTRATION_AGENT_MAIL_CLI"),
             env.get("REGISTRATION_AGENT_MAIL_FROM"))
+    if kind == "smtp":
+        try:
+            return SmtpMailSender(env)
+        except MailSenderUnavailable:
+            return None
     return None
 
 

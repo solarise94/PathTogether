@@ -82,6 +82,28 @@ case "$_sample_tma" in
     ;;
 esac
 
+# ---------------------------------------------------------------------------
+# 注册验证邮件 worker（I 线）：registration_mail_jobs 权威排水。
+# REGISTRATION_MAIL_WORKER=0/false/no/off 关闭；未配置发送通道时 drain 保
+# queued、不拒启。与 tma 后端同款：后台循环崩溃 2s 重启，gunicorn 仍 PID 1。
+# ---------------------------------------------------------------------------
+_mail_worker="$(printf '%s' "${REGISTRATION_MAIL_WORKER:-1}" | tr '[:upper:]' '[:lower:]')"
+case "$_mail_worker" in
+  0|false|no|off)
+    echo "[entry] REGISTRATION_MAIL_WORKER=$_mail_worker, skip mail worker"
+    ;;
+  *)
+    echo "[entry] starting registration_mail_worker --loop"
+    (
+      while :; do
+        python3 /app/registration_mail_worker.py --loop || true
+        echo "[entry] registration_mail_worker exited, restart in 2s" >&2
+        sleep 2
+      done
+    ) &
+    ;;
+esac
+
 exec gunicorn app:app \
   -b "0.0.0.0:${PORT:-8000}" \
   -w "${GUNICORN_WORKERS:-2}" \

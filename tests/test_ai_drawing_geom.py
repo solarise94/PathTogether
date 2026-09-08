@@ -11,10 +11,11 @@
      的 type=polygon|freehand 走点列路径（不再要求矩形字段、不再走矩形
      parser）；与矩形字段互斥；自交/越出切片边界 400 不静默裁剪；矩形路径
      回归不变。
-  4. 会话级开关说明：AI 描绘开关由 HistoPilot 侧裁剪+纵深拒绝（关闭时
-     sidecar 不组装 draw_suspicious_region、execute 再拒、flask.annotate 不
-     被调用——见 HP 仓 test/ai-drawing.test.ts）；PT 按既有通道鉴权
-     （internal token / plugin token + run grant 绑定 session）与几何校验放行。
+  4. 会话级开关说明：AI 描绘开关权威在 HistoPilot 侧（关闭时 sidecar 不组装
+     draw_suspicious_region、execute 再拒、flask.annotate 不被调用——见 HP 仓
+     test/ai-drawing.test.ts）；P1-4 起 plugin v1 写入口另查 PT 本地镜像表
+     复核（无行/false → 403 ai_drawing_disabled，见 test_ai_drawing_gate），
+     本文件统一预置「已开启」镜像，聚焦既有通道鉴权与几何校验。
 """
 import math
 import os
@@ -361,6 +362,18 @@ def _mock_plugin_channel(monkeypatch, valid=True):
                         lambda iid: {"plugin_id": "histopilot", "version": "0"})
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
     monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
+    # P1-4 起：plugin v1 写入口复核本地镜像开关——本文件聚焦几何/点列路径，
+    # 统一预置「已开启」镜像；闸门自身的开/关/无行行为见 test_ai_drawing_gate。
+    share_store.upsert_ai_session_drawing_flag("sess1", True)
+
+
+# P1-5 起：plugin v1 polygon 必带来源快照溯源（快照 bbox 与点列外接框不必
+# 相同——这里给一个覆盖全部点列的合法 bbox）。
+SNAP = {
+    "snapshot_id": "snap-geom-1",
+    "snapshot_bbox": {"x": 0, "y": 0, "w": 1000, "h": 800},
+    "render_context_fingerprint": "rcfp-geom",
+}
 
 
 def test_plugin_v1_annotate_polygon(monkeypatch):
@@ -370,6 +383,7 @@ def test_plugin_v1_annotate_polygon(monkeypatch):
     r = c.post("/api/plugin/v1/slides/demo.svs/annotations", json={
         "label": "AI 描绘", "type": "polygon", "points": TRIANGLE,
         "note": "n", "effect_key": "ek-poly-v1", "session_id": "sess1",
+        **SNAP,
     }, headers={"X-Run-Grant": "g1"})
     assert r.status_code == 200, r.get_data(as_text=True)
     body = r.get_json()
@@ -380,6 +394,7 @@ def test_plugin_v1_annotate_polygon(monkeypatch):
     r2 = c.post("/api/plugin/v1/slides/demo.svs/annotations", json={
         "label": "AI 描绘", "type": "polygon",
         "points": [[10, 10], [1200, 50], [100, 100]],
+        **SNAP,
     }, headers={"X-Run-Grant": "g1"})
     assert r2.status_code == 400
     assert r2.get_json()["error"]["code"] == "invalid_request"
@@ -392,7 +407,7 @@ def test_plugin_v1_annotate_polygon_run_grant_still_gating(monkeypatch):
     c = app_mod.app.test_client()
     r = c.post("/api/plugin/v1/slides/demo.svs/annotations", json={
         "label": "AI 描绘", "type": "polygon", "points": TRIANGLE,
-        "session_id": "sess1",
+        "session_id": "sess1", **SNAP,
     }, headers={"X-Run-Grant": "g1"})
     assert r.status_code == 403
     assert r.get_json()["error"]["code"] == "run_grant_invalid"

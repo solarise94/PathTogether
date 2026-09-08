@@ -123,6 +123,9 @@ _BUSINESS_TABLES = (
     # 清空重置；registration_mail_jobs 无外键，显式列出防跨用例残留
     # token/配额占用）
     "registration_mail_jobs",
+    # 0039 起：会话级「允许 AI 描绘」开关 PT 本地镜像（P1-4；无外键，
+    # 显式列出防跨用例残留授权）
+    "ai_session_drawing_flags",
 )
 
 @pytest.fixture(scope="session")

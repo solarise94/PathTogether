@@ -2307,3 +2307,55 @@ def list_run_grants(slide=None, include_revoked=False):
                 return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 会话级「允许 AI 描绘」开关——PT 本地镜像（0039 / P1-4）
+#   权威在 HP 侧 session 文件；PT 只存代理路由（/api/ai/session/<sid>/drawing）
+#   回传的权威布尔值。polygon/freehand 写入口查本表：无行或 false 一律拒绝
+#   （fail closed——镜像没见过该 session 就是不允许）。
+# --------------------------------------------------------------------------- #
+def get_ai_session_drawing_flag(session_id):
+    """读 session 的镜像开关。
+
+    返回 True/False（行存在时）；**行不存在返回 None**（与 False 区分，调用方
+    必须对 None 一并 fail closed，不得把"没见过"当成"允许"）。
+    """
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT allow_ai_drawing FROM ai_session_drawing_flags "
+                    "WHERE session_id=%s", (session_id,))
+                row = cur.fetchone()
+                return bool(row["allow_ai_drawing"]) if row is not None else None
+    finally:
+        conn.close()
+
+
+def upsert_ai_session_drawing_flag(session_id, allow_ai_drawing):
+    """upsert session 的镜像开关（代理路由收到 HP 权威值后调用）。幂等。
+
+    allow_ai_drawing 必须是布尔（代理侧已校验；这里再守一层）。返回 None。
+    """
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id 不能为空")
+    if not isinstance(allow_ai_drawing, bool):
+        raise ValueError("allow_ai_drawing 需为布尔")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ai_session_drawing_flags "
+                    "(session_id, allow_ai_drawing, updated_at) "
+                    "VALUES (%s, %s, now()) "
+                    "ON CONFLICT (session_id) DO UPDATE SET "
+                    "allow_ai_drawing=EXCLUDED.allow_ai_drawing, "
+                    "updated_at=now()",
+                    (session_id, allow_ai_drawing))
+    finally:
+        conn.close()

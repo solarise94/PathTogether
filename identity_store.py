@@ -271,7 +271,9 @@ def check_email_change_token(token, expected_user_id=None):
     masked = registration_store.mask_login_id(row["email_normalized"])
     if row["consumed_at"] is not None or row["status"] == "consumed":
         return {"state": "consumed", "email_masked": masked}
-    if row["status"] not in ("queued", "sent"):
+    # uncertain（发送结果不确定）在有效期内与 queued/sent 同按 valid 展示
+    # （P1-1 口径：用户可能已收到邮件，不能把有效链接显示成无效）
+    if row["status"] not in ("queued", "sent", "uncertain"):
         return {"state": "unknown", "email_masked": masked}
     if row["expires_at"] is not None and row["expires_at"] <= time.time():
         return {"state": "expired", "email_masked": masked}
@@ -292,7 +294,8 @@ def consume_email_change(token, user_id):
     单个 PostgreSQL 事务：
       1. ``SELECT ... FOR UPDATE`` 取 purpose='email_change' 作业；未命中/
          已消费/已作废/已过期 → EmailChangeError('invalid_or_expired')；
-         queued/sent 均可消费（发送结果不确定不阻塞确认——token 本身即凭据）；
+         queued/sent/uncertain 均可消费（发送结果不确定不阻塞确认——token
+         本身即凭据；uncertain=用户可能已收到邮件，与 P1-1 注册验证同口径）；
       2. 解密 payload；``payload.user_id`` 必须等于当前登录 user（绑定校验，
          不符 → invalid_or_expired，且**消费前拒绝不改任何状态**）；
       3. 唯一复检（:func:`_assert_email_free_tx`）：期间目标邮箱被其他账号
@@ -325,7 +328,8 @@ def consume_email_change(token, user_id):
                      MAIL_PURPOSE_EMAIL_CHANGE))
                 job = cur.fetchone()
                 if job is None or job["consumed_at"] is not None \
-                        or job["status"] not in ("queued", "sent"):
+                        or job["status"] not in ("queued", "sent",
+                                                 "uncertain"):
                     raise EmailChangeError("invalid_or_expired")
                 if job["expires_at"] is not None \
                         and job["expires_at"] <= time.time():

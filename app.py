@@ -16293,13 +16293,12 @@ def api_ai_session_drawing(session_id):
         return auth
     body = request.get_json(silent=True) or {}
     want = body.get("enabled")
-    close_gen = None       # 关闭请求预写到的 generation（响应回程 CAS 基线）
-    open_base_gen = None   # 开启请求发起时读到的 generation 基线
+    req_gen = None  # 本请求意图的 generation（跨服务单调，第四轮 P1）
 
     # 关闭预写（fail-closed 核心）：先收紧本地镜像，再让 HP 跟随。
     if want is False:
         try:
-            close_gen = share_store.upsert_ai_session_drawing_flag(
+            req_gen = share_store.upsert_ai_session_drawing_flag(
                 session_id, False)
         except Exception:
             app.logger.exception(
@@ -16307,40 +16306,55 @@ def api_ai_session_drawing(session_id):
             return jsonify(error="描绘开关本地状态写失败，关闭请求已被拒绝",
                            code="mirror_write_failed"), 503
     elif want is True:
-        # 开启先记基线：读失败同样 fail-closed（不转发，绝不事后放大权限）。
+        # 开启的意图代数 = 当前基线 + 1（CAS 成功即写入该代）：读失败同样
+        # fail-closed（不转发，绝不事后放大权限）。
         try:
-            open_base_gen = share_store.get_ai_session_drawing_generation(
-                session_id)
+            req_gen = share_store.get_ai_session_drawing_generation(
+                session_id) + 1
         except Exception:
             app.logger.exception(
                 "ai drawing 开启基线读取失败（session=%s）", session_id)
             return jsonify(error="描绘开关本地状态读失败，开启请求已被拒绝",
                            code="mirror_read_failed"), 503
 
+    # 第四轮 P1：意图代数随请求传 HP——HP 在 session lock 内拒绝低代请求，
+    # 两端统一「高代赢」排序（此前 HP 按到达序、PT 按发起序，规则相反会
+    # 双端分叉）。客户端携带的同名字段一律覆盖（不采信浏览器值）。
+    wire_body = dict(body)
+    if req_gen is not None:
+        wire_body["drawing_generation"] = req_gen
+
     def _on_response(status, parsed):
-        # 只在 HP 明确成功、响应体带权威布尔、且与请求方向一致时镜像；
-        # 一律经 CAS 到本请求基线——并发乱序下旧响应被更晚的写入作废，
-        # 绝不直接 upsert（三轮 review P1）。
+        # 返回 None=透传 HP 响应；（dict, status)=覆盖为稳定错误。
         if not (status < 400 and isinstance(parsed, dict)
                 and isinstance(parsed.get("allow_ai_drawing"), bool)
                 and parsed["allow_ai_drawing"] is want):
-            return
+            return None
+        cas_max = req_gen if want is False else req_gen - 1
         try:
-            if want is False:
-                # 关闭方向：预写已收紧；重申也走 CAS——旧关闭响应不得覆盖
-                # 其后开启请求已写入的 true（gen 已超越本请求）。
-                share_store.cas_ai_session_drawing_flag(
-                    session_id, False, close_gen)
-            else:
-                # 开启方向：CAS 到发起基线——期间任何关闭预写（gen 自增）
-                # 已把本响应作废。
-                share_store.cas_ai_session_drawing_flag(
-                    session_id, True, open_base_gen)
+            applied = share_store.cas_ai_session_drawing_flag(
+                session_id, want, cas_max)
         except Exception:
             app.logger.exception(
                 "ai drawing 镜像 CAS 失败（session=%s）", session_id)
+            if want is True:
+                # 开启未落到本地写闸：绝不能让浏览器以为已开启
+                return ({"error": "开关已在远端开启，但本地状态提交失败；"
+                                  "请重试开启",
+                         "code": "mirror_write_failed"}, 503)
+            # 关闭：预写已收紧（本地权威 false），安全方向，透传成功
+            return None
+        if not applied:
+            # 意外 no-op：行已被更晚请求写入，本请求已被取代——稳定 409 +
+            # 当前镜像值（前端 epoch 机制只认最新请求的提示）
+            return ({"error": "操作已被更新的开关请求取代",
+                     "code": "stale_generation",
+                     "allow_ai_drawing":
+                         share_store.get_ai_session_drawing_flag(session_id)},
+                    409)
+        return None
 
-    return _proxy_json("/session/{}/drawing".format(session_id), body,
+    return _proxy_json("/session/{}/drawing".format(session_id), wire_body,
                        on_response=_on_response)
 
 
@@ -16473,11 +16487,18 @@ def _proxy_json(path, body, method="POST", query=None, on_response=None):
                               headers=_sidecar_auth_headers())
     except (requests.ConnectionError, requests.Timeout):
         return _sidecar_unavailable_response()
+    override = None
     if on_response is not None:
         try:
-            on_response(r.status_code, r.get_json(silent=True))
+            # 返回 None=透传 sidecar 响应；（dict, status)=覆盖为本响应
+            #（drawing 开关第四轮 P2：镜像提交失败/被取代时给浏览器稳定
+            # 错误，而不是透传 HP 的成功）
+            override = on_response(r.status_code, r.get_json(silent=True))
         except Exception:
             app.logger.warning("代理 on_response 回调失败", exc_info=True)
+    if override is not None:
+        payload, override_status = override
+        return jsonify(payload), override_status
     # 透传 Content-Type（JSON 或其它）与状态码
     ctype = r.headers.get("Content-Type", "application/json")
     return Response(r.content, status=r.status_code, mimetype=ctype.split(";")[0])

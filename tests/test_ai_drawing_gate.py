@@ -360,6 +360,99 @@ def test_proxy_disable_then_late_write_blocked(monkeypatch):
     assert _no_rois()
 
 
+# =========================================================================== #
+# 第四轮 review：跨服务 generation + 稳定错误
+# =========================================================================== #
+def test_proxy_forwards_drawing_generation(monkeypatch):
+    """第四轮 P1：意图代数随请求传 HP（关闭=预写代；开启=基线+1）——
+    客户端伪造的同名字段被覆盖（不采信浏览器值）。"""
+    _mock_proxy_owner(monkeypatch)
+    c = _browser_client(app_mod.app)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)  # gen=1
+
+    fake = _install_fake_sidecar(monkeypatch, status=200,
+                                 body={"ok": True, "allow_ai_drawing": False})
+    r = c.post("/api/ai/session/sess1/drawing",
+               json={"enabled": False, "drawing_generation": 999})
+    assert r.status_code == 200
+    # 关闭：预写自增到 gen=2 并随请求转发（伪造 999 被覆盖）
+    assert fake.calls[0]["body"]["drawing_generation"] == 2
+    assert share_store.get_ai_session_drawing_flag("sess1") is False
+
+    # 关闭回程重申 CAS 生效后 gen=3；开启意图代 = 3+1 = 4（伪造 1 被覆盖）
+    base_before_open = share_store.get_ai_session_drawing_generation("sess1")
+    fake2 = _install_fake_sidecar(monkeypatch, status=200,
+                                  body={"ok": True, "allow_ai_drawing": True})
+    r2 = c.post("/api/ai/session/sess1/drawing",
+                json={"enabled": True, "drawing_generation": 1})
+    assert r2.status_code == 200
+    assert fake2.calls[0]["body"]["drawing_generation"] == base_before_open + 1
+    assert share_store.get_ai_session_drawing_flag("sess1") is True
+
+
+def test_proxy_open_cas_failure_returns_503(monkeypatch):
+    """第四轮 P2：开启获 HP 200/true 但本地 CAS 抛错 → 覆盖为 503
+    mirror_write_failed（绝不让浏览器以为已开启）。"""
+    _mock_proxy_owner(monkeypatch)
+    c = _browser_client(app_mod.app)
+    share_store.upsert_ai_session_drawing_flag("sess1", False)
+    _install_fake_sidecar(monkeypatch, status=200,
+                          body={"ok": True, "allow_ai_drawing": True})
+
+    def _boom(sid, val, max_gen):
+        raise RuntimeError("pg down")
+
+    monkeypatch.setattr(app_mod.share_store, "cas_ai_session_drawing_flag",
+                        _boom)
+    r = _proxy_toggle(c, enabled=True)
+    assert r.status_code == 503
+    assert r.get_json()["code"] == "mirror_write_failed"
+    # 本地写闸仍关（fail closed）
+    assert share_store.get_ai_session_drawing_flag("sess1") is False
+
+
+def test_proxy_superseded_toggle_returns_409(monkeypatch):
+    """第四轮 P2：CAS 意外 no-op（行已被更晚请求写入）→ 409 stale_generation
+    + 当前镜像值（稳定错误而非透传成功）。"""
+    _mock_proxy_owner(monkeypatch)
+    c = _browser_client(app_mod.app)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)  # gen=1
+
+    def _delayed_open(body, q, h, k):
+        # 开启响应回程前，更晚的关闭已完成预写（gen 超越开启基线）
+        share_store.upsert_ai_session_drawing_flag("sess1", False)  # gen=2
+        return FakeResponse(200, {"ok": True, "allow_ai_drawing": True})
+
+    fake = FakeRequests()
+    fake.register("POST", "/session/sess1/drawing", _delayed_open)
+    monkeypatch.setattr(app_mod, "requests", fake)
+    r = _proxy_toggle(c, enabled=True)
+    assert r.status_code == 409
+    body = r.get_json()
+    assert body["code"] == "stale_generation"
+    assert body["allow_ai_drawing"] is False  # 当前权威镜像值
+    assert share_store.get_ai_session_drawing_flag("sess1") is False
+
+
+def test_proxy_close_cas_failure_still_succeeds(monkeypatch):
+    """关闭重申 CAS 抛错仍透传成功：预写已收紧（本地权威 false），安全
+    方向不给用户报错。"""
+    _mock_proxy_owner(monkeypatch)
+    c = _browser_client(app_mod.app)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)
+    _install_fake_sidecar(monkeypatch, status=200,
+                          body={"ok": True, "allow_ai_drawing": False})
+
+    def _boom(sid, val, max_gen):
+        raise RuntimeError("pg down")
+
+    monkeypatch.setattr(app_mod.share_store, "cas_ai_session_drawing_flag",
+                        _boom)
+    r = _proxy_toggle(c, enabled=False)
+    assert r.status_code == 200
+    assert share_store.get_ai_session_drawing_flag("sess1") is False
+
+
 def test_store_mirror_generation_cas(monkeypatch):
     """三轮 review P1（0041）：generation 单调 + CAS 语义。
 
@@ -406,7 +499,9 @@ def test_proxy_stale_open_response_cannot_override_later_close(monkeypatch):
     fake.register("POST", "/session/sess1/drawing", _delayed_open)
     monkeypatch.setattr(app_mod, "requests", fake)
     r = _proxy_toggle(c, enabled=True)
-    assert r.status_code == 200
+    # 第四轮起被取代的请求得稳定 409（而非透传 HP 200），镜像断言不变
+    assert r.status_code == 409
+    assert r.get_json()["code"] == "stale_generation"
     # 关键：镜像未被旧开启响应写回 true
     assert share_store.get_ai_session_drawing_flag("sess1") is False
     # 迟到描绘仍被拒
@@ -434,7 +529,8 @@ def test_proxy_stale_close_response_cannot_override_later_open(monkeypatch):
     fake.register("POST", "/session/sess1/drawing", _delayed_close)
     monkeypatch.setattr(app_mod, "requests", fake)
     r = _proxy_toggle(c, enabled=False)
-    assert r.status_code == 200
+    # 旧关闭响应被其后的开启取代：409 + 镜像保持 true
+    assert r.status_code == 409
     assert share_store.get_ai_session_drawing_flag("sess1") is True
 
 

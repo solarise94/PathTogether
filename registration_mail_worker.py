@@ -468,9 +468,11 @@ def drain_once(limit=_DRAIN_BATCH, sender=None, environ=None) -> int:
 
     P1-2 模式停机语义：排水前查**生效注册模式**——与 app 层共用
     registration_store.resolve_effective_registration_mode 的权威判定（worker
-    绝不 import Flask app）。非 email_verify_invite_activation → 全部作业保留
-    queued 直接返回 0（注册暂停是运维动作，不是作业失败：不 fail、不计时、
-    不改状态）。
+    绝不 import Flask app）。非 email_verify_invite_activation → **注册类
+    邮件（purpose='email_verify'）暂停**（保留 queued：不 fail、不计时、
+    不改状态）；账户服务邮件（purpose='email_change'，登录用户的本人
+    操作）不在注册停机范围内，照常发送（注册关闭不应波及已注册用户
+    的本人邮件——P1-3 改绑闭环依赖此通道）。
 
     每条作业独立事务：``SELECT ... FOR UPDATE SKIP LOCKED``（行锁只在单条
     发送期间持有）→ 解密载荷 → sender.send → 按阶段分类落状态（P1-1）：
@@ -491,10 +493,13 @@ def drain_once(limit=_DRAIN_BATCH, sender=None, environ=None) -> int:
     import registration_store
     mode, _failures = registration_store.resolve_effective_registration_mode(
         environ)
-    if mode != registration_store.MODE_EMAIL_VERIFY_INVITE_ACTIVATION:
+    # 注册停只停注册类邮件（email_verify）；email_change 等账户服务邮件
+    # 照常领取。registration_open=True 时不过滤 purpose。
+    registration_open = (
+        mode == registration_store.MODE_EMAIL_VERIFY_INVITE_ACTIVATION)
+    if not registration_open:
         _log.info("生效注册模式为 %s（非 email_verify_invite_activation）："
-                  "作业保留 queued，本轮不发送", mode)
-        return 0
+                  "email_verify 作业保留 queued 暂停；账户服务邮件照常", mode)
     snd = sender if sender is not None else get_sender()
     if snd is None:
         _log.warning("邮件发送通道未配置（REGISTRATION_MAIL_SENDER），%d 条"
@@ -513,9 +518,10 @@ def drain_once(limit=_DRAIN_BATCH, sender=None, environ=None) -> int:
                         "WHERE (status='queued' OR (status='failed' "
                         "AND attempts < %s)) "
                         "AND scheduled_at <= now() AND expires_at > now() "
+                        "AND (%s OR purpose <> 'email_verify') "
                         "ORDER BY created_at, job_id LIMIT 1 FOR UPDATE "
                         "SKIP LOCKED",
-                        (_MAX_SEND_ATTEMPTS,))
+                        (_MAX_SEND_ATTEMPTS, registration_open))
                     row = cur.fetchone()
                     if row is None:
                         break

@@ -803,3 +803,29 @@ def test_share_comment_author_stays_masked(monkeypatch):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_closed_pauses_verify_mail_but_sends_email_change(monkeypatch):
+    """P1-2 语义细化（合并后修正）：closed 只停注册类邮件（email_verify
+    保持 queued 不发送）；登录用户的本人账户服务邮件（email_change）
+    不在注册停机范围内，照常被 worker 发送。"""
+    settings_store.set_registration_mode("closed", updated_by="t")
+    registration_store.enqueue_email_verification("paused-verify@x.com",
+                                               base_url="https://pt.test")
+    u, client = _logged_in_client("stillmail@x.com")
+    assert _start_change(client, "stillmail-new@x.com").status_code == 200
+    assert registration_mail_worker.drain_once() == 1
+    # 只发了改绑邮件；注册验证邮件仍 queued
+    assert len(_fake().sent) == 1
+    assert _fake().sent[0][0] == "stillmail-new@x.com"
+    conn = pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT status FROM registration_mail_jobs "
+                "WHERE purpose='email_verify' "
+                "AND email_normalized='paused-verify@x.com'")
+            rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    assert rows and all(r["status"] == "queued" for r in rows)

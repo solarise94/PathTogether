@@ -206,6 +206,10 @@ def test_schema_migrations_recorded(conn):
         # 唯一索引（pending+active）+ registration_mail_jobs 验证邮件队列
         # （存量 backfill active/legacy；不回填 @ login_id 为已验证邮箱）。
         "0037_identity_activation_email.sql",
+        # P1-3 身份收口（w1b）追加 0040_email_change_purpose.sql：幂等重建
+        # registration_mail_jobs.purpose CHECK 词表加 'email_change'
+        # （登录用户邮箱改绑闭环；payload 绑定 user_id，token 只存 hash）。
+        "0040_email_change_purpose.sql",
     ]
 
 

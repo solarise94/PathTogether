@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="referrer" content="no-referrer" />
+  <title>PathTogether · 确认邮箱改绑</title>
+  <style>
+    :root {
+      --accent: #007AFF;
+      --accent-hover: #0062CC;
+      --bg: #f5f5f7;
+      --text: #1d1d1f;
+      --text-2: #86868b;
+      --danger: #FF3B30;
+      --ok: #34C759;
+      --separator: rgba(0, 0, 0, 0.08);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      height: 100%;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+                   "Helvetica Neue", Arial, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .card {
+      width: 100%;
+      max-width: 420px;
+      background: #fff;
+      border-radius: 16px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), 0 12px 32px rgba(0, 0, 0, 0.10);
+      padding: 36px 30px 28px;
+      text-align: center;
+    }
+    .badge {
+      display: inline-block;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--accent);
+      background: rgba(0, 122, 255, 0.08);
+      border-radius: 999px;
+      padding: 4px 12px;
+      margin-bottom: 14px;
+    }
+    .title { font-size: 19px; font-weight: 600; letter-spacing: -0.2px; margin-bottom: 10px; }
+    .desc { font-size: 13px; color: var(--text-2); line-height: 1.7; margin-bottom: 24px; text-align: left; }
+    .state-ok { color: var(--ok); font-weight: 600; }
+    .state-bad { color: var(--danger); font-weight: 600; }
+    .error-box {
+      background: rgba(255, 59, 48, 0.08);
+      color: var(--danger);
+      font-size: 13px;
+      text-align: center;
+      padding: 9px 12px;
+      border-radius: 9px;
+      margin-bottom: 16px;
+    }
+    .btn {
+      display: inline-block;
+      height: 42px;
+      line-height: 42px;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      font-family: inherit;
+      text-decoration: none;
+      cursor: pointer;
+      border: none;
+      width: 100%;
+    }
+    .btn.primary { background: var(--accent); color: #fff; }
+    .btn.primary:hover { background: var(--accent-hover); }
+    .btn.secondary { background: #fff; color: var(--accent); border: 1px solid var(--separator); }
+    .btn + .btn { margin-top: 10px; }
+    .footer { margin-top: 20px; font-size: 11px; color: var(--text-2); line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <span class="badge">邮箱改绑</span>
+    {% if state == "login_required" %}
+    <!-- 匿名访问：只提示先登录，不回显 token 状态与邮箱（无任何状态信号） -->
+    <h1 class="title">请先登录</h1>
+    <p class="desc">确认邮箱改绑需要验证你的登录身份。请先登录账号，再重新打开邮件中的确认链接。</p>
+    <a class="btn primary" href="/login">前往登录</a>
+    {% elif state == "valid" %}
+    <h1 class="title">确认改绑邮箱 <span class="state-ok">✓</span></h1>
+    <p class="desc">链接有效（新邮箱：{{ email_masked }}）。确认后：该邮箱将成为你的登录用户名，当前及所有已登录设备都需要重新登录。</p>
+    <div id="confirm-error" class="error-box" role="alert" style="display:none;"></div>
+    <!-- token 经 POST body 提交（一次性；CSRF 双提交；/api/* 只认 header） -->
+    <form id="confirm-form" autocomplete="on">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+      <input type="hidden" name="token" value="{{ token }}" />
+      <button class="btn primary" type="submit" id="confirm-submit">确认改绑</button>
+    </form>
+    <a class="btn secondary" href="/">取消</a>
+    {% elif state == "expired" %}
+    <h1 class="title">链接已过期 <span class="state-bad">✕</span></h1>
+    <p class="desc">确认链接有效期 30 分钟，且只能使用一次。请登录后重新发起邮箱改绑。</p>
+    <a class="btn secondary" href="/login">前往登录</a>
+    {% elif state == "consumed" %}
+    <h1 class="title">链接已使用 <span class="state-bad">✕</span></h1>
+    <p class="desc">该确认链接已被使用（改绑确认一次性）。如改绑已完成，请使用新邮箱重新登录。</p>
+    <a class="btn secondary" href="/login">前往登录</a>
+    {% else %}
+    <h1 class="title">链接无效 <span class="state-bad">✕</span></h1>
+    <p class="desc">确认链接无效、已失效，或与当前登录账号不匹配。请用发起改绑的账号登录后重新请求确认邮件。</p>
+    <a class="btn secondary" href="/login">前往登录</a>
+    {% endif %}
+    <p class="footer">仅用于研究、教学和软件演示，不用于临床诊断。</p>
+  </main>
+
+  {% if state == "valid" %}
+  <script>
+    (function () {
+      "use strict";
+      var form = document.getElementById("confirm-form");
+      var btn = document.getElementById("confirm-submit");
+      var errBox = document.getElementById("confirm-error");
+      function fail(msg) {
+        errBox.textContent = msg;
+        errBox.style.display = "";
+        btn.disabled = false;
+        btn.textContent = "确认改绑";
+      }
+      form.addEventListener("submit", function (ev) {
+        ev.preventDefault();
+        errBox.style.display = "none";
+        btn.disabled = true;
+        btn.textContent = "提交中…";
+        fetch("/api/account/email/change/confirm", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": form.csrf_token.value
+          },
+          body: JSON.stringify({ token: form.token.value })
+        }).then(function (resp) {
+          return resp.json().then(function (data) {
+            if (resp.ok && data.ok) {
+              // 全端会话已失效：回登录页用新邮箱重新登录
+              window.location.href = "/login";
+              return;
+            }
+            fail((data && data.error) || "确认失败，请稍后重试");
+          });
+        }).catch(function () { fail("网络异常，请稍后重试"); });
+      });
+    })();
+  </script>
+  {% endif %}
+</body>
+</html>

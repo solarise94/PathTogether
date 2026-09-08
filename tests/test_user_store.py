@@ -321,8 +321,12 @@ def test_admin_users_owner_vs_user(monkeypatch):
     check("owner 创建用户 200", r2.status_code == 200)
     check("新用户 role=user",
           (json.loads(r2.data).get("user") or {}).get("role") == "user")
-    check("创建响应 user.email=None（未验证；0037 J）",
-          (json.loads(r2.data).get("user") or {}).get("email") is None)
+    # P1-3 收口（w1b）：建号写入同步 email/email_normalized（未验证态）
+    _u = json.loads(r2.data).get("user") or {}
+    check("创建响应 user.email=规范化邮箱（未验证；P1-3）",
+          _u.get("email") == "new@x.com"
+          and _u.get("email_normalized") == "new@x.com"
+          and _u.get("email_verified_at") is None)
     # 冲突
     r3 = client.post("/api/admin/v1/users", json={"login_id": "u@x.com", "password": PW2})
     check("创建冲突 409", r3.status_code == 409, "got %s" % r3.status_code)

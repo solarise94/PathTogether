@@ -264,7 +264,12 @@ def test_admin_users_api_login_id_only(monkeypatch):
     body2 = r2.get_json().get("user") or {}
     check("创建响应 login_id==规范化值",
           body2.get("login_id") == "new@x.com")
-    check("创建响应 email=None（未验证）", body2.get("email") is None)
+    # P1-3 收口（w1b）：建号入口只收邮箱，写入同步 email/email_normalized
+    # （email_verified_at 保持 NULL=未验证，绝不伪造验证状态）
+    check("创建响应 email=规范化邮箱（未验证态）",
+          body2.get("email") == "new@x.com"
+          and body2.get("email_normalized") == "new@x.com"
+          and body2.get("email_verified_at") is None)
 
     # 批次 C：email 兼容入参已删除——只传 email 不给 login_id → 400
     r3 = client.post("/api/admin/v1/users",

@@ -87,6 +87,10 @@ import demo_store
 # registration_mail_worker 的 MailSender 适配边界（app 绝不直接外发）。
 import registration_store
 import registration_mail_worker
+# P1-3 身份收口（review P1-3：邮箱=唯一用户名收尾）：邮箱改绑闭环 /
+# 存量冲突清单 / orphan pending 处置的存储原语（复用 registration_mail_jobs
+# 队列与 registration_store 公开校验函数；详见 identity_store 模块 docstring）。
+import identity_store
 # PR4 用户来源归因（docs/admin-billing-plugin-implementation-plan.md §11）：
 # acquisition_store 提供 /r/<source_code> 触点写入、注册归因（redeem_invite
 # 同事务）、匿名触点 90 天清理与 admin 漏斗/明细汇总。PostgreSQL 唯一后端。
@@ -873,6 +877,10 @@ def _auth_challenge():
 # 取 token，与 /register 同口径）。
 _REGISTRATION_PUBLIC_PATHS = frozenset({
     "/verify-email",
+    # P1-3 改绑落地页：匿名 GET 放行到页面层（只渲染「请先登录」提示，
+    # 不回显 token 状态/邮箱）；确认 POST /api/account/email/change/confirm
+    # 仍要求登录态 + CSRF，不在本清单
+    "/verify-email-change",
     "/api/registration/verify",
     "/api/registration/resend",
 })
@@ -2914,8 +2922,9 @@ def login():
         # 防 session fixation：先清旧 session 再写新身份，并轮换 CSRF token。
         # auth_version（docs §6.2）：登录成功把当次凭据版本写进 session；
         # 改密/重置/禁用/启用都会递增版本，旧 Cookie 随即失效。
-        # auth_user 是展示名（J：display_name 缺省回退 login_id；新形态用户
-        # display_name 默认即规范化邮箱，展示主列恒为邮箱口径）
+        # auth_user 是权威身份（P1-3 收口：**邮箱优先**——email_normalized
+        # → email → login_id；display_name 是纯展示字段，绝不冒充身份）。
+        # 存量无邮箱账号回退 login_id（语义即「当前唯一用户名」）。
         session.clear()
         # I 线状态机（设计文档第 8 节）：pending_activation 凭据正确只发
         # **enrollment 受限 session**（独立 scope，不写 auth_user/role/
@@ -2932,7 +2941,9 @@ def login():
             rotate_csrf_token()
             return redirect("/activate")
         session.permanent = True
-        session["auth_user"] = user.get("display_name") or user.get("login_id")
+        session["auth_user"] = (user.get("email_normalized")
+                                or user.get("email")
+                                or user.get("login_id"))
         session["user_id"] = user.get("user_id")
         session["role"] = user.get("role")
         session["auth_version"] = user.get("auth_version")
@@ -3073,6 +3084,181 @@ def api_account_password():
     _clear_login_failures(account_hash, ip_prefix_hash)
     session.clear()
     return jsonify(ok=True)
+
+
+# =========================================================================== #
+# P1-3 身份收口：登录用户邮箱改绑闭环（邮箱=唯一用户名，J 语义）。
+#
+# 流程：
+#   1. POST /api/account/email/change/start（登录 + CSRF）：新邮箱规范化 →
+#      唯一预检（users_email_identity_key 口径 + login_id 让位检查）→
+#      identity_store.enqueue_email_change 复用 registration_mail_jobs 队列
+#      入队（purpose='email_change'，0040 迁移扩词表；payload 绑定 user_id，
+#      token 只存 hash；明文 token 只经邮件外发，绝不进响应/日志）；
+#   2. GET /verify-email-change?token=：只展示不消费（与 /verify-email 同
+#      红线）；匿名访问只提示先登录（不泄露 token 状态/邮箱）；
+#   3. POST /api/account/email/change/confirm（登录 + CSRF）：单事务校验
+#      token（queued/sent 可消费、一次性、30 分钟、payload.user_id==当前
+#      登录 user）→ 更新 users.email/email_normalized/login_id=新邮箱（J：
+#      邮箱即用户名）/email_verified_at=now、auth_version+1（全端会话失效）
+#      → job 置 consumed → 同事务审计。目标邮箱期间被其他账号占用 → 拒绝
+#      且不改任何状态（事务整体回滚，job 保持未消费）。
+# =========================================================================== #
+def _require_own_active_account_or_none():
+    """登录态 + 账号可用校验（本人账户 API 共用）；返回错误响应或 None。
+
+    - 无 session user_id（AUTH_ENABLED=False 本地开发态 / 未登录）→ 401；
+    - 并发禁用/删除 → 清 session + 401；
+    - activation_state != active（pending 账号走 enrollment 通道，
+      不开放本人改绑）→ 403 account_pending。
+    """
+    uid = session.get("user_id")
+    if not uid:
+        return jsonify(error="auth_required"), 401
+    user = user_store.get_user(uid)
+    if user is None or user.get("disabled"):
+        session.clear()
+        return jsonify(error="auth_required"), 401
+    if (user.get("activation_state") or "active") != "active":
+        return (jsonify(error="account_pending",
+                        detail="账号尚未完成邀请码激活，请先完成激活"), 403)
+    return None
+
+
+@app.route("/api/account/email/change/start", methods=["POST"])
+def api_account_email_change_start():
+    """发起邮箱改绑（登录 + CSRF；/api/account/* 不在 CSRF 豁免清单内）。
+
+    body: {"new_email": str}。成功入队后 best-effort 即时排水（失败留
+    queued，worker 为权威发送方）。响应只含掩码新邮箱——**明文 token 绝不
+    回传**（只经邮件链接送达）。错误码：invalid_request（形状）/
+    email_taken（409，邮箱被其他账号占用）/ rate_limited（429，
+    同邮箱冷却/限额）/ email_channel_unavailable（503，出口未配置）。
+    """
+    guard = _require_own_active_account_or_none()
+    if guard is not None:
+        return guard
+    uid = session.get("user_id")
+    body = request.get_json(silent=True) or {}
+    new_email = body.get("new_email")
+    if not isinstance(new_email, str) or not new_email.strip():
+        return jsonify(error="请输入新的邮箱地址",
+                       code="invalid_request"), 400
+    try:
+        result = identity_store.enqueue_email_change(
+            uid, new_email,
+            base_url=(os.environ.get("PUBLIC_BASE_URL") or "").strip())
+    except identity_store.EmailChangeError as exc:
+        if exc.code == "bad_input":
+            return jsonify(error="请输入有效的邮箱地址",
+                           code="invalid_request"), 400
+        if exc.code == "email_taken":
+            return jsonify(error="该邮箱已被占用，无法改绑",
+                           code="email_taken"), 409
+        if exc.code == "rate_limited":
+            return jsonify(error="尝试过于频繁，请稍后再试",
+                           code="rate_limited"), 429
+        app.logger.warning("邮箱改绑入队被拒（code=%s）", exc.code)
+        return jsonify(error="改绑请求暂时不可用，请稍后重试",
+                       code="invalid_request"), 400
+    except registration_mail_worker.MailSenderUnavailable:
+        # 出口未配置（PUBLIC_BASE_URL 缺失）：fail-closed 503，无任何落库
+        return jsonify(error="邮件通道未配置，暂时无法发起改绑",
+                       code="email_channel_unavailable"), 503
+    except Exception:
+        app.logger.exception("邮箱改绑入队异常")
+        return jsonify(error="改绑请求暂时不可用，请稍后重试",
+                       code="invalid_request"), 503
+    try:
+        registration_mail_worker.drain_async()
+    except Exception:
+        app.logger.warning("改绑邮件即时排水启动失败（留待 worker）",
+                           exc_info=True)
+    _audit("account.email_change_requested", target_type="user",
+           target_id=uid,
+           detail={"to_masked": registration_store.mask_login_id(
+               result["email"])})
+    return jsonify(ok=True,
+                   email_masked=registration_store.mask_login_id(
+                       result["email"]))
+
+
+@app.route("/verify-email-change", methods=["GET"])
+def verify_email_change_page():
+    """改绑确认落地页。**GET 只展示不消费**（与 /verify-email 同红线）。
+
+    - 未登录（无普通 session）：只提示先登录（不回显 token 状态/邮箱——
+      token 是本人敏感凭据，页面不能向非绑定者泄露任何状态信号）；
+    - 已登录：展示 token 状态（valid 时给出确认按钮，POST 提交 token +
+      CSRF）；email 只回掩码；
+    - 已登录但 token 绑定其他用户 → 状态按 unknown 渲染（payload.user_id
+      绑定校验在 check_email_change_token 内）。
+    """
+    token = (request.args.get("token") or "").strip()
+    uid = session.get("user_id")
+    if not uid:
+        state, email_masked, page_token = "login_required", None, ""
+    else:
+        try:
+            view = identity_store.check_email_change_token(
+                token, expected_user_id=uid)
+        except Exception:
+            app.logger.exception("改绑 token 解析失败（按未知处理）")
+            view = {"state": "unknown", "email_masked": None}
+        state = view["state"]
+        email_masked = view.get("email_masked")
+        page_token = token if state == "valid" else ""
+    resp = Response(render_template(
+        "verify_email_change.html", state=state,
+        email_masked=email_masked, token=page_token,
+        csrf_token=ensure_csrf_token()), 200)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/account/email/change/confirm", methods=["POST"])
+def api_account_email_change_confirm():
+    """确认改绑（登录 + CSRF）：单事务消费 token 并完成邮箱+用户名改名。
+
+    - identity_store.consume_email_change：token 一次性/30 分钟/
+      payload.user_id 绑定校验；queued/sent 均可消费；
+    - 成功：users.email/email_normalized/login_id=新邮箱、
+      email_verified_at=now、auth_version+1（当前与全部旧 session 立即
+      失效）、job consumed、同事务审计 account.email_change；
+    - 目标邮箱被其他账号占用（并发窗口）→ 409 email_taken，任何状态不变；
+    - 本端成功后清当前 session（用户需用新邮箱重新登录）。
+    """
+    guard = _require_own_active_account_or_none()
+    if guard is not None:
+        return guard
+    uid = session.get("user_id")
+    body = request.get_json(silent=True) or {}
+    token = (body.get("token") or "").strip()
+    if not token:
+        return jsonify(error="缺少改绑 token", code="invalid_request"), 400
+    try:
+        result = identity_store.consume_email_change(token, uid)
+    except identity_store.EmailChangeError as exc:
+        if exc.code == "email_taken":
+            return jsonify(error="该邮箱已被占用，改绑未生效",
+                           code="email_taken"), 409
+        if exc.code in ("user_missing", "user_disabled"):
+            session.clear()
+            return jsonify(error="auth_required"), 401
+        return jsonify(error="改绑链接无效或已过期，请重新发起改绑",
+                       code="invalid_or_expired"), 400
+    except Exception:
+        app.logger.exception("邮箱改绑确认异常（统一错误）")
+        return jsonify(error="改绑暂时不可用，请稍后重试",
+                       code="invalid_request"), 503
+    # auth_version 已 +1：当前 session（旧版本）已失效，显式清掉本端；
+    # 用户以新邮箱（=新用户名）重新登录
+    session.clear()
+    return jsonify(ok=True,
+                   login_id=result["user"].get("login_id"),
+                   email_masked=registration_store.mask_login_id(
+                       result["email"]),
+                   sessions_revoked=True)
 
 
 # =========================================================================== #
@@ -3221,7 +3407,9 @@ def register():
 
     # invite_only：表单校验（本地形状错误，非枚举信号；不回显邀请码）。
     # login_id 字段为登录账号（docs §8.2：邀请绑定的是「允许兑换的登录
-    # 账号」；批次 C 起表单字段名即 login_id，email 入参已删除）
+    # 账号」；批次 C 起表单字段名即 login_id，email 入参已删除）。
+    # P1-3 收口（J：邮箱=唯一用户名）：login_id 必须邮箱形态，规范化值
+    # 贯穿兑换与建号；display_name 输入保留但只是纯展示字段。
     login_id = (request.form.get("login_id") or "").strip()
     display_name = (request.form.get("display_name") or "").strip()
     password = request.form.get("password") or ""
@@ -3231,12 +3419,18 @@ def register():
         form_error = "请填写邀请码"
     elif not login_id:
         form_error = "请填写登录账号"
-    elif not password.strip():
+    else:
+        try:
+            login_id = registration_store.validate_email(login_id)
+        except registration_store.EmailVerifyError:
+            form_error = "登录账号需为有效的邮箱地址（邮箱即用户名）"
+    if form_error is None and not password.strip():
         form_error = "密码不能为全空白字符"
-    elif len(password) < registration_store.MIN_PASSWORD_LENGTH:
+    if form_error is None and len(password) < \
+            registration_store.MIN_PASSWORD_LENGTH:
         form_error = "密码长度至少 %d 位（推荐使用密码管理器生成的长口令）" \
             % registration_store.MIN_PASSWORD_LENGTH
-    elif password != confirm:
+    if form_error is None and password != confirm:
         form_error = "两次输入的密码不一致"
     if form_error:
         return _register_form_error(form_error, "invalid")
@@ -4562,9 +4756,10 @@ def api_auth_info():
         pv = _preview_state() or {}
         role = subject.get("role") or user_store.ROLE_USER
         user_id = subject.get("user_id") or ""
+        # P1-3 收口：与登录 session 同口径——email_normalized → email →
+        # login_id（display_name 是纯展示字段，绝不冒充身份）
         username = (subject.get("email_normalized") or subject.get("email")
-                    or subject.get("login_id")
-                    or subject.get("display_name") or actor_username)
+                    or subject.get("login_id") or actor_username)
         preview = {
             "subject_user_id": user_id,
             "subject_role": role,
@@ -6466,11 +6661,21 @@ def admin_v1_users_create():
     if body.get("role") not in (None, user_store.ROLE_USER):
         return _admin_v1_error(400, "invalid_request",
                                "本端点只能创建普通用户（role=user）")
-    login_id = body.get("login_id")
+    login_id_raw = body.get("login_id")
     password = body.get("password")
     display_name = body.get("display_name")
-    if not isinstance(login_id, str) or not login_id.strip():
+    if not isinstance(login_id_raw, str) or not login_id_raw.strip():
         return _admin_v1_error(400, "invalid_request", "缺少登录账号")
+    # P1-3 收口（J：邮箱=唯一用户名）：建号入口只收邮箱形态的 login_id。
+    # 规范化（trim+lower）值贯穿 login_id 与 email/email_normalized 列
+    # （email_verified_at 保持 NULL=未验证，绝不伪造验证状态）；display_name
+    # 保留为可选纯展示字段，缺省由 store 层回退=规范化邮箱。
+    try:
+        login_id = registration_store.validate_email(login_id_raw)
+    except registration_store.EmailVerifyError:
+        return _admin_v1_error(
+            400, "login_id_not_email",
+            "登录账号需为有效的邮箱地址（邮箱即用户名）")
     if not isinstance(password, str) or not password:
         return _admin_v1_error(400, "invalid_request", "缺少密码")
     if (len(password) < user_store.PASSWORD_MIN_LENGTH
@@ -6506,7 +6711,10 @@ def admin_v1_users_create():
         user, allowance = user_store_pg.create_user_with_total_allowance(
             login_id, password, display_name=display_name,
             ai_access=True if ai_access is None else ai_access,
-            total_limit_nano_cny=total_limit, actor_user_id=actor)
+            total_limit_nano_cny=total_limit, actor_user_id=actor,
+            # P1-3：建号即同步 email 身份三列（email/email_normalized 写
+            # 规范化邮箱；email_verified_at 由 store 保持 NULL=未验证）
+            email=login_id)
     except spend_store.ProvisioningMaintenanceError:
         # cutover 维护闸开启（或平台设置读不出，fail-closed）期间禁止建号：
         # 与 AI dispatch 同款稳定 503 ai_dispatch_maintenance（闸关闭后重试；
@@ -6616,6 +6824,77 @@ def admin_v1_users_password_reset(user_id):
     _audit("user.password_reset", target_type="user", target_id=user_id,
            detail={"sessions_revoked": True})
     return jsonify(user=_admin_v1_user_out(user))
+
+
+# --------------------------------------------------------------------------- #
+# P1-3 身份收口（review P1-3：邮箱=唯一用户名收尾）：owner 存量冲突清单 +
+# orphan pending 处置。只读清单不改任何状态；discard 只允许「pending_
+# activation + bind.invalid 合成 login_id」的孤儿行，其余一律 409——
+# 绝不自动合并/夺取已有账号。
+# --------------------------------------------------------------------------- #
+@app.route("/api/admin/v1/users/identity-conflicts", methods=["GET"])
+def admin_v1_users_identity_conflicts():
+    """存量身份冲突清单（owner 只读；J 收口摸排）。
+
+    返回四类冲突行（一行可命中多类，conflicts 列全）+ 计数：
+      - login_id_not_email：login_id 非邮箱形态；
+      - email_login_mismatch：email_normalized 与 login_id 不一致；
+      - pending_bind_synthetic：pending-*@bind.invalid 待补绑孤儿行
+        （可经 discard-pending 处置）；
+      - email_shared：同 email_normalized 多行占用。
+    owner-only（_require_owner_admin_v1，预览态一律拒绝）；只读端点。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    try:
+        report = identity_store.list_identity_conflicts()
+    except Exception:
+        app.logger.exception("admin v1 identity-conflicts 读取失败")
+        return _admin_v1_error(500, "internal", "身份冲突清单读取失败")
+    return jsonify(items=report["items"], counts=report["counts"])
+
+
+@app.route("/api/admin/v1/users/<user_id>/discard-pending", methods=["POST"])
+def admin_v1_users_discard_pending(user_id):
+    """物理删除 orphan pending_activation 行（owner 显式处置；P1-3）。
+
+    仅允许 activation_state=pending_activation 且 login_id 为
+    pending-*@bind.invalid 合成形的账号；其余任何账号一律 409
+    not_discardable（绝不自动夺取/合并已有账号）。物理删除不可逆：
+    仅对「邮箱验证建号时因存量 login_id 冲突进入待补绑、从未激活、
+    无任何业务关联」的孤儿行开放。删除成功写审计（user.pending_discard，
+    detail 只含掩码邮箱与冲突快照，无密码/token）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    try:
+        snap = identity_store.discard_pending_activation(user_id)
+    except identity_store.DiscardPendingError as exc:
+        if exc.code == "user_missing":
+            return _admin_v1_error(404, "user_not_found", "用户不存在")
+        if exc.code == "has_dependents":
+            return _admin_v1_error(
+                409, "not_discardable",
+                "该账号存在业务关联行（并非孤儿），已拒绝删除；请先人工核查")
+        return _admin_v1_error(
+            409, "not_discardable",
+            "仅允许删除「待激活且登录名为待补绑合成形（pending-*@bind."
+            "invalid）」的孤儿账号")
+    except Exception:
+        app.logger.exception("admin v1 discard-pending 失败")
+        return _admin_v1_error(500, "internal", "处置失败（未删除任何行）")
+    # 审计沿用现有 best-effort 工具函数（actor=真实 owner；detail 无敏感值）
+    _audit("user.pending_discard", target_type="user", target_id=user_id,
+           detail={
+               "login_id_masked": registration_store.mask_login_id(
+                   snap.get("login_id") or ""),
+               "activation_state": snap.get("activation_state"),
+               "activation_source": snap.get("activation_source"),
+               "physically_deleted": True,
+           })
+    return jsonify(ok=True, discarded={"user_id": user_id})
 
 
 @app.route("/api/admin/v1/invites", methods=["GET"])

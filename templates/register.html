@@ -189,17 +189,20 @@
       <div class="field">
         <!-- 账户系统批次 C（docs §8.2）：表单字段名为登录账号 login_id
              （邀请绑定的就是「允许兑换的登录账号」），非已验证邮箱；
-             批次 B 的 email 字段名已随物理收口删除 -->
-        <label for="login_id" data-i18n="register.invite.email">登录账号</label>
-        <input id="login_id" name="login_id" type="text" required maxlength="120"
-               autocomplete="username"
-               data-i18n-ph="register.invite.email.ph" placeholder="邀请码绑定的登录账号" />
+             批次 B 的 email 字段名已随物理收口删除。
+             P1-3 收口（J：邮箱=唯一用户名）：登录账号必须为邮箱形态，
+             服务端 validate_email 权威校验 -->
+        <label for="login_id" data-i18n="register.invite.email">登录账号（邮箱）</label>
+        <input id="login_id" name="login_id" type="email" required maxlength="254"
+               autocomplete="username" spellcheck="false"
+               data-i18n-ph="register.invite.email.ph" placeholder="you@example.com" />
+        <p class="hint">请填写你的邮箱地址——该邮箱将成为你的登录用户名。</p>
       </div>
       <div class="field">
         <label for="display_name" data-i18n="register.invite.display">显示名（可选，仅展示）</label>
         <input id="display_name" name="display_name" type="text" maxlength="120"
                autocomplete="nickname"
-               data-i18n-ph="register.invite.display.ph" placeholder="其他人看到的名字（不用于登录）" />
+               data-i18n-ph="register.invite.display.ph" placeholder="其他人看到的名字（不用于登录，也不作为身份）" />
       </div>
       <div class="field">
         <label for="password" data-i18n="register.invite.password">设置密码</label>

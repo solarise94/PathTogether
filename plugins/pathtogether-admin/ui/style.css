@@ -523,6 +523,7 @@ body {
   .adm-nav-btn::before { font-size: 14px; }
   .adm-nav-btn[data-page="overview"]::before { content: "概"; }
   .adm-nav-btn[data-page="users"]::before { content: "户"; }
+  .adm-nav-btn[data-page="identity"]::before { content: "冲"; }
   .adm-nav-btn[data-page="invites"]::before { content: "邀"; }
   .adm-nav-btn[data-page="billing"]::before { content: "账"; }
   .adm-nav-btn[data-page="plugins"]::before { content: "件"; }
@@ -543,6 +544,7 @@ body {
      复位，否则出现「概概览/户用户」首字符重复（P0-1 回归） */
   .adm-nav-btn[data-page="overview"]::before,
   .adm-nav-btn[data-page="users"]::before,
+  .adm-nav-btn[data-page="identity"]::before,
   .adm-nav-btn[data-page="invites"]::before,
   .adm-nav-btn[data-page="settings"]::before,
   .adm-nav-btn[data-page="billing"]::before,

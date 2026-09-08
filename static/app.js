@@ -160,6 +160,9 @@
       els.logoutBtn.hidden = !!previewState;
     }
     if (els.changepwBtn) { els.changepwBtn.hidden = !!previewState; }
+    // 更换邮箱入口与改密/登出同级：预览态隐藏（未登录时 auth_enabled=false
+    // 提前返回，入口保持模板里的 hidden，不会出现）
+    if (els.changeemailBtn) { els.changeemailBtn.hidden = !!previewState; }
     // 管理台入口按真实 actor 判定（预览态隐藏——与改密/登出同级约定；
     // 预览中 /admin 仍可手动直达，宿主每条消息回查真实 owner）。
     if (els.adminEntryLink) {
@@ -252,6 +255,9 @@
     applyAuthInfo: applyAuthInfo,
     startIdentityPreview: startIdentityPreview,
     stopIdentityPreview: stopIdentityPreview,
+    // 更换邮箱提交（tests/js/account-email-change.test.ts 行为契约挂载点，
+    // 与 apiFetch/applyAuthInfo 同级；init 在 bindEvents 里照常接线）
+    changeemailSubmit: changeemailSubmit,
   };
 
   // ---------- 修改我的密码（账户系统批次 A docs §7.1；owner/user 通用） ----------
@@ -338,6 +344,89 @@
     els.changepwSubmitBtn.addEventListener("click", changepwSubmit);
     els.changepwConfirm.addEventListener("keydown", function (e) {
       if (e.key === "Enter") { changepwSubmit(); }
+    });
+  }
+
+  // ---------- 更换邮箱（P1-3 身份收口；review-2026-09-08 P2-2 前端闭环） ----------
+  // 与改密同一账户设置区、同一弹窗骨架。POST /api/account/email/change/start
+  // （JSON + apiFetch 统一 CSRF 头）；成功响应只含掩码新邮箱——明文 token 只经
+  // 确认邮件链接送达，绝不回传。用户在 /verify-email-change 确认后服务端才改
+  // 绑并 auth_version+1 全端下线（重新登录由确认页文案负责，本页不处理）。
+  function changeemailShowError(msg) {
+    if (!els.changeemailError) return;
+    els.changeemailError.textContent = msg || "";
+    els.changeemailError.hidden = !msg;
+  }
+
+  function changeemailOpen() {
+    if (!els.changeemailMask) return;
+    changeemailShowError("");
+    els.changeemailNew.value = "";
+    els.changeemailMask.style.display = "";
+    if (els.changeemailNew.focus) { setTimeout(function () { els.changeemailNew.focus(); }, 30); }
+  }
+
+  function changeemailClose() {
+    if (!els.changeemailMask) return;
+    els.changeemailMask.style.display = "none";
+  }
+
+  function changeemailSubmit() {
+    var ne = (els.changeemailNew.value || "").trim();
+    if (!ne) {
+      changeemailShowError(t("acct.changeemail.err.required"));
+      return;
+    }
+    var btn = els.changeemailSubmitBtn;
+    // 防重复：在途（按钮禁用）时直接忽略后续触发（DOM 禁用之外的 JS 层兜底）
+    if (btn && btn.disabled) { return; }
+    if (btn) { btn.disabled = true; }
+    apiFetch("/api/account/email/change/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ new_email: ne }),
+    }).then(function (r) {
+      return r.json().then(function (b) { return { status: r.status, body: b }; });
+    }).then(function (res) {
+      // 到达终态（成功/失败）一律恢复按钮；成功分支随后关弹窗
+      if (btn) { btn.disabled = false; }
+      if (res.status === 200) {
+        // 成功：确认邮件已入队（掩码邮箱回显；登录态此刻仍有效，不跳转）
+        changeemailClose();
+        toast(t("acct.changeemail.ok", { email: (res.body && res.body.email_masked) || "" }), "info");
+        return;
+      }
+      // 按服务端机器码映射可读文案（与上传修复 U1 同口径：机器码不原样透出；
+      // 未知码/缺码走本地化兜底，不透出服务端原始报文）
+      var code = res.body && res.body.code;
+      if (code === "email_taken") {
+        changeemailShowError(t("acct.changeemail.err.taken"));
+      } else if (code === "rate_limited") {
+        changeemailShowError(t("acct.changeemail.err.locked"));
+      } else if (code === "email_channel_unavailable") {
+        changeemailShowError(t("acct.changeemail.err.channel"));
+      } else if (code === "invalid_request") {
+        changeemailShowError(t("acct.changeemail.err.invalid"));
+      } else {
+        changeemailShowError(t("acct.changeemail.err.generic"));
+      }
+    }).catch(function () {
+      if (btn) { btn.disabled = false; }
+      changeemailShowError(t("acct.changeemail.err.generic"));
+    });
+  }
+
+  function initChangeEmail() {
+    if (!els.changeemailMask) return;
+    els.changeemailBtn.addEventListener("click", changeemailOpen);
+    els.changeemailClose.addEventListener("click", changeemailClose);
+    els.changeemailCancel.addEventListener("click", changeemailClose);
+    els.changeemailMask.addEventListener("click", function (e) {
+      if (e.target === els.changeemailMask) { changeemailClose(); }
+    });
+    els.changeemailSubmitBtn.addEventListener("click", changeemailSubmit);
+    els.changeemailNew.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { changeemailSubmit(); }
     });
   }
 
@@ -494,6 +583,14 @@
     changepwNew: $("changepw-new"),
     changepwConfirm: $("changepw-confirm"),
     changepwError: $("changepw-error"),
+    // 更换邮箱（P1-3 身份收口 review-2026-09-08 P2-2；弹窗骨架复用 changepw）
+    changeemailBtn: $("changeemail-btn"),
+    changeemailMask: $("changeemail-mask"),
+    changeemailClose: $("changeemail-close"),
+    changeemailCancel: $("changeemail-cancel"),
+    changeemailSubmitBtn: $("changeemail-submit"),
+    changeemailNew: $("changeemail-new"),
+    changeemailError: $("changeemail-error"),
     annoAllToggle: $("anno-all-toggle"),
     // 手机端侧栏抽屉
     menuBtn: $("menu-btn"),
@@ -4682,6 +4779,9 @@
 
     // 修改我的密码（owner/user 通用；docs §8.1）
     initChangePw();
+
+    // 更换邮箱（P1-3 身份收口 review-2026-09-08 P2-2；与改密同级账户入口）
+    initChangeEmail();
 
     // user max_steps 只读同步（AI 预算管理 UI 已迁入 admin 插件，PR5）
     initAiMaxStepsSync();

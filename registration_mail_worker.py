@@ -294,9 +294,10 @@ class SmtpMailSender:
       REGISTRATION_SMTP_FROM（缺省=USER）
       REGISTRATION_SMTP_STARTTLS=1 时走 587 STARTTLS，否则 SMTP_SSL。
 
-    P1-1 不确定态的阶段划分（见 :meth:`_transmit`）：DATA 结束符发出**之前**
-    的任何失败=确定未发出（failed，可重试）；结束符发出后等远端最终响应期间
-    的超时/断连=结果不确定（uncertain，绝不自动重发）。
+      P1-1 不确定态的阶段划分（见 :meth:`_transmit`）：DATA 结束符开始写出
+      **之前**的任何失败=确定未发出（failed，可重试）；从开始发送结束符起
+      （含结束符 send 本身与等待最终响应）的超时/断连=结果不确定
+      （uncertain，绝不自动重发）。
     """
 
     def __init__(self, environ=None):
@@ -359,9 +360,14 @@ class SmtpMailSender:
                        msg_str.encode("ascii"))
         data = _re.sub(br"(?m)^\.", b"..", data)
         smtp.send(data)
-        smtp.send(b".\r\n")
-        # ---- 阶段 2（不确定窗口）：等待远端最终响应 ----
+        # ---- 阶段 2（不确定窗口）：从开始发送 DATA 结束符起 ----
+        # 结束符一旦开始写出，客户端即无法证明远端未完整接收并提交整个
+        # DATA 事务（TCP send 缓冲/对端已读都不可观测）。因此结束符 send
+        # 本身的超时/断连与 getreply 超时同一语义：结果不确定，绝不重发。
+        # （二轮 review P1-1：此前结束符 send 在阶段 1，TimeoutError 会被
+        # 外层 except OSError 译成可重试 MailSenderError，可能重复发信。）
         try:
+            smtp.send(b".\r\n")
             code, _resp = smtp.getreply()
         except Exception as exc:
             raise MailSenderUncertainError(

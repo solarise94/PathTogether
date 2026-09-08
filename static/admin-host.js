@@ -70,6 +70,13 @@
     "admin.users.setEnabled": "admin:users:write",
     "admin.users.setAiAccess": "admin:users:write",
     "admin.users.resetPassword": "admin:users:write",
+    // 2026-09-08（review-2026-09-08 P2-2 产品闭环）：身份冲突清单（owner 只读
+    // 摸排，GET /api/admin/v1/users/identity-conflicts）与孤儿 pending 行显式
+    // 处置（POST .../discard-pending，物理删除不可逆）。清单是只读 →
+    // admin:users:read；处置是写且不可逆 → admin:users:write。服务端对每个
+    // 端点独立 owner/CSRF 复核（_require_owner_admin_v1），桥层门只是纵深防御。
+    "admin.users.identityConflicts": "admin:users:read",
+    "admin.users.discardPending": "admin:users:write",
     // 2026-09-05（review P0 owner 读隔离）：切片可见性管理——inventory 是
     // owner 唯一「看全部」出口；setVisibility 给 owner 建立/收回单切片
     // view 授权（幂等）。独立 slides 权限域，不与 users/settings 混用。
@@ -213,6 +220,16 @@
         password: { type: "string", minLength: 1, maxLength: 200 },
       },
       required: ["user_id", "password"],
+      additionalProperties: false,
+    },
+    // 2026-09-08（review P2-2）：身份冲突清单（无参数只读）+ 孤儿 pending
+    // 行处置（仅 user_id；user_id 走 pathId 防护，拒绝空值/含 "/"、"?"）。
+    "admin.users.identityConflicts": {
+      properties: {}, additionalProperties: false,
+    },
+    "admin.users.discardPending": {
+      properties: { user_id: _userIdSpec },
+      required: ["user_id"],
       additionalProperties: false,
     },
     // 2026-09-05：切片可见性管理。inventory 只允许游标/页大小；setVisibility
@@ -778,6 +795,20 @@
       var url = "/api/admin/v1/users/" + pathId(payload.user_id, "user_id") +
           "/password-reset";
       return jsonWrite(url, "POST", { password: payload.password })(ctx);
+    },
+
+    // 2026-09-08（review P2-2）：身份冲突清单（owner 只读；四类冲突行 +
+    // counts）与孤儿 pending 行显式处置。discard 是**物理删除、不可逆**：
+    // 服务端只放行 activation_state=pending_activation 且 login_id 为
+    // pending-*@bind.invalid 合成形的孤儿行，其余一律 409 not_discardable
+    // （含 has_dependents 语义文案，桥层原样透传给插件 UI 展示）。
+    "admin.users.identityConflicts":
+      jsonGet("/api/admin/v1/users/identity-conflicts"),
+
+    "admin.users.discardPending": function (ctx, payload) {
+      var url = "/api/admin/v1/users/" + pathId(payload.user_id, "user_id") +
+          "/discard-pending";
+      return jsonWrite(url, "POST", {})(ctx);
     },
 
     "admin.invites.list": function (ctx, payload) {

@@ -897,11 +897,12 @@ def test_admin_manifest_plugin_version_bumped_with_hashes():
     升 0.3.5：切片可见性管理页（review P0 owner 读隔离），申请
     admin:slides:read/write，hashes/pin 同步。2026-09-06 升 0.3.6：升级批次
     0–5（owner 工作区收录语义：管理台切片页按「自有 ∪ 已授权」呈现），
-    hashes/pin 同步。2026-09-07 升 0.4.0：展示 J（身份主列=完整邮箱用户名：
+    hashes/pin 同步。2026-09-08 升 0.4.1：身份冲突清单+孤儿处置页（P2-2 闭环；
+    2026-09-07 0.4.0：展示 J（身份主列=完整邮箱用户名：
     用户表/抽屉/用量/账单/审计/切片归属/邀请绑定列换 identity 口径），
     main.js hash 与 manifest pin 同步。"""
     data = json.loads(ADMIN_MANIFEST.read_text(encoding="utf-8"))
-    assert data["pluginVersion"] == "0.4.0"  # 展示 J 身份主列，hashes/pin 同步
+    assert data["pluginVersion"] == "0.4.1"  # P2-2 身份冲突页；hashes/pin 同步
     assert "admin:settings:read" in data["adminPermissions"]
     assert "admin:settings:write" in data["adminPermissions"]
     assert "admin:slides:read" in data["adminPermissions"]

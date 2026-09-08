@@ -269,6 +269,10 @@
         <!-- 修改我的密码（owner/user 均可见；账户系统批次 A docs §8.1） -->
         <button type="button" id="changepw-btn" class="logout-link changepw-link"
                 data-i18n="acct.changepw" hidden>修改我的密码</button>
+        <!-- 更换邮箱（owner/user 均可见；P1-3 身份收口 review-2026-09-08 P2-2：
+             预览态/未登录态隐藏——与改密/登出同级，applyAuthInfo 统一控制） -->
+        <button type="button" id="changeemail-btn" class="logout-link changepw-link"
+                data-i18n="acct.changeemail" hidden>更换邮箱</button>
         <button type="button" id="logout-btn" class="logout-link" data-i18n="toast.logout" hidden>退出登录</button>
       </div>
       {% endif %}
@@ -340,6 +344,32 @@
           <div class="picker-footer">
             <button id="changepw-cancel" class="btn secondary small" data-i18n="acct.changepw.cancel">取消</button>
             <button id="changepw-submit" class="btn primary" data-i18n="acct.changepw.submit">修改密码</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 更换邮箱弹窗（P1-3 身份收口 review-2026-09-08 P2-2；owner/user 通用）：
+           POST /api/account/email/change/start 只入队确认邮件（响应仅含掩码邮箱，
+           明文 token 只经邮件链接送达）；用户在 /verify-email-change?token=...
+           确认后服务端才改绑并 auth_version+1 全端下线——本页不跳转，仅提示。 -->
+      <div id="changeemail-mask" class="picker-mask" style="display:none;">
+        <div class="picker-dialog changepw-dialog">
+          <div class="picker-title">
+            <span data-i18n="acct.changeemail.title">更换邮箱</span>
+            <button id="changeemail-close" class="icon-btn close" aria-label="关闭" data-i18n-aria="picker.close">×</button>
+          </div>
+          <div class="changepw-body">
+            <label class="changepw-field">
+              <span data-i18n="acct.changeemail.new">新邮箱地址</span>
+              <input id="changeemail-new" type="email" maxlength="254"
+                     autocomplete="email" inputmode="email" />
+            </label>
+            <p class="changepw-hint" data-i18n="acct.changeemail.hint">确认邮件将发送到新邮箱，点击邮件内的链接完成改绑；确认后所有已登录设备（含本设备）都会退出，需用新邮箱重新登录。</p>
+            <p class="changepw-error" id="changeemail-error" role="alert" hidden></p>
+          </div>
+          <div class="picker-footer">
+            <button id="changeemail-cancel" class="btn secondary small" data-i18n="acct.changeemail.cancel">取消</button>
+            <button id="changeemail-submit" class="btn primary" data-i18n="acct.changeemail.submit">发送确认邮件</button>
           </div>
         </div>
       </div>

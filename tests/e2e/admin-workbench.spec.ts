@@ -922,7 +922,8 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
     await expect(frame.locator("#adm-nav.adm-nav--open")).toBeVisible();
     // P0-1：每个导航按钮 innerText 是完整标签（概览/用户/邀请/…，wave 2
     // 改名后无首字符重复），且 ::before 内容已按同特异性复位
-    const labels = ["概览", "用户", "切片", "邀请", "设置", "费用", "插件", "审计"];
+    // 2026-09-08：新增「身份冲突」页（P2-2：冲突清单+孤儿处置，位于「用户」后）。
+    const labels = ["概览", "用户", "身份冲突", "切片", "邀请", "设置", "费用", "插件", "审计"];
     const navBtns = frame.locator(".adm-nav-btn");
     expect(await navBtns.count()).toBe(labels.length);
     for (let i = 0; i < labels.length; i++) {

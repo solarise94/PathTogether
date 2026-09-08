@@ -1318,8 +1318,10 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 
 	// §5.3/§4.8 390px 列适配（CSS 断言）
 	it("批次A-8: 次要列可隐藏、5 列表头（窄屏 4 列）、移动堆叠补行、日期不 break-all", () => {
+		// 2026-09-08（review P2-2）：users 与 invites 之间插入「身份冲突」页，
+		// 切片终点同步改为 adm-page-identity——本用例仍然只断言用户页
 		const usersPage = htmlSrc.slice(htmlSrc.indexOf('id="adm-page-users"'),
-			htmlSrc.indexOf('id="adm-page-invites"'));
+			htmlSrc.indexOf('id="adm-page-identity"'));
 		expect(usersPage).toMatch(/<th[^>]*adm-col-secondary[^>]*>角色</);
 		expect(usersPage).not.toMatch(/<th[^>]*>登录账号</);
 		expect(usersPage).not.toMatch(/<th[^>]*>最近 AI 调用</);

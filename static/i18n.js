@@ -141,6 +141,21 @@
       "acct.changepw.err.same": "新密码不能与当前密码相同",
       "acct.changepw.err.generic": "修改失败，请稍后重试",
 
+      // ---- 更换邮箱（owner/user 通用；P1-3 身份收口 review-2026-09-08 P2-2） ----
+      "acct.changeemail": "更换邮箱",
+      "acct.changeemail.title": "更换邮箱",
+      "acct.changeemail.new": "新邮箱地址",
+      "acct.changeemail.hint": "确认邮件将发送到新邮箱，点击邮件内的链接完成改绑；确认后所有已登录设备（含本设备）都会退出，需用新邮箱重新登录。",
+      "acct.changeemail.cancel": "取消",
+      "acct.changeemail.submit": "发送确认邮件",
+      "acct.changeemail.ok": "确认邮件已发送至 {email}，请查收邮件完成改绑",
+      "acct.changeemail.err.required": "请输入新的邮箱地址",
+      "acct.changeemail.err.invalid": "请输入有效的邮箱地址",
+      "acct.changeemail.err.taken": "该邮箱已被占用，无法改绑",
+      "acct.changeemail.err.locked": "尝试过于频繁，请稍后再试",
+      "acct.changeemail.err.channel": "邮件通道未配置，暂时无法发起改绑",
+      "acct.changeemail.err.generic": "改绑失败，请稍后重试",
+
       // ---- 插件管理（owner；Stage 4-3） ----
 
       // ---- AI 预算（owner；docs §4.2，PT-3） ----
@@ -789,6 +804,21 @@
       "acct.changepw.err.locked": "Too many attempts, please try again later",
       "acct.changepw.err.same": "The new password must differ from the current password",
       "acct.changepw.err.generic": "Failed to change password, please try again later",
+
+      // ---- Change email (owner/user; P1-3 identity unification, review-2026-09-08 P2-2) ----
+      "acct.changeemail": "Change email",
+      "acct.changeemail.title": "Change email",
+      "acct.changeemail.new": "New email address",
+      "acct.changeemail.hint": "We'll send a confirmation link to the new address. After you confirm, all signed-in devices (including this one) are signed out; log in again with the new email.",
+      "acct.changeemail.cancel": "Cancel",
+      "acct.changeemail.submit": "Send confirmation email",
+      "acct.changeemail.ok": "Confirmation email sent to {email}. Check the inbox to finish the change",
+      "acct.changeemail.err.required": "Please enter the new email address",
+      "acct.changeemail.err.invalid": "Please enter a valid email address",
+      "acct.changeemail.err.taken": "This email is already taken and cannot be used",
+      "acct.changeemail.err.locked": "Too many attempts, please try again later",
+      "acct.changeemail.err.channel": "Email delivery is not configured; please try again later",
+      "acct.changeemail.err.generic": "Failed to request the email change, please try again later",
 
       // ---- 插件管理（owner；Stage 4-3） ----
 

@@ -32,7 +32,7 @@ import share_shared  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
-from _pt_helpers import isolate_app  # noqa: E402
+from _pt_helpers import isolate_app, make_snapshot_attestation  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -214,6 +214,7 @@ def test_internal_annotate_polygon_points_path(monkeypatch):
         "slide": "demo.svs", "label": "AI 描绘", "type": "polygon",
         "points": TRIANGLE, "note": "n", "effect_key": "ek-poly-1",
         "session_id": "sess-h-1",
+        **SNAP_INT_SESS,
     })
     assert r.status_code == 200, r.get_data(as_text=True)
     body = r.get_json()
@@ -226,6 +227,7 @@ def test_internal_annotate_polygon_points_path(monkeypatch):
         "slide": "demo.svs", "label": "AI 描绘", "type": "polygon",
         "points": TRIANGLE, "effect_key": "ek-poly-1",
         "session_id": "sess-h-1",
+        **SNAP_INT_SESS,
     })
     assert r2.status_code == 200
     assert r2.get_json()["annotation_id"] == body["annotation_id"]
@@ -265,6 +267,7 @@ def test_internal_annotate_polygon_mutually_exclusive_with_rect(monkeypatch):
     r = c.post("/internal/ai/annotate", json={
         "slide": "demo.svs", "label": "X", "type": "polygon",
         "points": TRIANGLE, "width_px": 100,
+        **SNAP_INT,
     })
     assert r.status_code == 400
     assert "互斥" in r.get_json()["error"]
@@ -284,6 +287,7 @@ def test_internal_annotate_polygon_self_intersecting_rejected(monkeypatch):
     r = c.post("/internal/ai/annotate", json={
         "slide": "demo.svs", "label": "X", "type": "polygon",
         "points": [[0, 0], [100, 80], [100, 0], [0, 100]],
+        **SNAP_INT,
     })
     assert r.status_code == 400
     assert "自交" in r.get_json()["error"]
@@ -304,6 +308,7 @@ def test_internal_annotate_polygon_out_of_slide_bounds_rejected(monkeypatch):
     r = c.post("/internal/ai/annotate", json={
         "slide": "demo.svs", "label": "X", "type": "polygon",
         "points": [[10, 10], [1200, 50], [100, 100]],
+        **SNAP_INT,
     })
     assert r.status_code == 400
     assert "越出切片边界" in r.get_json()["error"]
@@ -311,6 +316,7 @@ def test_internal_annotate_polygon_out_of_slide_bounds_rejected(monkeypatch):
     r2 = c.post("/internal/ai/annotate", json={
         "slide": "demo.svs", "label": "X", "type": "polygon",
         "points": [[10, 10], [100, 900], [100, 100]],
+        **SNAP_INT,
     })
     assert r2.status_code == 400
 
@@ -367,6 +373,7 @@ def test_internal_annotate_polygon_requires_label_and_valid_type(monkeypatch):
     r2 = c.post("/internal/ai/annotate", json={
         "slide": "demo.svs", "label": "X", "type": "polygon",
         "points": [[0, 0], [10, 10]],
+        **SNAP_INT,
     })
     assert r2.status_code == 400
     assert "3~500" in r2.get_json()["error"]
@@ -396,11 +403,30 @@ def _mock_plugin_channel(monkeypatch, valid=True):
 
 
 # P1-5 起：plugin v1 polygon 必带来源快照溯源（快照 bbox 与点列外接框不必
-# 相同——这里给一个覆盖全部点列的合法 bbox）。
+# 相同——这里给一个覆盖全部点列的合法 bbox）。P1-3 起另须 HP 服务端
+# attestation（无 slide_revision 可选字段 → 载荷 rev=null）。
 SNAP = {
     "snapshot_id": "snap-geom-1",
     "snapshot_bbox": {"x": 0, "y": 0, "w": 1000, "h": 800},
     "render_context_fingerprint": "rcfp-geom",
+    "snapshot_attestation": make_snapshot_attestation(
+        app_mod.AI_INTERNAL_TOKEN, sid="sess1", snap="snap-geom-1",
+        bbox=(0, 0, 1000, 800), rev=None, fp="rcfp-geom"),
+}
+
+# P1-3：internal 通道几何用例的溯源+attestation（points_path 用例带
+# session_id=sess-h-1；其余无 session → attestation.sid 同为空串）。
+SNAP_INT = {
+    "snapshot_id": "snap-geom-int",
+    "snapshot_attestation": make_snapshot_attestation(
+        app_mod.AI_INTERNAL_TOKEN, sid="", snap="snap-geom-int",
+        bbox=None, rev=None, fp=None),
+}
+SNAP_INT_SESS = {
+    "snapshot_id": "snap-geom-int",
+    "snapshot_attestation": make_snapshot_attestation(
+        app_mod.AI_INTERNAL_TOKEN, sid="sess-h-1", snap="snap-geom-int",
+        bbox=None, rev=None, fp=None),
 }
 
 

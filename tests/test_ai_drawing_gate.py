@@ -58,12 +58,29 @@ def _touch(name="demo.svs"):
 TRIANGLE = [[100, 100], [400, 100], [250, 400]]
 
 # P1-5 溯源样例（与 HP draw_suspicious_region 发送侧同一套字段口径）。
+# P1-3 起 polygon 必带 snapshot_attestation（按需用 _snap_prov 覆盖字段）。
 SNAP_PROV = {
     "snapshot_id": "snap-20260907-1",
     "snapshot_bbox": {"x": 0, "y": 0, "w": 1024, "h": 1024},
     "render_context_fingerprint": "rcfp-abc123",
-    "slide_revision": "1700000000:4096",
+    "slide_revision": "rev0",
 }
+
+
+def _attest(sid="sess1", snap="snap-20260907-1",
+            bbox=(0, 0, 1024, 1024), rev="rev0", fp="rcfp-abc123",
+            exp_delta=600, key=None):
+    from _pt_helpers import make_snapshot_attestation
+    return make_snapshot_attestation(
+        key or app_mod.AI_INTERNAL_TOKEN, sid=sid, snap=snap, bbox=bbox,
+        rev=rev, fp=fp, exp_delta=exp_delta)
+
+
+def _snap_prov(**overrides):
+    """合法快照溯源（含匹配 attestation）；overrides 直接覆盖最终 dict。"""
+    prov = dict(SNAP_PROV, snapshot_attestation=_attest())
+    prov.update(overrides)
+    return prov
 
 
 def _mock_plugin_channel(monkeypatch, valid=True):
@@ -107,7 +124,7 @@ def test_gate_fail_closed_when_mirror_never_seen(monkeypatch):
     _touch()
     _mock_plugin_channel(monkeypatch, valid=True)
     c = app_mod.app.test_client()
-    r = _post_polygon(c, **SNAP_PROV)
+    r = _post_polygon(c, **_snap_prov())
     assert r.status_code == 403, r.get_data(as_text=True)
     err = r.get_json()["error"]
     assert err["code"] == "ai_drawing_disabled"
@@ -121,7 +138,7 @@ def test_gate_blocks_forged_polygon_when_off(monkeypatch):
     _mock_plugin_channel(monkeypatch, valid=True)
     share_store.upsert_ai_session_drawing_flag("sess1", False)
     c = app_mod.app.test_client()
-    r = _post_polygon(c, **SNAP_PROV)
+    r = _post_polygon(c, **_snap_prov())
     assert r.status_code == 403
     assert r.get_json()["error"]["code"] == "ai_drawing_disabled"
     assert _no_rois()
@@ -133,7 +150,7 @@ def test_gate_allows_polygon_when_on(monkeypatch):
     _mock_plugin_channel(monkeypatch, valid=True)
     share_store.upsert_ai_session_drawing_flag("sess1", True)
     c = app_mod.app.test_client()
-    r = _post_polygon(c, **SNAP_PROV)
+    r = _post_polygon(c, **_snap_prov())
     assert r.status_code == 200, r.get_data(as_text=True)
     roi = share_store.get_roi(share_store.ADMIN_TOKEN, 0)
     assert roi is not None and roi["type"] == "polygon"
@@ -146,13 +163,13 @@ def test_gate_blocks_late_polygon_after_midrun_off(monkeypatch):
     _mock_plugin_channel(monkeypatch, valid=True)
     share_store.upsert_ai_session_drawing_flag("sess1", True)
     c = app_mod.app.test_client()
-    r1 = _post_polygon(c, effect_key="ek-gate-open", **SNAP_PROV)
+    r1 = _post_polygon(c, effect_key="ek-gate-open", **_snap_prov())
     assert r1.status_code == 200
     first = share_store.get_roi(share_store.ADMIN_TOKEN, 0)
     assert first is not None
     # 运行中用户关闭（经代理路由镜像写回 false——这里直写镜像等价）。
     share_store.upsert_ai_session_drawing_flag("sess1", False)
-    r2 = _post_polygon(c, effect_key="ek-gate-late", **SNAP_PROV)
+    r2 = _post_polygon(c, effect_key="ek-gate-late", **_snap_prov())
     assert r2.status_code == 403
     assert r2.get_json()["error"]["code"] == "ai_drawing_disabled"
     late = share_store.get_roi(share_store.ADMIN_TOKEN, 1)
@@ -195,7 +212,7 @@ def test_gate_still_requires_run_grant(monkeypatch):
     _mock_plugin_channel(monkeypatch, valid=False)
     share_store.upsert_ai_session_drawing_flag("sess1", True)
     c = app_mod.app.test_client()
-    r = _post_polygon(c, **SNAP_PROV)
+    r = _post_polygon(c, **_snap_prov())
     assert r.status_code == 403
     assert r.get_json()["error"]["code"] == "run_grant_invalid"
     assert _no_rois()
@@ -249,22 +266,27 @@ def test_proxy_mirrors_hp_authoritative_value(monkeypatch):
 
 
 def test_proxy_failure_keeps_mirror_unchanged(monkeypatch):
-    """HP 5xx / 404 / 畸形成功体 → 镜像不变（不推定开关状态）。"""
+    """HP 5xx / 404 / 畸形成功体 → 镜像不因**开启**失败而放大（不推定开关）。
+
+    二轮 review P1-2 后语义按方向区分：关闭（enabled=false）在请求 HP 前
+    已预写 false（见 test_proxy_disable_* 用例）；本用例锁**开启方向**失败
+    不镜像——旧值保留（无行/非 true 写入口 fail closed，不放大权限）。
+    """
     _mock_proxy_owner(monkeypatch)
     c = _browser_client(app_mod.app)
     share_store.upsert_ai_session_drawing_flag("sess1", True)
 
     _install_fake_sidecar(monkeypatch, status=500, body={"error": "boom"})
-    assert _proxy_toggle(c).status_code == 500  # 上游错误码透传
+    assert _proxy_toggle(c, enabled=True).status_code == 500  # 上游错误码透传
     assert share_store.get_ai_session_drawing_flag("sess1") is True
 
     _install_fake_sidecar(monkeypatch, status=404, body={"error": "no session"})
-    _proxy_toggle(c)
+    _proxy_toggle(c, enabled=True)
     assert share_store.get_ai_session_drawing_flag("sess1") is True
 
-    # 200 但响应体缺权威布尔（旧 sidecar 形态）——不镜像。
+    # 200 但响应体缺权威布尔（旧 sidecar 形态）——开启方向不镜像。
     _install_fake_sidecar(monkeypatch, status=200, body={"ok": True})
-    _proxy_toggle(c, enabled=False)
+    _proxy_toggle(c, enabled=True)
     assert share_store.get_ai_session_drawing_flag("sess1") is True
 
     # 开启前的失败路径：镜像仍无行（写入口 fail closed）。
@@ -272,6 +294,70 @@ def test_proxy_failure_keeps_mirror_unchanged(monkeypatch):
     _install_fake_sidecar(monkeypatch, status=500, body={"error": "boom"})
     _proxy_toggle(c, enabled=True)
     assert share_store.get_ai_session_drawing_flag("sess1") is False
+
+
+def test_proxy_disable_tightens_mirror_before_hp(monkeypatch):
+    """二轮 review P1-2 回归①：关闭在 HP 前预写 false——HP 已应用关闭但
+    响应途中丢失（连接失败 503）也绝不残留旧 true。"""
+    _mock_proxy_owner(monkeypatch)
+    c = _browser_client(app_mod.app)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)
+
+    _install_fake_sidecar(monkeypatch, status=500, body={"error": "boom"})
+    assert _proxy_toggle(c, enabled=False).status_code == 500
+    assert share_store.get_ai_session_drawing_flag("sess1") is False
+
+    # HP 完全不可达（连接失败 → _proxy_json 503）：镜像同样已收紧。
+    fake = _install_fake_sidecar(monkeypatch, status=200,
+                                 body={"ok": True, "allow_ai_drawing": False})
+    fake.set_unreachable()
+    assert _proxy_toggle(c, enabled=False).status_code == 503
+    assert share_store.get_ai_session_drawing_flag("sess1") is False
+
+
+def test_proxy_disable_local_write_failure_returns_503(monkeypatch):
+    """二轮 review P1-2 回归②：关闭预写失败 → 503，且绝不向 HP 发出请求。"""
+    _mock_proxy_owner(monkeypatch)
+    c = _browser_client(app_mod.app)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)
+    fake = _install_fake_sidecar(monkeypatch, status=200,
+                                 body={"ok": True, "allow_ai_drawing": False})
+
+    def _fail_upsert(session_id, value):
+        raise RuntimeError("pg down")
+
+    monkeypatch.setattr(app_mod.share_store, "upsert_ai_session_drawing_flag",
+                        _fail_upsert)
+    r = _proxy_toggle(c, enabled=False)
+    assert r.status_code == 503
+    assert r.get_json()["code"] == "mirror_write_failed"
+    # 预写先于转发：HP 一个请求都没收到
+    assert fake.calls == []
+    # 镜像保持旧 true（本次关闭失败，用户可重试；闸门状态未被破坏）
+    assert share_store.get_ai_session_drawing_flag("sess1") is True
+
+
+def test_proxy_disable_then_late_write_blocked(monkeypatch):
+    """二轮 review P1-2 回归③：关闭（即便 HP 响应丢失）之后，迟到的
+    plugin v1 polygon 写入立即被写端闸门拒绝（镜像已是 false）。"""
+    _mock_proxy_owner(monkeypatch)
+    c = _browser_client(app_mod.app)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)
+
+    # 关闭时 HP 不可达（响应丢失）——镜像仍已收紧为 false
+    fake = _install_fake_sidecar(monkeypatch, status=200,
+                                 body={"ok": True, "allow_ai_drawing": False})
+    fake.set_unreachable()
+    _proxy_toggle(c, enabled=False)
+    assert share_store.get_ai_session_drawing_flag("sess1") is False
+
+    # 迟到写入：镜像 false → 写入口拒绝（与 test_gate_blocks_* 同一口径）
+    _touch()
+    _mock_plugin_channel(monkeypatch, valid=True)
+    r = _post_polygon(c, effect_key="ek-late-after-off", **_snap_prov())
+    assert r.status_code == 403
+    assert r.get_json()["error"]["code"] == "ai_drawing_disabled"
+    assert _no_rois()
 
 
 def test_store_mirror_semantics(monkeypatch):
@@ -331,7 +417,7 @@ def test_polygon_provenance_persisted(monkeypatch):
     _mock_plugin_channel(monkeypatch, valid=True)
     share_store.upsert_ai_session_drawing_flag("sess1", True)
     c = app_mod.app.test_client()
-    r = _post_polygon(c, **SNAP_PROV)
+    r = _post_polygon(c, **_snap_prov())
     assert r.status_code == 200, r.get_data(as_text=True)
     prov = r.get_json()["provenance"]
     assert prov["snapshot_id"] == SNAP_PROV["snapshot_id"]
@@ -351,18 +437,169 @@ def test_polygon_provenance_persisted(monkeypatch):
 
 
 def test_polygon_provenance_partial_persisted(monkeypatch):
-    """只带 snapshot_id（无 bbox/指纹）也放行：可选字段缺省不伪造。"""
+    """只带 snapshot_id（无 bbox/指纹）也放行：可选字段缺省不伪造——
+    attestation 载荷相应字段为 null（双方同缺即一致）。"""
     _touch()
     _mock_plugin_channel(monkeypatch, valid=True)
     share_store.upsert_ai_session_drawing_flag("sess1", True)
     c = app_mod.app.test_client()
-    r = _post_polygon(c, snapshot_id="snap-only")
-    assert r.status_code == 200
+    r = _post_polygon(c, snapshot_id="snap-only",
+                      snapshot_attestation=_attest(snap="snap-only",
+                                                   bbox=None, rev=None,
+                                                   fp=None))
+    assert r.status_code == 200, r.get_data(as_text=True)
     prov = r.get_json()["provenance"]
     assert prov["snapshot_id"] == "snap-only"
     assert "snapshot_bbox" not in prov
     assert "render_context_fingerprint" not in prov
     assert "slide_revision" not in prov
+
+
+# =========================================================================== #
+# P1-3（二轮 review）：快照 provenance 权威归属（HP 服务端 attestation）
+# =========================================================================== #
+def test_polygon_without_attestation_rejected(monkeypatch):
+    """带 snapshot_id 但无 attestation → 400（形状合法≠归属可信：有效
+    plugin token + run grant 的调用者仍可自报任意 snapshot 字段）。"""
+    _touch()
+    _mock_plugin_channel(monkeypatch, valid=True)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)
+    c = app_mod.app.test_client()
+    prov = {k: v for k, v in _snap_prov().items()
+            if k != "snapshot_attestation"}
+    r = _post_polygon(c, **prov)
+    assert r.status_code == 400
+    assert r.get_json()["error"]["code"] == "invalid_request"
+    assert "snapshot_attestation" in r.get_json()["error"]["message"]
+    assert _no_rois()
+
+
+def test_polygon_attestation_forged_bbox_rejected(monkeypatch):
+    """请求 bbox 改写（attestation 覆盖服务端真值 1024×1024）→ 400。"""
+    _touch()
+    _mock_plugin_channel(monkeypatch, valid=True)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)
+    c = app_mod.app.test_client()
+    r = _post_polygon(c, **_snap_prov(
+        snapshot_bbox={"x": 0, "y": 0, "w": 512, "h": 512}))
+    assert r.status_code == 400
+    assert _no_rois()
+
+
+def test_polygon_attestation_cross_session_rejected(monkeypatch):
+    """跨 session 快照（attestation.sid=其他会话）→ 400。"""
+    _touch()
+    _mock_plugin_channel(monkeypatch, valid=True)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)
+    c = app_mod.app.test_client()
+    r = _post_polygon(c, **_snap_prov(
+        snapshot_attestation=_attest(sid="sess-other")))
+    assert r.status_code == 400
+    assert "会话" in r.get_json()["error"]["message"]
+    assert _no_rois()
+
+
+def test_polygon_attestation_expired_rejected(monkeypatch):
+    """过期 attestation → 400（短 TTL 缩小信令重放窗口）。"""
+    _touch()
+    _mock_plugin_channel(monkeypatch, valid=True)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)
+    c = app_mod.app.test_client()
+    r = _post_polygon(c, **_snap_prov(
+        snapshot_attestation=_attest(exp_delta=-30)))
+    assert r.status_code == 400
+    assert "过期" in r.get_json()["error"]["message"]
+    assert _no_rois()
+
+
+def test_polygon_attestation_tampered_payload_rejected(monkeypatch):
+    """payload 字节被改（改 bbox 后不重算 mac）→ 签名失配 400。"""
+    import base64
+    import json as _json
+    _touch()
+    _mock_plugin_channel(monkeypatch, valid=True)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)
+    c = app_mod.app.test_client()
+    v1, seg, mac = _attest().split(".")
+    pad = "=" * (-len(seg) % 4)
+    payload = _json.loads(base64.urlsafe_b64decode(seg + pad))
+    payload["bbox"] = [0, 0, 512, 512]
+    forged = base64.urlsafe_b64encode(
+        _json.dumps(payload, separators=(",", ":")).encode()
+    ).decode().rstrip("=")
+    r = _post_polygon(c, **_snap_prov(
+        snapshot_attestation="v1.%s.%s" % (forged, mac)))
+    assert r.status_code == 400
+    assert _no_rois()
+
+
+def test_polygon_attestation_wrong_key_rejected(monkeypatch):
+    """非共享密钥签发（密钥不匹配）→ 签名失配 400。"""
+    _touch()
+    _mock_plugin_channel(monkeypatch, valid=True)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)
+    c = app_mod.app.test_client()
+    r = _post_polygon(c, **_snap_prov(
+        snapshot_attestation=_attest(key="not-the-internal-token")))
+    assert r.status_code == 400
+    assert _no_rois()
+
+
+def test_polygon_attestation_stale_asset_revision_conflict(monkeypatch):
+    """attestation rev=旧资产 revision（快照后切片被替换）→ 409
+    slide_revision_conflict（几何坐标系可能漂移，fail-closed）。"""
+    _touch()
+    _mock_plugin_channel(monkeypatch, valid=True)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)
+    c = app_mod.app.test_client()
+    r = _post_polygon(c, **_snap_prov(
+        slide_revision="rev-old",
+        snapshot_attestation=_attest(rev="rev-old")))
+    assert r.status_code == 409
+    assert r.get_json()["error"]["code"] == "slide_revision_conflict"
+    assert _no_rois()
+
+
+def test_polygon_attestation_valid_not_persisted(monkeypatch):
+    """合法 attestation 通过且不进 provenance（一次性凭据，验证即弃）。"""
+    _touch()
+    _mock_plugin_channel(monkeypatch, valid=True)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)
+    c = app_mod.app.test_client()
+    r = _post_polygon(c, **_snap_prov())
+    assert r.status_code == 200
+    assert "snapshot_attestation" not in r.get_json()["provenance"]
+    stored = share_store.get_roi(share_store.ADMIN_TOKEN, 0)
+    assert "snapshot_attestation" not in stored["provenance"]
+
+
+def test_freehand_with_snapshot_id_requires_attestation(monkeypatch):
+    """freehand 带 snapshot_id → 同样必须带 attestation；不带 snapshot_id
+    的 freehand 维持「溯源可选」既有语义。"""
+    _touch()
+    _mock_plugin_channel(monkeypatch, valid=True)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)
+    c = app_mod.app.test_client()
+    fh = {"label": "AI 描图", "type": "freehand",
+          "points": [[10, 10], [60, 40], [90, 90], [40, 60]],
+          "effect_key": "ek-fh-attest", "session_id": "sess1"}
+    # 带 snapshot_id 无 attestation → 400
+    r1 = c.post("/api/plugin/v1/slides/demo.svs/annotations",
+                json=dict(fh, snapshot_id="snap-fh-1"),
+                headers={"X-Run-Grant": "g1"})
+    assert r1.status_code == 400
+    # 合法 attestation → 200
+    r2 = c.post("/api/plugin/v1/slides/demo.svs/annotations",
+                json=dict(fh, snapshot_id="snap-fh-1",
+                          snapshot_attestation=_attest(snap="snap-fh-1",
+                                                       bbox=None, rev=None,
+                                                       fp=None)),
+                headers={"X-Run-Grant": "g1"})
+    assert r2.status_code == 200, r2.get_data(as_text=True)
+    # 完全不带 snapshot_id 的 freehand：可选语义不变
+    r3 = c.post("/api/plugin/v1/slides/demo.svs/annotations", json=fh,
+                headers={"X-Run-Grant": "g1"})
+    assert r3.status_code == 200
 
 
 # =========================================================================== #
@@ -376,12 +613,30 @@ def _mock_internal_channel(monkeypatch):
     monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
 
 
-def _post_internal_polygon(c, session_id="sess-int-1"):
-    return c.post("/internal/ai/annotate", json={
+def _post_internal_polygon(c, session_id="sess-int-1", **overrides):
+    body = {
         "slide": "demo.svs", "label": "AI 描绘", "type": "polygon",
         "points": TRIANGLE, "effect_key": "ek-int-gate",
         "session_id": session_id,
-    })
+        # P1-3：legacy 通道与 plugin v1 同一溯源要求
+        "snapshot_id": "snap-int-1",
+        "snapshot_attestation": _attest(sid=session_id, snap="snap-int-1",
+                                        bbox=None, rev=None, fp=None),
+    }
+    body.update(overrides)
+    return c.post("/internal/ai/annotate", json=body)
+
+
+def test_internal_channel_requires_attestation(monkeypatch):
+    """legacy 通道：polygon 无 attestation → 400（与 plugin v1 同一强制）。"""
+    _touch()
+    _mock_internal_channel(monkeypatch)
+    share_store.upsert_ai_session_drawing_flag("sess-int-1", True)
+    c = app_mod.app.test_client()
+    r = _post_internal_polygon(c, snapshot_attestation=None)
+    assert r.status_code == 400
+    assert "snapshot_attestation" in r.get_json()["error"]
+    assert _no_rois()
 
 
 def test_internal_channel_blocked_without_mirror_row(monkeypatch):

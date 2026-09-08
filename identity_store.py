@@ -212,12 +212,14 @@ def enqueue_email_change(user_id, new_email, base_url=None,
                         or daily >= EMAIL_CHANGE_DAILY_LIMIT:
                     raise EmailChangeError("rate_limited")
                 _assert_email_free_tx(cur, email_norm, user_id)
-                # 作废同邮箱同用途全部未消费旧 token（一次性 + 单活）
+                # 作废同邮箱同用途全部未消费旧 token（一次性 + 单活）。
+                # uncertain 必须在集合内（二轮 review P2-1）：发送结果不确定
+                # 的旧 token 同样可被消费，遗漏会留下新旧双活 token。
                 cur.execute(
                     "UPDATE registration_mail_jobs SET status='superseded' "
                     "WHERE email_normalized=%s AND purpose=%s "
                     "AND consumed_at IS NULL "
-                    "AND status IN ('queued','sent')",
+                    "AND status IN ('queued','sent','uncertain')",
                     (email_norm, MAIL_PURPOSE_EMAIL_CHANGE))
                 cur.execute(
                     "INSERT INTO registration_mail_jobs "
@@ -507,7 +509,7 @@ def list_identity_conflicts():
     return {"items": items, "counts": counts}
 
 
-def discard_pending_activation(user_id):
+def discard_pending_activation(user_id, audit=None):
     """物理删除 orphan pending_activation 行（owner 显式处置；不自动夺取）。
 
     仅当账号同时满足：
@@ -516,14 +518,18 @@ def discard_pending_activation(user_id):
         即邮箱验证建号时因存量 login_id 冲突进入「待补绑」的孤儿行；
     才允许物理 DELETE。其余任何账号（active/pending 且正常用户名/owner/
     disabled……）一律 DiscardPendingError('not_discardable')——**绝不**
-   自动合并或夺取已有账号。
+    自动合并或夺取已有账号。
 
     存在引用行（外键 NO ACTION 拦截，如异常的 billing/acquisition 关联）
     → DiscardPendingError('has_dependents')，fail-closed 不删（说明该行
     并非孤儿，需人工核查）。
 
-    返回被删行的快照 dict（供审计 detail；无敏感字段）。审计由路由层在
-    删除成功后经现有 _audit 工具函数补写（best-effort，不与本删除同事务）。
+    audit 给定 ``{"actor_user_id","actor_role"}`` 时（二轮 review P2-2）：
+    ``user.pending_discard`` 审计经 share_store_pg.record_audit_tx 写入
+    **同一事务**——审计失败则删除整体回滚（「受审计删除」，不再 best-effort
+    事后补写）。detail 只含掩码邮箱与状态快照，无密码/token。
+
+    返回被删行的快照 dict（供调用方核对；无敏感字段）。
     """
     uid = str(user_id or "").strip()
     if not uid:
@@ -549,6 +555,21 @@ def discard_pending_activation(user_id):
                     raise DiscardPendingError("has_dependents") from exc
                 if (cur.rowcount or 0) != 1:
                     raise DiscardPendingError("user_missing")
+                if audit is not None:
+                    import share_store_pg
+                    share_store_pg.record_audit_tx(
+                        cur, "user.pending_discard",
+                        actor_user_id=audit.get("actor_user_id") or None,
+                        actor_role=audit.get("actor_role") or "owner",
+                        target_type="user", target_id=uid,
+                        detail={
+                            "login_id_masked":
+                                registration_store.mask_login_id(
+                                    snap.get("login_id") or ""),
+                            "activation_state": snap.get("activation_state"),
+                            "activation_source": snap.get("activation_source"),
+                            "physically_deleted": True,
+                        })
     finally:
         conn.close()
     snap.pop("password_hash", None)

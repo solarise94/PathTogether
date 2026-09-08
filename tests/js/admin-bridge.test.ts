@@ -416,7 +416,12 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 		// 2026-09-05（review P0 owner 读隔离）：新增 slides.inventory /
 		// slides.setVisibility（切片可见性管理，独立 admin:slides:read/write
 		// 权限域），27 → 29
-		expect(Object.keys(table)).toHaveLength(29);
+		// 2026-09-08（review P2-2 产品闭环）：新增 users.identityConflicts
+		// （身份冲突清单，owner 只读 users:read）与 users.discardPending
+		// （孤儿 pending 行物理删除，不可逆，users:write），29 → 31
+		expect(Object.keys(table)).toHaveLength(31);
+		expect(table["admin.users.identityConflicts"]).toBe("admin:users:read");
+		expect(table["admin.users.discardPending"]).toBe("admin:users:write");
 		expect(table["admin.slides.inventory"]).toBe("admin:slides:read");
 		expect(table["admin.slides.setVisibility"]).toBe("admin:slides:write");
 		expect(table["admin.auth.get"]).toBe("admin:overview:read");

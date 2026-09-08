@@ -331,3 +331,33 @@ class FakeRequests:
 
     def post(self, url, **kwargs):
         return self._dispatch("POST", url, **kwargs)
+
+
+def make_snapshot_attestation(key, sid, snap, bbox=None, rev=None, fp=None,
+                              exp_delta=600, domain="hp-snapshot-attest-v1"):
+    """生成 HP 侧同款快照 attestation（P1-3 跨语言 wire 契约的 Python 镜像）。
+
+    与 HistoPilot src/snapshot-attest.ts signSnapshotAttestation 保持同一
+    wire 格式：``v1.<b64url(payload_json)>.<b64url(hmac_sha256)>``，MAC 覆盖
+    ``domain + "\\n" + payload 原始字节``。bbox 为 (x,y,w,h) 四元组或 None。
+    """
+    import base64
+    import hashlib
+    import hmac as _hmac
+    import json as _json
+    import time as _time
+
+    def _shorten(b):
+        return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
+
+    payload = _json.dumps(
+        {"sid": sid, "snap": snap,
+         "bbox": [float(v) for v in bbox] if bbox is not None else None,
+         "rev": rev or None, "fp": fp or None,
+         "exp": int(_time.time() + exp_delta)},
+        separators=(",", ":"))
+    payload_bytes = payload.encode("utf-8")
+    mac = _hmac.new(key.encode("utf-8"),
+                    ("%s\n" % domain).encode("utf-8") + payload_bytes,
+                    hashlib.sha256).digest()
+    return "v1.%s.%s" % (_shorten(payload_bytes), _shorten(mac))

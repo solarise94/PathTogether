@@ -2061,6 +2061,9 @@ def _parse_snapshot_provenance(body, require_snapshot_id=False):
         未给）。
       - slide_revision：快照抓取时的切片资产 revision（mtime:size 权威口径；
         可选 str）。
+      - snapshot_attestation：HP 服务端 attestation（可选 str；P1-3）。
+        携带 snapshot_id 的描绘必须携带（_check_snapshot_attestation 强制），
+        验证通过即弃、不持久化。
 
     返回 (prov, err)：prov 为**只含合法给出字段**的 dict（直接并入 provenance）；
     err 非 None 时为 message（调用方一律 400 invalid_request，不落库）。
@@ -2107,7 +2110,130 @@ def _parse_snapshot_provenance(body, require_snapshot_id=False):
             return None, err
         if val is not None:
             prov[key] = val
+    # P1-3（二轮 review）：HP 服务端 attestation（与快照字段同源提交；见
+    # _verify_snapshot_attestation）。携带 snapshot_id 的描绘必须携带它。
+    att = body.get("snapshot_attestation")
+    if att is not None:
+        if not isinstance(att, str):
+            return None, "snapshot_attestation 需为字符串"
+        att = att.strip()
+        if att:
+            prov["snapshot_attestation"] = att
     return prov, None
+
+
+# --------------------------------------------------------------------------- #
+# P1-3（二轮 review）：来源快照 provenance 权威归属验证
+# --------------------------------------------------------------------------- #
+# HP sidecar 对**服务端** pending 快照的权威字段（session/snapshot_id/bbox/
+# slide_revision/render fingerprint）生成短时、域分离的 HMAC attestation
+# （密钥=两服务共享的 internal token；HP 侧见 src/snapshot-attest.ts）。
+# 请求体里的快照字段只是「声称值」：只有通过 attestation 验证（签名、
+# 归属、逐项一致、未过期、资产未替换）才允许作为审计事实落库。
+_SNAPSHOT_ATTEST_DOMAIN = b"hp-snapshot-attest-v1"
+
+
+def _verify_snapshot_attestation(att, prov, session_id, current_revision):
+    """校验快照 attestation；返回 (err400, conflict409)（双双 None=通过）。
+
+    wire 形状：``v1.<b64url(payload_json)>.<b64url(hmac_sha256)>``，
+    payload：``{"sid","snap","bbox":[x,y,w,h]|null,"rev":str|null,
+    "fp":str|null,"exp":<epoch 秒>}``。校验项：
+      1. HMAC(domain + "\\n" + payload 原始字节, internal token) 恒时比较
+         （对收到的 payload 字节验签——PT 不重序列化，杜绝跨语言数值
+         序列化歧义；payload 任何字节被改即失配）；
+      2. exp 未过期（HP 侧短 TTL；过期即拒绝，缩短信令重放窗口）；
+      3. payload.sid == 当前 run grant 绑定的 session（跨 session 快照或
+         伪造归属拒绝）；
+      4. payload 与请求 provenance 四字段逐项一致（snapshot_id / bbox /
+         slide_revision / render fingerprint——请求里改任何一字段都失配，
+         防伪 bbox/fingerprint）；
+      5. payload.rev 非空且与当前切片资产 revision 不符 → 409（快照抓取
+         后资产被替换，几何坐标系可能漂移；与 expected_asset_revision
+         同语义 fail-closed）。
+    """
+    parts = str(att or "").split(".")
+    if len(parts) != 3 or parts[0] != "v1" or not parts[1] or not parts[2]:
+        return "描绘 snapshot_attestation 形状非法（v1.<payload>.<mac>）", None
+
+    def _b64url_dec(seg):
+        try:
+            return base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4))
+        except Exception:
+            return None
+
+    payload_bytes = _b64url_dec(parts[1])
+    mac = _b64url_dec(parts[2])
+    if payload_bytes is None or mac is None:
+        return "描绘 snapshot_attestation 编码非法", None
+    key = (AI_INTERNAL_TOKEN or "").encode("utf-8")
+    digest = hmac.new(
+        key, _SNAPSHOT_ATTEST_DOMAIN + b"\n" + payload_bytes,
+        hashlib.sha256).digest()
+    if not hmac.compare_digest(digest, mac):
+        return "描绘 snapshot_attestation 签名不匹配", None
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("not an object")
+    except Exception:
+        return "描绘 snapshot_attestation 载荷非法", None
+
+    try:
+        exp = float(payload.get("exp") or 0)
+    except (TypeError, ValueError):
+        return "描绘 snapshot_attestation exp 非法", None
+    if exp <= time.time():
+        return "描绘 snapshot_attestation 已过期", None
+
+    if str(payload.get("sid") or "") != str(session_id or ""):
+        return "描绘 snapshot_attestation 与当前会话不符（跨会话快照拒绝）", None
+    if str(payload.get("snap") or "") != str(prov.get("snapshot_id") or ""):
+        return "描绘 snapshot_attestation 与 snapshot_id 不符", None
+
+    pb, qb = payload.get("bbox"), prov.get("snapshot_bbox")
+    if (pb is None) != (qb is None):
+        return "描绘 snapshot_attestation 与 snapshot_bbox 不符", None
+    if pb is not None:
+        if not isinstance(pb, (list, tuple)) or len(pb) != 4:
+            return "描绘 snapshot_attestation 载荷 bbox 非法", None
+        try:
+            pair_vals = [float(pb[i]) for i in range(4)]
+        except (TypeError, ValueError):
+            return "描绘 snapshot_attestation 载荷 bbox 非法", None
+        req_vals = [float(qb.get(k)) for k in ("x", "y", "w", "h")]
+        if pair_vals != req_vals:
+            return "描绘 snapshot_attestation 与 snapshot_bbox 不符", None
+
+    prev, qrev = payload.get("rev"), prov.get("slide_revision")
+    if (prev or None) != (qrev or None):
+        return "描绘 snapshot_attestation 与 slide_revision 不符", None
+    pfp, qfp = payload.get("fp"), prov.get("render_context_fingerprint")
+    if (pfp or None) != (qfp or None):
+        return "描绘 snapshot_attestation 与 render_context_fingerprint 不符", None
+
+    if prev and current_revision and str(prev) != str(current_revision):
+        return None, "快照基于旧版切片资产（资产已更新，几何坐标系可能漂移）"
+    return None, None
+
+
+def _check_snapshot_attestation(snap_prov, session_id, safe):
+    """两通道共用的 attestation 强制闸（plugin v1 与 legacy internal）。
+
+    携带 snapshot_id 的描绘（polygon 必带、freehand 可选带）必须携带通过
+    _verify_snapshot_attestation 的服务端 attestation；不带 snapshot_id 的
+    freehand 维持「溯源可选」语义（矩形路径不涉快照）。
+    返回 (err, conflict)：双双 None=通过；err → 400（文案），conflict →
+    409 slide_revision_conflict（文案）。响应形状由各通道调用方构造。
+    """
+    if not snap_prov.get("snapshot_id"):
+        return None, None  # 无 snapshot_id：freehand 可选语义 / 矩形不涉快照
+    att = snap_prov.get("snapshot_attestation")
+    if not att:
+        return ("描绘缺少 snapshot_attestation（来源快照须携带 HP 服务端 "
+                "attestation；旧版 sidecar 请升级）"), None
+    return _verify_snapshot_attestation(
+        att, snap_prov, session_id, _legacy_slide_revision(safe))
 
 
 # --------------------------------------------------------------------------- #
@@ -6939,8 +7065,13 @@ def admin_v1_users_discard_pending(user_id):
     auth = _require_owner_admin_v1()
     if auth:
         return auth
+    ident = current_identity()
     try:
-        snap = identity_store.discard_pending_activation(user_id)
+        # 审计与删除同一 PG 事务（二轮 review P2-2：审计失败整体回滚，
+        # 杜绝「删了但没记审计」）；actor=真实 owner，detail 无敏感值。
+        snap = identity_store.discard_pending_activation(
+            user_id, audit={"actor_user_id": ident.get("user_id") or None,
+                            "actor_role": ident.get("role") or "owner"})
     except identity_store.DiscardPendingError as exc:
         if exc.code == "user_missing":
             return _admin_v1_error(404, "user_not_found", "用户不存在")
@@ -6955,15 +7086,6 @@ def admin_v1_users_discard_pending(user_id):
     except Exception:
         app.logger.exception("admin v1 discard-pending 失败")
         return _admin_v1_error(500, "internal", "处置失败（未删除任何行）")
-    # 审计沿用现有 best-effort 工具函数（actor=真实 owner；detail 无敏感值）
-    _audit("user.pending_discard", target_type="user", target_id=user_id,
-           detail={
-               "login_id_masked": registration_store.mask_login_id(
-                   snap.get("login_id") or ""),
-               "activation_state": snap.get("activation_state"),
-               "activation_source": snap.get("activation_source"),
-               "physically_deleted": True,
-           })
     return jsonify(ok=True, discarded={"user_id": user_id})
 
 
@@ -14080,6 +14202,7 @@ def internal_ai_annotate():
     # 不变（既有 create_annotation 矩形工具继续走 x/y/w/h/side_px）。
     body_type = body.get("type")
     points_norm = None
+    snap_prov = {}
     if body_type in ("polygon", "freehand"):
         # P1-4 收口（review-2026-09-07）：legacy internal 通道与 plugin v1
         # 同闸——polygon/freehand 描绘要求会话镜像开关为 true（无 session_id
@@ -14091,6 +14214,23 @@ def internal_ai_annotate():
             return jsonify(
                 error="本会话未开启「允许 AI 描绘」（或平台无其开启记录）",
                 code="ai_drawing_disabled"), 403
+        # P1-5 + P1-3（二轮 review）：legacy internal 通道与 plugin v1 同一
+        # 溯源要求——polygon 必带 snapshot_id；携带 snapshot_id 的描绘必须
+        # 附带 HP 服务端 attestation 并通过权威归属验证（旧版 sidecar 无
+        # attestation 会被拒——请升级 sidecar 后再描绘）。
+        snap_prov, serr = _parse_snapshot_provenance(
+            body, require_snapshot_id=(body_type == "polygon"))
+        if serr is not None:
+            return jsonify(error=serr), 400
+        attest_err, attest_conflict = _check_snapshot_attestation(
+            snap_prov, str(body.get("session_id") or ""), safe)
+        if attest_err is not None:
+            return jsonify(error=attest_err,
+                           code="invalid_request"), 400
+        if attest_conflict is not None:
+            return jsonify(error="slide_revision_conflict",
+                           detail=attest_conflict,
+                           current_slide_asset_revision=_legacy_slide_revision(safe)), 409
         points_norm, perr = _validate_annotation_points(safe, body_type, body)
         if perr is not None:
             return jsonify(error=perr[0]), 400
@@ -14140,6 +14280,12 @@ def internal_ai_annotate():
         "slide_asset_revision": _legacy_slide_revision(safe),
         "idempotency_key": effect_key or "",
     }
+    # P1-5/P1-3：来源快照溯源字段并入（含验证通过的 attestation 不落库——
+    # 它只是一次性凭据；持久化的是被证明过的四个快照字段）。
+    prov_persist = {k: v for k, v in (snap_prov or {}).items()
+                    if k != "snapshot_attestation"}
+    if prov_persist:
+        provenance.update(prov_persist)
     try:
         if points_norm is not None:
             # H（AI 描绘）点列落库：source="ai" → review_status 默认 pending
@@ -14910,6 +15056,16 @@ def plugin_v1_annotate(slide):
         snap_prov, serr = _parse_snapshot_provenance(body, require_snapshot_id=(body_type == "polygon"))
         if serr is not None:
             return _plugin_error(400, "invalid_request", serr)
+        # P1-3（二轮 review）：快照 provenance 权威归属——携带 snapshot_id 的
+        # 描绘必须附带 HP 服务端 attestation 并通过验证（伪造/跨会话/篡改
+        # bbox/过期/资产已替换一律拒绝落库）。
+        attest_err, attest_conflict = _check_snapshot_attestation(
+            snap_prov, session_id, safe)
+        if attest_err is not None:
+            return _plugin_error(400, "invalid_request", attest_err)
+        if attest_conflict is not None:
+            return _plugin_error(409, "slide_revision_conflict",
+                                 attest_conflict)
         points_norm, perr = _validate_annotation_points(safe, body_type, body)
         if perr is not None:
             return _plugin_error(400, "invalid_request", perr[0], details=perr[1])
@@ -14954,7 +15110,8 @@ def plugin_v1_annotate(slide):
     # AI 溯源子对象（§6.4）：created_by_user_id 从 grant 来；plugin_id/version
     # 回查 installation；请求体同名字段（created_by_user_id 等）不采信。
     # P1-5：描绘（点列路径）并入来源快照溯源字段（_parse_snapshot_provenance
-    # 已做形态校验；缺 snapshot_id 的 polygon 在上方已被 400 拒绝）。
+    # 已做形态校验；缺 snapshot_id 的 polygon 在上方已被 400 拒绝）。P1-3：
+    # snapshot_attestation 是一次性凭据，验证通过即弃——不持久化进 provenance。
     installation = share_store.get_plugin_installation(claims.get("sub") or "") or {}
     provenance = {
         "plugin_id": installation.get("plugin_id") or "histopilot",
@@ -14967,8 +15124,10 @@ def plugin_v1_annotate(slide):
         "slide_asset_revision": _legacy_slide_revision(safe),
         "idempotency_key": effect_key or "",
     }
-    if snap_prov:
-        provenance.update(snap_prov)
+    prov_persist = {k: v for k, v in snap_prov.items()
+                    if k != "snapshot_attestation"}
+    if prov_persist:
+        provenance.update(prov_persist)
     try:
         if points_norm is not None:
             # H（AI 描绘）点列落库：source="ai" → review_status 默认 pending
@@ -16117,18 +16276,35 @@ def api_ai_session_drawing(session_id):
     P1-4（review-2026-09-07）：HP 返回成功（2xx 且含权威布尔 allow_ai_drawing）
     后，把该值 upsert 进 PT 本地镜像表（ai_session_drawing_flags，0039）——
     polygon/freehand 写入口据此复核开关，不再单方面信任 HP 侧裁剪。
-    HP 失败（非 2xx / 响应体缺权威布尔）**不改变镜像**（旧值保留，fail closed）。
+    P1-2（二轮 review）：**关闭是权限收紧**——请求 HP 之前先把 PT 镜像原子
+    写为 false，本地写失败直接 503（不转发 HP、不报告成功）。否则 HP 已关、
+    PT 残留旧 true 时，迟到/重放的 plugin v1 与 legacy internal 写入仍会
+    通过写端闸门。开启方向不变：HP 明确成功（2xx + 权威布尔且与请求方向
+    一致）后才置 true；失败不镜像（写入口对无行/非 true 均 fail closed）。
     """
     auth = _require_ai_session_owner(session_id)
     if auth is not None:
         return auth
     body = request.get_json(silent=True) or {}
 
+    # 关闭预写（fail-closed 核心）：先收紧本地镜像，再让 HP 跟随。
+    if body.get("enabled") is False:
+        try:
+            share_store.upsert_ai_session_drawing_flag(session_id, False)
+        except Exception:
+            app.logger.exception(
+                "ai drawing 关闭预写镜像失败（session=%s）", session_id)
+            return jsonify(error="描绘开关本地状态写失败，关闭请求已被拒绝",
+                           code="mirror_write_failed"), 503
+
     def _on_response(status, parsed):
-        # 只在 HP 明确成功且响应体带权威布尔时镜像；其余情况一律不动镜像
-        # （503/404/畸形体都不推定开关状态——写入口对无行/非 true 均 fail closed）。
+        # 只在 HP 明确成功、响应体带权威布尔、且与请求方向一致时镜像。
+        # 其余情况（503/404/畸形体/方向矛盾）一律不动镜像：关闭方向已由
+        # 预写收紧；开启方向失败最多留下保守的旧 false，不放大权限。
+        want = body.get("enabled")
         if status < 400 and isinstance(parsed, dict) \
-                and isinstance(parsed.get("allow_ai_drawing"), bool):
+                and isinstance(parsed.get("allow_ai_drawing"), bool) \
+                and parsed["allow_ai_drawing"] is want:
             share_store.upsert_ai_session_drawing_flag(
                 session_id, parsed["allow_ai_drawing"])
 

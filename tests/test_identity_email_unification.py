@@ -473,6 +473,35 @@ def test_discard_pending_deletes_orphan_and_audits(monkeypatch):
     assert r2.status_code == 404
 
 
+def test_discard_pending_rolls_back_when_audit_fails(monkeypatch):
+    """二轮 review P2-2：审计与删除同一事务——审计写失败则删除整体回滚，
+    杜绝「物理删除已生效但审计缺失」。"""
+    import share_store_pg
+    owner = _mk_owner()
+    orphan_uid = _mk_pending_bind_row()
+    client = _client()
+    _owner_session(client, owner)
+
+    real_audit_tx = share_store_pg.record_audit_tx
+
+    def _audit_down(*a, **k):
+        raise RuntimeError("audit_events insert failed")
+
+    monkeypatch.setattr(share_store_pg, "record_audit_tx", _audit_down)
+    r = client.post("/api/admin/v1/users/%s/discard-pending" % orphan_uid)
+    assert r.status_code == 500
+    # 关键：删除未生效（行仍在），审计亦无记录
+    assert _user_row(orphan_uid) is not None
+    # 审计恢复后重试可完成（同事务路径正常工作）
+    monkeypatch.setattr(share_store_pg, "record_audit_tx", real_audit_tx)
+    r2 = client.post("/api/admin/v1/users/%s/discard-pending" % orphan_uid)
+    assert r2.status_code == 200, r2.get_data(as_text=True)
+    assert _user_row(orphan_uid) is None
+    events = client.get(
+        "/api/admin/v1/audit?action=user.pending_discard").get_json()["items"]
+    assert any(e["target_id"] == orphan_uid for e in events)
+
+
 def test_discard_pending_rejects_everything_else(monkeypatch):
     """红线：绝不自动夺取已有账号——active/正常 pending/owner 一律 409。"""
     owner = _mk_owner()
@@ -595,6 +624,59 @@ def test_email_change_start_rate_limited_per_email(monkeypatch):
     r = _start_change(client, "a1@x.com")
     assert r.status_code == 429
     assert r.get_json()["code"] == "rate_limited"
+
+
+class _UncertainSender:
+    """DATA 结束符后超时：远端可能已接受 → uncertain（P1-1 语义）。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def send(self, to, subject, body):
+        self.calls += 1
+        raise registration_mail_worker.MailSenderUncertainError(
+            "smtp_final_response_missing（TimeoutError）")
+
+
+def test_email_change_uncertain_token_superseded_by_new_request(monkeypatch):
+    """二轮 review P2-1：uncertain 改绑作业必须被同邮箱新请求作废——与注册
+    验证（test_uncertain_token_superseded_by_new_request）对称的单活红线。
+
+    修复前 supersede 集合漏 uncertain：旧 uncertain token 与新 token 同时
+    可消费，持有旧确认链接的用户可在改绑目标已再次发起后仍完成首次改绑。
+    """
+    u, client = _logged_in_client("unc@x.com")
+    assert _start_change(client, "moved@x.com").status_code == 200
+    snd = _UncertainSender()
+    assert registration_mail_worker.drain_once(sender=snd) == 0
+    # uncertain 作业存在（其明文 token 只在「远端可能已收到的邮件」里，
+    # 绝不落库——本用例以行状态断言为主）
+    assert any(r["status"] == "uncertain" for r in _mail_job_rows())
+    # 出 60s 冷却窗（配额以作业行 created_at 计）
+    conn = pg_conn()
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE registration_mail_jobs SET created_at = "
+                "now() - interval '2 minutes' "
+                "WHERE email_normalized='moved@x.com' "
+                "AND purpose='email_change'")
+    finally:
+        conn.close()
+    assert _start_change(client, "moved@x.com").status_code == 200
+    registration_mail_worker.drain_once()  # fake sender 发出新邮件
+    # 旧 uncertain 已被作废；新作业 queued→sent
+    statuses = {r["status"] for r in _mail_job_rows()}
+    assert "uncertain" not in statuses
+    assert "superseded" in statuses and "sent" in statuses
+    new_token = _extract_change_token(_fake().sent[-1][2])
+    assert new_token
+    # 新 token 可完成改绑闭环
+    r = client.post("/api/account/email/change/confirm",
+                    json={"token": new_token})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert _user_row(u["user_id"])["login_id"] == "moved@x.com"
 
 
 def test_email_change_start_unconfigured_channel(monkeypatch):

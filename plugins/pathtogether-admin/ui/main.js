@@ -31,6 +31,10 @@
        整卡隐藏，绝不显示为错误；
      - 面向人的 CNY 统一两位小数（formatCny2：十进制字符串/BigInt 半分进位，
        不经 JS Number）；原始 nano 只在技术详情/原始值展开区。
+   2026-09-08（review-2026-09-08 P2-2 产品闭环）：新增「身份冲突」页——
+     admin.users.identityConflicts（owner 只读清单）+ admin.users.discardPending
+     （仅 pending_bind_synthetic 孤儿行可物理删除，不可逆；确认条 + 409 文案
+     原样展示），其余冲突只报告、绝不自动合并/夺取账号。
    渲染只用 textContent / createElement（不拼 HTML，插件数据永不进标记）。
  ========================================================================= */
 (function () {
@@ -88,7 +92,7 @@
   // 深链起始页（PR5 /admin#invites 兼容）：宿主把父页 hash 透传到本 iframe
   // 自身 URL；只接受已知页面 slug，其余回概览。
   function initialPageFromHash() {
-    var pages = ["overview", "users", "slides", "invites", "settings",
+    var pages = ["overview", "users", "identity", "slides", "invites", "settings",
                  "billing", "plugins", "audit"];
     var hash = "";
     try { hash = window.location.hash || ""; } catch (e) { hash = ""; }
@@ -102,8 +106,9 @@
   // wave 2：顶级页名收敛（「邀请与来源」→「邀请」、「额度与账单」→「费用」）；
   // slug 保持不变，宿主深链 #invites/#billing 兼容。
   var PAGE_TITLES = {
-    overview: "概览", users: "用户", slides: "切片可见性", invites: "邀请",
-    settings: "设置", billing: "费用", plugins: "插件", audit: "审计",
+    overview: "概览", users: "用户", identity: "身份冲突", slides: "切片可见性",
+    invites: "邀请", settings: "设置", billing: "费用", plugins: "插件",
+    audit: "审计",
   };
 
   var els = {
@@ -118,6 +123,7 @@
     pages: {
       overview: $("adm-page-overview"),
       users: $("adm-page-users"),
+      identity: $("adm-page-identity"),
       slides: $("adm-page-slides"),
       invites: $("adm-page-invites"),
       settings: $("adm-page-settings"),
@@ -882,7 +888,8 @@
                       audit: null, invites: null, slides: null };
     ["adm-users-tbody", "adm-usage-tbody", "adm-unpriced-tbody",
      "adm-ledger-tbody", "adm-audit-tbody", "adm-invites-tbody",
-     "adm-plugins-tbody", "adm-slides-tbody"].forEach(function (id) {
+     "adm-plugins-tbody", "adm-slides-tbody", "adm-identity-tbody"].forEach(
+    function (id) {
       var el = $(id);
       if (el) el.textContent = "";
     });
@@ -1664,6 +1671,142 @@
       showError(err && err.code, err && err.message);
       setStatus("adm-users-create-status", errText(err));
     });
+  }
+
+  // ------------------------------------------------------------------
+  // 身份冲突清单 + 孤儿处置（review-2026-09-08 P2-2 产品闭环）：
+  //   - admin.users.identityConflicts（owner 只读）→ 四类冲突行 + counts；
+  //   - 仅 discardable=true（pending_bind_synthetic 孤儿行）提供
+  //     「删除孤儿账号」，页内确认条明示**物理删除、不可逆**；成功后刷新
+  //     清单；失败（404 user_not_found / 409 not_discardable 含
+  //     has_dependents 语义文案 / 500）按后端 message 如实展示，绝不静默；
+  //   - 其余冲突只报告：系统不提供自动合并/夺取已有账号的入口（与后端
+  //     fail-closed 语义一致）。
+  // ------------------------------------------------------------------
+  var IDENTITY_CONFLICT_LABELS = {
+    login_id_not_email: "登录名非邮箱",
+    email_login_mismatch: "邮箱与登录名不一致",
+    pending_bind_synthetic: "待补绑孤儿",
+    email_shared: "邮箱复用",
+  };
+
+  function loadIdentityConflicts() {
+    var seq = state.listSeq;
+    var status = $("adm-identity-status");
+    setPageState("identity", "loading");
+    request("admin.users.identityConflicts", {}).then(function (res) {
+      if (seq !== state.listSeq) return; // 页面已切换：晚到响应丢弃
+      hideError();
+      renderIdentityConflicts(res || {});
+      var items = (res && res.items) || [];
+      if (!items.length) {
+        setPageState("identity", "empty", {
+          message: "没有身份冲突行：登录名均为邮箱形态且与邮箱一致，无待补绑孤儿、无邮箱复用。",
+        });
+      } else {
+        setPageState("identity", "ready", {
+          message: "已更新（" + nowText() + "）",
+        });
+      }
+    }).catch(function (err) {
+      if (seq !== state.listSeq) return;
+      handleErr(err, status);
+      setPageState("identity", "error", {
+        code: err && err.code, message: err && err.message,
+        retry: function () { loadIdentityConflicts(); },
+      });
+    });
+  }
+
+  function renderIdentityConflicts(res) {
+    var kpis = $("adm-identity-kpis");
+    if (kpis) {
+      kpis.textContent = "";
+      var counts = res.counts || {};
+      kpis.appendChild(kpiCard("冲突行总数", fmtNum(counts.total_conflicting_rows),
+        "至少命中一类冲突的账号行数"));
+      kpis.appendChild(kpiCard("待补绑孤儿（可处置）",
+        fmtNum(counts.pending_bind_synthetic),
+        "pending-*@bind.invalid 合成形；可物理删除",
+        Number(counts.pending_bind_synthetic) > 0));
+      kpis.appendChild(kpiCard("登录名非邮箱", fmtNum(counts.login_id_not_email)));
+      kpis.appendChild(kpiCard("邮箱与登录名不一致", fmtNum(counts.email_login_mismatch)));
+      kpis.appendChild(kpiCard("邮箱复用", fmtNum(counts.email_shared)));
+    }
+    var tbody = $("adm-identity-tbody");
+    if (!tbody) return;
+    tbody.textContent = "";
+    (res.items || []).forEach(function (item) {
+      tbody.appendChild(renderIdentityRow(item));
+    });
+  }
+
+  function identityActivationText(item) {
+    if (item.activation_state === "pending_activation") return "待激活";
+    if (item.activation_state === "email_pending") return "待验证";
+    return "已激活";
+  }
+
+  function renderIdentityRow(item) {
+    var tr = document.createElement("tr");
+    tr.appendChild(td(item.user_id));
+    tr.appendChild(td(item.login_id));
+    // 邮箱列：规范化邮箱 + 未验证标注（email_verified=false 时加徽标）
+    var emailCell = td(item.email_normalized || "—");
+    if (item.email_normalized && !item.email_verified) {
+      var unverified = document.createElement("span");
+      unverified.className = "adm-badge";
+      unverified.textContent = "未验证";
+      emailCell.appendChild(document.createTextNode(" "));
+      emailCell.appendChild(unverified);
+    }
+    tr.appendChild(emailCell);
+    tr.appendChild(td((item.role || "—") + " · " +
+      (item.disabled ? "禁用" : "启用") + " · " + identityActivationText(item)));
+    // 冲突徽章列：一行可命中多类，全部列出
+    var conflictsCell = document.createElement("td");
+    (item.conflicts || []).forEach(function (c, idx) {
+      if (idx > 0) conflictsCell.appendChild(document.createTextNode(" "));
+      var badge = document.createElement("span");
+      badge.className = "adm-badge";
+      badge.textContent = IDENTITY_CONFLICT_LABELS[c] || c;
+      conflictsCell.appendChild(badge);
+    });
+    tr.appendChild(conflictsCell);
+    // 处置列：仅 discardable 行提供删除；其余只报告
+    var cell = document.createElement("td");
+    cell.className = "adm-actions-cell";
+    if (item.discardable) {
+      cell.appendChild(actionBtn("删除孤儿账号", function () {
+        askConfirm($("adm-identity-confirm"),
+          "确认物理删除孤儿账号 " + (item.login_id || item.user_id) +
+          "（user_id " + item.user_id + "）？该操作**不可逆**：直接物理删除" +
+          "数据库行，不进入回收站、无法恢复；仅适用于「待激活且登录名为" +
+          "待补绑合成形」的孤儿行。",
+          function () { discardPendingIdentity(item); });
+      }, true));
+    } else {
+      cell.appendChild(document.createTextNode("仅报告"));
+    }
+    tr.appendChild(cell);
+    return tr;
+  }
+
+  function discardPendingIdentity(item) {
+    var status = $("adm-identity-status");
+    setStatus("adm-identity-status", "删除中…");
+    request("admin.users.discardPending", { user_id: item.user_id })
+      .then(function () {
+        setStatus("adm-identity-status",
+          "已物理删除孤儿账号 " + (item.login_id || item.user_id) +
+          "（user_id " + item.user_id + "；不可逆，清单已刷新）");
+        loadIdentityConflicts();
+      })
+      .catch(function (err) {
+        // 409 not_discardable（含 has_dependents 文案）/ 404 / 500：errText
+        // 原样透出后端 message，绝不静默或伪装成功
+        handleErr(err, status);
+      });
   }
 
   // ------------------------------------------------------------------
@@ -3090,6 +3233,7 @@
     }
     if (name === "overview") loadOverview();
     else if (name === "users") loadUsers(false);
+    else if (name === "identity") loadIdentityConflicts();
     else if (name === "slides") loadSlides(false);
     else if (name === "invites") loadInvitesPage();
     else if (name === "settings") loadSettingsPage();
@@ -3187,6 +3331,8 @@
     onClick("adm-users-more-btn", function () { loadUsers(true); });
     // 用户页写操作（PR5）
     onClick("adm-users-create-btn", submitCreateUser);
+    // 身份冲突页（review P2-2）：清单刷新（删除动作在行内按钮 + 页内确认条）
+    onClick("adm-identity-refresh-btn", function () { loadIdentityConflicts(); });
     // 邀请页（wave 2：注册模式只读 + 跳设置）
     onClick("adm-invite-goto-settings-btn", function () { showPage("settings"); });
     onClick("adm-invite-create-btn", submitCreateInvite);

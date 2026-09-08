@@ -875,11 +875,17 @@ class _ScriptedSmtp:
     P1-1 阶段划分验证用：
       - ``next_getreply_exc`` 非空 → getreply()（最终响应等待段）抛该异常，
         模拟「远端已接受、本地等响应超时/断连」；
+      - ``next_terminator_send_exc`` 非空 → send(b".\\r\\n")（DATA 结束符
+        写出段）抛该异常，模拟「结束符开始写出后断连——远端可能已完整接收」
+        （二轮 review P1-1 反例探针）；
+      - ``next_body_send_exc`` 非空 → 正文 send（阶段 1）抛该异常；
       - ``next_final_code`` = 远端对整个事务的最终响应码（250=接受）；
       - ``next_auth_exc`` 非空 → login 抛该异常（DATA 之前的确定失败）。
     """
 
     next_getreply_exc = None
+    next_terminator_send_exc = None
+    next_body_send_exc = None
     next_final_code = 250
     next_auth_exc = None
     last = None  # 最后一个实例（断言信封与线上字节用）
@@ -921,6 +927,14 @@ class _ScriptedSmtp:
         return (250, b"ok")
 
     def send(self, data):
+        if data == b".\r\n" and _ScriptedSmtp.next_terminator_send_exc:
+            exc = _ScriptedSmtp.next_terminator_send_exc
+            _ScriptedSmtp.next_terminator_send_exc = None
+            raise exc
+        if _ScriptedSmtp.next_body_send_exc is not None:
+            exc = _ScriptedSmtp.next_body_send_exc
+            _ScriptedSmtp.next_body_send_exc = None
+            raise exc
         self.sent_data += data
 
     def getreply(self):
@@ -943,10 +957,14 @@ def _smtp_sender():
 def _scripted_smtp_state():
     """每个用例前后复位 _ScriptedSmtp 类级脚本（防用例间泄漏）。"""
     _ScriptedSmtp.next_getreply_exc = None
+    _ScriptedSmtp.next_terminator_send_exc = None
+    _ScriptedSmtp.next_body_send_exc = None
     _ScriptedSmtp.next_final_code = 250
     _ScriptedSmtp.next_auth_exc = None
     yield
     _ScriptedSmtp.next_getreply_exc = None
+    _ScriptedSmtp.next_terminator_send_exc = None
+    _ScriptedSmtp.next_body_send_exc = None
     _ScriptedSmtp.next_final_code = 250
     _ScriptedSmtp.next_auth_exc = None
 
@@ -1003,6 +1021,51 @@ def test_smtp_uncertain_when_final_response_missing(monkeypatch):
     # 子类关系：既有 MailSenderError 捕获方语义不变（worker 先捕 uncertain）
     assert issubclass(registration_mail_worker.MailSenderUncertainError,
                       registration_mail_worker.MailSenderError)
+
+
+def test_smtp_uncertain_when_terminator_send_times_out(monkeypatch):
+    """二轮 review P1-1 反例：DATA 结束符 send 本身超时 → 必须判 uncertain。
+
+    结束符开始写出后，客户端无法证明远端未完整接收（TCP 缓冲/对端已读均
+    不可观测）；此前的实现把该异常留在阶段 1，被外层 except OSError 译成
+    可重试 MailSenderError → worker 自动重发 → 重复发信。
+    """
+    import smtplib
+    monkeypatch.setattr(smtplib, "SMTP_SSL", _ScriptedSmtp)
+    sender = _smtp_sender()
+    _ScriptedSmtp.next_terminator_send_exc = TimeoutError("terminator write")
+    with pytest.raises(
+            registration_mail_worker.MailSenderUncertainError) as ei:
+        sender.send("user@example.com", "s", "hello")
+    assert "smtp_final_response_missing" in str(ei.value)
+    assert "TimeoutError" in str(ei.value)
+
+
+def test_smtp_uncertain_when_terminator_send_disconnects(monkeypatch):
+    """结束符写出段连接断开（非超时类 OSError）同样归 uncertain。"""
+    import smtplib
+    monkeypatch.setattr(smtplib, "SMTP_SSL", _ScriptedSmtp)
+    sender = _smtp_sender()
+    _ScriptedSmtp.next_terminator_send_exc = ConnectionResetError("reset")
+    with pytest.raises(
+            registration_mail_worker.MailSenderUncertainError):
+        sender.send("user@example.com", "s", "hello")
+
+
+def test_smtp_body_send_failure_is_deterministic(monkeypatch):
+    """正文写出（阶段 1）失败仍=确定未发出 → 普通可重试 MailSenderError。
+
+    sendall 语义保证数据未完整送达即抛错，远端事务未提交；这是阶段划分
+    的另一半边界，不得被误放大到 uncertain（否则会卡死不发）。
+    """
+    import smtplib
+    monkeypatch.setattr(smtplib, "SMTP_SSL", _ScriptedSmtp)
+    sender = _smtp_sender()
+    _ScriptedSmtp.next_body_send_exc = TimeoutError("body write")
+    with pytest.raises(registration_mail_worker.MailSenderError) as ei:
+        sender.send("user@example.com", "s", "hello")
+    assert not isinstance(
+        ei.value, registration_mail_worker.MailSenderUncertainError)
 
 
 def test_smtp_data_rejected_is_deterministic_failure(monkeypatch):

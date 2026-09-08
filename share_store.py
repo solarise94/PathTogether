@@ -100,6 +100,9 @@ _PUBLIC_NAMES = (
     "list_run_grants_for_session",
     "bind_run_grant_session",
     "list_run_grants",
+    # —— 会话级「允许 AI 描绘」开关镜像（0039 / P1-4） ——
+    "get_ai_session_drawing_flag",
+    "upsert_ai_session_drawing_flag",
 )
 
 import share_store_pg as _pg

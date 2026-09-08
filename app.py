@@ -2018,10 +2018,11 @@ def _validate_annotation_points(safe, typ, body):
         points 与 x/y/side_px 兼容 bbox）；
       - err 非 None 时为 (message, details)，调用方一律 400（绝不静默裁剪/
         降采样/改点序）。
-    授权说明（review-2026-09-06 P1-1）：AI 描绘的会话级开关由 HistoPilot
-    裁剪+纵深拒绝（关闭时 sidecar 不组装工具、execute 再拒、不触达平台）；
-    平台侧按既有通道鉴权（internal token / plugin token + run grant 绑定
-    session）与几何校验放行，不做会话开关查询。
+    授权说明（review-2026-09-06 P1-1 / review-2026-09-07 P1-4）：AI 描绘的
+    会话级开关权威在 HistoPilot（裁剪+纵深拒绝，关闭时 sidecar 不组装工具、
+    execute 再拒、不触达平台）；平台侧本函数只做几何校验——**开关复核在
+    plugin v1 写入口查本地镜像表（ai_session_drawing_flags，0039）**，legacy
+    internal 通道仍按既有 internal token 鉴权放行（见该端点注释）。
     """
     if body.get("width_px") is not None or body.get("height_px") is not None \
             or body.get("side_px") is not None:
@@ -2046,6 +2047,67 @@ def _validate_annotation_points(safe, typ, body):
                 {"point": p, "slide_level0": {"width": slide_w, "height": slide_h}},
             )
     return norm, None
+
+
+def _parse_snapshot_provenance(body, require_snapshot_id=False):
+    """P1-5：解析描绘请求的来源快照溯源字段（wire 口径与 HP 发送侧一致）。
+
+    字段（全部来自请求体；不与 grant 冲突——session/用户归属仍以 grant 为准）：
+      - snapshot_id：来源快照 id（HP pending snapshot_review 的服务端绑定值）。
+        polygon 必填（缺/空 → err）；freehand 可选。
+      - snapshot_bbox：快照 level-0 外接框 {x,y,w,h}（可选；给出必须是有限
+        数值四键 dict，畸形 → err）。
+      - render_context_fingerprint：快照显示上下文指纹（可选 str，空串视为
+        未给）。
+      - slide_revision：快照抓取时的切片资产 revision（mtime:size 权威口径；
+        可选 str）。
+
+    返回 (prov, err)：prov 为**只含合法给出字段**的 dict（直接并入 provenance）；
+    err 非 None 时为 message（调用方一律 400 invalid_request，不落库）。
+    任何字段都不静默改写/补齐——无法核验的形态直接拒绝（fail closed）。
+    """
+
+    def _opt_str(key):
+        v = body.get(key)
+        if v is None:
+            return None, None
+        if not isinstance(v, str):
+            return None, "%s 需为字符串" % key
+        v = v.strip()
+        if not v:
+            return None, None  # 空串与缺省同义（不持久化空溯源）
+        return v, None
+
+    prov = {}
+    sid = body.get("snapshot_id")
+    if sid is not None and not isinstance(sid, str):
+        return None, "snapshot_id 需为字符串"
+    sid = (sid or "").strip()
+    if sid:
+        prov["snapshot_id"] = sid
+    elif require_snapshot_id:
+        return None, "描绘缺少 snapshot_id（必须可追溯到来源快照；HP 侧 draw_suspicious_region 应携带）"
+
+    bbox = body.get("snapshot_bbox")
+    if bbox is not None:
+        if not isinstance(bbox, dict):
+            return None, "snapshot_bbox 需为 {x,y,w,h} 对象"
+        clean = {}
+        for k in ("x", "y", "w", "h"):
+            v = bbox.get(k)
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v):
+                return None, "snapshot_bbox.%s 需为有限数值" % k
+            clean[k] = v
+        prov["snapshot_bbox"] = clean
+
+    for key in ("render_context_fingerprint", "slide_revision"):
+        val, err = _opt_str(key)
+        if err is not None:
+            return None, err
+        if val is not None:
+            prov[key] = val
+    return prov, None
 
 
 # --------------------------------------------------------------------------- #
@@ -14786,6 +14848,26 @@ def plugin_v1_annotate(slide):
                              "run grant 无效（%s）" % reason)
     # verify 通过后原量再取一次供 provenance 用（竞态消失则按空 dict 降级）
     grant = share_store.get_run_grant(grant_id) or {}
+    # session_id 已在 verify 前解析；body 缺省时回退 grant 的绑定 session
+    # （expect_session 校验已保证二者相等，见上方 _verify_run_grant）。
+    session_id = session_id or grant.get("session_id") or ""
+
+    # P1-4（review-2026-09-07）：AI 描绘写端复核——平台本地镜像授权，不在写
+    # 路径同步回调 HP。H 批次把开关裁剪放在 HistoPilot 侧（工具不装配+纵深
+    # 拒绝），但旧 sidecar / 伪造重放可绕过 HP 直捅本端点写 polygon。修法：
+    # 代理路由（/api/ai/session/<sid>/drawing）在 HP 成功后把权威布尔 upsert
+    # 进镜像表（ai_session_drawing_flags，0039）；本写入口对 polygon|freehand
+    # 查镜像——**无行或 false 一律 403 ai_drawing_disabled（fail closed）**，
+    # 不落库。矩形路径（create_annotation）不受此闸影响；人类分享页 polygon
+    # （share 端点）同样不受影响。
+    body_type = body.get("type")
+    if body_type in ("polygon", "freehand"):
+        mirror_flag = share_store.get_ai_session_drawing_flag(session_id)
+        if mirror_flag is not True:
+            return _plugin_error(
+                403, "ai_drawing_disabled",
+                "本会话未开启「允许 AI 描绘」（或平台无其开启记录）；描绘写入被拒绝",
+                details={"session_id": session_id})
 
     label = body.get("label")
     if not isinstance(label, str) or not label.strip():
@@ -14806,14 +14888,23 @@ def plugin_v1_annotate(slide):
             return None
 
     # H（AI 描绘）：type=polygon|freehand 时走点列路径（3~500 点；polygon 额外
-    # 做 ≥3 不同顶点/非零面积/拒绝自交校验），不再走矩形 parser。授权仍由上方
-    # run grant（绑定 session）把关；会话级开关由 HistoPilot 侧裁剪+纵深拒绝。
-    body_type = body.get("type")
+    # 做 ≥3 不同顶点/非零面积/拒绝自交校验），不再走矩形 parser。授权由上方
+    # run grant（绑定 session）+ 镜像开关（P1-4）双重把关。
     points_norm = None
     if body_type in ("polygon", "freehand"):
+        # P1-5（review-2026-09-07）：来源快照溯源。描绘必须可追溯到模型看到
+        # 的那张快照——polygon 缺 snapshot_id 直接 400（不落库，不给静默降级）；
+        # 其余溯源字段（snapshot_bbox / render_context_fingerprint /
+        # slide_revision）可选，但**给出即校验形态**（畸形 400，绝不把垃圾
+        # 持久化进 provenance）。freehand 为既有描图类型，溯源字段可选。
+        snap_prov, serr = _parse_snapshot_provenance(body, require_snapshot_id=(body_type == "polygon"))
+        if serr is not None:
+            return _plugin_error(400, "invalid_request", serr)
         points_norm, perr = _validate_annotation_points(safe, body_type, body)
         if perr is not None:
             return _plugin_error(400, "invalid_request", perr[0], details=perr[1])
+    else:
+        snap_prov = {}
 
     if points_norm is None:
         x = _parse_num("x")
@@ -14835,9 +14926,8 @@ def plugin_v1_annotate(slide):
             return _plugin_error(400, "invalid_request", reject[0], details=reject[1])
     note = body.get("note") or ""
     effect_key = body.get("effect_key") or body.get("idempotency_key") or ""
-    # session_id 已在 verify 前解析：grant 绑定校验（expect_session）通过后，
-    # 这里不再回退 grant.session_id（二者已被强制相等）。
-    session_id = session_id or grant.get("session_id") or ""
+    # session_id 已在 grant 校验后解析（body 缺省回退 grant 绑定 session，
+    # 见上方 P1-4 闸门前）。
 
     expected_asset_revision = body.get("expected_asset_revision")
     if expected_asset_revision is not None and str(expected_asset_revision) != "":
@@ -14852,7 +14942,9 @@ def plugin_v1_annotate(slide):
         return _plugin_error(403, "forbidden", "切片所在项目已归档，只读")
 
     # AI 溯源子对象（§6.4）：created_by_user_id 从 grant 来；plugin_id/version
-    # 回查 installation；请求体同名字段不采信。
+    # 回查 installation；请求体同名字段（created_by_user_id 等）不采信。
+    # P1-5：描绘（点列路径）并入来源快照溯源字段（_parse_snapshot_provenance
+    # 已做形态校验；缺 snapshot_id 的 polygon 在上方已被 400 拒绝）。
     installation = share_store.get_plugin_installation(claims.get("sub") or "") or {}
     provenance = {
         "plugin_id": installation.get("plugin_id") or "histopilot",
@@ -14865,6 +14957,8 @@ def plugin_v1_annotate(slide):
         "slide_asset_revision": _legacy_slide_revision(safe),
         "idempotency_key": effect_key or "",
     }
+    if snap_prov:
+        provenance.update(snap_prov)
     try:
         if points_norm is not None:
             # H（AI 描绘）点列落库：source="ai" → review_status 默认 pending
@@ -16009,12 +16103,27 @@ def api_ai_session_drawing(session_id):
     开关默认关、只影响 HistoPilot 侧 draw_suspicious_region 的工具装配/执行，
     不改变任何平台写权限（只读/Demo profile 仍由 sidecar 兜底拒绝）。
     鉴权与 archive/unarchive 同款：owner 任意；user 仅自己名下会话。
+
+    P1-4（review-2026-09-07）：HP 返回成功（2xx 且含权威布尔 allow_ai_drawing）
+    后，把该值 upsert 进 PT 本地镜像表（ai_session_drawing_flags，0039）——
+    polygon/freehand 写入口据此复核开关，不再单方面信任 HP 侧裁剪。
+    HP 失败（非 2xx / 响应体缺权威布尔）**不改变镜像**（旧值保留，fail closed）。
     """
     auth = _require_ai_session_owner(session_id)
     if auth is not None:
         return auth
     body = request.get_json(silent=True) or {}
-    return _proxy_json("/session/{}/drawing".format(session_id), body)
+
+    def _on_response(status, parsed):
+        # 只在 HP 明确成功且响应体带权威布尔时镜像；其余情况一律不动镜像
+        # （503/404/畸形体都不推定开关状态——写入口对无行/非 true 均 fail closed）。
+        if status < 400 and isinstance(parsed, dict) \
+                and isinstance(parsed.get("allow_ai_drawing"), bool):
+            share_store.upsert_ai_session_drawing_flag(
+                session_id, parsed["allow_ai_drawing"])
+
+    return _proxy_json("/session/{}/drawing".format(session_id), body,
+                       on_response=_on_response)
 
 
 @app.route("/api/ai/session/<session_id>/stream")

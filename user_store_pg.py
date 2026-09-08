@@ -256,7 +256,7 @@ def create_user(login_id, password, role=ROLE_USER, display_name=None):
 
 
 def _insert_user_tx(cur, uid, norm_login, name, password, role, now,
-                    ai_access=True):
+                    ai_access=True, email=None):
     """在调用方事务的 cursor 内插入用户行，返回公共列 dict（不提交）。
 
     供 :func:`create_user` 与 :func:`create_user_with_total_allowance`
@@ -266,17 +266,22 @@ def _insert_user_tx(cur, uid, norm_login, name, password, role, now,
     0037：owner/admin 建号直接 active（activation_source='admin'）；
     注册新形态（email_verify_invite_activation）经 registration_store
     的 pending_activation 插入原语，不经本函数。
+    P1-3 收口（J：邮箱=唯一用户名）：``email`` 给定时（规范化邮箱）同步写
+    users.email / users.email_normalized；``email_verified_at`` 恒为 NULL
+    ——管理台建号不是邮箱验证通道，绝不伪造验证状态。缺省 None 保持既有
+    行为（owner bootstrap 等调用方零改动）。
     """
     cur.execute(
         "INSERT INTO users "
         "(user_id, login_id, display_name, password_hash, "
         " role, created_at, disabled, ai_access, "
-        " activation_state, activation_source, activation_updated_at) "
+        " activation_state, activation_source, activation_updated_at, "
+        " email, email_normalized) "
         "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), FALSE, %s, "
-        " 'active', 'admin', now()) "
+        " 'active', 'admin', now(), %s, %s) "
         "RETURNING " + _SEL_PUBLIC,
         (uid, norm_login, name, generate_password_hash(password), role,
-         now, bool(ai_access)),
+         now, bool(ai_access), email, email),
     )
     return cur.fetchone()
 
@@ -284,8 +289,13 @@ def _insert_user_tx(cur, uid, norm_login, name, password, role, now,
 def create_user_with_total_allowance(login_id, password, display_name=None,
                                      ai_access=True,
                                      total_limit_nano_cny=None,
-                                     actor_user_id=None):
+                                     actor_user_id=None, email=None):
     """**单个 PostgreSQL 事务**内：创建 role=user 用户 + 建总额度行 + audit。
+
+    ``email``（P1-3 收口，可选）：规范化邮箱——给定时同事务写入
+    users.email / users.email_normalized（email_verified_at 保持 NULL=
+    未验证）；缺省 None 行为不变（邮箱唯一身份由
+    users_email_identity_key 部分唯一索引兜底）。
 
     R3 Wave1-Money 单轨：原 ``platform_settings.user_spend_target`` 建号
     分叉已拆除——**每个 role=user 用户建号时必须**同事务建一次性总额度行
@@ -344,7 +354,7 @@ def create_user_with_total_allowance(login_id, password, display_name=None,
                             "系统维护中（cutover），暂禁止建号；请稍后重试")
                     row = _insert_user_tx(
                         cur, uid, norm_login, name, password, ROLE_USER, now,
-                        ai_access=ai_access)
+                        ai_access=ai_access, email=email)
                     # 单轨：恒建总额度行（显式 X 按面值；无 X 走 defaults
                     # 表；缺默认 fail-closed 拒绝建号），授权面与用户行
                     # 原子共生

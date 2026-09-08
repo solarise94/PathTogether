@@ -209,6 +209,13 @@ def test_schema_migrations_recorded(conn):
         # P1-1（review）发送不确定态：registration_mail_jobs.status 词表补
         # 'uncertain'（远端可能已接受，不自动重发，留人工核对）。
         "0038_mail_uncertain_state.sql",
+        # P1-4（review）AI 描绘写端平台复核：会话级开关的 PT 本地镜像表
+        # （ai_session_drawing_flags；权威在 HP，无行或 false 一律拒绝）。
+        "0039_ai_session_drawing_flags.sql",
+        # P1-3 身份收口（w1b）追加 0040_email_change_purpose.sql：幂等重建
+        # registration_mail_jobs.purpose CHECK 词表加 'email_change'
+        # （登录用户邮箱改绑闭环；payload 绑定 user_id，token 只存 hash）。
+        "0040_email_change_purpose.sql",
     ]
 
 

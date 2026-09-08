@@ -360,6 +360,103 @@ def test_proxy_disable_then_late_write_blocked(monkeypatch):
     assert _no_rois()
 
 
+def test_store_mirror_generation_cas(monkeypatch):
+    """三轮 review P1（0041）：generation 单调 + CAS 语义。
+
+    - 无条件 upsert 每次自增 generation 并返回；
+    - cas 到「未超越基线」生效（gen+1）、到「已被超越基线」no-op；
+    - cas 对无行 session 直接生效（首代）。
+    """
+    assert share_store.get_ai_session_drawing_generation("s-cas") == 0
+    g1 = share_store.upsert_ai_session_drawing_flag("s-cas", True)
+    assert g1 == 1
+    g2 = share_store.upsert_ai_session_drawing_flag("s-cas", False)
+    assert g2 == 2 and share_store.get_ai_session_drawing_flag("s-cas") is False
+    # 基线=2（未被超越）→ 生效
+    assert share_store.cas_ai_session_drawing_flag("s-cas", True, 2) is True
+    assert share_store.get_ai_session_drawing_flag("s-cas") is True
+    assert share_store.get_ai_session_drawing_generation("s-cas") == 3
+    # 基线=1（已被 gen=3 超越）→ no-op，值不变
+    assert share_store.cas_ai_session_drawing_flag("s-cas", False, 1) is False
+    assert share_store.get_ai_session_drawing_flag("s-cas") is True
+    assert share_store.get_ai_session_drawing_generation("s-cas") == 3
+    # 无行：直接生效（首代），基线 0
+    assert share_store.cas_ai_session_drawing_flag("s-cas-new", True, 0) is True
+    assert share_store.get_ai_session_drawing_flag("s-cas-new") is True
+    with pytest.raises(ValueError):
+        share_store.cas_ai_session_drawing_flag("s-cas", True, -1)
+
+
+def test_proxy_stale_open_response_cannot_override_later_close(monkeypatch):
+    """三轮 review P1 复现用例：开启请求在 HP 排队期间用户完成关闭（预写
+    false），晚到的开启成功响应（allow=true）必须被 CAS 作废——镜像保持
+    false，迟到 polygon 仍被写闸拒绝。"""
+    _mock_proxy_owner(monkeypatch)
+    c = _browser_client(app_mod.app)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)  # gen=1
+
+    def _delayed_open(body, q, h, k):
+        # 开启响应回程前，关闭请求已完成预写+确认（generation 超越开启基线）
+        close_gen = share_store.upsert_ai_session_drawing_flag("sess1", False)
+        assert close_gen == 2
+        assert share_store.cas_ai_session_drawing_flag("sess1", False, 2)
+        return FakeResponse(200, {"ok": True, "allow_ai_drawing": True})
+
+    fake = FakeRequests()
+    fake.register("POST", "/session/sess1/drawing", _delayed_open)
+    monkeypatch.setattr(app_mod, "requests", fake)
+    r = _proxy_toggle(c, enabled=True)
+    assert r.status_code == 200
+    # 关键：镜像未被旧开启响应写回 true
+    assert share_store.get_ai_session_drawing_flag("sess1") is False
+    # 迟到描绘仍被拒
+    _touch()
+    _mock_plugin_channel(monkeypatch, valid=True)
+    r2 = _post_polygon(c, effect_key="ek-late-stale-open", **_snap_prov())
+    assert r2.status_code == 403
+    assert r2.get_json()["error"]["code"] == "ai_drawing_disabled"
+    assert _no_rois()
+
+
+def test_proxy_stale_close_response_cannot_override_later_open(monkeypatch):
+    """对称反例：关闭请求响应回程前，更晚的开启已把镜像写 true——旧关闭
+    响应重申 false 也只能 CAS 到自己预写代，不得覆盖其后的 true。"""
+    _mock_proxy_owner(monkeypatch)
+    c = _browser_client(app_mod.app)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)   # gen=1
+
+    def _delayed_close(body, q, h, k):
+        # 关闭预写已完成（路由层 gen=2）；其后的开启请求 CAS 到基线 2 → true
+        assert share_store.cas_ai_session_drawing_flag("sess1", True, 2) is True
+        return FakeResponse(200, {"ok": True, "allow_ai_drawing": False})
+
+    fake = FakeRequests()
+    fake.register("POST", "/session/sess1/drawing", _delayed_close)
+    monkeypatch.setattr(app_mod, "requests", fake)
+    r = _proxy_toggle(c, enabled=False)
+    assert r.status_code == 200
+    assert share_store.get_ai_session_drawing_flag("sess1") is True
+
+
+def test_proxy_open_baseline_read_failure_returns_503(monkeypatch):
+    """开启请求基线读取失败 → 503 且不转发 HP（不放大权限路径同样
+    fail-closed）。"""
+    _mock_proxy_owner(monkeypatch)
+    c = _browser_client(app_mod.app)
+    fake = _install_fake_sidecar(monkeypatch, status=200,
+                                 body={"ok": True, "allow_ai_drawing": True})
+
+    def _boom(sid):
+        raise RuntimeError("pg down")
+
+    monkeypatch.setattr(app_mod.share_store,
+                        "get_ai_session_drawing_generation", _boom)
+    r = _proxy_toggle(c, enabled=True)
+    assert r.status_code == 503
+    assert r.get_json()["code"] == "mirror_read_failed"
+    assert fake.calls == []
+
+
 def test_store_mirror_semantics(monkeypatch):
     """镜像存储语义：无行 None / false / true 可区分；upsert 幂等且可覆盖。"""
     assert share_store.get_ai_session_drawing_flag("nope") is None

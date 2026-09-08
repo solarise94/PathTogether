@@ -2337,9 +2337,12 @@ def get_ai_session_drawing_flag(session_id):
 
 
 def upsert_ai_session_drawing_flag(session_id, allow_ai_drawing):
-    """upsert session 的镜像开关（代理路由收到 HP 权威值后调用）。幂等。
+    """upsert session 的镜像开关（无条件写，generation 自增）。幂等值、不幂等代。
 
-    allow_ai_drawing 必须是布尔（代理侧已校验；这里再守一层）。返回 None。
+    allow_ai_drawing 必须是布尔（代理侧已校验；这里再守一层）。
+    返回写入后的 generation（int，从 1 起单调自增）——三轮 review P1：
+    关闭预写调用方以此作为响应回程 CAS 的基线；任何无条件写都会作废所有
+    携带更早基线的在途响应。
     """
     if not isinstance(session_id, str) or not session_id:
         raise ValueError("session_id 不能为空")
@@ -2351,11 +2354,65 @@ def upsert_ai_session_drawing_flag(session_id, allow_ai_drawing):
             with c.cursor() as cur:
                 cur.execute(
                     "INSERT INTO ai_session_drawing_flags "
-                    "(session_id, allow_ai_drawing, updated_at) "
-                    "VALUES (%s, %s, now()) "
+                    "(session_id, allow_ai_drawing, updated_at, generation) "
+                    "VALUES (%s, %s, now(), 1) "
                     "ON CONFLICT (session_id) DO UPDATE SET "
                     "allow_ai_drawing=EXCLUDED.allow_ai_drawing, "
-                    "updated_at=now()",
+                    "updated_at=now(), "
+                    "generation=ai_session_drawing_flags.generation+1 "
+                    "RETURNING generation",
                     (session_id, allow_ai_drawing))
+                return int(cur.fetchone()["generation"])
+    finally:
+        conn.close()
+
+
+def get_ai_session_drawing_generation(session_id):
+    """读镜像行 generation（三轮 review P1）。无行返回 0（第一代之前）。"""
+    if not isinstance(session_id, str) or not session_id:
+        return 0
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT generation FROM ai_session_drawing_flags "
+                    "WHERE session_id=%s", (session_id,))
+                row = cur.fetchone()
+                return int(row["generation"]) if row is not None else 0
+    finally:
+        conn.close()
+
+
+def cas_ai_session_drawing_flag(session_id, allow_ai_drawing, max_generation):
+    """CAS 写镜像：仅当当前 generation <= max_generation 才写入（gen+1）。
+
+    三轮 review P1：代理响应回程的唯一写入口——携带「请求发起时」的基线，
+    行已被更晚的请求（更高 generation）写入时 no-op。返回是否生效（bool）。
+    """
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id 不能为空")
+    if not isinstance(allow_ai_drawing, bool):
+        raise ValueError("allow_ai_drawing 需为布尔")
+    if isinstance(max_generation, bool) or not isinstance(max_generation, int) \
+            or max_generation < 0:
+        raise ValueError("max_generation 需为非负整数")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ai_session_drawing_flags "
+                    "(session_id, allow_ai_drawing, updated_at, generation) "
+                    "VALUES (%s, %s, now(), 1) "
+                    "ON CONFLICT (session_id) DO UPDATE SET "
+                    "allow_ai_drawing=EXCLUDED.allow_ai_drawing, "
+                    "updated_at=now(), "
+                    "generation=ai_session_drawing_flags.generation+1 "
+                    "WHERE ai_session_drawing_flags.generation <= %s "
+                    "RETURNING generation",
+                    (session_id, allow_ai_drawing, max_generation))
+                row = cur.fetchone()
+                return row is not None
     finally:
         conn.close()

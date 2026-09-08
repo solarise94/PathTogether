@@ -16281,32 +16281,64 @@ def api_ai_session_drawing(session_id):
     PT 残留旧 true 时，迟到/重放的 plugin v1 与 legacy internal 写入仍会
     通过写端闸门。开启方向不变：HP 明确成功（2xx + 权威布尔且与请求方向
     一致）后才置 true；失败不镜像（写入口对无行/非 true 均 fail closed）。
+    P1（三轮 review，0041）：并发乱序防护——并发开启/关闭时，旧的成功响应
+    晚于其后请求的写入到达，按响应值直接 upsert 会把镜像写回与 HP 权威
+    状态相反的值（复现：HP 最终 false、晚到的开启响应把 PT 写回 true，
+    迟到描绘重新过闸）。镜像行加单调 generation：关闭预写=无条件写（gen+1，
+    作废一切在途旧响应）；开启/关闭的 on_response 只能 CAS 到**本请求发起
+    时**的 generation 基线，被其间任何写入超越即 no-op。
     """
     auth = _require_ai_session_owner(session_id)
     if auth is not None:
         return auth
     body = request.get_json(silent=True) or {}
+    want = body.get("enabled")
+    close_gen = None       # 关闭请求预写到的 generation（响应回程 CAS 基线）
+    open_base_gen = None   # 开启请求发起时读到的 generation 基线
 
     # 关闭预写（fail-closed 核心）：先收紧本地镜像，再让 HP 跟随。
-    if body.get("enabled") is False:
+    if want is False:
         try:
-            share_store.upsert_ai_session_drawing_flag(session_id, False)
+            close_gen = share_store.upsert_ai_session_drawing_flag(
+                session_id, False)
         except Exception:
             app.logger.exception(
                 "ai drawing 关闭预写镜像失败（session=%s）", session_id)
             return jsonify(error="描绘开关本地状态写失败，关闭请求已被拒绝",
                            code="mirror_write_failed"), 503
+    elif want is True:
+        # 开启先记基线：读失败同样 fail-closed（不转发，绝不事后放大权限）。
+        try:
+            open_base_gen = share_store.get_ai_session_drawing_generation(
+                session_id)
+        except Exception:
+            app.logger.exception(
+                "ai drawing 开启基线读取失败（session=%s）", session_id)
+            return jsonify(error="描绘开关本地状态读失败，开启请求已被拒绝",
+                           code="mirror_read_failed"), 503
 
     def _on_response(status, parsed):
-        # 只在 HP 明确成功、响应体带权威布尔、且与请求方向一致时镜像。
-        # 其余情况（503/404/畸形体/方向矛盾）一律不动镜像：关闭方向已由
-        # 预写收紧；开启方向失败最多留下保守的旧 false，不放大权限。
-        want = body.get("enabled")
-        if status < 400 and isinstance(parsed, dict) \
-                and isinstance(parsed.get("allow_ai_drawing"), bool) \
-                and parsed["allow_ai_drawing"] is want:
-            share_store.upsert_ai_session_drawing_flag(
-                session_id, parsed["allow_ai_drawing"])
+        # 只在 HP 明确成功、响应体带权威布尔、且与请求方向一致时镜像；
+        # 一律经 CAS 到本请求基线——并发乱序下旧响应被更晚的写入作废，
+        # 绝不直接 upsert（三轮 review P1）。
+        if not (status < 400 and isinstance(parsed, dict)
+                and isinstance(parsed.get("allow_ai_drawing"), bool)
+                and parsed["allow_ai_drawing"] is want):
+            return
+        try:
+            if want is False:
+                # 关闭方向：预写已收紧；重申也走 CAS——旧关闭响应不得覆盖
+                # 其后开启请求已写入的 true（gen 已超越本请求）。
+                share_store.cas_ai_session_drawing_flag(
+                    session_id, False, close_gen)
+            else:
+                # 开启方向：CAS 到发起基线——期间任何关闭预写（gen 自增）
+                # 已把本响应作废。
+                share_store.cas_ai_session_drawing_flag(
+                    session_id, True, open_base_gen)
+        except Exception:
+            app.logger.exception(
+                "ai drawing 镜像 CAS 失败（session=%s）", session_id)
 
     return _proxy_json("/session/{}/drawing".format(session_id), body,
                        on_response=_on_response)

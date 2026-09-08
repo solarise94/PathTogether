@@ -473,6 +473,25 @@ def test_discard_pending_deletes_orphan_and_audits(monkeypatch):
     assert r2.status_code == 404
 
 
+def test_discard_pending_requires_audit_actor(monkeypatch):
+    """三轮 review P2：物理删除不允许无审计调用——audit 必填且 actor_user_id
+    非空，DELETE 前拒绝（TypeError / DiscardPendingError，行不删）。"""
+    owner = _mk_owner()
+    orphan_uid = _mk_pending_bind_row()
+
+    # 缺参（签名必填）→ TypeError，绝不静默删
+    with pytest.raises(TypeError):
+        identity_store.discard_pending_activation(orphan_uid)
+    assert _user_row(orphan_uid) is not None
+    # actor 为空 → actor_missing，行不删
+    with pytest.raises(identity_store.DiscardPendingError) as ei:
+        identity_store.discard_pending_activation(
+            orphan_uid, audit={"actor_user_id": "", "actor_role": "owner"})
+    assert ei.value.code == "actor_missing"
+    assert _user_row(orphan_uid) is not None
+    del owner
+
+
 def test_discard_pending_rolls_back_when_audit_fails(monkeypatch):
     """二轮 review P2-2：审计与删除同一事务——审计写失败则删除整体回滚，
     杜绝「物理删除已生效但审计缺失」。"""

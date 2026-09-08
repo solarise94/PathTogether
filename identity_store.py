@@ -509,8 +509,12 @@ def list_identity_conflicts():
     return {"items": items, "counts": counts}
 
 
-def discard_pending_activation(user_id, audit=None):
+def discard_pending_activation(user_id, audit):
     """物理删除 orphan pending_activation 行（owner 显式处置；不自动夺取）。
+
+    audit 为**必填** ``{"actor_user_id": str, "actor_role": str}``（三轮
+    review P2：物理删除不允许无审计调用——缺参/actor 为空在删除前拒绝，
+    杜绝未来调用方绕过「受审计删除」不变量）。
 
     仅当账号同时满足：
       - ``activation_state = 'pending_activation'``；
@@ -534,6 +538,10 @@ def discard_pending_activation(user_id, audit=None):
     uid = str(user_id or "").strip()
     if not uid:
         raise DiscardPendingError("user_missing")
+    actor_uid = str(((audit or {}).get("actor_user_id")) or "").strip()
+    if not actor_uid:
+        # DELETE 前拒绝：无 actor 的物理删除不进任何事务
+        raise DiscardPendingError("actor_missing")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -555,12 +563,12 @@ def discard_pending_activation(user_id, audit=None):
                     raise DiscardPendingError("has_dependents") from exc
                 if (cur.rowcount or 0) != 1:
                     raise DiscardPendingError("user_missing")
-                if audit is not None:
-                    import share_store_pg
-                    share_store_pg.record_audit_tx(
+                import share_store_pg
+                share_store_pg.record_audit_tx(
                         cur, "user.pending_discard",
-                        actor_user_id=audit.get("actor_user_id") or None,
-                        actor_role=audit.get("actor_role") or "owner",
+                        actor_user_id=actor_uid,
+                        actor_role=str(audit.get("actor_role") or "").strip()
+                        or "owner",
                         target_type="user", target_id=uid,
                         detail={
                             "login_id_masked":

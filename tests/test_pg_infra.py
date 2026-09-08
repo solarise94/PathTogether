@@ -216,6 +216,9 @@ def test_schema_migrations_recorded(conn):
         # registration_mail_jobs.purpose CHECK 词表加 'email_change'
         # （登录用户邮箱改绑闭环；payload 绑定 user_id，token 只存 hash）。
         "0040_email_change_purpose.sql",
+        # 三轮 review P1：描绘开关镜像单调 generation——关闭预写自增、
+        # 代理响应只能 CAS 到发起基线（并发乱序旧响应不得覆盖新状态）。
+        "0041_ai_session_drawing_generation.sql",
     ]
 
 

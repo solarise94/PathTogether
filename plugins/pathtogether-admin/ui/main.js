@@ -35,6 +35,11 @@
      admin.users.identityConflicts（owner 只读清单）+ admin.users.discardPending
      （仅 pending_bind_synthetic 孤儿行可物理删除，不可逆；确认条 + 409 文案
      原样展示），其余冲突只报告、绝不自动合并/夺取账号。
+   2026-09-09（0.4.2）：设置页新增「平台默认模型」卡——admin.settings.model
+     （owner 只读：当前模型/provider/图片传输/允许集合 options）+
+     admin.settings.model.update（切换；限时模型保存前页内确认条提示到期，
+     transport 自动落回 inline 时成功文案含联动说明）；模型卡独立降级，
+     拉取失败显示「不可用」，不阻塞设置页其它卡。
    渲染只用 textContent / createElement（不拼 HTML，插件数据永不进标记）。
  ========================================================================= */
 (function () {
@@ -63,6 +68,11 @@
     // 设置页快照（批次 D §6.1）：admin.settings.get 的响应（含 spend
     // current_windows 的 demo/owner 窗口 CAS version）——仅内存。
     settingsSnapshot: null,
+    // 平台默认模型（0.4.2）：admin.settings.model 响应（model/provider_kind/
+    // image_transport/options）与独立降级错误——拉取失败只让模型卡显示
+    // 「不可用」，不阻塞设置页其它卡。
+    modelSnapshot: null,
+    modelError: null,
     // 费用页数据快照（KPI/告警条聚合用；仅内存）
     billOverview: null,
     billProviderBalance: null,
@@ -2036,6 +2046,78 @@
         retry: function () { loadSettingsPage(); },
       });
     });
+    // 平台默认模型（0.4.2）：独立拉取、独立降级——失败只让模型卡显示
+    // 「不可用」，不阻塞设置页其它卡（页级状态只跟 settings.get 走）。
+    loadDefaultModel(seq);
+  }
+
+  // 平台默认模型卡数据（0.4.2）：GET admin.settings.model，响应仅存内存；
+  // 代际校验与设置页同源（快速切页/刷新时迟到响应不写回）。
+  function loadDefaultModel(seq) {
+    request("admin.settings.model", {}).then(function (model) {
+      if (seq !== state.listSeq) return;
+      state.modelSnapshot = model || null;
+      state.modelError = null;
+      renderModelCard();
+    }).catch(function (err) {
+      if (seq !== state.listSeq) return;
+      state.modelSnapshot = null;
+      state.modelError = err || { code: "bridge_error" };
+      renderModelCard();
+    });
+  }
+
+  // 平台默认模型卡（0.4.2）：渲染 state.modelSnapshot / state.modelError。
+  // select 选项 = options 动态填充（label 含限时到期标注）；当前模型必须
+  // 命中 options（否则补一项禁用占位，不让保存按钮在非法值上可点）。
+  // kv 摘要展示当前模型/provider/图片传输与 transport 自动落回提示。
+  function renderModelCard() {
+    var sel = $("adm-model-select");
+    var info = $("adm-model-info");
+    var saveBtn = $("adm-model-save-btn");
+    var m = state.modelSnapshot;
+    if (info) {
+      info.textContent = "";
+      if (state.modelError) {
+        kvRow(info, "可用性",
+          "不可用（" + errText(state.modelError) + "）");
+      } else if (m) {
+        kvRow(info, "当前模型", m.model);
+        kvRow(info, "provider", m.provider_kind);
+        kvRow(info, "图片传输", m.image_transport);
+        kvRow(info, "传输联动",
+          "切到限时模型将自动落回 inline（服务端自动调整，无需手工改）");
+      }
+    }
+    if (sel) {
+      sel.textContent = "";
+      var opts = m && Array.isArray(m.options) ? m.options : [];
+      var sawCurrent = false;
+      opts.forEach(function (opt) {
+        if (!opt || typeof opt.model !== "string" || !opt.model) return;
+        var option = document.createElement("option");
+        option.value = opt.model;
+        var label = typeof opt.label === "string" && opt.label
+          ? opt.label : opt.model;
+        if (opt.expires_at) label += "（" + opt.expires_at + " 到期）";
+        option.textContent = label;
+        if (m && opt.model === m.model) sawCurrent = true;
+        sel.appendChild(option);
+      });
+      if (m && m.model && !sawCurrent) {
+        // 当前模型不在允许集合（异常快照兜底）：保留可见但禁选，防误保存
+        var keep = document.createElement("option");
+        keep.value = m.model;
+        keep.textContent = m.model + "（当前，不在允许集合）";
+        keep.disabled = true;
+        sel.appendChild(keep);
+      }
+      if (m && m.model) sel.value = m.model;
+    }
+    if (saveBtn) {
+      saveBtn.disabled = !!state.modelError || !m ||
+        !Array.isArray(m.options) || !m.options.length;
+    }
   }
 
   // §5.5：当前窗口小型摘要卡只回答「额度 / 剩余」（Demo 一张、Owner 一张）
@@ -2190,6 +2272,10 @@
           " 分钟窗口（DEMO_IP_RATE_PER_MINUTE，≤0 关闭；非消费额度）");
       }
     }
+    // 平台默认模型卡（0.4.2）：数据来自独立的 admin.settings.model 请求
+    //（loadDefaultModel），此处按当前快照/降级态渲染；模型响应到达后再
+    // 重渲染一次（不阻塞其它卡的呈现时序）。
+    renderModelCard();
   }
 
   function saveRegistrationMode() {
@@ -2206,6 +2292,51 @@
         showError(err && err.code, err && err.message);
         setStatus("adm-regmode-status", errText(err));
       });
+  }
+
+  // 平台默认模型切换（0.4.2）：PUT body 原样 {model}。限时模型保存前页内
+  // 确认条提示到期（取消不发任何请求）；成功文案在 transport_adjusted=true
+  // 时说明服务端已自动落回 inline；失败 errText 原样展示（400 invalid_request
+  // =模型不在服务端允许集合）；成功后整页刷新（settings.get + model 重拉）。
+  function saveDefaultModel() {
+    var sel = $("adm-model-select");
+    var model = sel ? String(sel.value || "") : "";
+    var m = state.modelSnapshot;
+    if (state.modelError || !m) {
+      setStatus("adm-model-status", "平台默认模型暂不可用（无法切换）");
+      return;
+    }
+    if (!model) {
+      setStatus("adm-model-status", "暂无可选模型");
+      return;
+    }
+    var currentOpt = null;
+    (Array.isArray(m.options) ? m.options : []).forEach(function (opt) {
+      if (opt && opt.model === model) currentOpt = opt;
+    });
+    var doSave = function () {
+      setStatus("adm-model-status", "保存中…");
+      request("admin.settings.model.update", { model: model }).then(function (res) {
+        var adjusted = !!(res && res.transport_adjusted);
+        setStatus("adm-model-status",
+          "默认模型已切换为 " + ((res && res.model) || model) +
+          (adjusted
+            ? "；该模型不支持 Files 传图，图片传输已自动落回 inline"
+            : "（即时生效于之后的 AI 会话）"));
+        loadSettingsPage();
+      }).catch(function (err) {
+        showError(err && err.code, err && err.message);
+        setStatus("adm-model-status", errText(err));
+      });
+    };
+    if (currentOpt && currentOpt.expires_at) {
+      askConfirm($("adm-model-confirm"),
+        "确认把平台默认模型切换为 " + model + "？该模型 " +
+        currentOpt.expires_at + " 到期，到期后需切回；切换即时生效于之后的 AI 会话。",
+        doSave);
+      return;
+    }
+    doSave();
   }
 
   function saveSpendPolicies() {
@@ -3343,6 +3474,7 @@
     });
     // 设置页（批次 D + wave 2）
     onClick("adm-regmode-save-btn", saveRegistrationMode);
+    onClick("adm-model-save-btn", saveDefaultModel); // 0.4.2 平台默认模型
     onClick("adm-spend-save-btn", saveSpendPolicies);
     onClick("adm-rt-save-btn", saveRuntimeLimits);
     onClick("adm-win-demo-adjust-btn", function () { adjustFixedWindow("demo"); });

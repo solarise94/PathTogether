@@ -525,6 +525,116 @@ def test_users_row_joins_turn_billing_last_call(monkeypatch):
     assert "total" not in owner_item["spend"]
     assert owner_item["spend"]["window"] is not None
 
+def test_settings_model_switch_limited_model():
+    """2026-09-09 限时模型批次：GET/PUT /api/admin/v1/settings/model。
+
+    - GET：当前模型 + 选项集合（限时模型带 expires_at、files_supported=False）；
+    - PUT 切限时模型：原子落盘 model，且 image_transport=deepseek_files
+      联动落回 inline（Files API 仅 vision-exp），api_key 不动；
+    - 审计 ai.default_model（from/to + transport 联动）；
+    - 非集合模型 400；切回 vision-exp 无联动。
+    """
+    owner, _u = _setup_users()
+    c = _login(_client(), owner)
+    cfg = {"base_url": app_mod.DEEPSEEK_BASE_URL,
+           "api_protocol": "openai",
+           "provider_kind": "deepseek_official",
+           "model": app_mod.DEEPSEEK_VISION_MODEL,
+           "api_key": "sk-test-official-key-000",
+           "image_transport": "deepseek_files",
+           "files_rollout_percent": 10}
+    app_mod._save_ai_config(cfg)
+
+    r = c.get("/api/admin/v1/settings/model")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["model"] == app_mod.DEEPSEEK_VISION_MODEL
+    assert body["provider_kind"] == "deepseek_official"
+    assert [o["model"] for o in body["options"]] == \
+        list(app_mod._DEEPSEEK_OFFICIAL_MODELS)
+    v41 = next(o for o in body["options"]
+               if o["model"] == app_mod.DEEPSEEK_V41_FLASH_MODEL)
+    assert v41["expires_at"] == "2026-09-10"
+    assert v41["files_supported"] is False
+    assert "sk-" not in r.get_data(as_text=True)  # 不回显 key
+
+    r = c.put("/api/admin/v1/settings/model",
+              json={"model": app_mod.DEEPSEEK_V41_FLASH_MODEL})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    body = r.get_json()
+    assert body["model"] == app_mod.DEEPSEEK_V41_FLASH_MODEL
+    assert body["transport_adjusted"] is True
+    assert body["image_transport"] == "inline"
+    cfg2 = app_mod._load_ai_config()
+    assert cfg2["model"] == app_mod.DEEPSEEK_V41_FLASH_MODEL
+    assert cfg2["image_transport"] == "inline"
+    assert cfg2.get("api_key") == "sk-test-official-key-000"  # key 不动
+
+    events = c.get(
+        "/api/admin/v1/audit?action=ai.default_model").get_json()["items"]
+    assert any(e["detail"].get("to_model") == app_mod.DEEPSEEK_V41_FLASH_MODEL
+               and e["detail"].get("transport_adjusted") is True
+               for e in events)
+
+    assert c.put("/api/admin/v1/settings/model",
+                 json={"model": "gpt-9"}).status_code == 400
+    assert c.put("/api/admin/v1/settings/model",
+                 json={"model": ""}).status_code == 400
+
+    r2 = c.put("/api/admin/v1/settings/model",
+               json={"model": app_mod.DEEPSEEK_VISION_MODEL})
+    assert r2.status_code == 200
+    assert r2.get_json()["transport_adjusted"] is False
+    assert app_mod._load_ai_config()["model"] == app_mod.DEEPSEEK_VISION_MODEL
+
+
+def test_limited_model_priced_same_as_vision_exp():
+    """0042：限时模型在两本 active 价格书中有价，且与 vision-exp 逐档一致
+    （owner 决策同价；hard 模式无价会 pricing_unavailable fail-closed）。"""
+    import billing_pricing
+    import _billing_helpers as bh
+    from datetime import datetime, timezone as tz
+    bh.seed_price_books()  # conftest TRUNCATE 清种子；重放 0018+0022+0042
+    conn = bh.connect()
+    try:
+        with conn.cursor() as cur:
+            for kind in ("provider_cost", "customer_charge"):
+                r_v41 = billing_pricing.find_active_rate(
+                    cur, kind, "deepseek",
+                    "deepseek-v4.1-flash-expires-on-0910",
+                    datetime(2026, 9, 9, 12, 0, tzinfo=tz.utc))
+                r_vis = billing_pricing.find_active_rate(
+                    cur, kind, "deepseek", "deepseek-v4-flash-vision-exp",
+                    datetime(2026, 9, 9, 12, 0, tzinfo=tz.utc))
+                assert r_v41 is not None, kind
+                assert r_vis is not None, kind
+                for k in ("cache_hit_nano_per_million",
+                          "cache_miss_nano_per_million",
+                          "output_nano_per_million"):
+                    assert r_v41[k] == r_vis[k], (kind, k)
+    finally:
+        conn.close()
+
+
+def test_provider_contract_limited_model_transport_matrix():
+    """官方契约：v4.1-flash 允许（inline）；v4.1-flash + deepseek_files 拒。"""
+    base = {"base_url": app_mod.DEEPSEEK_BASE_URL,
+            "api_protocol": "openai",
+            "provider_kind": "deepseek_official",
+            "api_key": "sk-test-official-key-000"}
+    ok_cfg = dict(base, model=app_mod.DEEPSEEK_V41_FLASH_MODEL,
+                  image_transport="inline")
+    assert app_mod._validate_provider_contract(ok_cfg, {}, None) is None
+    files_cfg = dict(base, model=app_mod.DEEPSEEK_V41_FLASH_MODEL,
+                     image_transport="deepseek_files")
+    err = app_mod._validate_provider_contract(files_cfg, {}, None)
+    assert err and "deepseek_files" in err
+    # vision-exp + files 仍合法（现状不回归）
+    legacy = dict(base, model=app_mod.DEEPSEEK_VISION_MODEL,
+                  image_transport="deepseek_files")
+    assert app_mod._validate_provider_contract(legacy, {}, None) is None
+
+
 def test_settings_runtime_endpoint_reads_and_writes_ai_safety():
     """批次 F：PUT /api/admin/v1/settings/runtime（五安全参数子集）。
 

@@ -219,6 +219,9 @@ def test_schema_migrations_recorded(conn):
         # 三轮 review P1：描绘开关镜像单调 generation——关闭预写自增、
         # 代理响应只能 CAS 到发起基线（并发乱序旧响应不得覆盖新状态）。
         "0041_ai_session_drawing_generation.sql",
+        # 2026-09-09 限时模型批次：v4.1-flash 计价行（与 vision-exp 同价，
+        # 从两本 active 书的 vision-exp 行原样复制）。
+        "0042_v41_flash_price_rows.sql",
     ]
 
 

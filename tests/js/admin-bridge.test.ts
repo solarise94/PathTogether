@@ -419,7 +419,12 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 		// 2026-09-08（review P2-2 产品闭环）：新增 users.identityConflicts
 		// （身份冲突清单，owner 只读 users:read）与 users.discardPending
 		// （孤儿 pending 行物理删除，不可逆，users:write），29 → 31
-		expect(Object.keys(table)).toHaveLength(31);
+		// 2026-09-09（0.4.2）：新增 settings.model（平台默认模型读，
+		// settings:read）与 settings.model.update（切换写，settings:write），
+		// 31 → 33
+		expect(Object.keys(table)).toHaveLength(33);
+		expect(table["admin.settings.model"]).toBe("admin:settings:read");
+		expect(table["admin.settings.model.update"]).toBe("admin:settings:write");
 		expect(table["admin.users.identityConflicts"]).toBe("admin:users:read");
 		expect(table["admin.users.discardPending"]).toBe("admin:users:write");
 		expect(table["admin.slides.inventory"]).toBe("admin:slides:read");

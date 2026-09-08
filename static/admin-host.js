@@ -44,6 +44,10 @@
    admin.siteStats.get（只读统计）与 admin.spend.userTotalLimit.set /
    admin.spend.userTotalLimit.restoreDefault（user 一次性总额度 CAS 写）；
    邀请与建号的金额字段切为 total_limit_nano_cny、邀请有效期切为 ttl_seconds。
+   2026-09-09（0.4.2）：平台默认模型查看/切换上桥——admin.settings.model
+   （GET /api/admin/v1/settings/model，settings:read）与
+   admin.settings.model.update（PUT 同路径 body {model}，settings:write）；
+   options 白名单与限时模型 transport 自动落回 inline 由服务端权威执行。
    ========================================================================= */
 (function () {
   "use strict";
@@ -124,6 +128,12 @@
     // 批次 F：运行时安全参数写（与 settings.update 同权限域；服务端
     // PUT /api/admin/v1/settings/runtime）
     "admin.settings.runtime.update": "admin:settings:write",
+    // 2026-09-09（0.4.2）：平台默认模型（owner-only，服务端
+    // GET/PUT /api/admin/v1/settings/model）。读与写都归 admin:settings 域
+    // （与统一设置页同级，不新开权限域）；服务端对每个端点独立 owner/CSRF
+    // 复核，桥层门只是纵深防御。
+    "admin.settings.model": "admin:settings:read",
+    "admin.settings.model.update": "admin:settings:write",
     "admin.spend.currentWindow.adjust": "admin:settings:write",
   };
 
@@ -281,6 +291,17 @@
         own_task_max_steps_limit: _budgetIntSpec(1),
         demo_max_concurrency: _budgetIntSpec(1),
       },
+      additionalProperties: false,
+    },
+    // 2026-09-09（0.4.2）：平台默认模型。读零参数；写只收必填 model 字符串
+    //（合法集合由服务端权威校验——options 之外的 model 由后端回 400
+    // invalid_request，桥层只挡空值/超长/非字符串与任意附加字段）。
+    "admin.settings.model": { properties: {}, additionalProperties: false },
+    "admin.settings.model.update": {
+      properties: {
+        model: { type: "string", minLength: 1, maxLength: 128 },
+      },
+      required: ["model"],
       additionalProperties: false,
     },
     // Batch B：注册 user 一次性总额度（绝对 limit，CAS，不清零已用）。
@@ -842,6 +863,19 @@
     // 原 turn-budgets PUT 已 410 turn_budgets_retired）
     "admin.settings.runtime.update": function (ctx, payload) {
       return jsonWrite("/api/admin/v1/settings/runtime", "PUT", payload)(ctx);
+    },
+
+    // 2026-09-09（0.4.2）：平台默认模型。读=GET 原样透传（model/
+    // provider_kind/image_transport/options）；写=PUT body 原样 {model}——
+    // 服务端负责 options 白名单校验（400 invalid_request）与限时模型的
+    // image_transport 自动落回 inline（响应 transport_adjusted=true 原样
+    // 透传给插件 UI 做联动提示）。
+    "admin.settings.model": jsonGet("/api/admin/v1/settings/model"),
+
+    "admin.settings.model.update": function (ctx, payload) {
+      return jsonWrite("/api/admin/v1/settings/model", "PUT", {
+        model: payload.model,
+      })(ctx);
     },
 
     // ---- PR5 修订（UI parity）：身份预览 + 插件管理（旧 /api/admin/* 端点，

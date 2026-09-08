@@ -7931,6 +7931,87 @@ def admin_v1_settings_runtime_put():
 # 复用 admin:overview:read 门控口径（_require_owner_admin_v1）；store 未随
 # 镜像发布（import 容错 None）→ 404 site_stats_unavailable。
 # --------------------------------------------------------------------------- #
+@app.route("/api/admin/v1/settings/model", methods=["GET"])
+def admin_v1_settings_model_get():
+    """平台默认模型现状 + 可切换选项（owner-only 只读）。
+
+    options 按允许集合（_DEEPSEEK_OFFICIAL_MODELS）给出 label/限时到期日/
+    Files 支持位；image_transport 供 UI 提示「切到限时模型时图片传输自动
+    落回 inline（Files API 仅 vision-exp）」。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    cfg = _load_ai_config()
+    labels = {
+        DEEPSEEK_VISION_MODEL: "DeepSeek v4-flash-vision-exp（常规默认，"
+                               "支持 Files API）",
+        DEEPSEEK_V41_FLASH_MODEL: "DeepSeek v4.1-flash（限时试用，"
+                                  "2026-09-10 到期）",
+    }
+    options = []
+    for m in _DEEPSEEK_OFFICIAL_MODELS:
+        item = {"model": m, "label": labels.get(m) or m,
+                "files_supported": m == DEEPSEEK_VISION_MODEL}
+        if m == DEEPSEEK_V41_FLASH_MODEL:
+            item["expires_at"] = "2026-09-10"
+        options.append(item)
+    return jsonify(
+        model=cfg.get("model") or "",
+        provider_kind=_effective_provider_kind(cfg),
+        image_transport=_effective_image_transport(cfg),
+        options=options,
+    )
+
+
+@app.route("/api/admin/v1/settings/model", methods=["PUT"])
+def admin_v1_settings_model_put():
+    """切换平台默认模型（owner-only；2026-09-09 限时模型批次）。
+
+    body {model}，须在官方允许集合内（否则 400）。原子落盘 ai_config.json：
+      - model ← 目标模型；
+      - 目标非 vision-exp 且当前 image_transport=deepseek_files 时，同步
+        落回 inline（Files API 仅 vision-exp；保留 files 配置会在官方契约
+        校验失败）——响应 transport_adjusted 说明该联动；
+      - 复用 _validate_provider_contract 对落盘候选整体校验（任一失败
+        400，不产生部分写入）。
+    审计 ai.default_model（from/to 模型名 + transport 联动），不改 api_key。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    body = request.get_json(silent=True) or {}
+    target = str(body.get("model") or "").strip()
+    if target not in _DEEPSEEK_OFFICIAL_MODELS:
+        return _admin_v1_error(
+            400, "invalid_request",
+            "model 须为 {} 之一".format(" / ".join(_DEEPSEEK_OFFICIAL_MODELS)))
+    cfg = _load_ai_config()
+    prev_model = cfg.get("model") or ""
+    prev_transport = _effective_image_transport(cfg)
+    transport_adjusted = False
+    cfg["model"] = target
+    if target != DEEPSEEK_VISION_MODEL \
+            and _effective_image_transport(cfg) == AI_IMAGE_TRANSPORT_DEEPSEEK_FILES:
+        cfg["image_transport"] = AI_IMAGE_TRANSPORT_INLINE
+        transport_adjusted = True
+    # 复用官方契约校验（对落盘候选整体判定；含 Fernet/0600 安全门禁）
+    contract_err = _validate_provider_contract(cfg, {"model": target}, None)
+    if contract_err:
+        return _admin_v1_error(400, "invalid_request", contract_err)
+    _save_ai_config(cfg)
+    _audit("ai.default_model", target_type="settings", target_id="model",
+           detail={"from_model": prev_model, "to_model": target,
+                   "transport_adjusted": transport_adjusted,
+                   "from_transport": prev_transport})
+    return jsonify(
+        model=target,
+        image_transport=_effective_image_transport(cfg),
+        transport_adjusted=transport_adjusted,
+        ok=True,
+    )
+
+
 @app.route("/api/admin/v1/site-stats", methods=["GET"])
 def admin_v1_site_stats():
     """站点访问统计（Batch D2；owner-only 只读透传 site_stats_store.dashboard_stats）。"""
@@ -12664,6 +12745,11 @@ _AI_PROVIDER_KINDS = (AI_PROVIDER_GENERIC, AI_PROVIDER_DEEPSEEK_OFFICIAL)
 # 官方模式 canonical 值（§4.1 原子校验的唯一合法取值；base URL 不带 /v1）
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_VISION_MODEL = "deepseek-v4-flash-vision-exp"
+# 官方限时模型（2026-09-09 实测：官方直连可调、支持图片输入，但 /models
+# 不列出；2026-09-10 到期）。Files API（image_transport=deepseek_files）
+# 仍仅限 vision-exp（file_id 引用语义未对该模型验证）。
+DEEPSEEK_V41_FLASH_MODEL = "deepseek-v4.1-flash-expires-on-0910"
+_DEEPSEEK_OFFICIAL_MODELS = (DEEPSEEK_VISION_MODEL, DEEPSEEK_V41_FLASH_MODEL)
 # image_transport：inline（图片 base64 内联，首次部署默认）/ deepseek_files
 # （Files API 引用 file_id；仅官方 OpenAI 协议 + vision-exp 模型允许）
 AI_IMAGE_TRANSPORT_INLINE = "inline"
@@ -12813,9 +12899,9 @@ def _validate_provider_contract(cfg, pending, key_action):
                     .format(DEEPSEEK_BASE_URL))
         if proto != "openai":
             return "provider_kind=deepseek_official 时 api_protocol 必须为 openai"
-        if model != DEEPSEEK_VISION_MODEL:
-            return ("provider_kind=deepseek_official 时 model 必须为 {}"
-                    .format(DEEPSEEK_VISION_MODEL))
+        if model not in _DEEPSEEK_OFFICIAL_MODELS:
+            return ("provider_kind=deepseek_official 时 model 必须为 {} 之一"
+                    .format(" / ".join(_DEEPSEEK_OFFICIAL_MODELS)))
         if not str(merged.get("api_key") or "").strip():
             return ("provider_kind=deepseek_official 需要非空 api_key"
                     "（随本批提交或已加密保存）")

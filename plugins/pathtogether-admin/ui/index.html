@@ -391,8 +391,9 @@
           </section>
         </section>
 
-        <!-- 设置：注册模式 / 金额策略（三键拆分 + Demo/Owner 立即调整折叠 +
-             enforcement 折叠危险开关）/ 当前窗口摘要卡（Demo/Owner）/ 运行时参数 -->
+        <!-- 设置：注册模式 / 平台默认模型（0.4.2：查看与切换）/ 金额策略
+             （三键拆分 + Demo/Owner 立即调整折叠 + enforcement 折叠危险开关）/
+             当前窗口摘要卡（Demo/Owner）/ 运行时参数 -->
         <section class="adm-page" id="adm-page-settings" hidden>
           <div class="adm-state" id="adm-state-settings" data-page-state="idle" role="status" aria-live="polite"></div>
           <section class="adm-card">
@@ -415,6 +416,26 @@
             </div>
             <p class="adm-status" id="adm-regmode-status"></p>
             <dl id="adm-regmode-info" class="adm-kv"></dl>
+          </section>
+          <!-- 0.4.2：平台默认模型（owner-only）：查看当前模型/provider/图片
+               传输并切换；选项由服务端允许集合动态下发，切换即时生效于之后
+               的 AI 会话；限时模型带到期标注，保存前页内确认条提示到期 -->
+          <section class="adm-card" id="adm-model-card">
+            <h2>平台默认模型</h2>
+            <p class="adm-note">平台默认模型只作用于之后的 AI 会话（进行中的会话不受影响）。限时模型在选项中标注到期日，到期后需切回正式模型；当前若经 Files API 传图，切到不支持 Files 的模型时服务端自动落回 inline 传图。</p>
+            <div class="adm-form" id="adm-model-form">
+              <div class="adm-field">
+                <label class="adm-field-label" for="adm-model-select">默认模型</label>
+                <select id="adm-model-select" aria-describedby="adm-model-help"></select>
+                <small class="adm-field-help" id="adm-model-help">选项为服务端允许集合；保存写审计，即时生效于之后的新 AI 会话</small>
+              </div>
+              <div class="adm-form-actions">
+                <button type="button" id="adm-model-save-btn" class="adm-btn-primary">保存默认模型</button>
+              </div>
+            </div>
+            <p class="adm-status" id="adm-model-status"></p>
+            <div class="adm-confirm" id="adm-model-confirm" hidden></div>
+            <dl id="adm-model-info" class="adm-kv"></dl>
           </section>
           <section class="adm-card">
             <h2>消费额度策略（输入按 CNY 精确换算为 nano wire）</h2>

@@ -104,6 +104,7 @@ _PUBLIC_NAMES = (
     "get_ai_session_drawing_flag",
     "upsert_ai_session_drawing_flag",
     "get_ai_session_drawing_generation",
+    "reserve_ai_session_drawing_generation",
     "cas_ai_session_drawing_flag",
 )
 

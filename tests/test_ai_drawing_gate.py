@@ -434,9 +434,9 @@ def test_proxy_superseded_toggle_returns_409(monkeypatch):
     assert share_store.get_ai_session_drawing_flag("sess1") is False
 
 
-def test_proxy_close_cas_failure_still_succeeds(monkeypatch):
-    """关闭重申 CAS 抛错仍透传成功：预写已收紧（本地权威 false），安全
-    方向不给用户报错。"""
+def test_proxy_close_cas_failure_returns_503(monkeypatch):
+    """五轮 P2：关闭重申 CAS 抛错 → 一律 503（镜像状态未知不得报成功；
+    此前「预写已收紧即透传」属残余洞——预写后可能已有并发写）。"""
     _mock_proxy_owner(monkeypatch)
     c = _browser_client(app_mod.app)
     share_store.upsert_ai_session_drawing_flag("sess1", True)
@@ -449,7 +449,9 @@ def test_proxy_close_cas_failure_still_succeeds(monkeypatch):
     monkeypatch.setattr(app_mod.share_store, "cas_ai_session_drawing_flag",
                         _boom)
     r = _proxy_toggle(c, enabled=False)
-    assert r.status_code == 200
+    assert r.status_code == 503
+    assert r.get_json()["code"] == "mirror_write_failed"
+    # 预写仍已生效（本地收紧不受影响），用户刷新/重试即可对齐
     assert share_store.get_ai_session_drawing_flag("sess1") is False
 
 
@@ -489,10 +491,11 @@ def test_proxy_stale_open_response_cannot_override_later_close(monkeypatch):
     share_store.upsert_ai_session_drawing_flag("sess1", True)  # gen=1
 
     def _delayed_open(body, q, h, k):
-        # 开启响应回程前，关闭请求已完成预写+确认（generation 超越开启基线）
+        # 开启响应回程前，关闭请求已完成预写+确认（generation 超越开启
+        # 占代：开启 reserve 占 2，关闭预写占 3 并重申生效至 4）
         close_gen = share_store.upsert_ai_session_drawing_flag("sess1", False)
-        assert close_gen == 2
-        assert share_store.cas_ai_session_drawing_flag("sess1", False, 2)
+        assert close_gen == 3
+        assert share_store.cas_ai_session_drawing_flag("sess1", False, 3)
         return FakeResponse(200, {"ok": True, "allow_ai_drawing": True})
 
     fake = FakeRequests()
@@ -534,9 +537,85 @@ def test_proxy_stale_close_response_cannot_override_later_open(monkeypatch):
     assert share_store.get_ai_session_drawing_flag("sess1") is True
 
 
-def test_proxy_open_baseline_read_failure_returns_503(monkeypatch):
-    """开启请求基线读取失败 → 503 且不转发 HP（不放大权限路径同样
-    fail-closed）。"""
+def test_proxy_open_then_close_generations_strictly_increase(monkeypatch):
+    """五轮 P1 复现回归：开启与紧随的关闭必须拿到**不同**代（开启原子
+    占代）。旧行为 get+1 不落库——close 预写与 open 同代，HP 把后到的
+    关闭当同代旧请求丢弃 → PT=false / HP=true 分叉。"""
+    _mock_proxy_owner(monkeypatch)
+    c = _browser_client(app_mod.app)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)  # gen=1
+
+    fake = FakeRequests()
+
+    def _open_handler(body, q, h, k):
+        return FakeResponse(200, {"ok": True, "allow_ai_drawing": True})
+
+    def _close_handler(body, q, h, k):
+        return FakeResponse(200, {"ok": True, "allow_ai_drawing": False})
+
+    fake.register("POST", "/session/sess1/drawing", _open_handler)
+    monkeypatch.setattr(app_mod, "requests", fake)
+    assert _proxy_toggle(c, enabled=True).status_code == 200
+    open_gen = fake.calls[0]["body"]["drawing_generation"]
+
+    fake2 = FakeRequests()
+    fake2.register("POST", "/session/sess1/drawing", _close_handler)
+    monkeypatch.setattr(app_mod, "requests", fake2)
+    assert _proxy_toggle(c, enabled=False).status_code == 200
+    close_gen = fake2.calls[0]["body"]["drawing_generation"]
+
+    assert close_gen > open_gen  # 严格递增（旧代码 get+1 下两者相等 → 同代分叉）
+    assert share_store.get_ai_session_drawing_flag("sess1") is False
+
+
+def test_proxy_stale_current_read_failure_returns_503(monkeypatch):
+    """五轮 P2：CAS no-op（被取代）后读当前镜像值失败 → 503，绝不能被
+    代理层吞掉后透传 HP 200。"""
+    _mock_proxy_owner(monkeypatch)
+    c = _browser_client(app_mod.app)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)  # gen=1
+
+    def _delayed_open(body, q, h, k):
+        share_store.upsert_ai_session_drawing_flag("sess1", False)  # gen=2
+        return FakeResponse(200, {"ok": True, "allow_ai_drawing": True})
+
+    fake = FakeRequests()
+    fake.register("POST", "/session/sess1/drawing", _delayed_open)
+    monkeypatch.setattr(app_mod, "requests", fake)
+
+    real_cas = share_store.cas_ai_session_drawing_flag
+
+    def _cas_ok(sid, val, max_gen):
+        return False if real_cas(sid, val, max_gen) else False
+
+    monkeypatch.setattr(app_mod.share_store,
+                        "get_ai_session_drawing_flag",
+                        lambda sid: (_ for _ in ()).throw(
+                            RuntimeError("pg down")))
+    r = _proxy_toggle(c, enabled=True)
+    assert r.status_code == 503
+    assert r.get_json()["code"] == "mirror_read_failed"
+
+
+def test_store_reserve_generation_semantics(monkeypatch):
+    """reserve：原子占代、严格递增、不改 allow；无行时插 false（fail-closed）；
+    与 upsert 交错的代数全局唯一。"""
+    assert share_store.get_ai_session_drawing_flag("s-res") is None
+    g1 = share_store.reserve_ai_session_drawing_generation("s-res")
+    assert g1 == 1
+    assert share_store.get_ai_session_drawing_flag("s-res") is False  # 不放大
+    g2 = share_store.upsert_ai_session_drawing_flag("s-res", True)   # 占代 2
+    g3 = share_store.reserve_ai_session_drawing_generation("s-res")  # 占代 3
+    assert (g1, g2, g3) == (1, 2, 3)
+    assert share_store.get_ai_session_drawing_flag("s-res") is True  # upsert 值
+    # 连续 reserve 仍严格递增
+    g4 = share_store.reserve_ai_session_drawing_generation("s-res")
+    assert g4 == 4 and share_store.get_ai_session_drawing_flag("s-res") is True
+
+
+def test_proxy_open_reservation_failure_returns_503(monkeypatch):
+    """开启请求原子占代失败 → 503 且不转发 HP（不放大权限路径同样
+    fail-closed；五轮 P1 起开启经 reserve 原子占代）。"""
     _mock_proxy_owner(monkeypatch)
     c = _browser_client(app_mod.app)
     fake = _install_fake_sidecar(monkeypatch, status=200,
@@ -546,10 +625,10 @@ def test_proxy_open_baseline_read_failure_returns_503(monkeypatch):
         raise RuntimeError("pg down")
 
     monkeypatch.setattr(app_mod.share_store,
-                        "get_ai_session_drawing_generation", _boom)
+                        "reserve_ai_session_drawing_generation", _boom)
     r = _proxy_toggle(c, enabled=True)
     assert r.status_code == 503
-    assert r.get_json()["code"] == "mirror_read_failed"
+    assert r.get_json()["code"] == "mirror_write_failed"
     assert fake.calls == []
 
 

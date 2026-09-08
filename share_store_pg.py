@@ -2384,6 +2384,36 @@ def get_ai_session_drawing_generation(session_id):
         conn.close()
 
 
+def reserve_ai_session_drawing_generation(session_id):
+    """原子占用一个新的 generation（不改 allow 值）。返回占用到的代数（int）。
+
+    五轮 review P1：开启路径此前用 get_generation()+1 推算代数，与紧随的
+    关闭预写（无条件自增）可能拿到**同一代**——HP 会把后到的关闭当同代旧
+    请求丢弃，造成 PT=false / HP=true 分叉。开启与关闭现在都经原子分配
+    （本函数 / 预写 upsert）取得唯一递增代数；占代顺序即请求到达 PT 的顺序。
+    无行 session 首次占代插入 allow=false 行（fail-closed：正在开启中的会话
+    在写闸看来仍是关）。
+    """
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id 不能为空")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ai_session_drawing_flags "
+                    "(session_id, allow_ai_drawing, updated_at, generation) "
+                    "VALUES (%s, FALSE, now(), 1) "
+                    "ON CONFLICT (session_id) DO UPDATE SET "
+                    "updated_at=now(), "
+                    "generation=ai_session_drawing_flags.generation+1 "
+                    "RETURNING generation",
+                    (session_id,))
+                return int(cur.fetchone()["generation"])
+    finally:
+        conn.close()
+
+
 def cas_ai_session_drawing_flag(session_id, allow_ai_drawing, max_generation):
     """CAS 写镜像：仅当当前 generation <= max_generation 才写入（gen+1）。
 

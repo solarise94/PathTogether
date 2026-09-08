@@ -16392,16 +16392,18 @@ def api_ai_session_drawing(session_id):
             return jsonify(error="描绘开关本地状态写失败，关闭请求已被拒绝",
                            code="mirror_write_failed"), 503
     elif want is True:
-        # 开启的意图代数 = 当前基线 + 1（CAS 成功即写入该代）：读失败同样
-        # fail-closed（不转发，绝不事后放大权限）。
+        # 开启同样**原子占代**（五轮 review P1）：此前 get+1 推算与紧随关闭
+        # 的预写自增可能拿到同一代——HP 会把后到的关闭当同代旧请求丢弃，
+        # 造成 PT=false / HP=true 分叉。占代不改 allow（无行时插入 false，
+        # fail-closed），占代失败不转发（绝不事后放大权限）。
         try:
-            req_gen = share_store.get_ai_session_drawing_generation(
-                session_id) + 1
+            req_gen = share_store.reserve_ai_session_drawing_generation(
+                session_id)
         except Exception:
             app.logger.exception(
-                "ai drawing 开启基线读取失败（session=%s）", session_id)
-            return jsonify(error="描绘开关本地状态读失败，开启请求已被拒绝",
-                           code="mirror_read_failed"), 503
+                "ai drawing 开启占代失败（session=%s）", session_id)
+            return jsonify(error="描绘开关本地状态写失败，开启请求已被拒绝",
+                           code="mirror_write_failed"), 503
 
     # 第四轮 P1：意图代数随请求传 HP——HP 在 session lock 内拒绝低代请求，
     # 两端统一「高代赢」排序（此前 HP 按到达序、PT 按发起序，规则相反会
@@ -16416,28 +16418,34 @@ def api_ai_session_drawing(session_id):
                 and isinstance(parsed.get("allow_ai_drawing"), bool)
                 and parsed["allow_ai_drawing"] is want):
             return None
-        cas_max = req_gen if want is False else req_gen - 1
+        # CAS 基线 = 本请求原子占用到的代（开启经 reserve 占代、关闭经预写
+        # 占代；行被更晚请求超越即 no-op）。
         try:
             applied = share_store.cas_ai_session_drawing_flag(
-                session_id, want, cas_max)
+                session_id, want, req_gen)
         except Exception:
+            # 五轮 P2：镜像提交失败时状态未知——无论方向一律稳定 503，
+            # 绝不让浏览器把镜像未知的操作显示为成功（关闭方向此前透传
+            # HP 200 属残余洞）。
             app.logger.exception(
                 "ai drawing 镜像 CAS 失败（session=%s）", session_id)
-            if want is True:
-                # 开启未落到本地写闸：绝不能让浏览器以为已开启
-                return ({"error": "开关已在远端开启，但本地状态提交失败；"
-                                  "请重试开启",
-                         "code": "mirror_write_failed"}, 503)
-            # 关闭：预写已收紧（本地权威 false），安全方向，透传成功
-            return None
+            return ({"error": "开关本地镜像提交失败，状态未知；请刷新后重试",
+                     "code": "mirror_write_failed"}, 503)
         if not applied:
             # 意外 no-op：行已被更晚请求写入，本请求已被取代——稳定 409 +
-            # 当前镜像值（前端 epoch 机制只认最新请求的提示）
+            # 当前镜像值（当前值读取失败同样 fail-closed 503，不得透传成功）
+            try:
+                current = share_store.get_ai_session_drawing_flag(session_id)
+            except Exception:
+                app.logger.exception(
+                    "ai drawing 被取代后读取当前镜像失败（session=%s）",
+                    session_id)
+                return ({"error": "操作已被更新的开关请求取代，但当前状态"
+                                  "读取失败；请刷新",
+                         "code": "mirror_read_failed"}, 503)
             return ({"error": "操作已被更新的开关请求取代",
                      "code": "stale_generation",
-                     "allow_ai_drawing":
-                         share_store.get_ai_session_drawing_flag(session_id)},
-                    409)
+                     "allow_ai_drawing": current}, 409)
         return None
 
     return _proxy_json("/session/{}/drawing".format(session_id), wire_body,

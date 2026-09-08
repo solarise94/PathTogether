@@ -206,6 +206,9 @@ def test_schema_migrations_recorded(conn):
         # 唯一索引（pending+active）+ registration_mail_jobs 验证邮件队列
         # （存量 backfill active/legacy；不回填 @ login_id 为已验证邮箱）。
         "0037_identity_activation_email.sql",
+        # P1-1（review）发送不确定态：registration_mail_jobs.status 词表补
+        # 'uncertain'（远端可能已接受，不自动重发，留人工核对）。
+        "0038_mail_uncertain_state.sql",
     ]
 
 

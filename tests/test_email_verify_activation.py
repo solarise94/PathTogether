@@ -24,6 +24,7 @@ import stat
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -511,6 +512,136 @@ def test_activate_api_requires_enrollment_session():
     assert _activate_via_api(client, "some-code").status_code == 401
 
 
+# --------------------------------------------------------------------------- #
+# 4.5 P0-1：邀请码绑定邮箱校验（激活面）
+# --------------------------------------------------------------------------- #
+def _allowance_count(user_id):
+    conn = pg_store_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*)::int AS n FROM ai_spend_total_allowances "
+                "WHERE subject_id=%s", (user_id,))
+            return int(cur.fetchone()["n"])
+    finally:
+        conn.close()
+
+
+def _redeem_attempt_audit_status(invite_id):
+    """取该邀请码最近一条 redeem_attempt 审计的 status（真实原因核验用）。"""
+    conn = pg_store_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT detail FROM audit_events "
+                "WHERE action='registration.redeem_attempt' "
+                "AND target_id=%s ORDER BY ts DESC LIMIT 1", (invite_id,))
+            row = cur.fetchone()
+            return (row["detail"] or {}).get("status") if row else None
+    finally:
+        conn.close()
+
+
+def test_activate_invite_bound_match_succeeds_normalized(monkeypatch):
+    """P0-1：绑定匹配（大小写/空白归一后相等）→ 激活成功。"""
+    _open_email_mode(monkeypatch)
+    owner = _mk_owner()
+    # pending 用户邮箱带大小写/空白；规范化后与绑定值一致
+    user, _pw = _make_pending("  Bound-A@X.COM ")
+    inv = registration_store.create_invite(
+        owner["user_id"], login_id=" bound-a@X.com ",
+        total_limit_nano_cny=2 * 10 ** 9)
+    # 绑定值落库即规范化
+    assert registration_store.get_invite(inv["invite_id"])[
+        "login_id_normalized"] == "bound-a@x.com"
+    result = registration_store.activate_registered_user(
+        user["user_id"], inv["token"])
+    assert result["user"]["activation_state"] == "active"
+    updated = user_store.get_user(user["user_id"])
+    assert updated["activation_state"] == "active"
+    assert updated["activation_source"] == "invite"
+    # 面值额度照常建立
+    assert _allowance_count(user["user_id"]) == 1
+
+
+def test_activate_invite_bound_mismatch_rejected_and_not_consumed(monkeypatch):
+    """P0-1 红线：绑定给 Alice 的邀请码不能激活 Bob——整体回滚（邀请码不
+    消费、状态不变、不建额度），对外统一 403 文案，真实原因只进审计。"""
+    _open_email_mode(monkeypatch)
+    owner = _mk_owner()
+    _alice, _ = _make_pending("alice@x.com")
+    bob, _ = _make_pending("bob@x.com")
+    inv = registration_store.create_invite(owner["user_id"],
+                                           login_id="alice@x.com")
+    # store 层：InviteRedeemError（对外统一 code）
+    with pytest.raises(registration_store.InviteRedeemError) as ei:
+        registration_store.activate_registered_user(bob["user_id"],
+                                                    inv["token"])
+    assert ei.value.code == "invite_invalid_or_unavailable"
+    # 整体回滚三件套
+    row = registration_store.get_invite(inv["invite_id"])
+    assert row["use_count"] == 0 and row["consumed_at"] is None
+    assert user_store.get_user(bob["user_id"])[
+        "activation_state"] == "pending_activation"
+    assert _allowance_count(bob["user_id"]) == 0
+    # 审计行记录真实原因 bound_mismatch（对外不泄露）
+    assert _redeem_attempt_audit_status(inv["invite_id"]) == \
+        "activate:bound_mismatch"
+    # 绑定者本人随后仍可成功（码未被抢用）
+    registration_store.activate_registered_user(_alice["user_id"],
+                                                inv["token"])
+    assert registration_store.get_invite(inv["invite_id"])["use_count"] == 1
+    assert user_store.get_user(_alice["user_id"])["activation_state"] == \
+        "active"
+
+
+def test_activate_api_bound_mismatch_unified_403(monkeypatch):
+    """P0-1 API 面：绑定不匹配 → 403 统一 invite_invalid_or_unavailable
+    （反枚举：与无效码同文案同 code），且不消费。"""
+    _open_email_mode(monkeypatch)
+    owner = _mk_owner()
+    _alice, _ = _make_pending("alice@x.com")
+    bob, bob_pw = _make_pending("bob@x.com")
+    inv = registration_store.create_invite(owner["user_id"],
+                                           login_id="alice@x.com")
+    client = _client()
+    assert client.post("/login", data={"username": "bob@x.com",
+                                       "password": bob_pw}).status_code == 302
+    r = _activate_via_api(client, inv["token"])
+    assert r.status_code == 403
+    assert r.get_json()["code"] == "invite_invalid_or_unavailable"
+    assert registration_store.get_invite(inv["invite_id"])["use_count"] == 0
+    assert user_store.get_user(bob["user_id"])[
+        "activation_state"] == "pending_activation"
+
+
+def test_activate_bound_invite_only_bound_user_wins(monkeypatch):
+    """P0-1：两个 pending 用户抢同一绑定码——非绑定者先到被拒且不消费，
+    绑定者（大小写/空白归一匹配）随后成功；反向顺序只有绑定者成功。"""
+    _open_email_mode(monkeypatch)
+    owner = _mk_owner()
+    bound_user, _ = _make_pending("  Racer-A@X.COM ")
+    other, _ = _make_pending("racer-b@x.com")
+    inv = registration_store.create_invite(owner["user_id"],
+                                           login_id=" racer-a@x.com ")
+    # 顺序 A：非绑定者先到 → 拒绝、码不消费
+    with pytest.raises(registration_store.InviteRedeemError):
+        registration_store.activate_registered_user(other["user_id"],
+                                                    inv["token"])
+    assert registration_store.get_invite(inv["invite_id"])["use_count"] == 0
+    assert user_store.get_user(other["user_id"])[
+        "activation_state"] == "pending_activation"
+    # 顺序 B：绑定者（归一化匹配）后到 → 成功消费
+    registration_store.activate_registered_user(bound_user["user_id"],
+                                                inv["token"])
+    row = registration_store.get_invite(inv["invite_id"])
+    assert row["use_count"] == 1
+    assert row["consumed_by_user_id"] == bound_user["user_id"]
+    # 非绑定者仍未被波及
+    assert user_store.get_user(other["user_id"])[
+        "activation_state"] == "pending_activation"
+
+
 # =========================================================================== #
 # 5. I-R4：require_active_account 统一守卫
 # =========================================================================== #
@@ -558,9 +689,10 @@ def test_legacy_backfill_state_defaults_active():
 # =========================================================================== #
 # 6. 邮件：worker / fake / Agent Mail CLI / 配额
 # =========================================================================== #
-def test_worker_drains_with_fake_sender_and_body_has_link():
+def test_worker_drains_with_fake_sender_and_body_has_link(monkeypatch):
+    _open_email_mode(monkeypatch)  # P1-2：worker 排水前置=生效注册模式
     out = _enqueue("drain@x.com")
-    n = registration_mail_worker.drain_once()
+    n = registration_mail_worker.drain_once(sender=_fake())
     assert n == 1
     sent = _fake().sent
     assert len(sent) == 1
@@ -573,6 +705,7 @@ def test_worker_drains_with_fake_sender_and_body_has_link():
 
 
 def test_worker_unconfigured_sender_keeps_queued(monkeypatch):
+    _open_email_mode(monkeypatch)  # 模式生效后专测「通道未配置」分支
     out = _enqueue("q@x.com")
     monkeypatch.setattr(registration_mail_worker, "get_sender",
                         lambda environ=None: None)
@@ -663,6 +796,7 @@ def test_resend_quota_cooldown_hourly_daily(monkeypatch):
 
 
 def test_resend_api_unified_response(monkeypatch):
+    _open_email_mode(monkeypatch)  # P1-2：resend 写前查生效模式
     monkeypatch.setenv("PUBLIC_BASE_URL", BASE)
     app_mod.AUTH_ENABLED = True
     client = _client()
@@ -735,10 +869,27 @@ def test_sender_configured_production_ignores_fake():
     assert registration_mail_worker.sender_configured({}) is False
 
 
-class _FakeSmtp:
+class _ScriptedSmtp:
+    """docmd 级 smtplib.SMTP_SSL 替身：按类级脚本决定各阶段行为。
+
+    P1-1 阶段划分验证用：
+      - ``next_getreply_exc`` 非空 → getreply()（最终响应等待段）抛该异常，
+        模拟「远端已接受、本地等响应超时/断连」；
+      - ``next_final_code`` = 远端对整个事务的最终响应码（250=接受）；
+      - ``next_auth_exc`` 非空 → login 抛该异常（DATA 之前的确定失败）。
+    """
+
+    next_getreply_exc = None
+    next_final_code = 250
+    next_auth_exc = None
+    last = None  # 最后一个实例（断言信封与线上字节用）
+
     def __init__(self, *a, **k):
+        self.sent_data = b""
+        self.mail_from = None
+        self.rcpt_to = None
         self.logged = None
-        self.sent = None
+        _ScriptedSmtp.last = self
 
     def __enter__(self):
         return self
@@ -746,39 +897,394 @@ class _FakeSmtp:
     def __exit__(self, *a):
         return False
 
-    def login(self, user, password):
-        self.logged = (user, password)
-
-    def sendmail(self, frm, to, msg):
-        type(self).last = {"from": frm, "to": list(to), "msg": msg}
-
     def ehlo(self):
-        return None
+        return (250, b"greeting")
 
     def starttls(self, context=None):
-        return None
+        return (220, b"ready")
+
+    def login(self, user, password):
+        if _ScriptedSmtp.next_auth_exc is not None:
+            raise _ScriptedSmtp.next_auth_exc
+        self.logged = (user, password)
+
+    def docmd(self, cmd, arg=None):
+        c = str(cmd).upper()
+        if c == "MAIL":
+            self.mail_from = arg
+            return (250, b"ok")
+        if c == "RCPT":
+            self.rcpt_to = arg
+            return (250, b"ok")
+        if c == "DATA":
+            return (354, b"go ahead")
+        return (250, b"ok")
+
+    def send(self, data):
+        self.sent_data += data
+
+    def getreply(self):
+        if _ScriptedSmtp.next_getreply_exc is not None:
+            raise _ScriptedSmtp.next_getreply_exc
+        return (_ScriptedSmtp.next_final_code, b"done")
 
 
-def test_smtp_sender_sends_without_logging_password(monkeypatch):
-    import smtplib
-    monkeypatch.setattr(smtplib, "SMTP_SSL", _FakeSmtp)
-    sender = registration_mail_worker.SmtpMailSender({
+def _smtp_sender():
+    return registration_mail_worker.SmtpMailSender({
         "REGISTRATION_SMTP_HOST": "smtp.example.test",
         "REGISTRATION_SMTP_PORT": "465",
         "REGISTRATION_SMTP_USER": "bot@example.test",
         "REGISTRATION_SMTP_PASSWORD": "secret-auth-code",
         "REGISTRATION_SMTP_FROM": "bot@example.test",
     })
-    sender.send("user@example.com", "PathTogether · 验证邮箱", "hello")
-    rec = _FakeSmtp.last
-    assert rec["from"] == "bot@example.test"
-    assert rec["to"] == ["user@example.com"]
-    assert "PathTogether" in rec["msg"]
-    assert "secret-auth-code" not in rec["msg"]
+
+
+@pytest.fixture(autouse=True)
+def _scripted_smtp_state():
+    """每个用例前后复位 _ScriptedSmtp 类级脚本（防用例间泄漏）。"""
+    _ScriptedSmtp.next_getreply_exc = None
+    _ScriptedSmtp.next_final_code = 250
+    _ScriptedSmtp.next_auth_exc = None
+    yield
+    _ScriptedSmtp.next_getreply_exc = None
+    _ScriptedSmtp.next_final_code = 250
+    _ScriptedSmtp.next_auth_exc = None
+
+
+def test_smtp_sender_sends_without_logging_password(monkeypatch):
+    import base64
+    import smtplib
+    monkeypatch.setattr(smtplib, "SMTP_SSL", _ScriptedSmtp)
+    sender = _smtp_sender()
+    sender.send("user@example.com", "PathTogether · 验证邮箱",
+                "hello\n.leading dot line\nbye")
+    rec = _ScriptedSmtp.last
+    assert rec.mail_from == "FROM:<bot@example.test>"
+    assert rec.rcpt_to == "TO:<user@example.com>"
+    assert rec.logged == ("bot@example.test", "secret-auth-code")
+    # 解出 MIME 载荷（utf-8 → base64 传输编码）
+    _head, _, payload_b64 = rec.sent_data.partition(b"\r\n\r\n")
+    decoded = base64.b64decode(
+        payload_b64.replace(b"\r\n", b"")).decode("utf-8")
+    assert "hello" in decoded
+    assert ".leading dot line" in decoded
+    assert rec.sent_data.endswith(b".\r\n")
+    assert "secret-auth-code" not in rec.sent_data.decode("utf-8", "replace")
     with pytest.raises(registration_mail_worker.MailSenderUnavailable):
         registration_mail_worker.SmtpMailSender({
             "REGISTRATION_SMTP_HOST": "smtp.example.test",
         })
+
+
+def test_smtp_transmit_dot_quotes_leading_dots():
+    """线级点引用（与 smtplib.data 同款）：行首 '.' → '..'，结束符 '.' 收尾。"""
+    sender = _smtp_sender()
+    smtp = _ScriptedSmtp()
+    sender._transmit(smtp, "line1\n.top secret\nline2\r\n",
+                     "user@example.com", None)
+    wire = smtp.sent_data
+    assert b"\r\n..top secret" in wire
+    assert wire.endswith(b".\r\n")
+
+
+def test_smtp_uncertain_when_final_response_missing(monkeypatch):
+    """P1-1：DATA 结束符已写出、等最终响应期间本地超时 → 不确定（绝非
+    failed——远端可能已接受，按失败重试会重复发信）。"""
+    import smtplib
+    monkeypatch.setattr(smtplib, "SMTP_SSL", _ScriptedSmtp)
+    sender = _smtp_sender()
+    _ScriptedSmtp.next_getreply_exc = TimeoutError("local wait timeout")
+    with pytest.raises(
+            registration_mail_worker.MailSenderUncertainError) as ei:
+        sender.send("user@example.com", "s", "hello")
+    assert "smtp_final_response_missing" in str(ei.value)
+    # 不确定窗口边界证据：结束符已全部写出
+    assert _ScriptedSmtp.last.sent_data.endswith(b".\r\n")
+    # 子类关系：既有 MailSenderError 捕获方语义不变（worker 先捕 uncertain）
+    assert issubclass(registration_mail_worker.MailSenderUncertainError,
+                      registration_mail_worker.MailSenderError)
+
+
+def test_smtp_data_rejected_is_deterministic_failure(monkeypatch):
+    """远端明确回绝（收到最终非 250 响应）= 确定未发出 → 普通失败可重试。"""
+    import smtplib
+    monkeypatch.setattr(smtplib, "SMTP_SSL", _ScriptedSmtp)
+    sender = _smtp_sender()
+    _ScriptedSmtp.next_final_code = 452
+    with pytest.raises(registration_mail_worker.MailSenderError) as ei:
+        sender.send("user@example.com", "s", "hello")
+    assert not isinstance(
+        ei.value, registration_mail_worker.MailSenderUncertainError)
+    assert "smtp_data_rejected_452" in str(ei.value)
+
+
+def test_smtp_pre_data_failure_is_deterministic(monkeypatch):
+    """DATA 之前（认证）失败 = 确定未发出 → failed 可重试。"""
+    import smtplib
+    monkeypatch.setattr(smtplib, "SMTP_SSL", _ScriptedSmtp)
+    sender = _smtp_sender()
+    _ScriptedSmtp.next_auth_exc = smtplib.SMTPAuthenticationError(535, b"no")
+    with pytest.raises(registration_mail_worker.MailSenderError) as ei:
+        sender.send("user@example.com", "s", "hello")
+    assert not isinstance(
+        ei.value, registration_mail_worker.MailSenderUncertainError)
+    assert "smtp_auth_failed" in str(ei.value)
+
+
+# --------------------------------------------------------------------------- #
+# 6.5 P1-1：发送不确定态（uncertain）——worker 落状态 / 链接仍可验证 / 有界重试
+# --------------------------------------------------------------------------- #
+def _backdate_scheduled_by_token(token, seconds_ago=3600):
+    """把作业 scheduled_at 回填到过去（autocommit；出指数退避窗）。"""
+    conn = pg_store_connect()
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE registration_mail_jobs SET scheduled_at = now() - "
+                "(%s * interval '1 second') WHERE token_hash=%s",
+                (seconds_ago, registration_store.verify_token_hash(token)))
+    finally:
+        conn.close()
+
+
+class _UncertainAfterDataSender:
+    """模拟「远端已接受、本地等响应超时」的发送器（DATA 后抛 TimeoutError
+    类别，经 SmtpMailSender 阶段划分映射为 MailSenderUncertainError）。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def send(self, to, subject, body):
+        self.calls += 1
+        raise registration_mail_worker.MailSenderUncertainError(
+            "smtp_final_response_missing（TimeoutError）")
+
+
+class _AlwaysFailSender:
+    """确定未发出（DATA 之前失败类别）的发送器。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def send(self, to, subject, body):
+        self.calls += 1
+        raise registration_mail_worker.MailSenderError(
+            "smtp_connect_failed（ConnectionRefusedError）")
+
+
+def test_worker_uncertain_no_resend_and_link_still_verifiable(monkeypatch):
+    """P1-1 主线：远端接受后本地超时 → 作业 uncertain、收到的链接仍可验证
+    建号、worker 重跑不重复发送。"""
+    _open_email_mode(monkeypatch)
+    out = _enqueue("uncertain@x.com")
+    snd = _UncertainAfterDataSender()
+    assert registration_mail_worker.drain_once(sender=snd) == 0
+    row = _mail_job_row(out["token"])
+    assert row["status"] == "uncertain"          # 0038 词表含 uncertain
+    assert row["attempts"] == 1
+    assert "smtp_final_response_missing" in (row["last_error"] or "")
+    # worker 重跑：uncertain 不在领取范围 → 不重复发送
+    assert registration_mail_worker.drain_once(sender=snd) == 0
+    assert registration_mail_worker.drain_once(sender=_fake()) == 0
+    assert snd.calls == 1 and _fake().sent == []
+    # 用户手里「已收到」的链接仍可验证建号（有效期内 uncertain 一律放行）
+    assert registration_store.check_verify_token(out["token"])[
+        "state"] == "valid"
+    r = _client().post("/api/registration/verify",
+                       json={"token": out["token"],
+                             "password": "longpassword123"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    user = user_store.get_user_by_login_id("uncertain@x.com")
+    assert user is not None
+    assert user["activation_state"] == "pending_activation"
+    row = _mail_job_row(out["token"])
+    assert row["status"] == "consumed" and row["consumed_at"] is not None
+
+
+def test_uncertain_token_superseded_by_new_request(monkeypatch):
+    """P1-1：uncertain 作业持有的链接与新请求互斥——同邮箱重新入队即作废
+    （单活 token 红线对 uncertain 同样成立）。"""
+    _open_email_mode(monkeypatch)
+    out = _enqueue("sup@x.com")
+    snd = _UncertainAfterDataSender()
+    registration_mail_worker.drain_once(sender=snd)
+    assert _mail_job_row(out["token"])["status"] == "uncertain"
+    # 出 60s 冷却窗后重新入队（冷却以 job 行数计）
+    conn = pg_store_connect()
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE registration_mail_jobs SET created_at = now() - "
+                "interval '2 minutes' WHERE email_normalized='sup@x.com'")
+    finally:
+        conn.close()
+    out2 = _enqueue("sup@x.com")
+    assert _mail_job_row(out["token"])["status"] == "superseded"
+    # 旧（uncertain→superseded）链接失效；新链接可用
+    assert registration_store.check_verify_token(out["token"])[
+        "state"] == "unknown"
+    assert registration_store.check_verify_token(out2["token"])[
+        "state"] == "valid"
+
+
+def test_worker_failed_retry_backoff_then_success(monkeypatch):
+    """确定失败 → failed + 指数退避（scheduled_at 顺延、退避期内不重试）；
+    退避出窗后用正常 sender 重试成功。"""
+    _open_email_mode(monkeypatch)
+    out = _enqueue("retry@x.com")
+    snd = _AlwaysFailSender()
+    assert registration_mail_worker.drain_once(sender=snd) == 0
+    row = _mail_job_row(out["token"])
+    assert row["status"] == "failed" and row["attempts"] == 1
+    # 退避顺延（第 0 次失败 → +30s）
+    assert row["scheduled_at"] > datetime.now(timezone.utc)
+    # 退避期内不重试
+    assert registration_mail_worker.drain_once(sender=snd) == 0
+    assert snd.calls == 1
+    # 出退避窗 → 重试（仍失败，attempts=2，退避翻倍）
+    _backdate_scheduled_by_token(out["token"])
+    assert registration_mail_worker.drain_once(sender=snd) == 0
+    row = _mail_job_row(out["token"])
+    assert row["attempts"] == 2
+    assert row["scheduled_at"] > datetime.now(timezone.utc)
+    # 换正常 sender + 出退避窗 → 重试成功置 sent
+    _backdate_scheduled_by_token(out["token"])
+    assert registration_mail_worker.drain_once(sender=_fake()) == 1
+    row = _mail_job_row(out["token"])
+    assert row["status"] == "sent"
+    assert len(_fake().sent) == 1
+
+
+def test_worker_failed_retry_stops_at_attempts_cap(monkeypatch):
+    """attempts 达上限（5）后保持 failed 不再发送（回填退避窗也不领取）。"""
+    _open_email_mode(monkeypatch)
+    out = _enqueue("cap@x.com")
+    snd = _AlwaysFailSender()
+    for expected in range(1, registration_mail_worker._MAX_SEND_ATTEMPTS + 1):
+        if expected > 1:
+            _backdate_scheduled_by_token(out["token"])
+        assert registration_mail_worker.drain_once(sender=snd) == 0
+        row = _mail_job_row(out["token"])
+        assert row["attempts"] == expected
+        assert row["status"] == "failed"
+    assert snd.calls == registration_mail_worker._MAX_SEND_ATTEMPTS
+    # 超上限：出退避窗也不再领取（不再发送）
+    _backdate_scheduled_by_token(out["token"])
+    assert registration_mail_worker.drain_once(sender=snd) == 0
+    assert registration_mail_worker.drain_once(sender=_fake()) == 0
+    assert snd.calls == registration_mail_worker._MAX_SEND_ATTEMPTS
+    assert _fake().sent == []
+    row = _mail_job_row(out["token"])
+    assert row["status"] == "failed"
+    assert row["attempts"] == registration_mail_worker._MAX_SEND_ATTEMPTS
+
+
+# --------------------------------------------------------------------------- #
+# 6.9 P1-2：注册模式停机语义（写端点 + worker 排水）
+# --------------------------------------------------------------------------- #
+def _mail_job_count(email_norm):
+    conn = pg_store_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*)::int AS n FROM registration_mail_jobs "
+                "WHERE email_normalized=%s", (email_norm,))
+            return int(cur.fetchone()["n"])
+    finally:
+        conn.close()
+
+
+def test_activate_blocked_when_registration_closed(monkeypatch):
+    """P1-2：closed 下 activate 403 registration_closed，且邀请码不消费、
+    用户状态不变（只暂停）。"""
+    # 先配齐全部前置 env（token 哈希盐/载荷密钥全程稳定），再模拟停机：
+    # 存储模式 closed ≠ 前置缺失，二者语义分离
+    _open_email_mode(monkeypatch)
+    settings_store.set_registration_mode("closed", updated_by="t")
+    owner = _mk_owner()
+    user, password = _make_pending("closedact@x.com")
+    inv = registration_store.create_invite(owner["user_id"])
+    client = _client()
+    assert client.post("/login", data={"username": "closedact@x.com",
+                                       "password": password}).status_code == 302
+    r = _activate_via_api(client, inv["token"])
+    assert r.status_code == 403
+    assert r.get_json()["code"] == "registration_closed"
+    # 只暂停：邀请码不消费、状态不变、无额度
+    assert registration_store.get_invite(inv["invite_id"])["use_count"] == 0
+    assert user_store.get_user(user["user_id"])[
+        "activation_state"] == "pending_activation"
+    assert _allowance_count(user["user_id"]) == 0
+    # 恢复开放后同一请求成功（停机只暂停，不销毁）
+    settings_store.set_registration_mode("email_verify_invite_activation",
+                                         updated_by="t")
+    r2 = _activate_via_api(client, inv["token"])
+    assert r2.status_code == 200, r2.get_data(as_text=True)
+    assert user_store.get_user(user["user_id"])["activation_state"] == "active"
+
+
+def test_resend_blocked_when_registration_closed(monkeypatch):
+    """P1-2：closed 下 resend 403 registration_closed，且不写队列。"""
+    app_mod.AUTH_ENABLED = True
+    client = _client()
+    r = client.post("/api/registration/resend",
+                    json={"email": "closedrs@x.com"})
+    assert r.status_code == 403
+    assert r.get_json()["code"] == "registration_closed"
+    assert _mail_job_count("closedrs@x.com") == 0
+
+
+def test_register_email_start_blocked_when_closed(monkeypatch):
+    """P1-2：closed 下验证请求（verify start）403，且不写队列。"""
+    app_mod.AUTH_ENABLED = True
+    client = _client()
+    r = client.post("/register", data={"email": "closedstart@x.com"})
+    assert r.status_code == 403
+    assert r.get_json()["code"] == "registration_closed"
+    assert _mail_job_count("closedstart@x.com") == 0
+    # 恢复开放后可正常入队
+    _open_email_mode(monkeypatch)
+    r2 = client.post("/register", data={"email": "closedstart@x.com"})
+    assert r2.status_code == 200
+    assert _mail_job_count("closedstart@x.com") == 1
+
+
+def test_worker_keeps_queued_when_registration_closed(monkeypatch):
+    """P1-2：closed 下 worker 不发信、作业留 queued（不是 failed）。"""
+    out = _enqueue("closedq@x.com")
+    assert registration_mail_worker.drain_once(sender=_fake()) == 0
+    assert _fake().sent == []
+    row = _mail_job_row(out["token"])
+    assert row["status"] == "queued"
+
+
+def test_worker_after_reopen_skips_expired_sends_unexpired(monkeypatch):
+    """P1-2：恢复开放后只发未过期作业；过期作业保持 queued（验证端报
+    expired），不发也不 fail。"""
+    # 先配齐全部前置 env（载荷加密密钥全程稳定），再经存储模式切换停机/恢复
+    _open_email_mode(monkeypatch)
+    expired = _enqueue("expired-open@x.com", ttl_seconds=1)
+    fresh = _enqueue("fresh-open@x.com")
+    time.sleep(1.1)
+    settings_store.set_registration_mode("closed", updated_by="t")
+    # closed：都不发
+    assert registration_mail_worker.drain_once(sender=_fake()) == 0
+    assert _fake().sent == []
+    # 切回 open：只发未过期作业
+    settings_store.set_registration_mode("email_verify_invite_activation",
+                                         updated_by="t")
+    assert registration_mail_worker.drain_once(sender=_fake()) == 1
+    sent = _fake().sent
+    assert len(sent) == 1 and sent[0][0] == "fresh-open@x.com"
+    # 过期作业：留 queued、不发送；验证端报 expired
+    row = _mail_job_row(expired["token"])
+    assert row["status"] == "queued"
+    assert registration_store.check_verify_token(expired["token"])[
+        "state"] == "expired"
+    # 未过期作业正常消费
+    assert _mail_job_row(fresh["token"])["status"] == "sent"
 
 
 # =========================================================================== #

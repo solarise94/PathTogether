@@ -35,14 +35,19 @@ Werkzeug 密码哈希沿用默认算法（当前 scrypt:32768:8:1），旧 hash 
 import hashlib
 import hmac
 import logging
+import os
 import secrets
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import psycopg
 from werkzeug.security import generate_password_hash
 
 import pg_store
+# P1-2（review）：生效注册模式的共享判定依赖 settings_store（存储值读取）；
+# settings_store 只依赖 pg_store/platform_features，无导入环。
+import settings_store
 import user_store
 # Batch B（docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
 # §Batch B 数据模型 6）：来源归因与注册解耦——兑换事务**不再**调用
@@ -76,6 +81,14 @@ MAX_PASSWORD_LENGTH = user_store.PASSWORD_MAX_LENGTH
 REGISTRATION_MODES = ("closed", "invite_only",
                       "email_verify_invite_activation", "public")
 
+#: I 线邮件线的目标模式常量（激活/重发/验证请求写前置与 worker drain 前置
+#: 共用此名，避免调用方散落字符串字面量）
+MODE_EMAIL_VERIFY_INVITE_ACTIVATION = "email_verify_invite_activation"
+
+#: P1-2（review）：需要 fail-closed 前置闸的开放注册形态（public 原样透传给
+#: 路由层统一 503；判定实现见 registration_mode_precondition_failures）
+REGISTRATION_GATED_MODES = ("invite_only", "email_verify_invite_activation")
+
 
 class RegistrationStoreError(RuntimeError):
     """registration_store 业务异常基类。"""
@@ -108,6 +121,78 @@ def _connect():
     conn = pg_store.connect()
     conn.row_factory = psycopg.rows.dict_row
     return conn
+
+
+# --------------------------------------------------------------------------- #
+# P1-2（review）：生效注册模式共享判定（app 层与 registration_mail_worker
+# 共用同一实现；worker 绝不 import Flask app）
+# --------------------------------------------------------------------------- #
+def _env_truthy(env, name) -> bool:
+    """env 布尔解析（与 app 层 _env_truthy 同口径：1/true/yes）。"""
+    return (env.get(name) or "").strip().lower() in ("1", "true", "yes")
+
+
+def registration_mode_precondition_failures(environ=None, mode=None) -> list:
+    """开放注册形态生效的前置条件（docs §3.2 末段 + I 线模式前置；纯函数）。
+
+    invite_only 与 email_verify_invite_activation 共同要求：
+      1. ``PUBLIC_BASE_URL`` 配置为 https://（公网入口 TLS 已终止）；
+      2. ``ADMIN_SESSION_COOKIE_SECURE`` 启用（session cookie 带 Secure）；
+    email_verify_invite_activation 额外要求（I 线模式前置）：
+      3. 邮件发送通道已配置（registration_mail_worker.sender_configured，
+         ``fake`` 不计入生产通道）；
+      4. 邮件载荷加密密钥可用（含明文 token 的冻结正文必须加密落库）；
+      5. 验证 token 哈希盐非默认（REGISTRATION_VERIFY_HASH_SALT /
+         AUTH_SUBJECT_HASH_SALT / SECRET_KEY 至少其一已配置）。
+    任一不满足即应降级 closed（见 :func:`resolve_effective_registration_mode`）。
+    app 层的 ``_registration_precondition_failures`` / ``_effective_registration
+    _mode`` 与 worker drain 前置共用本实现，不再复制判定逻辑。
+    """
+    env = os.environ if environ is None else environ
+    failures = []
+    base_url = (env.get("PUBLIC_BASE_URL") or "").strip()
+    if not base_url or urlparse(base_url).scheme != "https":
+        failures.append("PUBLIC_BASE_URL 未配置为 https:// 入口")
+    if not _env_truthy(env, "ADMIN_SESSION_COOKIE_SECURE"):
+        failures.append("ADMIN_SESSION_COOKIE_SECURE 未启用（Secure Cookie）")
+    if mode == MODE_EMAIL_VERIFY_INVITE_ACTIVATION:
+        import registration_mail_worker as mail_worker
+        if not mail_worker.sender_configured(env, production=True):
+            failures.append("邮件发送通道未配置（REGISTRATION_MAIL_SENDER；"
+                            "fake 不计入生产通道）")
+        if not mail_worker.payload_key_available():
+            failures.append("邮件载荷加密密钥不可用（"
+                            "REGISTRATION_MAIL_PAYLOAD_KEY / SECRET_KEY）")
+        if not ((env.get("REGISTRATION_VERIFY_HASH_SALT") or "").strip()
+                or (env.get("AUTH_SUBJECT_HASH_SALT") or "").strip()
+                or (env.get("SECRET_KEY") or "").strip()):
+            failures.append("验证 token 哈希盐未配置（"
+                            "REGISTRATION_VERIFY_HASH_SALT / SECRET_KEY）")
+    return failures
+
+
+def resolve_effective_registration_mode(environ=None):
+    """生效注册模式（共享权威实现）：存储值 × 前置条件闸，返回 ``(mode,
+    failures)``。
+
+    - 存储读取失败按 closed（fail-closed，本地告警）；非开放形态（closed/
+      public）原样透传且 failures 为空；
+    - 开放形态前置不满足 → 降级 closed，failures 携带原因（是否告警由调用方
+      决定：app 层每进程告警一次，worker 逐轮 info）；
+    - ``public`` 不做前置判定，原样透传给路由层统一 503。
+    """
+    try:
+        mode = settings_store.get_registration_mode()
+    except Exception:
+        _log.warning("读取 registration_mode 失败，按 closed 处理",
+                     exc_info=True)
+        mode = "closed"
+    if mode not in REGISTRATION_GATED_MODES:
+        return mode, []
+    failures = registration_mode_precondition_failures(environ, mode=mode)
+    if failures:
+        return "closed", failures
+    return mode, []
 
 
 # --------------------------------------------------------------------------- #
@@ -153,6 +238,17 @@ def mask_login_id(login_id) -> str:
         masked_local = (head + "***") if len(local) > 1 else "***"
         return masked_local + "@" + domain
     return (s[:1] + "***") if len(s) > 1 else "***"
+
+
+def _consttime_eq(a, b) -> bool:
+    """常数时间字符串比较（P0-1）：两侧规范化值等长补齐后 compare_digest，
+    长度差不泄露信息。redeem_invite 与 activate_registered_user 的绑定校验
+    共用同一实现。"""
+    x = str(a or "").encode("utf-8")
+    y = str(b or "").encode("utf-8")
+    n = max(len(x), len(y), 1)
+    return hmac.compare_digest(x + b"\0" * (n - len(x)),
+                               y + b"\0" * (n - len(y)))
 
 
 # --------------------------------------------------------------------------- #
@@ -490,12 +586,8 @@ def redeem_invite(token, login_id, password, display_name=None):
                     raise _RedeemFail("consumed")
                 bound = row["login_id_normalized"]
                 if bound:
-                    # 常数时间比较（规范化后等长补齐，长度差不泄露信息）
-                    a = norm_login.encode("utf-8")
-                    b = str(bound).encode("utf-8")
-                    n = max(len(a), len(b), 1)
-                    if not hmac.compare_digest(a + b"\0" * (n - len(a)),
-                                               b + b"\0" * (n - len(b))):
+                    # 常数时间比较（规范化值等长补齐，长度差不泄露信息）
+                    if not _consttime_eq(norm_login, str(bound)):
                         raise _RedeemFail("email_mismatch")
                 # users 登录账号唯一检查（在消费 invite 之前；冲突则整体回滚不消费）
                 cur.execute(
@@ -765,12 +857,14 @@ def enqueue_email_verification(email, base_url=None,
                         or daily >= VERIFY_DAILY_LIMIT \
                         or app_daily >= VERIFY_APP_DAILY_BUDGET:
                     raise EmailVerifyError("rate_limited")
-                # 作废同邮箱全部未消费旧 token（一次性 + 单活）
+                # 作废同邮箱全部未消费旧 token（一次性 + 单活）：
+                # P1-1 起 uncertain（发送结果不确定）同样持有可用链接，一并
+                # 作废，维持「同邮箱任意时刻至多一个可用 token」
                 cur.execute(
                     "UPDATE registration_mail_jobs SET status='superseded' "
                     "WHERE email_normalized=%s AND purpose=%s "
                     "AND consumed_at IS NULL "
-                    "AND status IN ('queued','sent')",
+                    "AND status IN ('queued','sent','uncertain')",
                     (email_norm, MAIL_PURPOSE_EMAIL_VERIFY))
                 cur.execute(
                     "INSERT INTO registration_mail_jobs "
@@ -821,7 +915,9 @@ def check_verify_token(token):
     masked = mask_login_id(row["email_normalized"])
     if row["consumed_at"] is not None or row["status"] == "consumed":
         return {"state": "consumed", "email_masked": masked}
-    if row["status"] not in ("queued", "sent"):
+    # P1-1：uncertain（发送结果不确定=用户可能已收到邮件）在有效期内与
+    # queued/sent 同样按 valid 处理，防止「收到的链接被判无效」
+    if row["status"] not in ("queued", "sent", "uncertain"):
         return {"state": "unknown", "email_masked": masked}
     if row["expires_at"] is not None and row["expires_at"] <= time.time():
         return {"state": "expired", "email_masked": masked}
@@ -929,8 +1025,12 @@ def verify_email_create_user(token, password, display_name=None):
                     "WHERE token_hash=%s AND purpose=%s FOR UPDATE",
                     (verify_token_hash(tok), MAIL_PURPOSE_EMAIL_VERIFY))
                 job = cur.fetchone()
+                # P1-1：token 消费接受 queued/sent/uncertain（uncertain=发送
+                # 结果不确定，用户手里的链接可能真实有效，一律放行——防「收到
+                # 的链接被判无效」；failed=确定未发出，仍拒绝）
                 if job is None or job["consumed_at"] is not None \
-                        or job["status"] not in ("queued", "sent"):
+                        or job["status"] not in ("queued", "sent",
+                                                 "uncertain"):
                     raise EmailVerifyError("invalid_or_expired")
                 if job["expires_at"] is not None \
                         and job["expires_at"] <= time.time():
@@ -983,6 +1083,9 @@ def activate_registered_user(user_id, invite_token):
       闸检查 → acquire_user_provisioning_lock_tx → 复查闸
       → SELECT users FOR UPDATE（锁 user 行、复查状态机）
       → SELECT registration_invites FOR UPDATE（锁 invite 行）
+      → 绑定校验（P0-1：invite.login_id_normalized 非空时，与 pending 用户
+        的**权威邮箱身份** users.email_normalized 做规范化 + 常数时间比较，
+        缺省回退 login_id 的规范化形——绑定给 A 的邀请码绝不能激活 B）
       → CAS 消费邀请码（use_count+1 / consumed_at / consumed_by_user_id，
         WHERE consumed_at IS NULL AND revoked_at IS NULL——同码两人并发只有
         一人成功）
@@ -995,8 +1098,10 @@ def activate_registered_user(user_id, invite_token):
     失败语义：
       - 用户缺失/禁用/状态非 pending_activation → ActivationError
         （already_active 时**邀请码未读未消费**：先查状态后读 invite）；
-      - 邀请码无效/过期/撤销/已消费 → InviteRedeemError（对外统一
-        ``invite_invalid_or_unavailable``；消费 CAS 未命中同样整体回滚）；
+      - 邀请码无效/过期/撤销/已消费/**绑定邮箱不匹配（bound_mismatch）** →
+        InviteRedeemError（对外统一 ``invite_invalid_or_unavailable``，不泄露
+        绑定差异；整体回滚：邀请码不消费、用户状态不变、不建额度；真实原因
+        只进 best-effort 审计与日志；消费 CAS 未命中同样整体回滚）；
       - 维护闸开启 → spend_store.ProvisioningMaintenanceError 原样上抛。
 
     成功返回 ``{"user", "invite_id", "total_allowance"}``。
@@ -1034,9 +1139,9 @@ def activate_registered_user(user_id, invite_token):
                 if user["activation_state"] != "pending_activation":
                     raise ActivationError("not_pending")
                 # 2) 锁 invite 行 + 状态检查（时间列统一 epoch float，与
-                #    redeem_invite 同口径）
+                #    redeem_invite 同口径；P0-1：补读绑定列 login_id_normalized）
                 cur.execute(
-                    "SELECT invite_id, "
+                    "SELECT invite_id, login_id_normalized, "
                     "extract(epoch from expires_at)::float8 AS expires_at, "
                     "max_uses, use_count, "
                     "extract(epoch from consumed_at)::float8 AS consumed_at, "
@@ -1063,6 +1168,25 @@ def activate_registered_user(user_id, invite_token):
                         int(invite["max_uses"] or 1):
                     fail_reason = "consumed"
                     raise InviteRedeemError("consumed")
+                # 2.5) 绑定校验（P0-1，先于 CAS 消费）：invite 绑定了
+                #    login_id_normalized（非空）时，与 pending 用户的权威
+                #    邮箱身份做规范化 + 常数时间比较——email_normalized 缺省
+                #    （理论上 pending 行必有，防御回退）时比较 login_id 的
+                #    规范化形。不匹配 → 抛 InviteRedeemError 整体回滚：邀请码
+                #    不消费、用户状态不变、不建额度；对外统一 403
+                #    invite_invalid_or_unavailable（反枚举，不泄露绑定差异），
+                #    真实原因 bound_mismatch 只进 best-effort 审计。
+                bound = invite["login_id_normalized"]
+                if bound:
+                    user_email = normalize_email(
+                        user["email_normalized"] or "") \
+                        or normalize_email(user["login_id"])
+                    if not _consttime_eq(user_email, str(bound)):
+                        fail_reason = "bound_mismatch"
+                        _log.warning(
+                            "激活拒绝：邀请码绑定身份与用户不匹配"
+                            "（invite=%s，细节仅审计不外泄）", invite_id)
+                        raise InviteRedeemError("bound_mismatch")
                 # 3) CAS 消费（同码并发只有一人命中）
                 cur.execute(
                     "UPDATE registration_invites SET use_count=use_count+1, "

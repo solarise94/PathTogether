@@ -363,3 +363,55 @@ def test_polygon_provenance_partial_persisted(monkeypatch):
     assert "snapshot_bbox" not in prov
     assert "render_context_fingerprint" not in prov
     assert "slide_revision" not in prov
+
+
+# =========================================================================== #
+# P1-4 收口：legacy /internal/ai/annotate 通道同闸（internal token 不再单独
+# 放行描绘写入；几何路径回归见 test_ai_drawing_geom）
+# =========================================================================== #
+def _mock_internal_channel(monkeypatch):
+    monkeypatch.setattr(app_mod, "_require_internal", lambda: None)
+    monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
+    monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
+    monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
+
+
+def _post_internal_polygon(c, session_id="sess-int-1"):
+    return c.post("/internal/ai/annotate", json={
+        "slide": "demo.svs", "label": "AI 描绘", "type": "polygon",
+        "points": TRIANGLE, "effect_key": "ek-int-gate",
+        "session_id": session_id,
+    })
+
+
+def test_internal_channel_blocked_without_mirror_row(monkeypatch):
+    """internal 通道：镜像无行 → 403 ai_drawing_disabled，不落库。"""
+    _touch()
+    _mock_internal_channel(monkeypatch)
+    c = app_mod.app.test_client()
+    r = _post_internal_polygon(c)
+    assert r.status_code == 403
+    assert r.get_json()["code"] == "ai_drawing_disabled"
+    assert _no_rois()
+
+
+def test_internal_channel_allowed_when_mirror_on(monkeypatch):
+    """internal 通道：镜像 true → 200 落库（与 plugin v1 同闸语义）。"""
+    _touch()
+    _mock_internal_channel(monkeypatch)
+    share_store.upsert_ai_session_drawing_flag("sess-int-1", True)
+    c = app_mod.app.test_client()
+    r = _post_internal_polygon(c)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.get_json()["type"] == "polygon"
+
+
+def test_internal_channel_blocks_late_polygon_after_midrun_off(monkeypatch):
+    """internal 通道：运行中关闭（true→false）→ 迟到 polygon 403。"""
+    _touch()
+    _mock_internal_channel(monkeypatch)
+    share_store.upsert_ai_session_drawing_flag("sess-int-1", False)
+    c = app_mod.app.test_client()
+    r = _post_internal_polygon(c)
+    assert r.status_code == 403
+    assert _no_rois()

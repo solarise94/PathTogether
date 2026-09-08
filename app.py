@@ -14081,6 +14081,16 @@ def internal_ai_annotate():
     body_type = body.get("type")
     points_norm = None
     if body_type in ("polygon", "freehand"):
+        # P1-4 收口（review-2026-09-07）：legacy internal 通道与 plugin v1
+        # 同闸——polygon/freehand 描绘要求会话镜像开关为 true（无 session_id
+        # 或镜像无行/false 一律 403 fail closed），internal token 不再单独
+        # 放行描绘写入。
+        mirror_flag = share_store.get_ai_session_drawing_flag(
+            str(body.get("session_id") or ""))
+        if mirror_flag is not True:
+            return jsonify(
+                error="本会话未开启「允许 AI 描绘」（或平台无其开启记录）",
+                code="ai_drawing_disabled"), 403
         points_norm, perr = _validate_annotation_points(safe, body_type, body)
         if perr is not None:
             return jsonify(error=perr[0]), 400

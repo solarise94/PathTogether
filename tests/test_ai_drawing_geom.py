@@ -202,6 +202,10 @@ def test_add_roi_human_polygon_review_none():
 def test_internal_annotate_polygon_points_path(monkeypatch):
     _touch()
     monkeypatch.setattr(app_mod, "_require_internal", lambda: None)
+    # P1-4 收口：internal 通道描绘同样复核镜像开关——本文件聚焦几何路径，
+    # 统一预置「已开启」；闸门关/无行行为见 test_ai_drawing_gate。
+    monkeypatch.setattr(app_mod.share_store, "get_ai_session_drawing_flag",
+                        lambda sid: True)
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
     monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
@@ -230,6 +234,10 @@ def test_internal_annotate_polygon_points_path(monkeypatch):
 def test_internal_annotate_freehand_points_path(monkeypatch):
     _touch()
     monkeypatch.setattr(app_mod, "_require_internal", lambda: None)
+    # P1-4 收口：internal 通道描绘同样复核镜像开关——本文件聚焦几何路径，
+    # 统一预置「已开启」；闸门关/无行行为见 test_ai_drawing_gate。
+    monkeypatch.setattr(app_mod.share_store, "get_ai_session_drawing_flag",
+                        lambda sid: True)
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
     monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
@@ -246,6 +254,10 @@ def test_internal_annotate_freehand_points_path(monkeypatch):
 def test_internal_annotate_polygon_mutually_exclusive_with_rect(monkeypatch):
     _touch()
     monkeypatch.setattr(app_mod, "_require_internal", lambda: None)
+    # P1-4 收口：internal 通道描绘同样复核镜像开关——本文件聚焦几何路径，
+    # 统一预置「已开启」；闸门关/无行行为见 test_ai_drawing_gate。
+    monkeypatch.setattr(app_mod.share_store, "get_ai_session_drawing_flag",
+                        lambda sid: True)
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
     monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
@@ -261,6 +273,10 @@ def test_internal_annotate_polygon_mutually_exclusive_with_rect(monkeypatch):
 def test_internal_annotate_polygon_self_intersecting_rejected(monkeypatch):
     _touch()
     monkeypatch.setattr(app_mod, "_require_internal", lambda: None)
+    # P1-4 收口：internal 通道描绘同样复核镜像开关——本文件聚焦几何路径，
+    # 统一预置「已开启」；闸门关/无行行为见 test_ai_drawing_gate。
+    monkeypatch.setattr(app_mod.share_store, "get_ai_session_drawing_flag",
+                        lambda sid: True)
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
     monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
@@ -276,6 +292,10 @@ def test_internal_annotate_polygon_self_intersecting_rejected(monkeypatch):
 def test_internal_annotate_polygon_out_of_slide_bounds_rejected(monkeypatch):
     _touch()
     monkeypatch.setattr(app_mod, "_require_internal", lambda: None)
+    # P1-4 收口：internal 通道描绘同样复核镜像开关——本文件聚焦几何路径，
+    # 统一预置「已开启」；闸门关/无行行为见 test_ai_drawing_gate。
+    monkeypatch.setattr(app_mod.share_store, "get_ai_session_drawing_flag",
+                        lambda sid: True)
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
     monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
@@ -299,6 +319,10 @@ def test_internal_annotate_rect_path_regression(monkeypatch):
     """无 type 的既有矩形请求行为不变（H 不改变 create_annotation 矩形通道）。"""
     _touch()
     monkeypatch.setattr(app_mod, "_require_internal", lambda: None)
+    # P1-4 收口：internal 通道描绘同样复核镜像开关——本文件聚焦几何路径，
+    # 统一预置「已开启」；闸门关/无行行为见 test_ai_drawing_gate。
+    monkeypatch.setattr(app_mod.share_store, "get_ai_session_drawing_flag",
+                        lambda sid: True)
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
     monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
@@ -325,6 +349,10 @@ def test_internal_annotate_rect_path_regression(monkeypatch):
 def test_internal_annotate_polygon_requires_label_and_valid_type(monkeypatch):
     _touch()
     monkeypatch.setattr(app_mod, "_require_internal", lambda: None)
+    # P1-4 收口：internal 通道描绘同样复核镜像开关——本文件聚焦几何路径，
+    # 统一预置「已开启」；闸门关/无行行为见 test_ai_drawing_gate。
+    monkeypatch.setattr(app_mod.share_store, "get_ai_session_drawing_flag",
+                        lambda sid: True)
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
     monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")

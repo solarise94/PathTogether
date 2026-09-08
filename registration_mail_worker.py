@@ -25,6 +25,15 @@
 worker 循环：``python registration_mail_worker.py --loop``（生产）；``--once``
 单次排水（部署钩子/测试）。app 层入队后另有线程内 best-effort 即时排水
 （失败不重试路径安全：作业保持 queued，worker 循环是权威发送方）。
+
+P1-1/P1-2 语义（review）：
+  - 发送阶段划分：DATA/确认步**之前**的失败=确定未发出（failed，有界指数
+    退避重试）；请求发出后未收到远端最终响应=不确定（uncertain，绝不自动
+    重发，防重复邮件/重复建号，留人工核对）；
+  - 注册模式停机：排水前与 app 层共用 registration_store 的生效模式判定，
+    非 email_verify_invite_activation 时全部作业保留 queued 直接返回；
+  - 恢复开放后只发未过期作业（expires_at 已过期的保持 queued，验证端报
+    expired）。
 """
 
 import argparse
@@ -55,11 +64,30 @@ _CLI_TIMEOUT_SECONDS = 20
 
 
 class MailSenderError(RuntimeError):
-    """发送失败（可重试类别由调用方按 status=failed 记录；不自动重试）。"""
+    """发送**确定未发出**（DATA/确认步之前失败或远端明确回绝）。
+
+    worker 按 status=failed 记录并有界重试（指数退避 scheduled_at，attempts
+    达上限后保持 failed 不再发送）。"""
+
+
+class MailSenderUncertainError(MailSenderError):
+    """发送**结果不确定**（P1-1）：请求已完整发出但未收到远端最终接受/拒绝
+    响应——远端**可能已接受**，用户可能已收到邮件。
+
+    worker 置 status=uncertain 且**绝不自动重发**（防重复邮件/重复建号），
+    只留状态供人工核对；验证端在有效期内接受 uncertain 作业的 token。
+    注意：本类是 MailSenderError 的子类，调用方 except 顺序必须**先捕获本类**。
+    """
 
 
 class MailSenderUnavailable(MailSenderError):
     """发送通道未配置/不可用（模式前置检查 fail-closed 依据）。"""
+
+
+#: 确定失败的有界重试上限：attempts 达到后保持 status=failed 不再发送（P1-1）
+_MAX_SEND_ATTEMPTS = 5
+#: 指数退避基数（秒）：第 n 次失败（0 起数）后顺延 base * 2^n —— 30s/1m/2m/4m
+_RETRY_BACKOFF_BASE_SECONDS = 30
 
 
 # --------------------------------------------------------------------------- #
@@ -196,7 +224,13 @@ class AgentMailCliSender:
         if not self.cli_path:
             raise MailSenderUnavailable("REGISTRATION_AGENT_MAIL_CLI 未配置")
 
-    def _run(self, argv, stdin_text=None):
+    def _run(self, argv, stdin_text=None, confirm_phase=False):
+        """执行一步 CLI（参数数组，无 shell）。
+
+        ``confirm_phase=True`` 标注第二步 send-confirm：该步请求已提交、若未
+        收到 CLI 响应（超时/执行中断）则**远端可能已确认发送**——按 P1-1 划
+        分为不确定（MailSenderUncertainError），绝不当 failed 自动重试。
+        """
         try:
             proc = subprocess.run(
                 [self.cli_path] + list(argv),  # 参数数组；绝无 shell
@@ -204,21 +238,32 @@ class AgentMailCliSender:
                 timeout=_CLI_TIMEOUT_SECONDS,
             )
         except FileNotFoundError as exc:
+            # CLI 缺失=确认步根本未发出（确定未发送），两阶段同语义
             raise MailSenderUnavailable(
                 "agent_mail_cli_not_found") from exc
         except subprocess.TimeoutExpired as exc:
+            if confirm_phase:
+                raise MailSenderUncertainError(
+                    "agent_mail_cli_confirm_timeout") from exc
             raise MailSenderError("agent_mail_cli_timeout") from exc
         except OSError as exc:
+            if confirm_phase:
+                raise MailSenderUncertainError(
+                    "agent_mail_cli_confirm_no_response（%s）"
+                    % exc.__class__.__name__) from exc
             raise MailSenderError(
                 "agent_mail_cli_exec_failed（%s）" % exc.__class__.__name__
             ) from exc
         if proc.returncode != 0:
+            # CLI 已给出明确回绝（exit code=收到了响应）→ 确定未发出；
             # 不回传 stderr 原文（可能含本机路径/凭据线索），只记类别
             raise MailSenderError(
                 "agent_mail_cli_exit_%d" % int(proc.returncode))
         return proc.stdout
 
     def send(self, to, subject, body):
+        # 阶段 1（确定未发出区间）：send-request 未成功、确认令牌未拿到——
+        # 远端两步协议下必未真正外发，一切失败按 MailSenderError（可重试）
         req_argv = ["send-request", "--to", str(to), "--subject",
                     str(subject)]
         if self.sender:
@@ -233,7 +278,11 @@ class AgentMailCliSender:
                 % exc.__class__.__name__) from exc
         if not token:
             raise MailSenderError("agent_mail_cli_empty_confirmation_token")
-        self._run(["send-confirm", "--confirmation-token", token])
+        # 阶段 2（不确定窗口）：send-confirm 已提交、响应未收到=远端可能已
+        # 确认外发（P1-1：置 uncertain 不自动重发）；exit code 非零=CLI 明确
+        # 回绝（确定未发出，仍按 failed）
+        self._run(["send-confirm", "--confirmation-token", token],
+                  confirm_phase=True)
 
 
 class SmtpMailSender:
@@ -244,6 +293,10 @@ class SmtpMailSender:
       REGISTRATION_SMTP_USER / REGISTRATION_SMTP_PASSWORD
       REGISTRATION_SMTP_FROM（缺省=USER）
       REGISTRATION_SMTP_STARTTLS=1 时走 587 STARTTLS，否则 SMTP_SSL。
+
+    P1-1 不确定态的阶段划分（见 :meth:`_transmit`）：DATA 结束符发出**之前**
+    的任何失败=确定未发出（failed，可重试）；结束符发出后等远端最终响应期间
+    的超时/断连=结果不确定（uncertain，绝不自动重发）。
     """
 
     def __init__(self, environ=None):
@@ -262,6 +315,61 @@ class SmtpMailSender:
             "1", "true", "yes", "on")
         if not self.host or not self.user or not self.password:
             raise MailSenderUnavailable("registration_smtp_not_configured")
+
+    def _transmit(self, smtp, msg_str, to_addr, ctx):
+        """分阶段 SMTP 事务（P1-1 划分边界）。
+
+        阶段 1（确定未发出区间）：EHLO / STARTTLS / AUTH / MAIL FROM /
+        RCPT TO / DATA(354) 与正文写出——此段任何失败（含正文 socket 写失败：
+        sendall 语义保证数据未完整送达、远端事务中止）都意味着邮件**确定未
+        发出**，抛 MailSenderError（worker 记 failed 可重试）；
+        阶段 2（不确定窗口）：正文与结束符 ``.`` 已全部写出、等待远端对整个
+        事务的最终响应——此段超时/断连意味着远端**可能已接受**，抛
+        MailSenderUncertainError（worker 置 uncertain，绝不自动重发）。
+        """
+        import smtplib
+
+        # ---- 阶段 1 ----
+        code, _resp = smtp.ehlo()
+        if code != 250:
+            raise MailSenderError("smtp_ehlo_rejected_%d" % int(code))
+        if self.starttls:
+            code, _resp = smtp.starttls(context=ctx)
+            if code != 220:
+                raise MailSenderError(
+                    "smtp_starttls_rejected_%d" % int(code))
+            code, _resp = smtp.ehlo()
+            if code != 250:
+                raise MailSenderError("smtp_ehlo_rejected_%d" % int(code))
+        # 认证失败 → SMTPAuthenticationError（send 层统一译为 smtp_auth_failed）
+        smtp.login(self.user, self.password)
+        code, _resp = smtp.docmd("MAIL", "FROM:<%s>" % self.from_addr)
+        if code != 250:
+            raise MailSenderError("smtp_mail_from_rejected_%d" % int(code))
+        code, _resp = smtp.docmd("RCPT", "TO:<%s>" % to_addr)
+        if code not in (250, 251):
+            raise MailSenderError("smtp_rcpt_rejected_%d" % int(code))
+        code, _resp = smtp.docmd("DATA")
+        if code != 354:
+            raise MailSenderError("smtp_data_start_rejected_%d" % int(code))
+        # 正文写出（与 smtplib.SMTP.data 对 str 的处理同款：CRLF 归一 + 行首
+        # 点引用/转义；本处本地实现等价逻辑，避免依赖 smtplib 私有助手）
+        import re as _re
+        data = _re.sub(br"(?:\r\n|\n|\r(?!\n))", b"\r\n",
+                       msg_str.encode("ascii"))
+        data = _re.sub(br"(?m)^\.", b"..", data)
+        smtp.send(data)
+        smtp.send(b".\r\n")
+        # ---- 阶段 2（不确定窗口）：等待远端最终响应 ----
+        try:
+            code, _resp = smtp.getreply()
+        except Exception as exc:
+            raise MailSenderUncertainError(
+                "smtp_final_response_missing（%s）"
+                % exc.__class__.__name__) from exc
+        if code != 250:
+            # 远端明确回绝（未接受）→ 仍属确定未发出
+            raise MailSenderError("smtp_data_rejected_%d" % int(code))
 
     def send(self, to, subject, body):
         import smtplib
@@ -283,27 +391,28 @@ class SmtpMailSender:
         ctx = ssl.create_default_context()
         try:
             if self.starttls:
-                with smtplib.SMTP(self.host, self.port, timeout=30) as smtp:
-                    smtp.ehlo()
-                    smtp.starttls(context=ctx)
-                    smtp.ehlo()
-                    smtp.login(self.user, self.password)
-                    smtp.sendmail(self.from_addr, [to_addr], msg.as_string())
+                smtp = smtplib.SMTP(self.host, self.port, timeout=30)
             else:
-                with smtplib.SMTP_SSL(self.host, self.port, context=ctx,
-                                      timeout=30) as smtp:
-                    smtp.login(self.user, self.password)
-                    smtp.sendmail(self.from_addr, [to_addr], msg.as_string())
+                smtp = smtplib.SMTP_SSL(self.host, self.port, context=ctx,
+                                        timeout=30)
+        except OSError as exc:
+            raise MailSenderError(
+                "smtp_connect_failed（%s）" % exc.__class__.__name__) from exc
+        try:
+            with smtp:
+                self._transmit(smtp, msg.as_string(), to_addr, ctx)
         except MailSenderError:
-            raise
+            raise  # 含 MailSenderUncertainError（子类）：阶段语义由 _transmit 决定，原样透传
         except smtplib.SMTPAuthenticationError as exc:
             raise MailSenderError("smtp_auth_failed") from exc
         except smtplib.SMTPException as exc:
             raise MailSenderError(
                 "smtp_send_failed（%s）" % exc.__class__.__name__) from exc
         except OSError as exc:
+            # DATA 之前的连接级错误（确定未发出；正文写失败已在 sendall 语义
+            # 下归入本类）
             raise MailSenderError(
-                "smtp_connect_failed（%s）" % exc.__class__.__name__) from exc
+                "smtp_send_failed（%s）" % exc.__class__.__name__) from exc
 
 
 def sender_configured(environ=None, production=True) -> bool:
@@ -354,14 +463,38 @@ def _connect():
     return conn
 
 
-def drain_once(limit=_DRAIN_BATCH, sender=None) -> int:
-    """处理至多 limit 条 queued 作业；返回成功发送条数。
+def drain_once(limit=_DRAIN_BATCH, sender=None, environ=None) -> int:
+    """处理至多 limit 条待发作业；返回成功发送条数。
 
-    每条作业独立事务：``SELECT ... FOR UPDATE``（行锁只在单条发送期间持有）
-    → 解密载荷 → sender.send → status=sent / failed（attempts+1，last_error
-    只记类别）。发送通道未配置 → 全部保留 queued（worker 前置未满足是部署
-    问题，不是作业失败）。
+    P1-2 模式停机语义：排水前查**生效注册模式**——与 app 层共用
+    registration_store.resolve_effective_registration_mode 的权威判定（worker
+    绝不 import Flask app）。非 email_verify_invite_activation → 全部作业保留
+    queued 直接返回 0（注册暂停是运维动作，不是作业失败：不 fail、不计时、
+    不改状态）。
+
+    每条作业独立事务：``SELECT ... FOR UPDATE SKIP LOCKED``（行锁只在单条
+    发送期间持有）→ 解密载荷 → sender.send → 按阶段分类落状态（P1-1）：
+
+    - 成功 → status=sent；
+    - :class:`MailSenderUncertainError`（远端可能已接受）→ status=uncertain，
+      **不自动重发**（防重复邮件/重复建号），只留状态供人工核对；
+    - :class:`MailSenderError`（确定未发出）→ status=failed，attempts+1，
+      scheduled_at 按指数退避顺延（上限 :data:`_MAX_SEND_ATTEMPTS`，达上限
+      保持 failed 不再发送）。
+
+    领取范围只含 ``scheduled_at <= now()`` 且 ``expires_at > now()`` 的
+    queued/未达上限 failed 行——恢复开放后只发未过期作业；已过期的保持
+    queued（不发送、不 fail），由验证端报 expired。
+    发送通道未配置 → 全部保留 queued（worker 前置未满足是部署问题，不是
+    作业失败）。
     """
+    import registration_store
+    mode, _failures = registration_store.resolve_effective_registration_mode(
+        environ)
+    if mode != registration_store.MODE_EMAIL_VERIFY_INVITE_ACTIVATION:
+        _log.info("生效注册模式为 %s（非 email_verify_invite_activation）："
+                  "作业保留 queued，本轮不发送", mode)
+        return 0
     snd = sender if sender is not None else get_sender()
     if snd is None:
         _log.warning("邮件发送通道未配置（REGISTRATION_MAIL_SENDER），%d 条"
@@ -375,11 +508,14 @@ def drain_once(limit=_DRAIN_BATCH, sender=None) -> int:
                 with c.cursor() as cur:
                     cur.execute(
                         "SELECT job_id, email_normalized, payload_enc, "
-                        "payload_enc IS NULL AS bad_payload "
+                        "payload_enc IS NULL AS bad_payload, attempts "
                         "FROM registration_mail_jobs "
-                        "WHERE status='queued' AND scheduled_at <= now() "
+                        "WHERE (status='queued' OR (status='failed' "
+                        "AND attempts < %s)) "
+                        "AND scheduled_at <= now() AND expires_at > now() "
                         "ORDER BY created_at, job_id LIMIT 1 FOR UPDATE "
-                        "SKIP LOCKED")
+                        "SKIP LOCKED",
+                        (_MAX_SEND_ATTEMPTS,))
                     row = cur.fetchone()
                     if row is None:
                         break
@@ -388,14 +524,45 @@ def drain_once(limit=_DRAIN_BATCH, sender=None) -> int:
                         subject = str(payload.get("subject") or "")
                         body = str(payload.get("body") or "")
                         snd.send(row["email_normalized"], subject, body)
-                    except MailSenderError as exc:
+                    except MailSenderUncertainError as exc:
+                        # 先于 MailSenderError 捕获（子类）：远端可能已接受，
+                        # 置 uncertain 且绝不自动重发（uncertain 不在领取
+                        # 范围内），只留状态供人工核对
                         cur.execute(
                             "UPDATE registration_mail_jobs SET "
-                            "status='failed', attempts=attempts+1, "
+                            "status='uncertain', attempts=attempts+1, "
                             "last_error=%s WHERE job_id=%s",
                             (str(exc)[:120], row["job_id"]))
-                        _log.warning("验证邮件发送失败（job=%s 类别见 "
-                                     "last_error）", row["job_id"])
+                        _log.warning("验证邮件发送结果不确定（job=%s 类别见 "
+                                     "last_error）：置 uncertain，不自动"
+                                     "重发", row["job_id"])
+                        continue
+                    except MailSenderError as exc:
+                        attempts = int(row["attempts"] or 0)
+                        if attempts + 1 >= _MAX_SEND_ATTEMPTS:
+                            # 达重试上限：保持 failed，不再顺延 scheduled_at
+                            # （领取范围含 attempts<上限，自然停发）
+                            cur.execute(
+                                "UPDATE registration_mail_jobs SET "
+                                "status='failed', attempts=attempts+1, "
+                                "last_error=%s WHERE job_id=%s",
+                                (str(exc)[:120], row["job_id"]))
+                        else:
+                            # 确定未发出（DATA/确认步之前或远端明确回绝）：
+                            # 指数退避后有界重试
+                            delay = _RETRY_BACKOFF_BASE_SECONDS \
+                                * (2 ** attempts)
+                            cur.execute(
+                                "UPDATE registration_mail_jobs SET "
+                                "status='failed', attempts=attempts+1, "
+                                "last_error=%s, scheduled_at=now() + "
+                                "(%s * interval '1 second') "
+                                "WHERE job_id=%s",
+                                (str(exc)[:120], delay, row["job_id"]))
+                        _log.warning("验证邮件发送失败（job=%s 第 %d/%d 次"
+                                     "尝试，类别见 last_error）",
+                                     row["job_id"], attempts + 1,
+                                     _MAX_SEND_ATTEMPTS)
                         continue
                     cur.execute(
                         "UPDATE registration_mail_jobs SET status='sent', "

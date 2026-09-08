@@ -3187,7 +3187,8 @@ def register():
 
     # ---- POST ----
     if mode == "closed":
-        return jsonify(error="当前采用邀请注册，暂未开放自助注册"), 403
+        return jsonify(error="当前采用邀请注册，暂未开放自助注册",
+                       code="registration_closed"), 403
 
     # IP 前缀限流（invite_only 与 email_verify 两形态共用 IP 桶；存储不可用
     # 503 fail-closed，绝不退化进程内计数）
@@ -3280,6 +3281,9 @@ def _register_email_verify_post(ip_hash):
 
     - 只收 email（不填邀请码、不发额度；J：注册页不再要求独立登录账号/
       显示名——验证成功后以规范化邮箱为唯一用户名）；
+    - P1-2：入队写前重查生效模式（与 activate/resend 同一权威判定）——
+      注册暂停只停新验证请求（统一 403 registration_closed），token、
+      pending 用户、审计、队列一律不动；
     - registration_store.enqueue_email_verification 同事务入队 + 配额
       （60s 冷却 / 时 3 / 日 5 / 应用日预算 40）；
     - **统一文案**：已存在/未知邮箱/超限/内部异常一律同一响应（反枚举；
@@ -3287,6 +3291,13 @@ def _register_email_verify_post(ip_hash):
     - 入队成功后 best-effort 即时排水（失败留 queued，worker 循环为权威
       发送方）；异步排水不改变响应时序与文案。
     """
+    # P1-2：写前重查（防御层；register() 顶部已查过一次，此处紧贴写路径）
+    if _effective_registration_mode() != \
+            registration_store.MODE_EMAIL_VERIFY_INVITE_ACTIVATION:
+        resp = Response(render_template(
+            "register.html", mode="closed", registration_open=False), 403)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
     email = (request.form.get("email") or "").strip()
     try:
         registration_store.enqueue_email_verification(
@@ -3498,6 +3509,13 @@ def api_account_activate():
     enr, err = _require_enrollment()
     if err:
         return err
+    # P1-2：提交写前重查生效模式——注册暂停只停激活写路径（统一 403
+    # registration_closed；只暂停：token、pending 用户、审计、队列一律不动）
+    if _effective_registration_mode() != \
+            registration_store.MODE_EMAIL_VERIFY_INVITE_ACTIVATION:
+        return jsonify(
+            error="注册当前未开放，激活暂不可用；请稍后再试或联系管理员",
+            code="registration_closed"), 403
     body = request.get_json(silent=True) or request.form
     invite_token = (body.get("invite_code") or body.get("invite_token")
                     or "").strip()
@@ -3542,7 +3560,14 @@ def api_registration_resend():
 
     匿名可调（enrollment 白名单同样放行——pending 用户换邮箱重新走验证属
     新请求）。body: {email}；对未知/已存在/超限邮箱一律同一响应（反枚举）。
+    P1-2：入队写前重查生效模式——注册暂停时统一 403 registration_closed
+    （只暂停：不写队列、不发邮件、不动已有 token）。
     """
+    # P1-2：写前重查生效模式（与 activate/verify-start 共用同一权威判定）
+    if _effective_registration_mode() != \
+            registration_store.MODE_EMAIL_VERIFY_INVITE_ACTIVATION:
+        return jsonify(error="注册当前未开放，请稍后再试",
+                       code="registration_closed"), 403
     if request.is_json:
         body = request.get_json(silent=True) or {}
     else:
@@ -5090,51 +5115,34 @@ def _registration_mode_stored() -> str:
 def _registration_precondition_failures(environ=None, mode=None) -> list:
     """开放注册形态生效的前置条件（docs §3.2 末段，fail-closed）。
 
-    invite_only 与 email_verify_invite_activation 要求：
-      1. ``PUBLIC_BASE_URL`` 配置为 https://（公网入口 TLS 已终止）；
-      2. ``ADMIN_SESSION_COOKIE_SECURE`` 启用（session cookie 带 Secure）；
-      3. 存储后端为 postgres（邀请注册/限流整体 PG-only）。
-    email_verify_invite_activation 额外要求（I 线模式前置）：
-      4. 邮件发送通道已配置（registration_mail_worker.sender_configured，
-         ``fake`` 不计入生产通道）；
-      5. 邮件载荷加密密钥可用（含明文 token 的冻结正文必须加密落库）；
-      6. 验证 token 哈希盐非默认（生产口径：REGISTRATION_VERIFY_HASH_SALT /
-         AUTH_SUBJECT_HASH_SALT / SECRET_KEY 至少其一已配置）。
-    任一不满足即拒绝启用注册功能（_effective_registration_mode 降级 closed）。
+    P1-2（review）：判定下沉为 registration_store.registration_mode_
+    precondition_failures——app 层与 mail worker 共用同一实现，不再复制逻辑。
+    语义（详见共享实现 docstring）：
+      invite_only / email_verify_invite_activation 要求 PUBLIC_BASE_URL https、
+      ADMIN_SESSION_COOKIE_SECURE、postgres 后端；email_verify 形态额外要求
+      邮件通道已配置、载荷加密密钥可用、验证 token 哈希盐非默认。
     """
-    env = os.environ if environ is None else environ
-    failures = []
-    base_url = (env.get("PUBLIC_BASE_URL") or "").strip()
-    if not base_url or urlparse(base_url).scheme != "https":
-        failures.append("PUBLIC_BASE_URL 未配置为 https:// 入口")
-    if not _env_truthy(env, "ADMIN_SESSION_COOKIE_SECURE"):
-        failures.append("ADMIN_SESSION_COOKIE_SECURE 未启用（Secure Cookie）")
-    if mode == "email_verify_invite_activation":
-        if not registration_mail_worker.sender_configured(env,
-                                                          production=True):
-            failures.append("邮件发送通道未配置（REGISTRATION_MAIL_SENDER；"
-                            "fake 不计入生产通道）")
-        if not registration_mail_worker.payload_key_available():
-            failures.append("邮件载荷加密密钥不可用（"
-                            "REGISTRATION_MAIL_PAYLOAD_KEY / SECRET_KEY）")
-        if not ((env.get("REGISTRATION_VERIFY_HASH_SALT") or "").strip()
-                or (env.get("AUTH_SUBJECT_HASH_SALT") or "").strip()
-                or (env.get("SECRET_KEY") or "").strip()):
-            failures.append("验证 token 哈希盐未配置（"
-                            "REGISTRATION_VERIFY_HASH_SALT / SECRET_KEY）")
-    return failures
+    return registration_store.registration_mode_precondition_failures(
+        environ, mode=mode)
 
 
 _registration_gate_warned = {"flag": False}
 
-#: 需要 fail-closed 前置闸的开放注册形态（public 原样透传给路由层统一 503）
-_REGISTRATION_GATED_MODES = ("invite_only", "email_verify_invite_activation")
+#: 需要 fail-closed 前置闸的开放注册形态（public 原样透传给路由层统一 503）；
+#: P1-2 起与共享判定同源（registration_store.REGISTRATION_GATED_MODES）
+_REGISTRATION_GATED_MODES = registration_store.REGISTRATION_GATED_MODES
 
 
 def _effective_registration_mode() -> str:
     """生效注册模式：存储值 × 前置条件闸（未满足降级 closed，每进程告警一次）。
 
-    降级对象为全部开放形态（invite_only 与 I 线的
+    P1-2（review）：核心判定下沉为 registration_store 共享纯函数——前置条件
+    计算经 :func:`_registration_precondition_failures` 委托
+    ``registration_store.registration_mode_precondition_failures``，worker
+    drain 前置走同一共享实现的组合入口
+    ``registration_store.resolve_effective_registration_mode``（worker 绝不
+    import Flask app）。本包装只保留 app 层的存储值读取与「降级每进程告警
+    一次」行为。降级对象为全部开放形态（invite_only 与 I 线的
     email_verify_invite_activation；后者还叠加邮件通道/载荷密钥/哈希盐前置）；
     ``public`` 原样透传给路由层统一 503 public_registration_not_supported
     （本阶段不支持，也没有任何开放回退路径）。

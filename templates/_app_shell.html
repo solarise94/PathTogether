@@ -11,16 +11,18 @@
             aria-label="展开侧栏" data-i18n-aria="tb.sidebar.expand"
             data-i18n-title="tb.sidebar.expand" title="展开侧栏"
             aria-controls="sidebar" aria-expanded="false">☰</button>
+    <!-- 升级 Review 2026-09-09 §3.4：品牌区 = PathTogether + Beta 状态徽标。
+         常驻 #current-slide 已下架：切片名在侧栏选中行 / document.title /
+         切片信息菜单 / AI 与标注面板标题仍有。 -->
     <div class="title-group">
       <span class="header-title" data-i18n="app.title">PathTogether</span>
+      <span class="beta-badge" tabindex="0" role="note" data-i18n="beta.badge"
+            data-i18n-title="beta.badge.tip" data-i18n-aria="beta.badge.tip"
+            title="Beta 测试中，功能可能调整；遇到异常请反馈"
+            aria-label="Beta 测试中，功能可能调整；遇到异常请反馈">Beta</span>
       {% if C.readonly_badge %}
       <span class="demo-badge" data-i18n="demo.badge">Demo 只读体验</span>
-      {% else %}
-      <span class="title-sep">·</span>
-      <span class="header-subtitle" data-i18n="app.subtitle">协作式病理读片</span>
       {% endif %}
-      <span class="title-sep">·</span>
-      <span id="current-slide" class="header-current" data-i18n="header.no.slide">未打开切片</span>
     </div>
     <span id="header-zoom-badge" class="zoom-badge header-zoom-badge">—</span>
     {% if C.login_cta %}
@@ -34,12 +36,14 @@
     <button type="button" class="lang-toggle" aria-label="Switch language">EN</button>
 
     <div id="toolbar">
-      <div class="btn-group">
+      <div class="btn-group" id="zoom-group">
         <button id="zoom-out" class="icon-btn" data-i18n-title="tb.zoom.out" aria-label="缩小" data-i18n-aria="tb.zoom.out">−</button>
         <button id="zoom-in" class="icon-btn" data-i18n-title="tb.zoom.in" aria-label="放大" data-i18n-aria="tb.zoom.in">+</button>
       </div>
 
-      <div class="btn-group view-tools">
+      {# 升级 Review 2026-09-09 §3.3：视图组（旋转/镜像）在中等宽度折入 ⋯ 菜单；
+         DOM 节点整体搬移（同一状态机），菜单机制复用 tbb-more。 #}
+      <div class="btn-group view-tools" id="view-tools-group">
         <button id="rotate-btn" class="icon-btn" data-i18n-title="tb.rotate" aria-label="旋转">↻</button>
         <button id="flip-btn" class="icon-btn" data-i18n-title="tb.flip" aria-label="镜像">⇋</button>
       </div>
@@ -47,11 +51,14 @@
       <span class="tb-sep" aria-hidden="true"></span>
 
       {% if C.roi %}
-      {# 升级 C（§6.1）：两个固定 ROI 按钮替换为单个「矩形」入口 + 紧凑设置区
-         （宽/高/单位/锁定比例/预设；默认不锁定比例）。#}
+      {# 升级 C（§6.1）：两个固定 ROI 按钮替换为单个「矩形」入口。
+         升级 Review 2026-09-09 §3.3：尺寸五项（宽/高/单位/锁比例/预设）改为
+         按钮下方锚定 popover（.toolbar-pop，JS 定位）；主行只留简短摘要
+         （#roi-summary，如 6×6 mm）。#}
       <div class="roi-rect-wrap">
         <button id="roi-rect-btn" class="tool-btn roi-rect-btn" aria-expanded="false" aria-controls="roi-settings" data-i18n-title="tb.rect.title"><span aria-hidden="true">▭</span><span class="tb-txt" data-i18n="tb.rect"> 矩形</span></button>
-        <div id="roi-settings" class="roi-settings" role="group" aria-label="矩形尺寸" data-i18n-aria="tb.rect.settings.aria" hidden>
+        <span id="roi-summary" class="roi-summary" data-i18n-title="tb.rect.summary.title" title="当前矩形尺寸" hidden></span>
+        <div id="roi-settings" class="roi-settings toolbar-pop" role="group" aria-label="矩形尺寸" data-i18n-aria="tb.rect.settings.aria" hidden>
           <label class="roi-set-field"><span data-i18n="tb.rect.w">宽</span>
             <input id="roi-w-input" class="roi-num" type="number" min="0" step="any" autocomplete="off" /></label>
           <label class="roi-set-field"><span data-i18n="tb.rect.h">高</span>
@@ -72,11 +79,26 @@
       {% endif %}
 
       {% if C.annotate %}
-      <div class="btn-group anno-tools">
+      {# 升级 Review 2026-09-09 §3.3：标注组。#anno-label-input 移出主行，
+         进入「标注选项」popover（更名「标注名称（可选）」）；同一 input id，
+         saveAnno 事件逻辑不变。 #}
+      <div class="btn-group anno-tools" id="anno-tools-group">
         <button id="anno-arrow-btn" class="tool-btn" data-i18n-title="tb.anno.arrow.title" disabled><span aria-hidden="true">↗</span><span class="tb-txt" data-i18n="tb.anno.arrow"> 箭头</span></button>
         <button id="anno-free-btn" class="tool-btn" data-i18n-title="tb.anno.free.title" disabled><span aria-hidden="true">〰</span><span class="tb-txt" data-i18n="tb.anno.free"> 描图</span></button>
+        <button id="anno-more-btn" class="icon-btn anno-more-btn" type="button" aria-label="标注选项"
+                data-i18n-aria="tb.anno.more" data-i18n-title="tb.anno.more" title="标注选项"
+                aria-haspopup="dialog" aria-expanded="false" aria-controls="anno-pop">▾</button>
       </div>
       <button id="anno-btn" class="tool-btn" data-i18n="tb.anno.open" disabled>标记</button>
+      <div id="anno-pop" class="anno-pop toolbar-pop" role="dialog"
+           aria-label="标注选项" data-i18n-aria="tb.anno.more" hidden>
+        <label class="anno-pop-field">
+          <span class="anno-pop-label" data-i18n="tb.anno.label.name">标注名称（可选）</span>
+          <input id="anno-label-input" type="text" maxlength="40"
+                 class="anno-label-input" data-i18n-ph="tb.anno.label.ph" data-i18n-title="tb.anno.label.title"
+                 placeholder="默认 管理员" autocomplete="off" />
+        </label>
+      </div>
       {% endif %}
 
       {% if mode == 'demo' or histopilot_ui_enabled %}
@@ -97,10 +119,9 @@
       {% if C.annotate or C.save_image or C.mpp %}
       <span class="tb-sep" aria-hidden="true"></span>
       <div class="tbb-context" id="tbb-context">
+        {# 升级 Review 2026-09-09 §3.3：标注名称输入框已迁入「标注选项」popover，
+           主行不再出现自由文本输入框（避免被误读为账户身份）。 #}
         {% if C.annotate %}
-        <input id="anno-label-input" type="text" maxlength="40"
-               class="anno-label-input" data-i18n-ph="tb.anno.label.ph" data-i18n-title="tb.anno.label.title"
-               placeholder="默认 管理员" autocomplete="off" />
         <button id="save-anno-btn" class="tool-btn anno-save" data-i18n-title="tb.save.anno.title" data-i18n="tb.save.anno" disabled>保存标记</button>
         {% endif %}
         {% if C.save_image %}
@@ -133,6 +154,39 @@
         {% endif %}
         <button id="reset-btn" class="tool-btn" role="menuitem" data-i18n-title="tb.reset" data-i18n="tb.reset.label">Reset</button>
       </div>
+
+      {# 升级 Review 2026-09-09 §3.5：账户 chip + popover。真实账户入口
+         （display_username local-part）；Demo 只读壳无登录态不渲染。
+         余额经 GET /api/account/balance（打开 popover 时拉取，服务端 no-store）。 #}
+      {% if mode != 'demo' %}
+      <div id="acct-wrap" class="acct-wrap">
+        <button id="acct-btn" class="acct-btn" type="button" hidden
+                aria-haspopup="dialog" aria-expanded="false" aria-controls="acct-pop"
+                aria-label="账户" data-i18n-aria="acct.chip.aria"
+                data-i18n-title="acct.chip.aria" title="账户">
+          <span id="acct-btn-name" class="acct-btn-name"></span>
+          <span class="acct-btn-caret" aria-hidden="true">▾</span>
+        </button>
+        <div id="acct-pop" class="acct-pop toolbar-pop" role="dialog"
+             aria-label="账户信息" data-i18n-aria="acct.pop.aria" hidden>
+          <div id="acct-pop-preview" class="acct-pop-preview" hidden data-i18n="acct.preview.tag">管理员预览</div>
+          <div id="acct-pop-email" class="acct-pop-email"></div>
+          <div class="acct-pop-role-row">
+            <span class="acct-pop-role-label" data-i18n="acct.role.label">角色</span>
+            <span id="acct-pop-role" class="acct-pop-role"></span>
+          </div>
+          <div id="acct-pop-balance" class="acct-pop-balance">
+            <div class="acct-pop-balance-head">
+              <span data-i18n="acct.balance.title">余额</span>
+              <span id="acct-pop-scope" class="acct-pop-scope"></span>
+            </div>
+            <div id="acct-pop-remaining" class="acct-pop-remaining">—</div>
+            <div id="acct-pop-detail" class="acct-pop-detail"></div>
+          </div>
+          <button type="button" id="acct-settings-btn" class="acct-settings" data-i18n="acct.settings" hidden>账户设置</button>
+        </div>
+      </div>
+      {% endif %}
     </div>
   </header>
 

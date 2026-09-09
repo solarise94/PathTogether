@@ -903,7 +903,7 @@ def test_admin_manifest_plugin_version_bumped_with_hashes():
     main.js hash 与 manifest pin 同步。"""
     data = json.loads(ADMIN_MANIFEST.read_text(encoding="utf-8"))
     # 2026-09-09 0.4.2：默认模型切换卡
-    assert data["pluginVersion"] == "0.4.2"  # P2-2 身份冲突页；hashes/pin 同步
+    assert data["pluginVersion"] == "0.4.3"  # P2-2 身份冲突页；hashes/pin 同步
     assert "admin:settings:read" in data["adminPermissions"]
     assert "admin:settings:write" in data["adminPermissions"]
     assert "admin:slides:read" in data["adminPermissions"]

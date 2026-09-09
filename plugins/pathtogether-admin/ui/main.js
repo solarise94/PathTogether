@@ -2115,8 +2115,15 @@
       if (m && m.model) sel.value = m.model;
     }
     if (saveBtn) {
+      var curOpt = null;
+      if (m && Array.isArray(m.options)) {
+        curOpt = m.options.filter(function (o) {
+          return o && o.model === sel.value;
+        })[0] || null;
+      }
       saveBtn.disabled = !!state.modelError || !m ||
-        !Array.isArray(m.options) || !m.options.length;
+        !Array.isArray(m.options) || !m.options.length ||
+        (curOpt && curOpt.available === false);
     }
   }
 

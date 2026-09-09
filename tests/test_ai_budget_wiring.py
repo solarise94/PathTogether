@@ -713,7 +713,7 @@ def test_ui_budget_card_and_max_steps_sync_present():
     # 2026-09-07 升 0.4.0：展示 J（身份主列=完整邮箱用户名，main.js/pin 同步）。
     # 2026-09-08 升 0.4.1：身份冲突清单+孤儿处置页（P2-2 闭环）。
     # 2026-09-09 0.4.2：默认模型切换卡
-    assert manifest["pluginVersion"] == "0.4.2"
+    assert manifest["pluginVersion"] == "0.4.3"
     for perm in ("admin:turn-budgets:read", "admin:turn-budgets:write",
                  "admin:acquisition:read", "admin:billing:write"):
         assert perm not in manifest["adminPermissions"], perm

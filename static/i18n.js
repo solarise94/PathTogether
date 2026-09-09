@@ -23,6 +23,11 @@
       "header.no.slide": "未打开切片",
       "header.loading": "加载中…",
       "lang.toggle": "EN", // 中文界面下按钮显示 EN（切到英文）
+      // ---- Beta 徽标与文档标题（升级 Review 2026-09-09 §3.4） ----
+      "beta.badge": "Beta",
+      "beta.badge.tip": "Beta 测试中，功能可能调整；遇到异常请反馈。",
+      "app.doc.title": "PathTogether Beta",
+      "app.doc.title.demo": "PathTogether Beta · Demo",
 
       // ---- index 工具栏 ----
       "tb.menu": "菜单",
@@ -55,6 +60,10 @@
       "tb.rect.preset.none": "预设",
       "tb.rect.preset.6": "6×6 mm",
       "tb.rect.preset.6.5": "6.5×6.5 mm",
+      "tb.rect.summary.title": "当前矩形尺寸",
+      // 标注选项 popover（§3.3：标注名称移出主行）
+      "tb.anno.more": "标注选项",
+      "tb.anno.label.name": "标注名称（可选）",
       "roi.rect.tip": "矩形工具：在视野中拖出矩形，或输入宽高后点击中心放置；拖内部平移、边/角调整大小；Escape 取消",
       "roi.cancelled": "已取消未保存的选区",
       "roi.input.invalid": "矩形尺寸非法或超出图像范围，已保留上次的合法框",
@@ -155,6 +164,29 @@
       "acct.changeemail.err.locked": "尝试过于频繁，请稍后再试",
       "acct.changeemail.err.channel": "邮件通道未配置，暂时无法发起改绑",
       "acct.changeemail.err.generic": "改绑失败，请稍后重试",
+      // ---- 账户 chip + popover（升级 Review 2026-09-09 §3.5） ----
+      "acct.chip.aria": "账户",
+      "acct.pop.aria": "账户信息",
+      "acct.preview.tag": "管理员预览",
+      "acct.role.label": "角色",
+      "acct.role.owner": "管理员（owner）",
+      "acct.role.user": "用户（user）",
+      "acct.settings": "账户设置",
+      "acct.balance.title": "余额",
+      "acct.balance.scope.total": "一次性总额度",
+      "acct.balance.scope.month": "当月窗口",
+      "acct.balance.remaining": "剩余",
+      "acct.balance.limit": "总额度",
+      "acct.balance.spent": "已用",
+      "acct.balance.reserved": "在途预留",
+      "acct.balance.period": "窗口",
+      "acct.balance.loading": "加载中…",
+      "acct.balance.unavailable": "额度信息暂不可用（{reason}）",
+      "acct.balance.reason.missing": "未设置总额度",
+      "acct.balance.reason.db": "数据库暂不可用",
+      "acct.balance.reason.auth": "登录状态已失效",
+      "acct.balance.reason.http": "服务返回 {status}",
+      "acct.balance.reason.network": "网络异常",
 
       // ---- 插件管理（owner；Stage 4-3） ----
 
@@ -687,6 +719,11 @@
       "header.no.slide": "No slide open",
       "header.loading": "Loading…",
       "lang.toggle": "中", // 英文界面下按钮显示 中（切到中文）
+      // ---- Beta badge & document title (review 2026-09-09 §3.4) ----
+      "beta.badge": "Beta",
+      "beta.badge.tip": "Beta: features may change; please report any issues.",
+      "app.doc.title": "PathTogether Beta",
+      "app.doc.title.demo": "PathTogether Beta · Demo",
 
       // ---- index 工具栏 ----
       "tb.menu": "Menu",
@@ -719,6 +756,10 @@
       "tb.rect.preset.none": "Preset",
       "tb.rect.preset.6": "6×6 mm",
       "tb.rect.preset.6.5": "6.5×6.5 mm",
+      "tb.rect.summary.title": "Current rectangle size",
+      // Annotation options popover (§3.3: label input moved out of the main row)
+      "tb.anno.more": "Annotation options",
+      "tb.anno.label.name": "Annotation name (optional)",
       "roi.rect.tip": "Rectangle tool: drag in the view, or enter width/height then click to place; drag inside to move, edges/corners to resize; Escape cancels",
       "roi.cancelled": "Unsaved selection cancelled",
       "roi.input.invalid": "Invalid rectangle size or out of image bounds; kept the last valid box",
@@ -819,6 +860,29 @@
       "acct.changeemail.err.locked": "Too many attempts, please try again later",
       "acct.changeemail.err.channel": "Email delivery is not configured; please try again later",
       "acct.changeemail.err.generic": "Failed to request the email change, please try again later",
+      // ---- Account chip + popover (review 2026-09-09 §3.5) ----
+      "acct.chip.aria": "Account",
+      "acct.pop.aria": "Account info",
+      "acct.preview.tag": "Admin preview",
+      "acct.role.label": "Role",
+      "acct.role.owner": "Administrator (owner)",
+      "acct.role.user": "User",
+      "acct.settings": "Account settings",
+      "acct.balance.title": "Balance",
+      "acct.balance.scope.total": "Total allowance (one-time)",
+      "acct.balance.scope.month": "Current monthly window",
+      "acct.balance.remaining": "Remaining",
+      "acct.balance.limit": "Limit",
+      "acct.balance.spent": "Spent",
+      "acct.balance.reserved": "Reserved",
+      "acct.balance.period": "Window",
+      "acct.balance.loading": "Loading…",
+      "acct.balance.unavailable": "Balance info unavailable ({reason})",
+      "acct.balance.reason.missing": "total allowance not set",
+      "acct.balance.reason.db": "database unavailable",
+      "acct.balance.reason.auth": "session expired",
+      "acct.balance.reason.http": "service returned {status}",
+      "acct.balance.reason.network": "network error",
 
       // ---- 插件管理（owner；Stage 4-3） ----
 

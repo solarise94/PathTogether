@@ -588,6 +588,84 @@ def test_settings_model_switch_limited_model():
     assert app_mod._load_ai_config()["model"] == app_mod.DEEPSEEK_VISION_MODEL
 
 
+def test_model_catalog_availability_and_expiry():
+    """Batch A（升级 Review §4.1）：目录字段 + 服务端 UTC 时钟判定到期。"""
+    from datetime import datetime, timedelta, timezone
+    entries = {e["model"]: e for e in app_mod._model_catalog_entries()}
+    assert set(entries) == set(app_mod._DEEPSEEK_OFFICIAL_MODELS)
+    vis = entries[app_mod.DEEPSEEK_VISION_MODEL]
+    v41 = entries[app_mod.DEEPSEEK_V41_FLASH_MODEL]
+    # 到期前（09-10 当天内）：两项均可用
+    in_day = app_mod._model_catalog_entries(
+        now=datetime(2026, 9, 10, 23, 0, tzinfo=timezone.utc))
+    assert all(e["available"] for e in in_day)
+    # 到期后（09-11 00:00Z 起）：限时模型 unavailable + disabled_reason
+    after = {e["model"]: e for e in app_mod._model_catalog_entries(
+        now=datetime(2026, 9, 11, 0, 0, tzinfo=timezone.utc))}
+    assert after[app_mod.DEEPSEEK_V41_FLASH_MODEL]["available"] is False
+    assert after[app_mod.DEEPSEEK_V41_FLASH_MODEL]["disabled_reason"] == "expired"
+    assert after[app_mod.DEEPSEEK_VISION_MODEL]["available"] is True
+    # 长期模型 expires_at=None；限时模型带日期；files 语义不变
+    assert vis["expires_at"] is None and v41["expires_at"] == "2026-09-10"
+    assert vis["files_supported"] is True and v41["files_supported"] is False
+    # GET 目录带 catalog_version 与稳定字段
+    owner, _u = _setup_users()
+    c = _login(_client(), owner)
+    body = c.get("/api/admin/v1/settings/model").get_json()
+    assert body["catalog_version"] == app_mod._DEEPSEEK_MODEL_CATALOG_VERSION
+    opt = body["options"][0]
+    assert set(opt) >= {"model", "label", "available", "files_supported",
+                        "expires_at", "disabled_reason"}
+
+
+def test_switch_default_model_rejects_unavailable(monkeypatch):
+    """Batch A：目录内但服务端判定不可用 → 409 model_unavailable（客户端
+    伪造 available 无效——PUT 不看请求体可用性）；到期边界经服务函数注入。"""
+    from datetime import datetime, timezone
+    owner, _u = _setup_users()
+    c = _login(_client(), owner)
+    cfg = {"base_url": app_mod.DEEPSEEK_BASE_URL,
+           "api_protocol": "openai",
+           "provider_kind": "deepseek_official",
+           "model": app_mod.DEEPSEEK_VISION_MODEL,
+           "api_key": "sk-test-official-key-000"}
+    app_mod._save_ai_config(cfg)
+
+    real_entries = app_mod._model_catalog_entries
+
+    def _expired_now(now=None):
+        return real_entries(now=datetime(2026, 9, 12, tzinfo=timezone.utc))
+
+    monkeypatch.setattr(app_mod, "_model_catalog_entries", _expired_now)
+    r = c.put("/api/admin/v1/settings/model",
+              json={"model": app_mod.DEEPSEEK_V41_FLASH_MODEL,
+                    "available": True})  # 伪造无效
+    assert r.status_code == 409
+    assert r.get_json()["error"]["code"] == "model_unavailable"
+    # 落盘未动
+    assert app_mod._load_ai_config()["model"] == app_mod.DEEPSEEK_VISION_MODEL
+    # 到期后切回长期模型不受影响
+    r2 = c.put("/api/admin/v1/settings/model",
+               json={"model": app_mod.DEEPSEEK_VISION_MODEL})
+    assert r2.status_code == 200
+
+
+def test_ai_config_user_get_has_effective_model_label():
+    """Batch A：user 视角 GET /api/ai/config 带脱敏模型摘要（无目录/key）。"""
+    owner, user = _setup_users()
+    cfg = {"base_url": app_mod.DEEPSEEK_BASE_URL,
+           "api_protocol": "openai",
+           "provider_kind": "deepseek_official",
+           "model": app_mod.DEEPSEEK_V41_FLASH_MODEL,
+           "api_key": "sk-test-official-key-000"}
+    app_mod._save_ai_config(cfg)
+    c = _login(_client(), user)
+    body = c.get("/api/ai/config").get_json()
+    assert body["effective_model_label"] == "DeepSeek v4.1 Flash（限时试用）"
+    assert "options" not in body and "catalog_version" not in body
+    assert "api_key" not in body
+
+
 def test_limited_model_priced_same_as_vision_exp():
     """0042：限时模型在两本 active 价格书中有价，且与 vision-exp 逐档一致
     （owner 决策同价；hard 模式无价会 pricing_unavailable fail-closed）。"""

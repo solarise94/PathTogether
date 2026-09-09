@@ -443,6 +443,9 @@
       $("current-slide").textContent = entry.display_name || entry.name || slideId;
       $("current-slide").title = entry.description || entry.name || "";
     }
+    // §3.4：常驻 #current-slide 下架后，切片名进 document.title；
+    // Demo 组合「Beta · Demo」标识（正式版为「切片名 · PathTogether Beta」）。
+    document.title = (entry.display_name || entry.name || slideId) + " · " + t("app.doc.title.demo");
     var api = demoApi();
     return api.slideInfo(slideId)
       .then(function (r) { return r.json(); })

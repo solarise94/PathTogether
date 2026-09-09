@@ -168,6 +168,24 @@
     if (els.adminEntryLink) {
       els.adminEntryLink.hidden = !!previewState || actorRole !== "owner";
     }
+    // 账户 chip（§3.5）：视觉文字 = 规范化邮箱 @ 前的 local-part（非邮箱存量
+    // 账号回退完整 login_id）；权威身份仍是完整邮箱，popover 展示完整邮箱。
+    // 未登录（username 空）不显示；预览态显示被预览 subject 并在 popover
+    // 顶部标「管理员预览」，真实 actor 的账户设置入口照旧隐藏。
+    if (els.acctBtn) {
+      var chipName = acctDisplayUsername(info.username);
+      if (els.acctBtnName) els.acctBtnName.textContent = chipName;
+      els.acctBtn.hidden = !chipName;
+      if (els.acctPopPreview) els.acctPopPreview.hidden = !previewState;
+      if (els.acctPopEmail) els.acctPopEmail.textContent = info.username || "";
+      if (els.acctPopRole) {
+        els.acctPopRole.textContent =
+          t(currentRole === "owner" ? "acct.role.owner" : "acct.role.user");
+      }
+      if (els.acctSettingsBtn) {
+        els.acctSettingsBtn.hidden = !!previewState || !info.username;
+      }
+    }
     if (window.HP_I18N && window.HP_I18N.setRole) { window.HP_I18N.setRole(currentRole); }
     if (els.sharePermHint) {
       els.sharePermHint.hidden = currentRole !== "user";
@@ -258,6 +276,11 @@
     // 更换邮箱提交（tests/js/account-email-change.test.ts 行为契约挂载点，
     // 与 apiFetch/applyAuthInfo 同级；init 在 bindEvents 里照常接线）
     changeemailSubmit: changeemailSubmit,
+    // 账户 chip / 余额展示（升级 Review 2026-09-09 §3.5）纯函数挂载点
+    // （tests/js/toolbar-account-upgrade.test.ts 锁 local-part 回退与
+    // nano-CNY 精确换算锚点）
+    acctDisplayUsername: acctDisplayUsername,
+    acctCny: acctCny,
   };
 
   // ---------- 修改我的密码（账户系统批次 A docs §7.1；owner/user 通用） ----------
@@ -530,7 +553,6 @@
   var viewer = null;
   function $(id) { return document.getElementById(id); }
   var els = {
-    currentSlide: $("current-slide"),
     zoomIn: $("zoom-in"),
     zoomOut: $("zoom-out"),
     rotateBtn: $("rotate-btn"),
@@ -538,6 +560,7 @@
     // 升级 C：单一矩形入口 + 紧凑设置区（旧 roi-6/roi-6-5/roi-box-btn 已移除）
     roiRectBtn: $("roi-rect-btn"),
     roiSettings: $("roi-settings"),
+    roiSummary: $("roi-summary"),
     roiWInput: $("roi-w-input"),
     roiHInput: $("roi-h-input"),
     roiUnitSelect: $("roi-unit-select"),
@@ -550,6 +573,8 @@
     annoArrowBtn: $("anno-arrow-btn"),
     annoFreeBtn: $("anno-free-btn"),
     annoLabelInput: $("anno-label-input"),
+    annoMoreBtn: $("anno-more-btn"),
+    annoPop: $("anno-pop"),
     annoCanvas: $("anno-canvas"),
     resetBtn: $("reset-btn"),
     mppSetter: $("mpp-setter"),
@@ -654,6 +679,17 @@
     channelPanelHost: $("channel-panel"),
     // viewer 画质档（image-transport-upgrade；能力存在才显示）
     qualityControl: $("quality-control"),
+    // 账户 chip + popover（升级 Review 2026-09-09 §3.5；Demo 壳不渲染，全部可空）
+    acctBtn: $("acct-btn"),
+    acctBtnName: $("acct-btn-name"),
+    acctPop: $("acct-pop"),
+    acctPopPreview: $("acct-pop-preview"),
+    acctPopEmail: $("acct-pop-email"),
+    acctPopRole: $("acct-pop-role"),
+    acctPopScope: $("acct-pop-scope"),
+    acctPopRemaining: $("acct-pop-remaining"),
+    acctPopDetail: $("acct-pop-detail"),
+    acctSettingsBtn: $("acct-settings-btn"),
   };
 
   var roiBox = null;
@@ -1021,6 +1057,14 @@
     });
   }
 
+  // ---------- 文档标题（§3.4：品牌区 Beta 徽标后切片名只进 document.title） ----------
+  function updateDocTitle(slideName) {
+    var base = t("app.doc.title");
+    try {
+      document.title = slideName ? (slideName + " · " + base) : base;
+    } catch (e) { /* 非 DOM 环境忽略 */ }
+  }
+
   // ---------- 打开切片 ----------
   function openSlide(name) {
     // 切换切片前移除旧底图
@@ -1048,8 +1092,9 @@
         state.rotation = 0;
         // 升级 A：切片已打开，隐藏无切片空态入口
         updateViewerEmptyState();
-        els.currentSlide.textContent = info.alias || info.name;
-        els.currentSlide.title = info.name + (info.note ? " · " + info.note : "");
+        // §3.4：常驻 #current-slide 已下架——切片名进 document.title
+        //（"切片名 · PathTogether Beta"）；侧栏选中行/切片信息菜单/面板标题仍在。
+        updateDocTitle(info.alias || info.name);
         updateMppSetterVisibility();
         exitRoi();
         // 创建底图缩略图层：铺在瓦片 canvas 之前（下层），慢网下透出模糊预览
@@ -1271,7 +1316,11 @@
     state.roi = { x: 0, y: 0, w: 0, h: 0 };
     els.annoCanvas.classList.add("drawing");
     els.roiRectBtn.classList.add("active");
-    if (els.roiSettings) els.roiSettings.hidden = false;
+    if (els.roiSettings) {
+      els.roiSettings.hidden = false;
+      // §3.3：尺寸区改为按钮下方锚定 popover（fixed 定位，JS 计算）
+      positionToolbarPop(els.roiRectBtn, els.roiSettings);
+    }
     els.roiRectBtn.setAttribute("aria-expanded", "true");
     if (viewer) viewer.setMouseNavEnabled(false);
     updateRoiButtons();
@@ -1292,6 +1341,7 @@
       els.roiRectBtn.setAttribute("aria-expanded", "false");
     }
     if (els.roiSettings) els.roiSettings.hidden = true;
+    if (els.roiSummary) els.roiSummary.hidden = true;
     if (viewer) viewer.setMouseNavEnabled(true);
     updateRoiButtons();
     els.saveBtn.disabled = true;
@@ -1389,6 +1439,33 @@
       viewer.addOverlay(opts);
     }
     syncRoiSettings();
+    updateRoiSummary();
+  }
+
+  // 主行简短摘要（§3.3）：有选区时显示如「6×6 mm」，无选区隐藏。
+  // 与 rectPhysicalText 同口径（分轴反算、当前单位），去掉尾随 0。
+  function rectSummaryText() {
+    var r = state.roi;
+    if (!r || !(r.w > 0) || !(r.h > 0)) return "";
+    var unit = state.roiUnit;
+    if (unit === "px") return r.w + "×" + r.h + " px";
+    var mx = Number(state.mppX), my = Number(state.slide && state.slide.mppY);
+    if (!posNum(mx) || !posNum(my)) return r.w + "×" + r.h + " px";
+    var wx = r.w * mx, hy = r.h * my; // µm
+    function trimNum(n) {
+      return String(n).replace(/\.0$/, "").replace(/(\.\d*?)0+$/, "$1");
+    }
+    if (unit === "mm") {
+      return trimNum(+(wx / 1000).toFixed(2)) + "×" + trimNum(+(hy / 1000).toFixed(2)) + " mm";
+    }
+    return trimNum(+wx.toFixed(1)) + "×" + trimNum(+hy.toFixed(1)) + " μm";
+  }
+
+  function updateRoiSummary() {
+    if (!els.roiSummary) return;
+    var s = rectSummaryText();
+    els.roiSummary.textContent = s;
+    els.roiSummary.hidden = !s;
   }
 
   // ---------- 矩形拖拽：内部平移 / 四边单轴 / 四角双轴（pointer 捕获） ----------
@@ -2604,6 +2681,20 @@
         }
         if (typeof deps.focusSearch === "function") deps.focusSearch();
       },
+      // 账户设置入口（§3.5）：只展开侧栏/开抽屉（不抢搜索框焦点），
+      // 随后由调用方滚动到既有改密/改绑卡片区
+      expand: function () {
+        if (isMobile()) {
+          if (!drawerOpen()) applyDrawer(true);
+          return;
+        }
+        if (collapsed) {
+          collapsed = false;
+          userTouched = true;
+          applyDesktop();
+          writeSidebarPref(deps.storage, scopeName(), collapsed);
+        }
+      },
       // 语言切换后同步按钮文案/aria（状态不变，仅 label）
       refreshButton: function () {
         setBtnState(isMobile() ? drawerOpen() : !collapsed);
@@ -2690,7 +2781,11 @@
     document.body.classList.toggle("ctx-on", on);
   }
 
-  // ---------- ⋯ 溢出菜单（移动端装 AI 读片；桌面端装 Reset/显示全部标记等低频操作） ----------
+  // ---------- ⋯ 溢出菜单（§3.3 宽度分组的统一折叠目标；装 AI 副本/Reset/
+  //   显示全部标记，以及按断点搬入的视图/标注/保存等真实 DOM 节点） ----------
+  // 外点关闭走 document 级监听：#tbb-more-mask（z 490）会盖住 #app-header
+  // （z 10）导致菜单项点击被 mask 吞掉（只关菜单不触发动作），故不再展示
+  // mask（元素保留，移动端 CSS 不受影响）。
   function bindTbbMore() {
     if (!els.tbbMoreBtn || !els.tbbMore) return;
     var mask = $("tbb-more-mask");
@@ -2700,13 +2795,23 @@
       els.tbbMoreBtn.setAttribute("aria-expanded", "false");
     }
     function openMore() {
+      // 同一时间至多一个工具栏浮层：打开 ⋯ 前收起其它浮层
+      toolbarPopClosers.forEach(function (fn) { fn(); });
       els.tbbMore.classList.add("open");
-      if (mask) mask.classList.add("open");
       els.tbbMoreBtn.setAttribute("aria-expanded", "true");
     }
+    closeTbbMoreMenu = closeMore;
     els.tbbMoreBtn.addEventListener("click", function (e) {
       e.stopPropagation();
       if (els.tbbMore.classList.contains("open")) { closeMore(); } else { openMore(); }
+    });
+    // 点击菜单外（viewer / 侧栏 / 工具栏其它控件）即关闭；菜单内部点击照常生效
+    document.addEventListener("click", function (e) {
+      if (!els.tbbMore.classList.contains("open")) return;
+      var tgt = e.target;
+      if (tgt && tgt.closest &&
+          (tgt.closest("#tbb-more") || tgt.closest("#tbb-more-btn"))) return;
+      closeMore();
     });
     if (mask) mask.addEventListener("click", closeMore);
     // Esc 关菜单（HIG：弹出层必须可键盘退出）
@@ -3299,6 +3404,8 @@
     syncAnnoAllBtns();
     redrawAnnoCanvas();
     updateCtxBar();
+    // §3.3 narrow 档「只留当前工具」：激活的绘制工具所在组保留在主行
+    applyToolbarTier();
     toast(mode === "arrow" ? t("draw.arrow.tip") : t("draw.free.tip"), "info");
   }
 
@@ -3312,6 +3419,7 @@
     if (viewer) viewer.setMouseNavEnabled(true);
     redrawAnnoCanvas();
     updateCtxBar();
+    applyToolbarTier();
   }
 
   function toggleDrawMode(mode) {
@@ -4239,7 +4347,7 @@
         if (!r.ok) return r.json().then(function (j) { throw new Error(j.error); });
         if (state.slide && state.slide.name === name) {
           state.slide = null; state.mppX = null; state.roiMode = null;
-          els.currentSlide.textContent = t("header.no.slide");
+          updateDocTitle(null);
           updateMppSetterVisibility();
           if (roiBox) exitRoi();
           if (viewer) viewer.close();
@@ -4630,6 +4738,357 @@
   }
 
   // ---------- 事件绑定 ----------
+  // =========================================================================
+  // 顶栏信息架构（升级 Review 2026-09-09 §3.3–3.5）：
+  //   - 工具栏 popover 通用定位/开关机制（矩形设置、标注选项、账户）
+  //   - 账户 chip + popover + GET /api/account/balance 自助余额
+  //   - 宽度断点分组（>=1440 全展开；1024–1439 折视图/标注组；<1024 只留
+  //     当前工具、AI、倍率、账户，其余入 ⋯）
+  // =========================================================================
+
+  // ---------- nano-CNY 精确换算（§4.2；与 plugins/pathtogether-admin
+  // ui/main.js formatCny2 同一算法：十进制字符串/BigInt → 两位小数，半分
+  // 进位、绝对值方向舍入，全程不经 Number/toFixed，>2^53 不失真） ----------
+  function formatCny2(v) {
+    if (v === null || v === undefined || v === "") return null;
+    var b;
+    try { b = BigInt(v); } catch (e) { return null; }
+    var neg = b < 0n;
+    if (neg) b = -b;
+    // 1 分 = 1e7 nano；+5e6 后整除 = 半分进位（away from zero）
+    var cents = (b + 5000000n) / 10000000n;
+    var whole = cents / 100n;
+    var frac = (cents % 100n).toString().padStart(2, "0");
+    return (neg && cents !== 0n ? "-" : "") + whole.toString() + "." + frac;
+  }
+  function acctCny(v) {
+    var s = formatCny2(v);
+    return s === null ? null : s + " CNY";
+  }
+
+  // 规范化邮箱 @ 前的 local-part；非邮箱存量账号回退完整 login_id
+  function acctDisplayUsername(username) {
+    var s = String(username == null ? "" : username);
+    if (!s) return "";
+    var at = s.indexOf("@");
+    return at > 0 ? s.slice(0, at) : s;
+  }
+
+  // ---------- 工具栏 popover 机制 ----------
+  // #toolbar overflow-x:auto 会裁剪内部绝对定位后代，因此浮层用 fixed 定位，
+  // 打开时按触发按钮 getBoundingClientRect 计算；窗口 resize / 工具栏滚动 /
+  // Escape / 点击外部即关闭。同一机制服务矩形设置、标注选项与账户三个浮层。
+  var toolbarPopClosers = [];   // 已注册浮层的关闭函数（打开 ⋯ 菜单时统一收起）
+  var closeTbbMoreMenu = function () {}; // bindTbbMore 里被真实 closeMore 覆盖
+
+  // 打开期间把浮层挂到 body：#toolbar 的 overflow 裁剪与移动端底栏的
+  // backdrop-filter（fixed 包含块）都不再影响定位。
+  function ensurePopInBody(pop) {
+    try {
+      if (pop && pop.parentNode !== document.body && document.body && document.body.appendChild) {
+        document.body.appendChild(pop);
+      }
+    } catch (e) { /* 保持原位 */ }
+  }
+
+  function positionToolbarPop(btn, pop) {
+    if (!btn || !pop) return;
+    ensurePopInBody(pop);
+    var r = btn.getBoundingClientRect();
+    if (!r) return;
+    var pw = pop.offsetWidth || 0;
+    var ph = pop.offsetHeight || 0;
+    var vw = window.innerWidth || 1024;
+    var vh = window.innerHeight || 768;
+    var left = r.right - pw;
+    if (left < 8) left = 8;
+    if (left + pw > vw - 8) left = vw - 8 - pw;
+    if (left < 8) left = 8;
+    var top = r.bottom + 6;
+    // 下方空间不足（如移动端底栏触发）：向上弹
+    if (top + ph > vh - 8 && r.top - ph - 6 >= 8) {
+      top = r.top - ph - 6;
+    }
+    pop.style.left = Math.round(left) + "px";
+    pop.style.top = Math.round(top) + "px";
+  }
+
+  function bindToolbarPop(btn, pop, opts) {
+    opts = opts || {};
+    if (!btn || !pop) return null;
+    var open = false;
+    function setOpen(v) {
+      v = !!v;
+      if (v === open) { if (v) positionToolbarPop(btn, pop); return; }
+      open = v;
+      pop.hidden = !open;
+      btn.setAttribute("aria-expanded", open ? "true" : "false");
+      if (open) {
+        positionToolbarPop(btn, pop);
+        // 打开一个浮层时收起其它浮层与 ⋯ 菜单（同一时间至多一个）
+        toolbarPopClosers.forEach(function (fn) {
+          if (fn !== closer) fn();
+        });
+        closeTbbMoreMenu();
+        if (typeof opts.onOpen === "function") opts.onOpen();
+      } else if (typeof opts.onClose === "function") {
+        opts.onClose();
+      }
+    }
+    function closer() { setOpen(false); }
+    btn.addEventListener("click", function (e) {
+      e.stopPropagation();
+      setOpen(!open);
+    });
+    document.addEventListener("click", function (e) {
+      if (!open) return;
+      var tgt = e.target;
+      if (tgt && tgt.closest &&
+          (tgt.closest("#" + pop.id) || tgt.closest("#" + btn.id))) return;
+      setOpen(false);
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && open) setOpen(false);
+    });
+    window.addEventListener("resize", function () { if (open) setOpen(false); });
+    if (els.tbbMoreHost()) {
+      els.tbbMoreHost().addEventListener("scroll", function () {
+        if (open) setOpen(false);
+      });
+    }
+    toolbarPopClosers.push(closer);
+    return {
+      open: function () { setOpen(true); },
+      close: closer,
+      isOpen: function () { return open; },
+    };
+  }
+
+  // ---------- 账户 popover：余额拉取与渲染（§3.5） ----------
+  // user=一次性总额度口径（total_allowance）；owner=当月窗口口径
+  // （owner_month_window）。额度缺失（400 spend_total_allowance_missing）/
+  // DB 不可用（503）/网络失败一律显示「额度信息暂不可用（原因）」，
+  // 绝不显示 ¥0。金额是十进制字符串，经 formatCny2 精确换算两位小数。
+  function acctBalanceUnavailable(status, code) {
+    var key;
+    if (status === 400 && code === "spend_total_allowance_missing") {
+      key = "acct.balance.reason.missing";
+    } else if (status === 503) {
+      key = "acct.balance.reason.db";
+    } else if (status === 401 || status === 403) {
+      key = "acct.balance.reason.auth";
+    } else if (status) {
+      key = "acct.balance.reason.http";
+    } else {
+      key = "acct.balance.reason.network";
+    }
+    var reason = t(key, key === "acct.balance.reason.http" ? { status: String(status) } : null);
+    if (els.acctPopScope) els.acctPopScope.textContent = "";
+    if (els.acctPopRemaining) els.acctPopRemaining.textContent = "—";
+    if (els.acctPopDetail) {
+      els.acctPopDetail.textContent = t("acct.balance.unavailable", { reason: reason });
+    }
+  }
+
+  function acctBalanceRender(data) {
+    data = data || {};
+    var isMonth = data.spend_target === "owner_month_window";
+    if (els.acctPopScope) {
+      els.acctPopScope.textContent = t(isMonth ? "acct.balance.scope.month" : "acct.balance.scope.total");
+    }
+    if (els.acctPopRemaining) {
+      var remaining = acctCny(data.remaining_nano_cny);
+      els.acctPopRemaining.textContent =
+        remaining === null ? "—" : t("acct.balance.remaining") + " " + remaining;
+    }
+    if (els.acctPopDetail) {
+      var rows = [];
+      var limit = acctCny(data.limit_nano_cny);
+      var spent = acctCny(data.spent_nano_cny);
+      var reserved = acctCny(data.reserved_nano_cny);
+      if (limit !== null) rows.push(t("acct.balance.limit") + " " + limit);
+      if (spent !== null) rows.push(t("acct.balance.spent") + " " + spent);
+      if (reserved !== null && String(data.reserved_nano_cny) !== "0") {
+        rows.push(t("acct.balance.reserved") + " " + reserved);
+      }
+      if (isMonth && data.period_start && data.period_end) {
+        rows.push(t("acct.balance.period") + " " +
+          String(data.period_start).slice(0, 10) + " → " +
+          String(data.period_end).slice(0, 10));
+      }
+      els.acctPopDetail.textContent = rows.join(" · ");
+    }
+  }
+
+  function loadAccountBalance() {
+    if (els.acctPopRemaining) els.acctPopRemaining.textContent = t("acct.balance.loading");
+    if (els.acctPopDetail) els.acctPopDetail.textContent = "";
+    if (els.acctPopScope) els.acctPopScope.textContent = "";
+    apiFetch("/api/account/balance").then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (body) {
+        return { status: r.status, body: body };
+      });
+    }).then(function (res) {
+      if (res.status !== 200 || !res.body || !res.body.subject) {
+        acctBalanceUnavailable(res.status, res.body && res.body.code);
+        return;
+      }
+      acctBalanceRender(res.body);
+    }).catch(function () {
+      acctBalanceUnavailable(0, null);
+    });
+  }
+
+  function openAccountSettings() {
+    if (acctPopCtl) acctPopCtl.close();
+    if (!sidebarCtrl) return;
+    // 沿用既有改密/改绑入口：展开侧栏（手机开抽屉）并滚到侧栏账户区
+    sidebarCtrl.expand();
+    var target = els.changepwBtn || els.changeemailBtn;
+    if (target && typeof target.scrollIntoView === "function") {
+      try { target.scrollIntoView({ block: "center" }); }
+      catch (e) { try { target.scrollIntoView(); } catch (e2) {} }
+    }
+  }
+
+  var acctPopCtl = null;
+  var annoPopCtl = null;
+
+  // els.tbbMore 的宿主：正式版在 #toolbar 内；浮层随工具栏横向滚动收起
+  els.tbbMoreHost = function () { return els.tbbMore && els.tbbMore.parentNode; };
+
+  function initToolbarPops() {
+    acctPopCtl = bindToolbarPop(els.acctBtn, els.acctPop, {
+      onOpen: function () { loadAccountBalance(); },
+    });
+    annoPopCtl = bindToolbarPop(els.annoMoreBtn, els.annoPop, {
+      onOpen: function () {
+        var input = els.annoLabelInput;
+        if (input && typeof input.focus === "function") {
+          setTimeout(function () { try { input.focus(); } catch (e) {} }, 30);
+        }
+      },
+    });
+    if (els.acctSettingsBtn) {
+      els.acctSettingsBtn.addEventListener("click", openAccountSettings);
+    }
+    // 矩形设置 popover：开合由工具激活状态驱动（toggleRectTool/exitRoi）；
+    // 这里只补「点击外部关闭 popover（工具保持激活）」的语义。
+    document.addEventListener("click", function (e) {
+      if (!rectToolActive() || !els.roiSettings || els.roiSettings.hidden) return;
+      var tgt = e.target;
+      if (tgt && tgt.closest &&
+          (tgt.closest("#roi-settings") || tgt.closest("#roi-rect-btn"))) return;
+      els.roiSettings.hidden = true;
+      els.roiRectBtn.setAttribute("aria-expanded", "false");
+    });
+    toolbarPopClosers.push(function () {
+      if (rectToolActive() && els.roiSettings && !els.roiSettings.hidden) {
+        els.roiSettings.hidden = true;
+        els.roiRectBtn.setAttribute("aria-expanded", "false");
+      }
+    });
+    window.addEventListener("resize", function () {
+      if (rectToolActive() && els.roiSettings && !els.roiSettings.hidden) {
+        els.roiSettings.hidden = true;
+        els.roiRectBtn.setAttribute("aria-expanded", "false");
+      }
+    });
+  }
+
+  // ---------- 宽度断点分组（§3.3） ----------
+  // >=1440 全展开；1024–1439 折「视图」组（旋转/镜像/画质/通道）与「标注」组；
+  // <1024 只留当前工具、AI、倍率、账户，其余入 ⋯。<=768 交还既有移动端布局
+  //（底栏/上下文条 CSS 自管）。搬移真实 DOM 节点（监听器/状态机不复制），
+  // 折叠目标统一是现有 #tbb-more 菜单。
+  var TB_FOLD_SPECS = [
+    { id: "view-tools-group", tiers: ["mid", "narrow"] },
+    { id: "quality-control", tiers: ["mid", "narrow"] },
+    { id: "channel-btn", tiers: ["mid", "narrow"] },
+    { id: "anno-tools-group", tiers: ["mid", "narrow"] },
+    { id: "anno-btn", tiers: ["mid", "narrow"] },
+    { id: "save-anno-btn", tiers: ["mid", "narrow"] },
+    { id: "zoom-group", tiers: ["narrow"] },
+    { id: "save-btn", tiers: ["narrow"] },
+    { id: "mpp-setter", tiers: ["narrow"] },
+    { id: "zoom-native", tiers: ["narrow"] },
+  ];
+
+  function tbTierForWidth() {
+    try {
+      if (window.matchMedia) {
+        if (window.matchMedia("(min-width: 1440px)").matches) return "wide";
+        if (window.matchMedia("(min-width: 1024px)").matches) return "mid";
+        return "narrow";
+      }
+    } catch (e) { /* fallthrough */ }
+    var w = Number(window.innerWidth) || 1440;
+    if (w >= 1440) return "wide";
+    if (w >= 1024) return "mid";
+    return "narrow";
+  }
+
+  // narrow 档「只留当前工具」：绘制工具激活时其所在组保留在主行
+  function tbSpecPinned(id) {
+    if (id === "anno-tools-group" && state.drawMode) return true;
+    return false;
+  }
+
+  function tbMoveIntoMore(el, more) {
+    if (el.parentNode === more) return;
+    el.__tbHome = { parent: el.parentNode, next: el.nextSibling };
+    more.appendChild(el);
+  }
+
+  function tbRestore(el) {
+    var home = el.__tbHome;
+    if (!home || !home.parent) return;
+    try { home.parent.insertBefore(el, home.next); }
+    catch (e) { try { home.parent.appendChild(el); } catch (e2) {} }
+  }
+
+  var tbCurrentTier = null;
+
+  function applyToolbarTier() {
+    var more = els.tbbMore;
+    if (!more) return;
+    var tier = tbTierForWidth();
+    // <=768：既有移动端布局（底栏/上下文条）全权接管，节点全部归位
+    try {
+      if (window.matchMedia && window.matchMedia(SB_MOBILE_QUERY).matches) tier = "mobile";
+    } catch (e) {}
+    TB_FOLD_SPECS.forEach(function (spec) {
+      var el = document.getElementById(spec.id);
+      if (!el) return;
+      var wantFolded = spec.tiers.indexOf(tier) >= 0 && !tbSpecPinned(spec.id);
+      var isFolded = el.parentNode === more;
+      if (wantFolded === isFolded) return;
+      if (wantFolded) tbMoveIntoMore(el, more);
+      else tbRestore(el);
+    });
+    // 档位类名（幂等）：CSS 据此隐藏悬空分隔线等
+    var toolbar = more.parentNode;
+    if (toolbar && toolbar.classList) {
+      toolbar.classList.toggle("tb-tier-mid", tier === "mid");
+      toolbar.classList.toggle("tb-tier-narrow", tier === "narrow");
+    }
+    if (tier !== tbCurrentTier) {
+      tbCurrentTier = tier;
+      // 档位切换时收起已开的工具栏浮层（几何已失效）
+      if (annoPopCtl) annoPopCtl.close();
+      if (acctPopCtl) acctPopCtl.close();
+      if (rectToolActive() && els.roiSettings && !els.roiSettings.hidden) {
+        els.roiSettings.hidden = true;
+        els.roiRectBtn.setAttribute("aria-expanded", "false");
+      }
+    }
+  }
+
+  function initToolbarTier() {
+    applyToolbarTier();
+    window.addEventListener("resize", function () { applyToolbarTier(); });
+  }
+
   function bindEvents() {
     els.zoomIn.addEventListener("click", zoomIn);
     els.zoomOut.addEventListener("click", zoomOut);
@@ -4668,6 +5127,7 @@
       els.roiUnitSelect.addEventListener("change", function () {
         state.roiUnit = els.roiUnitSelect.value;
         syncRoiSettings();
+        updateRoiSummary();
       });
     }
     if (els.roiLockRatio) {
@@ -4738,8 +5198,10 @@
       });
     }
 
-    // 移动端 ⋯ 溢出面板（AI 读片 + 缩放徽章）
+    // 移动端 ⋯ 溢出面板（AI 读片 + 缩放徽章）；§3.3 宽度分组的统一折叠目标
     bindTbbMore();
+    // 工具栏浮层（账户/标注选项/矩形设置外点关闭）：§3.3/§3.5
+    initToolbarPops();
 
     // 新建项目
     els.newProjectBtn.addEventListener("click", function () {
@@ -5166,6 +5628,8 @@
     initQualityControl();
     initSidebarController();
     bindEvents();
+    // §3.3 宽度断点分组：先于首次布局执行（把折叠档的节点搬入 ⋯ 菜单）
+    initToolbarTier();
     setupDragDrop();
     initAuth();
     // 注册 HistoPilot HostBridge host 能力（插件未启用时为空操作）
@@ -5203,6 +5667,16 @@
     } catch (e) {}
     // 升级 A：侧栏按钮文案/aria 随状态（展开↔收起）变化，切语言后重写
     try { if (sidebarCtrl) sidebarCtrl.refreshButton(); } catch (e) {}
+    // §3.4：document.title 的产品名后缀随语言刷新（切片名不变）
+    try {
+      if (state.slide && state.slide.name) updateDocTitle(state.slide.alias || state.slide.name);
+    } catch (e) {}
+    // 账户 popover 角色文案随语言刷新
+    try {
+      if (els.acctPopRole && currentRole) {
+        els.acctPopRole.textContent = t(currentRole === "owner" ? "acct.role.owner" : "acct.role.user");
+      }
+    } catch (e) {}
     // AI 配置摘要 / 会话切换器的语言重渲由 HistoPilot 插件 bundle 自行监听 hp-lang-change 处理。
   });
 })();

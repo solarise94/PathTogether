@@ -1,0 +1,668 @@
+/**
+ * 升级 Review 2026-09-09 Batch B（§3.3–3.5）：顶栏信息架构 + Beta + 账户入口。
+ *
+ * 加载真实 static/app.js（最小 DOM + fetch stub）与真实 static/i18n.js，锁定：
+ *   - 账户 chip：display_username = 邮箱 local-part（非邮箱回退完整 login_id）；
+ *     未登录不显示；预览态显示被预览 subject 并在 popover 顶部标「管理员预览」；
+ *     真实 actor 的账户设置入口在预览态隐藏；
+ *   - 账户 popover：打开时拉 GET /api/account/balance（apiFetch 路径）；
+ *     user=一次性总额度口径 / owner=当月窗口口径；nano-CNY 十进制字符串精确
+ *     换算两位小数（半分进位锚点 17806450800→17.81）；额度缺失（400
+ *     spend_total_allowance_missing）/503/网络失败显示「暂不可用（原因）」，
+ *     绝不显示 ¥0；
+ *   - 标注名称迁移：#anno-label-input 只出现在标注选项 popover 内，
+ *     主行 tbb-context 不再有自由文本输入框；
+ *   - 矩形设置 popover：#roi-settings 锚定 popover + #roi-summary 摘要载体；
+ *     exitRoi 收起摘要（同一状态机，无第二套事件）；
+ *   - 宽度断点分组：matchMedia mock 驱动 applyToolbarTier——>=1440 全展开；
+ *     1024–1439 折视图/标注组；<1024 只留当前工具/AI/倍率/账户，其余入
+ *     tbb-more（搬移真实 DOM 节点）；
+ *   - Beta 徽标 + 切片名下架：壳内无 #current-slide；openSlide 不再写该节点，
+ *     改写 document.title（<切片名> · PathTogether Beta）；
+ *   - i18n：zh/en 字典键集一致，新文案键双语齐备。
+ */
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const appSrc = readFileSync(resolve(here, "../../static/app.js"), "utf8");
+const i18nSrc = readFileSync(resolve(here, "../../static/i18n.js"), "utf8");
+const shellSrc = readFileSync(resolve(here, "../../templates/_app_shell.html"), "utf8");
+const demoJsSrc = readFileSync(resolve(here, "../../static/demo.js"), "utf8");
+
+// ---------- 假元素（与 sidebar-layout.test.ts 同风格） ----------
+interface FakeEl extends Record<string, unknown> {
+	id: string;
+	hidden: boolean;
+	title: string;
+	style: Record<string, string>;
+	dataset: Record<string, string>;
+	textContent: string;
+	innerHTML: string;
+	value: string;
+	children: FakeEl[];
+	parentNode?: FakeEl;
+	nextSibling?: FakeEl;
+	classList: {
+		add: (...names: string[]) => void;
+		remove: (...names: string[]) => void;
+		contains: (n: string) => boolean;
+		toggle: (n: string, force?: boolean) => boolean;
+	};
+	setAttribute: (k: string, v: string) => void;
+	getAttribute: (k: string) => string | null;
+	addEventListener: (type: string, cb: (e?: unknown) => void) => void;
+	dispatch: (type: string, evt?: unknown) => void;
+	focus: () => void;
+	closest: () => null;
+	appendChild: (c: unknown) => void;
+	insertBefore: (c: unknown, before: unknown) => void;
+	getBoundingClientRect: () => { left: number; top: number; right: number; bottom: number; width: number; height: number };
+}
+
+function fakeEl(id = ""): FakeEl {
+	const classes = new Set<string>();
+	const attrs = new Map<string, string>();
+	const listeners: Record<string, Array<(e?: unknown) => void>> = {};
+	const children: FakeEl[] = [];
+	const el: FakeEl = {
+		id,
+		hidden: false,
+		title: "",
+		style: {},
+		dataset: {},
+		textContent: "",
+		innerHTML: "",
+		value: "",
+		children,
+		classList: {
+			add: (...names) => names.forEach((n) => classes.add(n)),
+			remove: (...names) => names.forEach((n) => classes.delete(n)),
+			contains: (n) => classes.has(n),
+			toggle: (n, force) => {
+				const on = force === undefined ? !classes.has(n) : !!force;
+				if (on) classes.add(n);
+				else classes.delete(n);
+				return on;
+			},
+		},
+		setAttribute: (k, v) => void attrs.set(k, String(v)),
+		getAttribute: (k) => (attrs.has(k) ? (attrs.get(k) as string) : null),
+		addEventListener: (type, cb) => void (listeners[type] ||= []).push(cb),
+		dispatch: (type, evt) => (listeners[type] || []).forEach((cb) => cb(evt)),
+		focus: () => {},
+		appendChild: (c) => {
+			if (c && typeof c === "object" && "id" in (c as object)) {
+				const child = c as FakeEl;
+				child.parentNode = el;
+				children.push(child);
+			}
+		},
+		insertBefore: (c, before) => {
+			if (!(c && typeof c === "object" && "id" in (c as object))) return;
+			const child = c as FakeEl;
+			child.parentNode = el;
+			const i = children.indexOf(before as FakeEl);
+			if (i >= 0) children.splice(i, 0, child);
+			else children.push(child);
+		},
+		closest: () => null,
+		getBoundingClientRect: () => ({ left: 100, top: 20, right: 180, bottom: 48, width: 80, height: 28 }),
+		getContext: () => ({ setTransform() {}, clearRect() {} }),
+	};
+	return el;
+}
+
+function clickEvt() {
+	return { stopPropagation() {}, target: null };
+}
+
+interface AuthInfo {
+	auth_enabled: boolean;
+	username: string | null;
+	role: string | null;
+	user_id: string | null;
+	actor?: { username?: string | null; role?: string | null; user_id?: string | null };
+	preview?: Record<string, unknown> | null;
+}
+
+// ---------- 启动真实 app.js ----------
+function bootApp(opts: { width?: number } = {}) {
+	const width = opts.width ?? 1920;
+	const els: Record<string, FakeEl> = {};
+	const docListeners: Record<string, Array<(e?: unknown) => void>> = {};
+	const winListeners: Record<string, Array<(e?: unknown) => void>> = {};
+	const fetchCalls: string[] = [];
+	const fetchRoutes = new Map<string, () => { status: number; body: unknown }>();
+	const rejectRoutes = new Set<string>();
+	let defaultStatus = 200;
+
+	const fetchImpl = vi.fn((url: string) => {
+		fetchCalls.push(String(url));
+		if (rejectRoutes.has(String(url))) {
+			return Promise.reject(new TypeError("network down"));
+		}
+		const route = fetchRoutes.get(String(url));
+		const status = route ? route().status : defaultStatus;
+		const body = route ? route().body : [];
+		return Promise.resolve({
+			ok: status >= 200 && status < 300,
+			status,
+			clone() {
+				return this;
+			},
+			json: () => Promise.resolve(body),
+		});
+	}) as unknown as typeof fetch;
+
+	const doc = {
+		readyState: "loading",
+		cookie: "",
+		getElementById(id: string) {
+			if (!els[id]) els[id] = fakeEl(id);
+			return els[id];
+		},
+		createElement: (tag = "") => fakeEl(tag),
+		addEventListener(type: string, cb: (e?: unknown) => void) {
+			(docListeners[type] ||= []).push(cb);
+		},
+		querySelector: () => null,
+		querySelectorAll: () => [] as FakeEl[],
+		body: fakeEl("body"),
+		documentElement: { lang: "" },
+	};
+
+	const mq = (q: string) => ({
+		matches:
+			q.includes("min-width: 1440")
+				? width >= 1440
+				: q.includes("min-width: 1024")
+					? width >= 1024
+					: q.includes("max-width: 768")
+						? width <= 768
+						: false,
+		addEventListener() {},
+		addListener() {},
+	});
+
+	const fakeViewer = {
+		container: {
+			style: {},
+			getBoundingClientRect: () => ({ width: 800, height: 600, left: 0, top: 0 }),
+			insertBefore() {},
+		},
+		canvas: {},
+		viewport: null,
+		addHandler() {},
+		setMouseNavEnabled() {},
+	};
+
+	const w: Record<string, unknown> = {
+		HP_I18N: {
+			// 键 + 变量插值桩：断言用键名可见即可（"key({...})"）
+			t: (k: string, vars?: Record<string, unknown>) =>
+				vars && Object.keys(vars).length ? `${k}(${JSON.stringify(vars)})` : k,
+			getLang: () => "zh",
+		},
+		HP_ViewerCore: { create: () => fakeViewer },
+		HP_API: {},
+		fetch: fetchImpl,
+		location: { href: "http://local/", pathname: "/" },
+		matchMedia: mq,
+		innerWidth: width,
+		innerHeight: 900,
+		requestAnimationFrame: (cb: () => void) => {
+			cb();
+			return 1;
+		},
+		addEventListener(type: string, cb: (e?: unknown) => void) {
+			(winListeners[type] ||= []).push(cb);
+		},
+		localStorage: null,
+	};
+
+	(globalThis as { document: unknown }).document = doc;
+	(globalThis as { window: unknown }).window = w;
+	(globalThis as { fetch: typeof fetch }).fetch = fetchImpl;
+	(globalThis as { HP_ViewerCore?: unknown }).HP_ViewerCore = w.HP_ViewerCore;
+
+	new Function("window", "document", "fetch", "location", appSrc)(w, doc, fetchImpl, w.location);
+
+	(docListeners["DOMContentLoaded"] || []).forEach((cb) => cb());
+
+	return {
+		els,
+		fetchCalls,
+		fetchRoutes,
+		rejectRoutes,
+		docDispatch(type: string, evt?: unknown) {
+			(docListeners[type] || []).forEach((cb) => cb(evt));
+		},
+		winDispatch(type: string, evt?: unknown) {
+			(winListeners[type] || []).forEach((cb) => cb(evt));
+		},
+		HP_AUTH: (w as { HP_AUTH?: Record<string, unknown> }).HP_AUTH as {
+			applyAuthInfo: (i: AuthInfo) => AuthInfo;
+			acctDisplayUsername: (u: string | null) => string;
+			acctCny: (v: string | null) => string | null;
+		},
+	};
+}
+
+const BALANCE_OK = {
+	subject: {
+		username: "solarise94@gmail.com",
+		display_username: "solarise94",
+		role: "user",
+		preview: false,
+	},
+	currency: "CNY",
+	spend_target: "total_allowance",
+	limit_nano_cny: "50000000000",
+	spent_nano_cny: "12000000000",
+	reserved_nano_cny: "1000000000",
+	remaining_nano_cny: "37000000000",
+	period_start: null,
+	period_end: null,
+	as_of: "2026-09-09T12:00:00Z",
+};
+
+function loggedIn(overrides: Partial<AuthInfo> = {}): AuthInfo {
+	return {
+		auth_enabled: true,
+		username: "solarise94@gmail.com",
+		role: "user",
+		user_id: "u1",
+		actor: { username: "solarise94@gmail.com", role: "user", user_id: "u1" },
+		preview: null,
+		...overrides,
+	};
+}
+
+async function openAcctPop(h: ReturnType<typeof bootApp>) {
+	h.els["acct-btn"].dispatch("click", clickEvt());
+	await vi.waitFor(() => {
+		expect(h.fetchCalls).toContain("/api/account/balance");
+	});
+}
+
+describe("账户 chip：display_username（§3.5）", () => {
+	afterEach(() => {
+		delete (globalThis as { window?: unknown }).window;
+		delete (globalThis as { document?: unknown }).document;
+		delete (globalThis as { fetch?: unknown }).fetch;
+		delete (globalThis as { HP_ViewerCore?: unknown }).HP_ViewerCore;
+	});
+
+	it("邮箱账号显示 @ 前的 local-part；chip 不再隐藏", () => {
+		const h = bootApp();
+		h.HP_AUTH.applyAuthInfo(loggedIn());
+		expect(h.HP_AUTH.acctDisplayUsername("solarise94@gmail.com")).toBe("solarise94");
+		expect(h.els["acct-btn-name"].textContent).toBe("solarise94");
+		expect(h.els["acct-btn"].hidden).toBe(false);
+	});
+
+	it("非邮箱存量账号回退完整 login_id", () => {
+		const h = bootApp();
+		expect(h.HP_AUTH.acctDisplayUsername("lab_admin")).toBe("lab_admin");
+		h.HP_AUTH.applyAuthInfo(loggedIn({ username: "lab_admin" }));
+		expect(h.els["acct-btn-name"].textContent).toBe("lab_admin");
+	});
+
+	it("未登录（username 空）不显示账户 chip", () => {
+		const h = bootApp();
+		h.HP_AUTH.applyAuthInfo(loggedIn({ username: null, user_id: null }));
+		expect(h.els["acct-btn"].hidden).toBe(true);
+	});
+
+	it("预览态：chip 显示被预览 subject，popover 标「管理员预览」，账户设置隐藏", () => {
+		const h = bootApp();
+		h.HP_AUTH.applyAuthInfo(
+			loggedIn({
+				username: "victim@x.com",
+				role: "user",
+				user_id: "u9",
+				actor: { username: "admin@x.com", role: "owner", user_id: "a1" },
+				preview: { subject_username: "victim@x.com", subject_role: "user", subject_user_id: "u9", expires_at: 9999999999 },
+			}),
+		);
+		expect(h.els["acct-btn-name"].textContent).toBe("victim");
+		expect(h.els["acct-pop-email"].textContent).toBe("victim@x.com");
+		expect(h.els["acct-pop-preview"].hidden).toBe(false);
+		expect(h.els["acct-settings-btn"].hidden).toBe(true);
+		expect(h.els["acct-pop-role"].textContent).toBe("acct.role.user");
+	});
+
+	it("owner 非预览：角色显示 owner，账户设置可见", () => {
+		const h = bootApp();
+		h.HP_AUTH.applyAuthInfo(
+			loggedIn({
+				username: "boss@x.com",
+				role: "owner",
+				user_id: "a1",
+				actor: { username: "boss@x.com", role: "owner", user_id: "a1" },
+			}),
+		);
+		expect(h.els["acct-pop-role"].textContent).toBe("acct.role.owner");
+		expect(h.els["acct-settings-btn"].hidden).toBe(false);
+	});
+});
+
+describe("账户 popover 余额（GET /api/account/balance）", () => {
+	afterEach(() => {
+		delete (globalThis as { window?: unknown }).window;
+		delete (globalThis as { document?: unknown }).document;
+		delete (globalThis as { fetch?: unknown }).fetch;
+		delete (globalThis as { HP_ViewerCore?: unknown }).HP_ViewerCore;
+	});
+
+	it("nano-CNY 精确换算（半分进位锚点 17806450800→17.81；绝不走 float）", () => {
+		const h = bootApp();
+		expect(h.HP_AUTH.acctCny("17806450800")).toBe("17.81 CNY");
+		expect(h.HP_AUTH.acctCny("17804000000")).toBe("17.80 CNY");
+		expect(h.HP_AUTH.acctCny("-1235000000")).toBe("-1.24 CNY");
+		expect(h.HP_AUTH.acctCny("0")).toBe("0.00 CNY");
+		expect(h.HP_AUTH.acctCny("abc")).toBeNull();
+		expect(h.HP_AUTH.acctCny(null)).toBeNull();
+	});
+
+	it("打开 popover 拉取余额；user 口径=一次性总额度；剩余/明细精确两位", async () => {
+		const h = bootApp();
+		h.HP_AUTH.applyAuthInfo(loggedIn());
+		h.fetchRoutes.set("/api/account/balance", () => ({ status: 200, body: BALANCE_OK }));
+		await openAcctPop(h);
+		await vi.waitFor(() => {
+			expect(h.els["acct-pop-remaining"].textContent).toContain("37.00 CNY");
+		});
+		expect(h.els["acct-pop-scope"].textContent).toBe("acct.balance.scope.total");
+		const detail = h.els["acct-pop-detail"].textContent;
+		expect(detail).toContain("50.00 CNY");
+		expect(detail).toContain("12.00 CNY");
+		expect(detail).toContain("1.00 CNY");
+		expect(h.els["acct-pop"].hidden).toBe(false);
+		expect(h.els["acct-btn"].getAttribute("aria-expanded")).toBe("true");
+	});
+
+	it("owner 月窗口口径：spend_target=owner_month_window", async () => {
+		const h = bootApp();
+		h.HP_AUTH.applyAuthInfo(
+			loggedIn({
+				username: "boss@x.com",
+				role: "owner",
+				user_id: "a1",
+				actor: { username: "boss@x.com", role: "owner", user_id: "a1" },
+			}),
+		);
+		h.fetchRoutes.set("/api/account/balance", () => ({
+			status: 200,
+			body: {
+				...BALANCE_OK,
+				subject: { ...BALANCE_OK.subject, role: "owner" },
+				spend_target: "owner_month_window",
+				period_start: "2026-09-01T00:00:00Z",
+				period_end: "2026-10-01T00:00:00Z",
+			},
+		}));
+		await openAcctPop(h);
+		await vi.waitFor(() => {
+			expect(h.els["acct-pop-scope"].textContent).toBe("acct.balance.scope.month");
+		});
+		expect(h.els["acct-pop-detail"].textContent).toContain("2026-09-01");
+	});
+
+	it("额度缺失 400 spend_total_allowance_missing：显示暂不可用（未设置总额度），绝不显示 ¥0", async () => {
+		const h = bootApp();
+		h.HP_AUTH.applyAuthInfo(loggedIn());
+		h.fetchRoutes.set("/api/account/balance", () => ({
+			status: 400,
+			body: { error: "spend_total_allowance_missing", code: "spend_total_allowance_missing" },
+		}));
+		await openAcctPop(h);
+		await vi.waitFor(() => {
+			expect(h.els["acct-pop-detail"].textContent).toContain("acct.balance.unavailable");
+		});
+		expect(h.els["acct-pop-detail"].textContent).toContain("acct.balance.reason.missing");
+		expect(h.els["acct-pop-remaining"].textContent).toBe("—");
+		expect(h.els["acct-pop-remaining"].textContent).not.toContain("0.00");
+	});
+
+	it("DB 不可用 503：显示暂不可用（数据库暂不可用），不显示 ¥0", async () => {
+		const h = bootApp();
+		h.HP_AUTH.applyAuthInfo(loggedIn());
+		h.fetchRoutes.set("/api/account/balance", () => ({
+			status: 503,
+			body: { error: "database_unavailable" },
+		}));
+		await openAcctPop(h);
+		await vi.waitFor(() => {
+			expect(h.els["acct-pop-detail"].textContent).toContain("acct.balance.reason.db");
+		});
+		expect(h.els["acct-pop-remaining"].textContent).toBe("—");
+	});
+
+	it("网络失败：fetch reject 同样走「暂不可用（网络异常）」，不显示 ¥0", async () => {
+		const h = bootApp();
+		h.HP_AUTH.applyAuthInfo(loggedIn());
+		h.rejectRoutes.add("/api/account/balance");
+		h.els["acct-btn"].dispatch("click", clickEvt());
+		await vi.waitFor(() => {
+			expect(h.fetchCalls).toContain("/api/account/balance");
+		});
+		await vi.waitFor(() => {
+			expect(h.els["acct-pop-detail"].textContent).toContain("acct.balance.reason.network");
+		});
+		expect(h.els["acct-pop-remaining"].textContent).toBe("—");
+	});
+});
+
+describe("标注名称迁移 + 矩形 popover（§3.3）", () => {
+	afterEach(() => {
+		delete (globalThis as { window?: unknown }).window;
+		delete (globalThis as { document?: unknown }).document;
+		delete (globalThis as { fetch?: unknown }).fetch;
+		delete (globalThis as { HP_ViewerCore?: unknown }).HP_ViewerCore;
+	});
+
+	it("壳模板：#anno-label-input 只在标注选项 popover 内；主行 tbb-context 无自由文本输入框", () => {
+		const annoPopStart = shellSrc.indexOf('<div id="anno-pop"');
+		const annoPopEnd = shellSrc.indexOf("</div>", annoPopStart);
+		expect(annoPopStart).toBeGreaterThan(0);
+		const popBlock = shellSrc.slice(annoPopStart, annoPopEnd);
+		expect(popBlock).toContain('id="anno-label-input"');
+		// tbb-context 块内不再有 input
+		const ctxStart = shellSrc.indexOf('<div class="tbb-context"');
+		const ctxEnd = shellSrc.indexOf("</div>", ctxStart);
+		const ctxBlock = shellSrc.slice(ctxStart, ctxEnd);
+		expect(ctxBlock).not.toContain('id="anno-label-input"');
+		expect(ctxBlock).not.toContain("anno-label-input");
+		// popover 触发钮与 aria 接线
+		expect(shellSrc).toContain('id="anno-more-btn"');
+		expect(shellSrc).toContain('aria-controls="anno-pop"');
+	});
+
+	it("壳模板：矩形尺寸 popover 化——#roi-settings 在按钮下方锚定，主行有 #roi-summary 摘要", () => {
+		expect(shellSrc).toContain('id="roi-summary"');
+		expect(shellSrc).toContain('class="roi-settings toolbar-pop"');
+		// app.js：exitRoi 收起设置与摘要；updateRoiOverlay 同步摘要（同一状态机）
+		expect(appSrc).toMatch(/function updateRoiSummary\(/);
+		expect(appSrc).toMatch(/roiSummary\.hidden = true/);
+		expect(appSrc).toMatch(/updateRoiSummary\(\);[\s\S]{0,80}$/m);
+	});
+
+	it("app.js 不再把业务状态写入 #current-slide（§3.4）", () => {
+		expect(appSrc).not.toContain("currentSlide");
+		expect(appSrc).toContain("updateDocTitle(");
+		// openSlide / deleteSlide 都经 updateDocTitle
+		expect(appSrc).toMatch(/updateDocTitle\(info\.alias \|\| info\.name\)/);
+		expect(appSrc).toMatch(/updateDocTitle\(null\)/);
+	});
+
+	it("demo.js 切片名进 document.title（Beta · Demo 组合），不再依赖 #current-slide", () => {
+		expect(demoJsSrc).toContain('app.doc.title.demo');
+	});
+});
+
+describe("宽度断点分组（§3.3）：搬移真实 DOM 节点到 ⋯ 菜单", () => {
+	afterEach(() => {
+		delete (globalThis as { window?: unknown }).window;
+		delete (globalThis as { document?: unknown }).document;
+		delete (globalThis as { fetch?: unknown }).fetch;
+		delete (globalThis as { HP_ViewerCore?: unknown }).HP_ViewerCore;
+	});
+
+	it("boot 后 wide（1920）档不搬移：视图/标注/缩放组留在主行", () => {
+		const h = bootApp({ width: 1920 });
+		const inMore = h.els["tbb-more"].children.map((c) => c.id);
+		expect(inMore).not.toContain("view-tools-group");
+		expect(inMore).not.toContain("anno-tools-group");
+		expect(inMore).not.toContain("save-anno-btn");
+		expect(inMore).not.toContain("zoom-group");
+	});
+
+	it("1024–1439（mid）：视图组/画质/通道/标注组/保存标记入菜单；缩放组留主行；档位类名打在 #toolbar", () => {
+		const h = bootApp({ width: 1280 });
+		// applyToolbarTier 把 tbb-more.parentNode 当 #toolbar（此处手工接线供类名断言）
+		if (!h.els["toolbar"]) h.els["toolbar"] = fakeEl("toolbar");
+		const toolbar = h.els["toolbar"];
+		h.els["tbb-more"].parentNode = toolbar;
+		h.winDispatch("resize");
+		const inMore = h.els["tbb-more"].children.map((c) => c.id);
+		expect(inMore).toEqual(expect.arrayContaining([
+			"view-tools-group",
+			"quality-control",
+			"channel-btn",
+			"anno-tools-group",
+			"anno-btn",
+			"save-anno-btn",
+		]));
+		expect(inMore).not.toContain("zoom-group");
+		expect(inMore).not.toContain("save-btn");
+		expect(toolbar.classList.contains("tb-tier-mid")).toBe(true);
+		expect(toolbar.classList.contains("tb-tier-narrow")).toBe(false);
+	});
+
+	it("<1024（narrow）：缩放组/保存图片/mpp/1:1 也入菜单；倍率徽章与账户留在主行", () => {
+		const h = bootApp({ width: 900 });
+		if (!h.els["toolbar"]) h.els["toolbar"] = fakeEl("toolbar");
+		const toolbar = h.els["toolbar"];
+		h.els["tbb-more"].parentNode = toolbar;
+		h.winDispatch("resize");
+		const inMore = h.els["tbb-more"].children.map((c) => c.id);
+		expect(inMore).toEqual(expect.arrayContaining([
+			"zoom-group",
+			"save-btn",
+			"mpp-setter",
+			"zoom-native",
+			"view-tools-group",
+			"anno-tools-group",
+		]));
+		// 倍率徽章 / 账户 / 矩形入口 / AI 不折叠
+		expect(inMore).not.toContain("zoom-badge");
+		expect(inMore).not.toContain("acct-wrap");
+		expect(inMore).not.toContain("roi-rect-btn");
+		expect(inMore).not.toContain("ai-btn");
+		expect(toolbar.classList.contains("tb-tier-narrow")).toBe(true);
+	});
+});
+
+describe("Beta 徽标 + i18n 新键（§3.4/§7）", () => {
+	afterEach(() => {
+		delete (globalThis as { window?: unknown }).window;
+		delete (globalThis as { document?: unknown }).document;
+	});
+
+	function bootI18n(lang: "zh" | "en" = "zh") {
+		const listeners: Record<string, Array<(e?: unknown) => void>> = {};
+		const storage = new Map<string, string>([["hp_lang", lang]]);
+		const doc = {
+			readyState: "complete",
+			cookie: "",
+			documentElement: { lang: "" },
+			body: fakeEl("body"),
+			getElementById: () => null,
+			createElement: () => fakeEl(),
+			addEventListener(type: string, cb: (e?: unknown) => void) {
+				(listeners[type] ||= []).push(cb);
+			},
+			querySelector: () => null,
+			querySelectorAll: () => [] as FakeEl[],
+			dispatchEvent() {},
+		};
+		const w = {
+			localStorage: {
+				getItem: (k: string) => (storage.has(k) ? (storage.get(k) as string) : null),
+				setItem: (k: string, v: string) => void storage.set(k, v),
+			},
+			CustomEvent: class {},
+		};
+		// i18n.js 以裸标识符引用 localStorage/navigator/CustomEvent（浏览器=window
+		// 属性）；Node 环境显式注入，语言检测才可控。
+		new Function("window", "document", "localStorage", "navigator", "CustomEvent", i18nSrc)(
+			w,
+			doc,
+			w.localStorage,
+			{ language: "zh-CN" },
+			w.CustomEvent,
+		);
+		const HP = (w as { HP_I18N?: { t: (k: string, vars?: Record<string, unknown>) => string; getLang: () => string; setLang: (l: string) => void } }).HP_I18N;
+		expect(HP).toBeTruthy();
+		return HP!;
+	}
+
+	it("壳模板：品牌区 = PathTogether + Beta 徽标；#current-slide 已删除", () => {
+		expect(shellSrc).toContain('class="beta-badge"');
+		expect(shellSrc).toContain('data-i18n="beta.badge"');
+		expect(shellSrc).toContain('data-i18n-title="beta.badge.tip"');
+		expect(shellSrc).not.toContain('id="current-slide"');
+		// Demo 只读壳仍保留 demo 徽章，且 Beta 徽标同样渲染
+		expect(shellSrc).toContain("demo-badge");
+		// 账户 chip 只在非 Demo 模式渲染
+		expect(shellSrc).toContain("{% if mode != 'demo' %}");
+		expect(shellSrc).toContain('id="acct-btn"');
+	});
+
+	it("index/demo 页标题已带 Beta；分享页不受影响", () => {
+		expect(readFileSync(resolve(here, "../../templates/index.html"), "utf8")).toContain("<title>PathTogether Beta</title>");
+		expect(readFileSync(resolve(here, "../../templates/demo.html"), "utf8")).toContain("<title>PathTogether Beta · Demo</title>");
+		expect(readFileSync(resolve(here, "../../templates/share.html"), "utf8")).toContain('id="current-slide"');
+	});
+
+	it("zh/en 字典键集一致；新文案键双语齐备", () => {
+		const zhStart = i18nSrc.indexOf("zh: {");
+		const enStart = i18nSrc.indexOf("en: {");
+		const zhBlock = i18nSrc.slice(zhStart, enStart);
+		const enBlock = i18nSrc.slice(enStart);
+		const keys = (block: string) =>
+			new Set(Array.from(block.matchAll(/"([a-z0-9.\-]+)":\s/g), (m) => m[1]));
+		const zhKeys = keys(zhBlock);
+		const enKeys = keys(enBlock);
+		const onlyZh = Array.from(zhKeys).filter((k) => !enKeys.has(k));
+		const onlyEn = Array.from(enKeys).filter((k) => !zhKeys.has(k));
+		expect(onlyZh, `en 缺键: ${onlyZh.join(",")}`).toEqual([]);
+		expect(onlyEn, `zh 缺键: ${onlyEn.join(",")}`).toEqual([]);
+	});
+
+	it("新键文案：Beta 提示 / 文档标题 / 标注名称（可选）/ 账户与余额口径", () => {
+		const zh = bootI18n("zh");
+		expect(zh.t("beta.badge")).toBe("Beta");
+		expect(zh.t("beta.badge.tip")).toContain("Beta 测试中");
+		expect(zh.t("app.doc.title")).toBe("PathTogether Beta");
+		expect(zh.t("app.doc.title.demo")).toBe("PathTogether Beta · Demo");
+		expect(zh.t("tb.anno.label.name")).toBe("标注名称（可选）");
+		expect(zh.t("tb.anno.more")).toBe("标注选项");
+		expect(zh.t("acct.preview.tag")).toBe("管理员预览");
+		expect(zh.t("acct.balance.scope.total")).toBe("一次性总额度");
+		expect(zh.t("acct.balance.scope.month")).toBe("当月窗口");
+		expect(zh.t("acct.balance.unavailable", { reason: "X" })).toBe("额度信息暂不可用（X）");
+		expect(zh.t("acct.balance.reason.missing")).toBe("未设置总额度");
+		expect(zh.t("acct.settings")).toBe("账户设置");
+
+		zh.setLang("en");
+		expect(zh.t("beta.badge.tip")).toContain("Beta");
+		expect(zh.t("acct.balance.scope.total")).toBe("Total allowance (one-time)");
+		expect(zh.t("acct.balance.scope.month")).toBe("Current monthly window");
+		expect(zh.t("acct.balance.unavailable", { reason: "X" })).toBe("Balance info unavailable (X)");
+	});
+});

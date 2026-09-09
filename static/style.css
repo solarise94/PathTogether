@@ -98,18 +98,28 @@ button {
   flex-shrink: 0; /* 品牌名不收缩 */
 }
 
-/* 装饰性副标题与分隔符一律不显示（宽屏也不占标题栏宽度），品牌与文件名靠 gap 分隔 */
+/* 装饰性副标题与分隔符一律不显示（宽屏也不占标题栏宽度），品牌与徽标靠 gap 分隔 */
 .title-sep,
 .header-subtitle { display: none; }
 
-.header-current {
-  font-size: 13px;
-  color: var(--text-2);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  /* 长文件名（如 TCGA 全名 70+ 字符）提前省略；悬停 title 看全名（app.js 已设） */
-  max-width: clamp(64px, 14vw, 180px);
+/* Beta 状态徽标（§3.4）：品牌区常驻；不可点击、可聚焦提示产品阶段。
+   切片名不再常驻品牌区（document.title / 侧栏选中行 / 面板标题仍可读）。 */
+.beta-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  color: var(--accent);
+  border: 1px solid rgba(0, 122, 255, 0.35);
+  border-radius: 6px;
+  padding: 1px 6px;
+  line-height: 1.4;
+  cursor: default;
+  user-select: none;
+}
+.beta-badge:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 /* ---------- 工具栏 ---------- */
@@ -371,6 +381,24 @@ button {
   }
   /* 桌面端工具栏已有 ✨AI 主钮，菜单里不再重复 */
   #toolbar .tbb-more #tbb-more-ai { display: none; }
+  /* §3.3 宽度分组：搬入 ⋯ 菜单的真实节点（视图/标注组、画质、通道、mpp）。
+     DOM 是原班节点（同一状态机），这里只调排版不复制交互。 */
+  #toolbar .tbb-more .btn-group,
+  #toolbar .tbb-more .view-tools,
+  #toolbar .tbb-more .anno-tools {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 2px;
+    padding: 2px 4px;
+  }
+  #toolbar .tbb-more .viewer-quality-host,
+  #toolbar .tbb-more .mpp-setter {
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 10px;
+  }
+  #toolbar .tbb-more .rgb-mode-badge { margin: 4px 10px; }
   .tbb-more-mask {
     position: fixed;
     inset: 0;
@@ -378,6 +406,161 @@ button {
   }
   .tbb-more-mask.open { display: block; }
 }
+
+/* =========================================================================
+   工具栏锚定 popover + 宽度分组（升级 Review 2026-09-09 §3.3–3.5）
+   ========================================================================= */
+/* 浮层由 JS 以 fixed 坐标定位（打开时按触发按钮计算，打开期间重挂到
+   body 以脱离 #toolbar 的裁剪/包含块）；同一时间至多一个浮层。 */
+.toolbar-pop {
+  position: fixed;
+  z-index: 520;
+  background: var(--toolbar-bg);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border: 0.5px solid var(--separator);
+  border-radius: 10px;
+  box-shadow: var(--shadow-float);
+  padding: 10px 12px;
+}
+.toolbar-pop[hidden] { display: none !important; }
+
+/* 矩形尺寸 popover：沿用原设置区内部排版（宽/高/单位/锁比例/预设） */
+.roi-settings.toolbar-pop { display: inline-flex; }
+
+/* 矩形尺寸主行摘要（如 6×6 mm）：有选区才显示 */
+.roi-summary {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-2);
+  background: var(--seg-bg, rgba(0, 0, 0, 0.05));
+  border-radius: 6px;
+  padding: 2px 7px;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.roi-summary[hidden] { display: none !important; }
+
+/* 标注选项 popover（标注名称（可选）迁入） */
+.anno-pop { display: flex; flex-direction: column; gap: 4px; min-width: 200px; }
+.anno-pop-field { display: flex; flex-direction: column; gap: 4px; }
+.anno-pop-label { font-size: 11px; color: var(--text-2); }
+.anno-pop .anno-label-input { width: 180px; }
+.anno-more-btn { font-size: 10px; color: var(--text-3); }
+
+/* 宽度分组档位标记：折叠档隐藏悬空分隔线（组已搬入 ⋯ 菜单） */
+#toolbar.tb-tier-mid .tb-sep,
+#toolbar.tb-tier-narrow .tb-sep { display: none; }
+
+/* ---------- 账户 chip + popover（§3.5） ---------- */
+.acct-wrap {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.acct-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 160px;
+  height: 26px;
+  padding: 0 8px;
+  border: 0.5px solid var(--separator-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.acct-btn:hover { background: var(--hover-strong); }
+.acct-btn[hidden] { display: none; }
+.acct-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.acct-btn-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.acct-btn-caret { font-size: 9px; color: var(--text-3); }
+
+.acct-pop {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 240px;
+  max-width: 300px;
+  font-size: 12px;
+}
+.acct-pop-preview {
+  align-self: flex-start;
+  font-size: 11px;
+  font-weight: 600;
+  color: #6b5a00;
+  background: #fff6d6;
+  border-radius: 6px;
+  padding: 2px 8px;
+}
+.acct-pop-preview[hidden] { display: none; }
+.acct-pop-email {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  word-break: break-all;
+}
+.acct-pop-role-row { display: flex; gap: 6px; color: var(--text-2); }
+.acct-pop-role-label { color: var(--text-3); }
+.acct-pop-balance {
+  border-top: 0.5px solid var(--separator);
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.acct-pop-balance-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-3);
+  font-size: 11px;
+}
+.acct-pop-scope { color: var(--accent); font-weight: 600; }
+.acct-pop-remaining {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.acct-pop-detail {
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+.acct-settings {
+  align-self: stretch;
+  text-align: left;
+  border: none;
+  border-top: 0.5px solid var(--separator);
+  background: transparent;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 8px 0 0;
+  cursor: pointer;
+}
+.acct-settings:hover { text-decoration: underline; }
+.acct-settings[hidden] { display: none; }
 
 /* 顶部栏缩放徽章：桌面隐藏（桌面用底栏 #zoom-badge），仅移动端显示 */
 .header-zoom-badge { display: none; }
@@ -2022,7 +2205,6 @@ button {
   /* 手机端隐藏长标题文字，仅保留当前切片名 */
   .header-title,
   .title-sep { display: none; }
-  .header-current { max-width: 60vw; font-size: 13px; }
 
   /* ---------- 工具栏：脱离 header，固定到屏幕底部 ---------- */
   #toolbar {
@@ -2093,6 +2275,9 @@ button {
     flex-shrink: 0;
     order: 99;                                   /* 排最右 */
   }
+  /* §3.5：账户 chip 在窄屏底栏保持在最右（⋯ 之后），浮层向上弹出 */
+  #toolbar .acct-wrap { order: 100; }
+  #toolbar .acct-btn { height: 32px; max-width: 120px; }
   /* ⋯ 溢出面板：底栏上方弹出的紧凑行 */
   #toolbar .tbb-more {
     display: none;
@@ -2266,7 +2451,6 @@ button {
   #toolbar .tool-btn { padding: 0 8px; font-size: 11px; }
   #toolbar .seg-control .seg { padding: 5px 7px; font-size: 10px; }
   #toolbar .anno-tools .tool-btn { padding: 0 6px; font-size: 12px; }
-  .header-current { max-width: 50vw; }
 }
 
 /* 极窄屏（≤380px） */

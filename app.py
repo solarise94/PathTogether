@@ -3292,6 +3292,94 @@ def api_account_password():
 #      → job 置 consumed → 同事务审计。目标邮箱期间被其他账号占用 → 拒绝
 #      且不改任何状态（事务整体回滚，job 保持未消费）。
 # =========================================================================== #
+@app.route("/api/account/balance", methods=["GET"])
+def api_account_balance():
+    """只读自助余额（Batch B，升级 Review §4.2）。
+
+    subject 只取 current_identity()（预览态 = effective subject，§3.5 余额
+    随被预览者）；URL/body 不接受 user_id（不提供查他人余额的口子）。
+    user = 一次性总额度（get_total_allowance 只读）；owner = 当前月窗口
+    （peek_current_window **不建行**——点开账户不改变账务；窗口未开时以
+    策略限额 + 0 用量呈现）。金额一律十进制字符串（JS 大整数安全）；
+    Cache-Control: no-store。额度缺失 → 400 spend_total_allowance_missing
+    （绝不呈现为 ¥0）；数据层异常 → 503。不含供应商余额/策略内部 ID/key。
+    """
+    guard = _require_own_active_account_or_none()
+    if guard is not None:
+        return guard
+    ident = current_identity()
+    uid = str(ident.get("user_id") or "")
+    role = ident.get("role") or user_store.ROLE_USER
+    # 权威登录名按 uid 回查用户行（与登录 session 同口径：email_normalized
+    # → email → login_id；current_identity 只带 role/user_id）
+    row = user_store.get_user(uid) or {}
+    username = str(row.get("email_normalized") or row.get("email")
+                   or row.get("login_id") or "")
+    preview = _preview_subject() is not None
+    local_part = username.split("@", 1)[0] if "@" in username else username
+
+    def _iso(epoch):
+        if not epoch:
+            return None
+        return datetime.fromtimestamp(float(epoch), tz=timezone.utc) \
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    as_of = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    subject = {"username": username, "display_username": local_part,
+               "role": role, "preview": preview}
+    try:
+        if role == user_store.ROLE_OWNER:
+            spend_target = "owner_month_window"
+            win = spend_store.peek_current_window("owner", uid)
+            if win is not None:
+                limit = int(win.get("limit_nano_snapshot") or 0)
+                spent = int(win.get("spent_nano_cny") or 0)
+                reserved = int(win.get("reserved_nano_cny") or 0)
+                period = (_iso(win.get("window_start")),
+                          _iso(win.get("window_end")))
+            else:
+                # 本月窗口未开（未使用）：以策略限额呈现，不建行
+                policy = spend_store.resolve_policy("owner", uid)
+                if policy is None or not policy.get("enabled", True):
+                    return jsonify(
+                        error="额度策略缺失，余额暂不可用",
+                        code="spend_total_allowance_missing"), 400
+                limit = int(policy.get("limit_nano_cny") or 0)
+                spent = 0
+                reserved = 0
+                period = (None, None)
+        else:
+            spend_target = "total_allowance"
+            allow = spend_store.get_total_allowance(uid)
+            if allow is None:
+                return jsonify(
+                    error="总额度记录缺失，余额暂不可用",
+                    code="spend_total_allowance_missing"), 400
+            limit = int(allow.get("limit_nano_cny") or 0)
+            spent = int(allow.get("spent_nano_cny") or 0)
+            reserved = int(allow.get("reserved_nano_cny") or 0)
+            period = (None, None)
+    except Exception:
+        app.logger.exception("account balance 读取失败")
+        return jsonify(error="余额读取暂时不可用，请稍后重试",
+                       code="balance_unavailable"), 503
+    remaining = limit - spent - reserved
+    resp = jsonify(
+        subject=subject,
+        currency="CNY",
+        spend_target=spend_target,
+        limit_nano_cny=str(limit),
+        spent_nano_cny=str(spent),
+        reserved_nano_cny=str(reserved),
+        remaining_nano_cny=str(remaining),
+        period_start=period[0],
+        period_end=period[1],
+        as_of=as_of,
+    )
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 def _require_own_active_account_or_none():
     """登录态 + 账号可用校验（本人账户 API 共用）；返回错误响应或 None。
 
@@ -7943,24 +8031,12 @@ def admin_v1_settings_model_get():
     if auth:
         return auth
     cfg = _load_ai_config()
-    labels = {
-        DEEPSEEK_VISION_MODEL: "DeepSeek v4-flash-vision-exp（常规默认，"
-                               "支持 Files API）",
-        DEEPSEEK_V41_FLASH_MODEL: "DeepSeek v4.1-flash（限时试用，"
-                                  "2026-09-10 到期）",
-    }
-    options = []
-    for m in _DEEPSEEK_OFFICIAL_MODELS:
-        item = {"model": m, "label": labels.get(m) or m,
-                "files_supported": m == DEEPSEEK_VISION_MODEL}
-        if m == DEEPSEEK_V41_FLASH_MODEL:
-            item["expires_at"] = "2026-09-10"
-        options.append(item)
     return jsonify(
         model=cfg.get("model") or "",
         provider_kind=_effective_provider_kind(cfg),
         image_transport=_effective_image_transport(cfg),
-        options=options,
+        options=_model_catalog_entries(),
+        catalog_version=_DEEPSEEK_MODEL_CATALOG_VERSION,
     )
 
 
@@ -7981,35 +8057,11 @@ def admin_v1_settings_model_put():
     if auth:
         return auth
     body = request.get_json(silent=True) or {}
-    target = str(body.get("model") or "").strip()
-    if target not in _DEEPSEEK_OFFICIAL_MODELS:
-        return _admin_v1_error(
-            400, "invalid_request",
-            "model 须为 {} 之一".format(" / ".join(_DEEPSEEK_OFFICIAL_MODELS)))
-    cfg = _load_ai_config()
-    prev_model = cfg.get("model") or ""
-    prev_transport = _effective_image_transport(cfg)
-    transport_adjusted = False
-    cfg["model"] = target
-    if target != DEEPSEEK_VISION_MODEL \
-            and _effective_image_transport(cfg) == AI_IMAGE_TRANSPORT_DEEPSEEK_FILES:
-        cfg["image_transport"] = AI_IMAGE_TRANSPORT_INLINE
-        transport_adjusted = True
-    # 复用官方契约校验（对落盘候选整体判定；含 Fernet/0600 安全门禁）
-    contract_err = _validate_provider_contract(cfg, {"model": target}, None)
-    if contract_err:
-        return _admin_v1_error(400, "invalid_request", contract_err)
-    _save_ai_config(cfg)
-    _audit("ai.default_model", target_type="settings", target_id="model",
-           detail={"from_model": prev_model, "to_model": target,
-                   "transport_adjusted": transport_adjusted,
-                   "from_transport": prev_transport})
-    return jsonify(
-        model=target,
-        image_transport=_effective_image_transport(cfg),
-        transport_adjusted=transport_adjusted,
-        ok=True,
-    )
+    payload, err = _switch_default_model(body.get("model"), None)
+    if err is not None:
+        status, code, message = err
+        return _admin_v1_error(status, code, message)
+    return jsonify(**payload)
 
 
 @app.route("/api/admin/v1/site-stats", methods=["GET"])
@@ -12749,7 +12801,91 @@ DEEPSEEK_VISION_MODEL = "deepseek-v4-flash-vision-exp"
 # 不列出；2026-09-10 到期）。Files API（image_transport=deepseek_files）
 # 仍仅限 vision-exp（file_id 引用语义未对该模型验证）。
 DEEPSEEK_V41_FLASH_MODEL = "deepseek-v4.1-flash-expires-on-0910"
-_DEEPSEEK_OFFICIAL_MODELS = (DEEPSEEK_VISION_MODEL, DEEPSEEK_V41_FLASH_MODEL)
+# 官方模型目录（Batch A，升级 Review §4.1）：available 由**服务端 UTC 时钟**
+# 判定，限时模型到期日（UTC 当天结束）后 unavailable 且 PUT 拒绝——前端
+# 禁用只是展示，不承担权威判定。expires_at=None 表示长期可用。
+_DEEPSEEK_MODEL_CATALOG = (
+    {"model": DEEPSEEK_VISION_MODEL,
+     "label": "DeepSeek v4 Flash Vision",
+     "expires_at": None},
+    {"model": DEEPSEEK_V41_FLASH_MODEL,
+     "label": "DeepSeek v4.1 Flash（限时试用）",
+     "expires_at": "2026-09-10"},
+)
+_DEEPSEEK_MODEL_CATALOG_VERSION = "deepseek-official-2026-09"
+_DEEPSEEK_OFFICIAL_MODELS = tuple(e["model"] for e in _DEEPSEEK_MODEL_CATALOG)
+
+
+def _model_catalog_entries(now=None):
+    """模型目录 + 服务端可用性判定（每项含 available/disabled_reason）。
+
+    ``now`` 可注入（测试到期边界）；缺省取服务端 UTC 当前时间。到期语义：
+    ``expires_at`` 日期的 **UTC 当天结束**（次日 00:00Z）起 unavailable。
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    out = []
+    for e in _DEEPSEEK_MODEL_CATALOG:
+        item = {
+            "model": e["model"],
+            "label": e["label"],
+            "files_supported": e["model"] == DEEPSEEK_VISION_MODEL,
+            "expires_at": e["expires_at"],
+            "disabled_reason": None,
+            "available": True,
+        }
+        if e["expires_at"]:
+            try:
+                exp_end = datetime.fromisoformat(
+                    e["expires_at"]).replace(tzinfo=timezone.utc) + timedelta(days=1)
+            except ValueError:
+                exp_end = None
+            if exp_end is not None and now >= exp_end:
+                item["available"] = False
+                item["disabled_reason"] = "expired"
+        out.append(item)
+    return out
+
+
+def _switch_default_model(target, actor):
+    """切换平台默认模型（唯一写入口；管理台端点与测试共用）。
+
+    返回 (payload, err)：err=(status, code, message) 时端点直接返回；
+    成功 payload 含 model/image_transport/transport_adjusted。目录外
+    400 invalid_request；目录内但服务端判定不可用 409 model_unavailable
+    （客户端伪造 available 无效——PUT 不看请求体里的可用性）。
+    """
+    target = str(target or "").strip()
+    entries = {e["model"]: e for e in _model_catalog_entries()}
+    if target not in entries:
+        return None, (400, "invalid_request",
+                      "model 须为 {} 之一".format(" / ".join(entries)))
+    entry = entries[target]
+    if not entry["available"]:
+        return None, (409, "model_unavailable",
+                      "模型 {} 当前不可用（{}）".format(
+                          target, entry["disabled_reason"] or "unavailable"))
+    cfg = _load_ai_config()
+    prev_model = cfg.get("model") or ""
+    prev_transport = _effective_image_transport(cfg)
+    transport_adjusted = False
+    cfg["model"] = target
+    if target != DEEPSEEK_VISION_MODEL \
+            and _effective_image_transport(cfg) == AI_IMAGE_TRANSPORT_DEEPSEEK_FILES:
+        cfg["image_transport"] = AI_IMAGE_TRANSPORT_INLINE
+        transport_adjusted = True
+    contract_err = _validate_provider_contract(cfg, {"model": target}, None)
+    if contract_err:
+        return None, (400, "invalid_request", contract_err)
+    _save_ai_config(cfg)
+    _audit("ai.default_model", target_type="settings", target_id="model",
+           detail={"from_model": prev_model, "to_model": target,
+                   "transport_adjusted": transport_adjusted,
+                   "from_transport": prev_transport})
+    return {"model": target,
+            "image_transport": _effective_image_transport(cfg),
+            "transport_adjusted": transport_adjusted,
+            "ok": True}, None
 # image_transport：inline（图片 base64 内联，首次部署默认）/ deepseek_files
 # （Files API 引用 file_id；仅官方 OpenAI 协议 + vision-exp 模型允许）
 AI_IMAGE_TRANSPORT_INLINE = "inline"
@@ -13702,6 +13838,11 @@ def _ai_user_config_get(user_ctx):
         out[k] = platform_cfg.get(k, v)
     out["max_tokens"] = platform_cfg.get("max_tokens") or DEFAULT_MAX_TOKENS
     out["api_protocol"] = platform_cfg.get("api_protocol") or "openai"
+    # Batch A（升级 Review §4.1）：普通 user 的脱敏模型摘要——只有展示名，
+    # 不含 owner-only 模型目录（切换入口）/key/base URL。
+    cur = platform_cfg.get("model") or ""
+    labels = {e["model"]: e["label"] for e in _model_catalog_entries()}
+    out["effective_model_label"] = labels.get(cur) or cur
     _apply_user_max_steps_view(out, own, source)
     return out
 

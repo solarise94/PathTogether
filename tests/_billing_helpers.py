@@ -27,9 +27,10 @@ BILLING_DIR = REPO_ROOT / "tests" / "fixtures" / "billing"
 _MIGRATION_0018 = REPO_ROOT / "migrations" / "0018_billing.sql"
 _MIGRATION_0022 = REPO_ROOT / "migrations" / "0022_billing_price_unit_fix.sql"
 # 0042：限时模型 v4.1-flash 计价行（从 active 书 vision-exp 行复制，同价）。
-# TRUNCATE 会清掉迁移种子，故与 0018/0022 一起重放（缺它 hard 模式会
-# pricing_unavailable fail-closed，计价用例全部误伤）。
+# 0044：官方现网 ID deepseek-flash 同款复制。TRUNCATE 会清掉迁移种子，
+# 故与 0018/0022 一起重放（缺它 hard 模式会 pricing_unavailable fail-closed）。
 _MIGRATION_0042 = REPO_ROOT / "migrations" / "0042_v41_flash_price_rows.sql"
+_MIGRATION_0044 = REPO_ROOT / "migrations" / "0044_deepseek_flash_price_rows.sql"
 _MIGRATION_0023 = REPO_ROOT / "migrations" / "0023_spend_policies_windows.sql"
 _MIGRATION_0029 = REPO_ROOT / "migrations" / "0029_user_total_allowances_and_denials.sql"
 _MIGRATION_0032 = REPO_ROOT / "migrations" / "0032_user_total_allowance_single_track.sql"
@@ -83,9 +84,9 @@ def _replay(conn, path):
 
 
 def seed_price_books(conn=None):
-    """幂等重放 0018 + 0022 + 0042（IF NOT EXISTS/ON CONFLICT/守卫 UPDATE）→ 重建
-    「legacy 书（已收口）+ corrected v2 书（当前生效，含 0042 限时模型同价行）」
-    的完整价格史。"""
+    """幂等重放 0018 + 0022 + 0042 + 0044 → 重建
+    「legacy 书（已收口）+ corrected v2 书（当前生效，含限时模型与
+    deepseek-flash 同价行）」的完整价格史。"""
     own = conn is None
     if own:
         conn = connect()
@@ -93,6 +94,7 @@ def seed_price_books(conn=None):
         _replay(conn, _MIGRATION_0018)
         _replay(conn, _MIGRATION_0022)
         _replay(conn, _MIGRATION_0042)
+        _replay(conn, _MIGRATION_0044)
     finally:
         if own:
             conn.close()

@@ -8066,8 +8066,8 @@ def admin_v1_settings_model_get():
     """平台默认模型现状 + 可切换选项（owner-only 只读）。
 
     options 按允许集合（_DEEPSEEK_OFFICIAL_MODELS）给出 label/限时到期日/
-    Files 支持位；image_transport 供 UI 提示「切到限时模型时图片传输自动
-    落回 inline（Files API 仅 vision-exp）」。
+    Files 支持位；image_transport 供 UI 提示「切到不支持 Files 的模型时
+    图片传输自动落回 inline」。
     """
     auth = _require_owner_admin_v1()
     if auth:
@@ -12839,23 +12839,34 @@ _AI_PROVIDER_KINDS = (AI_PROVIDER_GENERIC, AI_PROVIDER_DEEPSEEK_OFFICIAL)
 # 官方模式 canonical 值（§4.1 原子校验的唯一合法取值；base URL 不带 /v1）
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_VISION_MODEL = "deepseek-v4-flash-vision-exp"
+# 官方现网 ID（2026-09-10，api-docs.deepseek.com/zh-cn 定价页）：
+# deepseek-flash = DeepSeek-V4.1-Flash，支持视觉；旧名
+# deepseek-v4-flash / deepseek-v4-flash-vision-exp 仍可调、路由到 V4.1-Flash。
+DEEPSEEK_FLASH_MODEL = "deepseek-flash"
 # 官方限时模型（2026-09-09 实测：官方直连可调、支持图片输入，但 /models
-# 不列出；2026-09-10 到期）。Files API（image_transport=deepseek_files）
-# 仍仅限 vision-exp（file_id 引用语义未对该模型验证）。
+# 不列出；2026-09-10 到期）。Files API 仅 files_supported=True 的目录项。
 DEEPSEEK_V41_FLASH_MODEL = "deepseek-v4.1-flash-expires-on-0910"
 # 官方模型目录（Batch A，升级 Review §4.1）：available 由**服务端 UTC 时钟**
 # 判定，限时模型到期日（UTC 当天结束）后 unavailable 且 PUT 拒绝——前端
 # 禁用只是展示，不承担权威判定。expires_at=None 表示长期可用。
 _DEEPSEEK_MODEL_CATALOG = (
+    {"model": DEEPSEEK_FLASH_MODEL,
+     "label": "DeepSeek Flash（V4.1 视觉）",
+     "expires_at": None,
+     "files_supported": True},
     {"model": DEEPSEEK_VISION_MODEL,
-     "label": "DeepSeek v4 Flash Vision",
-     "expires_at": None},
+     "label": "DeepSeek v4 Flash Vision（旧名）",
+     "expires_at": None,
+     "files_supported": True},
     {"model": DEEPSEEK_V41_FLASH_MODEL,
      "label": "DeepSeek v4.1 Flash（限时试用）",
-     "expires_at": "2026-09-10"},
+     "expires_at": "2026-09-10",
+     "files_supported": False},
 )
-_DEEPSEEK_MODEL_CATALOG_VERSION = "deepseek-official-2026-09"
+_DEEPSEEK_MODEL_CATALOG_VERSION = "deepseek-official-2026-09-flash"
 _DEEPSEEK_OFFICIAL_MODELS = tuple(e["model"] for e in _DEEPSEEK_MODEL_CATALOG)
+_DEEPSEEK_FILES_MODELS = tuple(
+    e["model"] for e in _DEEPSEEK_MODEL_CATALOG if e.get("files_supported"))
 
 
 def _model_catalog_entries(now=None):
@@ -12871,7 +12882,7 @@ def _model_catalog_entries(now=None):
         item = {
             "model": e["model"],
             "label": e["label"],
-            "files_supported": e["model"] == DEEPSEEK_VISION_MODEL,
+            "files_supported": bool(e.get("files_supported")),
             "expires_at": e["expires_at"],
             "disabled_reason": None,
             "available": True,
@@ -12912,8 +12923,8 @@ def _switch_default_model(target, actor):
     prev_transport = _effective_image_transport(cfg)
     transport_adjusted = False
     cfg["model"] = target
-    if target != DEEPSEEK_VISION_MODEL \
-            and _effective_image_transport(cfg) == AI_IMAGE_TRANSPORT_DEEPSEEK_FILES:
+    if (not entry["files_supported"]
+            and _effective_image_transport(cfg) == AI_IMAGE_TRANSPORT_DEEPSEEK_FILES):
         cfg["image_transport"] = AI_IMAGE_TRANSPORT_INLINE
         transport_adjusted = True
     contract_err = _validate_provider_contract(cfg, {"model": target}, None)
@@ -12929,7 +12940,7 @@ def _switch_default_model(target, actor):
             "transport_adjusted": transport_adjusted,
             "ok": True}, None
 # image_transport：inline（图片 base64 内联，首次部署默认）/ deepseek_files
-# （Files API 引用 file_id；仅官方 OpenAI 协议 + vision-exp 模型允许）
+# （Files API 引用 file_id；仅官方 OpenAI 协议 + 目录 files_supported 模型）
 AI_IMAGE_TRANSPORT_INLINE = "inline"
 AI_IMAGE_TRANSPORT_DEEPSEEK_FILES = "deepseek_files"
 _AI_IMAGE_TRANSPORTS = (AI_IMAGE_TRANSPORT_INLINE, AI_IMAGE_TRANSPORT_DEEPSEEK_FILES)
@@ -13042,7 +13053,7 @@ def _validate_provider_contract(cfg, pending, key_action):
     对「落盘后的完整候选」（既有 cfg + 本批 pending + api_key 动作）整体
     判定，任一失败返回中文错误文案（端点回 400，不产生部分写入）：
       - image_transport=deepseek_files：仅官方 provider + OpenAI 协议 +
-        vision-exp 模型；
+        目录 files_supported 模型（deepseek-flash / vision-exp）；
       - provider_kind=deepseek_official（显式或 canonical 推断）：base_url/
         api_protocol/model 必须为 canonical 官方值，api_key 非空，
         prompt_cache_mode=auto，files_rollout_percent 为 0–100 整数，且
@@ -13068,9 +13079,9 @@ def _validate_provider_contract(cfg, pending, key_action):
         if proto != "openai":
             return ("image_transport=deepseek_files 仅支持 OpenAI 协议"
                     "（api_protocol=openai）")
-        if model != DEEPSEEK_VISION_MODEL:
+        if model not in _DEEPSEEK_FILES_MODELS:
             return ("image_transport=deepseek_files 仅支持模型 {}"
-                    .format(DEEPSEEK_VISION_MODEL))
+                    .format(" / ".join(_DEEPSEEK_FILES_MODELS)))
     if kind == AI_PROVIDER_DEEPSEEK_OFFICIAL and _official_contract_applies(merged):
         if base.rstrip("/") != DEEPSEEK_BASE_URL:
             return ("provider_kind=deepseek_official 时 base_url 必须为 {}"

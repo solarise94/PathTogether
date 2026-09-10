@@ -882,12 +882,12 @@ def test_image_transport_enum_and_combination():
                    "api_protocol": "anthropic"})
     check("files + anthropic 协议 → 400", code == 400, "got %s %r" % (code, j))
     assert code == 400
-    # files 模式 + 非 vision-exp 模型 → 拒绝
+    # files 模式 + 非视觉模型 → 拒绝
     reset_config()
     code, j = put({"provider_kind": "deepseek_official",
                    "image_transport": "deepseek_files",
                    "model": "deepseek-chat"})
-    check("files + 非 vision-exp 模型 → 400", code == 400, "got %s %r" % (code, j))
+    check("files + 非视觉模型 → 400", code == 400, "got %s %r" % (code, j))
     assert code == 400
     # 完整官方负载 + files → 200
     reset_config()
@@ -904,6 +904,15 @@ def test_image_transport_enum_and_combination():
         check("回显 files_rollout_percent=100",
               j.get("files_rollout_percent") == 100,
               "got %r" % j.get("files_rollout_percent"))
+    # 官方现网 ID deepseek-flash + files → 200
+    reset_config()
+    payload = dict(OFFICIAL_PAYLOAD)
+    payload["model"] = "deepseek-flash"
+    payload["image_transport"] = "deepseek_files"
+    code, j = put(payload)
+    check("官方 + deepseek-flash + files → 200", code == 200,
+          "got %s %r" % (code, j))
+    assert code == 200
 
 
 def test_files_rollout_percent_validation():
@@ -1001,6 +1010,13 @@ def test_official_mode_atomic_validation():
     code, j = put(payload)
     check("官方 + deepseek-chat → 400", code == 400, "got %s %r" % (code, j))
     assert code == 400
+    # 4b) 官方现网 ID deepseek-flash → 200
+    reset_config()
+    payload = dict(OFFICIAL_PAYLOAD)
+    payload["model"] = "deepseek-flash"
+    code, j = put(payload)
+    check("官方 + deepseek-flash → 200", code == 200, "got %s %r" % (code, j))
+    assert code == 200
     # 5) 缺 api_key → 400
     reset_config()
     payload = dict(OFFICIAL_PAYLOAD)

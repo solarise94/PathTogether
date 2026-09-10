@@ -226,6 +226,8 @@ def test_schema_migrations_recorded(conn):
         # ai_safety.platform_task_max_steps / own_task_max_steps_limit 的
         # >100 存量显式归一为 100 并写审计（仿 0031 先例；demo 键不动）。
         "0043_max_steps_normalize_100.sql",
+        # 2026-09-10：官方现网 ID deepseek-flash 计价行（从 vision-exp 复制）。
+        "0044_deepseek_flash_price_rows.sql",
     ]
 
 

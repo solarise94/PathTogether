@@ -595,8 +595,9 @@ def test_model_catalog_availability_and_expiry():
     entries = {e["model"]: e for e in app_mod._model_catalog_entries()}
     assert set(entries) == set(app_mod._DEEPSEEK_OFFICIAL_MODELS)
     vis = entries[app_mod.DEEPSEEK_VISION_MODEL]
+    flash = entries[app_mod.DEEPSEEK_FLASH_MODEL]
     v41 = entries[app_mod.DEEPSEEK_V41_FLASH_MODEL]
-    # 到期前（09-10 当天内）：两项均可用
+    # 到期前（09-10 当天内）：限时项仍可用
     in_day = app_mod._model_catalog_entries(
         now=datetime(2026, 9, 10, 23, 0, tzinfo=timezone.utc))
     assert all(e["available"] for e in in_day)
@@ -606,9 +607,12 @@ def test_model_catalog_availability_and_expiry():
     assert after[app_mod.DEEPSEEK_V41_FLASH_MODEL]["available"] is False
     assert after[app_mod.DEEPSEEK_V41_FLASH_MODEL]["disabled_reason"] == "expired"
     assert after[app_mod.DEEPSEEK_VISION_MODEL]["available"] is True
-    # 长期模型 expires_at=None；限时模型带日期；files 语义不变
-    assert vis["expires_at"] is None and v41["expires_at"] == "2026-09-10"
-    assert vis["files_supported"] is True and v41["files_supported"] is False
+    assert after[app_mod.DEEPSEEK_FLASH_MODEL]["available"] is True
+    # 长期模型 expires_at=None；限时模型带日期；flash 与旧 vision-exp 均支持 Files
+    assert vis["expires_at"] is None and flash["expires_at"] is None
+    assert v41["expires_at"] == "2026-09-10"
+    assert vis["files_supported"] is True and flash["files_supported"] is True
+    assert v41["files_supported"] is False
     # GET 目录带 catalog_version 与稳定字段
     owner, _u = _setup_users()
     c = _login(_client(), owner)
@@ -667,6 +671,57 @@ def test_ai_config_user_get_has_effective_model_label():
     assert "api_key" not in body
 
 
+def test_deepseek_flash_priced_same_as_vision_exp():
+    """0044：deepseek-flash 在两本 active 价格书中有价，且与 vision-exp 逐档一致
+    （hard 模式无价会 pricing_unavailable fail-closed）。"""
+    import billing_pricing
+    import _billing_helpers as bh
+    from datetime import datetime, timezone as tz
+    bh.seed_price_books()
+    conn = bh.connect()
+    # 0022 测试重放把 v2 书 effective_from 设为 now()，查价必须用种子之后的时刻
+    at = datetime.now(tz.utc)
+    try:
+        with conn.cursor() as cur:
+            for kind in ("provider_cost", "customer_charge"):
+                r_flash = billing_pricing.find_active_rate(
+                    cur, kind, "deepseek", "deepseek-flash", at)
+                r_vis = billing_pricing.find_active_rate(
+                    cur, kind, "deepseek", "deepseek-v4-flash-vision-exp", at)
+                assert r_flash is not None, kind
+                assert r_vis is not None, kind
+                for k in ("cache_hit_nano_per_million",
+                          "cache_miss_nano_per_million",
+                          "output_nano_per_million"):
+                    assert r_flash[k] == r_vis[k], (kind, k)
+    finally:
+        conn.close()
+
+
+def test_settings_model_switch_deepseek_flash_keeps_files():
+    """切到官方现网 ID deepseek-flash 不落回 inline（目录 files_supported）。"""
+    owner, _u = _setup_users()
+    c = _login(_client(), owner)
+    cfg = {"base_url": app_mod.DEEPSEEK_BASE_URL,
+           "api_protocol": "openai",
+           "provider_kind": "deepseek_official",
+           "model": app_mod.DEEPSEEK_VISION_MODEL,
+           "api_key": "sk-test-official-key-000",
+           "image_transport": "deepseek_files",
+           "files_rollout_percent": 10}
+    app_mod._save_ai_config(cfg)
+    r = c.put("/api/admin/v1/settings/model",
+              json={"model": app_mod.DEEPSEEK_FLASH_MODEL})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    body = r.get_json()
+    assert body["model"] == app_mod.DEEPSEEK_FLASH_MODEL
+    assert body["transport_adjusted"] is False
+    assert body["image_transport"] == "deepseek_files"
+    cfg2 = app_mod._load_ai_config()
+    assert cfg2["model"] == app_mod.DEEPSEEK_FLASH_MODEL
+    assert cfg2["image_transport"] == "deepseek_files"
+
+
 def test_limited_model_priced_same_as_vision_exp():
     """0042：限时模型在两本 active 价格书中有价，且与 vision-exp 逐档一致
     （owner 决策同价；hard 模式无价会 pricing_unavailable fail-closed）。"""
@@ -675,16 +730,15 @@ def test_limited_model_priced_same_as_vision_exp():
     from datetime import datetime, timezone as tz
     bh.seed_price_books()  # conftest TRUNCATE 清种子；重放 0018+0022+0042
     conn = bh.connect()
+    at = datetime.now(tz.utc)
     try:
         with conn.cursor() as cur:
             for kind in ("provider_cost", "customer_charge"):
                 r_v41 = billing_pricing.find_active_rate(
                     cur, kind, "deepseek",
-                    "deepseek-v4.1-flash-expires-on-0910",
-                    datetime(2026, 9, 9, 12, 0, tzinfo=tz.utc))
+                    "deepseek-v4.1-flash-expires-on-0910", at)
                 r_vis = billing_pricing.find_active_rate(
-                    cur, kind, "deepseek", "deepseek-v4-flash-vision-exp",
-                    datetime(2026, 9, 9, 12, 0, tzinfo=tz.utc))
+                    cur, kind, "deepseek", "deepseek-v4-flash-vision-exp", at)
                 assert r_v41 is not None, kind
                 assert r_vis is not None, kind
                 for k in ("cache_hit_nano_per_million",
@@ -696,7 +750,8 @@ def test_limited_model_priced_same_as_vision_exp():
 
 
 def test_provider_contract_limited_model_transport_matrix():
-    """官方契约：v4.1-flash 允许（inline）；v4.1-flash + deepseek_files 拒。"""
+    """官方契约：v4.1-flash 允许（inline）；v4.1-flash + deepseek_files 拒；
+    deepseek-flash / vision-exp + files 合法。"""
     base = {"base_url": app_mod.DEEPSEEK_BASE_URL,
             "api_protocol": "openai",
             "provider_kind": "deepseek_official",
@@ -708,10 +763,12 @@ def test_provider_contract_limited_model_transport_matrix():
                      image_transport="deepseek_files")
     err = app_mod._validate_provider_contract(files_cfg, {}, None)
     assert err and "deepseek_files" in err
-    # vision-exp + files 仍合法（现状不回归）
     legacy = dict(base, model=app_mod.DEEPSEEK_VISION_MODEL,
                   image_transport="deepseek_files")
     assert app_mod._validate_provider_contract(legacy, {}, None) is None
+    flash = dict(base, model=app_mod.DEEPSEEK_FLASH_MODEL,
+                 image_transport="deepseek_files")
+    assert app_mod._validate_provider_contract(flash, {}, None) is None
 
 
 def test_settings_runtime_endpoint_reads_and_writes_ai_safety():

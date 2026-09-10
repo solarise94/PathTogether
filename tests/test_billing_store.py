@@ -363,9 +363,9 @@ def test_migration_seed_matches_price_fixture():
                 assert book["effective_from"] == cutover
     # cutover 标志与书边界一致（platform_settings，epoch 秒）
     assert bh.pricing_cutover() == cutover
-    # legacy 代 12 行（3 模型 × 2 时段 × 2 kind）+ corrected v2 代 16 行
-    #（0042 起含限时模型 v4.1-flash 同价行：4 模型 × 2 时段 × 2 kind）
-    assert len(rates) == 28
+    # legacy 代 12 行（3 模型 × 2 时段 × 2 kind）+ corrected v2 代 20 行
+    #（0042 限时模型 + 0044 deepseek-flash：5 模型 × 2 时段 × 2 kind）
+    assert len(rates) == 32
     by_key = {(r["price_book_id"], r["model"], r["time_band"]): r
               for r in rates}
     for model, bands in snap["models"].items():

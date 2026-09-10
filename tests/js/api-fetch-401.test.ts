@@ -3,7 +3,8 @@
  *
  * 与 logout.test.ts 同款 loadApp harness：app.js 以函数体加载，注入
  * window/document/fetch/location。覆盖：
- *   - 401 + body {error:"auth_required"} → location 跳 /login?next=<当前路径>
+ *   - 401 + body {error:"auth_required"}（旧形态）→ location 跳 /login?next=<当前路径>
+ *   - 401 + body {error:中文, code:"auth_required"}（D2 2026-09-10 新契约）→ 跳转
  *   - 401 + 其它 body → 原样返回 Response，不跳转
  *   - 非 401 → 原样返回
  */
@@ -76,7 +77,19 @@ describe("app.js apiFetch 401 处理", () => {
 		vi.unstubAllGlobals();
 	});
 
-	it("401 + auth_required → 跳 /login?next=<当前路径>", async () => {
+	it("401 + code=auth_required（D2 新契约：中文 error + code 字段）→ 跳 /login?next=<当前路径>", async () => {
+		const fetchImpl = vi.fn(() => Promise.resolve(resp(401, { error: "登录状态已失效，请重新登录后再试", code: "auth_required" }))) as unknown as typeof fetch;
+		const h = loadApp(fetchImpl);
+		expect(typeof h.apiFetch).toBe("function");
+		const r = await h.apiFetch("/api/annotations");
+		expect(r.status).toBe(401);
+		// 跳转发生在 json() 解析之后
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(h.location.href).toBe("/login?next=" + encodeURIComponent("/slides/a.svs"));
+	});
+
+	it("401 + 旧形态 error=auth_required（兼容）→ 跳 /login?next=<当前路径>", async () => {
 		const fetchImpl = vi.fn(() => Promise.resolve(resp(401, { error: "auth_required" }))) as unknown as typeof fetch;
 		const h = loadApp(fetchImpl);
 		expect(typeof h.apiFetch).toBe("function");

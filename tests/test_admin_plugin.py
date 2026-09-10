@@ -369,7 +369,8 @@ def test_asset_anonymous_gets_401():
     _setup_users()
     r = _client().get(ASSET_BASE + "/ui/index.html")
     assert r.status_code == 401
-    assert r.get_json()["error"] == "auth_required"
+    # D2（2026-09-10）：机器码在 code 字段
+    assert r.get_json()["code"] == "auth_required"
 
 
 def test_asset_non_owner_gets_403():
@@ -902,8 +903,8 @@ def test_admin_manifest_plugin_version_bumped_with_hashes():
     用户表/抽屉/用量/账单/审计/切片归属/邀请绑定列换 identity 口径），
     main.js hash 与 manifest pin 同步。"""
     data = json.loads(ADMIN_MANIFEST.read_text(encoding="utf-8"))
-    # 2026-09-09 0.4.2：默认模型切换卡
-    assert data["pluginVersion"] == "0.4.3"  # P2-2 身份冲突页；hashes/pin 同步
+    # 2026-09-10 0.4.4：步数上限 500→100（§2 A：input max/校验区间/帮助文案）
+    assert data["pluginVersion"] == "0.4.4"  # hashes/pin 同步
     assert "admin:settings:read" in data["adminPermissions"]
     assert "admin:settings:write" in data["adminPermissions"]
     assert "admin:slides:read" in data["adminPermissions"]

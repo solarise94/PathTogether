@@ -942,3 +942,36 @@ def test_internal_channel_blocks_late_polygon_after_midrun_off(monkeypatch):
     r = _post_internal_polygon(c)
     assert r.status_code == 403
     assert _no_rois()
+
+
+# =========================================================================== #
+# C2（2026-09-10）：session detail 带回 drawing_mirror，不在 GET 路径回写镜像
+# =========================================================================== #
+def test_session_detail_includes_drawing_mirror(monkeypatch):
+    """GET /api/ai/session/<id> 2xx 附带 session.drawing_mirror。
+
+    无行 → false；镜像 true → true。HP allow_ai_drawing 仍透传。GET 不把
+    HP=true 回写成镜像 true（写入口继续对无行 fail-closed）。
+    """
+    _mock_proxy_owner(monkeypatch)
+    fake = FakeRequests()
+    fake.register("GET", "/session/sess1",
+                  lambda b, q, h, k: FakeResponse(
+                      200, {"session": {"id": "sess1",
+                                        "allow_ai_drawing": True},
+                            "transcript": []}))
+    monkeypatch.setattr(app_mod, "requests", fake)
+    c = _browser_client(app_mod.app)
+
+    r = c.get("/api/ai/session/sess1")
+    assert r.status_code == 200, r.get_data(as_text=True)
+    body = r.get_json()
+    assert body["session"]["allow_ai_drawing"] is True
+    assert body["session"]["drawing_mirror"] is False  # 无行
+    assert share_store.get_ai_session_drawing_flag("sess1") is None
+
+    share_store.upsert_ai_session_drawing_flag("sess1", True)
+    r2 = c.get("/api/ai/session/sess1")
+    assert r2.status_code == 200
+    assert r2.get_json()["session"]["drawing_mirror"] is True
+    assert r2.get_json()["session"]["allow_ai_drawing"] is True

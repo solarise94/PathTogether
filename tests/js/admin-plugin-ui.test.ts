@@ -1481,19 +1481,19 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 	});
 
 	// §4.5 wave 2：运行时安全参数改名 + 自带 API 步数字段移除
-	it("批次A-14: 「注册用户单任务安全上限」文案与 500 上限；ownsteps 字段不出现", () => {
+	it("批次A-14: 「注册用户单任务安全上限」文案与 100 上限（2026-09-10 §2 A）；ownsteps 字段不出现", () => {
 		const rtStart = htmlSrc.indexOf('id="adm-rt-psteps"');
 		expect(rtStart).toBeGreaterThan(-1);
 		const rtBlockStart = htmlSrc.lastIndexOf("<section", rtStart);
 		const rtBlockEnd = htmlSrc.indexOf("</section>", rtStart);
 		const rtBlock = htmlSrc.slice(rtBlockStart, rtBlockEnd);
 		expect(rtBlock).toContain("注册用户单任务安全上限");
-		expect(rtBlock).toContain("默认/最高 500");
-		expect(rtBlock).toContain("超过 100 记为异常长任务");
-		expect(rtBlock).toContain("达到 500 暂停");
+		expect(rtBlock).toContain("默认/最高 100");
+		expect(rtBlock).toContain("1–100 整数");
+		expect(rtBlock).toContain("达到 100 暂停");
 		expect(rtBlock).toContain("消费额度由总金额控制");
-		// psteps 输入上限 500（HTML + JS 双闸）
-		expect(rtBlock).toMatch(/id="adm-rt-psteps"[^>]*max="500"/);
+		// psteps 输入上限 100（HTML + JS 双闸）
+		expect(rtBlock).toMatch(/id="adm-rt-psteps"[^>]*max="100"/);
 		// 自带 API 步数上限从 UI 移除（后端字段兼容保留）
 		expect(htmlSrc).not.toContain('id="adm-rt-ownsteps"');
 		expect(src).not.toContain('"adm-rt-ownsteps"');

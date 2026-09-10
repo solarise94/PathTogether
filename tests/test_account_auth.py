@@ -373,7 +373,9 @@ def test_legacy_cookie_without_auth_version_rejected():
         s.pop("auth_version", None)
     r = c.get("/api/projects")
     check("旧 cookie 401", r.status_code == 401, "got %s" % r.status_code)
-    check("错误码 auth_required", r.get_json().get("error") == "auth_required")
+    # D2（2026-09-10）：机器码在 code 字段
+    check("错误码 code=auth_required",
+          r.get_json().get("code") == "auth_required")
     # 同一 cookie 不会因回填兼容而复活（session 已被清理）
     with c.session_transaction() as s:
         check("session 已清理无 auth_version", "auth_version" not in s)
@@ -389,19 +391,26 @@ def _login_user_client():
     return c
 
 def test_change_password_requires_login():
-    """未登录（AUTH_ENABLED=True）→ 401 auth_required。"""
+    """未登录（AUTH_ENABLED=True）→ 鉴权闸 401（D2：code=auth_required）。"""
     make_owner("admin", OWNER_PW)
     user_store.create_user("u@x.com", USER_PW, role="user")
     c = make_client()  # 未登录
     r = c.post("/api/account/password", json={
         "current_password": USER_PW, "new_password": NEW_PW})
     check("未登录 401", r.status_code == 401)
-    check("错误码 auth_required", r.get_json().get("error") == "auth_required")
+    # AUTH_ENABLED=True 时 before_request 鉴权闸先行（D2 新契约：机器码在 code）
+    check("错误码 code=auth_required",
+          r.get_json().get("code") == "auth_required")
 
 def test_change_password_dev_mode_401():
-    """AUTH_ENABLED=False 本地开发态（无登录 session）→ 401。"""
-    app_mod.AUTH_ENABLED = False
+    """AUTH_ENABLED=False 本地开发态（无登录 session）→ 401。
+
+    开发态鉴权闸关闭，命中视图内防御 401（裸 error 短码形态保持不变）。
+    注意：AUTH_ENABLED 必须在 make_client() 之后置 False（make_client 会把
+    开关置 True 走鉴权闸；旧写法被覆盖，两条路径的 401 body 在 D2 2026-09-10
+    契约变更前恰好同形，测试空过）。"""
     c = make_client()
+    app_mod.AUTH_ENABLED = False
     r = c.post("/api/account/password", json={
         "current_password": USER_PW, "new_password": NEW_PW})
     check("开发态无 session 401", r.status_code == 401)

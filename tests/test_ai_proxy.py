@@ -448,8 +448,9 @@ def test_auth_still_enforced():
         r = client.post("/api/ai/run", json={"slide": "s.svs"})
         check("开启认证时 /api/ai/run 401", r.status_code == 401,
               "got %d" % r.status_code)
-        check("401 body auth_required",
-              json.loads(r.data).get("error") == "auth_required")
+        # D2（2026-09-10）：机器码在 code 字段
+        check("401 body code=auth_required",
+              json.loads(r.data).get("code") == "auth_required")
         r2 = client.get("/api/ai/sessions?slide=s.svs")
         check("开启认证时 /api/ai/sessions 401", r2.status_code == 401)
     finally:

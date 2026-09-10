@@ -129,7 +129,8 @@ def test_anonymous_401_on_new_endpoints():
         r = _client().open(path, method=method)
         assert r.status_code == 401, "%s %s -> %s" % (method, path,
                                                       r.status_code)
-        assert r.get_json()["error"] == "auth_required"
+        # D2（2026-09-10）：机器码在 code 字段
+        assert r.get_json()["code"] == "auth_required"
 
 def test_plain_user_403_on_new_endpoints():
     owner, usera = _setup_users()

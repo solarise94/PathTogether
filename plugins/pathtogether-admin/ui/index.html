@@ -32,7 +32,7 @@
       - 邀请：只保留注册模式只读摘要 + 创建/列表/撤销；不再有
         source/campaign/cohort 输入与列、来源漏斗、用户来源明细；
       - 设置：「平台单任务最大步骤」改名「注册用户单任务安全上限」
-        （默认/最高 500；>100 异常长任务观测；金额由总金额控制）；
+        （默认/最高 100（2026-09-10 §2 A）；达到 100 暂停；金额由总金额控制）；
         「自带 API 步数上限」字段移除；spend 策略三键拆分；
       - 费用页重排：KPI（供应商余额/User 累计已用/Demo 本周已用/未计价）→
         [仅异常]计费异常条 → Demo 消耗卡（周窗口，可切上周）→ 费用明细
@@ -523,8 +523,8 @@
               <label class="adm-check adm-field-span"><input type="checkbox" id="adm-rt-demo-enabled"> 开放公开 Demo</label>
               <div class="adm-field">
                 <label class="adm-field-label" for="adm-rt-psteps">注册用户单任务安全上限（可选）</label>
-                <input type="number" id="adm-rt-psteps" min="1" max="500" placeholder="如 500" aria-describedby="adm-rt-psteps-help">
-                <small class="adm-field-help" id="adm-rt-psteps-help">1–500 整数；默认/最高 500，留空沿用现值。超过 100 记为异常长任务，达到 500 暂停；消费额度由总金额控制，步数不是额度</small>
+                <input type="number" id="adm-rt-psteps" min="1" max="100" placeholder="如 100" aria-describedby="adm-rt-psteps-help">
+                <small class="adm-field-help" id="adm-rt-psteps-help">1–100 整数；默认/最高 100，留空沿用现值，达到 100 暂停；消费额度由总金额控制，步数不是额度</small>
               </div>
               <div class="adm-field">
                 <label class="adm-field-label" for="adm-rt-demosteps">Demo 单任务最大步骤（可选）</label>

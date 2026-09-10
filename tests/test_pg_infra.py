@@ -222,6 +222,10 @@ def test_schema_migrations_recorded(conn):
         # 2026-09-09 限时模型批次：v4.1-flash 计价行（与 vision-exp 同价，
         # 从两本 active 书的 vision-exp 行原样复制）。
         "0042_v41_flash_price_rows.sql",
+        # 2026-09-10 修复规格 §2 A 追加 0043_max_steps_normalize_100.sql：
+        # ai_safety.platform_task_max_steps / own_task_max_steps_limit 的
+        # >100 存量显式归一为 100 并写审计（仿 0031 先例；demo 键不动）。
+        "0043_max_steps_normalize_100.sql",
     ]
 
 

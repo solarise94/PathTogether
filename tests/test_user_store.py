@@ -391,7 +391,11 @@ def test_disable_invalidates_existing_session(monkeypatch):
     check("禁用后 /api/projects 401", r2.status_code == 401,
           "got %s" % r2.status_code)
     body = json.loads(r2.data)
-    check("禁用后 error=auth_required", body.get("error") == "auth_required")
+    # D2（2026-09-10）：机器码在 code 字段，error 是中文引导文案
+    check("禁用后 code=auth_required", body.get("code") == "auth_required")
+    check("禁用后 error 非裸码",
+          body.get("error") != "auth_required"
+          and "重新登录" in (body.get("error") or ""))
     # session 已被清理：先 GET /login 取新 CSRF token（模拟浏览器跳转流程），
     # 再提交旧凭据 → 401
     user_client.get("/login")

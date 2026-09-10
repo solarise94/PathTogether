@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="referrer" content="no-referrer" />
   <title>PathTogether · 激活账号</title>
+  <!-- D1（2026-09-10）：空 data URI favicon，避免浏览器自动 GET /favicon.ico 撞鉴权闸 -->
+  <link rel="icon" href="data:," />
   <style>
     :root {
       --accent: #007AFF;
@@ -166,6 +168,13 @@
           return resp.json().then(function (data) {
             if (resp.ok && data.ok) {
               window.location.href = "/login";
+              return;
+            }
+            // D2（2026-09-10）：会话失效（401 / code=auth_required）显示中文
+            // 并引导重新登录；禁止把裸机器码渲染进红条
+            if (resp.status === 401 ||
+                (data && data.code === "auth_required")) {
+              fail("登录状态已失效，请重新登录后再试（重新登录后即可重试激活）");
               return;
             }
             fail((data && data.error) || "激活失败，请稍后重试");

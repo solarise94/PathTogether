@@ -297,9 +297,9 @@ def test_index_user_render_has_no_own_credentials_form(monkeypatch):
     assert 'id="ai-own-fields" class="ai-own-fields" style="display:none;"' in body
     assert body.count('id="ai-base-url"') == 1
     assert body.count('id="ai-config-save"') == 1
-    # 步数上限只读展示（user 不再有可编辑步数）
+    # 步数上限只读展示（user 不再有可编辑步数）；2026-09-10 §2 A 上限 100
     assert body.count('id="ai-max-steps"') == 1
-    assert 'id="ai-max-steps" type="number" min="1" max="500" readonly' in body
+    assert 'id="ai-max-steps" type="number" min="1" max="100" readonly' in body
 
 
 def test_index_owner_render_keeps_full_platform_form(monkeypatch):
@@ -316,8 +316,8 @@ def test_index_owner_render_keeps_full_platform_form(monkeypatch):
                     'id="ai-model" type="text"', 'id="ai-api-protocol"',
                     'id="ai-advanced"', 'id="ai-config-save"'):
         assert present in body, present
-    # owner 分支的 max_steps 可编辑（无 readonly）
-    assert 'id="ai-max-steps" type="number" min="1" max="500" placeholder' in body
+    # owner 分支的 max_steps 可编辑（无 readonly）；上限 100（2026-09-10 §2 A）
+    assert 'id="ai-max-steps" type="number" min="1" max="100" placeholder' in body
     assert 'id="ai-use-platform"' in body  # 隐藏 checkbox 载体同样保留
 
 

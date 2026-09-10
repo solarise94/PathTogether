@@ -12,10 +12,10 @@
 - **GET /api/admin/v1/site-stats**（§Batch D2 7）：owner-only 只读透传
   dashboard_stats；无写副作用；store 缺失 → 404（import 容错分支不在此测）；
 - **步数契约 API**（§Batch C 1/9）：PUT /api/admin/v1/settings/runtime 对
-  platform_task_max_steps / own_task_max_steps_limit 字段级 1..500 校验
-  （>500 稳定 400，不再静默截回）；demo_task_max_steps / demo_max_concurrency
-  维持各自现有边界（demo 步数 501 合法、并发上限 1_000_000）；demo 步数
-  独立默认 20，不继承 user 的 500。
+  platform_task_max_steps / own_task_max_steps_limit 字段级 1..100 校验
+  （2026-09-10 §2 A：>100 稳定 400，不再静默截回）；demo_task_max_steps /
+  demo_max_concurrency 维持各自现有边界（demo 步数 501 合法、并发上限
+  1_000_000）；demo 步数独立默认 20，不继承 user 值。
 
 运行：cd 项目根 && python3 -m pytest tests/test_admin_spend_total_api.py -q
 （PG 双跑：RUN_PG_TESTS=1 python3 -m pytest tests/test_admin_spend_total_api.py -q）
@@ -335,18 +335,19 @@ def test_site_stats_store_missing_returns_404(monkeypatch):
 # 4. 步数契约 API（§Batch C 1/4/8/9）
 # --------------------------------------------------------------------------- #
 def test_runtime_step_validator_field_level_bounds():
-    """字段级 validator（纯函数，json/PG 双跑）：user 步数 1..500；越界 400；
-    demo 步数/并发维持各自现有边界（回归：_BUDGET_LIMIT_MAX 未被改 500）。"""
+    """字段级 validator（纯函数，json/PG 双跑）：user 步数 1..100（2026-09-10
+    §2 A）；越界 400；demo 步数/并发维持各自现有边界（回归：_BUDGET_LIMIT_MAX
+    未被改 100）。"""
     v = app_mod._validate_runtime_settings
-    # user 步数字段：500（上限）与 1（下限）合法
-    ok, err = v({"platform_task_max_steps": 500})
-    assert (ok, err) == ({"platform_task_max_steps": 500}, None)
+    # user 步数字段：100（上限）与 1（下限）合法
+    ok, err = v({"platform_task_max_steps": 100})
+    assert (ok, err) == ({"platform_task_max_steps": 100}, None)
     ok, err = v({"own_task_max_steps_limit": 1})
     assert ok == {"own_task_max_steps_limit": 1} and err is None
-    # >500 → 稳定 400（不再「保存成功、运行时静默截回」）
-    for bad in (501, 5000, 1_000_000):
+    # >100 → 稳定 400（不再「保存成功、运行时静默截回」）
+    for bad in (101, 500, 5000, 1_000_000):
         ok, err = v({"platform_task_max_steps": bad})
-        assert ok is None and err is not None and "1–500" in err, bad
+        assert ok is None and err is not None and "1–100" in err, bad
     ok, err = v({"own_task_max_steps_limit": 0})
     assert ok is None and err is not None
     # demo 字段独立边界（_BUDGET_LIMIT_MAX=1_000_000 未动）：
@@ -356,47 +357,50 @@ def test_runtime_step_validator_field_level_bounds():
     assert ok == {"demo_max_concurrency": 8} and err is None
     ok, err = v({"demo_max_concurrency": 1_000_001})
     assert ok is None and err is not None
-    # 常量红线：共享上限未被改成 500；默认常量 = 500
+    # 常量红线：共享上限未被改成 100；默认常量 = 100（demo 仍 20）
     assert app_mod._BUDGET_LIMIT_MAX == 1_000_000
-    assert budget_store.DEFAULT_PLATFORM_TASK_MAX_STEPS == 500
-    assert budget_store.DEFAULT_OWN_TASK_MAX_STEPS_LIMIT == 500
+    assert budget_store.DEFAULT_PLATFORM_TASK_MAX_STEPS == 100
+    assert budget_store.DEFAULT_OWN_TASK_MAX_STEPS_LIMIT == 100
     assert budget_store.DEFAULT_DEMO_TASK_MAX_STEPS == 20
-    assert app_mod.DEFAULT_CONFIG["max_steps"] == 500
-    assert app_mod._USER_STEP_LIMIT_MAX == 500
+    assert app_mod.DEFAULT_CONFIG["max_steps"] == 100
+    assert app_mod._USER_STEP_LIMIT_MAX == 100
 
 
 def test_runtime_step_settings_api_and_demo_independence():
-    """PUT settings/runtime：user 步数 >500 稳定 400、500 落库；demo 步数
-    独立默认 20 不继承 user 值（§Batch C 8）。"""
+    """PUT settings/runtime：user 步数 >100 稳定 400、100 落库（2026-09-10
+    §2 A：101→400、100→200）；demo 步数独立默认 20 不继承 user 值。"""
     bh.seed_spend_settings()
     owner, _u = _setup_users()
     c = _login(_client(), owner)
-    # >500 → 400
+    # >100 → 400（101 越界、旧默认 500 同样越界）
     r = c.put("/api/admin/v1/settings/runtime",
-              json={"platform_task_max_steps": 501})
+              json={"platform_task_max_steps": 101})
     assert r.status_code == 400
     assert r.get_json()["error"]["code"] == "invalid_request"
-    # 500 落库 + demo 独立
+    r = c.put("/api/admin/v1/settings/runtime",
+              json={"platform_task_max_steps": 500})
+    assert r.status_code == 400
+    # 100 落库 + demo 独立
     r = c.put("/api/admin/v1/settings/runtime", json={
-        "platform_task_max_steps": 500, "demo_task_max_steps": 20})
+        "platform_task_max_steps": 100, "demo_task_max_steps": 20})
     assert r.status_code == 200, r.get_data(as_text=True)
-    assert r.get_json()["limits"]["platform_task_max_steps"] == 500
+    assert r.get_json()["limits"]["platform_task_max_steps"] == 100
     assert r.get_json()["limits"]["demo_task_max_steps"] == 20
-    # 运行时读取：user=500；demo 恒 20（不继承 user 的 500）
-    assert app_mod._platform_task_max_steps() == 500
+    # 运行时读取：user=100；demo 恒 20（不继承 user 值）
+    assert app_mod._platform_task_max_steps() == 100
     assert app_mod._demo_task_max_steps() == 20
     # user 步数改小不影响 demo（独立字段、独立边界）
     r = c.put("/api/admin/v1/settings/runtime", json={
-        "platform_task_max_steps": 300})
+        "platform_task_max_steps": 60})
     assert r.status_code == 200
-    assert app_mod._platform_task_max_steps() == 300
+    assert app_mod._platform_task_max_steps() == 60
     assert app_mod._demo_task_max_steps() == 20
     # own_task_max_steps_limit 字段同口径（通道已退役，字段级校验保留）
     r = c.put("/api/admin/v1/settings/runtime",
               json={"own_task_max_steps_limit": 9999})
     assert r.status_code == 400
     r = c.put("/api/admin/v1/settings/runtime",
-              json={"own_task_max_steps_limit": 500})
+              json={"own_task_max_steps_limit": 100})
     assert r.status_code == 200
 
 

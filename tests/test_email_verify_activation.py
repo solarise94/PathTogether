@@ -388,12 +388,95 @@ def test_pending_login_enrollment_scope_only(monkeypatch):
     # 业务面全拒（enrollment 不是登录态）
     assert client.get("/api/admin/v1/users").status_code == 401
     assert client.get("/api/admin/v1/slides/inventory").status_code == 401
-    # 白名单外 /api 一律 401 auth_required
-    assert client.get("/api/admin/v1/invites").status_code == 401
+    # 白名单外 /api 一律 401（D2：code=auth_required + 中文 error）
+    r_inv = client.get("/api/admin/v1/invites")
+    assert r_inv.status_code == 401
+    body = r_inv.get_json()
+    assert body["code"] == "auth_required"
+    assert body["error"] != "auth_required"
+    assert "重新登录" in body["error"]
     # 登出可用（白名单）
     assert client.post("/logout").status_code == 302
     with client.session_transaction() as s:
         assert not s.get(app_mod.ENROLLMENT_SESSION_KEY)
+
+
+# =========================================================================== #
+# 3.5 D1/D2 回归（2026-09-10）：enrollment 会话不被非白名单请求清掉、
+#     favicon 放行、401 错误契约（中文 error + code=auth_required）
+# =========================================================================== #
+def test_activation_survives_favicon_request(monkeypatch):
+    """D1 锁定：GET /activate 后浏览器自动 GET /favicon.ico（公开路径，204），
+    再 POST 正确邀请码仍 200 ok=true。旧代码 favicon 会话被清 → 必 401。"""
+    _open_email_mode(monkeypatch)
+    owner = _mk_owner()
+    app_mod.AUTH_ENABLED = True
+    user, password = _make_pending("fav@x.com")
+    inv = registration_store.create_invite(
+        owner["user_id"], total_limit_nano_cny=10 ** 9)
+    client = _client()
+    assert client.post("/login", data={"username": "fav@x.com",
+                                       "password": password}).status_code == 302
+    assert client.get("/activate").status_code == 200
+    # 浏览器自动请求 favicon：公开路径放行（204），不得影响 enrollment 会话
+    r_fav = client.get("/favicon.ico")
+    assert r_fav.status_code == 204
+    # 激活仍成功（旧代码此处必 401 auth_required）
+    r = _activate_via_api(client, inv["token"])
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.get_json()["ok"] is True
+    assert user_store.get_user(user["user_id"])["activation_state"] == "active"
+
+
+def test_enrollment_session_survives_nonwhitelist_challenge(monkeypatch):
+    """D1 锁定：非白名单路径只拒绝、不清会话——401 后 enrollment 状态接口
+    仍 200（激活页刷新/再提交不丢会话）；401 body 符合 D2 契约。"""
+    _open_email_mode(monkeypatch)
+    app_mod.AUTH_ENABLED = True
+    user, password = _make_pending("keep@x.com")
+    client = _client()
+    assert client.post("/login", data={"username": "keep@x.com",
+                                       "password": password}).status_code == 302
+    # 任意非白名单路径（页面 302 /login、/api 401），cookie 保留
+    r_api = client.get("/api/admin/v1/users")
+    assert r_api.status_code == 401
+    body = r_api.get_json()
+    assert body["code"] == "auth_required"
+    assert body["error"] != "auth_required"      # 不是裸机器码
+    assert "重新登录" in body["error"]            # 中文引导文案
+    assert client.get("/some/random/page").status_code == 302
+    # 会话没有被清：enrollment 状态接口仍可用
+    r_enr = client.get("/api/account/enrollment")
+    assert r_enr.status_code == 200
+    assert r_enr.get_json()["state"] == "pending_activation"
+    assert user_store.get_user(user["user_id"]) \
+        ["activation_state"] == "pending_activation"
+
+
+def test_enrollment_whitelist_invalid_session_still_cleared(monkeypatch):
+    """D1 边界：白名单路径上会话/用户本身已无效（禁用）仍清会话（既有
+    fail-closed 语义不放宽；激活成功/already_active 清会话由既有用例锁定）。"""
+    _open_email_mode(monkeypatch)
+    app_mod.AUTH_ENABLED = True
+    user, password = _make_pending("ban@x.com")
+    client = _client()
+    assert client.post("/login", data={"username": "ban@x.com",
+                                       "password": password}).status_code == 302
+    # 管理员禁用 pending 用户 → enrollment 会话立即失效
+    user_store.set_user_disabled(user["user_id"], True)
+    assert client.get("/activate").status_code == 302   # 会话已清 → 去登录
+    with client.session_transaction() as s:
+        assert not s.get(app_mod.ENROLLMENT_SESSION_KEY)
+    assert client.get("/api/account/enrollment").status_code == 401
+
+
+def test_favicon_public_without_session():
+    """favicon 对匿名也公开（与 /healthz 同类）：204 且不 302 /login。"""
+    app_mod.AUTH_ENABLED = True
+    client = _client()
+    r = client.get("/favicon.ico")
+    assert r.status_code == 204
+    assert r.get_data() == b""
 
 
 # =========================================================================== #

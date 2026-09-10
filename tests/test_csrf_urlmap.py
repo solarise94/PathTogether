@@ -193,7 +193,8 @@ class TestShareRoisEndpoint:
         client = csrf_client(app_mod.app.test_client())
         r = client.get("/api/share/rois")
         assert r.status_code == 401
-        assert r.get_json()["error"] == "auth_required"
+        # D2（2026-09-10）：机器码在 code 字段
+        assert r.get_json()["code"] == "auth_required"
 
     def test_owner_visible_only_after_grant(self):
         """owner 默认不见他人切片 ROI；显式授权后可见；收回后再次不可见。"""
@@ -278,7 +279,8 @@ class TestAdminPluginsInstallEndpoint:
         client = csrf_client(app_mod.app.test_client())
         r = client.post("/api/admin/plugins/install", json={"plugin": "p"})
         assert r.status_code == 401
-        assert r.get_json()["error"] == "auth_required"
+        # D2（2026-09-10）：机器码在 code 字段
+        assert r.get_json()["code"] == "auth_required"
 
     def test_user_403_owner_bad_body_400(self):
         owner, usera, _b = _setup_users()

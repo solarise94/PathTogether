@@ -228,4 +228,6 @@ def test_session_path_csrf_exempt_get_only(fake_sidecar):
     c = _client()
     r = c.get("/api/ai/session/sess-a/path")
     assert r.status_code == 401
-    assert r.get_json()["error"] == "auth_required"
+    # D2（2026-09-10）：机器码在 code 字段，error 是中文引导文案
+    assert r.get_json()["code"] == "auth_required"
+    assert "重新登录" in r.get_json()["error"]

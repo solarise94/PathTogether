@@ -218,9 +218,9 @@ def test_user_put_any_field_rejected_400():
 
 def test_user_get_effective_max_steps_platform_readonly():
     """user GET 只读：using 恒 platform（平台已配）；生效步数=平台
-    platform_task_max_steps（Batch C：默认/上限 500）；存量 own 步数仅作回显
-    （own_max_steps），无写入通道。"""
-    _setup_platform()  # 平台 ai_config.json 的 max_steps 用默认 500
+    platform_task_max_steps（2026-09-10 §2 A：默认/上限 100）；存量 own 步数
+    仅作回显（own_max_steps），无写入通道。"""
+    _setup_platform()  # 平台 ai_config.json 的 max_steps 用默认 100
     u = _make_user("user")
     _own_credentials(u["user_id"], steps=OWN_STEPS)
     c = _client()
@@ -228,23 +228,23 @@ def test_user_get_effective_max_steps_platform_readonly():
     r = c.get("/api/ai/config")
     j = r.get_json()
     assert j["using"] == "platform"
-    # 平台模式：生效步数=platform_task_max_steps（Batch C 默认 500，不再 20），
+    # 平台模式：生效步数=platform_task_max_steps（默认 100，不再 20/500），
     # 忽略存量 OWN_STEPS
-    assert j["max_steps"] == 500
-    assert j["effective_max_steps"] == 500
+    assert j["max_steps"] == 100
+    assert j["effective_max_steps"] == 100
     assert j["own_max_steps"] == OWN_STEPS  # 存量回显：值是本测试写入的种子，不是生效步数
-    assert j["own_task_max_steps_limit"] >= 500
+    assert j["own_task_max_steps_limit"] >= 100
     # 切回 own 的 PUT 已下线：use_platform=false 同样 400
     r2 = c.put("/api/ai/config", json={"use_platform": False})
     assert r2.status_code == 400
     j3 = c.get("/api/ai/config").get_json()
     assert j3["using"] == "platform"
-    assert j3["effective_max_steps"] == 500
+    assert j3["effective_max_steps"] == 100
 
 def test_max_steps_injection_rules_for_sidecar_config():
-    """Batch C（§Batch C 实现要求 1）：user 恒平台模式，_build_sidecar_config
-    对 role=user **始终输出** max_steps=500（缺配置回退 budget_store 常量，
-    不再 20/50）；存量 own 步数被忽略。"""
+    """user 恒平台模式，_build_sidecar_config 对 role=user **始终输出**
+    max_steps=100（2026-09-10 §2 A：缺配置回退 budget_store 常量，不再
+    20/50/500）；存量 own 步数被忽略。"""
     _setup_platform()
     u = _make_user("user")
     _own_credentials(u["user_id"], steps=7)  # use_platform=False + steps=7
@@ -257,11 +257,11 @@ def test_max_steps_injection_rules_for_sidecar_config():
     r = _run_ok(c, "inj.svs")
     assert r.status_code == 200
     cfg = fake.calls[-1]["body"]["config"]
-    assert cfg["max_steps"] == 500  # 平台步数（Batch C 契约），忽略存量 own 7
+    assert cfg["max_steps"] == 100  # 平台步数（现契约 100），忽略存量 own 7
     assert cfg["base_url"] == "http://platform.example/v1"  # 平台凭据
     assert cfg.get("ssrf_guard") is not True
-    # 回归（§Batch C 1）：平台配置缺 max_steps 时注入仍恒为 500（不对 sidecar
-    # 缺省 50 兜底）——拔掉 ai_config.json 里的显式值再跑一次
+    # 回归：平台配置缺 max_steps 时注入仍恒为 100（不对 sidecar 缺省兜底）
+    # ——拔掉 ai_config.json 里的显式值再跑一次
     u2 = _make_user("user")
     _own_credentials(u2["user_id"], steps=9)
     _touch("inj2.svs")
@@ -270,7 +270,7 @@ def test_max_steps_injection_rules_for_sidecar_config():
     _login(c2, "user", u2["user_id"])
     assert _run_ok(c2, "inj2.svs").status_code == 200
     cfg2 = fake.calls[-1]["body"]["config"]
-    assert cfg2["max_steps"] == 500
+    assert cfg2["max_steps"] == 100
 
 def test_run_body_cannot_smuggle_tuning_fields():
     """浏览器不能靠请求体临时塞未保存的调优值（注入只读已保存配置）。"""
@@ -286,12 +286,13 @@ def test_run_body_cannot_smuggle_tuning_fields():
     r = c.post("/api/ai/run", json={
         "slide": "smug.svs",
         "request_id": _rid(),
+        # 请求体故意塞旧默认 500（超新硬顶）：注入路径整体忽略请求体
         "config": {"max_steps": 500, "api_key": "sk-smuggled"},
         "max_steps": 500,
     })
     assert r.status_code == 200
     cfg = fake.calls[-1]["body"]["config"]
-    assert cfg["max_steps"] == 500        # 平台步数（存量 own 9 被忽略）
+    assert cfg["max_steps"] == 100        # 平台步数（存量 own 9 / 请求体 500 均被忽略）
     assert cfg["api_key"] == "sk-platform-123456"  # 平台 key，请求体整体被忽略
 
 # --------------------------------------------------------------------------- #
@@ -713,7 +714,8 @@ def test_ui_budget_card_and_max_steps_sync_present():
     # 2026-09-07 升 0.4.0：展示 J（身份主列=完整邮箱用户名，main.js/pin 同步）。
     # 2026-09-08 升 0.4.1：身份冲突清单+孤儿处置页（P2-2 闭环）。
     # 2026-09-09 0.4.2：默认模型切换卡
-    assert manifest["pluginVersion"] == "0.4.3"
+    # 2026-09-10 0.4.4：步数上限 500→100（§2 A：input max/校验区间/帮助文案）
+    assert manifest["pluginVersion"] == "0.4.4"
     for perm in ("admin:turn-budgets:read", "admin:turn-budgets:write",
                  "admin:acquisition:read", "admin:billing:write"):
         assert perm not in manifest["adminPermissions"], perm

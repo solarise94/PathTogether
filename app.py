@@ -843,6 +843,10 @@ def _auth_challenge():
     # （Stage 4-3 demo 实测被 302 到 /login，探活全挂）
     if path == "/healthz":
         return None
+    # /favicon.ico 是浏览器自动请求（D1 修复 2026-09-10）：非敏感公开路径，
+    # 与 /healthz 同类免鉴权（路由返回 204），不再让自动请求撞鉴权闸
+    if path == "/favicon.ico":
+        return None
     # internal 回调端点由 _require_internal 单独鉴权（共享 token），不走管理员 session
     if path.startswith("/internal/"):
         return None
@@ -864,9 +868,11 @@ def _auth_challenge():
                 asset_plugin_id,
                 request.args.get(_ADMIN_ASSET_TOKEN_PARAM)):
             return None
-        return jsonify(error="auth_required"), 401
+        return jsonify(error="登录状态已失效，请重新登录后再试",
+                       code="auth_required"), 401
     if path.startswith("/api/"):
-        return jsonify(error="auth_required"), 401
+        return jsonify(error="登录状态已失效，请重新登录后再试",
+                       code="auth_required"), 401
     # 页面：跳登录，带 next（防开放跳转在 login 路由内校验）
     return redirect("/login?next=" + path)
 
@@ -910,7 +916,8 @@ def _require_auth():
     verify,resend}、/api/demo/*、/static/、/plugins/、/healthz、/internal/、
     /api/plugin/；其余请求检查 session，并按 user_id 回查用户是否仍存在且
     enabled（禁用或删除立即失效，不等 cookie 过期）。
-    /api/ 开头返回 401 jsonify(error="auth_required")，页面 302 到 /login。
+    /api/ 开头返回 401 JSON（中文 error + code="auth_required"，D2 2026-09-10
+    起，机器码只进 code 字段），页面 302 到 /login。
     例外：未登录访问 ``/`` 不跳登录——由 index() 渲染入口分流页（docs §3.1，
     同一路由按认证状态分流，不做 302 /login）。
 
@@ -935,6 +942,9 @@ def _require_auth():
     if path.startswith("/api/demo/"):
         return None
     if path == "/healthz":
+        return None
+    # /favicon.ico 浏览器自动请求（D1 修复 2026-09-10）：公开路径，路由返回 204
+    if path == "/favicon.ico":
         return None
     if path.startswith("/internal/") or path.startswith("/api/plugin/"):
         return None
@@ -971,12 +981,24 @@ def _require_auth():
             return None
     elif session.get(ENROLLMENT_SESSION_KEY):
         # enrollment 受限 scope：仅白名单路径，且用户仍处于 pending_activation
-        # 且未禁用（禁用/激活完成/状态变化即失效）
+        # 且未禁用（禁用/激活完成/状态变化即失效）。
+        # D1 修复（2026-09-10）：非白名单路径（浏览器自动 GET /favicon.ico、
+        # apple-touch-icon.png 等）**只拒绝、不清会话**——此前任何非白名单
+        # 请求都会 session.clear()，把 pending 用户唯一有效的激活会话销毁
+        # （激活页红条 auth_required 的根因）。清会话只留给两类场景：
+        #   - 白名单路径上 _enrollment_session_valid() 判定会话/用户本身已
+        #     无效（已激活/禁用/lookup 失败）；
+        #   - 激活成功 / already_active / user_disabled 等业务写路径（各自
+        #     视图内已有，不在此处）。
         if path in _ENROLLMENT_ALLOWED_PATHS:
-            enr = _enrollment_session_valid()
-            if enr is not None:
+            if _enrollment_session_valid() is not None:
                 return None
-        session.clear()
+            # 白名单路径但会话已无效：清掉残留 cookie 再拒绝
+            session.clear()
+            if path == "/":
+                return None
+            return _auth_challenge()
+        # 非白名单：拒绝但保留 enrollment cookie（不扩大安全面）
         if path == "/":
             return None
         return _auth_challenge()
@@ -3926,7 +3948,10 @@ def _require_enrollment():
     """
     enr = _enrollment_session_valid()
     if enr is None:
-        return None, (jsonify(error="auth_required"), 401)
+        # D2（2026-09-10）：与激活接口其它错误对齐——中文 error + 机器 code；
+        # 禁止把裸机器码放进 error（前端原样渲染成红条）
+        return None, (jsonify(error="登录状态已失效，请重新登录后再试",
+                              code="auth_required"), 401)
     return enr, None
 
 
@@ -5097,6 +5122,21 @@ def api_healthz():
         backend=getattr(share_store, "STORAGE_BACKEND", "json"),
         sidecar=sidecar_status,
     )
+
+
+@app.route("/favicon.ico")
+def favicon():
+    """空 favicon（204，D1 修复 2026-09-10）。
+
+    浏览器加载任意页面后都会自动 GET /favicon.ico（带 Lax cookie）。此前
+    本应用没有该路由，Flask 对未匹配路由仍跑 before_request → 鉴权闸把
+    pending 用户的激活会话当未登录拒绝。现按非敏感公开路径返回 204 空
+    body（可短缓存），配合各页面 <link rel="icon" href="data:,"> 不再
+    产生该请求。
+    """
+    resp = Response(status=204)
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
 
 
 def _sidecar_health_status(timeout=2.0):
@@ -7818,13 +7858,14 @@ _SETTINGS_RUNTIME_FIELDS = (
     "own_task_max_steps_limit", "demo_max_concurrency",
 )
 
-#: Batch C 8/9（§4.5）：user 步数字段级 1..500 边界——默认值与硬上限都是
-#: 500，API 对 >500 返回稳定 400（不再「保存成功、运行时静默截回 500」，
-#: 遗留 >500 值由迁移 0031 显式归一并审计）。共享 _BUDGET_LIMIT_MAX 保持
-#: 1_000_000 不动（demo 步数/并发等字段各自边界由回归测试锁定）。
+#: Batch C 8/9（§4.5）：user 步数字段级 1.._USER_STEP_LIMIT_MAX 边界——默认值
+#: 与硬上限一致（2026-09-10 §2 A 起均为 100），API 对越界返回稳定 400（不再
+#: 「保存成功、运行时静默截回」，存量 >100 值由迁移 0043 显式归一并审计）。
+#: 共享 _BUDGET_LIMIT_MAX 保持 1_000_000 不动（demo 步数/并发等字段各自边界
+#: 由回归测试锁定）。
 _USER_STEP_LIMIT_FIELDS = frozenset((
     "platform_task_max_steps", "own_task_max_steps_limit"))
-_USER_STEP_LIMIT_MAX = 500
+_USER_STEP_LIMIT_MAX = 100
 
 
 def _validate_user_step_limit_field(field, value):
@@ -7841,7 +7882,8 @@ def _validate_runtime_settings(body):
     整数为 >0 且 ≤ _BUDGET_LIMIT_MAX，demo_enabled 布尔）。
 
     Batch C（§Batch C 实现要求 1/9）：``platform_task_max_steps`` 与
-    ``own_task_max_steps_limit`` 使用字段级 1..500 边界（越界稳定 400）；
+    ``own_task_max_steps_limit`` 使用字段级 1.._USER_STEP_LIMIT_MAX 边界
+    （2026-09-10 §2 A 起 = 100，越界稳定 400）；
     demo_task_max_steps / demo_max_concurrency 等其他字段维持各自现有边界
     （正整数 ≤ _BUDGET_LIMIT_MAX）。
 
@@ -11512,14 +11554,14 @@ def _parse_client_request_id(body):
 
 
 def _platform_task_max_steps() -> int:
-    """注册用户平台 AI 单次任务步骤（ai_safety.platform_task_max_steps，默认 500）。
+    """注册用户平台 AI 单次任务步骤（ai_safety.platform_task_max_steps，默认 100）。
 
     批次 F：自周期列迁居 platform_settings（settings_store 统一设置源）；
     周期行仅在软闸回退路径（reserve_turn）与冻结报表中继续存在。
-    Batch C（§Batch C 实现要求 1）：默认值与硬上限均为 500——缺值/读取失败
-    回落 budget_store.DEFAULT_PLATFORM_TASK_MAX_STEPS（=500），不再回退 20；
-    运行时仍钳制到 _MAX_STEPS_LIMIT，但保存路径已改为字段级 1..500 稳定
-    400（不再「保存成功、运行时静默截回」），>500 存量由迁移 0031 显式归一。
+    Batch C（§Batch C 实现要求 1）：默认值与硬上限一致（2026-09-10 §2 A 起
+    均为 100）——缺值/读取失败回落 budget_store.DEFAULT_PLATFORM_TASK_MAX_
+    STEPS（=100），不再回退 20；运行时仍钳制到 _MAX_STEPS_LIMIT，保存路径
+    为字段级 1..100 稳定 400，>100 存量由迁移 0043 显式归一。
     """
     try:
         raw = settings_store.get_ai_safety_settings()[
@@ -11531,11 +11573,11 @@ def _platform_task_max_steps() -> int:
 
 
 def _own_task_max_steps_limit() -> int:
-    """自带 API 可设置的步数硬上限（ai_safety.own_task_max_steps_limit，默认 500）。
+    """自带 API 可设置的步数硬上限（ai_safety.own_task_max_steps_limit，默认 100）。
 
-    Batch C：缺值回落 DEFAULT_OWN_TASK_MAX_STEPS_LIMIT（=500）；字段级
-    1..500 校验见 _validate_runtime_settings（自带 API 通道已退役，字段本批
-    兼容保留）。
+    Batch C：缺值回落 DEFAULT_OWN_TASK_MAX_STEPS_LIMIT（2026-09-10 §2 A 起
+    =100）；字段级 1..100 校验见 _validate_runtime_settings（自带 API 通道已
+    退役，字段本批兼容保留）。
     """
     try:
         raw = settings_store.get_ai_safety_settings()[
@@ -12573,9 +12615,9 @@ _SITE_STATS_RETENTION_THREAD = _start_site_stats_retention_thread()
 DEFAULT_MAX_TOKENS = 384000
 
 DEFAULT_CONFIG = {
-    # Batch C（§Batch C 实现要求 1 / §4.5）：max_steps 默认与硬上限统一 500
-    #（异常循环熔断，不是业务额度；HistoPilot 兼容默认同步 500，不再 ?? 50）
-    "max_steps": 500,
+    # 2026-09-10（§2 A）：max_steps 默认与硬上限统一 100（异常循环熔断，不是
+    # 业务额度；达到 100 暂停、点「继续」开新 run 重新计数；owner 不豁免）
+    "max_steps": 100,
     # §9.2.1：窗口与视觉预算改由 window_tier（默认 balanced=400k/60000）推导；
     # None = 未显式设置，sidecar 按档位推导。显式覆盖仍优先。
     "context_window_tokens": None,
@@ -13075,12 +13117,13 @@ def _build_sidecar_config(user_ctx=None, demo_capability_id=None) -> dict:
     DeepSeek user_id 隔离 scope = "demo:" + capability_id（§4.2）。
     tuning 调优字段始终来自平台 ai_config.json（user 无独立调优）。
     max_steps 注入规则（docs §9.2 / §12.3；Batch C §4.5）：
-      - owner：平台 ai_config.json 值（现状不变，owner 自担；缺省 500）；
+      - owner：平台 ai_config.json 值（现状不变，owner 自担；缺省 100；
+        2026-09-10 §2 A 起 owner 不豁免 100 硬顶，读取时钳制）；
       - user：一律平台模式，始终注入 platform_task_max_steps（默认/上限
-        500，budget_store.DEFAULT_PLATFORM_TASK_MAX_STEPS；字段级 1..500
-        校验，>500 不再静默截断），忽略用户曾保存的自带 API 步数（注入只
-        读已保存配置，请求体不可绕过）。_build_sidecar_config 对 role=user
-        始终输出 config.max_steps（回归测试锁定）。
+        100，budget_store.DEFAULT_PLATFORM_TASK_MAX_STEPS；字段级 1..100
+        校验，>100 存量由迁移 0043 归一），忽略用户曾保存的自带 API 步数
+        （注入只读已保存配置，请求体不可绕过）。_build_sidecar_config 对
+        role=user 始终输出 config.max_steps（回归测试锁定）。
     返回的 dict 直接作为 sidecar body 的 `config` 字段。
     """
     source, cred_cfg = _resolve_ai_credentials(user_ctx)
@@ -13098,7 +13141,7 @@ def _build_sidecar_config(user_ctx=None, demo_capability_id=None) -> dict:
     if (user_ctx is not None
             and user_ctx.get("role") == user_store.ROLE_USER
             and user_ctx.get("user_id")):
-        # user 恒平台模式：注入 platform_task_max_steps（默认/上限 500）
+        # user 恒平台模式：注入 platform_task_max_steps（默认/上限 100）
         out["max_steps"] = _platform_task_max_steps()
     # 运行时再守一次：即使加载迁移未持久化，注入 sidecar 的值也不能 <128。
     _apply_legacy_reserve_migration(out)
@@ -13187,6 +13230,15 @@ def _load_ai_config() -> dict:
                 "ai_config_migrate_write_failed",
                 "ai_config.json reserve_tokens 迁移重写失败（%s）：磁盘保留现状"
                 % exc.__class__.__name__)
+    # 2026-09-10 §2 A：max_steps 硬顶降至 100——存量 ai_config.json 可能仍是
+    # 旧默认 500。PUT 校验已拒绝 >上限（owner 下次保存会被 400），这里在读取
+    # 路径钳制到上限（仅内存，不回写文件），避免「页面显示 500、实际跑 100」
+    # 的显示/行为漂移；DB 侧存量由 migrations/0043 带审计归一。
+    try:
+        if int(data.get("max_steps")) > _MAX_STEPS_LIMIT:
+            data["max_steps"] = _MAX_STEPS_LIMIT
+    except (TypeError, ValueError):
+        pass  # 缺失/非数字：交由 DEFAULT_CONFIG 缺省与 PUT 校验兜底
     data["api_key"] = _decrypt_api_key(stored)
     return data
 
@@ -13243,8 +13295,8 @@ def _save_ai_config(cfg: dict) -> None:
 #   lease_ttl              sidecar 不再用（仅 legacy ai_session.py）；UI min=30。
 #                          → 正整数。
 #   max_tokens             模型输出上限（基础字段，无 UI 输入）。→ 正整数。
-#   max_steps              agent-runner.ts:604 Math.max(1,...)；UI min=1 max=500。
-#                          → 正整数，且 <= 500（UI 声明上限；防止失控调用/费用）。
+#   max_steps              agent-runner.ts:604 Math.max(1,...)；UI min=1 max=100。
+#                          → 正整数，且 <= 100（2026-09-10 §2 A 硬顶；防止失控调用/费用）。
 # 字段关系：reserve_tokens + keep_recent_tokens 必须 < context_window_tokens
 # （压缩：context - reserve 是触发线，keep_recent 是保留尾；重叠即配置矛盾）。
 # 允许 0 的字段（keep_recent_tokens / keep_recent_images / safety_margin）：
@@ -13327,9 +13379,11 @@ def _resolve_effective_context_window(cfg):
     if tier in _WINDOW_TIER_PRESETS:
         return _WINDOW_TIER_PRESETS[tier]["context_window_tokens"]
     return _LEGACY_CONTEXT_WINDOW_TOKENS
-# max_steps 上限：取自 templates/index.html 的 input max="500"（步数上限字段）。
-# 防止 max_steps=99999 之类失控（sidecar 运行循环只限下限，费用风险）。
-_MAX_STEPS_LIMIT = 500
+# max_steps 上限：单轮循环熔断硬顶（2026-09-10 产品口径：全员 100，含 owner；
+# Demo 默认 20 不动）。防止 max_steps=99999 之类失控（sidecar 运行循环只限
+# 下限，费用风险）。存量 >100 值：DB 侧由 migrations/0043 归一，ai_config.json
+# 读取路径钳制（_load_ai_config），PUT 校验拒绝 >100。
+_MAX_STEPS_LIMIT = 100
 # reserve_tokens 下限：产品规定的最小可用摘要预算。pi 用 floor(0.8 * reserve)
 # 作摘要 maxTokens；128 保证 ≥102 输出 tokens（127 仍有 101，但不是产品下限）。
 # 与 sidecar RESERVE_TOKENS_MIN 保持一致。
@@ -13438,7 +13492,7 @@ def _validate_ai_tuning(body, cfg):
     for field in ("overview_long_edge", "working_image_long_edge", "detail_image_long_edge"):
         if field in validated and validated[field] > _LONG_EDGE_LIMIT:
             return None, "{} 不可超过 {}（最长边上限）".format(field, _LONG_EDGE_LIMIT)
-    # max_steps 上限（UI 声明 max=500）
+    # max_steps 上限（2026-09-10 §2 A：硬顶 100）
     if "max_steps" in validated and validated["max_steps"] > _MAX_STEPS_LIMIT:
         return None, "max_steps 不可超过 {}（步数上限）".format(_MAX_STEPS_LIMIT)
     if "reserve_tokens" in validated and validated["reserve_tokens"] < _RESERVE_TOKENS_MIN:
@@ -16436,11 +16490,36 @@ def api_ai_session_detail(session_id):
     """session detail + 脱敏 transcript。代理 sidecar GET /session/<id>。
 
     Stage 3a-2b：owner 任意；user 仅自己名下会话（越权 403，统一不泄露存在性）。
+    C2（2026-09-10）：2xx 回填 ``session.drawing_mirror``（PT 镜像表权威布尔；
+    无行/读失败按 false）。HP 的 ``allow_ai_drawing`` 仍原样透传——UI 用二者
+    对照提示「平台同步未完成」，写入口继续对无行/false fail-closed，不在
+    GET 路径把 HP=true 回写成镜像 true。
     """
     auth = _require_ai_session_owner(session_id)
     if auth is not None:
         return auth
-    return _proxy_json("/session/" + session_id, None, method="GET")
+
+    def _on_response(status, parsed):
+        if status >= 400 or not isinstance(parsed, dict):
+            return None
+        try:
+            flag = share_store.get_ai_session_drawing_flag(session_id)
+        except Exception:
+            app.logger.exception(
+                "session detail 读描绘镜像失败（session=%s）", session_id)
+            flag = None
+        out = dict(parsed)
+        sess = out.get("session")
+        if isinstance(sess, dict):
+            sess = dict(sess)
+            sess["drawing_mirror"] = flag is True
+            out["session"] = sess
+        else:
+            out["drawing_mirror"] = flag is True
+        return (out, status)
+
+    return _proxy_json("/session/" + session_id, None, method="GET",
+                       on_response=_on_response)
 
 
 @app.route("/api/ai/session/by-request/<request_id>")

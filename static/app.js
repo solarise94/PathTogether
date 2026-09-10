@@ -121,10 +121,13 @@
     }
     return fetch(url, opts).then(function (resp) {
       if (resp.status === 401) {
-        // 尝试读 body 判断是否 auth_required（不消费主响应流：克隆一份）
+        // 尝试读 body 判断是否 auth_required（不消费主响应流：克隆一份）。
+        // D2（2026-09-10）起 401 body 为 {error: 中文, code: "auth_required"}，
+        // 机器码在 code 字段；兼容读取旧形态 error 字段。
         return resp.clone().json().then(
           function (body) {
-            if (body && body.error === "auth_required") {
+            if (body && (body.code === "auth_required" ||
+                         body.error === "auth_required")) {
               location.href = "/login?next=" + encodeURIComponent(location.pathname);
             }
             return resp;

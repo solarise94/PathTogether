@@ -2256,7 +2256,7 @@
       var limits = rt.limits || {};
       if (demoEnabled) demoEnabled.checked = !!limits.demo_enabled;
       // 自带 API 步数上限（own_task_max_steps_limit）已从 UI 移除
-      //（后端字段兼容保留）；注册用户步数字段统一 1..500。
+      //（后端字段兼容保留）；注册用户步数字段统一 1..100（2026-09-10）。
       [["adm-rt-psteps", "platform_task_max_steps"],
        ["adm-rt-demosteps", "demo_task_max_steps"],
        ["adm-rt-concurrency", "demo_max_concurrency"]].forEach(
@@ -2437,10 +2437,10 @@
     }
     var payload = {};
     try {
-      // 注册用户单任务安全上限：1..500（默认/最高 500；>100 为异常长任务
-      // 观测线，500 为安全暂停线；消费额度由总金额控制）。
+      // 注册用户单任务安全上限：1..100（默认/最高 100；达到 100 暂停，点
+      // 「继续」开新 run 重新计数；消费额度由总金额控制，步数不是额度）。
       // Demo 步数/并发沿用各自现有边界；自带 API 步数上限已从 UI 移除。
-      [["adm-rt-psteps", "platform_task_max_steps", 1, 500],
+      [["adm-rt-psteps", "platform_task_max_steps", 1, 100],
        ["adm-rt-demosteps", "demo_task_max_steps", 1, 1000000],
        ["adm-rt-concurrency", "demo_max_concurrency", 1, 1000000]].forEach(
         function (triple) {

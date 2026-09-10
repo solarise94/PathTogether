@@ -142,7 +142,8 @@ def test_anonymous_gets_401_on_every_endpoint():
     for path in _endpoints(owner["user_id"]):
         r = _client().get(path)
         assert r.status_code == 401, "%s -> %s" % (path, r.status_code)
-        assert r.get_json()["error"] == "auth_required"
+        # D2（2026-09-10）：机器码在 code 字段
+        assert r.get_json()["code"] == "auth_required"
 
 def test_user_gets_403_on_every_endpoint():
     owner, usera = _setup_users()

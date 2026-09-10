@@ -287,7 +287,7 @@ def test_nonneg_int_fields_reject_negative():
 
 
 # =========================================================================== #
-# max_steps 上限：UI 声明 max=500。
+# max_steps 上限：2026-09-10 §2 A 硬顶 100（UI 声明 max=100）。
 # =========================================================================== #
 def test_max_steps_upper_bound():
     print("== max_steps 超上限 → 400 ==")
@@ -297,16 +297,40 @@ def test_max_steps_upper_bound():
     check("error 提示上限", j and "max_steps" in (j or {}).get("error", ""),
           "error=%r" % (j or {}).get("error"))
     check("99999 不落盘", "max_steps" not in load_raw())
-    # 边界：500 合法
+    # 边界：100 合法（旧默认 500 同步越界）
+    reset_config()
+    code, j = put({"max_steps": 100})
+    check("max_steps=100 → 200", code == 200, "got %s %r" % (code, j))
+    check("max_steps=100 落盘", j and j.get("max_steps") == 100,
+          "got %r" % (j or {}).get("max_steps"))
+    # 边界：101 非法（旧默认 500 也一并回归）
+    reset_config()
+    code, j = put({"max_steps": 101})
+    check("max_steps=101 → 400", code == 400, "got %s %r" % (code, j))
     reset_config()
     code, j = put({"max_steps": 500})
-    check("max_steps=500 → 200", code == 200, "got %s %r" % (code, j))
-    check("max_steps=500 落盘", j and j.get("max_steps") == 500,
+    check("max_steps=500 → 400", code == 400, "got %s %r" % (code, j))
+
+
+def test_legacy_persisted_max_steps_clamped_on_read():
+    """存量 ai_config.json 的 max_steps=500（旧默认）在读取路径钳制到 100
+    （2026-09-10 §2 A；仅内存钳制、不静默改文件）——避免「页面显示 500、
+    实际跑 100」的显示/行为漂移；owner 下次保存被 PUT 校验 400 纠正。"""
+    print("== 存量 max_steps=500 读取钳制 ==")
+    # 绕过端点直写旧默认值（模拟迁移前已持久化的文件形态）
+    seed_config(base_url="http://x/v1", max_steps=500)
+    assert load_raw().get("max_steps") == 500
+    # 读取路径（sidecar 注入 / GET 回显共用）钳制到上限
+    check("_load_ai_config 钳到 100",
+          app_mod._load_ai_config().get("max_steps") == 100,
+          "got %r" % app_mod._load_ai_config().get("max_steps"))
+    client = make_client()
+    r = client.get("/api/ai/config")
+    j = r.get_json()
+    check("GET 回显钳到 100", j and j.get("max_steps") == 100,
           "got %r" % (j or {}).get("max_steps"))
-    # 边界：501 非法
-    reset_config()
-    code, j = put({"max_steps": 501})
-    check("max_steps=501 → 400", code == 400, "got %s %r" % (code, j))
+    # 文件保持原样（读取钳制不回写磁盘；DB 侧归一走 migrations/0043）
+    assert load_raw().get("max_steps") == 500
 
 
 # =========================================================================== #
@@ -427,8 +451,8 @@ def test_omitted_fields_keep_defaults():
     reset_config()
     code, j = put({"base_url": "http://x/v1"})
     check("只提交 base_url → 200", code == 200, "got %s %r" % (code, j))
-    check("max_steps 回填默认 500（Batch C §4.5：默认与硬上限一致）",
-          j.get("max_steps") == 500,
+    check("max_steps 回填默认 100（2026-09-10 §2 A：默认与硬上限一致）",
+          j.get("max_steps") == 100,
           "got %r" % j.get("max_steps"))
     check("context_window_tokens 缺省保持 None（由档位推导）",
           j.get("context_window_tokens") is None,

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="referrer" content="no-referrer" />
-  <title>PathTogether · 管理工作台</title>
+  <title>HistoPilot · 管理工作台</title>
   <!--
     PR3 admin.workspace 宿主页（docs/admin-billing-plugin-implementation-plan.md §8.1/§8.3；
     一次性修复包 C/D：docs/admin-workbench-ci-one-shot-remediation-plan.md §7/§8）。
@@ -49,7 +49,7 @@
   {% else %}
   <header class="adm-host-header">
     <div class="adm-host-header-inner">
-      <h1>PathTogether 管理工作台</h1>
+      <h1>HistoPilot 管理工作台</h1>
       <p class="adm-host-status" id="admin-host-status" data-admin-host-state="idle"
          role="status" aria-live="polite">正在初始化…</p>
       <div class="adm-host-actions">
@@ -60,7 +60,7 @@
   </header>
   <main class="adm-host-main">
     <iframe id="admin-plugin-frame"
-            title="PathTogether Admin 插件"
+            title="HistoPilot Admin 插件"
             sandbox="allow-scripts"
             referrerpolicy="no-referrer"
             data-plugin-id="{{ admin_plugin.plugin_id }}"></iframe>

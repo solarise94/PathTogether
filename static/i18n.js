@@ -16,18 +16,18 @@
   var DICT = {
     zh: {
       // ---- 通用 / 页头 ----
-      "app.title": "PathTogether",
+      "app.title": "HistoPilot",
       "app.subtitle": "协作式病理读片",
       "share.title": "病理切片查看",
-      "login.title": "登录 PathTogether",
+      "login.title": "登录 HistoPilot",
       "header.no.slide": "未打开切片",
       "header.loading": "加载中…",
       "lang.toggle": "EN", // 中文界面下按钮显示 EN（切到英文）
       // ---- Beta 徽标与文档标题（升级 Review 2026-09-09 §3.4） ----
       "beta.badge": "Beta",
       "beta.badge.tip": "Beta 测试中，功能可能调整；遇到异常请反馈。",
-      "app.doc.title": "PathTogether Beta",
-      "app.doc.title.demo": "PathTogether Beta · Demo",
+      "app.doc.title": "HistoPilot Beta",
+      "app.doc.title.demo": "HistoPilot Beta · Demo",
 
       // ---- index 工具栏 ----
       "tb.menu": "菜单",
@@ -270,7 +270,7 @@
       // ---- login（docs §6.1/§8.3：去 admin 专属措辞） ----
       // 批次 B（账户系统 docs §6.1/§8.1）：登录只认登录账号 login_id，
       // 不再承诺「邮箱或用户名/显示名可登录」
-      "login.title": "登录 PathTogether",
+      "login.title": "登录 HistoPilot",
       "login.subtitle": "登录后继续查看、测试 AI 和协作",
       "login.username": "登录账号",
       "login.password": "密码",
@@ -317,7 +317,7 @@
       "demo.coming": "Demo 正在准备中，即将开放：可查看示例切片并体验 1 次只读 AI 导航。",
       "demo.requires.pg": "当前部署未满足公开 Demo 的前置条件（需要 PostgreSQL 后端），Demo 暂不可用。",
       "demo.closed": "公开 Demo 当前未开放。登录后可继续使用，或稍后再来。",
-      "demo.login": "登录 PathTogether",
+      "demo.login": "登录 HistoPilot",
       "demo.register": "注册方式",
       "demo.open.full": "打开完整版",
       "demo.home": "返回首页",
@@ -712,18 +712,18 @@
 
     en: {
       // ---- 通用 / 页头 ----
-      "app.title": "PathTogether",
+      "app.title": "HistoPilot",
       "app.subtitle": "Collaborative pathology review",
       "share.title": "Pathology Slide Viewer",
-      "login.title": "Log in to PathTogether",
+      "login.title": "Log in to HistoPilot",
       "header.no.slide": "No slide open",
       "header.loading": "Loading…",
       "lang.toggle": "中", // 英文界面下按钮显示 中（切到中文）
       // ---- Beta badge & document title (review 2026-09-09 §3.4) ----
       "beta.badge": "Beta",
       "beta.badge.tip": "Beta: features may change; please report any issues.",
-      "app.doc.title": "PathTogether Beta",
-      "app.doc.title.demo": "PathTogether Beta · Demo",
+      "app.doc.title": "HistoPilot Beta",
+      "app.doc.title.demo": "HistoPilot Beta · Demo",
 
       // ---- index 工具栏 ----
       "tb.menu": "Menu",
@@ -966,7 +966,7 @@
       // ---- login（docs §6.1/§8.3：去 admin 专属措辞） ----
       // Batch B (account docs §6.1/§8.1): login accepts the login ID only —
       // no longer promises "email or username / display name" logins
-      "login.title": "Log in to PathTogether",
+      "login.title": "Log in to HistoPilot",
       "login.subtitle": "Continue viewing, testing AI, and collaborating",
       "login.username": "Login ID",
       "login.password": "Password",
@@ -1013,7 +1013,7 @@
       "demo.coming": "The Demo is being prepared: view sample slides and try 1 read-only AI navigation run.",
       "demo.requires.pg": "This deployment does not meet the prerequisites for the public Demo (PostgreSQL backend required); the Demo is unavailable.",
       "demo.closed": "The public Demo is currently closed. Log in to continue, or check back later.",
-      "demo.login": "Log in to PathTogether",
+      "demo.login": "Log in to HistoPilot",
       "demo.register": "Registration",
       "demo.open.full": "Open full version",
       "demo.home": "Back to home",

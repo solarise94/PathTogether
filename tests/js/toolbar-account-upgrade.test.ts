@@ -18,7 +18,7 @@
  *     1024–1439 折视图/标注组；<1024 只留当前工具/AI/倍率/账户，其余入
  *     tbb-more（搬移真实 DOM 节点）；
  *   - Beta 徽标 + 切片名下架：壳内无 #current-slide；openSlide 不再写该节点，
- *     改写 document.title（<切片名> · PathTogether Beta）；
+ *     改写 document.title（<切片名> · HistoPilot Beta）；
  *   - i18n：zh/en 字典键集一致，新文案键双语齐备。
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -611,7 +611,7 @@ describe("Beta 徽标 + i18n 新键（§3.4/§7）", () => {
 		return HP!;
 	}
 
-	it("壳模板：品牌区 = PathTogether + Beta 徽标；#current-slide 已删除", () => {
+	it("壳模板：品牌区 = HistoPilot + Beta 徽标；#current-slide 已删除", () => {
 		expect(shellSrc).toContain('class="beta-badge"');
 		expect(shellSrc).toContain('data-i18n="beta.badge"');
 		expect(shellSrc).toContain('data-i18n-title="beta.badge.tip"');
@@ -623,9 +623,9 @@ describe("Beta 徽标 + i18n 新键（§3.4/§7）", () => {
 		expect(shellSrc).toContain('id="acct-btn"');
 	});
 
-	it("index/demo 页标题已带 Beta；分享页不受影响", () => {
-		expect(readFileSync(resolve(here, "../../templates/index.html"), "utf8")).toContain("<title>PathTogether Beta</title>");
-		expect(readFileSync(resolve(here, "../../templates/demo.html"), "utf8")).toContain("<title>PathTogether Beta · Demo</title>");
+		it("index/demo 页标题已带 Beta；分享页不受影响", () => {
+		expect(readFileSync(resolve(here, "../../templates/index.html"), "utf8")).toContain("<title>HistoPilot Beta</title>");
+		expect(readFileSync(resolve(here, "../../templates/demo.html"), "utf8")).toContain("<title>HistoPilot Beta · Demo</title>");
 		expect(readFileSync(resolve(here, "../../templates/share.html"), "utf8")).toContain('id="current-slide"');
 	});
 
@@ -648,8 +648,8 @@ describe("Beta 徽标 + i18n 新键（§3.4/§7）", () => {
 		const zh = bootI18n("zh");
 		expect(zh.t("beta.badge")).toBe("Beta");
 		expect(zh.t("beta.badge.tip")).toContain("Beta 测试中");
-		expect(zh.t("app.doc.title")).toBe("PathTogether Beta");
-		expect(zh.t("app.doc.title.demo")).toBe("PathTogether Beta · Demo");
+		expect(zh.t("app.doc.title")).toBe("HistoPilot Beta");
+		expect(zh.t("app.doc.title.demo")).toBe("HistoPilot Beta · Demo");
 		expect(zh.t("tb.anno.label.name")).toBe("标注名称（可选）");
 		expect(zh.t("tb.anno.more")).toBe("标注选项");
 		expect(zh.t("acct.preview.tag")).toBe("管理员预览");

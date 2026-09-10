@@ -506,7 +506,7 @@ def test_i18n_no_admin_only_wording_left():
                    "AI reading assistant (admin)", "AI 服务配置",
                    "AI service config"):
         assert banned not in text, "i18n.js 仍含旧措辞：%r" % banned
-    for required in ("登录 PathTogether", "Log in to PathTogether",
+    for required in ("登录 HistoPilot", "Log in to HistoPilot",
                      "登录后继续查看、测试 AI 和协作",
                      "AI 导航助手", "AI navigation assistant",
                      "平台 AI 配置", "AI 服务（平台统一提供）",

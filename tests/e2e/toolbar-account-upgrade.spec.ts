@@ -13,7 +13,7 @@
  *   - 标注名称（可选）在「标注选项」popover 内，主行不再出现自由文本输入框；
  *   - 矩形尺寸为按钮下方锚定 popover；选预设后主行只显示简短摘要（6×6 mm）；
  *   - 品牌区 Beta 徽标可聚焦提示；壳内无 #current-slide；打开切片后
- *     document.title = "<切片名> · PathTogether Beta"；
+	 *     document.title = "<切片名> · HistoPilot Beta"；
  *   - 宽度断点分组：1440 全展开；1024–1439 折视图/标注组；<1024 只留当前
  *     工具、AI、倍率、账户（其余入 ⋯）；≤768 交还移动端布局；
  *   - Demo 只读壳：无账户 chip，保留 Demo 徽章与 Beta 徽标。
@@ -303,7 +303,7 @@ async function openSlideRow(page: Page): Promise<void> {
 		.locator(".slide-mid")
 		.click();
 	// openSlide 完成（info 拉取并写入 document.title）后再继续
-	await expect(page).toHaveTitle(/Fixture Slide A · PathTogether Beta/);
+		await expect(page).toHaveTitle(/Fixture Slide A · HistoPilot Beta/);
 }
 
 test.describe("账户 chip + popover（§3.5）", () => {
@@ -445,7 +445,7 @@ test.describe("Beta 徽标 + 切片名下架（§3.4）", () => {
 		await expect(beta).toHaveAttribute("tabindex", "0");
 		// 打开切片后标题组合
 		await openSlideRow(page);
-		await expect(page).toHaveTitle(/Fixture Slide A · PathTogether Beta/);
+		await expect(page).toHaveTitle(/Fixture Slide A · HistoPilot Beta/);
 	});
 
 	test("Demo 只读壳：无账户 chip；保留 Beta 徽标与 Demo 徽章", async ({ page }) => {

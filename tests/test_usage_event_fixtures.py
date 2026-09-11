@@ -12,6 +12,8 @@ keyword 子集的最小 draft 2020-12 校验器；schema/夹具不变更时它�
   c) DeepSeek 价格快照换算：全部 CNY×1e9 精确等于 nano 值（Decimal，禁止 float
      中转；rate 列单位 = nano-CNY / 百万 tokens，批次 A 0022 修正了 0018 的
      CNY×1000 误写），并与方案 §4 价格表逐项核对，另抽查三档 nano 值；
+     2026-09-11 官方降价快照（deepseek-flash repricing，迁移 0045）另行按
+     官方表逐项核对（c2 节）；
   d) time_band_cases 期望值与「北京时间工作日 09:00–12:00/14:00–18:00（左闭
      右开，周末 off_peak）」规则一致——用 zoneinfo 实现最小判定函数交叉验证。
      该函数仅用于夹具校验，不是生产 pricing 代码；
@@ -384,6 +386,94 @@ def test_price_snapshot_spot_checks():
     assert models["deepseek-v4-pro"]["peak"]["output_nano_per_million"] == 27_000_000_000
     # 3.0 CNY → 3,000,000,000
     assert models["deepseek-v4-flash-vision-exp"]["peak"]["cache_miss_nano_per_million"] == 3_000_000_000
+
+
+# --------------------------------------------------------------------------- #
+# (c2) 2026-09-11 官方降价快照（deepseek-flash repricing，0045）
+# --------------------------------------------------------------------------- #
+PRICE_PATH_V3 = BILLING_DIR / "deepseek_price_snapshot_2026-09-11.json"
+
+# 官方 zh-cn 定价页（2026-09-11 核实；docs/fix-2026-09-11-deepseek-flash-
+# repricing.md；CNY/百万 tokens）。旧名 deepseek-v4-flash / vision-exp 已
+# 退役、上游路由到 V4.1-Flash 并按其价格计费，故官方表只列现网 ID。
+DOC_TABLE_V3 = {
+    "deepseek-flash": {
+        "off_peak": ("0.02", "1.0", "4.0"),
+        "peak": ("0.04", "2.0", "8.0"),
+    },
+    "deepseek-v4-pro": {
+        "off_peak": ("0.15", "4.5", "13.5"),
+        "peak": ("0.30", "9.0", "27.0"),
+    },
+}
+
+
+def _load_price_snapshot_v3():
+    # parse_float=Decimal：精确十进制，避免 0.02 之类先变 binary float
+    return json.loads(
+        PRICE_PATH_V3.read_text(encoding="utf-8"), parse_float=Decimal, parse_int=int
+    )
+
+
+def test_price_snapshot_v3_matches_official_repricing_table():
+    snap = _load_price_snapshot_v3()
+    assert snap["provider"] == "deepseek"
+    assert snap["currency"] == "CNY"
+    assert snap["snapshot_date"] == "2026-09-11"
+    assert snap["timezone"] == "Asia/Shanghai"
+    models = snap["models"]
+    assert set(models) == set(DOC_TABLE_V3)
+    for model, bands in DOC_TABLE_V3.items():
+        assert set(models[model]) == set(bands), model
+        for band, cny_values in bands.items():
+            for key, expected in zip(_CNY_KEYS, cny_values):
+                assert models[model][band][key] == Decimal(expected), (
+                    "%s/%s/%s 与 2026-09-11 官方降价表不一致"
+                    % (model, band, key)
+                )
+    # 时段口径不变（billing_pricing.py 的时段表不动）：北京时间双峰窗仍在
+    assert "09:00" in snap["schedule_rule_text"] and "18:00" in snap["schedule_rule_text"]
+
+
+def test_price_snapshot_v3_nano_conversion_exact():
+    snap = _load_price_snapshot_v3()
+    one_cny_nano = Decimal(1_000_000_000)
+    for model, bands in snap["models"].items():
+        for band, rates in bands.items():
+            for cny_key, nano_key in zip(_CNY_KEYS, _NANO_KEYS):
+                cny, nano = rates[cny_key], rates[nano_key]
+                assert isinstance(nano, int), "%s/%s/%s 必须是整数" % (model, band, nano_key)
+                assert cny * one_cny_nano == Decimal(nano), (
+                    "%s/%s/%s 换算错误：%s×1e9 != %s" % (model, band, nano_key, cny, nano)
+                )
+                # 量级护栏：禁止退回 0018 的 CNY×1000（每 token nano）误写
+                # （v3 最低档 0.02 CNY → 20,000,000）
+                assert nano >= 20_000_000, (
+                    "%s/%s/%s 疑似 legacy 错误量级（CNY×1000）" % (model, band, nano_key)
+                )
+
+
+def test_price_snapshot_v3_spot_checks():
+    snap = _load_price_snapshot_v3()
+    models = snap["models"]
+    # 独立手算：0.02 CNY → 20,000,000；0.04 → 40,000,000；8.0 → 8,000,000,000
+    assert models["deepseek-flash"]["off_peak"]["cache_hit_nano_per_million"] == 20_000_000
+    assert models["deepseek-flash"]["peak"]["cache_hit_nano_per_million"] == 40_000_000
+    assert models["deepseek-flash"]["peak"]["output_nano_per_million"] == 8_000_000_000
+
+
+def test_price_snapshot_v3_pro_unchanged_flash_repriced():
+    """官方 changelog：deepseek-v4-pro 价格未变（与 08-28 快照逐项一致）；
+    flash 确实是降价（低于 08-28 旧价）。"""
+    old = _load_price_snapshot()
+    new = _load_price_snapshot_v3()
+    assert new["models"]["deepseek-v4-pro"] == old["models"]["deepseek-v4-pro"]
+    for band in ("off_peak", "peak"):
+        for nano_key in _NANO_KEYS:
+            assert (
+                new["models"]["deepseek-flash"][band][nano_key]
+                < old["models"]["deepseek-v4-flash"][band][nano_key]
+            ), (band, nano_key)
 
 
 # --------------------------------------------------------------------------- #

@@ -673,16 +673,21 @@ def test_ai_config_user_get_has_effective_model_label():
     assert "api_key" not in body
 
 
-def test_deepseek_flash_priced_same_as_vision_exp():
-    """0044：deepseek-flash 在两本 active 价格书中有价，且与 vision-exp 逐档一致
-    （hard 模式无价会 pricing_unavailable fail-closed）。"""
+def test_deepseek_flash_priced_at_v3_official_rates():
+    """0045：0044 曾把 deepseek-flash 按 vision-exp 旧价复制（当时悬置的
+    决策），0045 cutover 后 flash 家族在 v3 书按 2026-09-11 官方降价面值
+    计价；deepseek-flash 与 vision-exp 仍逐档同价（上游同价路由）。
+    """
     import billing_pricing
     import _billing_helpers as bh
-    from datetime import datetime, timezone as tz
+    from datetime import timedelta
+    snap_v3 = bh.load_price_snapshot_v3()
     bh.seed_price_books()
     conn = bh.connect()
-    # 0022 测试重放把 v2 书 effective_from 设为 now()，查价必须用种子之后的时刻
-    at = datetime.now(tz.utc)
+    # 0045 cutover 后 1 秒：v3 书开放区间，任何部署时钟下都确定命中
+    at = bh.pricing_v3_cutover() + timedelta(seconds=1)
+    v3_ids = dict(zip(("provider_cost", "customer_charge"),
+                      bh.V3_BOOK_IDS))
     try:
         with conn.cursor() as cur:
             for kind in ("provider_cost", "customer_charge"):
@@ -692,10 +697,20 @@ def test_deepseek_flash_priced_same_as_vision_exp():
                     cur, kind, "deepseek", "deepseek-v4-flash-vision-exp", at)
                 assert r_flash is not None, kind
                 assert r_vis is not None, kind
+                # 现行书是 v3（v2 书已随 0045 cutover 收口）
+                assert r_flash["price_book_id"] == v3_ids[kind], kind
+                # 官方降价面值：与 2026-09-11 快照逐项一致（含 CNY→nano
+                # 独立换算闭环；错拿 0022/0044 旧价会在此失败）
+                band = r_flash["time_band"]
+                values = snap_v3["models"]["deepseek-flash"][band]
                 for k in ("cache_hit_nano_per_million",
                           "cache_miss_nano_per_million",
                           "output_nano_per_million"):
-                    assert r_flash[k] == r_vis[k], (kind, k)
+                    assert r_flash[k] == values[k], (kind, band, k)
+                    assert r_flash[k] == billing_pricing.parse_balance_to_nano(
+                        str(values[k.replace("nano", "cny")])), (kind, k)
+                    # vision-exp 同价（关系断言保留：上游已同价路由）
+                    assert r_vis[k] == r_flash[k], (kind, k)
     finally:
         conn.close()
 
@@ -725,28 +740,54 @@ def test_settings_model_switch_deepseek_flash_keeps_files():
 
 
 def test_limited_model_priced_same_as_vision_exp():
-    """0042：限时模型在两本 active 价格书中有价，且与 vision-exp 逐档一致
-    （owner 决策同价；hard 模式无价会 pricing_unavailable fail-closed）。"""
+    """0042+0045：限时模型与 vision-exp 逐档同价——v2 区间内按 0042 复制的
+    当时现行价；0045 cutover 后两模型在 v3 书同为 flash 官方新价（限时模型
+    已到期不可选，但历史迟到事件重放要有正确费率）。"""
     import billing_pricing
     import _billing_helpers as bh
-    from datetime import datetime, timezone as tz
-    bh.seed_price_books()  # conftest TRUNCATE 清种子；重放 0018+0022+0042
+    from datetime import timedelta
+    snap_v3 = bh.load_price_snapshot_v3()
+    bh.seed_price_books()  # conftest TRUNCATE 清种子；重放 0018+0022+0042+0044+0045
     conn = bh.connect()
-    at = datetime.now(tz.utc)
+    v2_at = bh.v2_interval_midpoint()   # 0042 时代（v2 书生效区间内）
+    v3_at = bh.pricing_v3_cutover() + timedelta(seconds=1)
+    v2_ids = dict(zip(("provider_cost", "customer_charge"),
+                      bh.CORRECTED_BOOK_IDS))
+    v3_ids = dict(zip(("provider_cost", "customer_charge"),
+                      bh.V3_BOOK_IDS))
+    rate_keys = ("cache_hit_nano_per_million",
+                 "cache_miss_nano_per_million",
+                 "output_nano_per_million")
     try:
         with conn.cursor() as cur:
             for kind in ("provider_cost", "customer_charge"):
+                # v2 区间内：0042 从 vision-exp 现行行原样复制（同价旧价）
+                r_v41_old = billing_pricing.find_active_rate(
+                    cur, kind, "deepseek",
+                    "deepseek-v4.1-flash-expires-on-0910", v2_at)
+                r_vis_old = billing_pricing.find_active_rate(
+                    cur, kind, "deepseek", "deepseek-v4-flash-vision-exp",
+                    v2_at)
+                assert r_v41_old is not None, kind
+                assert r_vis_old is not None, kind
+                assert r_v41_old["price_book_id"] == v2_ids[kind], kind
+                for k in rate_keys:
+                    assert r_v41_old[k] == r_vis_old[k], ("v2", kind, k)
+                # 0045 cutover 后：v3 书内两模型同为 flash 官方降价面值
                 r_v41 = billing_pricing.find_active_rate(
                     cur, kind, "deepseek",
-                    "deepseek-v4.1-flash-expires-on-0910", at)
+                    "deepseek-v4.1-flash-expires-on-0910", v3_at)
                 r_vis = billing_pricing.find_active_rate(
-                    cur, kind, "deepseek", "deepseek-v4-flash-vision-exp", at)
+                    cur, kind, "deepseek", "deepseek-v4-flash-vision-exp",
+                    v3_at)
                 assert r_v41 is not None, kind
                 assert r_vis is not None, kind
-                for k in ("cache_hit_nano_per_million",
-                          "cache_miss_nano_per_million",
-                          "output_nano_per_million"):
-                    assert r_v41[k] == r_vis[k], (kind, k)
+                assert r_v41["price_book_id"] == v3_ids[kind], kind
+                values = snap_v3["models"]["deepseek-flash"][
+                    r_v41["time_band"]]
+                for k in rate_keys:
+                    assert r_v41[k] == values[k], ("v3", kind, k)
+                    assert r_vis[k] == r_v41[k], ("v3", kind, k)
     finally:
         conn.close()
 

@@ -326,14 +326,17 @@ def test_authorize_estimated_balance_would_deny_deterministic():
 def test_authorize_estimate_matches_cny_conversion_independent():
     """authorize 估算与「CNY 面值 ×1e9」独立复算一致（批次 A §9.1）。
 
-    不从迁移/DB rate 复制常量：直接用 flash 的 CNY 面值经
+    不从迁移/DB rate 复制常量：直接用 flash 的 corrected v2 CNY 面值经
     parse_balance_to_nano 换算复算最坏价（输入 1M 全按 cache-miss +
-    输出 200k）。corrected 价下该估算必然是「元」量级（≥2.4 CNY）；
-    0018 错误量级只会算出 2400 nano（0.0000024 CNY）。
+    输出 200k）。锚点取 v2 区间（0022→0045 cutover 之间）中点，任何部署
+    时钟下都命中 0045 降价前的 v2 书（0045 降价面值另见
+    tests/test_admin_api_v1.py 的 v3 用例）。corrected v2 价下该估算必然
+    是「元」量级（≥2.4 CNY）；0018 错误量级只会算出 2400 nano
+    （0.0000024 CNY）。
     """
     bh.seed_price_books_with_history()
     user = _user_with_account("hold-unit@x.com", grant_nano=1_000_000_000)
-    occurred = bh.pricing_cutover() + timedelta(seconds=1)
+    occurred = bh.v2_interval_midpoint()
     band = billing_pricing.time_band_for(occurred)
     cny = {"peak": ("0.1", "3.0", "9.0"),
            "off_peak": ("0.05", "1.5", "4.5")}[band]

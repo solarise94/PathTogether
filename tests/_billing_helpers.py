@@ -3,10 +3,12 @@
 
 - ``load_event``：读 tests/fixtures/usage_events/ 样例（深拷贝，用例可改写）；
 - ``seed_price_books``：幂等重放 migrations/0018_billing.sql +
-  migrations/0022_billing_price_unit_fix.sql——迁移文件是 DeepSeek
-  2026-08-28 价格种子与批次 A 单位修复（corrected v2 书 + legacy 收口）的
-  唯一权威来源（conftest 每用例 TRUNCATE 会清掉迁移期种子，需要种子的
-  用例显式调用本函数重建）；
+  migrations/0022_billing_price_unit_fix.sql + 0042/0044 计价行 +
+  migrations/0045_deepseek_flash_repricing.sql——迁移文件是 DeepSeek
+  2026-08-28 价格种子、批次 A 单位修复（corrected v2 书 + legacy 收口）
+  与 2026-09-11 flash 官方降价 cutover（v2 收口 + v3 书）的唯一权威来源
+  （conftest 每用例 TRUNCATE 会清掉迁移期种子，需要种子的用例显式调用本
+  函数重建）；
 - ``seed_legacy_price_books_only``：只重放 0018（单位修复**前**的错误状态，
   供 cutover/legacy 用例构造历史区间）；
 - ``bind_reservation`` / ``bind_run_binding`` / ``bind_demo_session`` /
@@ -31,6 +33,9 @@ _MIGRATION_0022 = REPO_ROOT / "migrations" / "0022_billing_price_unit_fix.sql"
 # 故与 0018/0022 一起重放（缺它 hard 模式会 pricing_unavailable fail-closed）。
 _MIGRATION_0042 = REPO_ROOT / "migrations" / "0042_v41_flash_price_rows.sql"
 _MIGRATION_0044 = REPO_ROOT / "migrations" / "0044_deepseek_flash_price_rows.sql"
+# 0045：官方 deepseek-flash 降价的 v2→v3 cutover（v2 书收口 + v3 新书，
+# flash 家族按 2026-09-11 官方新价，v4-pro 原样复制；0022 同款切换模式）。
+_MIGRATION_0045 = REPO_ROOT / "migrations" / "0045_deepseek_flash_repricing.sql"
 _MIGRATION_0023 = REPO_ROOT / "migrations" / "0023_spend_policies_windows.sql"
 _MIGRATION_0029 = REPO_ROOT / "migrations" / "0029_user_total_allowances_and_denials.sql"
 _MIGRATION_0032 = REPO_ROOT / "migrations" / "0032_user_total_allowance_single_track.sql"
@@ -45,10 +50,15 @@ LEGACY_BOOK_IDS = (
     "pb_deepseek_provider_cost_20260828",
     "pb_deepseek_customer_charge_20260828",
 )
-#: 0022 corrected v2 书（正确换算 CNY×1e9；cutover 起生效）
+#: 0022 corrected v2 书（正确换算 CNY×1e9；cutover 起生效，0045 起收口）
 CORRECTED_BOOK_IDS = (
     "pb_deepseek_provider_cost_v2_corrected",
     "pb_deepseek_customer_charge_v2_corrected",
+)
+#: 0045 v3 书（flash 官方降价后；v3 cutover 起生效、区间开放）
+V3_BOOK_IDS = (
+    "pb_deepseek_provider_cost_v3_flash_repricing",
+    "pb_deepseek_customer_charge_v3_flash_repricing",
 )
 
 
@@ -58,8 +68,16 @@ def load_event(name):
 
 
 def load_price_snapshot():
+    """2026-08-28 快照（降价前旧价；legacy/v2 历史区间断言用）。"""
     return json.loads(
         (BILLING_DIR / "deepseek_price_snapshot_2026-08-28.json")
+        .read_text(encoding="utf-8"))
+
+
+def load_price_snapshot_v3():
+    """2026-09-11 快照（deepseek-flash 官方降价后；v3 书断言用）。"""
+    return json.loads(
+        (BILLING_DIR / "deepseek_price_snapshot_2026-09-11.json")
         .read_text(encoding="utf-8"))
 
 
@@ -84,9 +102,10 @@ def _replay(conn, path):
 
 
 def seed_price_books(conn=None):
-    """幂等重放 0018 + 0022 + 0042 + 0044 → 重建
-    「legacy 书（已收口）+ corrected v2 书（当前生效，含限时模型与
-    deepseek-flash 同价行）」的完整价格史。"""
+    """幂等重放 0018 + 0022 + 0042 + 0044 + 0045 → 重建
+    「legacy 书（已收口）+ corrected v2 书（0045 起收口，含限时模型与
+    deepseek-flash 同价行）+ v3 书（flash 官方降价，当前生效）」的完整
+    价格史。"""
     own = conn is None
     if own:
         conn = connect()
@@ -95,6 +114,7 @@ def seed_price_books(conn=None):
         _replay(conn, _MIGRATION_0022)
         _replay(conn, _MIGRATION_0042)
         _replay(conn, _MIGRATION_0044)
+        _replay(conn, _MIGRATION_0045)
     finally:
         if own:
             conn.close()
@@ -192,6 +212,54 @@ def pricing_cutover(conn=None):
     if row is None:
         return None
     return datetime.fromtimestamp(float(row["value"]), tz=timezone.utc)
+
+
+def pricing_v3_cutover(conn=None):
+    """读取 0045 写入的 pricing_v3_cutover_at（datetime，UTC）。
+
+    = v2 书收口点 = v3 书 effective_from（0045 DO 块内同一变量，逐微秒
+    一致）。未迁移（无标志）时返回 None。
+    """
+    own = conn is None
+    if own:
+        conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT value FROM platform_settings "
+                "WHERE key='pricing_v3_cutover_at'")
+            row = cur.fetchone()
+    finally:
+        if own:
+            conn.close()
+    if row is None:
+        return None
+    return datetime.fromtimestamp(float(row["value"]), tz=timezone.utc)
+
+
+def v2_interval_midpoint(conn=None):
+    """v2 书开区间 [pricing_v2_cutover, pricing_v3_cutover) 的中点时刻。
+
+    0022 重放把 v2 书起点定为 now()；0045 再把它收口到
+    GREATEST(now, '2026-09-11T00:00:01Z')。区间宽度随时钟不同（部署日在
+    降价生效日前 > 半天宽，其后重放只剩微秒级），``now() + 固定偏移``
+    式的锚点会随时钟跨过 v3 cutover 落进 v3 区间；取中点保证任何时钟下
+    都确定性落在 v2 计价区间内（timedelta 除法舍入最多回退到起点，
+    仍在半开区间内）。供「按 v2 旧价断言」的用例定位 occurred_at。
+    """
+    own = conn is None
+    if own:
+        conn = connect()
+    try:
+        start = pricing_cutover(conn)
+        end = pricing_v3_cutover(conn)
+    finally:
+        if own:
+            conn.close()
+    assert start is not None and end is not None, (
+        "v2/v3 cutover 标志缺失：先 seed_price_books()")
+    assert start < end, "v2 区间为空（%s >= %s）" % (start, end)
+    return start + (end - start) / 2
 
 
 #: 种子书起点（快照日 Asia/Shanghai 00:00 = UTC 前一日 16:00）

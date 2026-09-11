@@ -1,0 +1,59 @@
+{
+  "_comment": "DeepSeek 官方价格快照测试夹具（快照日 2026-09-11，官方降价落地日；docs/fix-2026-09-11-deepseek-flash-repricing.md）。2026-09-10 DeepSeek 发布 V4.1-Flash（官方现网 ID deepseek-flash）并降价，本文件记录降价后的官方面值（2026-09-11 在 api-docs.deepseek.com/zh-cn 定价页重新核对）。旧夹具 deepseek_price_snapshot_2026-08-28.json 保留（0022 时代 legacy/v2 历史区间测试仍需要），历史区间按旧价计价的语义不回改。价格单位：CNY/百万 tokens。nano 换算公式（0022 口径）：nano_per_million = CNY_per_million × 1e9（1 CNY = 1e9 nano-CNY；rate 列单位是「nano-CNY / 百万 tokens」，例：0.02 CNY → 20,000,000；27.0 CNY → 27,000,000,000）。换算必须用十进制精确算术（Decimal(str(cny)) × 1e9），禁止先转 float 再乘。官方 changelog：旧名 deepseek-v4-flash / deepseek-v4-flash-vision-exp 已退役，上游路由到 V4.1-Flash 并按其价格计费（migrations/0045_deepseek_flash_repricing.sql 把 flash 家族旧名与限时模型 deepseek-v4.1-flash-expires-on-0910 一并按本表 flash 价入册）；deepseek-v4-pro 价格未变（与 2026-08-28 快照逐项一致）。高峰定义不变：北京时间工作日 09:00–12:00、14:00–18:00，空闲价为高峰一半。",
+  "provider": "deepseek",
+  "kind": "provider_cost",
+  "currency": "CNY",
+  "snapshot_date": "2026-09-11",
+  "source_url": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
+  "timezone": "Asia/Shanghai",
+  "time_bands": ["peak", "off_peak"],
+  "schedule_rule_text": "peak = 北京时间（Asia/Shanghai）工作日 09:00–12:00、14:00–18:00（区间左闭右开），其余均为 off_peak；off_peak 价 = peak 价的一半（官方 2026-09-11 定价页口径，与 billing_pricing.py 现行时段表一致）。计价时间取该次 provider 调用的 occurred_at，不得静默改用 received_at。边界用例见同目录 time_band_cases.json。",
+  "unit_cny_per_million": {
+    "cache_hit_input_tokens": "cache_hit_cny_per_million",
+    "cache_miss_input_tokens": "cache_miss_cny_per_million",
+    "output_tokens": "output_cny_per_million"
+  },
+  "conversion": {
+    "formula": "nano_per_million = Decimal(cny_per_million) * 1000000000",
+    "derivation": "1 CNY = 1e9 nano_cny；rate 列单位是每 1e6 tokens 的 nano-CNY 单价，故 nano_per_million = CNY × 1e9（每 token nano 值 = CNY × 1e9 / 1e6 = CNY × 1000，那是另一个量，不得写入本列）",
+    "note": "禁止 float 中转；所有快照值换算后必须是整数。0018 旧种子按错误公式 CNY×1000 写入（legacy，历史保留，不作正确规则）"
+  },
+  "models": {
+    "deepseek-flash": {
+      "off_peak": {
+        "cache_hit_cny_per_million": 0.02,
+        "cache_miss_cny_per_million": 1.0,
+        "output_cny_per_million": 4.0,
+        "cache_hit_nano_per_million": 20000000,
+        "cache_miss_nano_per_million": 1000000000,
+        "output_nano_per_million": 4000000000
+      },
+      "peak": {
+        "cache_hit_cny_per_million": 0.04,
+        "cache_miss_cny_per_million": 2.0,
+        "output_cny_per_million": 8.0,
+        "cache_hit_nano_per_million": 40000000,
+        "cache_miss_nano_per_million": 2000000000,
+        "output_nano_per_million": 8000000000
+      }
+    },
+    "deepseek-v4-pro": {
+      "off_peak": {
+        "cache_hit_cny_per_million": 0.15,
+        "cache_miss_cny_per_million": 4.5,
+        "output_cny_per_million": 13.5,
+        "cache_hit_nano_per_million": 150000000,
+        "cache_miss_nano_per_million": 4500000000,
+        "output_nano_per_million": 13500000000
+      },
+      "peak": {
+        "cache_hit_cny_per_million": 0.3,
+        "cache_miss_cny_per_million": 9.0,
+        "output_cny_per_million": 27.0,
+        "cache_hit_nano_per_million": 300000000,
+        "cache_miss_nano_per_million": 9000000000,
+        "output_nano_per_million": 27000000000
+      }
+    }
+  }
+}

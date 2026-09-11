@@ -15,11 +15,13 @@
   （旧 json/dual fail-closed pg_backend_required 门已随 R3 Wave3 退役。）
 
 PG 部分（RUN_PG_TESTS=1；conftest 每用例 TRUNCATE billing 表）：
-  - 0018+0022 种子两代书：legacy（错误 CNY×1000 量级，收口保留）与
-    corrected v2（CNY×1e9）逐项核对 + 幂等（§7.1 批次 A）；
+  - 0018+0022+0045 种子三代书：legacy（错误 CNY×1000 量级，收口保留）、
+    corrected v2（CNY×1e9，0045 收口）与 v3 flash_repricing（2026-09-11
+    官方 flash 降价，当前生效）逐项核对 + 幂等（§7.1 批次 A + 0045）；
   - 价格版本固定：调价（新 active book）后历史事件不重算、重放 duplicate；
-  - cutover 前后各取正确版本、区间无重叠、旧 event 重放不重算；
-  - fresh PG 全量迁移后当前价格为 corrected v2（§9.7）；
+  - cutover 前后各取正确版本（0018→0022 与 0022/0044→0045 两代边界）、
+    区间无重叠、旧 event 重放不重算；
+  - fresh PG 全量迁移后各代价格按 occurred_at 正确选书（§9.7）；
   - §7.2 admin 汇总只读口径（cutover/legacy 计数/固定说明）；
   - 并发激活 price book 只有一个成功（advisory xact lock + 区间重叠拒绝）；
   - ledger 符号 CHECK、usage_debit 每 event_id 只一条（部分唯一索引）、
@@ -311,15 +313,17 @@ def test_parse_balance_rejects_bad_inputs():
 # 7. PG：迁移种子 / 价格版本 / 并发激活 / 账本约束 / ingest 路径
 # =========================================================================== #
 def test_migration_seed_matches_price_fixture():
-    """种子两代书：legacy（0018 错误换算，已收口）+ corrected v2（0022）。
+    """种子三代书：legacy（0018 错误换算，0022 收口保留）+ corrected v2
+    （0022，0045 收口）+ v3 flash_repricing（0045，当前生效）。
 
     独立断言：corrected rate == parse_balance_to_nano(CNY 面值)；legacy
-    rate 保留历史错误量级（CNY×1000，重放 0018 的原始值，禁止被改写）。
+    rate 保留历史错误量级（CNY×1000，重放 0018 的原始值，禁止被改写）；
+    v3 flash 家族 = 2026-09-11 官方降价面值、v4-pro 与 v2 逐项一致。
     """
     from decimal import Decimal
     conn = bh.connect()
     try:
-        bh.seed_price_books(conn)   # 幂等重放 0018 + 0022（种子唯一权威来源）
+        bh.seed_price_books(conn)   # 幂等重放 0018+0022+0042+0044+0045
         bh.seed_price_books(conn)   # 重跑仍幂等（区间/价格不变）
         with conn.cursor() as cur:
             cur.execute(
@@ -336,13 +340,16 @@ def test_migration_seed_matches_price_fixture():
     finally:
         conn.close()
     snap = bh.load_price_snapshot()
-    # 4 本书：每 kind 一本 legacy + 一本 corrected v2
+    snap_v3 = bh.load_price_snapshot_v3()
+    # 6 本书：每 kind 一本 legacy + 一本 corrected v2 + 一本 v3
     assert {b["kind"] for b in books} == {"provider_cost", "customer_charge"}
-    assert len(books) == 4
+    assert len(books) == 6
     assert {b["price_book_id"] for b in books} == (
-        set(bh.LEGACY_BOOK_IDS) | set(bh.CORRECTED_BOOK_IDS))
+        set(bh.LEGACY_BOOK_IDS) | set(bh.CORRECTED_BOOK_IDS)
+        | set(bh.V3_BOOK_IDS))
     seed_from = datetime.fromisoformat("2026-08-27T16:00:00+00:00")
     cutover = None
+    cutover3 = None
     for book in books:
         assert book["status"] == "active"
         assert book["source_url"] == snap["source_url"]
@@ -354,18 +361,31 @@ def test_migration_seed_matches_price_fixture():
             assert book["effective_to"] is not None
             assert book["effective_to"] > seed_from
             cutover = book["effective_to"]
-        else:
+        elif book["price_book_id"] in bh.CORRECTED_BOOK_IDS:
             assert book["created_by"] == "system-seed-0022"
-            # v2 从 cutover 起开放（与 legacy 收口点逐微秒一致）
+            # v2 从 0022 cutover 起生效、0045 cutover 收口（历史区间保留）
             assert book["effective_from"] is not None
-            assert book["effective_to"] is None
+            assert book["effective_to"] is not None
             if cutover is not None:
                 assert book["effective_from"] == cutover
-    # cutover 标志与书边界一致（platform_settings，epoch 秒）
+            cutover3 = book["effective_to"]
+        else:
+            assert book["price_book_id"] in bh.V3_BOOK_IDS
+            assert book["created_by"] == "system-seed-0045"
+            # v3 从 0045 cutover 起开放生效（与 v2 收口点逐微秒一致）
+            assert book["effective_from"] is not None
+            assert book["effective_to"] is None
+            if cutover3 is not None:
+                assert book["effective_from"] == cutover3
+    assert cutover is not None and cutover3 is not None
+    assert cutover3 > cutover
+    # 两代 cutover 标志均与书边界一致（platform_settings，epoch 秒）
     assert bh.pricing_cutover() == cutover
+    assert bh.pricing_v3_cutover() == cutover3
     # legacy 代 12 行（3 模型 × 2 时段 × 2 kind）+ corrected v2 代 20 行
     #（0042 限时模型 + 0044 deepseek-flash：5 模型 × 2 时段 × 2 kind）
-    assert len(rates) == 32
+    # + v3 代 20 行（flash 家族 4 模型新价 + v4-pro 复制：5 × 2 × 2）
+    assert len(rates) == 52
     by_key = {(r["price_book_id"], r["model"], r["time_band"]): r
               for r in rates}
     for model, bands in snap["models"].items():
@@ -396,6 +416,81 @@ def test_migration_seed_matches_price_fixture():
                     int(Decimal(cny[0]) * 1000)
                 assert v2["cache_hit_nano_per_million"] == \
                     legacy["cache_hit_nano_per_million"] * 1_000_000
+    # v3 代（0045）：flash 家族 4 模型 = 2026-09-11 官方降价面值（独立换算
+    # + 夹具 nano 双重核对）；v4-pro = v2 对应行原值（官方未调价）
+    flash_family = ("deepseek-flash", "deepseek-v4-flash",
+                    "deepseek-v4-flash-vision-exp",
+                    "deepseek-v4.1-flash-expires-on-0910")
+    for kind_i, v3_id in enumerate(bh.V3_BOOK_IDS):
+        v2_id = bh.CORRECTED_BOOK_IDS[kind_i]
+        for model in flash_family:
+            for band, values in snap_v3["models"]["deepseek-flash"].items():
+                v3 = by_key[(v3_id, model, band)]
+                cny = (str(values["cache_hit_cny_per_million"]),
+                       str(values["cache_miss_cny_per_million"]),
+                       str(values["output_cny_per_million"]))
+                assert v3["cache_hit_nano_per_million"] == \
+                    billing_pricing.parse_balance_to_nano(cny[0])
+                assert v3["cache_miss_nano_per_million"] == \
+                    billing_pricing.parse_balance_to_nano(cny[1])
+                assert v3["output_nano_per_million"] == \
+                    billing_pricing.parse_balance_to_nano(cny[2])
+                assert v3["cache_hit_nano_per_million"] == \
+                    values["cache_hit_nano_per_million"]
+                assert v3["cache_miss_nano_per_million"] == \
+                    values["cache_miss_nano_per_million"]
+                assert v3["output_nano_per_million"] == \
+                    values["output_nano_per_million"]
+        for band in ("peak", "off_peak"):
+            v2 = by_key[(v2_id, "deepseek-v4-pro", band)]
+            v3 = by_key[(v3_id, "deepseek-v4-pro", band)]
+            for k in ("cache_hit_nano_per_million",
+                      "cache_miss_nano_per_million",
+                      "output_nano_per_million"):
+                assert v3[k] == v2[k], ("deepseek-v4-pro", band, k)
+
+
+def test_migration_0045_marker_and_audit_row():
+    """0045 标志 + 固定 event_id 审计行（无密钥；重放不覆盖/不重复）。"""
+    bh.seed_price_books()
+    bh.seed_price_books()   # 重放：标志 ON CONFLICT DO NOTHING、审计不重复
+    cutover3 = bh.pricing_v3_cutover()
+    conn = bh.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT detail, actor_role, action, target_type "
+                "FROM audit_events WHERE event_id="
+                "'aud_migration_0045_flash_repricing'")
+            rows = [dict(r) for r in cur.fetchall()]
+            assert len(rows) == 1, "固定 event_id 审计行应恰一条"
+            row = rows[0]
+            assert (row["actor_role"], row["action"],
+                    row["target_type"]) == (
+                "system", "billing.flash_repricing_applied",
+                "billing_price_books")
+            detail = row["detail"]
+            assert detail["superseded_price_book_ids"] == \
+                list(bh.CORRECTED_BOOK_IDS)
+            assert detail["active_price_book_ids"] == list(bh.V3_BOOK_IDS)
+            assert detail["repriced_models"] == [
+                "deepseek-flash", "deepseek-v4-flash",
+                "deepseek-v4-flash-vision-exp",
+                "deepseek-v4.1-flash-expires-on-0910"]
+            assert detail["unchanged_models"] == ["deepseek-v4-pro"]
+            assert abs(detail["cutover_epoch"] - cutover3.timestamp()) < 1.0
+            # 无密钥口径：detail 只含上述说明性键
+            assert set(detail) == {
+                "cutover_epoch", "reason", "superseded_price_book_ids",
+                "active_price_book_ids", "repriced_models",
+                "unchanged_models", "official_note"}
+            # 审计行 ts 与 v3 书边界一致（同一 cutover 变量）
+            cur.execute(
+                "SELECT ts FROM audit_events "
+                "WHERE event_id='aud_migration_0045_flash_repricing'")
+            assert cur.fetchone()["ts"] == cutover3
+    finally:
+        conn.close()
 
 def _ingest(event, *, installation="pin_test", **kwargs):
     """store 级 ingest 便捷封装（绑定 reservation 后调用）。"""
@@ -415,13 +510,15 @@ def _iso(dt):
     return dt.isoformat().replace("+00:00", "Z")
 
 def test_price_version_fixed_after_rate_change():
-    """cutover 后事件 → corrected v2 计价；调价 supersede 后历史不重算。
+    """v2 区间内事件 → corrected v2 计价；调价 supersede 后历史不重算。
 
-    时间全部相对 cutover 定位（不用夹具固定日期），保证与真实时钟无关。
+    时间全部相对 v2 区间（0022 与 0045 两个 cutover 之间）定位（不用夹具
+    固定日期），保证与真实时钟无关：v2 区间中点处的事件必然命中 v2 书。
     """
     bh.seed_price_books()
     cutover = bh.pricing_cutover()
-    t_event = cutover + timedelta(minutes=10)
+    cutover3 = bh.pricing_v3_cutover()
+    t_event = bh.v2_interval_midpoint()
     event = dict(bh.load_event("01_owner_priced_flash_peak.json"),
                  occurred_at=_iso(t_event),
                  enqueued_at=_iso(t_event + timedelta(seconds=1)))
@@ -431,7 +528,7 @@ def test_price_version_fixed_after_rate_change():
     row = billing_store.get_usage_event(event["event_id"])
     original_cost = row["provider_cost_nano_cny"]
     original_book = row["provider_price_book_id"]
-    # cutover 之后的事件 → corrected v2 书
+    # v2 区间内的事件 → corrected v2 书
     assert original_book == "pb_deepseek_provider_cost_v2_corrected"
     # 金额与「CNY 面值独立换算」的时段单价复算一致（flash：peak
     # 0.1/3.0/9.0、off_peak 0.05/1.5/4.5 CNY/百万 → ×1e9 nano）
@@ -447,9 +544,9 @@ def test_price_version_fixed_after_rate_change():
                 billing_pricing.parse_balance_to_nano(cny[2]),
         })
 
-    # 调价：新建 10× 价格的书（effective 晚于原事件），supersede 接班——
-    # 旧书在分界点收口（已入账事件的价格版本不受影响），两套 kind 各一本
-    later = t_event + timedelta(days=1)
+    # 调价：新建 10× 价格的书（effective 晚于原事件与 v3 cutover），supersede
+    # 接班——起点更晚的 v3 书（0045 建立）被收口；两套 kind 各一本
+    later = cutover3 + timedelta(days=1)
     snap = bh.load_price_snapshot()
     rates = [{
         "provider": "deepseek", "model": model, "time_band": band2,
@@ -468,12 +565,17 @@ def test_price_version_fixed_after_rate_change():
             book["price_book_id"], actor="pytest", supersede=True)
         assert activated["status"] == "active"
         new_books[kind] = book["price_book_id"]
-    # corrected v2 被收口：[cutover, later)，仍是 active（旧区间内迟到
-    # 事件仍可计价），不是 retired；legacy 0018 书区间不受影响
-    # （get_price_book 的边界列是 epoch 秒）
+    # v2 书保持 0045 的收口点 [cutover, v3_cutover)，仍是 active（旧区间内
+    # 迟到事件仍可计价），不是 retired；其区间早于新书、未被测试调价改写
+    #（get_price_book 的边界列是 epoch 秒）
     old_book = billing_store.get_price_book(original_book)
     assert old_book["status"] == "active"
-    assert old_book["effective_to"] == later.timestamp()
+    assert old_book["effective_to"] == cutover3.timestamp()
+    # supersede 真正收口的是 v3 书（[v3_cutover, ∞) 与新书区间重叠）
+    v3_book = billing_store.get_price_book(
+        "pb_deepseek_provider_cost_v3_flash_repricing")
+    assert v3_book["status"] == "active"
+    assert v3_book["effective_to"] == later.timestamp()
     legacy_book = billing_store.get_price_book(
         "pb_deepseek_provider_cost_20260828")
     assert legacy_book["effective_to"] == cutover.timestamp()
@@ -485,8 +587,9 @@ def test_price_version_fixed_after_rate_change():
     assert replay["row"]["provider_cost_nano_cny"] == original_cost
     assert replay["row"]["provider_price_book_id"] == original_book
 
-    # 历史时刻（corrected v2 区间内）的事件用 v2；新时刻的事件固定到新书
-    old_time = t_event + timedelta(minutes=30)   # 仍在 v2 区间内
+    # 历史时刻（仍在 v2 区间内、原事件之后）的事件用 v2；新时刻的事件固定
+    # 到新书（取 v2 区间上半段中点，任何时钟下都不跨过 v3 cutover）
+    old_time = t_event + (cutover3 - t_event) / 2
     old_time_event = dict(
         bh.load_event("06_user_priced_flash_no_provider_request_id.json"),
         occurred_at=_iso(old_time),
@@ -726,11 +829,10 @@ def test_unpriced_paths_and_no_received_at_substitution():
     assert r["row"]["unpriced_reason"] == "no_active_price_book"
 
     # ⑥ 时段判定用 occurred_at，不得静默改用 received_at：occurred 定在
-    # cutover 之后 1 秒（corrected v2 计价），received（now）人为晚 3 小时
+    # v2 区间中点（corrected v2 计价），received（now）人为晚 3 小时
     # ——合法延迟，且大概率落在不同时段。正确计价只看 occurred_at 的时段
     # 价（corrected：CNY 面值 ×1e9，与 parse_balance_to_nano 独立换算一致）
-    cutover = bh.pricing_cutover()
-    occurred06 = cutover + timedelta(seconds=1)
+    occurred06 = bh.v2_interval_midpoint()
     event02 = dict(bh.load_event("02_user_priced_pro_offpeak_reasoning.json"),
                    event_id="use_" + "c" * 32, call_id="call_" + "d" * 32,
                    request_id="req_band_case",
@@ -902,32 +1004,66 @@ def _cny_of(snap, model, band):
             str(values["cache_miss_cny_per_million"]),
             str(values["output_cny_per_million"]))
 
-def test_all_supported_models_two_kinds_corrected_prices():
+def test_all_supported_models_two_kinds_prices_by_generation():
     """所有 supported model × 峰/谷 × provider_cost/customer_charge 两套价。
 
-    独立断言：corrected rate == parse_balance_to_nano(CNY 面值)，全部命中
-    v2 书；不从迁移复制常量自证。
+    独立断言：rate == parse_balance_to_nano(CNY 面值)，不从迁移复制常量
+    自证。探针时刻按代定位，任何时钟下确定：
+      - v2 区间中点：快照 3 模型全部命中 v2 书（0045 收口前的现行价）；
+      - v3 cutover 后峰/谷各一时刻：5 模型（flash 家族 4 + v4-pro）全部
+        命中 v3 书，flash 家族 = 2026-09-11 官方新价、v4-pro = 旧价；
+      - 区间无重叠（§9.1）：同 kind/provider/model 的 active 书两两半开
+        区间不相交（含 legacy/v2/v3、以及 early 覆盖书）。
     """
     from decimal import Decimal
     bh.seed_price_books()
     snap = bh.load_price_snapshot()
-    cutover = bh.pricing_cutover()
+    snap_v3 = bh.load_price_snapshot_v3()
+    cutover3 = bh.pricing_v3_cutover()
+    v2_at = bh.v2_interval_midpoint()
+    v2_ids = dict(zip(("provider_cost", "customer_charge"),
+                      bh.CORRECTED_BOOK_IDS))
+    v3_ids = dict(zip(("provider_cost", "customer_charge"),
+                      bh.V3_BOOK_IDS))
     conn = bh.connect()
     try:
         with conn.cursor() as cur:
+            # —— v2 代：区间中点处快照 3 模型 × 两套 kind 全部命中 v2 ——
+            band_v2 = billing_pricing.time_band_for(v2_at)
             for model in snap["models"]:
-                for band in ("peak", "off_peak"):
-                    occurred = _next_time_with_band(cutover + timedelta(
-                        seconds=1), band)
+                for kind in ("provider_cost", "customer_charge"):
+                    rate = billing_pricing.find_active_rate(
+                        cur, kind, "deepseek", model, v2_at)
+                    assert rate is not None, (model, band_v2, kind)
+                    assert rate["price_book_id"] == v2_ids[kind]
+                    assert rate["time_band"] == band_v2
+                    cny = _cny_of(snap, model, band_v2)
+                    assert rate["cache_hit_nano_per_million"] == \
+                        billing_pricing.parse_balance_to_nano(cny[0])
+                    assert rate["cache_miss_nano_per_million"] == \
+                        billing_pricing.parse_balance_to_nano(cny[1])
+                    assert rate["output_nano_per_million"] == \
+                        billing_pricing.parse_balance_to_nano(cny[2])
+            # —— v3 代：cutover 后峰/谷各取一时刻（v3 区间开放，必可达）——
+            flash_family = ("deepseek-flash", "deepseek-v4-flash",
+                            "deepseek-v4-flash-vision-exp",
+                            "deepseek-v4.1-flash-expires-on-0910")
+            for band in ("peak", "off_peak"):
+                occurred = _next_time_with_band(
+                    cutover3 + timedelta(seconds=1), band)
+                for model in flash_family + ("deepseek-v4-pro",):
+                    # flash 家族按 2026-09-11 快照的 deepseek-flash 面值，
+                    # v4-pro 按旧快照面值（官方未调价）
+                    snap_model = ("deepseek-v4-pro" if model == "deepseek-v4-pro"
+                                  else "deepseek-flash")
+                    snapshot = snap if model == "deepseek-v4-pro" else snap_v3
                     for kind in ("provider_cost", "customer_charge"):
                         rate = billing_pricing.find_active_rate(
                             cur, kind, "deepseek", model, occurred)
                         assert rate is not None, (model, band, kind)
-                        assert rate["price_book_id"] == dict(
-                            zip(("provider_cost", "customer_charge"),
-                                bh.CORRECTED_BOOK_IDS))[kind]
+                        assert rate["price_book_id"] == v3_ids[kind]
                         assert rate["time_band"] == band
-                        cny = _cny_of(snap, model, band)
+                        cny = _cny_of(snapshot, snap_model, band)
                         assert rate["cache_hit_nano_per_million"] == \
                             billing_pricing.parse_balance_to_nano(cny[0])
                         assert rate["cache_miss_nano_per_million"] == \
@@ -935,7 +1071,7 @@ def test_all_supported_models_two_kinds_corrected_prices():
                         assert rate["output_nano_per_million"] == \
                             billing_pricing.parse_balance_to_nano(cny[2])
             # 区间无重叠（§9.1）：同 kind/provider/model 的 active 书两两
-            # 半开区间不相交（含 0018 legacy 与 v2、以及 early 覆盖书）
+            # 半开区间不相交（含 0018 legacy 与 v2/v3、以及 early 覆盖书）
             cur.execute(
                 "SELECT count(*) AS n FROM billing_price_books b1 "
                 "JOIN billing_rates r1 ON r1.price_book_id=b1.price_book_id "
@@ -963,10 +1099,11 @@ def test_all_supported_models_two_kinds_corrected_prices():
     assert legacy_hit == int(Decimal("0.05") * 1000)  # = 50（历史错误量级）
 
 def test_cutover_boundary_picks_book_by_occurred_at_and_replay_stable():
-    """cutover 前后各取正确版本；旧 event 重放不重算（§9.1/§7.1）。
+    """0018→0022 边界：cutover 前后各取正确版本；旧 event 重放不重算。
 
     cutover 前 1 小时的事件按 legacy 书计价（错误量级但确定性保留——
-    迟到旧事件不失去确定性价格）；cutover 后按 corrected v2 计价。
+    迟到旧事件不失去确定性价格）；v2 区间内（0022 与 0045 cutover 之间）
+    按 corrected v2 计价。
     """
     from decimal import Decimal
     bh.seed_price_books()
@@ -1009,12 +1146,13 @@ def test_cutover_boundary_picks_book_by_occurred_at_and_replay_stable():
         "pb_deepseek_provider_cost_20260828"
     assert replay["row"]["provider_cost_nano_cny"] == legacy_cost
 
-    # cutover 后（1 秒）：corrected v2 书，金额按「CNY 面值 ×1e9」独立复算
-    # （注意新事件自身时段可能与旧事件不同，不能直接 legacy×1e6）
-    new_time = cutover + timedelta(seconds=1)
+    # v2 区间内（0022 cutover 与 0045 cutover 之间）：corrected v2 书，金额
+    # 按「CNY 面值 ×1e9」独立复算（注意新事件自身时段可能与旧事件不同，
+    # 不能直接 legacy×1e6）；区间中点在任何时钟下都不跨过 0045 cutover
+    new_time = bh.v2_interval_midpoint()
     new_evt = _evt("06_user_priced_flash_no_provider_request_id.json",
                    new_time, "bb")
-    r_new = _ingest(new_evt, now=cutover + timedelta(minutes=2))
+    r_new = _ingest(new_evt, now=new_time + timedelta(minutes=2))
     assert r_new["status"] == "priced"
     assert r_new["row"]["provider_price_book_id"] == \
         "pb_deepseek_provider_cost_v2_corrected"
@@ -1033,17 +1171,95 @@ def test_cutover_boundary_picks_book_by_occurred_at_and_replay_stable():
     # 量级护栏：corrected 金额是 nano「元」级；同量级 legacy 只会算出个位数
     assert r_new["row"]["provider_cost_nano_cny"] >= 1_000_000
 
-def test_fresh_database_full_migration_current_price_is_corrected_v2():
-    """fresh PG 依次跑 0001→0022 后：当前生效价 = corrected v2（§9.7）。
+
+def test_cutover_v3_boundary_picks_book_by_occurred_at_and_replay_stable():
+    """0022/0044→0045 边界：cutover 前事件按 v2 旧价、之后按 v3 新价。
+
+    镜像上一条 0018→0022 的 cutover 语义到 flash 官方降价：边界逐微秒取自
+    pricing_v3_cutover_at（= v2 书收口点 = v3 书起点），部署时钟在降价生效
+    日（2026-09-11）前后的两种形态都确定成立。重放不调价：cutover 前事件
+    在 v3 时代迟投仍按 v2 原价原书。
+    """
+    bh.seed_price_books()
+    cutover3 = bh.pricing_v3_cutover()
+    v2_at = bh.v2_interval_midpoint()
+    assert v2_at < cutover3
+
+    def _evt(tag, when):
+        return dict(
+            bh.load_event("06_user_priced_flash_no_provider_request_id.json"),
+            event_id="use_" + tag * 16, call_id="call_" + tag * 16,
+            request_id="req_cut3_" + tag,
+            occurred_at=_iso(when),
+            enqueued_at=_iso(when + timedelta(seconds=1)))
+
+    def _rates_of(snapshot, model, band):
+        cny = _cny_of(snapshot, model, band)
+        return {key: billing_pricing.parse_balance_to_nano(cny)
+                for key, cny in zip(
+                    ("cache_hit_nano_per_million",
+                     "cache_miss_nano_per_million",
+                     "output_nano_per_million"), cny)}
+
+    # —— cutover 前（v2 区间中点）：v2 书 + 降价前旧价 ——
+    old_evt = _evt("aa", v2_at)
+    r_old = _ingest(old_evt, now=cutover3 + timedelta(minutes=1))
+    assert r_old["status"] == "priced"
+    assert r_old["row"]["provider_price_book_id"] == \
+        "pb_deepseek_provider_cost_v2_corrected"
+    band_old = billing_pricing.time_band_for(v2_at)
+    old_cost = billing_pricing.price_tokens_nano(
+        old_evt["cache_hit_input_tokens"], old_evt["cache_miss_input_tokens"],
+        old_evt["output_tokens"],
+        _rates_of(bh.load_price_snapshot(), "deepseek-v4-flash", band_old))
+    assert r_old["row"]["provider_cost_nano_cny"] == old_cost
+
+    # —— cutover 后（1 秒）：v3 书 + flash 官方新价（deepseek-v4-flash 为
+    # 0045 repriced_models 之一：上游已同价路由，按新价计 provider_cost）——
+    new_time = cutover3 + timedelta(seconds=1)
+    new_evt = _evt("bb", new_time)
+    r_new = _ingest(new_evt, now=cutover3 + timedelta(minutes=2))
+    assert r_new["status"] == "priced"
+    assert r_new["row"]["provider_price_book_id"] == \
+        "pb_deepseek_provider_cost_v3_flash_repricing"
+    band_new = billing_pricing.time_band_for(new_time)
+    new_cost = billing_pricing.price_tokens_nano(
+        new_evt["cache_hit_input_tokens"], new_evt["cache_miss_input_tokens"],
+        new_evt["output_tokens"],
+        _rates_of(bh.load_price_snapshot_v3(), "deepseek-flash", band_new))
+    assert r_new["row"]["provider_cost_nano_cny"] == new_cost
+    # 量级护栏：新价金额是 nano「元」级（miss 主导），非 legacy 个位数
+    assert r_new["row"]["provider_cost_nano_cny"] >= 1_000_000
+
+    # —— 重放（重放不调价）：cutover 前事件在 v3 时代迟投，仍 v2 原价原书
+    replay = billing_store.ingest_usage_event(
+        old_evt, installation_id="pin_test",
+        now=cutover3 + timedelta(days=1))
+    assert replay["duplicate"] is True
+    assert replay["row"]["provider_price_book_id"] == \
+        "pb_deepseek_provider_cost_v2_corrected"
+    assert replay["row"]["provider_cost_nano_cny"] == old_cost
+    # cutover 后事件重放同样原样（v3 价被固定在事件行）
+    replay_new = billing_store.ingest_usage_event(
+        new_evt, installation_id="pin_test",
+        now=cutover3 + timedelta(days=1))
+    assert replay_new["duplicate"] is True
+    assert replay_new["row"]["provider_price_book_id"] == \
+        "pb_deepseek_provider_cost_v3_flash_repricing"
+    assert replay_new["row"]["provider_cost_nano_cny"] == new_cost
+
+def test_fresh_database_full_migration_price_generation_boundaries():
+    """fresh PG 依次跑 0001→0045 后：各代价格按 occurred_at 正确选书（§9.7）。
 
     独立起一个真实 PG（与 conftest 的实例无关），ensure_schema 两遍（幂等），
-    断言 schema_migrations 收录 0022、当前价命中 v2 书且等于 CNY×1e9、
+    断言 schema_migrations 收录 0022/0045；v2 区间中点命中 v2 书且等于
+    CNY×1e9；v3 cutover 后命中 v3 书（flash 官方新价 / v4-pro 旧价）；
     legacy 书区间仍可查询。
     """
     psycopg_rows = pytest.importorskip("psycopg.rows")
     pgserver = pytest.importorskip("pgserver")
     import tempfile
-    data_dir = tempfile.mkdtemp(prefix="m0022-fresh-")
+    data_dir = tempfile.mkdtemp(prefix="m0045-fresh-")
     srv = pgserver.get_server(data_dir)
     try:
         import psycopg
@@ -1055,21 +1271,34 @@ def test_fresh_database_full_migration_current_price_is_corrected_v2():
             pg_store.ensure_schema(conn)   # 幂等重跑
             conn.row_factory = psycopg_rows.dict_row
             assert "0022_billing_price_unit_fix.sql" in files
+            assert "0045_deepseek_flash_repricing.sql" in files
             with conn.cursor() as cur:
                 cur.execute("SELECT filename FROM schema_migrations "
-                            "WHERE filename LIKE '0022%'")
+                            "WHERE filename LIKE '0045%'")
                 assert cur.fetchone()["filename"] == \
-                    "0022_billing_price_unit_fix.sql"
-                # 当前生效价（now）：3 模型两套 kind 全部命中 corrected v2
+                    "0045_deepseek_flash_repricing.sql"
+                # 两代 cutover 标志（epoch 秒 → datetime）
+                cur.execute(
+                    "SELECT key, value FROM platform_settings "
+                    "WHERE key IN ('pricing_v2_cutover_at', "
+                    "'pricing_v3_cutover_at')")
+                marks = {r["key"]: datetime.fromtimestamp(
+                            float(r["value"]), tz=timezone.utc)
+                         for r in cur.fetchall()}
+                cutover2 = marks["pricing_v2_cutover_at"]
+                cutover3 = marks["pricing_v3_cutover_at"]
+                assert cutover3 > cutover2
                 snap = bh.load_price_snapshot()
-                now = datetime.now(timezone.utc)
-                band = billing_pricing.time_band_for(now)
+                snap_v3 = bh.load_price_snapshot_v3()
+                # v2 区间中点：快照 3 模型两套 kind 全部命中 corrected v2
+                v2_at = cutover2 + (cutover3 - cutover2) / 2
+                band = billing_pricing.time_band_for(v2_at)
                 for model in snap["models"]:
                     for kind, book_id in zip(
                             ("provider_cost", "customer_charge"),
                             bh.CORRECTED_BOOK_IDS):
                         rate = billing_pricing.find_active_rate(
-                            cur, kind, "deepseek", model, now)
+                            cur, kind, "deepseek", model, v2_at)
                         assert rate is not None, (model, kind)
                         assert rate["price_book_id"] == book_id
                         cny = _cny_of(snap, model, band)
@@ -1077,15 +1306,28 @@ def test_fresh_database_full_migration_current_price_is_corrected_v2():
                             billing_pricing.parse_balance_to_nano(cny[0])
                         assert rate["output_nano_per_million"] == \
                             billing_pricing.parse_balance_to_nano(cny[2])
-                # legacy 书区间仍可查（cutover 前一秒命中 legacy）
-                cur.execute(
-                    "SELECT value FROM platform_settings "
-                    "WHERE key='pricing_v2_cutover_at'")
-                cutover = datetime.fromtimestamp(
-                    float(cur.fetchone()["value"]), tz=timezone.utc)
+                # v3 cutover 后：deepseek-flash 命中 v3 新价、v4-pro 命中
+                # v3 且面值与旧快照一致（官方未调价）
+                v3_at = cutover3 + timedelta(seconds=1)
+                band3 = billing_pricing.time_band_for(v3_at)
+                for model, snapshot in (("deepseek-flash", snap_v3),
+                                        ("deepseek-v4-pro", snap)):
+                    for kind, book_id in zip(
+                            ("provider_cost", "customer_charge"),
+                            bh.V3_BOOK_IDS):
+                        rate = billing_pricing.find_active_rate(
+                            cur, kind, "deepseek", model, v3_at)
+                        assert rate is not None, (model, kind)
+                        assert rate["price_book_id"] == book_id
+                        cny = _cny_of(snapshot, model, band3)
+                        assert rate["cache_hit_nano_per_million"] == \
+                            billing_pricing.parse_balance_to_nano(cny[0])
+                        assert rate["output_nano_per_million"] == \
+                            billing_pricing.parse_balance_to_nano(cny[2])
+                # legacy 书区间仍可查（v2 cutover 前一秒命中 legacy）
                 rate = billing_pricing.find_active_rate(
                     cur, "provider_cost", "deepseek", "deepseek-v4-flash",
-                    cutover - timedelta(seconds=1))
+                    cutover2 - timedelta(seconds=1))
                 assert rate["price_book_id"] == \
                     "pb_deepseek_provider_cost_20260828"
         finally:
@@ -1097,15 +1339,16 @@ def test_admin_overview_legacy_pricing_split_marker():
     """§7.2 只读口径：cutover/legacy 计数/固定说明，旧影子数据可区分。"""
     bh.seed_price_books_with_history()
     cutover = bh.pricing_cutover()
-    # 一条 cutover 前事件（legacy 计价）+ 一条 cutover 后事件（corrected）
+    # 一条 cutover 前事件（legacy 计价）+ 一条 v2 区间内事件（corrected，
+    # 区间中点保证任何时钟下不跨过 0045 cutover）
     for when, tag in ((cutover - timedelta(minutes=30), "1f"),
-                      (cutover + timedelta(minutes=30), "2f")):
+                      (bh.v2_interval_midpoint(), "2f")):
         event = dict(bh.load_event("06_user_priced_flash_no_provider_request_id.json"),
                      event_id="use_" + tag * 16, call_id="call_" + tag * 16,
                      request_id="req_ov_" + tag,
                      occurred_at=_iso(when),
                      enqueued_at=_iso(when + timedelta(seconds=1)))
-        result = _ingest(event, now=cutover + timedelta(hours=1))
+        result = _ingest(event, now=when + timedelta(hours=1))
         assert result["status"] == "priced"
     stats = billing_store.admin_overview_usage_stats()
     assert stats["pricing_cutover_epoch"] is not None

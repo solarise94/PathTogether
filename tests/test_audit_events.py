@@ -15,6 +15,7 @@
 json/pg 双跑（pg 由 RUN_PG_TESTS=1 conftest 起库 + autouse TRUNCATE 隔离）。
 """
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -29,6 +30,7 @@ DATA_DIR = _bootstrap.SHARE_DATA_DIR
 UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 os.environ["AI_INTERNAL_TOKEN"] = "test-internal-token"
 import share_store  # noqa: E402
+import share_store_pg  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
 from _pt_helpers import csrf_client, install_json_login_limits, isolate_app # noqa: E402
@@ -435,3 +437,57 @@ def test_usage_ingest_audit_no_sensitive_content(monkeypatch):
                    event["session_id"], "Bearer"):
         assert banned not in dumped, "审计出现敏感内容：%s" % banned
     assert detail["status"] == "priced" and detail["provider"] == "deepseek"
+
+
+# =========================================================================== #
+# 7. record_audit 写失败：best-effort 契约不变 + 节流 exception 日志
+#    （fix 2026-09-11：此前 `except Exception: return False` 完全静默，PG 故障
+#    期间审计 100% 丢失且零信号）
+# =========================================================================== #
+def test_record_audit_failure_returns_false_and_logs_throttled(
+        monkeypatch, caplog):
+    """写失败仍吞掉返回 False（契约不变），但节流记 exception 级日志不再静默。
+
+    - 第一次失败：返回 False + 一条 exception 日志（含 action/target 标识，
+      绝不含 detail 负载）；
+    - 节流窗口内第二次失败：仍返回 False，但不重复记日志；
+    - 窗口过后（回拨时间戳模拟 300s 流逝）：再记一条。
+    """
+    import time as _time
+
+    share_store_pg._reset_audit_fail_log_state()
+
+    def _no_conn():
+        raise RuntimeError("pg down（测试注入）")
+
+    monkeypatch.setattr(share_store_pg, "_connect", _no_conn)
+    with caplog.at_level(logging.ERROR):
+        assert share_store_pg.record_audit(
+            "plugin.install", actor_role="owner", target_type="plugin",
+            target_id="histopilot", detail={"secret_payload": "must-not-log"},
+        ) is False
+        # 节流窗口内第二次失败：契约不变（False），但不重复记日志
+        assert share_store_pg.record_audit(
+            "plugin.install", actor_role="owner", target_type="plugin",
+            target_id="histopilot", detail={},
+        ) is False
+    recs = [r for r in caplog.records
+            if r.name == "share_store_pg" and "audit" in r.getMessage()]
+    assert len(recs) == 1  # 节流：两次失败只记一条
+    assert recs[0].levelno == logging.ERROR
+    assert recs[0].exc_info  # 带异常堆栈（固定说明文本 + exc_info）
+    msg = recs[0].getMessage()
+    assert "plugin.install" in msg  # action 名
+    assert "plugin" in msg and "histopilot" in msg  # target_type / target_id
+    assert "secret_payload" not in msg  # detail 负载绝不入日志
+
+    # 窗口过后（回拨节流时间戳，避免测试真等 300s）→ 再记一条
+    share_store_pg._audit_fail_log_last["last"] = (
+        _time.monotonic()
+        - share_store_pg._AUDIT_FAIL_LOG_INTERVAL_SECONDS - 1)
+    caplog.clear()
+    with caplog.at_level(logging.ERROR):
+        assert share_store_pg.record_audit("plugin.install", detail={}) is False
+    recs2 = [r for r in caplog.records
+             if r.name == "share_store_pg" and "audit" in r.getMessage()]
+    assert len(recs2) == 1

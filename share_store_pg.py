@@ -34,6 +34,7 @@
 import hashlib
 import hmac
 import json
+import logging
 import secrets
 import time
 import uuid
@@ -72,6 +73,10 @@ from share_shared import (
     _status_of,
     _validate_geom,
 )
+
+#: 本模块日志（audit 写失败 best-effort 的节流 exception 日志走这里；消息只含
+#: action/target 标识与异常堆栈，绝不落 detail 负载/密钥——同 billing_store 红线）
+_LOG = logging.getLogger(__name__)
 
 
 class RevisionConflict(Exception):
@@ -1858,6 +1863,17 @@ def delete_comment(comment_id):
 # --------------------------------------------------------------------------- #
 AUDIT_MAX_EVENTS = 5000
 
+# 审计写失败节流告警（进程内简单实现，风格同 app.py `_warn_secret_throttled` /
+# site_stats_store `_warn_state`）：PG 故障期间每次审计写都失败，300s 至多记一条
+# 堆栈，防止刷屏；复位函数供测试清零（惯例同 site_stats_store._reset_warn_state）。
+_AUDIT_FAIL_LOG_INTERVAL_SECONDS = 300.0
+_audit_fail_log_last = {"last": 0.0}
+
+
+def _reset_audit_fail_log_state():
+    """测试辅助：清空写失败日志节流状态（下一条失败日志必然发出）。"""
+    _audit_fail_log_last["last"] = 0.0
+
 
 def record_audit(action, actor_user_id=None, actor_role=None, target_type=None,
                  target_id=None, slide=None, detail=None, ts=None):
@@ -1887,6 +1903,19 @@ def record_audit(action, actor_user_id=None, actor_role=None, target_type=None,
         finally:
             conn.close()
     except Exception:
+        # best-effort 契约不变：吞异常、返回 False、绝不抛出（审计不能打挂
+        # 业务路径）。但不再静默——节流记一条 exception 级日志（fix
+        # 2026-09-11：此前完全吞掉，PG 故障期间审计 100% 丢失且零信号）。
+        # 只记 action 名与 target_type/target_id 标识 + 异常堆栈；detail 可能
+        # 含业务数据/密钥相邻信息，绝不入日志。
+        now_mono = time.monotonic()
+        if (now_mono - _audit_fail_log_last["last"]) >= \
+                _AUDIT_FAIL_LOG_INTERVAL_SECONDS:
+            _audit_fail_log_last["last"] = now_mono
+            _LOG.exception(
+                "[audit] 审计写入失败（best-effort 返回 False；"
+                "action=%s target_type=%s target_id=%s；节流窗口内同类仅记本条）",
+                str(action or ""), target_type or None, target_id or None)
         return False
 
 

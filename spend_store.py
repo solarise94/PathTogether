@@ -282,10 +282,6 @@ def is_dispatch_maintenance_tx(cur) -> bool:
         return bool(row["value"]) if row is not None else False
     except Exception:
         return True
-        row = cur.fetchone()
-        return row is None or row["value"] is not False
-    except Exception:
-        return True
 
 
 def _connect():

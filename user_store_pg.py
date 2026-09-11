@@ -40,6 +40,7 @@ display_name 登录 fallback；get_user_by_display_name 删除。
 暴露为 None 占位，仅供 dispatcher 公共名校验（hasattr）与形状兼容。
 """
 
+import logging
 import secrets
 import time
 from datetime import datetime, timezone
@@ -48,6 +49,36 @@ import psycopg
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import pg_store
+
+#: 模块 logger：只记 hash 校验异常等运行异常（含堆栈），绝不落密码明文、
+#: hash 值等敏感信息（惯例同 share_store_pg._LOG）。
+_LOG = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# hash 校验异常告警节流（fix 2026-09-11 P3）：check_password_hash 抛异常
+# （hash 行损坏 / scheme 不符）此前被静默吞掉——用户只见「账号或密码错误」，
+# 服务端零日志，批量锁死与暴力破解无法区分。对外契约不变（登录 None /
+# invalid_current_password），只补可见性：进程内 300s 至多一条 exception 级
+# 日志（惯例同 share_store_pg._audit_fail_log_last）；复位函数供测试清零。
+# --------------------------------------------------------------------------- #
+_HASH_CHECK_LOG_INTERVAL_SECONDS = 300.0
+_hash_check_log_last = {"last": 0.0}
+
+
+def _reset_hash_check_log_state():
+    """测试辅助：清空 hash 校验异常日志节流状态（下一条日志必然发出）。"""
+    _hash_check_log_last["last"] = 0.0
+
+
+def _log_hash_check_throttled():
+    """hash 校验异常节流留痕（300s 一条；只记异常堆栈，不含任何凭据值）。"""
+    now_mono = time.monotonic()
+    if (now_mono - _hash_check_log_last["last"]) >= \
+            _HASH_CHECK_LOG_INTERVAL_SECONDS:
+        _hash_check_log_last["last"] = now_mono
+        _LOG.exception(
+            "[auth] 密码 hash 校验异常（按校验失败处理；"
+            "300s 节流窗口内同类仅记本条；不含密码/hash 值）")
 
 
 class UserStoreCorrupt(Exception):
@@ -471,6 +502,10 @@ def verify_user(login_id, password):
         if not check_password_hash(user.get("password_hash") or "", password):
             return None
     except Exception:
+        # 契约不变：仍按校验失败返回 None（统一「账号或密码错误」文案）；
+        # 但不再静默——节流记一条 exception 日志（fix 2026-09-11 P3），
+        # 让 hash 行损坏 / scheme 不符与普通密码错误可区分。
+        _log_hash_check_throttled()
         return None
     return user
 
@@ -586,6 +621,9 @@ def change_own_password(user_id, current_password, new_password,
                     current_ok = check_password_hash(
                         row.get("password_hash") or "", current_password or "")
                 except Exception:
+                    # 契约不变：仍按校验失败走 invalid_current_password；
+                    # 节流留痕同 verify_user（fix 2026-09-11 P3）。
+                    _log_hash_check_throttled()
                     current_ok = False
                 if not current_ok:
                     raise PasswordChangeConflict("invalid_current_password")

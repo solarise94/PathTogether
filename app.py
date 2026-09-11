@@ -4176,11 +4176,17 @@ def _demo_task_max_steps() -> int:
     """Demo 单次任务步骤（ai_safety.demo_task_max_steps，默认 20；docs §4.1/§5.3）。
 
     批次 F：自周期列迁居 platform_settings（settings_store 统一设置源）。
+    读取失败按默认处理（保守内置上限，方向不变）但不再静默——对齐
+    _demo_public_mode 的写法记 warning（fix 2026-09-11 P4：管理员调紧后
+    被静默放宽必须留痕）。
     """
     try:
         raw = settings_store.get_ai_safety_settings()["demo_task_max_steps"]
         v = int(raw)
     except Exception:
+        app.logger.warning("读取 Demo 步数上限失败（按默认 %d 处理）",
+                           budget_store.DEFAULT_DEMO_TASK_MAX_STEPS,
+                           exc_info=True)
         v = budget_store.DEFAULT_DEMO_TASK_MAX_STEPS
     return max(1, min(v, _MAX_STEPS_LIMIT))
 
@@ -5182,10 +5188,14 @@ def _require_owner():
 # 他人切片不可读写）；can_delete_slide / 项目管理写 / 分享撤销 / 标注删除
 # 的 owner 语义不变。
 #
-# AUTH_ENABLED=False（内网模式）或 session 无 role 时，current_identity 仍
-# 返回 role=owner：本地免认证开发态 owner 无稳定 user_id → 读/写全量（
+# AUTH_ENABLED=False（内网模式）时 session 无 role 是合法路径，current_identity
+# 归一 role=owner：本地免认证开发态 owner 无稳定 user_id → 读/写全量（
 # §5.4 明确例外，不存在「其他用户」可隔离）。稳定 owner 账户部署中，owner
 # 看自己上传的切片不受影响，他人切片需系统管理显式添加。
+# AUTH_ENABLED=True 时 session 无 role 只可能是异常（session 写入 bug /
+# 序列化问题）→ 降级 ROLE_GUEST（最低权限）+ 节流 warning，不再默认最高
+# 权限（fix 2026-09-11 P1；登录/激活等合法路径均写入 role，见
+# _require_auth 对 auth_user 的硬校验）。
 #
 # user：上传/维护自己的图库；查看 = 自己的 + 公开 + 受邀（认领过 active
 #       share）+ 显式授权；标注 = 自己的 + 协作切片；删除标注 = 仅本人创建；
@@ -5212,16 +5222,43 @@ PREVIEW_TTL_SECONDS = int(
     os.environ.get("PREVIEW_TTL_SECONDS") or 15 * 60)
 
 
+#: session role 缺失告警节流（fix 2026-09-11 P1）：AUTH_ENABLED=True 下
+#: session 无 role 只可能是异常（写入 bug / 序列化问题），降级 GUEST 时记
+#: 一条节流 warning（同类一条/5 分钟，惯例同 _warn_site_stats_throttled）；
+#: 只记 session 是否有 user_id，绝不记 session 内容本身。
+_ROLE_MISSING_WARN_INTERVAL_SECONDS = 300
+_role_missing_warn_last = {"ts": 0.0}
+
+
+def _reset_role_missing_warn_state():
+    """测试辅助：清空 role 缺失告警节流状态（下一条告警必然发出）。"""
+    _role_missing_warn_last["ts"] = 0.0
+
+
 def actor_identity():
     """真实登录身份（flat {"role","user_id"}，**永不被预览替换**）。
 
-    归一契约与 current_identity 一致：session 无 role（AUTH_ENABLED=False
-    内网模式 / 未登录）→ role=owner。预览态下 session 仍是管理员的——本函数
-    即「管理员本人」视角。
+    归一契约与 current_identity 一致：session 无 role 时按 AUTH 模式区分
+    （fix 2026-09-11 P1，不再无条件「保守放行」owner）——AUTH_ENABLED=False
+    （内网免认证）为合法路径，归一 role=owner；AUTH_ENABLED=True 下 role
+    缺失只可能是异常 → 降级 ROLE_GUEST（最低权限）+ 节流 warning。
+    预览态下 session 仍是管理员的——本函数即「管理员本人」视角。
     """
     role = session.get("role")
     if role is None:
-        role = user_store.ROLE_OWNER
+        if AUTH_ENABLED:
+            now = time.monotonic()
+            if (now - _role_missing_warn_last["ts"]) >= \
+                    _ROLE_MISSING_WARN_INTERVAL_SECONDS:
+                _role_missing_warn_last["ts"] = now
+                app.logger.warning(
+                    "[auth] session 缺少 role（AUTH_ENABLED=True，合法登录/"
+                    "激活路径均应写入；只可能是 session 异常）——按最低权限"
+                    " %s 处理（session 有 user_id=%s；节流窗口内同类仅记本条）",
+                    user_store.ROLE_GUEST, bool(session.get("user_id")))
+            role = user_store.ROLE_GUEST
+        else:
+            role = user_store.ROLE_OWNER
     return {"role": role, "user_id": session.get("user_id")}
 
 
@@ -5276,9 +5313,11 @@ def _preview_active():
 def current_identity():
     """返回 {"role","user_id"}（**effective subject**；S4 预览态 = 被预览用户）。
 
-    session 无 role（AUTH_ENABLED=False 内网模式 / 未登录）→ role=owner 全开。
-    AUTH_ENABLED=True 时未登录请求已被 _require_auth 在 before_request 拦截为 401，
-    不会走到资源级判定；此处对无 role 的分支保守放行，避免误锁。
+    session 无 role 的归一见 actor_identity（fix 2026-09-11 P1，按 AUTH 模式
+    区分）：AUTH_ENABLED=False（内网模式）→ owner 免认证语义不动；
+    AUTH_ENABLED=True → ROLE_GUEST（最低权限）+ 节流 warning——该模式下
+    未登录请求已被 _require_auth 在 before_request 拦截为 401，不会走到
+    资源级判定，此处无 role 只可能是 session 异常，不再保守放行。
 
     预览态（session[preview] 有效）→ 返回 subject 的 role/user_id：can_view /
     can_annotate / 切片列表 / AI 会话过滤等继续读本函数，预览下自动按 subject
@@ -5981,18 +6020,26 @@ def _release_budget_for_terminated_runs(terminated_runs):
     不得盲 release：sidecar 已接受但平台尚未 accept 时必须 consume，否则会
     退回已经产生模型成本的额度。found+已接受 → consume（run 侧已被 revoke
     置为 expired 终态，不重复流转）；missing → release；不可达或尚未接受 →
-    顺延 reservation。
+    顺延 reservation；预留行**读取失败** → 本轮跳过该 rid（下轮重试，
+    fix 2026-09-11 P2：不得以 expected_attempt=None 绕过 attempt CAS）。
     """
     released = []
     for run in terminated_runs or []:
         rid = (run or {}).get("request_id")
         if not rid:
             continue
-        budget_row = None
         try:
             budget_row = budget_store.get_reservation(rid)
         except Exception:
-            budget_row = None
+            # fix 2026-09-11（P2）：读取失败时若置 budget_row=None 继续，
+            # consume/release 会以 expected_attempt=None 跳过乐观并发检查
+            # （budget_store 只在 expected_attempt 非 None 时做 attempt CAS），
+            # 可能消费/释放已被新尝试接替的预留行。对账由 ai-budget-reclaim
+            # 守护线程周期执行，本轮跳过、下轮重试，天然安全。
+            app.logger.warning(
+                "terminated run 预算对账读取预留失败，本轮跳过：%s", rid,
+                exc_info=True)
+            continue
         budget_attempt = (budget_row or {}).get("attempt") if budget_row else None
         verdict, hp_sid, accepted = _histopilot_lookup_request(rid)
         if verdict == "found" and accepted:
@@ -16270,6 +16317,26 @@ def api_ai_run():
         auth = _require_ai_session_owner(session_id)
         if auth is not None:
             return auth
+    # fix-2026-09-11：草稿期「允许 AI 描绘」随创建参数（严格布尔，缺省不传 =
+    # 关，per-session 默认关不变）。校验先于预算预占/grant 签发（零副作用拒绝）：
+    #   - 非布尔非缺省 → 400 invalid_argument（不猜测 truthy；显式 null 同样
+    #     拒绝——键存在即必须给严格布尔）；
+    #   - 值为 true 但非 fresh（续写既有会话）→ 400 invalid_argument：改既有
+    #     会话的开关必须走 /api/ai/session/<sid>/drawing（generation 机制，
+    #     职责不混）；
+    #   - fresh 且 true → 随 payload 透传，HP 在工具装配前落为会话权威值；
+    #     run 被接受（on_accepted 拿到 X-AI-Session-ID）后写 PT 镜像使二者
+    #     一致（见下方 on_accepted 包装）。值为 false 视同缺省（不透传）。
+    if "allow_ai_drawing" in body and not isinstance(body.get("allow_ai_drawing"), bool):
+        return jsonify(error="allow_ai_drawing 非法：需布尔值",
+                       code="invalid_argument"), 400
+    draft_allow_drawing = body.get("allow_ai_drawing")
+    # JSON body 与 query 双重兼容（前端历史上把 fresh=1 放在 query）
+    is_fresh_run = bool(body.get("fresh")) or request.args.get("fresh") == "1"
+    if draft_allow_drawing is True and not is_fresh_run:
+        return jsonify(error="allow_ai_drawing 仅支持新建会话（fresh）时携带；"
+                             "既有会话请使用描绘开关端点",
+                       code="invalid_argument"), 400
     prep = _ai_run_prepare(user_ctx, body, slide, need_grant=True)
     if not isinstance(prep, dict):
         return prep
@@ -16359,26 +16426,6 @@ def api_ai_continue():
         auth = _require_ai_session_owner(session_id)
         if auth is not None:
             return auth
-    # fix-2026-09-11：草稿期「允许 AI 描绘」随创建参数（严格布尔，缺省不传 =
-    # 关，per-session 默认关不变）。校验先于预算预占/grant 签发（零副作用拒绝）：
-    #   - 非布尔非缺省 → 400 invalid_argument（不猜测 truthy；显式 null 同样
-    #     拒绝——键存在即必须给严格布尔）；
-    #   - 值为 true 但非 fresh（续写既有会话）→ 400 invalid_argument：改既有
-    #     会话的开关必须走 /api/ai/session/<sid>/drawing（generation 机制，
-    #     职责不混）；
-    #   - fresh 且 true → 随 payload 透传，HP 在工具装配前落为会话权威值；
-    #     run 被接受（on_accepted 拿到 X-AI-Session-ID）后写 PT 镜像使二者
-    #     一致（见下方 on_accepted 包装）。值为 false 视同缺省（不透传）。
-    if "allow_ai_drawing" in body and not isinstance(body.get("allow_ai_drawing"), bool):
-        return jsonify(error="allow_ai_drawing 非法：需布尔值",
-                       code="invalid_argument"), 400
-    draft_allow_drawing = body.get("allow_ai_drawing")
-    # JSON body 与 query 双重兼容（前端历史上把 fresh=1 放在 query）
-    is_fresh_run = bool(body.get("fresh")) or request.args.get("fresh") == "1"
-    if draft_allow_drawing is True and not is_fresh_run:
-        return jsonify(error="allow_ai_drawing 仅支持新建会话（fresh）时携带；"
-                             "既有会话请使用描绘开关端点",
-                       code="invalid_argument"), 400
     prep = _ai_run_prepare(user_ctx, body, slide, need_grant=True)
     if not isinstance(prep, dict):
         return prep

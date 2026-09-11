@@ -318,7 +318,11 @@ def test_archived_project_write_protected():
         "side_px": 100, "size_mm": 6.0,
     })
     assert r.status_code == 403
-    # can_annotate_slide / can_upload 对归档切片 False（在请求上下文内判定）
+    # can_annotate_slide / can_upload 对归档切片 False（在请求上下文内判定）。
+    # 这里用裸 test_request_context（空 session）做单元级判定——须钉在内网
+    # 模式（AUTH_ENABLED=False，owner 无 uid 全量例外 §5.4）：fix 2026-09-11
+    # P1 起 AUTH_ENABLED=True 下空 session 归一 guest，不再默认 owner。
+    app_mod.AUTH_ENABLED = False
     with app_mod.app.test_request_context():
         assert app_mod.can_annotate_slide("demo.svs") is False
         assert app_mod.can_upload("demo.svs") is False
@@ -328,6 +332,7 @@ def test_archived_project_write_protected():
     assert r.get_json()["archived"] is False
     with app_mod.app.test_request_context():
         assert app_mod.can_annotate_slide("demo.svs") is True
+    app_mod.AUTH_ENABLED = True
     r = c.post("/api/annotation", json={
         "slide": "demo.svs", "type": "rect", "label": "L", "x": 0, "y": 0,
         "side_px": 100, "size_mm": 6.0,

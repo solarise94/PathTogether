@@ -20,6 +20,7 @@
 openslide stub（本测试覆盖鉴权路径，多数在打开切片前即 403，无需真 OpenSlide）。
 """
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -1228,16 +1229,18 @@ def test_annotations_filtered_for_user():
     assert cb.get("/api/annotations?slide=b.svs").status_code == 200
 
 # =========================================================================== #
-# 11. current_identity 单元（owner 角色兜底；读隔离按 uid 判定）
+# 11. current_identity 单元（无 role 兜底按 AUTH 模式区分；读隔离按 uid 判定）
 # =========================================================================== #
 def test_current_identity_owner_when_no_role():
-    """无 session role 时 current_identity() 兜底 role=owner（访问判定用）。
+    """AUTH_ENABLED=False（内网免认证）无 session role 仍兜底 role=owner。
 
-    读隔离（review P0 2026-09-05）：owner 无稳定 user_id = 本地免认证单租户
-    态 → 读恢复全量（不存在「其他用户」可隔离）；写路径（can_upload /
-    can_annotate_slide / 删除）owner 语义不变。
+    内网模式 session 无 role 是合法路径（fix 2026-09-11 P1 保持不变）：
+    owner 无稳定 user_id = 本地免认证单租户态 → 读恢复全量（不存在
+    「其他用户」可隔离）；写路径（can_upload / can_annotate_slide / 删除）
+    owner 语义不变。
     """
     _setup_users()
+    app_mod.AUTH_ENABLED = False
     # 无 session（test_request_context 默认空 session）→ current_identity 返回 owner
     with app_mod.app.test_request_context("/api/anything"):
         ident = app_mod.current_identity()
@@ -1247,3 +1250,31 @@ def test_current_identity_owner_when_no_role():
         assert app_mod.can_view_slide("any.svs") is True
         assert app_mod.can_upload() is True
         assert app_mod.can_annotate_slide("any.svs") is True
+
+
+def test_current_identity_guest_when_no_role_under_auth(caplog):
+    """AUTH_ENABLED=True 且 session 无 role → 降级 GUEST + 节流 warning。
+
+    fix 2026-09-11 P1：认证部署下 role 缺失只可能是 session 异常（写入 bug /
+    序列化问题），不再默认最高权限——按最低权限 guest 处理且留痕（窗口内
+    第二次不再记）；不能上传 / 非 owner，可读面同 user（按 uid 判定）。
+    """
+    _setup_users()
+    app_mod.AUTH_ENABLED = True
+    app_mod._reset_role_missing_warn_state()
+    with caplog.at_level(logging.WARNING):
+        with app_mod.app.test_request_context("/api/anything"):
+            ident = app_mod.current_identity()
+            assert ident["role"] == "guest"
+            assert ident["user_id"] is None
+            assert app_mod._is_owner() is False
+            assert app_mod.can_upload() is False
+            assert app_mod.can_view_slide("any.svs") is False
+            assert app_mod.can_annotate_slide("any.svs") is False
+            # actor_identity 同口径（actor 视角同样降级）
+            assert app_mod.actor_identity()["role"] == "guest"
+            # 节流：窗口内第二次身份解析只记一条 warning
+            assert app_mod.actor_identity()["role"] == "guest"
+    recs = [r for r in caplog.records if "session 缺少 role" in r.getMessage()]
+    assert len(recs) == 1
+    app_mod._reset_role_missing_warn_state()

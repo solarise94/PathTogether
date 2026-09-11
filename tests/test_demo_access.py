@@ -23,6 +23,7 @@ PostgreSQL 唯一后端（RUN_PG_TESTS=1）：
 """
 import inspect
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -896,6 +897,46 @@ def test_catalog_remove_reconciles_reservations_not_blind_release():
     for run in (run_ok, run_miss, run_pend):
         assert demo_store.get_run(run["demo_run_id"])["state"] == "expired"
 
+def test_catalog_remove_budget_read_failure_skips_round_then_retries(
+        caplog, monkeypatch):
+    """fix 2026-09-11 P2：预留行读取失败 → 本轮跳过该 rid，不得绕过 attempt CAS。
+
+    get_reservation 抛异常时旧行为置 budget_row=None 继续——consume/release
+    以 expected_attempt=None 调用会跳过乐观并发检查，可能消费/释放已被新
+    尝试接替的预留行。新行为：记 warning + 跳过（reservation 原样保留），
+    下一轮（读取恢复）正常结算（missing → release）。
+    """
+    _setup_platform()
+    # 本测试只要 1 个在途 run，无需调高并发闸；目录撤销链路同上例
+    slide_id = _catalog_add(_touch("rev-skip.svs"))
+    cap, rid, run = _reserve_pending_run(slide_id)
+    fake = FakeSidecar()
+    fake.on("GET", "/session/by-request/",
+            lambda path, body, params, headers: FakeResponse(
+                404, {"error": "该 request_id 没有对应会话",
+                      "code": "not_found"}), prefix=True)
+    fake._install()
+
+    def _boom(request_id):
+        raise RuntimeError("预留行读取失败（test）")
+
+    with caplog.at_level(logging.WARNING):
+        with monkeypatch.context() as m:
+            m.setattr(budget_store, "get_reservation", _boom)
+            released = app_mod._release_budget_for_terminated_runs(
+                [{"request_id": rid, "demo_run_id": run["demo_run_id"],
+                  "attempt": run["attempt"]}])
+    assert released == []
+    # 本轮跳过：reservation 未被 consume/release（未被 expected_attempt=None 绕闸）
+    assert budget_store.get_reservation(rid)["state"] == "reserved"
+    assert any("预算对账读取预留失败" in r.getMessage() for r in caplog.records)
+    # 下一轮（读取恢复）正常结算：missing → release
+    released = app_mod._release_budget_for_terminated_runs(
+        [{"request_id": rid, "demo_run_id": run["demo_run_id"],
+          "attempt": run["attempt"]}])
+    assert released == [rid]
+    assert budget_store.get_reservation(rid)["state"] == "released"
+
 def test_demo_sequential_runs_unlimited_via_ui():
     """批次 E §4.1：同 capability 顺序多次 run，无累计次数上限。"""
     _enable_demo_period()
@@ -1325,3 +1366,39 @@ def test_demo_js_text_delta_and_paused_are_terminal():
         .read_text(encoding="utf-8")
     assert i18n.count('"demo.ai.ended":') == 2
     assert i18n.count('"demo.ai.snapshot":') == 2
+
+# --------------------------------------------------------------------------- #
+# fix 2026-09-11 P4：安全限额读取失败不再静默（回落值不变，只补可观测）
+# --------------------------------------------------------------------------- #
+def test_demo_task_max_steps_read_failure_logs_and_falls_back(caplog, monkeypatch):
+    """app._demo_task_max_steps 读取失败 → 默认 20 步 + warning（对齐 _demo_public_mode）。"""
+    import settings_store
+
+    def _boom():
+        raise RuntimeError("settings 读取失败（test）")
+    monkeypatch.setattr(settings_store, "get_ai_safety_settings", _boom)
+    with caplog.at_level(logging.WARNING):
+        v = app_mod._demo_task_max_steps()
+    assert v == budget_store.DEFAULT_DEMO_TASK_MAX_STEPS
+    assert any("读取 Demo 步数上限失败" in r.getMessage() for r in caplog.records)
+
+def test_demo_max_concurrency_read_failure_logs_and_falls_back(caplog, monkeypatch):
+    """demo_store._demo_max_concurrency 读取失败 → 缺省 2 + 节流 warning。
+
+    窗口内第二次调用仍回落缺省、但不再重复记日志（300s 节流，进程内实现）。
+    """
+    import settings_store
+
+    def _boom():
+        raise RuntimeError("settings 读取失败（test）")
+    monkeypatch.setattr(settings_store, "get_ai_safety_settings", _boom)
+    demo_store._reset_concurrency_warn_state()
+    with caplog.at_level(logging.WARNING):
+        assert demo_store._demo_max_concurrency() \
+            == demo_store.DEFAULT_DEMO_MAX_CONCURRENCY == 2
+        # 窗口内第二次：行为不变（仍回落 2），不再记日志
+        assert demo_store._demo_max_concurrency() == 2
+    recs = [r for r in caplog.records
+            if "读取 Demo 并发上限失败" in r.getMessage()]
+    assert len(recs) == 1
+    demo_store._reset_concurrency_warn_state()

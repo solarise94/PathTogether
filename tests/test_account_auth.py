@@ -634,6 +634,45 @@ def test_single_user_lookup_per_request(monkeypatch):
     check("恰好一次 get_user 回查", calls["n"] == 1, "calls=%d" % calls["n"])
 
 # =========================================================================== #
+# 5.5 fix 2026-09-11 P3：hash 校验异常留痕（登录/改密契约不变，补节流日志）
+# =========================================================================== #
+def test_password_hash_check_exception_logged_throttled(monkeypatch, caplog):
+    """check_password_hash 抛异常（hash 行损坏/scheme 不符）不再静默。
+
+    登录仍返回 None、本人改密仍 invalid_current_password（对外契约不变）；
+    但记一条 exception 级日志，且 300s 节流窗口内第二次不再记——批量锁死
+    与暴力破解可区分的前提是服务端有信号。日志不含密码/hash 值。
+    """
+    import user_store_pg
+    user = user_store.create_user("hashfail@x.com", USER_PW, role="user")
+
+    def _boom(_hash, _password):
+        raise RuntimeError("corrupted hash (test)")
+
+    monkeypatch.setattr(user_store_pg, "check_password_hash", _boom)
+
+    user_store_pg._reset_hash_check_log_state()
+    with caplog.at_level(logging.ERROR):
+        # 登录路径：异常按校验失败处理 → None（契约不变）
+        assert user_store.verify_user("hashfail@x.com", USER_PW) is None
+        # 窗口内第二次：行为不变（仍 None），不再重复记日志
+        assert user_store.verify_user("hashfail@x.com", USER_PW) is None
+    recs = [r for r in caplog.records if "密码 hash 校验异常" in r.getMessage()]
+    assert len(recs) == 1
+
+    # 改密路径：复位节流后，异常 → invalid_current_password（契约不变）+ 一条日志
+    caplog.clear()
+    user_store_pg._reset_hash_check_log_state()
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(user_store.PasswordChangeConflict) as exc_info:
+            user_store.change_own_password(
+                user["user_id"], USER_PW, NEW_PW, user["auth_version"])
+    assert exc_info.value.reason == "invalid_current_password"
+    recs2 = [r for r in caplog.records if "密码 hash 校验异常" in r.getMessage()]
+    assert len(recs2) == 1
+    user_store_pg._reset_hash_check_log_state()
+
+# =========================================================================== #
 # 6. 汇总
 # =========================================================================== #
 def test_run_summary():

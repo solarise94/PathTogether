@@ -43,6 +43,7 @@ revoke_by_slide（切片下架/删除/移出目录）：终止该切片的**在�
 （info/dzi/tile 404）。json/dual 后端 fail-closed（platform_features）。
 """
 
+import logging
 import math
 import os
 import secrets
@@ -51,6 +52,10 @@ import time
 import psycopg
 
 import pg_store
+
+#: 模块 logger：只记安全参数读取失败等运行异常（含堆栈），绝不落 token、
+#: token_hash、IP 前缀 hash 等敏感值（惯例同 share_store_pg._LOG）。
+_LOG = logging.getLogger(__name__)
 
 #: capability 默认 24 小时到期（docs §5.2）
 DEMO_CAPABILITY_TTL_HOURS = 24
@@ -145,16 +150,36 @@ class DemoConcurrencyExceeded(Exception):
 _DEMO_CONCURRENCY_LOCK_KEY = 0x444D4343
 
 
+#: 并发上限读取失败告警节流（fix 2026-09-11 P4）：回落缺省（2）本身是保守
+#: 方向（设计上限），但「管理员调紧后被静默放宽」必须留痕——进程内 300s 至
+#: 多一条 warning（惯例同 share_store_pg._audit_fail_log_last）；复位函数供
+#: 测试清零。日志只含异常堆栈，不含 settings 内容/敏感值。
+_DEMO_CONCURRENCY_WARN_INTERVAL_SECONDS = 300.0
+_demo_concurrency_warn_last = {"last": 0.0}
+
+
+def _reset_concurrency_warn_state():
+    """测试辅助：清空读取失败告警节流状态（下一条告警必然发出）。"""
+    _demo_concurrency_warn_last["last"] = 0.0
+
+
 def _demo_max_concurrency() -> int:
     """读 Demo 全局并发上限（settings_store ai_safety.*，缺省回落常量）。
 
-    读取失败按缺省（2）处理：安全参数读取异常不放大并发（fail-closed）。
+    读取失败按缺省（2）处理：安全参数读取异常不放大并发（fail-closed），
+    但不再静默——节流记一条 warning（fix 2026-09-11 P4）。
     json/dual 由调用方 fail-closed（reserve_run 的 PG 守卫先行）。
     """
     import settings_store
     try:
         return int(settings_store.get_ai_safety_settings()["demo_max_concurrency"])
-    except Exception:  # pragma: no cover - settings 读取异常的保守回退
+    except Exception:
+        now_mono = time.monotonic()
+        if (now_mono - _demo_concurrency_warn_last["last"]) >= \
+                _DEMO_CONCURRENCY_WARN_INTERVAL_SECONDS:
+            _demo_concurrency_warn_last["last"] = now_mono
+            _LOG.warning("读取 Demo 并发上限失败（按缺省 %d 处理）",
+                         DEFAULT_DEMO_MAX_CONCURRENCY, exc_info=True)
         return DEFAULT_DEMO_MAX_CONCURRENCY
 
 

@@ -103,6 +103,7 @@ _PUBLIC_NAMES = (
     # —— 会话级「允许 AI 描绘」开关镜像（0039/0041 / P1-4+三轮 P1） ——
     "get_ai_session_drawing_flag",
     "upsert_ai_session_drawing_flag",
+    "init_ai_session_drawing_flag",
     "get_ai_session_drawing_generation",
     "reserve_ai_session_drawing_generation",
     "cas_ai_session_drawing_flag",

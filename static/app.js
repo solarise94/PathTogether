@@ -55,8 +55,10 @@
     // U3 三段状态（§3.5：正在传输 → 服务端校验 → 入库完成）
     "upload.stage.transferring": { zh: "正在传输", en: "Transferring" },
     "upload.stage.validating": { zh: "服务端校验中", en: "Validating on server" },
+    "upload.stage.converting": { zh: "切片转换中", en: "Converting slide" },
     "upload.stage.done": { zh: "入库完成", en: "Completed" },
     "upload.stage.failed": { zh: "上传失败", en: "Upload failed" },
+    "upload.err.conversion": { zh: "切片转换失败", en: "Slide conversion failed" },
     // 升级 C（§6.1）：矩形工具文案（i18n.js 为主源；此处兜底）
     "roi.rect.tip": { zh: "矩形工具：在视野中拖出矩形，或输入宽高后点击中心放置；拖内部平移、边/角调整大小；Escape 取消",
                       en: "Rectangle tool: drag in the view, or enter width/height then click to place; drag inside to move, edges/corners to resize; Escape cancels" },
@@ -876,6 +878,12 @@
   }
 
   function onViewerOpen() {
+    // AI 助手：切片一旦可用即启用触发按钮（插件停用时 aiBtn 不渲染，跳过；
+    // 平台人工读片不受影响）。必须放在 channelReopening 分支之前：模板初始
+    // disabled，而多通道切片带本地配色时首开被 close 吃掉、最终 open 只走
+    // 轻量路径——若在普通分支才解除禁用，首开该切片时 AI 入口保持灰色。
+    if (els.aiBtn) els.aiBtn.disabled = false;
+    if (els.tbbMoreAi) els.tbbMoreAi.disabled = false;  // ⋯ 面板里的 AI 钮同步
     // 通道配色重开（同一切片换 TileSource，§8.2）：走轻量路径——只同步倍率
     // 徽章与底图缩略图；不退绘制模式、不重置标注/AI 面板。slide.opened 仍经
     // emitSlideOpened 补发（键相同自动去重，见上），不再无条件吞掉。
@@ -896,9 +904,6 @@
     els.annoAllBtn.disabled = true;
     els.annoPanel.style.display = "none";
     annoPanelOpen = false;
-    // AI 助手：启用触发按钮（插件停用时 aiBtn 不渲染，跳过；平台人工读片不受影响）
-    if (els.aiBtn) els.aiBtn.disabled = false;
-    if (els.tbbMoreAi) els.tbbMoreAi.disabled = false;  // ⋯ 面板里的 AI 钮同步
     syncAnnoAllBtns();
     state.showAnno = false;
     state.focusAnno = null;
@@ -4584,7 +4589,14 @@
         .then(function (r) {
           if (!r.ok) return null;  // 403/404/409 等：任务没了 → 重新创建
           return r.json().then(function (body) {
-            if (!body || body.state !== "active") return null;
+            if (!body) return null;
+            if (body.state === "committed") {
+              // commit 已收口但转换入队/响应可能丢失：重放 commit 取 conversion_job_id
+              return { upload_id: saved.upload_id, committed: true,
+                       chunk_size: body.chunk_size,
+                       offset: body.confirmed_offset | 0 };
+            }
+            if (body.state !== "active") return null;
             return { upload_id: saved.upload_id,
                      chunk_size: body.chunk_size,
                      offset: body.confirmed_offset | 0 };
@@ -4615,7 +4627,8 @@
         });
       });
     }).then(function () {
-      // 3) 串行传完全部分片
+      // 3) 串行传完全部分片；committed 恢复跳过 PUT，直接重放 commit
+      if (task && task.committed) return;
       return uploadV2Chunks(file, task, row);
     }).then(function () {
       // 4) 服务端校验（commit 三段式：整文件复算 + OpenSlide + 原子提升）
@@ -4627,13 +4640,18 @@
         if (!r.ok) throw { status: r.status, data: body };
         return body;
       });
-    }).then(function () {
+    }).then(function (body) {
       try { localStorage.removeItem(key); } catch (e) { /* 同上 */ }
+      if (body && body.conversion_job_id && body.state && body.state !== "ready") {
+        return pollConversionJob(body, row);
+      }
+      var openName = (body && body.state === "ready" && body.canonical_name)
+        ? body.canonical_name : file.name;
       row.setStage("upload.stage.done");
       row.finish();
-      toast(t("upload.done", { name: file.name }), "success");
+      toast(t("upload.done", { name: openName }), "success");
       loadAll();
-      openSlide(file.name);
+      openSlide(openName);
     }).catch(function (err) {
       var data = (err && err.data) || null;
       var status = (err && err.status) || 0;
@@ -4657,6 +4675,49 @@
       row.finish(10000);
       toast(t("upload.fail", { e: msg }), "error");
     });
+  }
+
+  function pollConversionJob(body, row) {
+    var jobId = body.conversion_job_id;
+    var canonical = body.canonical_name;
+    row.setStage("upload.stage.converting");
+    var started = Date.now();
+    var maxMs = 15 * 60 * 1000;
+    function tick() {
+      if (Date.now() - started > maxMs) {
+        row.markError();
+        row.setStage("upload.stage.failed");
+        row.finish(10000);
+        toast(t("upload.fail", { e: t("upload.err.conversion") }), "error");
+        return;
+      }
+      apiFetch("/api/conversions/" + encodeURIComponent(jobId))
+        .then(function (r) { return r.json().then(function (j) {
+          return { ok: r.ok, body: j };
+        }); })
+        .then(function (res) {
+          var st = res.body && res.body.state;
+          if (st === "ready") {
+            var name = (res.body.canonical_name || canonical);
+            row.setStage("upload.stage.done");
+            row.finish();
+            toast(t("upload.done", { name: name }), "success");
+            loadAll();
+            if (name) openSlide(name);
+            return;
+          }
+          if (st === "failed" || st === "cancelled") {
+            row.markError();
+            row.setStage("upload.stage.failed");
+            row.finish(10000);
+            toast(t("upload.fail", { e: t("upload.err.conversion") }), "error");
+            return;
+          }
+          setTimeout(tick, 2000);
+        })
+        .catch(function () { setTimeout(tick, 3000); });
+    }
+    tick();
   }
 
   function uploadFile(file) {
@@ -4684,11 +4745,17 @@
       var data;
       try { data = JSON.parse(xhr.responseText); } catch (e) { row.finish(); toast(t("upload.parse.fail"), "error"); return; }
       if (xhr.status >= 200 && xhr.status < 300) {
+        if (data && data.conversion_job_id && data.state && data.state !== "ready") {
+          pollConversionJob(data, row);
+          return;
+        }
+        var openName = (data && data.state === "ready" && data.canonical_name)
+          ? data.canonical_name : data.name;
         row.setStage("upload.stage.done");
         row.finish();
-        toast(t("upload.done", { name: data.name }), "success");
+        toast(t("upload.done", { name: openName }), "success");
         loadAll();
-        openSlide(data.name);
+        openSlide(openName);
       } else {
         row.markError();
         row.setStage("upload.stage.failed");

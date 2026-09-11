@@ -102,6 +102,9 @@ import acquisition_store
 # Decimal 精确换算），Admin API v1 的 provider balance refresh 复用。
 import billing_store
 import billing_pricing
+import conversion_store
+import slide_format_registry
+from kfb import KfbError, parse_kfb
 # 批次 B 金额额度 policy/window 数据层（docs
 # ai-money-budget-bugfix-and-simplification-plan.md §3.1/§3.2/§8）：spend_store
 # 提供周/月窗口边界、策略解析（override→default 回退）、get_or_create 窗口与
@@ -225,6 +228,141 @@ SUPPORTED_EXTS = {
 }
 # 归档扩展名：zip 上传后解压（用于 MRXS 等需要伴侣数据目录的格式）
 ARCHIVE_EXTS = {"zip"}
+
+
+def _upload_ext_allowed(safe_name):
+    """原生切片或 convert-required（KFB）。KFBF / 未知仍拒绝。"""
+    ext = safe_name.rsplit(".", 1)[-1].lower() if "." in safe_name else ""
+    if ext in SUPPORTED_EXTS or ext in ARCHIVE_EXTS:
+        return True
+    return slide_format_registry.lookup(safe_name)["capability"] == \
+        slide_format_registry.CAP_CONVERT_REQUIRED
+
+
+def _needs_conversion(safe_name):
+    return slide_format_registry.lookup(safe_name)["capability"] == \
+        slide_format_registry.CAP_CONVERT_REQUIRED
+
+
+def _canonical_name_for(source_safe):
+    info = slide_format_registry.lookup(source_safe)
+    stem = source_safe.rsplit(".", 1)[0]
+    ext = info.get("canonical_ext") or ".tif"
+    if not ext.startswith("."):
+        ext = "." + ext
+    return stem + ext
+
+
+def _probe_kfb_or_fail(path):
+    """commit 期只做解析探测，不转换。成功返回 header 摘要。"""
+    doc = parse_kfb(path)
+    try:
+        return {
+            "width": doc.header.width_px,
+            "height": doc.header.height_px,
+            "levels": doc.header.level_count,
+            "mpp": doc.header.mpp_x,
+            "format": ("kfb_kfbio_jpeg" if doc.header.version != 1
+                       else "kfb_bf_v1"),
+        }
+    finally:
+        doc.close()
+
+
+def _upload_name_conflict(safe):
+    """源名、canonical 名、进行中转换任务任一占用则冲突。"""
+    if (UPLOAD_DIR / safe).exists():
+        return True
+    if conversion_store.canonical_is_live(safe):
+        return True
+    if _needs_conversion(safe):
+        canon = _canonical_name_for(safe)
+        if (UPLOAD_DIR / canon).exists():
+            return True
+        if conversion_store.canonical_is_live(canon):
+            return True
+    return False
+
+
+def _enqueue_conversion(ident, *, source_name, source_sha256, upload_id,
+                        source_format):
+    canonical = _canonical_name_for(source_name)
+    product = (UPLOAD_DIR / canonical).is_file()
+    if product and not conversion_store.canonical_is_live(canonical):
+        # 目录里已有同名 TIFF，且不是本转换任务占用
+        raise FileExistsError(canonical)
+    try:
+        job = conversion_store.create_job(
+            owner_user_id=(ident or {}).get("user_id") or "",
+            upload_id=upload_id,
+            source_name=source_name,
+            source_sha256=source_sha256,
+            source_format=source_format,
+            canonical_name=canonical,
+            product_exists=product)
+    except conversion_store.NameConflict as e:
+        raise FileExistsError(canonical) from e
+    return job, canonical
+
+
+def _owned_committed_upload(ident, safe_name):
+    """当前身份下、该 safe_name 最近一条 committed 上传任务。"""
+    owner = (ident or {}).get("user_id") or ""
+    try:
+        tasks = upload_task_store.list_tasks(
+            owner_user_id=owner, state=upload_task_store.STATE_COMMITTED)
+    except Exception:
+        return None
+    for task in reversed(tasks):
+        if task.get("safe_name") == safe_name:
+            return task
+    return None
+
+
+def _ensure_conversion_job(ident, *, source_name, source_sha256, upload_id,
+                           source_format=None):
+    """committed 源文件上幂等补建/复用转换任务（崩溃、500、重放）。"""
+    job = conversion_store.get_job_by_upload_id(upload_id)
+    src = UPLOAD_DIR / source_name
+    if job and job.get("state") == "ready":
+        canon = job.get("canonical_name") or _canonical_name_for(source_name)
+        if (UPLOAD_DIR / canon).is_file():
+            return job, canon
+    if not src.is_file():
+        if job:
+            return job, job.get("canonical_name") or _canonical_name_for(source_name)
+        raise FileNotFoundError(source_name)
+    if not source_format:
+        source_format = _probe_kfb_or_fail(src)["format"]
+    return _enqueue_conversion(
+        ident, source_name=source_name, source_sha256=source_sha256,
+        upload_id=upload_id, source_format=source_format)
+
+
+def _conversion_accepted_body(job):
+    view = conversion_store.public_view(job)
+    view["status"] = "conversion_pending"
+    return view
+
+
+def _cleanup_conversion_sidecars(canonical_name):
+    """删除 canonical 时一并清源 KFB、manifest、associated，并作废转换任务。"""
+    job = conversion_store.get_job_by_canonical(canonical_name)
+    if job and job.get("source_name"):
+        src = UPLOAD_DIR / job["source_name"]
+        if src.is_file() and _needs_conversion(job["source_name"]):
+            src.unlink(missing_ok=True)
+    try:
+        conversion_store.invalidate_by_canonical(canonical_name)
+    except Exception:
+        app.logger.warning("作废 conversion_jobs 失败：%s", canonical_name,
+                           exc_info=True)
+    man = UPLOAD_DIR / (canonical_name + ".manifest.json")
+    man.unlink(missing_ok=True)
+    assoc = UPLOAD_DIR / (canonical_name + ".associated")
+    if assoc.is_dir():
+        shutil.rmtree(assoc, ignore_errors=True)
+
 
 # 分享服务基础 URL（外部用户访问入口，生产部署用 env 覆盖，如 https://slides.example.com）
 SHARE_BASE_URL = os.environ.get(
@@ -6238,7 +6376,8 @@ PROVIDER_BALANCE_REFRESH_MIN_INTERVAL_SECONDS = 60.0
 #: 成功章——否则一次失败后 60s 内重试只得 429，真实错误被节流掩盖
 PROVIDER_BALANCE_REFRESH_FAILURE_RETRY_SECONDS = 10.0
 _provider_balance_refresh_state = {"last_ok_attempt": 0.0,
-                                   "last_fail_attempt": 0.0}
+                                   "last_fail_attempt": 0.0,
+                                   "in_flight": False}
 _provider_balance_refresh_lock = threading.Lock()
 #: provider balance 的固定 provider id（当前唯一官方来源）
 BILLING_BALANCE_PROVIDER = "deepseek"
@@ -6864,8 +7003,10 @@ def admin_v1_billing_provider_balance_refresh():
     - 简单节流（进程内，请求发出**前不预盖章**，成功/失败分账——2026-09-11
       可诊断性修复）：距上次**成功** <
       PROVIDER_BALANCE_REFRESH_MIN_INTERVAL_SECONDS（缺省 60s）或距上次
-      **失败** < PROVIDER_BALANCE_REFRESH_FAILURE_RETRY_SECONDS（10s）→
-      429 refresh_throttled（message 带还需等待的秒数）；
+      **失败** < PROVIDER_BALANCE_REFRESH_FAILURE_RETRY_SECONDS（10s）或
+      已有请求 in-flight → 429 refresh_throttled（message 带还需等待的秒数）。
+      in-flight 在锁内原子占用、finally 释放，避免首个上游请求未完成时后续
+      请求都穿过历史完成时间检查并打到上游。
     - 失败错误类别（稳定 code）：provider_not_configured /
       provider_unreachable / provider_rejected（4xx）/ provider_error（5xx、
       响应形态异常）/ invalid_balance_response（金额解析失败）。
@@ -6880,9 +7021,22 @@ def admin_v1_billing_provider_balance_refresh():
             429, "refresh_throttled",
             "刷新过于频繁，还需等待 %ds 再试" % wait_seconds)
 
+    cfg = _load_ai_config()
+    if _effective_provider_kind(cfg) != AI_PROVIDER_DEEPSEEK_OFFICIAL:
+        # 配置类拒绝发生在请求发出前，不消耗节流窗口 / in-flight
+        return _admin_v1_error(
+            400, "provider_not_configured",
+            "provider balance 仅支持 deepseek_official 官方配置")
+    api_key = str(cfg.get("api_key") or "").strip()
+    if not api_key:
+        return _admin_v1_error(
+            400, "provider_not_configured", "官方 API key 未配置")
+
     with _provider_balance_refresh_lock:
         now = time.time()
         state = _provider_balance_refresh_state
+        if state.get("in_flight"):
+            return _throttled(1)
         ok_wait = math.ceil(PROVIDER_BALANCE_REFRESH_MIN_INTERVAL_SECONDS
                             - (now - state["last_ok_attempt"]))
         if ok_wait > 0:
@@ -6891,17 +7045,16 @@ def admin_v1_billing_provider_balance_refresh():
                               - (now - state["last_fail_attempt"]))
         if fail_wait > 0:
             return _throttled(fail_wait)
+        state["in_flight"] = True
 
-    cfg = _load_ai_config()
-    if _effective_provider_kind(cfg) != AI_PROVIDER_DEEPSEEK_OFFICIAL:
-        # 配置类拒绝发生在请求发出前，不消耗任何节流窗口
-        return _admin_v1_error(
-            400, "provider_not_configured",
-            "provider balance 仅支持 deepseek_official 官方配置")
-    api_key = str(cfg.get("api_key") or "").strip()
-    if not api_key:
-        return _admin_v1_error(
-            400, "provider_not_configured", "官方 API key 未配置")
+    try:
+        return _admin_v1_billing_provider_balance_refresh_body(cfg, api_key)
+    finally:
+        with _provider_balance_refresh_lock:
+            _provider_balance_refresh_state["in_flight"] = False
+
+
+def _admin_v1_billing_provider_balance_refresh_body(cfg, api_key):
     base = str(cfg.get("base_url") or DEEPSEEK_BASE_URL).strip().rstrip("/")
     url = base + "/user/balance"
 
@@ -9148,13 +9301,15 @@ def api_upload():
     if ext in ARCHIVE_EXTS:
         return _api_upload_zip(file, filename, safe, ident, reservation)
 
-    if ext not in SUPPORTED_EXTS:
+    if ext not in SUPPORTED_EXTS and not _upload_ext_allowed(safe):
         _upload_release_quietly(reservation)
         return jsonify(error="不支持的文件类型"), 400
 
     dest = UPLOAD_DIR / safe
-    if dest.exists():
-        # 统一文案：不回显已存在的（可能跨用户的）真实文件名（docs §3.12）
+    # convert-required 且源已落盘：先收本次内容再按原任务/owner/摘要恢复，
+    # 不能只凭文件名把他人源文件交给当前请求者。
+    allow_kfb_recover = _needs_conversion(safe) and dest.is_file()
+    if (dest.exists() or _upload_name_conflict(safe)) and not allow_kfb_recover:
         _upload_release_quietly(reservation)
         return jsonify(error="名称不可用", code="name_unavailable"), 409
 
@@ -9180,7 +9335,16 @@ def api_upload():
     # 只捕获 SlideValidationError，按稳定机器码返回 400（未知异常已在
     # _validate_slide_file 内收敛为 slide_open_failed）。
     try:
-        _validate_slide_file(tmp, format_hint=safe)
+        if allow_kfb_recover:
+            pass  # 恢复路径用内容摘要比对，不把本次垃圾当 KFB 解析
+        elif _needs_conversion(safe):
+            _probe_kfb_or_fail(tmp)
+        else:
+            _validate_slide_file(tmp, format_hint=safe)
+    except KfbError as e:
+        tmp.unlink(missing_ok=True)
+        _upload_release_quietly(reservation)
+        return jsonify(error="无效的 KFB 文件", code=e.code), 400
     except slide_io.SlideValidationError as e:
         tmp.unlink(missing_ok=True)
         _upload_release_quietly(reservation)
@@ -9195,6 +9359,31 @@ def api_upload():
         tmp.unlink(missing_ok=True)
         _upload_release_quietly(reservation)
         return jsonify(error=f"保存失败: {e}"), 400
+
+    if allow_kfb_recover:
+        owned = _owned_committed_upload(ident, safe)
+        try:
+            dest_sha = _sha256_file(dest)
+        except OSError:
+            dest_sha = ""
+        task_sha = ((owned or {}).get("sha256_actual") or "").lower()
+        tmp.unlink(missing_ok=True)
+        _upload_release_quietly(reservation)
+        if not (owned and dest_sha and dest_sha == file_sha == task_sha):
+            return jsonify(error="名称不可用", code="name_unavailable"), 409
+        try:
+            job, _canon = _ensure_conversion_job(
+                ident, source_name=safe, source_sha256=file_sha,
+                upload_id=owned["upload_id"])
+        except Exception:
+            app.logger.exception("V1 KFB 原任务恢复失败：%s", safe)
+            return jsonify(error="转换任务创建失败"), 500
+        body = _conversion_accepted_body(job)
+        if job.get("state") == "ready":
+            body["status"] = "ok"
+            body["name"] = job.get("canonical_name")
+            return jsonify(body), 200
+        return jsonify(body), 202
 
     # ---- task intent：commit token + manifest 持久化（提升之前，G7 步骤 1）----
     intent, err = _upload_legacy_intent(
@@ -9219,19 +9408,20 @@ def api_upload():
         _upload_legacy_fail(upload_id, token, task, permanent=False)
         return jsonify(error=f"保存失败: {e}"), 400
 
-    # ---- 建立归属（slide_meta.owner_user_id = 上传者；guest 已在 can_upload 拦截）----
-    try:
-        share_store.set_slide_meta(safe, owner_user_id=ident["user_id"],
-                                   requester_role=ident["role"])
-    except PermissionError:
-        _upload_legacy_fail(upload_id, token, task, permanent=True,
-                            remove_names=(safe,))
-        return jsonify(error="无上传权限"), 403
-    except Exception:
-        app.logger.exception("V1 上传归属登记失败：%s", upload_id)
-        _upload_legacy_fail(upload_id, token, task, permanent=False,
-                            remove_names=(safe,))
-        return jsonify(error="归属登记失败，请重试"), 503
+    # ---- 建立归属（convert-required 源文件不对 Viewer 可见，不写 slide_meta）----
+    if not _needs_conversion(safe):
+        try:
+            share_store.set_slide_meta(safe, owner_user_id=ident["user_id"],
+                                       requester_role=ident["role"])
+        except PermissionError:
+            _upload_legacy_fail(upload_id, token, task, permanent=True,
+                                remove_names=(safe,))
+            return jsonify(error="无上传权限"), 403
+        except Exception:
+            app.logger.exception("V1 上传归属登记失败：%s", upload_id)
+            _upload_legacy_fail(upload_id, token, task, permanent=False,
+                                remove_names=(safe,))
+            return jsonify(error="归属登记失败，请重试"), 503
 
     # ---- 短事务 B：committed + 配额同事务转实占（G7 收口；崩溃后由恢复扫描
     #      幂等补账，文件已持久提升，请求仍按成功返回）----
@@ -9241,6 +9431,14 @@ def api_upload():
     except upload_task_store.StateConflict as e:
         cur = e.task or {}
         if cur.get("state") == upload_task_store.STATE_COMMITTED:
+            if _needs_conversion(safe):
+                try:
+                    job, _c = _ensure_conversion_job(
+                        ident, source_name=safe, source_sha256=file_sha,
+                        upload_id=upload_id)
+                    return jsonify(_conversion_accepted_body(job)), 202
+                except Exception:
+                    app.logger.exception("V1 committed 补建 conversion 失败")
             return jsonify(name=safe)
         # 恢复流程已回滚（提升被撤/未提升）：清孤儿文件并允许重试
         app.logger.warning("V1 上传收口被恢复流程回滚：%s", upload_id)
@@ -9259,6 +9457,22 @@ def api_upload():
         app.logger.exception(
             "V1 上传收口失败（任务保持 committing，由恢复扫描幂等补账）：%s",
             upload_id)
+    if _needs_conversion(safe):
+        try:
+            job, _canon = _ensure_conversion_job(
+                ident, source_name=safe, source_sha256=file_sha,
+                upload_id=upload_id)
+        except FileExistsError:
+            return jsonify(error="名称不可用", code="name_unavailable"), 409
+        except Exception:
+            app.logger.exception("V1 转换任务创建失败：%s", upload_id)
+            return jsonify(error="转换任务创建失败"), 500
+        body = _conversion_accepted_body(job)
+        if job.get("state") == "ready":
+            body["status"] = "ok"
+            body["name"] = job.get("canonical_name")
+            return jsonify(body), 200
+        return jsonify(body), 202
     return jsonify(name=safe)
 
 
@@ -9547,7 +9761,8 @@ def _upload_v2_recover_commit(task):
     sha = task.get("sha256_actual") or ""
     size = int(task["declared_size"])
     try:
-        _upload_v2_set_ownership(task)
+        if not _needs_conversion(task.get("safe_name") or ""):
+            _upload_v2_set_ownership(task)
     except Exception:
         app.logger.exception(
             "upload task %s 恢复时 ownership 失败，保持 committing", upload_id)
@@ -9594,7 +9809,8 @@ def _upload_v2_maintain(task):
             task = _upload_legacy_recover_commit(task)
         else:
             task = _upload_v2_recover_commit(task)
-    if task["state"] == upload_task_store.STATE_COMMITTED:
+    if (task["state"] == upload_task_store.STATE_COMMITTED
+            and not _needs_conversion(task.get("safe_name") or "")):
         # 已 committed 但崩溃窗口里漏写 slide_meta 时，GET 路径校正归属。
         try:
             meta = share_store.get_slide_meta_full(task["safe_name"])
@@ -9606,7 +9822,7 @@ def _upload_v2_maintain(task):
     return task
 
 
-def _upload_v2_state_body(task, **extra):
+def _upload_v2_state_dict(task, **extra):
     """GET/PUT/commit 共用的服务端权威进度快照（供刷新恢复，§3.5）。"""
     body = {
         "upload_id": task["upload_id"],
@@ -9617,7 +9833,42 @@ def _upload_v2_state_body(task, **extra):
                        if task.get("expires_at") else None),
     }
     body.update(extra)
-    return jsonify(body)
+    return body
+
+
+def _upload_v2_state_body(task, **extra):
+    return jsonify(_upload_v2_state_dict(task, **extra))
+
+
+def _v2_committed_conversion_response(ident, task):
+    """committed 的 convert-required 上传：补建任务并返回 202/200。"""
+    sha = task.get("sha256_actual") or ""
+    payload = _upload_v2_state_dict(task, sha256=sha)
+    try:
+        job, _canon = _ensure_conversion_job(
+            ident, source_name=task["safe_name"], source_sha256=sha,
+            upload_id=task["upload_id"])
+    except FileExistsError:
+        payload["code"] = "name_unavailable"
+        return jsonify(payload), 409
+    except Exception:
+        app.logger.exception(
+            "补建 conversion job 失败 upload=%s", task.get("upload_id"))
+        payload.update(_conversion_accepted_body({
+            "id": None, "state": "queued",
+            "source_name": task["safe_name"],
+            "canonical_name": _canonical_name_for(task["safe_name"]),
+            "source_format": "kfb", "attempt": 0, "error_code": None,
+            "created_at": None, "finished_at": None,
+        }))
+        # 没有 job id 时仍 202，前端无法轮询——应 500 让客户端重试 commit
+        return jsonify(error="转换任务创建失败"), 500
+    payload.update(_conversion_accepted_body(job))
+    if job.get("state") == "ready":
+        payload["status"] = "ok"
+        payload["name"] = job.get("canonical_name")
+        return jsonify(payload), 200
+    return jsonify(payload), 202
 
 
 def _upload_acquire_reservation_exact(ident, nbytes):
@@ -9675,7 +9926,7 @@ def api_uploads_create():
         return jsonify(
             error="ZIP/MRXS 暂不支持分片上传，请使用旧 /api/upload 单请求上传",
             code="use_legacy_upload"), 400
-    if ext not in SUPPORTED_EXTS:
+    if ext not in SUPPORTED_EXTS and not _upload_ext_allowed(safe):
         return jsonify(error="不支持的文件类型"), 400
 
     try:
@@ -9694,7 +9945,7 @@ def api_uploads_create():
             return jsonify(error="sha256_expected 需为 64 位十六进制"), 400
         sha256_expected = sha256_expected.strip().lower()
 
-    if (UPLOAD_DIR / safe).exists():
+    if (UPLOAD_DIR / safe).exists() or _upload_name_conflict(safe):
         return jsonify(error="名称不可用", code="name_unavailable"), 409
 
     # 初始化即预占（§3.3 防护前移：任何分片 body 接收之前）+ 磁盘水位
@@ -9917,6 +10168,8 @@ def api_uploads_commit(upload_id):
         return err
     task = _upload_v2_maintain(task)
     if task["state"] == upload_task_store.STATE_COMMITTED:
+        if _needs_conversion(task.get("safe_name") or ""):
+            return _v2_committed_conversion_response(ident, task)
         return _upload_v2_state_body(task, sha256=task.get("sha256_actual"))
     if task["state"] != upload_task_store.STATE_ACTIVE:
         return jsonify(error="任务状态 %s 不可 commit" % task["state"],
@@ -9976,11 +10229,21 @@ def api_uploads_commit(upload_id):
         return _deterministic_fail(
             "hash_mismatch", "整文件 SHA-256 与期望不符", sha=sha_actual)
 
-    # ---- 事务外 3：OpenSlide 试开验证（**在提升之前**，§2.3 纠正）----
-    # A0：传 task 的 safe_name 作 format_hint（.part 临时名不参与格式判定）；
-    # 验证失败 → _deterministic_fail 携同一稳定机器码（预占释放，终态幂等）。
+    # ---- 事务外 3：格式探测（**在提升之前**）。convert-required 只 parse，
+    # 不在 Gunicorn 内转换；原生格式仍走 OpenSlide 试开。
+    convert_probe = None
     try:
-        _validate_slide_file(part, format_hint=task["safe_name"])
+        if _needs_conversion(task["safe_name"]):
+            convert_probe = _probe_kfb_or_fail(part)
+            canon = _canonical_name_for(task["safe_name"])
+            if ((UPLOAD_DIR / canon).exists()
+                    or conversion_store.canonical_is_live(canon)):
+                return _deterministic_fail("name_unavailable", "名称不可用",
+                                           sha=sha_actual)
+        else:
+            _validate_slide_file(part, format_hint=task["safe_name"])
+    except KfbError as e:
+        return _deterministic_fail(e.code, "无效的 KFB 文件", sha=sha_actual)
     except slide_io.SlideValidationError as e:
         app.logger.warning(
             "upload.validate_failed stage=v2_commit code=%s upload=%s exc=%s"
@@ -9999,16 +10262,17 @@ def api_uploads_commit(upload_id):
     except OSError as e:
         return _rollback_temp("文件提升失败: %s" % e)
 
-    # ---- ownership 入库（提升之后、收口之前；失败清孤儿文件并回滚）----
-    try:
-        _upload_v2_set_ownership(task, ident)
-    except PermissionError:
-        dest.unlink(missing_ok=True)
-        return _rollback_temp("无上传权限", status=403)
-    except Exception:
-        app.logger.exception("upload task ownership failed: %s", upload_id)
-        dest.unlink(missing_ok=True)
-        return _rollback_temp("归属登记失败")
+    # ---- ownership 入库（convert-required 源不对 Viewer 可见，跳过）----
+    if not _needs_conversion(task["safe_name"]):
+        try:
+            _upload_v2_set_ownership(task, ident)
+        except PermissionError:
+            dest.unlink(missing_ok=True)
+            return _rollback_temp("无上传权限", status=403)
+        except Exception:
+            app.logger.exception("upload task ownership failed: %s", upload_id)
+            dest.unlink(missing_ok=True)
+            return _rollback_temp("归属登记失败")
 
     # ---- 短事务 B：token 匹配且仍 committing → committed，配额同事务转实占 ----
     try:
@@ -10022,6 +10286,8 @@ def api_uploads_commit(upload_id):
         cur = e.task or {}
         if cur.get("state") == upload_task_store.STATE_COMMITTED:
             # 惰性恢复已按提升文件收口完成：以库内现状为准
+            if _needs_conversion(cur.get("safe_name") or ""):
+                return _v2_committed_conversion_response(ident, cur)
             return _upload_v2_state_body(cur, sha256=cur.get("sha256_actual"))
         # 恢复流程已回滚 active：清掉本次孤儿提升，允许重试
         dest.unlink(missing_ok=True)
@@ -10031,6 +10297,8 @@ def api_uploads_commit(upload_id):
         return jsonify(error="无上传权限"), 403
 
     _upload_v2_cleanup_part(task)
+    if convert_probe is not None:
+        return _v2_committed_conversion_response(ident, task)
     return _upload_v2_state_body(task, sha256=sha_actual)
 
 
@@ -10058,6 +10326,22 @@ def api_uploads_cancel(upload_id):
         _upload_v2_cleanup_part(task)
         _upload_v2_release_reservation_quietly(task)
     return jsonify(upload_id=upload_id, state=task["state"])
+
+
+@app.route("/api/conversions/<job_id>", methods=["GET"])
+def api_conversion_get(job_id):
+    """查询转换任务（仅 owner 或任务归属者）。"""
+    if not can_upload():
+        return jsonify(error="无上传权限"), 403
+    job = conversion_store.get_job(job_id)
+    if not job:
+        return jsonify(error="转换任务不存在", code="conversion_not_found"), 404
+    ident = current_identity()
+    owner = job.get("owner_user_id") or ""
+    me = ident.get("user_id") or ""
+    if ident.get("role") != user_store.ROLE_OWNER and owner and owner != me:
+        return jsonify(error="转换任务不存在", code="conversion_not_found"), 404
+    return jsonify(conversion_store.public_view(job))
 
 
 @app.route("/api/slide/<name>", methods=["DELETE"])
@@ -10098,6 +10382,11 @@ def api_slide_delete(name):
         (UPLOAD_DIR / safe).unlink()
     except FileNotFoundError:
         pass
+    try:
+        _cleanup_conversion_sidecars(safe)
+    except Exception:
+        app.logger.warning("切片删除的转换 sidecar 清理失败：%s", safe,
+                           exc_info=True)
     # MRXS：删除伴侣数据目录（先做安全检查确保在 UPLOAD_DIR 内）
     if safe.lower().endswith(".mrxs"):
         stem = safe[: -len(".mrxs")]
@@ -16373,23 +16662,21 @@ def api_ai_run():
     _audit("ai.run", target_type="session", slide=slide, detail=audit_detail)
     # fix-2026-09-11：run 被接受（_proxy_sse 从 X-AI-Session-ID 解析出新 sid
     # 触发 on_accepted）且本请求携带 allow_ai_drawing=True 时，为新 sid 写
-    # PT 镜像——走 drawing 代理端点同款的 reserve/CAS（初始 generation，与
-    # 既有 generation/CAS 机制一致，不与并发 toggle 相互覆盖：被更晚的开关
-    # 请求超越即 no-op）。HP 侧 session 已在创建时落 allow=true，这里只对齐
-    # mirror、消除 mirror.stale 假警报；写失败仅记日志并照常返回——HP 侧已
-    # 生效，用户可再拨一次开关修复 mirror，绝不因此回滚已开始的 run。
+    # PT 镜像。只在行不存在时初始化 true——HP 去重重放 / 迟到 on_accepted
+    # 不得覆盖用户已关闭（或任何已有开关意图）。HP 侧 session 已在创建时
+    # 落 allow=true，这里只对齐 mirror、消除 mirror.stale 假警报；写失败仅
+    # 记日志并照常返回——HP 侧已生效，用户可再拨一次开关修复 mirror，绝不
+    # 因此回滚已开始的 run。
     _budget_on_accepted = prep["on_accepted"]
 
     def on_accepted_with_drawing(hp_session_id):
         if draft_allow_drawing is True and hp_session_id:
             try:
-                req_gen = share_store.reserve_ai_session_drawing_generation(
-                    hp_session_id)
-                if not share_store.cas_ai_session_drawing_flag(
-                        hp_session_id, True, req_gen):
-                    app.logger.warning(
-                        "ai drawing 创建参数镜像 CAS no-op（session=%s）——"
-                        "已被更晚的开关请求取代", hp_session_id)
+                if not share_store.init_ai_session_drawing_flag(
+                        hp_session_id, True):
+                    app.logger.info(
+                        "ai drawing 创建参数镜像已存在，不覆盖（session=%s）",
+                        hp_session_id)
             except Exception:
                 app.logger.exception(
                     "ai drawing 创建参数镜像写入失败（session=%s）；HP 侧已"

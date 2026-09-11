@@ -104,6 +104,27 @@ case "$_mail_worker" in
     ;;
 esac
 
+# ---------------------------------------------------------------------------
+# KFB 转换 worker（Phase B）：conversion_jobs 排水。独立于 Gunicorn。
+# CONVERSION_WORKER=0/false/no/off 关闭。
+# ---------------------------------------------------------------------------
+_cv_worker="$(printf '%s' "${CONVERSION_WORKER:-1}" | tr '[:upper:]' '[:lower:]')"
+case "$_cv_worker" in
+  0|false|no|off)
+    echo "[entry] CONVERSION_WORKER=$_cv_worker, skip conversion worker"
+    ;;
+  *)
+    echo "[entry] starting conversion_worker --loop"
+    (
+      while :; do
+        python3 /app/conversion_worker.py --loop || true
+        echo "[entry] conversion_worker exited, restart in 2s" >&2
+        sleep 2
+      done
+    ) &
+    ;;
+esac
+
 exec gunicorn app:app \
   -b "0.0.0.0:${PORT:-8000}" \
   -w "${GUNICORN_WORKERS:-2}" \

@@ -554,6 +554,26 @@ def consume_reservation(reservation_id, actual_bytes):
         conn.close()
 
 
+def add_used_bytes(user_id, nbytes):
+    """转换产出等额外入账：直接累加 used_bytes（无 reservation）。
+
+    owner / 空 user_id 跳过。nbytes<=0 为 no-op。
+    """
+    if not user_id or int(nbytes) <= 0:
+        return None
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE upload_user_quotas SET used_bytes = used_bytes + %s, "
+                    "updated_at=now() WHERE user_id=%s",
+                    (int(nbytes), user_id))
+                return cur.rowcount
+    finally:
+        conn.close()
+
+
 # --------------------------------------------------------------------------- #
 # 默认值依据汇总（上线前复核清单；详见各常量处注释）
 # --------------------------------------------------------------------------- #

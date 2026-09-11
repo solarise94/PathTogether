@@ -16,6 +16,8 @@
       true → 伪造 polygon 不再 403；fresh 不带 flag（含显式 false）→ 不透传
       不镜像，闸门回归仍 403；非 fresh 带 true → 400 invalid_argument；非
       布尔（含显式 null）→ 400。
+    - 创建成功后关闭描绘，再重放同一 session 的创建接受路径：镜像保持
+      false（仅不存在时初始化，禁止 reserve+CAS 把已关闭闸门写回 true）。
   P1-5 来源快照溯源：
     - polygon 缺 snapshot_id → 400 invalid_request，不落库；
     - snapshot_bbox 畸形 → 400（不把垃圾持久化）；
@@ -485,6 +487,24 @@ def test_store_mirror_generation_cas(monkeypatch):
     assert share_store.get_ai_session_drawing_flag("s-cas-new") is True
     with pytest.raises(ValueError):
         share_store.cas_ai_session_drawing_flag("s-cas", True, -1)
+
+
+def test_store_init_drawing_flag_does_not_overwrite():
+    """创建参数镜像：仅不存在时插入，已有行（含关闭后 false）不覆盖、不抬代。"""
+    assert share_store.init_ai_session_drawing_flag("s-init", True) is True
+    assert share_store.get_ai_session_drawing_flag("s-init") is True
+    assert share_store.get_ai_session_drawing_generation("s-init") == 1
+    # 已存在 true：再次 init 不改
+    assert share_store.init_ai_session_drawing_flag("s-init", True) is False
+    assert share_store.get_ai_session_drawing_flag("s-init") is True
+    assert share_store.get_ai_session_drawing_generation("s-init") == 1
+    share_store.upsert_ai_session_drawing_flag("s-init", False)
+    gen = share_store.get_ai_session_drawing_generation("s-init")
+    assert share_store.get_ai_session_drawing_flag("s-init") is False
+    # 关闭后再 init true：不得把闸门写回 true，也不得抬 generation
+    assert share_store.init_ai_session_drawing_flag("s-init", True) is False
+    assert share_store.get_ai_session_drawing_flag("s-init") is False
+    assert share_store.get_ai_session_drawing_generation("s-init") == gen
 
 
 def test_proxy_stale_open_response_cannot_override_later_close(monkeypatch):
@@ -1094,3 +1114,46 @@ def test_run_rejects_non_boolean_flag(monkeypatch):
         assert r.get_json()["code"] == "invalid_argument"
     assert fake.calls == []
     assert share_store.get_ai_session_drawing_flag("sess1") is None
+
+
+def test_run_create_param_replay_does_not_reopen_closed_mirror(monkeypatch):
+    """fresh+allow_ai_drawing=true 创建成功后用户关闭描绘，再重放同一 sid
+    的创建接受路径：HP 去重不改开关；PT 不得 reserve+CAS 把镜像写回 true。"""
+    fake = _setup_run_env(monkeypatch)
+    _register_run_sse(fake, "sess-replay-1")
+    _mock_proxy_owner(monkeypatch)
+    c = _browser_client(app_mod.app)
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide": "demo.svs", "task": "看全片", "allow_ai_drawing": True,
+        "request_id": "req-draw-replay-1"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert share_store.get_ai_session_drawing_flag("sess-replay-1") is True
+
+    fake.register("POST", "/session/sess-replay-1/drawing",
+                  lambda b, q, h, k: FakeResponse(
+                      200, {"ok": True, "allow_ai_drawing": False}))
+    r_off = c.post("/api/ai/session/sess-replay-1/drawing",
+                   json={"enabled": False})
+    assert r_off.status_code == 200, r_off.get_data(as_text=True)
+    assert share_store.get_ai_session_drawing_flag("sess-replay-1") is False
+    gen_after_close = share_store.get_ai_session_drawing_generation(
+        "sess-replay-1")
+
+    # 迟到/去重重放：sidecar 再次接受同一 session（X-AI-Session-ID 相同）
+    _register_run_sse(fake, "sess-replay-1")
+    r2 = c.post("/api/ai/run?fresh=1", json={
+        "slide": "demo.svs", "task": "看全片", "allow_ai_drawing": True,
+        "request_id": "req-draw-replay-1"})
+    assert r2.status_code == 200, r2.get_data(as_text=True)
+    assert share_store.get_ai_session_drawing_flag("sess-replay-1") is False
+    assert share_store.get_ai_session_drawing_generation(
+        "sess-replay-1") == gen_after_close
+
+    # 迟到描绘写入仍被闸门拒绝
+    _mock_plugin_channel(monkeypatch, valid=True)
+    prov = dict(SNAP_PROV, snapshot_attestation=_attest(sid="sess-replay-1"))
+    r3 = _post_polygon(c, session_id="sess-replay-1",
+                       effect_key="ek-replay-closed", **prov)
+    assert r3.status_code == 403
+    assert r3.get_json()["error"]["code"] == "ai_drawing_disabled"
+    assert _no_rois()

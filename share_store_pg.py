@@ -2396,6 +2396,33 @@ def upsert_ai_session_drawing_flag(session_id, allow_ai_drawing):
         conn.close()
 
 
+def init_ai_session_drawing_flag(session_id, allow_ai_drawing):
+    """仅当行不存在时插入镜像开关。已有行（含用户关闭后的 false）一律不覆盖。
+
+    返回 True=本次插入；False=已有行，未改动。创建参数路径必须走这里，
+    不能 reserve+CAS：后者会抬 generation，并在未超越时把已关闭开关写回
+    true（同 request_id 去重重放 / 迟到 on_accepted 会重新打开闸门）。
+    """
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id 不能为空")
+    if not isinstance(allow_ai_drawing, bool):
+        raise ValueError("allow_ai_drawing 需为布尔")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ai_session_drawing_flags "
+                    "(session_id, allow_ai_drawing, updated_at, generation) "
+                    "VALUES (%s, %s, now(), 1) "
+                    "ON CONFLICT (session_id) DO NOTHING "
+                    "RETURNING generation",
+                    (session_id, allow_ai_drawing))
+                return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
 def get_ai_session_drawing_generation(session_id):
     """读镜像行 generation（三轮 review P1）。无行返回 0（第一代之前）。"""
     if not isinstance(session_id, str) or not session_id:

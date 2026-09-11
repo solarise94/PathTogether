@@ -11,6 +11,8 @@ COPY platform_features.py settings_store.py budget_store.py auth_limit_store.py 
 COPY billing_pricing.py billing_store.py acquisition_store.py ./
 COPY spend_store.py site_stats_store.py ./
 COPY crop_guard.py upload_guard.py upload_task_store.py useradmin.py ./
+COPY conversion_store.py conversion_worker.py slide_format_registry.py ./
+COPY kfb/ kfb/
 COPY migrations/ migrations/
 COPY scripts/ scripts/
 COPY docker_entry.sh ./

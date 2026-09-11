@@ -232,6 +232,9 @@ def test_schema_migrations_recorded(conn):
         # + v3 flash_repricing 两书，flash 家族按官方新价、v4-pro 原样复制，
         # pricing_v3_cutover_at 标志 + 固定 event_id 审计行）。
         "0045_deepseek_flash_repricing.sql",
+        # KFB Phase B：后台转换任务表（不改 upload_tasks）。
+        "0046_conversion_jobs.sql",
+        "0047_conversion_jobs_settle_and_name_lock.sql",
     ]
 
 

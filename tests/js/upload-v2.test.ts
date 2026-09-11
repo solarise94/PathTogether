@@ -317,8 +317,8 @@ describe("大文件走 Upload V2（/api/uploads + 分片 PUT + commit）", () =>
 
 	it("刷新恢复：localStorage 有未完成任务 → GET 状态后从 confirmed_offset 续传", async () => {
 		let statusQueried = false;
-		const fetchImpl = vi.fn((url: string, opts?: RequestInit) => {
-			if (url === "/api/uploads/up-9" && !(opts && opts.method)) {
+			const fetchImpl = vi.fn((url: string, opts?: RequestInit) => {
+				if (url === "/api/uploads/up-9" && (!opts || !opts.method || opts.method === "GET")) {
 				statusQueried = true;
 				return Promise.resolve({
 					ok: true, status: 200, clone() { return this; },
@@ -342,10 +342,60 @@ describe("大文件走 Upload V2（/api/uploads + 分片 PUT + commit）", () =>
 		expect(statusQueried).toBe(true);
 		// 不发 POST /api/uploads（复用任务）；第一片 offset = 恢复的 24
 		expect(h.fetchCalls().some((c) => c.url === "/api/uploads" && c.opts.method === "POST")).toBe(false);
-		expect(FakeXHR.instances[0].open).toHaveBeenCalledWith(
-			"PUT", expect.stringMatching(/^\/api\/uploads\/up-9\/chunk\?offset=24&sha256=/));
+			expect(FakeXHR.instances[0].open).toHaveBeenCalledWith(
+				"PUT", expect.stringMatching(/^\/api\/uploads\/up-9\/chunk\?offset=24&sha256=/));
+		});
+
+		it("刷新恢复：committed 任务重放 commit，不新建上传、不 PUT 分片", async () => {
+			const fetchImpl = vi.fn((url: string, opts?: RequestInit) => {
+				const method = (opts && opts.method) || "GET";
+				if (url === "/api/uploads/up-c" && (!opts || !opts.method || method === "GET")) {
+					return Promise.resolve({
+						ok: true, status: 200, clone() { return this; },
+						json: () => Promise.resolve({
+							upload_id: "up-c", state: "committed", chunk_size: 8,
+							confirmed_offset: THRESHOLD + 16,
+						}),
+					} as unknown as Response);
+				}
+				if (url === "/api/uploads/up-c/commit" && method === "POST") {
+					return Promise.resolve({
+						ok: true, status: 202, clone() { return this; },
+						json: () => Promise.resolve({
+							upload_id: "up-c", state: "queued",
+							status: "conversion_pending",
+							conversion_job_id: "cvj-1",
+							canonical_name: "big.tif",
+						}),
+					} as unknown as Response);
+				}
+				if (String(url).startsWith("/api/conversions/")) {
+					return Promise.resolve({
+						ok: true, status: 200, clone() { return this; },
+						json: () => Promise.resolve({
+							conversion_job_id: "cvj-1", state: "queued",
+							canonical_name: "big.tif",
+						}),
+					} as unknown as Response);
+				}
+				return Promise.resolve({
+					ok: true, status: 200, clone() { return this; },
+					json: () => Promise.resolve({}),
+				} as unknown as Response);
+			}) as unknown as typeof fetch;
+			const h = loadApp(fetchImpl);
+			const file = bigFile(THRESHOLD + 16);
+			h.storage.setItem("pt.upload.v2::big.svs:" + file.size + ":42",
+				JSON.stringify({ upload_id: "up-c", declared_size: file.size, chunk_size: 8 }));
+			h.uploadFile(file);
+			await flush();
+			expect(h.fetchCalls().some((c) => c.url === "/api/uploads" && c.opts.method === "POST")).toBe(false);
+			expect(FakeXHR.instances.length).toBe(0);
+			const commit = h.fetchCalls().find((c) => c.url === "/api/uploads/up-c/commit");
+			expect(commit).toBeTruthy();
+			expect(commit!.opts.method).toBe("POST");
+		});
 	});
-});
 
 describe("小文件仍走旧 /api/upload（U1 契约不回退）", () => {
 	it("小文件：XHR POST /api/upload 带头，不创建 V2 任务", async () => {

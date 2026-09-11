@@ -47,8 +47,9 @@ interface FakeEl extends Record<string, unknown> {
 	hidden: boolean;
 	title: string;
 	type: string;
-	checked: boolean;
-	style: Record<string, string>;
+		checked: boolean;
+		disabled: boolean;
+		style: Record<string, string>;
 	dataset: Record<string, string>;
 	textContent: string;
 	innerHTML: string;
@@ -88,8 +89,9 @@ function fakeEl(id = ""): FakeEl {
 		hidden: false,
 		title: "",
 		type: "",
-		checked: false,
-		style: {},
+			checked: false,
+			disabled: false,
+			style: {},
 		dataset: {},
 		textContent: "",
 		innerHTML: "",
@@ -251,8 +253,10 @@ interface BootResult {
 	deliverOpens: (times?: number) => void;
 	channelOpts: () => { onReopening?: () => void } | null;
 	channelCtrl: () => { setChannelColor: (index: number, color: string) => boolean } | null;
-	findSlideRow: (name?: string) => FakeEl;
-}
+		findSlideRow: (name?: string) => FakeEl;
+		aiBtn: () => FakeEl;
+		tbbMoreAi: () => FakeEl;
+	}
 
 function bootApp(opts: {
 	infoByName: Record<string, Record<string, unknown>>;
@@ -346,10 +350,14 @@ function bootApp(opts: {
 	const doc = {
 		readyState: "loading",
 		cookie: "",
-		getElementById(id: string) {
-			if (!els[id]) els[id] = fakeEl(id);
-			return els[id];
-		},
+			getElementById(id: string) {
+				if (!els[id]) {
+					els[id] = fakeEl(id);
+					// 正式页模板：AI 主入口与 ⋯ 溢出入口初始 disabled
+					if (id === "ai-btn" || id === "tbb-more-ai") els[id].disabled = true;
+				}
+				return els[id];
+			},
 		createElement: () => {
 			const el = fakeEl();
 			created.push(el);
@@ -447,9 +455,11 @@ function bootApp(opts: {
 		// 控制器在首次 openSlide 时才创建（app.js 惰性 createChannelController），
 		// 必须经 getter 取点击后的捕获值，不能在 boot 时快照
 		channelOpts: () => channelOpts,
-		channelCtrl: () => channelCtrl,
-		findSlideRow,
-	};
+			channelCtrl: () => channelCtrl,
+			findSlideRow,
+			aiBtn: () => doc.getElementById("ai-btn"),
+			tbbMoreAi: () => doc.getElementById("tbb-more-ai"),
+		};
 }
 
 async function settle(times = 20) {
@@ -497,7 +507,46 @@ describe("slide.opened：多通道持久化配色重开不丢事件 + name|revis
 		expect(opened[0]).toEqual({ slide: Object.assign({}, EXPECTED_SLIDE, { revision: REV1 }) });
 	});
 
-	it("bug 复现：多通道 + 本地持久化配色，首开默认 token 的 open 事件被 viewer.close 吃掉 → 持久化配色重开补发恰好一次", async () => {
+		it("AI 入口：模板初始 disabled，多通道首开仅第二次 open 到达后主入口与溢出入口均可用", async () => {
+			const storage = fakeStorage();
+			storage.setItem(persistedSelectionKey(SLIDE_A, REV1), persistedSelection());
+			const app = bootApp({ infoByName: { [SLIDE_A]: multichannelInfo(REV1) }, storage });
+			await settle();
+			expect(app.aiBtn().disabled, "模板初始 AI 主入口必须禁用").toBe(true);
+			expect(app.tbbMoreAi().disabled, "模板初始 ⋯ AI 入口必须禁用").toBe(true);
+
+			app.findSlideRow().dispatch("click");
+			await settle();
+			expect(app.pendingOpens(), "第 1 次 open 被 close 吃掉，只剩轻量路径在途").toBe(1);
+			expect(app.aiBtn().disabled, "第二次 open 到达前不得提前启用").toBe(true);
+			expect(app.tbbMoreAi().disabled).toBe(true);
+
+			app.deliverOpens();
+			expect(app.aiBtn().disabled, "轻量路径必须解除主 AI 禁用").toBe(false);
+			expect(app.tbbMoreAi().disabled, "轻量路径必须同步解除溢出 AI 禁用").toBe(false);
+			expect(slideOpenedEvents(app.emitted).length).toBe(1);
+		});
+
+		it("AI 入口：普通换色/画质重开仍不重置会话，且保持 AI 可用", async () => {
+			const storage = fakeStorage();
+			storage.setItem(persistedSelectionKey(SLIDE_A, REV1), persistedSelection());
+			const app = bootApp({ infoByName: { [SLIDE_A]: multichannelInfo(REV1) }, storage });
+			await settle();
+			app.findSlideRow().dispatch("click");
+			await settle();
+			app.deliverOpens();
+			expect(app.aiBtn().disabled).toBe(false);
+			expect(slideOpenedEvents(app.emitted).length).toBe(1);
+
+			expect(app.channelCtrl()!.setChannelColor(0, "#00FF00")).toBe(true);
+			await settle();
+			app.deliverOpens();
+			expect(app.aiBtn().disabled, "换色重开不得重新禁用 AI").toBe(false);
+			expect(app.tbbMoreAi().disabled).toBe(false);
+			expect(slideOpenedEvents(app.emitted).length, "换色不得重发 slide.opened").toBe(1);
+		});
+
+		it("bug 复现：多通道 + 本地持久化配色，首开默认 token 的 open 事件被 viewer.close 吃掉 → 持久化配色重开补发恰好一次", async () => {
 		const storage = fakeStorage();
 		storage.setItem(persistedSelectionKey(SLIDE_A, REV1), persistedSelection());
 		const app = bootApp({ infoByName: { [SLIDE_A]: multichannelInfo(REV1) }, storage });

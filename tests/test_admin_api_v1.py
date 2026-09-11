@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1110,6 +1111,51 @@ def test_provider_balance_refresh_not_configured(monkeypatch):
     fake = _fake_requests(monkeypatch)
     fake.register_json("GET", "/user/balance", status=200, body=_BALANCE_OK)
     assert c.post("/api/admin/v1/billing/provider-balance/refresh").status_code == 200
+
+
+def test_provider_balance_refresh_inflight_rejects_duplicate(monkeypatch):
+    """进行中的刷新必须占用 in-flight：第二个请求 429，且不得打到上游。"""
+    owner, _u = _setup_users()
+    _write_ai_config(monkeypatch)
+    entered = threading.Event()
+    release = threading.Event()
+    hits = []
+
+    fake = _fake_requests(monkeypatch)
+    orig_get = fake.get
+
+    def _slow_get(url, **kwargs):
+        hits.append(1)
+        entered.set()
+        if not release.wait(5.0):
+            raise RuntimeError("in-flight test release timeout")
+        return orig_get(url, **kwargs)
+
+    fake.get = _slow_get
+    fake.register_json("GET", "/user/balance", status=200, body=_BALANCE_OK)
+
+    results = [None, None]
+
+    def _run(idx):
+        c = _login(_client(), owner)
+        results[idx] = c.post("/api/admin/v1/billing/provider-balance/refresh")
+
+    t1 = threading.Thread(target=_run, args=(0,))
+    t1.start()
+    assert entered.wait(2.0), "首个刷新未进入上游"
+    t2 = threading.Thread(target=_run, args=(1,))
+    t2.start()
+    t2.join(5.0)
+    release.set()
+    t1.join(5.0)
+    assert results[0] is not None and results[1] is not None
+    codes = sorted(r.status_code for r in results)
+    assert codes == [200, 429], "in-flight 重复刷新应 200+429，实际 %s" % (
+        [r.status_code for r in results],)
+    throttled = results[0] if results[0].status_code == 429 else results[1]
+    assert throttled.get_json()["error"]["code"] == "refresh_throttled"
+    assert len(hits) == 1
+    assert app_mod._provider_balance_refresh_state.get("in_flight") is False
 
 # --------------------------------------------------------------------------- #
 # 批次 B：金额 policy/window 只读出口（/api/admin/v1/spend/*）

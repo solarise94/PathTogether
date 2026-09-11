@@ -19,7 +19,7 @@
  *     Demo 卡 + 三页内标签（只有当前标签发请求，迟到旧响应按代际丢弃）；
  *   - D2-3：siteStats 桥不可达时概览站点访问卡整卡隐藏。
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -152,6 +152,7 @@ function loadPluginUi(hash: string) {
 interface PluginClient {
 	request: (method: string, payload?: unknown) => Promise<unknown>;
 	showPage: (page: string) => void;
+	copyToClipboard: (text: string) => Promise<boolean>;
 	cnyToNano: (text: unknown) => string | null;
 	nanoToCnyString: (n: unknown) => string;
 	formatCny2: (v: unknown) => string | null;
@@ -2014,5 +2015,152 @@ describe("wave 2 — 费用页（Demo 统计 + 页内标签 §4.6）", () => {
 		// End：跳到 unpriced
 		bus.els["adm-tab-usage"]._fire("keydown", { key: "End", preventDefault() {} });
 		expect(bus.els["adm-tab-unpriced"].getAttribute("aria-selected")).toBe("true");
+	});
+});
+
+// --------------------------------------------------------------------------- //
+// 2026-09-11 admin 复制修复（docs/fix-2026-09-11-admin-copy-fallback.md）：
+// copyToClipboard 三级降级（async clipboard → textarea+execCommand → 选中文本
+// 供手动复制）+ 3 个复制按钮的成功/失败反馈。
+// --------------------------------------------------------------------------- //
+type FakeRange = { node?: { textContent?: string }; selectNode(n?: unknown): void };
+
+describe("copyToClipboard 三级降级 + 复制按钮反馈（2026-09-11 修复）", () => {
+	// copy 专用装配：假 DOM 补 body/execCommand/createRange/getSelection；
+	// navigator.clipboard 经 vi.stubGlobal 注入（main.js 在调用时读裸 navigator）。
+	function loadCopyHarness(
+		opts: { execOk?: boolean; noSelection?: boolean } = {},
+	) {
+		const els: Record<string, FakeEl> = {};
+		const appendedToBody: FakeEl[] = [];
+		const removedFromBody: FakeEl[] = [];
+		const ranges: FakeRange[] = [];
+		let execCalls = 0;
+		const selection = {
+			removeAllRanges() {},
+			addRange(r: FakeRange) { ranges.push(r); },
+		};
+		const body = Object.assign(fakeEl("body"), {
+			appendChild(c: FakeEl) { appendedToBody.push(c); return c; },
+			removeChild(c: FakeEl) { removedFromBody.push(c); return c; },
+		});
+		const w: Record<string, unknown> = {
+			location: { hash: "" },
+			parent: { postMessage() {} },
+			addEventListener() {},
+			setTimeout,
+			clearTimeout,
+		};
+		if (!opts.noSelection) w.getSelection = () => selection;
+		const doc: Record<string, unknown> = {
+			getElementById(id: string) {
+				if (!els[id]) els[id] = fakeEl();
+				return els[id];
+			},
+			createElement: (tag?: string) =>
+				Object.assign(fakeEl(tag), { select() {} }),
+			createTextNode: (text: string) => ({ textContent: text }),
+			addEventListener() {},
+			body,
+			execCommand() { execCalls += 1; return opts.execOk !== false; },
+		};
+		if (!opts.noSelection) {
+			doc.createRange = () => {
+				const r: FakeRange = { selectNode(n?: unknown) { r.node = n as { textContent?: string }; } };
+				return r;
+			};
+		}
+		(w as { document: Record<string, unknown> }).document = doc;
+		new Function("window", "document", src)(w, doc);
+		return {
+			els,
+			doc: doc as {
+				getElementById: (id: string) => FakeEl;
+			},
+			client: w.PathTogetherAdminClient as PluginClient,
+			appendedToBody,
+			removedFromBody,
+			ranges,
+			execCalls: () => execCalls,
+		};
+	}
+
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
+	it("路径① clipboard.writeText resolve → true（不触发 textarea 降级）", async () => {
+		vi.stubGlobal("navigator", {
+			clipboard: { writeText: () => Promise.resolve() },
+		});
+		const h = loadCopyHarness();
+		await expect(h.client.copyToClipboard("pt-inv-secret")).resolves.toBe(true);
+		expect(h.appendedToBody).toHaveLength(0);
+		expect(h.execCalls()).toBe(0);
+	});
+
+	it("路径① rejection → 路径② textarea 降级 → true；textarea 用后即卸载", async () => {
+		vi.stubGlobal("navigator", {
+			clipboard: { writeText: () => Promise.reject(new Error("denied")) },
+		});
+		const h = loadCopyHarness();
+		await expect(h.client.copyToClipboard("pt-inv-secret")).resolves.toBe(true);
+		expect(h.execCalls()).toBe(1);
+		expect(h.appendedToBody).toHaveLength(1);
+		expect(h.removedFromBody).toHaveLength(1);
+	});
+
+	it("路径② clipboard 不存在 → textarea + execCommand(\"copy\") → true", async () => {
+		// Node 全局 navigator 无 clipboard（或无 navigator）→ 视同路径②条件
+		const h = loadCopyHarness();
+		await expect(h.client.copyToClipboard("12500000000")).resolves.toBe(true);
+		expect(h.execCalls()).toBe(1);
+		expect(h.removedFromBody).toHaveLength(1);
+	});
+
+	it("路径②③ 降级也失败 → 选中文本节点供手动复制，返回 false", async () => {
+		const h = loadCopyHarness({ execOk: false });
+		await expect(h.client.copyToClipboard("12500000000")).resolves.toBe(false);
+		expect(h.ranges).toHaveLength(1);
+		expect(h.ranges[0].node && h.ranges[0].node.textContent).toBe("12500000000");
+	});
+
+	it("路径②③ 全失败（无 getSelection/createRange）→ 仍返回 false 不抛错", async () => {
+		const h = loadCopyHarness({ execOk: false, noSelection: true });
+		await expect(h.client.copyToClipboard("x")).resolves.toBe(false);
+	});
+
+	it("邀请码复制按钮：成功 → 最近状态行「已复制」", async () => {
+		vi.stubGlobal("navigator", {
+			clipboard: { writeText: () => Promise.resolve() },
+		});
+		const h = loadCopyHarness();
+		h.doc.getElementById("adm-invite-token")!.textContent = "pt-inv-secret";
+		h.els["adm-invite-token-copy"]._fire("click", {});
+		await ticks();
+		expect(h.els["adm-invite-create-status"].textContent).toBe("已复制");
+	});
+
+	it("邀请码复制按钮：降级全失败 → 状态行提示「复制失败，文本已选中，请手动复制」", async () => {
+		vi.stubGlobal("navigator", {
+			clipboard: { writeText: () => Promise.reject(new Error("denied")) },
+		});
+		const h = loadCopyHarness({ execOk: false, noSelection: true });
+		h.doc.getElementById("adm-invite-token")!.textContent = "pt-inv-secret";
+		h.els["adm-invite-token-copy"]._fire("click", {});
+		await ticks();
+		expect(h.els["adm-invite-create-status"].textContent)
+			.toBe("复制失败，文本已选中，请手动复制");
+	});
+
+	it("插件密钥复制按钮：成功 → adm-plugins-status「已复制」", async () => {
+		vi.stubGlobal("navigator", {
+			clipboard: { writeText: () => Promise.resolve() },
+		});
+		const h = loadCopyHarness();
+		h.doc.getElementById("adm-plugin-secret")!.textContent = "pt-plugin-secret";
+		h.els["adm-plugin-secret-copy"]._fire("click", {});
+		await ticks();
+		expect(h.els["adm-plugins-status"].textContent).toBe("已复制");
 	});
 });

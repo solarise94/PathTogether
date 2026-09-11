@@ -470,7 +470,11 @@
       var code = document.createElement("code");
       code.textContent = String(row[1]);
       var copy = actionBtn("复制", function () {
-        copyToClipboard(String(row[1]));
+        copyToClipboard(String(row[1])).then(function (ok) {
+          // 行内无 status 元素：反馈落在按钮自身（短暂改文案后还原）
+          copy.textContent = ok ? "已复制" : "复制失败，请手动复制";
+          setTimeout(function () { copy.textContent = "复制"; }, 2000);
+        });
       }, "secondary");
       line.appendChild(key);
       line.appendChild(code);
@@ -480,14 +484,64 @@
     return details;
   }
 
+  // 2026-09-11 修复（docs/fix-2026-09-11-admin-copy-fallback.md）：本页运行在
+  // opaque origin iframe（sandbox="allow-scripts"）内，navigator.clipboard 在
+  // 非 secure context 缺失、被拒时 reject——旧实现降级路径是空注释且 rejection
+  // 被吞，复制按钮完全无反应。三级路径：
+  //   ① navigator.clipboard.writeText（宿主 iframe 已授权 clipboard-write 时）；
+  //   ② textarea + select() + execCommand("copy")（写法对齐宿主 static/app.js）；
+  //   ③ 兜底：把文本挂为文本节点并加入选区，用户手动 Ctrl+C。
+  // 返回 Promise<boolean> 供 3 个复制按钮的点击处理器做「已复制 / 失败」反馈。
   function copyToClipboard(text) {
+    var t = String(text == null ? "" : text);
+    function fallback() {
+      if (legacyCopy(t)) return true;
+      selectForManualCopy(t); // 兜底：选中文本，配合「请手动复制」提示
+      return false;
+    }
     try {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).catch(function () { /* ignore */ });
-        return;
+      if (typeof navigator !== "undefined" && navigator.clipboard &&
+          typeof navigator.clipboard.writeText === "function") {
+        return navigator.clipboard.writeText(t).then(
+          function () { return true; },
+          function () { return fallback(); });
       }
+    } catch (e) { /* ignore：进入降级 */ }
+    return Promise.resolve(fallback());
+  }
+
+  // 路径②：textarea 离屏挂载 + select() + execCommand（opaque origin 下
+  // execCommand 可能返回 false 或抛错；假 DOM/无 body 等异常一律按失败）。
+  function legacyCopy(text) {
+    try {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try { ok = !!document.execCommand("copy"); } catch (e) { /* ignore */ }
+      document.body.removeChild(ta);
+      return ok;
     } catch (e) { /* ignore */ }
-    // 降级：选中文本由用户手动复制（opaque origin 下 execCommand 可能被拒）
+    return false;
+  }
+
+  // 路径③兜底：文本节点挂到 body 并加入选区（节点保留以维持选区，供手动
+  // Ctrl+C）；返回是否成功建立选区，调用方无论结果都按复制失败反馈。
+  function selectForManualCopy(text) {
+    try {
+      var sel = window.getSelection ? window.getSelection() : null;
+      if (!sel || !document.body || !document.createRange ||
+          typeof sel.addRange !== "function") return false;
+      var node = document.createTextNode(text);
+      document.body.appendChild(node);
+      var range = document.createRange();
+      range.selectNode(node);
+      if (typeof sel.removeAllRanges === "function") sel.removeAllRanges();
+      sel.addRange(range);
+      return true;
+    } catch (e) { /* ignore */ }
+    return false;
   }
 
   // ---- 请求：nonce + 递增 requestId；targetOrigin "*" —— iframe 是 opaque
@@ -3477,7 +3531,12 @@
     onClick("adm-invites-more-btn", function () { loadInvites(true); });
     onClick("adm-invite-token-copy", function () {
       var code = $("adm-invite-token");
-      if (code) copyToClipboard(code.textContent || "");
+      if (!code) return;
+      // 反馈写最近的状态行（token 区上方的创建状态行）
+      copyToClipboard(code.textContent || "").then(function (ok) {
+        setStatus("adm-invite-create-status",
+          ok ? "已复制" : "复制失败，文本已选中，请手动复制");
+      });
     });
     // 设置页（批次 D + wave 2）
     onClick("adm-regmode-save-btn", saveRegistrationMode);
@@ -3543,7 +3602,12 @@
     onClick("adm-plugins-refresh-btn", function () { loadPlugins(); });
     onClick("adm-plugin-secret-copy", function () {
       var code = $("adm-plugin-secret");
-      if (code) copyToClipboard(code.textContent || "");
+      if (!code) return;
+      // 反馈写最近的状态行（插件列表卡的状态行，secret 区上方）
+      copyToClipboard(code.textContent || "").then(function (ok) {
+        setStatus("adm-plugins-status",
+          ok ? "已复制" : "复制失败，文本已选中，请手动复制");
+      });
     });
   }
 
@@ -3552,10 +3616,11 @@
 
   // 导出（仅调试/测试用；不含 nonce 读取器）。金额换算函数一并导出供
   // tests/js/admin-plugin-ui.test.ts 锁定「字符串进、字符串出」契约与
-  // 两位小数口径（formatCny2）。
+  // 两位小数口径（formatCny2）；copyToClipboard 导出供锁定三级降级路径。
   window.PathTogetherAdminClient = {
     request: request,
     showPage: showPage,
+    copyToClipboard: copyToClipboard,
     cnyToNano: cnyToNano,
     nanoToCnyString: nanoToCnyString,
     formatCny2: formatCny2,

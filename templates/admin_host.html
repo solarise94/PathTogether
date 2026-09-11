@@ -14,6 +14,9 @@
     - admin 插件经 opaque iframe（sandbox="allow-scripts"，无 allow-same-origin/
       allow-forms/allow-popups/allow-top-navigation）挂载，src 指向 owner-only 的
       插件资源路由（§8.3）；
+    - allow="clipboard-write"（2026-09-11 修复）：仅放开 secure context
+      （https/localhost）下的剪贴板主路径；plain HTTP 部署仍走插件内
+      textarea/execCommand 降级。sandbox 属性不动（不加 allow-same-origin）；
     - 启动配置经不可执行 bootstrap JSON 节点下发（type="application/json"
       不可执行；Jinja tojson 对闭合 script 标签与边界字符已转义）。**不得**回退为
       data 属性注入 JSON——tojson 输出的双引号会提前终结属性值（生产实测
@@ -62,6 +65,7 @@
     <iframe id="admin-plugin-frame"
             title="HistoPilot Admin 插件"
             sandbox="allow-scripts"
+            allow="clipboard-write"
             referrerpolicy="no-referrer"
             data-plugin-id="{{ admin_plugin.plugin_id }}"></iframe>
   </main>

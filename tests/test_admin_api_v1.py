@@ -528,7 +528,7 @@ def test_users_row_joins_turn_billing_last_call(monkeypatch):
     assert "total" not in owner_item["spend"]
     assert owner_item["spend"]["window"] is not None
 
-def test_settings_model_switch_limited_model():
+def test_settings_model_switch_limited_model(monkeypatch):
     """2026-09-09 限时模型批次：GET/PUT /api/admin/v1/settings/model。
 
     - GET：当前模型 + 选项集合（限时模型带 expires_at、files_supported=False）；
@@ -536,7 +536,19 @@ def test_settings_model_switch_limited_model():
       联动落回 inline（Files API 仅 vision-exp），api_key 不动；
     - 审计 ai.default_model（from/to + transport 联动）；
     - 非集合模型 400；切回 vision-exp 无联动。
+
+    日期炸弹修复（2026-09-11）：限时模型 2026-09-10（UTC 当日结束）到期后
+    PUT 会按设计 409——本用例验证的是「可用期内的切换语义」，故 monkeypatch
+    目录时钟钉在到期日前（同 test_switch_default_model_rejects_unavailable
+    的注入模式，方向相反）。
     """
+    real_entries = app_mod._model_catalog_entries
+
+    def _before_expiry(now=None):
+        return real_entries(
+            now=now or datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc))
+
+    monkeypatch.setattr(app_mod, "_model_catalog_entries", _before_expiry)
     owner, _u = _setup_users()
     c = _login(_client(), owner)
     cfg = {"base_url": app_mod.DEEPSEEK_BASE_URL,

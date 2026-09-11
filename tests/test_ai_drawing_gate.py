@@ -11,6 +11,11 @@
     - freehand 同受闸门约束；矩形路径不受影响（无镜像行仍 200）；
     - 代理路由 /api/ai/session/<sid>/drawing：HP 200 且带权威布尔 → 镜像
       upsert；HP 200 畸形体 / HP 5xx → 镜像不变（不推定开关状态）。
+  fix-2026-09-11 创建参数链路：
+    - fresh 首发携带 allow_ai_drawing:true → 严格布尔透传 + run 接受后镜像
+      true → 伪造 polygon 不再 403；fresh 不带 flag（含显式 false）→ 不透传
+      不镜像，闸门回归仍 403；非 fresh 带 true → 400 invalid_argument；非
+      布尔（含显式 null）→ 400。
   P1-5 来源快照溯源：
     - polygon 缺 snapshot_id → 400 invalid_request，不落库；
     - snapshot_bbox 畸形 → 400（不把垃圾持久化）；
@@ -946,8 +951,7 @@ def test_internal_channel_blocks_late_polygon_after_midrun_off(monkeypatch):
 
 # =========================================================================== #
 # C2（2026-09-10）：session detail 带回 drawing_mirror，不在 GET 路径回写镜像
-# =========================================================================== #
-def test_session_detail_includes_drawing_mirror(monkeypatch):
+# =========================================================================== #def test_session_detail_includes_drawing_mirror(monkeypatch):
     """GET /api/ai/session/<id> 2xx 附带 session.drawing_mirror。
 
     无行 → false；镜像 true → true。HP allow_ai_drawing 仍透传。GET 不把
@@ -975,3 +979,118 @@ def test_session_detail_includes_drawing_mirror(monkeypatch):
     assert r2.status_code == 200
     assert r2.get_json()["session"]["drawing_mirror"] is True
     assert r2.get_json()["session"]["allow_ai_drawing"] is True
+
+
+# =========================================================================== #
+# fix-2026-09-11：创建参数链路——fresh 首发携带 allow_ai_drawing:true 时透传
+# HP 并在 run 被接受后写镜像（HP=true ↔ mirror 一致，写端闸门放行）；不带
+# flag 行为回归（无行 → 仍 403）；非 fresh / 非布尔在预算预占前 400。
+# =========================================================================== #
+def _setup_run_env(monkeypatch, name="demo.svs"):
+    """run 端到端用例的公共准备：切片 + 平台 AI 凭据 + 假 sidecar。"""
+    _touch(name)
+    app_mod._save_ai_config({
+        "base_url": "http://llm.example/v1",
+        "api_key": "sk-run-secret-123456",
+        "model": "m-run",
+        "api_protocol": "openai",
+    })
+    fake = FakeRequests()
+    monkeypatch.setattr(app_mod, "requests", fake)
+    return fake
+
+
+def _register_run_sse(fake, session_id):
+    """POST /run → 2xx SSE + X-AI-Session-ID（= HistoPilot 已接受执行）。"""
+    fake.register("POST", "/run", lambda b, q, h, k: FakeResponse(
+        200, sse_frames=[b"id: 1\nevent: slide_opened\ndata: {}\n\n"],
+        headers={"X-AI-Session-ID": session_id}))
+
+
+def test_run_create_param_mirrors_drawing_flag(monkeypatch):
+    """fresh + allow_ai_drawing:true：严格布尔透传 → 镜像 true → 伪造描绘写
+    不再 403（创建参数等价「建会话后立刻拨开关」，只消除竞态）；审计带值。"""
+    fake = _setup_run_env(monkeypatch)
+    _register_run_sse(fake, "sess-fresh-1")
+    audits = []
+    monkeypatch.setattr(app_mod, "_audit",
+                        lambda *a, **k: audits.append(k.get("detail")))
+    c = _browser_client(app_mod.app)
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide": "demo.svs", "task": "看全片", "allow_ai_drawing": True})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    # 透传：fresh 与 allow_ai_drawing 严格布尔进 sidecar body
+    sent = fake.calls[-1]["body"]
+    assert sent["fresh"] is True
+    assert sent["allow_ai_drawing"] is True
+    # 镜像对齐：HP=true ↔ PT mirror=true（不产生 mirror.stale 假警报）
+    assert share_store.get_ai_session_drawing_flag("sess-fresh-1") is True
+    # 审计：ai.run detail 带 allow_ai_drawing（true 时）
+    run_audits = [d for d in audits
+                  if isinstance(d, dict) and d.get("mode") == "run"]
+    assert run_audits and run_audits[-1]["allow_ai_drawing"] is True
+    # 写端闸门：该 session 的伪造 polygon 不再 403（attestation sid 对应）
+    _mock_plugin_channel(monkeypatch, valid=True)
+    prov = dict(SNAP_PROV, snapshot_attestation=_attest(sid="sess-fresh-1"))
+    r2 = _post_polygon(c, session_id="sess-fresh-1",
+                       effect_key="ek-create-param", **prov)
+    assert r2.status_code == 200, r2.get_data(as_text=True)
+    roi = share_store.get_roi(share_store.ADMIN_TOKEN, 0)
+    assert roi is not None and roi["type"] == "polygon"
+
+
+def test_run_without_flag_keeps_gate_closed(monkeypatch):
+    """回归：fresh 不带 flag（含显式 false）→ 不透传、不镜像（无行）；
+    伪造 polygon 仍 403（平台写端闸门不变）。"""
+    fake = _setup_run_env(monkeypatch)
+    _register_run_sse(fake, "sess-plain-1")
+    c = _browser_client(app_mod.app)
+    r = c.post("/api/ai/run?fresh=1",
+               json={"slide": "demo.svs", "task": "看全片"})
+    assert r.status_code == 200
+    sent = fake.calls[-1]["body"]
+    assert sent["fresh"] is True
+    assert "allow_ai_drawing" not in sent  # 只在严格 true 时携带该键
+    assert share_store.get_ai_session_drawing_flag("sess-plain-1") is None
+    # 显式 false 视同缺省：不透传、不镜像
+    r2 = c.post("/api/ai/run?fresh=1",
+                json={"slide": "demo.svs", "allow_ai_drawing": False})
+    assert r2.status_code == 200
+    assert "allow_ai_drawing" not in fake.calls[-1]["body"]
+    assert share_store.get_ai_session_drawing_flag("sess-plain-1") is None
+    # 闸门回归：无镜像行 → 伪造 polygon 403、不落库
+    _mock_plugin_channel(monkeypatch, valid=True)
+    prov = dict(SNAP_PROV, snapshot_attestation=_attest(sid="sess-plain-1"))
+    r3 = _post_polygon(c, session_id="sess-plain-1", **prov)
+    assert r3.status_code == 403
+    assert r3.get_json()["error"]["code"] == "ai_drawing_disabled"
+    assert _no_rois()
+
+
+def test_run_rejects_flag_without_fresh(monkeypatch):
+    """非 fresh 带 allow_ai_drawing:true → 400 invalid_argument（改既有会话
+    必须走 /drawing 端点，职责不混）；拒绝在转发前，sidecar 零请求。"""
+    fake = _setup_run_env(monkeypatch)
+    c = _browser_client(app_mod.app)
+    r = c.post("/api/ai/run", json={
+        "slide": "demo.svs", "task": "继续", "fresh": False,
+        "allow_ai_drawing": True})
+    assert r.status_code == 400
+    body = r.get_json()
+    assert body["code"] == "invalid_argument"
+    assert fake.calls == []  # 未转发 sidecar
+    assert share_store.get_ai_session_drawing_flag("sess1") is None  # 未镜像
+
+
+def test_run_rejects_non_boolean_flag(monkeypatch):
+    """非布尔非缺省 → 400 invalid_argument（严格布尔，不猜 truthy；显式
+    null 同样拒绝）；校验先于转发（零副作用）。"""
+    fake = _setup_run_env(monkeypatch)
+    c = _browser_client(app_mod.app)
+    for bad in ("true", 1, None, [True]):
+        r = c.post("/api/ai/run?fresh=1",
+                   json={"slide": "demo.svs", "allow_ai_drawing": bad})
+        assert r.status_code == 400, "bad=%r" % (bad,)
+        assert r.get_json()["code"] == "invalid_argument"
+    assert fake.calls == []
+    assert share_store.get_ai_session_drawing_flag("sess1") is None

@@ -16239,7 +16239,8 @@ def plugin_v1_dispatch(plugin_id, capability_name):
 
 @app.route("/api/ai/run", methods=["POST"])
 def api_ai_run():
-    """主 session 起跑（SSE）。body: {slide, task?, fresh?, session_id?, request_id?}。
+    """主 session 起跑（SSE）。body: {slide, task?, fresh?, session_id?,
+    request_id?, allow_ai_drawing?}。
 
     代理到 sidecar POST /run：注入 config（base_url/api_key 明文/model/
     api_protocol + 全部调优参数）。Stage 3a-2b：按当前身份做切片级鉴权
@@ -16248,6 +16249,10 @@ def api_ai_run():
     grant fail-closed（写工具 run 缺 grant 拒绝转发）。
     session_id（非空字符串）原样透传（会话隔离 S2 前置）；fresh=1 透传，
     其归档语义归 sidecar（HistoPilot 仓负责）。
+    fix-2026-09-11：``allow_ai_drawing``（严格布尔）仅作为**创建参数**——
+    fresh 且 true 时透传（HP 建会话即在工具装配前落权威值），并在 run 被
+    接受后写 PT 镜像对齐；非 fresh 带 true → 400（既有会话改开关走
+    /drawing 端点）；非布尔 → 400。校验先于预算预占（零副作用拒绝）。
     """
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
@@ -16283,9 +16288,10 @@ def api_ai_run():
     # 让 sidecar 把消息发到用户当前选中的会话（归档/路由语义归 sidecar）
     if isinstance(session_id, str) and session_id:
         payload["session_id"] = session_id
-    # JSON body 与 query 双重兼容（前端历史上把 fresh=1 放在 query）
-    if bool(body.get("fresh")) or request.args.get("fresh") == "1":
+    if is_fresh_run:
         payload["fresh"] = True
+    if draft_allow_drawing is True:
+        payload["allow_ai_drawing"] = True
     # §9.1：浏览器 render_context 服务端再校验（revision 绑定 + fingerprint 重算）
     # → camelCase 注入 config；审计带 asset revision + render fingerprint。
     audit_rc, rc_err = _ai_run_inject_render_context(payload, slide, body)
@@ -16294,8 +16300,36 @@ def api_ai_run():
     audit_detail = {"mode": "run", "request_id": prep["request_id"]}
     if audit_rc:
         audit_detail.update(audit_rc)
+    # fix-2026-09-11：审计带上创建参数方向的描绘授权（仅 true 时）。
+    if draft_allow_drawing is True:
+        audit_detail["allow_ai_drawing"] = True
     _audit("ai.run", target_type="session", slide=slide, detail=audit_detail)
-    return _proxy_sse("/run", payload, on_accepted=prep["on_accepted"],
+    # fix-2026-09-11：run 被接受（_proxy_sse 从 X-AI-Session-ID 解析出新 sid
+    # 触发 on_accepted）且本请求携带 allow_ai_drawing=True 时，为新 sid 写
+    # PT 镜像——走 drawing 代理端点同款的 reserve/CAS（初始 generation，与
+    # 既有 generation/CAS 机制一致，不与并发 toggle 相互覆盖：被更晚的开关
+    # 请求超越即 no-op）。HP 侧 session 已在创建时落 allow=true，这里只对齐
+    # mirror、消除 mirror.stale 假警报；写失败仅记日志并照常返回——HP 侧已
+    # 生效，用户可再拨一次开关修复 mirror，绝不因此回滚已开始的 run。
+    _budget_on_accepted = prep["on_accepted"]
+
+    def on_accepted_with_drawing(hp_session_id):
+        if draft_allow_drawing is True and hp_session_id:
+            try:
+                req_gen = share_store.reserve_ai_session_drawing_generation(
+                    hp_session_id)
+                if not share_store.cas_ai_session_drawing_flag(
+                        hp_session_id, True, req_gen):
+                    app.logger.warning(
+                        "ai drawing 创建参数镜像 CAS no-op（session=%s）——"
+                        "已被更晚的开关请求取代", hp_session_id)
+            except Exception:
+                app.logger.exception(
+                    "ai drawing 创建参数镜像写入失败（session=%s）；HP 侧已"
+                    "生效，可再拨一次开关对齐", hp_session_id)
+        _budget_on_accepted(hp_session_id)
+
+    return _proxy_sse("/run", payload, on_accepted=on_accepted_with_drawing,
                       on_rejected=prep["on_rejected"],
                       on_finished=prep.get("on_finished"))
 
@@ -16325,6 +16359,26 @@ def api_ai_continue():
         auth = _require_ai_session_owner(session_id)
         if auth is not None:
             return auth
+    # fix-2026-09-11：草稿期「允许 AI 描绘」随创建参数（严格布尔，缺省不传 =
+    # 关，per-session 默认关不变）。校验先于预算预占/grant 签发（零副作用拒绝）：
+    #   - 非布尔非缺省 → 400 invalid_argument（不猜测 truthy；显式 null 同样
+    #     拒绝——键存在即必须给严格布尔）；
+    #   - 值为 true 但非 fresh（续写既有会话）→ 400 invalid_argument：改既有
+    #     会话的开关必须走 /api/ai/session/<sid>/drawing（generation 机制，
+    #     职责不混）；
+    #   - fresh 且 true → 随 payload 透传，HP 在工具装配前落为会话权威值；
+    #     run 被接受（on_accepted 拿到 X-AI-Session-ID）后写 PT 镜像使二者
+    #     一致（见下方 on_accepted 包装）。值为 false 视同缺省（不透传）。
+    if "allow_ai_drawing" in body and not isinstance(body.get("allow_ai_drawing"), bool):
+        return jsonify(error="allow_ai_drawing 非法：需布尔值",
+                       code="invalid_argument"), 400
+    draft_allow_drawing = body.get("allow_ai_drawing")
+    # JSON body 与 query 双重兼容（前端历史上把 fresh=1 放在 query）
+    is_fresh_run = bool(body.get("fresh")) or request.args.get("fresh") == "1"
+    if draft_allow_drawing is True and not is_fresh_run:
+        return jsonify(error="allow_ai_drawing 仅支持新建会话（fresh）时携带；"
+                             "既有会话请使用描绘开关端点",
+                       code="invalid_argument"), 400
     prep = _ai_run_prepare(user_ctx, body, slide, need_grant=True)
     if not isinstance(prep, dict):
         return prep

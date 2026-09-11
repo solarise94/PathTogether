@@ -6187,7 +6187,11 @@ _ADMIN_V1_DEFAULT_LIMIT = 50
 _ADMIN_V1_MAX_LIMIT = 200
 #: provider balance refresh 的进程内节流窗口（秒；§9 速率收敛意识）
 PROVIDER_BALANCE_REFRESH_MIN_INTERVAL_SECONDS = 60.0
-_provider_balance_refresh_state = {"last_ok_attempt": 0.0}
+#: 失败后的重试间隔（秒；2026-09-11 可诊断性修复）：失败只盖 fail 章、不动
+#: 成功章——否则一次失败后 60s 内重试只得 429，真实错误被节流掩盖
+PROVIDER_BALANCE_REFRESH_FAILURE_RETRY_SECONDS = 10.0
+_provider_balance_refresh_state = {"last_ok_attempt": 0.0,
+                                   "last_fail_attempt": 0.0}
 _provider_balance_refresh_lock = threading.Lock()
 #: provider balance 的固定 provider id（当前唯一官方来源）
 BILLING_BALANCE_PROVIDER = "deepseek"
@@ -6810,8 +6814,11 @@ def admin_v1_billing_provider_balance_refresh():
       key 绝不进日志/响应/审计；
     - 金额十进制字符串经 billing_pricing.parse_balance_to_nano（Decimal 精确
       换算，禁 float 中转）；解析失败只返回错误类别，**不写伪造零余额**；
-    - 简单节流：PROVIDER_BALANCE_REFRESH_MIN_INTERVAL_SECONDS（进程内，缺省
-      60s）内的重复刷新 429 refresh_throttled；
+    - 简单节流（进程内，请求发出**前不预盖章**，成功/失败分账——2026-09-11
+      可诊断性修复）：距上次**成功** <
+      PROVIDER_BALANCE_REFRESH_MIN_INTERVAL_SECONDS（缺省 60s）或距上次
+      **失败** < PROVIDER_BALANCE_REFRESH_FAILURE_RETRY_SECONDS（10s）→
+      429 refresh_throttled（message 带还需等待的秒数）；
     - 失败错误类别（稳定 code）：provider_not_configured /
       provider_unreachable / provider_rejected（4xx）/ provider_error（5xx、
       响应形态异常）/ invalid_balance_response（金额解析失败）。
@@ -6819,33 +6826,55 @@ def admin_v1_billing_provider_balance_refresh():
     auth = _require_owner_admin_v1()
     if auth:
         return auth
+
+    def _throttled(wait_seconds):
+        # 429 message 带还需等待的秒数（文案中文，code 稳定不变）
+        return _admin_v1_error(
+            429, "refresh_throttled",
+            "刷新过于频繁，还需等待 %ds 再试" % wait_seconds)
+
     with _provider_balance_refresh_lock:
         now = time.time()
-        if now - _provider_balance_refresh_state["last_ok_attempt"] < \
-                PROVIDER_BALANCE_REFRESH_MIN_INTERVAL_SECONDS:
-            return _admin_v1_error(
-                429, "refresh_throttled",
-                "刷新过于频繁（>%ds 一次）" %
-                int(PROVIDER_BALANCE_REFRESH_MIN_INTERVAL_SECONDS))
-        _provider_balance_refresh_state["last_ok_attempt"] = now
+        state = _provider_balance_refresh_state
+        ok_wait = math.ceil(PROVIDER_BALANCE_REFRESH_MIN_INTERVAL_SECONDS
+                            - (now - state["last_ok_attempt"]))
+        if ok_wait > 0:
+            return _throttled(ok_wait)
+        fail_wait = math.ceil(PROVIDER_BALANCE_REFRESH_FAILURE_RETRY_SECONDS
+                              - (now - state["last_fail_attempt"]))
+        if fail_wait > 0:
+            return _throttled(fail_wait)
 
     cfg = _load_ai_config()
     if _effective_provider_kind(cfg) != AI_PROVIDER_DEEPSEEK_OFFICIAL:
-        _provider_balance_refresh_state["last_ok_attempt"] = 0.0
+        # 配置类拒绝发生在请求发出前，不消耗任何节流窗口
         return _admin_v1_error(
             400, "provider_not_configured",
             "provider balance 仅支持 deepseek_official 官方配置")
     api_key = str(cfg.get("api_key") or "").strip()
     if not api_key:
-        _provider_balance_refresh_state["last_ok_attempt"] = 0.0
         return _admin_v1_error(
             400, "provider_not_configured", "官方 API key 未配置")
     base = str(cfg.get("base_url") or DEEPSEEK_BASE_URL).strip().rstrip("/")
     url = base + "/user/balance"
 
-    def _fail(status, code, message):
-        # key 不进日志/响应：message 只含类别与状态码
-        app.logger.warning("provider balance refresh 失败（%s）", code)
+    def _resp_excerpt(resp, limit=300):
+        # 官方（错误）响应 body 可记：api_key 只在请求头、不在 body；
+        # 截断到 300 字符防日志膨胀（字节流按 utf-8 容错解码）
+        return (getattr(resp, "content", b"") or b"").decode(
+            "utf-8", "replace")[:limit]
+
+    def _fail(status, code, message, http_status=None, resp_excerpt=None):
+        # 失败：盖 fail 章、**不动**成功章；key 不进日志/响应——日志只含
+        # 类别、上游 HTTP 状态码与错误 body 截断，请求头一律不记
+        with _provider_balance_refresh_lock:
+            _provider_balance_refresh_state["last_fail_attempt"] = time.time()
+        if http_status is None:
+            app.logger.warning("provider balance refresh 失败（%s）", code)
+        else:
+            app.logger.warning(
+                "provider balance refresh 失败（%s, HTTP %s）：%s",
+                code, http_status, resp_excerpt or "")
         return _admin_v1_error(status, code, message)
 
     try:
@@ -6856,19 +6885,29 @@ def admin_v1_billing_provider_balance_refresh():
     except (requests.ConnectionError, requests.Timeout):
         return _fail(502, "provider_unreachable", "官方余额端点不可达")
     except Exception:
+        # 兜底必须记异常对象（否则真实失败原因无法诊断，2026-09-11）
+        app.logger.exception("provider balance refresh 请求异常")
         return _fail(502, "provider_error", "官方余额端点请求失败")
     if 400 <= resp.status_code < 500:
         return _fail(502, "provider_rejected",
-                     "官方余额端点拒绝（HTTP %d）" % resp.status_code)
+                     "官方余额端点拒绝（HTTP %d）" % resp.status_code,
+                     http_status=resp.status_code,
+                     resp_excerpt=_resp_excerpt(resp))
     if resp.status_code != 200:
         return _fail(502, "provider_error",
-                     "官方余额端点异常（HTTP %d）" % resp.status_code)
+                     "官方余额端点异常（HTTP %d）" % resp.status_code,
+                     http_status=resp.status_code,
+                     resp_excerpt=_resp_excerpt(resp))
     try:
         body = resp.json()
     except ValueError:  # requests JSONDecodeError 是 ValueError 子类
-        return _fail(502, "provider_error", "官方余额响应非 JSON")
+        return _fail(502, "provider_error", "官方余额响应非 JSON",
+                     http_status=resp.status_code,
+                     resp_excerpt=_resp_excerpt(resp))
     if not isinstance(body, dict):
-        return _fail(502, "provider_error", "官方余额响应形态非法")
+        return _fail(502, "provider_error", "官方余额响应形态非法",
+                     http_status=resp.status_code,
+                     resp_excerpt=_resp_excerpt(resp))
     infos = body.get("balance_infos")
     cny = None
     if isinstance(infos, list):
@@ -6878,7 +6917,9 @@ def admin_v1_billing_provider_balance_refresh():
                 cny = info
                 break
     if cny is None:
-        return _fail(502, "invalid_balance_response", "响应缺少 CNY 余额条目")
+        return _fail(502, "invalid_balance_response", "响应缺少 CNY 余额条目",
+                     http_status=resp.status_code,
+                     resp_excerpt=_resp_excerpt(resp))
     try:
         total = billing_pricing.parse_balance_to_nano(cny["total_balance"])
         granted = billing_pricing.parse_balance_to_nano(
@@ -6887,7 +6928,9 @@ def admin_v1_billing_provider_balance_refresh():
             cny.get("topped_up_balance"))
     except (KeyError, TypeError, ValueError):
         # 不写伪造零余额：解析失败只报错误类别（§5/§6.6）
-        return _fail(502, "invalid_balance_response", "余额金额解析失败")
+        return _fail(502, "invalid_balance_response", "余额金额解析失败",
+                     http_status=resp.status_code,
+                     resp_excerpt=_resp_excerpt(resp))
     is_available = bool(body.get("is_available"))
     try:
         snapshot = billing_store.insert_provider_balance_snapshot(
@@ -6896,6 +6939,10 @@ def admin_v1_billing_provider_balance_refresh():
     except Exception:
         app.logger.exception("provider balance 快照写入失败")
         return _admin_v1_error(500, "internal", "余额快照写入失败")
+    # 成功：盖成功章、清失败章（失败章只影响 10s 重试节奏）
+    with _provider_balance_refresh_lock:
+        _provider_balance_refresh_state["last_ok_attempt"] = time.time()
+        _provider_balance_refresh_state["last_fail_attempt"] = 0.0
     _audit("billing.provider_balance_refresh",
            target_type="provider_balance", target_id=BILLING_BALANCE_PROVIDER,
            detail={"status": "ok", "is_available": is_available})

@@ -17,12 +17,14 @@ PG 模式（RUN_PG_TESTS=1）：
     金额保持 null 不混 0 元）；
   - 未开户 account:null（不伪造 0 余额）；开户后余额 = ledger 合计；
   - provider balance refresh：mock HTTP（FakeRequests）覆盖成功写快照 / 4xx /
-    网络失败 / Decimal 非法 / 不写伪造零余额 / 60s 节流 / key 不进响应。
+    网络失败 / Decimal 非法 / 不写伪造零余额 / 成功 60s 节流 / 失败 10s 重试窗
+    （fix 2026-09-11：失败不盖成功章）/ 失败日志可诊断且 key 不进日志与响应。
 
 运行：cd 项目根 && python3 -m pytest tests/test_admin_api_v1.py -q
 （PG 双跑：RUN_PG_TESTS=1 python3 -m pytest tests/test_admin_api_v1.py -q）
 """
 import json
+import logging
 import os
 import sys
 import uuid
@@ -57,7 +59,7 @@ def _isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
     # provider balance refresh 的进程内节流状态跨用例必须复位
     monkeypatch.setattr(app_mod, "_provider_balance_refresh_state",
-                        {"last_ok_attempt": 0.0})
+                        {"last_ok_attempt": 0.0, "last_fail_attempt": 0.0})
     yield
 
 def _client():
@@ -932,13 +934,116 @@ def test_provider_balance_refresh_throttled(monkeypatch):
     assert c.post("/api/admin/v1/billing/provider-balance/refresh").status_code == 200
     r = c.post("/api/admin/v1/billing/provider-balance/refresh")
     assert r.status_code == 429
+    err = r.get_json()["error"]
+    assert err["code"] == "refresh_throttled"
+    # 429 message 带还需等待的秒数（2026-09-11 可诊断性修复）
+    assert "还需等待" in err["message"]
+    assert any(ch.isdigit() for ch in err["message"])
+
+def test_provider_balance_refresh_failure_retry_window_10s(monkeypatch):
+    """失败只进 10s 重试窗（fix 2026-09-11）：失败盖 fail 章、**不动**成功章
+    ——重试不再被 60s 成功冷却误伤，真实错误可尽快复现诊断。"""
+    owner, _u = _setup_users()
+    _write_ai_config(monkeypatch)
+    fake = _fake_requests(monkeypatch)
+    fake.register_json("GET", "/user/balance", status=500,
+                       body={"error": "upstream boom"})
+    c = _login(_client(), owner)
+    state = app_mod._provider_balance_refresh_state
+
+    def _rewind_fail_window():
+        state["last_fail_attempt"] -= (
+            app_mod.PROVIDER_BALANCE_REFRESH_FAILURE_RETRY_SECONDS + 1.0)
+
+    r = c.post("/api/admin/v1/billing/provider-balance/refresh")
+    assert r.status_code == 502
+    assert r.get_json()["error"]["code"] == "provider_error"
+    # 失败不盖成功章
+    assert state["last_ok_attempt"] == 0.0
+    assert state["last_fail_attempt"] > 0.0
+    # 失败后立即重试 → 429（10s 窗内），message 带还需等待秒数
+    r = c.post("/api/admin/v1/billing/provider-balance/refresh")
+    assert r.status_code == 429
+    err = r.get_json()["error"]
+    assert err["code"] == "refresh_throttled"
+    assert "还需等待" in err["message"]
+    # 失败章拨回 10s 前 → 放行：请求真实重发（路由仍 500 → 再 502）
+    _rewind_fail_window()
+    n = len(fake.calls)
+    assert c.post("/api/admin/v1/billing/provider-balance/refresh").status_code == 502
+    assert len(fake.calls) == n + 1
+    # 越过失败窗后路由换成功 → 刷新成功：盖成功章、清失败章
+    _rewind_fail_window()
+    fake.register_json("GET", "/user/balance", status=200, body=_BALANCE_OK)
+    r = c.post("/api/admin/v1/billing/provider-balance/refresh")
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert state["last_ok_attempt"] > 0.0
+    assert state["last_fail_attempt"] == 0.0
+    # 成功章语义不回退：60s 内再刷仍 429
+    assert c.post("/api/admin/v1/billing/provider-balance/refresh").status_code == 429
+
+def test_provider_balance_refresh_failure_logs_no_api_key(monkeypatch, caplog):
+    """失败日志可诊断（fix 2026-09-11）：warning 含类别 + 上游 HTTP 状态码 +
+    错误 body 截断；api_key 只在请求头，绝不进日志。"""
+    owner, _u = _setup_users()
+    _write_ai_config(monkeypatch)
+    fake = _fake_requests(monkeypatch)
+    fake.register_json(
+        "GET", "/user/balance", status=401,
+        body={"error": {"message": "Invalid Credential Sentinel-401"}})
+    c = _login(_client(), owner)
+    with caplog.at_level(logging.WARNING):
+        r = c.post("/api/admin/v1/billing/provider-balance/refresh")
+    assert r.status_code == 502
+    text = caplog.text
+    assert "provider balance refresh 失败（provider_rejected, HTTP 401）" in text
+    assert "Sentinel-401" in text  # 上游错误 body 进日志（此前全部丢弃）
+    assert "sk-official-key-123456" not in text  # api_key 绝不泄入日志
+
+def test_provider_balance_refresh_log_excerpt_truncated(monkeypatch, caplog):
+    """错误 body 只记前 300 字符（防日志膨胀）。"""
+    owner, _u = _setup_users()
+    _write_ai_config(monkeypatch)
+    fake = _fake_requests(monkeypatch)
+    fake.register_json("GET", "/user/balance", status=500,
+                       body={"error": "HEAD<<<" + "A" * 400 + ">>>TAIL"})
+    c = _login(_client(), owner)
+    with caplog.at_level(logging.WARNING):
+        r = c.post("/api/admin/v1/billing/provider-balance/refresh")
+    assert r.status_code == 502
+    text = caplog.text
+    assert "HEAD<<<" in text          # 截断起点之前的错误信息已记录
+    assert ">>>TAIL" not in text      # 300 字符截断生效
+
+def test_provider_balance_refresh_unexpected_exception_logged(monkeypatch, caplog):
+    """except Exception 兜底必须记异常对象（logger.exception，fix 2026-09-11），
+    且失败盖 fail 章：10s 内重试 429 而非静默放行。"""
+    owner, _u = _setup_users()
+    _write_ai_config(monkeypatch)
+    fake = _fake_requests(monkeypatch)
+
+    def _boom(body, query, headers, kwargs):
+        raise RuntimeError("UnexpectedBoom-Sentinel")
+
+    fake.register("GET", "/user/balance", _boom)
+    c = _login(_client(), owner)
+    with caplog.at_level(logging.ERROR):
+        r = c.post("/api/admin/v1/billing/provider-balance/refresh")
+    assert r.status_code == 502
+    assert r.get_json()["error"]["code"] == "provider_error"
+    assert "UnexpectedBoom-Sentinel" in caplog.text  # 异常对象进了日志
+    assert "sk-official-key-123456" not in caplog.text
+    # 失败盖 fail 章（不动成功章）→ 10s 内重试 429
+    assert app_mod._provider_balance_refresh_state["last_ok_attempt"] == 0.0
+    r = c.post("/api/admin/v1/billing/provider-balance/refresh")
+    assert r.status_code == 429
     assert r.get_json()["error"]["code"] == "refresh_throttled"
 
 def test_provider_balance_refresh_not_configured(monkeypatch):
     owner, _u = _setup_users()
     _fake_requests(monkeypatch)
     c = _login(_client(), owner)
-    # 无官方 key → 400（且不消耗节流窗口）
+    # 无官方 key → 400（请求未发出，不消耗任何节流窗口）
     r = c.post("/api/admin/v1/billing/provider-balance/refresh")
     assert r.status_code == 400
     assert r.get_json()["error"]["code"] == "provider_not_configured"
@@ -947,6 +1052,11 @@ def test_provider_balance_refresh_not_configured(monkeypatch):
     r = c.post("/api/admin/v1/billing/provider-balance/refresh")
     assert r.status_code == 400
     assert r.get_json()["error"]["code"] == "provider_not_configured"
+    # 配置类拒绝不盖任何章：随后配置修复即可成功刷新（无 429 误伤）
+    _write_ai_config(monkeypatch)
+    fake = _fake_requests(monkeypatch)
+    fake.register_json("GET", "/user/balance", status=200, body=_BALANCE_OK)
+    assert c.post("/api/admin/v1/billing/provider-balance/refresh").status_code == 200
 
 # --------------------------------------------------------------------------- #
 # 批次 B：金额 policy/window 只读出口（/api/admin/v1/spend/*）

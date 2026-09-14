@@ -60,6 +60,7 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.delenv("PLUGINS_SOURCE_POLICY_FILE", raising=False)
     monkeypatch.delenv("SAMPLE_PLUGIN_ENABLED", raising=False)
     monkeypatch.delenv("HISTOPILOT_UI_ENABLED", raising=False)
+    monkeypatch.delenv("PUBLIC_ORIGINS", raising=False)
     # PLUGIN_BUNDLES_DIR 显式指到空目录：仓库 plugins/ 目录（PLUGINS_DIR）仍是
     # pathtogether-admin 的发现来源，且不泄漏本机部署的 bundle
     monkeypatch.setattr(app_mod, "PLUGIN_BUNDLES_DIR", tmp_path / "no-bundles")
@@ -672,6 +673,7 @@ def test_asset_csp_prefers_public_base_url_over_request_host(monkeypatch):
     owner, _u = _setup_users()
     _install_admin_plugin()
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://pt.example")
+    monkeypatch.delenv("PUBLIC_ORIGINS", raising=False)
     oc = _login(_client(), owner)
     r = oc.get(ASSET_BASE + "/ui/index.html")
     assert r.status_code == 200
@@ -680,6 +682,41 @@ def test_asset_csp_prefers_public_base_url_over_request_host(monkeypatch):
                    "style-src https://pt.example; img-src https://pt.example; "
                    "frame-ancestors 'self'")
     assert "http://localhost" not in csp
+
+
+def test_asset_csp_includes_public_origins(monkeypatch):
+    """多入口：PUBLIC_ORIGINS 并入 iframe CSP，且仍不信任 request.host_url。"""
+    owner, _u = _setup_users()
+    _install_admin_plugin()
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://pt.example")
+    monkeypatch.setenv(
+        "PUBLIC_ORIGINS",
+        "https://histopilot.com, https://histopilot.cn, https://pt.example/")
+    oc = _login(_client(), owner)
+    r = oc.get(ASSET_BASE + "/ui/index.html")
+    assert r.status_code == 200
+    csp = r.headers["Content-Security-Policy"]
+    assert csp == (
+        "default-src 'none'; "
+        "script-src https://pt.example https://histopilot.com https://histopilot.cn; "
+        "style-src https://pt.example https://histopilot.com https://histopilot.cn; "
+        "img-src https://pt.example https://histopilot.com https://histopilot.cn; "
+        "frame-ancestors 'self'")
+    assert "http://localhost" not in csp
+
+
+@pytest.mark.parametrize("bad", _BAD_PUBLIC_BASE_URLS + ["   ,  ,"])
+def test_asset_csp_fails_closed_on_invalid_public_origins(monkeypatch, bad):
+    """PUBLIC_ORIGINS 非法/空列表 → 与非法 PUBLIC_BASE_URL 同样 fail-closed。"""
+    owner, _u = _setup_users()
+    _install_admin_plugin()
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://pt.example")
+    monkeypatch.setenv("PUBLIC_ORIGINS", bad)
+    oc = _login(_client(), owner)
+    r = oc.get(ASSET_BASE + "/ui/index.html")
+    assert r.status_code == 200
+    assert r.headers["Content-Security-Policy"] == \
+        "default-src 'none'; frame-ancestors 'self'"
 
 
 @pytest.mark.parametrize("bad", _BAD_PUBLIC_BASE_URLS)
@@ -904,7 +941,10 @@ def test_admin_manifest_plugin_version_bumped_with_hashes():
     main.js hash 与 manifest pin 同步。"""
     data = json.loads(ADMIN_MANIFEST.read_text(encoding="utf-8"))
     # 2026-09-10 0.4.4：步数上限 500→100（§2 A：input max/校验区间/帮助文案）
-    assert data["pluginVersion"] == "0.4.4"  # hashes/pin 同步
+    # 2026-09-14 0.4.5（W2 admin UI）：格式申请工单页（format-requests：
+    # admin.formatRequests.list/get/patch，复用 users 权限域不扩域），
+    # hashes/pin 同步
+    assert data["pluginVersion"] == "0.4.5"  # hashes/pin 同步
     assert "admin:settings:read" in data["adminPermissions"]
     assert "admin:settings:write" in data["adminPermissions"]
     assert "admin:slides:read" in data["adminPermissions"]

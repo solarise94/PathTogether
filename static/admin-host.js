@@ -48,6 +48,9 @@
    （GET /api/admin/v1/settings/model，settings:read）与
    admin.settings.model.update（PUT 同路径 body {model}，settings:write）；
    options 白名单与限时模型 transport 自动落回 inline 由服务端权威执行。
+   2026-09-14（W2 admin UI）：格式支持申请工单上桥——admin.formatRequests.
+   list/get（users:read）与 patch（users:write，CAS 状态机），复用 users
+   权限域不扩域；样本文件下载不经桥（iframe 消费不了 blob）。
    ========================================================================= */
 (function () {
   "use strict";
@@ -135,6 +138,15 @@
     "admin.settings.model": "admin:settings:read",
     "admin.settings.model.update": "admin:settings:write",
     "admin.spend.currentWindow.adjust": "admin:settings:write",
+    // 2026-09-14（W2 admin UI）：格式支持申请工单（format-requests）。
+    // 复用 users 权限域（manifest adminPermissions 不扩域）：list/get 是
+    // owner 只读 → admin:users:read；patch 是状态机 CAS 写 →
+    // admin:users:write。样本文件下载（send_file attachment）**不经桥**：
+    // opaque iframe 无法消费 blob，宿主也不把文件字节注入 iframe——桥只
+    // 透传 JSON（public_view 元数据，样本以 has_sample/name/size 呈现）。
+    "admin.formatRequests.list": "admin:users:read",
+    "admin.formatRequests.get": "admin:users:read",
+    "admin.formatRequests.patch": "admin:users:write",
   };
 
   // 参数 schema（§14.1：每方法白名单 + 类型/长度/枚举/范围；未声明属性
@@ -144,6 +156,8 @@
   var _cursorSpec = { type: "string", maxLength: 512, nullable: true };
   var _limitSpec = { type: "integer", min: 1, max: 200 };
   var _userIdSpec = { type: "string", minLength: 1, maxLength: 128 };
+  // W2：格式申请工单 id（pathId 防路径拼接，与 user_id/invite_id 同规格）
+  var _requestIdSpec = { type: "string", minLength: 1, maxLength: 128 };
   var _budgetIntSpec = function (min) {
     return { type: "integer", min: min, max: 1000000 };
   };
@@ -398,6 +412,43 @@
         version: { type: "integer", min: 1 },
       },
       required: ["window_id", "limit_nano_snapshot", "version"],
+      additionalProperties: false,
+    },
+
+    // ---- 2026-09-14（W2）：格式支持申请工单 ----
+    // list：游标/页大小/可选 business_status 枚举过滤（缺省=全部）。
+    // get：request_id 必填（经 pathId 拒绝空值与 "/"、"?"）。
+    // patch：CAS 状态迁移——business_status 枚举 + expected_version（来自
+    // 列表/详情快照的 version，缺一即拒）；admin_note 可选（≤2000 字符，
+    // 与服务端截断一致；缺省=保持现值，空串=清除，由调用方决定是否携带）。
+    "admin.formatRequests.list": {
+      properties: {
+        cursor: _cursorSpec,
+        limit: _limitSpec,
+        status: {
+          type: "string",
+          enum: ["submitted", "reviewing", "supported", "declined"],
+          nullable: true,
+        },
+      },
+      additionalProperties: false,
+    },
+    "admin.formatRequests.get": {
+      properties: { request_id: _requestIdSpec },
+      required: ["request_id"],
+      additionalProperties: false,
+    },
+    "admin.formatRequests.patch": {
+      properties: {
+        request_id: _requestIdSpec,
+        business_status: {
+          type: "string",
+          enum: ["submitted", "reviewing", "supported", "declined"],
+        },
+        expected_version: { type: "integer", min: 1 },
+        admin_note: { type: "string", maxLength: 2000, nullable: true },
+      },
+      required: ["request_id", "business_status", "expected_version"],
       additionalProperties: false,
     },
   };
@@ -1054,6 +1105,43 @@
       return jsonWrite(url, "POST", {
         expected_version: payload.expected_version,
       })(ctx);
+    },
+
+    // ---- 2026-09-14（W2）：格式支持申请工单（format-requests）----
+    // list：GET /api/admin/v1/format-requests（游标 + 可选状态过滤，成功
+    // 体 {items, next_cursor}）；get：GET .../<id>（public_view admin 视图）。
+    // patch：PATCH .../<id>，body {business_status, expected_version,
+    // admin_note?}；409 format_request_version_conflict / 409
+    // format_request_invalid_transition 经 backendError 原样透传给插件 UI。
+    // 样本文件本体（send_file attachment）不经桥：iframe 是 opaque origin
+    // 消费不了 blob，宿主也不把文件字节注入 iframe——样本以元数据呈现。
+    "admin.formatRequests.list": function (ctx, payload) {
+      var url = "/api/admin/v1/format-requests" + buildQuery({
+        cursor: payload.cursor, limit: payload.limit, status: payload.status,
+      });
+      return ctx.fetchJson(url).then(function (res) {
+        if (!res.ok) throw backendError(url, res);
+        return res.body;
+      });
+    },
+
+    "admin.formatRequests.get": function (ctx, payload) {
+      var url = "/api/admin/v1/format-requests/" +
+          pathId(payload.request_id, "request_id");
+      return jsonGet(url)(ctx);
+    },
+
+    "admin.formatRequests.patch": function (ctx, payload) {
+      var url = "/api/admin/v1/format-requests/" +
+          pathId(payload.request_id, "request_id");
+      var body = {
+        business_status: payload.business_status,
+        expected_version: payload.expected_version,
+      };
+      if (payload.admin_note !== undefined && payload.admin_note !== null) {
+        body.admin_note = payload.admin_note;
+      }
+      return jsonWrite(url, "PATCH", body)(ctx);
     },
   };
 

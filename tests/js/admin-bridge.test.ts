@@ -419,11 +419,17 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 		// 2026-09-08（review P2-2 产品闭环）：新增 users.identityConflicts
 		// （身份冲突清单，owner 只读 users:read）与 users.discardPending
 		// （孤儿 pending 行物理删除，不可逆，users:write），29 → 31
-		// 2026-09-09（0.4.2）：新增 settings.model（平台默认模型读，
-		// settings:read）与 settings.model.update（切换写，settings:write），
-		// 31 → 33
-		expect(Object.keys(table)).toHaveLength(33);
-		expect(table["admin.settings.model"]).toBe("admin:settings:read");
+			// 2026-09-09（0.4.2）：新增 settings.model（平台默认模型读，
+			// settings:read）与 settings.model.update（切换写，settings:write），
+			// 31 → 33
+			// 2026-09-14（W2 admin UI）：新增 formatRequests.list/get（格式申请
+			// 工单只读，users:read）与 formatRequests.patch（CAS 状态机写，
+			// users:write）——复用 users 权限域不扩域，33 → 36
+			expect(Object.keys(table)).toHaveLength(36);
+			expect(table["admin.formatRequests.list"]).toBe("admin:users:read");
+			expect(table["admin.formatRequests.get"]).toBe("admin:users:read");
+			expect(table["admin.formatRequests.patch"]).toBe("admin:users:write");
+			expect(table["admin.settings.model"]).toBe("admin:settings:read");
 		expect(table["admin.settings.model.update"]).toBe("admin:settings:write");
 		expect(table["admin.users.identityConflicts"]).toBe("admin:users:read");
 		expect(table["admin.users.discardPending"]).toBe("admin:users:write");
@@ -496,6 +502,8 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			"admin.siteStats.get",
 			// 批次 F：运行时安全参数写 schema（五参数子集白名单）
 			"admin.settings.runtime.update",
+			// W2（2026-09-14）：格式申请工单（游标/页大小/状态枚举过滤）
+			"admin.formatRequests.list",
 		]) {
 			expect(schemas[method], method).toBeTruthy();
 			// 附加属性一律拒绝（iframe 不能借桥传任意字段）
@@ -1780,5 +1788,165 @@ describe("AdminBridge host — wave 2：users/invites 总额度字段过桥（Ba
 			.toBe("invalid_params");
 		expect((responses(posted, "r3")[0].env.error as { code: string }).code)
 			.toBe("invalid_params");
+	});
+});
+
+describe("AdminBridge host — W2 格式申请工单方法（format-requests，2026-09-14）", () => {
+	const PERMS = ["admin:users:read", "admin:users:write"];
+
+	function makeFmtHost(
+		fetchJson: (url: string, o?: unknown) => Promise<unknown>,
+	) {
+		return makeHost({ permissions: PERMS, fetchJson });
+	}
+
+	it("formatRequests.list maps cursor/limit/status into the query string", async () => {
+		const calls: string[] = [];
+		const { handle, posted, contentWindow } = makeFmtHost(async (url) => {
+			calls.push(url);
+			return { status: 200, ok: true, body: { items: [], next_cursor: null } };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.formatRequests.list", {
+				cursor: "cx9", limit: 25, status: "submitted",
+			}),
+		});
+		await ticks();
+		expect(calls[0]).toBe(
+			"/api/admin/v1/format-requests?cursor=cx9&limit=25&status=submitted");
+		expect(responses(posted, "r1")[0].env.ok).toBe(true);
+	});
+
+	it("formatRequests.get/patch hit the id path; patch PATCHes CAS body (admin_note optional)", async () => {
+		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+		const { handle, posted, contentWindow } = makeFmtHost(async (url, o) => {
+			const raw = (o as { body?: string } | undefined)?.body;
+			calls.push({
+				url, method: (o as { method?: string } | undefined)?.method,
+				...(raw ? { body: JSON.parse(String(raw)) } : {}),
+			});
+			return { status: 200, ok: true, body: { id: "fr_1", version: 2 } };
+		});
+		handle._handleIframeLoad();
+		const nonce = nonce0(posted);
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r1", "admin.formatRequests.get", {
+				request_id: "fr_1",
+			}),
+		});
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r2", "admin.formatRequests.patch", {
+				request_id: "fr_1", business_status: "reviewing",
+				expected_version: 2, admin_note: "排期评估",
+			}),
+		});
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r3", "admin.formatRequests.patch", {
+				request_id: "fr_1", business_status: "declined",
+				expected_version: 3,
+			}),
+		});
+		await ticks();
+		expect(calls[0]).toEqual({
+			url: "/api/admin/v1/format-requests/fr_1", method: undefined,
+		});
+		expect(calls[1]).toEqual({
+			url: "/api/admin/v1/format-requests/fr_1", method: "PATCH",
+			body: { business_status: "reviewing", expected_version: 2,
+				admin_note: "排期评估" },
+		});
+		// admin_note 缺省不携带（服务端 None=保持不变）
+		expect(calls[2]).toEqual({
+			url: "/api/admin/v1/format-requests/fr_1", method: "PATCH",
+			body: { business_status: "declined", expected_version: 3 },
+		});
+	});
+
+	it("schema gate：状态枚举/必填/version 下限；request_id 含 / 即拒（零后端调用）", async () => {
+		const calls: string[] = [];
+		const { handle, posted, contentWindow } = makeFmtHost(async (url) => {
+			calls.push(url);
+			return { status: 200, ok: true, body: {} };
+		});
+		handle._handleIframeLoad();
+		const nonce = nonce0(posted);
+		const bad: Array<[string, unknown]> = [
+			["admin.formatRequests.list", { status: "closed" }],          // 枚举外
+			["admin.formatRequests.list", { q: "ndpi" }],                 // 未声明字段
+			["admin.formatRequests.get", {}],                             // 缺 request_id
+			["admin.formatRequests.patch", {
+				request_id: "fr_1", business_status: "supported",
+			}],                                                             // 缺 expected_version
+			["admin.formatRequests.patch", {
+				request_id: "fr_1", business_status: "reopen",
+				expected_version: 1,
+			}],                                                             // 枚举外
+			["admin.formatRequests.patch", {
+				request_id: "fr_1", business_status: "supported",
+				expected_version: 0,
+			}],                                                             // version min 1
+			["admin.formatRequests.get", {
+				request_id: "fr_1/../../api/admin/v1/users",
+			}],                                                             // pathId 拒
+		];
+		for (let i = 0; i < bad.length; i++) {
+			handle._handleWindowMessage({
+				source: contentWindow,
+				data: requestEnv(nonce, "b-" + i, bad[i][0], bad[i][1]),
+			});
+		}
+		await ticks();
+		for (let i = 0; i < bad.length; i++) {
+			const rs = responses(posted, "b-" + i);
+			expect(rs, bad[i][0]).toHaveLength(1);
+			expect(rs[0].env.ok, bad[i][0]).toBe(false);
+			expect((rs[0].env.error as { code: string }).code, bad[i][0])
+				.toBe("invalid_params");
+		}
+		expect(calls).toEqual([]); // 全部在桥层拒绝，后端零调用
+	});
+
+	it("409 format_request_version_conflict 原样透传（backendError 信封映射）", async () => {
+		const { handle, posted, contentWindow } = makeFmtHost(async () => ({
+			status: 409, ok: false,
+			body: { error: { code: "format_request_version_conflict",
+				message: "版本冲突，请刷新后重试" } },
+		}));
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.formatRequests.patch", {
+				request_id: "fr_1", business_status: "reviewing", expected_version: 1,
+			}),
+		});
+		await ticks();
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(false);
+		expect(rs[0].env.error).toEqual({
+			code: "format_request_version_conflict", message: "版本冲突，请刷新后重试",
+		});
+	});
+
+	it("patch 需要 admin:users:write（仅 users:read 时 permission_denied）", async () => {
+		const { handle, posted, contentWindow } = makeHost({
+			permissions: ["admin:users:read"], // 只读：patch 应被拒
+			fetchJson: async () => ({ status: 200, ok: true, body: {} }),
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.formatRequests.patch", {
+				request_id: "fr_1", business_status: "reviewing", expected_version: 1,
+			}),
+		});
+		await ticks();
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(false);
+		expect((rs[0].env.error as { code: string }).code).toBe("permission_denied");
 	});
 });

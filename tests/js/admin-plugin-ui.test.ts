@@ -2259,3 +2259,309 @@ describe("copyToClipboard 三级降级 + 复制按钮反馈（2026-09-11 修复�
 		expect(h.els["adm-plugins-status"].textContent).toBe("已复制");
 	});
 });
+
+// --------------------------------------------------------------------------- //
+// W2（2026-09-14）：格式申请页（format-requests）——清单/筛选/分页 +
+// 内联详情（public_view 白名单渲染）+ 状态机 CAS 迁移（admin_note 可选）。
+// --------------------------------------------------------------------------- //
+describe("W2 — 格式申请页（format-requests）", () => {
+	const NONCE = "f9".repeat(32);
+
+	function boot(bus: ReturnType<typeof loadPluginUiWithBus>) {
+		bus.dispatch(bus.parent, {
+			kind: "init", bridge: "admin", protocolVersion: "1.0.0",
+			nonce: NONCE, adminPermissions: ["admin:users:read", "admin:users:write"],
+		});
+		expect(bus.client!.handshakeState().ready).toBe(true);
+	}
+
+	// public_view admin 视图（服务端 admin=True 形态）；sample_internal_ref
+	// 刻意混入 —— UI 白名单渲染必须把它挡在 DOM 之外
+	const FR_SUBMITTED = {
+		id: "fr_0001",
+		format_ext: "ndpi",
+		message: "Leica Aperio 的 ndpi 扫描件打不开，能否支持？",
+		contact: "user@example.com",
+		business_status: "submitted",
+		created_at: "2026-09-14T03:21:07+00:00",
+		updated_at: "2026-09-14T03:21:07+00:00",
+		has_sample: true,
+		sample_name: "sample-001.ndpi",
+		sample_size: 52428800,
+		sample_missing: false,
+		mail_status: "sent",
+		owner_user_id: "usr_77",
+		admin_note: null,
+		version: 3,
+		mail_attempts: 1,
+		mail_last_error: null,
+		sample_sha256: "ab".repeat(32),
+		sample_internal_ref: "/internal/format_requests/fr_0001/sample.bin",
+	};
+
+	it("HTML/PAGE_TITLES：导航按钮、页面骨架与表列齐备；状态枚举四态可选", () => {
+		// 导航按钮（切片之后）+ 深链白名单 slug
+		expect(htmlSrc).toContain('data-page="format-requests"');
+		expect(htmlSrc).toMatch(/data-page="slides"[^<]*>切片<\/button>\s*<button[^>]*data-page="format-requests"[^>]*>格式申请<\/button>/);
+		expect(src).toContain('"format-requests": "格式申请"');
+		expect(src).toMatch(/name === "format-requests"\) loadFormatRequests\(false\)/);
+		// 页面骨架：状态条/筛选/表格/确认条/详情容器/分页
+		const frStart = htmlSrc.indexOf('id="adm-page-format-requests"');
+		expect(frStart).toBeGreaterThan(-1);
+		const frEnd = htmlSrc.indexOf('id="adm-page-invites"');
+		const page = htmlSrc.slice(frStart, frEnd);
+		expect(page).toContain('id="adm-state-format-requests"');
+		expect(page).toContain('id="adm-format-status"');
+		expect(page).toContain('value="submitted"');
+		expect(page).toContain('value="reviewing"');
+		expect(page).toContain('value="supported"');
+		expect(page).toContain('value="declined"');
+		expect(page).toContain("<th>提交时间</th>");
+		expect(page).toContain("<th>申请人</th>");
+		expect(page).toContain(">格式</th>");
+		expect(page).toContain("<th>业务状态</th>");
+		expect(page).toContain(">邮件</th>");
+		expect(page).toContain(">样本</th>");
+		expect(page).toContain('id="adm-format-tbody"');
+		expect(page).toContain('id="adm-format-confirm"');
+		expect(page).toContain('id="adm-format-detail"');
+		expect(page).toContain('id="adm-format-more-btn"');
+		// 样本只展示元数据：内嵌文件/服务器内部路径不是本页的展示义务
+		expect(htmlSrc).not.toContain("sample_internal_ref");
+		expect(cssSrc).not.toContain("sample_internal_ref");
+		expect(src).not.toContain("sample_internal_ref");
+	});
+
+	it("showPage：首屏只发 formatRequests.list；submitted 行完整渲染（无缺失错误码）", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		bus.client!.showPage("format-requests");
+		await ticks(4);
+		const req = bus.parentPosted
+			.filter((p) => p.env.kind === "request").at(-1);
+		expect(req!.env.method).toBe("admin.formatRequests.list");
+		expect(req!.env.payload).toEqual({ limit: 50, cursor: null });
+		replyMethod(bus, NONCE, "admin.formatRequests.list", {
+			ok: true,
+			result: { items: [FR_SUBMITTED], next_cursor: null },
+		});
+		await ticks(4);
+		const st = bus.els["adm-state-format-requests"];
+		expect(st.getAttribute("data-page-state")).toBe("ready");
+		const tbody = bus.els["adm-format-tbody"].textContent;
+		expect(tbody).toContain("2026-09-14 11:21:07 GMT+8");
+		expect(tbody).toContain("usr_77");
+		expect(tbody).toContain("ndpi");
+		expect(tbody).toContain("待评估");
+		expect(tbody).toContain("sent");
+		expect(tbody).toContain("有");
+		expect(tbody).not.toContain("undefined");
+		expect(tbody).not.toContain("NaN");
+		// 内部路径绝不进表格
+		expect(tbody).not.toContain("/internal/");
+	});
+
+	it("筛选：状态 select → list 请求携带 status=submitted；空结果给解释型空态", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		bus.client!.showPage("format-requests");
+		await ticks(4);
+		bus.doc.getElementById("adm-format-status")!.value = "submitted";
+		bus.els["adm-format-search-btn"]._fire("click", {});
+		await ticks(2);
+		const req = bus.parentPosted
+			.filter((p) => p.env.kind === "request" &&
+				p.env.method === "admin.formatRequests.list").at(-1);
+		expect(req!.env.payload).toEqual({ limit: 50, cursor: null, status: "submitted" });
+		replyMethod(bus, NONCE, "admin.formatRequests.list", {
+			ok: true, result: { items: [], next_cursor: null },
+		});
+		await ticks(4);
+		const st = bus.els["adm-state-format-requests"];
+		expect(st.getAttribute("data-page-state")).toBe("empty");
+		expect(st.textContent).toContain("submitted");
+	});
+
+	it("详情：get 快照白名单渲染（含样本元数据/SHA-256）；内部路径被挡在 DOM 外", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		bus.client!.showPage("format-requests");
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.formatRequests.list", {
+			ok: true, result: { items: [FR_SUBMITTED], next_cursor: null },
+		});
+		await ticks(4);
+		const detailBtn = bus.created.find((el) => el.textContent === "详情" &&
+			el._listeners && el._listeners.click);
+		expect(detailBtn).toBeTruthy();
+		detailBtn!._fire("click", {});
+		await ticks(2);
+		const getReq = bus.parentPosted
+			.filter((p) => p.env.kind === "request" &&
+				p.env.method === "admin.formatRequests.get").at(-1);
+		expect(getReq!.env.payload).toEqual({ request_id: "fr_0001" });
+		replyMethod(bus, NONCE, "admin.formatRequests.get", {
+			ok: true, result: FR_SUBMITTED,
+		});
+		await ticks(4);
+		const detail = bus.els["adm-format-detail"].textContent;
+		expect(detail).toContain("Leica Aperio");
+		expect(detail).toContain("user@example.com");
+		expect(detail).toContain("sample-001.ndpi");
+		expect(detail).toContain("50.0 MB");
+		expect(detail).toContain("abab");
+		expect(detail).toContain("CAS 版本");
+		expect(detail).toContain("样本下载走宿主鉴权接口");
+		// 白名单渲染：响应里的内部路径/未知字段绝不进 DOM
+		expect(detail).not.toContain("/internal/");
+		expect(detail).not.toContain("sample.bin");
+	});
+
+	it("开始评估（submitted→reviewing）：直接提交 CAS；admin_note 未修改不携带", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		bus.client!.showPage("format-requests");
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.formatRequests.list", {
+			ok: true, result: { items: [FR_SUBMITTED], next_cursor: null },
+		});
+		await ticks(4);
+		bus.created.find((el) => el.textContent === "详情" &&
+			el._listeners && el._listeners.click)!._fire("click", {});
+		await ticks(2);
+		replyMethod(bus, NONCE, "admin.formatRequests.get", {
+			ok: true, result: { ...FR_SUBMITTED, admin_note: "旧备注" },
+		});
+		await ticks(4);
+		const startBtn = bus.created.find((el) => el.textContent === "开始评估" &&
+			el._listeners && el._listeners.click);
+		expect(startBtn).toBeTruthy();
+		startBtn!._fire("click", {});
+		await ticks(2);
+		const req = bus.parentPosted
+			.filter((p) => p.env.kind === "request" &&
+				p.env.method === "admin.formatRequests.patch").at(-1);
+		expect(req!.env.payload).toEqual({
+			request_id: "fr_0001", business_status: "reviewing",
+			expected_version: 3,
+		});
+		replyMethod(bus, NONCE, "admin.formatRequests.patch", {
+			ok: true, result: { ...FR_SUBMITTED, business_status: "reviewing", version: 4 },
+		});
+		await ticks(4);
+		expect(bus.els["adm-format-list-status"].textContent)
+			.toContain("已更新为 评估中");
+	});
+
+	it("拒绝（submitted→declined）：页内确认条 + admin_note 修改随迁移提交", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		bus.client!.showPage("format-requests");
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.formatRequests.list", {
+			ok: true, result: { items: [FR_SUBMITTED], next_cursor: null },
+		});
+		await ticks(4);
+		bus.created.find((el) => el.textContent === "详情" &&
+			el._listeners && el._listeners.click)!._fire("click", {});
+		await ticks(2);
+		replyMethod(bus, NONCE, "admin.formatRequests.get", {
+			ok: true, result: { ...FR_SUBMITTED, admin_note: null },
+		});
+		await ticks(4);
+		const noteInput = bus.created.find((el) =>
+			el.id === "adm-format-note-input");
+		expect(noteInput).toBeTruthy();
+		noteInput!.value = "样本无法在本机解码，暂拒";
+		const declineBtn = bus.created.find((el) => el.textContent === "拒绝" &&
+			el._listeners && el._listeners.click);
+		expect(declineBtn).toBeTruthy();
+		declineBtn!._fire("click", {});
+		// 页内确认条（sandbox 无 window.confirm）：明示终态不可逆
+		const box = bus.els["adm-format-confirm"];
+		expect(box.hidden).toBe(false);
+		expect(box.textContent).toContain("终态");
+		const okBtn = bus.created.filter((el) => el.textContent === "确认执行").at(-1);
+		okBtn!._fire("click", {});
+		await ticks(2);
+		const req = bus.parentPosted
+			.filter((p) => p.env.kind === "request" &&
+				p.env.method === "admin.formatRequests.patch").at(-1);
+		expect(req!.env.payload).toEqual({
+			request_id: "fr_0001", business_status: "declined",
+			expected_version: 3, admin_note: "样本无法在本机解码，暂拒",
+		});
+	});
+
+	it("409 format_request_version_conflict → 提示刷新重试，不假装成功", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		bus.client!.showPage("format-requests");
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.formatRequests.list", {
+			ok: true, result: { items: [FR_SUBMITTED], next_cursor: null },
+		});
+		await ticks(4);
+		bus.created.find((el) => el.textContent === "详情" &&
+			el._listeners && el._listeners.click)!._fire("click", {});
+		await ticks(2);
+		replyMethod(bus, NONCE, "admin.formatRequests.get", {
+			ok: true, result: FR_SUBMITTED,
+		});
+		await ticks(4);
+		bus.created.find((el) => el.textContent === "开始评估")!._fire("click", {});
+		await ticks(2);
+		replyMethod(bus, NONCE, "admin.formatRequests.patch", {
+			ok: false,
+			error: { code: "format_request_version_conflict", message: "版本冲突" },
+		});
+		await ticks(4);
+		const status = bus.els["adm-format-list-status"].textContent;
+		expect(status).toContain("版本冲突");
+		expect(status).toContain("请重试");
+		expect(status).not.toContain("已更新为");
+	});
+
+	it("终态（supported/declined）：详情无迁移按钮、无备注编辑；列表渲染中文标签", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		bus.client!.showPage("format-requests");
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.formatRequests.list", {
+			ok: true,
+			result: {
+				items: [
+					{ ...FR_SUBMITTED, id: "fr_2", business_status: "supported",
+					has_sample: false, sample_missing: false },
+					{ ...FR_SUBMITTED, id: "fr_3", business_status: "declined",
+					has_sample: true, sample_missing: true },
+				],
+				next_cursor: null,
+			},
+		});
+		await ticks(4);
+		const tbody = bus.els["adm-format-tbody"].textContent;
+		expect(tbody).toContain("已支持");
+		expect(tbody).toContain("已拒绝");
+		expect(tbody).toContain("已缺失");
+		expect(tbody).toContain("无");
+		// 打开终态详情：无迁移动作 / 无备注编辑
+		const detailBtn = bus.created.filter((el) => el.textContent === "详情" &&
+			el._listeners && el._listeners.click)[0];
+		detailBtn!._fire("click", {});
+		await ticks(2);
+		replyMethod(bus, NONCE, "admin.formatRequests.get", {
+			ok: true,
+			result: { ...FR_SUBMITTED, id: "fr_2", business_status: "supported" },
+		});
+		await ticks(4);
+		expect(bus.els["adm-format-detail"].textContent).toContain("终态");
+		expect(bus.created.some((el) =>
+			el.id === "adm-format-note-input")).toBe(false);
+		expect(bus.created.some((el) =>
+			(el.textContent === "开始评估" || el.textContent === "标记支持" ||
+				el.textContent === "拒绝") && el._listeners && el._listeners.click))
+			.toBe(false);
+	});
+});
+

@@ -49,10 +49,14 @@
     .adm-state 页级状态条（role=status aria-live=polite）承载；错误显示
     类别 + 本地请求序号（非敏感）+ 重试；空态解释为什么为空与下一步。
 
-    页面（9 页 IA）：概览 / 用户 / 身份冲突 / 切片 / 邀请 / 设置 / 费用 / 插件 /
-    审计。「切片」（2026-09-05，review P0 读隔离 × 升级 B 收录语义）= 切片可见性
-    管理：inventory 全量清点（唯一「看全部」出口，仅元数据）+ 把他人切片
-    显式加入/移出 owner 工作区（view 收录，资产生代绑定，撤销联动取消）。
+    页面（10 页 IA）：概览 / 用户 / 身份冲突 / 切片 / 格式申请 / 邀请 /
+    设置 / 费用 / 插件 / 审计。「切片」（2026-09-05，review P0 读隔离 × 升级 B
+    收录语义）= 切片可见性管理：inventory 全量清点（唯一「看全部」出口，
+    仅元数据）+ 把他人切片显式加入/移出 owner 工作区（view 收录，资产生代
+    绑定，撤销联动取消）。
+    「格式申请」（2026-09-14 W2）= 格式支持申请工单：清单 + 状态机处置
+    （submitted → reviewing → supported|declined，CAS 迁移 + admin_note）；
+    样本只呈现元数据，不内嵌文件内容。
     「身份冲突」（2026-09-08，review P2-2 产品闭环）= 存量身份冲突清单（owner
     只读摸排：login_id 非邮箱 / 邮箱与登录名不一致 / 待补绑孤儿 / 邮箱复用）
     + 仅「待补绑孤儿」（pending-*@bind.invalid 合成形、从未激活、无业务关联）
@@ -79,6 +83,7 @@
         <button type="button" class="adm-nav-btn" data-page="users">用户</button>
         <button type="button" class="adm-nav-btn" data-page="identity">身份冲突</button>
         <button type="button" class="adm-nav-btn" data-page="slides">切片</button>
+        <button type="button" class="adm-nav-btn" data-page="format-requests">格式申请</button>
         <button type="button" class="adm-nav-btn" data-page="invites">邀请</button>
         <button type="button" class="adm-nav-btn" data-page="settings">设置</button>
         <button type="button" class="adm-nav-btn" data-page="billing">费用</button>
@@ -314,6 +319,60 @@
               <button type="button" id="adm-slides-refresh-btn" class="adm-btn-secondary">刷新列表</button>
               <button type="button" id="adm-slides-more-btn" class="adm-btn-secondary">加载更多</button>
               <span id="adm-slides-status" class="adm-status"></span>
+            </div>
+          </section>
+        </section>
+
+        <!-- 格式支持申请工单（W2 admin UI，2026-09-14）：用户提交的切片格式
+             支持申请清单 + 状态机处置（submitted → reviewing →
+             supported|declined；declined 也可自 submitted 直接进入）。
+             状态迁移是 CAS 写（expected_version 来自列表/详情快照，409 冲突
+             提示刷新重试）。样本文件只呈现元数据（名称/大小/SHA-256/缺失
+             标记）：样本下载走宿主鉴权接口，本页不内嵌文件（opaque iframe
+             无法消费 blob）；服务器内部路径等非白名单字段绝不展示。 -->
+        <section class="adm-page" id="adm-page-format-requests" hidden>
+          <div class="adm-state" id="adm-state-format-requests" data-page-state="idle" role="status" aria-live="polite"></div>
+          <section class="adm-card">
+            <h2>格式支持申请</h2>
+            <p class="adm-note">用户通过 Viewer「申请格式支持」提交的工单：格式扩展名、诉求留言与可选联系方式；带样本时附样本文件元数据（名称/大小/SHA-256）。状态机：submitted（待评估）→ reviewing（评估中）→ supported（已支持）/ declined（已拒绝）；拒绝也可自 submitted 直接进入。迁移按版本 CAS 提交，他人先改则提示刷新重试。样本下载走宿主鉴权接口，本页不内嵌文件内容。</p>
+            <div class="adm-filters" id="adm-format-filters">
+              <div class="adm-field">
+                <label class="adm-field-label" for="adm-format-status">业务状态</label>
+                <select id="adm-format-status">
+                  <option value="">全部</option>
+                  <option value="submitted">submitted（待评估）</option>
+                  <option value="reviewing">reviewing（评估中）</option>
+                  <option value="supported">supported（已支持）</option>
+                  <option value="declined">declined（已拒绝）</option>
+                </select>
+              </div>
+              <div class="adm-field adm-field--actions">
+                <button type="button" id="adm-format-search-btn" class="adm-btn-secondary">筛选</button>
+              </div>
+            </div>
+            <div class="adm-table-wrap">
+              <table class="adm-table" id="adm-format-table">
+                <thead>
+                  <tr>
+                    <th>提交时间</th>
+                    <th>申请人</th>
+                    <th class="adm-col-secondary">格式</th>
+                    <th>业务状态</th>
+                    <th class="adm-col-secondary">邮件</th>
+                    <th class="adm-col-secondary">样本</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="adm-format-tbody"></tbody>
+              </table>
+            </div>
+            <div class="adm-confirm" id="adm-format-confirm" hidden></div>
+            <!-- 行详情（内联面板）：留言/联系方式/样本与邮件元数据/CAS 版本 +
+                 admin_note 备注 + 按当前状态给出的迁移动作 -->
+            <div id="adm-format-detail"></div>
+            <div class="adm-pager">
+              <button type="button" id="adm-format-more-btn" class="adm-btn-secondary">加载更多</button>
+              <span id="adm-format-list-status" class="adm-status"></span>
             </div>
           </section>
         </section>

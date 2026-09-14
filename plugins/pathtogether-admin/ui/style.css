@@ -238,12 +238,13 @@ body {
 .adm-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .adm-field-label { font-size: 12px; font-weight: 600; color: var(--text); line-height: 1.5; }
 .adm-field-help { font-size: 11px; color: var(--text-2); line-height: 1.5; }
-.adm-field input, .adm-field select {
+.adm-field input, .adm-field select, .adm-field textarea {
   font-size: 13px; padding: 6px 10px; border-radius: 8px;
   border: 1px solid var(--separator); background: #fff; color: var(--text);
   width: 100%; min-width: 0;
 }
-.adm-field input:focus-visible, .adm-field select:focus-visible {
+.adm-field input:focus-visible, .adm-field select:focus-visible,
+.adm-field textarea:focus-visible {
   outline: 2px solid var(--accent); outline-offset: 1px;
 }
 .adm-field input[aria-invalid="true"] { border-color: var(--danger); }

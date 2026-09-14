@@ -36,10 +36,14 @@
      （仅 pending_bind_synthetic 孤儿行可物理删除，不可逆；确认条 + 409 文案
      原样展示），其余冲突只报告、绝不自动合并/夺取账号。
    2026-09-09（0.4.2）：设置页新增「平台默认模型」卡——admin.settings.model
-     （owner 只读：当前模型/provider/图片传输/允许集合 options）+
-     admin.settings.model.update（切换；限时模型保存前页内确认条提示到期，
-     transport 自动落回 inline 时成功文案含联动说明）；模型卡独立降级，
-     拉取失败显示「不可用」，不阻塞设置页其它卡。
+   （owner 只读：当前模型/provider/图片传输/允许集合 options）+
+   admin.settings.model.update（切换；限时模型保存前页内确认条提示到期，
+   transport 自动落回 inline 时成功文案含联动说明）；模型卡独立降级，
+   拉取失败显示「不可用」，不阻塞设置页其它卡。
+   2026-09-14（W2 admin UI）：新增「格式申请」页——admin.formatRequests.
+   list/get（users:read）+ patch（users:write，CAS 状态机 + admin_note），
+   复用 users 权限域不扩域；样本只呈现元数据（样本下载走宿主鉴权接口，
+   本页不内嵌文件）；渲染字段白名单化，内部字段绝不进 DOM。
    渲染只用 textContent / createElement（不拼 HTML，插件数据永不进标记）。
  ========================================================================= */
 (function () {
@@ -63,8 +67,8 @@
     listSeq: 0,
     // 分页游标（每列表独立；仅内存）
     cursors: { users: null, usage: null, unpriced: null, ledger: null,
-               audit: null, invites: null, slides: null },
-    filters: { users: {}, usage: {}, audit: {} },
+               audit: null, invites: null, slides: null, formatRequests: null },
+    filters: { users: {}, usage: {}, audit: {}, format: {} },
     // 设置页快照（批次 D §6.1）：admin.settings.get 的响应（含 spend
     // current_windows 的 demo/owner 窗口 CAS version）——仅内存。
     settingsSnapshot: null,
@@ -102,8 +106,8 @@
   // 深链起始页（PR5 /admin#invites 兼容）：宿主把父页 hash 透传到本 iframe
   // 自身 URL；只接受已知页面 slug，其余回概览。
   function initialPageFromHash() {
-    var pages = ["overview", "users", "identity", "slides", "invites", "settings",
-                 "billing", "plugins", "audit"];
+    var pages = ["overview", "users", "identity", "slides", "format-requests",
+                 "invites", "settings", "billing", "plugins", "audit"];
     var hash = "";
     try { hash = window.location.hash || ""; } catch (e) { hash = ""; }
     var name = hash.replace(/^#/, "");
@@ -117,6 +121,7 @@
   // slug 保持不变，宿主深链 #invites/#billing 兼容。
   var PAGE_TITLES = {
     overview: "概览", users: "用户", identity: "身份冲突", slides: "切片可见性",
+    "format-requests": "格式申请",
     invites: "邀请", settings: "设置", billing: "费用", plugins: "插件",
     audit: "审计",
   };
@@ -135,6 +140,7 @@
       users: $("adm-page-users"),
       identity: $("adm-page-identity"),
       slides: $("adm-page-slides"),
+      "format-requests": $("adm-page-format-requests"),
       invites: $("adm-page-invites"),
       settings: $("adm-page-settings"),
       billing: $("adm-page-billing"),
@@ -951,14 +957,18 @@
   // ------------------------------------------------------------------
   function resetLists() {
     state.cursors = { users: null, usage: null, unpriced: null, ledger: null,
-                      audit: null, invites: null, slides: null };
+                      audit: null, invites: null, slides: null,
+                      formatRequests: null };
     ["adm-users-tbody", "adm-usage-tbody", "adm-unpriced-tbody",
      "adm-ledger-tbody", "adm-audit-tbody", "adm-invites-tbody",
-     "adm-plugins-tbody", "adm-slides-tbody", "adm-identity-tbody"].forEach(
+     "adm-plugins-tbody", "adm-slides-tbody", "adm-identity-tbody",
+     "adm-format-tbody"].forEach(
     function (id) {
       var el = $(id);
       if (el) el.textContent = "";
     });
+    var frDetail = $("adm-format-detail");
+    if (frDetail) frDetail.textContent = "";
   }
 
   function loadUsers(append) {
@@ -3323,6 +3333,256 @@
   }
 
   // ------------------------------------------------------------------
+  // 格式支持申请工单（W2 admin UI，2026-09-14）：
+  //   - admin.formatRequests.list（游标 + 可选 business_status 过滤）；
+  //   - admin.formatRequests.get（public_view admin 视图：留言/联系方式/
+  //     样本元数据/邮件状态/owner/version）；
+  //   - admin.formatRequests.patch（CAS 状态迁移 + 可选 admin_note）；
+  //   - 状态机：submitted → reviewing → supported|declined；declined 也可
+  //     自 submitted 直接进入；supported/declined 是终态（无自环迁移）；
+  //   - 样本只呈现元数据（名称/大小/SHA-256/缺失标记）——样本下载走宿主
+  //     鉴权接口，本页不内嵌文件内容（opaque iframe 消费不了 blob）；
+  //   - 渲染一律按下方白名单逐字段 kvRow/td（textContent）——响应里的
+  //     未知字段（含服务器内部路径）即使存在也绝不进 DOM；
+  //   - 409 format_request_version_conflict / format_request_invalid_transition
+  //     → 提示刷新重试（他人先改时不假装成功）。
+  // ------------------------------------------------------------------
+  var FORMAT_STATUS_LABELS = {
+    submitted: "待评估", reviewing: "评估中",
+    supported: "已支持", declined: "已拒绝",
+  };
+  var FORMAT_TRANSITIONS = {
+    submitted: [["reviewing", "开始评估"], ["declined", "拒绝"]],
+    reviewing: [["supported", "标记支持"], ["declined", "拒绝"]],
+    supported: [],
+    declined: [],
+  };
+
+  function formatStatusLabel(status) {
+    return FORMAT_STATUS_LABELS[status] || String(status || "—");
+  }
+
+  // 样本列短文案：无 / 有 / 已缺失（元数据在但文件丢失）
+  function formatSampleText(rec) {
+    if (!rec || !rec.has_sample) return "无";
+    return rec.sample_missing ? "已缺失" : "有";
+  }
+
+  function loadFormatRequests(append) {
+    var seq = state.listSeq;
+    var f = state.filters.format || {};
+    var payload = {
+      limit: 50,
+      cursor: append ? state.cursors.formatRequests : null,
+    };
+    if (f.status) payload.status = f.status;
+    var status = $("adm-format-list-status");
+    setPageState("format-requests", "loading");
+    request("admin.formatRequests.list", payload).then(function (res) {
+      if (seq !== state.listSeq) return; // 页面已切换：晚到响应丢弃
+      hideError();
+      var items = (res && res.items) || [];
+      var tbody = $("adm-format-tbody");
+      if (!append && tbody) tbody.textContent = "";
+      items.forEach(function (item) { renderFormatRow(item); });
+      if (!append && !items.length) {
+        setPageState("format-requests", "empty", {
+          message: f.status
+            ? "没有状态为 " + f.status + " 的格式申请；切换筛选可查看全部。"
+            : "暂无格式支持申请。用户在 Viewer「申请格式支持」提交后会出现在此。",
+        });
+      } else {
+        setPageState("format-requests", "ready", {
+          message: "已更新（" + nowText() + "）",
+        });
+      }
+      state.cursors.formatRequests = (res && res.next_cursor) || null;
+      var more = $("adm-format-more-btn");
+      if (more) more.disabled = !(res && res.next_cursor);
+      setPageHint(status, res && res.next_cursor ? "还有更多" : "已到底");
+    }).catch(function (err) {
+      if (seq !== state.listSeq) return;
+      handleErr(err, status);
+      setPageState("format-requests", "error", {
+        code: err && err.code, message: err && err.message,
+        retry: function () { loadFormatRequests(false); },
+      });
+    });
+  }
+
+  function renderFormatRow(item) {
+    var tbody = $("adm-format-tbody");
+    if (!tbody) return;
+    var tr = document.createElement("tr");
+    tr.appendChild(td(fmtTs(item.created_at), "adm-cell-time"));
+    tr.appendChild(td(item.owner_user_id
+      ? identityText(String(item.owner_user_id)) : "—"));
+    tr.appendChild(td(item.format_ext, "adm-col-secondary"));
+    tr.appendChild(td(formatStatusLabel(item.business_status)));
+    tr.appendChild(td(item.mail_status, "adm-col-secondary"));
+    tr.appendChild(td(formatSampleText(item), "adm-col-secondary"));
+    var cell = document.createElement("td");
+    cell.className = "adm-actions-cell";
+    cell.appendChild(actionBtn("详情", function () {
+      openFormatDetail(item.id);
+    }, "secondary"));
+    tr.appendChild(cell);
+    tbody.appendChild(tr);
+  }
+
+  // 行详情（内联面板）：先取最新 public_view（含 CAS version），再渲染。
+  // 「读取中」写在面板自身而非页级状态行——状态行留给操作反馈（迁移
+  // 成功/409 冲突文案不被详情刷新覆盖）。
+  function openFormatDetail(requestId) {
+    var seq = state.listSeq;
+    var box = $("adm-format-detail");
+    if (box) box.textContent = "读取工单详情…";
+    request("admin.formatRequests.get", { request_id: requestId })
+      .then(function (rec) {
+        if (seq !== state.listSeq) return;
+        hideError();
+        renderFormatDetail(rec || {});
+      })
+      .catch(function (err) {
+        if (seq !== state.listSeq) return;
+        if (box) box.textContent = "";
+        handleErr(err, $("adm-format-list-status"));
+      });
+  }
+
+  // 当前详情面板里的备注输入框引用（renderFormatDetail 创建/复位；
+  // patch 提交时读取——不按 id 重查，避免任何环境下的取错节点）
+  var formatNoteInput = null;
+
+  function renderFormatDetail(rec) {
+    var box = $("adm-format-detail");
+    if (!box) return;
+    box.textContent = "";
+    formatNoteInput = null;
+    // 字段白名单（public_view admin 视图）：内部字段绝不在此列
+    var dl = document.createElement("dl");
+    dl.className = "adm-kv adm-detail-kv";
+    kvRow(dl, "工单 id", rec.id);
+    kvRow(dl, "格式扩展名", rec.format_ext);
+    kvRow(dl, "留言", rec.message);
+    kvRow(dl, "联系方式", rec.contact);
+    kvRow(dl, "业务状态",
+      formatStatusLabel(rec.business_status) + "（" + rec.business_status + "）");
+    kvRow(dl, "申请人（user_id）", rec.owner_user_id);
+    kvRow(dl, "提交时间", fmtTs(rec.created_at));
+    kvRow(dl, "更新时间", fmtTs(rec.updated_at));
+    kvRow(dl, "样本", formatSampleText(rec));
+    if (rec.has_sample) {
+      kvRow(dl, "样本文件名", rec.sample_name);
+      kvRow(dl, "样本大小", fmtBytes(
+        typeof rec.sample_size === "number" ? rec.sample_size : null));
+      kvRow(dl, "样本 SHA-256", rec.sample_sha256);
+    }
+    kvRow(dl, "邮件状态", rec.mail_status);
+    kvRow(dl, "邮件尝试次数", fmtNum(rec.mail_attempts));
+    if (rec.mail_last_error) kvRow(dl, "邮件最近错误", rec.mail_last_error);
+    kvRow(dl, "备注（admin_note）", rec.admin_note);
+    kvRow(dl, "CAS 版本（version）", rec.version);
+    box.appendChild(dl);
+    if (rec.has_sample) {
+      var sampleNote = document.createElement("p");
+      sampleNote.className = "adm-note";
+      sampleNote.textContent =
+        "样本下载走宿主鉴权接口，本页不内嵌文件内容；核对样本完整性可用上方 SHA-256。";
+      box.appendChild(sampleNote);
+    }
+    var transitions = FORMAT_TRANSITIONS[rec.business_status] || [];
+    if (!transitions.length) {
+      // 终态：无迁移可写（patch 要求合法迁移，无自环），也不再提供备注编辑
+      var terminal = document.createElement("p");
+      terminal.className = "adm-note";
+      terminal.textContent = "该工单已处于终态（" +
+        formatStatusLabel(rec.business_status) + "），不再提供状态迁移。";
+      box.appendChild(terminal);
+      return;
+    }
+    // 处理备注（admin_note）：预填当前值；未修改不重复提交，修改（含清空）
+    // 随下一次状态迁移一并保存
+    var noteField = document.createElement("div");
+    noteField.className = "adm-field";
+    var noteLabel = document.createElement("label");
+    noteLabel.className = "adm-field-label";
+    noteLabel.htmlFor = "adm-format-note-input";
+    noteLabel.textContent = "处理备注（admin_note，可选）";
+    var noteInput = document.createElement("textarea");
+    noteInput.id = "adm-format-note-input";
+    noteInput.maxLength = 2000;
+    noteInput.rows = 3;
+    noteInput.value = rec.admin_note || "";
+    var noteHelp = document.createElement("small");
+    noteHelp.className = "adm-field-help";
+    noteHelp.textContent =
+      "≤2000 字符；修改后随下一次状态迁移一并保存（清空=删除备注），未修改不重复提交";
+    noteField.appendChild(noteLabel);
+    noteField.appendChild(noteInput);
+    noteField.appendChild(noteHelp);
+    box.appendChild(noteField);
+    formatNoteInput = noteInput;
+    var actions = document.createElement("div");
+    actions.className = "adm-actions";
+    transitions.forEach(function (pair) {
+      var newStatus = pair[0];
+      var label = pair[1];
+      var variant = newStatus === "declined" ? "danger-outline"
+        : (newStatus === "supported" ? "primary" : "secondary");
+      actions.appendChild(actionBtn(label, function () {
+        if (newStatus === "reviewing") {
+          // 非终态迁移：直接提交（不二次确认）
+          patchFormatStatus(rec, newStatus);
+          return;
+        }
+        askConfirm($("adm-format-confirm"),
+          "确认把工单 " + rec.id + "（" + rec.format_ext + "）标记为「" +
+          formatStatusLabel(newStatus) + "」？该状态是终态，之后不能再迁移" +
+          (newStatus === "declined"
+            ? "；用户侧将看到申请被拒绝。" : "。"),
+          function () { patchFormatStatus(rec, newStatus); });
+      }, variant));
+    });
+    box.appendChild(actions);
+  }
+
+  function patchFormatStatus(rec, newStatus) {
+    var note = formatNoteInput ? String(formatNoteInput.value || "") : "";
+    var loaded = rec.admin_note === null || rec.admin_note === undefined
+      ? "" : String(rec.admin_note);
+    var payload = {
+      request_id: rec.id,
+      business_status: newStatus,
+      expected_version: rec.version,
+    };
+    // 备注与加载值一致（未修改）→ 不携带；修改（含清空）→ 随迁移提交
+    if (note !== loaded) payload.admin_note = note;
+    setStatus("adm-format-list-status", "提交中…");
+    request("admin.formatRequests.patch", payload).then(function () {
+      setStatus("adm-format-list-status",
+        "已更新为 " + formatStatusLabel(newStatus) + "（" + rec.id + "）");
+      loadFormatRequests(false);
+      openFormatDetail(rec.id); // 重取最新 version 供下一次 CAS
+    }).catch(function (err) {
+      if (err && (err.code === "format_request_version_conflict" ||
+                  err.code === "version_conflict")) {
+        setStatus("adm-format-list-status",
+          "版本冲突：该工单已被他人修改（409），已刷新，请重试");
+        loadFormatRequests(false);
+        openFormatDetail(rec.id);
+      } else if (err && err.code === "format_request_invalid_transition") {
+        setStatus("adm-format-list-status",
+          "状态迁移被拒绝（他人可能已先行处理）；已刷新，请重试");
+        loadFormatRequests(false);
+        openFormatDetail(rec.id);
+      } else {
+        handleErr(err, $("adm-format-list-status"));
+      }
+    });
+  }
+
+  // ------------------------------------------------------------------
   // 插件管理（PR5 修订：恢复旧侧栏插件管理功能面）
   // ------------------------------------------------------------------
   function pluginHealthText(h) {
@@ -3458,6 +3718,7 @@
     else if (name === "users") loadUsers(false);
     else if (name === "identity") loadIdentityConflicts();
     else if (name === "slides") loadSlides(false);
+    else if (name === "format-requests") loadFormatRequests(false);
     else if (name === "invites") loadInvitesPage();
     else if (name === "settings") loadSettingsPage();
     else if (name === "billing") loadBillingPage();
@@ -3629,6 +3890,16 @@
     // 切片可见性页（2026-09-05 读隔离）
     onClick("adm-slides-refresh-btn", function () { loadSlides(false); });
     onClick("adm-slides-more-btn", function () { loadSlides(true); });
+    // 格式申请页（W2，2026-09-14）：状态筛选 + 分页（详情/迁移动作在行内）
+    onClick("adm-format-search-btn", function () {
+      state.filters.format = {
+        status: $("adm-format-status") ? $("adm-format-status").value : "",
+      };
+      state.cursors.formatRequests = null;
+      state.listSeq++;
+      loadFormatRequests(false);
+    });
+    onClick("adm-format-more-btn", function () { loadFormatRequests(true); });
     // 插件页（PR5 修订）
     onClick("adm-plugins-refresh-btn", function () { loadPlugins(); });
     onClick("adm-plugin-secret-copy", function () {

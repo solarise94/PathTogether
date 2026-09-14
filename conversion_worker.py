@@ -182,6 +182,7 @@ def process_job(job, upload_dir, worker_id):
             job["id"], worker_id, canonical,
             owner_user_id=job.get("owner_user_id") or "",
             settle_bytes=os.path.getsize(dest))
+        _associate_target_project(job, canonical)
         _discard_work(work)
         return True
     except FileExistsError:
@@ -219,6 +220,27 @@ def _retract_ours(dest, work, job):
             os.unlink(dest + ".manifest.json")
         except OSError:
             pass
+
+
+def _associate_target_project(job, canonical_name):
+    """转换产物 ready 后幂等加入目标项目（C02）。失败不回滚产物。"""
+    pid = job.get("target_project_id")
+    if not pid:
+        return
+    state = "failed"
+    try:
+        proj = share_store.get_project(pid)
+        owner = job.get("owner_user_id") or ""
+        if proj and (proj.get("owner_user_id") or "") == owner \
+                and not proj.get("archived"):
+            slides = proj.get("slides") or []
+            if canonical_name in slides:
+                state = "succeeded"
+            elif share_store.add_slides_to_project(pid, [canonical_name]):
+                state = "succeeded"
+    except Exception:
+        state = "failed"
+    conversion_store.set_project_associate(job["id"], pid, state)
 
 
 def run_once(upload_dir=None, worker_id=None):

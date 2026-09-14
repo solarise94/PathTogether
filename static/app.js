@@ -5054,6 +5054,9 @@
   function uploadFileLegacy(file, row) {
     var formData = new FormData();
     formData.append("file", file);
+    if (importTargetState && importTargetState.pid) {
+      formData.append("target_project_id", importTargetState.pid);
+    }
     var xhr = new XMLHttpRequest();
     row.setStage("upload.stage.transferring", 0);
     xhr.upload.addEventListener("progress", function (e) {

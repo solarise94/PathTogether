@@ -244,6 +244,7 @@ def test_schema_migrations_recorded(conn):
         "0050_project_create_idempotency.sql",
         # 2026-09-14 W5：百度分享导入（枚举/候选/批次/条目四表）。
         "0051_baidu_remote_imports.sql",
+        "0052_import_target_association.sql",
     ]
 
 

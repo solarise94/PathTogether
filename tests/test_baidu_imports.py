@@ -384,9 +384,14 @@ def test_b11_no_secrets_in_public_views(monkeypatch, tmp_path):
         assert "share_url" not in text
     # 条目级也没有内部字段
     for item in view["items"]:
-        assert set(item) == {"id", "fs_id", "name", "relative_path", "stage",
-                             "error_code", "cleanup_state", "source_size",
-                             "attempt"}
+        allowed = {
+            "id", "fs_id", "name", "relative_path", "stage",
+            "error_code", "cleanup_state", "source_size", "attempt",
+            "conversion_job_id", "slide_name", "project_associate_state",
+        }
+        assert set(item) <= allowed
+        assert "staging_path" not in item
+        assert "ingest_token" not in item
 
 
 def test_b11_owner_isolation_lists(monkeypatch):

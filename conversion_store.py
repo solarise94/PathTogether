@@ -82,7 +82,8 @@ def _requeue_row(cur, job_id, *, source_name, upload_id, canonical_name,
 
 
 def create_job(*, owner_user_id, upload_id, source_name, source_sha256,
-               source_format, canonical_name, product_exists=None):
+               source_format, canonical_name, product_exists=None,
+               target_project_id=None):
     """创建或返回同一 owner+hash+converter 的已有任务（幂等）。
 
     failed/cancelled 重置为 queued（删除后重传）。ready 一律保持原
@@ -120,22 +121,64 @@ def create_job(*, owner_user_id, upload_id, source_name, source_sha256,
                     return existing
                 job_id = new_job_id()
                 try:
+                    assoc = ("pending" if target_project_id else "not_needed")
                     cur.execute(
                         "INSERT INTO conversion_jobs "
                         "(id, owner_user_id, upload_id, source_name, "
                         " source_sha256, source_format, canonical_name, "
-                        " converter_id, converter_version, state) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'queued') "
+                        " converter_id, converter_version, state, "
+                        " target_project_id, project_associate_state) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'queued',%s,%s) "
                         "RETURNING *",
                         (job_id, owner_user_id, upload_id, source_name,
                          source_sha256, source_format, canonical_name,
-                         CONVERTER_ID, CONVERTER_VERSION))
+                         CONVERTER_ID, CONVERTER_VERSION,
+                         target_project_id or None, assoc))
                     row = _row(cur)
                     _insert_source(cur, job_id, source_name, upload_id,
                                    source_sha256)
                     return row
                 except UniqueViolation as e:
                     raise NameConflict("canonical 名已被占用") from e
+    finally:
+        conn.close()
+
+
+def claim_job(job_id, worker_id, lease_seconds=LEASE_SECONDS):
+    """领取指定 queued（或租约过期）任务，供百度入库同步转换。"""
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM conversion_jobs WHERE id=%s "
+                    "AND state IN ('queued', 'converting', 'validating') "
+                    "AND (lease_expires_at IS NULL OR lease_expires_at < now()) "
+                    "FOR UPDATE", (job_id,))
+                row = _row(cur)
+                if not row:
+                    return None
+                cur.execute(
+                    "UPDATE conversion_jobs SET state='converting', "
+                    "attempt=attempt+1, lease_owner=%s, "
+                    "lease_expires_at=now() + (%s || ' seconds')::interval, "
+                    "heartbeat_at=now(), started_at=COALESCE(started_at, now()) "
+                    "WHERE id=%s RETURNING *",
+                    (worker_id, str(int(lease_seconds)), job_id))
+                return _row(cur)
+    finally:
+        conn.close()
+
+
+def set_project_associate(job_id, target_project_id, state):
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE conversion_jobs SET target_project_id=%s, "
+                    "project_associate_state=%s WHERE id=%s",
+                    (target_project_id, state, job_id))
     finally:
         conn.close()
 

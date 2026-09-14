@@ -13,7 +13,7 @@ COPY spend_store.py site_stats_store.py ./
 COPY crop_guard.py upload_guard.py upload_task_store.py useradmin.py ./
 COPY conversion_store.py conversion_worker.py slide_format_registry.py format_request_store.py format_request_http.py ./
 COPY project_idempotency_store.py project_create_http.py conversion_http.py ./
-COPY baidu_share_parser.py baidu_adapter.py baidu_import_store.py baidu_import_http.py ./
+COPY baidu_share_parser.py baidu_adapter.py baidu_import_store.py baidu_import_http.py baidu_ingest.py ./
 COPY kfb/ kfb/
 COPY migrations/ migrations/
 COPY scripts/ scripts/

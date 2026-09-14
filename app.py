@@ -307,7 +307,7 @@ def _upload_name_conflict(safe):
 
 
 def _enqueue_conversion(ident, *, source_name, source_sha256, upload_id,
-                        source_format):
+                        source_format, target_project_id=None):
     canonical = _canonical_name_for(source_name)
     product = (UPLOAD_DIR / canonical).is_file()
     if product and not conversion_store.canonical_is_live(canonical):
@@ -321,7 +321,8 @@ def _enqueue_conversion(ident, *, source_name, source_sha256, upload_id,
             source_sha256=source_sha256,
             source_format=source_format,
             canonical_name=canonical,
-            product_exists=product)
+            product_exists=product,
+            target_project_id=target_project_id)
     except conversion_store.NameConflict as e:
         raise FileExistsError(canonical) from e
     return job, canonical
@@ -342,7 +343,7 @@ def _owned_committed_upload(ident, safe_name):
 
 
 def _ensure_conversion_job(ident, *, source_name, source_sha256, upload_id,
-                           source_format=None):
+                           source_format=None, target_project_id=None):
     """committed 源文件上幂等补建/复用转换任务（崩溃、500、重放）。
 
     磁盘上的源必须仍是本 upload_id 当时结算的摘要；同名被他人覆盖后，
@@ -377,7 +378,8 @@ def _ensure_conversion_job(ident, *, source_name, source_sha256, upload_id,
         source_format = _probe_kfb_or_fail(src)["format"]
     return _enqueue_conversion(
         ident, source_name=source_name, source_sha256=disk_sha,
-        upload_id=upload_id, source_format=source_format)
+        upload_id=upload_id, source_format=source_format,
+        target_project_id=target_project_id)
 
 
 def _conversion_accepted_body(job):
@@ -9723,6 +9725,9 @@ def api_upload():
     ident = current_identity()
     if "file" not in request.files:
         return jsonify(error="缺少 file 字段"), 400
+    target_pid = (request.form.get("target_project_id") or "").strip() or None
+    if target_pid and not _can_access_project(target_pid):
+        return jsonify(error="无权写入目标项目", code="forbidden"), 403
 
     # G7：请求路径上的 committing 惰性恢复扫描（上一请求崩溃后的幂等补账）
     _upload_legacy_recover_stale(ident)
@@ -9818,7 +9823,8 @@ def api_upload():
         try:
             job, _canon = _ensure_conversion_job(
                 ident, source_name=safe, source_sha256=file_sha,
-                upload_id=owned["upload_id"])
+                upload_id=owned["upload_id"],
+                target_project_id=target_pid)
         except Exception:
             app.logger.exception("V1 KFB 原任务恢复失败：%s", safe)
             return jsonify(error="转换任务创建失败"), 500
@@ -9866,6 +9872,12 @@ def api_upload():
             _upload_legacy_fail(upload_id, token, task, permanent=False,
                                 remove_names=(safe,))
             return jsonify(error="归属登记失败，请重试"), 503
+        if target_pid:
+            proj = share_store.get_project(target_pid)
+            owner = (ident.get("user_id") or "")
+            if proj and (proj.get("owner_user_id") or "") == owner \
+                    and safe not in (proj.get("slides") or []):
+                share_store.add_slides_to_project(target_pid, [safe])
 
     # ---- 短事务 B：committed + 配额同事务转实占（G7 收口；崩溃后由恢复扫描
     #      幂等补账，文件已持久提升，请求仍按成功返回）----
@@ -9879,7 +9891,7 @@ def api_upload():
                 try:
                     job, _c = _ensure_conversion_job(
                         ident, source_name=safe, source_sha256=file_sha,
-                        upload_id=upload_id)
+                        upload_id=upload_id, target_project_id=target_pid)
                     return jsonify(_conversion_accepted_body(job)), 202
                 except Exception:
                     app.logger.exception("V1 committed 补建 conversion 失败")
@@ -9905,7 +9917,7 @@ def api_upload():
         try:
             job, _canon = _ensure_conversion_job(
                 ident, source_name=safe, source_sha256=file_sha,
-                upload_id=upload_id)
+                upload_id=upload_id, target_project_id=target_pid)
         except FileExistsError:
             return jsonify(error="名称不可用", code="name_unavailable"), 409
         except Exception:

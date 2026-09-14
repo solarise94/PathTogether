@@ -25,10 +25,9 @@
 - 清理只针对 ``/apps/bdpan/<batch-id>/`` 本批副本；清理失败置
   ``cleanup_state=failed``，绝不回滚 ready。
 
-简化声明（app 集成层接线，见 spec W5/B06）：入库默认钩子只落幂等
-凭证 ``ingest_token``（真实转换/入库沿用既有 upload/conversion 收口，
-由 ``hooks`` 注入）；批次级配额预占在全部条目终结后一次 ``consume``
-（``consume_reservation`` 幂等，崩溃重跑不双扣）。
+入库走 :mod:`baidu_ingest`：native 校验后写入 ``UPLOAD_DIR``，KFB/KFBF
+同步领取 conversion job 并 ``process_job``；``ingest_token`` 防崩溃重入。
+批次级配额预占在全部条目终结后一次 ``consume``（幂等，崩溃重跑不双扣）。
 """
 
 from __future__ import annotations
@@ -824,7 +823,11 @@ def get_import(batch_id, owner_user_id):
                      "error_code": r["error_code"],
                      "cleanup_state": r["cleanup_state"],
                      "source_size": _dec_str(r["source_size"]),
-                     "attempt": int(r["attempt"])}
+                     "attempt": int(r["attempt"]),
+                     "conversion_job_id": r.get("conversion_job_id"),
+                     "slide_name": r.get("slide_name"),
+                     "project_associate_state": r.get("project_associate_state")
+                     or "not_needed"}
                     for r in cur.fetchall()]
         return view
     finally:
@@ -1046,6 +1049,13 @@ def _phase_download(adapter, batch, item, staging_root, hooks):
                 and Path(sp).stat().st_size == int(item["source_size"]):
             skip = True
         if not skip:
+            copies = {c["name"]: c for c in
+                      adapter.list_batch_copies(batch["id"])}
+            remote = copies.get(item["name"])
+            if remote is not None \
+                    and int(remote["size"]) != int(item["source_size"]):
+                _fail_item(item["id"], "source_changed")
+                return _get_item(item["id"])
             if stage != "downloading":
                 item = _update_item(item["id"], {"stage": "downloading"})
             staging_dir = Path(staging_root) / batch["id"]
@@ -1074,8 +1084,7 @@ def _phase_download(adapter, batch, item, staging_root, hooks):
 
 
 def _phase_convert_placeholder(adapter, batch, item):
-    """转换阶段占位：真实转换在 app 集成层经 hooks 接线（B06 范围）；
-    此处保留阶段转移与 conversion_job_id 字段。"""
+    """进入 converting 或 ingesting；真正收口在 _phase_ingest。"""
     if item["stage"] == "validating":
         info = slide_format_registry.lookup(item["name"])
         new_stage = ("converting"
@@ -1083,17 +1092,38 @@ def _phase_convert_placeholder(adapter, batch, item):
                      slide_format_registry.CAP_CONVERT_REQUIRED
                      else "ingesting")
         item = _update_item(item["id"], {"stage": new_stage})
-    if item["stage"] == "converting":
-        item = _update_item(item["id"], {"stage": "ingesting"})
     return item
 
 
 def _phase_ingest(adapter, batch, item, hooks):
-    """入库阶段：ingest_token 为幂等凭证，崩溃重跑不重复入库。"""
-    if item["stage"] == "ingesting" and not item["ingest_token"]:
-        token = "bing_" + secrets.token_hex(12)
-        item = _update_item(item["id"],
-                            {"stage": "ready", "ingest_token": token})
+    """入库阶段：真实校验/转换/归属；ingest_token 是崩溃幂等凭证。"""
+    if item.get("ingest_token"):
+        hook = hooks.get("on_ingested")
+        if hook:
+            hook(_get_item(item["id"]))
+        return _get_item(item["id"])
+    if item["stage"] not in ("converting", "ingesting", "validating"):
+        return _get_item(item["id"])
+    import baidu_ingest
+    try:
+        result = baidu_ingest.ingest_staging(
+            owner_user_id=batch.get("owner_user_id") or "",
+            original_name=item["name"],
+            staging_path=item.get("staging_path"),
+            source_sha256=item.get("source_sha256"),
+            source_size=item.get("source_size"),
+            target_project_id=batch.get("target_project_id"))
+    except baidu_ingest.IngestError as exc:
+        _fail_item(item["id"], exc.code)
+        return _get_item(item["id"])
+    item = _update_item(item["id"], {
+        "stage": "ready",
+        "ingest_token": result["ingest_token"],
+        "conversion_job_id": result.get("conversion_job_id"),
+        "slide_name": result.get("slide_name"),
+        "project_associate_state": result.get("project_associate_state")
+        or "not_needed",
+    })
     hook = hooks.get("on_ingested")
     if hook:
         hook(_get_item(item["id"]))  # 崩溃注入点 C

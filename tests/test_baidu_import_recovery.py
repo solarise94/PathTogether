@@ -19,8 +19,10 @@ import pytest
 
 import baidu_import_http as http
 import baidu_import_store as store
+import kfb.converter as kfb_converter
 from _baidu_helpers import (expire_batch_lease, install_fake,
                             make_ready_enumeration)
+from _tiff_fixtures import make_tiff_bytes
 
 OWNER = "u-baidu-rec"
 IDENT = {"role": "user", "user_id": OWNER}
@@ -31,9 +33,13 @@ class Crash(RuntimeError):
 
 
 @pytest.fixture(autouse=True)
-def _env(monkeypatch):
+def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("BAIDU_SHARE_SECRET_KEY",
                        "test-baidu-share-secret-key-2026-09-14")
+    up = tmp_path / "uploads"
+    up.mkdir()
+    monkeypatch.setenv("UPLOAD_DIR", str(up))
+    monkeypatch.setattr(kfb_converter, "DEFAULT_MIN_FREE_BYTES", 0)
 
 
 def _sql(fn):
@@ -67,10 +73,22 @@ def _make_batch(monkeypatch, paths, tmp_path, entries=None, **kw):
     return fake, batch
 
 
-ENTRIES = [
-    {"path": "/a.svs", "size": 111},
-    {"path": "/b.svs", "size": 222},
-]
+def _tiff_entries():
+    a = make_tiff_bytes()
+    b = make_tiff_bytes(h=48, w=64)
+    return [
+        {"path": "/a.tif", "size": len(a), "content": a},
+        {"path": "/b.tif", "size": len(b), "content": b},
+    ]
+
+
+ENTRIES = None  # 由 fixture 填充真实 TIFF，占位避免导入期生成
+
+
+@pytest.fixture(autouse=True)
+def _tiff_entries_ready():
+    global ENTRIES
+    ENTRIES = _tiff_entries()
 
 
 # --------------------------------------------------------------------------- #
@@ -78,7 +96,7 @@ ENTRIES = [
 # --------------------------------------------------------------------------- #
 
 def test_b07_crash_after_transfer_no_double_transfer(monkeypatch, tmp_path):
-    fake, batch = _make_batch(monkeypatch, ["/a.svs"], tmp_path,
+    fake, batch = _make_batch(monkeypatch, ["/a.tif"], tmp_path,
                               idempotency_key="c1")
     with pytest.raises(Crash):
         store.run_batch(batch["id"], fake, staging_root=tmp_path,
@@ -100,7 +118,7 @@ def test_b07_crash_after_transfer_no_double_transfer(monkeypatch, tmp_path):
 def test_b07_crash_after_transfer_reconcile_via_copies(monkeypatch, tmp_path):
     # worker 重启（进程内 task 登记丢失，poll → unknown）：
     # 必须先 list_batch_copies 对账，副本在则不重转存
-    fake, batch = _make_batch(monkeypatch, ["/a.svs"], tmp_path,
+    fake, batch = _make_batch(monkeypatch, ["/a.tif"], tmp_path,
                               idempotency_key="c2")
     with pytest.raises(Crash):
         store.run_batch(batch["id"], fake, staging_root=tmp_path,
@@ -117,7 +135,7 @@ def test_b07_crash_after_transfer_reconcile_via_copies(monkeypatch, tmp_path):
 
 
 def test_b07_crash_after_download_no_double_download(monkeypatch, tmp_path):
-    fake, batch = _make_batch(monkeypatch, ["/a.svs"], tmp_path,
+    fake, batch = _make_batch(monkeypatch, ["/a.tif"], tmp_path,
                               idempotency_key="c3")
     with pytest.raises(Crash):
         store.run_batch(batch["id"], fake, staging_root=tmp_path,
@@ -136,7 +154,7 @@ def test_b07_crash_after_download_no_double_download(monkeypatch, tmp_path):
 
 
 def test_b07_crash_after_ingest_no_duplicate_ingest(monkeypatch, tmp_path):
-    fake, batch = _make_batch(monkeypatch, ["/a.svs"], tmp_path,
+    fake, batch = _make_batch(monkeypatch, ["/a.tif"], tmp_path,
                               idempotency_key="c4")
     ingest_calls = []
 
@@ -163,26 +181,26 @@ def test_b07_crash_after_ingest_no_duplicate_ingest(monkeypatch, tmp_path):
 # --------------------------------------------------------------------------- #
 
 def test_b09_partial_fail_retry_only_failed(monkeypatch, tmp_path):
-    fake, batch = _make_batch(monkeypatch, ["/a.svs", "/b.svs"], tmp_path,
+    fake, batch = _make_batch(monkeypatch, ["/a.tif", "/b.tif"], tmp_path,
                               entries=ENTRIES, idempotency_key="r1")
-    fake.fail_download_names = {"b.svs"}
+    fake.fail_download_names = {"b.tif"}
     view = store.run_batch(batch["id"], fake, staging_root=tmp_path)
     assert view["state"] == "partial_failed"
     stages = {i["name"]: i["stage"] for i in view["items"]}
-    assert stages == {"a.svs": "ready", "b.svs": "failed"}
+    assert stages == {"a.tif": "ready", "b.tif": "failed"}
     transfers_before = fake.counters()["transfer"]
     # 成功项不重跑：只能选择失败项
-    good_id = [i["id"] for i in view["items"] if i["name"] == "a.svs"][0]
+    good_id = [i["id"] for i in view["items"] if i["name"] == "a.tif"][0]
     with pytest.raises(store.ConflictError):
         store.retry_items(batch["id"], OWNER, [good_id])
-    bad_id = [i["id"] for i in view["items"] if i["name"] == "b.svs"][0]
+    bad_id = [i["id"] for i in view["items"] if i["name"] == "b.tif"][0]
     retried = store.retry_items(batch["id"], OWNER, [bad_id])
     assert retried["state"] == "queued"
     fake.fail_download_names = set()
     view2 = store.run_batch(batch["id"], fake, staging_root=tmp_path)
     assert view2["state"] == "succeeded"
     assert {i["stage"] for i in view2["items"]} == {"ready"}
-    # 重跑只重试失败项：a.svs 不重转存；b.svs 副本仍在（首跑已转存、
+    # 重跑只重试失败项：a.tif 不重转存；b.tif 副本仍在（首跑已转存、
     # 仅下载失败）→ 对账后也无需二次转存，直接重下载
     assert fake.counters()["transfer"] == transfers_before
     assert fake.counters()["download"] == 3  # a×1 + b×2
@@ -196,7 +214,7 @@ def test_b09_cancel_releases_unconsumed_reservation(monkeypatch, tmp_path):
     def hook(user_id, nbytes):
         return "upr_cancel_1"
 
-    fake, batch = _make_batch(monkeypatch, ["/a.svs"], tmp_path,
+    fake, batch = _make_batch(monkeypatch, ["/a.tif"], tmp_path,
                               entries=ENTRIES, quota_hook=hook,
                               idempotency_key="x1")
     store.request_cancel(batch["id"], OWNER)
@@ -221,7 +239,7 @@ def test_b09_cancel_after_ready_keeps_products(monkeypatch, tmp_path):
     def hook(user_id, nbytes):
         return "upr_cancel_2"
 
-    fake, batch = _make_batch(monkeypatch, ["/a.svs", "/b.svs"], tmp_path,
+    fake, batch = _make_batch(monkeypatch, ["/a.tif", "/b.tif"], tmp_path,
                               entries=ENTRIES, quota_hook=hook,
                               idempotency_key="x2")
     # 首个条目 ready 后、其余完成前取消（按计数注入，规避条目顺序不确定）
@@ -246,7 +264,7 @@ def test_b09_cancel_after_ready_keeps_products(monkeypatch, tmp_path):
 
 
 def test_b09_cancel_terminal_batch_noop(monkeypatch, tmp_path):
-    fake, batch = _make_batch(monkeypatch, ["/a.svs"], tmp_path,
+    fake, batch = _make_batch(monkeypatch, ["/a.tif"], tmp_path,
                               entries=ENTRIES, idempotency_key="x3")
     view = store.run_batch(batch["id"], fake, staging_root=tmp_path)
     assert view["state"] == "succeeded"
@@ -260,7 +278,7 @@ def test_b09_cancel_terminal_batch_noop(monkeypatch, tmp_path):
 # --------------------------------------------------------------------------- #
 
 def test_b10_cleanup_only_batch_paths(monkeypatch, tmp_path):
-    fake, batch = _make_batch(monkeypatch, ["/a.svs"], tmp_path,
+    fake, batch = _make_batch(monkeypatch, ["/a.tif"], tmp_path,
                               entries=ENTRIES, idempotency_key="k1")
     view = store.run_batch(batch["id"], fake, staging_root=tmp_path)
     assert view["state"] == "succeeded"
@@ -272,7 +290,7 @@ def test_b10_cleanup_only_batch_paths(monkeypatch, tmp_path):
 
 def test_b10_cleanup_foreign_path_rejected(monkeypatch, tmp_path):
     from baidu_adapter import AdapterError
-    fake, batch = _make_batch(monkeypatch, ["/a.svs"], tmp_path,
+    fake, batch = _make_batch(monkeypatch, ["/a.tif"], tmp_path,
                               entries=ENTRIES, idempotency_key="k2")
     with pytest.raises(AdapterError) as ei:
         fake.cleanup_batch_copies(batch["id"],
@@ -281,7 +299,7 @@ def test_b10_cleanup_foreign_path_rejected(monkeypatch, tmp_path):
 
 
 def test_b10_cleanup_failure_keeps_ready(monkeypatch, tmp_path):
-    fake, batch = _make_batch(monkeypatch, ["/a.svs"], tmp_path,
+    fake, batch = _make_batch(monkeypatch, ["/a.tif"], tmp_path,
                               entries=ENTRIES, idempotency_key="k3")
     fake.fail_cleanup = True
     view = store.run_batch(batch["id"], fake, staging_root=tmp_path)
@@ -322,6 +340,6 @@ def test_b10_flags_disabled_503_existing_rows_visible(monkeypatch, tmp_path):
     assert status2 == 200 and body2["reason_code"] == "enumeration_disabled"
     # fake 仍可继续导入既有枚举（已接受任务收口）
     batch = store.create_import(
-        OWNER, enum_id, [by_path["a.svs"]["id"]], idempotency_key="k4")
+        OWNER, enum_id, [by_path["a.tif"]["id"]], idempotency_key="k4")
     view2 = store.run_batch(batch["id"], fake, staging_root=tmp_path)
     assert view2["state"] == "succeeded"

@@ -126,8 +126,23 @@ _BUSINESS_TABLES = (
     # 0039 起：会话级「允许 AI 描绘」开关 PT 本地镜像（P1-4；无外键，
     # 显式列出防跨用例残留授权）
     "ai_session_drawing_flags",
-    # 0046 起：KFB 转换任务（无外键，显式列出防跨用例残留 queued/ready）
+    # 0046/0048 起：KFB 转换任务 + 源别名（无外键，显式列出防跨用例残留）
+    "conversion_job_sources",
     "conversion_jobs",
+    # 0050 起：项目创建幂等记录（projects 的 FK CASCADE 已随 projects 清空，
+    # 显式列出防跨用例残留键占用）
+    "project_create_idempotency",
+    # 0049 起：格式兼容请求（W2 PG 权威化）。mail_jobs 引用 format_requests
+    # （CASCADE 已覆盖），显式列出防跨用例残留请求/邮件作业
+    "format_request_mail_jobs",
+    "format_requests",
+    # 0051 起：百度分享导入（W5）。children first：items/batches/candidates
+    # 引用 enumerations（TRUNCATE CASCADE 兜底，显式列出防跨用例残留
+    # 枚举/批次/候选/条目与租约）
+    "baidu_import_items",
+    "baidu_import_batches",
+    "baidu_candidates",
+    "baidu_enumerations",
 )
 
 @pytest.fixture(scope="session")

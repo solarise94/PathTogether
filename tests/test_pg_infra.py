@@ -84,6 +84,8 @@ def test_ensure_schema_idempotent(conn):
         "ai_run_bindings",
         # 0017：Upload V2 分片任务表
         "upload_tasks",
+        # 0046/0048：KFB 转换任务 + 源别名
+        "conversion_jobs", "conversion_job_sources",
     }
     assert expected <= tables, "缺失表: %s" % (expected - tables)
 
@@ -235,6 +237,13 @@ def test_schema_migrations_recorded(conn):
         # KFB Phase B：后台转换任务表（不改 upload_tasks）。
         "0046_conversion_jobs.sql",
         "0047_conversion_jobs_settle_and_name_lock.sql",
+        "0048_conversion_job_sources.sql",
+        # 2026-09-14 W2：格式兼容请求 PG 权威化（format_requests + 邮件队列）。
+        "0049_format_requests.sql",
+        # 2026-09-14 W3：项目创建按 (owner, key) 幂等。
+        "0050_project_create_idempotency.sql",
+        # 2026-09-14 W5：百度分享导入（枚举/候选/批次/条目四表）。
+        "0051_baidu_remote_imports.sql",
     ]
 
 

@@ -576,10 +576,17 @@ describe("Beta 徽标 + i18n 新键（§3.4/§7）", () => {
 	function bootI18n(lang: "zh" | "en" = "zh") {
 		const listeners: Record<string, Array<(e?: unknown) => void>> = {};
 		const storage = new Map<string, string>([["hp_lang", lang]]);
+		const attrs = new Map<string, string>();
 		const doc = {
 			readyState: "complete",
 			cookie: "",
-			documentElement: { lang: "" },
+			// i18n.js applyLang 会写 documentElement.lang，并读 data-page 决定是否更新
+			// document.title；本 harness 非 entry 页，data-page 恒为 null。
+			documentElement: {
+				lang: "",
+				getAttribute: (k: string) => (attrs.has(k) ? (attrs.get(k) as string) : null),
+				setAttribute: (k: string, v: string) => void attrs.set(k, String(v)),
+			},
 			body: fakeEl("body"),
 			getElementById: () => null,
 			createElement: () => fakeEl(),

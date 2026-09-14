@@ -27,7 +27,7 @@
     <span id="header-zoom-badge" class="zoom-badge header-zoom-badge">—</span>
     {% if C.login_cta %}
     {% if logged_in %}
-    <a class="header-login-link" href="/" data-i18n="demo.open.full">打开完整版</a>
+    <a class="header-login-link" href="/app" data-i18n="demo.open.full">打开完整版</a>
     {% else %}
     <a class="header-login-link" href="/login" data-i18n="demo.login">登录 HistoPilot</a>
     <a class="header-login-link header-register-link" href="/register" data-i18n="demo.register">注册方式</a>
@@ -220,10 +220,14 @@
         <input id="slide-search" type="search" class="slide-search" autocomplete="off"
                placeholder="搜索切片…" data-i18n-ph="sb.search.ph"
                aria-label="按名称过滤切片列表" data-i18n-aria="sb.search.aria" />
-        <button id="upload-btn" class="btn primary block" data-i18n="sb.upload">上传切片</button>
+        {# W3/W4/W6 2026-09-14：侧栏只留两个主入口——「导入切片」统一抽屉 +
+           「新建项目」对话框；内联 new-project-form / format-req 已移除
+           （格式申请迁入导入抽屉次级入口）。#file-input 保持隐藏，上传管线
+           （legacy /api/upload 与 V2 分片）不变，进度行照旧显示在这里。 #}
+        <button id="import-slides-btn" class="btn primary block" data-i18n="sb.upload">导入切片</button>
         <button id="new-project-btn" class="btn secondary block" data-i18n="sb.new.project">＋ 新建项目</button>
         <input id="file-input" type="file"
-               accept=".svs,.tif,.tiff,.ndpi,.mrxs,.vms,.vmu,.scn,.bif,.svslide,.kfb,.zip"
+               accept=".svs,.tif,.tiff,.ndpi,.mrxs,.vms,.vmu,.scn,.bif,.svslide,.kfb,.kfbf,.zip"
                hidden />
         <div id="progress-wrap" class="progress-wrap" style="display:none;">
           <div id="progress-bar" class="progress-bar"></div>
@@ -231,15 +235,6 @@
         </div>
         <!-- U3：多文件各自独立进度行（修共用进度条的 bug；分片上传三段状态） -->
         <div id="upload-progress-list" class="upload-progress-list"></div>
-
-        <div id="new-project-form" class="new-project-form" style="display:none;">
-          <input id="np-name" type="text" maxlength="60" data-i18n-ph="sb.np.name.ph" placeholder="项目名称" autocomplete="off" />
-          <input id="np-note" type="text" maxlength="200" data-i18n-ph="sb.np.note.ph" placeholder="备注（可选）" autocomplete="off" />
-          <div class="np-actions">
-            <button id="np-confirm" class="btn primary small" data-i18n="sb.np.confirm">确认</button>
-            <button id="np-cancel" class="btn secondary small" data-i18n="sb.np.cancel">取消</button>
-          </div>
-        </div>
       </div>
 
       <div class="sidebar-scroll">
@@ -637,6 +632,168 @@
       {% endif %}
     </main>
   </div>
+
+  {% if mode != 'demo' %}
+  {# ====================== W4/W6：统一「导入切片」抽屉 ======================
+     桌面右侧抽屉 / 小屏全屏抽屉（CSS 断点）。两个页签：本地文件 / 百度分享。
+     - 本地页签：文件选择（仍走 #file-input 与既有上传管线）、目标位置
+       （未归类 / 已有项目 / 新项目）、格式目录（GET /api/slide-formats）、
+       「申请新格式支持」次级入口、后台任务列表（GET /api/conversions）。
+     - 百度页签：能力探测 → 分享文本/提取码 → 读取文件列表（枚举）→
+       候选分页/搜索/跨页选择 → 目标项目 → 显式「开始导入」（Idempotency-Key）。
+     分享文本与提取码只进请求体，绝不写日志。 #}
+  <div id="import-drawer-mask" class="drawer-mask" hidden></div>
+  <aside id="import-drawer" class="import-drawer" role="dialog" aria-modal="true"
+         aria-labelledby="import-drawer-title" hidden>
+    <div class="drawer-head">
+      <span id="import-drawer-title" data-i18n="imp.title">导入切片</span>
+      <button id="import-drawer-close" type="button" class="icon-btn close"
+              aria-label="关闭" data-i18n-aria="picker.close">×</button>
+    </div>
+    <div class="drawer-tabs" role="tablist" aria-label="导入方式">
+      <button id="import-tab-local" type="button" class="drawer-tab active" role="tab"
+              aria-selected="true" aria-controls="import-panel-local"
+              data-i18n="imp.tab.local">本地文件</button>
+      <button id="import-tab-baidu" type="button" class="drawer-tab" role="tab"
+              aria-selected="false" aria-controls="import-panel-baidu"
+              data-i18n="imp.tab.baidu">百度分享</button>
+    </div>
+    <div class="drawer-body">
+      <section id="import-panel-local" class="drawer-panel" role="tabpanel" aria-labelledby="import-tab-local">
+        <div class="imp-block">
+          <div class="imp-block-title" data-i18n="imp.local.pick.title">选择文件</div>
+          <button id="import-pick-files" type="button" class="btn primary block"
+                  data-i18n="imp.local.pick">选择本地文件</button>
+          <p class="imp-hint" data-i18n="imp.local.drop.hint">也可以直接把文件拖到查看器窗口</p>
+        </div>
+        <div class="imp-block">
+          <label class="imp-field" for="import-target-select">
+            <span data-i18n="imp.target.label">目标位置</span>
+            <select id="import-target-select" class="select"></select>
+          </label>
+          <input id="import-target-new-name" type="text" maxlength="60" class="input"
+                 data-i18n-ph="sb.np.name.ph" placeholder="项目名称" hidden autocomplete="off" />
+          <p class="imp-hint" data-i18n="imp.target.hint">上传成功后自动把切片加入所选位置</p>
+        </div>
+        <div class="imp-block">
+          <div class="imp-block-title" data-i18n="imp.formats.title">支持的格式</div>
+          <div id="import-format-catalog" class="imp-format-catalog"
+               data-i18n="imp.formats.loading">格式目录加载中…</div>
+        </div>
+        <div class="imp-block">
+          <button id="format-req-btn" type="button" class="btn secondary block"
+                  data-i18n="sb.format.req">申请新格式支持</button>
+          <div id="format-req-form" class="format-req-form" hidden>
+            <label class="imp-field" for="fr-ext">
+              <span data-i18n="fr.ext.label">格式 / 扩展名</span>
+              <input id="fr-ext" type="text" maxlength="40" autocomplete="off" />
+            </label>
+            <label class="imp-field" for="fr-message">
+              <span data-i18n="fr.msg.label">来源设备 / 软件与说明</span>
+              <textarea id="fr-message" maxlength="2000" rows="3"></textarea>
+            </label>
+            <label class="imp-field" for="fr-contact">
+              <span data-i18n="fr.contact.label">联系邮箱（可选）</span>
+              <input id="fr-contact" type="email" maxlength="200" autocomplete="off" />
+            </label>
+            <label class="imp-field" for="fr-sample">
+              <span data-i18n="fr.sample.label">小样本（可选）</span>
+              <input id="fr-sample" type="file" />
+            </label>
+            <p class="imp-hint" id="fr-sample-max"></p>
+            <div class="np-actions">
+              <button id="fr-submit" type="button" class="btn primary small" data-i18n="sb.fr.submit">提交</button>
+              <button id="fr-cancel" type="button" class="btn secondary small" data-i18n="sb.fr.cancel">取消</button>
+            </div>
+            <div id="fr-result" class="fr-result" role="status" hidden></div>
+          </div>
+          <div id="fr-recent" class="fr-recent"></div>
+        </div>
+      </section>
+      <section id="import-panel-baidu" class="drawer-panel" role="tabpanel"
+               aria-labelledby="import-tab-baidu" hidden>
+        <div id="baidu-cap-status" class="imp-cap-status" role="status" data-i18n="bd.cap.loading">能力检测中…</div>
+        <div class="imp-block" id="baidu-input-block">
+          <label class="imp-field" for="baidu-share-text">
+            <span data-i18n="bd.share.label">分享链接</span>
+            <textarea id="baidu-share-text" rows="3" autocomplete="off"></textarea>
+          </label>
+          <label class="imp-field" for="baidu-extract-code">
+            <span data-i18n="bd.code.label">提取码（可选）</span>
+            <input id="baidu-extract-code" type="text" maxlength="16" autocomplete="off" />
+          </label>
+          <button id="baidu-list-btn" type="button" class="btn primary block"
+                  data-i18n="bd.list.btn">读取文件列表</button>
+          <p class="imp-hint" data-i18n="bd.list.hint">此步骤只读取文件列表，不会转存或下载</p>
+          <div id="baidu-enum-status" class="imp-hint" role="status" hidden></div>
+        </div>
+        <div class="imp-block" id="baidu-candidates-block" hidden>
+          <input id="baidu-search" type="search" class="slide-search" autocomplete="off"
+                 placeholder="按名称过滤…" data-i18n-ph="bd.search.ph"
+                 aria-label="按名称过滤候选列表" data-i18n-aria="bd.search.aria" />
+          <div id="baidu-candidate-list" class="baidu-candidate-list"></div>
+          <div class="baidu-pager">
+            <button id="baidu-prev-btn" type="button" class="btn secondary small"
+                    data-i18n="bd.page.prev">上一页</button>
+            <span id="baidu-page-info" class="imp-hint"></span>
+            <button id="baidu-next-btn" type="button" class="btn secondary small"
+                    data-i18n="bd.page.next">下一页</button>
+          </div>
+          <div id="baidu-selection-summary" class="imp-hint"></div>
+          <label class="imp-field" for="baidu-target-select">
+            <span data-i18n="imp.target.label">目标位置</span>
+            <select id="baidu-target-select" class="select"></select>
+          </label>
+          <button id="baidu-import-btn" type="button" class="btn primary block"
+                  data-i18n="bd.import.btn">开始导入</button>
+          <div id="baidu-import-status" class="imp-hint" role="status" hidden></div>
+          <div id="baidu-import-items" class="baidu-import-items"></div>
+        </div>
+      </section>
+      <div class="imp-block" id="import-tasks-block">
+        <div class="imp-block-title" data-i18n="imp.tasks.title">后台任务</div>
+        <div id="import-task-list" class="import-task-list"
+             data-i18n="imp.tasks.loading">任务加载中…</div>
+      </div>
+    </div>
+  </aside>
+
+  {# ====================== W3：新建项目对话框 ======================
+     替换侧栏内联表单（R3：empty/selection 两模式显式分离，取消/Esc/重开
+     清空草稿，空数组就是空项目；R4：提交锁 + Idempotency-Key 重试复用）。 #}
+  <div id="project-create-mask" class="dialog-mask" hidden>
+    <div id="project-create-dialog" class="picker-dialog project-create-dialog"
+         role="dialog" aria-modal="true" aria-labelledby="pcd-title">
+      <div class="picker-title">
+        <span id="pcd-title" data-i18n="pcd.title">新建项目</span>
+        <button id="pcd-close" type="button" class="icon-btn close"
+                aria-label="关闭" data-i18n-aria="picker.close">×</button>
+      </div>
+      <div class="pcd-body">
+        <label class="changepw-field">
+          <span data-i18n="pcd.name.label">项目名称</span>
+          <input id="pcd-name" type="text" maxlength="60" autocomplete="off" />
+        </label>
+        <label class="changepw-field">
+          <span data-i18n="pcd.note.label">备注（可选）</span>
+          <input id="pcd-note" type="text" maxlength="200" autocomplete="off" />
+        </label>
+        <div class="pcd-slides">
+          <div class="pcd-slides-head">
+            <span data-i18n="pcd.slides.label">初始切片</span>
+            <span id="pcd-slides-summary" class="pcd-slides-summary"></span>
+          </div>
+          <div id="pcd-slides-list" class="pcd-slides-list"></div>
+        </div>
+        <p class="pcd-error" id="pcd-error" role="alert" hidden></p>
+      </div>
+      <div class="picker-footer">
+        <button id="pcd-cancel" type="button" class="btn secondary small" data-i18n="pcd.cancel">取消</button>
+        <button id="pcd-confirm" type="button" class="btn primary" data-i18n="pcd.confirm">创建项目</button>
+      </div>
+    </div>
+  </div>
+  {% endif %}
 
   <div id="tbb-more-mask" class="tbb-more-mask"></div>
   <div id="toast-container"></div>

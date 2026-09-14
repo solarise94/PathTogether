@@ -597,6 +597,40 @@
     progressBar: $("progress-bar"),
     progressText: $("progress-text"),
     uploadProgressList: $("upload-progress-list"),
+    // W3/W4/W6（2026-09-14）：统一「导入切片」抽屉 + 新建项目对话框
+    importSlidesBtn: $("import-slides-btn"),
+    importDrawer: $("import-drawer"),
+    importDrawerMask: $("import-drawer-mask"),
+    importDrawerClose: $("import-drawer-close"),
+    importTabLocal: $("import-tab-local"),
+    importTabBaidu: $("import-tab-baidu"),
+    importPanelLocal: $("import-panel-local"),
+    importPanelBaidu: $("import-panel-baidu"),
+    importPickFiles: $("import-pick-files"),
+    importTargetSelect: $("import-target-select"),
+    importTargetNewName: $("import-target-new-name"),
+    importFormatCatalog: $("import-format-catalog"),
+    importTaskList: $("import-task-list"),
+    frSampleMax: $("fr-sample-max"),
+    frResult: $("fr-result"),
+    frRecent: $("fr-recent"),
+    baiduCapStatus: $("baidu-cap-status"),
+    baiduInputBlock: $("baidu-input-block"),
+    baiduShareText: $("baidu-share-text"),
+    baiduExtractCode: $("baidu-extract-code"),
+    baiduListBtn: $("baidu-list-btn"),
+    baiduEnumStatus: $("baidu-enum-status"),
+    baiduCandidatesBlock: $("baidu-candidates-block"),
+    baiduSearch: $("baidu-search"),
+    baiduCandidateList: $("baidu-candidate-list"),
+    baiduPrevBtn: $("baidu-prev-btn"),
+    baiduNextBtn: $("baidu-next-btn"),
+    baiduPageInfo: $("baidu-page-info"),
+    baiduSelectionSummary: $("baidu-selection-summary"),
+    baiduTargetSelect: $("baidu-target-select"),
+    baiduImportBtn: $("baidu-import-btn"),
+    baiduImportStatus: $("baidu-import-status"),
+    baiduImportItems: $("baidu-import-items"),
     viewerWrap: $("viewer-wrap"),
     dropOverlay: $("drop-overlay"),
     toastContainer: $("toast-container"),
@@ -631,12 +665,27 @@
     viewerEmpty: $("viewer-empty"),
     viewerEmptyPick: $("viewer-empty-pick"),
     // 项目
+    // 其他格式请求兼容
+    formatReqBtn: $("format-req-btn"),
+    formatReqForm: $("format-req-form"),
+    frExt: $("fr-ext"),
+    frMessage: $("fr-message"),
+    frContact: $("fr-contact"),
+    frSample: $("fr-sample"),
+    frSubmit: $("fr-submit"),
+    frCancel: $("fr-cancel"),
     newProjectBtn: $("new-project-btn"),
-    newProjectForm: $("new-project-form"),
-    npName: $("np-name"),
-    npNote: $("np-note"),
-    npConfirm: $("np-confirm"),
-    npCancel: $("np-cancel"),
+    // W3：新建项目对话框（替换内联表单；R3 empty/selection 草稿 + R4 提交锁）
+    projectCreateMask: $("project-create-mask"),
+    projectCreateDialog: $("project-create-dialog"),
+    pcdClose: $("pcd-close"),
+    pcdName: $("pcd-name"),
+    pcdNote: $("pcd-note"),
+    pcdSlidesSummary: $("pcd-slides-summary"),
+    pcdSlidesList: $("pcd-slides-list"),
+    pcdError: $("pcd-error"),
+    pcdCancel: $("pcd-cancel"),
+    pcdConfirm: $("pcd-confirm"),
     projectList: $("project-list"),
     unfiledToggle: $("unfiled-toggle"),
     unfiledCount: $("unfiled-count"),
@@ -2196,39 +2245,269 @@
     if (els.slideSearch) applySlideFilter(els.slideSearch.value);
   }
 
-  // ---------- 新建项目 ----------
-  // 待加入新建项目的切片（来自未归类勾选）；表单确认时带上
-  var pendingNewProjectSlides = null;
+  // ---------- 新建项目（W3：独立对话框；修 R3 草稿残留 / R4 重复提交） ----------
+  // R3：旧实现把「显式空数组」回退到 pendingNewProjectSlides（未归类勾选的
+  // 隐式全局），取消含选中后普通新建仍夹带旧选择。现在 empty / selection
+  // 两种模式显式分离：selection 打开时**复制**当前勾选快照进草稿，取消 /
+  // Esc / 重新以 empty 打开一律清空草稿；空数组必须表示空项目，绝无 fallback。
+  // R4：inFlight 提交锁由确认按钮与 Enter 共用；Idempotency-Key 按草稿内容
+  // 指纹生成，同一份草稿（含失败后重试）复用，编辑后换新键。
+  var projectDialog = {
+    open: false,
+    mode: null,            // null | "empty" | "selection"
+    slides: [],            // 草稿切片（快照副本，可逐项移除）
+    inFlight: false,       // R4 提交锁
+    idemKey: null,         // 当前草稿的 Idempotency-Key（未发送/已失败时保留）
+    idemFingerprint: "",   // 生成 idemKey 时的载荷指纹
+    lastFocusEl: null,     // 打开者（Esc/关闭后归还焦点）
+  };
 
-  function toggleNewProjectForm(show) {
-    els.newProjectForm.style.display = show ? "block" : "none";
-    if (show) { els.npName.value = ""; els.npNote.value = ""; els.npName.focus(); }
+  function uuid() {
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") {
+        return window.crypto.randomUUID();
+      }
+    } catch (e) { /* 回退 */ }
+    // RFC4122 v4 形态的伪随机回退（crypto.getRandomValues 缺失时的兜底）
+    var s = "";
+    for (var i = 0; i < 36; i++) {
+      if (i === 8 || i === 13 || i === 18 || i === 23) { s += "-"; continue; }
+      s += Math.floor(Math.random() * 16).toString(16);
+    }
+    return s;
   }
 
-  // slidesArg 为显式传入的切片（如顶部"新建项目"为空数组）；
-  // 为空时回退到 pendingNewProjectSlides（未归类勾选预填）
-  function createProjectFromForm(slidesArg) {
-    var slides = (slidesArg && slidesArg.length) ? slidesArg : (pendingNewProjectSlides || []);
-    var name = (els.npName.value || "").trim();
-    if (!name) { toast(t("newproj.need.name"), "error"); els.npName.focus(); return; }
-    var note = els.npNote.value || "";
+  function projectDialogFingerprint(name, note, slides) {
+    return JSON.stringify([name, note, slides.slice().sort()]);
+  }
+
+  function pcdShowError(msg) {
+    if (!els.pcdError) return;
+    els.pcdError.textContent = msg || "";
+    els.pcdError.hidden = !msg;
+  }
+
+  function renderProjectDialogSlides() {
+    if (!els.pcdSlidesList) return;
+    els.pcdSlidesList.innerHTML = "";
+    var n = projectDialog.slides.length;
+    if (els.pcdSlidesSummary) {
+      els.pcdSlidesSummary.textContent = n
+        ? t("pcd.slides.contains", { n: n })
+        : t("pcd.slides.empty.hint");
+    }
+    if (!n) return;
+    projectDialog.slides.forEach(function (name) {
+      var chip = document.createElement("span");
+      chip.className = "pcd-slide-chip";
+      var label = document.createElement("span");
+      label.className = "pcd-slide-chip-name";
+      label.textContent = truncateMiddle(name, 28);
+      label.title = name;
+      chip.appendChild(label);
+      var rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "pcd-slide-chip-remove";
+      rm.textContent = "×";
+      rm.setAttribute("aria-label", t("pcd.slides.remove", { name: truncateMiddle(name, 20) }));
+      rm.addEventListener("click", function () {
+        if (projectDialog.inFlight) return;  // 提交中不允许改草稿
+        projectDialog.slides = projectDialog.slides.filter(function (s) { return s !== name; });
+        renderProjectDialogSlides();
+      });
+      chip.appendChild(rm);
+      els.pcdSlidesList.appendChild(chip);
+    });
+  }
+
+  // 手机端：侧栏抽屉与导入抽屉/对话框同为全屏浮层——打开后者前先收起侧栏
+  // 抽屉（移动端 #sidebar 抽屉 z-index 300，若不收起会盖住遮罩劫持点击）。
+  // 触发按钮多半在侧栏里（导入切片/新建项目都在侧栏顶部），随抽屉收起后
+  // 不可聚焦，焦点归还目标改指向 ☰（closeDrawer 的 a11y 路径通常已先还给它）。
+  function closeSidebarDrawerUnderOverlay(triggerEl) {
+    if (!isMobileWidth() || !sidebarCtrl || !sidebarCtrl.isDrawerOpen ||
+        !sidebarCtrl.isDrawerOpen()) {
+      return triggerEl;
+    }
+    sidebarCtrl.closeDrawer();
+    if (triggerEl && els.sidebar && els.sidebar.contains && els.sidebar.contains(triggerEl)) {
+      return els.menuBtn || triggerEl;
+    }
+    return triggerEl;
+  }
+
+  // 打开对话框。mode="empty"：永远 slides=[]（普通新建）；
+  // mode="selection"：复制 slidesSnapshot 快照（「新建项目(含选中)」）。
+  function openProjectDialog(mode, slidesSnapshot, triggerEl) {
+    if (!els.projectCreateMask) return;
+    triggerEl = closeSidebarDrawerUnderOverlay(triggerEl);
+    projectDialog.open = true;
+    projectDialog.mode = mode === "selection" ? "selection" : "empty";
+    projectDialog.slides = projectDialog.mode === "selection" && Array.isArray(slidesSnapshot)
+      ? slidesSnapshot.slice() : [];
+    projectDialog.inFlight = false;
+    // R3：每次打开都是新草稿——旧键/旧指纹/旧输入一并清空
+    projectDialog.idemKey = null;
+    projectDialog.idemFingerprint = "";
+    projectDialog.lastFocusEl = triggerEl || null;
+    if (els.pcdName) els.pcdName.value = "";
+    if (els.pcdNote) els.pcdNote.value = "";
+    pcdShowError("");
+    renderProjectDialogSlides();
+    if (els.pcdConfirm) {
+      els.pcdConfirm.disabled = false;
+      els.pcdConfirm.textContent = t("pcd.confirm");
+    }
+    els.projectCreateMask.hidden = false;
+    if (els.pcdName && typeof els.pcdName.focus === "function") {
+      try { els.pcdName.focus(); } catch (e) { /* 忽略聚焦失败 */ }
+    }
+  }
+
+  // 关闭并**清空草稿**（取消 / Esc / 遮罩点击 / 成功后共用）。
+  // 提交进行中不允许关闭产生新状态：直接返回（按钮已禁用，防御 Enter 路径）。
+  function closeProjectDialog() {
+    if (!els.projectCreateMask) return;
+    if (projectDialog.inFlight) return;
+    projectDialog.open = false;
+    projectDialog.mode = null;
+    projectDialog.slides = [];
+    projectDialog.idemKey = null;
+    projectDialog.idemFingerprint = "";
+    els.projectCreateMask.hidden = true;
+    pcdShowError("");
+    var back = projectDialog.lastFocusEl;
+    projectDialog.lastFocusEl = null;
+    if (back && typeof back.focus === "function") {
+      try { back.focus(); } catch (e) { /* 触发按钮可能已移除 */ }
+    }
+  }
+
+  // 定位新项目：展开行并滚到可见（成功后的「locate pid」）
+  function locateProject(pid) {
+    if (!pid || !els.projectList) return;
+    var rows = els.projectList.children || [];
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if (row.dataset && row.dataset.pid === pid) {
+        if (row.classList) row.classList.add("expanded");
+        if (typeof row.scrollIntoView === "function") {
+          try { row.scrollIntoView({ block: "nearest" }); } catch (e) {}
+        }
+        return;
+      }
+    }
+  }
+
+  function ensureProjectIdemKey(payloadFp) {
+    if (projectDialog.idemKey && projectDialog.idemFingerprint === payloadFp) {
+      return projectDialog.idemKey;  // 同一草稿重试：复用（响应丢失幂等收口）
+    }
+    projectDialog.idemKey = uuid();
+    projectDialog.idemFingerprint = payloadFp;
+    return projectDialog.idemKey;
+  }
+
+  function submitProjectDialog() {
+    if (!projectDialog.open || projectDialog.inFlight) return;  // R4 双保险
+    if (!els.pcdName) return;
+    var name = (els.pcdName.value || "").trim();
+    if (!name) { pcdShowError(t("newproj.need.name")); try { els.pcdName.focus(); } catch (e) {} return; }
+    var note = (els.pcdNote && els.pcdNote.value) || "";
+    // slides 永远显式：空数组=空项目（R3），无任何隐式回退
+    var slides = projectDialog.slides.slice();
+    var fp = projectDialogFingerprint(name, note, slides);
+    var idemKey = ensureProjectIdemKey(fp);
+    projectDialog.inFlight = true;
+    pcdShowError("");
+    els.pcdConfirm.disabled = true;
+    els.pcdConfirm.textContent = t("pcd.creating");
+    var headers = { "Content-Type": "application/json", "Idempotency-Key": idemKey };
     apiFetch("/api/project/create", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: headers,
       body: JSON.stringify({ name: name, note: note, slides: slides }),
     })
       .then(function (r) {
-        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("newproj.create.fail")); });
-        return r.json();
+        return r.json().then(function (j) {
+          return { ok: r.ok, status: r.status, body: j };
+        }, function () {
+          return { ok: r.ok, status: r.status, body: null };
+        });
       })
-      .then(function () {
+      .then(function (res) {
+        if (!res.ok) {
+          var msg = (res.body && res.body.error) || t("newproj.create.fail");
+          throw new Error(msg);
+        }
+        return res.body || {};
+      })
+      .then(function (created) {
         toast(t("newproj.created"), "success");
-        toggleNewProjectForm(false);
-        pendingNewProjectSlides = null;
+        // 成功：关闭 + 清空草稿 + 勾选清零 + 重载并定位
+        projectDialog.inFlight = false;
+        projectDialog.open = false;
+        projectDialog.slides = [];
+        projectDialog.idemKey = null;
+        projectDialog.idemFingerprint = "";
+        if (els.projectCreateMask) els.projectCreateMask.hidden = true;
+        if (els.pcdConfirm) {
+          els.pcdConfirm.disabled = false;
+          els.pcdConfirm.textContent = t("pcd.confirm");
+        }
         slideChecked = {};
-        reloadProjectsAndUnfiled();
+        renderUnfiled();
+        reloadProjectsAndUnfiled().then(function () {
+          locateProject(created && (created.pid || created.id));
+        }).catch(function () {
+          // 列表刷新失败不影响创建结果（对话框已关闭、草稿已清）
+          locateProject(created && (created.pid || created.id));
+        });
       })
-      .catch(function (e) { toast(t("newproj.create.fail2", { e: e.message }), "error"); });
+      .catch(function (e) {
+        // 失败：保留草稿与 idemKey（同草稿重试复用），恢复按钮
+        projectDialog.inFlight = false;
+        if (els.pcdConfirm) {
+          els.pcdConfirm.disabled = false;
+          els.pcdConfirm.textContent = t("pcd.confirm");
+        }
+        pcdShowError(t("newproj.create.fail2", { e: (e && e.message) ? e.message : e }));
+      });
+  }
+
+  // 对话框焦点圈闭（Tab 不落回背景）：在最后一个可聚焦元素上 Tab 回到第一个。
+  // 注意 els 表是 camelCase 键（els.pcdClose…），不能用字面 id 索引——
+  // 旧写法 els["pcd-close"] 全为 undefined → focusables 恒空 → 圈闭失效。
+  function pcdFocusables() {
+    var list = [els.pcdClose, els.pcdName, els.pcdNote, els.pcdCancel, els.pcdConfirm];
+    var out = [];
+    list.forEach(function (el) {
+      if (el && !(el.hidden)) out.push(el);
+    });
+    return out;
+  }
+
+  function handleProjectDialogKeydown(e) {
+    if (!projectDialog.open) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeProjectDialog();
+      return;
+    }
+    if (e.key === "Tab") {
+      var focusables = pcdFocusables();
+      if (!focusables.length) return;
+      var active = document.activeElement;
+      var first = focusables[0], last = focusables[focusables.length - 1];
+      var inDialog = focusables.indexOf(active) >= 0;
+      if (e.shiftKey && (!inDialog || active === first)) {
+        e.preventDefault();
+        try { last.focus(); } catch (err) {}
+      } else if (!e.shiftKey && (!inDialog || active === last)) {
+        e.preventDefault();
+        try { first.focus(); } catch (err) {}
+      }
+    }
   }
 
   // ---------- 编辑项目 ----------
@@ -4651,6 +4930,7 @@
       row.finish();
       toast(t("upload.done", { name: openName }), "success");
       loadAll();
+      importAssociateUploaded(openName);   // W4：上传行自身的目标关联（若有）
       openSlide(openName);
     }).catch(function (err) {
       var data = (err && err.data) || null;
@@ -4677,25 +4957,60 @@
     });
   }
 
+  // 转换轮询（W4/R5 修复）：后台任务状态是成功的唯一权威。
+  //  - 本地观察超过 15 分钟**不再判失败**：提示「仍在后台处理」后继续退避轮询；
+  //  - 401/403：权限失效 → 停止轮询（不再无意义重试）；
+  //  - 404：任务不存在（终态提示，不冒充失败重试）；
+  //  - 其他非 2xx / 网络异常：显示「暂时无法获取进度」并退避重试，绝不永久判失败；
+  //  - ready：保持既有行为（完成 + 刷新 + 打开本行上传的切片——这是上传行
+  //    自身的原行为，不属于持久任务列表的自动抢占）；失败/取消仍以后端为准。
   function pollConversionJob(body, row) {
     var jobId = body.conversion_job_id;
     var canonical = body.canonical_name;
     row.setStage("upload.stage.converting");
     var started = Date.now();
-    var maxMs = 15 * 60 * 1000;
+    var OBSERVE_NOTE_MS = 15 * 60 * 1000;   // 仅切换提示文案，不停轮询
+    var notedStillProcessing = false;
+    var stopped = false;
+    var delay = 2000;                       // 退避：2s 起步，上限 15s
+    function schedule() {
+      if (stopped) return;
+      delay = Math.min(delay * 2, 15000);
+      setTimeout(tick, delay);
+    }
     function tick() {
-      if (Date.now() - started > maxMs) {
-        row.markError();
-        row.setStage("upload.stage.failed");
-        row.finish(10000);
-        toast(t("upload.fail", { e: t("upload.err.conversion") }), "error");
-        return;
+      if (stopped) return;
+      if (!notedStillProcessing && Date.now() - started > OBSERVE_NOTE_MS) {
+        notedStillProcessing = true;
+        row.setStage("imp.conv.still.processing");  // 「仍在后台处理」（不是失败）
       }
       apiFetch("/api/conversions/" + encodeURIComponent(jobId))
-        .then(function (r) { return r.json().then(function (j) {
-          return { ok: r.ok, body: j };
-        }); })
+        .then(function (r) {
+          return r.json().then(function (j) {
+            return { ok: r.ok, status: r.status, body: j };
+          }, function () {
+            return { ok: r.ok, status: r.status, body: null };  // body 非 JSON
+          });
+        })
         .then(function (res) {
+          if (stopped) return;
+          if (res.status === 401 || res.status === 403) {
+            stopped = true;
+            row.setStage("imp.conv.auth.stop");
+            row.finish(10000);
+            return;
+          }
+          if (res.status === 404) {
+            stopped = true;
+            row.setStage("imp.conv.missing");
+            row.finish(10000);
+            return;
+          }
+          if (!res.ok) {
+            row.setStage("imp.conv.progress.unavailable");
+            schedule();
+            return;
+          }
           var st = res.body && res.body.state;
           if (st === "ready") {
             var name = (res.body.canonical_name || canonical);
@@ -4703,6 +5018,7 @@
             row.finish();
             toast(t("upload.done", { name: name }), "success");
             loadAll();
+            importAssociateUploaded(name);   // W4：上传行自身的目标关联（若有）
             if (name) openSlide(name);
             return;
           }
@@ -4713,9 +5029,13 @@
             toast(t("upload.fail", { e: t("upload.err.conversion") }), "error");
             return;
           }
-          setTimeout(tick, 2000);
+          schedule();
         })
-        .catch(function () { setTimeout(tick, 3000); });
+        .catch(function () {
+          if (stopped) return;
+          row.setStage("imp.conv.progress.unavailable");
+          schedule();
+        });
     }
     tick();
   }
@@ -4755,6 +5075,7 @@
         row.finish();
         toast(t("upload.done", { name: openName }), "success");
         loadAll();
+        importAssociateUploaded(openName);   // W4：上传行自身的目标关联（若有）
         openSlide(openName);
       } else {
         row.markError();
@@ -4782,6 +5103,8 @@
     uploadFileV2: uploadFileV2,
     shouldChunkUpload: shouldChunkUpload,
     UPLOAD_V2_THRESHOLD: UPLOAD_V2_THRESHOLD,
+    // W4/R5：转换轮询（观察超时不判失败；401/403/404 分级处理）
+    pollConversionJob: pollConversionJob,
   };
   // 供测试（升级 A）：侧栏开合控制器与偏好存取的真实逻辑入口
   window.HP_SIDEBAR = {
@@ -4805,6 +5128,971 @@
       var files = e.dataTransfer.files;
       if (files && files.length > 0) { for (var i = 0; i < files.length; i++) uploadFile(files[i]); }
     });
+  }
+
+  // =========================================================================
+  // W4/W6（2026-09-14）：统一「导入切片」抽屉 —— 本地文件 / 百度分享两页签、
+  // 格式目录（GET /api/slide-formats）、「申请新格式支持」次级入口与
+  // 后台任务列表（GET /api/conversions?group=open|recent）。
+  // 本地上传仍走既有 legacy/V2 管线（不重写）；抽屉只负责入口、目标位置
+  // 与任务可视化。百度页签按能力探测结果降级：不可枚举 → 显示可行动原因；
+  // 可枚举不可导入 → 允许读列表、禁用导入。分享文本/提取码只进请求体，
+  // 绝不写日志或 console。
+  // =========================================================================
+  var importDrawerState = {
+    open: false,
+    tab: "local",            // "local" | "baidu"
+    formatsLoaded: false,
+    formatCatalog: [],
+    maxSampleBytes: 64 * 1024 * 1024,   // /api/slide-formats 下发后覆盖
+    taskTimer: null,
+    taskPollStopped: false,  // 401/403 后停止（权限失效，重试无意义）
+    lastFocusEl: null,
+  };
+
+  // 本地页签目标位置（抽屉会话内保留）："" = 未归类；"<pid>" = 已有项目；
+  // "new" = 新项目（首个上传成功时懒创建一次，幂等键固定，后续复用 pid）。
+  var importTargetState = {
+    pid: "",
+    newProjectName: "",
+    createdPid: "",
+    createKey: null,
+  };
+  // 可观测镜像（W4 spec 命名）：上传成功后据此 POST /api/project/<pid>/slides
+  window.__importTargetPid = "";
+
+  function jsonBody(r) {
+    return r.json().then(function (b) { return { ok: r.ok, status: r.status, body: b }; },
+                           function () { return { ok: r.ok, status: r.status, body: null }; });
+  }
+
+  // ---------- 本地页签：目标位置 ----------
+  function impOptionEl(value, label) {
+    var o = document.createElement("option");
+    o.value = value;
+    o.textContent = label;
+    return o;
+  }
+
+  function renderImportTargetSelects() {
+    var projects = allProjects || [];
+    if (els.importTargetSelect) {
+      var keep = els.importTargetSelect.value;
+      els.importTargetSelect.innerHTML = "";
+      els.importTargetSelect.appendChild(impOptionEl("", t("imp.target.unfiled")));
+      projects.forEach(function (p) {
+        els.importTargetSelect.appendChild(impOptionEl(p.pid, p.name || p.pid));
+      });
+      els.importTargetSelect.appendChild(impOptionEl("new", t("imp.target.new")));
+      els.importTargetSelect.value = keep || "";
+    }
+    if (els.baiduTargetSelect) {
+      var keepB = els.baiduTargetSelect.value;
+      els.baiduTargetSelect.innerHTML = "";
+      els.baiduTargetSelect.appendChild(impOptionEl("", t("imp.target.unfiled")));
+      projects.forEach(function (p) {
+        els.baiduTargetSelect.appendChild(impOptionEl(p.pid, p.name || p.pid));
+      });
+      els.baiduTargetSelect.value = keepB || "";
+    }
+  }
+
+  function syncImportTargetFromSelect() {
+    if (!els.importTargetSelect) return;
+    var v = els.importTargetSelect.value;
+    if (els.importTargetNewName) els.importTargetNewName.hidden = v !== "new";
+    if (v === "new") {
+      importTargetState.pid = "";
+      importTargetState.newProjectName = (els.importTargetNewName.value || "").trim();
+    } else {
+      importTargetState.pid = v || "";
+      importTargetState.newProjectName = "";
+    }
+    window.__importTargetPid = importTargetState.pid;
+  }
+
+  // 上传成功后的目标关联（W4）：有目标才动作；目标被删/权限撤销 → 提示
+  // 关联失败，产物保留在未归类（不静默改目标）。
+  function importAssociateUploaded(slideName) {
+    if (!slideName) return Promise.resolve();
+    var st = importTargetState;
+    if (!st.pid && !st.newProjectName) return Promise.resolve();
+    var ensureProject;
+    if (st.pid) {
+      ensureProject = Promise.resolve(st.pid);
+    } else if (st.createdPid) {
+      ensureProject = Promise.resolve(st.createdPid);
+    } else {
+      if (!st.createKey) st.createKey = uuid();
+      var projectName = st.newProjectName;
+      ensureProject = apiFetch("/api/project/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Idempotency-Key": st.createKey },
+        body: JSON.stringify({ name: projectName, note: "", slides: [] }),
+      }).then(jsonBody).then(function (res) {
+        if (!res.ok || !res.body || !res.body.pid) {
+          throw new Error((res.body && res.body.error) || t("newproj.create.fail"));
+        }
+        st.createdPid = res.body.pid;
+        return st.createdPid;
+      });
+    }
+    return ensureProject.then(function (pid) {
+      return apiFetch("/api/project/" + encodeURIComponent(pid) + "/slides", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slides: [slideName] }),
+      }).then(jsonBody).then(function (res) {
+        if (!res.ok) throw new Error((res.body && res.body.error) || t("imp.assoc.fail"));
+        toast(t("imp.assoc.ok", { name: truncateMiddle(slideName, 24) }), "success");
+        return reloadProjectsAndUnfiled();
+      });
+    }).catch(function (e) {
+      toast(t("imp.assoc.fail2", { e: (e && e.message) ? e.message : e }), "error");
+    });
+  }
+
+  // ---------- 格式目录（GET /api/slide-formats，打开抽屉时拉一次） ----------
+  var FORMAT_CATALOG_FALLBACK = [
+    { display_name: "SVS / TIFF / BigTIFF / OME-TIFF / NDPI / VMS / VMU / SCN / BIF / SVSlide",
+      extensions: [".svs", ".tif", ".tiff", ".ome.tif", ".ome.tiff", ".ndpi", ".vms", ".vmu", ".scn", ".bif", ".svslide"],
+      import_mode: "direct", limits: [] },
+    { display_name: "KFB / KFBF", extensions: [".kfb", ".kfbf"],
+      import_mode: "convert",
+      limits: ["KFB 上传后后台转换为 BigTIFF（明场）；KFBF 转换为多通道 OME-TIFF（荧光）"] },
+    { display_name: "MRXS", extensions: [".mrxs"], import_mode: "bundle",
+      limits: ["需要完整包（主文件 + 同名伴随目录），请打包 zip 上传"] },
+  ];
+
+  function formatModeLabel(mode) {
+    if (mode === "convert") return t("imp.formats.mode.convert");
+    if (mode === "bundle") return t("imp.formats.mode.bundle");
+    return t("imp.formats.mode.direct");
+  }
+
+  function renderFormatCatalog(items) {
+    if (!els.importFormatCatalog) return;
+    els.importFormatCatalog.innerHTML = "";
+    (items || []).forEach(function (f) {
+      var row = document.createElement("div");
+      row.className = "imp-format-row";
+      var head = document.createElement("div");
+      head.className = "imp-format-head";
+      var nm = document.createElement("span");
+      nm.className = "imp-format-name";
+      nm.textContent = (f.display_name || f.id || "") + "  " + (f.extensions || []).join(" / ");
+      var badge = document.createElement("span");
+      badge.className = "imp-format-badge mode-" + (f.import_mode || "direct");
+      badge.textContent = formatModeLabel(f.import_mode);
+      head.appendChild(nm);
+      head.appendChild(badge);
+      row.appendChild(head);
+      (f.limits || []).forEach(function (lim) {
+        var l = document.createElement("div");
+        l.className = "imp-format-limit";
+        l.textContent = lim;
+        row.appendChild(l);
+      });
+      els.importFormatCatalog.appendChild(row);
+    });
+  }
+
+  function loadImportFormatCatalog() {
+    if (!els.importFormatCatalog) return Promise.resolve();
+    if (importDrawerState.formatsLoaded) return Promise.resolve();
+    els.importFormatCatalog.textContent = t("imp.formats.loading");
+    return apiFetch("/api/slide-formats").then(jsonBody).then(function (res) {
+      var body = res.body;
+      var items = body && (body.formats || body.items);
+      if (!Array.isArray(items) && Array.isArray(body)) items = body;
+      if (!res.ok || !Array.isArray(items)) {
+        renderFormatCatalog(FORMAT_CATALOG_FALLBACK);   // 后端暂缺：静态产品文案兜底
+        return;
+      }
+      importDrawerState.formatCatalog = items;
+      var maxSample = Number(body && body.max_sample_bytes);
+      if (maxSample > 0) importDrawerState.maxSampleBytes = maxSample;
+      importDrawerState.formatsLoaded = true;
+      renderFormatCatalog(items);
+      renderFrSampleMax();
+    }).catch(function () {
+      renderFormatCatalog(FORMAT_CATALOG_FALLBACK);
+    });
+  }
+
+  function renderFrSampleMax() {
+    if (!els.frSampleMax) return;
+    els.frSampleMax.textContent = t("fr.sample.max", {
+      size: fmtSize(importDrawerState.maxSampleBytes),
+    });
+  }
+
+  // ---------- 申请新格式支持（次级入口；202 = 已登记，等待评估） ----------
+  function frBusinessStatusLabel(status) {
+    if (status === "reviewing") return t("fr.status.reviewing");
+    if (status === "supported") return t("fr.status.supported");
+    if (status === "declined") return t("fr.status.declined");
+    return t("fr.status.submitted");   // submitted / 未知一律「已登记，等待评估」
+  }
+
+  function renderFormatRequestResult(rec) {
+    if (!els.frResult) return;
+    els.frResult.innerHTML = "";
+    els.frResult.hidden = false;
+    var line = document.createElement("span");
+    line.textContent = t("fr.ok.registered", { id: (rec && rec.request_id) || (rec && rec.id) || "" }) +
+      " · " + frBusinessStatusLabel(rec && rec.business_status);
+    els.frResult.appendChild(line);
+    var refresh = document.createElement("button");
+    refresh.type = "button";
+    refresh.className = "link-btn";
+    refresh.textContent = t("fr.refresh");
+    refresh.addEventListener("click", function () {
+      var rid = rec && (rec.request_id || rec.id);
+      if (!rid) return;
+      apiFetch("/api/format-requests/" + encodeURIComponent(rid))
+        .then(jsonBody)
+        .then(function (res) {
+          if (res.ok && res.body) {
+            renderFormatRequestResult(res.body);
+            loadRecentFormatRequests();
+          } else {
+            toast(t("fr.refresh.fail"), "error");
+          }
+        })
+        .catch(function () { toast(t("fr.refresh.fail"), "error"); });
+    });
+    els.frResult.appendChild(refresh);
+  }
+
+  function loadRecentFormatRequests() {
+    if (!els.frRecent) return;
+    apiFetch("/api/format-requests").then(jsonBody).then(function (res) {
+      if (!res.ok || !res.body || !Array.isArray(res.body.items)) {
+        els.frRecent.innerHTML = "";   // 接口暂缺/失败：静默（次级入口不打扰）
+        return;
+      }
+      els.frRecent.innerHTML = "";
+      if (!res.body.items.length) return;
+      var title = document.createElement("div");
+      title.className = "fr-recent-title";
+      title.textContent = t("fr.recent.title");
+      els.frRecent.appendChild(title);
+      res.body.items.slice(0, 5).forEach(function (it) {
+        var row = document.createElement("div");
+        row.className = "fr-recent-row";
+        row.textContent = (it.format_ext || "") + " · " + frBusinessStatusLabel(it.business_status);
+        els.frRecent.appendChild(row);
+      });
+    }).catch(function () { /* 静默 */ });
+  }
+
+  function submitFormatRequest() {
+    if (!els.frExt || !els.frSubmit) return;
+    var ext = (els.frExt.value || "").trim();
+    if (!ext) { toast(t("fr.need.ext"), "error"); return; }
+    // 前端预检样本大小（服务端仍权威校验）
+    if (els.frSample && els.frSample.files && els.frSample.files[0] &&
+        els.frSample.files[0].size > importDrawerState.maxSampleBytes) {
+      toast(t("fr.sample.too.large", {
+        size: fmtSize(importDrawerState.maxSampleBytes),
+      }), "error");
+      return;
+    }
+    var fd = new FormData();
+    fd.append("format_ext", ext);
+    fd.append("message", (els.frMessage.value || "").trim());
+    fd.append("contact", (els.frContact.value || "").trim());
+    if (els.frSample.files && els.frSample.files[0]) {
+      fd.append("sample", els.frSample.files[0]);
+    }
+    els.frSubmit.disabled = true;
+    apiFetch("/api/format-requests", { method: "POST", body: fd })
+      .then(jsonBody)
+      .then(function (res) {
+        if (res.status === 202) {
+          // 202 只表示登记成功：展示申请编号 + 业务状态（不说「已发送/已兼容」）
+          renderFormatRequestResult(res.body);
+          els.frExt.value = ""; els.frMessage.value = "";
+          els.frContact.value = ""; els.frSample.value = "";
+          loadRecentFormatRequests();
+        } else {
+          // 413/429/其他失败：保留草稿（输入不清空），就地提示
+          toast((res.body && res.body.error) || t("fr.fail"), "error");
+        }
+      })
+      .catch(function () { toast(t("fr.fail"), "error"); })
+      .finally(function () { els.frSubmit.disabled = false; });
+  }
+
+  // ---------- 后台任务列表（GET /api/conversions?group=…；轮询） ----------
+  function conversionStateLabel(state) {
+    switch (state) {
+      case "queued": return t("imp.task.state.queued");
+      case "converting": case "validating": return t("imp.task.state.running");
+      case "ready": return t("imp.task.state.ready");
+      case "failed": return t("imp.task.state.failed");
+      case "cancelled": return t("imp.task.state.cancelled");
+      default: return state || "";
+    }
+  }
+
+  function refreshImportTasks() {
+    if (!els.importTaskList || !importDrawerState.open) return;
+    apiFetch("/api/conversions?group=open").then(jsonBody)
+      .then(function (openRes) {
+        if (openRes.status === 401 || openRes.status === 403) {
+          importDrawerState.taskPollStopped = true;
+          els.importTaskList.textContent = t("imp.tasks.auth.stop");
+          return null;
+        }
+        // recent 合并展示（open 优先去重；失败不影响 open 列表）
+        return apiFetch("/api/conversions?group=recent").then(jsonBody)
+          .then(function (recentRes) { return { openRes: openRes, recentRes: recentRes }; });
+      })
+      .then(function (res) {
+        if (!res) return;
+        var seen = {};
+        var items = [];
+        ((res.openRes.body && res.openRes.body.items) || []).forEach(function (j) {
+          if (!seen[j.conversion_job_id]) { seen[j.conversion_job_id] = true; items.push(j); }
+        });
+        ((res.recentRes.body && res.recentRes.body.items) || []).forEach(function (j) {
+          if (!seen[j.conversion_job_id]) { seen[j.conversion_job_id] = true; items.push(j); }
+        });
+        renderImportTasks(items);
+      })
+      .catch(function () {
+        // 网络故障：明确「暂时无法获取进度」，下次轮询继续（不判失败）
+        if (els.importTaskList) els.importTaskList.textContent = t("imp.tasks.net.err");
+      });
+  }
+
+  function renderImportTasks(items) {
+    if (!els.importTaskList) return;
+    els.importTaskList.innerHTML = "";
+    if (!items || !items.length) {
+      els.importTaskList.textContent = t("imp.tasks.empty");
+      return;
+    }
+    items.slice(0, 20).forEach(function (job) {
+      var row = document.createElement("div");
+      row.className = "imp-task-row state-" + (job.state || "");
+      var mid = document.createElement("div");
+      mid.className = "imp-task-mid";
+      var nm = document.createElement("div");
+      nm.className = "imp-task-name";
+      nm.textContent = truncateMiddle(job.source_name || job.canonical_name || job.conversion_job_id, 36);
+      var st = document.createElement("div");
+      st.className = "imp-task-state";
+      st.textContent = conversionStateLabel(job.state) +
+        (job.error_code ? " · " + job.error_code : "");
+      mid.appendChild(nm);
+      mid.appendChild(st);
+      row.appendChild(mid);
+      if (job.state === "ready") {
+        var openBtn = document.createElement("button");
+        openBtn.type = "button";
+        openBtn.className = "btn secondary small";
+        openBtn.textContent = t("imp.task.open");
+        openBtn.addEventListener("click", function () {
+          // 用户显式点击才打开（持久列表绝不自动抢占正在看的切片）
+          var n = job.canonical_name || job.source_name;
+          if (n) openSlide(n);
+        });
+        row.appendChild(openBtn);
+      } else if (job.state === "failed" || job.state === "cancelled") {
+        var retryBtn = document.createElement("button");
+        retryBtn.type = "button";
+        retryBtn.className = "btn secondary small";
+        retryBtn.textContent = t("imp.task.retry");
+        retryBtn.addEventListener("click", function () {
+          retryBtn.disabled = true;
+          apiFetch("/api/conversions/" + encodeURIComponent(job.conversion_job_id) + "/retry",
+                   { method: "POST" })
+            .then(jsonBody)
+            .then(function (res) {
+              if (!res.ok) {
+                toast((res.body && res.body.error) || t("imp.task.retry.fail"), "error");
+                retryBtn.disabled = false;
+                return;
+              }
+              toast(t("imp.task.retry.queued"), "success");
+              refreshImportTasks();
+            })
+            .catch(function () { toast(t("imp.task.retry.fail"), "error"); retryBtn.disabled = false; });
+        });
+        row.appendChild(retryBtn);
+      }
+      els.importTaskList.appendChild(row);
+    });
+  }
+
+  function startImportTaskPolling() {
+    stopImportTaskPolling();
+    importDrawerState.taskPollStopped = false;
+    importDrawerState.taskTimer = setInterval(function () {
+      if (!importDrawerState.taskPollStopped) refreshImportTasks();
+    }, 5000);
+  }
+
+  function stopImportTaskPolling() {
+    if (importDrawerState.taskTimer) {
+      clearInterval(importDrawerState.taskTimer);
+      importDrawerState.taskTimer = null;
+    }
+  }
+
+  // ---------- 百度分享页签 ----------
+  var baiduState = {
+    capsChecked: false,
+    enumerationAvailable: false,
+    importAvailable: false,
+    reasonCode: "",
+    enumId: null,
+    enumState: null,
+    enumComplete: false,
+    enumErrorCode: "",
+    enumTimer: null,
+    candidates: [],      // 当前页条目
+    cursor: null,        // 当前页游标（null = 第一页）
+    nextCursor: null,
+    prevStack: [],
+    selected: {},        // candidate id → candidate（跨页保留）
+    importId: null,
+    importTimer: null,
+    importIdemKey: null,
+  };
+
+  function baiduCapReasonText(code) {
+    switch (code) {
+      case "enumeration_disabled": return t("bd.cap.reason.enumeration_disabled");
+      case "connector_missing": return t("bd.cap.reason.connector_missing");
+      case "secret_unconfigured": return t("bd.cap.reason.secret_unconfigured");
+      case "import_disabled": return t("bd.cap.reason.import_disabled");
+      default: return t("bd.cap.reason.unknown");
+    }
+  }
+
+  function setBaiduListEnabled(enabled) {
+    if (els.baiduListBtn) els.baiduListBtn.disabled = !enabled;
+  }
+
+  function setBaiduImportEnabled(enabled, reason) {
+    if (!els.baiduImportBtn) return;
+    els.baiduImportBtn.disabled = !enabled;
+    els.baiduImportBtn.title = enabled ? "" : (reason || "");
+  }
+
+  function renderBaiduCapabilities() {
+    if (!els.baiduCapStatus) return;
+    if (!baiduState.enumerationAvailable) {
+      // 页签仍可见：给出可行动原因（不呈现无响应按钮）
+      els.baiduCapStatus.textContent = t("bd.cap.unavailable", {
+        reason: baiduCapReasonText(baiduState.reasonCode),
+      });
+      els.baiduCapStatus.hidden = false;
+      setBaiduListEnabled(false);
+      setBaiduImportEnabled(false, baiduCapReasonText(baiduState.reasonCode));
+      if (els.baiduInputBlock) els.baiduInputBlock.hidden = true;
+      if (els.baiduCandidatesBlock) els.baiduCandidatesBlock.hidden = true;
+      return;
+    }
+    els.baiduCapStatus.textContent = baiduState.importAvailable
+      ? t("bd.cap.ready")
+      : t("bd.cap.enum.only");
+    els.baiduCapStatus.hidden = false;
+    setBaiduListEnabled(true);
+    if (els.baiduInputBlock) els.baiduInputBlock.hidden = false;
+    // 可枚举但不可导入：允许读列表，禁用导入
+    setBaiduImportEnabled(false, t("bd.cap.reason.import_disabled"));
+  }
+
+  function refreshBaiduCapabilities() {
+    if (!els.baiduCapStatus) return Promise.resolve();
+    return apiFetch("/api/remote-imports/baidu/capabilities").then(jsonBody).then(function (res) {
+      baiduState.capsChecked = true;
+      if (!res.ok || !res.body) {
+        // 503 connector_unavailable 等：按不可用处理（带原因）
+        baiduState.enumerationAvailable = false;
+        baiduState.importAvailable = false;
+        baiduState.reasonCode = (res.body && res.body.code) || "";
+        renderBaiduCapabilities();
+        return;
+      }
+      baiduState.enumerationAvailable = !!res.body.enumeration_available;
+      baiduState.importAvailable = !!res.body.import_available;
+      baiduState.reasonCode = res.body.reason_code || "";
+      renderBaiduCapabilities();
+    }).catch(function () {
+      baiduState.capsChecked = true;
+      baiduState.enumerationAvailable = false;
+      baiduState.importAvailable = false;
+      baiduState.reasonCode = "";
+      renderBaiduCapabilities();
+    });
+  }
+
+  function setBaiduEnumStatus(msg) {
+    if (!els.baiduEnumStatus) return;
+    els.baiduEnumStatus.textContent = msg || "";
+    els.baiduEnumStatus.hidden = !msg;
+  }
+
+  function startBaiduEnumeration() {
+    if (!els.baiduShareText || !baiduState.enumerationAvailable) return;
+    var shareText = (els.baiduShareText.value || "").trim();
+    if (!shareText) { toast(t("bd.share.need"), "error"); return; }
+    var code = (els.baiduExtractCode && els.baiduExtractCode.value || "").trim();
+    var payload = { share_text: shareText };
+    if (code) payload.extraction_code = code;   // 提取码只进请求体，不写日志
+    setBaiduListEnabled(false);
+    setBaiduEnumStatus(t("bd.enum.starting"));
+    apiFetch("/api/remote-imports/baidu/enumerations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).then(jsonBody).then(function (res) {
+      if (res.status !== 202 || !res.body || !res.body.id) {
+        setBaiduListEnabled(true);
+        setBaiduEnumStatus(t("bd.enum.create.fail", {
+          e: (res.body && (res.body.error || res.body.code)) || ("HTTP " + res.status),
+        }));
+        return;
+      }
+      baiduState.enumId = res.body.id;
+      baiduState.enumState = res.body.state || "queued";
+      baiduState.selected = {};
+      pollBaiduEnumeration();
+    }).catch(function () {
+      setBaiduListEnabled(true);
+      setBaiduEnumStatus(t("bd.enum.create.fail", { e: t("imp.tasks.net.err") }));
+    });
+  }
+
+  function pollBaiduEnumeration() {
+    if (!baiduState.enumId) return;
+    if (baiduState.enumTimer) clearTimeout(baiduState.enumTimer);
+    var tick = function () {
+      apiFetch("/api/remote-imports/baidu/enumerations/" +
+               encodeURIComponent(baiduState.enumId)).then(jsonBody).then(function (res) {
+        if (!res.ok || !res.body) {
+          setBaiduEnumStatus(t("bd.enum.poll.fail", {
+            e: (res.body && res.body.error) || ("HTTP " + res.status),
+          }));
+          baiduState.enumTimer = setTimeout(tick, 5000);
+          return;
+        }
+        var b = res.body;
+        baiduState.enumState = b.state;
+        if (b.state === "queued" || b.state === "enumerating") {
+          setBaiduEnumStatus(t("bd.enum.progress", { n: b.scanned_count || 0 }));
+          baiduState.enumTimer = setTimeout(tick, 2000);
+          return;
+        }
+        setBaiduListEnabled(true);
+        if (b.state === "failed" || b.state === "expired") {
+          baiduState.enumComplete = false;
+          baiduState.enumErrorCode = b.error_code || b.state;
+          setBaiduEnumStatus(t("bd.enum.failed", {
+            code: baiduState.enumErrorCode,
+          }));
+          if (els.baiduCandidatesBlock) els.baiduCandidatesBlock.hidden = true;
+          return;
+        }
+        // ready：complete 才可导入；不完整禁用导入并说明
+        baiduState.enumComplete = !!b.complete;
+        setBaiduEnumStatus(t("bd.enum.ready", {
+          n: b.candidate_count != null ? b.candidate_count : (b.scanned_count || 0),
+        }) + (b.complete ? "" : " · " + t("bd.enum.incomplete", {
+          reason: b.incomplete_reason || b.error_code || "",
+        })));
+        if (els.baiduCandidatesBlock) els.baiduCandidatesBlock.hidden = false;
+        baiduState.cursor = null;
+        baiduState.nextCursor = null;
+        baiduState.prevStack = [];
+        loadBaiduCandidates();
+        updateBaiduImportGate();
+      }).catch(function () {
+        setBaiduEnumStatus(t("bd.enum.poll.fail", { e: t("imp.tasks.net.err") }));
+        baiduState.enumTimer = setTimeout(tick, 5000);
+      });
+    };
+    tick();
+  }
+
+  // 大小展示：十进制字符串 → 可读单位（BigInt 全程，不经 Number）
+  function formatDecBytes(dec) {
+    try {
+      var b = BigInt(dec == null ? 0 : dec);
+      if (b < 1024n) return b.toString() + " B";
+      var units = ["KB", "MB", "GB", "TB"];
+      var u = -1n;
+      var v = b;
+      do {
+        v /= 1024n;
+        u += 1n;
+      } while (v >= 1024n && u < BigInt(units.length - 1));
+      // 一位小数（整数部分 + 千分位余数；不再回落 Number）
+      var tenths = ((b * 10n) / (1024n ** (u + 1n))) % 10n;
+      var whole = v.toString();
+      return whole + "." + tenths.toString() + " " + units[Number(u)];
+    } catch (e) {
+      return String(dec == null ? "" : dec);
+    }
+  }
+
+  function loadBaiduCandidates() {
+    if (!baiduState.enumId || !els.baiduCandidateList) return Promise.resolve();
+    var url = "/api/remote-imports/baidu/enumerations/" +
+      encodeURIComponent(baiduState.enumId) + "/candidates?limit=50";
+    if (baiduState.cursor) url += "&cursor=" + encodeURIComponent(baiduState.cursor);
+    return apiFetch(url).then(jsonBody).then(function (res) {
+      if (!res.ok || !res.body || !Array.isArray(res.body.items)) {
+        toast((res.body && res.body.error) || t("bd.candidates.fail"), "error");
+        return;
+      }
+      baiduState.candidates = res.body.items;
+      baiduState.nextCursor = res.body.next_cursor || null;
+      renderBaiduCandidates();
+    }).catch(function () { toast(t("bd.candidates.fail"), "error"); });
+  }
+
+  function baiduCandidateReasonText(code) {
+    if (!code) return "";
+    if (code === "directory") return t("bd.cand.reason.directory");
+    if (code === "bundle_incomplete") return t("bd.cand.reason.bundle_incomplete");
+    if (code === "unsupported") return t("bd.cand.reason.unsupported");
+    return code;
+  }
+
+  function renderBaiduCandidates() {
+    if (!els.baiduCandidateList) return;
+    var filter = (els.baiduSearch && els.baiduSearch.value || "").trim().toLowerCase();
+    var items = baiduState.candidates.filter(function (c) {
+      if (!filter) return true;
+      return ((c.name || "") + " " + (c.relative_path || "")).toLowerCase().indexOf(filter) >= 0;
+    });
+    els.baiduCandidateList.innerHTML = "";
+    if (!items.length) {
+      var empty = document.createElement("div");
+      empty.className = "imp-hint";
+      empty.textContent = t("bd.candidates.empty");
+      els.baiduCandidateList.appendChild(empty);
+    }
+    items.forEach(function (c) {
+      var row = document.createElement("label");
+      row.className = "baidu-cand-row" + (c.selectable ? "" : " not-selectable");
+      var cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.value = c.id;
+      cb.checked = !!baiduState.selected[c.id];
+      cb.disabled = !c.selectable;   // 目录/缺包/不支持：不可选
+      cb.addEventListener("change", function () {
+        toggleBaiduCandidate(c, cb.checked);
+      });
+      row.appendChild(cb);
+      var info = document.createElement("span");
+      info.className = "bc-info";
+      var nm = document.createElement("span");
+      nm.className = "bc-name";
+      nm.textContent = c.name || c.id;
+      nm.title = c.relative_path || c.name || "";
+      var meta = document.createElement("span");
+      meta.className = "bc-meta";
+      meta.textContent = (c.relative_path || "") + " · " + formatDecBytes(c.size_bytes) +
+        (c.format ? " · " + c.format : "") +
+        (c.selectable ? "" : " · " + baiduCandidateReasonText(c.reason_code));
+      info.appendChild(nm);
+      info.appendChild(meta);
+      row.appendChild(info);
+      els.baiduCandidateList.appendChild(row);
+    });
+    if (els.baiduPrevBtn) els.baiduPrevBtn.disabled = baiduState.prevStack.length === 0;
+    if (els.baiduNextBtn) els.baiduNextBtn.disabled = !baiduState.nextCursor;
+    if (els.baiduPageInfo) {
+      els.baiduPageInfo.textContent = t("bd.page.info", {
+        n: baiduState.candidates.length,
+        sel: Object.keys(baiduState.selected).length,
+      });
+    }
+    updateBaiduSelectionSummary();
+  }
+
+  // 选择跨页保留（Map：candidate id → candidate）
+  function toggleBaiduCandidate(c, on) {
+    if (!c || !c.selectable) return;
+    if (on) baiduState.selected[c.id] = c;
+    else delete baiduState.selected[c.id];
+    updateBaiduSelectionSummary();
+    if (els.baiduPageInfo) {
+      els.baiduPageInfo.textContent = t("bd.page.info", {
+        n: baiduState.candidates.length,
+        sel: Object.keys(baiduState.selected).length,
+      });
+    }
+  }
+
+  function baiduSelectedTotalBytes() {
+    var total = 0n;
+    Object.keys(baiduState.selected).forEach(function (k) {
+      try { total += BigInt(baiduState.selected[k].size_bytes || 0); }
+      catch (e) { /* 畸形条目跳过 */ }
+    });
+    return total;   // BigInt（十进制字符串来源，不经 Number）
+  }
+
+  function updateBaiduSelectionSummary() {
+    if (!els.baiduSelectionSummary) return;
+    var n = Object.keys(baiduState.selected).length;
+    if (!n) {
+      els.baiduSelectionSummary.textContent = t("bd.selected.none");
+      return;
+    }
+    els.baiduSelectionSummary.textContent = t("bd.selected.summary", {
+      n: n,
+      size: formatDecBytes(baiduSelectedTotalBytes().toString()),
+    });
+  }
+
+  // 导入门：枚举 ready+complete、能力允许、有选择
+  function updateBaiduImportGate() {
+    var ok = baiduState.importAvailable && baiduState.enumComplete &&
+      Object.keys(baiduState.selected).length > 0;
+    setBaiduImportEnabled(ok, !baiduState.importAvailable
+      ? t("bd.cap.reason.import_disabled")
+      : (!baiduState.enumComplete ? t("bd.enum.incomplete.short") : ""));
+  }
+
+  function startBaiduImport() {
+    if (!baiduState.importAvailable || !baiduState.enumId || !baiduState.enumComplete) return;
+    var ids = Object.keys(baiduState.selected);
+    if (!ids.length) { toast(t("bd.selected.none"), "error"); return; }
+    var payload = { enumeration_id: baiduState.enumId, candidate_ids: ids };
+    var targetPid = (els.baiduTargetSelect && els.baiduTargetSelect.value) || "";
+    if (targetPid) payload.target_project_id = targetPid;
+    // Idempotency-Key：每次确认点击生成；网络失败重试复用（成功后清除）
+    if (!baiduState.importIdemKey) baiduState.importIdemKey = uuid();
+    var key = baiduState.importIdemKey;
+    if (els.baiduImportBtn) els.baiduImportBtn.disabled = true;
+    setBaiduImportStatus(t("bd.import.submitting"));
+    apiFetch("/api/remote-imports/baidu/imports", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": key },
+      body: JSON.stringify(payload),
+    }).then(jsonBody).then(function (res) {
+      if (res.status !== 202 || !res.body || !res.body.id) {
+        baiduState.importIdemKey = key;   // 保留：同一确认重试复用
+        if (els.baiduImportBtn) els.baiduImportBtn.disabled = false;
+        setBaiduImportStatus(t("bd.import.fail", {
+          e: (res.body && (res.body.error || res.body.code)) || ("HTTP " + res.status),
+        }));
+        return;
+      }
+      baiduState.importIdemKey = null;    // 成功：下次确认重新生成
+      baiduState.importId = res.body.id;
+      setBaiduImportStatus(t("bd.import.started", { id: res.body.id }));
+      pollBaiduImport();
+    }).catch(function () {
+      baiduState.importIdemKey = key;     // 网络失败：重试复用同一键
+      if (els.baiduImportBtn) els.baiduImportBtn.disabled = false;
+      setBaiduImportStatus(t("bd.import.fail", { e: t("imp.tasks.net.err") }));
+    });
+  }
+
+  function setBaiduImportStatus(msg) {
+    if (!els.baiduImportStatus) return;
+    els.baiduImportStatus.textContent = msg || "";
+    els.baiduImportStatus.hidden = !msg;
+  }
+
+  function bdStageLabel(stage) {
+    switch (stage) {
+      case "queued": return t("bd.stage.queued");
+      case "transferring": return t("bd.stage.transferring");
+      case "downloading": return t("bd.stage.downloading");
+      case "validating": return t("bd.stage.validating");
+      case "converting": return t("bd.stage.converting");
+      case "ingesting": return t("bd.stage.ingesting");
+      case "ready": return t("bd.stage.ready");
+      case "failed": return t("bd.stage.failed");
+      case "cancelled": return t("bd.stage.cancelled");
+      default: return stage || "";
+    }
+  }
+
+  function renderBaiduImport(batch) {
+    if (!els.baiduImportItems) return;
+    els.baiduImportItems.innerHTML = "";
+    var counts = { ready: 0, failed: 0, other: 0 };
+    (batch.items || []).forEach(function (it) {
+      if (it.stage === "ready") counts.ready++;
+      else if (it.stage === "failed" || it.stage === "cancelled") counts.failed++;
+      else counts.other++;
+      var row = document.createElement("div");
+      row.className = "baidu-import-row stage-" + (it.stage || "");
+      var nm = document.createElement("span");
+      nm.className = "bi-name";
+      nm.textContent = truncateMiddle(it.name || it.id, 30);
+      var stg = document.createElement("span");
+      stg.className = "bi-stage";
+      stg.textContent = bdStageLabel(it.stage) +
+        (it.error_code ? " · " + it.error_code : "");
+      row.appendChild(nm);
+      row.appendChild(stg);
+      els.baiduImportItems.appendChild(row);
+    });
+    setBaiduImportStatus(t("bd.import.progress", {
+      state: batch.state || "",
+      ok: counts.ready,
+      fail: counts.failed,
+      total: (batch.items || []).length,
+    }));
+    // 部分失败（批次终态）：显示统计 + 仅重试失败项
+    if (batch.state === "partial_failed" || batch.state === "failed") {
+      var failedIds = (batch.items || [])
+        .filter(function (it) { return it.stage === "failed"; })
+        .map(function (it) { return it.id; });
+      if (failedIds.length) {
+        var retryBtn = document.createElement("button");
+        retryBtn.type = "button";
+        retryBtn.className = "btn secondary small";
+        retryBtn.textContent = t("bd.import.retry.failed", { n: failedIds.length });
+        retryBtn.addEventListener("click", function () {
+          retryBtn.disabled = true;
+          apiFetch("/api/remote-imports/baidu/imports/" +
+                   encodeURIComponent(batch.id) + "/retry", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Idempotency-Key": uuid() },
+            body: JSON.stringify({ item_ids: failedIds }),
+          }).then(jsonBody).then(function (res) {
+            if (!res.ok) {
+              toast((res.body && res.body.error) || t("bd.import.fail.short"), "error");
+              retryBtn.disabled = false;
+              return;
+            }
+            toast(t("imp.task.retry.queued"), "success");
+            pollBaiduImport();
+          }).catch(function () {
+            toast(t("bd.import.fail.short"), "error");
+            retryBtn.disabled = false;
+          });
+        });
+        els.baiduImportItems.appendChild(retryBtn);
+      }
+    }
+  }
+
+  function pollBaiduImport() {
+    if (!baiduState.importId) return;
+    if (baiduState.importTimer) clearTimeout(baiduState.importTimer);
+    var tick = function () {
+      apiFetch("/api/remote-imports/baidu/imports/" +
+               encodeURIComponent(baiduState.importId)).then(jsonBody).then(function (res) {
+        if (!res.ok || !res.body) {
+          setBaiduImportStatus(t("bd.import.fail", {
+            e: (res.body && res.body.error) || ("HTTP " + res.status),
+          }));
+          baiduState.importTimer = setTimeout(tick, 5000);
+          return;
+        }
+        renderBaiduImport(res.body);
+        var st = res.body.state;
+        if (st === "succeeded" || st === "partial_failed" || st === "failed" ||
+            st === "cancelled") {
+          baiduState.importTimer = null;   // 终态：停止轮询
+          reloadProjectsAndUnfiled();
+          updateBaiduImportGate();
+          return;
+        }
+        baiduState.importTimer = setTimeout(tick, 2500);
+      }).catch(function () {
+        setBaiduImportStatus(t("bd.import.fail", { e: t("imp.tasks.net.err") }));
+        baiduState.importTimer = setTimeout(tick, 5000);
+      });
+    };
+    tick();
+  }
+
+  // ---------- 抽屉开合 / 页签 ----------
+  function switchImportTab(which) {
+    importDrawerState.tab = which === "baidu" ? "baidu" : "local";
+    var isLocal = importDrawerState.tab === "local";
+    if (els.importTabLocal) {
+      els.importTabLocal.classList.toggle("active", isLocal);
+      els.importTabLocal.setAttribute("aria-selected", isLocal ? "true" : "false");
+    }
+    if (els.importTabBaidu) {
+      els.importTabBaidu.classList.toggle("active", !isLocal);
+      els.importTabBaidu.setAttribute("aria-selected", !isLocal ? "true" : "false");
+    }
+    if (els.importPanelLocal) els.importPanelLocal.hidden = !isLocal;
+    if (els.importPanelBaidu) els.importPanelBaidu.hidden = isLocal;
+    if (!isLocal && !baiduState.capsChecked) refreshBaiduCapabilities();
+  }
+
+  function openImportDrawer(triggerEl) {
+    if (!els.importDrawer) return;
+    triggerEl = closeSidebarDrawerUnderOverlay(triggerEl);
+    importDrawerState.open = true;
+    importDrawerState.lastFocusEl = triggerEl || null;
+    els.importDrawer.hidden = false;
+    if (els.importDrawerMask) els.importDrawerMask.hidden = false;
+    // 目标下拉按当前项目列表重建（会话内选择保留）
+    apiFetch("/api/projects").then(jsonBody).then(function (res) {
+      if (res.ok && Array.isArray(res.body)) {
+        allProjects = res.body;
+      }
+    }).catch(function () { /* 保留当前缓存 */ }).then(function () {
+      renderImportTargetSelects();
+      syncImportTargetFromSelect();
+    });
+    loadImportFormatCatalog();
+    renderFrSampleMax();
+    loadRecentFormatRequests();
+    refreshImportTasks();
+    startImportTaskPolling();
+    switchImportTab(importDrawerState.tab);
+    try {
+      var first = els.importDrawerClose || els.importDrawer;
+      if (first && typeof first.focus === "function") first.focus();
+    } catch (e) { /* 忽略聚焦失败 */ }
+  }
+
+  function closeImportDrawer() {
+    if (!els.importDrawer) return;
+    importDrawerState.open = false;
+    els.importDrawer.hidden = true;
+    if (els.importDrawerMask) els.importDrawerMask.hidden = true;
+    stopImportTaskPolling();
+    var back = importDrawerState.lastFocusEl;
+    importDrawerState.lastFocusEl = null;
+    if (back && typeof back.focus === "function") {
+      try { back.focus(); } catch (e) { /* 触发按钮可能已移除 */ }
+    }
+  }
+
+  // 抽屉焦点圈闭：Tab 在抽屉可聚焦元素间循环（不落回背景）
+  function trapDrawerFocus(e) {
+    var drawer = els.importDrawer;
+    if (!drawer) return;
+    var focusables = [];
+    try {
+      focusables = Array.prototype.slice.call(drawer.querySelectorAll(
+        "button:not([disabled]), input:not([disabled]), select, textarea"))
+        .filter(function (el) { return !el.hidden; });
+    } catch (err) { return; }
+    if (!focusables.length) return;
+    var active = document.activeElement;
+    var first = focusables[0], last = focusables[focusables.length - 1];
+    var inside = focusables.indexOf(active) >= 0;
+    if (e.shiftKey && (!inside || active === first)) {
+      e.preventDefault();
+      try { last.focus(); } catch (err) {}
+    } else if (!e.shiftKey && (!inside || active === last)) {
+      e.preventDefault();
+      try { first.focus(); } catch (err) {}
+    }
   }
 
   // ---------- 事件绑定 ----------
@@ -5174,7 +6462,15 @@
     // 退出登录：POST /logout + CSRF（docs §10.14）
     if (els.logoutBtn) { els.logoutBtn.addEventListener("click", doLogout); }
 
-    els.uploadBtn.addEventListener("click", function () { els.fileInput.click(); });
+    // W4/W6：侧栏主入口 = 导入抽屉；#file-input 保持隐藏（抽屉内/拖拽仍触发）
+    if (els.importSlidesBtn) {
+      els.importSlidesBtn.addEventListener("click", function () {
+        openImportDrawer(els.importSlidesBtn);
+      });
+    }
+    if (els.uploadBtn) {   // 兼容：旧模板若仍渲染 #upload-btn，保持直开文件框
+      els.uploadBtn.addEventListener("click", function () { els.fileInput.click(); });
+    }
     els.fileInput.addEventListener("change", function () {
       if (this.files && this.files[0]) { uploadFile(this.files[0]); this.value = ""; }
     });
@@ -5273,15 +6569,112 @@
     // 工具栏浮层（账户/标注选项/矩形设置外点关闭）：§3.3/§3.5
     initToolbarPops();
 
-    // 新建项目
-    els.newProjectBtn.addEventListener("click", function () {
-      var showing = els.newProjectForm.style.display !== "none";
-      toggleNewProjectForm(!showing);
+    // 新建项目（W3：对话框；empty 永远空草稿，selection 复制勾选快照）
+    if (els.newProjectBtn) {
+      els.newProjectBtn.addEventListener("click", function () {
+        openProjectDialog("empty", null, els.newProjectBtn);
+      });
+    }
+    if (els.pcdClose) els.pcdClose.addEventListener("click", closeProjectDialog);
+    if (els.pcdCancel) els.pcdCancel.addEventListener("click", closeProjectDialog);
+    if (els.pcdConfirm) els.pcdConfirm.addEventListener("click", submitProjectDialog);
+    if (els.pcdName) {
+      els.pcdName.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          if (els.pcdNote && typeof els.pcdNote.focus === "function") {
+            try { els.pcdNote.focus(); } catch (err) {}
+          }
+        }
+      });
+    }
+    if (els.pcdNote) {
+      els.pcdNote.addEventListener("keydown", function (e) {
+        // R4：Enter 与确认按钮共用同一提交锁（inFlight 双保险）
+        if (e.key === "Enter") { e.preventDefault(); submitProjectDialog(); }
+      });
+    }
+    if (els.projectCreateMask) {
+      els.projectCreateMask.addEventListener("click", function (e) {
+        if (e.target === els.projectCreateMask) closeProjectDialog();
+      });
+    }
+
+    // 导入抽屉（W4/W6）
+    if (els.importDrawerClose) {
+      els.importDrawerClose.addEventListener("click", closeImportDrawer);
+    }
+    if (els.importDrawerMask) {
+      els.importDrawerMask.addEventListener("click", closeImportDrawer);
+    }
+    if (els.importTabLocal) {
+      els.importTabLocal.addEventListener("click", function () { switchImportTab("local"); });
+    }
+    if (els.importTabBaidu) {
+      els.importTabBaidu.addEventListener("click", function () { switchImportTab("baidu"); });
+    }
+    if (els.importPickFiles) {
+      els.importPickFiles.addEventListener("click", function () {
+        if (els.fileInput) els.fileInput.click();
+      });
+    }
+    if (els.importTargetSelect) {
+      els.importTargetSelect.addEventListener("change", syncImportTargetFromSelect);
+    }
+    if (els.importTargetNewName) {
+      els.importTargetNewName.addEventListener("input", function () {
+        importTargetState.newProjectName = (els.importTargetNewName.value || "").trim();
+      });
+    }
+
+    // 申请新格式支持（抽屉内次级入口；提交逻辑在 submitFormatRequest）
+    if (els.formatReqBtn && els.formatReqForm) {
+      els.formatReqBtn.addEventListener("click", function () {
+        els.formatReqForm.hidden = !els.formatReqForm.hidden;
+      });
+      els.frCancel.addEventListener("click", function () {
+        els.formatReqForm.hidden = true;
+      });
+      els.frSubmit.addEventListener("click", submitFormatRequest);
+    }
+
+    // 百度分享页签（W5/W6）
+    if (els.baiduListBtn) {
+      els.baiduListBtn.addEventListener("click", startBaiduEnumeration);
+    }
+    if (els.baiduSearch) {
+      els.baiduSearch.addEventListener("input", renderBaiduCandidates);
+    }
+    if (els.baiduPrevBtn) {
+      els.baiduPrevBtn.addEventListener("click", function () {
+        if (!baiduState.prevStack.length) return;
+        baiduState.cursor = baiduState.prevStack.pop();
+        loadBaiduCandidates();
+      });
+    }
+    if (els.baiduNextBtn) {
+      els.baiduNextBtn.addEventListener("click", function () {
+        if (!baiduState.nextCursor) return;
+        if (baiduState.cursor) baiduState.prevStack.push(baiduState.cursor);
+        baiduState.cursor = baiduState.nextCursor;
+        loadBaiduCandidates();
+      });
+    }
+    if (els.baiduImportBtn) {
+      els.baiduImportBtn.addEventListener("click", startBaiduImport);
+    }
+
+    // Esc 关闭：项目对话框优先，其次导入抽屉；Tab 圈闭焦点
+    document.addEventListener("keydown", function (e) {
+      if (projectDialog.open) { handleProjectDialogKeydown(e); return; }
+      if (!importDrawerState.open) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeImportDrawer();
+      } else if (e.key === "Tab") {
+        trapDrawerFocus(e);
+      }
     });
-    els.npConfirm.addEventListener("click", function () { createProjectFromForm([]); });
-    els.npCancel.addEventListener("click", function () { toggleNewProjectForm(false); });
-    els.npName.addEventListener("keydown", function (e) { if (e.key === "Enter") els.npNote.focus(); });
-    els.npNote.addEventListener("keydown", function (e) { if (e.key === "Enter") createProjectFromForm([]); });
 
     // 未归类
     els.unfiledToggle.addEventListener("click", function () {
@@ -5291,10 +6684,9 @@
     els.unfiledNewProject.addEventListener("click", function () {
       var slides = Object.keys(slideChecked).filter(function (k) { return slideChecked[k]; });
       if (slides.length === 0) { toast(t("unfiled.need.check"), "error"); return; }
-      // 预填并打开表单：这里直接以选中切片创建项目
-      toggleNewProjectForm(true);
-      // 记录待加入切片，确认时带上
-      pendingNewProjectSlides = slides;
+      // selection 模式：把当前勾选**快照**传入对话框（可逐项移除；取消/重开
+      // 清空，不再有 pendingNewProjectSlides 隐式全局回退）
+      openProjectDialog("selection", slides, els.unfiledNewProject);
       toast(t("unfiled.selected.tip", { n: slides.length }), "info");
     });
 
@@ -5720,6 +7112,38 @@
     init();
   }
 
+  // 供测试（tests/js/project-import-upgrade.test.ts）：__PT_TEST_HOOKS 由测试
+  // 预置后再加载 app.js 才挂载；生产环境不暴露任何额外全局（与 HP_AUTH/
+  // HP_UPLOAD 同风格）。置于 IIFE 末尾：确保引用的状态对象已初始化。
+  if (window.__PT_TEST_HOOKS) {
+    window.HP_PROJECT_UI = {
+      projectDialog: projectDialog,
+      openProjectDialog: openProjectDialog,
+      closeProjectDialog: closeProjectDialog,
+      submitProjectDialog: submitProjectDialog,
+      submitFormatRequest: submitFormatRequest,
+      importDrawer: {
+        state: importDrawerState,
+        targetState: importTargetState,
+        open: openImportDrawer,
+        close: closeImportDrawer,
+        switchTab: switchImportTab,
+        refreshTasks: refreshImportTasks,
+        loadFormatCatalog: loadImportFormatCatalog,
+        associate: importAssociateUploaded,
+      },
+      baidu: {
+        state: baiduState,
+        refreshCapabilities: refreshBaiduCapabilities,
+        startEnumeration: startBaiduEnumeration,
+        loadCandidates: loadBaiduCandidates,
+        toggleCandidate: toggleBaiduCandidate,
+        startImport: startBaiduImport,
+        formatDecBytes: formatDecBytes,
+      },
+    };
+  }
+
   // 语言切换：重渲染当前可见的动态面板（动态文本走 t()，重渲染即换语言）。
   // 静态 [data-i18n] 节点由 i18n.js 的 applyLang 直接刷新，这里只处理 JS 渲染的部分。
   document.addEventListener("hp-lang-change", function () {
@@ -5745,6 +7169,20 @@
     try {
       if (els.acctPopRole && currentRole) {
         els.acctPopRole.textContent = t(currentRole === "owner" ? "acct.role.owner" : "acct.role.user");
+      }
+    } catch (e) {}
+    // W3/W4/W6：导入抽屉 / 新建项目对话框的动态文案随语言重渲
+    try {
+      if (projectDialog.open) renderProjectDialogSlides();
+      if (els.pcdConfirm && !projectDialog.inFlight) {
+        els.pcdConfirm.textContent = t("pcd.confirm");
+      }
+    } catch (e) {}
+    try {
+      if (importDrawerState.open) {
+        if (importDrawerState.formatsLoaded) renderFormatCatalog(importDrawerState.formatCatalog);
+        renderFrSampleMax();
+        refreshImportTasks();
       }
     } catch (e) {}
     // AI 配置摘要 / 会话切换器的语言重渲由 HistoPilot 插件 bundle 自行监听 hp-lang-change 处理。

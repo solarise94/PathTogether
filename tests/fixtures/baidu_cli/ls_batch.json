@@ -1,0 +1,20 @@
+[
+  {
+    "fs_id": 9007199254740993,
+    "path": "我的应用数据/bdpan/bib_demo/大切片.svs",
+    "server_filename": "大切片.svs",
+    "size": 9007199254740993,
+    "isdir": false,
+    "category": 6,
+    "server_mtime": "2026-09-01 10:00:00"
+  },
+  {
+    "fs_id": 524080722157776,
+    "path": "我的应用数据/bdpan/bib_demo/panel1.kfbf",
+    "server_filename": "panel1.kfbf",
+    "size": 481661346,
+    "isdir": false,
+    "category": 6,
+    "server_mtime": "2026-09-01 10:00:00"
+  }
+]

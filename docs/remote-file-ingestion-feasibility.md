@@ -6,6 +6,10 @@
 > 目标文件：数 GB 至数十 GB 的 SVS / NDPI / MRXS / OME-TIFF 等 WSI 进入 PathTogether 后沿用现有 Viewer / DZI 瓦片链路
 >
 > **2026-09-11 产品决定：本方案暂缓实施。** 先不建 `ingestion_jobs`、worker、API 或 UI；浏览器 V1/V2 上传保持现状。后续若重启，以本文 Go/No-Go、SSRF 双层防护与「邮件大附件 NO-GO」为不可降级门槛，不得把网络拉取放进 Web 请求或 HistoPilot。
+>
+> **2026-09-12 选型更新（仅方案与审计，未授权开工）：** 用户选定平台 COS 暂存桶，浏览器直传，最终服务器不在腾讯云；按公网下行计费，成功入库后删除暂存源。重启实施时，优先级以 [COS 直传上传审计方案](cos-direct-upload-audit-plan.md) 与 [分流调研冻结决定](upload-routing-open-source-review.md) 为准：平台自有 COS 入口优先于下文历史建议中的任意 HTTPS / AWS S3 入口；先授权 PoC 与 worker，后 300/500 路由；禁止双授权栈。本文的 worker、配额、校验、恢复、SSRF 和发布门槛继续有效；现有业务代码及部署保持现状。
+>
+> **2026-09-12 百度探索更新：** 查到官方 `bdpan-storage` 已有分享列表、转存及先转存再下载的文档能力，旧文中将分享入口一概归为非官方抓取的判断需修正。见 [百度分享导入开源调研](baidu-share-ingestion-open-source-review.md)：官方工具条件式 PoC；Beta、CLI 核心开源范围、会员速度及后台授权尚待核验；禁止把网页 Cookie 逆向当作已经验证的正式入口。本次未访问用户分享、未转存下载。
 
 ## 1. 结论先行
 
@@ -124,7 +128,7 @@
 | 腾讯云 COS | 高；官方文档支持约 48.82 TB 分块对象[9] | 单 Range、If-Match；部分源站回源场景会重定向，必须逐跳复核[10] | CAM 临时密钥、地域/域名差异 | 中国客户价值高 | S3 抽象后首批适配，**待真实账号验证** |
 | MinIO | 高；S3-compatible，官方上限 50 TiB/10,000 parts[11] | 取决于部署版本与网关；需在客户实例实测 ETag/Range/TLS | 私网 MinIO 与公网 SSRF 策略冲突；不能开放任意内网地址 | 企业私有化价值高 | **Phase 2 企业连接器**；由管理员 allowlist endpoint/VPN，不走公网自助 URL |
 | 百度网盘 OAuth 文件 | 中高，官方平台提供账号授权与文件传输；官方 Go SDK提供 OAuth、列举、`fs_id -> dlink -> stream`[12][13] | SDK scene 有接口级重试，但当前下载 helper 中途失败会删除 partial；dlink 续传、刷新、限速/会员差异需实测 | 应用审核、OAuth token、dlink、User-Agent、频控、用户撤权 | 中国个人/小团队价值可能高 | **Phase 2 条件式**；先完成 vendor qualification |
-| 百度分享链接 + 提取码 | 非官方抓取虽可能实现，稳定性与合规性差 | 页面/风控/验证码/登录变化，不是可靠 API 合同 | Cookie 抓取、账号封禁、内容授权风险 | 表面价值高，长期维护价值低 | **延后/不做**；引导用户 OAuth 选择自己网盘内文件 |
+| 百度分享链接 + 提取码 | 官方 bdpan 已文档化列表/转存/下载；非官方工具也有实现，二者须区分 | 官方工具 Beta，长任务恢复及核心源码未验证；非官方还有网页变动风险 | 应用授权、会员能力、账号代收范围、目录/批次隔离 | 现有用户明确需求，可减少重新上传 | **条件式 Phase 2 PoC**，以新增百度调研为准；不等同于批准网页抓取 |
 | WebDAV | 中高，本质仍经 HTTP GET；WebDAV 标准给出集合和属性，但不保证服务器支持 Range/稳定 ETag[20] | 服务器差异大，需 capability probe；认证与重定向同 HTTPS | Basic/Bearer、私网 endpoint、证书与路径兼容性 | 企业长尾 | **Phase 2 按需求**，管理员建连接，不公开任意 endpoint |
 | SFTP | 高；OpenSSH `reget` 可从本地文件长度继续，但明确警告远端内容变化会导致损坏[21] | 需固定 host key + size/mtime/可选 hash；resume 后仍必须全文件 SHA-256 | 私钥/密码、host-key rotation、跳板机、私网出口 | 企业长尾 | **Phase 2 按需求**；优先管理员 staging + `import_slides.py` 操作流程 |
 | 入站邮件大附件 | **不适合**：主流平台 35–40 MB，远小于 WSI[16][17] | SMTP 可重投，MIME/供应商无可用的 GB 级断点合同 | 邮件炸弹、伪造、重放、恶意附件、数据副本扩散 | 低 | **不做** |

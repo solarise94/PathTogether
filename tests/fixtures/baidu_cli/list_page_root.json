@@ -1,0 +1,26 @@
+{
+  "list": [
+    {
+      "fs_id": "524080722157776",
+      "path": "/批次日结",
+      "server_filename": "批次日结",
+      "size": 0,
+      "isdir": true
+    },
+    {
+      "fs_id": "910700000000000001",
+      "path": "/样本A.svs",
+      "server_filename": "样本A.svs",
+      "size": 12345678901234,
+      "isdir": false
+    },
+    {
+      "fs_id": "910700000000000002",
+      "path": "/panel1.kfbf",
+      "server_filename": "panel1.kfbf",
+      "size": 481661346,
+      "isdir": false
+    }
+  ],
+  "has_more": true
+}

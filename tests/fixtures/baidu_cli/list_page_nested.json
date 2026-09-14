@@ -1,0 +1,33 @@
+{
+  "list": [
+    {
+      "fs_id": "524080722157790",
+      "path": "/批次日结/scan.ome.tif",
+      "server_filename": "scan.ome.tif",
+      "size": 806456145,
+      "isdir": false
+    },
+    {
+      "fs_id": "524080722157791",
+      "path": "/批次日结/panel1_kfbf",
+      "server_filename": "panel1_kfbf",
+      "size": 0,
+      "isdir": true
+    },
+    {
+      "fs_id": "524080722157792",
+      "path": "/批次日结/panel1_kfbf/channel.json",
+      "server_filename": "channel.json",
+      "size": 1229,
+      "isdir": false
+    },
+    {
+      "fs_id": "524080722157793",
+      "path": "/批次日结/切片.mrxs",
+      "server_filename": "切片.mrxs",
+      "size": 2048,
+      "isdir": false
+    }
+  ],
+  "has_more": false
+}

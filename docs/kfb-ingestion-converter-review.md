@@ -3,7 +3,8 @@
 - 文档状态：可行性评审 + Phase A/B/C 上线合同（2026-09-11）
 - 日期：2026-09-11
 - 适用范围：PathTogether 上传、切片存储与读取链路
-- 本轮实施：Phase A 离线转换器 + 厂商 KFB 校准 + Phase B 后台 job/worker + Phase C 上传 UI。**不**宣称通用 KFB/KFBF；**不**把 `.kfb` 加入 `SUPPORTED_EXTS`（源文件不对 Viewer 列出）。
+- 本轮实施：Phase A 离线转换器 + 厂商 KFB 校准 + Phase B 后台 job/worker + Phase C 上传 UI。**不**宣称通用 KFB/KFBF 变体；**不**把 `.kfb`/`.kfbf` 加入 `SUPPORTED_EXTS`（源文件不对 Viewer 列出）。
+- 2026-09-15 现状：明场 `.kfb` 与荧光 `.kfbf` 均登记为 `convert-required`。上传走 `_upload_ext_allowed`（不进 `SUPPORTED_EXTS`），commit 按 magic 分派 `parse_kfb` / `parse_kfbf`，worker 产出 canonical BigTIFF / 多通道 OME-TIFF。前端 `accept` 含 `.kfb,.kfbf`；`GET /api/slide-formats` 产品目录标明需后台转换。百度导入对 KFBF 可选、对 MRXS bundle 明确不可选。
 
 ## 0. 2026-09-11 核实与 Phase A 合同
 
@@ -11,8 +12,8 @@
 
 - `app.py` `SUPPORTED_EXTS` 仍是 svs/tif/tiff/ndpi/mrxs/vms/vmu/scn/bif/svslide；无 `.kfb`。
 - `slide_io.py` `LOGICAL_EXTS` 与上同集，OpenSlide 无 KFB backend。
-- `templates/_app_shell.html` 的 `accept` 与 `static/app.js` 上传成功后打开 `file.name` 的行为未变。
-- 仅加后缀会在 `slide_io.open_slide` 失败。V2 commit 仍同步校验，不适合承载转换。
+- `templates/_app_shell.html` 的 `accept` 已含 `.kfb,.kfbf`；上传成功后对 convert-required 轮询转换任务，打开的是 canonical 名而不是源名。
+- 仅加后缀仍会在 `slide_io.open_slide` 失败。V2 commit 对 convert-required 只做解析探测，转换在独立 worker。
 
 ### 0.2 样本与布局约束
 

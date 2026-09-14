@@ -1,6 +1,6 @@
 # Agent 一次执行规格：账户状态、导入与项目 UI
 
-版本：2026-09-14。状态：**待实施**。本文是交给 coding agent 的完整任务，不是已完成的升级报告。
+版本：2026-09-14。状态：**代码已实施（2026-09-15）**。W1–W6 已落在 `wip/ser8-dev`；真实百度 L01–L04 仍缺外部条件。本文保留为执行规格，完成情况见 [验收报告](acceptance-account-import-project-ui-2026-09-14.md) §0。
 
 工作目录：`/home/solarise/ZCodeProject/histopilot-suite/PathTogether`。
 

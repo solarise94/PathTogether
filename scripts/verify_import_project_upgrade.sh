@@ -68,7 +68,8 @@ PYTEST_FILES=(
   tests/test_format_request_concurrency.py tests/test_format_request_migration.py
   tests/test_project_creation_upgrade.py tests/test_conversion_task_api.py
   tests/test_baidu_adapter.py tests/test_baidu_imports.py
-  tests/test_baidu_import_recovery.py
+  tests/test_baidu_import_recovery.py tests/test_baidu_ingest.py
+  tests/test_upgrade_http_wiring.py
 )
 E2E_SPECS=(
   tests/e2e/admin-workbench.spec.ts

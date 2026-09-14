@@ -1,7 +1,25 @@
 # 验收报告：账户状态、导入与项目 UI 升级（2026-09-14）
 
 > 对应规格：[agent-implementation-account-import-project-ui-2026-09-14.md](agent-implementation-account-import-project-ui-2026-09-14.md)（W1–W6 / §8 测试矩阵 / §10 交付清单）。
-> 状态：**进行中（草稿）**。本报告由验证/测试轨道在 2026-09-14 填写；未运行的项目如实标注，不虚构 PASS。统一验收入口：`scripts/verify_import_project_upgrade.sh`。
+> 状态：**代码实施已接线（2026-09-15 增补）**。2026-09-14 草稿保留为当时证据；下文「§0 增补」覆盖接线后的 KFBF / 百度入库缺口。统一验收入口：`scripts/verify_import_project_upgrade.sh`。
+>
+> ## 0. 2026-09-15 增补（KFBF + 百度入库）
+>
+> 相对 2026-09-14 草稿，下列缺口已补：
+>
+> | 项 | 现状 |
+> |---|---|
+> | app.py 路由 | 已接线：format-requests list/get、slide-formats、conversions list/retry、project Idempotency-Key、`/api/remote-imports/baidu/*`、admin 格式申请 |
+> | 工作区 UI | 导入抽屉 + 新建项目对话框已替换内联表单；`npm run test:js` 410 passed（当时） |
+> | KFBF | 本地上传 202 → worker 产出 `.ome.tif`；目录文案为需转换；**不**进入 `SUPPORTED_EXTS` |
+> | B06 | `baidu_ingest.py`：fake 传输 + 真实 TIFF/KFB/KFBF 探测转换入库；`tests/test_baidu_ingest.py` |
+> | B08 | 来源大小漂移 `source_changed`；名称占用 `name_unavailable`（不泄露他人文件） |
+> | C02 | 上传 `target_project_id` 写入 conversion_jobs；native 立即关联；转换 ready 后幂等关联；目标删除则 associate=failed、产物保留 |
+> | L01–L04 | 仍 **NOT RUN**（无授权测试分享）；默认 `BAIDU_*_ENABLED=false` |
+> | U09–U11 全量浏览器 | E2E 规格已写；完整双尺寸×中英文截图未作为本轮发布门槛重跑 |
+>
+> 迁移：`0052_import_target_association.sql`。
+>
 
 ## 1. 基线
 

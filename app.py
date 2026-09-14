@@ -254,7 +254,29 @@ def _canonical_name_for(source_safe):
 
 
 def _probe_kfb_or_fail(path):
-    """commit 期只做解析探测，不转换。成功返回 header 摘要。"""
+    """commit 期只做解析探测，不转换。成功返回 header 摘要。
+
+    按 magic 分派荧光 KFBF / 明场 KFB（两者同为 convert-required）。
+    """
+    from kfb import KFBF_MAGIC, parse_kfbf
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(8)
+    except OSError as e:
+        raise KfbError("invalid_kfb_header", "无法读取文件：%s" % e)
+    if magic == bytes(KFBF_MAGIC):
+        doc = parse_kfbf(path)
+        try:
+            return {
+                "width": doc.header.width_px,
+                "height": doc.header.height_px,
+                "levels": len(doc.levels),
+                "mpp": doc.header.mpp,
+                "channels": doc.header.channel_count,
+                "format": "kfbf_kfbio_jpeg",
+            }
+        finally:
+            doc.close()
     doc = parse_kfb(path)
     try:
         return {
@@ -321,7 +343,13 @@ def _owned_committed_upload(ident, safe_name):
 
 def _ensure_conversion_job(ident, *, source_name, source_sha256, upload_id,
                            source_format=None):
-    """committed 源文件上幂等补建/复用转换任务（崩溃、500、重放）。"""
+    """committed 源文件上幂等补建/复用转换任务（崩溃、500、重放）。
+
+    磁盘上的源必须仍是本 upload_id 当时结算的摘要；同名被他人覆盖后，
+    旧 commit 不得认领新资产。
+    """
+    expected_sha = (source_sha256 or "").lower()
+    ident_owner = (ident or {}).get("user_id") or ""
     job = conversion_store.get_job_by_upload_id(upload_id)
     src = UPLOAD_DIR / source_name
     if job and job.get("state") == "ready":
@@ -332,10 +360,23 @@ def _ensure_conversion_job(ident, *, source_name, source_sha256, upload_id,
         if job:
             return job, job.get("canonical_name") or _canonical_name_for(source_name)
         raise FileNotFoundError(source_name)
+    disk_sha = _sha256_file(src)
+    if expected_sha and disk_sha != expected_sha:
+        raise FileExistsError(source_name)
+    if job:
+        job_sha = (job.get("source_sha256") or "").lower()
+        if job_sha and job_sha != disk_sha:
+            raise FileExistsError(source_name)
+        job_owner = job.get("owner_user_id") or ""
+        if job_owner and ident_owner and job_owner != ident_owner:
+            raise FileExistsError(source_name)
+        job_up = job.get("upload_id") or ""
+        if job_up and upload_id and job_up != upload_id:
+            raise FileExistsError(source_name)
     if not source_format:
         source_format = _probe_kfb_or_fail(src)["format"]
     return _enqueue_conversion(
-        ident, source_name=source_name, source_sha256=source_sha256,
+        ident, source_name=source_name, source_sha256=disk_sha,
         upload_id=upload_id, source_format=source_format)
 
 
@@ -346,12 +387,19 @@ def _conversion_accepted_body(job):
 
 
 def _cleanup_conversion_sidecars(canonical_name):
-    """删除 canonical 时一并清源 KFB、manifest、associated，并作废转换任务。"""
+    """删除 canonical 时一并清源 KFB（含去重别名）、manifest、associated，并作废转换任务。"""
     job = conversion_store.get_job_by_canonical(canonical_name)
-    if job and job.get("source_name"):
-        src = UPLOAD_DIR / job["source_name"]
-        if src.is_file() and _needs_conversion(job["source_name"]):
-            src.unlink(missing_ok=True)
+    source_names = []
+    if job:
+        source_names.append(job.get("source_name"))
+        try:
+            source_names.extend(conversion_store.list_source_names(job["id"]))
+        except Exception:
+            app.logger.warning("列举 conversion 源别名失败：%s", canonical_name,
+                               exc_info=True)
+    for name in {n for n in source_names if n}:
+        if _needs_conversion(name):
+            (UPLOAD_DIR / name).unlink(missing_ok=True)
     try:
         conversion_store.invalidate_by_canonical(canonical_name)
     except Exception:
@@ -1058,8 +1106,8 @@ def _require_auth():
     enabled（禁用或删除立即失效，不等 cookie 过期）。
     /api/ 开头返回 401 JSON（中文 error + code="auth_required"，D2 2026-09-10
     起，机器码只进 code 字段），页面 302 到 /login。
-    例外：未登录访问 ``/`` 不跳登录——由 index() 渲染入口分流页（docs §3.1，
-    同一路由按认证状态分流，不做 302 /login）。
+    例外：访问 ``/`` 不跳登录——由 index() 渲染介绍主页（未登录分流；已登录
+    仍见主页，工作台在 /app）。未登录访问 /app 仍 302 /login?next=/app。
 
     I-R4 统一 ``require_active_account`` 守卫（设计文档第 8 节，最危险项）：
     auth_version 比对通过后再查 ``activation_state``——非 active（
@@ -2572,13 +2620,61 @@ def sample_plugin_context():
 # --------------------------------------------------------------------------- #
 # 路由
 # --------------------------------------------------------------------------- #
-@app.route("/")
-def index():
-    # 未登录（AUTH_ENABLED=True）：渲染入口分流页，不 302 /login（docs §3.1）；
-    # 已登录或 AUTH_ENABLED=False（本地免登录）：保持现状渲染完整应用——
-    # 否则会破坏本地开发与既有测试。
-    if AUTH_ENABLED and not session.get("auth_user"):
-        return render_template("entry.html")
+def _apply_landing_security_headers(resp):
+    """公开介绍页：禁止中间缓存、禁止被嵌入；无 inline script/style，CSP 不放 'unsafe-inline'。"""
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'none'; script-src 'self'; style-src 'self'; "
+        "img-src 'self' data:; font-src 'self'; connect-src 'self'; "
+        "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    )
+    return resp
+
+
+def _entry_avatar_letter(name: str) -> str:
+    """头像字母：取展示名首字；ASCII 则大写。"""
+    ch = (name or "").strip()[:1]
+    if not ch:
+        return "?"
+    return ch.upper() if ("A" <= ch <= "Z" or "a" <= ch <= "z") else ch
+
+
+def _entry_signed_in_context():
+    """介绍页已登录态：展示名 + 头像字母。查找失败仍视为已登录，回退 session 身份。"""
+    if not (AUTH_ENABLED and session.get("auth_user")):
+        return {"signed_in": False, "display_name": "", "avatar_letter": "", "csrf_token": None}
+    uid = session.get("user_id")
+    user = None
+    if uid:
+        try:
+            user = user_store.get_user(uid)
+        except Exception:
+            user = None
+    name = ""
+    if isinstance(user, dict):
+        name = (user.get("display_name") or user.get("login_id")
+                or user.get("email_normalized") or user.get("email") or "")
+    name = str(name or session.get("auth_user") or "").strip()
+    return {
+        "signed_in": True,
+        "display_name": name,
+        "avatar_letter": _entry_avatar_letter(name),
+        "csrf_token": ensure_csrf_token(),
+    }
+
+
+def _landing_response():
+    ctx = _entry_signed_in_context()
+    resp = make_response(render_template("entry.html", **ctx))
+    return _apply_landing_security_headers(resp)
+
+
+def _workbench_response():
+    """完整 PathTogether 工作台（登录后 /app；AUTH_ENABLED=False 时也用于 /）。"""
     sample = sample_plugin_context()
     # histopilot index 注入 = feature flag 与来源策略**与**逻辑（Stage 5-3）：
     # 来源策略拒绝时不加载 bundle（与 flag=0 同等静默降级）。
@@ -2597,6 +2693,22 @@ def index():
     # 入口 HTML 可重新验证（§5.3）：普通刷新必须取得新 UI，不要求用户清缓存
     resp.headers["Cache-Control"] = "no-cache"
     return resp
+
+
+@app.route("/")
+def index():
+    # AUTH_ENABLED=True：/ 始终是介绍主页（未登录分流 + 已登录仍可见主页，
+    # 头像 /「进入工作台」进 /app）。AUTH_ENABLED=False（本地免登录）仍直接
+    # 渲染工作台，避免破坏本地开发与既有测试。
+    if AUTH_ENABLED:
+        return _landing_response()
+    return _workbench_response()
+
+
+@app.route("/app")
+def workbench():
+    """协作工作台。未登录由 _require_auth 302 到 /login?next=/app；可收藏本地址跳过主页。"""
+    return _workbench_response()
 
 
 def _plugin_ui_dir(plugin_id):
@@ -2912,9 +3024,11 @@ def _canonical_public_origin(environ=None):
 
     优先且在生产唯一使用 ``PUBLIC_BASE_URL``（经 parse_public_base_url 严格
     校验——公网 HTTPS 反代下 ``request.host_url`` 只是内部 origin，绝不能作
-    CSP 源）；未配置时仅测试（app.testing）与本地开发（app.debug）回退
-    request origin；生产缺失/非法一律 raise ValueError（fail-closed，调用方
-    退化为全拒绝 CSP 并记录不含敏感信息的可操作日志）。
+    CSP 源）；邮件等后台链接仍只用这一项 canonical origin。浏览器入口 CSP
+    另见 ``_admin_iframe_resource_origins``（可叠加 ``PUBLIC_ORIGINS``）。
+    未配置时仅测试（app.testing）与本地开发（app.debug）回退 request origin；
+    生产缺失/非法一律 raise ValueError（fail-closed，调用方退化为全拒绝 CSP
+    并记录不含敏感信息的可操作日志）。
     """
     env = os.environ if environ is None else environ
     raw = (env.get("PUBLIC_BASE_URL") or "").strip()
@@ -2934,6 +3048,36 @@ def _canonical_public_origin(environ=None):
                      " https:// 公网 origin（公网入口 TLS 终止后的规范 origin）")
 
 
+def _admin_iframe_resource_origins(environ=None):
+    """admin iframe script/style/img CSP 允许的公网 origin 列表（有序去重）。
+
+    始终包含 ``_canonical_public_origin``（``PUBLIC_BASE_URL`` / 测试回退）。
+    ``PUBLIC_ORIGINS`` 为逗号分隔的额外入口（如 histopilot.com / histopilot.cn）；
+    每项经同一 ``parse_public_base_url`` 校验。任一项非法或列表被写成纯空白
+    → raise ValueError，调用方 fail-closed。不信任 ``request.host_url``。
+    """
+    canonical = _canonical_public_origin(environ)
+    origins = [canonical]
+    seen = {canonical}
+    env = os.environ if environ is None else environ
+    extra = (env.get("PUBLIC_ORIGINS") or "").strip()
+    if not extra:
+        return origins
+    parts = [p.strip() for p in extra.split(",")]
+    if not any(parts):
+        raise ValueError("PUBLIC_ORIGINS 为空")
+    for i, raw in enumerate(parts):
+        if not raw:
+            continue
+        origin, reason = parse_public_base_url(raw)
+        if origin is None:
+            raise ValueError("PUBLIC_ORIGINS[%d] 非法（%s）" % (i, reason))
+        if origin not in seen:
+            seen.add(origin)
+            origins.append(origin)
+    return origins
+
+
 def _admin_asset_html_csp():
     """admin iframe entry HTML 的 CSP。
 
@@ -2951,16 +3095,21 @@ def _admin_asset_html_csp():
     ``_canonical_public_origin``（PUBLIC_BASE_URL 严格解析）；非法/生产缺失
     时 fail-closed 全拒绝（宁可掐死脚本也不放宽）。
 
+    **多入口（histopilot.com / histopilot.cn）**：``PUBLIC_ORIGINS`` 把额外公网
+    origin 并入 script/style/img 白名单。未配置时行为与单 ``PUBLIC_BASE_URL``
+    完全一致。不改 ``default-src 'none'``，也不把 ``'self'`` 写回 iframe。
+
     ``frame-ancestors 'self'`` 保留：该指令按受保护资源 **URL** 与祖先链匹配
     （在父页面上下文求值），不受文档 opaque origin 影响。
     """
     try:
-        origin = _canonical_public_origin()
+        origins = _admin_iframe_resource_origins()
     except ValueError as exc:
         app.logger.warning("admin 插件 HTML CSP fail-closed：%s", exc)
         return "default-src 'none'; %s" % _ADMIN_ASSET_HTML_CSP_FRAME_ANCESTORS
+    o = " ".join(origins)
     return ("default-src 'none'; script-src %(o)s; style-src %(o)s; "
-            "img-src %(o)s; %(fa)s" % {"o": origin,
+            "img-src %(o)s; %(fa)s" % {"o": o,
                                        "fa": _ADMIN_ASSET_HTML_CSP_FRAME_ANCESTORS})
 
 
@@ -8654,6 +8803,63 @@ def admin_v1_ai_unowned_sessions():
                    unowned_count=len(unowned))
 
 
+@app.route("/api/admin/v1/format-requests", methods=["GET"])
+def admin_v1_format_requests():
+    """格式申请列表（owner-only）。"""
+    import format_request_http
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    payload, status = format_request_http.handle_admin_list(request)
+    if isinstance(payload, dict):
+        for item in payload.get("items") or []:
+            if isinstance(item, dict):
+                item.pop("sample_internal_ref", None)
+    return _admin_v1_from_handler((payload, status))
+
+
+@app.route("/api/admin/v1/format-requests/<request_id>", methods=["GET"])
+def admin_v1_format_request_get(request_id):
+    """格式申请详情（含管理字段；样本路径不进 JSON）。"""
+    import format_request_http
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    payload, status = format_request_http.handle_admin_get(request_id)
+    if isinstance(payload, dict):
+        payload.pop("sample_internal_ref", None)
+    return _admin_v1_from_handler((payload, status))
+
+
+@app.route("/api/admin/v1/format-requests/<request_id>", methods=["PATCH"])
+def admin_v1_format_request_patch(request_id):
+    """格式申请状态 CAS 迁移。body: business_status, expected_version, admin_note?"""
+    import format_request_http
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    payload, status = format_request_http.handle_admin_patch(
+        request_id, request, current_identity())
+    if isinstance(payload, dict):
+        payload.pop("sample_internal_ref", None)
+    return _admin_v1_from_handler((payload, status))
+
+
+@app.route("/api/admin/v1/format-requests/<request_id>/sample", methods=["GET"])
+def admin_v1_format_request_sample(request_id):
+    """鉴权下载样本（attachment；JSON 错误走 admin v1 信封）。"""
+    import format_request_http
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    payload, status = format_request_http.handle_admin_sample(request_id)
+    if status != 200:
+        return _admin_v1_from_handler((payload, status))
+    return send_file(
+        payload["path"], as_attachment=True,
+        download_name=payload.get("download_name") or "sample")
+
+
 @app.route("/api/slides")
 def api_slides():
     """列出所有切片的元数据（读隔离：可见集按主体分域，docs §5.1.1/§5.1）。
@@ -9312,6 +9518,183 @@ def _upload_legacy_intent(ident, filename, safe_name, artifacts, reservation):
         _upload_release_quietly(reservation)
         return None, (jsonify(error="上传受理失败，请重试", code=e.code), 500)
     return (upload_id, token, task), None
+
+
+#: 「其他格式请求兼容」：管理员收件箱 / 样本大小上限 / 每日限流
+FORMAT_REQUEST_ADMIN_EMAIL = os.environ.get("FORMAT_REQUEST_ADMIN_EMAIL") \
+    or "solarise94@gmail.com"
+FORMAT_REQUEST_MAX_SAMPLE_BYTES = int(
+    os.environ.get("FORMAT_REQUEST_MAX_SAMPLE_BYTES") or 64 * 1024 * 1024)
+FORMAT_REQUEST_DAILY_LIMIT = int(
+    os.environ.get("FORMAT_REQUEST_DAILY_LIMIT") or 10)
+
+
+def _jsonify_pair(pair):
+    """HTTP 助手统一出口：``(payload_dict, status)`` → Flask 响应。"""
+    payload, status = pair
+    return jsonify(payload), status
+
+
+def _admin_v1_from_handler(pair):
+    """把 format_request_http 的 ``{error, code}`` 信封收成 admin v1。"""
+    payload, status = pair
+    if status >= 400:
+        err = payload.get("error") if isinstance(payload, dict) else payload
+        code = "invalid_request"
+        message = ""
+        if isinstance(err, dict):
+            code = err.get("code") or payload.get("code") or code
+            message = err.get("message") or ""
+        else:
+            code = (payload.get("code") if isinstance(payload, dict) else None) or code
+            message = str(err or "")
+        return _admin_v1_error(status, code, message)
+    return jsonify(payload), status
+
+
+@app.route("/api/format-requests", methods=["POST"])
+def api_format_request():
+    """提交「申请新格式支持」：PG 原子登记 + 可选样本落盘。
+
+    请求先入 PostgreSQL（0049）；邮件通道未配置/故障不丢请求（worker 排水）。
+    样本可选、流式保存、超限 413；每用户每日限流与插入同事务。
+    """
+    import format_request_http
+    if not can_upload():
+        return jsonify(error="无权限"), 403
+    return _jsonify_pair(format_request_http.handle_submit(
+        current_identity(), request,
+        daily_limit=FORMAT_REQUEST_DAILY_LIMIT,
+        max_sample_bytes=FORMAT_REQUEST_MAX_SAMPLE_BYTES))
+
+
+@app.route("/api/format-requests", methods=["GET"])
+def api_format_request_list():
+    """当前用户的格式申请列表（分页，不透明 cursor）。"""
+    import format_request_http
+    if not can_upload():
+        return jsonify(error="无权限"), 403
+    return _jsonify_pair(format_request_http.handle_list(
+        current_identity(), request))
+
+
+@app.route("/api/format-requests/<request_id>", methods=["GET"])
+def api_format_request_get(request_id):
+    """当前用户单条申请；他人/不存在统一 404。"""
+    import format_request_http
+    if not can_upload():
+        return jsonify(error="无权限"), 403
+    return _jsonify_pair(format_request_http.handle_get(
+        current_identity(), request_id))
+
+
+@app.route("/api/slide-formats", methods=["GET"])
+def api_slide_formats():
+    """产品向格式能力目录（W4）。"""
+    import slide_format_registry
+    if not can_upload():
+        return jsonify(error="无权限"), 403
+    return jsonify(slide_format_registry.public_catalog())
+
+
+def _baidu_ident_or_403():
+    if not can_upload():
+        return None, (jsonify(code="forbidden", error="无权限"), 403)
+    return current_identity(), None
+
+
+@app.route("/api/remote-imports/baidu/capabilities", methods=["GET"])
+def api_baidu_capabilities():
+    import baidu_import_http
+    ident, err = _baidu_ident_or_403()
+    if err:
+        return err
+    return _jsonify_pair(baidu_import_http.capabilities(ident))
+
+
+@app.route("/api/remote-imports/baidu/enumerations", methods=["POST"])
+def api_baidu_enumerations_create():
+    import baidu_import_http
+    ident, err = _baidu_ident_or_403()
+    if err:
+        return err
+    return _jsonify_pair(baidu_import_http.create_enumeration(
+        ident, request.get_json(silent=True) or {}))
+
+
+@app.route("/api/remote-imports/baidu/enumerations/<enumeration_id>",
+           methods=["GET"])
+def api_baidu_enumeration_get(enumeration_id):
+    import baidu_import_http
+    ident, err = _baidu_ident_or_403()
+    if err:
+        return err
+    return _jsonify_pair(baidu_import_http.get_enumeration(
+        ident, enumeration_id))
+
+
+@app.route("/api/remote-imports/baidu/enumerations/<enumeration_id>/candidates",
+           methods=["GET"])
+def api_baidu_enumeration_candidates(enumeration_id):
+    import baidu_import_http
+    ident, err = _baidu_ident_or_403()
+    if err:
+        return err
+    return _jsonify_pair(baidu_import_http.list_candidates(
+        ident, enumeration_id, request.args))
+
+
+@app.route("/api/remote-imports/baidu/imports", methods=["POST"])
+def api_baidu_imports_create():
+    import baidu_import_http
+    ident, err = _baidu_ident_or_403()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    target = body.get("target_project_id")
+    if target:
+        if not _can_access_project(target):
+            return jsonify(code="forbidden", error="无权写入目标项目"), 403
+    key = request.headers.get("Idempotency-Key")
+    return _jsonify_pair(baidu_import_http.create_import(ident, body, key))
+
+
+@app.route("/api/remote-imports/baidu/imports", methods=["GET"])
+def api_baidu_imports_list():
+    import baidu_import_http
+    ident, err = _baidu_ident_or_403()
+    if err:
+        return err
+    return _jsonify_pair(baidu_import_http.list_imports(ident, request.args))
+
+
+@app.route("/api/remote-imports/baidu/imports/<batch_id>", methods=["GET"])
+def api_baidu_import_get(batch_id):
+    import baidu_import_http
+    ident, err = _baidu_ident_or_403()
+    if err:
+        return err
+    return _jsonify_pair(baidu_import_http.get_import(ident, batch_id))
+
+
+@app.route("/api/remote-imports/baidu/imports/<batch_id>/cancel", methods=["POST"])
+def api_baidu_import_cancel(batch_id):
+    import baidu_import_http
+    ident, err = _baidu_ident_or_403()
+    if err:
+        return err
+    return _jsonify_pair(baidu_import_http.cancel_import(ident, batch_id))
+
+
+@app.route("/api/remote-imports/baidu/imports/<batch_id>/retry", methods=["POST"])
+def api_baidu_import_retry(batch_id):
+    import baidu_import_http
+    ident, err = _baidu_ident_or_403()
+    if err:
+        return err
+    key = request.headers.get("Idempotency-Key")
+    return _jsonify_pair(baidu_import_http.retry_import(
+        ident, batch_id, request.get_json(silent=True) or {}, key))
 
 
 @app.route("/api/upload", methods=["POST"])
@@ -10389,20 +10772,38 @@ def api_uploads_cancel(upload_id):
     return jsonify(upload_id=upload_id, state=task["state"])
 
 
-@app.route("/api/conversions/<job_id>", methods=["GET"])
-def api_conversion_get(job_id):
-    """查询转换任务（仅 owner 或任务归属者）。"""
+@app.route("/api/conversions", methods=["GET"])
+def api_conversion_list():
+    """当前身份的转换任务列表（open/recent，分页）。本人隔离。"""
+    import conversion_http
     if not can_upload():
         return jsonify(error="无上传权限"), 403
-    job = conversion_store.get_job(job_id)
-    if not job:
-        return jsonify(error="转换任务不存在", code="conversion_not_found"), 404
+    return _jsonify_pair(conversion_http.handle_list(
+        current_identity(), request.args))
+
+
+@app.route("/api/conversions/<job_id>", methods=["GET"])
+def api_conversion_get(job_id):
+    """查询转换任务（仅任务归属者；他人统一 404）。"""
+    import conversion_http
+    if not can_upload():
+        return jsonify(error="无上传权限"), 403
+    return _jsonify_pair(conversion_http.handle_get(
+        current_identity(), job_id))
+
+
+@app.route("/api/conversions/<job_id>/retry", methods=["POST"])
+def api_conversion_retry(job_id):
+    """重试 failed/cancelled 转换任务（同 id 重新入队，不重复扣配额）。"""
+    import conversion_http
+    if not can_upload():
+        return jsonify(error="无上传权限"), 403
     ident = current_identity()
-    owner = job.get("owner_user_id") or ""
-    me = ident.get("user_id") or ""
-    if ident.get("role") != user_store.ROLE_OWNER and owner and owner != me:
-        return jsonify(error="转换任务不存在", code="conversion_not_found"), 404
-    return jsonify(conversion_store.public_view(job))
+    job = conversion_store.get_job(job_id)
+    src = (job or {}).get("source_name") or ""
+    source_available = bool(job) and bool(src) and (UPLOAD_DIR / src).is_file()
+    return _jsonify_pair(conversion_http.handle_retry(
+        ident, job_id, source_available=source_available))
 
 
 @app.route("/api/slide/<name>", methods=["DELETE"])
@@ -17642,24 +18043,26 @@ def _validate_slide_names(names):
 
 @app.route("/api/project/create", methods=["POST"])
 def api_project_create():
-    """创建项目。JSON: {name, note?, slides?}。Stage 3a-2a：归属=创建者。"""
+    """创建项目。JSON: {name, note?, slides?}。可选 Idempotency-Key。
+
+    非 list 的 slides 返回 400（不得静默吞成空集合）。带键时 (user, key)
+    幂等：同载荷返回原 pid，异载荷 409。
+    """
+    from project_create_http import handle_create
     ident = current_identity()
     body = request.get_json(silent=True) or {}
-    name = body.get("name", "")
-    note = body.get("note", "")
-    slides = body.get("slides", [])
-    if not isinstance(name, str) or not name.strip():
-        return jsonify(error="name 不能为空"), 400
-    clean, err = _validate_slide_names(slides if isinstance(slides, list) else [])
+    if not isinstance(body, dict):
+        return jsonify(error="请求体需为 JSON 对象"), 400
+    if "slides" in body and not isinstance(body.get("slides"), list):
+        return jsonify(error="slides 需为数组"), 400
+    slides = body.get("slides") if "slides" in body else []
+    clean, err = _validate_slide_names(slides)
     if err:
         return jsonify(error=err), 400
-    try:
-        proj = share_store.create_project(
-            name=name.strip(), note=note or "", slides=clean,
-            owner_user_id=ident["user_id"], requester_role=ident["role"])
-    except PermissionError:
-        return jsonify(error="无权创建项目"), 403
-    return jsonify(proj)
+    key = request.headers.get("Idempotency-Key")
+    payload, status = handle_create(
+        ident, body, key, slides_override=clean)
+    return jsonify(payload), status
 
 
 @app.route("/api/projects")

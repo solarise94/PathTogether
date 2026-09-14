@@ -11,7 +11,9 @@ COPY platform_features.py settings_store.py budget_store.py auth_limit_store.py 
 COPY billing_pricing.py billing_store.py acquisition_store.py ./
 COPY spend_store.py site_stats_store.py ./
 COPY crop_guard.py upload_guard.py upload_task_store.py useradmin.py ./
-COPY conversion_store.py conversion_worker.py slide_format_registry.py ./
+COPY conversion_store.py conversion_worker.py slide_format_registry.py format_request_store.py format_request_http.py ./
+COPY project_idempotency_store.py project_create_http.py conversion_http.py ./
+COPY baidu_share_parser.py baidu_adapter.py baidu_import_store.py baidu_import_http.py ./
 COPY kfb/ kfb/
 COPY migrations/ migrations/
 COPY scripts/ scripts/
@@ -25,7 +27,10 @@ ENV PORT=8000 \
     SHARE_PORT=38000 \
     UPLOAD_DIR=/data/uploads \
     SHARE_DATA_DIR=/data/share \
-    PLUGIN_BUNDLES_DIR=/data/plugins
+    PLUGIN_BUNDLES_DIR=/data/plugins \
+    FORMAT_REQUEST_DIR=/data/format-requests \
+    FORMAT_REQUEST_ADMIN_EMAIL=solarise94@gmail.com \
+    FORMAT_REQUEST_WORKER=1
 
 EXPOSE 8000
 CMD ["./docker_entry.sh"]

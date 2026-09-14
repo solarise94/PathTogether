@@ -47,7 +47,9 @@ finally:
     conn.close()
 '
 
-mkdir -p "${UPLOAD_DIR:-/data/uploads}" "${SHARE_DATA_DIR:-/data/share}" "${PLUGIN_BUNDLES_DIR:-/data/plugins}"
+mkdir -p "${UPLOAD_DIR:-/data/uploads}" "${SHARE_DATA_DIR:-/data/share}" \
+  "${PLUGIN_BUNDLES_DIR:-/data/plugins}" \
+  "${FORMAT_REQUEST_DIR:-/data/format-requests}"
 
 # ---------------------------------------------------------------------------
 # sample-tma-score 后端（demo 同容器托管）
@@ -105,6 +107,28 @@ case "$_mail_worker" in
 esac
 
 # ---------------------------------------------------------------------------
+# 格式兼容请求邮件 worker：PostgreSQL format_request_mail_jobs 权威排水。
+# FORMAT_REQUEST_WORKER=0/false/no/off 关闭。发送通道与注册邮件共用
+# REGISTRATION_MAIL_SENDER（homePC 已配 smtp）；未配置时 drain 保 queued。
+# ---------------------------------------------------------------------------
+_fr_worker="$(printf '%s' "${FORMAT_REQUEST_WORKER:-1}" | tr '[:upper:]' '[:lower:]')"
+case "$_fr_worker" in
+  0|false|no|off)
+    echo "[entry] FORMAT_REQUEST_WORKER=$_fr_worker, skip format-request worker"
+    ;;
+  *)
+    echo "[entry] starting format_request_worker --loop"
+    (
+      while :; do
+        python3 /app/scripts/format_request_worker.py --loop || true
+        echo "[entry] format_request_worker exited, restart in 2s" >&2
+        sleep 2
+      done
+    ) &
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
 # KFB 转换 worker（Phase B）：conversion_jobs 排水。独立于 Gunicorn。
 # CONVERSION_WORKER=0/false/no/off 关闭。
 # ---------------------------------------------------------------------------
@@ -122,6 +146,28 @@ case "$_cv_worker" in
         sleep 2
       done
     ) &
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
+# 百度分享导入 worker：枚举 + 转存/下载批次。默认关闭（真实外部动作
+# 需显式 BAIDU_ENUMERATION_ENABLED / BAIDU_IMPORT_ENABLED）。
+# BAIDU_IMPORT_WORKER=1/true 才拉起；缺省 skip。
+# ---------------------------------------------------------------------------
+_bd_worker="$(printf '%s' "${BAIDU_IMPORT_WORKER:-0}" | tr '[:upper:]' '[:lower:]')"
+case "$_bd_worker" in
+  1|true|yes|on)
+    echo "[entry] starting baidu_import_worker --loop"
+    (
+      while :; do
+        python3 /app/scripts/baidu_import_worker.py --loop || true
+        echo "[entry] baidu_import_worker exited, restart in 2s" >&2
+        sleep 2
+      done
+    ) &
+    ;;
+  *)
+    echo "[entry] BAIDU_IMPORT_WORKER=$_bd_worker, skip baidu-import worker"
     ;;
 esac
 

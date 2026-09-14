@@ -10,9 +10,15 @@ from .parser import (KfbAssociated, KfbDocument, KfbHeader, KfbLevel,
                      KfbTile, parse_kfb)
 from .converter import convert_kfb
 from .fixture import build_synthetic_kfb
+from .vendor_kfbf import (KFBF_MAGIC, KfbfChannel, KfbfDocument, KfbfHeader,
+                          KfbfLevel, KfbfTile, parse_kfbf)
+from .converter_fl import convert_kfbf
+from .fixture_fl import build_synthetic_kfbf
 
 __all__ = [
     "KfbError", "KFB_ERROR_CODES",
     "KfbAssociated", "KfbDocument", "KfbHeader", "KfbLevel", "KfbTile",
     "parse_kfb", "convert_kfb", "build_synthetic_kfb",
+    "KFBF_MAGIC", "KfbfChannel", "KfbfDocument", "KfbfHeader", "KfbfLevel",
+    "KfbfTile", "parse_kfbf", "convert_kfbf", "build_synthetic_kfbf",
 ]

@@ -4,7 +4,8 @@
 覆盖：
   - 现有 SUPPORTED_EXTS 每个扩展名的 capability 归类正确；
   - registry 词表与 app.SUPPORTED_EXTS 同步（两侧防漂移）；
-  - .kfb = convert-required（canonical .tif）、.kfbf = unsupported；
+  - .kfb = convert-required（canonical .tif）、.kfbf = convert-required
+    （canonical .ome.tif，荧光多通道 OME-TIFF 通道，真实样本已校准）；
   - 未知扩展名 fail-closed；
   - **上传白名单未被改动**：.kfb/.kfbf 不在 app.SUPPORTED_EXTS。
 
@@ -54,11 +55,11 @@ def test_kfb_is_convert_required(filename, ext):
     assert info["canonical_ext"] == ".tif"
 
 
-def test_kfbf_is_unsupported():
+def test_kfbf_is_convert_required():
     info = reg.lookup("sample.kfbf")
     assert info["ext"] == ".kfbf"
-    assert info["capability"] == reg.CAP_UNSUPPORTED
-    assert info["canonical_ext"] is None
+    assert info["capability"] == reg.CAP_CONVERT_REQUIRED
+    assert info["canonical_ext"] == ".ome.tif"
 
 
 @pytest.mark.parametrize("filename", [

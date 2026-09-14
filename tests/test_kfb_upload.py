@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """KFB 上传 → 202 转换任务 → worker 产出 canonical TIFF。"""
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -33,6 +34,19 @@ def _isolate(tmp_path, monkeypatch):
 def _client():
     app_mod.app.config["TESTING"] = True
     return csrf_client(app_mod.app.test_client())
+
+
+def _v2_commit_file(c, filename, data):
+    r = c.post("/api/uploads", json={
+        "filename": filename, "declared_size": len(data)})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    uid = r.get_json()["upload_id"]
+    sha = hashlib.sha256(data).hexdigest()
+    put = c.put("/api/uploads/%s/chunk?offset=0&sha256=%s" % (uid, sha),
+                data=data, content_type="application/octet-stream")
+    assert put.status_code == 200, put.get_data(as_text=True)
+    r = c.post("/api/uploads/%s/commit" % uid)
+    return uid, r
 
 
 def test_v1_kfb_returns_202_and_worker_makes_tif(tmp_path):
@@ -73,7 +87,8 @@ def test_v1_kfb_returns_202_and_worker_makes_tif(tmp_path):
     assert "case.tif" in names2
 
 
-def test_kfbf_still_rejected(tmp_path):
+def test_kfbf_garbage_bytes_rejected(tmp_path):
+    """.kfbf 已是 convert-required（可上传），但垃圾字节过不了探测。"""
     p = tmp_path / "x.kfbf"
     p.write_bytes(b"not-a-slide")
     c = _client()
@@ -209,6 +224,12 @@ def test_same_bytes_rename_does_not_rewrite_inflight_paths(tmp_path):
     job2 = conversion_store.get_job(jid)
     assert job2["source_name"] == "a.kfb"
     assert job2["canonical_name"] == "a.tif"
+    assert "b.kfb" in conversion_store.list_source_names(jid)
+    conversion_worker.run_once(upload_dir=str(app_mod.UPLOAD_DIR))
+    assert conversion_store.get_job(jid)["state"] == "ready"
+    c.delete("/api/slide/a.tif")
+    assert not (app_mod.UPLOAD_DIR / "a.kfb").exists()
+    assert not (app_mod.UPLOAD_DIR / "b.kfb").exists()
 
 
 def test_worker_link_fail_does_not_delete_foreign_tif(tmp_path):
@@ -222,3 +243,105 @@ def test_worker_link_fail_does_not_delete_foreign_tif(tmp_path):
     victim.write_bytes(b"FOREIGN-TIFF-BYTES")
     conversion_worker.run_once(upload_dir=str(app_mod.UPLOAD_DIR))
     assert victim.read_bytes() == b"FOREIGN-TIFF-BYTES"
+
+
+def test_v2_old_commit_cannot_claim_replaced_source(tmp_path, monkeypatch):
+    """删除后同名新源落盘，原 upload 重放 commit 不得认领新文件。"""
+    import user_store
+    monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
+    src_a = build_synthetic_kfb(tmp_path / "a.kfb", width=580, height=300)
+    src_b = build_synthetic_kfb(tmp_path / "b.kfb", width=300, height=280)
+    data_a = Path(src_a).read_bytes()
+    data_b = Path(src_b).read_bytes()
+    assert hashlib.sha256(data_a).digest() != hashlib.sha256(data_b).digest()
+
+    ca = _client()
+    ua = user_store.create_user("owna@x.com", "pass1234pass1234", role="user")
+    with ca.session_transaction() as s:
+        s["auth_user"] = ua.get("login_id") or "owna@x.com"
+        s["user_id"] = ua["user_id"]
+        s["role"] = "user"
+        s["auth_version"] = ua.get("auth_version", 1)
+    uid_a, r = _v2_commit_file(ca, "claim.kfb", data_a)
+    assert r.status_code == 202, r.get_data(as_text=True)
+    conversion_worker.run_once(upload_dir=str(app_mod.UPLOAD_DIR))
+    assert conversion_store.get_job(r.get_json()["conversion_job_id"])["state"] == "ready"
+    assert ca.delete("/api/slide/claim.tif").status_code == 200
+
+    cb = _client()
+    ub = user_store.create_user("ownb@x.com", "pass1234pass1234", role="user")
+    with cb.session_transaction() as s:
+        s["auth_user"] = ub.get("login_id") or "ownb@x.com"
+        s["user_id"] = ub["user_id"]
+        s["role"] = "user"
+        s["auth_version"] = ub.get("auth_version", 1)
+    _uid_b, rb = _v2_commit_file(cb, "claim.kfb", data_b)
+    assert rb.status_code == 202, rb.get_data(as_text=True)
+    sha_b = hashlib.sha256(data_b).hexdigest()
+    assert hashlib.sha256(
+        (app_mod.UPLOAD_DIR / "claim.kfb").read_bytes()).hexdigest() == sha_b
+
+    replay = ca.post("/api/uploads/%s/commit" % uid_a)
+    assert replay.status_code == 409, replay.get_data(as_text=True)
+    on_disk = hashlib.sha256(
+        (app_mod.UPLOAD_DIR / "claim.kfb").read_bytes()).hexdigest()
+    assert on_disk == sha_b
+    job_b = conversion_store.get_job(rb.get_json()["conversion_job_id"])
+    assert job_b["owner_user_id"] == ub["user_id"]
+    assert job_b["source_sha256"] == sha_b
+
+
+def test_ready_same_bytes_rename_keeps_original_canonical(tmp_path):
+    src = build_synthetic_kfb(tmp_path / "a.kfb")
+    c = _client()
+    with open(src, "rb") as f:
+        r = c.post("/api/upload", data={"file": (f, "a.kfb")},
+                   content_type="multipart/form-data")
+    assert r.status_code == 202
+    jid = r.get_json()["conversion_job_id"]
+    conversion_worker.run_once(upload_dir=str(app_mod.UPLOAD_DIR))
+    assert conversion_store.get_job(jid)["state"] == "ready"
+    assert (app_mod.UPLOAD_DIR / "a.tif").is_file()
+    with open(src, "rb") as f:
+        r2 = c.post("/api/upload", data={"file": (f, "b.kfb")},
+                    content_type="multipart/form-data")
+    assert r2.status_code in (200, 202), r2.get_data(as_text=True)
+    job = conversion_store.get_job(jid)
+    assert job["source_name"] == "a.kfb"
+    assert job["canonical_name"] == "a.tif"
+    assert job["state"] == "ready"
+    assert (app_mod.UPLOAD_DIR / "a.tif").is_file()
+    assert (app_mod.UPLOAD_DIR / "b.kfb").is_file()
+    aliases = conversion_store.list_source_names(jid)
+    assert "b.kfb" in aliases
+    c.delete("/api/slide/a.tif")
+    assert not (app_mod.UPLOAD_DIR / "a.kfb").exists()
+    assert not (app_mod.UPLOAD_DIR / "b.kfb").exists()
+
+
+def test_worker_resumes_hardlink_without_dest_manifest(tmp_path):
+    """dest 已是本任务 work 的 hardlink、sidecar 未写完时，续跑应收口而非 name_unavailable。"""
+    src = build_synthetic_kfb(tmp_path / "resume.kfb")
+    c = _client()
+    with open(src, "rb") as f:
+        r = c.post("/api/upload", data={"file": (f, "resume.kfb")},
+                   content_type="multipart/form-data")
+    assert r.status_code == 202
+    jid = r.get_json()["conversion_job_id"]
+    source = str(app_mod.UPLOAD_DIR / "resume.kfb")
+    dest = str(app_mod.UPLOAD_DIR / "resume.tif")
+    work = conversion_worker.work_path_for(dest, jid)
+    kfb_converter.convert_kfb(source, work)
+    os.link(work, dest)
+    assert os.path.isfile(dest)
+    assert not os.path.isfile(dest + ".manifest.json")
+    assert os.path.isfile(work + ".manifest.json")
+    conversion_worker.run_once(upload_dir=str(app_mod.UPLOAD_DIR))
+    job = conversion_store.get_job(jid)
+    assert job["state"] == "ready"
+    assert os.path.isfile(dest)
+    assert os.path.isfile(dest + ".manifest.json")
+    assert not os.path.isfile(work)
+    slides = c.get("/api/slides").get_json()
+    names = [s["name"] if isinstance(s, dict) else s for s in slides]
+    assert "resume.tif" in names

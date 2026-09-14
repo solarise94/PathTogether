@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import socket
 import sys
 import time
@@ -23,10 +24,28 @@ import conversion_store  # noqa: E402
 import share_store  # noqa: E402
 import slide_io  # noqa: E402
 import user_store  # noqa: E402
-from kfb import KfbError, convert_kfb  # noqa: E402
+from kfb import KfbError, convert_kfb, convert_kfbf  # noqa: E402
 
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR") or os.path.join(_REPO, "uploads")
 POLL_SECONDS = float(os.environ.get("CONVERSION_POLL_SECONDS") or 1.5)
+
+
+def _convert_for_source(source, work, *, on_progress=None):
+    """按 magic 分派：KFBF → 多通道 OME-TIFF；其余 → 明场 KFB 路径。
+
+    内容嗅探优先于扩展名（改名文件按真实字节走对应转换器）。
+    """
+    from kfb import KFBF_MAGIC
+    try:
+        with open(source, "rb") as fh:
+            magic = fh.read(8)
+    except OSError:
+        magic = b""
+    if magic == bytes(KFBF_MAGIC):
+        return convert_kfbf(source, work, overwrite=False,
+                            on_progress=on_progress)
+    return convert_kfb(source, work, overwrite=False,
+                       on_progress=on_progress)
 
 
 def _worker_id():
@@ -46,6 +65,68 @@ def _manifest_matches_job(dest, job):
         return False
 
 
+def _same_inode(a, b):
+    try:
+        sa, sb = os.stat(a), os.stat(b)
+    except OSError:
+        return False
+    return sa.st_dev == sb.st_dev and sa.st_ino == sb.st_ino
+
+
+def work_path_for(dest, job_id):
+    return dest + ".work-" + job_id
+
+
+def _discard_work(work):
+    """清本任务的 work 产物（不影响 canonical dest）。"""
+    if not work:
+        return
+    for p in (work, work + ".part", work + ".manifest.json",
+              work + ".manifest.json.part"):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    assoc = work + ".associated"
+    if os.path.isdir(assoc):
+        shutil.rmtree(assoc, ignore_errors=True)
+
+
+def _promote_work(work, dest):
+    """把已完成的 work TIFF+manifest 无覆盖提升到 canonical dest。
+
+    dest 仅在 work 完成后经 hardlink 出现，故 dest 无 manifest 的崩溃窗口
+    可用 work 与 dest 同 inode 识别并续跑。他人 dest 一律 FileExistsError。
+    """
+    work_man = work + ".manifest.json"
+    dest_man = dest + ".manifest.json"
+    work_assoc = work + ".associated"
+    dest_assoc = dest + ".associated"
+    if not os.path.isfile(work) or not os.path.isfile(work_man):
+        raise KfbError("conversion_validation_failed", "work 产物不完整")
+    if os.path.isfile(dest):
+        if not _same_inode(work, dest):
+            raise FileExistsError(dest)
+    else:
+        os.link(work, dest)
+    if not os.path.isfile(dest_man):
+        import json
+        with open(work_man, encoding="utf-8") as fh:
+            data = json.load(fh)
+        canon = data.get("canonical")
+        if isinstance(canon, dict):
+            canon["name"] = os.path.basename(dest)
+        tmp_man = dest_man + ".part"
+        with open(tmp_man, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_man, dest_man)
+    if os.path.isdir(work_assoc) and not os.path.isdir(dest_assoc):
+        os.rename(work_assoc, dest_assoc)
+    _discard_work(work)
+
+
 def _validate_canonical(dest):
     slide = slide_io.open_slide(dest)
     try:
@@ -62,6 +143,7 @@ def process_job(job, upload_dir, worker_id):
     canonical = job.get("canonical_name") or (
         os.path.splitext(job["source_name"])[0] + ".tif")
     dest = os.path.join(upload_dir, canonical)
+    work = work_path_for(dest, job["id"])
     if not os.path.isfile(source):
         conversion_store.fail_job(job["id"], worker_id, "invalid_kfb_header",
                                   "source missing")
@@ -70,21 +152,25 @@ def process_job(job, upload_dir, worker_id):
     def on_progress(*_a):
         conversion_store.heartbeat(job["id"], worker_id)
 
-    dest_existed = os.path.isfile(dest)
-    created_dest = False
     try:
         conversion_store.mark_state(job["id"], worker_id, "converting")
-        if dest_existed:
-            # 目标在本轮开始前已存在：可能是他人文件，或上次本任务已 link
-            # 但未 complete。仅当 sidecar 证明是本源的续跑才收口；失败不删 dest。
-            if not _manifest_matches_job(dest, job):
-                conversion_store.fail_job(
-                    job["id"], worker_id, "name_unavailable",
-                    "canonical exists")
-                return False
+        if os.path.isfile(dest) and _manifest_matches_job(dest, job):
+            _discard_work(work)
+        elif os.path.isfile(dest) and os.path.isfile(work) and _same_inode(
+                work, dest):
+            _promote_work(work, dest)
+        elif os.path.isfile(dest):
+            conversion_store.fail_job(
+                job["id"], worker_id, "name_unavailable",
+                "canonical exists")
+            _discard_work(work)
+            return False
         else:
-            convert_kfb(source, dest, overwrite=False, on_progress=on_progress)
-            created_dest = os.path.isfile(dest)
+            if not (os.path.isfile(work)
+                    and os.path.isfile(work + ".manifest.json")):
+                _discard_work(work)
+                _convert_for_source(source, work, on_progress=on_progress)
+            _promote_work(work, dest)
         conversion_store.heartbeat(job["id"], worker_id)
         conversion_store.mark_state(job["id"], worker_id, "validating")
         _validate_canonical(dest)
@@ -96,33 +182,43 @@ def process_job(job, upload_dir, worker_id):
             job["id"], worker_id, canonical,
             owner_user_id=job.get("owner_user_id") or "",
             settle_bytes=os.path.getsize(dest))
+        _discard_work(work)
         return True
+    except FileExistsError:
+        conversion_store.fail_job(
+            job["id"], worker_id, "name_unavailable", "canonical exists")
+        _discard_work(work)
+        return False
     except KfbError as e:
         conversion_store.fail_job(job["id"], worker_id, e.code, str(e))
-        _cleanup_partial(dest, ours=created_dest)
+        _retract_ours(dest, work, job)
+        _discard_work(work)
         return False
     except Exception:  # noqa: BLE001
         conversion_store.fail_job(
             job["id"], worker_id, "conversion_validation_failed",
             traceback.format_exc()[-1500:])
-        _cleanup_partial(dest, ours=created_dest)
+        _retract_ours(dest, work, job)
+        _discard_work(work)
         return False
 
 
-def _cleanup_partial(dest, *, ours=False):
-    """只清 .part；仅当产物确认是本任务写出时才删 dest（不覆盖他人文件）。"""
+def _retract_ours(dest, work, job):
+    """失败时只收回本任务 hardlink 出的 dest（他人文件不动）。"""
     try:
-        if os.path.exists(dest + ".part"):
-            os.unlink(dest + ".part")
+        os.unlink(dest + ".manifest.json.part")
     except OSError:
         pass
-    if not ours:
-        return
-    try:
-        if os.path.exists(dest):
+    if os.path.isfile(dest) and os.path.isfile(work) and _same_inode(
+            work, dest) and not _manifest_matches_job(dest, job):
+        try:
             os.unlink(dest)
-    except OSError:
-        pass
+        except OSError:
+            pass
+        try:
+            os.unlink(dest + ".manifest.json")
+        except OSError:
+            pass
 
 
 def run_once(upload_dir=None, worker_id=None):

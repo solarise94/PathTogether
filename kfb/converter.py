@@ -306,6 +306,7 @@ def convert_kfb(src_path, dst_path, *, timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
     part_path = dst.with_name(dst.name + ".part")
     assoc_dir = dst.with_name(dst.name + ".associated")
     assoc_dir_created = False
+    linked = False
     started = time.monotonic()
 
     def _check_time():
@@ -436,6 +437,7 @@ def convert_kfb(src_path, dst_path, *, timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
         except FileExistsError:
             raise KfbError("conversion_validation_failed",
                            "输出已存在：%s" % dst)
+        linked = True
         try:
             part_path.unlink()
         except OSError:
@@ -443,7 +445,9 @@ def convert_kfb(src_path, dst_path, *, timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
         write_manifest(manifest, dst.with_name(dst.name + ".manifest.json"))
         return manifest
     except Exception:
-        # 失败清理：半成品 .part 不留（源文件永远保留）
+        # 失败清理：半成品 .part 不留（源文件永远保留）。link 失败说明 dest
+        # 已是他人产物，不得删其 sidecar；仅当本轮已 link 出 dest 才收回
+        # dest 与 dest.manifest（sidecar 未完成的崩溃窗口）。
         for p in (part_path,
                   dst.with_name(dst.name + ".manifest.json.part")):
             try:
@@ -453,6 +457,12 @@ def convert_kfb(src_path, dst_path, *, timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
                 pass
         if assoc_dir_created:
             shutil.rmtree(assoc_dir, ignore_errors=True)
+        if linked:
+            for p in (dst.with_name(dst.name + ".manifest.json"), dst):
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
         raise
     finally:
         doc.close()

@@ -22,6 +22,7 @@ import os
 import struct
 import subprocess
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import _bootstrap  # noqa: E402,F401  # session 目录 + openslide stub（conftest 先行）
@@ -252,6 +253,41 @@ def test_refuse_existing_output(synth_pair):
     with pytest.raises(KfbError) as ei:
         convert_kfb(src, dst)
     assert ei.value.code == "conversion_validation_failed"
+
+
+def test_manifest_write_failure_unlinks_new_tif(synth_pair, monkeypatch):
+    src, dst = synth_pair
+
+    def _boom(*_a, **_k):
+        raise OSError("sidecar fail")
+
+    monkeypatch.setattr("kfb.manifest.write_manifest", _boom)
+    with pytest.raises(OSError, match="sidecar fail"):
+        convert_kfb(src, dst)
+    assert not os.path.exists(dst)
+    assert not os.path.exists(dst + ".manifest.json")
+    assert not os.path.exists(dst + ".part")
+
+
+def test_link_fail_keeps_existing_dest_manifest(synth_pair, monkeypatch):
+    """link 失败时不得删除目标已有 sidecar。"""
+    src, dst = synth_pair
+    man = dst + ".manifest.json"
+    real_link = os.link
+
+    def _link_competitor(src_path, dst_path):
+        if os.path.abspath(dst_path) == os.path.abspath(dst):
+            Path(dst).write_bytes(b"FOREIGN-TIFF")
+            Path(man).write_text('{"keep":true}', encoding="utf-8")
+            raise FileExistsError(dst_path)
+        return real_link(src_path, dst_path)
+
+    monkeypatch.setattr(kfb.converter.os, "link", _link_competitor)
+    with pytest.raises(KfbError) as ei:
+        convert_kfb(src, dst)
+    assert ei.value.code == "conversion_validation_failed"
+    assert Path(dst).read_bytes() == b"FOREIGN-TIFF"
+    assert Path(man).read_text(encoding="utf-8") == '{"keep":true}'
 
 
 # --------------------------------------------------------------------------- #

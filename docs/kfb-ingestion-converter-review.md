@@ -667,8 +667,37 @@ KFB parser 面向用户上传的非可信二进制文件。最低要求：
 | Phase A 离线 parser/converter | 已落地 |
 | Phase B conversion_jobs + worker | **已落地**（0046 + conversion_worker.py） |
 | Phase C 上传 UI | **已落地**（accept `.kfb`，202 轮询，打开 canonical `.tif`） |
-| 多样本/KFBF | 未完成 |
+| 多样本/KFBF | **已落地**（KFBF §14：4 份真实荧光样本校准 + 端到端转换验证；明场仍单样本） |
 | 线上部署验证 | 需在目标主机跑 migration 并确认 worker 进程 |
 
 合成 fixture 走 **kfb_bf_v1**。真实江丰样本走 **kfb_kfbio_jpeg**。未知变体 fail-closed。**不得**把 `.kfb` 加入 `SUPPORTED_EXTS`。
 
+
+## 14. KFBF 荧光通道（已校准，2026-09 实施）
+
+原「未经真实荧光样本验证就上线 KFBF」的 No-Go 已解除：取得 4 份真实
+KFBF 样本（KFFL02000113023，DAPI+480/520/570/620/690 六通道，含厂商
+viewer 导出的 channel.json 对照），逐字段校准后落地 **kfb_fl_v1** 合同：
+
+- parser：`kfb/vendor_kfbf.py`（fail-closed；magic `f1 01 ee ee 4b 46 42 46`、
+  version=0、格式版本 f32=2.1、tagged 段 tag75/77/79/84 通道数/名称/颜色/
+  曝光；tile 记录 64B 哨兵结构与明场同源，但 payload 为「指针块（96B，
+  前 6×u64 通道绝对偏移）+ side 记录（48B，6×u64 长度）」二级结构，
+  每网格位置 6 张灰度 JPEG；金字塔 L0=header、L1..L3 floor 减半、
+  L4..L8=ceil(L0/256)×2^(8-L)、L9+ 自 L8 floor 减半——以 4 份样本全部
+  tile 网格 extent 逐层验证）。
+- 稀疏性：厂商丢弃纯背景 cell（各层缺失 9..232 个），转换器黑填充
+  （荧光背景即黑，语义无损），记 warning `sparse_fill_black`；L0 底行
+  内容裁剪 tile 走黑底重编码（复用源量化表）。
+- converter：`kfb/converter_fl.py` → 多通道金字塔 OME-TIFF（BigTIFF，
+  顶层 IFD 链=level0 各通道、SubIFDs 挂缩减层，OME-XML 保留通道名/
+  ARGB 颜色/曝光（ms 假定）/PhysicalSize/NominalMagnification），
+  canonical 扩展名 `.ome.tif`；满格 tile 的通道 JPEG **逐字节透传**
+  （真实样本逐字节比对验证）。NJH 样本（481MB）转换 ~1.8s。
+- 链路：registry `.kfbf`=convert-required（canonical `.ome.tif`）；
+  app 探测与 conversion_worker 均按 magic 嗅探分派（内容优先于扩展名）；
+  CLI `scripts/convert_kfbf.py`；测试 `tests/test_kfbf_{parser,converter,
+  upload,real_samples}.py`（真实样本用例 gated 于 `PT_KFBF_SAMPLES_DIR`）。
+- 仍未做：其它扫描仪型号/其它通道数（2/3/4 通道等）的 KFBF variant
+  未见样本，遇到即 fail-closed；曝光时间单位（ms）为推断值，manifest
+  记 `exposure_unit: ms(assumed)`。

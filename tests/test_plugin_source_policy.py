@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -92,6 +93,63 @@ def test_sample_manifest_validates_and_policy_pin_matches():
     tma = json.loads(TMA_MANIFEST.read_text(encoding="utf-8"))
     assert M.validate_manifest(tma) == []
     assert [c["name"] for c in tma["provides"]] == ["slide_summary"]
+
+
+def test_builtin_plugin_bundle_file_hashes_match_disk():
+    """信任链第三级防漂移门禁（review 2026-09-14）：manifest ui.fileHashes
+    ↔ 磁盘 bundle 文件逐一对账 + 声明集合恰好覆盖 ui/ 目录。
+
+    上一用例只锁 source-policy pin ↔ manifest 一级；本用例补
+    _admin_plugin_trusted ③b / 资产路由声明集合那一级——改 bundle 文件
+    但不更新 manifest fileHashes（及 source-policy pin）时，运行时
+    fail-closed 使 admin 插件整体降级不可信（/admin 降级页、资产 403），
+    而既有测试直到运行时才暴露。2026-09-14 实发：改 ui/main.js 与
+    ui/style.css 未同步 pin，test_admin_plugin 31 例连锁失败。
+
+    修复动作提示：改 bundle 后须同步
+      1) manifest.json ui.fileHashes（sha256sum plugins/<id>/<rel>）
+      2) plugins/source-policy.json 的 manifest pin（sha256sum manifest.json）
+    未声明 fileHashes 的内置插件（sample-*）沿用既有弱信任模型，不在此
+    扩权或加码。"""
+    policy = json.loads(
+        (REPO_ROOT / "plugins" / "source-policy.json")
+        .read_text(encoding="utf-8"))
+    problems = []
+    for plugin_id in sorted(policy):
+        plugin_dir = REPO_ROOT / "plugins" / plugin_id
+        manifest_path = plugin_dir / "manifest.json"
+        assert manifest_path.is_file(), plugin_id
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        declared = ((manifest.get("ui") or {}).get("fileHashes") or {})
+        if not declared:
+            continue  # 未声明 fileHashes 的插件不在本门禁范围
+        for rel, expected in sorted(declared.items()):
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", str(expected)):
+                problems.append("%s: %s 声明哈希非 64 位 hex" % (plugin_id, rel))
+                continue
+            target = plugin_dir / rel
+            if not target.is_file():
+                problems.append(
+                    "%s: %s 已声明但磁盘缺失" % (plugin_id, rel))
+                continue
+            actual = _sha256(target)
+            if actual != str(expected).lower():
+                problems.append(
+                    "%s: %s 漂移（manifest=%s… 磁盘=%s…）——改 bundle 后须同步"
+                    "更新 fileHashes 与 source-policy pin"
+                    % (plugin_id, rel, str(expected).lower()[:12], actual[:12]))
+        # 声明集合须恰好覆盖 ui/ 全部文件：未声明文件运行时一律 403
+        # （app.py 资产路由），等于静默功能缺失；多余声明同样暴露
+        ui_dir = plugin_dir / "ui"
+        on_disk = sorted(
+            f.relative_to(plugin_dir).as_posix()
+            for f in ui_dir.rglob("*") if f.is_file()) \
+            if ui_dir.is_dir() else []
+        if sorted(declared) != on_disk:
+            problems.append(
+                "%s: fileHashes 声明集合与 ui/ 磁盘文件不一致（声明=%r 磁盘=%r）"
+                % (plugin_id, sorted(declared), on_disk))
+    assert not problems, "插件 bundle 防漂移门禁失败：\n" + "\n".join(problems)
 
 
 def test_histopilot_is_absent_by_default():

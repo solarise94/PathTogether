@@ -1031,12 +1031,14 @@ _REGISTRATION_PUBLIC_PATHS = frozenset({
 
 #: enrollment 受限会话白名单（设计文档第 8 节 I-R4）：pending_activation
 #: 用户凭正确凭据只拿到 enrollment scope（独立键，不写 auth_user/role），
-#: 仅可触达激活页/激活 API/状态/受限重发/登出，其余一律拒绝。
+#: 仅可触达激活页/激活 API/状态/匿名重发/登出，其余一律拒绝。
+#: （review 2026-09-14：移除从未实现过的 /api/account/enrollment/resend——
+#: 白名单不得承诺不存在的路由，pending 用户换邮箱重新验证走匿名
+#: /api/registration/resend 即可。）
 _ENROLLMENT_ALLOWED_PATHS = frozenset({
     "/activate",
     "/api/account/enrollment",
     "/api/account/activate",
-    "/api/account/enrollment/resend",
     "/api/registration/resend",
     "/logout",
 })
@@ -4195,12 +4197,32 @@ def api_registration_resend():
     新请求）。body: {email}；对未知/已存在/超限邮箱一律同一响应（反枚举）。
     P1-2：入队写前重查生效模式——注册暂停时统一 403 registration_closed
     （只暂停：不写队列、不发邮件、不动已有 token）。
+    IP 前缀限流（review 2026-09-14 附带观察加固）：本端点对任意邮箱统一
+    ok，若无 IP 维度闸，单一来源即可用数十个不同邮箱把应用级日预算
+    （VERIFY_APP_DAILY_BUDGET）耗尽，当天所有真实注册静默收不到验证邮件。
+    与 POST /register 共用同一 reg_ip_daily 桶（24 小时 30 次尝试，成功也
+    计——两入口都是「触发一封验证邮件」的同一动作面）；锁定时同样统一
+    ok 响应（IP 维度信息不构成邮箱枚举信号），仅不再入队。
     """
     # P1-2：写前重查生效模式（与 activate/verify-start 共用同一权威判定）
     if _effective_registration_mode() != \
             registration_store.MODE_EMAIL_VERIFY_INVITE_ACTIVATION:
         return jsonify(error="注册当前未开放，请稍后再试",
                        code="registration_closed"), 403
+    # IP 前缀限流（与 register POST 同款原语；存储不可用 fail-closed 503）
+    import auth_limit_store
+    ip_hash = _ip_prefix_hash(request.remote_addr or "")
+    try:
+        retry = auth_limit_store.check_registration_locked(ip_hash)
+        if retry <= 0:
+            retry = auth_limit_store.record_registration_attempt(ip_hash)
+    except Exception:
+        app.logger.exception("重发限流存储不可用，fail-closed 503")
+        return _registration_unavailable_response()
+    if retry > 0:
+        app.logger.warning(
+            "验证邮件重发被 IP 限流吸收（锁定剩余 %d 秒，不入队）", retry)
+        return jsonify(ok=True)
     if request.is_json:
         body = request.get_json(silent=True) or {}
     else:
@@ -6853,9 +6875,7 @@ def admin_v1_users():
     items = []
     for u in page:
         uid = str(u.get("user_id") or "")
-        spend = spend_by_user.get(uid)
-        if spend is not None:
-            spend = _admin_v1_spend_summary_out(spend)
+        spend = _admin_v1_user_spend_wire(spend_by_user.get(uid), u)
         email_norm = str(u.get("email_normalized")
                          or u.get("email") or "") or None
         items.append({
@@ -7650,6 +7670,47 @@ def _admin_v1_spend_summary_out(spend_item):
         out["total"] = _admin_v1_nano_out(dict(out["total"]))
     if out.get("window") is not None:
         out["window"] = _admin_v1_spend_window_summary(out["window"])
+    return out
+
+
+def _admin_v1_user_spend_wire(spend_item, user_row):
+    """用户列表 spend 投影 + 激活状态语义（review 2026-09-14 R1 / 规格 W1）。
+
+    在 :func:`_admin_v1_spend_summary_out` 的互斥形态之上叠一层 ``status``；
+    **不改**底层总额度缺行拒绝逻辑（total_allowance_summary_tx 照旧抛
+    missing），也不在读路径补写任何行：
+
+    - 合法待激活（activation_state ∈ pending_activation/email_pending）且
+      无额度行 → ``not_provisioned``：摘除 missing error——待激活无行是
+      正常业务状态（激活事务才建额度），不是数据损坏；绝不伪造
+      total/window/金额 0；
+    - 待激活却已有 total 行 → ``unavailable`` + 稳定 error
+      ``activation_allowance_conflict``（状态矛盾只报告，不删不补数据；
+      total 原样保留供技术详情排查）；
+    - active user 有 total → ``available``；active user 缺行 →
+      ``unavailable``（保留 spend_total_allowance_missing，既有「缺行即
+      损坏」语义不变）；
+    - owner 有 window → ``available``；owner 读取失败 → ``unavailable``。
+
+    判定只用服务端权威 activation_state（不由邮箱是否存在或 ai_access
+    推断）；存量行缺省（NULL）按既有用户模型规范化规则视为 active。
+    """
+    if spend_item is None:
+        return None
+    out = _admin_v1_spend_summary_out(spend_item)
+    activation_state = (user_row.get("activation_state") or "active")
+    if activation_state in ("pending_activation", "email_pending"):
+        if out.get("error") == "spend_total_allowance_missing":
+            out["status"] = "not_provisioned"
+            del out["error"]
+        elif out.get("error") is None and out.get("total") is not None:
+            out["status"] = "unavailable"
+            out["error"] = "activation_allowance_conflict"
+        else:
+            out["status"] = "unavailable"
+        return out
+    out["status"] = "unavailable" if out.get("error") is not None \
+        else "available"
     return out
 
 

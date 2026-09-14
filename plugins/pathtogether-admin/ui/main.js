@@ -848,9 +848,11 @@
     var today = res.today || {};
     var d7 = res.d7 || {};
     var d30 = res.d30 || {};
-    var totalVisits = Number((d30 && d30.visits) || 0) +
-      Number((d7 && d7.visits) || 0) + Number((today && today.visits) || 0);
-    var hasData = totalVisits > 0 || (res.daily || []).length > 0;
+    // 空态判定看「真实事件数」而不是 daily 长度——后端 daily 恒返回 30 行
+    // （缺日补零），按长度判断空态永远不成立（review 2026-09-14）。recent
+    // 兜底 30 天窗口外仍留存的记录（保留期内），两种任一非空即视为有数据。
+    var hasData = Number(d30.visits || 0) > 0 ||
+      (res.recent || []).length > 0;
     if (empty) {
       empty.hidden = hasData;
       empty.textContent = "当前没有站点访问记录（仅统计公开页面的匿名访问）。";
@@ -1014,12 +1016,18 @@
   //   - role=owner → 恒 spend.window（月窗口）；
   //   - 两种形态同时出现 = 契约错误：显式报错态，绝不任选其一渲染；
   //   - 数据缺失/错误 = 不可用（原因），绝不伪造 0。金额运算全程 BigInt。
+  //   - W1（review 2026-09-14 R1）：服务端对合法待激活用户下发
+  //     status=not_provisioned（无 error、无金额）——不是错误，也不伪造
+  //     金额；文案见 remainingInfo。
   // ------------------------------------------------------------------
   function userSpendInfo(u) {
     var s = u && u.spend;
     if (!s || s.error) {
       return { shape: "unavailable",
                reason: s && s.error ? String(s.error) : "额度数据缺失" };
+    }
+    if (s.status === "not_provisioned") {
+      return { shape: "not_provisioned" };
     }
     var t = s.total;
     var w = s.window;
@@ -1071,6 +1079,11 @@
     if (info.shape === "invalid") {
       return { text: "契约错误（total 与 window 同时返回）", danger: true };
     }
+    if (info.shape === "not_provisioned") {
+      // W1（review 2026-09-14 R1）：合法待激活无额度行——正常业务状态
+      return { text: u && u.activation_state === "email_pending"
+        ? "待验证" : "待激活，激活后发放额度", danger: false };
+    }
     if (info.shape === "unavailable") {
       return { text: "不可用（" + info.reason + "）", danger: false };
     }
@@ -1106,6 +1119,14 @@
     return cell;
   }
 
+  // 激活状态标签（W1/R1 review 2026-09-14）：桌面与移动端都可见——
+  // 「启用/禁用」只是账户开关，不代表完成激活或可使用 AI
+  function activationLabel(u) {
+    if (u && u.activation_state === "pending_activation") return "待激活";
+    if (u && u.activation_state === "email_pending") return "待验证";
+    return "";
+  }
+
   function renderUsers(items, append) {
     var tbody = $("adm-users-tbody");
     if (!tbody) return;
@@ -1116,18 +1137,23 @@
       // display_name 冒充身份）。user_id 为次级技术详情（drawer 内展示）。
       tr.appendChild(td(identityText(u)));
       tr.appendChild(td(u.role, "adm-col-secondary"));
-      // 状态 + AI（P0-2）：桌面一列；≤767px 状态格内堆叠 AI 补行
+      // 状态列：账户开关（启用/禁用）+ 元信息行（激活标签、AI access）。
+      // R1 修复：此前激活标签只写进 ≤767px 才显示的移动端堆叠行，桌面端
+      // 完全不可见；且显示激活标签时把 AI 信息顶掉。现改为始终可见的
+      // 小字元信息行，激活（如有）+ AI 并列展示。
       var statusCell = document.createElement("td");
       statusCell.appendChild(document.createTextNode(u.enabled ? "启用" : "禁用"));
-      var stateStack = document.createElement("div");
-      stateStack.className = "adm-stack-mobile";
-      var activationText = u.activation_state === "pending_activation"
-        ? "待激活" : (u.activation_state === "email_pending" ? "待验证" : "");
-      if (activationText) stateStack.textContent = activationText;
-      else {
-        stateStack.textContent = u.ai_access ? "AI" : "无 AI";
+      var meta = document.createElement("div");
+      meta.className = "adm-user-meta";
+      var act = activationLabel(u);
+      if (act) {
+        var chip = document.createElement("span");
+        chip.className = "adm-chip--pending";
+        chip.textContent = act;
+        meta.appendChild(chip);
       }
-      statusCell.appendChild(stateStack);
+      meta.appendChild(document.createTextNode(u.ai_access ? "AI" : "无 AI"));
+      statusCell.appendChild(meta);
       tr.appendChild(statusCell);
       tr.appendChild(renderRemainCell(u));
       var cell = document.createElement("td");
@@ -1491,8 +1517,7 @@
     kvRow(dl, "身份（邮箱用户名）", identityText(u));
     kvRow(dl, "user_id", u.user_id);
     kvRow(dl, "已验证邮箱", u.email_verified ? (u.email || "是") : "无");
-    kvRow(dl, "激活状态", u.activation_state === "pending_activation"
-      ? "待激活" : (u.activation_state === "email_pending" ? "待验证" : "已激活"));
+    kvRow(dl, "激活状态", activationLabel(u) || "已激活");
     kvRow(dl, "显示名", u.display_name);
     kvRow(dl, "登录账号（掩码）", u.login_id_masked);
     kvRow(dl, "角色", u.role);
@@ -1521,6 +1546,12 @@
       kvRow(dl, "额度来源", "默认（owner 独立策略）");
     } else if (info.shape === "invalid") {
       kvRow(dl, "额度", "契约错误：total 与 window 同时返回（服务端契约破坏，已禁止操作）");
+    } else if (info.shape === "not_provisioned") {
+      // W1/R1：合法待激活——激活事务按邀请面值开户，此处无金额可显示，
+      // 也不提供金额动作（编辑器仅 total/window 形态渲染）
+      kvRow(dl, "额度", u.activation_state === "email_pending"
+        ? "待验证（验证邮箱后凭邀请码激活，激活后发放额度）"
+        : "待激活，激活后发放额度");
     } else {
       kvRow(dl, "额度", "不可用（" + info.reason + "）");
     }

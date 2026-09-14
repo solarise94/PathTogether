@@ -679,9 +679,14 @@ def _window_agg(start_utc, end_utc):
         conn.close()
 
 
-def _daily_series(today_start, today_end, days):
+def _daily_series(start_utc, end_utc, days):
     """30 天逐日序列（缺日补零）。日界：本地（UTC+8）日，SQL 侧先把
-    timestamptz 剥成 naive UTC 再加固定偏移，避免 ::date 受会话时区影响。"""
+    timestamptz 剥成 naive UTC 再加固定偏移，避免 ::date 受会话时区影响。
+
+    序列锚定在 [start, end) 的**最后一个本地日**（end−1µs 的本地日期），
+    与 SQL 分组键共用同一日界；调用方传完整窗口（如 [今天−29 天零点,
+    明天零点)）即得以今天结尾的 30 天序列（review 2026-09-14：此前锚点
+    取首参日期，调用方只能传今天一天宽的窗口，其余 29 天恒为 0）。"""
     sql = (
         "SELECT (occurred_at AT TIME ZONE 'UTC'"
         "         + INTERVAL '%d hours')::date AS day,"
@@ -699,15 +704,16 @@ def _daily_series(today_start, today_end, days):
     conn.row_factory = _dict_row()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (today_start, today_end))
+            cur.execute(sql, (start_utc, end_utc))
             for row in cur.fetchall():
                 grouped[row["day"]] = row
     finally:
         conn.close()
+    last_day = (end_utc - timedelta(microseconds=1)) \
+        .astimezone(_STATS_TIMEZONE).date()
     series = []
     for i in range(days - 1, -1, -1):
-        day = (today_start.astimezone(_STATS_TIMEZONE).date()
-               - timedelta(days=i))
+        day = last_day - timedelta(days=i)
         row = grouped.get(day)
         series.append({
             "date": day.isoformat(),
@@ -805,7 +811,10 @@ def dashboard_stats(*, now=None):
         "today": windows["today"],
         "d7": windows["d7"],
         "d30": windows["d30"],
-        "daily": _daily_series(today_start, today_end, 30),
+        # 查询窗口必须是完整 30 天（[d30_start, today_end)，含今日）——此前
+        # 误传 (today_start, today_end) 导致 SQL 只查到今天一天，其余 29 天
+        # 被「缺日补零」填成 0（review 2026-09-14）；序列锚定见 _daily_series
+        "daily": _daily_series(d30_start, today_end, 30),
         "top_referrers": _top_list(
             d30_start, today_end, "referrer_domain", "domain",
             "AND referrer_domain IS NOT NULL"

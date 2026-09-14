@@ -725,6 +725,43 @@ describe("wave 2 — 概览页收敛 + 站点访问卡（§4.2 / D2-3）", () =>
 		expect(siteAll).not.toContain("注册用户");
 	});
 
+	it("站点访问卡：零数据（daily 为 30 行补零序列）显示空态而非一排 0", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		bus.client!.showPage("overview");
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.overview.get", {
+			ok: true, result: { users: { total: 1 }, billing: { available: false } },
+		});
+		// 后端契约：daily 恒返回 30 行缺日补零序列（长度判断空态永远不成立，
+		// review 2026-09-14 修复——空态只看真实事件数）
+		const zeroDaily = Array.from({ length: 30 }, (_, i) => ({
+			date: `2026-08-${String(i + 1).padStart(2, "0")}`,
+			visits: 0, unique_visitors: 0, bots: 0,
+		}));
+		replyMethod(bus, NONCE, "admin.siteStats.get", {
+			ok: true,
+			result: {
+				generated_at: 1700000000,
+				today: { visits: 0, unique_visitors: 0, bots: 0 },
+				d7: { visits: 0, unique_visitors: 0, bots: 0 },
+				d30: { visits: 0, unique_visitors: 0, bots: 0 },
+				daily: zeroDaily,
+				top_referrers: [], top_pages: [], top_countries: [],
+				visitor_kinds: { anonymous_human: 0, signed_in_human: 0, suspected_bot: 0 },
+				recent: [],
+				geo_configured: false,
+			},
+		});
+		await ticks(6);
+		expect(bus.els["adm-site-card"].hidden).toBe(false);
+		expect(bus.els["adm-site-empty"].hidden).toBe(false);
+		expect(bus.els["adm-site-empty"].textContent)
+			.toContain("当前没有站点访问记录");
+		// 零数据不渲染 KPI 卡（不是一排 0）
+		expect(bus.els["adm-site-kpis"].textContent).toBe("");
+	});
+
 	it("siteStats permission_denied / not_implemented / backend_error 同样整卡隐藏", async () => {
 		for (const code of ["permission_denied", "not_implemented", "backend_error"]) {
 			const bus = loadPluginUiWithBus();
@@ -972,10 +1009,65 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 		// 每行 5 个单元格（显示名/角色/状态/额度剩余/操作）
 		const rowCount = (tbody.match(/详情/g) || []).length;
 		expect(rowCount).toBe(7);
-		// 状态格内仍有移动端 AI 堆叠补行
-		const stacks = bus.created.filter((el) =>
-			String(el.className).includes("adm-stack-mobile"));
-		expect(stacks.length).toBeGreaterThanOrEqual(1);
+		// 状态格内元信息行始终渲染（R1 修复：不再只限移动端）
+		const metas = bus.created.filter((el) =>
+			String(el.className).includes("adm-user-meta"));
+		expect(metas.length).toBeGreaterThanOrEqual(1);
+	});
+
+	// W1（review 2026-09-14 R1）：合法待激活用户不得显示成额度缺失
+	it("批次A-2c: pending 用户 status=not_provisioned → 待激活文案，激活标签桌面可见", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		bus.client!.showPage("users");
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.users.list", {
+			ok: true,
+			result: {
+				items: [
+					{
+						user_id: "p1", display_name: "待激活用户", role: "user",
+						enabled: true, ai_access: false,
+						activation_state: "pending_activation",
+						spend: { spend_target: "total_allowance",
+							status: "not_provisioned" },
+					},
+					{
+						user_id: "p2", display_name: "active 缺行", role: "user",
+						enabled: true, ai_access: true, activation_state: "active",
+						spend: { spend_target: "total_allowance", status: "unavailable",
+							error: "spend_total_allowance_missing" },
+					},
+				],
+				next_cursor: null,
+			},
+		});
+		await ticks(4);
+		const tbody = bus.els["adm-users-tbody"].textContent;
+		// 按行精确断言剩余单元格（两行文案本就不同，不能只看整表 textContent）
+		const remainCells = bus.created.filter((el) =>
+			String(el.className).includes("adm-cell-remaining"));
+		expect(remainCells.length).toBe(2);
+		// 待激活（p1）：正常业务状态文案，不是 missing error，不伪造金额
+		expect(remainCells[0].textContent).toBe("待激活，激活后发放额度");
+		// active 缺行（p2）：仍是稳定错误码（数据损坏语义不变）
+		expect(remainCells[1].textContent)
+			.toBe("不可用（spend_total_allowance_missing）");
+		expect(tbody).toContain("待激活，激活后发放额度");
+		// 激活标签在状态列（元信息行，桌面可见），不依赖移动端媒体查询
+		const chips = bus.created.filter((el) =>
+			String(el.className).includes("adm-chip--pending"));
+		expect(chips.length).toBe(1);
+		expect(chips[0].textContent).toBe("待激活");
+		// 抽屉：待激活无金额动作（不渲染总额度编辑器）
+		const detailBtn = bus.created.find((el) => el.textContent === "详情" &&
+			el._listeners && el._listeners.click);
+		detailBtn!._fire("click", {});
+		const body = bus.els["adm-drawer-body"].textContent;
+		expect(body).toContain("激活状态");
+		expect(body).toContain("待激活，激活后发放额度");
+		const editorInput = bus.created.find((el) => el.id === "adm-total-limit-input");
+		expect(editorInput).toBeUndefined();
 	});
 
 	// §4.3 wave 2：互斥形态契约——total 与 window 同时出现必须显式报错
@@ -1335,8 +1427,11 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 		expect(usersPage).not.toContain("<th>本月剩余</th>");
 		expect(usersPage).toContain("<th>操作</th>");
 		expect(cssSrc).toMatch(/@media \(max-width:\s*767px\)[\s\S]*\.adm-col-secondary\s*{[^}]*display:\s*none/);
-		expect(cssSrc).toMatch(/@media \(max-width:\s*767px\)[\s\S]*\.adm-table--users \.adm-stack-mobile\s*{[^}]*display:\s*block/);
-		expect(cssSrc).toMatch(/\.adm-stack-mobile\s*{[^}]*display:\s*none/);
+		// R1 修复（review 2026-09-14）：状态元信息行（激活标签 + AI）桌面与
+		// 移动端都可见，不再有桌面 display:none 的 adm-stack-mobile
+		expect(cssSrc).toMatch(/\.adm-user-meta\s*{[^}]*font-size/);
+		expect(cssSrc).toMatch(/\.adm-chip--pending\s*{/);
+		expect(cssSrc).not.toContain("adm-stack-mobile");
 		expect(cssSrc).toMatch(/\.adm-cell-time\s*{[^}]*word-break:\s*normal/);
 		expect(cssSrc).toMatch(/\.adm-drawer-tech\s*{/);
 		expect(cssSrc).toMatch(/\.adm-win-adjust\s*{/);

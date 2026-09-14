@@ -12,8 +12,8 @@
     ],
     "fileHashes": {
       "ui/index.html": "45ed62f01823d43179156a283031577bff453d8c5038be0fa378c6a0efffa1a0",
-      "ui/main.js": "d04c0faf00806b8e773a7ef452bce246f0fb3f286d73197d978de912d4075180",
-      "ui/style.css": "dd53f7b7cb942696be2040c680fafb0b3d3dab85598d9de988422add585ee9da"
+      "ui/main.js": "3034a433b515ca195b90a86edda0e1feca450e28be522d87f842d0ca1651eae0",
+      "ui/style.css": "c5e9f411bc4bc146ee054bff2b21dc9f8bfe6e8c727bece0984bf3766f97ff51"
     }
   },
   "service": {

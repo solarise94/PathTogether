@@ -898,6 +898,52 @@ def test_resend_api_unified_response(monkeypatch):
         conn.close()
 
 
+def test_resend_ip_prefix_rate_limit(monkeypatch):
+    """IP 前缀限流（review 2026-09-14 附带观察加固）：单一来源对**不同**
+    邮箱刷 resend（绕开同邮箱冷却/日限）不能耗尽应用级日预算——与
+    POST /register 共用 reg_ip_daily 桶；达限后响应仍是统一 ok（无枚举/
+    无 429 信号），但不再产生新的 registration_mail_jobs 行。"""
+    import auth_limit_store
+    _open_email_mode(monkeypatch)
+    monkeypatch.setenv("PUBLIC_BASE_URL", BASE)
+    app_mod.AUTH_ENABLED = True
+    client = _client()
+    limit = auth_limit_store.REG_IP_DAILY_ATTEMPT_LIMIT
+    for i in range(limit + 3):
+        r = client.post("/api/registration/resend",
+                        json={"email": "iplimit%03d@x.com" % i})
+        assert r.status_code == 200, i
+        assert r.get_json()["ok"] is True, i  # 锁定前后同一响应
+    conn = pg_store_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*)::int AS n FROM registration_mail_jobs "
+                "WHERE email_normalized LIKE 'iplimit%'")
+            n = cur.fetchone()["n"]
+            # 第 limit 次尝试即触发锁定（窗口内 count>=limit 置锁），
+            # 此前 limit-1 次真实入队；远低于应用日预算 40
+            assert n == limit - 1
+            # 锁定期间再发新邮箱：行数不再增长
+            cur.execute(
+                "SELECT count(*)::int AS n FROM registration_mail_jobs "
+                "WHERE email_normalized LIKE 'iplimit%'")
+            assert cur.fetchone()["n"] == n
+    finally:
+        conn.close()
+    r = client.post("/api/registration/resend",
+                    json={"email": "after-lock@x.com"})
+    assert r.status_code == 200 and r.get_json()["ok"] is True
+    conn = pg_store_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*)::int AS n FROM registration_mail_jobs"
+                        " WHERE email_normalized='after-lock@x.com'")
+            assert cur.fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+
 def _make_cli_script(tmpdir, marker):
     """两步 confirmation_token 的最小 CLI stub（bash；参数数组调用）。"""
     path = Path(tmpdir) / "agent_mail_cli_stub.sh"

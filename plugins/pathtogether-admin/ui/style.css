@@ -396,11 +396,26 @@ body {
 .adm-check input { min-width: 0; width: auto; }
 .adm-field-span { grid-column: 1 / -1; }
 
-/* ---- §5.3 用户行剩余/超支颜色 + 移动端堆叠补行 ---- */
+/* ---- §5.3 用户行剩余/超支颜色 + 状态列元信息 ---- */
 .adm-usage-overage { color: var(--danger); font-weight: 600; }
-/* 移动端堆叠补行（P0-2）：桌面隐藏；≤767px 在状态格内以块级补行显示，
-   4 列 = 显示名 / 状态+AI（堆叠）/ 本月剩余 / 操作 */
-.adm-stack-mobile { display: none; }
+/* 状态列元信息行（R1 修复 review 2026-09-14）：桌面与移动端都可见——
+   「启用/禁用」只是账户开关，不代表完成激活或可使用 AI；激活标签与
+   AI access 以小字并列，取代此前仅 ≤767px 显示的移动端堆叠补行 */
+.adm-user-meta {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.adm-chip--pending {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #b25000;
+  background: rgba(255, 149, 0, 0.12);
+}
 
 /* 页内二次确认条（sandbox 无 allow-modals，window.confirm 不可用） */
 .adm-confirm {
@@ -561,9 +576,8 @@ body {
   .adm-table td, .adm-table th { white-space: normal; }
   .adm-table td { word-break: normal; overflow-wrap: anywhere; }
   .adm-table--users .adm-col-secondary { display: none; }
-  /* P0-2：390px 用户表收成 4 列 = 显示名 / 状态+AI（堆叠）/
-     本月剩余 / 操作——角色次要列隐藏，剩余列必须保留 */
-  .adm-table--users .adm-stack-mobile { display: block; }
+  /* 390px 用户表收成 4 列 = 显示名 / 状态+AI / 额度剩余 / 操作——
+     角色次要列隐藏，剩余列必须保留（状态元信息行本就始终可见） */
   /* 首列给最小宽度，避免显示名逐字符竖排（仍不产生页面级横向滚动） */
   .adm-table--users td:first-child, .adm-table--users th:first-child { min-width: 96px; }
 }

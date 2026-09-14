@@ -614,6 +614,42 @@ def test_dashboard_stats_counts_and_readonly(secret):
     assert _business_counts() == before
 
 
+def test_dashboard_stats_daily_series_covers_full_30_days(secret):
+    """回归（review 2026-09-14）：daily 序列必须覆盖完整 30 天窗口。
+
+    旧 bug：dashboard_stats 误把 (today_start, today_end) 传给 _daily_series，
+    SQL 只查到今天一天，其余 29 天被缺日补零填成 0——近 30 天趋势表除今天
+    外恒为 0。断言：前几天的事件落在正确日期行，30 天合计 == d30.visits。"""
+    # 不同 /24（跨桶、跨日哈希不同）避免去重互相吞并；today 与各历史日各 1 条
+    _flush([
+        _ev(remote_addr="203.0.113.1"),                                      # 今天
+        _ev(remote_addr="203.0.114.2",
+            now=BASE_TIME - timedelta(days=3)),                             # 3 天前
+        _ev(remote_addr="203.0.115.3",
+            now=BASE_TIME - timedelta(days=10)),                            # 10 天前
+        _ev(remote_addr="203.0.116.4",
+            now=BASE_TIME - timedelta(days=29)),                            # 29 天前
+        _ev(remote_addr="203.0.117.5",
+            now=BASE_TIME - timedelta(days=40)),                            # 窗口外
+    ])
+    stats = sss.dashboard_stats(now=BASE_TIME)
+    assert stats["d30"]["visits"] == 4
+    by_date = {row["date"]: row for row in stats["daily"]}
+    assert len(stats["daily"]) == 30
+    # 序列边界：最早一天 = 今天 - 29 天，最晚一天 = 今天
+    base_day = datetime.strptime(BASE_DAY, "%Y-%m-%d").date()
+    assert stats["daily"][0]["date"] == (base_day - timedelta(days=29)).isoformat()
+    assert stats["daily"][-1]["date"] == BASE_DAY
+    assert by_date[BASE_DAY]["visits"] == 1
+    assert by_date[(base_day - timedelta(days=3)).isoformat()]["visits"] == 1
+    assert by_date[(base_day - timedelta(days=10)).isoformat()]["visits"] == 1
+    assert by_date[(base_day - timedelta(days=29)).isoformat()]["visits"] == 1
+    # 40 天前不入任何一天
+    assert sum(row["visits"] for row in stats["daily"]) == 4
+    assert sum(row["unique_visitors"] for row in stats["daily"]) \
+        == stats["d30"]["unique_visitors"] == 4
+
+
 def test_dashboard_stats_excludes_expired_window_and_never_purges(secret):
     outside = _ev(now=BASE_TIME - timedelta(days=40))
     fresh = _ev()

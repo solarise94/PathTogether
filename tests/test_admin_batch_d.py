@@ -576,11 +576,85 @@ def test_users_list_spend_total_mode_missing_row_reports_stable_error():
     by_id = {u["user_id"]: u for u in items}
     assert by_id[usera["user_id"]]["spend"]["error"] == \
         "spend_total_allowance_missing"
+    # W1（review 2026-09-14 R1）：active 用户缺行仍是稳定错误（数据损坏
+    # 语义不变），status 语义化为 unavailable
+    assert by_id[usera["user_id"]]["spend"]["status"] == "unavailable"
     assert "window" not in by_id[usera["user_id"]]["spend"]
     assert "total" not in by_id[usera["user_id"]]["spend"]
     # owner 行恒 window 形态
     assert "total" not in by_id[owner["user_id"]]["spend"]
     assert by_id[owner["user_id"]]["spend"]["window"] is not None
+    assert by_id[owner["user_id"]]["spend"]["status"] == "available"
+
+def test_users_list_pending_activation_not_provisioned():
+    """待激活用户（合法无额度行）→ status=not_provisioned：无 missing
+    error、无伪造金额；读路径不补建 allowance/审计（W1/R1，review
+    2026-09-14——此前待激活被显示成 spend_total_allowance_missing）。"""
+    bh.seed_spend_policies()
+    owner, usera = _setup_users()
+    pending = user_store.create_user("pending@x.com", "userpass123456-pp",
+                                     role="user")
+    conflict = user_store.create_user("conflict@x.com",
+                                      "userpass123456-cc", role="user")
+    conn = bh.connect()
+    try:
+        with conn.cursor() as qcur:
+            # 正常待激活形态：邮箱验证建号（无 allowance）+ pending 状态
+            qcur.execute(
+                "UPDATE users SET activation_state='pending_activation', "
+                "activation_source='invite_activation' WHERE user_id=%s",
+                (pending["user_id"],))
+            qcur.execute("DELETE FROM ai_spend_total_allowances "
+                         "WHERE subject_id=%s", (pending["user_id"],))
+            # 矛盾形态：pending 却已有 allowance 行（只报告不删补）
+            qcur.execute(
+                "UPDATE users SET activation_state='pending_activation' "
+                "WHERE user_id=%s", (conflict["user_id"],))
+        conn.commit()
+    finally:
+        conn.close()
+
+    def _allowance_count():
+        c2 = bh.connect()
+        try:
+            with c2.cursor() as qcur:
+                qcur.execute("SELECT count(*) AS n FROM "
+                             "ai_spend_total_allowances")
+                return qcur.fetchone()["n"]
+        finally:
+            c2.close()
+
+    c = _login(_client(), owner)
+    before = _allowance_count()
+    items = c.get("/api/admin/v1/users").get_json()["items"]
+    by_id = {u["user_id"]: u for u in items}
+
+    # 合法待激活：not_provisioned，摘除 missing error，不伪造金额
+    spend = by_id[pending["user_id"]]["spend"]
+    assert spend["status"] == "not_provisioned"
+    assert "error" not in spend
+    assert "total" not in spend
+    assert "window" not in spend
+    assert spend["spend_target"] == "total_allowance"  # 纯展示标注不变
+    # 列表项本身携带权威激活状态（UI 据此显示待激活标签）
+    assert by_id[pending["user_id"]]["activation_state"] == \
+        "pending_activation"
+
+    # 矛盾形态：unavailable + 稳定 error（数据原样保留供排查）
+    spend_c = by_id[conflict["user_id"]]["spend"]
+    assert spend_c["status"] == "unavailable"
+    assert spend_c["error"] == "activation_allowance_conflict"
+    assert spend_c["total"] is not None
+
+    # active 有行：available（usera 是建号即有行的正常用户）
+    assert by_id[usera["user_id"]]["spend"]["status"] == "available"
+
+    # 只读语义：重复 GET 不补建 allowance 行、不新增额度审计
+    assert _allowance_count() == before
+    again = c.get("/api/admin/v1/users").get_json()["items"]
+    assert {u["user_id"]: u for u in again}[pending["user_id"]][
+        "spend"]["status"] == "not_provisioned"
+    assert _allowance_count() == before
 
 def test_users_list_spend_display_single_track_locked():
     """R3 单轨形态锁定（取代四象限 target 驱动裁定）：user+有行 → 恒 total

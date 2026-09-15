@@ -1,6 +1,7 @@
 # 上传修复方案：CSRF 立即修复（P0）+ Upload V2 分片续传（P1）
 
 > 状态：已实施（U1–U4，2026-08-26）。本文件保留原方案正文。review 修订：每任务写租约串行化 pwrite+append、reservation fail-closed、no-clobber 提升不再 os.replace。
+> 2026-09-12 补充：后续 COS 前端直传选型见 [COS 直传上传审计方案](cos-direct-upload-audit-plan.md)，目前仅更新方案、未实施。本文 V1/V2 行为继续保留，新方案不复用 V2 的串行 offset 任务协议。
 > 关联：`docs/open-registration-security-remediation.md`（P0-A §3.3 资源防护，本方案的配额/水位/在途机制即源自该文档）、`docs/account-system-simplification-fix-plan.md`、`docs/ai-viewport-observation-annotation-fix-plan.md`。
 > 核实基线：2026-08-25 源码与测试审查。**未启动新的测试服务**，但引用了现有部署的只读证据（线上 access log、容器内文件哈希）。审查发现、glm-coder 全量核查与主代理独立核对三方一致；另经一轮设计 review 修订（见各节"review 修订"）。
 

@@ -5,8 +5,20 @@
   "use strict";
 
   // 中英双语：i18n.js 在本脚本之前加载，提供 window.HP_I18N.t
+  // Wave 3（普通图片兼容）：新增键放本文件兜底表（不改 i18n.js 既有行）；
+  // i18n.js 未来若收录同名键则优先走 i18n.js（与 app.js tt() 同策略）。
+  var _SHARE_I18N = {
+    "roi.no.scale.mm": {
+      zh: "普通图片无物理标尺，不支持毫米预设标记；查看与像素坐标不受影响",
+      en: "This image has no physical scale; millimeter preset marks are unavailable. Viewing and pixel coordinates still work",
+    },
+  };
   function t(key, vars) {
-    return window.HP_I18N ? window.HP_I18N.t(key, vars) : key;
+    var s = window.HP_I18N ? window.HP_I18N.t(key, vars) : key;
+    if (s !== key) return s;
+    var e = _SHARE_I18N[key];
+    var lang = (window.HP_I18N && window.HP_I18N.getLang) ? window.HP_I18N.getLang() : "zh";
+    return (e && (e[lang] || e.zh)) || key;
   }
 
   // ---------- token 与 API 前缀 ----------
@@ -114,6 +126,10 @@
     showAnno: true,      // 默认始终显示（用户需要看到管理员标记）
     focusAnno: null,     // null=显示全部；否则只显示该条标注（currentRois 中的引用）
     roiSizes: [6, 6.5],  // 本次分享允许的矩形标记尺寸（fetch config 后填充）
+    // Wave 3（普通图片兼容）：当前切片无物理标尺（mpp_source="missing"）时为
+    // true——毫米预设标记按钮禁用、滑块段禁用（服务端本就拒绝缺 MPP 的毫米
+    // 预设，前端不把用户引向必失败路径）；查看与像素标注（arrow/freehand）不受影响
+    noPhysicalScale: false,
     channelReopening: false, // 通道配色重开（同一切片换 TileSource，非新切片）
     channelCtrl: null,   // 多通道通道着色控制器（Batch 4，channel-controls.js 共用）
   };
@@ -329,14 +345,17 @@
       .then(function () { applyRoiSizeRestriction(); });
   }
 
-  // 根据允许尺寸禁用/启用 ROI 分段按钮；若当前 roiMode 被禁则退出 ROI
+  // 根据允许尺寸禁用/启用 ROI 分段按钮；若当前 roiMode 被禁则退出 ROI。
+  // Wave 3：noPhysicalScale（普通图片缺物理标尺）在此与 roi_sizes 白名单汇合
+  // ——两个闸任一不满足即禁用；提示文案区分「分享不允许该尺寸」与「无物理标尺」。
   function applyRoiSizeRestriction() {
     var allowed = {};
     state.roiSizes.forEach(function (s) { allowed[Number(s)] = true; });
     function setBtn(btn, sizeKey) {
-      var ok = !!allowed[sizeKey];
+      var ok = !!allowed[sizeKey] && !state.noPhysicalScale;
       btn.disabled = !ok;
-      btn.title = ok ? "" : t("share.size.disallowed");
+      btn.title = ok ? ""
+        : (state.noPhysicalScale ? t("roi.no.scale.mm") : t("share.size.disallowed"));
       btn.classList.toggle("disabled", !ok);
     }
     setBtn(els.roi6, 6);
@@ -344,7 +363,7 @@
     // 同步移动端滑块（disabled 段 + 拇指定位）
     syncRoiSlider();
     // 若当前 roiMode 被禁则退出 ROI 模式
-    if (state.roiMode != null && !allowed[state.roiMode]) {
+    if (state.roiMode != null && (!allowed[state.roiMode] || state.noPhysicalScale)) {
       exitRoi();
     }
   }
@@ -434,6 +453,9 @@
     els.currentSlide.title = info.name + (info.note ? " · " + info.note : "");
     updateMppSetterVisibility();
     exitRoi();
+    // Wave 3（普通图片兼容）：无物理标尺切片禁用毫米预设入口（提示文案按
+    // 「普通图片无物理标尺」方向，不引导去填 mpp——那不会改变服务端判定）
+    syncRoiScaleAvailability();
 
     // 高亮 chip
     var chips = els.slideChips.querySelectorAll(".chip");
@@ -467,15 +489,31 @@
   }
 
   // ---------- mpp 设置区显示控制 ----------
+  // Wave 3（普通图片兼容）：mpp_source="missing"（普通图片）不再显示 mpp 输入——
+  // 手动 mpp 只改前端状态，服务端仍按缺可信 MPP 拒绝毫米预设；展示这个输入会
+  // 暗示「填了就能标」，与实际能力不符（校准系统不在本期范围）。
+  // "estimated"（扫描切片估算 mpp）保持原有入口不变。
   function updateMppSetterVisibility() {
     if (!state.slide) { els.mppSetter.style.display = "none"; return; }
     var src = state.slide.mppSource;
-    if (src === "missing" || src === "estimated") {
+    if (src === "estimated") {
       els.mppSetter.style.display = "flex";
       els.mppInput.value = state.mppX != null ? state.mppX : "";
     } else {
       els.mppSetter.style.display = "none";
     }
+  }
+
+  // ---------- 无物理标尺（普通图片 mpp_source="missing"）毫米预设可用性 ----------
+  // Wave 3：无物理标尺时毫米预设入口整体下闸（服务端 _reject_preset_rect_mm
+  // 本就拒绝缺可信 MPP 的毫米预设，前端不把用户引向必失败路径）。尺寸白名单
+  // （roi_sizes）与标尺闸在 applyRoiSizeRestriction 汇合，避免互相覆盖。
+  function slideHasPhysicalScale() {
+    return !!(state.mppX && state.mppX > 0);
+  }
+  function syncRoiScaleAvailability() {
+    state.noPhysicalScale = !slideHasPhysicalScale();
+    applyRoiSizeRestriction();
   }
 
   // ---------- 缩放 / 旋转 / 复位 ----------
@@ -538,7 +576,13 @@
       return;
     }
     if (!state.mppX || state.mppX <= 0) {
-      toast(t("roi.need.mpp"), "error");
+      // Wave 3（普通图片兼容）：missing（普通图片）给准确说明，不再提示
+      // 「请先在工具栏设置 mpp」——分享端手动 mpp 不持久化，服务端仍会拒绝
+      if (state.slide.mppSource === "missing") {
+        toast(t("roi.no.scale.mm"), "info");
+      } else {
+        toast(t("roi.need.mpp"), "error");
+      }
       return;
     }
     if (state.slide.mppSource === "estimated") {
@@ -621,7 +665,8 @@
     var activeIdx = -1;
     segs.forEach(function (seg, i) {
       var sz = Number(seg.getAttribute("data-size"));
-      var ok = !!allowed[sz];
+      // Wave 3：无物理标尺（普通图片）时段一并禁用（thumb 跳过）
+      var ok = !!allowed[sz] && !state.noPhysicalScale;
       seg.classList.toggle("disabled", !ok);
       seg.disabled = !ok;
       var on = state.roiMode === sz;
@@ -2261,5 +2306,10 @@
     saveAnnotation: saveAnnotation,
     commitEdit: commitEdit,
     deleteRoi: deleteRoi,
+    // Wave 3（普通图片兼容）：无物理标尺语义入口
+    toggleRoi: toggleRoi,
+    syncRoiScaleAvailability: syncRoiScaleAvailability,
+    slideHasPhysicalScale: slideHasPhysicalScale,
+    updateMppSetterVisibility: updateMppSetterVisibility,
   };
 })();

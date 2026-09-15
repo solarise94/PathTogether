@@ -65,6 +65,10 @@
     "roi.cancelled": { zh: "已取消未保存的选区", en: "Unsaved selection cancelled" },
     "roi.input.invalid": { zh: "矩形尺寸非法或超出图像范围，已保留上次的合法框",
                            en: "Invalid rectangle size or out of image bounds; kept the last valid box" },
+    // Wave 3（普通图片兼容）：无物理标尺语义（i18n.js 为主源；此处兜底，未改 i18n.js）
+    "roi.no.scale.hint": { zh: "该图片无物理标尺，仅支持像素（px）测量",
+                           en: "This image has no physical scale; only pixel (px) measurements are available" },
+    "slide.meta.no.scale": { zh: "无物理标尺", en: "no physical scale" },
     "edit.conflict": { zh: "该标注已被他人修改（当前 revision {rev}），已显示当前版本；请基于最新版本重新编辑",
                        en: "This annotation was modified by someone else (current revision {rev}); showing the current version — please re-edit on top of it" },
   };
@@ -571,6 +575,8 @@
     roiUnitSelect: $("roi-unit-select"),
     roiLockRatio: $("roi-lock-ratio"),
     roiPresetSelect: $("roi-preset-select"),
+    // Wave 3（普通图片兼容）：无物理标尺提示（模板内联元素；demo 模板无此块时为 null）
+    roiNoScaleHint: $("roi-no-scale-hint"),
     saveBtn: $("save-btn"),
     saveAnnoBtn: $("save-anno-btn"),
     annoBtn: $("anno-btn"),
@@ -1154,6 +1160,10 @@
         updateDocTitle(info.alias || info.name);
         updateMppSetterVisibility();
         exitRoi();
+        // Wave 3（普通图片兼容）：缺物理标尺（mpp_source="missing"）时单位区
+        // 直接落到 px 并禁用 mm/µm 预设——首次打开即可进行像素操作，不要求
+        // 先填写虚假标尺；显式 setMpp 后由 syncUnitAvailability 重新放开。
+        syncUnitAvailability();
         // 创建底图缩略图层：铺在瓦片 canvas 之前（下层），慢网下透出模糊预览
         // （src 由通道控制器 setThumbnail 或 legacy 路径填充）
         baseThumbEl = document.createElement("img");
@@ -1206,6 +1216,38 @@
       els.mppInput.value = state.mppX != null ? state.mppX : "";
     } else {
       els.mppSetter.style.display = "none";
+    }
+  }
+
+  // ---------- 无物理标尺（普通图片 mpp_source="missing"）单位区可用性 ----------
+  // Wave 3 产品语义（§4.4）：没有可信 MPP 时保留像素尺寸/像素标注/缩放百分比，
+  // 物理单位（mm/µm）操作禁用并明确提示，而不是要求先填一个虚假标尺。
+  // 显式手动校准（setMpp，前端态）后 mppX/mppY 有效，物理单位重新可用。
+  function slideHasPhysicalScale() {
+    return posNum(Number(state.mppX)) && posNum(Number(state.slide && state.slide.mppY));
+  }
+  function syncUnitAvailability() {
+    var hasPhys = !!state.slide && slideHasPhysicalScale();
+    if (els.roiUnitSelect) {
+      var opts = els.roiUnitSelect.options || [];
+      Array.prototype.forEach.call(opts, function (opt) {
+        if (opt && opt.value !== "px") opt.disabled = !hasPhys;
+      });
+      if (!hasPhys && state.roiUnit !== "px") {
+        // 普通图片首次打开：单位默认直接落到像素，不停在 mm 上报错
+        state.roiUnit = "px";
+        els.roiUnitSelect.value = "px";
+      }
+    }
+    if (els.roiPresetSelect) {
+      // mm 预设（6/6.5）属于物理单位操作，一并禁用
+      els.roiPresetSelect.disabled = !hasPhys;
+    }
+    if (els.roiNoScaleHint) {
+      els.roiNoScaleHint.hidden = hasPhys || !state.slide;
+      if (!els.roiNoScaleHint.hidden) {
+        els.roiNoScaleHint.textContent = tt("roi.no.scale.hint");
+      }
     }
   }
 
@@ -1827,6 +1869,8 @@
     // 只更新物理显示——refresh 显示层即可。
     updateRoiOverlay();
     updateMppSetterVisibility();
+    // Wave 3：显式手动校准后（前端态，非持久化），物理单位重新可用
+    syncUnitAvailability();
     toast(t("mpp.set.ok", { v: v }), "success");
   }
 
@@ -1882,7 +1926,9 @@
       var mpp = Math.round(s.mpp_x * 1000) / 1000;
       parts.push("mpp " + mpp + (s.mpp_source === "estimated" ? "*" : ""));
     } else {
-      parts.push(t("slide.mpp.missing"));
+      // Wave 3（普通图片兼容）：产品语义说「无物理标尺」，不说「mpp 缺失」
+      // （缺 mpp ≠ 数据缺陷；普通图片本就不携带物理标尺）
+      parts.push(tt("slide.meta.no.scale"));
     }
     return parts.join(" · ");
   }
@@ -5256,16 +5302,57 @@
   }
 
   // ---------- 格式目录（GET /api/slide-formats，打开抽屉时拉一次） ----------
+  // Wave 3（普通图片兼容）：目录是格式词表的唯一权威（§3），raster-image 行
+  // 与后端 slide_format_registry._CATALOG_DISPLAY 同文；一致性由
+  // tests/js/raster-image-compat.test.ts 对后端源码做契约校验，防漂移。
   var FORMAT_CATALOG_FALLBACK = [
     { display_name: "SVS / TIFF / BigTIFF / OME-TIFF / NDPI / VMS / VMU / SCN / BIF / SVSlide",
       extensions: [".svs", ".tif", ".tiff", ".ome.tif", ".ome.tiff", ".ndpi", ".vms", ".vmu", ".scn", ".bif", ".svslide"],
       import_mode: "direct", limits: [] },
+    { id: "raster-image", display_name: "普通图片（BMP / JPEG）",
+      extensions: [".bmp", ".jpg", ".jpeg"], import_mode: "direct",
+      limits: ["普通图片、支持像素坐标、无物理标尺"] },
     { display_name: "KFB / KFBF", extensions: [".kfb", ".kfbf"],
       import_mode: "convert",
       limits: ["KFB 上传后后台转换为 BigTIFF（明场）；KFBF 转换为多通道 OME-TIFF（荧光）"] },
     { display_name: "MRXS", extensions: [".mrxs"], import_mode: "bundle",
       limits: ["需要完整包（主文件 + 同名伴随目录），请打包 zip 上传"] },
   ];
+
+  // 文件选择器 accept 的静态 fallback：= acceptFromCatalog(FORMAT_CATALOG_FALLBACK)
+  // 的展开结果（单一权威链：后端目录 → fallback 目录 → accept → 模板属性）。
+  // 契约（两处断言）由 raster-image-compat.test.ts 锁定；接口可用时该串会被
+  // 同一函数对线上目录的派生结果覆盖。
+  var FILE_INPUT_ACCEPT_FALLBACK = ".svs,.tif,.tiff,.ome.tif,.ome.tiff,.ndpi,.vms,.vmu,.scn,.bif,.svslide,.bmp,.jpg,.jpeg,.kfb,.kfbf,.mrxs,.zip";
+
+  // 由格式目录派生文件选择器 accept（Wave 3）：
+  //   - 只取 selectable_for_upload !== false 的条目扩展名（小写、去重、保序）；
+  //   - .zip 恒定保留：它是 MRXS 完整包的运输容器，不属于任何目录条目扩展名；
+  //   - 目录为空/形态异常时返回 null（调用方保留静态 fallback，不缩窄能力）。
+  function acceptFromCatalog(items) {
+    if (!Array.isArray(items) || items.length === 0) return null;
+    var seen = {};
+    var parts = [];
+    items.forEach(function (f) {
+      if (!f || f.selectable_for_upload === false) return;
+      (f.extensions || []).forEach(function (ext) {
+        var e = String(ext || "").trim().toLowerCase();
+        if (!e || e.charAt(0) !== "." || seen[e]) return;
+        seen[e] = true;
+        parts.push(e);
+      });
+    });
+    if (!parts.length) return null;
+    if (!seen[".zip"]) { seen[".zip"] = true; parts.push(".zip"); }
+    return parts.join(",");
+  }
+
+  // 目录拉取成功后把派生 accept 写回 #file-input（静态属性作为兜底先行存在）
+  function applyFileInputAccept(items) {
+    if (!els.fileInput) return;
+    var a = acceptFromCatalog(items);
+    if (a) els.fileInput.accept = a;
+  }
 
   function formatModeLabel(mode) {
     if (mode === "convert") return t("imp.formats.mode.convert");
@@ -5317,6 +5404,9 @@
       if (maxSample > 0) importDrawerState.maxSampleBytes = maxSample;
       importDrawerState.formatsLoaded = true;
       renderFormatCatalog(items);
+      // Wave 3：文件选择器 accept 由目录派生（selectable_for_upload 条目并集 +
+      // .zip），目录不可达时保持模板静态 fallback（含 .bmp/.jpg/.jpeg）
+      applyFileInputAccept(items);
       renderFrSampleMax();
     }).catch(function () {
       renderFormatCatalog(FORMAT_CATALOG_FALLBACK);
@@ -7144,6 +7234,21 @@
         startImport: startBaiduImport,
         formatDecBytes: formatDecBytes,
       },
+      // Wave 3（普通图片兼容）测试入口：accept 派生/无物理标尺单位区/像素标注保存。
+      // 与 HP_UPLOAD 同约定：仅当测试预置 __PT_TEST_HOOKS 才挂载，生产不暴露。
+      formats: {
+        fallbackCatalog: FORMAT_CATALOG_FALLBACK,
+        acceptFallback: FILE_INPUT_ACCEPT_FALLBACK,
+        acceptFromCatalog: acceptFromCatalog,
+        applyFileInputAccept: applyFileInputAccept,
+      },
+      viewerState: state,
+      openSlide: openSlide,
+      slideHasPhysicalScale: slideHasPhysicalScale,
+      syncUnitAvailability: syncUnitAvailability,
+      setMpp: setMpp,
+      saveAnno: saveAnno,
+      slideMetaTags: slideMetaTags,
     };
   }
 

@@ -56,7 +56,10 @@ def drain_once(worker_id="baidu-worker"):
         claim = store.claim_batch(worker_id)
         if claim is None:
             break
-        store.run_batch(claim["batch"]["id"], adapter, worker_id=worker_id)
+        # claim 已置 running 并持有新鲜租约：直接执行已领取的批次，
+        # 不按 id 二次领取（run_batch 只接受 queued/租约过期 → None，
+        # 批次会永远停在 running）
+        store.run_claimed_batch(claim, adapter, worker_id=worker_id)
         n_batch += 1
     return n_enum, n_batch
 

@@ -13,6 +13,7 @@ B10：清理只针对本批路径；越界路径拒绝；清理失败不回滚 r
 集成层注入 hooks，见 baidu_import_store 模块 docstring 的简化声明）。
 """
 import os
+from pathlib import Path
 
 import psycopg
 import pytest
@@ -20,6 +21,7 @@ import pytest
 import baidu_import_http as http
 import baidu_import_store as store
 import kfb.converter as kfb_converter
+import kfb.converter_fl as kfbf_converter
 from _baidu_helpers import (expire_batch_lease, install_fake,
                             make_ready_enumeration)
 from _tiff_fixtures import make_tiff_bytes
@@ -40,6 +42,7 @@ def _env(monkeypatch, tmp_path):
     up.mkdir()
     monkeypatch.setenv("UPLOAD_DIR", str(up))
     monkeypatch.setattr(kfb_converter, "DEFAULT_MIN_FREE_BYTES", 0)
+    monkeypatch.setattr(kfbf_converter, "DEFAULT_MIN_FREE_BYTES", 0)
 
 
 def _sql(fn):
@@ -56,8 +59,9 @@ def _item_rows(batch_id):
         cur.execute(
             "SELECT id, name, stage, error_code, transfer_task_id, "
             "staging_path, source_sha256, ingest_token, attempt, "
-            "cleanup_state FROM baidu_import_items WHERE batch_id=%s "
-            "ORDER BY name", (batch_id,))
+            "cleanup_state, conversion_job_id, slide_name, "
+            "project_associate_state FROM baidu_import_items "
+            "WHERE batch_id=%s ORDER BY name", (batch_id,))
         cols = [d.name for d in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
     return _sql(q)
@@ -343,3 +347,367 @@ def test_b10_flags_disabled_503_existing_rows_visible(monkeypatch, tmp_path):
         OWNER, enum_id, [by_path["a.tif"]["id"]], idempotency_key="k4")
     view2 = store.run_batch(batch["id"], fake, staging_root=tmp_path)
     assert view2["state"] == "succeeded"
+
+
+# --------------------------------------------------------------------------- #
+# 回归：worker 双重领取 / 入库-凭证间隙崩溃 / 运行中取消
+# --------------------------------------------------------------------------- #
+
+def _load_worker_module():
+    """importlib 加载 scripts/baidu_import_worker.py（scripts 非包）。"""
+    import importlib.util
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, "scripts", "baidu_import_worker.py")
+    spec = importlib.util.spec_from_file_location(
+        "baidu_import_worker_under_test", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _slides_count():
+    conn = psycopg.connect(os.environ["DATABASE_URL"])
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM slides")
+            return int(cur.fetchone()[0])
+    finally:
+        conn.close()
+
+
+def _upload_names():
+    return sorted(p.name for p in Path(os.environ["UPLOAD_DIR"]).iterdir())
+
+
+def test_worker_drain_once_reaches_terminal_state(monkeypatch, tmp_path):
+    # P1：claim_batch 已置 running 并持有新鲜租约；若随后 run_batch 按
+    # id 二次领取（只接受 queued/租约过期）→ None，批次永远卡 running。
+    fake, batch = _make_batch(monkeypatch, ["/a.tif"], tmp_path,
+                              idempotency_key="w1")
+    import baidu_adapter
+    monkeypatch.setattr(baidu_adapter, "get_adapter", lambda: fake)
+    monkeypatch.setattr(store, "STAGING_ROOT", str(tmp_path / "staging"))
+    worker = _load_worker_module()
+    n_enum, n_batch = worker.drain_once(worker_id="w-worker")
+    assert (n_enum, n_batch) == (0, 1)
+    view = store.get_import(batch["id"], OWNER)
+    assert view["state"] == "succeeded"  # 一轮 drain 即达终态
+    assert [i["stage"] for i in view["items"]] == ["ready"]
+    c = fake.counters()
+    assert (c["transfer"], c["download"]) == (1, 1)  # 各只一次
+
+
+def test_crash_between_ingest_and_token_recovers_native(
+        monkeypatch, tmp_path):
+    # P1：ingest_staging 完成后、ingest_token 落库前崩溃 → 条目停在
+    # ingesting 且无凭证；恢复时按标识对账直接收口，不重跑入库
+    # （重跑会 name_unavailable，把已成功任务打成 failed）。
+    import baidu_ingest
+    fake, batch = _make_batch(monkeypatch, ["/a.tif"], tmp_path,
+                              idempotency_key="w3")
+    real_ingest = baidu_ingest.ingest_staging
+
+    def crash_after_ingest(**kw):
+        real_ingest(**kw)  # 产物落盘 + 归属登记已完成
+        raise Crash("token 未落库即进程死亡")
+
+    monkeypatch.setattr(baidu_ingest, "ingest_staging", crash_after_ingest)
+    with pytest.raises(Crash):
+        store.run_batch(batch["id"], fake, staging_root=tmp_path)
+    row = _item_rows(batch["id"])[0]
+    assert row["stage"] == "ingesting" and not row["ingest_token"]
+    expire_batch_lease(batch["id"])
+    view = store.run_batch(batch["id"], fake, staging_root=tmp_path)
+    assert view["state"] == "succeeded"
+    row = _item_rows(batch["id"])[0]
+    assert row["stage"] == "ready"
+    assert row["ingest_token"] == "slide:a.tif"
+    # 无重复产物：uploads 单文件、slides 元数据单条、外部调用不重放
+    assert _upload_names() == ["a.tif"]
+    assert _slides_count() == 1
+    c = fake.counters()
+    assert (c["transfer"], c["download"]) == (1, 1)
+
+
+def test_crash_between_ingest_and_token_recovers_convert_kfbf(
+        monkeypatch, tmp_path):
+    # P1 convert 路径：conversion job 已 ready 但 token 未落库 → 恢复时
+    # 按 canonical 名对账（owner/sha/state）直接按成功路径落库。
+    import baidu_ingest
+    from kfb.fixture_fl import build_synthetic_kfbf
+    payload = build_synthetic_kfbf(tmp_path / "src.kfbf").read_bytes()
+    entries = [{"path": "/fl.kfbf", "size": len(payload),
+                "content": payload}]
+    fake, batch = _make_batch(monkeypatch, ["/fl.kfbf"], tmp_path,
+                              entries=entries, idempotency_key="w3f")
+    real_ingest = baidu_ingest.ingest_staging
+
+    def crash_after_ingest(**kw):
+        real_ingest(**kw)
+        raise Crash("token 未落库即进程死亡")
+
+    monkeypatch.setattr(baidu_ingest, "ingest_staging", crash_after_ingest)
+    with pytest.raises(Crash):
+        store.run_batch(batch["id"], fake, staging_root=tmp_path)
+    row = _item_rows(batch["id"])[0]
+    assert row["stage"] == "converting" and not row["ingest_token"]
+    expire_batch_lease(batch["id"])
+    view = store.run_batch(batch["id"], fake, staging_root=tmp_path)
+    assert view["state"] == "succeeded"
+    row = _item_rows(batch["id"])[0]
+    assert row["stage"] == "ready"
+    assert row["ingest_token"] and row["ingest_token"].startswith("cvj:")
+    assert row["slide_name"] == "fl.ome.tif"
+    # 无重复产物：canonical 产物仅一个（.manifest.json/.associated 是
+    # 转换 sidecar，不算重复），conversion job 仅一条
+    names = _upload_names()
+    assert "fl.kfbf" in names and "fl.ome.tif" in names
+    assert [n for n in names if n.endswith(".ome.tif")] == ["fl.ome.tif"]
+    conn = psycopg.connect(os.environ["DATABASE_URL"])
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM conversion_jobs")
+            assert int(cur.fetchone()[0]) == 1
+    finally:
+        conn.close()
+
+
+def test_running_cancel_stops_remaining_items(monkeypatch, tmp_path):
+    # P2：循环内不重读 cancel_requested → 第一项 ready 后的取消请求
+    # 拦不住第二项的转存/下载/入库。
+    fake, batch = _make_batch(monkeypatch, ["/a.tif", "/b.tif"], tmp_path,
+                              entries=ENTRIES, idempotency_key="w4")
+
+    def cancel_after_first(item):
+        store.request_cancel(batch["id"], OWNER)
+
+    view = store.run_batch(batch["id"], fake, staging_root=tmp_path,
+                           hooks={"on_ingested": cancel_after_first})
+    assert view["state"] == "partial_failed"  # 有 ready 产物，不整批失败
+    stages = sorted(i["stage"] for i in view["items"])
+    assert stages == ["cancelled", "ready"]  # 第二项被取消，不再推进
+    c = fake.counters()
+    assert (c["transfer"], c["download"]) == (1, 1)  # 第二项未转存/下载
+    ready_name = [i["name"] for i in view["items"]
+                  if i["stage"] == "ready"][0]
+    assert _upload_names() == [ready_name]  # 第二项未入库
+
+
+def test_reconcile_never_claims_same_name_different_content(
+        monkeypatch, tmp_path):
+    # 对账只认内容一致的同名产物：owner 既有同名（内容不同）上传时，
+    # 对账不得把它认领为本批 ready（首轮入库前也会先过对账），
+    # 必须照旧 name_unavailable → failed，既有文件内容原样保留。
+    import share_store
+    victim = make_tiff_bytes(h=32, w=48)  # 与 ENTRIES 的 a.tif 内容不同
+    (Path(os.environ["UPLOAD_DIR"]) / "a.tif").write_bytes(victim)
+    share_store.set_slide_meta("a.tif", owner_user_id=OWNER,
+                               requester_role="user")
+    fake, batch = _make_batch(monkeypatch, ["/a.tif"], tmp_path,
+                              idempotency_key="w5")
+    view = store.run_batch(batch["id"], fake, staging_root=tmp_path)
+    row = _item_rows(batch["id"])[0]
+    assert row["stage"] == "failed"
+    assert row["error_code"] == "name_unavailable"
+    assert not row["ingest_token"]
+    assert (Path(os.environ["UPLOAD_DIR"]) / "a.tif").read_bytes() == victim
+    assert _upload_names() == ["a.tif"]
+    assert _slides_count() == 1
+
+
+# --------------------------------------------------------------------------- #
+# P1 回归：批次租约 fencing（旧 owner 写回/收口被拒）+ 心跳续期
+# --------------------------------------------------------------------------- #
+
+def test_heartbeat_batch_requires_matching_token(monkeypatch, tmp_path):
+    # heartbeat_batch 对齐 heartbeat_enumeration，但额外匹配 lease_token：
+    # 只有仍持有本次 claim 租约的 (worker, token) 能续期；批次被重领后
+    # 旧 token 心跳恒 False（调用方据此安静放弃）。
+    fake, batch = _make_batch(monkeypatch, ["/a.tif"], tmp_path,
+                              idempotency_key="f0")
+    claim = store.claim_batch(worker_id="w-a")
+    assert claim is not None and claim["batch"]["id"] == batch["id"]
+    token = claim["batch"]["lease_token"]
+    assert store.heartbeat_batch(batch["id"], "w-a", token) is True
+    assert store.heartbeat_batch(batch["id"], "w-a", "not-the-token") is False
+    assert store.heartbeat_batch(batch["id"], "w-other", token) is False
+    # 租约过期 → 他人重领（token 更新）→ 旧 token 心跳被拒、新 token 可续
+    expire_batch_lease(batch["id"])
+    claim2 = store.claim_batch(worker_id="w-b")
+    token2 = claim2["batch"]["lease_token"]
+    assert token2 != token
+    assert store.heartbeat_batch(batch["id"], "w-a", token) is False
+    assert store.heartbeat_batch(batch["id"], "w-b", token2) is True
+
+
+def test_stale_owner_writeback_and_finalize_fenced(monkeypatch, tmp_path):
+    # 旧 worker 在 on_downloaded 钩子内被新 worker 重领（token 更新），
+    # 心跳间隔大于租约（等效无心跳）：旧 worker 后续条目写回被 fence
+    # 拒绝 → 安静放弃：不推进条目、不 finalize、不清理副本、绝不覆盖
+    # 新 owner 的状态；新 owner 续跑凭对账凭证正常收口。
+    fake, batch = _make_batch(monkeypatch, ["/a.tif"], tmp_path,
+                              idempotency_key="f1")
+    steal = {}
+
+    def steal_lease(item):
+        expire_batch_lease(batch["id"])
+        claim2 = store.claim_batch(worker_id="w-new")
+        assert claim2 is not None and claim2["batch"]["id"] == batch["id"]
+        steal["owner"] = claim2["batch"]["lease_owner"]
+        steal["token"] = claim2["batch"]["lease_token"]
+
+    view = store.run_batch(
+        batch["id"], fake, staging_root=tmp_path,
+        lease_seconds=2, heartbeat_interval=3600,
+        hooks={"on_downloaded": steal_lease})
+    assert steal["owner"] == "w-new" and steal["token"]
+    # 旧 run 安静退出：返回当前视图——批次仍 running（未收口到终态）
+    assert view["state"] == "running"
+    assert view["items"][0]["stage"] == "validating"
+    # 旧 owner 未收口：无副本清理（delete=0）；条目未被推进到入库后状态
+    assert fake.counters()["delete"] == 0
+    assert sorted(fake.copies.get(batch["id"], {})) == ["a.tif"]
+    row = _item_rows(batch["id"])[0]
+    assert row["stage"] == "validating"
+    assert not row["ingest_token"]
+    # 丢租约前的合法写入（下载对账凭证）保留 → 新 owner 不重下载
+    assert row["source_sha256"] and row["staging_path"]
+    # 新 owner 续跑：正常收口；下载/清理各只发生一次
+    expire_batch_lease(batch["id"])
+    view2 = store.run_batch(batch["id"], fake, staging_root=tmp_path,
+                            worker_id="w-new2")
+    assert view2["state"] == "succeeded"
+    assert fake.counters()["download"] == 1
+    assert fake.counters()["delete"] == 1
+
+
+def test_heartbeat_keeps_lease_during_slow_download(monkeypatch, tmp_path):
+    # 小租约（2s）+ 快心跳（0.5s）+ 慢下载（3s）：租约靠续租始终未过期
+    # ——原租约到点后（2.5s 时）另一 worker 领不走，批次单 owner 完成。
+    import threading
+    import time
+
+    fake, batch = _make_batch(monkeypatch, ["/a.tif"], tmp_path,
+                              idempotency_key="f2")
+    real_download = fake.download_to
+
+    def slow_download(remote_path, dest_path):
+        time.sleep(3.0)  # 下载（3s）远超租约（2s）
+        return real_download(remote_path, dest_path)
+
+    monkeypatch.setattr(fake, "download_to", slow_download)
+    steal = {"got_batch": None}
+
+    def try_steal():
+        time.sleep(2.5)  # 原租约已到点、下载未完 → 只能靠心跳续租保住
+        c = store.claim_batch(worker_id="w-thief")
+        steal["got_batch"] = bool(c and c["batch"]["id"] == batch["id"])
+
+    thief = threading.Thread(target=try_steal, daemon=True)
+    thief.start()
+    view = store.run_batch(batch["id"], fake, staging_root=tmp_path,
+                           lease_seconds=2, heartbeat_interval=0.5)
+    thief.join(timeout=10)
+    assert steal["got_batch"] is False  # 心跳续租 → 抢不走
+    assert view["state"] == "succeeded"
+    assert fake.counters()["download"] == 1
+
+
+def test_long_download_survives_short_lease_with_heartbeat(
+        monkeypatch, tmp_path):
+    # 长下载不丢批：多条目、每条下载都慢于租约，另一线程周期性抢领；
+    # 心跳开着 → 租约始终在本 worker 手里，单 worker 正常跑到 succeeded。
+    import threading
+    import time
+
+    fake, batch = _make_batch(monkeypatch, ["/a.tif", "/b.tif"], tmp_path,
+                              idempotency_key="f3")
+    real_download = fake.download_to
+
+    def slow_download(remote_path, dest_path):
+        time.sleep(1.2)  # 单条下载即超过租约（1s）
+        return real_download(remote_path, dest_path)
+
+    monkeypatch.setattr(fake, "download_to", slow_download)
+    steal = {"got_batch": 0}
+    done = threading.Event()
+
+    def _lease_owner():
+        def q(cur):
+            cur.execute(
+                "SELECT lease_owner FROM baidu_import_batches WHERE id=%s",
+                (batch["id"],))
+            row = cur.fetchone()
+            return row[0] if row else None
+        return _sql(q)
+
+    def try_steal_loop():
+        # 先等主 worker 领走（w-solo 持租约）：本用例只考察运行中的
+        # 租约保持，不与初始领取竞争（那是一次正常的单赢家竞争）
+        while not done.is_set() and _lease_owner() != "w-solo":
+            done.wait(0.05)
+        while not done.is_set():
+            c = store.claim_batch(worker_id="w-thief")
+            if c is not None and c["batch"]["id"] == batch["id"]:
+                steal["got_batch"] += 1
+            done.wait(0.3)
+
+    thief = threading.Thread(target=try_steal_loop, daemon=True)
+    thief.start()
+    try:
+        view = store.run_batch(batch["id"], fake, staging_root=tmp_path,
+                               lease_seconds=1, heartbeat_interval=0.3,
+                               worker_id="w-solo")
+    finally:
+        done.set()
+        thief.join(timeout=10)
+    assert steal["got_batch"] == 0  # 全程无人抢走
+    assert view["state"] == "succeeded"
+    assert sorted(i["stage"] for i in view["items"]) == ["ready", "ready"]
+    assert fake.counters()["download"] == 2
+
+
+def test_stale_owner_cancel_fenced(monkeypatch, tmp_path):
+    # 旧 worker 丢租约后触发取消收口：批次 terminal 落库被 fence 拒绝
+    # → 不取消条目、不释放预占（新 owner 会看到 cancel_requested 并
+    # 自行按取消语义收口）。
+    released = []
+    monkeypatch.setattr(store, "_release_reservation",
+                        lambda rid: released.append(rid))
+
+    def hook(user_id, nbytes):
+        return "upr_fence_cancel"
+
+    fake, batch = _make_batch(monkeypatch, ["/a.tif", "/b.tif"], tmp_path,
+                              entries=ENTRIES, quota_hook=hook,
+                              idempotency_key="f4")
+    steal = {}
+
+    def steal_and_cancel(item):
+        expire_batch_lease(batch["id"])
+        claim2 = store.claim_batch(worker_id="w-new")
+        assert claim2 is not None and claim2["batch"]["id"] == batch["id"]
+        steal["token"] = claim2["batch"]["lease_token"]
+        store.request_cancel(batch["id"], OWNER)
+
+    view = store.run_batch(
+        batch["id"], fake, staging_root=tmp_path,
+        lease_seconds=2, heartbeat_interval=3600,
+        hooks={"on_transfer_persisted": steal_and_cancel})
+    assert steal["token"]
+    # 旧 owner 的取消收口被 fence 拒绝：预占未释放、条目未被取消、
+    # 批次仍 running；且旧 owner 在丢租约后未再推进条目（a 停在
+    # transferring，未下载）
+    assert released == []
+    assert view["state"] == "running"
+    assert sorted(i["stage"] for i in view["items"]) == \
+        ["queued", "transferring"]
+    assert fake.counters()["download"] == 0
+    # 新 owner 续跑：真正按取消语义收口（无 ready 产物 → 释放预占）
+    expire_batch_lease(batch["id"])
+    view2 = store.run_batch(batch["id"], fake, staging_root=tmp_path,
+                            worker_id="w-new2")
+    assert view2["state"] == "cancelled"
+    assert sorted(i["stage"] for i in view2["items"]) == \
+        ["cancelled", "cancelled"]
+    assert released == ["upr_fence_cancel"]

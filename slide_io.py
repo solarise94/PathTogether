@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """切片 I/O 抽象层。
 
-提供 ``open_slide(path, *, format_hint=None)`` 工厂：优先用 OpenSlide 打开厂商格式
+提供 ``open_slide(path, *, format_hint=None)`` 工厂：普通图片族
+（.bmp/.jpg/.jpeg，见 ``_RASTER_LOGICAL_EXTS``）只走 ``RasterSlide``
+（Pillow 全量解码，raster_slide.py）；其余优先用 OpenSlide 打开厂商格式
 （SVS/NDPI/MRXS 等）；失败且为 TIFF 类（含 OME-TIFF）时回退到
 ``TiffFileSlide``（基于 tifffile + zarr<3 实现 OpenSlide API 子集）。
 
-两者都 duck-type 出 DeepZoomGenerator 需要的接口：
+三者在各自支持的范围外 duck-type 出 DeepZoomGenerator 需要的接口：
 ``properties``（dict）、``dimensions``、``level_dimensions``、
 ``level_downsamples``、``get_best_level_for_downsample(d)``、
 ``read_region((x,y), level, (w,h))``，外加 ``get_thumbnail``、``close``。
@@ -47,12 +49,26 @@ from PIL import Image
 LOGICAL_EXTS = (
     ".ome.tiff", ".ome.tif",
     ".svslide",
-    ".tiff", ".ndpi", ".mrxs",
-    ".svs", ".vms", ".vmu", ".scn", ".bif", ".tif",
+    ".tiff", ".jpeg", ".ndpi", ".mrxs",
+    ".svs", ".vms", ".vmu", ".scn", ".bif", ".bmp", ".jpg", ".tif",
 )
 
 #: 其中的 TIFF 类（走 OME 优先 / TiffFileSlide fallback 的子集）
 _TIFF_LOGICAL_EXTS = frozenset((".ome.tiff", ".ome.tif", ".tiff", ".tif"))
+
+#: 普通图片族（BMP/JPEG；走 raster_slide.RasterSlide 分支的子集）。
+#: ``.jpg`` 与 ``.jpeg`` 是同一解码格式的别名；真实字节格式由
+#: raster_slide.RasterSlide 按后缀白名单再校验（伪装字节不放行）。
+_RASTER_LOGICAL_EXTS = frozenset((".bmp", ".jpg", ".jpeg"))
+
+
+def is_raster_ext(name) -> bool:
+    """判断逻辑文件名是否为普通图片族后缀（.bmp/.jpg/.jpeg，大小写不敏感）。
+
+    纯**字符串级**判定（不触碰文件系统/字节），供缓存层等后续消费方识别
+    普通图片实例；签名钉死：``is_raster_ext(name) -> bool``。
+    """
+    return logical_format_ext(name) in _RASTER_LOGICAL_EXTS
 
 #: SlideValidationError.code 的固定词表
 VALID_SLIDE_ERROR_CODES = frozenset((
@@ -200,15 +216,19 @@ def _is_ome_tiff(path) -> bool:
 
 
 def open_slide(path, *, format_hint=None):
-    """工厂函数：打开切片，返回 OpenSlide 或 TiffFileSlide。
+    """工厂函数：打开切片，返回 OpenSlide、TiffFileSlide 或 RasterSlide。
 
-    策略（TIFF 类文件，含 .ome.tif/.ome.tiff）：
-    1. OME-TIFF 优先走 TiffFileSlide——OpenSlide 的 generic-tiff 驱动
+    策略：
+    0. 普通图片族（.bmp/.jpg/.jpeg）只走 raster 分支（RasterSlide，
+       lazy import；真实字节格式由其按后缀白名单校验，伪装/截断/超限/
+       多帧均有稳定码）。
+    1. TIFF 类文件（含 .ome.tif/.ome.tiff）：
+       OME-TIFF 优先走 TiffFileSlide——OpenSlide 的 generic-tiff 驱动
        虽然能打开 OME-TIFF，但只认 level 0（不识别 SubIFD 金字塔），
        且不解析 OME-XML 的 PhysicalSize（mpp 丢失）；
-    2. 其余 TIFF 先试 openslide.OpenSlide（lazy import，使无 openslide
+       其余 TIFF 先试 openslide.OpenSlide（lazy import，使无 openslide
        库的机器也能单独使用 TiffFileSlide），失败回退 TiffFileSlide；
-    3. OME-TIFF 若 TiffFileSlide 失败（异形 axes 等），回退 OpenSlide 保底。
+       OME-TIFF 若 TiffFileSlide 失败（异形 axes 等），回退 OpenSlide 保底。
 
     上传修复 A0：
     - **实际字节永远从 ``path`` 读取**；``format_hint`` 只参与逻辑格式判定
@@ -230,6 +250,23 @@ def open_slide(path, *, format_hint=None):
             "invalid_slide", "切片路径是目录", cause_type="IsADirectoryError")
 
     verdicts = []  # [(kind, exc)]：每次失败尝试的分类信号
+
+    # 普通图片族（BMP/JPEG）：**只走** raster 分支（Pillow 全量解码），
+    # 不落入 openslide.OpenSlide/TiffFile 尝试。RasterSlide 自身抛稳定码
+    # （格式不符/多帧/超限 → invalid_slide；解码/截断/IO →
+    # slide_open_failed），此处仅把未知异常收敛为 slide_open_failed。
+    if ext in _RASTER_LOGICAL_EXTS:
+        import raster_slide  # lazy import：缺 Pillow 不影响其它格式路径
+
+        try:
+            return raster_slide.RasterSlide(
+                path, expected_format=raster_slide.EXT_FORMATS[ext])
+        except SlideValidationError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise SlideValidationError(
+                "slide_open_failed", "切片打开失败（slide_open_failed）",
+                cause_type=type(e).__name__) from e
 
     if ext in _TIFF_LOGICAL_EXTS and _is_ome_tiff(str(path)):
         try:

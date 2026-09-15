@@ -225,6 +225,7 @@ DERIVATIVE_JPEG_QUALITY = 85
 # 支持的病理图像扩展名
 SUPPORTED_EXTS = {
     "svs", "tif", "tiff", "ndpi", "mrxs", "vms", "vmu", "scn", "bif", "svslide",
+    "bmp", "jpg", "jpeg",
 }
 # 归档扩展名：zip 上传后解压（用于 MRXS 等需要伴侣数据目录的格式）
 ARCHIVE_EXTS = {"zip"}
@@ -1858,9 +1859,24 @@ def _read_metadata(osr: OpenSlide, path: Path) -> dict:
     2. TIFF 标准分辨率标签 XResolution + ResolutionUnit
     3. 按扫描倍率估算 mpp = 10 / objective-power（标记为 estimated）
     4. 缺失（missing）
+
+    普通图片（BMP/JPEG，``osr.is_raster_image``）：读取器 properties 无任何
+    mpp/objective 键，且文件 DPI/EXIF 分辨率**不得**当作组织的 µm/px
+    （raster-image-compat 任务书 §4.4）——恒输出 ``mpp_x/mpp_y/objective =
+    null``、``mpp_source = "missing"``，不落入下面的 TIFF 分辨率/倍率估算
+    路径；``width/height`` 为 EXIF 方向校正后的像素尺寸。
     """
     width, height = osr.dimensions
     props = osr.properties
+    if getattr(osr, "is_raster_image", False):
+        return {
+            "width": width,
+            "height": height,
+            "mpp_x": None,
+            "mpp_y": None,
+            "objective": None,
+            "mpp_source": "missing",
+        }
     objective_f = _to_float(props.get("openslide.objective-power"))
 
     mpp_x_f = _to_float(props.get("openslide.mpp-x"))

@@ -77,6 +77,7 @@ def _slide_cache_reset():
     """清空模块级缓存（跨用例隔离；与现有测试清理 _info_cache 的做法一致）。"""
     with slide_cache._cache_lock:
         slide_cache._slide_cache.clear()
+        slide_cache._raster_lru.clear()
     with slide_cache._info_cache_lock:
         slide_cache._info_cache.clear()
 
@@ -508,6 +509,188 @@ def test_cross_process_replacement_switches_generation(tmp_path):
     assert m1 == "v1"
     assert m2.startswith("v2"), "子进程仍读到旧代内容：%r" % (m2,)
     assert g2 > g1, "子进程未换代：gen %s -> %s" % (g1, g2)
+
+
+# --------------------------------------------------------------------------- #
+# 8) 普通图片（BMP/JPEG）：单解码句柄 + 有界缓存（raster-image §4.6）
+#    （假句柄工厂照旧；raster 由路径后缀 is_raster_ext 识别）
+# --------------------------------------------------------------------------- #
+def test_raster_entry_pool_capacity_is_one(slide_file, fake_pairs):
+    """普通图片 entry：信号量容量 1；非普通图片保持 SLIDE_HANDLE_POOL 不变。"""
+    entry = slide_cache.get_slide("demo.svs", slide_file)
+    assert entry["raster"] is False
+    got = 0
+    while entry["sem"].acquire(blocking=False):
+        got += 1
+    assert got == slide_cache.SLIDE_HANDLE_POOL
+    for _ in range(got):
+        entry["sem"].release()
+
+    raster_path = slide_file.with_name("photo.bmp")
+    raster_path.write_text("v1", encoding="utf-8")
+    rentry = slide_cache.get_slide("photo.bmp", raster_path)
+    assert rentry["raster"] is True
+    assert rentry["sem"].acquire(blocking=False) is True
+    # 第二个并发借用必须排队（每张图片每进程最多一个解码句柄）
+    assert rentry["sem"].acquire(blocking=False) is False
+    rentry["sem"].release()
+
+
+def test_raster_concurrent_borrow_creates_at_most_one_handle(
+        tmp_path, fake_pairs):
+    """并发 borrow 同一张普通图片：created_handles 最多 1（串行排队复用）。"""
+    p = tmp_path / "photo.bmp"
+    p.write_text("v1", encoding="utf-8")
+    entry = slide_cache.get_slide("photo.bmp", p)
+    barrier = threading.Barrier(8)
+    errors = []
+
+    def _borrower():
+        try:
+            barrier.wait(5)
+            for _ in range(6):
+                with slide_cache.borrow_pair(entry) as pair:
+                    assert pair["osr"].marker == "v1"
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=_borrower) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert errors == [], errors
+    assert entry["created_handles"] == 1, (
+        "普通图片并发借用不得创建第二个解码句柄")
+
+
+@pytest.mark.parametrize("how", sorted(REPLACERS))
+def test_raster_replacement_switches_generation(tmp_path, fake_pairs, how):
+    """同名替换三类形态对 raster entry 换代语义与 svs 完全一致。"""
+    p = tmp_path / "photo.bmp"
+    p.write_text("v1", encoding="utf-8")
+    entry = slide_cache.get_slide("photo.bmp", p)
+    with slide_cache.borrow_pair(entry) as p1:
+        gen1 = p1["gen"]
+    REPLACERS[how](p, "v2")
+    with slide_cache.borrow_pair(entry) as p2:
+        assert p2["osr"].marker == "v2"
+        assert p2["gen"] == gen1 + 1
+    assert "v1" in fake_pairs, "旧代空闲句柄应立即关闭"
+
+
+def test_raster_eviction_spares_inflight_pair(tmp_path, fake_pairs, monkeypatch):
+    """LRU 淘汰超预算条目：借出中（活跃）句柄不被强关，归还时按代差关闭。"""
+    monkeypatch.setattr(slide_cache, "RASTER_CACHE_MAX_ENTRIES", 1)
+    p0 = tmp_path / "a0.bmp"
+    p0.write_text("v1", encoding="utf-8")
+    e0 = slide_cache.get_slide("a0.bmp", p0)
+    with slide_cache.borrow_pair(e0) as held:
+        p1 = tmp_path / "a1.bmp"
+        p1.write_text("v2", encoding="utf-8")
+        slide_cache.get_slide("a1.bmp", p1)  # 超预算 → e0 被 LRU 淘汰
+        assert "a0.bmp" not in slide_cache._slide_cache
+        assert "a0.bmp" not in slide_cache._raster_lru
+        assert not held["osr"].closed, "活跃（借出中）条目不得被强关"
+        assert held["osr"].marker == "v1"  # 在途读取可一致完成
+    assert held["osr"].closed, "归还时按代差（retired）关闭在途旧句柄"
+
+
+def test_raster_lru_eviction_closes_idle_and_clears_info(
+        tmp_path, fake_pairs, monkeypatch):
+    """超预算后最久未用条目被关闭释放；info 缓存一并清理；LRU 按 recency。"""
+    monkeypatch.setattr(slide_cache, "RASTER_CACHE_MAX_ENTRIES", 2)
+    paths = {}
+    entries = {}
+    for i in range(2):
+        p = tmp_path / ("img%d.bmp" % i)
+        p.write_text("m%d" % i, encoding="utf-8")
+        paths[i] = p
+        entries[i] = slide_cache.get_slide("img%d.bmp" % i, p)
+        with slide_cache.borrow_pair(entries[i]):
+            pass  # 各留一个空闲句柄在池内
+        slide_cache.cached_read_metadata(
+            "img%d.bmp" % i, p, lambda i=i: {"marker": "m%d" % i})
+    assert "img0.bmp" in slide_cache._info_cache
+
+    # recency：再次访问 img0（最久未用）→ 淘汰对象变为 img1
+    slide_cache.get_slide("img0.bmp", paths[0])
+    p2 = tmp_path / "img2.bmp"
+    p2.write_text("m2", encoding="utf-8")
+    slide_cache.get_slide("img2.bmp", p2)
+
+    assert "img1.bmp" not in slide_cache._slide_cache, "最久未用条目应被淘汰"
+    assert "img0.bmp" in slide_cache._slide_cache, "刚访问过的条目不得被淘汰"
+    assert "img1.bmp" not in slide_cache._info_cache, "淘汰须清 info 缓存"
+    assert "img0.bmp" in slide_cache._info_cache
+    assert "m1" in fake_pairs, "被淘汰条目的空闲句柄必须关闭释放"
+    assert "m0" not in fake_pairs, "存活条目的句柄不得被关"
+
+
+def test_non_raster_entries_unaffected_by_raster_budget(
+        tmp_path, fake_pairs, monkeypatch):
+    """普通图片预算只管普通图片：svs 条目不进 LRU、不被淘汰、池内句柄不动。"""
+    monkeypatch.setattr(slide_cache, "RASTER_CACHE_MAX_ENTRIES", 1)
+    svs = tmp_path / "s.svs"
+    svs.write_text("v1", encoding="utf-8")
+    se = slide_cache.get_slide("s.svs", svs)
+    with slide_cache.borrow_pair(se):
+        pass
+    for i in range(3):
+        p = tmp_path / ("r%d.bmp" % i)
+        p.write_text("v%d" % i, encoding="utf-8")
+        slide_cache.get_slide("r%d.bmp" % i, p)
+    assert "s.svs" in slide_cache._slide_cache
+    assert not se["pool"].empty(), "非普通图片条目的池内句柄不得被 LRU 关闭"
+    assert len(slide_cache._raster_lru) == 1
+    assert list(slide_cache._raster_lru) == ["r2.bmp"]
+
+
+def test_raster_cache_max_env_override(monkeypatch):
+    """RASTER_CACHE_MAX_ENTRIES env 覆盖（非法/非正值回退默认）。"""
+    monkeypatch.setenv("RASTER_CACHE_MAX_ENTRIES", "7")
+    assert slide_cache._env_raster_cache_max() == 7
+    monkeypatch.setenv("RASTER_CACHE_MAX_ENTRIES", "nope")
+    assert slide_cache._env_raster_cache_max() == \
+        slide_cache._DEFAULT_RASTER_CACHE_MAX
+    monkeypatch.setenv("RASTER_CACHE_MAX_ENTRIES", "0")
+    assert slide_cache._env_raster_cache_max() == \
+        slide_cache._DEFAULT_RASTER_CACHE_MAX
+    monkeypatch.setenv("RASTER_CACHE_MAX_ENTRIES", "")
+    assert slide_cache._env_raster_cache_max() == \
+        slide_cache._DEFAULT_RASTER_CACHE_MAX
+
+
+def test_share_server_raster_tile_follows_generation(
+        share_env, fake_pairs):
+    """普通图片走分享路由：换代后瓦片不得命中旧代 JPEG 缓存（demo.bmp）。"""
+    c, upload_dir, _token = share_env
+    path = upload_dir / "photo.bmp"
+    path.write_text("v1", encoding="utf-8")
+    token = share_store.create_share(["photo.bmp"], 24)["token"]
+
+    tile_url = "/s/%s/api/slide/photo.bmp_files/0/0_0.jpeg" % token
+    r1 = c.get(tile_url)
+    assert r1.status_code == 200, r1.get_data(as_text=True)
+    body1 = r1.data
+    entry = slide_cache._slide_cache["photo.bmp"]
+    assert entry["raster"] is True
+
+    _replace_preserving_stat(path, "v2")
+    r2 = c.get(tile_url)
+    assert r2.status_code == 200
+    assert r2.data != body1, "换代后普通图片瓦片不得命中旧代 JPEG 缓存"
+    gens = {k[1] for k in share_srv._tile_cache.keys()
+            if k[0] == "photo.bmp"}
+    assert len(gens) >= 2, "两代瓦片应各有键：%s" % gens
+
+    # info：普通图片缺物理标尺（_read_metadata raster 分支）
+    r3 = c.get("/s/%s/api/slides" % token)
+    assert r3.status_code == 200
+    item = r3.get_json()[0]
+    assert item["exists"] is True
+    assert item["mpp_x"] is None and item["mpp_y"] is None
+    assert item["objective"] is None and item["mpp_source"] == "missing"
 
 
 # --------------------------------------------------------------------------- #

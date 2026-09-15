@@ -74,6 +74,10 @@
             <option value="6" data-i18n="tb.rect.preset.6">6×6 mm</option>
             <option value="6.5" data-i18n="tb.rect.preset.6.5">6.5×6.5 mm</option>
           </select>
+          {# 无物理标尺提示（普通图片 mpp_source="missing"）：文案由 app.js 按语言
+             填充（键在 app.js _EXTRA_I18N，不改 i18n.js）；有标尺时保持 hidden。 #}
+          <p id="roi-no-scale-hint" class="roi-no-scale-hint" role="note" hidden
+             style="margin:4px 0 0;font-size:12px;line-height:1.45;opacity:.8;"></p>
         </div>
       </div>
       {% endif %}
@@ -226,8 +230,13 @@
            （legacy /api/upload 与 V2 分片）不变，进度行照旧显示在这里。 #}
         <button id="import-slides-btn" class="btn primary block" data-i18n="sb.upload">导入切片</button>
         <button id="new-project-btn" class="btn secondary block" data-i18n="sb.new.project">＋ 新建项目</button>
+        {# accept 静态 fallback（含 raster-image 的 .bmp/.jpg/.jpeg）：接口不可用时的
+           兜底；与 app.js FILE_INPUT_ACCEPT_FALLBACK 同文 = acceptFromCatalog(
+           FORMAT_CATALOG_FALLBACK) 的展开；目录可用时由 app.js 按
+           /api/slide-formats（selectable_for_upload）重新派生。契约由
+           tests/js/raster-image-compat.test.ts 锁定防漂移。 #}
         <input id="file-input" type="file"
-               accept=".svs,.tif,.tiff,.ndpi,.mrxs,.vms,.vmu,.scn,.bif,.svslide,.kfb,.kfbf,.zip"
+               accept=".svs,.tif,.tiff,.ome.tif,.ome.tiff,.ndpi,.vms,.vmu,.scn,.bif,.svslide,.bmp,.jpg,.jpeg,.kfb,.kfbf,.mrxs,.zip"
                hidden />
         <div id="progress-wrap" class="progress-wrap" style="display:none;">
           <div id="progress-bar" class="progress-bar"></div>

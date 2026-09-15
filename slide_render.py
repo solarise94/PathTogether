@@ -895,9 +895,15 @@ NATIVE_RGB_FINGERPRINT = _fingerprint({
 def slide_image_mode(slide):
     """切片显示模式：``native_rgb`` / ``multichannel``（§6.1 image_mode）。
 
+    普通图片（raster_slide.RasterSlide，BMP/JPEG）**显式** native_rgb：转
+    显示 RGB 后就是单幅彩色图，绝不允许进入荧光通道流程（is_raster_image
+    守卫先于 isinstance——灰度/调色板/CMYK 已在读入器内归一 RGB，没有
+    channel_count/axes 之类的通道属性可依赖）。
     非 TiffFileSlide（OpenSlide 厂商格式 SVS/NDPI…）一律 native_rgb；
     TiffFileSlide 按 photometric/S/C 判定（is_native_rgb / channel_count）。
     """
+    if getattr(slide, "is_raster_image", False):
+        return "native_rgb"
     if not isinstance(slide, TiffFileSlide):
         return "native_rgb"
     if slide.is_native_rgb:
@@ -1138,8 +1144,16 @@ def composite_region(slide, context, location, level, size):
     只接受 ``multichannel-additive-v1``；native RGB 由
     :class:`RenderedSlideView` 直通旧 ``read_region``。通道越界在解码前
     拒绝（``render_channel_out_of_range``）。
+    普通图片（is_raster_image）没有 channel_count/read_region_channels，
+    正常请求流不可能到达这里（slide_image_mode 恒 native_rgb）；防御性
+    守卫把「伪造/串位的 multichannel context」从 AttributeError 收敛为
+    稳定 ``invalid_render_context``（§4.5 错误契约）。
     """
     t0 = time.perf_counter()
+    if getattr(slide, "is_raster_image", False):
+        raise SlideRenderError(
+            "invalid_render_context",
+            "普通图片（BMP/JPEG）为单幅 RGB，不支持多通道合成")
     _require(isinstance(context, dict)
              and context.get("version") == CONTEXT_VERSION_MULTICHANNEL,
              "invalid_render_context",

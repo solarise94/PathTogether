@@ -27,7 +27,7 @@ import slide_format_registry as reg  # noqa: E402
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("ext", [
     ".svs", ".tif", ".tiff", ".ndpi", ".vms", ".vmu", ".scn", ".bif",
-    ".svslide",
+    ".svslide", ".bmp", ".jpg", ".jpeg",
 ])
 def test_native_single_file_exts(ext):
     info = reg.lookup("sample" + ext)
@@ -85,12 +85,13 @@ def test_capability_values_are_the_four_contract_kinds():
 
 
 # --------------------------------------------------------------------------- #
-# 2. 与 app.SUPPORTED_EXTS 同步 + 上传白名单未被改动
+# 2. 与 app.SUPPORTED_EXTS 同步 + 上传白名单
 # --------------------------------------------------------------------------- #
-#: app.py SUPPORTED_EXTS 的冻结期望（Phase A 合同：**不得**加入 kfb/kfbf）
+#: app.py SUPPORTED_EXTS 的冻结期望（含普通图片族 bmp/jpg/jpeg；
+#: **不得**加入 kfb/kfbf）
 _EXPECTED_SUPPORTED_EXTS = {
     "svs", "tif", "tiff", "ndpi", "mrxs", "vms", "vmu", "scn", "bif",
-    "svslide",
+    "svslide", "bmp", "jpg", "jpeg",
 }
 
 
@@ -102,7 +103,7 @@ def test_registry_covers_supported_exts_exactly():
     native = {"." + e for e in app.SUPPORTED_EXTS}
     registered = {ext for ext in reg._FORMATS}  # noqa: SLF001
     assert native <= registered
-    # 登记表允许额外包含 convert-required / unsupported 项（kfb/kfbf）
+    # 登记表允许额外包含 convert-required 项（kfb/kfbf）
     assert registered - native == {".kfb", ".kfbf"}
 
 
@@ -117,3 +118,56 @@ def test_upload_whitelist_unchanged_no_kfb():
 
     assert ".kfb" not in slide_io.LOGICAL_EXTS
     assert ".kfbf" not in slide_io.LOGICAL_EXTS
+
+
+# --------------------------------------------------------------------------- #
+# 3. 普通图片族（BMP/JPEG）：能力登记 + 产品目录 + 白名单同步
+# --------------------------------------------------------------------------- #
+def test_raster_image_whitelist_synced():
+    """普通图片族进入上传白名单：SUPPORTED_EXTS / _upload_ext_allowed 同步。"""
+    import app
+
+    assert {"bmp", "jpg", "jpeg"} <= app.SUPPORTED_EXTS
+    for name in ("a.bmp", "a.JPG", "a.jpeg"):
+        assert app._upload_ext_allowed(name) is True
+    # 大小写不敏感 + kfb/kfbf 走 convert-required 通道、未知仍拒绝
+    assert app._upload_ext_allowed("a.BMP") is True
+    assert app._upload_ext_allowed("a.kfb") is True   # convert-required 通道
+    assert app._upload_ext_allowed("a.kfbf") is True  # convert-required 通道
+    assert app._upload_ext_allowed("a.png") is False
+
+
+def test_public_catalog_raster_image_row():
+    """目录单列一条 raster-image：direct 单文件、可选上传、用户向短句。"""
+    rows = {item["id"]: item for item in reg.public_catalog()}
+    item = rows["raster-image"]
+    assert item["display_name"] == "普通图片（BMP / JPEG）"
+    assert item["extensions"] == [".bmp", ".jpg", ".jpeg"]
+    assert item["capability"] == reg.CAP_NATIVE_SINGLE_FILE
+    assert item["canonical_format"] is None
+    assert item["bundle_required"] is False
+    assert item["import_mode"] == "direct"
+    assert item["selectable_for_upload"] is True
+    assert item["limits"] == ["普通图片、支持像素坐标、无物理标尺"]
+
+
+def test_public_catalog_user_wording_no_internal_terms():
+    """用户文案不出现内部实现词汇（reader/解码库/Pillow/OpenSlide 等）。"""
+    banned = ("reader", "解码", "Pillow", "OpenSlide", "openslide",
+              "tifffile", "RasterSlide")
+    for item in reg.public_catalog():
+        text = item["display_name"] + "".join(item["limits"])
+        for word in banned:
+            assert word not in text, (item["id"], word)
+
+
+def test_public_catalog_ids_unique_and_exts_disjoint():
+    """目录 id 唯一、extensions 两两不重叠（词表不再漂移的底线）。"""
+    items = reg.public_catalog()
+    ids = [item["id"] for item in items]
+    assert len(ids) == len(set(ids))
+    seen = []
+    for item in items:
+        for ext in item["extensions"]:
+            assert ext not in seen, ext
+            seen.append(ext)

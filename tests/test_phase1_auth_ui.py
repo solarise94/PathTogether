@@ -404,7 +404,8 @@ def test_index_entry_landing_page_content(monkeypatch):
     assert 'id="capabilities"' in body
     assert 'id="suite"' in body
     # 中文默认文案（测试锁定，勿改写）
-    assert "登录测试与协作" in body
+    assert body.count('href="/login"') == 1
+    assert 'href="#principle"' not in body
     assert "Demo 无需登录，可查看示例切片并体验 AI 导航" in body
     assert "仅用于研究、教学和软件演示，不用于临床诊断。" in body
     # 三个 GitHub 仓库链接（顶栏 / 套件卡 / 页脚）
@@ -414,7 +415,7 @@ def test_index_entry_landing_page_content(monkeypatch):
     assert 'href="mailto:solarise94@gmail.com"' in body
     # i18n 锚点（语言切换覆盖导航 / hero / mock / 卡片）
     for key in ("entry.nav.login", "entry.hero.title", "entry.mock.step1",
-                "entry.cap.1.title", "entry.suite.github", "entry.cta.title"):
+                "entry.cap.1.title", "entry.suite.github", "entry.principle.title"):
         assert 'data-i18n="%s"' % key in body
     # 不加载完整应用资源（介绍页只做营销与分流）
     assert 'id="viewer"' not in body
@@ -426,10 +427,22 @@ def test_index_entry_landing_page_content(monkeypatch):
     # 不编造尚不存在的条款/隐私路由
     assert 'href="/terms"' not in body
     assert 'href="/privacy"' not in body
-    # 无外部字体 / CDN / 真实切片图
+    # 无外部字体 / CDN；真实 TCGA 图从本站静态资源读取
     assert "fonts.googleapis" not in body
     assert 'src="http' not in body
-    assert "<img" not in body
+    js_src = (REPO_ROOT / "static" / "entry.js").read_text(encoding="utf-8")
+    assert "tcga-session-base.jpg" in js_src
+    assert "tcga-left-2.jpg" in js_src
+    assert "tcga-left-10.jpg" in js_src
+    assert "tcga-left-20.jpg" in js_src
+    assert "tcga-right-40.jpg" in js_src
+    assert "data-hp-fov" not in body
+    assert "data-hp-scan" not in body
+    # 自动循环演示：无播放/暂停按钮；图上蓝框 + 框边解读
+    assert "data-hp-play" not in body
+    assert "data-hp-pause" not in body
+    assert 'data-hp-box="a"' in body and 'data-hp-box="b"' in body
+    assert "data-hp-stream" in body
     # 无内联脚本（CSP script-src 'self'）；标题由 i18n.js 按 data-page=entry 同步
     assert body.count("<script") == 2
     assert 'src="/static/i18n.js' in body
@@ -455,6 +468,15 @@ def test_entry_landing_source_guards():
     js = (REPO_ROOT / "static" / "entry.js").read_text(encoding="utf-8")
     assert "data-hp-stage" in js
     assert "prefers-reduced-motion" in js
+    # 自动循环 + 双标注回看（homepage-agent-storyboard 实现规格）：无播放按钮
+    assert "data-hp-play" not in js and "data-hp-pause" not in js
+    assert 'data-hp-play' not in html and 'data-hp-pause' not in html
+    assert "LOOP_HOLD_MS" in js and "BOX_DELAY_MS" in js  # 末拍停 3s 再循环 / 蓝框弹出
+    assert "IntersectionObserver" in js                   # 进入可见区自动播放
+    assert "data-hp-box" in js and "data-hp-stream" in js
+    assert 'data-hp-box="a"' in html and 'data-hp-box="b"' in html
+    assert "data-hp-img-from" in html
+    assert "#007AFF" in css
     # 语义结构：header + main + footer；锚点导航与跳转链接
     assert "<header" in html and "<main" in html and "<footer" in html
     assert "<nav" in html
@@ -489,8 +511,10 @@ def test_entry_landing_source_guards():
         "entry.cap.1.title", "entry.cap.1.body",
         "entry.cap.2.title", "entry.cap.2.body",
         "entry.cap.3.title", "entry.cap.3.body",
-        "entry.principle.title", "entry.principle.play",
-        "entry.principle.tab.plugin",
+        "entry.principle.title", "entry.principle.review.a", "entry.principle.review.b",
+        "entry.principle.pin.a", "entry.principle.pin.b",
+        "entry.principle.loop.hint", "entry.principle.nav.s5",
+        "entry.principle.status.nav.7",
         "entry.suite.kicker", "entry.suite.title",
         "entry.suite.hp.body", "entry.suite.pt.body", "entry.suite.dsh.body",
         "entry.suite.github", "entry.cta.title", "entry.cta.body",
@@ -519,7 +543,8 @@ def test_index_authenticated_stays_on_landing(monkeypatch):
     body = r.get_data(as_text=True)
     assert 'id="viewer"' not in body
     assert "进入工作台" in body
-    assert 'href="/app"' in body
+    assert body.count('href="/app"') == 1
+    assert '<span class="avatar"' in body
     assert 'class="avatar"' in body
     assert "登录测试与协作" not in body
 

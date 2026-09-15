@@ -6,9 +6,9 @@
   <title>HistoPilot</title>
   <!-- 空 data URI favicon：避免未登录浏览器自动 GET /favicon.ico 撞鉴权闸 -->
   <link rel="icon" href="data:," />
-  <link rel="stylesheet" href="/static/entry.css?v=20260914f" />
-  <script src="/static/i18n.js?v=20260914f"></script>
-  <script src="/static/entry.js?v=20260914f"></script>
+  <link rel="stylesheet" href="/static/entry.css?v=20260915l" />
+  <script defer src="/static/i18n.js?v=20260915l"></script>
+  <script defer src="/static/entry.js?v=20260915l"></script>
 </head>
 <body id="top">
   <a class="skip-link" href="#main" data-i18n="entry.skip">跳到主要内容</a>
@@ -19,7 +19,6 @@
       <a class="brand" href="#top">HistoPilot</a>
       <ul class="nav-links">
         <li><a href="#product" data-i18n="entry.nav.product">产品</a></li>
-        <li><a href="#principle" data-i18n="entry.nav.principle">原理</a></li>
         <li><a href="#capabilities" data-i18n="entry.nav.capabilities">能力</a></li>
         <li><a href="#suite" data-i18n="entry.nav.suite">套件</a></li>
         <li>
@@ -37,7 +36,7 @@
       <div class="topbar-actions">
         <button type="button" class="lang-toggle" data-i18n-aria="lang.toggle.aria" aria-label="切换为英文">EN</button>
         {% if signed_in %}
-        <a class="avatar" href="/app" title="{{ display_name }}" aria-label="{{ display_name }}">{{ avatar_letter }}</a>
+        <span class="avatar" title="{{ display_name }}" aria-label="{{ display_name }}">{{ avatar_letter }}</span>
         <a class="btn btn-primary btn-sm" href="/app" data-i18n="entry.nav.workbench">进入工作台</a>
         <form class="logout-form" method="post" action="/logout">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
@@ -55,16 +54,10 @@
     <section class="hero">
       <div class="hero-copy">
         <p class="badge"><span data-i18n="entry.badge">研究软件 · 不用于临床诊断</span></p>
-        <h1 data-i18n="entry.hero.title">让 Agent 自己读完整张切片。</h1>
-        <p class="lead" data-i18n="entry.hero.lead">HistoPilot 先在高倍看清细胞，再退到低倍识别结构，并留下可复查的观察轨迹。需要定量时，再调用你自己部署的分析插件。PathTogether 提供协作 Viewer、项目、标注与分享。</p>
+        <h1 data-i18n="entry.hero.title">和 AI 一起，看看这张切片。</h1>
+        <p class="lead" data-i18n="entry.hero.lead">先在低倍下看组织结构，找到目标区域，再放大确认细节。HistoPilot 帮你导航、整理观察结果，你可以随时回看。</p>
         <div class="hero-actions">
-          {% if signed_in %}
-          <a class="btn btn-primary" href="/app" data-i18n="entry.workbench">进入工作台</a>
-          <a class="btn btn-secondary" href="/demo" data-i18n="entry.demo">直接体验 Demo</a>
-          {% else %}
           <a class="btn btn-primary" href="/demo" data-i18n="entry.demo">直接体验 Demo</a>
-          <a class="btn btn-secondary" href="/login" data-i18n="entry.login">登录测试与协作</a>
-          {% endif %}
         </div>
         {% if signed_in %}
         <p class="hero-hint" data-i18n="entry.signed.hint">已登录。进入工作台继续查看、标注与协作。</p>
@@ -73,33 +66,29 @@
         {% endif %}
       </div>
 
-      <!-- 纯 CSS 抽象 mock（H&E 配色、无真实切片、装饰性、不可点击进 Viewer） -->
+      <!-- TCGA 公开切片截图；装饰性预览，不包含病例标签 -->
       <div class="mock" aria-hidden="true">
         <div class="mock-bar">
           <span class="lights"><i></i><i></i><i></i></span>
-          <span class="mock-title" data-i18n="entry.mock.title">Demo slide · HistoPilot</span>
+          <span class="mock-title" data-i18n="entry.mock.title">TCGA-49-AAR4 · HistoPilot</span>
         </div>
         <div class="mock-body">
           <div class="tissue">
-            <span class="gland g1"></span>
-            <span class="gland g2"></span>
-            <span class="gland g3"></span>
-            <span class="vac v1"></span>
-            <span class="vac v2"></span>
-            <span class="vac v3"></span>
-            <span class="obs"></span>
-            <span class="scale"><i></i>500 µm</span>
-            <span class="zoomctl"><span>+</span><span>−</span><span class="zlvl">20×</span></span>
+            <img class="hero-slide" src="/static/entry-media/tcga-session-low-960.webp"
+                 srcset="/static/entry-media/tcga-session-low-480.webp 480w, /static/entry-media/tcga-session-low-960.webp 960w"
+                 sizes="(max-width: 720px) calc(100vw - 32px), (max-width: 1079px) 60vw, 340px"
+                 width="960" height="960" fetchpriority="high" decoding="async" alt="" />
+            <span class="scale">TCGA-49-AAR4 · ≈2×</span>
           </div>
           <div class="agent">
             <div class="agent-head"><span class="pulse"></span><span>Agent</span></div>
             <ol>
-              <li class="done"><span class="n">1</span><span data-i18n="entry.mock.step1">20× 观察核形态</span></li>
-              <li class="done"><span class="n">2</span><span data-i18n="entry.mock.step2">拉远到 2× 识别腺体结构</span></li>
-              <li class="active"><span class="n">3</span><span data-i18n="entry.mock.step3">调用分析插件扩展能力</span></li>
-              <li><span class="n">4</span><span data-i18n="entry.mock.step4">留下可复查轨迹，未写入正式标注</span></li>
+              <li class="active"><span class="n">1</span><span data-i18n="entry.mock.step1">低倍定位组织区域</span></li>
+              <li><span class="n">2</span><span data-i18n="entry.mock.step2">10× → 40× 放大查看</span></li>
+              <li><span class="n">3</span><span data-i18n="entry.mock.step3">记录观察，标注待复核</span></li>
+              <li><span class="n">4</span><span data-i18n="entry.mock.step4">整理结果，回看位置</span></li>
             </ol>
-            <div class="agent-foot">read-only · steps 3/8</div>
+            <div class="agent-foot" data-i18n="entry.principle.mock.note">TCGA 公开切片 · 操作示例</div>
           </div>
         </div>
       </div>
@@ -113,12 +102,12 @@
         <div class="how-card">
           <span class="no">01</span>
           <h3 data-i18n="entry.how.s1.title">打开切片</h3>
-          <p data-i18n="entry.how.s1.body">把 WSI 放进 PathTogether。想先看效果，可以从 Demo 展示入口进入。</p>
+          <p data-i18n="entry.how.s1.body">上传你的切片，或先用 Demo 里的示例试一试。</p>
         </div>
         <div class="how-card">
           <span class="no">02</span>
-          <h3 data-i18n="entry.how.s2.title">让 HistoPilot 导航</h3>
-          <p data-i18n="entry.how.s2.body">Agent 先高倍观察，再低倍识别，必要时调用分析插件；步骤有上限。</p>
+          <h3 data-i18n="entry.how.s2.title">找到值得细看的地方</h3>
+          <p data-i18n="entry.how.s2.body">先低倍看结构，再放大确认细节；需要时调用分析插件。</p>
         </div>
         <div class="how-card">
           <span class="no">03</span>
@@ -126,59 +115,45 @@
           <p data-i18n="entry.how.s3.body">登录后上传自己的切片、标注、评论，按权限分享。</p>
         </div>
       </div>
-    </section>
+      <h3 id="principle" class="demo-heading" data-i18n="entry.principle.title">Agent 怎么读一张切片</h3>
+      <p class="section-lead" data-i18n="entry.principle.lead">跟着一次真实会话，看看 Agent 怎样移动视野、逐级放大，再记录观察结果。</p>
 
-    <!-- ================= 原理演示 ================= -->
-    <section id="principle" class="section">
-      <p class="kicker" data-i18n="entry.principle.kicker">原理</p>
-      <h2 data-i18n="entry.principle.title">Agent 怎么读一张切片</h2>
-      <p class="section-lead" data-i18n="entry.principle.lead">先点「播放原理」看高倍观察再低倍识别；再点「播放插件」看 Agent 如何把视野交给你自己部署的分析插件。</p>
-
+      <!-- 真实 TCGA-49-AAR4 会话（sess_f38dfd3facf64f25）自动循环演示。
+           2×/10×/20×/40× 为同一中心的实切图；放大过程中只在 FOV 重合时换图。
+           进入可见区自动播放，末拍停约 3 秒后循环；+/− 手动缩放。 -->
       <div class="demo-stage" data-hp-stage>
         <div class="demo-toolbar">
-          <div class="demo-tabs" role="tablist" aria-label="演示切换">
-            <button type="button" class="demo-tab is-on" data-hp-tab="nav" aria-pressed="true" data-i18n="entry.principle.tab.nav">高倍 → 低倍</button>
-            <button type="button" class="demo-tab" data-hp-tab="plugin" aria-pressed="false" data-i18n="entry.principle.tab.plugin">调用插件</button>
-          </div>
-          <div class="demo-actions">
-            <button type="button" class="btn btn-primary btn-sm" data-hp-play data-i18n="entry.principle.play">播放原理</button>
-            <button type="button" class="btn btn-secondary btn-sm" data-hp-pause data-i18n="entry.principle.pause">暂停</button>
-          </div>
+          <strong data-hp-phase data-i18n="entry.principle.nav.s1">概览</strong>
+          <span class="demo-loop-hint" data-i18n="entry.principle.loop.hint">自动循环演示 · +/− 可手动缩放</span>
         </div>
 
         <div class="demo-body">
-          <div class="slide-stage" aria-hidden="true">
-            <div class="slide-world" data-hp-world>
-              <span class="gland g1"></span>
-              <span class="gland g2"></span>
-              <span class="gland g3"></span>
-              <span class="gland g4"></span>
-              <span class="vac v1"></span>
-              <span class="vac v2"></span>
-              <span class="vac v3"></span>
-              <span class="nuclei"></span>
+          <div class="slide-stage">
+            <div class="shot-viewport" data-hp-viewport>
+              <img class="shot-img" data-hp-img-from alt="" />
+              <img class="shot-img" data-hp-img-to alt="" />
+              <div class="anno-box anno-a" data-hp-box="a">
+                <span class="anno-caption"><span data-hp-stream></span></span>
+              </div>
+              <div class="anno-box anno-b" data-hp-box="b">
+                <span class="anno-caption"><span data-hp-stream></span></span>
+              </div>
             </div>
-            <span class="fov" data-hp-fov></span>
-            <span class="plugin-scan" data-hp-scan></span>
-            <span class="scale" data-hp-scale>50 µm</span>
-            <span class="zoomctl"><span class="zlvl" data-hp-zoom>20×</span></span>
+            <span class="scale"><i data-hp-scale-bar></i><span data-hp-scale>2 mm</span></span>
+            <div class="zoomctl"><button type="button" data-hp-zoom-in disabled data-i18n-aria="entry.zoom.in" aria-label="放大">+</button><button type="button" data-hp-zoom-out disabled data-i18n-aria="entry.zoom.out" aria-label="缩小">−</button><span class="zlvl" data-hp-zoom>≈0.5×</span></div>
           </div>
 
           <aside class="demo-panel">
-            <p class="demo-status" data-hp-status data-i18n="entry.principle.status.idle">准备播放：先高倍看清细胞，再退到低倍识别结构。</p>
+            <p class="demo-status" role="status" data-hp-status data-i18n="entry.principle.status.idle">正在加载切片图像…</p>
             <ol class="demo-steps" data-hp-steps-nav>
-              <li data-step="0" data-i18n="entry.principle.nav.s1">高倍 20×：看细胞核与局部细节</li>
-              <li data-step="1" data-i18n="entry.principle.nav.s2">平移到相邻视野，继续确认</li>
-              <li data-step="2" data-i18n="entry.principle.nav.s3">拉远到 2×：识别腺体与组织结构</li>
-              <li data-step="3" data-i18n="entry.principle.nav.s4">留下可复查的观察轨迹</li>
+              <li data-step="0" data-i18n="entry.principle.nav.s1">概览</li>
+              <li data-step="1" data-i18n="entry.principle.nav.s2">左块复核</li>
+              <li data-step="2" data-i18n="entry.principle.nav.s3">右上观察</li>
+              <li data-step="3" data-i18n="entry.principle.nav.s4">右下复核</li>
+              <li data-step="4" data-i18n="entry.principle.nav.s5">回看</li>
             </ol>
-            <ol class="demo-steps is-hidden" data-hp-steps-plugin>
-              <li data-step="0" data-i18n="entry.principle.plugin.s1">Agent 选定当前视野</li>
-              <li data-step="1" data-i18n="entry.principle.plugin.s2">调用你部署的分析插件</li>
-              <li data-step="2" data-i18n="entry.principle.plugin.s3">插件返回计数 / 区域结果</li>
-              <li data-step="3" data-i18n="entry.principle.plugin.s4">能力边界由插件扩展，不改导航内核</li>
-            </ol>
-            <p class="demo-footnote" data-i18n="entry.principle.footnote">抽象示意，不是真实切片，也不构成诊断。</p>
+            <p class="demo-source">TCGA-49-AAR4 · TCGA-LUAD</p>
+            <p class="demo-footnote" data-i18n="entry.principle.footnote">真实会话节选 · 已压缩等待时间。模型观察结果需人工复核。</p>
           </aside>
         </div>
       </div>
@@ -197,8 +172,8 @@
               <path d="M15.5 8.5 13 13l-4.5 2.5L11 11z"></path>
             </svg>
           </span>
-          <h3 data-i18n="entry.cap.1.title">Agentic 导航</h3>
-          <p data-i18n="entry.cap.1.body">高倍观察、低倍识别、坐标语义、快照与视觉预算。</p>
+          <h3 data-i18n="entry.cap.1.title">AI 导航</h3>
+          <p data-i18n="entry.cap.1.body">从组织结构到局部细节，保留观察位置，方便回看。</p>
         </div>
         <div class="cap-card">
           <span class="icon" aria-hidden="true">
@@ -209,7 +184,7 @@
             </svg>
           </span>
           <h3 data-i18n="entry.cap.2.title">协作 Viewer</h3>
-          <p data-i18n="entry.cap.2.body">OpenSlide + OpenSeadragon，项目、ROI、评论。</p>
+          <p data-i18n="entry.cap.2.body">和同事一起看切片、做标注、讨论并分享。</p>
         </div>
         <div class="cap-card">
           <span class="icon" aria-hidden="true">
@@ -219,7 +194,7 @@
             </svg>
           </span>
           <h3 data-i18n="entry.cap.3.title">自研分析插件</h3>
-          <p data-i18n="entry.cap.3.body">部署自己撰写的分析插件，扩展能力边界；HistoPilot 只负责导航与调用。</p>
+          <p data-i18n="entry.cap.3.body">接入你部署的插件，完成计数或区域分析。</p>
         </div>
       </div>
     </section>
@@ -253,24 +228,6 @@
       </div>
     </section>
 
-    <!-- ================= 关闭 CTA ================= -->
-    <section class="section cta-section">
-      {% if signed_in %}
-      <h2 data-i18n="entry.cta.title.signed">进入工作台，继续你的切片。</h2>
-      <p class="cta-body" data-i18n="entry.cta.body.signed">工作台可收藏：下次打开 /app 即可跳过介绍页。</p>
-      <div class="hero-actions">
-        <a class="btn btn-primary" href="/app" data-i18n="entry.workbench">进入工作台</a>
-        <a class="btn btn-secondary" href="/demo" data-i18n="entry.demo">直接体验 Demo</a>
-      </div>
-      {% else %}
-      <h2 data-i18n="entry.cta.title">先从 Demo 看看效果，再决定是否登录。</h2>
-      <p class="cta-body" data-i18n="entry.cta.body">Demo 是展示入口，无需账号即可查看示例切片。需要上传、标注、协作或部署自己的分析插件时再登录。</p>
-      <div class="hero-actions">
-        <a class="btn btn-primary" href="/demo" data-i18n="entry.demo">直接体验 Demo</a>
-        <a class="btn btn-secondary" href="/login" data-i18n="entry.login">登录测试与协作</a>
-      </div>
-      {% endif %}
-    </section>
   </main>
 
   <!-- ================= 页脚 ================= -->
@@ -279,11 +236,6 @@
       <p class="footer-note" data-i18n="entry.footer">仅用于研究、教学和软件演示，不用于临床诊断。</p>
       <nav class="footer-links" aria-label="页脚导航">
         <a href="/demo">Demo</a>
-        {% if signed_in %}
-        <a href="/app" data-i18n="entry.nav.workbench">进入工作台</a>
-        {% else %}
-        <a href="/login" data-i18n="entry.nav.login">登录</a>
-        {% endif %}
         <a href="https://me.solarise94.fun" target="_blank" rel="noopener noreferrer"
            data-i18n="entry.nav.home">主页</a>
         <a href="mailto:solarise94@gmail.com" data-i18n="entry.nav.email">邮箱</a>

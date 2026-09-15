@@ -565,12 +565,23 @@ def _build_manifest(*, src, dst, part_path, doc, level_results, warnings,
 # --------------------------------------------------------------------------- #
 # 输出结构校验（promote 前）
 # --------------------------------------------------------------------------- #
+def _channel_shape_ok(shape, nch, height, width):
+    """shape 是否等于 (nch, H, W)（nch==1 兼容 tifffile 折叠单例 C 维）。
+
+    nch==1 的 OME-TIFF 每层只有一页，tifffile 重开时会把单例 C 维
+    折叠掉返回 (H, W)，同为合法产物。
+    """
+    t = tuple(shape)
+    return t == (nch, height, width) or (nch == 1 and t == (height, width))
+
+
 def _validate_output(part_path, levels, nch):
     """用 tifffile 重开 .part 做结构校验（不整幅解码）。
 
-    校验：BigTIFF + OME、主 series axes=CYX 且 shape=(nch,H0,W0)、
-    金字塔层数与尺寸一致、level0 每通道首末 tile 可解码为 cell 尺寸
-    （防 SOI/EOI 完好但流损坏）。
+    校验：BigTIFF + OME、主 series axes=CYX 且 shape=(nch,H0,W0)
+    （nch==1 时单例 C 维被折叠，YX/(H0,W0) 同为合法）、金字塔层数与
+    尺寸一致、level0 每通道首末 tile 可解码为 cell 尺寸（防 SOI/EOI
+    完好但流损坏）。
     """
     try:
         import tifffile
@@ -593,20 +604,29 @@ def _validate_output(part_path, levels, nch):
                                % (len(level0_pages), nch))
             series = tf.series[0]
             lv0 = levels[0]
-            if series.axes != "CYX" or tuple(series.shape) != \
-                    (nch, lv0.height, lv0.width):
+            # nch==1 时 tifffile 折叠单例 C 维：主 series 除 CYX/(nch,H,W)
+            # 外，YX/(H,W) 亦为合法组合
+            series_ok = (
+                (series.axes == "CYX"
+                 and _channel_shape_ok(series.shape, nch, lv0.height,
+                                       lv0.width))
+                or (nch == 1 and series.axes == "YX"
+                    and tuple(series.shape) == (lv0.height, lv0.width)))
+            if not series_ok:
                 raise KfbError(
                     "conversion_validation_failed",
-                    "主 series axes/shape=%r/%r 与期望 CYX/%r 不符"
+                    "主 series axes/shape=%r/%r 与期望 CYX/%r%s 不符"
                     % (series.axes, tuple(series.shape),
-                       (nch, lv0.height, lv0.width)))
+                       (nch, lv0.height, lv0.width),
+                       "（或 YX/(H, W)）" if nch == 1 else ""))
             slevels = series.levels or [series]
             if len(slevels) != len(levels):
                 raise KfbError(
                     "conversion_validation_failed",
                     "金字塔层数 %d != %d" % (len(slevels), len(levels)))
             for slv, lv in zip(slevels, levels):
-                if tuple(slv.shape) != (nch, lv.height, lv.width):
+                if not _channel_shape_ok(slv.shape, nch, lv.height,
+                                         lv.width):
                     raise KfbError(
                         "conversion_validation_failed",
                         "层 %d shape=%r != %r"

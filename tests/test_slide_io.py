@@ -75,6 +75,11 @@ TIFF_NAME = "0702-L2-2 鼠奥球.tiff"  # 中文 + 空格 + 连字符（spec 必
     ("a.scn", ".scn"),
     ("a.bif", ".bif"),
     ("a.svslide", ".svslide"),
+    ("a.bmp", ".bmp"),             # 普通图片族（Wave 1 raster 分支）
+    ("a.jpg", ".jpg"),
+    ("a.jpeg", ".jpeg"),
+    ("photo.JPG", ".jpg"),         # 大小写不敏感
+    ("扫描.BMP", ".bmp"),
     (TIFF_NAME, ".tiff"),          # 中文/空格文件名
     ("/tmp/x/y.TIFF", ".tiff"),    # 完整路径取 basename
 ])
@@ -119,6 +124,72 @@ def test_logical_exts_stay_in_sync_with_app_supported_exts():
     logical = set(slide_io.LOGICAL_EXTS)
     assert all("." + ext in logical for ext in app_mod.SUPPORTED_EXTS)
     assert all(e.rsplit(".", 1)[-1] in app_mod.SUPPORTED_EXTS for e in logical)
+
+
+# --------------------------------------------------------------------------- #
+# 1.5 普通图片族（BMP/JPEG）：is_raster_ext + open_slide raster 分发
+# --------------------------------------------------------------------------- #
+def _raster_bmp_bytes(w=64, h=48):
+    """合成确定性 RGB 渐变 BMP（无患者数据）。"""
+    from PIL import Image as PILImage
+
+    im = PILImage.new("RGB", (w, h))
+    px = im.load()
+    for y in range(h):
+        for x in range(w):
+            px[x, y] = ((x * 7) % 256, (y * 9) % 256, (x + y) % 256)
+    b = io.BytesIO()
+    im.save(b, format="BMP")
+    return b.getvalue()
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("a.bmp", True),
+    ("a.JPG", True),
+    ("a.jpeg", True),
+    ("a.Bmp", True),
+    ("/x/y.jpg", True),
+    ("a.tiff", False),
+    ("a.png", False),
+    (".uploading-x.part", False),
+    ("", False),
+    (None, False),
+])
+def test_is_raster_ext(name, expected):
+    assert slide_io.is_raster_ext(name) is expected
+
+
+def test_open_slide_bmp_dispatches_to_raster(tmp_path):
+    """.bmp 经 open_slide 返回 RasterSlide（vendor=raster-image，无 mpp 键）。"""
+    import raster_slide
+
+    p = tmp_path / "r.bmp"
+    p.write_bytes(_raster_bmp_bytes())
+    osr = slide_io.open_slide(p)
+    try:
+        assert isinstance(osr, raster_slide.RasterSlide)
+        assert osr.is_raster_image is True
+        assert osr.properties["openslide.vendor"] == "raster-image"
+        assert "openslide.mpp-x" not in osr.properties  # 缺物理标尺语义
+        assert osr.dimensions == (64, 48)
+    finally:
+        osr.close()
+
+
+def test_open_slide_raster_stable_codes(tmp_path):
+    """伪装/垃圾/缺文件：raster 分支稳定码（不透出裸异常与路径）。"""
+    from PIL import Image as PILImage
+
+    b = io.BytesIO()
+    PILImage.new("RGB", (8, 6)).save(b, format="PNG")
+    p = tmp_path / "fake.bmp"
+    p.write_bytes(b.getvalue())
+    with pytest.raises(slide_io.SlideValidationError) as ei:
+        slide_io.open_slide(p)
+    assert ei.value.code == "invalid_slide"
+    with pytest.raises(slide_io.SlideValidationError) as ei2:
+        slide_io.open_slide(tmp_path / "missing.jpg")
+    assert ei2.value.code == "slide_open_failed"
 
 
 # --------------------------------------------------------------------------- #
@@ -450,6 +521,86 @@ def test_v2_quota_cleanup_on_real_invalid_commit_pg(monkeypatch):
                         "FROM upload_user_quotas WHERE user_id=%s", (uid_user,))
             reserved, used = cur.fetchone()
     assert reserved == 0 and used == 0  # 预占释放、无实占
+
+
+# --------------------------------------------------------------------------- #
+# 5.5 普通图片族（BMP/JPEG）路由级真验证（不 monkeypatch）
+# --------------------------------------------------------------------------- #
+def test_v1_small_real_bmp_no_monkeypatch():
+    """V1 真 BMP：.part + 净化名 hint → 200 提升（普通图片走真验证）。"""
+    bmp = _raster_bmp_bytes()
+    c = _client()
+    r = c.post("/api/upload",
+               data={"file": (io.BytesIO(bmp), "photo.bmp")},
+               content_type="multipart/form-data")
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.get_json()["name"] == "photo.bmp"
+    assert (Path(UPLOAD_DIR) / "photo.bmp").read_bytes() == bmp
+    assert _residue() == []
+
+
+def test_v1_truncated_bmp_stable_code_no_residue():
+    """V1 截断 BMP：slide_open_failed 稳定码 + 临时文件清理（无残留）。"""
+    bmp = _raster_bmp_bytes(64, 48)
+    data = bmp[:int(len(bmp) * 0.7)]
+    c = _client()
+    r = c.post("/api/upload",
+               data={"file": (io.BytesIO(data), "cut.bmp")},
+               content_type="multipart/form-data")
+    assert r.status_code == 400
+    assert r.get_json()["code"] == "slide_open_failed"
+    assert not (Path(UPLOAD_DIR) / "cut.bmp").exists()
+    assert _residue() == []
+
+
+def test_v1_png_disguised_as_bmp_stable_code_no_residue():
+    """V1 PNG 字节伪装 .bmp：invalid_slide（真实字节格式校验）。"""
+    from PIL import Image as PILImage
+
+    b = io.BytesIO()
+    PILImage.new("RGB", (8, 6)).save(b, format="PNG")
+    c = _client()
+    r = c.post("/api/upload",
+               data={"file": (io.BytesIO(b.getvalue()), "fake.bmp")},
+               content_type="multipart/form-data")
+    assert r.status_code == 400
+    assert r.get_json()["code"] == "invalid_slide"
+    assert _residue() == []
+
+
+def test_v2_real_bmp_create_chunks_commit_no_monkeypatch():
+    """V2 create→chunk→commit 真 BMP：committed + 无临时残留。"""
+    bmp = _raster_bmp_bytes()
+    c = _client()
+    r = c.post("/api/uploads", json={"filename": "photo.bmp",
+                                     "declared_size": len(bmp)})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    uid = r.get_json()["upload_id"]
+    for off in range(0, len(bmp), 4096):
+        assert _put(c, uid, off, bmp[off:off + 4096]).status_code == 200
+    r = c.post("/api/uploads/%s/commit" % uid)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.get_json()["state"] == "committed"
+    assert (Path(UPLOAD_DIR) / "photo.bmp").read_bytes() == bmp
+    assert _residue() == []
+
+
+def test_v2_junk_jpg_commit_stable_code():
+    """V2 垃圾 .jpg commit：409 invalid_slide failed；part 清理。"""
+    junk = b"\x00junk-not-jpeg" * 8
+    c = _client()
+    r = c.post("/api/uploads", json={"filename": "junk.jpg",
+                                     "declared_size": len(junk)})
+    uid = r.get_json()["upload_id"]
+    assert _put(c, uid, 0, junk).status_code == 200
+    r = c.post("/api/uploads/%s/commit" % uid)
+    assert r.status_code == 409
+    j = r.get_json()
+    assert j["code"] == "invalid_slide"
+    assert j["state"] == "failed"
+    assert not (Path(UPLOAD_DIR) / "junk.jpg").exists()
+    assert c.delete("/api/uploads/%s" % uid).status_code == 200
+    assert _residue() == []
 
 
 # --------------------------------------------------------------------------- #

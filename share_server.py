@@ -32,7 +32,6 @@ from flask import (
 )
 from werkzeug.utils import secure_filename
 
-from openslide import OpenSlide
 from openslide.deepzoom import DeepZoomGenerator
 
 import share_store
@@ -59,9 +58,11 @@ app = Flask(__name__)
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR") or (Path.home() / "svs-viewer" / "uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-SUPPORTED_EXTS = {
-    "svs", "tif", "tiff", "ndpi", "mrxs", "vms", "vmu", "scn", "bif", "svslide",
-}
+# 说明：本服务**不维护**独立扩展名词表。历史上这里有一份从 app.py 复制的
+# ``SUPPORTED_EXTS``（厂商格式词表），但全文件零引用（分享端只做
+# _sanitize_name + 分享成员校验 + slide_io.open_slide 按后缀分发），已删除
+# 以免词表漂移；格式能力的唯一来源是 slide_format_registry / slide_io
+# （LOGICAL_EXTS / is_raster_ext），app.SUPPORTED_EXTS 仅是主站上传白名单。
 
 # Deep Zoom 参数（512 瓦片降低公网请求数，渐进式 q82 JPEG 降体积并支持模糊→清晰预览）
 DZ_TILE_SIZE = 512
@@ -93,13 +94,11 @@ _viewer_metrics = tile_cache.ViewerMetrics()
 
 # 默认 context (fp, image_mode) 的 per-(safe, generation) 缓存（与主站同语义）：
 # 无 render 参数的瓦片请求在借句柄前命中缓存/精确 spec。
+# （_ctx_scope 定义在下方多通道 render context 区块——此前本文件曾重复定义
+# 两次、后者遮蔽前者，已收敛为一份。）
 _DEFAULT_FP_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
 _DEFAULT_FP_CACHE_MAX = 4096
 _DEFAULT_FP_LOCK = threading.Lock()
-
-
-def _ctx_scope(safe: str, generation) -> str:
-    return "%s#%s" % (safe, generation)
 
 
 def _default_fp_cached(safe: str, generation):
@@ -198,9 +197,25 @@ def _mpp_from_tiff_resolution(path: Path):
     return None, None
 
 
-def _read_metadata(osr: OpenSlide, path: Path) -> dict:
-    """读取尺寸与 mpp 元数据（与主应用逻辑相同）。"""
+def _read_metadata(osr, path: Path) -> dict:
+    """读取尺寸与 mpp 元数据（与主应用逻辑相同）。
+
+    普通图片（BMP/JPEG，raster-image-compatibility §4.4）短路：无物理标尺，
+    ``mpp_x/mpp_y/objective`` 一律 null、``mpp_source="missing"``——BMP/JPEG
+    的 DPI / EXIF 分辨率不得当作组织的 µm/px，也不补默认 0.25 MPP 或 40×，
+    更不走下面的 TIFF 分辨率/倍率估算探测。
+    """
     width, height = osr.dimensions
+    if getattr(osr, "is_raster_image", False) \
+            or slide_io.is_raster_ext(str(path)):
+        return {
+            "width": width,
+            "height": height,
+            "mpp_x": None,
+            "mpp_y": None,
+            "objective": None,
+            "mpp_source": "missing",
+        }
     props = osr.properties
     objective_f = _to_float(props.get("openslide.objective-power"))
 

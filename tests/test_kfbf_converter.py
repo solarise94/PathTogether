@@ -164,6 +164,58 @@ def test_reject_non_grayscale_channel(tmp_path, monkeypatch):
     assert ei.value.code == "conversion_validation_failed"
 
 
+def test_convert_single_channel_synthetic(tmp_path):
+    """nch==1：tifffile 折叠单例 C 维，校验不得误杀合法单通道产物。
+
+    单通道 OME-TIFF 每层只有一页，tifffile 重开时主 series/各层均为
+    ``YX``/``(H, W)``（未折叠 ``CYX``/``(1, H, W)`` 亦合法）。
+    """
+    src = build_synthetic_kfbf(
+        tmp_path / "one.kfbf",
+        channels=(("DAPI", (0, 0, 229), 6.0, 1.0),))
+    dst = tmp_path / "one.ome.tif"
+    man = convert_kfbf(src, dst, min_free_bytes=0)
+    assert dst.is_file()
+    assert not (tmp_path / "one.ome.tif.part").exists()
+    assert (tmp_path / "one.ome.tif.manifest.json").is_file()
+    assert [c["name"] for c in man["channels"]] == ["DAPI"]
+    assert man["dimensions"] == {"width": 600, "height": 400}
+    assert [lv["level"] for lv in man["levels"]] == [0, 1, 2]
+
+    # tifffile 重开：主 series 与各层 axes/shape 符合折叠或未折叠之一
+    import tifffile
+
+    def _layout_ok(axes, shape, h, w):
+        return (axes, tuple(shape)) in (("CYX", (1, h, w)), ("YX", (h, w)))
+
+    with tifffile.TiffFile(str(dst)) as tf:
+        series = tf.series[0]
+        assert _layout_ok(series.axes, series.shape, 400, 600), \
+            (series.axes, tuple(series.shape))
+        assert len(series.levels) == 3
+        for slv, (h, w) in zip(series.levels,
+                               ((400, 600), (200, 300), (100, 150))):
+            assert _layout_ok(slv.axes, slv.shape, h, w), \
+                (slv.axes, tuple(slv.shape))
+
+    slide = slide_io.open_slide(str(dst))
+    try:
+        assert slide.channel_count == 1
+        assert slide.level_count == 3
+        assert slide.level_dimensions == ((600, 400), (300, 200), (150, 100))
+        # 通道像素与合成图案一致（JPEG 有损容差）；缺失 cell(0,1) 纯黑
+        planes, _ = slide.read_region_channels((0, 0), 0, (600, 400), [0])
+        assert planes.shape == (1, 400, 600)
+        exp = _channel_pattern(256, 256, 0, 0, 0, 0)
+        assert np.abs(planes[0][0:256, 0:256] - exp).max() <= 24
+        assert planes[0][0:256, 256:512].max() == 0
+        # 深层 level 可读
+        planes_l2, _ = slide.read_region_channels((0, 0), 2, (150, 100), [0])
+        assert planes_l2.shape == (1, 100, 150)
+    finally:
+        slide.close()
+
+
 def test_cli_success_and_failure(tmp_path):
     src = build_synthetic_kfbf(tmp_path / "cli.kfbf")
     dst = tmp_path / "cli.ome.tif"

@@ -73,6 +73,24 @@ _FORMATS = {
         "canonical_ext": None,
         "notes": "GE/Synthesys SVSlide",
     },
+    # --- 普通图片族（BMP/JPEG；raster_slide.RasterSlide 直接读） -----------
+    ".bmp": {
+        "capability": CAP_NATIVE_SINGLE_FILE,
+        "canonical_ext": None,
+        "notes": "普通图片 BMP；RasterSlide（Pillow）全量解码，"
+                 "按真实字节格式校验伪装",
+    },
+    ".jpg": {
+        "capability": CAP_NATIVE_SINGLE_FILE,
+        "canonical_ext": None,
+        "notes": "普通图片 JPEG；与 .jpeg 同一解码格式的别名"
+                 "（RasterSlide 按后缀互认 JPEG 字节）",
+    },
+    ".jpeg": {
+        "capability": CAP_NATIVE_SINGLE_FILE,
+        "canonical_ext": None,
+        "notes": "普通图片 JPEG；同 .jpg",
+    },
     # --- 原生 bundle（主文件 + 伴随目录） ----------------------------------
     ".mrxs": {
         "capability": CAP_NATIVE_BUNDLE,
@@ -259,6 +277,17 @@ _CATALOG_DISPLAY = (
         "bundle_required": False,
         "import_mode": "direct",
         "limits": [],
+        "selectable_for_upload": True,
+    },
+    {
+        "id": "raster-image",
+        "display_name": "普通图片（BMP / JPEG）",
+        "extensions": [".bmp", ".jpg", ".jpeg"],
+        "capability": CAP_NATIVE_SINGLE_FILE,
+        "canonical_format": None,
+        "bundle_required": False,
+        "import_mode": "direct",
+        "limits": ["普通图片、支持像素坐标、无物理标尺"],
         "selectable_for_upload": True,
     },
     {

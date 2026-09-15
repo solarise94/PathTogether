@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HistoPilot · 组织导航示意</title>
+<link rel="icon" href="data:,"><link rel="stylesheet" href="preview.css">
+<script defer src="tissue.js"></script><script defer src="motion.js"></script>
+</head>
+<body>
+<header><a href="#">HistoPilot</a><span>主页视觉预览 / 01</span></header>
+<main>
+<div class="intro"><p class="eyebrow">从组织结构，到细胞细节</p><h1>沿着组织，找到值得细看的地方。</h1><p>看全景，选一处，放大观察并标注；再到下一处继续。</p></div>
+<section class="viewer" aria-label="组织导航流程示意">
+<div class="toolbar"><span><i></i>组织导航</span><span class="schematic">形态与流程示意 · 非真实切片</span></div>
+<div class="body"><div class="canvas">
+<svg id="tissue" viewBox="0 0 900 680" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="svg-title svg-desc"><title id="svg-title">腺体组织 SVG 示意图</title><desc id="svg-desc">多个大小与形状不同的腺体围绕腔隙排列。细胞与细胞核有适度随机变化，腺体之间分布纤维状间质。</desc></svg>
+<div class="corner"><span id="location">全景</span><span class="dot">·</span><span>示意视野</span></div>
+<div class="note" id="note" hidden><span id="note-id">01</span><div><strong id="note-title"></strong><p id="note-body"></p></div></div>
+</div><aside><div class="agent-label"><span class="agent-dot"></span>AGENT WALKTHROUGH</div><h2 id="phase">先看看整体组织</h2><p id="status" role="status">辨认腺体分布与腺体之间的间质，选择第一处观察区域。</p>
+<ol id="steps"><li>全景</li><li>局部 A</li><li>细节 A</li><li>标注 A</li><li>切换局部 B</li><li>细节 B</li><li>标注 B</li></ol>
+<div class="legend"><span><i class="nucleus"></i>细胞核</span><span><i class="lumen"></i>腔隙</span><span><i class="mark"></i>观察标注</span></div>
+<p class="aside-note">参考腺体组织的排列关系绘制。观察文字用于演示交互，不代表模型分析结果。</p></aside></div>
+<div class="controls"><div class="progress"><span id="progress"></span></div><span id="count">01 / 07</span><button id="previous" aria-label="上一步">←</button><button id="toggle">暂停</button><button id="next" aria-label="下一步">→</button><button id="replay">重播 ↻</button></div>
+</section>
+<div class="design-notes"><p><b>有结构的随机</b>腺体围绕腔隙排列，细胞大小、长短、旋转角度与间距有受控变化。</p><p><b>同一张矢量图</b>从全景到细节只移动视野。标注随组织保留，整个流程无需切换图片。</p></div>
+</main>
+</body></html>

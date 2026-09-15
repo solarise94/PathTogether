@@ -18,6 +18,7 @@ import os
 import secrets
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -31,13 +32,20 @@ import pg_reap  # noqa: E402  (path 就绪后再 import，不依赖脚本目录�
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8907)
+    # 分享服务（share_server.py，独立 Flask）第二端口；缺省 = 主端口 + 1
+    parser.add_argument("--share-port", type=int, default=None)
     args = parser.parse_args()
+    share_port = args.share_port or (args.port + 1)
 
     tmp = tempfile.mkdtemp(prefix="pt-e2e-app-")
     os.environ["SHARE_DATA_DIR"] = os.path.join(tmp, "share-data")
     os.environ["UPLOAD_DIR"] = os.path.join(tmp, "uploads")
     os.makedirs(os.environ["SHARE_DATA_DIR"], exist_ok=True)
     os.makedirs(os.environ["UPLOAD_DIR"], exist_ok=True)
+    # E2E 上传目录在 /tmp（tmpfs 常小于 upload_guard 默认 20 GiB 磁盘保留
+    # 水位）——测试环境把水位降到 16 MiB，只影响本进程内的守卫阈值
+    #（upload_guard 在 import 期读 env；真实默认值语义不受影响）。
+    os.environ.setdefault("UPLOAD_RESERVED_FREE_BYTES", str(16 * 1024 * 1024))
     os.environ.setdefault("AI_SIDECAR_URL", "http://127.0.0.1:8055")
 
     # 内嵌 PostgreSQL（隔离实例，不碰任何本机库）
@@ -76,6 +84,9 @@ def main():
     # 生产判定（TESTING/debug 均关）下 CSP 必须有规范公网 origin；本地 E2E
     # 用 http origin（本地 HTTP 合法，公网强制 https 由 Python CSP 测试覆盖）
     os.environ["PUBLIC_BASE_URL"] = "http://127.0.0.1:%d" % args.port
+    # 分享 URL 指向本进程第二端口的 share_server（SHARE_BASE_URL 在 app.py
+    # 模块作用域读取，必须先于 import app 设置）。
+    os.environ["SHARE_BASE_URL"] = "http://127.0.0.1:%d" % share_port
 
     # openslide stub + 数据目录幂等初始化（与 pytest 会话同一套引导）
     import _bootstrap  # noqa: F401
@@ -96,11 +107,22 @@ def main():
         tempfile.gettempdir(), "pt-e2e-creds-%d.json" % args.port)
     Path(creds_path).write_text(json.dumps({
         "baseUrl": "http://127.0.0.1:%d" % args.port,
+        "shareBaseUrl": "http://127.0.0.1:%d" % share_port,
         "ownerLogin": "e2e-owner@pt.test",
         "ownerPassword": owner_pw,
         "userLogin": "e2e-user@pt.test",
         "userPassword": user_pw,
     }), encoding="utf-8")
+
+    # 分享服务（raster-image-compat E2E 起接入）：真实 share_server.app 在
+    # 第二端口以 daemon 线程运行，与主站共享 UPLOAD_DIR / SHARE_DATA_DIR /
+    # DATABASE_URL（既有 PG 与临时目录清理纪律不变——daemon 线程随进程
+    # 退出结束，finally/atexit 清理路径不受影响）。
+    import share_server
+    threading.Thread(
+        target=lambda: share_server.app.run(
+            host="127.0.0.1", port=share_port, threaded=True),
+        name="e2e-share-server", daemon=True).start()
 
     try:
         app_mod.app.run(host="127.0.0.1", port=args.port, threaded=True)

@@ -38,6 +38,7 @@ import json
 import os
 import secrets
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -123,6 +124,18 @@ class QuotaError(BaiduImportError):
 class UnavailableError(BaiduImportError):
     code = "connector_unavailable"
     http_status = 503
+
+
+class LeaseLost(BaiduImportError):
+    """批次租约已被其他 worker 重领（fence 校验失败）。
+
+    内部异常：``run_claimed_batch`` 捕获后**安静放弃**（不推进剩余条目、
+    不 finalize、不清理副本、不覆盖新 owner 状态），绝不向
+    ``run_batch`` / ``run_claimed_batch`` 的调用方泄漏（worker 脚本不
+    感知）；HTTP 层正常情况下永远不会见到它。
+    """
+    code = "lease_lost"
+    http_status = 409
 
 
 # --------------------------------------------------------------------------- #
@@ -963,8 +976,41 @@ def claim_batch(worker_id="worker", lease_seconds=BATCH_LEASE_SECONDS):
         conn.close()
 
 
-def _update_item(item_id, fields):
-    """短事务更新条目（fields：列名→值 dict）。返回新行。"""
+def heartbeat_batch(batch_id, worker_id, lease_token,
+                    lease_seconds=BATCH_LEASE_SECONDS):
+    """批次租约续期（对齐 ``heartbeat_enumeration``；额外匹配 lease_token：
+    只有仍持有本次 claim 租约的 ``(worker_id, lease_token)`` 能续期）。
+
+    批次被其他 worker 重领（token 更新）或已终结（state != 'running'）
+    后返回 False——调用方（心跳线程）据此置标志、主循环安静放弃，
+    绝不覆盖新 owner 的状态。
+    """
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE baidu_import_batches SET lease_expires_at="
+                    "now() + (%s || ' seconds')::interval, updated_at=now() "
+                    "WHERE id=%s AND lease_owner=%s AND lease_token=%s "
+                    "AND state='running'",
+                    (str(int(lease_seconds)), batch_id, worker_id,
+                     lease_token))
+                return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def _update_item(item_id, fields, batch_id=None, lease_token=None):
+    """短事务更新条目（fields：列名→值 dict）。返回新行。
+
+    带 fence（batch_id + lease_token）时：同一事务内以批次当前
+    lease_token 匹配本次 claim 持有的 token（``IS NOT DISTINCT FROM``
+    为 NULL 安全比较）——不匹配（租约已被其他 worker 经 claim_batch
+    重领）→ 行数 0 → 抛 :class:`LeaseLost`，绝不覆盖新 owner 的条目
+    状态。worker 写回路径（_phase_* / _fail_item / 对账）全部带 fence；
+    读路径 ``_get_item`` 无需 fence。
+    """
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -973,11 +1019,24 @@ def _update_item(item_id, fields):
                 for k, v in fields.items():
                     sets.append("%s=%%s" % k)
                     args.append(v)
-                args.append(item_id)
+                if batch_id is None:
+                    # 无 fence 兼容路径（无租约上下文的调用方自行负责）
+                    args.append(item_id)
+                    cur.execute(
+                        "UPDATE baidu_import_items SET " + ", ".join(sets) +
+                        " WHERE id=%s RETURNING *", tuple(args))
+                    return cur.fetchone()
+                args.extend([item_id, batch_id, lease_token])
                 cur.execute(
                     "UPDATE baidu_import_items SET " + ", ".join(sets) +
-                    " WHERE id=%s RETURNING *", tuple(args))
-                return cur.fetchone()
+                    " WHERE id=%s AND (SELECT lease_token FROM "
+                    "baidu_import_batches WHERE id=%s) "
+                    "IS NOT DISTINCT FROM %s RETURNING *", tuple(args))
+                row = cur.fetchone()
+        if row is None:
+            raise LeaseLost(
+                "批次租约已被重领，条目写回被拒绝（item=%s）" % item_id)
+        return row
     finally:
         conn.close()
 
@@ -995,12 +1054,15 @@ def _get_item(item_id):
         conn.close()
 
 
-def _fail_item(item_id, error_code):
-    _update_item(item_id, {"stage": "failed", "error_code": error_code})
+def _fail_item(item_id, error_code, batch_id=None, lease_token=None):
+    """条目置 failed（带 fence：租约被夺 → LeaseLost，绝不覆盖新 owner）。"""
+    _update_item(item_id, {"stage": "failed", "error_code": error_code},
+                 batch_id=batch_id, lease_token=lease_token)
 
 
 def _phase_transfer(adapter, batch, item, hooks):
     """转存阶段（含崩溃对账：task_id poll → 副本对账 → 才考虑重转存）。"""
+    bid, token = batch["id"], batch.get("lease_token")
     stage = item["stage"]
     if stage in ("queued", "transferring"):
         need = True
@@ -1019,19 +1081,20 @@ def _phase_transfer(adapter, batch, item, hooks):
                 item = _update_item(
                     item["id"],
                     {"stage": "transferring",
-                     "attempt": int(item["attempt"]) + 1})
+                     "attempt": int(item["attempt"]) + 1}, bid, token)
             try:
                 resp = adapter.transfer_selected(
                     batch["id"], batch["_share_url"],
                     batch.get("_extraction_code"), [item["fs_id"]])
             except AdapterError as exc:
-                _fail_item(item["id"], exc.code)
+                _fail_item(item["id"], exc.code, bid, token)
                 return _get_item(item["id"])
             item = _update_item(item["id"],
-                                {"transfer_task_id": resp["task_id"]})
+                                {"transfer_task_id": resp["task_id"]},
+                                bid, token)
             poll = adapter.poll_transfer(resp["task_id"])
             if poll.get("state") == "failed":
-                _fail_item(item["id"], "transfer_failed")
+                _fail_item(item["id"], "transfer_failed", bid, token)
                 return _get_item(item["id"])
         hook = hooks.get("on_transfer_persisted")
         if hook:
@@ -1041,6 +1104,7 @@ def _phase_transfer(adapter, batch, item, hooks):
 
 def _phase_download(adapter, batch, item, staging_root, hooks):
     """下载阶段（sha 已记录且文件在盘 → 不重下载）。"""
+    bid, token = batch["id"], batch.get("lease_token")
     stage = item["stage"]
     if stage in ("queued", "transferring", "downloading"):
         skip = False
@@ -1054,29 +1118,30 @@ def _phase_download(adapter, batch, item, staging_root, hooks):
             remote = copies.get(item["name"])
             if remote is not None \
                     and int(remote["size"]) != int(item["source_size"]):
-                _fail_item(item["id"], "source_changed")
+                _fail_item(item["id"], "source_changed", bid, token)
                 return _get_item(item["id"])
             if stage != "downloading":
-                item = _update_item(item["id"], {"stage": "downloading"})
+                item = _update_item(item["id"], {"stage": "downloading"},
+                                    bid, token)
             staging_dir = Path(staging_root) / batch["id"]
             try:
                 adapter.download_to(
                     "%s/%s" % (batch["id"], item["name"]), staging_dir)
             except AdapterError as exc:
-                _fail_item(item["id"], exc.code)
+                _fail_item(item["id"], exc.code, bid, token)
                 return _get_item(item["id"])
             spath = staging_dir / item["name"]
             if not spath.is_file():
-                _fail_item(item["id"], "download_output_missing")
+                _fail_item(item["id"], "download_output_missing", bid, token)
                 return _get_item(item["id"])
             digest = _sha256_file(spath)
             if spath.stat().st_size != int(item["source_size"]):
-                _fail_item(item["id"], "size_mismatch")
+                _fail_item(item["id"], "size_mismatch", bid, token)
                 return _get_item(item["id"])
             item = _update_item(
                 item["id"], {"stage": "validating",
                              "staging_path": str(spath),
-                             "source_sha256": digest})
+                             "source_sha256": digest}, bid, token)
         hook = hooks.get("on_downloaded")
         if hook:
             hook(_get_item(item["id"]))  # 崩溃注入点 B
@@ -1091,12 +1156,78 @@ def _phase_convert_placeholder(adapter, batch, item):
                      if info["capability"] ==
                      slide_format_registry.CAP_CONVERT_REQUIRED
                      else "ingesting")
-        item = _update_item(item["id"], {"stage": new_stage})
+        item = _update_item(item["id"], {"stage": new_stage},
+                            batch["id"], batch.get("lease_token"))
     return item
+
+
+def _reconcile_ingest(item, batch):
+    """入库成功后、ingest_token 落库前崩溃的按标识对账。
+
+    ingest_staging 先完成产物落盘与归属登记，之后才单独写 ingest_token；
+    间隙崩溃重跑会因产物已存在 name_unavailable，把已成功任务打成
+    failed。此处按标识确认产物已完整落成且归属本批 owner → 直接按成功
+    路径落库（不再重跑入库）；不命中返回 None，调用方照旧走入库。
+    """
+    import baidu_ingest
+    owner = batch.get("owner_user_id") or ""
+    capability = slide_format_registry.lookup(item["name"])["capability"]
+    if capability == slide_format_registry.CAP_CONVERT_REQUIRED:
+        # convert：可见名 = canonical；锚点 = conversion job（owner/sha/state）
+        import conversion_store
+        visible = baidu_ingest.canonical_name_for(item["name"])
+        job = conversion_store.get_job_by_canonical(visible)
+        if job is None or job.get("state") != "ready" \
+                or (job.get("owner_user_id") or "") != owner \
+                or (job.get("source_sha256") or "").lower() != \
+                (item.get("source_sha256") or "").lower():
+            return None
+        assoc = job.get("project_associate_state") or "not_needed"
+        if assoc == "not_needed" and batch.get("target_project_id"):
+            # 关联重放（associate_slide 幂等：已入项目返回 succeeded）
+            assoc = baidu_ingest.associate_slide(
+                owner, batch["target_project_id"], visible)
+            conversion_store.set_project_associate(
+                job["id"], batch["target_project_id"], assoc)
+        return _update_item(item["id"], {
+            "stage": "ready",
+            "ingest_token": "cvj:" + job["id"],
+            "conversion_job_id": job["id"],
+            "slide_name": visible,
+            "project_associate_state": assoc,
+        }, batch["id"], batch.get("lease_token"))
+    # native：可见名 = 条目名（枚举名已是 basename）；锚点 = 产物在盘、
+    # 内容 sha 与条目下载摘要一致、share_store 元数据 owner 与批次 owner
+    # 一致。首轮入库也会先过对账，故 sha 必须核：owner 既有的同名不同
+    # 内容上传不得被认领（应走 ingest → name_unavailable）
+    import share_store
+    visible = item["name"]
+    up_dir = os.environ.get("UPLOAD_DIR")
+    if not up_dir or not (Path(up_dir) / visible).is_file():
+        return None
+    meta = share_store.get_slide_meta_full(visible)
+    if (meta.get("owner_user_id") or "") != owner:
+        return None
+    if not item.get("source_sha256") \
+            or _sha256_file(Path(up_dir) / visible) != \
+            item["source_sha256"].lower():
+        return None
+    assoc = "not_needed"
+    if batch.get("target_project_id"):
+        assoc = baidu_ingest.associate_slide(
+            owner, batch["target_project_id"], visible)
+    return _update_item(item["id"], {
+        "stage": "ready",
+        "ingest_token": "slide:" + visible,
+        "conversion_job_id": None,
+        "slide_name": visible,
+        "project_associate_state": assoc,
+    }, batch["id"], batch.get("lease_token"))
 
 
 def _phase_ingest(adapter, batch, item, hooks):
     """入库阶段：真实校验/转换/归属；ingest_token 是崩溃幂等凭证。"""
+    bid, token = batch["id"], batch.get("lease_token")
     if item.get("ingest_token"):
         hook = hooks.get("on_ingested")
         if hook:
@@ -1105,25 +1236,30 @@ def _phase_ingest(adapter, batch, item, hooks):
     if item["stage"] not in ("converting", "ingesting", "validating"):
         return _get_item(item["id"])
     import baidu_ingest
-    try:
-        result = baidu_ingest.ingest_staging(
-            owner_user_id=batch.get("owner_user_id") or "",
-            original_name=item["name"],
-            staging_path=item.get("staging_path"),
-            source_sha256=item.get("source_sha256"),
-            source_size=item.get("source_size"),
-            target_project_id=batch.get("target_project_id"))
-    except baidu_ingest.IngestError as exc:
-        _fail_item(item["id"], exc.code)
-        return _get_item(item["id"])
-    item = _update_item(item["id"], {
-        "stage": "ready",
-        "ingest_token": result["ingest_token"],
-        "conversion_job_id": result.get("conversion_job_id"),
-        "slide_name": result.get("slide_name"),
-        "project_associate_state": result.get("project_associate_state")
-        or "not_needed",
-    })
+    reconciled = _reconcile_ingest(item, batch)
+    if reconciled is not None:
+        # 间隙崩溃对账命中：产物已落成，按成功路径收口，不重跑入库
+        item = reconciled
+    else:
+        try:
+            result = baidu_ingest.ingest_staging(
+                owner_user_id=batch.get("owner_user_id") or "",
+                original_name=item["name"],
+                staging_path=item.get("staging_path"),
+                source_sha256=item.get("source_sha256"),
+                source_size=item.get("source_size"),
+                target_project_id=batch.get("target_project_id"))
+        except baidu_ingest.IngestError as exc:
+            _fail_item(item["id"], exc.code, bid, token)
+            return _get_item(item["id"])
+        item = _update_item(item["id"], {
+            "stage": "ready",
+            "ingest_token": result["ingest_token"],
+            "conversion_job_id": result.get("conversion_job_id"),
+            "slide_name": result.get("slide_name"),
+            "project_associate_state": result.get("project_associate_state")
+            or "not_needed",
+        }, bid, token)
     hook = hooks.get("on_ingested")
     if hook:
         hook(_get_item(item["id"]))  # 崩溃注入点 C
@@ -1143,7 +1279,8 @@ _TERMINAL_BATCH_STATES = ("succeeded", "partial_failed", "failed",
 
 
 def run_batch(batch_id, adapter, *, staging_root=None, worker_id="worker",
-              hooks=None, lease_seconds=BATCH_LEASE_SECONDS):
+              hooks=None, lease_seconds=BATCH_LEASE_SECONDS,
+              heartbeat_interval=None):
     """按 id 领取并推进一个批次到终态（不可领取返回 None）。
 
     ``hooks``：``on_transfer_persisted`` / ``on_downloaded`` /
@@ -1151,6 +1288,13 @@ def run_batch(batch_id, adapter, *, staging_root=None, worker_id="worker",
     对账凭证已先落库）。取消：queued 条目停止；无 ready 产物时释放
     未消费预占。清理：仅本批 ready 项副本；失败置 cleanup_state=failed，
     不回滚 ready。
+
+    心跳与 fencing：执行期间 daemon 心跳线程每 ``heartbeat_interval``
+    秒（缺省 ``max(1, lease_seconds/3)``）调 ``heartbeat_batch`` 续租；
+    心跳失败仅置标志。租约被夺后本 worker 的条目写回与收口全部被
+    lease_token fence 拒绝 → 安静放弃（返回当前 get_import 视图，批次
+    仍 running 由新 owner 推进；不清理副本、不重复配额动作），
+    ``LeaseLost`` 不向调用方泄漏。
     """
     claim = None
     conn = _connect()
@@ -1186,37 +1330,185 @@ def run_batch(batch_id, adapter, *, staging_root=None, worker_id="worker",
     finally:
         conn.close()
 
-    batch, items = claim["batch"], claim["items"]
-    hooks = hooks or {}
-    staging_root = Path(staging_root or STAGING_ROOT)
-
-    if batch["cancel_requested"]:
-        _apply_cancel(batch)
-        return get_import(batch_id, batch["owner_user_id"])
-
-    for item in items:
-        if item["stage"] in ("ready", "failed", "cancelled"):
-            continue
-        item = _phase_transfer(adapter, batch, item, hooks)
-        if item["stage"] == "failed":
-            continue
-        item = _phase_download(adapter, batch, item, staging_root, hooks)
-        if item["stage"] == "failed":
-            continue
-        item = _phase_convert_placeholder(adapter, batch, item)
-        item = _phase_ingest(adapter, batch, item, hooks)
-
-    _finalize_batch(batch, adapter, worker_id)
-    return get_import(batch_id, batch["owner_user_id"])
+    return run_claimed_batch(claim, adapter, staging_root=staging_root,
+                             worker_id=worker_id, hooks=hooks,
+                             lease_seconds=lease_seconds,
+                             heartbeat_interval=heartbeat_interval)
 
 
-def _apply_cancel(batch):
-    """取消收口：停止未开始条目；有 ready 产物时批次落 partial_failed
-    （成功产物不冒充失败也不删除）；无 ready 产物释放未消费预占。"""
+def _claim_with_secrets(claim):
+    """补齐 claim["batch"] 的瞬态 ``_share_url``/``_extraction_code``。
+
+    claim_batch 领取时不解密（保持轻量）；执行前从 baidu_enumerations
+    解密补齐，结果只存内存（绝不回写/出线），与 run_batch 领取路径一致。
+    """
+    batch = claim["batch"]
+    if "_share_url" in batch:
+        return claim
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
+                cur.execute(
+                    "SELECT share_url_enc, extraction_enc "
+                    "FROM baidu_enumerations WHERE id=%s",
+                    (batch["enumeration_id"],))
+                enc = cur.fetchone()
+    finally:
+        conn.close()
+    batch = dict(batch)
+    batch["_share_url"] = decrypt_text(enc["share_url_enc"])
+    batch["_extraction_code"] = decrypt_text(enc["extraction_enc"])
+    return {"batch": batch, "items": claim["items"]}
+
+
+def _batch_cancel_requested(batch_id):
+    """重读批次 cancel_requested（取消请求与 worker 并发于不同进程）。"""
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT cancel_requested FROM baidu_import_batches "
+                    "WHERE id=%s", (batch_id,))
+                row = cur.fetchone()
+                return bool(row and row["cancel_requested"])
+    finally:
+        conn.close()
+
+
+def _heartbeat_loop(batch_id, worker_id, lease_token, interval,
+                    lease_seconds, stop):
+    """daemon 续租循环：每 ``interval`` 秒调 ``heartbeat_batch`` 续期。
+
+    失败（租约被夺 / state 非 running / DB 异常）只置 ``stop`` 标志，
+    绝不抛出——主循环在条目边界检查该标志安静放弃；置位后本线程随即
+    退出（``finally`` 里主流程也用它停线程）。
+    """
+    while not stop.wait(interval):
+        try:
+            ok = heartbeat_batch(batch_id, worker_id, lease_token,
+                                 lease_seconds=lease_seconds)
+        except Exception:  # noqa: BLE001  心跳绝不干扰主流程
+            ok = False
+        if not ok:
+            stop.set()
+            return
+
+
+def run_claimed_batch(claim, adapter, *, staging_root=None,
+                      worker_id="worker", hooks=None, lease_seconds=None,
+                      heartbeat_interval=None):
+    """执行已领取的批次（claim_batch 返回值），推进到终态。
+
+    与 :func:`run_batch` 只差领取方式：本函数直接消费 claim 持有的新鲜
+    租约（两段式 ``claim_batch`` → ``run_claimed_batch``，与枚举侧
+    ``claim_enumeration`` → ``run_one_enumeration`` 同款），不按 id 二次
+    领取——二次领取因“queued 或租约过期”条件不满足恒返回 None，批次
+    会永远停在 running。
+
+    ``hooks``：``on_transfer_persisted`` / ``on_downloaded`` /
+    ``on_ingested``（崩溃注入点，异常向上传播 = 模拟进程崩溃；阶段与
+    对账凭证已先落库）。取消：queued 条目停止；无 ready 产物时释放
+    未消费预占。清理：仅本批 ready 项副本；失败置 cleanup_state=failed，
+    不回滚 ready。
+
+    心跳与租约 fencing（P1）：claim 携带 lease_token 时起 daemon 心跳
+    线程，每 ``heartbeat_interval`` 秒（缺省 ``max(1, lease_seconds/3)``；
+    ``lease_seconds`` 缺省取 ``BATCH_LEASE_SECONDS``）续租一次。条目
+    写回、取消收口、批次终态落库全部以本次 claim 的 lease_token 为
+    fence：心跳失败（租约被夺）或任一 fence 拒绝（``LeaseLost``）→
+    **安静放弃**——停心跳、不推进剩余条目、不 finalize、不清理副本、
+    不做配额动作，返回当前 :func:`get_import` 视图（批次仍 running，
+    由新 owner 推进到终态）；``LeaseLost`` 绝不向调用方泄漏。
+    """
+    claim = _claim_with_secrets(claim)
+    batch, items = claim["batch"], claim["items"]
+    hooks = hooks or {}
+    staging_root = Path(staging_root or STAGING_ROOT)
+
+    if lease_seconds is None:
+        lease_seconds = BATCH_LEASE_SECONDS
+    stop_hb = threading.Event()  # 置位 = 停心跳（含租约丢失）
+    hb = None
+    if batch.get("lease_token"):
+        interval = (max(1.0, lease_seconds / 3.0)
+                    if heartbeat_interval is None
+                    else float(heartbeat_interval))
+        hb = threading.Thread(
+            target=_heartbeat_loop,
+            args=(batch["id"], worker_id, batch["lease_token"], interval,
+                  int(lease_seconds), stop_hb),
+            name="baidu-batch-heartbeat-%s" % batch["id"], daemon=True)
+        hb.start()
+
+    def _abandon():
+        # 安静放弃：不收口/不清理，返回当前视图（批次仍 running，
+        # cancel_requested/终态由赢得租约的新 owner 落地）
+        return get_import(batch["id"], batch["owner_user_id"])
+
+    try:
+        if batch["cancel_requested"]:
+            _apply_cancel(batch)
+            return get_import(batch["id"], batch["owner_user_id"])
+
+        for item in items:
+            if stop_hb.is_set():
+                return _abandon()  # 心跳显示租约已丢：安静放弃
+            if item["stage"] in ("ready", "failed", "cancelled"):
+                continue
+            if _batch_cancel_requested(batch["id"]):
+                # 运行中收到取消：停止剩余条目并按取消语义收口（不走 finalize）
+                _apply_cancel(batch)
+                return get_import(batch["id"], batch["owner_user_id"])
+            try:
+                item = _phase_transfer(adapter, batch, item, hooks)
+                if item["stage"] == "failed":
+                    continue
+                item = _phase_download(adapter, batch, item, staging_root,
+                                       hooks)
+                if item["stage"] == "failed":
+                    continue
+                item = _phase_convert_placeholder(adapter, batch, item)
+                item = _phase_ingest(adapter, batch, item, hooks)
+            except LeaseLost:
+                # 租约已被其他 worker 重领：绝不能覆盖新 owner 的条目
+                # 状态，也不得 finalize/清理（会误删新 worker 的副本、
+                # 重复配额动作）——安静放弃
+                return _abandon()
+
+        _finalize_batch(batch, adapter, worker_id)
+        return get_import(batch["id"], batch["owner_user_id"])
+    finally:
+        stop_hb.set()  # 停心跳（wait 立即返回，线程随即退出）
+        if hb is not None:
+            hb.join(timeout=5)
+
+
+def _apply_cancel(batch):
+    """取消收口：停止未开始条目；有 ready 产物时批次落 partial_failed
+    （成功产物不冒充失败也不删除）；无 ready 产物释放未消费预占。
+
+    Fencing：条目取消与批次 terminal 落库均要求本次 claim 的
+    lease_token 仍是批次当前 token（事务先 FOR UPDATE 锁批次行并核对，
+    与 claim_batch 的 SKIP LOCKED 串行化，杜绝「条目已取消而批次落库
+    被拒」的中间态）；不匹配（新 worker 已重领）→ 原样跳过、不动配额
+    ——新 owner 会看到 cancel_requested 并自行收口。返回本 worker 是否
+    完成收口。
+    """
+    owner = batch.get("lease_owner")
+    token = batch.get("lease_token")
+    conn = _connect()
+    applied = False
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT lease_token FROM baidu_import_batches "
+                    "WHERE id=%s FOR UPDATE", (batch["id"],))
+                lease_row = cur.fetchone()
+                if lease_row is None or lease_row["lease_token"] != token:
+                    return False  # 租约已被夺：新 owner 负责取消收口
                 cur.execute(
                     "SELECT stage FROM baidu_import_items "
                     "WHERE batch_id=%s AND stage='ready'", (batch["id"],))
@@ -1229,15 +1521,22 @@ def _apply_cancel(batch):
                 cur.execute(
                     "UPDATE baidu_import_items SET stage='cancelled', "
                     "updated_at=now() WHERE batch_id=%s "
-                    "AND stage NOT IN ('ready','failed','cancelled')",
-                    (batch["id"],))
+                    "AND stage NOT IN ('ready','failed','cancelled') "
+                    "AND (SELECT lease_token FROM baidu_import_batches "
+                    "WHERE id=%s) IS NOT DISTINCT FROM %s",
+                    (batch["id"], batch["id"], token))
                 state = ("partial_failed" if has_ready
                          else ("failed" if has_failed else "cancelled"))
                 cur.execute(
                     "UPDATE baidu_import_batches SET state=%s, "
                     "lease_owner=NULL, lease_token=NULL, "
                     "lease_expires_at=NULL, updated_at=now() "
-                    "WHERE id=%s RETURNING *", (state, batch["id"]))
+                    "WHERE id=%s AND lease_owner IS NOT DISTINCT FROM %s "
+                    "AND lease_token IS NOT DISTINCT FROM %s RETURNING *",
+                    (state, batch["id"], owner, token))
+                if cur.rowcount != 1:
+                    return False  # 新 worker 已接管：跳过配额收口
+                applied = True
                 reservation_id = batch["quota_reservation_id"]
                 cur.execute(
                     "SELECT COALESCE(SUM(source_size),0)::bigint AS bytes "
@@ -1246,6 +1545,8 @@ def _apply_cancel(batch):
                 ready_bytes = int(cur.fetchone()["bytes"])
     finally:
         conn.close()
+    if not applied:
+        return False
     if reservation_id:
         if has_ready and ready_bytes > 0:
             # 已有 ready 产物：按实际字节幂等收口（consume 幂等，重跑不双扣）
@@ -1256,14 +1557,32 @@ def _apply_cancel(batch):
         elif not has_ready:
             # 仅有未消费预占（无任何 ready 产物）→ 释放
             _safe_release(reservation_id)
+    return True
 
 
 def _finalize_batch(batch, adapter, worker_id):
-    """聚合条目终态 → 批次终态；配额一次收口；本批副本清理。"""
+    """聚合条目终态 → 批次终态；配额一次收口；本批副本清理。
+
+    Fencing：事务先 FOR UPDATE 锁批次行并核对本次 claim 的 lease_token，
+    批次 terminal UPDATE 再以 ``lease_owner/lease_token`` 为条件；行数
+    0（新 worker 已重领）→ **跳过配额收口与副本清理**——清理删除的是
+    「当前批次目录」下的副本，新旧 worker 同批次路径同名，旧 worker
+    清理会误删新 worker 的副本。配额 consume/release 只由赢得条件更新
+    的那方执行。返回本 worker 是否赢得收口。
+    """
+    owner = batch.get("lease_owner")
+    token = batch.get("lease_token")
     conn = _connect()
+    won = False
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
+                cur.execute(
+                    "SELECT lease_token FROM baidu_import_batches "
+                    "WHERE id=%s FOR UPDATE", (batch["id"],))
+                lease_row = cur.fetchone()
+                if lease_row is None or lease_row["lease_token"] != token:
+                    return False  # 新 worker 已接管：不收口、不清理
                 cur.execute(
                     "SELECT stage, COUNT(*)::int AS n, "
                     "COALESCE(SUM(source_size),0)::bigint AS bytes "
@@ -1277,7 +1596,7 @@ def _finalize_batch(batch, adapter, worker_id):
                 pending = sum(n for s, (n, _) in stats.items()
                               if s not in ("ready", "failed", "cancelled"))
                 if pending:
-                    return  # 尚有条目在途（本轮未推进完），不改批次态
+                    return False  # 尚有条目在途（本轮未推进完），不改批次态
                 if ready_n and (failed_n or cancelled_n):
                     state = "partial_failed"
                 elif ready_n:
@@ -1289,12 +1608,19 @@ def _finalize_batch(batch, adapter, worker_id):
                 cur.execute(
                     "UPDATE baidu_import_batches SET state=%s, "
                     "lease_owner=NULL, lease_token=NULL, "
-                    "lease_expires_at=NULL, updated_at=now() WHERE id=%s",
-                    (state, batch["id"]))
+                    "lease_expires_at=NULL, updated_at=now() "
+                    "WHERE id=%s AND lease_owner IS NOT DISTINCT FROM %s "
+                    "AND lease_token IS NOT DISTINCT FROM %s",
+                    (state, batch["id"], owner, token))
+                if cur.rowcount != 1:
+                    return False  # 条件更新未赢：跳过配额收口与清理
+                won = True
                 reservation_id = batch["quota_reservation_id"]
                 consumed_bytes = ready_bytes
     finally:
         conn.close()
+    if not won:
+        return False
     # 配额收口：ready 产物字节数一次 consume（consume_reservation 幂等，
     # 崩溃重跑不双扣；无 ready（全失败/取消）→ 释放未消费预占
     if reservation_id:
@@ -1306,6 +1632,7 @@ def _finalize_batch(batch, adapter, worker_id):
         else:
             _safe_release(reservation_id)
     _cleanup_copies(batch, adapter, state)
+    return True
 
 
 def _cleanup_copies(batch, adapter, batch_state):

@@ -38,12 +38,26 @@
   不缓存旧代内容）。
 - 主站 ``evict`` 仅是快速路径：正确性不依赖它——跨进程（share_server 与
   app 各自进程）由借用时的签名检查兜底，未 evict 也会在下次借用换代。
+
+普通图片（BMP/JPEG，raster-image-compatibility §4.6）
+-----------------------------------------------------
+- **单解码句柄**：普通图片不是可按需读块的金字塔切片，整幅 RGB 缓冲常驻
+  （50MP ≈ 150MB/张）。按路径（``slide_io.is_raster_ext``）识别普通图片，
+  信号量/池上限取 **1**——并发请求同图在信号量上自然串行排队；借还锁与
+  换代（FileSignature/generation/retire）语义完全不变。
+- **有界缓存/惰性 LRU**：``_slide_cache`` 原本只增不减（仅 evict 快路径），
+  对全量解码的普通图片不能只记录风险就声称内存有界。普通图片条目额外记入
+  ``_raster_lru``（容量 ``RASTER_CACHE_MAX_ENTRIES``，env 可配，默认 4）；
+  ``get_slide`` 惰性触发淘汰（不新增常驻线程）：超出预算时最久未用条目按
+  现有换代纪律退休（空闲句柄立即关、在途句柄归还即关——活跃条目不会被
+  强关），并清其 info 缓存。非普通图片条目行为保持不变。
 """
 
 import contextlib
 import os
 import queue
 import threading
+from collections import OrderedDict
 from typing import Callable, NamedTuple, Optional, Tuple
 
 import openslide
@@ -57,6 +71,29 @@ DZ_OVERLAP = 1
 
 # 句柄池大小：每个切片可并行的句柄数（默认 6）
 SLIDE_HANDLE_POOL = int(os.environ.get("SLIDE_HANDLE_POOL") or 6)
+
+# 普通图片缓存预算（§4.6）：RGB 常驻 ≈ W×H×3 字节（50MP ≈ 150MB/张；Wave 1
+# 实测 48MP BMP 冷打开峰值 RSS ~217MB，含解码/转置瞬时开销）。默认按目标
+# 进程内存 1–2GB 取 **4 张**起步：4 × 150MB ≈ 600MB 常驻上限，叠加一次解码
+# 的 ~220MB 瞬时峰值与瓦片 JPEG 编码开销仍在预算内，同时给「多图对比查看」
+# 留出实用的工作集。环境变量 RASTER_CACHE_MAX_ENTRIES 可覆盖（非法/非正值
+# 回退默认；模块加载期读取，测试可 monkeypatch 本常量）。
+_DEFAULT_RASTER_CACHE_MAX = 4
+
+
+def _env_raster_cache_max():
+    """读取 ``RASTER_CACHE_MAX_ENTRIES`` 环境变量（非法/缺省回退默认值）。"""
+    raw = os.environ.get("RASTER_CACHE_MAX_ENTRIES")
+    if not raw:
+        return _DEFAULT_RASTER_CACHE_MAX
+    try:
+        v = int(raw)
+    except ValueError:
+        return _DEFAULT_RASTER_CACHE_MAX
+    return v if v > 0 else _DEFAULT_RASTER_CACHE_MAX
+
+
+RASTER_CACHE_MAX_ENTRIES = _env_raster_cache_max()
 
 # 借用期间文件被连续替换的最大重试次数（正常 1 次内必成；只是病态竞争兜底）
 _MAX_ACQUIRE_ATTEMPTS = 4
@@ -88,10 +125,14 @@ class SlideFileChanged(Exception):
     """
 
 
-# 切片缓存：name -> {"name", "path", "pool", "sem", "created_handles",
+# 切片缓存：name -> {"name", "path", "pool", "sem", "raster", "created_handles",
 #                    "generation", "signature", "retired", "gen_lock"}
 _slide_cache: dict = {}
 _cache_lock = threading.Lock()
+
+# 普通图片 LRU（仅收录 entry["raster"] 条目；name -> None，尾部 = 最近使用）。
+# 读写均在 _cache_lock 内；淘汰对象按尾部→头部（最久未用优先）。
+_raster_lru: "OrderedDict[str, None]" = OrderedDict()
 
 # 元数据缓存：name -> (FileSignature, meta_dict)（签名感知，文件未变则复用）
 _info_cache: dict = {}
@@ -112,12 +153,17 @@ def _new_entry(name, path):
 
     generation 从 0 起；signature 惰性（首次借用时 stat）。retired 一旦
     True 表示该 entry 至少换过一代/被 evict 过（在途旧代句柄归还即关）。
+
+    普通图片（按路径后缀 ``slide_io.is_raster_ext`` 识别）：``raster=True``，
+    信号量/池上限取 1（§4.6 单解码句柄）；其余格式保持 SLIDE_HANDLE_POOL。
     """
+    is_raster = slide_io.is_raster_ext(name)
     return {
         "name": name,
         "path": path,
         "pool": queue.Queue(),
-        "sem": threading.Semaphore(SLIDE_HANDLE_POOL),
+        "raster": is_raster,
+        "sem": threading.Semaphore(1 if is_raster else SLIDE_HANDLE_POOL),
         "created_handles": 0,
         "generation": 0,
         "signature": None,
@@ -126,23 +172,70 @@ def _new_entry(name, path):
     }
 
 
+def _touch_raster_locked(name):
+    """LRU 记账：普通图片条目移到「最近使用」尾部（须持 _cache_lock）。"""
+    if name in _raster_lru:
+        _raster_lru.move_to_end(name)
+
+
+def _pop_raster_victims_locked():
+    """普通图片条目超预算时按最久未用弹出待淘汰 entry（须持 _cache_lock）。
+
+    只淘汰普通图片条目（_raster_lru 即其成员清单）；被挤出的 entry 同时从
+    _slide_cache 移除。返回 victim entry 列表（ retirement 在锁外做，避免
+    _cache_lock 与 gen_lock 嵌套）。
+    """
+    victims = []
+    while len(_raster_lru) > RASTER_CACHE_MAX_ENTRIES:
+        victim_name, _ = _raster_lru.popitem(last=False)
+        victim = _slide_cache.pop(victim_name, None)
+        if victim is not None:
+            victims.append(victim)
+    return victims
+
+
+def _retire_victim_entry(victim):
+    """淘汰收尾（锁外）：按换代纪律退休 + 清 info 缓存。
+
+    空闲句柄立即关闭；**在途（借出中）句柄不被强关**——归还时按代差
+    （pair.gen != entry.generation）关闭，借出方手里的读取可一致完成。
+    """
+    with victim["gen_lock"]:
+        _retire_generation_locked(victim, signature_of(victim["path"]))
+    with _info_cache_lock:
+        _info_cache.pop(victim["name"], None)
+
+
 def get_slide(name, path):
     """从缓存获取（或创建）切片的句柄池 entry。
 
     打开是惰性的：首次 borrow_pair 时才真正调用 slide_io.open_slide，因此这里
     无需处理"并发打开同一文件"的句柄泄漏（空 entry 被丢弃也无副作用）。
+
+    普通图片条目：命中即刷新 LRU recency；新建后惰性触发 LRU 淘汰
+    （超 ``RASTER_CACHE_MAX_ENTRIES`` 时关掉最久未用条目，见模块 docstring）。
     """
     with _cache_lock:
         entry = _slide_cache.get(name)
         if entry is not None:
+            if entry.get("raster"):
+                _touch_raster_locked(name)
             return entry
     # 缓存未命中：创建空 entry（不在全局锁内，避免阻塞其他切片）
     entry = _new_entry(name, path)
     with _cache_lock:
         existing = _slide_cache.get(name)
         if existing is not None:
+            if existing.get("raster"):
+                _touch_raster_locked(name)
             return existing
         _slide_cache[name] = entry
+        victims = []
+        if entry["raster"]:
+            _raster_lru[name] = None
+            victims = _pop_raster_victims_locked()
+    for victim in victims:
+        _retire_victim_entry(victim)
     return entry
 
 
@@ -249,8 +342,10 @@ def borrow_pair(entry):
     """借出一个属于当前 generation 的 (osr, dz) 句柄对，用完归还到池。
 
     并发数受 entry["sem"] 限制：池空且并发 > N 时阻塞等待归还（至少 N 路并行）。
-    借出前在同一把代锁内比较文件签名并按需换代（同名 replace/原地改写/
-    保持 mtime 均触发）；旧代空闲句柄立即关，旧代在途句柄归还时关。
+    普通图片（entry["raster"]）N=1：并发请求同图在信号量上自然串行排队
+    （§4.6 单解码句柄）。借出前在同一把代锁内比较文件签名并按需换代
+    （同名 replace/原地改写/保持 mtime 均触发）；旧代空闲句柄立即关，
+    旧代在途句柄归还时关。
     """
     entry["sem"].acquire()
     pair = None
@@ -271,10 +366,11 @@ def evict(name):
 
     仅作快速路径（主站删除/重传后主动释放）：正确性不依赖本调用——
     跨进程（share_server 不 evict）由 borrow_pair 的签名检查兜底换代。
-    在途句柄通过换代标记在归还时关闭。
+    在途句柄通过换代标记在归还时关闭。普通图片条目同时移出 LRU。
     """
     with _cache_lock:
         entry = _slide_cache.pop(name, None)
+        _raster_lru.pop(name, None)
     if entry is not None:
         with entry["gen_lock"]:
             _retire_generation_locked(entry, signature_of(entry["path"]))

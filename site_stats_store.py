@@ -11,11 +11,12 @@ docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md §3.4 / §4.4 /
 
 - ``SITE_BOT_UA_RULESET_VERSION``：bot 词表版本常量（词表修改必须同步提版）；
 - ``build_event(**kwargs) -> dict | None``：纯函数。非 allowlist 路径 /
-  非本站 Host（配置了 PUBLIC_BASE_URL/PUBLIC_ORIGINS 时） /
+  Host 未命中 ``SITE_STATS_ENTRY_HOSTS`` 白名单（未配置该 env / Host 缺失或
+  非法 / 同机其它域名一律 fail-closed 拒绝） /
   非 2xx-3xx / 非 HTML / 含 query token 或资源 ID → None；返回 dict 键固定
-  page_key/occurred_at/dedup_bucket/referrer_domain/utm_source/country_code/
-  daily_visitor_hash/visitor_kind/bot_name（即落库最小事件，无原始 IP/UA/
-  query/token/资源 ID——原始值在本函数内计算派生后即丢弃）；
+  page_key/occurred_at/dedup_bucket/request_host/referrer_domain/utm_source/
+  country_code/daily_visitor_hash/visitor_kind/bot_name（即落库最小事件，无原始
+  IP/UA/query/token/资源 ID——原始值在本函数内计算派生后即丢弃）；
 - ``enqueue_visit(event) -> bool``：有界进程内队列 put_nowait；队列满 /
   worker 未启动 / 后端不可用 → False（丢该条），**永不抛异常**；
 - ``start_worker()``：后台批量写线程，幂等（PostgreSQL 为唯一后端）；
@@ -23,7 +24,13 @@ docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md §3.4 / §4.4 /
   页面响应）；
 - ``dashboard_stats(*, now=None) -> dict``：owner-only 只读固定聚合，
   无写副作用、不创建事件、不调清理；全部来自 site_visit_events，不联任何
-  业务表；
+  业务表。聚合口径（review 2026-09-15 访问来源混入治理）：只统计
+  ``request_host`` 命中当前 ``SITE_STATS_ENTRY_HOSTS`` 白名单的行；迁移前
+  历史行（request_host IS NULL = 目标域名未知）默认排除，仅在 ``legacy``
+  键单独计数。**目标域名（Host）决定「是不是本服务访问」，Referer 只表示
+  「从哪里跳过来」**——外部来源榜照常保留真实外站 Referer（Google 等搜索引擎
+  是有效外部来源），但默认排除疑似爬虫（``top_referrers_with_bots`` 为含爬虫
+  的对照口径）；
 - ``purge_expired(*, now=None) -> int``：显式 retention 清理，只删
   ``expires_at`` 到期的 site events，返回删除行数。
 
@@ -34,6 +41,10 @@ docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md §3.4 / §4.4 /
 ==========================================  ==============================
 secret 文件未配置/缺失/权限过宽/为空        build_event → None（采集停
                                             止）+ 节流 warning
+SITE_STATS_ENTRY_HOSTS 未配置/含非法项     build_event → None（fail-closed，
+                                            停止采集）+ 节流 warning
+Host 缺失（None/空）/ 未命中白名单          build_event → None（静默，无
+                                            日志——外部扫描拒绝是常态）
 remote_addr 缺失/不可解析                   build_event → None（无法算
                                             日轮换匿名哈希）
 worker 未启动                               enqueue False
@@ -128,6 +139,16 @@ _WARN_INTERVAL_SECONDS = 60.0
 SECRET_FILE_ENV = "SITE_STATS_HMAC_SECRET_FILE"
 _SECRET_MAX_BYTES = 4096
 
+#: 统计入口白名单 env 名（review 2026-09-15）：逗号分隔 hostname，每项可写
+#: 裸域名（histopilot.com）或完整 origin（https://histopilot.com:443），统一
+#: 取规范化 hostname。**独立于 PUBLIC_BASE_URL/PUBLIC_ORIGINS**——那两个是
+#: CSP/邮件 canonical 配置，允许范围会随入口演进；统计口径要求显式严格，
+#: 未配置/含非法项一律 fail-closed 停止采集（页面服务不受影响）。
+SITE_STATS_ENTRY_HOSTS_ENV = "SITE_STATS_ENTRY_HOSTS"
+
+#: 白名单项（与 0053 CHECK 同一口径）的 hostname 形态
+_ENTRY_HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
+
 #: 统计日界时区：Asia/Shanghai 无夏令时，固定 UTC+8 等价（避免依赖容器
 #: tzdata）；与 spend_store 的业务周期时区口径一致（DB 存 UTC）。
 _STATS_TIMEZONE = timezone(timedelta(hours=8))
@@ -209,9 +230,9 @@ _LOCAL_HOSTS = frozenset({
 
 #: 事件 dict 的固定键集合（跨代理契约；多余键一个都不能有）
 _EVENT_KEYS = frozenset({
-    "page_key", "occurred_at", "dedup_bucket", "referrer_domain",
-    "utm_source", "country_code", "daily_visitor_hash", "visitor_kind",
-    "bot_name",
+    "page_key", "occurred_at", "dedup_bucket", "request_host",
+    "referrer_domain", "utm_source", "country_code", "daily_visitor_hash",
+    "visitor_kind", "bot_name",
 })
 
 
@@ -340,11 +361,50 @@ def _add_url_host(hosts, raw):
         hosts.add(host.lower().rstrip("."))
 
 
-def _public_entry_hostnames():
-    """本服务公网入口 hostname：只含 PUBLIC_BASE_URL + PUBLIC_ORIGINS。
+def _stats_entry_hosts():
+    """解析 ``SITE_STATS_ENTRY_HOSTS`` → 规范化 hostname 集合。
 
-    同机其它站点（如 cpa.ni-biolab.com）即使打到同一 gunicorn，也不算本站访问。
-    未配置公网入口时返回空集（本地/测试不按 Host 过滤）。
+    返回值两态：
+
+    - ``set([...])``：已配置且全部合法（至少一个 hostname；纯空白/逗号
+      组成的输入按未配置处理）；
+    - ``None``：未配置，或任一项无法解析为合法 hostname（fail-closed：
+      整个白名单作废，调用方停止采集并节流告警，绝不"跳过坏项继续用"）。
+
+    每项容忍裸 hostname / 完整 origin / 带端口 / 尾点 / 大小写，统一规范化
+    为小写无端口 hostname。每次调用重读 env（与 secret 文件同口径，便于
+    测试注入；调用频率 = 页面请求频率，开销可忽略）。
+    """
+    raw = (os.environ.get(SITE_STATS_ENTRY_HOSTS_ENV) or "").strip()
+    if not raw:
+        return None
+    hosts = set()
+    for part in raw.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if "//" in item:
+            try:
+                host = urlparse(item).hostname
+            except ValueError:
+                host = None
+            if not host:
+                return None
+            host = _normalize_hostname(host)
+        else:
+            host = _normalize_hostname(item)
+        if not host or len(host) > 253 or not _ENTRY_HOST_RE.match(host):
+            return None
+        hosts.add(host)
+    return hosts if hosts else None
+
+
+def _public_entry_hostnames():
+    """公网入口 hostname：只含 PUBLIC_BASE_URL + PUBLIC_ORIGINS。
+
+    仅用于 referrer 的"同站"归类（本服务自己入口之间的跳转不算外部来源），
+    **不再参与采集准入**——准入由 ``_stats_entry_hosts`` 独立白名单负责。
+    未配置时返回空集。
     """
     hosts = set()
     _add_url_host(hosts, os.environ.get("PUBLIC_BASE_URL"))
@@ -356,31 +416,32 @@ def _public_entry_hostnames():
 
 
 def _self_hostnames():
-    """视作"同站"的 hostname 集合：公网入口 + SERVER_NAME + 本机兜底。"""
+    """视作"同站"的 hostname 集合：统计入口白名单 + 公网入口 + SERVER_NAME
+    + 本机兜底。"""
     hosts = set(_LOCAL_HOSTS)
     hosts.update(_public_entry_hostnames())
+    entry_hosts = _stats_entry_hosts()
+    if entry_hosts:
+        hosts.update(entry_hosts)
     server_name = (os.environ.get("SERVER_NAME") or "").strip().lower()
     if server_name:
         hosts.add(_normalize_hostname(server_name) or server_name.rstrip("."))
     return hosts
 
 
-def _request_host_allowed(host):
-    """请求 Host 是否为本服务入口。
+def _admitted_request_host(host, entry_hosts):
+    """请求 Host 规范化后命中统计白名单 → 返回该规范化 hostname；否则 None。
 
-    未配置 PUBLIC_BASE_URL/PUBLIC_ORIGINS：不按 Host 过滤（本地测试）。
-    已配置：必须给出可解析 Host 且落在公网入口集合；同机其它域名一律不记。
-    host=None 视为调用方未接线（单元测试），不过滤。
+    fail-closed：entry_hosts 为 None（未配置/非法）、host 非 str（含未接线
+    的 None）、空串、规范化失败、未命中——一律 None。命中与否都不写日志
+    （外部扫描被拒是常态，且 Host 值不进日志）。
     """
-    if host is None:
-        return True
-    allowed = _public_entry_hostnames()
-    if not allowed:
-        return True
+    if entry_hosts is None or not isinstance(host, str):
+        return None
     normalized = _normalize_hostname(host)
     if not normalized:
-        return False
-    return normalized in allowed
+        return None
+    return normalized if normalized in entry_hosts else None
 
 
 def _referrer_domain(referrer):
@@ -467,14 +528,18 @@ def build_event(*, path, query_string, referrer, remote_addr, user_agent,
                 status_code, content_type, signed_in, host=None, now=None):
     """构造最小匿名事件；不符合口径返回 None（调用方静默丢弃）。
 
-    拒绝口径：非 allowlist 精确路径 / 非本站 Host（已配置公网入口时） /
-    状态码非 2xx-3xx / Content-Type 非 HTML / query 含 token 或资源 ID 键 /
-    secret 不可用 / remote_addr 不可解析。HTTP method（仅 GET 采集）由
-    after_request 调用点过滤——本函数契约无 method 参数。
+    拒绝口径：非 allowlist 精确路径 / Host 未命中 SITE_STATS_ENTRY_HOSTS
+    白名单（未配置该 env 或配置非法 → 停止采集并节流告警；Host 缺失或非
+    本服务域名 → 静默拒绝） / 状态码非 2xx-3xx / Content-Type 非 HTML /
+    query 含 token 或资源 ID 键 / secret 不可用 / remote_addr 不可解析。
+    HTTP method（仅 GET 采集）由 after_request 调用点过滤——本函数契约无
+    method 参数。
 
-    返回 dict 键固定（与 0030 列一一对应，无任何多余键）：
-    page_key, occurred_at, dedup_bucket, referrer_domain, utm_source,
-    country_code, daily_visitor_hash, visitor_kind, bot_name。
+    返回 dict 键固定（与 0030/0053 列一一对应，无任何多余键）：
+    page_key, occurred_at, dedup_bucket, request_host, referrer_domain,
+    utm_source, country_code, daily_visitor_hash, visitor_kind, bot_name。
+    request_host 为命中的白名单 hostname（目标域名决定「是不是本服务访问」；
+    Referer 只表示「从哪里跳过来」，两者语义不同，互不替代）。
     """
     # 1. 状态码：仅 2xx/3xx（要求真实 int，拒绝 "200" 之类的宽松转换）
     if not isinstance(status_code, int) or isinstance(status_code, bool):
@@ -489,8 +554,18 @@ def build_event(*, path, query_string, referrer, remote_addr, user_agent,
     page_key = PAGE_ALLOWLIST.get(path) if isinstance(path, str) else None
     if page_key is None:
         return None
-    # 3b. Host 必须是本服务公网入口。同机其它站点打到同一进程不记为本站访问。
-    if not _request_host_allowed(host):
+    # 3b. 入口域名白名单（review 2026-09-15，fail-closed）：目标域名决定
+    # 「是不是本服务访问」。未配置/非法 → 停止采集 + 节流告警；Host 缺失或
+    # 未命中（同机其它域名、裸 IP、扫描器伪造 Host）→ 静默拒绝。
+    entry_hosts = _stats_entry_hosts()
+    if entry_hosts is None:
+        _throttled_warn(
+            "entry_hosts_missing",
+            "site_stats: %s 未配置或含非法项，停止站点访问采集（页面服务"
+            "不受影响）" % SITE_STATS_ENTRY_HOSTS_ENV)
+        return None
+    request_host = _admitted_request_host(host, entry_hosts)
+    if request_host is None:
         return None
     # 4. query：含 token/资源 ID 键 → 整条拒绝；utm_source 之外的键全部丢弃
     if _query_has_sensitive_key(query_string):
@@ -526,6 +601,7 @@ def build_event(*, path, query_string, referrer, remote_addr, user_agent,
         "page_key": page_key,
         "occurred_at": moment_utc.isoformat(),
         "dedup_bucket": int(moment_utc.timestamp() // DEDUP_BUCKET_SECONDS),
+        "request_host": request_host,
         "referrer_domain": _referrer_domain(referrer),
         "utm_source": utm_source,
         "country_code": COUNTRY_CODE_FALLBACK,
@@ -636,6 +712,7 @@ def _flush_batch(events):
             occurred + timedelta(days=RETENTION_DAYS),
             ev.get("dedup_bucket"),
             ev.get("page_key"),
+            ev.get("request_host"),
             ev.get("referrer_domain"),
             ev.get("utm_source"),
             ev.get("country_code"),
@@ -664,9 +741,10 @@ def _flush_batch(events):
                 cur.executemany(
                     "INSERT INTO site_visit_events ("
                     "  event_id, occurred_at, expires_at, dedup_bucket,"
-                    "  page_key, referrer_domain, utm_source, country_code,"
-                    "  daily_visitor_hash, visitor_kind, bot_name) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    "  page_key, request_host, referrer_domain, utm_source,"
+                    "  country_code, daily_visitor_hash, visitor_kind,"
+                    "  bot_name) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                     "ON CONFLICT (daily_visitor_hash, page_key, dedup_bucket)"
                     " DO NOTHING",
                     rows)
@@ -685,8 +763,13 @@ def _flush_batch(events):
 
 # --------------------------------------------------------------------------- #
 # dashboard_stats（owner-only 只读固定聚合；无写副作用）
+#
+# 聚合口径（review 2026-09-15）：所有查询统一限定 request_host ∈ 当前
+# SITE_STATS_ENTRY_HOSTS 白名单——「目标域名」决定一条访问是不是本服务；
+# 迁移前历史行（request_host IS NULL = 目标域名未知）默认排除，仅在
+# legacy 键单独计数。白名单未配置（host_filter_configured=False）时主口径
+# 恒为空，面板据此亮红提示而不是静默展示混入数据。
 # --------------------------------------------------------------------------- #
-#: 聚合窗口（含今日）：today=1 天，d7=近 7 天，d30=近 30 天
 _DASHBOARD_WINDOW_KEYS = ("today", "d7", "d30")
 _DASHBOARD_DAYS = {"today": 1, "d7": 7, "d30": 30}
 _DASHBOARD_DAYS_BACK = {"today": 0, "d7": 6, "d30": 29}
@@ -706,10 +789,10 @@ def _dict_row():
     return psycopg.rows.dict_row
 
 
-def _window_agg(start_utc, end_utc):
-    """一个 [start, end) 窗口的三项聚合。unique_visitors 只数人类
-    （visitor_kind <> 'suspected_bot'）的日去重哈希——爬虫不进入匿名访客
-    近似数（§4.2/§7.2）；哈希按日轮换，跨日去重计数 ≈ 各日去重之和，
+def _window_agg(start_utc, end_utc, entry_hosts):
+    """一个 [start, end) 窗口的三项聚合（只计白名单入口）。unique_visitors
+    只数人类（visitor_kind <> 'suspected_bot'）的日去重哈希——爬虫不进入
+    匿名访客近似数（§4.2/§7.2）；哈希按日轮换，跨日去重计数 ≈ 各日去重之和，
     跨日不可识别同一人（故该指标不是"独立用户数"）。"""
     conn = pg_store.connect()
     conn.row_factory = _dict_row()
@@ -723,8 +806,9 @@ def _window_agg(start_utc, end_utc):
                 " count(*) FILTER (WHERE visitor_kind = 'suspected_bot')"
                 "   AS bots"
                 " FROM site_visit_events"
-                " WHERE occurred_at >= %s AND occurred_at < %s",
-                (start_utc, end_utc))
+                " WHERE occurred_at >= %s AND occurred_at < %s"
+                " AND request_host = ANY(%s)",
+                (start_utc, end_utc, list(entry_hosts)))
             row = cur.fetchone()
         return {
             "visits": int(row["visits"] or 0),
@@ -735,9 +819,10 @@ def _window_agg(start_utc, end_utc):
         conn.close()
 
 
-def _daily_series(start_utc, end_utc, days):
-    """30 天逐日序列（缺日补零）。日界：本地（UTC+8）日，SQL 侧先把
-    timestamptz 剥成 naive UTC 再加固定偏移，避免 ::date 受会话时区影响。
+def _daily_series(start_utc, end_utc, days, entry_hosts):
+    """30 天逐日序列（缺日补零；只计白名单入口）。日界：本地（UTC+8）日，
+    SQL 侧先把 timestamptz 剥成 naive UTC 再加固定偏移，避免 ::date 受会话
+    时区影响。
 
     序列锚定在 [start, end) 的**最后一个本地日**（end−1µs 的本地日期），
     与 SQL 分组键共用同一日界；调用方传完整窗口（如 [今天−29 天零点,
@@ -754,13 +839,14 @@ def _daily_series(start_utc, end_utc, days):
         "   AS bots"
         " FROM site_visit_events"
         " WHERE occurred_at >= %%s AND occurred_at < %%s"
+        " AND request_host = ANY(%%s)"
         " GROUP BY 1" % _STATS_SQL_OFFSET_HOURS)
     grouped = {}
     conn = pg_store.connect()
     conn.row_factory = _dict_row()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (start_utc, end_utc))
+            cur.execute(sql, (start_utc, end_utc, list(entry_hosts)))
             for row in cur.fetchall():
                 grouped[row["day"]] = row
     finally:
@@ -780,22 +866,25 @@ def _daily_series(start_utc, end_utc, days):
     return series
 
 
-def _top_list(today_start, today_end, column, output_key, extra_where,
-              limit=10):
-    """Top-N（top_referrers 排除 direct/空——同站跳转不是外部来源；
-    top_countries 排除 unknown——UI 据此隐藏国家块）。column/extra_where
-    均为模块内字面常量，不经外部输入。"""
+def _top_list(start_utc, end_utc, column, output_key, extra_where,
+              entry_hosts, limit=10):
+    """Top-N（只计白名单入口；column/extra_where 均为模块内字面常量，不经
+    外部输入）。top_referrers 排除 direct/空——同站跳转不是外部来源；来源
+    是浏览器声明的 Referer（可伪造），默认口径（top_referrers）排除疑似爬虫，
+    对照口径（top_referrers_with_bots）不排除；top_countries 排除 unknown
+    ——UI 据此隐藏国家块。"""
     sql = (
         "SELECT %s AS value, count(*) AS visits"
         " FROM site_visit_events"
-        " WHERE occurred_at >= %%s AND occurred_at < %%s %s"
+        " WHERE occurred_at >= %%s AND occurred_at < %%s"
+        " AND request_host = ANY(%%s) %s"
         " GROUP BY 1 ORDER BY count(*) DESC, 1 ASC LIMIT %%s"
         % (column, extra_where))
     conn = pg_store.connect()
     conn.row_factory = _dict_row()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (today_start, today_end, limit))
+            cur.execute(sql, (start_utc, end_utc, list(entry_hosts), limit))
             rows = cur.fetchall()
     finally:
         conn.close()
@@ -803,23 +892,27 @@ def _top_list(today_start, today_end, column, output_key, extra_where,
             for r in rows]
 
 
-def _recent(limit=20):
+def _recent(entry_hosts, limit=20):
+    """最近访问（只计白名单入口；迁移前 request_host IS NULL 的历史行天然
+    排除）。request_host 即「访问域名」，供面板展示本次访问命中的入口。"""
     conn = pg_store.connect()
     conn.row_factory = _dict_row()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT occurred_at, page_key, referrer_domain,"
+                "SELECT occurred_at, page_key, request_host, referrer_domain,"
                 " country_code, visitor_kind, bot_name"
                 " FROM site_visit_events"
+                " WHERE request_host = ANY(%s)"
                 " ORDER BY occurred_at DESC, event_id DESC LIMIT %s",
-                (limit,))
+                (list(entry_hosts), limit))
             rows = cur.fetchall()
     finally:
         conn.close()
     return [{
         "occurred_at": r["occurred_at"].isoformat(),
         "page_key": r["page_key"],
+        "request_host": r["request_host"],
         "referrer_domain": r["referrer_domain"],
         "country_code": r["country_code"],
         "visitor_kind": r["visitor_kind"],
@@ -827,15 +920,16 @@ def _recent(limit=20):
     } for r in rows]
 
 
-def _visitor_kind_counts(start_utc, end_utc):
+def _visitor_kind_counts(start_utc, end_utc, entry_hosts):
     conn = pg_store.connect()
     conn.row_factory = _dict_row()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT visitor_kind, count(*) AS n FROM site_visit_events"
-                " WHERE occurred_at >= %s AND occurred_at < %s GROUP BY 1",
-                (start_utc, end_utc))
+                " WHERE occurred_at >= %s AND occurred_at < %s"
+                " AND request_host = ANY(%s) GROUP BY 1",
+                (start_utc, end_utc, list(entry_hosts)))
             grouped = {r["visitor_kind"]: int(r["n"] or 0)
                        for r in cur.fetchall()}
     finally:
@@ -843,9 +937,32 @@ def _visitor_kind_counts(start_utc, end_utc):
     return {kind: grouped.get(kind, 0) for kind in VISITOR_KINDS}
 
 
+def _legacy_window_count(start_utc, end_utc):
+    """「目标域名未知」历史行（request_host IS NULL，0053 之前落库）在窗口
+    内的条数——不进入任何主口径，仅计数供面板提示存量规模。"""
+    conn = pg_store.connect()
+    conn.row_factory = _dict_row()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) AS n FROM site_visit_events"
+                " WHERE occurred_at >= %s AND occurred_at < %s"
+                " AND request_host IS NULL",
+                (start_utc, end_utc))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    return int(row["n"] or 0)
+
+
 def dashboard_stats(*, now=None):
     """owner-only 只读固定聚合（契约形状，一字不差）。只读 site_visit_events，
     不联任何业务表、不创建事件、不调清理。
+
+    聚合口径（review 2026-09-15）：只统计 request_host 命中当前
+    SITE_STATS_ENTRY_HOSTS 白名单的行；白名单未配置（host_filter_configured
+    =False）时主口径恒为空；迁移前历史行（request_host IS NULL）不进入主
+    口径，仅在 legacy.d30_visits 计数。
 
     geo_configured 恒 False（D2 country_code 恒 unknown，未配置离线定位库）。
     """
@@ -857,11 +974,14 @@ def dashboard_stats(*, now=None):
     today_end = today_start + timedelta(days=1)
     d7_start = _day_start_utc(moment_utc, _DASHBOARD_DAYS_BACK["d7"])
     d30_start = _day_start_utc(moment_utc, _DASHBOARD_DAYS_BACK["d30"])
+    # 两态：set([...]) = 已配置；None = 未配置/非法（主口径恒空，面板亮提示）
+    entry_hosts = _stats_entry_hosts()
+    hosts = sorted(entry_hosts) if entry_hosts else []
     windows = {}
     for key in _DASHBOARD_WINDOW_KEYS:
         start = d30_start if key == "d30" else (
             d7_start if key == "d7" else today_start)
-        windows[key] = _window_agg(start, today_end)
+        windows[key] = _window_agg(start, today_end, hosts)
     return {
         "generated_at": moment_utc.isoformat(),
         "today": windows["today"],
@@ -870,18 +990,30 @@ def dashboard_stats(*, now=None):
         # 查询窗口必须是完整 30 天（[d30_start, today_end)，含今日）——此前
         # 误传 (today_start, today_end) 导致 SQL 只查到今天一天，其余 29 天
         # 被「缺日补零」填成 0（review 2026-09-14）；序列锚定见 _daily_series
-        "daily": _daily_series(d30_start, today_end, 30),
+        "daily": _daily_series(d30_start, today_end, 30, hosts),
+        # 默认口径排除疑似爬虫（referrer spam 基本是爬虫，与 unique_visitors
+        # 的"爬虫不进人类指标"口径一致）；with_bots 为对照口径，面板可切换
         "top_referrers": _top_list(
             d30_start, today_end, "referrer_domain", "domain",
             "AND referrer_domain IS NOT NULL"
-            " AND referrer_domain <> 'direct'"),
+            " AND referrer_domain <> 'direct'"
+            " AND visitor_kind <> 'suspected_bot'", hosts),
+        "top_referrers_with_bots": _top_list(
+            d30_start, today_end, "referrer_domain", "domain",
+            "AND referrer_domain IS NOT NULL"
+            " AND referrer_domain <> 'direct'", hosts),
         "top_pages": _top_list(
-            d30_start, today_end, "page_key", "page_key", ""),
+            d30_start, today_end, "page_key", "page_key", "", hosts),
         "top_countries": _top_list(
             d30_start, today_end, "country_code", "country_code",
-            "AND country_code <> 'unknown'"),
-        "recent": _recent(),
-        "visitor_kinds": _visitor_kind_counts(d30_start, today_end),
+            "AND country_code <> 'unknown'", hosts),
+        "recent": _recent(hosts),
+        "visitor_kinds": _visitor_kind_counts(d30_start, today_end, hosts),
+        # 入口白名单可见性（review 2026-09-15）：面板直接展示当前统计覆盖的
+        # 域名；未配置时亮提示而不是静默展示混入数据
+        "entry_hosts": hosts,
+        "host_filter_configured": entry_hosts is not None,
+        "legacy": {"d30_visits": _legacy_window_count(d30_start, today_end)},
         "geo_configured": False,
     }
 

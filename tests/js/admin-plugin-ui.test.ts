@@ -691,15 +691,22 @@ describe("wave 2 — 概览页收敛 + 站点访问卡（§4.2 / D2-3）", () =>
 				d7: { visits: 80, unique_visitors: 41, bots: 4 },
 				d30: { visits: 300, unique_visitors: 120, bots: 15 },
 				daily: [{ date: "2026-09-01", visits: 10, unique_visitors: 6, bots: 1 }],
-				top_referrers: [{ domain: "example.com", visits: 20 }],
+				top_referrers: [{ domain: "google.com", visits: 5 }],
+				top_referrers_with_bots: [
+					{ domain: "spam.example", visits: 40 },
+					{ domain: "google.com", visits: 5 },
+				],
 				top_pages: [{ page_key: "home", visits: 90 }],
 				top_countries: [{ country_code: "unknown", visits: 10 }],
 				visitor_kinds: { anonymous_human: 200, signed_in_human: 85, suspected_bot: 15 },
 				recent: [{
-					occurred_at: 1700000000, page_key: "home",
+					occurred_at: 1700000000, page_key: "home", request_host: "histopilot.com",
 					referrer_domain: null, country_code: "unknown",
 					visitor_kind: "suspected_bot", bot_name: "Googlebot",
 				}],
+				entry_hosts: ["histopilot.com", "pt.solarise94.fun"],
+				host_filter_configured: true,
+				legacy: { d30_visits: 7 },
 				geo_configured: false,
 			},
 		});
@@ -711,9 +718,26 @@ describe("wave 2 — 概览页收敛 + 站点访问卡（§4.2 / D2-3）", () =>
 		expect(kpis).toContain("匿名访客日去重次数（30 天累计）");
 		expect(kpis).toContain("不是独立用户数");
 		expect(kpis).toContain("疑似爬虫");
-		expect(bus.els["adm-site-referrers-tbody"].textContent).toContain("example.com");
+		// 来源榜默认排除爬虫（review 2026-09-15）：只渲染 top_referrers
+		const refBody = bus.els["adm-site-referrers-tbody"].textContent;
+		expect(refBody).toContain("google.com");
+		expect(refBody).not.toContain("spam.example");
 		expect(bus.els["adm-site-pages-tbody"].textContent).toContain("home");
-		expect(bus.els["adm-site-recent-tbody"].textContent).toContain("Googlebot");
+		// 最近访问带「访问域名」列；入口白名单与历史隔离在提示行可见
+		const recent = bus.els["adm-site-recent-tbody"].textContent;
+		expect(recent).toContain("Googlebot");
+		expect(recent).toContain("histopilot.com");
+		const note = bus.els["adm-site-entry-note"].textContent;
+		expect(note).toContain("histopilot.com、pt.solarise94.fun");
+		expect(note).toContain("7 条");
+		expect(bus.els["adm-site-entry-warn"].hidden).toBe(true);
+		// 勾选「包含疑似爬虫」→ 切换到 with_bots 对照口径（不发新桥请求）
+		const toggle = bus.els["adm-site-referrers-bots-toggle"];
+		toggle.checked = true;
+		toggle._fire("change");
+		const refBody2 = bus.els["adm-site-referrers-tbody"].textContent;
+		expect(refBody2).toContain("spam.example");
+		expect(refBody2).toContain("google.com");
 		expect(bus.els["adm-site-kinds"].textContent).toContain("疑似爬虫");
 		// geo_configured=false：国家块隐藏
 		expect(bus.els["adm-site-countries-block"].hidden).toBe(true);
@@ -723,6 +747,41 @@ describe("wave 2 — 概览页收敛 + 站点访问卡（§4.2 / D2-3）", () =>
 			.map((id) => bus.els[id].textContent).join("\n");
 		expect(siteAll).not.toContain("转化");
 		expect(siteAll).not.toContain("注册用户");
+	});
+
+	it("站点访问卡：入口白名单未配置亮警示条（fail-closed 可见），不静默", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		bus.client!.showPage("overview");
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.overview.get", {
+			ok: true, result: { users: { total: 1 }, billing: { available: false } },
+		});
+		replyMethod(bus, NONCE, "admin.siteStats.get", {
+			ok: true,
+			result: {
+				generated_at: 1700000000,
+				today: { visits: 0, unique_visitors: 0, bots: 0 },
+				d7: { visits: 0, unique_visitors: 0, bots: 0 },
+				d30: { visits: 0, unique_visitors: 0, bots: 0 },
+				daily: [],
+				top_referrers: [], top_referrers_with_bots: [],
+				top_pages: [], top_countries: [],
+				visitor_kinds: { anonymous_human: 0, signed_in_human: 0, suspected_bot: 0 },
+				recent: [],
+				entry_hosts: [],
+				host_filter_configured: false,
+				legacy: { d30_visits: 0 },
+				geo_configured: false,
+			},
+		});
+		await ticks(6);
+		expect(bus.els["adm-site-card"].hidden).toBe(false);
+		const warn = bus.els["adm-site-entry-warn"];
+		expect(warn.hidden).toBe(false);
+		expect(warn.textContent).toContain("SITE_STATS_ENTRY_HOSTS");
+		// 未配置时提示行隐藏（没有入口域名可列）
+		expect(bus.els["adm-site-entry-note"].hidden).toBe(true);
 	});
 
 	it("站点访问卡：零数据（daily 为 30 行补零序列）显示空态而非一排 0", async () => {

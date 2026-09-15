@@ -8,14 +8,18 @@ store 级（默认全跑；PG-only 用例 RUN_PG_TESTS=1）：
     /admin、/healthz、工作区/深路径（含分享 token、切片名、项目 ID）不落；
   - 口径门：非 2xx-3xx 不落；非 HTML 不落；query 含 token/资源 ID 键整条
     拒绝；utm_source 白名单外丢弃；其余 query 全丢弃；
-  - referrer 只取 hostname；同站（PUBLIC_BASE_URL/本机）归 direct；
-  - Host 不在 PUBLIC_BASE_URL/PUBLIC_ORIGINS（同机其它站点）不落；
+  - referrer 只取 hostname；同站（统计白名单/PUBLIC_*/本机）归 direct；
+  - 入口域名（review 2026-09-15）：SITE_STATS_ENTRY_HOSTS 独立白名单
+    fail-closed——未配置/含非法项停止采集并告警；Host 缺失（None/空）或
+    未命中（同机其它站点/裸 IP）静默拒绝；命中后 request_host 规范化
+    （小写去端口尾点）落库；
   - bot：Googlebot/curl/headless → suspected_bot + bot_name；正常浏览器
     登录 → signed_in_human；匿名 → anonymous_human；bot 优先于登录态；
   - 去重与哈希：IPv4 同 /24 同哈希、跨 /24 不同；IPv6 /64 同理；
     IPv4-mapped IPv6 等价；跨日哈希改变（含 Asia/Shanghai 日界回归）；
     同 hash+page+10 分钟桶唯一约束生效、跨桶落新行（真实 PG）；
-  - 落库形态：0030 列固定 11 列；行值无完整 IP/UA/query/token/资源 ID；
+  - 落库形态：0030+0053 列固定 12 列（含 request_host）；行值无完整 IP/
+    UA/query/token/资源 ID；
   - secret 缺失/权限错误：build_event/enqueue 降级不落事件且不抛
     （公开页面仍成功由 app.py 接线代理测；此处只证 store 不抛）；
     secret 绝不复用 session secret（SECRET_KEY 无回退）；
@@ -23,7 +27,11 @@ store 级（默认全跑；PG-only 用例 RUN_PG_TESTS=1）：
     start/stop 幂等；缺 STORAGE_BACKEND 时仍起 worker（Wave 3 后 PG 唯一）；
   - dashboard_stats：形状与钉死契约逐键一致；visits/unique_visitors/bots
     三分类互不混入（爬虫不进入匿名访客近似数）；只读——调用前后业务表与
-    site 表行数不变、不触发清理；90 天窗口外事件不计入；
+    site 表行数不变、不触发清理；90 天窗口外事件不计入；聚合只计
+    request_host 命中当前白名单的行（同机其它域名/历史 NULL 行隔离，
+    legacy.d30_visits 单独计数）；top_referrers 默认排除疑似爬虫、
+    top_referrers_with_bots 为含爬虫对照口径；白名单未配置时主口径恒空
+    且 host_filter_configured=False；
   - purge_expired 只删 expires_at 到期行；
   - F4/R2-F5 每日保留任务接线（双跑纯单元，monkeypatch 注入）：R2-F5 拆分
     后 acquisition 段（_run_daily_retention_once）与 site stats 段
@@ -76,18 +84,21 @@ _BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) Safari/605.1.15"
 
 DASHBOARD_KEYS = {
     "generated_at", "today", "d7", "d30", "daily", "top_referrers",
-    "top_pages", "top_countries", "recent", "visitor_kinds",
+    "top_referrers_with_bots", "top_pages", "top_countries", "recent",
+    "visitor_kinds", "entry_hosts", "host_filter_configured", "legacy",
     "geo_configured",
 }
 WINDOW_KEYS = {"visits", "unique_visitors", "bots"}
 DAILY_KEYS = {"date", "visits", "unique_visitors", "bots"}
-RECENT_KEYS = {"occurred_at", "page_key", "referrer_domain", "country_code",
-               "visitor_kind", "bot_name"}
+RECENT_KEYS = {"occurred_at", "page_key", "request_host", "referrer_domain",
+               "country_code", "visitor_kind", "bot_name"}
 SITE_COLUMNS = [
     "event_id", "occurred_at", "dedup_bucket", "page_key",
     "referrer_domain", "utm_source", "country_code", "daily_visitor_hash",
-    "visitor_kind", "bot_name", "expires_at",
+    "visitor_kind", "bot_name", "expires_at", "request_host",
 ]
+#: 采集启用前提（_make_secret 注入）：入口白名单默认两域名
+ENTRY_HOSTS_DEFAULT = "histopilot.com,pt.solarise94.fun"
 
 
 # --------------------------------------------------------------------------- #
@@ -102,7 +113,7 @@ def _isolate(tmp_path, monkeypatch):
     """
     isolate_app(monkeypatch, tmp_path, clear_stores=True)
     for name in ("SITE_STATS_HMAC_SECRET_FILE", "PUBLIC_BASE_URL",
-                 "PUBLIC_ORIGINS", "SERVER_NAME"):
+                 "PUBLIC_ORIGINS", "SERVER_NAME", "SITE_STATS_ENTRY_HOSTS"):
         monkeypatch.delenv(name, raising=False)
     sss._reset_warn_state()
     sss.stop_worker()          # 先停 worker（app import 可能已自起；见 app.py）
@@ -137,16 +148,19 @@ def _make_secret(tmp_path, monkeypatch, mode=0o600,
     p.write_bytes(content)
     os.chmod(p, mode)
     monkeypatch.setenv("SITE_STATS_HMAC_SECRET_FILE", str(p))
+    # 采集启用的另一前提：入口白名单（review 2026-09-15 fail-closed）
+    monkeypatch.setenv("SITE_STATS_ENTRY_HOSTS", ENTRY_HOSTS_DEFAULT)
     return p
 
 
 def _ev(**over):
-    """build_event 固定入参（公开页成功 HTML GET、匿名、IPv4）。"""
+    """build_event 固定入参（公开页成功 HTML GET、匿名、IPv4、入口域名
+    histopilot.com——_make_secret 已注入白名单）。"""
     kwargs = dict(
         path="/", query_string="", referrer="", remote_addr="203.0.113.45",
         user_agent=_BROWSER_UA, status_code=200,
         content_type="text/html; charset=utf-8", signed_in=False,
-        now=BASE_TIME)
+        host="histopilot.com", now=BASE_TIME)
     kwargs.update(over)
     return sss.build_event(**kwargs)
 
@@ -157,6 +171,7 @@ def _fake_event(**over):
         "page_key": "home",
         "occurred_at": BASE_TIME.isoformat(),
         "dedup_bucket": int(BASE_TIME.timestamp() // sss.DEDUP_BUCKET_SECONDS),
+        "request_host": "histopilot.com",
         "referrer_domain": "direct",
         "utm_source": None,
         "country_code": "unknown",
@@ -282,9 +297,10 @@ def test_query_otherwise_dropped_utm_whitelisted(secret):
 def test_event_keys_are_exactly_contract_and_minimized(secret):
     ev = _ev(query_string="?utm_source=n", referrer="https://news.example.com")
     assert set(ev.keys()) == {
-        "page_key", "occurred_at", "dedup_bucket", "referrer_domain",
-        "utm_source", "country_code", "daily_visitor_hash", "visitor_kind",
-        "bot_name"}
+        "page_key", "occurred_at", "dedup_bucket", "request_host",
+        "referrer_domain", "utm_source", "country_code", "daily_visitor_hash",
+        "visitor_kind", "bot_name"}
+    assert ev["request_host"] == "histopilot.com"
     blob = json.dumps(ev, ensure_ascii=False)
     # 原始 IP / UA / query / 资源标识一个都不能出现在事件里
     for raw in ("203.0.113.45", _BROWSER_UA, "utm_medium", "Safari/605",
@@ -314,23 +330,57 @@ def test_referrer_hostname_only_and_same_site_direct(secret, monkeypatch):
         "referrer_domain"] == "direct"
     assert _ev(referrer="https://histopilot.cn/")[
         "referrer_domain"] == "direct"
+    # 统计白名单域名也在"同站"集合里：两入口互跳不当外部来源
+    assert _ev(referrer="https://pt.solarise94.fun/login", host="pt.solarise94.fun")[
+        "referrer_domain"] == "direct"
 
 
-def test_foreign_host_on_same_server_is_not_recorded(secret, monkeypatch):
-    """同机其它站点（cpa.ni-biolab.com）打到本进程：不记为本站访问。"""
-    monkeypatch.setenv("PUBLIC_BASE_URL", "https://pt.solarise94.fun")
-    monkeypatch.setenv(
-        "PUBLIC_ORIGINS",
-        "https://pt.solarise94.fun,https://histopilot.com,https://histopilot.cn")
+def test_foreign_host_on_same_server_is_not_recorded(secret):
+    """入口域名白名单（review 2026-09-15）：目标域名决定「是不是本服务访问」。
+
+    同机其它站点（cpa.ni-biolab.com）/ 裸 IP / 伪造 Host 一律不落；
+    本服务入口照常落库且 request_host 为规范化 hostname。"""
     assert _ev(host="cpa.ni-biolab.com") is None
     assert _ev(host="cpa.ni-biolab.com:443") is None
     assert _ev(host="") is None
-    # 本服务入口仍记
-    assert _ev(host="histopilot.com") is not None
-    assert _ev(host="HISTOPILOT.COM:443") is not None
-    assert _ev(host="pt.solarise94.fun") is not None
-    # 未接线 host=None 保持旧单元测试行为
-    assert _ev() is not None
+    assert _ev(host="192.0.2.44") is None               # 裸 IP 访问
+    assert _ev(host="evil.histopilot.com") is None      # 子域不在白名单
+    assert _ev(host="histopilot.com.evil.example") is None
+    # Host 未接线（None）也拒绝：app.py 恒传 request.host，缺失即异常路径
+    assert _ev(host=None) is None
+    # 本服务入口仍记；request_host 规范化（大写/端口/尾点 → 小写裸域名）
+    ev = _ev(host="histopilot.com")
+    assert ev is not None and ev["request_host"] == "histopilot.com"
+    ev = _ev(host="HISTOPILOT.COM:443")
+    assert ev is not None and ev["request_host"] == "histopilot.com"
+    ev = _ev(host="PT.Solarise94.FUN.")
+    assert ev is not None and ev["request_host"] == "pt.solarise94.fun"
+
+
+def test_entry_host_allowlist_fail_closed(secret, monkeypatch, caplog):
+    """SITE_STATS_ENTRY_HOSTS 未配置 / 含非法项 → 停止采集并节流告警；
+    白名单外的 Host 拒绝**不**产生日志（外部扫描是常态，不刷屏）。"""
+    # 未配置 → fail-closed + 告警
+    monkeypatch.delenv("SITE_STATS_ENTRY_HOSTS", raising=False)
+    sss._reset_warn_state()
+    with caplog.at_level(logging.WARNING, logger="svs.site_stats"):
+        assert _ev() is None
+    assert "SITE_STATS_ENTRY_HOSTS" in caplog.text
+    # 含非法项 → 整个白名单作废（不"跳过坏项继续用"）
+    caplog.clear()
+    sss._reset_warn_state()
+    monkeypatch.setenv("SITE_STATS_ENTRY_HOSTS", "histopilot.com,bad host!!")
+    with caplog.at_level(logging.WARNING, logger="svs.site_stats"):
+        assert _ev() is None
+        assert _ev(host="histopilot.com") is None
+    assert "SITE_STATS_ENTRY_HOSTS" in caplog.text
+    # 白名单生效但 Host 未命中 → 静默拒绝（无日志）
+    caplog.clear()
+    sss._reset_warn_state()
+    monkeypatch.setenv("SITE_STATS_ENTRY_HOSTS", ENTRY_HOSTS_DEFAULT)
+    with caplog.at_level(logging.WARNING, logger="svs.site_stats"):
+        assert _ev(host="cpa.ni-biolab.com") is None
+    assert caplog.text == ""
 
 
 # --------------------------------------------------------------------------- #
@@ -437,6 +487,7 @@ def test_secret_not_reused_from_session_secret(monkeypatch, tmp_path):
 # 4. secret 降级：不落事件、不抛、有告警
 # --------------------------------------------------------------------------- #
 def test_secret_missing_degrades_without_raise(monkeypatch, caplog):
+    monkeypatch.setenv("SITE_STATS_ENTRY_HOSTS", ENTRY_HOSTS_DEFAULT)
     monkeypatch.delenv("SITE_STATS_HMAC_SECRET_FILE", raising=False)
     with caplog.at_level(logging.WARNING, logger="svs.site_stats"):
         assert _ev() is None                       # build_event 降级
@@ -469,16 +520,17 @@ def test_secret_readable_event_built(secret):
 
 
 # --------------------------------------------------------------------------- #
-# 5. 迁移 0030（真实 PG）
+# 5. 迁移 0030 + 0053（真实 PG）
 # --------------------------------------------------------------------------- #
 def test_migration_0030_applied_idempotent_and_minimal():
     import pg_store
     # ensure_schema 按 tuple 行访问（row[0]），必须用默认 row_factory 连接
     plain = pg_store.connect()
     try:
-        # ensure_schema 幂等：再跑两遍不报错且 0030 已记录
+        # ensure_schema 幂等：再跑两遍不报错且 0030/0053 已记录
         files = pg_store.ensure_schema(plain)
         assert "0030_site_visit_events.sql" in files
+        assert "0053_site_visit_request_host.sql" in files
         files2 = pg_store.ensure_schema(plain)
         assert files == files2
     finally:
@@ -517,6 +569,33 @@ def test_migration_0030_applied_idempotent_and_minimal():
         conn.close()
 
 
+def test_migration_0053_request_host_idempotent():
+    """0053：request_host 列 + CHECK（NULL=历史行目标域名未知）+ 索引，
+    重放幂等；request_host 为 NULL 的历史形态仍可写入（隔离口径依赖）。"""
+    import pg_store
+    sql = (pg_store.migrations_dir()
+           / "0053_site_visit_request_host.sql").read_text(encoding="utf-8")
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql)      # 重放：不抛、不改行
+            cur.execute(sql)
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) AS n FROM pg_constraint WHERE conrelid ="
+                " 'site_visit_events'::regclass AND contype = 'c'"
+                " AND conname = 'site_visit_events_request_host_check'")
+            assert cur.fetchone()["n"] == 1
+            cur.execute(
+                "SELECT count(*) AS n FROM pg_indexes WHERE tablename ="
+                " 'site_visit_events'"
+                " AND indexname = 'idx_site_visit_events_host_time'")
+            assert cur.fetchone()["n"] == 1
+    finally:
+        conn.close()
+
+
 # --------------------------------------------------------------------------- #
 # 6. 去重桶与落库形态（真实 PG）
 # --------------------------------------------------------------------------- #
@@ -539,6 +618,7 @@ def test_persisted_row_minimized_shape(secret):
     assert row["event_id"].startswith("sve_")
     assert len(row["event_id"]) == 4 + 24
     assert row["page_key"] == "home"
+    assert row["request_host"] == "histopilot.com"
     assert row["referrer_domain"] == "news.example.com"
     assert row["utm_source"] == "n"
     assert row["country_code"] == "unknown"
@@ -608,10 +688,16 @@ def test_dashboard_stats_counts_and_readonly(secret):
         assert set(row.keys()) == RECENT_KEYS
     for row in stats["top_referrers"]:
         assert set(row.keys()) == {"domain", "visits"}
+    for row in stats["top_referrers_with_bots"]:
+        assert set(row.keys()) == {"domain", "visits"}
     for row in stats["top_pages"]:
         assert set(row.keys()) == {"page_key", "visits"}
     for row in stats["top_countries"]:
         assert set(row.keys()) == {"country_code", "visits"}
+    # 入口白名单可见性 + 历史行隔离键
+    assert stats["entry_hosts"] == ["histopilot.com", "pt.solarise94.fun"]
+    assert stats["host_filter_configured"] is True
+    assert stats["legacy"] == {"d30_visits": 0}
 
     # 三分类互不混入：visits=事件数；bots 单列不进入 unique_visitors；
     # unique_visitors=人类日去重哈希数（同 /24 同日的两个 IP 只算 1 个）
@@ -622,8 +708,11 @@ def test_dashboard_stats_counts_and_readonly(secret):
         "anonymous_human": 2, "signed_in_human": 1, "suspected_bot": 1}
     assert stats["daily"][-1] == {
         "date": BASE_DAY, "visits": 4, "unique_visitors": 2, "bots": 1}
-    # top：外部来源排除 direct；页 Top；国家全 unknown → 空列表
+    # top：外部来源排除 direct；默认口径还排除疑似爬虫（referrer spam
+    # 基本是爬虫），with_bots 为含爬虫对照口径；国家全 unknown → 空列表
     assert stats["top_referrers"] == [
+        {"domain": "news.example.com", "visits": 1}]
+    assert stats["top_referrers_with_bots"] == [
         {"domain": "news.example.com", "visits": 2}]
     assert stats["top_pages"] == [
         {"page_key": "home", "visits": 2},
@@ -631,12 +720,82 @@ def test_dashboard_stats_counts_and_readonly(secret):
         {"page_key": "register", "visits": 1}]
     assert stats["top_countries"] == []
     assert stats["geo_configured"] is False
-    # recent 按时间倒序
+    # recent 按时间倒序，且逐行携带访问域名
     occurred = [r["occurred_at"] for r in stats["recent"]]
     assert occurred == sorted(occurred, reverse=True)
+    assert all(r["request_host"] == "histopilot.com" for r in stats["recent"])
 
     # 只读：业务表与 site 表行数都不变；也不触发清理
     assert _business_counts() == before
+
+
+def test_dashboard_restricts_entry_hosts_and_isolates_legacy(secret):
+    """聚合口径（review 2026-09-15）：只计 request_host 命中白名单的行。
+
+    - 同机其它域名的历史混入行（request_host=cpa.ni-biolab.com）：被新采集
+      拒之门外，此处手工落一行模拟迁移前已混入的存量——主口径必须排除；
+    - 迁移前历史行（request_host IS NULL = 目标域名未知）：排除出主口径，
+      仅 legacy.d30_visits 计数，不删除。"""
+    ev = _ev()                                     # histopilot.com，白名单内
+    ev2 = _ev(remote_addr="198.51.100.9", path="/login",
+              host="pt.solarise94.fun")            # 第二入口，也在白名单内
+    _flush([ev, ev2])
+    # 手工落两类"混入/历史"行（绕开 build_event 准入，模拟存量数据）
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO site_visit_events (event_id, occurred_at,"
+                " expires_at, dedup_bucket, page_key, request_host,"
+                " referrer_domain, country_code, daily_visitor_hash,"
+                " visitor_kind) VALUES"
+                " ('sve_foreign0000000000000001', %s, %s, %s, 'home',"
+                "  'cpa.ni-biolab.com', 'direct', 'unknown', %s,"
+                "  'anonymous_human'),"
+                " ('sve_legacy00000000000000001', %s, %s, %s, 'home',"
+                "  NULL, 'direct', 'unknown', %s, 'anonymous_human')",
+                (BASE_TIME, BASE_TIME + timedelta(days=90),
+                 int(BASE_TIME.timestamp() // 600), "b" * 64,
+                 BASE_TIME, BASE_TIME + timedelta(days=90),
+                 int(BASE_TIME.timestamp() // 600) + 1, "c" * 64))
+        conn.commit()
+    finally:
+        conn.close()
+    assert _site_count() == 4
+
+    stats = sss.dashboard_stats(now=BASE_TIME)
+    # 主口径只认两个入口域名：窗口/趋势/分类/Top/recent 全部不含混入行
+    assert stats["today"] == {"visits": 2, "unique_visitors": 2, "bots": 0}
+    assert stats["visitor_kinds"] == {
+        "anonymous_human": 2, "signed_in_human": 0, "suspected_bot": 0}
+    assert stats["top_pages"] == [
+        {"page_key": "home", "visits": 1}, {"page_key": "login", "visits": 1}]
+    recent_hosts = sorted(r["request_host"] for r in stats["recent"])
+    assert recent_hosts == ["histopilot.com", "pt.solarise94.fun"]
+    # 历史行单独计数（不进入主口径，也不被删除）
+    assert stats["legacy"] == {"d30_visits": 1}
+    assert _site_count() == 4
+    # recent 中的访问域名可分辨两个入口
+    by_page = {r["page_key"]: r["request_host"] for r in stats["recent"]}
+    assert by_page["home"] == "histopilot.com"
+    assert by_page["login"] == "pt.solarise94.fun"
+
+
+def test_dashboard_fail_closed_when_allowlist_unconfigured(
+        monkeypatch, secret):
+    """白名单未配置：主口径恒空 + host_filter_configured=False（面板亮
+    提示），legacy 计数仍可见；已有白名单行不被计入。"""
+    _flush([_ev()])
+    monkeypatch.delenv("SITE_STATS_ENTRY_HOSTS", raising=False)
+    stats = sss.dashboard_stats(now=BASE_TIME)
+    assert stats["host_filter_configured"] is False
+    assert stats["entry_hosts"] == []
+    assert stats["today"] == {"visits": 0, "unique_visitors": 0, "bots": 0}
+    assert stats["d30"]["visits"] == 0
+    assert stats["recent"] == []
+    assert stats["top_pages"] == []
+    # 白名单行不是"历史行"：legacy 只数 request_host IS NULL
+    assert stats["legacy"] == {"d30_visits": 0}
 
 
 def test_dashboard_stats_daily_series_covers_full_30_days(secret):
@@ -863,15 +1022,19 @@ def test_app_admin_site_stats_owner_only(monkeypatch):
 @site_stats_app_wiring
 def test_app_after_request_records_public_html_get(secret, monkeypatch):
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
+    # test client 的 Host 是 localhost：白名单按入口域名收窄后需显式放行
+    monkeypatch.setenv("SITE_STATS_ENTRY_HOSTS", "localhost")
     sss.start_worker()                       # 幂等；若 app 启动已起则 no-op
     try:
         client = _client()
         resp = client.get("/")               # 公开 HTML GET → 应落 home 事件
         assert resp.status_code == 200
         assert _wait_until(lambda: _site_count() >= 1)
-        row = _sql_one("SELECT page_key, visitor_kind, country_code,"
-                       " referrer_domain FROM site_visit_events")
+        row = _sql_one("SELECT page_key, request_host, visitor_kind,"
+                       " country_code, referrer_domain"
+                       " FROM site_visit_events")
         assert row["page_key"] == "home"
+        assert row["request_host"] == "localhost"
         assert row["visitor_kind"] in sss.VISITOR_KINDS
         assert row["country_code"] == "unknown"
         assert row["referrer_domain"] == "direct"

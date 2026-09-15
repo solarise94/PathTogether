@@ -1260,7 +1260,9 @@ def test_fresh_database_full_migration_price_generation_boundaries():
     pgserver = pytest.importorskip("pgserver")
     import tempfile
     data_dir = tempfile.mkdtemp(prefix="m0045-fresh-")
-    srv = pgserver.get_server(data_dir)
+    # cleanup_mode='delete'：finally 的 cleanup() 停库并删目录（默认 'stop'
+    # 只停库——本用例单跑即泄漏 41MB，/tmp 用户配额会被累积打爆）
+    srv = pgserver.get_server(data_dir, cleanup_mode="delete")
     try:
         import psycopg
         import pg_store

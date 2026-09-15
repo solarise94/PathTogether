@@ -19,7 +19,9 @@
     ``openslide.deepzoom.DeepZoomGenerator = object``）。生产代码只用到这两个
     名字；测试切片文件均为字节 stub，无需真 openslide。
 """
+import atexit
 import os
+import shutil
 import sys
 import tempfile
 
@@ -52,6 +54,9 @@ if "SHARE_DATA_DIR" in os.environ and "UPLOAD_DIR" in os.environ:
     UPLOAD_DIR = os.environ["UPLOAD_DIR"]
 else:
     _tmp_root = tempfile.mkdtemp(prefix="svs-pt-tests-")
+    # /tmp 带 usrquota：session 临时树必须随进程退出删除（被 kill 的会话
+    # 由 conftest 启动期清扫兜底）。ignore_errors——清理失败不影响退出。
+    atexit.register(shutil.rmtree, _tmp_root, True)
     SHARE_DATA_DIR = os.environ.setdefault(
         "SHARE_DATA_DIR", os.path.join(_tmp_root, "share-data"))
     UPLOAD_DIR = os.environ.setdefault(

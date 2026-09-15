@@ -78,6 +78,7 @@
     modelSnapshot: null,
     modelError: null,
     // 费用页数据快照（KPI/告警条聚合用；仅内存）
+    siteStats: null,        // 站点访问统计快照（来源榜爬虫切换只重渲染，不发请求）
     billOverview: null,
     billProviderBalance: null,
     billProviderBalanceError: null,
@@ -827,13 +828,19 @@
   // （D2 未发布的 unknown_method/not_implemented/404/permission_denied，
   // 以及网络/后端错误）都整卡隐藏——绝不显示成错误，也不阻塞概览。
   // 禁止出现用户/邀请/注册/首次 AI/first·last touch/转化率任何内容。
+  //
+  // 入口口径（review 2026-09-15）：后端聚合只计「访问域名」命中
+  // SITE_STATS_ENTRY_HOSTS 白名单的行；host_filter_configured=false 时亮
+  // 警示条。来源榜默认排除疑似爬虫，勾选切换到含爬虫对照口径
+  // （top_referrers_with_bots），切换只重渲染本页内存快照，不发新请求。
   // ------------------------------------------------------------------
   function loadSiteStats() {
     var card = $("adm-site-card");
     request("admin.siteStats.get", {}).then(function (res) {
       if (!card) return;
       card.hidden = false;
-      renderSiteStats(res || {});
+      state.siteStats = res || {};
+      renderSiteStats(state.siteStats);
     }).catch(function () {
       if (card) card.hidden = true;
     });
@@ -847,9 +854,56 @@
     return "匿名访客";
   }
 
+  function renderSiteEntryNote(res) {
+    var warn = $("adm-site-entry-warn");
+    var note = $("adm-site-entry-note");
+    var hosts = res.entry_hosts || [];
+    if (warn) {
+      if (res.host_filter_configured === false) {
+        warn.hidden = false;
+        warn.textContent = "入口域名白名单（SITE_STATS_ENTRY_HOSTS）未配置或"
+          + "非法：采集已停止，以下统计不会更新。请先在服务端配置只属于本服"
+          + "务的入口域名。";
+      } else {
+        warn.hidden = true;
+        warn.textContent = "";
+      }
+    }
+    if (note) {
+      var legacy = res.legacy && Number(res.legacy.d30_visits || 0);
+      var lines = [];
+      if (hosts.length) {
+        lines.push("统计入口域名：" + hosts.join("、") + "。只统计访问这些域名"
+          + "的请求；其它域名打到同一服务的访问不计入。");
+      }
+      if (legacy > 0) {
+        lines.push("另有 " + legacy + " 条近 30 天历史事件目标域名未知"
+          + "（新口径上线前落库），已排除在以上统计之外，保留至过期。");
+      }
+      note.hidden = lines.length === 0;
+      note.textContent = lines.join("");
+    }
+  }
+
+  function renderSiteReferrers(res) {
+    var toggle = $("adm-site-referrers-bots-toggle");
+    var withBots = !!(toggle && toggle.checked);
+    var rows = withBots ? res.top_referrers_with_bots : res.top_referrers;
+    var tbody = $("adm-site-referrers-tbody");
+    if (!tbody) return;
+    tbody.textContent = "";
+    (rows || []).slice(0, 10).forEach(function (r) {
+      var tr = document.createElement("tr");
+      tr.appendChild(td(r.domain || "（直接）"));
+      tr.appendChild(td(fmtNum(r.visits)));
+      tbody.appendChild(tr);
+    });
+  }
+
   function renderSiteStats(res) {
     var card = $("adm-site-card");
     if (!card) return;
+    renderSiteEntryNote(res);
     var empty = $("adm-site-empty");
     var today = res.today || {};
     var d7 = res.d7 || {};
@@ -903,9 +957,7 @@
         tbody.appendChild(tr);
       });
     }
-    fillTop("adm-site-referrers-tbody", res.top_referrers,
-      function (r) { return r.domain || "（直接）"; },
-      function (r) { return r.visits; });
+    renderSiteReferrers(res);
     fillTop("adm-site-pages-tbody", res.top_pages,
       function (r) { return r.page_key; },
       function (r) { return r.visits; });
@@ -942,6 +994,7 @@
       (res.recent || []).slice(0, 20).forEach(function (r) {
         var tr = document.createElement("tr");
         tr.appendChild(td(fmtTs(r.occurred_at), "adm-cell-time"));
+        tr.appendChild(td(r.request_host || "—"));
         tr.appendChild(td(r.page_key));
         tr.appendChild(td(r.referrer_domain || "（直接）"));
         tr.appendChild(td(r.country_code && r.country_code !== "unknown"
@@ -3817,6 +3870,14 @@
     onClick("adm-users-create-btn", submitCreateUser);
     // 身份冲突页（review P2-2）：清单刷新（删除动作在行内按钮 + 页内确认条）
     onClick("adm-identity-refresh-btn", function () { loadIdentityConflicts(); });
+    // 站点访问（review 2026-09-15）：来源榜「包含疑似爬虫」切换——只按本页
+    // 内存快照重渲染，不发新的桥请求
+    var refBotsToggle = $("adm-site-referrers-bots-toggle");
+    if (refBotsToggle && refBotsToggle.addEventListener) {
+      refBotsToggle.addEventListener("change", function () {
+        if (state.siteStats) renderSiteReferrers(state.siteStats);
+      });
+    }
     // 邀请页（wave 2：注册模式只读 + 跳设置）
     onClick("adm-invite-goto-settings-btn", function () { showPage("settings"); });
     onClick("adm-invite-create-btn", submitCreateInvite);

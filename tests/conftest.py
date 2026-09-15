@@ -24,6 +24,8 @@ user_store 在 import 期即选中 PostgreSQL 后端；
 import _bootstrap  # noqa: F401  # 须最先：session 目录 + openslide stub
 
 import os
+import shutil
+import tempfile
 
 import psycopg
 import pytest
@@ -36,11 +38,41 @@ import pgserver
 # ----------------------------------------------------------------------- #
 _PG_DATA_DIR = None
 
+# 本仓测试在 /tmp 的专用前缀（清扫 + 泄漏归因用）。/tmp 挂载带 usrquota，
+# 泄漏目录长期累积会打爆用户配额（2026-09-15 事故：EDQUOT 导致 initdb 失败）。
+_TEST_TMP_PREFIXES = ("svs-pg-conftest-", "svs-pt-tests-",
+                      "m0045-fresh-", "m0045-scratch-")
+
+#: 清扫年龄阈值（小时）：只删早于该阈值的目录。当前会话刚 mkdtemp 的目录
+#: 与近阈值内启动的并发会话目录必然不满足条件，不会被误删。
+_STALE_TMP_MAX_AGE_HOURS = 12
+
+
+def _sweep_stale_test_tmp():
+    """清扫历史泄漏的测试临时目录（进程被 kill/超时时 atexit 不会执行）。
+
+    只按本仓专用前缀匹配 + 只删超过年龄阈值的目录；任何失败静默跳过
+    （清扫是尽力而为的补救，绝不能让测试会话起不来）。
+    """
+    import glob
+    import time
+    cutoff = time.time() - _STALE_TMP_MAX_AGE_HOURS * 3600
+    for prefix in _TEST_TMP_PREFIXES:
+        for path in glob.glob(os.path.join(tempfile.gettempdir(), prefix + "*")):
+            try:
+                if os.path.isdir(path) and os.stat(path).st_mtime < cutoff:
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                continue
+
+
 def _start_pg_server():
-    import tempfile
     global _PG_DATA_DIR
     _PG_DATA_DIR = tempfile.mkdtemp(prefix="svs-pg-conftest-")
-    _srv = pgserver.get_server(_PG_DATA_DIR)
+    # cleanup_mode='delete'：退出时停库并删除数据目录。默认 'stop' 只停库
+    # 不删目录——每次会话固定泄漏约 42MB PG 数据目录，/tmp 用户配额会被
+    # 打爆（pgserver 库文档亦要求临时目录配 'delete'）。
+    _srv = pgserver.get_server(_PG_DATA_DIR, cleanup_mode="delete")
     _uri = _srv.get_uri()
     os.environ["DATABASE_URL"] = _uri
     os.environ["STORAGE_BACKEND"] = "postgres"
@@ -51,6 +83,7 @@ def _start_pg_server():
         _conn.close()
     return _srv
 
+_sweep_stale_test_tmp()
 _SERVER = _start_pg_server()
 
 def _session_cleanup():
@@ -58,6 +91,10 @@ def _session_cleanup():
         _SERVER.cleanup()
     except Exception:
         pass
+    # 兜底：cleanup 半途异常（库已停但目录未删）时也把数据目录删掉；
+    # 目录不存在时静默（cleanup_mode='delete' 正常路径已删过）
+    if _PG_DATA_DIR:
+        shutil.rmtree(_PG_DATA_DIR, ignore_errors=True)
 
 import atexit
 

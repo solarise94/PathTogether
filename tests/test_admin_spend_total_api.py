@@ -308,8 +308,9 @@ def test_site_stats_owner_only_and_readonly_passthrough():
     assert r.status_code == 200, r.get_data(as_text=True)
     body = r.get_json()
     for key in ("generated_at", "today", "d7", "d30", "daily",
-                "top_referrers", "top_pages", "top_countries", "recent",
-                "visitor_kinds", "geo_configured"):
+                "top_referrers", "top_referrers_with_bots", "top_pages",
+                "top_countries", "recent", "visitor_kinds", "entry_hosts",
+                "host_filter_configured", "legacy", "geo_configured"):
         assert key in body, key
     for seg in ("today", "d7", "d30"):
         assert set(body[seg].keys()) == {"visits", "unique_visitors", "bots"}

@@ -17,6 +17,7 @@ share-data/
 plugin-bundles/
 certs/
 *.log
+format_requests/
 
 # 本地环境变量（可能含密钥）
 .env
@@ -33,6 +34,17 @@ docs/ai-money-budget-bugfix-and-simplification-plan.md
 docs/histopilot-neutral-prompt-and-nuclei-plugin-design.md
 test-results/
 playwright-report/
+
+# 运维快照/部署记录（2026-09-16 隐私审计）：含真实 IP、主机别名、
+# 内网拓扑或服务器路径，一律仅本地保留，不推 GitHub
+docs/international-port-18445.md
+docs/histopilot-com-overseas-entry-design.md
+deploy/site-stats-entry-filtering.md
+deploy/pt-edge-international.inc.conf
+deploy/kuaikuaiyun-00-default.conf
+deploy/kuaikuaiyun-ni-biolab-holding.conf
+artifacts/homepage-deploy-20260915/
+artifacts/import-project-upgrade-20260914T161016Z/
 
 # image-review venv（本地基准环境，不进 git）
 .venv-image-review/

@@ -944,7 +944,10 @@ def test_admin_manifest_plugin_version_bumped_with_hashes():
     # 2026-09-14 0.4.5（W2 admin UI）：格式申请工单页（format-requests：
     # admin.formatRequests.list/get/patch，复用 users 权限域不扩域），
     # hashes/pin 同步
-    assert data["pluginVersion"] == "0.4.5"  # hashes/pin 同步
+    # 2026-09-15 0.4.6（站点统计入口域名口径）：站点访问卡增加「访问域名」
+    # 列、入口白名单/历史隔离提示、外部来源爬虫切换（review 2026-09-15），
+    # hashes/pin 同步
+    assert data["pluginVersion"] == "0.4.6"  # hashes/pin 同步
     assert "admin:settings:read" in data["adminPermissions"]
     assert "admin:settings:write" in data["adminPermissions"]
     assert "admin:slides:read" in data["adminPermissions"]

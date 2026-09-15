@@ -115,7 +115,9 @@
                （D2 未发布）时保持隐藏，不给操作员一个永远报错的卡 -->
           <section class="adm-card" id="adm-site-card" hidden>
             <h2>站点访问（匿名统计）</h2>
-            <p class="adm-note">只统计公开页面的匿名访问：与注册用户、邀请、AI 用量完全无关。同一访客按日轮换匿名 hash 去重，「匿名访客日去重次数」不是独立用户数；「疑似爬虫」只是观测标签，不是封禁依据。</p>
+            <p class="adm-note">只统计公开页面的匿名访问：与注册用户、邀请、AI 用量完全无关。同一访客按日轮换匿名 hash 去重，「匿名访客日去重次数」不是独立用户数；「疑似爬虫」只是观测标签，不是封禁依据。只统计目标域名为本服务入口（访问域名）的访问；「来源」是浏览器声明的 Referer（可伪造），仅作参考。</p>
+            <div class="adm-warning-card" id="adm-site-entry-warn" hidden></div>
+            <p class="adm-note" id="adm-site-entry-note" hidden></p>
             <div class="adm-empty" id="adm-site-empty" hidden></div>
             <div class="adm-kpis" id="adm-site-kpis"></div>
             <h3 class="adm-site-h3">近 30 天每日趋势</h3>
@@ -130,6 +132,7 @@
             <div class="adm-summary-grid adm-site-grid">
               <div class="adm-summary-card" id="adm-site-referrers-block">
                 <h3>外部来源 Top 10</h3>
+                <p class="adm-note"><label><input type="checkbox" id="adm-site-referrers-bots-toggle"> 包含疑似爬虫的访问</label>（默认排除；来源由浏览器声明，仅作参考）</p>
                 <div class="adm-table-wrap">
                   <table class="adm-table">
                     <thead><tr><th>来源站点</th><th>访问</th></tr></thead>
@@ -161,7 +164,7 @@
             <div class="adm-table-wrap">
               <table class="adm-table" id="adm-site-recent-table">
                 <thead>
-                  <tr><th>时间</th><th>页面</th><th>来源</th><th>国家 / 地区</th><th>分类</th></tr>
+                  <tr><th>时间</th><th>访问域名</th><th>页面</th><th>来源</th><th>国家 / 地区</th><th>分类</th></tr>
                 </thead>
                 <tbody id="adm-site-recent-tbody"></tbody>
               </table>

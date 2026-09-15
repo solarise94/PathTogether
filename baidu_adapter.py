@@ -183,9 +183,9 @@ def _parse_entry(raw):
     if not isinstance(is_dir, bool):
         raise AdapterError("connector_output_invalid", "isdir 缺失或形态非法")
     size = _coerce_size(raw.get("size", 0))
-    name = raw.get("server_filename")
+    name = raw.get("server_filename") or raw.get("name")
     path = raw.get("path")
-    if name is None and isinstance(path, str) and path:
+    if not name and isinstance(path, str) and path:
         name = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
     if not isinstance(name, str) or not name:
         raise AdapterError("connector_output_invalid", "文件名缺失")
@@ -218,8 +218,12 @@ def _parse_listing_payload(payload):
     """``ls --json``（裸数组，官方文档形态）或防御性兼容 ``{"list": []}``。"""
     if isinstance(payload, list):
         return [_parse_entry(e) for e in payload]
-    if isinstance(payload, dict) and isinstance(payload.get("list"), list):
-        return [_parse_entry(e) for e in payload["list"]]
+    if isinstance(payload, dict):
+        rows = payload.get("items")
+        if not isinstance(rows, list):
+            rows = payload.get("list")
+        if isinstance(rows, list):
+            return [_parse_entry(e) for e in rows]
     raise AdapterError("connector_output_invalid", "列表输出形态未知")
 
 
@@ -394,15 +398,21 @@ class ProductionBaiduAdapter:
         argv += ["--page", str(page), "--page-size", str(limit)]
         self._counters["list"] += 1
         payload = self._run_json(argv, LIST_TIMEOUT_SECONDS, (share, code))
-        if not isinstance(payload, dict) or not isinstance(
-                payload.get("list"), list):
+        if not isinstance(payload, dict):
             raise AdapterError(
                 "connector_output_invalid",
-                "分享列表输出形态未知（缺 list/has_more 不能当空分享）")
+                "分享列表输出形态未知（缺 items/list+has_more 不能当空分享）")
+        rows = payload.get("items")
+        if not isinstance(rows, list):
+            rows = payload.get("list")
+        if not isinstance(rows, list):
+            raise AdapterError(
+                "connector_output_invalid",
+                "分享列表输出形态未知（缺 items/list+has_more 不能当空分享）")
         has_more = payload.get("has_more")
         if not isinstance(has_more, bool):
             raise AdapterError("connector_output_invalid", "has_more 缺失")
-        items = [_parse_entry(e) for e in payload["list"]]
+        items = [_parse_entry(e) for e in rows]
         return {
             "items": items,
             "has_more": has_more,

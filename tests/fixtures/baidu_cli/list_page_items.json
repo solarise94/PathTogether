@@ -1,0 +1,17 @@
+{
+  "count": 1,
+  "dir": "",
+  "has_more": false,
+  "page": 1,
+  "page_size": 50,
+  "items": [
+    {
+      "fs_id": "379673321351613",
+      "index": 1,
+      "is_dir": false,
+      "name": "pt-bdpan-smoke.txt",
+      "path": "/pt-bdpan-smoke.txt",
+      "size": 35
+    }
+  ]
+}

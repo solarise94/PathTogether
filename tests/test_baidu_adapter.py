@@ -176,6 +176,21 @@ def test_b02_list_page_root_fixture(prod, monkeypatch):
     assert out["has_more"] is True and out["next_cursor"] == "2"
 
 
+def test_b02_list_page_live_items_shape(prod, monkeypatch):
+    """bdpan 3.8.7 实测：transfer list --json 为 items/is_dir/name，不是 list/isdir。"""
+    monkeypatch.setattr(
+        prod, "_run",
+        lambda *a, **k: _load("list_page_items.json"))
+    out = prod.list_share_page(SHARE, None, None, None, 50)
+    assert len(out["items"]) == 1
+    it = out["items"][0]
+    assert it["fs_id"] == "379673321351613"
+    assert it["is_dir"] is False
+    assert it["name"] == "pt-bdpan-smoke.txt"
+    assert it["size"] == 35
+    assert out["has_more"] is False and out["next_cursor"] is None
+
+
 def test_b02_list_page_nested_fixture(prod, monkeypatch):
     monkeypatch.setattr(
         prod, "_run", lambda *a, **k: _load("list_page_nested.json"))

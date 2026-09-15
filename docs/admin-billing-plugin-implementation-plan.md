@@ -110,7 +110,7 @@ HistoPilot 当前 `RequestMetrics` 只有：
 - 插件目录当前以 RW 方式挂载，`plugins/histopilot` 是普通目录；当前不存在 `plugins/releases` 或原子切换 symlink；
 - HistoPilot `/data/sessions` 是宿主机 bind mount，但 `/data/config` 是随机 ID 的匿名 Podman volume；
 - rootless 用户 `Linger=yes`；已有 `project-sync-backup.timer`，但其脚本只备份 `youtube-trans` 和 `projects-cuda`，**不覆盖** `svs-viewer-demo-data`、usage outbox、插件目录或匿名 config volume；
-- 本机 `ssh homePC` 当前解析为 `117.72.24.99:52044`；`docs/demo-deployment.md` 仍记录历史 LAN 地址 `192.168.3.223`。两者用途可能不同，发布 runbook 应以 SSH alias 为连接入口，并分别标注公网 SSH 端点和 LAN 地址，不能把二者直接互相替换。
+- 本机 `ssh homePC` 的实际端点见各工作站 `~/.ssh/config`（alias 为权威连接方式）；`docs/demo-deployment.md`（本地保留，不进仓库）另记录历史 LAN 地址。两者用途可能不同，发布 runbook 应以 SSH alias 为连接入口，并分别标注公网 SSH 端点和 LAN 地址，不能把二者直接互相替换。真实地址不得写入本仓库（2026-09-16 隐私审计）。
 
 本方案不新增官网后台容器，也不新增 admin 服务容器。PathTogether 主程序首次升级后，admin UI bundle 可以沿用现有插件目录独立发布。但 §16 的版本化 staging、原子切换、具名 config volume、专用备份与恢复演练是 PR3 的发布前置条件，不是已经具备的能力。上线时应把 PathTogether 对插件目录的挂载收紧为只读；发布动作在宿主机完成原子换版。
 
@@ -1110,7 +1110,7 @@ plugins/histopilot -> releases/histopilot-<version>
 
 通过同文件系统原子 symlink 切换或目录 rename 发布。若使用 symlink，插件加载器必须 `resolve()` 后验证目标仍位于受信任插件根内，再计算实际 manifest/bundle hash；不得允许链接逃逸。PathTogether 容器仅只读挂载插件根。发布脚本至少提供 `preflight`、`stage`、`switch`、`verify`、`rollback` 五个明确阶段，并把版本、hash、旧/新 target 和验证结果写入不含密钥的发布记录。
 
-`docs/demo-deployment.md` 的地址字段应在发布底座 PR 中拆成“SSH alias（权威连接方式）/当前解析端点/可选 LAN 地址”三个字段并更新核查日期；不能仅把历史 `192.168.3.223` 文本替换成 `117.72.24.99:52044`，因为它们并非同一种地址语义。
+`docs/demo-deployment.md` 的地址字段应在发布底座 PR 中拆成“SSH alias（权威连接方式）/当前解析端点/可选 LAN 地址”三个字段并更新核查日期；不能把 LAN 地址文本替换成公网端点（二者并非同一种地址语义），真实地址一律只留在本地文档。
 
 ### 16.2 回滚
 

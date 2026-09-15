@@ -1,122 +1,302 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-page="entry">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>HistoPilot</title>
-  <script src="/static/i18n.js?v=20260910b"></script>
-  <style>
-    :root {
-      --accent: #007AFF;
-      --accent-hover: #0062CC;
-      --bg: #f5f5f7;
-      --text: #1d1d1f;
-      --text-2: #86868b;
-      --separator: rgba(0, 0, 0, 0.08);
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body {
-      height: 100%;
-      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
-                   "Helvetica Neue", Arial, sans-serif;
-      -webkit-font-smoothing: antialiased;
-    }
-    body {
-      background: var(--bg);
-      color: var(--text);
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      padding: 32px 24px;
-      text-align: center;
-    }
-    .lang-toggle {
-      position: fixed;
-      top: 16px;
-      right: 16px;
-      min-width: 40px;
-      height: 32px;
-      padding: 0 10px;
-      border: 1px solid var(--separator);
-      border-radius: 9px;
-      background: #fff;
-      color: var(--text);
-      font-size: 13px;
-      font-weight: 600;
-      font-family: inherit;
-      cursor: pointer;
-      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
-    }
-    .brand-name {
-      font-size: 40px;
-      font-weight: 700;
-      letter-spacing: -0.5px;
-      margin-bottom: 12px;
-    }
-    .tagline {
-      font-size: 16px;
-      color: var(--text-2);
-      line-height: 1.6;
-      margin-bottom: 36px;
-    }
-    .actions {
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      width: 100%;
-      max-width: 320px;
-    }
-    .btn {
-      display: inline-block;
-      height: 44px;
-      line-height: 44px;
-      border-radius: 11px;
-      font-size: 15px;
-      font-weight: 600;
-      font-family: inherit;
-      text-decoration: none;
-      cursor: pointer;
-    }
-    .btn.primary {
-      background: var(--accent);
-      color: #fff;
-    }
-    .btn.primary:hover { background: var(--accent-hover); }
-    .btn.secondary {
-      background: #fff;
-      color: var(--accent);
-      border: 1px solid var(--separator);
-      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
-    }
-    .btn.secondary:hover { background: #f7f9fc; }
-    .hint {
-      margin-top: 18px;
-      font-size: 13px;
-      color: var(--text-2);
-      line-height: 1.6;
-    }
-    .footer {
-      margin-top: auto;
-      padding-top: 48px;
-      font-size: 12px;
-      color: var(--text-2);
-      line-height: 1.6;
-    }
-  </style>
+  <!-- 空 data URI favicon：避免未登录浏览器自动 GET /favicon.ico 撞鉴权闸 -->
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/static/entry.css?v=20260914f" />
+  <script src="/static/i18n.js?v=20260914f"></script>
+  <script src="/static/entry.js?v=20260914f"></script>
 </head>
-<body>
-  <button type="button" class="lang-toggle" aria-label="Switch language">EN</button>
-  <main>
-    <h1 class="brand-name" data-i18n="app.title">HistoPilot</h1>
-    <p class="tagline" data-i18n="entry.tagline">协作式数字病理切片查看与 AI 导航</p>
-    <div class="actions">
-      <a class="btn primary" href="/demo" data-i18n="entry.demo">直接体验 Demo</a>
-      <a class="btn secondary" href="/login" data-i18n="entry.login">登录测试与协作</a>
-    </div>
-    <p class="hint" data-i18n="entry.demo.hint">Demo 无需登录，可查看示例切片并体验 AI 导航</p>
+<body id="top">
+  <a class="skip-link" href="#main" data-i18n="entry.skip">跳到主要内容</a>
+
+  <!-- ================= 顶栏：品牌 / 锚点 / GitHub / 语言 / 登录 ================= -->
+  <header class="topbar">
+    <nav class="topbar-inner" aria-label="主导航">
+      <a class="brand" href="#top">HistoPilot</a>
+      <ul class="nav-links">
+        <li><a href="#product" data-i18n="entry.nav.product">产品</a></li>
+        <li><a href="#principle" data-i18n="entry.nav.principle">原理</a></li>
+        <li><a href="#capabilities" data-i18n="entry.nav.capabilities">能力</a></li>
+        <li><a href="#suite" data-i18n="entry.nav.suite">套件</a></li>
+        <li>
+          <a href="https://github.com/solarise94/HistoPilot" target="_blank"
+             rel="noopener noreferrer"><span data-i18n="entry.nav.github">GitHub</span><span class="ext" aria-hidden="true">↗</span></a>
+        </li>
+        <li>
+          <a href="https://me.solarise94.fun" target="_blank"
+             rel="noopener noreferrer"><span data-i18n="entry.nav.home">主页</span><span class="ext" aria-hidden="true">↗</span></a>
+        </li>
+        <li>
+          <a href="mailto:solarise94@gmail.com"><span data-i18n="entry.nav.email">邮箱</span></a>
+        </li>
+      </ul>
+      <div class="topbar-actions">
+        <button type="button" class="lang-toggle" data-i18n-aria="lang.toggle.aria" aria-label="切换为英文">EN</button>
+        {% if signed_in %}
+        <a class="avatar" href="/app" title="{{ display_name }}" aria-label="{{ display_name }}">{{ avatar_letter }}</a>
+        <a class="btn btn-primary btn-sm" href="/app" data-i18n="entry.nav.workbench">进入工作台</a>
+        <form class="logout-form" method="post" action="/logout">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+          <button type="submit" class="btn btn-secondary btn-sm" data-i18n="entry.nav.logout">退出</button>
+        </form>
+        {% else %}
+        <a class="btn btn-primary btn-sm" href="/login" data-i18n="entry.nav.login">登录</a>
+        {% endif %}
+      </div>
+    </nav>
+  </header>
+
+  <main id="main">
+    <!-- ================= Hero：左文右产品 mock ================= -->
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="badge"><span data-i18n="entry.badge">研究软件 · 不用于临床诊断</span></p>
+        <h1 data-i18n="entry.hero.title">让 Agent 自己读完整张切片。</h1>
+        <p class="lead" data-i18n="entry.hero.lead">HistoPilot 先在高倍看清细胞，再退到低倍识别结构，并留下可复查的观察轨迹。需要定量时，再调用你自己部署的分析插件。PathTogether 提供协作 Viewer、项目、标注与分享。</p>
+        <div class="hero-actions">
+          {% if signed_in %}
+          <a class="btn btn-primary" href="/app" data-i18n="entry.workbench">进入工作台</a>
+          <a class="btn btn-secondary" href="/demo" data-i18n="entry.demo">直接体验 Demo</a>
+          {% else %}
+          <a class="btn btn-primary" href="/demo" data-i18n="entry.demo">直接体验 Demo</a>
+          <a class="btn btn-secondary" href="/login" data-i18n="entry.login">登录测试与协作</a>
+          {% endif %}
+        </div>
+        {% if signed_in %}
+        <p class="hero-hint" data-i18n="entry.signed.hint">已登录。进入工作台继续查看、标注与协作。</p>
+        {% else %}
+        <p class="hero-hint" data-i18n="entry.demo.hint">Demo 无需登录，可查看示例切片并体验 AI 导航</p>
+        {% endif %}
+      </div>
+
+      <!-- 纯 CSS 抽象 mock（H&E 配色、无真实切片、装饰性、不可点击进 Viewer） -->
+      <div class="mock" aria-hidden="true">
+        <div class="mock-bar">
+          <span class="lights"><i></i><i></i><i></i></span>
+          <span class="mock-title" data-i18n="entry.mock.title">Demo slide · HistoPilot</span>
+        </div>
+        <div class="mock-body">
+          <div class="tissue">
+            <span class="gland g1"></span>
+            <span class="gland g2"></span>
+            <span class="gland g3"></span>
+            <span class="vac v1"></span>
+            <span class="vac v2"></span>
+            <span class="vac v3"></span>
+            <span class="obs"></span>
+            <span class="scale"><i></i>500 µm</span>
+            <span class="zoomctl"><span>+</span><span>−</span><span class="zlvl">20×</span></span>
+          </div>
+          <div class="agent">
+            <div class="agent-head"><span class="pulse"></span><span>Agent</span></div>
+            <ol>
+              <li class="done"><span class="n">1</span><span data-i18n="entry.mock.step1">20× 观察核形态</span></li>
+              <li class="done"><span class="n">2</span><span data-i18n="entry.mock.step2">拉远到 2× 识别腺体结构</span></li>
+              <li class="active"><span class="n">3</span><span data-i18n="entry.mock.step3">调用分析插件扩展能力</span></li>
+              <li><span class="n">4</span><span data-i18n="entry.mock.step4">留下可复查轨迹，未写入正式标注</span></li>
+            </ol>
+            <div class="agent-foot">read-only · steps 3/8</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 产品如何工作 ================= -->
+    <section id="product" class="section">
+      <p class="kicker" data-i18n="entry.how.kicker">产品</p>
+      <h2 data-i18n="entry.how.title">产品如何工作</h2>
+      <div class="how-grid">
+        <div class="how-card">
+          <span class="no">01</span>
+          <h3 data-i18n="entry.how.s1.title">打开切片</h3>
+          <p data-i18n="entry.how.s1.body">把 WSI 放进 PathTogether。想先看效果，可以从 Demo 展示入口进入。</p>
+        </div>
+        <div class="how-card">
+          <span class="no">02</span>
+          <h3 data-i18n="entry.how.s2.title">让 HistoPilot 导航</h3>
+          <p data-i18n="entry.how.s2.body">Agent 先高倍观察，再低倍识别，必要时调用分析插件；步骤有上限。</p>
+        </div>
+        <div class="how-card">
+          <span class="no">03</span>
+          <h3 data-i18n="entry.how.s3.title">协作与分享</h3>
+          <p data-i18n="entry.how.s3.body">登录后上传自己的切片、标注、评论，按权限分享。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 原理演示 ================= -->
+    <section id="principle" class="section">
+      <p class="kicker" data-i18n="entry.principle.kicker">原理</p>
+      <h2 data-i18n="entry.principle.title">Agent 怎么读一张切片</h2>
+      <p class="section-lead" data-i18n="entry.principle.lead">先点「播放原理」看高倍观察再低倍识别；再点「播放插件」看 Agent 如何把视野交给你自己部署的分析插件。</p>
+
+      <div class="demo-stage" data-hp-stage>
+        <div class="demo-toolbar">
+          <div class="demo-tabs" role="tablist" aria-label="演示切换">
+            <button type="button" class="demo-tab is-on" data-hp-tab="nav" aria-pressed="true" data-i18n="entry.principle.tab.nav">高倍 → 低倍</button>
+            <button type="button" class="demo-tab" data-hp-tab="plugin" aria-pressed="false" data-i18n="entry.principle.tab.plugin">调用插件</button>
+          </div>
+          <div class="demo-actions">
+            <button type="button" class="btn btn-primary btn-sm" data-hp-play data-i18n="entry.principle.play">播放原理</button>
+            <button type="button" class="btn btn-secondary btn-sm" data-hp-pause data-i18n="entry.principle.pause">暂停</button>
+          </div>
+        </div>
+
+        <div class="demo-body">
+          <div class="slide-stage" aria-hidden="true">
+            <div class="slide-world" data-hp-world>
+              <span class="gland g1"></span>
+              <span class="gland g2"></span>
+              <span class="gland g3"></span>
+              <span class="gland g4"></span>
+              <span class="vac v1"></span>
+              <span class="vac v2"></span>
+              <span class="vac v3"></span>
+              <span class="nuclei"></span>
+            </div>
+            <span class="fov" data-hp-fov></span>
+            <span class="plugin-scan" data-hp-scan></span>
+            <span class="scale" data-hp-scale>50 µm</span>
+            <span class="zoomctl"><span class="zlvl" data-hp-zoom>20×</span></span>
+          </div>
+
+          <aside class="demo-panel">
+            <p class="demo-status" data-hp-status data-i18n="entry.principle.status.idle">准备播放：先高倍看清细胞，再退到低倍识别结构。</p>
+            <ol class="demo-steps" data-hp-steps-nav>
+              <li data-step="0" data-i18n="entry.principle.nav.s1">高倍 20×：看细胞核与局部细节</li>
+              <li data-step="1" data-i18n="entry.principle.nav.s2">平移到相邻视野，继续确认</li>
+              <li data-step="2" data-i18n="entry.principle.nav.s3">拉远到 2×：识别腺体与组织结构</li>
+              <li data-step="3" data-i18n="entry.principle.nav.s4">留下可复查的观察轨迹</li>
+            </ol>
+            <ol class="demo-steps is-hidden" data-hp-steps-plugin>
+              <li data-step="0" data-i18n="entry.principle.plugin.s1">Agent 选定当前视野</li>
+              <li data-step="1" data-i18n="entry.principle.plugin.s2">调用你部署的分析插件</li>
+              <li data-step="2" data-i18n="entry.principle.plugin.s3">插件返回计数 / 区域结果</li>
+              <li data-step="3" data-i18n="entry.principle.plugin.s4">能力边界由插件扩展，不改导航内核</li>
+            </ol>
+            <p class="demo-footnote" data-i18n="entry.principle.footnote">抽象示意，不是真实切片，也不构成诊断。</p>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 能力 ================= -->
+    <section id="capabilities" class="section">
+      <p class="kicker" data-i18n="entry.cap.kicker">能力</p>
+      <h2 data-i18n="entry.cap.title">核心能力</h2>
+      <div class="cap-grid cap-grid-3">
+        <div class="cap-card">
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+                 stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="8"></circle>
+              <path d="M15.5 8.5 13 13l-4.5 2.5L11 11z"></path>
+            </svg>
+          </span>
+          <h3 data-i18n="entry.cap.1.title">Agentic 导航</h3>
+          <p data-i18n="entry.cap.1.body">高倍观察、低倍识别、坐标语义、快照与视觉预算。</p>
+        </div>
+        <div class="cap-card">
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+                 stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3 3 8l9 5 9-5-9-5Z"></path>
+              <path d="m3 13 9 5 9-5"></path>
+            </svg>
+          </span>
+          <h3 data-i18n="entry.cap.2.title">协作 Viewer</h3>
+          <p data-i18n="entry.cap.2.body">OpenSlide + OpenSeadragon，项目、ROI、评论。</p>
+        </div>
+        <div class="cap-card">
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+                 stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M10 4a2 2 0 1 1 4 0v1h3a1 1 0 0 1 1 1v3h-1a2 2 0 1 0 0 4h1v3a1 1 0 0 1-1 1h-3v-1a2 2 0 1 0-4 0v1H7a1 1 0 0 1-1-1v-3H5a2 2 0 1 0 0-4h1V6a1 1 0 0 1 1-1h3V4Z"></path>
+            </svg>
+          </span>
+          <h3 data-i18n="entry.cap.3.title">自研分析插件</h3>
+          <p data-i18n="entry.cap.3.body">部署自己撰写的分析插件，扩展能力边界；HistoPilot 只负责导航与调用。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 套件 ================= -->
+    <section id="suite" class="section">
+      <p class="kicker" data-i18n="entry.suite.kicker">套件</p>
+      <h2 data-i18n="entry.suite.title">HistoPilot 套件</h2>
+      <div class="suite-grid">
+        <div class="suite-card">
+          <span class="repo">solarise94 /</span>
+          <h3>HistoPilot</h3>
+          <p data-i18n="entry.suite.hp.body">面向 WSI 的自主导航服务</p>
+          <a href="https://github.com/solarise94/HistoPilot" target="_blank"
+             rel="noopener noreferrer"><span data-i18n="entry.suite.github">GitHub →</span></a>
+        </div>
+        <div class="suite-card">
+          <span class="repo">solarise94 /</span>
+          <h3>PathTogether</h3>
+          <p data-i18n="entry.suite.pt.body">协作读片平台与插件宿主</p>
+          <a href="https://github.com/solarise94/PathTogether" target="_blank"
+             rel="noopener noreferrer"><span data-i18n="entry.suite.github">GitHub →</span></a>
+        </div>
+        <div class="suite-card">
+          <span class="repo">solarise94 /</span>
+          <h3>HistoPilot-DSH</h3>
+          <p data-i18n="entry.suite.dsh.body">把导航注册为 DSH 高层工具</p>
+          <a href="https://github.com/solarise94/HistoPilot-DSH" target="_blank"
+             rel="noopener noreferrer"><span data-i18n="entry.suite.github">GitHub →</span></a>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 关闭 CTA ================= -->
+    <section class="section cta-section">
+      {% if signed_in %}
+      <h2 data-i18n="entry.cta.title.signed">进入工作台，继续你的切片。</h2>
+      <p class="cta-body" data-i18n="entry.cta.body.signed">工作台可收藏：下次打开 /app 即可跳过介绍页。</p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="/app" data-i18n="entry.workbench">进入工作台</a>
+        <a class="btn btn-secondary" href="/demo" data-i18n="entry.demo">直接体验 Demo</a>
+      </div>
+      {% else %}
+      <h2 data-i18n="entry.cta.title">先从 Demo 看看效果，再决定是否登录。</h2>
+      <p class="cta-body" data-i18n="entry.cta.body">Demo 是展示入口，无需账号即可查看示例切片。需要上传、标注、协作或部署自己的分析插件时再登录。</p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="/demo" data-i18n="entry.demo">直接体验 Demo</a>
+        <a class="btn btn-secondary" href="/login" data-i18n="entry.login">登录测试与协作</a>
+      </div>
+      {% endif %}
+    </section>
   </main>
-  <footer class="footer" data-i18n="entry.footer">仅用于研究、教学和软件演示，不用于临床诊断。</footer>
+
+  <!-- ================= 页脚 ================= -->
+  <footer class="footer">
+    <div class="footer-inner">
+      <p class="footer-note" data-i18n="entry.footer">仅用于研究、教学和软件演示，不用于临床诊断。</p>
+      <nav class="footer-links" aria-label="页脚导航">
+        <a href="/demo">Demo</a>
+        {% if signed_in %}
+        <a href="/app" data-i18n="entry.nav.workbench">进入工作台</a>
+        {% else %}
+        <a href="/login" data-i18n="entry.nav.login">登录</a>
+        {% endif %}
+        <a href="https://me.solarise94.fun" target="_blank" rel="noopener noreferrer"
+           data-i18n="entry.nav.home">主页</a>
+        <a href="mailto:solarise94@gmail.com" data-i18n="entry.nav.email">邮箱</a>
+        <a href="https://github.com/solarise94/HistoPilot" target="_blank"
+           rel="noopener noreferrer">HistoPilot</a>
+        <a href="https://github.com/solarise94/PathTogether" target="_blank"
+           rel="noopener noreferrer">PathTogether</a>
+        <a href="https://github.com/solarise94/HistoPilot-DSH" target="_blank"
+           rel="noopener noreferrer">HistoPilot-DSH</a>
+      </nav>
+      <p class="footer-copy" data-i18n="entry.footer.copy">© 2026 HistoPilot</p>
+    </div>
+  </footer>
+
 </body>
 </html>

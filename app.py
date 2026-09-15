@@ -1513,6 +1513,7 @@ def _collect_site_visit(resp):
             status_code=resp.status_code,
             content_type=content_type,
             signed_in=bool(session.get("user_id")),
+            host=request.host,
             now=None)
         if evt is not None:
             site_stats_store.enqueue_visit(evt)  # put_nowait，满则丢

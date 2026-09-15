@@ -11,6 +11,7 @@ docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md §3.4 / §4.4 /
 
 - ``SITE_BOT_UA_RULESET_VERSION``：bot 词表版本常量（词表修改必须同步提版）；
 - ``build_event(**kwargs) -> dict | None``：纯函数。非 allowlist 路径 /
+  非本站 Host（配置了 PUBLIC_BASE_URL/PUBLIC_ORIGINS 时） /
   非 2xx-3xx / 非 HTML / 含 query token 或资源 ID → None；返回 dict 键固定
   page_key/occurred_at/dedup_bucket/referrer_domain/utm_source/country_code/
   daily_visitor_hash/visitor_kind/bot_name（即落库最小事件，无原始 IP/UA/
@@ -314,22 +315,72 @@ def _daily_visitor_hash(secret, day_str, prefix):
 # --------------------------------------------------------------------------- #
 # referrer / query / utm 清洗
 # --------------------------------------------------------------------------- #
+def _normalize_hostname(raw):
+    """Host / referrer hostname：小写、去端口、去 IPv6 方括号、去尾点。空串表示无效。"""
+    value = (raw or "").strip().lower()
+    if not value:
+        return ""
+    if value.startswith("["):
+        end = value.find("]")
+        if end > 0:
+            return value[1:end].rstrip(".")
+    return value.split(":", 1)[0].rstrip(".")
+
+
+def _add_url_host(hosts, raw):
+    value = (raw or "").strip()
+    if not value:
+        return
+    try:
+        candidate = value if "//" in value else "https://" + value
+        host = urlparse(candidate).hostname
+    except ValueError:
+        host = None
+    if host:
+        hosts.add(host.lower().rstrip("."))
+
+
+def _public_entry_hostnames():
+    """本服务公网入口 hostname：只含 PUBLIC_BASE_URL + PUBLIC_ORIGINS。
+
+    同机其它站点（如 cpa.ni-biolab.com）即使打到同一 gunicorn，也不算本站访问。
+    未配置公网入口时返回空集（本地/测试不按 Host 过滤）。
+    """
+    hosts = set()
+    _add_url_host(hosts, os.environ.get("PUBLIC_BASE_URL"))
+    extra = (os.environ.get("PUBLIC_ORIGINS") or "").strip()
+    if extra:
+        for part in extra.split(","):
+            _add_url_host(hosts, part)
+    return hosts
+
+
 def _self_hostnames():
-    """视作"同站"的 hostname 集合：PUBLIC_BASE_URL + SERVER_NAME + 本机兜底。"""
+    """视作"同站"的 hostname 集合：公网入口 + SERVER_NAME + 本机兜底。"""
     hosts = set(_LOCAL_HOSTS)
-    raw = (os.environ.get("PUBLIC_BASE_URL") or "").strip()
-    if raw:
-        try:
-            candidate = raw if "//" in raw else "https://" + raw
-            host = urlparse(candidate).hostname
-        except ValueError:
-            host = None
-        if host:
-            hosts.add(host.lower().rstrip("."))
+    hosts.update(_public_entry_hostnames())
     server_name = (os.environ.get("SERVER_NAME") or "").strip().lower()
     if server_name:
-        hosts.add(server_name.rstrip("."))
+        hosts.add(_normalize_hostname(server_name) or server_name.rstrip("."))
     return hosts
+
+
+def _request_host_allowed(host):
+    """请求 Host 是否为本服务入口。
+
+    未配置 PUBLIC_BASE_URL/PUBLIC_ORIGINS：不按 Host 过滤（本地测试）。
+    已配置：必须给出可解析 Host 且落在公网入口集合；同机其它域名一律不记。
+    host=None 视为调用方未接线（单元测试），不过滤。
+    """
+    if host is None:
+        return True
+    allowed = _public_entry_hostnames()
+    if not allowed:
+        return True
+    normalized = _normalize_hostname(host)
+    if not normalized:
+        return False
+    return normalized in allowed
 
 
 def _referrer_domain(referrer):
@@ -344,7 +395,9 @@ def _referrer_domain(referrer):
         return "direct"
     if not host:
         return "direct"
-    host = host.lower().rstrip(".")
+    host = _normalize_hostname(host)
+    if not host:
+        return "direct"
     if host in _self_hostnames():
         return "direct"
     return host
@@ -411,13 +464,13 @@ def _classify_user_agent(user_agent):
 # build_event（纯函数；跨代理契约）
 # --------------------------------------------------------------------------- #
 def build_event(*, path, query_string, referrer, remote_addr, user_agent,
-                status_code, content_type, signed_in, now=None):
+                status_code, content_type, signed_in, host=None, now=None):
     """构造最小匿名事件；不符合口径返回 None（调用方静默丢弃）。
 
-    拒绝口径：非 allowlist 精确路径 / 状态码非 2xx-3xx / Content-Type 非
-    HTML / query 含 token 或资源 ID 键 / secret 不可用 / remote_addr 不可
-    解析。HTTP method（仅 GET 采集）由 after_request 调用点过滤——本函数
-    契约无 method 参数。
+    拒绝口径：非 allowlist 精确路径 / 非本站 Host（已配置公网入口时） /
+    状态码非 2xx-3xx / Content-Type 非 HTML / query 含 token 或资源 ID 键 /
+    secret 不可用 / remote_addr 不可解析。HTTP method（仅 GET 采集）由
+    after_request 调用点过滤——本函数契约无 method 参数。
 
     返回 dict 键固定（与 0030 列一一对应，无任何多余键）：
     page_key, occurred_at, dedup_bucket, referrer_domain, utm_source,
@@ -435,6 +488,9 @@ def build_event(*, path, query_string, referrer, remote_addr, user_agent,
     # 3. 路径必须精确命中 allowlist（拒绝 /demo/、//demo、/demo/x 等）
     page_key = PAGE_ALLOWLIST.get(path) if isinstance(path, str) else None
     if page_key is None:
+        return None
+    # 3b. Host 必须是本服务公网入口。同机其它站点打到同一进程不记为本站访问。
+    if not _request_host_allowed(host):
         return None
     # 4. query：含 token/资源 ID 键 → 整条拒绝；utm_source 之外的键全部丢弃
     if _query_has_sensitive_key(query_string):

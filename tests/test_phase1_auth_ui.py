@@ -389,7 +389,126 @@ def test_index_unauthenticated_renders_entry_page(monkeypatch):
     # 不是完整应用
     assert 'id="viewer"' not in body
 
-def test_index_authenticated_renders_full_app(monkeypatch):
+def test_index_entry_landing_page_content(monkeypatch):
+    """未登录 / 的产品介绍页内容（histopilot-com-landing-page.md §5/§6）。"""
+    install_json_login_limits(monkeypatch)
+    app_mod.AUTH_ENABLED = True
+    _setup_owner_and_user()
+    client = _client()
+    r = client.get("/")
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    # 新深色样式与结构锚点
+    assert "entry.css?v=" in body
+    assert 'id="product"' in body
+    assert 'id="capabilities"' in body
+    assert 'id="suite"' in body
+    # 中文默认文案（测试锁定，勿改写）
+    assert "登录测试与协作" in body
+    assert "Demo 无需登录，可查看示例切片并体验 AI 导航" in body
+    assert "仅用于研究、教学和软件演示，不用于临床诊断。" in body
+    # 三个 GitHub 仓库链接（顶栏 / 套件卡 / 页脚）
+    for repo in ("HistoPilot", "PathTogether", "HistoPilot-DSH"):
+        assert 'https://github.com/solarise94/%s' % repo in body
+    assert 'href="https://me.solarise94.fun"' in body
+    assert 'href="mailto:solarise94@gmail.com"' in body
+    # i18n 锚点（语言切换覆盖导航 / hero / mock / 卡片）
+    for key in ("entry.nav.login", "entry.hero.title", "entry.mock.step1",
+                "entry.cap.1.title", "entry.suite.github", "entry.cta.title"):
+        assert 'data-i18n="%s"' % key in body
+    # 不加载完整应用资源（介绍页只做营销与分流）
+    assert 'id="viewer"' not in body
+    assert "app.js" not in body
+    assert "openseadragon" not in body
+    assert "style.css" not in body
+    # 空 favicon（data URI，避免未登录撞 /favicon.ico 鉴权）
+    assert 'href="data:,"' in body
+    # 不编造尚不存在的条款/隐私路由
+    assert 'href="/terms"' not in body
+    assert 'href="/privacy"' not in body
+    # 无外部字体 / CDN / 真实切片图
+    assert "fonts.googleapis" not in body
+    assert 'src="http' not in body
+    assert "<img" not in body
+    # 无内联脚本（CSP script-src 'self'）；标题由 i18n.js 按 data-page=entry 同步
+    assert body.count("<script") == 2
+    assert 'src="/static/i18n.js' in body
+    assert 'src="/static/entry.js' in body
+    assert 'data-page="entry"' in body
+    assert 'id="principle"' in body
+    assert "受控 Demo" not in body
+    assert "自研分析插件" in body
+    assert "Content-Security-Policy" in r.headers
+    assert "unsafe-inline" not in r.headers.get("Content-Security-Policy", "")
+    assert "no-store" in r.headers.get("Cache-Control", "")
+    assert r.headers.get("X-Frame-Options") == "DENY"
+
+def test_entry_landing_source_guards():
+    """介绍页源码守卫：深色主题、减少动画、语义结构与 i18n 键。"""
+    html = (REPO_ROOT / "templates" / "entry.html").read_text(encoding="utf-8")
+    css = (REPO_ROOT / "static" / "entry.css").read_text(encoding="utf-8")
+    i18n = (REPO_ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
+    # 深色 ZCode 风格 + 尊重 prefers-reduced-motion
+    assert "#161616" in css
+    assert "prefers-reduced-motion" in css
+    assert "position: sticky" in css
+    js = (REPO_ROOT / "static" / "entry.js").read_text(encoding="utf-8")
+    assert "data-hp-stage" in js
+    assert "prefers-reduced-motion" in js
+    # 语义结构：header + main + footer；锚点导航与跳转链接
+    assert "<header" in html and "<main" in html and "<footer" in html
+    assert "<nav" in html
+    assert 'href="#top"' in html
+    assert 'class="skip-link"' in html
+    # 语言切换沿用 .lang-toggle
+    assert 'class="lang-toggle"' in html
+    assert html.count("<script") == 2
+    assert 'src="/static/i18n.js' in html
+    assert 'src="/static/entry.js' in html
+    assert 'data-page="entry"' in html
+    assert 'id="principle"' in html
+    assert "受控 Demo" not in html
+    # i18n 新键 zh/en 双语成对存在（histopilot-com-landing-page.md §4）
+    new_keys = (
+        "entry.skip", "lang.toggle.aria", "app.doc.title.entry",
+        "entry.nav.product", "entry.nav.principle", "entry.nav.capabilities",
+        "entry.nav.suite",
+        "entry.nav.github", "entry.nav.home", "entry.nav.email",
+        "entry.nav.login", "entry.nav.workbench", "entry.nav.logout",
+        "entry.workbench", "entry.signed.hint",
+        "entry.cta.title.signed", "entry.cta.body.signed",
+        "entry.badge",
+        "entry.hero.title", "entry.hero.lead",
+        "entry.mock.title", "entry.mock.step1", "entry.mock.step2",
+        "entry.mock.step3", "entry.mock.step4",
+        "entry.how.kicker", "entry.how.title",
+        "entry.how.s1.title", "entry.how.s1.body",
+        "entry.how.s2.title", "entry.how.s2.body",
+        "entry.how.s3.title", "entry.how.s3.body",
+        "entry.cap.kicker", "entry.cap.title",
+        "entry.cap.1.title", "entry.cap.1.body",
+        "entry.cap.2.title", "entry.cap.2.body",
+        "entry.cap.3.title", "entry.cap.3.body",
+        "entry.principle.title", "entry.principle.play",
+        "entry.principle.tab.plugin",
+        "entry.suite.kicker", "entry.suite.title",
+        "entry.suite.hp.body", "entry.suite.pt.body", "entry.suite.dsh.body",
+        "entry.suite.github", "entry.cta.title", "entry.cta.body",
+        "entry.footer.copy",
+    )
+    zh_block = i18n[i18n.index("zh: {"):i18n.index("en: {")]
+    en_block = i18n[i18n.index("en: {"):]
+    for key in new_keys:
+        assert '"%s"' % key in zh_block, "i18n.js zh 缺新键：%r" % key
+        assert '"%s"' % key in en_block, "i18n.js en 缺新键：%r" % key
+    # 现有 entry.* 中文默认不回退（其他页面共用）
+    for text in ("直接体验 Demo", "登录测试与协作",
+                 "Demo 无需登录，可查看示例切片并体验 AI 导航",
+                 "仅用于研究、教学和软件演示，不用于临床诊断。"):
+        assert text in zh_block
+
+def test_index_authenticated_stays_on_landing(monkeypatch):
+    """已登录访问 / 仍是介绍主页：头像 + 进入工作台，不进 Viewer。"""
     install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
@@ -398,6 +517,28 @@ def test_index_authenticated_renders_full_app(monkeypatch):
     r = client.get("/")
     assert r.status_code == 200
     body = r.get_data(as_text=True)
+    assert 'id="viewer"' not in body
+    assert "进入工作台" in body
+    assert 'href="/app"' in body
+    assert 'class="avatar"' in body
+    assert "登录测试与协作" not in body
+
+
+def test_workbench_requires_login_and_renders_app(monkeypatch):
+    """/app 未登录 302 /login?next=/app；已登录渲染完整工作台。"""
+    install_json_login_limits(monkeypatch)
+    app_mod.AUTH_ENABLED = True
+    _setup_owner_and_user()
+    anon = _client()
+    r = anon.get("/app")
+    assert r.status_code == 302
+    assert "/login" in r.headers["Location"]
+    assert "next=/app" in r.headers["Location"]
+    client = _client()
+    _login_ok(client)
+    r2 = client.get("/app")
+    assert r2.status_code == 200
+    body = r2.get_data(as_text=True)
     assert 'id="viewer"' in body
 
 def test_index_auth_disabled_keeps_current_behavior():

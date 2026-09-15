@@ -9,6 +9,7 @@ store 级（默认全跑；PG-only 用例 RUN_PG_TESTS=1）：
   - 口径门：非 2xx-3xx 不落；非 HTML 不落；query 含 token/资源 ID 键整条
     拒绝；utm_source 白名单外丢弃；其余 query 全丢弃；
   - referrer 只取 hostname；同站（PUBLIC_BASE_URL/本机）归 direct；
+  - Host 不在 PUBLIC_BASE_URL/PUBLIC_ORIGINS（同机其它站点）不落；
   - bot：Googlebot/curl/headless → suspected_bot + bot_name；正常浏览器
     登录 → signed_in_human；匿名 → anonymous_human；bot 优先于登录态；
   - 去重与哈希：IPv4 同 /24 同哈希、跨 /24 不同；IPv6 /64 同理；
@@ -101,7 +102,7 @@ def _isolate(tmp_path, monkeypatch):
     """
     isolate_app(monkeypatch, tmp_path, clear_stores=True)
     for name in ("SITE_STATS_HMAC_SECRET_FILE", "PUBLIC_BASE_URL",
-                 "SERVER_NAME"):
+                 "PUBLIC_ORIGINS", "SERVER_NAME"):
         monkeypatch.delenv(name, raising=False)
     sss._reset_warn_state()
     sss.stop_worker()          # 先停 worker（app import 可能已自起；见 app.py）
@@ -306,6 +307,30 @@ def test_referrer_hostname_only_and_same_site_direct(secret, monkeypatch):
         "referrer_domain"] == "direct"
     assert _ev(referrer="https://histo.example.com")[
         "referrer_domain"] == "direct"
+    monkeypatch.setenv(
+        "PUBLIC_ORIGINS",
+        "https://histopilot.com,https://histopilot.cn")
+    assert _ev(referrer="https://histopilot.com/admin")[
+        "referrer_domain"] == "direct"
+    assert _ev(referrer="https://histopilot.cn/")[
+        "referrer_domain"] == "direct"
+
+
+def test_foreign_host_on_same_server_is_not_recorded(secret, monkeypatch):
+    """同机其它站点（cpa.ni-biolab.com）打到本进程：不记为本站访问。"""
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://pt.solarise94.fun")
+    monkeypatch.setenv(
+        "PUBLIC_ORIGINS",
+        "https://pt.solarise94.fun,https://histopilot.com,https://histopilot.cn")
+    assert _ev(host="cpa.ni-biolab.com") is None
+    assert _ev(host="cpa.ni-biolab.com:443") is None
+    assert _ev(host="") is None
+    # 本服务入口仍记
+    assert _ev(host="histopilot.com") is not None
+    assert _ev(host="HISTOPILOT.COM:443") is not None
+    assert _ev(host="pt.solarise94.fun") is not None
+    # 未接线 host=None 保持旧单元测试行为
+    assert _ev() is not None
 
 
 # --------------------------------------------------------------------------- #

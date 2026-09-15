@@ -1310,7 +1310,7 @@ def test_demo_landing_login_cta_switches_for_logged_in_users(monkeypatch):
     assert 'data-i18n="demo.register"' in anon
     assert 'data-i18n="demo.open.full"' not in anon
     assert 'data-i18n="demo.open.full"' in logged
-    assert 'href="/"' in logged
+    assert 'href="/app"' in logged
     assert 'data-i18n="demo.login"' not in logged
     # i18n 双语键齐全
     i18n = (Path(__file__).resolve().parent.parent / "static" / "i18n.js") \

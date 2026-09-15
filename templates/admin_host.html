@@ -36,7 +36,7 @@
     <section class="adm-host-card adm-host-card--error">
       <h1>403 · 需要 owner 权限</h1>
       <p>管理工作台仅对部署管理员（owner）开放；身份预览期间同样不可用。</p>
-      <p class="adm-host-actions"><a href="/">返回 Viewer</a></p>
+      <p class="adm-host-actions"><a href="/app">返回 Viewer</a></p>
     </section>
   </main>
   {% elif mode == "degraded" %}
@@ -46,7 +46,7 @@
       <p>admin.workspace 插件未通过平台信任校验，管理工作台已降级。Viewer、登录与分享等平台功能不受影响。</p>
       <p class="adm-host-reason">原因：<code>{{ admin_reason }}</code></p>
       <p class="adm-host-note">常见原因：插件未安装或被禁用、来源策略未 pin 或 manifest 哈希不匹配。修复后刷新本页即可。</p>
-      <p class="adm-host-actions"><a href="/">返回 Viewer</a></p>
+      <p class="adm-host-actions"><a href="/app">返回 Viewer</a></p>
     </section>
   </main>
   {% else %}
@@ -57,7 +57,7 @@
          role="status" aria-live="polite">正在初始化…</p>
       <div class="adm-host-actions">
         <button type="button" id="admin-reload-btn">重新加载插件</button>
-        <a href="/">返回 Viewer</a>
+        <a href="/app">返回 Viewer</a>
       </div>
     </div>
   </header>

@@ -62,11 +62,11 @@ function attachErrorCollectors(page: Page) {
 
 async function login(page: Page, loginId: string, password: string) {
 	await page.goto("/login");
-	await page.fill("#username", loginId);
-	await page.fill("#password", password);
+	await page.fill('form[action="/login"] input[name="username"]', loginId);
+	await page.fill('form[action="/login"] input[name="password"]', password);
 	await Promise.all([
 		page.waitForURL((u) => !u.pathname.includes("/login")),
-		page.click("#login-submit"),
+		page.click('form[action="/login"] button[type="submit"]'),
 	]);
 }
 

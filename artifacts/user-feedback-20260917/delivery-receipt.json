@@ -1,0 +1,33 @@
+{
+  "ok": true,
+  "html": "/home/solarise/ZCodeProject/histopilot-suite/PathTogether/artifacts/user-feedback-20260917/report.html",
+  "stages": {
+    "validation": "passed",
+    "package": "passed",
+    "verification": "passed"
+  },
+  "counts": {
+    "blocks": 11,
+    "charts": 1,
+    "html": 0,
+    "metrics": 0,
+    "tables": 0
+  },
+  "sourceDialog": "passed",
+  "sourceInteraction": "keyboard_menu_semantic_click",
+  "viewports": [
+    1440,
+    390
+  ],
+  "timings": {
+    "validateAndPackageMs": 1149.3,
+    "staticChartExtractionMs": 1094,
+    "browserRunMs": 774.3,
+    "readerReadyMs": 93.2,
+    "contentChecksMs": 32,
+    "sourceDialogMs": 32.1,
+    "responsiveChecksMs": 32,
+    "verificationMs": 792.2,
+    "totalMs": 1943.3
+  }
+}

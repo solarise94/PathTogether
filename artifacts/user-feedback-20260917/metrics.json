@@ -1,0 +1,15 @@
+{
+  "sessions": 7,
+  "files": 6,
+  "human_messages": 11,
+  "categories": {
+    "分析当前视野": 7,
+    "寻找可疑区域": 1,
+    "明确矩形坐标": 1,
+    "判断肿瘤组织": 1,
+    "解释具体细胞": 1
+  },
+  "finished_sessions": 6,
+  "nonempty_final_events": 8,
+  "degraded_summary_calls": 7
+}

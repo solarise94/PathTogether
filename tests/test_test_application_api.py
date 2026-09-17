@@ -337,6 +337,26 @@ def test_verify_submits_application_and_rejects_bad_shape_before_token(
 # --------------------------------------------------------------------------- #
 # 管理侧：GET /api/admin/v1/test-applications + review
 # --------------------------------------------------------------------------- #
+def test_application_email_link_preserves_login_and_owner_gate():
+    client = _client()
+    response = client.get("/admin/test-applications")
+    assert response.status_code == 302
+    from urllib.parse import urlsplit, parse_qs
+    location = urlsplit(response.headers["Location"])
+    assert location.path == "/login"
+    assert parse_qs(location.query)["next"] == ["/admin/test-applications"]
+
+    user = user_store.create_user("link-user@x.com", "userpass12345678",
+                                  role="user")
+    _session_as(client, user, "user")
+    assert client.get("/admin/test-applications").status_code == 403
+
+    _session_as(client, _owner(), "owner")
+    response = client.get("/admin/test-applications")
+    assert response.status_code == 302
+    assert response.headers["Location"] == "/admin#test-applications"
+
+
 def test_admin_list_owner_gate_and_filters(monkeypatch):
     """列表：匿名 401 / 非 owner 403 / owner 200（status/direction 过滤 +
     字段白名单 + next_cursor=None）。"""

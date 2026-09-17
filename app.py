@@ -3154,6 +3154,16 @@ def _admin_asset_html_csp():
 ADMIN_BOOTSTRAP_SCHEMA_VERSION = 1
 
 
+@app.route("/admin/test-applications")
+def admin_test_applications_link():
+    """Keep application notification links working with hash-based admin navigation."""
+    if actor_identity()["role"] != user_store.ROLE_OWNER:
+        return _admin_host_response("forbidden", status=403)
+    if AUTH_ENABLED and _preview_active():
+        return _admin_host_response("forbidden", status=403)
+    return redirect("/admin#test-applications")
+
+
 @app.route("/admin")
 def admin_workspace():
     """owner-only admin 宿主页（§8.1，PR3）。

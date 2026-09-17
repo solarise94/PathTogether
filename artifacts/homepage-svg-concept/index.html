@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>HistoPilot · 组织导航示意</title>
-<link rel="icon" href="data:,"><link rel="stylesheet" href="preview.css">
-<script defer src="tissue.js"></script><script defer src="motion.js"></script>
+<link rel="icon" href="data:,"><link rel="stylesheet" href="preview.css?v=typing-2">
+<script defer src="tissue.js"></script><script defer src="motion.js?v=typing-2"></script>
 </head>
 <body>
 <header><a href="#">HistoPilot</a><span>主页视觉预览 / 01</span></header>
@@ -13,9 +13,11 @@
 <section class="viewer" aria-label="组织导航流程示意">
 <div class="toolbar"><span><i></i>组织导航</span><span class="schematic">形态与流程示意 · 非真实切片</span></div>
 <div class="body"><div class="canvas">
-<svg id="tissue" viewBox="0 0 900 680" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="svg-title svg-desc"><title id="svg-title">腺体组织 SVG 示意图</title><desc id="svg-desc">多个大小与形状不同的腺体围绕腔隙排列。细胞与细胞核有适度随机变化，腺体之间分布纤维状间质。</desc></svg>
+<svg id="tissue" viewBox="0 0 900 680" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="svg-title svg-desc"><title id="svg-title">腺体组织 SVG 示意图</title><desc id="svg-desc">多个大小与形状不同的腺体围绕腔隙排列。细胞与细胞核有适度随机变化，腺体之间分布纤维状间质。</desc></svg>
 <div class="corner"><span id="location">全景</span><span class="dot">·</span><span>示意视野</span></div>
 <div class="note" id="note" hidden><span id="note-id">01</span><div><strong id="note-title"></strong><p id="note-body"></p></div></div>
+<div class="review-pin" id="review-a" hidden><strong>01 · 区域 A</strong><span>细胞环绕腔隙排列</span></div>
+<div class="review-pin" id="review-b" hidden><strong>02 · 区域 B</strong><span>腺体与周围间质</span></div>
 </div><aside><div class="agent-label"><span class="agent-dot"></span>AGENT WALKTHROUGH</div><h2 id="phase">先看看整体组织</h2><p id="status" role="status">辨认腺体分布与腺体之间的间质，选择第一处观察区域。</p>
 <ol id="steps"><li>全景</li><li>局部 A</li><li>细节 A</li><li>标注 A</li><li>切换局部 B</li><li>细节 B</li><li>标注 B</li></ol>
 <div class="legend"><span><i class="nucleus"></i>细胞核</span><span><i class="lumen"></i>腔隙</span><span><i class="mark"></i>观察标注</span></div>

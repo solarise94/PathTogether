@@ -5641,6 +5641,7 @@
     capsChecked: false,
     enumerationAvailable: false,
     importAvailable: false,
+    workerEnabled: true,
     reasonCode: "",
     enumId: null,
     enumState: null,
@@ -5694,6 +5695,11 @@
     els.baiduCapStatus.textContent = baiduState.importAvailable
       ? t("bd.cap.ready")
       : t("bd.cap.enum.only");
+    // 可枚举但部署未拉起 worker：提交后会一直排队。只提示、不藏表单
+    // （worker 可能在另一进程/容器；是否开启属部署配置问题）
+    if (!baiduState.workerEnabled) {
+      els.baiduCapStatus.textContent += " · " + t("bd.cap.worker.off");
+    }
     els.baiduCapStatus.hidden = false;
     setBaiduListEnabled(true);
     if (els.baiduInputBlock) els.baiduInputBlock.hidden = false;
@@ -5715,6 +5721,7 @@
       }
       baiduState.enumerationAvailable = !!res.body.enumeration_available;
       baiduState.importAvailable = !!res.body.import_available;
+      baiduState.workerEnabled = !!res.body.worker_enabled;
       baiduState.reasonCode = res.body.reason_code || "";
       renderBaiduCapabilities();
     }).catch(function () {
@@ -5779,7 +5786,10 @@
         var b = res.body;
         baiduState.enumState = b.state;
         if (b.state === "queued" || b.state === "enumerating") {
-          setBaiduEnumStatus(t("bd.enum.progress", { n: b.scanned_count || 0 }));
+          // 排队 ≠ 已扫出 0 项：queued 用独立文案，enumerating 才报进度
+          setBaiduEnumStatus(t(
+            b.state === "queued" ? "bd.enum.queued" : "bd.enum.progress",
+            { n: b.scanned_count || 0 }));
           baiduState.enumTimer = setTimeout(tick, 2000);
           return;
         }

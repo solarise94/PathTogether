@@ -7,6 +7,7 @@
   <title>HistoPilot · 激活账号</title>
   <!-- D1（2026-09-10）：空 data URI favicon，避免浏览器自动 GET /favicon.ico 撞鉴权闸 -->
   <link rel="icon" href="data:," />
+  <script src="/static/i18n.js?v=20260916a"></script>
   <style>
     :root {
       --accent: #007AFF;
@@ -15,6 +16,7 @@
       --text: #1d1d1f;
       --text-2: #86868b;
       --danger: #FF3B30;
+      --ok: #34C759;
       --separator: rgba(0, 0, 0, 0.08);
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -111,51 +113,310 @@
     .btn.secondary { background: #fff; color: var(--accent); border: 1px solid var(--separator); }
     .btn + .btn { margin-top: 10px; }
     .footer { margin-top: 20px; font-size: 11px; color: var(--text-2); line-height: 1.5; }
+    /* 双区块：申请测试（默认）/ 邀请码激活 */
+    .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+    .tab {
+      flex: 1;
+      height: 36px;
+      border-radius: 9px;
+      border: 1px solid var(--separator);
+      background: #fff;
+      color: var(--text-2);
+      font-size: 13px;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+    }
+    .tab.active {
+      color: var(--accent);
+      border-color: var(--accent);
+      background: rgba(0, 122, 255, 0.06);
+    }
+    .panel-desc { margin-bottom: 14px; }
+    .state-line { font-size: 13px; line-height: 1.7; text-align: left; margin-bottom: 14px; }
+    .state-line.ok { color: var(--ok); font-weight: 600; }
+    .state-line.bad { color: var(--danger); font-weight: 600; }
+    /* 测试申请表单：研究方向单选组 + 数据分享自愿勾选 */
+    fieldset { border: none; margin: 0 0 14px; padding: 0; text-align: left; }
+    legend { font-size: 12px; color: var(--text-2); font-weight: 500; margin-bottom: 8px; padding: 0; }
+    .radio-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--text);
+      font-weight: 400;
+      border: 1px solid var(--separator);
+      border-radius: 9px;
+      padding: 9px 12px;
+      margin-bottom: 8px;
+      cursor: pointer;
+    }
+    .radio-row:hover { border-color: var(--accent); }
+    .radio-row input[type="radio"] {
+      accent-color: var(--accent);
+      width: 15px;
+      height: 15px;
+      flex: none;
+      margin: 0;
+    }
+    .check-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--text);
+      font-weight: 400;
+      line-height: 1.55;
+      margin-bottom: 0;
+      cursor: pointer;
+    }
+    .check-row input[type="checkbox"] {
+      accent-color: var(--accent);
+      width: 15px;
+      height: 15px;
+      flex: none;
+      margin: 2px 0 0;
+    }
   </style>
 </head>
 <body>
   <main class="card">
-    <span class="badge">激活账号</span>
-    <h1 class="title">输入邀请码激活</h1>
-    <p class="desc">你的邮箱已完成验证。请输入管理员发放的<strong>邀请码</strong>激活账号——激活成功后即可使用个人工作区与 AI 额度。邀请码仅可使用一次。</p>
+    <span class="badge" data-i18n="activate.badge">激活账号</span>
+    <h1 class="title" data-i18n="activate.title">选择激活方式</h1>
+    <p class="desc" data-i18n="activate.desc">你的邮箱已完成验证。两种方式可用：申请测试——提交后由管理员审核，通过即可使用；或使用管理员发放的邀请码直接激活。</p>
     <div class="email-chip">{{ email_masked or "已验证邮箱" }}</div>
     <div id="activate-error" class="error-box" role="alert" style="display:none;"></div>
-    <form id="activate-form" autocomplete="off">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-      <div class="field">
-        <label for="invite_code">邀请码</label>
-        <input id="invite_code" name="invite_code" type="text" required
-               spellcheck="false" autofocus placeholder="粘贴管理员发送的邀请码" />
-        <p class="hint">身份由当前登录会话推导，无需填写邮箱。</p>
+
+    <div class="tabs" role="tablist" aria-label="激活方式">
+      <button type="button" class="tab active" id="tab-apply" role="tab"
+              aria-selected="true" aria-controls="panel-apply"
+              data-i18n="activate.tab.apply">申请测试</button>
+      <button type="button" class="tab" id="tab-invite" role="tab"
+              aria-selected="false" aria-controls="panel-invite"
+              data-i18n="activate.tab.invite">邀请码激活</button>
+    </div>
+
+    <!-- 区块 1：申请测试（默认展示；覆盖 verify 阶段漏建申请的兜底场景） -->
+    <section id="panel-apply" role="tabpanel" aria-labelledby="tab-apply">
+      <p id="apply-checking" class="hint" data-i18n="activate.state.checking">正在获取申请状态…</p>
+      <p id="apply-none-desc" class="desc panel-desc" hidden
+         data-i18n="activate.state.none.desc">请选择研究方向并提交测试申请，管理员审核通过后即可开始使用。</p>
+      <div id="apply-pending" hidden>
+        <p class="state-line" data-i18n="activate.state.pending.desc">申请已提交，请等待管理员审核。</p>
       </div>
-      <button class="btn primary" type="submit" id="activate-submit">激活账号</button>
-    </form>
+      <div id="apply-rejected" hidden>
+        <p class="state-line bad" data-i18n="activate.state.rejected.desc">你之前的测试申请未通过。如需了解详情，请联系管理员；也可以调整选择后重新申请。</p>
+        <button type="button" class="btn secondary" id="apply-retry"
+                data-i18n="activate.reapply">重新申请</button>
+      </div>
+      <div id="apply-approved" hidden>
+        <p class="state-line ok" data-i18n="activate.state.approved.desc">申请已通过，账号已激活。请用你的邮箱密码重新登录。</p>
+        <a class="btn primary" href="/login" data-i18n="activate.state.approved.login">前往登录</a>
+      </div>
+      <form id="apply-form" autocomplete="off" hidden>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+        <fieldset>
+          <legend data-i18n="verify.apply.direction.legend">研究方向</legend>
+          <label class="radio-row" for="ad-model_plant">
+            <input id="ad-model_plant" name="research_direction" type="radio"
+                   value="model_plant" required />
+            <span data-i18n="verify.apply.direction.model_plant">模式植物</span>
+          </label>
+          <label class="radio-row" for="ad-model_animal">
+            <input id="ad-model_animal" name="research_direction" type="radio"
+                   value="model_animal" required />
+            <span data-i18n="verify.apply.direction.model_animal">模式动物</span>
+          </label>
+          <label class="radio-row" for="ad-clinical_pathology">
+            <input id="ad-clinical_pathology" name="research_direction" type="radio"
+                   value="clinical_pathology" required />
+            <span data-i18n="verify.apply.direction.clinical_pathology">临床病理</span>
+          </label>
+          <label class="radio-row" for="ad-other">
+            <input id="ad-other" name="research_direction" type="radio"
+                   value="other" required />
+            <span data-i18n="verify.apply.direction.other">其他</span>
+          </label>
+        </fieldset>
+        <div class="field">
+          <label class="check-row" for="share_research_data">
+            <input id="share_research_data" name="share_research_data" type="checkbox"
+                   value="1" />
+            <span data-i18n="verify.apply.share.label">我愿意向研究团队分享我的切片、分析结果及使用行为数据，用于软件改进和科学研究。</span>
+          </label>
+          <p class="hint" data-i18n="verify.apply.share.hint">此项为自愿选择，不影响测试申请审批，之后可在账号设置中更改。</p>
+        </div>
+        <button class="btn primary" type="submit" id="apply-submit"
+                data-i18n="verify.apply.submit">申请测试</button>
+      </form>
+    </section>
+
+    <!-- 区块 2：邀请码激活（次要位置，标签切换；保留原激活逻辑） -->
+    <section id="panel-invite" role="tabpanel" aria-labelledby="tab-invite" hidden>
+      <p class="desc panel-desc" data-i18n="activate.invite.hint">已有邀请码？直接激活。</p>
+      <form id="activate-form" autocomplete="off">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+        <div class="field">
+          <label for="invite_code" data-i18n="activate.invite.code">邀请码</label>
+          <input id="invite_code" name="invite_code" type="text" required
+                 spellcheck="false" placeholder="粘贴管理员发送的邀请码"
+                 data-i18n-ph="activate.invite.code.ph" />
+          <p class="hint" data-i18n="activate.invite.identity.hint">身份由当前登录会话推导，无需填写邮箱。</p>
+        </div>
+        <button class="btn primary" type="submit" id="activate-submit"
+                data-i18n="activate.invite.submit">激活账号</button>
+      </form>
+    </section>
+
     <form method="POST" action="/logout" id="logout-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-      <button class="btn secondary" type="submit">退出当前会话</button>
+      <button class="btn secondary" type="submit" id="logout-submit"
+              data-i18n="activate.logout">退出当前会话</button>
     </form>
-    <p class="footer">仅用于研究、教学和软件演示，不用于临床诊断。</p>
+    <p class="footer" data-i18n="activate.footer">仅用于研究、教学和软件演示，不用于临床诊断。</p>
   </main>
 
   <script>
     (function () {
       "use strict";
-      var form = document.getElementById("activate-form");
-      var btn = document.getElementById("activate-submit");
       var errBox = document.getElementById("activate-error");
-      function fail(msg) {
+      function t(key, fallback) {
+        try {
+          var s = window.HP_I18N && HP_I18N.t(key);
+          return (s && s !== key) ? s : fallback;
+        } catch (e) { return fallback; }
+      }
+      function showErr(msg) {
         errBox.textContent = msg;
         errBox.style.display = "";
+      }
+      function clearErr() { errBox.style.display = "none"; }
+
+      // ---- 标签页切换：申请测试（默认）/ 邀请码激活 ----
+      var tabApply = document.getElementById("tab-apply");
+      var tabInvite = document.getElementById("tab-invite");
+      var panelApply = document.getElementById("panel-apply");
+      var panelInvite = document.getElementById("panel-invite");
+      function selectTab(apply) {
+        tabApply.classList.toggle("active", apply);
+        tabInvite.classList.toggle("active", !apply);
+        tabApply.setAttribute("aria-selected", apply ? "true" : "false");
+        tabInvite.setAttribute("aria-selected", apply ? "false" : "true");
+        panelApply.hidden = !apply;
+        panelInvite.hidden = apply;
+      }
+      tabApply.addEventListener("click", function () { selectTab(true); });
+      tabInvite.addEventListener("click", function () { selectTab(false); });
+
+      // ---- 区块 1：测试申请状态机（none/pending/rejected/approved） ----
+      var applyForm = document.getElementById("apply-form");
+      var applyBtn = document.getElementById("apply-submit");
+      var applyChecking = document.getElementById("apply-checking");
+      var applyNoneDesc = document.getElementById("apply-none-desc");
+      var applyPending = document.getElementById("apply-pending");
+      var applyRejected = document.getElementById("apply-rejected");
+      var applyApproved = document.getElementById("apply-approved");
+      function showApplyBlock(block) {
+        applyChecking.hidden = true;
+        applyNoneDesc.hidden = true;
+        applyPending.hidden = true;
+        applyRejected.hidden = true;
+        applyApproved.hidden = true;
+        applyForm.hidden = true;
+        if (block === "form") {
+          applyNoneDesc.hidden = false;
+          applyForm.hidden = false;
+        } else if (block === "pending") {
+          applyPending.hidden = false;
+        } else if (block === "rejected") {
+          applyRejected.hidden = false;
+        } else if (block === "approved") {
+          applyApproved.hidden = false;
+        }
+      }
+      document.getElementById("apply-retry").addEventListener("click", function () {
+        clearErr();
+        showApplyBlock("form");
+      });
+      function resetApplyBtn() {
+        applyBtn.disabled = false;
+        applyBtn.textContent = t("verify.apply.submit", "申请测试");
+      }
+      function failApply(msg) {
+        showErr(msg);
+        resetApplyBtn();
+      }
+      applyForm.addEventListener("submit", function (ev) {
+        ev.preventDefault();
+        clearErr();
+        // 前端先校验拦截：研究方向必选（后端 submit_tx 亦权威校验）
+        var direction = applyForm.querySelector('input[name="research_direction"]:checked');
+        if (!direction) {
+          failApply(t("verify.apply.direction.required", "请选择研究方向")); return;
+        }
+        applyBtn.disabled = true;
+        applyBtn.textContent = t("verify.apply.submitting", "提交中…");
+        fetch("/api/account/test-application", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": applyForm.csrf_token.value
+          },
+          body: JSON.stringify({
+            research_direction: direction.value,
+            share_research_data: applyForm.share_research_data.checked
+          })
+        }).then(function (resp) {
+          return resp.json().then(function (data) {
+            if (resp.ok && data.ok) {
+              showApplyBlock("pending");
+              return;
+            }
+            resetApplyBtn();
+            showErr((data && data.error) ||
+                    t("verify.apply.err.generic", "提交失败，请稍后重试"));
+          });
+        }).catch(function () {
+          failApply(t("verify.apply.err.network", "网络异常，请稍后重试"));
+        });
+      });
+      // 初始状态：GET /api/account/test-application（enrollment 会话身份）
+      (function loadState() {
+        fetch("/api/account/test-application", { credentials: "same-origin" })
+          .then(function (resp) {
+            if (!resp.ok) { throw new Error("http " + resp.status); }
+            return resp.json();
+          })
+          .then(function (data) {
+            var state = data && data.state;
+            if (state === "pending") { showApplyBlock("pending"); }
+            else if (state === "rejected") { showApplyBlock("rejected"); }
+            else if (state === "approved") { showApplyBlock("approved"); }
+            else { showApplyBlock("form"); }  // none / 未知：兜底显示申请表单
+          })
+          .catch(function () {
+            applyChecking.hidden = true;
+            showErr(t("activate.state.load.fail", "暂时无法获取申请状态，请刷新重试"));
+          });
+      })();
+
+      // ---- 区块 2：邀请码激活（保留原逻辑） ----
+      var form = document.getElementById("activate-form");
+      var btn = document.getElementById("activate-submit");
+      function failInvite(msg) {
+        showErr(msg);
         btn.disabled = false;
-        btn.textContent = "激活账号";
+        btn.textContent = t("activate.invite.submit", "激活账号");
       }
       form.addEventListener("submit", function (ev) {
         ev.preventDefault();
-        errBox.style.display = "none";
+        clearErr();
         var code = form.invite_code.value.trim();
-        if (!code) { fail("请填写邀请码"); return; }
+        if (!code) { failInvite(t("activate.invite.need_code", "请填写邀请码")); return; }
         btn.disabled = true;
-        btn.textContent = "激活中…";
+        btn.textContent = t("activate.invite.activating", "激活中…");
         fetch("/api/account/activate", {
           method: "POST",
           credentials: "same-origin",
@@ -174,12 +435,16 @@
             // 并引导重新登录；禁止把裸机器码渲染进红条
             if (resp.status === 401 ||
                 (data && data.code === "auth_required")) {
-              fail("登录状态已失效，请重新登录后再试（重新登录后即可重试激活）");
+              failInvite(t("activate.invite.err.auth",
+                           "登录状态已失效，请重新登录后再试（重新登录后即可重试激活）"));
               return;
             }
-            fail((data && data.error) || "激活失败，请稍后重试");
+            failInvite((data && data.error) ||
+                       t("activate.invite.err.generic", "激活失败，请稍后重试"));
           });
-        }).catch(function () { fail("网络异常，请稍后重试"); });
+        }).catch(function () {
+          failInvite(t("activate.err.network", "网络异常，请稍后重试"));
+        });
       });
     })();
   </script>

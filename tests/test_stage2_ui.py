@@ -283,7 +283,8 @@ def test_index_user_render_has_no_own_credentials_form(monkeypatch):
     u = _make_role_user("user")
     c = _client()
     _login_session(c, "user", u["user_id"])
-    r = c.get("/")
+    # SER-8 分流：/ 为介绍主页，工作台在 /app（AI 配置表单所在页）
+    r = c.get("/app")
     assert r.status_code == 200
     body = r.get_data(as_text=True)
     # 两卡卡组与自有凭据表单不再渲染
@@ -308,7 +309,8 @@ def test_index_owner_render_keeps_full_platform_form(monkeypatch):
     o = _make_role_user("owner")
     c = _client()
     _login_session(c, "owner", o["user_id"])
-    r = c.get("/")
+    # SER-8 分流：/ 为介绍主页，工作台在 /app（AI 配置表单所在页）
+    r = c.get("/app")
     assert r.status_code == 200
     body = r.get_data(as_text=True)
     assert 'id="ai-own-fields" class="ai-own-fields">' in body  # 无内联隐藏

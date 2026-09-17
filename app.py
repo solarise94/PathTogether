@@ -121,6 +121,12 @@ import spend_store
 import crop_guard
 import upload_guard
 import upload_task_store
+# SER-8 测试申请（wip/ser8-dev）：已验证待激活用户申请测试资格 + owner 审核
+# 原子激活（含默认额度 provisioning）。test_application_store 提供
+# submit/get/list_applications/review 原语（PostgreSQL 唯一后端，0054；
+# 通知邮件复用 registration_mail_jobs 的 test_application/test_decision
+# purpose）。verify 路径的申请提交是 best-effort——失败不阻断建号。
+import test_application_store
 
 # Batch D2（§Batch D2 1/2，docs review-2026-09-02-upload-user-limits-admin-
 # ui-cleanup.md §4.4）：匿名站点访问统计——独立 store（site_visit_events；
@@ -1090,6 +1096,10 @@ _ENROLLMENT_ALLOWED_PATHS = frozenset({
     "/activate",
     "/api/account/enrollment",
     "/api/account/activate",
+    # SER-8 测试申请：激活页（enrollment scope）内可直接提交/查询测试申请
+    # （verify 建号时申请提交失败的前端兜底路径）。匹配按 path 不按
+    # method——GET 查询与 POST 提交一条白名单同时覆盖。
+    "/api/account/test-application",
     "/api/registration/resend",
     "/logout",
 })
@@ -1413,9 +1423,8 @@ def _csrf_protect():
     if path == "/login":
         # 表单页给可重试的 HTML 错误（带新 token），不是裸 JSON
         next_url = _safe_next_path(request.form.get("next") or request.args.get("next"))
-        return render_template(
-            "login.html", error=None, error_code="csrf", next_url=next_url,
-            csrf_token=ensure_csrf_token(), retry_after=0), 400
+        return _login_page(error="登录状态已过期，请重新提交", error_code="csrf",
+                           next_url=next_url, status=400)
     return jsonify(error="csrf_required"), 400
 
 
@@ -2665,7 +2674,11 @@ def _entry_avatar_letter(name: str) -> str:
 def _entry_signed_in_context():
     """介绍页已登录态：展示名 + 头像字母。查找失败仍视为已登录，回退 session 身份。"""
     if not (AUTH_ENABLED and session.get("auth_user")):
-        return {"signed_in": False, "display_name": "", "avatar_letter": "", "csrf_token": None}
+        return {"signed_in": False, "display_name": "", "avatar_letter": "",
+                "csrf_token": ensure_csrf_token(), "login_open": False,
+                "login_error": None, "login_error_code": None,
+                "login_next_url": "/", "login_retry_after": 0,
+                "login_password_changed": False}
     uid = session.get("user_id")
     user = None
     if uid:
@@ -2683,11 +2696,15 @@ def _entry_signed_in_context():
         "display_name": name,
         "avatar_letter": _entry_avatar_letter(name),
         "csrf_token": ensure_csrf_token(),
+        "login_open": False, "login_error": None, "login_error_code": None,
+        "login_next_url": "/", "login_retry_after": 0,
+        "login_password_changed": False,
     }
 
 
-def _landing_response():
+def _landing_response(**overrides):
     ctx = _entry_signed_in_context()
+    ctx.update(overrides)
     resp = make_response(render_template("entry.html", **ctx))
     return _apply_landing_security_headers(resp)
 
@@ -3377,11 +3394,14 @@ def _login_page(error=None, error_code=None, next_url="/", retry_after=0,
     password_changed=True 时渲染「密码已修改，请使用新密码重新登录」提示
     （本人改密成功后前端跳 /login?password_changed=1，docs §7.1-7）。
     """
-    html = render_template(
-        "login.html", error=error, error_code=error_code, next_url=next_url,
-        csrf_token=ensure_csrf_token(), retry_after=int(retry_after or 0),
-        password_changed=bool(password_changed))
-    resp = Response(html, status=status)
+    ctx = _entry_signed_in_context()
+    ctx.update(login_open=True, login_error=error,
+               login_error_code=error_code,
+               login_next_url=_safe_next_path(next_url),
+               login_retry_after=int(retry_after or 0),
+               login_password_changed=bool(password_changed))
+    resp = make_response(render_template("entry.html", **ctx), status)
+    resp = _apply_landing_security_headers(resp)
     if headers:
         for k, v in headers.items():
             resp.headers[k] = v
@@ -4197,7 +4217,10 @@ def api_registration_verify():
     """消费验证 token + 设置密码，原子创建 pending_activation 用户（流程 2）。
 
     - CSRF 走全局 before_request 闸（/api/* 只认 X-CSRF-Token 头）；
-    - body: {token, password, password_confirm?}；密码策略 15..200；
+    - body: {token, password, password_confirm?, research_direction?,
+      share_research_data?}；密码策略 15..200；申请字段可选（SER-8：缺
+      research_direction 跳过申请提交；提供了但非法在建号前 400，不废
+      token）；建号成功后 best-effort 提交申请，响应带 application_submitted；
     - registration_store.verify_email_create_user 单事务：token 一次性消费
       + 建号（J：login_id=规范化邮箱；与存量 login_id 冲突进待补绑）；
     - 错误统一 code：invalid_request（形状）/ invalid_or_expired /
@@ -4223,6 +4246,18 @@ def api_registration_verify():
                   % (registration_store.MIN_PASSWORD_LENGTH,
                      registration_store.MAX_PASSWORD_LENGTH),
             code="invalid_request"), 400
+    # SER-8 测试申请（可选字段）：形状**先于** token 消费校验——非法请求
+    # 直接 400，绝不废掉一次性 token。缺 research_direction = 老前端兼容
+    # （跳过申请提交，application_submitted=false，前端兜底引导激活页内
+    # 再申请）；提供了但非法（方向不在四个值内 / share 非 bool）→ 400。
+    application_request = None
+    if body.get("research_direction") is not None:
+        try:
+            application_request = test_application_store.validate(
+                body.get("research_direction"),
+                body.get("share_research_data"))
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
     try:
         result = registration_store.verify_email_create_user(token, password)
     except registration_store.EmailVerifyError as exc:
@@ -4245,7 +4280,22 @@ def api_registration_verify():
            detail={"email_masked": registration_store.mask_login_id(
                result["email"]),
                "pending_bind": bool(result.get("pending_bind"))})
-    return jsonify(ok=True, next="/login", activation_required=True)
+    # SER-8：建号成功后 best-effort 提交测试申请（submit 自开事务，**非**
+    # 建号同事务——可接受）。失败（如管理员通知邮箱未配置）只记日志，不
+    # 回滚建号：响应 application_submitted=false，前端兜底引导用户在激活
+    # 页（enrollment 会话）内重新提交。重复申请由 submit_tx 幂等吸收。
+    application_submitted = False
+    if application_request is not None:
+        try:
+            application_submitted = bool(test_application_store.submit(
+                result["user"]["user_id"],
+                application_request["research_direction"],
+                application_request["share_research_data"]))
+        except Exception:
+            app.logger.exception("测试申请提交失败（不阻断建号）")
+            application_submitted = False
+    return jsonify(ok=True, next="/login", activation_required=True,
+                   application_submitted=application_submitted)
 
 
 def _require_enrollment():
@@ -4355,6 +4405,106 @@ def api_account_activate():
            target_id=result["user"]["user_id"],
            detail={"invite_id": result["invite_id"]})
     return jsonify(ok=True, next="/login")
+
+
+# =========================================================================== #
+# SER-8 测试申请（wip/ser8-dev）：已验证待激活用户申请测试资格 + 状态查询。
+#
+# 身份规则：enrollment 受限会话（激活页 scope）或正式 session 均可，身份只
+# 从 session 推导，绝不信请求体身份字段。注意 I-R4 硬闸下正式 session 的
+# pending 用户本就到不了这里（403 account_pending 且会话即清）——实际可达
+# 主体是 enrollment 会话（提交/查询）与已激活用户（查询；提交会被仓储层
+# 状态校验拒绝 → 409 invalid_state）。白名单：本路径已加入
+# _ENROLLMENT_ALLOWED_PATHS（匹配按 path 不按 method，GET/POST 一条覆盖）；
+# CSRF 照走全局闸（POST /api/* 只认 X-CSRF-Token 头）。
+# =========================================================================== #
+def _test_application_actor():
+    """测试申请身份解析：enrollment 会话优先，其次正式 session user_id。
+
+    返回 user_id 或 None（无任何可识别身份）；401 响应由调用方统一给出
+    （与激活面同口径的中文 auth_required 文案）。
+    """
+    enr = _enrollment_session_valid()
+    if enr is not None:
+        return enr.get("user_id")
+    return session.get("user_id") or None
+
+
+@app.route("/api/account/test-application", methods=["GET"])
+def api_account_test_application_get():
+    """查询本人测试申请状态。
+
+    返回 {state: "none"|"pending"|"approved"|"rejected", research_direction?,
+    share_research_data?, consent_version?}；无记录 → state="none"。
+    """
+    if not AUTH_ENABLED:
+        return jsonify(error="测试申请需要启用认证"), 400
+    user_id = _test_application_actor()
+    if not user_id:
+        return jsonify(error="登录状态已失效，请重新登录后再试",
+                       code="auth_required"), 401
+    try:
+        record = test_application_store.get(user_id)
+    except Exception:
+        app.logger.exception("测试申请状态读取失败")
+        return jsonify(error="暂无法读取申请状态，请稍后重试",
+                       code="storage_unavailable"), 503
+    if record is None:
+        return jsonify(state="none")
+    return jsonify(state=record.get("status") or "none",
+                   research_direction=record.get("research_direction"),
+                   share_research_data=record.get("share_research_data"),
+                   consent_version=record.get("consent_version"))
+
+
+@app.route("/api/account/test-application", methods=["POST"])
+def api_account_test_application_submit():
+    """提交测试申请（幂等）。body: {research_direction, share_research_data}。
+
+    - 方向非法 / share 非 bool → 400 invalid_request（本地形状错误）；
+    - 管理员通知邮箱未配置 → 503 admin_email_unconfigured（fail-closed，
+      不静默吞申请）；
+    - 状态不符（已激活/禁用/邮箱未验证）→ 409 invalid_state（含中文原因）；
+    - 成功 {ok:true, state:"pending"}；重复提交 submit 返回 False →
+      {ok:true, state:"pending", duplicate:true}（幂等，不再重复通知）。
+    """
+    if not AUTH_ENABLED:
+        return jsonify(error="测试申请需要启用认证"), 400
+    user_id = _test_application_actor()
+    if not user_id:
+        return jsonify(error="登录状态已失效，请重新登录后再试",
+                       code="auth_required"), 401
+    if request.is_json:
+        body = request.get_json(silent=True) or {}
+    else:
+        body = request.form
+    try:
+        data = test_application_store.validate(
+            body.get("research_direction"),
+            body.get("share_research_data"))
+    except ValueError as exc:
+        return jsonify(error=str(exc), code="invalid_request"), 400
+    # 通知邮箱未配置：入口 fail-closed 503（与 submit_tx 内同源判定，双保险）
+    if test_application_store.admin_email() is None:
+        return jsonify(error="申请通道暂不可用，请稍后重试",
+                       code="admin_email_unconfigured"), 503
+    try:
+        submitted = test_application_store.submit(
+            user_id, data["research_direction"],
+            data["share_research_data"])
+    except ValueError as exc:
+        message = str(exc)
+        if "尚未配置" in message:
+            return jsonify(error="申请通道暂不可用，请稍后重试",
+                           code="admin_email_unconfigured"), 503
+        return jsonify(error=message, code="invalid_state"), 409
+    except Exception:
+        app.logger.exception("测试申请提交异常")
+        return jsonify(error="申请暂不可用，请稍后重试",
+                       code="storage_unavailable"), 503
+    if not submitted:
+        return jsonify(ok=True, state="pending", duplicate=True)
+    return jsonify(ok=True, state="pending")
 
 
 @app.route("/api/registration/resend", methods=["POST"])
@@ -8877,6 +9027,111 @@ def admin_v1_format_request_sample(request_id):
     return send_file(
         payload["path"], as_attachment=True,
         download_name=payload.get("download_name") or "sample")
+
+
+# --------------------------------------------------------------------------- #
+# SER-8 测试申请管理面（owner-only；wip/ser8-dev）
+#
+# 守卫与错误信封同 format-requests admin API（_require_owner_admin_v1 +
+# _admin_v1_error 的 {error:{code,message}} 信封——宿主桥 backendError 据此
+# 还原 err.code）。审核写路径（原子激活 + 默认额度 provisioning + 通知邮件
+# + 审计）全部在 test_application_store.review 单事务内；路由只做 owner 门
+# 控、参数形状与错误码映射，不重复写审计。
+# --------------------------------------------------------------------------- #
+def _test_app_rfc3339(value):
+    """timestamptz → RFC3339（UTC，Z 后缀；None 透传）——同 _hold_rfc3339。"""
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@app.route("/api/admin/v1/test-applications", methods=["GET"])
+def admin_v1_test_applications():
+    """测试申请列表（owner-only）。?direction=&status=。
+
+    list_applications 单查即全量（ORDER BY pending 优先 + created_at 降序，
+    上限 500 行），cursor 参数预留不启用（next_cursor 恒 None）；status 为
+    服务端内存过滤；方向只回机器值（中文映射在插件前端做）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    direction = (request.args.get("direction") or "").strip() or None
+    status = (request.args.get("status") or "").strip() or None
+    if direction is not None and \
+            direction not in test_application_store.DIRECTIONS:
+        return _admin_v1_error(400, "invalid_request", "研究方向无效")
+    if status is not None and \
+            status not in ("pending", "approved", "rejected"):
+        return _admin_v1_error(400, "invalid_request", "状态无效")
+    try:
+        rows = test_application_store.list_applications(direction)
+    except Exception:
+        app.logger.exception("测试申请列表读取失败")
+        return _admin_v1_error(503, "storage_unavailable",
+                               "存储暂不可用，请稍后重试")
+    if status is not None:
+        rows = [row for row in rows if row.get("status") == status]
+    # 字段白名单出线（store 行含 consent_updated_at 等内部列，不进 wire）
+    items = [{
+        "user_id": row.get("user_id"),
+        "email_normalized": row.get("email_normalized"),
+        "display_name": row.get("display_name"),
+        "research_direction": row.get("research_direction"),
+        "share_research_data": bool(row.get("share_research_data")),
+        "status": row.get("status"),
+        "created_at": _test_app_rfc3339(row.get("created_at")),
+        "reviewed_at": _test_app_rfc3339(row.get("reviewed_at")),
+        "reviewed_by": row.get("reviewed_by"),
+        "activation_state": row.get("activation_state"),
+    } for row in rows]
+    return jsonify(items=items, next_cursor=None)
+
+
+@app.route("/api/admin/v1/test-applications/<user_id>/review",
+           methods=["POST"])
+def admin_v1_test_application_review(user_id):
+    """测试申请审核（owner-only）。body: {decision, ai_access?}。
+
+    decision ∈ approved|rejected；ai_access 缺省 true（仅 approved 生效，
+    与页面「开通 AI 权限」默认勾一致）。错误映射：
+      403 permission_denied              —— 非真实 owner（仓储层复核兜底）；
+      409 default_allowance_unconfigured —— 新用户默认总额度未配置（提示
+                                              先去管理工作台设置）；
+      409 already_reviewed               —— 重复审批（review 返回 False，
+                                              不重复发额度/邮件）；
+      400 invalid_request                —— 参数形状 / 其余状态类 ValueError。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    body = request.get_json(silent=True) or {}
+    decision = body.get("decision")
+    ai_access = body.get("ai_access")
+    if ai_access is None:
+        ai_access = True  # 缺省开通；显式 false 才关闭
+    if decision not in ("approved", "rejected") or \
+            not isinstance(ai_access, bool):
+        return _admin_v1_error(400, "invalid_request", "审核参数无效")
+    try:
+        applied = test_application_store.review(
+            user_id, actor_identity().get("user_id"), decision,
+            ai_access=ai_access)
+    except PermissionError:
+        return _admin_v1_error(403, "permission_denied", "仅管理员可审核")
+    except ValueError as exc:
+        message = str(exc)
+        if message == "请先在管理工作台设置新用户默认总额度":
+            return _admin_v1_error(409, "default_allowance_unconfigured",
+                                   message)
+        return _admin_v1_error(400, "invalid_request", message)
+    except Exception:
+        app.logger.exception("测试申请审核异常")
+        return _admin_v1_error(503, "storage_unavailable",
+                               "存储暂不可用，请稍后重试")
+    if not applied:
+        return _admin_v1_error(409, "already_reviewed", "该申请已处理")
+    return jsonify(ok=True, user_id=user_id, status=decision)
 
 
 @app.route("/api/slides")

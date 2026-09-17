@@ -1327,8 +1327,13 @@ def test_official_template_keeps_write_ops_and_budget_diag():
             histopilot_ui_enabled=True,
             sample_plugin_enabled=False,
             sample_plugin_permissions=[],
+            # _app_shell.html 按 capabilities 条件渲染写操作入口
+            viewer_role="owner",
         )
-    assert 'id="upload-btn"' in html
+    # 5aa7a91 起上传入口改为导入抽屉（#import-slides-btn），#upload-btn 已删
+    # （app.js:6564 仅作旧模板兼容兜底）。这里断言当前真实的写操作入口。
+    assert 'id="import-slides-btn"' in html
+    assert 'id="new-project-btn"' in html
     assert 'id="ai-config-wrap"' in html
     # PR5：旧侧栏 AI 预算区已删（管理动作迁入 admin 插件）
     assert 'id="aibudget-reset-btn"' not in html

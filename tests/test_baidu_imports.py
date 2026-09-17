@@ -71,6 +71,71 @@ def test_b03_nested_dir_enumeration_zero_side_effects(monkeypatch):
         conn.close()
 
 
+def test_b03_recursive_list_uses_cli_path_contract(monkeypatch):
+    """递归 list 的 path 参数必须满足 CLI 合同（docs §7.1）。
+
+    FakeBaiduAdapter._norm_dir 会剥掉 /，无斜杠形态在 fake 下静默可用，
+    单测发现不了真实 CLI 的 --source-dir 合同问题。此处包装 fake 记录
+    每次 list_share_page 的 path：根为 ""，子目录必须以 / 开头
+    （/A1、/A1/panel_kfbf、/B1、/B1/deep——即 CLI 返回的 path 形态）。
+    """
+    fake = install_fake(monkeypatch, entries=STANDARD_ENTRIES)
+    seen = []
+    real = fake.list_share_page
+
+    def spy(share, code, path, cursor, limit):
+        seen.append(path)
+        return real(share, code, path, cursor, limit)
+
+    fake.list_share_page = spy
+    out = store.create_enumeration(
+        OWNER, "https://pan.baidu.com/s/1TestShareId99")
+    result = store.run_enumeration(out["id"], fake)
+    assert result["state"] == "ready"
+    assert seen[0] == ""  # 根目录：省略 --source-dir
+    assert all(p.startswith("/") for p in seen[1:]), seen
+    assert set(seen[1:]) == {"/A1", "/A1/panel_kfbf", "/B1", "/B1/deep"}
+    # 相对路径候选不受影响（无前导 / 的分享内相对路径）
+    cands = store.list_candidates(out["id"], OWNER, limit=100)
+    rels = {c["relative_path"] for c in cands["items"]}
+    assert "A1/sample.svs" in rels and "B1/deep/Slidedat.ini" in rels
+
+
+def test_b03_scanned_count_written_mid_enumeration(monkeypatch):
+    """枚举中途回写 scanned_count：UI 轮询 enumerating 时不再恒 0。
+
+    每成功处理一页回写一次（同时续租约）；在后续 list_share_page 调用
+    前读取视图，第一页处理完成后即应看到 scanned_count > 0 且 state
+    仍为 enumerating；终态仍 ready。
+    """
+    fake = install_fake(monkeypatch, entries=STANDARD_ENTRIES)
+    out = store.create_enumeration(
+        OWNER, "https://pan.baidu.com/s/1TestShareId99")
+    enum_id = out["id"]
+    snapshots = []
+    real = fake.list_share_page
+
+    def spy(share, code, path, cursor, limit):
+        # 适配器调用前读视图：第一页处理完成后（第二次调用起）能看到
+        # 已回写的 scanned_count
+        view = store.get_enumeration(enum_id, OWNER)
+        snapshots.append((view["state"], view["scanned_count"]))
+        return real(share, code, path, cursor, limit)
+
+    fake.list_share_page = spy
+    result = store.run_enumeration(enum_id, fake)
+    assert result["state"] == "ready"
+    # 根 + 4 个子目录 = 5 次调用；第一次调用前尚无进度
+    assert len(snapshots) == 5
+    assert snapshots[0] == ("enumerating", 0)
+    for state, scanned in snapshots[1:]:
+        assert state == "enumerating"
+        assert scanned > 0, snapshots
+    view = store.get_enumeration(enum_id, OWNER)
+    assert view["state"] == "ready" and view["complete"] is True
+    assert view["scanned_count"] == result["scanned"]
+
+
 def test_b03_duplicate_cursor_fails_explicitly(monkeypatch):
     # 分页注入重复游标：必须显式失败（cursor_loop），不能当空分享/ready
     fake = install_fake(monkeypatch, entries=STANDARD_ENTRIES, page_size=3)

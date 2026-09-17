@@ -18,7 +18,8 @@ argv 表（``<bin>`` = ``BAIDU_CONNECTOR_BIN``，默认 ``bdpan``；全部为
 分享内分页列表          ``[bin, "transfer", "list", <share_url>, "--json",
                         "--no-check-update", "--pwd", <code>?,
                         "--source-dir", <dir>?, "--page", <N>,
-                        "--page-size", <K>]``
+                        "--page-size", <K>]``（``<dir>`` 归一为
+                        ``/<分享内相对路径>``，根目录省略该 flag）
 按选中项转存            ``[bin, "transfer", "select", <share_url>, "--json",
                         "--no-check-update", "--fsid", <fs_id>...,
                         "--dir", <batch_id>, "--pwd", <code>?]``
@@ -85,8 +86,18 @@ ENV_CONNECTOR_BIN = "BAIDU_CONNECTOR_BIN"
 ENV_CONNECTOR_HOME = "BAIDU_CONNECTOR_HOME"
 #: 分享秘密加密密钥（BAIDU_SHARE_SECRET_KEY；缺省则适配器不可用）
 ENV_SHARE_SECRET_KEY = "BAIDU_SHARE_SECRET_KEY"
+#: 导入 worker 开关（BAIDU_IMPORT_WORKER；与 docker_entry.sh 同口径：
+#: 1/true/yes/on（大小写不敏感）为真，缺省/其它为假——只作能力暴露，
+#: 不门控任何接口）
+ENV_WORKER_ENABLED = "BAIDU_IMPORT_WORKER"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _worker_enabled_from_env():
+    """worker 开关判定（与 docker_entry.sh 的 1|true|yes|on 完全对齐）。"""
+    return (os.environ.get(ENV_WORKER_ENABLED) or "").strip().lower() \
+        in _TRUTHY
 
 #: 子命令白名单（argv 校验用；出现其他子命令直接拒绝）
 ALLOWED_SUBCOMMANDS = frozenset(
@@ -142,6 +153,44 @@ def _redact(text, *secrets):
             out = out.replace(str(s), "***")
     out = re.sub(r"[\x00-\x1f\x7f]", " ", out)
     return out[:300]
+
+
+def normalize_source_dir(path):
+    """``--source-dir`` 合同归一（docs §7.1）。
+
+    bdpan ``transfer list`` 的 ``--source-dir`` 必须是 CLI 返回的
+    ``path`` 形态：``/<分享内相对路径>``（带前导 ``/``）。调用方可能
+   传无斜杠相对路径或尾随斜杠形态，此处统一：
+
+    - ``None`` / ``""`` / ``"/"`` → ``None``（根目录，省略 --source-dir）；
+    - 其它路径 → 以 ``/`` 开头、去尾随 ``/``、``\\`` 归一为 ``/``。
+    """
+    if path in (None, ""):
+        return None
+    p = str(path).replace("\\", "/").rstrip("/")
+    if not p:
+        return None  # 纯斜杠（"/"、"//"）视作根目录
+    return p if p.startswith("/") else "/" + p
+
+
+#: 非零退出时脱敏 stderr 的有限错码映射（保守：宁可保持
+#: connector_failed 也不把未知失败误伤成业务错码）。顺序即优先级：
+#: 未登录提示（docs §7.1：未登录时输出「请先执行 bdpan login」）
+#: 先于提取码/密码，再先于分享失效类。
+_EXIT_TEXT_CODES = (
+    (("请先执行", "login"), "connector_unusable"),
+    (("提取码", "密码", "password"), "share_password_error"),
+    (("分享不存在", "已失效", "已取消"), "share_invalid"),
+)
+
+
+def _classify_cli_failure(redacted_tail):
+    """脱敏后的 stderr 尾部 → 稳定错码（未知映射回 connector_failed）。"""
+    low = redacted_tail.lower()
+    for needles, code in _EXIT_TEXT_CODES:
+        if any(n.lower() in low for n in needles):
+            return code
+    return "connector_failed"
 
 
 # --------------------------------------------------------------------------- #
@@ -276,18 +325,35 @@ class ProductionBaiduAdapter:
         if proc.returncode != 0:
             tail = _redact((proc.stderr or "")[-500:], *secrets)
             raise AdapterError(
-                "connector_failed", "连接器退出码 %d：%s"
-                % (proc.returncode, tail))
+                _classify_cli_failure(tail),
+                "连接器退出码 %d：%s" % (proc.returncode, tail))
         return proc.stdout or ""
 
     def _run_json(self, argv, timeout, secrets=()):
         stdout = self._run(argv, timeout, secrets)
         try:
-            return json.loads(stdout)
+            payload = json.loads(stdout)
         except ValueError:
             raise AdapterError(
                 "connector_output_invalid", "CLI stdout 不是合法 JSON",
                 detail_internal=_redact(stdout[:500], *secrets)) from None
+        # bdpan 3.8.7 的业务失败可能退出码为 0，错误放在 JSON 中。
+        if isinstance(payload, dict) and "code" in payload:
+            code = payload["code"]
+            if type(code) is not int:
+                raise AdapterError("connector_output_invalid", "CLI code 形态非法")
+            if code != 0:
+                error = payload.get("error")
+                # 新批次目录尚不存在是正常状态；仅 ls 的已核验 -9 错误
+                # 可当空列表，认证/网络等失败不得误判为副本不存在。
+                if (argv[1] == "ls" and code == 1
+                        and payload.get("data") is None
+                        and error == "找不到指定的文件或目录（错误码 -9），请检查路径是否正确。"):
+                    return []
+                safe = _redact(error, *secrets)
+                raise AdapterError(_classify_cli_failure(safe),
+                                   "连接器业务错误：" + safe)
+        return payload
 
     # -- 校验辅助 ---------------------------------------------------------- #
 
@@ -322,6 +388,10 @@ class ProductionBaiduAdapter:
         reason_code 优先级：``secret_unconfigured`` > ``connector_missing``
         > ``connector_unusable`` > 开关原因（枚举/导入各自独立判定；
         双 unavailable 时给枚举开关原因为主因）。
+
+        ``worker_enabled``：部署是否拉起导入 worker（与 docker_entry.sh
+        的 BAIDU_IMPORT_WORKER 同口径）；仅作 UI 提示，不门控任何接口
+        ——worker 可能在另一进程/容器运行。
         """
         enumeration_flag = (os.environ.get(ENV_ENUMERATION_ENABLED) or
                             "").strip().lower() in _TRUTHY
@@ -332,6 +402,7 @@ class ProductionBaiduAdapter:
         out = {
             "enumeration_available": False,
             "import_available": False,
+            "worker_enabled": _worker_enabled_from_env(),
             "reason_code": None,
             "limits": dict(CAPABILITY_LIMITS),
             "connector_version": None,
@@ -389,12 +460,15 @@ class ProductionBaiduAdapter:
             raise AdapterError("invalid_cursor", "limit 形态非法") from None
         if path not in (None, "") and not isinstance(path, str):
             raise AdapterError("invalid_cursor", "分享目录形态非法")
+        # CLI 合同（docs §7.1）：--source-dir 必须 /<分享内相对路径>；
+        # 调用方传无斜杠/尾随斜杠形态在此归一，根目录（None/""/"/"）省略
+        source_dir = normalize_source_dir(path)
         argv = [self._bin, "transfer", "list", share, "--json",
                 "--no-check-update"]
         if code:
             argv += ["--pwd", code]
-        if path:
-            argv += ["--source-dir", path]
+        if source_dir:
+            argv += ["--source-dir", source_dir]
         argv += ["--page", str(page), "--page-size", str(limit)]
         self._counters["list"] += 1
         payload = self._run_json(argv, LIST_TIMEOUT_SECONDS, (share, code))
@@ -592,6 +666,7 @@ class FakeBaiduAdapter:
             return {
                 "enumeration_available": False,
                 "import_available": False,
+                "worker_enabled": _worker_enabled_from_env(),
                 "reason_code": "fake_adapter_forbidden_in_production",
                 "limits": dict(CAPABILITY_LIMITS),
                 "connector_version": None,
@@ -599,6 +674,8 @@ class FakeBaiduAdapter:
         return {
             "enumeration_available": True,
             "import_available": True,
+            # 非 production 视为 worker 可用（测试环境不依赖 env 设置）
+            "worker_enabled": True,
             "reason_code": None,
             "limits": dict(CAPABILITY_LIMITS),
             "connector_version": "fake",

@@ -1,0 +1,33 @@
+{% if not signed_in %}
+<dialog class="login-dialog" id="login-dialog" aria-labelledby="login-dialog-title"{% if login_open %} open{% endif %}>
+  <div class="login-dialog-card" role="document">
+    <button class="login-dialog-close" type="button" data-login-close aria-label="关闭">×</button>
+    <p class="login-dialog-kicker">HistoPilot</p>
+    <h2 id="login-dialog-title" data-i18n="login.title">登录 HistoPilot</h2>
+    <p class="login-dialog-subtitle" data-i18n="login.subtitle">登录后继续查看、测试 AI 和协作</p>
+    {% if login_password_changed %}<div class="login-dialog-message" role="status" data-i18n="login.password_changed">密码已修改，请使用新密码重新登录</div>{% endif %}
+    {% if login_error %}
+    <div class="login-dialog-error" role="alert">
+      {% if login_error_code == 'locked' %}<span data-i18n="login.error.locked">尝试过于频繁，请稍后再试</span>
+      {% elif login_error_code == 'csrf' %}<span data-i18n="login.error.csrf">登录状态已过期，请重新提交</span>
+      {% else %}{{ login_error }}{% endif %}
+      {% if login_retry_after %}<span id="login-dialog-countdown" data-retry-seconds="{{ login_retry_after }}"></span>{% endif %}
+    </div>
+    {% endif %}
+    <form method="POST" action="/login" id="login-dialog-form" autocomplete="on">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+      <input type="hidden" name="next" value="{{ login_next_url or '/' }}" />
+      <label for="login-dialog-username" data-i18n="login.username">登录账号</label>
+      <input id="login-dialog-username" name="username" type="text" required autocomplete="username" spellcheck="false" />
+      <label for="login-dialog-password" data-i18n="login.password">密码</label>
+      <input id="login-dialog-password" name="password" type="password" required autocomplete="current-password" />
+      <button class="login-dialog-submit" type="submit" data-i18n="login.submit">登录</button>
+    </form>
+    <div class="login-dialog-links">
+      <a href="/register" data-i18n="login.register">没有账号？查看注册方式</a>
+      <a href="/demo" data-i18n="login.demo">先体验 Demo</a>
+    </div>
+    <p class="login-dialog-forgot" data-i18n="login.forgot">忘记密码？请联系管理员重置。</p>
+  </div>
+</dialog>
+{% endif %}

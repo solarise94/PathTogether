@@ -877,3 +877,226 @@ button:focus-visible {
   .topbar-actions { gap: 6px; }
   .topbar-actions .btn-sm { padding: 0 12px; }
 }
+
+/* Approved SVG tissue walkthrough, scoped to the homepage component. */
+.tissue-demo .viewer{border:1px solid #ffffff1c;border-radius:15px;overflow:hidden;background:#1b191c;box-shadow:0 25px 70px #0003}
+.tissue-demo .toolbar{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:16px 20px;border-bottom:1px solid #ffffff13;font-size:13px}
+.tissue-demo .toolbar>span:first-child{display:flex;align-items:center;gap:8px}
+.tissue-demo .toolbar i{display:block;width:7px;height:7px;border-radius:50%;background:#ba829f}
+.tissue-demo .schematic{color:#aba0ae;font-size:11px}
+.tissue-demo .body{display:grid;grid-template-columns:minmax(0,1fr) 284px}
+.tissue-demo .canvas{position:relative;overflow:hidden;aspect-ratio:900/680;background:#edc5d4}
+.tissue-demo #tissue{display:block;width:100%;height:100%;overflow:hidden}
+.tissue-demo .corner{position:absolute;bottom:15px;left:15px;background:#251525d9;border:1px solid #ffffff33;padding:7px 10px;border-radius:6px;font-size:11px;color:#f7eef4;display:flex;gap:8px}
+.tissue-demo .dot{color:#af8fa9}
+.tissue-demo aside{padding:25px 23px;display:flex;flex-direction:column;border-left:1px solid #ffffff12}
+.tissue-demo .agent-label{font-size:10px;letter-spacing:1.4px;color:#ac9ead;display:flex;align-items:center;gap:7px}
+.tissue-demo .agent-dot{width:6px;height:6px;border-radius:50%;background:#93c9b0}
+.tissue-demo aside h2{font-size:19px;line-height:1.45;font-weight:600;margin:25px 0 12px}
+.tissue-demo #status{font-size:13px;line-height:1.85;color:#bdb3c0;min-height:76px;margin:0}
+.tissue-demo ol{list-style:none;padding:0;display:grid;gap:4px;margin:23px 0}
+.tissue-demo li{color:#958a99;font-size:12px;position:relative;padding:9px 12px 9px 28px;border-radius:5px}
+.tissue-demo li:before{content:"";width:6px;height:6px;position:absolute;left:10px;top:13px;border:1px solid #807184;border-radius:50%}
+.tissue-demo li.active{background:#ffffff08;color:#f5eef6}
+.tissue-demo li.active:before{background:#d9b0c8;border-color:#d9b0c8}
+.tissue-demo li.done:before{background:#7d6073;border-color:#7d6073}
+.tissue-demo .legend{margin-top:auto;display:flex;flex-wrap:wrap;gap:13px;font-size:10px;color:#b4a7b8}
+.tissue-demo .legend span{display:flex;align-items:center;gap:5px}
+.tissue-demo .legend i{width:9px;height:9px;display:block;border-radius:50%}
+.tissue-demo .nucleus{background:#8d497f}
+.tissue-demo .lumen{background:#f4e5e6}
+.tissue-demo .legend .mark{border:1px solid #007aff;border-radius:2px}
+.tissue-demo .aside-note{font-size:10px;line-height:1.8;color:#948898;border-top:1px solid #ffffff10;padding-top:15px;margin:18px 0 0}
+.tissue-demo .controls{padding:13px 18px;display:flex;align-items:center;gap:9px;border-top:1px solid #ffffff13}
+.tissue-demo .progress{height:2px;background:#ffffff15;flex:1;margin-right:12px;border-radius:5px;overflow:hidden}
+.tissue-demo .progress span{display:block;width:0;height:100%;background:#ca9bb8}
+.tissue-demo #count{font-size:10px;font-variant-numeric:tabular-nums;color:#a89bae;margin-right:5px}
+.tissue-demo button{border:1px solid #ffffff1a;background:#242026;color:#dcd2df;min-width:34px;height:34px;border-radius:6px;padding:0 10px;font:inherit;font-size:12px;cursor:pointer}
+.tissue-demo button:hover{border-color:#a9819a;background:#312935}
+.tissue-demo button:disabled{opacity:.3;cursor:default}
+.tissue-demo button:focus-visible{outline:2px solid #dba9c9;outline-offset:3px}
+.tissue-demo .note{position:absolute;left:20px;right:20px;bottom:57px;display:flex;gap:12px;padding:13px 15px;background:#171d2bed;border:1px solid #7caceb55;border-left:3px solid #007aff;border-radius:7px;max-width:350px;color:#edf3ff}
+.tissue-demo .note[hidden]{display:none}
+.tissue-demo .note>span{font-size:12px;color:#89b9ff;margin-top:2px}
+.tissue-demo .note strong{font-size:12px;font-weight:600}
+.tissue-demo .note p{font-size:11px;line-height:1.7;color:#b9c9e2;margin:5px 0 0}
+@media(max-width:760px){.tissue-demo .body{grid-template-columns:1fr}
+.tissue-demo .canvas{aspect-ratio:1}
+.tissue-demo aside{border-left:0;border-top:1px solid #ffffff12;padding:20px}
+.tissue-demo aside h2{margin:14px 0 8px;font-size:17px}
+.tissue-demo #status{min-height:0}
+.tissue-demo ol{display:flex;flex-wrap:wrap;margin:16px 0;gap:2px}
+.tissue-demo li{font-size:11px;padding:8px 8px 8px 23px}
+.tissue-demo li:before{left:9px;top:11px}
+.tissue-demo .legend{margin-top:4px}
+.tissue-demo .aside-note{margin-top:14px}
+.tissue-demo .toolbar{padding:13px;font-size:12px}
+.tissue-demo .schematic{font-size:10px}
+.tissue-demo .controls{padding:12px;gap:6px}
+.tissue-demo button{height:40px;min-width:37px}
+.tissue-demo .note{left:14px;right:14px;bottom:57px;max-width:310px}
+.tissue-demo .progress{margin-right:3px}
+.tissue-demo #count{font-size:9px}
+}
+.tissue-demo #note-body{min-height:3.4em}
+.tissue-demo #note-title.streaming::after,.tissue-demo #note-body.streaming::after{content:"▍";color:#8cbdff;margin-left:2px}
+.tissue-demo .review-pin{position:absolute;max-width:180px;width:43%;padding:9px 11px;border:1px solid #79acff80;border-left:3px solid #007aff;border-radius:6px;background:#152237ed;color:#edf3ff;pointer-events:none;box-shadow:0 3px 14px #0002}
+.tissue-demo .review-pin[hidden]{display:none}
+.tissue-demo .review-pin strong{display:block;font-size:11px;font-weight:600}
+.tissue-demo .review-pin span{display:block;margin-top:4px;font-size:10px;line-height:1.5;color:#c7d9f2}
+.tissue-demo #note-title{display:block;min-height:1.5em}
+
+.tissue-demo #tissue{max-width:100%}.tissue-demo .viewer{box-shadow:none}.tissue-demo .body{grid-template-columns:minmax(0,1fr) 270px}@media(max-width:760px){.tissue-demo .body{grid-template-columns:1fr}}
+
+/* =========================================================================
+   登录弹窗（<dialog id="login-dialog">，_login_dialog.html）
+   - showModal：top-layer 居中 + ::backdrop 半透明遮罩（entry-auth.js 升级模态）
+   - 无 JS 退化：服务端 open 属性直出时按 fixed 居中浮层呈现
+   - body.login-dialog-open 期间锁定背景滚动
+   ========================================================================= */
+.login-dialog {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  width: min(400px, calc(100vw - 32px));
+  height: fit-content;
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+  padding: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--bg-raise);
+  color: var(--text);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+}
+.login-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.62);
+}
+body.login-dialog-open { overflow: hidden; }
+
+.login-dialog-card {
+  position: relative;
+  padding: 36px 32px 28px;
+}
+.login-dialog-close {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+.login-dialog-close:hover { background: rgba(255, 255, 255, 0.08); color: var(--text); }
+.login-dialog-close:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+
+.login-dialog-kicker {
+  margin-bottom: 6px;
+  font-size: 12px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.login-dialog h2 {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.2px;
+}
+.login-dialog-subtitle {
+  margin: 6px 0 18px;
+  font-size: 14px;
+  color: var(--text-2);
+}
+
+.login-dialog-message,
+.login-dialog-error {
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  font-size: 13px;
+}
+.login-dialog-message {
+  background: rgba(52, 199, 89, 0.12);
+  border: 1px solid rgba(52, 199, 89, 0.35);
+  color: #7ddc9a;
+}
+.login-dialog-error {
+  background: rgba(255, 69, 58, 0.12);
+  border: 1px solid rgba(255, 69, 58, 0.35);
+  color: #ff8a80;
+}
+.login-dialog-error #login-dialog-countdown { font-variant-numeric: tabular-nums; }
+
+.login-dialog form label {
+  display: block;
+  margin: 10px 0 6px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+.login-dialog form input {
+  width: 100%;
+  height: 42px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--bg-deep);
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+}
+.login-dialog form input:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 1px;
+  border-color: transparent;
+}
+.login-dialog-submit {
+  width: 100%;
+  height: 44px;
+  margin-top: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 10px;
+  background: #fff;
+  color: #111;
+  font: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.login-dialog-submit:hover { background: rgba(255, 255, 255, 0.86); }
+.login-dialog-submit:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
+.login-dialog-submit:disabled { opacity: 0.5; cursor: default; }
+
+.login-dialog-links {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 16px;
+  font-size: 13px;
+}
+.login-dialog-links a {
+  color: var(--text);
+  text-decoration: none;
+  border-bottom: 1px solid var(--line-strong);
+  padding-bottom: 1px;
+}
+.login-dialog-links a:hover { border-bottom-color: var(--text); }
+
+.login-dialog-forgot {
+  margin-top: 14px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+@media (max-width: 720px) {
+  .login-dialog { width: calc(100vw - 24px); max-height: calc(100vh - 24px); }
+  .login-dialog-card { padding: 28px 20px 22px; }
+  .login-dialog-links { flex-direction: column; gap: 10px; }
+}

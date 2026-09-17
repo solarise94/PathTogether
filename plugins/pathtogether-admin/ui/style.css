@@ -432,6 +432,10 @@ body {
 }
 /* 确认条内嵌 field 组件（如重置密码输入）时占整行，不与按钮挤同一行 */
 .adm-confirm .adm-field { flex: 1 1 100%; }
+/* SER-8 测试申请页：通过确认条的「开通 AI 权限」勾选（复用 adm-check），
+   checkbox 不吃上面 .adm-confirm input 的文本框宽度，整行排布 */
+.adm-confirm .adm-check { flex: 1 1 100%; }
+.adm-confirm .adm-check input { min-width: 0; width: auto; padding: 0; }
 
 .adm-actions-cell button {
   font-size: 12px; padding: 3px 8px; margin: 2px 4px 2px 0;

@@ -201,6 +201,29 @@ def test_b02_list_page_nested_fixture(prod, monkeypatch):
     assert out["has_more"] is False and out["next_cursor"] is None
 
 
+def test_b02_source_dir_argv_contract(prod, monkeypatch):
+    """--source-dir 合同（docs §7.1）：必须 /<分享内相对路径>。
+
+    无论调用方传 批次日结 / /批次日结 / 尾随斜杠 / 反斜杠形态，argv
+    一律归一为 ``--source-dir /批次日结``；根目录（None/""/"/"）省略
+    --source-dir。argv 其余部分不变（参数数组、无 shell）。
+    """
+    cap = _CapRun(stdout=_load("list_page_root.json"))
+    monkeypatch.setattr(ba.subprocess, "run", cap)
+    for path in ("批次日结", "/批次日结", "/批次日结/", "\\批次日结"):
+        cap.calls.clear()
+        prod.list_share_page(SHARE, None, path, None, 100)
+        argv = cap.calls[0]["argv"]
+        assert argv[argv.index("--source-dir") + 1] == "/批次日结", path
+        assert isinstance(argv, list) and not cap.calls[0]["kwargs"].get(
+            "shell")
+    for root in (None, "", "/"):
+        cap.calls.clear()
+        prod.list_share_page(SHARE, None, root, None, 100)
+        argv = cap.calls[0]["argv"]
+        assert "--source-dir" not in argv, root
+
+
 def test_b02_large_integer_fs_id_and_size(prod, monkeypatch):
     # fs_id 超过 float53 精度（2^53+1）与 BIGINT 上限形态：字符串原样、
     # int 任意精度 → 转 str 后不丢精度
@@ -268,6 +291,26 @@ def test_b02_nonzero_exit_via_subprocess(prod, monkeypatch):
         prod.list_share_page(SHARE, "ab12", None, None, 100)
     assert ei.value.code == "connector_failed"
     assert SHARE not in str(ei.value) and "ab12" not in str(ei.value)
+
+
+def test_b02_nonzero_exit_stderr_error_mapping(prod, monkeypatch):
+    """非零退出的脱敏 stderr 有限错码映射（code 稳定，消息仍脱敏）。"""
+    cases = [
+        ("提取码错误或缺失", "share_password_error"),
+        ("wrong password for this share", "share_password_error"),
+        ("请先执行 bdpan login", "connector_unusable"),
+        ("bdpan login required", "connector_unusable"),
+        ("分享不存在或已取消", "share_invalid"),
+        ("打开分享失败（其它原因）", "connector_failed"),
+    ]
+    for stderr, code in cases:
+        monkeypatch.setattr(
+            ba.subprocess, "run",
+            _CapRun(stdout="", returncode=1, stderr=stderr))
+        with pytest.raises(AdapterError) as ei:
+            prod.list_share_page(SHARE, "ab12", None, None, 100)
+        assert ei.value.code == code, stderr
+        assert SHARE not in str(ei.value) and "ab12" not in str(ei.value)
 
 
 def test_b02_unknown_json_shapes_fail(prod, monkeypatch):
@@ -349,6 +392,21 @@ def test_b02_capabilities_reason_codes(monkeypatch):
         "secret_unconfigured"
 
 
+def test_b02_capabilities_worker_enabled(monkeypatch):
+    """worker_enabled 与 docker_entry.sh 对齐：1/true/yes/on（大小写
+    不敏感）为真；缺省/空/其它为假。只暴露字段，不影响可用性判定。"""
+    monkeypatch.delenv("BAIDU_IMPORT_WORKER", raising=False)
+    caps = _caps(monkeypatch, "/bin/true")
+    assert caps["worker_enabled"] is False  # 缺省（docker 默认 0）
+    assert caps["enumeration_available"] is True  # 不因此门控
+    for val in ("1", "true", "YES", "On"):
+        monkeypatch.setenv("BAIDU_IMPORT_WORKER", val)
+        assert _caps(monkeypatch, "/bin/true")["worker_enabled"] is True, val
+    for val in ("0", "false", "", "2"):
+        monkeypatch.setenv("BAIDU_IMPORT_WORKER", val)
+        assert _caps(monkeypatch, "/bin/true")["worker_enabled"] is False, val
+
+
 # --------------------------------------------------------------------------- #
 # fake 适配器基础行为（分页/重复游标/上限溢出由 store 侧 B03 验证）
 # --------------------------------------------------------------------------- #
@@ -390,3 +448,34 @@ def test_get_adapter_env_injection(monkeypatch):
     caps = a.capabilities()
     assert caps["enumeration_available"] is False
     assert caps["reason_code"] == "fake_adapter_forbidden_in_production"
+
+
+def test_fake_capabilities_worker_enabled(monkeypatch):
+    # fake 非 production：worker 视为可用（测试不依赖 BAIDU_IMPORT_WORKER）
+    monkeypatch.delenv("PT_ENV", raising=False)
+    monkeypatch.delenv("BAIDU_IMPORT_WORKER", raising=False)
+    caps = FakeBaiduAdapter().capabilities()
+    assert caps["worker_enabled"] is True
+    assert caps["enumeration_available"] is True
+    # production：fake 仍整体 unavailable（worker_enabled 按 env 判定）
+    monkeypatch.setenv("PT_ENV", "production")
+    caps2 = FakeBaiduAdapter().capabilities()
+    assert caps2["enumeration_available"] is False
+    assert caps2["reason_code"] == "fake_adapter_forbidden_in_production"
+
+
+def test_live_missing_batch_directory_is_empty(prod, monkeypatch):
+    payload = {"code": 1, "data": None,
+               "error": "找不到指定的文件或目录（错误码 -9），请检查路径是否正确。"}
+    monkeypatch.setattr(prod, "_run", lambda *a, **k: json.dumps(payload))
+    assert prod.list_batch_copies("bib_new") == []
+    with pytest.raises(AdapterError):
+        prod.transfer_selected("bib_new", SHARE, None, ["123"])
+
+
+@pytest.mark.parametrize("message", ["请先执行 bdpan login", "网络失败", "未知错误 -9"])
+def test_live_json_failure_is_not_an_empty_listing(prod, monkeypatch, message):
+    monkeypatch.setattr(prod, "_run", lambda *a, **k: json.dumps(
+        {"code": 1, "data": None, "error": message}))
+    with pytest.raises(AdapterError):
+        prod.list_batch_copies("bib_new")

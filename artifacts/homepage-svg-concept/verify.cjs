@@ -1,0 +1,46 @@
+const {chromium}=require('@playwright/test');
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const zlib=require('node:zlib');
+(async()=>{
+ const browser=await chromium.launch();
+ const p=await browser.newPage({viewport:{width:1440,height:1100}});
+ const errors=[];const requests=[];
+ p.on('pageerror',e=>errors.push(e.message));p.on('request',r=>requests.push(r.url()));
+ await p.clock.install();
+ await p.goto('http://127.0.0.1:8921');
+ const geometry=await p.locator('[data-glands]').evaluate(el=>el.outerHTML);
+ const seen=new Set();
+ for(let i=0;i<160;i++){
+  await p.clock.runFor(200);
+  seen.add(await p.locator('#tissue').getAttribute('data-scene'));
+ }
+ assert.equal(seen.size,8,'all eight scenes, including final overview');
+ assert.equal(await p.locator('[data-glands]').evaluate(el=>el.outerHTML),geometry,'geometry must remain stable throughout animation');
+ assert(!requests.some(u=>/\.(webp|png|jpg|jpeg)(\?|$)/.test(u)),'no raster downloads');
+ await p.locator('#toggle').click();
+ const paused=await p.locator('#tissue').getAttribute('viewBox');await p.clock.runFor(1000);
+ assert.equal(await p.locator('#tissue').getAttribute('viewBox'),paused,'pause freezes camera');
+ await p.close();
+ const mobile=await browser.newPage({viewport:{width:390,height:844},reducedMotion:'reduce'});
+ await mobile.goto('http://127.0.0.1:8921');
+ assert.equal(await mobile.locator('#tissue').getAttribute('data-scene'),'7','reduced motion shows overview with annotations');
+ for(const key of ['a','b'])assert.equal(await mobile.locator(`[data-mark="${key}"]`).getAttribute('visibility'),'visible');
+ await mobile.locator('#replay').click();
+ for(let i=0;i<6;i++)await mobile.locator('#next').click();
+ assert.equal(await mobile.locator('#tissue').getAttribute('data-scene'),'6');
+ const note=await mobile.locator('#note').boundingBox();const canvas=await mobile.locator('.canvas').boundingBox();
+ assert(note.x>=canvas.x&&note.x+note.width<=canvas.x+canvas.width,'mobile note stays within canvas');
+ assert(await mobile.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'no mobile overflow');
+ await mobile.screenshot({path:'artifacts/homepage-svg-concept/mobile.png',fullPage:true});
+ assert.equal(await mobile.locator('[data-glands]').evaluate(el=>el.outerHTML),geometry,'seed produces the same geometry across loads');
+ assert.deepEqual(errors,[]);
+ await browser.close();
+ const files=['index.html','preview.css','tissue.js','motion.js'];
+ const payload=files.reduce((s,f)=>s+fs.statSync('artifacts/homepage-svg-concept/'+f).size,0);
+ const compressed=files.reduce((s,f)=>s+zlib.gzipSync(fs.readFileSync('artifacts/homepage-svg-concept/'+f)).length,0);
+ const svg=fs.readFileSync('artifacts/homepage-svg-concept/tissue.svg');
+ const report={checks:['8 scenes','stable geometry during zoom','no raster requests','pause freezes camera','reduced motion','both annotations persist','mobile note bounds','no mobile overflow','repeatable seed','no JS errors'],payloadBytes:payload,gzipPayloadBytes:compressed,exportedSvgBytes:svg.length,gzipSvgBytes:zlib.gzipSync(svg).length};
+ fs.writeFileSync('artifacts/homepage-svg-concept/verification.json',JSON.stringify(report,null,2)+'\n');
+ console.log(JSON.stringify(report,null,2));
+})().catch(e=>{console.error(e);process.exitCode=1});

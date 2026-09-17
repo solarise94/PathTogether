@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HistoPilot · 组织导航示意</title>
+<link rel="icon" href="data:,"><style>
+:root{color-scheme:dark;font-family:Inter,-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;color:#f3f0f3;background:#141315;font-synthesis:none}*{box-sizing:border-box}body{margin:0}header{max-width:1200px;padding:28px 24px;margin:auto;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #ffffff12}header a{color:inherit;text-decoration:none;font-size:19px;font-weight:700;letter-spacing:-.5px}header span{font-size:12px;color:#a9a0ac}main{max-width:1200px;margin:auto;padding:50px 24px 42px}.intro{margin-bottom:32px}.eyebrow{font-size:12px;letter-spacing:2px;color:#cda5ba}.intro h1{font-size:clamp(25px,3.2vw,38px);letter-spacing:-1px;line-height:1.35;margin:14px 0}.intro>p:last-child{color:#aaa1ad;font-size:15px;line-height:1.8}.viewer{border:1px solid #ffffff1c;border-radius:15px;overflow:hidden;background:#1b191c;box-shadow:0 25px 70px #0003}.toolbar{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:16px 20px;border-bottom:1px solid #ffffff13;font-size:13px}.toolbar>span:first-child{display:flex;align-items:center;gap:8px}.toolbar i{display:block;width:7px;height:7px;border-radius:50%;background:#ba829f}.schematic{color:#aba0ae;font-size:11px}.body{display:grid;grid-template-columns:minmax(0,1fr) 284px}.canvas{position:relative;overflow:hidden;aspect-ratio:900/680;background:#edc5d4}#tissue{display:block;width:100%;height:100%;overflow:hidden}.corner{position:absolute;bottom:15px;left:15px;background:#251525d9;border:1px solid #ffffff33;padding:7px 10px;border-radius:6px;font-size:11px;color:#f7eef4;display:flex;gap:8px}.dot{color:#af8fa9}aside{padding:25px 23px;display:flex;flex-direction:column;border-left:1px solid #ffffff12}.agent-label{font-size:10px;letter-spacing:1.4px;color:#ac9ead;display:flex;align-items:center;gap:7px}.agent-dot{width:6px;height:6px;border-radius:50%;background:#93c9b0}aside h2{font-size:19px;line-height:1.45;font-weight:600;margin:25px 0 12px}#status{font-size:13px;line-height:1.85;color:#bdb3c0;min-height:76px;margin:0}ol{list-style:none;padding:0;display:grid;gap:4px;margin:23px 0}li{color:#958a99;font-size:12px;position:relative;padding:9px 12px 9px 28px;border-radius:5px}li:before{content:"";width:6px;height:6px;position:absolute;left:10px;top:13px;border:1px solid #807184;border-radius:50%}li.active{background:#ffffff08;color:#f5eef6}li.active:before{background:#d9b0c8;border-color:#d9b0c8}li.done:before{background:#7d6073;border-color:#7d6073}.legend{margin-top:auto;display:flex;flex-wrap:wrap;gap:13px;font-size:10px;color:#b4a7b8}.legend span{display:flex;align-items:center;gap:5px}.legend i{width:9px;height:9px;display:block;border-radius:50%}.nucleus{background:#8d497f}.lumen{background:#f4e5e6}.legend .mark{border:1px solid #007aff;border-radius:2px}.aside-note{font-size:10px;line-height:1.8;color:#948898;border-top:1px solid #ffffff10;padding-top:15px;margin:18px 0 0}.controls{padding:13px 18px;display:flex;align-items:center;gap:9px;border-top:1px solid #ffffff13}.progress{height:2px;background:#ffffff15;flex:1;margin-right:12px;border-radius:5px;overflow:hidden}.progress span{display:block;width:0;height:100%;background:#ca9bb8}#count{font-size:10px;font-variant-numeric:tabular-nums;color:#a89bae;margin-right:5px}button{border:1px solid #ffffff1a;background:#242026;color:#dcd2df;min-width:34px;height:34px;border-radius:6px;padding:0 10px;font:inherit;font-size:12px;cursor:pointer}button:hover{border-color:#a9819a;background:#312935}button:disabled{opacity:.3;cursor:default}button:focus-visible{outline:2px solid #dba9c9;outline-offset:3px}.note{position:absolute;left:20px;right:20px;bottom:57px;display:flex;gap:12px;padding:13px 15px;background:#171d2bed;border:1px solid #7caceb55;border-left:3px solid #007aff;border-radius:7px;max-width:350px;color:#edf3ff}.note[hidden]{display:none}.note>span{font-size:12px;color:#89b9ff;margin-top:2px}.note strong{font-size:12px;font-weight:600}.note p{font-size:11px;line-height:1.7;color:#b9c9e2;margin:5px 0 0}.design-notes{display:grid;grid-template-columns:1fr 1fr;gap:40px;margin-top:25px;color:#918494;font-size:12px;line-height:1.85}.design-notes b{display:block;color:#c5b6c9;font-size:12px;font-weight:500;margin-bottom:5px}@media(max-width:760px){header{padding:22px 18px}main{padding:30px 16px}.body{grid-template-columns:1fr}.canvas{aspect-ratio:1}aside{border-left:0;border-top:1px solid #ffffff12;padding:20px}aside h2{margin:14px 0 8px;font-size:17px}#status{min-height:0}ol{display:flex;flex-wrap:wrap;margin:16px 0;gap:2px}li{font-size:11px;padding:8px 8px 8px 23px}li:before{left:9px;top:11px}.legend{margin-top:4px}.aside-note{margin-top:14px}.toolbar{padding:13px;font-size:12px}.schematic{font-size:10px}.controls{padding:12px;gap:6px}button{height:40px;min-width:37px}.design-notes{grid-template-columns:1fr;gap:0}.note{left:14px;right:14px;bottom:57px;max-width:310px}.intro h1{letter-spacing:-.5px}.progress{margin-right:3px}#count{font-size:9px}}
+
+/* Simulated streamed observations; overview labels retain a readable screen size. */
+#note-body{min-height:3.4em}
+#note-title.streaming::after,#note-body.streaming::after{content:"▍";color:#8cbdff;margin-left:2px}
+.review-pin{position:absolute;max-width:180px;width:43%;padding:9px 11px;border:1px solid #79acff80;border-left:3px solid #007aff;border-radius:6px;background:#152237ed;color:#edf3ff;pointer-events:none;box-shadow:0 3px 14px #0002}
+.review-pin[hidden]{display:none}.review-pin strong{display:block;font-size:11px;font-weight:600}.review-pin span{display:block;margin-top:4px;font-size:10px;line-height:1.5;color:#c7d9f2}
+
+#note-title{display:block;min-height:1.5em}
+
+</style>
+
+</head>
+<body>
+<header><a href="#">HistoPilot</a><span>主页视觉预览 / 01</span></header>
+<main>
+<div class="intro"><p class="eyebrow">从组织结构，到细胞细节</p><h1>沿着组织，找到值得细看的地方。</h1><p>看全景，选一处，放大观察并标注；再到下一处继续。</p></div>
+<section class="viewer" aria-label="组织导航流程示意">
+<div class="toolbar"><span><i></i>组织导航</span><span class="schematic">形态与流程示意 · 非真实切片</span></div>
+<div class="body"><div class="canvas">
+<svg id="tissue" viewBox="0 0 900 680" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="svg-title svg-desc"><title id="svg-title">腺体组织 SVG 示意图</title><desc id="svg-desc">多个大小与形状不同的腺体围绕腔隙排列。细胞与细胞核有适度随机变化，腺体之间分布纤维状间质。</desc></svg>
+<div class="corner"><span id="location">全景</span><span class="dot">·</span><span>示意视野</span></div>
+<div class="note" id="note" hidden><span id="note-id">01</span><div><strong id="note-title"></strong><p id="note-body"></p></div></div>
+<div class="review-pin" id="review-a" hidden><strong>01 · 区域 A</strong><span>细胞环绕腔隙排列</span></div>
+<div class="review-pin" id="review-b" hidden><strong>02 · 区域 B</strong><span>腺体与周围间质</span></div>
+</div><aside><div class="agent-label"><span class="agent-dot"></span>AGENT WALKTHROUGH</div><h2 id="phase">先看看整体组织</h2><p id="status" role="status">辨认腺体分布与腺体之间的间质，选择第一处观察区域。</p>
+<ol id="steps"><li>全景</li><li>局部 A</li><li>细节 A</li><li>标注 A</li><li>切换局部 B</li><li>细节 B</li><li>标注 B</li></ol>
+<div class="legend"><span><i class="nucleus"></i>细胞核</span><span><i class="lumen"></i>腔隙</span><span><i class="mark"></i>观察标注</span></div>
+<p class="aside-note">参考腺体组织的排列关系绘制。观察文字用于演示交互，不代表模型分析结果。</p></aside></div>
+<div class="controls"><div class="progress"><span id="progress"></span></div><span id="count">01 / 07</span><button id="previous" aria-label="上一步">←</button><button id="toggle">暂停</button><button id="next" aria-label="下一步">→</button><button id="replay">重播 ↻</button></div>
+</section>
+<div class="design-notes"><p><b>有结构的随机</b>腺体围绕腔隙排列，细胞大小、长短、旋转角度与间距有受控变化。</p><p><b>同一张矢量图</b>从全景到细节只移动视野。标注随组织保留，整个流程无需切换图片。</p></div>
+</main>
+<script>
+/* Seeded glandular-tissue illustration. All geometry is invented; no embedded bitmap. */
+(function () {
+  'use strict';
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.querySelector('#tissue');
+  let seed = 149336;
+  const random = () => { seed = (Math.imul(1664525, seed) + 1013904223) >>> 0; return seed / 4294967296; };
+  const between = (a,b) => a + random() * (b-a);
+  const choose = a => a[Math.floor(random()*a.length)];
+  const fmt = x => Math.round(x*100)/100;
+  function node(tag, attrs, parent) {
+    const el = document.createElementNS(NS,tag);
+    Object.entries(attrs).forEach(([k,v]) => el.setAttribute(k,v));
+    if(parent) parent.append(el);
+    return el;
+  }
+  function loop(points) {
+    const n = points.length;
+    const mid = (a,b) => `${fmt((a[0]+b[0])/2)} ${fmt((a[1]+b[1])/2)}`;
+    let d = 'M'+mid(points[n-1],points[0]);
+    for(let i=0;i<n;i++) d+='Q'+points[i].map(fmt).join(' ')+' '+mid(points[i],points[(i+1)%n]);
+    return d+'Z';
+  }
+  const defs = node('defs',{},svg);
+  const wash = node('radialGradient',{id:'wash',cx:'40%',cy:'30%',r:'80%'},defs);
+  node('stop',{offset:'0','stop-color':'#e8b9cf'},wash);
+  node('stop',{offset:'1','stop-color':'#ce8aad'},wash);
+  const camera = node('g',{'data-camera':''},svg);
+  node('rect',{x:-100,y:-100,width:1100,height:900,fill:'url(#wash)'},camera);
+  const stroma=node('g',{'data-stroma':''},camera);
+  // Fine curved collagen and sparse spindle-shaped nuclei in the spaces between glands.
+  for(let i=0;i<850;i++) {
+    const x=between(-30,930),y=between(-30,710),a=between(0,180);
+    node('path',{d:`M${fmt(x)} ${fmt(y)}q${fmt(between(-8,8))} ${fmt(between(-8,8))} ${fmt(between(10,25))} ${fmt(between(-10,10))}`,fill:'none',stroke:choose(['#fae5e7','#bd789e','#e8b2c7']), 'stroke-width':fmt(between(.4,1.1)),opacity:'.65'},stroma);
+    if(i%3===0) node('ellipse',{cx:fmt(x),cy:fmt(y),rx:fmt(between(1,1.8)),ry:fmt(between(2.4,4)),fill:choose(['#975184','#864171','#ac608d']),transform:`rotate(${fmt(a)} ${fmt(x)} ${fmt(y)})`,opacity:'.7'},stroma);
+  }
+  const glands=node('g',{'data-glands':''},camera);
+  const centers=[];
+  // Pack unequal gland footprints organically; cell noise follows each gland's wall.
+  const footprints=[{id:'region-a',x:260,y:235,r:49},{id:'region-b',x:650,y:445,r:47}];
+  for(let trial=0;trial<14000&&footprints.length<90;trial++) {
+    const r=trial<2200?between(38,58):between(23,38);
+    const x=between(-18,918),y=between(-18,698);
+    if(footprints.every(c=>Math.hypot(x-c.x,y-c.y)>r+c.r+between(1,5)))footprints.push({id:'gland-'+footprints.length,x,y,r});
+  }
+  for(const footprint of footprints) {
+    const cx=footprint.x,cy=footprint.y;
+    const rx=footprint.r*between(.91,1.04),ry=footprint.r*between(.8,1.02),rotation=between(-85,85);
+    const id=footprint.id;
+    const g=node('g',{id,'data-gland':'',transform:`translate(${fmt(cx)} ${fmt(cy)}) rotate(${fmt(rotation)})`},glands);
+    centers.push({id,x:cx,y:cy});
+    const phase=between(0,6.28),waves=random()>.6?3:2;
+    function shape(a,r) {
+      const warp=1+.065*Math.sin(waves*a+phase)+.035*Math.sin(5*a-phase);
+      return [rx*r*Math.cos(a)*warp,ry*r*Math.sin(a)*warp];
+    }
+    const outer=Array.from({length:24},(_,i)=>shape(i*Math.PI/12,1));
+    node('path',{d:loop(outer),fill:choose(['#c980a2','#c579a0','#d18aa9','#bc7096']),stroke:'#fff0ec','stroke-width':2.1},g);
+    node('path',{d:loop(outer),fill:'none',stroke:'#a45185','stroke-width':.8},g);
+    const count=Math.floor(between(25,34));
+    const angles=Array.from({length:count},(_,i)=>2*Math.PI*(i+between(-.16,.16))/count);
+    const inner=between(.23,.35);
+    // Epithelial cells form a radial wall, with pale apical vacuoles and darker basal nuclei.
+    for(let i=0;i<count;i++) {
+      const a=angles[i], b=i===count-1?angles[0]+Math.PI*2:angles[i+1], m=(a+b)/2;
+      const o1=shape(a,.96),o2=shape(b,.96),i1=shape(a,inner),i2=shape(b,inner);
+      const cytoplasm=`M${o1.map(fmt).join(' ')}Q${shape(m,1.02).map(fmt).join(' ')} ${o2.map(fmt).join(' ')}L${i2.map(fmt).join(' ')}Q${shape(m,inner*.86).map(fmt).join(' ')} ${i1.map(fmt).join(' ')}Z`;
+      node('path',{d:cytoplasm,fill:choose(['#c47da3','#ce8eae','#b96f99','#cb84a7','#b36594']),stroke:'#eabdd0','stroke-width':.48},g);
+      const [nx,ny]=shape(m+between(-.025,.025),between(.73,.83));
+      const nuclearAngle=m*180/Math.PI-90+between(-17,17);
+      const nucleus=node('ellipse',{cx:fmt(nx),cy:fmt(ny),rx:fmt(between(1.65,2.55)),ry:fmt(between(3.6,5.7)),fill:choose(['#6c326b','#803e78','#8e457f','#74336e']),stroke:'#ad6393','stroke-width':.35,transform:`rotate(${fmt(nuclearAngle)} ${fmt(nx)} ${fmt(ny)})`,'data-nucleus':''},g);
+      if(random()>.4) node('ellipse',{cx:fmt(nx+.35),cy:fmt(ny-.6),rx:.65,ry:.9,fill:'#d899c2',opacity:'.6'},g);
+      if(random()>.16) {
+        const [vx,vy]=shape(m,between(.43,.55));
+        node('ellipse',{cx:fmt(vx),cy:fmt(vy),rx:fmt(between(2.5,4.2)),ry:fmt(between(5.1,8.3)),fill:choose(['#f5e5e8','#f7ecec','#edd2df','#f0dce4']),stroke:'#e8b5cf','stroke-width':.55,transform:`rotate(${fmt(m*180/Math.PI-90+between(-10,10))} ${fmt(vx)} ${fmt(vy)})`},g);
+      }
+    }
+    const lumen=Array.from({length:16},(_,i)=>shape(i*Math.PI/8,inner*between(.78,1.14)));
+    node('path',{d:loop(lumen),fill:'#fff3ef',stroke:'#efd0dc','stroke-width':1},g);
+  }
+  // These are illustration coordinates, not patient observations or physical measurements.
+  const a=centers.find(c=>c.id==='region-a'),b=centers.find(c=>c.id==='region-b');
+  const annotations=node('g',{'data-annotations':''},camera);
+  for(const [key,c] of [['a',a],['b',b]]) {
+    const group=node('g',{'data-mark':key,visibility:'hidden'},annotations);
+    node('rect',{x:fmt(c.x-49),y:fmt(c.y-48),width:98,height:96,rx:5,fill:'none',stroke:'#007AFF','stroke-width':2,'vector-effect':'non-scaling-stroke'},group);
+
+  }
+  window.tissueConcept={svg,camera,a,b,seed:149336};
+})();
+
+</script>
+<script>
+(function () {
+  'use strict';
+  const {svg,a,b}=window.tissueConcept;
+  const $=id=>document.getElementById(id);
+  const all={x:450,y:340,w:900};
+  const local=c=>({x:c.x,y:c.y,w:340});
+  const detail=c=>({x:c.x+3,y:c.y-2,w:140});
+  const scenes=[
+    {camera:all,travel:0,hold:1900,where:'全景',title:'先看看整体组织',body:'辨认腺体分布与腺体之间的间质，选择第一处观察区域。'},
+    {camera:local(a),travel:1600,hold:1000,where:'局部 A',title:'选定一处腺体',body:'把视野移到区域 A，观察腺体轮廓、腔隙与相邻组织的关系。'},
+    {camera:detail(a),travel:1600,hold:1500,where:'细节 A',title:'沿着腔隙看细胞',body:'继续放大，查看细胞围绕腔隙的排列，以及细胞核的形状与方向。'},
+    {camera:detail(a),travel:0,hold:6200,where:'标注 A',title:'留下第一处观察',body:'标注固定在组织坐标上。缩小或移动视野后，仍能回到同一个位置。',note:'a'},
+    {camera:local(b),travel:2800,hold:1100,where:'局部 B',title:'换到下一处继续观察',body:'先拉远，再移动到区域 B。保留第一处标注，继续查看另一组腺体。',via:{x:(a.x+b.x)/2,y:(a.y+b.y)/2,w:740}},
+    {camera:detail(b),travel:1700,hold:1500,where:'细节 B',title:'再看一处细节',body:'观察这处腺体的形态与周围间质，比较不同位置的组织结构。'},
+    {camera:detail(b),travel:0,hold:6200,where:'标注 B',title:'记录第二处位置',body:'为区域 B 添加观察标注，形成可以回看的观察路径。',note:'b'},
+    {camera:all,travel:2200,hold:4200,where:'回看',title:'把观察放回整体',body:'回到全景，两处标注仍留在原来的组织位置。下一轮从整体重新开始。'}
+  ];
+  const extra=document.createElement('li');extra.textContent='回看';$('steps').append(extra);
+  const observations={
+    a:'细胞围绕腔隙呈环状排列，细胞核的大小与方向略有差异。已记录区域 A 的观察位置。',
+    b:'这处腺体轮廓与邻近区域有所不同，周围可见间质。已记录区域 B，便于回看比较。'
+  };
+  function placeReview(frame,h) {
+    const bounds=svg.getBoundingClientRect();
+    const scale=Math.max(bounds.width/frame.w,bounds.height/h);
+    for(const [key,point] of [['a',a],['b',b]]) {
+      const pin=$('review-'+key);
+      pin.hidden=index!==7;
+      if(pin.hidden)continue;
+      const x=bounds.width/2+(point.x-frame.x)*scale;
+      const y=bounds.height/2+(point.y+48-frame.y)*scale+7;
+      pin.style.left=Math.max(8,Math.min(bounds.width-pin.offsetWidth-8,x-pin.offsetWidth/2))+'px';
+      pin.style.top=Math.max(8,Math.min(bounds.height-pin.offsetHeight-8,y))+'px';
+    }
+  }
+  const total=scenes.reduce((sum,s)=>sum+s.travel+s.hold,0);
+  let index=0,elapsed=0,last=0,raf=0,manual=false;
+  const motion=matchMedia('(prefers-reduced-motion: reduce)');
+  let paused=motion.matches,visible=true;
+  const smooth=k=>k*k*(3-2*k);
+  function mix(from,to,k) {
+    k=smooth(Math.max(0,Math.min(1,k)));
+    return {x:from.x+(to.x-from.x)*k,y:from.y+(to.y-from.y)*k,w:from.w*Math.pow(to.w/from.w,k)};
+  }
+  function paint() {
+    const scene=scenes[index],from=index?scenes[index-1].camera:all;
+    const fraction=scene.travel?Math.min(elapsed/scene.travel,1):1;
+    let frame=scene.via&&fraction<.5?mix(from,scene.via,fraction*2):scene.via?mix(scene.via,scene.camera,(fraction-.5)*2):mix(from,scene.camera,fraction);
+    const h=frame.w*680/900;
+    svg.setAttribute('viewBox',`${frame.x-frame.w/2} ${frame.y-h/2} ${frame.w} ${h}`);
+    svg.dataset.scene=String(index);
+    svg.querySelector('[data-mark="a"]').setAttribute('visibility',index>=3?'visible':'hidden');
+    svg.querySelector('[data-mark="b"]').setAttribute('visibility',index>=6?'visible':'hidden');
+    // Only the camera changes each frame. Thousands of cell nodes stay untouched.
+    if($('phase').dataset.scene!==String(index)) {
+      $('phase').dataset.scene=String(index);
+      $('phase').textContent=scene.title;$('status').textContent=scene.body;$('location').textContent=scene.where;
+      $('steps').querySelectorAll('li').forEach((li,i)=>{li.classList.toggle('active',i===index);li.classList.toggle('done',i<index);});
+      $('count').textContent=`${String(index+1).padStart(2,'0')} / 08`;
+      $('previous').disabled=index===0;$('next').disabled=index===scenes.length-1;
+      $('note').hidden=!scene.note;
+      if(scene.note){$('note-id').textContent=scene.note==='a'?'01':'02';$('note-title').textContent='';$('note-body').textContent='';}
+    }
+    if(scene.note) {
+      const full=observations[scene.note];
+      const title=scene.note==='a'?'区域 A · 环绕腔隙的细胞排列':'区域 B · 腺体与周围间质';
+      const count=motion.matches&&!manual?title.length+full.length:Math.max(0,Math.floor((elapsed-350)/60));
+      $('note-title').textContent=title.slice(0,count);
+      $('note-body').textContent=full.slice(0,Math.max(0,count-title.length));
+      $('note-title').classList.toggle('streaming',count<title.length);
+      $('note-body').classList.toggle('streaming',count>=title.length&&count<title.length+full.length);
+    } else $('note-body').classList.remove('streaming');
+    placeReview(frame,h);
+    const spent=scenes.slice(0,index).reduce((sum,s)=>sum+s.travel+s.hold,0)+elapsed;
+    $('progress').style.width=Math.min(100,spent/total*100)+'%';
+    $('toggle').textContent=paused?'继续':'暂停';
+  }
+  function tick(now) {
+    raf=0;
+    if(paused||!visible||document.hidden)return;
+    if(last)elapsed+=Math.min(now-last,100);
+    last=now;
+    if(elapsed>=scenes[index].travel+scenes[index].hold){
+      if(manual)paused=true;
+      else {index=(index+1)%scenes.length;elapsed=0;}
+    }
+    paint();raf=requestAnimationFrame(tick);
+  }
+  function schedule() {
+    cancelAnimationFrame(raf);raf=0;last=0;
+    if(!paused&&visible&&!document.hidden)raf=requestAnimationFrame(tick);
+  }
+  function jump(to) {manual=true;index=to;elapsed=scenes[index].travel;paused=!scenes[index].note;paint();schedule();}
+  $('previous').onclick=()=>jump(Math.max(0,index-1));
+  $('next').onclick=()=>jump(Math.min(scenes.length-1,index+1));
+  $('toggle').onclick=()=>{paused=!paused;if(!paused)manual=false;paint();schedule();};
+  $('replay').onclick=()=>{index=0;elapsed=0;paused=motion.matches;manual=false;paint();schedule();};
+  document.addEventListener('visibilitychange',schedule);
+  new ResizeObserver(()=>paint()).observe(svg);
+  if('IntersectionObserver' in window)new IntersectionObserver(entries=>{visible=entries[0].isIntersecting;schedule();},{threshold:0}).observe(svg);
+  motion.addEventListener('change',()=>{if(motion.matches){paused=true;index=scenes.length-1;elapsed=scenes[index].travel;}else if(!manual)paused=false;paint();schedule();});
+  if(motion.matches){index=scenes.length-1;elapsed=scenes[index].travel;}
+  paint();schedule();
+})();
+
+</script>
+</body></html>

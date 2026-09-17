@@ -1,394 +1,205 @@
-/* 主页读片演示：2× / 10× / 20× / 40× 同心实图。
- * 同一视野连续放大；只在倍率正好翻倍、两张图 FOV 重合时换图（无淡入淡出）。
- * 高倍到位后在图上画蓝框，框边逐字流出解读。自动循环，无播放按钮。 */
-(function () {
-  "use strict";
-  var MEDIA = "/static/entry-media/";
-  var LOOP_HOLD_MS = 3000;
-  var BOX_DELAY_MS = 280;
-  var CHAR_MS = 26;
-  var TICK_MS = 32;
-  var SETTLE_MS = 420;
-
-  var LEFT = [
-    { src: "tcga-left-2.jpg", mag: 2.5 },
-    { src: "tcga-left-10.jpg", mag: 10 },
-    { src: "tcga-left-20.jpg", mag: 20 },
-    { src: "tcga-left-40.jpg", mag: 40 }
-  ];
-  var UPPER = [
-    { src: "tcga-upper-2.jpg", mag: 2.5 },
-    { src: "tcga-upper-10.jpg", mag: 10 },
-    { src: "tcga-upper-20.jpg", mag: 20 },
-    { src: "tcga-upper-40.jpg", mag: 40 }
-  ];
-  var RIGHT = [
-    { src: "tcga-right-2.jpg", mag: 2.5 },
-    { src: "tcga-right-10.jpg", mag: 10 },
-    { src: "tcga-right-20.jpg", mag: 20 },
-    { src: "tcga-right-40.jpg", mag: 40 }
-  ];
-  var SCENES = [
-    { kind: "wide", src: "tcga-session-base.jpg", mag: 0.5, d: 1600, stage: 0, status: 0 },
-    { kind: "zoom", stack: LEFT, zoom: 2600, hold: 3400, stage: 1, box: "a", statusLow: 1, statusHigh: 2 },
-    { kind: "zoom", stack: UPPER, zoom: 2200, hold: 1400, stage: 2, statusLow: 3, statusHigh: 4 },
-    { kind: "zoom", stack: RIGHT, zoom: 2600, hold: 3600, stage: 3, box: "b", statusLow: 5, statusHigh: 6 },
-    { kind: "wide", src: "tcga-session-base.jpg", mag: 1, scale: 1.35, ox: 58, oy: 57, d: 3800, stage: 4, both: true, status: 7 }
-  ];
-
-  function t(key) { return window.HP_I18N ? window.HP_I18N.t(key) : key; }
-  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
-  function ease(k) { return k * k * (3 - 2 * k); }
-
-  function pickLayer(stack, mag) {
-    var i = 0;
-    while (i + 1 < stack.length && mag >= stack[i + 1].mag - 1e-4) i += 1;
-    return { src: stack[i].src, mag: stack[i].mag, scale: mag / stack[i].mag, idx: i };
+/* Seeded glandular-tissue illustration. All geometry is invented; no embedded bitmap. */
+window.HP_EntryTissue = function (svg, compact) {
+  'use strict';
+  const NS = 'http://www.w3.org/2000/svg';
+  let seed = 149336;
+  const random = () => { seed = (Math.imul(1664525, seed) + 1013904223) >>> 0; return seed / 4294967296; };
+  const between = (a,b) => a + random() * (b-a);
+  const choose = a => a[Math.floor(random()*a.length)];
+  const fmt = x => Math.round(x*100)/100;
+  function node(tag, attrs, parent) {
+    const el = document.createElementNS(NS,tag);
+    Object.entries(attrs).forEach(([k,v]) => el.setAttribute(k,v));
+    if(parent) parent.append(el);
+    return el;
   }
-
-  function init(root) {
-    var fromImg = root.querySelector("[data-hp-img-from]");
-    var toImg = root.querySelector("[data-hp-img-to]");
-    var bufs = [fromImg, toImg];
-    var cur = 0;
-    var zoom = root.querySelector("[data-hp-zoom]");
-    var scale = root.querySelector("[data-hp-scale]");
-    var scaleBar = root.querySelector("[data-hp-scale-bar]");
-    var status = root.querySelector("[data-hp-status]");
-    var phase = root.querySelector("[data-hp-phase]");
-    var zoomIn = root.querySelector("[data-hp-zoom-in]");
-    var zoomOut = root.querySelector("[data-hp-zoom-out]");
-    var boxes = {};
-    var streams = {};
-    Array.prototype.forEach.call(root.querySelectorAll("[data-hp-box]"), function (el) {
-      boxes[el.getAttribute("data-hp-box")] = el;
-      streams[el.getAttribute("data-hp-box")] = el.querySelector("[data-hp-stream]");
-    });
-    var inView = false, autoResume = false, started = false, ready = false;
-    var loading = false;
-    var imageWidth;
-    function mediaUrl(src) {
-      return MEDIA + src.replace(/\.jpg$/, "-" + imageWidth + ".webp");
-    }
-    var motion = window.matchMedia("(prefers-reduced-motion: reduce)");
-    var step = 0, elapsed = 0, last = 0, raf = 0, streamTimer = 0;
-    var playing = false, manual = false;
-    var shownBox = null;
-    var statusIdx = 0;
-
-    function copy(el, key) {
-      el.setAttribute("data-i18n", key);
-      el.textContent = t(key);
-    }
-    function magText(mag) {
-      if (mag < 1) return "≈0.5×";
-      if (mag < 4) return "≈2×";
-      if (mag < 15) return "≈10×";
-      if (mag < 30) return "≈20×";
-      return "≈40×";
-    }
-    function scaleFor(mag) {
-      scale.textContent = mag >= 30 ? "50 µm" : mag >= 15 ? "100 µm" : mag >= 4 ? "200 µm" : mag >= 1 ? "500 µm" : "2 mm";
-      scaleBar.style.width = mag >= 30 ? "42px" : mag >= 15 ? "48px" : mag >= 4 ? "56px" : "72px";
-    }
-    function pose(el, spec) {
-      el.classList.toggle("is-wide", !!spec.wide);
-      el.style.transformOrigin = (spec.ox == null ? 50 : spec.ox) + "% " + (spec.oy == null ? 50 : spec.oy) + "%";
-      el.style.transform = "translateZ(0) scale(" + (spec.scale || 1) + ")";
-    }
-    function showFrame(spec) {
-      var a = bufs[cur];
-      var b = bufs[1 - cur];
-      if (a.getAttribute("data-key") !== spec.src) {
-        if (b.getAttribute("data-key") !== spec.src) {
-          b.src = mediaUrl(spec.src);
-          b.setAttribute("data-key", spec.src);
-        }
-        pose(b, spec);
-        b.style.opacity = "1";
-        a.style.opacity = "0";
-        cur = 1 - cur;
-      } else {
-        pose(a, spec);
-        a.style.opacity = "1";
-        b.style.opacity = "0";
-      }
-    }
-    function prefetch(src) {
-      var b = bufs[1 - cur];
-      if (b.getAttribute("data-key") === src) return;
-      b.src = mediaUrl(src);
-      b.setAttribute("data-key", src);
-    }
-    function stopStream() {
-      if (streamTimer) { window.clearInterval(streamTimer); streamTimer = 0; }
-    }
-    function streamInto(kind) {
-      stopStream();
-      var el = streams[kind];
-      var full = t("entry.principle.review." + kind);
-      if (motion.matches) { el.textContent = full; return; }
-      el.textContent = "";
-      var i = 0;
-      streamTimer = window.setInterval(function () {
-        i += 1;
-        el.textContent = full.slice(0, i);
-        if (i >= full.length) stopStream();
-      }, CHAR_MS);
-    }
-    function setBox(kind, on, wide) {
-      var el = boxes[kind];
-      el.classList.toggle("is-on", on);
-      el.classList.toggle("is-wide", !!wide);
-      if (!on) {
-        streams[kind].textContent = "";
-        if (shownBox === kind) shownBox = null;
-      }
-    }
-    function showInterpret(kind) {
-      if (shownBox === kind) return;
-      shownBox = kind;
-      setBox(kind, true, false);
-      streamInto(kind);
-    }
-    function setStatus(idx) {
-      if (statusIdx === idx && status.getAttribute("data-i18n") === "entry.principle.status.nav." + idx) return;
-      statusIdx = idx;
-      copy(status, "entry.principle.status.nav." + idx);
-    }
-    function applySceneChrome(n, mag) {
-      step = n;
-      var scene = SCENES[n];
-      copy(phase, "entry.principle.nav.s" + (scene.stage + 1));
-      zoom.textContent = magText(mag);
-      scaleFor(mag);
-      root.dataset.phase = String(scene.stage);
-      root.querySelectorAll("[data-hp-steps-nav] [data-step]").forEach(function (li) {
-        var s = Number(li.dataset.step);
-        li.classList.toggle("is-on", s === scene.stage);
-        li.classList.toggle("is-done", s < scene.stage);
-      });
-      zoomIn.disabled = !ready || n >= SCENES.length - 1;
-      zoomOut.disabled = !ready || n <= 0;
-      if (scene.kind === "zoom") {
-        setStatus(mag >= 20 ? scene.statusHigh : scene.statusLow);
-      } else {
-        setStatus(scene.status);
-      }
-      if (scene.both) {
-        stopStream();
-        shownBox = null;
-        setBox("a", true, true);
-        setBox("b", true, true);
-        streams.a.textContent = t("entry.principle.pin.a");
-        streams.b.textContent = t("entry.principle.pin.b");
-      } else if (!scene.box || mag < 35) {
-        setBox("a", false);
-        setBox("b", false);
-        shownBox = null;
-        stopStream();
-      } else if (scene.box) {
-        setBox(scene.box === "a" ? "b" : "a", false);
-      }
-    }
-    function frameOf(n, elapsedMs) {
-      var scene = SCENES[n];
-      if (scene.kind === "wide") {
-        return {
-          src: scene.src,
-          wide: true,
-          scale: scene.scale || 1,
-          ox: scene.ox,
-          oy: scene.oy,
-          mag: scene.mag,
-          atEnd: elapsedMs >= scene.d
-        };
-      }
-      var stack = scene.stack;
-      var mag0 = stack[0].mag;
-      var mag1 = stack[stack.length - 1].mag;
-      var mag = mag0;
-      if (elapsedMs > SETTLE_MS) {
-        var k = clamp((elapsedMs - SETTLE_MS) / scene.zoom, 0, 1);
-        mag = mag0 * Math.pow(mag1 / mag0, ease(k));
-      }
-      var layer = pickLayer(stack, mag);
-      return {
-        src: layer.src,
-        wide: false,
-        scale: layer.scale,
-        mag: mag,
-        atEnd: elapsedMs >= SETTLE_MS + scene.zoom,
-        holdEnd: elapsedMs >= SETTLE_MS + scene.zoom + scene.hold
-      };
-    }
-    function paintScene(n, elapsedMs) {
-      var fr = frameOf(n, elapsedMs);
-      showFrame(fr);
-      // Prepare the next layer only after the current frame has been installed.
-      var stack = SCENES[n].stack;
-      if (stack) {
-        var next = stack[pickLayer(stack, fr.mag).idx + 1];
-        if (next) prefetch(next.src);
-      }
-      applySceneChrome(n, fr.mag);
-      var scene = SCENES[n];
-      if (scene.box && fr.atEnd && elapsedMs >= SETTLE_MS + scene.zoom + BOX_DELAY_MS) {
-        showInterpret(scene.box);
-      }
-      return fr;
-    }
-    function sceneDuration(n) {
-      var scene = SCENES[n];
-      if (scene.kind === "wide") return scene.d + (n === SCENES.length - 1 ? LOOP_HOLD_MS : 0);
-      return SETTLE_MS + scene.zoom + scene.hold;
-    }
-    function stopLoop() {
-      playing = false;
-      if (raf) { window.clearTimeout(raf); raf = 0; }
-      last = 0;
-    }
-    function tick() {
-      if (!playing) return;
-      var now = Date.now();
-      if (last) elapsed += now - last;
-      last = now;
-      paintScene(step, elapsed);
-      if (elapsed >= sceneDuration(step)) {
-        elapsed = 0;
-        if (step === SCENES.length - 1) {
-          setBox("a", false);
-          setBox("b", false);
-          paintScene(0, 0);
-        } else {
-          paintScene(step + 1, 0);
-        }
-      }
-      raf = window.setTimeout(tick, TICK_MS);
-    }
-    function start() {
-      if (playing || !ready || manual) return;
-      if (motion.matches) {
-        applyReducedMotion();
-        return;
-      }
-      started = true;
-      playing = true;
-      last = Date.now();
-      raf = window.setTimeout(tick, TICK_MS);
-    }
-    function applyReducedMotion() {
-      stopLoop();
-      started = true;
-      paintScene(SCENES.length - 1, SCENES[SCENES.length - 1].d);
-    }
-    function manualZoom(dir) {
-      if (!ready) return;
-      autoResume = false;
-      started = true;
-      stopLoop();
-      manual = true;
-      stopStream();
-      var n = clamp(step + dir, 0, SCENES.length - 1);
-      var scene = SCENES[n];
-      var elaps = scene.kind === "zoom" ? SETTLE_MS + scene.zoom + BOX_DELAY_MS + 40 : scene.d;
-      paintScene(n, elaps);
-      copy(status, "entry.principle.manual");
-    }
-    zoomIn.addEventListener("click", function () { manualZoom(1); });
-    zoomOut.addEventListener("click", function () { manualZoom(-1); });
-    function visibility() {
-      if (inView && !document.hidden && !ready && !loading) loadMedia();
-      if (!inView || document.hidden) {
-        if (playing) { autoResume = true; stopLoop(); }
-        stopStream();
-        if (shownBox) streams[shownBox].textContent = t("entry.principle.review." + shownBox);
-      } else if (autoResume && !manual) {
-        autoResume = false;
-        start();
-      } else if (!started) {
-        start();
-      }
-    }
-    document.addEventListener("visibilitychange", visibility);
-    var stageEl = root.querySelector(".slide-stage");
-    function stageVisible() {
-      var r = stageEl.getBoundingClientRect();
-      var vis = Math.max(0, Math.min(r.bottom, window.innerHeight) - Math.max(r.top, 0));
-      return r.height > 0 && vis / r.height >= 0.4;
-    }
-    if ("IntersectionObserver" in window) {
-      var observer = new IntersectionObserver(function (entries) {
-        inView = entries[0].isIntersecting && entries[0].intersectionRatio >= 0.4;
-        visibility();
-      }, { threshold: [0, 0.4] });
-      observer.observe(stageEl);
-    }
-    if (!("IntersectionObserver" in window)) {
-      window.addEventListener("scroll", function () { inView = stageVisible(); visibility(); }, { passive: true });
-      window.addEventListener("resize", function () { inView = stageVisible(); visibility(); });
-    }
-    if (stageVisible()) inView = true;
-    document.addEventListener("hp-lang-change", function () {
-      if (manual) copy(status, "entry.principle.manual");
-      else if (ready && started) {
-        copy(status, "entry.principle.status.nav." + statusIdx);
-        copy(phase, "entry.principle.nav.s" + (SCENES[step].stage + 1));
-      } else copy(status, ready ? "entry.principle.status.idle" : "entry.principle.loading");
-      stopStream();
-      if (shownBox) streams[shownBox].textContent = t("entry.principle.review." + shownBox);
-      if (SCENES[step] && SCENES[step].both) {
-        streams.a.textContent = t("entry.principle.pin.a");
-        streams.b.textContent = t("entry.principle.pin.b");
-      }
-    });
-
-    function loadMedia() {
-      loading = true;
-      // Lock one resolution for this visit so every layer has the same pixel grid.
-      // Data Saver uses the compact stack; all layers decode before playback.
-      var compact = navigator.connection && navigator.connection.saveData;
-      imageWidth = compact || stageEl.clientWidth * Math.min(window.devicePixelRatio || 1, 2) <= 640 ? 640 : 1024;
-      copy(status, "entry.principle.loading");
-      var urls = ["tcga-session-base.jpg"];
-      [LEFT, UPPER, RIGHT].forEach(function (stack) {
-        stack.forEach(function (s) { urls.push(s.src); });
-      });
-      function loadImage(name) {
-        return new Promise(function (resolve, reject) {
-          var im = new Image();
-          im.onload = function () {
-            var decoded = im.decode ? im.decode() : Promise.resolve();
-            decoded.then(function () {
-              resolve();
-            }, reject);
-          };
-          im.onerror = reject;
-          im.src = mediaUrl(name);
-        });
-      }
-      // Bound decode concurrency to keep image preparation responsive on small devices.
-      var pending = 0;
-      function loadNext() {
-        if (pending >= urls.length) return Promise.resolve();
-        return loadImage(urls[pending++]).then(loadNext);
-      }
-      Promise.all([loadNext(), loadNext()]).then(function () {
-        ready = true;
-        paintScene(0, 0);
-        copy(status, "entry.principle.status.idle");
-        visibility();
-      }).catch(function () { copy(status, "entry.principle.load.error"); });
-    }
-    copy(status, "entry.principle.loading");
-    visibility();
+  function loop(points) {
+    const n = points.length;
+    const mid = (a,b) => `${fmt((a[0]+b[0])/2)} ${fmt((a[1]+b[1])/2)}`;
+    let d = 'M'+mid(points[n-1],points[0]);
+    for(let i=0;i<n;i++) d+='Q'+points[i].map(fmt).join(' ')+' '+mid(points[i],points[(i+1)%n]);
+    return d+'Z';
   }
+  const defs = node('defs',{},svg);
+  const wash = node('radialGradient',{id:compact?'hero-wash':'entry-wash',cx:'40%',cy:'30%',r:'80%'},defs);
+  node('stop',{offset:'0','stop-color':'#e8b9cf'},wash);
+  node('stop',{offset:'1','stop-color':'#ce8aad'},wash);
+  const camera = node('g',{'data-camera':''},svg);
+  node('rect',{x:-100,y:-100,width:1100,height:900,fill:compact?'url(#hero-wash)':'url(#entry-wash)'},camera);
+  const stroma=node('g',{'data-stroma':''},camera);
+  // Fine curved collagen and sparse spindle-shaped nuclei in the spaces between glands.
+  for(let i=0;i<(compact?180:850);i++) {
+    const x=between(-30,930),y=between(-30,710),a=between(0,180);
+    node('path',{d:`M${fmt(x)} ${fmt(y)}q${fmt(between(-8,8))} ${fmt(between(-8,8))} ${fmt(between(10,25))} ${fmt(between(-10,10))}`,fill:'none',stroke:choose(['#fae5e7','#bd789e','#e8b2c7']), 'stroke-width':fmt(between(.4,1.1)),opacity:'.65'},stroma);
+    if(i%3===0) node('ellipse',{cx:fmt(x),cy:fmt(y),rx:fmt(between(1,1.8)),ry:fmt(between(2.4,4)),fill:choose(['#975184','#864171','#ac608d']),transform:`rotate(${fmt(a)} ${fmt(x)} ${fmt(y)})`,opacity:'.7'},stroma);
+  }
+  const glands=node('g',{'data-glands':''},camera);
+  const centers=[];
+  // Pack unequal gland footprints organically; cell noise follows each gland's wall.
+  const footprints=[{id:'region-a',x:260,y:235,r:49},{id:'region-b',x:650,y:445,r:47}];
+  for(let trial=0;trial<14000&&footprints.length<90;trial++) {
+    const r=trial<2200?between(38,58):between(23,38);
+    const x=between(-18,918),y=between(-18,698);
+    if(footprints.every(c=>Math.hypot(x-c.x,y-c.y)>r+c.r+between(1,5)))footprints.push({id:'gland-'+footprints.length,x,y,r});
+  }
+  for(const footprint of footprints) {
+    const cx=footprint.x,cy=footprint.y;
+    const rx=footprint.r*between(.91,1.04),ry=footprint.r*between(.8,1.02),rotation=between(-85,85);
+    const id=footprint.id;
+    const g=node('g',{id:(compact?'hero-':'demo-')+id,'data-gland':'',transform:`translate(${fmt(cx)} ${fmt(cy)}) rotate(${fmt(rotation)})`},glands);
+    centers.push({id,x:cx,y:cy});
+    const phase=between(0,6.28),waves=random()>.6?3:2;
+    function shape(a,r) {
+      const warp=1+.065*Math.sin(waves*a+phase)+.035*Math.sin(5*a-phase);
+      return [rx*r*Math.cos(a)*warp,ry*r*Math.sin(a)*warp];
+    }
+    const outer=Array.from({length:24},(_,i)=>shape(i*Math.PI/12,1));
+    node('path',{d:loop(outer),fill:choose(['#c980a2','#c579a0','#d18aa9','#bc7096']),stroke:'#fff0ec','stroke-width':2.1},g);
+    node('path',{d:loop(outer),fill:'none',stroke:'#a45185','stroke-width':.8},g);
+    const count=Math.floor(compact?between(15,20):between(25,34));
+    const angles=Array.from({length:count},(_,i)=>2*Math.PI*(i+between(-.16,.16))/count);
+    const inner=between(.23,.35);
+    // Epithelial cells form a radial wall, with pale apical vacuoles and darker basal nuclei.
+    for(let i=0;i<count;i++) {
+      const a=angles[i], b=i===count-1?angles[0]+Math.PI*2:angles[i+1], m=(a+b)/2;
+      const o1=shape(a,.96),o2=shape(b,.96),i1=shape(a,inner),i2=shape(b,inner);
+      const cytoplasm=`M${o1.map(fmt).join(' ')}Q${shape(m,1.02).map(fmt).join(' ')} ${o2.map(fmt).join(' ')}L${i2.map(fmt).join(' ')}Q${shape(m,inner*.86).map(fmt).join(' ')} ${i1.map(fmt).join(' ')}Z`;
+      node('path',{d:cytoplasm,fill:choose(['#c47da3','#ce8eae','#b96f99','#cb84a7','#b36594']),stroke:'#eabdd0','stroke-width':.48},g);
+      const [nx,ny]=shape(m+between(-.025,.025),between(.73,.83));
+      const nuclearAngle=m*180/Math.PI-90+between(-17,17);
+      const nucleus=node('ellipse',{cx:fmt(nx),cy:fmt(ny),rx:fmt(between(1.65,2.55)),ry:fmt(between(3.6,5.7)),fill:choose(['#6c326b','#803e78','#8e457f','#74336e']),stroke:'#ad6393','stroke-width':.35,transform:`rotate(${fmt(nuclearAngle)} ${fmt(nx)} ${fmt(ny)})`,'data-nucleus':''},g);
+      if(!compact&&random()>.4) node('ellipse',{cx:fmt(nx+.35),cy:fmt(ny-.6),rx:.65,ry:.9,fill:'#d899c2',opacity:'.6'},g);
+      if(!compact&&random()>.16) {
+        const [vx,vy]=shape(m,between(.43,.55));
+        node('ellipse',{cx:fmt(vx),cy:fmt(vy),rx:fmt(between(2.5,4.2)),ry:fmt(between(5.1,8.3)),fill:choose(['#f5e5e8','#f7ecec','#edd2df','#f0dce4']),stroke:'#e8b5cf','stroke-width':.55,transform:`rotate(${fmt(m*180/Math.PI-90+between(-10,10))} ${fmt(vx)} ${fmt(vy)})`},g);
+      }
+    }
+    const lumen=Array.from({length:16},(_,i)=>shape(i*Math.PI/8,inner*between(.78,1.14)));
+    node('path',{d:loop(lumen),fill:'#fff3ef',stroke:'#efd0dc','stroke-width':1},g);
+  }
+  // These are illustration coordinates, not patient observations or physical measurements.
+  const a=centers.find(c=>c.id==='region-a'),b=centers.find(c=>c.id==='region-b');
+  const annotations=node('g',{'data-annotations':''},camera);
+  for(const [key,c] of [['a',a],['b',b]]) {
+    const group=node('g',{'data-mark':key,visibility:'hidden'},annotations);
+    node('rect',{x:fmt(c.x-49),y:fmt(c.y-48),width:98,height:96,rx:5,fill:'none',stroke:'#007AFF','stroke-width':2,'vector-effect':'non-scaling-stroke'},group);
 
-  function boot() {
-    if (document.documentElement.dataset.page === "entry") {
-      document.querySelectorAll("[data-hp-stage]").forEach(init);
+  }
+  return {svg,camera,a,b};
+};
+
+function initEntryTissue(root) {
+  'use strict';
+  const {svg,a,b}=window.HP_EntryTissue(root.querySelector('#tissue'),false);
+  const $=id=>root.querySelector('#'+id);
+  const t=key=>window.HP_I18N.t('entry.svg.'+key);
+  const all={x:450,y:340,w:900};
+  const local=c=>({x:c.x,y:c.y,w:340});
+  const detail=c=>({x:c.x+3,y:c.y-2,w:140});
+  const scenes=[
+    {camera:all,travel:0,hold:1900,key:0},
+    {camera:local(a),travel:1600,hold:1000,key:1},
+    {camera:detail(a),travel:1600,hold:1500,key:2},
+    {camera:detail(a),travel:0,hold:6200,key:3,note:'a'},
+    {camera:local(b),travel:2800,hold:1100,key:4,via:{x:(a.x+b.x)/2,y:(a.y+b.y)/2,w:740}},
+    {camera:detail(b),travel:1700,hold:1500,key:5},
+    {camera:detail(b),travel:0,hold:6200,key:6,note:'b'},
+    {camera:all,travel:2200,hold:4200,key:7}
+  ];
+  $('steps').replaceChildren(...scenes.map(()=>document.createElement('li')));
+
+  function placeReview(frame,h) {
+    const bounds=svg.getBoundingClientRect();
+    const scale=Math.max(bounds.width/frame.w,bounds.height/h);
+    for(const [key,point] of [['a',a],['b',b]]) {
+      const pin=$('review-'+key);
+      pin.hidden=index!==7;
+      if(pin.hidden)continue;
+      const x=bounds.width/2+(point.x-frame.x)*scale;
+      const y=bounds.height/2+(point.y+48-frame.y)*scale+7;
+      pin.style.left=Math.max(8,Math.min(bounds.width-pin.offsetWidth-8,x-pin.offsetWidth/2))+'px';
+      pin.style.top=Math.max(8,Math.min(bounds.height-pin.offsetHeight-8,y))+'px';
     }
   }
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
-  else boot();
+  function duration(scene){return scene.travel+(scene.note?Math.max(scene.hold,350+60*(t('note.'+scene.note).length+t('observation.'+scene.note).length)+1600):scene.hold);}
+  const total=()=>scenes.reduce((sum,s)=>sum+duration(s),0);
+  let index=0,elapsed=0,last=0,raf=0,manual=false;
+  const motion=matchMedia('(prefers-reduced-motion: reduce)');
+  let paused=motion.matches,visible=true;
+  const smooth=k=>k*k*(3-2*k);
+  function mix(from,to,k) {
+    k=smooth(Math.max(0,Math.min(1,k)));
+    return {x:from.x+(to.x-from.x)*k,y:from.y+(to.y-from.y)*k,w:from.w*Math.pow(to.w/from.w,k)};
+  }
+  function paint() {
+    const scene=scenes[index],from=index?scenes[index-1].camera:all;
+    const fraction=scene.travel?Math.min(elapsed/scene.travel,1):1;
+    let frame=scene.via&&fraction<.5?mix(from,scene.via,fraction*2):scene.via?mix(scene.via,scene.camera,(fraction-.5)*2):mix(from,scene.camera,fraction);
+    const h=frame.w*680/900;
+    svg.setAttribute('viewBox',`${frame.x-frame.w/2} ${frame.y-h/2} ${frame.w} ${h}`);
+    svg.dataset.scene=String(index);
+    svg.querySelector('[data-mark="a"]').setAttribute('visibility',index>=3?'visible':'hidden');
+    svg.querySelector('[data-mark="b"]').setAttribute('visibility',index>=6?'visible':'hidden');
+    // Only the camera changes each frame. Thousands of cell nodes stay untouched.
+    if($('phase').dataset.scene!==String(index)) {
+      $('phase').dataset.scene=String(index);
+      $('phase').textContent=t('scene.'+index+'.title');$('status').textContent=t('scene.'+index+'.body');$('location').textContent=t('scene.'+index+'.where');
+      $('steps').querySelectorAll('li').forEach((li,i)=>{li.textContent=t('scene.'+i+'.where');li.classList.toggle('active',i===index);li.classList.toggle('done',i<index);});
+      $('count').textContent=`${String(index+1).padStart(2,'0')} / 08`;
+      $('previous').disabled=index===0;$('next').disabled=index===scenes.length-1;
+      $('note').hidden=!scene.note;
+      if(scene.note){$('note-id').textContent=scene.note==='a'?'01':'02';$('note-title').textContent='';$('note-body').textContent='';}
+    }
+    if(scene.note) {
+      const full=t('observation.'+scene.note);
+      const title=t('note.'+scene.note);
+      const count=motion.matches&&!manual?title.length+full.length:Math.max(0,Math.floor((elapsed-350)/60));
+      $('note-title').textContent=title.slice(0,count);
+      $('note-body').textContent=full.slice(0,Math.max(0,count-title.length));
+      $('note-title').classList.toggle('streaming',count<title.length);
+      $('note-body').classList.toggle('streaming',count>=title.length&&count<title.length+full.length);
+    } else $('note-body').classList.remove('streaming');
+    placeReview(frame,h);
+    const spent=scenes.slice(0,index).reduce((sum,s)=>sum+duration(s),0)+elapsed;
+    $('progress').style.width=Math.min(100,spent/total()*100)+'%';
+    $('toggle').textContent=t(paused?'resume':'pause');
+  }
+  function tick(now) {
+    raf=0;
+    if(paused||!visible||document.hidden)return;
+    if(last)elapsed+=Math.min(now-last,100);
+    last=now;
+    if(elapsed>=duration(scenes[index])){
+      if(manual)paused=true;
+      else {index=(index+1)%scenes.length;elapsed=0;}
+    }
+    paint();raf=requestAnimationFrame(tick);
+  }
+  function schedule() {
+    cancelAnimationFrame(raf);raf=0;last=0;
+    if(!paused&&visible&&!document.hidden)raf=requestAnimationFrame(tick);
+  }
+  function jump(to) {manual=true;index=to;elapsed=scenes[index].travel;paused=!scenes[index].note;paint();schedule();}
+  $('previous').onclick=()=>jump(Math.max(0,index-1));
+  $('next').onclick=()=>jump(Math.min(scenes.length-1,index+1));
+  $('toggle').onclick=()=>{paused=!paused;if(!paused)manual=false;paint();schedule();};
+  $('replay').onclick=()=>{index=0;elapsed=0;paused=motion.matches;manual=false;paint();schedule();};
+  document.addEventListener('visibilitychange',schedule);
+  document.addEventListener('hp-lang-change',()=>{$('phase').dataset.scene='';paint();});
+  new ResizeObserver(()=>paint()).observe(svg);
+  if('IntersectionObserver' in window)new IntersectionObserver(entries=>{visible=entries[0].isIntersecting;schedule();},{threshold:0}).observe(svg);
+  motion.addEventListener('change',()=>{if(motion.matches){paused=true;index=scenes.length-1;elapsed=scenes[index].travel;}else if(!manual)paused=false;paint();schedule();});
+  if(motion.matches){index=scenes.length-1;elapsed=scenes[index].travel;}
+  paint();schedule();
+ }
+(function boot(){
+  if(document.documentElement.dataset.page!=='entry')return;
+  const hero=document.querySelector('#hero-tissue');
+  if(hero)window.HP_EntryTissue(hero,true);
+  const root=document.querySelector('[data-hp-stage]');
+  if(!root)return;
+  if('IntersectionObserver' in window){
+    const observer=new IntersectionObserver(entries=>{if(entries[0].isIntersecting){observer.disconnect();initEntryTissue(root);}}, {rootMargin:'160px'});
+    observer.observe(root);
+  }else initEntryTissue(root);
 })();

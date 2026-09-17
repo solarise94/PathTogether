@@ -239,7 +239,9 @@ def test_verify_email_get_does_not_consume(monkeypatch):
     assert r.status_code == 200
     body = r.get_data(as_text=True)
     assert "设置密码" in body
-    assert "邀请码" in body
+    # SER-8：验证流程从「邀请码激活」改为「申请测试」——研究方向单选组
+    assert "research_direction" in body
+    assert "申请测试" in body
     row = _mail_job_row(out["token"])
     assert row["consumed_at"] is None and row["status"] == "queued"
     # 无效 token：状态页（不 500）

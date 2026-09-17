@@ -6,9 +6,10 @@
   <title>HistoPilot</title>
   <!-- 空 data URI favicon：避免未登录浏览器自动 GET /favicon.ico 撞鉴权闸 -->
   <link rel="icon" href="data:," />
-  <link rel="stylesheet" href="/static/entry.css?v=20260915l" />
-  <script defer src="/static/i18n.js?v=20260915l"></script>
-  <script defer src="/static/entry.js?v=20260915l"></script>
+  <link rel="stylesheet" href="/static/entry.css?v=20260916svg1" />
+  <script defer src="/static/i18n.js?v=20260916svg1"></script>
+  <script defer src="/static/entry.js?v=20260916svg1"></script>
+  <script defer src="/static/entry-auth.js?v=20260916auth2"></script>
 </head>
 <body id="top">
   <a class="skip-link" href="#main" data-i18n="entry.skip">跳到主要内容</a>
@@ -27,10 +28,10 @@
         </li>
         <li>
           <a href="https://me.solarise94.fun" target="_blank"
-             rel="noopener noreferrer"><span data-i18n="entry.nav.home">主页</span><span class="ext" aria-hidden="true">↗</span></a>
+             rel="noopener noreferrer"><span data-i18n="entry.nav.home">关于我</span><span class="ext" aria-hidden="true">↗</span></a>
         </li>
         <li>
-          <a href="mailto:solarise94@gmail.com"><span data-i18n="entry.nav.email">邮箱</span></a>
+          <a href="mailto:solarise94@gmail.com"><span data-i18n="entry.nav.email">联系我</span></a>
         </li>
       </ul>
       <div class="topbar-actions">
@@ -53,9 +54,9 @@
     <!-- ================= Hero：左文右产品 mock ================= -->
     <section class="hero">
       <div class="hero-copy">
-        <p class="badge"><span data-i18n="entry.badge">研究软件 · 不用于临床诊断</span></p>
-        <h1 data-i18n="entry.hero.title">和 AI 一起，看看这张切片。</h1>
-        <p class="lead" data-i18n="entry.hero.lead">先在低倍下看组织结构，找到目标区域，再放大确认细节。HistoPilot 帮你导航、整理观察结果，你可以随时回看。</p>
+        <p class="badge"><span data-i18n="entry.badge">AI 导航 · 插件分析 · 团队协作</span></p>
+        <h1 data-i18n="entry.hero.title">与 AI 一起，观察病理切片。</h1>
+        <p class="lead" data-i18n="entry.hero.lead">让 AI 协助寻找目标区域与可疑病理区域，逐步放大观察、记录位置，再利用测量插件开展计量分析，帮助研究者更快推进病理研究。</p>
         <div class="hero-actions">
           <a class="btn btn-primary" href="/demo" data-i18n="entry.demo">直接体验 Demo</a>
         </div>
@@ -66,29 +67,26 @@
         {% endif %}
       </div>
 
-      <!-- TCGA 公开切片截图；装饰性预览，不包含病例标签 -->
+      <!-- 与下方演示一致的轻量组织结构示意 -->
       <div class="mock" aria-hidden="true">
         <div class="mock-bar">
           <span class="lights"><i></i><i></i><i></i></span>
-          <span class="mock-title" data-i18n="entry.mock.title">TCGA-49-AAR4 · HistoPilot</span>
+          <span class="mock-title" data-i18n="entry.mock.title">HistoPilot · AI 病理分析</span>
         </div>
         <div class="mock-body">
           <div class="tissue">
-            <img class="hero-slide" src="/static/entry-media/tcga-session-low-960.webp"
-                 srcset="/static/entry-media/tcga-session-low-480.webp 480w, /static/entry-media/tcga-session-low-960.webp 960w"
-                 sizes="(max-width: 720px) calc(100vw - 32px), (max-width: 1079px) 60vw, 340px"
-                 width="960" height="960" fetchpriority="high" decoding="async" alt="" />
-            <span class="scale">TCGA-49-AAR4 · ≈2×</span>
+            <svg id="hero-tissue" class="hero-slide" viewBox="0 0 900 680" preserveAspectRatio="xMidYMid slice" aria-hidden="true"></svg>
+            <span class="scale" data-i18n="entry.principle.mock.note">组织形态与导航流程示意</span>
           </div>
           <div class="agent">
             <div class="agent-head"><span class="pulse"></span><span>Agent</span></div>
             <ol>
-              <li class="active"><span class="n">1</span><span data-i18n="entry.mock.step1">低倍定位组织区域</span></li>
-              <li><span class="n">2</span><span data-i18n="entry.mock.step2">10× → 40× 放大查看</span></li>
-              <li><span class="n">3</span><span data-i18n="entry.mock.step3">记录观察，标注待复核</span></li>
-              <li><span class="n">4</span><span data-i18n="entry.mock.step4">整理结果，回看位置</span></li>
+              <li class="active"><span class="n">1</span><span data-i18n="entry.mock.step1">寻找目标与可疑区域</span></li>
+              <li><span class="n">2</span><span data-i18n="entry.mock.step2">放大观察组织与细胞</span></li>
+              <li><span class="n">3</span><span data-i18n="entry.mock.step3">标注位置，整理观察</span></li>
+              <li><span class="n">4</span><span data-i18n="entry.mock.step4">调用测量插件开展分析</span></li>
             </ol>
-            <div class="agent-foot" data-i18n="entry.principle.mock.note">TCGA 公开切片 · 操作示例</div>
+            <div class="agent-foot" data-i18n="entry.principle.mock.note">组织形态与导航流程示意</div>
           </div>
         </div>
       </div>
@@ -106,56 +104,33 @@
         </div>
         <div class="how-card">
           <span class="no">02</span>
-          <h3 data-i18n="entry.how.s2.title">找到值得细看的地方</h3>
-          <p data-i18n="entry.how.s2.body">先低倍看结构，再放大确认细节；需要时调用分析插件。</p>
+          <h3 data-i18n="entry.how.s2.title">定位目标，观察细节</h3>
+          <p data-i18n="entry.how.s2.body">让 AI 协助寻找目标区域与可疑病理区域，放大查看并保留观察位置。</p>
         </div>
         <div class="how-card">
           <span class="no">03</span>
-          <h3 data-i18n="entry.how.s3.title">协作与分享</h3>
-          <p data-i18n="entry.how.s3.body">登录后上传自己的切片、标注、评论，按权限分享。</p>
+          <h3 data-i18n="entry.how.s3.title">计量分析，协作复核</h3>
+          <p data-i18n="entry.how.s3.body">通过测量插件开展计量分析，与同事共享标注、讨论观察结果。</p>
         </div>
       </div>
       <h3 id="principle" class="demo-heading" data-i18n="entry.principle.title">Agent 怎么读一张切片</h3>
-      <p class="section-lead" data-i18n="entry.principle.lead">跟着一次真实会话，看看 Agent 怎样移动视野、逐级放大，再记录观察结果。</p>
+      <p class="section-lead" data-i18n="entry.principle.lead">从全景定位到局部观察，再标注并切换区域，看看 AI 如何协助你逐步探索切片。</p>
 
-      <!-- 真实 TCGA-49-AAR4 会话（sess_f38dfd3facf64f25）自动循环演示。
-           2×/10×/20×/40× 为同一中心的实切图；放大过程中只在 FOV 重合时换图。
-           进入可见区自动播放，末拍停约 3 秒后循环；+/− 手动缩放。 -->
-      <div class="demo-stage" data-hp-stage>
-        <div class="demo-toolbar">
-          <strong data-hp-phase data-i18n="entry.principle.nav.s1">概览</strong>
-          <span class="demo-loop-hint" data-i18n="entry.principle.loop.hint">自动循环演示 · +/− 可手动缩放</span>
-        </div>
-
-        <div class="demo-body">
-          <div class="slide-stage">
-            <div class="shot-viewport" data-hp-viewport>
-              <img class="shot-img" data-hp-img-from alt="" />
-              <img class="shot-img" data-hp-img-to alt="" />
-              <div class="anno-box anno-a" data-hp-box="a">
-                <span class="anno-caption"><span data-hp-stream></span></span>
-              </div>
-              <div class="anno-box anno-b" data-hp-box="b">
-                <span class="anno-caption"><span data-hp-stream></span></span>
-              </div>
-            </div>
-            <span class="scale"><i data-hp-scale-bar></i><span data-hp-scale>2 mm</span></span>
-            <div class="zoomctl"><button type="button" data-hp-zoom-in disabled data-i18n-aria="entry.zoom.in" aria-label="放大">+</button><button type="button" data-hp-zoom-out disabled data-i18n-aria="entry.zoom.out" aria-label="缩小">−</button><span class="zlvl" data-hp-zoom>≈0.5×</span></div>
-          </div>
-
-          <aside class="demo-panel">
-            <p class="demo-status" role="status" data-hp-status data-i18n="entry.principle.status.idle">正在加载切片图像…</p>
-            <ol class="demo-steps" data-hp-steps-nav>
-              <li data-step="0" data-i18n="entry.principle.nav.s1">概览</li>
-              <li data-step="1" data-i18n="entry.principle.nav.s2">左块复核</li>
-              <li data-step="2" data-i18n="entry.principle.nav.s3">右上观察</li>
-              <li data-step="3" data-i18n="entry.principle.nav.s4">右下复核</li>
-              <li data-step="4" data-i18n="entry.principle.nav.s5">回看</li>
-            </ol>
-            <p class="demo-source">TCGA-49-AAR4 · TCGA-LUAD</p>
-            <p class="demo-footnote" data-i18n="entry.principle.footnote">真实会话节选 · 已压缩等待时间。模型观察结果需人工复核。</p>
-          </aside>
-        </div>
+      <div class="tissue-demo">
+<section class="viewer" data-hp-stage data-i18n-aria="entry.svg.aria" aria-label="组织导航流程示意">
+<div class="toolbar"><span><i></i><span data-i18n="entry.svg.heading">组织导航</span></span><span class="schematic"><span data-i18n="entry.svg.schematic">形态与流程示意 · 非真实切片</span></span></div>
+<div class="body"><div class="canvas">
+<svg id="tissue" viewBox="0 0 900 680" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="svg-title svg-desc"><title id="svg-title" data-i18n="entry.svg.image.title">腺体组织 SVG 示意图</title><desc id="svg-desc" data-i18n="entry.svg.image.desc">多个大小与形状不同的腺体围绕腔隙排列。细胞与细胞核有适度随机变化，腺体之间分布纤维状间质。</desc></svg>
+<div class="corner"><span id="location" data-i18n="entry.svg.scene.0.where">全景</span><span class="dot">·</span><span><span data-i18n="entry.svg.view">示意视野</span></span></div>
+<div class="note" id="note" hidden><span id="note-id">01</span><div><strong id="note-title"></strong><p id="note-body"></p></div></div>
+<div class="review-pin" id="review-a" hidden><strong><span data-i18n="entry.svg.pin.a">01 · 区域 A</span></strong><span><span data-i18n="entry.svg.summary.a">细胞环绕腔隙排列</span></span></div>
+<div class="review-pin" id="review-b" hidden><strong><span data-i18n="entry.svg.pin.b">02 · 区域 B</span></strong><span><span data-i18n="entry.svg.summary.b">腺体与周围间质</span></span></div>
+</div><aside><div class="agent-label"><span class="agent-dot"></span>AGENT WALKTHROUGH</div><h2 id="phase" data-i18n="entry.svg.scene.0.title">先看看整体组织</h2><p id="status" role="status" data-i18n="entry.svg.scene.0.body">辨认腺体分布与腺体之间的间质，选择第一处观察区域。</p>
+<ol id="steps"><li>全景</li><li>局部 A</li><li>细节 A</li><li>标注 A</li><li>切换局部 B</li><li>细节 B</li><li>标注 B</li></ol>
+<div class="legend"><span><i class="nucleus"></i><span data-i18n="entry.svg.nucleus">细胞核</span></span><span><i class="lumen"></i><span data-i18n="entry.svg.lumen">腔隙</span></span><span><i class="mark"></i><span data-i18n="entry.svg.annotation">观察标注</span></span></div>
+<p class="aside-note"><span data-i18n="entry.svg.footnote">参考腺体组织的排列关系绘制。观察文字用于演示交互，不代表模型分析结果。</span></p></aside></div>
+<div class="controls" aria-label="演示控制"><div class="progress"><span id="progress"></span></div><span id="count">01 / 08</span><button id="previous" data-i18n-aria="entry.svg.previous" aria-label="上一步">←</button><button id="toggle"><span data-i18n="entry.svg.pause">暂停</span></button><button id="next" data-i18n-aria="entry.svg.next" aria-label="下一步">→</button><button id="replay"><span data-i18n="entry.svg.replay">重播 ↻</span></button></div>
+</section>
       </div>
     </section>
 
@@ -172,8 +147,8 @@
               <path d="M15.5 8.5 13 13l-4.5 2.5L11 11z"></path>
             </svg>
           </span>
-          <h3 data-i18n="entry.cap.1.title">AI 导航</h3>
-          <p data-i18n="entry.cap.1.body">从组织结构到局部细节，保留观察位置，方便回看。</p>
+          <h3 data-i18n="entry.cap.1.title">AI 区域导航</h3>
+          <p data-i18n="entry.cap.1.body">从全景到细节，协助寻找目标区域与可疑病理区域，保留可回看的观察路径。</p>
         </div>
         <div class="cap-card">
           <span class="icon" aria-hidden="true">
@@ -183,8 +158,8 @@
               <path d="m3 13 9 5 9-5"></path>
             </svg>
           </span>
-          <h3 data-i18n="entry.cap.2.title">协作 Viewer</h3>
-          <p data-i18n="entry.cap.2.body">和同事一起看切片、做标注、讨论并分享。</p>
+          <h3 data-i18n="entry.cap.2.title">标注与团队协作</h3>
+          <p data-i18n="entry.cap.2.body">在切片上记录位置与观察结果，与同事协作复核、讨论和分享。</p>
         </div>
         <div class="cap-card">
           <span class="icon" aria-hidden="true">
@@ -193,8 +168,8 @@
               <path d="M10 4a2 2 0 1 1 4 0v1h3a1 1 0 0 1 1 1v3h-1a2 2 0 1 0 0 4h1v3a1 1 0 0 1-1 1h-3v-1a2 2 0 1 0-4 0v1H7a1 1 0 0 1-1-1v-3H5a2 2 0 1 0 0-4h1V6a1 1 0 0 1 1-1h3V4Z"></path>
             </svg>
           </span>
-          <h3 data-i18n="entry.cap.3.title">自研分析插件</h3>
-          <p data-i18n="entry.cap.3.body">接入你部署的插件，完成计数或区域分析。</p>
+          <h3 data-i18n="entry.cap.3.title">测量与计量分析</h3>
+          <p data-i18n="entry.cap.3.body">接入测量和分析插件，按研究需求开展计数、测量与区域计量分析。</p>
         </div>
       </div>
     </section>
@@ -230,15 +205,17 @@
 
   </main>
 
+  {% include "_login_dialog.html" %}
+
   <!-- ================= 页脚 ================= -->
   <footer class="footer">
     <div class="footer-inner">
-      <p class="footer-note" data-i18n="entry.footer">仅用于研究、教学和软件演示，不用于临床诊断。</p>
+      <p class="footer-note" data-i18n="entry.footer">从区域定位到计量分析，协助研究者更快开展病理研究。</p>
       <nav class="footer-links" aria-label="页脚导航">
         <a href="/demo">Demo</a>
         <a href="https://me.solarise94.fun" target="_blank" rel="noopener noreferrer"
-           data-i18n="entry.nav.home">主页</a>
-        <a href="mailto:solarise94@gmail.com" data-i18n="entry.nav.email">邮箱</a>
+           data-i18n="entry.nav.home">关于我</a>
+        <a href="mailto:solarise94@gmail.com" data-i18n="entry.nav.email">联系我</a>
         <a href="https://github.com/solarise94/HistoPilot" target="_blank"
            rel="noopener noreferrer">HistoPilot</a>
         <a href="https://github.com/solarise94/PathTogether" target="_blank"

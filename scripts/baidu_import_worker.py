@@ -10,7 +10,12 @@
 fake）。与 spec §6.3 对齐：
 
 - ``BAIDU_IMPORT_WORKER=false`` 时拒绝启动（部署级总开关；其余值/缺省
-  视为允许运行——是否常驻由部署的进程管理决定）；
+  视为允许运行——是否常驻由部署的进程管理决定）。
+  注意与 ``docker_entry.sh`` 的口径差异：容器入口只在
+  ``BAIDU_IMPORT_WORKER=1/true/yes/on``（缺省 0）时拉起本脚本；而本
+  脚本自身把**空值/缺省当允许**，方便运维在容器外手动跑一轮排水
+  （``--once``）。两端故意不一致：入口 fail-closed，脚本宽松放行；
+  capabilities 暴露的 ``worker_enabled`` 与**入口**口径对齐。
 - ``BAIDU_ENUMERATION_ENABLED`` 关闭时**不再领取新枚举**（已接受任务
   继续收口/展示）；导入批次一经接受不受开关回退影响（已接受任务必须
   收口），批次执行的真实外部动作由 ``BAIDU_IMPORT_ENABLED`` 在创建时

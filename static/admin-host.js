@@ -147,6 +147,11 @@
     "admin.formatRequests.list": "admin:users:read",
     "admin.formatRequests.get": "admin:users:read",
     "admin.formatRequests.patch": "admin:users:write",
+    // SER-8：测试申请工单（待激活用户审批）。list 只读 → admin:users:read；
+    // review 是状态机写（原子激活/拒绝 + 额度 provisioning + 结果邮件）→
+    // admin:users:write，与 formatRequests.patch 同域。
+    "admin.testApplications.list": "admin:users:read",
+    "admin.testApplications.review": "admin:users:write",
   };
 
   // 参数 schema（§14.1：每方法白名单 + 类型/长度/枚举/范围；未声明属性
@@ -449,6 +454,32 @@
         admin_note: { type: "string", maxLength: 2000, nullable: true },
       },
       required: ["request_id", "business_status", "expected_version"],
+      additionalProperties: false,
+    },
+    // SER-8：测试申请。list 过滤项均可空（空=全部）；review 必填
+    // user_id+decision，ai_access 缺省由服务端按 true 处理。
+    "admin.testApplications.list": {
+      properties: {
+        status: {
+          type: "string",
+          enum: ["pending", "approved", "rejected"],
+          nullable: true,
+        },
+        direction: {
+          type: "string",
+          enum: ["model_plant", "model_animal", "clinical_pathology", "other"],
+          nullable: true,
+        },
+      },
+      additionalProperties: false,
+    },
+    "admin.testApplications.review": {
+      properties: {
+        user_id: _userIdSpec,
+        decision: { type: "string", enum: ["approved", "rejected"] },
+        ai_access: { type: "boolean", nullable: true },
+      },
+      required: ["user_id", "decision"],
       additionalProperties: false,
     },
   };
@@ -1142,6 +1173,28 @@
         body.admin_note = payload.admin_note;
       }
       return jsonWrite(url, "PATCH", body)(ctx);
+    },
+
+    // SER-8：测试申请工单。错误信封 {error:{code,message}} 由 backendError
+    // 原样透传（前端按 code 分流 default_allowance_unconfigured 等）。
+    "admin.testApplications.list": function (ctx, payload) {
+      var url = "/api/admin/v1/test-applications" + buildQuery({
+        status: payload.status, direction: payload.direction,
+      });
+      return ctx.fetchJson(url).then(function (res) {
+        if (!res.ok) throw backendError(url, res);
+        return res.body;
+      });
+    },
+
+    "admin.testApplications.review": function (ctx, payload) {
+      var url = "/api/admin/v1/test-applications/" +
+          pathId(payload.user_id, "user_id") + "/review";
+      var body = { decision: payload.decision };
+      if (payload.ai_access !== undefined && payload.ai_access !== null) {
+        body.ai_access = payload.ai_access;
+      }
+      return jsonWrite(url, "POST", body)(ctx);
     },
   };
 

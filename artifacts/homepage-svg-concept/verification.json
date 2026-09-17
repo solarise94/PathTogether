@@ -1,0 +1,18 @@
+{
+  "checks": [
+    "8 scenes",
+    "stable geometry during zoom",
+    "no raster requests",
+    "pause freezes camera",
+    "reduced motion",
+    "both annotations persist",
+    "mobile note bounds",
+    "no mobile overflow",
+    "repeatable seed",
+    "no JS errors"
+  ],
+  "payloadBytes": 21205,
+  "gzipPayloadBytes": 8992,
+  "exportedSvgBytes": 1425201,
+  "gzipSvgBytes": 264279
+}

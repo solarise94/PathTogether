@@ -72,7 +72,7 @@ STAGING_ROOT = os.environ.get("BAIDU_IMPORT_STAGING_DIR") or str(
 
 #: 不可重试的条目错误码（其余 failed 条目均可重试）
 NON_RETRYABLE_ERROR_CODES = frozenset(
-    {"share_invalid", "source_changed", "not_retryable"})
+    {"share_invalid", "source_changed", "not_retryable", "duplicate_filename"})
 
 #: 份额秘密加密 env（同 baidu_adapter.ENV_SHARE_SECRET_KEY）
 _ENV_SECRET = "BAIDU_SHARE_SECRET_KEY"
@@ -395,37 +395,65 @@ def claim_enumeration(worker_id="worker", lease_seconds=ENUMERATION_LEASE_SECOND
         conn.close()
 
 
-def heartbeat_enumeration(enumeration_id, worker_id="worker",
+def heartbeat_enumeration(enumeration_id, worker_id, lease_token,
                           lease_seconds=ENUMERATION_LEASE_SECONDS):
-    """枚举租约续期（活性由 lease_expires_at 表达；匹配 lease_owner）。"""
+    """只有持有当前领取令牌且枚举未过期的 worker 可以续租。"""
+    return _progress_enumeration(enumeration_id, worker_id, None,
+                                 lease_token, lease_seconds)
+
+
+def _progress_enumeration(enumeration_id, worker_id, scanned, lease_token,
+                          lease_seconds=ENUMERATION_LEASE_SECONDS):
+    """每页回写进度并续租；False 表示失去租约，None 表示暂时写库失败。"""
+    try:
+        conn = _connect()
+        try:
+            with pg_store.transaction(conn) as c:
+                with c.cursor() as cur:
+                    cur.execute(
+                        "UPDATE baidu_enumerations SET "
+                        "scanned_count=COALESCE(%s, scanned_count), "
+                        "lease_expires_at="
+                        "now() + (%s || ' seconds')::interval, "
+                        "updated_at=now() "
+                        "WHERE id=%s AND lease_owner=%s AND lease_token=%s "
+                        "AND state='enumerating' AND expires_at > now()",
+                        (scanned, str(int(lease_seconds)), enumeration_id,
+                         worker_id, lease_token))
+                    return cur.rowcount == 1
+        finally:
+            conn.close()
+    except Exception:
+        # 进度写入可重试；最终提交仍须重新检查令牌，不能绕过 fence。
+        return None
+
+
+def _finalize_enumeration(enumeration_id, *, worker_id, lease_token,
+                          state, complete, scanned, error_code=None,
+                          incomplete=None, counters=None, files=(), dirs=()):
+    """锁定当前领取令牌，原子提交候选与终态；失去租约返回 None。"""
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "UPDATE baidu_enumerations SET lease_expires_at="
-                    "now() + (%s || ' seconds')::interval, updated_at=now() "
-                    "WHERE id=%s AND lease_owner=%s AND state='enumerating'",
-                    (str(int(lease_seconds)), enumeration_id, worker_id))
-                return cur.rowcount == 1
-    finally:
-        conn.close()
-
-
-def _finalize_enumeration(enumeration_id, *, state, complete, scanned,
-                          candidates, error_code=None, incomplete=None,
-                          counters=None):
-    conn = _connect()
-    try:
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
+                    "SELECT id FROM baidu_enumerations WHERE id=%s "
+                    "AND lease_owner=%s AND lease_token=%s "
+                    "AND state='enumerating' AND expires_at > now() "
+                    "FOR UPDATE", (enumeration_id, worker_id, lease_token))
+                if cur.fetchone() is None:
+                    return None
+                # 兼容旧版本在候选提交后、终态提交前崩溃遗留的候选。
+                cur.execute("DELETE FROM baidu_candidates WHERE enumeration_id=%s",
+                            (enumeration_id,))
+                count = (_insert_candidates(cur, enumeration_id, files, dirs)
+                         if state == "ready" else 0)
                 sets = ["state=%s", "complete=%s", "scanned_count=%s",
                         "candidate_count=%s", "error_code=%s",
                         "incomplete_reason=%s", "updated_at=now()",
                         "lease_owner=NULL", "lease_token=NULL",
                         "lease_expires_at=NULL"]
-                args = [state, complete, scanned, candidates,
-                        error_code, incomplete]
+                args = [state, complete, scanned, count, error_code, incomplete]
                 if counters:
                     sets += ["transfer_calls=%s", "download_calls=%s",
                              "delete_calls=%s"]
@@ -435,6 +463,7 @@ def _finalize_enumeration(enumeration_id, *, state, complete, scanned,
                 cur.execute(
                     "UPDATE baidu_enumerations SET "
                     + ", ".join(sets) + " WHERE id=%s", tuple(args))
+                return count
     finally:
         conn.close()
 
@@ -529,13 +558,21 @@ def run_one_enumeration(claim_row, adapter):
     max_depth = int(claim_row["max_depth"] or DEFAULT_MAX_DEPTH)
     max_entries = int(claim_row["max_entries"] or DEFAULT_MAX_ENTRIES)
     deadline = time.monotonic() + ENUMERATION_TIMEOUT_SECONDS
+    worker_id = claim_row["lease_owner"]
+    lease_token = claim_row["lease_token"]
+
+    def abandon():
+        return get_enumeration(enum_id, claim_row["owner_user_id"])
+
+    if heartbeat_enumeration(enum_id, worker_id, lease_token) is False:
+        return abandon()
 
     before = adapter.counters()
     files, dirs = [], set()
     scanned = 0
     error_code = None
     incomplete = None
-    queue = [("", 0)]
+    queue = [("", 0)]  # 根目录：省略 --source-dir（适配器合同）
     visited = set()  # (dir_path, cursor)
 
     while queue and error_code is None:
@@ -569,11 +606,21 @@ def run_one_enumeration(claim_row, adapter):
                         error_code = "incomplete_limit"
                         incomplete = "max_depth"
                         break
-                    queue.append((rel, depth + 1))
+                    # CLI 路径合同（docs §7.1）：递归 --source-dir 必须用
+                    # CLI 返回的 path（/<分享内相对路径>，带前导 /）；
+                    # path 缺失时回退拼 relative_path（适配器侧还会归一）
+                    child = item.get("path")
+                    if not isinstance(child, str) or not child.strip():
+                        child = "/" + rel
+                    queue.append((child, depth + 1))
                 else:
                     files.append(item)
             if error_code is not None:
                 break
+            # 每页一次：中途回写进度 + 续租约（UI 轮询可见非零计数）
+            if _progress_enumeration(enum_id, worker_id, scanned,
+                                     lease_token) is False:
+                return abandon()
             if resp.get("has_more") and resp.get("next_cursor"):
                 cursor = resp["next_cursor"]
                 continue
@@ -590,24 +637,17 @@ def run_one_enumeration(claim_row, adapter):
         error_code = "enumeration_side_effect"
         incomplete = "side_effect_during_enumeration"
 
+    state = "ready" if error_code is None else "failed"
+    count = _finalize_enumeration(
+        enum_id, worker_id=worker_id, lease_token=lease_token,
+        state=state, complete=error_code is None, scanned=scanned,
+        error_code=error_code, incomplete=incomplete, counters=counters,
+        files=files, dirs=dirs)
+    if count is None:
+        return abandon()
     if error_code is None:
-        conn = _connect()
-        try:
-            with pg_store.transaction(conn) as c:
-                with c.cursor() as cur:
-                    count = _insert_candidates(cur, enum_id, files, dirs)
-        finally:
-            conn.close()
-        _finalize_enumeration(
-            enum_id, state="ready", complete=True, scanned=scanned,
-            candidates=count, counters=counters)
         return {"id": enum_id, "state": "ready", "complete": True,
                 "scanned": scanned, "candidates": count}
-
-    _finalize_enumeration(
-        enum_id, state="failed", complete=False, scanned=scanned,
-        candidates=0, error_code=error_code, incomplete=incomplete,
-        counters=counters)
     return {"id": enum_id, "state": "failed", "complete": False,
             "error_code": error_code, "scanned": scanned}
 
@@ -727,6 +767,11 @@ def create_import(owner_user_id, enumeration_id, candidate_ids,
                 if not_selectable:
                     raise ValidationError(
                         "存在不可选候选", code="candidate_not_selectable")
+                names = [found[cid]["name"] for cid in candidate_ids]
+                if len(names) != len(set(names)):
+                    raise ValidationError(
+                        "同一批次不能包含同名文件，请分批导入",
+                        code="duplicate_filename")
                 total_bytes = sum(int(found[cid]["size_bytes"])
                                   for cid in candidate_ids)
                 digest = _payload_digest(enumeration_id, candidate_ids,
@@ -1424,6 +1469,11 @@ def run_claimed_batch(claim, adapter, *, staging_root=None,
     """
     claim = _claim_with_secrets(claim)
     batch, items = claim["batch"], claim["items"]
+    seen_names, duplicate_names = set(), set()
+    for item in items:
+        if item["name"] in seen_names:
+            duplicate_names.add(item["name"])
+        seen_names.add(item["name"])
     hooks = hooks or {}
     staging_root = Path(staging_root or STAGING_ROOT)
 
@@ -1462,6 +1512,11 @@ def run_claimed_batch(claim, adapter, *, staging_root=None,
                 _apply_cancel(batch)
                 return get_import(batch["id"], batch["owner_user_id"])
             try:
+                # 旧版本已经接受的同名批次同样不能继续复用副本。
+                if item["name"] in duplicate_names:
+                    _fail_item(item["id"], "duplicate_filename",
+                               batch["id"], batch.get("lease_token"))
+                    continue
                 item = _phase_transfer(adapter, batch, item, hooks)
                 if item["stage"] == "failed":
                     continue
@@ -1471,6 +1526,13 @@ def run_claimed_batch(claim, adapter, *, staging_root=None,
                     continue
                 item = _phase_convert_placeholder(adapter, batch, item)
                 item = _phase_ingest(adapter, batch, item, hooks)
+            except AdapterError as exc:
+                # 副本对账也会失败，必须收口为可见错误，不能遗留 running。
+                try:
+                    _fail_item(item["id"], exc.code,
+                               batch["id"], batch.get("lease_token"))
+                except LeaseLost:
+                    return _abandon()
             except LeaseLost:
                 # 租约已被其他 worker 重领：绝不能覆盖新 owner 的条目
                 # 状态，也不得 finalize/清理（会误删新 worker 的副本、

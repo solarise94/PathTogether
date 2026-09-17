@@ -425,10 +425,15 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			// 2026-09-14（W2 admin UI）：新增 formatRequests.list/get（格式申请
 			// 工单只读，users:read）与 formatRequests.patch（CAS 状态机写，
 			// users:write）——复用 users 权限域不扩域，33 → 36
-			expect(Object.keys(table)).toHaveLength(36);
+			// SER-8（wip/ser8-dev）：新增 testApplications.list（待激活申请
+			// 只读，users:read）与 testApplications.review（审批写，原子激活
+			// + 额度 provisioning，users:write）——同域不扩域，36 → 38
+			expect(Object.keys(table)).toHaveLength(38);
 			expect(table["admin.formatRequests.list"]).toBe("admin:users:read");
 			expect(table["admin.formatRequests.get"]).toBe("admin:users:read");
 			expect(table["admin.formatRequests.patch"]).toBe("admin:users:write");
+			expect(table["admin.testApplications.list"]).toBe("admin:users:read");
+			expect(table["admin.testApplications.review"]).toBe("admin:users:write");
 			expect(table["admin.settings.model"]).toBe("admin:settings:read");
 		expect(table["admin.settings.model.update"]).toBe("admin:settings:write");
 		expect(table["admin.users.identityConflicts"]).toBe("admin:users:read");
@@ -504,6 +509,8 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			"admin.settings.runtime.update",
 			// W2（2026-09-14）：格式申请工单（游标/页大小/状态枚举过滤）
 			"admin.formatRequests.list",
+			// SER-8：测试申请工单（状态/方向枚举过滤，均可空）
+			"admin.testApplications.list",
 		]) {
 			expect(schemas[method], method).toBeTruthy();
 			// 附加属性一律拒绝（iframe 不能借桥传任意字段）

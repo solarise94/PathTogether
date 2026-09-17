@@ -44,6 +44,11 @@
    list/get（users:read）+ patch（users:write，CAS 状态机 + admin_note），
    复用 users 权限域不扩域；样本只呈现元数据（样本下载走宿主鉴权接口，
    本页不内嵌文件）；渲染字段白名单化，内部字段绝不进 DOM。
+   SER-8（wip/ser8-dev）：新增「测试申请」页——admin.testApplications.list
+   （users:read）+ review（users:write，POST .../review，body {decision,
+   ai_access}）。approved = 原子激活 + 默认额度 provisioning + 结果邮件
+   （终态不可撤销），页内确认条 +「开通 AI 权限」默认勾选；
+   409 default_allowance_unconfigured 提示先去设置页配置默认总额度。
    渲染只用 textContent / createElement（不拼 HTML，插件数据永不进标记）。
  ========================================================================= */
 (function () {
@@ -67,8 +72,9 @@
     listSeq: 0,
     // 分页游标（每列表独立；仅内存）
     cursors: { users: null, usage: null, unpriced: null, ledger: null,
-               audit: null, invites: null, slides: null, formatRequests: null },
-    filters: { users: {}, usage: {}, audit: {}, format: {} },
+               audit: null, invites: null, slides: null, formatRequests: null,
+               testApplications: null },
+    filters: { users: {}, usage: {}, audit: {}, format: {}, testApp: {} },
     // 设置页快照（批次 D §6.1）：admin.settings.get 的响应（含 spend
     // current_windows 的 demo/owner 窗口 CAS version）——仅内存。
     settingsSnapshot: null,
@@ -108,7 +114,8 @@
   // 自身 URL；只接受已知页面 slug，其余回概览。
   function initialPageFromHash() {
     var pages = ["overview", "users", "identity", "slides", "format-requests",
-                 "invites", "settings", "billing", "plugins", "audit"];
+                 "test-applications", "invites", "settings", "billing",
+                 "plugins", "audit"];
     var hash = "";
     try { hash = window.location.hash || ""; } catch (e) { hash = ""; }
     var name = hash.replace(/^#/, "");
@@ -122,7 +129,7 @@
   // slug 保持不变，宿主深链 #invites/#billing 兼容。
   var PAGE_TITLES = {
     overview: "概览", users: "用户", identity: "身份冲突", slides: "切片可见性",
-    "format-requests": "格式申请",
+    "format-requests": "格式申请", "test-applications": "测试申请",
     invites: "邀请", settings: "设置", billing: "费用", plugins: "插件",
     audit: "审计",
   };
@@ -142,6 +149,7 @@
       identity: $("adm-page-identity"),
       slides: $("adm-page-slides"),
       "format-requests": $("adm-page-format-requests"),
+      "test-applications": $("adm-page-test-applications"),
       invites: $("adm-page-invites"),
       settings: $("adm-page-settings"),
       billing: $("adm-page-billing"),
@@ -1011,17 +1019,19 @@
   function resetLists() {
     state.cursors = { users: null, usage: null, unpriced: null, ledger: null,
                       audit: null, invites: null, slides: null,
-                      formatRequests: null };
+                      formatRequests: null, testApplications: null };
     ["adm-users-tbody", "adm-usage-tbody", "adm-unpriced-tbody",
      "adm-ledger-tbody", "adm-audit-tbody", "adm-invites-tbody",
      "adm-plugins-tbody", "adm-slides-tbody", "adm-identity-tbody",
-     "adm-format-tbody"].forEach(
+     "adm-format-tbody", "adm-test-tbody"].forEach(
     function (id) {
       var el = $(id);
       if (el) el.textContent = "";
     });
     var frDetail = $("adm-format-detail");
     if (frDetail) frDetail.textContent = "";
+    var testConfirm = $("adm-test-confirm");
+    if (testConfirm) { testConfirm.hidden = true; testConfirm.textContent = ""; }
   }
 
   function loadUsers(append) {
@@ -3636,6 +3646,184 @@
   }
 
   // ------------------------------------------------------------------
+  // 测试申请审核（SER-8，wip/ser8-dev）：
+  //   - admin.testApplications.list：GET /api/admin/v1/test-applications
+  //     （direction/status 服务端过滤；单查即全量、上限 500 行，无游标）；
+  //   - admin.testApplications.review：POST .../<user_id>/review，body
+  //     {decision, ai_access}；
+  //   - approved = 原子激活 + 默认额度 provisioning + 结果邮件，终态不可
+  //     撤销 → 页内确认条（sandbox 无 allow-modals，原生 confirm 被吞）
+  //     +「开通 AI 权限」勾选（默认勾）；rejected 亦终态（页内确认条）；
+  //   - 409 default_allowance_unconfigured → 提示先去设置页配置新用户默认
+  //     总额度（fail-closed，绝不无额度激活）；409 already_reviewed →
+  //     提示并刷新（他人先行处理）；
+  //   - 渲染白名单字段 textContent（同格式申请页纪律），方向中文映射在本
+  //     前端做（API 只回机器值）。
+  // ------------------------------------------------------------------
+  var TEST_APP_STATUS_LABELS = {
+    pending: "待审核", approved: "已通过", rejected: "已拒绝",
+  };
+  var TEST_APP_DIRECTIONS = {
+    model_plant: "模式植物", model_animal: "模式动物",
+    clinical_pathology: "临床病理", other: "其他",
+  };
+
+  function testAppStatusLabel(status) {
+    return TEST_APP_STATUS_LABELS[status] || String(status || "—");
+  }
+
+  function testAppDirectionLabel(direction) {
+    return TEST_APP_DIRECTIONS[direction] || String(direction || "—");
+  }
+
+  function loadTestApplications() {
+    var seq = state.listSeq;
+    var f = state.filters.testApp || {};
+    var payload = {};
+    if (f.status) payload.status = f.status;
+    if (f.direction) payload.direction = f.direction;
+    var status = $("adm-test-list-status");
+    setPageState("test-applications", "loading");
+    request("admin.testApplications.list", payload).then(function (res) {
+      if (seq !== state.listSeq) return; // 页面已切换：晚到响应丢弃
+      hideError();
+      var items = (res && res.items) || [];
+      var tbody = $("adm-test-tbody");
+      if (tbody) tbody.textContent = "";
+      items.forEach(function (item) { renderTestAppRow(item); });
+      if (!items.length) {
+        setPageState("test-applications", "empty", {
+          message: (f.status || f.direction)
+            ? "没有匹配筛选条件的测试申请；切换筛选可查看全部。"
+            : "暂无测试申请。用户完成邮箱验证并提交申请后会出现在此。",
+        });
+      } else {
+        setPageState("test-applications", "ready", {
+          message: "已更新（" + nowText() + "）",
+        });
+      }
+    }).catch(function (err) {
+      if (seq !== state.listSeq) return;
+      handleErr(err, status);
+      setPageState("test-applications", "error", {
+        code: err && err.code, message: err && err.message,
+        retry: function () { loadTestApplications(); },
+      });
+    });
+  }
+
+  function renderTestAppRow(item) {
+    var tbody = $("adm-test-tbody");
+    if (!tbody) return;
+    var tr = document.createElement("tr");
+    tr.appendChild(td(item.email_normalized || "—"));
+    tr.appendChild(td(item.display_name, "adm-col-secondary"));
+    tr.appendChild(td(testAppDirectionLabel(item.research_direction)));
+    tr.appendChild(td(item.share_research_data ? "同意" : "未同意",
+                     "adm-col-secondary"));
+    tr.appendChild(td(fmtTs(item.created_at), "adm-cell-time"));
+    var statusCell = document.createElement("td");
+    statusCell.textContent = testAppStatusLabel(item.status);
+    if (item.status !== "pending" && item.reviewed_at) {
+      // 已处理行：状态列附审核时间（操作列不再提供动作）
+      statusCell.appendChild(document.createElement("br"));
+      var meta = document.createElement("span");
+      meta.className = "adm-user-meta";
+      meta.textContent = fmtTs(item.reviewed_at);
+      statusCell.appendChild(meta);
+    }
+    tr.appendChild(statusCell);
+    var cell = document.createElement("td");
+    cell.className = "adm-actions-cell";
+    if (item.status === "pending" && item.user_id) {
+      cell.appendChild(actionBtn("通过", function () {
+        askTestAppApprove(item);
+      }, "primary"));
+      cell.appendChild(actionBtn("拒绝", function () {
+        askConfirm($("adm-test-confirm"),
+          "确认拒绝 " + (item.email_normalized || item.user_id) +
+          " 的测试申请？该结果是终态，用户将收到结果邮件。",
+          function () { reviewTestApplication(item, "rejected", false); });
+      }, "danger-outline"));
+    }
+    tr.appendChild(cell);
+    tbody.appendChild(tr);
+  }
+
+  // 通过确认条（§3.3 页内二次确认；含「开通 AI 权限」勾选，默认勾）——
+  // askConfirm 只支持纯文案，这里按同一 DOM 纪律手搭：文案 + checkbox +
+  // 确认/取消按钮，确认按钮落焦点（新交互内容可达）。
+  function askTestAppApprove(item) {
+    var box = $("adm-test-confirm");
+    if (!box) return;
+    box.hidden = false;
+    box.textContent = "";
+    var msg = document.createElement("span");
+    msg.className = "adm-confirm-text";
+    msg.textContent = "确认通过 " + (item.email_normalized || item.user_id) +
+      " 的测试申请？账号将立即激活并按新用户默认总额度发放额度" +
+      "（终态，不可撤销）";
+    var check = document.createElement("label");
+    check.className = "adm-check";
+    var input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = true;
+    check.appendChild(input);
+    check.appendChild(document.createTextNode("开通 AI 权限"));
+    var ok = document.createElement("button");
+    ok.type = "button";
+    ok.className = "adm-btn-primary";
+    ok.textContent = "确认通过";
+    var cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "adm-btn-secondary";
+    cancel.textContent = "取消";
+    ok.addEventListener("click", function () {
+      var aiAccess = input.checked;
+      clearConfirm(box);
+      reviewTestApplication(item, "approved", aiAccess);
+    });
+    cancel.addEventListener("click", function () { clearConfirm(box); });
+    box.appendChild(msg);
+    box.appendChild(check);
+    box.appendChild(ok);
+    box.appendChild(cancel);
+    if (ok.focus) ok.focus();
+  }
+
+  function reviewTestApplication(item, decision, aiAccess) {
+    var status = $("adm-test-list-status");
+    setStatus("adm-test-list-status", "提交中…");
+    request("admin.testApplications.review", {
+      user_id: item.user_id,
+      decision: decision,
+      ai_access: !!aiAccess,
+    }).then(function () {
+      hideError();
+      var who = item.email_normalized || item.user_id || "";
+      setStatus("adm-test-list-status", decision === "approved"
+        ? "已通过 " + who + " 的申请，账号已激活"
+        : "已拒绝 " + who + " 的申请");
+      loadTestApplications();
+    }).catch(function (err) {
+      if (err && err.code === "default_allowance_unconfigured") {
+        // 前置条件缺失：去设置页配置新用户默认总额度后再通过（服务端
+        // fail-closed，绝不无额度激活）
+        setStatus("adm-test-list-status",
+          "无法通过：请先在「设置」页配置新用户默认总额度，再执行通过操作");
+        return;
+      }
+      if (err && err.code === "already_reviewed") {
+        setStatus("adm-test-list-status",
+          "该申请已被处理（409），已刷新列表");
+        loadTestApplications();
+        return;
+      }
+      handleErr(err, status);
+    });
+  }
+
+  // ------------------------------------------------------------------
   // 插件管理（PR5 修订：恢复旧侧栏插件管理功能面）
   // ------------------------------------------------------------------
   function pluginHealthText(h) {
@@ -3772,6 +3960,7 @@
     else if (name === "identity") loadIdentityConflicts();
     else if (name === "slides") loadSlides(false);
     else if (name === "format-requests") loadFormatRequests(false);
+    else if (name === "test-applications") loadTestApplications();
     else if (name === "invites") loadInvitesPage();
     else if (name === "settings") loadSettingsPage();
     else if (name === "billing") loadBillingPage();
@@ -3961,6 +4150,16 @@
       loadFormatRequests(false);
     });
     onClick("adm-format-more-btn", function () { loadFormatRequests(true); });
+    // 测试申请页（SER-8）：状态/方向过滤 + 刷新（审核动作在行内）
+    onClick("adm-test-search-btn", function () {
+      state.filters.testApp = {
+        status: $("adm-test-status") ? $("adm-test-status").value : "",
+        direction: $("adm-test-direction") ? $("adm-test-direction").value : "",
+      };
+      state.listSeq++;
+      loadTestApplications(false);
+    });
+    onClick("adm-test-refresh-btn", function () { loadTestApplications(false); });
     // 插件页（PR5 修订）
     onClick("adm-plugins-refresh-btn", function () { loadPlugins(); });
     onClick("adm-plugin-secret-copy", function () {

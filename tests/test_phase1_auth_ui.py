@@ -24,6 +24,7 @@
    分享 UI 显式权限选择；前端 CSRF 头 + POST logout。
 """
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -72,6 +73,11 @@ def _setup_owner_and_user():
 def _login_ok(client, username="owner@x.com", password="ownerpass123456", **extra):
     return client.post("/login", data={
         "username": username, "password": password, **extra})
+
+def _dialog_tag(body):
+    """取页面里登录弹窗 <dialog id="login-dialog"> 的起始标签（无则 None）。"""
+    m = re.search(r'<dialog\b[^>]*id="login-dialog"[^>]*>', body)
+    return m.group(0) if m else None
 
 # =========================================================================== #
 # 1. 统一 CSRF（Cookie 会话写端点）
@@ -316,10 +322,13 @@ def test_login_lock_two_buckets_mock_429_with_retry_after(monkeypatch):
     r2 = _login_ok(client, "owner@x.com", "ownerpass123456")
     assert r2.status_code == 429
     assert int(r2.headers.get("Retry-After") or 0) > 0
-    # 页面含服务端权威倒计时
+    # 页面含服务端权威倒计时（弹窗内 span，entry-auth.js 据此禁用提交按钮）
     body = r2.get_data(as_text=True)
     assert "尝试过于频繁" in body
     assert 'data-retry-seconds=' in body
+    assert 'id="login-dialog-countdown"' in body
+    tag = _dialog_tag(body)
+    assert tag and re.search(r"\bopen\b", tag)
 
 def test_login_success_clears_failure_buckets(monkeypatch):
     install_json_login_limits(monkeypatch)
@@ -334,7 +343,7 @@ def test_login_success_clears_failure_buckets(monkeypatch):
     assert r2.status_code == 401
 
 def test_login_error_message_no_account_enumeration(monkeypatch):
-    """不存在账号与错误密码文案一致（不泄露账号是否存在）。"""
+    """不存在账号与错误密码文案一致（不泄露账号是否存在）；错误页弹窗直开。"""
     install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
@@ -342,8 +351,13 @@ def test_login_error_message_no_account_enumeration(monkeypatch):
     r1 = _login_ok(client, "ghost@x.com", "whatever1")
     r2 = _login_ok(client, "owner@x.com", "wrongpass")
     assert r1.status_code == r2.status_code == 401
-    assert "账号或密码错误" in r1.get_data(as_text=True)
-    assert "账号或密码错误" in r2.get_data(as_text=True)
+    body1 = r1.get_data(as_text=True)
+    body2 = r2.get_data(as_text=True)
+    # 错误凭据返回的页面同样渲染 entry.html + 打开的登录弹窗 + 错误条
+    for body in (body1, body2):
+        tag = _dialog_tag(body)
+        assert tag and re.search(r"\bopen\b", tag)
+        assert "账号或密码错误" in body
 
 def test_ip_prefix_normalization_and_hashing():
     # IPv4 /24
@@ -384,8 +398,8 @@ def test_index_unauthenticated_renders_entry_page(monkeypatch):
     assert "直接体验 Demo" in body
     assert 'href="/demo"' in body
     assert 'href="/login"' in body
-    # 底部研究/教学声明（docs §3.2）
-    assert "仅用于研究、教学和软件演示" in body
+    # 底部功能定位
+    assert "协助研究者更快开展病理研究" in body
     # 不是完整应用
     assert 'id="viewer"' not in body
 
@@ -407,7 +421,9 @@ def test_index_entry_landing_page_content(monkeypatch):
     assert body.count('href="/login"') == 1
     assert 'href="#principle"' not in body
     assert "Demo 无需登录，可查看示例切片并体验 AI 导航" in body
-    assert "仅用于研究、教学和软件演示，不用于临床诊断。" in body
+    assert "不用于临床诊断" not in body
+    assert "与 AI 一起，观察病理切片。" in body
+    assert "可疑病理区域" in body and "计量分析" in body
     # 三个 GitHub 仓库链接（顶栏 / 套件卡 / 页脚）
     for repo in ("HistoPilot", "PathTogether", "HistoPilot-DSH"):
         assert 'https://github.com/solarise94/%s' % repo in body
@@ -431,26 +447,24 @@ def test_index_entry_landing_page_content(monkeypatch):
     assert "fonts.googleapis" not in body
     assert 'src="http' not in body
     js_src = (REPO_ROOT / "static" / "entry.js").read_text(encoding="utf-8")
-    assert "tcga-session-base.jpg" in js_src
-    assert "tcga-left-2.jpg" in js_src
-    assert "tcga-left-10.jpg" in js_src
-    assert "tcga-left-20.jpg" in js_src
-    assert "tcga-right-40.jpg" in js_src
-    assert "data-hp-fov" not in body
-    assert "data-hp-scan" not in body
-    # 自动循环演示：无播放/暂停按钮；图上蓝框 + 框边解读
-    assert "data-hp-play" not in body
-    assert "data-hp-pause" not in body
-    assert 'data-hp-box="a"' in body and 'data-hp-box="b"' in body
-    assert "data-hp-stream" in body
+    assert "HP_EntryTissue" in js_src
+    assert 'id="tissue"' in body and 'id="hero-tissue"' in body
+    assert "entry-media/" not in body
+    assert 'id="note-body"' in body
+    assert 'id="review-a"' in body and 'id="review-b"' in body
     # 无内联脚本（CSP script-src 'self'）；标题由 i18n.js 按 data-page=entry 同步
-    assert body.count("<script") == 2
+    assert body.count("<script") == 3
     assert 'src="/static/i18n.js' in body
     assert 'src="/static/entry.js' in body
+    assert 'src="/static/entry-auth.js' in body
     assert 'data-page="entry"' in body
     assert 'id="principle"' in body
     assert "受控 Demo" not in body
-    assert "自研分析插件" in body
+    assert "测量与计量分析" in body
+    # 登录弹窗内嵌在主页且默认关闭（GET / 不直出 open 属性，登录链接才打开）
+    tag = _dialog_tag(body)
+    assert tag, "介绍页未渲染登录弹窗"
+    assert not re.search(r"\bopen\b", tag), "介绍页登录弹窗不应默认打开"
     assert "Content-Security-Policy" in r.headers
     assert "unsafe-inline" not in r.headers.get("Content-Security-Policy", "")
     assert "no-store" in r.headers.get("Cache-Control", "")
@@ -468,15 +482,12 @@ def test_entry_landing_source_guards():
     js = (REPO_ROOT / "static" / "entry.js").read_text(encoding="utf-8")
     assert "data-hp-stage" in js
     assert "prefers-reduced-motion" in js
-    # 自动循环 + 双标注回看（homepage-agent-storyboard 实现规格）：无播放按钮
-    assert "data-hp-play" not in js and "data-hp-pause" not in js
-    assert 'data-hp-play' not in html and 'data-hp-pause' not in html
-    assert "LOOP_HOLD_MS" in js and "BOX_DELAY_MS" in js  # 末拍停 3s 再循环 / 蓝框弹出
-    assert "IntersectionObserver" in js                   # 进入可见区自动播放
-    assert "data-hp-box" in js and "data-hp-stream" in js
-    assert 'data-hp-box="a"' in html and 'data-hp-box="b"' in html
-    assert "data-hp-img-from" in html
-    assert "#007AFF" in css
+    assert "IntersectionObserver" in js
+    assert "HP_EntryTissue" in js
+    assert "viewBox" in js and "streaming" in js
+    assert 'id="review-a"' in html and 'id="review-b"' in html
+    assert 'id="note-body"' in html and 'id="toggle"' in html
+    assert "#007aff" in css.lower()
     # 语义结构：header + main + footer；锚点导航与跳转链接
     assert "<header" in html and "<main" in html and "<footer" in html
     assert "<nav" in html
@@ -484,11 +495,18 @@ def test_entry_landing_source_guards():
     assert 'class="skip-link"' in html
     # 语言切换沿用 .lang-toggle
     assert 'class="lang-toggle"' in html
-    assert html.count("<script") == 2
+    assert html.count("<script") == 3
     assert 'src="/static/i18n.js' in html
     assert 'src="/static/entry.js' in html
+    assert 'src="/static/entry-auth.js' in html
     assert 'data-page="entry"' in html
     assert 'id="principle"' in html
+    # 登录弹窗：entry.html include _login_dialog.html（login.html 已删除）
+    assert '{% include "_login_dialog.html" %}' in html
+    assert ".login-dialog::backdrop" in css
+    auth_js = (REPO_ROOT / "static" / "entry-auth.js").read_text(encoding="utf-8")
+    assert "showModal" in auth_js
+    assert "login-dialog-countdown" in auth_js
     assert "受控 Demo" not in html
     # i18n 新键 zh/en 双语成对存在（histopilot-com-landing-page.md §4）
     new_keys = (
@@ -528,7 +546,7 @@ def test_entry_landing_source_guards():
     # 现有 entry.* 中文默认不回退（其他页面共用）
     for text in ("直接体验 Demo", "登录测试与协作",
                  "Demo 无需登录，可查看示例切片并体验 AI 导航",
-                 "仅用于研究、教学和软件演示，不用于临床诊断。"):
+                 "与 AI 一起，观察病理切片。", "计量分析"):
         assert text in zh_block
 
 def test_index_authenticated_stays_on_landing(monkeypatch):
@@ -589,6 +607,31 @@ def test_login_get_redirects_when_authenticated(monkeypatch):
     # 外部 next 仍拒绝
     r2 = client.get("/login?next=//evil.com")
     assert r2.headers["Location"] == "/"
+
+def test_login_get_renders_entry_with_open_dialog(monkeypatch):
+    """GET /login 复用介绍页模板：entry.html + 直出已打开的登录弹窗。
+
+    login.html 已删除（登录页并入主页弹窗）：返回 200、含 id="login-dialog"
+    且弹窗带 open 属性（login_open=True，无 JS 时也可见）。
+    """
+    install_json_login_limits(monkeypatch)
+    app_mod.AUTH_ENABLED = True
+    _setup_owner_and_user()
+    client = _client()
+    r = client.get("/login")
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    tag = _dialog_tag(body)
+    assert tag, "GET /login 未渲染登录弹窗"
+    assert re.search(r"\bopen\b", tag), "login_open=True 时弹窗应带 open 属性"
+    # 弹窗表单（CSRF + next）随 entry.html 一起下发
+    assert 'id="login-dialog-form"' in body
+    assert 'name="csrf_token"' in body
+    assert 'name="next"' in body
+    # 本人改密成功后跳 /login?password_changed=1：弹窗内提示（docs §7.1-7）
+    r2 = client.get("/login?password_changed=1")
+    assert r2.status_code == 200
+    assert "密码已修改，请使用新密码重新登录" in r2.get_data(as_text=True)
 
 # =========================================================================== #
 # 6. /register 关闭态
@@ -680,18 +723,28 @@ def test_i18n_no_admin_only_wording_left():
                      "只能分享你拥有的切片", "允许标注", "允许下载"):
         assert required in text, "i18n.js 缺新文案：%r" % required
 
-def test_login_template_phase1_requirements():
-    text = (REPO_ROOT / "templates" / "login.html").read_text(encoding="utf-8")
+def test_login_dialog_template_phase1_requirements():
+    """登录并入主页弹窗（_login_dialog.html）后的 Phase 1 语义守卫。
+
+    login.html 已删除：GET/POST /login 由 app._login_page 渲染 entry.html +
+    login_open=True，登录表单完全来自 _login_dialog.html（登录行为测试见上）。
+    """
+    assert not (REPO_ROOT / "templates" / "login.html").exists()
+    entry_html = (REPO_ROOT / "templates" / "entry.html").read_text(encoding="utf-8")
+    assert '{% include "_login_dialog.html" %}' in entry_html
+    text = (REPO_ROOT / "templates" / "_login_dialog.html").read_text(encoding="utf-8")
     # 次入口：注册方式 + Demo；找回提示为纯文本（非链接，docs §6.1）
     assert 'href="/register"' in text and "login.register" in text
     assert 'href="/demo"' in text and "login.demo" in text
-    assert '<p class="forgot" data-i18n="login.forgot">' in text
+    assert '<p class="login-dialog-forgot" data-i18n="login.forgot">' in text
     assert 'class="forgot" href=' not in text
-    # 密码显示/隐藏按钮带可访问名称
-    assert "pwd-toggle" in text and "login.pwd.show.aria" in text
-    # 提交中状态 + CSRF 隐藏域
-    assert "login.submitting" in text
+    # 弹窗表单：提交按钮 + CSRF 隐藏域 + next 透传
+    assert 'type="submit"' in text
     assert 'name="csrf_token"' in text
+    assert 'name="next"' in text
+    # 服务端锁定倒计时挂点（entry-auth.js 读取 data-retry-seconds 禁用提交）
+    assert 'id="login-dialog-countdown"' in text
+    assert 'data-retry-seconds' in text
 
 def test_index_template_share_permissions_and_logout():
     text = (REPO_ROOT / "templates" / "index.html").read_text(encoding="utf-8")

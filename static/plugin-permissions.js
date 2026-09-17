@@ -33,6 +33,9 @@
     "viewer.navigate": "viewer:navigate",
     "viewer.highlight": "viewer:navigate",
     "viewer.applyRenderContext": "viewer:navigate",
+    // P1「当前视野」：读当前视野 level-0 bbox 与 selection.getBbox 同档
+    //（只读几何，不发导航/写操作）→ 同挂 viewer:navigate。
+    "viewer.getViewport": "viewer:navigate",
     "annotation.create": "annotation:write",
     "annotation.read": "annotation:read",
     "annotation.focus": "viewer:navigate",

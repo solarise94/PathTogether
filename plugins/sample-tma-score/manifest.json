@@ -34,7 +34,8 @@
       },
       "accessMode": "read",
       "requiredPermissions": ["slide:metadata:read", "annotation:read"],
-      "timeout_ms": 15000
+      "timeout_ms": 15000,
+      "agent_exposed": false
     }
   ]
 }

@@ -629,6 +629,15 @@ def test_official_run_injects_extra_tools_and_tool_token():
     caps = installation.get("capabilities") if installation else []
     check("安装行登记了 slide_summary 能力",
           [c.get("name") for c in caps] == ["slide_summary"], "caps=%r" % caps)
+    # 2026-09-17 P1 修复：manifest 已把 slide_summary 标记为 agent_exposed=false
+    # （能力级退出，官方 run 不再注入）。本用例验证的是注入链路本身的形状，
+    # 这里把登记行改回「暴露」（等价缺字段的历史安装行），工具形状断言保持
+    # 不变；退出语义由 tests/test_plugin_agent_optout.py 覆盖。
+    if installation:
+        import share_store as _ss
+        _ss.set_installation_capabilities(
+            installation["installation_id"],
+            [dict(c, agent_exposed=True) for c in caps])
 
     captured = {}
 

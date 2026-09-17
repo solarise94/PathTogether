@@ -908,10 +908,14 @@
       return;
     }
     if (type === "agent_finished") {
-      var hadLive = state.liveBubble && String(state.liveBubble._rawText || "").trim();
+      // 总结去重与主站 main.js 同口径（2026-09-17 修复）：引导语（如「下面
+      // 给出总结」）不得抑制 summary——唯一去重依据是活气泡文本已包含完整
+      // 总结；空 summary 不追加。
+      var finSum = String(p.summary || "").trim();
+      var liveText = String((state.liveBubble && state.liveBubble._rawText) || "").trim();
       closeLiveTextBubble();
       state.terminal = true;
-      if (p.summary && !hadLive) {
+      if (finSum && liveText.indexOf(finSum) === -1) {
         appendTrace("ai-msg agent", p.summary);
       }
       appendTrace("ai-row", t("demo.ai.finished"));

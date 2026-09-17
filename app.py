@@ -12201,8 +12201,11 @@ def _parse_provides_registry(manifest):
     校验失败（validate_manifest/validate_provides 任何错误）抛 ``ValueError``
     （message 含全部错误，安装端点映射 400）。登记项形状：
     ``{name, version, description, parameters, access_mode, required_permissions,
-    timeout_ms, base_url, enabled}``——base_url 取 manifest.service.baseUrl
-    快照（dispatch 转发用；插件内网地址不外泄给任何消费方，docs D1）。
+    timeout_ms, base_url, agent_exposed, enabled}``——base_url 取
+    manifest.service.baseUrl 快照（dispatch 转发用；插件内网地址不外泄给任何
+    消费方，docs D1）。agent_exposed 是能力级 AI agent 退出标记（additive 可选
+    manifest 字段，缺省/None 归一为 True=暴露；false 时注入侧不再把该能力
+    进 agent 工具集，dispatch 与登记行不受影响）。
     """
     errors = validate_manifest(manifest)
     if errors:
@@ -12228,6 +12231,11 @@ def _parse_provides_registry(manifest):
                                      if p in CAPABILITY_REQUIRED_PERMISSIONS],
             "timeout_ms": timeout_ms,
             "base_url": base_url,
+            # 能力级 agent 退出标记（缺省/None=暴露）：校验层已保证非 None 即
+            # 布尔，这里归一落盘为 True/False，注入侧按「缺字段=暴露」兼容
+            # 历史安装行。
+            "agent_exposed": True if item.get("agent_exposed") is None
+                             else bool(item["agent_exposed"]),
             "enabled": True,
         })
     return out
@@ -12845,6 +12853,10 @@ def _start_binding_attach_retry_thread():
 #
 # 官方模式（/api/ai/run|continue|ask|branch 的 _ai_run_prepare）下：
 #   1. 查注册表 enabled + access_mode=read 的能力；
+#      另排除 manifest 声明能力级退出的条目（provides[].agent_exposed=false，
+#      2026-09-17 P1：样例插件 dev.sample.tma 的 slide_summary 每会话被必调、
+#      无平台回调时恒返回降级占位——标记 false 后不再注入，dispatch 端点与
+#      插件本身零改动；缺字段的历史安装行按暴露处理）；
 #   2. 按 §6.1 用户权限映射过滤（_subject_slide_permissions，与 dispatch 共用）；
 #   3. 签发 agent-tool-token（claims：typ/session/slide/能力全名清单/exp）；
 #   4. 注入 config.extra_tools + config.tool_token（sidecar 据此拼 remote tool，
@@ -12861,6 +12873,11 @@ _CAPABILITY_TOOL_DESCRIPTION_SUFFIX = (
 
 def _list_agent_capabilities(user_ctx, slide):
     """注册表中 enabled + read 且发起用户对该 slide 有权调用的能力。
+
+    另排除 manifest 声明能力级退出（``agent_exposed: false``）的能力——
+    不再注入 agent 工具集（如样例插件的 slide_summary：无平台回调时返回
+    降级占位，切片尺寸/mpp 主上下文本就有，注入只增无效步骤）；历史安装行
+    缺该字段按暴露处理（向后兼容），重新安装后标记才随登记行刷新。
 
     返回 [(installation, capability), ...]（按安装行创建序）。注册表读取失败
     记 warning 返回 []（本轮不注入——附加能力缺失不阻断主 AI 路径，不注入
@@ -12883,6 +12900,8 @@ def _list_agent_capabilities(user_ctx, slide):
         for cap in inst.get("capabilities") or []:
             if not cap.get("enabled", True):
                 continue
+            if not cap.get("agent_exposed", True):
+                continue  # manifest 能力级退出：不暴露给 AI agent（缺字段=暴露）
             if cap.get("access_mode") != "read":
                 continue  # P1 只注入只读（注册表层已拒绝 write，双保险）
             required = cap.get("required_permissions") or []
@@ -12894,6 +12913,10 @@ def _list_agent_capabilities(user_ctx, slide):
 
 def _inject_agent_extra_tools(user_ctx, slide, config):
     """起跑时注入 extra_tools + tool_token（无可用能力时不写入任何键）。
+
+    仅「暴露给 agent」的能力进入工具集：manifest 声明 agent_exposed=false
+    的能力已在 _list_agent_capabilities 过滤（能力级退出，dispatch 不受
+    影响；缺字段的历史安装行按暴露处理）。
 
     token claims（docs §5.1）：typ=agent-tool、session_id（恒为空串——run
     起跑时 session 未创建；continue/ask/branch 的 session 也由 sidecar 在
@@ -15047,6 +15070,58 @@ def _ai_run_inject_render_context(payload, slide, body):
     return {"asset_revision": revision, "render_fingerprint": fp}, None
 
 
+# P1「普通发送绑定浏览器当前视野」：viewport（level-0 像素 bbox）四数值的
+# 量级上限——防畸形超大数值注入下游 sidecar / 模型上下文；真实切片 level-0
+# 尺寸远低于该量级。
+_AI_VIEWPORT_MAGNITUDE_LIMIT = 1e8
+
+
+def _validate_ai_viewport(body):
+    """AI run 入口的浏览器视野 bbox 校验（P1「当前视野」切片）。
+
+    浏览器 run/continue/branch body 可带 ``viewport`` = {x,y,w,h}（level-0
+    像素 bbox，发送时浏览器当前视野；fork-ask 端点不透传）。键缺失或显式
+    None → ``(None, None)``（旧 UI 不带，行为完全不变）。携带则严格校验：
+
+      - 必须是对象；
+      - x/y/w/h 均为数值（bool 是 int 子类，显式排除）且有限（JSON 解析可
+        产生 NaN/Infinity，必须拒绝）；
+      - w>0、h>0；x/y 非负（level-0 像素坐标）；
+      - 四数绝对值 ≤ 1e8（防注入畸形量级）。
+
+    非法 → ``(None, (response, status))`` 形式的 400 invalid_argument，调用
+    方直接 ``return``（校验先于预算预占，零副作用拒绝）。合法 → 返回仅含
+    x/y/w/h 四键的白名单重建 dict（数值保持原样不重排类型，多余键不透传）,
+    与 task/session_id 同级放进转发 payload。
+    """
+    vp = body.get("viewport") if isinstance(body, dict) else None
+    if vp is None:
+        return None, None
+    if not isinstance(vp, dict):
+        return None, (jsonify(error="viewport 非法：需对象 {x,y,w,h}",
+                              code="invalid_argument"), 400)
+    out = {}
+    for key in ("x", "y", "w", "h"):
+        val = vp.get(key)
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            return None, (jsonify(error="viewport 非法：%s 需数值" % key,
+                                  code="invalid_argument"), 400)
+        if not math.isfinite(val):
+            return None, (jsonify(error="viewport 非法：%s 需有限数值" % key,
+                                  code="invalid_argument"), 400)
+        if abs(val) > _AI_VIEWPORT_MAGNITUDE_LIMIT:
+            return None, (jsonify(error="viewport 非法：%s 超出量级上限" % key,
+                                  code="invalid_argument"), 400)
+        out[key] = val
+    if out["w"] <= 0 or out["h"] <= 0:
+        return None, (jsonify(error="viewport 非法：w/h 必须为正",
+                              code="invalid_argument"), 400)
+    if out["x"] < 0 or out["y"] < 0:
+        return None, (jsonify(error="viewport 非法：x/y 不可为负",
+                              code="invalid_argument"), 400)
+    return out, None
+
+
 def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
                      max_long_edge=None, jpeg_quality=DERIVATIVE_JPEG_QUALITY,
                      render_context=None, render_fingerprint=None):
@@ -16750,7 +16825,7 @@ _PLUGIN_CAPABILITIES = [
     "slide:region:read",     # POST /slides/{slide_id}/regions
     "annotation:read",       # GET /slides/{slide_id}/changes（增量读标注）
     "annotation:write",      # POST /slides/{slide_id}/annotations（+X-Run-Grant）
-    "viewer:navigate",       # HostBridge viewer.navigate / selection.getBbox
+    "viewer:navigate",       # HostBridge viewer.navigate / selection.getBbox / viewer.getViewport
     "events:read",           # GET /events/stream（SSE，事件流节点）
     "audit:write",           # POST /audit/plugin-events（审计节点）
 ]
@@ -17117,6 +17192,11 @@ def api_ai_run():
         return jsonify(error="allow_ai_drawing 仅支持新建会话（fresh）时携带；"
                              "既有会话请使用描绘开关端点",
                        code="invalid_argument"), 400
+    # P1「当前视野」：body 带 viewport 时严格校验（先于预算预占，零副作用
+    # 拒绝），合法 → 与 task/session_id 同级透传 sidecar；不带 → 行为不变。
+    viewport, vp_err = _validate_ai_viewport(body)
+    if vp_err is not None:
+        return vp_err
     prep = _ai_run_prepare(user_ctx, body, slide, need_grant=True)
     if not isinstance(prep, dict):
         return prep
@@ -17139,6 +17219,10 @@ def api_ai_run():
         payload["fresh"] = True
     if draft_allow_drawing is True:
         payload["allow_ai_drawing"] = True
+    # P1「当前视野」：合法 bbox 原样透传（x/y/w/h 白名单键，与 task/session_id
+    # 同级；sidecar 注入模型可见上下文）。
+    if viewport:
+        payload["viewport"] = viewport
     # §9.1：浏览器 render_context 服务端再校验（revision 绑定 + fingerprint 重算）
     # → camelCase 注入 config；审计带 asset revision + render fingerprint。
     audit_rc, rc_err = _ai_run_inject_render_context(payload, slide, body)
@@ -17147,6 +17231,10 @@ def api_ai_run():
     audit_detail = {"mode": "run", "request_id": prep["request_id"]}
     if audit_rc:
         audit_detail.update(audit_rc)
+    # P1「当前视野」：审计记录 bbox 四个数（粒度同 render_context 的
+    # fingerprint/revision——只记几何事实，不记任务文本）。
+    if viewport:
+        audit_detail["viewport"] = viewport
     # fix-2026-09-11：审计带上创建参数方向的描绘授权（仅 true 时）。
     if draft_allow_drawing is True:
         audit_detail["allow_ai_drawing"] = True
@@ -17204,6 +17292,10 @@ def api_ai_continue():
         auth = _require_ai_session_owner(session_id)
         if auth is not None:
             return auth
+    # P1「当前视野」：同 /run——先校验（零副作用拒绝）再透传；不带不变。
+    viewport, vp_err = _validate_ai_viewport(body)
+    if vp_err is not None:
+        return vp_err
     prep = _ai_run_prepare(user_ctx, body, slide, need_grant=True)
     if not isinstance(prep, dict):
         return prep
@@ -17218,6 +17310,8 @@ def api_ai_continue():
     # 透传给 sidecar（continue 目标会话由客户端显式指定）
     if isinstance(session_id, str) and session_id:
         payload["session_id"] = session_id
+    if viewport:
+        payload["viewport"] = viewport
     # §9.1：render_context 服务端再校验 + camelCase 注入（同 /run）。
     audit_rc, rc_err = _ai_run_inject_render_context(payload, slide, body)
     if rc_err is not None:
@@ -17225,6 +17319,8 @@ def api_ai_continue():
     audit_detail = {"mode": "continue", "request_id": prep["request_id"]}
     if audit_rc:
         audit_detail.update(audit_rc)
+    if viewport:
+        audit_detail["viewport"] = viewport
     _audit("ai.run", target_type="session", slide=slide, detail=audit_detail)
     return _proxy_sse("/continue", payload, on_accepted=prep["on_accepted"],
                       on_rejected=prep["on_rejected"],
@@ -17298,6 +17394,11 @@ def api_ai_branch():
     if not can_view_slide(slide) or not can_annotate_slide(slide):
         return _denied()
     user_ctx = current_identity()
+    # P1「当前视野」：branch 同 run/continue——先校验（零副作用拒绝）再透传；
+    # fork-ask（lite、无工具）不透传。
+    viewport, vp_err = _validate_ai_viewport(body)
+    if vp_err is not None:
+        return vp_err
     prep = _ai_run_prepare(user_ctx, body, slide, need_grant=True)
     if not isinstance(prep, dict):
         return prep
@@ -17312,6 +17413,8 @@ def api_ai_branch():
     question = body.get("question")
     if isinstance(question, str):
         payload["question"] = question
+    if viewport:
+        payload["viewport"] = viewport
     # §9.1：branch 同 run/continue/ask——render_context 服务端再校验 + 注入。
     audit_rc, rc_err = _ai_run_inject_render_context(payload, slide, body)
     if rc_err is not None:
@@ -17319,6 +17422,8 @@ def api_ai_branch():
     audit_detail = {"mode": "branch", "request_id": prep["request_id"]}
     if audit_rc:
         audit_detail.update(audit_rc)
+    if viewport:
+        audit_detail["viewport"] = viewport
     _audit("ai.run", target_type="session", target_id=annotation_id, slide=slide,
            detail=audit_detail)
     return _proxy_sse("/branch", payload, on_accepted=prep["on_accepted"],

@@ -6864,14 +6864,48 @@
     // 修复）——插件脚本先于 app.js 加载并立即握手时，等这里的 onRequest 注册会先
     // 收到 unknown_method（demo 实测）。业务方法才走下方注册表。
     // Plugin→Host request（被 gate 的方法：slide.getCurrent / selection.getBbox /
-    // viewer.navigate / viewer.highlight / viewer.applyRenderContext /
-    // annotation.create / annotation.read / annotation.focus）
+    // viewer.navigate / viewer.getViewport / viewer.highlight /
+    // viewer.applyRenderContext / annotation.create / annotation.read /
+    // annotation.focus）
     host.onRequest("slide.getCurrent", gate("slide.getCurrent", function () {
       if (!state.slide) return null;
       return { name: state.slide.name, width: state.slide.width, height: state.slide.height,
                mppX: state.slide.mppX, mppY: state.slide.mppY };
     }));
     host.onRequest("selection.getBbox", gate("selection.getBbox", function () { return currentSelectionBbox(); }));
+    host.onRequest("viewer.getViewport", gate("viewer.getViewport", function () {
+      // P1「普通发送绑定浏览器当前视野」：返回当前 OpenSeadragon 视野的
+      // level-0 像素 bbox {x,y,w,h}，供插件随 run/continue 发送附带，使
+      // 「分析/判读当前视野」类指令落到用户真实在看的范围（而非 AI 上次
+      // 快照）。R1（同 viewer.navigate 惯例）：viewer 未就绪回真实 error
+      // code（retryable），不吞异常伪报 ok；无切片返回 null。
+      if (!state.slide) return null;
+      if (!viewer || !viewer.viewport) {
+        throw { code: "viewer_not_ready", message: "查看器未就绪", retryable: true };
+      }
+      // getBounds(true)：当前视野（viewport 坐标系，取动画即时值）→
+      // viewportToImageRectangle 转图像像素 → 钳到切片 level-0 边界
+      // [0,0,width,height]（视野越界给边界值）→ 取整输出。
+      var bounds = viewer.viewport.getBounds(true);
+      var rect = viewer.viewport.viewportToImageRectangle(bounds);
+      var vx = Number(rect && rect.x), vy = Number(rect && rect.y);
+      var vw = Number(rect && rect.width), vh = Number(rect && rect.height);
+      if (!isFinite(vx) || !isFinite(vy) || !isFinite(vw) || !isFinite(vh)) {
+        throw { code: "invalid_geometry", message: "视野几何非法", retryable: false };
+      }
+      var sw = Number(state.slide.width) || 0, sh = Number(state.slide.height) || 0;
+      var x0 = Math.min(Math.max(vx, 0), sw);
+      var y0 = Math.min(Math.max(vy, 0), sh);
+      var x1 = Math.min(Math.max(vx + vw, 0), sw);
+      var y1 = Math.min(Math.max(vy + vh, 0), sh);
+      var rx0 = Math.round(x0), ry0 = Math.round(y0);
+      return {
+        x: rx0,
+        y: ry0,
+        w: Math.max(0, Math.round(x1) - rx0),
+        h: Math.max(0, Math.round(y1) - ry0),
+      };
+    }));
     host.onRequest("viewer.navigate", gate("viewer.navigate", function (p) {
       // AI goto/snapshot 跳转：level-0 bbox → viewport.fitBounds。
       // （文档 {x,y,level} 在本阶段以 level-0 bbox 表达，agent 全程在图像坐标系工作）

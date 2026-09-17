@@ -544,40 +544,124 @@ describe("demo.js 展示 text_delta 并在 agent_paused 结束本轮", () => {
 		expect(trace.children[2].textContent).toBe("结论");
 	});
 
-	it("agent_paused 视为终态：finishRun 且不再请求 stream", async () => {
-		vi.useFakeTimers();
-		const calls: string[] = [];
-		const fetchImpl = vi.fn((url: string) => {
+		it("agent_paused 视为终态：finishRun 且不再请求 stream", async () => {
+			vi.useFakeTimers();
+			const calls: string[] = [];
+			const fetchImpl = vi.fn((url: string) => {
+				const u = String(url);
+				calls.push(u);
+				if (u.includes("/api/demo/config")) {
+					return jsonResponse({
+						demo_enabled: true,
+						ai_available: true,
+						run_state: "accepted",
+						histopilot_session_id: "sess_paused",
+						active_run: true,
+						budget: { demo_used: 1, demo_limit: 10, demo_exhausted: false, platform_exhausted: false },
+					});
+				}
+				return jsonResponse({ session: { last_event_seq: 1 }, transcript: [] });
+			}) as unknown as typeof fetch;
+			const w = loadDemo(fetchImpl);
+			w.HP_DEMO.state.running = true;
+			w.HP_DEMO.state.sessionId = "sess_paused";
+			w.HP_DEMO.state.sessionAttached = true;
+			calls.length = 0;
+			w.HP_DEMO.handleEvent("agent_paused", { summary: "已达步数上限", can_continue: true });
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(w.HP_DEMO.state.terminal).toBe(true);
+			expect(w.HP_DEMO.state.running).toBe(false);
+			expect(calls.every((u) => u.includes("/api/demo/config"))).toBe(true);
+			expect(calls.some((u) => u.includes("/stream"))).toBe(false);
+			calls.length = 0;
+			await vi.advanceTimersByTimeAsync(5000);
+			expect(calls.filter((u) => u.includes("/stream")).length).toBe(0);
+			vi.useRealTimers();
+		});
+	});
+
+// =========================================================================
+// agent_finished 总结去重（2026-09-17 修复回归：与主站 main.js 同口径）
+// 旧缺陷：只要存在任意流式文字（引导语如「下面给出总结」）就跳过 summary，
+// 界面只追加完成状态行——生产复现为 Demo 入口漏显总结。
+// =========================================================================
+describe("demo.js agent_finished 总结去重", () => {
+	function idleFetch() {
+		return vi.fn((url: string) => {
 			const u = String(url);
-			calls.push(u);
 			if (u.includes("/api/demo/config")) {
 				return jsonResponse({
 					demo_enabled: true,
 					ai_available: true,
 					run_state: "accepted",
-					histopilot_session_id: "sess_paused",
+					histopilot_session_id: "sess_fin",
 					active_run: true,
 					budget: { demo_used: 1, demo_limit: 10, demo_exhausted: false, platform_exhausted: false },
 				});
 			}
 			return jsonResponse({ session: { last_event_seq: 1 }, transcript: [] });
 		}) as unknown as typeof fetch;
-		const w = loadDemo(fetchImpl);
+	}
+
+	function traceChildren() {
+		return (globalThis as { document: { getElementById: (id: string) => { children: Array<{ textContent: string; className: string }> } } })
+			.document.getElementById("ai-trace").children;
+	}
+
+	function agentMsgs() {
+		return traceChildren()
+			.filter((c) => c.className === "ai-msg agent")
+			.map((c) => c.textContent);
+	}
+
+	it("引导语气泡不抑制总结：先流式引导句，再收到完整 summary → 总结仍追加", async () => {
+		const w = loadDemo(idleFetch());
 		w.HP_DEMO.state.running = true;
-		w.HP_DEMO.state.sessionId = "sess_paused";
+		w.HP_DEMO.state.sessionId = "sess_fin";
 		w.HP_DEMO.state.sessionAttached = true;
-		calls.length = 0;
-		w.HP_DEMO.handleEvent("agent_paused", { summary: "已达步数上限", can_continue: true });
+		w.HP_DEMO.handleEvent("text_delta", { text: "下面给出总结" });
+		w.HP_DEMO.handleEvent("agent_finished", { summary: "未见明确恶性证据。" });
 		await Promise.resolve();
 		await Promise.resolve();
-		expect(w.HP_DEMO.state.terminal).toBe(true);
-		expect(w.HP_DEMO.state.running).toBe(false);
-		expect(calls.every((u) => u.includes("/api/demo/config"))).toBe(true);
-		expect(calls.some((u) => u.includes("/stream"))).toBe(false);
-		calls.length = 0;
-		await vi.advanceTimersByTimeAsync(5000);
-		expect(calls.filter((u) => u.includes("/stream")).length).toBe(0);
-		vi.useRealTimers();
+		expect(agentMsgs()).toEqual(["下面给出总结", "未见明确恶性证据。"]);
+		expect(traceChildren().some((c) => c.className === "ai-row")).toBe(true);
+	});
+
+	it("流式文本已含完整总结 → 不重复追加", async () => {
+		const w = loadDemo(idleFetch());
+		w.HP_DEMO.state.running = true;
+		w.HP_DEMO.state.sessionId = "sess_fin";
+		w.HP_DEMO.state.sessionAttached = true;
+		const summary = "全片未见可疑灶，建议结合临床随诊。";
+		w.HP_DEMO.handleEvent("text_delta", { text: summary });
+		w.HP_DEMO.handleEvent("agent_finished", { summary });
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(agentMsgs()).toEqual([summary]);
+	});
+
+	it("无流式气泡 → 总结正常追加（现有行为保持）", async () => {
+		const w = loadDemo(idleFetch());
+		w.HP_DEMO.state.running = true;
+		w.HP_DEMO.state.sessionId = "sess_fin";
+		w.HP_DEMO.state.sessionAttached = true;
+		w.HP_DEMO.handleEvent("agent_finished", { summary: "已完成读片。" });
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(agentMsgs()).toEqual(["已完成读片。"]);
+	});
+
+	it("空 summary → 不造总结气泡", async () => {
+		const w = loadDemo(idleFetch());
+		w.HP_DEMO.state.running = true;
+		w.HP_DEMO.state.sessionId = "sess_fin";
+		w.HP_DEMO.state.sessionAttached = true;
+		w.HP_DEMO.handleEvent("agent_finished", {});
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(agentMsgs()).toEqual([]);
+		expect(traceChildren().some((c) => c.className === "ai-row")).toBe(true);
 	});
 });
 

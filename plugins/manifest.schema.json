@@ -83,7 +83,7 @@
       }
     },
     "permissions": {
-      "description": "插件向平台申请的权限枚举（5 项）。前 4 项（slide:metadata:read / slide:region:read / annotation:read / annotation:write）对应平台 plugin v1 服务端能力端点；viewer:navigate 是浏览器 UI 侧导航权限（HostBridge viewer.navigate / selection.getBbox），无服务端端点。平台 capabilities 公告（/api/plugin/v1/capabilities）在此基础上另有 events:read / audit:write 两项，属平台侧扩展公告，不在 manifest 申请枚举内。未知值校验失败。",
+      "description": "插件向平台申请的权限枚举（5 项）。前 4 项（slide:metadata:read / slide:region:read / annotation:read / annotation:write）对应平台 plugin v1 服务端能力端点；viewer:navigate 是浏览器 UI 侧导航权限（HostBridge viewer.navigate / selection.getBbox / viewer.getViewport——getViewport 只读当前视野 level-0 bbox，与 selection.getBbox 同档），无服务端端点。平台 capabilities 公告（/api/plugin/v1/capabilities）在此基础上另有 events:read / audit:write 两项，属平台侧扩展公告，不在 manifest 申请枚举内。未知值校验失败。",
       "type": "array",
       "items": {
         "enum": [
@@ -165,6 +165,10 @@
             "type": "integer",
             "minimum": 1,
             "maximum": 60000
+          },
+          "agent_exposed": {
+            "description": "是否把该能力注入官方 AI 读片的 agent 工具集（extra_tools，可选布尔，缺省 true=暴露）。false = 能力级退出：平台网关不再注入（_list_agent_capabilities 过滤），dispatch 端点与能力登记行不受影响；历史安装行缺该字段按暴露处理。",
+            "type": "boolean"
           }
         }
       }

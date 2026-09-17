@@ -229,13 +229,17 @@ def validate_provides(d):
     规则（P1）：
       - 不声明 ``provides`` → 空列表（老插件零迁移）；
       - 每项必填 ``name/version/description/parameters/accessMode``，
-        可选 ``requiredPermissions/timeout_ms``，其余键拒绝；
+        可选 ``requiredPermissions/timeout_ms/agent_exposed``，其余键拒绝；
       - name 匹配 ``^[a-z][a-z0-9_]{1,63}$``，同 manifest 内重名拒绝；
       - version 为 semver core；description 8~500 字；
       - parameters 限 JSON Schema 子集（``_validate_capability_parameters``）；
       - accessMode 仅放行 ``read``（``write`` 校验层拒绝，docs §6.2）；
       - requiredPermissions 枚举不含 ``viewer:navigate``；
-      - timeout_ms 为 1~60000 的整数（缺省 15000 由消费方补）。
+      - timeout_ms 为 1~60000 的整数（缺省 15000 由消费方补）；
+      - agent_exposed 为可选布尔（2026-09-17 P1 缺陷修复新增，additive）：
+        缺省/true = 注入官方 AI 读片的 agent 工具集（extra_tools）；false =
+        能力级退出——平台网关不再注入，dispatch 端点与登记行不受影响。
+        历史安装行缺该字段按暴露处理（app.py _list_agent_capabilities）。
     """
     errors = []
     provides = d.get("provides")
@@ -254,7 +258,8 @@ def validate_provides(d):
                 errors.append("缺少必填字段：%s.%s" % (path, key))
         for key in item:
             if key not in ("name", "version", "description", "parameters",
-                           "accessMode", "requiredPermissions", "timeout_ms"):
+                           "accessMode", "requiredPermissions", "timeout_ms",
+                           "agent_exposed"):
                 errors.append("%s.%s 不在 provides 允许字段内" % (path, key))
         name = item.get("name")
         if isinstance(name, str):
@@ -316,6 +321,11 @@ def validate_provides(d):
                     or not (1 <= timeout_ms <= CAPABILITY_MAX_TIMEOUT_MS)):
                 errors.append("%s.timeout_ms 需为 1~%d 的整数"
                               % (path, CAPABILITY_MAX_TIMEOUT_MS))
+        agent_exposed = item.get("agent_exposed")
+        if agent_exposed is not None and not isinstance(agent_exposed, bool):
+            # 可选布尔：缺省/None 视为未声明（= 暴露，与其它可选字段口径一致）
+            errors.append("%s.agent_exposed 需为布尔值（缺省 true=暴露给 AI "
+                          "agent）" % path)
     return errors
 
 

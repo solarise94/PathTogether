@@ -120,7 +120,8 @@
             <p class="adm-note" id="adm-site-entry-note" hidden></p>
             <div class="adm-empty" id="adm-site-empty" hidden></div>
             <div class="adm-kpis" id="adm-site-kpis"></div>
-            <h3 class="adm-site-h3">近 30 天每日趋势</h3>
+            <h3 class="adm-site-h3">近 7 天每日趋势</h3>
+            <p class="adm-note">统计今日至前 6 天（UTC+8 日界，缺日补 0），最新日期在最上一行；KPI 卡的今日 / 近 7 天 / 近 30 天统计窗口不受影响。</p>
             <div class="adm-table-wrap">
               <table class="adm-table" id="adm-site-daily-table">
                 <thead>
@@ -132,7 +133,9 @@
             <div class="adm-summary-grid adm-site-grid">
               <div class="adm-summary-card" id="adm-site-referrers-block">
                 <h3>外部来源 Top 10</h3>
-                <p class="adm-note"><label><input type="checkbox" id="adm-site-referrers-bots-toggle"> 包含疑似爬虫的访问</label>（默认排除；来源由浏览器声明，仅作参考）</p>
+                <!-- R4（2026-09-19）：爬虫开关退役——外部来源榜固定排除疑似爬虫
+                     （后端 top_referrers 固定口径）；总览疑似爬虫计数保留 -->
+                <p class="adm-note">外部来源（不含疑似爬虫）；来源由浏览器声明的 Referer（可伪造），仅作参考。</p>
                 <div class="adm-table-wrap">
                   <table class="adm-table">
                     <thead><tr><th>来源站点</th><th>访问</th></tr></thead>

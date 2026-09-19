@@ -28,9 +28,13 @@ docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md §3.4 / §4.4 /
   ``request_host`` 命中当前 ``SITE_STATS_ENTRY_HOSTS`` 白名单的行；迁移前
   历史行（request_host IS NULL = 目标域名未知）默认排除，仅在 ``legacy``
   键单独计数。**目标域名（Host）决定「是不是本服务访问」，Referer 只表示
-  「从哪里跳过来」**——外部来源榜照常保留真实外站 Referer（Google 等搜索引擎
-  是有效外部来源），但默认排除疑似爬虫（``top_referrers_with_bots`` 为含爬虫
-  的对照口径）；
+  「从哪里跳过来」**——外部来源榜照常保留真实外站 Referer（Google 等搜索
+  引擎是有效外部来源），**固定排除疑似爬虫**（review 2026-09-19 R4：爬虫
+  开关退役，含爬虫的对照口径 ``top_referrers_with_bots`` 一并移除——除该
+  已退役的 UI 开关外无其他产品消费者；总览疑似爬虫计数保留）。``daily``
+  每日趋势 = 近 7 天共 7 行（UTC+8 日界、缺日补 0、**严格倒序**：第 1 行
+  = 今天，最后一行 = 今天−6 天）；today/d7/d30 KPI 与 Top 榜统计窗口不变
+  （30 天 KPI 不随趋势窗口切换，review §6）；
 - ``purge_expired(*, now=None) -> int``：显式 retention 清理，只删
   ``expires_at`` 到期的 site events，返回删除行数。
 
@@ -96,7 +100,18 @@ _log = logging.getLogger("svs.site_stats")
 # 版本化常量
 # --------------------------------------------------------------------------- #
 #: bot 词表版本（修改 _BOT_UA_NEEDLES / _BOT_UA_GENERIC_MARKERS 必须提版）。
-SITE_BOT_UA_RULESET_VERSION = "2026-09-03.v1"
+#: 版本历史（生效时间与前后口径，review 2026-09-19 §7）：
+#: - 2026-09-03.v1：宽泛子串——``sogou`` 把 SogouMobileBrowser 等搜狗系
+#:   浏览器实测误判为 SogouSpider；``whatsapp`` 把 WhatsApp 内置浏览器访问
+#:   当成链接预览抓取。
+#: - 2026-09-19.v2（本版）：``sogou`` 收窄为具体爬虫标识（sogou spider /
+#:   sogouspider 及已知变体）；``whatsapp`` 仅在 UA 非 Mozilla 浏览器形态
+#:   时记 WhatsApp 链接预览抓取（内置浏览器 UA 带 Mozilla/ 前缀，排除）。
+#:   带预期分类的脱敏完整 UA 样本表见 tests/test_site_stats.py。
+#: **口径局限**：本模块不保留原始 UA，历史 suspected_bot 行无法按新词表
+#: 可靠重分类——不做批量改写历史，也不宣称历史数据已修复；新词表只影响
+#: 新落库事件的分类。
+SITE_BOT_UA_RULESET_VERSION = "2026-09-19.v2"
 
 #: 页面 allowlist（path → page_key）：**精确匹配**，不允许前缀/模糊命中未知
 #: 路径（权威定义；0030 的 page_key CHECK 只约束形态）。集合口径 §4.4：
@@ -172,6 +187,11 @@ _QUERY_DENY_EXACT = frozenset({
 # --------------------------------------------------------------------------- #
 # bot 词表（仿 mywebpage 口径；规则归本仓所有，运行时不 import 外部仓库）。
 # 有序：具体名称优先于泛化标记；needle 均为小写子串。
+# 规则形态：(needle, 规范名称[, 排除子串, ...])——命中 needle 且**不含**任一
+# 排除子串才判为该 bot。review 2026-09-19 §7：部分 App 的「内置浏览器 UA」
+# 与「链接预览抓取 UA」共享厂商子串（如 WhatsApp），用排除子串收窄，不把
+# 内置浏览器访问当抓取；已证实过宽的裸子串（如 sogou）一律改为具体爬虫
+# 标识。带预期分类的脱敏完整 UA 样本表见 tests/test_site_stats.py。
 # --------------------------------------------------------------------------- #
 _BOT_UA_NEEDLES = (
     ("googlebot", "Googlebot"),
@@ -183,7 +203,15 @@ _BOT_UA_NEEDLES = (
     ("baiduspider", "Baiduspider"),
     ("yandexbot", "YandexBot"),
     ("yandeximages", "YandexImages"),
-    ("sogou", "SogouSpider"),
+    # 搜狗（v2 收窄）：裸 ``sogou`` 会命中 SogouMobileBrowser/SogouExplorer
+    # 等搜狗系浏览器 UA（实测 v1 误判）。只认官方爬虫标识；未知搜狗爬虫
+    # 变体仍会命中泛化 ``spider`` 标记 → generic_bot，不会漏成已验证真人。
+    ("sogou spider", "SogouSpider"),        # Sogou spider/x.y
+    ("sogou web spider", "SogouSpider"),    # Sogou web spider/4.0
+    ("sogouspider", "SogouSpider"),         # SogouSpider/x.y
+    ("sogou inst spider", "SogouSpider"),
+    ("sogou news spider", "SogouSpider"),
+    ("sogou mobile spider", "SogouSpider"),
     ("applebot", "Applebot"),
     ("petalbot", "PetalBot"),
     ("ahrefsbot", "AhrefsBot"),
@@ -195,7 +223,10 @@ _BOT_UA_NEEDLES = (
     ("linkedinbot", "LinkedInBot"),
     ("slackbot", "Slackbot"),
     ("discordbot", "Discordbot"),
-    ("whatsapp", "WhatsApp"),
+    # WhatsApp（v2 收窄）：链接预览抓取 UA 为裸 ``WhatsApp/2.x``（无
+    # Mozilla/ 前缀）；内置浏览器 UA 以 Mozilla/5.0 开头且携带 WhatsApp
+    # 厂商词——排除之，保持人类口径。
+    ("whatsapp", "WhatsApp", "mozilla/"),
     ("telegrambot", "TelegramBot"),
     ("headless", "HeadlessBrowser"),
     ("phantomjs", "PhantomJS"),
@@ -508,12 +539,20 @@ def _clean_utm_source(value):
 # --------------------------------------------------------------------------- #
 def _classify_user_agent(user_agent):
     """命中疑似 bot → 规范 bot 名称；否则 None（人类）。只做观测标签，
-    不做安全封禁依据（§3.4）。原始 UA 在调用处用后即弃，不落库。"""
+    不做安全封禁依据（§3.4）。原始 UA 在调用处用后即弃，不落库。
+
+    规则形态见 ``_BOT_UA_NEEDLES``：命中 needle 且不含该规则的排除子串
+    （如 WhatsApp 内置浏览器的 ``mozilla/``）才判为 bot。
+    **口径局限（review 2026-09-19 §7）**：空/缺失 UA 返回 None 并被下游
+    归入 anonymous_human——这只表示「UA 未命中 bot 词表」，不等于已验证
+    真人。不新增 unknown 维度（需同步 schema/API/统计契约，另行评审），
+    也不把空 UA 擅自当成确定爬虫。
+    """
     ua = (user_agent or "").strip().lower()
     if not ua:
         return None
-    for needle, name in _BOT_UA_NEEDLES:
-        if needle in ua:
+    for needle, name, *exclusions in _BOT_UA_NEEDLES:
+        if needle in ua and not any(excl in ua for excl in exclusions):
             return name
     for marker in _BOT_UA_GENERIC_MARKERS:
         if marker in ua:
@@ -820,14 +859,16 @@ def _window_agg(start_utc, end_utc, entry_hosts):
 
 
 def _daily_series(start_utc, end_utc, days, entry_hosts):
-    """30 天逐日序列（缺日补零；只计白名单入口）。日界：本地（UTC+8）日，
-    SQL 侧先把 timestamptz 剥成 naive UTC 再加固定偏移，避免 ::date 受会话
-    时区影响。
+    """逐日序列（R4 2026-09-19 契约：**严格倒序**——第 1 行 = 窗口内最后
+    一个本地日（通常今天），其后依次回退，最后一行 = 该日 − (days−1) 天；
+    缺日补 0；只计白名单入口）。日界：本地（UTC+8）日，SQL 侧先把
+    timestamptz 剥成 naive UTC 再加固定偏移，避免 ::date 受会话时区影响。
 
     序列锚定在 [start, end) 的**最后一个本地日**（end−1µs 的本地日期），
-    与 SQL 分组键共用同一日界；调用方传完整窗口（如 [今天−29 天零点,
-    明天零点)）即得以今天结尾的 30 天序列（review 2026-09-14：此前锚点
-    取首参日期，调用方只能传今天一天宽的窗口，其余 29 天恒为 0）。"""
+    与 SQL 分组键共用同一日界；调用方传完整窗口（如 [今天−6 天零点,
+    明天零点)）即得以今天开头的 days 天倒序序列（review 2026-09-14：锚点
+    取首参日期会让调用方只能传今天一天宽的窗口）。顺序契约由本 API 明确
+    提供（下游 admin 插件 UI 按返回顺序原样渲染），不依赖 CSS 倒排。"""
     sql = (
         "SELECT (occurred_at AT TIME ZONE 'UTC'"
         "         + INTERVAL '%d hours')::date AS day,"
@@ -854,8 +895,8 @@ def _daily_series(start_utc, end_utc, days, entry_hosts):
     last_day = (end_utc - timedelta(microseconds=1)) \
         .astimezone(_STATS_TIMEZONE).date()
     series = []
-    for i in range(days - 1, -1, -1):
-        day = last_day - timedelta(days=i)
+    for offset in range(0, days):          # 0=最新（今天）→ days-1=最旧
+        day = last_day - timedelta(days=offset)
         row = grouped.get(day)
         series.append({
             "date": day.isoformat(),
@@ -870,9 +911,9 @@ def _top_list(start_utc, end_utc, column, output_key, extra_where,
               entry_hosts, limit=10):
     """Top-N（只计白名单入口；column/extra_where 均为模块内字面常量，不经
     外部输入）。top_referrers 排除 direct/空——同站跳转不是外部来源；来源
-    是浏览器声明的 Referer（可伪造），默认口径（top_referrers）排除疑似爬虫，
-    对照口径（top_referrers_with_bots）不排除；top_countries 排除 unknown
-    ——UI 据此隐藏国家块。"""
+    是浏览器声明的 Referer（可伪造），**固定排除疑似爬虫**（R4 2026-09-19：
+    爬虫开关退役，含爬虫的对照口径 top_referrers_with_bots 一并移除）；
+    top_countries 排除 unknown——UI 据此隐藏国家块。"""
     sql = (
         "SELECT %s AS value, count(*) AS visits"
         " FROM site_visit_events"
@@ -987,21 +1028,22 @@ def dashboard_stats(*, now=None):
         "today": windows["today"],
         "d7": windows["d7"],
         "d30": windows["d30"],
-        # 查询窗口必须是完整 30 天（[d30_start, today_end)，含今日）——此前
-        # 误传 (today_start, today_end) 导致 SQL 只查到今天一天，其余 29 天
-        # 被「缺日补零」填成 0（review 2026-09-14）；序列锚定见 _daily_series
-        "daily": _daily_series(d30_start, today_end, 30, hosts),
-        # 默认口径排除疑似爬虫（referrer spam 基本是爬虫，与 unique_visitors
-        # 的"爬虫不进人类指标"口径一致）；with_bots 为对照口径，面板可切换
+        # R4（2026-09-19）：每日趋势 = 近 7 天完整窗口（[今天−6 天零点,
+        # 明天零点)，7 行严格倒序，第 1 行 = 今天）。窗口必须完整传参——
+        # 此前误传 (today_start, today_end) 导致其余 6 天被「缺日补零」填
+        # 成 0（review 2026-09-14）；锚定见 _daily_series。today/d7/d30
+        # KPI 与 Top 榜窗口不变：30 天 KPI 不随趋势窗口切换。
+        "daily": _daily_series(d7_start, today_end, 7, hosts),
+        # 外部来源榜**固定排除**疑似爬虫（R4 2026-09-19：爬虫开关退役；
+        # 含爬虫的对照口径 top_referrers_with_bots 移除——无其他产品消费
+        # 者）。referrer spam 基本是爬虫，与 unique_visitors 的「爬虫不进
+        # 人类指标」口径一致；总览疑似爬虫计数（d30.bots /
+        # visitor_kinds.suspected_bot）保留不受影响。
         "top_referrers": _top_list(
             d30_start, today_end, "referrer_domain", "domain",
             "AND referrer_domain IS NOT NULL"
             " AND referrer_domain <> 'direct'"
             " AND visitor_kind <> 'suspected_bot'", hosts),
-        "top_referrers_with_bots": _top_list(
-            d30_start, today_end, "referrer_domain", "domain",
-            "AND referrer_domain IS NOT NULL"
-            " AND referrer_domain <> 'direct'", hosts),
         "top_pages": _top_list(
             d30_start, today_end, "page_key", "page_key", "", hosts),
         "top_countries": _top_list(

@@ -613,6 +613,10 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
 			// 指标命名必须是「日去重次数」口径（帮助文案须明确否定「独立用户数」）
 			await expect(siteCard).toContainText("匿名访客日去重次数");
 			await expect(siteCard).toContainText("不是独立用户数");
+			// R4（2026-09-19）：来源榜爬虫开关退役——无开关 DOM；趋势标题为 7 天
+			expect(await frame.locator("#adm-site-referrers-bots-toggle").count()).toBe(0);
+			await expect(siteCard).toContainText("近 7 天每日趋势");
+			await expect(siteCard).toContainText("外部来源（不含疑似爬虫）");
 		}
 		await assertNoHorizontalOverflow(page, "overview-1440");
 		await shot(page, "after-1440-overview.png");

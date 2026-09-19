@@ -690,12 +690,13 @@ describe("wave 2 — 概览页收敛 + 站点访问卡（§4.2 / D2-3）", () =>
 				today: { visits: 12, unique_visitors: 7, bots: 1 },
 				d7: { visits: 80, unique_visitors: 41, bots: 4 },
 				d30: { visits: 300, unique_visitors: 120, bots: 15 },
-				daily: [{ date: "2026-09-01", visits: 10, unique_visitors: 6, bots: 1 }],
-				top_referrers: [{ domain: "google.com", visits: 5 }],
-				top_referrers_with_bots: [
-					{ domain: "spam.example", visits: 40 },
-					{ domain: "google.com", visits: 5 },
+				// R4（2026-09-19）：daily = 近 7 天倒序契约（第 1 行 = 今天），
+				// UI 按后端返回顺序原样渲染
+				daily: [
+					{ date: "2026-09-03", visits: 10, unique_visitors: 6, bots: 1 },
+					{ date: "2026-09-02", visits: 4, unique_visitors: 3, bots: 0 },
 				],
+				top_referrers: [{ domain: "google.com", visits: 5 }],
 				top_pages: [{ page_key: "home", visits: 90 }],
 				top_countries: [{ country_code: "unknown", visits: 10 }],
 				visitor_kinds: { anonymous_human: 200, signed_in_human: 85, suspected_bot: 15 },
@@ -718,10 +719,24 @@ describe("wave 2 — 概览页收敛 + 站点访问卡（§4.2 / D2-3）", () =>
 		expect(kpis).toContain("匿名访客日去重次数（30 天累计）");
 		expect(kpis).toContain("不是独立用户数");
 		expect(kpis).toContain("疑似爬虫");
-		// 来源榜默认排除爬虫（review 2026-09-15）：只渲染 top_referrers
+		// R4：趋势标题改「近 7 天每日趋势」，旧的 30 天趋势标题不再存在
+		expect(htmlSrc).toContain("近 7 天每日趋势");
+		expect(htmlSrc).not.toContain("近 30 天每日趋势");
+		// R4：日期严格倒序 = 按后端返回顺序原样渲染（API 契约，不做 CSS 倒排/
+		// 前端重排）——先出现的日期更新
+		const dailyBody = bus.els["adm-site-daily-tbody"].textContent;
+		expect(dailyBody).toContain("2026-09-03");
+		expect(dailyBody).toContain("2026-09-02");
+		expect(dailyBody.indexOf("2026-09-03")).toBeLessThan(dailyBody.indexOf("2026-09-02"));
+		// 来源榜固定排除爬虫（R4 2026-09-19 爬虫开关退役）：只渲染 top_referrers；
+		// 开关 DOM 与含爬虫对照口径在 HTML/JS 两端都不再存在
 		const refBody = bus.els["adm-site-referrers-tbody"].textContent;
 		expect(refBody).toContain("google.com");
 		expect(refBody).not.toContain("spam.example");
+		expect(htmlSrc).not.toContain("adm-site-referrers-bots-toggle");
+		expect(src).not.toContain("adm-site-referrers-bots-toggle");
+		expect(src).not.toContain("top_referrers_with_bots");
+		expect(htmlSrc).toContain("外部来源（不含疑似爬虫）");
 		expect(bus.els["adm-site-pages-tbody"].textContent).toContain("home");
 		// 最近访问带「访问域名」列；入口白名单与历史隔离在提示行可见
 		const recent = bus.els["adm-site-recent-tbody"].textContent;
@@ -731,13 +746,7 @@ describe("wave 2 — 概览页收敛 + 站点访问卡（§4.2 / D2-3）", () =>
 		expect(note).toContain("histopilot.com、pt.solarise94.fun");
 		expect(note).toContain("7 条");
 		expect(bus.els["adm-site-entry-warn"].hidden).toBe(true);
-		// 勾选「包含疑似爬虫」→ 切换到 with_bots 对照口径（不发新桥请求）
-		const toggle = bus.els["adm-site-referrers-bots-toggle"];
-		toggle.checked = true;
-		toggle._fire("change");
-		const refBody2 = bus.els["adm-site-referrers-tbody"].textContent;
-		expect(refBody2).toContain("spam.example");
-		expect(refBody2).toContain("google.com");
+		// 总览的疑似爬虫计数保留（R4：只退役来源榜开关，不动总览口径）
 		expect(bus.els["adm-site-kinds"].textContent).toContain("疑似爬虫");
 		// geo_configured=false：国家块隐藏
 		expect(bus.els["adm-site-countries-block"].hidden).toBe(true);
@@ -765,8 +774,7 @@ describe("wave 2 — 概览页收敛 + 站点访问卡（§4.2 / D2-3）", () =>
 				d7: { visits: 0, unique_visitors: 0, bots: 0 },
 				d30: { visits: 0, unique_visitors: 0, bots: 0 },
 				daily: [],
-				top_referrers: [], top_referrers_with_bots: [],
-				top_pages: [], top_countries: [],
+				top_referrers: [], top_pages: [], top_countries: [],
 				visitor_kinds: { anonymous_human: 0, signed_in_human: 0, suspected_bot: 0 },
 				recent: [],
 				entry_hosts: [],
@@ -784,7 +792,7 @@ describe("wave 2 — 概览页收敛 + 站点访问卡（§4.2 / D2-3）", () =>
 		expect(bus.els["adm-site-entry-note"].hidden).toBe(true);
 	});
 
-	it("站点访问卡：零数据（daily 为 30 行补零序列）显示空态而非一排 0", async () => {
+	it("站点访问卡：零数据（daily 为 7 行补零序列）显示空态而非一排 0", async () => {
 		const bus = loadPluginUiWithBus();
 		boot(bus);
 		bus.client!.showPage("overview");
@@ -792,10 +800,10 @@ describe("wave 2 — 概览页收敛 + 站点访问卡（§4.2 / D2-3）", () =>
 		replyMethod(bus, NONCE, "admin.overview.get", {
 			ok: true, result: { users: { total: 1 }, billing: { available: false } },
 		});
-		// 后端契约：daily 恒返回 30 行缺日补零序列（长度判断空态永远不成立，
-		// review 2026-09-14 修复——空态只看真实事件数）
-		const zeroDaily = Array.from({ length: 30 }, (_, i) => ({
-			date: `2026-08-${String(i + 1).padStart(2, "0")}`,
+		// 后端契约：daily 恒返回 7 行缺日补零倒序序列（R4 2026-09-19；长度
+		// 判断空态永远不成立，review 2026-09-14 修复——空态只看真实事件数）
+		const zeroDaily = Array.from({ length: 7 }, (_, i) => ({
+			date: `2026-09-0${7 - i}`,
 			visits: 0, unique_visitors: 0, bots: 0,
 		}));
 		replyMethod(bus, NONCE, "admin.siteStats.get", {

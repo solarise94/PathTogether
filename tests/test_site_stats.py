@@ -29,8 +29,11 @@ store 级（默认全跑；PG-only 用例 RUN_PG_TESTS=1）：
     三分类互不混入（爬虫不进入匿名访客近似数）；只读——调用前后业务表与
     site 表行数不变、不触发清理；90 天窗口外事件不计入；聚合只计
     request_host 命中当前白名单的行（同机其它域名/历史 NULL 行隔离，
-    legacy.d30_visits 单独计数）；top_referrers 默认排除疑似爬虫、
-    top_referrers_with_bots 为含爬虫对照口径；白名单未配置时主口径恒空
+    legacy.d30_visits 单独计数）；top_referrers 固定排除疑似爬虫（R4
+    2026-09-19 爬虫开关退役，top_referrers_with_bots 对照口径一并移除）；
+    daily 每日趋势 = 近 7 天共 7 行、UTC+8 日界、缺日补 0、严格倒序
+    （第 1 行 = 今天，review 2026-09-19 R4）；today/d7/d30 KPI 窗口不变
+    （30 天 KPI 不被误切成 7 天）；白名单未配置时主口径恒空
     且 host_filter_configured=False；
   - purge_expired 只删 expires_at 到期行；
   - F4/R2-F5 每日保留任务接线（双跑纯单元，monkeypatch 注入）：R2-F5 拆分
@@ -84,7 +87,7 @@ _BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) Safari/605.1.15"
 
 DASHBOARD_KEYS = {
     "generated_at", "today", "d7", "d30", "daily", "top_referrers",
-    "top_referrers_with_bots", "top_pages", "top_countries", "recent",
+    "top_pages", "top_countries", "recent",
     "visitor_kinds", "entry_hosts", "host_filter_configured", "legacy",
     "geo_configured",
 }
@@ -389,7 +392,9 @@ def test_entry_host_allowlist_fail_closed(secret, monkeypatch, caplog):
 def test_ruleset_version_constant_shape():
     assert isinstance(sss.SITE_BOT_UA_RULESET_VERSION, str)
     assert sss.SITE_BOT_UA_RULESET_VERSION
-    assert sss.SITE_BOT_UA_RULESET_VERSION == "2026-09-03.v1"
+    # R5（2026-09-19）：词表收窄（sogou/whatsapp）必须提版——版本历史与
+    # 前后口径见 site_stats_store.SITE_BOT_UA_RULESET_VERSION 注释
+    assert sss.SITE_BOT_UA_RULESET_VERSION == "2026-09-19.v2"
 
 
 def test_bot_ua_classified_with_name(secret):
@@ -424,6 +429,184 @@ def test_human_kinds_and_bot_priority(secret):
     ev = _ev(user_agent="curl/8.4.0", signed_in=True)
     assert ev["visitor_kind"] == "suspected_bot"
     assert ev["bot_name"] == "curl"
+
+
+# --------------------------------------------------------------------------- #
+# 2b. R5（2026-09-19）：UA 样本表（脱敏完整 UA + 预期分类）
+#
+# 覆盖：搜狗浏览器 vs 搜狗爬虫、普通浏览器 vs Googlebot、链接预览抓取 vs
+# 内置浏览器、自动化工具、空 UA。每组附证据说明（为何应这样分类）。
+# 分类函数只依赖 UA 子串，store 级纯函数断言；不涉任何真实用户数据。
+# --------------------------------------------------------------------------- #
+#: (组名, 完整 UA, 预期 _classify_user_agent 结果, 证据)
+UA_FIXTURES = (
+    # --- 普通浏览器（必须保持 human，不因厂商词/来源误判）---
+    ("chrome-desktop",
+     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+     " (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+     None, "最常见桌面 Chrome，无任何爬虫标识"),
+    ("safari-macos",
+     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15"
+     " (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+     None, "桌面 Safari"),
+    ("firefox-desktop",
+     "Mozilla/5.0 (X11; Linux x86_64; rv:127.0) Gecko/20100101 Firefox/127.0",
+     None, "桌面 Firefox"),
+    ("sogou-mobile-browser",
+     "Mozilla/5.0 (Linux; U; Android 13; zh-cn; M2012K11AC Build/TKQ1.220829."
+     "002) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/108.0."
+     "5359.82 Mobile Safari/537.36 SogouMobileBrowser/6.0",
+     None, "v1 实测误判样本：搜狗手机浏览器 UA 带厂商词 sogou，"
+           "v2 收窄后不再命中 SogouSpider（爬虫标识是 spider 而非 browser）"),
+    ("sogou-desktop-browser",
+     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+     " (KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36 SE 2.X"
+     " MetaSr 1.0",
+     None, "搜狗高速浏览器（桌面）UA 带 SE 2.X MetaSr 1.0，无爬虫标识"),
+    ("wechat-inapp",
+     "Mozilla/5.0 (Linux; Android 13; PGT-AL10 Build/HUAWEIPGT-AL10;"
+     " wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0"
+     " Chrome/114.0.0.0 Mobile Safari/537.36 XWEB/85000917"
+     " MicroMessenger/8.0.49",
+     None, "微信内置浏览器：用户真实浏览，不是抓取"),
+    ("whatsapp-inapp",
+     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X)"
+     " AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+     " WhatsApp/24.9.0.80",
+     None, "WhatsApp 内置浏览器：UA 以 Mozilla/5.0 开头且带 WhatsApp 厂商"
+           "词——v1 会误判为链接预览抓取，v2 用 mozilla/ 排除子串收窄"),
+    # --- 已知爬虫 / 链接预览抓取（必须判为 suspected_bot + 具体名）---
+    ("googlebot",
+     "Mozilla/5.0 (compatible; Googlebot/2.1;"
+     " +http://www.google.com/bot.html)",
+     "Googlebot", "Google 官方搜索爬虫"),
+    ("bingbot",
+     "Mozilla/5.0 (compatible; bingbot/2.0;"
+     " +http://www.bing.com/bingbot.htm)",
+     "Bingbot", "Bing 官方爬虫"),
+    ("sogou-web-spider",
+     "Sogou web spider/4.0(+http://www.sogou.com/docs/help/webmasters.htm"
+     "#07)",
+     "SogouSpider", "搜狗官方网页爬虫（具体 spider 标识）"),
+    ("sogou-spider-compat",
+     "Mozilla/5.0 (compatible; SogouSpider/1.0;"
+     " +https://www.sogou.com/docs/help/webmasters.html)",
+     "SogouSpider", "搜狗爬虫的 Mozilla 包装形态"),
+    ("sogou-inst-spider",
+     "Sogou inst spider, contact spider@sogou.com",
+     "SogouSpider", "搜狗收录爬虫变体"),
+    ("whatsapp-link-preview",
+     "WhatsApp/2.19.81 A",
+     "WhatsApp", "WhatsApp 链接预览抓取：裸 UA（无 Mozilla/ 前缀），"
+                 "与内置浏览器 UA 形态可区分"),
+    ("facebook-link-preview",
+     "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext"
+     ".php)",
+     "FacebookExternalHit", "Facebook 链接预览抓取（专用抓取 UA，非浏览器）"),
+    ("twitterbot-preview",
+     "Twitterbot/1.0",
+     "Twitterbot", "Twitter/X 链接预览抓取"),
+    # --- 自动化 / 采集工具 ---
+    ("headless-chrome",
+     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like"
+     " Gecko) HeadlessChrome/120.0.0.0 Safari/537.36",
+     "HeadlessBrowser", "无头浏览器（自动化）"),
+    ("curl", "curl/8.4.0", "curl", "命令行 HTTP 客户端"),
+    ("python-requests", "python-requests/2.31.0", "python-requests",
+     "Python HTTP 库"),
+    ("generic-company-crawler",
+     "Mozilla/5.0 (compatible; SomeCompanyCrawler/1.0)",
+     "generic_bot", "未知公司爬虫：未命中具体词表，但命中泛化 crawl 标记"),
+    # --- 空 UA（口径局限，不是已验证真人）---
+    ("empty-ua", "", None, "空 UA：词表未命中 ≠ 已验证真人——下游归"
+                           " anonymous_human 是记录在案的口径局限"
+                           "（不新增 unknown 维度，见 _classify_user_agent "
+                           "docstring）"),
+)
+
+
+@pytest.mark.parametrize("group,ua,expected,evidence", UA_FIXTURES,
+                         ids=[f[0] for f in UA_FIXTURES])
+def test_ua_fixture_table_classifications(group, ua, expected, evidence):
+    """R5 样本表：每条脱敏完整 UA 的预期分类逐条钉死（id=组名）。"""
+    assert sss._classify_user_agent(ua) == expected, group
+
+
+def _ua(group):
+    """按组名取样本表中的完整 UA（避免脆弱的位置索引）。"""
+    for g, ua, _expected, _ev_reason in UA_FIXTURES:
+        if g == group:
+            return ua
+    raise AssertionError("unknown UA fixture group: %s" % group)
+
+
+def test_sogou_browser_human_and_sogou_spider_bot(secret):
+    """R4/R5 核心回归：搜狗浏览器不再被误判为爬虫；搜狗爬虫仍被抓出。"""
+    ev = _ev(user_agent=_ua("sogou-mobile-browser"))
+    assert ev is not None
+    assert ev["visitor_kind"] == "anonymous_human"
+    assert ev["bot_name"] is None
+    ev = _ev(user_agent=_ua("sogou-web-spider"))
+    assert ev["visitor_kind"] == "suspected_bot"
+    assert ev["bot_name"] == "SogouSpider"
+
+
+def test_whatsapp_inapp_human_and_link_preview_bot(secret):
+    """R5：WhatsApp 内置浏览器（Mozilla 形态）保持 human；裸 UA 链接预览
+    抓取仍判 WhatsApp bot——不能把每次内置浏览器访问当抓取。"""
+    ev = _ev(user_agent=_ua("whatsapp-inapp"))
+    assert ev["visitor_kind"] == "anonymous_human"
+    assert ev["bot_name"] is None
+    ev = _ev(user_agent=_ua("whatsapp-link-preview"))
+    assert ev["visitor_kind"] == "suspected_bot"
+    assert ev["bot_name"] == "WhatsApp"
+
+
+def test_empty_ua_limitation_documented(secret):
+    """空 UA 现状：返回 None → 下游归 anonymous_human。这是口径局限
+    （词表未命中 ≠ 已验证真人），按 review §7 保持现状并在代码注释/
+    文档写明，不擅自当成确定爬虫，也不新增 unknown 维度。"""
+    assert sss._classify_user_agent("") is None
+    assert sss._classify_user_agent(None) is None
+    assert sss._classify_user_agent("   ") is None
+    ev = _ev(user_agent="")
+    assert ev["visitor_kind"] == "anonymous_human"
+    assert ev["bot_name"] is None
+
+
+def test_search_referrer_from_human_browser_is_kept(secret):
+    """R5 行为契约：正常浏览器 UA + google/baidu Referer 保留外部来源，
+    访客为 human——不能把所有搜索来源当爬虫（来源=Referer、类别=UA，
+    两个维度独立）。"""
+    for referrer, domain in (("https://www.google.com/search?q=x", "www.google.com"),
+                             ("https://www.baidu.com/s?wd=x", "www.baidu.com")):
+        ev = _ev(referrer=referrer)
+        assert ev["referrer_domain"] == domain, referrer
+        assert ev["visitor_kind"] == "anonymous_human", referrer
+        assert ev["bot_name"] is None, referrer
+
+
+def test_googlebot_with_referrer_is_bot_and_excluded_from_referrers(secret):
+    """R5 行为契约：Googlebot + 任意 Referer → suspected_bot，且被外部
+    来源榜排除（含爬虫对照口径已随 R4 移除）；站内跨入口 Referer 按现有
+    规则归 direct。Google/Baidu 真人点击不受影响（见上一用例）。"""
+    bot = _ev(remote_addr="216.239.32.10",
+              user_agent=_ua("googlebot"),
+              referrer="https://news.example.com/from-google")
+    assert bot["visitor_kind"] == "suspected_bot"
+    assert bot["bot_name"] == "Googlebot"
+    assert bot["referrer_domain"] == "news.example.com"  # 事件保留来源明细
+    human = _ev(remote_addr="198.51.100.5", path="/demo",
+                referrer="https://news.example.com/human-click")
+    _flush([bot, human])
+    stats = sss.dashboard_stats(now=BASE_TIME)
+    assert "top_referrers_with_bots" not in stats   # 对照口径已移除
+    assert stats["top_referrers"] == [
+        {"domain": "news.example.com", "visits": 1}]  # 只剩人类那条
+    # 站内跨入口来源按现有规则归 direct（两入口互跳不当外部来源）
+    cross = _ev(remote_addr="203.0.113.77", path="/login",
+                host="pt.solarise94.fun", referrer="https://histopilot.com/")
+    assert cross["referrer_domain"] == "direct"
 
 
 # --------------------------------------------------------------------------- #
@@ -680,15 +863,14 @@ def test_dashboard_stats_counts_and_readonly(secret):
     for key in ("today", "d7", "d30"):
         assert set(stats[key].keys()) == WINDOW_KEYS, key
     assert set(stats["visitor_kinds"].keys()) == set(sss.VISITOR_KINDS)
-    assert len(stats["daily"]) == 30
+    # R4（2026-09-19）：daily 趋势 = 近 7 天共 7 行（UTC+8 日界、缺日补 0）
+    assert len(stats["daily"]) == 7
     for row in stats["daily"]:
         assert set(row.keys()) == DAILY_KEYS
     assert len(stats["recent"]) == 4
     for row in stats["recent"]:
         assert set(row.keys()) == RECENT_KEYS
     for row in stats["top_referrers"]:
-        assert set(row.keys()) == {"domain", "visits"}
-    for row in stats["top_referrers_with_bots"]:
         assert set(row.keys()) == {"domain", "visits"}
     for row in stats["top_pages"]:
         assert set(row.keys()) == {"page_key", "visits"}
@@ -706,14 +888,14 @@ def test_dashboard_stats_counts_and_readonly(secret):
     assert stats["d30"] == stats["today"]
     assert stats["visitor_kinds"] == {
         "anonymous_human": 2, "signed_in_human": 1, "suspected_bot": 1}
-    assert stats["daily"][-1] == {
+    # 倒序契约第 1 行 = 今天（BASE_DAY）
+    assert stats["daily"][0] == {
         "date": BASE_DAY, "visits": 4, "unique_visitors": 2, "bots": 1}
-    # top：外部来源排除 direct；默认口径还排除疑似爬虫（referrer spam
-    # 基本是爬虫），with_bots 为含爬虫对照口径；国家全 unknown → 空列表
+    # top：外部来源排除 direct；固定排除疑似爬虫（R4 2026-09-19 爬虫开关
+    # 退役，含爬虫对照口径 top_referrers_with_bots 已移除）；国家全 unknown
+    # → 空列表
     assert stats["top_referrers"] == [
         {"domain": "news.example.com", "visits": 1}]
-    assert stats["top_referrers_with_bots"] == [
-        {"domain": "news.example.com", "visits": 2}]
     assert stats["top_pages"] == [
         {"page_key": "home", "visits": 2},
         {"page_key": "demo", "visits": 1},
@@ -798,13 +980,11 @@ def test_dashboard_fail_closed_when_allowlist_unconfigured(
     assert stats["legacy"] == {"d30_visits": 0}
 
 
-def test_dashboard_stats_daily_series_covers_full_30_days(secret):
-    """回归（review 2026-09-14）：daily 序列必须覆盖完整 30 天窗口。
-
-    旧 bug：dashboard_stats 误把 (today_start, today_end) 传给 _daily_series，
-    SQL 只查到今天一天，其余 29 天被缺日补零填成 0——近 30 天趋势表除今天
-    外恒为 0。断言：前几天的事件落在正确日期行，30 天合计 == d30.visits。"""
-    # 不同 /24（跨桶、跨日哈希不同）避免去重互相吞并；today 与各历史日各 1 条
+def test_dashboard_stats_daily_series_is_seven_days_descending(secret):
+    """R4（review 2026-09-19）：daily 趋势 = 近 7 天共 7 行、严格倒序
+    （第 1 行 = 今天）、缺日补 0；today/d7/d30 KPI 窗口不变——7 天窗口外、
+    30 天窗口内的旧事件仍计入 d30 KPI（30 天 KPI 没有被误切成 7 天）。"""
+    # 不同 /24 避免去重互相吞并；today 与各历史日各 1 条
     _flush([
         _ev(remote_addr="203.0.113.1"),                                      # 今天
         _ev(remote_addr="203.0.114.2",
@@ -817,21 +997,62 @@ def test_dashboard_stats_daily_series_covers_full_30_days(secret):
             now=BASE_TIME - timedelta(days=40)),                            # 窗口外
     ])
     stats = sss.dashboard_stats(now=BASE_TIME)
+    # 30 天 KPI 仍覆盖完整 30 天窗口（4 条），7 天趋势只含其中 2 条
     assert stats["d30"]["visits"] == 4
-    by_date = {row["date"]: row for row in stats["daily"]}
-    assert len(stats["daily"]) == 30
-    # 序列边界：最早一天 = 今天 - 29 天，最晚一天 = 今天
+    assert stats["d7"]["visits"] == 2
+    assert len(stats["daily"]) == 7
     base_day = datetime.strptime(BASE_DAY, "%Y-%m-%d").date()
-    assert stats["daily"][0]["date"] == (base_day - timedelta(days=29)).isoformat()
-    assert stats["daily"][-1]["date"] == BASE_DAY
+    # 严格倒序：第 1 行 = 今天，随后逐日回退，最后一行 = 今天 − 6 天
+    dates = [row["date"] for row in stats["daily"]]
+    assert dates == [(base_day - timedelta(days=i)).isoformat()
+                     for i in range(7)]
+    assert all(
+        dates[i] > dates[i + 1] for i in range(len(dates) - 1))
+    by_date = {row["date"]: row for row in stats["daily"]}
     assert by_date[BASE_DAY]["visits"] == 1
     assert by_date[(base_day - timedelta(days=3)).isoformat()]["visits"] == 1
-    assert by_date[(base_day - timedelta(days=10)).isoformat()]["visits"] == 1
-    assert by_date[(base_day - timedelta(days=29)).isoformat()]["visits"] == 1
-    # 40 天前不入任何一天
-    assert sum(row["visits"] for row in stats["daily"]) == 4
-    assert sum(row["unique_visitors"] for row in stats["daily"]) \
-        == stats["d30"]["unique_visitors"] == 4
+    # 缺日补 0：其余 5 天全零（10/29 天前的事件不进入 7 天趋势）
+    assert sum(row["visits"] for row in stats["daily"]) == 2
+    assert sum(1 for row in stats["daily"] if row["visits"] == 0) == 5
+
+
+def test_dashboard_stats_daily_seven_rows_cross_month_year_and_utc8_boundary(
+        secret):
+    """R4 通过条件：冻结日期跨月/跨年 + UTC+8 零点边界下仍是共 7 行的倒序
+    序列，补零正确。
+
+    冻结 now = 2025-12-31 16:30 UTC = 本地（UTC+8）2026-01-01 00:30
+    （跨年又跨月的今天）。7 行应为 2026-01-01 → 2025-12-26。
+    """
+    frozen_utc = datetime(2025, 12, 31, 16, 30, 0, tzinfo=UTC)
+    boundary_before = datetime(2025, 12, 31, 15, 59, 59, tzinfo=UTC)
+    boundary_after = datetime(2025, 12, 31, 16, 0, 0, tzinfo=UTC)
+    _flush([
+        # UTC+8 零点前 1 秒 → 本地 2025-12-31 23:59:59（趋势第 2 行）
+        _ev(remote_addr="203.0.113.1", now=boundary_before),
+        # UTC+8 零点整 → 本地 2026-01-01 00:00:00（趋势第 1 行「今天」）
+        _ev(remote_addr="203.0.114.2", now=boundary_after),
+        # 趋势最末行（今天 − 6 天 = 2025-12-26 本地）：UTC 02:00 = 本地 10:00
+        _ev(remote_addr="203.0.115.3",
+            now=datetime(2025, 12, 26, 2, 0, 0, tzinfo=UTC)),
+        # 7 天窗口外（本地 2025-12-25）：不入趋势，但仍计入 d30 KPI
+        _ev(remote_addr="203.0.116.4",
+            now=datetime(2025, 12, 25, 2, 0, 0, tzinfo=UTC)),
+    ])
+    stats = sss.dashboard_stats(now=frozen_utc)
+    dates = [row["date"] for row in stats["daily"]]
+    assert dates == [
+        "2026-01-01", "2025-12-31", "2025-12-30", "2025-12-29",
+        "2025-12-28", "2025-12-27", "2025-12-26"]
+    assert all(dates[i] > dates[i + 1] for i in range(len(dates) - 1))
+    # 零点两侧各 1 条，分属第 1/2 行；最末行 1 条；其余 4 天补 0
+    visits = {row["date"]: row["visits"] for row in stats["daily"]}
+    assert visits == {"2026-01-01": 1, "2025-12-31": 1, "2025-12-26": 1,
+                      "2025-12-30": 0, "2025-12-29": 0, "2025-12-28": 0,
+                      "2025-12-27": 0}
+    # 30 天 KPI 未被误切：窗口外那条（本地 2025-12-25）仍计入 d30
+    assert stats["d30"]["visits"] == 4
+    assert stats["d7"]["visits"] == 3
 
 
 def test_dashboard_stats_excludes_expired_window_and_never_purges(secret):
@@ -842,7 +1063,7 @@ def test_dashboard_stats_excludes_expired_window_and_never_purges(secret):
     assert stats["today"]["visits"] == 1
     assert stats["d30"]["visits"] == 1
     assert stats["d30"]["unique_visitors"] == 1
-    # 30 天 daily 里最早一天也要晚于 40 天前的事件（无任何一天计入它）
+    # 7 天趋势里任何一天都不计入 40 天前的事件
     assert all(row["visits"] <= 1 for row in stats["daily"])
     assert sum(row["visits"] for row in stats["daily"]) == 1
     # 只读聚合不得顺带清理到期行（outside 行 expires_at 未到本例 now，但
@@ -1007,7 +1228,8 @@ def test_app_admin_site_stats_owner_only(monkeypatch):
     for key in ("today", "d7", "d30"):
         assert set(payload[key].keys()) == WINDOW_KEYS
     assert set(payload["visitor_kinds"].keys()) == set(sss.VISITOR_KINDS)
-    assert len(payload["daily"]) == 30
+    # R4（2026-09-19）：API 明确提供近 7 天倒序契约
+    assert len(payload["daily"]) == 7
     for row in payload["daily"]:
         assert set(row.keys()) == DAILY_KEYS
     assert payload["geo_configured"] is False

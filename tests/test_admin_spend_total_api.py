@@ -308,13 +308,16 @@ def test_site_stats_owner_only_and_readonly_passthrough():
     assert r.status_code == 200, r.get_data(as_text=True)
     body = r.get_json()
     for key in ("generated_at", "today", "d7", "d30", "daily",
-                "top_referrers", "top_referrers_with_bots", "top_pages",
+                "top_referrers", "top_pages",
                 "top_countries", "recent", "visitor_kinds", "entry_hosts",
                 "host_filter_configured", "legacy", "geo_configured"):
         assert key in body, key
     for seg in ("today", "d7", "d30"):
         assert set(body[seg].keys()) == {"visits", "unique_visitors", "bots"}
-    assert len(body["daily"]) == 30
+    # R4（2026-09-19）：daily = 近 7 天倒序 7 行；top_referrers_with_bots
+    # 对照口径已随爬虫开关退役
+    assert len(body["daily"]) == 7
+    assert "top_referrers_with_bots" not in body
     assert body["geo_configured"] is False
     # 只读：无写副作用（调用后形状仍为空，无事件被创建）
     r2 = c.get("/api/admin/v1/site-stats")

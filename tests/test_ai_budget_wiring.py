@@ -718,7 +718,9 @@ def test_ui_budget_card_and_max_steps_sync_present():
     # 2026-09-19 0.4.9（service review R6）：身份冲突清单/孤儿处置页与手动
     # 建号整体退役（0.4.1 引入的身份冲突页撤销）；0.4.5–0.4.8 的断言跟进
     # 见 test_admin_plugin.py。hashes/pin 同步
-    assert manifest["pluginVersion"] == "0.4.9"
+    # 2026-09-19 0.4.10（R4）：每日趋势近 7 天倒序、来源榜固定排除疑似
+    # 爬虫。hashes/pin 同步
+    assert manifest["pluginVersion"] == "0.4.10"
     for perm in ("admin:turn-budgets:read", "admin:turn-budgets:write",
                  "admin:acquisition:read", "admin:billing:write"):
         assert perm not in manifest["adminPermissions"], perm

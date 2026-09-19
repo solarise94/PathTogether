@@ -87,7 +87,6 @@
     modelSnapshot: null,
     modelError: null,
     // 费用页数据快照（KPI/告警条聚合用；仅内存）
-    siteStats: null,        // 站点访问统计快照（来源榜爬虫切换只重渲染，不发请求）
     billOverview: null,
     billProviderBalance: null,
     billProviderBalanceError: null,
@@ -841,16 +840,15 @@
   //
   // 入口口径（review 2026-09-15）：后端聚合只计「访问域名」命中
   // SITE_STATS_ENTRY_HOSTS 白名单的行；host_filter_configured=false 时亮
-  // 警示条。来源榜默认排除疑似爬虫，勾选切换到含爬虫对照口径
-  // （top_referrers_with_bots），切换只重渲染本页内存快照，不发新请求。
+  // 警示条。外部来源榜**固定排除疑似爬虫**（R4 2026-09-19：爬虫开关退役，
+  // 后端只提供 top_referrers 固定口径；总览疑似爬虫计数保留）。
   // ------------------------------------------------------------------
   function loadSiteStats() {
     var card = $("adm-site-card");
     request("admin.siteStats.get", {}).then(function (res) {
       if (!card) return;
       card.hidden = false;
-      state.siteStats = res || {};
-      renderSiteStats(state.siteStats);
+      renderSiteStats(res || {});
     }).catch(function () {
       if (card) card.hidden = true;
     });
@@ -895,14 +893,13 @@
     }
   }
 
+  // R4（2026-09-19）：爬虫开关退役——来源榜固定渲染 top_referrers
+  // （后端已排除疑似爬虫），不再有 checked 切换 state 与对照口径分支。
   function renderSiteReferrers(res) {
-    var toggle = $("adm-site-referrers-bots-toggle");
-    var withBots = !!(toggle && toggle.checked);
-    var rows = withBots ? res.top_referrers_with_bots : res.top_referrers;
     var tbody = $("adm-site-referrers-tbody");
     if (!tbody) return;
     tbody.textContent = "";
-    (rows || []).slice(0, 10).forEach(function (r) {
+    (res.top_referrers || []).slice(0, 10).forEach(function (r) {
       var tr = document.createElement("tr");
       tr.appendChild(td(r.domain || "（直接）"));
       tr.appendChild(td(fmtNum(r.visits)));
@@ -918,9 +915,10 @@
     var today = res.today || {};
     var d7 = res.d7 || {};
     var d30 = res.d30 || {};
-    // 空态判定看「真实事件数」而不是 daily 长度——后端 daily 恒返回 30 行
-    // （缺日补零），按长度判断空态永远不成立（review 2026-09-14）。recent
-    // 兜底 30 天窗口外仍留存的记录（保留期内），两种任一非空即视为有数据。
+    // 空态判定看「真实事件数」而不是 daily 长度——后端 daily 恒返回 7 行
+    // （近 7 天倒序、缺日补零，R4 2026-09-19），按长度判断空态永远不成立
+    // （review 2026-09-14）。recent 兜底 30 天窗口外仍留存的记录（保留期
+    // 内），两种任一非空即视为有数据。
     var hasData = Number(d30.visits || 0) > 0 ||
       (res.recent || []).length > 0;
     if (empty) {
@@ -945,6 +943,9 @@
 
     var dailyBody = $("adm-site-daily-tbody");
     if (dailyBody) {
+      // 近 7 天每日趋势（R4 2026-09-19）：后端 API 契约即「严格倒序」
+      // （第 1 行 = 今天，缺日补 0）——按返回顺序原样渲染，不做 CSS 倒排，
+      // 也不在前端重排顺序。
       dailyBody.textContent = "";
       (res.daily || []).forEach(function (d) {
         var tr = document.createElement("tr");
@@ -3918,14 +3919,8 @@
     onClick("adm-users-more-btn", function () { loadUsers(true); });
     // R6（2026-09-19）：「新建用户」表单与身份冲突页监听已退役移除
     // （submitCreateUser / adm-identity-refresh-btn 不再存在）
-    // 站点访问（review 2026-09-15）：来源榜「包含疑似爬虫」切换——只按本页
-    // 内存快照重渲染，不发新的桥请求
-    var refBotsToggle = $("adm-site-referrers-bots-toggle");
-    if (refBotsToggle && refBotsToggle.addEventListener) {
-      refBotsToggle.addEventListener("change", function () {
-        if (state.siteStats) renderSiteReferrers(state.siteStats);
-      });
-    }
+    // R4（2026-09-19）：来源榜「包含疑似爬虫」切换（change 监听 + state
+    // 快照分支）已随开关一并退役——来源榜固定排除疑似爬虫
     // 邀请页（wave 2：注册模式只读 + 跳设置）
     onClick("adm-invite-goto-settings-btn", function () { showPage("settings"); });
     onClick("adm-invite-create-btn", submitCreateInvite);

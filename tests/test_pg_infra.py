@@ -245,6 +245,15 @@ def test_schema_migrations_recorded(conn):
         # 2026-09-14 W5：百度分享导入（枚举/候选/批次/条目四表）。
         "0051_baidu_remote_imports.sql",
         "0052_import_target_association.sql",
+        # 站点访问统计入口域名口径（review 2026-09-15）：site_visit_events
+        # 补 request_host 列（迁移前历史行 NULL = 目标域名未知，仅 legacy
+        # 计数）。基线遗留：0053/0054 的登记此前未跟进本清单。
+        "0053_site_visit_request_host.sql",
+        # 测试申请表（已验证邮箱用户申请测试资格，管理员审批/拒绝终态）。
+        "0054_test_applications.sql",
+        # R7（2026-09-19）：test_applications status CHECK 词表扩
+        # activated_by_invite（邀请码激活同事务收口的显式终态）。
+        "0055_test_application_invite_terminal.sql",
     ]
 
 

@@ -1,8 +1,12 @@
 # R1 三条未计价事件生产取证清单（2026-09-19）
 
-状态：**R1 待完成（未宣称三条已修复）**。本文档是交给有生产数据库/生产主机权限
-人员的只读取证清单与判读矩阵。本轮无生产访问权限（本地 `.demo/run/db.uri` 的
-Unix socket 不存在），未连接、未启动、未修改任何生产/业务数据库。
+状态：**R1 取证已完成（2026-09-19 回填，结论见 §7）；处置口径已定（§7.7）：
+全部 11 条异常项按「供应商异常不扣费」入账结案**。三条事件逐条有证据：
+均属判读矩阵分类 a（未计价，no_final_usage），根因为「run 在 provider 调用启动
+后约 20ms 内被中止，provider 未实报任何 usage」（HP 侧 pi-ai 会话转录的全 0 占位
+usage 佐证），平台链路（hold→release、outbox→ingest、dedup、幂等）全部按设计
+工作，**无漏扣、无需修数**。取证全程只读（SELECT / 文件名清单 / 转录数值字段
+抽取），未修改任何生产数据，未复制密钥、cookie、提示词或 raw_usage 全文。
 
 关联：`docs/service-review-fix-plan-20260919.md` §2（R1）。本轮代码级成果见 §5：
 HistoPilot 已确认缺陷一处（error/aborted 终态丢弃上游可信 usage）已修复并带回归
@@ -212,15 +216,17 @@ hold 走 release。这直接产生一类「有真实用量却 unpriced + 漏扣�
   effective_to−1µs → 旧书旧价；== effective_to（=新书 effective_from）→ 新书新价；
   收口无接班 → unpriced（不拿区间外现价覆盖）。
 
-### 5.3 待生产取证后才能下结论的事项
+### 5.3 待生产取证后才能下结论的事项（2026-09-19 已取证，结论见 §7）
 
-- 三条事件各属 §3 矩阵的哪一类（a/b/c/d）；本轮不假设三条同根因。
-- 若属 `no_final_usage`：HP 侧网关/日志能否证明 provider 实报过 usage（决定是否
-  落在 §5.1 修复的类别内，以及事件发生时 HP 版本是否已含修复）。
-- 若属 `no_active_price_book`：⑥ 中别名/provider key/生效窗口/时段行缺哪一样。
-- `cpa-gateway` 网关是否恒回 usage 分块：若否，done 全 0 占位历史事件会以
-  「priced 0 元（zero_charge skip）」形态存在，属分类 b 的特殊形态（修复后变为
-  unpriced no_final_usage，如实入账）。
+- 三条事件各属 §3 矩阵的哪一类（a/b/c/d）→ **均为 a**（no_final_usage），
+  b/c/d 逐条排除（§7.2）。
+- `no_final_usage` 的 HP 侧佐证 → **provider 未实报 usage**（会话转录全 0 占位，
+  §7.3）：三条均**不**落在 §5.1 已修复缺陷的类别内。
+- `no_active_price_book` → 不适用（优先级低于 no_final_usage）；⑥ 已核：两类
+  价格书对 deepseek/deepseek-flash 全程覆盖（§7.4）。
+- `cpa-gateway` 网关是否恒回 usage 分块 → 本次三条不经 cpa-gateway（provider 均
+  为 deepseek 直连）；该问题对历史事件无未决影响（现存 11 条 unpriced 全部
+  no_final_usage 且全部有转录佐证），留作后续观察项。
 
 ## 6. 本轮测试命令与结果
 
@@ -242,3 +248,176 @@ R1 本轮未改任何 admin 插件/产品源码文件（仅 tests/test_billing_s
 
 （未执行项：HP `test:contract` 其余三个跨仓文件与 R1 无关且各自需要额外环境，
 未点名运行；PT 其余 -k 未命中文件未被本轮选择集覆盖。）
+
+---
+
+## 7. 生产取证结论（2026-09-19 回填；全程只读，未改任何数据）
+
+取证通道：homePC 只读 SQL（psql SELECT，svs_demo）+ HP 主机文件清单与日志
+（journald）+ pi-ai 会话转录数值字段抽取（只取 stopReason/usage/errorMessage
+存在性与数值，未取任何消息正文）。账号一律脱敏（`usr_XXXX…(长度)`）。
+
+### 7.1 范围校准：现存 unpriced 共 11 条，不止三条
+
+`ai_usage_events` 共 2275 行，unpriced 11 行，**原因 100% 为 `no_final_usage`**
+（无其他原因分布）。按时间两组：
+
+- **09-16 三条**（subject `usr_UpOL…(15)`）——与报告账号吻合、时间最早，即 §0
+  「三条」的最可能所指；
+- **今日（09-19）07:56–08:22 UTC 八条**（subject `usr_0VbW…(15)`）——同一根因
+  的新发同类，发生在今日部署（修复版 HP）**之前**，取证一并覆盖。
+
+### 7.2 三条事件逐字段取证（§1 表口径）
+
+三条公共字段：provider=`deepseek`、model=`deepseek-flash`、subject_type=`user`；
+status=`unpriced`、unpriced_reason=`no_final_usage`；五个 token 列**全 NULL**；
+`raw_usage` 仅两键 `finish_reason=aborted` + `provider_meta_v1{meta_version,
+service,stream_state=interrupted_no_final_usage}`；金额两列 NULL（不是 0 元）。
+
+| 字段 | 事件 1 | 事件 2 | 事件 3 |
+|---|---|---|---|
+| event_id | use_625e98dd7cacc2b79176b71ef91402a0 | use_7bf7a97111b1a448144ad365b4826275 | use_ccc39b88536c9f1ba10116b9c93c0ee3 |
+| call_id | call_f62d0af820d705c756f94fb5bf2192df | call_0342a99d738f8c56f6ada7dcaa618d9c | call_62d7ed7a74d47962d8b91815b8ad3b45 |
+| occurred_at→received_at（lag） | 09-16 09:07:56.056→09:07:57.164（1.1s） | 09:16:06.063→09:16:07.966（1.9s） | 09:18:41.371→09:18:45.582（4.2s） |
+| subject | user / usr_UpOL…(15) | 同左 | 同左 |
+| ② 同 call 重投 | 仅此 1 行 | 仅此 1 行 | 仅此 1 行 |
+| ③ hold | hold_05cdbb5…：open→**released**，est=rsv=110820000 nano（¥0.1108），settled_at≈received_at | hold_d45b630…：released，est=rsv=43548000（¥0.0435） | hold_da83492…：released，est=rsv=49982000（¥0.0500） |
+| ④ debit | 0 行 | 0 行 | 0 行 |
+| ⑤ ingest audit | 1 条：duplicate=false、real_debit_skipped=unpriced | 同左 | 同左 |
+| ⑩ usage outbox | acked/ | acked/ | acked/ |
+| ⑪ settle outbox | 无 dead 文件（release 投递成功） | 同左 | 同左 |
+| ⑭ 拒绝事件 | 无 | 无 | 无 |
+| session（转录佐证） | sess_b166e60a8df74759 | sess_f00ef8e2eabf455f | sess_f00ef8e2eabf455f |
+
+**判读（§3 矩阵）：三条均为分类 a（未计价）**。逐条排除其他类：非 b（无
+priced 行、无漏扣——hold 走 release 属设计行为）；非 c（无重投、无重复 audit）；
+非 d（subject_type=user 且非 demo 口径豁免情形——此处「不扣费」的依据是
+「中止发生在任何 usage 产生之前」，见 §7.3）。
+
+### 7.3 根因：run 启动即被中止，provider 从未实报 usage
+
+决定性证据来自 HP 主机 pi-ai 会话转录（`sidecar-sessions/<sess>.json`，只抽取
+数值/枚举字段）：
+
+- 三条事件对应的终态 assistant 消息均为 `stopReason=aborted` +
+  `usage={input:0, output:0, cacheRead:0, cacheWrite:0, totalTokens:0}`（**全 0
+  占位**，即 `usageIsProviderReported=false` 的情形）+ `errorMessage` 以
+  「Request was aborted」开头。
+- 中止消息时间戳与事件 occurred_at 相差 **19–25ms**（09:07:56.056→.081、
+  09:16:06.063→.082、09:18:41.371→.390）：provider 流在产出任何内容/usage 分块
+  之前即被切断。
+- 同会话前后的正常 toolUse 消息 usage 均为非零真实计数（转录链路本身完好，
+  排除「转录丢 usage」）。
+
+结论：**这三条不是 §5.1 已修复缺陷（abort/error 终态丢弃实报 usage）的实例**
+——provider 根本没有实报过 usage，旧代码没有可丢弃的东西；即使用今日修复版
+重放，`usageIsProviderReported` 对全 0 占位仍判否，事件形态完全相同。按 §3
+口径保留未知状态：**不补零、不追扣、不改写**。
+
+中止来源的产品侧观察（与计费正确性无关，不展开）：中止在调用启动后约 20ms
+到达，更像客户端自动抢占/重试（快速连发新请求）而非人工停止；09-16 三条落在
+11 分钟内、今日 8 条落在 27 分钟内，呈连发形态。
+
+「API 商 429 故障」假设核查（2026-09-19 晚，应运营反馈补查）：全部 75 个会话
+转录在两个事件窗口（09-16 08:00–10:30、09-19 07:00–09:30 UTC）内 **0 条 error
+终态、0 条 429/限流字样**；HP 两容器日志无 429 报错行（仅指标计数器恒
+`"429":0`）。pi-ai 对 HTTP 429 会落 `stopReason=error` + 429 字样的
+errorMessage，与实测的 `aborted` + 「Request was aborted」是两种不同终态——
+即中止确为客户端 AbortController 发起，而非 provider 直接回 429。若用户当时在
+UI 上看到了 DeepSeek 故障/限流（驱动其快速重试、抢占在途调用），该情节与计费
+结论相容（429 调用 vendor 不计费、平台侧无 usage 不计费，双向无账），但留存
+数据中没有直接证据，不作断言。
+
+### 7.4 支撑性核对
+
+- ⑥ 价格书：deepseek/deepseek-flash 两类书均覆盖全部事件时点——v3
+  （`pb_deepseek_*_v3_flash_repricing`，2026-09-11 起生效、无截止，peak/off_peak
+  双全）。即「若这些调用正常完成，会按 v3 价格正常计价」；旁证：同账号同时段
+  正常完成的调用均 priced + 恰一次 usage_debit（见 §7.5 的三条 priced 事件）。
+- ⑦ cutover 标志：不适用（分类在计价之前）。
+- ⑧ 概览口径：unpriced 计数与原因分布已核（11 条全 no_final_usage），与 admin
+  概览一致。
+- HP 单行指标：当前与上一容器 `[usage-outbox]` 均 pending=0 / dead_total=0；
+  无投递积压。
+- 今日 8 条（usr_0VbW…(15)）聚合核对与三条完全同型：hold 8/8 released、debit
+  0、audit 8 条 duplicate=false、outbox 8/8 acked；5 个会话转录中 8 条 aborted
+  消息全部全 0 占位 + 「Request (was) aborted」；其中两条连 provider_request_id
+  都为 NULL（中止发生在拿到响应头之前）。同样不修数。
+
+### 7.5 附带发现：billing-settles dead ×3（与三条无关联，金额无影响）
+
+`billing-settles/dead/` 现存 3 个文件，属另外三次调用；HP 日志有对应 P0 行
+（`[billing-settles] P0 billing settle moved to dead`）。逐条核对：
+
+| dead 文件（hold_id） | call / 时间（UTC） | 事件与扣费（DB 实证） | hold 现状 |
+|---|---|---|---|
+| hold_6e6abfac01b61f9465125bd9 | call_53cd20d0… / 09-02 08:30 | use_b674f2d5… priced 9523200 nano；debit −9523200（幂等键 usage:…，恰一次） | expired（惰性回收） |
+| hold_7a05313e096a53340d7d1816 | call_1fe5f46b… / 09-16 09:08 | use_2e167342… priced 2680720；debit −2680720 恰一次 | expired（惰性回收） |
+| hold_027d12e9e28d4016391b81fa | call_92fa2146… / 09-19 08:22 | use_54036f3b… priced 825000；debit −825000 恰一次 | **仍 open 且已过 expires_at（08:27:27）**，rsv=29384000 nano（¥0.029）预约占用中 |
+
+要点：
+
+- **钱已正确**：三事件经 /usage-events 孪生链 priced 且恰一次真实扣费；dead
+  只影响 hold 的 settled 收口，不影响账本。
+- HP 侧死信原因是「**确定性 4xx**」（retryable=false → dead）。确切状态码已
+  不可考：PT 无请求级日志（容器仅启动日志），HP 的 P0 行不含响应码，18080 即
+  gunicorn 本进程（无中间代理日志）。
+- **429 假设已排除**：PT 插件限流的 429 信封恒带 `retryable=true`
+  （`_PLUGIN_ERROR_RETRYABLE["rate_limited"]=True`），HP 的 `settleRetryable`
+  对 `retryable=true` 只退避回 pending、**永不进 dead**；且 09-19 08:22 同分钟、
+  同 installation 的 /usage-events POST 成功——per-installation 令牌桶也不会
+  只拦 settle 放行 usage。故 dead 必为语义性确定性 4xx（400 invalid_request /
+  403 forbidden / 404 hold_not_found / 409 hold_conflict 族）。曾核查
+  「abort 后重试的调用更易 dead」相关性：3 条中仅 2 条吻合（09-02 那条前后无
+  abort），不作模式断言。
+- 遗留风险仅一项：hold_027d12e9 的 ¥0.029 预约在该主体下次触发惰性回收
+  （`_expire_stale_holds_tx`，随新 hold/settle 事务执行）前一直占用；两个
+  expired 的预约已释放。
+- ~~建议（均为**待批准**项，本轮未执行任何写操作）~~ **两项已于 2026-09-19
+  晚执行完毕**（用户批准「都做完然后上线吧」）：
+  1. ~~修复手段（设计内路径）：把 3 个 dead 文件移回 pending 让 sender 重放~~
+     **已执行**（先上线带类别日志的 HP 0.3.4 再重放）：三个 hold 全部
+     settled、event_id 关联、actual=已扣金额（9523200/2680720/825000 nano），
+     settled_at=2026-09-19 12:32:49 UTC；每事件 debit 恰 1 行（无双扣）；
+     全表 open 且过期 hold 归零（¥0.029 预约占用已释放）；三个 outbox 文件
+     按设计在成功后删除。原始 4xx 未复现，拒绝码仍不可考（见第 2 项的防护）。
+  2. ~~代码级小改进（另立项）：`billing-settle-outbox` 的 P0 dead 日志行补
+     响应码/失败类别~~ **已上线**：HP 0.3.4（`553252e`），`BillingHoldSettleResult`
+     新增 `failure_category`，P0 dead 行携带类别；回归测试断言
+     `category=settle_hold_conflict`；全量 1430 测试通过。今后同类死信可直接
+     定位拒绝码。
+
+### 7.6 红线合规声明
+
+本次取证只读：未 UPDATE/DELETE 任何行、未移动/修改任何 outbox 文件、未重启
+或改动任何服务；未复制密钥/cookie/提示词/raw_usage 全文（转录仅抽取
+stopReason/usage 数值与 errorMessage 前 80 字符）。三条事件保持 unpriced 原状
+（金额 NULL），不补零、不清零告警、不改写为 priced。
+
+### 7.7 处置与入账：供应商异常不扣费（运营判定，2026-09-19）
+
+依运营指令，现存全部 11 条 unpriced 异常项**按「供应商异常不扣费」入账结案**：
+
+- **类目**：供应商异常（API 商故障窗口）→ 不扣费。
+- **入账判据**（技术佐证，与运营判定相容）：11 条事件全部无任何可计费用量
+  （provider 流在产出内容/usage 前被中止，转录全 0 占位佐证），平台侧无扣费、
+  vendor 侧亦无可计量消费——双向无账，不存在待追扣/待退款金额。
+- **范围**（event_id 全列，避免口径漂移）：
+  - 09-16（usr_UpOL…(15)）：use_625e98dd7cacc2b79176b71ef91402a0、
+    use_7bf7a97111b1a448144ad365b4826275、
+    use_ccc39b88536c9f1ba10116b9c93c0ee3；
+  - 09-19（usr_0VbW…(15)）：use_18c3738ff8742ee8fc7b5eee1609d811、
+    use_ed5e2c956e790cce5427595ead6665dc、
+    use_4ad87c5e50271521372666bd286f6109、
+    use_0c35f4ad7325d93aa05add969820fdd4、
+    use_ada0128a252430488744ee6ec6360e96、
+    use_79dc6a63872fc5bd9c5b16bec0772160、
+    use_a62a8165f523b90806718959625cd342、
+    use_1f28ddaefd34d78d9d8ea0d5a8583fa6。
+- **记录方式**：仅本文档入账；事件行保持原状（status=unpriced、金额 NULL），
+  admin 异常列表继续如实显示 unpriced/no_final_usage（不冒充已计价、不清零）——
+  本节即这些条目的结案依据，后续审计以本节为准。
+- 若后续出现**同形态**（aborted + 全 0 占位）新条目，可沿用本口径直接结案；
+  若出现「有实报 usage 却 unpriced」的形态（§5.1 修复针对的类别），须单独取证，
+  不适用本节。
+

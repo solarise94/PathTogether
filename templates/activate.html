@@ -292,6 +292,10 @@
     <p class="footer" data-i18n="activate.footer">仅用于研究、教学和软件演示，不用于临床诊断。</p>
   </main>
 
+  <!-- 轮询控制器（R7 2026-09-19 修复）：预算/定时器控制不内联，便于
+       tests/js/activate-waiting.test.ts 用假定时器锁定行为；?v= 版本号
+       习惯与 entry.html 一致 -->
+  <script src="/static/activate-waiting.js?v=20260919r7"></script>
   <script>
     (function () {
       "use strict";
@@ -331,7 +335,11 @@
       //      离开页面停止）；请求带递增序号，旧响应一律丢弃（不覆盖新状态）。
       //      401 = 登录状态已更新或失效（如管理员已审批推进状态），明确引导
       //      重新登录查看，绝不解释为审批通过；503/网络错误保留明确重试状态，
-      //      不退回申请表单、不误标待审、不重复提交。----
+      //      不退回申请表单、不误标待审、不重复提交。
+      //      2026-09-19 修复（轮询上限失效）：轮询预算/定时器控制迁至
+      //      static/activate-waiting.js——预算只在「进入等待状态」时武装一次，
+      //      pending 响应反复到达不重置、耗尽后保持停止；手动「刷新状态」
+      //      只发单次请求、不重新武装预算。----
       var applyForm = document.getElementById("apply-form");
       var applyBtn = document.getElementById("apply-submit");
       var applyChecking = document.getElementById("apply-checking");
@@ -342,28 +350,19 @@
       var applyInviteActivated = document.getElementById("apply-invite-activated");
       var applyAuth = document.getElementById("apply-auth");
       var applyLoadError = document.getElementById("apply-load-error");
-      var APPLY_POLL_INTERVAL_MS = 15000;
+      var APPLY_POLL_INTERVAL_MS = 15000;      // 轮询间隔（预算控制在 activate-waiting.js）
       var APPLY_POLL_MAX_REQUESTS = 20;        // 有界：最多自动刷新 20 次
       var APPLY_REFRESH_THROTTLE_MS = 5000;    // 焦点/可见刷新节流
       var loadSeq = 0;
-      var pollTimer = null;
-      var pollRequestsLeft = 0;
       var lastAutoRefreshAt = Date.now();
-      function stopPolling() {
-        if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
-        pollRequestsLeft = 0;
-      }
-      function startPolling() {
-        stopPolling();
-        pollRequestsLeft = APPLY_POLL_MAX_REQUESTS;
-        pollTimer = setInterval(function () {
-          // 后台标签页不发请求（避免堆积）；页面重新可见由 visibilitychange 触发
-          if (document.hidden) return;
-          if (pollRequestsLeft <= 0) { stopPolling(); return; }
-          pollRequestsLeft -= 1;
-          loadState();
-        }, APPLY_POLL_INTERVAL_MS);
-      }
+      // 轮询控制器：enterPending 幂等（已在等待态不重置预算/不重启定时器），
+      // stop 用于离开 pending 区块与 pagehide/beforeunload。
+      var waiting = window.HPActivateWaiting.createWaitingController({
+        loadState: loadState,
+        intervalMs: APPLY_POLL_INTERVAL_MS,
+        maxRequests: APPLY_POLL_MAX_REQUESTS,
+        isHidden: function () { return document.hidden; }
+      });
       function autoRefresh() {
         var now = Date.now();
         if (now - lastAutoRefreshAt < APPLY_REFRESH_THROTTLE_MS) return;
@@ -380,13 +379,13 @@
         applyAuth.hidden = true;
         applyLoadError.hidden = true;
         applyForm.hidden = true;
-        if (block !== "pending") stopPolling();
+        if (block !== "pending") waiting.stop();
         if (block === "form") {
           applyNoneDesc.hidden = false;
           applyForm.hidden = false;
         } else if (block === "pending") {
           applyPending.hidden = false;
-          startPolling();
+          waiting.enterPending();
         } else if (block === "rejected") {
           applyRejected.hidden = false;
         } else if (block === "approved") {
@@ -482,6 +481,8 @@
             showApplyBlock("load-error"); // 网络异常：同 503 保留重试状态
           });
       }
+      // 手动「刷新状态」：用户显式操作——只发单次请求，不重新武装/重置
+      // 轮询预算（语义见 activate-waiting.js 文件头）。
       document.getElementById("apply-refresh").addEventListener("click", function () {
         clearErr();
         lastAutoRefreshAt = Date.now();
@@ -497,8 +498,8 @@
         if (document.visibilityState === "visible") autoRefresh();
       });
       // 离开页面：停止轮询（导航/关闭时定时器随页面销毁，这里显式收口）
-      window.addEventListener("pagehide", stopPolling);
-      window.addEventListener("beforeunload", stopPolling);
+      window.addEventListener("pagehide", function () { waiting.stop(); });
+      window.addEventListener("beforeunload", function () { waiting.stop(); });
       // 初始状态：GET /api/account/test-application（enrollment 会话身份）
       loadState();
 

@@ -257,6 +257,33 @@ def test_register_email_mode_done_view_copy(monkeypatch):
     assert "no-store" in r.headers.get("Cache-Control", "")
 
 
+def test_register_done_view_again_link_navigates_to_clean_form(monkeypatch):
+    """发送成功态「重新填写邮箱」真实导航 /register 深链接（2026-09-19 修复：
+    链接带 data-auth-nav 显式 opt-out，entry-auth.js 不拦截原地切换——此时
+    注册视图已是发送成功态，切换等于没动）。深链接由服务端重新渲染介绍主页
+    + 干净注册表单（register_done=False、无 sent 视图），可重新填写/重发。"""
+    _open_email_mode(monkeypatch)
+    app_mod.AUTH_ENABLED = True
+    client = _client()
+    r = client.post("/register", data={"email": "again.nav@x.com"})
+    assert r.status_code == 200
+    done = r.get_data(as_text=True)
+    assert "验证邮件已发送，请查收。" in done
+    # i18n 键不变 + 显式 opt-out 属性存在（允许真实导航）
+    assert 'data-i18n="register.dialog.again">重新填写邮箱</a>' in done
+    assert "data-auth-nav" in done
+    # 深链接 GET /register：干净注册表单（register_done=False、无 sent 视图）
+    r2 = client.get("/register")
+    assert r2.status_code == 200
+    clean = r2.get_data(as_text=True)
+    assert "验证邮件已发送，请查收。" not in clean
+    assert "请查收验证邮件" not in clean
+    assert 'id="register-dialog-form"' in clean
+    assert 'name="email"' in clean
+    assert "data-auth-nav" not in clean  # 干净表单不再渲染该链接
+    assert "no-store" in r2.headers.get("Cache-Control", "")
+
+
 def test_register_dialog_full_real_chain(monkeypatch):
     """R2 完整真实链：注册弹窗表单 → 入队 → fake 发送（真实链接）→
     GET /verify-email 只展示 → POST /api/registration/verify 建号 + 申请。

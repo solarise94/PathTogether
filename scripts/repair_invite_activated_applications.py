@@ -25,6 +25,14 @@
     python3 scripts/repair_invite_activated_applications.py            # dry-run
     python3 scripts/repair_invite_activated_applications.py --apply    # 执行
 
+schema 前置（fail-closed，2026-09-19 修复）：本工具**绝不隐式迁移**——
+dry-run 与 --apply 都不调用 ``pg_store.ensure_schema`` 或任何等价物；缺少
+必要 schema（users/test_applications/audit_events 表或所需列缺失，apply 另
+要求 test_applications.status 约束已支持 activated_by_invite）时立即报错
+退出（非零码），提示先由部署流程应用迁移。dry-run 连接额外设为会话级只读
+（``SET default_transaction_read_only = on``），任何写都被数据库拒绝——
+「dry-run 不写库」由数据库层保证，不靠脚本自觉。
+
 幂等：逐行 CAS（``WHERE status='pending'``）+ 收口后目标集合恒空，
 重复 ``--apply`` 第二遍 0 行改动、不写审计。apply 单事务、锁序与
 activate/review 同款（provisioning advisory → user → application），
@@ -51,13 +59,78 @@ import spend_store  # noqa: E402  （复用 provisioning advisory 锁，锁序�
 
 AUDIT_ACTION = "test_application.repair_invite_activated"
 
+#: dry-run / apply 共同的必需表与列（脚本 SQL 实际用到的最小集）。
+_REQUIRED_COLUMNS = {
+    "users": ("user_id", "login_id", "email_normalized",
+              "activation_state", "activation_source"),
+    "test_applications": ("user_id", "status"),
+    "audit_events": ("event_id", "actor_user_id", "actor_role", "action",
+                     "target_type", "target_id", "slide", "detail"),
+}
 
-def _connect():
-    """建连接并设 dict_row（先跑 ensure_schema，再切 dict_row）。"""
+
+class SchemaMissingError(RuntimeError):
+    """数据库 schema 不满足本工具前置条件（缺表/缺列/缺 apply 所需约束）。"""
+
+
+def _connect(readonly=False):
+    """建连接并设 dict_row（**绝不隐式迁移**：不调用 ensure_schema）。
+
+    readonly=True（dry-run）：会话级 ``default_transaction_read_only = on``
+    ——本连接上后续所有事务均为 READ ONLY，任何写（含意外混入的 DDL/DML）
+    都在数据库层被拒绝，dry-run「不写库」不靠脚本自觉。
+    """
     conn = pg_store.connect()
-    pg_store.ensure_schema(conn)
     conn.row_factory = psycopg.rows.dict_row
+    if readonly:
+        with conn.cursor() as cur:
+            cur.execute("SET default_transaction_read_only = on")
+        conn.commit()
     return conn
+
+
+def _require_schema(cur):
+    """显式校验必需表/列已存在（fail-closed：缺 schema 报错退出，提示先应用
+    迁移；绝不静默补建、绝不顺手执行迁移）。"""
+    cur.execute(
+        "SELECT table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema = current_schema()")
+    have = {}
+    for row in cur.fetchall():
+        have.setdefault(row["table_name"], set()).add(row["column_name"])
+    problems = []
+    for table, columns in _REQUIRED_COLUMNS.items():
+        cols = have.get(table)
+        if cols is None:
+            problems.append("表 %s 不存在" % table)
+            continue
+        missing_cols = [c for c in columns if c not in cols]
+        if missing_cols:
+            problems.append("表 %s 缺列：%s" % (table, ", ".join(missing_cols)))
+    if problems:
+        raise SchemaMissingError("；".join(problems))
+
+
+def _require_invite_terminal_status(cur):
+    """apply 前置：test_applications.status 约束必须已支持 activated_by_invite
+    （迁移 0055）；否则 UPDATE 会撞 CHECK 约束——显式报错优于中途回滚。"""
+    cur.execute(
+        "SELECT count(*)::int AS n FROM pg_constraint "
+        "WHERE conrelid = 'test_applications'::regclass AND contype = 'c' "
+        "AND pg_get_constraintdef(oid) LIKE '%activated_by_invite%'")
+    if (cur.fetchone() or {}).get("n", 0) < 1:
+        raise SchemaMissingError(
+            "test_applications.status 约束不支持 activated_by_invite"
+            "（未应用激活终态迁移）")
+
+
+def _schema_fail(exc):
+    """缺 schema 的统一出口：中文错误（stderr）+ 非零码，绝不静默修复。"""
+    sys.stderr.write(
+        "错误：数据库 schema 不满足本工具前置条件：%s\n"
+        "请先应用数据库迁移（部署迁移流程 / pg_store.ensure_schema）后再"
+        "运行本工具；本工具绝不隐式执行迁移。\n" % exc)
+    return 2
 
 
 def _scan(cur):
@@ -120,11 +193,27 @@ def main(argv=None):
 
     mode = "apply" if args.apply else "dry-run"
     sys.stdout.write("模式：%s\n" % mode)
-    conn = _connect()
+    # dry-run 连接只读（数据库层拒绝任何写）；apply 连接读写但开工前同样
+    # 显式校验 schema。两条路径都不做隐式迁移。
+    conn = _connect(readonly=not args.apply)
     try:
-        if not args.apply:
+        try:
             with conn.cursor() as cur:
+                _require_schema(cur)
+                if args.apply:
+                    _require_invite_terminal_status(cur)
+            conn.rollback()  # 校验事务收口（只读 SELECT，不留事务残留）
+        except SchemaMissingError as exc:
+            conn.rollback()
+            return _schema_fail(exc)
+
+        if not args.apply:
+            # 只读连接 + 只读事务：_report 只发 SELECT，任何写都会被数据库
+            # 拒绝（cannot execute ... in a read-only transaction）。
+            with conn.cursor() as cur:
+                cur.execute("SET TRANSACTION READ ONLY")
                 _report(cur, apply_mode=False)
+            conn.rollback()
             return 0
 
         # apply：单事务；锁序与 activate/review 一致（provisioning advisory

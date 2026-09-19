@@ -35,6 +35,7 @@ interface FakeEl {
 	showModal(): void;
 	close(): void;
 	querySelector(sel: string): FakeEl | null;
+	hasAttribute?(name: string): boolean;
 }
 
 function fakeEl(id: string, attrs: Partial<FakeEl> = {}): FakeEl {
@@ -71,6 +72,7 @@ function fakeEl(id: string, attrs: Partial<FakeEl> = {}): FakeEl {
 function makeDoc(opts: {
 	dialogOpen?: boolean;
 	retrySeconds?: string;
+	againNav?: boolean;
 } = {}) {
 	const focusLog: string[] = [];
 	const dialogAttrs: Record<string, string> = {
@@ -138,6 +140,21 @@ function makeDoc(opts: {
 
 	const loginLinks = [fakeEl("topbar-login")];
 	const registerLinks = [fakeEl("dialog-register-link")];
+	// 发送成功视图的「重新填写邮箱」链接：带 data-auth-nav（真实导航 opt-out），
+	// click 记录是否被 preventDefault（允许导航 = 不被拦截）。
+	let navPrevented = 0;
+	let againLink: FakeEl | null = null;
+	if (opts.againNav) {
+		const link = fakeEl("register-again-link", {
+			hasAttribute: (name: string) => name === "data-auth-nav",
+		});
+		link.click = () => {
+			(link._clickHandlers["click"] || []).forEach((fn) =>
+				fn({ preventDefault() { navPrevented += 1; } }));
+		};
+		againLink = link;
+		registerLinks.push(link);
+	}
 	// 限流倒计时 DOM 与真实模板同构：span 在 .login-dialog-error 区块内
 	// （表单之外），closest('.auth-view') 命中所属视图 pane，再由 pane 取
 	// 'form button[type="submit"]'——此前 mock 让 closest('form') 直接返回
@@ -177,7 +194,7 @@ function makeDoc(opts: {
 	return {
 		doc, dialog, loginView, registerView, loginLinks, registerLinks,
 		loginForm, registerForm, focusLog, bodyClasses, countdownSubmit,
-		dialogAttrs,
+		dialogAttrs, againLink, navPrevented: () => navPrevented,
 	};
 }
 
@@ -260,5 +277,28 @@ describe("entry-auth（登录/注册统一弹窗）", () => {
 		const ctx2 = makeDoc({ retrySeconds: "30" });
 		load(ctx2.doc);
 		expect(ctx2.countdownSubmit.disabled).toBe(true);
+	});
+
+	it("发送成功态的「重新填写邮箱」（data-auth-nav）不被拦截（允许真实导航）；data-auth-switch 链接仍原地拦截", () => {
+		const ctx = makeDoc({ dialogOpen: true, againNav: true });
+		// 服务端 done 态直出：注册视图可见（发送成功视图）、登录视图收起
+		ctx.registerView.hidden = false;
+		ctx.loginView.hidden = true;
+		load(ctx.doc);
+		expect(ctx.dialog.open).toBe(true);
+		// 重新填写邮箱：真实导航——不注册任何 click 拦截器、不 preventDefault
+		expect(ctx.againLink!._clickHandlers["click"]).toBeFalsy();
+		ctx.againLink!.click();
+		expect(ctx.navPrevented()).toBe(0);
+		// 弹窗与视图原样：切换/刷新完全交给浏览器整页导航（深链接渲染干净表单）
+		expect(ctx.dialog.open).toBe(true);
+		expect(ctx.registerView.hidden).toBe(false);
+		expect(ctx.loginView.hidden).toBe(true);
+		// 对照：同视图内 data-auth-switch「已有账号？登录」仍被拦截原地切换
+		ctx.loginLinks[0].click();
+		expect(ctx.dialog.open).toBe(true);
+		expect(ctx.loginView.hidden).toBe(false);
+		expect(ctx.registerView.hidden).toBe(true);
+		expect(ctx.dialogAttrs["aria-labelledby"]).toBe("login-dialog-title");
 	});
 });

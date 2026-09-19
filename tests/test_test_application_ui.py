@@ -194,7 +194,11 @@ def test_activate_apply_panel_form_fields_and_state_machine():
 
 def test_activate_pending_block_has_refresh_and_stale_guard():
     """R7：等待页可刷新——pending 区块「刷新状态」按钮 + 焦点/可见恢复刷新 +
-    有界轮询 + 离开页面停止 + seq 守卫防旧响应覆盖新状态。"""
+    有界轮询 + 离开页面停止 + seq 守卫防旧响应覆盖新状态。
+
+    2026-09-19 修复（轮询上限失效）：轮询预算/定时器控制迁至
+    static/activate-waiting.js（预算只在进入等待态武装一次、耗尽保持停止），
+    模板断言同步指向新接线。"""
     html = _activate_html()
     assert 'id="apply-refresh"' in html
     assert "刷新状态" in html
@@ -203,15 +207,41 @@ def test_activate_pending_block_has_refresh_and_stale_guard():
     assert 'window.addEventListener("focus", autoRefresh)' in html
     assert 'document.addEventListener("visibilitychange"' in html
     assert "APPLY_REFRESH_THROTTLE_MS" in html
-    # 有界轮询 + 隐藏页暂停 + 离开页面停止
+    # 有界轮询常量仍由模板接线（预算控制在 activate-waiting.js）
     assert "APPLY_POLL_INTERVAL_MS" in html
     assert "APPLY_POLL_MAX_REQUESTS" in html
-    assert "if (document.hidden) return;" in html
-    assert 'window.addEventListener("pagehide", stopPolling)' in html
-    assert 'window.addEventListener("beforeunload", stopPolling)' in html
+    # 隐藏页暂停（isHidden 注入）+ 离开页面停止（pagehide/beforeunload）
+    assert "isHidden: function () { return document.hidden; }" in html
+    assert 'window.addEventListener("pagehide", function () { waiting.stop(); })' in html
+    assert 'window.addEventListener("beforeunload", function () { waiting.stop(); })' in html
     # seq 守卫：旧响应一律丢弃
     assert "loadSeq" in html
     assert "if (seq !== loadSeq) return;" in html
+
+
+def test_activate_wires_waiting_controller():
+    """2026-09-19 修复：模板接线存在——activate.html 引用带版本号的
+    activate-waiting.js 并经 HPActivateWaiting.createWaitingController 装配；
+    进入 pending 用 waiting.enterPending()（幂等，不重置预算），离开
+    pending / 离开页面用 waiting.stop()；控制器内隐藏页不发请求。"""
+    html = _activate_html()
+    waiting_js = (REPO_ROOT / "static" / "activate-waiting.js").read_text(
+        encoding="utf-8")
+    # 引用新 JS 文件（带版本号 query，与 entry.html 的 ?v= 习惯一致）
+    assert '<script src="/static/activate-waiting.js?v=' in html
+    assert "HPActivateWaiting" in html and "createWaitingController" in html
+    assert "intervalMs: APPLY_POLL_INTERVAL_MS" in html
+    assert "maxRequests: APPLY_POLL_MAX_REQUESTS" in html
+    # pending 区块切换经控制器：enterPending（幂等）+ 非 pending/卸载 stop
+    assert "waiting.enterPending();" in html
+    assert 'if (block !== "pending") waiting.stop();' in html
+    assert "waiting.stop();" in html
+    # 旧内联轮询控制已迁出（不再有 startPolling/pollRequestsLeft 内联实现）
+    assert "startPolling" not in html
+    assert "pollRequestsLeft" not in html
+    # 控制器行为锚点：隐藏页不发请求（预算不动）+ 耗尽保持停止（drained）
+    assert "if (isHidden()) return;" in waiting_js
+    assert "drained" in waiting_js
 
 
 def test_activate_401_shows_relogin_not_approval():

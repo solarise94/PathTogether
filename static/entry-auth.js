@@ -107,9 +107,17 @@
   // 拦截 /login 与 /register 站内链接（顶栏「登录」、弹窗内「没有账号？注册」
   // /「已有账号？登录」等）：原地打开弹窗并切到对应视图。
   // 无 JS 时链接照常导航到服务端直开的同一弹窗（深链接兜底）。
+  // data-auth-nav = 显式 opt-out：带该属性的链接不拦截，允许真实导航到
+  // 服务端深链接（发送成功视图的「重新填写邮箱」——注册视图已是发送成功
+  // 态，原地切换等于没动；深链接会重新渲染干净表单 register_done=False）。
+  function wantsRealNavigation(link) {
+    return typeof link.hasAttribute === 'function' &&
+      link.hasAttribute('data-auth-nav');
+  }
   Array.prototype.forEach.call(
     document.querySelectorAll('a[href="/login"], a[href^="/login?"]'),
     function (link) {
+      if (wantsRealNavigation(link)) return;
       link.addEventListener('click', function (ev) {
         ev.preventDefault();
         switchTo('login');
@@ -118,6 +126,7 @@
   Array.prototype.forEach.call(
     document.querySelectorAll('a[href="/register"], a[href^="/register?"]'),
     function (link) {
+      if (wantsRealNavigation(link)) return;
       link.addEventListener('click', function (ev) {
         ev.preventDefault();
         switchTo('register');

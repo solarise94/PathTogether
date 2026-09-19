@@ -52,7 +52,10 @@
       <div class="login-dialog-message" role="status" data-i18n="register.dialog.sent">验证邮件已发送，请查收。</div>
       <p class="login-dialog-subtitle" data-i18n="register.dialog.sent.hint">请在 30 分钟内点击邮件中的链接完成验证；未收到可稍后重试或检查垃圾邮件。</p>
       <div class="login-dialog-links">
-        <a href="/register" data-i18n="register.dialog.again">重新填写邮箱</a>
+        {# data-auth-nav：显式要求真实导航到 /register 深链接（服务端重渲染
+           干净注册表单 register_done=False）。此时注册视图已是发送成功态，
+           原地切换等于没动——entry-auth.js 对带该属性的链接不拦截。i18n 键不变。 #}
+        <a href="/register" data-auth-nav data-i18n="register.dialog.again">重新填写邮箱</a>
         <a href="/login" data-auth-switch="login" data-i18n="register.dialog.have_account">已有账号？登录</a>
       </div>
       {% else %}

@@ -394,3 +394,100 @@ def test_migration_0015_single_enabled_owner_index(pg_uri):
         c.commit()
     finally:
         c.close()
+
+
+# --------------------------------------------------------------------------- #
+# 6. 0055_test_application_invite_terminal（R7 修复 2026-09-19）：
+#    test_applications.status 词表扩展 activated_by_invite——fresh/升级两路
+#    均验证；不修改已执行的 0054 文件
+# --------------------------------------------------------------------------- #
+_MIGRATION_0055 = "0055_test_application_invite_terminal.sql"
+
+
+def _insert_test_application(cur, uid):
+    cur.execute(
+        "INSERT INTO test_applications (user_id, research_direction, "
+        "share_research_data, consent_version) "
+        "VALUES (%s,'other',FALSE,'research-data-20260916-v1')", (uid,))
+
+
+def test_migration_0055_applied_and_upgrade_path(pg_uri):
+    """fresh 库：conftest ensure_schema 已应用 0055（记录在案 + 新约束生效）。
+    升级库：把约束回拨成 0054 时代的旧词表后重跑 0055 原始 SQL——必须成功
+    换上新词表；重跑第二次幂等 no-op。"""
+    c = psycopg.connect(pg_uri)
+    try:
+        with c.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM schema_migrations WHERE filename=%s",
+                (_MIGRATION_0055,))
+            assert cur.fetchone() is not None, "0055 应已被 ensure_schema 应用"
+    finally:
+        c.close()
+
+    sql = (pg_store.migrations_dir() / _MIGRATION_0055).read_text(
+        encoding="utf-8")
+    c = psycopg.connect(pg_uri)
+    try:
+        with c.cursor() as cur:
+            # 模拟「已执行 0054 的存量库」：换回旧词表约束 + 预置一行
+            # activated_by_invite 会失败的历史形状（先不插）
+            cur.execute(
+                "ALTER TABLE test_applications "
+                "DROP CONSTRAINT IF EXISTS test_applications_status_check")
+            cur.execute(
+                "ALTER TABLE test_applications "
+                "ADD CONSTRAINT test_applications_status_check "
+                "CHECK (status IN ('pending','approved','rejected'))")
+        c.commit()
+        # 旧约束下：activated_by_invite 必须被拒（确认回拨成立）
+        with c.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (user_id, login_id, display_name, "
+                "password_hash, role, created_at, disabled) "
+                "VALUES ('usr_m55u','m55@x.com','','x','user',"
+                "to_timestamp(1),FALSE)")
+            _insert_test_application(cur, "usr_m55u")
+        c.commit()
+        blocked = False
+        try:
+            with c.cursor() as cur:
+                cur.execute("UPDATE test_applications "
+                            "SET status='activated_by_invite' "
+                            "WHERE user_id='usr_m55u'")
+            c.commit()
+        except psycopg.errors.CheckViolation:
+            blocked = True
+            c.rollback()
+        assert blocked, "0054 旧词表应拒绝 activated_by_invite（回拨成立）"
+        # 升级：重跑 0055 原始 SQL 两次（第二次验证幂等）
+        for _ in range(2):
+            with c.cursor() as cur:
+                cur.execute(sql)
+        c.commit()
+        with c.cursor() as cur:
+            cur.execute(
+                "SELECT conname FROM pg_constraint "
+                "WHERE conrelid='test_applications'::regclass "
+                "AND conname='test_applications_status_check'")
+            assert cur.fetchone() is not None
+            # 新词表：activated_by_invite 通过
+            cur.execute("UPDATE test_applications "
+                        "SET status='activated_by_invite' "
+                        "WHERE user_id='usr_m55u'")
+            cur.execute("SELECT status FROM test_applications "
+                        "WHERE user_id='usr_m55u'")
+            assert cur.fetchone()[0] == "activated_by_invite"
+        c.commit()
+        violated = False
+        try:
+            with c.cursor() as cur:
+                cur.execute("UPDATE test_applications SET status='bogus' "
+                            "WHERE user_id='usr_m55u'")
+            c.commit()
+        except psycopg.errors.CheckViolation:
+            violated = True
+            c.rollback()
+        assert violated, "未知状态应被 0055 约束拒绝"
+    finally:
+        c.close()

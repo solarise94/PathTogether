@@ -6,8 +6,10 @@
   share_research_data 勾选框（默认不勾）+ fieldset/legend a11y；
   前端缺方向先拦截；fetch JSON body 恒含两字段（checkbox 未勾时 false）；
 - activate.html：双区块「申请测试（默认）/ 邀请码激活」；
-  申请状态机 none/pending/rejected/approved + POST
-  /api/account/test-application 带 X-CSRF-Token；邀请码逻辑保留；
+  申请状态机 none/pending/rejected/approved/activated_by_invite +
+  POST /api/account/test-application 带 X-CSRF-Token；等待页「刷新状态」
+  按钮 + 焦点/可见恢复刷新 + 有界轮询（R7 2026-09-19）；401 引导重新登录
+  （不解释为审批通过）、503/网络错误保留重试状态；邀请码逻辑保留；
 - register.html：流程说明改为「邮箱验证 → 设置密码并申请测试 → 管理员审核」；
 - static/i18n.js：verify.* / activate.* 命名空间新键 zh/en 双语成对。
 
@@ -51,7 +53,9 @@ ACTIVATE_KEYS = (
     "activate.state.checking", "activate.state.load.fail",
     "activate.state.none.desc", "activate.state.pending.desc",
     "activate.state.rejected.desc", "activate.state.approved.desc",
-    "activate.state.approved.login", "activate.reapply",
+    "activate.state.approved.login", "activate.state.refresh",
+    "activate.state.invite_activated.desc", "activate.state.auth.desc",
+    "activate.state.auth.login", "activate.reapply",
     "activate.invite.hint", "activate.invite.code", "activate.invite.code.ph",
     "activate.invite.identity.hint", "activate.invite.submit",
     "activate.invite.activating", "activate.invite.need_code",
@@ -173,14 +177,73 @@ def test_activate_apply_panel_form_fields_and_state_machine():
     assert 'name="share_research_data"' in html
     assert "<fieldset" in html and "<legend" in html
     assert 'role="alert"' in html
-    # 状态机文案：pending / rejected（重新申请）/ approved
+    # 状态机文案：pending / rejected（重新申请）/ approved /
+    # activated_by_invite（邀请码收口）
     assert "申请已提交，请等待管理员审核" in html
     assert "重新申请" in html
     assert 'id="apply-retry"' in html
-    # JS 状态机：GET 状态 + 四态分流
+    assert 'id="apply-invite-activated"' in html
+    assert "已通过邀请码激活" in html
+    # JS 状态机：GET 状态 + 全部分流（含 activated_by_invite）
     assert 'fetch("/api/account/test-application"' in html
-    for state in ('"none"', '"pending"', '"rejected"', '"approved"'):
+    for state in ('"none"', '"pending"', '"rejected"', '"approved"',
+                  '"activated_by_invite"'):
         assert state in html
+
+
+def test_activate_pending_block_has_refresh_and_stale_guard():
+    """R7：等待页可刷新——pending 区块「刷新状态」按钮 + 焦点/可见恢复刷新 +
+    有界轮询 + 离开页面停止 + seq 守卫防旧响应覆盖新状态。"""
+    html = _activate_html()
+    assert 'id="apply-refresh"' in html
+    assert "刷新状态" in html
+    assert 'id="apply-load-retry"' in html  # 读取失败态同样提供重试按钮
+    # 焦点/可见恢复刷新（节流）
+    assert 'window.addEventListener("focus", autoRefresh)' in html
+    assert 'document.addEventListener("visibilitychange"' in html
+    assert "APPLY_REFRESH_THROTTLE_MS" in html
+    # 有界轮询 + 隐藏页暂停 + 离开页面停止
+    assert "APPLY_POLL_INTERVAL_MS" in html
+    assert "APPLY_POLL_MAX_REQUESTS" in html
+    assert "if (document.hidden) return;" in html
+    assert 'window.addEventListener("pagehide", stopPolling)' in html
+    assert 'window.addEventListener("beforeunload", stopPolling)' in html
+    # seq 守卫：旧响应一律丢弃
+    assert "loadSeq" in html
+    assert "if (seq !== loadSeq) return;" in html
+
+
+def test_activate_401_shows_relogin_not_approval():
+    """R7：401 显示「登录状态已更新或失效，请重新登录查看」+ 登录按钮；
+    绝不把 401 解释为审批通过（auth 区块与 approved 区块分离）。"""
+    html = _activate_html()
+    assert 'id="apply-auth"' in html
+    assert "登录状态已更新或失效，请重新登录查看" in html
+    assert 'data-i18n="activate.state.auth.login"' in html
+    # 401 分支只进入 auth 区块，绝不进入 approved/invite-activated
+    assert 'resp.status === 401' in html
+    auth_fix = html.split('resp.status === 401')[1][:400]
+    assert 'showApplyBlock("auth")' in auth_fix
+    assert 'showApplyBlock("approved")' not in auth_fix
+    assert 'href="/login"' in html.split('id="apply-auth"')[1][:600]
+
+
+def test_activate_load_failure_keeps_retry_state():
+    """R7：503/网络错误保留明确重试状态（专用区块 + 重试按钮），不退回
+    申请表单、不误标待审、不重复提交。"""
+    html = _activate_html()
+    assert 'id="apply-load-error"' in html
+    assert "暂时无法获取申请状态" in html
+    # 失败分支只进入 load-error，不回退表单、不标 pending
+    fail_fix = html.split("if (!resp.ok) {")[1][:300]
+    assert 'showApplyBlock("load-error")' in fail_fix
+    assert 'showApplyBlock("form")' not in fail_fix
+    # loadState 自己的 catch（第二处 seq 守卫之后）：网络异常同样进 load-error
+    seq_anchor = "if (seq !== loadSeq) return;  // 旧响应：丢弃"
+    assert html.count(seq_anchor) == 2
+    catch_fix = html.split(seq_anchor)[2][:200]
+    assert 'showApplyBlock("load-error")' in catch_fix
+    assert 'showApplyBlock("form")' not in catch_fix
 
 
 def test_activate_apply_post_carries_csrf_and_fields():

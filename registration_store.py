@@ -1091,20 +1091,38 @@ def activate_registered_user(user_id, invite_token):
         一人成功）
       → users.activation_state='active'、activation_source='invite'、
         ai_access=邀请模板值、auth_version+1（权限面变化推进凭据版本）
+      → test_applications pending 收口（R7 2026-09-19）：status='pending'
+        的申请同事务推进显式终态 activated_by_invite——管理员待审列表
+        移除，不再出现「已激活用户申请滞留 pending → 审批报错」；CAS 只
+        命中 pending，已拒绝/已审批的历史决定绝不改写；reviewed_by/
+        reviewed_at 保持 NULL（邀请码激活不是人工审批，不伪造审核人）。
       → spend_store.create_user_total_allowance_tx（按邀请面值建一次性总额
         度；无面值解析全局默认，皆缺 fail-closed 整体回滚）
-      → 审计 registration.activate（同事务）。
+      → 审计 registration.activate（同事务，detail 记 application_closed）。
+
+    锁序总说明（R7 并发核对）：本函数持锁顺序为
+      provisioning advisory → users 行 → registration_invites 行 →
+      test_applications 行；
+    test_application_store.review 的顺序为 provisioning advisory → users 行
+    → test_applications 行——两路在 users→applications 的相对顺序上一致，
+    invite 行只有本函数触碰，不存在交叉等待环，激活与审批并发无死锁；
+    且两者都先取同一把 provisioning advisory 锁，整个开通段天然互斥串行。
 
     失败语义：
       - 用户缺失/禁用/状态非 pending_activation → ActivationError
-        （already_active 时**邀请码未读未消费**：先查状态后读 invite）；
+        （already_active 时**邀请码未读未消费**：先查状态后读 invite；
+        与管理员审批并发时后到的一方拿到该明确幂等/冲突错误，双方只可能
+        成功一次激活、一次额度 provisioning）；
       - 邀请码无效/过期/撤销/已消费/**绑定邮箱不匹配（bound_mismatch）** →
         InviteRedeemError（对外统一 ``invite_invalid_or_unavailable``，不泄露
-        绑定差异；整体回滚：邀请码不消费、用户状态不变、不建额度；真实原因
-        只进 best-effort 审计与日志；消费 CAS 未命中同样整体回滚）；
+        绑定差异；整体回滚：邀请码不消费、用户状态不变、不建额度、申请不
+        收口；真实原因只进 best-effort 审计与日志；消费 CAS 未命中同样整体
+        回滚）；
       - 维护闸开启 → spend_store.ProvisioningMaintenanceError 原样上抛。
 
-    成功返回 ``{"user", "invite_id", "total_allowance"}``。
+    成功返回 ``{"user", "invite_id", "total_allowance",
+    "application_closed"}``（application_closed=True 表示本次同事务把
+    pending 申请收口为 activated_by_invite）。
     """
     tok = (invite_token or "").strip()
     if not tok or not isinstance(user_id, str) or not user_id.strip():
@@ -1209,6 +1227,18 @@ def activate_registered_user(user_id, invite_token):
                     "email, email_normalized",
                     (bool(invite["ai_access"]), user_id))
                 updated = dict(cur.fetchone())
+                # 4.5) pending 测试申请同事务收口（R7 2026-09-19）：邀请码
+                #    激活后申请不再是待审任务。CAS 只命中 pending——已拒绝
+                #    （rejected）/已审批（approved）的历史决定绝不改写；
+                #    reviewed_by/reviewed_at 保持 NULL，不把邀请码事件伪装
+                #    成管理员审批（激活时间以 users.activation_updated_at
+                #    为准）。无申请记录（未提交过申请）为正常形态，0 行命中。
+                #    锁序：users 行锁已持有 → 此处按 user_id 命中 application
+                #    行（与 review 的 users→applications 顺序一致，无死锁）。
+                cur.execute(
+                    "UPDATE test_applications SET status='activated_by_invite' "
+                    "WHERE user_id=%s AND status='pending'", (user_id,))
+                application_closed = (cur.rowcount or 0) > 0
                 # 5) 按邀请面值建一次性总额度（单轨；无面值解析全局默认；
                 #    皆缺 fail-closed 整体回滚——invite 不消费、状态不推进）
                 invite_limit = invite["total_limit_nano_cny"]
@@ -1236,10 +1266,12 @@ def activate_registered_user(user_id, invite_token):
                     "registration_invite", invite_id,
                     {"status": "success",
                      "user_id": user_id,
+                     "application_closed": bool(application_closed),
                      "email_masked": mask_login_id(
                          user["email_normalized"] or "")})
         return {"user": updated, "invite_id": invite_id,
-                "total_allowance": allowance}
+                "total_allowance": allowance,
+                "application_closed": bool(application_closed)}
     except InviteRedeemError as exc:
         # 失败审计（独立 best-effort 小事务；主事务已回滚，invite 必未消费）
         fail_reason = exc.reason if exc.reason != "bad_input" else fail_reason

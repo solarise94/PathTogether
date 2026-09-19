@@ -947,7 +947,10 @@ def test_admin_manifest_plugin_version_bumped_with_hashes():
     # 2026-09-15 0.4.6（站点统计入口域名口径）：站点访问卡增加「访问域名」
     # 列、入口白名单/历史隔离提示、外部来源爬虫切换（review 2026-09-15），
     # hashes/pin 同步
-    assert data["pluginVersion"] == "0.4.6"  # hashes/pin 同步
+    # 2026-09-19 0.4.8（R7 审批/邀请码一致性）：测试申请新增终态
+    # activated_by_invite 枚举/筛选/激活来源展示（0.4.7 为基线遗留、
+    # 本断言此前未跟进），hashes/pin 同步
+    assert data["pluginVersion"] == "0.4.8"  # hashes/pin 同步
     assert "admin:settings:read" in data["adminPermissions"]
     assert "admin:settings:write" in data["adminPermissions"]
     assert "admin:slides:read" in data["adminPermissions"]

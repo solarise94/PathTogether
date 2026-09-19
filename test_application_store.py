@@ -96,7 +96,11 @@ def list_applications(direction=None):
     conn = registration._connect()
     try:
         with conn.cursor() as cur:
-            cur.execute('SELECT t.*,u.email_normalized,u.display_name,u.activation_state '
+            # activation_source：R7 起 admin 列表需显示激活来源（admin=管理员
+            # 审批通过 / invite=邀请码激活），区分 approved 与
+            # activated_by_invite 两条不同的激活路径。
+            cur.execute('SELECT t.*,u.email_normalized,u.display_name,'
+                        'u.activation_state,u.activation_source '
                         'FROM test_applications t JOIN users u USING(user_id) '
                         'WHERE (%s::text IS NULL OR t.research_direction=%s) '
                         "ORDER BY (t.status='pending') DESC,t.created_at DESC LIMIT 500",
@@ -125,7 +129,15 @@ def set_consent(user_id, share):
 
 
 def review(user_id, actor_id, decision, ai_access=True):
-    """Atomic provisioning/decision/mail; a repeated approval never adds credits."""
+    """Atomic provisioning/decision/mail; a repeated approval never adds credits.
+
+    R7（2026-09-19）终态语义：仅 status='pending' 可审。用户已被邀请码激活
+    时申请收口为 activated_by_invite（registration_store.activate_registered
+    _user 同事务完成），本函数对其返回 False（路由映射 409 already_reviewed，
+    明确幂等/冲突状态，不重复激活、不重复发额度/邮件）。锁序与激活同款：
+    provisioning advisory → users 行 → test_applications 行，激活/审批并发
+    无死锁、唯一终态。
+    """
     if decision not in ('approved', 'rejected') or not isinstance(ai_access, bool):
         raise ValueError('审核操作无效')
     conn = registration._connect()

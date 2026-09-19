@@ -4360,9 +4360,11 @@ def api_account_activate():
 
     - 身份从 session 推导（_require_enrollment），不信请求身份字段；
     - registration_store.activate_registered_user 单事务：锁序沿用
-      provisioning 闸 → CAS 消费邀请码 → activation_state=active → 按邀请
+      provisioning 闸 → CAS 消费邀请码 → activation_state=active → pending
+      测试申请收口为 activated_by_invite（R7 2026-09-19，同事务）→ 按邀请
       面值建一次性总额度 → 审计；**绝不**调用 redeem_invite；
-    - already_active：不消费、不充值 → 409；
+    - already_active：不消费、不充值 → 409（与管理员审批并发时后到一方的
+      明确幂等/冲突状态）；
     - 邀请码无效/过期/撤销/已消费 → 403 统一
       invite_invalid_or_unavailable；
     - 成功：清 enrollment session，轮换 CSRF，客户端跳 /login 重新登录。
@@ -4413,7 +4415,9 @@ def api_account_activate():
     rotate_csrf_token()
     _audit("registration.activation_flow_done", target_type="user",
            target_id=result["user"]["user_id"],
-           detail={"invite_id": result["invite_id"]})
+           detail={"invite_id": result["invite_id"],
+                   "application_closed":
+                       bool(result.get("application_closed"))})
     return jsonify(ok=True, next="/login")
 
 
@@ -4444,8 +4448,11 @@ def _test_application_actor():
 def api_account_test_application_get():
     """查询本人测试申请状态。
 
-    返回 {state: "none"|"pending"|"approved"|"rejected", research_direction?,
-    share_research_data?, consent_version?}；无记录 → state="none"。
+    返回 {state: "none"|"pending"|"approved"|"rejected"|
+    "activated_by_invite", research_direction?, share_research_data?,
+    consent_version?}；无记录 → state="none"。activated_by_invite（R7
+    2026-09-19）= 用户已凭邀请码激活、申请同事务自动收口（非人工审批）；
+    等待页据此显示「已通过邀请码激活」并引导重新登录，不混同 approved。
     """
     if not AUTH_ENABLED:
         return jsonify(error="测试申请需要启用认证"), 400
@@ -9071,8 +9078,10 @@ def admin_v1_test_applications():
     if direction is not None and \
             direction not in test_application_store.DIRECTIONS:
         return _admin_v1_error(400, "invalid_request", "研究方向无效")
-    if status is not None and \
-            status not in ("pending", "approved", "rejected"):
+    if status is not None and status not in (
+            "pending", "approved", "rejected", "activated_by_invite"):
+        # activated_by_invite（R7 2026-09-19）：邀请码激活同事务收口的显式
+        # 终态；管理员不再能对其审批（review 对非 pending 返回 409）。
         return _admin_v1_error(400, "invalid_request", "状态无效")
     try:
         rows = test_application_store.list_applications(direction)
@@ -9094,6 +9103,9 @@ def admin_v1_test_applications():
         "reviewed_at": _test_app_rfc3339(row.get("reviewed_at")),
         "reviewed_by": row.get("reviewed_by"),
         "activation_state": row.get("activation_state"),
+        # 激活来源（R7）：admin=管理员审批通过 / invite=邀请码激活；列表据
+        # 此显示来源，approved 与 activated_by_invite 不再混淆。
+        "activation_source": row.get("activation_source"),
     } for row in rows]
     return jsonify(items=items, next_cursor=None)
 

@@ -204,6 +204,8 @@
          data-i18n="activate.state.none.desc">请选择研究方向并提交测试申请，管理员审核通过后即可开始使用。</p>
       <div id="apply-pending" hidden>
         <p class="state-line" data-i18n="activate.state.pending.desc">申请已提交，请等待管理员审核。</p>
+        <button type="button" class="btn secondary" id="apply-refresh"
+                data-i18n="activate.state.refresh">刷新状态</button>
       </div>
       <div id="apply-rejected" hidden>
         <p class="state-line bad" data-i18n="activate.state.rejected.desc">你之前的测试申请未通过。如需了解详情，请联系管理员；也可以调整选择后重新申请。</p>
@@ -213,6 +215,19 @@
       <div id="apply-approved" hidden>
         <p class="state-line ok" data-i18n="activate.state.approved.desc">申请已通过，账号已激活。请用你的邮箱密码重新登录。</p>
         <a class="btn primary" href="/login" data-i18n="activate.state.approved.login">前往登录</a>
+      </div>
+      <div id="apply-invite-activated" hidden>
+        <p class="state-line ok" data-i18n="activate.state.invite_activated.desc">你的账号已通过邀请码激活，无需再等待审核。请用你的邮箱密码重新登录。</p>
+        <a class="btn primary" href="/login" data-i18n="activate.state.approved.login">前往登录</a>
+      </div>
+      <div id="apply-auth" hidden>
+        <p class="state-line" data-i18n="activate.state.auth.desc">登录状态已更新或失效，请重新登录查看。</p>
+        <a class="btn primary" href="/login" data-i18n="activate.state.auth.login">重新登录</a>
+      </div>
+      <div id="apply-load-error" hidden>
+        <p class="state-line bad" data-i18n="activate.state.load.fail">暂时无法获取申请状态，请刷新重试</p>
+        <button type="button" class="btn secondary" id="apply-load-retry"
+                data-i18n="activate.state.refresh">刷新状态</button>
       </div>
       <form id="apply-form" autocomplete="off" hidden>
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
@@ -309,7 +324,14 @@
       tabApply.addEventListener("click", function () { selectTab(true); });
       tabInvite.addEventListener("click", function () { selectTab(false); });
 
-      // ---- 区块 1：测试申请状态机（none/pending/rejected/approved） ----
+      // ---- 区块 1：测试申请状态机
+      //      （none/pending/rejected/approved/activated_by_invite + auth/load-error）
+      //      R7（2026-09-19）：等待页可感知审批结果——手动「刷新状态」按钮 +
+      //      焦点/可见恢复时刷新 + 有界轮询（15s × 20 次，页面隐藏时暂停，
+      //      离开页面停止）；请求带递增序号，旧响应一律丢弃（不覆盖新状态）。
+      //      401 = 登录状态已更新或失效（如管理员已审批推进状态），明确引导
+      //      重新登录查看，绝不解释为审批通过；503/网络错误保留明确重试状态，
+      //      不退回申请表单、不误标待审、不重复提交。----
       var applyForm = document.getElementById("apply-form");
       var applyBtn = document.getElementById("apply-submit");
       var applyChecking = document.getElementById("apply-checking");
@@ -317,22 +339,64 @@
       var applyPending = document.getElementById("apply-pending");
       var applyRejected = document.getElementById("apply-rejected");
       var applyApproved = document.getElementById("apply-approved");
+      var applyInviteActivated = document.getElementById("apply-invite-activated");
+      var applyAuth = document.getElementById("apply-auth");
+      var applyLoadError = document.getElementById("apply-load-error");
+      var APPLY_POLL_INTERVAL_MS = 15000;
+      var APPLY_POLL_MAX_REQUESTS = 20;        // 有界：最多自动刷新 20 次
+      var APPLY_REFRESH_THROTTLE_MS = 5000;    // 焦点/可见刷新节流
+      var loadSeq = 0;
+      var pollTimer = null;
+      var pollRequestsLeft = 0;
+      var lastAutoRefreshAt = Date.now();
+      function stopPolling() {
+        if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
+        pollRequestsLeft = 0;
+      }
+      function startPolling() {
+        stopPolling();
+        pollRequestsLeft = APPLY_POLL_MAX_REQUESTS;
+        pollTimer = setInterval(function () {
+          // 后台标签页不发请求（避免堆积）；页面重新可见由 visibilitychange 触发
+          if (document.hidden) return;
+          if (pollRequestsLeft <= 0) { stopPolling(); return; }
+          pollRequestsLeft -= 1;
+          loadState();
+        }, APPLY_POLL_INTERVAL_MS);
+      }
+      function autoRefresh() {
+        var now = Date.now();
+        if (now - lastAutoRefreshAt < APPLY_REFRESH_THROTTLE_MS) return;
+        lastAutoRefreshAt = now;
+        loadState();
+      }
       function showApplyBlock(block) {
         applyChecking.hidden = true;
         applyNoneDesc.hidden = true;
         applyPending.hidden = true;
         applyRejected.hidden = true;
         applyApproved.hidden = true;
+        applyInviteActivated.hidden = true;
+        applyAuth.hidden = true;
+        applyLoadError.hidden = true;
         applyForm.hidden = true;
+        if (block !== "pending") stopPolling();
         if (block === "form") {
           applyNoneDesc.hidden = false;
           applyForm.hidden = false;
         } else if (block === "pending") {
           applyPending.hidden = false;
+          startPolling();
         } else if (block === "rejected") {
           applyRejected.hidden = false;
         } else if (block === "approved") {
           applyApproved.hidden = false;
+        } else if (block === "invite-activated") {
+          applyInviteActivated.hidden = false;
+        } else if (block === "auth") {
+          applyAuth.hidden = false;
+        } else if (block === "load-error") {
+          applyLoadError.hidden = false;
         }
       }
       document.getElementById("apply-retry").addEventListener("click", function () {
@@ -382,25 +446,61 @@
           failApply(t("verify.apply.err.network", "网络异常，请稍后重试"));
         });
       });
-      // 初始状态：GET /api/account/test-application（enrollment 会话身份）
-      (function loadState() {
+      // 状态读取（可重复调用）：手动按钮 / 焦点与可见恢复 / 有界轮询共用；
+      // seq 守卫保证只有最新一次响应能驱动界面。
+      function loadState() {
+        var seq = ++loadSeq;
         fetch("/api/account/test-application", { credentials: "same-origin" })
           .then(function (resp) {
-            if (!resp.ok) { throw new Error("http " + resp.status); }
-            return resp.json();
-          })
-          .then(function (data) {
-            var state = data && data.state;
-            if (state === "pending") { showApplyBlock("pending"); }
-            else if (state === "rejected") { showApplyBlock("rejected"); }
-            else if (state === "approved") { showApplyBlock("approved"); }
-            else { showApplyBlock("form"); }  // none / 未知：兜底显示申请表单
+            return resp.json().catch(function () { return {}; })
+              .then(function (data) {
+                if (seq !== loadSeq) return;  // 旧响应：丢弃
+                if (resp.status === 401 ||
+                    (data && data.code === "auth_required")) {
+                  // 401：登录状态已更新或失效（审批推进 activation_state/
+                  // auth_version 后原 enrollment 会话失效即属此列）。明确
+                  // 引导重新登录查看，不解释为任何申请结果。
+                  showApplyBlock("auth");
+                  return;
+                }
+                if (!resp.ok) {
+                  // 503 等：保留明确重试状态（不退回表单、不误标待审）
+                  showApplyBlock("load-error");
+                  return;
+                }
+                var state = data && data.state;
+                if (state === "pending") { showApplyBlock("pending"); }
+                else if (state === "rejected") { showApplyBlock("rejected"); }
+                else if (state === "approved") { showApplyBlock("approved"); }
+                else if (state === "activated_by_invite") {
+                  showApplyBlock("invite-activated");
+                } else { showApplyBlock("form"); }  // none / 未知：兜底申请表单
+              });
           })
           .catch(function () {
-            applyChecking.hidden = true;
-            showErr(t("activate.state.load.fail", "暂时无法获取申请状态，请刷新重试"));
+            if (seq !== loadSeq) return;  // 旧响应：丢弃
+            showApplyBlock("load-error"); // 网络异常：同 503 保留重试状态
           });
-      })();
+      }
+      document.getElementById("apply-refresh").addEventListener("click", function () {
+        clearErr();
+        lastAutoRefreshAt = Date.now();
+        loadState();
+      });
+      document.getElementById("apply-load-retry").addEventListener("click", function () {
+        clearErr();
+        lastAutoRefreshAt = Date.now();
+        loadState();
+      });
+      window.addEventListener("focus", autoRefresh);
+      document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState === "visible") autoRefresh();
+      });
+      // 离开页面：停止轮询（导航/关闭时定时器随页面销毁，这里显式收口）
+      window.addEventListener("pagehide", stopPolling);
+      window.addEventListener("beforeunload", stopPolling);
+      // 初始状态：GET /api/account/test-application（enrollment 会话身份）
+      loadState();
 
       // ---- 区块 2：邀请码激活（保留原逻辑） ----
       var form = document.getElementById("activate-form");

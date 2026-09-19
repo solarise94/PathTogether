@@ -386,12 +386,14 @@
              结果邮件（终态，不可撤销），走页内确认条（sandbox 无 allow-modals，
              原生 confirm 被吞）+「开通 AI 权限」默认勾选；rejected 亦终态。
              409 default_allowance_unconfigured 提示先去设置页配置新用户默认
-             总额度。渲染字段白名单 textContent（同格式申请页纪律）。 -->
+             总额度。activated_by_invite（R7）= 邀请码激活同事务收口的终态，
+             从待审任务移除、仅显示激活来源。渲染字段白名单 textContent
+             （同格式申请页纪律）。 -->
         <section class="adm-page" id="adm-page-test-applications" hidden>
           <div class="adm-state" id="adm-state-test-applications" data-page-state="idle" role="status" aria-live="polite"></div>
           <section class="adm-card">
             <h2>测试申请</h2>
-            <p class="adm-note">已验证邮箱的待激活用户在此申请测试资格：研究方向与自愿数据分享选择（分享与否不影响审批）。通过即激活账号并按新用户默认总额度发放额度（终态，不可撤销）；拒绝同样终态并邮件通知用户。通过前请先确认「设置」页已配置新用户默认总额度，否则无法发放。</p>
+            <p class="adm-note">已验证邮箱的待激活用户在此申请测试资格：研究方向与自愿数据分享选择（分享与否不影响审批）。通过即激活账号并按新用户默认总额度发放额度（终态，不可撤销）；拒绝同样终态并邮件通知用户。通过前请先确认「设置」页已配置新用户默认总额度，否则无法发放。用户若凭邀请码直接激活，其申请会自动收口为「已通过邀请码激活」（非人工审批，无法再审核）。</p>
             <div class="adm-filters" id="adm-test-filters">
               <div class="adm-field">
                 <label class="adm-field-label" for="adm-test-status">状态</label>
@@ -400,6 +402,7 @@
                   <option value="pending">待审核</option>
                   <option value="approved">已通过</option>
                   <option value="rejected">已拒绝</option>
+                  <option value="activated_by_invite">已通过邀请码激活</option>
                 </select>
               </div>
               <div class="adm-field">

@@ -3654,14 +3654,22 @@
   //   - approved = 原子激活 + 默认额度 provisioning + 结果邮件，终态不可
   //     撤销 → 页内确认条（sandbox 无 allow-modals，原生 confirm 被吞）
   //     +「开通 AI 权限」勾选（默认勾）；rejected 亦终态（页内确认条）；
+  //   - activated_by_invite（R7 2026-09-19）：用户凭邀请码激活时服务端已
+  //     同事务收口的显式终态——从待审任务移除（无通过/拒绝按钮），状态列
+  //     显示「已通过邀请码激活」+ 激活来源；对它审批服务端一律 409
+  //     already_reviewed；
   //   - 409 default_allowance_unconfigured → 提示先去设置页配置新用户默认
   //     总额度（fail-closed，绝不无额度激活）；409 already_reviewed →
-  //     提示并刷新（他人先行处理）；
+  //     提示并刷新（他人先行处理/邀请码已收口）；
   //   - 渲染白名单字段 textContent（同格式申请页纪律），方向中文映射在本
   //     前端做（API 只回机器值）。
   // ------------------------------------------------------------------
   var TEST_APP_STATUS_LABELS = {
     pending: "待审核", approved: "已通过", rejected: "已拒绝",
+    activated_by_invite: "已通过邀请码激活",
+  };
+  var TEST_APP_SOURCE_LABELS = {
+    admin: "管理员审批", invite: "邀请码",
   };
   var TEST_APP_DIRECTIONS = {
     model_plant: "模式植物", model_animal: "模式动物",
@@ -3674,6 +3682,16 @@
 
   function testAppDirectionLabel(direction) {
     return TEST_APP_DIRECTIONS[direction] || String(direction || "—");
+  }
+
+  // 激活来源（R7）：仅已激活账号显示；服务端 activation_source 权威，
+  // 前端只做中文映射，未知来源原样回显机器值不猜。
+  function testAppSourceLabel(item) {
+    if (item.activation_state !== "active" || !item.activation_source) {
+      return null;
+    }
+    var known = TEST_APP_SOURCE_LABELS[item.activation_source];
+    return "激活来源：" + (known || String(item.activation_source));
   }
 
   function loadTestApplications() {
@@ -3724,13 +3742,30 @@
     tr.appendChild(td(fmtTs(item.created_at), "adm-cell-time"));
     var statusCell = document.createElement("td");
     statusCell.textContent = testAppStatusLabel(item.status);
-    if (item.status !== "pending" && item.reviewed_at) {
+    if (item.status === "activated_by_invite") {
+      // 邀请码激活收口（R7）：非人工审批（reviewed_by 恒空），状态列附
+      // 激活来源；操作列不提供任何审核动作（待审任务已移除）。
+      var source = testAppSourceLabel(item);
+      if (source) {
+        statusCell.appendChild(document.createElement("br"));
+        var inviteMeta = document.createElement("span");
+        inviteMeta.className = "adm-user-meta";
+        inviteMeta.textContent = source;
+        statusCell.appendChild(inviteMeta);
+      }
+    } else if (item.status !== "pending" && item.reviewed_at) {
       // 已处理行：状态列附审核时间（操作列不再提供动作）
       statusCell.appendChild(document.createElement("br"));
       var meta = document.createElement("span");
       meta.className = "adm-user-meta";
       meta.textContent = fmtTs(item.reviewed_at);
       statusCell.appendChild(meta);
+      // 管理员审批通过行同样标注激活来源（区分两条激活路径）
+      var src = testAppSourceLabel(item);
+      if (src) {
+        meta.appendChild(document.createElement("br"));
+        meta.appendChild(document.createTextNode(src));
+      }
     }
     tr.appendChild(statusCell);
     var cell = document.createElement("td");

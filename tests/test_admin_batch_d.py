@@ -17,10 +17,12 @@ pg 模式（RUN_PG_TESTS=1）：
     （spent/reserved 不动）/ 409 CAS / audit；
   - 用户月额度覆盖 PUT/DELETE：设置后解析到 user_override、清除后下个窗口
     回退 user_default / owner 目标 400 / 404 不存在 / audit 无敏感字段；
-  - 用户创建扩展：total 模式（target=total_allowance）带
+  - 用户创建组合原语（R6：POST /api/admin/v1/users 已 410 退役，建号唯一
+    入口 = user_store_pg.create_user_with_total_allowance，经正常注册/
+    邀请码/test-applications 审批调用）：total 模式带
     total_limit_nano_cny 同事务建一次性总额度（含注入失败整体回滚：用户不
-    创建）；window 模式无金额不建任何额度面；postgres 后端无金额字段也走
-    同事务原语（total 模式缺默认 → 400 total_default_missing）；
+    创建）；无金额走 defaults 权威默认（缺默认 → total_default_missing，
+    绝不建出无额度行的用户）；退役端点对任何载荷一律 410 endpoint_retired；
   - 邀请码模板：创建携带初始总额度（wire 十进制字符串、库内整数）/ 兑换
     total 模式同事务建总额度（含注入失败整体回滚：邀请不消费、用户不创建）/
     明文码仅创建响应一次 + no-store；
@@ -384,14 +386,14 @@ def test_user_total_limit_set_and_restore():
     # R3 单轨：user 恒走互斥 total 形态（无 target 可切）
     owner, usera = _setup_users()
     c = _login(_client(), owner)
-    # 建号带初始总额度（同一事务建行）
-    r = c.post("/api/admin/v1/users", json={
-        "login_id": "total@x.com", "password": "password-123456",
-        "total_limit_nano_cny": "9007199254740993"})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    uid = r.get_json()["user"]["user_id"]
-    assert r.get_json()["total_allowance"]["limit_nano_cny"] == \
-        OVER_2E53_NANO
+    # R6：建号入口 POST /api/admin/v1/users 已 410 退役——经组合原语建
+    # 带初始总额度（>2^53 面值）的用户，再走 total-limit/restore-default API
+    import user_store_pg
+    user, allowance = user_store_pg.create_user_with_total_allowance(
+        "total@x.com", "password-123456",
+        total_limit_nano_cny=int(OVER_2E53_NANO))
+    uid = user["user_id"]
+    assert allowance["limit_nano_cny"] == int(OVER_2E53_NANO)
 
     # JSON number 拒绝 / 缺字段拒绝 / 非法 version 拒绝
     base = "/api/admin/v1/spend/users/%s/total-limit" % uid
@@ -479,27 +481,25 @@ def test_user_total_limit_set_and_restore():
     assert "password" not in blob and "token" not in blob
 
 # --------------------------------------------------------------------------- #
-# 7. 用户创建扩展（同事务一次性总额度 + 不带额度不建行 + 注入失败回滚）
+# 7. 用户创建组合原语（R6 后建号唯一入口；POST /api/admin/v1/users 已退役）
 # --------------------------------------------------------------------------- #
 def test_users_create_with_total_limit_atomic():
-    """建号带 total_limit_nano_cny → 同事务建一次性总额度（source=admin_create，
-    default_version=None；不建 user_override 月策略——写面已随 R3 单轨删除）；
-    旧 monthly 字段退役：body 带该键一律 400 retired_spend_field。"""
+    """组合原语带 total_limit_nano_cny → 同事务建一次性总额度（source=
+    admin_create，default_version=None；不建 user_override 月策略——写面已随
+    R3 单轨删除）；user.create 审计同事务落库。"""
     bh.seed_spend_policies()
     owner, _u = _setup_users()
-    c = _login(_client(), owner)
-    r = c.post("/api/admin/v1/users", json={
-        "login_id": "limited@x.com", "password": "password-123456",
-        "display_name": "Limited", "total_limit_nano_cny": "30500000000"})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    body = r.get_json()
-    uid = body["user"]["user_id"]
-    assert body["total_allowance"]["limit_nano_cny"] == "30500000000"
-    allowance = spend_store.get_total_allowance(uid)
-    assert allowance is not None
+    import user_store_pg
+    user, allowance = user_store_pg.create_user_with_total_allowance(
+        "limited@x.com", "password-123456", display_name="Limited",
+        total_limit_nano_cny=305 * 10 ** 8, actor_user_id=owner["user_id"])
+    uid = user["user_id"]
     assert allowance["limit_nano_cny"] == 305 * 10 ** 8
-    assert allowance["source"] == "admin_create"
-    assert allowance["default_version"] is None  # 显式 X 不锚定默认版本
+    row = spend_store.get_total_allowance(uid)
+    assert row is not None
+    assert row["limit_nano_cny"] == 305 * 10 ** 8
+    assert row["source"] == "admin_create"
+    assert row["default_version"] is None  # 显式 X 不锚定默认版本
     # user_override 月策略不再创建（写面已删）
     conn = bh.connect()
     try:
@@ -515,39 +515,26 @@ def test_users_create_with_total_limit_atomic():
     assert mine and mine[0]["detail"]["total_limit_nano_cny"] == 305 * 10 ** 8
     assert mine[0]["detail"]["spend_target"] == "total_allowance"  # wire 兼容标注
     assert mine[0]["detail"]["limit_surface"] == "total_allowance"
-    # R3 Wave2-Compat：旧 monthly 字段退役——body 带该键一律 400
-    # retired_spend_field（绝不静默忽略），不再有「兼容落总额度」路径
-    r_ret = c.post("/api/admin/v1/users", json={
-        "login_id": "amb@x.com", "password": "password-123456",
-        "total_limit_nano_cny": "1000000000",
-        "monthly_limit_nano_cny": "1000000000"})
-    assert r_ret.status_code == 400
-    assert r_ret.get_json()["error"]["code"] == "retired_spend_field"
-    r_ret2 = c.post("/api/admin/v1/users", json={
-        "login_id": "legacyfld@x.com", "password": "password-123456",
-        "monthly_limit_nano_cny": "2000000000"})
-    assert r_ret2.status_code == 400
-    assert r_ret2.get_json()["error"]["code"] == "retired_spend_field"
 
 def test_users_create_without_limit_inherits_default():
     """R3 单轨：无金额建号 → 同事务按 ai_spend_total_defaults 权威行（20 CNY）
     建 allowance（source=admin_create，default_version 锚定默认行版本）。"""
     bh.seed_spend_policies()
-    owner, _u = _setup_users()
-    c = _login(_client(), owner)
-    r = c.post("/api/admin/v1/users", json={
-        "login_id": "inherits@x.com", "password": "password-123456"})
-    assert r.status_code == 200
-    # 单轨恒建行：响应携带 total_allowance（默认 20 CNY）
-    assert r.get_json()["total_allowance"]["limit_nano_cny"] == \
-        str(20 * 10 ** 9)
-    uid = r.get_json()["user"]["user_id"]
-    allowance = spend_store.get_total_allowance(uid)
-    assert allowance is not None
+    _owner, _u = _setup_users()
+    import user_store_pg
+    user, allowance = user_store_pg.create_user_with_total_allowance(
+        "inherits@x.com", "password-123456")
+    uid = user["user_id"]
+    # 单轨恒建行：返回值携带 allowance（默认 20 CNY）
     assert allowance["limit_nano_cny"] == 20 * 10 ** 9
-    assert allowance["source"] == "admin_create"
-    assert allowance["default_version"] is not None  # 锚定默认行版本
+    row = spend_store.get_total_allowance(uid)
+    assert row is not None
+    assert row["limit_nano_cny"] == 20 * 10 ** 9
+    assert row["source"] == "admin_create"
+    assert row["default_version"] is not None  # 锚定默认行版本
     # users 列表：total 形态（现行唯一授权面）
+    owner = user_store.get_user_by_login_id("owner@x.com")
+    c = _login(_client(), owner)
     item = [u for u in c.get("/api/admin/v1/users").get_json()["items"]
             if u["user_id"] == uid][0]
     assert item["spend"]["spend_target"] == "total_allowance"
@@ -696,11 +683,11 @@ def test_users_list_spend_display_single_track_locked():
     assert spend["window"] is not None
 
 def test_users_create_pg_always_atomic_and_total_default_gate():
-    """finding 1 建号变体收口：postgres 后端**不带金额字段**也走同事务组合
-    原语——R3 单轨后 defaults 表无可用默认时 400 total_default_missing
-    （绝不建出无额度行的用户）；defaults 恢复后照常 200 并建行。"""
-    owner, _u = _setup_users()
-    c = _login(_client(), owner)
+    """finding 1 建号变体收口（组合原语层；R6 后 POST /api/admin/v1/users
+    已 410 退役）：defaults 表无可用默认时原语抛 ValueError
+    total_default_missing（绝不建出无额度行的用户）；defaults 恢复后照常
+    建号并建行。"""
+    _owner, _u = _setup_users()
     bh.seed_spend_policies()
     # 构造「defaults 缺行」→ 无可用默认（策略回退已删，唯一来源是 defaults 表）
     conn = bh.connect()
@@ -711,61 +698,60 @@ def test_users_create_pg_always_atomic_and_total_default_gate():
         conn.commit()
     finally:
         conn.close()
-    r = c.post("/api/admin/v1/users", json={
-        "login_id": "gate@x.com", "password": "password-123456"})
-    assert r.status_code == 400, r.get_data(as_text=True)
-    assert r.get_json()["error"]["code"] == "total_default_missing"
+    import user_store_pg
+    with pytest.raises(ValueError) as ei:
+        user_store_pg.create_user_with_total_allowance(
+            "gate@x.com", "password-123456")
+    assert "total_default_missing" in str(ei.value)
     # 整体回滚：不留无额度行的用户
     assert user_store.get_user_by_login_id("gate@x.com") is None
     # defaults 恢复（重放 0032 物化）→ 无金额字段照常建号并按默认建行
     bh.seed_spend_settings()
-    r2 = c.post("/api/admin/v1/users", json={
-        "login_id": "plain-pg@x.com", "password": "password-123456"})
-    assert r2.status_code == 200, r2.get_data(as_text=True)
-    assert r2.get_json()["total_allowance"]["limit_nano_cny"] == \
-        str(20 * 10 ** 9)
-    assert spend_store.get_total_allowance(
-        r2.get_json()["user"]["user_id"]) is not None
+    user, allowance = user_store_pg.create_user_with_total_allowance(
+        "plain-pg@x.com", "password-123456")
+    assert allowance["limit_nano_cny"] == 20 * 10 ** 9
+    assert spend_store.get_total_allowance(user["user_id"]) is not None
 
 def test_users_create_override_failure_rolls_back_user():
     """单事务证据：总额度行写入失败 → 用户不创建（§5.1；allowance 注入目标，
     单轨恒触达 allowance 原语）。"""
     bh.seed_spend_policies()
-    owner, _u = _setup_users()
-    c = _login(_client(), owner)
+    _owner, _u = _setup_users()
     orig = spend_store.create_user_total_allowance_tx
 
     def boom(*_a, **_k):
         raise RuntimeError("allowance down")
     spend_store.create_user_total_allowance_tx = boom
     try:
-        r = c.post("/api/admin/v1/users", json={
-            "login_id": "rollback@x.com", "password": "password-123456",
-            "total_limit_nano_cny": "1000000000"})
-        assert r.status_code == 500
+        import user_store_pg
+        with pytest.raises(RuntimeError, match="allowance down"):
+            user_store_pg.create_user_with_total_allowance(
+                "rollback@x.com", "password-123456",
+                total_limit_nano_cny=1000000000)
     finally:
         spend_store.create_user_total_allowance_tx = orig
     assert user_store.get_user_by_login_id("rollback@x.com") is None
     assert spend_store.get_total_allowance("rollback@x.com") is None
 
-def test_users_create_rejects_owner_and_bad_amount():
+def test_users_create_endpoint_retired_r6():
+    """R6（service-review-fix-plan-20260919.md §8）：POST /api/admin/v1/users
+    对任何载荷（role=owner / 坏金额 / 旧 monthly 字段 / 合法载荷）一律
+    410 endpoint_retired——退役分支先于所有入参校验，零用户行落库。"""
     bh.seed_spend_policies()
     owner, _u = _setup_users()
     c = _login(_client(), owner)
-    assert c.post("/api/admin/v1/users", json={
-        "login_id": "o@x.com", "password": "password-123456",
-        "role": "owner"}).status_code == 400
-    for bad in (5, "1.5", "9" * 20):
-        rb = c.post("/api/admin/v1/users", json={
-            "login_id": "bad@x.com", "password": "password-123456",
-            "total_limit_nano_cny": bad})
-        assert rb.status_code == 400, "limit=%r 应 400" % (bad,)
-    # 旧字段（已退役）：坏值同样 400 retired_spend_field（键出现即拒绝）
-    rb = c.post("/api/admin/v1/users", json={
-        "login_id": "bad2@x.com", "password": "password-123456",
-        "monthly_limit_nano_cny": 5})
-    assert rb.status_code == 400
-    assert rb.get_json()["error"]["code"] == "retired_spend_field"
+    for payload in (
+            {"login_id": "o@x.com", "password": "password-123456",
+             "role": "owner"},
+            {"login_id": "bad@x.com", "password": "password-123456",
+             "total_limit_nano_cny": 5},
+            {"login_id": "bad2@x.com", "password": "password-123456",
+             "monthly_limit_nano_cny": 5},
+            {"login_id": "fine@x.com", "password": "password-123456"}):
+        r = c.post("/api/admin/v1/users", json=payload)
+        assert r.status_code == 410, (payload, r.status_code)
+        assert r.get_json()["error"]["code"] == "endpoint_retired"
+        assert user_store.get_user_by_login_id(payload["login_id"]) is None
 
 # --------------------------------------------------------------------------- #
 # 8. 邀请码总额度模板 + 兑换事务内一次性总额度（Batch B wave 2）

@@ -88,7 +88,9 @@ def _pg_count(table, where="", args=()):
 # 1. owner 门控（匿名 / user / preview）——全部写端点
 # --------------------------------------------------------------------------- #
 _WRITE_ENDPOINTS = [
-    ("POST", "/api/admin/v1/users"),
+    # R6（2026-09-19）：POST /api/admin/v1/users 已 410 退役（无鉴权分支，
+    # 任何调用方一律 410）——不再列入「owner 门控写端点」遍历面，退役语义
+    # 由 test_r6_users_create_endpoint_retired 单独锁定。
     ("POST", "/api/admin/v1/users/u_x/enable"),
     ("POST", "/api/admin/v1/users/u_x/disable"),
     ("POST", "/api/admin/v1/users/u_x/ai-access"),
@@ -124,32 +126,36 @@ def test_preview_owner_rejected_on_every_write_endpoint():
         assert r.status_code == 403, "%s %s -> %s" % (method, path, r.status_code)
 
 # --------------------------------------------------------------------------- #
-# 2. users 写端点（两种后端同语义；break-glass 镜像旧端点）
+# 2. users 写端点（break-glass 镜像旧端点）+ R6 退役入口
 # --------------------------------------------------------------------------- #
-def test_users_create_basic_and_guards():
-    owner, _u = _setup_users()
+def test_r6_users_create_endpoint_retired():
+    """R6（service-review-fix-plan-20260919.md §8）：手动建号入口 410 退役。
+
+    直接 POST /api/admin/v1/users（含 owner 登录态 + 合法载荷）不再建用户：
+    稳定 410 endpoint_retired、零副作用（无新用户行、响应不含 user 键）。"""
+    owner, usera = _setup_users()
     c = _login(_client(), owner)
-    r = c.post("/api/admin/v1/users", json={
-        "login_id": "newbie@x.com", "password": "longpassword-12345",
-        "display_name": "Newbie"})
-    assert r.status_code == 200, r.get_json()
-    user = r.get_json()["user"]
-    assert user["role"] == "user"
-    assert user["login_id"] == "newbie@x.com"
-    # §9 敏感红线：不回 password_hash / ai_config
-    assert "password_hash" not in user
-    assert "ai_config" not in user
-    # 禁止经此创建 owner
-    assert c.post("/api/admin/v1/users", json={
-        "login_id": "hack@x.com", "password": "longpassword-12345",
-        "role": "owner"}).status_code == 400
-    # 密码长度策略（15..200）
-    assert c.post("/api/admin/v1/users", json={
-        "login_id": "short@x.com", "password": "short"}).status_code == 400
-    # 冲突 409
-    assert c.post("/api/admin/v1/users", json={
-        "login_id": "owner@x.com", "password": "longpassword-12345"
-    }).status_code == 409
+    for payload in (
+            # 合法形态（曾 200 建号）
+            {"login_id": "newbie@x.com", "password": "longpassword-12345",
+             "display_name": "Newbie"},
+            # 禁止经此创建 owner 的旧防护现已无意义——一律 410
+            {"login_id": "hack@x.com", "password": "longpassword-12345",
+             "role": "owner"},
+            # 短密码 / 冲突载荷同样走退役分支
+            {"login_id": "short@x.com", "password": "short"},
+            {"login_id": "owner@x.com", "password": "longpassword-12345"}):
+        r = c.post("/api/admin/v1/users", json=payload)
+        assert r.status_code == 410, (payload, r.status_code)
+        assert r.get_json()["error"]["code"] == "endpoint_retired"
+        assert "user" not in (r.get_json() or {})
+        if payload["login_id"] != "owner@x.com":  # 种子 owner 行本来就在
+            assert user_store.get_user_by_login_id(payload["login_id"]) is None
+    # 列表仍只有种子用户（无新建行）
+    items = c.get("/api/admin/v1/users?limit=100").get_json()["items"]
+    assert {u["login_id_masked"] for u in items} <= {"o***@x.com",
+                                                     "u***@x.com"}
+
 
 def test_users_disable_enable_auth_version_and_break_glass():
     owner, usera = _setup_users()

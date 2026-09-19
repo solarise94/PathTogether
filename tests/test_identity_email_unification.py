@@ -1,24 +1,28 @@
 # -*- coding: utf-8 -*-
 """P1-3 身份收口测试（w1b）：登录 session 主身份邮箱化 + 建号入口只收邮箱 +
-存量冲突清单 + orphan pending 处置 + 邮箱改绑闭环 + 分享页掩码不回退。
+邮箱改绑闭环 + 分享页掩码不回退。
 
-覆盖（review P1-3 修复范围）：
+R6（service-review-fix-plan-20260919.md §8，2026-09-19）：owner 手动建号
+端点（POST /api/admin/v1/users）、存量冲突清单（GET identity-conflicts）与
+orphan pending 处置（POST discard-pending）已整体 410 退役——管理台身份
+冲突页/新建用户表单同批移除；本文件原第 3/4 节改锁「退役入口不可调用且
+零副作用」。底层一致性保护保留并继续验证：邮箱唯一约束（users_email_
+identity_key / login_id 唯一）、建号即写 email 身份三列、分享页掩码。
+
+覆盖：
   1. 登录 session：auth_user = email_normalized → email → login_id
      （display_name 绝不冒充身份）；/api/auth/info 顶层与 actor、身份预览
      subject 同口径；
-  2. owner 建号 API：login_id 必须邮箱形态（非邮箱 400 login_id_not_email），
-     写入同步 email/email_normalized（email_verified_at NULL=未验证），
-     display_name 缺省=邮箱、可选保留；invite_only 注册表单 login_id 必须
-     邮箱形态，display_name 输入保留但不再作为身份；
-  3. GET /api/admin/v1/users/identity-conflicts：四类冲突行 + 计数（只读）；
-  4. POST /api/admin/v1/users/<id>/discard-pending：仅 pending_activation +
-     bind.invalid 合成形可物理删除，其余 409（绝不自动夺取已有账号），写审计；
-  5. 邮箱改绑闭环：start（唯一预检/配额/无 token 回传）→ 邮件（复用
+  2. 建号组合原语（唯一建号入口，经正常注册/邀请码/test-applications 审批
+     调用）：login_id 规范化邮箱形态，写入同步 email/email_normalized
+     （email_verified_at NULL=未验证）、display_name 缺省=邮箱、可选保留、
+     唯一冲突 ValueError；R6 退役端点对任何载荷 410 且零副作用；
+  3. 邮箱改绑闭环：start（唯一预检/配额/无 token 回传）→ 邮件（复用
      registration_mail_jobs，purpose=email_change）→ /verify-email-change
      页面（匿名不泄露状态）→ confirm 单事务（login_id=新邮箱、
      email_verified_at=now、auth_version+1 全端失效、job consumed、审计）；
      占用/过期/一次性/他人 token 全拒绝且不改状态；
-  6. 公开分享页评论作者只出掩码邮箱（不回传完整邮箱、不回退 display_name）。
+  4. 公开分享页评论作者只出掩码邮箱（不回传完整邮箱、不回退 display_name）。
 """
 import json
 import os
@@ -36,7 +40,6 @@ import psycopg  # noqa: E402
 import pytest  # noqa: E402
 
 import app as app_mod  # noqa: E402
-import identity_store  # noqa: E402
 import pg_store  # noqa: E402
 import registration_mail_worker  # noqa: E402
 import registration_store  # noqa: E402
@@ -107,6 +110,13 @@ def _user_session(client, user):
         s.update({"auth_user": user["login_id"],
                   "user_id": user["user_id"], "role": user.get("role", "user"),
                   "auth_version": user.get("auth_version", 1)})
+
+
+def _client_login_as(user):
+    """带指定用户 session 的 CSRF client（负路径遍历用）。"""
+    client = _client()
+    _user_session(client, user)
+    return client
 
 
 def _login(client, username, password=PW):
@@ -256,57 +266,69 @@ def test_auth_info_preview_subject_email_first(monkeypatch):
 
 
 # =========================================================================== #
-# 2. 建号入口只收邮箱
+# 2. 建号组合原语（唯一建号入口）+ R6 退役端点不可调用
 # =========================================================================== #
-def test_admin_create_rejects_non_email_login_id(monkeypatch):
-    """非邮箱形态 login_id → 400 login_id_not_email，且无用户行落库。"""
+def test_admin_create_endpoint_retired_r6(monkeypatch):
+    """R6：POST /api/admin/v1/users 对任何载荷（含非邮箱 / 合法邮箱）一律
+    410 endpoint_retired，且无用户行落库（直接 POST 不能建用户）。"""
     owner = _mk_owner()
     client = _client()
     _owner_session(client, owner)
-    r = client.post("/api/admin/v1/users",
-                    json={"login_id": "plainuser", "password": PW})
-    assert r.status_code == 400, r.get_data(as_text=True)
-    assert r.get_json()["error"]["code"] == "login_id_not_email"
+    for payload in ({"login_id": "plainuser", "password": PW},
+                    {"login_id": "r6@x.com", "password": PW}):
+        r = client.post("/api/admin/v1/users", json=payload)
+        assert r.status_code == 410, r.get_data(as_text=True)
+        assert r.get_json()["error"]["code"] == "endpoint_retired"
     assert user_store.get_user_by_login_id("plainuser") is None
+    assert user_store.get_user_by_login_id("r6@x.com") is None
 
 
-def test_admin_create_writes_email_identity_columns(monkeypatch):
-    """邮箱建号：email/email_normalized=规范化邮箱、email_verified_at NULL、
-    display_name 缺省=邮箱、显式 display_name 保留。"""
-    owner = _mk_owner()
-    client = _client()
-    _owner_session(client, owner)
-    r = client.post("/api/admin/v1/users",
-                    json={"login_id": "  BOB@X.Com ", "password": PW})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    uid = r.get_json()["user"]["user_id"]
-    row = _user_row(uid)
+def test_create_primitive_writes_email_identity_columns(monkeypatch):
+    """P1-3 契约保留（建号唯一入口 = 组合原语；R6 后 HTTP 手动建号已退役）：
+    email/email_normalized=规范化邮箱、email_verified_at NULL、display_name
+    缺省=邮箱、显式 display_name 保留。"""
+    _mk_owner()
+    login_id = registration_store.validate_email("  BOB@X.Com ")
+    user, _allowance = user_store_pg_create(login_id, PW, email=login_id)
+    row = _user_row(user["user_id"])
     assert row["login_id"] == "bob@x.com"
     assert row["email"] == "bob@x.com"
     assert row["email_normalized"] == "bob@x.com"
     assert row["email_verified_at"] is None  # 绝不伪造验证状态
     assert row["display_name"] == "bob@x.com"  # 缺省=邮箱（纯展示）
     assert row["activation_state"] == "active"
-    r2 = client.post("/api/admin/v1/users",
-                     json={"login_id": "carol@x.com", "password": PW,
-                           "display_name": "Carol 展示名"})
-    assert r2.status_code == 200
-    row2 = _user_row(r2.get_json()["user"]["user_id"])
+    user2, _a2 = user_store_pg_create("carol@x.com", PW,
+                                      display_name="Carol 展示名",
+                                      email="carol@x.com")
+    row2 = _user_row(user2["user_id"])
     assert row2["display_name"] == "Carol 展示名"
     assert row2["login_id"] == "carol@x.com"
 
 
-def test_admin_create_email_conflict_409(monkeypatch):
-    owner = _mk_owner()
-    client = _client()
-    _owner_session(client, owner)
-    r1 = client.post("/api/admin/v1/users",
-                     json={"login_id": "dup@x.com", "password": PW})
-    assert r1.status_code == 200
-    r2 = client.post("/api/admin/v1/users",
-                     json={"login_id": "dup@x.com", "password": PW})
-    assert r2.status_code == 409
-    assert r2.get_json()["error"]["code"] == "login_id_conflict"
+def test_create_primitive_email_conflict_rejected(monkeypatch):
+    """邮箱唯一约束（P1-3 / users_email_identity_key 口径）保留：同邮箱/同
+    login_id 二次建号在原语层拒绝（ValueError「已存在」），无第二行落库。"""
+    _mk_owner()
+    user_store_pg_create("dup@x.com", PW, email="dup@x.com")
+    with pytest.raises(ValueError) as ei:
+        user_store_pg_create("dup@x.com", PW, email="dup@x.com")
+    assert "已存在" in str(ei.value)
+    conn = pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*)::int AS n FROM users "
+                "WHERE lower(login_id)='dup@x.com'")
+            assert cur.fetchone()["n"] == 1
+    finally:
+        conn.close()
+
+
+def user_store_pg_create(login_id, password, **kwargs):
+    """测试辅助：经建号组合原语创建用户（返回 (user, allowance)）。"""
+    import user_store_pg
+    return user_store_pg.create_user_with_total_allowance(
+        login_id, password, **kwargs)
 
 
 def test_invite_only_register_requires_email_login_id(monkeypatch):
@@ -342,231 +364,52 @@ def test_invite_only_register_requires_email_login_id(monkeypatch):
 
 
 # =========================================================================== #
-# 3. 存量冲突清单 API
+# 3. R6 退役入口：身份冲突清单 / 孤儿 pending 处置不可调用（410 + 零副作用）
 # =========================================================================== #
-def test_identity_conflicts_empty(monkeypatch):
+def test_identity_conflicts_endpoint_retired_r6(monkeypatch):
+    """R6：GET /api/admin/v1/users/identity-conflicts 对任何已登录调用方
+    （普通用户 / owner）稳定 410 endpoint_retired——不再有只读冲突清单
+    分支（403/200 均不复存在；匿名在 before_request 认证闸照常 401）。"""
     owner = _mk_owner()
-    client = _client()
-    _owner_session(client, owner)
-    r = client.get("/api/admin/v1/users/identity-conflicts")
-    assert r.status_code == 200
-    body = r.get_json()
-    assert body["items"] == []
-    assert body["counts"]["total_conflicting_rows"] == 0
-    for key in ("login_id_not_email", "email_login_mismatch",
-                "pending_bind_synthetic", "email_shared"):
-        assert body["counts"][key] == 0
-
-
-def test_identity_conflicts_classifies_and_gates(monkeypatch):
-    owner = _mk_owner()
-    # ① login_id 非邮箱形态（存量 display_name != login_id 的旧账号形态）
-    legacy = user_store.create_user("oldchief", PW, role="user",
-                                    display_name="老 Chief")
-    # ② email_normalized 与 login_id 不一致
-    mismatch = user_store.create_user("mike@x.com", PW)
-    _set_email(mismatch["user_id"], "mike-renamed@x.com")
-    # ③ 待补绑孤儿（pending + bind.invalid 合成形）
-    orphan_uid = _mk_pending_bind_row()
-    # ④ 同 email_normalized 多行：该形态被 users_email_identity_key 部分
-    # 唯一索引在库层拦截（pending_activation+active 两态内唯一）——清单里的
-    # email_shared 是针对「历史/损坏数据」的防御性分类，此处临时移除索引
-    # 构造（断言后解除冲突并恢复索引，不污染 session 级共享 PG 的 schema）。
-    shared_a = user_store.create_user("shared-a@x.com", PW)
-    shared_b = user_store.create_user("shared-b@x.com", PW)
-    conn = pg_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DROP INDEX IF EXISTS users_email_identity_key")
-        conn.commit()
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE users SET email=%s, email_normalized=%s, "
-                "email_verified_at=now() WHERE user_id IN (%s,%s)",
-                ("clash@x.com", "clash@x.com", shared_a["user_id"],
-                 shared_b["user_id"]))
-        conn.commit()
-    finally:
-        conn.close()
-
-    client = _client()
-    # 非 owner：403
-    _user_session(client, legacy)
-    assert client.get(
-        "/api/admin/v1/users/identity-conflicts").status_code == 403
-    # 匿名：401
+    usera = user_store.create_user("plain-r6@x.com", PW)
+    # 匿名：认证闸 401（先于退役分支）
     anon = _client()
     assert anon.get(
         "/api/admin/v1/users/identity-conflicts").status_code == 401
-    # owner：四类齐出 + 计数（owner 本行 login_id=邮箱形，不在清单内）
-    _owner_session(client, owner)
-    body = client.get("/api/admin/v1/users/identity-conflicts").get_json()
-    by_uid = {it["user_id"]: it for it in body["items"]}
-    assert set(by_uid) == {legacy["user_id"], mismatch["user_id"],
-                           orphan_uid, shared_a["user_id"],
-                           shared_b["user_id"]}
-    assert by_uid[legacy["user_id"]]["conflicts"] == ["login_id_not_email"]
-    assert by_uid[mismatch["user_id"]]["conflicts"] == ["email_login_mismatch"]
-    # 待补绑孤儿：合成 login_id 必然 ≠ email_normalized，双类命中
-    # （信息更全：该行既可 discard，也提示 login_id 与邮箱不一致）
-    assert set(by_uid[orphan_uid]["conflicts"]) == {
-        "email_login_mismatch", "pending_bind_synthetic"}
-    assert by_uid[orphan_uid]["discardable"] is True
-    # shared 两行同时命中 email_login_mismatch（login_id 是各自旧名）+
-    # email_shared
-    for uid in (shared_a["user_id"], shared_b["user_id"]):
-        assert "email_shared" in by_uid[uid]["conflicts"]
-        assert "email_login_mismatch" in by_uid[uid]["conflicts"]
-        assert by_uid[uid]["email_shared_key"] == "clash@x.com"
-    counts = body["counts"]
-    assert counts["login_id_not_email"] == 1
-    assert counts["email_login_mismatch"] == 4
-    assert counts["pending_bind_synthetic"] == 1
-    assert counts["email_shared"] == 2
-    assert counts["total_conflicting_rows"] == 5
-    # 只读：响应前后用户行数不变
-    conn = pg_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT count(*) AS n FROM users")
-            assert int(cur.fetchone()["n"]) == 6
-    finally:
-        conn.close()
-    # 清理：解除冲突 → 重建唯一索引（与 0037 同定义；测试后 schema 复原）
-    conn = pg_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE users SET email=NULL, email_normalized=NULL, "
-                "email_verified_at=NULL WHERE user_id=%s",
-                (shared_b["user_id"],))
-            cur.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS users_email_identity_key "
-                "ON users (lower(email_normalized)) "
-                "WHERE email_normalized IS NOT NULL "
-                "AND activation_state IN ('pending_activation','active')")
-        conn.commit()
-    finally:
-        conn.close()
+    for client, label in ((_client_login_as(usera), "普通用户"),
+                          (_client_login_as(owner), "owner")):
+        r = client.get("/api/admin/v1/users/identity-conflicts")
+        assert r.status_code == 410, (label, r.status_code)
+        assert r.get_json()["error"]["code"] == "endpoint_retired"
+
+
+def test_discard_pending_endpoint_retired_r6(monkeypatch):
+    """R6：POST /api/admin/v1/users/<id>/discard-pending 对任何已登录调用方
+    稳定 410 endpoint_retired——**包括真正的孤儿 pending 行**：直接调用不能
+    删除任何 pending 账号（系统不再提供经 Web 物理删除用户行的入口），
+    零审计（匿名在认证闸照常 401）。"""
+    owner = _mk_owner()
+    orphan_uid = _mk_pending_bind_row()
+    usera = user_store.create_user("keeper-r6@x.com", PW)
+    before_audit = len(app_mod.share_store.list_audit(limit=1000))
+    for uid in (orphan_uid, usera["user_id"]):
+        # owner 登录态（原 200/409 分支）一律 410
+        r_owner = _client_login_as(owner).post(
+            "/api/admin/v1/users/%s/discard-pending" % uid)
+        assert r_owner.status_code == 410, (uid, r_owner.status_code)
+        assert r_owner.get_json()["error"]["code"] == "endpoint_retired"
+        # 匿名：认证闸 401（先于退役分支）
+        r_anon = _client().post(
+            "/api/admin/v1/users/%s/discard-pending" % uid)
+        assert r_anon.status_code == 401
+    # 零副作用：孤儿行与普通用户行都原样存在，无新审计
+    assert _user_row(orphan_uid) is not None
+    assert _user_row(usera["user_id"]) is not None
+    assert len(app_mod.share_store.list_audit(limit=1000)) == before_audit
 
 
 # =========================================================================== #
-# 4. orphan pending 处置
-# =========================================================================== #
-def test_discard_pending_deletes_orphan_and_audits(monkeypatch):
-    owner = _mk_owner()
-    orphan_uid = _mk_pending_bind_row()
-    client = _client()
-    _owner_session(client, owner)
-    r = client.post("/api/admin/v1/users/%s/discard-pending" % orphan_uid)
-    assert r.status_code == 200, r.get_data(as_text=True)
-    assert r.get_json()["ok"] is True
-    assert _user_row(orphan_uid) is None  # 物理删除
-    events = client.get(
-        "/api/admin/v1/audit?action=user.pending_discard").get_json()["items"]
-    assert any(e["target_id"] == orphan_uid for e in events)
-    ev = next(e for e in events if e["target_id"] == orphan_uid)
-    # 审计 detail 无明文邮箱（掩码）
-    assert "orphan@x.com" not in json.dumps(ev["detail"])
-    # 二次删除：404
-    r2 = client.post("/api/admin/v1/users/%s/discard-pending" % orphan_uid)
-    assert r2.status_code == 404
-
-
-def test_discard_pending_requires_audit_actor(monkeypatch):
-    """三轮 review P2：物理删除不允许无审计调用——audit 必填且 actor_user_id
-    非空，DELETE 前拒绝（TypeError / DiscardPendingError，行不删）。"""
-    owner = _mk_owner()
-    orphan_uid = _mk_pending_bind_row()
-
-    # 缺参（签名必填）→ TypeError，绝不静默删
-    with pytest.raises(TypeError):
-        identity_store.discard_pending_activation(orphan_uid)
-    assert _user_row(orphan_uid) is not None
-    # actor 为空 → actor_missing，行不删
-    with pytest.raises(identity_store.DiscardPendingError) as ei:
-        identity_store.discard_pending_activation(
-            orphan_uid, audit={"actor_user_id": "", "actor_role": "owner"})
-    assert ei.value.code == "actor_missing"
-    assert _user_row(orphan_uid) is not None
-    del owner
-
-
-def test_discard_pending_rolls_back_when_audit_fails(monkeypatch):
-    """二轮 review P2-2：审计与删除同一事务——审计写失败则删除整体回滚，
-    杜绝「物理删除已生效但审计缺失」。"""
-    import share_store_pg
-    owner = _mk_owner()
-    orphan_uid = _mk_pending_bind_row()
-    client = _client()
-    _owner_session(client, owner)
-
-    real_audit_tx = share_store_pg.record_audit_tx
-
-    def _audit_down(*a, **k):
-        raise RuntimeError("audit_events insert failed")
-
-    monkeypatch.setattr(share_store_pg, "record_audit_tx", _audit_down)
-    r = client.post("/api/admin/v1/users/%s/discard-pending" % orphan_uid)
-    assert r.status_code == 500
-    # 关键：删除未生效（行仍在），审计亦无记录
-    assert _user_row(orphan_uid) is not None
-    # 审计恢复后重试可完成（同事务路径正常工作）
-    monkeypatch.setattr(share_store_pg, "record_audit_tx", real_audit_tx)
-    r2 = client.post("/api/admin/v1/users/%s/discard-pending" % orphan_uid)
-    assert r2.status_code == 200, r2.get_data(as_text=True)
-    assert _user_row(orphan_uid) is None
-    events = client.get(
-        "/api/admin/v1/audit?action=user.pending_discard").get_json()["items"]
-    assert any(e["target_id"] == orphan_uid for e in events)
-
-
-def test_discard_pending_rejects_everything_else(monkeypatch):
-    """红线：绝不自动夺取已有账号——active/正常 pending/owner 一律 409。"""
-    owner = _mk_owner()
-    active = user_store.create_user("keeper@x.com", PW)
-    _set_email(active["user_id"], "keeper@x.com")
-    # pending 但 login_id 是正常邮箱形（邮箱验证后、绑定前的正常形态）
-    from werkzeug.security import generate_password_hash
-    conn = pg_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO users (user_id, login_id, display_name, "
-                " password_hash, role, disabled, ai_config, ai_access, "
-                " activation_state, activation_source, activation_updated_at,"
-                " email, email_normalized, email_verified_at) "
-                "VALUES ('usr_pendingnormal', 'normal@x.com', 'normal@x.com',"
-                " %s, 'user', FALSE, '{}'::jsonb, FALSE, "
-                " 'pending_activation', 'invite_activation', now(), "
-                " 'normal@x.com', 'normal@x.com', now())",
-                (generate_password_hash(PW),))
-        conn.commit()
-    finally:
-        conn.close()
-    client = _client()
-    _owner_session(client, owner)
-    for uid in (active["user_id"], owner["user_id"], "usr_pendingnormal"):
-        r = client.post("/api/admin/v1/users/%s/discard-pending" % uid)
-        assert r.status_code == 409, (uid, r.get_data(as_text=True))
-        assert r.get_json()["error"]["code"] == "not_discardable"
-    # 行全部原样存在
-    assert _user_row(active["user_id"]) is not None
-    assert _user_row(owner["user_id"]) is not None
-    assert _user_row("usr_pendingnormal") is not None
-    # 非 owner / 匿名：403 / 401
-    _user_session(client, active)
-    assert client.post(
-        "/api/admin/v1/users/%s/discard-pending"
-        % active["user_id"]).status_code == 403
-    anon = _client()
-    assert anon.post(
-        "/api/admin/v1/users/%s/discard-pending"
-        % active["user_id"]).status_code == 401
-
-
-# =========================================================================== #
-# 5. 邮箱改绑闭环
+# 3. 邮箱改绑闭环
 # =========================================================================== #
 def _mk_login_user(name):
     u = user_store.create_user(name, PW)
@@ -851,13 +694,8 @@ def test_email_change_confirm_email_taken_rolls_back(monkeypatch):
     assert _start_change(client, "prize@x.com").status_code == 200
     registration_mail_worker.drain_once()
     token = _extract_change_token(_fake().sent[-1][2])
-    # 竞争者先用 owner 建号通道占住 prize@x.com
-    owner_client = _client()
-    _owner_session(owner_client, _mk_owner())
-    r_create = owner_client.post(
-        "/api/admin/v1/users",
-        json={"login_id": "prize@x.com", "password": PW})
-    assert r_create.status_code == 200
+    # 竞争者先用建号组合原语占住 prize@x.com（R6：HTTP 建号入口已 410 退役）
+    user_store_pg_create("prize@x.com", PW, email="prize@x.com")
     old_version = _user_row(u["user_id"])["auth_version"]
     r = client.post("/api/account/email/change/confirm", json={"token": token})
     assert r.status_code == 409
@@ -870,7 +708,7 @@ def test_email_change_confirm_email_taken_rolls_back(monkeypatch):
 
 
 # =========================================================================== #
-# 6. 公开分享页身份输出保持掩码（不回传完整邮箱）
+# 4. 公开分享页身份输出保持掩码（不回传完整邮箱）
 # =========================================================================== #
 def test_share_comment_author_stays_masked(monkeypatch):
     """P1-3 回归护栏：auth_user/身份改邮箱后，分享页评论作者仍只出掩码。"""

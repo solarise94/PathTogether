@@ -344,7 +344,7 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 			.toContainText("额度1002.00 CNY", { timeout: 10_000 });
 	});
 
-	test("10d. 用户页：初始总额度进高级折叠 + 抽屉「设置总额度」（CAS、不重置已用）", async ({ page }) => {
+	test("10d. 用户页：创建表单已退役（R6）+ 抽屉「设置总额度」（CAS、不重置已用）", async ({ page }) => {
 		await login(page, CREDS.ownerLogin, CREDS.ownerPassword);
 		await page.goto("/admin");
 		await expect(hostStatus(page)).toHaveAttribute(
@@ -353,26 +353,15 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		await frame.locator('.adm-nav-btn[data-page="users"]').click();
 		await expect(frame.locator("#adm-users-tbody"))
 			.toContainText("e2e-user@pt.test", { timeout: 10_000 });
-		// §4.4：创建用户默认折叠——入口 summary 可见、表单隐藏，展开后填写
-		const createBox = frame.locator("#adm-users-create-box");
-		await expect(createBox.locator("summary").first()).toBeVisible();
-		await expect(frame.locator("#adm-users-create-form")).toBeHidden();
-		await createBox.locator("summary").first().click();
-		await expect(frame.locator("#adm-users-create-form")).toBeVisible();
-		// wave 2：初始总额度在默认折叠的「高级：单独总额度」里
-		await expect(frame.locator("#adm-users-new-limit")).toBeHidden();
-		await frame.locator("#adm-users-new-limit-box").locator("summary").click();
-		await expect(frame.locator("#adm-users-new-limit")).toBeVisible();
-		// 创建带 3.5 CNY 初始总额度的用户（建号 + total allowance + audit 同事务）
-		await frame.locator("#adm-users-new-login").fill("e2e-limited@pt.test");
-		await frame.locator("#adm-users-new-display").fill("E2E 限额用户");
-		await frame.locator("#adm-users-new-password").fill("e2e-limited-pass-123456");
-		await frame.locator("#adm-users-new-limit").fill("3.5");
-		await frame.locator("#adm-users-create-btn").click();
-		await expect(frame.locator("#adm-users-create-status"))
-			.toContainText("初始总额度 3.50 CNY", { timeout: 10_000 });
-		// 详情抽屉：金额主视图（总额度/累计已用/可用金额/额度来源），两位小数
+		// R6（2026-09-19）：「新建用户」表单整体退役——无入口、无表单、
+		// 无提交按钮（用户获取统一走正常注册/邀请码）
+		await expect(frame.locator("#adm-users-create-box")).toHaveCount(0);
+		await expect(frame.locator("#adm-users-create-form")).toHaveCount(0);
+		await expect(frame.locator("#adm-users-create-btn")).toHaveCount(0);
+		// 种子限额户（初始总额度 3.5 CNY）在列表可见；详情抽屉：金额主视图
+		// （总额度/累计已用/可用金额/额度来源），两位小数
 		const row = frame.locator("#adm-users-tbody tr", { hasText: "e2e-limited@pt.test" });
+		await expect(row).toBeVisible();
 		await row.locator("button", { hasText: "详情" }).click();
 		await expect(frame.locator("#adm-user-drawer")).toBeVisible();
 		await expect(frame.locator("#adm-drawer-body")).toContainText("总额度");
@@ -663,8 +652,8 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
 			expect(row.text).not.toContain("预占");
 			expect(row.text).not.toContain("下次预占将被拒绝");
 		}
-		// 创建用户默认折叠
-		await expect(frame.locator("#adm-users-create-form")).toBeHidden();
+		// R6：创建用户表单已整体退役（无折叠入口可展开）
+		await expect(frame.locator("#adm-users-create-box")).toHaveCount(0);
 		await assertNoHorizontalOverflow(page, "users-1440");
 		await shot(page, "after-1440-users.png");
 	});
@@ -920,10 +909,11 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
     // 导航抽屉打开
     await frame.locator("#adm-nav-toggle").click();
     await expect(frame.locator("#adm-nav.adm-nav--open")).toBeVisible();
-    // P0-1：每个导航按钮 innerText 是完整标签（概览/用户/邀请/…，wave 2
-    // 改名后无首字符重复），且 ::before 内容已按同特异性复位
-    // 2026-09-08：新增「身份冲突」页（P2-2：冲突清单+孤儿处置，位于「用户」后）。
-    const labels = ["概览", "用户", "身份冲突", "切片", "邀请", "设置", "费用", "插件", "审计"];
+    // P0-1：每个导航按钮 innerText 是完整标签（概览/用户/…，wave 2
+    // 改名后无首字符重复），且 ::before 内容已按同特异性复位。
+    // R6（2026-09-19）：「身份冲突」页退役移除——导航 10 页（概览/用户/
+    // 切片/格式申请/测试申请/邀请/设置/费用/插件/审计）。
+    const labels = ["概览", "用户", "切片", "格式申请", "测试申请", "邀请", "设置", "费用", "插件", "审计"];
     const navBtns = frame.locator(".adm-nav-btn");
     expect(await navBtns.count()).toBe(labels.length);
     for (let i = 0; i < labels.length; i++) {
@@ -1009,8 +999,8 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
     // 状态格堆叠了 AI 补行（窄屏堆叠补行唯一保留处）
     const aiStack = geo.stacks.find((s) => /AI/.test(s.text));
     expect(aiStack && aiStack.display).toBe("block");
-    // 创建表单折叠
-    await expect(frame.locator("#adm-users-create-form")).toBeHidden();
+    // R6：创建用户表单已整体退役（无折叠入口可展开）
+    await expect(frame.locator("#adm-users-create-box")).toHaveCount(0);
     await assertNoHorizontalOverflow(page, "users-390");
     await shot(page, "after-390-users.png");
   });

@@ -1176,19 +1176,13 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 		expect(editorInput).toBeUndefined();
 	});
 
-	// §4.4 折叠创建表单：高级折叠项改名「单独总额度」
-	it("批次A-3: 创建用户/邀请默认折叠为入口，token 区在展开区内", () => {
-		const usersBox = htmlSrc.indexOf('id="adm-users-create-box"');
-		expect(usersBox).toBeGreaterThan(-1);
-		const usersTag = htmlSrc.slice(htmlSrc.lastIndexOf("<details", usersBox),
-			htmlSrc.indexOf(">", usersBox) + 1);
-		expect(usersTag).not.toMatch(/\sopen[\s>]/); // 默认折叠
-		const usersEnd = htmlSrc.indexOf("<section", usersBox);
-		const usersBlock = htmlSrc.slice(usersBox, usersEnd);
-		expect(usersBlock).toContain("新建用户");
-		expect(usersBlock).toContain('id="adm-users-create-form"');
-		expect(usersBlock).toContain('id="adm-users-create-btn"');
-		expect(usersBlock).toContain("高级：单独总额度");
+	// §4.4 折叠创建表单：R6 后「新建用户」表单退役（只剩邀请折叠入口）
+	it("批次A-3: 创建邀请默认折叠为入口，token 区在展开区内；用户创建表单已退役", () => {
+		// R6（service-review-fix-plan-20260919.md §8）：用户创建表单整体移除
+		expect(htmlSrc).not.toContain('id="adm-users-create-box"');
+		expect(htmlSrc).not.toContain('id="adm-users-create-form"');
+		expect(htmlSrc).not.toContain('id="adm-users-create-btn"');
+		expect(htmlSrc).not.toContain(">新建用户</summary>");
 		const invBox = htmlSrc.indexOf('id="adm-invite-create-box"');
 		expect(invBox).toBeGreaterThan(-1);
 		const invTag = htmlSrc.slice(htmlSrc.lastIndexOf("<details", invBox),
@@ -1206,10 +1200,7 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 	// §4.1 持久 label
 	it("批次A-4: 每个关键 input/select 都有真实 <label for>（全量扫描）", () => {
 		const ids = [
-			// 创建用户
-			"adm-users-new-login", "adm-users-new-display", "adm-users-new-password",
-			"adm-users-new-limit",
-			// 用户筛选
+			// 用户筛选（R6：创建用户表单已退役，其输入一并移除）
 			"adm-users-q", "adm-users-enabled", "adm-users-ai",
 			// 创建邀请（wave 2：login/ttl/limit/note；cohort/source/campaign 已删）
 			"adm-invite-login", "adm-invite-ttl", "adm-invite-limit", "adm-invite-note",
@@ -1470,10 +1461,10 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 
 	// §5.3/§4.8 390px 列适配（CSS 断言）
 	it("批次A-8: 次要列可隐藏、5 列表头（窄屏 4 列）、移动堆叠补行、日期不 break-all", () => {
-		// 2026-09-08（review P2-2）：users 与 invites 之间插入「身份冲突」页，
-		// 切片终点同步改为 adm-page-identity——本用例仍然只断言用户页
+		// R6（2026-09-19）：身份冲突页退役——用户页切片直达「切片可见性」；
+		// 本用例仍然只断言用户页
 		const usersPage = htmlSrc.slice(htmlSrc.indexOf('id="adm-page-users"'),
-			htmlSrc.indexOf('id="adm-page-identity"'));
+			htmlSrc.indexOf('id="adm-page-slides"'));
 		expect(usersPage).toMatch(/<th[^>]*adm-col-secondary[^>]*>角色</);
 		expect(usersPage).not.toMatch(/<th[^>]*>登录账号</);
 		expect(usersPage).not.toMatch(/<th[^>]*>最近 AI 调用</);
@@ -1889,21 +1880,18 @@ describe("wave 2 — 抽屉总额度动作（§4.3 / Batch B）", () => {
 		expect(restoreReqs).toHaveLength(0);
 	}, 10000);
 
-	it("M-6b: 建号带初始总额度发 total_limit_nano_cny（不再发 monthly 字段）", async () => {
+	it("M-6b (R6): 用户创建表单退役——无提交处理器、无 admin.users.create 请求", async () => {
+		// R6（service-review-fix-plan-20260919.md §8）：手动建号整体退役——
+		// main.js 不再绑定 adm-users-create-btn 处理器、不再发
+		// admin.users.create 请求（index.html 中表单 DOM 已移除）
 		const bus = loadPluginUiWithBus();
 		boot(bus);
-		bus.doc.getElementById("adm-users-new-login")!.value = "new@pt.test";
-		bus.doc.getElementById("adm-users-new-password")!.value = "longpass-123456789";
-		bus.doc.getElementById("adm-users-new-limit")!.value = "3.5";
-		bus.els["adm-users-create-btn"]._fire("click", {});
-		await ticks(2);
-		const req = bus.parentPosted
-			.filter((p) => p.env.kind === "request" && p.env.method === "admin.users.create")
-			.at(-1);
-		expect(req!.env.payload).toEqual({
-			login_id: "new@pt.test", password: "longpass-123456789",
-			total_limit_nano_cny: "3500000000",
-		});
+		const createBtn = bus.els["adm-users-create-btn"];
+		expect((createBtn && createBtn._listeners.click) || []).toHaveLength(0);
+		const createReqs = bus.parentPosted
+			.filter((p) => p.env.kind === "request" &&
+				p.env.method === "admin.users.create");
+		expect(createReqs).toHaveLength(0);
 	});
 });
 

@@ -1,31 +1,31 @@
 # -*- coding: utf-8 -*-
 """身份收口存储层（review P1-3：邮箱=唯一用户名的收尾闭环）。
 
-职责（全部 PG-only，fail-closed）：
+职责（PG-only，fail-closed）：
 
-1. **邮箱改绑闭环**（登录用户把账号邮箱换成新邮箱，login_id 同步改名）：
-   - :func:`enqueue_email_change`：规范化 + 唯一预检（users_email_identity_key
-     口径）→ 复用 registration_mail_jobs 队列（purpose='email_change'，
-     0040 迁移扩词表）入队验证邮件。payload（加密冻结正文）额外绑定
-     ``user_id``，库内只存 token hash（明文 token 只在返回值/邮件链接出现，
-     绝不落库、绝不进日志）；
-   - :func:`check_email_change_token`：只读解析（GET
-     /verify-email-change 页面用，绝不消费）；token 绑定校验——payload
-     ``user_id`` 与期望用户不符按 unknown 处理（不泄露任何状态）；
-   - :func:`consume_email_change`：单事务消费：token（queued/sent 可消费、
-     一次性、30 分钟）→ 唯一复检 → users.email/email_normalized/
-     **login_id=新邮箱**（J：邮箱即用户名）/email_verified_at=now、
-     auth_version+1（全端 session 失效）→ job 置 consumed → 同事务审计。
-     任何一步失败整体回滚（job 保持未消费、用户行不动）。
+**邮箱改绑闭环**（登录用户把账号邮箱换成新邮箱，login_id 同步改名）：
+- :func:`enqueue_email_change`：规范化 + 唯一预检（users_email_identity_key
+  口径）→ 复用 registration_mail_jobs 队列（purpose='email_change'，
+  0040 迁移扩词表）入队验证邮件。payload（加密冻结正文）额外绑定
+  ``user_id``，库内只存 token hash（明文 token 只在返回值/邮件链接出现，
+  绝不落库、绝不进日志）；
+- :func:`check_email_change_token`：只读解析（GET
+  /verify-email-change 页面用，绝不消费）；token 绑定校验——payload
+  ``user_id`` 与期望用户不符按 unknown 处理（不泄露任何状态）；
+- :func:`consume_email_change`：单事务消费：token（queued/sent 可消费、
+  一次性、30 分钟）→ 唯一复检 → users.email/email_normalized/
+  **login_id=新邮箱**（J：邮箱即用户名）/email_verified_at=now、
+  auth_version+1（全端 session 失效）→ job 置 consumed → 同事务审计。
+  任何一步失败整体回滚（job 保持未消费、用户行不动）。
 
-2. **存量冲突清单**（owner 管理端点只读数据源）：:func:`list_identity_conflicts`
-   枚举四类冲突行 + 计数，供 owner 摸排 J 收口前的存量账号。
-
-3. **orphan pending 处置**：:func:`discard_pending_activation` 物理删除
-   「activation_state=pending_activation 且 login_id 为 bind.invalid 合成形」
-   的待激活孤儿行。**禁止自动夺取已有账号**：其余任何账号一律拒绝
-   （DiscardPendingError('not_discardable')），删除动作由 owner 端点显式
-   触发并写审计。
+R6（2026-09-19 service review §8）退役说明：原「存量冲突清单」
+（list_identity_conflicts）与「orphan pending 处置」（discard_pending_
+activation，物理删除）专属管理台身份冲突页——该页连同桥方法与 REST
+入口已整体退役，两个 store 原语作为专属死代码一并移除。**底层一致性
+保护原样保留**：users_email_identity_key 部分唯一索引（pending_activation
++ active 两态内 lower(email_normalized) 唯一）、users_login_id_ci_key、
+邮箱改绑的唯一预检/复检（_assert_email_free_tx）均不受影响；系统不提供
+任何经应用层物理删除用户行的入口。
 
 红线：
   - 不修改 registration_mail_worker.py / registration_store.py（并行批次
@@ -37,9 +37,7 @@
   - 唯一性口径与 0037 一致：lower(email_normalized) 在 pending_activation +
     active 两态内唯一（users_email_identity_key 部分唯一索引兜底）。
 """
-import hmac  # noqa: F401  # 保留：与 registration_store 同口径的哈希域分离语义说明
 import logging
-import re
 import secrets
 import time
 
@@ -62,26 +60,11 @@ EMAIL_CHANGE_COOLDOWN_SECONDS = registration_store.VERIFY_COOLDOWN_SECONDS
 EMAIL_CHANGE_HOURLY_LIMIT = registration_store.VERIFY_HOURLY_LIMIT
 EMAIL_CHANGE_DAILY_LIMIT = registration_store.VERIFY_DAILY_LIMIT
 
-#: 待补绑合成 login_id 形（registration_store._pending_bind_login_id 的
-#: 产物格式：pending-<16 hex>@bind.invalid；不可投递、可识别）
-PENDING_BIND_LOGIN_ID_RE = re.compile(
-    r"^pending-[0-9a-f]{16}@bind\.invalid$")
-
 
 class EmailChangeError(RuntimeError):
     """邮箱改绑失败。``code`` 稳定：bad_input / rate_limited / email_taken /
     invalid_or_expired / user_missing / user_disabled。（对外文案统一由
     路由层决定；绝不泄露「邮箱是否已被占用」以外的账号信息。）"""
-
-    def __init__(self, code, message=None):
-        self.code = str(code)
-        super().__init__(message or self.code)
-
-
-class DiscardPendingError(RuntimeError):
-    """orphan pending 处置拒绝。``code`` 稳定：user_missing /
-    not_discardable（非 pending_activation 或非 bind.invalid 合成形）/
-    has_dependents（存在引用行，物理删除被外键拦截——fail-closed 不删）。"""
 
     def __init__(self, code, message=None):
         self.code = str(code)
@@ -410,175 +393,3 @@ def consume_email_change(token, user_id):
         conn.close()
     return {"user": dict(updated), "email": new_email,
             "old_login_id": user.get("login_id")}
-
-
-# --------------------------------------------------------------------------- #
-# 存量冲突清单（owner 只读）+ orphan pending 处置
-# --------------------------------------------------------------------------- #
-_USER_CONFLICT_COLS = (
-    "user_id, login_id, display_name, role, disabled, activation_state, "
-    "activation_source, email, email_normalized, "
-    "extract(epoch from email_verified_at)::float8 AS email_verified_at, "
-    "extract(epoch from created_at)::float8 AS created_at")
-
-
-def _is_email_shape(value) -> bool:
-    """login_id 是否邮箱形态（registration_store.validate_email 同口径）。"""
-    try:
-        registration_store.validate_email(value)
-        return True
-    except registration_store.EmailVerifyError:
-        return False
-
-
-def list_identity_conflicts():
-    """枚举存量身份冲突行（只读；owner 冲突清单端点数据源）。
-
-    四类口径（一行可同时命中多类；conflicts 列出全部命中类）：
-      - ``login_id_not_email``：login_id 非邮箱形态（validate_email 拒绝）；
-      - ``email_login_mismatch``：email_normalized 与 login_id 都存在且
-        规范化后不一致；
-      - ``pending_bind_synthetic``：pending_activation 且 login_id 为
-        pending-*@bind.invalid 合成形（可经 discard-pending 处置）；
-      - ``email_shared``：同一 lower(email_normalized) 被 >1 行占用
-        （users_email_identity_key 语义的冲突预警；理论上被唯一索引拦住，
-        存量/历史数据可能违反）。
-
-    返回 ``{"items": [...], "counts": {...}}``；items 按冲突数降序、再按
-    created_at 升序。owner-only 端点消费：行内含完整 login_id/email_
-    normalized（管理台主列 J 语义即完整邮箱用户名，非对外通道）。
-    """
-    conn = _connect()
-    try:
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
-                cur.execute(
-                    "SELECT " + _USER_CONFLICT_COLS + " FROM users "
-                    "ORDER BY created_at, user_id")
-                rows = [dict(r) for r in cur.fetchall()]
-    finally:
-        conn.close()
-    # email_shared：同 normalized 邮箱 >1 行
-    seen = {}
-    for r in rows:
-        key = (r.get("email_normalized") or "").strip().lower()
-        if key:
-            seen.setdefault(key, []).append(r["user_id"])
-    shared_keys = {k for k, uids in seen.items() if len(uids) > 1}
-    items = []
-    counts = {"login_id_not_email": 0, "email_login_mismatch": 0,
-              "pending_bind_synthetic": 0, "email_shared": 0}
-    for r in rows:
-        conflicts = []
-        login_id = r.get("login_id") or ""
-        email_norm = (r.get("email_normalized") or "").strip().lower() or None
-        if login_id and not _is_email_shape(login_id):
-            conflicts.append("login_id_not_email")
-        if email_norm and login_id \
-                and email_norm != registration_store.normalize_email(login_id):
-            conflicts.append("email_login_mismatch")
-        if (r.get("activation_state") == "pending_activation"
-                and PENDING_BIND_LOGIN_ID_RE.match(login_id)):
-            conflicts.append("pending_bind_synthetic")
-        key = (r.get("email_normalized") or "").strip().lower()
-        if key and key in shared_keys:
-            conflicts.append("email_shared")
-        if not conflicts:
-            continue
-        for c in conflicts:
-            counts[c] += 1
-        out = {
-            "user_id": r["user_id"],
-            "login_id": login_id,
-            "display_name": r.get("display_name"),
-            "email_normalized": email_norm,
-            "email_verified": r.get("email_verified_at") is not None,
-            "role": r.get("role"),
-            "disabled": bool(r.get("disabled")),
-            "activation_state": r.get("activation_state"),
-            "activation_source": r.get("activation_source"),
-            "conflicts": conflicts,
-            "discardable":
-                "pending_bind_synthetic" in conflicts,
-        }
-        if key and key in shared_keys:
-            out["email_shared_key"] = key
-        items.append(out)
-    items.sort(key=lambda x: (-len(x["conflicts"]), x["user_id"]))
-    counts["total_conflicting_rows"] = len(items)
-    return {"items": items, "counts": counts}
-
-
-def discard_pending_activation(user_id, audit):
-    """物理删除 orphan pending_activation 行（owner 显式处置；不自动夺取）。
-
-    audit 为**必填** ``{"actor_user_id": str, "actor_role": str}``（三轮
-    review P2：物理删除不允许无审计调用——缺参/actor 为空在删除前拒绝，
-    杜绝未来调用方绕过「受审计删除」不变量）。
-
-    仅当账号同时满足：
-      - ``activation_state = 'pending_activation'``；
-      - ``login_id`` 为 bind.invalid 合成形（PENDING_BIND_LOGIN_ID_RE）——
-        即邮箱验证建号时因存量 login_id 冲突进入「待补绑」的孤儿行；
-    才允许物理 DELETE。其余任何账号（active/pending 且正常用户名/owner/
-    disabled……）一律 DiscardPendingError('not_discardable')——**绝不**
-    自动合并或夺取已有账号。
-
-    存在引用行（外键 NO ACTION 拦截，如异常的 billing/acquisition 关联）
-    → DiscardPendingError('has_dependents')，fail-closed 不删（说明该行
-    并非孤儿，需人工核查）。
-
-    audit 给定 ``{"actor_user_id","actor_role"}`` 时（二轮 review P2-2）：
-    ``user.pending_discard`` 审计经 share_store_pg.record_audit_tx 写入
-    **同一事务**——审计失败则删除整体回滚（「受审计删除」，不再 best-effort
-    事后补写）。detail 只含掩码邮箱与状态快照，无密码/token。
-
-    返回被删行的快照 dict（供调用方核对；无敏感字段）。
-    """
-    uid = str(user_id or "").strip()
-    if not uid:
-        raise DiscardPendingError("user_missing")
-    actor_uid = str(((audit or {}).get("actor_user_id")) or "").strip()
-    if not actor_uid:
-        # DELETE 前拒绝：无 actor 的物理删除不进任何事务
-        raise DiscardPendingError("actor_missing")
-    conn = _connect()
-    try:
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
-                cur.execute(
-                    "SELECT " + _USER_CONFLICT_COLS +
-                    " FROM users WHERE user_id=%s FOR UPDATE", (uid,))
-                row = cur.fetchone()
-                if row is None:
-                    raise DiscardPendingError("user_missing")
-                snap = dict(row)
-                if snap.get("activation_state") != "pending_activation" \
-                        or not PENDING_BIND_LOGIN_ID_RE.match(
-                            snap.get("login_id") or ""):
-                    raise DiscardPendingError("not_discardable")
-                try:
-                    cur.execute("DELETE FROM users WHERE user_id=%s", (uid,))
-                except psycopg.errors.ForeignKeyViolation as exc:
-                    raise DiscardPendingError("has_dependents") from exc
-                if (cur.rowcount or 0) != 1:
-                    raise DiscardPendingError("user_missing")
-                import share_store_pg
-                share_store_pg.record_audit_tx(
-                        cur, "user.pending_discard",
-                        actor_user_id=actor_uid,
-                        actor_role=str(audit.get("actor_role") or "").strip()
-                        or "owner",
-                        target_type="user", target_id=uid,
-                        detail={
-                            "login_id_masked":
-                                registration_store.mask_login_id(
-                                    snap.get("login_id") or ""),
-                            "activation_state": snap.get("activation_state"),
-                            "activation_source": snap.get("activation_source"),
-                            "physically_deleted": True,
-                        })
-    finally:
-        conn.close()
-    snap.pop("password_hash", None)
-    return snap

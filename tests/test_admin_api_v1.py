@@ -228,6 +228,46 @@ def test_users_pagination_search_and_filters():
     assert scan_sensitive(r) == []
 
 # --------------------------------------------------------------------------- #
+# 3b. R6 退役入口（service-review-fix-plan-20260919.md §8）：手动建号 /
+#     身份冲突清单 / 孤儿 pending 处置一律 410 且零副作用
+# --------------------------------------------------------------------------- #
+def test_r6_retired_endpoints_return_410_and_do_nothing():
+    """退役入口对任何调用方（匿名 / owner）稳定 410 endpoint_retired：
+    直接 POST 不能建用户、discard-pending 不能删 pending 账号、清单不读，
+    全程零新用户行、零新审计。"""
+    owner, usera = _setup_users()
+    before_audit = len(app_mod.share_store.list_audit(limit=1000))
+    before_users = len(_login(_client(), owner).get(
+        "/api/admin/v1/users?limit=200").get_json()["items"])
+
+    # 匿名 POST 建号：认证闸（before_request）先于退役分支 → 401
+    r = _client().post("/api/admin/v1/users", json={
+        "login_id": "ghost@x.com", "password": "longpassword-12345"})
+    assert r.status_code == 401
+    assert r.get_json()["code"] == "auth_required"
+    # owner 合法载荷 POST 建号：同样 410，绝不建用户
+    c = _login(_client(), owner)
+    r = c.post("/api/admin/v1/users", json={
+        "login_id": "nope@x.com", "password": "longpassword-12345"})
+    assert r.status_code == 410
+    assert r.get_json()["error"]["code"] == "endpoint_retired"
+    assert user_store.get_user_by_login_id("nope@x.com") is None
+    # 身份冲突清单（GET）与孤儿处置（POST）同样 410
+    assert c.get("/api/admin/v1/users/identity-conflicts").status_code == 410
+    r = c.post("/api/admin/v1/users/%s/discard-pending" % usera["user_id"])
+    assert r.status_code == 410
+    assert r.get_json()["error"]["code"] == "endpoint_retired"
+    r = c.post("/api/admin/v1/users/usr_ghost/discard-pending")
+    assert r.status_code == 410
+
+    # 零副作用：用户行原样存在、无新用户行、无任何新审计
+    assert user_store.get_user(usera["user_id"]) is not None
+    assert len(_login(_client(), owner).get(
+        "/api/admin/v1/users?limit=200").get_json()["items"]) == before_users
+    assert len(app_mod.share_store.list_audit(limit=1000)) == before_audit
+
+
+# --------------------------------------------------------------------------- #
 # 4. audit 分页 + 出口脱敏（两后端）
 # --------------------------------------------------------------------------- #
 def _write_audit_events(n=5):

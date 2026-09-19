@@ -51,6 +51,13 @@
    2026-09-14（W2 admin UI）：格式支持申请工单上桥——admin.formatRequests.
    list/get（users:read）与 patch（users:write，CAS 状态机），复用 users
    权限域不扩域；样本文件下载不经桥（iframe 消费不了 blob）。
+   2026-09-19（R6，service-review-fix-plan-20260919.md §8）：手动建号与
+   身份冲突功能整体退役——admin.users.create / admin.users.identityConflicts /
+   admin.users.discardPending 三个方法整行删除（权限映射/参数 schema/
+   后端映射一并移除）；已删方法按既有语义稳定回 unknown_method；服务端
+   旧 REST 入口（POST /api/admin/v1/users、GET .../identity-conflicts、
+   POST .../discard-pending）由服务端 410 endpoint_retired。用户列表/
+   启停/AI 权限/密码重置/总额度方法保持不变。
    ========================================================================= */
 (function () {
   "use strict";
@@ -73,17 +80,12 @@
     "admin.auth.get": "admin:overview:read",
     "admin.overview.get": "admin:overview:read",
     "admin.users.list": "admin:users:read",
-    "admin.users.create": "admin:users:write",
     "admin.users.setEnabled": "admin:users:write",
     "admin.users.setAiAccess": "admin:users:write",
     "admin.users.resetPassword": "admin:users:write",
-    // 2026-09-08（review-2026-09-08 P2-2 产品闭环）：身份冲突清单（owner 只读
-    // 摸排，GET /api/admin/v1/users/identity-conflicts）与孤儿 pending 行显式
-    // 处置（POST .../discard-pending，物理删除不可逆）。清单是只读 →
-    // admin:users:read；处置是写且不可逆 → admin:users:write。服务端对每个
-    // 端点独立 owner/CSRF 复核（_require_owner_admin_v1），桥层门只是纵深防御。
-    "admin.users.identityConflicts": "admin:users:read",
-    "admin.users.discardPending": "admin:users:write",
+    // 2026-09-19（R6）：admin.users.create / identityConflicts /
+    // discardPending 整行删除（手动建号与身份冲突页退役）——已删方法不在
+    // 本表 → dispatch 门按既有语义稳定回 unknown_method。
     // 2026-09-05（review P0 owner 读隔离）：切片可见性管理——inventory 是
     // owner 唯一「看全部」出口；setVisibility 给 owner 建立/收回单切片
     // view 授权（幂等）。独立 slides 权限域，不与 users/settings 混用。
@@ -218,21 +220,8 @@
     "admin.siteStats.get": { properties: {}, additionalProperties: false },
 
     // ---- PR5 写方法（§9 Admin API v1 写端点；服务端 owner/CSRF 复核权威）----
-    "admin.users.create": {
-      properties: {
-        login_id: { type: "string", minLength: 1, maxLength: 120 },
-        password: { type: "string", minLength: 1, maxLength: 200 },
-        display_name: { type: "string", maxLength: 120, nullable: true },
-        // Batch B：可选初始总额度（十进制字符串 nano；null/缺省=继承全局默认；
-        // 建号+allowance+audit 服务端同一事务）。旧 monthly_limit_nano_cny 已删。
-        total_limit_nano_cny: {
-          type: "string", pattern: "^[0-9]{1,19}$", nullable: true,
-        },
-        ai_access: { type: "boolean" },
-      },
-      required: ["login_id", "password"],
-      additionalProperties: false,
-    },
+    // R6（2026-09-19）：admin.users.create 的 schema 已随手动建号退役删除；
+    // 请求该方法的插件在 dispatch 门即得 unknown_method，不再进入 schema 门。
     "admin.users.setEnabled": {
       properties: { user_id: _userIdSpec, enabled: { type: "boolean" } },
       required: ["user_id", "enabled"],
@@ -251,16 +240,8 @@
       required: ["user_id", "password"],
       additionalProperties: false,
     },
-    // 2026-09-08（review P2-2）：身份冲突清单（无参数只读）+ 孤儿 pending
-    // 行处置（仅 user_id；user_id 走 pathId 防护，拒绝空值/含 "/"、"?"）。
-    "admin.users.identityConflicts": {
-      properties: {}, additionalProperties: false,
-    },
-    "admin.users.discardPending": {
-      properties: { user_id: _userIdSpec },
-      required: ["user_id"],
-      additionalProperties: false,
-    },
+    // R6（2026-09-19）：identityConflicts / discardPending 的 schema 已随
+    // 身份冲突页退役删除（同回 unknown_method）。
     // 2026-09-05：切片可见性管理。inventory 只允许游标/页大小；setVisibility
     // 的 name 是切片文件名（服务端 _sanitize_name 权威校验，桥层只挡空值
     // 与路径分隔符——pathId）。
@@ -871,17 +852,9 @@
     // ---- PR5 写方法 → Admin API v1 写端点（POST/PUT 走 makeFetchJson 的
     // CSRF 双提交；路径参数必须 encodeURIComponent 且拒绝含 "/" 的值，防止
     // iframe 借 user_id/invite_id 拼出任意路径）----
-    "admin.users.create": function (ctx, payload) {
-      return jsonWrite("/api/admin/v1/users", "POST", {
-        login_id: payload.login_id,
-        password: payload.password,
-        display_name: payload.display_name,
-        // Batch B：可选初始总额度 + ai_access（缺省沿用服务端默认）
-        total_limit_nano_cny: payload.total_limit_nano_cny,
-        ai_access: payload.ai_access,
-      })(ctx);
-    },
-
+    // R6（2026-09-19）：admin.users.create / identityConflicts /
+    // discardPending 的后端映射已随功能退役删除（手动建号与身份冲突页
+    // 下线；服务端旧入口 410 endpoint_retired）。
     "admin.users.setEnabled": function (ctx, payload) {
       var url = "/api/admin/v1/users/" + pathId(payload.user_id, "user_id") +
           (payload.enabled ? "/enable" : "/disable");
@@ -900,19 +873,8 @@
       return jsonWrite(url, "POST", { password: payload.password })(ctx);
     },
 
-    // 2026-09-08（review P2-2）：身份冲突清单（owner 只读；四类冲突行 +
-    // counts）与孤儿 pending 行显式处置。discard 是**物理删除、不可逆**：
-    // 服务端只放行 activation_state=pending_activation 且 login_id 为
-    // pending-*@bind.invalid 合成形的孤儿行，其余一律 409 not_discardable
-    // （含 has_dependents 语义文案，桥层原样透传给插件 UI 展示）。
-    "admin.users.identityConflicts":
-      jsonGet("/api/admin/v1/users/identity-conflicts"),
-
-    "admin.users.discardPending": function (ctx, payload) {
-      var url = "/api/admin/v1/users/" + pathId(payload.user_id, "user_id") +
-          "/discard-pending";
-      return jsonWrite(url, "POST", {})(ctx);
-    },
+    // R6（2026-09-19）：identityConflicts / discardPending 后端映射已删
+    // （身份冲突页退役；已删方法稳定 unknown_method）。
 
     "admin.invites.list": function (ctx, payload) {
       var url = "/api/admin/v1/invites" + buildQuery({

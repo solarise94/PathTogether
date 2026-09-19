@@ -239,9 +239,9 @@ def test_case_variants_share_account_lockout_bucket(monkeypatch):
 # 4. 管理 API 单键输出与 login_id-only 入参（docs §4.2/§8.1，批次 C）
 # =========================================================================== #
 def test_admin_users_api_login_id_only(monkeypatch):
-    """列表/重置/禁用响应无 email 键；创建只接受 login_id（email 入参
-    已删除——只传 email 不给 login_id 一律 400）。旧建号端点已 410 退役
-    （review R2-F1），创建契约改在 POST /api/admin/v1/users 上验证。"""
+    """列表/重置/禁用响应无 email 键；R6 后建号端点整体 410 退役
+    （service-review-fix-plan-20260919.md §8）——任何入参形态（login_id /
+    旧 email 兼容键 / 缺参）都不再有创建分支，直接 POST 不建用户。"""
     make_owner()
     user_store.create_user("u@x.com", PW2, role="user")
     client = make_client()
@@ -256,34 +256,25 @@ def test_admin_users_api_login_id_only(monkeypatch):
           all(u.get("login_id_masked") and "password_hash" not in u
               and u.get("email") is None for u in users))
 
-    # 创建：login_id 入参（旧建号端点已 410 退役，review R2-F1；契约在 v1）
+    # R6 退役：login_id 入参（曾在此验证创建规范化契约）→ 410，不建用户
     r2 = client.post("/api/admin/v1/users",
                      json={"login_id": "New@X.com", "password": PW})
-    check("login_id 入参创建 200", r2.status_code == 200,
-          "got %s %s" % (r2.status_code, r2.get_data(as_text=True)))
-    body2 = r2.get_json().get("user") or {}
-    check("创建响应 login_id==规范化值",
-          body2.get("login_id") == "new@x.com")
-    # P1-3 收口（w1b）：建号入口只收邮箱，写入同步 email/email_normalized
-    # （email_verified_at 保持 NULL=未验证，绝不伪造验证状态）
-    check("创建响应 email=规范化邮箱（未验证态）",
-          body2.get("email") == "new@x.com"
-          and body2.get("email_normalized") == "new@x.com"
-          and body2.get("email_verified_at") is None)
+    check("login_id 入参创建 410（R6 退役）", r2.status_code == 410,
+          "got %s" % r2.status_code)
+    check("退役错误码 endpoint_retired",
+          (r2.get_json().get("error") or {}).get("code") == "endpoint_retired")
+    check("未创建用户行（无 new@x.com）",
+          user_store.get_user_by_login_id("new@x.com") is None)
 
-    # 批次 C：email 兼容入参已删除——只传 email 不给 login_id → 400
+    # 批次 C：email 兼容入参已删除；R6 后连该校验也随端点退役 → 410
     r3 = client.post("/api/admin/v1/users",
                      json={"email": "legacy@x.com", "password": PW})
-    check("email 入参不再被接受（400）", r3.status_code == 400,
+    check("email 入参同样 410（端点已退役）", r3.status_code == 410,
           "got %s" % r3.status_code)
-    check("错误文案为缺登录账号",
-          "登录账号" in r3.get_json()["error"].get("message", ""))
 
-    # 两个都没给 → 400（登录账号缺失）
+    # 两个都没给 → 410（退役分支先于任何入参校验）
     r4 = client.post("/api/admin/v1/users", json={"password": PW})
-    check("缺登录账号 400", r4.status_code == 400)
-    check("缺登录账号文案",
-          "登录账号" in r4.get_json()["error"].get("message", ""))
+    check("缺登录账号同样 410", r4.status_code == 410)
 
     # 重置密码 / 禁用 / 启用响应同样单键
     uid = user_store.get_user_by_login_id("u@x.com")["user_id"]

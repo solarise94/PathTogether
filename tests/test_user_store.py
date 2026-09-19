@@ -315,24 +315,21 @@ def test_admin_users_owner_vs_user(monkeypatch):
     check("owner GET /api/admin/v1/users 200", r.status_code == 200)
     check("返回 items 数组", isinstance(body.get("items"), list))
     check("list 不含 hash", all("password_hash" not in u for u in body["items"]))
-    # 创建 user（旧建号端点已 410 退役，review R2-F1——创建契约迁至
-    # POST /api/admin/v1/users，响应包 user 键；最小改动：仅换端点与解包）
+    # R6（service-review-fix-plan-20260919.md §8）：v1 建号端点已 410 退役
+    # （此前承接旧 POST /api/admin/users 的创建契约）——owner 登录态直接
+    # POST 也不再建用户；建号统一走正常注册/邀请码
     r2 = client.post("/api/admin/v1/users", json={"login_id": "new@x.com", "password": PW2})
-    check("owner 创建用户 200", r2.status_code == 200)
-    check("新用户 role=user",
-          (json.loads(r2.data).get("user") or {}).get("role") == "user")
-    # P1-3 收口（w1b）：建号写入同步 email/email_normalized（未验证态）
-    _u = json.loads(r2.data).get("user") or {}
-    check("创建响应 user.email=规范化邮箱（未验证；P1-3）",
-          _u.get("email") == "new@x.com"
-          and _u.get("email_normalized") == "new@x.com"
-          and _u.get("email_verified_at") is None)
-    # 冲突
+    check("owner POST 建号 410（R6 退役）", r2.status_code == 410,
+          "got %s" % r2.status_code)
+    check("退役错误码 endpoint_retired",
+          (json.loads(r2.data).get("error") or {}).get("code") == "endpoint_retired")
+    check("未创建用户行", user_store.get_user_by_login_id("new@x.com") is None)
+    # 冲突/短密码等旧校验随端点一并退役：同样 410（不再有 409/400 分支）
     r3 = client.post("/api/admin/v1/users", json={"login_id": "u@x.com", "password": PW2})
-    check("创建冲突 409", r3.status_code == 409, "got %s" % r3.status_code)
-    # 短密码（store 层 15..200 统一策略；v1 端点同样拦）
+    check("退役端点对冲突载荷同样 410", r3.status_code == 410)
     r4 = client.post("/api/admin/v1/users", json={"login_id": "s@x.com", "password": "short"})
-    check("短密码创建 400", r4.status_code == 400)
+    check("退役端点对短密码载荷同样 410", r4.status_code == 410)
+    check("短密码载荷也未建用户", user_store.get_user_by_login_id("s@x.com") is None)
 
     # user 角色登录 → 403
     client2 = make_client()

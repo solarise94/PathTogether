@@ -428,7 +428,10 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			// SER-8（wip/ser8-dev）：新增 testApplications.list（待激活申请
 			// 只读，users:read）与 testApplications.review（审批写，原子激活
 			// + 额度 provisioning，users:write）——同域不扩域，36 → 38
-			expect(Object.keys(table)).toHaveLength(38);
+			// 2026-09-19（R6，service-review-fix-plan-20260919.md §8）：手动建号
+			// 与身份冲突功能退役——users.create / users.identityConflicts /
+			// users.discardPending 整行删除，38 → 35
+			expect(Object.keys(table)).toHaveLength(35);
 			expect(table["admin.formatRequests.list"]).toBe("admin:users:read");
 			expect(table["admin.formatRequests.get"]).toBe("admin:users:read");
 			expect(table["admin.formatRequests.patch"]).toBe("admin:users:write");
@@ -436,14 +439,11 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			expect(table["admin.testApplications.review"]).toBe("admin:users:write");
 			expect(table["admin.settings.model"]).toBe("admin:settings:read");
 		expect(table["admin.settings.model.update"]).toBe("admin:settings:write");
-		expect(table["admin.users.identityConflicts"]).toBe("admin:users:read");
-		expect(table["admin.users.discardPending"]).toBe("admin:users:write");
 		expect(table["admin.slides.inventory"]).toBe("admin:slides:read");
 		expect(table["admin.slides.setVisibility"]).toBe("admin:slides:write");
 		expect(table["admin.auth.get"]).toBe("admin:overview:read");
 		expect(table["admin.overview.get"]).toBe("admin:overview:read");
 		expect(table["admin.users.list"]).toBe("admin:users:read");
-		expect(table["admin.users.create"]).toBe("admin:users:write");
 		expect(table["admin.users.setEnabled"]).toBe("admin:users:write");
 		expect(table["admin.users.setAiAccess"]).toBe("admin:users:write");
 		expect(table["admin.users.resetPassword"]).toBe("admin:users:write");
@@ -484,6 +484,10 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 		expect(table["admin.acquisition.summary"]).toBeUndefined();
 		expect(table["admin.acquisition.list"]).toBeUndefined();
 		expect(table["admin.users.setSpendOverride"]).toBeUndefined();
+		// R6（2026-09-19）退役方法：同样不在表内 → 稳定 unknown_method
+		expect(table["admin.users.create"]).toBeUndefined();
+		expect(table["admin.users.identityConflicts"]).toBeUndefined();
+		expect(table["admin.users.discardPending"]).toBeUndefined();
 	});
 
 	it("declares param schemas for every read method (whitelist + types)", () => {
@@ -861,12 +865,14 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		return makeHost({ permissions, fetchJson });
 	}
 
-	it("admin.users.create proxies POST /api/admin/v1/users with whitelisted body", async () => {
-		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+	it("R6: admin.users.create is retired — unknown_method, no backend call", async () => {
+		// R6（service-review-fix-plan-20260919.md §8）：手动建号退役——桥层
+		// 无权限映射/无后端映射，dispatch 门稳定 unknown_method，绝不发出
+		// POST /api/admin/v1/users（服务端旧入口也已 410）。
+		const calls: Array<{ url: string; method?: string }> = [];
 		const { handle, posted, contentWindow } = makeWriteHost(async (url, o) => {
 			calls.push({
 				url, method: (o as { method?: string } | undefined)?.method,
-				body: JSON.parse(String((o as { body?: string }).body)),
 			});
 			return { status: 200, ok: true, body: { user: { user_id: "u1" } } };
 		});
@@ -878,11 +884,11 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 			}),
 		});
 		await ticks();
-		expect(responses(posted, "r1")[0].env.ok).toBe(true);
-		expect(calls).toEqual([{
-			url: "/api/admin/v1/users", method: "POST",
-			body: { login_id: "a@x.com", password: "longpass-12345", display_name: "A" },
-		}]);
+		const rs = responses(posted, "r1");
+		expect(rs).toHaveLength(1);
+		expect(rs[0].env.ok).toBe(false);
+		expect((rs[0].env.error as { code: string }).code).toBe("unknown_method");
+		expect(calls).toHaveLength(0); // 后端零调用
 	});
 
 	it("admin.users.setEnabled maps enabled flag onto enable/disable path", async () => {
@@ -1086,8 +1092,8 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		handle._handleIframeLoad();
 		const nonce = nonce0(posted);
 		const bad: Array<[string, unknown]> = [
-			["admin.users.create", { login_id: "a@x.com" }],                     // 缺 password
-			["admin.users.create", { login_id: "", password: "longpass-12345" }], // minLength
+			// R6：admin.users.create 已退役（unknown_method，见上方专属用例），
+			// 不再进入 schema 门——非法载荷断言换 setEnabled/resetPassword 等
 			["admin.users.setEnabled", { user_id: "u1" }],                        // 缺 enabled
 			["admin.users.setEnabled", { user_id: "u1", enabled: "yes" }],       // boolean
 			["admin.users.resetPassword", { user_id: "u1", password: "" }],      // minLength
@@ -1146,8 +1152,8 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		const nonce = nonce0(posted);
 		handle._handleWindowMessage({
 			source: contentWindow,
-			data: requestEnv(nonce, "r1", "admin.users.create",
-				{ login_id: "a@x.com", password: "longpass-12345" }),
+			data: requestEnv(nonce, "r1", "admin.users.setEnabled",
+				{ user_id: "u1", enabled: true }),
 		});
 		handle._handleWindowMessage({
 			source: contentWindow,
@@ -1697,58 +1703,45 @@ describe("AdminBridge host — 批次 D：统一设置页方法（§6.1/§6.5）
 });
 
 describe("AdminBridge host — wave 2：users/invites 总额度字段过桥（Batch B/D1）", () => {
-	it("admin.users.create forwards total_limit_nano_cny + ai_access", async () => {
-		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+	it("R6: admin.users.create retired — total-limit forwarding only via spend CAS methods", async () => {
+		// R6（service-review-fix-plan-20260919.md §8）：手动建号退役后
+		// admin.users.create（含 total_limit_nano_cny/ai_access 转发）整条
+		// 下线——任何载荷（含旧 monthly 字段）都稳定 unknown_method，后端
+		// 零调用；总额度调整唯一出口 = admin.spend.userTotalLimit.set。
+		const calls: Array<{ url: string; method?: string }> = [];
 		const { handle, posted, contentWindow } = makeHost({
 			permissions: ["admin:users:write"],
 			fetchJson: async (url, o) => {
 				calls.push({
 					url, method: (o as { method?: string } | undefined)?.method,
-					body: JSON.parse(String((o as { body?: string }).body)),
 				});
 				return { status: 200, ok: true, body: { user: { user_id: "u1" } } };
 			},
 		});
 		handle._handleIframeLoad();
-		handle._handleWindowMessage({
-			source: contentWindow,
-			data: requestEnv(nonce0(posted), "r1", "admin.users.create", {
-				login_id: "a@x.com", password: "longpass-12345",
-				total_limit_nano_cny: "3500000000", ai_access: false,
-			}),
-		});
+		const payloads: Array<Record<string, unknown>> = [
+			{ login_id: "a@x.com", password: "longpass-12345",
+			  total_limit_nano_cny: "3500000000", ai_access: false },
+			{ login_id: "b@x.com", password: "longpass-12345",
+			  total_limit_nano_cny: 3500000000 },
+			{ login_id: "c@x.com", password: "longpass-12345",
+			  monthly_limit_nano_cny: "3500000000" },
+		];
+		for (let i = 0; i < payloads.length; i++) {
+			handle._handleWindowMessage({
+				source: contentWindow,
+				data: requestEnv(nonce0(posted), "r" + i, "admin.users.create",
+					payloads[i]),
+			});
+		}
 		await ticks();
-		expect(responses(posted, "r1")[0].env.ok).toBe(true);
-		expect(calls).toEqual([{
-			url: "/api/admin/v1/users", method: "POST",
-			body: {
-				login_id: "a@x.com", password: "longpass-12345",
-				display_name: undefined,
-				total_limit_nano_cny: "3500000000", ai_access: false,
-			},
-		}]);
-		// JSON number 金额在 schema 门即拒（§5 v0.3 wire 纪律）
-		handle._handleWindowMessage({
-			source: contentWindow,
-			data: requestEnv(nonce0(posted), "r2", "admin.users.create", {
-				login_id: "b@x.com", password: "longpass-12345",
-				total_limit_nano_cny: 3500000000,
-			}),
-		});
-		// 旧 monthly 字段已删除：携带即桥层拒绝（管理插件不得再发旧字段）
-		handle._handleWindowMessage({
-			source: contentWindow,
-			data: requestEnv(nonce0(posted), "r3", "admin.users.create", {
-				login_id: "c@x.com", password: "longpass-12345",
-				monthly_limit_nano_cny: "3500000000",
-			}),
-		});
-		await ticks();
-		expect((responses(posted, "r2")[0].env.error as { code: string }).code)
-			.toBe("invalid_params");
-		expect((responses(posted, "r3")[0].env.error as { code: string }).code)
-			.toBe("invalid_params");
-		expect(calls).toHaveLength(1);
+		for (let i = 0; i < payloads.length; i++) {
+			const rs = responses(posted, "r" + i);
+			expect(rs).toHaveLength(1);
+			expect(rs[0].env.ok).toBe(false);
+			expect((rs[0].env.error as { code: string }).code).toBe("unknown_method");
+		}
+		expect(calls).toHaveLength(0); // 后端零调用
 	});
 
 	it("admin.invites.create forwards total_limit_nano_cny + ttl_seconds (no attribution fields)", async () => {

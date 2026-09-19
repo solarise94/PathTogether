@@ -49,18 +49,18 @@
     .adm-state 页级状态条（role=status aria-live=polite）承载；错误显示
     类别 + 本地请求序号（非敏感）+ 重试；空态解释为什么为空与下一步。
 
-    页面（10 页 IA）：概览 / 用户 / 身份冲突 / 切片 / 格式申请 / 邀请 /
-    设置 / 费用 / 插件 / 审计。「切片」（2026-09-05，review P0 读隔离 × 升级 B
+    页面（10 页 IA，R6 后）：概览 / 用户 / 切片 / 格式申请 / 邀请 /
+    测试申请 / 设置 / 费用 / 插件 / 审计。「切片」（2026-09-05，review P0 读隔离 × 升级 B
     收录语义）= 切片可见性管理：inventory 全量清点（唯一「看全部」出口，
     仅元数据）+ 把他人切片显式加入/移出 owner 工作区（view 收录，资产生代
     绑定，撤销联动取消）。
     「格式申请」（2026-09-14 W2）= 格式支持申请工单：清单 + 状态机处置
     （submitted → reviewing → supported|declined，CAS 迁移 + admin_note）；
     样本只呈现元数据，不内嵌文件内容。
-    「身份冲突」（2026-09-08，review P2-2 产品闭环）= 存量身份冲突清单（owner
-    只读摸排：login_id 非邮箱 / 邮箱与登录名不一致 / 待补绑孤儿 / 邮箱复用）
-    + 仅「待补绑孤儿」（pending-*@bind.invalid 合成形、从未激活、无业务关联）
-    可经页内确认条物理删除（不可逆；409 not_discardable 文案原样展示）。
+    R6（2026-09-19 service review §8）：「身份冲突」页与「新建用户」表单
+    整体退役（含桥方法 admin.users.identityConflicts / discardPending /
+    create 与服务端 REST 入口）——用户获取统一走正常注册/邀请码；用户页
+    只保留列表/筛选/抽屉（启停、AI 权限、密码重置、总额度）。
 
     只加载相对路径 style.css / main.js（owner-only 的
     /admin/plugin-assets/pathtogether-admin/ui/*）；不写内联样式/脚本（CSP）。
@@ -81,7 +81,6 @@
       <nav class="adm-nav" id="adm-nav" aria-label="管理页面">
         <button type="button" class="adm-nav-btn" data-page="overview">概览</button>
         <button type="button" class="adm-nav-btn" data-page="users">用户</button>
-        <button type="button" class="adm-nav-btn" data-page="identity">身份冲突</button>
         <button type="button" class="adm-nav-btn" data-page="slides">切片</button>
         <button type="button" class="adm-nav-btn" data-page="format-requests">格式申请</button>
         <button type="button" class="adm-nav-btn" data-page="test-applications">测试申请</button>
@@ -173,43 +172,10 @@
           </section>
         </section>
 
-        <!-- 用户：创建默认折叠为「新建用户」；列表只回答能不能用 AI、额度剩多少 -->
+        <!-- 用户（R6：创建表单已退役——用户获取统一走正常注册/邀请码；
+             列表只回答能不能用 AI、额度剩多少） -->
         <section class="adm-page" id="adm-page-users" hidden>
           <div class="adm-state" id="adm-state-users" data-page-state="idle" role="status" aria-live="polite"></div>
-          <details class="adm-card adm-collapsible-form" id="adm-users-create-box">
-            <summary>新建用户</summary>
-            <p class="adm-note">初始密码 ≥15 位，由 owner 线下告知用户；经本表创建的账户与旧入口语义一致（不会创建 owner）。初始总额度留空 = 继承全局默认；填 CNY 值则与建号同一事务创建该用户的一次性总额度。</p>
-            <div class="adm-form adm-form--grid" id="adm-users-create-form">
-              <div class="adm-field">
-                <label class="adm-field-label" for="adm-users-new-login">邮箱用户名（必填）</label>
-                <input type="text" id="adm-users-new-login" placeholder="如 user@example.com" maxlength="120" autocomplete="off" aria-describedby="adm-users-new-login-help">
-                <small class="adm-field-help" id="adm-users-new-login-help">规范化邮箱即唯一用户名；创建后改绑需重新验证</small>
-              </div>
-              <div class="adm-field">
-                <label class="adm-field-label" for="adm-users-new-display">显示名（可选）</label>
-                <input type="text" id="adm-users-new-display" placeholder="如 张三" maxlength="120" autocomplete="off">
-                <small class="adm-field-help">仅用于界面展示</small>
-              </div>
-              <div class="adm-field">
-                <label class="adm-field-label" for="adm-users-new-password">初始密码（必填）</label>
-                <input type="password" id="adm-users-new-password" placeholder="至少 15 位" minlength="15" maxlength="200" autocomplete="new-password" aria-describedby="adm-users-new-password-help">
-                <small class="adm-field-help" id="adm-users-new-password-help">≥15 位；创建后由 owner 线下告知用户</small>
-              </div>
-              <!-- wave 2：初始总额度降级为高级折叠项（默认表单不含金额） -->
-              <details class="adm-field-span" id="adm-users-new-limit-box">
-                <summary>高级：单独总额度</summary>
-                <div class="adm-field">
-                  <label class="adm-field-label" for="adm-users-new-limit">初始总额度（CNY，可选）</label>
-                  <input type="text" id="adm-users-new-limit" placeholder="如 20 或 12.5" autocomplete="off" aria-describedby="adm-users-new-limit-help">
-                  <small class="adm-field-help" id="adm-users-new-limit-help">留空 = 继承全局默认；最多 9 位小数；与建号同一事务生效；一次性总额度不按月刷新，之后可在用户抽屉单独调整</small>
-                </div>
-              </details>
-              <div class="adm-form-actions">
-                <button type="button" id="adm-users-create-btn" class="adm-btn-primary">创建用户</button>
-              </div>
-            </div>
-            <p class="adm-status" id="adm-users-create-status"></p>
-          </details>
           <section class="adm-card">
             <h2>用户</h2>
             <p class="adm-note">「额度剩余」按角色显示：注册用户为一次性总额度剩余（不按月刷新），owner 为本月窗口剩余（不可用会写明原因）；登录账号、已消费/预占等技术细节在「详情」抽屉；owner 行不提供禁用/重置（break-glass 不变量，服务端同样拒绝）。</p>
@@ -260,38 +226,9 @@
           </section>
         </section>
 
-        <!-- 身份冲突清单 + 孤儿处置（review-2026-09-08 P2-2 产品闭环）：
-             存量身份冲突摸排（owner 只读，四类冲突 + 计数摘要）；仅
-             discardable（pending_bind_synthetic 孤儿行）提供「删除孤儿账号」
-             —— 页内确认条明示不可逆物理删除；其余冲突只报告，不自动合并 -->
-        <section class="adm-page" id="adm-page-identity" hidden>
-          <div class="adm-state" id="adm-state-identity" data-page-state="idle" role="status" aria-live="polite"></div>
-          <div class="adm-kpis" id="adm-identity-kpis"></div>
-          <section class="adm-card">
-            <h2>身份冲突清单</h2>
-            <p class="adm-note">四类冲突一行可同时命中多类：登录名非邮箱、邮箱与登录名不一致、待补绑孤儿（pending-*@bind.invalid 合成形）、邮箱复用（同邮箱多行占用）。这是存量摸排清单，仅 owner 可见；只有「待补绑孤儿」（从未激活、无任何业务关联）可物理删除，其余冲突只报告——系统绝不自动合并或夺取已有账号。删除不可逆：直接删除数据库行，无法恢复。</p>
-            <div class="adm-table-wrap">
-              <table class="adm-table" id="adm-identity-table">
-                <thead>
-                  <tr>
-                    <th>user_id</th>
-                    <th>登录账号</th>
-                    <th>邮箱</th>
-                    <th class="adm-col-secondary">角色 / 状态</th>
-                    <th>冲突</th>
-                    <th>处置</th>
-                  </tr>
-                </thead>
-                <tbody id="adm-identity-tbody"></tbody>
-              </table>
-            </div>
-            <div class="adm-confirm" id="adm-identity-confirm" hidden></div>
-            <div class="adm-pager">
-              <button type="button" id="adm-identity-refresh-btn" class="adm-btn-secondary">刷新清单</button>
-              <span id="adm-identity-status" class="adm-status"></span>
-            </div>
-          </section>
-        </section>
+        <!-- R6（2026-09-19）：「身份冲突」页已整体退役（含清单/孤儿处置桥
+             方法与服务端入口）；系统不再提供经 Web 物理删除用户行的入口，
+             存量冲突收敛回归唯一约束 + 正常注册自身的 fail-closed 语义 -->
 
         <!-- 切片可见性 / 我的工作区收录（review P0 读隔离 × 升级 B 2026-09-05）：
              owner 不再默认可见全部切片（public/协作也不自动计入）；本页是唯一

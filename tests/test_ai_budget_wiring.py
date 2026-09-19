@@ -715,7 +715,10 @@ def test_ui_budget_card_and_max_steps_sync_present():
     # 2026-09-08 升 0.4.1：身份冲突清单+孤儿处置页（P2-2 闭环）。
     # 2026-09-09 0.4.2：默认模型切换卡
     # 2026-09-10 0.4.4：步数上限 500→100（§2 A：input max/校验区间/帮助文案）
-    assert manifest["pluginVersion"] == "0.4.4"
+    # 2026-09-19 0.4.9（service review R6）：身份冲突清单/孤儿处置页与手动
+    # 建号整体退役（0.4.1 引入的身份冲突页撤销）；0.4.5–0.4.8 的断言跟进
+    # 见 test_admin_plugin.py。hashes/pin 同步
+    assert manifest["pluginVersion"] == "0.4.9"
     for perm in ("admin:turn-budgets:read", "admin:turn-budgets:write",
                  "admin:acquisition:read", "admin:billing:write"):
         assert perm not in manifest["adminPermissions"], perm

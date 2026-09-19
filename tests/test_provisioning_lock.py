@@ -201,11 +201,14 @@ def test_missing_maintenance_setting_treated_open():
 
 
 # --------------------------------------------------------------------------- #
-# 3. 端点层：维护中 POST /api/admin/v1/users → 503 ai_dispatch_maintenance
+# 3. 端点层：POST /api/admin/v1/users 已 R6 410 退役（先于维护闸等任何分支）
 # --------------------------------------------------------------------------- #
-def test_v1_users_create_returns_503_while_gate_on():
-    """开闸时 v1 建号端点稳定 503（code=ai_dispatch_maintenance，与 AI
-    dispatch 同款文案口径），且不产生半创建用户。"""
+def test_v1_users_create_endpoint_retired_regardless_of_gate():
+    """R6（service-review-fix-plan-20260919.md §8）：v1 建号端点 410 退役。
+
+    维护闸开/关均 410 endpoint_retired（退役分支先于 owner 门控与维护
+    闸），且不产生半创建用户；维护中的建号拒绝语义由组合原语层用例覆盖
+    （见上方 create_user_with_total_allowance 用例）。"""
     owner = _mk_owner("ep-owner@x.com")
     assert _set_gate(False, True) is True
     c = csrf_client(app_mod.app.test_client())
@@ -215,13 +218,12 @@ def test_v1_users_create_returns_503_while_gate_on():
                   "auth_version": owner.get("auth_version", 1)})
     r = c.post("/api/admin/v1/users",
                json={"login_id": "epgated@x.com", "password": _PW})
-    assert r.status_code == 503, r.get_data(as_text=True)
-    body = r.get_json()
-    assert body["error"]["code"] == "ai_dispatch_maintenance"
+    assert r.status_code == 410, r.get_data(as_text=True)
+    assert r.get_json()["error"]["code"] == "endpoint_retired"
     assert user_store.get_user_by_login_id("epgated@x.com") is None
-    # 关闸后同一端点恢复 200（CAS 返回写入值 False；未抛冲突即命中）
+    # 关闸后同一端点仍 410（退役不随闸状态回退）
     _set_gate(True, False)
     r2 = c.post("/api/admin/v1/users",
                 json={"login_id": "epafter@x.com", "password": _PW})
-    assert r2.status_code == 200, r2.get_data(as_text=True)
-    assert user_store.get_user_by_login_id("epafter@x.com") is not None
+    assert r2.status_code == 410, r2.get_data(as_text=True)
+    assert user_store.get_user_by_login_id("epafter@x.com") is None

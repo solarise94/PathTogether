@@ -93,15 +93,20 @@ def main():
     import app as app_mod  # 启动期自动：owner 首建 + admin 插件 installation 引导
 
     # R3 Wave1-Money 单轨：注册用户授权面恒为一次性总额度（无 target 种
-    # 子行——user_spend_target 键已随 0032 删除）；10d/10e/10f（建号/抽屉
+    # 子行——user_spend_target 键已随 0032 删除）；10d/10e/10f（抽屉
     # CAS/邀请模板）验收总额度形态，故只种子：全局默认总额度 50 CNY
     # （version=1 首写），预建普通用户经建号组合原语自动获得默认额度行。
+    # R6（2026-09-19）：管理台「新建用户」表单退役——10d 不再经 UI 建号，
+    # 限额户改为种子直建（3.5 CNY 初始总额度，与原 10d 面值一致）。
     import spend_store
     spend_store.set_total_default(50_000_000_000, 1, updated_by="e2e-seed")
 
     import user_store_pg
     user_store_pg.create_user_with_total_allowance(
         "e2e-user@pt.test", user_pw, display_name="E2E 普通用户")
+    user_store_pg.create_user_with_total_allowance(
+        "e2e-limited@pt.test", secrets.token_urlsafe(24),
+        display_name="E2E 限额用户", total_limit_nano_cny=3_500_000_000)
 
     creds_path = os.environ.get("E2E_CREDS_FILE") or os.path.join(
         tempfile.gettempdir(), "pt-e2e-creds-%d.json" % args.port)

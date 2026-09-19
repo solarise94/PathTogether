@@ -950,7 +950,9 @@ def test_admin_manifest_plugin_version_bumped_with_hashes():
     # 2026-09-19 0.4.8（R7 审批/邀请码一致性）：测试申请新增终态
     # activated_by_invite 枚举/筛选/激活来源展示（0.4.7 为基线遗留、
     # 本断言此前未跟进），hashes/pin 同步
-    assert data["pluginVersion"] == "0.4.8"  # hashes/pin 同步
+    # 2026-09-19 0.4.9（R6）：身份冲突页（导航/页/表单）与「新建用户」
+    # 表单整体退役，hashes/pin 同步
+    assert data["pluginVersion"] == "0.4.9"  # hashes/pin 同步
     assert "admin:settings:read" in data["adminPermissions"]
     assert "admin:settings:write" in data["adminPermissions"]
     assert "admin:slides:read" in data["adminPermissions"]

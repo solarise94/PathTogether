@@ -7555,15 +7555,34 @@ def admin_v1_audit():
 #     与只读端点/宿主页同口径 §14.1）；CSRF 沿用 before_request 全局闸；
 #   - 旧建号端点 POST /api/admin/users 曾 410 退役（review R2-F1：total 模式
 #     下会建出无 allowance 行的用户），R3 wave1 已随旧管理面一并物理删除；
-#     建号统一走本节 POST /api/admin/v1/users 同事务组合原语；
-#     break-glass 不变量原样保持（owner 禁用/重置一律 409，
-#     disable/enable 同事务推进 auth_version）；
+#     R6（2026-09-19 service review §8）：手动建号的 v1 入口
+#     POST /api/admin/v1/users 也一并 410 退役（管理面不再提供手动建号，
+#     用户获取统一走正常注册/邀请码；用户管理写面只剩 enable/disable/
+#     ai-access/password-reset，break-glass 不变量原样保持——owner 禁用/
+#     重置一律 409，disable/enable 同事务推进 auth_version）；
+#   - 身份冲突清单/孤儿处置两端点（GET identity-conflicts、POST
+#     discard-pending，review P2-2 产品闭环）同批 410 退役（R6）：管理面
+#     不再提供身份冲突页与物理删除入口；退役入口对任何已登录调用方（含
+#     owner）稳定 410 endpoint_retired 且不读不写任何数据（匿名在
+#     before_request 认证闸照常 401）；
 #   - billing 写（caps/adjustments）端点已随 R3 wave1 下线（bridge 侧早已
 #     无调用方；billing_store 写原语保留，供调账工具链使用）；
 #   - 响应红线与只读端点一致：绝不含 password_hash / ai_config（内含 enc:
 #     密文形态）/ 完整邀请 token（创建邀请的明文码仅首次响应返回 + no-store）
 #     / 完整 IP。
 # --------------------------------------------------------------------------- #
+def _admin_v1_retired(method_hint):
+    """R6 退役端点的统一 410 响应。
+
+    认证闸（before_request）仍先于本分支：匿名请求照常 401；任何**已登录**
+    调用方（含 owner/预览态/普通用户）一律 410，视图内不再有任何读写——
+    不建用户、不删行、不写审计。
+    """
+    return _admin_v1_error(
+        410, "endpoint_retired",
+        "该管理入口已退役（R6）：不再提供%s，请改用正常注册/邀请流程" % method_hint)
+
+
 def _admin_v1_user_out(user):
     """用户写端点响应出口：剥 password_hash 与 ai_config（§9 敏感红线）。"""
     out = dict(user or {})
@@ -7574,106 +7593,16 @@ def _admin_v1_user_out(user):
 
 @app.route("/api/admin/v1/users", methods=["POST"])
 def admin_v1_users_create():
-    """创建普通用户（§9：仅 role=user，禁止经此创建 owner）。
+    """R6 退役（2026-09-19 service review §8）：手动新建用户入口下线。
 
-    login_id 唯一冲突 409；密码 15..200；audit 动作 user.create（口径承自
-    已删除的旧 POST /api/admin/users）。
-
-    批次 B wave 2（§Batch B 数据模型 6 / §4.3）扩展可选字段：
-      - ``total_limit_nano_cny``：十进制字符串 nano-CNY | null（缺省）。
-        postgres 后端一律走同事务组合原语（user_store_pg
-        .create_user_with_total_allowance）。R3 单轨：恒建**一次性总额度**
-        行——显式 X 按面值（source=admin_create），无 X 解析
-        ai_spend_total_defaults 权威默认，皆缺 → 400 ``total_default_missing``
-        （绝不建出无额度行的用户；缺行 = 数据损坏 fail-closed）；
-      - ``ai_access``：bool（缺省 True，与 users.ai_access 列默认一致）。
-    旧 wire 名 ``monthly_limit_nano_cny`` 已随 R3 Wave2-Compat 退役：body 带
-    该键一律 400 ``retired_spend_field``（绝不静默忽略）。
-    带金额字段时要求 PG（json/dual 稳定 503，不降级）。
+    管理台「新建用户」表单与桥方法（admin.users.create）已同批移除；本端点
+    对任何**已登录**调用方（owner/普通用户/预览态；匿名经 before_request
+    认证闸照常 401）稳定返回 410 endpoint_retired，**不执行任何操作**
+    （不建用户、不写审计、不读库）。用户获取统一走正常
+    注册（invite_only / email_verify_invite_activation）；既有用户的额度
+    调整仍走 /api/admin/v1/spend/users/<id>/total-limit。
     """
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    body = request.get_json(silent=True) or {}
-    # §9「创建普通用户」：本端点不接受 role 入参（显式给 owner 一律 400）
-    if body.get("role") not in (None, user_store.ROLE_USER):
-        return _admin_v1_error(400, "invalid_request",
-                               "本端点只能创建普通用户（role=user）")
-    login_id_raw = body.get("login_id")
-    password = body.get("password")
-    display_name = body.get("display_name")
-    if not isinstance(login_id_raw, str) or not login_id_raw.strip():
-        return _admin_v1_error(400, "invalid_request", "缺少登录账号")
-    # P1-3 收口（J：邮箱=唯一用户名）：建号入口只收邮箱形态的 login_id。
-    # 规范化（trim+lower）值贯穿 login_id 与 email/email_normalized 列
-    # （email_verified_at 保持 NULL=未验证，绝不伪造验证状态）；display_name
-    # 保留为可选纯展示字段，缺省由 store 层回退=规范化邮箱。
-    try:
-        login_id = registration_store.validate_email(login_id_raw)
-    except registration_store.EmailVerifyError:
-        return _admin_v1_error(
-            400, "login_id_not_email",
-            "登录账号需为有效的邮箱地址（邮箱即用户名）")
-    if not isinstance(password, str) or not password:
-        return _admin_v1_error(400, "invalid_request", "缺少密码")
-    if (len(password) < user_store.PASSWORD_MIN_LENGTH
-            or len(password) > user_store.PASSWORD_MAX_LENGTH):
-        return _admin_v1_error(
-            400, "invalid_request",
-            "密码长度须在 %d..%d 字符之间（当前 %d 字符）"
-            % (user_store.PASSWORD_MIN_LENGTH, user_store.PASSWORD_MAX_LENGTH,
-               len(password)))
-    ai_access = body.get("ai_access")
-    if ai_access is not None and not isinstance(ai_access, bool):
-        return _admin_v1_error(400, "invalid_request",
-                               "ai_access 需为布尔值")
-    # R3 Wave2-Compat：旧月额度字段退役——body 带该键一律 400（与来源字段
-    # retired_invite_field 同模式，绝不静默忽略）
-    if body.get("monthly_limit_nano_cny") is not None:
-        return _admin_v1_error(
-            400, "retired_spend_field",
-            "monthly_limit_nano_cny 已退役（R3 单轨为一次性总额度）："
-            "请改用 total_limit_nano_cny")
-    # 金额 wire：只接受 ^-?[0-9]{1,19}$ 十进制字符串（JSON number 一律 400）
-    try:
-        total_limit = _admin_v1_amount_in(
-            body.get("total_limit_nano_cny"), "total_limit_nano_cny")
-    except ValueError as exc:
-        return _admin_v1_error(400, "invalid_request", str(exc))
-
-    actor = actor_identity().get("user_id")
-
-    # user 插入 + 按目标建授权面 + audit 必须同一 PG 事务（§5.1）
-    import user_store_pg
-    try:
-        user, allowance = user_store_pg.create_user_with_total_allowance(
-            login_id, password, display_name=display_name,
-            ai_access=True if ai_access is None else ai_access,
-            total_limit_nano_cny=total_limit, actor_user_id=actor,
-            # P1-3：建号即同步 email 身份三列（email/email_normalized 写
-            # 规范化邮箱；email_verified_at 由 store 保持 NULL=未验证）
-            email=login_id)
-    except spend_store.ProvisioningMaintenanceError:
-        # cutover 维护闸开启（或平台设置读不出，fail-closed）期间禁止建号：
-        # 与 AI dispatch 同款稳定 503 ai_dispatch_maintenance（闸关闭后重试；
-        # 组合原语在用户行插入前检查，无半创建状态）
-        return _admin_v1_error(503, "ai_dispatch_maintenance",
-                               "系统维护中（cutover），暂禁止建号；请稍后重试")
-    except ValueError as e:
-        msg = str(e)
-        if "total_default_missing" in msg:
-            return _admin_v1_error(400, "total_default_missing", msg)
-        if "已存在" in msg:
-            return _admin_v1_error(409, "login_id_conflict", msg)
-        return _admin_v1_error(400, "invalid_request", msg)
-    except Exception:
-        # 单事务组合原语（建号+总额度+audit）任一失败已整体回滚——
-        # 统一 500，不暴露内部错误细节
-        app.logger.exception("admin v1 users create（含总额度）失败")
-        return _admin_v1_error(500, "internal",
-                               "用户创建失败（事务已整体回滚，无半创建状态）")
-    return jsonify(user=_admin_v1_user_out(user),
-                   total_allowance=_admin_v1_nano_out(allowance))
+    return _admin_v1_retired("手动新建用户")
 
 
 def _admin_v1_set_user_enabled(user_id, enabled):
@@ -7766,69 +7695,33 @@ def admin_v1_users_password_reset(user_id):
 
 # --------------------------------------------------------------------------- #
 # P1-3 身份收口（review P1-3：邮箱=唯一用户名收尾）：owner 存量冲突清单 +
-# orphan pending 处置。只读清单不改任何状态；discard 只允许「pending_
-# activation + bind.invalid 合成 login_id」的孤儿行，其余一律 409——
-# 绝不自动合并/夺取已有账号。
+# orphan pending 处置。R6（2026-09-19 service review §8）已整体退役：
+# 管理台身份冲突页/桥方法同批移除，两端点对任何调用方稳定 410
+# endpoint_retired 且不读不写任何数据；底层一致性保护（users_email_
+# identity_key 唯一约束、身份解析、邮箱改绑闭环）原样保留。
 # --------------------------------------------------------------------------- #
 @app.route("/api/admin/v1/users/identity-conflicts", methods=["GET"])
 def admin_v1_users_identity_conflicts():
-    """存量身份冲突清单（owner 只读；J 收口摸排）。
+    """R6 退役：身份冲突清单入口下线（原 owner 只读四类冲突枚举）。
 
-    返回四类冲突行（一行可命中多类，conflicts 列全）+ 计数：
-      - login_id_not_email：login_id 非邮箱形态；
-      - email_login_mismatch：email_normalized 与 login_id 不一致；
-      - pending_bind_synthetic：pending-*@bind.invalid 待补绑孤儿行
-        （可经 discard-pending 处置）；
-      - email_shared：同 email_normalized 多行占用。
-    owner-only（_require_owner_admin_v1，预览态一律拒绝）；只读端点。
+    只读入口本无写副作用，随「删除孤儿账号」写入口一并 410 退役（管理面
+    不再提供该页）；存量冲突的收敛回归唯一约束 + 正常注册流程自身的
+    fail-closed 语义。
     """
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    try:
-        report = identity_store.list_identity_conflicts()
-    except Exception:
-        app.logger.exception("admin v1 identity-conflicts 读取失败")
-        return _admin_v1_error(500, "internal", "身份冲突清单读取失败")
-    return jsonify(items=report["items"], counts=report["counts"])
+    return _admin_v1_retired("身份冲突清单")
 
 
 @app.route("/api/admin/v1/users/<user_id>/discard-pending", methods=["POST"])
 def admin_v1_users_discard_pending(user_id):
-    """物理删除 orphan pending_activation 行（owner 显式处置；P1-3）。
+    """R6 退役：孤儿 pending 行物理删除入口下线。
 
-    仅允许 activation_state=pending_activation 且 login_id 为
-    pending-*@bind.invalid 合成形的账号；其余任何账号一律 409
-    not_discardable（绝不自动夺取/合并已有账号）。物理删除不可逆：
-    仅对「邮箱验证建号时因存量 login_id 冲突进入待补绑、从未激活、
-    无任何业务关联」的孤儿行开放。删除成功写审计（user.pending_discard，
-    detail 只含掩码邮箱与冲突快照，无密码/token）。
+    原语义仅允许「pending_activation + pending-*@bind.invalid 合成形」的
+    孤儿行；R6 连同身份冲突页一起退役后，系统不再提供任何经 Web 物理删除
+    用户行的入口。本端点对任何调用方稳定 410 endpoint_retired，**不删除、
+    不修改任何用户行**（identity_store 的受审计删除原语一并移除，防止
+    未来调用方绕过退役决定）。
     """
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    ident = current_identity()
-    try:
-        # 审计与删除同一 PG 事务（二轮 review P2-2：审计失败整体回滚，
-        # 杜绝「删了但没记审计」）；actor=真实 owner，detail 无敏感值。
-        snap = identity_store.discard_pending_activation(
-            user_id, audit={"actor_user_id": ident.get("user_id") or None,
-                            "actor_role": ident.get("role") or "owner"})
-    except identity_store.DiscardPendingError as exc:
-        if exc.code == "user_missing":
-            return _admin_v1_error(404, "user_not_found", "用户不存在")
-        if exc.code == "has_dependents":
-            return _admin_v1_error(
-                409, "not_discardable",
-                "该账号存在业务关联行（并非孤儿），已拒绝删除；请先人工核查")
-        return _admin_v1_error(
-            409, "not_discardable",
-            "仅允许删除「待激活且登录名为待补绑合成形（pending-*@bind."
-            "invalid）」的孤儿账号")
-    except Exception:
-        app.logger.exception("admin v1 discard-pending 失败")
-        return _admin_v1_error(500, "internal", "处置失败（未删除任何行）")
-    return jsonify(ok=True, discarded={"user_id": user_id})
+    return _admin_v1_retired("孤儿 pending 行处置")
 
 
 @app.route("/api/admin/v1/invites", methods=["GET"])

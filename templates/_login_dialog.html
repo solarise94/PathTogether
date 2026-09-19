@@ -1,33 +1,117 @@
+{# =========================================================================
+   登录 / 注册统一弹窗（R2 2026-09-19）。
+
+   - 一个 <dialog> 承载两个视图（#login-view / #register-view），一次只打开
+     一个弹窗；切换经 entry-auth.js（按钮拦截）或 /login、/register 深链接
+     （服务端 login_open / register_open 直开对应视图）。
+   - 无 JS 退化：服务端 open 属性 + hidden 属性直出对应视图（CSS 居中浮层）。
+   - 注册复用既有 POST /register API（同一 CSRF/限流/模式策略），后端不重复造。
+   - 文案口径（R2）：首屏「验证邮箱并提交申请，管理员审核通过后即可使用。」；
+     发送后「验证邮件已发送，请查收。」；不写权限/额度类实现型说明。
+   ========================================================================= #}
 {% if not signed_in %}
-<dialog class="login-dialog" id="login-dialog" aria-labelledby="login-dialog-title"{% if login_open %} open{% endif %}>
+<dialog class="login-dialog" id="login-dialog" aria-labelledby="{% if register_open %}register-dialog-title{% else %}login-dialog-title{% endif %}"{% if login_open or register_open %} open{% endif %}>
   <div class="login-dialog-card" role="document">
     <button class="login-dialog-close" type="button" data-login-close aria-label="关闭">×</button>
     <p class="login-dialog-kicker">HistoPilot</p>
-    <h2 id="login-dialog-title" data-i18n="login.title">登录 HistoPilot</h2>
-    <p class="login-dialog-subtitle" data-i18n="login.subtitle">登录后继续查看、测试 AI 和协作</p>
-    {% if login_password_changed %}<div class="login-dialog-message" role="status" data-i18n="login.password_changed">密码已修改，请使用新密码重新登录</div>{% endif %}
-    {% if login_error %}
-    <div class="login-dialog-error" role="alert">
-      {% if login_error_code == 'locked' %}<span data-i18n="login.error.locked">尝试过于频繁，请稍后再试</span>
-      {% elif login_error_code == 'csrf' %}<span data-i18n="login.error.csrf">登录状态已过期，请重新提交</span>
-      {% else %}{{ login_error }}{% endif %}
-      {% if login_retry_after %}<span id="login-dialog-countdown" data-retry-seconds="{{ login_retry_after }}"></span>{% endif %}
+
+    <!-- ===================== 登录视图 ===================== -->
+    <div class="auth-view" id="login-view" data-auth-pane="login"{% if register_open %} hidden{% endif %}>
+      <h2 id="login-dialog-title" data-i18n="login.title">登录 HistoPilot</h2>
+      <p class="login-dialog-subtitle" data-i18n="login.subtitle">登录后继续查看、测试 AI 和协作</p>
+      {% if login_password_changed %}<div class="login-dialog-message" role="status" data-i18n="login.password_changed">密码已修改，请使用新密码重新登录</div>{% endif %}
+      {% if login_error %}
+      <div class="login-dialog-error" role="alert">
+        {% if login_error_code == 'locked' %}<span data-i18n="login.error.locked">尝试过于频繁，请稍后再试</span>
+        {% elif login_error_code == 'csrf' %}<span data-i18n="login.error.csrf">登录状态已过期，请重新提交</span>
+        {% else %}{{ login_error }}{% endif %}
+        {% if login_retry_after %}<span id="login-dialog-countdown" data-retry-seconds="{{ login_retry_after }}"></span>{% endif %}
+      </div>
+      {% endif %}
+      <form method="POST" action="/login" id="login-dialog-form" autocomplete="on">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+        <input type="hidden" name="next" value="{{ login_next_url or '/app' }}" />
+        <label for="login-dialog-username" data-i18n="login.username">登录账号</label>
+        <input id="login-dialog-username" name="username" type="text" required autocomplete="username" spellcheck="false" />
+        <label for="login-dialog-password" data-i18n="login.password">密码</label>
+        <input id="login-dialog-password" name="password" type="password" required autocomplete="current-password" />
+        <button class="login-dialog-submit" type="submit" data-i18n="login.submit">登录</button>
+      </form>
+      <div class="login-dialog-links">
+        <a href="/register" data-auth-switch="register" data-i18n="login.register">没有账号？注册</a>
+        <a href="/demo" data-i18n="login.demo">先体验 Demo</a>
+      </div>
+      <p class="login-dialog-forgot" data-i18n="login.forgot">忘记密码？请联系管理员重置。</p>
     </div>
-    {% endif %}
-    <form method="POST" action="/login" id="login-dialog-form" autocomplete="on">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-      <input type="hidden" name="next" value="{{ login_next_url or '/' }}" />
-      <label for="login-dialog-username" data-i18n="login.username">登录账号</label>
-      <input id="login-dialog-username" name="username" type="text" required autocomplete="username" spellcheck="false" />
-      <label for="login-dialog-password" data-i18n="login.password">密码</label>
-      <input id="login-dialog-password" name="password" type="password" required autocomplete="current-password" />
-      <button class="login-dialog-submit" type="submit" data-i18n="login.submit">登录</button>
-    </form>
-    <div class="login-dialog-links">
-      <a href="/register" data-i18n="login.register">没有账号？查看注册方式</a>
-      <a href="/demo" data-i18n="login.demo">先体验 Demo</a>
+
+    <!-- ===================== 注册视图 ===================== -->
+    <div class="auth-view" id="register-view" data-auth-pane="register"{% if not register_open %} hidden{% endif %}>
+      {% if register_done %}
+      <!-- 发送后统一文案（R2）：已知/未知/超限邮箱同一视图，无枚举信号 -->
+      <h2 id="register-dialog-title" data-i18n="register.dialog.sent.title">请查收验证邮件</h2>
+      <div class="login-dialog-message" role="status" data-i18n="register.dialog.sent">验证邮件已发送，请查收。</div>
+      <p class="login-dialog-subtitle" data-i18n="register.dialog.sent.hint">请在 30 分钟内点击邮件中的链接完成验证；未收到可稍后重试或检查垃圾邮件。</p>
+      <div class="login-dialog-links">
+        <a href="/register" data-i18n="register.dialog.again">重新填写邮箱</a>
+        <a href="/login" data-auth-switch="login" data-i18n="register.dialog.have_account">已有账号？登录</a>
+      </div>
+      {% else %}
+      <h2 id="register-dialog-title" data-i18n="register.dialog.title">注册 HistoPilot</h2>
+      <p class="login-dialog-subtitle" data-i18n="register.dialog.subtitle">验证邮箱并提交申请，管理员审核通过后即可使用。</p>
+      {% if register_error %}
+      <div class="login-dialog-error" role="alert">
+        {% if register_error_code == 'locked' %}<span data-i18n="login.error.locked">尝试过于频繁，请稍后再试</span>
+        {% else %}{{ register_error }}{% endif %}
+        {% if register_retry_after %}<span id="register-dialog-countdown" data-retry-seconds="{{ register_retry_after }}"></span>{% endif %}
+      </div>
+      {% endif %}
+      {% if registration_mode == "email_verify" %}
+      <form method="POST" action="/register" id="register-dialog-form" autocomplete="on">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+        <label for="register-dialog-email" data-i18n="register.dialog.email">邮箱地址</label>
+        <input id="register-dialog-email" name="email" type="email" required maxlength="254"
+               autocomplete="email" spellcheck="false"
+               data-i18n-ph="register.dialog.email.ph" placeholder="you@example.com" />
+        <p class="login-dialog-hint" data-i18n="register.dialog.email.hint">验证成功后，该邮箱将作为你的登录账号。</p>
+        <button class="login-dialog-submit" type="submit" data-i18n="register.dialog.submit">发送验证邮件</button>
+      </form>
+      {% elif registration_mode == "invite_only" %}
+      <form method="POST" action="/register" id="register-dialog-form" autocomplete="on">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+        <label for="register-dialog-invite" data-i18n="register.invite.code">邀请码</label>
+        <input id="register-dialog-invite" name="invite_token" type="text" required
+               autocomplete="off" spellcheck="false"
+               data-i18n-ph="register.invite.code.ph" placeholder="粘贴管理员发送的邀请码" />
+        <label for="register-dialog-login-id" data-i18n="register.invite.email">登录账号（邮箱）</label>
+        <input id="register-dialog-login-id" name="login_id" type="email" required maxlength="254"
+               autocomplete="username" spellcheck="false"
+               data-i18n-ph="register.invite.email.ph" placeholder="you@example.com" />
+        <p class="login-dialog-hint" data-i18n="register.dialog.email.hint">验证成功后，该邮箱将作为你的登录账号。</p>
+        <label for="register-dialog-display" data-i18n="register.invite.display">显示名（可选，仅展示）</label>
+        <input id="register-dialog-display" name="display_name" type="text" maxlength="120"
+               autocomplete="nickname"
+               data-i18n-ph="register.invite.display.ph" placeholder="其他人看到的名字（不用于登录，也不作为身份）" />
+        <label for="register-dialog-password" data-i18n="register.invite.password">设置密码</label>
+        <input id="register-dialog-password" name="password" type="password" required minlength="15"
+               maxlength="200" autocomplete="new-password"
+               data-i18n-ph="register.invite.password.ph" placeholder="至少 15 位，推荐使用密码管理器生成的长口令" />
+        <label for="register-dialog-password-confirm" data-i18n="register.invite.confirm">确认密码</label>
+        <input id="register-dialog-password-confirm" name="password_confirm" type="password" required
+               minlength="15" maxlength="200" autocomplete="new-password" />
+        <p class="login-dialog-hint" data-i18n="register.invite.password.hint">至少 15 位，可直接使用密码管理器生成并粘贴；不要求大小写或符号组合。</p>
+        <button class="login-dialog-submit" type="submit" data-i18n="register.invite.submit">创建账号</button>
+      </form>
+      {% else %}
+      <!-- 注册关闭（含 fail-closed 降级）：无可提交表单，仍按服务端策略 -->
+      <div class="login-dialog-message" role="status" data-i18n="register.title">当前采用邀请注册</div>
+      <p class="login-dialog-subtitle" data-i18n="register.desc">测试账号由管理员创建。如果你已收到账号，请直接登录。</p>
+      {% endif %}
+      <div class="login-dialog-links">
+        <a href="/login" data-auth-switch="login" data-i18n="register.dialog.have_account">已有账号？登录</a>
+        <a href="/demo" data-i18n="login.demo">先体验 Demo</a>
+      </div>
+      {% endif %}
     </div>
-    <p class="login-dialog-forgot" data-i18n="login.forgot">忘记密码？请联系管理员重置。</p>
   </div>
 </dialog>
 {% endif %}

@@ -6,10 +6,10 @@
   <title>HistoPilot</title>
   <!-- 空 data URI favicon：避免未登录浏览器自动 GET /favicon.ico 撞鉴权闸 -->
   <link rel="icon" href="data:," />
-  <link rel="stylesheet" href="/static/entry.css?v=20260916svg1" />
-  <script defer src="/static/i18n.js?v=20260916svg1"></script>
-  <script defer src="/static/entry.js?v=20260916svg1"></script>
-  <script defer src="/static/entry-auth.js?v=20260916auth2"></script>
+  <link rel="stylesheet" href="/static/entry.css?v=20260919r2" />
+  <script defer src="/static/i18n.js?v=20260919r2"></script>
+  <script defer src="/static/entry.js?v=20260919r2"></script>
+  <script defer src="/static/entry-auth.js?v=20260919r2"></script>
 </head>
 <body id="top">
   <a class="skip-link" href="#main" data-i18n="entry.skip">跳到主要内容</a>
@@ -37,7 +37,7 @@
       <div class="topbar-actions">
         <button type="button" class="lang-toggle" data-i18n-aria="lang.toggle.aria" aria-label="切换为英文">EN</button>
         {% if signed_in %}
-        <span class="avatar" title="{{ display_name }}" aria-label="{{ display_name }}">{{ avatar_letter }}</span>
+        {# R3（2026-09-19）：删除首页无用途的头像字母圆圈；「进入工作台」承担身份入口 #}
         <a class="btn btn-primary btn-sm" href="/app" data-i18n="entry.nav.workbench">进入工作台</a>
         <form class="logout-form" method="post" action="/logout">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />

@@ -20,6 +20,7 @@ review J / P2-4 / I-R4 守卫）。
 """
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -184,6 +185,7 @@ def test_put_registration_mode_new_mode(monkeypatch):
 
 
 def test_register_email_mode_page_copy(monkeypatch):
+    """R2：GET /register 渲染介绍主页并直开注册弹窗（邮箱表单 + 简明文案）。"""
     _open_email_mode(monkeypatch)
     app_mod.AUTH_ENABLED = True
     client = _client()
@@ -194,7 +196,16 @@ def test_register_email_mode_page_copy(monkeypatch):
     assert 'name="invite_token"' not in body   # 不填邀请码
     assert 'name="login_id"' not in body       # J：不要求独立登录账号
     assert 'name="display_name"' not in body   # J：不要求显示名
-    assert "邀请码" in body and "激活" in body  # 文案写明后置激活
+    # R2 首屏核心文案（不再承诺/解释激活细节，无实现型说明）
+    assert "验证邮箱并提交申请，管理员审核通过后即可使用。" in body
+    assert "验证邮箱本身不授予" not in body
+    # 弹窗直开且注册视图激活（登录视图收起）
+    assert re.search(r'\bopen\b', re.search(
+        r'<dialog\b[^>]*id="login-dialog"[^>]*>', body).group(0))
+    assert 'id="register-view" data-auth-pane="register">' in body
+    assert 'id="login-view" data-auth-pane="login" hidden>' in body
+    # 注册表单复用既有 POST /register API + CSRF
+    assert 'action="/register"' in body and 'name="csrf_token"' in body
 
 
 def test_register_email_mode_post_unified_copy(monkeypatch):
@@ -225,6 +236,83 @@ def test_register_email_mode_post_unified_copy(monkeypatch):
         conn.close()
     # token 明文/链接绝不落库（载荷加密）
     assert "verify-email?token=" not in row["payload_enc"]
+
+
+def test_register_email_mode_done_view_copy(monkeypatch):
+    """R2：发送后注册弹窗内展示「验证邮件已发送，请查收。」（不跳独立页）。"""
+    _open_email_mode(monkeypatch)
+    app_mod.AUTH_ENABLED = True
+    client = _client()
+    r = client.post("/register", data={"email": "done.view@x.com"})
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    assert "验证邮件已发送，请查收。" in body
+    # 完成视图不再提供邮箱表单（防重复提交歧义）；保留重新填写与登录入口
+    assert 'name="email"' not in body
+    assert "重新填写邮箱" in body
+    assert "已有账号？登录" in body
+    # 弹窗仍直开（register_open），登录视图收起
+    assert 'id="register-view" data-auth-pane="register">' in body
+    assert 'id="login-view" data-auth-pane="login" hidden>' in body
+    assert "no-store" in r.headers.get("Cache-Control", "")
+
+
+def test_register_dialog_full_real_chain(monkeypatch):
+    """R2 完整真实链：注册弹窗表单 → 入队 → fake 发送（真实链接）→
+    GET /verify-email 只展示 → POST /api/registration/verify 建号 + 申请。
+
+    验证 token/建号/申请链全部真实（不全 mock）；仅邮件发送用 fake。
+    """
+    _open_email_mode(monkeypatch)
+    app_mod.AUTH_ENABLED = True
+    client = _client()
+    # 1. 深链接：渲染介绍主页 + 注册弹窗（邮箱表单）
+    page = client.get("/register")
+    assert page.status_code == 200
+    # 2. 弹窗表单提交（同真实 form POST：email + CSRF）
+    r = client.post("/register", data={"email": "dialog.chain@x.com"})
+    assert r.status_code == 200
+    assert "验证邮件已发送，请查收。" in r.get_data(as_text=True)
+    # 3. 真实排水（fake 发送器）：正文带真实 PUBLIC_BASE_URL 链接与 token
+    assert registration_mail_worker.drain_once(sender=_fake()) == 1
+    to, subject, body = _fake().sent[0]
+    assert to == "dialog.chain@x.com"
+    link = "%s/verify-email?token=" % BASE
+    assert link in body
+    token = body.split(link, 1)[1].split()[0]
+    # 4. GET 验证落地页只展示不消费
+    vpage = client.get("/verify-email?token=" + token)
+    assert vpage.status_code == 200
+    assert "管理员审核通过后即可使用" in vpage.get_data(as_text=True)
+    assert _mail_job_row(token)["status"] == "sent"  # GET 只展示，未消费
+    # 5. 消费 token + 设置密码 + 提交申请（原子建 pending 用户）
+    r2 = client.post("/api/registration/verify", json={
+        "token": token, "password": "longpassword123",
+        "password_confirm": "longpassword123",
+        "research_direction": "clinical_pathology",
+        "share_research_data": False})
+    assert r2.status_code == 200, r2.get_data(as_text=True)
+    assert r2.get_json()["ok"] is True
+    assert r2.get_json()["application_submitted"] is True
+    user = user_store.get_user_by_login_id("dialog.chain@x.com")
+    assert user is not None
+    assert user["activation_state"] == "pending_activation"
+    row = _mail_job_row(token)
+    assert row["status"] == "consumed"
+
+
+def test_verify_email_mail_body_copy_simplified(monkeypatch):
+    """R2：验证邮件文案与弹窗同口径——无「不授予任何权限」实现型说明；
+    保留一次性、30 分钟与邀请码直接激活提示。"""
+    _open_email_mode(monkeypatch)
+    subject, body = registration_mail_worker.build_verify_email_body(
+        "copy@x.com", "tok-value", BASE)
+    assert "30 分钟" in subject
+    assert BASE + "/verify-email?token=tok-value" in body
+    assert "只能使用一次" in body
+    assert "邀请码" in body
+    assert "不会授予任何工作区" not in body
+    assert "验证邮箱本身" not in body
 
 
 # =========================================================================== #
@@ -1543,10 +1631,12 @@ def test_admin_audit_actor_identity(monkeypatch):
     app_mod.AUTH_ENABLED = True
     client = _client()
     _owner_session(client, owner)
-    # 触发一条带 actor 的审计（owner 建 user）
-    client.post("/api/admin/v1/users",
-                json={"login_id": "audit-u@x.com",
-                      "password": "auditpass12345678"})
+    # 触发一条带 actor 的审计（owner 经建号组合原语建 user；R6 后
+    # POST /api/admin/v1/users 已 410 退役，user.create 审计由原语直写）
+    import user_store_pg
+    user_store_pg.create_user_with_total_allowance(
+        "audit-u@x.com", "auditpass12345678",
+        actor_user_id=owner["user_id"])
     events = client.get("/api/admin/v1/audit").get_json()["items"]
     ev = next(e for e in events if e["action"] == "user.create")
     assert ev["actor_identity"] == "reg-owner@x.com"

@@ -98,13 +98,23 @@ def _owner_session(client, owner):
 # 1. 三模式 fail-closed 与前置条件（json/PG 双跑）
 # =========================================================================== #
 def test_register_closed_mode_get_and_post():
+    """closed：GET /register 渲染介绍主页 + 注册弹窗关闭态（无可提交表单）。
+
+    R2（2026-09-19）：注册并入介绍主页弹窗；登录表单仍在（视图切换用），
+    但 invite_token/email 注册字段一律不存在；POST 一律 403（策略不变）。
+    """
     app_mod.AUTH_ENABLED = True
     client = _client()
     r = client.get("/register")
     assert r.status_code == 200
     body = r.get_data(as_text=True)
     assert "当前采用邀请注册" in body
-    assert "<form" not in body
+    # 注册视图直开（登录视图收起）
+    assert 'id="register-view" data-auth-pane="register">' in body
+    assert 'id="login-view" data-auth-pane="login" hidden>' in body
+    # 无可提交的注册表单（invite_token/email 字段不存在）
+    assert 'name="invite_token"' not in body
+    assert 'name="email"' not in body
     r2 = client.post("/register", data={"login_id": "n@x.com",
                                         "password": "password1password1"})
     assert r2.status_code == 403
@@ -147,7 +157,10 @@ def test_invite_only_degraded_without_preconditions(monkeypatch, caplog):
     client = _client()
     r = client.get("/register")
     assert r.status_code == 200
-    assert "<form" not in r.get_data(as_text=True)  # 关闭态页
+    body = r.get_data(as_text=True)
+    assert "当前采用邀请注册" in body  # 关闭态注册视图
+    assert 'name="invite_token"' not in body  # 无可提交注册表单
+    assert 'name="email"' not in body
     r2 = client.post("/register", data={"invite_token": "x",
                                         "login_id": "n@x.com",
                                         "password": "password1password1"})

@@ -10,7 +10,8 @@
   POST /api/account/test-application 带 X-CSRF-Token；等待页「刷新状态」
   按钮 + 焦点/可见恢复刷新 + 有界轮询（R7 2026-09-19）；401 引导重新登录
   （不解释为审批通过）、503/网络错误保留重试状态；邀请码逻辑保留；
-- register.html：流程说明改为「邮箱验证 → 设置密码并申请测试 → 管理员审核」；
+- _login_dialog.html（R2：注册并入介绍主页弹窗，register.html 已删）：
+  流程说明「验证邮箱并提交申请，管理员审核通过后即可使用」；
 - static/i18n.js：verify.* / activate.* 命名空间新键 zh/en 双语成对。
 
 写法跟随 tests/test_phase1_auth_ui.py：Jinja 直接渲染模板 + 源码子串守卫，
@@ -269,20 +270,41 @@ def test_activate_keeps_invite_code_flow():
 
 
 # =========================================================================== #
-# 3. register.html：注册流程说明
+# 3. 注册弹窗（R2 2026-09-19）：注册流程说明
 # =========================================================================== #
 def test_register_copy_describes_new_flow():
-    text = (REPO_ROOT / "templates" / "register.html").read_text(encoding="utf-8")
-    # 邮箱验证 → 设置密码并申请测试 → 管理员审核后可用
-    assert "设置密码并提交测试申请" in text
-    assert "管理员审核通过后即可使用" in text
-    # 旧「邀请码激活」承诺不再出现在邮箱注册流文案中
-    assert "还需邀请码激活" not in text
-    # 渲染 email_verify 模式确认文案真的展示
-    html = _render("register.html", mode="email_verify", error=None,
-                   csrf_token="c-1")
-    assert "设置密码并提交测试申请" in html
-    assert 'id="email-verify-form"' in html
+    """R2：注册并入介绍主页弹窗（register.html 已删），弹窗文案即流程说明。"""
+    assert not (REPO_ROOT / "templates" / "register.html").exists()
+    text = (REPO_ROOT / "templates" / "_login_dialog.html").read_text(encoding="utf-8")
+    # 首屏核心文案：验证邮箱并提交申请 → 管理员审核通过后即可使用
+    assert "验证邮箱并提交申请，管理员审核通过后即可使用。" in text
+    # 发送后统一文案
+    assert "验证邮件已发送，请查收。" in text
+    # 实现型说明一律删除（模板/邮件/i18n 同步，行为层守卫另有用例）
+    assert "验证邮箱本身不授予" not in text
+    assert "不授予任何工作区" not in text
+    # 注册表单复用既有 POST /register API
+    assert 'action="/register"' in text
+    assert 'id="register-dialog-form"' in text
+    # 渲染 email_verify 模式确认文案真的展示（经介绍主页渲染链）
+    html = _landing_register_html(mode="email_verify")
+    assert "验证邮箱并提交申请，管理员审核通过后即可使用。" in html
+    assert 'id="register-dialog-form"' in html
+    assert 'name="email"' in html
+
+
+def _landing_register_html(mode):
+    """经 _register_landing_page 的模板链渲染（entry.html + _login_dialog.html）。"""
+    with app_mod.app.test_request_context("/"):
+        return render_template(
+            "entry.html",
+            signed_in=False, csrf_token="c-1",
+            login_open=False, login_error=None, login_error_code=None,
+            login_next_url="/app", login_retry_after=0,
+            login_password_changed=False,
+            register_open=True, registration_mode=mode,
+            register_error=None, register_error_code=None,
+            register_done=False, register_retry_after=0)
 
 
 # =========================================================================== #

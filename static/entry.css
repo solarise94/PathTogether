@@ -166,20 +166,6 @@ button:focus-visible {
   background: rgba(255, 255, 255, 0.05);
 }
 .btn-sm { height: 34px; padding: 0 18px; font-size: 13px; }
-.avatar {
-  display: inline-grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  border-radius: 50%;
-  background: #fff;
-  color: #111;
-  font-size: 13px;
-  font-weight: 700;
-  text-decoration: none;
-  letter-spacing: 0;
-}
-.avatar:hover { background: rgba(255, 255, 255, 0.86); color: #111; }
 .logout-form { display: inline-flex; margin: 0; }
 
 /* =========================================================================
@@ -1032,7 +1018,17 @@ body.login-dialog-open { overflow: hidden; }
   border: 1px solid rgba(255, 69, 58, 0.35);
   color: #ff8a80;
 }
-.login-dialog-error #login-dialog-countdown { font-variant-numeric: tabular-nums; }
+.login-dialog-error #login-dialog-countdown,
+.login-dialog-error #register-dialog-countdown { font-variant-numeric: tabular-nums; }
+
+/* 双视图（登录/注册）：一次只显示一个（hidden 属性兜底 display:none） */
+.login-dialog .auth-view[hidden] { display: none; }
+.login-dialog-hint {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
 
 .login-dialog form label {
   display: block;

@@ -151,7 +151,10 @@ def test_csrf_admin_users_post_enforced():
     """POST /api/admin/v1/users（Cookie 会话写端点）纳入 CSRF。
 
     旧 POST /api/admin/users 已 410 退役（review R2-F1），CSRF 探针换到
-    v1 建号端点（同为 Cookie 会话写端点，闸层一致）。"""
+    v1 建号端点（同为 Cookie 会话写端点，闸层一致）。R6（2026-09-19）：
+    v1 建号端点本身也已 410 退役——CSRF 闸仍先于业务（无 token 一律
+    400 csrf_required），带 token 的请求则落在 410 endpoint_retired
+    （再无 200 建号分支）。"""
     app_mod.AUTH_ENABLED = True
     owner, _u = _setup_owner_and_user()
     client = _client()
@@ -163,10 +166,11 @@ def test_csrf_admin_users_post_enforced():
                           json={"login_id": "n@x.com", "password": "password1password1"})
     assert r.status_code == 400
     assert r.get_json()["error"] == "csrf_required"
-    # wrapper 自动带 token → 通过 CSRF（业务 200/400 由参数决定）
+    # wrapper 自动带 token → 通过 CSRF 层，落在退役分支（410，不建用户）
     r2 = client.post("/api/admin/v1/users",
                      json={"login_id": "n@x.com", "password": "password1password1"})
-    assert r2.status_code == 200, r2.get_data(as_text=True)
+    assert r2.status_code == 410, r2.get_data(as_text=True)
+    assert r2.get_json()["error"]["code"] == "endpoint_retired"
 
 def test_csrf_token_bound_to_session():
     """token 与 session 绑定：复制他人 token 到另一 session 无效。"""
@@ -276,13 +280,14 @@ def test_login_success_clears_old_session(monkeypatch):
     "\\\\evil.com", "/\\evil.com", "javascript:alert(1)", "evil.com",
 ])
 def test_login_next_rejects_external(monkeypatch, bad_next):
+    """恶意/非法 next 不外跳：统一回落 /app（R3：普通登录默认进工作台）。"""
     install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
     client = _client()
     r = _login_ok(client, next=bad_next)
     assert r.status_code == 302
-    assert r.headers["Location"] == "/"
+    assert r.headers["Location"] == "/app"
 
 def test_login_next_allows_site_absolute(monkeypatch):
     install_json_login_limits(monkeypatch)
@@ -293,15 +298,39 @@ def test_login_next_allows_site_absolute(monkeypatch):
     assert r.status_code == 302
     assert r.headers["Location"] == "/api/slides"
 
+def test_login_default_next_is_app(monkeypatch):
+    """R3：无 next 的普通用户/owner 登录成功默认到 /app（不再回介绍主页）。"""
+    install_json_login_limits(monkeypatch)
+    app_mod.AUTH_ENABLED = True
+    _setup_owner_and_user()
+    for username, password in (("owner@x.com", "ownerpass123456"),
+                               ("u@x.com", "userpass1234567")):
+        client = _client()
+        r = client.post("/login", data={"username": username,
+                                        "password": password})
+        assert r.status_code == 302
+        assert r.headers["Location"] == "/app"
+
+def test_login_safe_next_preserved(monkeypatch):
+    """R3：有效安全站内 next（如 /admin）登录后正确保留。"""
+    install_json_login_limits(monkeypatch)
+    app_mod.AUTH_ENABLED = True
+    _setup_owner_and_user()
+    client = _client()
+    r = _login_ok(client, next="/admin")
+    assert r.status_code == 302
+    assert r.headers["Location"] == "/admin"
+
 def test_safe_next_path_unit():
     f = app_mod._safe_next_path
     assert f("/ok/path") == "/ok/path"
-    assert f("//host") == "/"
-    assert f("/\\host") == "/"
-    assert f("https://x") == "/"
-    assert f("\\\\host") == "/"
-    assert f("") == "/"
-    assert f(None) == "/"
+    # R3：非法/缺失 next 回落 /app（普通登录默认目的地 = 工作台）
+    assert f("//host") == "/app"
+    assert f("/\\host") == "/app"
+    assert f("https://x") == "/app"
+    assert f("\\\\host") == "/app"
+    assert f("") == "/app"
+    assert f(None) == "/app"
 
 # =========================================================================== #
 # 4. 跨 worker 登录锁定
@@ -418,7 +447,8 @@ def test_index_entry_landing_page_content(monkeypatch):
     assert 'id="capabilities"' in body
     assert 'id="suite"' in body
     # 中文默认文案（测试锁定，勿改写）
-    assert body.count('href="/login"') == 1
+    # href="/login"：顶栏登录 + 注册视图「已有账号？登录」（R2 统一弹窗）
+    assert body.count('href="/login"') == 2
     assert 'href="#principle"' not in body
     assert "Demo 无需登录，可查看示例切片并体验 AI 导航" in body
     assert "不用于临床诊断" not in body
@@ -506,7 +536,8 @@ def test_entry_landing_source_guards():
     assert ".login-dialog::backdrop" in css
     auth_js = (REPO_ROOT / "static" / "entry-auth.js").read_text(encoding="utf-8")
     assert "showModal" in auth_js
-    assert "login-dialog-countdown" in auth_js
+    # R2：倒计时泛化为 [data-retry-seconds]（登录/注册视图通用）
+    assert "data-retry-seconds" in auth_js
     assert "受控 Demo" not in html
     # i18n 新键 zh/en 双语成对存在（histopilot-com-landing-page.md §4）
     new_keys = (
@@ -550,7 +581,11 @@ def test_entry_landing_source_guards():
         assert text in zh_block
 
 def test_index_authenticated_stays_on_landing(monkeypatch):
-    """已登录访问 / 仍是介绍主页：头像 + 进入工作台，不进 Viewer。"""
+    """已登录访问 / 仍是介绍主页：「进入工作台」链接，不进 Viewer。
+
+    R3：首页不再渲染无用途的头像字母圆圈（avatar_letter 已随消费者删除）；
+    「进入工作台」承担身份入口（主动回访可直达工作台）。
+    """
     install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
@@ -562,9 +597,21 @@ def test_index_authenticated_stays_on_landing(monkeypatch):
     assert 'id="viewer"' not in body
     assert "进入工作台" in body
     assert body.count('href="/app"') == 1
-    assert '<span class="avatar"' in body
-    assert 'class="avatar"' in body
+    # R3：无头像圆圈（模板与服务端变量均已删除）
+    assert 'class="avatar"' not in body
+    assert "avatar_letter" not in body
     assert "登录测试与协作" not in body
+
+
+def test_entry_avatar_letter_removed_everywhere():
+    """R3：_entry_avatar_letter 与模板/样式中的 avatar 消费者已物理删除。"""
+    app_src = (REPO_ROOT / "app.py").read_text(encoding="utf-8")
+    assert "_entry_avatar_letter" not in app_src
+    assert "avatar_letter" not in app_src
+    entry_html = (REPO_ROOT / "templates" / "entry.html").read_text(encoding="utf-8")
+    assert "avatar" not in entry_html.lower()
+    entry_css = (REPO_ROOT / "static" / "entry.css").read_text(encoding="utf-8")
+    assert ".avatar" not in entry_css
 
 
 def test_workbench_requires_login_and_renders_app(monkeypatch):
@@ -595,7 +642,7 @@ def test_index_auth_disabled_keeps_current_behavior():
     assert "直接体验 Demo" not in body
 
 def test_login_get_redirects_when_authenticated(monkeypatch):
-    """已登录访问 /login：302 到安全 next 或 /（docs §3.1）。"""
+    """已登录访问 /login：302 到安全 next 或 /app（docs §3.1 + R3 默认工作台）。"""
     install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
@@ -603,10 +650,10 @@ def test_login_get_redirects_when_authenticated(monkeypatch):
     _login_ok(client)
     r = client.get("/login")
     assert r.status_code == 302
-    assert r.headers["Location"] == "/"
-    # 外部 next 仍拒绝
+    assert r.headers["Location"] == "/app"
+    # 外部 next 仍拒绝（回落 /app，不外跳）
     r2 = client.get("/login?next=//evil.com")
-    assert r2.headers["Location"] == "/"
+    assert r2.headers["Location"] == "/app"
 
 def test_login_get_renders_entry_with_open_dialog(monkeypatch):
     """GET /login 复用介绍页模板：entry.html + 直出已打开的登录弹窗。
@@ -628,15 +675,34 @@ def test_login_get_renders_entry_with_open_dialog(monkeypatch):
     assert 'id="login-dialog-form"' in body
     assert 'name="csrf_token"' in body
     assert 'name="next"' in body
+    # R3：弹窗隐藏 next 默认 /app（无 next 的登录直接进工作台）
+    assert 'value="/app" name="next"' in body or \
+        'name="next" value="/app"' in body
+    # R2：登录视图激活、注册视图收起
+    assert _pane_hidden(body, "login-view") is False
+    assert _pane_hidden(body, "register-view") is True
     # 本人改密成功后跳 /login?password_changed=1：弹窗内提示（docs §7.1-7）
     r2 = client.get("/login?password_changed=1")
     assert r2.status_code == 200
     assert "密码已修改，请使用新密码重新登录" in r2.get_data(as_text=True)
 
 # =========================================================================== #
-# 6. /register 关闭态
+# 6. /register 深链接 = 介绍主页 + 注册弹窗（R2 2026-09-19）
 # =========================================================================== #
+def _pane_hidden(body, pane_id):
+    """取指定 auth-view 面板标签；返回其是否带 hidden（找不到返回 None）。"""
+    m = re.search(r'<div class="auth-view" id="%s"[^>]*>' % pane_id, body)
+    if not m:
+        return None
+    return "hidden" in m.group(0)
+
+
 def test_register_get_closed_state_page():
+    """closed：GET /register 渲染介绍主页并直开注册视图（关闭态说明）。
+
+    无可提交的注册表单（invite_token/email 字段都不存在），登录表单仍在
+    （注册视图切换回登录后可用）；POST 一律 403（下方独立用例）。
+    """
     app_mod.AUTH_ENABLED = True
     client = _client()
     r = client.get("/register")
@@ -645,8 +711,15 @@ def test_register_get_closed_state_page():
     assert "当前采用邀请注册" in body
     assert 'href="/login"' in body
     assert 'href="/demo"' in body
-    # 不是 404、没有可提交的注册表单
-    assert "<form" not in body
+    # 弹窗直开且注册视图激活（登录视图收起）
+    tag = _dialog_tag(body)
+    assert tag and re.search(r"\bopen\b", tag)
+    assert _pane_hidden(body, "register-view") is False
+    assert _pane_hidden(body, "login-view") is True
+    # 无可提交的注册表单（登录表单除外）
+    assert 'name="invite_token"' not in body
+    assert 'name="email"' not in body
+
 
 def test_register_post_always_rejected_phase1():
     app_mod.AUTH_ENABLED = True
@@ -660,6 +733,59 @@ def test_register_post_always_rejected_phase1():
         "login_id": "n@x.com", "password": "password1password1"},
         headers={"X-Registration-Open": "1"})
     assert r2.status_code == 403
+
+
+def test_login_dialog_register_view_template_requirements():
+    """R2 模板守卫：登录/注册共享同一弹窗与视觉框架。
+
+    - 「没有账号？注册」直接指向 /register（entry-auth.js 拦截原地切换视图，
+      无 JS 时退化为深链接导航，仍渲染首页 + 注册弹窗）；
+    - 双视图 data-auth-pane + hidden 直出对应视图；aria-labelledby 随视图；
+    - 登录表单 next 默认 /app（R3）；注册表单 POST 同一 /register API；
+    - 旧「查看注册方式」与实现型说明文案不再出现。
+    """
+    text = (REPO_ROOT / "templates" / "_login_dialog.html").read_text(encoding="utf-8")
+    assert "查看注册方式" not in text
+    assert 'data-i18n="login.register">没有账号？注册</a>' in text
+    # 双视图结构 + 服务端直开
+    assert 'id="login-view" data-auth-pane="login"' in text
+    assert 'id="register-view" data-auth-pane="register"' in text
+    assert "{% if login_open or register_open %} open{% endif %}" in text
+    assert "{% if not register_open %} hidden{% endif %}" in text
+    # 注册视图核心文案（R2 简明口径）
+    assert "验证邮箱并提交申请，管理员审核通过后即可使用。" in text
+    assert "验证邮件已发送，请查收。" in text
+    assert "验证邮箱本身不授予" not in text
+    assert "不授予任何工作区" not in text
+    # 注册表单复用既有 API（POST /register + CSRF），不是新后端
+    assert 'action="/register"' in text
+    assert text.count('name="csrf_token"') >= 2  # 登录 + 注册表单各一
+    # 登录安全 next 默认 /app（R3）
+    assert 'value="{{ login_next_url or \'/app\' }}"' in text
+    # 保留密码设置与显示名输入（invite_only 形态）；分享选择只在验证页
+    assert 'name="password"' in text and 'name="password_confirm"' in text
+    assert 'autocomplete="new-password"' in text
+    assert 'name="display_name"' in text
+
+
+def test_entry_auth_js_register_switch_and_dialog_discipline():
+    """R2 JS 守卫：视图切换、单弹窗纪律、焦点/滚动锁与双击防护。"""
+    js = (REPO_ROOT / "static" / "entry-auth.js").read_text(encoding="utf-8")
+    # 拦截 /login 与 /register 站内链接，原地切换对应视图
+    assert 'a[href="/login"], a[href^="/login?"]' in js
+    assert 'a[href="/register"], a[href^="/register?"]' in js
+    assert "data-auth-pane" in js
+    # 一次只打开一个弹窗（同一 dialog 内切视图）；焦点恢复 + 滚动锁
+    assert "showModal" in js
+    assert "login-dialog-open" in js
+    assert "opener.focus" in js
+    # ESC / 背景点击 / 关闭按钮
+    assert "cancel" in js and 'ev.target === dialog' in js
+    assert "[data-login-close]" in js
+    # aria-labelledby 跟随当前视图 + 双击防护 + 倒计时泛化（登录/注册）
+    assert "aria-labelledby" in js
+    assert "dataset.submitting" in js
+    assert "[data-retry-seconds]" in js
 
 def test_registration_mode_reads_settings_store(monkeypatch):
     """v1 settings 聚合 registration 段的 mode 来自 settings_store（PG 权威）。"""
@@ -713,15 +839,51 @@ def test_i18n_no_admin_only_wording_left():
     for banned in ("管理员登录", "请输入管理员账号", "Admin Login",
                    "Enter admin credentials", "AI 读片助手（管理员）",
                    "AI reading assistant (admin)", "AI 服务配置",
-                   "AI service config"):
+                   "AI service config",
+                   # R2：旧注册入口提示（「查看注册方式」→「注册」）
+                   "查看注册方式", "See registration options",
+                   # R2：实现型说明文案一律删除（模板/邮件同步）
+                   "验证邮箱本身不授予", "不会授予任何工作区"):
         assert banned not in text, "i18n.js 仍含旧措辞：%r" % banned
     for required in ("登录 HistoPilot", "Log in to HistoPilot",
                      "登录后继续查看、测试 AI 和协作",
                      "AI 导航助手", "AI navigation assistant",
                      "平台 AI 配置", "AI 服务（平台统一提供）",
                      "Platform AI config", "AI service (platform-provided)",
-                     "只能分享你拥有的切片", "允许标注", "允许下载"):
+                     "只能分享你拥有的切片", "允许标注", "允许下载",
+                     # R2 新口径
+                     "没有账号？注册", "No account? Sign up"):
         assert required in text, "i18n.js 缺新文案：%r" % required
+
+
+def test_i18n_register_dialog_keys_bilingual():
+    """R2：注册弹窗新键 zh/en 成对存在（无单语键）。"""
+    i18n = (REPO_ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
+    zh_block = i18n[i18n.index("zh: {"):i18n.index("en: {")]
+    en_block = i18n[i18n.index("en: {"):]
+    keys = (
+        "login.register",
+        "register.title", "register.desc",
+        "register.dialog.title", "register.dialog.subtitle",
+        "register.dialog.email", "register.dialog.email.ph",
+        "register.dialog.email.hint", "register.dialog.submit",
+        "register.dialog.submitting", "register.dialog.sent.title",
+        "register.dialog.sent", "register.dialog.sent.hint",
+        "register.dialog.again", "register.dialog.have_account",
+        "register.invite.code", "register.invite.code.ph",
+        "register.invite.email", "register.invite.email.ph",
+        "register.invite.display", "register.invite.display.ph",
+        "register.invite.password", "register.invite.password.ph",
+        "register.invite.password.hint", "register.invite.confirm",
+        "register.invite.submit", "register.invite.submitting",
+    )
+    for key in keys:
+        assert '"%s"' % key in zh_block, "i18n.js zh 缺键：%r" % key
+        assert '"%s"' % key in en_block, "i18n.js en 缺键：%r" % key
+    # R2 核心文案（zh 默认 + en 对应）
+    assert "验证邮箱并提交申请，管理员审核通过后即可使用。" in zh_block
+    assert "验证邮件已发送，请查收。" in zh_block
+    assert "Verification email sent. Please check your inbox." in en_block
 
 def test_login_dialog_template_phase1_requirements():
     """登录并入主页弹窗（_login_dialog.html）后的 Phase 1 语义守卫。

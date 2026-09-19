@@ -336,7 +336,9 @@
       "login.password": "密码",
       "login.submit": "登录",
       "login.submitting": "登录中…",
-      "login.register": "没有账号？查看注册方式",
+      // R2（2026-09-19）：注册入口直达注册表单（统一弹窗），旧的
+      // 「注册方式」入口提示已下线
+      "login.register": "没有账号？注册",
       "login.demo": "先体验 Demo",
       "login.forgot": "忘记密码？请联系管理员重置。",
       "login.error.invalid": "账号或密码错误",
@@ -431,22 +433,41 @@
       "entry.cta.body": "Demo 是展示入口，无需账号即可查看示例切片。需要上传、标注、协作或部署自己的分析插件时再登录。",
       "entry.footer.copy": "© 2026 HistoPilot",
 
-      // ---- 注册关闭态（docs §7.1） ----
+      // ---- 注册弹窗（R2 2026-09-19：统一登录/注册弹窗；独立 register 页已删） ----
+      // 关闭态（含 fail-closed 降级）：无可提交表单，仅说明
       "register.badge": "邀请注册",
       "register.title": "当前采用邀请注册",
       "register.desc": "测试账号由管理员创建。如果你已收到账号，请直接登录。",
       "register.back": "返回登录",
       "register.demo": "先体验 Demo",
-      // 注册表单密码口径（账户系统批次 A：统一 15..200，docs §3.3）
-      "register.invite.password.ph": "至少 15 位，推荐使用密码管理器生成的长口令",
-      "register.invite.password.hint": "至少 15 位，可直接使用密码管理器生成并粘贴；不要求大小写或符号组合。",
-      // 注册表单账号口径（账户系统批次 C：登录账号 login_id，docs §8.2；
-      // 表单 login_id 字段为邀请绑定的登录账号，显示名仅展示不用于登录；
-      // key 名 register.invite.email 为不透明标识符，保持不动）
-      "register.invite.email": "登录账号",
+      // 弹窗注册视图通用
+      "register.dialog.title": "注册 HistoPilot",
+      "register.dialog.subtitle": "验证邮箱并提交申请，管理员审核通过后即可使用。",
+      "register.dialog.email": "邮箱地址",
+      "register.dialog.email.ph": "you@example.com",
+      "register.dialog.email.hint": "验证成功后，该邮箱将作为你的登录账号。",
+      "register.dialog.submit": "发送验证邮件",
+      "register.dialog.submitting": "发送中…",
+      "register.dialog.sent.title": "请查收验证邮件",
+      "register.dialog.sent": "验证邮件已发送，请查收。",
+      "register.dialog.sent.hint": "请在 30 分钟内点击邮件中的链接完成验证；未收到可稍后重试或检查垃圾邮件。",
+      "register.dialog.again": "重新填写邮箱",
+      "register.dialog.have_account": "已有账号？登录",
+      // 邀请码注册表单（密码口径：账户系统批次 A 统一 15..200，docs §3.3；
+      // 登录账号 login_id 为邀请绑定的登录账号，批次 C docs §8.2；显示名仅
+      // 展示不用于登录；key 名 register.invite.email 为不透明标识符，保持不动）
+      "register.invite.code": "邀请码",
+      "register.invite.code.ph": "粘贴管理员发送的邀请码",
+      "register.invite.email": "登录账号（邮箱）",
       "register.invite.email.ph": "邀请码绑定的登录账号",
       "register.invite.display": "显示名（可选，仅展示）",
-      "register.invite.display.ph": "其他人看到的名字（不用于登录）",
+      "register.invite.display.ph": "其他人看到的名字（不用于登录，也不作为身份）",
+      "register.invite.password": "设置密码",
+      "register.invite.password.ph": "至少 15 位，推荐使用密码管理器生成的长口令",
+      "register.invite.password.hint": "至少 15 位，可直接使用密码管理器生成并粘贴；不要求大小写或符号组合。",
+      "register.invite.confirm": "确认密码",
+      "register.invite.submit": "创建账号",
+      "register.invite.submitting": "创建中…",
 
       // ---- Demo 页（Phase 2 只读 Viewer） ----
       "demo.title": "Demo 体验",
@@ -454,7 +475,7 @@
       "demo.requires.pg": "当前部署未满足公开 Demo 的前置条件（需要 PostgreSQL 后端），Demo 暂不可用。",
       "demo.closed": "公开 Demo 当前未开放。登录后可继续使用，或稍后再来。",
       "demo.login": "登录 HistoPilot",
-      "demo.register": "注册方式",
+      "demo.register": "注册",
       "demo.open.full": "打开完整版",
       "demo.home": "返回首页",
       "demo.badge": "Demo 只读体验",
@@ -1342,7 +1363,9 @@
       "login.password": "Password",
       "login.submit": "Log in",
       "login.submitting": "Logging in…",
-      "login.register": "No account? See registration options",
+      // R2 (2026-09-19): the register entry opens the sign-up form directly
+      // (unified dialog); the old registration-options hint is retired
+      "login.register": "No account? Sign up",
       "login.demo": "Try the Demo first",
       "login.forgot": "Forgot your password? Contact an administrator to reset it.",
       "login.error.invalid": "Incorrect account or password",
@@ -1437,22 +1460,43 @@
       "entry.cta.body": "The Demo is a showcase: no account needed to view sample slides. Log in when you need upload, annotation, collaboration, or to deploy your own analysis plugins.",
       "entry.footer.copy": "© 2026 HistoPilot",
 
-      // ---- 注册关闭态（docs §7.1） ----
+      // ---- Register dialog (R2 2026-09-19: unified login/register dialog;
+      //      the standalone register page has been removed) ----
+      // Closed state (incl. fail-closed downgrade): no submittable form, notice only
       "register.badge": "Invite-only",
       "register.title": "Registration is currently invite-only",
       "register.desc": "Test accounts are created by the administrator. If you already received an account, just log in.",
       "register.back": "Back to login",
       "register.demo": "Try the Demo first",
-      // Register form password policy (account batch A: unified 15..200, docs §3.3)
-      "register.invite.password.ph": "At least 15 characters; a long passphrase from a password manager is recommended",
-      "register.invite.password.hint": "At least 15 characters. Paste from a password manager is fine; no character-class requirements.",
-      // Register form account fields (account batch B: login ID, docs §8.2; the
-      // login_id form field means the invite-bound login ID; display name is
-      // display-only and never used for login)
-      "register.invite.email": "Login ID",
+      // Dialog register view (shared)
+      "register.dialog.title": "Sign up for HistoPilot",
+      "register.dialog.subtitle": "Verify your email and submit an application — you can start once an administrator approves it.",
+      "register.dialog.email": "Email address",
+      "register.dialog.email.ph": "you@example.com",
+      "register.dialog.email.hint": "After verification, this email address becomes your login name.",
+      "register.dialog.submit": "Send verification email",
+      "register.dialog.submitting": "Sending…",
+      "register.dialog.sent.title": "Check your inbox",
+      "register.dialog.sent": "Verification email sent. Please check your inbox.",
+      "register.dialog.sent.hint": "Open the link in the email within 30 minutes to finish verification. Didn't get it? Try again later or check your spam folder.",
+      "register.dialog.again": "Re-enter email",
+      "register.dialog.have_account": "Already have an account? Log in",
+      // Invite-code registration form (password policy: account batch A unified
+      // 15..200, docs §3.3; login_id form field means the invite-bound login ID,
+      // batch C docs §8.2; display name is display-only and never used for login;
+      // key name register.invite.email stays as an opaque identifier)
+      "register.invite.code": "Invite code",
+      "register.invite.code.ph": "Paste the invite code from the administrator",
+      "register.invite.email": "Login ID (email)",
       "register.invite.email.ph": "Login ID bound to the invite",
       "register.invite.display": "Display name (optional, display only)",
-      "register.invite.display.ph": "Name shown to others (not used for login)",
+      "register.invite.display.ph": "Name shown to others (not used for login, not an identity)",
+      "register.invite.password": "Set password",
+      "register.invite.password.ph": "At least 15 characters; a long passphrase from a password manager is recommended",
+      "register.invite.password.hint": "At least 15 characters. Paste from a password manager is fine; no character-class requirements.",
+      "register.invite.confirm": "Confirm password",
+      "register.invite.submit": "Create account",
+      "register.invite.submitting": "Creating…",
 
       // ---- Demo page (Phase 2 read-only viewer) ----
       "demo.title": "Demo",
@@ -1460,7 +1504,7 @@
       "demo.requires.pg": "This deployment does not meet the prerequisites for the public Demo (PostgreSQL backend required); the Demo is unavailable.",
       "demo.closed": "The public Demo is currently closed. Log in to continue, or check back later.",
       "demo.login": "Log in to HistoPilot",
-      "demo.register": "Registration",
+      "demo.register": "Sign up",
       "demo.open.full": "Open full version",
       "demo.home": "Back to home",
       "demo.badge": "Read-only demo",

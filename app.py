@@ -1536,15 +1536,16 @@ def _safe_next_path(candidate) -> str:
     """登录 next 白名单校验：只允许站内绝对路径。
 
     拒绝协议 URL（https://…）、`//host`（scheme-relative）与 ``\\\\host``（反斜杠
-    变体，部分浏览器把 /\\ 解释为协议分隔）；不合法一律回 `/`（docs §6.3）。
+    变体，部分浏览器把 /\\ 解释为协议分隔）；不合法一律回落 `/app`——普通登录
+    成功的默认目的地是工作台（R3 2026-09-19），不再回介绍主页（docs §6.3）。
     """
     if not isinstance(candidate, str):
-        return "/"
+        return "/app"
     p = candidate.strip()
     if not p.startswith("/") or p.startswith("//") or p.startswith("/\\"):
-        return "/"
+        return "/app"
     if "\\" in p[:2]:
-        return "/"
+        return "/app"
     return p
 
 # Deep Zoom 参数（512 瓦片降低公网请求数，渐进式 q82 JPEG 降体积并支持模糊→清晰预览）
@@ -2663,42 +2664,43 @@ def _apply_landing_security_headers(resp):
     return resp
 
 
-def _entry_avatar_letter(name: str) -> str:
-    """头像字母：取展示名首字；ASCII 则大写。"""
-    ch = (name or "").strip()[:1]
-    if not ch:
-        return "?"
-    return ch.upper() if ("A" <= ch <= "Z" or "a" <= ch <= "z") else ch
+def _registration_dialog_mode() -> str:
+    """注册弹窗视图模式（模板层简化命名）：
+
+    - email_verify_invite_activation → "email_verify"（首屏只填邮箱）；
+    - invite_only → "invite_only"（邀请码表单）；
+    - closed / public → "closed"（无可提交表单；public 由 /register 路由 503）。
+    服务端权威策略（_effective_registration_mode 的 fail-closed 前置闸）不变，
+    弹窗只是按同一权威值渲染对应表单，不提供任何绕过。
+    """
+    mode = _effective_registration_mode()
+    if mode == "email_verify_invite_activation":
+        return "email_verify"
+    if mode == "invite_only":
+        return "invite_only"
+    return "closed"
 
 
 def _entry_signed_in_context():
-    """介绍页已登录态：展示名 + 头像字母。查找失败仍视为已登录，回退 session 身份。"""
-    if not (AUTH_ENABLED and session.get("auth_user")):
-        return {"signed_in": False, "display_name": "", "avatar_letter": "",
-                "csrf_token": ensure_csrf_token(), "login_open": False,
-                "login_error": None, "login_error_code": None,
-                "login_next_url": "/", "login_retry_after": 0,
-                "login_password_changed": False}
-    uid = session.get("user_id")
-    user = None
-    if uid:
-        try:
-            user = user_store.get_user(uid)
-        except Exception:
-            user = None
-    name = ""
-    if isinstance(user, dict):
-        name = (user.get("display_name") or user.get("login_id")
-                or user.get("email_normalized") or user.get("email") or "")
-    name = str(name or session.get("auth_user") or "").strip()
+    """介绍页登录态 + 登录/注册弹窗上下文（entry.html + _login_dialog.html）。
+
+    R3（2026-09-19）：删除首页无用途的头像字母/展示名（entry.html 不再渲染
+    avatar 圆圈，用户查找随之移除；登录后「进入工作台」链接承担身份入口）。
+    登录默认 next 统一为 /app（普通登录成功直接进工作台）。
+    """
+    signed_in = bool(AUTH_ENABLED and session.get("auth_user"))
     return {
-        "signed_in": True,
-        "display_name": name,
-        "avatar_letter": _entry_avatar_letter(name),
+        "signed_in": signed_in,
         "csrf_token": ensure_csrf_token(),
         "login_open": False, "login_error": None, "login_error_code": None,
-        "login_next_url": "/", "login_retry_after": 0,
+        "login_next_url": "/app", "login_retry_after": 0,
         "login_password_changed": False,
+        # 注册弹窗（R2）：/register 深链接与注册错误回显经 _register_landing_page
+        # 覆写 register_open/register_error 等；介绍页默认收起注册视图。
+        "register_open": False,
+        "registration_mode": _registration_dialog_mode(),
+        "register_error": None, "register_error_code": None,
+        "register_done": False, "register_retry_after": 0,
     }
 
 
@@ -3397,12 +3399,13 @@ class _PtSessionInterface(SecureCookieSessionInterface):
 app.session_interface = _PtSessionInterface()
 
 
-def _login_page(error=None, error_code=None, next_url="/", retry_after=0,
+def _login_page(error=None, error_code=None, next_url="/app", retry_after=0,
                 status=200, headers=None, password_changed=False):
     """渲染登录页（统一携带 CSRF token 与服务端权威 retry_after）。
 
     password_changed=True 时渲染「密码已修改，请使用新密码重新登录」提示
     （本人改密成功后前端跳 /login?password_changed=1，docs §7.1-7）。
+    next_url 默认 /app：无安全 next 的普通登录成功直接进工作台（R3）。
     """
     ctx = _entry_signed_in_context()
     ctx.update(login_open=True, login_error=error,
@@ -3420,7 +3423,7 @@ def _login_page(error=None, error_code=None, next_url="/", retry_after=0,
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    """登录页。GET 渲染（已登录则 302 到安全 next 或 /）；POST 校验并写 session。
+    """登录页。GET 渲染（已登录则 302 到安全 next 或 /app）；POST 校验并写 session。
 
     - 只认登录账号 login_id（账户系统批次 B，docs §6.1）：表单输入先
       strip().lower() 规范化，**规范化后的值**同时用于登录防爆破主体
@@ -3431,18 +3434,19 @@ def login():
       429 + Retry-After + 服务端权威倒计时；成功登录只清该主体两桶；
     - json/dual 后端无权威存储：POST 503 保守拒绝（不退化为内存计数）；
     - 登录成功先 session.clear() 再写新身份（防 fixation），并轮换 CSRF token；
-    - next 只允许站内绝对路径（_safe_next_path：拒绝 //host、协议与 \\\\host）；
+    - next 只允许站内绝对路径（_safe_next_path：拒绝 //host、协议与 \\\\host），
+      无 next/非法 next 默认 /app（R3：普通登录直接进工作台）；
     - 失败统一「账号或密码错误」，不泄露账号是否存在。
     """
     if not AUTH_ENABLED:
         # 未启用认证：直接回首页
         return redirect("/")
 
-    next_url = _safe_next_path(request.args.get("next") or "/")
+    next_url = _safe_next_path(request.args.get("next") or "/app")
 
     if request.method == "GET":
         if session.get("auth_user"):
-            # 已登录访问登录页：302 到安全 next 或 /（docs §3.1）
+            # 已登录访问登录页：302 到安全 next 或 /app（docs §3.1 + R3）
             return redirect(next_url)
         return _login_page(
             next_url=next_url,
@@ -3954,22 +3958,23 @@ def acquisition_redirect(source_code):
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
-    """注册页（registration_mode = closed | invite_only |
-    email_verify_invite_activation | public，P0-B §4.1 + I 线设计文档第 8 节）。
+    """注册弹窗页（registration_mode = closed | invite_only |
+    email_verify_invite_activation | public，P0-B §4.1 + I 线设计文档第 8 节；
+    R2 2026-09-19：并入介绍主页弹窗，register.html 独立页已删除）。
 
-    - closed：GET 渲染关闭态页（不 404、无可提交表单），POST 一律 403；
-    - invite_only：GET 渲染邀请码/登录账号/显示名/密码表单（统一密码策略
+    - GET（任意模式）：渲染介绍主页并直开注册视图（深链接可用）；
+      closed：注册视图为关闭态说明（无可提交表单），POST 一律 403；
+    - invite_only：注册视图渲染邀请码/登录账号/显示名/密码表单（统一密码策略
       15..200 位、允许密码管理器 paste），POST 走 registration_store 原子
-      兑换（表单 login_id 字段为登录账号，批次 C docs §8.2；批次 B 的 email
-      字段名已随物理收口删除）；成功**不自动登录**——清理匿名 session、
-      轮换 CSRF 后 302 /login；
-    - email_verify_invite_activation（I 线）：注册页**先填邮箱**请求验证
-      邮件（不填邀请码、不发额度；文案写明「验证邮箱后还需邀请码激活」）。
-      POST 同事务入队 registration_mail_jobs（配额：同邮箱 60s 冷却、时 3、
-      日 5，应用日预算 40）；对已存在/未知邮箱/超限一律**同一文案**（无枚举
-      信号）。验证邮件含一次性链接 → GET /verify-email 只展示 →
-      POST /api/registration/verify 消费 token 并原子建 pending_activation
-      用户（密码在邮箱确认之后设置）；
+      兑换（表单 login_id 字段为登录账号，批次 C docs §8.2）；成功**不自动
+      登录**——清理匿名 session、轮换 CSRF 后 302 /login；
+    - email_verify_invite_activation（I 线）：注册视图**先填邮箱**请求验证
+      邮件（不填邀请码、不发额度；首屏文案「验证邮箱并提交申请，管理员审核
+      通过后即可使用」）。POST 同事务入队 registration_mail_jobs（配额：同
+      邮箱 60s 冷却、时 3、日 5，应用日预算 40）；对已存在/未知邮箱/超限一律
+      **同一文案**（无枚举信号）。验证邮件含一次性链接 → GET /verify-email
+      只展示 → POST /api/registration/verify 消费 token 并原子建
+      pending_activation 用户（密码在邮箱确认之后设置）；
     - public：本阶段不支持，GET/POST 均 503 public_registration_not_supported
       （无 public 回退路径）；
     - 模式权威值还受 fail-closed 前置闸（_effective_registration_mode：非
@@ -3990,22 +3995,14 @@ def register():
                 503)
 
     if request.method == "GET":
+        # R2（2026-09-19）：/register 深链接 = 渲染介绍主页 + 直开注册弹窗；
+        # 邮箱验证链接（/verify-email）、token 校验与过期/重复使用错误仍由
+        # 独立页面承担，不为弹窗破坏验证链。
         if mode == "invite_only":
-            resp = Response(render_template(
-                "register.html", mode="invite_only",
-                csrf_token=ensure_csrf_token(), error=None, error_code=None),
-                200)
-            resp.headers["Cache-Control"] = "no-store"
-            return resp
+            return _register_landing_page(mode="invite_only")
         if mode == "email_verify_invite_activation":
-            resp = Response(render_template(
-                "register.html", mode="email_verify",
-                csrf_token=ensure_csrf_token(), error=None, error_code=None),
-                200)
-            resp.headers["Cache-Control"] = "no-store"
-            return resp
-        return render_template("register.html", mode="closed",
-                               registration_open=False)
+            return _register_landing_page(mode="email_verify")
+        return _register_landing_page(mode="closed")
 
     # ---- POST ----
     if mode == "closed":
@@ -4028,16 +4025,12 @@ def register():
         app.logger.exception("注册限流存储不可用，fail-closed 503")
         return _registration_unavailable_response()
     if retry > 0:
-        resp = Response(render_template(
-            "register.html",
+        return _register_landing_page(
             mode=("email_verify" if mode == "email_verify_invite_activation"
                   else "invite_only"),
-            csrf_token=ensure_csrf_token(),
             error="尝试过于频繁，请稍后再试", error_code="locked",
-            retry_after=int(retry)), 429)
-        resp.headers["Retry-After"] = str(max(1, int(retry)))
-        resp.headers["Cache-Control"] = "no-store"
-        return resp
+            retry_after=int(retry), status=429,
+            headers={"Retry-After": str(max(1, int(retry)))})
 
     if mode == "email_verify_invite_activation":
         return _register_email_verify_post(ip_hash)
@@ -4124,10 +4117,7 @@ def _register_email_verify_post(ip_hash):
     # P1-2：写前重查（防御层；register() 顶部已查过一次，此处紧贴写路径）
     if _effective_registration_mode() != \
             registration_store.MODE_EMAIL_VERIFY_INVITE_ACTIVATION:
-        resp = Response(render_template(
-            "register.html", mode="closed", registration_open=False), 403)
-        resp.headers["Cache-Control"] = "no-store"
-        return resp
+        return _register_landing_page(mode="closed", status=403)
     email = (request.form.get("email") or "").strip()
     try:
         registration_store.enqueue_email_verification(
@@ -4151,22 +4141,44 @@ def _register_email_verify_post(ip_hash):
     return _register_email_verify_done_page()
 
 
-def _register_email_verify_done_page():
-    """邮箱验证请求的统一完成页（已知/未知/超限同文案，no-store）。"""
-    resp = Response(render_template(
-        "register.html", mode="email_verify_done",
-        csrf_token=ensure_csrf_token(), error=None, error_code=None), 200)
-    resp.headers["Cache-Control"] = "no-store"
+def _register_landing_page(mode, error=None, error_code=None, done=False,
+                           retry_after=0, status=200, headers=None):
+    """注册弹窗页（R2 2026-09-19）：渲染介绍主页 + 直开注册视图。
+
+    - /register 深链接：介绍主页上下文 + register_open=True（entry-auth.js
+      升级为模态；无 JS 时 CSS 浮层直出）；
+    - 注册错误回显（表单错误 / 429 限流）：同一页面直开注册视图并保留错误，
+      与登录弹窗的 login_open/login_error 模式对称；
+    - 统一 no-store + 介绍页安全响应头（与 _landing_response 同口径）。
+    """
+    ctx = _entry_signed_in_context()
+    ctx.update(register_open=True, registration_mode=mode,
+               register_error=error, register_error_code=error_code,
+               register_done=bool(done), register_retry_after=int(retry_after or 0))
+    resp = make_response(render_template("entry.html", **ctx), status)
+    resp = _apply_landing_security_headers(resp)
+    if headers:
+        for k, v in headers.items():
+            resp.headers[k] = v
     return resp
+
+
+def _register_email_verify_done_page():
+    """邮箱验证请求的统一完成视图（已知/未知/超限同文案，no-store）。
+
+    R2：发送后文案统一「验证邮件已发送，请查收。」；仍在注册弹窗内展示，
+    不再跳独立完成页。
+    """
+    return _register_landing_page(mode="email_verify", done=True)
 
 
 def _register_form_error(message, error_code, status=200, mode="invite_only"):
-    """渲染注册表单错误（统一文案；不回显邀请码；no-store）。"""
-    resp = Response(render_template(
-        "register.html", mode=mode, csrf_token=ensure_csrf_token(),
-        error=message, error_code=error_code), status)
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
+    """渲染注册表单错误（统一文案；不回显邀请码；no-store）。
+
+    R2：错误在介绍主页 + 注册弹窗内回显（不再跳独立注册页）。
+    """
+    return _register_landing_page(mode=mode, error=message,
+                                  error_code=error_code, status=status)
 
 
 def _registration_unavailable_response():

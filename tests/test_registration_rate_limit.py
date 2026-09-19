@@ -185,6 +185,11 @@ def test_register_ip_short_window_429(monkeypatch):
         "password": "longpassword123", "password_confirm": "longpassword123"})
     assert r11.status_code == 429
     assert int(r11.headers.get("Retry-After") or 0) > 0
+    # R2：429 仍在介绍主页 + 注册弹窗内回显（服务端权威倒计时挂点）
+    body429 = r11.get_data(as_text=True)
+    assert "尝试过于频繁" in body429
+    assert "data-retry-seconds" in body429
+    assert 'id="register-view" data-auth-pane="register">' in body429
     # 锁定期内即使表单形状错误也直接 429（闸在表单校验之前）
     r12 = client.post("/register", data={"invite_token": ""})
     assert r12.status_code == 429

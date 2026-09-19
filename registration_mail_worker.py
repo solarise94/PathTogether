@@ -170,6 +170,10 @@ def build_verify_email_body(email, token, base_url):
 
     链接 = ``<base_url>/verify-email?token=<明文 token>``；GET /verify-email
     只展示不消费（消费在 POST /api/registration/verify）。
+
+    R2（2026-09-19）文案同步：与注册弹窗同一口径——「验证邮箱并提交申请，
+    管理员审核通过后即可使用」；删除「验证邮箱本身不会授予任何工作区、AI 或
+    额度权限」等实现型说明；保留邀请码直接激活的替代路径提示。
     """
     base = str(base_url or "").strip().rstrip("/")
     if not base:
@@ -181,8 +185,8 @@ def build_verify_email_body(email, token, base_url):
         "有人（通常是你本人）刚用邮箱 %s 请求注册 PathTogether。\n"
         "请在 30 分钟内打开下面的链接完成邮箱验证：\n\n"
         "%s\n\n"
-        "该链接只能使用一次。验证邮箱后，你还需要管理员发放的邀请码才能激活"
-        "账号；验证邮箱本身不会授予任何工作区、AI 或额度权限。\n\n"
+        "该链接只能使用一次。验证后请设置密码并提交使用申请，管理员审核通过"
+        "后即可使用；如果你已有邀请码，也可以凭邀请码直接激活。\n\n"
         "如果你没有请求过注册，请忽略本邮件。\n"
         % (str(email), link))
     return subject, body

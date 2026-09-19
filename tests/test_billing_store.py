@@ -862,6 +862,186 @@ def test_unpriced_paths_and_no_received_at_substitution():
         + billing_pricing.price_component_nano(
             1204, rates06["output_nano_per_million"]))
 
+
+def _create_pair_books(model, kind, rates, eff_from, eff_to=None,
+                       tag="x"):
+    """建并激活一本指定 kind 的价格书（peak/off_peak 同价，band 无关）。
+
+    断言激活成功（区间不重叠时无需 supersede）；返回 price_book_id。"""
+    rows = [{"provider": "deepseek", "model": model, "time_band": b,
+             "cache_hit_nano_per_million": rates[0],
+             "cache_miss_nano_per_million": rates[1],
+             "output_nano_per_million": rates[2]}
+            for b in ("peak", "off_peak")]
+    book = billing_store.create_price_book(
+        kind, rows, eff_from, eff_to, source_url="r1-test",
+        created_by="pytest", price_book_id="pb_r1_%s_%s_%s" % (kind, model, tag))
+    activated = billing_store.activate_price_book(book["price_book_id"],
+                                                  actor="pytest")
+    assert activated["status"] == "active"
+    return book["price_book_id"]
+
+
+def test_missing_one_price_book_kind_is_unpriced_not_zero():
+    """缺一类价格表（R1 执行要求 3）：provider_cost 与 customer_charge 必须同时
+    覆盖同一 (provider, model, 时段, 生效窗口) 才计价。
+
+    - 只有 provider_cost active（customer_charge 全缺）→ unpriced
+      no_active_price_book：金额保持 NULL（不按 0 元混入）、token 列保留、
+      charge_price_book_id 为 NULL（provider 侧书 id 在场——可据此定位缺的
+      是哪一类）、无任何 debit；
+    - 只有 customer_charge active（provider_cost 全缺）→ 同样 unpriced，
+      镜像断言。
+    """
+    from datetime import datetime
+    now = datetime.now(timezone.utc)
+    occurred = now - timedelta(hours=1)
+    conn = bh.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*)::int AS n FROM billing_price_books")
+            assert cur.fetchone()["n"] == 0  # conftest TRUNCATE 后无任何书
+    finally:
+        conn.close()
+
+    def _event(model, tag):
+        return dict(bh.load_event("06_user_priced_flash_no_provider_request_id.json"),
+                    event_id="use_" + tag * 16, call_id="call_" + tag * 16,
+                    request_id="req_missing_kind_" + tag,
+                    model=model,
+                    occurred_at=_iso(occurred),
+                    enqueued_at=_iso(occurred + timedelta(seconds=1)))
+
+    # ① 只有 provider_cost：缺 customer_charge → unpriced，无 debit
+    cost_only_model = "deepseek-r1-costonly"
+    _create_pair_books(cost_only_model, "provider_cost",
+                       (1_000_000, 2_000_000, 3_000_000), occurred - timedelta(days=1),
+                       tag="c1")
+    ev1 = _event(cost_only_model, "11")
+    r1 = _ingest(ev1, now=occurred + timedelta(minutes=1))
+    assert (r1["status"], r1["row"]["unpriced_reason"]) == (
+        "unpriced", "no_active_price_book")
+    assert r1["row"]["provider_cost_nano_cny"] is None
+    assert r1["row"]["charge_nano_cny"] is None
+    # 定位线索：命中的那类书 id 在场，缺的一类为 NULL
+    assert r1["row"]["provider_price_book_id"] is not None
+    assert r1["row"]["charge_price_book_id"] is None
+    # token 列保留（未计价 ≠ 抹掉用量）；无 debit 落账
+    assert r1["row"]["total_tokens"] == ev1["total_tokens"]
+    conn = bh.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*)::int AS n FROM billing_ledger_entries "
+                        "WHERE event_id=%s", (ev1["event_id"],))
+            assert cur.fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+    # ② 只有 customer_charge：缺 provider_cost → 同样 unpriced（两书缺一不可）
+    charge_only_model = "deepseek-r1-chargeonly"
+    _create_pair_books(charge_only_model, "customer_charge",
+                       (4_000_000, 5_000_000, 6_000_000), occurred - timedelta(days=1),
+                       tag="c2")
+    ev2 = _event(charge_only_model, "22")
+    r2 = _ingest(ev2, now=occurred + timedelta(minutes=1))
+    assert (r2["status"], r2["row"]["unpriced_reason"]) == (
+        "unpriced", "no_active_price_book")
+    assert r2["row"]["provider_price_book_id"] is None
+    assert r2["row"]["charge_price_book_id"] is not None
+    assert r2["row"]["charge_nano_cny"] is None
+    assert r2["row"]["total_tokens"] == ev2["total_tokens"]
+
+
+def test_price_window_boundary_exact_instant_picks_by_occurred_at():
+    """价格窗口边界（R1 执行要求 3）：occurred_at 恰落在生效边界的取书语义。
+
+    半开区间 [effective_from, effective_to)：
+    - occurred_at == effective_to - 1µs → 旧书（旧价）；
+    - occurred_at == effective_to（== 新书 effective_from）→ 新书（新价）；
+    - 旧书收口后无新书 → occurred_at == effective_to 即 unpriced
+      （不得拿区间外的现价无条件覆盖历史）。
+    received_at 恒晚于 occurred_at（无时钟偏差干扰），取书只由 occurred_at
+    决定。
+    """
+    from datetime import datetime
+    now = datetime.now(timezone.utc)
+    boundary = now.replace(microsecond=0) - timedelta(hours=2)
+    _base = bh.load_event("06_user_priced_flash_no_provider_request_id.json")
+    tokens = (_base["cache_hit_input_tokens"],
+              _base["cache_miss_input_tokens"],
+              _base["output_tokens"])
+
+    def _event(model, tag, when):
+        return dict(bh.load_event("06_user_priced_flash_no_provider_request_id.json"),
+                    event_id="use_" + tag * 16, call_id="call_" + tag * 16,
+                    request_id="req_boundary_" + tag,
+                    model=model,
+                    occurred_at=_iso(when),
+                    enqueued_at=_iso(when + timedelta(seconds=1)))
+    # tokens 变量随 _base 定值后删除，防止误改夹具行
+    del _base
+
+    def _cost(rates):
+        keys = ("cache_hit_nano_per_million",
+                "cache_miss_nano_per_million",
+                "output_nano_per_million")
+        return billing_pricing.price_tokens_nano(
+            tokens[0], tokens[1], tokens[2],
+            dict(zip(keys, rates)))
+
+    # —— 换代场景：旧书 [T-1d, T) → 新书 [T, ∞)，两 kind 成对，新旧价可区分
+    model = "deepseek-r1-boundary"
+    old_cost_rates = (1_000_000, 2_000_000, 3_000_000)
+    new_cost_rates = (10_000_000, 20_000_000, 30_000_000)
+    old_charge_rates = (4_000_000, 5_000_000, 6_000_000)
+    new_charge_rates = (40_000_000, 50_000_000, 60_000_000)
+    _create_pair_books(model, "provider_cost", old_cost_rates,
+                       boundary - timedelta(days=1), boundary, tag="old")
+    _create_pair_books(model, "customer_charge", old_charge_rates,
+                       boundary - timedelta(days=1), boundary, tag="old")
+    _create_pair_books(model, "provider_cost", new_cost_rates,
+                       boundary, None, tag="new")
+    _create_pair_books(model, "customer_charge", new_charge_rates,
+                       boundary, None, tag="new")
+
+    # 边界前 1µs：旧书旧价（微秒级边界必须稳定，不受 PG 微秒精度影响）
+    before = _event(model, "33", boundary - timedelta(microseconds=1))
+    r_before = _ingest(before, now=boundary + timedelta(minutes=1))
+    assert r_before["status"] == "priced"
+    assert r_before["row"]["provider_price_book_id"] == \
+        "pb_r1_provider_cost_%s_old" % model
+    assert r_before["row"]["provider_cost_nano_cny"] == _cost(old_cost_rates)
+    assert r_before["row"]["charge_price_book_id"] == \
+        "pb_r1_customer_charge_%s_old" % model
+    assert r_before["row"]["charge_nano_cny"] == _cost(old_charge_rates)
+
+    # 恰在边界：新书新价（effective_to == 新书 effective_from → 半开区间
+    # 语义下边界瞬间归新书，不双归属也不漏归属）
+    at = _event(model, "44", boundary)
+    r_at = _ingest(at, now=boundary + timedelta(minutes=1))
+    assert r_at["status"] == "priced"
+    assert r_at["row"]["provider_price_book_id"] == \
+        "pb_r1_provider_cost_%s_new" % model
+    assert r_at["row"]["provider_cost_nano_cny"] == _cost(new_cost_rates)
+    assert r_at["row"]["charge_nano_cny"] == _cost(new_charge_rates)
+
+    # —— 收口无接班场景：旧书 [T-1d, T) 且无新书
+    solo_model = "deepseek-r1-boundary-open"
+    _create_pair_books(solo_model, "provider_cost", old_cost_rates,
+                       boundary - timedelta(days=1), boundary, tag="solo")
+    _create_pair_books(solo_model, "customer_charge", old_charge_rates,
+                       boundary - timedelta(days=1), boundary, tag="solo")
+    solo_before = _event(solo_model, "55", boundary - timedelta(microseconds=1))
+    r_solo = _ingest(solo_before, now=boundary + timedelta(minutes=1))
+    assert r_solo["status"] == "priced"
+    assert r_solo["row"]["provider_cost_nano_cny"] == _cost(old_cost_rates)
+    # 边界瞬间起无有效价格 → unpriced（保留具体原因，不按现价/0 元入账）
+    solo_at = _event(solo_model, "66", boundary)
+    r_solo_at = _ingest(solo_at, now=boundary + timedelta(minutes=1))
+    assert (r_solo_at["status"], r_solo_at["row"]["unpriced_reason"]) == (
+        "unpriced", "no_active_price_book")
+    assert r_solo_at["row"]["charge_nano_cny"] is None
+
 def test_concurrent_insert_race_savepoint_paths(monkeypatch):
     """并发投递竞态的确定性复现（§7.5 步骤 2；SAVEPOINT 修复的回归测试）。
 

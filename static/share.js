@@ -765,7 +765,8 @@
     viewer.setMouseNavEnabled(false);
     roiBox.addEventListener("pointermove", onRoiPointerMove);
     roiBox.addEventListener("pointerup", onRoiPointerUp);
-    roiBox.addEventListener("pointercancel", onRoiPointerUp);
+    // 工单 D：pointercancel = 取消恢复（绝不按「完成」提交当前位移）
+    roiBox.addEventListener("pointercancel", onRoiPointerCancel);
   }
 
   function onRoiPointerMove(e) {
@@ -795,8 +796,32 @@
     try { roiBox.releasePointerCapture(dragInfo.pointerId); } catch (err) {}
     roiBox.removeEventListener("pointermove", onRoiPointerMove);
     roiBox.removeEventListener("pointerup", onRoiPointerUp);
-    roiBox.removeEventListener("pointercancel", onRoiPointerUp);
+    roiBox.removeEventListener("pointercancel", onRoiPointerCancel);
     dragInfo = null;
+    viewer.setMouseNavEnabled(true);
+  }
+
+  // 工单 D：拖拽被打断（pointercancel / 丢失捕获）→ 恢复拖前位置，不提交位移
+  function onRoiPointerCancel(e) {
+    if (!dragInfo) return;
+    if (e && e.preventDefault) { try { e.preventDefault(); } catch (err) {} }
+    try { roiBox.releasePointerCapture(dragInfo.pointerId); } catch (err) {}
+    roiBox.removeEventListener("pointermove", onRoiPointerMove);
+    roiBox.removeEventListener("pointerup", onRoiPointerUp);
+    roiBox.removeEventListener("pointercancel", onRoiPointerCancel);
+    var sx = dragInfo.startRoiX, sy = dragInfo.startRoiY;
+    var side = state.roi.side;
+    dragInfo = null;
+    state.roi.x = sx; state.roi.y = sy;
+    if (roiBox && viewer && side > 0) {
+      try {
+        viewer.updateOverlay(
+          roiBox,
+          viewer.viewport.imageToViewportRectangle(sx, sy, side, side),
+          OpenSeadragon.Placement.TOP_LEFT
+        );
+      } catch (err) {}
+    }
     viewer.setMouseNavEnabled(true);
   }
 
@@ -1632,15 +1657,18 @@
     if (!state.slide) return;
     // 绘制模式优先：走原有绘制逻辑
     if (state.drawMode) {
+      if (e.button === 2) return; // 右键不启动绘制（工单 D）
       e.preventDefault(); e.stopPropagation();
       var c = els.annoCanvas;
       try { c.setPointerCapture(e.pointerId); } catch (err) {}
       drawPointer = { id: e.pointerId };
       var img0 = screenToImg(e);
       if (state.drawMode === "arrow") {
-        drawPreview = { type: "arrow", x1: img0.x, y1: img0.y, x2: img0.x, y2: img0.y };
+        drawPreview = { type: "arrow", x1: img0.x, y1: img0.y, x2: img0.x, y2: img0.y,
+                        sx0: e.clientX, sy0: e.clientY };
       } else {
-        drawPreview = { type: "freehand", points: [[img0.x, img0.y]], lastScreen: screenPt(e) };
+        drawPreview = { type: "freehand", points: [[img0.x, img0.y]], lastScreen: screenPt(e),
+                        sx0: e.clientX, sy0: e.clientY };
       }
       redrawAnnoCanvas();
       return;
@@ -1694,12 +1722,44 @@
   function onAnnoPointerUp(e) {
     if (state.drawMode && drawPreview) {
       e.preventDefault(); e.stopPropagation();
+      // 纯单击（无位移）的描图不产生有效几何：清草稿留在工具内，不保存（工单 D）
+      if (drawPreview.type === "freehand" && drawPreview.points.length < 3 &&
+          !drawPointerMoved(e)) {
+        releaseDrawPointer();
+        drawPreview = null;
+        redrawAnnoCanvas();
+        return;
+      }
       finishDraw();
       return;
     }
     if (!editDrag) return;
     e.preventDefault(); e.stopPropagation();
     endEditDrag(e);
+  }
+
+  // 工单 D：pointercancel / 丢失指针捕获 = 取消恢复，绝不走完成/保存路径
+  function onAnnoPointerCancel(e) {
+    if (state.drawMode && drawPreview) {
+      if (e && e.preventDefault) { try { e.preventDefault(); } catch (err) {} }
+      releaseDrawPointer();
+      drawPreview = null; // 丢弃被中断的笔画
+      redrawAnnoCanvas();
+      return;
+    }
+    if (editDrag) { cancelEditDragRestore(); }
+  }
+
+  function releaseDrawPointer() {
+    var c = els.annoCanvas;
+    if (drawPointer) { try { c.releasePointerCapture(drawPointer.id); } catch (err) {} }
+    drawPointer = null;
+  }
+
+  // 本次按下是否有明显位移（屏幕 px）：区分「单击」与「拖动释放」
+  function drawPointerMoved(e) {
+    if (!drawPreview || drawPreview.sx0 == null || !e) return true; // 无记录按拖动处理
+    return Math.hypot(e.clientX - drawPreview.sx0, e.clientY - drawPreview.sy0) > 4;
   }
 
   // ---------- 编辑拖动会话 ----------
@@ -1833,6 +1893,27 @@
     // 拖完不立即保存，等用户点"保存"
   }
 
+  // 工单 D：编辑拖拽被打断 → 恢复拖前几何（本地快照），不保留半截修改
+  function cancelEditDragRestore() {
+    var c = els.annoCanvas;
+    var d = editDrag;
+    if (d) { try { c.releasePointerCapture(d.pointerId); } catch (err) {} }
+    editDrag = null;
+    if (d && d.item && d.start) {
+      var s = d.start, it = d.item;
+      var typ = it.type || "rect";
+      if (typ === "rect") {
+        it.x = s.x; it.y = s.y; it.w = s.w; it.h = s.h;
+      } else if (typ === "arrow") {
+        it.x1 = s.x1; it.y1 = s.y1; it.x2 = s.x2; it.y2 = s.y2;
+      } else if (typ === "freehand") {
+        it.points = s.points;
+      }
+    }
+    if (viewer) viewer.setMouseNavEnabled(true);
+    redrawAnnoCanvas();
+  }
+
   function finishDraw() {
     var dp = drawPreview;
     var c = els.annoCanvas;
@@ -1842,16 +1923,16 @@
     if (!dp) { exitDrawMode(); return; }
     if (dp.type === "arrow") {
       var dist = Math.hypot(dp.x2 - dp.x1, dp.y2 - dp.y1);
-      if (dist < 10) { toast(t("draw.short.cancel"), "info"); exitDrawMode(); return; }
+      if (dist < 10) { toast(t("draw.short.cancel"), "info"); redrawAnnoCanvas(); return; }
       saveAnnotation({ type: "arrow", x1: dp.x1, y1: dp.y1, x2: dp.x2, y2: dp.y2 });
     } else {
       var pts = dp.points;
-      if (pts.length < 3) { toast(t("draw.few.cancel"), "info"); exitDrawMode(); return; }
+      if (pts.length < 3) { toast(t("draw.few.cancel"), "info"); redrawAnnoCanvas(); return; }
       var xs = pts.map(function (p) { return p[0]; });
       var ys = pts.map(function (p) { return p[1]; });
       var bb = Math.max(Math.max.apply(null, xs) - Math.min.apply(null, xs),
                         Math.max.apply(null, ys) - Math.min.apply(null, ys));
-      if (bb < 10) { toast(t("draw.small.cancel"), "info"); exitDrawMode(); return; }
+      if (bb < 10) { toast(t("draw.small.cancel"), "info"); redrawAnnoCanvas(); return; }
       saveAnnotation({ type: "freehand", points: pts });
     }
   }
@@ -1867,17 +1948,21 @@
     return { x: e.clientX - rect.left, y: e.clientY - rect.top };
   }
 
-  // 保存用户标注（arrow/freehand）
+  // 保存用户标注（arrow/freehand）。工单 D：保存失败保留可重试草稿——
+  // 恢复预览、不退工具、不清几何；只读/无标注权限的链接在服务端 403，
+  // 前端不新增任何写入口。
   function saveAnnotation(geom) {
     if (!state.slide) return;
+    var slideName = state.slide.name; // 冻结提交时的切片（回包不串片）
     var label = (els.roiLabel.value || "").trim();
     if (!label) {
       toast(t("share.label.need"), "error");
       try { els.roiLabel.focus(); } catch (e) {}
-      exitDrawMode();
+      // 草稿保留：恢复预览等用户补完用户名后重画/重试
+      restorePreviewFromGeom(geom);
       return;
     }
-    var body = { slide: state.slide.name, type: geom.type, label: label };
+    var body = { slide: slideName, type: geom.type, label: label };
     for (var k in geom) body[k] = geom[k];
     body.note = (els.roiNote ? els.roiNote.value : "") || "";
     fetch(API + "/api/roi", {
@@ -1890,11 +1975,32 @@
         return r.json();
       })
       .then(function () {
+        // 切片已切换：回包不落到新切片（只提示，不改新切片状态）
+        if (!state.slide || state.slide.name !== slideName) return;
         toast(t("anno.saved"), "success");
         exitDrawMode();
         refreshRoisOnce();
       })
-      .catch(function (e) { toast(t("save.fail2", { e: e.message }), "error"); exitDrawMode(); });
+      .catch(function (e) {
+        // 失败：可重试草稿——恢复预览、留在工具内（工单 D）
+        if (!state.slide || state.slide.name !== slideName) return;
+        restorePreviewFromGeom(geom);
+        toast(t("draw.unsaved.retry", { e: e.message }), "error");
+      });
+  }
+
+  // 保存路径恢复绘制预览（几何不清空）
+  function restorePreviewFromGeom(geom) {
+    if (!geom || !state.drawMode) return;
+    if (geom.type === "arrow") {
+      drawPreview = { type: "arrow", x1: geom.x1, y1: geom.y1,
+                      x2: geom.x2, y2: geom.y2 };
+    } else if (geom.type === "freehand" && geom.points) {
+      drawPreview = { type: "freehand",
+                      points: geom.points.map(function (p) { return [p[0], p[1]]; }),
+                      lastScreen: null };
+    }
+    redrawAnnoCanvas();
   }
 
   // 加载当前切片的标注（本 token + 管理员）供画布层绘制
@@ -2224,7 +2330,8 @@
     c.addEventListener("pointerdown", onAnnoPointerDown);
     c.addEventListener("pointermove", onAnnoPointerMove);
     c.addEventListener("pointerup", onAnnoPointerUp);
-    c.addEventListener("pointercancel", onAnnoPointerUp);
+    // 工单 D：pointercancel ≠ pointerup——取消恢复，绝不触发完成/保存
+    c.addEventListener("pointercancel", onAnnoPointerCancel);
     window.addEventListener("resize", function () { resizeAnnoCanvas(); redrawAnnoCanvas(); });
 
     // 选区面板开关（底部抽屉 + 遮罩）

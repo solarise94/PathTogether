@@ -53,6 +53,7 @@ from PIL import Image
 
 import requests
 
+import annotation_access
 import share_store
 import share_shared
 import slide_cache
@@ -4680,8 +4681,11 @@ def _demo_public_mode() -> bool:
 
 
 def _demo_task_max_steps() -> int:
-    """Demo 单次任务步骤（ai_safety.demo_task_max_steps，默认 20；docs §4.1/§5.3）。
+    """Demo 单次任务步骤（ai_safety.demo_task_max_steps，默认 100；docs §4.1/§5.3）。
 
+    工单 C（plan 20260919 §4）：默认自 20 抬到 100（0058 迁移同步 DB 缺省与
+    旧缺省存量；运行时仍钳制 _MAX_STEPS_LIMIT=100，只读工具/单任务/预算闸
+    不变——100 是上限，任务允许提前结束）。
     批次 F：自周期列迁居 platform_settings（settings_store 统一设置源）。
     读取失败按默认处理（保守内置上限，方向不变）但不再静默——对齐
     _demo_public_mode 的写法记 warning（fix 2026-09-11 P4：管理员调紧后
@@ -4849,6 +4853,42 @@ def _demo_catalog_slide(slide_id):
     return entry, filename
 
 
+def _demo_request_lang():
+    """Demo 目录展示语言（工单 B）：``?lang=`` 优先，其次 Accept-Language。
+
+    只认 ``zh``/``en``（与前端 HP_I18N.getLang 同集），其余一律 zh（缺省语言）。
+    仅影响 API 载荷里的便利字段 ``display_name``/``description``；双语原始
+    字段恒返回，前端自身按当前语言选择（切换语言无需重载）。
+    """
+    raw = (request.args.get("lang") or "").strip().lower()
+    if not raw:
+        accept = (request.headers.get("Accept-Language") or "").lower()
+        raw = accept.split(",")[0].strip() if accept else ""
+    return "en" if raw.startswith("en") else "zh"
+
+
+def _demo_localized_entry(entry, lang=None):
+    """目录条目双语出口：补齐 ``*_en`` 字段 + 当前语言的便利字段。
+
+    ``display_name``/``description`` 恒为中文/缺省语言原值；lang=en 时额外
+    提供 ``localized_display_name``/``localized_description``（无英文译文回落
+    缺省字段，明确回退不猜值）。不修改 slide_id / 原始文件名。
+    """
+    out = dict(entry)
+    out.setdefault("display_name_en", None)
+    out.setdefault("description_en", None)
+    lang = lang or _demo_request_lang()
+    if lang == "en":
+        out["localized_display_name"] = (
+            out.get("display_name_en") or out.get("display_name"))
+        out["localized_description"] = (
+            out.get("description_en") or out.get("description"))
+    else:
+        out["localized_display_name"] = out.get("display_name")
+        out["localized_description"] = out.get("description")
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # /demo 页面与 /api/demo/*（docs §9.1）
 # --------------------------------------------------------------------------- #
@@ -4997,20 +5037,28 @@ def api_demo_config():
 
 @app.route("/api/demo/slides")
 def api_demo_slides():
-    """Demo 目录切片摘要（allowlist 内条目 + 稳定 slide_id，docs §5.1/§9.1）。"""
+    """Demo 目录切片摘要（allowlist 内条目 + 稳定 slide_id，docs §5.1/§9.1）。
+
+    工单 B（双语）：条目同时返回 ``display_name``/``description``（中文/缺省
+    语言）与 ``display_name_en``/``description_en``（可空 = 无译文）；另按
+    ``?lang=``/Accept-Language 提供 ``localized_display_name``/
+    ``localized_description`` 便利字段。前端（demo.js）按 HP_I18N.getLang()
+    自行选择，切换语言无需重载。slide_id 与原始文件名恒不变。
+    """
     err = _demo_require_open()
     if err is not None:
         return err
     cap, cap_err = _demo_require_capability()
     if cap_err is not None:
         return cap_err
+    lang = _demo_request_lang()
     items = []
     try:
         for entry in demo_store.catalog_list_ordered():
             filename = demo_store.resolve_slide_filename(entry["slide_id"])
             if not filename:
                 continue  # 行缺失/无映射：fail-closed 不展示
-            item = dict(entry)
+            item = _demo_localized_entry(entry, lang)
             item["name"] = filename
             items.append(item)
     except Exception:
@@ -5033,10 +5081,15 @@ def api_demo_slide_info(slide_id):
         return jsonify(error="slide 不在 Demo 目录内", code="slide_not_in_catalog"), 404
     info = _slide_info_dict(filename)
     info["slide_id"] = slide_id
+    # 工单 B：demo_* 双语展示字段（en 可空 = 无译文，前端回落缺省字段）
     if entry.get("display_name"):
         info["demo_display_name"] = entry["display_name"]
     if entry.get("description"):
         info["demo_description"] = entry["description"]
+    if entry.get("display_name_en"):
+        info["demo_display_name_en"] = entry["display_name_en"]
+    if entry.get("description_en"):
+        info["demo_description_en"] = entry["description_en"]
     info["demo_is_default"] = bool(entry.get("is_default"))
     if not info.get("error"):
         # Batch 3（§6.1）：render additive 字段与主站同一份 manifest/统计
@@ -6635,9 +6688,12 @@ def api_admin_demo_catalog_list():
 def api_admin_demo_catalog_put():
     """加入/更新 Demo 目录条目（owner，UPSERT）。
 
-    body: {slide（文件名）, display_name?, description?, sort_order?, is_default?}。
+    body: {slide（文件名）, display_name?, description?, display_name_en?,
+    description_en?, sort_order?, is_default?}。
     切片文件必须存在（allowlist 只接受真实入库切片）；首次加入时为其确保稳定
     slide_id。is_default=true 时设为默认 Demo 切片。
+    双语（工单 B / 0057）：display_name/description 为中文/缺省语言，
+    display_name_en/description_en 可选（缺省 None = 无译文，读取端回落）。
     """
     auth = _require_owner()
     if auth:
@@ -6657,10 +6713,16 @@ def api_admin_demo_catalog_put():
         return jsonify(error="无法解析切片稳定 id：%s" % slide), 404
     display_name = body.get("display_name")
     description = body.get("description")
+    display_name_en = body.get("display_name_en")
+    description_en = body.get("description_en")
     if display_name is not None and not isinstance(display_name, str):
         return jsonify(error="display_name 需为字符串"), 400
     if description is not None and not isinstance(description, str):
         return jsonify(error="description 需为字符串"), 400
+    if display_name_en is not None and not isinstance(display_name_en, str):
+        return jsonify(error="display_name_en 需为字符串"), 400
+    if description_en is not None and not isinstance(description_en, str):
+        return jsonify(error="description_en 需为字符串"), 400
     sort_order = body.get("sort_order") or 0
     try:
         sort_order = int(sort_order)
@@ -6669,7 +6731,9 @@ def api_admin_demo_catalog_put():
     try:
         entry = demo_store.catalog_add(
             slide_id, display_name=display_name, description=description,
-            sort_order=sort_order, added_by=current_identity().get("user_id"))
+            sort_order=sort_order, added_by=current_identity().get("user_id"),
+            display_name_en=display_name_en,
+            description_en=description_en)
         if body.get("is_default") is True:
             entry = demo_store.catalog_set_default(slide_id)
     except ValueError as exc:
@@ -13228,6 +13292,22 @@ def _ai_run_prepare(user_ctx, body, slide, need_grant):
         _revoke_grant_in_config(config, reason="run_rejected")
         return budget_err
     on_accepted, on_rejected = _ai_budget_lifecycle(rid, resv, hard_ctx=hard_ctx)
+    _budget_on_accepted = on_accepted
+    _principal_uid = (user_ctx or {}).get("user_id") or ""
+
+    def on_accepted(session_id):
+        _budget_on_accepted(session_id)
+        if session_id and _principal_uid:
+            try:
+                share_store.upsert_ai_session_principal(
+                    session_id, _principal_uid, slide)
+            except Exception:
+                app.logger.warning(
+                    "绑定 AI 会话主体失败 session=%s", session_id, exc_info=True)
+
+    # 不在 sidecar 校验归属前用请求体 session_id 预绑定（Q1：会覆盖他人会话属主）。
+    # 属主只在 on_accepted（服务端确认的 session id）或 internal spots 的
+    # X-AI-Session-Owner（sidecar 回显已注入的 session_owner）上 bind-if-absent。
     # §3.10 P0-C：grant 生命周期回调——run 被拒（4xx/5xx/连接失败）→ 撤销本轮
     # grant；run 结束（上游 SSE 正常关流）→ 撤销绑定到该 session 的 grant。
     grant_id = ((config.get("run_grant") or {}).get("grant_id")) or ""
@@ -15304,6 +15384,77 @@ def _validate_ai_viewport(body):
     return out, None
 
 
+def _validate_ai_attachments(body, slide):
+    """校验 run/continue/branch 的 attachments 数组；返回 (cleaned, err)。
+
+    每项须含 kind=viewport|marker 与合法 bbox。marker 须可读且 revision 匹配。
+    非法 → 400/403/409；缺省/空 → (None, None)。
+    """
+    if not isinstance(body, dict) or "attachments" not in body:
+        return None, None
+    raw = body.get("attachments")
+    if raw is None:
+        return None, None
+    if not isinstance(raw, list):
+        return None, (jsonify(error="attachments 需为数组",
+                              code="invalid_argument"), 400)
+    if len(raw) > 16:
+        return None, (jsonify(error="attachments 过多",
+                              code="invalid_argument"), 400)
+    subject = annotation_access.subject_from_request()
+    out = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            return None, (jsonify(error="attachments[%d] 需为对象" % i,
+                                  code="invalid_argument"), 400)
+        kind = item.get("kind")
+        if kind not in ("viewport", "marker"):
+            return None, (jsonify(error="attachments[%d].kind 非法" % i,
+                                  code="invalid_argument"), 400)
+        vp, vp_err = _validate_ai_viewport({"viewport": item.get("bbox")
+                                            or item.get("viewport")})
+        if vp_err is not None:
+            return None, vp_err
+        if vp is None:
+            return None, (jsonify(error="attachments[%d] 缺少 bbox" % i,
+                                  code="invalid_argument"), 400)
+        rec = {"kind": kind, "bbox": vp, "slide": slide}
+        if item.get("render_context") is not None:
+            rec["render_context"] = item.get("render_context")
+        if kind == "marker":
+            aid = item.get("annotation_id")
+            if not isinstance(aid, str) or not aid:
+                return None, (jsonify(error="attachments[%d] 缺少 annotation_id" % i,
+                                      code="invalid_argument"), 400)
+            roi = share_store.get_roi_by_annotation_id(aid)
+            if roi is None or roi.get("deleted"):
+                return None, (jsonify(error="标注不存在",
+                                      code="annotation_not_found"), 404)
+            if roi.get("slide") and roi.get("slide") != slide:
+                return None, (jsonify(error="标注不属于当前切片",
+                                      code="forbidden"), 403)
+            if not annotation_access.can_read_annotation(subject, roi):
+                return None, (jsonify(error="标注不存在",
+                                      code="annotation_not_found"), 404)
+            expected = item.get("revision")
+            if expected is not None:
+                try:
+                    expected = int(expected)
+                except (TypeError, ValueError):
+                    return None, (jsonify(error="revision 非法",
+                                          code="invalid_argument"), 400)
+                current = int(roi.get("revision") or 1)
+                if expected != current:
+                    return None, (jsonify(
+                        error="revision_conflict",
+                        current_revision=current), 409)
+            rec["annotation_id"] = aid
+            rec["revision"] = int(roi.get("revision") or 1)
+            rec["type"] = roi.get("type")
+        out.append(rec)
+    return out, None
+
+
 def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
                      max_long_edge=None, jpeg_quality=DERIVATIVE_JPEG_QUALITY,
                      render_context=None, render_fingerprint=None):
@@ -15739,13 +15890,63 @@ def internal_ai_annotate():
     return jsonify(roi)
 
 
+def _internal_ai_read_subject(session_id, slide):
+    """internal/plugin spots 读取主体（工单 A / P0：绝不返回全片标注）。
+
+    身份推导链（均为服务端数据，不采信 query 自报 owner）：
+      1. 本地免认证单租户态（AUTH_ENABLED=False）→ local_owner（全量——
+         该形态不存在其他用户可隔离）；
+      2. session_id 可解析出运行属主：run grant 绑定（run_grants.session_id
+         → created_by_user_id，未撤销且 slide 匹配）→ 该 user 主体（AI 上下
+         文按属主业务可见性：本人 + 显式授权，他人私有不进上下文）；
+      3. 其余（sidecar 未带 session / demo 会话 / legacy internal 通道）→
+         ai 无属主主体：fail-closed 只见 source=ai 的记录（AI 自己的产出），
+         人类私有标注/评论一律不出流。
+    """
+    if not AUTH_ENABLED:
+        return annotation_access.local_owner_subject()
+    if session_id:
+        try:
+            principal = share_store.get_ai_session_principal(session_id)
+        except Exception:  # noqa: BLE001
+            principal = None
+        if principal and principal.get("user_id"):
+            if slide and principal.get("slide") and principal.get("slide") != slide:
+                principal = None
+            else:
+                uid = principal["user_id"]
+                u = user_store.get_user(uid) or {}
+                return annotation_access.user_subject(
+                    uid, u.get("role") or user_store.ROLE_USER)
+        try:
+            grants = share_store.list_run_grants_for_session(session_id)
+        except Exception:  # noqa: BLE001 - 查询失败按无绑定（fail-closed）
+            grants = []
+        for gr in grants:
+            if gr.get("revoked"):
+                continue
+            if slide and gr.get("slide") and gr.get("slide") != slide:
+                continue
+            creator = gr.get("created_by_user_id") or ""
+            if creator:
+                u = user_store.get_user(creator) or {}
+                return annotation_access.user_subject(
+                    creator, u.get("role") or user_store.ROLE_USER)
+    # 未绑定：空集合。不得凭 source=ai 跨用户放行。
+    return annotation_access.ai_subject()
+
+
 @app.route("/internal/ai/spots", methods=["GET"])
 def internal_ai_spots():
     """sidecar 增量取切片变更（含 tombstone）。
 
-    query: slide（必填）、after_seq（缺省 0）。
+    query: slide（必填）、after_seq（缺省 0）、session_id（可选，0056）。
     返回 {changes: [...], current_seq: int}（share_store.list_changes /
     current_change_seq）。
+    0056 工单 A / P0：变更流按读取主体过滤（_internal_ai_read_subject）——
+    未绑定会话主体时返回空集合（不得凭 source=ai 跨用户放行）；
+    sidecar 传 session_id 后按会话属主（ai_session_principals / run grant）
+    业务可见性：本人 + 显式授权。
     """
     auth = _require_internal()
     if auth:
@@ -15757,7 +15958,15 @@ def internal_ai_spots():
         after_seq = float(request.args.get("after_seq", "0") or "0")
     except (TypeError, ValueError):
         after_seq = 0
-    changes = share_store.list_changes(slide, after_seq)
+    session_id = request.args.get("session_id", "") or ""
+    owner_hdr = (request.headers.get("X-AI-Session-Owner") or "").strip()
+    if session_id and owner_hdr and len(owner_hdr) <= 128:
+        try:
+            share_store.upsert_ai_session_principal(session_id, owner_hdr, slide)
+        except Exception:
+            app.logger.warning("internal spots 绑定会话主体失败", exc_info=True)
+    subject = _internal_ai_read_subject(session_id, slide)
+    changes = share_store.list_changes(slide, after_seq, subject=subject)
     current_seq = share_store.current_change_seq(slide)
     return jsonify({"changes": changes, "current_seq": current_seq})
 
@@ -16370,8 +16579,11 @@ def plugin_v1_region(slide):
 def plugin_v1_changes(slide):
     """增量取切片变更（含 tombstone；对应 /internal/ai/spots）。scope: slide:read。
 
-    query: after_seq（缺省 0；兼容 §7.2 的 after 别名）。
-    返回 {changes, current_seq}（与 internal 端点同形）。
+    query: after_seq（缺省 0；兼容 §7.2 的 after 别名）、session_id（可选，
+    0056）。返回 {changes, current_seq}（与 internal 端点同形）。
+    0056 工单 A / P0：变更流按读取主体过滤（_internal_ai_read_subject）——
+    installation JWT 无用户身份，未携带 session_id 时 fail-closed 只返回
+    source=ai 的变更；携带 session_id 时按绑定 run grant 的运行属主放宽。
     """
     claims, err = _require_plugin_token("slide:read")
     if err is not None:
@@ -16386,7 +16598,9 @@ def plugin_v1_changes(slide):
         after_seq = float(raw_after or "0")
     except (TypeError, ValueError):
         after_seq = 0
-    changes = share_store.list_changes(safe, after_seq)
+    session_id = request.args.get("session_id", "") or ""
+    subject = _internal_ai_read_subject(session_id, safe)
+    changes = share_store.list_changes(safe, after_seq, subject=subject)
     current_seq = share_store.current_change_seq(safe)
     return jsonify({"changes": changes, "current_seq": current_seq})
 
@@ -17379,6 +17593,18 @@ def api_ai_run():
     viewport, vp_err = _validate_ai_viewport(body)
     if vp_err is not None:
         return vp_err
+    atts, att_err = _validate_ai_attachments(body, slide)
+    if att_err is not None:
+        return att_err
+    if atts:
+        if viewport is None:
+            viewport = atts[-1]["bbox"]
+        if body.get("render_context") is None:
+            for a in reversed(atts):
+                if a.get("render_context") is not None:
+                    body = dict(body)
+                    body["render_context"] = a["render_context"]
+                    break
     prep = _ai_run_prepare(user_ctx, body, slide, need_grant=True)
     if not isinstance(prep, dict):
         return prep
@@ -17405,6 +17631,8 @@ def api_ai_run():
     # 同级；sidecar 注入模型可见上下文）。
     if viewport:
         payload["viewport"] = viewport
+    if atts:
+        payload["attachments"] = atts
     # §9.1：浏览器 render_context 服务端再校验（revision 绑定 + fingerprint 重算）
     # → camelCase 注入 config；审计带 asset revision + render fingerprint。
     audit_rc, rc_err = _ai_run_inject_render_context(payload, slide, body)
@@ -17478,6 +17706,18 @@ def api_ai_continue():
     viewport, vp_err = _validate_ai_viewport(body)
     if vp_err is not None:
         return vp_err
+    atts, att_err = _validate_ai_attachments(body, slide)
+    if att_err is not None:
+        return att_err
+    if atts:
+        if viewport is None:
+            viewport = atts[-1]["bbox"]
+        if body.get("render_context") is None:
+            for a in reversed(atts):
+                if a.get("render_context") is not None:
+                    body = dict(body)
+                    body["render_context"] = a["render_context"]
+                    break
     prep = _ai_run_prepare(user_ctx, body, slide, need_grant=True)
     if not isinstance(prep, dict):
         return prep
@@ -17494,6 +17734,8 @@ def api_ai_continue():
         payload["session_id"] = session_id
     if viewport:
         payload["viewport"] = viewport
+    if atts:
+        payload["attachments"] = atts
     # §9.1：render_context 服务端再校验 + camelCase 注入（同 /run）。
     audit_rc, rc_err = _ai_run_inject_render_context(payload, slide, body)
     if rc_err is not None:
@@ -17581,6 +17823,18 @@ def api_ai_branch():
     viewport, vp_err = _validate_ai_viewport(body)
     if vp_err is not None:
         return vp_err
+    atts, att_err = _validate_ai_attachments(body, slide)
+    if att_err is not None:
+        return att_err
+    if atts:
+        if viewport is None:
+            viewport = atts[-1]["bbox"]
+        if body.get("render_context") is None:
+            for a in reversed(atts):
+                if a.get("render_context") is not None:
+                    body = dict(body)
+                    body["render_context"] = a["render_context"]
+                    break
     prep = _ai_run_prepare(user_ctx, body, slide, need_grant=True)
     if not isinstance(prep, dict):
         return prep
@@ -17597,6 +17851,8 @@ def api_ai_branch():
         payload["question"] = question
     if viewport:
         payload["viewport"] = viewport
+    if atts:
+        payload["attachments"] = atts
     # §9.1：branch 同 run/continue/ask——render_context 服务端再校验 + 注入。
     audit_rc, rc_err = _ai_run_inject_render_context(payload, slide, body)
     if rc_err is not None:
@@ -18232,8 +18488,27 @@ def api_share_create():
     except (ValueError, PermissionError) as e:
         return jsonify(error=str(e)), 400
     url = SHARE_BASE_URL + "/s/" + share["token"]
+    granted = 0
+    if body.get("include_annotations", True) is not False:
+        subject = annotation_access.subject_from_request()
+        by_slide = share_store.annotations_by_slide(subject=subject)
+        for sname in clean:
+            for grp in by_slide.get(sname, []):
+                for it in grp.get("items") or []:
+                    aid = it.get("annotation_id")
+                    if not aid:
+                        continue
+                    if not annotation_access.can_write_annotation(subject, it):
+                        continue
+                    try:
+                        share_store.grant_annotation_to_share(
+                            aid, share["token"],
+                            created_by=ident.get("user_id"))
+                        granted += 1
+                    except ValueError:
+                        continue
     _audit("share.create", target_type="share", target_id=share["token"],
-           detail={"slide_count": len(clean)})
+           detail={"slide_count": len(clean), "annotations_granted": granted})
     return jsonify(
         token=share["token"],
         url=url,
@@ -18241,6 +18516,7 @@ def api_share_create():
         roi_sizes=share.get("roi_sizes", list(share_store.DEFAULT_ROI_SIZES)),
         rect_policy=share.get("rect_policy", "preset_only"),
         permissions=share.get("permissions", list(share_store.DEFAULT_PERMISSIONS)),
+        annotations_granted=granted,
     )
 
 
@@ -18290,15 +18566,33 @@ def api_share_revoke():
 
 @app.route("/api/share/rois")
 def api_share_rois():
-    """列出 ROI（读隔离：按 _visible_slide_names 主体分域过滤）。
+    """列出 ROI（切片可见性 × 标注可见性双层过滤）。
 
-    review P0 2026-09-05 × 升级 B R5：owner 仅本人 ∪ 显式添加切片的标注；
-    user = 自己的 ∪ public ∪ 认领 ∪ 显式授权。管理出口走 /api/admin/*
-    （inventory 是唯一「看全部」）。
+    review P0 2026-09-05 × 升级 B R5 × 工单 A（0056）：切片层仍按
+    _visible_slide_names 主体分域（owner 仅本人 ∪ 显式添加切片；user =
+    自己的 ∪ public ∪ 认领 ∪ 显式授权）；**标注层**再按 subject 过滤——
+    「能看切片」不再等于「能看该切片上的全部标注」：个人标注默认私有，
+    仅本人工作台记录（token=admin 归本人）+ 显式 annotation_grants 授权
+    可见；他人/访客/AI 的私有标注不出现在本列表（全量清点走管理台
+    inventory / annotation_visibility_report）。
     """
-    rois = share_store.list_rois()
+    subject = annotation_access.subject_from_request()
     visible = _visible_slide_names()
-    return jsonify([r for r in rois if r.get("slide") in visible])
+    rois = share_store.list_rois(subject=subject)
+    ctx = annotation_access.access_context_for(subject)
+    out = []
+    for r in rois:
+        if r.get("slide") not in visible:
+            continue
+        proj = annotation_access.author_projection(r, label_of_user=_display_label)
+        r["author_key"] = proj["author_key"]
+        r["author_kind"] = proj["author_kind"]
+        r["author_label_safe"] = proj["author_label_safe"]
+        caps = annotation_access.capabilities(subject, r, ctx)
+        r["can_edit"] = caps["can_edit"]
+        r["can_delete"] = caps["can_delete"]
+        out.append(annotation_access.public_roi_view(r, subject))
+    return jsonify(out)
 
 
 @app.route("/api/share/<token>/claim", methods=["POST"])
@@ -18391,8 +18685,10 @@ def api_projects():
     uid = _current_uid()
     projects = [p for p in share_store.list_projects()
                 if p.get("owner_user_id") == uid]
-    # 一次性取 annotations_by_slide，按项目 slides 汇总
-    by_slide = share_store.annotations_by_slide()
+    # 一次性取 annotations_by_slide（工单 A：按 subject 过滤——roi_count 不
+    # 再计入项目切片上他人/访客的私有标注），按项目 slides 汇总
+    by_slide = share_store.annotations_by_slide(
+        subject=annotation_access.subject_from_request())
 
     def _count_for(slides):
         total = 0
@@ -18415,15 +18711,17 @@ def api_project_detail(pid):
 
     读隔离（review P0 2026-09-05）：owner 与 user 均仅自己创建的项目
     （_can_read_project）；项目写/管理路径仍走 _can_access_project（owner
-    语义不变）。
+    语义不变）。工单 A（0056）：标注摘要按 subject 过滤——项目切片上
+    他人/访客的私有标注与分组计数不出现在详情里。
     """
     if not _can_read_project(pid):
         return _denied()
     proj = share_store.get_project(pid)
     if proj is None:
         return jsonify(error="项目不存在"), 404
-    by_slide = share_store.annotations_by_slide()
-    project_slides = set(proj.get("slides", []))
+    subject = annotation_access.subject_from_request()
+    by_slide = share_store.annotations_by_slide(subject=subject)
+    by_slide = _decorate_annotation_items(by_slide, subject)
     slide_annotations = [
         {"slide": s, "annotations": by_slide.get(s, [])}
         for s in proj.get("slides", [])
@@ -18526,6 +18824,33 @@ def api_project_unarchive(pid):
     return jsonify(proj)
 
 
+def _decorate_annotation_items(by_slide, subject):
+    """标注分组 items 附加 author/capability 字段（工单 A：people 口径 +
+    前端能力位）。就地修改并返回 by_slide。
+
+    - author_key/author_kind/author_label_safe：稳定作者身份（AI 不是人、
+      未知作者不造人）；工作台记录的 label 走 _display_label 快照；
+    - can_edit/can_delete：写能力（创建者/编辑授权/owner 角色）。
+    """
+    ctx = annotation_access.access_context_for(subject) \
+        if subject is not None else None
+    for groups in by_slide.values():
+        for grp in groups:
+            for item in grp.get("items", []):
+                proj = annotation_access.author_projection(
+                    item, label_of_user=_display_label)
+                item["author_key"] = proj["author_key"]
+                item["author_kind"] = proj["author_kind"]
+                item["author_label_safe"] = proj["author_label_safe"]
+                caps = annotation_access.capabilities(subject, item, ctx)
+                item["can_edit"] = caps["can_edit"]
+                item["can_delete"] = caps["can_delete"]
+                projected = annotation_access.public_roi_view(item, subject)
+                item.clear()
+                item.update(projected)
+    return by_slide
+
+
 @app.route("/api/annotations")
 def api_annotations():
     """返回标注（按 slide 或 project 过滤），供查看器加载某切片的标记。
@@ -18535,12 +18860,15 @@ def api_annotations():
       - project=<pid>：只返回该项目内切片的标注
     同时传 slide 与 project 时，slide 优先（且需属于项目）。
     items 已含 type 与全部几何字段（经 store 自动带）。
-    读隔离模型（review P0 2026-09-05）：owner 与 user 均仅可见切片的标注
-    （默认分支按 _visible_slide_names 过滤；project 分支按创建者口径读），
-    越权 403；单 slide 分支鉴权同 can_view_slide。
+    读隔离模型（review P0 2026-09-05）× 工单 A（0056）：切片层鉴权/过滤
+    不变（单 slide 分支 can_view_slide；默认分支 _visible_slide_names）；
+    **标注层**新增 subject 过滤——个人标注默认私有，仅本人工作台记录与
+    显式 annotation_grants 授权可见（「能看切片」≠「能看标注」）。index
+    为 token 内 pre-filter 位置（不因过滤重编号）；定位优先 annotation_id。
     """
     slide = request.args.get("slide")
     project = request.args.get("project")
+    subject = annotation_access.subject_from_request()
 
     if slide:
         safe = _sanitize_name(slide)
@@ -18548,20 +18876,24 @@ def api_annotations():
             return jsonify(error="非法文件名"), 400
         if not can_view_slide(safe):
             return _denied()
-        by_slide = share_store.annotations_by_slide()
-        return jsonify({"slide": safe, "annotations": by_slide.get(safe, [])})
+        by_slide = share_store.annotations_by_slide(subject=subject)
+        return jsonify({"slide": safe,
+                        "annotations": _decorate_annotation_items(
+                            {safe: by_slide.get(safe, [])}, subject)[safe]})
 
     if project:
         if not _can_read_project(project):
             return _denied()
-        by_slide = share_store.annotations_by_project(project)
-        return jsonify({"project": project, "by_slide": by_slide})
+        by_slide = share_store.annotations_by_project(project, subject=subject)
+        return jsonify({"project": project,
+                        "by_slide": _decorate_annotation_items(by_slide,
+                                                               subject)})
 
     # 默认返回全部（owner 与 user 均按可见切片过滤——owner 不再全量）
-    by_slide = share_store.annotations_by_slide()
+    by_slide = share_store.annotations_by_slide(subject=subject)
     visible = _visible_slide_names()
     filtered = {s: v for s, v in by_slide.items() if s in visible}
-    return jsonify({"by_slide": filtered})
+    return jsonify({"by_slide": _decorate_annotation_items(filtered, subject)})
 
 
 @app.route("/api/annotations/changes")
@@ -18574,7 +18906,9 @@ def api_annotations_changes():
       - changes = change_seq > after 的全部变更（含 tombstone / 评论，带 type）
       - reset_required：after 超出可读水位（json 结构被截断 / pg 无早期行）时为 True，
         消费方应丢弃本地缓存、从 0 全量重拉。
-    鉴权同标注（can_view_slide）。
+    鉴权：切片层同标注（can_view_slide）× 工单 A（0056）标注层按 subject
+    过滤——不可见标注的变更（含 tombstone/评论负载）不出流；被跳过事件的
+    seq 照常越过，游标推进语义不变。
     """
     slide = request.args.get("slide")
     if not slide:
@@ -18589,8 +18923,9 @@ def api_annotations_changes():
     except (TypeError, ValueError):
         after = 0
     after = max(0, after)
+    subject = annotation_access.subject_from_request()
     cur = share_store.current_change_seq(safe)
-    changes = share_store.list_changes(safe, after)
+    changes = share_store.list_changes(safe, after, subject=subject)
     # after 超出可读水位 → reset_required（json 截断/丢最旧；pg 无该早期行）
     reset_required = bool(after > cur)
     return jsonify({"cursor": cur, "changes": changes, "reset_required": reset_required})
@@ -18647,6 +18982,8 @@ def api_annotation_add():
     token 固定为 "admin"，label 默认 "管理员"。slide 必须存在。
     几何字段随 type 不同：rect(x,y,side_px,size_mm) / arrow(x1,y1,x2,y2) /
     freehand(points)。shared 可选（默认 false），透传给 store 记录公开状态。
+    0056：client_action_id 可选（客户端幂等键，同键重复提交返回原标注）；
+    响应含 annotation_id/revision/作者与能力位。
     Stage 3a-2a：can_annotate_slide（owner 全量；user 自己的 + 协作切片），无权 403。
     """
     ident = current_identity()
@@ -18706,27 +19043,163 @@ def api_annotation_add():
     try:
         roi = share_store.add_roi(
             share_store.ADMIN_TOKEN, safe, label, type=typ, shared=shared, note=note,
-            owner_user_id=ident["user_id"], requester_role=ident["role"], **geom
+            owner_user_id=ident["user_id"], requester_role=ident["role"],
+            client_action_id=body.get("client_action_id"), **geom
         )
     except (ValueError, PermissionError) as e:
         return jsonify(error=str(e)), 400
     _audit("annotation.add", target_type="annotation", target_id=roi.get("annotation_id"),
            slide=safe, detail={"type": typ, "source": roi.get("source", "human")})
-    return jsonify(ok=True, index=roi["index"], shared=roi.get("shared", shared))
+    # 0056：响应补稳定定位（annotation_id/revision）+ 作者/能力位（幂等重放
+    # 返回原行，前端可据 annotation_id 去重）。
+    proj = annotation_access.author_projection(roi, label_of_user=_display_label)
+    return jsonify(ok=True, index=roi["index"], shared=roi.get("shared", shared),
+                   annotation_id=roi.get("annotation_id"),
+                   revision=roi.get("revision"),
+                   author_key=proj["author_key"], author_kind=proj["author_kind"],
+                   can_edit=True, can_delete=True)
 
 
 def _check_annotation_owner(token, index):
-    """资源级鉴权（docs §5.1.1）：owner 任意；否则仅本人创建的标注可改/删。
+    """资源级鉴权（docs §5.1.1 × 工单 A/0056）：owner 任意；否则仅本人创建
+    的标注或持有 can_edit 授权的可改/删。
 
     无权返回 (resp, None)（resp 为 403 JSON）；有权返回 (None, roi_or_None)。
     roi 为 None 表示标注不存在（owner 放行后续 store 调用自行 404）。
+    写判定与 annotation_access.can_write_annotation 同源：创建者（AI 溯源
+    归属优先）∪ annotation_grants(can_edit)；「能看切片」不授予写他人标注。
     """
     if _is_owner():
         return None, None
     roi = share_store.get_roi(token, index)
-    if roi is None or roi.get("owner_user_id") != _current_uid():
+    subject = annotation_access.subject_from_request()
+    if roi is None or not annotation_access.can_write_annotation(subject, roi):
         return _denied("只能修改自己创建的标注"), None
     return None, roi
+
+
+def _resolve_anno_by_id(annotation_id, require_write=False, allow_deleted=False):
+    """按稳定 annotation_id 取 ROI 并做切片×标注双层鉴权。"""
+    if not isinstance(annotation_id, str) or not annotation_id:
+        return None, (jsonify(error="缺少 annotation_id"), 400)
+    roi = share_store.get_roi_by_annotation_id(annotation_id)
+    if roi is None:
+        return None, (jsonify(error="标注不存在"), 404)
+    if roi.get("deleted") and not allow_deleted:
+        return None, (jsonify(error="标注不存在"), 404)
+    slide = roi.get("slide") or ""
+    if require_write:
+        if not can_annotate_slide(slide):
+            return None, _denied()
+        subject = annotation_access.subject_from_request()
+        if not annotation_access.can_write_annotation(subject, roi):
+            return None, _denied("只能修改自己创建的标注")
+    else:
+        if not can_view_slide(slide):
+            return None, _denied()
+        subject = annotation_access.subject_from_request()
+        if not annotation_access.can_read_annotation(subject, roi):
+            return None, (jsonify(error="标注不存在"), 404)
+    return roi, None
+
+
+@app.route("/api/annotation/id/<annotation_id>", methods=["DELETE"])
+def api_annotation_delete_by_id(annotation_id):
+    """按稳定 annotation_id 删除（CAS expected_revision）。目标不存在 → 404。"""
+    roi, err = _resolve_anno_by_id(annotation_id, require_write=True)
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    expected = body.get("expected_revision")
+    try:
+        ok = share_store.delete_roi_by_annotation_id(
+            annotation_id, expected_revision=expected)
+    except share_store.RevisionConflict as e:
+        return jsonify(error="revision_conflict",
+                       current_revision=e.current_revision), 409
+    if not ok:
+        return jsonify(error="标注不存在"), 404
+    _audit("annotation.delete", target_type="annotation", target_id=annotation_id,
+           slide=roi.get("slide"))
+    tomb = share_store.get_roi_by_annotation_id(annotation_id) or {}
+    return jsonify(ok=True, annotation_id=annotation_id,
+                   revision=tomb.get("revision"))
+
+
+@app.route("/api/annotation/id/<annotation_id>", methods=["PATCH"])
+def api_annotation_patch_by_id(annotation_id):
+    """按稳定 annotation_id 更新几何/备注或授权。"""
+    roi, err = _resolve_anno_by_id(annotation_id, require_write=True)
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    expected = body.get("expected_revision")
+    ident = current_identity()
+    grants_after = None
+    updated = None
+    if "grantee_kind" in body or "grantee_id" in body:
+        gk = body.get("grantee_kind")
+        gid = body.get("grantee_id")
+        if gk not in ("user", "share_token") or not isinstance(gid, str) or not gid:
+            return jsonify(error="grantee_kind 需为 user/share_token 且 grantee_id 非空"), 400
+        try:
+            if body.get("revoke_grant"):
+                share_store.revoke_grant(annotation_id, gk, gid)
+            elif gk == "user":
+                share_store.grant_annotation_to_user(
+                    annotation_id, gid, can_edit=bool(body.get("can_edit", False)),
+                    created_by=ident.get("user_id"))
+            else:
+                share_store.grant_annotation_to_share(
+                    annotation_id, gid, can_edit=bool(body.get("can_edit", False)),
+                    created_by=ident.get("user_id"))
+        except ValueError as e:
+            return jsonify(error=str(e)), 400
+        grants_after = share_store.list_grants(annotation_id=annotation_id)
+    if "geom" in body or "note" in body:
+        try:
+            updated = share_store.update_roi_by_annotation_id(
+                annotation_id, geom=body.get("geom"), note=body.get("note"),
+                expected_revision=expected)
+        except share_store.RevisionConflict as e:
+            return jsonify(error="revision_conflict",
+                           current_revision=e.current_revision), 409
+        except ValueError as e:
+            return jsonify(error=str(e)), 400
+        if updated is False:
+            return jsonify(error="标注不存在"), 404
+    out = {"ok": True, "annotation_id": annotation_id}
+    if updated:
+        out["revision"] = updated.get("revision")
+        out["note"] = updated.get("note", "")
+    if grants_after is not None:
+        out["grants"] = grants_after
+    return jsonify(out)
+
+
+@app.route("/api/annotation/id/<annotation_id>/restore", methods=["POST"])
+def api_annotation_restore(annotation_id):
+    """恢复 tombstone（重做创建）。CAS expected_revision 针对删除后的版本。"""
+    roi, err = _resolve_anno_by_id(annotation_id, require_write=True,
+                                   allow_deleted=True)
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    expected = body.get("expected_revision")
+    try:
+        restored = share_store.restore_roi(annotation_id,
+                                           expected_revision=expected)
+    except share_store.RevisionConflict as e:
+        return jsonify(error="revision_conflict",
+                       current_revision=e.current_revision), 409
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    if restored is False:
+        return jsonify(error="标注不存在"), 404
+    _audit("annotation.restore", target_type="annotation",
+           target_id=annotation_id, slide=restored.get("slide"))
+    return jsonify(ok=True, annotation_id=annotation_id,
+                   revision=restored.get("revision"))
 
 
 @app.route("/api/annotation/admin/<int:index>", methods=["DELETE"])
@@ -18782,36 +19255,79 @@ def api_annotation_delete(token, index):
 
 @app.route("/api/annotation/<token>/<int:index>", methods=["PATCH"])
 def api_annotation_set_shared(token, index):
-    """管理员策展/编辑：可切换「公开」状态，或更新几何/备注。
+    """管理员策展/编辑：切换标注授权/「公开」状态，或更新几何/备注。
 
     JSON body 支持任意组合：
-      - {"shared": bool}：走 set_roi_shared；
+      - {"shared": bool}：走 set_roi_shared。**0056 新语义**：shared=true
+        不再「对同片所有分享/用户公开」——仅当本条 token 是真实分享链接时
+        授予该链接只读；token=admin 时只记标志不扩大可见（要公开必须用
+        下面的显式 grant 字段）；shared=false 撤销对应授权；
+      - {"grantee_kind": "user"|"share_token", "grantee_id": "...",
+         "can_edit"?: bool}：显式授予（0056，工单 A 的授权原语）；配合
+         {"revoke_grant": true} 撤销该授权；
       - {"geom": {...}}：走 update_roi 更新几何（不含 type）；
       - {"note": "..."}：走 update_roi 更新备注。
       - {"expected_revision": int}（Stage 3c-1 CAS）：可选，不符 → 409。
-    两者可同时传（shared 与 geom/note 独立处理；expected_revision 对两者共同生效，
-    set_roi_shared 不 bump revision，故先 shared 后 update 顺序无碍）。
+    各部分独立处理（shared 与 geom/note 独立；expected_revision 对两者共同
+    生效，set_roi_shared 不 bump revision，故先 shared 后 update 顺序无碍）。
     token/index 无效（shared 或 update 侧）返回 404；
-    成功返回 {"ok": true, "shared": <更新后值>, "note": <更新后值>}。
-    Stage 3a-2a：owner 任意；否则仅本人创建（owner_user_id 判定），无权 403。
+    成功返回 {"ok": true, "shared": <更新后值>, "note": <更新后值>,
+    "grants": [...]}。
+    Stage 3a-2a × 0056：owner 任意；否则仅本人创建或持有 can_edit 授权
+    （_check_annotation_owner），无权 403。
     """
     if not isinstance(token, str) or not token:
         return jsonify(error="缺少 token"), 400
-    denied, _roi = _check_annotation_owner(token, index)
+    denied, roi = _check_annotation_owner(token, index)
     if denied:
         return denied
     body = request.get_json(silent=True) or {}
     expected = body.get("expected_revision")
+    ident = current_identity()
 
     shared_after = None
     note_after = None
+    grants_after = None
 
-    # shared 部分
+    # 显式授权部分（grantee_kind/grantee_id + granted|revoke_grant）
+    if "grantee_kind" in body or "grantee_id" in body:
+        gk = body.get("grantee_kind")
+        gid = body.get("grantee_id")
+        if gk not in ("user", "share_token") or not isinstance(gid, str) \
+                or not gid:
+            return jsonify(error="grantee_kind 需为 user/share_token 且 "
+                                 "grantee_id 非空"), 400
+        revoke = bool(body.get("revoke_grant", False))
+        aid_roi = roi or share_store.get_roi(token, index)
+        aid = (aid_roi or {}).get("annotation_id")
+        if not aid:
+            return jsonify(error="标注不存在"), 404
+        try:
+            if revoke:
+                share_store.revoke_grant(aid, gk, gid)
+            elif gk == "user":
+                share_store.grant_annotation_to_user(
+                    aid, gid, can_edit=bool(body.get("can_edit", False)),
+                    created_by=ident.get("user_id"))
+            else:
+                share_store.grant_annotation_to_share(
+                    aid, gid, can_edit=bool(body.get("can_edit", False)),
+                    created_by=ident.get("user_id"))
+        except ValueError as e:
+            return jsonify(error=str(e)), 400
+        grants_after = share_store.list_grants(annotation_id=aid)
+
+    # shared 部分（own-token / 显式 grantee 目标均由 store 语义承担）
     if "shared" in body:
         shared_target = bool(body.get("shared"))
+        grantee_kind = body.get("grantee_kind")
+        grantee_id = body.get("grantee_id")
         try:
             ok = share_store.set_roi_shared(
-                token, index, shared_target, expected_revision=expected)
+                token, index, shared_target, expected_revision=expected,
+                grantee_kind=grantee_kind, grantee_id=grantee_id,
+                can_edit=bool(body.get("can_edit", False)),
+                actor_user_id=ident.get("user_id"))
         except share_store.RevisionConflict as e:
             return jsonify(error="revision_conflict",
                            current_revision=e.current_revision), 409
@@ -18866,16 +19382,25 @@ def api_annotation_set_shared(token, index):
 
     _audit("annotation.update", target_type="annotation", slide=None,
            detail={"shared_after": shared_after})
-    return jsonify(ok=True, shared=shared_after, note=note_after)
+    out = {"ok": True, "shared": shared_after, "note": note_after}
+    if grants_after is not None:
+        out["grants"] = grants_after
+    if "updated" in locals() and isinstance(updated, dict) and updated.get("revision") is not None:
+        out["revision"] = updated.get("revision")
+        out["annotation_id"] = updated.get("annotation_id")
+    return jsonify(**out)
 
 
 # --------------------------------------------------------------------------- #
 # Stage 3c-1：评论线程 / AI 审核 / 修改历史（docs §5.3）
 # --------------------------------------------------------------------------- #
 def _resolve_anno(token, index, require_annotate):
-    """解析 token+index → roi 并做切片级鉴权。
+    """解析 token+index → roi 并做切片级 × 标注级双层鉴权。
 
-    require_annotate=True 时用 can_annotate_slide，否则 can_view_slide。
+    require_annotate=True 时切片层用 can_annotate_slide，否则 can_view_slide。
+    工单 A（0056）：切片通过后还要 can_read_annotation(subject, roi)——他人
+    私有标注的评论/历史/审核即便切片可见也 404（不泄露存在性区分的细节，
+    统一按「标注不存在」语义返回）。
     返回 (roi, None) 或 (None, error_response)。roi=None 表示不存在（已 404）。
     """
     if not isinstance(token, str) or not token:
@@ -18890,6 +19415,9 @@ def _resolve_anno(token, index, require_annotate):
         # 分支不可达，读隔离后 owner 亦可被拒——多包一层 1-tuple 会让 Flask
         # 以 TypeError 500 收场（review P0 2026-09-05 修复）。
         return None, _denied()
+    subject = annotation_access.subject_from_request()
+    if not annotation_access.can_read_annotation(subject, roi):
+        return None, (jsonify(error="标注不存在"), 404)
     return roi, None
 
 
@@ -18911,12 +19439,14 @@ def _display_label(uid):
 
 @app.route("/api/annotation/<token>/<int:index>/comments")
 def api_annotation_comments(token, index):
-    """列出某标注的评论。鉴权同查看（can_view_slide）。"""
+    """列出某标注的评论。鉴权同查看（can_view_slide × 标注可见性）。"""
     roi, err = _resolve_anno(token, index, require_annotate=False)
     if err:
         return err
     aid = roi.get("annotation_id")
-    return jsonify({"comments": share_store.list_comments(annotation_id=aid)})
+    subject = annotation_access.subject_from_request()
+    comments = share_store.list_comments(annotation_id=aid, subject=subject)
+    return jsonify({"comments": comments})
 
 
 @app.route("/api/annotation/<token>/<int:index>/comments", methods=["POST"])
@@ -18960,6 +19490,12 @@ def api_comment_resolve(comment_id):
     slide = target.get("slide") or ""
     if not can_annotate_slide(slide):
         return _denied()
+    # 工单 A（0056）：resolve 是对挂靠标注的写操作——父标注不可见（他人
+    # 私有）时不可 resolve（统一按不存在处理，不泄露）。
+    parent = share_store.get_roi_by_annotation_id(target.get("annotation_id"))
+    subject = annotation_access.subject_from_request()
+    if not annotation_access.can_read_annotation(subject, parent or {}):
+        return jsonify(error="评论不存在"), 404
     body = request.get_json(silent=True) or {}
     resolved = body.get("resolved")
     resolved = True if resolved is None else bool(resolved)

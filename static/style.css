@@ -967,7 +967,7 @@ button {
   flex-direction: column;
   gap: 1px;
 }
-/* 第一行：文件名（左）+ 标注 pill（右） */
+/* 第一行：名称独占整行（工单 B：徽章移到次行，窄侧栏互不挤压） */
 .slide-top {
   display: flex;
   align-items: center;
@@ -983,6 +983,13 @@ button {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* 第二行：标注 pill（标记/作者数）独立成行 */
+.slide-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
 }
 /* 第二行：meta 独占整行，不被右侧元素挤压 */
 .slide-meta {
@@ -4204,4 +4211,113 @@ button {
   .drawer-body { padding: 12px 12px 24px; }
   .project-create-dialog { max-height: calc(100vh - 32px); }
   .baidu-pager { flex-wrap: wrap; }
+}
+
+
+/* =========================================================================
+   工单 E：查看器右键菜单（把当前视野/标注加入 AI 会话草稿）
+   Apple HIG 风格浮层：同工具栏浮层（.toolbar-pop）材质，accent 高亮态。
+   ========================================================================= */
+.viewer-ctx-menu {
+  position: fixed;
+  z-index: 9000;
+  min-width: 180px;
+  max-width: 260px;
+  padding: 4px;
+  background: var(--toolbar-bg, rgba(255, 255, 255, 0.96));
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  backdrop-filter: saturate(180%) blur(20px);
+  border: 1px solid var(--separator);
+  border-radius: var(--r-panel, 12px);
+  box-shadow: var(--shadow-float);
+}
+.viewer-ctx-menu-item {
+  display: block;
+  width: 100%;
+  padding: 6px 10px;
+  border: none;
+  border-radius: var(--r-btn, 7px);
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.4;
+  text-align: left;
+  cursor: pointer;
+}
+.viewer-ctx-menu-item:hover,
+.viewer-ctx-menu-item:focus-visible {
+  background: var(--accent-fill, rgba(0, 122, 255, 0.12));
+  color: var(--accent);
+  outline: none;
+}
+.viewer-ctx-menu-item:active {
+  background: var(--hover-strong, rgba(0, 0, 0, 0.08));
+}
+
+
+/* ---- 工单 E：会话附件草稿条（#ai-pending-attaches，轨迹与 composer 之间） ---- */
+.ai-pending-attaches {
+  display: none;            /* 空态整体隐藏（JS 控制） */
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 12px 2px;
+  max-height: 132px;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+/* 附件卡：沿用 .ai-attach 底材，加待发送视觉（accent 描边 + 移除钮），
+   与轨迹里的历史快照卡（.ai-attach.snapshot）明确区分 */
+.ai-attach.pending-attach {
+  position: relative;
+  align-self: stretch;
+  max-width: none;
+  margin: 0;
+  padding: 6px 30px 6px 12px;
+  border: 1px solid var(--accent-fill, rgba(0, 122, 255, 0.12));
+  border-radius: var(--r-pill, 10px);
+  background: var(--accent-fill, rgba(0, 122, 255, 0.06));
+}
+.ai-attach.pending-attach .ai-attach-title {
+  color: var(--accent);
+}
+.ai-attach-remove {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+.ai-attach-remove:hover,
+.ai-attach-remove:focus-visible {
+  background: var(--hover, rgba(0, 0, 0, 0.05));
+  color: var(--danger);
+  outline: none;
+}
+/* composer「添加视野」按钮（键盘/触屏入口；插件动态插入 aux 行上方） */
+.ai-attach-view-btn {
+  align-self: flex-start;
+  margin: 2px 12px;
+  padding: 3px 10px;
+  border: 1px solid var(--separator-strong, rgba(0, 0, 0, 0.12));
+  border-radius: var(--r-pill, 10px);
+  background: transparent;
+  color: var(--accent);
+  font-family: var(--font);
+  font-size: 12px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+.ai-attach-view-btn:hover,
+.ai-attach-view-btn:focus-visible {
+  background: var(--accent-fill, rgba(0, 122, 255, 0.12));
+  border-color: var(--accent);
+  outline: none;
 }

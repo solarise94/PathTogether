@@ -173,6 +173,11 @@ _BUSINESS_TABLES = (
     # （CASCADE 已覆盖），显式列出防跨用例残留请求/邮件作业
     "format_request_mail_jobs",
     "format_requests",
+    # 0056 起：标注级授权（工单 A / P0 数据隔离；无外键，显式列出防跨用例
+    # 残留授权）
+    "annotation_grants",
+    "annotation_access_events",
+    "ai_session_principals",
     # 0051 起：百度分享导入（W5）。children first：items/batches/candidates
     # 引用 enumerations（TRUNCATE CASCADE 兜底，显式列出防跨用例残留
     # 枚举/批次/候选/条目与租约）

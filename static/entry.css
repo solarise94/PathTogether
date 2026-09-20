@@ -448,6 +448,63 @@ button:focus-visible {
   text-wrap: balance;
 }
 
+/* ---- 更新内容 ---- */
+.whats-new-list {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  max-width: 720px;
+}
+.whats-new-release {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--bg-raise);
+  padding: 18px 20px 8px;
+}
+.whats-new-release.is-latest {
+  border-color: var(--line-strong);
+}
+.whats-new-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 12px 16px;
+  margin-bottom: 12px;
+  list-style: none;
+}
+.whats-new-release:not(.is-latest) .whats-new-head { cursor: pointer; }
+.whats-new-version {
+  font-family: var(--mono);
+  font-size: 14px;
+  font-weight: 650;
+}
+.whats-new-date {
+  font-size: 13px;
+  color: var(--text-3);
+}
+.whats-new-items {
+  margin: 0 0 12px 1.1em;
+  padding: 0;
+}
+.whats-new-items li {
+  font-size: 14px;
+  color: var(--text-2);
+  margin: 0 0 8px;
+}
+.whats-new-empty { font-size: 14px; color: var(--text-2); }
+.whats-new-release summary::-webkit-details-marker { display: none; }
+.whats-new-release summary::after {
+  content: "";
+  margin-left: auto;
+  width: 0.55em;
+  height: 0.55em;
+  border-right: 1.5px solid var(--text-3);
+  border-bottom: 1.5px solid var(--text-3);
+  transform: rotate(45deg);
+  transition: transform 0.15s ease;
+}
+.whats-new-release[open] summary::after { transform: rotate(225deg); }
+
 /* ---- 产品如何工作：三列步骤 ---- */
 .how-grid {
   display: grid;

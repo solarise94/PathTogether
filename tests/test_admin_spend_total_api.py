@@ -361,18 +361,18 @@ def test_runtime_step_validator_field_level_bounds():
     assert ok == {"demo_max_concurrency": 8} and err is None
     ok, err = v({"demo_max_concurrency": 1_000_001})
     assert ok is None and err is not None
-    # 常量红线：共享上限未被改成 100；默认常量 = 100（demo 仍 20）
+    # 常量红线：共享上限未被改成 100；默认常量 = 100（工单 C 起 demo 同为 100）
     assert app_mod._BUDGET_LIMIT_MAX == 1_000_000
     assert budget_store.DEFAULT_PLATFORM_TASK_MAX_STEPS == 100
     assert budget_store.DEFAULT_OWN_TASK_MAX_STEPS_LIMIT == 100
-    assert budget_store.DEFAULT_DEMO_TASK_MAX_STEPS == 20
+    assert budget_store.DEFAULT_DEMO_TASK_MAX_STEPS == 100
     assert app_mod.DEFAULT_CONFIG["max_steps"] == 100
     assert app_mod._USER_STEP_LIMIT_MAX == 100
 
 
 def test_runtime_step_settings_api_and_demo_independence():
     """PUT settings/runtime：user 步数 >100 稳定 400、100 落库（2026-09-10
-    §2 A：101→400、100→200）；demo 步数独立默认 20 不继承 user 值。"""
+    §2 A：101→400、100→200）；demo 步数独立（显式 20，不继承 user 值）。"""
     bh.seed_spend_settings()
     owner, _u = _setup_users()
     c = _login(_client(), owner)

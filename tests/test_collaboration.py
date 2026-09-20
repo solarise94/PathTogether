@@ -385,7 +385,15 @@ def test_guest_comment_requires_annotate_perm():
     r = _add()
     aid = r["annotation_id"]
     c = _share_client()
-    # guest GET 评论 → 200（share 有效）
+    # 工单 A（0056）：admin 标注默认私有——未显式授予该分享前，guest
+    # 评论/读取按不可见处理（404，不泄露正文）
+    resp = c.get("/s/%s/api/comments?annotation_id=%s" % (tok, aid))
+    assert resp.status_code == 404
+    resp = c.post("/s/%s/api/comments" % tok,
+                  json={"annotation_id": aid, "body": "nope"})
+    assert resp.status_code == 404
+    # 显式授予该分享后：guest GET 评论 → 200（share 有效）
+    share_store.grant_annotation_to_share(aid, tok)
     resp = c.get("/s/%s/api/comments?annotation_id=%s" % (tok, aid))
     assert resp.status_code == 200, resp.get_data(as_text=True)
     # guest POST 评论（share 含 annotate）→ 200

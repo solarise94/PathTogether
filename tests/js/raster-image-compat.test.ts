@@ -378,7 +378,8 @@ describe("Wave 3：像素坐标标注保存不依赖 mpp", () => {
 		expect(call).toBeTruthy();
 		expect(call!.opts!.method).toBe("POST");
 		const body = JSON.parse(call!.opts!.body!);
-		// 权威几何是像素：与 mpp 无关，也绝不掺入 mm/size 字段冒充物理测量
+		// 权威几何是像素：与 mpp 无关，也绝不掺入 mm/size 字段冒充物理测量。
+		// 工单 D：提交带 client_action_id（客户端幂等键，重试/双击不重复建标注）。
 		expect(body).toEqual({
 			slide: "0005.bmp",
 			type: "rect",
@@ -386,7 +387,9 @@ describe("Wave 3：像素坐标标注保存不依赖 mpp", () => {
 			x: 10, y: 20, w: 30, h: 40,
 			shared: false,
 			note: "",
+			client_action_id: expect.any(String),
 		});
+		expect(body.client_action_id.length).toBeGreaterThan(0);
 		expect(Object.keys(body)).not.toContain("size_mm");
 		expect(Object.keys(body)).not.toContain("side_px");
 	});

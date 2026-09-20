@@ -483,9 +483,11 @@ def test_index_entry_landing_page_content(monkeypatch):
     assert 'id="note-body"' in body
     assert 'id="review-a"' in body and 'id="review-b"' in body
     # 无内联脚本（CSP script-src 'self'）；标题由 i18n.js 按 data-page=entry 同步
-    assert body.count("<script") == 3
+    # entry-releases.js：What's New 发布说明（2026-09-20），同为静态 self 脚本
+    assert body.count("<script") == 4
     assert 'src="/static/i18n.js' in body
     assert 'src="/static/entry.js' in body
+    assert 'src="/static/entry-releases.js' in body
     assert 'src="/static/entry-auth.js' in body
     assert 'data-page="entry"' in body
     assert 'id="principle"' in body
@@ -525,9 +527,10 @@ def test_entry_landing_source_guards():
     assert 'class="skip-link"' in html
     # 语言切换沿用 .lang-toggle
     assert 'class="lang-toggle"' in html
-    assert html.count("<script") == 3
+    assert html.count("<script") == 4
     assert 'src="/static/i18n.js' in html
     assert 'src="/static/entry.js' in html
+    assert 'src="/static/entry-releases.js' in html
     assert 'src="/static/entry-auth.js' in html
     assert 'data-page="entry"' in html
     assert 'id="principle"' in html

@@ -18,7 +18,9 @@
   - demo_ip_request_rate：固定窗口计数、窗口滚动重置、超限 retry_after、
     缺 hash 归 unknown 桶；
   - revoke_by_slide：终止该切片在途 run（capability 多切片复用，不整体失效）；
-  - demo_catalog 增删查排 + add 校验 slide 存在 + remove 联动撤销。
+  - demo_catalog 增删查排 + add 校验 slide 存在 + remove 联动撤销；
+  - 工单 B：demo_catalog 双语字段（display_name_en/description_en 持久化与
+    回落）+ TCGA 种子脚本四张切片英文名规格锁定。
 """
 import time
 import uuid
@@ -506,3 +508,70 @@ def test_catalog_remove_revokes_active_runs(pg_conn):
     assert demo_store.get_run_by_request("dmo_1", "req_1")["state"] == "expired"
     assert demo_store.catalog_list_ordered() == []
     assert demo_store.catalog_remove(s1) is None  # 再删 → None
+
+
+# --------------------------------------------------------------------------- #
+# demo_catalog 双语字段（工单 B / 0057）
+# --------------------------------------------------------------------------- #
+def test_catalog_bilingual_fields_roundtrip(pg_conn):
+    """catalog_add/list/get 携带并持久化英文字段；缺省 None = 无译文。"""
+    s1 = _slide(pg_conn, "bi.svs")
+    e = demo_store.catalog_add(
+        s1, display_name="肺腺癌 TCGA-49-AAR4",
+        description="中文说明",
+        display_name_en="Lung adenocarcinoma TCGA-49-AAR4",
+        description_en="English description",
+        sort_order=0, added_by="usr_owner")
+    assert e["display_name"] == "肺腺癌 TCGA-49-AAR4"
+    assert e["display_name_en"] == "Lung adenocarcinoma TCGA-49-AAR4"
+    assert e["description"] == "中文说明"
+    assert e["description_en"] == "English description"
+    got = demo_store.catalog_get(s1)
+    assert got["display_name_en"] == e["display_name_en"]
+    assert got["description_en"] == e["description_en"]
+    listed = demo_store.catalog_list_ordered()
+    assert listed == [e]
+    # UPSERT：更新英文字段不新增条目；不传 en → 置空（无译文回落中文）
+    e2 = demo_store.catalog_add(
+        s1, display_name="新名", display_name_en="New name")
+    assert e2["display_name"] == "新名"
+    assert e2["display_name_en"] == "New name"
+    assert e2["description_en"] is None and e2["description"] is None
+    assert len(demo_store.catalog_list_ordered()) == 1
+
+
+def test_catalog_bilingual_missing_en_falls_back_none(pg_conn):
+    """只写中文（旧调用方/旧数据）：英文字段为 None，不猜值。"""
+    s1 = _slide(pg_conn, "zh-only.svs")
+    e = demo_store.catalog_add(s1, display_name="旧条目", description="旧说明")
+    assert e["display_name_en"] is None
+    assert e["description_en"] is None
+    assert demo_store.catalog_get(s1)["display_name_en"] is None
+
+
+def test_seed_demo_tcga_catalog_bilingual_names():
+    """工单 B：TCGA 种子四张切片英文名精确匹配规格，中文名保留，双语齐备。"""
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "seed_demo_tcga_catalog",
+        Path(__file__).resolve().parent.parent / "scripts" /
+        "seed_demo_tcga_catalog.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    # 7 元组：文件名 / 中文名 / 中文说明 / 英文名 / 英文说明 / 排序 / 默认
+    assert all(len(row) == 7 for row in mod.TCGA_SLIDES)
+    assert all(row[3] and row[4] for row in mod.TCGA_SLIDES)
+    assert [row[3] for row in mod.TCGA_SLIDES] == [
+        "Lung adenocarcinoma TCGA-49-AAR4",
+        "Lung adenocarcinoma TCGA-86-8668",
+        "Hepatocellular carcinoma TCGA-BC-A10Q",
+        "Cholangiocarcinoma TCGA-FV-A3R2",
+    ]
+    # 中文名/说明不英化（保持中文/缺省语言语义）
+    assert [row[1] for row in mod.TCGA_SLIDES] == [
+        "肺腺癌 TCGA-49-AAR4", "肺腺癌 TCGA-86-8668",
+        "肝细胞癌 TCGA-BC-A10Q", "胆管癌 TCGA-FV-A3R2"]
+    for row in mod.TCGA_SLIDES:
+        assert "TCGA" in row[2]  # 中文说明仍描述 TCGA 公开切片
+        assert "clinical" in row[4].lower()  # 英文说明含「不用于临床诊断」

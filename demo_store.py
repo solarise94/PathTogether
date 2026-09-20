@@ -221,6 +221,7 @@ _RUN_SEL = (
 
 _CATALOG_SEL = (
     "slide_id, display_name, description, sort_order, is_default, added_by, "
+    "display_name_en, description_en, "
     "extract(epoch from added_at)::float8 AS added_at"
 )
 
@@ -902,8 +903,12 @@ def hit_ip_request_rate(ip_prefix_hash, limit=None,
 # demo_catalog：Demo 切片目录（owner allowlist）
 # --------------------------------------------------------------------------- #
 def catalog_add(slide_id, display_name=None, description=None, sort_order=0,
-                added_by=None):
+                added_by=None, display_name_en=None, description_en=None):
     """加入/更新 Demo 目录条目（UPSERT；is_default 不在此处改动）。
+
+    双语（工单 B / 0057）：``display_name``/``description`` 为中文/缺省语言，
+    ``display_name_en``/``description_en`` 可空（None = 无译文，读取端回落
+    缺省字段）。不对用户自定义工作台别名做任何翻译。
 
     校验 slide_id 在 slides 表存在（Demo allowlist 只接受已入库的稳定切片
     身份），不存在抛 ValueError。返回条目 dict。
@@ -922,15 +927,18 @@ def catalog_add(slide_id, display_name=None, description=None, sort_order=0,
                 cur.execute(
                     "INSERT INTO demo_catalog "
                     "(slide_id, display_name, description, sort_order, "
-                    " added_by, added_at) VALUES (%s,%s,%s,%s,%s, now()) "
+                    " added_by, added_at, display_name_en, description_en) "
+                    "VALUES (%s,%s,%s,%s,%s, now(), %s, %s) "
                     "ON CONFLICT (slide_id) DO UPDATE SET "
                     "display_name=EXCLUDED.display_name, "
                     "description=EXCLUDED.description, "
                     "sort_order=EXCLUDED.sort_order, "
-                    "added_by=EXCLUDED.added_by, added_at=now() "
+                    "added_by=EXCLUDED.added_by, added_at=now(), "
+                    "display_name_en=EXCLUDED.display_name_en, "
+                    "description_en=EXCLUDED.description_en "
                     "RETURNING " + _CATALOG_SEL,
                     (slide_id, display_name, description, int(sort_order),
-                     added_by))
+                     added_by, display_name_en, description_en))
                 return _catalog_out(cur.fetchone())
     finally:
         conn.close()

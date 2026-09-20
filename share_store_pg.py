@@ -41,6 +41,7 @@ import uuid
 
 import psycopg
 
+import annotation_access
 import pg_store
 from share_shared import (
     ADMIN_TOKEN,
@@ -177,15 +178,28 @@ def _geom_of(roi: dict) -> dict:
     return {k: roi[k] for k in _GEOM_KEYS if k in roi}
 
 
+def _roi_visibility_status(roi: dict) -> str:
+    """行级可见性状态列（0056）：unclaimed / granted / private。
+
+    判定权威在 annotation_access.is_unclaimed / annotation_grants；本列只是
+    查询与审计报表的 aid（0056 迁移一次性回填存量，运行期由本函数与授权
+    函数维护）。
+    """
+    if annotation_access.is_unclaimed(roi):
+        return "unclaimed"
+    return "private"
+
+
 def _insert_roi(cur, roi: dict, rid: str):
     """插入一条 roi：data 存权威 dict，离散列镜像，返回 insert_seq。"""
     now = roi.get("updated_at") or roi.get("ts") or time.time()
     cur.execute(
         "INSERT INTO rois "
         "(id, token, slide, annotation_id, label, type, geom, size_mm, shared, "
-        " note, deleted, owner_user_id, created_at, updated_at, data) "
+        " note, deleted, owner_user_id, created_at, updated_at, data, "
+        " visibility_status, client_action_id) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, to_timestamp(%s), "
-        "to_timestamp(%s), %s) RETURNING insert_seq",
+        "to_timestamp(%s), %s, %s, %s) RETURNING insert_seq",
         (
             rid, roi.get("token"), roi.get("slide"), roi.get("annotation_id"),
             roi.get("label", ""), roi.get("type", "rect"),
@@ -194,6 +208,7 @@ def _insert_roi(cur, roi: dict, rid: str):
             roi.get("note", ""), bool(roi.get("deleted", False)),
             roi.get("owner_user_id"), now, now,
             psycopg.types.json.Jsonb(roi),
+            _roi_visibility_status(roi), roi.get("client_action_id"),
         ),
     )
     return cur.fetchone()["insert_seq"]
@@ -256,6 +271,16 @@ def _fetch_live_rois_locked(cur, token):
     cur.execute(
         "SELECT id, data FROM rois WHERE token=%s AND NOT deleted "
         "ORDER BY insert_seq FOR UPDATE",
+        (token,),
+    )
+    return cur.fetchall()
+
+
+def _fetch_token_rows(cur, token):
+    """按 token 取全部 ROI 行（含 tombstone，insert_seq 序）——index 语义
+    （token 内含 tombstone 的数组位置）与幂等回读定位用。"""
+    cur.execute(
+        "SELECT data FROM rois WHERE token=%s ORDER BY insert_seq",
         (token,),
     )
     return cur.fetchall()
@@ -735,10 +760,13 @@ def list_slide_view_grants():
 # --------------------------------------------------------------------------- #
 def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note="", visitor=None,
             source=None, created_by_session_id=None, _effect_key=None, owner_user_id=None,
-            requester_role=None, provenance=None, **geom):
+            requester_role=None, provenance=None, client_action_id=None, **geom):
     """为 token 的 share 添加一条标注；统一入口，支持 rect/arrow/freehand。
 
     语义与 json 完全一致（含 WAL effect_key 幂等、index 语义、source 推断）。
+    0056：client_action_id（客户端幂等键）——有 owner 时按
+    (owner_user_id, client_action_id) 唯一约束去重，重复提交返回原标注
+    （唯一索引兜底并发，撞索引时回读原行）。
     """
     _reject_guest_write(requester_role)
     if type not in ROI_TYPES:
@@ -766,6 +794,25 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
                         raise ValueError("share invalid")
                     if slide not in (share.get("slides") or []):
                         raise ValueError("slide not in share")
+                # 0056 幂等：client_action_id（有 owner 时）已落 → 复用返回
+                if client_action_id and (owner_user_id or _OWNER_USER_ID):
+                    eff_owner = owner_user_id or _OWNER_USER_ID
+                    cur.execute(
+                        "SELECT data FROM rois WHERE NOT deleted "
+                        "AND owner_user_id=%s AND client_action_id=%s "
+                        "ORDER BY insert_seq",
+                        (eff_owner, client_action_id),
+                    )
+                    hit = cur.fetchone()
+                    if hit is not None:
+                        all_rows = _fetch_token_rows(cur, token)
+                        idx = next(
+                            (i for i, row in enumerate(all_rows)
+                             if row["data"].get("annotation_id") ==
+                             hit["data"].get("annotation_id")),
+                            len(all_rows) - 1)
+                        return _roi_out(hit["data"], index=idx,
+                                        shared=_roi_shared_compat(hit["data"]))
                 # WAL 幂等：effect_key 已落 → 复用返回
                 if _effect_key:
                     cur.execute(
@@ -817,6 +864,8 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
                 }
                 if _effect_key:
                     roi["effect_key"] = _effect_key
+                if client_action_id:
+                    roi["client_action_id"] = str(client_action_id)
                 # Stage 3c-2：AI 溯源子对象（仅 AI 写入，且仅当传入非空 dict 才落）
                 if src == "ai" and isinstance(provenance, dict) and provenance:
                     roi["provenance"] = dict(provenance)
@@ -824,7 +873,32 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
                 roi["change_seq"] = _bump_change_seq(
                     cur, slide, token, roi["annotation_id"], "add")
                 rid = "roi_" + secrets.token_urlsafe(10)
-                _insert_roi(cur, roi, rid)
+                try:
+                    _insert_roi(cur, roi, rid)
+                except psycopg.errors.UniqueViolation:
+                    # 0056 并发兜底：同 (owner, client_action_id) 撞唯一索引
+                    # → 事务已失效，回读原行返回（不重复落第二条）
+                    if not (client_action_id and roi.get("owner_user_id")):
+                        raise
+                    c.rollback()
+                    with c.cursor() as cur2:
+                        cur2.execute(
+                            "SELECT data FROM rois WHERE NOT deleted "
+                            "AND owner_user_id=%s AND client_action_id=%s "
+                            "ORDER BY insert_seq",
+                            (roi["owner_user_id"], client_action_id),
+                        )
+                        hit = cur2.fetchone()
+                    if hit is None:
+                        raise
+                    all_rows = _fetch_token_rows(cur2, token)
+                    idx = next(
+                        (i for i, row in enumerate(all_rows)
+                         if row["data"].get("annotation_id") ==
+                         hit["data"].get("annotation_id")),
+                        len(all_rows) - 1)
+                    return _roi_out(hit["data"], index=idx,
+                                    shared=_roi_shared_compat(hit["data"]))
                 out = _roi_out(roi)
                 out["index"] = total
                 out["shared"] = bool(shared)
@@ -908,8 +982,12 @@ def update_roi(token, index, geom=None, note=None, expected_revision=None):
         conn.close()
 
 
-def list_rois(token=None):
-    """返回 ROI 列表；可按 token 过滤（跳过 tombstone）。"""
+def list_rois(token=None, subject=None, access_context=None):
+    """返回 ROI 列表；可按 token 过滤（跳过 tombstone）。
+
+    0056：subject 非 None 时按主体过滤（annotation_access.can_read_annotation）；
+    index 保持 pre-filter 位置（token 内非 tombstone 序），不按可见子集重编号。
+    """
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -923,9 +1001,15 @@ def list_rois(token=None):
                     cur.execute(
                         "SELECT data FROM rois WHERE NOT deleted ORDER BY insert_seq")
                     rows = cur.fetchall()
+        ctx = (access_context if access_context is not None
+               else annotation_access.access_context_for(subject)
+               if subject is not None else None)
         if token is not None:
             out = []
             for i, row in enumerate(rows):
+                if subject is not None and not annotation_access.can_read_annotation(
+                        subject, row["data"], ctx):
+                    continue
                 r = _rect_read_compat(dict(row["data"]))
                 r["index"] = i
                 r["shared"] = _roi_shared_compat(r)
@@ -937,9 +1021,14 @@ def list_rois(token=None):
         counters = defaultdict(int)
         out = []
         for row in rows:
-            r = _rect_read_compat(dict(row["data"]))
-            r["index"] = counters[r["token"]]
-            counters[r["token"]] += 1
+            r_raw = row["data"]
+            idx = counters[r_raw["token"]]
+            counters[r_raw["token"]] += 1
+            if subject is not None and not annotation_access.can_read_annotation(
+                    subject, r_raw, ctx):
+                continue
+            r = _rect_read_compat(dict(r_raw))
+            r["index"] = idx
             r["shared"] = _roi_shared_compat(r)
             r["note"] = r.get("note", "")
             out.append(r)
@@ -1099,11 +1188,166 @@ def delete_roi_by_annotation_id(annotation_id, expected_revision=None):
         conn.close()
 
 
-def list_changes(slide, after_seq):
+def restore_roi(annotation_id, expected_revision=None):
+    """恢复 tombstone（按稳定 annotation_id）。成功返回 roi dict，否则 False。
+
+    重做创建必须走这条路径：同一 client_action_id 不能再 INSERT（唯一索引
+    覆盖 tombstone）。CAS 针对 tombstone 当前 revision。
+    """
+    if not annotation_id:
+        raise ValueError("缺少 annotation_id")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT id, data FROM rois WHERE annotation_id=%s "
+                    "FOR UPDATE",
+                    (annotation_id,))
+                row = cur.fetchone()
+                if row is None:
+                    return False
+                rid = row["id"]
+                roi = dict(row["data"])
+                if not roi.get("deleted"):
+                    # 已是活行：幂等返回
+                    out = _roi_out(roi)
+                    out["shared"] = _roi_shared_compat(roi)
+                    return out
+                _check_cas(roi, expected_revision)
+                roi["deleted"] = False
+                roi.pop("deleted_at", None)
+                roi["revision"] = int(roi.get("revision") or 1) + 1
+                roi["updated_at"] = time.time()
+                roi["change_seq"] = _bump_change_seq(
+                    cur, roi.get("slide"), roi.get("token") or "",
+                    roi.get("annotation_id"), "restore")
+                _update_roi_row(cur, rid, roi)
+                out = _roi_out(roi)
+                out["shared"] = _roi_shared_compat(roi)
+                return out
+    finally:
+        conn.close()
+
+
+def update_roi_by_annotation_id(annotation_id, geom=None, note=None,
+                                expected_revision=None):
+    """按稳定 annotation_id 更新几何/备注（CAS 同 update_roi）。"""
+    if not annotation_id:
+        raise ValueError("缺少 annotation_id")
+    if geom is not None and not isinstance(geom, dict):
+        raise ValueError("geom 需为对象")
+    note_clean = "_UNSET_"
+    if note is not None:
+        note_clean = _clean_note(note)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT id, data FROM rois WHERE annotation_id=%s "
+                    "AND NOT deleted FOR UPDATE",
+                    (annotation_id,))
+                row = cur.fetchone()
+                if row is None:
+                    return False
+                rid = row["id"]
+                roi = dict(row["data"])
+                token = roi.get("token") or ""
+                _check_cas(roi, expected_revision)
+                orig_type = roi.get("type", "rect")
+                _append_history(roi)
+                if geom is not None:
+                    geom_full = dict(geom)
+                    if orig_type == "rect" and "size_mm" not in geom_full:
+                        geom_full["size_mm"] = roi.get("size_mm", 0.0)
+                    if orig_type == "rect":
+                        _effective_rect_geometry(roi, geom_full)
+                        if ("side_px" in geom_full and "w" not in geom_full
+                                and "h" not in geom_full
+                                and roi.get("geometry_version") == 2):
+                            side_val = geom_full.pop("side_px")
+                            geom_full["w"] = side_val
+                            geom_full["h"] = side_val
+                    norm_g = _validate_geom(orig_type, geom_full)
+                    norm_g["type"] = orig_type
+                    roi.update(norm_g)
+                    if orig_type == "rect" \
+                            and norm_g.get("geometry_version") == 2 \
+                            and "side_px" not in norm_g:
+                        roi.pop("side_px", None)
+                if note_clean != "_UNSET_":
+                    roi["note"] = note_clean
+                roi["revision"] = int(roi.get("revision") or 1) + 1
+                roi["change_seq"] = _bump_change_seq(
+                    cur, roi.get("slide"), token, roi.get("annotation_id"),
+                    "update")
+                roi["updated_at"] = time.time()
+                _update_roi_row(cur, rid, roi)
+                out = _roi_out(roi)
+                out["shared"] = _roi_shared_compat(roi)
+                return out
+    finally:
+        conn.close()
+
+
+def upsert_ai_session_principal(session_id, user_id, slide=None):
+    """绑定 AI 会话属主（spots 读取主体）。已有会话不得改绑 user_id。"""
+    if not session_id or not user_id:
+        return False
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ai_session_principals "
+                    "(session_id, user_id, slide, updated_at) "
+                    "VALUES (%s,%s,%s,now()) "
+                    "ON CONFLICT (session_id) DO UPDATE SET "
+                    "slide=COALESCE(EXCLUDED.slide, ai_session_principals.slide), "
+                    "updated_at=now() "
+                    "WHERE ai_session_principals.user_id = EXCLUDED.user_id "
+                    "RETURNING user_id",
+                    (session_id, user_id, slide or None),
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    return True
+                cur.execute(
+                    "SELECT user_id FROM ai_session_principals WHERE session_id=%s",
+                    (session_id,))
+                existing = cur.fetchone()
+                return bool(existing and existing["user_id"] == user_id)
+    finally:
+        conn.close()
+
+
+def get_ai_session_principal(session_id):
+    """返回 {session_id, user_id, slide} 或 None。"""
+    if not session_id:
+        return None
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT session_id, user_id, slide FROM ai_session_principals "
+                    "WHERE session_id=%s",
+                    (session_id,))
+                row = cur.fetchone()
+                return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def list_changes(slide, after_seq, subject=None, access_context=None):
     """返回 change_seq > after_seq 的全部变更（含 tombstone）。
 
     Stage 3c-1：含评论增删（type=comment）与标注变更（type=annotation）；tombstone
     标注走 _roi_out 最小字段输出。
+    0056 工单 A / P0：subject 非 None 时按主体过滤（annotation_access.
+    filter_changes）——不可见标注的文本/几何/身份/tombstone 与挂靠评论一律
+    不出流；被跳过事件的 seq 照常越过（游标推进语义不变）。
     """
     if not isinstance(after_seq, (int, float)):
         after_seq = 0
@@ -1119,6 +1363,27 @@ def list_changes(slide, after_seq):
                     "SELECT data FROM comments WHERE slide=%s ORDER BY created_at",
                     (slide,))
                 crows = cur.fetchall()
+                cur.execute(
+                    "SELECT seq, slide, annotation_id, op, grantee_kind, grantee_id "
+                    "FROM annotation_access_events WHERE slide=%s AND seq > %s "
+                    "ORDER BY seq",
+                    (slide, after_seq))
+                access_rows = cur.fetchall()
+        if subject is not None:
+            ctx = (access_context if access_context is not None
+                   else annotation_access.access_context_for(subject))
+            parent_by_aid = {r["data"].get("annotation_id"): r["data"]
+                             for r in rows}
+            visible_raw = annotation_access.filter_rois(
+                subject, [r["data"] for r in rows], ctx)
+            visible_ids = {r.get("annotation_id") for r in visible_raw}
+            rows = [r for r in rows
+                    if r["data"].get("annotation_id") in visible_ids]
+            crows = [r for r in crows
+                     if annotation_access.can_read_annotation(
+                         subject,
+                         parent_by_aid.get(r["data"].get("annotation_id")),
+                         ctx)]
         out = []
         for row in rows:
             r = row["data"]
@@ -1127,6 +1392,9 @@ def list_changes(slide, after_seq):
                 continue
             rr = _roi_out(r)
             rr.setdefault("type", "annotation")
+            if subject is not None:
+                rr = annotation_access.public_roi_view(rr, subject)
+                rr.setdefault("type", "annotation")
             out.append(rr)
         for row in crows:
             c = row["data"]
@@ -1135,7 +1403,24 @@ def list_changes(slide, after_seq):
                 continue
             cc = dict(c)
             cc["type"] = "comment"
+            if subject is not None:
+                cc = annotation_access.public_comment_view(cc)
+                cc["type"] = "comment"
             out.append(cc)
+        for row in access_rows:
+            ev = {
+                "type": "access",
+                "op": row["op"],
+                "annotation_id": row["annotation_id"],
+                "slide": row["slide"],
+                "change_seq": int(row["seq"]),
+                "grantee_kind": row["grantee_kind"],
+                "grantee_id": row["grantee_id"],
+                "reset_required": row["op"] == "revoke",
+            }
+            if subject is None or annotation_access.can_see_access_event(subject, ev):
+                out.append(annotation_access.public_access_event_view(ev)
+                           if subject is not None else ev)
         out.sort(key=lambda x: x.get("change_seq", 0))
         return out
     finally:
@@ -1156,10 +1441,24 @@ def current_change_seq(slide):
         conn.close()
 
 
-def set_roi_shared(token, index, shared, expected_revision=None):
+def set_roi_shared(token, index, shared, expected_revision=None,
+                   grantee_kind=None, grantee_id=None, can_edit=False,
+                   actor_user_id=None):
     """设置该 token 下第 index 条 ROI 的 shared 字段（跳过 tombstone）。
 
     expected_revision（CAS）：提供且与当前 revision 不符 → 抛 RevisionConflict。
+
+    0056 新语义（工单 A / P0）：``shared`` **不再**是「对同片所有分享/用户
+    公开」的全局开关，而是收窄为标注级授权的便捷封装：
+      - shared=True + 显式 (grantee_kind, grantee_id)：授予该 user/share_token
+        （can_edit 缺省只读）；
+      - shared=True 无显式目标：仅当本条 token 是**真实分享链接**时，授予
+        该 token 只读（「分享到本链接」）；token=admin 时**不再全局公开**
+        （shared 标志照记，但不会让任何其他主体可见——旧行为的 breaking
+        change，见 0056 迁移注释；要公开请显式授权）；
+      - shared=False：撤销上述口径对应的授权（显式目标或本 token）。
+
+    返回 True（沿用既有 bool 契约；授权明细经 list_grants 另查）。
     """
     shared_b = bool(shared)
     conn = _connect()
@@ -1174,7 +1473,255 @@ def set_roi_shared(token, index, shared, expected_revision=None):
                 _check_cas(roi, expected_revision)
                 roi["shared"] = shared_b
                 _update_roi_row(cur, rid, roi)
+                aid = roi.get("annotation_id")
+                # —— 授权维护（同事务；aid 缺失的旧行不授权，仅记标志）——
+                if aid:
+                    if grantee_kind is not None or grantee_id is not None:
+                        if grantee_kind not in ("user", "share_token"):
+                            raise ValueError("grantee_kind 需为 user 或 share_token")
+                        if not grantee_id:
+                            raise ValueError("缺少 grantee_id")
+                        if shared_b:
+                            _grant_annotation_tx(
+                                cur, aid, grantee_kind, grantee_id,
+                                can_edit=bool(can_edit),
+                                created_by=actor_user_id)
+                        else:
+                            _revoke_annotation_grant_tx(
+                                cur, aid, grantee_kind, grantee_id)
+                    elif shared_b and token != ADMIN_TOKEN:
+                        # 「分享到本链接」：token 是真实分享 → 授予该 token 只读
+                        _grant_annotation_tx(
+                            cur, aid, "share_token", token, can_edit=False,
+                            created_by=actor_user_id)
+                    elif not shared_b and token != ADMIN_TOKEN:
+                        _revoke_annotation_grant_tx(cur, aid, "share_token", token)
                 return True
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 标注级授权（annotation_grants，0056 工单 A / P0）
+#
+# 跨主体可见性唯一的显式原语：grantee ∈ {user, share_token}；can_edit 缺省
+# 只读。tombstone 不清理授权行（删除事件对被授权者仍需可见）。visibility_
+# status 列随授权维护（private↔granted，仅报表/查询 aid）。
+# --------------------------------------------------------------------------- #
+def _record_access_event_tx(cur, annotation_id, op, grantee_kind, grantee_id,
+                            actor_user_id=None):
+    """写入 change_log + annotation_access_events（同 seq）。"""
+    cur.execute(
+        "SELECT slide, token FROM rois WHERE annotation_id=%s LIMIT 1",
+        (annotation_id,))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    slide, token = row["slide"], row["token"] or ""
+    seq = _bump_change_seq(cur, slide, token, annotation_id, "access_" + op)
+    cur.execute(
+        "INSERT INTO annotation_access_events "
+        "(seq, slide, annotation_id, op, grantee_kind, grantee_id, actor_user_id) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+        (seq, slide, annotation_id, op, grantee_kind, grantee_id,
+         actor_user_id or None),
+    )
+    return seq
+
+
+def _grant_annotation_tx(cur, annotation_id, grantee_kind, grantee_id,
+                         can_edit=False, created_by=None):
+    """同事务 UPSERT 一条授权（幂等；can_edit 以最新写入为准）。"""
+    cur.execute(
+        "INSERT INTO annotation_grants "
+        "(annotation_id, grantee_kind, grantee_id, can_edit, created_by) "
+        "VALUES (%s,%s,%s,%s,%s) "
+        "ON CONFLICT (annotation_id, grantee_kind, grantee_id) "
+        "DO UPDATE SET can_edit=EXCLUDED.can_edit, created_by=EXCLUDED.created_by",
+        (annotation_id, grantee_kind, grantee_id, bool(can_edit),
+         created_by or None),
+    )
+    cur.execute(
+        "UPDATE rois SET visibility_status='granted' "
+        "WHERE annotation_id=%s AND visibility_status='private'",
+        (annotation_id,),
+    )
+    _record_access_event_tx(cur, annotation_id, "grant", grantee_kind,
+                            grantee_id, actor_user_id=created_by)
+
+
+def _revoke_annotation_grant_tx(cur, annotation_id, grantee_kind, grantee_id,
+                                actor_user_id=None):
+    """同事务删除一条授权；无剩余授权行时回落 private。"""
+    cur.execute(
+        "DELETE FROM annotation_grants "
+        "WHERE annotation_id=%s AND grantee_kind=%s AND grantee_id=%s "
+        "RETURNING 1",
+        (annotation_id, grantee_kind, grantee_id),
+    )
+    existed = cur.fetchone() is not None
+    cur.execute(
+        "UPDATE rois SET visibility_status='private' "
+        "WHERE annotation_id=%s AND visibility_status='granted' "
+        "AND NOT EXISTS (SELECT 1 FROM annotation_grants g "
+        "                WHERE g.annotation_id=%s)",
+        (annotation_id, annotation_id),
+    )
+    if existed:
+        _record_access_event_tx(cur, annotation_id, "revoke", grantee_kind,
+                                grantee_id, actor_user_id=actor_user_id)
+    return existed
+
+
+def _list_annotation_grants_tx(cur, annotation_id):
+    cur.execute(
+        "SELECT annotation_id, grantee_kind, grantee_id, can_edit, created_by, "
+        "extract(epoch from created_at)::float8 AS created_at "
+        "FROM annotation_grants WHERE annotation_id=%s ORDER BY created_at",
+        (annotation_id,))
+    return [dict(r) for r in cur.fetchall()]
+
+
+def grant_annotation_to_user(annotation_id, user_id, can_edit=False,
+                             created_by=None):
+    """授予某用户对标注的访问（缺省只读）。annotation_id 不存在 → ValueError。"""
+    if not annotation_id or not user_id:
+        raise ValueError("annotation_id 与 user_id 不能为空")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute("SELECT 1 FROM rois WHERE annotation_id=%s",
+                            (annotation_id,))
+                if cur.fetchone() is None:
+                    raise ValueError("标注不存在")
+                _grant_annotation_tx(cur, annotation_id, "user", user_id,
+                                     can_edit=bool(can_edit),
+                                     created_by=created_by)
+                return _list_annotation_grants_tx(cur, annotation_id)
+    finally:
+        conn.close()
+
+
+def grant_annotation_to_share(annotation_id, share_token, can_edit=False,
+                              created_by=None):
+    """授予某分享链接对标注的访问（缺省只读）。token 需为真实分享。"""
+    if not annotation_id or not share_token:
+        raise ValueError("annotation_id 与 share_token 不能为空")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute("SELECT 1 FROM rois WHERE annotation_id=%s",
+                            (annotation_id,))
+                if cur.fetchone() is None:
+                    raise ValueError("标注不存在")
+                share = _fetch_share(cur, share_token)
+                if share is None:
+                    raise ValueError("分享链接不存在")
+                _grant_annotation_tx(cur, annotation_id, "share_token",
+                                     share_token, can_edit=bool(can_edit),
+                                     created_by=created_by)
+                return _list_annotation_grants_tx(cur, annotation_id)
+    finally:
+        conn.close()
+
+
+def revoke_grant(annotation_id, grantee_kind, grantee_id):
+    """撤销一条授权（幂等；返回撤销前是否确有该行）。"""
+    if grantee_kind not in ("user", "share_token"):
+        raise ValueError("grantee_kind 需为 user 或 share_token")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                return _revoke_annotation_grant_tx(
+                    cur, annotation_id, grantee_kind, grantee_id)
+    finally:
+        conn.close()
+
+
+def list_grants(annotation_id=None, grantee_kind=None, grantee_id=None):
+    """按条件列授权行（annotation_id / grantee 组合过滤；按创建时间升序）。"""
+    clauses, params = [], []
+    if annotation_id is not None:
+        clauses.append("annotation_id=%s")
+        params.append(annotation_id)
+    if grantee_kind is not None:
+        clauses.append("grantee_kind=%s")
+        params.append(grantee_kind)
+    if grantee_id is not None:
+        clauses.append("grantee_id=%s")
+        params.append(grantee_id)
+    sql = ("SELECT annotation_id, grantee_kind, grantee_id, can_edit, "
+           "created_by, extract(epoch from created_at)::float8 AS created_at "
+           "FROM annotation_grants")
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY created_at"
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(sql, tuple(params))
+                return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def annotation_grants_for_subject(grantee_kind, grantee_id):
+    """主体的授权表 {annotation_id: can_edit}（annotation_access 过滤用）。"""
+    if not grantee_kind or not grantee_id:
+        return {}
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT annotation_id, can_edit FROM annotation_grants "
+                    "WHERE grantee_kind=%s AND grantee_id=%s",
+                    (grantee_kind, grantee_id))
+                return {r["annotation_id"]: bool(r["can_edit"])
+                        for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+
+def annotation_visibility_report():
+    """0056 审计报表：owned / visitor_bound / shared_true_legacy / granted /
+    unclaimed 计数与样本 annotation_id（前 20，认领核对用）。
+
+    只读、不改动任何行（不批量公开/不推 owner/不删历史）。
+    """
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT annotation_id, owner_user_id IS NOT NULL "
+                    "  AND coalesce(data->>'visitor','')='' AS owned, "
+                    "  coalesce(data->>'visitor','')<>'' AS visitor_bound, "
+                    "  shared AS shared_flag, visibility_status "
+                    "FROM rois")
+                rows = cur.fetchall()
+        buckets = {
+            "owned": [], "visitor_bound": [], "shared_true_legacy": [],
+            "granted": [], "unclaimed": [],
+        }
+        for r in rows:
+            aid = r["annotation_id"]
+            if r["owned"]:
+                buckets["owned"].append(aid)
+            if r["visitor_bound"]:
+                buckets["visitor_bound"].append(aid)
+            if r["shared_flag"]:
+                buckets["shared_true_legacy"].append(aid)
+            if r["visibility_status"] == "granted":
+                buckets["granted"].append(aid)
+            if r["visibility_status"] == "unclaimed":
+                buckets["unclaimed"].append(aid)
+        return {k: {"count": len(v), "sample": v[:20]}
+                for k, v in buckets.items()}
     finally:
         conn.close()
 
@@ -1232,8 +1779,16 @@ def roi_count_by_token():
         conn.close()
 
 
-def list_shared_rois_for_slides(slides):
-    """返回 shared 为真且 slide ∈ slides 的标注列表（跳过 tombstone）。"""
+def list_shared_rois_for_slides(slides, share_token=None):
+    """返回授予 ``share_token`` 且 slide ∈ slides 的标注列表（跳过 tombstone）。
+
+    0056 工单 A / P0：**必须**携带 share_token（None → ValueError，fail-closed
+    ——绝不返回「同片全部 shared 标注」）。可见集合 = annotation_grants 中
+    grantee=(share_token, token) 的授权行（管理员策展显式授予该链接的标注）。
+    每项 index 沿用 get_roi/delete URL 的 token 内非 tombstone 位置口径。
+    """
+    if not share_token:
+        raise ValueError("share_token is required（不再返回同片全部 shared 标注）")
     if not slides:
         return []
     slide_set = set(slides)
@@ -1242,21 +1797,27 @@ def list_shared_rois_for_slides(slides):
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT data FROM rois WHERE NOT deleted ORDER BY insert_seq")
+                    "SELECT r.data FROM rois r WHERE NOT deleted "
+                    "AND r.annotation_id IN ("
+                    "  SELECT annotation_id FROM annotation_grants "
+                    "  WHERE grantee_kind='share_token' AND grantee_id=%s) "
+                    "ORDER BY r.insert_seq", (share_token,))
                 rows = cur.fetchall()
-        from collections import defaultdict
-        counters = defaultdict(int)
+                # pre-filter index：各 token 非 tombstone 行内位置（get_roi 口径）
+                cur.execute(
+                    "SELECT token, annotation_id, "
+                    "       (row_number() OVER (PARTITION BY token "
+                    "         ORDER BY insert_seq) - 1)::int AS idx "
+                    "FROM rois WHERE NOT deleted", ())
+                idx_map = {(r["token"], r["annotation_id"]): r["idx"]
+                           for r in cur.fetchall()}
         out = []
         for row in rows:
             r = row["data"]
-            idx = counters[r["token"]]
-            counters[r["token"]] += 1
             if r.get("slide") not in slide_set:
                 continue
-            if not _roi_shared_compat(r):
-                continue
             rr = _rect_read_compat(dict(r))
-            rr["index"] = idx
+            rr["index"] = idx_map.get((r.get("token"), r.get("annotation_id")), 0)
             rr["shared"] = True
             rr.setdefault("type", "rect")
             rr["note"] = r.get("note", "")
@@ -1642,8 +2203,15 @@ def delete_project(pid):
 # --------------------------------------------------------------------------- #
 # 标注（annotations）汇总
 # --------------------------------------------------------------------------- #
-def annotations_by_slide():
-    """把全部 rois 按 slide 分组聚合（结构与 json 完全一致）。"""
+def annotations_by_slide(subject=None, access_context=None):
+    """把 rois 按 slide 分组聚合（结构与 json 完全一致）。
+
+    0056 工单 A / P0：subject 非 None 时**先按主体过滤再分组计数**（见
+    annotation_access.can_read_annotation；HTTP 层一律传 subject，subject=None
+    仅限管理清点/存量 store 级测试）。过滤不重排 index——index 是该 token
+    全部非 tombstone 行内的 pre-filter 位置（与 get_roi/delete URL 口径一致），
+    绝不是可见子集的 0..n 重编号；定位请优先用 annotation_id。
+    """
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -1651,11 +2219,20 @@ def annotations_by_slide():
                 cur.execute(
                     "SELECT data FROM rois WHERE NOT deleted ORDER BY insert_seq")
                 rows = cur.fetchall()
+        ctx = (access_context if access_context is not None
+               else annotation_access.access_context_for(subject)
+               if subject is not None else None)
         from collections import defaultdict
         counters = defaultdict(int)
         by_slide = {}
         for row in rows:
             r = row["data"]
+            tok = r.get("token")
+            idx = counters[tok]
+            counters[tok] += 1
+            if subject is not None and not annotation_access.can_read_annotation(
+                    subject, r, ctx):
+                continue
             slide = r.get("slide")
             lbl = _norm_label(r.get("label"))
             grp_map = by_slide.setdefault(slide, {})
@@ -1664,9 +2241,6 @@ def annotations_by_slide():
                 grp = {"label": lbl, "count": 0, "items": []}
                 grp_map[lbl] = grp
             grp["count"] += 1
-            tok = r.get("token")
-            idx = counters[tok]
-            counters[tok] += 1
             item = {
                 "index": idx,
                 "token": tok,
@@ -1681,6 +2255,8 @@ def annotations_by_slide():
                 "note": r.get("note", ""),
                 "annotation_id": r.get("annotation_id"),
                 "source": r.get("source", "human"),
+                # 0056：作者口径与能力位判定所需（annotation_access）
+                "owner_user_id": r.get("owner_user_id"),
                 "created_by_session_id": r.get("created_by_session_id", ""),
                 "change_seq": r.get("change_seq"),
                 "revision": r.get("revision", 1),
@@ -1702,9 +2278,11 @@ def annotations_by_slide():
         conn.close()
 
 
-def annotations_by_project(pid=None):
-    """与 annotations_by_slide 同结构，但可选按项目内的 slides 过滤。"""
-    by_slide = annotations_by_slide()
+def annotations_by_project(pid=None, subject=None, access_context=None):
+    """与 annotations_by_slide 同结构，但可选按项目内的 slides 过滤（subject
+    语义同 annotations_by_slide：非 None 时按主体过滤）。"""
+    by_slide = annotations_by_slide(subject=subject,
+                                    access_context=access_context)
     if pid is None:
         return by_slide
     proj = get_project(pid)
@@ -1787,8 +2365,13 @@ def add_comment(annotation_id, slide, token, body, author_user_id=None,
         conn.close()
 
 
-def list_comments(annotation_id=None, slide=None):
-    """返回评论列表（跳过软删）。可按 annotation_id / slide 过滤。按 created_at 升序。"""
+def list_comments(annotation_id=None, slide=None, subject=None,
+                  access_context=None, access_token=None, project=True):
+    """返回评论列表（跳过软删）。可按 annotation_id / slide 过滤。按 created_at 升序。
+
+    0056：subject 非 None 时按父标注可见性过滤（父不可见 → 评论不出；
+    父缺失/无 annotation_id 的挂靠按不可见处理，fail-closed）。
+    """
     clauses = ["NOT deleted"]
     params = []
     if annotation_id is not None:
@@ -1805,7 +2388,22 @@ def list_comments(annotation_id=None, slide=None):
                     "SELECT data FROM comments WHERE " + " AND ".join(clauses) +
                     " ORDER BY created_at", params)
                 rows = cur.fetchall()
-        return [dict(r["data"]) for r in rows]
+                if subject is not None:
+                    cur.execute(
+                        "SELECT data FROM rois WHERE NOT deleted")
+                    parent_by_aid = {r["data"].get("annotation_id"): r["data"]
+                                     for r in cur.fetchall()}
+        out = [dict(r["data"]) for r in rows]
+        if subject is not None:
+            ctx = (access_context if access_context is not None
+                   else annotation_access.access_context_for(subject))
+            out = [cmt for cmt in out
+                   if annotation_access.can_read_annotation(
+                       subject, parent_by_aid.get(cmt.get("annotation_id")), ctx)]
+        if not project:
+            return out
+        return [annotation_access.public_comment_view(cmt, access_token=access_token)
+                for cmt in out]
     finally:
         conn.close()
 

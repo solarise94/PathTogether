@@ -6,7 +6,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py share_server.py share_store.py user_store.py slide_io.py raster_slide.py slide_render.py slide_cache.py viewer_display.py tile_cache.py share_entry.sh ./
-COPY pg_store.py share_store_pg.py user_store_pg.py share_shared.py ./
+COPY pg_store.py share_store_pg.py user_store_pg.py share_shared.py annotation_access.py ./
 COPY platform_features.py settings_store.py budget_store.py auth_limit_store.py demo_store.py registration_store.py registration_mail_worker.py identity_store.py ./
 COPY billing_pricing.py billing_store.py acquisition_store.py ./
 COPY spend_store.py site_stats_store.py ./

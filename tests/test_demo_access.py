@@ -344,6 +344,68 @@ def test_demo_slides_listing_and_catalog_outside_rejected(monkeypatch):
     tr = client.get("/api/demo/slides/%s_files/0/0_0.jpeg" % inside)
     assert tr.status_code == 200 and tr.data == b"JPEGBYTES"
 
+def test_demo_slides_bilingual_and_lang_convenience():
+    """工单 B：目录 API 双语字段 + ?lang=/Accept-Language 便利字段。
+
+    - 恒返回 display_name/description（中文缺省）与 *_en（可空）；
+    - localized_* 按请求语言；en 无译文回落缺省字段（不猜值）；
+    - slide_id 与原始文件名不随语言变化；
+    - info 端点带 demo_display_name_en / demo_description_en。
+    """
+    _enable_demo_period()
+    _setup_platform()
+    FakeSidecar()._install()
+    zh_only = _catalog_add(_touch("zh-only.svs"))
+    bilingual = _touch("bi.svs")
+    share_store.set_slide_meta(bilingual)
+    bi_id = share_store.get_slide_id(bilingual)
+    demo_store.catalog_add(
+        bi_id, display_name="肺腺癌 TCGA-49-AAR4",
+        description="中文说明",
+        display_name_en="Lung adenocarcinoma TCGA-49-AAR4",
+        description_en="English description",
+        added_by="owner-test")
+    client = _client()
+    client.get("/api/demo/config")
+    # 默认（无 Accept-Language）：localized_* = 中文字段；en 字段原样返回
+    slides = client.get("/api/demo/slides").get_json()["slides"]
+    by_id = {s["slide_id"]: s for s in slides}
+    bi = by_id[bi_id]
+    assert bi["display_name"] == "肺腺癌 TCGA-49-AAR4"
+    assert bi["display_name_en"] == "Lung adenocarcinoma TCGA-49-AAR4"
+    assert bi["description_en"] == "English description"
+    assert bi["name"] == bilingual  # 原始文件名不变
+    assert bi["localized_display_name"] == "肺腺癌 TCGA-49-AAR4"
+    assert by_id[zh_only]["display_name_en"] is None
+    assert by_id[zh_only]["localized_display_name"] is None  # 中文缺省也无名
+    # ?lang=en：双语条目 localized_* 取英文；无译文条目回落中文字段
+    slides_en = client.get(
+        "/api/demo/slides?lang=en").get_json()["slides"]
+    en_by_id = {s["slide_id"]: s for s in slides_en}
+    assert en_by_id[bi_id]["localized_display_name"] == \
+        "Lung adenocarcinoma TCGA-49-AAR4"
+    assert en_by_id[bi_id]["localized_description"] == "English description"
+    assert en_by_id[zh_only]["localized_display_name"] is None
+    # Accept-Language: en 同 ?lang=en
+    slides_al = client.get(
+        "/api/demo/slides", headers={
+            "Accept-Language": "en-US,en;q=0.9"}).get_json()["slides"]
+    al_by_id = {s["slide_id"]: s for s in slides_al}
+    assert al_by_id[bi_id]["localized_display_name"] == \
+        "Lung adenocarcinoma TCGA-49-AAR4"
+    # ?lang 优先于 Accept-Language
+    slides_zh = client.get(
+        "/api/demo/slides?lang=zh", headers={
+            "Accept-Language": "en"}).get_json()["slides"]
+    zh_by_id = {s["slide_id"]: s for s in slides_zh}
+    assert zh_by_id[bi_id]["localized_display_name"] == "肺腺癌 TCGA-49-AAR4"
+    # info：demo_* 双语展示字段
+    info = client.get("/api/demo/slides/%s/info" % bi_id).get_json()
+    assert info["demo_display_name"] == "肺腺癌 TCGA-49-AAR4"
+    assert info["demo_display_name_en"] == \
+        "Lung adenocarcinoma TCGA-49-AAR4"
+    assert info["demo_description_en"] == "English description"
+
 def test_demo_cookie_cannot_read_normal_slides_pg():
     _enable_demo_period()
     _setup_platform()
@@ -384,7 +446,7 @@ def test_demo_run_full_flow_and_security_envelope():
     assert sec["request_id"] == rid == body["request_id"]
     assert "create_annotation" not in json.dumps(body)
     cfg = body["config"]
-    assert cfg["max_steps"] == budget_store.DEFAULT_DEMO_TASK_MAX_STEPS == 20
+    assert cfg["max_steps"] == budget_store.DEFAULT_DEMO_TASK_MAX_STEPS == 100
     # session_owner = "demo_" + token_hash 前 16 位（不可反推、非 IP/明文）
     assert cfg["session_owner"].startswith("demo_")
     assert len(cfg["session_owner"]) == len("demo_") + 16
@@ -1142,15 +1204,23 @@ def test_admin_demo_catalog_crud_and_access_control():
                      json={"slide": "ghost.svs"}).status_code == 404
     name = _touch("cat1.svs")
     r = admin.put("/api/admin/demo-catalog", json={
-        "slide": name, "display_name": "教学示例", "sort_order": 1,
-        "is_default": True})
+        "slide": name, "display_name": "教学示例",
+        "display_name_en": "Teaching example",
+        "description_en": "An example slide",
+        "sort_order": 1, "is_default": True})
     assert r.status_code == 200
     entry = r.get_json()
     assert entry["display_name"] == "教学示例" and entry["is_default"] is True
+    assert entry["display_name_en"] == "Teaching example"
+    assert entry["description_en"] == "An example slide"
     assert entry["slide_id"].startswith("sld_")
-    # 列表可见
+    # 列表可见（双语字段随行列出）
     listed = admin.get("/api/admin/demo-catalog").get_json()["slides"]
     assert [s["name"] for s in listed] == [name]
+    assert listed[0]["display_name_en"] == "Teaching example"
+    # 类型校验：display_name_en 非字符串 → 400
+    assert admin.put("/api/admin/demo-catalog", json={
+        "slide": name, "display_name_en": 123}).status_code == 400
     # DELETE：不存在的 404；正常移除（含 revoke 联动）
     assert admin.delete(
         "/api/admin/demo-catalog?slide=ghost2.svs").status_code == 404
@@ -1376,7 +1446,7 @@ def test_demo_js_text_delta_and_paused_are_terminal():
 # fix 2026-09-11 P4：安全限额读取失败不再静默（回落值不变，只补可观测）
 # --------------------------------------------------------------------------- #
 def test_demo_task_max_steps_read_failure_logs_and_falls_back(caplog, monkeypatch):
-    """app._demo_task_max_steps 读取失败 → 默认 20 步 + warning（对齐 _demo_public_mode）。"""
+    """app._demo_task_max_steps 读取失败 → 默认 100 步 + warning（对齐 _demo_public_mode）。"""
     import settings_store
 
     def _boom():

@@ -882,7 +882,7 @@ def test_settings_runtime_endpoint_reads_and_writes_ai_safety():
     body = c.get("/api/admin/v1/settings").get_json()
     assert body["runtime"]["available"] is True
     assert body["runtime"]["limits"]["demo_enabled"] is False
-    assert body["runtime"]["limits"]["demo_task_max_steps"] == 20
+    assert body["runtime"]["limits"]["demo_task_max_steps"] == 100
     assert body["runtime"]["limits"]["demo_max_concurrency"] == 2
     # 部分更新（允许子集）
     r = c.put("/api/admin/v1/settings/runtime", json={

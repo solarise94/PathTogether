@@ -186,6 +186,8 @@ class TestShareRoisEndpoint:
 
     review P0 2026-09-05 读隔离：owner 不再全量——默认仅自己的 ∪ public ∪
     认领 ∪ 显式授权（slide_view_grants），管理台 inventory 是唯一「看全部」。
+    工单 A（0056）叠加：切片可见 ≠ 标注可见——列表再按 subject 过滤标注，
+    他人切片上的私有标注即便切片已收录也不出现。
     """
 
     def test_unauthenticated_401(self):
@@ -197,7 +199,8 @@ class TestShareRoisEndpoint:
         assert r.get_json()["code"] == "auth_required"
 
     def test_owner_visible_only_after_grant(self):
-        """owner 默认不见他人切片 ROI；显式授权后可见；收回后再次不可见。"""
+        """owner 默认不见他人切片；显式授权后**切片**可见，但其上 userA 的
+        私有标注仍不可见（工单 A / 0056：「能看切片」≠「能看标注」）。"""
         owner, usera, userb = _setup_users()
         sa = _touch("a.svs")
         sb = _touch("b.svs")
@@ -217,7 +220,9 @@ class TestShareRoisEndpoint:
         assert r.status_code == 200
         assert {x["slide"] for x in r.get_json()} == set()
 
-        # 显式授权 a.svs 后可见（幂等：重复授权状态不变）
+        # 显式授权 a.svs 后切片可见（幂等：重复授权状态不变），但 userA 在
+        # 该切片上的私有标注不因此对 owner 可见（0056：owner 工作台非全量
+        # dump；标注级可见需 annotation_grants 显式授权）
         r = oc.post("/api/admin/v1/slides/%s/visibility" % sa,
                     json={"granted": True})
         assert r.status_code == 200, r.get_data(as_text=True)
@@ -226,9 +231,12 @@ class TestShareRoisEndpoint:
         assert r.status_code == 200
         assert r.get_json()["already_granted"] is True
         r = oc.get("/api/share/rois")
-        assert {x["slide"] for x in r.get_json()} == {sa}
+        assert {x["slide"] for x in r.get_json()} == set()
+        r = oc.get("/api/annotations?slide=%s" % sa)
+        assert r.status_code == 200
+        assert r.get_json()["annotations"] == []
 
-        # 收回后再次不可见（幂等收回）
+        # 收回后切片再次不可见（幂等收回）
         r = oc.post("/api/admin/v1/slides/%s/visibility" % sa,
                     json={"granted": False})
         assert r.status_code == 200
@@ -238,8 +246,9 @@ class TestShareRoisEndpoint:
         assert r.get_json()["existed"] is False
         r = oc.get("/api/share/rois")
         assert {x["slide"] for x in r.get_json()} == set()
+        assert oc.get("/api/annotations?slide=%s" % sa).status_code == 403
 
-        # userA / userB 行为不变：仅自己的
+        # userA / userB 行为不变：仅自己的标注
         ac = _login(csrf_client(app_mod.app.test_client()), usera)
         r = ac.get("/api/share/rois")
         assert r.status_code == 200

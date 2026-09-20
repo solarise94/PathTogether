@@ -254,6 +254,17 @@ def test_schema_migrations_recorded(conn):
         # R7（2026-09-19）：test_applications status CHECK 词表扩
         # activated_by_invite（邀请码激活同事务收口的显式终态）。
         "0055_test_application_invite_terminal.sql",
+        # 数据隔离工单（2026-09-19 A）：标注可见性（另一 agent 的 0056；
+        # 本清单按目录实际文件登记）。
+        "0056_annotation_visibility.sql",
+        # 工单 B（plan 2026-09-19 §3）：受管 Demo 目录双语展示字段
+        # （display_name_en / description_en，可空；NULL 回落缺省字段）。
+        "0057_demo_catalog_bilingual.sql",
+        # 工单 C（plan 2026-09-19 §4）：Demo 单次任务默认 20 → 100
+        # （列缺省 + 仍停在旧缺省 20/10 的开放周期与 ai_safety 键；自定义值
+        # 保留，迁移 audit 固定 event_id）。
+        "0058_demo_task_max_steps_100.sql",
+        "0059_annotation_access_events.sql",
     ]
 
 
@@ -318,6 +329,99 @@ def test_migration_0027_backfills_ai_safety_keys(conn):
                 "subject_id, histopilot_session_id) "
                 "VALUES ('req_chk', 'demo', 'dmo_x', 'sess_x')")
             conn.commit()
+        conn.rollback()
+
+
+# --------------------------------------------------------------------------- #
+# 1b-2. 0058：Demo 单次任务默认 20 → 100（工单 C）
+# --------------------------------------------------------------------------- #
+def test_migration_0058_demo_steps_default_100(conn):
+    """0058 迁移回归：只抬旧缺省（20/10），管理员自定义值与已关周期保留。
+
+    - ai_budget_periods：开放周期 20/10 → 100；自定义 33 不动；已关周期不动；
+      列缺省改 100（无值插入新行走 100）；
+    - platform_settings ai_safety.demo_task_max_steps：JSONB 标量 20/10 → 100；
+      自定义 33 不动；非数字形态不动（运行时 fail-closed 回落默认）；
+    - 迁移 audit 固定 event_id；重放幂等（不重复、不覆盖）。
+    """
+    sql = (pg_store.migrations_dir() / "0058_demo_task_max_steps_100.sql"
+           ).read_text(encoding="utf-8")
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM ai_budget_periods")
+        # 本模块 session 级共享一库（0027 用例等会留 ai_safety.* 键）：先清场
+        cur.execute("DELETE FROM platform_settings WHERE key LIKE 'ai_safety.%'")
+        cur.execute("DELETE FROM audit_events WHERE event_id = "
+                    "'aud_migration_0058_demo_task_max_steps_100'")
+        conn.commit()
+        # 开放周期：旧缺省 20 / 10 / 自定义 33；已关周期旧缺省 20
+        cur.execute(
+            "INSERT INTO ai_budget_periods "
+            "(started_at, closed_at, demo_task_max_steps) VALUES "
+            "(now(), NULL, 20), (now(), NULL, 10), (now(), NULL, 33), "
+            "(now(), now(), 20)")
+        cur.execute(
+            "INSERT INTO platform_settings (key, value) VALUES "
+            "('ai_safety.demo_task_max_steps', '20'::jsonb)")
+        cur.execute(
+            "INSERT INTO platform_settings (key, value) VALUES "
+            "('ai_safety.demo_max_concurrency', '20'::jsonb)")
+        conn.commit()
+        cur.execute(sql)
+        conn.commit()
+        cur.execute(
+            "SELECT demo_task_max_steps, (closed_at IS NULL) AS open "
+            "FROM ai_budget_periods ORDER BY demo_task_max_steps, closed_at "
+            "NULLS LAST")
+        rows = cur.fetchall()
+        # 33（自定义，开放）与 20（已关）保留；开放 20/10 → 100
+        assert sorted(
+            (int(v), bool(o)) for v, o in rows) == [
+            (20, False), (33, True), (100, True), (100, True)]
+        cur.execute(
+            "SELECT value FROM platform_settings "
+            "WHERE key = 'ai_safety.demo_task_max_steps'")
+        assert cur.fetchone()[0] == 100  # 旧缺省 20 → 100
+        # 其它键不被触碰
+        cur.execute(
+            "SELECT value FROM platform_settings "
+            "WHERE key = 'ai_safety.demo_max_concurrency'")
+        assert cur.fetchone()[0] == 20
+        # 列缺省 = 100：无值插入新周期行直接得 100
+        cur.execute(
+            "INSERT INTO ai_budget_periods (started_at) VALUES (now()) "
+            "RETURNING demo_task_max_steps")
+        assert cur.fetchone()[0] == 100
+        # audit 标志行存在；重放幂等（值不再变化、无重复行）
+        cur.execute(
+            "SELECT count(*) FROM audit_events WHERE event_id = "
+            "'aud_migration_0058_demo_task_max_steps_100'")
+        assert cur.fetchone()[0] == 1
+        cur.execute(sql)
+        conn.commit()
+        cur.execute(
+            "SELECT count(*) FROM audit_events WHERE event_id = "
+            "'aud_migration_0058_demo_task_max_steps_100'")
+        assert cur.fetchone()[0] == 1
+        cur.execute(
+            "SELECT count(*) FROM ai_budget_periods "
+            "WHERE closed_at IS NULL AND demo_task_max_steps = 100")
+        assert cur.fetchone()[0] == 3
+        # 自定义值（33）整体重放后仍保留
+        cur.execute(
+            "SELECT count(*) FROM ai_budget_periods "
+            "WHERE demo_task_max_steps = 33")
+        assert cur.fetchone()[0] == 1
+        # 自定义 settings 值（33）：迁移不动，运行时按 33 生效（仍 ≤ 上限 100）
+        cur.execute(
+            "UPDATE platform_settings SET value='33'::jsonb "
+            "WHERE key='ai_safety.demo_task_max_steps'")
+        conn.commit()
+        cur.execute(sql)
+        conn.commit()
+        cur.execute(
+            "SELECT value FROM platform_settings "
+            "WHERE key = 'ai_safety.demo_task_max_steps'")
+        assert cur.fetchone()[0] == 33
         conn.rollback()
 
 

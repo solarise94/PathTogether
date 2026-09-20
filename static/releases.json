@@ -1,0 +1,56 @@
+{
+  "product": "HistoPilot",
+  "version_scheme": "YYYY.MM.DD product release. Do not use PathTogether package.json 0.1.0 (test package) as the product version.",
+  "releases": [
+    {
+      "version": "2026.09.20",
+      "date": "2026-09-20",
+      "published": true,
+      "components": {
+        "histopilot": "0.3.4",
+        "pathtogether": "tree"
+      },
+      "items": {
+        "zh": [
+          "修复英文示例切片名称与长名称显示。",
+          "Demo AI 导航单次上限提升至 100 步。",
+          "加强个人标注与分享链接的数据隔离，修正作者人数统计。",
+          "优化矩形与箭头绘制，支持撤销操作。",
+          "支持右键添加视野和标注到会话。",
+          "从标注开始分析时自动附带全片概览。"
+        ],
+        "en": [
+          "Fixed English sample slide names and long-name display.",
+          "Increased the demo AI navigation limit to 100 steps per run.",
+          "Improved annotation and share isolation and corrected author counts.",
+          "Improved rectangle and arrow drawing and added undo support.",
+          "Added context-menu actions to attach a view or annotation to a conversation.",
+          "Added a whole-slide overview when starting an analysis from an annotation."
+        ]
+      }
+    },
+    {
+      "version": "2026.09.17",
+      "date": "2026-09-17",
+      "published": true,
+      "components": {
+        "histopilot": "0.3.2",
+        "pathtogether": "suite-20260917"
+      },
+      "items": {
+        "zh": [
+          "改进 AI 观察、停止/继续与当前视野上下文。",
+          "首页登录弹窗与演示在手机和语言切换下更稳定。",
+          "支持测试申请、审核与激活通知。",
+          "修复百度网盘导入相关问题。"
+        ],
+        "en": [
+          "Improved AI observations, stop/resume pairing, and current-view context.",
+          "Stabilized the homepage login dialog and demo on mobile and language switch.",
+          "Added test-application submission, review, and activation notices.",
+          "Fixed Baidu Netdisk import issues."
+        ]
+      }
+    }
+  ]
+}

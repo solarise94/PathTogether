@@ -83,7 +83,13 @@ DEFAULT_USER_POOL_TURN_LIMIT = _int_env("BUDGET_DEFAULT_USER_POOL_TURNS", 15)
 # 归一是上一轮同款先例）。
 DEFAULT_PLATFORM_TASK_MAX_STEPS = 100
 DEFAULT_OWN_TASK_MAX_STEPS_LIMIT = 100
-DEFAULT_DEMO_TASK_MAX_STEPS = 20
+# 工单 C（docs viewer-demo-collaboration-review-plan-20260919.md §4）：Demo
+# 单次任务默认步数自 20 抬到 100，对齐 user 步数契约（默认=上限 100；异常
+# 循环熔断语义，达到 100 暂停而非业务额度）。运行时仍被 app._demo_task_max_steps
+# 钳制 _MAX_STEPS_LIMIT=100；只读工具/同主体单任务/预算并发闸不变。DB 列缺省
+# 与旧缺省存量由 migrations/0058_demo_task_max_steps_100.sql 同步（0010 同款
+# 先例：只抬仍停在旧缺省 20/10 的行，管理员自定义值保留）。
+DEFAULT_DEMO_TASK_MAX_STEPS = 100
 DEFAULT_DEMO_ENABLED = False
 #: 批次 E（§4.1）：每浏览器累计次数闸已退役。demo_per_browser_limit 列仍在
 #: _PERIOD_LIMIT_COLUMNS（admin 兼容展示，批次 F 一并清理），但运行时不再读取。

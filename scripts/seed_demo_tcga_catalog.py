@@ -23,12 +23,16 @@ import share_store  # noqa: E402
 
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR") or (Path.home() / "svs-viewer" / "uploads"))
 
-# filename, display_name, description, sort_order, is_default
+# filename, display_name(zh), description(zh), display_name(en), description(en),
+# sort_order, is_default
 TCGA_SLIDES = (
     (
         "TCGA-49-AAR4-01Z-00-DX1.EDB32358-AF23-4F81-A99F-15574A2DE28E.svs",
         "肺腺癌 TCGA-49-AAR4",
         "TCGA-LUAD 公开诊断切片（已脱敏）。仅用于研究与软件演示，不用于临床诊断。",
+        "Lung adenocarcinoma TCGA-49-AAR4",
+        "TCGA-LUAD public diagnostic slide (de-identified). For research and "
+        "software demonstration only; not for clinical diagnosis.",
         0,
         True,
     ),
@@ -36,6 +40,9 @@ TCGA_SLIDES = (
         "TCGA-86-8668-01Z-00-DX1.d720d486-02c7-4f98-8feb-e0e50a12c158.svs",
         "肺腺癌 TCGA-86-8668",
         "TCGA-LUAD 公开诊断切片（已脱敏）。仅用于研究与软件演示，不用于临床诊断。",
+        "Lung adenocarcinoma TCGA-86-8668",
+        "TCGA-LUAD public diagnostic slide (de-identified). For research and "
+        "software demonstration only; not for clinical diagnosis.",
         1,
         False,
     ),
@@ -43,6 +50,9 @@ TCGA_SLIDES = (
         "TCGA-BC-A10Q-01Z-00-DX1.A2D1E6CD-73DA-49FF-B291-5A4FDB32808A.svs",
         "肝细胞癌 TCGA-BC-A10Q",
         "TCGA-LIHC 公开诊断切片（已脱敏）。仅用于研究与软件演示，不用于临床诊断。",
+        "Hepatocellular carcinoma TCGA-BC-A10Q",
+        "TCGA-LIHC public diagnostic slide (de-identified). For research and "
+        "software demonstration only; not for clinical diagnosis.",
         2,
         False,
     ),
@@ -50,6 +60,9 @@ TCGA_SLIDES = (
         "TCGA-FV-A3R2-01Z-00-DX1.B9E286ED-B4A3-44E7-B11F-F2B763083FBC.svs",
         "胆管癌 TCGA-FV-A3R2",
         "TCGA-CHOL 公开诊断切片（已脱敏）。仅用于研究与软件演示，不用于临床诊断。",
+        "Cholangiocarcinoma TCGA-FV-A3R2",
+        "TCGA-CHOL public diagnostic slide (de-identified). For research and "
+        "software demonstration only; not for clinical diagnosis.",
         3,
         False,
     ),
@@ -68,7 +81,7 @@ def main():
     if missing:
         raise SystemExit("UPLOAD_DIR 缺少切片：\n  " + "\n  ".join(missing))
 
-    for name, display, desc, order, is_default in TCGA_SLIDES:
+    for name, display, desc, display_en, desc_en, order, is_default in TCGA_SLIDES:
         share_store.set_slide_meta(name)
         slide_id = share_store.get_slide_id(name)
         if not slide_id:
@@ -79,6 +92,8 @@ def main():
             description=desc,
             sort_order=order,
             added_by="owner",
+            display_name_en=display_en,
+            description_en=desc_en,
         )
         if is_default:
             demo_store.catalog_set_default(slide_id)

@@ -38,6 +38,9 @@ import share_store
 import share_shared
 import slide_cache
 import slide_io
+# 标注可见性统一判定（工单 A / P0 数据隔离，0056）：分享端按
+# visitor subject 过滤，策略与主站同一实现，不复制第二份。
+import annotation_access
 # 展示 J（公开分享页红线）：登录用户作者身份在 /s/* 评论出口统一掩码
 # （email/login_id 经 mask_login_id，不外泄完整邮箱、不回退 display_name）。
 import registration_store
@@ -732,11 +735,10 @@ def _roi_owned_by(r, visitor):
     return hmac.compare_digest(v, visitor)
 
 
-def _public_roi(r):
-    """分享端响应：去掉原始/哈希 visitor，避免身份被复制冒用。"""
-    out = dict(r)
-    out.pop("visitor", None)
-    return out
+def _public_roi(r, access_token=None):
+    """分享端响应：去掉 visitor，并去掉非本链接的来源分享 token。"""
+    import annotation_access
+    return annotation_access.public_roi_view(r, access_token=access_token)
 
 
 def _require_share(token):
@@ -1640,46 +1642,65 @@ def share_roi_update(token, index):
         return jsonify(error=str(e)), 400
     if updated is False:
         return jsonify(error="选区不存在"), 404
-    return jsonify(_public_roi(updated))
+    return jsonify(_public_roi(updated, access_token=token))
+
+
+def _visitor_read_subject(token):
+    """当前请求在 token 上的读取主体（visitor subject；0056 工单 A）。"""
+    return annotation_access.visitor_subject(
+        token, _visitor_stored(_visitor_id()))
 
 
 @app.route("/s/<token>/api/rois")
 def share_roi_list(token):
-    """返回本 token 可见的全部标注（仅本分享切片内）。
+    """返回本 token 可见的全部标注（仅授权集合——工单 A / P0 数据隔离）。
 
-    组装三类来源：
-      - source="me"：本 token 且归当前访客所有的标注（本设备新建，可编辑）
-      - source="admin"：管理员(admin)被公开的标注
-      - source="shared"：其他用户被管理员公开的标注（含本 token 其他设备
-        被公开的标注，排除已归当前访客的"me"项）
-    后两类来自 list_shared_rois_for_slides(本分享切片)；本 token 其他设备未
-    公开的私有标注对当前设备不可见（既不在 me 也不在 shared）。
-    admin（token==ADMIN_TOKEN）为管理端特权视角，返回本 token 全部标注。
-    每项的 index 沿用 list_rois 的 token+index 语义（按 token 归组）。
+    可见性统一经 annotation_access（visitor subject）判定，先过滤再组装：
+      - 本 token 上本人创建的记录（visitor 哈希匹配；旧「无 visitor 字段」
+        链接级记录兼容）→ source=me（可编辑）；
+      - 本 token 上 shared=true 的他人记录 → 本链接只读（不再外溢到同片
+        兄弟链接）；
+      - annotation_grants 授予本 token 的标注（管理员策展显式授权，
+        list_shared_rois_for_slides 现在必须携带 share_token）→
+        source=admin（token=admin）/ shared（其他 token）。
+    他人**未公开**的私有标注对本设备不可见（不在 me 也不在 shared）；
+    每项 index 沿用 get_roi/delete URL 的 token 内非 tombstone 位置（pre-
+    filter，不因过滤重编号）。响应不含 visitor 原始/哈希（_public_roi）。
     """
     share = _require_share(token)
     share_slides = share.get("slides", [])
-    visitor = _visitor_id()
-
-    # 1) 本 token 且归当前访客所有的标注（含未公开，source=me）
-    mine = share_store.list_rois(token)
+    subject = _visitor_read_subject(token)
+    ctx = annotation_access.access_context_for(subject)
+    seen_aids = set()
     out = []
-    for r in mine:
-        if token == share_store.ADMIN_TOKEN or _roi_owned_by(r, visitor):
-            rr = _public_roi(r)
-            rr["source"] = "me"
-            out.append(rr)
 
-    # 2) 管理员策展公开的他人/admin 标注（排除已是 me 的条目）
-    shared_all = share_store.list_shared_rois_for_slides(share_slides)
-    for r in shared_all:
-        if r.get("token") == token:
-            # 本 token 的公开标注：仅当非 me（其他设备的 shared 标注）才作为
-            # shared 只读显示；me 已在上面列出，不重复
-            if _roi_owned_by(r, visitor):
+    # 1) 本 token 上主体可见的记录（本人 + 本链接 shared + 旧链接级兼容）
+    mine = share_store.list_rois(token, subject=subject, access_context=ctx)
+    for r in mine:
+        aid = r.get("annotation_id")
+        if aid:
+            if aid in seen_aids:
                 continue
-        rr = _public_roi(r)
-        rr["source"] = "admin" if r.get("token") == share_store.ADMIN_TOKEN else "shared"
+            seen_aids.add(aid)
+        rr = _public_roi(r, access_token=token)
+        rr["source"] = "me" if annotation_access.can_write_annotation(
+            subject, r, ctx) else "shared"
+        out.append(rr)
+
+    # 2) 显式授予本 token 的跨 token 标注（策展授权；不再汇入「同片全部
+    #    shared」——兄弟链接的公开标注不会出现在这里）
+    granted = share_store.list_shared_rois_for_slides(share_slides,
+                                                      share_token=token)
+    for r in granted:
+        aid = r.get("annotation_id")
+        if aid:
+            if aid in seen_aids:
+                continue
+            seen_aids.add(aid)
+        src_token = r.get("token")
+        rr = _public_roi(r, access_token=token)
+        rr["source"] = "admin" if src_token == share_store.ADMIN_TOKEN \
+            else "shared"
         out.append(rr)
 
     # 按时间倒序
@@ -1722,18 +1743,27 @@ def share_roi_delete(token, index):
 # --------------------------------------------------------------------------- #
 # 评论线程（guest）—— Stage 3c-1（docs §5.3）
 #
-# guest 经 /s/* 评论，按 annotation_id 定位（支持评论本分享内任意可见标注，含
-# 管理员策展公开的标注）。校验：标注所在 slide ∈ 本次分享；评论需 share 含
-# annotate 权限。author_user_id 留空（guest），author_label 取 body.name 或"访客"。
+# guest 经 /s/* 评论，按 annotation_id 定位。校验（0056 工单 A / P0）：标注
+# 所在 slide ∈ 本次分享 × **标注本身对该访客可见**（annotation_access 按
+# visitor subject 判定——他人未公开的私有标注不可评论/不可读，403/404 不泄
+# 露正文）。评论需 share 含 annotate 权限。author_user_id 留空（guest），
+# author_label 取 body.name 或"访客"。
 # --------------------------------------------------------------------------- #
 def _resolve_anno_in_share(share, annotation_id):
-    """按 annotation_id 取标注并校验其 slide 属于该 share；否则 (None, error_resp)。"""
+    """按 annotation_id 取标注并校验 slide ∈ share 且标注对本访客可见。
+
+    返回 (roi, None) 或 (None, error_resp)；不可见/不存在统一 404 语义
+    （slide 不在分享内仍 403——token 本身可见性不变）。
+    """
     roi = share_store.get_roi_by_annotation_id(annotation_id)
     if roi is None:
         return None, (jsonify(error="标注不存在"), 404)
     slide = roi.get("slide")
     if not slide or slide not in share.get("slides", []):
         return None, (jsonify(error="无权访问"), 403)
+    subject = _visitor_read_subject(share.get("token") or "")
+    if not annotation_access.can_read_annotation(subject, roi):
+        return None, (jsonify(error="标注不存在"), 404)
     return roi, None
 
 
@@ -1753,7 +1783,8 @@ def share_comments_list(token):
     _roi, err = _resolve_anno_in_share(share, annotation_id)
     if err:
         return err
-    comments = share_store.list_comments(annotation_id=annotation_id)
+    comments = share_store.list_comments(
+        annotation_id=annotation_id, project=False)
     # 掩码投影：按 author_user_id 批量解析身份再掩码（查询失败按 None 处理，
     # 降级为通用「成员」，绝不回退明文 label/display_name）
     out = []
@@ -1772,7 +1803,7 @@ def share_comments_list(token):
                 masked = None
             c["author_label"] = masked or "成员"
             c.pop("author_email", None)
-        out.append(c)
+        out.append(annotation_access.public_comment_view(c, access_token=token))
     return jsonify({"comments": out})
 
 

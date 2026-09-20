@@ -22,7 +22,7 @@
 
   var state = {
     viewer: null,
-    slides: [],           // Demo 目录（slide_id/name/display_name/...）
+    slides: [],           // Demo 目录（slide_id/name/display_name(_en)/description(_en)...）
     current: null,        // 当前 slide entry
     info: null,           // 当前切片 info（width/height/mpp_x）
     config: null,
@@ -65,6 +65,27 @@
     if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
     return "req-" + Date.now().toString(36) + "-" +
       Math.random().toString(36).slice(2, 12);
+  }
+
+  // ---------- 双语展示（工单 B：目录条目带 zh/en 字段，前端按当前语言选） ----------
+  function curLang() {
+    try {
+      if (window.HP_I18N && HP_I18N.getLang) return HP_I18N.getLang();
+    } catch (e) { /* 回退 zh（缺省语言） */ }
+    return "zh";
+  }
+
+  // 当前语言的目录展示名：en 无译文回落 display_name，再回落原始文件名/slide_id
+  function demoDisplayName(entry) {
+    if (!entry) return "";
+    if (curLang() === "en" && entry.display_name_en) return entry.display_name_en;
+    return entry.display_name || entry.name || entry.slide_id || "";
+  }
+
+  function demoDescription(entry) {
+    if (!entry) return "";
+    if (curLang() === "en" && entry.description_en) return entry.description_en;
+    return entry.description || "";
   }
 
   // ---------- Viewer（共享 HP_ViewerCore；无则回退直连 OSD） ----------
@@ -394,14 +415,26 @@
       var row = document.createElement("div");
       row.className = "slide-row" + (s.slide_id === activeId ? " active" : "");
       row.dataset.slideId = s.slide_id;
+      var dispName = demoDisplayName(s);
+      var dispDesc = demoDescription(s);
+      // 搜索索引（工单 B）：当前语言名 + 另一语言名 + slide_id + 原始文件名
+      // ——切语言后无需重载即可按编号/任一语言名命中
+      row.dataset.search = [
+        s.display_name || "", s.display_name_en || "",
+        s.slide_id || "", s.name || "", dispName || "",
+      ].join(" ").toLowerCase();
       var mid = document.createElement("div");
       mid.className = "slide-mid";
       var name = document.createElement("div");
       name.className = "slide-name";
-      name.textContent = s.display_name || s.name || s.slide_id;
+      name.textContent = dispName || s.slide_id;
+      // 完整名称经 tooltip 可获取（窄侧栏截断不丢信息）；行本身可聚焦元素
+      // 即名称文本（可访问名随语言重绘）
+      name.title = dispName || s.slide_id;
       var meta = document.createElement("div");
       meta.className = "slide-meta";
-      meta.textContent = s.description || s.name || "";
+      meta.textContent = dispDesc || s.name || "";
+      meta.title = dispDesc || "";
       mid.appendChild(name);
       mid.appendChild(meta);
       row.appendChild(mid);
@@ -440,12 +473,14 @@
     clearRunOverlays();
     renderDemoSlideList(slideId);
     if ($("current-slide")) {
-      $("current-slide").textContent = entry.display_name || entry.name || slideId;
-      $("current-slide").title = entry.description || entry.name || "";
+      $("current-slide").textContent = demoDisplayName(entry);
+      $("current-slide").title = demoDescription(entry) || entry.name || "";
     }
     // §3.4：常驻 #current-slide 下架后，切片名进 document.title；
     // Demo 组合「Beta · Demo」标识（正式版为「切片名 · PathTogether Beta」）。
-    document.title = (entry.display_name || entry.name || slideId) + " · " + t("app.doc.title.demo");
+    // 工单 B：#current-slide 与 document.title 均用当前语言展示名（切换语言
+    // 由 hp-lang-change 监听重绘，无需重载）；slide_id / 原始文件名不变。
+    document.title = demoDisplayName(entry) + " · " + t("app.doc.title.demo");
     var api = demoApi();
     return api.slideInfo(slideId)
       .then(function (r) { return r.json(); })
@@ -1260,7 +1295,8 @@
         if (input && input.focus) input.focus();
       });
     }
-    // 切片搜索：过滤示例切片列表
+    // 切片搜索：过滤示例切片列表（工单 B：索引 = 双语名 + slide_id + 原始
+    // 文件名，任一语言/编号/文件名均可命中）
     var search = $("slide-search");
     if (search) {
       search.addEventListener("input", function () {
@@ -1268,7 +1304,8 @@
         var list = $("demo-slide-list");
         if (!list) return;
         Array.prototype.forEach.call(list.querySelectorAll(".slide-row"), function (row) {
-          var hay = String(row.textContent || "").toLowerCase();
+          var hay = String((row.dataset && row.dataset.search) ||
+            row.textContent || "").toLowerCase();
           row.style.display = (q && hay.indexOf(q) < 0) ? "none" : "";
         });
       });
@@ -1317,6 +1354,27 @@
       });
     }
   }
+
+  // 语言切换（工单 B）：目录列表 / #current-slide / document.title / AI 步数
+  // 提示按新语言重绘，无需重载（切片打开后切语言同样生效）；slide_id 与
+  // 原始文件名不变。侧栏开合按钮文案由 bindSidebarChrome 内的监听处理。
+  document.addEventListener("hp-lang-change", function () {
+    renderDemoSlideList(state.current ? state.current.slide_id : null);
+    if (state.current) {
+      if ($("current-slide")) {
+        $("current-slide").textContent = demoDisplayName(state.current);
+        $("current-slide").title =
+          demoDescription(state.current) || state.current.name || "";
+      }
+      document.title =
+        demoDisplayName(state.current) + " · " + t("app.doc.title.demo");
+    }
+    var hint = $("ai-steps-hint");
+    if (hint && state.config) {
+      hint.textContent = t("demo.ai.steps.hint", {
+        steps: state.config.task_max_steps });
+    }
+  });
 
   // ---------- 启动 ----------
   // viewer 画质档（image-transport-upgrade §3.3/§5.2）：三入口共用模块；

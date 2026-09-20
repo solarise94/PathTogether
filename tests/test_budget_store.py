@@ -60,7 +60,9 @@ def test_period_defaults_and_row_is_authoritative():
     assert p1["user_pool_turn_limit"] == 15       # user 共享池
     assert p1["platform_task_max_steps"] == 20
     assert p1["own_task_max_steps_limit"] == 500
-    assert p1["demo_task_max_steps"] == 20
+    # 工单 C / 0058：demo 步数缺省自 20 抬到 100（周期行未显式给值时走列
+    # 缺省；get_or_create 只显式写 user/owner/user_pool 三列）
+    assert p1["demo_task_max_steps"] == 100
     assert p1["demo_enabled"] is False
     assert p1["demo_per_browser_limit"] == 1
     assert p1["demo_max_concurrency"] == 2

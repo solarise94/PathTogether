@@ -1693,6 +1693,8 @@ def test_share_page_comments_mask_identity(monkeypatch):
                             author_user_id=None, author_label="访客")
     sh = share_store.create_share([name], 24,
                                   permissions=["view", "annotate"])
+    # 工单 A（0056）：admin 标注默认私有，显式授予该分享后访客才可读评论
+    share_store.grant_annotation_to_share(aid, sh["token"])
     share_server.app.config["TESTING"] = True
     sc = share_server.app.test_client()
     resp = sc.get("/s/%s/api/comments?annotation_id=%s" % (sh["token"], aid))

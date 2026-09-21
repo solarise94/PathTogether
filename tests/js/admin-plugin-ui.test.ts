@@ -169,6 +169,7 @@ function loadPluginUiWithBus(hash = "") {
 	const els: Record<string, FakeEl> = {};
 	const messageHandlers: Array<(event: unknown) => void> = [];
 	const docHandlers: Record<string, FakeListener[]> = {};
+	const intervals: Array<{ callback: () => void; ms: number }> = [];
 	const created: FakeEl[] = [];
 	const parentPosted: Posted[] = [];
 	const parent = {
@@ -184,8 +185,10 @@ function loadPluginUiWithBus(hash = "") {
 		},
 		setTimeout,
 		clearTimeout,
+		setInterval(callback: () => void, ms: number) { intervals.push({ callback, ms }); },
 	};
 	const doc = {
+		hidden: false,
 		activeElement: null as { focus?: () => void } | null,
 		getElementById(id: string) {
 			if (!els[id]) els[id] = fakeEl();
@@ -212,6 +215,7 @@ function loadPluginUiWithBus(hash = "") {
 	return {
 		els,
 		doc,
+		intervals,
 		created,
 		fireDocument,
 		parent,
@@ -2620,3 +2624,104 @@ describe("W2 — 格式申请页（format-requests）", () => {
 	});
 });
 
+
+
+describe("访问统计刷新", () => {
+  it("可见概览定时刷新，合并在途请求，失败保留旧数据并提示过期", async () => {
+    const bus = loadPluginUiWithBus();
+    const NONCE = "d3".repeat(32);
+    bus.dispatch(bus.parent, {
+      kind: "init", bridge: "admin", protocolVersion: "1.0.0",
+      nonce: NONCE, adminPermissions: ["admin:overview:read"],
+    });
+    bus.client!.showPage("overview");
+    await ticks(4);
+    replyMethod(bus, NONCE, "admin.siteStats.get", {
+      ok: true, result: { generated_at: 1700000000, top_referrers: [{ domain: "example.org", visits: 2 }] },
+    });
+    await ticks(6);
+    const timer = bus.intervals.find((x) => x.ms === 60000)!;
+    expect(timer).toBeTruthy();
+    const count = () => bus.parentPosted.filter((x) => x.env.method === "admin.siteStats.get").length;
+    const before = count();
+    bus.doc.hidden = true;
+    timer.callback();
+    expect(count()).toBe(before);
+    bus.doc.hidden = false;
+    timer.callback(); timer.callback();
+    expect(count()).toBe(before + 1);
+    replyMethod(bus, NONCE, "admin.siteStats.get", { ok: false, error: { code: "unavailable" } });
+    await ticks(6);
+    expect(bus.els["adm-site-card"].hidden).toBe(false);
+    expect(bus.els["adm-site-referrers-tbody"].textContent).toContain("example.org");
+    expect(bus.els["adm-site-refresh-status"].textContent).toContain("可能已过期");
+    bus.client!.showPage("users");
+    timer.callback();
+    expect(count()).toBe(before + 1);
+  });
+
+  it("失败后恢复：下一次成功响应把状态改回最新，失效桥不发统计请求", async () => {
+    const bus = loadPluginUiWithBus();
+    const NONCE = "d3".repeat(32);
+    bus.dispatch(bus.parent, {
+      kind: "init", bridge: "admin", protocolVersion: "1.0.0",
+      nonce: NONCE, adminPermissions: ["admin:overview:read"],
+    });
+    bus.client!.showPage("overview");
+    await ticks(4);
+    replyMethod(bus, NONCE, "admin.siteStats.get", {
+      ok: true, result: { generated_at: 1700000000, top_referrers: [] },
+    });
+    await ticks(6);
+    const timer = bus.intervals.find((x) => x.ms === 60000)!;
+    const count = () => bus.parentPosted.filter((x) => x.env.method === "admin.siteStats.get").length;
+    // 失败一次 → 过期提示
+    timer.callback();
+    replyMethod(bus, NONCE, "admin.siteStats.get", { ok: false, error: { code: "bridge_timeout" } });
+    await ticks(6);
+    expect(bus.els["adm-site-refresh-status"].textContent).toContain("可能已过期");
+    // 恢复：下一次成功响应把状态改回「数据更新于」，数值跟随成功响应
+    timer.callback();
+    replyMethod(bus, NONCE, "admin.siteStats.get", {
+      ok: true, result: { generated_at: 1700000060, top_referrers: [{ domain: "recovered.example", visits: 1 }] },
+    });
+    await ticks(6);
+    expect(bus.els["adm-site-refresh-status"].textContent).toContain("数据更新于");
+    expect(bus.els["adm-site-refresh-status"].textContent).not.toContain("可能已过期");
+    expect(bus.els["adm-site-referrers-tbody"].textContent).toContain("recovered.example");
+    // 失效桥：定时器不发统计请求
+    const before = count();
+    bus.dispatch(bus.parent, {
+      kind: "event", bridge: "admin", type: "bridge_invalidated",
+      reason: "reload", message: "宿主已作废桥接会话",
+    });
+    timer.callback();
+    expect(count()).toBe(before);
+  });
+
+  it("首次加载失败给不可用状态；D2 未发布（site_stats_unavailable）保持整卡隐藏", async () => {
+    const bus = loadPluginUiWithBus();
+    const NONCE = "d3".repeat(32);
+    bus.dispatch(bus.parent, {
+      kind: "init", bridge: "admin", protocolVersion: "1.0.0",
+      nonce: NONCE, adminPermissions: ["admin:overview:read"],
+    });
+    bus.client!.showPage("overview");
+    await ticks(4);
+    replyMethod(bus, NONCE, "admin.siteStats.get", { ok: false, error: { code: "internal" } });
+    await ticks(6);
+    expect(bus.els["adm-site-card"].hidden).toBe(false);
+    expect(bus.els["adm-site-refresh-status"].textContent).toContain("暂时不可用");
+
+    const bus2 = loadPluginUiWithBus();
+    bus2.dispatch(bus2.parent, {
+      kind: "init", bridge: "admin", protocolVersion: "1.0.0",
+      nonce: NONCE, adminPermissions: ["admin:overview:read"],
+    });
+    bus2.client!.showPage("overview");
+    await ticks(4);
+    replyMethod(bus2, NONCE, "admin.siteStats.get", { ok: false, error: { code: "site_stats_unavailable" } });
+    await ticks(6);
+    expect(bus2.els["adm-site-card"].hidden).toBe(true);
+  });
+});

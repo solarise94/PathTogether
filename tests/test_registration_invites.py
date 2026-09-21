@@ -121,18 +121,22 @@ def test_register_closed_mode_get_and_post():
     assert "邀请注册" in (r2.get_json() or {}).get("error", "")
 
 
-def test_register_public_mode_not_supported(monkeypatch):
+def test_register_public_mode_fails_closed_without_preconditions(monkeypatch):
+    """public（P1 起正式支持）：存储值 public 但前置缺失（HTTPS/Secure
+    Cookie/邮件通道/管理员通知邮箱/双协议文稿任一）→ fail-closed 降级
+    closed（GET 渲染关闭态，POST 403），不再 503
+    public_registration_not_supported。"""
     _set_mode(monkeypatch, "public")
     app_mod.AUTH_ENABLED = True
     client = _client()
     r = client.get("/register")
-    assert r.status_code == 503
-    assert r.get_json()["code"] == "public_registration_not_supported"
+    assert r.status_code == 200
+    assert "当前采用邀请注册" in r.get_data(as_text=True)
     r2 = client.post("/register", data={"invite_token": "x",
                                         "login_id": "n@x.com",
                                         "password": "password1password1"})
-    assert r2.status_code == 503
-    assert r2.get_json()["code"] == "public_registration_not_supported"
+    assert r2.status_code == 403
+    assert (r2.get_json() or {}).get("code") == "registration_closed"
 
 
 def test_register_invite_only_renders_form(monkeypatch):
@@ -203,10 +207,12 @@ def test_put_registration_mode_validates(monkeypatch):
     app_mod.AUTH_ENABLED = True
     client = _client()
     _owner_session(client, owner)
-    # public 拒绝（v1；旧路由已随 R3 wave1 删除）
+    # public（P1 起正式接受，走自身前置闸）：缺前置 → 400
+    # registration_preconditions_failed（v1；旧路由已随 R3 wave1 删除）
     r = client.put("/api/admin/v1/settings/registration", json={"mode": "public"})
     assert r.status_code == 400
-    assert r.get_json()["error"]["code"] == "public_registration_not_supported"
+    assert r.get_json()["error"]["code"] == \
+        "registration_preconditions_failed"
     # invite_only 前置条件不满足 → 400（json 后端）
     r2 = client.put("/api/admin/v1/settings/registration",
                     json={"mode": "invite_only"})
@@ -239,7 +245,8 @@ def test_put_registration_mode_invite_only_with_preconditions(monkeypatch):
     assert g.status_code == 200
     body = g.get_json()["registration"]
     assert body["supported_modes"] == ["closed", "invite_only",
-                                        "email_verify_invite_activation"]
+                                        "email_verify_invite_activation",
+                                        "public"]
 
 
 def test_register_post_csrf_missing_400(monkeypatch):
@@ -632,9 +639,12 @@ def test_registration_mode_env_and_invalid_values():
     settings_store.set_setting(settings_store.REGISTRATION_MODE_KEY, 123,
                                updated_by="t")
     assert settings_store.get_registration_mode() == "closed"
-    # setter 拒绝 public
+    # setter 接受 public（P1 起正式支持；生效仍受前置闸约束）
+    assert settings_store.set_registration_mode("public") == "public"
+    assert settings_store.get_registration_mode() == "public"
+    # setter 拒绝词表外值
     with pytest.raises(ValueError):
-        settings_store.set_registration_mode("public")
+        settings_store.set_registration_mode("oops")
 
 
 # =========================================================================== #

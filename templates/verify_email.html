@@ -153,6 +153,55 @@
   <main class="card">
     <span class="badge" data-i18n="verify.badge">邮箱验证</span>
     {% if state == "valid" %}
+    {% if flow == "public" and public_ctx %}
+    <!-- ============ P1 public 流程（§3.3.3/§3.3.4）============ -->
+    <h1 class="title"><span>完成注册</span> <span class="state-ok">✓</span></h1>
+    <p class="desc">链接有效（收件人：{{ email_masked }}）。设置密码即可完成注册——当前每日最多 5 个新自助账号，名额于北京时间每日 00:00 更新，以完成注册时的剩余名额为准。</p>
+    <div id="verify-error" class="error-box" role="alert" style="display:none;"></div>
+    <form id="verify-form" autocomplete="on">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+      <input type="hidden" name="token" value="{{ token }}" />
+      <!-- 当前 published 文稿版本标识（服务端权威校验；仅实质变化时才要求
+           随提交重新确认） -->
+      <input type="hidden" id="pub-terms-version" value="{{ public_ctx.terms_doc.version if public_ctx.terms_doc else '' }}" />
+      <input type="hidden" id="pub-terms-sha256" value="{{ public_ctx.terms_doc.content_sha256 if public_ctx.terms_doc else '' }}" />
+      <input type="hidden" id="pub-research-version" value="{{ public_ctx.research_doc.version if public_ctx.research_doc else '' }}" />
+      <input type="hidden" id="pub-research-sha256" value="{{ public_ctx.research_doc.content_sha256 if public_ctx.research_doc else '' }}" />
+      <input type="hidden" id="pub-terms-changed" value="{{ '1' if public_ctx.terms_changed else '' }}" />
+      <div class="field">
+        <label for="password">设置密码</label>
+        <input id="password" name="password" type="password" required minlength="15"
+               maxlength="200" autocomplete="new-password" placeholder="至少 15 位" />
+      </div>
+      <div class="field">
+        <label for="password_confirm">确认密码</label>
+        <input id="password_confirm" name="password_confirm" type="password" required
+               minlength="15" maxlength="200" autocomplete="new-password" />
+      </div>
+      {% if public_ctx.terms_changed and public_ctx.terms_doc %}
+      <!-- 必选协议实质变化：重新提供 checkbox（§3.3.4；不用「继续访问视为同意」） -->
+      <div class="field">
+        <label class="check-row" for="terms_re">
+          <input id="terms_re" type="checkbox" value="1" />
+          <span>《用户协议与数据处理说明》已更新：我已重新阅读并接受<a href="/legal/user-agreement" target="_blank" rel="noopener noreferrer">最新版本</a>（必选）。</span>
+        </label>
+      </div>
+      {% else %}
+      <!-- 展示用户此前主动做出的选择（§3.3.3：展示不是替未操作用户预勾选） -->
+      <p class="hint" style="margin-bottom:14px;">你已在请求验证邮件时接受<a href="/legal/user-agreement" target="_blank" rel="noopener noreferrer">《用户协议与数据处理说明》</a>（版本 {{ public_ctx.terms_version }}）。</p>
+      {% endif %}
+      {% if public_ctx.research_doc %}
+      <div class="field">
+        <label class="check-row" for="research_opt">
+          <input id="research_opt" type="checkbox" value="1"{% if public_ctx.research_opt_in %} checked{% endif %} />
+          <span>我自愿同意<a href="/legal/research-sharing" target="_blank" rel="noopener noreferrer">《数据共享与软件改进协议》</a>（自愿，可随时撤回；不选不影响注册、登录、读片和 AI 额度）。</span>
+        </label>
+        <p class="hint">你在请求验证邮件时的选择是「{{ '同意' if public_ctx.research_opt_in else '不同意' }}」，此处可在完成注册前修改。</p>
+      </div>
+      {% endif %}
+      <button class="btn primary" type="submit" id="verify-submit">完成注册</button>
+    </form>
+    {% else %}
     <h1 class="title"><span data-i18n="verify.valid.title">验证你的邮箱</span> <span class="state-ok">✓</span></h1>
     <p class="desc" data-i18n="verify.valid.desc" data-i18n-vars="email:{{ email_masked }}">链接有效（收件人：{email}）。请为你的账号设置密码完成验证——提交后将创建账号并提交测试申请，管理员审核通过后即可使用。密码至少 15 位，可直接使用密码管理器生成。</p>
     <div id="verify-error" class="error-box" role="alert" style="display:none;"></div>
@@ -206,6 +255,7 @@
       <button class="btn primary" type="submit" id="verify-submit"
               data-i18n="verify.apply.submit">申请测试</button>
     </form>
+    {% endif %}
     {% elif state == "expired" %}
     <h1 class="title">链接已过期 <span class="state-bad">✕</span></h1>
     <p class="desc">验证链接有效期 30 分钟，且只能使用一次。请返回注册页重新请求验证邮件。</p>
@@ -229,6 +279,7 @@
       var form = document.getElementById("verify-form");
       var btn = document.getElementById("verify-submit");
       var errBox = document.getElementById("verify-error");
+      var isPublic = form && !!document.getElementById("pub-terms-version");
       function t(key, fallback) {
         try {
           var s = window.HP_I18N && HP_I18N.t(key);
@@ -239,7 +290,8 @@
         errBox.textContent = msg;
         errBox.style.display = "";
         btn.disabled = false;
-        btn.textContent = t("verify.apply.submit", "申请测试");
+        btn.textContent = isPublic ? "完成注册"
+                                   : t("verify.apply.submit", "申请测试");
       }
       form.addEventListener("submit", function (ev) {
         ev.preventDefault();
@@ -249,10 +301,35 @@
           fail(t("verify.err.pw.mismatch", "两次输入的密码不一致")); return;
         }
         if (pw.length < 15) { fail(t("verify.err.pw.length", "密码长度至少 15 位")); return; }
-        // 前端先校验拦截：研究方向必选（后端 submit_tx 亦权威校验）
-        var direction = form.querySelector('input[name="research_direction"]:checked');
-        if (!direction) {
-          fail(t("verify.apply.direction.required", "请选择研究方向")); return;
+        var payload = {
+          token: form.token.value,
+          password: pw,
+          password_confirm: form.password_confirm.value
+        };
+        if (isPublic) {
+          // P1 public：必选协议实质变化时，重新勾选是提交前置（§3.3.4）
+          var termsRe = document.getElementById("terms_re");
+          if (termsRe && !termsRe.checked) {
+            fail("请先重新阅读并勾选《用户协议与数据处理说明》（必选）"); return;
+          }
+          var researchOpt = document.getElementById("research_opt");
+          payload.research_opt_in = !!(researchOpt && researchOpt.checked);
+          if (termsRe) {
+            payload.terms_version = document.getElementById("pub-terms-version").value;
+            payload.terms_sha256 = document.getElementById("pub-terms-sha256").value;
+          }
+          if (payload.research_opt_in) {
+            payload.research_version = document.getElementById("pub-research-version").value;
+            payload.research_sha256 = document.getElementById("pub-research-sha256").value;
+          }
+        } else {
+          // 前端先校验拦截：研究方向必选（后端 submit_tx 亦权威校验）
+          var direction = form.querySelector('input[name="research_direction"]:checked');
+          if (!direction) {
+            fail(t("verify.apply.direction.required", "请选择研究方向")); return;
+          }
+          payload.research_direction = direction.value;
+          payload.share_research_data = form.share_research_data.checked;
         }
         btn.disabled = true;
         btn.textContent = t("verify.apply.submitting", "提交中…");
@@ -263,17 +340,12 @@
             "Content-Type": "application/json",
             "X-CSRF-Token": form.csrf_token.value
           },
-          body: JSON.stringify({
-            token: form.token.value,
-            password: pw,
-            password_confirm: form.password_confirm.value,
-            research_direction: direction.value,
-            share_research_data: form.share_research_data.checked
-          })
+          body: JSON.stringify(payload)
         }).then(function (resp) {
           return resp.json().then(function (data) {
             if (resp.ok && data.ok) {
-              window.location.href = "/login";
+              // P1 public 成功 → /login?registered=1；旧流程 → /login
+              window.location.href = (data && data.next) || "/login";
               return;
             }
             fail((data && data.error) || t("verify.err.generic", "验证失败，请稍后重试"));

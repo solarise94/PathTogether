@@ -843,14 +843,41 @@
   // 警示条。外部来源榜**固定排除疑似爬虫**（R4 2026-09-19：爬虫开关退役，
   // 后端只提供 top_referrers 固定口径；总览疑似爬虫计数保留）。
   // ------------------------------------------------------------------
+  var siteStatsLoading = false;
   function loadSiteStats() {
+    if (siteStatsLoading) return;
+    siteStatsLoading = true;
     var card = $("adm-site-card");
+    var status = $("adm-site-refresh-status");
+    var btn = $("adm-site-refresh-btn");
+    if (btn) btn.disabled = true;
+    if (status) status.textContent = "正在刷新…";
     request("admin.siteStats.get", {}).then(function (res) {
       if (!card) return;
       card.hidden = false;
       renderSiteStats(res || {});
-    }).catch(function () {
-      if (card) card.hidden = true;
+      if (status) status.textContent = "数据更新于 " + fmtTs(res.generated_at)
+        + "；本页可见时每 60 秒刷新。";
+    }).catch(function (err) {
+      // 永久/权限类失败保持整卡隐藏：不给操作员一个永远报错的卡，
+      // 无权限不暴露数据（§4.2/D2-3 契约）。其余（超时/内部错误等瞬时
+      // 失败）首次加载亮出可理解的不可用状态，后续失败保留旧数据标过期。
+      var code = err && err.code;
+      if (code === "site_stats_unavailable" || code === "unknown_method"
+          || code === "not_implemented" || code === "permission_denied"
+          || code === "backend_error") {
+        if (card) card.hidden = true;
+        return;
+      }
+      if (card && card.hidden) {
+        card.hidden = false;
+        if (status) status.textContent = "访问统计暂时不可用，请稍后重试。";
+      } else if (status) {
+        status.textContent = "刷新失败，当前数据可能已过期；请重试。";
+      }
+    }).then(function () {
+      siteStatsLoading = false;
+      if (btn) btn.disabled = false;
     });
   }
 
@@ -859,7 +886,7 @@
     if (kind === "suspected_bot") {
       return "疑似爬虫" + (botName ? "（" + botName + "）" : "");
     }
-    return "匿名访客";
+    return "匿名访客（未命中爬虫规则）";
   }
 
   function renderSiteEntryNote(res) {
@@ -992,7 +1019,7 @@
       kindsDl.textContent = "";
       var vk = res.visitor_kinds || {};
       if (hasData) {
-        kvRow(kindsDl, "匿名人类访问（30 天）", fmtNum(vk.anonymous_human));
+        kvRow(kindsDl, "匿名访问（未命中爬虫规则，30 天）", fmtNum(vk.anonymous_human));
         kvRow(kindsDl, "已登录访问（30 天）", fmtNum(vk.signed_in_human));
         kvRow(kindsDl, "疑似爬虫（30 天）", fmtNum(vk.suspected_bot));
         kvRow(kindsDl, "统计生成时间", fmtTs(res.generated_at));
@@ -2967,6 +2994,14 @@
   // 供应商余额卡（KPI + 异常条数据源）
   function renderProviderBalanceSnapshot(payload) {
     state.billProviderBalance = payload || null;
+    var auto = payload && payload.auto_check;
+    var status = $("adm-balance-auto-status");
+    if (status && auto) {
+      status.textContent = (auto.enabled ? "后台每小时自动更新余额，失败后每 5 分钟重试。" : "后台自动检查已关闭。")
+        + (auto.last_checked_at ? "最近检查：" + fmtTs(auto.last_checked_at)
+          + " · " + (auto.status === "ok" ? "成功" : auto.status || "未知") : "尚无自动检查记录。")
+        + (auto.status && auto.status !== "ok" ? "；保留最后成功余额，请检查配置或上游连接。" : "");
+    }
     renderBillKpis();
     renderBillAlert();
   }
@@ -2998,6 +3033,9 @@
         snapshot: res.snapshot,
         age_seconds: res.age_seconds,
       });
+      // 手动成功后重拉 GET 同步自动检查状态：避免把旧的自动检查错误
+      // 继续展示成当前余额失效（POST 响应不含 auto_check）。
+      loadProviderBalanceCard().catch(function () {});
     }).catch(function (err) {
       if (btn) btn.disabled = false;
       if (status) status.textContent = errText(err);
@@ -3948,6 +3986,7 @@
     }
     // 费用页（wave 2）：KPI 刷新 / Demo 统计 / 页内标签
     onClick("adm-balance-refresh-btn", refreshProviderBalance);
+    onClick("adm-site-refresh-btn", loadSiteStats);
     var demoSelect = $("adm-demo-window");
     if (demoSelect && demoSelect.addEventListener) {
       demoSelect.addEventListener("change", function () {
@@ -4029,6 +4068,13 @@
 
   window.addEventListener("message", onMessage);
   bindNav();
+  if (typeof window.setInterval === "function") {
+    window.setInterval(function () {
+      if (state.nonce && !state.dead && state.page === "overview" && !document.hidden) {
+        loadSiteStats();
+      }
+    }, 60000);
+  }
 
   // 导出（仅调试/测试用；不含 nonce 读取器）。金额换算函数一并导出供
   // tests/js/admin-plugin-ui.test.ts 锁定「字符串进、字符串出」契约与

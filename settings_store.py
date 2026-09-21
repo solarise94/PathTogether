@@ -43,8 +43,9 @@ REGISTRATION_MODE_KEY = "registration_mode"
 AI_DISPATCH_MAINTENANCE_KEY = "ai_dispatch_maintenance"
 
 #: 合法模式（I 线：email_verify_invite_activation 为「邮箱验证 + 邀请码激活」
-#: 两段式；public 本阶段路由不支持，仅允许出现在存量值中由路由统一拒绝；
-#: closed / invite_only 原义保留不变）
+#: 两段式；P1（docs/agent-plan-20260921 §4）起 public 正式支持——生效仍需
+#: 通过 registration_store 的前置闸（TLS/Secure Cookie/邮件通道/管理员通知
+#: 邮箱/双协议文稿），未满足降级 closed）
 REGISTRATION_MODES = ("closed", "invite_only",
                       "email_verify_invite_activation", "public")
 
@@ -176,9 +177,9 @@ def get_registration_mode() -> str:
       * 无该键 → bootstrap 为 ``closed`` 并回写（fail-closed：旧布尔
         ``registration_open`` 已随 0032/Wave2-Compat 删除，缺行绝不放大
         注册面，由 owner 显式切换）；
-      * 存量值非法（含手写的 public 之外的乱值）→ 按关闭处理返回 ``closed``；
-        合法存量 ``public`` 原样返回（路由层统一 503 public_registration_not_
-        supported，本阶段不支持公开注册）。
+      * 存量值非法（含乱值）→ 按关闭处理返回 ``closed``；
+        合法存量 ``public`` 原样返回（P1 起正式支持；生效仍受 app/worker
+        侧前置闸约束，未满足降级 closed）。
     - json/dual：一律 ``closed``（邀请注册整体 fail-closed，PG-only）。
 
     注意：本函数只解析存储值；「invite_only 是否允许生效」的前置条件
@@ -215,21 +216,17 @@ def get_registration_mode() -> str:
 
 
 def set_registration_mode(mode, updated_by=None) -> str:
-    """写注册模式。本阶段接受 closed / invite_only /
-    email_verify_invite_activation（public 拒绝）。
+    """写注册模式。接受 closed / invite_only /
+    email_verify_invite_activation / public（P1 起 public 正式支持）。
 
     返回写入后的模式。
-    前置条件（HTTPS / Secure Cookie / 邮件 worker 配置）由调用方（app 层）
-    先行校验；存储层只做词表校验。
+    前置条件（HTTPS / Secure Cookie / 邮件通道 / 管理员通知邮箱 / 双协议
+    文稿）由调用方（app 层）先行校验；存储层只做词表校验。
     """
-    if mode == "public":
-        raise ValueError(
-            "public_registration_not_supported：本阶段不支持 public（收到"
-            " %r）" % (mode,))
     if mode not in REGISTRATION_MODES:
         raise ValueError(
             "registration_mode 需为 %s（收到 %r）"
-            % (tuple(m for m in REGISTRATION_MODES if m != "public"), mode))
+            % (REGISTRATION_MODES, mode))
     set_setting(REGISTRATION_MODE_KEY, str(mode), updated_by=updated_by)
     return str(mode)
 

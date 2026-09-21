@@ -104,14 +104,16 @@ _log = logging.getLogger("svs.site_stats")
 #: - 2026-09-03.v1：宽泛子串——``sogou`` 把 SogouMobileBrowser 等搜狗系
 #:   浏览器实测误判为 SogouSpider；``whatsapp`` 把 WhatsApp 内置浏览器访问
 #:   当成链接预览抓取。
-#: - 2026-09-19.v2（本版）：``sogou`` 收窄为具体爬虫标识（sogou spider /
+#: - 2026-09-19.v2：``sogou`` 收窄为具体爬虫标识（sogou spider /
 #:   sogouspider 及已知变体）；``whatsapp`` 仅在 UA 非 Mozilla 浏览器形态
 #:   时记 WhatsApp 链接预览抓取（内置浏览器 UA 带 Mozilla/ 前缀，排除）。
 #:   带预期分类的脱敏完整 UA 样本表见 tests/test_site_stats.py。
+#: - 2026-09-21.v3（本版）：OkHttp 不再作为爬虫身份；泛化标记须位于
+#:   UA 产品词尾，避免 RobotPhone 等产品名中间子串误判。
 #: **口径局限**：本模块不保留原始 UA，历史 suspected_bot 行无法按新词表
 #: 可靠重分类——不做批量改写历史，也不宣称历史数据已修复；新词表只影响
 #: 新落库事件的分类。
-SITE_BOT_UA_RULESET_VERSION = "2026-09-19.v2"
+SITE_BOT_UA_RULESET_VERSION = "2026-09-21.v3"
 
 #: 页面 allowlist（path → page_key）：**精确匹配**，不允许前缀/模糊命中未知
 #: 路径（权威定义；0030 的 page_key CHECK 只约束形态）。集合口径 §4.4：
@@ -242,7 +244,7 @@ _BOT_UA_NEEDLES = (
     ("aiohttp", "aiohttp"),
     ("go-http-client", "GoHTTPClient"),
     ("java/", "JavaHTTPClient"),
-    ("okhttp", "OkHttp"),
+    # OkHttp is used by mobile apps too; it is not a crawler identity.
     ("apache-httpclient", "ApacheHttpClient"),
     ("libwww-perl", "libwww-perl"),
     ("scrapy", "Scrapy"),
@@ -555,7 +557,7 @@ def _classify_user_agent(user_agent):
         if needle in ua and not any(excl in ua for excl in exclusions):
             return name
     for marker in _BOT_UA_GENERIC_MARKERS:
-        if marker in ua:
+        if re.search(re.escape(marker) + r"(?:[^a-z]|$)", ua):
             return "generic_bot"
     return None
 

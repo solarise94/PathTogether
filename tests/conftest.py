@@ -185,6 +185,28 @@ _BUSINESS_TABLES = (
     "baidu_import_batches",
     "baidu_candidates",
     "baidu_enumerations",
+    # 0060 起：P0 协议与迁移底座——协议文档注册表 / 接受凭据 / 研究授权
+    # 当前状态与不可变历史（history→consents→acceptances→documents 顺序；
+    # 均有 users 外键 CASCADE，显式列出防跨用例残留授权凭据）
+    "user_research_consent_history",
+    "user_research_consents",
+    "user_agreement_acceptances",
+    "agreement_documents",
+    # 0061 起：P1 公共注册——registration_intents 引用 registration_mail_jobs
+    # （CASCADE 已覆盖，显式列出防跨用例残留 intent/名额桶/完成凭据；
+    # completions/days 无外键必须显式列出）
+    "registration_intents",
+    "public_registration_completions",
+    "public_registration_days",
+    # 0062 起：P2 研究副本删除任务（users 外键 CASCADE 已覆盖，显式列出
+    # 防跨用例残留删除任务/幂等占用唯一 active 槽）
+    "research_data_deletion_jobs",
+    # 0063 起：P3 人工读片行为采集研究存储——children first：events→sessions→
+    # subjects（FK CASCADE 已覆盖，显式列出防跨用例残留研究副本/伪名占用）
+    "research_viewer_events",
+    "research_viewing_sessions",
+    "research_conversation_items",
+    "research_subjects",
 )
 
 @pytest.fixture(scope="session")

@@ -19,6 +19,7 @@
     <div class="auth-view" id="login-view" data-auth-pane="login"{% if register_open %} hidden{% endif %}>
       <h2 id="login-dialog-title" data-i18n="login.title">登录 HistoPilot</h2>
       <p class="login-dialog-subtitle" data-i18n="login.subtitle">登录后继续查看、测试 AI 和协作</p>
+      {% if login_registered %}<div class="login-dialog-message" role="status" data-i18n="login.registered">注册成功，请使用邮箱和密码登录</div>{% endif %}
       {% if login_password_changed %}<div class="login-dialog-message" role="status" data-i18n="login.password_changed">密码已修改，请使用新密码重新登录</div>{% endif %}
       {% if login_error %}
       <div class="login-dialog-error" role="alert">
@@ -78,6 +79,38 @@
         <p class="login-dialog-hint" data-i18n="register.dialog.email.hint">验证成功后，该邮箱将作为你的登录账号。</p>
         <button class="login-dialog-submit" type="submit" data-i18n="register.dialog.submit">发送验证邮件</button>
       </form>
+      {% elif registration_mode == "public" %}
+      {% if register_terms and register_research %}
+      <!-- P1 public（docs §3.1/§3.3）：恰好两个独立复选框，均不预勾选；
+           必选未勾选时客户端提示并且服务端拒绝；第二项不选也能注册。
+           协议版本/hash 随表单提交，服务端权威校验（旧页面过期版本被拒）。 -->
+      <form method="POST" action="/register" id="register-dialog-form" autocomplete="on">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+        <input type="hidden" name="terms_version" value="{{ register_terms.version }}" />
+        <input type="hidden" name="terms_sha256" value="{{ register_terms.content_sha256 }}" />
+        <input type="hidden" name="research_version" value="{{ register_research.version }}" />
+        <input type="hidden" name="research_sha256" value="{{ register_research.content_sha256 }}" />
+        <label for="register-dialog-email" data-i18n="register.dialog.email">邮箱地址</label>
+        <input id="register-dialog-email" name="email" type="email" required maxlength="254"
+               autocomplete="email" spellcheck="false"
+               data-i18n-ph="register.dialog.email.ph" placeholder="you@example.com" />
+        <p class="login-dialog-hint" data-i18n="register.dialog.email.hint">验证成功后，该邮箱将作为你的登录账号。</p>
+        <p class="login-dialog-hint" data-i18n="register.public.quota.hint">当前开放邮箱验证注册，每日最多 5 个新自助账号，名额于北京时间每日 00:00 更新，以完成注册时的剩余名额为准。</p>
+        <label class="login-dialog-check" for="register-dialog-terms">
+          <input id="register-dialog-terms" name="terms_accepted" type="checkbox" value="1" required />
+          <span>我已阅读并接受<a href="{{ register_terms.url }}" target="_blank" rel="noopener noreferrer">《用户协议与数据处理说明》</a>（必选）</span>
+        </label>
+        <label class="login-dialog-check" for="register-dialog-research">
+          <input id="register-dialog-research" name="research_opt_in" type="checkbox" value="1" />
+          <span>我自愿同意<a href="{{ register_research.url }}" target="_blank" rel="noopener noreferrer">《数据共享与软件改进协议》</a>（自愿，可随时撤回；不选也能注册、登录、读片和使用相同 AI 额度策略）</span>
+        </label>
+        <button class="login-dialog-submit" type="submit" data-i18n="register.dialog.submit">发送验证邮件</button>
+      </form>
+      {% else %}
+      <!-- 缺当前发布文稿：不把 public 宣称为可注册（§3.2/§4.1 fail-closed） -->
+      <div class="login-dialog-message" role="status">注册暂不可用，请稍后重试</div>
+      <p class="login-dialog-subtitle">协议文稿发布中，公开注册暂未开放。</p>
+      {% endif %}
       {% elif registration_mode == "invite_only" %}
       <form method="POST" action="/register" id="register-dialog-form" autocomplete="on">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />

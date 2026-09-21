@@ -394,7 +394,7 @@ def test_ruleset_version_constant_shape():
     assert sss.SITE_BOT_UA_RULESET_VERSION
     # R5（2026-09-19）：词表收窄（sogou/whatsapp）必须提版——版本历史与
     # 前后口径见 site_stats_store.SITE_BOT_UA_RULESET_VERSION 注释
-    assert sss.SITE_BOT_UA_RULESET_VERSION == "2026-09-19.v2"
+    assert sss.SITE_BOT_UA_RULESET_VERSION == "2026-09-21.v3"
 
 
 def test_bot_ua_classified_with_name(secret):
@@ -1378,3 +1378,16 @@ def test_acq_interval_zero_does_not_affect_site_stats_segment(monkeypatch):
     monkeypatch.setenv("SITE_STATS_RETENTION_INTERVAL_SECONDS", "86400")
     th = app_mod._start_site_stats_retention_thread()
     assert th is not None and th.name == "site-stats-retention" and th.daemon
+
+
+@pytest.mark.parametrize("path", ["/wp-admin/install.php", "/.env", "/.git/config"])
+def test_unknown_probe_does_not_redirect_to_login(monkeypatch, path):
+    monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
+    response = app_mod.app.test_client().get(path)
+    assert response.status_code == 404
+    assert "Location" not in response.headers
+
+
+@pytest.mark.parametrize("ua", ["okhttp/4.12.0", "Mozilla/5.0 RobotPhone Chrome/130.0 Safari/537.36"])
+def test_mobile_client_is_not_crawler_identity(ua):
+    assert sss._classify_user_agent(ua) is None

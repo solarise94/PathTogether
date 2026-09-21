@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="referrer" content="no-referrer" />
+  <title>{{ doc.title }}（{{ doc.version }}）· HistoPilot / PathTogether</title>
+  <style>
+    body { max-width: 860px; margin: 0 auto; padding: 24px 16px 64px;
+           font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+           line-height: 1.75; color: #1f2933; }
+    h1 { font-size: 1.5rem; } h2 { font-size: 1.2rem; margin-top: 2em; }
+    table { border-collapse: collapse; width: 100%; font-size: .95rem; }
+    th, td { border: 1px solid #cbd2d9; padding: 6px 10px; text-align: left;
+             vertical-align: top; }
+    .meta { background: #f5f7fa; border: 1px solid #e4e7eb; border-radius: 8px;
+            padding: 12px 16px; font-size: .9rem; color: #52606d; }
+    .meta code { word-break: break-all; }
+    .status-draft { color: #9a3412; font-weight: 600; }
+    nav.related { margin: 24px 0; font-size: .95rem; }
+    nav.related a { margin-right: 16px; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="meta">
+      <div>文稿状态：<span class="status-draft">草稿（数据使用规则说明，随对应功能上线生效）</span></div>
+      <div>版本：<strong>{{ doc.version }}</strong> ｜ 语言：{{ doc.locale }}</div>
+      <div>内容 SHA-256：<code>{{ doc.content_sha256 }}</code></div>
+      <div>本页为版本化不可变链接：<a href="{{ permalink }}">{{ permalink }}</a>
+           ｜ <a href="{{ permalink }}?download=1" download>下载本文稿（Markdown）</a></div>
+      <div>本页面为公开只读页面，访问不会创建账号、不记录任何同意。</div>
+    </div>
+    <nav class="related">
+      相关协议：
+      <a href="/legal/user-agreement">用户协议与数据处理说明</a>
+      <a href="/legal/research-sharing">数据共享与软件改进协议</a>
+      <a href="/legal/model-providers">模型服务商披露</a>
+    </nav>
+    <article>
+      {{ content_html | safe }}
+    </article>
+  </main>
+</body>
+</html>

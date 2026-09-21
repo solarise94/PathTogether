@@ -4,7 +4,8 @@ review J / P2-4 / I-R4 守卫）。
 
 覆盖：
   - 模式：email_verify_invite_activation 前置检查（邮件通道/载荷密钥/哈希盐）
-    与 fail-closed 降级；PUT/GET 词表；public 拒绝保留；
+    与 fail-closed 降级；PUT/GET 词表；public 经自身前置闸（P1 起正式支持，
+    缺前置 400 registration_preconditions_failed）；
   - 注册流程 1-3：邮箱优先（不填邀请码、不发额度）、统一文案、GET
     /verify-email 只展示不消费、POST /api/registration/verify 原子创建
     pending_activation 用户（密码在邮箱确认之后设置；J：login_id=规范化
@@ -175,13 +176,16 @@ def test_put_registration_mode_new_mode(monkeypatch):
     assert r2.status_code == 200, r2.get_data(as_text=True)
     body = client.get("/api/admin/v1/settings").get_json()["registration"]
     assert body["supported_modes"] == ["closed", "invite_only",
-                                       "email_verify_invite_activation"]
+                                       "email_verify_invite_activation",
+                                       "public"]
     assert body["mode"] == "email_verify_invite_activation"
-    # public 仍拒绝
+    # public（P1 起正式接受，但走自己的前置闸）：缺管理员通知邮箱/双协议
+    # 文稿 → 400 registration_preconditions_failed
     r3 = client.put("/api/admin/v1/settings/registration",
                     json={"mode": "public"})
     assert r3.status_code == 400
-    assert r3.get_json()["error"]["code"] == "public_registration_not_supported"
+    assert r3.get_json()["error"]["code"] == \
+        "registration_preconditions_failed"
 
 
 def test_register_email_mode_page_copy(monkeypatch):
@@ -561,7 +565,8 @@ def test_enrollment_session_survives_nonwhitelist_challenge(monkeypatch):
     assert body["code"] == "auth_required"
     assert body["error"] != "auth_required"      # 不是裸机器码
     assert "重新登录" in body["error"]            # 中文引导文案
-    assert client.get("/some/random/page").status_code == 302
+    assert client.get("/some/random/page").status_code == 404
+    assert client.get("/app").status_code == 302
     # 会话没有被清：enrollment 状态接口仍可用
     r_enr = client.get("/api/account/enrollment")
     assert r_enr.status_code == 200

@@ -2,6 +2,15 @@
 
 No research export/collection is enabled by this module. Any future research job
 must check current consent at time of use; an old email is not consent authority.
+
+P0 协议与迁移底座（docs/agent-plan-20260921-registration-consent-research.md
+§1/§3.5，2026-09-21）起：``test_applications.share_research_data`` /
+``consent_version``（research-data-20260916-v1）只是**历史版本**证明——
+旧 true 不自动升级为有效研究授权，旧 false/缺行保持拒绝。当前研究授权的
+唯一服务端权威是 research_consent_store（user_research_consents 当前状态 +
+user_research_consent_history 不可变历史）；研究采集/读取准入由
+research_consent_store.ingest_allowed 判定（采集开关默认关闭），绝不读取
+本表旧字段。``set_consent`` 仅继续维护这条历史记录，不打开任何研究采集。
 """
 import os
 import secrets

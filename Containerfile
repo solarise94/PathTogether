@@ -15,6 +15,8 @@ COPY conversion_store.py conversion_worker.py slide_format_registry.py format_re
 COPY project_idempotency_store.py project_create_http.py conversion_http.py ./
 COPY baidu_share_parser.py baidu_adapter.py baidu_import_store.py baidu_import_http.py baidu_ingest.py ./
 COPY test_application_store.py ./
+COPY agreement_store.py research_consent_store.py research_store.py legal_render.py ./
+COPY legal_docs/ legal_docs/
 COPY kfb/ kfb/
 COPY migrations/ migrations/
 COPY scripts/ scripts/

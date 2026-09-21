@@ -115,7 +115,9 @@
                （D2 未发布）时保持隐藏，不给操作员一个永远报错的卡 -->
           <section class="adm-card" id="adm-site-card" hidden>
             <h2>站点访问（匿名统计）</h2>
-            <p class="adm-note">只统计公开页面的匿名访问：与注册用户、邀请、AI 用量完全无关。同一访客按日轮换匿名 hash 去重，「匿名访客日去重次数」不是独立用户数；「疑似爬虫」只是观测标签，不是封禁依据。只统计目标域名为本服务入口（访问域名）的访问；「来源」是浏览器声明的 Referer（可伪造），仅作参考。</p>
+            <button type="button" id="adm-site-refresh-btn" class="adm-btn-secondary">刷新访问统计</button>
+            <p class="adm-note" id="adm-site-refresh-status" role="status"></p>
+            <p class="adm-note">只统计公开页面访问（包含登录态），不覆盖工作台内的操作。同一访客按日轮换匿名 hash 去重，「匿名访客日去重次数」不是独立用户数；「疑似爬虫」只是观测标签，不是封禁依据。只统计目标域名为本服务入口（访问域名）的访问；「来源」是浏览器声明的 Referer（可伪造），仅作参考。</p>
             <div class="adm-warning-card" id="adm-site-entry-warn" hidden></div>
             <p class="adm-note" id="adm-site-entry-note" hidden></p>
             <div class="adm-empty" id="adm-site-empty" hidden></div>
@@ -135,7 +137,7 @@
                 <h3>外部来源 Top 10</h3>
                 <!-- R4（2026-09-19）：爬虫开关退役——外部来源榜固定排除疑似爬虫
                      （后端 top_referrers 固定口径）；总览疑似爬虫计数保留 -->
-                <p class="adm-note">外部来源（不含疑似爬虫）；来源由浏览器声明的 Referer（可伪造），仅作参考。</p>
+                <p class="adm-note">外部来源（不含疑似爬虫）；近 30 天累计。来源由浏览器声明的 Referer（可伪造），仅作参考。direct 包含直接访问、站内跳转和未携带来源；没有新外部来源时数值不会增加。</p>
                 <div class="adm-table-wrap">
                   <table class="adm-table">
                     <thead><tr><th>来源站点</th><th>访问</th></tr></thead>
@@ -164,6 +166,7 @@
             </div>
             <dl id="adm-site-kinds" class="adm-kv"></dl>
             <h3 class="adm-site-h3">最近访问（20 条）</h3>
+            <p class="adm-note">按时间混排不同访客，并非同一用户的访问路径。home → login 不能用于判断登录失败；匿名记录无法确认是否为本人。分类仅按浏览器声明判断，Googlebot 等名称未经真实爬虫身份验证，历史标签保留。</p>
             <div class="adm-table-wrap">
               <table class="adm-table" id="adm-site-recent-table">
                 <thead>
@@ -617,6 +620,7 @@
           <div class="adm-state" id="adm-state-billing" data-page-state="idle" role="status" aria-live="polite"></div>
           <div class="adm-kpis" id="adm-bill-kpis"></div>
           <p class="adm-pager">
+            <p class="adm-note" id="adm-balance-auto-status" role="status"></p>
             <button type="button" id="adm-balance-refresh-btn" class="adm-btn-secondary">手动刷新供应商余额</button>
             <span id="adm-balance-refresh-status" class="adm-status"></span>
           </p>

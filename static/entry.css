@@ -1087,6 +1087,31 @@ body.login-dialog-open { overflow: hidden; }
   color: var(--text-3);
 }
 
+/* P1 public 注册：双协议复选框（独立成行、不合并、不预勾选；链接新窗口
+   打开且不影响选中状态，§3.1） */
+.login-dialog form label.login-dialog-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 12px 0 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.login-dialog form label.login-dialog-check input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  margin: 3px 0 0;
+}
+.login-dialog form label.login-dialog-check a {
+  color: var(--text);
+  border-bottom: 1px solid var(--line-strong);
+  text-decoration: none;
+}
+.login-dialog form label.login-dialog-check a:hover { border-bottom-color: var(--text); }
+
 .login-dialog form label {
   display: block;
   margin: 10px 0 6px;

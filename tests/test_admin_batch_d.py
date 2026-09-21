@@ -4,8 +4,8 @@ ai-money-budget-bugfix-and-simplification-plan.md §5/§6/§8 批次 D/§9.6/§9
 
 pg 模式（RUN_PG_TESTS=1）：
   - 新端点 owner 门控：匿名 401 / user 403 / owner 预览态 403（§14.1 同口径）；
-  - 注册模式 v1 PUT 校验（public 400 / 非法值 400 / invite_only 前置条件
-    400；旧路由已随 R3 wave1 删除，service 语义由 v1 独守）；
+  - 注册模式 v1 PUT 校验（public 缺前置 400 / 非法值 400 / invite_only
+    前置条件 400；旧路由已随 R3 wave1 删除，service 语义由 v1 独守）；
   - spend policies/enforcement-mode/window adjust/settings 聚合 PG 语义
     （PostgreSQL 唯一后端；旧 json/dual pg_backend_required 门已退役）。
   - spend policies PUT：CAS 版本冲突 409 / JSON number 金额 400 / >2^53
@@ -195,10 +195,12 @@ def test_new_write_endpoints_require_csrf():
 def test_registration_v1_put_validates():
     owner, _u = _setup_users()
     c = _login(_client(), owner)
-    # public 一律 400
+    # public（P1 起正式接受）：前置缺失（HTTPS/邮件通道/管理员通知邮箱/双
+    # 协议文稿）→ 400 registration_preconditions_failed
     r1 = c.put("/api/admin/v1/settings/registration", json={"mode": "public"})
     assert r1.status_code == 400
-    assert r1.get_json()["error"]["code"] == "public_registration_not_supported"
+    assert r1.get_json()["error"]["code"] == \
+        "registration_preconditions_failed"
     # 非法值 400
     assert c.put("/api/admin/v1/settings/registration",
                  json={"mode": "oops"}).status_code == 400
@@ -903,7 +905,7 @@ def test_settings_aggregate_sections_and_decimal_strings():
     body = r.get_json()
     # 注册模式段（任何后端真实）
     assert body["registration"]["supported_modes"] == [
-        "closed", "invite_only", "email_verify_invite_activation"]
+        "closed", "invite_only", "email_verify_invite_activation", "public"]
     # spend 段：三条策略 + enforcement + 窗口边界（epoch）+ 当前 demo 窗口
     spend = body["spend"]
     assert spend["available"] is True

@@ -172,6 +172,9 @@
     // 更换邮箱入口与改密/登出同级：预览态隐藏（未登录时 auth_enabled=false
     // 提前返回，入口保持模板里的 hidden，不会出现）
     if (els.changeemailBtn) { els.changeemailBtn.hidden = !!previewState; }
+    // 数据共享入口与改密/改绑同级：预览态隐藏（服务端 actor 解析同样拒绝
+    // 预览态变更用户授权）；未登录时 auth_enabled=false 提前返回保持 hidden
+    if (els.datashareBtn) { els.datashareBtn.hidden = !!previewState; }
     // 管理台入口按真实 actor 判定（预览态隐藏——与改密/登出同级约定；
     // 预览中 /admin 仍可手动直达，宿主每条消息回查真实 owner）。
     if (els.adminEntryLink) {
@@ -200,6 +203,8 @@
       els.sharePermHint.hidden = currentRole !== "user";
     }
     applyPreviewBanner(info);
+    // P3：预览态不是用户本人操作——停研究采集（服务端写闸亦 403 兜底）
+    if (previewState && researchTelemetry) researchTelemetry.stop();
     if (currentRole === "owner") loadDemoCatalog();
     return info;
   }
@@ -265,6 +270,8 @@
   // r3-wave1 物理删除——仅存 POST，无兼容期）
   // 产品语义：只有服务端确认退出成功才跳登录页；网络/HTTP 失败留在当前页并提示。
   function doLogout() {
+    // P3：登出即停研究采集、清内存缓冲（旧数据不贴到新授权，§7.3）
+    if (researchTelemetry) researchTelemetry.stop();
     apiFetch("/logout", { method: "POST" }).then(function (resp) {
       if (!resp || !resp.ok) {
         throw new Error((resp && resp.status) ? ("HTTP " + resp.status) : "logout failed");
@@ -460,6 +467,233 @@
     els.changeemailNew.addEventListener("keydown", function (e) {
       if (e.key === "Enter") { changeemailSubmit(); }
     });
+  }
+
+  // ---------- 数据共享（P2 账户设置 §3.5：自愿研究授权） ----------
+  // 服务端是唯一权威：GET /api/account/agreements（no-store）读当前状态，
+  // PUT /api/account/research-consent 带 expected_epoch CAS 提交（409
+  // epoch_conflict = 另一标签页先改过，自动重载后由用户重试，不盲覆盖），
+  // POST /api/account/research-data/deletion 幂等申请删除研究副本（不删
+  // 业务切片/标注/会话）。勾选默认不预选；协议链接只读不改选中状态。
+  var datashareState = null;   // 最近一次 GET 的 research 视图（含 epoch）
+
+  function datashareShowError(msg) {
+    if (!els.datashareError) return;
+    els.datashareError.textContent = msg || "";
+    els.datashareError.hidden = !msg;
+  }
+
+  function datashareFmtTime(v) {
+    if (!v) return "—";
+    try {
+      var d = new Date(v);
+      if (isNaN(d.getTime())) return v;
+      return d.toLocaleString();
+    } catch (e) { return v; }
+  }
+
+  function datashareRender(body) {
+    var research = (body && body.research) || {};
+    datashareState = research;
+    var docs = (body && body.documents) || [];
+    var rsDoc = null;
+    for (var di = 0; di < docs.length; di++) {
+      if (docs[di].document_type === "research_sharing") { rsDoc = docs[di]; break; }
+    }
+    // grant 版本只取服务端下发的**当前 published** 文稿（draft 服务端必拒绝）
+    datashareState._rs_doc_version =
+      (rsDoc && rsDoc.status === "published" && rsDoc.version) || null;
+    var statusKey;
+    if (research.state === "granted") statusKey = "acct.datashare.state.granted";
+    else if (research.state === "withdrawn") statusKey = "acct.datashare.state.withdrawn";
+    else if (research.state === "declined") statusKey = "acct.datashare.state.declined";
+    else statusKey = "acct.datashare.state.none";
+    if (els.datashareStatus) {
+      els.datashareStatus.textContent = t(statusKey) +
+        (body.collection_enabled ? "" : "　·　" + t("acct.datashare.collect.off"));
+    }
+    if (els.datashareDoc) {
+      var parts = [];
+      if (rsDoc) {
+        parts.push(t("acct.datashare.doc", { version: rsDoc.version || "—" }) +
+          "（" + (rsDoc.status === "published" ? t("acct.datashare.doc.published")
+                                             : t("acct.datashare.doc.draft")) + "）");
+      }
+      if (research.state === "granted") {
+        parts.push(t("acct.datashare.grantedat", { time: datashareFmtTime(research.granted_at) }));
+      } else if (research.state === "withdrawn") {
+        parts.push(t("acct.datashare.withdrawnat", { time: datashareFmtTime(research.withdrawn_at) }));
+      }
+      els.datashareDoc.textContent = parts.join("　·　");
+    }
+    if (els.datashareScope) {
+      els.datashareScope.textContent = t("acct.datashare.scope");
+    }
+    var legacy = research.legacy_test_application;
+    if (els.datashareLegacy) {
+      if (legacy && legacy.historical_only) {
+        els.datashareLegacy.textContent = t("acct.datashare.legacy",
+          { value: legacy.share_research_data ? t("acct.datashare.legacy.true")
+                                               : t("acct.datashare.legacy.false") });
+        els.datashareLegacy.hidden = false;
+      } else {
+        els.datashareLegacy.hidden = true;
+      }
+    }
+    var job = research.active_deletion_job;
+    if (els.datashareJob) {
+      if (job) {
+        els.datashareJob.textContent = t("acct.datashare.job", {
+          status: job.status || "pending",
+          time: datashareFmtTime(job.created_at),
+        });
+        els.datashareJob.hidden = false;
+      } else {
+        els.datashareJob.hidden = true;
+      }
+    }
+    if (els.datashareCheck) {
+      // 渲染当前选择（服务端权威），但保持「不预选自愿项」：仅 granted 时勾选
+      els.datashareCheck.checked = research.state === "granted";
+    }
+    if (els.datashareWithdraw) {
+      els.datashareWithdraw.hidden = research.state !== "granted";
+    }
+    if (els.datashareSubmit) {
+      // 草稿文稿未发布时不能同意（服务端也会拒绝），提交按钮仅控制勾选变化
+      els.datashareSubmit.disabled = false;
+    }
+  }
+
+  function datashareLoad() {
+    if (els.datashareStatus) {
+      els.datashareStatus.textContent = t("acct.datashare.loading");
+    }
+    apiFetch("/api/account/agreements").then(function (r) {
+      return r.json().then(function (b) { return { status: r.status, body: b }; });
+    }).then(function (res) {
+      if (res.status !== 200) {
+        datashareShowError((res.body && res.body.error) || t("acct.datashare.err.load"));
+        return;
+      }
+      datashareShowError("");
+      datashareRender(res.body);
+    }).catch(function () {
+      datashareShowError(t("acct.datashare.err.load"));
+    });
+  }
+
+  function datashareOpen() {
+    if (!els.datashareMask) return;
+    datashareShowError("");
+    datashareState = null;
+    els.datashareMask.style.display = "";
+    datashareLoad();
+  }
+
+  function datashareClose() {
+    if (!els.datashareMask) return;
+    els.datashareMask.style.display = "none";
+  }
+
+  // 统一 PUT：409 epoch_conflict（多标签页/旧页面）→ 自动重载状态并提示，
+  // 绝不拿旧 epoch 盲目重试覆盖他人操作
+  function datasharePut(enabled, btn) {
+    var payload = { enabled: enabled, expected_epoch: datashareState ? datashareState.epoch : 0 };
+    if (enabled) {
+      // 版本必填：从服务端下发的当前 published 文稿取（draft 服务端必拒绝）
+      var ver = datashareState && datashareState._rs_doc_version;
+      payload.document_version = ver || null;
+      if (!payload.document_version) {
+        datashareShowError(t("acct.datashare.err.nodoc"));
+        datashareLoad();
+        return;
+      }
+    }
+    if (btn && btn.disabled) { return; }
+    if (btn) { btn.disabled = true; }
+    apiFetch("/api/account/research-consent", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).then(function (r) {
+      return r.json().then(function (b) { return { status: r.status, body: b }; });
+    }).then(function (res) {
+      if (btn) { btn.disabled = false; }
+      if (res.status === 409 && res.body && res.body.code === "epoch_conflict") {
+        datashareShowError(t("acct.datashare.err.epoch"));
+        datashareLoad();
+        return;
+      }
+      if (res.status !== 200) {
+        datashareShowError((res.body && res.body.error) || t("acct.datashare.err.save"));
+        return;
+      }
+      datashareShowError("");
+      if (enabled) { toast(t("acct.datashare.ok.granted"), "info"); }
+      else { toast(t("acct.datashare.ok.withdrawn"), "info"); }
+      datashareLoad();
+    }).catch(function () {
+      if (btn) { btn.disabled = false; }
+      datashareShowError(t("acct.datashare.err.save"));
+    });
+  }
+
+  function datashareSubmit() {
+    var want = !!(els.datashareCheck && els.datashareCheck.checked);
+    var was = !!(datashareState && datashareState.state === "granted");
+    if (want === was) { datashareClose(); return; }
+    if (want) {
+      var ver = datashareState && datashareState._rs_doc_version;
+      if (!ver) {
+        datashareShowError(t("acct.datashare.err.nodoc"));
+        datashareLoad();
+        return;
+      }
+    }
+    datasharePut(want, els.datashareSubmit);
+  }
+
+  function datashareWithdraw() {
+    datasharePut(false, els.datashareWithdraw);
+  }
+
+  function datashareDeleteRequest() {
+    var btn = els.datashareDelete;
+    if (btn && btn.disabled) { return; }
+    if (btn) { btn.disabled = true; }
+    apiFetch("/api/account/research-data/deletion", { method: "POST" })
+      .then(function (r) {
+        return r.json().then(function (b) { return { status: r.status, body: b }; });
+      }).then(function (res) {
+        if (btn) { btn.disabled = false; }
+        if (res.status !== 200) {
+          datashareShowError((res.body && res.body.error) || t("acct.datashare.err.del"));
+          return;
+        }
+        datashareShowError("");
+        toast(t(res.body && res.body.created
+          ? "acct.datashare.ok.del" : "acct.datashare.ok.del.dupe"), "info");
+        datashareLoad();
+      }).catch(function () {
+        if (btn) { btn.disabled = false; }
+        datashareShowError(t("acct.datashare.err.del"));
+      });
+  }
+
+  function initDataShare() {
+    if (!els.datashareMask) return;
+    els.datashareBtn.addEventListener("click", datashareOpen);
+    els.datashareClose.addEventListener("click", datashareClose);
+    els.datashareCancel.addEventListener("click", datashareClose);
+    els.datashareMask.addEventListener("click", function (e) {
+      if (e.target === els.datashareMask) { datashareClose(); }
+    });
+    els.datashareSubmit.addEventListener("click", datashareSubmit);
+    els.datashareWithdraw.addEventListener("click", datashareWithdraw);
+    if (els.datashareDelete) {
+      els.datashareDelete.addEventListener("click", datashareDeleteRequest);
+    }
   }
 
   function copyText(text) {
@@ -661,6 +895,21 @@
     changeemailSubmitBtn: $("changeemail-submit"),
     changeemailNew: $("changeemail-new"),
     changeemailError: $("changeemail-error"),
+    // 数据共享（P2 账户设置 §3.5：自愿研究授权；弹窗骨架复用 changepw）
+    datashareBtn: $("datashare-btn"),
+    datashareMask: $("datashare-mask"),
+    datashareClose: $("datashare-close"),
+    datashareCancel: $("datashare-cancel"),
+    datashareSubmit: $("datashare-submit"),
+    datashareWithdraw: $("datashare-withdraw"),
+    datashareDelete: $("datashare-delete"),
+    datashareCheck: $("datashare-check"),
+    datashareStatus: $("datashare-status"),
+    datashareDoc: $("datashare-doc"),
+    datashareScope: $("datashare-scope"),
+    datashareLegacy: $("datashare-legacy"),
+    datashareJob: $("datashare-job"),
+    datashareError: $("datashare-error"),
     annoAllToggle: $("anno-all-toggle"),
     // 手机端侧栏抽屉
     menuBtn: $("menu-btn"),
@@ -876,6 +1125,43 @@
     return { fill: "hsla(" + hue + ",70%,55%,0.18)", stroke: "hsl(" + hue + ",70%,45%)" };
   }
 
+  // =========================================================================
+  // P3 人工读片行为采集装配（docs/agent-plan-20260921-registration-consent-
+  // research.md §7.1）：只由本正式工作台显式装配——demo/公开分享/预览不加载
+  // research-viewer-telemetry.js 也不初始化；服务端 capabilities.
+  // research_collection（全局开关，默认关闭）关闭时零装配零网络请求。采集
+  // 模块自持手势归并/observe_pause/批次发送逻辑，本文件只提供装配点与
+  // 「业务写入成功后」的标注回调（失败不产事件）。
+  // =========================================================================
+  var researchTelemetry = null;
+
+  function initResearchTelemetry() {
+    if (!window.HP_ResearchTelemetry || !window.HP_ResearchTelemetry.create) return;
+    var caps = (window.HP_APP_BOOTSTRAP && window.HP_APP_BOOTSTRAP.capabilities) || {};
+    if (!caps.research_collection) return; // 全量关闭：不装配（无网络请求）
+    researchTelemetry = window.HP_ResearchTelemetry.create({});
+    researchTelemetry.attach(viewer);
+  }
+
+  // 切片打开（emitSlideOpened 同一去重口径）：为本切片建研究会话
+  function syncResearchTelemetrySlide() {
+    if (!researchTelemetry || !state.slide) return;
+    if (previewState) return; // 预览态不是用户本人操作（服务端亦 403 兜底）
+    researchTelemetry.startSlide({
+      slide: state.slide.name,
+      width: state.slide.width,
+      height: state.slide.height,
+    });
+  }
+
+  function updateResearchBusy() {
+    if (!researchTelemetry) return;
+    researchTelemetry.setBusy("drawing",
+      !!(state.drawMode || drawPhase !== "idle"));
+    researchTelemetry.setBusy("roi", !!state.roiMode);
+    researchTelemetry.setBusy("panel", !!(annoPanelOpen || editing));
+  }
+
   // ---------- 初始化 OpenSeadragon ----------
   function initViewer() {
     if (window.HP_ViewerCore && HP_ViewerCore.create) {
@@ -933,8 +1219,11 @@
       resizeAnnoCanvas();
       redrawAnnoCanvas();
     });
-    // 切片关闭时清理旧底图
-    viewer.addHandler("close", clearBaseThumb);
+    // 切片关闭时清理旧底图；P3：同时结束研究读片会话、清旧缓冲
+    viewer.addHandler("close", function () {
+      clearBaseThumb();
+      if (researchTelemetry) researchTelemetry.endSlide();
+    });
   }
 
   // slide.opened 发射（name|revision 去重）。语义是「插件应按此切片重置/恢复
@@ -958,6 +1247,8 @@
       // view.slide_revision，检测切片被替换（宽容缺省 → null，保护退化为不拦截）
       revision: state.slide.revision || null,
     } });
+    // P3：为本切片建研究读片会话（采集开关关闭/预览态时为无操作）
+    syncResearchTelemetrySlide();
   }
 
   function onViewerOpen() {
@@ -1280,13 +1571,21 @@
   }
 
   // ---------- 缩放 / 旋转 / 复位 ----------
+  // P3 研究采集：缩放按钮/快捷键是人工输入（§7.1），进入采集模块的
+  // gesture context；采集模块由 initResearchTelemetry 在采集开关开启时装配，
+  // 未装配时这里是无操作。
+  function notifyResearchZoomTool() {
+    if (researchTelemetry) researchTelemetry.notifyToolInteraction({ inputKind: "button" });
+  }
   function zoomIn() {
     if (!viewer || !viewer.viewport) return;
+    notifyResearchZoomTool();
     viewer.viewport.zoomBy(1.4);
     viewer.viewport.applyConstraints();
   }
   function zoomOut() {
     if (!viewer || !viewer.viewport) return;
+    notifyResearchZoomTool();
     viewer.viewport.zoomBy(1 / 1.4);
     viewer.viewport.applyConstraints();
   }
@@ -1453,6 +1752,7 @@
     updateRoiButtons();
     updateCtxBar();
     toast(t("roi.rect.tip"), "info");
+    updateResearchBusy();  // P3：矩形工具激活取消稳定观察检测
   }
 
   function exitRoi() {
@@ -1461,6 +1761,7 @@
     if (retryDraft && retryDraft.kind === "rect") retryDraft = null;
     setDrawUnsaved(false);
     setDrawPhase("idle");
+    updateResearchBusy();  // P3
     if (roiBox && viewer && viewer.currentOverlays) {
       try { viewer.removeOverlay(roiBox); } catch (e) {}
     }
@@ -3876,6 +4177,7 @@
   function setDrawPhase(p) {
     drawPhase = p;
     if (p === "idle" && !retryDraft) setDrawUnsaved(false);
+    updateResearchBusy();  // P3：绘制/保存中取消稳定观察检测
   }
 
   // 未保存提示：不动布局（工单 D 约束），只在「保存标记」按钮 title/状态上
@@ -4005,6 +4307,16 @@
         }
         retryDraft = null;
         setDrawUnsaved(false);
+        // P3 研究采集：业务写入成功才记 annotation_create（失败路径在 catch，
+        // 不产事件；§7.1）。业务标注 id 由采集模块换成会话内匿名局部 ID。
+        if (researchTelemetry) {
+          researchTelemetry.notifyAnnotation({
+            action: "annotation_create",
+            shapeType: draft.kind,
+            geom: draft.geom,
+            annotationId: j && j.annotation_id,
+          });
+        }
         // 撤销单元 = 语义操作（这次创建），压入撤销栈（限定本身份/本切片）
         var entry = pushUndoEntry({
           kind: "create",
@@ -4074,6 +4386,7 @@
     // §3.3 narrow 档「只留当前工具」：激活的绘制工具所在组保留在主行
     applyToolbarTier();
     toast(mode === "arrow" ? t("draw.arrow.tip") : t("draw.free.tip"), "info");
+    updateResearchBusy();  // P3
   }
 
   function exitDrawMode() {
@@ -4090,6 +4403,7 @@
     redrawAnnoCanvas();
     updateCtxBar();
     applyToolbarTier();
+    updateResearchBusy();  // P3
   }
 
   function toggleDrawMode(mode) {
@@ -4560,6 +4874,14 @@
     }).then(function (r) {
       if (r.ok) {
         return r.json().then(function (j) {
+          // P3 研究采集：删除业务写入成功才记事件（显式删除与撤销创建
+          // 同一 DELETE 入口；§7.1 匿名局部标注 ID，无几何字段）
+          if (researchTelemetry) {
+            researchTelemetry.notifyAnnotation({
+              action: "annotation_delete",
+              annotationId: entry.annotationId,
+            });
+          }
           return { ok: true, status: r.status, revision: j && j.revision };
         }).catch(function () { return { ok: true, status: r.status }; });
       }
@@ -4840,11 +5162,13 @@
     els.annoPanel.style.display = "flex";
     els.annoPanelTitle.textContent = t("anno.panel.title.with", { name: truncateMiddle(state.slide.name, 28) });
     renderAnnoPanel(currentAnnotations.annotations || []);
+    updateResearchBusy();  // P3：面板打开取消稳定观察检测
   }
 
   function closeAnnoPanel() {
     annoPanelOpen = false;
     els.annoPanel.style.display = "none";
+    updateResearchBusy();  // P3
   }
 
   function renderAnnoPanel(groups) {
@@ -5063,6 +5387,15 @@
       .then(function () {
         toast(t(action === "accept" ? "anno.review.accepted" : "anno.review.rejected"),
               "success");
+        // P3 研究采集：AI 标注审核写入成功才记 annotation_accept/reject
+        // （§7.1：来源 human_review，与 AI 自动标注不混同）
+        if (researchTelemetry) {
+          researchTelemetry.notifyAnnotation({
+            action: action === "accept"
+              ? "annotation_accept" : "annotation_reject",
+            annotationId: it.annotation_id,
+          });
+        }
         refreshCurrentAnnotations();
       })
       .catch(function (e) { toast(e.message || t("anno.update.fail"), "error"); });
@@ -5250,6 +5583,7 @@
         editing = true;
         redrawAnnoCanvas();
         openEditCard(it);
+        updateResearchBusy();  // P3：编辑卡打开取消稳定观察检测
       });
       saveB2.addEventListener("click", function () { commitAdminEdit(it, ta.value); });
       delB2.addEventListener("click", function () {
@@ -5324,6 +5658,15 @@
     })
       .then(function (j) {
         toast(t("edit.saved"), "success");
+        // P3 研究采集：编辑业务写入成功才记 annotation_update（§7.1）
+        if (researchTelemetry) {
+          researchTelemetry.notifyAnnotation({
+            action: "annotation_update",
+            shapeType: it.type || "rect",
+            geom: geom,
+            annotationId: it.annotation_id,
+          });
+        }
         var snap = editBeforeSnapshot;
         if (snap && state.slide && (snap.annotationId || it.annotation_id)) {
           pushUndoEntry({
@@ -7632,6 +7975,9 @@
     // 更换邮箱（P1-3 身份收口 review-2026-09-08 P2-2；与改密同级账户入口）
     initChangeEmail();
 
+    // 数据共享（P2 账户设置 §3.5；与改密/改绑同级的自愿研究授权入口）
+    initDataShare();
+
     // user max_steps 只读同步（AI 预算管理 UI 已迁入 admin 插件，PR5）
     initAiMaxStepsSync();
 
@@ -8280,6 +8626,8 @@
     initToolbarTier();
     setupDragDrop();
     initAuth();
+    // P3 研究采集装配（capabilities.research_collection 开启才工作）
+    initResearchTelemetry();
     // 注册 HistoPilot HostBridge host 能力（插件未启用时为空操作）
     registerHostBridgeHandlers();
     // 初始折叠区状态（默认展开）

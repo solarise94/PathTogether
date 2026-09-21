@@ -33,6 +33,7 @@ from urllib.parse import urlparse
 
 from flask import (
     Flask,
+    has_request_context,
     Response,
     abort,
     jsonify,
@@ -128,6 +129,19 @@ import upload_task_store
 # 通知邮件复用 registration_mail_jobs 的 test_application/test_decision
 # purpose）。verify 路径的申请提交是 best-effort——失败不阻断建号。
 import test_application_store
+# P0 协议与迁移底座（docs/agent-plan-20260921-registration-consent-research.md
+# §3）：协议文档注册表（legal_docs/ 版本化文稿 + agreement_documents 登记）、
+# 研究授权 consent 服务（user_research_consents 当前状态 + 不可变历史；
+# 旧 test_applications 选项仅历史证明，不自动升级为研究授权）。/legal/*
+# 公开只读页面由 agreement_store 内置文稿直接渲染，不查库、不记录同意。
+import agreement_store
+import legal_render
+import research_consent_store
+# P3 人工读片行为采集研究存储（同文档 §6.2/§7）：research_subjects 伪名 /
+# research_viewing_sessions / research_viewer_events（0063）+ 事件白名单
+# 校验与撤回即时阻断的写入入口；对话副本表 research_conversation_items
+# 本轮只落结构，写入链路属后续阶段。
+import research_store
 
 # Batch D2（§Batch D2 1/2，docs review-2026-09-02-upload-user-limits-admin-
 # ui-cleanup.md §4.4）：匿名站点访问统计——独立 store（site_visit_events；
@@ -1085,6 +1099,8 @@ _REGISTRATION_PUBLIC_PATHS = frozenset({
     "/verify-email-change",
     "/api/registration/verify",
     "/api/registration/resend",
+    # P1：public 名额公共快照（只读、无枚举信号；§4.3）
+    "/api/registration/public-status",
 })
 
 #: enrollment 受限会话白名单（设计文档第 8 节 I-R4）：pending_activation
@@ -1130,12 +1146,22 @@ def _require_auth():
     AI run grant 创建与使用、SSE、插件业务资源、身份预览全部收口：pending
     账号不可能经任何普通 session 触达业务面。
     """
+    # Unknown paths must stay 404. Redirecting vulnerability probes to /login
+    # makes scanners look like visitors attempting to sign in.
+    if request.url_rule is None and getattr(request.routing_exception, "code", None) == 404:
+        abort(404)
     if not AUTH_ENABLED:
         return None
     # 公开路径不回查用户（避免每个静态资源打一次存储）
     path = request.path
     if (path in ("/login", "/register", "/demo") or path.startswith("/static/")
             or path.startswith("/plugins/")):
+        return None
+    # P0 协议底座（docs §3.2）：版本化协议页面公开只读——未登录/未激活
+    # 用户必须能阅读协议，否则新注册用户会被重定向登录而无法读协议。
+    # GET 不创建用户、不记录同意；enrollment 受限会话同样放行（置于
+    # session 分支之前，匿名/pending/已登录一致可见）。
+    if path.startswith("/legal/"):
         return None
     # I 线匿名注册通道（验证页 + start/verify/resend；CSRF 仍由全局闸覆盖）
     if path in _REGISTRATION_PUBLIC_PATHS:
@@ -2529,6 +2555,12 @@ def _app_capabilities(mode):
         "ai_run": True,
         "view_tools": True,
         "ai_panel": True,
+        # P3 研究采集全局开关（非敏感 feature flag；默认关闭）：仅作前端
+        # 「是否装配采集模块」的提示——全量关闭时前端不发任何研究网络请求
+        # （§7.3）；用户级授权/资源/撤回判定仍以服务端为唯一权威。
+        # Demo/公开分享页不下发（demo=True 恒 False）。
+        "research_collection": (not demo)
+        and research_consent_store.collection_enabled(),
         # 上传修复 A1：V2 分片路由阈值（非敏感，随 bootstrap 下发；前端解析
         # 失败回落同值。ZIP/MRXS 例外不随此值变化）
         "upload_v2_threshold_bytes": int(UPLOAD_V2_THRESHOLD_BYTES),
@@ -2670,7 +2702,8 @@ def _registration_dialog_mode() -> str:
 
     - email_verify_invite_activation → "email_verify"（首屏只填邮箱）；
     - invite_only → "invite_only"（邀请码表单）；
-    - closed / public → "closed"（无可提交表单；public 由 /register 路由 503）。
+    - public → "public"（邮箱 + 双协议复选框表单，P1）；
+    - closed → "closed"（无可提交表单）。
     服务端权威策略（_effective_registration_mode 的 fail-closed 前置闸）不变，
     弹窗只是按同一权威值渲染对应表单，不提供任何绕过。
     """
@@ -2679,6 +2712,8 @@ def _registration_dialog_mode() -> str:
         return "email_verify"
     if mode == "invite_only":
         return "invite_only"
+    if mode == "public":
+        return "public"
     return "closed"
 
 
@@ -2696,6 +2731,9 @@ def _entry_signed_in_context():
         "login_open": False, "login_error": None, "login_error_code": None,
         "login_next_url": "/app", "login_retry_after": 0,
         "login_password_changed": False,
+        # P1：public 注册成功跳 /login?registered=1 的提示（§4.2：注册成功
+        # 后转 /login?registered=1，登录成功保持当前 /app 默认目的地）
+        "login_registered": False,
         # 注册弹窗（R2）：/register 深链接与注册错误回显经 _register_landing_page
         # 覆写 register_open/register_error 等；介绍页默认收起注册视图。
         "register_open": False,
@@ -3401,11 +3439,14 @@ app.session_interface = _PtSessionInterface()
 
 
 def _login_page(error=None, error_code=None, next_url="/app", retry_after=0,
-                status=200, headers=None, password_changed=False):
+                status=200, headers=None, password_changed=False,
+                registered=False):
     """渲染登录页（统一携带 CSRF token 与服务端权威 retry_after）。
 
     password_changed=True 时渲染「密码已修改，请使用新密码重新登录」提示
     （本人改密成功后前端跳 /login?password_changed=1，docs §7.1-7）。
+    registered=True 时渲染「注册成功」提示（P1：public 注册成功跳
+    /login?registered=1，§4.2）。
     next_url 默认 /app：无安全 next 的普通登录成功直接进工作台（R3）。
     """
     ctx = _entry_signed_in_context()
@@ -3413,7 +3454,8 @@ def _login_page(error=None, error_code=None, next_url="/app", retry_after=0,
                login_error_code=error_code,
                login_next_url=_safe_next_path(next_url),
                login_retry_after=int(retry_after or 0),
-               login_password_changed=bool(password_changed))
+               login_password_changed=bool(password_changed),
+               login_registered=bool(registered))
     resp = make_response(render_template("entry.html", **ctx), status)
     resp = _apply_landing_security_headers(resp)
     if headers:
@@ -3451,7 +3493,8 @@ def login():
             return redirect(next_url)
         return _login_page(
             next_url=next_url,
-            password_changed=request.args.get("password_changed") == "1")
+            password_changed=request.args.get("password_changed") == "1",
+            registered=request.args.get("registered") == "1")
 
     # ---- POST ----
     post_next = _safe_next_path(request.form.get("next") or next_url)
@@ -3976,8 +4019,14 @@ def register():
       **同一文案**（无枚举信号）。验证邮件含一次性链接 → GET /verify-email
       只展示 → POST /api/registration/verify 消费 token 并原子建
       pending_activation 用户（密码在邮箱确认之后设置）；
-    - public：本阶段不支持，GET/POST 均 503 public_registration_not_supported
-      （无 public 回退路径）；
+    - public（P1，docs/agent-plan-20260921 §3.3/§4）：注册视图填邮箱 +
+      **两个独立复选框**（必选《用户协议与数据处理说明》+ 自愿《数据共享
+      与软件改进协议》，均不预勾选）+ 服务端发布的协议版本标识。POST 入队
+      验证邮件并同事务建 registration intent（绑定双协议 version/hash、
+      必选接受时间、可选选择）——**不占名额、不建账号、不收密码**；验证
+      完成的原子事务才计每日 5 名额（Asia/Shanghai 日桶）、建 active 账
+      号、建初始额度（现有默认策略）、落协议凭据并同事务入队
+      registration_created 管理员通知。成功跳 /login?registered=1；
     - 模式权威值还受 fail-closed 前置闸（_effective_registration_mode：非
       HTTPS / 非 Secure Cookie / 邮件通道未配置等一律按 closed 处理，docs
       §3.2 末段 + I 线模式前置）。
@@ -3988,12 +4037,6 @@ def register():
     POST body，绝不进 URL query/path。
     """
     mode = _effective_registration_mode()
-    if mode == "public":
-        # 本阶段无 public 支持：稳定 code，不回退到任何开放形态
-        return (jsonify(error="公开注册暂不支持（public_registration_not_"
-                              "supported）",
-                        code="public_registration_not_supported"),
-                503)
 
     if request.method == "GET":
         # R2（2026-09-19）：/register 深链接 = 渲染介绍主页 + 直开注册弹窗；
@@ -4003,6 +4046,8 @@ def register():
             return _register_landing_page(mode="invite_only")
         if mode == "email_verify_invite_activation":
             return _register_landing_page(mode="email_verify")
+        if mode == "public":
+            return _register_landing_page(mode="public")
         return _register_landing_page(mode="closed")
 
     # ---- POST ----
@@ -4026,15 +4071,21 @@ def register():
         app.logger.exception("注册限流存储不可用，fail-closed 503")
         return _registration_unavailable_response()
     if retry > 0:
+        _retry_mode = ("email_verify"
+                       if mode == "email_verify_invite_activation"
+                       else mode if mode in ("invite_only", "public")
+                       else "invite_only")
         return _register_landing_page(
-            mode=("email_verify" if mode == "email_verify_invite_activation"
-                  else "invite_only"),
+            mode=_retry_mode,
             error="尝试过于频繁，请稍后再试", error_code="locked",
             retry_after=int(retry), status=429,
             headers={"Retry-After": str(max(1, int(retry)))})
 
     if mode == "email_verify_invite_activation":
         return _register_email_verify_post(ip_hash)
+
+    if mode == "public":
+        return _register_public_post(ip_hash)
 
     # invite_only：表单校验（本地形状错误，非枚举信号；不回显邀请码）。
     # login_id 字段为登录账号（docs §8.2：邀请绑定的是「允许兑换的登录
@@ -4142,6 +4193,99 @@ def _register_email_verify_post(ip_hash):
     return _register_email_verify_done_page()
 
 
+def _public_register_agreements_context():
+    """public 注册表单的协议上下文（当前 published 双文稿版本/hash/链接）。
+
+    读取失败/缺 published → 对应键为 None（模板退化为关闭态说明；生效模式
+    判定已在 _effective_registration_mode 把缺文稿降级 closed，这里是防御
+    层，不把 public 宣称为可注册）。
+    """
+    ctx = {"register_terms": None, "register_research": None}
+    try:
+        terms = agreement_store.current_published("user_agreement")
+        research = agreement_store.current_published("research_sharing")
+    except Exception:
+        app.logger.exception("public 注册表单协议上下文读取失败")
+        return ctx
+    if terms is not None:
+        ctx["register_terms"] = {
+            "version": terms["version"],
+            "content_sha256": terms["content_sha256"],
+            "url": "/legal/user-agreement/%s" % terms["version"],
+        }
+    if research is not None:
+        ctx["register_research"] = {
+            "version": research["version"],
+            "content_sha256": research["content_sha256"],
+            "url": "/legal/research-sharing/%s" % research["version"],
+        }
+    return ctx
+
+
+def _register_public_post(ip_hash):
+    """public 的 POST：邮箱 + 双协议选择 → 验证邮件 + intent（§3.3.1）。
+
+    - 必选协议未勾选 → 表单错误（本地校验，非枚举信号）；协议版本/hash 与
+      当前 published 不匹配（旧页面/篡改）→ 表单错误提示刷新；
+    - 可选研究选择缺省按 false（不能拒绝注册）；
+    - 已存在/未知邮箱/超限/内部异常一律**同一完成页**（无枚举信号）；
+    - **不占名额、不建账号、不收密码**（名额计数在验证完成的原子事务）；
+    - 入队成功后 best-effort 即时排水（worker 循环为权威发送方）。
+    """
+    # 写前重查（防御层；register() 顶部已查过一次，此处紧贴写路径）
+    if _effective_registration_mode() != registration_store.MODE_PUBLIC:
+        return _register_landing_page(mode="closed", status=403)
+    email = (request.form.get("email") or "").strip()
+    terms_accepted = registration_store.parse_wire_bool(
+        request.form.get("terms_accepted"))
+    research_opt_in = registration_store.parse_wire_bool(
+        request.form.get("research_opt_in"))
+    if not terms_accepted:
+        return _register_form_error(
+            "请先阅读并勾选《用户协议与数据处理说明》（必选）",
+            "terms_required", mode="public")
+    try:
+        registration_store.enqueue_public_verification(
+            email,
+            terms_accepted=True,
+            terms_version=(request.form.get("terms_version") or "").strip(),
+            terms_sha256=(request.form.get("terms_sha256") or "").strip(),
+            research_opt_in=research_opt_in,
+            research_version=(
+                request.form.get("research_version") or "").strip(),
+            research_sha256=(
+                request.form.get("research_sha256") or "").strip(),
+            base_url=(os.environ.get("PUBLIC_BASE_URL") or "").strip())
+    except registration_store.PublicRegistrationError as exc:
+        if exc.code in ("terms_required", "research_document_required"):
+            return _register_form_error(
+                "协议版本已更新，请刷新页面后重新阅读并勾选确认",
+                "terms_required", mode="public")
+        if exc.code == "document_not_published":
+            return _register_form_error(
+                "注册暂不可用，请稍后重试", "unavailable",
+                status=503, mode="public")
+        # bad_input（来自 validate_email 的 EmailVerifyError 在下方捕获；
+        # PublicRegistrationError 其余 code）→ 统一文案
+        app.logger.warning("public 验证邮件请求被统一文案吸收（code=%s）",
+                           exc.code)
+    except registration_store.EmailVerifyError as exc:
+        if exc.code == "bad_input":
+            return _register_form_error(
+                "请输入有效的邮箱地址", "invalid", mode="public")
+        app.logger.warning("public 验证邮件请求被统一文案吸收（code=%s）",
+                           exc.code)
+    except Exception:
+        app.logger.exception("public 验证邮件入队异常（统一文案）")
+    else:
+        try:
+            registration_mail_worker.drain_async()
+        except Exception:
+            app.logger.warning("验证邮件即时排水启动失败（留待 worker）",
+                               exc_info=True)
+    return _register_landing_page(mode="public", done=True)
+
+
 def _register_landing_page(mode, error=None, error_code=None, done=False,
                            retry_after=0, status=200, headers=None):
     """注册弹窗页（R2 2026-09-19）：渲染介绍主页 + 直开注册视图。
@@ -4150,12 +4294,16 @@ def _register_landing_page(mode, error=None, error_code=None, done=False,
       升级为模态；无 JS 时 CSS 浮层直出）；
     - 注册错误回显（表单错误 / 429 限流）：同一页面直开注册视图并保留错误，
       与登录弹窗的 login_open/login_error 模式对称；
+    - public 模式注入当前 published 双协议上下文（版本/hash 随表单提交，
+      服务端权威校验——旧页面提交的过期版本标识会被拒绝并提示刷新）；
     - 统一 no-store + 介绍页安全响应头（与 _landing_response 同口径）。
     """
     ctx = _entry_signed_in_context()
     ctx.update(register_open=True, registration_mode=mode,
                register_error=error, register_error_code=error_code,
                register_done=bool(done), register_retry_after=int(retry_after or 0))
+    if mode == "public":
+        ctx.update(_public_register_agreements_context())
     resp = make_response(render_template("entry.html", **ctx), status)
     resp = _apply_landing_security_headers(resp)
     if headers:
@@ -4222,17 +4370,56 @@ def verify_email_page():
     - 过期/已用/未知 → 渲染对应状态页（不泄露细分给非持有者以外的信号：
       页面本身只能被持链接者触达）；
     - 已登录（含 enrollment）访问：验证链接与登录态无关，照常渲染（GET 无
-      写副作用）。
+      写副作用）；
+    - P1 public 流程（§3.3.3/§3.3.4）：页面**展示用户此前主动做出的双协
+      议选择**（必选协议版本 + 可选研究选择；展示不是替未操作用户预勾
+      选），允许最终提交前修改可选项；发布内容实质变化（当前 published
+      版本/hash 与 intent 不一致）时重新提供两个 checkbox——不使用「继续
+      访问视为同意」。
     """
     token = (request.args.get("token") or "").strip()
     view = _verify_email_state_view(token)
-    resp = Response(render_template(
-        "verify_email.html", state=view["state"],
-        email_masked=view.get("email_masked"), token=token if view[
-            "state"] == "valid" else "",
-        csrf_token=ensure_csrf_token()), 200)
+    ctx = {"state": view["state"], "email_masked": view.get("email_masked"),
+           "token": token if view["state"] == "valid" else "",
+           "csrf_token": ensure_csrf_token(),
+           "flow": view.get("flow") or "legacy",
+           "public_ctx": None}
+    if view["state"] == "valid" and view.get("flow") == "public" \
+            and view.get("intent"):
+        ctx["public_ctx"] = _public_verify_page_context(view["intent"])
+    resp = Response(render_template("verify_email.html", **ctx), 200)
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+def _public_verify_page_context(intent):
+    """public 验证页上下文：intent 选择 + 当前 published 文稿比对。
+
+    - terms_changed / research_changed：当前 published 版本/hash 与 intent
+      不一致（实质变化或已下架）→ 最终页重新提供对应 checkbox；
+    - 研究可选项的勾选初值 = intent.research_opt_in（展示用户此前主动做
+      出的选择，允许修改；§3.3.3）。
+    """
+    terms_doc = research_doc = None
+    try:
+        terms_doc = agreement_store.current_published("user_agreement")
+        research_doc = agreement_store.current_published("research_sharing")
+    except Exception:
+        app.logger.exception("public 验证页协议上下文读取失败")
+    terms_changed = terms_doc is None or (
+        terms_doc["version"] != intent.get("terms_version")
+        or terms_doc["content_sha256"] != intent.get("terms_sha256"))
+    research_changed = research_doc is None or (
+        research_doc["version"] != (intent.get("research_version") or "")
+        or research_doc["content_sha256"]
+        != (intent.get("research_sha256") or ""))
+    return {
+        "terms_version": intent.get("terms_version"),
+        "research_opt_in": bool(intent.get("research_opt_in")),
+        "terms_doc": terms_doc, "research_doc": research_doc,
+        "terms_changed": terms_changed,
+        "research_changed": research_changed,
+    }
 
 
 @app.route("/api/registration/verify", methods=["POST"])
@@ -4269,6 +4456,16 @@ def api_registration_verify():
                   % (registration_store.MIN_PASSWORD_LENGTH,
                      registration_store.MAX_PASSWORD_LENGTH),
             code="invalid_request"), 400
+    # P1 public 分流：流程由 token 绑定的 intent 决定（§4.4：intent 固定签
+    # 发时 flow_mode，不把链接在切模式后静默改语义）；无 intent 的旧链接
+    # 走原 email_verify_invite_activation 流程
+    try:
+        _flow = registration_store.verify_token_flow(token)
+    except Exception:
+        app.logger.exception("验证 token 流程判定失败（按 legacy 处理）")
+        _flow = "legacy"
+    if _flow == "public":
+        return _api_registration_verify_public(body, token, password)
     # SER-8 测试申请（可选字段）：形状**先于** token 消费校验——非法请求
     # 直接 400，绝不废掉一次性 token。缺 research_direction = 老前端兼容
     # （跳过申请提交，application_submitted=false，前端兜底引导激活页内
@@ -4319,6 +4516,123 @@ def api_registration_verify():
             application_submitted = False
     return jsonify(ok=True, next="/login", activation_required=True,
                    application_submitted=application_submitted)
+
+
+def _api_registration_verify_public(body, token, password):
+    """public 最终确认 POST（P1，§3.3.5/§4.2）：原子建 active 账号。
+
+    - body 可选：research_opt_in（严格布尔；缺省沿用 intent 选择，显式提
+      交以最终为准——§3.3.3 允许修改可选项）、terms_version/terms_sha256
+      与 research_version/research_sha256（文稿实质变化时的重新确认，
+      §3.3.4）；research_direction / share_research_data 等旧申请字段在
+      public 流程**不适用**（§4.4：public 不要求填写研究方向，不再把新
+      账号写成待审批 test_application），一律忽略；
+    - 成功：清匿名 session、轮换 CSRF（沿用已建立的 session 清理策略），
+      返回 {ok, next:"/login?registered=1"}——不自动登录、不签发会话；
+    - completion 幂等重放：只回成功 + 登录地址（不碰 session、不审计、
+      不泄露已有身份）；
+    - 满额 429 + Retry-After 到下次北京时间零点（不消耗 token，可之后
+      重试；链接过期需重新申请）；模式已关闭 403 registration_closed；
+      邮箱冲突 409 统一文案。
+    """
+    research_opt_in = None
+    if isinstance(body, dict) and "research_opt_in" in body:
+        research_opt_in = registration_store.parse_wire_bool(
+            body.get("research_opt_in"))
+
+    def _s(name):
+        v = body.get(name)
+        v = (v or "").strip() if isinstance(v, str) else ""
+        return v or None
+
+    try:
+        result = registration_store.complete_public_registration(
+            token, password,
+            research_opt_in=research_opt_in,
+            research_version=_s("research_version"),
+            research_sha256=_s("research_sha256"),
+            terms_version=_s("terms_version"),
+            terms_sha256=_s("terms_sha256"))
+    except registration_store.PublicRegistrationError as exc:
+        code = exc.code
+        if code == "registration_daily_limit":
+            retry = registration_store.public_daily_limit_retry_after()
+            resp = jsonify(
+                error="今日注册名额已满，名额于北京时间每日 00:00 更新，"
+                      "请稍后重试；你的验证链接未被消耗，仍在有效期内可"
+                      "继续使用",
+                code="registration_daily_limit")
+            resp.status_code = 429
+            resp.headers["Retry-After"] = str(retry)
+            return resp
+        if code == "registration_closed":
+            return jsonify(
+                error="注册流程已更新，请返回注册页重新开始",
+                code="registration_closed"), 403
+        if code == "email_taken":
+            return jsonify(
+                error="该邮箱已被占用，请直接登录或联系管理员",
+                code="email_taken"), 409
+        if code in ("terms_required", "research_document_required"):
+            return jsonify(
+                error="协议内容已更新，请重新阅读并勾选确认后再提交",
+                code=code), 400
+        if code in ("document_not_published", "admin_email_unconfigured",
+                    "total_default_missing"):
+            app.logger.warning("public 注册前置缺失（code=%s，整体回滚）",
+                               code)
+            return jsonify(error="注册暂不可用，请稍后重试",
+                           code="registration_unavailable"), 503
+        # bad_input / invalid_or_expired 统一（不泄露细分）
+        return jsonify(
+            error="验证链接无效或已过期，请重新请求验证邮件",
+            code="invalid_or_expired"), 400
+    except spend_store.ProvisioningMaintenanceError:
+        return jsonify(error="系统维护中（cutover），暂停注册；请稍后重试",
+                       code="ai_dispatch_maintenance"), 503
+    except Exception:
+        app.logger.exception("public 建号异常（统一错误，整体回滚）")
+        return jsonify(error="注册暂不可用，请稍后重试",
+                       code="registration_unavailable"), 503
+    if result.get("replayed"):
+        # completion 幂等重放（§4.2）：只回成功 + 登录地址——不碰 session、
+        # 不审计、不签发新会话、不泄露身份字段
+        return jsonify(ok=True, next="/login?registered=1")
+    session.clear()
+    rotate_csrf_token()
+    _audit("registration.public_user_created", target_type="user",
+           target_id=result["user"]["user_id"],
+           detail={"email_masked": registration_store.mask_login_id(
+                       result["email"]),
+                   "day": result["day"],
+                   "successful_count": result["successful_count"]})
+    return jsonify(ok=True, next="/login?registered=1")
+
+
+@app.route("/api/registration/public-status", methods=["GET"])
+def api_registration_public_status():
+    """public 名额公共快照（§4.3）：当日余量 + 下次北京时间零点。
+
+    只是快照，**不是名额保证**（以完成注册时的剩余名额为准）；不泄露任何
+    邮箱/账号存在性。非 public 模式只回模式与 open=False（不暴露配额细
+    节）。no-store。
+    """
+    mode = _effective_registration_mode()
+    if mode != registration_store.MODE_PUBLIC:
+        return jsonify(mode="closed", open=False)
+    try:
+        status = registration_store.public_quota_status()
+    except Exception:
+        app.logger.exception("public 名额快照读取失败")
+        return jsonify(error="暂无法读取名额状态，请稍后重试",
+                       code="registration_unavailable"), 503
+    resp = jsonify(mode="public", open=True,
+                   day=status["day"], limit=status["limit"],
+                   successful_count=status["successful_count"],
+                   remaining=status["remaining"],
+                   resets_at=status["resets_at"])
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 def _require_enrollment():
@@ -4463,9 +4777,14 @@ def api_account_test_application_get():
 
     返回 {state: "none"|"pending"|"approved"|"rejected"|
     "activated_by_invite", research_direction?, share_research_data?,
-    consent_version?}；无记录 → state="none"。activated_by_invite（R7
-    2026-09-19）= 用户已凭邀请码激活、申请同事务自动收口（非人工审批）；
-    等待页据此显示「已通过邀请码激活」并引导重新登录，不混同 approved。
+    consent_version?, share_research_data_historical?}；无记录 → state="none"
+    （响应保持仅 state 字段）。activated_by_invite（R7 2026-09-19）= 用户已凭
+    邀请码激活、申请同事务自动收口（非人工审批）；等待页据此显示「已通过
+    邀请码激活」并引导重新登录，不混同 approved。
+
+    P2（§3.5）：``share_research_data`` 是旧申请的**历史记录字段**，不是当前
+    研究授权——有记录时附 ``share_research_data_historical=true`` 标记；当前
+    研究授权唯一权威是 user_research_consents（GET /api/account/agreements）。
     """
     if not AUTH_ENABLED:
         return jsonify(error="测试申请需要启用认证"), 400
@@ -4484,7 +4803,9 @@ def api_account_test_application_get():
     return jsonify(state=record.get("status") or "none",
                    research_direction=record.get("research_direction"),
                    share_research_data=record.get("share_research_data"),
-                   consent_version=record.get("consent_version"))
+                   consent_version=record.get("consent_version"),
+                   # 旧选项仅历史证明：不是当前研究采集权威（§3.5/§1）
+                   share_research_data_historical=True)
 
 
 @app.route("/api/account/test-application", methods=["POST"])
@@ -4497,6 +4818,11 @@ def api_account_test_application_submit():
     - 状态不符（已激活/禁用/邮箱未验证）→ 409 invalid_state（含中文原因）；
     - 成功 {ok:true, state:"pending"}；重复提交 submit 返回 False →
       {ok:true, state:"pending", duplicate:true}（幂等，不再重复通知）。
+
+    P2（§3.5）：``share_research_data`` 随申请保存为**旧选项历史记录**，
+    不构成当前研究授权、也不触发任何研究采集——当前授权唯一写入路径是
+    PUT /api/account/research-consent（CAS + 版本校验），本端点不会替用户
+    grant，避免出现两份互不一致的「当前同意」。
     """
     if not AUTH_ENABLED:
         return jsonify(error="测试申请需要启用认证"), 400
@@ -4535,6 +4861,494 @@ def api_account_test_application_submit():
     if not submitted:
         return jsonify(ok=True, state="pending", duplicate=True)
     return jsonify(ok=True, state="pending")
+
+
+# =========================================================================== #
+# P2 可撤回研究授权与账户设置（docs/agent-plan-20260921-registration-consent-
+# research.md §3.5/§6）。
+#
+#   - GET  /api/account/agreements          当前发布文档 + 本人接受情况 +
+#                                           本人研究状态（no-store）；
+#   - POST /api/account/agreements/accept   接受当前必选文档（CSRF/本人/
+#                                           版本校验，source=account_reaccept）；
+#   - PUT  /api/account/research-consent    {enabled, document_version,
+#                                           expected_epoch}——CAS 撤回/再同意，
+#                                           grant 版本必填，withdraw 不校验文稿；
+#   - POST /api/account/research-data/deletion  幂等创建本人研究副本删除任务；
+#       GET 同路径返回当前任务状态（可查询）。
+#
+# 身份规则（§6.1「当前真实用户本人」）：一律取 **actor_identity()**（真实登录
+# 本人）而非 current_identity()（预览态 = 被预览用户）——owner 预览不能替用户
+# 查看或变更授权；预览态显式 403 preview_forbidden。demo/公开分享访客没有
+# 登录 session，到不了这里（全局 _require_auth 401）。写方法照走全局 CSRF 闸。
+# 客户端提交的 user_id/角色/时间一律不作权威；expected_epoch 只用于 CAS。
+# =========================================================================== #
+def _p2_rfc3339(value):
+    """timestamptz → RFC3339（UTC，Z 后缀；None 透传）——同 _test_app_rfc3339。"""
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _account_settings_actor():
+    """账户设置面（协议/研究授权/删除）身份解析：真实登录本人；预览态拒绝。
+
+    返回 ``(user_id, None)`` 或 ``(None, error_response)``。AUTH 关闭时与
+    test-application 同口径 400（这些端点语义上需要登录本人）。
+    """
+    if not AUTH_ENABLED:
+        return None, (jsonify(error="账户设置需要启用认证"), 400)
+    if _preview_active():
+        return None, (jsonify(
+            error="管理员预览态不能查看或变更用户的协议与研究授权",
+            code="preview_forbidden"), 403)
+    user_id = session.get("user_id") or None
+    if not user_id:
+        return None, (jsonify(error="登录状态已失效，请重新登录后再试",
+                              code="auth_required"), 401)
+    return user_id, None
+
+
+def _consent_doc_wire(doc_type, doc, builtin):
+    """协议文档出线（published 行或内置 draft 回退；url 为版本化链接）。"""
+    slug = builtin.get(doc_type, {}).get("slug")
+    return {
+        "document_type": doc_type,
+        "title": (doc or builtin.get(doc_type) or {}).get("title"),
+        "version": (doc or builtin.get(doc_type) or {}).get("version"),
+        "locale": (doc or builtin.get(doc_type) or {}).get("locale"),
+        "content_sha256": (doc or builtin.get(doc_type) or {}).get(
+            "content_sha256"),
+        "status": (doc["status"] if doc else "draft"),
+        "published_at": _p2_rfc3339(doc["published_at"]) if doc else None,
+        "effective_at": _p2_rfc3339(doc["effective_at"]) if doc else None,
+        "url": "/legal/%s/%s" % (slug, (doc or builtin.get(doc_type) or {})
+                                 .get("version")) if slug else None,
+    }
+
+
+@app.route("/api/account/agreements", methods=["GET"])
+def api_account_agreements():
+    """当前发布文档、本人接受情况与本人研究状态（§3.5；no-store）。
+
+    - documents：三类文稿的**当前 published** 版本；缺 published 时回退内置
+      draft 信息（status=draft——draft 不可用于接受/授权，仅供阅读）；
+    - acceptances：本人 user_agreement_acceptances（新→旧，上限 20）；
+    - research：research_authorization_view（唯一权威 + 旧 test_application
+      选项的 historical_only 标记）；
+    - history：本人授权历史（上限 20）；deletion_jobs：研究副本删除任务
+      （上限 10，含未终态任务状态）；
+    - collection_enabled：研究采集功能开关（P2 默认关闭）。
+    """
+    user_id, err = _account_settings_actor()
+    if err:
+        return err
+    try:
+        builtin = {d["document_type"]: d
+                   for d in agreement_store.builtin_documents()}
+        documents = [
+            _consent_doc_wire(dt, agreement_store.current_published(dt),
+                              builtin)
+            for dt in agreement_store.DOCUMENT_TYPES]
+        acceptances = [{
+            "document_type": r["document_type"],
+            "version": r["version"],
+            "content_sha256": r["content_sha256"],
+            "accepted_at": _p2_rfc3339(r["accepted_at"]),
+            "source": r["source"],
+            "locale": r["locale"],
+        } for r in research_consent_store.list_acceptances(user_id)[:20]]
+        history = [{
+            "from_state": r["from_state"], "to_state": r["to_state"],
+            "epoch": r["epoch"],
+            "document_version": r["document_version"],
+            "created_at": _p2_rfc3339(r["created_at"]),
+        } for r in research_consent_store.list_history(user_id)[:20]]
+        jobs = [{
+            "job_id": r["job_id"], "reason": r["reason"],
+            "status": r["status"], "consent_epoch": r["consent_epoch"],
+            "online_cleared": r["online_cleared"],
+            "exports_cleared": r["exports_cleared"],
+            "backups_pending": r["backups_pending"],
+            "error_code": r["error_code"],
+            "created_at": _p2_rfc3339(r["created_at"]),
+            "updated_at": _p2_rfc3339(r["updated_at"]),
+            "completed_at": _p2_rfc3339(r["completed_at"]),
+        } for r in research_consent_store.list_deletion_jobs(user_id)[:10]]
+        research = research_consent_store.research_authorization_view(user_id)
+        if research.get("active_deletion_job") is not None:
+            research["active_deletion_job"] = dict(
+                research["active_deletion_job"])
+            for key in ("created_at", "updated_at", "completed_at"):
+                research["active_deletion_job"][key] = _p2_rfc3339(
+                    research["active_deletion_job"].get(key))
+        for key in ("granted_at", "withdrawn_at"):
+            research[key] = _p2_rfc3339(research.get(key))
+    except Exception:
+        app.logger.exception("账户协议/研究状态读取失败")
+        return jsonify(error="暂无法读取账户协议状态，请稍后重试",
+                       code="storage_unavailable"), 503
+    resp = jsonify(documents=documents, acceptances=acceptances,
+                   research=research, history=history, deletion_jobs=jobs,
+                   collection_enabled=research_consent_store
+                   .collection_enabled())
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _consent_error_response(exc):
+    """consent/agreement 服务异常 → 统一 HTTP 映射（4xx 业务码 + 503 存储）。"""
+    if isinstance(exc, research_consent_store.EpochConflictError):
+        return jsonify(error=str(exc), code="epoch_conflict"), 409
+    if isinstance(exc, agreement_store.DocumentNotPublishedError):
+        return jsonify(error=str(exc), code="document_not_published"), 409
+    if isinstance(exc, research_consent_store.DocumentVersionRequiredError):
+        return jsonify(error=str(exc),
+                       code="document_version_required"), 400
+    if isinstance(exc, research_consent_store.ActorForbiddenError):
+        return jsonify(error=str(exc), code="actor_forbidden"), 403
+    if isinstance(exc, (research_consent_store.ConsentError,
+                       agreement_store.AgreementStoreError)):
+        return jsonify(error=str(exc), code="invalid_request"), 400
+    app.logger.exception("consent 服务异常")
+    return jsonify(error="操作暂不可用，请稍后重试",
+                   code="storage_unavailable"), 503
+
+
+@app.route("/api/account/agreements/accept", methods=["POST"])
+def api_account_agreements_accept():
+    """接受当前必选《用户协议与数据处理说明》（§3.5）。
+
+    body: ``{version, content_sha256?, document_type?}``（document_type 仅
+    接受 user_agreement；version 必填）。CSRF/本人身份由全局闸与本路由的
+    actor 解析保证；版本与 hash 以**服务端注册表**为权威——引用版本不是
+    当前 published，或提供的 hash 不匹配，一律 409 document_not_published
+    （不接受旧版本、不接受客户端自造 hash）。成功追加
+    source=account_reaccept 凭据（不覆盖 register 期凭据）。
+    """
+    user_id, err = _account_settings_actor()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    doc_type = body.get("document_type") or \
+        research_consent_store.TERMS_DOCUMENT_TYPE
+    if doc_type != research_consent_store.TERMS_DOCUMENT_TYPE:
+        return jsonify(error="本端点仅接受必选《用户协议与数据处理说明》",
+                       code="unsupported_document_type"), 400
+    version = body.get("version")
+    if not isinstance(version, str) or not version.strip():
+        return jsonify(error="必须提供协议版本", code="invalid_request"), 400
+    version = version.strip()
+    # hash 可省略（以服务端 published 为权威）；提供了就必须匹配
+    sha256 = (body.get("content_sha256") or "").strip().lower() or None
+    if sha256 is None:
+        published = agreement_store.current_published(doc_type)
+        sha256 = published["content_sha256"] if published else "0" * 64
+    try:
+        record = research_consent_store.record_terms_acceptance(
+            user_id, doc_type, version, sha256,
+            source="account_reaccept")
+    except Exception as exc:  # noqa: BLE001 - 统一映射（含存储故障 503）
+        return _consent_error_response(exc)
+    return jsonify(ok=True, acceptance={
+        "acceptance_id": record["acceptance_id"],
+        "document_type": record["document_type"],
+        "version": record["version"],
+        "content_sha256": record["content_sha256"],
+        "accepted_at": _p2_rfc3339(record["accepted_at"]),
+        "source": record["source"],
+        "locale": record["locale"],
+    })
+
+
+@app.route("/api/account/research-consent", methods=["PUT"])
+def api_account_research_consent():
+    """同意/撤回研究数据共享（§3.5；CAS + epoch）。
+
+    body: ``{enabled: boolean, document_version?, expected_epoch?,
+    document_sha256?}``：
+
+    - ``enabled`` 必须是明确布尔值（字符串 "false" 等 truthiness 陷阱一律
+      400，§3.1）；identity 取自 session，body 里的 user_id/角色/时间不作
+      权威（用户 A 不能替 B 操作）；
+    - grant（enabled=true）：``document_version`` 必填且必须等于当前
+      published research_sharing 版本（缺版本 400，版本/hash 不匹配或无
+      published 409）；hash 以服务端注册表为权威，客户端提供则须匹配；
+    - withdraw（enabled=false）：不校验文稿（旧协议下架后仍可撤回）；
+    - ``expected_epoch`` 提供多标签页 CAS：与当前 epoch 不一致 → 409
+      epoch_conflict + current_epoch（调用方刷新后重试）；
+    - 撤回成功时**同事务**创建研究副本删除任务（§6.3 撤回原子），响应附
+      deletion_job 供前端提示清理进度；
+    - Idempotency-Key 头透传为请求幂等键（网络重放不重复写历史）。
+    """
+    user_id, err = _account_settings_actor()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        return jsonify(error="enabled 必须为布尔值", code="invalid_request"), 400
+    expected_epoch = body.get("expected_epoch")
+    if expected_epoch is not None and (
+            isinstance(expected_epoch, bool)
+            or not isinstance(expected_epoch, int)
+            or expected_epoch < 0):
+        return jsonify(error="expected_epoch 必须是非负整数",
+                       code="invalid_request"), 400
+    idem = (request.headers.get("Idempotency-Key") or "").strip() or None
+    try:
+        if enabled:
+            version = body.get("document_version")
+            if not isinstance(version, str) or not version.strip():
+                return jsonify(
+                    error="同意研究共享必须提供协议版本（document_version）",
+                    code="document_version_required"), 400
+            version = version.strip()
+            published = agreement_store.current_published(
+                research_consent_store.RESEARCH_DOCUMENT_TYPE)
+            if published is None:
+                raise agreement_store.DocumentNotPublishedError(
+                    "当前没有已发布的数据共享协议文稿，暂不能同意研究共享")
+            client_sha = (body.get("document_sha256") or "").strip().lower()
+            if client_sha and client_sha != published["content_sha256"]:
+                raise agreement_store.DocumentNotPublishedError(
+                    "数据共享协议 %s 的内容摘要不匹配" % version)
+            result = research_consent_store.grant(
+                user_id, document_version=version,
+                document_sha256=published["content_sha256"],
+                expected_epoch=expected_epoch, actor_user_id=user_id,
+                idempotency_key=idem)
+        else:
+            result = research_consent_store.withdraw(
+                user_id, expected_epoch=expected_epoch,
+                actor_user_id=user_id, idempotency_key=idem)
+    except research_consent_store.EpochConflictError as exc:
+        current = research_consent_store.get_consent(user_id)
+        return jsonify(error=str(exc), code="epoch_conflict",
+                       current_epoch=current["epoch"] if current else 0), 409
+    except Exception as exc:  # noqa: BLE001 - 统一映射（含存储故障 503）
+        return _consent_error_response(exc)
+
+    def _wire(consent):
+        if not consent:
+            return None
+        out = dict(consent)
+        for key in ("granted_at", "withdrawn_at", "updated_at"):
+            out[key] = _p2_rfc3339(out.get(key))
+        return out
+
+    job = result.get("deletion_job")
+    if job is not None:
+        job = dict(job)
+        for key in ("created_at", "updated_at", "completed_at"):
+            job[key] = _p2_rfc3339(job.get(key))
+    return jsonify(ok=True, consent=_wire(result.get("consent")),
+                   changed=result.get("changed", False),
+                   replayed=result.get("replayed", False),
+                   deletion_job=job)
+
+
+@app.route("/api/account/research-data/deletion", methods=["POST", "GET"])
+def api_account_research_data_deletion():
+    """研究副本删除任务：POST 幂等创建，GET 查询状态（§3.5）。
+
+    - POST：为**本人**创建 reason=user_request 删除任务；已有未终态
+      （pending/running）任务时原样返回（created=false，幂等——网络重试
+      不重复建任务）。该任务只清理研究副本层（在线副本/导出/隔离备份），
+      **不删除业务切片、标注或临床/科研工作记录**；不需要撤回授权也可
+      申请（删除已采集研究副本与当前授权状态是两件事）。
+    - GET：返回当前未终态任务；没有则返回最近一条终态记录（都无则 null）。
+    """
+    user_id, err = _account_settings_actor()
+    if err:
+        return err
+    if request.method == "POST":
+        try:
+            created = research_consent_store.create_deletion_job(
+                user_id, reason="user_request", actor_user_id=user_id)
+        except Exception as exc:  # noqa: BLE001 - 统一映射
+            return _consent_error_response(exc)
+        job = created["job"]
+    else:
+        job = research_consent_store.get_active_deletion_job(user_id)
+        if job is None:
+            history = research_consent_store.list_deletion_jobs(user_id)
+            job = history[0] if history else None
+        created = {"created": False}
+    if job is not None:
+        job = dict(job)
+        for key in ("created_at", "updated_at", "completed_at"):
+            job[key] = _p2_rfc3339(job.get(key))
+    resp = jsonify(ok=True, job=job, created=created.get("created", False))
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+# =========================================================================== #
+# P3 人工读片行为采集（docs/agent-plan-20260921-registration-consent-research.md
+# §6.2/§7.1/§7.2/§7.3）。
+#
+#   - POST /api/research/viewing-sessions   登录+CSRF，提交业务 slide ID 供
+#                                           ACL 验证；服务端创建研究 session
+#                                           并绑定 user/epoch；无授权不创建；
+#   - POST /api/research/viewer-events      {viewing_session_id, consent_epoch,
+#                                           events:[...]}——后端从 session 解析
+#                                           主体与切片，不信任客户端 user/
+#                                           owner/资源映射。
+#
+# 身份与边界（§6.1）：一律取真实登录本人（session.user_id；匿名 401 由全局
+# _require_auth、预览态写 403 由全局 _preview_write_guard 先行拦截）。demo/
+# 公开分享访客无登录 session，到不了这里。客户端提交的 user_id/角色/owner
+# 一律不作权威。事件白名单校验在 research_store（额外字段整批拒绝）；
+# 观测事件可丢（429），绝不阻塞标注或主业务。研究存储故障不影响读片与
+# 业务保存（本组端点独立于标注/AI 链路）。
+# =========================================================================== #
+def _research_ingest_actor():
+    """研究采集端点身份解析：真实登录本人。
+
+    与 _account_settings_actor 同口径：AUTH 关闭 → 400（研究采集语义上需要
+    登录本人）；预览态由全局 _preview_write_guard 统一 403（POST 非安全方法）。
+    """
+    if not AUTH_ENABLED:
+        return None, (jsonify(error="研究采集需要启用认证",
+                              code="auth_required"), 400)
+    user_id = session.get("user_id") or None
+    if not user_id:
+        return None, (jsonify(error="登录状态已失效，请重新登录后再试",
+                              code="auth_required"), 401)
+    return user_id, None
+
+
+def _research_store_error_response(exc):
+    """research_store 异常 → 统一 HTTP 映射（§7.3：403/409/429/413/503）。"""
+    if isinstance(exc, research_store.RateLimitedError):
+        resp = jsonify(error=str(exc), code="rate_limited")
+        resp.headers["Retry-After"] = str(exc.retry_after)
+        return resp, 429
+    if isinstance(exc, research_store.NotAuthorizedError):
+        # 未授权（开关关闭/未同意/撤回/文档过期/删除任务未清）——reason 机器码
+        # 只进 code 字段，不向最终用户展开内部判定细节
+        return jsonify(error=str(exc), code=exc.reason), 403
+    if isinstance(exc, research_store.EpochMismatchError):
+        return jsonify(error=str(exc), code="epoch_mismatch"), 409
+    if isinstance(exc, (research_store.EventIdConflictError,
+                        research_store.SeqConflictError)):
+        return jsonify(error=str(exc), code=exc.code), 409
+    if isinstance(exc, research_store.SessionNotFoundError):
+        return jsonify(error="研究会话不存在或已失效",
+                       code="session_not_found"), 404
+    if isinstance(exc, research_store.SessionClosedError):
+        return jsonify(error=str(exc), code="session_closed"), 409
+    if isinstance(exc, research_store.PayloadTooLargeError):
+        return jsonify(error=str(exc), code="payload_too_large"), 413
+    if isinstance(exc, research_store.ResearchStoreError):
+        return jsonify(error=str(exc), code=exc.code), 400
+    app.logger.exception("研究采集存储异常")
+    return jsonify(error="研究上报暂不可用（不影响读片）",
+                   code="storage_unavailable"), 503
+
+
+@app.route("/api/research/viewing-sessions", methods=["POST"])
+def api_research_viewing_sessions():
+    """创建研究读片会话（§7.3）。
+
+    body: ``{slide}``（业务切片名，供 ACL 验证；project 可选、本版忽略）。
+    第一版资源权利（§6.1）：只允许**本人拥有**的切片建立研究会话——
+    「可查看他人切片」不足以授权研究；无 owner 的切片同样拒绝。响应不含
+    账号、邮箱或真实文件路径；slide 只以研究伪名落库。
+    """
+    user_id, err = _research_ingest_actor()
+    if err:
+        return err
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify(error="请求体必须是 JSON 对象",
+                       code="invalid_request"), 400
+    unknown = sorted(set(body.keys()) - {"slide", "project"})
+    if unknown:
+        return jsonify(error="请求体含未知字段 %s" % unknown,
+                       code="invalid_request"), 400
+    slide = body.get("slide")
+    if not isinstance(slide, str) or not (1 <= len(slide.strip()) <= 255):
+        return jsonify(error="必须提供有效的业务切片标识（slide）",
+                       code="invalid_request"), 400
+    slide = slide.strip()
+    # ACL：本人拥有（§6.1 资源权利——研究第一版只允许本人拥有的切片）
+    owner = _slide_owner(slide)
+    if not owner or owner != user_id:
+        return jsonify(
+            error="仅本人拥有的切片可用于研究共享",
+            code="resource_not_owned"), 403
+    try:
+        view = research_store.create_viewing_session(user_id, slide)
+    except Exception as exc:  # noqa: BLE001 - 统一映射
+        return _research_store_error_response(exc)
+    return jsonify(ok=True,
+                   viewing_session_id=view["viewing_session_id"],
+                   schema_version=view["schema_version"],
+                   consent_epoch=view["consent_epoch"],
+                   started_day=view["started_day"],
+                   status=view["status"],
+                   expires_at=_p2_rfc3339(view["expires_at"]))
+
+
+@app.route("/api/research/viewer-events", methods=["POST"])
+def api_research_viewer_events():
+    """批次上传研究读片事件（§7.3）。
+
+    body: ``{viewing_session_id, consent_epoch, events: [...]}``：
+
+    - 主体从 session 解析（session → subject → user），body 携带的任何
+      user/owner/资源字段一律忽略（白名单外整批 400）；
+    - 批次 ≤50 条、≤64 KiB（超限 400/413，不部分写入）；
+    - 事件 enum/seq/id/数值/字段白名单校验失败 → 整批 400；
+    - 未授权 403；epoch 与会话或当前不一致 409；限流 429（Retry-After）；
+      存储故障 503；响应不含账号与原始文件路径；
+    - 相同 event_id 重传幂等（内容一致 replayed）；不同内容复用 ID 409。
+    """
+    user_id, err = _research_ingest_actor()
+    if err:
+        return err
+    raw = request.get_data(cache=True)
+    if len(raw) > research_store.BATCH_MAX_BYTES:
+        return jsonify(error="请求体超过 64 KiB 上限",
+                       code="payload_too_large"), 413
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return jsonify(error="请求体必须是合法 JSON",
+                       code="invalid_request"), 400
+    if not isinstance(body, dict):
+        return jsonify(error="请求体必须是 JSON 对象",
+                       code="invalid_request"), 400
+    unknown = sorted(set(body.keys())
+                     - {"viewing_session_id", "consent_epoch", "events"})
+    if unknown:
+        return jsonify(error="请求体含未知字段 %s" % unknown,
+                       code="invalid_request"), 400
+    sid = body.get("viewing_session_id")
+    if not isinstance(sid, str) or not sid:
+        return jsonify(error="必须提供 viewing_session_id",
+                       code="invalid_request"), 400
+    epoch = body.get("consent_epoch")
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+        return jsonify(error="consent_epoch 必须是 >=1 的整数",
+                       code="invalid_request"), 400
+    events = body.get("events")
+    if not isinstance(events, list) or not events:
+        return jsonify(error="events 必须是非空数组",
+                       code="invalid_request"), 400
+    if len(events) > research_store.BATCH_MAX_EVENTS:
+        return jsonify(error="单批次最多 %d 条事件"
+                       % research_store.BATCH_MAX_EVENTS,
+                       code="batch_too_large"), 400
+    try:
+        result = research_store.append_viewer_events(
+            user_id, sid, epoch, events, body_bytes=len(raw))
+    except Exception as exc:  # noqa: BLE001 - 统一映射
+        return _research_store_error_response(exc)
+    return jsonify(ok=True, accepted=result["accepted"],
+                   replayed=result["replayed"])
 
 
 @app.route("/api/registration/resend", methods=["POST"])
@@ -5705,6 +6519,44 @@ def favicon():
     return resp
 
 
+# --------------------------------------------------------------------------- #
+# P0 协议底座（docs/agent-plan-20260921-registration-consent-research.md §3.2）：
+# 公开只读、版本化不可变的协议页面。
+#
+#   - GET /legal/<slug>           当前内置版本页面（no-cache，可重新验证）；
+#   - GET /legal/<slug>/<version> 版本化不可变链接（长缓存 immutable）；
+#   - 任一 URL 加 ?download=1     以 attachment 下载 Markdown 原文。
+#
+# 页面由 agreement_store 的内置版本化文稿直接渲染：**不查库、不创建用户、
+# 不记录同意**；链接绝不拼接任何验证 token；响应带 Referrer-Policy:
+# no-referrer（从验证邮件页打开协议不泄露来源 URL）。当前内置文稿为
+# 2026-09-21-v4 草稿（数据使用规则说明），页面明确标注草稿状态。
+# --------------------------------------------------------------------------- #
+@app.route("/legal/<slug>", methods=["GET"])
+@app.route("/legal/<slug>/<version>", methods=["GET"])
+def legal_document(slug, version=None):
+    doc = agreement_store.get_builtin_document(slug, version)
+    if doc is None:
+        abort(404)
+    permalink = "/legal/%s/%s" % (doc["slug"], doc["version"])
+    if (request.args.get("download") or "").strip() == "1":
+        resp = Response(doc["content"], mimetype="text/markdown; charset=utf-8")
+        resp.headers["Content-Disposition"] = (
+            "attachment; filename=\"%s_%s.md\"" % (doc["slug"], doc["version"]))
+    else:
+        resp = make_response(render_template(
+            "legal_doc.html", doc=doc, permalink=permalink,
+            content_html=legal_render.render_markdown(doc["content"])))
+    # 版本化链接内容不可变 → 长缓存；当前版本页可重新验证
+    if version is None:
+        resp.headers["Cache-Control"] = "no-cache"
+    else:
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    # 不泄露来源（验证邮件页打开协议时不带 Referer）
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    return resp
+
+
 def _sidecar_health_status(timeout=2.0):
     """探测 sidecar /healthz，返回 "reachable" / "unreachable" / "unknown"。
 
@@ -6253,14 +7105,17 @@ def _effective_registration_mode() -> str:
     ``registration_store.resolve_effective_registration_mode``（worker 绝不
     import Flask app）。本包装只保留 app 层的存储值读取与「降级每进程告警
     一次」行为。降级对象为全部开放形态（invite_only 与 I 线的
-    email_verify_invite_activation；后者还叠加邮件通道/载荷密钥/哈希盐前置）；
-    ``public`` 原样透传给路由层统一 503 public_registration_not_supported
-    （本阶段不支持，也没有任何开放回退路径）。
+    email_verify_invite_activation；后者还叠加邮件通道/载荷密钥/哈希盐前
+    置）；P1 起 ``public`` 同为开放形态：env 前置之外叠加**双协议文稿发
+    布检查**（§4.1：缺当前发布文稿时不能把 public 宣称为可注册），任一
+    缺失降级 closed。
     """
     mode = _registration_mode_stored()
     if mode not in _REGISTRATION_GATED_MODES:
         return mode
     failures = _registration_precondition_failures(mode=mode)
+    if mode == registration_store.MODE_PUBLIC and not failures:
+        failures = registration_store.public_document_failures()
     if failures:
         if not _registration_gate_warned["flag"]:
             _registration_gate_warned["flag"] = True
@@ -6374,7 +7229,7 @@ def _registration_settings_payload() -> dict:
         "mode": effective,
         "stored_mode": stored,
         "supported_modes": ["closed", "invite_only",
-                            "email_verify_invite_activation"],
+                            "email_verify_invite_activation", "public"],
         "precondition_failures": _registration_precondition_failures(
             mode=stored if stored in _REGISTRATION_GATED_MODES else None),
         "registration_open": effective in _REGISTRATION_GATED_MODES,
@@ -6389,18 +7244,19 @@ def _set_registration_mode_service(mode, actor_user_id):
     三元组返回，由两个路由层（旧 /api/admin/settings/registration 与
     Admin API v1 /api/admin/v1/settings/registration）各自映射错误信封格式；
     校验/审计/前置条件语义在两入口完全一致（§5.3「不复制校验逻辑」）。
+    P1 起接受 public：env 前置（TLS/Secure Cookie/邮件通道/载荷密钥/哈希
+    盐/管理员通知邮箱）+ 双协议文稿发布检查，未满足 400
+    registration_preconditions_failed（缺项文案不含凭据）。
     """
-    if mode == "public":
-        return None, (400, "public_registration_not_supported",
-                      "公开注册本阶段不支持（public_registration_not_"
-                      "supported）")
     if mode not in ("closed", "invite_only",
-                    "email_verify_invite_activation"):
+                    "email_verify_invite_activation", "public"):
         return None, (400, "invalid_request",
                       "mode 需为 closed / invite_only / "
-                      "email_verify_invite_activation")
+                      "email_verify_invite_activation / public")
     if mode in _REGISTRATION_GATED_MODES:
         failures = _registration_precondition_failures(mode=mode)
+        if mode == registration_store.MODE_PUBLIC and not failures:
+            failures = registration_store.public_document_failures()
         if failures:
             return None, (400, "registration_preconditions_failed",
                           "注册前置条件不满足：" + "；".join(failures))
@@ -7402,10 +8258,23 @@ def _admin_v1_provider_balance_payload():
     age = None
     if snapshot is not None:
         age = max(0.0, time.time() - float(snapshot["observed_at"]))
+    import pg_store
+    with pg_store.connect() as conn:
+        row = conn.execute(
+            "SELECT ts, detail FROM audit_events WHERE action = %s"
+            " ORDER BY ts DESC LIMIT 1",
+            ("billing.provider_balance_auto_check",)).fetchone()
     return _admin_v1_nano_out({
         "provider": BILLING_BALANCE_PROVIDER,
         "snapshot": snapshot,
         "age_seconds": age,
+        "auto_check": {
+            "enabled": os.environ.get("PROVIDER_BALANCE_AUTO_CHECK_ENABLED", "1") == "1",
+            "last_checked_at": row[0].isoformat() if row else None,
+            "status": (row[1] or {}).get("status") if row else None,
+            "refresh_interval_seconds": 3600,
+            "retry_interval_seconds": 300,
+        },
     })
 
 
@@ -7446,6 +8315,11 @@ def admin_v1_billing_provider_balance_refresh():
     if auth:
         return auth
 
+    return _refresh_provider_balance()
+
+
+def _refresh_provider_balance():
+    """Shared refresh implementation; caller supplies owner auth or system context."""
     def _throttled(wait_seconds):
         # 429 message 带还需等待的秒数（文案中文，code 稳定不变）
         return _admin_v1_error(
@@ -7574,9 +8448,10 @@ def _admin_v1_billing_provider_balance_refresh_body(cfg, api_key):
     with _provider_balance_refresh_lock:
         _provider_balance_refresh_state["last_ok_attempt"] = time.time()
         _provider_balance_refresh_state["last_fail_attempt"] = 0.0
-    _audit("billing.provider_balance_refresh",
-           target_type="provider_balance", target_id=BILLING_BALANCE_PROVIDER,
-           detail={"status": "ok", "is_available": is_available})
+    if has_request_context():
+        _audit("billing.provider_balance_refresh",
+               target_type="provider_balance", target_id=BILLING_BALANCE_PROVIDER,
+               detail={"status": "ok", "is_available": is_available})
     return jsonify(ok=True, snapshot=_admin_v1_nano_out(snapshot),
                    age_seconds=0.0, provider=BILLING_BALANCE_PROVIDER)
 
@@ -9067,6 +9942,9 @@ def admin_v1_test_applications():
         "display_name": row.get("display_name"),
         "research_direction": row.get("research_direction"),
         "share_research_data": bool(row.get("share_research_data")),
+        # P2（§3.5/§8）：旧申请选项只读标记「历史版本，未授权当前研究采集」；
+        # 当前授权状态走 research_consent_store（另一只读视图）。
+        "share_research_data_historical": True,
         "status": row.get("status"),
         "created_at": _test_app_rfc3339(row.get("created_at")),
         "reviewed_at": _test_app_rfc3339(row.get("reviewed_at")),
@@ -13727,6 +14605,101 @@ def _start_site_stats_retention_thread():
 
     th = threading.Thread(target=_loop, name="site-stats-retention",
                           daemon=True)
+    th.start()
+    return th
+
+
+_BALANCE_CHECK_WARN_INTERVAL_SECONDS = 300
+_balance_check_warn_last = {"ts": 0.0}
+
+
+def _warn_balance_check_throttled(message: str) -> None:
+    """余额自动检查故障节流 warning（同类一条/5 分钟；只含安全类别）。"""
+    now = time.monotonic()
+    if now - _balance_check_warn_last["ts"] < _BALANCE_CHECK_WARN_INTERVAL_SECONDS:
+        return
+    _balance_check_warn_last["ts"] = now
+    app.logger.warning("[provider-balance] %s", message)
+
+
+def _run_provider_balance_check_once():
+    """Hourly snapshot, five-minute failure retry, serialized across workers.
+
+    Persist a bounded diagnostic in audit_events. The advisory transaction lock
+    and last-check timestamp prevent each worker retrying the same failed check.
+    No HTTP request context, credentials or provider response bodies in audit.
+    """
+    import pg_store
+    with pg_store.connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_xact_lock(%s)", (724196021,))
+            if not cur.fetchone()[0]:
+                return "busy"
+            cur.execute(
+                "SELECT ts FROM audit_events WHERE action = %s"
+                " ORDER BY ts DESC LIMIT 1",
+                ("billing.provider_balance_auto_check",))
+            last = cur.fetchone()
+            if last and time.time() - last[0].timestamp() < 300:
+                return "retry_wait"
+            snapshot = billing_store.latest_provider_balance_snapshot(
+                BILLING_BALANCE_PROVIDER)
+            if snapshot and time.time() - float(snapshot["observed_at"]) < 3600:
+                return "fresh"
+            with app.app_context():
+                response = app.make_response(_refresh_provider_balance())
+                payload = response.get_json() or {}
+            code = "ok" if response.status_code == 200 else (
+                (payload.get("error") or {}).get("code") or "internal")
+            share_store.record_audit(
+                action="billing.provider_balance_auto_check", actor_role="system",
+                target_type="provider_balance", target_id=BILLING_BALANCE_PROVIDER,
+                detail={"status": code, "http_status": response.status_code})
+            return code
+
+
+def _provider_balance_check_iteration():
+    """单次自动检查迭代（线程循环体，拆出供测试直接调用）。
+
+    异常路径同样留下安全错误类别（只记异常类型名——异常消息可能带连接串
+    等环境信息，不进审计/日志）。DB 不可写时 record_audit 自行吞错，节流
+    warning 兜底；绝不把异常当成检查成功。审计行同时充当 300s 退避的
+    持久化时间戳。
+    """
+    try:
+        return _run_provider_balance_check_once()
+    except Exception as exc:
+        try:
+            share_store.record_audit(
+                action="billing.provider_balance_auto_check",
+                actor_role="system",
+                target_type="provider_balance",
+                target_id=BILLING_BALANCE_PROVIDER,
+                detail={"status": "check_exception",
+                        "error_class": type(exc).__name__})
+        except Exception:
+            pass
+        _warn_balance_check_throttled(
+            "provider balance automatic check raised %s; retry in 300s"
+            % type(exc).__name__)
+        return "check_exception"
+
+
+def _start_provider_balance_check_thread():
+    # Explicit disable for tests or installations that use an external scheduler.
+    if os.environ.get("PROVIDER_BALANCE_AUTO_CHECK_ENABLED", "1") != "1":
+        return None
+    # 线程模型：docker_entry.sh 的 gunicorn 不带 --preload，每个 worker 进程
+    # 各自 import 本模块并启动一个 daemon 线程——不存在 preload 父进程初始化
+    # 后 fork 丢线程的问题；多 worker 的重复自动请求由 PostgreSQL advisory
+    # lock + 持久化检查时间串行化（见 _run_provider_balance_check_once）。
+
+    def _loop():
+        while True:
+            _provider_balance_check_iteration()
+            time.sleep(300)
+
+    th = threading.Thread(target=_loop, name="provider-balance-check", daemon=True)
     th.start()
     return th
 
@@ -19564,6 +20537,8 @@ def api_annotation_history(token, index):
         return err
     return jsonify({"history": roi.get("history", [])})
 
+
+_PROVIDER_BALANCE_CHECK_THREAD = _start_provider_balance_check_thread()
 
 if __name__ == "__main__":
     # 管理端外网门户由 share_server 合并进程提供（同端口按路径分流），

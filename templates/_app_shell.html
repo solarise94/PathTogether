@@ -331,6 +331,10 @@
              预览态/未登录态隐藏——与改密/登出同级，applyAuthInfo 统一控制） -->
         <button type="button" id="changeemail-btn" class="logout-link changepw-link"
                 data-i18n="acct.changeemail" hidden>更换邮箱</button>
+        <!-- 数据共享（P2 账户设置 §3.5）：自愿研究授权的查看/同意/撤回/申请删除
+             入口；预览态隐藏（服务端 actor 解析同样拒绝预览态），demo 无登录态不渲染 -->
+        <button type="button" id="datashare-btn" class="logout-link changepw-link"
+                data-i18n="acct.datashare" hidden>数据共享</button>
         <button type="button" id="logout-btn" class="logout-link" data-i18n="toast.logout" hidden>退出登录</button>
       </div>
       {% endif %}
@@ -428,6 +432,44 @@
           <div class="picker-footer">
             <button id="changeemail-cancel" class="btn secondary small" data-i18n="acct.changeemail.cancel">取消</button>
             <button id="changeemail-submit" class="btn primary" data-i18n="acct.changeemail.submit">发送确认邮件</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 数据共享弹窗（P2 账户设置 §3.5）：当前选择、适用版本、生效时间、
+           共享范围、撤回、申请删除研究副本。数据源 GET /api/account/agreements
+           （no-store）；变更走 PUT /api/account/research-consent（expected_epoch
+           CAS，409 epoch_conflict 自动重载）；删除走 POST
+           /api/account/research-data/deletion（幂等）。自愿勾选默认不预选；
+           链接只读协议、不改变选中状态。 -->
+      <div id="datashare-mask" class="picker-mask" style="display:none;">
+        <div class="picker-dialog changepw-dialog datashare-dialog">
+          <div class="picker-title">
+            <span data-i18n="acct.datashare.title">数据共享</span>
+            <button id="datashare-close" class="icon-btn close" aria-label="关闭" data-i18n-aria="picker.close">×</button>
+          </div>
+          <div class="changepw-body">
+            <p class="datashare-status" id="datashare-status" role="status">加载中…</p>
+            <p class="changepw-hint" id="datashare-doc"></p>
+            <p class="changepw-hint" id="datashare-scope"></p>
+            <p class="changepw-hint" id="datashare-legacy" hidden></p>
+            <p class="changepw-hint" id="datashare-job" hidden></p>
+            <label class="perm-chip datashare-grant-row" id="datashare-grant-row">
+              <input type="checkbox" id="datashare-check" />
+              <span><span data-i18n="acct.datashare.check">同意</span>
+                <a href="/legal/research-sharing" target="_blank" rel="noopener"
+                   data-i18n="acct.datashare.agreement">《数据共享与软件改进协议》</a>
+                <span data-i18n="acct.datashare.voluntary">（自愿，可随时撤回；不勾选不影响注册、读片与 AI 额度）</span></span>
+            </label>
+            <p class="changepw-error" id="datashare-error" role="alert" hidden></p>
+          </div>
+          <div class="picker-footer">
+            <button id="datashare-cancel" class="btn secondary small" data-i18n="acct.datashare.close">关闭</button>
+            <button id="datashare-withdraw" class="btn secondary" data-i18n="acct.datashare.withdraw" hidden>撤回共享</button>
+            <button id="datashare-submit" class="btn primary" data-i18n="acct.datashare.save">保存选择</button>
+          </div>
+          <div class="picker-footer datashare-del-row">
+            <button id="datashare-delete" class="btn secondary small" data-i18n="acct.datashare.delete">申请删除研究副本</button>
           </div>
         </div>
       </div>

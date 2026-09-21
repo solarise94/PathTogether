@@ -85,9 +85,16 @@ REGISTRATION_MODES = ("closed", "invite_only",
 #: 共用此名，避免调用方散落字符串字面量）
 MODE_EMAIL_VERIFY_INVITE_ACTIVATION = "email_verify_invite_activation"
 
-#: P1-2（review）：需要 fail-closed 前置闸的开放注册形态（public 原样透传给
-#: 路由层统一 503；判定实现见 registration_mode_precondition_failures）
-REGISTRATION_GATED_MODES = ("invite_only", "email_verify_invite_activation")
+#: P1（docs §4）：public 自助注册模式常量（register 路由 / verify POST /
+#: worker drain 前置共用）
+MODE_PUBLIC = "public"
+
+#: P1-2（review）：需要 fail-closed 前置闸的开放注册形态。P1（2026-09-21
+#: docs §4.1）起 public 正式纳入闸内：env 前置（TLS/Secure Cookie/邮件通道/
+#: 载荷密钥/哈希盐/管理员通知邮箱）+ 双协议文稿发布检查（见
+#: resolve_effective_registration_mode），任一缺失降级 closed
+REGISTRATION_GATED_MODES = ("invite_only", "email_verify_invite_activation",
+                            "public")
 
 
 class RegistrationStoreError(RuntimeError):
@@ -155,7 +162,7 @@ def registration_mode_precondition_failures(environ=None, mode=None) -> list:
         failures.append("PUBLIC_BASE_URL 未配置为 https:// 入口")
     if not _env_truthy(env, "ADMIN_SESSION_COOKIE_SECURE"):
         failures.append("ADMIN_SESSION_COOKIE_SECURE 未启用（Secure Cookie）")
-    if mode == MODE_EMAIL_VERIFY_INVITE_ACTIVATION:
+    if mode in (MODE_EMAIL_VERIFY_INVITE_ACTIVATION, MODE_PUBLIC):
         import registration_mail_worker as mail_worker
         if not mail_worker.sender_configured(env, production=True):
             failures.append("邮件发送通道未配置（REGISTRATION_MAIL_SENDER；"
@@ -168,6 +175,13 @@ def registration_mode_precondition_failures(environ=None, mode=None) -> list:
                 or (env.get("SECRET_KEY") or "").strip()):
             failures.append("验证 token 哈希盐未配置（"
                             "REGISTRATION_VERIFY_HASH_SALT / SECRET_KEY）")
+    if mode == MODE_PUBLIC:
+        # P1（docs §4.1）：public 额外要求配置明确的管理员接收邮箱；可显式
+        # 兼容 TEST_APPLICATION_ADMIN_EMAIL，但不以源码硬编码的个人邮箱
+        # 静默兜底。配置检查只输出缺项，不输出凭据
+        if registration_admin_email(env) is None:
+            failures.append("管理员通知邮箱未配置（REGISTRATION_ADMIN_EMAIL"
+                            " / TEST_APPLICATION_ADMIN_EMAIL）")
     return failures
 
 
@@ -175,11 +189,13 @@ def resolve_effective_registration_mode(environ=None):
     """生效注册模式（共享权威实现）：存储值 × 前置条件闸，返回 ``(mode,
     failures)``。
 
-    - 存储读取失败按 closed（fail-closed，本地告警）；非开放形态（closed/
-      public）原样透传且 failures 为空；
+    - 存储读取失败按 closed（fail-closed，本地告警）；非开放形态（closed）
+      原样透传且 failures 为空；
     - 开放形态前置不满足 → 降级 closed，failures 携带原因（是否告警由调用方
       决定：app 层每进程告警一次，worker 逐轮 info）；
-    - ``public`` 不做前置判定，原样透传给路由层统一 503。
+    - ``public``（P1 起正式支持）：env 前置（同 email_verify 形态 + 管理员
+      通知邮箱）之外叠加**双协议文稿发布检查**（§4.1：缺当前发布文稿时不
+      能把 public 宣称为可注册）——任一缺失降级 closed。
     """
     try:
         mode = settings_store.get_registration_mode()
@@ -190,6 +206,8 @@ def resolve_effective_registration_mode(environ=None):
     if mode not in REGISTRATION_GATED_MODES:
         return mode, []
     failures = registration_mode_precondition_failures(environ, mode=mode)
+    if mode == MODE_PUBLIC and not failures:
+        failures = public_document_failures()
     if failures:
         return "closed", failures
     return mode, []
@@ -794,8 +812,17 @@ def _new_verify_token() -> str:
 # --------------------------------------------------------------------------- #
 # 入队（start / resend 同事务入队 + 配额）
 # --------------------------------------------------------------------------- #
-def _verify_quota_counts_tx(cur, email_norm):
-    """同事务读取该邮箱配额占用：(cooldown, hourly, daily, app_daily)。"""
+def _verify_quota_counts_tx(cur, email_norm, purpose=None):
+    """同事务读取该邮箱配额占用：(cooldown, hourly, daily, app_daily)。
+
+    ``purpose`` 给定时只计该用途作业（P1 public 入队只计 email_verify——
+    「发送验证邮件日 5 封」与「新注册日 5 个」是两个不同计数器，docs
+    §4.3；registration_created 等通知不占用邮箱验证配额）。缺省 None
+    保持旧口径（全部用途），旧 email_verify_invite_activation 路径行为
+    不变。
+    """
+    purpose_sql = " AND purpose=%s" if purpose else ""
+    params = (email_norm, purpose) if purpose else (email_norm,)
     cur.execute(
         "SELECT "
         " count(*) FILTER (WHERE created_at > now() - interval '"
@@ -804,12 +831,15 @@ def _verify_quota_counts_tx(cur, email_norm):
         "   AS hourly, "
         " count(*) FILTER (WHERE created_at > now() - interval '24 hours') "
         "   AS daily "
-        "FROM registration_mail_jobs WHERE email_normalized=%s",
-        (email_norm,))
+        "FROM registration_mail_jobs WHERE email_normalized=%s"
+        + purpose_sql,
+        params)
     row = cur.fetchone()
     cur.execute(
         "SELECT count(*) AS app_daily FROM registration_mail_jobs "
-        "WHERE created_at > now() - interval '24 hours'")
+        "WHERE created_at > now() - interval '24 hours'"
+        + purpose_sql,
+        (purpose,) if purpose else ())
     return (int(row["cooldown"]), int(row["hourly"]), int(row["daily"]),
             int(cur.fetchone()["app_daily"]))
 
@@ -890,38 +920,67 @@ def check_verify_token(token):
     """**只读**解析验证 token（GET /verify-email 用，绝不消费）。
 
     返回 ``{"state": "valid"|"expired"|"consumed"|"unknown",
-    "email_masked": str|None}``——email 掩码展示（mask_login_id），页面不
+    "email_masked": str|None, "flow": "public"|"legacy"|"unknown",
+    "intent": dict|None}``——email 掩码展示（mask_login_id），页面不
     全量回显。未知/非法 token 与过期统一可区分（持链接者本地状态展示），
     但都不产生任何写副作用。
+
+    P1（§3.3.3）：public 签发的 token 附带 intent（绑定时的双协议选择：
+    terms_version/terms_sha256、research_opt_in/research_version/
+    research_sha256）——验证页据此**展示用户此前主动做出的选择**（不是
+    替未操作用户预勾选），并允许最终提交前修改可选项。旧
+    email_verify_invite_activation 链接无 intent 行，flow='legacy'。
     """
     tok = (token or "").strip()
     if not tok:
-        return {"state": "unknown", "email_masked": None}
+        return {"state": "unknown", "email_masked": None,
+                "flow": "unknown", "intent": None}
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT email_normalized, status, consumed_at, "
-                    "extract(epoch from expires_at)::float8 AS expires_at "
-                    "FROM registration_mail_jobs "
-                    "WHERE token_hash=%s AND purpose=%s",
+                    "SELECT j.email_normalized, j.status, j.consumed_at, "
+                    "extract(epoch from j.expires_at)::float8 AS expires_at, "
+                    "i.intent_id, i.terms_version, i.terms_sha256, "
+                    "i.research_opt_in, i.research_version, i.research_sha256 "
+                    "FROM registration_mail_jobs j "
+                    "LEFT JOIN registration_intents i "
+                    "  ON i.mail_job_id = j.job_id "
+                    "WHERE j.token_hash=%s AND j.purpose=%s",
                     (verify_token_hash(tok), MAIL_PURPOSE_EMAIL_VERIFY))
                 row = cur.fetchone()
     finally:
         conn.close()
     if row is None:
-        return {"state": "unknown", "email_masked": None}
+        return {"state": "unknown", "email_masked": None,
+                "flow": "unknown", "intent": None}
     masked = mask_login_id(row["email_normalized"])
+    if row["intent_id"] is not None:
+        flow = "public"
+        intent = {
+            "terms_version": row["terms_version"],
+            "terms_sha256": row["terms_sha256"],
+            "research_opt_in": bool(row["research_opt_in"]),
+            "research_version": row["research_version"],
+            "research_sha256": row["research_sha256"],
+        }
+    else:
+        flow = "legacy"
+        intent = None
     if row["consumed_at"] is not None or row["status"] == "consumed":
-        return {"state": "consumed", "email_masked": masked}
+        return {"state": "consumed", "email_masked": masked,
+                "flow": flow, "intent": intent}
     # P1-1：uncertain（发送结果不确定=用户可能已收到邮件）在有效期内与
     # queued/sent 同样按 valid 处理，防止「收到的链接被判无效」
     if row["status"] not in ("queued", "sent", "uncertain"):
-        return {"state": "unknown", "email_masked": masked}
+        return {"state": "unknown", "email_masked": masked,
+                "flow": flow, "intent": intent}
     if row["expires_at"] is not None and row["expires_at"] <= time.time():
-        return {"state": "expired", "email_masked": masked}
-    return {"state": "valid", "email_masked": masked}
+        return {"state": "expired", "email_masked": masked,
+                "flow": flow, "intent": intent}
+    return {"state": "valid", "email_masked": masked,
+            "flow": flow, "intent": intent}
 
 
 # --------------------------------------------------------------------------- #
@@ -1279,3 +1338,664 @@ def activate_registered_user(user_id, invite_token):
         raise
     finally:
         conn.close()
+
+
+# =========================================================================== #
+# P1：public 自助注册（docs/agent-plan-20260921-registration-consent-research.md
+# §3.3 邮件跨设备流程 + §4 每日 5 个自由注册与管理员邮件）
+#
+# 安全不变量（与 redeem/verify/activate 同款纪律）：
+#   - 验证邮件阶段**不占名额、不建账号、不收密码**（§3.3.1）；名额计数时点是
+#     「邮箱验证完成、账号成功激活的同一事务」（§1）；
+#   - intent 固定签发时 flow_mode='public'，保存必选协议 version/hash、必选
+#     接受动作时间、可选研究选择与表单语言——不依赖浏览器 cookie 还原选项；
+#     registration_request_id 服务端生成并绑定 intent，客户端不能借任意
+#     request_id 命中他人完成记录；
+#   - 原子建号事务锁序（§4.2）：intent/token → 相应日桶 → provisioning 三段式
+#     → 新账号/同邮箱唯一性检查与插入；并发由 users_email_identity_key、
+#     public_registration_days CHECK(0..5)、completions 双 UNIQUE、通知 job
+#     business_key 唯一兜底；
+#   - 任何中间失败整体回滚：不出现「账号建了但未扣名额」「发了通知但事务
+#     回滚」；quota 满时最终 POST 不消耗验证 token（日桶 UPDATE 先于 token
+#     消费，满额异常即回滚）；
+#   - completion 幂等：已完成 intent 的重放只回成功 + 登录地址——无身份
+#     字段、不签发新会话、无重复副作用（不重复扣数/通知）；
+#   - 通知邮件正文**不含**研究共享选择（§4.5：避免管理员以此区别对待用
+#     户），不含密码/验证链接/会话/任何可直接修改账号的令牌。
+# =========================================================================== #
+
+#: 每日自助注册名额（§1/§4：每 Asia/Shanghai 自然日最多 5 个新自助账号，
+#: 全站、所有入口、所有实例共用）
+PUBLIC_DAILY_LIMIT = 5
+#: 名额日桶时区（§4.2：日期由服务端数据库 clock_timestamp() 转 Asia/
+#: Shanghai 在锁内选定；跨零点一致性定义为成功占用名额时的北京时间日期）
+PUBLIC_QUOTA_TZ = "Asia/Shanghai"
+#: 注册成功管理员通知用途（0061 CHECK 同词表）
+MAIL_PURPOSE_REGISTRATION_CREATED = "registration_created"
+#: public completion 通道标记（本阶段唯一值；invite/管理员手工建号不占名额）
+PUBLIC_COMPLETION_CHANNEL = "public"
+#: 必选/可选协议文档类型（与 agreement_store 词表一致）
+PUBLIC_TERMS_DOCUMENT_TYPE = "user_agreement"
+PUBLIC_RESEARCH_DOCUMENT_TYPE = "research_sharing"
+
+
+class PublicRegistrationError(RegistrationStoreError):
+    """public 注册失败。``code`` 稳定：bad_input / invalid_or_expired /
+    email_taken / terms_required / research_document_required /
+    document_not_published / registration_closed / registration_daily_limit
+    / total_default_missing / admin_email_unconfigured。"""
+
+    def __init__(self, code, message=None):
+        self.code = str(code)
+        super().__init__(message or self.code)
+
+
+def parse_wire_bool(value) -> bool:
+    """wire 值 → 严格布尔（§3.1：true 必须是明确布尔值，不能用 Python
+    truthiness 把字符串 "false" 当成同意）。
+
+    True 仅接受：布尔 True、字符串 "1"/"true"/"yes"/"on"（大小写不敏感，
+    即 HTML checkbox 提交口径）；其余一切（None、False、"false"、"0"、
+    数字、任意其他字符串/类型）一律 False。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return False
+
+
+def registration_admin_email(environ=None):
+    """管理员通知接收邮箱（§4.1）：``REGISTRATION_ADMIN_EMAIL`` 优先，
+    显式兼容部署已配置的 ``TEST_APPLICATION_ADMIN_EMAIL``；**不以源码
+    硬编码的个人邮箱静默兜底**——都未配置/非法返回 None（前置检查按
+    缺项 fail-closed；配置检查只输出缺项，不输出凭据）。
+    """
+    env = os.environ if environ is None else environ
+    value = (env.get("REGISTRATION_ADMIN_EMAIL") or "").strip()
+    if not value:
+        value = (env.get("TEST_APPLICATION_ADMIN_EMAIL") or "").strip()
+    if not value:
+        return None
+    try:
+        return validate_email(value)
+    except EmailVerifyError:
+        return None
+
+
+def public_document_failures() -> list:
+    """public 生效的双协议文稿前置（§4.1/§3.2）：缺当前 published 文稿时
+    不能把 public 宣称为可注册。读取异常 fail-closed（按缺失处理）。
+    """
+    import agreement_store
+    failures = []
+    try:
+        for doc_type, label in (
+                (PUBLIC_TERMS_DOCUMENT_TYPE, "用户协议与数据处理说明"),
+                (PUBLIC_RESEARCH_DOCUMENT_TYPE, "数据共享与软件改进协议")):
+            if agreement_store.current_published(doc_type) is None:
+                failures.append(
+                    "协议文稿未发布：%s（%s 无 published 版本）"
+                    % (label, doc_type))
+    except Exception:
+        _log.warning("协议文稿注册表读取失败（按 public 前置缺失处理）",
+                     exc_info=True)
+        failures.append("协议文稿注册表读取失败（agreement_documents）")
+    return failures
+
+
+def _current_published_tx(cur, document_type, locale):
+    """同事务读当前 published 文稿（返回 dict 或 None）。"""
+    cur.execute(
+        "SELECT version, content_sha256 FROM agreement_documents "
+        "WHERE document_type=%s AND locale=%s AND status='published'",
+        (document_type, locale))
+    row = cur.fetchone()
+    return dict(row) if row is not None else None
+
+
+def _stored_registration_mode_tx(cur) -> str:
+    """同事务读存储层注册模式（§4.2/§4.4：最终建号在事务内重校验——
+    public 关闭时新的 public 最终建号必须失败，给出清晰边界）。"""
+    cur.execute(
+        "SELECT value FROM platform_settings WHERE key=%s",
+        (settings_store.REGISTRATION_MODE_KEY,))
+    row = cur.fetchone()
+    if row is not None and isinstance(row["value"], str) \
+            and row["value"] in REGISTRATION_MODES:
+        return row["value"]
+    return "closed"
+
+
+# --------------------------------------------------------------------------- #
+# 入队：public 验证邮件 + intent（§3.3.1/§3.3.2）——不占名额、不建账号
+# --------------------------------------------------------------------------- #
+def enqueue_public_verification(email, *, terms_accepted, terms_version,
+                                terms_sha256, research_opt_in=False,
+                                research_version=None, research_sha256=None,
+                                base_url=None, form_locale="zh-CN",
+                                ttl_seconds=VERIFY_TOKEN_TTL_SECONDS):
+    """public 注册请求验证邮件（§3.3.1）：邮箱 + 双协议选择 → intent + 邮件。
+
+    - 必选《用户协议与数据处理说明》：``terms_accepted`` 必须为严格 True
+      （路由层经 :func:`parse_wire_bool` 解析），且 version/hash 命中**当前
+      published** 文稿，否则 PublicRegistrationError('terms_required')
+      （条款缺失/版本不匹配后端拒绝，§3.1）；
+    - 可选《数据共享与软件改进协议》：``research_opt_in`` 严格布尔，false
+      或未提供按 false 处理、不能拒绝注册；True 时 version/hash 必填且命中
+      当前 published（否则 'research_document_required'）；false 时服务端
+      自行记录当前 published 版本/hash 备查（可为 None）；
+    - 配额与旧 email_verify 形态同口径（同邮箱 60s 冷却/时 3/日 5、应用日
+      预算 40），但**只计 email_verify 用途**（§4.3：验证邮件计数器与注册
+      名额计数器分离）；超限抛 EmailVerifyError('rate_limited')，路由层与
+      成功同一文案（无枚举信号）；
+    - 同事务：作废旧 token → INSERT email_verify job → INSERT intent
+      （mail_job_id 一对一、registration_request_id 服务端生成、
+      terms_accepted_at 服务端 now()）；
+    - **不占名额、不建账号、不收密码**（计数时点在验证完成的原子事务）。
+
+    返回 ``{"job_id", "intent_id", "registration_request_id", "email",
+    "token", "expires_at"}``（token 明文仅此一次，经邮件外发）。
+    """
+    import agreement_store
+    import registration_mail_worker as mail_worker
+    email_norm = validate_email(email)
+    if not terms_accepted or not terms_version or not terms_sha256:
+        raise PublicRegistrationError("terms_required")
+    try:
+        terms_doc = agreement_store.require_published_document(
+            PUBLIC_TERMS_DOCUMENT_TYPE, terms_version, terms_sha256,
+            locale=form_locale)
+    except agreement_store.DocumentNotPublishedError as exc:
+        raise PublicRegistrationError("terms_required") from exc
+    research_opt_in = bool(research_opt_in)
+    research_doc = None
+    if research_opt_in:
+        if not research_version or not research_sha256:
+            raise PublicRegistrationError("research_document_required")
+        try:
+            research_doc = agreement_store.require_published_document(
+                PUBLIC_RESEARCH_DOCUMENT_TYPE, research_version,
+                research_sha256, locale=form_locale)
+        except agreement_store.DocumentNotPublishedError as exc:
+            raise PublicRegistrationError(
+                "research_document_required") from exc
+    else:
+        # false 有效：服务端记录当前 published 版本/hash 备查（缺文稿不拒
+        # 注册——false 不引用文稿；前置闸保证 public 生效时双文稿齐备）
+        research_doc = agreement_store.current_published(
+            PUBLIC_RESEARCH_DOCUMENT_TYPE, locale=form_locale)
+    try:
+        ttl = int(ttl_seconds)
+    except (TypeError, ValueError):
+        raise ValueError("ttl_seconds 需为整数")
+    if ttl <= 0 or ttl > 24 * 3600:
+        raise ValueError("ttl_seconds 需在 (0, 86400] 内")
+    token = _new_verify_token()
+    subject, body = mail_worker.build_public_verify_email_body(
+        email_norm, token, base_url)
+    payload_enc = mail_worker.encrypt_payload(
+        {"subject": subject, "body": body, "purpose": MAIL_PURPOSE_EMAIL_VERIFY,
+         "email": email_norm})
+    token_hash = verify_token_hash(token)
+    job_id = "rmj_" + secrets.token_urlsafe(8)
+    intent_id = "rint_" + secrets.token_urlsafe(8)
+    request_id = "rreq_" + secrets.token_urlsafe(16)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cooldown, hourly, daily, app_daily = _verify_quota_counts_tx(
+                    cur, email_norm, purpose=MAIL_PURPOSE_EMAIL_VERIFY)
+                if cooldown > 0 or hourly >= VERIFY_HOURLY_LIMIT \
+                        or daily >= VERIFY_DAILY_LIMIT \
+                        or app_daily >= VERIFY_APP_DAILY_BUDGET:
+                    raise EmailVerifyError("rate_limited")
+                # 作废同邮箱全部未消费旧 token（一次性 + 单活；旧 intent 随
+                # 旧 job 一并失效——token 不再可用即 intent 不再可完成）
+                cur.execute(
+                    "UPDATE registration_mail_jobs SET status='superseded' "
+                    "WHERE email_normalized=%s AND purpose=%s "
+                    "AND consumed_at IS NULL "
+                    "AND status IN ('queued','sent','uncertain')",
+                    (email_norm, MAIL_PURPOSE_EMAIL_VERIFY))
+                cur.execute(
+                    "INSERT INTO registration_mail_jobs "
+                    "(job_id, purpose, email_normalized, token_hash, "
+                    " payload_enc, status, expires_at) "
+                    "VALUES (%s,%s,%s,%s,%s,'queued', "
+                    " now() + (%s * interval '1 second')) "
+                    "RETURNING extract(epoch from expires_at)::float8 "
+                    "AS expires_at",
+                    (job_id, MAIL_PURPOSE_EMAIL_VERIFY, email_norm,
+                     token_hash, payload_enc, ttl))
+                expires_at = float(cur.fetchone()["expires_at"])
+                cur.execute(
+                    "INSERT INTO registration_intents "
+                    "(intent_id, registration_request_id, mail_job_id, "
+                    " email_normalized, flow_mode, terms_version, terms_sha256, "
+                    " terms_accepted_at, research_opt_in, research_version, "
+                    " research_sha256, form_locale) "
+                    "VALUES (%s,%s,%s,%s,'public',%s,%s,now(),%s,%s,%s,%s)",
+                    (intent_id, request_id, job_id, email_norm,
+                     terms_doc["version"], terms_doc["content_sha256"],
+                     research_opt_in,
+                     research_doc["version"] if research_doc else None,
+                     research_doc["content_sha256"] if research_doc else None,
+                     str(form_locale or "zh-CN")[:32]))
+    except psycopg.errors.UniqueViolation:
+        # token_hash/request_id 撞唯一键概率可忽略；防御性统一失败
+        raise EmailVerifyError("bad_input")
+    finally:
+        conn.close()
+    return {"job_id": job_id, "intent_id": intent_id,
+            "registration_request_id": request_id, "email": email_norm,
+            "token": token, "expires_at": expires_at}
+
+
+def verify_token_flow(token) -> str:
+    """验证 token 的签发流程（POST /api/registration/verify 分流用，只读）：
+    'public'（有 intent）/ 'legacy'（email_verify job 无 intent）/ 'unknown'。
+    """
+    tok = (token or "").strip()
+    if not tok:
+        return "unknown"
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT i.intent_id FROM registration_mail_jobs j "
+                    "LEFT JOIN registration_intents i "
+                    "  ON i.mail_job_id = j.job_id "
+                    "WHERE j.token_hash=%s AND j.purpose=%s",
+                    (verify_token_hash(tok), MAIL_PURPOSE_EMAIL_VERIFY))
+                row = cur.fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return "unknown"
+    return "public" if row["intent_id"] is not None else "legacy"
+
+
+# --------------------------------------------------------------------------- #
+# 原子建号事务（§4.2 伪流程逐条对应）
+# --------------------------------------------------------------------------- #
+def _insert_public_user_tx(cur, email_norm, password):
+    """同事务插入 active 用户（public_registration 来源）。
+
+    - login_id = 规范化邮箱（J 唯一用户名口径）；users_login_id_ci_key 冲突
+      → 合成「待补绑」login_id 重试一次（**不**失败注册、**不**合并账号；
+      email 身份唯一由 users_email_identity_key 兜底，SAVEPOINT 内分类）；
+    - activation_state='active'、activation_source='public_registration'、
+      email/email_normalized/email_verified_at 三列落库（邮箱已验证）；
+    - ai_access=TRUE：与 owner 建号/测试申请审批的缺省开通口径一致——平台
+      AI 权限由同事务的一次性总额度行兜底（既有默认策略），不是无限权限；
+      研究同意/不同意两组获得**相同**账号状态与额度（§10 P1 验收）。
+    返回用户公共 dict。
+    """
+    uid = _new_user_id()
+    for attempt, login in ((1, email_norm),
+                           (2, _pending_bind_login_id())):
+        cur.execute("SAVEPOINT insert_public_try")
+        try:
+            cur.execute(
+                "INSERT INTO users "
+                "(user_id, login_id, display_name, password_hash, role, "
+                " created_at, disabled, ai_config, ai_access, "
+                " activation_state, activation_source, activation_updated_at,"
+                " email, email_normalized, email_verified_at) "
+                "VALUES (%s,%s,%s,%s,'user', now(), FALSE, '{}'::jsonb, "
+                " TRUE, 'active', 'public_registration', now(), "
+                " %s, %s, now()) "
+                "RETURNING user_id, login_id, display_name, role, "
+                "extract(epoch from created_at)::float8 AS created_at, "
+                "disabled, ai_config, ai_access, auth_version, "
+                "activation_state, activation_source, email, "
+                "email_normalized, "
+                "extract(epoch from email_verified_at)::float8 AS "
+                "email_verified_at",
+                (uid, login, email_norm,
+                 generate_password_hash(password), email_norm, email_norm))
+            row = dict(cur.fetchone())
+            cur.execute("RELEASE SAVEPOINT insert_public_try")
+            return row
+        except psycopg.errors.UniqueViolation as exc:
+            cur.execute("ROLLBACK TO SAVEPOINT insert_public_try")
+            name = getattr(getattr(exc, "diag", None),
+                           "constraint_name", "") or ""
+            text = str(exc)
+            if "users_email_identity_key" in name or \
+                    "users_email_identity_key" in text:
+                raise PublicRegistrationError("email_taken") from exc
+            if attempt == 1 and ("users_login_id_ci_key" in name
+                                 or "users_login_id_ci_key" in text
+                                 or "login_id" in text):
+                _log.warning(
+                    "public 建号 login_id 冲突（email=%s 掩码待审）：进待"
+                    "补绑，不合并账号", mask_login_id(email_norm))
+                continue
+            raise
+    raise PublicRegistrationError("bad_input")
+
+
+def complete_public_registration(token, password, *, research_opt_in=None,
+                                 research_version=None, research_sha256=None,
+                                 terms_version=None, terms_sha256=None):
+    """消费验证 token 并**原子创建** active 自助账号（§4.2 事务伪流程）。
+
+    单个 PostgreSQL 事务内（锁序：intent/token → 日桶 → provisioning 三段式
+    → 账号/唯一性检查与插入）：
+
+      1. 事务内重校验存储模式 == public（§4.4：public 关闭时新的最终建号
+         必须失败，code=registration_closed）；
+      2. ``SELECT job JOIN intent FOR UPDATE``（token_hash 匹配）——未知/
+         无 intent → invalid_or_expired；
+      3. **completion 幂等**：intent 已完成 → 直接返回成功 + 登录地址
+         （无身份字段、无重复扣数/通知/副作用；§4.2/§4.3）；
+      4. 状态/过期校验（queued/sent/uncertain 可消费；failed/superseded/
+         consumed/过期 → invalid_or_expired）；
+      5. 协议校验（§3.3.4）：当前 published 必选文稿与 intent 不一致（实质
+         变化）→ 最终提交必须携带对当前版本的明确接受（terms_version/
+         terms_sha256 参数），否则 terms_required；可选研究选择默认沿用
+         intent，调用方显式提供 research_opt_in 时以最终提交为准（§3.3.3
+         允许修改可选项）；opt-in True 且研究文稿已实质变化时同理要求
+         research_version/research_sha256 重新确认；
+      6. 同邮箱 pending/active 身份冲突 → email_taken（检查先于消费，
+         token 保留；绝不自动合并身份）；
+      7. 日桶：Asia/Shanghai 日**在锁内选定一次**（防跨零点两次求值撕
+         裂）→ INSERT ON CONFLICT DO NOTHING → UPDATE ... WHERE
+         successful_count < 5 RETURNING；未命中 → ROLLBACK，
+         registration_daily_limit（token 未消耗、账号未建、名额不泄）；
+      8. provisioning 三段式（与建号/兑换/激活/cutover 互斥串行）；
+      9. 建 active 用户 + 同事务建一次性总额度（**现有默认策略**
+         ai_spend_total_defaults；缺行 → total_default_missing 明确失败整
+         体回滚，不为自由注册创造无限 AI 权限）；
+      10. 必选协议凭据（user_agreement_acceptances，source='register'）；
+      11. 研究 consent：True → granted/epoch=1 + 不可变历史；False →
+          declined/epoch=1 + 历史（false 有效；授权只从账号成功注册时生效）；
+      12. CAS 消费 token → intent 完成（completed_user_id/completed_at）→
+          INSERT completion（user_id/registration_request_id 双 UNIQUE）→
+          INSERT 加密 registration_created 通知 job
+          （business_key='registration_created:<completion_id>' 唯一——任
+          务只创建一次，投递状态由 worker 状态机区分）；
+      13. 审计 registration.public_created（email 只存掩码；detail **不
+          含**研究选择——与通知邮件同口径，避免区别对待）。
+
+    通知收件人缺失（REGISTRATION_ADMIN_EMAIL 未配置，部署损坏）→
+    admin_email_unconfigured，整体回滚（宁可注册失败，不出现「账号建了但
+    无通知凭据」）。
+    """
+    import registration_mail_worker as mail_worker
+    tok = (token or "").strip()
+    if not tok:
+        raise PublicRegistrationError("invalid_or_expired")
+    if not isinstance(password, str) or not password.strip() \
+            or len(password) < MIN_PASSWORD_LENGTH \
+            or len(password) > MAX_PASSWORD_LENGTH:
+        raise PublicRegistrationError("bad_input")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                # 1) 事务内模式校验（§4.2「validate current mode」）
+                if _stored_registration_mode_tx(cur) != MODE_PUBLIC:
+                    raise PublicRegistrationError("registration_closed")
+                # 2) 锁 intent/token（FOR UPDATE；并发完成同一 token 只一个
+                #    进入后续段，其余在锁后看到 completed 走幂等重放）
+                cur.execute(
+                    "SELECT j.job_id, j.email_normalized, j.status, "
+                    "j.consumed_at, "
+                    "extract(epoch from j.expires_at)::float8 AS expires_at, "
+                    "i.intent_id, i.registration_request_id, "
+                    "i.terms_version, i.terms_sha256, i.research_opt_in, "
+                    "i.research_version, i.research_sha256, i.form_locale, "
+                    "i.completed_at "
+                    "FROM registration_mail_jobs j "
+                    "JOIN registration_intents i "
+                    "  ON i.mail_job_id = j.job_id "
+                    "WHERE j.token_hash=%s AND j.purpose=%s FOR UPDATE",
+                    (verify_token_hash(tok), MAIL_PURPOSE_EMAIL_VERIFY))
+                row = cur.fetchone()
+                if row is None:
+                    raise PublicRegistrationError("invalid_or_expired")
+                # 3) completion 幂等重放（§4.2：只回成功 + 登录地址）
+                if row["completed_at"] is not None:
+                    return {"ok": True, "next": "/login?registered=1",
+                            "replayed": True}
+                # 4) 状态/过期
+                if row["consumed_at"] is not None \
+                        or row["status"] not in ("queued", "sent",
+                                                 "uncertain"):
+                    raise PublicRegistrationError("invalid_or_expired")
+                if row["expires_at"] is not None \
+                        and row["expires_at"] <= time.time():
+                    raise PublicRegistrationError("invalid_or_expired")
+                email_norm = normalize_email(row["email_normalized"])
+                locale = row["form_locale"] or "zh-CN"
+                # 5) 协议校验（§3.3.4：实质变化需重新明确接受，不用「继续
+                #    访问视为同意」）
+                terms_doc = _current_published_tx(
+                    cur, PUBLIC_TERMS_DOCUMENT_TYPE, locale)
+                if terms_doc is None:
+                    raise PublicRegistrationError("document_not_published")
+                if terms_doc["version"] != row["terms_version"] \
+                        or terms_doc["content_sha256"] != row["terms_sha256"]:
+                    if (terms_version or "") != terms_doc["version"] \
+                            or (terms_sha256 or "").strip().lower() != \
+                            terms_doc["content_sha256"]:
+                        raise PublicRegistrationError("terms_required")
+                final_research = bool(row["research_opt_in"]) \
+                    if research_opt_in is None else bool(research_opt_in)
+                research_doc = None
+                if final_research:
+                    research_doc = _current_published_tx(
+                        cur, PUBLIC_RESEARCH_DOCUMENT_TYPE, locale)
+                    if research_doc is None:
+                        raise PublicRegistrationError(
+                            "document_not_published")
+                    if research_doc["version"] != (row["research_version"]
+                                                   or "") \
+                            or research_doc["content_sha256"] != \
+                            (row["research_sha256"] or ""):
+                        if (research_version or "") != \
+                                research_doc["version"] \
+                                or (research_sha256 or "").strip().lower() \
+                                != research_doc["content_sha256"]:
+                            raise PublicRegistrationError(
+                                "research_document_required")
+                # 6) 邮箱身份冲突（检查先于消费；不自动合并身份）
+                cur.execute(
+                    "SELECT 1 FROM users WHERE lower(email_normalized)=%s "
+                    "AND activation_state IN ('pending_activation','active') "
+                    "LIMIT 1", (email_norm,))
+                if cur.fetchone() is not None:
+                    raise PublicRegistrationError("email_taken")
+                # 7) 日桶（锁内选定一次；跨零点一致性=成功占用名额时的北京
+                #    时间日期，事务占位后跨零点提交仍归该桶）
+                cur.execute(
+                    "SELECT (clock_timestamp() AT TIME ZONE %s)::date AS d",
+                    (PUBLIC_QUOTA_TZ,))
+                quota_day = cur.fetchone()["d"]
+                cur.execute(
+                    "INSERT INTO public_registration_days "
+                    "(day, successful_count) VALUES (%s, 0) "
+                    "ON CONFLICT (day) DO NOTHING", (quota_day,))
+                cur.execute(
+                    "UPDATE public_registration_days "
+                    "SET successful_count = successful_count + 1 "
+                    "WHERE day=%s AND successful_count < %s "
+                    "RETURNING successful_count",
+                    (quota_day, PUBLIC_DAILY_LIMIT))
+                bucket = cur.fetchone()
+                if bucket is None:
+                    raise PublicRegistrationError("registration_daily_limit")
+                day_count = int(bucket["successful_count"])
+                # 8) provisioning 三段式（与 redeem/activate/cutover 互斥）
+                if spend_store.is_dispatch_maintenance_tx(cur):
+                    raise spend_store.ProvisioningMaintenanceError(
+                        "系统维护中（cutover），暂停注册；请稍后重试")
+                spend_store.acquire_user_provisioning_lock_tx(cur)
+                if spend_store.is_dispatch_maintenance_tx(cur):
+                    raise spend_store.ProvisioningMaintenanceError(
+                        "系统维护中（cutover），暂停注册；请稍后重试")
+                # 9) 建号 + 初始额度（现有默认策略；缺默认明确失败回滚）
+                user = _insert_public_user_tx(cur, email_norm, password)
+                limit, _src, dver = spend_store._resolve_total_default_tx(
+                    cur, datetime.now(timezone.utc))
+                if limit is None:
+                    raise PublicRegistrationError("total_default_missing")
+                spend_store.create_user_total_allowance_tx(
+                    cur, user["user_id"], limit,
+                    source="public_registration", default_version=dver,
+                    updated_by="public:" + row["registration_request_id"])
+                # 10) 必选协议凭据
+                cur.execute(
+                    "INSERT INTO user_agreement_acceptances "
+                    "(user_id, document_type, version, content_sha256, "
+                    " source, locale) "
+                    "VALUES (%s,%s,%s,%s,'register',%s)",
+                    (user["user_id"], PUBLIC_TERMS_DOCUMENT_TYPE,
+                     terms_doc["version"], terms_doc["content_sha256"],
+                     locale))
+                # 11) 研究 consent（false 有效；授权自账号成功注册时生效）
+                if final_research:
+                    consent_state = "granted"
+                    consent_version = research_doc["version"]
+                    consent_sha = research_doc["content_sha256"]
+                    cur.execute(
+                        "INSERT INTO user_research_consents "
+                        "(user_id, state, scope_version, document_version, "
+                        " document_sha256, epoch, granted_at, updated_at) "
+                        "VALUES (%s,'granted',%s,%s,%s,1,now(),now())",
+                        (user["user_id"], consent_version, consent_version,
+                         consent_sha))
+                else:
+                    consent_state = "declined"
+                    consent_version = row["research_version"]
+                    consent_sha = row["research_sha256"]
+                    cur.execute(
+                        "INSERT INTO user_research_consents "
+                        "(user_id, state, scope_version, document_version, "
+                        " document_sha256, epoch, updated_at) "
+                        "VALUES (%s,'declined',%s,%s,%s,1,now())",
+                        (user["user_id"], consent_version, consent_version,
+                         consent_sha))
+                cur.execute(
+                    "INSERT INTO user_research_consent_history "
+                    "(user_id, from_state, to_state, epoch, actor_user_id, "
+                    " document_version, document_sha256, idempotency_key) "
+                    "VALUES (%s,NULL,%s,1,%s,%s,%s,%s)",
+                    (user["user_id"], consent_state, user["user_id"],
+                     consent_version, consent_sha,
+                     "public-register:" + row["registration_request_id"]))
+                # 12) 消费 token（CAS）→ intent 完成 → completion → 通知 job
+                cur.execute(
+                    "UPDATE registration_mail_jobs SET status='consumed', "
+                    "consumed_at=now() WHERE job_id=%s AND "
+                    "consumed_at IS NULL", (row["job_id"],))
+                if (cur.rowcount or 0) != 1:
+                    raise PublicRegistrationError("invalid_or_expired")
+                cur.execute(
+                    "UPDATE registration_intents SET completed_user_id=%s, "
+                    "completed_at=now() WHERE intent_id=%s",
+                    (user["user_id"], row["intent_id"]))
+                completion_id = "prc_" + secrets.token_urlsafe(12)
+                cur.execute(
+                    "INSERT INTO public_registration_completions "
+                    "(completion_id, user_id, registration_request_id, day, "
+                    " channel) VALUES (%s,%s,%s,%s,%s)",
+                    (completion_id, user["user_id"],
+                     row["registration_request_id"], quota_day,
+                     PUBLIC_COMPLETION_CHANNEL))
+                admin = registration_admin_email()
+                if not admin:
+                    raise PublicRegistrationError("admin_email_unconfigured")
+                nsubject, nbody = mail_worker.build_registration_created_body(
+                    user_id=user["user_id"], email=email_norm,
+                    source="public_registration", day=str(quota_day),
+                    successful_count=day_count,
+                    daily_limit=PUBLIC_DAILY_LIMIT,
+                    base_url=mail_worker.public_base_url())
+                npayload = mail_worker.encrypt_payload(
+                    {"subject": nsubject, "body": nbody,
+                     "purpose": MAIL_PURPOSE_REGISTRATION_CREATED,
+                     "email": admin})
+                cur.execute(
+                    "INSERT INTO registration_mail_jobs "
+                    "(job_id, purpose, email_normalized, token_hash, "
+                    " payload_enc, status, expires_at, business_key) "
+                    "VALUES (%s,%s,%s,%s,%s,'queued', "
+                    " now() + interval '7 days', %s)",
+                    ("rmj_" + secrets.token_urlsafe(12),
+                     MAIL_PURPOSE_REGISTRATION_CREATED, admin,
+                     verify_token_hash(secrets.token_urlsafe(32)), npayload,
+                     "registration_created:" + completion_id))
+                # 13) 审计（email 掩码；不含研究选择/密码/token/IP）
+                _insert_audit(
+                    cur, "registration.public_created", user["user_id"],
+                    "user", user["user_id"],
+                    {"email_masked": mask_login_id(email_norm),
+                     "day": str(quota_day),
+                     "successful_count": day_count,
+                     "completion_id": completion_id})
+        return {"ok": True, "next": "/login?registered=1",
+                "replayed": False, "user": user, "email": email_norm,
+                "day": str(quota_day), "successful_count": day_count,
+                "completion_id": completion_id,
+                "research_opt_in": final_research}
+    except psycopg.errors.UniqueViolation as exc:
+        # 检查与插入之间的并发窗口（users_email_identity_key 兜底）
+        name = getattr(getattr(exc, "diag", None), "constraint_name", "") or ""
+        if "users_email_identity_key" in name or \
+                "users_email_identity_key" in str(exc):
+            raise PublicRegistrationError("email_taken") from exc
+        raise PublicRegistrationError("invalid_or_expired") from exc
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 公共名额快照（§4.3：只是快照，不是名额保证）
+# --------------------------------------------------------------------------- #
+def public_quota_status() -> dict:
+    """当日名额快照 + 下次北京时间零点（Retry-After 同源）。
+
+    返回 ``{"day", "limit", "successful_count", "remaining", "resets_at",
+    "retry_after"}``（resets_at 为 epoch 秒；retry_after 为距下次零点的
+    秒数，满额 429 的 Retry-After 复用）。
+    """
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT (clock_timestamp() AT TIME ZONE %s)::date AS d, "
+                    "extract(epoch from ((date_trunc('day', clock_timestamp() "
+                    " AT TIME ZONE %s) + interval '1 day') "
+                    " AT TIME ZONE %s))::float8 AS resets_at",
+                    (PUBLIC_QUOTA_TZ, PUBLIC_QUOTA_TZ, PUBLIC_QUOTA_TZ))
+                row = cur.fetchone()
+                day = row["d"]
+                resets_at = float(row["resets_at"])
+                cur.execute(
+                    "SELECT successful_count FROM public_registration_days "
+                    "WHERE day=%s", (day,))
+                bucket = cur.fetchone()
+        count = int(bucket["successful_count"]) if bucket is not None else 0
+        return {"day": str(day), "limit": PUBLIC_DAILY_LIMIT,
+                "successful_count": count,
+                "remaining": max(0, PUBLIC_DAILY_LIMIT - count),
+                "resets_at": resets_at,
+                "retry_after": max(1, int(resets_at - time.time()))}
+    finally:
+        conn.close()
+
+
+def public_daily_limit_retry_after() -> int:
+    """满额 429 的 Retry-After 秒数（到下次北京时间零点；读取异常给 1 小时
+    保守值——响应头必须存在，不能因读库抖动 500）。"""
+    try:
+        return int(public_quota_status()["retry_after"])
+    except Exception:
+        return 3600

@@ -25,6 +25,8 @@ import shutil
 import sys
 import tempfile
 
+os.environ["PROVIDER_BALANCE_AUTO_CHECK_ENABLED"] = "0"
+
 # --------------------------------------------------------------------------- #
 # 1) openslide stub（幂等：真 openslide 存在则什么都不做）
 # --------------------------------------------------------------------------- #

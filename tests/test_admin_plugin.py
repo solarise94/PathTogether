@@ -954,7 +954,7 @@ def test_admin_manifest_plugin_version_bumped_with_hashes():
     # 表单整体退役，hashes/pin 同步
     # 2026-09-19 0.4.10（R4）：站点统计每日趋势改近 7 天倒序、来源榜
     # 爬虫开关退役（固定排除疑似爬虫），hashes/pin 同步
-    assert data["pluginVersion"] == "0.4.10"  # hashes/pin 同步
+    assert data["pluginVersion"] == "0.4.11"  # hashes/pin 同步
     assert "admin:settings:read" in data["adminPermissions"]
     assert "admin:settings:write" in data["adminPermissions"]
     assert "admin:slides:read" in data["adminPermissions"]

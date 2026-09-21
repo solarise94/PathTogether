@@ -136,8 +136,10 @@ ENFORCEMENT_MODE_AUDIT_ACTION = "spend.enforcement_mode_update"
 TOTAL_ALLOWANCE_AUDIT_ACTION = "spend.total_allowance_update"
 TOTAL_DEFAULT_AUDIT_ACTION = "spend.total_default_update"
 
-#: Batch B（§3.1）：注册 user 一次性总额度的建行来源词表（0029 CHECK 同款）
-TOTAL_ALLOWANCE_SOURCES = ("cutover", "invite", "admin_create")
+#: Batch B（§3.1）：注册 user 一次性总额度的建行来源词表（0029 CHECK 同款；
+#: 0061 扩 'public_registration'——P1 自助注册同事务初始额度）
+TOTAL_ALLOWANCE_SOURCES = ("cutover", "invite", "admin_create",
+                           "public_registration")
 
 #: 0022 写入的 cutover 标志键（对账器只接纳 occurred_at >= cutover 的用量）
 _PRICING_CUTOVER_KEY = billing_store.PRICING_V2_CUTOVER_SETTING_KEY

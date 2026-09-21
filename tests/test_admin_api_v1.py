@@ -1298,3 +1298,63 @@ def test_spend_windows_current_reports_policy_missing_per_subject():
     assert next(u for u in body["users"]
                 if u["subject_id"] == owner["user_id"])["policy_id"] == \
         "spp_owner"
+
+
+def test_balance_auto_check_success_is_shared_and_audited(monkeypatch):
+    _write_ai_config(monkeypatch)
+    fake = _fake_requests(monkeypatch)
+    fake.register_json("GET", "/user/balance", status=200, body=_BALANCE_OK)
+    assert app_mod._run_provider_balance_check_once() == "ok"
+    assert app_mod._run_provider_balance_check_once() == "retry_wait"
+    assert len(fake.calls) == 1
+    with app_mod.app.app_context():
+        payload = app_mod._admin_v1_provider_balance_payload()
+    assert payload["snapshot"]["total_balance_nano"] == "110000000000"
+    assert payload["auto_check"]["status"] == "ok"
+    assert "sk-official" not in json.dumps(payload)
+
+
+def test_balance_auto_check_failure_preserves_snapshot_and_backs_off(monkeypatch):
+    billing_store.insert_provider_balance_snapshot(
+        "deepseek", "CNY", 123, 0, 123, True,
+        datetime.now(timezone.utc) - timedelta(hours=2))
+    _write_ai_config(monkeypatch)
+    fake = _fake_requests(monkeypatch)
+    fake.register_json("GET", "/user/balance", status=401, body={"error": "invalid"})
+    assert app_mod._run_provider_balance_check_once() == "provider_rejected"
+    assert app_mod._run_provider_balance_check_once() == "retry_wait"
+    assert len(fake.calls) == 1
+    assert billing_store.latest_provider_balance_snapshot("deepseek")["total_balance_nano"] == 123
+
+
+def test_balance_auto_check_fresh_snapshot_skips_network(monkeypatch):
+    billing_store.insert_provider_balance_snapshot(
+        "deepseek", "CNY", 123, 0, 123, True, datetime.now(timezone.utc))
+    fake = _fake_requests(monkeypatch)
+    assert app_mod._run_provider_balance_check_once() == "fresh"
+    assert not fake.calls
+
+
+def test_balance_auto_check_honors_other_worker_lock(monkeypatch):
+    import pg_store
+    fake = _fake_requests(monkeypatch)
+    with pg_store.connect() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (724196021,))
+        assert app_mod._run_provider_balance_check_once() == "busy"
+    assert not fake.calls
+
+
+def test_balance_auto_check_exception_leaves_safe_category(monkeypatch):
+    """后台迭代抛异常（如 DB 瞬时不可用）：审计留安全错误类别（异常类型名，
+    不含消息文本），返回 check_exception，不冒称成功。"""
+    def _boom():
+        raise RuntimeError("simulated db outage with dsn-secret")
+    monkeypatch.setattr(app_mod, "_run_provider_balance_check_once", _boom)
+    assert app_mod._provider_balance_check_iteration() == "check_exception"
+    rows = [e for e in app_mod.share_store.list_audit(limit=20)
+            if e.get("action") == "billing.provider_balance_auto_check"]
+    assert rows, "异常路径必须留下审计记录"
+    detail = rows[0].get("detail") or {}
+    assert detail.get("status") == "check_exception"
+    assert detail.get("error_class") == "RuntimeError"
+    assert "dsn-secret" not in json.dumps(rows)

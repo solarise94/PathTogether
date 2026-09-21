@@ -124,9 +124,11 @@ def test_verify_email_js_intercepts_missing_direction_and_always_submits_fields(
     html = _verify_email_html()
     # 缺 research_direction 时前端先校验拦截
     assert 'input[name="research_direction"]:checked' in html
-    # JSON body 恒含两字段（checkbox 未勾时提交 false）
-    assert "research_direction: direction.value" in html
-    assert "share_research_data: form.share_research_data.checked" in html
+    # JSON body 恒含两字段（checkbox 未勾时提交 false；P1 起经 payload 变量
+    # 组装，旧流程字段在 legacy 分支赋值）
+    assert "payload.research_direction = direction.value" in html
+    assert "payload.share_research_data = form.share_research_data.checked" \
+        in html
     # 仍提交到 /api/registration/verify + CSRF 头
     assert 'fetch("/api/registration/verify"' in html
     assert '"X-CSRF-Token"' in html

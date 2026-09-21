@@ -31,7 +31,10 @@ P1-1/P1-2 语义（review）：
     退避重试）；请求发出后未收到远端最终响应=不确定（uncertain，绝不自动
     重发，防重复邮件/重复建号，留人工核对）；
   - 注册模式停机：排水前与 app 层共用 registration_store 的生效模式判定，
-    非 email_verify_invite_activation 时全部作业保留 queued 直接返回；
+    非开放注册形态（email_verify_invite_activation / public）时
+    purpose='email_verify' 作业保留 queued 暂停；purpose='registration_
+    created'（P1 §4.5 已成功注册的管理员通知）与账户服务邮件在任何模式
+    下照常排水；
   - 恢复开放后只发未过期作业（expires_at 已过期的保持 queued，验证端报
     expired）。
 """
@@ -189,6 +192,59 @@ def build_verify_email_body(email, token, base_url):
         "后即可使用；如果你已有邀请码，也可以凭邀请码直接激活。\n\n"
         "如果你没有请求过注册，请忽略本邮件。\n"
         % (str(email), link))
+    return subject, body
+
+
+def build_public_verify_email_body(email, token, base_url):
+    """public 自助注册的验证邮件冻结正文（P1，docs §3.3/§4.1）。返回
+    (subject, body)。
+
+    文案口径与协议文稿/注册弹窗一致：每日最多 5 个新自助账号、名额于北京
+    时间每日 00:00 更新、以完成注册时的剩余名额为准——**不承诺发送邮件
+    即已预留名额**；不提前收密码、不提前建可用账号（§3.3.1）。
+    """
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        raise MailSenderUnavailable("PUBLIC_BASE_URL 未配置，无法构造验证链接")
+    link = base + "/verify-email?token=" + str(token)
+    subject = "PathTogether 邮箱验证（30 分钟内有效）"
+    body = (
+        "你好，\n\n"
+        "有人（通常是你本人）刚用邮箱 %s 请求注册 PathTogether。\n"
+        "请在 30 分钟内打开下面的链接完成注册：\n\n"
+        "%s\n\n"
+        "该链接只能使用一次。验证后设置密码即可直接使用，无需管理员审批。\n"
+        "当前开放邮箱验证注册，每日最多 5 个新自助账号，名额于北京时间每日 "
+        "00:00 更新，以完成注册时的剩余名额为准；发送或收到本邮件不代表已"
+        "预留名额。若链接过期，请重新申请验证邮件。\n\n"
+        "如果你没有请求过注册，请忽略本邮件。\n"
+        % (str(email), link))
+    return subject, body
+
+
+def build_registration_created_body(*, user_id, email, source, day,
+                                    successful_count, daily_limit, base_url):
+    """自助注册成功的管理员通知正文（P1，docs §4.5）。返回 (subject, body)。
+
+    正文**仅**包含：注册时间、账号 ID/邮箱、来源模式、当天成功数、管理员
+    用户列表链接。**默认不含研究共享选择**（避免管理员以此区别对待用
+    户）；不含密码、验证链接、会话 cookie、对话、图像、行为轨迹或可直接
+    修改账号的令牌。
+    """
+    base = str(base_url or "").strip().rstrip("/")
+    admin_link = (base + "/admin/users") if base else "（PUBLIC_BASE_URL 未配置）"
+    subject = "PathTogether · 新自助注册（%s 当日第 %d/%d 个）" % (
+        str(day), int(successful_count), int(daily_limit))
+    body = (
+        "新自助注册账号\n\n"
+        "注册时间：%s（Asia/Shanghai 日桶）\n"
+        "账号 ID：%s\n"
+        "邮箱：%s\n"
+        "来源模式：%s\n"
+        "当天成功数：%d/%d\n"
+        "管理台用户列表：%s\n"
+        % (str(day), str(user_id), str(email), str(source),
+           int(successful_count), int(daily_limit), admin_link))
     return subject, body
 
 
@@ -515,13 +571,17 @@ def drain_once(limit=_DRAIN_BATCH, sender=None, environ=None) -> int:
     import registration_store
     mode, _failures = registration_store.resolve_effective_registration_mode(
         environ)
-    # 注册停只停注册类邮件（email_verify）；email_change 等账户服务邮件
-    # 照常领取。registration_open=True 时不过滤 purpose。
+    # 注册停只停注册类邮件（email_verify）；registration_created（已成功
+    # 注册的管理员通知，P1 §4.5：注册暂停后仍发送）与 email_change 等账户
+    # 服务邮件照常领取——「非旧模式就不发任何邮件」的判断被显式禁止。
+    # registration_open=True 时不过滤 purpose。
     registration_open = (
-        mode == registration_store.MODE_EMAIL_VERIFY_INVITE_ACTIVATION)
+        mode in (registration_store.MODE_EMAIL_VERIFY_INVITE_ACTIVATION,
+                 registration_store.MODE_PUBLIC))
     if not registration_open:
-        _log.info("生效注册模式为 %s（非 email_verify_invite_activation）："
-                  "email_verify 作业保留 queued 暂停；账户服务邮件照常", mode)
+        _log.info("生效注册模式为 %s（非开放注册形态）：email_verify 作业保"
+                  "留 queued 暂停；registration_created/账户服务邮件照常",
+                  mode)
     snd = sender if sender is not None else get_sender()
     if snd is None:
         _log.warning("邮件发送通道未配置（REGISTRATION_MAIL_SENDER），%d 条"

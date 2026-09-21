@@ -20,12 +20,19 @@ research.md §3.3/§3.4/§3.5/§6.1/§6.2/§6.3）。
   ``research_data_deletion_jobs`` 删除任务在**同一事务**内落库——不存在
   「已撤回但没有删除任务」的中间态；事务回滚则三者一起回滚。
 - ``create_deletion_job``：账户设置显式申请（reason=user_request）幂等创建
-  本人研究副本删除任务（每用户至多一条未终态任务，部分唯一索引兜底）；
-  该任务不删除业务切片或临床/科研工作记录（§3.5）。
+  本人研究副本删除任务（每用户至多一条**未了结**任务——completed 之外均
+  算未了结，含待人工处置的终态 failed；部分唯一索引兜底并发）；该任务
+  不删除业务切片或临床/科研工作记录（§3.5）。任务由
+  ``research_deletion_worker``（独立进程，0064 退避簿记）异步执行：
+  pending→running→completed/failed，失败有界重试、安全错误码；达上限的
+  终态 failed 停止自动重试但**不解除研究阻断**（待人工处置，见
+  :data:`UNRESOLVED_DELETION_JOBS_SQL`）；90 天到期清理同样在该
+  worker（§8）。
 - ``evaluate_research_access``（§6.1，P2）：研究采集/读取/导出的**统一权威
   判定**——当前真实用户本人、账号 active、非 owner 预览态、非 demo/公开
   分享访客、state=granted、文档版本有效、epoch 一致、数据在本次 grant 之后
-  产生、无未终态删除任务、研究功能开关开启。任何前端上报、后端轨迹复制、
+  产生、无未了结删除任务（completed 之外一律阻断——含待人工处置的终态
+  failed）、研究功能开关开启。任何前端上报、后端轨迹复制、
   研究浏览、导出与后续分析作业都必须调用本判定，不能只看某个 checkbox。
 - **旧 test_applications.share_research_data 只是历史证明**：兼容层
   ``legacy_test_application_signal`` 只读旧字段并打 historical_only 标记；
@@ -44,6 +51,7 @@ import psycopg
 
 import agreement_store
 import pg_store
+import share_store_pg
 import user_store
 
 #: 研究授权对应的协议文档类型
@@ -61,9 +69,27 @@ ACCEPTANCE_SOURCES = ("register", "account_reaccept")
 #: 研究副本删除任务原因词表（与 0062 迁移 CHECK 一致）
 DELETION_JOB_REASONS = ("withdrawal", "user_request")
 
-#: 删除任务状态词表（与 0062 迁移 CHECK 一致；pending/running = 未终态）
+#: 删除任务状态词表（与 0062/0064 迁移 CHECK 一致；pending/running = 未终态）
 DELETION_JOB_ACTIVE_STATUSES = ("pending", "running")
 DELETION_JOB_STATUSES = ("pending", "running", "completed", "failed")
+
+#: 删除任务执行尝试上限（0064；含首试）。达到上限后 failed 为**终态**，
+#: worker 不再自动重试（需人工介入；worker 与本模块共用同一常量）。
+#: 注意：终态 failed ≠ 解除研究阻断——删除义务要到 completed 才算了结
+#: （见 :data:`UNRESOLVED_DELETION_JOBS_SQL`，两者是分开的两件事）。
+MAX_DELETION_ATTEMPTS = 5
+
+#: 「未了结（删除义务未了结）」删除任务的 SQL 谓词（§6.1/§6.3-5：删除
+#: 义务未了结期间持续阻断研究采集/使用/再授权后的采集恢复）：
+#: - pending / running：任务在队列或执行中；
+#: - failed（无论退避重试中 attempts<上限，还是 attempts 达上限的终态）：
+#:   数据还没删成，删除义务未了结，研究侧持续阻断。终态 failed 只表示
+#:   worker 停止自动重试（research_deletion_worker 不再领取），**不**表示
+#:   阻断可以解除——需人工按 error_code 处置；等待人工期间不影响用户
+#:   正常读片/业务（阻断只作用于研究采集/读取/使用侧）；
+#: - completed：在线副本已删，删除义务了结，唯一解除阻断的终态（任务行
+#:   仍保留为备份恢复时的重放清单）。
+UNRESOLVED_DELETION_JOBS_SQL = "(status IN ('pending','running','failed'))"
 
 #: 研究采集功能开关 env（默认关闭；§1「研究采集独立开关默认关闭」）
 COLLECTION_SWITCH_ENV = "RESEARCH_COLLECTION_ENABLED"
@@ -91,6 +117,23 @@ class DocumentVersionRequiredError(ConsentError):
     """grant 缺少协议版本或内容摘要（grant 时版本必填，§3.5）。"""
 
     code = "document_version_required"
+
+
+class DeletionJobNotFoundError(ConsentError):
+    """管理员处置入口按 job_id 定位删除任务失败（路由映射 404）。"""
+
+    code = "deletion_job_not_found"
+
+
+class DeletionJobNotTerminalFailedError(ConsentError):
+    """任务不是「重试耗尽的终态 failed」，不能经管理员入口复活（409）。
+
+    pending/running 本就会被 worker 领取；退避重试中的 failed
+    （attempts < MAX_DELETION_ATTEMPTS）仍会自动重试；completed 是删除义务
+    已了结的唯一终态——这些状态一律不接受管理员「重新执行」。
+    """
+
+    code = "deletion_job_not_terminal"
 
 
 def _connect():
@@ -396,11 +439,13 @@ def list_history(user_id) -> list:
 
 
 # --------------------------------------------------------------------------- #
-# 研究副本删除任务（§3.5/§6.2/§6.3，P2）
+# 研究副本删除任务（§3.5/§6.2/§6.3，P2 落任务；P1 修复补执行器
+# research_deletion_worker——本节只保留任务生命周期与阻断权威）
 # --------------------------------------------------------------------------- #
 _JOB_COLUMNS = ("job_id, user_id, consent_epoch, reason, status, "
                 "online_cleared, exports_cleared, backups_pending, "
-                "error_code, created_at, updated_at, completed_at")
+                "error_code, attempts, next_retry_at, "
+                "created_at, updated_at, completed_at")
 
 
 def _job_view(row) -> dict | None:
@@ -410,44 +455,74 @@ def _job_view(row) -> dict | None:
 
 
 def _active_job_tx(cur, user_id) -> dict | None:
-    """在既有 cursor 上读当前未终态删除任务（供事务内路径复用连接）。"""
+    """在既有 cursor 上读当前**未了结**删除任务（供事务内路径复用连接）。
+
+    未了结 = pending/running/failed（含达上限、待人工处置的终态 failed；
+    删除义务未了结即阻断，见 :data:`UNRESOLVED_DELETION_JOBS_SQL`）。
+    """
     cur.execute(
         "SELECT %s FROM research_data_deletion_jobs "
-        "WHERE user_id=%%s AND status IN ('pending','running') "
-        "ORDER BY created_at DESC LIMIT 1" % _JOB_COLUMNS, (user_id,))
+        "WHERE user_id=%%s AND %s "
+        "ORDER BY created_at DESC LIMIT 1"
+        % (_JOB_COLUMNS, UNRESOLVED_DELETION_JOBS_SQL), (user_id,))
     return _job_view(cur.fetchone())
 
 
 def _upsert_deletion_job_tx(cur, user_id, consent_epoch, reason):
     """在**既有事务内**创建/推进研究副本删除任务（撤回原子链的一环）。
 
-    每用户至多一条未终态任务（0062 部分唯一索引）：已有未终态任务时把其
-    consent_epoch 推进到本次撤回的新 epoch（清理目标以最新撤回为准），
-    不重复建任务；无则插入 reason='withdrawal' 新任务。
+    每用户至多一条未了结任务（completed 之外，见
+    :data:`UNRESOLVED_DELETION_JOBS_SQL`；0062→0065 部分唯一索引把 failed
+    也纳入唯一约束，兜底并发）：已有未了结任务时把其 consent_epoch 推进到
+    本次撤回的新 epoch（清理目标以最新撤回为准），不重复建任务；处于
+    failed（退避重试中或达上限的终态）的任务同时被**复活**为 pending
+    立即可领取（新撤回 = 新删除义务，不该等旧退避时钟；终态 failed 复活后
+    attempts 仍为已达上限，worker 再失败一次即回终态——每次新撤回至多换一
+    轮尝试，不会无限循环）；无未了结任务则插入 reason='withdrawal' 新任务。
+
+    并发兜底：本函数的 SELECT 与 INSERT 之间存在竞态窗口——另一请求抢先
+    提交未了结任务（0065 起含 failed，例如对方任务在窗口内建成并执行失败
+    转 failed）。INSERT ... ON CONFLICT DO NOTHING 落空时**不得**返回 None
+    （撤回原子：已撤回必须带出删除任务视图），而是重查未了结任务并按上述
+    推进/复活语义收口到赢家任务（READ COMMITTED 下 no-op 返回时对方事务
+    必然已提交、对下一条语句可见）。
     """
-    cur.execute(
-        "SELECT %s FROM research_data_deletion_jobs "
-        "WHERE user_id=%%s AND status IN ('pending','running') "
-        "FOR UPDATE" % _JOB_COLUMNS, (user_id,))
-    row = cur.fetchone()
-    if row is not None:
+    for _round in range(2):
         cur.execute(
-            "UPDATE research_data_deletion_jobs "
-            "SET consent_epoch=%s, updated_at=now() WHERE job_id=%s",
-            (consent_epoch, row["job_id"]))
+            "SELECT %s FROM research_data_deletion_jobs "
+            "WHERE user_id=%%s AND %s "
+            "ORDER BY created_at DESC, job_id DESC "
+            "FOR UPDATE" % (_JOB_COLUMNS, UNRESOLVED_DELETION_JOBS_SQL),
+            (user_id,))
+        row = cur.fetchone()
+        if row is not None:
+            cur.execute(
+                "UPDATE research_data_deletion_jobs "
+                "SET consent_epoch=%s, "
+                "    status=CASE WHEN status='failed' THEN 'pending' "
+                "                ELSE status END, "
+                "    next_retry_at=CASE WHEN status='failed' THEN now() "
+                "                       ELSE next_retry_at END, "
+                "    updated_at=now() WHERE job_id=%s",
+                (consent_epoch, row["job_id"]))
+            cur.execute(
+                "SELECT %s FROM research_data_deletion_jobs WHERE job_id=%%s"
+                % _JOB_COLUMNS, (row["job_id"],))
+            return _job_view(cur.fetchone())
+        job_id = "rdj_" + secrets.token_urlsafe(16)
+        cur.execute(
+            "INSERT INTO research_data_deletion_jobs "
+            "(job_id, user_id, consent_epoch, reason) VALUES (%s,%s,%s,%s) "
+            "ON CONFLICT DO NOTHING", (job_id, user_id, consent_epoch, reason))
         cur.execute(
             "SELECT %s FROM research_data_deletion_jobs WHERE job_id=%%s"
-            % _JOB_COLUMNS, (row["job_id"],))
-        return _job_view(cur.fetchone())
-    job_id = "rdj_" + secrets.token_urlsafe(16)
-    cur.execute(
-        "INSERT INTO research_data_deletion_jobs "
-        "(job_id, user_id, consent_epoch, reason) VALUES (%s,%s,%s,%s) "
-        "ON CONFLICT DO NOTHING", (job_id, user_id, consent_epoch, reason))
-    cur.execute(
-        "SELECT %s FROM research_data_deletion_jobs WHERE job_id=%%s"
-        % _JOB_COLUMNS, (job_id,))
-    return _job_view(cur.fetchone())
+            % _JOB_COLUMNS, (job_id,))
+        row = cur.fetchone()
+        if row is not None:
+            return _job_view(row)
+        # 插入被唯一索引兜底 no-op（并发赢家已提交，含 failed）：回到循环
+        # 头重查未了结任务并按撤回语义推进（一轮重试足够）。
+    return _active_job_tx(cur, user_id)
 
 
 def create_deletion_job(user_id, reason="user_request", actor_user_id=None) -> dict:
@@ -455,11 +530,15 @@ def create_deletion_job(user_id, reason="user_request", actor_user_id=None) -> d
 
     - reason ∈ withdrawal/user_request（路由层只允许 user_request；
       withdrawal 由 ``withdraw`` 事务内自动创建，不在此重复入口）；
-    - 幂等：已有未终态（pending/running）任务 → 原样返回 ``created=False``；
+    - 幂等：已有未了结任务（含退避重试中与达上限、待人工处置的终态
+      failed）→ 原样返回 ``created=False``（终态 failed 不自动重试，
+      任务状态即「删除任务待人工处理」的真实展示；处置到 completed 前
+      研究侧持续阻断）；
     - 记录创建时的 consent epoch（无 consent 行 = 0：从未授权，无研究副本，
       任务仅作请求凭据）；备份恢复后按本清单执行，不让已撤回数据复活；
-    - **不删除业务切片、标注或临床/科研工作记录**（清理执行属后续阶段；
-      P2 只落任务与状态）。
+    - **不删除业务切片、标注或临床/科研工作记录**（只清理研究副本层；
+      执行由 ``research_deletion_worker`` 异步完成，任务状态可经
+      GET /api/account/research-data/deletion 查询）。
     """
     _check_actor(user_id, actor_user_id)
     if reason not in DELETION_JOB_REASONS:
@@ -470,8 +549,9 @@ def create_deletion_job(user_id, reason="user_request", actor_user_id=None) -> d
             with tx.cursor() as cur:
                 cur.execute(
                     "SELECT %s FROM research_data_deletion_jobs "
-                    "WHERE user_id=%%s AND status IN ('pending','running') "
-                    "FOR UPDATE" % _JOB_COLUMNS, (user_id,))
+                    "WHERE user_id=%%s AND %s "
+                    "FOR UPDATE" % (_JOB_COLUMNS, UNRESOLVED_DELETION_JOBS_SQL),
+                    (user_id,))
                 row = cur.fetchone()
                 if row is not None:
                     return {"job": _job_view(row), "created": False}
@@ -481,8 +561,10 @@ def create_deletion_job(user_id, reason="user_request", actor_user_id=None) -> d
                 crow = cur.fetchone()
                 epoch = crow["epoch"] if crow is not None else 0
                 job_id = "rdj_" + secrets.token_urlsafe(16)
-                # 并发竞争兜底：另一事务抢先建了 active 任务（部分唯一索引）
-                # → 本插入 no-op，返回对方任务（created=False，幂等语义）
+                # 并发竞争兜底：另一事务抢先提交了未了结任务（0065 部分唯一
+                # 索引把 failed 也算冲突——含本 SELECT 与 INSERT 窗口内建成
+                # 即执行失败转 failed 的任务）→ 本插入 no-op，返回对方任务
+                # （created=False，幂等语义）
                 cur.execute(
                     "INSERT INTO research_data_deletion_jobs "
                     "(job_id, user_id, consent_epoch, reason) "
@@ -501,7 +583,8 @@ def create_deletion_job(user_id, reason="user_request", actor_user_id=None) -> d
 
 
 def get_active_deletion_job(user_id) -> dict | None:
-    """当前未终态（pending/running）删除任务；无则 None。"""
+    """当前未了结删除任务（pending/running/failed——含待人工处置的终态
+    failed）；全部 completed（或无任务）时 None。"""
     conn = _connect()
     try:
         with conn.cursor() as cur:
@@ -520,6 +603,107 @@ def list_deletion_jobs(user_id) -> list:
                 "WHERE user_id=%%s ORDER BY created_at DESC, job_id DESC"
                 % _JOB_COLUMNS, (user_id,))
             return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 管理员最小处置入口（owner-only；终态 failed 的人工处置，§6.3-5）
+# --------------------------------------------------------------------------- #
+def list_deletion_jobs_admin(status=None, limit=200) -> list:
+    """管理员视图：**全部用户**的研究删除任务（owner admin API 只读出口）。
+
+    - status ∈ :data:`DELETION_JOB_STATUSES` 时按状态过滤（None = 全部）；
+      非法状态直接 ConsentError（路由映射 400）；
+    - 行含处置诊断字段（status/error_code/attempts/next_retry_at/
+      consent_epoch/创建与更新时间）；按 updated_at 新→旧（最近失败的排在
+      前面），上限 limit（1..500）；
+    - 本函数不脱敏 user_id——出线白名单与身份映射由路由层（admin v1）负责。
+    """
+    if status is not None and status not in DELETION_JOB_STATUSES:
+        raise ConsentError("未知删除任务状态：%r" % (status,))
+    cap = max(1, min(int(limit), 500))
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            if status is None:
+                cur.execute(
+                    "SELECT %s FROM research_data_deletion_jobs "
+                    "ORDER BY updated_at DESC, job_id DESC LIMIT %s"
+                    % (_JOB_COLUMNS, cap))
+                return [dict(r) for r in cur.fetchall()]
+            cur.execute(
+                "SELECT %s FROM research_data_deletion_jobs "
+                "WHERE status=%%s ORDER BY updated_at DESC, job_id DESC "
+                "LIMIT %d" % (_JOB_COLUMNS, cap), (status,))
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def admin_retry_deletion_job(job_id, actor_user_id=None, actor_role=None) -> dict:
+    """管理员处置：把**终态 failed**（重试耗尽）的删除任务复活为 pending。
+
+    语义（与路由层 /api/admin/v1/research-deletion-jobs/<job_id>/retry 同源）：
+
+    - 仅接受 ``status='failed'`` 且 ``attempts >= MAX_DELETION_ATTEMPTS`` 的
+      **终态** failed（worker 已停止自动重试、待人工按 error_code 处置）；
+      pending/running/退避重试中的 failed/completed 一律
+      :class:`DeletionJobNotTerminalFailedError`（路由映射 409）——
+      非 终态任务不需要也不应经人工复活（避免绕过退避节奏、避免碰已了结
+      义务）；
+    - 复活 = ``status='pending'``、``attempts`` 重置 0（给一轮全新的
+      MAX_DELETION_ATTEMPTS 尝试预算）、``next_retry_at=now()``（立即可
+      领取）；``consent_epoch`` **不动**（删除义务的覆盖范围不变，只是
+      重新执行）；``error_code`` 保留为上一轮最后错误（诊断线索；worker
+      成功时清空、再失败时覆盖）；
+    - **红线：本函数（以及任何管理入口）绝不提供把任务直接置 'completed'
+      的路径**——completed 只能由 ``research_deletion_worker`` 在实际清理
+      成功后落库（``_finalize_success``）。删除义务是否了结以真实清理为准，
+      不接受任何「跳过清理直接了结」的人工终态；复活后研究侧仍以
+      deletion_pending 阻断，直到 worker 真实清理完成；
+    - 审计：**同一事务**内写 audit_events（操作者/动作/任务 id/时间由审计
+      行自带；detail 记 previous_attempts / attempts_reset_to / error_code）——
+      审计写失败则复活一并回滚（处置必留痕）。
+
+    返回 ``{"job": <view>, "previous_attempts": int}``。
+    """
+    if not isinstance(job_id, str) or not job_id:
+        raise DeletionJobNotFoundError("删除任务不存在")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as tx:
+            with tx.cursor() as cur:
+                cur.execute(
+                    "SELECT %s FROM research_data_deletion_jobs "
+                    "WHERE job_id=%%s FOR UPDATE" % _JOB_COLUMNS, (job_id,))
+                row = cur.fetchone()
+                if row is None:
+                    raise DeletionJobNotFoundError("删除任务不存在")
+                previous_attempts = int(row["attempts"] or 0)
+                if row["status"] != "failed" or \
+                        previous_attempts < MAX_DELETION_ATTEMPTS:
+                    raise DeletionJobNotTerminalFailedError(
+                        "仅重试耗尽的终态 failed 任务可重新执行"
+                        "（当前 status=%s attempts=%d）"
+                        % (row["status"], previous_attempts))
+                cur.execute(
+                    "UPDATE research_data_deletion_jobs "
+                    "SET status='pending', attempts=0, next_retry_at=now(), "
+                    "    updated_at=now() WHERE job_id=%s", (job_id,))
+                share_store_pg.record_audit_tx(
+                    cur, "research.deletion_job.retry",
+                    actor_user_id=actor_user_id, actor_role=actor_role,
+                    target_type="research_deletion_job", target_id=job_id,
+                    detail={"previous_attempts": previous_attempts,
+                            "attempts_reset_to": 0,
+                            "error_code": row["error_code"],
+                            "consent_epoch": row["consent_epoch"]})
+                cur.execute(
+                    "SELECT %s FROM research_data_deletion_jobs "
+                    "WHERE job_id=%%s" % _JOB_COLUMNS, (job_id,))
+                return {"job": _job_view(cur.fetchone()),
+                        "previous_attempts": previous_attempts}
     finally:
         conn.close()
 
@@ -551,8 +735,10 @@ def evaluate_research_access(user_id, *, preview=False, demo_guest=False,
     6. 资源权利：携带 ``resource_owner_id`` 时必须等于本人（第一版只允许
        本人拥有且明确标记可用于本项研究的资源；「可查看他人切片」不足
        以授权研究）；
-    7. 无未终态（pending/running）研究副本删除任务（撤回/删除链未清完
-       不得继续研究使用）；
+    7. 无未了结研究副本删除任务（pending/running/failed——撤回/删除链未
+       清完不得继续研究使用；终态 failed 只表示 worker 停止自动重试，
+       处置到 completed 前持续阻断、等待人工按 error_code 处置，执行详见
+       ``research_deletion_worker``）；
     8. 研究采集/使用功能开关开启（P2 默认关闭——即使已 grant 也不允许）。
 
     返回 ``{"allowed": bool, "reasons": [机器码...], "consent": <view>|None}``；
@@ -634,8 +820,9 @@ def research_authorization_view(user_id, environ=None) -> dict:
 
     ``granted``/``ingest_allowed`` 只由新 consent 行与采集开关决定；
     旧 test_applications 字段单独标记「历史版本，未授权当前研究采集」。
-    P2 起附 ``active_deletion_job``（撤回/显式申请产生的未终态删除任务，
-    账户设置展示清理状态用）。
+    P2 起附 ``active_deletion_job``（撤回/显式申请产生的未了结删除任务，
+    账户设置/后台展示清理状态用——含待人工处置的终态 failed，向用户/管理
+    呈现「删除任务待人工处理」的真实状态）。
     """
     consent = get_consent(user_id)
     granted = bool(consent and consent["state"] == "granted")

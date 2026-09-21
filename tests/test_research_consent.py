@@ -55,6 +55,7 @@ from _pt_helpers import csrf_client, isolate_app  # noqa: E402
 
 PASSWORD = "longpassword123"
 MIGRATION_0062 = "0062_research_data_deletion_jobs.sql"
+MIGRATION_0065 = "0065_research_deletion_unique_unresolved.sql"
 
 
 def _pg():
@@ -658,6 +659,203 @@ def test_concurrent_deletion_requests_create_single_job():
     assert len({r["job"]["job_id"] for r in results}) == 1
     assert len(research_consent_store.list_deletion_jobs(
         user["user_id"])) == 1
+
+
+# --------------------------------------------------------------------------- #
+# 8b. P2 并发缺口回归（review 2026-09-21）：唯一索引覆盖 failed
+# --------------------------------------------------------------------------- #
+def test_migration_0065_unique_index_blocks_second_unresolved_job():
+    """0065 后：pending/running/failed 任一存在，同用户第二条未了结任务
+    在数据库层（唯一索引）与应用层（幂等返回）都被拒；completed 放行。"""
+    conn = _pg()
+    try:
+        user = _create_user("m65blk@x.com")
+        seq = 0
+        for status in ("pending", "running", "failed"):
+            seq += 1
+            job_id = "jm65_%s" % status
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO research_data_deletion_jobs "
+                    "(job_id, user_id, consent_epoch, reason, status) "
+                    "VALUES (%s,%s,1,'user_request',%s)",
+                    (job_id, user["user_id"], status))
+            conn.commit()
+            # 应用层：显式申请幂等返回既有任务，不建第二条
+            res = research_consent_store.create_deletion_job(
+                user["user_id"], reason="user_request")
+            assert res["created"] is False
+            assert res["job"]["job_id"] == job_id
+            # 数据库层：直接 INSERT 第二条被唯一索引拒绝（旧索引缺口：
+            # status='failed' 时旧谓词不含 failed、此处不会冲突）
+            blocked = False
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO research_data_deletion_jobs "
+                        "(job_id, user_id, consent_epoch, reason) "
+                        "VALUES (%s,%s,1,'user_request')",
+                        ("jm65_dup_%s" % status, user["user_id"]))
+                conn.commit()
+            except psycopg.errors.UniqueViolation:
+                blocked = True
+                conn.rollback()
+            assert blocked, "存在 %s 任务时第二条未了结任务应被拒绝" % status
+            # completed 是唯一解除约束的终态 → 可建下一条
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE research_data_deletion_jobs SET "
+                    "status='completed', completed_at=now() WHERE job_id=%s",
+                    (job_id,))
+            conn.commit()
+        # 三轮各一条（全部 completed 保留为重放清单），未产生第二条
+        jobs = research_consent_store.list_deletion_jobs(user["user_id"])
+        assert len(jobs) == 3
+        assert all(j["status"] == "completed" for j in jobs)
+    finally:
+        conn.close()
+
+
+def test_migration_0065_rerun_idempotent_and_conflicting_rows_abort():
+    """0065 重跑幂等（DROP IF EXISTS + CREATE IF NOT EXISTS）；存量同用户
+    多条未了结任务（缺口期脏数据）→ 校验 DO 块 RAISE 中止，不静默标完成。"""
+    sql = (pg_store.migrations_dir() / MIGRATION_0065).read_text(
+        encoding="utf-8")
+    conn = _pg()
+    try:
+        # 已应用状态重跑两遍 no-op；索引仍在且谓词含 failed
+        for _ in range(2):
+            with conn.cursor() as cur:
+                cur.execute(sql)
+            conn.commit()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT indexdef FROM pg_indexes WHERE indexname="
+                "'research_data_deletion_jobs_one_active'")
+            defn = cur.fetchone()["indexdef"]
+            assert "'pending'" in defn and "'running'" in defn \
+                and "'failed'" in defn, "谓词应含 failed：%s" % defn
+        # 缺口期脏数据模拟（事务内先摘掉索引再造两行未了结任务）：
+        # 迁移校验必须报错中止，不静默合并/标完成
+        user = _create_user("m65conf@x.com")
+        with conn.cursor() as cur:
+            cur.execute("DROP INDEX research_data_deletion_jobs_one_active")
+            cur.execute(
+                "INSERT INTO research_data_deletion_jobs "
+                "(job_id, user_id, consent_epoch, reason) VALUES "
+                "('jm65_c1',%s,1,'withdrawal'),"
+                "('jm65_c2',%s,1,'user_request')",
+                (user["user_id"], user["user_id"]))
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute(sql)
+        conn.rollback()
+        # 回滚（DDL 事务性）后：索引恢复、脏数据未落库
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM pg_indexes WHERE indexname="
+                "'research_data_deletion_jobs_one_active'")
+            assert cur.fetchone() is not None
+            cur.execute("SELECT count(*) FROM research_data_deletion_jobs "
+                        "WHERE user_id=%s", (user["user_id"],))
+            assert cur.fetchone()["count"] == 0
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _fail_job_directly(job_id):
+    """直接把任务落 failed（模拟执行器领取后执行失败）。"""
+    conn = _pg()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE research_data_deletion_jobs SET status='failed', "
+                "attempts=1, error_code='deletion_failed_RuntimeError' "
+                "WHERE job_id=%s", (job_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_race_second_request_after_failed_job_keeps_single_job(monkeypatch):
+    """P2 竞态回归：两个删除请求都查到无任务 → 第一个建成、执行失败转
+    failed → 第二个的 INSERT 必须被唯一索引（0065 覆盖 failed）兜底
+    no-op → 幂等返回原任务，不产生第二条未了结任务。
+
+    竞态窗口用 monkeypatch 在 create_deletion_job 的「SELECT 无任务」与
+    「INSERT」之间（secrets.token_urlsafe 恰在窗口内调用）注入确定性事件，
+    等价于真实时序：请求 B 先查无任务；请求 A 建成任务；worker 执行失败
+    转 failed（已提交）；请求 B 再插入。旧索引下该 INSERT 会成功（failed
+    不在谓词内）→ 两条未了结任务。
+    """
+    user = _create_user("racefail@x.com")
+    injected = {"done": False}
+    winner = {}
+    real_token = research_consent_store.secrets.token_urlsafe
+
+    def _racy_token(n):
+        if not injected["done"]:
+            injected["done"] = True
+            # 窗口内：请求 A 建成任务（独立连接独立事务）并执行失败转 failed
+            first = research_consent_store.create_deletion_job(
+                user["user_id"], reason="user_request")
+            assert first["created"] is True
+            _fail_job_directly(first["job"]["job_id"])
+            winner.update(first)
+        return real_token(n)
+
+    monkeypatch.setattr(research_consent_store.secrets, "token_urlsafe",
+                        _racy_token)
+    second = research_consent_store.create_deletion_job(
+        user["user_id"], reason="user_request")
+
+    assert second["created"] is False, "第二个请求不得建成第二条任务"
+    assert second["job"]["job_id"] == winner["job"]["job_id"], \
+        "应幂等返回竞态赢家（原任务）"
+    assert second["job"]["status"] == "failed", "原任务保持真实状态（待人工处置）"
+    jobs = research_consent_store.list_deletion_jobs(user["user_id"])
+    assert len(jobs) == 1, "不得产生第二条未了结任务"
+    active = research_consent_store.get_active_deletion_job(user["user_id"])
+    assert active is not None and active["job_id"] == winner["job"]["job_id"]
+
+
+def test_race_withdraw_after_failed_job_revives_single_job(monkeypatch):
+    """同款竞态走撤回路径：_upsert_deletion_job_tx 的 INSERT 被唯一索引
+    no-op 后不得返回 None——重查未了结任务并按撤回语义推进 epoch、复活
+    failed（撤回原子：已撤回必须带出删除任务视图，且只有一条）。"""
+    user = _create_user("racewd@x.com")
+    _register_and_publish("research_sharing")
+    _grant(user["user_id"])  # epoch 1
+    injected = {"done": False}
+    winner = {}
+    real_token = research_consent_store.secrets.token_urlsafe
+
+    def _racy_token(n):
+        if not injected["done"]:
+            injected["done"] = True
+            # 窗口内：显式申请建成任务（epoch=1）并执行失败转 failed
+            first = research_consent_store.create_deletion_job(
+                user["user_id"], reason="user_request")
+            _fail_job_directly(first["job"]["job_id"])
+            winner.update(first)
+        return real_token(n)
+
+    monkeypatch.setattr(research_consent_store.secrets, "token_urlsafe",
+                        _racy_token)
+    w = research_consent_store.withdraw(user["user_id"])  # epoch 1 → 2
+
+    assert w["changed"] is True
+    assert w["deletion_job"] is not None, \
+        "竞态下撤回原子仍必须带出删除任务（不得 None）"
+    assert w["deletion_job"]["job_id"] == winner["job"]["job_id"], \
+        "收口到竞态赢家（原任务），不新建第二条"
+    assert w["deletion_job"]["status"] == "pending", "失败任务被新撤回复活"
+    assert w["deletion_job"]["consent_epoch"] == 2, "清理目标推进到最新撤回 epoch"
+    jobs = research_consent_store.list_deletion_jobs(user["user_id"])
+    assert len(jobs) == 1
+    assert jobs[0]["reason"] == "user_request", "赢家任务的 reason 保留原值"
+    assert research_consent_store.get_consent(user["user_id"])[
+        "state"] == "withdrawn"
 
 
 # --------------------------------------------------------------------------- #

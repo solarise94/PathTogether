@@ -265,6 +265,26 @@ def test_schema_migrations_recorded(conn):
         # 保留，迁移 audit 固定 event_id）。
         "0058_demo_task_max_steps_100.sql",
         "0059_annotation_access_events.sql",
+        # P0 协议与迁移底座（agent-plan-20260921-registration-consent-
+        # research §3.4）：协议文档注册表 / 接受凭据 / 研究授权当前状态与
+        # 不可变历史。（基线遗留：0060-0063 此前未跟进本清单，随 0064 补登。）
+        "0060_agreement_consent_registry.sql",
+        # P1 公共注册（同文档 §4）：注册 intent / 名额桶 / 完成凭据。
+        "0061_public_registration.sql",
+        # P2 可撤回研究授权（同文档 §6.3）：research_data_deletion_jobs。
+        "0062_research_data_deletion_jobs.sql",
+        # P3 人工读片行为采集（同文档 §6.2/§7）：research_subjects /
+        # research_viewing_sessions / research_viewer_events /
+        # research_conversation_items。
+        "0063_research_viewer_telemetry.sql",
+        # P1 修复（同文档 §6.3/§8）：删除任务执行簿记（attempts /
+        # next_retry_at + 领取索引；执行器 research_deletion_worker）。
+        "0064_research_deletion_execution.sql",
+        # P2 并发缺口修复（review 2026-09-21）：0062 的「每用户至多一条
+        # 未了结任务」部分唯一索引谓词扩到 failed（0064 引入终态后未同步；
+        # 阻断语义 completed 之外一律唯一，与 UNRESOLVED_DELETION_JOBS_SQL
+        # 对齐）。
+        "0065_research_deletion_unique_unresolved.sql",
     ]
 
 

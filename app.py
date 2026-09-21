@@ -4396,9 +4396,12 @@ def _public_verify_page_context(intent):
     """public 验证页上下文：intent 选择 + 当前 published 文稿比对。
 
     - terms_changed / research_changed：当前 published 版本/hash 与 intent
-      不一致（实质变化或已下架）→ 最终页重新提供对应 checkbox；
-    - 研究可选项的勾选初值 = intent.research_opt_in（展示用户此前主动做
-      出的选择，允许修改；§3.3.3）。
+      不一致（实质变化、缺有效证明或已下架）→ 最终页重新提供对应
+      checkbox，不使用「继续访问视为同意」（§3.3.4）；
+    - 研究可选项的勾选初值 = intent.research_opt_in **且** research_changed
+      为假（展示用户此前主动做出的选择，允许修改；§3.3.3）；协议实质变化
+      时不预勾选，必须重新明确同意（模板按 research_changed 分支，最终
+      提交校验在 registration_store.complete_public_registration）。
     """
     terms_doc = research_doc = None
     try:
@@ -4971,6 +4974,8 @@ def api_account_agreements():
             "exports_cleared": r["exports_cleared"],
             "backups_pending": r["backups_pending"],
             "error_code": r["error_code"],
+            "attempts": r.get("attempts", 0),
+            "next_retry_at": _p2_rfc3339(r.get("next_retry_at")),
             "created_at": _p2_rfc3339(r["created_at"]),
             "updated_at": _p2_rfc3339(r["updated_at"]),
             "completed_at": _p2_rfc3339(r["completed_at"]),
@@ -4979,7 +4984,8 @@ def api_account_agreements():
         if research.get("active_deletion_job") is not None:
             research["active_deletion_job"] = dict(
                 research["active_deletion_job"])
-            for key in ("created_at", "updated_at", "completed_at"):
+            for key in ("created_at", "updated_at", "completed_at",
+                        "next_retry_at"):
                 research["active_deletion_job"][key] = _p2_rfc3339(
                     research["active_deletion_job"].get(key))
         for key in ("granted_at", "withdrawn_at"):
@@ -5140,7 +5146,8 @@ def api_account_research_consent():
     job = result.get("deletion_job")
     if job is not None:
         job = dict(job)
-        for key in ("created_at", "updated_at", "completed_at"):
+        for key in ("created_at", "updated_at", "completed_at",
+                    "next_retry_at"):
             job[key] = _p2_rfc3339(job.get(key))
     return jsonify(ok=True, consent=_wire(result.get("consent")),
                    changed=result.get("changed", False),
@@ -5152,12 +5159,17 @@ def api_account_research_consent():
 def api_account_research_data_deletion():
     """研究副本删除任务：POST 幂等创建，GET 查询状态（§3.5）。
 
-    - POST：为**本人**创建 reason=user_request 删除任务；已有未终态
-      （pending/running）任务时原样返回（created=false，幂等——网络重试
-      不重复建任务）。该任务只清理研究副本层（在线副本/导出/隔离备份），
-      **不删除业务切片、标注或临床/科研工作记录**；不需要撤回授权也可
-      申请（删除已采集研究副本与当前授权状态是两件事）。
-    - GET：返回当前未终态任务；没有则返回最近一条终态记录（都无则 null）。
+    - POST：为**本人**创建 reason=user_request 删除任务；已有未了结
+      （pending/running 或 failed——含达上限、待人工处置的终态 failed）
+      任务时原样返回（created=false，幂等——网络重试不重复建任务）。该
+      任务只清理研究副本层（在线副本/导出/隔离备份），**不删除业务切片、
+      标注或临床/科研工作记录**；不需要撤回授权也可申请（删除已采集研究
+      副本与当前授权状态是两件事）。任务由 research_deletion_worker 异步
+      执行（pending→running→completed/failed，失败有界退避重试；终态
+      failed 停止自动重试但研究侧持续阻断，待人工处置）。
+    - GET：返回当前未了结任务（含待人工处置的终态 failed——向用户/管理
+      呈现「删除任务待人工处理」的真实状态）；没有则返回最近一条终态
+      记录（都无则 null）。
     """
     user_id, err = _account_settings_actor()
     if err:
@@ -5177,7 +5189,8 @@ def api_account_research_data_deletion():
         created = {"created": False}
     if job is not None:
         job = dict(job)
-        for key in ("created_at", "updated_at", "completed_at"):
+        for key in ("created_at", "updated_at", "completed_at",
+                    "next_retry_at"):
             job[key] = _p2_rfc3339(job.get(key))
     resp = jsonify(ok=True, job=job, created=created.get("created", False))
     resp.headers["Cache-Control"] = "no-store"
@@ -10001,6 +10014,120 @@ def admin_v1_test_application_review(user_id):
     if not applied:
         return _admin_v1_error(409, "already_reviewed", "该申请已处理")
     return jsonify(ok=True, user_id=user_id, status=decision)
+
+
+# --------------------------------------------------------------------------- #
+# 研究删除任务：管理员最小处置入口（owner-only；终态 failed 的人工处置，
+# docs/agent-plan-20260921-registration-consent-research.md §6.3-5）
+#
+# 面向「重试耗尽（attempts >= research_consent_store.MAX_DELETION_ATTEMPTS）
+# 的终态 failed」研究副本删除任务：worker 停止自动重试后删除义务仍未了结
+# （UNRESOLVED_DELETION_JOBS_SQL 持续阻断研究采集/使用），owner 按 error_code
+# 排障后经此入口重新执行。
+#
+# 红线（与 research_consent_store.admin_retry_deletion_job 的红线注释同源）：
+#   - 本入口**只有**「重新执行删除」一个动作——复活为 pending、attempts
+#     重置 0，交 research_deletion_worker 重新领取并**真实清理**；
+#   - **绝不提供把任务直接置 completed 的路径**：completed 只能由 worker
+#     在实际清理成功后落库（research_deletion_worker._finalize_success）。
+#     任何「跳过清理直接了结」都会让研究副本仍在线而阻断被解除，违反删除
+#     义务语义——因此这里没有（也不允许有）complete/resolve 类端点；
+#   - 本入口只处置删除任务本身，不触碰研究数据/业务切片，也不解除任何
+#     阻断（复活后 deletion_pending 依旧，直到 worker 落 completed）。
+#
+# 门控与错误信封同 test-applications admin API：_require_owner_admin_v1
+# （owner-only、预览态一律 403）+ _admin_v1_error；审计在 store 单事务内
+# （操作者/动作/任务 id/时间 + previous_attempts/error_code detail）。
+# --------------------------------------------------------------------------- #
+@app.route("/api/admin/v1/research-deletion-jobs", methods=["GET"])
+def admin_v1_research_deletion_jobs():
+    """研究删除任务列表（owner-only）。?status=&limit=。
+
+    展示处置诊断字段：status / error_code / attempts / next_retry_at /
+    user_id（附 identity 邮箱主列映射）/ consent_epoch / 创建与更新时间；
+    ``terminal_failed`` = 重试耗尽的终态 failed（唯一可经
+    POST .../<job_id>/retry 重新执行的状态），其余状态仅供观察。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    status = (request.args.get("status") or "").strip() or None
+    if status is not None and \
+            status not in research_consent_store.DELETION_JOB_STATUSES:
+        return _admin_v1_error(400, "invalid_request", "状态无效")
+    try:
+        rows = research_consent_store.list_deletion_jobs_admin(
+            status=status, limit=_admin_v1_limit_arg())
+    except research_consent_store.ConsentError:
+        return _admin_v1_error(400, "invalid_request", "状态无效")
+    except Exception:
+        app.logger.exception("研究删除任务列表读取失败")
+        return _admin_v1_error(503, "storage_unavailable",
+                               "存储暂不可用，请稍后重试")
+    identity_map = _admin_v1_identity_map([r.get("user_id") for r in rows])
+    items = [{
+        "job_id": row.get("job_id"),
+        "user_id": row.get("user_id"),
+        "identity": identity_map.get(str(row.get("user_id") or "")) or None,
+        "reason": row.get("reason"),
+        "status": row.get("status"),
+        "terminal_failed": (
+            row.get("status") == "failed"
+            and int(row.get("attempts") or 0) >=
+            research_consent_store.MAX_DELETION_ATTEMPTS),
+        "error_code": row.get("error_code"),
+        "attempts": int(row.get("attempts") or 0),
+        "next_retry_at": _test_app_rfc3339(row.get("next_retry_at")),
+        "consent_epoch": row.get("consent_epoch"),
+        "created_at": _test_app_rfc3339(row.get("created_at")),
+        "updated_at": _test_app_rfc3339(row.get("updated_at")),
+        "completed_at": _test_app_rfc3339(row.get("completed_at")),
+    } for row in rows]
+    resp = jsonify(items=items, next_cursor=None)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/admin/v1/research-deletion-jobs/<job_id>/retry",
+           methods=["POST"])
+def admin_v1_research_deletion_job_retry(job_id):
+    """重新执行终态 failed 的研究删除任务（owner-only）。
+
+    复活为 pending、attempts 重置 0、next_retry_at=now()——由
+    research_deletion_worker 重新领取并真实清理；completed 仍只能由 worker
+    清理成功产生（本入口绝不直接置 completed）。审计随 store 单事务落库。
+    错误映射：404 deletion_job_not_found；409 deletion_job_not_terminal
+    （pending/running/退避中 failed/completed 均不可经此入口改动）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not job_id or len(job_id) > 128 or "/" in job_id:
+        return _admin_v1_error(400, "invalid_request", "任务 id 无效")
+    ident = actor_identity()
+    try:
+        result = research_consent_store.admin_retry_deletion_job(
+            job_id, actor_user_id=ident.get("user_id"),
+            actor_role=ident.get("role"))
+    except research_consent_store.DeletionJobNotFoundError:
+        return _admin_v1_error(404, "deletion_job_not_found",
+                               "删除任务不存在")
+    except research_consent_store.DeletionJobNotTerminalFailedError:
+        return _admin_v1_error(
+            409, "deletion_job_not_terminal",
+            "仅重试耗尽的终态 failed 任务可重新执行（completed 由清理成功"
+            "产生，不可人工置位）")
+    except research_consent_store.ConsentError:
+        return _admin_v1_error(400, "invalid_request", "请求无效")
+    except Exception:
+        app.logger.exception("研究删除任务重新执行失败")
+        return _admin_v1_error(503, "storage_unavailable",
+                               "存储暂不可用，请稍后重试")
+    job = dict(result["job"])
+    for key in ("created_at", "updated_at", "completed_at", "next_retry_at"):
+        job[key] = _test_app_rfc3339(job.get(key))
+    return jsonify(ok=True, job=job,
+                   previous_attempts=result["previous_attempts"])
 
 
 @app.route("/api/slides")

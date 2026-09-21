@@ -193,10 +193,20 @@
       {% if public_ctx.research_doc %}
       <div class="field">
         <label class="check-row" for="research_opt">
-          <input id="research_opt" type="checkbox" value="1"{% if public_ctx.research_opt_in %} checked{% endif %} />
+          <!-- §3.3.4：研究协议实质变化（research_changed）→ 不预勾选，必须
+               重新明确同意；仅当未变化且用户此前勾选时才保留 checked -->
+          <input id="research_opt" type="checkbox" value="1"{% if public_ctx.research_opt_in and not public_ctx.research_changed %} checked{% endif %} />
+          {% if public_ctx.research_changed %}
+          <span><a href="/legal/research-sharing" target="_blank" rel="noopener noreferrer">《数据共享与软件改进协议》</a>已更新，请重新确认是否同意（自愿，可随时撤回；不选不影响注册、登录、读片和 AI 额度）。</span>
+          {% else %}
           <span>我自愿同意<a href="/legal/research-sharing" target="_blank" rel="noopener noreferrer">《数据共享与软件改进协议》</a>（自愿，可随时撤回；不选不影响注册、登录、读片和 AI 额度）。</span>
+          {% endif %}
         </label>
+        {% if public_ctx.research_changed %}
+        <p class="hint">你在请求验证邮件时的选择是「{{ '同意' if public_ctx.research_opt_in else '不同意' }}」；该协议此后已发布新版本，需重新确认后才会按新版记录。</p>
+        {% else %}
         <p class="hint">你在请求验证邮件时的选择是「{{ '同意' if public_ctx.research_opt_in else '不同意' }}」，此处可在完成注册前修改。</p>
+        {% endif %}
       </div>
       {% endif %}
       <button class="btn primary" type="submit" id="verify-submit">完成注册</button>

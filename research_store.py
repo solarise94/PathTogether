@@ -487,9 +487,13 @@ def _assert_ingest_allowed(cur, user_id, environ=None):
         raise NotAuthorizedError("document_not_published")
     if consent["document_version"] != published["version"]:
         raise NotAuthorizedError("document_version_stale")
+    # 删除义务未了结（completed 之外：pending/running/failed，含达上限、
+    # 待人工处置的终态 failed）→ 阻断采集；只有 completed 解除（§6.3-5）
     cur.execute(
         "SELECT 1 FROM research_data_deletion_jobs "
-        "WHERE user_id=%s AND status IN ('pending','running')", (user_id,))
+        "WHERE user_id=%%s AND %s"
+        % research_consent_store.UNRESOLVED_DELETION_JOBS_SQL,
+        (user_id,))
     if cur.fetchone() is not None:
         raise NotAuthorizedError("deletion_pending")
     return consent

@@ -634,3 +634,293 @@ describe("缓冲上限（§7.3：观测事件可丢）", () => {
     expect(state.buffered).toBeGreaterThan(0);
   });
 });
+
+// ---------- 回归修复：串会话（Bug A）与拖动归并（Bug B） ----------
+
+interface SessionResp {
+  ok: boolean;
+  status: number;
+  json: () => Promise<unknown>;
+}
+
+/** 会话创建请求挂起、回包时机可控（复现快速切切片时 A 的回包晚到）。 */
+function deferSessionFetch(h: Harness) {
+  const deferreds: Array<(r: SessionResp) => void> = [];
+  h.setFetchResult((url) => {
+    if (url.includes("viewing-sessions")) {
+      return new Promise<SessionResp>((res) => { deferreds.push(res); }) as never;
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true, accepted: 1 }) };
+  });
+  return {
+    respond(i: number, r: SessionResp) { deferreds[i](r); },
+  };
+}
+
+/** 全部 fetch（建会话 + 事件上传）挂起、按调用序号回包（复现上传回包晚到、
+ *  在途期间追加事件等时序）。deferreds 序号与 h.fetchCalls 一一对应。 */
+function deferAllFetch(h: Harness) {
+  const deferreds: Array<(r: SessionResp) => void> = [];
+  h.setFetchResult(() => {
+    return new Promise<SessionResp>((res) => { deferreds.push(res); }) as never;
+  });
+  return {
+    respond(i: number, r: SessionResp) { deferreds[i](r); },
+  };
+}
+
+describe("回归修复：快速切切片串会话（Bug A）", () => {
+  it("A 建会话 pending 时切到 B：A 回包不建立/不绑定会话；B 的建会话（权限检查）不被跳过", async () => {
+    const h = bootModule();
+    const defer = deferSessionFetch(h);
+    h.rt.attach(h.fv.viewer);
+    h.rt.startSlide({ slide: "A.ndpi", width: DIMS.x, height: DIMS.y });
+    await settle();
+    // A 的建会话请求仍 pending 时切到 B：B 必须照常发起自己的建会话请求
+    //（研究采集权限检查在服务端建会话时完成，不能因 A pending 被跳过）
+    h.rt.startSlide({ slide: "B.ndpi", width: DIMS.x, height: DIMS.y });
+    await settle();
+    const sessionCalls = h.fetchCalls
+      .filter((c) => c.url.includes("viewing-sessions"));
+    expect(sessionCalls.length).toBe(2);
+    expect(JSON.parse(String(sessionCalls[1].init.body))).toEqual(
+      { slide: "B.ndpi" });
+    // A 的回包（200）到达：不得建立会话、不得把 A 的会话绑定到当前切片 B
+    defer.respond(0, { ok: true, status: 200, json: async () => ({
+      viewing_session_id: "rvs_session_A", consent_epoch: 1 }) });
+    await settle();
+    expect(h.rt.isCollecting()).toBe(false);
+    expect((h.rt._state() as { session: unknown }).session).toBeNull();
+    // B 的回包到达：会话绑定到 B 的会话 ID 与 B 的切片
+    defer.respond(1, { ok: true, status: 200, json: async () => ({
+      viewing_session_id: "rvs_session_B", consent_epoch: 2 }) });
+    await settle();
+    expect(h.rt.isCollecting()).toBe(true);
+    const st = h.rt._state() as { session: { id: string; slide: string } };
+    expect(st.session.id).toBe("rvs_session_B");
+    expect(st.session.slide).toBe("B.ndpi");
+    // B 上的事件只进 B 的会话；A 的会话 ID 从未出现在任何请求里
+    wheelZoom(h, 2);
+    h.rt.flush();
+    await settle();
+    const bodies = eventBodies(h);
+    expect(bodies.length).toBe(1);
+    expect((bodies[0] as { viewing_session_id: string }).viewing_session_id)
+      .toBe("rvs_session_B");
+    expect(JSON.stringify(h.fetchCalls)).not.toContain("rvs_session_A");
+  });
+
+  it("旧切片的 403 回包不作废当前切片（不误停采）", async () => {
+    const h = bootModule();
+    const defer = deferSessionFetch(h);
+    h.rt.attach(h.fv.viewer);
+    h.rt.startSlide({ slide: "A.ndpi", width: DIMS.x, height: DIMS.y });
+    h.rt.startSlide({ slide: "B.ndpi", width: DIMS.x, height: DIMS.y });
+    await settle();
+    // A 回包 403：A 已不是当前切片，不得据此置 enabled=false 停掉 B 的采集
+    defer.respond(0, { ok: false, status: 403, json: async () => ({}) });
+    await settle();
+    expect((h.rt._state() as { enabled: boolean }).enabled).toBe(true);
+    // B 回包 200：正常建会话采集
+    defer.respond(1, { ok: true, status: 200, json: async () => ({
+      viewing_session_id: "rvs_session_B", consent_epoch: 2 }) });
+    await settle();
+    expect(h.rt.isCollecting()).toBe(true);
+  });
+});
+
+describe("回归修复：切切片后在途上传回包影响新切片（Bug C）", () => {
+  it("A 上传在途时切到 B：A 成功回包到达→B 的 buffer 不被删，B 事件后续照常上传", async () => {
+    const h = bootModule();
+    const defer = deferAllFetch(h);
+    h.rt.attach(h.fv.viewer);
+    // fetch 序号：0=A 建会话，1=A 事件上传，2=B 建会话，3=B 事件上传
+    h.rt.startSlide({ slide: "A.ndpi", width: DIMS.x, height: DIMS.y });
+    await settle();
+    defer.respond(0, { ok: true, status: 200, json: async () => ({
+      viewing_session_id: "rvs_session_A", consent_epoch: 1 }) });
+    await settle();
+    wheelZoom(h, 2); // A 上攒 1 条事件
+    h.rt.flush();    // A 的上传在途（挂起）
+    await settle();
+    // A 上传仍 pending 时切到 B：清态 + B 建会话（先放行 B 的会话建立）
+    h.rt.startSlide({ slide: "B.ndpi", width: DIMS.x, height: DIMS.y });
+    await settle();
+    defer.respond(2, { ok: true, status: 200, json: async () => ({
+      viewing_session_id: "rvs_session_B", consent_epoch: 2 }) });
+    await settle();
+    h.fv.dispatch("open");
+    wheelZoom(h, 3); // B 上攒 1 条事件（ratio 2 → 3）
+    expect((h.rt._state() as { buffered: number }).buffered).toBe(1);
+    // A 的成功回包迟到：不得 splice 当前（B）的 buffer（旧代码会把 B 尚未
+    // 上传的事件删掉）
+    defer.respond(1, { ok: true, status: 200, json: async () => ({ ok: true }) });
+    await settle();
+    expect((h.rt._state() as { buffered: number }).buffered).toBe(1);
+    expect(h.rt.isCollecting()).toBe(true);
+    // B 的事件后续照常上传（绑定 B 的会话）
+    h.rt.flush();
+    await settle();
+    defer.respond(3, { ok: true, status: 200, json: async () => ({ ok: true }) });
+    await settle();
+    const bodies = eventBodies(h);
+    expect(bodies.length).toBe(2);
+    expect((bodies[0] as { viewing_session_id: string }).viewing_session_id)
+      .toBe("rvs_session_A");
+    const b1 = bodies[1] as { viewing_session_id: string; events: unknown[] };
+    expect(b1.viewing_session_id).toBe("rvs_session_B");
+    expect(b1.events.length).toBe(1);
+    expect((h.rt._state() as { buffered: number }).buffered).toBe(0);
+  });
+
+  it.each([403, 409, 404])("A 上传在途时切到 B：A 迟到 %s 不 hardStop B，采集继续", async (status) => {
+    const h = bootModule();
+    const defer = deferAllFetch(h);
+    h.rt.attach(h.fv.viewer);
+    h.rt.startSlide({ slide: "A.ndpi", width: DIMS.x, height: DIMS.y });
+    await settle();
+    defer.respond(0, { ok: true, status: 200, json: async () => ({
+      viewing_session_id: "rvs_session_A", consent_epoch: 1 }) });
+    await settle();
+    wheelZoom(h, 2);
+    h.rt.flush();
+    await settle();
+    h.rt.startSlide({ slide: "B.ndpi", width: DIMS.x, height: DIMS.y });
+    await settle();
+    defer.respond(2, { ok: true, status: 200, json: async () => ({
+      viewing_session_id: "rvs_session_B", consent_epoch: 2 }) });
+    await settle();
+    // A 的上传回包迟到且为未授权类：属于旧代次，不得据此停掉 B 的采集
+    defer.respond(1, { ok: false, status, json: async () => ({}) });
+    await settle();
+    expect((h.rt._state() as { enabled: boolean }).enabled).toBe(true);
+    expect(h.rt.isCollecting()).toBe(true);
+    // B 采集继续：新事件入队并照常上传
+    wheelZoom(h, 3);
+    h.rt.flush();
+    await settle();
+    defer.respond(3, { ok: true, status: 200, json: async () => ({ ok: true }) });
+    await settle();
+    const bodies = eventBodies(h);
+    expect(bodies.length).toBe(2);
+    const b1 = bodies[1] as { viewing_session_id: string; events: unknown[] };
+    expect(b1.viewing_session_id).toBe("rvs_session_B");
+    expect(b1.events.length).toBe(1);
+    expect((h.rt._state() as { buffered: number }).buffered).toBe(0);
+    expect(h.rt.isCollecting()).toBe(true);
+  });
+
+  it("同代次：上传在途期间追加新事件，成功回包只删除已发送那批，新事件保留待发", async () => {
+    const h = bootModule();
+    const defer = deferAllFetch(h);
+    h.rt.attach(h.fv.viewer);
+    h.rt.startSlide({ slide: SLIDE, width: DIMS.x, height: DIMS.y });
+    await settle();
+    defer.respond(0, { ok: true, status: 200, json: async () => ({
+      viewing_session_id: SESSION_ID, consent_epoch: SESSION_EPOCH }) });
+    await settle();
+    h.fv.dispatch("open");
+    // fetch 序号：0=建会话，1=首批 1 条（在途），2=追加的 2 条
+    wheelZoom(h, 2);
+    h.rt.flush();
+    await settle();
+    wheelZoom(h, 3);                 // 在途期间追加事件 2（同代次）
+    dragPan(h, { x: 0.3, y: 0.3 });  // 在途期间追加事件 3（同代次）
+    expect((h.rt._state() as { buffered: number }).buffered).toBe(3);
+    const firstBatch = JSON.parse(String(
+      h.fetchCalls.filter((c) => c.url.includes("viewer-events"))[0].init.body)
+    ) as { events: Array<{ event_id: string }> };
+    expect(firstBatch.events.length).toBe(1);
+    // 成功回包：只删除已发送那 1 条（按事件 ID），追加的 2 条保留待发
+    defer.respond(1, { ok: true, status: 200, json: async () => ({ ok: true }) });
+    await settle();
+    expect((h.rt._state() as { buffered: number }).buffered).toBe(2);
+    // 剩余事件自动续发：第二批恰为追加的 2 条，与首批 ID 互补（不重发不丢发）
+    defer.respond(2, { ok: true, status: 200, json: async () => ({ ok: true }) });
+    await settle();
+    expect((h.rt._state() as { buffered: number }).buffered).toBe(0);
+    const batches = eventBodies(h) as Array<{ events: Array<{ event_id: string }> }>;
+    expect(batches.length).toBe(2);
+    expect(batches[1].events.length).toBe(2);
+    const allIds = batches.flatMap((b) => b.events.map((e) => e.event_id));
+    expect(new Set(allIds).size).toBe(3);
+    expect(batches[1].events.map((e) => e.event_id))
+      .not.toContain(firstBatch.events[0].event_id);
+  });
+
+  it("同代次：在途期间 200 上限丢最旧移动队头，成功回包按已发送 ID 删除不误删", async () => {
+    const h = bootModule();
+    const defer = deferAllFetch(h);
+    h.rt.attach(h.fv.viewer);
+    h.rt.startSlide({ slide: SLIDE, width: DIMS.x, height: DIMS.y });
+    await settle();
+    defer.respond(0, { ok: true, status: 200, json: async () => ({
+      viewing_session_id: SESSION_ID, consent_epoch: SESSION_EPOCH }) });
+    await settle();
+    h.fv.dispatch("open");
+    // 50 条触发自动上传（fetch 序号 1，挂起）
+    for (let i = 0; i < 50; i++) wheelZoom(h, 1 + ((i % 3) + 1) * 0.1);
+    await settle();
+    expect(h.fetchCalls.filter((c) => c.url.includes("viewer-events")).length)
+      .toBe(1);
+    const sentIds = new Set((JSON.parse(String(
+      h.fetchCalls.filter((c) => c.url.includes("viewer-events"))[0].init.body)
+    ) as { events: Array<{ event_id: string }> }).events.map((e) => e.event_id));
+    expect(sentIds.size).toBe(50);
+    // 在途期间继续攒 160 条：缓冲 200 封顶，最旧的 10 条（属于已发送批次）
+    // 被挤出队头——盲目 splice(0,50) 会连未发送的事件一起删
+    for (let i = 0; i < 160; i++) wheelZoom(h, 1 + ((i % 3) + 1) * 0.1);
+    expect((h.rt._state() as { buffered: number }).buffered).toBe(200);
+    defer.respond(1, { ok: true, status: 200, json: async () => ({ ok: true }) });
+    await settle();
+    // 只删除仍在缓冲中的 40 条已发送事件；160 条未发送事件保留待发
+    expect((h.rt._state() as { buffered: number }).buffered).toBe(160);
+    // 放行剩余 4 个批次（50+50+50+10）：210 条全部恰好上传一次（不丢不重）
+    for (let r = 2; r <= 5; r++) {
+      defer.respond(r, { ok: true, status: 200, json: async () => ({ ok: true }) });
+      await settle();
+    }
+    const batches = eventBodies(h) as Array<{ events: Array<{ event_id: string }> }>;
+    expect(batches.length).toBe(5);
+    const allIds = batches.flatMap((b) => b.events.map((e) => e.event_id));
+    expect(allIds.length).toBe(210);
+    expect(new Set(allIds).size).toBe(210);
+    expect((h.rt._state() as { buffered: number }).buffered).toBe(0);
+  });
+});
+
+describe("回归修复：拖动动画先结束再松手漏记（Bug B）", () => {
+  it("拖-停-松手：松开时归并产出一条 pan，随后 observe_pause 正常启动，且不重复产出", async () => {
+    const h = bootModule();
+    await openSlide(h);
+    h.fv.dispatch("canvas-press");
+    h.fv.dispatch("canvas-drag");
+    h.fv.state.center = { x: 0.3, y: 0.2 };
+    // 拖动稍停：动画先于松手结束——手势保持挂起，不在此归并
+    h.fv.dispatch("animation-start");
+    h.fv.dispatch("animation-finish");
+    expect((h.rt._state() as { gesture: unknown }).gesture).toBeTruthy();
+    // 松开：此刻完成归并（此前该手势会永远挂起，漏记 pan 与后续停留观察）
+    h.fv.dispatch("canvas-release");
+    h.rt.flush();
+    await settle();
+    const evs = allEvents(h) as Array<{
+      action: string; payload: Record<string, unknown> }>;
+    expect(evs.filter((e) => e.action === "pan").length).toBe(1);
+    expect(evs[0].payload.input_kind).toBe("drag");
+    // 手势已清空并重新启动稳定观察检测
+    expect((h.rt._state() as { gesture: unknown }).gesture).toBeNull();
+    expect((h.rt._state() as { observeArmed: boolean }).observeArmed).toBe(true);
+    // 松手后迟到的 animation-finish 不再重复产出
+    h.fv.dispatch("animation-finish");
+    h.rt.flush();
+    await settle();
+    expect((allEvents(h) as Array<{ action: string }>)
+      .filter((e) => e.action === "pan").length).toBe(1);
+    vi.advanceTimersByTime(2000);
+    h.rt.flush();
+    await settle();
+    expect((allEvents(h) as Array<{ action: string }>)
+      .filter((e) => e.action === "observe_pause").length).toBe(1);
+  });
+});

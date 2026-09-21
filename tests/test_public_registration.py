@@ -25,10 +25,15 @@
     token 未消耗；public 关闭后 notification 继续排水、email_verify 暂停；
   - 无初始额度配置 → 明确失败整体回滚（不建号、不扣名额、不消费 token）；
   - 页面：GET /register 双 checkbox 不预勾选；GET /verify-email 展示 intent
-    选择；/login?registered=1 提示；/api/registration/public-status 快照。
+    选择；/login?registered=1 提示；/api/registration/public-status 快照；
+  - 研究协议更新后的重新确认（§3.3.4，2026-09-21 review P1 修复）：协议未
+    变保留原勾选；协议更新后验证页 research_opt 不预勾选 + 重新确认文案；
+    最终提交未勾选/缺省 → 记为不同意（不报错）；明确勾选 + 当前版本证明 →
+    记为接受新版；旧 version/hash 提交拒绝且 token 不消耗。
 
 运行：cd 项目根 && .venv/bin/python -m pytest tests/test_public_registration.py -q
 """
+import hashlib
 import os
 import re
 import sys
@@ -858,3 +863,171 @@ def test_http_register_post_uniform_copy_for_known_email(monkeypatch):
     assert r1.status_code == r2.status_code == 200
     assert "验证邮件已发送" in r1.get_data(as_text=True)
     assert "验证邮件已发送" in r2.get_data(as_text=True)
+
+
+# =========================================================================== #
+# 8. 研究协议更新后的重新确认（§3.3.4；2026-09-21 review P1 修复）
+# =========================================================================== #
+def _publish_new_research_version(version="2099-12-31-vnext"):
+    """模拟《数据共享与软件改进协议》发布新版本：向注册表登记新文稿行并
+    publish（publish_document 同事务 retire 旧 published 行）。
+
+    测试版本不在内置清单（legal_docs/）内，先 INSERT draft 行——/legal 页
+    面按内置文件渲染不读这行，注册表只关心 version/hash 不可变语义。
+    """
+    content = "research-sharing test document %s" % version
+    sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    conn = _pg()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO agreement_documents "
+                "(document_type, version, locale, title, content_sha256, "
+                " content_path, status) "
+                "VALUES ('research_sharing', %s, 'zh-CN', "
+                "        '数据共享与软件改进协议（测试新版）', %s, %s, 'draft') "
+                "ON CONFLICT (document_type, version, locale) DO NOTHING",
+                (version, sha,
+                 "legal_docs/research-sharing_%s.md" % version))
+        conn.commit()
+    finally:
+        conn.close()
+    return agreement_store.publish_document("research_sharing", version)
+
+
+def test_verify_page_research_unchanged_keeps_prior_choice(monkeypatch):
+    """协议未变：此前勾选 → research_opt 保留 checked；此前未勾选 → 不
+    预勾选；提示语为「可修改」（不出现已更新/重新确认文案）。"""
+    _open_public_mode(monkeypatch)
+    client = _client()
+    out_y = _enqueue("rc_same_yes@x.com", research_opt_in=True)
+    out_n = _enqueue("rc_same_no@x.com", research_opt_in=False)
+    for out, checked in ((out_y, True), (out_n, False)):
+        r = client.get("/verify-email?token=" + out["token"])
+        assert r.status_code == 200
+        body = r.get_data(as_text=True)
+        m = re.search(r'<input id="research_opt"[^>]*>', body)
+        assert m, "research_opt 输入应存在"
+        assert ("checked" in m.group(0)) is checked
+        assert "已更新" not in body       # 未变化：无重新确认文案
+        assert "此处可在完成注册前修改" in body
+
+
+def test_verify_page_research_changed_not_prechecked(monkeypatch):
+    """协议更新后：research_opt 不预勾选（即使 intent 里 research_opt_in
+    为 true），文案切换为「已更新，请重新确认」，仍展示此前选择（§3.3.4：
+    展示不是替未操作用户预勾选，也不用「继续访问视为同意」）。"""
+    _open_public_mode(monkeypatch)
+    out = _enqueue("rc_chg@x.com", research_opt_in=True)  # 勾选旧版
+    _publish_new_research_version()
+    client = _client()
+    r = client.get("/verify-email?token=" + out["token"])
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    m = re.search(r'<input id="research_opt"[^>]*>', body)
+    assert m, "research_opt 输入应存在"
+    assert "checked" not in m.group(0)    # 不预勾选新版
+    assert "已更新" in body and "重新确认" in body
+    assert "「同意」" in body              # 仍展示此前主动做出的选择
+    # GET 不消费 token（重新确认发生在最终 POST）
+    job = _one("SELECT * FROM registration_mail_jobs WHERE job_id=%s",
+               (out["job_id"],))
+    assert job["consumed_at"] is None
+
+
+def test_verify_page_research_changed_opt_out_also_fresh(monkeypatch):
+    """此前未勾选 + 协议更新：同样不预勾选（fresh checkbox + 更新文案）。"""
+    _open_public_mode(monkeypatch)
+    out = _enqueue("rc_chg_no@x.com", research_opt_in=False)
+    _publish_new_research_version()  # intent 之后发布 → 备查版本过期
+    client = _client()
+    r = client.get("/verify-email?token=" + out["token"])
+    body = r.get_data(as_text=True)
+    m = re.search(r'<input id="research_opt"[^>]*>', body)
+    assert m and "checked" not in m.group(0)
+    assert "已更新" in body
+
+
+def test_complete_research_changed_unchecked_recorded_declined(monkeypatch):
+    """协议更新后提交未勾选/缺省字段 → 记为不同意（不报错）；intent 旧
+    勾选不得沿用为新版同意（§3.3.4）。"""
+    _open_public_mode(monkeypatch)
+    out = _enqueue("rc_dec@x.com", research_opt_in=True)  # 勾选旧版
+    _publish_new_research_version()
+    # 显式不勾选 → declined，且按最终提交时面对的新版记录
+    r = _complete(out["token"], research_opt_in=False)
+    consent = research_consent_store.get_consent(r["user"]["user_id"])
+    assert consent["state"] == "declined"
+    assert consent["document_version"] == \
+        _doc("research_sharing")["version"]
+    # 缺省（body 不带 research_opt_in：非 JS / 旧客户端）→ 同样 declined
+    out2 = _enqueue("rc_dec2@x.com", research_opt_in=True)
+    _publish_new_research_version("2099-12-31-vnext2")
+    r2 = _complete(out2["token"])
+    consent2 = research_consent_store.get_consent(r2["user"]["user_id"])
+    assert consent2["state"] == "declined"
+    assert r2["research_opt_in"] is False
+
+
+def test_http_verify_research_changed_omitted_field_declined(monkeypatch):
+    """HTTP 最终 POST 不带 research_opt_in（协议已更新）→ 成功注册且记为
+    不同意（路由层 None → 存储层按不同意，不报错、不沿用旧勾选）。"""
+    _open_public_mode(monkeypatch)
+    out = _enqueue("rc_http@x.com", research_opt_in=True)
+    _publish_new_research_version()
+    client = _client()
+    rp = client.post("/api/registration/verify", json={
+        "token": out["token"], "password": PASSWORD})
+    assert rp.status_code == 200, rp.get_data(as_text=True)
+    assert rp.get_json()["next"] == "/login?registered=1"
+    user_id = _one(
+        "SELECT completed_user_id AS u FROM registration_intents "
+        "WHERE intent_id=%s", (out["intent_id"],))["u"]
+    assert research_consent_store.get_consent(user_id)["state"] == "declined"
+
+
+def test_complete_research_changed_recheck_grants_new_version(monkeypatch):
+    """协议更新后明确勾选 + 携带当前版本证明 → 记为接受**新版**。"""
+    _open_public_mode(monkeypatch)
+    out = _enqueue("rc_gr@x.com", research_opt_in=True)   # 勾选旧版
+    old = _doc("research_sharing")
+    _publish_new_research_version()
+    new = _doc("research_sharing")
+    assert new["version"] != old["version"]  # 确为不同版本
+    r = _complete(out["token"], research_opt_in=True,
+                  research_version=new["version"],
+                  research_sha256=new["content_sha256"])
+    consent = research_consent_store.get_consent(r["user"]["user_id"])
+    assert consent["state"] == "granted"
+    assert consent["document_version"] == new["version"]
+    assert consent["document_sha256"] == new["content_sha256"]
+    assert consent["granted_at"] is not None
+
+
+def test_complete_research_changed_old_version_rejected(monkeypatch):
+    """协议更新后用旧 version/hash（或缺证明）提交不得冒充分享新版；
+    token 不消耗，补交当前版本仍可完成（§3.3.4）。"""
+    _open_public_mode(monkeypatch)
+    out = _enqueue("rc_old@x.com", research_opt_in=True)
+    old = _doc("research_sharing")
+    _publish_new_research_version()
+    for kw in (
+            dict(research_opt_in=True,
+                 research_version=old["version"],
+                 research_sha256=old["content_sha256"]),  # 旧版本冒充
+            dict(research_opt_in=True),                   # 缺版本证明
+    ):
+        with pytest.raises(registration_store.PublicRegistrationError) as ei:
+            _complete(out["token"], **kw)
+        assert ei.value.code == "research_document_required"
+        job = _one("SELECT * FROM registration_mail_jobs WHERE job_id=%s",
+                   (out["job_id"],))
+        assert job["consumed_at"] is None  # 拒绝不废 token
+    assert _count("SELECT count(*) FROM users") == 0
+    # 补交当前版本 → 完成（注册本身不被阻断）
+    new = _doc("research_sharing")
+    r = _complete(out["token"], research_opt_in=True,
+                  research_version=new["version"],
+                  research_sha256=new["content_sha256"])
+    assert research_consent_store.get_consent(
+        r["user"]["user_id"])["state"] == "granted"

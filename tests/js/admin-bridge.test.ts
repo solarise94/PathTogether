@@ -431,12 +431,19 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			// 2026-09-19（R6，service-review-fix-plan-20260919.md §8）：手动建号
 			// 与身份冲突功能退役——users.create / users.identityConflicts /
 			// users.discardPending 整行删除，38 → 35
-			expect(Object.keys(table)).toHaveLength(35);
+			// 2026-09-21：新增研究删除任务管理员最小处置入口——
+			// researchDeletionJobs.list（终态 failed 任务清单只读，users:read）
+			// 与 researchDeletionJobs.retry（复活为 pending 交 worker 真实
+			// 清理，users:write）——同域不扩域，35 → 37。服务端没有（也不允许
+			// 有）直接置 completed 的桥方法或 REST 入口。
+			expect(Object.keys(table)).toHaveLength(37);
 			expect(table["admin.formatRequests.list"]).toBe("admin:users:read");
 			expect(table["admin.formatRequests.get"]).toBe("admin:users:read");
 			expect(table["admin.formatRequests.patch"]).toBe("admin:users:write");
 			expect(table["admin.testApplications.list"]).toBe("admin:users:read");
 			expect(table["admin.testApplications.review"]).toBe("admin:users:write");
+			expect(table["admin.researchDeletionJobs.list"]).toBe("admin:users:read");
+			expect(table["admin.researchDeletionJobs.retry"]).toBe("admin:users:write");
 			expect(table["admin.settings.model"]).toBe("admin:settings:read");
 		expect(table["admin.settings.model.update"]).toBe("admin:settings:write");
 		expect(table["admin.slides.inventory"]).toBe("admin:slides:read");
@@ -515,6 +522,8 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			"admin.formatRequests.list",
 			// SER-8：测试申请工单（状态/方向枚举过滤，均可空）
 			"admin.testApplications.list",
+			// 2026-09-21：研究删除任务（状态枚举过滤 + 页大小，均可空）
+			"admin.researchDeletionJobs.list",
 		]) {
 			expect(schemas[method], method).toBeTruthy();
 			// 附加属性一律拒绝（iframe 不能借桥传任意字段）

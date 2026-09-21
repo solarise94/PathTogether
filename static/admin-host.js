@@ -58,6 +58,10 @@
    旧 REST 入口（POST /api/admin/v1/users、GET .../identity-conflicts、
    POST .../discard-pending）由服务端 410 endpoint_retired。用户列表/
    启停/AI 权限/密码重置/总额度方法保持不变。
+   2026-09-21：研究删除任务管理员最小处置入口上桥——admin.
+   researchDeletionJobs.list（users:read）与 retry（users:write，把终态
+   failed 复活为 pending 交 worker 真实清理；completed 只能由清理成功产生，
+   不存在也不允许存在「直接置 completed」的桥方法）。
    ========================================================================= */
 (function () {
   "use strict";
@@ -154,6 +158,13 @@
     // admin:users:write，与 formatRequests.patch 同域。
     "admin.testApplications.list": "admin:users:read",
     "admin.testApplications.review": "admin:users:write",
+    // 研究删除任务管理员最小处置入口（终态 failed 的人工处置）：list 只读 →
+    // admin:users:read；retry 是「复活为 pending 交 research_deletion_worker
+    // 真实清理」的写 → admin:users:write（同 testApplications 域不扩域）。
+    // 服务端**没有**也不允许有直接置 completed 的入口（completed 只能由
+    // worker 清理成功产生）。
+    "admin.researchDeletionJobs.list": "admin:users:read",
+    "admin.researchDeletionJobs.retry": "admin:users:write",
   };
 
   // 参数 schema（§14.1：每方法白名单 + 类型/长度/枚举/范围；未声明属性
@@ -461,6 +472,24 @@
         ai_access: { type: "boolean", nullable: true },
       },
       required: ["user_id", "decision"],
+      additionalProperties: false,
+    },
+    // 研究删除任务：status 枚举过滤可空（空=全部）；retry 必填 job_id
+    // （pathId 防路径拼接，与 request_id 同规格）。
+    "admin.researchDeletionJobs.list": {
+      properties: {
+        status: {
+          type: "string",
+          enum: ["pending", "running", "completed", "failed"],
+          nullable: true,
+        },
+        limit: _limitSpec,
+      },
+      additionalProperties: false,
+    },
+    "admin.researchDeletionJobs.retry": {
+      properties: { job_id: _requestIdSpec },
+      required: ["job_id"],
       additionalProperties: false,
     },
   };
@@ -1157,6 +1186,24 @@
         body.ai_access = payload.ai_access;
       }
       return jsonWrite(url, "POST", body)(ctx);
+    },
+
+    // 研究删除任务处置（owner-only）。错误信封 {error:{code,message}} 由
+    // backendError 透传（前端按 409 deletion_job_not_terminal 刷新列表）。
+    "admin.researchDeletionJobs.list": function (ctx, payload) {
+      var url = "/api/admin/v1/research-deletion-jobs" + buildQuery({
+        status: payload.status, limit: payload.limit,
+      });
+      return ctx.fetchJson(url).then(function (res) {
+        if (!res.ok) throw backendError(url, res);
+        return res.body;
+      });
+    },
+
+    "admin.researchDeletionJobs.retry": function (ctx, payload) {
+      var url = "/api/admin/v1/research-deletion-jobs/" +
+          pathId(payload.job_id, "job_id") + "/retry";
+      return jsonWrite(url, "POST", {})(ctx);
     },
   };
 

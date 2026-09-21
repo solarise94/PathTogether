@@ -1700,7 +1700,10 @@ def complete_public_registration(token, password, *, research_opt_in=None,
          terms_sha256 参数），否则 terms_required；可选研究选择默认沿用
          intent，调用方显式提供 research_opt_in 时以最终提交为准（§3.3.3
          允许修改可选项）；opt-in True 且研究文稿已实质变化时同理要求
-         research_version/research_sha256 重新确认；
+         research_version/research_sha256 重新确认；研究文稿实质变化或
+         intent 缺有效证明（research_changed）时 intent 旧选择**不得**作为
+         新版同意——未显式勾选按不同意处理（不报错），旧 version/hash
+         提交拒绝（research_document_required）；
       6. 同邮箱 pending/active 身份冲突 → email_taken（检查先于消费，
          token 保留；绝不自动合并身份）；
       7. 日桶：Asia/Shanghai 日**在锁内选定一次**（防跨零点两次求值撕
@@ -1787,23 +1790,34 @@ def complete_public_registration(token, password, *, research_opt_in=None,
                         raise PublicRegistrationError("terms_required")
                 final_research = bool(row["research_opt_in"]) \
                     if research_opt_in is None else bool(research_opt_in)
-                research_doc = None
+                research_doc = _current_published_tx(
+                    cur, PUBLIC_RESEARCH_DOCUMENT_TYPE, locale)
+                # research_changed（与验证页 public_ctx 同口径）：intent 的研
+                # 究协议 version/hash 与当前 published 不一致（实质变化），
+                # 或缺有效证明（含未勾选时的备查值对不上/文稿下架）
+                research_changed = research_doc is None or (
+                    research_doc["version"] != (row["research_version"] or "")
+                    or research_doc["content_sha256"]
+                    != (row["research_sha256"] or ""))
+                if research_changed:
+                    # §3.3.4：研究协议实质变化/缺有效证明——intent 的旧选择
+                    # 不能作为新版同意凭据；未显式勾选按不同意处理（不报
+                    # 错），绝不用「继续访问视为同意」
+                    final_research = bool(research_opt_in) \
+                        if research_opt_in is not None else False
                 if final_research:
-                    research_doc = _current_published_tx(
-                        cur, PUBLIC_RESEARCH_DOCUMENT_TYPE, locale)
                     if research_doc is None:
                         raise PublicRegistrationError(
                             "document_not_published")
-                    if research_doc["version"] != (row["research_version"]
-                                                   or "") \
-                            or research_doc["content_sha256"] != \
-                            (row["research_sha256"] or ""):
-                        if (research_version or "") != \
-                                research_doc["version"] \
-                                or (research_sha256 or "").strip().lower() \
-                                != research_doc["content_sha256"]:
-                            raise PublicRegistrationError(
-                                "research_document_required")
+                    if research_changed \
+                            and ((research_version or "")
+                                 != research_doc["version"]
+                                 or (research_sha256 or "").strip().lower()
+                                 != research_doc["content_sha256"]):
+                        # 只有对**当前**版本的明确接受才记为同意新版；
+                        # 旧 version/hash（或缺证明）不得冒充分享新版
+                        raise PublicRegistrationError(
+                            "research_document_required")
                 # 6) 邮箱身份冲突（检查先于消费；不自动合并身份）
                 cur.execute(
                     "SELECT 1 FROM users WHERE lower(email_normalized)=%s "
@@ -1872,8 +1886,14 @@ def complete_public_registration(token, password, *, research_opt_in=None,
                          consent_sha))
                 else:
                     consent_state = "declined"
-                    consent_version = row["research_version"]
-                    consent_sha = row["research_sha256"]
+                    # 未同意：按最终提交时实际面对的文稿记录（当前
+                    # published；无文稿时退回 intent 备查值）
+                    if research_doc is not None:
+                        consent_version = research_doc["version"]
+                        consent_sha = research_doc["content_sha256"]
+                    else:
+                        consent_version = row["research_version"]
+                        consent_sha = row["research_sha256"]
                     cur.execute(
                         "INSERT INTO user_research_consents "
                         "(user_id, state, scope_version, document_version, "

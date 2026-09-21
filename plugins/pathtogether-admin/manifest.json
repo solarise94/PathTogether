@@ -2,7 +2,7 @@
   "manifestSchemaVersion": "1.1.0",
   "id": "pathtogether-admin",
   "name": "PathTogether Admin",
-  "pluginVersion": "0.4.11",
+  "pluginVersion": "0.4.12",
   "pluginContractVersion": "1.0.0",
   "bridgeProtocolVersion": "1.0.0",
   "ui": {
@@ -11,8 +11,8 @@
       "admin.workspace"
     ],
     "fileHashes": {
-      "ui/index.html": "1ad33980c72293b5b76ed05e9bfe6a5bd169c3f942b24c5ff9108ae7d7585854",
-      "ui/main.js": "42b12df7de9f55f9b1802440942f5a096f9212a91888c8c4888c5d414d902867",
+      "ui/index.html": "a561d5c5229208dcd0eca2b231219c0223cc617a468ae3c85bb05e1fa17aa6fa",
+      "ui/main.js": "3a8d0350b144be06001aee0d96abaf3006a6a61214ed439e6c55591715a10c61",
       "ui/style.css": "7b9a6b5c769edf1fbb0bb8bb9f4e5952797f359b72383f44ed04f66b5805e6da"
     }
   },

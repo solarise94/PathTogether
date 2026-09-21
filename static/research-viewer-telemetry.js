@@ -32,6 +32,9 @@
    - POST /api/research/viewing-sessions（切切片时建会话，服务端绑定主体/
      epoch）；POST /api/research/viewer-events 批次 ≤50 条 / 64 KiB，内存缓冲
      最大 200 条（超限丢最旧观测事件）；发送失败不影响读片；403/409 停采。
+   - 建会话与上传回包都按会话代次（sessionReqId）校验：A 切片在途请求的
+     回包在切到 B 后迟到 → 丢弃（成功不删 B 的缓冲、403/409 不停 B 的采集）；
+     成功回包按实际发出的事件 ID 确认删除，不误删在途期间新入队的事件。
    ========================================================================= */
 (function (root) {
   "use strict";
@@ -84,6 +87,8 @@
     var enabled = true;         // 页面级停采（403/409/withdraw/logout）
     var session = null;         // {id, epoch, slide}（服务端创建后才有）
     var creatingSession = false;
+    var sessionReqId = 0;       // 会话代次：切切片/清态/新建会话时自增，作废
+                                // 在途建会话请求与事件上传回包
     var slideSpec = null;       // {slide, width, height}
     var ready = false;          // viewer open 且 source 可读
     var buffer = [];
@@ -94,7 +99,9 @@
     var flushTimer = null;
 
     // gesture context（§7.1：底层真实输入建立，animation-finish 归并）
-    var gesture = null;         // {inputKind, kind, before, released, lastInputAt}
+    var gesture = null;         // {inputKind, kind, before, released, animDone,
+                                //  lastInputAt}；animDone=drag 动画先于松手结束，
+                                //  改由 canvas-release 完成归并
     var wheelTimer = null;
     var sawAnimation = false;
 
@@ -204,6 +211,13 @@
         return sendNext();
       }
       var sent = buffer.slice(0, count);
+      // 上传回包按会话代次保护：发送时捕获当前代次（sessionReqId 在切切片/
+      // 清态/新建会话时自增）。A 切片上传在途时切到 B，A 的回包迟到 → 代次
+      // 已变 → 整个回包丢弃：成功不得 splice 当前（B）的 buffer，A 的
+      // 403/409/404 不得 hardStop B 的采集（B 的授权由 B 自己的请求判定）。
+      var reqGen = sessionReqId;
+      var sentIds = {};
+      for (var i = 0; i < sent.length; i++) sentIds[sent[i].event_id] = true;
       var headers = { "Content-Type": "application/json" };
       var tok = csrfTokenFromCookie(doc);
       if (tok) headers["X-CSRF-Token"] = tok;
@@ -213,8 +227,14 @@
         body: body,
         credentials: "same-origin",
       }).then(function (resp) {
+        if (reqGen !== sessionReqId) return null; // 旧代次回包：丢弃
         if (resp.ok) {
-          buffer.splice(0, count);
+          // 成功按"实际发送的事件 ID"确认删除：仅当代次一致时移除这批确实
+          // 发出的事件。不用盲目 splice(0,count)——在途期间同代次可能追加了
+          // 新事件、或 200 上限丢最旧移动了队头，按 id 删除才不会误删待发事件
+          buffer = buffer.filter(function (ev) {
+            return !sentIds[ev.event_id];
+          });
           return sendNext();
         }
         if (resp.status === 403 || resp.status === 409 || resp.status === 404) {
@@ -349,6 +369,10 @@
 
     // ---- 会话生命周期（§7.3） ----
     function clearSessionState() {
+      // 作废在途建会话请求：旧切片的回包不得建立会话、也不得触发本页停采
+      // （快速切切片时 A 的回包晚到，不能把 A 的会话/403 贴到当前切片 B 上）
+      sessionReqId += 1;
+      creatingSession = false;
       cancelObserve();
       gesture = null;
       if (wheelTimer !== null) { win.clearTimeout(wheelTimer); wheelTimer = null; }
@@ -368,15 +392,21 @@
     function createSession() {
       if (!enabled || creatingSession || !slideSpec) return;
       creatingSession = true;
+      sessionReqId += 1;
+      var reqId = sessionReqId;    // 本次请求标识：切切片作废旧请求
+      var slide = slideSpec.slide; // 冻结发起时的切片：回包只允许绑定回该切片
       var headers = { "Content-Type": "application/json" };
       var tok = csrfTokenFromCookie(doc);
       if (tok) headers["X-CSRF-Token"] = tok;
       fetchImpl(endpoints.sessions, {
         method: "POST",
         headers: headers,
-        body: JSON.stringify({ slide: slideSpec.slide }),
+        body: JSON.stringify({ slide: slide }),
         credentials: "same-origin",
       }).then(function (resp) {
+        // 请求已作废（期间切了切片）：丢弃回包——不建会话、也不因旧切片的
+        // 403 停掉当前切片的采集（B 的权限检查由 B 自己的请求承担）
+        if (reqId !== sessionReqId) return null;
         creatingSession = false;
         if (!resp.ok) {
           // 未授权/资源不属于本人/开关关闭：本切片停采（换切片再试）
@@ -385,11 +415,13 @@
         }
         return resp.json();
       }).then(function (body) {
+        if (reqId !== sessionReqId) return; // json 解包期间又切了切片：丢弃
         if (!body || !body.viewing_session_id) return;
+        if (!slideSpec || slideSpec.slide !== slide) return; // 冻结切片≠当前切片：丢弃
         session = {
           id: body.viewing_session_id,
           epoch: body.consent_epoch,
-          slide: slideSpec.slide,
+          slide: slide,
         };
         seq = 0;
         buffer = [];
@@ -397,7 +429,7 @@
         // 人工打开切片（§7.2：完成一次人工打开后开始稳定观察检测）
         if (ready) armObserve();
       }).catch(function () {
-        creatingSession = false;
+        if (reqId === sessionReqId) creatingSession = false;
         // 网络失败：不重试建会话（观测事件本就允许缺失）；下次换切片再试
       });
     }
@@ -423,14 +455,31 @@
         if (gesture && gesture.inputKind === "drag") touchGesture();
       });
       v.addHandler("canvas-release", function () {
-        if (gesture) gesture.released = true;
+        if (!gesture) return;
+        // 拖动-稍停-松手：动画已先于松手结束（animDone），不会再有
+        // animation-finish 来归并——松开时立即归并，否则该手势永不
+        // finalize（漏记 pan 及后续 observe_pause）。归并一次即清
+        // gesture，后续 animation-finish 不会重复产出。
+        if (gesture.inputKind === "drag" && gesture.animDone) {
+          finalizeGesture();
+          return;
+        }
+        gesture.released = true;
       });
       v.addHandler("animation-start", function () {
-        if (gesture) sawAnimation = true;
+        if (!gesture) return;
+        sawAnimation = true;
+        // drag 在"动画已结束待松手"期间又启动新动画：回到等 animation-finish
+        if (gesture.inputKind === "drag") gesture.animDone = false;
       });
       v.addHandler("animation-finish", function () {
         if (!gesture) return;
-        if (gesture.inputKind === "drag" && !gesture.released) return;
+        if (gesture.inputKind === "drag" && !gesture.released) {
+          // 动画先于松手结束：不在此归并，标记后等 canvas-release 归并
+          //（同一手势同一时间只归并一次）
+          gesture.animDone = true;
+          return;
+        }
         if ((gesture.inputKind === "wheel" || gesture.inputKind === "pinch")
             && Date.now() - gesture.lastInputAt < WHEEL_SILENCE_MS) {
           return; // 连续滚轮尚未静默：归并到同一条（§7.1）

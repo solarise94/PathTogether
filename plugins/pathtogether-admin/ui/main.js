@@ -47,12 +47,19 @@
    list/get（users:read）+ patch（users:write，CAS 状态机 + admin_note），
    复用 users 权限域不扩域；样本只呈现元数据（样本下载走宿主鉴权接口，
    本页不内嵌文件）；渲染字段白名单化，内部字段绝不进 DOM。
-   SER-8（wip/ser8-dev）：新增「测试申请」页——admin.testApplications.list
+  SER-8（wip/ser8-dev）：新增「测试申请」页——admin.testApplications.list
    （users:read）+ review（users:write，POST .../review，body {decision,
    ai_access}）。approved = 原子激活 + 默认额度 provisioning + 结果邮件
-   （终态不可撤销），页内确认条 +「开通 AI 权限」默认勾选；
+   （终态不可撤销），页内确认条 +「开通 AI 权限」默认勾；
    409 default_allowance_unconfigured 提示先去设置页配置默认总额度。
    渲染只用 textContent / createElement（不拼 HTML，插件数据永不进标记）。
+   2026-09-21：新增「研究删除」页（管理员最小处置入口）——admin.
+   researchDeletionJobs.list（users:read）+ retry（users:write，POST
+   .../research-deletion-jobs/<job_id>/retry）。唯一动作 = 把**终态 failed**
+   （重试耗尽、worker 停止自动重试）的删除任务复活为 pending 交 worker
+   真实清理；completed 只能由清理成功产生——本页没有（也不允许有）
+   「直接置 completed」的操作。terminal_failed 由服务端判定下发，
+   前端只按它显示操作按钮。
  ========================================================================= */
 (function () {
   "use strict";
@@ -77,7 +84,8 @@
     cursors: { users: null, usage: null, unpriced: null, ledger: null,
                audit: null, invites: null, slides: null, formatRequests: null,
                testApplications: null },
-    filters: { users: {}, usage: {}, audit: {}, format: {}, testApp: {} },
+    filters: { users: {}, usage: {}, audit: {}, format: {}, testApp: {},
+               rdel: {} },
     // 设置页快照（批次 D §6.1）：admin.settings.get 的响应（含 spend
     // current_windows 的 demo/owner 窗口 CAS version）——仅内存。
     settingsSnapshot: null,
@@ -116,8 +124,8 @@
   // 自身 URL；只接受已知页面 slug，其余回概览。
   function initialPageFromHash() {
     var pages = ["overview", "users", "slides", "format-requests",
-                 "test-applications", "invites", "settings", "billing",
-                 "plugins", "audit"];
+                 "test-applications", "research-deletion", "invites",
+                 "settings", "billing", "plugins", "audit"];
     var hash = "";
     try { hash = window.location.hash || ""; } catch (e) { hash = ""; }
     var name = hash.replace(/^#/, "");
@@ -132,8 +140,8 @@
   var PAGE_TITLES = {
     overview: "概览", users: "用户", slides: "切片可见性",
     "format-requests": "格式申请", "test-applications": "测试申请",
-    invites: "邀请", settings: "设置", billing: "费用", plugins: "插件",
-    audit: "审计",
+    "research-deletion": "研究删除", invites: "邀请", settings: "设置",
+    billing: "费用", plugins: "插件", audit: "审计",
   };
 
   var els = {
@@ -151,6 +159,7 @@
       slides: $("adm-page-slides"),
       "format-requests": $("adm-page-format-requests"),
       "test-applications": $("adm-page-test-applications"),
+      "research-deletion": $("adm-page-research-deletion"),
       invites: $("adm-page-invites"),
       settings: $("adm-page-settings"),
       billing: $("adm-page-billing"),
@@ -1053,7 +1062,7 @@
     ["adm-users-tbody", "adm-usage-tbody", "adm-unpriced-tbody",
      "adm-ledger-tbody", "adm-audit-tbody", "adm-invites-tbody",
      "adm-plugins-tbody", "adm-slides-tbody",
-     "adm-format-tbody", "adm-test-tbody"].forEach(
+     "adm-format-tbody", "adm-test-tbody", "adm-rdel-tbody"].forEach(
     function (id) {
       var el = $(id);
       if (el) el.textContent = "";
@@ -1062,6 +1071,8 @@
     if (frDetail) frDetail.textContent = "";
     var testConfirm = $("adm-test-confirm");
     if (testConfirm) { testConfirm.hidden = true; testConfirm.textContent = ""; }
+    var rdelConfirm = $("adm-rdel-confirm");
+    if (rdelConfirm) { rdelConfirm.hidden = true; rdelConfirm.textContent = ""; }
   }
 
   function loadUsers(append) {
@@ -3725,6 +3736,131 @@
   }
 
   // ------------------------------------------------------------------
+  // 研究删除任务处置（2026-09-21，管理员最小处置入口）：
+  //   - admin.researchDeletionJobs.list：GET /api/admin/v1/research-deletion-jobs
+  //     （status 过滤可空；单查即全量、上限由服务端 limit 控制，无游标）；
+  //   - admin.researchDeletionJobs.retry：POST .../<job_id>/retry——把**终态
+  //     failed**（重试耗尽、worker 停止自动重试）的任务复活为 pending、
+  //     attempts 重置 0，交 research_deletion_worker 重新领取并真实清理；
+  //   - 红线：completed 只能由 worker 清理成功产生——本页没有（也不允许有）
+  //     「直接置 completed」的操作；terminal_failed 由服务端判定下发，
+  //     前端只按它显示「重新执行删除」按钮；
+  //   - 409 deletion_job_not_terminal → 提示并刷新（他人已处置/状态已变）；
+  //     404 deletion_job_not_found → 提示并刷新；
+  //   - 渲染白名单字段 textContent（同测试申请页纪律），时间统一 fmtTs。
+  // ------------------------------------------------------------------
+  var RDEL_STATUS_LABELS = {
+    pending: "pending（待执行）", running: "running（执行中）",
+    completed: "completed（已完成）", failed: "failed（失败）",
+  };
+
+  function rdelStatusLabel(item) {
+    return RDEL_STATUS_LABELS[item.status] || String(item.status || "—");
+  }
+
+  function loadResearchDeletionJobs() {
+    var seq = state.listSeq;
+    var f = state.filters.rdel || {};
+    var payload = {};
+    if (f.status) payload.status = f.status;
+    setPageState("research-deletion", "loading");
+    request("admin.researchDeletionJobs.list", payload).then(function (res) {
+      if (seq !== state.listSeq) return; // 页面已切换：晚到响应丢弃
+      hideError();
+      var items = (res && res.items) || [];
+      var tbody = $("adm-rdel-tbody");
+      if (tbody) tbody.textContent = "";
+      items.forEach(function (item) { renderRdelRow(item); });
+      if (!items.length) {
+        setPageState("research-deletion", "empty", {
+          message: f.status
+            ? "没有匹配筛选条件的删除任务；切换筛选可查看全部。"
+            : "暂无研究删除任务。用户撤回研究授权或申请删除研究副本后会出现任务。",
+        });
+      } else {
+        setPageState("research-deletion", "ready", {
+          message: "已更新（" + nowText() + "）",
+        });
+      }
+    }).catch(function (err) {
+      if (seq !== state.listSeq) return;
+      handleErr(err, $("adm-rdel-status"));
+      setPageState("research-deletion", "error", {
+        code: err && err.code, message: err && err.message,
+        retry: function () { loadResearchDeletionJobs(); },
+      });
+    });
+  }
+
+  function renderRdelRow(item) {
+    var tbody = $("adm-rdel-tbody");
+    if (!tbody) return;
+    var tr = document.createElement("tr");
+    // 身份主列：identity（邮箱用户名）优先，回退 user_id 技术详情
+    tr.appendChild(td(item.identity || item.user_id));
+    var statusCell = document.createElement("td");
+    statusCell.textContent = rdelStatusLabel(item);
+    if (item.terminal_failed) {
+      // 终态 failed：worker 已停止自动重试，待人工按错误码处置
+      statusCell.appendChild(document.createElement("br"));
+      var meta = document.createElement("span");
+      meta.className = "adm-user-meta";
+      meta.textContent = "终态，待人工处置";
+      statusCell.appendChild(meta);
+    }
+    tr.appendChild(statusCell);
+    tr.appendChild(td(item.attempts, "adm-col-secondary"));
+    tr.appendChild(td(item.error_code));
+    tr.appendChild(td(fmtTs(item.next_retry_at), "adm-cell-time adm-col-secondary"));
+    tr.appendChild(td(item.consent_epoch, "adm-col-secondary"));
+    tr.appendChild(td(fmtTs(item.created_at), "adm-cell-time"));
+    tr.appendChild(td(fmtTs(item.updated_at), "adm-cell-time"));
+    var cell = document.createElement("td");
+    cell.className = "adm-actions-cell";
+    if (item.terminal_failed && item.job_id) {
+      // 唯一动作：重新执行删除（复活为 pending 交 worker 真实清理）；
+      // completed 不提供任何人工置位路径
+      cell.appendChild(actionBtn("重新执行删除", function () {
+        askConfirm($("adm-rdel-confirm"),
+          "确认重新执行该删除任务（" + (item.identity || item.user_id) +
+          "，上次错误 " + (item.error_code || "未知") + "）？任务将复活为" +
+          " pending 并重置尝试次数，由后台 worker 重新清理研究副本；" +
+          "completed 只能由实际清理成功产生。",
+          function () { retryResearchDeletionJob(item); });
+      }, "primary"));
+    }
+    tr.appendChild(cell);
+    tbody.appendChild(tr);
+  }
+
+  function retryResearchDeletionJob(item) {
+    setStatus("adm-rdel-status", "提交中…");
+    request("admin.researchDeletionJobs.retry", { job_id: item.job_id })
+      .then(function (res) {
+        hideError();
+        var prev = res && typeof res.previous_attempts === "number"
+          ? "（此前尝试 " + res.previous_attempts + " 次）" : "";
+        setStatus("adm-rdel-status",
+          "已重新执行：" + (item.identity || item.user_id) +
+          " 的删除任务复活为 pending，等待 worker 清理" + prev);
+        loadResearchDeletionJobs();
+      }).catch(function (err) {
+        if (err && err.code === "deletion_job_not_terminal") {
+          setStatus("adm-rdel-status",
+            "该任务已不在终态 failed（他人可能已处置或 worker 已领取），已刷新");
+          loadResearchDeletionJobs();
+          return;
+        }
+        if (err && err.code === "deletion_job_not_found") {
+          setStatus("adm-rdel-status", "任务不存在，已刷新");
+          loadResearchDeletionJobs();
+          return;
+        }
+        handleErr(err, $("adm-rdel-status"));
+      });
+  }
+
+  // ------------------------------------------------------------------
   // 插件管理（PR5 修订：恢复旧侧栏插件管理功能面）
   // ------------------------------------------------------------------
   function pluginHealthText(h) {
@@ -3861,6 +3997,7 @@
     else if (name === "slides") loadSlides(false);
     else if (name === "format-requests") loadFormatRequests(false);
     else if (name === "test-applications") loadTestApplications();
+    else if (name === "research-deletion") loadResearchDeletionJobs();
     else if (name === "invites") loadInvitesPage();
     else if (name === "settings") loadSettingsPage();
     else if (name === "billing") loadBillingPage();
@@ -4053,6 +4190,15 @@
       loadTestApplications(false);
     });
     onClick("adm-test-refresh-btn", function () { loadTestApplications(false); });
+    // 研究删除任务页（2026-09-21）：状态过滤 + 刷新（重新执行动作在行内）
+    onClick("adm-rdel-search-btn", function () {
+      state.filters.rdel = {
+        status: $("adm-rdel-status") ? $("adm-rdel-status").value : "",
+      };
+      state.listSeq++;
+      loadResearchDeletionJobs();
+    });
+    onClick("adm-rdel-refresh-btn", function () { loadResearchDeletionJobs(); });
     // 插件页（PR5 修订）
     onClick("adm-plugins-refresh-btn", function () { loadPlugins(); });
     onClick("adm-plugin-secret-copy", function () {

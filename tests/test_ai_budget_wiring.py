@@ -720,7 +720,9 @@ def test_ui_budget_card_and_max_steps_sync_present():
     # 见 test_admin_plugin.py。hashes/pin 同步
     # 2026-09-19 0.4.10（R4）：每日趋势近 7 天倒序、来源榜固定排除疑似
     # 爬虫。hashes/pin 同步
-    assert manifest["pluginVersion"] == "0.4.10"
+    # 2026-09-21 0.4.12：新增研究删除任务管理页（终态 failed 复活重试、无置
+    # completed 入口）；hashes/pin 同步
+    assert manifest["pluginVersion"] == "0.4.12"
     for perm in ("admin:turn-budgets:read", "admin:turn-budgets:write",
                  "admin:acquisition:read", "admin:billing:write"):
         assert perm not in manifest["adminPermissions"], perm

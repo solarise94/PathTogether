@@ -129,6 +129,29 @@ case "$_fr_worker" in
 esac
 
 # ---------------------------------------------------------------------------
+# 研究副本删除 worker（docs/agent-plan-20260921 §6.3/§8）：research_data_
+# deletion_jobs 权威排水 + 研究副本 90 天到期清理。RESEARCH_DELETION_
+# WORKER=0/false/no/off 关闭。多实例/重启安全（FOR UPDATE SKIP LOCKED +
+# 幂等删除 + running 租约回收），与 gunicorn 独立、后台循环崩溃 2s 重启。
+# ---------------------------------------------------------------------------
+_rd_worker="$(printf '%s' "${RESEARCH_DELETION_WORKER:-1}" | tr '[:upper:]' '[:lower:]')"
+case "$_rd_worker" in
+  0|false|no|off)
+    echo "[entry] RESEARCH_DELETION_WORKER=$_rd_worker, skip research deletion worker"
+    ;;
+  *)
+    echo "[entry] starting research_deletion_worker --loop"
+    (
+      while :; do
+        python3 /app/research_deletion_worker.py --loop || true
+        echo "[entry] research_deletion_worker exited, restart in 2s" >&2
+        sleep 2
+      done
+    ) &
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
 # KFB 转换 worker（Phase B）：conversion_jobs 排水。独立于 Gunicorn。
 # CONVERSION_WORKER=0/false/no/off 关闭。
 # ---------------------------------------------------------------------------

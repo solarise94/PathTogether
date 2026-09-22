@@ -868,6 +868,7 @@ def test_i18n_register_dialog_keys_bilingual():
         "login.register",
         "register.title", "register.desc",
         "register.dialog.title", "register.dialog.subtitle",
+        "register.dialog.subtitle.public",
         "register.dialog.email", "register.dialog.email.ph",
         "register.dialog.email.hint", "register.dialog.submit",
         "register.dialog.submitting", "register.dialog.sent.title",

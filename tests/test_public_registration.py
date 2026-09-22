@@ -725,6 +725,9 @@ def test_homepage_dialog_public_branch_has_agreements(monkeypatch):
         assert 'name="terms_version" value="%s"' % terms["version"] in body, path
         assert "协议文稿发布中" not in body, path
         assert "注册暂不可用" not in body, path
+        # public 副标题：无管理员审核环节（邀请制文案不得出现在 public 弹窗）
+        assert "验证邮箱并设置密码，即可开始使用。" in body, path
+        assert "管理员审核通过后即可使用" not in body, path
 
 
 def test_register_post_requires_terms_checkbox(monkeypatch):

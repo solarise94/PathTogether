@@ -499,6 +499,7 @@
       // 弹窗注册视图通用
       "register.dialog.title": "注册 HistoPilot",
       "register.dialog.subtitle": "验证邮箱并提交申请，管理员审核通过后即可使用。",
+      "register.dialog.subtitle.public": "验证邮箱并设置密码，即可开始使用。",
       "register.dialog.email": "邮箱地址",
       "register.dialog.email.ph": "you@example.com",
       "register.dialog.email.hint": "验证成功后，该邮箱将作为你的登录账号。",
@@ -1594,6 +1595,7 @@
       // Dialog register view (shared)
       "register.dialog.title": "Sign up for HistoPilot",
       "register.dialog.subtitle": "Verify your email and submit an application — you can start once an administrator approves it.",
+      "register.dialog.subtitle.public": "Verify your email and set a password to start right away — no admin approval needed.",
       "register.dialog.email": "Email address",
       "register.dialog.email.ph": "you@example.com",
       "register.dialog.email.hint": "After verification, this email address becomes your login name.",

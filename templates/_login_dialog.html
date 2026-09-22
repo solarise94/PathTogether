@@ -61,7 +61,12 @@
       </div>
       {% else %}
       <h2 id="register-dialog-title" data-i18n="register.dialog.title">注册 HistoPilot</h2>
+      {% if registration_mode == "public" %}
+      <!-- public 无管理员审核环节：验证邮箱 + 设密码即开通（§4.2 原子建号） -->
+      <p class="login-dialog-subtitle" data-i18n="register.dialog.subtitle.public">验证邮箱并设置密码，即可开始使用。</p>
+      {% else %}
       <p class="login-dialog-subtitle" data-i18n="register.dialog.subtitle">验证邮箱并提交申请，管理员审核通过后即可使用。</p>
+      {% endif %}
       {% if register_error %}
       <div class="login-dialog-error" role="alert">
         {% if register_error_code == 'locked' %}<span data-i18n="login.error.locked">尝试过于频繁，请稍后再试</span>

@@ -708,6 +708,25 @@ def test_register_get_public_form_two_checkboxes(monkeypatch):
     assert "名额于北京时间每日 00:00 更新" in body
 
 
+def test_homepage_dialog_public_branch_has_agreements(monkeypatch):
+    """回归（2026-09-22 生产事故）：首页 / 与 /login 的弹窗注册视图在 public
+    生效态必须渲染双 checkbox——弹窗经 entry-auth.js 原地切换（无服务端往返），
+    缺 register_terms/register_research 会落入模板 fail-closed 分支误报
+    「公开注册暂未开放」。"""
+    _open_public_mode(monkeypatch)
+    client = _client()
+    terms = _doc("user_agreement")
+    for path in ("/", "/login"):
+        r = client.get(path)
+        assert r.status_code == 200
+        body = r.get_data(as_text=True)
+        assert 'name="terms_accepted"' in body, path
+        assert 'name="research_opt_in"' in body, path
+        assert 'name="terms_version" value="%s"' % terms["version"] in body, path
+        assert "协议文稿发布中" not in body, path
+        assert "注册暂不可用" not in body, path
+
+
 def test_register_post_requires_terms_checkbox(monkeypatch):
     """未勾选必选 → 服务端拒绝（不只见前端拦截）；不入队、不占名额。"""
     _open_public_mode(monkeypatch)

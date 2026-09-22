@@ -2725,7 +2725,8 @@ def _entry_signed_in_context():
     登录默认 next 统一为 /app（普通登录成功直接进工作台）。
     """
     signed_in = bool(AUTH_ENABLED and session.get("auth_user"))
-    return {
+    registration_mode = _registration_dialog_mode()
+    ctx = {
         "signed_in": signed_in,
         "csrf_token": ensure_csrf_token(),
         "login_open": False, "login_error": None, "login_error_code": None,
@@ -2737,10 +2738,16 @@ def _entry_signed_in_context():
         # 注册弹窗（R2）：/register 深链接与注册错误回显经 _register_landing_page
         # 覆写 register_open/register_error 等；介绍页默认收起注册视图。
         "register_open": False,
-        "registration_mode": _registration_dialog_mode(),
+        "registration_mode": registration_mode,
         "register_error": None, "register_error_code": None,
         "register_done": False, "register_retry_after": 0,
     }
+    # public 模式必须随首页/登录页就注入协议上下文：弹窗经 entry-auth.js 原地
+    # 切换到注册视图（无服务端往返），渲染时缺 register_terms/register_research
+    # 会落入模板 fail-closed 分支误报「公开注册暂未开放」。
+    if registration_mode == "public":
+        ctx.update(_public_register_agreements_context())
+    return ctx
 
 
 def _landing_response(**overrides):

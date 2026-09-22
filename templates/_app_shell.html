@@ -220,10 +220,15 @@
       </div>
       {% else %}
       <div class="sidebar-top">
-        <!-- 升级 A：切片搜索（空态「选择切片」展开侧栏后聚焦此框；纯前端过滤） -->
-        <input id="slide-search" type="search" class="slide-search" autocomplete="off"
-               placeholder="搜索切片…" data-i18n-ph="sb.search.ph"
-               aria-label="按名称过滤切片列表" data-i18n-aria="sb.search.aria" />
+        {# 切片搜索（2026-09-22 重做，slide-search-autofill-bug）：默认只渲染
+           「搜索切片」按钮 + 空容器，输入框由 app.js 点击后才创建——首屏 DOM
+           不存在任何搜索输入框，浏览器/密码管理器不会把账号邮箱自动填进来。
+           Demo 分支的常驻搜索框在 demo.html 分支，不走此方案。 #}
+        <button id="slide-search-btn" type="button" class="btn secondary block slide-search-btn"
+                aria-expanded="false" aria-controls="slide-search-area"
+                data-i18n="sb.search.btn" data-i18n-title="sb.search.btn.title"
+                title="按名称或别名过滤切片列表">搜索切片</button>
+        <div id="slide-search-area" class="slide-search-area"></div>
         {# W3/W4/W6 2026-09-14：侧栏只留两个主入口——「导入切片」统一抽屉 +
            「新建项目」对话框；内联 new-project-form / format-req 已移除
            （格式申请迁入导入抽屉次级入口）。#file-input 保持隐藏，上传管线
@@ -271,8 +276,11 @@
             <span class="section-title" data-i18n="sb.section.share">分享管理</span>
           </div>
           <div id="share-mgr-body" class="section-body">
-            <div class="share-row">
-              <select id="share-expires-select" class="select">
+          {# 分享选项竖排（2026-09-23：三个下拉在窄侧栏并排会截断文案，如
+             「矩形：仅预设 6/6.5mm」被切成「矩形：仅预设」）；CSS 见
+             .share-row.share-selects #}
+          <div class="share-row share-selects">
+            <select id="share-expires-select" class="select">
                 <option value="6" data-i18n="sb.share.expires.6">6 小时</option>
                 <option value="24" selected data-i18n="sb.share.expires.24">24 小时</option>
                 <option value="72" data-i18n="sb.share.expires.72">3 天</option>

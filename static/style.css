@@ -644,6 +644,38 @@ button {
 .slide-search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-fill); }
 .slide-search::placeholder { color: var(--text-3); }
 
+/* 切片搜索（2026-09-22 重做，slide-search-autofill-bug）：按钮常驻，label +
+   输入框 + 关闭钮由 app.js 点击后才创建；#slide-search-area 空容器不占布局 */
+.slide-search-area:empty { display: none; }
+.slide-search-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-2);
+  letter-spacing: 0.3px;
+}
+.slide-search-row { display: flex; align-items: center; gap: 4px; }
+.slide-search-row .slide-search { flex: 1; min-width: 0; }
+.slide-search-close {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: var(--text-2);
+  border-radius: var(--r-btn);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.slide-search-close:hover { background: var(--hover-strong); color: var(--text); }
+.slide-search-close:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* 过滤后无匹配：显式提示，不留空白列表（未归类/项目两区共用外观） */
+.unfiled-filter-empty,
+.proj-filter-empty { color: var(--text-3); font-size: 12px; text-align: center; padding: 10px 4px; }
+
 .sidebar-top {
   padding: 12px;
   display: flex;
@@ -1084,6 +1116,15 @@ button {
   gap: 6px;
   margin-bottom: 6px;
 }
+
+/* 分享选项（有效期/矩形尺寸/矩形策略）竖排：窄侧栏里并排 flex:1 会把
+   「矩形：仅预设 6/6.5mm」等长文案截断；整行放下拉+原生箭头才完整可读 */
+.share-row.share-selects {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+.share-row.share-selects .select { flex: none; width: 100%; }
 
 /* 链接权限显式选择（docs §8.3）：仅查看为基线（锁定），标注/下载默认不勾选 */
 .share-perms {

@@ -915,8 +915,9 @@
     menuBtn: $("menu-btn"),
     sidebar: $("sidebar"),
     sidebarMask: $("sidebar-mask"),
-    // 升级 A：切片搜索 + 无切片空态入口
-    slideSearch: $("slide-search"),
+    // 升级 A（2026-09-22 重做）：搜索输入框按需创建——首屏只有按钮 + 空容器
+    slideSearchBtn: $("slide-search-btn"),
+    slideSearchArea: $("slide-search-area"),
     viewerEmpty: $("viewer-empty"),
     viewerEmptyPick: $("viewer-empty-pick"),
     // 项目
@@ -2363,8 +2364,9 @@
       return;
     }
     var renderTail = function () {
-      // 升级 A：列表重渲后重放当前搜索条件（搜索条件不因收起/重渲丢失）
-      if (els.slideSearch) applySlideFilter(els.slideSearch.value);
+      // 升级 A：列表重渲后重放当前搜索条件（搜索条件不因收起/重渲丢失；
+      // 输入框未创建/已移除时 getSlideQuery 返回空 → 显示全部）
+      applySlideFilter(getSlideQuery());
     };
     projects.forEach(function (p) {
       var row = document.createElement("div");
@@ -2709,13 +2711,15 @@
       empty.className = "unfiled-empty";
       empty.textContent = t("unfiled.empty");
       els.unfiledList.appendChild(empty);
+      // 真实空态（没有未归类切片）不是过滤结果：清掉过滤残留并复位计数
+      applySlideFilter(getSlideQuery());
       return;
     }
     unfiled.forEach(function (s) {
       els.unfiledList.appendChild(renderSlideRow(s.name, true));
     });
     // 升级 A：列表重渲后重放当前搜索条件（搜索条件不因收起/重渲丢失）
-    if (els.slideSearch) applySlideFilter(els.slideSearch.value);
+    applySlideFilter(getSlideQuery());
   }
 
   // ---------- 新建项目（W3：独立对话框；修 R3 草稿残留 / R4 重复提交） ----------
@@ -3508,29 +3512,228 @@
     }
   }
 
+  // ---------- 切片搜索（2026-09-22 重做，slide-search-autofill-bug） ----------
+  // 按需创建：默认 DOM 没有搜索输入框，点「搜索切片」才创建；关闭即清空
+  // 过滤、移除输入框并把焦点还给按钮。首屏无输入框 + 防自动填充属性 +
+  // 原生 autofill 标记检测，避免浏览器/密码管理器把账号邮箱填进侧栏顶部、
+  // 造成「有数量、无列表、无解释」的误填状态。查询保留在输入框里，侧栏
+  // 收起/展开、列表重渲不丢失；重渲后由 renderTail 重放当前条件。
+  var slideSearchState = { open: false, wrap: null, label: null, input: null, closeBtn: null };
+
+  // 原生 autofill 状态检测：能力检测 + try/catch，不支持的浏览器一律按
+  // 「非自动填充」处理，绝不让检测异常中断列表加载/过滤
+  function isNativeAutofilled(el) {
+    if (!el || typeof el.matches !== "function") return false;
+    try { return el.matches(":-webkit-autofill"); } catch (e) { return false; }
+  }
+
+  // 当前有效查询：输入框不存在（未创建/已移除/脱离 DOM）时为空串。读取时
+  // 发现明确标记为自动填充的值：清掉该值并返回空查询（列表保持全量）。
+  // 不按「含 @ / 像邮箱」拒绝——用户可能合法地按文件名/别名搜索。
+  function getSlideQuery() {
+    var st = slideSearchState;
+    if (!st.open || !st.input || !st.input.isConnected) return "";
+    if (st.input.value && isNativeAutofilled(st.input)) {
+      st.input.value = "";
+      return "";
+    }
+    return st.input.value;
+  }
+
+  // 动态控件文案/aria 随语言刷新（静态节点由 i18n.js applyLang 处理）
+  function refreshSlideSearchTexts() {
+    var st = slideSearchState;
+    if (st.label) st.label.textContent = t("sb.search.label");
+    if (st.input) {
+      st.input.setAttribute("placeholder", t("sb.search.ph"));
+      st.input.setAttribute("aria-label", t("sb.search.aria"));
+    }
+    if (st.closeBtn) {
+      var closeLabel = t("sb.search.close");
+      st.closeBtn.setAttribute("aria-label", closeLabel);
+      st.closeBtn.title = closeLabel;
+    }
+  }
+
+  function openSlideSearch() {
+    var st = slideSearchState;
+    if (!els.slideSearchArea) return;
+    if (st.open) {
+      // 已打开：按钮点击只把焦点送回输入框（关闭走 × / Escape）
+      if (st.input && typeof st.input.focus === "function") {
+        try { st.input.focus(); } catch (e) { /* 忽略聚焦失败 */ }
+      }
+      return;
+    }
+    var wrap = document.createElement("div");
+    wrap.className = "slide-search-wrap";
+
+    // 用途标签（可见 label，不只靠 placeholder 表明用途）
+    var label = document.createElement("label");
+    label.className = "slide-search-label";
+    label.setAttribute("for", "slide-search");
+    wrap.appendChild(label);
+
+    var row = document.createElement("div");
+    row.className = "slide-search-row";
+    var input = document.createElement("input");
+    input.type = "search";
+    input.id = "slide-search";
+    input.className = "slide-search";
+    // 防自动填充（辅助措施）：非账号含义的字段名 + autocomplete off + 各
+    // 密码管理器忽略标记；主要保障是首屏没有输入框与明确的用途展示
+    input.name = "slide-filter";
+    input.setAttribute("autocomplete", "off");
+    input.setAttribute("data-lpignore", "true");
+    input.setAttribute("data-1p-ignore", "");
+    input.setAttribute("data-bwignore", "");
+    input.setAttribute("data-form-type", "other");
+    row.appendChild(input);
+
+    var closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.id = "slide-search-close";
+    closeBtn.className = "slide-search-close";
+    closeBtn.textContent = "×";
+    row.appendChild(closeBtn);
+    wrap.appendChild(row);
+
+    els.slideSearchArea.appendChild(wrap);
+    st.open = true;
+    st.wrap = wrap;
+    st.label = label;
+    st.input = input;
+    st.closeBtn = closeBtn;
+
+    function onSearchValue() {
+      // 明确标记为浏览器原生 autofill 的值：清空并恢复列表（正常输入照常过滤）
+      if (input.value && isNativeAutofilled(input)) {
+        input.value = "";
+        applySlideFilter("");
+        return;
+      }
+      applySlideFilter(input.value);
+    }
+    input.addEventListener("input", onSearchValue);
+    input.addEventListener("change", onSearchValue);
+    // Escape 关闭搜索；阻止同一事件继续冒泡去关手机抽屉
+    input.addEventListener("keydown", function (e) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        closeSlideSearch();
+      }
+    });
+    closeBtn.addEventListener("click", closeSlideSearch);
+
+    if (els.slideSearchBtn) els.slideSearchBtn.setAttribute("aria-expanded", "true");
+    refreshSlideSearchTexts();
+    try { input.focus(); } catch (e) { /* 忽略聚焦失败 */ }
+  }
+
+  function closeSlideSearch() {
+    var st = slideSearchState;
+    if (!st.open) return;
+    if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap);
+    st.open = false;
+    st.wrap = null;
+    st.label = null;
+    st.input = null;
+    st.closeBtn = null;
+    // 清空过滤、恢复全部可见切片；计数与无匹配提示由 applySlideFilter 复位
+    applySlideFilter("");
+    if (els.slideSearchBtn) {
+      els.slideSearchBtn.setAttribute("aria-expanded", "false");
+      try { els.slideSearchBtn.focus(); } catch (e) { /* 忽略聚焦失败 */ }
+    }
+  }
+
   // ---------- 切片搜索过滤（升级 A：纯前端；收起不丢搜索条件） ----------
-  // 匹配切片行 data-name 与行文本（别名优先）。项目行：名称命中整组显示，
-  // 否则任一切片命中则展开显示；无命中隐藏。列表重渲后需重放当前条件。
+  // 匹配完整文件名（data-name）与显示别名（.slide-name 文本），大小写不敏感。
+  // 项目行：名称命中 → 项目及其全部切片可见；仅切片命中 → 展开显示命中行；
+  // 无命中隐藏。未归类：过滤时计数显示 匹配数/总数（如 0/4），全部被滤掉时
+  // 显示「没有匹配的切片」提示，不留空白列表、不误写成没有上传切片。
   function applySlideFilter(raw) {
     if (!els.sidebar) return;
     var q = String(raw == null ? "" : raw).trim().toLowerCase();
-    var rows = els.sidebar.querySelectorAll(".slide-row");
-    Array.prototype.forEach.call(rows, function (row) {
-      var hay = String(row.getAttribute("data-name") || row.textContent || "").toLowerCase();
-      row.style.display = (q && hay.indexOf(q) < 0) ? "none" : "";
+    function rowMatches(row) {
+      if (!q) return true;
+      var nameEl = row.querySelector(".slide-name");
+      var hay = String(row.getAttribute("data-name") || "") + " " +
+        String((nameEl && nameEl.textContent) || "");
+      return hay.toLowerCase().indexOf(q) >= 0;
+    }
+    // 未归类行 + 匹配数/总数计数 + 无匹配提示
+    var unfiledRows = els.sidebar.querySelectorAll("#unfiled-list .slide-row");
+    var unfiledVisible = 0;
+    Array.prototype.forEach.call(unfiledRows, function (row) {
+      var hit = rowMatches(row);
+      row.style.display = hit ? "" : "none";
+      if (hit) unfiledVisible += 1;
     });
-    Array.prototype.forEach.call(els.sidebar.querySelectorAll(".proj-row"), function (row) {
+    var filterEmpty = els.unfiledList
+      ? els.unfiledList.querySelector(".unfiled-filter-empty") : null;
+    var needEmpty = !!q && unfiledRows.length > 0 && unfiledVisible === 0;
+    if (needEmpty) {
+      if (!filterEmpty && els.unfiledList) {
+        filterEmpty = document.createElement("div");
+        filterEmpty.className = "unfiled-filter-empty";
+        els.unfiledList.appendChild(filterEmpty);
+      }
+      if (filterEmpty) filterEmpty.textContent = t("sb.search.empty");
+    } else if (filterEmpty && filterEmpty.parentNode) {
+      filterEmpty.parentNode.removeChild(filterEmpty);
+    }
+    if (els.unfiledCount) {
+      els.unfiledCount.textContent = (q && unfiledRows.length > 0)
+        ? unfiledVisible + "/" + unfiledRows.length
+        : String(unfiledRows.length);
+    }
+    // 有查询且存在未归类切片时展开未归类分区：命中行或「没有匹配的切片」
+    // 提示必须可见（用户手动折叠态在查询期间不适用；清空查询不回收展开）
+    if (q && unfiledRows.length > 0 && els.unfiledBody) {
+      var unfiledSec = els.unfiledBody.closest(".section");
+      if (unfiledSec) unfiledSec.classList.remove("collapsed");
+    }
+    // 项目行
+    var projRows = els.sidebar.querySelectorAll(".proj-row");
+    var projVisible = 0;
+    Array.prototype.forEach.call(projRows, function (row) {
       var nameEl = row.querySelector(".proj-name");
       var nameHit = !!(q && nameEl &&
         String(nameEl.textContent || "").toLowerCase().indexOf(q) >= 0);
       var slideHit = false;
       Array.prototype.forEach.call(row.querySelectorAll(".slide-row"), function (s) {
-        if (s.style.display !== "none") slideHit = true;
+        var hit = nameHit || rowMatches(s);
+        s.style.display = hit ? "" : "none";
+        if (hit) slideHit = true;
       });
       var show = !q || nameHit || slideHit;
       row.style.display = show ? "" : "none";
-      if (q && show && !nameHit && row.classList) row.classList.add("expanded");
+      if (show) projVisible += 1;
+      // 过滤时命中即展开：项目名命中要整组可见，切片命中要看到命中行
+      // （折叠体会把切片藏住；清空查询不回收用户手动折叠态）
+      if (q && show && row.classList) row.classList.add("expanded");
     });
+    // 项目区过滤反馈：有查询且没有可见项目行时显示「没有匹配的项目」，
+    // 不留只有「项目」标题的空白；真实空态（暂无项目）在过滤期间让位
+    var projList = els.projectList;
+    if (projList) {
+      var projEmpty = projList.querySelector(".proj-empty");
+      var projHint = projList.querySelector(".proj-filter-empty");
+      if (q && projVisible === 0) {
+        if (projEmpty) projEmpty.style.display = "none";
+        if (!projHint) {
+          projHint = document.createElement("div");
+          projHint.className = "proj-filter-empty";
+          projList.appendChild(projHint);
+        }
+        projHint.textContent = t("sb.search.empty.projects");
+      } else {
+        if (projEmpty) projEmpty.style.display = "";
+        if (projHint && projHint.parentNode) projHint.parentNode.removeChild(projHint);
+      }
+    }
   }
 
   // ---------- 移动端上下文动作条显隐 ----------
@@ -7825,11 +8028,10 @@
         sidebarCtrl.expandAndFocusSearch();
       });
     }
-    // 切片搜索：输入即过滤；条件保留在输入框里，侧栏收起/展开不丢失
-    if (els.slideSearch) {
-      els.slideSearch.addEventListener("input", function () {
-        applySlideFilter(this.value);
-      });
+    // 切片搜索（2026-09-22 重做）：点「搜索切片」才创建输入框；关闭即清空
+    // 过滤并移除输入框。查询保留在输入框里，侧栏收起/展开、列表重渲不丢失
+    if (els.slideSearchBtn) {
+      els.slideSearchBtn.addEventListener("click", openSlideSearch);
     }
 
     // 移动端 ⋯ 溢出面板（AI 读片 + 缩放徽章）；§3.3 宽度分组的统一折叠目标
@@ -8580,8 +8782,10 @@
       doc: document,
       onLayoutChange: syncViewerLayoutAfterSidebar,
       focusSearch: function () {
-        if (els.slideSearch && typeof els.slideSearch.focus === "function") {
-          try { els.slideSearch.focus(); } catch (e) { /* 忽略聚焦失败 */ }
+        // 2026-09-22 重做：搜索输入框按需创建，「选择切片」只展开侧栏、
+        // 不创建输入框；焦点落在「搜索切片」按钮（侧栏内首个入口）
+        if (els.slideSearchBtn && typeof els.slideSearchBtn.focus === "function") {
+          try { els.slideSearchBtn.focus(); } catch (e) { /* 忽略聚焦失败 */ }
         }
       },
     });
@@ -8710,6 +8914,8 @@
     } catch (e) {}
     // 升级 A：侧栏按钮文案/aria 随状态（展开↔收起）变化，切语言后重写
     try { if (sidebarCtrl) sidebarCtrl.refreshButton(); } catch (e) {}
+    // 切片搜索（按需创建）：动态控件文案/aria 随语言刷新
+    try { refreshSlideSearchTexts(); } catch (e) {}
     // §3.4：document.title 的产品名后缀随语言刷新（切片名不变）
     try {
       if (state.slide && state.slide.name) updateDocTitle(state.slide.alias || state.slide.name);

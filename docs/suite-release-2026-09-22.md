@@ -86,3 +86,24 @@ The register dialog subtitle「验证邮箱并提交申请，管理员审核通�
 is the R2 invite-mode copy and is inaccurate in public mode (email verify → set
 password → immediate account, no admin review). Candidate for the next
 evening deploy: make the subtitle mode-aware.
+
+## suite-20260922-2 (same day, follow-up hotfix)
+
+User authorized immediate deploy of the follow-up above. The register dialog
+subtitle is now mode-aware: public mode renders「验证邮箱并设置密码，即可开始
+使用。」(new bilingual i18n key `register.dialog.subtitle.public`); invite /
+email-verify-activation modes keep the original copy. Regression assertions
+added to `test_homepage_dialog_public_branch_has_agreements` (public pages must
+not contain the admin-review copy).
+
+| Component | Source revision | Production image |
+| --- | --- | --- |
+| PathTogether | `143afbf` | `localhost/pathtogether-demo:suite-20260922-2` (`823538cfaf9d`) |
+| HistoPilot service | unchanged | `localhost/histopilot-demo:suite-20260922-2` (re-tag) |
+
+Same procedure (fresh DB dump `backups/suite-20260922-2/`, staged-container
+config compare, cutover, both `/healthz` green). Post-cutover verified: `/`,
+`/login`, `/register` all render the new public subtitle with zero occurrences
+of the admin-review copy; both checkboxes intact; `public-status` open with
+5/5 remaining; `static/i18n.js` serves the new key. Rollback:
+`python3 ~/releases/suite-20260922-2/deploy.py rollback`.

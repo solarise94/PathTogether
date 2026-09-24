@@ -86,32 +86,83 @@ def issue_sts(
 ) -> Dict[str, object]:
     """Issue a single-key STS credential and return the JS-SDK-shaped dict.
 
-    Raises poc_config.ConfigError when external inputs are missing (no network
-    attempt is made) and lets the STS SDK's own errors propagate otherwise.
+    qcloud-python-sts 3.1.6's get_credential() fails on Python 3: it returns the
+    HMAC signature as bytes and omits Region unless the caller passed one.
+    This call uses the same legacy STS signature the SDK intends, with both
+    fixes, and never logs the temporary credential.
     """
     cfg.require_credentials()
-    from sts.sts import Sts  # qcloud-python-sts (pinned in requirements-poc.txt)
-
+    if not cfg.region:
+        raise poc_config.ConfigError("blocked_external_input: missing COS_POC_REGION")
     policy = render_policy(cfg, full_object_key)
-    sts = Sts({
-        "secret_id": cfg.secret_id,
-        "secret_key": cfg.secret_key,
-        "duration_seconds": int(duration_seconds),
-        "policy": policy,
-    })
-    raw = sts.get_credential()  # backward-compat lower-cased dict from the SDK
-    credentials = raw.get("credentials", {})
+    raw = _get_federation_token(cfg, policy, int(duration_seconds))
+    credentials = raw.get("Credentials") or {}
+    expired = raw.get("ExpiredTime")
+    start = expired - int(duration_seconds) if isinstance(expired, int) else None
+    token = credentials.get("Token")
     return {
-        "TmpSecretId": credentials.get("tmpSecretId"),
-        "TmpSecretKey": credentials.get("tmpSecretKey"),
-        "XCosSecurityToken": credentials.get("sessionToken"),
-        "SecurityToken": credentials.get("sessionToken"),
-        "StartTime": raw.get("startTime"),
-        "ExpiredTime": raw.get("expiredTime"),
-        # non-secret bookkeeping for evidence records:
+        "TmpSecretId": credentials.get("TmpSecretId"),
+        "TmpSecretKey": credentials.get("TmpSecretKey"),
+        "XCosSecurityToken": token,
+        "SecurityToken": token,
+        "StartTime": start,
+        "ExpiredTime": expired,
         "policy": policy,
-        "request_id": raw.get("requestId"),
+        "request_id": raw.get("RequestId"),
     }
+
+
+def _get_federation_token(
+    cfg: poc_config.PocConfig,
+    policy: dict,
+    duration_seconds: int,
+) -> Dict[str, object]:
+    """POST GetFederationToken. Returns the Response object or raises."""
+    import hashlib
+    import hmac
+    import base64
+    import json as _json
+    import random
+    import time
+    import urllib.parse
+    import urllib.request
+    from urllib.error import HTTPError
+
+    data = {
+        "SecretId": cfg.secret_id,
+        "Timestamp": int(time.time()),
+        "Nonce": random.randint(100000, 200000),
+        "Action": "GetFederationToken",
+        "Version": "2018-08-13",
+        "DurationSeconds": int(duration_seconds),
+        "Name": "cos-sts-poc",
+        "Policy": urllib.parse.quote(_json.dumps(policy, separators=(",", ":"))),
+        "Region": cfg.region,
+    }
+    source = "POSTsts.tencentcloudapi.com/?" + "&".join(
+        f"{key}={data[key]}" for key in sorted(data)
+    )
+    digest = hmac.new(
+        cfg.secret_key.encode("utf-8"), source.encode("utf-8"), hashlib.sha1
+    ).digest()
+    data["Signature"] = base64.b64encode(digest).decode("ascii")
+    body = urllib.parse.urlencode(data).encode("utf-8")
+    req = urllib.request.Request(
+        "https://sts.tencentcloudapi.com/", data=body, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = _json.loads(resp.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        raise RuntimeError(f"sts http {exc.code}: {detail}") from exc
+    response = payload.get("Response") or {}
+    error = response.get("Error")
+    if error:
+        code = error.get("Code") or "unknown"
+        message = (error.get("Message") or "")[:180]
+        raise RuntimeError(f"sts {code}: {message}")
+    return response
 
 
 def redacted_shape(credential: Dict[str, object]) -> Dict[str, object]:

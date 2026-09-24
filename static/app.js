@@ -59,6 +59,31 @@
     "upload.stage.done": { zh: "入库完成", en: "Completed" },
     "upload.stage.failed": { zh: "上传失败", en: "Upload failed" },
     "upload.err.conversion": { zh: "切片转换失败", en: "Slide conversion failed" },
+    // COS 直传 Phase 4（§5 阶段文案固定六段 + 稳定机器码；i18n.js 为主源，
+    // 此处兜底）。上传 100% ≠ 可查看，绝不合成全流程百分比
+    "upload.cos.toggle": { zh: "云端直传", en: "Cloud direct upload" },
+    "upload.cos.toggle.tip": { zh: "手动选择 COS 云端直传；可查看前还需服务器接收与校验", en: "Manual COS direct upload; the server still needs to receive and validate before viewing" },
+    "upload.cos.stage.waiting_space": { zh: "等待暂存空间", en: "Waiting for staging space" },
+    "upload.cos.stage.uploading": { zh: "正在上传", en: "Uploading" },
+    "upload.cos.stage.awaiting_server": { zh: "等待服务器接收", en: "Waiting for server" },
+    "upload.cos.stage.downloading": { zh: "服务器接收中", en: "Server downloading" },
+    "upload.cos.stage.validating": { zh: "正在校验", en: "Validating" },
+    "upload.cos.stage.readiness": { zh: "准备可查看", en: "Preparing to view" },
+    "upload.cos.stage.viewable": { zh: "可查看", en: "Viewable" },
+    "upload.cos.queue": { zh: "第 {n} 位", en: "position {n}" },
+    "upload.cos.cancel": { zh: "取消", en: "Cancel" },
+    "upload.cos.cancelled": { zh: "已取消", en: "Cancelled" },
+    "upload.cos.retry": { zh: "重试", en: "Retry" },
+    "upload.cos.retry_platform": { zh: "改用平台上传", en: "Retry with platform upload" },
+    "upload.cos.resume_hint": { zh: "上传未完成；重新选择同名文件可续传", en: "Upload unfinished; re-select the same file to resume" },
+    "upload.cos.resume_confirm": { zh: "检测到「{name}」有未完成的云端直传任务，续传已上传的分块？", en: "An unfinished cloud upload for \"{name}\" exists. Resume from the uploaded parts?" },
+    "upload.cos.err.exceeds_admission": { zh: "文件超过云端直传大小上限，请改用平台上传", en: "File exceeds the cloud direct-upload size limit; please use platform upload" },
+    "upload.cos.err.format_unsupported": { zh: "该格式暂不支持云端直传，请使用平台上传", en: "Format not supported for cloud direct upload; please use platform upload" },
+    "upload.cos.err.waiting_limit": { zh: "已有等待中的云端直传任务", en: "Another cloud upload is already waiting" },
+    "upload.cos.err.state": { zh: "任务状态冲突，请刷新页面后重试", en: "Job state conflict; please refresh and retry" },
+    "upload.cos.err.rate": { zh: "签名请求过于频繁，请稍后重试", en: "Signing rate limited; please retry later" },
+    "upload.cos.err.reconcile": { zh: "云端容量对账中，暂不可继续，请稍后重试", en: "Cloud capacity reconciliation in progress; retry later" },
+    "upload.cos.err.unavailable": { zh: "云端直传暂不可用，请使用平台上传", en: "Cloud direct upload unavailable; please use platform upload" },
     // 升级 C（§6.1）：矩形工具文案（i18n.js 为主源；此处兜底）
     "roi.rect.tip": { zh: "矩形工具：在视野中拖出矩形，或输入宽高后点击中心放置；拖内部平移、边/角调整大小；Escape 取消",
                       en: "Rectangle tool: drag in the view, or enter width/height then click to place; drag inside to move, edges/corners to resize; Escape cancels" },
@@ -72,14 +97,22 @@
     "edit.conflict": { zh: "该标注已被他人修改（当前 revision {rev}），已显示当前版本；请基于最新版本重新编辑",
                        en: "This annotation was modified by someone else (current revision {rev}); showing the current version — please re-edit on top of it" },
   };
-  function tt(key) {
+  function tt(key, vars) {
     try {
-      var s = window.HP_I18N && window.HP_I18N.t(key);
+      var s = window.HP_I18N && window.HP_I18N.t(key, vars);
       if (s && s !== key) return s;
     } catch (e) {}
     var lang = (window.HP_I18N && window.HP_I18N.getLang()) || "zh";
     var e = _EXTRA_I18N[key];
-    return (e && (e[lang] || e.zh)) || key;
+    var raw = (e && (e[lang] || e.zh)) || key;
+    // COS 直传引入：兜底文案同样支持 {n}/{name} 形参（照 i18n.js fmt 语义）；
+    // 不传 vars 的既有调用方不受影响
+    if (vars) {
+      raw = String(raw).replace(/\{(\w+)\}/g, function (_, k) {
+        return Object.prototype.hasOwnProperty.call(vars, k) ? String(vars[k]) : ("{" + k + "}");
+      });
+    }
+    return raw;
   }
 
   // ---------- 全局状态 ----------
@@ -6119,11 +6152,14 @@
     }
     return {
       // 三段状态：正在传输（confirmed_offset 为准）→ 服务端校验 → 入库完成
-      setStage: function (stageKey, frac) {
+      // note（可选，COS 直传引入）：阶段后的补充说明（如排队位置/续传提示），
+      // 既有调用方不传不受影响
+      setStage: function (stageKey, frac, note) {
         var label = tt(stageKey);
         if (frac !== undefined && frac !== null && isFinite(frac)) {
           label += " " + Math.round(frac * 100) + "%";
         }
+        if (note) { label += " · " + note; }
         statusEl.textContent = label;
         if (fallback) {
           // 旧模板回退：写入共用进度条（单文件场景行为与旧版一致）
@@ -6447,8 +6483,19 @@
     tick();
   }
 
-  function uploadFile(file) {
+  function uploadFile(file, opts) {
     if (!file) return;
+    opts = opts || {};
+    // COS 选路（Phase 4，manual_only）：只在任务开始前判一次（D8 开始后
+    // transport 冻结）。opts.platform 是用户点了「改用平台上传」的显式选择
+    // （COS 422 超上限后的全新平台任务），不是自动换路；不勾选/不可用/
+    // 不 eligible 一律照旧平台路径
+    if (!opts.platform && cosManual && cosUploadEligible(file)) {
+      var cosRow = makeUploadRow(file);
+      uploadFileCos(file, cosRow,
+        opts.cosRetry ? { resumeJobId: opts.cosRetry, skipConfirm: true } : null);
+      return;
+    }
     var row = makeUploadRow(file);
     if (shouldChunkUpload(file)) {
       uploadFileV2(file, row);
@@ -6506,6 +6553,621 @@
     xhr.setRequestHeader("X-CSRF-Token", csrfToken());
     xhr.send(formData);
   }
+
+  // =========================================================================
+  // COS 直传（Phase 4；docs/cos-direct-upload-audit-plan.md §5/§10 Phase 4、
+  // docs/upload-routing-open-source-review.md D3/D6/D7/D8/D10）
+  // 授权决议 A-presign-parts：浏览器只持有绑定 Content-Length 的 UploadPart
+  // 预签名 URL；Initiate/Complete/Abort 全在 worker。控制 API（创建/签名/
+  // 完成/取消）走 apiFetch（登录会话 + CSRF）；COS PUT 必须走独立传输——
+  // 裸 fetch + credentials:"omit"，绝不带平台 Cookie/CSRF（§5）。
+  // 选路 manual_only（校准规则 3）：默认关，用户勾选后才对 eligible 文件
+  // 走 COS，不按大小自动导流；任务开始后 transport 冻结（D8）——
+  // uploadFileCos 内部不回退平台路径，超上限只给「改用平台上传」显式按钮
+  //（用户明确选择的全新平台任务，不算自动换路）。
+  // =========================================================================
+  var COS_JOBS_KEY = "pt.cos.jobs";
+
+  function resolveCosConfig() {
+    // 仿 resolveUploadV2Threshold：唯一权威是 bootstrap.capabilities.cos_upload
+    //（app.py _cos_upload_capability_payload）。capability off 时只下发
+    // {available:false,...}——available 非 true 直接 null，前端不得因文件大
+    // 而自行启用 COS（§5）。缺字段/结构非法一律 null：宁可不走 COS，也不拿
+    // 坏参数拼请求（D3：十进制字节整数原样使用，前端不自算另一份上限）。
+    try {
+      var caps = window.HP_APP_BOOTSTRAP && window.HP_APP_BOOTSTRAP.capabilities;
+      var c = caps && caps.cos_upload;
+      if (!c || c.available !== true) return null;
+      var nums = {
+        max_size_bytes: Number(c.max_size_bytes),
+        part_bytes: Number(c.part_bytes),
+        url_ttl_seconds: Number(c.url_ttl_seconds),
+        max_concurrent_parts: Number(c.max_concurrent_parts),
+        sign_batch_max_parts: Number(c.sign_batch_max_parts),
+      };
+      for (var k in nums) {
+        if (typeof nums[k] !== "number" || !isFinite(nums[k]) || nums[k] <= 0) {
+          return null;
+        }
+      }
+      if (!Array.isArray(c.formats) || !c.formats.length) return null;
+      var fmts = [];
+      for (var i = 0; i < c.formats.length; i++) {
+        if (typeof c.formats[i] !== "string" || !c.formats[i]) return null;
+        fmts.push(c.formats[i].toLowerCase());
+      }
+      return {
+        max_size_bytes: nums.max_size_bytes,
+        part_bytes: nums.part_bytes,
+        url_ttl_seconds: nums.url_ttl_seconds,
+        // 并发/批量夹到合理上界：服务端值异常大时别把浏览器与签名速率打爆
+        max_concurrent_parts: Math.max(1, Math.min(16, Math.floor(nums.max_concurrent_parts))),
+        sign_batch_max_parts: Math.max(1, Math.min(64, Math.floor(nums.sign_batch_max_parts))),
+        formats: fmts,
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  var COS_UPLOAD_CONFIG = resolveCosConfig();
+
+  // manual_only 手动开关状态：仅存内存——刷新回到默认平台路径，不留
+  //「隐性开启」的自动导流状态（D6/D7：首期禁止按大小/繁忙自动切 COS）
+  var cosManual = false;
+
+  function cosUploadEligible(file) {
+    // D10：capability/格式白名单/大小在任务开始前一次判定。
+    // D11：首期 COS 只收原生单文件白名单；ZIP/MRXS 恒 V1——与
+    // shouldChunkUpload 同一例外双保险，即使服务端白名单误配也不放行。
+    if (!COS_UPLOAD_CONFIG) return false;
+    if (!file || typeof file.size !== "number") return false;
+    if (file.size <= 0 || file.size > COS_UPLOAD_CONFIG.max_size_bytes) return false;
+    var name = file.name || "";
+    var ext = name.slice(name.lastIndexOf(".") + 1).toLowerCase();
+    if (ext === "zip" || ext === "mrxs") return false;
+    return COS_UPLOAD_CONFIG.formats.indexOf(ext) >= 0;
+  }
+
+  // ---------- 刷新恢复（§5：只存非秘密 job id 与文件提示） ----------
+  // 签名 URL 短 TTL 且属凭证，绝不落 localStorage；隐私模式写入可能抛错。
+  function cosJobsRead() {
+    try {
+      var arr = JSON.parse(localStorage.getItem(COS_JOBS_KEY) || "[]");
+      if (!Array.isArray(arr)) return [];
+      return arr.filter(function (j) {
+        return j && typeof j.job_id === "string" && j.job_id &&
+          typeof j.filename === "string" && typeof j.size === "number" &&
+          Array.isArray(j.confirmed);
+      });
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function cosJobsWrite(jobs) {
+    try { localStorage.setItem(COS_JOBS_KEY, JSON.stringify(jobs)); }
+    catch (e) { /* localStorage 不可用（隐私模式）：仅失去刷新恢复 */ }
+  }
+
+  function cosJobSave(job) {
+    if (!job || !job.job_id) return;
+    var jobs = cosJobsRead().filter(function (j) { return j.job_id !== job.job_id; });
+    jobs.push({
+      job_id: job.job_id, filename: job.filename, size: job.size,
+      confirmed: (job.confirmed || []).slice().sort(function (a, b) { return a - b; }),
+    });
+    cosJobsWrite(jobs);
+  }
+
+  function cosJobRemove(jobId) {
+    if (!jobId) return;
+    cosJobsWrite(cosJobsRead().filter(function (j) { return j.job_id !== jobId; }));
+  }
+
+  function cosFindResumableJob(file) {
+    // 同名同大小才视为同一候选（§5：文件名/大小只是候选不是证明；真正的
+    // 字节核验在 worker ListParts，浏览器侧 ETag 仅提示）
+    var jobs = cosJobsRead();
+    for (var i = 0; i < jobs.length; i++) {
+      if (jobs[i].filename === (file && file.name) &&
+          jobs[i].size === (file && file.size)) {
+        return jobs[i];
+      }
+    }
+    return null;
+  }
+
+  // ---------- COS PUT 独立传输（§5/Phase 4-2） ----------
+  function cosPutPart(url, blob, abortCtl) {
+    // 绝不走 apiFetch/xhrSend——它们会注入 X-CSRF-Token（对 COS 是污染头，
+    // 还会触发不必要的 CORS 预检）。credentials:"omit" 显式不带平台 Cookie；
+    // mode:"cors" 走 COS 暴露的响应头读 ETag（仅提示，§3.1）。Content-Length
+    // 由浏览器按 body 自动设置（与签名绑定值一致），手动设置既多余又会被
+    // CORS 拒绝，因此这里不设任何请求头。
+    return fetch(url, {
+      method: "PUT",
+      body: blob,
+      mode: "cors",
+      credentials: "omit",
+      signal: abortCtl ? abortCtl.signal : undefined,
+    }).then(function (resp) {
+      var etag = null;
+      try {
+        etag = (resp.headers && resp.headers.get) ? resp.headers.get("ETag") : null;
+      } catch (e) { /* ETag 读不到不影响成功判定（仅提示） */ }
+      if (!resp.ok) throw { status: resp.status, etag: etag };
+      return { etag: etag };
+    });
+  }
+
+  // ---------- 稳定机器码 → 可读文案（照 uploadErrorMessage 的兜底模式） ----------
+  function cosErrorMessage(status, data) {
+    var code = (data && (data.code || data.error)) || "";
+    if (code === "cos_exceeds_admission") return tt("upload.cos.err.exceeds_admission");
+    if (code === "cos_format_unsupported") return tt("upload.cos.err.format_unsupported");
+    if (code === "cos_waiting_limit") return tt("upload.cos.err.waiting_limit");
+    if (code === "ingestion_state_conflict") return tt("upload.cos.err.state");
+    if (code === "cos_sign_rate_limited") return tt("upload.cos.err.rate");
+    if (code === "cos_capacity_reconcile_required") return tt("upload.cos.err.reconcile");
+    if (code === "name_unavailable") return tt("upload.err.name");
+    if (code === "invalid_declared_size") return tt("upload.err.size_mismatch");
+    if (code === "cos_unavailable") return tt("upload.cos.err.unavailable");
+    if (status === 403) return tt("upload.err.csrf");
+    // 未知码保留原文（排障需要机器码，不猜测语义）
+    return code || status || tt("upload.stage.failed");
+  }
+
+  // 阶段名 → 文案键（§5 固定六段 + terminal/未知兜底）
+  function cosStageKey(stage) {
+    var known = { waiting_space: 1, uploading: 1, awaiting_server: 1,
+                  downloading: 1, validating: 1, readiness: 1, viewable: 1 };
+    return known[stage] ? "upload.cos.stage." + stage : "upload.stage.failed";
+  }
+
+  function cosShowStage(row, b, noteOverride) {
+    // 阶段文案唯一入口：上传阶段百分比由分块确认驱动（调用方另设），
+    // 下载进度用服务端持久 checkpoint（downloaded_bytes/declared_size）——
+    // 上传 100% ≠ 可查看，绝不合成全流程百分比（§5）
+    var frac = null;
+    if (b && b.stage === "downloading" && typeof b.downloaded_bytes === "number" &&
+        typeof b.declared_size === "number" && b.declared_size > 0) {
+      frac = Math.min(b.downloaded_bytes / b.declared_size, 1);
+    }
+    var note = noteOverride || "";
+    if (!note && b && b.stage === "waiting_space" &&
+        typeof b.queue_position === "number") {
+      // 排队位置 0 基 → 人类序数；绝不显示预计时间（§6.1 不承诺 ETA）
+      note = tt("upload.cos.queue", { n: b.queue_position + 1 });
+    }
+    row.setStage(cosStageKey(b && b.stage), frac, note);
+  }
+
+  // COS 行操作按钮（取消/重试/改用平台上传）：现有上传行无按钮先例，
+  // 借 upload-item 的紧凑文本习惯用行内样式兜底（不改样式表）
+  function addRowButton(row, label, onClick) {
+    if (!row || !row._row || !row._row.appendChild) return null;
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "upload-item-btn";
+    btn.textContent = label;
+    btn.style.marginTop = "4px";
+    btn.style.fontSize = "11px";
+    btn.style.padding = "2px 8px";
+    btn.style.cursor = "pointer";
+    btn.addEventListener("click", function (e) {
+      if (e && e.preventDefault) e.preventDefault();
+      onClick(e);
+    });
+    row._row.appendChild(btn);
+    return btn;
+  }
+
+  // 服务端冻结计划 {part_number,length} → 前端切片表：编号排序后按顺序
+  // 累加推导 offset（worker 按同一顺序初始化，编号连续；计划不含 offset）
+  function cosBuildPlan(parts) {
+    var byNum = {};
+    var nums = [];
+    for (var i = 0; i < parts.length; i++) {
+      byNum[parts[i].part_number] = parts[i];
+      nums.push(parts[i].part_number);
+    }
+    nums.sort(function (a, b) { return a - b; });
+    var out = [];
+    var offset = 0;
+    for (var j = 0; j < nums.length; j++) {
+      var p = byNum[nums[j]];
+      out.push({ part_number: p.part_number, offset: offset, length: p.length });
+      offset += p.length;
+    }
+    return out;
+  }
+
+  function uploadFileCos(file, row, opts) {
+    opts = opts || {};
+    var cfg = COS_UPLOAD_CONFIG;   // 选路时已判可用（D8：进入即冻结为 COS）
+    var jobId = opts.resumeJobId || null;
+    var confirmedMap = {};         // part_number -> ETag|""（ETag 仅提示，§3.1）
+    var plan = null;               // [{part_number, offset, length}]
+    var totalConfirmed = 0;
+    var abortCtl = (typeof AbortController === "function") ? new AbortController() : null;
+    var stopped = false;           // 用户取消/行终结后停一切后续动作
+    var timerHandle = null;
+
+    // —— 取消（§4 cancel 幂等）：停轮询 + abort 在途 PUT + POST cancel ——
+    addRowButton(row, tt("upload.cos.cancel"), function () {
+      if (stopped) return;
+      stopped = true;
+      if (timerHandle) { clearTimeout(timerHandle); timerHandle = null; }
+      if (abortCtl) { try { abortCtl.abort(); } catch (e) {} }
+      cosJobRemove(jobId);
+      row.setStage("upload.cos.cancelled");
+      row.finish(10000);
+      if (jobId) {
+        // 网络失败也照常停 UI：服务端等待超时/容量调度器会兜底清理
+        apiFetch("/api/ingestions/" + encodeURIComponent(jobId) + "/cancel",
+                 { method: "POST" }).catch(function () {});
+      }
+    });
+
+    function delay(ms) {
+      // 所有等待统一走可 clearTimeout 的定时器：取消后不再推进状态机
+      return new Promise(function (resolve) {
+        timerHandle = setTimeout(function () { timerHandle = null; resolve(); }, ms);
+      });
+    }
+
+    function confirmedList() {
+      var out = [];
+      for (var k in confirmedMap) {
+        if (confirmedMap.hasOwnProperty(k)) out.push(parseInt(k, 10));
+      }
+      return out;
+    }
+
+    function confirmPart(n, etag) {
+      if (confirmedMap.hasOwnProperty(n)) return;
+      confirmedMap[n] = etag || "";
+      totalConfirmed++;
+      // 进度 = 已确认分块/总块数：只代表上传阶段（§5），重试不重复计数
+      if (plan && plan.length) {
+        row.setStage("upload.cos.stage.uploading", totalConfirmed / plan.length);
+      }
+      cosJobSave({ job_id: jobId, filename: file.name, size: file.size,
+                   confirmed: confirmedList() });
+    }
+
+    function loadConfirmedFromStorage() {
+      // 续传起点以本地记录为准（编号即已确认；worker ListParts 才是权威，
+      // 多传的分块只是同编号覆盖，绑定长度保证不越界——resume 语义）
+      var jobs = cosJobsRead().filter(function (j) { return j.job_id === jobId; });
+      var saved = jobs.length ? jobs[0] : null;
+      (saved && saved.confirmed || []).forEach(function (n) {
+        if (!confirmedMap.hasOwnProperty(n)) {
+          confirmedMap[n] = "";
+          totalConfirmed++;
+        }
+      });
+    }
+
+    function fetchStatus() {
+      return apiFetch("/api/ingestions/" + encodeURIComponent(jobId)).then(jsonBody);
+    }
+
+    function drive() {
+      // 统一状态机：waiting_space(5s 轮询) → uploading(拿计划传分块) →
+      // upload-complete → 服务端阶段(2s 轮询) → viewable/terminal
+      return fetchStatus().then(function (res) {
+        if (stopped) throw { cancelled: true };
+        if (!res.ok) throw { status: res.status, data: res.body };
+        var b = res.body || {};
+        var st = b.stage;
+        if (st === "waiting_space") {
+          cosShowStage(row, b);
+          return delay(5000).then(drive);   // 等待期间可取消（行上按钮）
+        }
+        if (st === "uploading") {
+          if (b.parts && b.parts.length) {
+            plan = cosBuildPlan(b.parts);
+            return uploadPendingParts();
+          }
+          // preparing：worker 尚未初始化 multipart（无分块计划）→ 短间隔再查
+          row.setStage("upload.cos.stage.uploading", 0);
+          return delay(2000).then(drive);
+        }
+        if (st === "awaiting_server" || st === "downloading" ||
+            st === "validating" || st === "readiness" || st === "viewable") {
+          if (st === "viewable") return succeed(b);
+          cosShowStage(row, b);
+          return delay(2000).then(drive);
+        }
+        if (st === "terminal") {
+          cosJobRemove(jobId);   // 等待超时/过期/失败：终态任务不再恢复
+          throw { terminal: true, data: b };
+        }
+        return delay(2000).then(drive);   // 未知 stage：以服务端为准再查
+      });
+    }
+
+    function signBatch(parts) {
+      // 按 sign_batch_max_parts 分批申请绑定长度的 UploadPart URL（A 合同
+      // 唯一授权接口）；429/503 退避重试同一批（同 uploadId 续签幂等）
+      var attempt = 0;
+      function go() {
+        attempt++;
+        return apiFetch("/api/ingestions/" + encodeURIComponent(jobId) + "/parts/sign", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            part_numbers: parts.map(function (p) { return p.part_number; }),
+          }),
+        }).then(jsonBody).then(function (res) {
+          if (res.ok && res.body && Array.isArray(res.body.urls)) {
+            var byNum = {};
+            res.body.urls.forEach(function (u) { byNum[u.part_number] = u; });
+            return parts.map(function (p) {
+              return { part: p, url: byNum[p.part_number] && byNum[p.part_number].url };
+            });
+          }
+          if ((res.status === 429 || res.status === 503) && attempt < 4) {
+            return delay(3000).then(go);
+          }
+          throw { status: res.status, data: res.body };
+        });
+      }
+      return go();
+    }
+
+    function putPartRobust(item, freshUrl) {
+      // 单片容错：同 URL 重试 ≤3 → 重新签名一次（短 TTL URL 可能过期/损坏）
+      // → 新 URL 再试 ≤3 → 仍失败抛给行级失败（confirmed 保留，可续传重试）
+      var url = freshUrl || item.url;
+      var attempt = 0;
+      function go() {
+        if (stopped) return Promise.reject({ cancelled: true });
+        attempt++;
+        if (!url) return Promise.reject({ status: 0, data: null });
+        return cosPutPart(url, file.slice(item.part.offset,
+                                          item.part.offset + item.part.length), abortCtl)
+          .then(function (r) { confirmPart(item.part.part_number, r.etag); })
+          .catch(function (err) {
+            if (stopped || (err && err.name === "AbortError")) {
+              return Promise.reject({ cancelled: true });
+            }
+            if (attempt < 3) return delay(600).then(go);
+            if (!freshUrl) {
+              return signBatch([item.part]).then(function (signed) {
+                return putPartRobust(item, signed[0] && signed[0].url);
+              });
+            }
+            throw { part: item.part.part_number, status: err && err.status,
+                    network: err instanceof TypeError };
+          });
+      }
+      return go();
+    }
+
+    function uploadPendingParts() {
+      // pending = 计划编号 − 已确认（服务端计划是权威；本地 confirmed 只用于
+      // 跳过，误判多传的分块会被同编号覆盖且长度受签名约束）
+      var pending = plan.filter(function (p) {
+        return !confirmedMap.hasOwnProperty(p.part_number);
+      });
+      var i = 0;
+      function nextBatch() {
+        if (stopped) return Promise.reject({ cancelled: true });
+        var batch = pending.slice(i, i + cfg.sign_batch_max_parts);
+        i += batch.length;
+        if (!batch.length) return requestComplete();
+        return signBatch(batch).then(function (signed) {
+          // 批内并发 max_concurrent_parts（默认 3）：签名批与并发解耦
+          var conc = cfg.max_concurrent_parts || 3;
+          var next = 0;
+          function lane() {
+            if (next >= signed.length) return Promise.resolve();
+            var item = signed[next++];
+            return putPartRobust(item).then(lane);
+          }
+          var lanes = [];
+          for (var k = 0; k < Math.min(conc, signed.length); k++) lanes.push(lane());
+          return Promise.all(lanes).then(nextBatch);
+        });
+      }
+      if (!pending.length) return requestComplete();
+      row.setStage("upload.cos.stage.uploading",
+        totalConfirmed / plan.length);
+      return nextBatch();
+    }
+
+    var completePosts = 0;   // upload-complete 回放计数（限速热循环）
+
+    function requestComplete() {
+      // 全部 confirmed → 幂等记录「浏览器侧完成」；409 状态冲突视为已完成过
+      //（服务端状态是唯一权威，直接转入阶段轮询）。重复回放（complete 后
+      // 状态仍停在 uploading，如 worker 尚未处理完成请求）做限速重放，避免
+      // 无延时的热循环打爆控制 API
+      function send() {
+        completePosts++;
+        return apiFetch("/api/ingestions/" + encodeURIComponent(jobId) +
+                        "/upload-complete", { method: "POST" })
+          .then(jsonBody)
+          .then(function (res) {
+            if (res.ok || (res.status === 409 && res.body &&
+                           res.body.code === "ingestion_state_conflict")) {
+              return drive();
+            }
+            throw { status: res.status, data: res.body };
+          });
+      }
+      if (completePosts > 0) return delay(1500).then(send);
+      return send();
+    }
+
+    function succeed(b) {
+      // viewable：照 V2 commit 后的跳转习惯（完成 → 刷新列表 → 关联 → 打开）
+      cosJobRemove(jobId);
+      var name = b.slide || file.name;
+      row.setStage("upload.stage.done");
+      row.finish();
+      toast(t("upload.done", { name: name }), "success");
+      loadAll();
+      importAssociateUploaded(name);
+      openSlide(name);
+    }
+
+    Promise.resolve().then(function () {
+      if (jobId) return;   // 显式续传（重试按钮）：跳过询问直接进状态机
+      // 同名同大小未完任务 → 询问后续传（§5）；用户拒绝 = 换新任务语义，
+      // 按 D8 先取消旧任务再全新创建（不双占、不静默复用）
+      var prev = cosFindResumableJob(file);
+      if (!prev) return;
+      var doResume = opts.skipConfirm ||
+        window.confirm(tt("upload.cos.resume_confirm", { name: file.name }));
+      if (doResume) {
+        jobId = prev.job_id;
+        return;
+      }
+      var cancelPrev = apiFetch(
+        "/api/ingestions/" + encodeURIComponent(prev.job_id) + "/cancel",
+        { method: "POST" });
+      return cancelPrev.then(function () {
+        cosJobRemove(prev.job_id);
+      }, function () {
+        cosJobRemove(prev.job_id);
+      });
+    }).then(function () {
+      if (jobId) { loadConfirmedFromStorage(); return; }
+      return apiFetch("/api/ingestions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename: file.name, declared_size: file.size }),
+      }).then(jsonBody).then(function (res) {
+        if (res.ok && res.body && res.body.job_id) {
+          jobId = res.body.job_id;
+          cosJobSave({ job_id: jobId, filename: file.name, size: file.size,
+                       confirmed: [] });
+          // 创建响应自带初始阶段（waiting_capacity/preparing）：先照实展示
+          if (res.body.stage) cosShowStage(row, res.body);
+          return;
+        }
+        throw { status: res.status, data: res.body };   // 422/409 → 稳定码映射
+      });
+    }).then(function () {
+      return drive();
+    }).catch(function (err) {
+      if (stopped || (err && err.cancelled)) return;
+      var code = err && err.data && (err.data.code || err.data.error);
+      var msg;
+      if (err && err.terminal) {
+        msg = cosErrorMessage(0, { code: (err.data && err.data.fail_code) || "" });
+      } else if (err instanceof TypeError || (err && err.network)) {
+        // 网络层失败：任务与已确认分块保留，重选同名文件可续传（§5）
+        msg = tt("upload.cos.resume_hint");
+      } else {
+        msg = cosErrorMessage(err && err.status, err && err.data);
+      }
+      row.markError();
+      row.setStage("upload.stage.failed");
+      if (code === "cos_exceeds_admission") {
+        // §6.1：说明超限 + 显式「改用平台上传」（用户明确选择，非自动换路；
+        // 平台路径仍受 V2/legacy 自身校验约束，不承诺必然接收）
+        addRowButton(row, tt("upload.cos.retry_platform"), function () {
+          uploadFile(file, { platform: true });
+        });
+      } else if (err && typeof err.part === "number") {
+        // 分块最终失败：从 confirmed 续传（服务端计划仍在，跳过已确认块）
+        addRowButton(row, tt("upload.cos.retry"), function () {
+          uploadFile(file, { cosRetry: jobId });
+        });
+      }
+      row.finish(10000);
+      toast(t("upload.fail", { e: msg }), "error");
+    });
+  }
+
+  // ---------- 启动：手动开关渲染 + 未完任务只读恢复 ----------
+  function initCosUploadUi() {
+    // capability 可用才渲染开关（§5：off 时前端零 COS 痕迹，不因文件大
+    // 走 COS）。开关放在上传进度行容器正上方（侧栏上传入口旁），沿用
+    // upload-item 的 11px 紧凑文字习惯——不改模板与样式表。
+    restoreCosJobs();
+    if (!COS_UPLOAD_CONFIG) return;
+    var host = els.uploadProgressList;
+    if (!host || !host.parentNode ||
+        typeof host.parentNode.insertBefore !== "function") return;
+    var label = document.createElement("label");
+    label.className = "cos-manual-toggle";
+    label.title = tt("upload.cos.toggle.tip");
+    var cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = cosManual;
+    var span = document.createElement("span");
+    span.textContent = tt("upload.cos.toggle");
+    label.style.display = "flex";
+    label.style.alignItems = "center";
+    label.style.gap = "6px";
+    label.style.margin = "6px 0 0";
+    label.style.fontSize = "11px";
+    label.style.cursor = "pointer";
+    cb.addEventListener("change", function () { cosManual = !!cb.checked; });
+    label.appendChild(cb);
+    label.appendChild(span);
+    host.parentNode.insertBefore(label, host);
+  }
+
+  function restoreCosJobs() {
+    // 刷新恢复（§5）：未终态任务显示只读进度行继续轮询（浏览器没有文件
+    // 句柄，不能替用户续传分块）；uploading 未完成 → 提示重选同名文件续传。
+    // 查询失败保留记录，下次启动再试；终态/已可查看/查无此任务即清理。
+    cosJobsRead().forEach(function (j) {
+      pollRestoredRow(j);
+    });
+  }
+
+  function pollRestoredRow(job) {
+    var done = false;
+    var row = null;
+    function ensureRow() {
+      if (!row) row = makeUploadRow({ name: job.filename, size: job.size });
+      return row;
+    }
+    function tick() {
+      apiFetch("/api/ingestions/" + encodeURIComponent(job.job_id))
+        .then(jsonBody)
+        .then(function (res) {
+          if (done) return;
+          var b = res.ok ? res.body : null;
+          var st = b && b.stage;
+          if (!st) { setTimeout(tick, 5000); return; }
+          if (st === "viewable") {
+            done = true;
+            cosJobRemove(job.job_id);
+            var r0 = ensureRow();
+            r0.setStage("upload.stage.done");
+            r0.finish();
+            toast(t("upload.done", { name: b.slide || job.filename }), "success");
+            loadAll();
+            return;
+          }
+          if (st === "terminal") {
+            done = true;
+            cosJobRemove(job.job_id);
+            var r1 = ensureRow();
+            r1.markError();
+            r1.setStage("upload.stage.failed");
+            r1.finish(10000);
+            return;
+          }
+          var note = (st === "uploading") ? tt("upload.cos.resume_hint") : "";
+          cosShowStage(ensureRow(), b, note);
+          setTimeout(tick, 3000);
+        })
+        .catch(function () {
+          if (!done) setTimeout(tick, 5000);
+        });
+    }
+    tick();
+  }
   // 供测试（tests/js/*.test.ts loadApp harness）驱动真实上传路径；
   // 与 HP_AUTH 同风格的命名空间导出，不进业务调用面
   window.HP_UPLOAD = {
@@ -6515,6 +7177,15 @@
     UPLOAD_V2_THRESHOLD: UPLOAD_V2_THRESHOLD,
     // W4/R5：转换轮询（观察超时不判失败；401/403/404 分级处理）
     pollConversionJob: pollConversionJob,
+    // COS 直传 Phase 4（测试入口：真实路由/状态机/独立传输的驱动面）
+    cosUploadEligible: cosUploadEligible,
+    uploadFileCos: uploadFileCos,
+    resolveCosConfig: resolveCosConfig,
+    cosStageKey: cosStageKey,
+    setCosManual: function (on) { cosManual = !!on; },
+    isCosManual: function () { return cosManual; },
+    initCosUploadUi: initCosUploadUi,
+    restoreCosJobs: restoreCosJobs,
   };
   // 供测试（升级 A）：侧栏开合控制器与偏好存取的真实逻辑入口
   window.HP_SIDEBAR = {
@@ -8829,6 +9500,9 @@
     // §3.3 宽度断点分组：先于首次布局执行（把折叠档的节点搬入 ⋯ 菜单）
     initToolbarTier();
     setupDragDrop();
+    // COS 直传 Phase 4：capability 可用时渲染手动开关，并恢复未完任务的
+    // 只读进度行（off 时均为无操作，上传管线行为不变）
+    initCosUploadUi();
     initAuth();
     // P3 研究采集装配（capabilities.research_collection 开启才工作）
     initResearchTelemetry();

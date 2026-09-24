@@ -173,6 +173,29 @@ case "$_cv_worker" in
 esac
 
 # ---------------------------------------------------------------------------
+# COS 直传摄取 worker（Phase 2，docs/cos-direct-upload-audit-plan.md §10）：
+# ingestion_jobs 排水（核对/合并/版本化下载/本地入库/readiness/清理/对账）。
+# 默认关闭：COS capability 未上线（§8 off），避免生产无谓空转噪声；
+# COS 部署时随 env 开启（COS_INGEST_WORKER=1 且配置 bucket/region/secret）。
+# ---------------------------------------------------------------------------
+_cos_worker="$(printf '%s' "${COS_INGEST_WORKER:-0}" | tr '[:upper:]' '[:lower:]')"
+case "$_cos_worker" in
+  1|true|yes|on)
+    echo "[entry] starting cos_ingest_worker --loop"
+    (
+      while :; do
+        python3 /app/cos_ingest_worker.py --loop || true
+        echo "[entry] cos_ingest_worker exited, restart in 2s" >&2
+        sleep 2
+      done
+    ) &
+    ;;
+  *)
+    echo "[entry] COS_INGEST_WORKER=$_cos_worker, skip cos-ingest worker"
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
 # 百度分享导入 worker：枚举 + 转存/下载批次。默认关闭（真实外部动作
 # 需显式 BAIDU_ENUMERATION_ENABLED / BAIDU_IMPORT_ENABLED）。
 # BAIDU_IMPORT_WORKER=1/true 才拉起；缺省 skip。

@@ -285,6 +285,9 @@ def test_schema_migrations_recorded(conn):
         # 阻断语义 completed 之外一律唯一，与 UNRESOLVED_DELETION_JOBS_SQL
         # 对齐）。
         "0065_research_deletion_unique_unresolved.sql",
+        # 0066 起：COS 直传摄取（ingestion_jobs/ingestion_events/cos_pool_state，
+        # docs/cos-direct-upload-audit-plan.md §10 Phase 1）
+        "0066_ingestion_jobs_cos_pool.sql",
     ]
 
 

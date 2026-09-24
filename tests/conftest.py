@@ -123,6 +123,9 @@ _BUSINESS_TABLES = (
     # 0017 起：Upload V2 分片任务（无 users 外键——owner_user_id 允许空，
     # 不随 users CASCADE 清空，必须显式列出，否则跨用例残留串数据）
     "upload_tasks",
+    # 0066 起：COS 直传摄取任务/事件/池账本（无 users 外键；池行随
+    # TRUNCATE 清掉后由 ingestion 测试夹具 ensure_pool_state 重建）
+    "ingestion_jobs", "ingestion_events", "cos_pool_state",
     # 0034 起：切片可见性显式授权（owner 读隔离的直授表；无外键，显式
     # 列出防跨用例残留授权）
     "slide_view_grants",

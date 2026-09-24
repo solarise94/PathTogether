@@ -16,6 +16,7 @@ COPY project_idempotency_store.py project_create_http.py conversion_http.py ./
 COPY baidu_share_parser.py baidu_adapter.py baidu_import_store.py baidu_import_http.py baidu_ingest.py ./
 COPY test_application_store.py ./
 COPY agreement_store.py research_consent_store.py research_store.py research_deletion_worker.py legal_render.py ./
+COPY cos_config.py cos_client.py cos_pool_store.py ingestion_store.py cos_ingest_worker.py ./
 COPY legal_docs/ legal_docs/
 COPY kfb/ kfb/
 COPY migrations/ migrations/

@@ -136,3 +136,16 @@ PoC 需要两条 origin：本地 dev 页面 `http://127.0.0.1:8765`（serve_poc.
 | 3. 生命周期（poc/ 前缀） | ☐ | | |
 | 4. 用量/账单入口 | ☐ | | |
 | 5. PoC 凭证 | ☐ | | 建立时间；吊销时间事后补 |
+
+### 2026-09-25 回填与待办（Agent 侧已核部分）
+
+操作者已执行并经 Agent 复核的项目（evidence cos-20260924.md）：
+
+- **1. 版本控制：已开启**（§7 探针 PUT 返回 x-cos-version-id，按 versionId HEAD/DELETE 均通过）。开启时间未记录——请在行内补填控制台显示的开启时间。
+- **2. CORS：已配置**（§9：四个 origin——`http://127.0.0.1:8765` 与三个生产 origin 的 PUT 预检 + ETag 暴露均 200）。
+- **5. PoC 凭证：已建立**（`PathTogether/.env.cos-poc`，600，git 排除）。**尚未吊销**——产品化继续使用，Phase 0 费用核对完成后吊销并记录时间。
+
+Agent 无法代查、仍需操作者在控制台执行的项目（PoC 子账号 API 尝试已记录：GetBucketVersioning/CORS/Lifecycle 均 403 AccessDenied，GetBucketLocation 200，见 evidence §10.3）：
+
+- [ ] **3. 生命周期（§4 表第 3 行）**：确认 `poc/` 前缀（及将来的 `incoming/` 前缀）的过期天数与"删除碎片/未完成 multipart 自动清理"规则的实际配置值，回填上行；该规则仅作 7 天兜底，不是 10 GB 实时控制器（合同 §6.2）。
+- [ ] **4. 用量/账单（§4 表）**：按 evidence §10.4 的用量账本（上行约 2.4 GB、外网下行约 0.8 GB、无驻留存储）核对控制台用量统计与账单明细，回填实际计费数字；差异过大先查非 PoC 写入来源。

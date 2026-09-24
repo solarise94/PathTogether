@@ -25,8 +25,10 @@ from typing import Dict, Mapping, Optional, Tuple
 
 def cam_safe_url_encode(value: str) -> str:
     """URL-encode exactly like the official SDKs ('cam' safe encoding)."""
+    # safe="" so '/' becomes %2F. encodeURIComponent encodes slashes; the default
+    # quote() safe set keeps them, which breaks prefix/query signatures.
     return (
-        urllib.parse.quote(str(value), encoding="utf-8")
+        urllib.parse.quote(str(value), safe="", encoding="utf-8")
         .replace("!", "%21")
         .replace("'", "%27")
         .replace("(", "%28")
@@ -77,7 +79,8 @@ def sign_params(
     `headers` here are ONLY the headers bound into the signature
     (q-header-list). Everything not listed is not covered by the signature.
     """
-    method = method.upper()
+    # COS 签名串里的 method 必须小写（官方算法文档 HTTPMethod）；线上请求仍发大写。
+    method = method.lower()
     query = dict(query or {})
     headers = dict(headers or {})
     now = int(time.time()) if now is None else now

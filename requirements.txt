@@ -15,3 +15,7 @@ cryptography
 # Stage 3b：PostgreSQL 运行期驱动（唯一存储，决策 #8）。dispatcher 默认仍走 json，
 # postgres/dual 后端接入在 3b-2；本节点先落地基建依赖。
 psycopg[binary]>=3.2
+# COS 直传（A-presign-parts）：官方服务端 SDK——预签名/multipart/分页/版本/对象
+# 读写均走官方实现，项目仅做薄适配（docs/upload-routing-open-source-review.md
+# §3 组件复用原则 2026-09-25：PoC 手写签名只用于实验，生产不自研签名算法）。
+cos-python-sdk-v5>=1.9.44

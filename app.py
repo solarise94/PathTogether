@@ -123,6 +123,14 @@ import spend_store
 import crop_guard
 import upload_guard
 import upload_task_store
+# COS direct upload (Phase 1–3, contract docs/cos-direct-upload-audit-plan.md, ruling
+# A-presign-parts): cos_config/cos_pool_store/ingestion_store are pure data-layer + state machine;
+# cos_client has only presign_upload_part in this file (purely local computation, no network) —— network
+# calls are done exclusively by the independent worker cos_ingest_worker.py. capability is off by default.
+import cos_client
+import cos_config
+import cos_pool_store
+import ingestion_store
 # SER-8 测试申请（wip/ser8-dev）：已验证待激活用户申请测试资格 + owner 审核
 # 原子激活（含默认额度 provisioning）。test_application_store 提供
 # submit/get/list_applications/review 原语（PostgreSQL 唯一后端，0054；
@@ -2564,7 +2572,47 @@ def _app_capabilities(mode):
         # 上传修复 A1：V2 分片路由阈值（非敏感，随 bootstrap 下发；前端解析
         # 失败回落同值。ZIP/MRXS 例外不随此值变化）
         "upload_v2_threshold_bytes": int(UPLOAD_V2_THRESHOLD_BYTES),
+        # COS 直传（Phase 3；capability 默认 off——四项门禁未过前恒不可用，
+        # 合同 §1/§8）。非敏感参数随 bootstrap 下发；不含 bucket 名/endpoint
+        # 之外的任何秘密（endpoint 本身是公开 COS 域名）。manual_only：校准
+        # 结论（COS→服务器不稳且不快于平台路径）→ 首期只允许用户手动选路，
+        # 不做按大小自动导流（分流文档校准规则 3）。
+        "cos_upload": _cos_upload_capability_payload(demo),
     }
+
+
+#: 首期 COS 直传格式白名单（D11：原生单文件；ZIP/MRXS 强制 V1、KFB 未验收
+#: 禁止 COS——与 SUPPORTED_EXTS 的差异是有意的，不回退到后者）。
+_COS_NATIVE_EXTS = frozenset(
+    {"svs", "tif", "tiff", "ndpi", "vms", "vmu", "scn", "bif", "svslide"})
+
+
+def _cos_upload_capability_payload(demo):
+    """COS 直传 capability 下发（off 时零 DB 查询，静态不可用）。"""
+    payload = {"available": False, "manual_only": True,
+               "formats": sorted(_COS_NATIVE_EXTS)}
+    if demo or cos_config.COS_UPLOAD_CAPABILITY not in ("off", "internal", "on"):
+        return payload
+    _sid, _skey, ok = cos_config.cos_credentials()
+    if not ok or not cos_config.capability_available_for(
+            current_identity()["role"], ok):
+        return payload
+    try:
+        pool = cos_pool_store.get_pool_state()
+    except Exception:
+        return payload
+    if pool is None or cos_pool_store.admission_paused(pool):
+        return payload
+    payload.update({
+        "available": True,
+        "max_size_bytes": int(cos_pool_store.admission_limit_bytes(pool)),
+        "part_bytes": int(cos_config.COS_PART_BYTES),
+        "url_ttl_seconds": int(cos_config.COS_PART_URL_TTL_SECONDS),
+        "max_concurrent_parts": int(cos_config.COS_UPLOAD_PART_CONCURRENCY),
+        "sign_batch_max_parts": int(cos_config.COS_SIGN_BATCH_MAX_PARTS),
+        "policy_version": "v1-manual",
+    })
+    return payload
 
 
 # Sample Annotator 示例插件目录（Stage 5-2，plugins/sample-annotator/）。
@@ -2682,6 +2730,44 @@ def sample_plugin_context():
 # --------------------------------------------------------------------------- #
 # 路由
 # --------------------------------------------------------------------------- #
+#: COS 直传 Phase 0 门禁（docs/evidence/cos-20260924.md §9.5-1）：获准的发布
+#: 路径经 ``CSP_EXTRA_CONNECT_SRC`` 向 entry 页（/、/login、/register）CSP 的
+#: connect-src 追加**精确** ``https://host[:port]`` 源（空格或逗号分隔）。
+#: 只追加受控源，cos capability 开关与本变量无关；不设置（默认）时 CSP 逐字节
+#: 不变。admin 宿主页 / admin 插件 CSP 永不放行 COS——管理面不发起直传。
+_CSP_EXTRA_CONNECT_SRC_ENV = "CSP_EXTRA_CONNECT_SRC"
+_CSP_CONNECT_SOURCE_RE = re.compile(r"https://[A-Za-z0-9.-]+(?::([0-9]{1,5}))?")
+
+
+def _parse_csp_extra_connect_sources(raw):
+    """解析 CSP_EXTRA_CONNECT_SRC，返回按序去重的源表达式元组。
+
+    只接受精确 https://host[:port]：拒绝通配符、路径、query、fragment、
+    非 https scheme 与 ``*``——通配或 http 源会放大 connect-src 授权面，
+    与「仅放行测试桶 endpoint」的门禁语义冲突。非法输入 ValueError，由
+    import 期 fail-fast（配置错误的放行宁可拒启也不能静默忽略后误以为已放行）。
+    """
+    tokens = [t for t in re.split(r"[\s,]+", (raw or "").strip()) if t]
+    sources = []
+    for t in tokens:
+        m = _CSP_CONNECT_SOURCE_RE.fullmatch(t)
+        if not m or (m.group(1) is not None
+                     and not 1 <= int(m.group(1)) <= 65535):
+            raise ValueError(
+                "CSP_EXTRA_CONNECT_SRC 含非法源表达式 %r（只接受精确 "
+                "https://host[:port]，不允许通配/路径/http）" % t)
+        if t not in sources:
+            sources.append(t)
+    return tuple(sources)
+
+
+try:
+    CSP_EXTRA_CONNECT_SOURCES = _parse_csp_extra_connect_sources(
+        os.environ.get(_CSP_EXTRA_CONNECT_SRC_ENV))
+except ValueError as _csp_exc:
+    raise SystemExit("[startup] %s" % _csp_exc)
+
+
 def _apply_landing_security_headers(resp):
     """公开介绍页：禁止中间缓存、禁止被嵌入；无 inline script/style，CSP 不放 'unsafe-inline'。"""
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
@@ -2691,7 +2777,8 @@ def _apply_landing_security_headers(resp):
     resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     resp.headers["Content-Security-Policy"] = (
         "default-src 'none'; script-src 'self'; style-src 'self'; "
-        "img-src 'self' data:; font-src 'self'; connect-src 'self'; "
+        "img-src 'self' data:; font-src 'self'; connect-src 'self'"
+        + "".join(" " + s for s in CSP_EXTRA_CONNECT_SOURCES) + "; "
         "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
     )
     return resp
@@ -3838,7 +3925,7 @@ def api_account_email_change_start():
     try:
         result = identity_store.enqueue_email_change(
             uid, new_email,
-            base_url=(os.environ.get("PUBLIC_BASE_URL") or "").strip())
+            base_url=_registration_email_base_url())
     except identity_store.EmailChangeError as exc:
         if exc.code == "bad_input":
             return jsonify(error="请输入有效的邮箱地址",
@@ -4180,7 +4267,7 @@ def _register_email_verify_post(ip_hash):
     email = (request.form.get("email") or "").strip()
     try:
         registration_store.enqueue_email_verification(
-            email, base_url=(os.environ.get("PUBLIC_BASE_URL") or "").strip())
+            email, base_url=_registration_email_base_url())
     except registration_store.EmailVerifyError as exc:
         if exc.code == "bad_input":
             # 本地形状错误可回显（与 invite_only 表单校验同口径；不泄露
@@ -4229,6 +4316,28 @@ def _public_register_agreements_context():
     return ctx
 
 
+# 注册入口与访问统计的 request_host 使用同一请求 Host。这里只允许产品明确
+# 开放的两个公网入口，绝不把任意 Host 头反射进验证邮件；其它 Host（本地开发、
+# 测试或内部代理）继续回退到部署配置 PUBLIC_BASE_URL。
+_REGISTRATION_EMAIL_ENTRY_ORIGINS = {
+    "histopilot.com": "https://HistoPilot.com",
+    "pt.solarise94.fun": "https://pt.solarise94.fun",
+}
+
+
+def _registration_email_base_url():
+    """按本次注册入口选择验证邮件 origin；未知 Host 安全回退 canonical 配置。"""
+    raw_host = (request.host or "").strip()
+    try:
+        hostname = (urlparse("//" + raw_host).hostname or "").lower().rstrip(".")
+    except ValueError:
+        hostname = ""
+    selected = _REGISTRATION_EMAIL_ENTRY_ORIGINS.get(hostname)
+    if selected:
+        return selected
+    return (os.environ.get("PUBLIC_BASE_URL") or "").strip()
+
+
 def _register_public_post(ip_hash):
     """public 的 POST：邮箱 + 双协议选择 → 验证邮件 + intent（§3.3.1）。
 
@@ -4262,7 +4371,7 @@ def _register_public_post(ip_hash):
                 request.form.get("research_version") or "").strip(),
             research_sha256=(
                 request.form.get("research_sha256") or "").strip(),
-            base_url=(os.environ.get("PUBLIC_BASE_URL") or "").strip())
+            base_url=_registration_email_base_url())
     except registration_store.PublicRegistrationError as exc:
         if exc.code in ("terms_required", "research_document_required"):
             return _register_form_error(
@@ -4405,10 +4514,9 @@ def _public_verify_page_context(intent):
     - terms_changed / research_changed：当前 published 版本/hash 与 intent
       不一致（实质变化、缺有效证明或已下架）→ 最终页重新提供对应
       checkbox，不使用「继续访问视为同意」（§3.3.4）；
-    - 研究可选项的勾选初值 = intent.research_opt_in **且** research_changed
-      为假（展示用户此前主动做出的选择，允许修改；§3.3.3）；协议实质变化
-      时不预勾选，必须重新明确同意（模板按 research_changed 分支，最终
-      提交校验在 registration_store.complete_public_registration）。
+    - 研究协议未变化时沿用注册页的 intent 选择，不在设置密码页重复提供
+      checkbox；协议实质变化时才不预勾选地重新确认（最终提交校验在
+      registration_store.complete_public_registration）。
     """
     terms_doc = research_doc = None
     try:
@@ -4531,8 +4639,8 @@ def api_registration_verify():
 def _api_registration_verify_public(body, token, password):
     """public 最终确认 POST（P1，§3.3.5/§4.2）：原子建 active 账号。
 
-    - body 可选：research_opt_in（严格布尔；缺省沿用 intent 选择，显式提
-      交以最终为准——§3.3.3 允许修改可选项）、terms_version/terms_sha256
+    - body 可选：research_opt_in（严格布尔；正常页面不提交并沿用 intent
+      选择，仅协议实质变化时重新提供选择）、terms_version/terms_sha256
       与 research_version/research_sha256（文稿实质变化时的重新确认，
       §3.3.4）；research_direction / share_research_data 等旧申请字段在
       public 流程**不适用**（§4.4：public 不要求填写研究方向，不再把新
@@ -5412,7 +5520,7 @@ def api_registration_resend():
     email = (body.get("email") or "").strip()
     try:
         registration_store.enqueue_email_verification(
-            email, base_url=(os.environ.get("PUBLIC_BASE_URL") or "").strip())
+            email, base_url=_registration_email_base_url())
     except registration_store.EmailVerifyError as exc:
         if exc.code == "bad_input":
             return jsonify(error="请输入有效的邮箱地址",
@@ -7244,14 +7352,18 @@ def _invite_public_view(invite: dict) -> dict:
 def _registration_settings_payload() -> dict:
     """注册模式 GET 权威 payload（存储值 × 前置条件闸 + 支持的模式词表）。"""
     stored = _registration_mode_stored()
-    effective = _effective_registration_mode()
+    failures = []
+    if stored in _REGISTRATION_GATED_MODES:
+        failures = _registration_precondition_failures(mode=stored)
+        if stored == registration_store.MODE_PUBLIC and not failures:
+            failures = registration_store.public_document_failures()
+    effective = "closed" if failures else stored
     return {
         "mode": effective,
         "stored_mode": stored,
         "supported_modes": ["closed", "invite_only",
                             "email_verify_invite_activation", "public"],
-        "precondition_failures": _registration_precondition_failures(
-            mode=stored if stored in _REGISTRATION_GATED_MODES else None),
+        "precondition_failures": failures,
         "registration_open": effective in _REGISTRATION_GATED_MODES,
         "backend": platform_features.current_backend(),
     }
@@ -12057,6 +12169,286 @@ def api_uploads_cancel(upload_id):
         _upload_v2_cleanup_part(task)
         _upload_v2_release_reservation_quietly(task)
     return jsonify(upload_id=upload_id, state=task["state"])
+
+
+# --------------------------------------------------------------------------- #
+# COS 直传摄取 API（合同 §4，Phase 3）。裁决 A-presign-parts：只有
+# parts/sign 一个授权接口，/credentials 不存在（B 已否决）。
+# 写接口经全局登录 + CSRF 闸；COS 网络调用一律不在本进程（worker 专用），
+# 本块唯一的授权产物是纯本地计算的绑定 Content-Length 预签名 URL。
+# --------------------------------------------------------------------------- #
+def _cos_ingestion_ready():
+    """COS 直传可用性（服务端权威：capability + 凭证 + 池未暂停）。"""
+    _sid, _skey, ok = cos_config.cos_credentials()
+    if not ok or not cos_config.capability_available_for(
+            current_identity()["role"], ok):
+        return None, (jsonify(error="cos 直传未开放", code="cos_unavailable"), 404)
+    try:
+        pool = cos_pool_store.get_pool_state()
+    except Exception:
+        app.logger.exception("cos pool state read failed")
+        return None, (jsonify(error="cos 直传暂不可用",
+                              code="cos_unavailable"), 503)
+    if pool is None:
+        return None, (jsonify(error="cos 直传暂不可用",
+                              code="cos_unavailable"), 503)
+    return pool, None
+
+
+_INGESTION_STAGE = {
+    ingestion_store.WAITING: "waiting_space",
+    ingestion_store.PREPARING: "uploading",
+    ingestion_store.UPLOADING: "uploading",
+    ingestion_store.COMPLETING: "awaiting_server",
+    ingestion_store.QUEUED: "downloading",
+    ingestion_store.DOWNLOADING: "downloading",
+    ingestion_store.VALIDATING: "validating",
+    ingestion_store.READY: "readiness",
+    ingestion_store.COMPLETED: "viewable",
+    ingestion_store.CANCELLED: "terminal",
+    ingestion_store.FAILED: "terminal",
+    ingestion_store.EXPIRED: "terminal",
+}
+
+
+def _ingestion_state_body(job, *, queue_position=None):
+    """任务状态 JSON（阶段文案映射合同 §5；不含任何秘密/签名 URL）。"""
+    body = {
+        "job_id": job["job_id"],
+        "state": job["state"],
+        "stage": _INGESTION_STAGE.get(job["state"], "terminal"),
+        "declared_size": job["declared_size"],
+        "format_ext": job["format_ext"],
+        "viewer_ready": bool(job.get("viewer_ready")),
+        "cleanup_status": job.get("cleanup_status"),
+        "fail_code": job.get("fail_code"),
+        "created_at": job.get("created_at"),
+        "expires_at": job.get("waiting_expires_at")
+        if job["state"] == ingestion_store.WAITING else job.get("job_deadline_at"),
+    }
+    if job["state"] == ingestion_store.DOWNLOADING:
+        body["downloaded_bytes"] = job.get("downloaded_bytes")
+    if job["state"] == ingestion_store.UPLOADING and job.get("part_plan_json"):
+        # 非秘密冻结计划（编号+长度）：浏览器据此申请签名与切片上传
+        body["total_parts"] = len(job["part_plan_json"])
+        body["parts"] = [{"part_number": int(p["part_number"]),
+                          "length": int(p["length"])}
+                         for p in job["part_plan_json"]]
+    if job.get("slide_canonical_name"):
+        body["slide"] = job["slide_canonical_name"]
+    if queue_position is not None:
+        body["queue_position"] = queue_position
+    return body
+
+
+def _ingestion_fetch(job_id):
+    """ownership 拉取：本人或 owner；他人/不存在统一 403（不泄露存在性）。"""
+    ident = current_identity()
+    job = ingestion_store.get_job(job_id)
+    uid = ident.get("user_id") or ""
+    if (job is None
+            or (job["owner_user_id"] != uid
+                and ident.get("role") != user_store.ROLE_OWNER)):
+        return None, (jsonify(error="无权限"), 403)
+    return job, None
+
+
+@app.route("/api/ingestions", methods=["POST"])
+def api_ingestions_create():
+    """创建 COS 直传任务（合同 §4/§6.1）。
+
+    大小校验先于容量排队：非法 → 422 invalid_declared_size；超过单文件准入
+    上限 → 422 cos_exceeds_admission（max_size_bytes + fallback_transport=v2），
+    **不建行、不占预约、不发凭证、不进等待**。其余创建门禁通过而池不足时
+    202 + waiting_capacity（含排队位置，无预计秒数）。
+    """
+    if not can_upload():
+        return jsonify(error="无上传权限"), 403
+    pool, err = _cos_ingestion_ready()
+    if err is not None:
+        return err
+
+    body = request.get_json(silent=True) or {}
+    filename = body.get("filename")
+    if not isinstance(filename, str) or not filename.strip():
+        return jsonify(error="缺少 filename 字段"), 400
+    safe = _sanitize_name(filename.strip())
+    if not safe:
+        return jsonify(error="非法文件名"), 400
+    ext = safe.rsplit(".", 1)[-1].lower() if "." in safe else ""
+    if ext not in _COS_NATIVE_EXTS:
+        return jsonify(
+            error="COS 直传首期仅支持原生单文件格式（%s）；ZIP/MRXS 请用"
+                  "旧接口，其它格式走平台上传" % "/".join(sorted(_COS_NATIVE_EXTS)),
+            code="cos_format_unsupported"), 422
+
+    try:
+        declared_size = int(body.get("declared_size"))
+    except (TypeError, ValueError):
+        declared_size = -1
+    if declared_size <= 0:
+        return jsonify(
+            error="declared_size 需为正整数（十进制字节）",
+            code="invalid_declared_size"), 422
+    max_bytes = int(cos_pool_store.admission_limit_bytes(pool))
+    if declared_size > max_bytes:
+        # §6.1：明确回退 V2，不建行/不占预约/不进等待
+        return jsonify(
+            error="文件超过 COS 暂存准入上限，请使用平台上传",
+            code="cos_exceeds_admission",
+            max_size_bytes=max_bytes,
+            fallback_transport="v2"), 422
+
+    idem = body.get("idempotency_key")
+    if idem is not None and (not isinstance(idem, str) or not idem.strip()
+                             or len(idem) > 128):
+        return jsonify(error="idempotency_key 需为非空字符串（≤128）"), 400
+    if (UPLOAD_DIR / safe).exists() or _upload_name_conflict(safe):
+        return jsonify(error="名称不可用", code="name_unavailable"), 409
+
+    ident = current_identity()
+    try:
+        job, _created = ingestion_store.create_waiting_job(
+            owner_user_id=(ident.get("user_id") or ""),
+            owner_role=(ident.get("role") or ""),
+            filename=filename.strip(), safe_name=safe, format_ext=ext,
+            declared_size=declared_size,
+            idempotency_key=(idem.strip() if idem else None),
+            policy_version="v1-manual",
+            route_reason=body.get("route_reason") or "manual_cos")
+    except ingestion_store.IngestionStateError as e:
+        return jsonify(error=str(e), code="cos_waiting_limit"), 409
+
+    # 创建后立即尝试准入（容量不足转等待；池对账暂停/水位同样只等待）
+    try:
+        upload_guard.check_disk_watermark(UPLOAD_DIR)
+        watermark_ok = True
+    except upload_guard.DiskWatermarkExceeded:
+        watermark_ok = False
+    out = ingestion_store.try_admit_job(job["job_id"],
+                                        disk_watermark_ok=watermark_ok)
+    job = out["job"] or job
+    resp = _ingestion_state_body(job)
+    if out["outcome"] == "waiting" and job["state"] == ingestion_store.WAITING:
+        resp["code"] = "cos_waiting_capacity"
+        resp["queue_position"] = ingestion_store.queue_position(job["job_id"])
+        resp["status_url"] = "/api/ingestions/%s" % job["job_id"]
+    elif out["outcome"] == "terminal":
+        resp["code"] = out["reason"] or job.get("fail_code")
+    return jsonify(resp), 202
+
+
+@app.route("/api/ingestions/<job_id>", methods=["GET"])
+def api_ingestion_status(job_id):
+    """阶段/进度快照（不触发任何远程读取；进度是服务端权威持久值）。"""
+    job, err = _ingestion_fetch(job_id)
+    if err is not None:
+        return err
+    position = (ingestion_store.queue_position(job_id)
+                if job["state"] == ingestion_store.WAITING else None)
+    return jsonify(_ingestion_state_body(job, queue_position=position))
+
+
+@app.route("/api/ingestions/<job_id>/upload-complete", methods=["POST"])
+def api_ingestion_upload_complete(job_id):
+    """幂等记录「浏览器侧完成」（§4）：worker 随后核验远端对象。"""
+    job, err = _ingestion_fetch(job_id)
+    if err is not None:
+        return err
+    try:
+        job = ingestion_store.request_upload_complete(job_id)
+    except ingestion_store.IngestionStateError as e:
+        return jsonify(error=str(e), code="ingestion_state_conflict"), 409
+    return jsonify(_ingestion_state_body(job)), 202
+
+
+@app.route("/api/ingestions/<job_id>/cancel", methods=["POST"])
+def api_ingestion_cancel(job_id):
+    """幂等取消：worker 停下载、Abort/清理、释放预约；已入库走切片删除。"""
+    job, err = _ingestion_fetch(job_id)
+    if err is not None:
+        return err
+    try:
+        job = ingestion_store.cancel_job(job_id)
+    except ingestion_store.IngestionStateError as e:
+        return jsonify(error=str(e), code="already_committed"), 409
+    return jsonify(_ingestion_state_body(job)), 202
+
+
+@app.route("/api/ingestions/<job_id>/parts/sign", methods=["POST"])
+def api_ingestion_parts_sign(job_id):
+    """A 方案唯一授权接口：批量签发绑定 Content-Length 的 UploadPart URL。
+
+    纯本地签名（无 COS 网络调用）；只签冻结计划内分块；短 TTL 可续签同一
+    uploadId。暂停/取消/超时/超配额后停发（状态机闸）。响应 no-store。
+    """
+    pool, err = _cos_ingestion_ready()
+    if err is not None:
+        return err
+    job, err = _ingestion_fetch(job_id)
+    if err is not None:
+        return err
+    if job["state"] != ingestion_store.UPLOADING:
+        return jsonify(
+            error="任务当前状态 %s 不接受分块签名" % job["state"],
+            code="ingestion_state_conflict"), 409
+    if pool is not None and cos_pool_store.admission_paused(pool):
+        return jsonify(error="容量对账暂停，暂停签发",
+                       code="cos_capacity_reconcile_required"), 503
+
+    body = request.get_json(silent=True) or {}
+    nums = body.get("part_numbers")
+    if (not isinstance(nums, list) or not nums
+            or not all(isinstance(n, int) and not isinstance(n, bool)
+                       for n in nums)):
+        return jsonify(error="part_numbers 需为非空整数数组"), 400
+    if len(set(nums)) != len(nums):
+        return jsonify(error="part_numbers 不得重复"), 400
+    plan = {int(p["part_number"]): int(p["length"])
+            for p in (job.get("part_plan_json") or [])}
+    if not plan or not job.get("upload_id") or not job.get("object_key"):
+        return jsonify(error="分块计划未就绪，请稍后重试",
+                       code="plan_not_ready"), 409
+    if any(n not in plan for n in nums):
+        return jsonify(error="part_numbers 含计划外编号"), 400
+    if len(nums) > cos_config.COS_SIGN_BATCH_MAX_PARTS:
+        return jsonify(
+            error="单批最多 %d 个分块"
+                  % cos_config.COS_SIGN_BATCH_MAX_PARTS), 400
+    if not ingestion_store.record_sign_batch(job_id, nums):
+        return jsonify(error="签名请求过于频繁，请稍后重试",
+                       code="cos_sign_rate_limited"), 429
+    try:
+        urls = [cos_client.presign_upload_part(
+                    job["object_key"], job["upload_id"], n, plan[n])
+                for n in sorted(nums)]
+    except cos_client.CosConfigMissing:
+        return jsonify(error="cos 直传暂不可用", code="cos_unavailable"), 503
+    except cos_client.CosClientError as e:
+        app.logger.warning("presign part failed: %s", e)
+        return jsonify(error="签名失败", code="presign_failed"), 500
+    resp = jsonify(job_id=job_id, upload_id=job["upload_id"],
+                   transport="presign_parts", urls=urls)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/ingestions/<job_id>/resume", methods=["POST"])
+def api_ingestion_resume(job_id):
+    """恢复上传会话（§4 resume）：completing 未收口时回 uploading 续传。
+
+    首版语义：浏览器按自身未确认分块重取签名重传（同编号 UploadPart 覆盖
+    旧块，绑定长度保证不越界）；worker Complete 前仍以可信 ListParts 核对
+    为准，浏览器上报仅是提示。
+    """
+    job, err = _ingestion_fetch(job_id)
+    if err is not None:
+        return err
+    try:
+        job = ingestion_store.request_resume(job_id)
+    except ingestion_store.IngestionStateError as e:
+        return jsonify(error=str(e), code="ingestion_state_conflict"), 409
+    return jsonify(_ingestion_state_body(job)), 202
 
 
 @app.route("/api/conversions", methods=["GET"])

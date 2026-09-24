@@ -1,9 +1,7 @@
 # COS 前端直传 PoC（Phase 0 准备）
 
 本目录是 [COS 执行合同](../../docs/cos-direct-upload-audit-plan.md) **Phase 0（真实
-PoC 与授权裁决）** 的工具链。当前状态：**准备完成、未执行真实 COS 调用**——腾讯云
-凭证尚不存在，所有依赖外部输入的步骤以 `blocked_external_input` 记录于
-[证据文件](../../docs/evidence/cos-20260924.md)。绝不以 mock/硬编码密钥替代。
+PoC 与授权裁决）** 的工具链。当前状态：**Phase 0 进行中**。授权已裁决为 `A-presign-parts`；COS→生产服务器、浏览器→COS（本地 PoC origin）和浏览器→平台/frp 已有 300/500 MB 单次样本；生产 origin 的 CSP 正向上传仍待完成。实际结果与历史阻塞快照见[证据文件](../../docs/evidence/cos-20260924.md)。绝不以 mock/硬编码密钥替代。
 
 ## 范围与合同对应
 
@@ -11,13 +9,19 @@ PoC 与授权裁决）** 的工具链。当前状态：**准备完成、未执�
 |---|---|
 | 候选 B：`web/poc_b.{html,js}` + `tools/sts_issuer.py` + `policies/cam-single-key.json` + `vendor/`（本地托管锁版本 SDK） | §3.2 候选 B；§3.0 条件 1/2/3/5 判定 |
 | 候选 A：`tools/presign_parts.py` | §3.1 候选 A；§3.0 A-1..A-4；B 失败后才执行 |
-| 三段吞吐：`tools/cos_download_bench.py`（COS→服务器腿）+ 本文测量规程（另两腿） | §7 阶段 0"三段吞吐"；分流调研 §0 校准规则 1 |
+| 三段吞吐：`tools/cos_download_bench.py` / `tools/bench_a_server_leg.py`（COS→服务器腿）+ 本文测量规程（另两腿） | §7 阶段 0"三段吞吐"；分流调研 §0 校准规则 1 |
 | 测试文件：`tools/make_test_files.py` | §10 前置输入"可复现随机文件生成方法" |
 | 控制台准备：`ops/console-checklist.md` | §10"PoC 环境边界"；§5 CORS；§6.2/§6.3 生命周期 |
 | dev 服务：`tools/serve_poc.py` | §3.2 getAuthorization 服务端；生产 origin 验证走获准发布路径，不在本目录 |
 
 不在范围：产品代码、`deploy/`、`app.py`、`upload_guard.py`、`static/`、`tests/`
 一概不改；Phase 1+ 的任何实现。
+
+## PoC 与生产复用边界
+
+本目录的手写签名（包括 `tools/cos_xml_signing.py`）、XML 处理和上传循环是实验工具，不是生产客户端。生产按[执行合同 §1.1](../../docs/cos-direct-upload-audit-plan.md#11-成熟组件优先与自研边界2026-09-25) 优先使用官方服务端 SDK 和兼容的成熟前端上传组件；只保留项目业务逻辑与必要薄适配，不直接导入或复制这些实验协议实现。
+
+可复用的是测试数据生成方法、测量口径、验收用例和断言。替换实现后必须重新验证：长度恰好/超长/截短、签名参数篡改、过期重放、非授权方法、真实浏览器 CORS 与 ETag、取消/Abort 和版本/碎片清理。旧 PoC 证据不代表生产 SDK 已通过。组件不能满足 A 合同时，记录版本、实测缺口与最小适配范围；不得放宽长度绑定或恢复浏览器 STS 路径。
 
 ## 运行前提
 
@@ -32,7 +36,7 @@ python3 -m venv .venv          # 若报 ensurepip 不可用：python3 -m venv --
 ```
 
 依赖清单钉死版本且与产品依赖完全隔离；`serve_poc.py`/`make_test_files.py`
-（无 numpy 时）/`presign_parts.py` 仅用标准库。
+（无 numpy 时）/`presign_parts.py` 仅用标准库。浏览器测速使用仓库已有的 Playwright 包与本机 Chrome；V2 脚本由 `COS_POC_V2_LOGIN_ID` 指定测试身份，密码仅从标准输入读取，不能写进命令行、文件或证据。
 
 ## 环境变量（唯一凭证入口；一律不落文件）
 
@@ -110,9 +114,11 @@ COS_POC_BUCKET=... COS_POC_REGION=... python3 tools/sts_issuer.py --dry-run
 # COS→服务器腿（服务器直连 endpoint，不绕 frp）
 .venv/bin/python tools/cos_download_bench.py --key <uploaded-key> \
     --manifest data/testfiles/manifest.json --repeats 3
+# 需要先以候选 A 绑定长度的分块方式暂存测试对象、由 homepc 直连 COS 下载并自动删版本时：
+.venv/bin/python tools/bench_a_server_leg.py --manifest data/testfiles/manifest.json --size 300000000 --repeats 1
 ```
 
-浏览器→COS 与浏览器→平台/frp 两腿按下面"三段吞吐测量规程"人工执行，统一用
+浏览器→COS 与浏览器→平台/frp 两腿可按下面"三段吞吐测量规程"执行；本地 PoC 自动化驱动分别是 `tools/browser_a_bench.py` 和 `tools/browser_v2_bench.js`。统一用
 `tools/evidence_log.py` 的格式摘录进证据文件。
 
 ## 三段吞吐测量规程

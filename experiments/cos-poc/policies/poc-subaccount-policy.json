@@ -1,0 +1,72 @@
+// PoC 子账号（长期密钥持有方）的 CAM 策略模板。
+//
+// 与 cam-single-key.json 的区别：那个是签给浏览器的 STS 临时凭证策略（单 key、
+// 只写）；这个是子账号自身的策略，承担 PoC 的全部服务器侧身份——对应合同 §10
+// 外部输入第 3 条"PoC 对象操作仅限测试前缀的凭证引用"。
+//
+// 占位符：{{REGION}}（如 ap-shanghai）、{{APPID}}（数字）、{{BUCKET}}（name-appid）。
+// sts_issuer.py 渲染单 key 策略时所需的写权限必须先在子账号身上——
+// GetFederationToken 签出的临时凭证权限 = 子账号权限 ∩ 传入策略（交集规则）。
+//
+// 三段语句：
+//   1. 对象操作，resource 精确到 poc/ 前缀——PoC 需要 Put（造测试对象）、
+//      Get/Head（下载 bench 与钉版本核验）、Delete（清理与全版本删除验证，
+//      带 versionId 的删除也走 DeleteObject）、multipart 全套。
+//      浏览器凭证拿不到的 GetObject/DeleteObject 由这里持有，正好验证
+//      §3.0 条件 2 的"浏览器无下载/删除"是真拒绝而不是没测到。
+//   2. 桶级列举，用 cos:prefix 条件限定 poc/*——审计/清理端点要列对象版本
+//      （GetBucketObjectVersions）和未完成 multipart（ListMultipartUploads）。
+//      若控制台不允许在这两个 action 上挂 prefix 条件：专用空测试桶可接受
+//      去掉条件（桶内无其他对象），但要在证据文件里记录该偏差。
+//   3. sts:GetFederationToken——qcloud-python-sts 签发浏览器临时凭证的唯一
+//      调用；STS 不支持资源级限制，resource 只能 "*"。
+//
+// 明确不授予（合同 §10：桶级配置权限由操作者管理身份单独持有）：
+//   PutBucketVersioning / PutBucketCORS / PutBucketLifecycle 及一切桶级写；
+//   CAM 与账单 API（用量对账由操作者在控制台查）；
+//   任何 poc/ 以外的对象 resource。
+{
+  "version": "2.0",
+  "statement": [
+    {
+      "effect": "allow",
+      "action": [
+        "name/cos:PutObject",
+        "name/cos:InitiateMultipartUpload",
+        "name/cos:UploadPart",
+        "name/cos:CompleteMultipartUpload",
+        "name/cos:ListParts",
+        "name/cos:AbortMultipartUpload",
+        "name/cos:GetObject",
+        "name/cos:HeadObject",
+        "name/cos:DeleteObject"
+      ],
+      "resource": [
+        "qcs::cos:{{REGION}}:uid/{{APPID}}:{{BUCKET}}/poc/*"
+      ]
+    },
+    {
+      "effect": "allow",
+      "action": [
+        "name/cos:GetBucket",
+        "name/cos:GetBucketObjectVersions",
+        "name/cos:ListMultipartUploads"
+      ],
+      "resource": [
+        "qcs::cos:{{REGION}}:uid/{{APPID}}:{{BUCKET}}"
+      ],
+      "condition": {
+        "for_any_value:string_like": {
+          "cos:prefix": ["poc/*"]
+        }
+      }
+    },
+    {
+      "effect": "allow",
+      "action": [
+        "name/sts:GetFederationToken"
+      ],
+      "resource": "*"
+    }
+  ]
+}

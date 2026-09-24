@@ -117,7 +117,7 @@ sequenceDiagram
 - key 由服务端生成：`incoming/<opaque-owner-id>/<job-id>/<random-id>`，不用患者信息或原文件名。
 - 分块长度按 declared size 和分块计划计算，不信任浏览器自报长度。
 - Content-Length 与 Blob 上传兼容性必须实测。无法证明 COS 拒绝超长/截短时，不能声称云端容量已硬限制，也不能公开上线。
-- PoC 起点（非已验证生产值）：32 MiB 分块、每文件 3 并发、每用户 1 个活动 COS 文件。
+- PoC 起点（非已验证生产值）：`32_000_000` 字节（十进制）分块、每文件 3 并发、每用户 1 个活动 COS 文件。
 - 按少量待传分块批量签发、短 TTL，可续签同一 uploadId。暂停/取消/超时/超配额后停发。停发 ≠ 撤销已发出的 URL。
 - 签名器在独立授权单元；控制 API 请求内不做 COS 网络调用。Init/Complete/Abort 进 worker。
 - 浏览器上报的 ETag 只是提示。worker 分页 ListParts，核对连续编号、每块长度、总长度和计划后再 Complete。必须读完 Complete 响应再 HEAD。

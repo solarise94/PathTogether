@@ -1,0 +1,55 @@
+// Candidate B browser STS policy template — SINGLE RANDOM KEY, WRITE-ONLY.
+//
+// This is a JSON-with-comments template consumed by tools/sts_issuer.py,
+// which strips full-line `//` comments and substitutes the placeholders:
+//   {{REGION}}   e.g. ap-guangzhou        (from COS_POC_REGION)
+//   {{APPID}}    numeric appid            (derived from COS_POC_BUCKET)
+//   {{BUCKET}}   name-appid               (from COS_POC_BUCKET)
+//   {{KEY}}      full object key including the poc/ prefix, e.g. poc/obj-...-...
+//
+// Contract mapping (docs/cos-direct-upload-audit-plan.md §3.0 判定条件):
+//   条件 1 — CAM can confine temporary permissions to the single random key
+//            assigned by the platform: the `resource` below names EXACTLY one
+//            object (no `*`, no prefix wildcard, no bucket-wide grants).
+//            The PoC must prove a cross-key write FAILS with this credential.
+//   条件 2 — NO GetObject / DeleteObject / ListBucket(GetBucket) / object
+//            download is granted. ListParts / AbortMultipartUpload are granted
+//            only because the official SDK's chunked upload needs them to
+//            resume/abort, and their resource is the SAME single key — never
+//            bucket-wide ListMultipartUploads.
+//
+// Per-action purpose:
+//   name/cos:PutObject              — simple upload & re-write of the single
+//                                      key (the §3.0 条件 3 repeat-write window
+//                                      lives here; versioning must contain it)
+//   name/cos:InitiateMultipartUpload— SDK slice upload: begin multipart
+//   name/cos:UploadPart             — SDK slice upload: PUT one part
+//   name/cos:CompleteMultipartUpload— SDK slice upload: merge parts
+//   name/cos:ListParts              — SDK resume/verify; scope == this key only
+//   name/cos:AbortMultipartUpload   — cancel incomplete multiparts of this key
+//
+// Deliberately NOT granted (browser must never hold these):
+//   name/cos:GetObject, name/cos:HeadObject, name/cos:DeleteObject,
+//   name/cos:GetBucket (ListBucket), name/cos:GetBucketObjectVersions,
+//   name/cos:ListMultipartUploads (bucket-wide), anything with resource "*".
+// If the PoC shows the SDK REQUIRES one of these, record it as evidence —
+// it feeds the §3.0 verdict, it does not silently widen this template.
+{
+  "version": "2.0",
+  "statement": [
+    {
+      "effect": "allow",
+      "action": [
+        "name/cos:PutObject",
+        "name/cos:InitiateMultipartUpload",
+        "name/cos:UploadPart",
+        "name/cos:CompleteMultipartUpload",
+        "name/cos:ListParts",
+        "name/cos:AbortMultipartUpload"
+      ],
+      "resource": [
+        "qcs::cos:{{REGION}}:uid/{{APPID}}:{{BUCKET}}/{{KEY}}"
+      ]
+    }
+  ]
+}

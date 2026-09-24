@@ -1,0 +1,20 @@
+# PoC-only dependencies. COMPLETELY SEPARATE from the product requirements
+# (repo-root requirements.txt / requirements-dev.txt must not gain any of
+# these before an authorization verdict is written into the audit contract).
+# Installed into experiments/cos-poc/.venv only (see README).
+#
+# Everything else in this PoC is Python stdlib by design.
+
+# STS federation for candidate B (tools/sts_issuer.py, tools/serve_poc.py,
+# tools/cos_download_bench.py). Official Tencent Cloud STS SDK.
+# Source inspected 2026-09-24: https://pypi.org/pypi/qcloud-python-sts/3.1.6
+qcloud-python-sts==3.1.6
+
+# Transitive dependency of qcloud-python-sts (it POSTs via requests); pinned
+# explicitly so the PoC environment is reproducible.
+requests==2.34.2
+
+# Fast random test-file generation (tools/make_test_files.py). Optional at
+# runtime — the script falls back to os.urandom — but installed here so the
+# reproducible (seeded) generation path is the default during the PoC.
+numpy==2.5.3

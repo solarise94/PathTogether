@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>COS PoC — 候选 B（官方 SDK + 单 key STS）</title>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 980px; padding: 0 1rem; color: #111; }
+  h1 { font-size: 1.3rem; }
+  h2 { font-size: 1.05rem; margin-top: 1.8rem; border-bottom: 1px solid #ccc; padding-bottom: .3rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .85rem; }
+  th, td { border: 1px solid #bbb; padding: .3rem .5rem; text-align: left; vertical-align: top; }
+  th { background: #f0f0f0; }
+  .fail { color: #a00; font-weight: 600; }
+  .pass { color: #070; font-weight: 600; }
+  .muted { color: #666; font-size: .8rem; }
+  .warn { background: #fff6e0; border-left: 4px solid #e6a700; padding: .6rem .8rem; margin: 1rem 0; }
+  label { display: block; margin: .4rem 0; }
+  input[type="text"], input[type="number"] { width: 22rem; }
+  button { margin: .2rem .4rem .2rem 0; padding: .3rem .7rem; }
+  code { background: #f4f4f4; padding: 0 .2rem; }
+  pre { background: #f4f4f4; padding: .5rem; overflow-x: auto; font-size: .8rem; }
+</style>
+</head>
+<body>
+<h1>COS PoC — 候选 B：官方 cos-js-sdk-v5（本地托管，锁版本）+ 单 key STS</h1>
+
+<div class="warn">
+  仅限 PoC：本页只允许在本地 dev 服务（tools/serve_poc.py，绑定 127.0.0.1）或获准的
+  生产 origin 验证窗口使用。凭证只存内存；本页代码不写 localStorage/sessionStorage，
+  不 console.log 凭证（合同 §3.2 / §5）。测试内容为脚本生成的随机数据，禁止医疗数据。
+</div>
+
+<h2>0. 环境（由 /api/poc-sts 响应回填，不在页面手工输入密钥）</h2>
+<table id="env-table">
+  <tr><th>bucket</th><td id="env-bucket">—</td></tr>
+  <tr><th>region</th><td id="env-region">—</td></tr>
+  <tr><th>assigned key</th><td id="env-key">—（点击“分配 key”生成）</td></tr>
+  <tr><th>SDK 版本</th><td id="env-sdk">—</td></tr>
+</table>
+<label>分块大小 SDK chunkSize（MB，可选；留空用 SDK 默认）
+  <input id="opt-chunk-size" type="number" min="1" max="64" placeholder="SDK 默认">
+</label>
+<button id="btn-assign-key">分配 key（随机，服务端生成）</button>
+
+<h2>1. 正向路径：上传随机测试文件到指定 key</h2>
+<p class="muted">文件来自 tools/make_test_files.py（或本页“生成随机 Blob”开关）。上传完成后记录 ETag 与（开启版本控制时）返回的 version 头。</p>
+<label><input id="opt-use-blob" type="checkbox"> 不选文件，改为页面生成随机 Blob（字节快，仅用于负向/重复写开关）</label>
+<label><input id="opt-blob-mb" type="number" min="1" value="8" style="width:5rem"> 随机 Blob 大小（MB 十进制）</label>
+<input id="file-input" type="file">
+<div>进度：<progress id="upload-progress" value="0" max="100"></progress>
+  <span id="upload-progress-text">0%</span></div>
+<button id="btn-upload">sliceUploadFile 上传（预期成功）</button>
+
+<h2>2. 负向与边界开关（§3.0 判定条件证据）</h2>
+<table>
+  <tr><th>开关</th><th>预期</th><th>合同依据</th></tr>
+  <tr><td><button id="btn-cross-key">跨 key 写入</button></td>
+      <td class="fail">失败（403）</td><td>§3.0 条件 1：CAM 限制单 key</td></tr>
+  <tr><td><button id="btn-get-object">GetObject 下载该 key</button></td>
+      <td class="fail">失败（403）</td><td>§3.0 条件 2：不授 GetObject</td></tr>
+  <tr><td><button id="btn-delete-object">DeleteObject 删除该 key</button></td>
+      <td class="fail">失败（403）</td><td>§3.0 条件 2：不授删除</td></tr>
+  <tr><td><button id="btn-list-bucket">ListBucket（getBucket 列举前缀）</button></td>
+      <td class="fail">失败（403）</td><td>§3.0 条件 2：不授全桶列举</td></tr>
+  <tr><td><button id="btn-repeat-write">同 key 重复写 N 次</button>
+      <label>N = <input id="opt-repeat-n" type="number" min="2" max="10" value="3" style="width:4rem"></label></td>
+      <td>每次成功且产生新版本；随后“占用审计”必须证明 <em>凭证有效期内
+          版本+multipart 碎片总占用 ≤ 已预约字节</em>，事后清理不算通过</td>
+      <td class="fail">§3.0 条件 3（硬门槛）</td></tr>
+  <tr><td><button id="btn-abort">Abort 指定 key 的未完成 multipart</button></td>
+      <td class="pass">成功（授权范围内）</td><td>§3.2 取消路径</td></tr>
+  <tr><td><button id="btn-audit">占用审计（服务端 admin 凭证）</button></td>
+      <td>返回该 key 全部版本与在途分块的字节数</td><td>§3.0 条件 3 证据</td></tr>
+  <tr><td><button id="btn-cleanup">全版本清理（服务端 admin 凭证）</button></td>
+      <td>abort 全部在途分块 + 逐 versionId 删除</td><td>§3.2 / §6.2 清理</td></tr>
+</table>
+
+<h2>3. 结果记录</h2>
+<p class="muted">只记录操作名、预期、实际状态码/错误码、request id 与时间戳。响应体不落盘；凭证与签名永不出现在记录里。</p>
+<button id="btn-export">导出结果 JSON（脱敏）</button>
+<button id="btn-clear-results">清空</button>
+<table id="results">
+  <thead><tr><th>#</th><th>操作</th><th>预期</th><th>实际</th><th>判定</th><th>request id</th><th>时间</th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<h2>4. 原始输出（脱敏）</h2>
+<pre id="log">— 等待操作 —</pre>
+
+<script src="/vendor/cos-js-sdk-v5.min.js"></script>
+<script src="/poc_b.js"></script>
+</body>
+</html>

@@ -52,10 +52,10 @@ def _isolate(monkeypatch, tmp_path):
             child.unlink()
     # 真实切片边界（测试切片是字节 stub；注入可信 dims 供路径入口校验）
     monkeypatch.setattr(app_mod, "_annotation_slide_bounds",
-                        lambda safe: (1000.0, 800.0))
+                        lambda safe, path=None: (1000.0, 800.0))
     # 分享端真实元数据（分轴 MPP：mpp_x=0.2, mpp_y=0.1 µm/px）
     monkeypatch.setattr(share_srv, "_slide_dims_and_mpp",
-                        lambda safe: (1000, 800, 0.2, 0.1))
+                        lambda safe, path=None: (1000, 800, 0.2, 0.1))
     yield
 
 
@@ -302,7 +302,7 @@ def test_create_6mm_square_at_0253_mpp_allowed_and_export_budgeted(monkeypatch):
     _setup_owner()
     # 0.253 µm/px 切片：level-0 足够大，6mm 方框完整落在切片内
     monkeypatch.setattr(app_mod, "_annotation_slide_bounds",
-                        lambda safe: (100000.0, 100000.0))
+                        lambda safe, path=None: (100000.0, 100000.0))
     c = _client()
     side = int(round(6000 / 0.253))  # 6mm = 6000µm → 23715 px
     assert side == 23715
@@ -361,7 +361,7 @@ def test_share_preset_paths_with_trusted_mpp(monkeypatch):
     _setup_owner()
     # mpp 60µm/px：6mm = 100px
     monkeypatch.setattr(share_srv, "_slide_dims_and_mpp",
-                        lambda safe: (1000, 800, 60.0, 60.0))
+                        lambda safe, path=None: (1000, 800, 60.0, 60.0))
     tok = share_store.create_share(["demo.svs"], 1)["token"]
     sc = _share_client()
     good = {"slide": "demo.svs", "type": "rect", "label": "V",
@@ -391,7 +391,7 @@ def test_share_custom_allows_rect_and_old_share_defaults_preset(monkeypatch):
     _touch()
     _setup_owner()
     monkeypatch.setattr(share_srv, "_slide_dims_and_mpp",
-                        lambda safe: (1000, 800, 60.0, 60.0))
+                        lambda safe, path=None: (1000, 800, 60.0, 60.0))
     custom = share_store.create_share(["demo.svs"], 1, rect_policy="custom")
     assert custom["rect_policy"] == "custom"
     tok = custom["token"]
@@ -432,7 +432,7 @@ def test_share_revoked_and_viewonly_unchanged(monkeypatch):
     _touch()
     _setup_owner()
     monkeypatch.setattr(share_srv, "_slide_dims_and_mpp",
-                        lambda safe: (1000, 800, 60.0, 60.0))
+                        lambda safe, path=None: (1000, 800, 60.0, 60.0))
     share = share_store.create_share(["demo.svs"], 1, rect_policy="custom",
                                      permissions=["view"])
     tok = share["token"]
@@ -533,7 +533,7 @@ def test_share_crop_wh_exact_and_not_roi_sizes_bound(monkeypatch):
     _touch()
     _setup_owner()
     monkeypatch.setattr(share_srv, "_slide_dims_and_mpp",
-                        lambda safe: (2000, 1500, 60.0, 60.0))
+                        lambda safe, path=None: (2000, 1500, 60.0, 60.0))
     share_store.set_slide_meta("demo.svs")  # P2：分享创建收口——先建行
     # preset_only 分享的 crop 不受 roi_sizes 约束（E06 收窄口径）
     tok = share_store.create_share(["demo.svs"], 1,

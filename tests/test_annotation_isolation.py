@@ -47,7 +47,7 @@ def _isolate(monkeypatch):
     # 100000² @ 60µm/px → side 100px = 6.0mm 预设）
     monkeypatch.setattr(
         share_srv, "_slide_dims_and_mpp",
-        lambda safe: (100000, 100000, 60.0, 60.0))
+        lambda safe, path=None: (100000, 100000, 60.0, 60.0))
     yield
 
 

@@ -5715,17 +5715,48 @@ def api_research_viewing_sessions():
     if not isinstance(body, dict):
         return jsonify(error="请求体必须是 JSON 对象",
                        code="invalid_request"), 400
-    unknown = sorted(set(body.keys()) - {"slide", "project"})
+    unknown = sorted(set(body.keys()) - {"slide", "project", "slide_id"})
     if unknown:
         return jsonify(error="请求体含未知字段 %s" % unknown,
                        code="invalid_request"), 400
     slide = body.get("slide")
-    if not isinstance(slide, str) or not (1 <= len(slide.strip()) <= 255):
+    slide_id_in = body.get("slide_id")
+    # slide ID 化（P2 前端缺口③）：双字段——slide_id 优先（权威），slide
+    # 为 legacy alias；两者同给且解析到不同资产 → 400（合同 §2.1）。
+    if slide_id_in is not None and (not isinstance(slide_id_in, str)
+                                    or not slide_id_in.strip()):
+        return jsonify(error="slide_id 非法", code="invalid_request"), 400
+    if slide is not None and (not isinstance(slide, str)
+                              or not (1 <= len(slide.strip()) <= 255)):
         return jsonify(error="必须提供有效的业务切片标识（slide）",
                        code="invalid_request"), 400
-    slide = slide.strip()
-    # ACL：本人拥有（§6.1 资源权利——研究第一版只允许本人拥有的切片）
-    owner = _slide_owner(slide)
+    if slide is None and slide_id_in is None:
+        return jsonify(error="必须提供有效的业务切片标识（slide）",
+                       code="invalid_request"), 400
+    slide = slide.strip() if isinstance(slide, str) else None
+    sid = None
+    if slide_id_in:
+        desc = slide_store.resolve_slide_id(slide_id_in.strip())
+        if desc is None:
+            return jsonify(error="切片不存在", code="slide_not_found"), 404
+        sid = desc.slide_id
+        if slide:
+            by_name = share_store.get_slide_id(slide)
+            if by_name is not None and by_name != sid:
+                return jsonify(error="slide 与 slide_id 指向不同资产",
+                               code="slide_ref_conflict"), 400
+        # ACL（§6.1 资源权利）：按 descriptor owner 判定
+        owner = desc.owner_user_id
+        if slide is None:
+            # 名称快照仅作记录兜底（伪名由 slide_id 派生，不存真实名）
+            slide = desc.legacy_filename or desc.original_filename or sid
+    else:
+        # ACL：本人拥有（§6.1 资源权利——研究第一版只允许本人拥有的切片）
+        owner = _slide_owner(slide)
+        try:
+            sid = share_store.get_slide_id(slide)
+        except Exception:
+            sid = None
     if not owner or owner != user_id:
         return jsonify(
             error="仅本人拥有的切片可用于研究共享",
@@ -5734,10 +5765,6 @@ def api_research_viewing_sessions():
     # （HMAC("slide-id:"+slide_id)）——同资产改名不再产生不同研究伪名；
     # 历史伪名不动。研究删除按 user 维度执行（research_deletion_jobs 无
     # slide 维度），无回绑风险。
-    try:
-        sid = share_store.get_slide_id(slide)
-    except Exception:
-        sid = None
     try:
         view = research_store.create_viewing_session(user_id, slide,
                                                      slide_id=sid)
@@ -13106,8 +13133,15 @@ def api_conversion_get(job_id):
     import conversion_http
     if not can_upload():
         return jsonify(error="无上传权限"), 403
-    return _jsonify_pair(conversion_http.handle_get(
-        current_identity(), job_id))
+    payload, status = conversion_http.handle_get(current_identity(), job_id)
+    if status == 200 and isinstance(payload, dict):
+        # slide ID 化（P2 前端缺口⑤）：轮询打开目标按 ID（canonical 名→行；
+        # 未 ready/无 canonical 时 None，前端继续轮询）
+        canon = payload.get("canonical_name") or ""
+        if canon:
+            payload = dict(payload)
+            payload["slide_id"] = share_store.get_slide_id(canon) or None
+    return _jsonify_pair((payload, status))
 
 
 @app.route("/api/conversions/<job_id>/retry", methods=["POST"])
@@ -13240,6 +13274,20 @@ def api_slide_render_context(name):
     if desc is None:
         return _denied()
     _desc_read_path(desc)
+    body = request.get_json(silent=True)
+    return _render_context_post_response(desc, body)
+
+
+@app.route("/api/slides/<slide_id>/render-context", methods=["POST"])
+def api_slide_render_context_by_id(slide_id):
+    """render-context 的 ID 原生路由（P2 前端缺口④，合同 §4）。
+
+    语义与按名端点一致（共用 _render_context_post_response）；render token
+    本就按 slide_id 绑定（R-15 已收口）。
+    """
+    desc, err = _authorize_id_read(slide_id)
+    if err is not None:
+        return err
     body = request.get_json(silent=True)
     return _render_context_post_response(desc, body)
 

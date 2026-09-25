@@ -822,10 +822,14 @@ def _share_slide_member(token, slide_id):
 
 
 def _share_slide_rows(token):
-    """分享成员（share_slides ⋈ slides）清单：[(legacy_filename, asset_state)]。
+    """分享成员（share_slides ⋈ slides）清单：[(legacy_filename, asset_state,
+    slide_id, display_name, original_filename, format_ext)]。
 
     P1-B2 列表端点数据源（替代遍历 shares.slides JSONB 快照）；按 position
     排序。DB 异常返回 None（调用方 fail-closed 503）。
+    P2（前端缺口①）：行携带 slide_id/display_name/original_filename/
+    format_ext——分享页前端以 slide_id 为操作键；legacy_filename 为 NULL
+    的 id_bundle 成员（P3 起）由调用方走 descriptor 路径。
     """
     try:
         conn = pg_store.connect()
@@ -836,13 +840,14 @@ def _share_slide_rows(token):
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT s.legacy_filename, s.asset_state "
+                    "SELECT s.legacy_filename, s.asset_state, s.slide_id, "
+                    "s.display_name, s.original_filename, s.format_ext "
                     "FROM share_slides ss JOIN slides s"
                     " ON s.slide_id = ss.slide_id "
                     "WHERE ss.token=%s ORDER BY ss.position, s.legacy_filename",
                     (token,))
                 rows = cur.fetchall()
-        return [(r[0], r[1]) for r in rows]
+        return [(r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows]
     except Exception:
         app.logger.warning("share_slides 成员清单查询失败", exc_info=True)
         return None
@@ -919,15 +924,22 @@ def _share_has_annotate(share):
 _PRESET_MM_TOLERANCE = 0.02
 
 
-def _slide_dims_and_mpp(safe):
+def _slide_dims_and_mpp(safe, path=None):
     """读切片 level-0 尺寸与 MPP（读元数据，不解码像素）。
 
     返回 (width, height, mpp_x, mpp_y)；任一不可读以 None 占位。
+    P2（缺口②）：path 显式给出时按解析后路径读（id_bundle 成员无 legacy
+    名；缓存键随之用路径字符串），缺省保持 UPLOAD_DIR / safe 旧口径。
     """
-    entry = _get_slide(safe)
+    if path is None:
+        path = UPLOAD_DIR / safe
+        key = safe
+    else:
+        key = str(path)
+    entry = _get_slide(key, path)
     try:
         def _read(pair):
-            meta = _read_metadata(pair["osr"], UPLOAD_DIR / safe)
+            meta = _read_metadata(pair["osr"], path)
             return (pair["osr"].dimensions, meta.get("mpp_x"),
                     meta.get("mpp_y"))
 
@@ -949,7 +961,7 @@ def _rect_policy_of(share):
     return share_shared._share_rect_policy(share)
 
 
-def _reject_preset_rect(share, safe, geom):
+def _reject_preset_rect(share, safe, geom, path=None):
     """preset_only 分享的 rect 新增校验（§6.4，不能只查自报 size_mm=6）。
 
     要求：
@@ -975,10 +987,11 @@ def _reject_preset_rect(share, safe, geom):
         side = geom.get("side_px")
         eff_w = side
         eff_h = side
-    return _reject_preset_rect_mm(share, safe, eff_w, eff_h, declared_mm=smm)
+    return _reject_preset_rect_mm(share, safe, eff_w, eff_h, declared_mm=smm,
+                                  path=path)
 
 
-def _reject_preset_rect_mm(share, safe, w, h, declared_mm=None):
+def _reject_preset_rect_mm(share, safe, w, h, declared_mm=None, path=None):
     """preset_only 的真实几何校验：正方形 + 可信 MPP 反算 mm ∈ roi_sizes。
 
     编辑路径用本函数（无需客户端 size_mm；按真实几何反算）。declared_mm
@@ -994,7 +1007,7 @@ def _reject_preset_rect_mm(share, safe, w, h, declared_mm=None):
     allowed = [float(v) for v in
                (share.get("roi_sizes") or list(share_store.DEFAULT_ROI_SIZES))]
     label_str = " / ".join(_fmt_mm(v) for v in allowed)
-    _w, _h, mpp_x, _mpp_y = _slide_dims_and_mpp(safe)
+    _w, _h, mpp_x, _mpp_y = _slide_dims_and_mpp(safe, path=path)
     if not mpp_x:
         return ("该切片缺少可信 MPP，无法核验预设尺寸；请在主站校准后重试", 403)
     real_mm = w_i * mpp_x / 1000.0
@@ -1011,9 +1024,11 @@ def _reject_preset_rect_mm(share, safe, w, h, declared_mm=None):
             % (real_mm, label_str), 403)
 
 
-def _reject_rect_out_of_bounds(safe, x, y, w, h):
-    """rect 写入的真实切片边界校验（§6.3-4，分享端路径入口）。None 或 message。"""
-    width, height, _mpp_x, _mpp_y = _slide_dims_and_mpp(safe)
+def _reject_rect_out_of_bounds(safe, x, y, w, h, path=None):
+    """rect 写入的真实切片边界校验（§6.3-4，分享端路径入口）。None 或 message。
+
+    P2（缺口②）：path 显式给出时按解析后路径读（id_bundle 成员）。"""
+    width, height, _mpp_x, _mpp_y = _slide_dims_and_mpp(safe, path=path)
     return share_shared._validate_rect_bounds(x, y, w, h, width, height)
 
 
@@ -1068,9 +1083,31 @@ def _archived_slide_names():
     return share_store.archived_slide_names()
 
 
-def _reject_archived_slide(share, name):
-    """归档项目内切片只读：guest 亦不可在归档项目内标注/评论。命中 → True。"""
-    return name in _archived_slide_names()
+def _reject_archived_slide(share, name, slide_id=None):
+    """归档项目内切片只读：guest 亦不可在归档项目内标注/评论。命中 → True。
+
+    P2（缺口②）：id_bundle 成员无 legacy 名——name 为 None 时按 slide_id
+    查 project_slides 双写列（与 app.py `_slide_id_archived` 同语义）。
+    """
+    if name is not None:
+        return name in _archived_slide_names()
+    if not slide_id:
+        return False
+    try:
+        conn = pg_store.connect()
+    except Exception:  # noqa: BLE001 - 查询失败按未归档（与名通道容错一致）
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM project_slides ps JOIN projects p "
+                "ON p.project_id = ps.project_id "
+                "WHERE ps.slide_id=%s AND p.archived LIMIT 1", (slide_id,))
+            return cur.fetchone() is not None
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        conn.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -1155,20 +1192,36 @@ def share_slides(token):
         return jsonify(error="share_store_unavailable"), 503
     all_meta = share_store.get_all_slide_meta()
     items = []
-    for name, _state in member_rows:
-        safe = _sanitize_name(name)
-        path = UPLOAD_DIR / safe
-        info = {"name": safe, "exists": path.is_file()}
-        sm = all_meta.get(safe, {})
-        info["alias"] = sm.get("alias", "")
+    for name, _state, slide_id, display_name, original_filename, format_ext in member_rows:
+        # P2（前端缺口①）：成员项携带 slide_id/display_name/original_filename/
+        # format_ext——分享页前端以 slide_id 为操作键；name 为 legacy 别名
+        # 快照（id_bundle 成员为 None，P3 起经 descriptor 路径读）。
+        if name:
+            safe = _sanitize_name(name)
+            path = UPLOAD_DIR / safe
+            cache_key = safe
+        else:
+            # id_bundle 成员（P3+）：路径经 resolver 解析（无 legacy 名）
+            safe = None
+            desc0 = slide_store.resolve_slide_id(slide_id)
+            path = (slide_storage.resolve_descriptor_path(desc0, root=UPLOAD_DIR)
+                    if desc0 is not None else None)
+            cache_key = slide_id
+        info = {"name": safe, "slide_id": slide_id,
+                "display_name": display_name or "",
+                "original_filename": original_filename,
+                "format_ext": format_ext,
+                "exists": bool(path is not None and path.is_file())}
+        sm = all_meta.get(safe, {}) if safe else {}
+        info["alias"] = sm.get("alias", "") or (display_name or "")
         info["note"] = sm.get("note", "")
-        if path.is_file():
+        if path is not None and path.is_file():
             def _read_meta():
-                entry = _get_slide(safe)
+                entry = _get_slide(cache_key, path)
                 with slide_cache.borrow_pair(entry) as pair:
                     return _read_metadata(pair["osr"], path)
             try:
-                meta = slide_cache.cached_read_metadata(safe, path, _read_meta)
+                meta = slide_cache.cached_read_metadata(cache_key, path, _read_meta)
                 info.update(meta)
             except Exception as e:
                 info.update({
@@ -1179,15 +1232,18 @@ def share_slides(token):
                 })
             else:
                 # Batch 3（§6.1）：render additive 字段（flag 开才带通道面板；
-                # 打开失败的条目保持 error 分支不加，单个失败不阻塞整个列表）
-                try:
-                    info.update(_render_info_fields(safe))
-                except slide_cache.SlideFileChanged:
-                    pass
-                except (slide_render.RenderRequestError,
-                        slide_io.SlideRenderError) as e:
-                    info["render_error_code"] = getattr(
-                        e, "code", "invalid_render_context")
+                # 打开失败的条目保持 error 分支不加，单个失败不阻塞整个列表）。
+                # id_bundle 成员（safe=None，P3+）暂无按名 render 通道——跳过
+                # additive 字段（P3 随 render_info 的 ID 化一并接）。
+                if safe is not None:
+                    try:
+                        info.update(_render_info_fields(safe))
+                    except slide_cache.SlideFileChanged:
+                        pass
+                    except (slide_render.RenderRequestError,
+                            slide_io.SlideRenderError) as e:
+                        info["render_error_code"] = getattr(
+                            e, "code", "invalid_render_context")
         else:
             info.update({
                 "width": None, "height": None,
@@ -1368,6 +1424,67 @@ def share_slide_render_context(token, name):
         "render_context_fingerprint": fp,
         "render_token": tok,
         "asset_revision": _legacy_revision(safe),
+        "warnings": [],
+    }
+    if display_versions:
+        payload["display_versions"] = display_versions
+    return jsonify(payload)
+
+
+@app.route("/s/<token>/api/slides/<slide_id>/render-context", methods=["POST"])
+def share_slide_render_context_by_id(token, slide_id):
+    """分享端 render-context 的 ID 原生路由（P2 前端缺口④，合同 §4）。
+
+    与按名端点同语义（成员判定 + ready 门禁 + 共用规范化实现）；scope/token
+    绑定键本来就是 slide_id（R-15）。revision 取数：legacy 资产按入口文件
+    mtime:size；id_bundle 资产（P3+）经 descriptor 路径取同一语义。
+    """
+    share = _require_share(token)
+    desc = _require_slide_by_id(share, slide_id)
+    safe = desc.legacy_filename
+    skey = _slide_scope_key(desc)
+    if not _multichannel_enabled():
+        return jsonify(error="多通道渲染未启用",
+                       code="multichannel_disabled"), 403
+    body = request.get_json(silent=True)
+    path = slide_storage.resolve_descriptor_path(desc, root=UPLOAD_DIR)
+    entry = _get_slide(safe, path)
+    # revision：legacy 布局按名取数（旧口径）；id_bundle 布局按解析后路径
+    revision = (_legacy_revision(safe) if safe is not None
+                else "%d:%d" % (int(path.stat().st_mtime),
+                                int(path.stat().st_size)))
+
+    def _build(pair):
+        canonical, fp = slide_render.resolve_render_context(
+            pair["osr"], safe=skey, expected_revision=revision,
+            body=body if isinstance(body, dict) else {},
+            asset_generation=_ctx_scope(skey, pair.get("gen")),
+            flag_enabled=True)
+        tok = slide_render.issue_render_token(
+            canonical, fp, revision, _render_secret(), slide=skey)
+        display_versions = None
+        try:
+            display_versions = \
+                viewer_display.display_versions_for_fingerprint(
+                    entry, fp,
+                    slide_render.image_mode_from_context(canonical),
+                    quality_override=JPEG_QUALITY)
+        except Exception:  # noqa: BLE001  additive 失败不阻塞规范化
+            display_versions = None
+        return canonical, fp, tok, display_versions
+
+    try:
+        canonical, fp, tok, display_versions = \
+            slide_cache.read_stable(entry, _build)[0]
+    except (slide_render.RenderRequestError, slide_io.SlideRenderError) as e:
+        return _render_error(e)
+    app.logger.info("[render-context] share slide=%s fp=%s channels=%d",
+                    skey, fp[:8], len(canonical.get("active_channels") or []))
+    payload = {
+        "render_context": dict(canonical, fingerprint=fp),
+        "render_context_fingerprint": fp,
+        "render_token": tok,
+        "asset_revision": revision,
         "warnings": [],
     }
     if display_versions:
@@ -1753,6 +1870,7 @@ def share_roi_add(token):
         return jsonify(error="该链接不允许标注"), 403
     body = request.get_json(silent=True) or {}
     slide = body.get("slide")
+    slide_id_in = body.get("slide_id")  # P2 前端缺口②：双字段（ID 优先）
     label = body.get("label")
     typ = body.get("type", "rect")
 
@@ -1763,24 +1881,54 @@ def share_roi_add(token):
     if typ not in share_store.ROI_TYPES:
         return jsonify(error="未知标注类型"), 400
 
-    if not slide:
+    if not slide and not slide_id_in:
         return jsonify(error="缺少 slide"), 400
-    safe = _sanitize_name(slide)
-    if not safe or safe != slide:
-        return jsonify(error="slide 不属于该分享"), 403
-    # P1-B2（R-04）：成员判定走 share_slides ID 关系（JSONB 快照不再参与）
-    try:
-        roi_desc = slide_store.resolve_legacy_alias(safe)
-    except Exception:
-        app.logger.warning("分享标注写通道 legacy 解析失败：%s", safe,
-                           exc_info=True)
-        roi_desc = None
+    # 双字段解析（P2 前端缺口② / 合同 §2.1）：slide_id 权威优先，slide 走
+    # 冻结别名；两者同给且解析到不同资产 → 400 slide_ref_conflict。
+    roi_desc = None
+    if slide_id_in:
+        try:
+            roi_desc = slide_store.resolve_slide_id(str(slide_id_in).strip())
+        except Exception:
+            app.logger.warning("分享标注写通道 slide_id 解析失败（fail-closed）",
+                               exc_info=True)
+            roi_desc = None
+        if roi_desc is None:
+            return jsonify(error="slide 不属于该分享"), 403
+    safe = None
+    desc_path = None
+    if slide:
+        safe = _sanitize_name(slide)
+        if not safe or safe != slide:
+            return jsonify(error="slide 不属于该分享"), 403
+        try:
+            desc_by_name = slide_store.resolve_legacy_alias(safe)
+        except Exception:
+            app.logger.warning("分享标注写通道 legacy 解析失败：%s", safe,
+                               exc_info=True)
+            desc_by_name = None
+        if (roi_desc is not None and desc_by_name is not None
+                and desc_by_name.slide_id != roi_desc.slide_id):
+            return jsonify(error="slide 与 slide_id 指向不同资产",
+                           code="slide_ref_conflict"), 400
+        if roi_desc is None:
+            roi_desc = desc_by_name
     if (roi_desc is None
             or roi_desc.asset_state != slide_store.SlideState.READY
             or not _share_slide_member(token, roi_desc.slide_id)):
         return jsonify(error="slide 不属于该分享"), 403
+    # id_bundle 成员（P3+，legacy_filename 为 None）：路径经 resolver；
+    # 归档/几何校验的按名助手改走 slide_id/路径变体
+    if roi_desc.legacy_filename:
+        safe = roi_desc.legacy_filename
+    else:
+        try:
+            desc_path = slide_storage.resolve_descriptor_path(
+                roi_desc, root=UPLOAD_DIR)
+        except ValueError:
+            return jsonify(error="slide 不属于该分享"), 403
     # Stage 3c-2（docs §v1.5）：归档项目内切片只读，guest 亦不可标注
-    if _reject_archived_slide(share, safe):
+    if _reject_archived_slide(share, safe, slide_id=roi_desc.slide_id):
         return jsonify(error="切片已归档只读"), 403
 
     # 收集几何字段透传给 store 校验。升级 C：rect 增加成对 w/h（v2）。
@@ -1795,7 +1943,7 @@ def share_roi_add(token):
     # preset_only 档，custom 档允许任意宽高但仍受几何/边界校验）。
     if typ == "rect":
         if _rect_policy_of(share) != "custom":
-            reject = _reject_preset_rect(share, safe, geom)
+            reject = _reject_preset_rect(share, safe, geom, path=desc_path)
             if reject is not None:
                 return jsonify(error=reject[0]), reject[1]
         # 真实切片边界校验（不静默裁剪；store 纯数值校验之外的第二道）
@@ -1809,7 +1957,8 @@ def share_roi_add(token):
         except (TypeError, ValueError):
             eff_w = eff_h = None
         if eff_w is not None:
-            msg = _reject_rect_out_of_bounds(safe, eff_x, eff_y, eff_w, eff_h)
+            msg = _reject_rect_out_of_bounds(safe, eff_x, eff_y, eff_w, eff_h,
+                                             path=desc_path)
             if msg:
                 return jsonify(error=msg), 400
 

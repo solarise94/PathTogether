@@ -644,3 +644,122 @@ def test_demo_catalog_requires_resolvable_row():
     _sql("DELETE FROM slides WHERE slide_id=%s", (sid,))
     e, d = app_mod._demo_catalog_slide(sid)
     assert e is None and d is None
+
+
+# =========================================================================== #
+# 13. P2 前端缺口修复回归（share 列表 slide_id / 分享 ROI 双字段 /
+#     render-context by-id / research 双字段 / conversions GET slide_id）
+# =========================================================================== #
+def _mk_share_with_slide(owner):
+    """一主一片一分享的基础夹具：返回 (client, name, slide_id, token)。"""
+    c = _client()
+    _login(c, "owner@x.com", "ownerpass123456")
+    name = _touch_tiff("gap.tif")
+    sid = _register(name, owner["user_id"])
+    token = c.post("/api/share/create", json={
+        "slide_ids": [sid], "expires_hours": 24}).get_json()["token"]
+    return c, name, sid, token
+
+
+def test_share_listing_carries_slide_id():
+    """缺口①：GET /s/<token>/api/slides 成员项带 slide_id（前端按 ID 键控）。"""
+    owner, _a, _b = _setup_users()
+    _c, name, sid, token = _mk_share_with_slide(owner)
+    items = _share_client().get("/s/%s/api/slides" % token).get_json()
+    assert len(items) == 1
+    assert items[0]["slide_id"] == sid
+    assert items[0]["name"] == name
+    assert "display_name" in items[0]
+
+
+def test_share_roi_add_dual_field():
+    """缺口②：POST /s/<token>/api/roi 接受 slide_id（优先）且冲突 400。"""
+    owner, _a, _b = _setup_users()
+    _c, name, sid, token = _mk_share_with_slide(owner)
+    sc = _share_client()
+    # slide_id 通道
+    r = sc.post("/s/%s/api/roi" % token, json={
+        "slide_id": sid, "label": "L1", "type": "freehand",
+        "points": [[1, 1], [2, 2], [3, 1]]})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    row = _sql("SELECT slide, slide_id FROM rois ORDER BY insert_seq DESC "
+               "LIMIT 1", fetch=True)[0]
+    assert row[0] == name and row[1] == sid
+    # 双字段同资产 → 放行；不同资产 → 400
+    _touch_tiff("gap2.tif")
+    sid2 = _register("gap2.tif", owner["user_id"])
+    r2 = sc.post("/s/%s/api/roi" % token, json={
+        "slide_id": sid, "slide": name, "label": "L2", "type": "freehand",
+        "points": [[1, 1], [2, 2], [3, 1]]})
+    assert r2.status_code == 200
+    r3 = sc.post("/s/%s/api/roi" % token, json={
+        "slide_id": sid2, "slide": name, "label": "L3", "type": "freehand",
+        "points": [[1, 1], [2, 2], [3, 1]]})
+    assert r3.status_code == 400
+    assert r3.get_json().get("code") == "slide_ref_conflict"
+
+
+def test_render_context_by_id_routes():
+    """缺口④：主站与分享端 render-context by-id 路由（多通道 flag 关时 403）。"""
+    owner, _a, _b = _setup_users()
+    c, _name, sid, token = _mk_share_with_slide(owner)
+    # flag 默认关：两端点都应到达功能闸（403 multichannel_disabled），
+    # 而不是 404（路由存在性证据）；未知 ID 主站 404、分享端 403
+    r_main = c.post("/api/slides/%s/render-context" % sid, json={})
+    assert r_main.status_code in (200, 403)
+    assert c.post("/api/slides/sld_nonexistent/render-context",
+                  json={}).status_code == 404
+    r_share = _share_client().post(
+        "/s/%s/api/slides/%s/render-context" % (token, sid), json={})
+    assert r_share.status_code in (200, 403)
+    assert _share_client().post(
+        "/s/%s/api/slides/sld_nonexistent/render-context" % token,
+        json={}).status_code == 403
+
+
+def test_research_viewing_session_dual_field():
+    """缺口③：研究读片会话接受 slide_id；冲突 400；伪名从 ID 派生。"""
+    owner, _a, _b = _setup_users()
+    c = _client()
+    _login(c, "owner@x.com", "ownerpass123456")
+    name = _touch_tiff("res2.tif")
+    sid = _register(name, owner["user_id"])
+    import research_store as rs
+    rs_store_env = rs  # noqa: F841
+    # 研究采集需开关+授权——直接走 store 层验证 slide_id 透传语义已在
+    # test_research_pseudonym_from_slide_id 覆盖；此处验证 HTTP 层字段接收
+    # 与冲突裁决（开关关闭时 403/503 均可，但不能 400 invalid_request）
+    r = c.post("/api/research/viewing-sessions", json={"slide_id": sid})
+    assert r.status_code != 400 or "未知字段" not in r.get_data(as_text=True)
+    r2 = c.post("/api/research/viewing-sessions",
+                json={"slide_id": sid, "slide": "nonexistent.tif"})
+    assert r2.status_code != 400 or "未知字段" not in r2.get_data(as_text=True)
+    # 明确冲突（名解析到另一资产）→ 400 slide_ref_conflict
+    _touch_tiff("res3.tif")
+    sid3 = _register("res3.tif", owner["user_id"])
+    r3 = c.post("/api/research/viewing-sessions",
+                json={"slide_id": sid, "slide": "res3.tif"})
+    assert r3.status_code == 400
+    assert r3.get_json().get("code") == "slide_ref_conflict"
+    assert sid3 != sid
+
+
+def test_conversions_get_carries_slide_id():
+    """缺口⑤：GET /api/conversions/<job_id> ready 任务的响应带 slide_id。"""
+    owner, _a, _b = _setup_users()
+    c = _client()
+    _login(c, "owner@x.com", "ownerpass123456")
+    name = _touch_tiff("conv-src.tif")
+    _register(name, owner["user_id"])
+    import conversion_store
+    job = conversion_store.create_job(
+        owner_user_id=owner["user_id"], upload_id=None, source_name=name,
+        source_sha256="0" * 64, source_format="kfb",
+        canonical_name="conv-src.tif.tif")
+    # 直接置 ready 并注册 canonical 行（模拟转换完成）
+    canon = _touch_tiff("conv-src.tif.tif")
+    canon_sid = _register(canon, owner["user_id"])
+    _sql("UPDATE conversion_jobs SET state='ready' WHERE id=%s", (job["id"],))
+    r = c.get("/api/conversions/%s" % job["id"])
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.get_json().get("slide_id") == canon_sid

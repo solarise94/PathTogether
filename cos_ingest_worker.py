@@ -862,20 +862,33 @@ def process_validating(cos=None, state=None):
         anonymous_took_platform = (ours == "" and platform_owner
                                    and meta_owner == platform_owner)
         if meta_owner and meta_owner != ours and not anonymous_took_platform:
-            # 名称已被他人持有：恢复认领场景 dest 是对方文件（绝不动）；
-            # 本任务提升场景 dest 是本任务字节——但**不做任何按路径的删除**
-            # （review 第四轮 P1）：同名文件的提升/替换/删除没有跨进程互斥，
-            # 「检查身份 → unlink」两步之间路径可被并发者先删后建，按路径
-            # unlink 必然存在误删他人新文件的窗口（inode 守卫收窄但不消除）。
-            # 残局交人工：日志给出 still_ours 判定，为真时需人工移除本任务
-            # 滞留在他人名下的文件；fail-closed 不猜、不破坏。
+            # 名称已被他人持有。恢复认领场景（文件本属对方）：绝不动。
+            # 本任务提升场景：dest 是本任务字节且不可安全按路径删除
+            # （第四轮 P1），保留文件的同时必须收口可见性（第五轮 P1：
+            # 列表/读取按 slides.owner_user_id 判定，不收口就把本上传内容
+            # 暴露给旧主人及其历史授权）——**元数据归属强制跟随实际文件**：
+            # 仅当 dest 仍是本任务提升的那份（still_ours）时，单事务撤销
+            # 旧 view 授权并把归属 CAS 转移给本任务主人（旧 alias/note 一并
+            # 复位，不泄露旧主人备注）；已非本任务文件（被并发替换）则保持
+            # 对方元数据不动（对方文件配对方元数据，自洽）。残余窗口：stat
+            # 判定后、转移提交前被替换——DB/FS 无法跨系统原子，届时
+            # outcome=transferred 但内容不符，error 日志交人工核对。
             if not adopted_existing:
                 still_ours = (promoted_ident is not None
                               and _stat_ident(dest) == promoted_ident)
-                _log.error(
-                    "归属终检拒绝：dest 不按路径删除（still_ours=%s；为 true "
-                    "时需人工清理本任务滞留文件）（job=%s name=%s）",
-                    still_ours, job_id, safe_name)
+                if still_ours:
+                    outcome = share_store.force_slide_owner_follow_file(
+                        safe_name, expected_owner=meta_owner,
+                        new_owner=(ours or None),
+                        requester_role=user_store.ROLE_OWNER)
+                    _log.error(
+                        "归属终检拒绝：dest 保留，元数据跟随文件转移给上传者"
+                        "（outcome=%s；任务 failed，滞留文件由上传者自行删除）"
+                        "（job=%s name=%s）", outcome, job_id, safe_name)
+                else:
+                    _log.error(
+                        "归属终检拒绝：dest 已非本任务文件，保持对方元数据"
+                        "不动（job=%s name=%s）", job_id, safe_name)
             _unlink_quiet(part_path)
             ist.fail_job(job_id, gen, "name_unavailable")
             _log.warning("归属终检失败：名称已被其它账号持有（job=%s）",

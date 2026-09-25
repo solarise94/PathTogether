@@ -118,6 +118,8 @@ _PUBLIC_NAMES = (
     "get_ai_session_drawing_generation",
     "reserve_ai_session_drawing_generation",
     "cas_ai_session_drawing_flag",
+    # COS 摄取归属终检冲突收口（review 第五轮）：元数据归属跟随实际文件
+    "force_slide_owner_follow_file",
 )
 
 import share_store_pg as _pg

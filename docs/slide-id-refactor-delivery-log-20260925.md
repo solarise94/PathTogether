@@ -94,3 +94,21 @@
 - 机器通道无行兼容分支、set_slide_meta 同名复活（P1-B2 #6）→ P3 强制收口。
 - 内容 revision 来源仍是 mtime:size；slide_assets.legacy_revision 消费在 P3/P4。
 - 前端 static/ 切 ID（下一阶段）；浏览器实测（P2 完成标准）待前端落地后执行。
+
+## P2 前端 + HP2 + 收口（2026-09-26）
+
+**P2 前端（提交 8a724c8）**：state.slide 唯一操作键=id；openSlide/列表/URL 通道（新增 ?slide=<id>）/上传完成打开/项目分享标注载荷全部 ID 化；localStorage 续传 v3 键（账户域+upload_id，v2 一次性迁移）；slideIdApiOn() 能力协商 helper；slide.opened 载荷带 id。test:js 562 passed（+9 合同用例）。
+
+**P2-HP2（HistoPilot f78f7c3）**：flask-client/legacy-flask-adapter 双字段（slide-id ref 仅发 slide_id、不发名）；跨仓契约测试 slide-id-contract.integration.test.ts 三场景（同显示名双资产全链路不串/删除失效/旧名兼容+tombstone 不复活）——真实 PT flask + pgserver + openslide。四门禁 build+unit 1146+integration 340+contract 49 全绿（编排方独立复核一致）。
+
+**前端发现的后端五缺口收口（提交 b972ea5）**：share 列表带 slide_id、分享 ROI 双字段、research 白名单放开 slide_id、render-context by-id（主站+分享端）、conversions GET 带 slide_id；5 个回归用例入 test_slide_id_relations_pg.py（19 total）。修复过程把 `_reject_preset_rect*`/`_slide_dims_and_mpp` 增 path 透传（7 处 monkeypatch lambda 签名随适配，断言不动；修复中误吞行尾闭括号已当场修复并复跑验证）。
+
+**浏览器实测（隔离实例：pgserver + tmp UPLOAD_DIR，app 8123 + share_server 38000）**：
+- 列表两片同显示名「同名切片QA」并存，行 `data-slide-id` 各异（sld_iJvBYLjDgzaN 96×64 / sld_73HQTw7UpBUX 160×128）。
+- `?slide=<id>` URL 通道打开；info 请求走 `/api/slides/<id>/info`（ID 原生端点）；两片打开内容尺寸正确不串。
+- PATCH display_name by ID 生效、ID 不变；列表/标题显示新名。
+- 分享（slide_ids 创建）页 chips 按 data-slide-id 键控、同名并存；chip 打开渲染真实内容（截图证据）；分享列表带 slide_id（缺口①线上验证）。
+- 删除 alpha：主站 info 403（tombstone 门禁）、beta 照常；分享列表 alpha exists=False；分享 DZI alpha 403 / beta 200。
+- 结论：P2 完成标准（同显示名分别打开/标注/分享/关联项目、改名不串片、两仓合同测试、真实浏览器验证）全部通过。上传/标注的浏览器路径由 JS 测试与跨仓契约测试覆盖（IAB 不支持文件选择器上传，上传经 API 注入）。
+
+**P2 门禁合计**：PT 全量 2664 passed / 1 已知无关失败（admin 0.4.13）；JS 562；HP 四门禁全绿。

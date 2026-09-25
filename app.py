@@ -422,6 +422,10 @@ def _ensure_conversion_job(ident, *, source_name, source_sha256, upload_id,
 def _conversion_accepted_body(job):
     view = conversion_store.public_view(job)
     view["status"] = "conversion_pending"
+    # slide ID 化（P2 合同 §5.2）：转换 ready 后的打开目标按 ID（canonical
+    # 名 → slides 行）；未 ready/行未注册时为 None（前端继续轮询）
+    canon = job.get("canonical_name") or ""
+    view["slide_id"] = (share_store.get_slide_id(canon) or None) if canon else None
     return view
 
 
@@ -11889,7 +11893,9 @@ def api_upload():
                     return jsonify(_conversion_accepted_body(job)), 202
                 except Exception:
                     app.logger.exception("V1 committed 补建 conversion 失败")
-            return jsonify(name=safe)
+            return jsonify(name=safe,
+                       # slide ID 化（P2 合同 §5.2）：完成响应携带 slide_id
+                       slide_id=share_store.get_slide_id(safe) or None)
         # 恢复流程已回滚（提升被撤/未提升）：清孤儿文件并允许重试
         app.logger.warning("V1 上传收口被恢复流程回滚：%s", upload_id)
         dest.unlink(missing_ok=True)
@@ -11923,7 +11929,9 @@ def api_upload():
             body["name"] = job.get("canonical_name")
             return jsonify(body), 200
         return jsonify(body), 202
-    return jsonify(name=safe)
+    return jsonify(name=safe,
+                       # slide ID 化（P2 合同 §5.2）：完成响应携带 slide_id
+                       slide_id=share_store.get_slide_id(safe) or None)
 
 
 def _api_upload_zip(file, filename, safe, ident, reservation):
@@ -12000,6 +12008,10 @@ def _api_upload_zip(file, filename, safe, ident, reservation):
                 return jsonify(error="归属登记失败，请重试"), 503
 
         # 短事务 B：committed + 配额同事务转实占（G7 步骤 3）
+        # slide ID 化（P2 合同 §5.2）：zip 完成响应带主切片 slide_id 与
+        # 逐 extracted 的 slide_ids 映射（前端打开目标不再按名猜）
+        _zip_slide_ids = {n: (share_store.get_slide_id(n) or None)
+                          for n in [bundle["main"]] + list(bundle["slides"])}
         try:
             upload_task_store.finish_commit(
                 upload_id, token, _upload_manifest_sha(artifacts),
@@ -12007,7 +12019,9 @@ def _api_upload_zip(file, filename, safe, ident, reservation):
         except upload_task_store.StateConflict as e:
             cur = e.task or {}
             if cur.get("state") == upload_task_store.STATE_COMMITTED:
-                return jsonify(name=bundle["main"], extracted=bundle["slides"])
+                return jsonify(name=bundle["main"], extracted=bundle["slides"],
+                               slide_id=_zip_slide_ids.get(bundle["main"]),
+                               slide_ids=_zip_slide_ids)
             app.logger.warning("V1 zip 上传收口被恢复流程回滚：%s", upload_id)
             _upload_legacy_fail(upload_id, token, task, permanent=False,
                                 remove_names=[a["name"] for a in artifacts])
@@ -12022,7 +12036,9 @@ def _api_upload_zip(file, filename, safe, ident, reservation):
             app.logger.exception(
                 "V1 zip 上传收口失败（任务保持 committing，由恢复扫描幂等补账）：%s",
                 upload_id)
-        return jsonify(name=bundle["main"], extracted=bundle["slides"])
+        return jsonify(name=bundle["main"], extracted=bundle["slides"],
+                       slide_id=_zip_slide_ids.get(bundle["main"]),
+                       slide_ids=_zip_slide_ids)
     finally:
         # 暂存目录兜底清理（成功路径已在 _promote_zip_bundle 内清理）
         shutil.rmtree(bundle["tmp_dir"], ignore_errors=True)
@@ -12281,6 +12297,11 @@ def _upload_v2_state_dict(task, **extra):
         "chunk_size": int(task["chunk_size"]),
         "expires_at": (float(task["expires_at"])
                        if task.get("expires_at") else None),
+        # slide ID 化（P2 合同 §5.2）：上传状态/完成响应携带 slide_id——
+        # 前端打开目标不再按名猜；committed 前行未注册（None），前端继续
+        # 按 upload_id 轮询。
+        "slide_id": (share_store.get_slide_id(task.get("safe_name") or "")
+                     or None),
     }
     body.update(extra)
     return body
@@ -12843,6 +12864,9 @@ def _ingestion_state_body(job, *, queue_position=None):
                          for p in job["part_plan_json"]]
     if job.get("slide_canonical_name"):
         body["slide"] = job["slide_canonical_name"]
+        # slide ID 化（P2 合同 §5.2）：COS 完成后的打开目标按 ID
+        body["slide_id"] = share_store.get_slide_id(
+            job["slide_canonical_name"]) or None
     if queue_position is not None:
         body["queue_position"] = queue_position
     return body

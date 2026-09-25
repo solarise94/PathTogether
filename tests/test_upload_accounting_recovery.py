@@ -146,7 +146,7 @@ def test_v1_single_file_success_uses_task_machine():
     data = b"single-slide-bytes"
     r = _upload(_client(), name="s1.svs", content=data)
     assert r.status_code == 200, r.get_data(as_text=True)
-    assert r.get_json() == {"name": "s1.svs"}
+    assert r.get_json() == {"name": "s1.svs", "slide_id": share_store.get_slide_id("s1.svs")}
     tasks = _tasks()
     assert len(tasks) == 1
     t = tasks[0]
@@ -201,7 +201,10 @@ def test_v1_zip_companion_files_in_manifest_not_slides():
     main, comp = b"mrxs-main", b"companion-data"
     r = _upload_zip(c, [("S.mrxs", main), ("S/", b""), ("S/d.dat", comp)])
     assert r.status_code == 200, r.get_data(as_text=True)
-    assert r.get_json() == {"name": "S.mrxs", "extracted": ["S.mrxs"]}
+    _zip_sid = share_store.get_slide_id("S.mrxs")
+    assert r.get_json() == {"name": "S.mrxs", "extracted": ["S.mrxs"],
+                            "slide_id": _zip_sid,
+                            "slide_ids": {"S.mrxs": _zip_sid}}
     t = _tasks()[0]
     arts = {x["name"]: x for x in t["v1_artifacts"]}
     assert set(arts) == {"S.mrxs", "S/d.dat"}

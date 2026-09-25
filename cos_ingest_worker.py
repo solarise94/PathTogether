@@ -125,8 +125,9 @@ def part_name(job_id: str) -> str:
 def _stat_ident(path):
     """路径的文件身份 (st_dev, st_ino)；stat 失败返回 None。
 
-    归属拒绝时删除 dest 前的同一性守卫用：只删「本任务提升的那份」，
-    路径已被并发者替换时不误删他人文件（review 第三轮 P1）。
+    归属拒绝分支的**诊断**用（review 第四轮 P1 后不再据此删除）：判定
+    dest 是否仍为本任务提升的那份，供人工清理滞留文件时参考。stat 与
+    unlink 之间无原子性，任何「检查后再删」都有误删并发替换文件的窗口。
     """
     try:
         st = os.stat(path)
@@ -782,7 +783,7 @@ def process_validating(cos=None, state=None):
         elif os.path.exists(part_path):
             try:
                 _promote_no_clobber(part_path, dest)
-                promoted_ident = _stat_ident(dest)  # 删除守卫的同一性基准
+                promoted_ident = _stat_ident(dest)  # 归属拒绝时诊断用基准
             except FileExistsError:
                 _unlink_quiet(part_path)
                 ist.fail_job(job_id, gen, "name_unavailable")
@@ -862,17 +863,19 @@ def process_validating(cos=None, state=None):
                                    and meta_owner == platform_owner)
         if meta_owner and meta_owner != ours and not anonymous_took_platform:
             # 名称已被他人持有：恢复认领场景 dest 是对方文件（绝不动）；
-            # 本任务提升场景 dest 原则上是本任务字节——但**删除前必须过
-            # (dev, ino) 同一性守卫**：提升与拒绝之间路径可能已被并发者
-            # 替换（先删后建同路径），按路径删除会误删他人新文件；身份
-            # 不符时只失败不删除（review 第三轮 P1）。
+            # 本任务提升场景 dest 是本任务字节——但**不做任何按路径的删除**
+            # （review 第四轮 P1）：同名文件的提升/替换/删除没有跨进程互斥，
+            # 「检查身份 → unlink」两步之间路径可被并发者先删后建，按路径
+            # unlink 必然存在误删他人新文件的窗口（inode 守卫收窄但不消除）。
+            # 残局交人工：日志给出 still_ours 判定，为真时需人工移除本任务
+            # 滞留在他人名下的文件；fail-closed 不猜、不破坏。
             if not adopted_existing:
-                if promoted_ident is not None and \
-                        _stat_ident(dest) == promoted_ident:
-                    _unlink_quiet(dest)
-                else:
-                    _log.warning("归属终检拒绝，但 dest 已非本任务提升的"
-                                 "文件，不删除（job=%s）", job_id)
+                still_ours = (promoted_ident is not None
+                              and _stat_ident(dest) == promoted_ident)
+                _log.error(
+                    "归属终检拒绝：dest 不按路径删除（still_ours=%s；为 true "
+                    "时需人工清理本任务滞留文件）（job=%s name=%s）",
+                    still_ours, job_id, safe_name)
             _unlink_quiet(part_path)
             ist.fail_job(job_id, gen, "name_unavailable")
             _log.warning("归属终检失败：名称已被其它账号持有（job=%s）",

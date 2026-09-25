@@ -71,6 +71,7 @@ import cos_pool_store  # noqa: E402
 import ingestion_store as ist  # noqa: E402
 import pg_store  # noqa: E402
 import share_store  # noqa: E402
+import share_store_pg  # noqa: E402  # 归属终检读 _OWNER_USER_ID（匿名回落）
 import slide_io  # noqa: E402
 import upload_guard  # noqa: E402
 import user_store  # noqa: E402
@@ -347,6 +348,11 @@ def _verify_parts_against_plan(parts, plan, declared_size) -> str:
     return ""
 
 
+class _RecoveryTransient(Exception):
+    """Complete 恢复路径的瞬态网络失败——保持 completing 下轮重试
+    （review 第二轮 P1：首次 HEAD 超时被误当永久失败）。"""
+
+
 def _is_no_such_upload(exc) -> bool:
     """ListParts 异常是否为「uploadId 已消耗/不存在」（404 NoSuchUpload）。
 
@@ -358,28 +364,38 @@ def _is_no_such_upload(exc) -> bool:
 
 
 def _recover_completed_head(cos, job_id, gen, key, declared_size):
-    """Complete 响应丢失后的恢复：HEAD latest 证明 Complete 属于本任务。
+    """Complete 响应丢失后的恢复：版本列举证明 Complete 属于本任务。
 
     对象 key ``incoming/<owner>/<job>/<rand>`` 由服务端为本任务独占生成，
-    浏览器只有绑定该 key+uploadId 的 UploadPart 授权——latest 存在且大小
-    ==declared 即可证明该版本是本任务的 Complete 产物（不存在他人代写或
-    部分上传成整对象的路径）。返回 version_id；无法证明返回 None。
+    浏览器只有绑定该 key+uploadId 的 UploadPart 授权——该 key 下存在
+    size==declared 的对象版本即可证明它是本任务的 Complete 产物（不存在
+    他人代写或部分上传成整对象的路径）。用 ListObjectVersions（而非
+    HEAD latest：部分实现/桩不支持无版本号的 latest 语义）取精确 key 的
+    版本。
+
+    返回 version_id；**不可恢复的否定证据**（key 下无整对象/大小不符）
+    返回 None → 调用方 fail；**瞬态错误**（列举失败）抛 _RecoveryTransient
+    → 调用方保持 completing 下轮重试——网络抖动永不构成失败依据。
     """
     try:
-        head = cos.head_object(key, None)
+        items, truncated, _marker = cos.list_object_versions_page(prefix=key)
     except cos_client.CosClientError as exc:
-        _log.warning("Complete 恢复 HEAD latest 失败（job=%s）：%s",
-                     job_id, exc)
+        raise _RecoveryTransient(str(exc)) from exc
+    matches = [v for v in items
+               if v.get("key") == key and not v.get("is_delete_marker")
+               and int(v.get("size") or 0) == int(declared_size)]
+    if not matches:
+        _log.warning("Complete 恢复：key 下无大小相符的整对象（job=%s）",
+                     job_id)
         return None
-    if int(head.get("size") or 0) != int(declared_size):
-        return None
-    version = head.get("version_id") or ""
+    latest = next((v for v in matches if v.get("is_latest")), matches[0])
+    version = latest.get("version_id") or ""
     if not version:
         return None
     ist.worker_record_complete(job_id, gen, version_id=version,
-                               etag=head.get("etag") or "",
+                               etag=latest.get("etag") or "",
                                size_bytes=int(declared_size))
-    _log.info("Complete 响应丢失，已按 latest 版本恢复（job=%s）", job_id)
+    _log.info("Complete 响应丢失，已按版本列举恢复（job=%s）", job_id)
     return version
 
 
@@ -419,10 +435,17 @@ def process_completing(cos=None, state=None):
             except cos_client.CosClientError as exc:
                 if _is_no_such_upload(exc):
                     # Complete 已发生但响应丢失（或上传被 Abort）：uploadId 已
-                    # 消耗。恢复路径——对象 key 为本任务独有，HEAD latest
+                    # 消耗。恢复路径——对象 key 为本任务独占，HEAD latest
                     # 且大小==declared 即可证明 Complete 属于本任务并补记版本。
-                    recovered = _recover_completed_head(
-                        cos, job_id, gen, key, job["declared_size"])
+                    try:
+                        recovered = _recover_completed_head(
+                            cos, job_id, gen, key, job["declared_size"])
+                    except _RecoveryTransient as exc:
+                        # 瞬态网络错误不构成失败依据：保持 completing 重试
+                        _release_lease(job_id, token, state)
+                        _log.warning("Complete 恢复 HEAD 瞬态失败，下轮重试"
+                                     "（job=%s）：%s", job_id, exc)
+                        return None
                     if recovered is None:
                         ist.fail_job(job_id, gen, "upload_lost_after_complete")
                         return job_id
@@ -724,6 +747,7 @@ def process_validating(cos=None, state=None):
     directory = _ensure_upload_dir()
     dest = os.path.join(directory, safe_name)
     intent = job.get("commit_intent_json")
+    adopted_existing = False
     if intent:
         # 崩溃恢复：sha 以 intent 为权威（提升前已算好），不重算 9.5GB。
         sha = intent.get("sha256") or ""
@@ -740,7 +764,7 @@ def process_validating(cos=None, state=None):
                 _log.warning("commit 恢复：目标文件内容与本任务不符，"
                              "按名称占用失败（job=%s）", job_id)
                 return None
-            pass  # 确属本次提交：直接进入 metadata/结算
+            adopted_existing = True  # 内容确属本任务，但文件可能非本任务落盘
         elif os.path.exists(part_path):
             try:
                 _promote_no_clobber(part_path, dest)
@@ -804,10 +828,28 @@ def process_validating(cos=None, state=None):
             ist.fail_job(job_id, gen, "name_unavailable")
             return None
     try:
-        share_store.set_slide_meta(
+        meta = share_store.set_slide_meta(
             safe_name,
             owner_user_id=(job.get("owner_user_id") or None),
             requester_role=user_store.ROLE_OWNER)
+        # 归属终检（review 第二轮 P1）：同名 slides 行已有**其它** owner 时
+        # set_slide_meta 不覆盖、只把现存 owner 返回——内容相同（sha 恰好
+        # 一致）的他人上传也会走到这里。不核返回值就会出现「本任务结算
+        # 成功、切片却归属他人」。匿名回落到平台 owner（_OWNER_USER_ID）
+        # 视为一致。
+        meta_owner = ((meta or {}).get("owner_user_id") or "").strip()
+        ours = (job.get("owner_user_id") or "").strip()
+        if meta_owner and meta_owner != ours and \
+                meta_owner != (share_store_pg._OWNER_USER_ID or ""):
+            # 名称已被他人持有：恢复认领场景 dest 是对方文件（绝不动）；
+            # 本任务提升场景 dest 是本任务字节（删除，把名称还原为无文件）。
+            if not adopted_existing:
+                _unlink_quiet(dest)
+            _unlink_quiet(part_path)
+            ist.fail_job(job_id, gen, "name_unavailable")
+            _log.warning("归属终检失败：名称已被其它账号持有（job=%s）",
+                         job_id)
+            return None
         ist.worker_settle_ready(
             job_id, gen, slide_canonical_name=safe_name, sha256_actual=sha,
             settle_bytes=os.path.getsize(dest))

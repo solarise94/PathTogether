@@ -95,6 +95,12 @@ class IngestionStateError(Exception):
     """非法状态转换 / CAS 冲突 / 已入库后取消等合同级拒绝。"""
 
 
+class CommitInProgress(IngestionStateError):
+    """本地提交已开始（commit intent 已持久化），取消被拒——落库后删除
+    走既有切片删除合同（review 740e823 P1-3：取消与提交之间需要原子裁决，
+    这里选择「提交开始后拒绝取消」，避免撤销提升/metadata 的文件竞态）。"""
+
+
 class StaleLease(Exception):
     """worker 失租（generation 过期）后的收口被拒——fencing 生效。"""
 
@@ -328,6 +334,10 @@ def _try_admit_txn(cur, job_id, *, disk_watermark_ok=True):
                 "job": _norm_row(cur.fetchone())}
     if not disk_watermark_ok:
         raise _AdmissionDeferred("disk_watermark")
+    # 活跃计数 fast-path（池锁前，仅省无谓工作，不做权威判定）。
+    # review 740e823 P2：权威判定在池锁内的 UPDATE 守卫子查询——准入都
+    # 串行于 cos_pool_state 行锁，持锁者的 UPDATE+commit 在锁内完成后，
+    # 后到者的守卫必然看到其已提交行；同步读取计数的双双准入在此被截断。
     per_identity, global_active = _active_counts(cur, job["owner_user_id"])
     if per_identity >= cos_config.COS_MAX_ACTIVE_UPLOADS_PER_IDENTITY:
         raise _AdmissionDeferred("identity_active_limit")
@@ -371,14 +381,23 @@ def _try_admit_txn(cur, job_id, *, disk_watermark_ok=True):
             "UPDATE ingestion_jobs SET state=%s, pool_reserved_bytes=%s, "
             "capacity_admitted_at=now(), job_deadline_at=now() + "
             "make_interval(secs => %s), local_reservation_id=%s, updated_at=now() "
-            "WHERE job_id=%s AND state=%s",
+            "WHERE job_id=%s AND state=%s "
+            # 全局活跃上限的原子守卫（池锁内）：守卫子查询看不到本行
+            #（此刻仍 waiting），但看得到先于本事务提交的其它活跃行。
+            "AND (SELECT COUNT(*) FROM ingestion_jobs WHERE state = ANY(%s)) "
+            "< %s",
             (PREPARING, job["declared_size"],
-             cos_config.COS_JOB_MAX_AGE_SECONDS, reservation_id, job_id, WAITING))
+             cos_config.COS_JOB_MAX_AGE_SECONDS, reservation_id, job_id,
+             WAITING, list(ACTIVE_UPLOAD_STATES),
+             cos_config.COS_MAX_ACTIVE_UPLOADS_GLOBAL))
     except psycopg.errors.UniqueViolation as exc:
         if (getattr(exc.diag, "constraint_name", "") or "") == \
                 "ingestion_jobs_one_active_per_owner":
             raise _AdmissionDeferred("identity_active_limit")
         raise
+    if cur.rowcount != 1:
+        # 守卫未过：全局活跃名额已被并发准入占用 → 整体回滚保持等待
+        raise _AdmissionDeferred("global_active_limit")
     _append_event(cur, job_id, "admitted", {
         "pool_reserved_bytes": job["declared_size"],
         "local_quota_reserved": quota_applies})
@@ -554,14 +573,85 @@ def worker_back_to_uploading(job_id, generation, *, reason):
         (), "complete_rejected", {"reason": reason})
 
 
+def worker_record_complete(job_id, generation, *, version_id, etag,
+                           size_bytes):
+    """Complete 成功后**立即**持久化源身份（状态保持 completing）。
+
+    review 740e823 P1-1：此前 version_id 只在 HEAD 成功后随 pin_source 落库；
+    Complete 与 HEAD 之间崩溃会让 uploadId 已被消耗而库内无版本，下轮
+    ListParts 持续 NoSuchUpload，任务卡死到超期。持久化后，崩溃恢复从
+    ``cos_version_id`` 直接进入 HEAD 验证。generation-guarded；幂等
+    （重复记录同值 no-op，值不同 fail-closed 拒绝）。
+    """
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                job = get_job_locked(cur, job_id)
+                if job is None:
+                    raise IngestionStateError("ingestion job 不存在：%r" % job_id)
+                if job["worker_generation"] != int(generation):
+                    raise StaleLease("generation 过期（complete 记录被拒）")
+                if job["state"] != COMPLETING:
+                    raise IngestionStateError(
+                        "complete 记录要求 completing（当前 %s）" % job["state"])
+                if job.get("cos_version_id") and \
+                        job["cos_version_id"] != version_id:
+                    raise IngestionStateError(
+                        "cos_version_id 已存在且不一致（%s != %s）——人工核查"
+                        % (job["cos_version_id"], version_id))
+                if job.get("cos_version_id"):
+                    return _norm_row(job)  # 幂等
+                cur.execute(
+                    "UPDATE ingestion_jobs SET cos_version_id=%s, "
+                    "source_etag=%s, source_size_bytes=%s, updated_at=now() "
+                    "WHERE job_id=%s",
+                    (version_id, etag, int(size_bytes), job_id))
+                _append_event(cur, job_id, "complete_recorded",
+                              {"size_bytes": int(size_bytes)})
+                cur.execute("SELECT * FROM ingestion_jobs WHERE job_id=%s",
+                            (job_id,))
+                return _norm_row(cur.fetchone())
+    finally:
+        conn.close()
+
+
 def worker_pin_source(job_id, generation, *, version_id, etag, size_bytes):
-    """worker ListParts 核对 + Complete + HEAD 后钉源：completing → queued。"""
-    return _worker_transition(
-        job_id, generation, {COMPLETING}, QUEUED,
-        ", cos_version_id=%s, source_etag=%s, source_size_bytes=%s",
-        (version_id, etag, int(size_bytes)),
-        "source_pinned",
-        {"version_bound": True, "size_bytes": int(size_bytes)})
+    """worker ListParts 核对 + Complete + HEAD 后钉源：completing → queued。
+
+    允许从已 ``worker_record_complete`` 的行推进（version 一致性校验：
+    与已记录版本不同则拒绝，防止旧 worker 覆盖）。"""
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                job = get_job_locked(cur, job_id)
+                if job is None:
+                    raise IngestionStateError("ingestion job 不存在：%r" % job_id)
+                if job["worker_generation"] != int(generation):
+                    raise StaleLease("generation 过期（pin 收口被拒）")
+                if job["state"] != COMPLETING:
+                    raise IngestionStateError(
+                        "pin 要求 completing（当前 %s）" % job["state"])
+                if job.get("cos_version_id") and \
+                        job["cos_version_id"] != version_id:
+                    raise IngestionStateError(
+                        "cos_version_id 与已记录不一致（%s != %s）"
+                        % (job["cos_version_id"], version_id))
+                _require_transition(job, QUEUED)
+                cur.execute(
+                    "UPDATE ingestion_jobs SET state=%s, cos_version_id=%s, "
+                    "source_etag=%s, source_size_bytes=%s, updated_at=now() "
+                    "WHERE job_id=%s",
+                    (QUEUED, version_id, etag, int(size_bytes), job_id))
+                _append_event(cur, job_id, "source_pinned",
+                              {"version_bound": True,
+                               "size_bytes": int(size_bytes)})
+                cur.execute("SELECT * FROM ingestion_jobs WHERE job_id=%s",
+                            (job_id,))
+                return _norm_row(cur.fetchone())
+    finally:
+        conn.close()
 
 
 def worker_begin_download(job_id, generation):
@@ -827,6 +917,10 @@ def record_sign_batch(job_id, part_numbers):
 def cancel_job(job_id, *, reason_code="cancelled_by_user"):
     """幂等取消（§4 cancel）。已入库 ready/completed → IngestionStateError。
 
+    **提交互斥（review 740e823 P1-3）**：validating 且 commit intent 已
+    持久化 → CommitInProgress 拒绝——此时文件即将落库，取消无法原子撤销
+    提升与 metadata；落库后删除走既有切片删除合同。
+
     锁序 job → reservation → quota（释放本地预占）；pool_reserved 不动——
     确认远端清理完成后由 finalize_cleanup 释放（§6.2）。
     """
@@ -841,6 +935,11 @@ def cancel_job(job_id, *, reason_code="cancelled_by_user"):
                     raise IngestionStateError(
                         "已本地入库（%s）——删除走既有切片删除合同，不上传取消"
                         % job["state"])
+                if (job["state"] == VALIDATING
+                        and job.get("commit_intent_json")):
+                    raise CommitInProgress(
+                        "本地提交进行中（commit intent 已持久化）——不可取消；"
+                        "落库后如需删除走既有切片删除合同")
                 if job["state"] in TERMINAL_STATES:
                     return _norm_row(job)  # 幂等
                 _require_transition(job, CANCELLED)
@@ -930,6 +1029,16 @@ def sweep_expired_jobs():
                 for jid in ids:
                     job = get_job_locked(cur, jid)
                     if job["state"] in TERMINAL_STATES:
+                        continue
+                    if (job["state"] == VALIDATING
+                            and job.get("commit_intent_json")):
+                        # 提交互斥同款裁决（review P1-3）：intent 已持久化的
+                        # 任务即将落库，超期取消会重演「取消赢了、文件仍落地」
+                        # 的竞态。跳过并记事件；提交 reconciler 收口后自然离开
+                        # 活跃集。若 worker 长期死亡导致卡 validating+intent，
+                        # 由告警人工处置（不自动删除已提交副本）。
+                        _append_event(cur, jid, "deadline_deferred_commit",
+                                      {"reason": "commit_intent_present"})
                         continue
                     if job.get("local_reservation_id"):
                         upload_guard.release_reservation_locked(

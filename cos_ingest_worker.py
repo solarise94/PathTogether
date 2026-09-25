@@ -121,6 +121,26 @@ def part_name(job_id: str) -> str:
     return ".ingesting-%s.part" % job_id
 
 
+def _file_sha256_matches(path, expected_hex) -> bool:
+    """流式比对文件 SHA-256（提交恢复的内容级归属核实，P1-2）。
+
+    expected_hex 非法/为空一律 False（fail-closed，不猜）。
+    """
+    if not expected_hex or len(expected_hex) != 64:
+        return False
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            while True:
+                buf = f.read(_IO_BUF_BYTES)
+                if not buf:
+                    break
+                h.update(buf)
+    except OSError:
+        return False
+    return h.hexdigest() == expected_hex.lower()
+
+
 def make_object_key(job) -> str:
     """服务端生成对象 key（§3.1）：incoming/<owner|anon>/<job_id>/<rand>。
 
@@ -327,6 +347,42 @@ def _verify_parts_against_plan(parts, plan, declared_size) -> str:
     return ""
 
 
+def _is_no_such_upload(exc) -> bool:
+    """ListParts 异常是否为「uploadId 已消耗/不存在」（404 NoSuchUpload）。
+
+    cos_client 的脱敏消息固定含「HTTP <code> <Code>」，按 404+NoSuchUpload
+    双特征识别；宁可把可疑错误当瞬态重试（下轮仍会走到这里），不误判恢复。
+    """
+    text = str(exc)
+    return "404" in text and "NoSuchUpload" in text
+
+
+def _recover_completed_head(cos, job_id, gen, key, declared_size):
+    """Complete 响应丢失后的恢复：HEAD latest 证明 Complete 属于本任务。
+
+    对象 key ``incoming/<owner>/<job>/<rand>`` 由服务端为本任务独占生成，
+    浏览器只有绑定该 key+uploadId 的 UploadPart 授权——latest 存在且大小
+    ==declared 即可证明该版本是本任务的 Complete 产物（不存在他人代写或
+    部分上传成整对象的路径）。返回 version_id；无法证明返回 None。
+    """
+    try:
+        head = cos.head_object(key, None)
+    except cos_client.CosClientError as exc:
+        _log.warning("Complete 恢复 HEAD latest 失败（job=%s）：%s",
+                     job_id, exc)
+        return None
+    if int(head.get("size") or 0) != int(declared_size):
+        return None
+    version = head.get("version_id") or ""
+    if not version:
+        return None
+    ist.worker_record_complete(job_id, gen, version_id=version,
+                               etag=head.get("etag") or "",
+                               size_bytes=int(declared_size))
+    _log.info("Complete 响应丢失，已按 latest 版本恢复（job=%s）", job_id)
+    return version
+
+
 def process_completing(cos=None, state=None):
     """领取 COMPLETING：核对 → Complete（必须拿到 versionId）→ HEAD 核 size → 钉源。
 
@@ -349,40 +405,65 @@ def process_completing(cos=None, state=None):
             # JSONB 损坏 fail-closed（store 侧已把坏 JSON 归 None）：不猜计划。
             ist.fail_job(job_id, gen, "part_plan_lost")
             return None
-        try:
-            parts = cos.list_parts(key, upload_id)
-        except cos_client.CosConfigMissing:
-            _release_lease(job_id, token, state)
-            _log.warning("COS 配置缺失，completing 空转（job=%s）", job_id)
-            return None
-        except cos_client.CosClientError as exc:
-            _release_lease(job_id, token, state)
-            _log.warning("ListParts 失败，下轮重试（job=%s）：%s", job_id, exc)
-            return None
-        reason = _verify_parts_against_plan(parts, plan, job["declared_size"])
-        if reason:
-            ist.worker_back_to_uploading(job_id, gen, reason=reason)
-            _log.info("complete 核对未过，回 uploading（job=%s reason=%s）",
-                      job_id, reason)
-            return job_id
-        try:
-            result = cos.complete_multipart(key, upload_id, parts)
-        except cos_client.CosConfigMissing:
-            _release_lease(job_id, token, state)
-            return None
-        except cos_client.CosClientError as exc:
-            _release_lease(job_id, token, state)
-            _log.warning("Complete 失败，下轮重试（job=%s）：%s", job_id, exc)
-            return job_id
-        version_id = (result or {}).get("version_id") or ""
+        version_id = job.get("cos_version_id") or ""
         if not version_id:
-            # §3.1：必须钉死 versionId（否则下载窗口内同 key 可被替换）。
-            ist.fail_job(job_id, gen, "source_version_missing")
-            return job_id
+            # 尚未 Complete：核对 → Complete → **立即落库**（review 740e823
+            # P1-1：Complete 与 HEAD 之间崩溃会让 uploadId 被消耗而库内无
+            # 版本，下轮 ListParts 永远 NoSuchUpload）。
+            try:
+                parts = cos.list_parts(key, upload_id)
+            except cos_client.CosConfigMissing:
+                _release_lease(job_id, token, state)
+                _log.warning("COS 配置缺失，completing 空转（job=%s）", job_id)
+                return None
+            except cos_client.CosClientError as exc:
+                if _is_no_such_upload(exc):
+                    # Complete 已发生但响应丢失（或上传被 Abort）：uploadId 已
+                    # 消耗。恢复路径——对象 key 为本任务独有，HEAD latest
+                    # 且大小==declared 即可证明 Complete 属于本任务并补记版本。
+                    recovered = _recover_completed_head(
+                        cos, job_id, gen, key, job["declared_size"])
+                    if recovered is None:
+                        ist.fail_job(job_id, gen, "upload_lost_after_complete")
+                        return job_id
+                    version_id = recovered
+                else:
+                    _release_lease(job_id, token, state)
+                    _log.warning("ListParts 失败，下轮重试（job=%s）：%s",
+                                 job_id, exc)
+                    return None
+            else:
+                reason = _verify_parts_against_plan(
+                    parts, plan, job["declared_size"])
+                if reason:
+                    ist.worker_back_to_uploading(job_id, gen, reason=reason)
+                    _log.info("complete 核对未过，回 uploading"
+                              "（job=%s reason=%s）", job_id, reason)
+                    return job_id
+                try:
+                    result = cos.complete_multipart(key, upload_id, parts)
+                except cos_client.CosConfigMissing:
+                    _release_lease(job_id, token, state)
+                    return None
+                except cos_client.CosClientError as exc:
+                    _release_lease(job_id, token, state)
+                    _log.warning("Complete 失败，下轮重试（job=%s）：%s",
+                                 job_id, exc)
+                    return job_id
+                version_id = (result or {}).get("version_id") or ""
+                if not version_id:
+                    # §3.1：必须钉死 versionId（否则下载窗口内同 key 可被替换）。
+                    ist.fail_job(job_id, gen, "source_version_missing")
+                    return job_id
+                # Complete 成功 → 立即持久化版本（此后任何崩溃都从 HEAD 续起）
+                ist.worker_record_complete(
+                    job_id, gen, version_id=version_id,
+                    etag=(result or {}).get("etag") or "",
+                    size_bytes=job["declared_size"])
         try:
             head = cos.head_object(key, version_id)
         except cos_client.CosClientError as exc:
-            # Complete 已成功、HEAD 失败：下轮重试（versionId 已知，幂等 HEAD）。
+            # Complete 结果已落库，HEAD 幂等可重试。
             _release_lease(job_id, token, state)
             _log.warning("HEAD 失败，下轮重试（job=%s）：%s", job_id, exc)
             return job_id
@@ -394,8 +475,7 @@ def process_completing(cos=None, state=None):
                          job_id, size, job["declared_size"])
             return job_id
         ist.worker_pin_source(job_id, gen, version_id=version_id,
-                              etag=(head.get("etag") or result.get("etag")
-                                    or ""),
+                              etag=(head.get("etag") or ""),
                               size_bytes=size)
         _log.info("source 已钉死（job=%s size=%d）", job_id, size)
         return job_id
@@ -650,7 +730,17 @@ def process_validating(cos=None, state=None):
         part_path = os.path.join(
             directory, intent.get("part") or part_name(job_id))
         if os.path.exists(dest) and os.path.getsize(dest) == declared:
-            pass  # 已提升过：直接进入 metadata/结算
+            # review 740e823 P1-2：大小一致≠归属本任务——崩溃窗口内其它上
+            # 传可能创建同名同大小文件。恢复采纳前必须内容级核实（流式
+            # 比对 intent.sha256，仅在恢复路径付一次全读）；不符按 no-clobber
+            # 语义失败（目标名已被他人占用），绝不猜、不覆盖。
+            if not _file_sha256_matches(dest, sha):
+                _unlink_quiet(part_path)
+                ist.fail_job(job_id, gen, "name_unavailable")
+                _log.warning("commit 恢复：目标文件内容与本任务不符，"
+                             "按名称占用失败（job=%s）", job_id)
+                return None
+            pass  # 确属本次提交：直接进入 metadata/结算
         elif os.path.exists(part_path):
             try:
                 _promote_no_clobber(part_path, dest)
@@ -984,6 +1074,19 @@ def reconcile_tick(cos=None, state=None, *, force=False):
         return False
     observed = sum(int(v.get("size") or 0) for v in versions
                    if not v.get("is_delete_marker"))
+    # review 740e823 P1-4：未完成 multipart 的已传分块同样占据暂存池容量
+    # （碎片收费且计入 10 GB 预约口径，§6.1 observed_remote_bytes 的定义是
+    # 「对象版本和 multipart 碎片」）。逐 upload ListParts 求和；任何一次
+    # 读取失败保持 fail-closed——暂停准入，不得带着低估的观测值放行。
+    for up in uploads:
+        try:
+            parts = cos.list_parts(up["key"], up["upload_id"])
+        except cos_client.CosClientError as exc:
+            _log.warning("对账读取未完成分块失败，fail-closed 暂停准入"
+                         "（key=%s）：%s", up.get("key"), exc)
+            _pause_pool_reconcile()
+            return False
+        observed += sum(int(p.get("size") or 0) for p in parts)
     pool = cos_pool_store.get_pool_state()
     if pool is None:
         _pause_pool_reconcile()

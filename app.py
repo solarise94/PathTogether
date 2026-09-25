@@ -12370,6 +12370,10 @@ def api_ingestion_cancel(job_id):
         return err
     try:
         job = ingestion_store.cancel_job(job_id)
+    except ingestion_store.CommitInProgress as e:
+        # 提交已开始（intent 持久化）：取消被拒，落库后走切片删除合同
+        # （review 740e823 P1-3 取消/提交互斥）。
+        return jsonify(error=str(e), code="commit_in_progress"), 409
     except ingestion_store.IngestionStateError as e:
         return jsonify(error=str(e), code="already_committed"), 409
     return jsonify(_ingestion_state_body(job)), 202

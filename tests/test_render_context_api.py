@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 
 import _bootstrap  # noqa: F401  # session 目录 + openslide stub（conftest 先行）
-from _pt_helpers import csrf_client, isolate_app  # noqa: E402
+from _pt_helpers import csrf_client, isolate_app, register_slide_row  # noqa: E402, register_slide_row
 
 import share_server as share_srv  # noqa: E402
 import share_store  # noqa: E402
@@ -71,6 +71,7 @@ def _write(name, data):
     p = Path(app_mod.UPLOAD_DIR) / name
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(data)
+    register_slide_row(name)  # P3：无行兼容分支已删——夹具先注册行（owner NULL，后续可回填归属）
     return name
 
 
@@ -640,7 +641,9 @@ def test_token_roundtrip_with_derived_key_only(monkeypatch):
     payload = slide_render.verify_render_token(tok, secret)
     assert payload is not None
     assert payload["rev"] == app_mod._legacy_slide_revision(CYX_NAME)
-    assert payload["slide"] == CYX_NAME
+    # R-15（P2）：token 的 slide 绑定 = slide_id（注册行；无行兼容分支删除前
+    # 该夹具无行、按名绑定——先注册行后按 ID 绑定）
+    assert payload["slide"] == share_store.get_slide_id(CYX_NAME)
     assert payload["ctx"]["active_channels"][0]["index"] == 0
     # secret 换掉 → 失效（稳定码路径，不抛异常）
     assert slide_render.verify_render_token(tok, "rotated-secret") is None

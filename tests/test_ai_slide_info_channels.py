@@ -22,9 +22,10 @@ from pathlib import Path
 import pytest
 
 import _bootstrap  # noqa: F401  # session 目录 + openslide stub（conftest 先行）
-from _pt_helpers import csrf_client, isolate_app  # noqa: E402
+from _pt_helpers import csrf_client, isolate_app, register_slide_row  # noqa: E402, register_slide_row
 
-import app as app_mod  # noqa: E402
+import app as app_mod
+import share_store  # noqa: E402
 from _tiff_fixtures import make_ome_cyx_bytes, make_ome_tiff_bytes  # noqa: E402
 
 FLAG_ENV = "PATHTOGETHER_MULTICHANNEL_ENABLED"
@@ -64,6 +65,7 @@ def _write(name, data):
     p = Path(app_mod.UPLOAD_DIR) / name
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(data)
+    register_slide_row(name)  # P3：无行兼容分支已删——夹具先注册行（owner NULL，后续可回填归属）
     return name
 
 

@@ -293,6 +293,10 @@ def test_schema_migrations_recorded(conn):
         # accounted_bytes 等）、任务表显式 slide_id、share_slides 关系表、
         # 各引用表 slide_id 列、slide_delete_jobs。
         "0067_slide_asset_identity.sql",
+        # slide ID 化重构 P3（docs/slide-id-refactor-p3-contract-20260925.md
+        # §2）：upload_tasks.commit_intent_json——publish intent 与任务置
+        # committing 同事务持久化（崩溃恢复幂等重判的唯一证据源）。
+        "0068_upload_publish_intent.sql",
     ]
 
 

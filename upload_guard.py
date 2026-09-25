@@ -621,6 +621,24 @@ def add_used_bytes(user_id, nbytes):
         conn.close()
 
 
+def refund_used_bytes_locked(cur, user_id, nbytes):
+    """P3 删除结算原语（合同 §5 / R-12）：在调用方已打开的事务内幂等减少
+    used_bytes。
+
+    幂等键 = 状态机 CAS 本身（deleting→deleted 只成功一次，减账与 CAS 同
+    事务——重复 DELETE/worker 重试时 CAS 已不匹配，不再进入本函数）。空
+    user_id（owner/本地免登录无配额行）与 nbytes<=0 为 no-op；行缺失静默
+    （quota 行惰性建，删除路径不强制存在）。GREATEST(0,…) 兜底防负。
+    """
+    if not user_id or int(nbytes) <= 0:
+        return False
+    cur.execute(
+        "UPDATE upload_user_quotas SET "
+        "used_bytes = GREATEST(0, used_bytes - %s), updated_at=now() "
+        "WHERE user_id=%s", (int(nbytes), user_id))
+    return cur.rowcount > 0
+
+
 # --------------------------------------------------------------------------- #
 # 默认值依据汇总（上线前复核清单；详见各常量处注释）
 # --------------------------------------------------------------------------- #

@@ -22,6 +22,17 @@ PostgreSQL 唯一后端：``upload_tasks`` 表（migrations/0017）。状态转�
   begin_legacy_commit（V1 单请求直入 committing）/ list_tasks（恢复扫描与
   admin 观测的只读列举）
 
+P3（slide ID 化重构，docs/slide-id-refactor-p3-contract-20260925.md）：
+  - 任务行新增 slide_id（0067；allocate_slide 的唯一绑定源）与
+    commit_intent_json（0068；publish intent 与置 committing 同事务写入、
+    收口同事务清空——崩溃恢复按 intent 幂等重跑，见 slide_publish）。
+  - begin_commit(intent=…) / begin_legacy_commit(slide_id=…, intent=…) 在
+    CAS 内持久化 intent；generation 语义见 slide_publish（V2=commit_token，
+    V1 单请求="1"）。
+  - fail_active：新管线验证前置于受理后的确定性失败原语（active→failed）。
+  - staging 布局（.staging/<task_id>/<generation>/）由 app/slide_storage
+    派生，本模块不触文件系统。
+
 错误类型（路由映射稳定错误码）：
   TaskNotFound / StateConflict / OffsetMismatch / ChunkConflict / SizeMismatch
   （后四者携带 .task 快照，供 409 响应回当前 confirmed_offset 等进度字段）。
@@ -255,6 +266,11 @@ _TASK_FIELDS = (
     "last_chunk_sha256", "sha256_expected", "sha256_actual", "reservation_id",
     "state", "commit_token", "commit_started_at", "expires_at", "created_at",
     "updated_at", "v1_artifacts",
+    # 0067/0068（P3 合同 §2/§3.1）：单切片任务的资产绑定 + publish intent。
+    # slide_id 是任务→资产的唯一绑定源（幂等重试复用原任务及其 ID）；
+    # commit_intent_json 与任务置 committing 同事务写入（begin_commit /
+    # begin_legacy_commit 的 CAS 内），发布收口短事务内清空。
+    "slide_id", "commit_intent_json",
 )
 
 # epoch 秒（float/int）入参 → timestamptz 的键
@@ -263,6 +279,37 @@ _TS_KEYS = ("commit_started_at", "expires_at", "created_at", "updated_at")
 
 def _new_task_id():
     return "upt_" + secrets.token_hex(12)
+
+
+def new_task_id():
+    """预生成任务 ID（P3：V1 单文件在写盘期即建 .staging/<task_id>/ 暂存目录，
+    任务行稍后由 begin_legacy_commit 以同一 ID 落库）。"""
+    return _new_task_id()
+
+
+def encode_commit_intent(payload):
+    """publish intent dict → JSON 文本（None 原样；字段形态见 slide_publish）。"""
+    if payload is None:
+        return None
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+
+
+def decode_commit_intent(raw):
+    """commit_intent_json TEXT → dict；None（V2 无 intent/已收口）返回 None。
+
+    损坏（非法 JSON/非对象）返回 ``{}``（空 dict，与 None 区分）——调用方按
+    证据冲突 fail-closed（保持 committing 告警），绝不猜。
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _epoch_to_dt(v):
@@ -360,8 +407,11 @@ def _task_row(task):
     return tuple(_to_db_value(k, task[k]) for k in _TASK_FIELDS)
 
 
-def _pg_insert(task):
-    conn = _pg_connect()
+def _pg_insert(task, conn=None):
+    """INSERT 任务行；conn 给出时复用调用方事务（P3：allocate_slide 同事务绑定）。"""
+    own = conn is None
+    if own:
+        conn = _pg_connect()
     try:
         with pg_store.transaction(conn):
             with conn.cursor() as cur:
@@ -370,12 +420,21 @@ def _pg_insert(task):
                     % (_PG_COLS, ", ".join(["%s"] * len(_TASK_FIELDS))),
                     _task_row(task))
     finally:
-        conn.close()
+        if own:
+            conn.close()
 
 
 def create_task(owner_user_id, filename, safe_name, declared_size, chunk_size,
-                sha256_expected=None, reservation_id=None, ttl_seconds=None):
-    """创建任务（state=active，confirmed_offset=0）。返回新任务 dict。"""
+                sha256_expected=None, reservation_id=None, ttl_seconds=None,
+                slide_id=None, conn=None):
+    """创建任务（state=active，confirmed_offset=0）。返回新任务 dict。
+
+    P3（合同 §3.1.2）：``slide_id`` 是任务与预分配资产（slide_store
+    .allocate_slide，storage_layout='id_bundle'）的唯一绑定——创建任务与绑定
+    **同一事务**由调用方保证（app 侧 allocate_slide(conn=c) + create_task 经
+    同一连接；本函数自身只写任务行）。幂等重试复用原任务及其 slide_id
+    （V2 续传按 upload_id，不重新分配 ID）。
+    """
     ttl = UPLOAD_TASK_TTL_SECONDS if ttl_seconds is None else int(ttl_seconds)
     now = time.time()
     task = {
@@ -399,13 +458,16 @@ def create_task(owner_user_id, filename, safe_name, declared_size, chunk_size,
         "created_at": now,
         "updated_at": now,
         "v1_artifacts": None,
+        "slide_id": (str(slide_id) if slide_id else None),
+        "commit_intent_json": None,
     }
-    _pg_insert(task)
+    _pg_insert(task, conn=conn)
     return task
 
 
 def begin_legacy_commit(owner_user_id, filename, safe_name, artifacts,
-                        reservation_id=None, ttl_seconds=None):
+                        reservation_id=None, ttl_seconds=None,
+                        slide_id=None, intent=None, upload_id=None, conn=None):
     """V1（旧单请求 /api/upload）的 commit 受理（review-2026-08-29 §10.4 G7）。
 
     与 V2「create_task → 分片 → begin_commit」不同：V1 无分片阶段，请求字节
@@ -417,6 +479,16 @@ def begin_legacy_commit(owner_user_id, filename, safe_name, artifacts,
     artifacts 为**提升之前**持久化的 manifest（_encode_artifacts 校验归一）；
     declared_size = confirmed_offset = settle_bytes = Σsize（提升后转实占的
     权威字节数）。返回 (upload_id, commit_token, task)。
+
+    P3（合同 §3.1/§3.3）：
+      - ``slide_id``：V1 原生单文件新管线的资产绑定——与任务行**同一事务**
+        （调用方先 slide_store.allocate_slide(conn=conn)，本 INSERT 落在同一
+        事务；conn 参数即为此服务）。
+      - ``intent``：publish intent dict（slide_publish 六步第 3 步）——与置
+        committing 同事务落 commit_intent_json；generation 固定 ``"1"``
+        （V1 单请求无重试代次，合同 §3.2）。
+      - ``upload_id``：调用方预生成的任务 ID（V1 单文件在写盘期即以该 ID 建
+        ``.staging/<task_id>/1/`` 暂存目录）。
     """
     arts = _encode_artifacts(artifacts)
     total = sum(int(a["size"]) for a in arts)
@@ -425,7 +497,7 @@ def begin_legacy_commit(owner_user_id, filename, safe_name, artifacts,
     ttl = max(ttl, 2 * UPLOAD_COMMIT_TIMEOUT_SECONDS)
     now = time.time()
     task = {
-        "upload_id": _new_task_id(),
+        "upload_id": upload_id or _new_task_id(),
         "owner_user_id": str(owner_user_id or ""),
         "filename": str(filename),
         "safe_name": str(safe_name),
@@ -445,8 +517,16 @@ def begin_legacy_commit(owner_user_id, filename, safe_name, artifacts,
         "created_at": now,
         "updated_at": now,
         "v1_artifacts": arts,
+        "slide_id": (str(slide_id) if slide_id else None),
+        "commit_intent_json": None,
     }
-    _pg_insert(task)
+    if slide_id and intent is not None:
+        payload = dict(intent)
+        payload["task_ref"] = task["upload_id"]
+        payload["generation"] = "1"
+        payload["commit_token"] = task["commit_token"]
+        task["commit_intent_json"] = encode_commit_intent(payload)
+    _pg_insert(task, conn=conn)
     return task["upload_id"], task["commit_token"], task
 
 
@@ -516,11 +596,16 @@ def append_chunk(upload_id, offset, length, sha256, *, ttl_seconds=None):
     return action, task
 
 
-def begin_commit(upload_id, *, ttl_seconds=None):
+def begin_commit(upload_id, *, ttl_seconds=None, intent=None):
     """commit 三段式的短事务 A：active → committing，写 commit_token。§3.2.5
 
     前置（锁内权威）：state=active 且 confirmed_offset == declared_size。
     返回 (commit_token, task)。
+
+    P3（合同 §3.3 第 3 步）：``intent`` 给出时（V2 原生单文件新管线），publish
+    intent 与任务置 committing **同一事务**落 ``commit_intent_json``——token
+    由本 CAS 生成，注入 intent 的 ``generation``/``commit_token`` 字段后存储
+    （generation = commit_token：崩溃恢复可重判的任务代次，合同 §3.2）。
     """
     ttl = (UPLOAD_TASK_TTL_SECONDS if ttl_seconds is None else int(ttl_seconds))
     # 任务 TTL 至少盖过 commit 超时窗口，避免受理后任务先于恢复判定过期
@@ -538,6 +623,12 @@ def begin_commit(upload_id, *, ttl_seconds=None):
         token = "uct_" + secrets.token_hex(16)
         fields = {"state": STATE_COMMITTING, "commit_token": token,
                   "commit_started_at": now, "expires_at": now + ttl}
+        if intent is not None:
+            payload = dict(intent)
+            payload["task_ref"] = upload_id
+            payload["generation"] = token
+            payload["commit_token"] = token
+            fields["commit_intent_json"] = encode_commit_intent(payload)
         return fields, token
 
     task, token = _apply(upload_id, _mutate)
@@ -588,7 +679,10 @@ def _pg_finish_commit(upload_id, commit_token, sha256_actual, *, settle_bytes=No
                     upload_guard.consume_reservation_locked(
                         cur, rid, int(settle_bytes))
             fields = {"state": STATE_COMMITTED,
-                      "sha256_actual": sha256_actual or None}
+                      "sha256_actual": sha256_actual or None,
+                      # P3（合同 §3.3 第 6 步）：收口同事务清空 publish intent
+                      #（legacy 任务本就 NULL，no-op）。
+                      "commit_intent_json": None}
             new_row = _pg_update(conn, upload_id, fields)
             return _norm_row(new_row)
     finally:
@@ -621,6 +715,33 @@ def fail_commit(upload_id, commit_token, *, permanent, sha256_actual=None,
             now = time.time()
             fields = {"state": STATE_ACTIVE, "commit_token": None,
                       "commit_started_at": None, "expires_at": now + ttl}
+        return fields, None
+
+    task, _ = _apply(upload_id, _mutate)
+    if task is None:
+        raise TaskNotFound("上传任务不存在：%r" % upload_id)
+    return task
+
+
+def fail_active(upload_id, *, ttl_seconds=None, sha256_actual=None):
+    """P3（合同 §3.3）：active 任务的确定性失败 → failed（无 token 版）。
+
+    V2 新管线把内容验证（哈希/格式）放在 begin_commit **之前**，非法内容的
+    确定性失败发生时任务尚在 active（无 commit_token，fail_commit 不可用）。
+    分片已确认的内容不可修复重传，故直接 active → failed（调用方随后清
+    staging、释放预占、staging 资产行 mark_failed）。其余状态 StateConflict。
+    sha256_actual（可选）随失败落库（证据，同 fail_commit 口径）。
+    """
+    ttl = (UPLOAD_TASK_TTL_SECONDS if ttl_seconds is None else int(ttl_seconds))
+
+    def _mutate(task):
+        if task["state"] != STATE_ACTIVE:
+            raise StateConflict(
+                "仅 active 可直接判失败（当前 %r）" % task["state"], task)
+        fields = {"state": STATE_FAILED,
+                  "expires_at": time.time() + ttl}
+        if sha256_actual:
+            fields["sha256_actual"] = str(sha256_actual)
         return fields, None
 
     task, _ = _apply(upload_id, _mutate)

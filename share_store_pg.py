@@ -166,6 +166,12 @@ def set_owner_user_id(user_id: str) -> None:
     _OWNER_USER_ID = user_id or ""
 
 
+def get_owner_user_id() -> str:
+    """读取当前注入的 owner user_id（P3：无 UID 本地模式的上传资产 owner
+    解析口径——与 set_slide_meta 归属缺省值同一来源；空串 = 未配置）。"""
+    return _OWNER_USER_ID or ""
+
+
 # --------------------------------------------------------------------------- #
 # 内部工具
 # --------------------------------------------------------------------------- #
@@ -2256,11 +2262,15 @@ def _project_slide_rows(cur, slides, slide_ids=None):
     legacy_filename）；否则按名解析 slide_id（解析不到保持 NULL——与既有
     无行夹具兼容，唯一键 (project_id, slide_id) 对 NULL 不生效）。去重保序：
     slide_id 已见的行跳过（同名不同 ID 可并存）。
+    P3（合同 §3.4）：slide_ids-only 关联（名数组为空）合法——ids 长于
+    slides 时按 None 补齐（id_bundle 资产无名快照，行内 slide=""）。
     """
     rows = []
     seen_ids, seen_names = set(), set()
     slides = list(slides or [])
     ids = list(slide_ids) if slide_ids else [None] * len(slides)
+    if slide_ids and len(slides) < len(ids):
+        slides = slides + [None] * (len(ids) - len(slides))
     for name, sid_in in zip(slides, ids):
         sid = sid_in or None
         if sid is None and name:
@@ -2549,11 +2559,11 @@ def annotations_by_slide(subject=None, access_context=None):
             if subject is not None and not annotation_access.can_read_annotation(
                     subject, r, ctx):
                 continue
-            # P2（合同 §3.1）：分组键保持名称快照（legacy_filename UNIQUE，
-            # 同显示名不同资产天然分组；id_bundle 行按 original_filename 快照）
-            # ——资产身份由 items.slide_id 携带，ID 维度过滤在
-            # annotations_by_project / 单切片端点按 slide_id 执行。
-            slide = r.get("slide")
+            # P3（合同 §1.2；P2 偏差 #1 收口）：分组键切 **slide_id**（行有
+            # ID 按 ID；NULL-ID 历史行按名称快照）——id_bundle 资产可同
+            # original_filename，按名分组会串；ID 维度天然隔离。消费方（app
+            # 的 /api/annotations 系）按 ID 取组、展示键在 DTO 层投影。
+            slide = r.get("slide_id") or r.get("slide")
             lbl = _norm_label(r.get("label"))
             grp_map = by_slide.setdefault(slide, {})
             grp = grp_map.get(lbl)
@@ -2603,8 +2613,9 @@ def annotations_by_project(pid=None, subject=None, access_context=None):
     """与 annotations_by_slide 同结构，但可选按项目内的 slides 过滤（subject
     语义同 annotations_by_slide：非 None 时按主体过滤）。
 
-    P2（合同 §3.2）：过滤按 project_slides.slide_id（权威）——分组键即
-    slide_id（无 ID 历史行按名快照分组）；项目内同名不同 ID 并存互不串。
+    P2（合同 §3.2）：过滤按 project_slides.slide_id（权威）；P3 起分组键=
+    slide_id（NULL-ID 历史行按名快照分组），与 project_ids/project_slides
+    双集过滤天然对齐——项目内同名不同 ID 并存互不串。
     """
     by_slide = annotations_by_slide(subject=subject,
                                     access_context=access_context)

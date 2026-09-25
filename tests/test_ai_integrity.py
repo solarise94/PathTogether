@@ -34,7 +34,7 @@ import pytest  # noqa: E402
 import app as app_mod  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits, isolate_app, FakeRequests, FakeResponse # noqa: E402
+from _pt_helpers import csrf_client, install_json_login_limits, isolate_app, FakeRequests, FakeResponse, register_slide_row  # noqa: E402, register_slide_row
 
 
 @pytest.fixture(autouse=True)
@@ -81,6 +81,7 @@ def _touch(name="demo.svs"):
     p = Path(UPLOAD_DIR) / name
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(b"svs-stub")
+    register_slide_row(name)  # P3：无行兼容分支已删——夹具先注册行（owner NULL，后续可回填归属）
     return name
 
 

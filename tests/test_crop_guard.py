@@ -29,7 +29,7 @@ import crop_guard  # noqa: E402
 import share_store  # noqa: E402
 import share_server as share_srv  # noqa: E402
 import app as app_mod  # noqa: E402
-from _pt_helpers import install_json_login_limits, isolate_app # noqa: E402
+from _pt_helpers import install_json_login_limits, isolate_app, register_slide_row  # noqa: E402, register_slide_row
 
 
 DEFAULT_MAX_PIXELS = 4096 ** 2
@@ -93,6 +93,7 @@ def _share_client():
 def _touch(name="demo.svs"):
     p = Path(UPLOAD_DIR) / name
     p.write_bytes(b"svs-stub")
+    register_slide_row(name)  # P3：无行兼容分支已删——夹具先注册行（owner NULL，后续可回填归属）
     return name
 
 

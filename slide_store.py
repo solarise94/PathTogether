@@ -714,6 +714,55 @@ def set_public(slide_id, public, *, conn=None) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# 删除编排辅助（P3 合同 §5 最小正确版；P5 再统一两阶段）
+#
+# id_bundle 资产没有 legacy_filename，旧按名清理函数（share_store 的
+# revoke_slide_view_grants_for_slide 等）不可用——此处提供按 slide_id 的
+# 授权/关系清理原语，供删除端点在物理清理前调用（兼容调用见 app 侧：legacy
+# 布局资产仍走旧按名路径）。全部可传 conn 以并入删除结算事务。
+# --------------------------------------------------------------------------- #
+def revoke_view_grants_by_slide_id(slide_id, *, conn=None) -> int:
+    """按 slide_id 删除全部 slide_view_grants 行（R-06/R-07 失效语义）。
+
+    新授权行恒带 slide_id（admin grant 写当前代）；NULL-ID 行是历史 unresolved
+    快照，不属于本资产授权面，不动。返回删除行数。
+    """
+    with _session(conn) as c:
+        with c.cursor() as cur:
+            cur.execute("DELETE FROM slide_view_grants WHERE slide_id=%s",
+                        (slide_id,))
+            return cur.rowcount
+
+
+def remove_share_membership(slide_id, *, conn=None) -> int:
+    """删除 share_slides 中该资产的成员行（R-04：原文件删除后旧 token 不因
+    同名新上传恢复访问——成员行删除后授权判定（share_slides ⋈ grants）自然
+    拒绝）。返回删除行数。"""
+    with _session(conn) as c:
+        with c.cursor() as cur:
+            cur.execute("DELETE FROM share_slides WHERE slide_id=%s",
+                        (slide_id,))
+            return cur.rowcount
+
+
+def record_revision(slide_id, legacy_revision, *, conn=None) -> bool:
+    """写一行 slide_assets（P3 合同 §4：id_bundle 资产的内容 revision 来源）。
+
+    新发布写 ``legacy_revision="sha256:<hex 前缀>"``；descriptor.revision 由
+    _DESCRIPTOR_SQL 取最新行（P1-A 已就位）。可传 conn 并入发布收口短事务
+    （与 mark_ready/finish 同事务）。旧行 mtime:size 口径不重写。
+    """
+    with _session(conn) as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "INSERT INTO slide_assets (asset_id, slide_id, legacy_revision) "
+                "VALUES (%s, %s, %s)",
+                ("ast_" + secrets.token_urlsafe(9), slide_id,
+                 str(legacy_revision)),)
+            return True
+
+
+# --------------------------------------------------------------------------- #
 # 跨进程仲裁锁（合同 §5 的第一把锁；publish/delete/recovery 共用）
 # --------------------------------------------------------------------------- #
 def acquire_slide_lock(cur, slide_id):

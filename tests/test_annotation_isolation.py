@@ -445,8 +445,10 @@ def test_unclaimed_annotations_isolated_from_normal_lists():
     co = _client_as("owner@x.com", "ownerpass123456")
     assert _visible_items(co.get("/api/annotations?slide=%s" % x).get_json()) == []
     store_all = share_store.annotations_by_slide()
+    # P3：分组键切 slide_id——管理清点按 ID 取组（NULL-ID 历史行回落名）
+    key = share_store.get_slide_id(x) or x
     assert any(i["annotation_id"] == aid
-               for g in store_all.get(x, []) for i in g["items"])
+               for g in store_all.get(key, []) for i in g["items"])
     report = share_store.annotation_visibility_report()
     assert report["unclaimed"]["count"] >= 1
 

@@ -51,6 +51,12 @@ def _isolate(tmp_path, monkeypatch):
     """每用例：独立存储 + 无登录限制 mock + 防护参数复位 + 清空 uploads。"""
     _, up_dir = isolate_app(monkeypatch, tmp_path, UPLOAD_DIR,
                             login_limits=True)
+    # P3（合同 §3.1.1）：本地免认证态的上传资产 owner 解析——先配置 owner
+    #（无 UID 不自动认领；owner-NULL 资产行不再产生）
+    import user_store as _us
+    share_store.set_owner_user_id(
+        _us.create_user("p3-local-owner@x.com", "localownerpass12345",
+                        role="user")["user_id"])
     # 防护参数复位（防环境变量/其它用例污染；水印置 0 使本机磁盘不干扰；
     # Werkzeug 层上限置 None = 放开，计数层单独收紧的用例自行 monkeypatch）
     monkeypatch.setattr(upload_guard, "UPLOAD_MAX_REQUEST_BYTES", 10 * 1024 ** 3)
@@ -139,7 +145,10 @@ def test_upload_success_uses_uploading_tmp_then_atomic(monkeypatch):
     r = _upload(_client(), name="ok.svs", size=128)
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.get_json()["name"] == "ok.svs"
-    assert (Path(UPLOAD_DIR) / "ok.svs").stat().st_size == 128
+    # P3：id_bundle——入口 objects/<slide_id>/data.svs（不平铺 .uploading-*）
+    sid = r.get_json()["slide_id"]
+    assert (Path(UPLOAD_DIR) / "objects" / sid /
+            "data.svs").stat().st_size == 128
     assert _residue() == []
 
 def test_upload_stream_over_limit_413_no_residue(monkeypatch):
@@ -160,14 +169,16 @@ def test_upload_werkzeug_layer_413(monkeypatch):
     assert r.get_json()["code"] == "upload_too_large"
     assert not (Path(UPLOAD_DIR) / "big2.svs").exists()
 
-def test_upload_conflict_unified_409_no_name_leak(monkeypatch):
-    """目标已存在 → 统一「名称不可用」，不回显冲突文件名（docs §3.12）。"""
+def test_upload_same_name_no_conflict_no_clobber(monkeypatch):
+    """P3（合同 §3.1.5）：原生单文件不再按名冲突（旧 name_unavailable 409
+    对原生通道退役——同名并发各得各的 ID/目录）；他人同名文件绝不被覆盖
+    （no-clobber 由 objects/<slide_id> 唯一性兜底，场景意义保留）。"""
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     (Path(UPLOAD_DIR) / "dup.svs").write_bytes(b"existing")
     r = _upload(_client(), name="dup.svs", size=10)
-    assert r.status_code == 409
-    assert "不可用" in r.get_json()["error"]
-    assert "dup.svs" not in r.get_json()["error"]
+    assert r.status_code == 200
+    sid = r.get_json()["slide_id"]
+    assert (Path(UPLOAD_DIR) / "objects" / sid / "data.svs").stat().st_size == 10
     assert (Path(UPLOAD_DIR) / "dup.svs").read_bytes() == b"existing"  # 未被覆盖
     assert _residue() == []
 
@@ -189,8 +200,10 @@ def test_upload_real_tiff_end_to_end_no_monkeypatch():
     r = _upload(_client(), name=name, content=tiff)
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.get_json()["name"] == name
-    dest = Path(UPLOAD_DIR) / name
-    assert dest.read_bytes() == tiff
+    # P3：id_bundle 入口 objects/<slide_id>/data.tiff
+    sid = r.get_json()["slide_id"]
+    assert (Path(UPLOAD_DIR) / "objects" / sid /
+            "data.tiff").read_bytes() == tiff
     assert _residue() == []
 
 def test_upload_real_garbage_tiff_rejected_with_stable_code():
@@ -217,7 +230,8 @@ def test_upload_owner_role_skips_quota(monkeypatch):
     _user_session(c, role="owner")
     r = _upload(c, name="own.svs", size=32)
     assert r.status_code == 200
-    assert (Path(UPLOAD_DIR) / "own.svs").exists()
+    sid = r.get_json()["slide_id"]
+    assert (Path(UPLOAD_DIR) / "objects" / sid / "data.svs").exists()
 
 # =========================================================================== #
 # 3. PG 权威配额 / reservation / 限流（RUN_PG_TESTS=1）

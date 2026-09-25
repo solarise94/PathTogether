@@ -62,6 +62,12 @@ def _validate_bad(path, **_):
 def _isolate(tmp_path, monkeypatch):
     """每用例：独立存储 + 无登录限制 mock + 防护参数复位 + 清空 uploads。"""
     isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    # P3（合同 §3.1.1）：本地免认证态的上传资产 owner 解析——先配置 owner
+    #（无 UID 不自动认领；owner-NULL 资产行不再产生）
+    import user_store as _us
+    share_store.set_owner_user_id(
+        _us.create_user("p3-local-owner@x.com", "localownerpass12345",
+                        role="user")["user_id"])
     # 防护/TTL 参数复位（防其它用例污染；水印 0 使本机磁盘不干扰）
     monkeypatch.setattr(upload_guard, "UPLOAD_MAX_REQUEST_BYTES", 10 * 1024 ** 3)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
@@ -102,7 +108,27 @@ def _put(client, upload_id, offset, data, sha=None):
                       data=data, content_type="application/octet-stream")
 
 def _part(upload_id):
+    """任务暂存件路径（P3：新管线 .staging/<uid>/transfer/data；升级窗口
+    旧任务维持平铺 .uploading-*.part——经服务端权威 helper 取）。"""
+    t = upload_task_store.get_task(upload_id)
+    if t is not None:
+        return app_mod._upload_v2_part_path(t)
     return Path(UPLOAD_DIR) / (".uploading-%s.part" % upload_id)
+
+def _downgrade_to_legacy_task(uid):
+    """把 _create 的新管线任务降级为「升级窗口旧任务」（slide_id 置 NULL +
+    清掉创建时预分配的 staging 资产行）——旧三段式/旧恢复路径（P6 排空
+    语义）的用例构造器。必须在 PUT 分片之前调用（暂存路径按任务形态分派）。"""
+    t = upload_task_store.get_task(uid)
+    with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE upload_tasks SET slide_id=NULL WHERE upload_id=%s",
+                        (uid,))
+            if t.get("slide_id"):
+                cur.execute("DELETE FROM slides WHERE slide_id=%s AND "
+                            "asset_state='staging'", (t["slide_id"],))
+    return upload_task_store.get_task(uid)
+
 
 def _upload_full(client, upload_id, data, chunk=64):
     """按 chunk 顺序传完全部数据，返回最后一个响应。"""
@@ -191,11 +217,17 @@ def test_create_over_limit_413(monkeypatch):
     assert r.status_code == 413
     assert r.get_json()["code"] == "upload_too_large"
 
-def test_create_name_conflict_409():
+def test_create_same_name_no_conflict():
+    """P3（合同 §3.1.5）：原生单文件不再按原名查冲突——同名并发各得各的
+    slide_id/objects 目录（旧 name_unavailable 409 语义对原生通道退役；
+    convert-required 仍保留冲突检查，P4 拆除）。"""
     (Path(UPLOAD_DIR) / "dup.svs").write_bytes(b"existing")
     r = _create(_client(), name="dup.svs", size=10)
-    assert r.status_code == 409
-    assert r.get_json()["code"] == "name_unavailable"
+    assert r.status_code == 200
+    sid = r.get_json()["slide_id"]
+    assert sid  # 创建即绑定
+    r2 = _create(_client(), name="dup.svs", size=10)
+    assert r2.status_code == 200 and r2.get_json()["slide_id"] != sid
 
 # =========================================================================== #
 # 2. PUT 分片：串行 offset / 幂等 / 哈希 / 单次落盘
@@ -357,9 +389,10 @@ def test_commit_happy_path(monkeypatch):
     j = r.get_json()
     assert j["state"] == "committed"
     assert j["sha256"] == hashlib.sha256(data).hexdigest()  # 服务端复算权威值
-    dest = Path(UPLOAD_DIR) / "ok.svs"
-    assert dest.read_bytes() == data
-    assert not _part(uid).exists()  # 临时文件已清
+    sid = j["slide_id"]
+    dest = Path(UPLOAD_DIR) / "objects" / sid / "data.svs"
+    assert dest.read_bytes() == data  # P3：id_bundle 入口（根目录不再落文件）
+    assert not _part(uid).exists()  # 暂存已清
     assert upload_task_store.get_task(uid)["state"] == "committed"
 
 def test_commit_real_tiff_end_to_end_no_monkeypatch():
@@ -379,8 +412,9 @@ def test_commit_real_tiff_end_to_end_no_monkeypatch():
     j = r.get_json()
     assert j["state"] == "committed"
     assert j["sha256"] == hashlib.sha256(tiff).hexdigest()
-    dest = Path(UPLOAD_DIR) / name
-    assert dest.read_bytes() == tiff
+    sid = j["slide_id"]
+    assert (Path(UPLOAD_DIR) / "objects" / sid /
+            "data.tiff").read_bytes() == tiff
     assert not _part(uid).exists()
     assert upload_task_store.get_task(uid)["state"] == "committed"
 
@@ -392,7 +426,9 @@ def test_commit_real_ome_tiff_end_to_end_no_monkeypatch():
     _upload_full(c, uid, ome, chunk=4096)
     r = c.post("/api/uploads/%s/commit" % uid)
     assert r.status_code == 200, r.get_data(as_text=True)
-    assert (Path(UPLOAD_DIR) / "ome-slide.ome.tiff").read_bytes() == ome
+    sid = r.get_json()["slide_id"]
+    assert (Path(UPLOAD_DIR) / "objects" / sid /
+            "data.tiff").read_bytes() == ome
     assert not _part(uid).exists()
 
 def test_commit_real_garbage_tiff_stable_code_and_cleanup():
@@ -408,16 +444,20 @@ def test_commit_real_garbage_tiff_stable_code_and_cleanup():
     assert j["state"] == "failed"
     assert not (Path(UPLOAD_DIR) / "junk.tif").exists()  # 未提升
     assert upload_task_store.get_task(uid)["state"] == "failed"
-    assert _part(uid).exists()  # failed 保留临时文件（证据），DELETE 清理
+    # P3（合同 §3.3.8）：确定性失败即清 staging（先清理后释放预占）
+    assert not _part(uid).exists()
     r = c.delete("/api/uploads/%s" % uid)
     assert r.status_code == 200 and r.get_json()["state"] == "cancelled"
     assert not _part(uid).exists()
 
 def test_recover_ownership_failure_keeps_committing(monkeypatch):
-    """ownership 失败不得 finish_commit：保持 committing，文件仍在，下次可自愈。"""
+    """**旧管线（升级窗口在途任务）**恢复：ownership 失败不得 finish_commit
+    ——保持 committing，文件仍在，下次可自愈。（新管线的归属随 allocate_slide
+    同事务落库，无此窗口；对应新路径见 test_slide_publish_pg。）"""
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client()
     uid = _create(c, name="own.svs", size=100).get_json()["upload_id"]
+    _downgrade_to_legacy_task(uid)
     data = b"o" * 100
     _upload_full(c, uid, data, chunk=50)
     _token, task = upload_task_store.begin_commit(uid)
@@ -445,10 +485,13 @@ def test_recover_ownership_failure_keeps_committing(monkeypatch):
     assert finish_calls == [1]
 
 def test_maintain_heals_committed_missing_owner(monkeypatch):
-    """GET 路径仅在 slide_meta 缺 owner 时校正归属。"""
+    """**旧管线（升级窗口在途任务）**：GET 路径仅在 slide_meta 缺 owner 时
+    校正归属。（新管线归属在 allocate_slide 同事务落库，无按名补写——
+    P3 合同 §3.1.2。）"""
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client()
     uid = _create(c, name="heal.svs", size=80).get_json()["upload_id"]
+    _downgrade_to_legacy_task(uid)
     _upload_full(c, uid, b"h" * 80, chunk=40)
     assert c.post("/api/uploads/%s/commit" % uid).status_code == 200
     healed = []
@@ -471,10 +514,12 @@ def test_maintain_heals_committed_missing_owner(monkeypatch):
     assert healed == []
 
 def test_recover_commit_does_not_commit_when_settle_fails(monkeypatch):
-    """崩溃恢复：入账失败不得留下 committed 文件。"""
+    """**旧管线（升级窗口在途任务）**崩溃恢复：入账失败不得留下 committed
+    文件。（新管线的预约失效收口见 test_slide_publish_pg 的恢复用例。）"""
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client()
     uid = _create(c, name="rc.svs", size=100).get_json()["upload_id"]
+    _downgrade_to_legacy_task(uid)
     data = b"r" * 100
     _upload_full(c, uid, data, chunk=50)
     _token, task = upload_task_store.begin_commit(uid)
@@ -493,19 +538,22 @@ def test_commit_validates_before_promotion(monkeypatch):
     """§2.3 纠正：_validate_slide_file 必须在原子提升**之前**调用。"""
     calls = []
 
+    c = _client()
+    uid = _create(c, name="vbp.svs", size=100).get_json()["upload_id"]
+    sid = upload_task_store.get_task(uid)["slide_id"]
+    target = Path(UPLOAD_DIR) / "objects" / sid
+
     def fake_validate(path, **_):
-        calls.append((str(path), (Path(UPLOAD_DIR) / "vbp.svs").exists()))
+        calls.append((str(path), target.exists()))
         return True
 
     monkeypatch.setattr(app_mod, "_validate_slide_file", fake_validate)
-    c = _client()
-    uid = _create(c, name="vbp.svs", size=100).get_json()["upload_id"]
     _upload_full(c, uid, b"z" * 100, chunk=64)
     r = c.post("/api/uploads/%s/commit" % uid)
     assert r.status_code == 200, r.get_data(as_text=True)
     assert len(calls) == 1
-    assert calls[0][1] is False, "验证发生时目标文件不应已提升"
-    assert (Path(UPLOAD_DIR) / "vbp.svs").exists()
+    assert calls[0][1] is False, "验证发生时目标包不应已发布"
+    assert (target / "data.svs").exists()
 
 def test_commit_hash_mismatch_deterministic_failure(monkeypatch):
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
@@ -521,7 +569,8 @@ def test_commit_hash_mismatch_deterministic_failure(monkeypatch):
     assert t["state"] == "failed"
     assert t["sha256_actual"] == hashlib.sha256(b"d" * 100).hexdigest()
     assert not (Path(UPLOAD_DIR) / "hm.svs").exists()
-    assert _part(uid).exists()  # failed 保留临时文件（证据），DELETE 时清理
+    # P3（合同 §3.3.8）：确定性失败即清 staging
+    assert not _part(uid).exists()
     # failed 后不可续写/重 commit，DELETE → cancelled 清理
     assert _put(c, uid, 100, b"e").status_code == 409
     assert c.post("/api/uploads/%s/commit" % uid).status_code == 409
@@ -557,19 +606,23 @@ def test_commit_invalid_slide_failed(monkeypatch):
     assert not (Path(UPLOAD_DIR) / "bad.svs").exists()
     assert upload_task_store.get_task(uid)["state"] == "failed"
 
-def test_commit_name_taken_failed(monkeypatch):
+def test_commit_same_name_occupied_root_succeeds(monkeypatch):
+    """P3（合同 §3.1.5 裁决）：原生单文件的目标位是 objects/<slide_id>（服务端
+    派生、唯一），根目录同名文件与本任务无关——旧 name_unavailable 提升冲突
+    对原生通道退役（no-clobber 由 ID 唯一性兜底）。"""
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     (Path(UPLOAD_DIR) / "nt.svs").write_bytes(b"taken")
     c = _client()
     uid = _create(c, name="nt2.svs", size=100).get_json()["upload_id"]
-    # 任务创建后目标名被占（模拟并发抢占）
+    # 任务创建后根目录同名文件出现（对旧管线是 TOCTOU 冲突；新管线无关）
     (Path(UPLOAD_DIR) / "nt2.svs").write_bytes(b"taken")
     _upload_full(c, uid, b"w" * 100, chunk=64)
     r = c.post("/api/uploads/%s/commit" % uid)
-    assert r.status_code == 409
-    assert r.get_json()["code"] == "name_unavailable"
-    assert upload_task_store.get_task(uid)["state"] == "failed"
-    assert (Path(UPLOAD_DIR) / "nt2.svs").read_bytes() == b"taken"  # 未覆盖
+    assert r.status_code == 200
+    sid = r.get_json()["slide_id"]
+    assert upload_task_store.get_task(uid)["state"] == "committed"
+    assert (Path(UPLOAD_DIR) / "objects" / sid / "data.svs").read_bytes() == b"w" * 100
+    assert (Path(UPLOAD_DIR) / "nt2.svs").read_bytes() == b"taken"  # 他人文件不动
 
 def test_commit_idempotent_replay_returns_committed(monkeypatch):
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
@@ -581,8 +634,10 @@ def test_commit_idempotent_replay_returns_committed(monkeypatch):
     assert r.status_code == 200
     assert r.get_json()["state"] == "committed"
 
-def test_cancel_during_commit_returns_409(monkeypatch):
-    """commit 与 cancel 竞态：验证阶段（无行锁）收到 DELETE → 409 不等待。"""
+def test_cancel_during_validation_wins(monkeypatch):
+    """P3（合同 §3.3/计划 §3.2 胜者规则）：验证阶段（受理/intent **之前**）
+    收到 DELETE → 取消先赢；后续 commit 的 begin_commit CAS 撞 cancelled →
+    409。受理（intent 落库）之后的取消恒 409——发布继续/恢复完成。"""
     started, release = threading.Event(), threading.Event()
 
     def fake_validate(path, **_):
@@ -603,15 +658,28 @@ def test_cancel_during_commit_returns_409(monkeypatch):
     th.start()
     try:
         assert started.wait(5), "commit 应进入验证阶段"
-        assert upload_task_store.get_task(uid)["state"] == "committing"
+        assert upload_task_store.get_task(uid)["state"] == "active"
         r = c.delete("/api/uploads/%s" % uid)
-        assert r.status_code == 409
-        assert r.get_json()["code"] == "upload_state_conflict"
+        assert r.status_code == 200
+        assert r.get_json()["state"] == "cancelled"
     finally:
         release.set()
         th.join(5)
-    assert out["r"].status_code == 200
-    assert upload_task_store.get_task(uid)["state"] == "committed"
+    assert out["r"].status_code == 409
+    assert upload_task_store.get_task(uid)["state"] == "cancelled"
+
+
+def test_cancel_after_intent_rejected(monkeypatch):
+    """受理（intent 落库）后取消 → 409（不可撤销段）；发布收口完成。"""
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
+    c = _client()
+    uid = _create(c, name="race2.svs", size=100).get_json()["upload_id"]
+    _upload_full(c, uid, b"r" * 100, chunk=64)
+    # 直接进入 committing（等价 commit 已受理、发布前的窗口）
+    _token, task = upload_task_store.begin_commit(uid)
+    assert c.delete("/api/uploads/%s" % uid).status_code == 409
+    assert upload_task_store.get_task(uid)["state"] == "committing"
+
 
 # =========================================================================== #
 # 5. DELETE / TTL / 过期
@@ -696,10 +764,16 @@ def test_cross_user_task_binding_403():
     assert c_owner.get("/api/uploads/%s" % uid).status_code == 200
 
 def test_noauth_identity_owner_semantics_unchanged():
-    """AUTH_ENABLED=False：current_identity 归一 owner，V2 创建/写入不破。"""
+    """AUTH_ENABLED=False：current_identity 归一 owner，V2 创建/写入不破。
+
+    P3（合同 §3.1.1）：本地免认证态的任务/资产 owner = 解析后的配置 owner
+    （显式非空，不再产生 owner_user_id="" 的任务行——「无 UID 不自动认领」
+    的另一面是必须有明确归属）。"""
     c = _client(auth=False)
     uid = _create(c, name="na.svs", size=50).get_json()["upload_id"]
-    assert upload_task_store.get_task(uid)["owner_user_id"] == ""
+    t = upload_task_store.get_task(uid)
+    assert t["owner_user_id"]  # 显式归属（配置 owner 解析结果）
+    assert t["slide_id"]
     assert _put(c, uid, 0, b"n" * 50).status_code == 200
 
 # =========================================================================== #

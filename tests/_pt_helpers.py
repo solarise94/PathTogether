@@ -176,6 +176,37 @@ def isolate_app(monkeypatch, data_dir, upload_dir=None, login_limits=False,
     return data_dir, upload_dir
 
 
+def register_slide_row(name):
+    """P3 夹具适配（合同 §1.1）：为已放置的文件注册 slides 行。
+
+    asset_state='ready' / storage_layout='legacy' / owner **NULL**——后续
+    ``set_slide_meta(name, owner_user_id=…)`` 仍可回填归属（与旧「无行」
+    夹具的所有权赋值行为完全兼容）。P3 删除「无行即可读」兼容分支后，
+    依赖目录直放文件的读端点夹具统一先经本函数注册。幂等（同名行已
+    存在则跳过）。返回 slide_id（已存在时返回既有行 ID）。
+    """
+    import os
+    import secrets
+
+    import psycopg
+    with psycopg.connect(os.environ["DATABASE_URL"],
+                         autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT slide_id FROM slides WHERE legacy_filename=%s",
+                        (name,))
+            row = cur.fetchone()
+            if row:
+                return row[0]
+            sid = "sld_" + secrets.token_urlsafe(9)
+            cur.execute(
+                "INSERT INTO slides (slide_id, legacy_filename, display_name, "
+                "original_filename, format_ext, asset_state, storage_layout, "
+                "published_at) VALUES (%s,%s,%s,%s,%s,'ready','legacy',now())",
+                (sid, name, name, name,
+                 (name.rsplit(".", 1)[-1].lower() if "." in name else None)))
+            return sid
+
+
 def clear_upload_dir(upload_dir):
     """清空上传目录里的测试切片文件（子目录一并 rmtree）。
 

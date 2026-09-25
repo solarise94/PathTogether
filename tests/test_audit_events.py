@@ -33,7 +33,7 @@ import share_store  # noqa: E402
 import share_store_pg  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits, isolate_app # noqa: E402
+from _pt_helpers import csrf_client, install_json_login_limits, isolate_app, register_slide_row  # noqa: E402, register_slide_row
 import share_server as share_srv  # noqa: E402
 
 
@@ -75,6 +75,8 @@ def _touch(name="demo.svs"):
     p = Path(UPLOAD_DIR) / name
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(b"svs-stub")
+    # P3：无行兼容分支已删——先注册行（owner 归属由 _setup_users 二次回填）
+    register_slide_row(name)
     return name
 
 

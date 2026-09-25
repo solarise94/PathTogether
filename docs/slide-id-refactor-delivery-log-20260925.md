@@ -112,3 +112,29 @@
 - 结论：P2 完成标准（同显示名分别打开/标注/分享/关联项目、改名不串片、两仓合同测试、真实浏览器验证）全部通过。上传/标注的浏览器路径由 JS 测试与跨仓契约测试覆盖（IAB 不支持文件选择器上传，上传经 API 注入）。
 
 **P2 门禁合计**：PT 全量 2664 passed / 1 已知无关失败（admin 0.4.13）；JS 562；HP 四门禁全绿。
+
+## P3 门禁（2026-09-26）
+
+合同：docs/slide-id-refactor-p3-contract-20260925.md。变更面：0068 迁移（upload_tasks.commit_intent_json）、slide_publish 真实接线（六步编排）、V2+V1 原生单文件切新管线（创建即 allocate_slide+任务绑定同事务、暂存 .staging/、同名冲突检查拆除）、`DELETE /api/slides/<slide_id>`（四阶段：门禁 CAS→授权联动→物理清理→同事务减账）、机器通道/本地态无行兼容分支删除（P1-B2 #2/#3 收口）、annotations_by_slide 分组键切 ID（P2 偏差 #1 收口）、`_legacy_slide_revision` 对 id_bundle 改取 slide_assets。
+
+- 编排方独立门禁（先清 /tmp 残渣）：**2685 passed / 1 已知无关失败**；`npm run test:js` 562 全绿；新测试 test_slide_publish_pg.py 19/19。
+- **跨仓联动**：PT P3 落地使 HP contract 8 用例失败（裸文件播种不再可读 + 本地态 owner 强制 + 新资产无冻结别名）——编排方迁移两仓测试至新语义（HP 提交 ed8a30f）：ai-drawing 播种补注册行、slide-id 契约的 owner 注入 + ①②③ 断言换新 + register_legacy 夹具 + 冲突负例改真实 legacy 别名。复跑 **contract 49/49 绿**。
+
+### P3 偏差裁决记录
+
+| # | 偏差 | 裁决 | 理由/收口 |
+|---|---|---|---|
+| 1 | publish_slide 的 FS 发布在 advisory 锁之前（合同顺序是锁→重验→发布） | **接受**（记录偏差） | 安全性由状态机不变量保证（committing 态 cancel 拒、staging 态 delete 拒、代次 fencing 先于 FS、no-clobber+verify_bundle 幂等兜底、settle 事务再全量重验）；动机是避免长 IO 持事务锁。**P4 义务**：COS/conversion writer 接入同一 publish 路径时按其 worker lease 模型重审该顺序 |
+| 2 | 语义退役断言改写族（同名冲突 409→各得各 ID、取消胜者规则重写、崩溃屏障换 settle/consume 等） | **采纳** | 逐份核对：场景意义保留（同名并发/竞态/崩溃恢复），断言换目标不变量；test_slide_publish_pg.py 19 用例覆盖 §6 全列 |
+| 3 | flock sidecar `.uploading-<id>.lock` 保留平铺 | 采纳 | 纯进程间协调原语，非暂存内容；P6 收口 |
+| 4 | /api/annotations 默认列表展示键投影回名称快照（同名 id_bundle 组在该列表展示级合并） | **暂时接受** | 单切片查询/项目详情/store 级全部按 ID 隔离（有专测）；前端切 ID 索引后收紧（列入 P4 前端项） |
+| 5 | 本地免认证态夹具注入配置 owner（p3-local-owner） | 采纳 | 与生产「配置 owner」语义一致 |
+| 6 | convert-required V1/V2 保留旧冲突检查 + 转换/COS/ZIP 响应仍按名出 slide_id | 采纳 | 合同明示 P4 随转换链/COS/ZIP 整体拆除 |
+
+### P3 遗留（P4/P5/P6 消化）
+
+- `set_slide_meta` 复活分支 + `test_slide_delete_clears_view_grants_no_orphans` 改写义务 → P4（ZIP 切走时）。
+- `_upload_name_conflict` 余下调用（convert-required 分支）+ conversion canonical 名锁 + COS adopted/still_ours/force-owner + 百度按名对账 → P4 拆除。
+- run grant 撤销的 sidecar 会话取消对 id_bundle 只撤 grant 行（按名查询运行会话不适用）→ P4/P5 补 ID 化联动。
+- 升级窗口在途旧任务排空与新旧物理布局并存 → P6。
+- share_server `_get_slide` 仍以 legacy 名为主键（id_bundle 资产 None 键）→ P4 收口为 slide_id 键。

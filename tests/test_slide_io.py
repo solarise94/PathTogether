@@ -390,6 +390,13 @@ def test_validate_slide_file_unknown_exception_becomes_slide_open_failed(
 def _iso(tmp_path, monkeypatch):
     """存储隔离（真验证用例不得 monkeypatch _validate_slide_file）。"""
     isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    # P3（合同 §3.1.1）：本地免认证态的上传资产 owner 解析——先配置 owner
+    #（无 UID 不自动认领；owner-NULL 资产行不再产生）
+    import share_store as _ss
+    import user_store as _us
+    _ss.set_owner_user_id(
+        _us.create_user("p3-local-owner@x.com", "localownerpass12345",
+                        role="user")["user_id"])
     monkeypatch.setattr(upload_guard, "UPLOAD_MAX_REQUEST_BYTES", 10 * 1024 ** 3)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
     monkeypatch.setattr(upload_task_store, "UPLOAD_TASK_TTL_SECONDS", 24 * 3600)
@@ -422,7 +429,10 @@ def test_v1_small_real_tiff_no_monkeypatch():
                content_type="multipart/form-data")
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.get_json()["name"] == TIFF_NAME
-    assert (Path(UPLOAD_DIR) / TIFF_NAME).read_bytes() == tiff
+    # P3：id_bundle 布局——入口 objects/<slide_id>/data.tiff（根目录不再落文件）
+    _sid = r.get_json()["slide_id"]
+    assert (Path(UPLOAD_DIR) / "objects" / _sid /
+            "data.tiff").read_bytes() == tiff
     assert _residue() == []
 
 
@@ -456,13 +466,17 @@ def test_v2_create_chunks_commit_real_tiff_no_monkeypatch():
     uid = r.get_json()["upload_id"]
     for off in range(0, len(tiff), 4096):
         assert _put(c, uid, off, tiff[off:off + 4096]).status_code == 200
-    part = Path(UPLOAD_DIR) / (".uploading-%s.part" % uid)
-    assert part.exists()  # 传完但未 commit：part 在
+    # P3：传输暂存迁 .staging/<uid>/transfer/（不平铺；经权威 helper 取路径）
+    part = app_mod._upload_v2_part_path(upload_task_store.get_task(uid))
+    assert part.exists()  # 传完但未 commit：暂存件在
     r = c.post("/api/uploads/%s/commit" % uid)
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.get_json()["state"] == "committed"
-    assert (Path(UPLOAD_DIR) / TIFF_NAME).read_bytes() == tiff
-    assert not part.exists()
+    sid = r.get_json()["slide_id"]
+    # id_bundle 布局：入口 objects/<slide_id>/data.tif
+    assert (Path(UPLOAD_DIR) / "objects" / sid /
+            "data.tiff").read_bytes() == tiff  # 入口 ext=白名单后缀
+    assert not (Path(UPLOAD_DIR) / ".staging" / uid).exists()
     assert _residue() == []
 
 
@@ -482,7 +496,8 @@ def test_v2_real_invalid_tiff_commit_stable_code():
     # 终态幂等：重复 commit 仍 409 failed，GET 可查
     assert c.post("/api/uploads/%s/commit" % uid).status_code == 409
     assert c.get("/api/uploads/%s" % uid).get_json()["state"] == "failed"
-    assert not (Path(UPLOAD_DIR) / "junk.tif").exists()
+    assert not (Path(UPLOAD_DIR) / "junk.tif").exists()  # 新管线不落根目录
+    assert not (Path(UPLOAD_DIR) / ".staging" / uid).exists()
     assert c.delete("/api/uploads/%s" % uid).status_code == 200
     assert _residue() == []
 
@@ -535,7 +550,9 @@ def test_v1_small_real_bmp_no_monkeypatch():
                content_type="multipart/form-data")
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.get_json()["name"] == "photo.bmp"
-    assert (Path(UPLOAD_DIR) / "photo.bmp").read_bytes() == bmp
+    # P3：id_bundle 布局——入口 objects/<slide_id>/data.bmp（根目录不再落文件）
+    sid = r.get_json()["slide_id"]
+    assert (Path(UPLOAD_DIR) / "objects" / sid / "data.bmp").read_bytes() == bmp
     assert _residue() == []
 
 
@@ -581,7 +598,9 @@ def test_v2_real_bmp_create_chunks_commit_no_monkeypatch():
     r = c.post("/api/uploads/%s/commit" % uid)
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.get_json()["state"] == "committed"
-    assert (Path(UPLOAD_DIR) / "photo.bmp").read_bytes() == bmp
+    sid = r.get_json()["slide_id"]
+    assert (Path(UPLOAD_DIR) / "objects" / sid / "data.bmp").read_bytes() == bmp
+    assert not (Path(UPLOAD_DIR) / ".staging" / uid).exists()
     assert _residue() == []
 
 

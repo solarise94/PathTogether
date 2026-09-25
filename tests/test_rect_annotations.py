@@ -39,7 +39,7 @@ import share_store  # noqa: E402
 import share_server as share_srv  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app  # noqa: E402
+from _pt_helpers import csrf_client, isolate_app, register_slide_row  # noqa: E402, register_slide_row
 
 
 @pytest.fixture(autouse=True)
@@ -66,6 +66,7 @@ def _touch(name="demo.svs"):
     p = Path(UPLOAD_DIR) / name
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(b"svs-stub")
+    register_slide_row(name)  # P3：无行兼容分支已删——夹具先注册行（owner NULL，后续可回填归属）
     return name
 
 
@@ -171,7 +172,8 @@ def test_v2_roi_roundtrip_and_history_and_change_feed():
                if c.get("annotation_id") == roi["annotation_id"])
     # 列表/项目索引返回全部承接 w/h
     assert share_store.list_rois(share_store.ADMIN_TOKEN)[0]["w"] == 300
-    by_slide = share_store.annotations_by_slide()["demo.svs"][0]["items"]
+    by_slide = share_store.annotations_by_slide()[
+        share_store.get_slide_id("demo.svs") or "demo.svs"][0]["items"]
     assert by_slide[0]["w"] == 300 and by_slide[0]["h"] == 150
 
 
@@ -233,7 +235,8 @@ def test_api_annotation_v2_and_bounds():
     })
     assert r.status_code == 200, r.get_data(as_text=True)
     idx = r.get_json()["index"]
-    item = share_store.annotations_by_slide()["demo.svs"][0]["items"][idx]
+    item = share_store.annotations_by_slide()[
+        share_store.get_slide_id("demo.svs") or "demo.svs"][0]["items"][idx]
     assert item["w"] == 320 and item["h"] == 170
     assert item["geometry_version"] == 2
 
@@ -313,7 +316,8 @@ def test_create_6mm_square_at_0253_mpp_allowed_and_export_budgeted(monkeypatch):
     })
     assert r.status_code == 200, r.get_data(as_text=True)
     idx = r.get_json()["index"]
-    item = share_store.annotations_by_slide()["demo.svs"][0]["items"][idx]
+    item = share_store.annotations_by_slide()[
+        share_store.get_slide_id("demo.svs") or "demo.svs"][0]["items"][idx]
     assert item["w"] == side and item["h"] == side
     assert item["geometry_version"] == 2
 

@@ -152,11 +152,42 @@ def staging_dir(task_id, generation, *, root=None) -> Path:
     """任务专属暂存目录：``UPLOAD_DIR/.staging/<task_id>/<generation>/``。
 
     不提供静态访问；task_id/generation 均为服务端生成的组件（白名单校验）。
-    generation 是崩溃恢复/重试的代次（int 或安全字符串）。
+    generation 是崩溃恢复/重试的代次（int 或安全字符串）：
+      - V2（P3 合同 §3.2）：传输阶段固定 ``"transfer"``（分片 pwrite 落
+        ``.staging/<task_id>/transfer/data``）；每次 commit 受理把传输件原子
+        搬入 ``.staging/<task_id>/<commit_token>/data.<ext>``（commit_token
+        即任务代次——崩溃恢复可从任务行重判）；每任务 sidecar flock 同在
+        ``.staging/<task_id>/chunk.lock``。
+      - V1 原生单文件：固定 ``"1"``（单请求无重试代次）。
     """
     task = _safe_component(task_id, "task_id")
     gen = _safe_component(generation, "generation")
     return _root(root) / _STAGING_DIRNAME / task / gen
+
+
+def staging_task_dir(task_id, *, root=None) -> Path:
+    """任务暂存根：``UPLOAD_DIR/.staging/<task_id>/``（含全部 generation 与
+    sidecar 锁文件）。取消/失败/收口的整树清理由 remove_staging_tree 执行。"""
+    task = _safe_component(task_id, "task_id")
+    return _root(root) / _STAGING_DIRNAME / task
+
+
+def remove_staging_tree(task_id, *, root=None) -> bool:
+    """删除任务暂存整树（P3 合同 §3.3 第 8 步：清 staging 后再释放预占）。
+
+    幂等：树不存在返回 False。只清理该任务专属目录（服务端 task_id 派生），
+    不触碰其他任务/objects/。旧平铺暂存件（升级窗口在途任务）不在本树内，
+    由旧清理逻辑负责。
+    """
+    target = staging_task_dir(task_id, root=root)
+    if not os.path.lexists(target):
+        return False
+    if target.is_symlink() or not target.is_dir():
+        raise ValueError("任务暂存路径不是目录（拒绝删除）：%s" % target)
+    shutil.rmtree(target)
+    if target.parent.is_dir():
+        _fsync_fd_dir(target.parent)
+    return True
 
 
 def bundle_dir(slide_id, *, root=None) -> Path:
@@ -393,6 +424,32 @@ def _publish_cross_volume(staging_path: Path, target: Path, manifest: dict):
     except BaseException:
         shutil.rmtree(temp, ignore_errors=True)
         raise
+
+
+# --------------------------------------------------------------------------- #
+# 已发布包核对（P3 崩溃恢复：目标已存在时的幂等重判，合同 §3.3 第 7 步）
+# --------------------------------------------------------------------------- #
+def verify_bundle(slide_id, manifest, *, root=None) -> bool:
+    """核对 ``objects/<slide_id>/`` 与 manifest 是否逐文件吻合（存在+size+sha）。
+
+    publish 崩溃恢复用：目标已存在且吻合 → 跳过 FS 只做 DB CAS；不吻合 →
+    调用方 fail-closed 告警（不删不猜）。manifest 缺 entry 也按不吻合处理。
+    """
+    try:
+        norm_manifest = validate_manifest(manifest)
+    except ValueError:
+        return False
+    target = bundle_dir(slide_id, root=root)
+    if not target.is_dir():
+        return False
+    try:
+        for item in norm_manifest["files"]:
+            _verify_file_against(target, item)
+        if not (target / norm_manifest["entry"]).is_file():
+            return False
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------- #

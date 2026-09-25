@@ -25,6 +25,12 @@ UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 @pytest.fixture(autouse=True)
 def _iso(tmp_path, monkeypatch):
     isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    # P3：本地免认证态上传资产 owner 解析（合同 §3.1.1）——先配置 owner
+    import share_store as _ss
+    import user_store as _us
+    _ss.set_owner_user_id(
+        _us.create_user("p3-local-owner@x.com", "localownerpass12345",
+                        role="user")["user_id"])
     monkeypatch.setenv("UPLOAD_DIR", str(UPLOAD_DIR))
     monkeypatch.setenv("BAIDU_SHARE_SECRET_KEY",
                        "test-baidu-share-secret-key-2026-09-14")
@@ -164,11 +170,22 @@ def test_b08_source_changed_and_name_conflict(tmp_path, monkeypatch):
 def test_c02_local_upload_native_and_kfb_associate(tmp_path, monkeypatch):
     import app as app_mod
     import upload_guard
+    import user_store
     from _pt_helpers import csrf_client
-    monkeypatch.setattr(app_mod, "AUTH_ENABLED", False)
+    # P3：改认证 owner 会话（本地免认证态的资产归属随配置 owner 解析后，
+    # 与 KFB 转换链按 ident.user_id 记 job owner 的旧口径不一致——P4 统一；
+    # 本用例场景用认证 owner 保持两侧同源）
+    monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
     app_mod.app.config["TESTING"] = True
     c = csrf_client(app_mod.app.test_client())
+    _own = user_store.create_user("c02@x.com", "c02ownerpass12345",
+                                  role="owner")
+    with c.session_transaction() as sess:
+        sess["auth_user"] = True
+        sess["user_id"] = _own["user_id"]
+        sess["role"] = "owner"
+        sess["auth_version"] = 1
     pr = c.post("/api/project/create", json={"name": "本地导入", "slides": []})
     assert pr.status_code == 200, pr.get_data(as_text=True)
     proj = pr.get_json()
@@ -179,7 +196,8 @@ def test_c02_local_upload_native_and_kfb_associate(tmp_path, monkeypatch):
     })
     assert r.status_code in (200, 201), r.get_data(as_text=True)
     got = share_store.get_project(proj["pid"])
-    assert "local.tif" in got["slides"]
+    # P3：原生单文件新管线按 slide_ids 关联（id_bundle 无名快照——合同 §3.4）
+    assert r.get_json()["slide_id"] in (got.get("slide_ids") or [])
 
     kfb_path = build_synthetic_kfb(tmp_path / "loc.kfb")
     with open(kfb_path, "rb") as fh:

@@ -96,6 +96,13 @@ def _jpeg_bytes(w=120, h=40, orientation=1, dpi=None):
 def _iso(tmp_path, monkeypatch):
     """存储隔离 + 上限复位 + 缓存清空（普通图片句柄/瓦片不跨用例泄漏）。"""
     isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    # P3（合同 §3.1.1）：本地免认证态的上传资产 owner 解析——先配置 owner
+    #（无 UID 不自动认领；owner-NULL 资产行不再产生）
+    import share_store as _ss
+    import user_store as _us
+    _ss.set_owner_user_id(
+        _us.create_user("p3-local-owner@x.com", "localownerpass12345",
+                        role="user")["user_id"])
     monkeypatch.setattr(upload_guard, "UPLOAD_MAX_REQUEST_BYTES", 10 * 1024 ** 3)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
     monkeypatch.setattr(upload_task_store, "UPLOAD_TASK_TTL_SECONDS", 24 * 3600)
@@ -200,12 +207,13 @@ def test_slide_info_endpoint_raster_metadata_contract():
     """/api/slide/<name>/info 对普通图片输出 §4.4 JSON（不含物理标尺字段值）。"""
     bmp = _bmp_bytes(64, 48)
     c = _client()
-    assert _v1_upload(c, "wire_meta.bmp", bmp).status_code == 200
-    r = c.get("/api/slide/wire_meta.bmp/info")
+    sid = _v1_upload(c, "wire_meta.bmp", bmp).get_json()["slide_id"]
+    # P3：id_bundle 资产经 ID 端点读（name=None；按名 403 是预期）
+    r = c.get("/api/slides/%s/info" % sid)
     assert r.status_code == 200, r.get_data(as_text=True)
     j = r.get_json()
     assert j.get("error") in (None, "")  # 打开成功，非 error 分支
-    assert j["name"] == "wire_meta.bmp"
+    assert j["name"] is None and j["original_filename"] == "wire_meta.bmp"
     assert j["width"] == 64 and j["height"] == 48  # EXIF 校正后口径的像素尺寸
     assert j["mpp_x"] is None and j["mpp_y"] is None
     assert j["objective"] is None
@@ -219,8 +227,8 @@ def test_slide_info_endpoint_exif_corrected_dimensions():
     jpg = _jpeg_bytes(120, 40, orientation=6)
     assert jpg.startswith(b"\xff\xd8")  # 真 JPEG 字节
     c = _client()
-    assert _v1_upload(c, "wire_rot.jpg", jpg).status_code == 200
-    r = c.get("/api/slide/wire_rot.jpg/info")
+    sid = _v1_upload(c, "wire_rot.jpg", jpg).get_json()["slide_id"]
+    r = c.get("/api/slides/%s/info" % sid)
     assert r.status_code == 200, r.get_data(as_text=True)
     j = r.get_json()
     assert (j["width"], j["height"]) == (40, 120)  # 宽高交换
@@ -230,11 +238,12 @@ def test_slide_info_endpoint_exif_corrected_dimensions():
 def test_slides_list_includes_raster_metadata():
     """/api/slides 列表对普通图片输出同一套缺标尺元数据（无物理倍率）。"""
     c = _client()
-    assert _v1_upload(c, "wire_list.bmp", _bmp_bytes(48, 32)).status_code == 200
+    sid = _v1_upload(c, "wire_list.bmp",
+                     _bmp_bytes(48, 32)).get_json()["slide_id"]
     r = c.get("/api/slides")
     assert r.status_code == 200
-    rows = {it["name"]: it for it in r.get_json()}
-    it = rows["wire_list.bmp"]
+    rows = {it["slide_id"]: it for it in r.get_json()}  # P3：name=None，按 ID 键
+    it = rows[sid]
     assert (it["width"], it["height"]) == (48, 32)
     assert it["mpp_x"] is None and it["mpp_y"] is None
     assert it["objective"] is None and it["mpp_source"] == "missing"
@@ -284,13 +293,15 @@ def test_v2_part_real_jpg_commit_committed():
     c = _client()
     uid = _v2_create(c, "wire_v2.jpg", len(jpg))
     assert _v2_put(c, uid, 0, jpg).status_code == 200
-    part = Path(UPLOAD_DIR) / (".uploading-%s.part" % uid)
-    assert part.exists()  # 传完未 commit：.part 暂存中
+    part = app_mod._upload_v2_part_path(upload_task_store.get_task(uid))
+    assert part.exists()  # P3：.staging/<uid>/transfer/ 暂存中
     r = c.post("/api/uploads/%s/commit" % uid)
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.get_json()["state"] == "committed"
-    assert (Path(UPLOAD_DIR) / "wire_v2.jpg").read_bytes() == jpg
-    assert not part.exists()
+    sid = r.get_json()["slide_id"]
+    assert (Path(UPLOAD_DIR) / "objects" / sid /
+            "data.jpg").read_bytes() == jpg
+    assert not (Path(UPLOAD_DIR) / ".staging" / uid).exists()
     assert _residue() == []
 
 
@@ -473,23 +484,23 @@ def test_bmp_info_dzi_tile_thumbnail_smoke():
 
     bmp = _bmp_bytes(96, 64)
     c = _client()
-    assert _v1_upload(c, "wire_view.bmp", bmp).status_code == 200
+    sid = _v1_upload(c, "wire_view.bmp", bmp).get_json()["slide_id"]
 
-    # info：渲染 additive 字段可用（deepzoom 描述）
-    info = c.get("/api/slide/wire_view.bmp/info").get_json()
+    # info：渲染 additive 字段可用（deepzoom 描述）；P3 起经 ID 端点
+    info = c.get("/api/slides/%s/info" % sid).get_json()
     assert info.get("error") in (None, "")
     assert info["width"] == 96 and info["height"] == 64
     assert info["mpp_source"] == "missing"
 
-    # DZI XML
-    r = c.get("/api/slide/wire_view.bmp.dzi")
+    # DZI XML（ID 端点）
+    r = c.get("/api/slides/%s/dzi" % sid)
     assert r.status_code == 200
     xml = r.get_data(as_text=True)
     assert 'xmlns="http://schemas.microsoft.com/deepzoom/2008"' in xml
     assert '<Size Width="' in xml
 
     # 低层瓦片（level 0 = DZI 最小层，单瓦片）
-    r = c.get("/api/slide/wire_view.bmp_files/0/0_0.jpeg")
+    r = c.get("/api/slides/%s/tiles/0/0_0.jpeg" % sid)
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.headers["Content-Type"].startswith("image/jpeg")
     tile = PILImage.open(io.BytesIO(r.get_data()))
@@ -497,7 +508,7 @@ def test_bmp_info_dzi_tile_thumbnail_smoke():
     assert tile.size[0] > 0 and tile.size[1] > 0
 
     # 缩略图：JPEG 可解码，保持宽高比（96x64 → 3:2）
-    r = c.get("/api/slide/wire_view.bmp/thumbnail")
+    r = c.get("/api/slides/%s/thumbnail" % sid)
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.headers["Content-Type"].startswith("image/jpeg")
     thumb = PILImage.open(io.BytesIO(r.get_data()))

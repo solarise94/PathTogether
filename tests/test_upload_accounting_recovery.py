@@ -49,6 +49,12 @@ from _pt_helpers import csrf_client, isolate_app, clear_upload_dir  # noqa: E402
 def _isolate(tmp_path, monkeypatch):
     """每用例：独立存储 + 上传防护复位 + _validate_slide_file 放行 + 清空。"""
     isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    # P3（合同 §3.1.1）：本地免认证态的上传资产 owner 解析——先配置 owner
+    #（无 UID 不自动认领；owner-NULL 资产行不再产生）
+    import user_store as _us
+    share_store.set_owner_user_id(
+        _us.create_user("p3-local-owner@x.com", "localownerpass12345",
+                        role="user")["user_id"])
     monkeypatch.setattr(upload_guard, "UPLOAD_MAX_REQUEST_BYTES", 10 * 1024 ** 3)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
     monkeypatch.setattr(upload_task_store, "UPLOAD_TASK_TTL_SECONDS", 24 * 3600)
@@ -142,24 +148,30 @@ def _age_committing(monkeypatch):
 # 1. 成功路径：V1/ZIP 接入 upload_task_store 收口状态机
 # =========================================================================== #
 def test_v1_single_file_success_uses_task_machine():
-    """免登录 owner：成功上传 → 唯一任务 committed，manifest 与文件吻合。"""
+    """免登录 owner：成功上传 → 唯一任务 committed，intent manifest 与发布
+    包吻合（P3 新管线：id_bundle 入口 objects/<slide_id>/data.svs）。"""
     data = b"single-slide-bytes"
     r = _upload(_client(), name="s1.svs", content=data)
     assert r.status_code == 200, r.get_data(as_text=True)
-    assert r.get_json() == {"name": "s1.svs", "slide_id": share_store.get_slide_id("s1.svs")}
+    body = r.get_json()
+    sid = body["slide_id"]
+    assert sid and body["name"] == "s1.svs"
     tasks = _tasks()
     assert len(tasks) == 1
     t = tasks[0]
     assert t["state"] == upload_task_store.STATE_COMMITTED
     assert t["safe_name"] == "s1.svs"
+    assert t["slide_id"] == sid            # 任务绑定（唯一绑定源）
+    assert t["commit_intent_json"] is None  # 收口清 intent
     assert t["declared_size"] == len(data)
     arts = t["v1_artifacts"]
     assert isinstance(arts, list) and len(arts) == 1
-    assert arts[0]["name"] == "s1.svs"
+    assert arts[0]["name"] == "data.svs"   # 包入口名（服务端派生）
     assert arts[0]["size"] == len(data)
     assert arts[0]["sha256"] == _sha(data)
     assert arts[0]["slide"] is True
-    assert (Path(UPLOAD_DIR) / "s1.svs").read_bytes() == data
+    assert (Path(UPLOAD_DIR) / "objects" / sid / "data.svs").read_bytes() == data
+    assert not (Path(UPLOAD_DIR) / "s1.svs").exists()  # 根目录不再落文件
     assert _residue() == []
 
 
@@ -181,9 +193,10 @@ def test_v1_zip_success_records_manifest_and_ownership():
     assert set(names) == {"a.svs", "b.tif"}
     assert all(x["slide"] for x in names.values())
     assert names["a.svs"]["sha256"] == _sha(a)
-    # 任务 committed 前归属已入库
+    # 任务 committed 前归属已入库（P3：本地免认证态 = 配置 owner 解析值）
     meta = share_store.get_slide_meta_full("a.svs") or {}
-    assert meta.get("owner_user_id") in (None, "")
+    assert meta.get("owner_user_id") in (None, "",
+                                         share_store.get_owner_user_id())
     assert _residue() == []
 
 
@@ -253,16 +266,19 @@ def test_owner_upload_no_quota_task_machine_still_works(monkeypatch):
 # 2. task intent 前不得提升
 # =========================================================================== 
 def test_no_promotion_before_task_intent_single_file(monkeypatch):
-    """begin_legacy_commit 失败 → 无提升、无残留、任务不落库。"""
+    """begin_legacy_commit 失败 → 无发布、staging 清理、任务不落库、预占
+    释放（P3：manifest 语义由 commit_intent_json 承担——受理失败等价
+    「intent 前」，无任何对象可见）。"""
     def _boom(*a, **kw):
         raise upload_task_store.UploadTaskError("受理失败（测试注入）")
 
     monkeypatch.setattr(upload_task_store, "begin_legacy_commit", _boom)
     r = _upload(_client(), name="np.svs", content=b"never-promoted")
     assert r.status_code == 500
-    assert r.get_json()["code"] == "upload_task_error"
     assert not (Path(UPLOAD_DIR) / "np.svs").exists()
     assert _residue() == []
+    staging = Path(UPLOAD_DIR) / ".staging"
+    assert not staging.exists() or not any(staging.iterdir())
     assert _tasks() == []
 
 
@@ -313,20 +329,29 @@ def test_finish_crash_then_scan_settles_once(monkeypatch):
         sess["role"] = "user"
         sess["auth_version"] = 1
     data = b"z" * 500
-    real_finish = upload_task_store.finish_commit
-    monkeypatch.setattr(upload_task_store, "finish_commit",
-                        lambda *a, **kw: (_ for _ in ()).throw(
-                            RuntimeError("PG 抖动（测试注入）")))
-    r = _upload(c, name="crash.svs", content=data)
-    # 文件已持久提升：请求按成功返回，收口由恢复扫描补账
-    assert r.status_code == 200
-    assert (Path(UPLOAD_DIR) / "crash.svs").read_bytes() == data
+    # P3：新管线的 DB 收口屏障 = slide_publish._settle_publish（发布短事务：
+    # mark_ready + consume + committed 同事务；崩溃即整体回滚）
+    import slide_publish
+    real_settle = slide_publish._settle_publish
+
+    def _settle_boom(*a, **kw):
+        raise RuntimeError("PG 抖动（测试注入）")
+
+    slide_publish._settle_publish = _settle_boom
+    try:
+        r = _upload(c, name="crash.svs", content=data)
+        # 包已发布但 DB 未收口：稳定 commit_in_progress，恢复扫描补账
+        assert r.status_code == 503
+        assert r.get_json()["code"] == "commit_in_progress"
+    finally:
+        slide_publish._settle_publish = real_settle
     t = _tasks()[0]
+    sid = t["slide_id"]
     assert t["state"] == upload_task_store.STATE_COMMITTING
+    assert (Path(UPLOAD_DIR) / "objects" / sid / "data.svs").read_bytes() == data
     row = upload_guard.get_quota_row(uid)
     assert row["used_bytes"] == 0
     assert row["reserved_bytes"] >= len(data)
-    monkeypatch.setattr(upload_task_store, "finish_commit", real_finish)
 
     _age_committing(monkeypatch)
     for _ in range(3):  # 重复恢复：幂等，只补一次账
@@ -356,7 +381,9 @@ def test_consume_crash_same_transaction_no_partial_settle(monkeypatch):
 
     monkeypatch.setattr(upload_guard, "consume_reservation_locked", _boom)
     r = _upload(c, name="cc.svs", content=b"c" * 300)
-    assert r.status_code == 200
+    # P3：收口事务整体回滚 → 稳定 commit_in_progress（不再伪装成功）
+    assert r.status_code == 503
+    assert r.get_json()["code"] == "commit_in_progress"
     t = _tasks()[0]
     assert t["state"] == upload_task_store.STATE_COMMITTING
     assert upload_guard.get_quota_row(uid)["used_bytes"] == 0
@@ -368,37 +395,46 @@ def test_consume_crash_same_transaction_no_partial_settle(monkeypatch):
     assert upload_guard.get_quota_row(uid)["used_bytes"] == 300
 
 
-def test_promote_crash_before_promotion_rolls_back_and_releases(monkeypatch):
-    """提升 IO 失败（intent 后、提升中）→ 临时失败收尾：任务取消、预占释放、
-    目标不落盘。"""
-    from unittest import mock
+def test_publish_io_failure_keeps_committing_then_recovers(monkeypatch):
+    """P3（合同 §3.3/计划 §3.2）：包发布 IO 失败（intent 后）→ **不可撤销段**
+    ——保持 committing（预占仍持有，不取消不释放），返回稳定
+    commit_in_progress；恢复扫描重试发布完成（无 premature settle、无泄漏）。"""
+    import slide_publish
+    import slide_storage as _ss
 
-    with mock.patch.object(app_mod, "_promote_no_clobber") as pm:
-        pm.side_effect = OSError("EIO（测试注入）")
+    real_pub = _ss.publish_bundle_no_clobber
+    _ss.publish_bundle_no_clobber = lambda *a, **kw: (_ for _ in ()).throw(
+        OSError("EIO（测试注入）"))
+    try:
         r = _upload(_client(), name="pf.svs", content=b"promote-fail")
-    assert r.status_code == 400
-    assert not (Path(UPLOAD_DIR) / "pf.svs").exists()
+        assert r.status_code == 503
+        assert r.get_json()["code"] == "commit_in_progress"
+    finally:
+        _ss.publish_bundle_no_clobber = real_pub
+    t = _tasks()[0]
+    assert t["state"] == upload_task_store.STATE_COMMITTING
+    assert t["commit_intent_json"] is not None
+    _age_committing(monkeypatch)
+    app_mod._upload_legacy_recover_stale({"role": "owner"})
+    t = _tasks()[0]
+    assert t["state"] == upload_task_store.STATE_COMMITTED
+    assert (Path(UPLOAD_DIR) / "objects" / t["slide_id"] /
+            "data.svs").read_bytes() == b"promote-fail"
     assert _residue() == []
+
+
+def test_same_name_after_intent_succeeds_no_clobber(monkeypatch):
+    """P3（合同 §3.1.5 裁决）：原生单文件的目标位 objects/<slide_id> 服务端
+    派生且唯一——受理后不存在「撞名」形态（旧 TOCTOU name_unavailable 对
+    原生通道退役）；同名根目录文件不受影响。"""
+    r = _upload(_client(), name="race.svs", content=b"challenger")
+    assert r.status_code == 200
+    sid = r.get_json()["slide_id"]
+    assert (Path(UPLOAD_DIR) / "objects" / sid /
+            "data.svs").read_bytes() == b"challenger"
     tasks = _tasks()
     assert len(tasks) == 1
-    assert tasks[0]["state"] == upload_task_store.STATE_CANCELLED
-
-
-def test_name_conflict_after_intent_fails_permanently(monkeypatch):
-    """受理后提升撞名（TOCTOU 竞态，no-clobber 兜底）→ 确定性失败：任务
-    failed，不占目标名。（入口的 dest.exists() 早退 409 不建任务，另有
-    test_upload_guard 覆盖。）"""
-    from unittest import mock
-
-    with mock.patch.object(app_mod, "_promote_no_clobber") as pm:
-        pm.side_effect = FileExistsError()
-        r = _upload(_client(), name="race.svs", content=b"challenger")
-    assert r.status_code == 409
-    assert r.get_json()["code"] == "name_unavailable"
-    assert not (Path(UPLOAD_DIR) / "race.svs").exists()
-    tasks = _tasks()
-    assert len(tasks) == 1
-    assert tasks[0]["state"] == upload_task_store.STATE_FAILED
+    assert tasks[0]["state"] == upload_task_store.STATE_COMMITTED
     assert _residue() == []
 
 

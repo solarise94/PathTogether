@@ -26,7 +26,7 @@ from pathlib import Path
 import pytest
 
 import _bootstrap  # noqa: F401  # session 目录 + openslide stub（conftest 先行）
-from _pt_helpers import csrf_client, isolate_app  # noqa: E402
+from _pt_helpers import csrf_client, isolate_app, register_slide_row  # noqa: E402
 
 from PIL import Image, JpegImagePlugin  # noqa: E402
 
@@ -76,6 +76,7 @@ def _write(name, data):
     p = Path(app_mod.UPLOAD_DIR) / name
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(data)
+    register_slide_row(name)  # P3：无行兼容分支已删——夹具先注册行
     return name
 
 
@@ -336,6 +337,9 @@ def test_demo_info_display_without_thumbnail(monkeypatch):
     _conn = _psy.connect(os.environ["DATABASE_URL"])
     try:
         with _conn.cursor() as _cur:
+            # P3：_write 已按夹具注册行（随机 slide_id）——先清掉再落固定 ID 行
+            _cur.execute("DELETE FROM slides WHERE legacy_filename=%s",
+                         (RGB_NAME,))
             _cur.execute(
                 "INSERT INTO slides (slide_id, legacy_filename, "
                 "original_filename, display_name, format_ext, asset_state, "

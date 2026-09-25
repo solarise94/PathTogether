@@ -11,10 +11,12 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
+import _bootstrap
+from _pt_helpers import register_slide_row  # noqa: E402  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
 UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 os.environ["AI_INTERNAL_TOKEN"] = "test-internal-token-fp"
-import app as app_mod  # noqa: E402
+import app as app_mod
+import share_store  # noqa: E402
 
 # 若其他测试已先 import app，强制指向本次 TMP，避免污染 ~/svs-viewer/uploads。
 from pathlib import Path as _Path  # noqa: E402
@@ -52,6 +54,7 @@ def _touch_slide(name: str = "demo.svs") -> str:
     path = app_mod.UPLOAD_DIR / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"svs-stub")
+    register_slide_row(name)  # P3：无行兼容分支已删——夹具先注册行（owner NULL，后续可回填归属）
     return name
 
 

@@ -32,6 +32,7 @@ _PUBLIC_NAMES = (
     "ShareStoreUnavailable",
     # —— 函数 ——
     "set_owner_user_id",
+    "get_owner_user_id",  # P3：无 UID 本地模式的资产 owner 解析口径
     "probe_readable",
     "create_share",
     "get_share",

@@ -38,6 +38,15 @@ import share_store
 import share_shared
 import slide_cache
 import slide_io
+# slide ID 化重构 P1-B2（docs/slide-id-refactor-p1-contract-20260925.md §3/§7）：
+# 本进程是 app 之外第二个切片读者——legacy 名一律经 slide_store.resolve_legacy_alias
+# 解析 + share_slides(token, slide_id) 成员判定（R-04：shares.slides JSONB 不再
+# 参与授权判定）+ asset_state='ready' 门禁；文件定位走
+# slide_storage.resolve_descriptor_path。share_slides 成员查询为本进程自写 SQL
+# （pg_store 连接习惯与 share_store_pg 同款）。
+import pg_store
+import slide_store
+import slide_storage
 # 标注可见性统一判定（工单 A / P0 数据隔离，0056）：分享端按
 # visitor subject 过滤，策略与主站同一实现，不复制第二份。
 import annotation_access
@@ -158,10 +167,16 @@ def _sanitize_name(name: str) -> str:
     return cleaned
 
 
-def _get_slide(name: str):
-    """从缓存获取（或创建）切片的句柄池 entry（惰性打开，见 slide_cache）。"""
-    path = UPLOAD_DIR / name
-    if not path.is_file():
+def _get_slide(name: str, path=None):
+    """从缓存获取（或创建）切片的句柄池 entry（惰性打开，见 slide_cache）。
+
+    P1-B2：path 为 resolver 解析后的绝对路径（读通道主路径——
+    slide_storage.resolve_descriptor_path 产物）；缺省按旧口径
+    ``UPLOAD_DIR / name``（无 descriptor 的调用方）。文件缺失 → 404（不变）。
+    """
+    if path is None:
+        path = UPLOAD_DIR / name
+    if not Path(path).is_file():
         abort(404, "切片不存在")
     return slide_cache.get_slide(name, path)
 
@@ -758,14 +773,89 @@ def _fmt_mm(v):
     return ("%.1f" % f).rstrip("0").rstrip(".")
 
 
+def _share_slide_member(token, slide_id):
+    """share_slides(token, slide_id) 成员判定（R-04：ID 关系唯一授权来源）。
+
+    token 有效性/过期/撤销由调用方先经 _require_share（get_share）裁决——
+    这里只做成员关系。DB 异常按非成员处理（fail-closed）。
+    """
+    if not token or not slide_id:
+        return False
+    try:
+        conn = pg_store.connect()
+    except Exception:
+        app.logger.warning("share_slides 成员查询连接失败（fail-closed）",
+                           exc_info=True)
+        return False
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM share_slides WHERE token=%s AND slide_id=%s"
+                    " LIMIT 1", (token, slide_id))
+                return cur.fetchone() is not None
+    except Exception:
+        app.logger.warning("share_slides 成员查询失败（fail-closed）",
+                           exc_info=True)
+        return False
+    finally:
+        conn.close()
+
+
+def _share_slide_rows(token):
+    """分享成员（share_slides ⋈ slides）清单：[(legacy_filename, asset_state)]。
+
+    P1-B2 列表端点数据源（替代遍历 shares.slides JSONB 快照）；按 position
+    排序。DB 异常返回 None（调用方 fail-closed 503）。
+    """
+    try:
+        conn = pg_store.connect()
+    except Exception:
+        app.logger.warning("share_slides 成员清单连接失败", exc_info=True)
+        return None
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT s.legacy_filename, s.asset_state "
+                    "FROM share_slides ss JOIN slides s"
+                    " ON s.slide_id = ss.slide_id "
+                    "WHERE ss.token=%s ORDER BY ss.position, s.legacy_filename",
+                    (token,))
+                rows = cur.fetchall()
+        return [(r[0], r[1]) for r in rows]
+    except Exception:
+        app.logger.warning("share_slides 成员清单查询失败", exc_info=True)
+        return None
+    finally:
+        conn.close()
+
+
 def _require_slide(share, name):
-    """校验 name 属于该 share 且通过文件名校验；否则 403/404。"""
+    """校验 name 属于该 share 且资产可读；403/404 语义不变。
+
+    P1-B2（R-04）：``resolve_legacy_alias``（冻结别名，无文件系统猜测）→
+    ``share_slides(token, slide_id)`` 成员 → ``asset_state='ready'`` 门禁
+    （staging/legacy 未回填/deleting/deleted/failed 不可读，合同 §4）。
+    **shares.slides JSONB 不再参与这里的判定**（兼容快照）。无行/非成员/
+    非 ready → 403「无权访问」（与旧口径一致，不泄露差异；行存在且成员、
+    文件缺失仍由 _get_slide 404）。返回 SlideDescriptor（legacy_filename 即
+    净化后的 name；文件读走 slide_storage.resolve_descriptor_path）。
+    """
     safe = _sanitize_name(name)
     if not safe or safe != name:
         abort(403, "无权访问")
-    if safe not in share.get("slides", []):
+    try:
+        desc = slide_store.resolve_legacy_alias(safe)
+    except Exception:
+        app.logger.warning("分享通道 legacy 解析失败（fail-closed）：%s",
+                           safe, exc_info=True)
+        desc = None
+    if (desc is None
+            or desc.asset_state != slide_store.SlideState.READY
+            or not _share_slide_member(share.get("token"), desc.slide_id)):
         abort(403, "无权访问")
-    return safe
+    return desc
 
 
 def _share_has_annotate(share):
@@ -1016,10 +1106,14 @@ def share_page(token):
 @app.route("/s/<token>/api/slides")
 def share_slides(token):
     share = _require_share(token)
-    # 一次性取 slide_meta，减少锁竞争
+    # P1-B2（R-04）：成员清单来自 share_slides ID 关系（不再遍历 shares.slides
+    # JSONB 快照）；读取该清单失败 → 503 fail-closed（不回退 JSONB 猜测）
+    member_rows = _share_slide_rows(token)
+    if member_rows is None:
+        return jsonify(error="share_store_unavailable"), 503
     all_meta = share_store.get_all_slide_meta()
     items = []
-    for name in share["slides"]:
+    for name, _state in member_rows:
         safe = _sanitize_name(name)
         path = UPLOAD_DIR / safe
         info = {"name": safe, "exists": path.is_file()}
@@ -1088,8 +1182,10 @@ def _handle_slide_file_changed(e):
 @app.route("/s/<token>/api/slide/<name>.dzi")
 def share_slide_dzi(token, name):
     share = _require_share(token)
-    safe = _require_slide(share, name)
-    entry = _get_slide(safe)
+    desc = _require_slide(share, name)
+    safe = desc.legacy_filename
+    entry = _get_slide(safe, slide_storage.resolve_descriptor_path(
+        desc, root=UPLOAD_DIR))
     # 尺寸按代读取（review G3）：文件换名重传后 dims 必须来自新代句柄
     (width, height), _gen = slide_cache.read_stable(
         entry, lambda pair: pair["dz"].level_dimensions[-1])
@@ -1110,10 +1206,15 @@ def share_slide_dzi(token, name):
 
 @app.route("/s/<token>/api/slide/<name>/info")
 def share_slide_info(token, name):
-    """分享端单切片 info（Batch 3 additive）：render 字段与主站同一实现。"""
+    """分享端单切片 info（Batch 3 additive）：render 字段与主站同一实现。
+
+    P1-B2：成员判定/状态门禁在 _require_slide（share_slides ID 关系）；
+    文件读走 resolve_descriptor_path。
+    """
     share = _require_share(token)
-    safe = _require_slide(share, name)
-    path = UPLOAD_DIR / safe
+    desc = _require_slide(share, name)
+    safe = desc.legacy_filename
+    path = slide_storage.resolve_descriptor_path(desc, root=UPLOAD_DIR)
     info = {"name": safe, "exists": path.is_file()}
     sm = share_store.get_slide_meta_full(safe)
     info["alias"] = sm.get("alias", "")
@@ -1122,7 +1223,7 @@ def share_slide_info(token, name):
         info["error"] = "文件不存在"
         return jsonify(info)
     try:
-        entry = _get_slide(safe)
+        entry = _get_slide(safe, path)
         with slide_cache.borrow_pair(entry) as pair:
             info.update(_read_metadata(pair["osr"], path))
     except Exception as e:  # noqa: BLE001  与列表端点同形
@@ -1147,12 +1248,14 @@ def share_slide_info(token, name):
 def share_slide_render_context(token, name):
     """分享端渲染上下文规范化（§6.2，不落库）：share token 先行鉴权。"""
     share = _require_share(token)
-    safe = _require_slide(share, name)
+    desc = _require_slide(share, name)
+    safe = desc.legacy_filename
     if not _multichannel_enabled():
         return jsonify(error="多通道渲染未启用",
                        code="multichannel_disabled"), 403
     body = request.get_json(silent=True)
-    entry = _get_slide(safe)
+    entry = _get_slide(safe, slide_storage.resolve_descriptor_path(
+        desc, root=UPLOAD_DIR))
 
     def _build(pair):
         canonical, fp = slide_render.resolve_render_context(
@@ -1209,8 +1312,10 @@ def share_slide_tile(token, name, level, x, y):
     旧 URL（无 profile/dv）保持既有编码语义。
     """
     share = _require_share(token)
-    safe = _require_slide(share, name)
-    entry = _get_slide(safe)
+    desc = _require_slide(share, name)
+    safe = desc.legacy_filename
+    entry = _get_slide(safe, slide_storage.resolve_descriptor_path(
+        desc, root=UPLOAD_DIR))
     render_tok = request.args.get("render") or ""
     flag = _multichannel_enabled()
 
@@ -1359,8 +1464,10 @@ def share_slide_crop(token, name):
     走兼容正方形分支（保留 clamp 语义）。
     """
     share = _require_share(token)
-    safe = _require_slide(share, name)
-    entry = _get_slide(safe)
+    desc = _require_slide(share, name)
+    safe = desc.legacy_filename
+    entry = _get_slide(safe, slide_storage.resolve_descriptor_path(
+        desc, root=UPLOAD_DIR))
     render_tok = request.args.get("render") or ""
 
     def _parse_int(key):
@@ -1478,8 +1585,10 @@ def share_slide_thumbnail(token, name):
     ``?profile=&dv=``；private no-cache + 强 ETag。
     """
     share = _require_share(token)
-    safe = _require_slide(share, name)
-    entry = _get_slide(safe)
+    desc = _require_slide(share, name)
+    safe = desc.legacy_filename
+    entry = _get_slide(safe, slide_storage.resolve_descriptor_path(
+        desc, root=UPLOAD_DIR))
     render_tok = request.args.get("render") or ""
     try:
         req_profile, req_dv = viewer_display.parse_display_params(
@@ -1535,7 +1644,18 @@ def share_roi_add(token):
     if not slide:
         return jsonify(error="缺少 slide"), 400
     safe = _sanitize_name(slide)
-    if not safe or safe != slide or safe not in share.get("slides", []):
+    if not safe or safe != slide:
+        return jsonify(error="slide 不属于该分享"), 403
+    # P1-B2（R-04）：成员判定走 share_slides ID 关系（JSONB 快照不再参与）
+    try:
+        roi_desc = slide_store.resolve_legacy_alias(safe)
+    except Exception:
+        app.logger.warning("分享标注写通道 legacy 解析失败：%s", safe,
+                           exc_info=True)
+        roi_desc = None
+    if (roi_desc is None
+            or roi_desc.asset_state != slide_store.SlideState.READY
+            or not _share_slide_member(token, roi_desc.slide_id)):
         return jsonify(error="slide 不属于该分享"), 403
     # Stage 3c-2（docs §v1.5）：归档项目内切片只读，guest 亦不可标注
     if _reject_archived_slide(share, safe):
@@ -1754,6 +1874,9 @@ def _resolve_anno_in_share(share, annotation_id):
 
     返回 (roi, None) 或 (None, error_resp)；不可见/不存在统一 404 语义
     （slide 不在分享内仍 403——token 本身可见性不变）。
+    P1-B2 注：此处的 slide ∈ share 仍按 shares.slides JSONB 快照比对——
+    标注/评论的 ID 化（R-08）与成员判定统一在 P2 收口（_require_slide/
+    roi 写通道已切 share_slides ID 关系）。
     """
     roi = share_store.get_roi_by_annotation_id(annotation_id)
     if roi is None:

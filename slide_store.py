@@ -353,11 +353,44 @@ def resolve_legacy_alias(alias, *, conn=None):
             return _row_to_descriptor(cur.fetchone())
 
 
+def list_ready_descriptors(*, conn=None):
+    """asset_state='ready' 的全部 descriptor（P1-B2 列表源；按 legacy_filename 排序）。
+
+    可见性开关的列表面：调用方（app 列表/管理清单）仍需对每行跑
+    authorize_read——本函数只保证状态过滤；文件存在性检查由调用方按
+    storage_layout stat（legacy 布局入口文件消失即不列出，旧行为）。
+    """
+    with _session(conn) as c:
+        with c.cursor() as cur:
+            cur.execute(_DESCRIPTOR_SQL
+                        + " WHERE s.asset_state=%s"
+                        " ORDER BY s.legacy_filename NULLS LAST",
+                        (SlideState.READY,))
+            rows = cur.fetchall()
+    return [d for d in (_row_to_descriptor(r) for r in rows) if d is not None]
+
+
+def list_all_descriptors(*, conn=None):
+    """全部 slides 行（含非 ready 状态与无 legacy_filename 的行）的 descriptor。
+
+    管理面（admin inventory）的 DB 清单源（P1-B2）：**不做可见性过滤**——
+    管理台是唯一「看全部」出口；无 legacy_filename 的行排最后（管理清单的
+    name 键是 legacy_filename，id_bundle-only 行由 slide_id 单独呈现）。
+    """
+    with _session(conn) as c:
+        with c.cursor() as cur:
+            cur.execute(_DESCRIPTOR_SQL
+                        + " ORDER BY s.legacy_filename NULLS LAST")
+            rows = cur.fetchall()
+    return [d for d in (_row_to_descriptor(r) for r in rows) if d is not None]
+
+
 # --------------------------------------------------------------------------- #
 # 统一读门禁（合同 §3.1/§4）
 # --------------------------------------------------------------------------- #
 def authorize_read(desc, *, actor_user_id=None, actor_role=None,
-                   demo_capability=False, conn=None) -> bool:
+                   demo_capability=False, allow_public=True, allow_share=True,
+                   conn=None) -> bool:
     """统一读取门禁：所有读取入口（新旧端点、分享进程、插件、AI）共用。
 
     判定序（合同 §3.1，顺序即裁决优先级）：
@@ -367,18 +400,26 @@ def authorize_read(desc, *, actor_user_id=None, actor_role=None,
          descriptor 只是解析快照，防快照过期/并发置 deleting 后仍放行）。
       1. admin 角色（平台 owner，管理面读）；
       2. owner（actor_user_id == 当前行 owner_user_id）；
-      3. public（当前行值）；
+      3. public（当前行值；``allow_public=False`` 时跳过）；
       4. slide_id 级 slide_view_grants（**只认 slide_id 列**，不认
          slide_name——R-06：旧名授权不再匹配新内容）；
       5. share_slides ⋈ grants：已领取（grants.active）未撤销
          （shares.revoked=false）未过期（expires_at NULL 或 > now）且 grant
          含 view 权限；shares.slides JSONB 快照**不参与**判定（R-04）；
+         ``allow_share=False`` 时跳过；
       6. demo_catalog capability（调用方显式声明 demo 通道；allowlist
          命中才放行——R-10：删除后 capability 不能读）。
 
     fail-closed：任何 DB 异常按拒绝处理，不回退目录扫描/名称猜测。
     desc 可传 SlideDescriptor 或 slide_id 字符串（内部走 resolve_slide_id，
     缺失即拒）。
+
+    P1-B2 平台兼容参数（app.py 读隔离接线，P2 权限关系统一后退役）：
+      - ``allow_public=False``：认证 owner 的可见集不含他人 public 切片
+        （升级 B R5）；Demo 通道亦用（allowlist 唯一入口，public ≠ 匿名可见）。
+      - ``allow_share=False``：认证 owner 的可见集不含 claimed 协作切片
+        （升级 B R5：owner = 本人 ∪ 显式添加）。缺省两参均为 True（本模块
+        既有调用方/测试语义不变）。
     """
     try:
         if desc is None:
@@ -403,14 +444,15 @@ def authorize_read(desc, *, actor_user_id=None, actor_role=None,
         # 2) owner
         if uid and row["owner_user_id"] and uid == row["owner_user_id"]:
             return True
-        # 3) public
-        if row["public"]:
+        # 3) public（P1-B2 兼容开关：认证 owner / Demo 通道跳过）
+        if allow_public and row["public"]:
             return True
         # 4~5) 显式授权/share 成员：需要具体主体
         if uid:
             if _has_slide_view_grant(uid, desc.slide_id, conn=conn):
                 return True
-            if _has_active_share_membership(uid, desc.slide_id, conn=conn):
+            if allow_share and _has_active_share_membership(
+                    uid, desc.slide_id, conn=conn):
                 return True
         # 6) demo capability（独立于主体——匿名 demo 通道也走 allowlist，
         #    命中才放行）
@@ -524,6 +566,24 @@ def mark_deleted(slide_id, *, expected_state=SlideState.DELETING, conn=None) -> 
     """
     return _cas_state(slide_id, expected_state, SlideState.DELETED,
                       "deleted_at=now()", conn=conn)
+
+
+def mark_deleted_compat(slide_id, *, conn=None) -> bool:
+    """P1-B2 兼容直写：旧删除端点（app.api_slide_delete）的立即失效步骤。
+
+    旧端点在 P5 前不做 deleting/deleted 两阶段编排——删完文件后由本原语把
+    行直写为 ``deleted``（+deleted_at），让 authorize_read 状态门禁立即拒绝
+    后续读取（合同 §4：tombstone 保留 legacy_filename）。从任意非 deleted
+    状态迁移（幂等：已 deleted 返回 False）；行缺失返回 False。**不是**通用
+    状态机原语——正式删除编排（advisory 锁 + CAS + 结算）在 P5 接线后移除。
+    """
+    with _session(conn) as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "UPDATE slides SET asset_state=%s, deleted_at=now(), "
+                "updated_at=now() WHERE slide_id=%s AND asset_state<>%s",
+                (SlideState.DELETED, slide_id, SlideState.DELETED))
+            return cur.rowcount == 1
 
 
 def mark_failed(slide_id, *, expected_state=SlideState.STAGING, conn=None) -> bool:

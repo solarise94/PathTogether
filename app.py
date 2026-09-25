@@ -59,6 +59,12 @@ import share_store
 import share_shared
 import slide_cache
 import slide_io
+# slide ID 化重构 P1-B2（docs/slide-id-refactor-p1-contract-20260925.md §3）：
+# slide_store = PG 资产身份/状态权威（resolver + authorize_read 统一门禁 +
+# 状态 CAS 原语）；slide_storage = 安全路径派生（resolve_descriptor_path，
+# containment 校验）。读通道一律经二者，不再 UPLOAD_DIR/name 直接拼。
+import slide_store
+import slide_storage
 # 多通道伪彩渲染（规格 §7.1 共享模块）：manifest / canonical context /
 # HMAC render_token / 请求级解析 / RenderedSlideView 由 app.py 与
 # share_server.py 共用，禁止在本文件复制颜色/签名算法。
@@ -1827,7 +1833,12 @@ def _sanitize_name(name: str) -> str:
 
 
 def _safe_name(name: str) -> str:
-    """校验 name 合法且对应文件存在于 UPLOAD_DIR，防路径穿越。"""
+    """校验 name 合法且对应文件存在于 UPLOAD_DIR，防路径穿越。
+
+    P1-B2 起读端点不再使用本函数定位资产（改 _resolve_legacy_read →
+    authorize_read → resolve_descriptor_path）；保留给写通道（删除/改名/
+    标注落库）与机器通道（internal/plugin）的无行兼容分支。
+    """
     safe = _sanitize_name(name)
     if not safe or safe != name:
         abort(400, jsonify(error="非法文件名"))
@@ -1837,19 +1848,175 @@ def _safe_name(name: str) -> str:
     return safe
 
 
-def _get_slide(name: str):
-    """从缓存获取（或创建）切片的句柄池 entry。
+# --------------------------------------------------------------------------- #
+# slide ID 化重构 P1-B2：统一 resolver + 状态门禁 + descriptor 路径
+# （docs/slide-id-refactor-p1-contract-20260925.md §3/§4/§7；P0 盘点 §2.1.1）
+#
+# 读通道接线（合同 §7）：旧端点入参一律按 legacy alias 解析（**不在同一
+# 字段上依次尝试 ID/名**——计划 §4.1），进入 authorize_read 统一门禁后经
+# slide_storage.resolve_descriptor_path 定位文件；DB asset_state='ready' 是
+# 唯一可见性开关（staging/legacy 未回填/deleting/deleted/failed 一律拒）。
+# --------------------------------------------------------------------------- #
+def _resolve_legacy_read(name):
+    """旧端点入参（legacy 文件名）→ SlideDescriptor | None。
 
-    打开是惰性的，真正的 slide_io.open_slide 在首次 borrow_pair 时发生；
-    多路并发读取同一切片由句柄池（SLIDE_HANDLE_POOL）保证并行。
+    ``slide_store.resolve_legacy_alias``（仅查 slides.legacy_filename 冻结
+    映射，无文件系统猜测）；无行/名非法/DB 异常 → None（fail-closed，
+    调用方按该端点既有状态码拒绝）。名合法性先过 _sanitize_name 白名单。
     """
-    safe = _safe_name(name)
+    safe = _sanitize_name(name)
+    if not safe or safe != name:
+        return None
+    try:
+        return slide_store.resolve_legacy_alias(safe)
+    except Exception:
+        app.logger.warning("legacy alias 解析失败（fail-closed 拒读）：%s",
+                           safe, exc_info=True)
+        return None
+
+
+def _authorize_or_deny(desc, *, channel="session"):
+    """authorize_read 的 app 侧接线（P1-B2）。返回 True=放行。
+
+    - channel="session"：/api/slide/<name>/* 用户面读端点。按当前登录主体
+      （current_identity，预览态自动按 subject 生效）走 authorize_read，并
+      保持升级 B 读隔离口径：本地免认证单租户态（owner 且无 uid）走 admin
+      语义（§5.4 例外）；**认证 owner** 不含他人 public/claimed（allow_public
+      =allow_share=False，升级 B R5）；普通 user = 本人 ∪ public ∪ 显式授权
+      ∪ share_slides 成员（与 _user_can_view_slide 同集）。
+    - channel="demo"：/api/demo/* —— authorize_read(demo_capability=True,
+      allow_public=False)：allowlist 唯一入口，public ≠ 匿名可见（docs §5.1）。
+    - channel="state"：internal/plugin 机器通道（internal token / 插件 JWT +
+      run grant 已各自鉴权）——只做 ready 状态门禁（见 _legacy_row_state_gate，
+      通道自身无用户主体，authorize_read 的主体分支不适用）。
+    """
+    if desc is None:
+        return False
+    if channel == "demo":
+        return slide_store.authorize_read(
+            desc, demo_capability=True, allow_public=False)
+    if channel == "state":
+        return getattr(desc, "asset_state", None) == slide_store.SlideState.READY
+    ident = current_identity()
+    role = ident.get("role")
+    uid = ident.get("user_id") or None
+    if role == user_store.ROLE_OWNER:
+        if not uid:
+            # 本地免认证单租户态：不存在「其他用户」可隔离（升级 B §5.4 例外）
+            return slide_store.authorize_read(
+                desc, actor_role=slide_store.ROLE_ADMIN)
+        # 认证 owner = 本人 ∪ 显式添加（升级 B R5：public/claimed 不自动计入）
+        return slide_store.authorize_read(
+            desc, actor_user_id=uid, allow_public=False, allow_share=False)
+    if not uid:
+        return False  # guest（AUTH_ENABLED=True 下到不了这里；防御性拒绝）
+    return slide_store.authorize_read(desc, actor_user_id=uid)
+
+
+def _authorize_legacy_read(name, *, channel="session"):
+    """session 通道读端点的解析+门禁一步接线。
+
+    返回 SlideDescriptor；无行/无权 → None（调用方按既有语义返回 _denied()
+    403——「无权与不存在一致，不泄露存在性差异」，test_access_control 冻结）。
+
+    兼容过渡（P1-B2）：**本地免认证单租户态**（owner 且无 uid）对无 slides
+    行的文件保持旧行为——入口文件存在即可读（ad-hoc descriptor，asset_state
+    按 legacy 未注册呈现）。既有迁移夹具（test_region_read_level 等）依赖该
+    形态；认证部署下无行一律拒（「外部程序手工放文件不自动注册」），P3
+    writer 全面接管 ID 后本地态一并收口。
+    """
+    desc = _resolve_legacy_read(name)
+    if desc is not None:
+        if not _authorize_or_deny(desc, channel=channel):
+            return None
+        return desc
+    if channel != "session":
+        return None
+    ident = current_identity()
+    if ident.get("role") != user_store.ROLE_OWNER or ident.get("user_id"):
+        return None
+    safe = _sanitize_name(name)
+    if not safe or safe != name or not (UPLOAD_DIR / safe).is_file():
+        return None
+    return slide_store.SlideDescriptor(
+        slide_id="", owner_user_id=None, original_filename=safe,
+        display_name=safe, legacy_filename=safe, format_ext=None,
+        asset_state=slide_store.SlideState.LEGACY,
+        storage_layout="legacy", storage_relpath=None, accounted_bytes=None,
+        public=False, note="", published_at=None, deleted_at=None,
+        revision=None)
+
+
+def _legacy_row_state_gate(safe):
+    """internal/plugin 机器通道的状态门禁（P1-B2 过渡口径）。
+
+    有 slides 行 → 返回 descriptor（asset_state != 'ready' 时调用方拒绝：
+    staging/legacy 未回填/deleting/deleted/failed 不可读，合同 §4）；无行 →
+    返回 None 并由调用方维持**旧行为**（文件存在即可读——既有 internal/
+    plugin 测试夹具与 P3 前的 writer 中间态依赖；P3 writer 全面接管 ID 后
+    收口为「无行一律拒」）。与 session 通道不同，机器通道自身已由 internal
+    token / 插件 JWT + run grant 完成主体鉴权。
+    """
+    try:
+        return slide_store.resolve_legacy_alias(safe)
+    except Exception:
+        app.logger.warning("机器通道状态门禁解析失败（按无行兼容处理）：%s",
+                           safe, exc_info=True)
+        return None
+
+
+def _slide_cache_key_for(slide_id, name):
+    """slide_cache 键：slide_id 为主（R-15：显示名/文件名变化不重建句柄、
+    删除按 ID 精确失效），拼接展示名仅为保留后缀形态——slide_cache._new_entry
+    按名后缀识别普通图片（raster），本阶段不改 slide_cache.py。"""
+    return "%s::%s" % (slide_id, name or "slide")
+
+
+def _slide_cache_key(desc):
+    return _slide_cache_key_for(
+        desc.slide_id, desc.legacy_filename or desc.original_filename)
+
+
+def _desc_path(desc):
+    """descriptor → 入口文件绝对路径（slide_storage.resolve_descriptor_path，
+    含 containment 校验；root 显式传 app.UPLOAD_DIR——测试按用例 monkeypatch
+    本模块常量，slide_storage 的模块级根不随之变化）。"""
+    return slide_storage.resolve_descriptor_path(desc, root=UPLOAD_DIR)
+
+
+def _desc_read_path(desc):
+    """读通道的路径收口：resolve 后入口文件必须存在，否则 404（保持旧
+    _safe_name「文件消失即 404」语义；授权在先、404 在后不变）。"""
+    path = _desc_path(desc)
+    if not path.is_file():
+        abort(404, jsonify(error="切片不存在"))
+    return path
+
+
+def _get_slide(desc_or_name):
+    """从缓存获取（或创建）切片的句柄池 entry（惰性打开，见 slide_cache）。
+
+    P1-B2：参数是 SlideDescriptor（读通道主路径——路径经 resolve_descriptor_path
+    派生、缓存键 = slide_id 形态）或 legacy 名（写通道/机器通道无行兼容分支，
+    旓名拼 UPLOAD_DIR）。多路并发读取同一切片由句柄池（SLIDE_HANDLE_POOL）
+    保证并行。
+    """
+    if isinstance(desc_or_name, slide_store.SlideDescriptor):
+        return slide_cache.get_slide(_slide_cache_key(desc_or_name),
+                                     _desc_path(desc_or_name))
+    safe = desc_or_name
     return slide_cache.get_slide(safe, UPLOAD_DIR / safe)
 
 
-def _close_slide(name: str) -> None:
-    """关闭并移除缓存中的切片句柄池，同时清掉其瓦片缓存。"""
+def _close_slide(name: str, slide_id=None) -> None:
+    """关闭并移除缓存中的切片句柄池，同时清掉其瓦片缓存。
+
+    P1-B2：句柄缓存键是 slide_id 形态（<slide_id>::<name>）；旧名键一并
+    evict（机器通道兼容分支可能以旧名开过句柄）。瓦片缓存键仍按 legacy 名
+    （R-15 的 tile 键迁移在 P2）。"""
     slide_cache.evict(name)
+    if slide_id:
+        slide_cache.evict(_slide_cache_key_for(slide_id, name))
     _tile_cache_purge(name)
 
 
@@ -1957,12 +2124,71 @@ def _read_metadata(osr: OpenSlide, path: Path) -> dict:
     }
 
 
-def _slide_info_dict(name: str) -> dict:
-    """构建单个切片的元数据字典（用于列表与 info 接口）。
+def _slide_info_dict_desc(desc, path=None):
+    """构建单个切片的元数据字典（descriptor 形态；列表与 info 接口共用）。
 
-    meta 部分（尺寸/mpp，需打开切片读取）走 mtime 感知缓存避免重复打开；
-    alias/note（来自 slide_meta，可独立于文件修改）每次现查并合并。
+    P1-B2：读端点主路径——path 由调用方经 _desc_read_path 解析（containment
+    校验后的绝对路径）；meta 部分走 mtime 感知缓存（键 = slide_id 形态缓存键），
+    alias/note（来自 slide_meta，可独立于文件修改）每次现查并合并；响应的
+    ``name`` 字段保持 legacy 文件名（前端主键，P2 切 ID）。附加 P1-B2 新字段
+    slide_id/original_filename/display_name/format_ext（旧字段原样保留）。
     """
+    if path is None:
+        path = _desc_read_path(desc)
+    safe = desc.legacy_filename or desc.original_filename or ""
+    base = {
+        "name": safe,
+        "size_bytes": path.stat().st_size,
+        "slide_id": desc.slide_id,
+        "original_filename": desc.original_filename,
+        "display_name": desc.display_name or (desc.legacy_filename or ""),
+        "format_ext": desc.format_ext,
+    }
+
+    def _read_meta():
+        entry = _get_slide(desc)
+        with slide_cache.borrow_pair(entry) as pair:
+            return _read_metadata(pair["osr"], path)
+
+    try:
+        meta = slide_cache.cached_read_metadata(_slide_cache_key(desc), path,
+                                                _read_meta)
+    except Exception as e:
+        base.update(
+            {
+                "width": None,
+                "height": None,
+                "mpp_x": None,
+                "mpp_y": None,
+                "objective": None,
+                "mpp_source": "missing",
+                "error": str(e),
+            }
+        )
+        sm = share_store.get_slide_meta_full(safe)
+        base["alias"] = sm.get("alias", "")
+        base["note"] = sm.get("note", "")
+        base["public"] = bool(sm.get("public"))
+        return base
+    base.update(meta)
+    sm = share_store.get_slide_meta_full(safe)
+    base["alias"] = sm.get("alias", "")
+    base["note"] = sm.get("note", "")
+    base["public"] = bool(sm.get("public"))
+    return base
+
+
+def _slide_info_dict(name: str) -> dict:
+    """构建单个切片的元数据字典（legacy 名形态；写通道辅助换算用）。
+
+    P1-B2：读端点请改用 _slide_info_dict_desc（经门禁）；本包装仅供内部
+    写通道（标注 size_mm 换算等，_rect_size_mm/_contains 校验）——有行按
+    descriptor 读，无行按旧口径直接读文件元数据（未经注册的测试桩/中间态，
+    与 P1 前行为一致）。
+    """
+    desc = _resolve_legacy_read(name)
+    if desc is not None:
+        return _slide_info_dict_desc(desc)
     safe = _safe_name(name)
     path = UPLOAD_DIR / safe
     base = {"name": safe, "size_bytes": path.stat().st_size}
@@ -1999,7 +2225,7 @@ def _slide_info_dict(name: str) -> dict:
     return base
 
 
-def _slide_render_info_fields(safe: str, *, include_deepzoom=True,
+def _slide_render_info_fields(desc_or_name, *, include_deepzoom=True,
                               include_thumbnail=True) -> dict:
     """info 响应的 render additive 字段（§6.1；flag 关只暴露探测能力）。
 
@@ -2009,8 +2235,16 @@ def _slide_render_info_fields(safe: str, *, include_deepzoom=True,
     ``server_capability.display_encoding_v1`` 与 ``display`` 对象（含默认
     context 下各档 display_version）；``include_thumbnail=False``（Demo）
     不输出 thumbnail 描述——不伪装出没有的能力。
+    P1-B2：参数可为 SlideDescriptor（读端点主路径——句柄经 _get_slide 按
+    slide_id 键取）或 legacy 名（写通道辅助；render 统计 scope / token 的
+    slide 绑定仍按 legacy 名——瓦片端点验签同键，R-15 的 token/统计键迁移
+    在 P2）。
     """
-    entry = _get_slide(safe)
+    if isinstance(desc_or_name, slide_store.SlideDescriptor):
+        safe = desc_or_name.legacy_filename or desc_or_name.original_filename
+    else:
+        safe = desc_or_name
+    entry = _get_slide(desc_or_name)
 
     def _read(pair):
         fields = slide_render.build_render_info(
@@ -2052,16 +2286,21 @@ def _slide_render_info_fields(safe: str, *, include_deepzoom=True,
     return slide_cache.read_stable(entry, _read)[0]
 
 
-def _render_context_post_response(safe: str, body):
+def _render_context_post_response(desc_or_name, body):
     """POST render-context 的共用实现（规范化 + 签发 token，§6.2）。
 
     不落库；调用方已先完成各自访问面鉴权。flag 关 → 403
     multichannel_disabled（RGB/多通道一致——旧客户端不走本端点）。
+    P1-B2：参数可为 SlideDescriptor（读端点主路径）或 legacy 名。
     """
+    if isinstance(desc_or_name, slide_store.SlideDescriptor):
+        safe = desc_or_name.legacy_filename or desc_or_name.original_filename
+    else:
+        safe = desc_or_name
     if not _multichannel_enabled():
         return jsonify(error="多通道渲染未启用",
                        code="multichannel_disabled"), 403
-    entry = _get_slide(safe)
+    entry = _get_slide(desc_or_name)
     try:
         def _build(pair):
             canonical, fp = slide_render.resolve_render_context(
@@ -5775,10 +6014,15 @@ def _demo_set_capability_cookie(resp):
 # Demo 切片 allowlist 解析（docs §5.1：独立 demo_catalog，public ≠ 匿名可见）
 # --------------------------------------------------------------------------- #
 def _demo_catalog_slide(slide_id):
-    """校验 slide_id 在 Demo 目录并解析回 legacy 文件名。
+    """校验 slide_id 在 Demo 目录并解析为 descriptor（P1-B2）。
 
-    返回 (entry, filename) 或 (None, None)：不在目录 / slides 行缺失 /
-    legacy_filename 为 NULL 一律 None（fail-closed，绝不按文件名猜）。
+    返回 (entry, desc) 或 (None, None)：不在目录 / slides 行缺失 /
+    legacy_filename 为 NULL（id_bundle 资产 P1 不经 demo 旧管线服务）/
+    authorize_read(demo_capability=True, allow_public=False) 不通过
+    （asset_state='ready' 唯一可见性开关；allowlist 唯一入口，public ≠
+    匿名可见）一律 None（fail-closed，绝不按文件名猜）。不再经
+    demo_store.resolve_slide_filename 回落文件名（该函数保留给目录列表等
+    其他调用方）。
     """
     if not isinstance(slide_id, str) or not slide_id:
         return None, None
@@ -5786,13 +6030,34 @@ def _demo_catalog_slide(slide_id):
         entry = demo_store.catalog_get(slide_id)
         if entry is None:
             return None, None
-        filename = demo_store.resolve_slide_filename(slide_id)
+        desc = slide_store.resolve_slide_id(slide_id)
     except Exception:
         app.logger.warning("Demo 目录读取失败", exc_info=True)
         return None, None
-    if not filename:
+    if desc is None:
+        # P1-B2 过渡：catalog 项指向无 slides 行的资产。生产不可能出现
+        # （demo_store.catalog_add 校验 slides 行存在）；仅外部构造的目录/
+        # 测试夹具会走到这里——按目录 allowlist + 旧 id→filename 反查兜底
+        # （文件存在即放行；不建行、不猜归属、行存在时绝不走此分支）。
+        try:
+            filename = demo_store.resolve_slide_filename(slide_id)
+        except Exception:
+            return None, None
+        if not filename:
+            return None, None
+        return entry, slide_store.SlideDescriptor(
+            slide_id=slide_id, owner_user_id=None, original_filename=filename,
+            display_name=filename, legacy_filename=filename, format_ext=None,
+            asset_state=slide_store.SlideState.READY,
+            storage_layout="legacy", storage_relpath=None,
+            accounted_bytes=None, public=False, note="", published_at=None,
+            deleted_at=None, revision=None)
+    if not desc.legacy_filename:
         return None, None
-    return entry, filename
+    if not slide_store.authorize_read(desc, demo_capability=True,
+                                      allow_public=False):
+        return None, None
+    return entry, desc
 
 
 def _demo_request_lang():
@@ -6018,10 +6283,11 @@ def api_demo_slide_info(slide_id):
     cap, cap_err = _demo_require_capability()
     if cap_err is not None:
         return cap_err
-    entry, filename = _demo_catalog_slide(slide_id)
+    entry, desc = _demo_catalog_slide(slide_id)
     if entry is None:
         return jsonify(error="slide 不在 Demo 目录内", code="slide_not_in_catalog"), 404
-    info = _slide_info_dict(filename)
+    path = _desc_read_path(desc)
+    info = _slide_info_dict_desc(desc, path)
     info["slide_id"] = slide_id
     # 工单 B：demo_* 双语展示字段（en 可空 = 无译文，前端回落缺省字段）
     if entry.get("display_name"):
@@ -6038,7 +6304,7 @@ def api_demo_slide_info(slide_id):
         # image-transport-upgrade：Demo 无缩略图能力 → 不输出 thumbnail 描述
         try:
             info.update(_slide_render_info_fields(
-                info["name"], include_thumbnail=False))
+                desc, include_thumbnail=False))
         except (slide_render.RenderRequestError,
                 slide_io.SlideRenderError) as e:
             return _render_error_response(e)
@@ -6057,12 +6323,12 @@ def api_demo_slide_render_context(slide_id):
     cap, cap_err = _demo_require_capability()
     if cap_err is not None:
         return cap_err
-    entry, filename = _demo_catalog_slide(slide_id)
+    entry, desc = _demo_catalog_slide(slide_id)
     if entry is None:
         return jsonify(error="slide 不在 Demo 目录内", code="slide_not_in_catalog"), 404
-    safe = _safe_name(filename)
+    _desc_read_path(desc)
     body = request.get_json(silent=True)
-    return _render_context_post_response(safe, body)
+    return _render_context_post_response(desc, body)
 
 
 @app.route("/api/demo/slides/<slide_id>.dzi")
@@ -6075,11 +6341,12 @@ def api_demo_slide_dzi(slide_id):
     cap, cap_err = _demo_require_capability()
     if cap_err is not None:
         return cap_err
-    entry, filename = _demo_catalog_slide(slide_id)
+    entry, desc = _demo_catalog_slide(slide_id)
     if entry is None:
         return jsonify(error="slide 不在 Demo 目录内", code="slide_not_in_catalog"), 404
-    safe = _safe_name(filename)
-    dz_entry = _get_slide(safe)
+    safe = desc.legacy_filename
+    _desc_read_path(desc)
+    dz_entry = _get_slide(desc)
     with slide_cache.borrow_pair(dz_entry) as pair:
         width, height = pair["dz"].level_dimensions[-1]
     xml = (
@@ -6110,10 +6377,11 @@ def api_demo_slide_tile(slide_id, level, x, y):
     cap, cap_err = _demo_require_capability()
     if cap_err is not None:
         return cap_err
-    catalog_entry, filename = _demo_catalog_slide(slide_id)
+    catalog_entry, desc = _demo_catalog_slide(slide_id)
     if catalog_entry is None:
         return jsonify(error="slide 不在 Demo 目录内", code="slide_not_in_catalog"), 404
-    safe = _safe_name(filename)
+    safe = desc.legacy_filename
+    _demo_tile_path = _desc_read_path(desc)
     token = request.args.get("render") or ""
     flag = _multichannel_enabled()
 
@@ -6123,12 +6391,12 @@ def api_demo_slide_tile(slide_id, level, x, y):
         _viewer_metrics.observe_status("400")
         return _display_param_error_response(e)
 
-    entry = _get_slide(safe)
+    entry = _get_slide(desc)
     token_payload = None
     if flag and token:
         payload = slide_render.verify_render_token(token, app.secret_key)
         if payload is not None and payload.get("slide") in ("", safe) \
-                and payload.get("rev") == _legacy_slide_revision(safe):
+                and payload.get("rev") == _legacy_slide_revision(_demo_tile_path):
             token_payload = payload
     gen = slide_cache.refresh_generation(entry)
     fp_pre = None
@@ -6209,7 +6477,7 @@ def api_demo_slide_tile(slide_id, level, x, y):
 
     def _produce():
         (tile, fp, ctx), tile_gen = slide_cache.read_stable(
-            _get_slide(safe), _decode)
+            _get_slide(desc), _decode)
         t0 = time.monotonic()
         data, enc_spec = _encode_tile_jpeg(tile, ctx, profile_id=req_profile)
         _viewer_metrics.observe_decode((time.monotonic() - t0) * 1000.0)
@@ -6302,7 +6570,7 @@ def api_demo_ai_run():
         return cap_err
     body = request.get_json(silent=True) or {}
     slide_id = body.get("slide_id") if isinstance(body.get("slide_id"), str) else None
-    entry, filename = _demo_catalog_slide(slide_id)
+    entry, desc = _demo_catalog_slide(slide_id)
     if entry is None:
         return (jsonify(error="slide 不在 Demo 目录内", code="slide_not_in_catalog"),
                 404)
@@ -6317,7 +6585,8 @@ def api_demo_ai_run():
     ip_gate = _demo_ip_request_rate_gate()
     if ip_gate is not None:
         return ip_gate
-    safe = _safe_name(filename)
+    safe = desc.legacy_filename
+    _demo_run_path = _desc_path(desc)
 
     # 惰性对账（docs §5.3-5：每次新预占前回收过期项；对账含 HistoPilot 反查）
     try:
@@ -6330,7 +6599,7 @@ def api_demo_ai_run():
     #    ai_safety.demo_max_concurrency）；DB 部分唯一索引兜底并发）
     try:
         run = demo_store.reserve_run(
-            cap["id"], rid, slide_id, _legacy_slide_revision(safe),
+            cap["id"], rid, slide_id, _legacy_slide_revision(_demo_run_path),
             ip_prefix_hash=_ip_prefix_hash(request.remote_addr or "") or "unknown")
     except demo_store.DemoCapabilityExpired:
         return (jsonify(error="Demo capability 已失效或过期",
@@ -6451,7 +6720,7 @@ def api_demo_ai_run():
         None, demo_capability_id=cap["id"])
 
     payload = {
-        "slide": filename,
+        "slide": safe,
         "config": config,
         "request_id": rid,
         "security": {
@@ -6505,7 +6774,7 @@ def api_demo_ai_run():
         _rollback_all("histopilot_rejected")
 
     _audit("demo.ai.run", target_type="demo_session", target_id=cap["id"],
-           slide=filename, detail={"request_id": rid, "slide_id": slide_id,
+           slide=safe, detail={"request_id": rid, "slide_id": slide_id,
                                    "demo_run_id": demo_run_id})
     return _proxy_sse("/run", payload, on_accepted=on_accepted,
                       on_rejected=on_rejected, on_finished=on_finished)
@@ -7077,46 +7346,62 @@ def can_manage_share(slides):
     return all(_slide_owner(s) == uid for s in slides)
 
 
+def _ready_slide_descs():
+    """DB 资产查询：asset_state='ready' 的全部 descriptor（P1-B2 列表源）。
+
+    列表源改 DB（合同 §4：DB asset_state='ready' 是唯一可见性开关——
+    「目录扫描=切片」退役）；legacy 布局行额外 stat 一次入口文件（不存在→
+    不列出，保持旧「文件消失即不列出」行为）。id_bundle 行（P1 尚无 app
+    writer 产出）暂不进 legacy 名集合。注意：authorize_read 会按行重读
+    当前状态（每行数次查询——P1 规模可接受，P2 列表查询收敛为单 SQL）。
+    """
+    try:
+        descs = slide_store.list_ready_descriptors()
+    except Exception:
+        app.logger.warning("slides 资产列表读取失败（fail-closed 空集）",
+                           exc_info=True)
+        return []
+    out = []
+    for desc in descs:
+        if desc.storage_layout != "legacy" or not desc.legacy_filename:
+            # id_bundle 资产不经 legacy 名集合（P2 起列表 DTO 直接带 ID）
+            continue
+        try:
+            if not slide_storage.resolve_descriptor_path(
+                    desc, root=UPLOAD_DIR).is_file():
+                continue  # 入口文件消失：不列出（旧行为）
+        except Exception:
+            continue  # 路径解析失败（containment 等）：fail-closed 不列出
+        out.append(desc)
+    return out
+
+
+def _visible_slide_descs():
+    """当前身份可见的 ready 切片 descriptor 列表（authorize_read 逐行门禁）。"""
+    ident = current_identity()
+    if not ident.get("user_id") and ident.get("role") != user_store.ROLE_OWNER:
+        return []  # guest（无 uid 非本地 owner）：可见集为空（旧口径）
+    return [d for d in _ready_slide_descs()
+            if _authorize_or_deny(d, channel="session")]
+
+
 def _visible_slide_names():
     """当前身份可见的切片文件名集合（升级 B R5：owner × user 集合分域）。
 
-    user 可见集 = 自己上传的 ∪ public ∪ 认领(view 级 claim) ∪ 显式授权
-    （slide_view_grants）——普通 user 语义不变。认证 owner 可见集收紧为
-    本人拥有 ∪ 本账号显式添加且资产生代有效（public 与 claimed 不再自动
-    计入；原文档 §5.1）。owner 不再全量短路（review P0 2026-09-05）；无主
-    切片（owner_user_id 为空）且非 public 对所有身份默认不可见，经管理台
-    显式授权后恢复可见（孤儿切片仍可管理）。例外：本地免认证单租户态
-    （owner 无 user_id）恢复全量（can_view_slide 同款口径，不存在「其他
-    用户」可隔离）；其余无 uid 主体（guest）可见集为空。
+    user 可见集 = 自己上传的 ∪ public ∪ 认领(view 级 claim，经 share_slides
+    ID 关系) ∪ 显式授权（slide_view_grants，slide_id 级）——普通 user 语义
+    不变。认证 owner 可见集收紧为本人拥有 ∪ 本账号显式添加且资产生代有效
+    （public 与 claimed 不再自动计入；原文档 §5.1）。owner 不再全量短路
+    （review P0 2026-09-05）；无主切片（owner_user_id 为空）且非 public 对
+    所有身份默认不可见，经管理台显式授权后恢复可见（孤儿切片仍可管理）。
+    例外：本地免认证单租户态（owner 无 user_id）恢复全量（不存在「其他
+    用户」可隔离）。
+
+    P1-B2：列表源改 DB（asset_state='ready' 的 slides 行 + 入口文件 stat），
+    目录上无 slides 行的文件不再出现（「外部程序手工放文件不自动注册」）；
+    返回值保持 legacy 名集合（下游消费者不动）。
     """
-    ident = current_identity()
-    all_names = {
-        child.name for child in UPLOAD_DIR.iterdir()
-        if child.is_file() and child.suffix.lower().lstrip(".") in SUPPORTED_EXTS
-    }
-    if ident["role"] == user_store.ROLE_OWNER and not ident["user_id"]:
-        return all_names
-    uid = ident["user_id"]
-    if not uid:
-        return set()
-    meta_all = share_store.get_all_slide_meta_full()
-    if ident["role"] == user_store.ROLE_OWNER:
-        # 升级 B R5：认证 owner = 本人 ∪ 显式添加（资产生代匹配的授权集合）
-        granted = share_store.slide_view_grants_for_user(uid)
-        return {
-            name for name in all_names
-            if meta_all.get(name, {}).get("owner_user_id") == uid
-            or name in granted
-        }
-    claimed = _claimed_slides(uid, permission=share_store.PERMISSION_VIEW)
-    granted = share_store.slide_view_grants_for_user(uid)
-    visible = set()
-    for name in all_names:
-        m = meta_all.get(name, {})
-        if (m.get("owner_user_id") == uid or m.get("public")
-                or name in claimed or name in granted):
-            visible.add(name)
-    return visible
+    return {d.legacy_filename for d in _visible_slide_descs()}
 
 
 def _can_access_project(pid):
@@ -9766,10 +10051,21 @@ def _admin_v1_owner_uid():
 def admin_v1_slides_inventory():
     """全量切片清单（管理台唯一「看全部」出口；不含切片图像内容）。
 
-    每行：name、size_bytes、owner_user_id、owner 展示名/掩码 login_id
-    （无归属 null）、public、alias、note、archived（归档项目只读保护）、
-    granted_to_owner（是否已显式授权给当前 actor-owner）、granted_at。
+    P1-B2：DB 驱动——全部 slides 行（含非 ready）+ 每行 file_exists（stat）+
+    owner/public/state；目录扫描只用于产出 ``orphan_files``（盘上无 slides 行
+    的支持格式文件清单，仅名称+大小，**不做任何隐式认领/建行**）。每行：
+    name、size_bytes、owner_user_id、owner 展示名/掩码 login_id（无归属
+    null）、public、alias、note、archived（归档项目只读保护）、
+    granted_to_owner（是否已显式授权给当前 actor-owner）、granted_at，
+    另加 slide_id / asset_state / storage_layout / file_exists /
+    original_filename / display_name / format_ext。
     按 name 升序 cursor/limit 分页（管理列表禁全量返回的既有口径）。
+
+    兼容过渡：盘上无 slides 行的支持格式文件同时以「未注册」形态并入 items
+    （owner_user_id/public/granted 等按空值呈现、asset_state=None、
+    unregistered=True），维持管理台「磁盘上看得见的文件都在清单里」的既有
+    口径（test_admin_inventory_lists_all_and_marks_grants 冻结）；其权威
+    报告面是 orphan_files，P2 收口后 items 仅含 DB 行。
     """
     auth = _require_owner_admin_v1()
     if auth:
@@ -9780,16 +10076,75 @@ def admin_v1_slides_inventory():
     if offset < 0:
         offset = 0
 
+    # 1) DB 资产行（含非 ready）——权威清单（alias 取自既有 meta 投影）
     rows = []
+    try:
+        descs = slide_store.list_all_descriptors()
+        alias_all = share_store.get_all_slide_meta_full()
+    except Exception:
+        app.logger.exception("admin v1 slides inventory 资产行读取失败")
+        return _admin_v1_error(500, "internal", "切片清单读取失败")
+    by_name = {}
+    for desc in descs:
+        name = desc.legacy_filename
+        if not name:
+            continue  # 无 legacy 名的 id_bundle 行不在按名清单（P2 单独呈现）
+        try:
+            st = (UPLOAD_DIR / name).stat()
+            file_exists, size = True, st.st_size
+        except OSError:
+            file_exists, size = False, 0
+        by_name[name] = {
+            "slide_id": desc.slide_id,
+            "legacy_filename": name,
+            "original_filename": desc.original_filename,
+            "display_name": desc.display_name,
+            "alias": (alias_all.get(name) or {}).get("alias", ""),
+            "note": desc.note or "",
+            "format_ext": desc.format_ext,
+            "asset_state": desc.asset_state,
+            "storage_layout": desc.storage_layout,
+            "owner_user_id": desc.owner_user_id,
+            "public": desc.public,
+            "file_exists": file_exists,
+            "size_bytes": size,
+        }
+
+    # 2) 目录扫描——仅产出 orphan_files（无 slides 行的文件；只报告不认领），
+    #    兼容过渡期同时并入 items 的「未注册」形态（见 docstring）
+    orphan_files = []
     for child in UPLOAD_DIR.iterdir():
         if not child.is_file():
             continue
         if child.suffix.lower().lstrip(".") not in SUPPORTED_EXTS:
             continue
-        rows.append(child.name)
-    rows.sort()
+        if child.name in by_name:
+            continue
+        try:
+            size = child.stat().st_size
+        except OSError:
+            continue
+        orphan_files.append({"name": child.name, "size_bytes": size})
+        by_name[child.name] = {
+            "slide_id": None,
+            "legacy_filename": child.name,
+            "original_filename": None,
+            "display_name": None,
+            "alias": "",
+            "note": "",
+            "format_ext": None,
+            "asset_state": None,
+            "storage_layout": None,
+            "owner_user_id": None,
+            "public": False,
+            "file_exists": True,
+            "size_bytes": size,
+            "unregistered": True,
+        }
+    orphan_files.sort(key=lambda f: f["name"])
 
-    meta_all = share_store.get_all_slide_meta_full()
+    names = sorted(by_name)
+
     archived = _archived_slide_names()
     owner_uid = _admin_v1_owner_uid()
     # 升级 B R7：included 状态与实际收录同口径——slide_view_grants_for_user
@@ -9820,22 +10175,22 @@ def admin_v1_slides_inventory():
         app.logger.warning("admin v1 slides inventory 用户投影读取失败",
                            exc_info=True)
 
-    page = rows[offset:offset + limit + 1]
+    page = names[offset:offset + limit + 1]
     has_more = len(page) > limit
     page = page[:limit]
 
     items = []
     for name in page:
-        meta = meta_all.get(name) or {}
+        meta = by_name[name]
         slide_owner = meta.get("owner_user_id") or None
         owner_user = users_by_id.get(str(slide_owner)) if slide_owner else None
         owner_email = (str(owner_user.get("email_normalized")
                            or owner_user.get("email") or "")
                        if owner_user else "")
         included = name in granted_names
-        items.append({
+        item = {
             "name": name,
-            "size_bytes": (UPLOAD_DIR / name).stat().st_size,
+            "size_bytes": meta.get("size_bytes") or 0,
             "owner_user_id": slide_owner,
             # 展示 J：归属主列 = 完整邮箱用户名（email 优先，否则 login_id；
             # display_name 不再冒充身份）；user_id 次级。
@@ -9853,12 +10208,23 @@ def admin_v1_slides_inventory():
             "granted_to_owner": included,
             "granted_at": (grants_rows.get(name) or {}).get("granted_at")
             if included else None,
-        })
+            # P1-B2 新字段（旧字段原样保留）
+            "slide_id": meta.get("slide_id"),
+            "asset_state": meta.get("asset_state"),
+            "storage_layout": meta.get("storage_layout"),
+            "file_exists": bool(meta.get("file_exists")),
+            "original_filename": meta.get("original_filename"),
+            "display_name": meta.get("display_name"),
+            "format_ext": meta.get("format_ext"),
+        }
+        if meta.get("unregistered"):
+            item["unregistered"] = True
+        items.append(item)
     next_cursor = None
     if has_more:
         next_cursor = _admin_v1_encode_cursor({"o": offset + limit})
     return jsonify(items=items, next_cursor=next_cursor, limit=limit,
-                   owner_user_id=owner_uid)
+                   owner_user_id=owner_uid, orphan_files=orphan_files)
 
 
 @app.route("/api/admin/v1/slides/<path:name>/visibility", methods=["POST"])
@@ -9893,8 +10259,20 @@ def admin_v1_slide_visibility(name):
             "当前部署 owner 无稳定 user_id（本地免认证开发态），"
             "无法建立/收回显式授权")
     if granted:
-        # 升级 B R7：授权行绑定当前资产生代（slide_id；孤儿切片允许 NULL）
+        # 升级 B R7：授权行绑定当前资产生代（slide_id）
         cur_slide_id = share_store.get_slide_id(safe)
+        if cur_slide_id is None:
+            # P1-B2：盘上无 slides 行的孤儿文件在显式授权时建行（与 demo
+            # 目录 PUT 同款迁移兼容语义）——authorize_read 只认 slide_id 级
+            # 授权，且 DB 驱动的可见集/清单自此能呈现该切片（孤儿可管理）。
+            try:
+                share_store.set_slide_meta(safe)
+                cur_slide_id = share_store.get_slide_id(safe)
+            except Exception:
+                app.logger.warning("admin visibility 建行失败：%s", safe,
+                                   exc_info=True)
+        if cur_slide_id is None:
+            return _admin_v1_error(500, "internal", "无法建立切片稳定身份")
         result = share_store.grant_slide_view(
             owner_uid, safe, granted_by=owner_uid, slide_id=cur_slide_id)
         _audit("admin.slide_visibility.grant", target_type="slide",
@@ -10256,37 +10634,83 @@ def api_slides():
     user 可见集 = 自己的 ∪ public ∪ 认领(view) ∪ 显式授权；认证 owner（升级
     B R5）= 自己的 ∪ 显式添加（public/claimed 不再自动计入）。全量清单唯一
     出口是管理台 GET /api/admin/v1/slides/inventory。
+
+    P1-B2：列表源改 DB（asset_state='ready' 的 slides 行 + authorize_read
+    逐行门禁；目录上无 slides 行的文件不再出现）。每 item 追加
+    slide_id/original_filename/display_name/format_ext（旧字段——含 alias——
+    原样保留，P2 起前端切 ID）。
     """
-    visible = _visible_slide_names()
     items = []
-    for child in sorted(UPLOAD_DIR.iterdir()):
-        if not child.is_file():
-            continue
-        if child.suffix.lower().lstrip(".") not in SUPPORTED_EXTS:
-            continue
-        if child.name not in visible:
-            continue
+    for desc in _visible_slide_descs():
         try:
-            items.append(_slide_info_dict(child.name))
+            path = _desc_read_path(desc)
+            items.append(_slide_info_dict_desc(desc, path))
         except Exception as e:
-            # 路径穿越校验等可能抛出 HTTP 异常，这里收集为 error
-            sm = share_store.get_slide_meta(child.name)
+            # 打开失败等（路径穿越校验抛 HTTP 异常也在此收集为 error 项，
+            # 单个失败不阻塞列表）
+            sm = share_store.get_slide_meta(desc.legacy_filename)
+            try:
+                size = _desc_path(desc).stat().st_size
+            except Exception:
+                size = 0
             items.append(
                 {
-                    "name": child.name,
-                    "size_bytes": child.stat().st_size,
+                    "name": desc.legacy_filename,
+                    "size_bytes": size,
                     "width": None,
                     "height": None,
                     "mpp_x": None,
                     "mpp_y": None,
                     "objective": None,
                     "mpp_source": "missing",
+                    "slide_id": desc.slide_id,
+                    "original_filename": desc.original_filename,
+                    "display_name": desc.display_name
+                    or (desc.legacy_filename or ""),
+                    "format_ext": desc.format_ext,
                     "alias": sm.get("alias", ""),
                     "note": sm.get("note", ""),
                     "error": str(getattr(e, "description", e)),
                 }
             )
     return jsonify(items)
+
+
+@app.route("/api/slides/<slide_id>/info")
+def api_slide_info_by_id(slide_id):
+    """首个 ID 原生读端点（P1-B2；合同 §7 / 计划 §4.1）。
+
+    slide_id 直接经 slide_store.resolve_slide_id（校验存在性——缺失不凭
+    ``sld_`` 前缀当成功；未知 ID / 资产名误当 ID → 404：ID 服务端随机
+    不可枚举，无旧端点「不泄露存在性」的 403 伪装需求）→ authorize_read
+    统一门禁（无权 403）→ descriptor 路径读取（授权后文件缺失 404）。
+    返回与旧 /api/slide/<name>/info 同形字段，另加
+    slide_id/original_filename/display_name/format_ext；**绝不返回
+    storage_relpath**（R-20：路径仅内部使用）。P1 只加 info；dzi/tile 等
+    ID 路由在 P2。注意与既有单数旧路由 ``/api/slide/<name>/...`` 不冲突。
+    """
+    desc = None
+    try:
+        desc = slide_store.resolve_slide_id(slide_id)
+    except Exception:
+        app.logger.warning("slide_id 解析失败（fail-closed 拒读）：%s",
+                           slide_id, exc_info=True)
+    if desc is None:
+        return jsonify(error="切片不存在", code="slide_not_found"), 404
+    if not _authorize_or_deny(desc, channel="session"):
+        return _denied()
+    path = _desc_read_path(desc)
+    info = _slide_info_dict_desc(desc, path)
+    if info.get("error"):
+        return jsonify(info)
+    try:
+        info.update(_slide_render_info_fields(desc))
+    except (slide_render.RenderRequestError, slide_io.SlideRenderError) as e:
+        return _render_error_response(e)
+    except slide_cache.SlideFileChanged:
+        return jsonify(error="slide_file_changed",
+                       code="slide_file_changed"), 503
+    return jsonify(info)
 
 
 # --------------------------------------------------------------------------- #
@@ -12500,6 +12924,10 @@ def api_slide_delete(name):
     升级 B R7：删除文件前清理该切片的全部 view 授权（按 legacy 名 + 旧
     slide_id 残留，单事务）——同名再上传后旧授权不自动生效（失效语义），
     需要系统管理重新添加；删除后无孤儿授权行残留。
+    P1-B2：删除端点结构不变（两阶段删除编排在 P5）；末尾把 slides 行直写
+    asset_state='deleted'（+deleted_at，slide_store.mark_deleted_compat），
+    让 authorize_read 状态门禁立即拒绝后续读取（tombstone 保留
+    legacy_filename，旧别名不重绑新 ID）。
     """
     if not can_delete_slide(name):
         return _denied()
@@ -12522,7 +12950,7 @@ def api_slide_delete(name):
     except Exception:
         app.logger.warning("切片删除的 Demo 撤销联动失败：%s", safe,
                            exc_info=True)
-    _close_slide(safe)
+    _close_slide(safe, slide_id=slide_id)
     try:
         (UPLOAD_DIR / safe).unlink()
     except FileNotFoundError:
@@ -12543,6 +12971,14 @@ def api_slide_delete(name):
         else:
             if companion.is_dir():
                 shutil.rmtree(companion, ignore_errors=True)
+    # P1-B2：状态门禁立即生效——行直写 deleted（+deleted_at）；两阶段
+    # deleting/deleted 编排（advisory 锁 + CAS + 结算）在 P5 接线。
+    if slide_id:
+        try:
+            slide_store.mark_deleted_compat(slide_id)
+        except Exception:
+            app.logger.warning("切片删除的状态直写失败（门禁延后生效）：%s",
+                               safe, exc_info=True)
     _audit("slide.delete", target_type="slide", target_id=safe, slide=safe,
            detail={"slide_id": slide_id,
                    "view_grants_revoked": True})
@@ -12553,18 +12989,25 @@ def api_slide_delete(name):
 def api_slide_info(name):
     """单个切片元数据。Stage 3a-2a：can_view_slide，无权 403。
 
+    P1-B2：入参按 legacy alias 解析（resolve_legacy_alias）→ authorize_read
+    统一门禁（asset_state='ready' 唯一可见性开关）→ descriptor 路径读取；
+    无行/无权保持 403（不泄露存在性差异），行存在且授权后文件缺失保持 404。
+    响应追加 slide_id/original_filename/display_name/format_ext（旧字段不变）。
+
     Batch 3（§6.1）：additive 返回 image_mode / channels /
     default_render_context / default_render_token / warnings / plane /
     deepzoom / server_capability（flag 关只暴露探测字段）。所有新字段
     optional，旧客户端忽略即可。
     """
-    if not can_view_slide(name):
+    desc = _authorize_legacy_read(name)
+    if desc is None:
         return _denied()
-    info = _slide_info_dict(name)
+    path = _desc_read_path(desc)
+    info = _slide_info_dict_desc(desc, path)
     if info.get("error"):
         return jsonify(info)
     try:
-        info.update(_slide_render_info_fields(info["name"]))
+        info.update(_slide_render_info_fields(desc))
     except (slide_render.RenderRequestError, slide_io.SlideRenderError) as e:
         return _render_error_response(e)
     except slide_cache.SlideFileChanged:
@@ -12579,21 +13022,28 @@ def api_slide_render_context(name):
 
     请求只提交用户选择 active_channels[] / plane；服务端验证 + 绑定当前
     asset revision，返回 canonical context + fingerprint + render_token。
+    P1-B2：legacy alias 解析 + authorize_read 门禁（语义同 info 端点）。
     """
-    if not can_view_slide(name):
+    desc = _authorize_legacy_read(name)
+    if desc is None:
         return _denied()
-    safe = _safe_name(name)
+    _desc_read_path(desc)
     body = request.get_json(silent=True)
-    return _render_context_post_response(safe, body)
+    return _render_context_post_response(desc, body)
 
 
 @app.route("/api/slide/<name>.dzi")
 def api_slide_dzi(name):
-    """手工生成 Deep Zoom XML。Stage 3a-2a：can_view_slide，无权 403。"""
-    if not can_view_slide(name):
+    """手工生成 Deep Zoom XML。Stage 3a-2a：can_view_slide，无权 403。
+
+    P1-B2：legacy alias 解析 + authorize_read 门禁 + descriptor 路径。
+    """
+    desc = _authorize_legacy_read(name)
+    if desc is None:
         return _denied()
-    safe = _safe_name(name)
-    entry = _get_slide(safe)
+    safe = desc.legacy_filename or _sanitize_name(name)
+    _desc_read_path(desc)
+    entry = _get_slide(desc)
     with slide_cache.borrow_pair(entry) as pair:
         dz = pair["dz"]
         # DZI Size 取最高层（level_count-1）尺寸
@@ -12666,11 +13116,15 @@ def api_slide_tile(name, level, x, y):
     之后）；并发 miss single-flight；字节预算 LRU。
     旧 URL（无 profile/dv）保持既有编码语义（native q<JPEG_QUALITY>/4:2:0
     不加优化；荧光 q95/4:4:4）。
+    P1-B2：legacy alias 解析 + authorize_read 门禁 + descriptor 路径；
+    瓦片缓存键仍按 legacy 名（R-15 tile 键迁移在 P2）。
     """
-    if not can_view_slide(name):
+    desc = _authorize_legacy_read(name)
+    if desc is None:
         return _denied()
-    safe = _safe_name(name)
-    entry = _get_slide(safe)
+    safe = desc.legacy_filename or _sanitize_name(name)
+    path = _desc_read_path(desc)
+    entry = _get_slide(desc)
     token = request.args.get("render") or ""
     flag = _multichannel_enabled()
 
@@ -12686,7 +13140,7 @@ def api_slide_tile(name, level, x, y):
     if flag and token:
         payload = slide_render.verify_render_token(token, app.secret_key)
         if payload is not None and payload.get("slide") in ("", safe) \
-                and payload.get("rev") == _legacy_slide_revision(safe):
+                and payload.get("rev") == _legacy_slide_revision(path):
             token_payload = payload
 
     gen = slide_cache.refresh_generation(entry)
@@ -12821,11 +13275,14 @@ def api_slide_crop(name):
     升级 C（§6.3-5）：支持 ``?x&y&w&h`` 通用矩形——输出 PNG 尺寸精确等于
     请求合法 w/h（不 clamp）；``size`` 与 ``w/h`` 混用冲突 400；旧 ``size``
     走兼容正方形分支（保留既有 clamp 语义，独立于新矩形路径）。
+    P1-B2：legacy alias 解析 + authorize_read 门禁 + descriptor 路径。
     """
-    if not can_view_slide(name):
+    desc = _authorize_legacy_read(name)
+    if desc is None:
         return _denied()
-    safe = _safe_name(name)
-    entry = _get_slide(safe)
+    safe = desc.legacy_filename or _sanitize_name(name)
+    path = _desc_read_path(desc)
+    entry = _get_slide(desc)
     token = request.args.get("render") or ""
 
     def _parse_int(key):
@@ -12939,11 +13396,14 @@ def api_slide_thumbnail(name):
     色度采样（RGB q90/4:2:0 与旧字节一致；荧光 q95/4:4:4 显式，不再依赖
     Pillow 默认采样）；additive ``?profile=&dv=``（白名单 + 409 + 错误
     no-store）；private no-cache + 强 ETag（304 在鉴权与版本核验之后）。
+    P1-B2：legacy alias 解析 + authorize_read 门禁 + descriptor 路径。
     """
-    if not can_view_slide(name):
+    desc = _authorize_legacy_read(name)
+    if desc is None:
         return _denied()
-    safe = _safe_name(name)
-    entry = _get_slide(safe)
+    safe = desc.legacy_filename or _sanitize_name(name)
+    _desc_read_path(desc)
+    entry = _get_slide(desc)
     token = request.args.get("render") or ""
     try:
         req_profile, req_dv = viewer_display.parse_display_params(
@@ -16228,11 +16688,14 @@ def api_slide_region(name):
               render_context_fingerprint 仅在多通道 context 生效时返回
               （additive）。width/height 恒等于编码后 JPEG 实际像素。
     Stage 3a-2a：can_view_slide，无权 403（不泄露存在性差异，统一 403）。
+    P1-B2：legacy alias 解析 + authorize_read 门禁 + descriptor 路径。
     """
-    if not can_view_slide(name):
+    desc = _authorize_legacy_read(name)
+    if desc is None:
         return _denied()
-    safe = _safe_name(name)
-    entry = _get_slide(safe)
+    safe = desc.legacy_filename or _sanitize_name(name)
+    path = _desc_read_path(desc)
+    entry = _get_slide(desc)
     token = request.args.get("render") or ""
 
     def _parse_int(key):
@@ -16298,7 +16761,7 @@ def api_slide_region(name):
             region = region.resize((ow, oh), Image.LANCZOS)
 
         # 读取 mpp 算放大倍率（供前端展示）
-        meta = _read_metadata(osr, UPLOAD_DIR / safe)
+        meta = _read_metadata(osr, path)
         mpp = meta.get("mpp_x")
         mag = None
         if mpp and mpp > 0:
@@ -16632,9 +17095,16 @@ def _ai_slide_ctx(slide_name: str):
     return ctx, materializer
 
 
-def _slide_fingerprint(safe: str) -> str:
-    """切片内容指纹（mtime+size），image_ref 防伪用（§3.3）。"""
-    p = UPLOAD_DIR / safe
+def _slide_fingerprint(target) -> str:
+    """切片内容指纹（mtime+size），image_ref 防伪用（§3.3）。
+
+    P1-B2：target 为 resolver 解析后的**绝对路径**（读通道主路径）；兼容传
+    legacy 名（写通道/未切换调用点——按 UPLOAD_DIR 拼接，内容语义不变，
+    P3 writer 接管后收口）。
+    """
+    p = Path(target)
+    if not p.is_absolute():
+        p = UPLOAD_DIR / p
     try:
         st = p.stat()
         return "{}:{}".format(st.st_mtime_ns, st.st_size)
@@ -16642,13 +17112,17 @@ def _slide_fingerprint(safe: str) -> str:
         return ""
 
 
-def _legacy_slide_revision(safe: str) -> str:
+def _legacy_slide_revision(target) -> str:
     """切片 legacy_revision（mtime:size，docs §6.4）。
 
-    demo 规模下用它近似 slide_asset_revision；内容 sha 留 Stage 4 二进制 transport。
-    文件不存在返回空串（sidecar 校验时不会误匹配）。
+    P1-B2：target 为 resolver 解析后的**绝对路径**（读通道主路径）；兼容传
+    legacy 名（写通道/共享 helper——按 UPLOAD_DIR 拼接）。legacy 布局下两者
+    指向同一文件，内容语义不变；id_bundle 资产只能传路径。文件不存在返回
+    空串（sidecar 校验时不会误匹配）。
     """
-    p = UPLOAD_DIR / safe
+    p = Path(target)
+    if not p.is_absolute():
+        p = UPLOAD_DIR / p
     try:
         st = p.stat()
         return "{}:{}".format(st.st_mtime_ns, st.st_size)
@@ -17166,19 +17640,26 @@ def internal_ai_region():
         return jsonify(error="jpeg_quality 需在 1..100"), 400
 
     safe = _safe_name(slide)
+    # P1-B2 机器通道状态门禁：行存在且非 ready → 拒（staging/legacy 未回填/
+    # deleting/deleted/failed 不可读，合同 §4）；无行维持旧行为（P3 收口）。
+    gate = _legacy_row_state_gate(safe)
+    if gate is not None and gate.asset_state != slide_store.SlideState.READY:
+        return jsonify(error="切片不存在"), 404
+    _region_target = gate if gate is not None else safe
+    _region_path = _desc_path(gate) if gate is not None else (UPLOAD_DIR / safe)
     expected_fp = body.get("expected_fingerprint")
     if isinstance(expected_fp, str) and expected_fp:
-        fp = _slide_fingerprint(safe)
+        fp = _slide_fingerprint(_region_path)
         if fp != expected_fp:
             return jsonify(error="切片指纹不匹配（文件已变更）"), 409
     # §6.3：wire render_context（snake / camel 容错）；不接收 token
     wire_ctx = body.get("render_context")
     if wire_ctx is None:
         wire_ctx = body.get("renderContext")
-    entry = _get_slide(safe)
+    entry = _get_slide(_region_target)
     with slide_cache.borrow_pair(entry) as pair:
         osr = pair["osr"]
-        meta = _read_metadata(osr, UPLOAD_DIR / safe)
+        meta = _read_metadata(osr, _region_path)
         mpp = meta.get("mpp_x")
     # 默认输出尺寸（max_long_edge 未给时用旧默认 1568×1568）
     if not out_w or out_w <= 0:
@@ -17474,7 +17955,7 @@ def internal_ai_spots():
     return jsonify({"changes": changes, "current_seq": current_seq})
 
 
-def _ai_slide_info_payload(pair, safe: str) -> dict:
+def _ai_slide_info_payload(pair, safe: str, *, path=None) -> dict:
     """AI slide info 载荷（G1，internal 与 plugin v1 两条路径共用实现）。
 
     必须在**当前借出的** pair 上调用：几何（width/height/level_downsamples/
@@ -17489,10 +17970,13 @@ def _ai_slide_info_payload(pair, safe: str) -> dict:
         level_downsamples = tuple(osr.level_downsamples)
     except Exception:  # noqa: BLE001
         level_downsamples = (1.0,)
-    meta = _read_metadata(osr, UPLOAD_DIR / safe)
+    # P1-B2：path 为 resolver 解析后的绝对路径（读通道主路径）；缺省按
+    # legacy 名拼（内容语义 mtime:size 不变）
+    info_path = path if path is not None else (UPLOAD_DIR / safe)
+    meta = _read_metadata(osr, info_path)
     mpp = meta.get("mpp_x")
     render_fields = slide_render.build_render_info(
-        osr, asset_revision=_legacy_slide_revision(safe),
+        osr, asset_revision=_legacy_slide_revision(info_path),
         asset_generation=_ctx_scope(safe, pair.get("gen")),
         secret=app.secret_key, slide_name=safe,
         flag_enabled=_multichannel_enabled())
@@ -17501,9 +17985,9 @@ def _ai_slide_info_payload(pair, safe: str) -> dict:
         "height": height,
         "level_downsamples": list(level_downsamples),
         "mpp": mpp,
-        "fingerprint": _slide_fingerprint(safe),
+        "fingerprint": _slide_fingerprint(info_path),
         "asset_revision": render_fields.get("asset_revision")
-                          or _legacy_slide_revision(safe),
+                          or _legacy_slide_revision(info_path),
         "image_mode": render_fields.get("image_mode"),
     }
     for key in ("channels", "warnings", "plane", "default_render_context",
@@ -17520,6 +18004,8 @@ def internal_ai_slide_info():
     query: slide（必填）。几何与 build_render_info 同一次 borrow 读取
     （channels 与几何同一 generation）；不下发 default_render_token。
     slide 不存在 → 404。
+    P1-B2 机器通道状态门禁：行存在且非 ready → 404（合同 §4）；无行维持
+    旧行为（P3 writer 接管后收口）。
     """
     auth = _require_internal()
     if auth:
@@ -17528,9 +18014,14 @@ def internal_ai_slide_info():
     if not slide:
         return jsonify(error="slide 参数缺失"), 400
     safe = _safe_name(slide)
-    entry = _get_slide(safe)
+    gate = _legacy_row_state_gate(safe)
+    if gate is not None and gate.asset_state != slide_store.SlideState.READY:
+        return jsonify(error="切片不存在"), 404
+    entry = _get_slide(gate if gate is not None else safe)
     with slide_cache.borrow_pair(entry) as pair:
-        out = _ai_slide_info_payload(pair, safe)
+        out = _ai_slide_info_payload(
+            pair, safe, path=(_desc_path(gate) if gate is not None
+                              else (UPLOAD_DIR / safe)))
     return jsonify(out)
 
 
@@ -17552,17 +18043,28 @@ def internal_ai_slide_info():
 # {slide_id} 仍是 legacy filename（与 sidecar LegacySlideRef 一致）。
 # =========================================================================== #
 def _plugin_resolve_slide(slide):
-    """切片名清洗 + 存在性检查（错误走统一信封）。
+    """切片名清洗 + 存在性/状态检查（错误走统一信封）。
 
-    返回 (safe, None) 或 (None, error_response)。存在性先查再交给 _get_slide，
-    保证 404 走信封（_safe_name 的 abort(JSON) 形状不同）。
+    P1-B2：返回 ``(safe, gate, None)`` 或 ``(None, None, error_response)``
+    ——gate 是 legacy alias 解析出的 SlideDescriptor（行存在时）：
+      - 行存在且非 ready → 404 信封（staging/legacy 未回填/deleting/deleted/
+        failed 不可读，合同 §4）；
+      - 行存在且 ready → 文件读经 gate 的 descriptor 路径；
+      - 无行 → 维持旧行为（入口文件存在即可；P3 writer 接管后收口），
+        gate=None（文件存在性仍在此检查，保证 404 走信封——_safe_name 的
+        abort(JSON) 形状不同）。
     """
     safe = _sanitize_name(slide)
     if not safe or safe != slide:
-        return None, _plugin_error(400, "invalid_request", "非法切片名")
+        return None, None, _plugin_error(400, "invalid_request", "非法切片名")
+    gate = _legacy_row_state_gate(safe)
+    if gate is not None:
+        if gate.asset_state != slide_store.SlideState.READY:
+            return None, None, _plugin_error(404, "not_found", "切片不存在")
+        return safe, gate, None
     if not (UPLOAD_DIR / safe).is_file():
-        return None, _plugin_error(404, "not_found", "切片不存在")
-    return safe, None
+        return None, None, _plugin_error(404, "not_found", "切片不存在")
+    return safe, None, None
 
 
 def _run_grant_creator_allowed(grant):
@@ -17754,12 +18256,14 @@ def plugin_v1_slide_info(slide):
     claims, err = _require_plugin_token("slide:read")
     if err is not None:
         return err
-    safe, serr = _plugin_resolve_slide(slide)
+    safe, gate, serr = _plugin_resolve_slide(slide)
     if serr is not None:
         return serr
-    entry = _get_slide(safe)
+    entry = _get_slide(gate if gate is not None else safe)
     with slide_cache.borrow_pair(entry) as pair:
-        out = _ai_slide_info_payload(pair, safe)
+        out = _ai_slide_info_payload(
+            pair, safe, path=(_desc_path(gate) if gate is not None
+                              else (UPLOAD_DIR / safe)))
     return jsonify(out)
 
 
@@ -17855,9 +18359,10 @@ def plugin_v1_region(slide):
     claims, err = _require_plugin_token("region:read")
     if err is not None:
         return err
-    safe, serr = _plugin_resolve_slide(slide)
+    safe, gate, serr = _plugin_resolve_slide(slide)
     if serr is not None:
         return serr
+    _region_path = _desc_path(gate) if gate is not None else (UPLOAD_DIR / safe)
     gerr = _plugin_slide_run_grant_gate(safe, claims)
     if gerr is not None:
         return gerr
@@ -17971,7 +18476,7 @@ def plugin_v1_region(slide):
 
     expected_fp = body.get("expected_fingerprint") or body.get("expectedAssetRevision")
     if isinstance(expected_fp, str) and expected_fp:
-        fp = _slide_fingerprint(safe)
+        fp = _slide_fingerprint(_region_path)
         if fp != expected_fp:
             return _plugin_error(409, "slide_revision_conflict", "切片指纹不匹配（文件已变更）",
                                  details={"expected": expected_fp, "actual": fp})
@@ -17993,10 +18498,10 @@ def plugin_v1_region(slide):
                 % _PLUGIN_REGION_PIXEL_BUDGET_PER_MIN, retry,
                 details={"pixels": pixels, "budget_per_min": _PLUGIN_REGION_PIXEL_BUDGET_PER_MIN,
                          "reason": "pixel_budget"})
-        entry = _get_slide(safe)
+        entry = _get_slide(gate if gate is not None else safe)
         with slide_cache.borrow_pair(entry) as pair:
             osr = pair["osr"]
-            meta = _read_metadata(osr, UPLOAD_DIR / safe)
+            meta = _read_metadata(osr, _region_path)
             mpp = meta.get("mpp_x")
         if not out_w or out_w <= 0:
             out_w = 1568
@@ -18029,7 +18534,7 @@ def plugin_v1_region(slide):
             resp = Response(jpeg_bytes, mimetype="application/octet-stream")
             resp.headers["Content-Type"] = "application/octet-stream"
             resp.headers["Content-SHA256"] = content_sha
-            resp.headers["X-Asset-Revision"] = _legacy_slide_revision(safe)
+            resp.headers["X-Asset-Revision"] = _legacy_slide_revision(_region_path)
             resp.headers["X-Region-Bbox"] = json.dumps(r["src"])
             resp.headers["X-Region-Out"] = json.dumps(
                 {"outW": int(r["width"]), "outH": int(r["height"])})
@@ -18065,7 +18570,7 @@ def plugin_v1_region(slide):
                 image_mode=r.get("image_mode") or "native_rgb",
                 subsampling=r.get("subsampling") or "4:2:0"),
             "content_sha256": content_sha,
-            "asset_revision": _legacy_slide_revision(safe),
+            "asset_revision": _legacy_slide_revision(_region_path),
         }
         # §6.3 additive：render_context 生效时的 fingerprint（与 asset_revision
         # 独立）；HistoPilot 记入 image_ref/derivative key（Batch 5）。
@@ -18091,7 +18596,7 @@ def plugin_v1_changes(slide):
     claims, err = _require_plugin_token("slide:read")
     if err is not None:
         return err
-    safe, serr = _plugin_resolve_slide(slide)
+    safe, _gate, serr = _plugin_resolve_slide(slide)
     if serr is not None:
         return serr
     raw_after = request.args.get("after_seq")
@@ -18129,7 +18634,7 @@ def plugin_v1_annotate(slide):
     claims, err = _require_plugin_token("annotation:write")
     if err is not None:
         return err
-    safe, serr = _plugin_resolve_slide(slide)
+    safe, _gate, serr = _plugin_resolve_slide(slide)
     if serr is not None:
         return serr
     body = request.get_json(silent=True) or {}
@@ -20441,13 +20946,28 @@ def api_annotations_changes():
 def api_slide_meta(name):
     """设置切片的别名/备注/公开档。JSON: {alias?, note?, public?}（None 不改，空串清除）。
 
-    name 需为已存在的切片文件。
+    P1-B2 收口：name 必须已有 slides 行（resolve_legacy_alias）；无行 → 404
+    （不再经本端点「为不存在的名字建行」——隐式建行旁路关闭，新资产建行走
+    上传 writer / slide_store.allocate_slide）。有行走 set_slide_meta 更新
+    分支（alias 双写 display_name）。
+
     Stage 3a-2a（docs §5.1.1）：
       - public 仅 owner 可设置（user 尝试 403）；
       - user 可改自己切片的 alias/note（不变），改他人切片 403。
     """
     ident = current_identity()
-    safe = _safe_name(name)
+    safe = _sanitize_name(name)
+    if not safe or safe != name:
+        return jsonify(error="非法文件名"), 400
+    desc = _resolve_legacy_read(safe)
+    if desc is None:
+        return jsonify(error="切片不存在"), 404
+    try:
+        if not _desc_path(desc).is_file():
+            # 行在文件不在（已删除/中间态）：保持旧 _safe_name 的 404 语义
+            return jsonify(error="切片不存在"), 404
+    except Exception:
+        return jsonify(error="切片不存在"), 404
     body = request.get_json(silent=True) or {}
     alias = body.get("alias", None)
     note = body.get("note", None)

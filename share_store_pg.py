@@ -35,6 +35,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import secrets
 import time
 import uuid
@@ -328,12 +329,47 @@ def _bump_change_seq(cur, slide, token, annotation_id, op):
 # --------------------------------------------------------------------------- #
 # 分享（shares）
 # --------------------------------------------------------------------------- #
+def _ensure_share_slide_row(cur, name, logger=None):
+    """分享成员名 → slide_id（P1-B2 / R-04）。
+
+    有 slides 行 → 返回既有（已确认的旧）slide_id；无行 → 按 set_slide_meta
+    懒建行同款语义补一行（legacy/ready，owner 留空——分享创建路径不带归属，
+    与旧行为「分享不建行」等价的可读性由 share_slides 成员关系提供）。
+    返回 slide_id；理论上的异常形态返回 None（调用方跳过并告警）。
+    """
+    cur.execute("SELECT slide_id FROM slides WHERE legacy_filename=%s",
+                (name,))
+    row = cur.fetchone()
+    if row is not None:
+        return row["slide_id"]
+    slide_id = _new_slide_id()
+    lazy = _lazy_slide_columns(None, name)
+    cur.execute(
+        "INSERT INTO slides (slide_id, legacy_filename, original_filename, "
+        "display_name, format_ext, asset_state, storage_layout, published_at) "
+        "VALUES (%s,%s,%s,%s,%s,'ready','legacy',now())",
+        (slide_id, name, name, lazy["display_name"], lazy["format_ext"]))
+    if logger is not None:
+        logger.warning("share_slides 映射：名 %r 无 slides 行，已按迁移兼容"
+                       "语义懒建 legacy/ready 行 slide_id=%s", name, slide_id)
+    return slide_id
+
+
 def create_share(slides, expires_hours, roi_sizes=None, permissions=None,
                  creator_user_id=None, requester_role=None, rect_policy=None):
     """创建分享：生成 token、写入并返回 share dict（含 token/roi_sizes/rect_policy）。
 
     升级 C（§6.4）：rect_policy ∈ preset_only|custom；缺省 preset_only
     （新建分享不显式选择时不放宽为 custom）。
+
+    P1-B2（R-04）：INSERT shares 后把 slides 名数组逐个解析 legacy_filename→
+    slide_id 写入 share_slides（position=数组序，ON CONFLICT DO NOTHING）；
+    解析不到的名跳过并 log warning。**兼容过渡**：为保持「先建分享、后放文件」
+    的既有流程（以及 0067 之前从未注册过行的历史名）可读，无 slides 行的名按
+    set_slide_meta 懒建行同款语义补 legacy/ready 行再映射（迁移兼容层，见
+    _ensure_share_slide_row；P2 权限关系收口时随回填统一）。shares.slides
+    JSONB 照写（兼容快照——列表/claimed 展示仍读它，授权判定不再参与，
+    见 share_server._require_slide / slide_store.authorize_read）。
     """
     _reject_guest_write(requester_role)
     roi_sizes_norm = _normalize_roi_sizes(roi_sizes)
@@ -358,6 +394,24 @@ def create_share(slides, expires_hours, roi_sizes=None, permissions=None,
                      psycopg.types.json.Jsonb(list(roi_sizes_norm)),
                      policy, expires_at, creator),
                 )
+                # R-04：share_slides ID 关系（授权判定唯一来源）
+                for pos, s in enumerate(slides):
+                    if not isinstance(s, str) or not s:
+                        _LOG.warning("share_slides 映射跳过非法名：%r", s)
+                        continue
+                    try:
+                        slide_id = _ensure_share_slide_row(cur, s)
+                    except Exception:
+                        _LOG.warning("share_slides 映射失败（跳过）：%s", s,
+                                     exc_info=True)
+                        continue
+                    if slide_id is None:
+                        _LOG.warning("share_slides 映射不到 slide_id（跳过）：%s", s)
+                        continue
+                    cur.execute(
+                        "INSERT INTO share_slides (token, slide_id, position) "
+                        "VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
+                        (token, slide_id, pos))
         return {
             "slides": list(slides),
             "created_at": now,
@@ -1835,12 +1889,48 @@ def _new_slide_id() -> str:
     return "sld_" + secrets.token_urlsafe(9)  # 12 位 urlsafe
 
 
+# P1-B2（slide ID 化重构，docs/slide-id-refactor-p1-contract-20260925.md §8）：
+# slides 行新增身份/状态列的写侧归一助手（与 slide_store.normalize_format_ext
+# 同口径的小写白名单 ^[a-z0-9]{1,16}$；本模块不 import slide_store，保持
+# share_store 依赖面不变）。
+_SLIDE_FORMAT_EXT_RE = re.compile(r"^[a-z0-9]{1,16}$")
+
+
+def _format_ext_from_name(name):
+    """从 legacy 文件名后缀归一 format_ext；不匹配白名单返回 None。"""
+    if not isinstance(name, str) or "." not in name:
+        return None
+    ext = name.rsplit(".", 1)[-1].strip().lower().lstrip(".")
+    return ext if _SLIDE_FORMAT_EXT_RE.match(ext) else None
+
+
+def _lazy_slide_columns(alias, name):
+    """懒建行的 P1-B2 新列值（合同 §3.1 / 任务书 P1-B2 A.1）。
+
+    legacy writer（V1/V2/COS/转换/导入等）同步完成即发布：asset_state='ready'
+    （保持旧「写完即可读」行为——读取门禁只认 ready）、storage_layout='legacy'、
+    original_filename=name、display_name（非空 alias 优先，否则 name）、
+    format_ext（白名单后缀归一，不匹配 NULL）。
+    """
+    a = alias.strip() if isinstance(alias, str) else ""
+    return {
+        "display_name": a or name,
+        "format_ext": _format_ext_from_name(name),
+    }
+
+
 def set_slide_meta(name, alias=None, note=None, owner_user_id=None, public=None,
                    requester_role=None):
     """设置/更新某切片的别名与备注；首次出现 name 时生成稳定 slide_id。
 
     语义与 json 一致，额外：name（legacy_filename）首次出现 → 新建 slides 行并
     生成稳定 slide_id；同名已存在 → 仅更新 alias/note/owner/public，slide_id 不动。
+
+    P1-B2（合同 §8 兼容与退出条件）：按名懒建行是**迁移兼容层**——仅限既有
+    legacy writer（上传 commit/归属校正/恢复/demo 目录/导入脚本）使用；正常
+    新读写自 P3 起改走 slide_store 的 ID 原语。新行进入 asset_state='ready' /
+    storage_layout='legacy'（_lazy_slide_columns），保持「写完即可读」旧行为；
+    alias 写入时同步双写 display_name（R-02；alias 列停写在 P2）。
     """
     _reject_guest_write(requester_role)
     conn = _connect()
@@ -1852,9 +1942,14 @@ def set_slide_meta(name, alias=None, note=None, owner_user_id=None, public=None,
                 row = cur.fetchone()
                 if row is None:
                     slide_id = _new_slide_id()
+                    lazy = _lazy_slide_columns(alias, name)
                     cur.execute(
-                        "INSERT INTO slides (slide_id, legacy_filename) "
-                        "VALUES (%s,%s)", (slide_id, name))
+                        "INSERT INTO slides (slide_id, legacy_filename, "
+                        "original_filename, display_name, format_ext, "
+                        "asset_state, storage_layout, published_at) "
+                        "VALUES (%s,%s,%s,%s,%s,'ready','legacy',now())",
+                        (slide_id, name, name, lazy["display_name"],
+                         lazy["format_ext"]))
                     cur_owner = None
                 else:
                     slide_id = row["slide_id"]
@@ -1864,6 +1959,12 @@ def set_slide_meta(name, alias=None, note=None, owner_user_id=None, public=None,
                 if alias is not None:
                     a = alias.strip() if isinstance(alias, str) else ""
                     sets.append("alias=%s")
+                    params.append(a)
+                    # R-02 双写过渡：alias 非空 → display_name=alias；清空 →
+                    # 回落 original_filename/legacy_filename（与回填规则同口径）
+                    sets.append(
+                        "display_name=COALESCE(NULLIF(%s,''), original_filename,"
+                        " legacy_filename, '')")
                     params.append(a)
                 if note is not None:
                     n = note.strip() if isinstance(note, str) else ""
@@ -1881,6 +1982,17 @@ def set_slide_meta(name, alias=None, note=None, owner_user_id=None, public=None,
                     cur.execute(
                         "UPDATE slides SET " + ", ".join(sets) +
                         " WHERE slide_id=%s", params)
+                # P1-B2：legacy writer 的重发布——行处于 deleted/deleting（旧
+                # 删除端点的状态直写 / P5 编排残留）后**同名重传**（no-clobber
+                # 上传必经删除），本调用即新内容注册完成：恢复 ready（slide_id
+                # 复用是既有行为；正式两阶段删除在 P5）。staging/legacy/failed
+                # 不在此复活——新 writer 走 slide_store 原语，legacy 只经回填
+                # 脚本验证（合同 §4：legacy ──盘点/验证──▶ ready）。
+                cur.execute(
+                    "UPDATE slides SET asset_state='ready', published_at=now(),"
+                    " updated_at=now() WHERE slide_id=%s"
+                    " AND asset_state IN ('deleted','deleting')",
+                    (slide_id,))
                 cur.execute(
                     "SELECT alias, note, owner_user_id, public FROM slides "
                     "WHERE slide_id=%s", (slide_id,))
@@ -1975,7 +2087,13 @@ def get_all_slide_meta():
 
 
 def get_slide_id(name):
-    """返回某 legacy_filename 对应的稳定 slide_id；无则 None。"""
+    """返回某 legacy_filename 对应的稳定 slide_id；无则 None。
+
+    P1-B2 起为**迁移兼容层**专用（R-01 / 计划 §5 限制项）：仅供既有按名的
+    写通道残留（删除联动/admin 授权绑定等）与迁移脚本使用；正常读路径走
+    slide_store.resolve_legacy_alias（带完整 descriptor + 状态门禁），新写
+    路径自 P3 起走 slide_store 的 ID 原语。签名不变（旧调用方不动）。
+    """
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -1989,7 +2107,13 @@ def get_slide_id(name):
 
 
 def resolve_slide_ref(ref):
-    """把 name（或已是稳定 id 的 slide_id）解析为稳定 slide_id；无则 None。"""
+    """把 name（或已是稳定 id 的 slide_id）解析为稳定 slide_id；无则 None。
+
+    P1-B2 起为**迁移兼容层**专用（R-01 / 计划 §5 限制项）：``sld_`` 前缀
+    直返**不做存在性/状态检查**（当前无生产调用方，仅导出+测试保留）；正常
+    解析一律走 slide_store.resolve_slide_id / resolve_legacy_alias（校验
+    存在性并进入 authorize_read 状态门禁）。签名不变（旧调用方不动）。
+    """
     if not ref:
         return None
     if isinstance(ref, str) and ref.startswith("sld_"):

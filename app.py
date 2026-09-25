@@ -2891,6 +2891,10 @@ def _app_capabilities(mode):
         # 上传修复 A1：V2 分片路由阈值（非敏感，随 bootstrap 下发；前端解析
         # 失败回落同值。ZIP/MRXS 例外不随此值变化）
         "upload_v2_threshold_bytes": int(UPLOAD_V2_THRESHOLD_BYTES),
+        # slide ID 化（P2 合同 §5.6）：后端 ID 通道能力协商旗标——自本版本
+        # 起恒 true（/api/slides/<slide_id>/ 族已上线）；前端检测到缺省/false
+        # （旧后端）时回落 name 通道（双栈期逻辑，退役条件见 P6）。
+        "slide_id_api": True,
         # COS 直传（Phase 3；capability 默认 off——四项门禁未过前恒不可用，
         # 合同 §1/§8）。非敏感参数随 bootstrap 下发；不含 bucket 名/endpoint
         # 之外的任何秘密（endpoint 本身是公开 COS 域名）。manual_only：校准

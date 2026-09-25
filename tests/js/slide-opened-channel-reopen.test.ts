@@ -37,6 +37,10 @@ const channelsSrc = readFileSync(resolve(here, "../../static/channel-controls.js
 
 const SLIDE_A = "slide-a.ndpi";
 const SLIDE_B = "slide-b.ndpi";
+// P2 slide ID 化：切片操作键 = slide_id（sld_ 前缀服务端随机串；与文件名
+// 两个不相交键空间）。本用例组按 ID 断言（harness 开 slide_id_api 能力）
+const ID_A = "sld_aaaaaaaaaaa";
+const ID_B = "sld_bbbbbbbbbbb";
 const REV1 = "1757000000000000000:42";
 const REV2 = "1757000001000000000:43";
 
@@ -196,7 +200,9 @@ interface EmittedEvent {
 function plainInfo(revision: string, name = SLIDE_A): Record<string, unknown> {
 	return {
 		name,
-		slide_id: name,
+		slide_id: name === SLIDE_B ? ID_B : ID_A,
+		display_name: "",
+		original_filename: name,
 		width: 1000,
 		height: 800,
 		mpp_x: 0.5,
@@ -231,7 +237,7 @@ function multichannelInfo(revision: string, name = SLIDE_A): Record<string, unkn
 }
 
 // channel-controls storageKey 口径：scope=currentUserId 为 null（harness 的
-// /api/auth/info 返回 {}）→ "official:local"
+// /api/auth/info 返回 {}）→ "official:local"；键的切片段 = slide_id（P2）
 function persistedSelectionKey(slideId: string, revision: string): string {
 	return "pt.rc.v1|official:local|" + slideId + "|" + revision;
 }
@@ -322,16 +328,20 @@ function bootApp(opts: {
 
 	const fetchImpl = vi.fn((url: string) => {
 		const u = String(url);
-		const m = u.match(/\/api\/slide\/([^/]+)\/info/);
+		// P2：ID 通道读端点 /api/slides/<slide_id>/info（slide_id_api=true）
+		const m = u.match(/\/api\/slides\/([^/]+)\/info/);
 		if (m) {
-			const name = decodeURIComponent(m[1]);
-			return jsonResponse(infoByName[name] || { error: "not_found" });
+			const sid = decodeURIComponent(m[1]);
+			const hit = Object.keys(infoByName)
+				.map((n) => infoByName[n])
+				.find((info) => info.slide_id === sid);
+			return jsonResponse(hit || { error: "not_found" });
 		}
-		if (u.includes("/api/annotations?slide=")) return jsonResponse({ annotations: [] });
+		if (u.includes("/api/annotations?slide_id=")) return jsonResponse({ annotations: [] });
 		if (u.includes("/api/annotations")) return jsonResponse({ by_slide: {} });
 		if (u.includes("/api/slides")) {
 			return jsonResponse(opts.slides || [
-				{ name: SLIDE_A, width: 1000, height: 800, mpp_x: 0.5, mpp_source: "native" },
+				{ name: SLIDE_A, slide_id: ID_A, display_name: "", width: 1000, height: 800, mpp_x: 0.5, mpp_source: "native" },
 			]);
 		}
 		if (u.includes("/api/projects")) {
@@ -377,6 +387,8 @@ function bootApp(opts: {
 	const w: Record<string, unknown> = {
 		HP_I18N: { t: (k: string) => k, getLang: () => "zh" },
 		HP_ViewerCore: { create: () => viewer },
+		// P2：能力协商——slide_id_api=true 走 ID 通道
+		HP_APP_BOOTSTRAP: { mode: "official", capabilities: { slide_id_api: true } },
 		// channel-controls adapter：多通道流程只用到 normalizeRenderContext
 		HP_API: {
 			normalizeRenderContext: (_id: string, _body: unknown) =>
@@ -441,8 +453,10 @@ function bootApp(opts: {
 	while (rafCbs.length) (rafCbs.shift() as () => void)();
 
 	const findSlideRow = (name?: string) => {
+		// P2：行操作键 = data-slide-id（slide_id）；name 入参按 data-name 兼容定位
 		const row = created.find((e) =>
-			e.classList.contains("slide-row") && (!name || e.dataset.name === name));
+			e.classList.contains("slide-row") &&
+			(!name || e.dataset.slideId === name || e.dataset.name === name));
 		if (!row) throw new Error("harness: 未渲染出 .slide-row（生产路径 loadAll → renderProjects → renderSlideRow）");
 		return row;
 	};
@@ -473,7 +487,10 @@ function slideOpenedEvents(emitted: EmittedEvent[]): Array<{ slide: Record<strin
 }
 
 const EXPECTED_SLIDE = {
+	// P2 合同 §5.5：slide.opened 载荷主键 id + name/display_name 快照
+	id: ID_A,
 	name: SLIDE_A,
+	display_name: null,
 	width: 1000,
 	height: 800,
 	mppX: 0.5,
@@ -499,7 +516,7 @@ describe("slide.opened：多通道持久化配色重开不丢事件 + name|revis
 		await settle();
 
 		// 生产路径：openSlide → legacy viewer.open（在途）→ OSD "open" 事件到达
-		expect(app.openArgs).toEqual(["/api/slide/" + SLIDE_A + ".dzi"]);
+		expect(app.openArgs).toEqual(["/api/slides/" + ID_A + "/dzi"]);
 		app.deliverOpens();
 
 		const opened = slideOpenedEvents(app.emitted);
@@ -509,7 +526,7 @@ describe("slide.opened：多通道持久化配色重开不丢事件 + name|revis
 
 		it("AI 入口：模板初始 disabled，多通道首开仅第二次 open 到达后主入口与溢出入口均可用", async () => {
 			const storage = fakeStorage();
-			storage.setItem(persistedSelectionKey(SLIDE_A, REV1), persistedSelection());
+			storage.setItem(persistedSelectionKey(ID_A, REV1), persistedSelection());
 			const app = bootApp({ infoByName: { [SLIDE_A]: multichannelInfo(REV1) }, storage });
 			await settle();
 			expect(app.aiBtn().disabled, "模板初始 AI 主入口必须禁用").toBe(true);
@@ -529,7 +546,7 @@ describe("slide.opened：多通道持久化配色重开不丢事件 + name|revis
 
 		it("AI 入口：普通换色/画质重开仍不重置会话，且保持 AI 可用", async () => {
 			const storage = fakeStorage();
-			storage.setItem(persistedSelectionKey(SLIDE_A, REV1), persistedSelection());
+			storage.setItem(persistedSelectionKey(ID_A, REV1), persistedSelection());
 			const app = bootApp({ infoByName: { [SLIDE_A]: multichannelInfo(REV1) }, storage });
 			await settle();
 			app.findSlideRow().dispatch("click");
@@ -548,7 +565,7 @@ describe("slide.opened：多通道持久化配色重开不丢事件 + name|revis
 
 		it("bug 复现：多通道 + 本地持久化配色，首开默认 token 的 open 事件被 viewer.close 吃掉 → 持久化配色重开补发恰好一次", async () => {
 		const storage = fakeStorage();
-		storage.setItem(persistedSelectionKey(SLIDE_A, REV1), persistedSelection());
+		storage.setItem(persistedSelectionKey(ID_A, REV1), persistedSelection());
 		const app = bootApp({ infoByName: { [SLIDE_A]: multichannelInfo(REV1) }, storage });
 		await settle();
 		app.findSlideRow().dispatch("click");
@@ -569,9 +586,20 @@ describe("slide.opened：多通道持久化配色重开不丢事件 + name|revis
 		expect(opened[0]).toEqual({ slide: Object.assign({}, EXPECTED_SLIDE, { revision: REV1 }) });
 	});
 
+	it("P2：多通道 render 计划的瓦片 URL 按 ID 通道（/api/slides/<slide_id>/tiles/...）", async () => {
+		const app = bootApp({ infoByName: { [SLIDE_A]: multichannelInfo(REV1) } });
+		await settle();
+		app.findSlideRow().dispatch("click");
+		await settle();
+		// 首开即 render 计划：viewer.open 收到 inline custom TileSource
+		const ts = app.openArgs[0] as { getTileUrl: (l: number, x: number, y: number) => string };
+		expect(typeof ts.getTileUrl).toBe("function");
+		expect(ts.getTileUrl(3, 2, 1)).toBe("/api/slides/" + ID_A + "/tiles/3/2_1.jpeg?render=tok-default");
+	});
+
 	it("去重（换配色不重置会话）：补发一次后，setChannelColor 换配色重开（同 name+revision）不再重发", async () => {
 		const storage = fakeStorage();
-		storage.setItem(persistedSelectionKey(SLIDE_A, REV1), persistedSelection());
+		storage.setItem(persistedSelectionKey(ID_A, REV1), persistedSelection());
 		const app = bootApp({ infoByName: { [SLIDE_A]: multichannelInfo(REV1) }, storage });
 		await settle();
 		app.findSlideRow().dispatch("click");
@@ -610,7 +638,7 @@ describe("slide.opened：多通道持久化配色重开不丢事件 + name|revis
 
 	it("同名替换（重开路径）：revision 变化 + 本地持久化配色 → 补发且载荷 revision 为新值", async () => {
 		const storage = fakeStorage();
-		storage.setItem(persistedSelectionKey(SLIDE_A, REV2), persistedSelection());
+		storage.setItem(persistedSelectionKey(ID_A, REV2), persistedSelection());
 		const app = bootApp({ infoByName: { [SLIDE_A]: multichannelInfo(REV2) }, storage });
 		await settle();
 		app.findSlideRow().dispatch("click");
@@ -648,8 +676,8 @@ describe("slide.opened：多通道持久化配色重开不丢事件 + name|revis
 				[SLIDE_B]: plainInfo(REV1, SLIDE_B),
 			},
 			slides: [
-				{ name: SLIDE_A, width: 1000, height: 800, mpp_x: 0.5, mpp_source: "native" },
-				{ name: SLIDE_B, width: 2000, height: 1600, mpp_x: 0.25, mpp_source: "native" },
+				{ name: SLIDE_A, slide_id: ID_A, display_name: "", width: 1000, height: 800, mpp_x: 0.5, mpp_source: "native" },
+				{ name: SLIDE_B, slide_id: ID_B, display_name: "", width: 2000, height: 1600, mpp_x: 0.25, mpp_source: "native" },
 			],
 		});
 		await settle();

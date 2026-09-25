@@ -94,6 +94,9 @@
       imageMode: info.image_mode === "multichannel" ? "multichannel" : "native_rgb",
       multichannel: false,
       assetRevision: typeof info.asset_revision === "string" ? info.asset_revision : null,
+      // slide_id 优先回退 name（P2 slide ID 化）：info.slide_id 是权威操作键；
+      // name 回退仅服务旧后端/畸形 DTO——退役条件：P6 拆 name 回落后改为
+      // 只取 slide_id 并对缺失 fail-fast。
       slideId: info.slide_id != null ? String(info.slide_id) : (info.name != null ? String(info.name) : null),
       channels: [],
       warnings: Array.isArray(info.warnings) ? info.warnings : [],
@@ -160,6 +163,7 @@
   // ------------------------------------------------------------------ #
   function createDeepZoomTileSource(info, adapter, renderToken) {
     var dz = info.deepzoom || {};
+    // id 优先回退 name（退役条件 P6，同 normalizeChannelInfo.slideId 注释）
     var slideId = info.slideId || info.slide_id || info.name;
     var qualityQuery = qualityTileQuery();
     return {
@@ -289,6 +293,8 @@
     // key 含用户作用域 + 切片安全名 + asset revision（不得只有文件名）；
     // revision 变化 → 新 key（旧选择自然丢弃回默认）。分隔符「|」保证可读且
     // 不与切片安全名/作用域冲突（localStorage key 无字符集限制）。
+    // P2（slide ID 化）：第二段键现在恒为 slide_id（info.slide_id 优先）；
+    // 旧键（按文件名）的本地选择自然失效回默认，不做迁移。
     return "pt.rc.v1|" + String(scope || "anonymous") +
       "|" + String(slideSafeName || "") +
       "|" + String(assetRevision || "");

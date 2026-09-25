@@ -138,9 +138,12 @@ function findByClass(root: FakeEl, cls: string): FakeEl[] {
 
 // ---------- URL 感知 fetch + 插值 t 的 bootApp ----------
 const LONG_NAME = "TCGA-49-AAR4-01Z-00-DX1.EDB32358-AF23-4F81-A99F-15574A2DE28E.svs";
+const LONG_ID = "sld_rowlong00001";
+const B_ID = "sld_rowb00000002";
+// P2：列表项带 slide_id/display_name（合同 §2 DTO）；行操作键 = data-slide-id
 const SLIDES = [
-	{ name: LONG_NAME, width: 1000, height: 1000, mpp_x: 0.5, size_bytes: 123456789 },
-	{ name: "b.svs", width: 800, height: 800, mpp_x: null, mpp_source: "missing" },
+	{ name: LONG_NAME, slide_id: LONG_ID, display_name: "", width: 1000, height: 1000, mpp_x: 0.5, size_bytes: 123456789 },
+	{ name: "b.svs", slide_id: B_ID, display_name: "", width: 800, height: 800, mpp_x: null, mpp_source: "missing" },
 ];
 const PROJECTS = [
 	{ pid: "p1", name: "项目A", slides: [LONG_NAME], note: "", roi_count: 0 },
@@ -269,7 +272,8 @@ function projectSlideRow(app: App): FakeEl {
 function unfiledRow(app: App, name: string): FakeEl {
 	const rows = app.els["unfiled-list"].children.filter((c) =>
 		c.classList.contains("slide-row"));
-	const row = rows.find((r) => r.dataset.name === name);
+	// P2：行操作键 data-slide-id（= slide_id）；data.name 兼容按名定位
+	const row = rows.find((r) => r.dataset.slideId === name || r.dataset.name === name);
 	expect(row).toBeTruthy();
 	return row!;
 }
@@ -329,6 +333,16 @@ describe("切片行布局：名称独占首行 / 徽章次行 / meta 第三行�
 		// 显示文本是截断名（含 …），完整名只经 tooltip/aria 提供
 		expect(nameEl.textContent).not.toBe(LONG_NAME);
 		expect(nameEl.textContent.includes("…")).toBe(true);
+	});
+
+	it("P2：行操作键 = data-slide-id（slide_id）；data-name 保留供搜索/显示", async () => {
+		const app = await boot({});
+		const row = projectSlideRow(app);
+		expect(row.dataset.slideId).toBe(LONG_ID);
+		expect(row.dataset.name).toBe(LONG_NAME);
+		const unfiled = unfiledRow(app, "b.svs");
+		expect(unfiled.dataset.slideId).toBe(B_ID);
+		expect(unfiled.dataset.name).toBe("b.svs");
 	});
 });
 

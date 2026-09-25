@@ -28,6 +28,7 @@ const appSrc = readFileSync(resolve(here, "../../static/app.js"), "utf8");
 const require = createRequire(import.meta.url);
 
 const SLIDE = "ctx-slide.ndpi";
+const SLIDE_ID = "sld_ctx000000001";
 
 // ---------- 最小假元素（裁自 viewer-get-viewport.test.ts harness） ----------
 interface FakeEl extends Record<string, unknown> {
@@ -199,20 +200,21 @@ function bootApp(): BootResult {
 
   const fetchImpl = vi.fn((url: string) => {
     const u = String(url);
-    if (u.includes("/api/slide/" + SLIDE + "/info")) {
-      return jsonResponse({ name: SLIDE, width: 1000, height: 800, mpp_x: 0.5, mpp_y: 0.5, mpp_source: "native" });
+    // P2：ID 通道 /api/slides/<slide_id>/info（harness 注入 slide_id_api）
+    if (u.includes("/api/slides/" + SLIDE_ID + "/info")) {
+      return jsonResponse({ name: SLIDE, slide_id: SLIDE_ID, display_name: "", original_filename: SLIDE, width: 1000, height: 800, mpp_x: 0.5, mpp_y: 0.5, mpp_source: "native" });
     }
-    if (u.includes("/api/annotations?slide=")) {
+    if (u.includes("/api/annotations?slide_id=")) {
       return jsonResponse({ annotations: [{
         label: "病理医生", count: 1,
-        items: [{ index: 0, token: "tok1", slide: SLIDE, type: "arrow",
+        items: [{ index: 0, token: "tok1", slide: SLIDE, slide_id: SLIDE_ID, type: "arrow",
                   x1: 100, y1: 100, x2: 300, y2: 200, ts: 1700000000,
                   note: "核异型区域", annotation_id: "anno-7", revision: 2 }],
       }] });
     }
     if (u.includes("/api/annotations")) return jsonResponse({ by_slide: {} });
     if (u.includes("/api/slides")) {
-      return jsonResponse([{ name: SLIDE, width: 1000, height: 800, mpp_x: 0.5, mpp_source: "native" }]);
+      return jsonResponse([{ name: SLIDE, slide_id: SLIDE_ID, display_name: "", width: 1000, height: 800, mpp_x: 0.5, mpp_source: "native" }]);
     }
     if (u.includes("/api/projects")) {
       return jsonResponse([{ pid: "p1", name: "P1", slides: [SLIDE], slide_count: 1, roi_count: 0 }]);
@@ -245,6 +247,8 @@ function bootApp(): BootResult {
     HP_I18N: { t: (k: string) => k, getLang: () => "zh" },
     HP_ViewerCore: { create: () => fakeViewer },
     HP_API: {},
+    // P2：ID 通道能力（slide_id_api=true）
+    HP_APP_BOOTSTRAP: { mode: "official", capabilities: { slide_id_api: true } },
     HistoPilot: {},   // 插件已加载（hpReady=true，emit 走 stub）
     PluginPermissions: {},
     SVS_PLUGIN_PERMISSIONS: { histopilot: [] },
@@ -361,6 +365,8 @@ describe("工单 E：右键加入会话（conversation.attachIntent）", () => {
     expect(evt).toBeTruthy();
     const p = evt!.payload as Record<string, unknown>;
     expect(p.kind).toBe("viewport");
+    // P2 合同 §5：载荷 slide_id 操作键 + slide 名称快照并存
+    expect(p.slide_id).toBe(SLIDE_ID);
     expect(p.slide).toBe(SLIDE);
     // bbox：与 viewer.getViewport 同一实现的 level-0 取整
     expect(p.bbox).toEqual({ x: 10, y: 20, w: 500, h: 400 });
@@ -394,6 +400,9 @@ describe("工单 E：右键加入会话（conversation.attachIntent）", () => {
     expect(evt).toBeTruthy();
     const p = evt!.payload as Record<string, unknown>;
     expect(p.kind).toBe("marker");
+    // P2：marker 载荷同样 slide_id + 名快照并存
+    expect(p.slide_id).toBe(SLIDE_ID);
+    expect(p.slide).toBe(SLIDE);
     // bbox = 标注包围盒（发送时作为冻结 viewport，不重查实时视野）
     expect(p.bbox).toEqual({ x: 100, y: 100, w: 200, h: 100 });
     expect(p.annotation_id).toBe("anno-7");

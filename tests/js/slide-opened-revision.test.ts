@@ -20,6 +20,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const appSrc = readFileSync(resolve(here, "../../static/app.js"), "utf8");
 
 const SLIDE = "slide-a.ndpi";
+const SLIDE_ID = "sld_rev00000001";
 const REVISION = "1757000000000000000:42";
 
 // ---------- 假元素：记录属性/监听器（含 canvas ctx 记录器） ----------
@@ -157,8 +158,14 @@ interface BootResult {
 	findSlideRow: () => FakeEl;
 }
 
-// info：/api/slide/<name>/info 响应体（asset_revision 可选，模拟边缘路径）
-function bootApp(info: Record<string, unknown>): BootResult {
+// info：/api/slides/<id>/info（ID 通道）/api/slide/<name>/info（旧后端回落）
+// 响应体（asset_revision 可选，模拟边缘路径）。idMode=true 时 harness 注入
+// slide_id_api 能力并把列表项/info 补 slide_id（P2 契约 §5.6 双栈口径）
+function bootApp(info: Record<string, unknown>, opts?: { idMode?: boolean }): BootResult {
+	const idMode = !!(opts && opts.idMode);
+	const body = idMode
+		? Object.assign({ slide_id: SLIDE_ID, display_name: "", original_filename: SLIDE }, info)
+		: info;
 	const els: Record<string, FakeEl> = {};
 	const created: FakeEl[] = [];
 	const docListeners: Record<string, Array<() => void>> = {};
@@ -189,11 +196,14 @@ function bootApp(info: Record<string, unknown>): BootResult {
 
 	const fetchImpl = vi.fn((url: string) => {
 		const u = String(url);
-		if (u.includes("/api/slide/" + SLIDE + "/info")) return jsonResponse(info);
-		if (u.includes("/api/annotations?slide=")) return jsonResponse({ annotations: [] });
+		if (u.includes("/api/slides/" + SLIDE_ID + "/info")) return jsonResponse(body);
+		if (u.includes("/api/slide/" + SLIDE + "/info")) return jsonResponse(body);
+		if (u.includes("/api/annotations?slide")) return jsonResponse({ annotations: [] });
 		if (u.includes("/api/annotations")) return jsonResponse({ by_slide: {} });
 		if (u.includes("/api/slides")) {
-			return jsonResponse([{ name: SLIDE, width: 1000, height: 800, mpp_x: 0.5, mpp_source: "native" }]);
+			return jsonResponse([Object.assign(
+				{ name: SLIDE, width: 1000, height: 800, mpp_x: 0.5, mpp_source: "native" },
+				idMode ? { slide_id: SLIDE_ID, display_name: "" } : null)]);
 		}
 		if (u.includes("/api/projects")) {
 			return jsonResponse([{ pid: "p1", name: "P1", slides: [SLIDE], slide_count: 1, roi_count: 0 }]);
@@ -228,6 +238,8 @@ function bootApp(info: Record<string, unknown>): BootResult {
 		HP_I18N: { t: (k: string) => k, getLang: () => "zh" },
 		HP_ViewerCore: { create: () => fakeViewer },
 		HP_API: {},
+		// P2：idMode 注入 slide_id_api=true（缺省=旧后端回落 name 通道）
+		...(idMode ? { HP_APP_BOOTSTRAP: { mode: "official", capabilities: { slide_id_api: true } } } : {}),
 		HistoPilot: {},
 		HostBridgeHost: {
 			onRequest() {},
@@ -299,18 +311,22 @@ describe("slide.opened 携带资产 revision（切片替换保护）", () => {
 			mpp_y: 0.5,
 			mpp_source: "native",
 			asset_revision: REVISION,
-		});
+		}, { idMode: true });
 		await settle();
 		app.findSlideRow().dispatch("click");
 		await settle();
 
-		// 生产路径确实走到了 legacy viewer.open（harness 触发 OSD "open" 事件）
-		expect(app.openUrls).toEqual(["/api/slide/" + SLIDE + ".dzi"]);
+		// 生产路径确实走到了 legacy viewer.open（harness 触发 OSD "open" 事件）。
+		// P2：ID 通道 dzi 走 /api/slides/<slide_id>/dzi
+		expect(app.openUrls).toEqual(["/api/slides/" + SLIDE_ID + "/dzi"]);
 		const opened = app.emitted.filter((e) => e.type === "slide.opened");
 		expect(opened.length).toBe(1);
 		expect(slideOpened(app.emitted)).toEqual({
 			slide: {
+				// P2 合同 §5.5：载荷主键 id + name/display_name 快照
+				id: SLIDE_ID,
 				name: SLIDE,
+				display_name: null,
 				width: 1000,
 				height: 800,
 				mppX: 0.5,

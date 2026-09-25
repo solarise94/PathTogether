@@ -85,7 +85,8 @@ class FakeXHR {
 	}
 }
 
-/** localStorage stub（全局；app.js 直接引用 localStorage） */
+/** localStorage stub（全局；app.js 直接引用 localStorage；含 key/length 枚举——
+ * P2 续传键 v3 的账户域扫描与 v2 一次性迁移依赖） */
 function fakeLocalStorage() {
 	const map = new Map<string, string>();
 	return {
@@ -93,6 +94,8 @@ function fakeLocalStorage() {
 		setItem: (k: string, v: string) => { map.set(k, String(v)); },
 		removeItem: (k: string) => { map.delete(k); },
 		clear: () => map.clear(),
+		get length() { return map.size; },
+		key: (i: number) => Array.from(map.keys())[i] ?? null,
 		_dump: map,
 	};
 }
@@ -234,7 +237,11 @@ describe("大文件走 Upload V2（/api/uploads + 分片 PUT + commit）", () =>
 			} as unknown as Response)],
 			["POST /api/uploads/up-1/commit", () => Promise.resolve({
 				ok: true, status: 200, clone() { return this; },
-				json: () => Promise.resolve({ state: "committed", upload_id: "up-1" }),
+				json: () => Promise.resolve({
+					state: "committed", upload_id: "up-1",
+					// P2 合同 §5.2：commit 完成响应携带 slide_id（打开目标不再按名猜）
+					slide_id: "sld_up1completed",
+				}),
 			} as unknown as Response)],
 		]);
 		const fetchImpl = vi.fn((url: string, opts?: RequestInit) => {
@@ -246,7 +253,10 @@ describe("大文件走 Upload V2（/api/uploads + 分片 PUT + commit）", () =>
 				json: () => Promise.resolve({}),
 			} as unknown as Response);
 		}) as unknown as typeof fetch;
-		const h = loadApp(fetchImpl);
+		const h = loadApp(fetchImpl, {
+			mode: "official",
+			capabilities: { slide_id_api: true },
+		});
 		const file = bigFile(THRESHOLD + 16); // chunk_size=8 → 2 片 + 尾片（由响应推进）
 		h.uploadFile(file);
 		await flush();
@@ -256,10 +266,13 @@ describe("大文件走 Upload V2（/api/uploads + 分片 PUT + commit）", () =>
 		expect(create).toBeTruthy();
 		expect(create!.opts.method).toBe("POST");
 		expect((create!.opts.headers as Record<string, string>)["X-CSRF-Token"]).toBe("tok");
-		// localStorage 已记录恢复指纹 → upload_id
-		const saved = JSON.parse(
-			h.storage.getItem("pt.upload.v2::big.svs:" + file.size + ":42") || "null");
+		// localStorage 已记录续传条目（P2 合同 §5.3：账户域键 pt.upload.v3::
+		// <account>:<upload_id>，值含 filename/size 供辨认 + slide_id 字段位）
+		const saved = JSON.parse(h.storage.getItem("pt.upload.v3::local:up-1") || "null");
 		expect(saved && saved.upload_id).toBe("up-1");
+		expect(saved.filename).toBe("big.svs");
+		expect(saved.declared_size).toBe(file.size);
+		expect("slide_id" in saved).toBe(true);
 
 		// ② 分片 PUT：裸 XHR 带头；offset/sha256 在 query；严格串行
 		expect(FakeXHR.instances.length).toBeGreaterThanOrEqual(1);
@@ -288,9 +301,13 @@ describe("大文件走 Upload V2（/api/uploads + 分片 PUT + commit）", () =>
 		expect(commit).toBeTruthy();
 		expect((commit!.opts.headers as Record<string, string>)["X-CSRF-Token"]).toBe("tok");
 		await flush();
-		// 成功：toast + localStorage 清恢复记录
+		// 成功：toast + 打开目标 = 响应 slide_id（P2 合同 §5.2：ID 通道
+		// /api/slides/<slide_id>/info，绝不按 file.name/canonical_name 猜）
 		expect(h.toastMessages.some((m) => m.indexOf("upload.done") >= 0)).toBe(true);
-		expect(h.storage.getItem("pt.upload.v2::big.svs:" + file.size + ":42")).toBeNull();
+		expect(h.fetchCalls().some((c) => c.url === "/api/slides/sld_up1completed/info")).toBe(true);
+		expect(h.fetchCalls().some((c) => c.url === "/api/slide/big.svs/info")).toBe(false);
+		// localStorage 清续传条目
+		expect(h.storage.getItem("pt.upload.v3::local:up-1")).toBeNull();
 	});
 
 	it("offset_mismatch 409 → 按服务端 confirmed_offset 对齐重传", async () => {
@@ -335,11 +352,17 @@ describe("大文件走 Upload V2（/api/uploads + 分片 PUT + commit）", () =>
 		}) as unknown as typeof fetch;
 		const h = loadApp(fetchImpl);
 		const file = bigFile(THRESHOLD + 32);
-		h.storage.setItem("pt.upload.v2::big.svs:" + file.size + ":42",
+		// P2 合同 §5.3：v2 键（无账户域）只做一次性只读迁移——能映射 upload_id
+		// 的迁入 v3（账户域 local），迁完删旧键
+		const v2Key = "pt.upload.v2::big.svs:" + file.size + ":42";
+		h.storage.setItem(v2Key,
 			JSON.stringify({ upload_id: "up-9", declared_size: file.size, chunk_size: 8 }));
 		h.uploadFile(file);
 		await flush();
 		expect(statusQueried).toBe(true);
+		// 迁移收口：v2 键删除、v3 键就位（账户域 local:up-9）
+		expect(h.storage.getItem(v2Key)).toBeNull();
+		expect(h.storage.getItem("pt.upload.v3::local:up-9")).toBeTruthy();
 		// 不发 POST /api/uploads（复用任务）；第一片 offset = 恢复的 24
 		expect(h.fetchCalls().some((c) => c.url === "/api/uploads" && c.opts.method === "POST")).toBe(false);
 			expect(FakeXHR.instances[0].open).toHaveBeenCalledWith(
@@ -385,7 +408,9 @@ describe("大文件走 Upload V2（/api/uploads + 分片 PUT + commit）", () =>
 			}) as unknown as typeof fetch;
 			const h = loadApp(fetchImpl);
 			const file = bigFile(THRESHOLD + 16);
-			h.storage.setItem("pt.upload.v2::big.svs:" + file.size + ":42",
+			// v2 键经一次性迁移进 v3（同上：账户域 local:up-c）
+			const v2Key = "pt.upload.v2::big.svs:" + file.size + ":42";
+			h.storage.setItem(v2Key,
 				JSON.stringify({ upload_id: "up-c", declared_size: file.size, chunk_size: 8 }));
 			h.uploadFile(file);
 			await flush();

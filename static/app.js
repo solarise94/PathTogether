@@ -117,7 +117,8 @@
 
   // ---------- 全局状态 ----------
   var state = {
-    slide: null,          // 当前切片 {name,width,height,mppX,mppY,mppSource}
+    slide: null,          // 当前切片 {id,name,display_name,width,height,mppX,mppY,mppSource,revision}
+                          // id=slide_id 唯一操作键（P2 合同 §5.1）；name=legacy 名（显示/快照）
     mppX: null,           // 当前生效的 µm/px
     // 升级 C（§6.1）：单一「矩形」入口。roiMode 为工具激活标志（null|"rect"）；
     // 选区本身是 level-0 像素矩形 roi={x,y,w,h}（权威几何，§6.2）。
@@ -132,7 +133,8 @@
     showAnno: false,      // 是否在画布层显示已保存标注
     focusAnno: null,      // null=显示全部；否则只显示该条标注（flatItems 中的引用）
     channelReopening: false, // 通道配色重开（同一切片换 TileSource，非新切片）
-    // 上次已发 slide.opened 的 "name|revision" 键：去重依据（见 emitSlideOpened）
+    // 上次已发 slide.opened 的 "id|revision" 键：去重依据（见 emitSlideOpened；
+    // P2 合同 §5.5：键切 id，旧后端无 id 时回落 name）
     lastSlideOpenedKey: null,
   };
 
@@ -1098,9 +1100,13 @@
     return null;
   }
 
-  function annoBadgeText(slideName) {
+  function annoBadgeText(ref) {
     if (!allAnnotationsBySlide) return null;
-    var grps = allAnnotationsBySlide[slideName];
+    // by_slide 索引键是名称快照（后端口径：legacy 名/original_filename 快照）；
+    // ref（slide_id 或旧后端的名）先解析到名再查（P2 合同 §5.1：入口按 id 定位；
+    // P3 起 id_bundle 行 name=None——快照键回落 original_filename）
+    var sinfo = findSlideInfo(ref);
+    var grps = allAnnotationsBySlide[(sinfo && (sinfo.name || sinfo.original_filename)) || ref];
     if (!grps || grps.length === 0) return null;
     var total = 0;
     var seen = {};
@@ -1138,10 +1144,17 @@
       .catch(function () { allAnnotationsBySlide = {}; });
   }
 
-  // 某切片是否属于任一项目
-  function isSlideInAnyProject(slideName) {
+  // 某切片是否属于任一项目（P2：项目 DTO 带 slide_ids；按 id 或名双查——
+  // id_bundle 行/旧后端名数组兼容）
+  function isSlideInAnyProject(s) {
+    var ref = s && (s.slide_id || s.name);
+    if (!ref) return false;
     for (var i = 0; i < allProjects.length; i++) {
-      if (allProjects[i].slides && allProjects[i].slides.indexOf(slideName) >= 0) {
+      var p = allProjects[i];
+      if (s.slide_id && (p.slide_ids || []).indexOf(s.slide_id) >= 0) {
+        return true;
+      }
+      if (p.slides && p.slides.indexOf(s.name) >= 0) {
         return true;
       }
     }
@@ -1182,6 +1195,10 @@
     if (!researchTelemetry || !state.slide) return;
     if (previewState) return; // 预览态不是用户本人操作（服务端亦 403 兜底）
     researchTelemetry.startSlide({
+      // P2 合同 §5：slide_id 随 spec 下发（采集模块建会话时仍按 slide 名提交
+      // ——服务端 /api/research/viewing-sessions 白名单尚未收 slide_id 字段，
+      // 会话伪名已由服务端按 slide_id 派生（R-11）；后端补字段后切 body 双发）
+      slide_id: state.slide.id || null,
       slide: state.slide.name,
       width: state.slide.width,
       height: state.slide.height,
@@ -1260,9 +1277,10 @@
     });
   }
 
-  // slide.opened 发射（name|revision 去重）。语义是「插件应按此切片重置/恢复
-  // 状态」：键相同（同切片同 revision，如换配色重开）跳过——不重置插件 AI
-  // 会话；键变化（切换切片，或同名文件替换 → revision 变化）必然重发。
+  // slide.opened 发射（id|revision 去重，P2 合同 §5.5；旧后端无 id 回落
+  // name|revision）。语义是「插件应按此切片重置/恢复状态」：键相同（同切片同
+  // revision，如换配色重开）跳过——不重置插件 AI 会话；键变化（切换切片，或
+  // 同名文件替换 → revision 变化）必然重发。
   // 正常路径与 channelReopening 轻量路径都必须走这里：多通道切片带本地持久化
   // 配色时，「首开默认 token → applySelection 同步 viewer.close() + 置位重开」
   // 时序下第一次 open 事件被 close 吃掉、第二次 open 只会从轻量路径到达——
@@ -1270,12 +1288,17 @@
   // 恢复/切片替换保护全部失效）；发了则由键去重保证纯换配色不重发、且两次
   // open 事件无论谁先到达都恰好送达一次。
   function emitSlideOpened() {
-    if (!state.slide || !state.slide.name) return;
-    var key = state.slide.name + "|" + (state.slide.revision || "");
+    if (!state.slide || !(state.slide.id || state.slide.name)) return;
+    var key = (state.slide.id || state.slide.name) + "|" + (state.slide.revision || "");
     if (key === state.lastSlideOpenedKey) return;
     state.lastSlideOpenedKey = key;
     hpEmit("slide.opened", { slide: {
-      name: state.slide.name, width: state.slide.width, height: state.slide.height,
+      // P2 合同 §5.5：载荷主键 id；name/display_name 为兼容快照（旧插件按
+      // name 解析当前切片——退役条件 P6 插件全面切 id）
+      id: state.slide.id || null,
+      name: state.slide.name,
+      display_name: state.slide.display_name || null,
+      width: state.slide.width, height: state.slide.height,
       mppX: state.slide.mppX, mppY: state.slide.mppY,
       // 资产 revision（服务端口径 = "mtime_ns:size"）：插件快照回看时比对
       // view.slide_revision，检测切片被替换（宽容缺省 → null，保护退化为不拦截）
@@ -1323,8 +1346,9 @@
       // 管理员标注工具在任意打开的切片上可用（箭头/描图不依赖 mpp）
       els.annoArrowBtn.disabled = false;
       els.annoFreeBtn.disabled = false;
-      // 拉取该切片标注
-      apiFetch("/api/annotations?slide=" + encodeURIComponent(state.slide.name))
+      // 拉取该切片标注（P2 合同 §3.1：?slide_id= 优先，旧后端 ?slide=<名>）
+      var annoQuery = annotationsQueryFor(state.slide);
+      apiFetch(annoQuery)
         .then(function (r) { return r.json(); })
         .then(function (data) {
           currentAnnotations = data;
@@ -1433,7 +1457,9 @@
 
   function createChannelController() {
     return HP_Channels.createChannelController({
-      adapter: window.HP_API,
+      // P2：通道读端点按 ID 通道（/api/slides/<id>/tiles|dzi|thumbnail）；
+      // render-context 走 by-name（后端缺口，见 channelControlsAdapter 注释）
+      adapter: channelControlsAdapter(),
       viewer: viewer,
       button: els.channelBtn,
       badge: els.rgbBadge,
@@ -1461,14 +1487,12 @@
         }
         if (baseThumbEl) baseThumbEl.src = url;
       },
-      // 409 slide_revision_conflict：只刷新 info 并重建一次（§6.3）
+      // 409 slide_revision_conflict：只刷新 info 并重建一次（§6.3）。
+      // slide ID 化（P2）：按当前切片操作键（id 优先；旧后端回落 name）刷新
       refreshInfo: function () {
         if (!state.slide) return Promise.resolve(null);
-        var adapter = window.HP_API;
-        var url = (adapter && adapter.slideInfoUrl)
-          ? adapter.slideInfoUrl(state.slide.name)
-          : "/api/slide/" + encodeURIComponent(state.slide.name) + "/info";
-        return apiFetch(url).then(function (r) { return r.json(); });
+        return apiFetch(slideInfoUrl(state.slide.id || state.slide.name))
+          .then(function (r) { return r.json(); });
       },
     });
   }
@@ -1481,20 +1505,172 @@
     } catch (e) { /* 非 DOM 环境忽略 */ }
   }
 
+  // =========================================================================
+  // slide ID 化（P2 合同 §5）：切片操作键 = slide_id。
+  // -------------------------------------------------------------------------
+  // 能力协商唯一口径（合同 §5.6）：HP_APP_BOOTSTRAP.capabilities.slide_id_api
+  // 由服务端注入（本版本起恒 true）；false/缺省 = 旧后端 → 全链回落 name
+  // 通道（旧端点 /api/slide/<name>/...）。
+  // 退役条件：P6 拆除 name 回落时删除本 helper 与全部调用点的回落分支。
+  function slideIdApiOn() {
+    try {
+      var caps = window.HP_APP_BOOTSTRAP && window.HP_APP_BOOTSTRAP.capabilities;
+      return !!(caps && caps.slide_id_api === true);
+    } catch (e) { return false; }
+  }
+
+  // 列表/行显示名（合同 §5.4）：display_name 优先，空则 original_filename/
+  // legacy 名；title 辅助显示 original_filename。
+  function slideDisplayName(s) {
+    return String((s && (s.display_name || s.original_filename || s.name)) || "");
+  }
+
+  // 切片操作键：ID 通道 = slide_id；旧后端（列表 DTO 无 slide_id）回落
+  // legacy 文件名——与列表行 data-slide-id 同源（P6 拆除 name 回落）。
+  function slideRefOf(s) {
+    return String((s && (s.slide_id || s.id)) || (s && s.name) || "");
+  }
+  function activeSlideRef() {
+    return state.slide ? String(state.slide.id || state.slide.name) : "";
+  }
+
+  // 读端点 URL 族（ID 通道 /api/slides/<id>/...；旧后端 /api/slide/<name>/...）。
+  // demo 通道保留 adapter.slideInfoUrl 兼容分支（demo.js 一直是 slide_id 通道）。
+  function slideInfoUrl(ref) {
+    var adapter = window.HP_API;
+    if (adapter && adapter.slideInfoUrl && adapter.mode === "demo") {
+      return adapter.slideInfoUrl(ref);
+    }
+    return slideIdApiOn()
+      ? "/api/slides/" + encodeURIComponent(ref) + "/info"
+      : "/api/slide/" + encodeURIComponent(ref) + "/info";
+  }
+  function slideDziUrl(ref) {
+    var adapter = window.HP_API;
+    if (adapter && adapter.dziUrl && adapter.mode === "demo") {
+      return adapter.dziUrl(ref);
+    }
+    return slideIdApiOn()
+      ? "/api/slides/" + encodeURIComponent(ref) + "/dzi"
+      : "/api/slide/" + encodeURIComponent(ref) + ".dzi";
+  }
+  function slideThumbnailUrl(ref, renderToken, qualityQuery) {
+    var adapter = window.HP_API;
+    if (adapter && adapter.thumbnailUrl && adapter.mode === "demo") {
+      return adapter.thumbnailUrl(ref, renderToken, qualityQuery);
+    }
+    var base = slideIdApiOn()
+      ? "/api/slides/" + encodeURIComponent(ref) + "/thumbnail"
+      : "/api/slide/" + encodeURIComponent(ref) + "/thumbnail";
+    return base + tileQueryJoin(renderToken, qualityQuery);
+  }
+
+  // 瓦片/缩略图 query 拼接（画质前置 ?profile=&dv=、render 后置；与
+  // app-mode.js tileUrlQuery 同一顺序，image-transport-upgrade §5.2）
+  function tileQueryJoin(renderToken, qualityQuery) {
+    var parts = [];
+    if (qualityQuery) parts.push(String(qualityQuery).replace(/^\?/, ""));
+    if (renderToken) parts.push("render=" + encodeURIComponent(renderToken));
+    return parts.length ? "?" + parts.join("&") : "";
+  }
+
+  // 通道控制器 adapter（P2 合同 §5.1）：ID 通道读端点 /api/slides/<id>/...
+  // （dzi/tiles/thumbnail 族已上线）。render-context 后端暂无 by-id 端点
+  // （P2 后端缺口，见交付报告）——按当前切片 legacy 名走旧通道；render
+  // token 本就按 slide_id 绑定（R-15），URL 形态不影响 token 有效性。
+  // demo 页不经此包装（app.js 只在 official 页加载；demo.js 自带 id 通道）。
+  function channelControlsAdapter() {
+    var base = window.HP_API || {};
+    return {
+      mode: base.mode || "official",
+      tileUrl: function (id, level, x, y, renderToken, qualityQuery) {
+        var seg = slideIdApiOn()
+          ? "/api/slides/" + encodeURIComponent(id) + "/tiles/" + level +
+            "/" + x + "_" + y + ".jpeg"
+          : "/api/slide/" + encodeURIComponent(id) + "_files/" + level +
+            "/" + x + "_" + y + ".jpeg";
+        return seg + tileQueryJoin(renderToken, qualityQuery);
+      },
+      thumbnailUrl: function (id, renderToken, qualityQuery) {
+        return slideThumbnailUrl(id, renderToken, qualityQuery);
+      },
+      dziUrl: function (id) {
+        return slideDziUrl(id);
+      },
+      normalizeRenderContext: function (id, body) {
+        // by-name 端点（缺口见上）：ID 通道时 id 是 slide_id，换成当前切片名
+        var name = (state.slide && state.slide.name) || id;
+        if (base.normalizeRenderContext) {
+          return base.normalizeRenderContext(name, body);
+        }
+        return apiFetch("/api/slide/" + encodeURIComponent(name) + "/render-context", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body || {}),
+        });
+      },
+    };
+  }
+  // 裁剪（升级 C v2 矩形 x/y/w/h；render token 可选）
+  function slideCropUrl(ref, r, token) {
+    if (slideIdApiOn()) {
+      return "/api/slides/" + encodeURIComponent(ref) +
+        "/crop?x=" + Math.round(r.x) + "&y=" + Math.round(r.y) +
+        "&w=" + Math.round(r.w) + "&h=" + Math.round(r.h) +
+        (token ? "&render=" + encodeURIComponent(token) : "");
+    }
+    return "/api/slide/" + encodeURIComponent(ref) +
+      "/crop?x=" + Math.round(r.x) + "&y=" + Math.round(r.y) +
+      "&w=" + Math.round(r.w) + "&h=" + Math.round(r.h) +
+      (token ? "&render=" + encodeURIComponent(token) : "");
+  }
+
+  // 当前切片标注查询（合同 §3.1：?slide_id= 优先；旧后端 ?slide=<名>）
+  function annotationsQueryFor(s) {
+    var ref = s ? (s.id || s.name) : "";
+    if (!ref) return null;
+    if (slideIdApiOn() && s && s.id) {
+      return "/api/annotations?slide_id=" + encodeURIComponent(s.id);
+    }
+    return "/api/annotations?slide=" + encodeURIComponent(ref);
+  }
+
+  // 行 key（data-slide-id；旧后端=name）→ 写通道载荷（合同 §3.2/§4）：
+  // ID 通道发 slide_ids（解析不到 ID 的行剔除——列表外资产不参与），
+  // 旧后端发 slides(名)。
+  function slidePayloadRef(ref) {
+    if (ref == null || ref === "") return null;
+    if (!slideIdApiOn()) return ref;
+    var s = findSlideInfo(ref);
+    return (s && s.slide_id) || null;
+  }
+  function slideRefsPayload(refs) {
+    var out = [];
+    (refs || []).forEach(function (r) {
+      var v = slidePayloadRef(r);
+      if (v) out.push(v);
+    });
+    return slideIdApiOn() ? { slide_ids: out } : { slides: out };
+  }
+
   // ---------- 打开切片 ----------
-  function openSlide(name) {
+  // ref = slide_id（ID 通道，唯一操作键）；slideIdApiOn()=false 的旧后端由
+  // 调用方传 legacy 文件名（列表行 data-slide-id 同源）。
+  function openSlide(ref) {
     // 切换切片前移除旧底图
     clearBaseThumb();
-    var adapter = window.HP_API;
-    var url = (adapter && adapter.slideInfoUrl)
-      ? adapter.slideInfoUrl(name)
-      : "/api/slide/" + encodeURIComponent(name) + "/info";
-    apiFetch(url)
+    apiFetch(slideInfoUrl(ref))
       .then(function (r) { return r.json(); })
       .then(function (info) {
         if (info.error) { toast(t("open.fail", { e: info.error }), "error"); return; }
         state.slide = {
+          // slide ID 化（P2 合同 §5.1）：id = slide_id 唯一操作键；name 保持
+          // legacy 文件名（显示/快照）；旧后端 DTO 无 slide_id → id 为 null，
+          // 全链回落按 name 比对
+          id: info.slide_id || null,
           name: info.name,
+          display_name: info.display_name || info.alias || "",
+          original_filename: info.original_filename || "",
           width: info.width,
           height: info.height,
           mppX: info.mpp_x,
@@ -1510,7 +1686,7 @@
         updateViewerEmptyState();
         // §3.4：常驻 #current-slide 已下架——切片名进 document.title
         //（"切片名 · PathTogether Beta"）；侧栏选中行/切片信息菜单/面板标题仍在。
-        updateDocTitle(info.alias || info.name);
+        updateDocTitle(slideDisplayName(state.slide) || info.name);
         updateMppSetterVisibility();
         exitRoi();
         // Wave 3（普通图片兼容）：缺物理标尺（mpp_source="missing"）时单位区
@@ -1532,25 +1708,24 @@
         if (window.HP_Channels) {
           channelCtrl = channelCtrl || createChannelController();
           plan = channelCtrl.handleInfo(info, {
+            // 通道配色/storageKey 键：ID 通道=slide_id；旧后端回落 name
             id: info.slide_id || info.name,
             scope: userScope(),
           });
         }
         if (!plan || plan.kind !== "render") {
-          baseThumbEl.src = (adapter && adapter.thumbnailUrl)
-            ? adapter.thumbnailUrl(name)
-            : "/api/slide/" + encodeURIComponent(name) + "/thumbnail";
-          viewer.open((adapter && adapter.dziUrl)
-            ? adapter.dziUrl(name)
-            : "/api/slide/" + encodeURIComponent(name) + ".dzi");
+          baseThumbEl.src = slideThumbnailUrl(ref);
+          viewer.open(slideDziUrl(ref));
         } else if (plan.thumbnailUrl && baseThumbEl && !baseThumbEl.src) {
           // render 计划首开（多通道 / RGB 画质路径）：底图预览由计划提供
           // （缩略图与瓦片同 context；仅当未设置过 src 时补设）
           baseThumbEl.src = plan.thumbnailUrl;
         }
-        // 高亮列表项（未归类与项目切片行）
+        // 高亮列表项（未归类与项目切片行）：按 data-slide-id（= slide_id；
+        // 旧后端列表无 slide_id 时 dataset 键回落 name，P6 拆 name 回落）
+        var activeRef = String(ref);
         document.querySelectorAll(".slide-row").forEach(function (it) {
-          it.classList.toggle("active", it.dataset.name === name);
+          it.classList.toggle("active", String(it.dataset.slideId) === activeRef);
         });
         // 手机端：打开切片后自动收起侧栏抽屉，让用户立刻看到查看器；
         // 收起后走统一布局同步（抽屉关闭 + viewer resize 链，§4.2）。
@@ -2247,19 +2422,13 @@
   function saveCrop() {
     if (!state.slide || !rectToolActive()) return;
     var r = state.roi;
-    var name = state.slide.name;
+    // P2 合同 §4：crop 走 /api/slides/<id>/crop（ID 通道）；旧后端按名
+    var ref = state.slide.id || state.slide.name;
     // Batch 4（§4.4）：多通道切片 crop 与屏幕瓦片同 render_token（服务端用同
     // 一 context 合成，且像素预算按启用通道数计）；RGB/legacy 不带参数
     var token = (channelCtrl && channelCtrl.isMultichannel())
       ? channelCtrl.getToken() : null;
-    var adapter = window.HP_API;
-    // 升级 C（§6.3-5）：v2 矩形走 x/y/w/h（输出尺寸精确等于 w/h）
-    var url = (adapter && adapter.cropUrl)
-      ? adapter.cropUrl(name, Math.round(r.x), Math.round(r.y), Math.round(r.w), token)
-      : "/api/slide/" + encodeURIComponent(name) +
-        "/crop?x=" + Math.round(r.x) + "&y=" + Math.round(r.y) +
-        "&w=" + Math.round(r.w) + "&h=" + Math.round(r.h) +
-        (token ? "&render=" + encodeURIComponent(token) : "");
+    var url = slideCropUrl(ref, r, token);
     var fp8 = ((channelCtrl && channelCtrl.getFingerprint()) || "").slice(0, 8);
     var multi = !!(channelCtrl && channelCtrl.isMultichannel() && token);
     var originalText = els.saveBtn.textContent;
@@ -2275,7 +2444,8 @@
         return res.blob();
       })
       .then(function (blob) {
-        var stem = name.replace(/\.[^.]+$/, "");
+        var stem = (state.slide.original_filename || state.slide.name)
+          .replace(/\.[^.]+$/, "");
         // 下载文件名与后端 Content-Disposition 同形：含宽高 + 多通道 fp 前 8 位
         var fname = stem + "_x" + Math.round(r.x) + "_y" + Math.round(r.y) +
           "_" + Math.round(r.w) + "x" + Math.round(r.h) + "px" +
@@ -2490,38 +2660,48 @@
   }
 
   // 切片行（项目展开体内 / 未归类）。unfiled=true 时显示复选框。
-  function renderSlideRow(sname, unfiled) {
-    var sinfo = findSlideInfo(sname);
+  // sname 是行的显示/列表定位名；操作键 sid = slide_id（P2 合同 §5.1；
+  // 列表外资产/旧后端回落 name——与 data-slide-id 同源）。
+  function renderSlideRow(sname, unfiled, sinfoHint) {
+    // sinfoHint：调用方已持有列表项（renderUnfiled）时直用，省一次线性查找，
+    // 也覆盖 P3 起 id_bundle 行（name=None，按名查不到）——操作键仍取 slide_id
+    var sinfo = sinfoHint || findSlideInfo(sname);
+    var sid = (sinfo && sinfo.slide_id) || sname;
     var row = document.createElement("div");
     row.className = "slide-row";
+    // 操作键：data-slide-id（ID 通道=slide_id；旧后端=name）。
+    // data-name 保留：搜索（applySlideFilter）与显示用（P6 拆 name 回落时评估收窄）
+    row.dataset.slideId = sid;
     row.dataset.name = sname;
-    if (state.slide && state.slide.name === sname) row.classList.add("active");
+    if (state.slide && activeSlideRef() === String(sid)) row.classList.add("active");
 
     // 所有切片行（项目内 + 未归类）都带复选框，可勾选用于分享/新建项目
     var cb = document.createElement("input");
     cb.type = "checkbox";
     cb.className = "slide-check";
     cb.title = t("proj.cb.title");
-    if (slideChecked[sname]) cb.checked = true;
+    if (slideChecked[sid]) cb.checked = true;
     cb.addEventListener("click", function (ev) { ev.stopPropagation(); });
-    cb.addEventListener("change", function () { slideChecked[sname] = cb.checked; });
+    cb.addEventListener("change", function () { slideChecked[sid] = cb.checked; });
     row.appendChild(cb);
 
     var mid = document.createElement("div");
     mid.className = "slide-mid";
     var failed = (sinfo && sinfo.error) || (!sinfo);
-    var alias = (sinfo && sinfo.alias) || "";
+    // 主显示名（P2 合同 §5.4）：display_name 优先（alias 已从 display_name
+    // 派生），空则文件名；title 辅助显示 original_filename
+    var dispName = sinfo ? slideDisplayName(sinfo) : "";
 
-    // 第一行：名称独占整行（别名优先，无别名则截断文件名）；第二行：标注
+    // 第一行：名称独占整行（显示名优先，无显示名则截断文件名）；第二行：标注
     // pill（标记/作者数）；第三行：meta（工单 B 布局：名称与徽章分行，窄
     // 侧栏/长英文名互不挤压，截断保留可辨认编号）
     var top = document.createElement("div");
     top.className = "slide-top";
     var nameEl = document.createElement("span");
     nameEl.className = "slide-name";
-    if (alias) {
+    if (dispName && dispName !== sname) {
       nameEl.classList.add("alias-first");
-      nameEl.innerHTML = esc(alias) +
+      nameEl.innerHTML = esc(dispName) +
         '<span class="alias-filename">' + esc(truncateMiddle(sname, 20)) + "</span>";
     } else {
       nameEl.textContent = truncateMiddle(sname, 24) + (failed ? t("slide.read.fail.short") : "");
@@ -2533,7 +2713,7 @@
     mid.appendChild(top);
 
     // 标注 pill（独立次行，不再与名称同行）
-    var badgeText = annoBadgeText(sname);
+    var badgeText = annoBadgeText(sid);
     if (badgeText) {
       var badges = document.createElement("div");
       badges.className = "slide-badges";
@@ -2543,7 +2723,7 @@
       badge.title = t("slide.anno.badge.title");
       badge.addEventListener("click", function (e) {
         e.stopPropagation();
-        openSlide(sname);
+        openSlide(sid);
         // 打开后自动展开标注面板
         setTimeout(function () { openAnnoPanel(); }, 600);
       });
@@ -2572,7 +2752,7 @@
     editBtn.title = t("slide.op.alias");
     editBtn.addEventListener("click", function (ev) {
       ev.stopPropagation();
-      enterSlideMetaEdit(row, sname, sinfo);
+      enterSlideMetaEdit(row, sname, sinfo, sid);
     });
     row.appendChild(editBtn);
 
@@ -2583,11 +2763,12 @@
     shareBtn.title = t("slide.op.share");
     shareBtn.addEventListener("click", function (ev) {
       ev.stopPropagation();
-      doCreateShare([sname]);
+      doCreateShare([sid]);
     });
     row.appendChild(shareBtn);
 
-    // 删除按钮（hover 浮现）
+    // 删除按钮（hover 浮现）。删除 P2 仍按名（DELETE /api/slide/<name> 是
+    // 旧路由；ID 删除 P5 才出——本阶段不动，见合同阶段划分）
     var delBtn = document.createElement("button");
     delBtn.className = "slide-del";
     delBtn.textContent = "×";
@@ -2595,7 +2776,8 @@
     delBtn.addEventListener("click", function (ev) { ev.stopPropagation(); deleteSlide(sname); });
     row.appendChild(delBtn);
 
-    // Demo 目录按钮（仅 owner；加入后无需登录即可从互联网访问，docs §5.1）
+    // Demo 目录按钮（仅 owner；加入后无需登录即可从互联网访问，docs §5.1）。
+    // admin demo-catalog 写通道 P2 保持按名（不动管理写通道）
     var demoBtn = document.createElement("button");
     demoBtn.className = "slide-demo";
     demoBtn.type = "button";
@@ -2607,7 +2789,7 @@
     row.appendChild(demoBtn);
     updateDemoBtn(demoBtn, sname);
 
-    row.addEventListener("click", function () { openSlide(sname); });
+    row.addEventListener("click", function () { openSlide(sid); });
     return row;
   }
 
@@ -2669,10 +2851,10 @@
     });
   }
 
-  // 行内别名/备注编辑态
-  function enterSlideMetaEdit(row, sname, sinfo) {
+  // 行内别名/备注编辑态。sid 是该行操作键（slide_id；旧后端=名）
+  function enterSlideMetaEdit(row, sname, sinfo, sid) {
     if (!row) return;
-    var alias0 = (sinfo && sinfo.alias) || "";
+    var alias0 = (sinfo && (sinfo.display_name || sinfo.alias)) || "";
     var note0 = (sinfo && sinfo.note) || "";
     // 清空行内容，替换为编辑表单
     row.innerHTML = "";
@@ -2700,11 +2882,24 @@
     function commit() {
       var alias = aInput.value;
       var note = nInput.value;
-      apiFetch("/api/slide/" + encodeURIComponent(sname) + "/meta", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ alias: alias, note: note }),
-      })
+      // P2 合同 §7：ID 通道 PATCH /api/slides/<slide_id>（display_name 是唯一
+      // 可编辑展示名，R-02）；旧后端回落 POST /api/slide/<name>/meta（alias
+      // 入参服务端映射 display_name）
+      var req;
+      if (slideIdApiOn() && sid) {
+        req = apiFetch("/api/slides/" + encodeURIComponent(sid), {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ display_name: alias, note: note }),
+        });
+      } else {
+        req = apiFetch("/api/slide/" + encodeURIComponent(sname) + "/meta", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ alias: alias, note: note }),
+        });
+      }
+      req
         .then(function (r) {
           if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("save.fail")); });
           return r.json();
@@ -2727,16 +2922,21 @@
     });
   }
 
-  function findSlideInfo(name) {
+  // 列表查找（P2 合同 §5.1：按 id 定位；旧后端/名称快照按名——两个键空间
+  // 不相交：slide_id 是 sld_ 前缀服务端随机串，文件名带扩展名）
+  function findSlideInfo(ref) {
+    if (ref == null) return null;
     for (var i = 0; i < allSlides.length; i++) {
-      if (allSlides[i].name === name) return allSlides[i];
+      if (allSlides[i].slide_id === ref || allSlides[i].name === ref) {
+        return allSlides[i];
+      }
     }
     return null;
   }
 
   // ---------- 未归类切片 ----------
   function renderUnfiled() {
-    var unfiled = allSlides.filter(function (s) { return !isSlideInAnyProject(s.name); });
+    var unfiled = allSlides.filter(function (s) { return !isSlideInAnyProject(s); });
     els.unfiledCount.textContent = String(unfiled.length);
     els.unfiledList.innerHTML = "";
     if (unfiled.length === 0) {
@@ -2748,8 +2948,13 @@
       applySlideFilter(getSlideQuery());
       return;
     }
+    // 同显示名（display_name）条目用列表自带的日期/序号辅助信息区分，
+    // 不改 ID（P2 合同 §5.4：同名条目按 data-slide-id 各自定位）。
+    // P3 起 id_bundle 行 name=None：行定位名回落 original_filename，再回落
+    // slide_id（显示键非操作键——操作键恒为 dataset.slideId）
     unfiled.forEach(function (s) {
-      els.unfiledList.appendChild(renderSlideRow(s.name, true));
+      els.unfiledList.appendChild(renderSlideRow(
+        s.name || s.original_filename || slideRefOf(s), true, s));
     });
     // 升级 A：列表重渲后重放当前搜索条件（搜索条件不因收起/重渲丢失）
     applySlideFilter(getSlideQuery());
@@ -2807,22 +3012,26 @@
         : t("pcd.slides.empty.hint");
     }
     if (!n) return;
-    projectDialog.slides.forEach(function (name) {
+    projectDialog.slides.forEach(function (ref) {
+      // P2：草稿键是行操作键（slide_id）；chip 主显示 display_name/名，
+      // title 辅助原始名/ID
+      var sinfo = findSlideInfo(ref);
+      var disp = sinfo ? (slideDisplayName(sinfo) || sinfo.name) : ref;
       var chip = document.createElement("span");
       chip.className = "pcd-slide-chip";
       var label = document.createElement("span");
       label.className = "pcd-slide-chip-name";
-      label.textContent = truncateMiddle(name, 28);
-      label.title = name;
+      label.textContent = truncateMiddle(disp, 28);
+      label.title = (sinfo && sinfo.name) || ref;
       chip.appendChild(label);
       var rm = document.createElement("button");
       rm.type = "button";
       rm.className = "pcd-slide-chip-remove";
       rm.textContent = "×";
-      rm.setAttribute("aria-label", t("pcd.slides.remove", { name: truncateMiddle(name, 20) }));
+      rm.setAttribute("aria-label", t("pcd.slides.remove", { name: truncateMiddle(disp, 20) }));
       rm.addEventListener("click", function () {
         if (projectDialog.inFlight) return;  // 提交中不允许改草稿
-        projectDialog.slides = projectDialog.slides.filter(function (s) { return s !== name; });
+        projectDialog.slides = projectDialog.slides.filter(function (s) { return s !== ref; });
         renderProjectDialogSlides();
       });
       chip.appendChild(rm);
@@ -2933,10 +3142,13 @@
     els.pcdConfirm.disabled = true;
     els.pcdConfirm.textContent = t("pcd.creating");
     var headers = { "Content-Type": "application/json", "Idempotency-Key": idemKey };
+    // P2 合同 §3.2：ID 通道发 slide_ids（草稿键是行操作键 slide_id；旧后端
+    // 回落 slides 名数组）
     apiFetch("/api/project/create", {
       method: "POST",
       headers: headers,
-      body: JSON.stringify({ name: name, note: note, slides: slides }),
+      body: JSON.stringify(Object.assign(
+        { name: name, note: note }, slideRefsPayload(slides))),
     })
       .then(function (r) {
         return r.json().then(function (j) {
@@ -3066,16 +3278,18 @@
       row.className = "picker-item";
       var cb = document.createElement("input");
       cb.type = "checkbox";
-      cb.value = s.name;
+      // 选择器键 = 行操作键（slide_id；旧后端回落名）
+      cb.value = slideRefOf(s);
       cb.addEventListener("change", function () {
-        pickerCtx.selected[s.name] = cb.checked;
+        pickerCtx.selected[cb.value] = cb.checked;
         updatePickerCount();
       });
       row.appendChild(cb);
       var info = document.createElement("span");
       info.className = "pi-info";
-      var nameHtml = s.alias
-        ? '<span class="pi-alias">' + esc(s.alias) + "</span>" +
+      var dispName = slideDisplayName(s);
+      var nameHtml = (dispName && dispName !== s.name)
+        ? '<span class="pi-alias">' + esc(dispName) + "</span>" +
           '<span class="alias-filename">' + esc(truncateMiddle(s.name, 24)) + "</span>"
         : esc(truncateMiddle(s.name, 30));
       info.innerHTML = '<span class="pi-name">' + nameHtml + "</span>" +
@@ -3100,21 +3314,22 @@
   }
 
   function confirmSlidePicker() {
-    var slides = Object.keys(pickerCtx.selected).filter(function (k) { return pickerCtx.selected[k]; });
-    if (slides.length === 0) { toast(t("picker.need.slide"), "error"); return; }
+    var refs = Object.keys(pickerCtx.selected).filter(function (k) { return pickerCtx.selected[k]; });
+    if (refs.length === 0) { toast(t("picker.need.slide"), "error"); return; }
     var pid = pickerCtx.targetPid;
     if (!pid) return;
+    // P2 合同 §3.2：ID 通道发 slide_ids（picker 键=行操作键）；旧后端 slides(名)
     apiFetch("/api/project/" + encodeURIComponent(pid) + "/slides", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ slides: slides }),
+      body: JSON.stringify(slideRefsPayload(refs)),
     })
       .then(function (r) {
         if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("picker.add.fail")); });
         return r.json();
       })
       .then(function () {
-        toast(t("picker.added", { n: slides.length }), "success");
+        toast(t("picker.added", { n: refs.length }), "success");
         closeSlidePicker();
         reloadProjectsAndUnfiled();
       })
@@ -3161,9 +3376,10 @@
     return "6/6.5mm";
   }
 
-  // 统一创建分享入口：slides 为要分享的切片名数组
-  function doCreateShare(slides) {
-    if (!slides || slides.length === 0) { toast(t("share.need.slide"), "error"); return; }
+  // 统一创建分享入口：refs 为要分享的切片操作键数组（data-slide-id；旧后端
+  // =名）。P2 合同 §4：ID 通道发 slide_ids；旧后端回落 slides(名)。
+  function doCreateShare(refs) {
+    if (!refs || refs.length === 0) { toast(t("share.need.slide"), "error"); return; }
     var hours = getExpiresHours();
     if (hours == null) { toast(t("share.need.hours"), "error"); return; }
     var roiSizes = getShareRoiSizes();
@@ -3176,10 +3392,10 @@
     apiFetch("/api/share/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        slides: slides, expires_hours: hours, roi_sizes: roiSizes,
+      body: JSON.stringify(Object.assign({
+        expires_hours: hours, roi_sizes: roiSizes,
         permissions: permissions, rect_policy: rectPolicy,
-      }),
+      }, slideRefsPayload(refs))),
     })
       .then(function (r) {
         if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || (t("share.create.fail") + " " + r.status)); });
@@ -3202,11 +3418,15 @@
       });
   }
 
-  // 分享本项目
+  // 分享本项目（项目 DTO 的 slides 是名数组；ID 通道逐名解析成 slide_id 作
+  // 操作键，列表外资产保持名——payload 构建时按通道裁决）
   function shareProject(p) {
     var slides = p.slides || [];
     if (slides.length === 0) { toast(t("share.project.empty"), "error"); return; }
-    sharePendingSlides = slides.slice();
+    sharePendingSlides = slides.map(function (n) {
+      var s = findSlideInfo(n);
+      return (s && s.slide_id) || n;
+    });
     // 展开分享管理区，预填提示
     var shareSec = els.shareMgrBody.closest(".section");
     if (shareSec) shareSec.classList.remove("collapsed");
@@ -4510,10 +4730,14 @@
   function submitAnnotationDraft(draft) {
     if (!state.slide) return;
     if (drawPhase === "saving") return; // 保存中禁止重复提交
-    var slideName = state.slide.name;   // 冻结提交时的切片
+    var slideName = state.slide.name;   // 冻结提交时的切片（名称快照）
+    var slideId = state.slide.id || null;  // 冻结提交时的 slide_id（P2 操作键）
     var label = (els.annoLabelInput.value || "").trim();
     if (!label) label = t("anno.default.user");
+    // P2 合同 §3.1：slide_id（权威）+ slide（名称快照）双字段并存；同名不同
+    // ID 资产由服务端按 slide_id 裁决（两字段冲突会 400，前端不做猜测）
     var body = { slide: slideName, type: draft.kind, label: label, shared: false, note: "" };
+    if (slideId) body.slide_id = slideId;
     for (var k in draft.geom) body[k] = draft.geom[k];
     // 幂等键：重试沿用同一键（双击/重试不产生第二条）
     body.client_action_id = draft.clientActionId ||
@@ -4533,8 +4757,12 @@
         return r.json();
       })
       .then(function (j) {
-        // 切片已切换：回包不污染新切片（草稿静默丢弃，不套用/不选中）
-        if (!state.slide || state.slide.name !== slideName) {
+        // 切片已切换：回包不污染新切片（草稿静默丢弃，不套用/不选中；
+        // P2：按 slide_id 比对，旧后端/无 id 回落名）
+        var slideSwitched = !state.slide || (slideId
+          ? String(state.slide.id) !== String(slideId)
+          : state.slide.name !== slideName);
+        if (slideSwitched) {
           retryDraft = null;
           drawPreview = null;
           drawPointer = null;
@@ -4553,10 +4781,12 @@
             annotationId: j && j.annotation_id,
           });
         }
-        // 撤销单元 = 语义操作（这次创建），压入撤销栈（限定本身份/本切片）
+        // 撤销单元 = 语义操作（这次创建），压入撤销栈（限定本身份/本切片；
+        // P2：切片作用域按 slide_id，旧数据/旧后端回落名）
         var entry = pushUndoEntry({
           kind: "create",
           slide: slideName,
+          slide_id: slideId,
           userId: currentUserId,
           annoKind: draft.kind,
           geom: JSON.parse(JSON.stringify(draft.geom)),
@@ -5076,7 +5306,12 @@
 
   function undoEntryInScope(entry) {
     if (!entry) return false;
-    if (entry.slide && state.slide && entry.slide !== state.slide.name) return false;
+    // P2：切片作用域按 slide_id 比对；旧条目（无 slide_id）/旧后端回落名比对
+    if (entry.slide_id && state.slide && state.slide.id) {
+      if (String(entry.slide_id) !== String(state.slide.id)) return false;
+    } else if (entry.slide && state.slide && entry.slide !== state.slide.name) {
+      return false;
+    }
     if (entry.userId != null && currentUserId != null &&
         String(entry.userId) !== String(currentUserId)) return false;
     return true;
@@ -5370,7 +5605,7 @@
   // 重新拉取当前切片标注并重绘（工单 D：返回 Promise 供「选中新标注」等待）
   function refreshCurrentAnnotations() {
     if (!state.slide) { redrawAnnoCanvas(); return Promise.resolve(); }
-    return apiFetch("/api/annotations?slide=" + encodeURIComponent(state.slide.name))
+    return apiFetch(annotationsQueryFor(state.slide))
       .then(function (r) { return r.json(); })
       .then(function (data) {
         currentAnnotations = data;
@@ -5396,7 +5631,9 @@
     hpRequest("panel.toggle", { open: false }).catch(function () { /* 插件未启用：静默 */ });
     annoPanelOpen = true;
     els.annoPanel.style.display = "flex";
-    els.annoPanelTitle.textContent = t("anno.panel.title.with", { name: truncateMiddle(state.slide.name, 28) });
+    // P2 合同 §5.4：面板标题主显示 display_name（旧 DTO 回落 name）
+    els.annoPanelTitle.textContent = t("anno.panel.title.with", {
+      name: truncateMiddle(slideDisplayName(state.slide) || state.slide.name, 28) });
     renderAnnoPanel(currentAnnotations.annotations || []);
     updateResearchBusy();  // P3：面板打开取消稳定观察检测
   }
@@ -5908,6 +6145,7 @@
           pushUndoEntry({
             kind: "edit",
             slide: state.slide.name,
+            slide_id: state.slide.id || null,
             userId: currentUserId,
             annotationId: snap.annotationId || it.annotation_id,
             revision: (j && j.revision != null) ? j.revision : it.revision,
@@ -6067,12 +6305,15 @@
   }
 
   // ---------- 删除切片 ----------
+  // P2：删除仍按名（DELETE /api/slide/<name> 是旧路由；ID 删除 P5 才出——
+  // 本阶段不动，sname 来自列表行的 legacy 名）
   function deleteSlide(name) {
     if (!confirm(t("del.slide.confirm", { name: name }))) return;
     apiFetch("/api/slide/" + encodeURIComponent(name), { method: "DELETE" })
       .then(function (r) {
         if (!r.ok) return r.json().then(function (j) { throw new Error(j.error); });
-        if (state.slide && state.slide.name === name) {
+        if (state.slide && (state.slide.name === name ||
+                            (state.slide.id && state.slide.id === name))) {
           state.slide = null; state.mppX = null; state.roiMode = null;
           updateDocTitle(null);
           updateMppSetterVisibility();
@@ -6213,11 +6454,119 @@
     return file.size >= UPLOAD_V2_THRESHOLD;
   }
 
-  function uploadResumeKey(file) {
-    // 文件指纹（名+大小+mtime）：刷新后据此找回未完成任务（§3.5 断点恢复）
-    return "pt.upload.v2::" + (file.name || "") + ":" + file.size + ":" +
-      (file.lastModified || 0);
+  // ---------- 上传续传键（P2 合同 §5.3：账户域 + upload_id 键） ----------
+  // v3 键形如 pt.upload.v3::<account>:<upload_id>；值 {upload_id, declared_size,
+  // chunk_size, filename, slide_id}（filename/size 供用户辨认与刷新后按文件
+  // 匹配；slide_id 是字段位，committed 响应回填）。换账户不复用会话：键含
+  // 账户域，天然隔离。v2 键（pt.upload.v2::<名>:<size>:<mtime>，无账户域）只做
+  // 一次性只读迁移：能映射 upload_id 的迁入 v3，迁完删旧键。
+  var UPLOAD_RESUME_V3_PREFIX = "pt.upload.v3::";
+  var UPLOAD_RESUME_V2_PREFIX = "pt.upload.v2::";
+
+  function uploadAccountScope() {
+    // 账户域 = 当前登录标识（预览中为被预览用户，与 userScope 同源）；
+    // 匿名/未知回落 local
+    return String(currentUserId || "local");
   }
+
+  function uploadResumeKeyPrefix() {
+    return UPLOAD_RESUME_V3_PREFIX + uploadAccountScope() + ":";
+  }
+
+  // v2 → v3 一次性迁移（幂等：迁完删旧键，重复执行无残留可迁）
+  function migrateUploadV2ResumeKeys() {
+    try {
+      var doomed = [];
+      for (var i = 0; i < localStorage.length; i++) {
+        var k = localStorage.key(i);
+        if (!k || k.indexOf(UPLOAD_RESUME_V2_PREFIX) !== 0) continue;
+        try {
+          var v = JSON.parse(localStorage.getItem(k) || "null");
+        } catch (e) { doomed.push(k); continue; }  // 畸形旧键：清理
+        if (!v || !v.upload_id) { doomed.push(k); continue; }  // 无任务号：作废
+        // v2 键尾部两段是 size:mtime——从右解析出文件名（文件名本身可含 ":"）
+        var rest = k.slice(UPLOAD_RESUME_V2_PREFIX.length);
+        var m1 = rest.lastIndexOf(":");
+        var m2 = rest.lastIndexOf(":", m1 - 1);
+        var fname = m2 > 0 ? rest.slice(0, m2) : "";
+        var migrated = {
+          upload_id: v.upload_id,
+          declared_size: (typeof v.declared_size === "number")
+            ? v.declared_size : Number(rest.slice(m2 + 1, m1)) || 0,
+          chunk_size: v.chunk_size || null,
+          filename: fname,
+          slide_id: null,  // v2 值无 slide_id；committed 时由响应回填
+        };
+        localStorage.setItem(uploadResumeKeyPrefix() + v.upload_id,
+                             JSON.stringify(migrated));
+        doomed.push(k);
+      }
+      doomed.forEach(function (k) { localStorage.removeItem(k); });
+    } catch (e) { /* localStorage 不可用：跳过迁移 */ }
+  }
+
+  // 当前账户域的全部 v3 续传记录（首次访问顺带执行 v2 迁移）
+  function uploadResumeEntries() {
+    migrateUploadV2ResumeKeys();
+    var out = [];
+    try {
+      var prefix = uploadResumeKeyPrefix();
+      for (var i = 0; i < localStorage.length; i++) {
+        var k = localStorage.key(i);
+        if (!k || k.indexOf(prefix) !== 0) continue;
+        try {
+          var v = JSON.parse(localStorage.getItem(k) || "null");
+        } catch (e) { continue; }
+        if (v && v.upload_id && typeof v.declared_size === "number") out.push(v);
+      }
+    } catch (e) { /* localStorage 不可用 */ }
+    return out;
+  }
+
+  // 刷新后按文件找回未完成任务（§3.5 断点恢复；v3 起按 filename+size 匹配
+  // 账户域内的记录——文件名/大小只是候选，权威是服务端 GET 状态）
+  function uploadResumeFind(file) {
+    var entries = uploadResumeEntries();
+    for (var i = 0; i < entries.length; i++) {
+      if (entries[i].filename === (file && file.name) &&
+          entries[i].declared_size === (file && file.size)) {
+        return entries[i];
+      }
+    }
+    return null;
+  }
+
+  function uploadResumeSave(task, file, slideId) {
+    try {
+      localStorage.setItem(uploadResumeKeyPrefix() + task.upload_id, JSON.stringify({
+        upload_id: task.upload_id,
+        declared_size: file.size,
+        chunk_size: task.chunk_size,
+        filename: file.name || "",
+        slide_id: slideId || null,
+      }));
+    } catch (e) { /* localStorage 不可用：仅失去刷新恢复 */ }
+  }
+
+  // 上传完成后的打开目标（P2 合同 §5.2）：slide_id 唯一；旧后端响应缺
+  // slide_id 时才按名回落，且 console.debug 标注回落（P3 拆除回落）。
+  // **禁止**按 file.name/canonical_name 猜打开目标（同名不同 ID 会串片）。
+  function uploadedTarget(body, file) {
+    var b = body || {};
+    var sid = b.slide_id || null;
+    // 展示/回落名：沿用旧逻辑口径（ready+canonical_name 优先，再响应名/slide，
+    // 最后本地文件名）
+    var name = ((b.state === "ready" && b.canonical_name) || b.name ||
+                b.slide || b.canonical_name) ||
+               ((file && file.name) || "");
+    if (!sid) {
+      console.debug(
+        "[slide-id] 上传响应缺 slide_id，按名回落打开（旧后端兼容，P3 拆除）:",
+        name);
+    }
+    return { id: sid, name: name };
+  }
+
 
   function sha256Hex(buf) {
     // 单片哈希：Web Crypto 只需该片入内存（整文件哈希受限于无增量 API，
@@ -6299,12 +6648,12 @@
   }
 
   function uploadFileV2(file, row) {
-    var key = uploadResumeKey(file);
+    var resumeKey = null;   // pt.upload.v3::<account>:<upload_id>（创建/续传时定）
     var task = null;
     Promise.resolve().then(function () {
-      // 1) 刷新恢复：按文件指纹找未完成任务，GET 状态后从 confirmed_offset 续传
-      var saved = null;
-      try { saved = JSON.parse(localStorage.getItem(key) || "null"); } catch (e) { saved = null; }
+      // 1) 刷新恢复：按文件（名+大小）在当前账户域找未完成任务，GET 状态后
+      //    从 confirmed_offset 续传
+      var saved = uploadResumeFind(file);
       if (!saved || !saved.upload_id || saved.declared_size !== file.size) return null;
       row.setStage("upload.stage.transferring", 0);
       return apiFetch("/api/uploads/" + encodeURIComponent(saved.upload_id))
@@ -6314,11 +6663,17 @@
             if (!body) return null;
             if (body.state === "committed") {
               // commit 已收口但转换入队/响应可能丢失：重放 commit 取 conversion_job_id
+              resumeKey = uploadResumeKeyPrefix() + saved.upload_id;
               return { upload_id: saved.upload_id, committed: true,
                        chunk_size: body.chunk_size,
                        offset: body.confirmed_offset | 0 };
             }
             if (body.state !== "active") return null;
+            resumeKey = uploadResumeKeyPrefix() + saved.upload_id;
+            // committed 前 slide_id 恒 null；防御性回填（服务端若已带）
+            if (body.slide_id) uploadResumeSave(
+              { upload_id: saved.upload_id, chunk_size: body.chunk_size },
+              file, body.slide_id);
             return { upload_id: saved.upload_id,
                      chunk_size: body.chunk_size,
                      offset: body.confirmed_offset | 0 };
@@ -6341,11 +6696,8 @@
           task = { upload_id: body.upload_id,
                    chunk_size: body.chunk_size,
                    offset: body.confirmed_offset | 0 };
-          try {
-            localStorage.setItem(key, JSON.stringify({
-              upload_id: task.upload_id, declared_size: file.size,
-              chunk_size: task.chunk_size }));
-          } catch (e) { /* localStorage 不可用：仅失去刷新恢复 */ }
+          resumeKey = uploadResumeKeyPrefix() + task.upload_id;
+          uploadResumeSave(task, file, null);
         });
       });
     }).then(function () {
@@ -6363,18 +6715,18 @@
         return body;
       });
     }).then(function (body) {
-      try { localStorage.removeItem(key); } catch (e) { /* 同上 */ }
+      try { if (resumeKey) localStorage.removeItem(resumeKey); } catch (e) { /* 同上 */ }
       if (body && body.conversion_job_id && body.state && body.state !== "ready") {
-        return pollConversionJob(body, row);
+        return pollConversionJob(body, row, file);
       }
-      var openName = (body && body.state === "ready" && body.canonical_name)
-        ? body.canonical_name : file.name;
+      // P2 合同 §5.2：打开目标 = 响应 slide_id（唯一）；缺字段才按名回落
+      var target = uploadedTarget(body, file);
       row.setStage("upload.stage.done");
       row.finish();
-      toast(t("upload.done", { name: openName }), "success");
+      toast(t("upload.done", { name: target.name }), "success");
       loadAll();
-      importAssociateUploaded(openName);   // W4：上传行自身的目标关联（若有）
-      openSlide(openName);
+      importAssociateUploaded(target.id, target.name);   // W4：上传行自身的目标关联（若有）
+      openSlide(target.id || target.name);
     }).catch(function (err) {
       var data = (err && err.data) || null;
       var status = (err && err.status) || 0;
@@ -6391,7 +6743,7 @@
       if (code === "hash_mismatch" || code === "invalid_slide" ||
           code === "slide_open_unsupported" || code === "slide_open_failed" ||
           code === "name_unavailable" || code === "size_mismatch") {
-        try { localStorage.removeItem(key); } catch (e) { /* 同上 */ }
+        try { if (resumeKey) localStorage.removeItem(resumeKey); } catch (e) { /* 同上 */ }
       }
       row.markError();
       row.setStage("upload.stage.failed");
@@ -6407,7 +6759,10 @@
   //  - 其他非 2xx / 网络异常：显示「暂时无法获取进度」并退避重试，绝不永久判失败；
   //  - ready：保持既有行为（完成 + 刷新 + 打开本行上传的切片——这是上传行
   //    自身的原行为，不属于持久任务列表的自动抢占）；失败/取消仍以后端为准。
-  function pollConversionJob(body, row) {
+  //  - P2 合同 §5.2：ready 打开目标 = 响应 slide_id（当前轮询 GET 响应不带
+  //    slide_id——用刷新后的列表按 canonical 名解析；两处都无才按名回落并
+  //    console.debug 标注）。
+  function pollConversionJob(body, row, file) {
     var jobId = body.conversion_job_id;
     var canonical = body.canonical_name;
     row.setStage("upload.stage.converting");
@@ -6457,12 +6812,28 @@
           var st = res.body && res.body.state;
           if (st === "ready") {
             var name = (res.body.canonical_name || canonical);
+            var target = uploadedTarget(res.body, file);
             row.setStage("upload.stage.done");
             row.finish();
             toast(t("upload.done", { name: name }), "success");
-            loadAll();
-            importAssociateUploaded(name);   // W4：上传行自身的目标关联（若有）
-            if (name) openSlide(name);
+            // 列表刷新完成后再解析打开目标：响应带 slide_id 直接用；否则按
+            // canonical 名在刷新后的 /api/slides 里解析 slide_id（ID 通道不
+            // 按名猜资产——解析不到才回落名，见 uploadedTarget）
+            loadAll().then(function () {
+              var ref = target.id;
+              if (!ref) {
+                var s = findSlideInfo(name);
+                ref = (s && s.slide_id) || null;
+              }
+              if (!ref) {
+                console.debug(
+                  "[slide-id] 转换 ready 无 slide_id（响应与列表均未解析到），按名回落打开（旧后端兼容）:",
+                  name);
+                ref = name;
+              }
+              importAssociateUploaded(ref, name);   // W4：上传行自身的目标关联（若有）
+              openSlide(ref);
+            });
             return;
           }
           if (st === "failed" || st === "cancelled") {
@@ -6523,17 +6894,17 @@
       try { data = JSON.parse(xhr.responseText); } catch (e) { row.finish(); toast(t("upload.parse.fail"), "error"); return; }
       if (xhr.status >= 200 && xhr.status < 300) {
         if (data && data.conversion_job_id && data.state && data.state !== "ready") {
-          pollConversionJob(data, row);
+          pollConversionJob(data, row, file);
           return;
         }
-        var openName = (data && data.state === "ready" && data.canonical_name)
-          ? data.canonical_name : data.name;
+        // P2 合同 §5.2：打开目标 = 响应 slide_id（唯一）；缺字段才按名回落
+        var target = uploadedTarget(data, file);
         row.setStage("upload.stage.done");
         row.finish();
-        toast(t("upload.done", { name: openName }), "success");
+        toast(t("upload.done", { name: target.name }), "success");
         loadAll();
-        importAssociateUploaded(openName);   // W4：上传行自身的目标关联（若有）
-        openSlide(openName);
+        importAssociateUploaded(target.id, target.name);   // W4：上传行自身的目标关联（若有）
+        openSlide(target.id || target.name);
       } else {
         row.markError();
         row.setStage("upload.stage.failed");
@@ -6653,8 +7024,11 @@
   function cosJobSave(job) {
     if (!job || !job.job_id) return;
     var jobs = cosJobsRead().filter(function (j) { return j.job_id !== job.job_id; });
+    // P2 合同 §5.3：COS jobs 记录补 slide_id 字段位（匹配/续传仍按 job_id；
+    // slide_id 随 status 响应出现时由 drive() 回填）
     jobs.push({
       job_id: job.job_id, filename: job.filename, size: job.size,
+      slide_id: job.slide_id || null,
       confirmed: (job.confirmed || []).slice().sort(function (a, b) { return a - b; }),
     });
     cosJobsWrite(jobs);
@@ -6861,6 +7235,12 @@
         if (stopped) throw { cancelled: true };
         if (!res.ok) throw { status: res.status, data: res.body };
         var b = res.body || {};
+        // P2 合同 §5.3：status 响应出现 slide_id（随 slide 出现）即回填本地
+        // 记录（job_id 仍是匹配键）
+        if (b.slide_id && jobId) {
+          cosJobSave({ job_id: jobId, filename: file.name, size: file.size,
+                       slide_id: b.slide_id, confirmed: confirmedList() });
+        }
         var st = b.stage;
         if (st === "waiting_space") {
           cosShowStage(row, b);
@@ -7004,15 +7384,16 @@
     }
 
     function succeed(b) {
-      // viewable：照 V2 commit 后的跳转习惯（完成 → 刷新列表 → 关联 → 打开）
+      // viewable：照 V2 commit 后的跳转习惯（完成 → 刷新列表 → 关联 → 打开）。
+      // P2 合同 §5.2：打开目标 = 响应 slide_id（唯一）；缺字段才按名回落
       cosJobRemove(jobId);
-      var name = b.slide || file.name;
+      var target = uploadedTarget(b, file);
       row.setStage("upload.stage.done");
       row.finish();
-      toast(t("upload.done", { name: name }), "success");
+      toast(t("upload.done", { name: target.name }), "success");
       loadAll();
-      importAssociateUploaded(name);
-      openSlide(name);
+      importAssociateUploaded(target.id, target.name);
+      openSlide(target.id || target.name);
     }
 
     Promise.resolve().then(function () {
@@ -7294,8 +7675,10 @@
 
   // 上传成功后的目标关联（W4）：有目标才动作；目标被删/权限撤销 → 提示
   // 关联失败，产物保留在未归类（不静默改目标）。
-  function importAssociateUploaded(slideName) {
-    if (!slideName) return Promise.resolve();
+  // P2 合同 §3.2：slideId 可得时发 {slide_ids:[...]}；旧后端/缺 id 回落
+  // {slides:[名]}。
+  function importAssociateUploaded(slideId, slideName) {
+    if (!slideId && !slideName) return Promise.resolve();
     var st = importTargetState;
     if (!st.pid && !st.newProjectName) return Promise.resolve();
     var ensureProject;
@@ -7319,13 +7702,14 @@
       });
     }
     return ensureProject.then(function (pid) {
+      var payload = slideId ? { slide_ids: [slideId] } : { slides: [slideName] };
       return apiFetch("/api/project/" + encodeURIComponent(pid) + "/slides", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ slides: [slideName] }),
+        body: JSON.stringify(payload),
       }).then(jsonBody).then(function (res) {
         if (!res.ok) throw new Error((res.body && res.body.error) || t("imp.assoc.fail"));
-        toast(t("imp.assoc.ok", { name: truncateMiddle(slideName, 24) }), "success");
+        toast(t("imp.assoc.ok", { name: truncateMiddle(slideName || slideId, 24) }), "success");
         return reloadProjectsAndUnfiled();
       });
     }).catch(function (e) {
@@ -7621,9 +8005,18 @@
         openBtn.className = "btn secondary small";
         openBtn.textContent = t("imp.task.open");
         openBtn.addEventListener("click", function () {
-          // 用户显式点击才打开（持久列表绝不自动抢占正在看的切片）
+          // 用户显式点击才打开（持久列表绝不自动抢占正在看的切片）。
+          // P2：任务视图无 slide_id——按 canonical 名在列表解析 id 后打开；
+          // 列表外/解析不到回落名（console.debug 由调用侧统一，P3 拆除）
           var n = job.canonical_name || job.source_name;
-          if (n) openSlide(n);
+          if (!n) return;
+          var s = findSlideInfo(n);
+          var ref = (s && s.slide_id) || null;
+          if (!ref) {
+            console.debug("[slide-id] 转换任务打开无 slide_id，按名回落（旧后端兼容）:", n);
+            ref = n;
+          }
+          openSlide(ref);
         });
         row.appendChild(openBtn);
       } else if (job.state === "failed" || job.state === "cancelled") {
@@ -8889,6 +9282,17 @@
     catch (e) { return Promise.reject({ code: "plugin_disabled" }); }
   }
 
+  // stale 比对（P2 合同 §5.5）：请求携带的 slide 标识按 id 比对；旧插件载荷
+  // 只带 name 的兼容分支——按 name 解析比对（退役条件：P6 插件侧全面切 id
+  // 后删除 name 分支）。宽容缺省：不带 slide 时不拒绝。
+  function bridgeSlideStale(p) {
+    if (!state.slide || p.slide == null || p.slide === "") return false;
+    var ref = String(p.slide);
+    if (state.slide.id && ref === String(state.slide.id)) return false;
+    if (ref === String(state.slide.name)) return false;
+    return true;
+  }
+
   // 注册 host 侧能力（在 init 中调用，viewer 在 initViewer 后才就绪）
   function registerHostBridgeHandlers() {
     var host = window.HostBridgeHost;
@@ -8920,7 +9324,10 @@
     // annotation.focus）
     host.onRequest("slide.getCurrent", gate("slide.getCurrent", function () {
       if (!state.slide) return null;
-      return { name: state.slide.name, width: state.slide.width, height: state.slide.height,
+      // P2 合同 §5.5：返回含 id（slide_id 操作键）+ name/display_name 快照
+      return { id: state.slide.id || null, name: state.slide.name,
+               display_name: state.slide.display_name || null,
+               width: state.slide.width, height: state.slide.height,
                mppX: state.slide.mppX, mppY: state.slide.mppY };
     }));
     host.onRequest("selection.getBbox", gate("selection.getBbox", function () { return currentSelectionBbox(); }));
@@ -8945,9 +9352,10 @@
       // （文档 {x,y,level} 在本阶段以 level-0 bbox 表达，agent 全程在图像坐标系工作）
       // R1（2026-09-05）：viewer 未就绪/几何非法回真实 error code，不再吞异常
       // 仍报 ok:true；请求携带 slide 标识且与当前切片不符（过期操作）时拒绝
-      // （宽容缺省：旧插件不带 slide 时不拒绝）。
+      // （宽容缺省：旧插件不带 slide 时不拒绝；stale 比对按 id，见
+      // bridgeSlideStale——旧插件 name 载荷走兼容分支）。
       p = p || {};
-      if (p.slide && state.slide && String(p.slide) !== String(state.slide.name)) {
+      if (bridgeSlideStale(p)) {
         throw { code: "stale_slide", message: "导航请求属于另一切片", retryable: false };
       }
       if (!viewer || !viewer.viewport) {
@@ -8964,9 +9372,9 @@
     host.onRequest("viewer.highlight", gate("viewer.highlight", function (p) {
       // 插件叠加层：写入平台 aiOverlay 并重绘画布（替代插件直接写 aiOverlay/redrawAnnoCanvas）。
       // R1：逐框几何校验，非法回 invalid_geometry；slide 标识不符拒绝过期画框
-      // （宽容缺省：旧插件不带时不拒绝）。
+      // （宽容缺省：旧插件不带时不拒绝；stale 比对按 id，见 bridgeSlideStale）。
       p = p || {};
-      if (p.slide && state.slide && String(p.slide) !== String(state.slide.name)) {
+      if (bridgeSlideStale(p)) {
         throw { code: "stale_slide", message: "画框请求属于另一切片", retryable: false };
       }
       var boxes = Array.isArray(p.boxes) ? p.boxes : [];
@@ -8988,7 +9396,8 @@
     // 回 {ok:true, applied:false}，插件侧据此显示「历史配色未知」，不伪称一致。
     host.onRequest("viewer.applyRenderContext", gate("viewer.applyRenderContext", function (p) {
       p = p || {};
-      if (p.slide && state.slide && String(p.slide) !== String(state.slide.name)) {
+      // stale 比对按 id（见 bridgeSlideStale；旧插件 name 载荷走兼容分支）
+      if (bridgeSlideStale(p)) {
         throw { code: "stale_slide", message: "配色恢复请求属于另一切片", retryable: false };
       }
       var ctx = p.render_context;
@@ -9106,6 +9515,7 @@
   function createPluginAnnotation(p) {
     if (!state.slide) throw { code: "annotation_create_failed", message: "当前无切片", retryable: false };
     p = p || {};
+    // P2 合同 §3.1：slide_id（权威）+ slide（名称快照）双字段并存
     var body = {
       slide: state.slide.name,
       type: "rect",
@@ -9113,6 +9523,7 @@
       x: Math.round(Number(p.x) || 0),
       y: Math.round(Number(p.y) || 0),
     };
+    if (state.slide.id) body.slide_id = state.slide.id;
     var pw = Number(p.w), ph = Number(p.h), ps = Number(p.side_px);
     if (isFinite(pw) && pw > 0 && isFinite(ph) && ph > 0) {
       // v2：w/h 直通（插件的矩形不再被取 max 转正方形）
@@ -9321,6 +9732,9 @@
     if (!bbox) return null;
     return {
       kind: "viewport",
+      // P2 合同 §5：slide_id 操作键 + slide 名称快照并存（插件侧按 id 归档，
+      // 旧插件按 name——退役条件 P6）
+      slide_id: (state.slide && state.slide.id) || null,
       slide: state.slide.name,
       bbox: bbox,
       click_point: clickPt || null,
@@ -9340,6 +9754,7 @@
     try { geom = snapshotGeom(it); } catch (e) { geom = null; }
     return {
       kind: "marker",
+      slide_id: (state.slide && state.slide.id) || null,
       slide: state.slide.name,
       bbox: bbox,   // 标注包围盒（发送时作为冻结 viewport，不重查实时视野）
       click_point: clickPt || null,
@@ -9516,6 +9931,19 @@
     // 升级 A：启动时无切片，显示空态入口（openSlide 成功后隐藏）
     updateViewerEmptyState();
     loadAll();
+    // P2 合同 §5.1：?slide=<slide_id> URL 通道——加载时若带此参数打开对应切片
+    // （与 /s/<token>、/login?next= 无语义冲突；旧链接无此参数不受影响）。
+    // 旧后端（slide_id_api=false）该参数按名回落打开。
+    openSlideFromLocation();
+  }
+
+  function openSlideFromLocation() {
+    var m = null;
+    try { m = location.search.match(/[?&]slide=([^&]+)/); } catch (e) { return; }
+    if (!m) return;
+    var ref = decodeURIComponent(m[1]);
+    if (!ref) return;
+    openSlide(ref);
   }
 
   if (document.readyState === "loading") {
@@ -9590,9 +10018,12 @@
     try { if (sidebarCtrl) sidebarCtrl.refreshButton(); } catch (e) {}
     // 切片搜索（按需创建）：动态控件文案/aria 随语言刷新
     try { refreshSlideSearchTexts(); } catch (e) {}
-    // §3.4：document.title 的产品名后缀随语言刷新（切片名不变）
+    // §3.4：document.title 的产品名后缀随语言刷新（切片名不变；P2：主显示
+    // display_name，旧 DTO 回落 name）
     try {
-      if (state.slide && state.slide.name) updateDocTitle(state.slide.alias || state.slide.name);
+      if (state.slide && state.slide.name) {
+        updateDocTitle(slideDisplayName(state.slide) || state.slide.name);
+      }
     } catch (e) {}
     // 账户 popover 角色文案随语言刷新
     try {

@@ -41,6 +41,29 @@
     for (var i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
     return h.toString(16);
   }
+
+  // ---------- slide ID 化（P2 合同 §5.8） ----------
+  // 分享页整页切 slide_id：chips/openSlide/读端点按 ID；列表条目缺 slide_id
+  // （旧后端/过渡期）时键回落 legacy 名——两键空间不相交（sld_ 前缀 vs 文件
+  // 名带扩展名），回落用 console.debug 标注。后端补齐列表 slide_id 后回落
+  // 分支自然消亡（P6 拆除）。
+  function shareSlideKey(s) {
+    return String((s && (s.slide_id || s.id)) || (s && s.name) || "");
+  }
+
+  // 当前打开切片的 id/name 视图（openSlide 维护；channel adapter 拼 URL 用）
+  var shareView = { id: null, name: null };
+
+  function shareRestBase(key) {
+    // key 是当前切片 slide_id → ID 通道 /api/slides/<id>/...（info/dzi/tiles/
+    // crop/thumbnail 族已上线）；否则按名走旧 /api/slide/<name>/...
+    if (shareView.id && String(key) === String(shareView.id)) {
+      return API + "/api/slides/" + encodeURIComponent(key);
+    }
+    console.debug("[slide-id] 分享列表条目缺 slide_id，按名回落（旧后端兼容）:", key);
+    return API + "/api/slide/" + encodeURIComponent(key);
+  }
+
   function shareChannelAdapter() {
     function renderQuery(renderToken) {
       return renderToken ? "?render=" + encodeURIComponent(renderToken) : "";
@@ -55,23 +78,30 @@
     }
     return {
       mode: "share",
-      normalizeRenderContext: function (id, body) {
-        return fetch(API + "/api/slide/" + encodeURIComponent(id) + "/render-context", {
+      normalizeRenderContext: function (_id, body) {
+        // render-context 无 by-id 端点（P2 后端缺口，报告待补）：按名走旧通道
+        return fetch(API + "/api/slide/" +
+          encodeURIComponent(shareView.name || _id) + "/render-context", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body || {}),
         });
       },
       tileUrl: function (id, level, x, y, renderToken, qualityQuery) {
-        return API + "/api/slide/" + encodeURIComponent(id) + "_files/" + level +
-          "/" + x + "_" + y + ".jpeg" + tileUrlQuery(renderToken, qualityQuery);
+        var base = (shareView.id && String(id) === String(shareView.id))
+          ? API + "/api/slides/" + encodeURIComponent(id) + "/tiles/" + level +
+            "/" + x + "_" + y + ".jpeg"
+          : API + "/api/slide/" + encodeURIComponent(id) + "_files/" + level +
+            "/" + x + "_" + y + ".jpeg";
+        return base + tileUrlQuery(renderToken, qualityQuery);
       },
       thumbnailUrl: function (id, renderToken, qualityQuery) {
-        return API + "/api/slide/" + encodeURIComponent(id) + "/thumbnail" +
-          tileUrlQuery(renderToken, qualityQuery);
+        return shareRestBase(id) + "/thumbnail" + tileUrlQuery(renderToken, qualityQuery);
       },
       dziUrl: function (id) {
-        return API + "/api/slide/" + encodeURIComponent(id) + ".dzi";
+        return (shareView.id && String(id) === String(shareView.id))
+          ? API + "/api/slides/" + encodeURIComponent(id) + "/dzi"
+          : API + "/api/slide/" + encodeURIComponent(id) + ".dzi";
       },
     };
   }
@@ -104,10 +134,11 @@
         }
         if (baseThumbEl) baseThumbEl.src = url;
       },
-      // 409 slide_revision_conflict：只刷新 info 并重建一次（§6.3）
+      // 409 slide_revision_conflict：只刷新 info 并重建一次（§6.3）。
+      // P2：按当前切片操作键（id 优先；列表缺 slide_id 回落名）刷新
       refreshInfo: function () {
         if (!state.slide) return Promise.resolve(null);
-        return fetch(API + "/api/slide/" + encodeURIComponent(state.slide.name) + "/info")
+        return fetch(shareRestBase(state.slide.id || state.slide.name) + "/info")
           .then(function (r) { return r.json(); });
       },
     });
@@ -116,7 +147,7 @@
   // ---------- 全局状态 ----------
   var state = {
     slides: [],          // 该分享的切片集
-    slide: null,         // 当前切片
+    slide: null,         // 当前切片 {id,name,width,height,mppX,mppY,mppSource}（P2：id=slide_id）
     mppX: null,
     roiMode: null,
     roi: { x: 0, y: 0, side: 0 },
@@ -315,7 +346,8 @@
           els.currentSlide.textContent = t("share.slide.unavailable");
           return;
         }
-        openSlide(state.slides[0].name);
+        // P2：默认打开首选切片的操作键（slide_id；列表缺 id 回落名）
+        openSlide(shareSlideKey(state.slides[0]));
       })
       .catch(function (e) {
         if (e.message !== "invalid") toast(t("share.load.fail", { e: e }), "error");
@@ -378,14 +410,20 @@
     state.slides.forEach(function (s) {
       var chip = document.createElement("div");
       chip.className = "chip";
-      var display = s.alias || s.name;
+      // P2 合同 §5.8：chips 操作键 dataset.slideId（= slide_id；列表缺 id 的
+      // 条目回落名——两键空间不相交）；dataset.name 保留供显示/调试
+      var key = shareSlideKey(s);
+      var display = s.display_name || s.alias || s.name;
       chip.textContent = display;
-      chip.title = (s.alias ? s.alias + " (" + s.name + ")" : s.name) + (s.error ? t("share.chip.read.fail") : "");
+      chip.title = ((s.display_name || s.alias)
+        ? (s.display_name || s.alias) + " (" + s.name + ")" : s.name) +
+        (s.error ? t("share.chip.read.fail") : "");
+      chip.dataset.slideId = key;
       chip.dataset.name = s.name;
-      if (state.slide && state.slide.name === s.name) {
+      if (state.slide && String(state.slide.id || state.slide.name) === key) {
         chip.classList.add("active");
       }
-      chip.addEventListener("click", function () { openSlide(s.name); });
+      chip.addEventListener("click", function () { openSlide(key); });
       els.slideChips.appendChild(chip);
     });
   }
@@ -425,12 +463,13 @@
   }
 
   // ---------- 打开切片 ----------
-  function openSlide(name) {
+  // P2 合同 §5.8：ref = slide_id（操作键）；列表条目缺 slide_id 时是 legacy 名
+  function openSlide(ref) {
     // 切换切片前移除旧底图
     clearBaseThumb();
     var info = null;
     for (var i = 0; i < state.slides.length; i++) {
-      if (state.slides[i].name === name) { info = state.slides[i]; break; }
+      if (shareSlideKey(state.slides[i]) === String(ref)) { info = state.slides[i]; break; }
     }
     if (!info) { toast(t("share.not.in.share"), "error"); return; }
     if (info.error || !info.width) {
@@ -439,6 +478,7 @@
     }
 
     state.slide = {
+      id: info.slide_id || null,   // P2：slide_id 操作键（列表缺 id 时为 null → 按名回落）
       name: info.name,
       width: info.width,
       height: info.height,
@@ -446,10 +486,13 @@
       mppY: info.mpp_y,
       mppSource: info.mpp_source,
     };
+    // channel adapter 的 ID 通道判定依据（当前打开切片的 id/name）
+    shareView.id = state.slide.id;
+    shareView.name = state.slide.name;
     state.mppX = info.mpp_x;
     state.rotation = 0;
 
-    els.currentSlide.textContent = info.alias || info.name;
+    els.currentSlide.textContent = info.display_name || info.alias || info.name;
     els.currentSlide.title = info.name + (info.note ? " · " + info.note : "");
     updateMppSetterVisibility();
     exitRoi();
@@ -457,10 +500,11 @@
     // 「普通图片无物理标尺」方向，不引导去填 mpp——那不会改变服务端判定）
     syncRoiScaleAvailability();
 
-    // 高亮 chip
+    // 高亮 chip（P2：按 dataset.slideId 操作键）
+    var activeKey = String(ref);
     var chips = els.slideChips.querySelectorAll(".chip");
     chips.forEach(function (c) {
-      c.classList.toggle("active", c.dataset.name === name);
+      c.classList.toggle("active", String(c.dataset.slideId) === activeKey);
     });
 
     // 创建底图缩略图层：铺在瓦片 canvas 之前（下层），慢网下透出模糊预览
@@ -478,13 +522,15 @@
     if (window.HP_Channels) {
       state.channelCtrl = state.channelCtrl || initChannelController();
       plan = state.channelCtrl.handleInfo(info, {
-        id: info.name,
+        id: String(ref),
         scope: "share:" + strHash(TOKEN),
       });
     }
     if (!plan || plan.kind !== "render") {
-      baseThumbEl.src = API + "/api/slide/" + encodeURIComponent(name) + "/thumbnail";
-      viewer.open(API + "/api/slide/" + encodeURIComponent(name) + ".dzi");
+      baseThumbEl.src = shareRestBase(ref) + "/thumbnail";
+      viewer.open((shareView.id && String(ref) === String(shareView.id))
+        ? API + "/api/slides/" + encodeURIComponent(ref) + "/dzi"
+        : API + "/api/slide/" + encodeURIComponent(ref) + ".dzi");
     }
   }
 
@@ -840,19 +886,22 @@
       return;
     }
     var r = state.roi;
+    // P2 合同 §5.8：ROI POST 带 slide_id（与 slide 名快照并存；服务端 ID 优先）
+    var roiBody = {
+      slide: state.slide.name,
+      type: "rect",
+      x: Math.round(r.x),
+      y: Math.round(r.y),
+      size_mm: state.roiMode,
+      side_px: Math.round(r.side),
+      label: label,
+      note: (els.roiNote ? els.roiNote.value : "") || "",
+    };
+    if (state.slide.id) roiBody.slide_id = state.slide.id;
     fetch(API + "/api/roi", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        slide: state.slide.name,
-        type: "rect",
-        x: Math.round(r.x),
-        y: Math.round(r.y),
-        size_mm: state.roiMode,
-        side_px: Math.round(r.side),
-        label: label,
-        note: (els.roiNote ? els.roiNote.value : "") || "",
-      }),
+      body: JSON.stringify(roiBody),
     })
       .then(function (res) {
         if (!res.ok) {
@@ -874,12 +923,12 @@
     if (!state.slide || state.roiMode == null) return;
     var r = state.roi;
     var name = state.slide.name;
-    // Batch 4（§4.4）：多通道切片 crop 与屏幕瓦片同 render_token；RGB/legacy
-    // 不带参数
+    // P2 合同 §5.8：crop 走 /s/<t>/api/slides/<slide_id>/crop（ID 通道）；
+    // 列表缺 slide_id 时按名回落旧端点
     var token = (state.channelCtrl && state.channelCtrl.isMultichannel())
       ? state.channelCtrl.getToken() : null;
     var multi = !!token;
-    var url = API + "/api/slide/" + encodeURIComponent(name) +
+    var url = shareRestBase(state.slide.id || name) +
       "/crop?x=" + Math.round(r.x) + "&y=" + Math.round(r.y) +
       "&size=" + Math.round(r.side) +
       (multi ? "&render=" + encodeURIComponent(token) : "");
@@ -1954,6 +2003,7 @@
   function saveAnnotation(geom) {
     if (!state.slide) return;
     var slideName = state.slide.name; // 冻结提交时的切片（回包不串片）
+    var slideId = state.slide.id || null;  // P2：冻结 slide_id（操作键）
     var label = (els.roiLabel.value || "").trim();
     if (!label) {
       toast(t("share.label.need"), "error");
@@ -1962,7 +2012,9 @@
       restorePreviewFromGeom(geom);
       return;
     }
+    // P2 合同 §5.8：slide_id（权威）+ slide（名称快照）双字段并存
     var body = { slide: slideName, type: geom.type, label: label };
+    if (slideId) body.slide_id = slideId;
     for (var k in geom) body[k] = geom[k];
     body.note = (els.roiNote ? els.roiNote.value : "") || "";
     fetch(API + "/api/roi", {
@@ -1975,15 +2027,23 @@
         return r.json();
       })
       .then(function () {
-        // 切片已切换：回包不落到新切片（只提示，不改新切片状态）
-        if (!state.slide || state.slide.name !== slideName) return;
+        // 切片已切换：回包不落到新切片（只提示，不改新切片状态；P2：按 id
+        // 比对，缺 id 回落名）
+        var switched = !state.slide || (slideId
+          ? String(state.slide.id) !== String(slideId)
+          : state.slide.name !== slideName);
+        if (switched) return;
         toast(t("anno.saved"), "success");
         exitDrawMode();
         refreshRoisOnce();
       })
       .catch(function (e) {
-        // 失败：可重试草稿——恢复预览、留在工具内（工单 D）
-        if (!state.slide || state.slide.name !== slideName) return;
+        // 失败：可重试草稿——恢复预览、留在工具内（工单 D）；切片已切换
+        // 则不动新切片
+        var switched = !state.slide || (slideId
+          ? String(state.slide.id) !== String(slideId)
+          : state.slide.name !== slideName);
+        if (switched) return;
         restorePreviewFromGeom(geom);
         toast(t("draw.unsaved.retry", { e: e.message }), "error");
       });
@@ -2004,12 +2064,21 @@
   }
 
   // 加载当前切片的标注（本 token + 管理员）供画布层绘制
+  // P2：roi 行携 slide_id 时按 id 匹配当前切片；无 id 历史行按名称快照匹配
+  function roiMatchesCurrentSlide(r) {
+    if (!state.slide || !r) return false;
+    if (state.slide.id && r.slide_id) {
+      return String(r.slide_id) === String(state.slide.id);
+    }
+    return r.slide === state.slide.name;
+  }
+
   function loadCurrentRois() {
     if (!state.slide) { currentRois = []; editItem = null; state.focusAnno = null; state.editing = false; closeEditCard(); redrawAnnoCanvas(); return; }
     fetch(API + "/api/rois")
       .then(function (r) { return r.json(); })
       .then(function (rois) {
-        currentRois = (rois || []).filter(function (r) { return r.slide === state.slide.name; });
+        currentRois = (rois || []).filter(roiMatchesCurrentSlide);
         // 若 editItem 已不在新列表，清除选中
         if (editItem && currentRois.indexOf(editItem) < 0) { editItem = null; state.editing = false; closeEditCard(); }
         if (state.focusAnno && currentRois.indexOf(state.focusAnno) < 0) { state.focusAnno = null; }
@@ -2044,9 +2113,9 @@
         rois = rois || [];
         // 面板渲染（原 loadRoiPanel 逻辑）
         renderRoiPanel(rois);
-        // 画布层数据（原 loadCurrentRois 逻辑）
+        // 画布层数据（原 loadCurrentRois 逻辑；P2：按 id 匹配，无 id 历史行按名）
         if (state.slide) {
-          currentRois = rois.filter(function (r) { return r.slide === state.slide.name; });
+          currentRois = rois.filter(roiMatchesCurrentSlide);
         } else {
           currentRois = [];
         }
@@ -2183,9 +2252,10 @@
       });
   }
 
-  // 跳转到指定 ROI：切到对应切片，OSD open 后定位
+  // 跳转到指定 ROI：切到对应切片，OSD open 后定位。
+  // P2：优先按 roi 的 slide_id 定位操作键；无 id 历史行按名称快照
   function jumpToRoi(r) {
-    var needSwitch = !(state.slide && state.slide.name === r.slide);
+    var needSwitch = !roiMatchesCurrentSlide(r);
     // 跳转后聚焦该标注（focusAnno = 该条引用），让画布只显示它
     var focusAfter = function () {
       var match = null;
@@ -2208,7 +2278,7 @@
         setTimeout(focusAfter, 300);
       };
       viewer.addHandler("open", handler);
-      openSlide(r.slide);
+      openSlide(r.slide_id || r.slide);
     } else {
       doJump(r);
       focusAfter();
@@ -2217,7 +2287,7 @@
 
   // 跳转并在加载完成后选中该标注进入编辑态
   function jumpAndEdit(r) {
-    var needSwitch = !(state.slide && state.slide.name === r.slide);
+    var needSwitch = !roiMatchesCurrentSlide(r);
     var doSelect = function () {
       // 在 currentRois 中找到匹配项（按 index+token）并选中
       var match = null;
@@ -2235,7 +2305,7 @@
         setTimeout(doSelect, 300);
       };
       viewer.addHandler("open", handler);
-      openSlide(r.slide);
+      openSlide(r.slide_id || r.slide);
     } else {
       doJump(r);
       doSelect();

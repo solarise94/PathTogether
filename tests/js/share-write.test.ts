@@ -91,10 +91,11 @@ describe("share.js 写请求契约（token 即凭据，无主站 CSRF 头）", (
 		vi.unstubAllGlobals();
 	});
 
-	it("saveRoi → POST /s/<token>/api/roi，JSON body 完整", () => {
+	it("saveRoi → POST /s/<token>/api/roi，JSON body 完整（P2：带 slide_id + 名快照）", () => {
 		const fetchImpl = vi.fn(() => Promise.resolve(okJson())) as unknown as typeof fetch;
 		const h = loadShare(fetchImpl);
-		h.share.state.slide = { name: "s.svs", width: 100, height: 100, mppX: 0.5, mppSource: "manual" };
+		// P2 合同 §5.8：state.slide 带 id（slide_id）——ROI POST 双字段并存
+		h.share.state.slide = { id: "sld_share00001", name: "s.svs", width: 100, height: 100, mppX: 0.5, mppSource: "manual" };
 		h.share.state.roiMode = 6;
 		h.share.state.roi = { x: 10, y: 20, side: 12 };
 		h.els["roi-label"].value = "病灶";
@@ -107,13 +108,13 @@ describe("share.js 写请求契约（token 即凭据，无主站 CSRF 头）", (
 		expect(opts.headers).toEqual({ "Content-Type": "application/json" });
 		expect(opts.headers).not.toHaveProperty("X-CSRF-Token");
 		const body = JSON.parse(String(opts.body));
-		expect(body).toMatchObject({ slide: "s.svs", type: "rect", label: "病灶", note: "备注" });
+		expect(body).toMatchObject({ slide_id: "sld_share00001", slide: "s.svs", type: "rect", label: "病灶", note: "备注" });
 	});
 
-	it("saveAnnotation（arrow）→ POST /s/<token>/api/roi，几何透传", () => {
+	it("saveAnnotation（arrow）→ POST /s/<token>/api/roi，几何透传（P2：带 slide_id）", () => {
 		const fetchImpl = vi.fn(() => Promise.resolve(okJson())) as unknown as typeof fetch;
 		const h = loadShare(fetchImpl);
-		h.share.state.slide = { name: "s.svs", width: 100, height: 100, mppX: 0.5, mppSource: "manual" };
+		h.share.state.slide = { id: "sld_share00001", name: "s.svs", width: 100, height: 100, mppX: 0.5, mppSource: "manual" };
 		h.els["roi-label"].value = "箭头";
 		h.share.saveAnnotation({ type: "arrow", x1: 1, y1: 2, x2: 3, y2: 4 });
 		const [url, opts] = (fetchImpl as unknown as vi.Mock).mock.calls[0] as [string, RequestInit];
@@ -121,7 +122,7 @@ describe("share.js 写请求契约（token 即凭据，无主站 CSRF 头）", (
 		expect((opts.method as string).toUpperCase()).toBe("POST");
 		expect(opts.headers).not.toHaveProperty("X-CSRF-Token");
 		const body = JSON.parse(String(opts.body));
-		expect(body).toMatchObject({ slide: "s.svs", type: "arrow", label: "箭头", x1: 1, y1: 2, x2: 3, y2: 4 });
+		expect(body).toMatchObject({ slide_id: "sld_share00001", slide: "s.svs", type: "arrow", label: "箭头", x1: 1, y1: 2, x2: 3, y2: 4 });
 	});
 
 	it("deleteRoi → DELETE /s/<token>/api/roi/<index>，无 body/无 CSRF 头", () => {

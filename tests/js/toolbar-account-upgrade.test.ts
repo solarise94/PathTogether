@@ -494,8 +494,9 @@ describe("标注名称迁移 + 矩形 popover（§3.3）", () => {
 	it("app.js 不再把业务状态写入 #current-slide（§3.4）", () => {
 		expect(appSrc).not.toContain("currentSlide");
 		expect(appSrc).toContain("updateDocTitle(");
-		// openSlide / deleteSlide 都经 updateDocTitle
-		expect(appSrc).toMatch(/updateDocTitle\(info\.alias \|\| info\.name\)/);
+		// openSlide / deleteSlide 都经 updateDocTitle。P2（合同 §5.4）：openSlide
+		// 主显示 display_name（slideDisplayName(state.slide)）；deleteSlide 传 null
+		expect(appSrc).toMatch(/updateDocTitle\(slideDisplayName\(state\.slide\) \|\| info\.name\)/);
 		expect(appSrc).toMatch(/updateDocTitle\(null\)/);
 	});
 

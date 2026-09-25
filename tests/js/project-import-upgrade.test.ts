@@ -935,12 +935,18 @@ describe("W4：导入抽屉", () => {
 		h.els["import-target-select"].value = "p1";
 		h.els["import-target-select"].dispatch("change", {});
 		expect(UI.importDrawer.targetState.pid).toBe("p1");
-		await UI.importDrawer.associate("new.svs");
+		// P2 合同 §3.2：associate(slideId, slideName)——有 slide_id 发 slide_ids
+		await UI.importDrawer.associate("sld_imported0001", "new.svs");
 		await flush();
 		const call = h.calls.find((c) => c.url === "/api/project/p1/slides");
 		expect(call).toBeTruthy();
 		expect(call!.opts && call!.opts.method).toBe("POST");
-		expect(JSON.parse(String(call!.opts && call!.opts.body))).toEqual({ slides: ["new.svs"] });
+		expect(JSON.parse(String(call!.opts && call!.opts.body))).toEqual({ slide_ids: ["sld_imported0001"] });
+		// 缺 slide_id（旧后端回落）：按名发 slides
+		await UI.importDrawer.associate(null, "legacy.svs");
+		await flush(24);
+		const call2 = h.calls.filter((c) => c.url === "/api/project/p1/slides").pop();
+		expect(JSON.parse(String(call2!.opts && call2!.opts.body))).toEqual({ slides: ["legacy.svs"] });
 		UI.importDrawer.close();
 	});
 
@@ -950,7 +956,7 @@ describe("W4：导入抽屉", () => {
 		await flush();
 		h.els["import-target-select"].value = "";
 		h.els["import-target-select"].dispatch("change", {});
-		await h.UI.importDrawer.associate("plain.svs");
+		await h.UI.importDrawer.associate(null, "plain.svs");
 		await flush();
 		expect(h.calls.some((c) => /^\/api\/project\/.+\/slides$/.test(c.url))).toBe(false);
 		h.UI.importDrawer.close();

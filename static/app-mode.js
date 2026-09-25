@@ -54,6 +54,14 @@
   }
 
   function officialAdapter() {
+    // P2（slide ID 化）说明：本 adapter 的 slideInfoUrl/dziUrl/thumbnailUrl/
+    // tileUrl/cropUrl 是 **name 通道** 形态（/api/slide/<名>/...），仅作旧后端
+    // 回落与接口兼容保留——official 页的运行时读端点统一由 app.js 的
+    // slideIdApiOn()（HP_APP_BOOTSTRAP.capabilities.slide_id_api）裁决：ID 通道
+    // 走 /api/slides/<slide_id>/...（app.js 的 slideInfoUrl/slideDziUrl/
+    // slideThumbnailUrl/slideCropUrl/channelControlsAdapter）。adapter 仍在用的
+    // 面是 listSlides 与 normalizeRenderContext（后者经 app.js 包装以当前切片
+    // legacy 名调用——render-context 后端暂无 by-id 端点）。
     return {
       mode: "official",
       listSlides: function () { return credFetch("/api/slides"); },

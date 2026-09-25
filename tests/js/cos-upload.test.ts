@@ -359,7 +359,11 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 				const stage = afterComplete[idx];
 				const body: Record<string, unknown> = { job_id: "inj_9", stage, declared_size: 30 };
 				if (stage === "downloading") body.downloaded_bytes = 15;
-				if (stage === "viewable") body.slide = "big.svs";
+				// P2 合同 §5.2：viewable 响应带 slide_id（slide 名快照并存）
+				if (stage === "viewable") {
+					body.slide = "big.svs";
+					body.slide_id = "sld_cos00000001";
+				}
 				return Promise.resolve(resp(body));
 			}
 			if (url === "/api/ingestions/inj_9/parts/sign" && method === "POST") {
@@ -378,7 +382,10 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 			if (url.startsWith("https://")) return Promise.resolve(resp({}));
 			return Promise.resolve(resp({}));
 		}) as unknown as typeof fetch;
-		const h = loadApp(fetchImpl, { mode: "official", capabilities: { cos_upload: cosCaps() } });
+		const h = loadApp(fetchImpl, { mode: "official", capabilities: {
+			slide_id_api: true,
+			cos_upload: cosCaps(),
+		} });
 		h.up.setCosManual(true);
 		const file = cosFile(30);
 		h.up.uploadFile(file);
@@ -434,6 +441,10 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 		await vi.advanceTimersByTimeAsync(2000);   // downloading → viewable
 		await vi.advanceTimersByTimeAsync(0);
 		expect(h.toastMessages.some((m) => m.indexOf("upload.done") >= 0)).toBe(true);
+		// P2 合同 §5.2：viewable 打开目标 = 响应 slide_id（ID 通道 info；绝不
+		// 按 file.name/slide 名猜）
+		expect(h.fetchCalls().some((c) => c.url === "/api/slides/sld_cos00000001/info")).toBe(true);
+		expect(h.fetchCalls().some((c) => c.url === "/api/slide/big.svs/info")).toBe(false);
 		expect(JSON.parse(h.storage.getItem("pt.cos.jobs") || "[]")).toEqual([]);
 	});
 

@@ -28,6 +28,7 @@ const PluginPermissions = require(resolve(here, "../../static/plugin-permissions
 };
 
 const SLIDE = "vp-slide.ndpi";
+const SLIDE_ID = "sld_vp0000000001";
 
 // ---------- 最小假元素（裁自 slide-opened-revision.test.ts harness） ----------
 interface FakeEl extends Record<string, unknown> {
@@ -192,13 +193,14 @@ function bootApp(declaredPerms: string[]): BootResult {
 
 	const fetchImpl = vi.fn((url: string) => {
 		const u = String(url);
-		if (u.includes("/api/slide/" + SLIDE + "/info")) {
-			return jsonResponse({ name: SLIDE, width: 1000, height: 800, mpp_x: 0.5, mpp_y: 0.5, mpp_source: "native" });
+		// P2：ID 通道 /api/slides/<slide_id>/info（harness 注入 slide_id_api）
+		if (u.includes("/api/slides/" + SLIDE_ID + "/info")) {
+			return jsonResponse({ name: SLIDE, slide_id: SLIDE_ID, display_name: "", original_filename: SLIDE, width: 1000, height: 800, mpp_x: 0.5, mpp_y: 0.5, mpp_source: "native" });
 		}
-		if (u.includes("/api/annotations?slide=")) return jsonResponse({ annotations: [] });
+		if (u.includes("/api/annotations?slide_id=")) return jsonResponse({ annotations: [] });
 		if (u.includes("/api/annotations")) return jsonResponse({ by_slide: {} });
 		if (u.includes("/api/slides")) {
-			return jsonResponse([{ name: SLIDE, width: 1000, height: 800, mpp_x: 0.5, mpp_source: "native" }]);
+			return jsonResponse([{ name: SLIDE, slide_id: SLIDE_ID, display_name: "", width: 1000, height: 800, mpp_x: 0.5, mpp_source: "native" }]);
 		}
 		if (u.includes("/api/projects")) {
 			return jsonResponse([{ pid: "p1", name: "P1", slides: [SLIDE], slide_count: 1, roi_count: 0 }]);
@@ -231,6 +233,8 @@ function bootApp(declaredPerms: string[]): BootResult {
 		HP_I18N: { t: (k: string) => k, getLang: () => "zh" },
 		HP_ViewerCore: { create: () => fakeViewer },
 		HP_API: {},
+		// P2：ID 通道能力（slide_id_api=true）
+		HP_APP_BOOTSTRAP: { mode: "official", capabilities: { slide_id_api: true } },
 		HistoPilot: {},
 		PluginPermissions,
 		// 宿主侧权限表：histopilot 声明的 manifest permissions（用例可编程）。
@@ -348,6 +352,36 @@ describe("viewer.getViewport 桥方法（真实 app.js）", () => {
 		);
 		const bbox = app.bridgeHandlers["viewer.getViewport"]({}, { pluginInstallationId: "histopilot" }) as Record<string, number>;
 		expect(bbox).toEqual({ x: 0, y: 0, w: 1000, h: 800 });
+	});
+
+	it("P2：slide.getCurrent 返回 id+name；navigate stale 比对按 id（旧插件 name 载荷兼容）", async () => {
+		const app = bootApp(FULL_PERMS);
+		await settle();
+		findSlideRow(app).dispatch("click");
+		await settle();
+		app.fakeViewer.viewport = makeMockViewport(
+			{ x: 0, y: 0, width: 1, height: 1 },
+			{ x: 0, y: 0, width: 1000, height: 800 },
+		);
+		const cur = app.bridgeHandlers["slide.getCurrent"]({}, { pluginInstallationId: "histopilot" }) as Record<string, unknown>;
+		// P2 合同 §5.5：getCurrent 返回含 id（slide_id 操作键）+ 名快照
+		expect(cur).toMatchObject({ id: SLIDE_ID, name: SLIDE, display_name: null, width: 1000, height: 800 });
+		const nav = app.bridgeHandlers["viewer.navigate"];
+		expect(nav).toBeTruthy();
+		// id 匹配 → 不拒
+		expect(nav({ slide: SLIDE_ID, x: 0, y: 0, w: 100, h: 100 }, { pluginInstallationId: "histopilot" }))
+			.toMatchObject({ ok: true });
+		// 旧插件只带 name → 兼容分支不拒（退役条件 P6）
+		expect(nav({ slide: SLIDE, x: 0, y: 0, w: 100, h: 100 }, { pluginInstallationId: "histopilot" }))
+			.toMatchObject({ ok: true });
+		// 既非 id 也非名 → stale_slide
+		let err: { code?: string } | null = null;
+		try {
+			nav({ slide: "other.svs", x: 0, y: 0, w: 100, h: 100 }, { pluginInstallationId: "histopilot" });
+		} catch (e) {
+			err = e as { code?: string };
+		}
+		expect(err && err.code).toBe("stale_slide");
 	});
 
 	it("权限门：未声明 viewer:navigate → permission_denied；声明后放行", async () => {

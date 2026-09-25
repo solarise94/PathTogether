@@ -210,6 +210,12 @@ _BUSINESS_TABLES = (
     "research_viewing_sessions",
     "research_conversation_items",
     "research_subjects",
+    # 0067 起：slide ID 化重构 P1——upload_task_items/slide_delete_jobs 无
+    # users 外键不随 CASCADE 清空，显式列出防跨用例残留任务项/删除任务；
+    # share_slides 随 shares/slides CASCADE 兜底，显式列出保持口径一致
+    "share_slides",
+    "upload_task_items",
+    "slide_delete_jobs",
 )
 
 @pytest.fixture(scope="session")

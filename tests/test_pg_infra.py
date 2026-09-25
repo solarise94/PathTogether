@@ -288,6 +288,11 @@ def test_schema_migrations_recorded(conn):
         # 0066 起：COS 直传摄取（ingestion_jobs/ingestion_events/cos_pool_state，
         # docs/cos-direct-upload-audit-plan.md §10 Phase 1）
         "0066_ingestion_jobs_cos_pool.sql",
+        # slide ID 化重构 P1（docs/slide-id-refactor-p1-contract-20260925.md
+        # §2）：slides 资产身份八列（storage_layout/storage_relpath/asset_state/
+        # accounted_bytes 等）、任务表显式 slide_id、share_slides 关系表、
+        # 各引用表 slide_id 列、slide_delete_jobs。
+        "0067_slide_asset_identity.sql",
     ]
 
 

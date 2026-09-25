@@ -97,6 +97,9 @@ def _touch(name="demo.svs"):
 
 
 def _share_token(slide):
+    # P2 收口（合同 §4/P1-B2 偏差 #4）：分享创建仅接受已存在资产——
+    # 先注册资产行（夹具顺序调整，断言不变）。
+    share_store.set_slide_meta(slide)
     share = share_store.create_share([slide], 1)
     return share["token"]
 

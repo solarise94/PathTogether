@@ -18,6 +18,7 @@ test_display_jpeg_encoding。运行：
 cd PathTogether && python -m pytest tests/test_viewer_encoding_protocol.py -q
 """
 import io
+import os
 import json
 import sys
 from pathlib import Path
@@ -290,6 +291,7 @@ def test_revoked_share_gets_no_304(monkeypatch):
     monkeypatch.setattr(share_store, "SHARE_FILE",
                         Path(app_mod.UPLOAD_DIR).parent / "share-data"
                         / "shares.json")
+    share_store.set_slide_meta(RGB_NAME)  # P2：分享创建收口——先建行
     share = share_store.create_share([RGB_NAME], 24)
     sc = share_srv.app.test_client()
     url = "/s/%s/api/slide/%s_files/0/0_0.jpeg" % (share["token"], RGB_NAME)
@@ -328,6 +330,26 @@ def test_demo_info_display_without_thumbnail(monkeypatch):
     monkeypatch.setattr(demo_store, "resolve_slide_filename",
                         lambda sid: RGB_NAME if sid == "vep-rgb" else None,
                         raising=False)
+    # P2 收口（合同 §3.4）：demo catalog 项必须 resolve_slide_id 命中——
+    # 夹具补注册 slides 行（slide_id 固定为 catalog 注入值；断言不变）。
+    import psycopg as _psy
+    _conn = _psy.connect(os.environ["DATABASE_URL"])
+    try:
+        with _conn.cursor() as _cur:
+            _cur.execute(
+                "INSERT INTO slides (slide_id, legacy_filename, "
+                "original_filename, display_name, format_ext, asset_state, "
+                "storage_layout, published_at) VALUES "
+                "('vep-rgb', %s, %s, 'vep', 'tif', 'ready', 'legacy', now())",
+                (RGB_NAME, RGB_NAME))
+            # authorize_read 的 allowlist 查 demo_catalog 表（R-10）：
+            # 夹具同时落目录行（catalog_get 的 monkeypatch 保留为直通）。
+            _cur.execute(
+                "INSERT INTO demo_catalog (slide_id, display_name, "
+                "description, is_default) VALUES ('vep-rgb', 'vep', '', TRUE)")
+        _conn.commit()
+    finally:
+        _conn.close()
     c = _client()
     r = c.get("/api/demo/slides/vep-rgb/info")
     assert r.status_code == 200, r.get_data(as_text=True)

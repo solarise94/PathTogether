@@ -189,6 +189,7 @@ def test_add_roi_human_polygon_review_none():
     owner = user_store.create_user("owner-draw@x.com", "ownerpass123456",
                                    role="owner")
     share_store.set_owner_user_id(owner["user_id"])
+    share_store.set_slide_meta("demo.svs")  # P2：分享创建收口——先建行
     tok = share_store.create_share(["demo.svs"], 1)["token"]
     roi = share_store.add_roi(tok, "demo.svs", "人工", type="polygon",
                               points=TRIANGLE)
@@ -389,8 +390,8 @@ def _mock_plugin_channel(monkeypatch, valid=True):
              "created_by_user_id": "u1", "session_id": "sess1"}
     monkeypatch.setattr(
         app_mod, "_verify_run_grant",
-        (lambda gid, slide, inst, expect_session=None: (True, "")) if valid
-        else (lambda gid, slide, inst, expect_session=None: (False, "expired")))
+        (lambda gid, slide, inst, expect_session=None, slide_id=None: (True, "")) if valid
+        else (lambda gid, slide, inst, expect_session=None, slide_id=None: (False, "expired")))
     monkeypatch.setattr(app_mod.share_store, "get_run_grant", lambda gid: grant)
     monkeypatch.setattr(app_mod, "_archived_slide_names", lambda: [])
     monkeypatch.setattr(app_mod.share_store, "get_plugin_installation",

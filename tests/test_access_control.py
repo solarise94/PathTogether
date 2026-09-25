@@ -652,6 +652,7 @@ def test_share_view_only_blocks_annotate():
     _setup_users()
     _touch("demo.svs")
     # 显式 view-only 分享
+    share_store.set_slide_meta("demo.svs")  # P2：分享创建收口——先注册资产行
     share = share_store.create_share(["demo.svs"], 1, permissions=["view"])
     token = share["token"]
     c = _share_client()
@@ -759,6 +760,7 @@ def test_share_visitor_cannot_impersonate_via_copied_id():
     """分享端 ROI 响应不含 visitor；复制明文 cookie 不能冒用他人私有标注。"""
     _setup_users()
     _touch("demo.svs")
+    share_store.set_slide_meta("demo.svs")  # P2：分享创建收口——先注册资产行
     share = share_store.create_share(["demo.svs"], 1)
     token = share["token"]
     c1 = _share_client()
@@ -781,6 +783,7 @@ def test_legacy_plaintext_visitor_reclaim_then_blocks_copy():
     """升级前明文 visitor：原设备 unsigned cookie 可认领；认领后复制无法再冒用。"""
     _setup_users()
     _touch("demo.svs")
+    share_store.set_slide_meta("demo.svs")  # P2：分享创建收口——先注册资产行
     share = share_store.create_share(["demo.svs"], 1)
     token = share["token"]
     roi = share_store.add_roi(
@@ -809,6 +812,7 @@ def test_legacy_reclaim_migrates_all_tokens_not_just_current():
     """认领 A 时同步哈希 B；攻击者不能借未迁移的 B 重铸同一签名身份。"""
     _setup_users()
     _touch("demo.svs")
+    share_store.set_slide_meta("demo.svs")  # P2：分享创建收口——先注册资产行
     share_a = share_store.create_share(["demo.svs"], 1)
     share_b = share_store.create_share(["demo.svs"], 1)
     token_a, token_b = share_a["token"], share_b["token"]
@@ -870,6 +874,7 @@ def _expire_share(token):
 def _two_shares_same_visitor():
     _setup_users()
     _touch("demo.svs")
+    share_store.set_slide_meta("demo.svs")  # P2：分享创建收口——先注册资产行
     share_a = share_store.create_share(["demo.svs"], 1)
     share_b = share_store.create_share(["demo.svs"], 1)
     token_a, token_b = share_a["token"], share_b["token"]
@@ -928,6 +933,7 @@ def test_missing_share_cannot_reclaim_visitor():
     """不存在的 token 返回 404，当场不得迁移；只复制 v2 不能编辑有效链接。"""
     _setup_users()
     _touch("demo.svs")
+    share_store.set_slide_meta("demo.svs")  # P2：分享创建收口——先注册资产行
     share_b = share_store.create_share(["demo.svs"], 1)
     token_b = share_b["token"]
     roi_b = share_store.add_roi(
@@ -957,6 +963,7 @@ def test_legacy_mig_cookie_survives_s_then_reclaims():
     """先访问 /s 不得销毁旧身份；随后正确链接仍可认领。"""
     _setup_users()
     _touch("demo.svs")
+    share_store.set_slide_meta("demo.svs")  # P2：分享创建收口——先注册资产行
     share = share_store.create_share(["demo.svs"], 1)
     token = share["token"]
     roi = share_store.add_roi(
@@ -982,6 +989,7 @@ def test_legacy_mig_cookie_survives_wrong_token_then_reclaims():
     """错误 token / 过期链接覆盖签名 cookie 后，mig 凭据仍能在正确链接认领。"""
     _setup_users()
     _touch("demo.svs")
+    share_store.set_slide_meta("demo.svs")  # P2：分享创建收口——先注册资产行
     share_a = share_store.create_share(["demo.svs"], 1)
     share_b = share_store.create_share(["demo.svs"], 1)
     token_a, token_b = share_a["token"], share_b["token"]
@@ -1005,6 +1013,7 @@ def test_reclaim_keeps_v2_identity_and_interim_roi_ownership():
     """错误 token 上用随机 v2 新建的 ROI，认领后仍可编辑（不切换主 cookie）。"""
     _setup_users()
     _touch("demo.svs")
+    share_store.set_slide_meta("demo.svs")  # P2：分享创建收口——先注册资产行
     share_a = share_store.create_share(["demo.svs"], 1)
     share_b = share_store.create_share(["demo.svs"], 1)
     token_a, token_b = share_a["token"], share_b["token"]

@@ -86,6 +86,8 @@ def test_default_backend_is_postgres():
 
 def test_postgres_smoke_share_store():
     """create_share → list_shares 走通 postgres 实现（conftest 已起内嵌 PG）。"""
+    # P2 收口：分享创建仅接受已存在资产——先注册行（夹具顺序调整）。
+    share_store.set_slide_meta("demo.svs")
     token = share_store.create_share(slides=["demo.svs"], expires_hours=1)
     assert token and token.get("token")
     listed = share_store.list_shares()

@@ -342,8 +342,21 @@ def _multichannel_enabled() -> bool:
     return slide_render.multichannel_enabled()
 
 
+def _slide_scope_key(desc_or_name):
+    """R-15 缓存/统计/token 的 slide 绑定键（P2 收口）：descriptor →
+    slide_id；legacy 名（无行兼容）→ 原名。与主站 app._slide_scope_key 同义。"""
+    if isinstance(desc_or_name, slide_store.SlideDescriptor):
+        return (desc_or_name.slide_id
+                or desc_or_name.legacy_filename
+                or desc_or_name.original_filename or "")
+    return desc_or_name
+
+
 def _ctx_scope(safe: str, generation) -> str:
-    """统计缓存 scope："<safe>#<generation>"（与主站同一命名空间约定）。"""
+    """统计缓存 scope："<safe>#<generation>"（与主站同一命名空间约定）。
+
+    P2（R-15）：safe 实参为 _slide_scope_key 派生的 slide_id 键。
+    """
     return "%s#%s" % (safe, generation)
 
 
@@ -356,21 +369,25 @@ def _legacy_revision(safe: str) -> str:
         return ""
 
 
-def _resolve_pair(pair, safe: str, *, token="", body=None, flag=True):
+def _resolve_pair(pair, skey: str, path=None, *, token="", body=None,
+                  flag=True):
     """在当前借出的 pair 上解析 render context（§6.3；解码前拒绝）。
 
     返回 (context|None, fingerprint)；context None → native/legacy 路径。
     默认 context 的 (fp, image_mode) 回填 per-generation 缓存（与主站同语义）。
+    P2（R-15）：``skey`` 是 slide_id 绑定键；``path`` 为 descriptor 解析后的
+    绝对路径（revision 取数源；缺省按旧名拼 UPLOAD_DIR）。
     """
-    gen_scope = _ctx_scope(safe, pair.get("gen"))
+    rev_target = path if path is not None else skey
+    gen_scope = _ctx_scope(skey, pair.get("gen"))
     ctx, fp = slide_render.resolve_render_context(
-        pair["osr"], safe=safe, expected_revision=_legacy_revision(safe),
+        pair["osr"], safe=skey, expected_revision=_legacy_revision(rev_target),
         token=token, token_secret=_render_secret(), body=body,
         asset_generation=gen_scope, flag_enabled=flag)
     if ctx is None:
         fp = slide_render.NATIVE_RGB_FINGERPRINT
     elif not token and body is None:
-        _default_fp_store(safe, pair.get("gen"), fp,
+        _default_fp_store(skey, pair.get("gen"), fp,
                           slide_render.image_mode_from_context(ctx))
     return ctx, fp or slide_render.NATIVE_RGB_FINGERPRINT
 
@@ -463,20 +480,22 @@ def _encode_tile_jpeg(tile, ctx, profile_id=None):
     return data, spec
 
 
-def _render_info_fields(safe: str) -> dict:
+def _render_info_fields(safe: str, desc=None) -> dict:
     """分享端 info 的 render additive 字段（§6.1；与主站同一实现）。
 
     image-transport-upgrade（§5.2）：同一次稳定读取 additive 返回
     ``display`` 对象 + ``display_encoding_v1`` 能力位；分享端有 thumbnail
-    端点 → include_thumbnail=True。
+    端点 → include_thumbnail=True。P2（R-15）：desc 给出时统计 scope/token
+    绑定键 = slide_id；revision 仍按入口文件（mtime:size）。
     """
     entry = _get_slide(safe)
+    skey = _slide_scope_key(desc) if desc is not None else safe
 
     def _read(pair):
         fields = slide_render.build_render_info(
             pair["osr"], asset_revision=_legacy_revision(safe),
-            asset_generation=_ctx_scope(safe, pair.get("gen")),
-            secret=_render_secret(), slide_name=safe,
+            asset_generation=_ctx_scope(skey, pair.get("gen")),
+            secret=_render_secret(), slide_name=skey,
             flag_enabled=_multichannel_enabled())
         try:
             z_dims = pair.get("dz").level_dimensions
@@ -858,6 +877,29 @@ def _require_slide(share, name):
     return desc
 
 
+def _require_slide_by_id(share, slide_id):
+    """校验 slide_id 属于该 share 且资产可读（P2，合同 §4）；403/404 同旧口径。
+
+    resolve_slide_id（校验存在性）→ share_slides(token, slide_id) 成员 →
+    asset_state='ready' 门禁。未知 ID → 403「无权访问」（与名通道一致，
+    不泄露差异）；行存在且成员、文件缺失仍由 _get_slide 404。
+    """
+    sid = (slide_id or "").strip() if isinstance(slide_id, str) else ""
+    if not sid:
+        abort(403, "无权访问")
+    try:
+        desc = slide_store.resolve_slide_id(sid)
+    except Exception:
+        app.logger.warning("分享通道 slide_id 解析失败（fail-closed）：%s",
+                           sid, exc_info=True)
+        desc = None
+    if (desc is None
+            or desc.asset_state != slide_store.SlideState.READY
+            or not _share_slide_member(share.get("token"), desc.slide_id)):
+        abort(403, "无权访问")
+    return desc
+
+
 def _share_has_annotate(share):
     """判断分享是否含 annotate 权限（docs §5.4 权限三档）。
 
@@ -1179,10 +1221,8 @@ def _handle_slide_file_changed(e):
     return jsonify(error="slide_file_changed"), 503
 
 
-@app.route("/s/<token>/api/slide/<name>.dzi")
-def share_slide_dzi(token, name):
-    share = _require_share(token)
-    desc = _require_slide(share, name)
+def _share_dzi_impl(token, desc, files_url):
+    """DZI XML 共用实现（P2，合同 §4）：Url 指向调用方通道的 tiles 前缀。"""
     safe = desc.legacy_filename
     entry = _get_slide(safe, slide_storage.resolve_descriptor_path(
         desc, root=UPLOAD_DIR))
@@ -1193,7 +1233,7 @@ def share_slide_dzi(token, name):
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<Image xmlns="http://schemas.microsoft.com/deepzoom/2008" '
-        f'Url="/s/{token}/api/slide/{safe}_files/" Format="jpeg" '
+        f'Url="{files_url}" Format="jpeg" '
         f'Overlap="{DZ_OVERLAP}" TileSize="{DZ_TILE_SIZE}">'
         f'<Size Width="{width}" Height="{height}"/>'
         "</Image>"
@@ -1202,6 +1242,24 @@ def share_slide_dzi(token, name):
     # DZI 元数据短期可变（重传/换切片后尺寸会变），用短缓存
     resp.headers["Cache-Control"] = "max-age=60"
     return resp
+
+
+@app.route("/s/<token>/api/slide/<name>.dzi")
+def share_slide_dzi(token, name):
+    share = _require_share(token)
+    desc = _require_slide(share, name)
+    safe = desc.legacy_filename
+    return _share_dzi_impl(token, desc,
+                           "/s/%s/api/slide/%s_files/" % (token, safe))
+
+
+@app.route("/s/<token>/api/slides/<slide_id>/dzi")
+def share_slide_dzi_by_id(token, slide_id):
+    """分享端 ID 原生 DZI（P2，合同 §4）：瓦片 URL 指向 /tiles/。"""
+    share = _require_share(token)
+    desc = _require_slide_by_id(share, slide_id)
+    return _share_dzi_impl(token, desc,
+                           "/s/%s/api/slides/%s/tiles/" % (token, slide_id))
 
 
 @app.route("/s/<token>/api/slide/<name>/info")
@@ -1213,9 +1271,26 @@ def share_slide_info(token, name):
     """
     share = _require_share(token)
     desc = _require_slide(share, name)
+    return _share_info_impl(desc)
+
+
+@app.route("/s/<token>/api/slides/<slide_id>/info")
+def share_slide_info_by_id(token, slide_id):
+    """分享端 ID 原生 info（P2，合同 §4）。"""
+    share = _require_share(token)
+    desc = _require_slide_by_id(share, slide_id)
+    return _share_info_impl(desc)
+
+
+def _share_info_impl(desc):
+    """分享端 info 共用实现（P2，合同 §4）。"""
     safe = desc.legacy_filename
     path = slide_storage.resolve_descriptor_path(desc, root=UPLOAD_DIR)
-    info = {"name": safe, "exists": path.is_file()}
+    info = {"name": safe, "exists": path.is_file(),
+            "slide_id": desc.slide_id,
+            "original_filename": desc.original_filename,
+            "display_name": desc.display_name or safe,
+            "format_ext": desc.format_ext}
     sm = share_store.get_slide_meta_full(safe)
     info["alias"] = sm.get("alias", "")
     info["note"] = sm.get("note", "")
@@ -1235,7 +1310,7 @@ def share_slide_info(token, name):
         })
         return jsonify(info)
     try:
-        info.update(_render_info_fields(safe))
+        info.update(_render_info_fields(safe, desc=desc))
     except slide_cache.SlideFileChanged:
         return jsonify(error="slide_file_changed",
                        code="slide_file_changed"), 503
@@ -1250,6 +1325,8 @@ def share_slide_render_context(token, name):
     share = _require_share(token)
     desc = _require_slide(share, name)
     safe = desc.legacy_filename
+    # P2（R-15）：scope/token 绑定键 = slide_id；revision 按入口文件取数
+    skey = _slide_scope_key(desc)
     if not _multichannel_enabled():
         return jsonify(error="多通道渲染未启用",
                        code="multichannel_disabled"), 403
@@ -1259,13 +1336,13 @@ def share_slide_render_context(token, name):
 
     def _build(pair):
         canonical, fp = slide_render.resolve_render_context(
-            pair["osr"], safe=safe, expected_revision=_legacy_revision(safe),
+            pair["osr"], safe=skey, expected_revision=_legacy_revision(safe),
             body=body if isinstance(body, dict) else {},
-            asset_generation=_ctx_scope(safe, pair.get("gen")),
+            asset_generation=_ctx_scope(skey, pair.get("gen")),
             flag_enabled=True)
         tok = slide_render.issue_render_token(
             canonical, fp, _legacy_revision(safe), _render_secret(),
-            slide=safe)
+            slide=skey)
         # 自定义 context 的显示身份（§5.2 additive）
         display_versions = None
         try:
@@ -1313,9 +1390,23 @@ def share_slide_tile(token, name, level, x, y):
     """
     share = _require_share(token)
     desc = _require_slide(share, name)
+    return _share_tile_impl(desc, level, x, y)
+
+
+@app.route("/s/<token>/api/slides/<slide_id>/tiles/<int:level>/<int:x>_<int:y>.jpeg")
+def share_slide_tile_by_id(token, slide_id, level, x, y):
+    """分享端 ID 原生瓦片（P2，合同 §4）。"""
+    share = _require_share(token)
+    desc = _require_slide_by_id(share, slide_id)
+    return _share_tile_impl(desc, level, x, y)
+
+
+def _share_tile_impl(desc, level, x, y):
+    """瓦片 JPEG 共用实现（P2，合同 §4/R-15：键/token 绑定按 slide_id）。"""
     safe = desc.legacy_filename
-    entry = _get_slide(safe, slide_storage.resolve_descriptor_path(
-        desc, root=UPLOAD_DIR))
+    skey = _slide_scope_key(desc)
+    path = slide_storage.resolve_descriptor_path(desc, root=UPLOAD_DIR)
+    entry = _get_slide(safe, path)
     render_tok = request.args.get("render") or ""
     flag = _multichannel_enabled()
 
@@ -1329,8 +1420,8 @@ def share_slide_tile(token, name, level, x, y):
     token_payload = None
     if flag and render_tok:
         payload = slide_render.verify_render_token(render_tok, _render_secret())
-        if payload is not None and payload.get("slide") in ("", safe) \
-                and payload.get("rev") == _legacy_revision(safe):
+        if payload is not None and payload.get("slide") in ("", skey) \
+                and payload.get("rev") == _legacy_revision(path):
             token_payload = payload
 
     gen = slide_cache.refresh_generation(entry)
@@ -1344,7 +1435,7 @@ def share_slide_tile(token, name, level, x, y):
             if (token_payload.get("ctx") or {}).get("version") \
             == slide_render.CONTEXT_VERSION_MULTICHANNEL else "native_rgb"
     else:
-        cached_default = _default_fp_cached(safe, gen)
+        cached_default = _default_fp_cached(skey, gen)
         if cached_default is not None:
             fp_pre, mode_pre = cached_default
 
@@ -1359,9 +1450,9 @@ def share_slide_tile(token, name, level, x, y):
 
     if fp_pre is not None and (pre_spec is not None or req_profile is None):
         cached = _tile_cache_lookup_spec(
-            safe, gen, fp_pre, level, x, y, pre_spec) \
+            skey, gen, fp_pre, level, x, y, pre_spec) \
             if pre_spec is not None \
-            else _tile_cache_lookup(safe, gen, fp_pre, level, x, y)
+            else _tile_cache_lookup(skey, gen, fp_pre, level, x, y)
         if cached is not None and req_dv is not None and pre_spec is not None:
             try:
                 cur_dv = viewer_display.compute_display_version(
@@ -1382,11 +1473,12 @@ def share_slide_tile(token, name, level, x, y):
             _viewer_metrics.observe_status("200")
             return _tile_jpeg_response(cached)
 
-    flight_key = (safe, gen, fp_pre or "", int(level), int(x), int(y),
+    flight_key = (skey, gen, fp_pre or "", int(level), int(x), int(y),
                   req_profile or "legacy", "tile")
 
     def _decode(pair):
-        ctx, fp = _resolve_pair(pair, safe, token=render_tok, flag=flag)
+        ctx, fp = _resolve_pair(pair, skey, path=path,
+                                token=render_tok, flag=flag)
         cur_mode = slide_render.image_mode_from_context(ctx)
         # spec/版本核验在昂贵合成之前（§4.8）
         try:
@@ -1440,7 +1532,7 @@ def share_slide_tile(token, name, level, x, y):
         _viewer_metrics.observe_status("5xx")
         return jsonify(error="瓦片生成排队超时，请重试",
                        code="tile_single_flight_timeout"), 503
-    key = _tile_fp_key(safe, tile_gen, fp, level, x, y, spec=enc_spec)
+    key = _tile_fp_key(skey, tile_gen, fp, level, x, y, spec=enc_spec)
     _tile_cache_put(key, data)
     mode = slide_render.image_mode_from_context(ctx)
     _viewer_metrics.observe_response(mode, enc_spec.profile_id, len(data))
@@ -1465,7 +1557,21 @@ def share_slide_crop(token, name):
     """
     share = _require_share(token)
     desc = _require_slide(share, name)
+    return _share_crop_impl(desc, token)
+
+
+@app.route("/s/<token>/api/slides/<slide_id>/crop")
+def share_slide_crop_by_id(token, slide_id):
+    """分享端 ID 原生 crop（P2，合同 §4）。"""
+    share = _require_share(token)
+    desc = _require_slide_by_id(share, slide_id)
+    return _share_crop_impl(desc, token)
+
+
+def _share_crop_impl(desc, token):
+    """分享端 crop 共用实现（P2，合同 §4；R-19 下载名走 original_filename）。"""
     safe = desc.legacy_filename
+    skey = _slide_scope_key(desc)
     entry = _get_slide(safe, slide_storage.resolve_descriptor_path(
         desc, root=UPLOAD_DIR))
     render_tok = request.args.get("render") or ""
@@ -1509,7 +1615,8 @@ def share_slide_crop(token, name):
     with slide_cache.borrow_pair(entry) as pair:
         # context 解析在解码前（§7.4）；失败 → 稳定 4xx/409
         try:
-            ctx, fp = _resolve_pair(pair, safe, token=render_tok,
+            ctx, fp = _resolve_pair(pair, skey, path=safe,
+                                    token=render_tok,
                                     flag=_multichannel_enabled())
         except (slide_render.RenderRequestError,
                 slide_io.SlideRenderError) as e:
@@ -1559,7 +1666,7 @@ def share_slide_crop(token, name):
     region.save(buf, format="PNG")
     buf.seek(0)
 
-    stem = Path(safe).stem
+    stem = Path(desc.original_filename or safe).stem
     fp_suffix = ("_%s" % str(fp)[:8]) \
         if (_multichannel_enabled() and fp) else ""
     if w2 == h2:
@@ -1586,7 +1693,21 @@ def share_slide_thumbnail(token, name):
     """
     share = _require_share(token)
     desc = _require_slide(share, name)
+    return _share_thumbnail_impl(desc)
+
+
+@app.route("/s/<token>/api/slides/<slide_id>/thumbnail")
+def share_slide_thumbnail_by_id(token, slide_id):
+    """分享端 ID 原生缩略图（P2，合同 §4）。"""
+    share = _require_share(token)
+    desc = _require_slide_by_id(share, slide_id)
+    return _share_thumbnail_impl(desc)
+
+
+def _share_thumbnail_impl(desc):
+    """分享端缩略图共用实现（P2，合同 §4）。"""
     safe = desc.legacy_filename
+    skey = _slide_scope_key(desc)
     entry = _get_slide(safe, slide_storage.resolve_descriptor_path(
         desc, root=UPLOAD_DIR))
     render_tok = request.args.get("render") or ""
@@ -1597,7 +1718,8 @@ def share_slide_thumbnail(token, name):
         return _display_param_error_response(e)
     with slide_cache.borrow_pair(entry) as pair:
         try:
-            ctx, fp = _resolve_pair(pair, safe, token=render_tok,
+            ctx, fp = _resolve_pair(pair, skey, path=safe,
+                                    token=render_tok,
                                     flag=_multichannel_enabled())
         except (slide_render.RenderRequestError,
                 slide_io.SlideRenderError) as e:
@@ -1697,7 +1819,8 @@ def share_roi_add(token):
     try:
         roi = share_store.add_roi(
             token, safe, label, type=typ, note=note,
-            visitor=_visitor_stored(_visitor_id()), **geom
+            visitor=_visitor_stored(_visitor_id()),
+            slide_id=roi_desc.slide_id, **geom
         )
     except ValueError as e:
         return jsonify(error=str(e)), 400
@@ -1874,15 +1997,18 @@ def _resolve_anno_in_share(share, annotation_id):
 
     返回 (roi, None) 或 (None, error_resp)；不可见/不存在统一 404 语义
     （slide 不在分享内仍 403——token 本身可见性不变）。
-    P1-B2 注：此处的 slide ∈ share 仍按 shares.slides JSONB 快照比对——
-    标注/评论的 ID 化（R-08）与成员判定统一在 P2 收口（_require_slide/
-    roi 写通道已切 share_slides ID 关系）。
+    P2 收口（合同 §3.1/R-04）：slide ∈ share 判定改 share_slides ID 关系
+    （roi.slide_id）；无 ID 的历史行（unresolved）按 JSONB 名快照兜底。
     """
     roi = share_store.get_roi_by_annotation_id(annotation_id)
     if roi is None:
         return None, (jsonify(error="标注不存在"), 404)
     slide = roi.get("slide")
-    if not slide or slide not in share.get("slides", []):
+    roi_sid = roi.get("slide_id")
+    if roi_sid:
+        if not _share_slide_member(share.get("token") or "", roi_sid):
+            return None, (jsonify(error="无权访问"), 403)
+    elif not slide or slide not in share.get("slides", []):
         return None, (jsonify(error="无权访问"), 403)
     subject = _visitor_read_subject(share.get("token") or "")
     if not annotation_access.can_read_annotation(subject, roi):
@@ -1956,7 +2082,8 @@ def share_comment_add(token):
     try:
         cmt = share_store.add_comment(
             annotation_id, roi.get("slide"), token, text,
-            author_user_id=None, author_label=label, parent_id=parent_id)
+            author_user_id=None, author_label=label, parent_id=parent_id,
+            slide_id=roi.get("slide_id"))
     except ValueError as e:
         return jsonify(error=str(e)), 400
     return jsonify(ok=True, comment=cmt)

@@ -193,6 +193,7 @@ def test_share_tile_is_444(monkeypatch):
     monkeypatch.setattr(share_store, "SHARE_FILE",
                         Path(app_mod.UPLOAD_DIR).parent / "share-data"
                         / "shares.json")
+    share_store.set_slide_meta(CYX_NAME)  # P2：分享创建收口——先建行
     share = share_store.create_share([CYX_NAME], 24)
     sc = share_srv.app.test_client()
     r = sc.get("/s/%s/api/slide/%s_files/0/0_0.jpeg"

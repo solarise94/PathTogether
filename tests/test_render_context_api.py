@@ -411,6 +411,7 @@ def _share_env(monkeypatch, name=CYX_NAME):
     monkeypatch.setattr(share_store, "SHARE_FILE",
                         Path(app_mod.UPLOAD_DIR).parent / "share-data"
                         / "shares.json")
+    share_store.set_slide_meta(name)  # P2：分享创建收口——先建行
     share = share_store.create_share([name], 24)
     return share["token"]
 

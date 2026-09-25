@@ -230,15 +230,24 @@ def _pseudonym_salt(cur) -> str:
     return _PSEUDONYM_SALT_CACHE["value"]
 
 
-def slide_pseudonym(slide_name, cur) -> str:
-    """业务切片 ID → 研究伪名（带盐 keyed hash，截断 32 hex）。
+def slide_pseudonym(slide_name, cur, slide_id=None) -> str:
+    """业务切片标识 → 研究伪名（带盐 keyed hash，截断 32 hex）。
 
     必须在既有事务游标上调用（盐的懒创建 INSERT 随调用方事务提交）。
+    P2（slide ID 化重构 / R-11）：新会话改从 **slide_id** 派生
+    （``HMAC("slide-id:"+slide_id)``）——同资产改名不再产生不同研究伪名；
+    ``slide_id`` 缺省（历史调用方/无行形态）保持旧的按名派生，历史伪名
+    记录不可变不动。
     """
     salt = _pseudonym_salt(cur)
-    digest = hmac.new(("rspd:" + salt).encode("utf-8"),
-                      ("slide:" + slide_name).encode("utf-8"),
-                      hashlib.sha256).hexdigest()
+    if slide_id:
+        digest = hmac.new(("rspd:" + salt).encode("utf-8"),
+                          ("slide-id:" + slide_id).encode("utf-8"),
+                          hashlib.sha256).hexdigest()
+    else:
+        digest = hmac.new(("rspd:" + salt).encode("utf-8"),
+                          ("slide:" + slide_name).encode("utf-8"),
+                          hashlib.sha256).hexdigest()
     return "sl_" + digest[:32]
 
 
@@ -518,17 +527,23 @@ def _ensure_subject(cur, user_id) -> str:
 # --------------------------------------------------------------------------- #
 # 研究读片会话（POST /api/research/viewing-sessions）
 # --------------------------------------------------------------------------- #
-def create_viewing_session(user_id, slide_name, *, environ=None) -> dict:
+def create_viewing_session(user_id, slide_name, *, environ=None,
+                           slide_id=None) -> dict:
     """创建研究读片会话（§7.3）：服务端绑定 subject/epoch，无授权不创建。
 
     - slide_name 由路由层完成 ACL（第一版仅本人拥有的切片，§6.1 资源权利）；
       本函数只收业务切片标识并落**研究伪名**；
+    - P2（R-11）：``slide_id`` 给出时伪名从 slide_id 派生（新会话口径）；
+      缺省保持按名派生（历史调用方兼容）；
     - 事务内顺序：速率桶 → consent 行锁 → 权威判定 → subject → 会话插入，
       与 withdraw 的锁序（consent 行）一致，无死锁环；
     - started_day 取 Asia/Shanghai 自然日（数据库侧换算）；expires_at = 90 天。
     """
     if not isinstance(slide_name, str) or not (1 <= len(slide_name) <= 255):
         raise ResearchStoreError("slide 必须是 1..255 字符的业务切片标识")
+    if slide_id is not None and (not isinstance(slide_id, str)
+                                 or not slide_id.strip()):
+        slide_id = None
     conn = _connect()
     try:
         # 速率限制独立事务先行（拒绝也要推进计数；见 _record_rate_hit）
@@ -541,7 +556,8 @@ def create_viewing_session(user_id, slide_name, *, environ=None) -> dict:
                 consent = _assert_ingest_allowed(cur, user_id, environ)
                 subject_id = _ensure_subject(cur, user_id)
                 session_id = "rvs_" + secrets.token_urlsafe(18)
-                pseudonym = slide_pseudonym(slide_name, cur)
+                pseudonym = slide_pseudonym(slide_name, cur,
+                                            slide_id=slide_id)
                 cur.execute(
                     "INSERT INTO research_viewing_sessions "
                     "(session_id, subject_id, consent_epoch, scope_version, "

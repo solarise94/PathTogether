@@ -10,7 +10,7 @@
 | P0 | `3a60933` | 任务书/迁移手册/P0 盘点文档 + `scripts/audit_slide_identity.py` + 12 用例 |
 | P1-A | `e2df401` | `migrations/0067_slide_asset_identity.sql`、`slide_store.py`、`slide_storage.py`、`slide_publish.py` 骨架、38 新用例（store 16 + storage 13 + migration 9）、`test_pg_infra` 清单 +0067、conftest 三新表 |
 | P1-B1 | `8a0447d` | `scripts/backfill_slide_asset_state.py`（dry-run 默认、分批幂等、DB 即 checkpoint）+ 17 用例 |
-| P1-B2 | `见本节末` | 读通道统一门禁 + 首个 ID 原生 API + share_server 切换 |
+| P1-B2 | `deaece4` | 读通道统一门禁 + 首个 ID 原生 API + share_server 切换 |
 
 ## P0 门禁（2026-09-25）
 
@@ -64,3 +64,33 @@
 ## 下一阶段（P2）范围预告
 
 计划 §4 全量：active 关系切 slide_id（rois/comments/change_log/run_grants/ai_session_principals/project_slides）、前端 static/* 与 HistoPilot 读通道 ID 化 + 能力协商、`/api/slides/<slide_id>/...` 读端点全族、PATCH display_name、跨仓契约测试。编排：先后端关系+API（单代理持有 app.py），再前端（static/）与 HistoPilot（独立仓）并行。
+
+## P2 门禁（2026-09-26 凌晨）
+
+合同：docs/slide-id-refactor-p2-contract-20260925.md。
+
+**P2-HP1（HistoPilot 仓，提交 a07850c）**：运行通道 slide_id 化（slideIndexKey/ToolContext.slide_id/run body slide_id 优先/v3-v2 会话键分域冻结/uuidv7 误注修正）。独立复核：build + unit 1145 + integration 340 全绿。遗留回落面清单已收编（PT 代理转发 slide_id、§6.5 双字段、§6.7 跨仓契约测试——分别由 P2 后端/P2-HP2 消化）。
+
+**P2 后端（本仓）**：活动关系全量切 slide_id（rois/comments/change_log/access_events/run_grants/ai_session_principals/audit 双写+按 ID 活动查询）、`/api/slides/<id>/` 读端点全族（app 8 + share_server 5）、双字段 slide_id/slide 解析（冲突 400）、项目 slide_ids、run grant 按 ID 校验（防伪比对）、机器通道双字段、R-15 缓存键收口 + 列表 N+1 收敛、alias 停写（R-02）、PATCH /api/slides/<id>、demo 兜底分支删除、研究伪名 ID 派生、create_share 拒绝未注册名（P1-B2 偏差 #4 收口）。
+
+- 编排方独立门禁：第一次跑遇 tmpfs 残渣雪崩（340 errors——部署 runbook 已记载的 `/tmp/pytest-of-solarise` 堆积陷阱，佐证：清理后 /tmp 74%→20%）；**清渣后干净复跑：2658 passed / 6 skipped / 1 failed**（唯一失败=已知无关 admin 0.4.13）；`npm run test:js` 553 passed；新测试 14 用例绿。**门禁纪律修订：全量套件运行前必须先清 `/tmp/pytest-of-solarise`**。
+
+### P2 后端偏差裁决记录
+
+| # | 偏差 | 裁决 | 理由/收口 |
+|---|---|---|---|
+| 1 | annotations_by_slide 分组键保持名称快照 | **暂时接受**，P3 门禁项 | legacy_filename UNIQUE 使 legacy 资产按名分组不串；但 id_bundle 资产可同 original_filename——**P3 上线 id_bundle writer 前必须验证同名 id_bundle 资产的标注分组不串（或先把分组键切 ID）** |
+| 2 | 历史 NULL-ID run grant 保留名比对兜底 | 采纳 | R-09 冻结快照语义，随 grant TTL 自然退役 |
+| 3 | list_changes 名入参解析不到回退名查询 | 采纳 | 仅服务机器通道无行兼容分支（P1-B2 #2/#3，P3 收口） |
+| 4 | share_server by-id 未知 ID → 403 而非 404 | 采纳 | 与名通道「不泄露存在性差异」一致 |
+| 5 | /api/ai/* 接受 slide_id（合同 §3.3 未列） | 采纳 | HP §6.5 的后端前提，additive |
+| 6 | force_slide_owner_follow_file 改清 display_name | 采纳 | R-02 停写必然；该函数仍是 P4 拆除对象 |
+| 7 | 项目幂等路径库层不改、app 层补写双列 | 采纳 | project_idempotency_store.py 未开放；崩溃窗口残留按 name-only 行→后续回填兜底，风险低 |
+| 8-⑤ | test_share_unregistered_name_lazy_row_readable 语义收紧 | **确认采纳** | 原断言保留（注册后分享可读）+ 新增收紧断言（未注册名→ValueError）；符合「保留场景意义、替换废弃断言」 |
+
+### P2 后端遗留
+
+- shares.slides JSONB 快照仍照写（授权判定已全部走 share_slides）——P6 退役。
+- 机器通道无行兼容分支、set_slide_meta 同名复活（P1-B2 #6）→ P3 强制收口。
+- 内容 revision 来源仍是 mtime:size；slide_assets.legacy_revision 消费在 P3/P4。
+- 前端 static/ 切 ID（下一阶段）；浏览器实测（P2 完成标准）待前端落地后执行。

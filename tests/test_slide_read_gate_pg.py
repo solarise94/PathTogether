@@ -256,9 +256,19 @@ def test_create_share_populates_share_slides_and_gates():
 
 
 def test_share_unregistered_name_lazy_row_readable():
-    """先建分享后放文件/从未注册的名：create_share 懒建行 → 可读（兼容）。"""
+    """P2 收口（合同 §4 / P1-B2 偏差 #4）：分享创建仅接受已存在资产。
+
+    原「先建分享后放文件/从未注册的名 → 懒建行」语义已按合同收紧为
+    ValueError（400，指明哪一个）；已注册资产建分享 → share_slides 映射
+    ready、分享端可读（原断言保留——夹具顺序调整为先注册行再建分享）。
+    """
     owner, _a, _b = _setup_users()
     name = _touch_tiff("late.tif")
+    # 未注册的名：不再懒建行，整体拒绝
+    with pytest.raises(ValueError, match="late.tif"):
+        share_store.create_share([name], 24)
+    # 注册后建分享（夹具顺序调整；断言不变）
+    _register(name, owner["user_id"])
     share = share_store.create_share([name], 24)
     token = share["token"]
 

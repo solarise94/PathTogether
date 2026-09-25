@@ -88,6 +88,7 @@ _PUBLIC_NAMES = (
     "update_project",
     "add_slides_to_project",
     "remove_slide_from_project",
+    "remove_slide_from_project_by_id",
     "delete_project",
     "annotations_by_slide",
     "annotations_by_project",

@@ -98,8 +98,8 @@ def _mock_plugin_channel(monkeypatch, valid=True):
              "created_by_user_id": "u1", "session_id": "sess1"}
     monkeypatch.setattr(
         app_mod, "_verify_run_grant",
-        (lambda gid, slide, inst, expect_session=None: (True, "")) if valid
-        else (lambda gid, slide, inst, expect_session=None: (False, "expired")))
+        (lambda gid, slide, inst, expect_session=None, slide_id=None: (True, "")) if valid
+        else (lambda gid, slide, inst, expect_session=None, slide_id=None: (False, "expired")))
     monkeypatch.setattr(app_mod.share_store, "get_run_grant", lambda gid: grant)
     monkeypatch.setattr(app_mod, "_archived_slide_names", lambda: [])
     monkeypatch.setattr(app_mod.share_store, "get_plugin_installation",

@@ -359,6 +359,7 @@ def test_archived_default_false_compat():
 def test_share_access_log_dedup():
     owner, _ = _setup_users()
     _touch()
+    share_store.set_slide_meta("demo.svs")  # P2：分享创建收口——先建行
     c = _client()
     _login(c, "owner@x.com", "ownerpass123456")
     # 建分享

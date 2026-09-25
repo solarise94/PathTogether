@@ -479,21 +479,104 @@ def _has_slide_view_grant(user_id, slide_id, *, conn=None) -> bool:
 
 def _has_active_share_membership(user_id, slide_id, *, conn=None) -> bool:
     """share_slides ⋈ grants 成员判定：已领取未撤销未过期且含 view 权限。"""
+    return _share_membership_permission(user_id, slide_id,
+                                        permission="view", conn=conn)
+
+
+def _share_membership_permission(user_id, slide_id, *, permission="view",
+                                 conn=None) -> bool:
+    """share_slides ⋈ grants 成员判定（可指定 view/annotate/download 权限档）。
+
+    permission 是服务端白名单词（view/annotate/download），直接内嵌 JSONB
+    字面量（psycopg 对 '%s'::jsonb 占位无法推断类型）。
+    """
+    if permission not in ("view", "annotate", "download"):
+        permission = "view"
+    sql = (
+        "SELECT 1 FROM grants g "
+        "JOIN shares sh ON sh.token = g.token "
+        "JOIN share_slides ss ON ss.token = sh.token "
+        "WHERE g.user_id=%s AND g.active "
+        "AND ss.slide_id=%s "
+        "AND sh.revoked = FALSE "
+        "AND (sh.expires_at IS NULL OR sh.expires_at > now()) "
+        "AND g.permissions @> '[\"" + permission + "\"]'::jsonb "
+        "LIMIT 1"
+    )
     with _session(conn) as c:
         with c.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM grants g "
-                "JOIN shares sh ON sh.token = g.token "
-                "JOIN share_slides ss ON ss.token = sh.token "
-                "WHERE g.user_id=%s AND g.active "
-                "AND ss.slide_id=%s "
-                "AND sh.revoked = FALSE "
-                "AND (sh.expires_at IS NULL OR sh.expires_at > now()) "
-                "AND g.permissions @> '[\"view\"]'::jsonb "
-                "LIMIT 1",
-                (user_id, slide_id),
-            )
+            cur.execute(sql, (user_id, slide_id))
             return cur.fetchone() is not None
+
+
+def has_share_permission(user_id, slide_id, permission="view", *, conn=None):
+    """主体经 share 成员关系对 slide_id 持指定权限档（P2 扩展，annotate 闸用）。"""
+    if not user_id or not slide_id:
+        return False
+    try:
+        return _share_membership_permission(user_id, slide_id,
+                                            permission=permission, conn=conn)
+    except Exception:  # noqa: BLE001 - fail-closed
+        _LOG.warning("share 成员权限查询失败（fail-closed）：%s",
+                     slide_id, exc_info=True)
+        return False
+
+
+def visible_ready_slide_ids(actor_user_id=None, actor_role=None, *,
+                            allow_public=True, allow_share=True,
+                            conn=None) -> set:
+    """主体的 ready 可读 slide_id 集合（P2 列表收敛：常量次查询）。
+
+    与逐行 ``authorize_read`` 完全同一判定序（判定优先级见其 docstring），
+    但以两次集合查询 + 一次 ready 行扫描在内存完成（P1-B2 遗留的列表 N+1
+    收敛——合同 §3.5）。DB 异常按空集处理（fail-closed，不回退扫描）。
+
+    - admin 角色（actor_role=ROLE_ADMIN）→ 全部 ready；
+    - owner（actor_user_id == 行 owner）；
+    - public（allow_public 时）；
+    - slide_view_grants（slide_id 级，只认 ID 列）；
+    - share_slides ⋈ grants（view 权限档；allow_share 时）。
+
+    demo capability 通道不在本集合语义内（allowlist 逐行走 authorize_read）。
+    """
+    try:
+        with _session(conn) as c:
+            with c.cursor() as cur:
+                cur.execute("SELECT slide_id, owner_user_id, public "
+                            "FROM slides WHERE asset_state=%s",
+                            (SlideState.READY,))
+                rows = cur.fetchall()
+                if actor_role == ROLE_ADMIN:
+                    return {r["slide_id"] for r in rows}
+                uid = (actor_user_id or "").strip() or None
+                if not uid:
+                    return set()
+                granted = set()
+                with c.cursor() as cur2:
+                    cur2.execute("SELECT slide_id FROM slide_view_grants "
+                                 "WHERE user_id=%s", (uid,))
+                    granted.update(r["slide_id"] for r in cur2.fetchall())
+                if allow_share:
+                    with c.cursor() as cur3:
+                        cur3.execute(
+                            "SELECT DISTINCT ss.slide_id FROM grants g "
+                            "JOIN shares sh ON sh.token = g.token "
+                            "JOIN share_slides ss ON ss.token = sh.token "
+                            "WHERE g.user_id=%s AND g.active "
+                            "AND sh.revoked = FALSE "
+                            "AND (sh.expires_at IS NULL "
+                            "     OR sh.expires_at > now()) "
+                            "AND g.permissions @> '[\"view\"]'::jsonb",
+                            (uid,))
+                        granted.update(r["slide_id"] for r in cur3.fetchall())
+                return {r["slide_id"] for r in rows
+                        if (r["owner_user_id"] and uid == r["owner_user_id"])
+                        or (allow_public and r["public"])
+                        or r["slide_id"] in granted}
+    except Exception:  # noqa: BLE001 - fail-closed 空集
+        _LOG.warning("visible_ready_slide_ids 查询失败（fail-closed 空集）",
+                     exc_info=True)
+        return set()
 
 
 def _in_demo_catalog(slide_id, *, conn=None) -> bool:

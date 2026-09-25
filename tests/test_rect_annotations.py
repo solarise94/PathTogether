@@ -534,6 +534,7 @@ def test_share_crop_wh_exact_and_not_roi_sizes_bound(monkeypatch):
     _setup_owner()
     monkeypatch.setattr(share_srv, "_slide_dims_and_mpp",
                         lambda safe: (2000, 1500, 60.0, 60.0))
+    share_store.set_slide_meta("demo.svs")  # P2：分享创建收口——先建行
     # preset_only 分享的 crop 不受 roi_sizes 约束（E06 收窄口径）
     tok = share_store.create_share(["demo.svs"], 1,
                                    roi_sizes=[6.0])["token"]
@@ -566,7 +567,7 @@ def test_plugin_v1_annotate_wh(monkeypatch):
     grant = {"grant_id": "g1", "slide": "demo.svs", "installation_id": "inst1",
              "created_by_user_id": "u1", "session_id": "sess1"}
     monkeypatch.setattr(app_mod, "_verify_run_grant",
-                        lambda gid, slide, inst, expect_session=None: (True, ""))
+                        lambda gid, slide, inst, expect_session=None, slide_id=None: (True, ""))
     monkeypatch.setattr(app_mod, "share_store", app_mod.share_store)
     monkeypatch.setattr(app_mod.share_store, "get_run_grant", lambda gid: grant)
     monkeypatch.setattr(app_mod, "_archived_slide_names", lambda: [])

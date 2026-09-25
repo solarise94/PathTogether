@@ -337,7 +337,8 @@ def filter_changes(subject, changes, access_context=None, roi_of=None):
 
 # 跨主体响应白名单：不含分享 bearer token / visitor 哈希 / 内部归属字段。
 _PUBLIC_ROI_KEYS = (
-    "annotation_id", "slide", "type", "x", "y", "w", "h", "side_px", "size_mm",
+    "annotation_id", "slide", "slide_id", "type", "x", "y", "w", "h",
+    "side_px", "size_mm",
     "x1", "y1", "x2", "y2", "points", "label", "note", "shared", "ts", "source",
     "revision", "change_seq", "index", "review_status", "geometry_version",
     "author_key", "author_kind", "author_label_safe", "can_edit", "can_delete",
@@ -367,7 +368,8 @@ def public_roi_view(roi, subject=None, access_token=None):
 
 
 _PUBLIC_COMMENT_KEYS = (
-    "comment_id", "annotation_id", "slide", "body", "parent_id", "resolved",
+    "comment_id", "annotation_id", "slide", "slide_id", "body", "parent_id",
+    "resolved",
     "deleted", "created_at", "updated_at", "author_label", "change_seq", "type",
     # 分享页掩码红线需要 author_user_id 区分成员/访客（不透明内部 id，
     # 非邮箱/登录名；明文身份由 share 端点替换为掩码 label 后才投影）。
@@ -400,6 +402,7 @@ def public_access_event_view(event):
         "op": event.get("op"),
         "annotation_id": event.get("annotation_id"),
         "slide": event.get("slide"),
+        "slide_id": event.get("slide_id"),
         "change_seq": event.get("change_seq"),
         "reset_required": event.get("op") == "revoke",
         "grantee_kind": event.get("grantee_kind"),

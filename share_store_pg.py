@@ -192,15 +192,19 @@ def _roi_visibility_status(roi: dict) -> str:
 
 
 def _insert_roi(cur, roi: dict, rid: str):
-    """插入一条 roi：data 存权威 dict，离散列镜像，返回 insert_seq。"""
+    """插入一条 roi：data 存权威 dict，离散列镜像，返回 insert_seq。
+
+    P2（合同 §3.1/R-08）：slide_id（权威）+ slide（名称快照）双列写入；
+    未解析到资产（无 slides 行）时 slide_id 保持 NULL = unresolved。
+    """
     now = roi.get("updated_at") or roi.get("ts") or time.time()
     cur.execute(
         "INSERT INTO rois "
         "(id, token, slide, annotation_id, label, type, geom, size_mm, shared, "
         " note, deleted, owner_user_id, created_at, updated_at, data, "
-        " visibility_status, client_action_id) "
+        " visibility_status, client_action_id, slide_id) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, to_timestamp(%s), "
-        "to_timestamp(%s), %s, %s, %s) RETURNING insert_seq",
+        "to_timestamp(%s), %s, %s, %s, %s) RETURNING insert_seq",
         (
             rid, roi.get("token"), roi.get("slide"), roi.get("annotation_id"),
             roi.get("label", ""), roi.get("type", "rect"),
@@ -210,6 +214,7 @@ def _insert_roi(cur, roi: dict, rid: str):
             roi.get("owner_user_id"), now, now,
             psycopg.types.json.Jsonb(roi),
             _roi_visibility_status(roi), roi.get("client_action_id"),
+            roi.get("slide_id") or None,
         ),
     )
     return cur.fetchone()["insert_seq"]
@@ -316,12 +321,15 @@ def _append_history(roi):
         del hist[: len(hist) - 20]
 
 
-def _bump_change_seq(cur, slide, token, annotation_id, op):
-    """写一条 change_log，返回全局单调 seq（作为该 roi 的 change_seq）。"""
+def _bump_change_seq(cur, slide, token, annotation_id, op, slide_id=None):
+    """写一条 change_log，返回全局单调 seq（作为该 roi 的 change_seq）。
+
+    P2（合同 §3.1/R-08）：slide_id（权威）+ slide（名称快照）双列。
+    """
     cur.execute(
-        "INSERT INTO change_log (slide, token, annotation_id, op) "
-        "VALUES (%s,%s,%s,%s) RETURNING seq",
-        (slide, token, annotation_id, op),
+        "INSERT INTO change_log (slide, token, annotation_id, op, slide_id) "
+        "VALUES (%s,%s,%s,%s,%s) RETURNING seq",
+        (slide, token, annotation_id, op, slide_id or None),
     )
     return cur.fetchone()["seq"]
 
@@ -329,47 +337,36 @@ def _bump_change_seq(cur, slide, token, annotation_id, op):
 # --------------------------------------------------------------------------- #
 # 分享（shares）
 # --------------------------------------------------------------------------- #
-def _ensure_share_slide_row(cur, name, logger=None):
-    """分享成员名 → slide_id（P1-B2 / R-04）。
+def _resolve_share_slide_row(cur, name):
+    """分享成员名 → slide_id（P2 收口 / R-04；P1-B2 偏差 #4）。
 
-    有 slides 行 → 返回既有（已确认的旧）slide_id；无行 → 按 set_slide_meta
-    懒建行同款语义补一行（legacy/ready，owner 留空——分享创建路径不带归属，
-    与旧行为「分享不建行」等价的可读性由 share_slides 成员关系提供）。
-    返回 slide_id；理论上的异常形态返回 None（调用方跳过并告警）。
+    只解析既有行：slides.legacy_filename 冻结映射命中才返回 slide_id；
+    **无行不再懒建**（分享创建仅接受能解析到已存在资产的名/ID——由调用方
+    校验后传入；本函数返回 None 表示不可解析，调用方必须拒绝而非跳过）。
     """
+    if not isinstance(name, str) or not name:
+        return None
     cur.execute("SELECT slide_id FROM slides WHERE legacy_filename=%s",
                 (name,))
     row = cur.fetchone()
-    if row is not None:
-        return row["slide_id"]
-    slide_id = _new_slide_id()
-    lazy = _lazy_slide_columns(None, name)
-    cur.execute(
-        "INSERT INTO slides (slide_id, legacy_filename, original_filename, "
-        "display_name, format_ext, asset_state, storage_layout, published_at) "
-        "VALUES (%s,%s,%s,%s,%s,'ready','legacy',now())",
-        (slide_id, name, name, lazy["display_name"], lazy["format_ext"]))
-    if logger is not None:
-        logger.warning("share_slides 映射：名 %r 无 slides 行，已按迁移兼容"
-                       "语义懒建 legacy/ready 行 slide_id=%s", name, slide_id)
-    return slide_id
+    return row["slide_id"] if row is not None else None
 
 
 def create_share(slides, expires_hours, roi_sizes=None, permissions=None,
-                 creator_user_id=None, requester_role=None, rect_policy=None):
+                 creator_user_id=None, requester_role=None, rect_policy=None,
+                 slide_ids=None):
     """创建分享：生成 token、写入并返回 share dict（含 token/roi_sizes/rect_policy）。
 
     升级 C（§6.4）：rect_policy ∈ preset_only|custom；缺省 preset_only
     （新建分享不显式选择时不放宽为 custom）。
 
-    P1-B2（R-04）：INSERT shares 后把 slides 名数组逐个解析 legacy_filename→
-    slide_id 写入 share_slides（position=数组序，ON CONFLICT DO NOTHING）；
-    解析不到的名跳过并 log warning。**兼容过渡**：为保持「先建分享、后放文件」
-    的既有流程（以及 0067 之前从未注册过行的历史名）可读，无 slides 行的名按
-    set_slide_meta 懒建行同款语义补 legacy/ready 行再映射（迁移兼容层，见
-    _ensure_share_slide_row；P2 权限关系收口时随回填统一）。shares.slides
-    JSONB 照写（兼容快照——列表/claimed 展示仍读它，授权判定不再参与，
-    见 share_server._require_slide / slide_store.authorize_read）。
+    P1-B2（R-04）→ P2 收口（偏差 #4）：INSERT shares 后把成员逐个映射到
+    slide_id 写入 share_slides（position=数组序，ON CONFLICT DO NOTHING）。
+    ``slide_ids`` 显式给出（新客户端）时直接使用（快照名回查 legacy_filename）；
+    名数组走冻结别名解析。**无法解析到已存在资产的名/ID → ValueError（400，
+    指明哪一个）**——不再懒建行（「先建分享后放文件」旧流程收口）。shares.
+    slides JSONB 照写（兼容快照——列表/claimed 展示仍读它，授权判定不再
+    参与，见 share_server._require_slide / slide_store.authorize_read）。
     """
     _reject_guest_write(requester_role)
     roi_sizes_norm = _normalize_roi_sizes(roi_sizes)
@@ -394,24 +391,32 @@ def create_share(slides, expires_hours, roi_sizes=None, permissions=None,
                      psycopg.types.json.Jsonb(list(roi_sizes_norm)),
                      policy, expires_at, creator),
                 )
-                # R-04：share_slides ID 关系（授权判定唯一来源）
-                for pos, s in enumerate(slides):
-                    if not isinstance(s, str) or not s:
-                        _LOG.warning("share_slides 映射跳过非法名：%r", s)
-                        continue
-                    try:
-                        slide_id = _ensure_share_slide_row(cur, s)
-                    except Exception:
-                        _LOG.warning("share_slides 映射失败（跳过）：%s", s,
-                                     exc_info=True)
-                        continue
-                    if slide_id is None:
-                        _LOG.warning("share_slides 映射不到 slide_id（跳过）：%s", s)
-                        continue
+                # R-04：share_slides ID 关系（授权判定唯一来源）。
+                # P2 收口：slide_ids（新客户端）优先；名走冻结别名解析；
+                # 解析不到已存在资产 → 整体拒绝（ValueError → 400，指明哪个）。
+                resolved = []
+                ids = list(slide_ids) if slide_ids else [None] * len(list(slides))
+                for s, sid_in in zip(list(slides), ids):
+                    sid = sid_in
+                    if sid is None:
+                        if not isinstance(s, str) or not s:
+                            raise ValueError("分享成员含非法切片名：%r" % (s,))
+                        sid = _resolve_share_slide_row(cur, s)
+                        if sid is None:
+                            raise ValueError("切片不存在，无法加入分享: %s" % s)
+                    else:
+                        cur.execute(
+                            "SELECT slide_id FROM slides WHERE slide_id=%s",
+                            (sid,))
+                        if cur.fetchone() is None:
+                            raise ValueError("切片不存在，无法加入分享: %s"
+                                             % sid)
+                    resolved.append((s, sid))
+                for pos, (s, sid) in enumerate(resolved):
                     cur.execute(
                         "INSERT INTO share_slides (token, slide_id, position) "
                         "VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
-                        (token, slide_id, pos))
+                        (token, sid, pos))
         return {
             "slides": list(slides),
             "created_at": now,
@@ -814,13 +819,17 @@ def list_slide_view_grants():
 # --------------------------------------------------------------------------- #
 def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note="", visitor=None,
             source=None, created_by_session_id=None, _effect_key=None, owner_user_id=None,
-            requester_role=None, provenance=None, client_action_id=None, **geom):
+            requester_role=None, provenance=None, client_action_id=None,
+            slide_id=None, **geom):
     """为 token 的 share 添加一条标注；统一入口，支持 rect/arrow/freehand。
 
     语义与 json 完全一致（含 WAL effect_key 幂等、index 语义、source 推断）。
     0056：client_action_id（客户端幂等键）——有 owner 时按
     (owner_user_id, client_action_id) 唯一约束去重，重复提交返回原标注
     （唯一索引兜底并发，撞索引时回读原行）。
+    P2（合同 §3.1/R-08）：``slide_id`` 显式传入（id_bundle 资产/已解析的
+    调用方）或按 legacy 名解析（slides.legacy_filename 冻结映射）；解析不到
+    保持 NULL = unresolved。rois/change_log 双写 slide_id + slide 快照。
     """
     _reject_guest_write(requester_role)
     if type not in ROI_TYPES:
@@ -895,12 +904,15 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
                 now = time.time()
                 src = source if source in ("ai", "human") else (
                     "ai" if (is_admin and not shared) else "human")
+                # P2：slide_id 双写解析（显式优先；名解析失败保持 NULL）
+                eff_slide_id = slide_id or _slide_id_of_name(cur, slide)
                 # index = 该 token 全部 roi（含 tombstone）中新增前的数量
                 cur.execute("SELECT count(*) FROM rois WHERE token=%s", (token,))
                 total = int(cur.fetchone()["count"])
                 roi = {
                     "token": token,
                     "slide": slide,
+                    "slide_id": eff_slide_id or None,
                     "label": label,
                     "ts": now,
                     "shared": bool(shared),
@@ -925,7 +937,8 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
                     roi["provenance"] = dict(provenance)
                 roi.update(norm)
                 roi["change_seq"] = _bump_change_seq(
-                    cur, slide, token, roi["annotation_id"], "add")
+                    cur, slide, token, roi["annotation_id"], "add",
+                    slide_id=eff_slide_id)
                 rid = "roi_" + secrets.token_urlsafe(10)
                 try:
                     _insert_roi(cur, roi, rid)
@@ -1017,7 +1030,8 @@ def update_roi(token, index, geom=None, note=None, expected_revision=None):
                     roi["note"] = note_clean
                 roi["revision"] = int(roi.get("revision") or 1) + 1
                 roi["change_seq"] = _bump_change_seq(
-                    cur, roi.get("slide"), token, roi.get("annotation_id"), "update")
+                    cur, roi.get("slide"), token, roi.get("annotation_id"), "update",
+                    slide_id=roi.get("slide_id"))
                 roi["updated_at"] = time.time()
                 _update_roi_row(cur, rid, roi)
                 # index：同 token 非 tombstone 中按插入序
@@ -1201,7 +1215,8 @@ def delete_roi(token, index, expected_revision=None):
                 roi["deleted_at"] = time.time()
                 roi["revision"] = int(roi.get("revision") or 1) + 1
                 roi["change_seq"] = _bump_change_seq(
-                    cur, roi.get("slide"), token, roi.get("annotation_id"), "delete")
+                    cur, roi.get("slide"), token, roi.get("annotation_id"), "delete",
+                    slide_id=roi.get("slide_id"))
                 roi["updated_at"] = roi["deleted_at"]
                 _update_roi_row(cur, rid, roi)
                 return True, roi.get("annotation_id")
@@ -1234,7 +1249,8 @@ def delete_roi_by_annotation_id(annotation_id, expected_revision=None):
                 roi["revision"] = int(roi.get("revision") or 1) + 1
                 roi["change_seq"] = _bump_change_seq(
                     cur, roi.get("slide"), roi.get("token"),
-                    roi.get("annotation_id"), "delete")
+                    roi.get("annotation_id"), "delete",
+                    slide_id=roi.get("slide_id"))
                 roi["updated_at"] = roi["deleted_at"]
                 _update_roi_row(cur, rid, roi)
                 return True
@@ -1275,7 +1291,8 @@ def restore_roi(annotation_id, expected_revision=None):
                 roi["updated_at"] = time.time()
                 roi["change_seq"] = _bump_change_seq(
                     cur, roi.get("slide"), roi.get("token") or "",
-                    roi.get("annotation_id"), "restore")
+                    roi.get("annotation_id"), "restore",
+                    slide_id=roi.get("slide_id"))
                 _update_roi_row(cur, rid, roi)
                 out = _roi_out(roi)
                 out["shared"] = _roi_shared_compat(roi)
@@ -1335,7 +1352,7 @@ def update_roi_by_annotation_id(annotation_id, geom=None, note=None,
                 roi["revision"] = int(roi.get("revision") or 1) + 1
                 roi["change_seq"] = _bump_change_seq(
                     cur, roi.get("slide"), token, roi.get("annotation_id"),
-                    "update")
+                    "update", slide_id=roi.get("slide_id"))
                 roi["updated_at"] = time.time()
                 _update_roi_row(cur, rid, roi)
                 out = _roi_out(roi)
@@ -1345,24 +1362,32 @@ def update_roi_by_annotation_id(annotation_id, geom=None, note=None,
         conn.close()
 
 
-def upsert_ai_session_principal(session_id, user_id, slide=None):
-    """绑定 AI 会话属主（spots 读取主体）。已有会话不得改绑 user_id。"""
+def upsert_ai_session_principal(session_id, user_id, slide=None, slide_id=None):
+    """绑定 AI 会话属主（spots 读取主体）。已有会话不得改绑 user_id。
+
+    P2（合同 §3.3/R-09）：slide_id + slide 快照双写；slide_id 显式给出时
+    优先（名仅作快照/兼容）。读取路径（_internal_ai_read_subject）兼容双列。
+    """
     if not session_id or not user_id:
         return False
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
+                if slide_id is None and slide:
+                    slide_id = _slide_id_of_name(cur, slide)
                 cur.execute(
                     "INSERT INTO ai_session_principals "
-                    "(session_id, user_id, slide, updated_at) "
-                    "VALUES (%s,%s,%s,now()) "
+                    "(session_id, user_id, slide, slide_id, updated_at) "
+                    "VALUES (%s,%s,%s,%s,now()) "
                     "ON CONFLICT (session_id) DO UPDATE SET "
                     "slide=COALESCE(EXCLUDED.slide, ai_session_principals.slide), "
+                    "slide_id=COALESCE(EXCLUDED.slide_id, "
+                    "ai_session_principals.slide_id), "
                     "updated_at=now() "
                     "WHERE ai_session_principals.user_id = EXCLUDED.user_id "
                     "RETURNING user_id",
-                    (session_id, user_id, slide or None),
+                    (session_id, user_id, slide or None, slide_id or None),
                 )
                 row = cur.fetchone()
                 if row is not None:
@@ -1377,7 +1402,7 @@ def upsert_ai_session_principal(session_id, user_id, slide=None):
 
 
 def get_ai_session_principal(session_id):
-    """返回 {session_id, user_id, slide} 或 None。"""
+    """返回 {session_id, user_id, slide, slide_id} 或 None。"""
     if not session_id:
         return None
     conn = _connect()
@@ -1385,7 +1410,8 @@ def get_ai_session_principal(session_id):
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT session_id, user_id, slide FROM ai_session_principals "
+                    "SELECT session_id, user_id, slide, slide_id "
+                    "FROM ai_session_principals "
                     "WHERE session_id=%s",
                     (session_id,))
                 row = cur.fetchone()
@@ -1394,7 +1420,8 @@ def get_ai_session_principal(session_id):
         conn.close()
 
 
-def list_changes(slide, after_seq, subject=None, access_context=None):
+def list_changes(slide, after_seq, subject=None, access_context=None,
+                 slide_id=None):
     """返回 change_seq > after_seq 的全部变更（含 tombstone）。
 
     Stage 3c-1：含评论增删（type=comment）与标注变更（type=annotation）；tombstone
@@ -1402,26 +1429,48 @@ def list_changes(slide, after_seq, subject=None, access_context=None):
     0056 工单 A / P0：subject 非 None 时按主体过滤（annotation_access.
     filter_changes）——不可见标注的文本/几何/身份/tombstone 与挂靠评论一律
     不出流；被跳过事件的 seq 照常越过（游标推进语义不变）。
+    P2（合同 §3.1/R-08）：``slide_id`` 给出时活动查询一律按 slide_id 过滤
+    （rois/comments/annotation_access_events 三处）；slide_id IS NULL 的历史
+    行 = unresolved，不展示在新资产下。仅给名（legacy 兼容）时按名查询。
     """
     if not isinstance(after_seq, (int, float)):
         after_seq = 0
+    if slide_id is None and slide:
+        # 名入参（未解析的调用方）：按冻结别名解析；解析不到 → unresolved 空集
+        conn0 = _connect()
+        try:
+            with pg_store.transaction(conn0) as c0:
+                with c0.cursor() as cur0:
+                    slide_id = _slide_id_of_name(cur0, slide)
+        finally:
+            conn0.close()
+    if slide_id is not None:
+        roi_cond, cmt_cond, acc_cond = "slide_id=%s", "slide_id=%s", \
+            "slide_id=%s AND seq > %s"
+        roi_params, cmt_params, acc_params = (slide_id,), (slide_id,), \
+            (slide_id, after_seq)
+    else:
+        roi_cond, cmt_cond, acc_cond = "slide=%s", "slide=%s", \
+            "slide=%s AND seq > %s"
+        roi_params, cmt_params, acc_params = (slide,), (slide,), \
+            (slide, after_seq)
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT data FROM rois WHERE slide=%s ORDER BY insert_seq",
-                    (slide,))
+                    "SELECT data FROM rois WHERE " + roi_cond +
+                    " ORDER BY insert_seq", roi_params)
                 rows = cur.fetchall()
                 cur.execute(
-                    "SELECT data FROM comments WHERE slide=%s ORDER BY created_at",
-                    (slide,))
+                    "SELECT data FROM comments WHERE " + cmt_cond +
+                    " ORDER BY created_at", cmt_params)
                 crows = cur.fetchall()
                 cur.execute(
-                    "SELECT seq, slide, annotation_id, op, grantee_kind, grantee_id "
-                    "FROM annotation_access_events WHERE slide=%s AND seq > %s "
-                    "ORDER BY seq",
-                    (slide, after_seq))
+                    "SELECT seq, slide, slide_id, annotation_id, op, "
+                    "grantee_kind, grantee_id "
+                    "FROM annotation_access_events WHERE " + acc_cond +
+                    " ORDER BY seq", acc_params)
                 access_rows = cur.fetchall()
         if subject is not None:
             ctx = (access_context if access_context is not None
@@ -1467,6 +1516,7 @@ def list_changes(slide, after_seq, subject=None, access_context=None):
                 "op": row["op"],
                 "annotation_id": row["annotation_id"],
                 "slide": row["slide"],
+                "slide_id": row["slide_id"],
                 "change_seq": int(row["seq"]),
                 "grantee_kind": row["grantee_kind"],
                 "grantee_id": row["grantee_id"],
@@ -1481,15 +1531,32 @@ def list_changes(slide, after_seq, subject=None, access_context=None):
         conn.close()
 
 
-def current_change_seq(slide):
-    """返回某切片当前的全局 change_seq 水位（无则 0）。"""
+def current_change_seq(slide, slide_id=None):
+    """返回某切片当前的全局 change_seq 水位（无则 0）。
+
+    P2：slide_id 给出时按 ID 查（活动查询口径）；仅名时先解析，解析不到
+    按名查（legacy 兼容）。
+    """
+    cond, params = "slide=%s", (slide,)
+    if slide_id is not None:
+        cond, params = "slide_id=%s", (slide_id,)
+    elif slide:
+        conn0 = _connect()
+        try:
+            with pg_store.transaction(conn0) as c0:
+                with c0.cursor() as cur0:
+                    sid = _slide_id_of_name(cur0, slide)
+            if sid is not None:
+                cond, params = "slide_id=%s", (sid,)
+        finally:
+            conn0.close()
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
                     "SELECT COALESCE(MAX(seq), 0)::int AS s FROM change_log "
-                    "WHERE slide=%s", (slide,))
+                    "WHERE " + cond, params)
                 return int(cur.fetchone()["s"])
     finally:
         conn.close()
@@ -1564,21 +1631,27 @@ def set_roi_shared(token, index, shared, expected_revision=None,
 # --------------------------------------------------------------------------- #
 def _record_access_event_tx(cur, annotation_id, op, grantee_kind, grantee_id,
                             actor_user_id=None):
-    """写入 change_log + annotation_access_events（同 seq）。"""
+    """写入 change_log + annotation_access_events（同 seq）。
+
+    P2（合同 §3.1/R-14）：slide_id 随 roi 行当前值双写（离散列权威；历史
+    NULL 保持 NULL = unresolved，不猜）。
+    """
     cur.execute(
-        "SELECT slide, token FROM rois WHERE annotation_id=%s LIMIT 1",
+        "SELECT slide, token, slide_id FROM rois WHERE annotation_id=%s LIMIT 1",
         (annotation_id,))
     row = cur.fetchone()
     if row is None:
         return None
     slide, token = row["slide"], row["token"] or ""
-    seq = _bump_change_seq(cur, slide, token, annotation_id, "access_" + op)
+    seq = _bump_change_seq(cur, slide, token, annotation_id, "access_" + op,
+                           slide_id=row["slide_id"])
     cur.execute(
         "INSERT INTO annotation_access_events "
-        "(seq, slide, annotation_id, op, grantee_kind, grantee_id, actor_user_id) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+        "(seq, slide, annotation_id, op, grantee_kind, grantee_id, actor_user_id, "
+        " slide_id) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
         (seq, slide, annotation_id, op, grantee_kind, grantee_id,
-         actor_user_id or None),
+         actor_user_id or None, row["slide_id"]),
     )
     return seq
 
@@ -1889,6 +1962,20 @@ def _new_slide_id() -> str:
     return "sld_" + secrets.token_urlsafe(9)  # 12 位 urlsafe
 
 
+def _slide_id_of_name(cur, name):
+    """legacy 名 → slide_id（P2 关系双写解析；无行返回 None = unresolved）。
+
+    只查 slides.legacy_filename 冻结映射（R-01），不建行、不猜；tombstone
+    行的映射也算（关系快照指向原资产生代，读取门禁按 asset_state 拒绝）。
+    """
+    if not isinstance(name, str) or not name:
+        return None
+    cur.execute("SELECT slide_id FROM slides WHERE legacy_filename=%s",
+                (name,))
+    row = cur.fetchone()
+    return row["slide_id"] if row is not None else None
+
+
 # P1-B2（slide ID 化重构，docs/slide-id-refactor-p1-contract-20260925.md §8）：
 # slides 行新增身份/状态列的写侧归一助手（与 slide_store.normalize_format_ext
 # 同口径的小写白名单 ^[a-z0-9]{1,16}$；本模块不 import slide_store，保持
@@ -1929,8 +2016,10 @@ def set_slide_meta(name, alias=None, note=None, owner_user_id=None, public=None,
     P1-B2（合同 §8 兼容与退出条件）：按名懒建行是**迁移兼容层**——仅限既有
     legacy writer（上传 commit/归属校正/恢复/demo 目录/导入脚本）使用；正常
     新读写自 P3 起改走 slide_store 的 ID 原语。新行进入 asset_state='ready' /
-    storage_layout='legacy'（_lazy_slide_columns），保持「写完即可读」旧行为；
-    alias 写入时同步双写 display_name（R-02；alias 列停写在 P2）。
+    storage_layout='legacy'（_lazy_slide_columns），保持「写完即可读」旧行为。
+    P2（合同 §7 / R-02 收口）：**alias 列停写**——UPDATE 不再 SET alias、
+    INSERT 时 alias 列留 ''；``alias`` 入参仅映射 display_name（旧客户端
+    兼容），读侧出参一律从 display_name 派生。
     """
     _reject_guest_write(requester_role)
     conn = _connect()
@@ -1958,10 +2047,9 @@ def set_slide_meta(name, alias=None, note=None, owner_user_id=None, public=None,
                 params = []
                 if alias is not None:
                     a = alias.strip() if isinstance(alias, str) else ""
-                    sets.append("alias=%s")
-                    params.append(a)
-                    # R-02 双写过渡：alias 非空 → display_name=alias；清空 →
-                    # 回落 original_filename/legacy_filename（与回填规则同口径）
+                    # R-02 收口（P2）：alias 列停写——入参仅映射 display_name
+                    # （非空 → display_name=alias；清空 → 回落
+                    # original_filename/legacy_filename，与回填规则同口径）。
                     sets.append(
                         "display_name=COALESCE(NULLIF(%s,''), original_filename,"
                         " legacy_filename, '')")
@@ -1994,11 +2082,12 @@ def set_slide_meta(name, alias=None, note=None, owner_user_id=None, public=None,
                     " AND asset_state IN ('deleted','deleting')",
                     (slide_id,))
                 cur.execute(
-                    "SELECT alias, note, owner_user_id, public FROM slides "
-                    "WHERE slide_id=%s", (slide_id,))
+                    "SELECT display_name, note, owner_user_id, public "
+                    "FROM slides WHERE slide_id=%s", (slide_id,))
                 r2 = cur.fetchone()
                 return {
-                    "alias": r2["alias"] or "",
+                    # R-02：alias 出参从 display_name 派生（列值不再读）
+                    "alias": (r2["display_name"] or ""),
                     "note": r2["note"] or "",
                     "owner_user_id": r2["owner_user_id"],
                     "public": bool(r2["public"]),
@@ -2008,17 +2097,21 @@ def set_slide_meta(name, alias=None, note=None, owner_user_id=None, public=None,
 
 
 def get_slide_meta(name):
-    """返回某切片的 {alias, note}（无则空 dict，保证字段存在为空串）。"""
+    """返回某切片的 {alias, note}（无则空 dict，保证字段存在为空串）。
+
+    P2（R-02 收口）：alias 出参从 display_name 派生（alias 列停写后不再读）。
+    """
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                cur.execute("SELECT alias, note FROM slides WHERE legacy_filename=%s",
-                            (name,))
+                cur.execute(
+                    "SELECT display_name, note FROM slides "
+                    "WHERE legacy_filename=%s", (name,))
                 row = cur.fetchone()
         if row is None:
             return {"alias": "", "note": ""}
-        return {"alias": row["alias"] or "", "note": row["note"] or ""}
+        return {"alias": row["display_name"] or "", "note": row["note"] or ""}
     finally:
         conn.close()
 
@@ -2030,13 +2123,13 @@ def get_slide_meta_full(name):
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT alias, note, owner_user_id, public FROM slides "
-                    "WHERE legacy_filename=%s", (name,))
+                    "SELECT display_name, note, owner_user_id, public "
+                    "FROM slides WHERE legacy_filename=%s", (name,))
                 row = cur.fetchone()
         if row is None:
             return {"alias": "", "note": "", "owner_user_id": None, "public": False}
         return {
-            "alias": row["alias"] or "",
+            "alias": row["display_name"] or "",
             "note": row["note"] or "",
             "owner_user_id": row["owner_user_id"],
             "public": bool(row["public"]),
@@ -2046,20 +2139,23 @@ def get_slide_meta_full(name):
 
 
 def get_all_slide_meta_full():
-    """返回全量 {name: {alias, note, owner_user_id, public}}。"""
+    """返回全量 {name: {alias, note, owner_user_id, public}}。
+
+    P2（R-02 收口）：alias 出参从 display_name 派生。
+    """
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT legacy_filename, alias, note, owner_user_id, public "
-                    "FROM slides WHERE legacy_filename IS NOT NULL ORDER BY "
-                    "legacy_filename")
+                    "SELECT legacy_filename, display_name, note, owner_user_id, "
+                    "public FROM slides WHERE legacy_filename IS NOT NULL "
+                    "ORDER BY legacy_filename")
                 rows = cur.fetchall()
         out = {}
         for row in rows:
             out[row["legacy_filename"]] = {
-                "alias": row["alias"] or "",
+                "alias": row["display_name"] or "",
                 "note": row["note"] or "",
                 "owner_user_id": row["owner_user_id"],
                 "public": bool(row["public"]),
@@ -2070,16 +2166,16 @@ def get_all_slide_meta_full():
 
 
 def get_all_slide_meta():
-    """返回全量 {name: {alias, note}}。"""
+    """返回全量 {name: {alias, note}}（R-02：alias 从 display_name 派生）。"""
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT legacy_filename, alias, note FROM slides "
+                    "SELECT legacy_filename, display_name, note FROM slides "
                     "WHERE legacy_filename IS NOT NULL ORDER BY legacy_filename")
                 rows = cur.fetchall()
-        return {row["legacy_filename"]: {"alias": row["alias"] or "",
+        return {row["legacy_filename"]: {"alias": row["display_name"] or "",
                                           "note": row["note"] or ""}
                 for row in rows}
     finally:
@@ -2153,8 +2249,47 @@ def _dedupe(slides):
     return out
 
 
-def create_project(name, note="", slides=None, owner_user_id=None, requester_role=None):
-    """创建项目。pid=secrets.token_urlsafe(10)。返回新建项目 dict（含 pid）。"""
+def _project_slide_rows(cur, slides, slide_ids=None):
+    """project_slides 双写行构造（P2 / 合同 §3.2 / R-07）。
+
+    slide_ids 显式给出（新客户端）时以 ID 为权威（名快照缺失时回查
+    legacy_filename）；否则按名解析 slide_id（解析不到保持 NULL——与既有
+    无行夹具兼容，唯一键 (project_id, slide_id) 对 NULL 不生效）。去重保序：
+    slide_id 已见的行跳过（同名不同 ID 可并存）。
+    """
+    rows = []
+    seen_ids, seen_names = set(), set()
+    slides = list(slides or [])
+    ids = list(slide_ids) if slide_ids else [None] * len(slides)
+    for name, sid_in in zip(slides, ids):
+        sid = sid_in or None
+        if sid is None and name:
+            sid = _slide_id_of_name(cur, name)
+        elif sid is not None and not name:
+            cur.execute(
+                "SELECT legacy_filename FROM slides WHERE slide_id=%s", (sid,))
+            row = cur.fetchone()
+            name = (row["legacy_filename"] or "") if row is not None else ""
+        if sid is not None:
+            if sid in seen_ids:
+                continue
+            seen_ids.add(sid)
+        elif name and name in seen_names:
+            continue
+        if name:
+            seen_names.add(name)
+        rows.append((name or "", sid))
+    return rows
+
+
+def create_project(name, note="", slides=None, owner_user_id=None,
+                   requester_role=None, slide_ids=None):
+    """创建项目。pid=secrets.token_urlsafe(10)。返回新建项目 dict（含 pid）。
+
+    P2（合同 §3.2/R-07）：slide_ids 优先或名数组（alias 解析）；project_slides
+    写 slide_id + 文本快照双列；唯一键 (project_id, slide_id)——同名不同 ID
+    可并存（0067 部分唯一索引）。
+    """
     _reject_guest_write(requester_role)
     pid = "prj_" + secrets.token_urlsafe(10)
     now = time.time()
@@ -2175,12 +2310,17 @@ def create_project(name, note="", slides=None, owner_user_id=None, requester_rol
                     "INSERT INTO projects (project_id, name, note, owner_user_id, "
                     "created_at) VALUES (%s,%s,%s,%s, to_timestamp(%s))",
                     (pid, proj["name"], proj["note"], proj["owner_user_id"], now))
-                for i, s in enumerate(uniq):
+                rows = _project_slide_rows(cur, list(slides or []),
+                                          slide_ids)
+                for i, (s, sid) in enumerate(rows):
                     cur.execute(
-                        "INSERT INTO project_slides (project_id, slide, position) "
-                        "VALUES (%s,%s,%s)", (pid, s, i))
+                        "INSERT INTO project_slides "
+                        "(project_id, slide, position, slide_id) "
+                        "VALUES (%s,%s,%s,%s)", (pid, s, i, sid))
         out = dict(proj)
         out["pid"] = pid
+        out["slides"] = [r[0] for r in rows if r[0]]
+        out["slide_ids"] = [r[1] for r in rows if r[1]]
         return out
     finally:
         conn.close()
@@ -2197,12 +2337,13 @@ def _fetch_project(cur, pid):
     row = cur.fetchone()
     if row is None:
         return None
-    cur.execute("SELECT slide FROM project_slides WHERE project_id=%s "
+    cur.execute("SELECT slide, slide_id FROM project_slides WHERE project_id=%s "
                 "ORDER BY position", (pid,))
-    slides = [r["slide"] for r in cur.fetchall()]
+    prows = cur.fetchall()
     d = dict(row)
     d["pid"] = pid
-    d["slides"] = slides
+    d["slides"] = [r["slide"] for r in prows]
+    d["slide_ids"] = [r["slide_id"] for r in prows if r["slide_id"]]
     return d
 
 
@@ -2237,7 +2378,7 @@ def get_project(pid):
         conn.close()
 
 
-def update_project(pid, *, name=None, note=None, slides=None):
+def update_project(pid, *, name=None, note=None, slides=None, slide_ids=None):
     """更新项目字段（仅更新非 None 字段）。返回更新后的 dict；不存在返回 None。"""
     conn = _connect()
     try:
@@ -2255,19 +2396,25 @@ def update_project(pid, *, name=None, note=None, slides=None):
                     cur.execute("UPDATE projects SET note=%s WHERE project_id=%s",
                                 (str(note), pid))
                 if slides is not None:
-                    uniq = _dedupe(slides)
+                    rows = _project_slide_rows(cur, list(slides or []),
+                                               slide_ids)
                     cur.execute("DELETE FROM project_slides WHERE project_id=%s", (pid,))
-                    for i, s in enumerate(uniq):
+                    for i, (s, sid) in enumerate(rows):
                         cur.execute(
-                            "INSERT INTO project_slides (project_id, slide, position) "
-                            "VALUES (%s,%s,%s)", (pid, s, i))
+                            "INSERT INTO project_slides "
+                            "(project_id, slide, position, slide_id) "
+                            "VALUES (%s,%s,%s,%s)", (pid, s, i, sid))
                 return _fetch_project(cur, pid)
     finally:
         conn.close()
 
 
-def add_slides_to_project(pid, slides):
-    """向项目追加切片（去重保序）。返回更新后的 dict；不存在返回 None。"""
+def add_slides_to_project(pid, slides, slide_ids=None):
+    """向项目追加切片（去重保序）。返回更新后的 dict；不存在返回 None。
+
+    P2（合同 §3.2）：slide_ids 优先或名数组；双列写入；同名不同 ID 可并存
+    （去重键 = slide_id，NULL-ID 行按名去重保持旧行为）。
+    """
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -2275,26 +2422,69 @@ def add_slides_to_project(pid, slides):
                 cur.execute("SELECT project_id FROM projects WHERE project_id=%s", (pid,))
                 if cur.fetchone() is None:
                     return None
-                cur.execute("SELECT slide FROM project_slides WHERE project_id=%s "
-                            "ORDER BY position", (pid,))
-                existing = [r["slide"] for r in cur.fetchall()]
+                cur.execute("SELECT slide, slide_id FROM project_slides "
+                            "WHERE project_id=%s ORDER BY position", (pid,))
+                prows = cur.fetchall()
+                existing = [r["slide"] for r in prows]
+                seen_ids = {r["slide_id"] for r in prows if r["slide_id"]}
                 seen = set(existing)
                 pos = len(existing)
-                for s in slides or []:
-                    if isinstance(s, str) and s not in seen:
+                for s, sid in _project_slide_rows(cur, slides, slide_ids):
+                    if sid is not None:
+                        if sid in seen_ids:
+                            continue
+                        seen_ids.add(sid)
+                    elif s and s in seen:
+                        continue
+                    if s:
                         seen.add(s)
-                        cur.execute(
-                            "INSERT INTO project_slides (project_id, slide, position) "
-                            "VALUES (%s,%s,%s)", (pid, s, pos))
-                        existing.append(s)
-                        pos += 1
+                    cur.execute(
+                        "INSERT INTO project_slides "
+                        "(project_id, slide, position, slide_id) "
+                        "VALUES (%s,%s,%s,%s)", (pid, s, pos, sid))
+                    existing.append(s)
+                    pos += 1
                 return _fetch_project(cur, pid)
     finally:
         conn.close()
 
 
 def remove_slide_from_project(pid, slide):
-    """从项目移除某切片。返回更新后的 dict；不存在或无该切片返回 None。"""
+    """从项目移除某切片（legacy 名通道）。返回更新后的 dict；不存在或无该切片返回 None。
+
+    P2：优先按解析到的 slide_id 删（同名不同 ID 时精确命中）；解析不到回退
+    名删（无行兼容）。ID 通道请用 remove_slide_from_project_by_id。
+    """
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute("SELECT project_id FROM projects WHERE project_id=%s", (pid,))
+                if cur.fetchone() is None:
+                    return None
+                sid = _slide_id_of_name(cur, slide)
+                if sid is not None:
+                    cur.execute(
+                        "DELETE FROM project_slides "
+                        "WHERE project_id=%s AND (slide_id=%s OR "
+                        "(slide_id IS NULL AND slide=%s)) RETURNING 1",
+                        (pid, sid, slide))
+                else:
+                    cur.execute(
+                        "DELETE FROM project_slides WHERE project_id=%s AND slide=%s "
+                        "RETURNING 1", (pid, slide))
+                if cur.fetchone() is None:
+                    return None
+                return _fetch_project(cur, pid)
+    finally:
+        conn.close()
+
+
+def remove_slide_from_project_by_id(pid, slide_id):
+    """从项目按 slide_id 移除切片（P2 新端点 DELETE /api/project/<pid>/slides/
+    <slide_id> 的存储原语）。返回更新后的 dict；不存在或无该切片返回 None。"""
+    if not isinstance(slide_id, str) or not slide_id:
+        return None
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -2303,8 +2493,9 @@ def remove_slide_from_project(pid, slide):
                 if cur.fetchone() is None:
                     return None
                 cur.execute(
-                    "DELETE FROM project_slides WHERE project_id=%s AND slide=%s "
-                    "RETURNING 1", (pid, slide))
+                    "DELETE FROM project_slides "
+                    "WHERE project_id=%s AND slide_id=%s RETURNING 1",
+                    (pid, slide_id))
                 if cur.fetchone() is None:
                     return None
                 return _fetch_project(cur, pid)
@@ -2341,7 +2532,8 @@ def annotations_by_slide(subject=None, access_context=None):
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT data FROM rois WHERE NOT deleted ORDER BY insert_seq")
+                    "SELECT data, slide_id FROM rois WHERE NOT deleted "
+                    "ORDER BY insert_seq")
                 rows = cur.fetchall()
         ctx = (access_context if access_context is not None
                else annotation_access.access_context_for(subject)
@@ -2357,6 +2549,10 @@ def annotations_by_slide(subject=None, access_context=None):
             if subject is not None and not annotation_access.can_read_annotation(
                     subject, r, ctx):
                 continue
+            # P2（合同 §3.1）：分组键保持名称快照（legacy_filename UNIQUE，
+            # 同显示名不同资产天然分组；id_bundle 行按 original_filename 快照）
+            # ——资产身份由 items.slide_id 携带，ID 维度过滤在
+            # annotations_by_project / 单切片端点按 slide_id 执行。
             slide = r.get("slide")
             lbl = _norm_label(r.get("label"))
             grp_map = by_slide.setdefault(slide, {})
@@ -2369,6 +2565,7 @@ def annotations_by_slide(subject=None, access_context=None):
                 "index": idx,
                 "token": tok,
                 "slide": r.get("slide"),
+                "slide_id": r.get("slide_id"),
                 "type": r.get("type", "rect"),
                 "x": r.get("x"),
                 "y": r.get("y"),
@@ -2404,17 +2601,22 @@ def annotations_by_slide(subject=None, access_context=None):
 
 def annotations_by_project(pid=None, subject=None, access_context=None):
     """与 annotations_by_slide 同结构，但可选按项目内的 slides 过滤（subject
-    语义同 annotations_by_slide：非 None 时按主体过滤）。"""
+    语义同 annotations_by_slide：非 None 时按主体过滤）。
+
+    P2（合同 §3.2）：过滤按 project_slides.slide_id（权威）——分组键即
+    slide_id（无 ID 历史行按名快照分组）；项目内同名不同 ID 并存互不串。
+    """
     by_slide = annotations_by_slide(subject=subject,
                                     access_context=access_context)
     if pid is None:
         return by_slide
     proj = get_project(pid)
+    project_ids = set(proj.get("slide_ids", []) or []) if proj else set()
     project_slides = set(proj.get("slides", [])) if proj else set()
     return {
         slide: groups
         for slide, groups in by_slide.items()
-        if slide in project_slides
+        if slide in project_ids or slide in project_slides
     }
 
 
@@ -2426,20 +2628,24 @@ def annotations_by_project(pid=None, subject=None, access_context=None):
 # 返回。语义与 json 完全一致。
 # --------------------------------------------------------------------------- #
 def _insert_comment(cur, cmt: dict, cid: str):
-    """插入一条 comment：data 存权威 dict，离散列镜像。"""
+    """插入一条 comment：data 存权威 dict，离散列镜像。
+
+    P2（合同 §3.1/R-08）：slide_id（权威）+ slide（名称快照）双列。
+    """
     now = cmt.get("updated_at") or cmt.get("created_at") or time.time()
     cur.execute(
         "INSERT INTO comments "
         "(comment_id, annotation_id, slide, token, author_user_id, author_label, "
-        " body, parent_id, resolved, deleted, created_at, updated_at, data) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, to_timestamp(%s), to_timestamp(%s), %s)",
+        " body, parent_id, resolved, deleted, created_at, updated_at, data, "
+        " slide_id) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, to_timestamp(%s), to_timestamp(%s), %s, %s)",
         (
             cid, cmt.get("annotation_id", ""), cmt.get("slide", ""),
             cmt.get("token", ""), cmt.get("author_user_id"),
             cmt.get("author_label", "访客"), cmt.get("body", ""),
             cmt.get("parent_id"), bool(cmt.get("resolved", False)),
             bool(cmt.get("deleted", False)), cmt.get("created_at", now), now,
-            psycopg.types.json.Jsonb(cmt),
+            psycopg.types.json.Jsonb(cmt), cmt.get("slide_id") or None,
         ),
     )
 
@@ -2456,8 +2662,13 @@ def _update_comment_row(cur, cid: str, cmt: dict):
 
 
 def add_comment(annotation_id, slide, token, body, author_user_id=None,
-                author_label="", parent_id=None, requester_role=None):
-    """新增评论；返回 comment dict（含 comment_id/change_seq）。语义同 json。"""
+                author_label="", parent_id=None, requester_role=None,
+                slide_id=None):
+    """新增评论；返回 comment dict（含 comment_id/change_seq）。语义同 json。
+
+    P2（合同 §3.1/R-08）：slide_id 显式优先，否则按 legacy 名解析；解析不到
+    保持 NULL = unresolved。comments/change_log 双写。
+    """
     body_clean = _clean_comment_body(body)
     if not body_clean:
         raise ValueError("评论正文不能为空")
@@ -2481,8 +2692,13 @@ def add_comment(annotation_id, slide, token, body, author_user_id=None,
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
+                eff_slide_id = slide_id
+                if eff_slide_id is None:
+                    eff_slide_id = _slide_id_of_name(cur, slide)
+                cmt["slide_id"] = eff_slide_id or None
                 cmt["change_seq"] = _bump_change_seq(
-                    cur, slide, token, cid, "comment_add")
+                    cur, slide, token, cid, "comment_add",
+                    slide_id=eff_slide_id)
                 _insert_comment(cur, cmt, cid)
                 return dict(cmt)
     finally:
@@ -2490,7 +2706,8 @@ def add_comment(annotation_id, slide, token, body, author_user_id=None,
 
 
 def list_comments(annotation_id=None, slide=None, subject=None,
-                  access_context=None, access_token=None, project=True):
+                  access_context=None, access_token=None, project=True,
+                  slide_id=None):
     """返回评论列表（跳过软删）。可按 annotation_id / slide 过滤。按 created_at 升序。
 
     0056：subject 非 None 时按父标注可见性过滤（父不可见 → 评论不出；
@@ -2501,7 +2718,11 @@ def list_comments(annotation_id=None, slide=None, subject=None,
     if annotation_id is not None:
         clauses.append("annotation_id=%s")
         params.append(annotation_id)
-    if slide is not None:
+    if slide_id is not None:
+        # P2 活动查询口径：按 ID 过滤（NULL-ID 历史行 = unresolved 不出）
+        clauses.append("slide_id=%s")
+        params.append(slide_id)
+    elif slide is not None:
         clauses.append("slide=%s")
         params.append(slide)
     conn = _connect()
@@ -2570,7 +2791,7 @@ def delete_comment(comment_id):
                 cmt["updated_at"] = time.time()
                 cmt["change_seq"] = _bump_change_seq(
                     cur, cmt.get("slide"), cmt.get("token"), comment_id,
-                    "comment_delete")
+                    "comment_delete", slide_id=cmt.get("slide_id"))
                 _update_comment_row(cur, comment_id, cmt)
                 return True
     finally:
@@ -2598,11 +2819,12 @@ def _reset_audit_fail_log_state():
 
 
 def record_audit(action, actor_user_id=None, actor_role=None, target_type=None,
-                 target_id=None, slide=None, detail=None, ts=None):
+                 target_id=None, slide=None, detail=None, ts=None, slide_id=None):
     """best-effort 追加一条审计事件；写失败吞掉返回 False，绝不抛异常。
 
     与 json 的 record_audit 同签名同语义（dispatcher 在 dual 下同参重放到 pg，
     各自生成独立 event_id，跨库 id 无需一致）。detail 绝不存 api_key/明文密码。
+    P2（合同 §3.4/R-14）：``slide_id`` 与名称快照 ``slide`` 双写。
     """
     ev_id = "aud_" + secrets.token_hex(16)
     detail = dict(detail) if isinstance(detail, dict) else {}
@@ -2614,12 +2836,13 @@ def record_audit(action, actor_user_id=None, actor_role=None, target_type=None,
                     cur.execute(
                         "INSERT INTO audit_events "
                         "(event_id, ts, actor_user_id, actor_role, action, "
-                        " target_type, target_id, slide, detail) "
-                        "VALUES (%s, to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s)",
+                        " target_type, target_id, slide, detail, slide_id) "
+                        "VALUES (%s, to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s, %s)",
                         (ev_id, ts if ts is not None else time.time(),
                          actor_user_id or None, actor_role or "",
                          str(action or ""), target_type or None, target_id or None,
-                         slide or None, psycopg.types.json.Jsonb(detail)),
+                         slide or None, psycopg.types.json.Jsonb(detail),
+                         slide_id or None),
                     )
             return True
         finally:
@@ -2643,7 +2866,7 @@ def record_audit(action, actor_user_id=None, actor_role=None, target_type=None,
 
 def record_audit_tx(cur, action, actor_user_id=None, actor_role=None,
                     target_type=None, target_id=None, slide=None, detail=None,
-                    ts=None):
+                    ts=None, slide_id=None):
     """同事务审计写入（cursor 注入变体，PR5 billing 写路径专用）。
 
     与 record_audit 的关键差异：**不吞错**——任何失败直接抛出，让调用方的
@@ -2657,12 +2880,12 @@ def record_audit_tx(cur, action, actor_user_id=None, actor_role=None,
     cur.execute(
         "INSERT INTO audit_events "
         "(event_id, ts, actor_user_id, actor_role, action, "
-        " target_type, target_id, slide, detail) "
-        "VALUES (%s, to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s)",
+        " target_type, target_id, slide, detail, slide_id) "
+        "VALUES (%s, to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s, %s)",
         (ev_id, ts if ts is not None else time.time(),
          actor_user_id or None, actor_role or "",
          str(action or ""), target_type or None, target_id or None,
-         slide or None, psycopg.types.json.Jsonb(detail)),
+         slide or None, psycopg.types.json.Jsonb(detail), slide_id or None),
     )
     return ev_id
 
@@ -2922,6 +3145,7 @@ def set_installation_capabilities(installation_id, capabilities):
 # --------------------------------------------------------------------------- #
 _GRANT_SEL = (
     "SELECT grant_id, installation_id, slide, session_id, created_by_user_id, "
+    " slide_id, "
     " extract(epoch from created_at)::float8 AS created_at, "
     " extract(epoch from expires_at)::float8 AS expires_at, revoked, "
     " extract(epoch from revoked_at)::float8 AS revoked_at "
@@ -2935,8 +3159,13 @@ def _fetch_grant(cur, grant_id):
 
 
 def create_run_grant(installation_id, slide, session_id="",
-                     created_by_user_id=None, ttl_seconds=None):
-    """发放一条 run grant（默认 2h），返回 grant dict。"""
+                     created_by_user_id=None, ttl_seconds=None, slide_id=None):
+    """发放一条 run grant（默认 2h），返回 grant dict。
+
+    P2（合同 §3.3/R-09）：slide_id（权威）+ slide（名称快照）双写；slide_id
+    未显式给出时按 legacy 名解析（解析不到保持 NULL——历史无行形态，授权
+    校验侧对 NULL 行回退名比对，随 TTL 自然退役）。
+    """
     if not isinstance(installation_id, str) or not installation_id:
         raise ValueError("installation_id 不能为空")
     if not isinstance(slide, str) or not slide:
@@ -2953,13 +3182,16 @@ def create_run_grant(installation_id, slide, session_id="",
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
+                if slide_id is None:
+                    slide_id = _slide_id_of_name(cur, slide)
                 cur.execute(
                     "INSERT INTO run_grants "
                     "(grant_id, installation_id, slide, session_id, "
-                    " created_by_user_id, created_at, expires_at) "
-                    "VALUES (%s,%s,%s,%s,%s, to_timestamp(%s), to_timestamp(%s))",
+                    " created_by_user_id, slide_id, created_at, expires_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s, to_timestamp(%s), to_timestamp(%s))",
                     (grant_id, installation_id, slide, session_id or "",
-                     created_by_user_id or None, now, now + ttl))
+                     created_by_user_id or None, slide_id or None,
+                     now, now + ttl))
                 return _fetch_grant(cur, grant_id)
     finally:
         conn.close()
@@ -3038,13 +3270,33 @@ def bind_run_grant_session(grant_id, session_id):
         conn.close()
 
 
-def list_run_grants(slide=None, include_revoked=False):
-    """列出 run grant（§3.10 P0-C 主动撤销钩子用；按创建时间升序）。"""
+def list_run_grants(slide=None, include_revoked=False, slide_id=None):
+    """列出 run grant（§3.10 P0-C 主动撤销钩子用；按创建时间升序）。
+
+    P2：slide_id 给出时按 ID 过滤（活动查询口径）；仅名时解析到 ID 后取
+    「该 ID 的行 ∪ 历史 NULL-ID 同名行」——撤销钩子必须覆盖全部行，不因
+    双写口径漏撤。
+    """
     sql = _GRANT_SEL + "FROM run_grants"
     conds, params = [], []
-    if slide is not None:
-        conds.append("slide=%s")
-        params.append(slide)
+    if slide_id is not None:
+        conds.append("slide_id=%s")
+        params.append(slide_id)
+    elif slide is not None:
+        sid = None
+        conn0 = _connect()
+        try:
+            with pg_store.transaction(conn0) as c0:
+                with c0.cursor() as cur0:
+                    sid = _slide_id_of_name(cur0, slide)
+        finally:
+            conn0.close()
+        if sid is not None:
+            conds.append("(slide_id=%s OR (slide_id IS NULL AND slide=%s))")
+            params.extend((sid, slide))
+        else:
+            conds.append("slide=%s")
+            params.append(slide)
     if not include_revoked:
         conds.append("revoked=FALSE")
     if conds:
@@ -3266,8 +3518,10 @@ def force_slide_owner_follow_file(slide_name, expected_owner, new_owner,
                         "DELETE FROM slide_view_grants WHERE slide_id=%s "
                         "AND slide_name <> %s", (row["slide_id"], slide_name))
                 cur.execute(
+                    # R-02（P2）：alias 列停写——归属转移只清 display_name/note
                     "UPDATE slides SET owner_user_id=%s, public=false, "
-                    "alias='', note='', updated_at=now() "
+                    "display_name=COALESCE(NULLIF(original_filename,''), "
+                    "legacy_filename, ''), note='', updated_at=now() "
                     "WHERE legacy_filename=%s",
                     (new_owner or _OWNER_USER_ID or None, slide_name))
                 return "transferred"

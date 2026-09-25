@@ -122,6 +122,19 @@ def part_name(job_id: str) -> str:
     return ".ingesting-%s.part" % job_id
 
 
+def _stat_ident(path):
+    """路径的文件身份 (st_dev, st_ino)；stat 失败返回 None。
+
+    归属拒绝时删除 dest 前的同一性守卫用：只删「本任务提升的那份」，
+    路径已被并发者替换时不误删他人文件（review 第三轮 P1）。
+    """
+    try:
+        st = os.stat(path)
+        return (st.st_dev, st.st_ino)
+    except OSError:
+        return None
+
+
 def _file_sha256_matches(path, expected_hex) -> bool:
     """流式比对文件 SHA-256（提交恢复的内容级归属核实，P1-2）。
 
@@ -748,6 +761,7 @@ def process_validating(cos=None, state=None):
     dest = os.path.join(directory, safe_name)
     intent = job.get("commit_intent_json")
     adopted_existing = False
+    promoted_ident = None  # 本任务提升出的 dest 的 (dev, ino)（若有）
     if intent:
         # 崩溃恢复：sha 以 intent 为权威（提升前已算好），不重算 9.5GB。
         sha = intent.get("sha256") or ""
@@ -768,6 +782,7 @@ def process_validating(cos=None, state=None):
         elif os.path.exists(part_path):
             try:
                 _promote_no_clobber(part_path, dest)
+                promoted_ident = _stat_ident(dest)  # 删除守卫的同一性基准
             except FileExistsError:
                 _unlink_quiet(part_path)
                 ist.fail_job(job_id, gen, "name_unavailable")
@@ -822,6 +837,7 @@ def process_validating(cos=None, state=None):
             return None
         try:
             _promote_no_clobber(part_path, dest)
+            promoted_ident = _stat_ident(dest)  # 删除守卫的同一性基准
         except FileExistsError:
             # 同名已存在他人文件：no-clobber 拒绝（绝不 os.replace 覆盖）。
             _unlink_quiet(part_path)
@@ -839,12 +855,24 @@ def process_validating(cos=None, state=None):
         # 视为一致。
         meta_owner = ((meta or {}).get("owner_user_id") or "").strip()
         ours = (job.get("owner_user_id") or "").strip()
-        if meta_owner and meta_owner != ours and \
-                meta_owner != (share_store_pg._OWNER_USER_ID or ""):
+        # 平台 owner 回落等价**仅限匿名任务**：实名任务要求精确归属
+        # （review 第三轮 P1：普通用户任务不能认领平台 owner 的同名文件）。
+        platform_owner = (share_store_pg._OWNER_USER_ID or "").strip()
+        anonymous_took_platform = (ours == "" and platform_owner
+                                   and meta_owner == platform_owner)
+        if meta_owner and meta_owner != ours and not anonymous_took_platform:
             # 名称已被他人持有：恢复认领场景 dest 是对方文件（绝不动）；
-            # 本任务提升场景 dest 是本任务字节（删除，把名称还原为无文件）。
+            # 本任务提升场景 dest 原则上是本任务字节——但**删除前必须过
+            # (dev, ino) 同一性守卫**：提升与拒绝之间路径可能已被并发者
+            # 替换（先删后建同路径），按路径删除会误删他人新文件；身份
+            # 不符时只失败不删除（review 第三轮 P1）。
             if not adopted_existing:
-                _unlink_quiet(dest)
+                if promoted_ident is not None and \
+                        _stat_ident(dest) == promoted_ident:
+                    _unlink_quiet(dest)
+                else:
+                    _log.warning("归属终检拒绝，但 dest 已非本任务提升的"
+                                 "文件，不删除（job=%s）", job_id)
             _unlink_quiet(part_path)
             ist.fail_job(job_id, gen, "name_unavailable")
             _log.warning("归属终检失败：名称已被其它账号持有（job=%s）",

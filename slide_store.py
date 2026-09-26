@@ -62,6 +62,9 @@ worker 可 import 本模块（不得 import app；本模块只依赖 pg_store/sl
     拒绝处理，不回退目录扫描。
   - 状态迁移原语（mark_ready/request_delete/mark_deleted/mark_failed）全部
     是带 ``expected_state`` 谓词的真实 SQL CAS，返回是否迁移成功。
+    ``request_delete``（P5 合同 §1.1）与 ``slide_delete_jobs`` 落库同一事务；
+    ``mark_deleted`` 的结算幂等键 = deleting→deleted CAS 本身（同事务减账）。
+    删除任务原语（enqueue/claim/finish，lease+退避）见「删除任务持久化」节。
   - 名称/元数据编辑（update_display_name/update_note/set_public）只动
     元数据：不动文件、不动 legacy_filename、不动授权。
 """
@@ -70,6 +73,7 @@ import contextlib
 import logging
 import re
 import secrets
+import time
 from dataclasses import dataclass
 
 import psycopg
@@ -632,13 +636,30 @@ def mark_ready(slide_id, *, accounted_bytes=None,
                       assignments, params, conn=conn)
 
 
-def request_delete(slide_id, *, expected_state=SlideState.READY, conn=None) -> bool:
-    """ready → deleting：立即拒绝后续新读取授权（合同 §4）。
+def request_delete(slide_id, *, expected_state=SlideState.READY, conn=None,
+                   requested_by=None, enqueue_job=True) -> bool:
+    """ready → deleting：立即拒绝后续新读取授权（合同 §4）；P5 起与
+    ``slide_delete_jobs`` 落库**同一事务**（P5 合同 §1.1——任务是删除的
+    唯一执行载体，物理清理由执行器完成）。
 
-    只做 CAS；幂等清理工作（slide_delete_jobs）的生成在 P5 删除编排接线。
+    expected_state 谓词由调用方按行当前态给出（id_bundle 资产恒 READY；
+    legacy 布局资产的统一编排允许 legacy/failed 态进入 deleting——迁移期
+    清理语义，见 app._slide_delete_unified）。CAS 成功才落任务行
+    （upsert：slide_id UNIQUE 防重复任务；已 done 的任务行不动）。重复
+    DELETE 在 app 层分流：deleted → 幂等 200；deleting → 触发执行器
+    （enqueue_delete_job 只复位 failed 任务）。
     """
-    return _cas_state(slide_id, expected_state, SlideState.DELETING,
-                      conn=conn)
+    with _session(conn) as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "UPDATE slides SET asset_state=%s, updated_at=now() "
+                "WHERE slide_id=%s AND asset_state=%s",
+                (SlideState.DELETING, slide_id, expected_state))
+            moved = cur.rowcount == 1
+            if moved and enqueue_job:
+                _upsert_delete_job(cur, slide_id, requested_by,
+                                   requeue_failed=False)
+            return moved
 
 
 def mark_deleted(slide_id, *, expected_state=SlideState.DELETING, conn=None) -> bool:
@@ -649,24 +670,6 @@ def mark_deleted(slide_id, *, expected_state=SlideState.DELETING, conn=None) -> 
     """
     return _cas_state(slide_id, expected_state, SlideState.DELETED,
                       "deleted_at=now()", conn=conn)
-
-
-def mark_deleted_compat(slide_id, *, conn=None) -> bool:
-    """P1-B2 兼容直写：旧删除端点（app.api_slide_delete）的立即失效步骤。
-
-    旧端点在 P5 前不做 deleting/deleted 两阶段编排——删完文件后由本原语把
-    行直写为 ``deleted``（+deleted_at），让 authorize_read 状态门禁立即拒绝
-    后续读取（合同 §4：tombstone 保留 legacy_filename）。从任意非 deleted
-    状态迁移（幂等：已 deleted 返回 False）；行缺失返回 False。**不是**通用
-    状态机原语——正式删除编排（advisory 锁 + CAS + 结算）在 P5 接线后移除。
-    """
-    with _session(conn) as c:
-        with c.cursor() as cur:
-            cur.execute(
-                "UPDATE slides SET asset_state=%s, deleted_at=now(), "
-                "updated_at=now() WHERE slide_id=%s AND asset_state<>%s",
-                (SlideState.DELETED, slide_id, SlideState.DELETED))
-            return cur.rowcount == 1
 
 
 def mark_failed(slide_id, *, expected_state=SlideState.STAGING, conn=None) -> bool:
@@ -780,6 +783,160 @@ def record_revision(slide_id, legacy_revision, *, conn=None) -> bool:
                 ("ast_" + secrets.token_urlsafe(9), slide_id,
                  str(legacy_revision)),)
             return True
+
+
+# --------------------------------------------------------------------------- #
+# 删除任务持久化（P5 合同 §1.1/§1.2/§2；表=slice 0067 + 0070 lease 列）
+#
+# slide_delete_jobs 是删除的唯一执行载体：request_delete 的 CAS 与任务落库
+# 同一事务；执行器（app daemon + 端点同步尝试）经 lease 领取，退避重试。
+# 重复执行/worker 重启不得重复减账——结算幂等键 = deleting→deleted 的 CAS
+# 本身（减账与 CAS 同事务），与租约无关；租约只防「同一任务被两个 worker
+# 同时领取」（claim 的 UPDATE 谓词 + FOR UPDATE SKIP LOCKED）。
+# --------------------------------------------------------------------------- #
+#: 任务状态（0067 CHECK 词表）
+DELETE_JOB_PENDING = "pending"
+DELETE_JOB_CLEANING = "cleaning"
+DELETE_JOB_DONE = "done"
+DELETE_JOB_FAILED = "failed"
+
+
+def _upsert_delete_job(cur, slide_id, requested_by, *, requeue_failed):
+    """任务行 upsert（调用方事务内）。缺行 → 插入 pending；已有行仅在
+    requeue_failed 且 state='failed' 时复位 pending（清 lease/错误）——
+    pending/cleaning（含活租约）不动，done 永不动。"""
+    cur.execute(
+        "INSERT INTO slide_delete_jobs (job_id, slide_id, requested_by, "
+        "state) VALUES (%s, %s, %s, %s) "
+        "ON CONFLICT (slide_id) DO UPDATE SET "
+        "state=%s, requested_by=EXCLUDED.requested_by, "
+        "lease_owner=NULL, lease_expires_at=NULL, last_error=NULL, "
+        "updated_at=now() WHERE slide_delete_jobs.state=%s",
+        ("sdj_" + secrets.token_urlsafe(9), slide_id,
+         (requested_by or None), DELETE_JOB_PENDING,
+         DELETE_JOB_PENDING, DELETE_JOB_FAILED))
+
+
+def enqueue_delete_job(slide_id, requested_by=None, *, conn=None) -> None:
+    """为已处 deleting 的资产（重放 DELETE/执行器重启后）确保任务在队列。
+
+    只复位 failed 任务（重试入口）；pending/cleaning/done 均为 no-op——
+    活租约不被端点重放打断，done 不复活。幂等。
+    """
+    with _session(conn) as c:
+        with c.cursor() as cur:
+            _upsert_delete_job(cur, slide_id, requested_by,
+                               requeue_failed=True)
+
+
+def claim_due_delete_job(worker_id, *, lease_seconds=300.0,
+                         backoff_base_seconds=2.0, backoff_cap_seconds=3600.0,
+                         conn=None):
+    """领取一条到期任务（执行器入口；lease + 退避）。
+
+    到期谓词：
+      - pending → 立即到期；
+      - failed → updated_at + min(cap, base*2^attempts) <= now（指数退避）；
+      - cleaning → lease_expires_at <= now（worker 崩溃恢复重领）。
+
+    并发安全：候选行 ``FOR UPDATE SKIP LOCKED``——两实例同时领取时各自
+    锁定不同行，同一行只被一个事务UPDATE 为 cleaning（第二实例跳过）；
+    结算侧再由 deleting→deleted CAS 兜底（即使极端竞态下重复执行清理，
+    减账与物理清理仍只发生一次语义：remove_bundle 幂等、CAS 只成功一次）。
+    领取即 attempts+1 并写 lease_owner/lease_expires_at。无到期任务返回
+    None。
+    """
+    with _session(conn) as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "SELECT job_id, slide_id, state, attempts, "
+                "extract(epoch from updated_at)::float8 AS updated_ts, "
+                "extract(epoch from lease_expires_at)::float8 AS lease_ts "
+                "FROM slide_delete_jobs "
+                "WHERE state IN (%s,%s,%s) "
+                "ORDER BY created_at LIMIT 5 FOR UPDATE SKIP LOCKED",
+                (DELETE_JOB_PENDING, DELETE_JOB_FAILED, DELETE_JOB_CLEANING))
+            rows = cur.fetchall()
+            now = time.time()
+            picked = None
+            for r in rows:
+                if r["state"] == DELETE_JOB_PENDING:
+                    picked = r
+                    break
+                if r["state"] == DELETE_JOB_FAILED:
+                    backoff = min(backoff_cap_seconds,
+                                  backoff_base_seconds * (2 ** int(r["attempts"])))
+                    if now >= float(r["updated_ts"] or 0) + backoff:
+                        picked = r
+                        break
+                elif r["state"] == DELETE_JOB_CLEANING:
+                    if r["lease_ts"] is None or now >= float(r["lease_ts"]):
+                        picked = r
+                        break
+            if picked is None:
+                return None
+            cur.execute(
+                "UPDATE slide_delete_jobs SET state=%s, attempts=attempts+1, "
+                "lease_owner=%s, lease_expires_at=now() + (%s || ' seconds')::"
+                "interval, last_error=NULL, updated_at=now() "
+                "WHERE job_id=%s RETURNING job_id, slide_id, requested_by, "
+                "attempts",
+                (DELETE_JOB_CLEANING, str(worker_id or "worker"),
+                 str(float(lease_seconds)), picked["job_id"]))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def finish_delete_job(job_id, state, *, error=None, conn=None) -> bool:
+    """任务收口：done（结算完成）/ failed（本次尝试失败，退避后重试）。
+
+    两者都清 lease；failed 记 last_error（截断 4KB）。done 只能由结算
+    成功方写入。返回行是否存在。
+    """
+    if state not in (DELETE_JOB_DONE, DELETE_JOB_FAILED):
+        raise ValueError("未知删除任务终态：%r" % (state,))
+    with _session(conn) as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "UPDATE slide_delete_jobs SET state=%s, last_error=%s, "
+                "lease_owner=NULL, lease_expires_at=NULL, updated_at=now() "
+                "WHERE job_id=%s",
+                (state, (str(error)[:4096] if error else None), job_id))
+            return cur.rowcount == 1
+
+
+def finish_delete_job_by_slide(slide_id, state, *, error=None, conn=None) -> bool:
+    """按 slide_id 收口任务（端点同步执行成功后把 pending 任务直接置 done，
+    免 daemon 空领一轮——executor 对已 deleted 幂等，晚到收口无害）。"""
+    if state not in (DELETE_JOB_DONE, DELETE_JOB_FAILED):
+        raise ValueError("未知删除任务终态：%r" % (state,))
+    with _session(conn) as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "UPDATE slide_delete_jobs SET state=%s, last_error=%s, "
+                "lease_owner=NULL, lease_expires_at=NULL, updated_at=now() "
+                "WHERE slide_id=%s",
+                (state, (str(error)[:4096] if error else None), slide_id))
+            return cur.rowcount == 1
+
+
+def get_delete_job(slide_id, *, conn=None):
+    """按 slide_id 取任务行（None=无任务）；测试/管理面观测用。"""
+    if not isinstance(slide_id, str) or not slide_id.strip():
+        return None
+    with _session(conn) as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "SELECT job_id, slide_id, requested_by, state, attempts, "
+                "last_error, lease_owner, "
+                "extract(epoch from lease_expires_at)::float8 "
+                "  AS lease_expires_ts, "
+                "extract(epoch from created_at)::float8 AS created_ts, "
+                "extract(epoch from updated_at)::float8 AS updated_ts "
+                "FROM slide_delete_jobs WHERE slide_id=%s",
+                (slide_id.strip(),))
+            row = cur.fetchone()
+            return dict(row) if row else None
 
 
 # --------------------------------------------------------------------------- #

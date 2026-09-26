@@ -10541,8 +10541,186 @@ def admin_v1_slides_inventory():
     next_cursor = None
     if has_more:
         next_cursor = _admin_v1_encode_cursor({"o": offset + limit})
+    orphan_objects, staging_residue = _admin_scan_storage_orphans()
     return jsonify(items=items, next_cursor=next_cursor, limit=limit,
-                   owner_user_id=owner_uid, orphan_files=orphan_files)
+                   owner_user_id=owner_uid, orphan_files=orphan_files,
+                   orphan_objects=orphan_objects,
+                   staging_residue=staging_residue)
+
+
+#: .staging/ 任务键的四个键空间（P5 合同 §1.5「任务键可判」）：
+#: upload_tasks.upload_id / conversion_jobs.id / ingestion_jobs.job_id /
+#: baidu_import_items.id（P4-c 起 item staging 键=item_id）。
+_STAGING_LIVE_UPLOAD_STATES = ("active", "committing")
+_STAGING_LIVE_CONVERSION_STATES = ("queued", "converting", "validating")
+_STAGING_LIVE_BAIDU_STAGES = ("queued", "transferring", "downloading",
+                              "validating", "converting", "ingesting")
+
+
+def _staging_live_tasks():
+    """四个键空间内在途任务的键集合（含所属键空间，观测用）。
+
+    在途=任务尚未终态、staging 树仍属其生命周期（取消/失败/收口路径会清
+    staging；已终态但树残留=P5 报告的 residue）。DB 异常按「全部在途」
+    处理（fail-closed：读不清就一律不可清，只报告）。
+    """
+    live = {"upload": set(), "conversion": set(), "ingestion": set(),
+            "baidu": set()}
+    try:
+        conn = pg_store.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT upload_id FROM upload_tasks "
+                            "WHERE state = ANY(%s)",
+                            (list(_STAGING_LIVE_UPLOAD_STATES),))
+                live["upload"] = {r[0] for r in cur.fetchall()}
+                cur.execute("SELECT id FROM conversion_jobs "
+                            "WHERE state = ANY(%s)",
+                            (list(_STAGING_LIVE_CONVERSION_STATES),))
+                live["conversion"] = {r[0] for r in cur.fetchall()}
+                cur.execute(
+                    "SELECT job_id FROM ingestion_jobs WHERE state <> ALL(%s)",
+                    (list(ingestion_store.TERMINAL_STATES),))
+                live["ingestion"] = {r[0] for r in cur.fetchall()}
+                cur.execute("SELECT id FROM baidu_import_items "
+                            "WHERE stage = ANY(%s)",
+                            (list(_STAGING_LIVE_BAIDU_STAGES),))
+                live["baidu"] = {r[0] for r in cur.fetchall()}
+        finally:
+            conn.close()
+    except Exception:
+        app.logger.exception(".staging 残留扫描的活任务读取失败（按全部在途"
+                             "处理，本轮只报告不判可清理）")
+        return None
+    return live
+
+
+def _tree_usage(path):
+    """目录树 (size_bytes, file_count)（扫描失败返回 (0, 0)）。"""
+    size = 0
+    count = 0
+    for _cur, _dirs, files in os.walk(path):
+        for fname in files:
+            try:
+                size += os.path.getsize(os.path.join(_cur, fname))
+                count += 1
+            except OSError:
+                continue
+    return size, count
+
+
+def _admin_scan_storage_orphans():
+    """objects/ 孤儿与 .staging/ 残留扫描（P5 合同 §1.5；**只隔离报告**，
+    不按名猜 owner、不自动删）。
+
+    - orphan_objects：objects/ 下无 slides 行、或行非 deleting/deleted 的
+      目录（deleting/deleted 行的目录归删除任务管——cleaning 中或清理失败
+      重试，不算孤儿）；
+    - staging_residue：.staging/<task_key>/ 无任何键空间在途行 →
+      cleanable=True（任务键可判）；在途 → cleanable=False（只报告）。
+      活任务读取失败（DB 异常）时全部按在途处理（fail-closed 不可清）。
+    """
+    orphan_objects = []
+    objects_dir = UPLOAD_DIR / "objects"
+    if objects_dir.is_dir():
+        states = {}
+        try:
+            conn = pg_store.connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT slide_id, asset_state, "
+                                "storage_layout FROM slides")
+                    states = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+            finally:
+                conn.close()
+        except Exception:
+            app.logger.exception("objects 孤儿扫描的 slides 状态读取失败"
+                                 "（本轮 objects 部分跳过）")
+            states = None
+        if states is not None:
+            for child in sorted(objects_dir.iterdir()):
+                if not child.is_dir():
+                    continue
+                row = states.get(child.name)
+                if row is not None:
+                    state, layout = row
+                    # 合法持包者不报：ready+id_bundle（活包）；deleting/
+                    # deleted（删除任务生命周期——cleaning 中/清理失败重试）。
+                    # staging/failed（内容应在 .staging/）、legacy 布局行
+                    # （平铺布局不该有 objects 目录）→ 目录是孤儿。
+                    if layout == "id_bundle" and state in (
+                            "ready", "deleting", "deleted"):
+                        continue
+                size, count = _tree_usage(child)
+                orphan_objects.append({
+                    "slide_id": child.name,
+                    "asset_state": row[0] if row else None,   # None=无行
+                    "storage_layout": row[1] if row else None,
+                    "size_bytes": size,
+                    "file_count": count,
+                })
+    staging_residue = []
+    staging_dir = UPLOAD_DIR / ".staging"
+    if staging_dir.is_dir():
+        live = _staging_live_tasks()
+        for child in sorted(staging_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            key = child.name
+            cleanable = bool(
+                live is not None and not any(key in keys
+                                             for keys in live.values()))
+            size, count = _tree_usage(child)
+            staging_residue.append({
+                "task_id": key,
+                "cleanable": cleanable,
+                "size_bytes": size,
+                "file_count": count,
+                "live_kind": (next((kind for kind, keys in (live or {}).items()
+                                    if key in keys), None)
+                              if live is not None else "unknown"),
+            })
+    return orphan_objects, staging_residue
+
+
+@app.route("/api/admin/v1/slides/staging-residue", methods=["DELETE"])
+def admin_v1_staging_residue_cleanup():
+    """按任务键清理 .staging/ 残留（P5 合同 §1.5「报告+可清理」的清理侧）。
+
+    body: {task_id}。重验活任务谓词（清理窗口内任务复活 → 409
+    staging_task_live）；键经 slide_storage 组件白名单（staging_task_dir
+    派生即校验，无用户可控路径片段）。幂等：树不存在 removed=False。
+    不触碰 objects/（孤儿 objects 只报告——归属不可判，物理处置走 P6
+    迁移工具链）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    body = request.get_json(silent=True) or {}
+    task_id = body.get("task_id")
+    if not isinstance(task_id, str) or not task_id.strip():
+        return _admin_v1_error(400, "invalid_request", "缺少 task_id")
+    task_id = task_id.strip()
+    try:
+        target = slide_storage.staging_task_dir(task_id, root=UPLOAD_DIR)
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    live = _staging_live_tasks()
+    if live is None:
+        return _admin_v1_error(503, "internal",
+                               "活任务状态读取失败，暂不可清理（只报告）")
+    kind = next((k for k, keys in live.items() if task_id in keys), None)
+    if kind:
+        return _admin_v1_error(409, "staging_task_live",
+                               "任务仍在途（%s），staging 属其生命周期" % kind)
+    try:
+        removed = slide_storage.remove_staging_tree(task_id, root=UPLOAD_DIR)
+    except (OSError, ValueError) as exc:
+        return _admin_v1_error(500, "internal", "清理失败：%s" % exc)
+    _audit("admin.staging_residue.cleanup", target_type="staging",
+           target_id=task_id, detail={"task_id": task_id,
+                                      "removed": bool(removed)})
+    return jsonify(ok=True, task_id=task_id, removed=bool(removed))
 
 
 @app.route("/api/admin/v1/slides/<path:name>/visibility", methods=["POST"])
@@ -14352,7 +14530,7 @@ def api_conversion_retry(job_id):
 
 @app.route("/api/slide/<name>", methods=["DELETE"])
 def api_slide_delete(name):
-    """关闭句柄并删除切片（**legacy 布局资产的删除路径**，P3 合同 §5）。
+    """关闭句柄并删除切片（legacy alias → 统一删除编排，P5 合同 §1.8）。
 
     .mrxs 切片带有同名伴侣数据目录（去扩展名后的目录），一并删除。
     Stage 3a-2a：owner 任意；user 仅自己的切片。
@@ -14361,57 +14539,251 @@ def api_slide_delete(name):
     升级 B R7：删除文件前清理该切片的全部 view 授权（按 legacy 名 + 旧
     slide_id 残留，单事务）——同名再上传后旧授权不自动生效（失效语义），
     需要系统管理重新添加；删除后无孤儿授权行残留。
-    P1-B2：删除端点结构不变（两阶段删除编排在 P5）；末尾把 slides 行直写
-    asset_state='deleted'（+deleted_at，slide_store.mark_deleted_compat），
-    让 authorize_read 状态门禁立即拒绝后续读取（tombstone 保留
-    legacy_filename，旧别名不重绑新 ID）。
-    P3：id_bundle 资产（无 legacy_filename）不经本端点——按名解析不到
-    （resolve 失败 → _safe_name 404/403）；新 DELETE /api/slides/<slide_id>
-    承担其两阶段删除 + 幂等减账。**R-12：legacy 资产删除维持不回退
-    used_bytes（0013 口径；P6 迁移演练时统一对账）。**
+    P5（合同 §1.8 删除端点归一）：本端点与 DELETE /api/slides/<slide_id>
+    共用同一编排——legacy alias 解析（resolve_legacy_alias，tombstone 冻结
+    别名）→ request_delete CAS + slide_delete_jobs 落库（同事务）→ 同步尝试
+    执行一次（用户感知不变）→ daemon 兜底重试。mark_deleted_compat 直写
+    已随之拆除。**R-12：legacy 资产删除维持不回退 used_bytes（0013 口径；
+    P6 迁移演练时统一对账）**；tombstone 保留 legacy_filename（授权映射
+    随之冻结，旧别名不重绑新 ID）。
+    无 slides 行的平铺文件是 admin inventory 的 orphan_files 人口（P1-B2
+    只报告不认领）——统一编排需要资产行（状态机+任务+账本），按名裸
+    unlink 退役（不按名猜 owner；物理处置走 P6 迁移工具链）→ 404。
     """
     if not can_delete_slide(name):
         return _denied()
-    safe = _safe_name(name)
+    # 只做路径形态校验（不要求文件存在——tombstone 行的幂等重放 DELETE
+    # 也走统一编排返回 200；文件缺失由资产行状态机裁决）。
+    safe = _sanitize_name(name)
+    if not safe or safe != name:
+        return jsonify(error="非法文件名"), 400
+    desc = None
     try:
-        slide_id = share_store.get_slide_id(safe)
+        desc = slide_store.resolve_legacy_alias(safe)
     except Exception:
-        slide_id = None
-    _slide_delete_legacy_core(safe, slide_id)
-    return jsonify(ok=True)
+        app.logger.warning("legacy alias 解析失败（fail-closed）：%s", safe,
+                           exc_info=True)
+    if desc is None:
+        return jsonify(error="切片不存在", code="slide_not_found"), 404
+    return _slide_delete_unified(
+        desc, requested_by=current_identity().get("user_id"),
+        legacy_response=True)
 
 
-def _slide_delete_legacy_core(safe, slide_id):
-    """旧删除端点的主体（legacy 布局；与新 by-ID 端点的 legacy 分支共用）。"""
-    # 授权清理必须在文件删除前（fail-closed：删除确认后授权立即失效，
-    # 无「文件已换、旧授权仍匹配」的窗口）
+# --------------------------------------------------------------------------- #
+# P5 统一删除编排（docs/slide-id-refactor-p5-contract-20260925.md §1-2）：
+#
+#   request_delete（ready→deleting CAS + slide_delete_jobs 落库，同事务）
+#     → 执行器（端点同步尝试一次 + daemon 兜底；lease + 退避）：
+#         阶段 2 授权/关系联动（fail-closed，可重入）
+#         阶段 3 物理清理（两种布局；幂等；失败停留 deleting 重试）
+#         阶段 4 结算（advisory 锁 + deleting→deleted CAS +（仅 id_bundle）
+#                refund_used_bytes_locked 同事务；幂等键=CAS 本身）
+#
+# 重复 DELETE：deleted → 幂等 200；deleting → 触发执行器（任务 failed 复位
+# pending）。重复执行/worker 重启不得重复减账（CAS 只成功一次）、不得重复
+# 清理别人（remove_bundle 只认 slide_id 独占目录；legacy 只动冻结别名文件）。
+# --------------------------------------------------------------------------- #
+#: 删除执行器 daemon 的轮询间隔（秒；<=0 关闭——测试隔离用）
+_SLIDE_DELETE_WORKER_ENV = "SLIDE_DELETE_WORKER_INTERVAL_SECONDS"
+
+
+def _env_float(name, default):
     try:
-        share_store.revoke_slide_view_grants_for_slide(safe, slide_id=slide_id)
+        return float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+#: 任务租约时长（claim 后超时视为 worker 崩溃，可重领）
+_SLIDE_DELETE_LEASE_SECONDS = _env_float("SLIDE_DELETE_LEASE_SECONDS", 300)
+#: 失败退避基数（base * 2^attempts，封顶）
+_SLIDE_DELETE_BACKOFF_BASE_SECONDS = _env_float(
+    "SLIDE_DELETE_BACKOFF_BASE_SECONDS", 2)
+_SLIDE_DELETE_BACKOFF_CAP_SECONDS = 3600.0
+
+
+def _slide_delete_unified(desc, requested_by, *, legacy_response=False):
+    """统一删除编排（两个 DELETE 端点共用；P5 合同 §1.1/§1.2/§1.8）。
+
+    阶段 1（短事务）：advisory 锁（第一把锁）→ slides 行 FOR UPDATE →
+    分流：deleted 幂等返回 / deleting 复位 failed 任务后重触发执行 /
+    可删态 CAS→deleting 且 slide_delete_jobs 落库（同事务）。
+    随后同步尝试执行一次（用户感知与 P3 内联版一致）；执行异常返回 503
+    （delete_retryable），daemon 按 lease+退避兜底。
+
+    可删态口径：id_bundle 恒 ready（状态机严格）；legacy 布局资产放行
+    ready/legacy/failed（迁移期清理语义——旧行 any-state 可删的能力保留，
+    failed 行的文件多已缺失，结算幂等不受影响）。staging 恒 409。
+    """
+    sid = desc.slide_id
+    legacy_layout = desc.storage_layout != slide_store.StorageLayout.ID_BUNDLE
+    allowed = ((slide_store.SlideState.READY, slide_store.SlideState.LEGACY,
+                slide_store.SlideState.FAILED) if legacy_layout
+               else (slide_store.SlideState.READY,))
+    state = None
+    import psycopg.rows
+    conn = pg_store.connect()
+    conn.row_factory = psycopg.rows.dict_row
+    try:
+        with pg_store.transaction(conn):
+            with conn.cursor() as cur:
+                slide_store.acquire_slide_lock(cur, sid)  # 第一把锁
+                cur.execute("SELECT asset_state FROM slides "
+                            "WHERE slide_id=%s FOR UPDATE", (sid,))
+                row = cur.fetchone()
+                if row is None:
+                    return jsonify(error="切片不存在",
+                                   code="slide_not_found"), 404
+                state = row["asset_state"]
+                if state == slide_store.SlideState.DELETED:
+                    pass  # 幂等：已完成（不重复减账；事务后统一 200）
+                elif state == slide_store.SlideState.DELETING:
+                    # 重放 DELETE：仅复位 failed 任务（活租约/终态不动）
+                    slide_store.enqueue_delete_job(sid, requested_by,
+                                                   conn=conn)
+                elif state in allowed:
+                    if not slide_store.request_delete(
+                            sid, expected_state=state,
+                            requested_by=requested_by, conn=conn):
+                        return jsonify(
+                            error="切片状态 %s 不可删除" % state,
+                            code="slide_state_conflict"), 409
+                else:
+                    return jsonify(error="切片状态 %s 不可删除" % state,
+                                   code="slide_state_conflict"), 409
+    finally:
+        conn.close()
+    if state == slide_store.SlideState.DELETED:
+        # 幂等 200（结算已完成，不重复减账）
+        if legacy_response:
+            return jsonify(ok=True)
+        return jsonify(ok=True, slide_id=sid, state="deleted")
+    try:
+        _slide_delete_execute(sid)
+    except Exception as exc:
+        app.logger.exception("删除执行失败（保持 deleting，daemon 兜底重试）："
+                             "%s", sid)
+        # 同步尝试的失败即一次尝试：记入任务（last_error 证据 + 退避基线），
+        # daemon 领取重试；对 daemon 已领取（cleaning）的任务无破坏（执行
+        # 幂等，收口状态由最后完成方收敛）。
+        try:
+            slide_store.finish_delete_job_by_slide(
+                sid, slide_store.DELETE_JOB_FAILED, error=str(exc))
+        except Exception:
+            app.logger.warning("删除任务 failed 收口写入失败（daemon 兜底）"
+                               "：%s", sid, exc_info=True)
+        if legacy_response:
+            return jsonify(error="删除清理失败，将重试",
+                           code="delete_retryable"), 503
+        return jsonify(error="删除清理失败，将重试",
+                       code="delete_retryable", slide_id=sid,
+                       state="deleting"), 503
+    # 同步执行成功：把本请求落库的任务直接收口 done（daemon 不再重复领取）
+    try:
+        slide_store.finish_delete_job_by_slide(sid,
+                                               slide_store.DELETE_JOB_DONE)
     except Exception:
-        app.logger.warning("切片删除的 view 授权清理失败：%s", safe,
-                           exc_info=True)
-    # Demo 撤销必须在文件删除前（revoke 后旧 capability 立即不可读，无悬空窗口）
+        app.logger.warning("删除任务 done 收口写入失败（daemon 幂等兜底）"
+                           "：%s", sid, exc_info=True)
+    if legacy_response:
+        return jsonify(ok=True)
+    return jsonify(ok=True, slide_id=sid, state="deleted")
+
+
+def _slide_delete_invalidations(desc):
+    """阶段 2：授权/关系联动清理（物理删除前，fail-closed；可重入——
+    重复执行/daemon 重试无副作用）。
+
+    覆盖面（P5 合同 §1.6 七类入口 + HistoPilot 会话）：
+      1. slide_view_grants（按 slide_id 权威 + legacy 名历史残留，单事务）；
+      2. share_slides 成员行（R-04：旧 token 不因同名新上传恢复访问）；
+      3. Demo 撤销（catalog 条目 + capability 失效 + 未完成 run 终止 +
+         预算预占释放）；
+      4. run grants（按 slide_id + 名兜底；HP 侧旧会话/回放由 grant 失效
+         与读取门禁冻结，不绑定新同名内容）；
+      5. conversion 任务作废 + 源副本/平铺 sidecar（.manifest.json/
+         .associated）清理（legacy 名联动语义保留）；
+      6. baidu_import_items 引用行失效（P4 偏差 #3 复审：删资产本体，
+         全部引用行失效——在途→failed、ready→标注）；
+      7. 缓存（句柄池/tile/render 统计按 slide_id 失效）；
+      8. legacy 布局：对运行中 sidecar run 发起既有取消（R6d 同款；
+         id_bundle 无 legacy 名，sidecar /sessions 按名查询不适用——
+         run grant 撤销 + TTL 兜底，P3 裁决口径）。
+    研究维度不动（伪名/研究删除按 user 维度既有编排）。
+    """
+    sid = desc.slide_id
+    legacy_name = desc.legacy_filename  # id_bundle 恒 None（仅审计/兜底用）
+    if legacy_name:
+        try:
+            share_store.revoke_slide_view_grants_for_slide(
+                legacy_name, slide_id=sid)
+        except Exception:
+            app.logger.warning("切片删除的 view 授权清理失败：%s", legacy_name,
+                               exc_info=True)
     try:
-        if slide_id:
-            _revoke_demo_slide(slide_id)
+        slide_store.revoke_view_grants_by_slide_id(sid)
     except Exception:
-        app.logger.warning("切片删除的 Demo 撤销联动失败：%s", safe,
+        app.logger.warning("切片删除的 view 授权清理（按 ID）失败：%s", sid,
                            exc_info=True)
-    _close_slide(safe, slide_id=slide_id)
     try:
-        (UPLOAD_DIR / safe).unlink()
+        slide_store.remove_share_membership(sid)
+    except Exception:
+        app.logger.warning("切片删除的 share 成员行清理失败：%s", sid,
+                           exc_info=True)
+    try:
+        _revoke_demo_slide(sid)
+    except Exception:
+        app.logger.warning("切片删除的 Demo 撤销联动失败：%s", sid,
+                           exc_info=True)
+    _revoke_run_grants_for_slide_id(sid, name=legacy_name)
+    try:
+        _cleanup_conversion_sidecars(sid, canonical_name=legacy_name)
+    except Exception:
+        app.logger.warning("切片删除的转换 sidecar 清理失败：%s", sid,
+                           exc_info=True)
+    try:
+        import baidu_import_store
+        baidu_import_store.invalidate_items_for_slide(sid)
+    except Exception:
+        app.logger.warning("切片删除的 baidu 引用行失效失败：%s", sid,
+                           exc_info=True)
+    if desc.storage_layout == slide_store.StorageLayout.ID_BUNDLE:
+        _close_slide(_slide_cache_key_for(sid, desc.original_filename or ""),
+                     slide_id=sid)
+    else:
+        _close_slide(legacy_name, slide_id=sid)
+        try:
+            if legacy_name and desc.owner_user_id:
+                _cancel_sidecar_runs_for_owners(
+                    legacy_name, [desc.owner_user_id],
+                    reason="slide_deleted")
+        except Exception:
+            app.logger.warning("切片删除的运行中 run 取消联动失败：%s",
+                               legacy_name, exc_info=True)
+
+
+def _slide_delete_physical(desc):
+    """阶段 3：两种布局的物理清理（P5 合同 §1.3；幂等，异常向上抛）。"""
+    sid = desc.slide_id
+    if desc.storage_layout == slide_store.StorageLayout.ID_BUNDLE:
+        # 仅该 ID 的独占目录；绝不按显示名扫描删除（no-clobber 的对偶：
+        # no-residue）
+        return slide_storage.remove_bundle(sid, root=UPLOAD_DIR)
+    name = desc.legacy_filename or ""
+    if not name:
+        return False
+    removed = False
+    try:
+        (UPLOAD_DIR / name).unlink()
+        removed = True
     except FileNotFoundError:
         pass
-    try:
-        # P4-app（合同 §3.5）：按 slide_id 作废转换任务/清源副本；canonical
-        # 名仅作升级窗口旧行（slide_id IS NULL）的匹配与平铺 sidecar 清理。
-        _cleanup_conversion_sidecars(slide_id, canonical_name=safe)
-    except Exception:
-        app.logger.warning("切片删除的转换 sidecar 清理失败：%s", safe,
-                           exc_info=True)
-    # MRXS：删除伴侣数据目录（先做安全检查确保在 UPLOAD_DIR 内）
-    if safe.lower().endswith(".mrxs"):
-        stem = safe[: -len(".mrxs")]
+    # MRXS：删除伴侣数据目录（先做安全检查确保在 UPLOAD_DIR 内）；
+    # <name>.manifest.json / <name>.associated 平铺 sidecar 由
+    # _cleanup_conversion_sidecars(canonical_name=...) 联动清理（同语义）。
+    if name.lower().endswith(".mrxs"):
+        stem = name[: -len(".mrxs")]
         companion = UPLOAD_DIR / stem
         try:
             companion.resolve().relative_to(UPLOAD_DIR.resolve())
@@ -14420,25 +14792,151 @@ def _slide_delete_legacy_core(safe, slide_id):
         else:
             if companion.is_dir():
                 shutil.rmtree(companion, ignore_errors=True)
-    # P1-B2：状态门禁立即生效——行直写 deleted（+deleted_at）；两阶段
-    # deleting/deleted 编排（advisory 锁 + CAS + 结算）在 P5 接线。
-    if slide_id:
+                removed = True
+    return removed
+
+
+def _slide_delete_settle(sid, layout):
+    """阶段 4：结算事务——advisory 锁 + deleting→deleted CAS + 幂等减账。
+
+    幂等键 = 本 CAS（只成功一次→减账只发生一次；重复执行/双 worker 安全）。
+    R-12：**只对 id_bundle 资产退款**——legacy 布局资产不回退 used_bytes
+    （0013 过渡口径，P6 迁移演练后统一对账）；tombstone 保留
+    legacy_filename（授权映射冻结）。返回 (settled, refunded_bytes)。
+    """
+    settled = False
+    refunded = 0
+    import psycopg.rows
+    conn = pg_store.connect()
+    conn.row_factory = psycopg.rows.dict_row
+    try:
+        with pg_store.transaction(conn):
+            with conn.cursor() as cur:
+                slide_store.acquire_slide_lock(cur, sid)  # 第一把锁
+                cur.execute(
+                    "UPDATE slides SET asset_state=%s, deleted_at=now(), "
+                    "updated_at=now() WHERE slide_id=%s AND asset_state=%s",
+                    (slide_store.SlideState.DELETED, sid,
+                     slide_store.SlideState.DELETING))
+                if cur.rowcount == 1:
+                    settled = True
+                    # 结算在该 CAS 事务内：used_bytes 幂等减 accounted_bytes
+                    #（GREATEST 兜底防负；仅 id_bundle）。
+                    cur.execute(
+                        "SELECT owner_user_id, accounted_bytes FROM slides "
+                        "WHERE slide_id=%s", (sid,))
+                    srow = cur.fetchone()
+                    owner = (srow["owner_user_id"] or "") if srow else ""
+                    bytes_n = int(srow["accounted_bytes"] or 0) if srow else 0
+                    if (layout == slide_store.StorageLayout.ID_BUNDLE
+                            and owner and bytes_n > 0):
+                        upload_guard.refund_used_bytes_locked(cur, owner,
+                                                              bytes_n)
+                        refunded = bytes_n
+    finally:
+        conn.close()
+    return settled, refunded
+
+
+def _slide_delete_execute(sid):
+    """执行器主体（端点同步尝试与 daemon 共用；可重入/重放安全）。
+
+    幂等：已 deleted 直接返回（结算幂等键=CAS，不重复减账）；物理清理
+    幂等（remove_bundle 缺目录 False / legacy unlink FileNotFound pass）。
+    非 deleting 态（含行缺失/被并发结算）不执行物理清理——已 deleted 返回
+    摘要，其余抛错（任务记 failed，人工可见 last_error）。返回执行摘要。
+    """
+    desc = slide_store.resolve_slide_id(sid)
+    if desc is None:
+        raise ValueError("slides 行缺失（拒绝盲删）：%s" % sid)
+    if desc.asset_state == slide_store.SlideState.DELETED:
+        return {"already_deleted": True, "bundle_removed": False,
+                "refunded_bytes": 0, "layout": desc.storage_layout}
+    if desc.asset_state != slide_store.SlideState.DELETING:
+        raise RuntimeError("资产不在 deleting 态（%s），拒绝物理清理"
+                           % desc.asset_state)
+    _slide_delete_invalidations(desc)
+    removed = _slide_delete_physical(desc)
+    settled, refunded = _slide_delete_settle(sid, desc.storage_layout)
+    if settled:
+        # 审计 best-effort：daemon 无请求上下文（_audit 的 actor_identity
+        # 依赖 session）——降级为无 actor 审计行，绝不因审计失败中断结算
+        #（与 _audit_grant_event 同款双跳）。
         try:
-            slide_store.mark_deleted_compat(slide_id)
+            _audit("slide.delete", target_type="slide", target_id=sid,
+                   slide=desc.legacy_filename, slide_id=sid,
+                   detail={"slide_id": sid, "layout": desc.storage_layout,
+                           "bundle_removed": removed,
+                           "refunded_bytes": refunded,
+                           "view_grants_revoked": True})
         except Exception:
-            app.logger.warning("切片删除的状态直写失败（门禁延后生效）：%s",
-                               safe, exc_info=True)
-    _audit("slide.delete", target_type="slide", target_id=safe, slide=safe,
-           slide_id=slide_id,
-           detail={"slide_id": slide_id,
-                   "view_grants_revoked": True})
+            try:
+                share_store.record_audit(
+                    action="slide.delete", actor_user_id=None,
+                    actor_role=None, target_type="slide", target_id=sid,
+                    slide=desc.legacy_filename,
+                    detail={"slide_id": sid, "layout": desc.storage_layout,
+                            "bundle_removed": removed,
+                            "refunded_bytes": refunded,
+                            "view_grants_revoked": True,
+                            "trigger": "delete_executor"})
+            except Exception:
+                app.logger.info("slide.delete 审计失败（executor）：%s", sid)
+    return {"already_deleted": False, "bundle_removed": removed,
+            "refunded_bytes": refunded, "layout": desc.storage_layout,
+            "settled": settled}
+
+
+def run_slide_delete_worker_once(*, max_jobs=1, worker_id=None):
+    """删除执行器单轮：领取到期任务并执行（测试可确定性驱动——直调本
+    函数，不起 daemon 线程）。
+
+    每任务：claim（lease + 退避谓词，FOR UPDATE SKIP LOCKED 防双领）→
+    执行（幂等清理+结算）→ done；异常 → failed（last_error，attempts 已
+    在领取时 +1，指数退避后由下一轮重领）。返回本轮执行的任务数。
+    """
+    wid = worker_id or "pid-%d-t%d" % (os.getpid(), threading.get_ident())
+    done = 0
+    for _ in range(max(1, int(max_jobs))):
+        try:
+            job = slide_store.claim_due_delete_job(
+                wid,
+                lease_seconds=_SLIDE_DELETE_LEASE_SECONDS,
+                backoff_base_seconds=_SLIDE_DELETE_BACKOFF_BASE_SECONDS,
+                backoff_cap_seconds=_SLIDE_DELETE_BACKOFF_CAP_SECONDS)
+        except Exception:
+            app.logger.warning("删除任务领取失败（下一轮重试）", exc_info=True)
+            return done
+        if job is None:
+            return done
+        done += 1
+        try:
+            _slide_delete_execute(job["slide_id"])
+        except Exception as exc:
+            app.logger.warning("删除任务执行失败（退避重试）：%s",
+                               job["slide_id"], exc_info=True)
+            try:
+                slide_store.finish_delete_job(
+                    job["job_id"], slide_store.DELETE_JOB_FAILED,
+                    error=str(exc))
+            except Exception:
+                app.logger.warning("删除任务 failed 收口写入失败：%s",
+                                   job["job_id"], exc_info=True)
+        else:
+            try:
+                slide_store.finish_delete_job(job["job_id"],
+                                              slide_store.DELETE_JOB_DONE)
+            except Exception:
+                app.logger.warning("删除任务 done 收口写入失败（下轮幂等）："
+                                   "%s", job["job_id"], exc_info=True)
+    return done
 
 
 def _revoke_run_grants_for_slide_id(slide_id, *, name=None):
-    """run grants 撤销联动（P3 合同 §5 by-ID 删除用）：按 slide_id（权威）＋
-    历史 NULL-ID 同名行兜底（P2 list_run_grants 双口径——撤销钩子必须覆盖
-    全部行）。旧按名删除路径不调用（行为冻结；旧端点 grant 随创建者权限
-    复查自然失效）。"""
+    """run grants 撤销联动（P3 合同 §5 by-ID 删除用；P5 起两个删除端点
+    统一经 _slide_delete_invalidations 调用）：按 slide_id（权威）＋历史
+    NULL-ID 同名行兜底（P2 list_run_grants 双口径——撤销钩子必须覆盖全部
+    行）。"""
     try:
         if slide_id:
             grants = share_store.list_run_grants(slide_id=slide_id,
@@ -14466,21 +14964,20 @@ def _revoke_run_grants_for_slide_id(slide_id, *, name=None):
 
 @app.route("/api/slides/<slide_id>", methods=["DELETE"])
 def api_slide_delete_by_id(slide_id):
-    """id_bundle 资产的删除（P3 合同 §5 最小正确版；P5 再统一两阶段）。
+    """切片删除（权威端点；P5 合同 §1.8——与 legacy 名端点共用统一编排）。
 
-    编排（锁序/语义见 slide_store 模块 docstring）：
-      advisory 锁 → request_delete（ready→deleting，**立即拒读**）→ 授权联动
-      清理（view grants 按 slide_id / Demo 撤销 / run grants 撤销 / share_slides
-      成员行删除）→ slide_storage.remove_bundle（仅该 ID 独占目录）→ 同一
-      控制流 mark_deleted + used_bytes 幂等减 accounted_bytes → 审计。
+    编排（锁序/语义见 slide_store 模块 docstring 与 _slide_delete_unified）：
+    advisory 锁 → request_delete（ready→deleting，**立即拒读**）+
+    slide_delete_jobs 落库（同事务）→ 同步尝试执行一次（授权联动清理 →
+    物理清理 → 结算；用户感知不变）→ daemon 兜底重试（lease+退避）。
 
-    幂等（合同 §6-7）：重复 DELETE / worker 重试不重复减——减账与
+    幂等（合同 §2）：重复 DELETE / worker 重试不重复减——减账与
     deleting→deleted 的 CAS **同一事务**，CAS 只成功一次即减账只发生一次；
-    已 deleted → 200 幂等返回；deleting（上次清理中断）→ 重跑清理+结算。
-    R-12：**只对 id_bundle 资产减账**；legacy 布局资产（按 ID 解析到）转旧
-    删除路径（不回退 used_bytes，0013 口径）。同名重传恒新 ID
-    （allocate_slide 不查原名）——旧分享/授权/标注/AI run grant/Demo 不指向
-    新资产（share_slides 成员行/授权行已随本删除清理）。
+    已 deleted → 200 幂等返回；deleting（上次清理中断）→ 重触发执行。
+    R-12：**只对 id_bundle 资产减账**；legacy 布局资产（按 ID 解析到）经
+    同一编排但不退款（0013 口径），tombstone 保留 legacy_filename。
+    同名重传恒新 ID（allocate_slide 不查原名）——旧分享/授权/标注/AI
+    run grant/Demo 不指向新资产（授权面已随本删除清理）。
     """
     ident = current_identity()
     desc = None
@@ -14496,120 +14993,8 @@ def api_slide_delete_by_id(slide_id):
     if ident.get("role") != user_store.ROLE_OWNER:
         if (desc.owner_user_id or "") != (ident.get("user_id") or ""):
             return _denied()
-
-    if desc.storage_layout != slide_store.StorageLayout.ID_BUNDLE:
-        # legacy 布局资产经 ID 指到：转旧删除路径（保持 R-12 旧口径）。
-        if not desc.legacy_filename:
-            return _denied()
-        if not can_delete_slide(desc.legacy_filename):
-            return _denied()
-        _slide_delete_legacy_core(desc.legacy_filename, desc.slide_id)
-        return jsonify(ok=True)
-
-    sid = desc.slide_id
-    # 阶段 1：advisory 锁 + request_delete CAS（ready→deleting：立即拒读）
-    settled_before = False
-    import psycopg.rows
-    conn = pg_store.connect()
-    conn.row_factory = psycopg.rows.dict_row
-    try:
-        with pg_store.transaction(conn):
-            with conn.cursor() as cur:
-                slide_store.acquire_slide_lock(cur, sid)  # 第一把锁
-                cur.execute(
-                    "SELECT asset_state, owner_user_id, accounted_bytes "
-                    "FROM slides WHERE slide_id=%s FOR UPDATE", (sid,))
-                row = cur.fetchone()
-                if row is None:
-                    return jsonify(error="切片不存在",
-                                   code="slide_not_found"), 404
-                if row["asset_state"] == slide_store.SlideState.DELETED:
-                    settled_before = True  # 幂等：已完成（不重复减账）
-                elif row["asset_state"] != slide_store.SlideState.DELETING:
-                    if not slide_store.request_delete(sid, conn=conn):
-                        return jsonify(
-                            error="切片状态 %s 不可删除" % row["asset_state"],
-                            code="slide_state_conflict"), 409
-    finally:
-        conn.close()
-    if settled_before:
-        return jsonify(ok=True, slide_id=sid, state="deleted")
-
-    # 阶段 2：授权联动清理（物理删除前，fail-closed——清理失败也已在 deleting
-    # 态拒读；删除后旧分享/授权/能力不指向任何后续同名新资产）
-    name_snapshot = desc.legacy_filename  # id_bundle 恒 None（仅审计用）
-    try:
-        slide_store.revoke_view_grants_by_slide_id(sid)
-    except Exception:
-        app.logger.warning("by-ID 删除的 view 授权清理失败：%s", sid,
-                           exc_info=True)
-    try:
-        _revoke_demo_slide(sid)
-    except Exception:
-        app.logger.warning("by-ID 删除的 Demo 撤销联动失败：%s", sid,
-                           exc_info=True)
-    _revoke_run_grants_for_slide_id(sid, name=name_snapshot)
-    try:
-        slide_store.remove_share_membership(sid)
-    except Exception:
-        app.logger.warning("by-ID 删除的 share 成员行清理失败：%s", sid,
-                           exc_info=True)
-    try:
-        # P4-app（合同 §3.5/§7）：删除转换产物按 slide_id 作废任务 + 清源
-        # 副本（连带源删除语义保持现状——源是否独立资产由 P5 裁决）。
-        _cleanup_conversion_sidecars(sid)
-    except Exception:
-        app.logger.warning("by-ID 删除的转换任务作废失败：%s", sid,
-                           exc_info=True)
-    _close_slide(_slide_cache_key_for(sid, desc.original_filename or ""),
-                 slide_id=sid)
-
-    # 阶段 3：物理清理（仅该 ID 独占目录；幂等——已不存在返回 False）
-    removed = False
-    try:
-        removed = slide_storage.remove_bundle(sid, root=UPLOAD_DIR)
-    except Exception:
-        app.logger.exception("by-ID 删除的物理清理失败（保持 deleting 重试）："
-                             "%s", sid)
-        return jsonify(error="删除清理失败，将重试",
-                       code="delete_retryable", slide_id=sid,
-                       state="deleting"), 503
-
-    # 阶段 4：mark_deleted + 幂等减账（同一事务；CAS 只成功一次 → 只减一次）
-    refunded = 0
-    conn = pg_store.connect()
-    conn.row_factory = psycopg.rows.dict_row
-    try:
-        with pg_store.transaction(conn):
-            with conn.cursor() as cur:
-                slide_store.acquire_slide_lock(cur, sid)  # 第一把锁
-                cur.execute(
-                    "UPDATE slides SET asset_state=%s, deleted_at=now(), "
-                    "updated_at=now() WHERE slide_id=%s AND asset_state=%s",
-                    (slide_store.SlideState.DELETED, sid,
-                     slide_store.SlideState.DELETING))
-                if cur.rowcount == 1:
-                    # 结算在该 CAS 事务内：used_bytes 幂等减 accounted_bytes
-                    #（幂等键 = 本 CAS 本身；GREATEST 兜底防负）。
-                    cur.execute(
-                        "SELECT owner_user_id, accounted_bytes FROM slides "
-                        "WHERE slide_id=%s", (sid,))
-                    srow = cur.fetchone()
-                    owner = (srow["owner_user_id"] or "") if srow else ""
-                    bytes_n = int(srow["accounted_bytes"] or 0) if srow else 0
-                    if owner and bytes_n > 0:
-                        upload_guard.refund_used_bytes_locked(cur, owner,
-                                                              bytes_n)
-                    refunded = bytes_n
-    finally:
-        conn.close()
-    _audit("slide.delete", target_type="slide", target_id=sid,
-           slide=name_snapshot, slide_id=sid,
-           detail={"slide_id": sid, "layout": "id_bundle",
-                   "bundle_removed": removed,
-                   "refunded_bytes": refunded,
-                   "view_grants_revoked": True})
-    return jsonify(ok=True, slide_id=sid, state="deleted")
+    return _slide_delete_unified(
+        desc, requested_by=ident.get("user_id"))
 
 
 @app.route("/api/slide/<name>/info")
@@ -17212,6 +17597,44 @@ _BUDGET_RECLAIM_THREAD = _start_budget_reclaim_thread()
 
 #: 0028 绑定 attach 重试线程（与 reclaim 同款 daemon；env 可调/关闭）
 _BINDING_ATTACH_RETRY_THREAD = _start_binding_attach_retry_thread()
+
+
+def _start_slide_delete_worker_thread():
+    """P5 删除执行器 daemon 线程（合同 §1.2；参照 ai-binding-attach-retry
+    模式）：周期领取 pending/failed 删除任务（lease + 退避）兜底重试。
+
+    - ``SLIDE_DELETE_WORKER_INTERVAL_SECONDS``：轮询间隔秒数（缺省 10；
+      ``0`` 或负数 = 关闭）；
+    - 端点在落库后已同步尝试执行一次（用户感知不变），daemon 只兜底
+      清理失败/崩溃中断的任务；
+    - pytest（``app.config['TESTING']``）下不执行任务：异步执行会跨用例
+      写库，破坏每用例 TRUNCATE 隔离；执行器语义由测试直调
+      ``run_slide_delete_worker_once`` 确定性覆盖；
+    - daemon 线程：进程退出即结束，不阻塞停机；重复执行/worker 重启
+      不重复减账（结算幂等键=deleting→deleted CAS，与租约无关）。
+    """
+    interval = _env_float(_SLIDE_DELETE_WORKER_ENV, 10)
+    if interval <= 0:
+        return None
+
+    def _loop():
+        while True:
+            time.sleep(interval)
+            if app.config.get("TESTING"):
+                continue
+            try:
+                run_slide_delete_worker_once(max_jobs=5)
+            except Exception:
+                app.logger.warning("删除执行器轮次异常（下一轮重试）",
+                                   exc_info=True)
+
+    th = threading.Thread(target=_loop, name="slide-delete-worker",
+                          daemon=True)
+    th.start()
+    return th
+
+
+_SLIDE_DELETE_WORKER_THREAD = _start_slide_delete_worker_thread()
 
 
 def _run_daily_retention_once():

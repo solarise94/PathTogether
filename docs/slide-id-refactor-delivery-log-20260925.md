@@ -180,3 +180,37 @@
 - 源 KFB 生命周期编排（产物 ready 后源副本保留至产物删除的现状）+ 多条目共享产物的删除/退款耦合（偏差 #3）→ P5。
 - demo 种子/CLI 导入的源平铺文件保留（P6 物理迁移统一搬运）；`.uploading-*.lock` sidecar 平铺维持 P3 裁决。
 - ZIP 响应 `failures` 为新增 additive 字段（前端未消费）；`b.slide` 类展示快照回落 P6 清理。
+
+## P5 门禁（2026-09-26）
+
+合同：docs/slide-id-refactor-p5-contract-20260925.md。变更面：0070 迁移（slide_delete_jobs 补 lease 列+调度索引——任务书误称 0067 已含 lease 列，实施方更正）；`request_delete` 扩展为「ready→deleting CAS + 任务落库同一事务」；删除任务原语族（enqueue/claim 退避+SKIP LOCKED/finish/get）；app.py 执行器族（`_slide_delete_unified`/`_invalidations`/`_physical`/`_settle`/`_execute` + `run_slide_delete_worker_once` + daemon 线程 slide-delete-worker，TESTING 下停执行、测试直调单轮）；`DELETE /api/slide/<name>` legacy 端点归一进同一编排（alias 解析→同一状态机）；`mark_deleted_compat`/`_slide_delete_legacy_core` 按承诺拆除；孤儿扫描 objects/（无行/staging/failed/legacy 布局→报告，ready+id_bundle 与 deleting/deleted 不报）+ .staging/ 残留（四键空间判活，DB 异常 fail-closed 全按在途）+ 清理端点 `DELETE /api/admin/v1/slides/staging-residue`（重验活谓词，活键 409）；baidu_import_store.invalidate_items_for_slide（在途→failed 终态、ready→标注 slide_deleted）。
+
+### P5 偏差裁决记录
+
+| # | 偏差 | 裁决 | 理由/收口 |
+|---|---|---|---|
+| 1 | 新增 0070（lease 列）——任务书误称 0067 已含 | 采纳（任务书更正） | 纯 state CAS 无法安全处理 cleaning 中 worker 崩溃的死任务 |
+| 2 | legacy 端点对无 slides 行的平铺文件由按名 unlink+200 改 404 | 采纳 | 无行文件=orphan_files 人口（只报告不认领）；统一编排需要资产行（状态机+账本）；物理处置走 P6 |
+| 3 | legacy 端点错误路径语义（非可删态 409/清理失败 503 delete_retryable/重放 200 幂等） | 采纳 | 响应信封不变（legacy 恒 {ok:true}）；旧恒 200 的静默部分清理语义本就是债务 |
+| 4 | legacy 布局资产允许 legacy/failed 态进入 deleting（id_bundle 恒严格 ready） | 采纳 | 旧端点 any-state 管理清理能力场景保留；结算幂等不受影响 |
+| 5 | 孤儿 objects 谓词不按合同字面（「行非 deleting/deleted→报告」会把 ready 活包误报） | 采纳（合同表述修正） | 实现为「无行或行不可能合法持包（staging/failed/legacy 布局）」 |
+| 6 | inventory 每次调用附带全树扫描 | 采纳 | admin-only；量大再分页/缓存 |
+| 7 | COS 取消释放顺序（事务内释放预占、提交后清树）维持 P4-b 形态 | 登记不翻案 | P4 review 已裁决；树残留由 worker 重试/孤儿扫描兜底 |
+| 8 | baidu 多条目共享产物的删除语义（P4 偏差 #3 复审义务） | **裁决成立** | 删资产本体+全部引用行失效（不删行保批次审计）；窄竞态（worker 租约写回晚于失效）由执行器可重入+读取门禁+恢复对账兜底 |
+
+### P5 review 观察（不改代码，记录在案）
+
+- `_upsert_delete_job` 的 `requeue_failed` 形参未进 SQL（ON CONFLICT 的 WHERE 恒为 state='failed'）——行为正确（request_delete 的冲突分支不可达：CAS 成功蕴含无既有任务行；enqueue 只需复位 failed），形参为装饰性，P6 顺手清理。
+- `_slide_delete_invalidations` 各步 best-effort（单项失败记日志继续）而非字面 fail-closed——方向安全：残留授权指向 deleted 资产由读取门禁兜底（tombstone 冻结别名不重绑），不阻断物理清理。
+
+### P5 门禁合计（编排方独立复核）
+
+- 全量 pytest（清 /tmp 残渣 + TMPDIR 重定向）：**2726 passed / 1 已知无关失败（admin 0.4.13）/ 6 skipped**（与实施方报告一致；新增 11 用例）。
+- `npm run test:js`：562/562 绿。HP 跨仓契约复跑：**49/49 绿**。
+- 取消路径统一（合同 §1.4）经盘点确认 P3/P4 已就位（V1/V2 取消、ZIP 撤回、COS cancel_job、过期 sweep 均经 remove_staging_tree+failed+释放），本阶段零改动+回归断言。
+
+### P5 遗留（P6 消化）
+
+- baidu 在途 item 的 staging 物理残留由 item 失败收口/孤儿扫描承接。
+- objects/ 孤儿与 legacy 平铺孤儿文件的物理处置 → P6 迁移工具链；`.uploading-*.lock` 平铺 sidecar 维持 P3 裁决（P6 收口）。
+- daemon 退避用应用侧时钟对 DB 时钟（同宿主实践无碍；跨主机部署时评审）。

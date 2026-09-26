@@ -302,6 +302,10 @@ def test_schema_migrations_recorded(conn):
         # （idx_conversion_jobs_canonical_live）+ conversion_jobs 的 publish
         # intent 列。
         "0069_conversion_slide_id_publish.sql",
+        # slide ID 化重构 P5（docs/slide-id-refactor-p5-contract-20260925.md
+        # §1-2）：slide_delete_jobs 的执行器租约列（lease_owner/
+        # lease_expires_at）+ 领取调度索引——daemon 领取/退避/崩溃重领。
+        "0070_slide_delete_jobs_lease.sql",
     ]
 
 

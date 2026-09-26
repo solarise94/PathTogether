@@ -1909,3 +1909,48 @@ def retry_cleanup(batch_id, adapter=None):
         conn.close()
     _cleanup_copies(dict(batch), adapter, batch["state"])
     return get_import(batch_id, batch["owner_user_id"])
+
+
+# --------------------------------------------------------------------------- #
+# 删除联动（P5 合同 §1 偏差 #3 复审：多条目共享同一产物资产）
+# --------------------------------------------------------------------------- #
+def invalidate_items_for_slide(slide_id, *, error_code="slide_deleted"):
+    """资产删除后作废指向该 slide_id 的引用行（不删行、置终态/标注）。
+
+    P4 裁决（0069 DROP uq_baidu_import_items_slide_id）：convert 幂等键
+    （owner+sha+converter）允许多个 item 共享同一产物资产。删除语义
+    （P5 合同 §1.6/交付裁决）：**删资产本体，全部引用行失效**——
+      - 在途 item（queued/transferring/downloading/validating/converting/
+        ingesting）→ stage='failed' + error_code（终态：产物本体已删，
+        该 item 永远到不了 ready）；
+      - 已 ready 的 item → stage 保持 ready（终态），仅标注
+        error_code='slide_deleted'（引用悬空的显式证据）。
+
+    可重入（删除执行器重试/幂等重放无副作用）；与 worker 的租约写回存在
+    窄竞态（worker 稍后把在途 item 写回 ready）——后续执行器重跑或读取侧
+    asset_state 门禁兜底（ready+已删资产不可读、恢复对账不认领）。
+    返回 (inflight_failed, ready_marked) 行数。
+    """
+    if not slide_id:
+        return (0, 0)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE baidu_import_items SET stage='failed', "
+                    "error_code=%s, updated_at=now() "
+                    "WHERE slide_id=%s "
+                    "AND stage NOT IN ('ready','failed','cancelled')",
+                    (error_code, slide_id))
+                inflight = cur.rowcount
+                cur.execute(
+                    "UPDATE baidu_import_items SET error_code=%s, "
+                    "updated_at=now() "
+                    "WHERE slide_id=%s AND stage='ready' "
+                    "AND error_code IS DISTINCT FROM %s",
+                    (error_code, slide_id, error_code))
+                marked = cur.rowcount
+    finally:
+        conn.close()
+    return (inflight, marked)

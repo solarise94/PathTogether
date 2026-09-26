@@ -682,6 +682,78 @@ def mark_failed(slide_id, *, expected_state=SlideState.STAGING, conn=None) -> bo
                       conn=conn)
 
 
+class LayoutBindConflict(RuntimeError):
+    """legacy→id_bundle 布局翻转 CAS 的证据冲突（P6 物理迁移 bound 步）。
+
+    行状态/storage_relpath/accounted_bytes 与翻转参数不一致——不猜不绑，
+    调用方（迁移工具）按冲突中止该迁移项，绝不自动修正。"""
+
+
+def bind_id_bundle_layout(slide_id, storage_relpath, *, accounted_bytes=None,
+                          expected_state=SlideState.READY,
+                          expected_layout=StorageLayout.LEGACY,
+                          conn=None) -> str:
+    """legacy→id_bundle 布局翻转 CAS（P6 合同 §1.2 bound 步；runbook §4.4）。
+
+    物理包已 no-clobber 发布到 ``objects/<slide_id>/`` 后，由本原语在短事务
+    内完成 DB 侧绑定：``storage_layout→id_bundle``、``storage_relpath→新位``、
+    ``accounted_bytes`` 校准（None=保持现值）。**不重复计上传配额**（不动
+    used_bytes——R-12 过渡口径：历史资产已在账本内或无账本责任）；**授权
+    映射零变更**（授权只能来自已审核计划，不因文件搬迁新增权限）。
+
+    语义（带 expected 谓词的真实 SQL CAS，与 mark_* 同口径）：
+      - 返回 ``"migrated"``：CAS 命中（legacy→id_bundle 一次性翻转）；
+      - 返回 ``"already"``：行已处于**同参** id_bundle（崩溃恢复幂等重入——
+        journal+manifest 证明同一迁移项后的重复绑定）；
+      - 抛 :class:`LayoutBindConflict`：行缺失 / 布局不是 expected / 状态
+        漂移 / relpath 或 accounted_bytes 与既有绑定不一致——fail-closed。
+
+    锁序（合同 §5）：调用方事务内先 ``acquire_slide_lock``（advisory 第一把
+    锁），本函数的 UPDATE 取 slides 行锁（迁移路径无任务行锁）。asset_state
+    不迁移（ready 保持 ready——物理搬迁不改变可见性语义）。
+    """
+    rel = slide_storage.check_relpath(storage_relpath, what="storage_relpath")
+    # 与 slide_storage._OBJECTS_DIRNAME 同源的字面（"objects" 是合同级布局词，
+    # 见 slide_storage 模块 docstring 的磁盘布局图）。
+    if rel.split("/")[:2] != ["objects", slide_id]:
+        raise ValueError(
+            "id_bundle storage_relpath 必须位于 objects/<本 slide_id>/ 之下：%r"
+            % storage_relpath)
+    if accounted_bytes is not None and int(accounted_bytes) < 0:
+        raise ValueError("accounted_bytes 不能为负")
+    with _session(conn) as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "UPDATE slides SET storage_layout=%s, storage_relpath=%s, "
+                "accounted_bytes=COALESCE(%s, accounted_bytes), "
+                "updated_at=now() "
+                "WHERE slide_id=%s AND storage_layout=%s AND asset_state=%s",
+                (StorageLayout.ID_BUNDLE, rel,
+                 int(accounted_bytes) if accounted_bytes is not None else None,
+                 slide_id, expected_layout, expected_state))
+            if cur.rowcount == 1:
+                return "migrated"
+            cur.execute(
+                "SELECT storage_layout, asset_state, storage_relpath, "
+                "accounted_bytes FROM slides WHERE slide_id=%s", (slide_id,))
+            row = cur.fetchone()
+            if (row is not None
+                    and row["storage_layout"] == StorageLayout.ID_BUNDLE
+                    and row["asset_state"] == expected_state
+                    and row["storage_relpath"] == rel
+                    and (accounted_bytes is None
+                         or (row["accounted_bytes"] is not None
+                             and int(row["accounted_bytes"])
+                             == int(accounted_bytes)))):
+                return "already"
+            raise LayoutBindConflict(
+                "布局翻转 CAS 未命中且非同参幂等重入（slide_id=%s 行=%r "
+                "期望 layout=%s state=%s relpath=%r accounted=%r）——不猜不绑"
+                % (slide_id,
+                   dict(row) if row is not None else None,
+                   expected_layout, expected_state, rel, accounted_bytes))
+
+
 def force_fail(slide_id, *, conn=None) -> bool:
     """→ failed：staging/ready 强制撤回（上传预占失效的整体撤回场景——
     内容从未入账，不得保持可见；P4-app review 补的迁移原语）。

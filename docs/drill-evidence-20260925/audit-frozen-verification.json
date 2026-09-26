@@ -1,0 +1,60 @@
+{
+  "tool_version": "1.0.0-p0",
+  "mode": "frozen",
+  "scan_version": "audit/1.0.0-p0/frozen/99c66232041f",
+  "scan_id": "99c66232041f",
+  "started_at": "2026-09-26T07:00:25+00:00",
+  "finished_at": "2026-09-26T07:00:25+00:00",
+  "incomplete": false,
+  "incomplete_reasons": [],
+  "consistent_snapshot": true,
+  "db": {
+    "isolation": "REPEATABLE READ READ ONLY",
+    "current_database": "postgres",
+    "pg_snapshot": "822:822:",
+    "conninfo_source": "--database-url",
+    "page_size": 500
+  },
+  "upload_dir": "/tmp/drill-slide-migration-4amfj0il/uploads",
+  "params": {
+    "rate_limit_files_per_sec": 0.0,
+    "quota_tolerance_bytes": 0
+  },
+  "counts": {
+    "slides": 11,
+    "slides_with_file": 7,
+    "slides_missing_file": 2,
+    "orphan_files": 1,
+    "companion_dirs": 1,
+    "staging_leftover": 0,
+    "whitelisted_entries": 4,
+    "special_files": 0,
+    "unknown_dirs": 0,
+    "root_symlinks": 0,
+    "distinct_owners": 2,
+    "slide_logical_bytes": 75689,
+    "slide_inode_dedup_bytes": 75689,
+    "orphan_bytes": 48,
+    "companion_bytes": 60
+  },
+  "issues_total": 9,
+  "issues_by_severity": {
+    "blocker": 3,
+    "review": 6,
+    "info": 0
+  },
+  "issues_by_type": {
+    "active_task": 1,
+    "symlink": 1,
+    "missing_file": 2,
+    "owner_missing": 1,
+    "no_legacy_filename": 1,
+    "orphan_file": 1,
+    "quota_mismatch": 2
+  },
+  "issues_by_disposition": {
+    "manual_review": 6,
+    "retain_history": 2,
+    "quarantine": 1
+  }
+}

@@ -214,3 +214,32 @@
 - baidu 在途 item 的 staging 物理残留由 item 失败收口/孤儿扫描承接。
 - objects/ 孤儿与 legacy 平铺孤儿文件的物理处置 → P6 迁移工具链；`.uploading-*.lock` 平铺 sidecar 维持 P3 裁决（P6 收口）。
 - daemon 退避用应用侧时钟对 DB 时钟（同宿主实践无碍；跨主机部署时评审）。
+
+## P6 第一段门禁（2026-09-26）：迁移工具链 + 合成副本演练
+
+合同：docs/slide-id-refactor-p6-contract-20260925.md §1/§2/§4（§3 运行时退役=第二段独立提交点）。
+
+**交付**：`scripts/plan_slide_migration.py`（冻结审计→确定性计划；零副作用不 import 业务模块，静态契约有测试；计划头 version/env/输入 sha256，无时间戳）；`scripts/migrate_slide_storage.py`（dry-run 默认；--apply 三件套 plan-digest+env+quiesce-proof 缺一拒绝；五态 planned→copied→verified→bound→postverified 持久 journal 逐事件 fsync；私有 staging 复制不硬链接；空间不足阻塞；publish_bundle_no_clobber+新原语 `slide_store.bind_id_bundle_layout` CAS（expected layout/state 谓词、migrated/already/LayoutBindConflict 三态、relpath 强制 objects/<sid>/ 下、不动配额不动授权）；源冻结重验漂移中止；不删源）；`scripts/verify_slide_migration.py`（独立重读 DB+磁盘，journal 仅作 manifest 交叉证据不信 success 字段——篡改有专测；10 张关系表引用落点；tombstone×同名重生交叉验证；配额对账只报告不改账+合法「不等于」披露；授权差异双向 diff；incomplete 退出码 3）；`scripts/drill_slide_migration.py`（演练驱动+合成世界夹具）；`tests/test_slide_migration_tools.py` 22 用例；演练证据 `docs/drill-evidence-20260925/`（文本 6 件，无 token 明文）。
+
+**演练**：合成世界 5 migrate（svs/tif/mrxs 伴侣/kfb 产物形态/kfbf→ome）+4 隔离+孤儿+tombstone×同名新资产+关系全谱；三处崩溃注入（copied/after_publish/bound）恢复幂等；40 断言 0 失败；verify 结论 go；授权表逐行一致、used_bytes 零变更。**编排方独立重跑演练复现通过（40/40）**。
+
+### P6-1 偏差裁决记录
+
+| # | 偏差 | 裁决 | 理由/收口 |
+|---|---|---|---|
+| 1 | MRXS 试开用进程内合成 stub | 采纳 | 真 mirax 驱动需真实厂商数据集；**生产终审须真实 MRXS 样本试开**（P7 硬门禁输入） |
+| 2 | quarantine 口径：legacy 态行不动（人工决议通道依赖 backfill 重扫）、ready 态物理不可信行 force_fail 收口 | 采纳 | 两形态均满足不可读不列表；failed 无回 ready 原语，翻了会锁死人工决议 |
+| 3 | NULL-alias 行不进逐项计划 | 采纳 | 无 legacy_filename=无 legacy 物理存在=不在迁移人群；header 计数披露 no_alias_rows_out_of_scope |
+| 4 | kfb 派生物（.manifest.json/.associated）留置原位不迁移 | 采纳 | runbook §2.3 派生数据保留/重建分类；计划 derivatives_in_place 披露；verify 对账差异作合法原因披露 |
+| 5 | 授权 diff 只对 ID 基字段（名基快照映射以信息项披露） | 采纳 | 名基 JSONB 快照与按 ID 重算不同源，diff 会假阳性 |
+| 6 | 崩溃注入为进程内 SystemExit(130) | 采纳 | journal 逐事件 fsync 与 kill -9 的已落盘证据等价 |
+
+### P6-1 门禁合计（编排方独立复核）
+
+- 全量 pytest：**2748 passed / 1 已知无关失败 / 6 skipped**（2726+22 新增）；test:js 562/562；HP 契约 49/49。
+- 演练独立重跑：40/40 断言通过（证据可复现，非一次性 artifacts）。
+
+### P6-1 遗留（第二段与 P7 输入）
+
+- 第二段（§3）：运行时 legacy 物理读取退役、canonical_is_live/NameConflict 壳删除、升级窗口在途分支（_upload_legacy_promote_state/_upload_v2_set_ownership）排空拆除、.uploading-*.lock 收口、share_server 残留复核、_upsert_delete_job.requeue_failed 装饰形参清理。
+- P7：生产停写窗口+一致备份方案、旧平铺源+留置派生物的独立清理 manifest、真实 MRXS 样本试开、shares.slides JSONB 退役顺序、COS capability 维持 off。

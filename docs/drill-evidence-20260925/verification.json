@@ -1,0 +1,113 @@
+{
+  "tool_version": "1.0.0-p6",
+  "mode": "post-migration",
+  "started_at": "2026-09-26T07:00:25+00:00",
+  "finished_at": "2026-09-26T07:00:25+00:00",
+  "upload_dir": "/tmp/drill-slide-migration-4amfj0il/uploads",
+  "plan": "/tmp/drill-slide-migration-4amfj0il/migration-plan.jsonl",
+  "journal_crosscheck": "/tmp/drill-slide-migration-4amfj0il/migration-journal.jsonl",
+  "incomplete": false,
+  "incomplete_reasons": [],
+  "counts": {
+    "slides": 11,
+    "ready": 6,
+    "ready_id_bundle_ok": 6,
+    "ready_id_bundle_bad": 0,
+    "ready_legacy_remaining": 0,
+    "non_ready": 5
+  },
+  "violations": [],
+  "warnings": [],
+  "references": {
+    "share_slides": {
+      "total": 2,
+      "dangling": []
+    },
+    "slide_view_grants": {
+      "total": 1,
+      "dangling": []
+    },
+    "project_slides": {
+      "total": 1,
+      "dangling": []
+    },
+    "rois": {
+      "total": 1,
+      "dangling": []
+    },
+    "comments": {
+      "total": 1,
+      "dangling": []
+    },
+    "change_log": {
+      "total": 1,
+      "dangling": []
+    },
+    "run_grants": {
+      "total": 1,
+      "dangling": []
+    },
+    "ai_session_principals": {
+      "total": 1,
+      "dangling": []
+    },
+    "annotation_access_events": {
+      "total": 1,
+      "dangling": []
+    },
+    "demo_catalog": {
+      "total": 1,
+      "dangling": []
+    }
+  },
+  "tombstones": {
+    "tombstones": 1,
+    "alias_unique": true,
+    "crossread_checks": 1,
+    "crossread_violations": []
+  },
+  "quota": {
+    "usr_alice": {
+      "quota_bytes": 100000000,
+      "used_bytes": 56426,
+      "reserved_bytes": 0,
+      "accounted_by_state": {
+        "failed": 48,
+        "ready": 56378
+      },
+      "responsible_ready_deleting_bytes": 56378,
+      "delta_used_minus_responsible": 48,
+      "reasons": [
+        "failed 资产 accounted=48（撤回/验证失败不退款或从未入账——历史责任项，须单独核准）"
+      ]
+    },
+    "usr_bob": {
+      "quota_bytes": 100000000,
+      "used_bytes": 42202,
+      "reserved_bytes": 0,
+      "accounted_by_state": {
+        "deleted": 4096,
+        "ready": 38083
+      },
+      "responsible_ready_deleting_bytes": 38083,
+      "delta_used_minus_responsible": 4119,
+      "reasons": [
+        "deleted tombstone accounted=4096（0013 口径删除不回退 used——合法不等于）",
+        "迁移 accounted 校准以包内字节为准（.manifest.json/.associated 派生物留置原位不计——计划 derivatives_in_place 披露）"
+      ]
+    }
+  },
+  "authorization_diff": {
+    "compared_items": 5,
+    "diffs": []
+  },
+  "plan_migration_coverage": {
+    "checked": 5,
+    "not_migrated": []
+  },
+  "quarantine_discipline": {
+    "checked": 5,
+    "readable": []
+  },
+  "go_no_go": "go"
+}

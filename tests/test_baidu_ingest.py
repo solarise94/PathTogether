@@ -83,14 +83,23 @@ def test_b06_native_kfb_kfbf_real_ingest_and_project(tmp_path, monkeypatch):
     assert names["slide.tif"]["stage"] == "ready"
     assert names["panel.kfb"]["stage"] == "ready"
     assert names["fl.kfbf"]["stage"] == "ready"
+    # slide_name 是展示快照（不再作定位键）
     assert names["slide.tif"]["slide_name"] == "slide.tif"
     assert names["panel.kfb"]["slide_name"] == "panel.tif"
     assert names["fl.kfbf"]["slide_name"] == "fl.ome.tif"
+    # native 条目预分配 slide_id 并经统一发布（objects/<id>/，不写根）；
+    # convert 条目 P4-a 前无产物 ID 回填（NULL 保持名快照）
+    sid_tif = names["slide.tif"]["slide_id"]
+    assert sid_tif
+    assert names["panel.kfb"]["slide_id"] is None
+    assert names["fl.kfbf"]["slide_id"] is None
     up = Path(UPLOAD_DIR)
-    assert (up / "slide.tif").is_file()
+    assert (up / "objects" / sid_tif / "data.tif").is_file()
+    assert not (up / "slide.tif").exists()  # 不写 UPLOAD_DIR 根
+    # convert 产物仍按 canonical 名落根（P4-a 切换前的现状）
     assert (up / "panel.tif").is_file()
     assert (up / "fl.ome.tif").is_file()
-    s = slide_io.open_slide(str(up / "slide.tif"))
+    s = slide_io.open_slide(str(up / "objects" / sid_tif / "data.tif"))
     try:
         assert s.level_count >= 1
     finally:
@@ -101,7 +110,10 @@ def test_b06_native_kfb_kfbf_real_ingest_and_project(tmp_path, monkeypatch):
     finally:
         s2.close()
     got = share_store.get_project(proj["pid"])
-    assert set(got["slides"]) == {"slide.tif", "panel.tif", "fl.ome.tif"}
+    # 项目关联：native 按 slide_id（ID 行无名快照）；convert 过渡期按名
+    #（名关联经 legacy_filename 解析也会落 slide_id 列——双列写入）
+    assert {s for s in got["slides"] if s} == {"panel.tif", "fl.ome.tif"}
+    assert sid_tif in (got["slide_ids"] or [])
     assert names["slide.tif"]["project_associate_state"] == "succeeded"
     # 未选中 notes.txt 无转存
     skip_fs = fake._files["skip/notes.txt"]["fs_id"]
@@ -118,9 +130,10 @@ def test_b06_native_kfb_kfbf_real_ingest_and_project(tmp_path, monkeypatch):
     store.run_batch(batch["id"], fake, staging_root=str(tmp_path / "st"))
     got2 = share_store.get_project(proj["pid"])
     assert got2["slides"] == got["slides"]
+    assert got2["slide_ids"] == got["slide_ids"]
 
 
-def test_b08_source_changed_and_name_conflict(tmp_path, monkeypatch):
+def test_b08_source_changed_and_same_name_independent(tmp_path, monkeypatch):
     tif = make_tiff_bytes()
     entries = [{"path": "/x.tif", "size": len(tif), "content": tif}]
     fake, enum_id, by_path = make_ready_enumeration(
@@ -142,6 +155,8 @@ def test_b08_source_changed_and_name_conflict(tmp_path, monkeypatch):
     assert view["items"][0]["error_code"] == "source_changed"
     assert not Path(UPLOAD_DIR).joinpath("x.tif").exists()
 
+    # P4-c：同名导入是独立资产——他人既有同名文件（legacy 布局）既不
+    # 冲突也不被认领，导入按新 slide_id 照常发布
     tif2 = make_tiff_bytes(h=40, w=40)
     entries2 = [{"path": "/y.tif", "size": len(tif2), "content": tif2}]
     fake2, enum2, by2 = make_ready_enumeration(
@@ -150,21 +165,36 @@ def test_b08_source_changed_and_name_conflict(tmp_path, monkeypatch):
     Path(UPLOAD_DIR).joinpath("y.tif").write_bytes(tif2)
     share_store.set_slide_meta("y.tif", owner_user_id="other-user",
                                requester_role="user")
-    batch2 = store.create_import(
-        OWNER, enum2, [by2["y.tif"]["id"]], idempotency_key="b08-2")
-    view2 = store.run_batch(batch2["id"], fake2, staging_root=str(tmp_path / "st2"))
-    assert view2["items"][0]["stage"] == "failed"
-    assert view2["items"][0]["error_code"] == "name_unavailable"
     conn = psycopg.connect(os.environ["DATABASE_URL"])
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT owner_user_id FROM slides WHERE legacy_filename=%s",
+                "SELECT slide_id FROM slides WHERE legacy_filename=%s",
                 ("y.tif",))
+            victim_sid = cur.fetchone()[0]
+    finally:
+        conn.close()
+    assert victim_sid
+    batch2 = store.create_import(
+        OWNER, enum2, [by2["y.tif"]["id"]], idempotency_key="b08-2")
+    view2 = store.run_batch(batch2["id"], fake2, staging_root=str(tmp_path / "st2"))
+    item2 = view2["items"][0]
+    assert item2["stage"] == "ready"  # 不再 name_unavailable
+    sid2 = item2["slide_id"]
+    assert sid2 and sid2 != victim_sid
+    up = Path(UPLOAD_DIR)
+    assert (up / "objects" / sid2 / "data.tif").is_file()
+    assert (up / "y.tif").read_bytes() == tif2  # 他人文件原样保留
+    conn = psycopg.connect(os.environ["DATABASE_URL"])
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT owner_user_id, storage_layout FROM slides "
+                "WHERE slide_id=%s", (victim_sid,))
             row = cur.fetchone()
     finally:
         conn.close()
-    assert row and row[0] == "other-user"
+    assert row == ("other-user", "legacy")  # 既有行不被认领/改绑
 
 
 def test_c02_local_upload_native_and_kfb_associate(tmp_path, monkeypatch):
@@ -283,22 +313,25 @@ def test_copy_new_exclusive_and_no_partial(tmp_path):
     assert dst.read_bytes() == b"payload-bytes"
 
 
-def test_race_native_must_not_overwrite_existing_file(tmp_path, monkeypatch):
-    """native 竞态：预检查放行但目标已存在 → name_unavailable 且不覆盖。"""
+def test_race_native_same_name_is_independent_asset(tmp_path):
+    """P4-c：native 无按名占用语义——他人既有同名文件不冲突、不被覆盖、
+    不被认领；导入按新 slide_id 独立发布（旧 name_unavailable 语义拆除）。"""
     import baidu_ingest
     tif = make_tiff_bytes()
     staging = _stage_file(tmp_path, "race.tif", tif)
     victim = Path(UPLOAD_DIR) / "race.tif"
     victim.write_bytes(_VICTIM)
-    _patch_exists_lie(monkeypatch, victim)
-    with pytest.raises(baidu_ingest.IngestError) as ei:
-        baidu_ingest.ingest_staging(
-            owner_user_id=OWNER, original_name="race.tif",
-            staging_path=str(staging), source_sha256=None, source_size=0)
-    assert ei.value.code == "name_unavailable"
-    # 既有文件内容原样保留（修复前被 copy2 直接覆盖）
+    out = baidu_ingest.ingest_staging(
+        owner_user_id=OWNER, original_name="race.tif",
+        staging_path=str(staging), source_sha256=None, source_size=0)
+    # token 不再承载按名身份（"slide:<name>" 形态拆除）
+    assert out["ingest_token"] == "asset:" + out["slide_id"]
+    sid = out["slide_id"]
+    assert sid
+    assert (Path(UPLOAD_DIR) / "objects" / sid / "data.tif").is_file()
+    # 既有文件内容原样保留（不被覆盖/不被认领）
     assert victim.read_bytes() == _VICTIM
-    # 暂存原件不受失败影响
+    # 暂存原件不受影响
     assert staging.read_bytes() == tif
 
 
@@ -329,7 +362,8 @@ def test_race_convert_must_not_overwrite_existing_file(tmp_path, monkeypatch):
 
 
 def test_midcopy_failure_leaves_no_partial_no_victim(tmp_path, monkeypatch):
-    """复制中途失败：不留半成品、不碰既有他人文件、暂存原件完好。"""
+    """复制中途失败：不留半成品（受管理暂存内清理）、不碰既有他人文件、
+    暂存原件完好、无 objects/ 发布。"""
     import shutil
     import baidu_ingest
     tif = make_tiff_bytes()
@@ -346,8 +380,11 @@ def test_midcopy_failure_leaves_no_partial_no_victim(tmp_path, monkeypatch):
         baidu_ingest.ingest_staging(
             owner_user_id=OWNER, original_name="broken.tif",
             staging_path=str(staging), source_sha256=None, source_size=0)
-    # 不留半成品
-    assert not (Path(UPLOAD_DIR) / "broken.tif").exists()
+    up = Path(UPLOAD_DIR)
+    # 不留半成品：根目录无 broken.tif；未发布任何 objects 资产
+    assert not (up / "broken.tif").exists()
+    assert not (up / "objects").exists() or \
+        not list((up / "objects").iterdir())
     # 不误删他人文件
     assert neighbor.read_bytes() == _VICTIM
     # 暂存原件完好
@@ -355,20 +392,21 @@ def test_midcopy_failure_leaves_no_partial_no_victim(tmp_path, monkeypatch):
 
 
 def test_ingest_native_success_unaffected(tmp_path):
-    """正常 native 入库不受独占创建改造影响（内容逐字节一致）。"""
+    """正常 native 入库不受统一发布改造影响（内容逐字节一致）。"""
     import baidu_ingest
     tif = make_tiff_bytes()
     staging = _stage_file(tmp_path, "direct.tif", tif)
     out = baidu_ingest.ingest_staging(
         owner_user_id=OWNER, original_name="direct.tif",
         staging_path=str(staging), source_sha256=None, source_size=0)
-    assert out["ingest_token"] == "slide:direct.tif"
-    assert out["slide_name"] == "direct.tif"
+    assert out["ingest_token"] == "asset:" + out["slide_id"]
+    assert out["slide_name"] == "direct.tif"  # 展示快照
     assert out["conversion_job_id"] is None
     assert out["project_associate_state"] == "not_needed"
-    dest = Path(UPLOAD_DIR) / "direct.tif"
+    dest = Path(UPLOAD_DIR) / "objects" / out["slide_id"] / "data.tif"
     assert dest.is_file()
     assert dest.read_bytes() == tif
+    assert not (Path(UPLOAD_DIR) / "direct.tif").exists()
 
 
 def test_ingest_convert_success_unaffected(tmp_path):
@@ -380,6 +418,7 @@ def test_ingest_convert_success_unaffected(tmp_path):
         owner_user_id=OWNER, original_name="direct.kfb",
         staging_path=str(staging), source_sha256=None, source_size=0)
     assert out["slide_name"] == "direct.tif"
+    assert out.get("slide_id") is None  # P4-a 前：convert 产物无 ID 回填
     assert out["conversion_job_id"]
     assert out["project_associate_state"] == "not_needed"
     assert (Path(UPLOAD_DIR) / "direct.tif").is_file()

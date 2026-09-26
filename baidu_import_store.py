@@ -25,9 +25,17 @@
 - 清理只针对 ``/apps/bdpan/<batch-id>/`` 本批副本；清理失败置
   ``cleanup_state=failed``，绝不回滚 ready。
 
-入库走 :mod:`baidu_ingest`：native 校验后写入 ``UPLOAD_DIR``，KFB/KFBF
-同步领取 conversion job 并 ``process_job``；``ingest_token`` 防崩溃重入。
-批次级配额预占在全部条目终结后一次 ``consume``（幂等，崩溃重跑不双扣）。
+入库走 :mod:`baidu_ingest`（slide ID 化 P4-c，合同 §4）：native 条目在
+入库编排时**预分配 slide_id**（``slide_store.allocate_slide`` 与
+``baidu_import_items.slide_id`` 同事务绑定；重放/恢复复用原 item 及其
+slide_id，绝不重新分配），经统一发布落 ``objects/<slide_id>/``；KFB/KFBF
+同步领取 conversion job 并 ``process_job``（产物身份经
+``conversion_jobs.slide_id`` 回填——P4-a 落地前该列为 NULL，保持名快照）；
+``ingest_token`` 防崩溃重入（形态 ``item:<item_id>`` / ``cvj:<job_id>``；
+不再承载 ``slide:<name>`` 的按名身份）。恢复只按 item.slide_id /
+conversion job 锚点判定资产状态——**盘上文件名不再是归属证据**（按名对账
+认领已拆除）。批次级配额预占在全部条目终结后一次 ``consume``（幂等，
+崩溃重跑不双扣）。
 """
 
 from __future__ import annotations
@@ -883,6 +891,7 @@ def get_import(batch_id, owner_user_id):
                      "source_size": _dec_str(r["source_size"]),
                      "attempt": int(r["attempt"]),
                      "conversion_job_id": r.get("conversion_job_id"),
+                     "slide_id": r.get("slide_id"),
                      "slide_name": r.get("slide_name"),
                      "project_associate_state": r.get("project_associate_state")
                      or "not_needed"}
@@ -1206,72 +1215,174 @@ def _phase_convert_placeholder(adapter, batch, item):
     return item
 
 
-def _reconcile_ingest(item, batch):
-    """入库成功后、ingest_token 落库前崩溃的按标识对账。
+def _allocate_item_slide(item, batch, owner, format_ext):
+    """native 条目 slide_id 预分配 + ``baidu_import_items.slide_id`` 同事务
+    落库（P4-c 合同 §4.1；0067 列）。
 
-    ingest_staging 先完成产物落盘与归属登记，之后才单独写 ingest_token；
-    间隙崩溃重跑会因产物已存在 name_unavailable，把已成功任务打成
-    failed。此处按标识确认产物已完整落成且归属本批 owner → 直接按成功
-    路径落库（不再重跑入库）；不命中返回 None，调用方照旧走入库。
+    - 幂等由调用方保证（item.slide_id 已有则不进入本函数）；UPDATE 带
+      ``slide_id IS NULL`` 谓词，行数 0（并发已写）时采用既有绑定，本次
+      分配的 staging 行留作证据——绝不把条目改绑第二个 ID。
+    - lease fence：事务内核对批次当前 lease_token（批次行 FOR UPDATE），
+      租约被夺 → :class:`LeaseLost`（worker 安静放弃，新 owner 重判）。
+    """
+    import slide_store
+    bid, token = batch["id"], batch.get("lease_token")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT lease_token FROM baidu_import_batches "
+                    "WHERE id=%s FOR UPDATE", (bid,))
+                lease = cur.fetchone()
+                if lease is None or lease["lease_token"] != token:
+                    raise LeaseLost(
+                        "批次租约已被重领，slide_id 预分配被拒绝（item=%s）"
+                        % item["id"])
+                desc = slide_store.allocate_slide(
+                    owner, original_filename=item["name"],
+                    format_ext=format_ext, conn=c)
+                cur.execute(
+                    "UPDATE baidu_import_items SET slide_id=%s, "
+                    "updated_at=now() WHERE id=%s AND slide_id IS NULL "
+                    "RETURNING slide_id",
+                    (desc.slide_id, item["id"]))
+                row = cur.fetchone()
+                if row is None:
+                    # 不应发生（条目由持租约 worker 串行推进）：采用既有绑定
+                    cur.execute(
+                        "SELECT slide_id FROM baidu_import_items "
+                        "WHERE id=%s", (item["id"],))
+                    row = cur.fetchone()
+                    if row is None:
+                        raise LeaseLost(
+                            "条目行丢失，预分配无法落库（item=%s）"
+                            % item["id"])
+                return row["slide_id"]
+    finally:
+        conn.close()
+
+
+def _find_terminal_conversion_job(owner, source_sha256):
+    """按转换幂等键 (owner, source_sha256, converter_id, converter_version)
+    查既有 conversion job（create_job 同款 WHERE；无则 None）。
+
+    convert 恢复对账的锚点：owner+sha+state 是内容身份证据；canonical 名
+    不再是对账依据（P4-a 将退役 get_job_by_canonical 的名占用语义）。
+    """
+    if not source_sha256:
+        return None
+    from kfb.manifest import CONVERTER_ID, CONVERTER_VERSION
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM conversion_jobs WHERE owner_user_id=%s "
+                    "AND source_sha256=%s AND converter_id=%s "
+                    "AND converter_version=%s LIMIT 1",
+                    (owner, str(source_sha256).lower(), CONVERTER_ID,
+                     CONVERTER_VERSION))
+                return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def _settle_failed_item_asset(item, error_code, slide_id=None):
+    """不可重试失败的 native 预分配资产收口：staging→failed（保留证据，
+    不可读）+ 清受管理暂存树。可重试失败保持 staging——条目重试复用同一
+    slide_id（合同 §4.1：重放不重新分配）。"""
+    sid = slide_id or item.get("slide_id")
+    if not sid or error_code not in NON_RETRYABLE_ERROR_CODES:
+        return
+    import slide_storage
+    import slide_store
+    try:
+        slide_store.mark_failed(sid)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        slide_storage.remove_staging_tree(item["id"])
+    except (OSError, ValueError):
+        pass
+
+
+def _reconcile_ingest(item, batch):
+    """入库成功后、ingest_token 落库前崩溃的按标识对账（P4-c 合同 §4.2）。
+
+    **只按 item.slide_id / conversion job 锚点判定资产状态**——盘上文件
+    名不再是归属证据（按名对账认领已拆除：owner 既有同名上传/他人同名
+    文件都不会被本批认领）。不命中返回 None，调用方照旧走入库（native
+    幂等重发布 / convert 幂等复用 job）：
+      - native：锚点 = item.slide_id（预分配持久绑定）+ asset_state=ready
+        （统一发布的 DB 收口已完成；未完成 → 重跑 ingest_staging 幂等收口）；
+      - convert：锚点 = conversion job（owner+source_sha256+state=ready；
+        产物身份 = job.slide_id 回填——P4-a 落地前该列为 NULL，保持名快照）。
     """
     import baidu_ingest
+    import slide_store
     owner = batch.get("owner_user_id") or ""
     capability = slide_format_registry.lookup(item["name"])["capability"]
-    if capability == slide_format_registry.CAP_CONVERT_REQUIRED:
-        # convert：可见名 = canonical；锚点 = conversion job（owner/sha/state）
-        import conversion_store
-        visible = baidu_ingest.canonical_name_for(item["name"])
-        job = conversion_store.get_job_by_canonical(visible)
-        if job is None or job.get("state") != "ready" \
-                or (job.get("owner_user_id") or "") != owner \
-                or (job.get("source_sha256") or "").lower() != \
-                (item.get("source_sha256") or "").lower():
-            return None
-        assoc = job.get("project_associate_state") or "not_needed"
-        if assoc == "not_needed" and batch.get("target_project_id"):
+
+    if capability == slide_format_registry.CAP_NATIVE_SINGLE_FILE:
+        sid = item.get("slide_id")
+        if not sid:
+            return None  # 尚未预分配 → 照旧入库（编排内分配）
+        desc = slide_store.resolve_slide_id(sid)
+        if desc is None or desc.asset_state != slide_store.SlideState.READY:
+            return None  # 发布未收口 → 重跑 ingest_staging（幂等重发布）
+        assoc = "not_needed"
+        if batch.get("target_project_id"):
             # 关联重放（associate_slide 幂等：已入项目返回 succeeded）
+            assoc = baidu_ingest.associate_slide(
+                owner, batch["target_project_id"], slide_id=sid)
+        return _update_item(item["id"], {
+            "stage": "ready",
+            "ingest_token": "item:" + item["id"],
+            "slide_id": sid,
+            "conversion_job_id": None,
+            "slide_name": item["name"],  # 展示快照（枚举名）
+            "project_associate_state": assoc,
+        }, batch["id"], batch.get("lease_token"))
+
+    # convert：锚点 = conversion job（owner+sha+state）
+    job = _find_terminal_conversion_job(owner, item.get("source_sha256"))
+    if job is None or (job.get("state") or "") != "ready":
+        return None
+    import conversion_store
+    visible = job.get("canonical_name") or job.get("source_name") or ""
+    product_sid = job.get("slide_id") or None  # P4-a 依赖（见模块 docstring）
+    assoc = job.get("project_associate_state") or "not_needed"
+    if batch.get("target_project_id"):
+        if product_sid:
+            assoc = baidu_ingest.associate_slide(
+                owner, batch["target_project_id"], slide_id=product_sid)
+            conversion_store.set_project_associate(
+                job["id"], batch["target_project_id"], assoc)
+        elif assoc == "not_needed":
             assoc = baidu_ingest.associate_slide(
                 owner, batch["target_project_id"], visible)
             conversion_store.set_project_associate(
                 job["id"], batch["target_project_id"], assoc)
-        return _update_item(item["id"], {
-            "stage": "ready",
-            "ingest_token": "cvj:" + job["id"],
-            "conversion_job_id": job["id"],
-            "slide_name": visible,
-            "project_associate_state": assoc,
-        }, batch["id"], batch.get("lease_token"))
-    # native：可见名 = 条目名（枚举名已是 basename）；锚点 = 产物在盘、
-    # 内容 sha 与条目下载摘要一致、share_store 元数据 owner 与批次 owner
-    # 一致。首轮入库也会先过对账，故 sha 必须核：owner 既有的同名不同
-    # 内容上传不得被认领（应走 ingest → name_unavailable）
-    import share_store
-    visible = item["name"]
-    up_dir = os.environ.get("UPLOAD_DIR")
-    if not up_dir or not (Path(up_dir) / visible).is_file():
-        return None
-    meta = share_store.get_slide_meta_full(visible)
-    if (meta.get("owner_user_id") or "") != owner:
-        return None
-    if not item.get("source_sha256") \
-            or _sha256_file(Path(up_dir) / visible) != \
-            item["source_sha256"].lower():
-        return None
-    assoc = "not_needed"
-    if batch.get("target_project_id"):
-        assoc = baidu_ingest.associate_slide(
-            owner, batch["target_project_id"], visible)
     return _update_item(item["id"], {
         "stage": "ready",
-        "ingest_token": "slide:" + visible,
-        "conversion_job_id": None,
-        "slide_name": visible,
+        "ingest_token": "cvj:" + job["id"],
+        "slide_id": product_sid,
+        "conversion_job_id": job["id"],
+        "slide_name": visible,  # 展示快照（job canonical）
         "project_associate_state": assoc,
     }, batch["id"], batch.get("lease_token"))
 
 
 def _phase_ingest(adapter, batch, item, hooks):
-    """入库阶段：真实校验/转换/归属；ingest_token 是崩溃幂等凭证。"""
+    """入库阶段：真实校验/转换/归属；ingest_token 是崩溃幂等凭证。
+
+    P4-c（合同 §4.1/§4.5）：token 形态 ``item:<item_id>``（native）/
+    ``cvj:<job_id>``（convert）——不再含 ``slide:<name>`` 的按名身份承诺。
+    既有 ready 条目上的旧形态 token（升级窗口在途批次）按原样 honored：
+    token 与 stage=ready 同事务落库，在途（未 ready）条目不可能持有旧
+    token，无需迁移或拒绝。
+    """
     bid, token = batch["id"], batch.get("lease_token")
     if item.get("ingest_token"):
         hook = hooks.get("on_ingested")
@@ -1286,6 +1397,18 @@ def _phase_ingest(adapter, batch, item, hooks):
         # 间隙崩溃对账命中：产物已落成，按成功路径收口，不重跑入库
         item = reconciled
     else:
+        # native 预分配（幂等：item.slide_id 已有则复用，绝不重分）
+        slide_id = item.get("slide_id")
+        if not slide_id:
+            info = slide_format_registry.lookup(item["name"])
+            if info["capability"] == \
+                    slide_format_registry.CAP_NATIVE_SINGLE_FILE:
+                ext = (info.get("ext") or "").lstrip(".").lower()
+                if not ext:
+                    _fail_item(item["id"], "unsupported_format", bid, token)
+                    return _get_item(item["id"])
+                slide_id = _allocate_item_slide(
+                    item, batch, batch.get("owner_user_id") or "", ext)
         try:
             result = baidu_ingest.ingest_staging(
                 owner_user_id=batch.get("owner_user_id") or "",
@@ -1293,13 +1416,18 @@ def _phase_ingest(adapter, batch, item, hooks):
                 staging_path=item.get("staging_path"),
                 source_sha256=item.get("source_sha256"),
                 source_size=item.get("source_size"),
-                target_project_id=batch.get("target_project_id"))
+                target_project_id=batch.get("target_project_id"),
+                item_id=item["id"],
+                slide_id=slide_id or None)
         except baidu_ingest.IngestError as exc:
             _fail_item(item["id"], exc.code, bid, token)
+            _settle_failed_item_asset(
+                item, exc.code, slide_id=slide_id or item.get("slide_id"))
             return _get_item(item["id"])
         item = _update_item(item["id"], {
             "stage": "ready",
             "ingest_token": result["ingest_token"],
+            "slide_id": result.get("slide_id") or slide_id,
             "conversion_job_id": result.get("conversion_job_id"),
             "slide_name": result.get("slide_name"),
             "project_associate_state": result.get("project_associate_state")

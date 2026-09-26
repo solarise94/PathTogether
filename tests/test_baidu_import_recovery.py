@@ -59,7 +59,7 @@ def _item_rows(batch_id):
         cur.execute(
             "SELECT id, name, stage, error_code, transfer_task_id, "
             "staging_path, source_sha256, ingest_token, attempt, "
-            "cleanup_state, conversion_job_id, slide_name, "
+            "cleanup_state, conversion_job_id, slide_id, slide_name, "
             "project_associate_state FROM baidu_import_items "
             "WHERE batch_id=%s ORDER BY name", (batch_id,))
         cols = [d.name for d in cur.description]
@@ -365,16 +365,6 @@ def _load_worker_module():
     return mod
 
 
-def _slides_count():
-    conn = psycopg.connect(os.environ["DATABASE_URL"])
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM slides")
-            return int(cur.fetchone()[0])
-    finally:
-        conn.close()
-
-
 def _upload_names():
     return sorted(p.name for p in Path(os.environ["UPLOAD_DIR"]).iterdir())
 
@@ -399,16 +389,16 @@ def test_worker_drain_once_reaches_terminal_state(monkeypatch, tmp_path):
 
 def test_crash_between_ingest_and_token_recovers_native(
         monkeypatch, tmp_path):
-    # P1：ingest_staging 完成后、ingest_token 落库前崩溃 → 条目停在
-    # ingesting 且无凭证；恢复时按标识对账直接收口，不重跑入库
-    # （重跑会 name_unavailable，把已成功任务打成 failed）。
+    # P4-c：ingest_staging 统一发布完成后、ingest_token 落库前崩溃 → 条目
+    # 停在 ingesting 且无凭证；恢复只按 item.slide_id 对账（asset_state=
+    # ready）直接收口，不重跑入库（重放复用同一 slide_id，不重新分配）。
     import baidu_ingest
     fake, batch = _make_batch(monkeypatch, ["/a.tif"], tmp_path,
                               idempotency_key="w3")
     real_ingest = baidu_ingest.ingest_staging
 
     def crash_after_ingest(**kw):
-        real_ingest(**kw)  # 产物落盘 + 归属登记已完成
+        real_ingest(**kw)  # 统一发布（objects/<slide_id>/ + mark_ready）完成
         raise Crash("token 未落库即进程死亡")
 
     monkeypatch.setattr(baidu_ingest, "ingest_staging", crash_after_ingest)
@@ -416,23 +406,36 @@ def test_crash_between_ingest_and_token_recovers_native(
         store.run_batch(batch["id"], fake, staging_root=tmp_path)
     row = _item_rows(batch["id"])[0]
     assert row["stage"] == "ingesting" and not row["ingest_token"]
+    assert row["slide_id"]  # 预分配已持久（对账锚点）
+    sid_before = row["slide_id"]
     expire_batch_lease(batch["id"])
     view = store.run_batch(batch["id"], fake, staging_root=tmp_path)
     assert view["state"] == "succeeded"
     row = _item_rows(batch["id"])[0]
     assert row["stage"] == "ready"
-    assert row["ingest_token"] == "slide:a.tif"
-    # 无重复产物：uploads 单文件、slides 元数据单条、外部调用不重放
-    assert _upload_names() == ["a.tif"]
-    assert _slides_count() == 1
+    assert row["ingest_token"] == "item:" + row["id"]
+    assert row["slide_id"] == sid_before  # 重放复用同一 slide_id，不重分
+    # 无重复产物：单一 objects 资产目录（native 不写 UPLOAD_DIR 根）、
+    # 同一 slide_id 只有一行 slides、外部调用不重放
+    up = Path(os.environ["UPLOAD_DIR"])
+    objects = list((up / "objects").iterdir())
+    assert [p.name for p in objects] == [row["slide_id"]]
+    assert (objects[0] / "data.tif").is_file()
+
+    def q(cur):
+        cur.execute("SELECT COUNT(*) FROM slides WHERE slide_id=%s",
+                    (row["slide_id"],))
+        return int(cur.fetchone()[0])
+    assert _sql(q) == 1
     c = fake.counters()
     assert (c["transfer"], c["download"]) == (1, 1)
 
 
 def test_crash_between_ingest_and_token_recovers_convert_kfbf(
         monkeypatch, tmp_path):
-    # P1 convert 路径：conversion job 已 ready 但 token 未落库 → 恢复时
-    # 按 canonical 名对账（owner/sha/state）直接按成功路径落库。
+    # P4-c convert 路径：conversion job 已 ready 但 token 未落库 → 恢复按
+    # 转换幂等锚点（owner+source_sha256+state）对账直接按成功路径落库
+    # （canonical 名不再是对账依据）。
     import baidu_ingest
     from kfb.fixture_fl import build_synthetic_kfbf
     payload = build_synthetic_kfbf(tmp_path / "src.kfbf").read_bytes()
@@ -458,6 +461,7 @@ def test_crash_between_ingest_and_token_recovers_convert_kfbf(
     assert row["stage"] == "ready"
     assert row["ingest_token"] and row["ingest_token"].startswith("cvj:")
     assert row["slide_name"] == "fl.ome.tif"
+    assert row["slide_id"] is None  # P4-a 前：convert 产物无 ID 回填
     # 无重复产物：canonical 产物仅一个（.manifest.json/.associated 是
     # 转换 sidecar，不算重复），conversion job 仅一条
     names = _upload_names()
@@ -488,31 +492,54 @@ def test_running_cancel_stops_remaining_items(monkeypatch, tmp_path):
     assert stages == ["cancelled", "ready"]  # 第二项被取消，不再推进
     c = fake.counters()
     assert (c["transfer"], c["download"]) == (1, 1)  # 第二项未转存/下载
-    ready_name = [i["name"] for i in view["items"]
-                  if i["stage"] == "ready"][0]
-    assert _upload_names() == [ready_name]  # 第二项未入库
+    # 第二项未入库：objects 下只有第一项的资产目录（native 不写根）
+    ready = [i for i in view["items"] if i["stage"] == "ready"][0]
+    up = Path(os.environ["UPLOAD_DIR"])
+    assert sorted(p.name for p in (up / "objects").iterdir()) == \
+        [ready["slide_id"]]
+    assert not (up / ready["name"]).exists()
 
 
 def test_reconcile_never_claims_same_name_different_content(
         monkeypatch, tmp_path):
-    # 对账只认内容一致的同名产物：owner 既有同名（内容不同）上传时，
-    # 对账不得把它认领为本批 ready（首轮入库前也会先过对账），
-    # 必须照旧 name_unavailable → failed，既有文件内容原样保留。
+    # P4-c：按名对账认领已拆除——盘上恰有 owner 自己的同名不同内容文件
+    # （legacy 布局）也不再是本批资产证据：导入照常独立新 slide_id 发布，
+    # 既有文件与既有 slides 行原样保留（不被覆盖/不被认领/不改绑）。
     import share_store
+    import slide_store
     victim = make_tiff_bytes(h=32, w=48)  # 与 ENTRIES 的 a.tif 内容不同
-    (Path(os.environ["UPLOAD_DIR"]) / "a.tif").write_bytes(victim)
+    up = Path(os.environ["UPLOAD_DIR"])
+    (up / "a.tif").write_bytes(victim)
     share_store.set_slide_meta("a.tif", owner_user_id=OWNER,
                                requester_role="user")
+
+    def q(cur):
+        cur.execute("SELECT slide_id FROM slides WHERE legacy_filename=%s",
+                    ("a.tif",))
+        return cur.fetchone()[0]
+    victim_sid = _sql(q)
+    assert victim_sid
     fake, batch = _make_batch(monkeypatch, ["/a.tif"], tmp_path,
                               idempotency_key="w5")
     view = store.run_batch(batch["id"], fake, staging_root=tmp_path)
     row = _item_rows(batch["id"])[0]
-    assert row["stage"] == "failed"
-    assert row["error_code"] == "name_unavailable"
-    assert not row["ingest_token"]
-    assert (Path(os.environ["UPLOAD_DIR"]) / "a.tif").read_bytes() == victim
-    assert _upload_names() == ["a.tif"]
-    assert _slides_count() == 1
+    assert row["stage"] == "ready"  # 同名导入是独立资产（不再 name_unavailable）
+    sid = row["slide_id"]
+    assert sid and sid != victim_sid
+    assert row["ingest_token"] == "item:" + row["id"]
+    # 既有文件与行原样：内容不变、owner/layout 不被认领改绑
+    assert (up / "a.tif").read_bytes() == victim
+
+    def q2(cur):
+        cur.execute("SELECT owner_user_id, storage_layout FROM slides "
+                    "WHERE slide_id=%s", (victim_sid,))
+        return cur.fetchone()
+    assert _sql(q2) == (OWNER, "legacy")
+    # 新资产独立目录发布且 ready
+    assert (up / "objects" / sid / "data.tif").is_file()
+    desc = slide_store.resolve_slide_id(sid)
+    assert desc is not None and desc.asset_state == "ready"
+    assert desc.owner_user_id == OWNER
 
 
 # --------------------------------------------------------------------------- #

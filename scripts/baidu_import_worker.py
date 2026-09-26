@@ -22,7 +22,8 @@ fake）。与 spec §6.3 对齐：
   门控；
 - 全部外部调用经适配器（参数数组/超时/schema 校验），本脚本不直接
   触发子进程；崩溃恢复依赖 store 内的对账凭证（transfer_task_id /
-  source_sha256 / ingest_token），不无条件重转存/重下载/重复入库。
+  source_sha256 / ingest_token / item.slide_id——P4-c：恢复只按标识判定
+  资产状态，盘上文件名不是归属证据），不无条件重转存/重下载/重复入库。
 """
 
 import os

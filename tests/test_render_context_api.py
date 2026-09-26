@@ -30,6 +30,7 @@ import share_server as share_srv  # noqa: E402
 import share_store  # noqa: E402
 import slide_cache  # noqa: E402
 import slide_render  # noqa: E402
+import slide_store  # noqa: E402
 import app as app_mod  # noqa: E402
 from _tiff_fixtures import (  # noqa: E402
     make_ome_cyx_bytes,
@@ -347,19 +348,38 @@ def test_region_endpoint_accepts_render_token(monkeypatch):
 # --------------------------------------------------------------------------- #
 # 6. 同名替换：旧 token 409，新 generation 不命中旧 cache
 # --------------------------------------------------------------------------- #
+def _rebind_new_asset(name=CYX_NAME, c=2):
+    """P6 改写辅助：同名「替换」在 id_bundle 世界 = 冻结别名改绑**新资产**
+    （R-20：换内容=新 slide_id）——删行释放别名后按新内容重建仓。"""
+    import psycopg
+    with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM slides WHERE legacy_filename=%s", (name,))
+    _write(name, make_ome_cyx_bytes(c=c))
+
+
 def test_replacement_conflicts_old_token_and_cache(monkeypatch):
+    """【P6 改写】同名替换语义=别名改绑新资产（R-20）：旧 token（绑定旧
+    slide_id/旧内容 revision）对新资产 409 slide_revision_conflict；默认瓦片
+    为新资产内容，不命中旧 cache（4ch 旧资产 ≠ 2ch 新资产）。"""
     _flag_on(monkeypatch)
     _write_cyx()
     tok = _ctx_from_selection([{"index": 0}])["render_token"]
+    old_sid = share_store.get_slide_id(CYX_NAME)
     c = _client()
     url = _default_tile_url()
     old_tile = c.get(url + "?render=" + tok).data
     assert old_tile
-    _replace_cyx()  # 同名替换为 2 通道内容
+    _rebind_new_asset()  # 同名新内容 = 新 slide_id 新 revision
+    assert share_store.get_slide_id(CYX_NAME) != old_sid
     r = c.get(url + "?render=" + tok)
-    assert r.status_code == 409, r.get_data(as_text=True)
-    assert (r.get_json() or {}).get("code") == "slide_revision_conflict"
-    # 无 render 的默认瓦片：新代内容，不得命中旧 cache（4ch 默认 ≠ 2ch 默认）
+    # 旧 token 对新资产一律拒绝：slide 绑定不符 → 400 invalid_render_context；
+    # （若别名同 ID 重绑则 revision 不符 → 409 slide_revision_conflict——
+    # 两者都是 fail-closed，不因形态放宽接受）
+    assert r.status_code in (400, 409), r.get_data(as_text=True)
+    assert (r.get_json() or {}).get("code") in (
+        "invalid_render_context", "slide_revision_conflict")
+    # 无 render 的默认瓦片：新资产内容，不得命中旧 cache（4ch 默认 ≠ 2ch 默认）
     new_default = c.get(url).data
     assert new_default != old_tile
 
@@ -640,7 +660,10 @@ def test_token_roundtrip_with_derived_key_only(monkeypatch):
     secret = app_mod.app.secret_key
     payload = slide_render.verify_render_token(tok, secret)
     assert payload is not None
-    assert payload["rev"] == app_mod._legacy_slide_revision(CYX_NAME)
+    # P6（§8 收口）：token rev = slide_assets 内容 revision（id_bundle 唯一取数源）
+    desc = slide_store.resolve_legacy_alias(CYX_NAME)
+    assert payload["rev"] == app_mod._slide_revision(desc)
+    assert payload["rev"].startswith("sha256:")
     # R-15（P2）：token 的 slide 绑定 = slide_id（注册行；无行兼容分支删除前
     # 该夹具无行、按名绑定——先注册行后按 ID 绑定）
     assert payload["slide"] == share_store.get_slide_id(CYX_NAME)

@@ -54,13 +54,6 @@ class StateConflict(ConversionError):
         self.job = job
 
 
-class NameConflict(ConversionError):
-    """**已退役**（P4-app 合同 §3.1）：canonical 名唯一锁拆除后 create_job
-    不再抛出。类保留仅为 baidu_ingest 等既有调用方的兼容捕获面（P6 删除）。"""
-
-    code = "name_unavailable"
-
-
 def _connect():
     conn = pg_store.connect()
     conn.row_factory = psycopg.rows.dict_row
@@ -182,7 +175,8 @@ def create_job(*, owner_user_id, upload_id, source_name, source_sha256,
     同一事务）；复用既有任务（ready/运行中/failed 重入）时**随任务复用其
     slide_id**。failed/cancelled 重置为 queued（删除后重传）。ready 一律保持
     原 source 关联，不因另一次换名上传而迁移产物。canonical 名唯一锁已拆
-    （0069）：同名产物是独立资产，``NameConflict`` 不再抛出。
+    （0069）：同名产物是独立资产，name_conflict 兼容壳（canonical_is_live /
+    NameConflict 类）已随 P6 运行时退役删除。
 
     ``product_exists`` 参数已退役（名占用语义拆除）——保留形参兼容既有调用
     方（baidu_ingest），值被忽略。``source_slide_id``：源本身是切片资产时的
@@ -351,15 +345,6 @@ def list_sources(job_id):
                 return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
-
-
-def canonical_is_live(canonical_name):
-    """**已退役**（P4-app 合同 §3.1/§7）：canonical 名占用语义拆除——同名
-    产物是独立资产（各得各 slide_id），名占用不再构成拒绝理由。恒 False。
-
-    函数保留仅为 baidu_ingest 等既有调用方的兼容面（其磁盘 O_EXCL 检查
-    仍有效）；P6 随 baidu convert 分支收口一并删除。"""
-    return False
 
 
 def get_job_by_slide_id(slide_id):

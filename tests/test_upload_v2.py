@@ -451,9 +451,10 @@ def test_commit_real_garbage_tiff_stable_code_and_cleanup():
     assert not _part(uid).exists()
 
 def test_recover_ownership_failure_keeps_committing(monkeypatch):
-    """**旧管线（升级窗口在途任务）**恢复：ownership 失败不得 finish_commit
-    ——保持 committing，文件仍在，下次可自愈。（新管线的归属随 allocate_slide
-    同事务落库，无此窗口；对应新路径见 test_slide_publish_pg。）"""
+    """【P6 运行时退役改写】旧形态（升级窗口在途任务）committing 恢复：
+    三态提升恢复/按名补归属已拆——**不认识的旧形态 → fail-closed 保持
+    committing + 不调 finish_commit/不回滚**（原场景「ownership 失败保持
+    committing」的拆除后不变量：恢复路径对旧形态不再有任何按名动作）。"""
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client()
     uid = _create(c, name="own.svs", size=100).get_json()["upload_id"]
@@ -471,29 +472,33 @@ def test_recover_ownership_failure_keeps_committing(monkeypatch):
         return real_finish(*a, **k)
 
     monkeypatch.setattr(upload_task_store, "finish_commit", wrap_finish)
-    monkeypatch.setattr(app_mod, "_upload_v2_set_ownership",
-                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("crash")))
+    set_meta_calls = []
+    monkeypatch.setattr(
+        share_store, "set_slide_meta",
+        lambda *a, **k: set_meta_calls.append(a))
+    # 平铺提升证据在（旧三态恢复会判 promoted）——拆除后一律不猜
     out = app_mod._upload_v2_recover_commit(task)
     assert out["state"] == "committing"
     assert finish_calls == []
-    assert dest.exists()
-
-    monkeypatch.setattr(app_mod, "_upload_v2_set_ownership",
-                        lambda *a, **k: None)
+    assert set_meta_calls == []
     out2 = app_mod._upload_v2_recover_commit(out)
-    assert out2["state"] == "committed"
-    assert finish_calls == [1]
+    assert out2["state"] == "committing"
+    assert finish_calls == []
+    assert dest.exists()  # 不撤回、不认领，交人工处置
 
 def test_maintain_heals_committed_missing_owner(monkeypatch):
-    """**旧管线（升级窗口在途任务）**：GET 路径仅在 slide_meta 缺 owner 时
-    校正归属。（新管线归属在 allocate_slide 同事务落库，无按名补写——
-    P3 合同 §3.1.2。）"""
+    """【P6 运行时退役改写】旧形态 committed 任务：GET 维护路径**不再按名
+    补写归属**（升级窗口校正分支已拆；新管线归属在 allocate_slide 同事务
+    落库——不变量=任何状态下都不触发 set_slide_meta 按名补写）。"""
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client()
     uid = _create(c, name="heal.svs", size=80).get_json()["upload_id"]
     _downgrade_to_legacy_task(uid)
     _upload_full(c, uid, b"h" * 80, chunk=40)
-    assert c.post("/api/uploads/%s/commit" % uid).status_code == 200
+    # 旧形态非转换任务 commit = 确定性失败（legacy_upload_task_unsupported）
+    r = c.post("/api/uploads/%s/commit" % uid)
+    assert r.status_code == 409
+    assert r.get_json()["code"] == "legacy_upload_task_unsupported"
     healed = []
 
     def note(*a, **k):
@@ -501,21 +506,17 @@ def test_maintain_heals_committed_missing_owner(monkeypatch):
 
     monkeypatch.setattr(share_store, "get_slide_meta_full",
                         lambda *_a, **_k: {"owner_user_id": None})
-    monkeypatch.setattr(app_mod, "_upload_v2_set_ownership", note)
+    monkeypatch.setattr(share_store, "set_slide_meta", note)
     task = upload_task_store.get_task(uid)
     out = app_mod._upload_v2_maintain(task)
-    assert out["state"] == "committed"
-    assert healed == [True]
-
-    healed.clear()
-    monkeypatch.setattr(share_store, "get_slide_meta_full",
-                        lambda *_a, **_k: {"owner_user_id": "usr_x"})
-    app_mod._upload_v2_maintain(task)
+    assert out["state"] == "failed"
     assert healed == []
 
 def test_recover_commit_does_not_commit_when_settle_fails(monkeypatch):
-    """**旧管线（升级窗口在途任务）**崩溃恢复：入账失败不得留下 committed
-    文件。（新管线的预约失效收口见 test_slide_publish_pg 的恢复用例。）"""
+    """【P6 运行时退役改写】旧形态崩溃恢复不再进入收口：无论 settle 行为
+    如何（含 ReservationInvalid），恢复对旧形态保持 committing——原场景
+    「入账失败不得留下 committed 文件」由「根本不尝试入账」这更强不变量
+    取代（新管线的预约失效收口见 test_slide_publish_pg 的恢复用例）。"""
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client()
     uid = _create(c, name="rc.svs", size=100).get_json()["upload_id"]
@@ -531,8 +532,25 @@ def test_recover_commit_does_not_commit_when_settle_fails(monkeypatch):
 
     monkeypatch.setattr(upload_task_store, "finish_commit", boom)
     out = app_mod._upload_v2_recover_commit(task)
-    assert out["state"] == "failed"
-    assert not dest.exists()
+    assert out["state"] == "committing"  # fail-closed：不猜、不入账、不删证据
+    assert dest.exists()
+
+def test_commit_old_form_native_fails_deterministic(monkeypatch):
+    """P6 运行时退役新增：升级窗口旧形态（无 slide_id 的原生单文件）commit
+    = 确定性失败（409 legacy_upload_task_unsupported）+ 释放预占；UPLOAD_DIR
+    根不产生任何平铺提升。"""
+    monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
+    c = _client()
+    uid = _create(c, name="oldform.svs", size=64).get_json()["upload_id"]
+    _downgrade_to_legacy_task(uid)
+    _upload_full(c, uid, b"o" * 64, chunk=64)
+    r = c.post("/api/uploads/%s/commit" % uid)
+    assert r.status_code == 409
+    j = r.get_json()
+    assert j["code"] == "legacy_upload_task_unsupported"
+    assert j["state"] == "failed"
+    assert not (Path(UPLOAD_DIR) / "oldform.svs").exists()
+    assert upload_task_store.get_task(uid)["state"] == "failed"
 
 def test_commit_validates_before_promotion(monkeypatch):
     """§2.3 纠正：_validate_slide_file 必须在原子提升**之前**调用。"""

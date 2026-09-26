@@ -47,7 +47,7 @@ import budget_store  # noqa: E402
 import demo_store  # noqa: E402
 import app as app_mod  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app, FakeResponse # noqa: E402
+from _pt_helpers import csrf_client, isolate_app, FakeResponse, register_slide_row  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # 公共基建
@@ -157,10 +157,12 @@ def _make_user(role="owner"):
         "u-%s@x.com" % uuid.uuid4().hex[:8], "password1password1", role=role)
 
 def _touch(name="demo1.svs"):
-    # 经 app_mod.UPLOAD_DIR 写入（其它测试模块可能改写过该常量）
+    # 经 app_mod.UPLOAD_DIR 写入（其它测试模块可能改写过该常量）；
+    # P6：建可读仓（id_bundle 行——legacy 布局在运行时不可读）
     p = Path(app_mod.UPLOAD_DIR) / name
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(b"svs-stub")
+    register_slide_row(name)
     return name
 
 def _setup_platform():
@@ -310,7 +312,7 @@ def test_demo_slides_listing_and_catalog_outside_rejected(monkeypatch):
     fake = FakeSidecar()._install()
     inside = _catalog_add(_touch("in-demo.svs"))
     outside_name = _touch("private.svs")
-    share_store.set_slide_meta(outside_name)  # 有 slides 行但不在目录
+    register_slide_row(outside_name)  # 有 slides 行但不在目录（P6：id_bundle）
     outside_id = share_store.get_slide_id(outside_name)
     client = _client()
     client.get("/api/demo/config")
@@ -357,7 +359,7 @@ def test_demo_slides_bilingual_and_lang_convenience():
     FakeSidecar()._install()
     zh_only = _catalog_add(_touch("zh-only.svs"))
     bilingual = _touch("bi.svs")
-    share_store.set_slide_meta(bilingual)
+    register_slide_row(bilingual)
     bi_id = share_store.get_slide_id(bilingual)
     demo_store.catalog_add(
         bi_id, display_name="肺腺癌 TCGA-49-AAR4",

@@ -360,8 +360,14 @@ def test_unknown_expected_state_rejected():
 # --------------------------------------------------------------------------- #
 def test_update_display_name_keeps_alias_and_grants(conn):
     with conn.cursor() as cur:
-        _insert_legacy_row(cur, "sld_meta1", "keep.svs", state="ready",
-                           owner="usr_o")
+        # P6 改写：行建为 id_bundle（authorize_read 的 layout 门禁——legacy
+        # 布局=待迁移不可读）；改名/别名/授权断言（本测试场景）不变。
+        cur.execute(
+            "INSERT INTO slides (slide_id, legacy_filename, owner_user_id, "
+            "public, asset_state, storage_layout, storage_relpath) "
+            "VALUES (%s,%s,%s,%s,%s,'id_bundle',%s)",
+            ("sld_meta1", "keep.svs", "usr_o", False, "ready",
+             "objects/sld_meta1/data.svs"))
         cur.execute(
             "INSERT INTO slide_view_grants (slide_name, user_id, slide_id) "
             "VALUES ('keep.svs', 'usr_g', 'sld_meta1')")

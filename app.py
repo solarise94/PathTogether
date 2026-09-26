@@ -291,6 +291,10 @@ def _canonical_name_for(source_safe):
     P4-app（合同 §3.1）：canonical 名唯一锁拆除（0069）后本函数只服务
     canonical_name/original_filename 的展示快照——不再参与路径构造、目标
     冲突或名占用判定（同名产物=独立资产，各得各 slide_id）。
+
+    P6 用途核对（运行时退役段）：唯一调用点 = _enqueue_conversion 的
+    create_job(canonical_name=…) 展示快照（落 conversion_jobs.canonical_name /
+    产物 original_filename）；其余用途清零（路径派生/冲突判定均不经此）。
     """
     info = slide_format_registry.lookup(source_safe)
     stem = source_safe.rsplit(".", 1)[0]
@@ -402,7 +406,12 @@ def _ensure_conversion_job(ident, *, source_name, source_sha256, upload_id,
                     job["id"], staged_source, UPLOAD_DIR, ext=_ext)
         return job, job.get("canonical_name")
     if not source_format:
-        probe_path = staged_source or (UPLOAD_DIR / source_name)
+        if staged_source:
+            probe_path = staged_source
+        else:
+            # P6 运行时退役：不再回落 UPLOAD_DIR/<source_name> 平铺源探测
+            #（新链路源副本恒在任务/任务 staging；无副本=源缺失，fail-closed）。
+            raise FileNotFoundError(source_name)
         source_format = _probe_kfb_or_fail(probe_path)["format"]
     return _enqueue_conversion(
         ident, source_name=source_name, source_sha256=source_sha256,
@@ -1849,11 +1858,10 @@ def _resolve_pair_context(pair, skey: str, path=None, *, token="", body=None,
     抛 RenderRequestError / SlideRenderError（稳定码，均为解码前拒绝）。
     默认 context 的 fingerprint 回填 _DEFAULT_FP_CACHE（按 generation）。
     P2（R-15）：``skey`` 是 _slide_scope_key 派生的 slide_id 绑定键（统计
-    scope/FP 缓存/token 绑定）；``path`` 是 resolver 解析后的绝对路径
-    （revision=mtime:size 的取数源；缺省按旧名拼 UPLOAD_DIR——内容语义不变）。
-    P3（合同 §4）：``revision`` 显式给出时优先（id_bundle 资产传
-    _slide_revision——slide_assets 内容 revision；legacy 布局维持 mtime:size）。
-    """
+    scope/FP 缓存/token 绑定）。
+    P6（任务 §8 收口）：``revision`` 显式给出时优先（**id_bundle 资产统一
+    slide_assets 内容 revision——签发/验签/fingerprint 同值**）；缺省回落
+    mtime:size（path 或名——仅剩无 descriptor 的防御路径）。"""
     osr = pair["osr"]
     rev_target = path if path is not None else skey
     gen_scope = _ctx_scope(skey, pair.get("gen"))
@@ -1982,8 +1990,9 @@ def _authorize_or_deny(desc, *, channel="session"):
     - channel="demo"：/api/demo/* —— authorize_read(demo_capability=True,
       allow_public=False)：allowlist 唯一入口，public ≠ 匿名可见（docs §5.1）。
     - channel="state"：internal/plugin 机器通道（internal token / 插件 JWT +
-      run grant 已各自鉴权）——只做 ready 状态门禁（见 _legacy_row_state_gate，
-      通道自身无用户主体，authorize_read 的主体分支不适用）。
+      run grant 已各自鉴权）——只做 ready 状态门禁（见 _desc_state_readable；
+      通道自身无用户主体，authorize_read 的主体分支不适用）。P6 运行时退役：
+      legacy 布局行同样拒（读路径只认 id_bundle）。
     """
     if desc is None:
         return False
@@ -1991,7 +2000,7 @@ def _authorize_or_deny(desc, *, channel="session"):
         return slide_store.authorize_read(
             desc, demo_capability=True, allow_public=False)
     if channel == "state":
-        return getattr(desc, "asset_state", None) == slide_store.SlideState.READY
+        return _desc_state_readable(desc)
     ident = current_identity()
     role = ident.get("role")
     uid = ident.get("user_id") or None
@@ -2043,6 +2052,15 @@ def _legacy_row_state_gate(safe):
         app.logger.warning("机器通道状态门禁解析失败（fail-closed 拒读）：%s",
                            safe, exc_info=True)
         return None
+
+
+def _desc_state_readable(desc):
+    """机器通道可读性判定：asset_state='ready' **且** storage_layout=
+    'id_bundle'（P6 运行时退役：legacy 布局行 = 待迁移/隔离，404 同「不
+    存在」口径，不泄露存在性）。"""
+    return (getattr(desc, "asset_state", None) == slide_store.SlideState.READY
+            and getattr(desc, "storage_layout", None)
+            == slide_store.StorageLayout.ID_BUNDLE)
 
 
 def _slide_cache_key_for(slide_id, name):
@@ -2125,8 +2143,14 @@ def _desc_path(desc):
 
 def _desc_read_path(desc):
     """读通道的路径收口：resolve 后入口文件必须存在，否则 404（保持旧
-    _safe_name「文件消失即 404」语义；授权在先、404 在后不变）。"""
-    path = _desc_path(desc)
+    _safe_name「文件消失即 404」语义；授权在先、404 在后不变）。
+
+    P6 运行时退役：legacy 布局行在统一门禁（authorize_read）已拒，这里的
+    ValueError → 404 是防御层（fail-closed，不泄露存在性——与文件消失同口径）。"""
+    try:
+        path = _desc_path(desc)
+    except ValueError:
+        abort(404, jsonify(error="切片不存在"))
     if not path.is_file():
         abort(404, jsonify(error="切片不存在"))
     return path
@@ -2896,7 +2920,15 @@ def _verify_snapshot_attestation(att, prov, session_id, current_revision):
     return None, None
 
 
-def _check_snapshot_attestation(snap_prov, session_id, safe):
+def _ai_write_revision(gate, safe):
+    """AI 写通道的 revision 取数（P6 §8 收口）：descriptor（id_bundle=
+    slide_assets 内容 revision）优先；无 descriptor 防御路径按名 mtime:size。"""
+    if gate is not None:
+        return _slide_revision(gate)
+    return _legacy_slide_revision(safe)
+
+
+def _check_snapshot_attestation(snap_prov, session_id, revision):
     """两通道共用的 attestation 强制闸（plugin v1 与 legacy internal）。
 
     携带 snapshot_id 的描绘（polygon 必带、freehand 可选带）必须携带通过
@@ -2911,8 +2943,10 @@ def _check_snapshot_attestation(snap_prov, session_id, safe):
     if not att:
         return ("描绘缺少 snapshot_attestation（来源快照须携带 HP 服务端 "
                 "attestation；旧版 sidecar 请升级）"), None
+    # P6（§8 收口）：revision 由调用方传 descriptor 口径（id_bundle=
+    # slide_assets；名 mtime:size 仅无 descriptor 防御路径）
     return _verify_snapshot_attestation(
-        att, snap_prov, session_id, _legacy_slide_revision(safe))
+        att, snap_prov, session_id, revision)
 
 
 # --------------------------------------------------------------------------- #
@@ -6647,7 +6681,9 @@ def api_demo_slide_tile(slide_id, level, x, y):
 
     def _decode(pair):
         ctx, fp = _resolve_pair_context(pair, skey, path=_demo_tile_path,
-                                        token=token, flag=flag)
+                                        token=token, flag=flag,
+                                        revision=_slide_revision(
+                                            desc, _demo_tile_path))
         cur_mode = slide_render.image_mode_from_context(ctx)
         if req_profile is not None:
             slide_render.resolve_viewer_encoding(
@@ -7614,11 +7650,10 @@ def _ready_slide_descs():
     """DB 资产查询：asset_state='ready' 的全部 descriptor（P1-B2 列表源）。
 
     列表源改 DB（合同 §4：DB asset_state='ready' 是唯一可见性开关——
-    「目录扫描=切片」退役）；legacy 布局行额外 stat 一次入口文件（不存在→
-    不列出，保持旧「文件消失即不列出」行为）。
-    P3（合同 §4）：**id_bundle 行（legacy_filename=NULL）一并出列**——入口
-    经 resolve_descriptor_path（objects/<slide_id>/data.<ext>）stat；这些行的
-    legacy 名集合语义见 _visible_slide_names（id_bundle 以 slide_id 入集）。
+    「目录扫描=切片」退役）；入口经 resolve_descriptor_path（objects/<
+    slide_id>/data.<ext>）stat，文件消失不列出（旧行为）。
+    P6 运行时退役：legacy 布局行在 resolver 即 ValueError——fail-closed 不
+    列出（待迁移/隔离不可见；visible_ready_slide_ids 的 SQL 侧同口径）。
     """
     try:
         descs = slide_store.list_ready_descriptors()
@@ -7633,7 +7668,7 @@ def _ready_slide_descs():
                     desc, root=UPLOAD_DIR).is_file():
                 continue  # 入口文件消失：不列出（旧行为）
         except Exception:
-            continue  # 路径解析失败（containment 等）：fail-closed 不列出
+            continue  # 路径解析失败（legacy 布局/containment 等）：fail-closed 不列出
         out.append(desc)
     return out
 
@@ -11978,35 +12013,6 @@ def _upload_legacy_manifest(task):
     return arts if isinstance(arts, list) else []
 
 
-def _upload_legacy_promote_state(task):
-    """V1 提升证据的三态判定（纯函数，json/PG 同一判定）。
-
-    返回 'promoted'（manifest 全存在且大小/哈希吻合）/ 'absent'（全不存在）/
-    'conflict'（部分存在或证据不符——含 manifest 损坏）。
-    """
-    arts = _upload_legacy_manifest(task)
-    if not arts:
-        return "conflict"  # manifest 缺失/损坏：无法安全判定，fail-closed
-    present = 0
-    for a in arts:
-        p = UPLOAD_DIR / str(a.get("name") or "")
-        try:
-            st = p.stat()
-        except OSError:
-            continue
-        if not p.is_file() or int(st.st_size) != int(a.get("size") or -1):
-            return "conflict"
-        want_sha = a.get("sha256")
-        if want_sha and _sha256_file(p) != want_sha:
-            return "conflict"
-        present += 1
-    if present == len(arts):
-        return "promoted"
-    if present == 0:
-        return "absent"
-    return "conflict"
-
-
 def _upload_legacy_fail(upload_id, token, task, *, permanent, remove_names=()):
     """V1 受理后的失败收尾：fail_commit → 清提升文件 → （临时类）取消 → 释放预占。
 
@@ -12033,35 +12039,22 @@ def _upload_legacy_fail(upload_id, token, task, *, permanent, remove_names=()):
     return t
 
 
-def _upload_legacy_remove_artifacts(artifacts):
-    """撤回提升：只删 manifest 内（且仍吻合大小）的文件，绝不删他人文件。"""
-    for a in artifacts:
-        p = UPLOAD_DIR / str(a.get("name") or "")
-        try:
-            if p.is_file() and p.stat().st_size == int(a.get("size") or -1):
-                p.unlink(missing_ok=True)
-        except OSError:
-            app.logger.exception("V1 上传撤回提升失败：%s", a.get("name"))
-
-
 def _upload_legacy_recover_commit(task):
     """V1 committing 超时的惰性恢复（G7；与 _upload_v2_recover_commit 并列）。
 
-    P4-app 三路分发：
+    P6 运行时退役后的两路分发（升级窗口排空——旧形态拆得不猜）：
       1. **ZIP 批量任务**（upload_task_items 有绑定行）→ 逐 item 幂等补发
          （objects/<sid> 已存在且吻合 → 只做 DB CAS；staging 在 → 组装+
          发布；都缺 → item 判失败），finish_commit 的 settle_bytes=全部
          已发布 item 字节合计（合同 §2.4）；
       2. **convert-required 任务**（conversion job 已按 upload_id 建）→
          源副本在任务 staging 即 finish_commit（源字节口径）；
-      3. 升级窗口旧任务（v1_artifacts 平铺提升）→ 证据三态恢复
-         （_upload_legacy_promote_state，纯状态判定）：
-         promoted → 补 ownership 后 finish_commit；absent → rollback +
-         取消 + 释放；conflict → fail-closed 保持 committing，绝不按过期
-         时间盲 release。
+      3. 其余（v1_artifacts 平铺提升形态的升级窗口在途旧任务）→ **不认识
+         的旧形态：fail-closed 保持 committing + 明确日志**，交人工处置——
+         三态提升恢复（_upload_legacy_promote_state）已随运行时退役拆除，
+         不按过期时间盲 release、不猜。
     """
     upload_id = task["upload_id"]
-    token = task.get("commit_token") or ""
     arts = _upload_legacy_manifest(task)
     if not arts:
         app.logger.error(
@@ -12075,50 +12068,11 @@ def _upload_legacy_recover_commit(task):
         out = _upload_legacy_recover_conversion(task, arts)
         if out is not None:
             return out
-    state = _upload_legacy_promote_state(task)
-    if state == "conflict":
-        app.logger.error(
-            "upload task %s 恢复证据冲突（部分 artifact 存在或大小/哈希不符），"
-            "保持 committing 等待人工处置，不释放预占", upload_id)
-        return task
-    if state == "absent":
-        try:
-            t = upload_task_store.rollback_committing(upload_id)
-            t = upload_task_store.cancel_task(upload_id)
-        except upload_task_store.UploadTaskError:
-            app.logger.exception("upload task %s 恢复回滚失败", upload_id)
-            t = upload_task_store.get_task(upload_id) or task
-        _upload_v2_release_reservation_quietly(t)
-        return t
-    sha = _upload_manifest_sha(arts)
-    # 【P4-app §7 核对】以下按名补归属只服务**升级窗口在途旧任务**（v1_
-    # artifacts 平铺提升形态；P4-app 起的 ZIP 批量任务在 items 分支、
-    # convert-required 在 job 源副本分支收口，均不经此处）——P6 排空后删。
-    for a in arts:
-        if not a.get("slide"):
-            continue
-        try:
-            share_store.set_slide_meta(
-                a["name"],
-                owner_user_id=(task.get("owner_user_id") or None),
-                requester_role=user_store.ROLE_OWNER)
-        except Exception:
-            app.logger.exception(
-                "upload task %s 恢复时 ownership 失败，保持 committing", upload_id)
-            return task
-    try:
-        return upload_task_store.finish_commit(
-            upload_id, token, sha, settle_bytes=int(task["declared_size"]))
-    except upload_guard.ReservationInvalid:
-        app.logger.warning(
-            "upload task %s 恢复收口时预占已失效，撤回提升", upload_id)
-        _upload_legacy_remove_artifacts(arts)
-        return _upload_legacy_fail(upload_id, token, task, permanent=True)
-    except upload_task_store.StateConflict as e:
-        return e.task or upload_task_store.get_task(upload_id) or task
-    except Exception:
-        app.logger.exception("upload task %s 恢复收口失败", upload_id)
-        return upload_task_store.get_task(upload_id) or task
+    app.logger.error(
+        "upload task %s 为升级窗口旧形态（v1_artifacts 平铺提升；该恢复路径"
+        "已随 P6 运行时退役拆除），fail-closed 保持 committing 等待人工处置，"
+        "不释放预占", upload_id)
+    return task
 
 
 def _upload_legacy_recover_zip(task, arts, items):
@@ -12180,9 +12134,10 @@ def _upload_legacy_recover_conversion(task, arts):
     """convert-required（KFB）任务的 committing 恢复（P4-app）。
 
     源副本归 conversion job 的任务 staging（``.staging/<job_id>/source/``）；
-    job 按 upload_id 找到且源副本在（大小/哈希与 manifest 吻合）→
+    job 按 upload_id 找到且源副本在（大小与 manifest 吻合）→
     finish_commit（源字节口径）。返回恢复后的 task；不是本形态（job 未建/
-    源不在任务 staging——例如升级窗口平铺源）返回 None 交回旧三态判定。
+    源不在任务 staging）返回 None 交回上层按「不认识的旧形态 fail-closed
+    保持 committing」收口（P6 运行时退役：平铺源三态判定已拆）。
     """
     upload_id = task["upload_id"]
     token = task.get("commit_token") or ""
@@ -12584,7 +12539,8 @@ def api_upload():
 
     P0-A §3.3 资源防护（docs/open-registration-security-remediation）：
       - 单请求字节上限两层执行（Werkzeug MAX_CONTENT_LENGTH + 计数流）；
-      - 始终先写 .uploading-* 临时文件，验证成功后原子 link/rename 提升；
+      - 内容直写任务 staging（.staging/<task_id>/；P6：平铺 .uploading-*
+        已收口），验证通过后统一发布；
       - PG 权威用户配额预占（失败释放 / 成功转实占）+ 在途与每小时限流；
       - 写入前与解压过程中检查磁盘保留水位；
       - 目标名冲突统一回「名称不可用」，不回显跨用户真实文件名（§3.12）。
@@ -12993,15 +12949,14 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 def _upload_v2_part_path(task):
     """任务临时分片文件（按 offset pwrite 单次落盘）。
 
-    P3（合同 §3.2）：新管线任务（slide_id 绑定）的传输暂存落
-    ``.staging/<upload_id>/transfer/data``（slide_storage.staging_dir 派生，
-    不再产生 UPLOAD_DIR 根下的平铺 ``.uploading-*``）；升级窗口在途的旧任务
-    （无 slide_id）维持旧平铺名，由旧恢复/清理路径排空（P6 收口并存）。
+    P6 运行时退役（升级窗口排空）：**全部任务**（slide_id 绑定的原生单文件
+    与 convert-required 无绑定任务）的传输暂存统一落
+    ``.staging/<upload_id>/transfer/data``（slide_storage.staging_dir 派生）
+    ——UPLOAD_DIR 根下的平铺 ``.uploading-*.part`` 后备分支已拆除（旧位
+    不再写入；锁是进程内协调原语，无跨版本兼容价值，读取旧位也不允许）。
     """
-    if task.get("slide_id"):
-        return slide_storage.staging_dir(task["upload_id"], "transfer",
-                                         root=UPLOAD_DIR) / "data"
-    return UPLOAD_DIR / (".uploading-%s.part" % task["upload_id"])
+    return slide_storage.staging_dir(task["upload_id"], "transfer",
+                                     root=UPLOAD_DIR) / "data"
 
 
 @contextmanager
@@ -13009,13 +12964,17 @@ def _upload_v2_chunk_lock(upload_id):
     """每任务写租约：串行化 offset 检查、pwrite 与 confirmed_offset 推进。
 
     元数据行锁（json flock / PG FOR UPDATE）只覆盖短事务，不能挡住锁外 pwrite
-    的同 offset 覆盖。本锁以 UPLOAD_DIR 下 sidecar `.uploading-<id>.lock` 的
-    排他 flock 把「权威 offset 检查 → 写文件 → append_chunk」圈进同一临界区。
-    P3 注：这是纯进程间协调 sidecar（flock 句柄），不是暂存内容——内容暂存
-    已全部迁 .staging/<task_id>/（_upload_v2_part_path）；锁文件保持平铺名以
-    维持升级窗口在途任务的锁同一性（P6 收口）。
+    的同 offset 覆盖。本锁以任务暂存树内的 sidecar
+    ``.staging/<upload_id>/chunk.lock`` 排他 flock 把「权威 offset 检查 →
+    写文件 → append_chunk」圈进同一临界区。
+    P6 收口（P3 裁决兑现）：锁文件从 UPLOAD_DIR 根下的平铺
+    ``.uploading-<id>.lock`` 收进任务 staging 目录——纯进程间协调 sidecar
+    （flock 句柄），无跨版本兼容价值；整树清理（remove_staging_tree）随之
+    覆盖锁文件，平铺旧位不再产生任何残留。
     """
-    path = UPLOAD_DIR / (".uploading-%s.lock" % upload_id)
+    path = slide_storage.staging_task_dir(upload_id, root=UPLOAD_DIR) \
+        / "chunk.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -13025,32 +12984,6 @@ def _upload_v2_chunk_lock(upload_id):
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
-
-
-def _promote_no_clobber(src, dest):
-    """原子 no-clobber 提升：优先 hard-link（源仍在，失败可回滚）。
-
-    ``os.replace`` 会覆盖并发出现的同名目标并把源移走，破坏 no-clobber。
-    跨设备（EXDEV 等）时复制到 dest 同目录的唯一临时文件再 link，绝不 replace。
-    目标已存在 → FileExistsError。
-    """
-    src = Path(src)
-    dest = Path(dest)
-    try:
-        os.link(src, dest)
-        return "link"
-    except FileExistsError:
-        raise
-    except OSError:
-        tmp = dest.with_name(".promoting-%s-%s" % (dest.name, secrets.token_hex(8)))
-        try:
-            shutil.copy2(src, tmp)
-            os.link(tmp, dest)
-        except Exception:
-            tmp.unlink(missing_ok=True)
-            raise
-        tmp.unlink(missing_ok=True)
-        return "copy-link"
 
 
 def _upload_v2_reservation_held(task):
@@ -13107,15 +13040,13 @@ def _upload_v2_release_reservation_quietly(task):
 def _upload_v2_cleanup_part(task):
     """清临时分片文件（取消/过期/commit 提升完成后）。
 
-    P3：新管线任务清整个 ``.staging/<task_id>/`` 树（传输件+全部 generation，
-    合同 §3.3 第 8 步「清 staging 后再释放预占」的文件侧动作——调用方保证
-    先本函数后 release）；旧任务维持平铺 .part unlink。
+    P6 运行时退役：全部任务清整个 ``.staging/<task_id>/`` 树（传输件+全部
+    generation+chunk.lock sidecar，合同 §3.3 第 8 步「清 staging 后再释放
+    预占」的文件侧动作——调用方保证先本函数后 release）。平铺
+    ``.uploading-*.part`` 的旧 unlink 分支已随升级窗口排空拆除。
     """
     try:
-        if task.get("slide_id"):
-            slide_storage.remove_staging_tree(task["upload_id"], root=UPLOAD_DIR)
-        else:
-            _upload_v2_part_path(task).unlink(missing_ok=True)
+        slide_storage.remove_staging_tree(task["upload_id"], root=UPLOAD_DIR)
     except OSError:
         app.logger.exception("upload task part cleanup failed: %s",
                              task.get("upload_id"))
@@ -13345,30 +13276,18 @@ def _upload_v2_fetch(upload_id, ident):
     return task, None
 
 
-def _upload_v2_set_ownership(task, ident=None):
-    """ownership 入库（slide_meta.owner_user_id = 任务归属者；§3.2 commit 段 B）。
-
-    【P4-app §7 核对】迁移兼容层：仅升级窗口在途旧 V2 任务（平铺提升）与
-    恢复路径调用——新管线（native/转换）归属在 allocate_slide 同事务落库，
-    不经本函数。P6 排空后随旧三段式一并删除。"""
-    share_store.set_slide_meta(
-        task["safe_name"],
-        owner_user_id=(task.get("owner_user_id") or None),
-        requester_role=(ident or {}).get("role") or user_store.ROLE_OWNER)
-
-
 def _upload_v2_recover_commit(task):
     """committing 超时的惰性恢复（§3.2.5 崩溃恢复）——**旧管线任务专用**
-    （P3：无 slide_id/intent 的升级窗口在途任务；新管线走
-    _upload_v2_recover_publish 的 intent 幂等重跑）。
+    （P3：无 slide_id/intent 的任务；新管线走 _upload_v2_recover_publish
+    的 intent 幂等重跑）。
 
-    P4-app：convert-required 任务优先按 conversion job 的源副本收口（源在
-    ``.staging/<job_id>/source/`` → finish_commit 源字节口径——不再有平铺
-    提升判定）；无 job/源不在任务 staging 的（升级窗口平铺源）走旧提升
-    判定。临时文件已提升为正式文件（dest 存在且大小吻合）→ **先**补
-    ownership（失败保持 committing，下次访问再试），再在同一短事务内
-    committed + 配额转实占。未提升则回滚 active。入账失败不得留下
-    committed 文件。
+    P6 运行时退役后只剩两路：
+      - convert-required 任务按 conversion job 的源副本收口（源在
+        ``.staging/<job_id>/source/`` → finish_commit 源字节口径）；
+      - 其余（升级窗口在途的平铺提升形态）→ **不认识的旧形态：fail-closed
+        保持 committing + 明确日志**，交人工处置——旧提升判定（dest 存在且
+        大小吻合 → 补 ownership 后收口 / 未提升回滚 active）已随升级窗口
+        排空拆除，不猜不盲 release。
     """
     upload_id = task["upload_id"]
     if _needs_conversion(task.get("safe_name") or ""):
@@ -13393,51 +13312,11 @@ def _upload_v2_recover_commit(task):
                     app.logger.exception(
                         "upload task %s KFB 恢复收口失败（下次再试）", upload_id)
                     return upload_task_store.get_task(upload_id) or task
-    dest = UPLOAD_DIR / task["safe_name"]
-    promoted = False
-    try:
-        promoted = (dest.is_file()
-                    and dest.stat().st_size == int(task["declared_size"]))
-    except OSError:
-        promoted = False
-    if not promoted:
-        try:
-            return upload_task_store.rollback_committing(task["upload_id"])
-        except upload_task_store.UploadTaskError:
-            return upload_task_store.get_task(task["upload_id"]) or task
-    upload_id = task["upload_id"]
-    token = task.get("commit_token") or ""
-    sha = task.get("sha256_actual") or ""
-    size = int(task["declared_size"])
-    try:
-        if not _needs_conversion(task.get("safe_name") or ""):
-            _upload_v2_set_ownership(task)
-    except Exception:
-        app.logger.exception(
-            "upload task %s 恢复时 ownership 失败，保持 committing", upload_id)
-        return task
-    try:
-        task = upload_task_store.finish_commit(
-            upload_id, token, sha, settle_bytes=size)
-        _upload_v2_cleanup_part(task)
-        return task
-    except upload_guard.ReservationInvalid:
-        app.logger.warning(
-            "upload task %s 恢复收口时预占已失效，撤回提升", upload_id)
-        dest.unlink(missing_ok=True)
-        try:
-            task = upload_task_store.fail_commit(
-                upload_id, token, permanent=True, sha256_actual=sha)
-        except upload_task_store.UploadTaskError:
-            task = upload_task_store.get_task(upload_id) or task
-        _upload_v2_release_reservation_quietly(task)
-        _upload_v2_cleanup_part(task)
-        return task
-    except upload_task_store.StateConflict as e:
-        return e.task or upload_task_store.get_task(upload_id) or task
-    except Exception:
-        app.logger.exception("upload task commit 恢复收口失败：%s", upload_id)
-        return upload_task_store.get_task(upload_id) or task
+    app.logger.error(
+        "upload task %s 为升级窗口旧形态（平铺提升恢复路径已随 P6 运行时退役"
+        "拆除），fail-closed 保持 committing 等待人工处置，不释放预占",
+        upload_id)
+    return task
 
 
 def _upload_v2_maintain(task):
@@ -13447,10 +13326,12 @@ def _upload_v2_maintain(task):
       1. 有 commit_intent_json（新管线 V2/V1 原生单文件）→ intent 幂等重跑
          （_upload_v2_recover_publish：目标已存在且吻合只做 DB CAS；不吻合
          fail-closed 保持 committing）；
-      2. v1_artifacts（V1 ZIP/KFB legacy）→ 证据三态恢复；
-      3. 其余（升级窗口在途 V2）→ 旧提升判定恢复。
-    committed 归属校正只对旧管线任务（新管线归属在 allocate_slide 即随行落库，
-    无按名补写）。"""
+      2. v1_artifacts（V1 ZIP/KFB legacy）→ ZIP items / conversion 源副本
+         两路恢复，其余旧形态 fail-closed 保持 committing；
+      3. 其余（升级窗口在途 V2）→ convert 源副本恢复，其余旧形态 fail-closed
+         保持 committing。
+    P6 运行时退役：旧管线的 committed 归属按名补写校正已随升级窗口排空拆除
+    （新管线归属在 allocate_slide 即随行落库，无按名补写窗口）。"""
     now = time.time()
     if (task["state"] == upload_task_store.STATE_ACTIVE
             and task.get("expires_at") is not None
@@ -13469,18 +13350,6 @@ def _upload_v2_maintain(task):
             task = _upload_legacy_recover_commit(task)
         else:
             task = _upload_v2_recover_commit(task)
-    if (task["state"] == upload_task_store.STATE_COMMITTED
-            and not task.get("slide_id")
-            and not _needs_conversion(task.get("safe_name") or "")):
-        # 旧管线：已 committed 但崩溃窗口里漏写 slide_meta 时，GET 路径校正归属
-        #（新管线的归属在 allocate_slide 同事务落库，无此窗口）。
-        try:
-            meta = share_store.get_slide_meta_full(task["safe_name"])
-            if not (meta or {}).get("owner_user_id"):
-                _upload_v2_set_ownership(task)
-        except Exception:
-            app.logger.exception(
-                "upload task %s committed ownership 校正失败", task.get("upload_id"))
     return task
 
 
@@ -13495,12 +13364,9 @@ def _upload_v2_state_dict(task, **extra):
                        if task.get("expires_at") else None),
         # slide ID 化（P2 §5.2 → P3 合同 §1.3 收口）：slide_id 从**任务绑定**
         # 读取（upload_tasks.slide_id 唯一绑定源；新管线创建即绑定）。按名
-        # resolve 只剩升级窗口在途旧任务的兜底（P4-app 转换链已切 ID：新
-        # convert-required 任务行无 slide_id，产物 ID 经 conversion 响应体
-        # 的 job.slide_id 下发；P6 排空后删除该回落）。
-        "slide_id": (task.get("slide_id")
-                     or share_store.get_slide_id(task.get("safe_name") or "")
-                     or None),
+        # resolve 的升级窗口回落已随 P6 运行时退役拆除（新 convert-required
+        # 任务行无 slide_id，产物 ID 经 conversion 响应体的 job.slide_id 下发）。
+        "slide_id": (task.get("slide_id") or None),
     }
     body.update(extra)
     return body
@@ -13722,7 +13588,8 @@ def api_uploads_put_chunk(upload_id):
 
     - 严格串行（§3.2.2）：只接受 offset == confirmed_offset；超前 → 409
       offset_mismatch（带当前 confirmed_offset 供对齐）。
-    - 单次落盘（§3.3）：按 offset pwrite 进同一个 .uploading-<id>.part，
+    - 单次落盘（§3.3）：按 offset pwrite 进同一个任务暂存件
+      （.staging/<upload_id>/transfer/data；P6：平铺 .uploading-* 已收口），
       不经 multipart 暂存；本片哈希不匹配即整段回退（ftruncate）。
     - 幂等（§3.2.1）：与最后已确认分片同 (offset,length,sha256) 的重放 → 200
       不重复写；同 offset 不同 length/sha256 → 409；更早分片 → 200 返回当前
@@ -13878,11 +13745,11 @@ def api_uploads_commit(upload_id):
 
     A 短事务（active→committing，写 commit_token + 续租）→ 事务外（流式复算
     整文件 SHA-256 → 大小校验 → 仅当客户端创建时给了 sha256_expected 才比对 →
-    **_validate_slide_file 在提升之前**（§2.3 纠正）→ 原子 no-clobber 提升 →
-    ownership 入库）→ B 短事务（token 匹配且仍 committing → committed +
-    reservation 转实占）。
+    **_validate_slide_file 在源落位之前**（§2.3 纠正）→ convert-required 建
+    job 并把源副本搬任务 staging）→ B 短事务（token 匹配且仍 committing →
+    committed + reservation 转实占）。
 
-    失败类型（§3.1）：哈希不匹配/非法切片/名称冲突 = 确定性失败 → failed
+    失败类型（§3.1）：哈希不匹配/非法切片 = 确定性失败 → failed
     （只能 DELETE 取消后重传）；IO 类临时故障 → 回滚 active 可重试。崩溃后
     committing 超时由 _upload_v2_maintain 惰性恢复。
 
@@ -13893,7 +13760,10 @@ def api_uploads_commit(upload_id):
     锁内重验 → publish_bundle_no_clobber → mark_ready+consume+清 intent
     同一短事务）。受理后进入不可撤销段：临时故障保持 committing 返回稳定
     ``commit_in_progress``，由恢复路径幂等收口（取消对 committing 拒绝——
-    取消先赢只发生在受理前，plan §3.2）。convert-required 维持旧三段式。
+    取消先赢只发生在受理前，plan §3.2）。convert-required 维持三段式（源
+    副本归 conversion job 的任务 staging）。
+    P6 运行时退役：升级窗口在途旧任务的平铺提升 + 按名 ownership 分支已拆
+    ——旧形态非转换任务 commit 即确定性失败（legacy_upload_task_unsupported）。
     """
     ident = current_identity()
     if not can_upload():
@@ -13934,9 +13804,6 @@ def api_uploads_commit(upload_id):
     part = _upload_v2_part_path(task)
     declared = int(task["declared_size"])
     is_convert = _needs_conversion(task["safe_name"])
-    # 升级窗口在途旧任务（平铺提升语义）；P4-app 起的 convert-required 任务
-    # 源副本归 conversion job 的任务 staging，不再平铺 UPLOAD_DIR。
-    dest = UPLOAD_DIR / task["safe_name"]
 
     def _deterministic_fail(code, message, sha=None):
         """确定性失败 → failed（§3.1）：预占释放，临时文件保留待 DELETE 清理。"""
@@ -13956,6 +13823,17 @@ def api_uploads_commit(upload_id):
         except upload_task_store.UploadTaskError:
             app.logger.exception("upload task temp-rollback failed: %s", upload_id)
         return jsonify(error=message, code="commit_retryable"), status
+
+    if not is_convert:
+        # P6 运行时退役：无 slide_id 的非转换任务是升级窗口在途旧形态——
+        # 平铺提升路径（_promote_no_clobber + 按名 ownership）已拆除，不猜。
+        # 确定性失败（failed + 释放预占），客户端删任务后走新管线上传。
+        app.logger.error(
+            "upload task %s 为升级窗口旧形态（无 slide_id 的原生单文件），"
+            "平铺提升已随 P6 运行时退役拆除，任务确定性失败", upload_id)
+        return _deterministic_fail(
+            "legacy_upload_task_unsupported",
+            "旧版本创建的上传任务不再支持，请取消后重新上传")
 
     # ---- 事务外 1：流式复算整文件哈希 + 大小权威校验 ----
     try:
@@ -14010,56 +13888,29 @@ def api_uploads_commit(upload_id):
             app.logger.exception(
                 "V2 KFB 转换任务创建失败：%s", upload_id)
             return _rollback_temp("转换任务创建失败，请重试")
-    else:
-        # ---- 事务外 4：原子 no-clobber 提升（升级窗口在途旧任务 / 旧
-        #      convert-required 平铺语义；提升后 .part 仍在，收口失败可回退）----
-        try:
-            _promote_no_clobber(part, dest)
-        except FileExistsError:
-            return _deterministic_fail("name_unavailable", "名称不可用")
-        except OSError as e:
-            return _rollback_temp("文件提升失败: %s" % e)
-
-        # ---- ownership 入库（convert-required 源不对 Viewer 可见，跳过）----
-        if not is_convert:
-            try:
-                _upload_v2_set_ownership(task, ident)
-            except PermissionError:
-                dest.unlink(missing_ok=True)
-                return _rollback_temp("无上传权限", status=403)
-            except Exception:
-                app.logger.exception(
-                    "upload task ownership failed: %s", upload_id)
-                dest.unlink(missing_ok=True)
-                return _rollback_temp("归属登记失败")
 
     # ---- 短事务 B：token 匹配且仍 committing → committed，配额同事务转实占 ----
     try:
         task = upload_task_store.finish_commit(
             upload_id, token, sha_actual, settle_bytes=size)
     except upload_guard.ReservationInvalid:
-        if not is_convert or conversion_store.get_job_by_upload_id(
-                upload_id) is None:
-            dest.unlink(missing_ok=True)
-        resp = _deterministic_fail(
-            "reservation_expired", "上传预占已失效，文件未入账")
         if is_convert:
             # P4-app review：commit 期已建 job（源副本已搬任务 staging）——
             # 连带作废，不留「上传报错但产物稍后上线」悬挂态
             _cancel_conversion_for_failed_upload(upload_id)
+        resp = _deterministic_fail(
+            "reservation_expired", "上传预占已失效，文件未入账")
         return resp
     except upload_task_store.StateConflict as e:
         cur = e.task or {}
         if cur.get("state") == upload_task_store.STATE_COMMITTED:
-            # 惰性恢复已按提升文件/源副本收口完成：以库内现状为准
+            # 惰性恢复已按源副本收口完成：以库内现状为准
             if _needs_conversion(cur.get("safe_name") or ""):
                 return _v2_committed_conversion_response(ident, cur)
             return _upload_v2_state_body(cur, sha256=cur.get("sha256_actual"))
-        # 恢复流程已回滚 active：清掉本次孤儿提升，允许重试
-        dest.unlink(missing_ok=True)
+        # 恢复流程已回滚 active（可重试）
         return _rollback_temp("commit 已被恢复流程回滚，请重试")
     except upload_task_store.TaskNotFound:
-        dest.unlink(missing_ok=True)
         return jsonify(error="无上传权限"), 403
 
     _upload_v2_cleanup_part(task)
@@ -19282,14 +19133,13 @@ def _slide_fingerprint(target) -> str:
 
 
 def _legacy_slide_revision(target) -> str:
-    """切片 legacy_revision（mtime:size，docs §6.4）——**legacy 布局专用**
-    （P3 合同 §4：mtime:size 只在 legacy 布局保留）。
+    """切片 mtime:size 指纹（docs §6.4 旧口径）——P6 运行时退役后仅剩
+    写通道/按名防御路径的消费者（_slide_revision 的纯名分支）；读通道的
+    revision 取数：id_bundle 走 slide_assets 内容 revision（_slide_revision），
+    legacy 布局行不可读、无 revision 消费者。
 
-    P1-B2：target 为 resolver 解析后的**绝对路径**（读通道主路径）；兼容传
-    legacy 名（写通道/共享 helper——按 UPLOAD_DIR 拼接）。id_bundle 资产请用
-    _slide_revision（slide_assets 内容 revision）——本函数对其入口路径算
-    mtime:size 只是防御态，正式取数不走这里。文件不存在返回空串（sidecar
-    校验时不会误匹配）。
+    target 为绝对路径或 legacy 名（按 UPLOAD_DIR 拼接）。文件不存在返回
+    空串（sidecar 校验时不会误匹配）。
     """
     p = Path(target)
     if not p.is_absolute():
@@ -19302,14 +19152,17 @@ def _legacy_slide_revision(target) -> str:
 
 
 def _slide_revision(desc_or_name, path=None) -> str:
-    """内容 revision 统一取数（P3 合同 §4 裁决落地）。
+    """内容 revision 统一取数（P3 合同 §4 裁决落地；P6 运行时退役收口）。
 
     - **id_bundle 资产**：``slide_assets`` 最新行的内容 revision（发布时
       record_revision 写 ``sha256:<hex 前缀>``；descriptor.revision 由
-      _DESCRIPTOR_SQL 取最新行，P1-A 已就位）——不再是 mtime:size；
+      _DESCRIPTOR_SQL 取最新行，P1-A 已就位）——不是 mtime:size；
       行缺失（发布中断等防御态）返回空串。
-    - **legacy 布局**：维持 mtime:size（入口文件路径——legacy_filename）。
-    - 纯名入参（无 descriptor 的写通道/兼容路径）：按旧口径 mtime:size。
+    - legacy 布局 descriptor：统一门禁（authorize_read）已拒，本函数不再
+      对其算 mtime:size（legacy 行不可读则其 revision 无消费者——P2 遗留
+      清单收口）。
+    - 纯名入参（无 descriptor 的写通道/兼容路径）：按旧口径 mtime:size
+      （防御态；读通道不经过此形态）。
 
     render token / demo run 预约 / AI 快照 attestation 的 revision 绑定
     统一经本函数取数（R-15：显示名修改不动 revision，换内容=新 slide_id）。
@@ -19317,9 +19170,6 @@ def _slide_revision(desc_or_name, path=None) -> str:
     if isinstance(desc_or_name, slide_store.SlideDescriptor):
         if desc_or_name.storage_layout == slide_store.StorageLayout.ID_BUNDLE:
             return desc_or_name.revision or ""
-        target = path if path is not None else desc_or_name.legacy_filename
-        if target:
-            return _legacy_slide_revision(target)
         return ""
     return _legacy_slide_revision(desc_or_name)
 
@@ -19405,7 +19255,7 @@ def _aspect_fit_size(w_src, h_src, max_long_edge):
     return ow, oh
 
 
-def _validated_wire_context(osr, ctx_body, safe):
+def _validated_wire_context(osr, ctx_body, safe, revision=None):
     """校验 wire render_context（plugin/internal 请求体形态，§6.3）。
 
     - snake ``render_context`` 或 camel ``renderContext`` 由调用方解析；
@@ -19415,11 +19265,14 @@ def _validated_wire_context(osr, ctx_body, safe):
       native-rgb）；任何结构/取值问题抛 SlideRenderError（稳定码，解码前）。
 
     返回 ``(canonical, fingerprint)``。
+    P6（任务 §8 收口）：``revision`` 由调用方传 ``_slide_revision(gate)``
+    （id_bundle=slide_assets sha——与 info/render-context 签发同值）；
+    缺省回落按名 mtime:size（无 descriptor 的防御路径）。
     """
     if not isinstance(ctx_body, dict):
         raise slide_io.SlideRenderError("invalid_render_context",
                                         "render_context 必须是对象")
-    expected = _legacy_slide_revision(safe)
+    expected = revision if revision is not None else _legacy_slide_revision(safe)
     ctx = dict(ctx_body)
     supplied = ctx.get("asset_revision")
     if supplied is not None and str(supplied) != str(expected):
@@ -19458,8 +19311,11 @@ def _ai_run_render_context(slide, body):
             wire = body.get("renderContext")
     if not isinstance(wire, dict):
         return None, None, None
-    safe = _safe_name(slide)
-    revision = _legacy_slide_revision(safe)
+    # P6（任务 §8 收口）：revision 与 info/render-context 签发同源——
+    # id_bundle=slide_assets 内容 revision（名回落 mtime:size 仅防御态）。
+    desc = _resolve_legacy_read(slide) if isinstance(slide, str) else None
+    revision = (_slide_revision(desc) if desc is not None
+                else _legacy_slide_revision(slide))
     ctx = dict(wire)
     ctx.pop("fingerprint", None)  # 服务端重算，绝不采信浏览器值
     supplied = ctx.get("asset_revision")
@@ -19628,7 +19484,8 @@ def _validate_ai_attachments(body, slide):
 
 def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
                      max_long_edge=None, jpeg_quality=DERIVATIVE_JPEG_QUALITY,
-                     render_context=None, render_fingerprint=None):
+                     render_context=None, render_fingerprint=None,
+                     expected_revision=None):
     """实际读 region → JPEG base64（与 /region 端点逻辑一致，供 AI 进程内调用）。
 
     输出尺寸规则（§6.1）：
@@ -19651,7 +19508,8 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
         if render_context is not None:
             # 解码前校验（§7.4）：canonicalize + revision 绑定 + 通道范围
             render_context, render_fingerprint = _validated_wire_context(
-                pair["osr"], render_context, safe)
+                pair["osr"], render_context, safe,
+                revision=expected_revision)
             # 只包装当前借出的 osr（不跨 borrow 缓存，§7.3）
             osr = slide_render.RenderedSlideView(
                 pair["osr"], render_context, fingerprint=render_fingerprint)
@@ -19864,7 +19722,8 @@ def internal_ai_region():
         if wire_ctx is not None:
             r = _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
                                  max_long_edge=max_long_edge, jpeg_quality=q,
-                                 render_context=wire_ctx)
+                                 render_context=wire_ctx,
+                                 expected_revision=_slide_revision(gate))
         else:
             r = _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
                                  max_long_edge=max_long_edge, jpeg_quality=q)
@@ -19978,14 +19837,16 @@ def internal_ai_annotate():
         if serr is not None:
             return jsonify(error=serr), 400
         attest_err, attest_conflict = _check_snapshot_attestation(
-            snap_prov, str(body.get("session_id") or ""), safe)
+            snap_prov, str(body.get("session_id") or ""),
+            _ai_write_revision(_gate, safe))
         if attest_err is not None:
             return jsonify(error=attest_err,
                            code="invalid_request"), 400
         if attest_conflict is not None:
             return jsonify(error="slide_revision_conflict",
                            detail=attest_conflict,
-                           current_slide_asset_revision=_legacy_slide_revision(safe)), 409
+                           current_slide_asset_revision=_ai_write_revision(
+                               _gate, safe)), 409
         points_norm, perr = _validate_annotation_points(safe, body_type, body)
         if perr is not None:
             return jsonify(error=perr[0]), 400
@@ -20015,7 +19876,7 @@ def internal_ai_annotate():
     # Stage 3c-2：slide_asset_revision 冲突校验（仅显式带 expected_asset_revision 时）
     expected_asset_revision = body.get("expected_asset_revision")
     if expected_asset_revision is not None and str(expected_asset_revision) != "":
-        cur_rev = _legacy_slide_revision(safe)
+        cur_rev = _ai_write_revision(_gate, safe)
         if str(expected_asset_revision) != cur_rev:
             return jsonify(
                 error="slide_revision_conflict",
@@ -20032,7 +19893,7 @@ def internal_ai_annotate():
         # provider = base_url host 即可（不记全 URL 不记 key）
         "provider": _provider_host(body.get("base_url") or body.get("provider") or ""),
         "created_by_user_id": body.get("created_by_user_id") or "",
-        "slide_asset_revision": _legacy_slide_revision(safe),
+        "slide_asset_revision": _ai_write_revision(_gate, safe),
         "idempotency_key": effect_key or "",
     }
     # P1-5/P1-3：来源快照溯源字段并入（含验证通过的 attestation 不落库——
@@ -20178,7 +20039,8 @@ def internal_ai_spots():
                     "slide_id": eff_sid or ""})
 
 
-def _ai_slide_info_payload(pair, safe: str, *, path=None, scope_key=None) -> dict:
+def _ai_slide_info_payload(pair, safe: str, *, path=None, scope_key=None,
+                           revision=None) -> dict:
     """AI slide info 载荷（G1，internal 与 plugin v1 两条路径共用实现）。
 
     必须在**当前借出的** pair 上调用：几何（width/height/level_downsamples/
@@ -20202,7 +20064,8 @@ def _ai_slide_info_payload(pair, safe: str, *, path=None, scope_key=None) -> dic
     # （scope_key 由调用方传 descriptor 的 slide_id；缺省沿用名——无行兼容分支）
     ai_skey = scope_key if scope_key else safe
     render_fields = slide_render.build_render_info(
-        osr, asset_revision=_legacy_slide_revision(info_path),
+        osr, asset_revision=(revision if revision is not None
+                             else _legacy_slide_revision(info_path)),
         asset_generation=_ctx_scope(ai_skey, pair.get("gen")),
         secret=app.secret_key, slide_name=ai_skey,
         flag_enabled=_multichannel_enabled())
@@ -20250,7 +20113,8 @@ def internal_ai_slide_info():
         out = _ai_slide_info_payload(
             pair, safe, path=(_desc_path(gate) if gate is not None
                               else (UPLOAD_DIR / safe)),
-            scope_key=(gate.slide_id if gate is not None else None))
+            scope_key=(gate.slide_id if gate is not None else None),
+            revision=(_slide_revision(gate) if gate is not None else None))
     return jsonify(out)
 
 
@@ -20296,7 +20160,8 @@ def _internal_slide_target(slide_id, slide):
                                exc_info=True)
         if desc is None:
             return None, None, None, (jsonify(error="切片不存在"), 404)
-        if desc.asset_state != slide_store.SlideState.READY:
+        if not _desc_state_readable(desc):
+            # P6 运行时退役：非 ready 或 legacy 布局（待迁移/隔离）同 404 口径
             return None, None, None, (jsonify(error="切片不存在"), 404)
         if slide:
             if not isinstance(slide, str):
@@ -20321,7 +20186,7 @@ def _internal_slide_target(slide_id, slide):
     gate = _legacy_row_state_gate(safe)
     if gate is None:
         return None, None, None, (jsonify(error="切片不存在"), 404)
-    if gate.asset_state != slide_store.SlideState.READY:
+    if not _desc_state_readable(gate):
         return None, None, None, (jsonify(error="切片不存在"), 404)
     return safe, gate, gate.slide_id, None
 
@@ -20344,7 +20209,7 @@ def _plugin_resolve_slide_by_id(slide_id):
         desc = None
     if desc is None:
         return None, None, _plugin_error(404, "not_found", "切片不存在")
-    if desc.asset_state != slide_store.SlideState.READY:
+    if not _desc_state_readable(desc):
         return None, None, _plugin_error(404, "not_found", "切片不存在")
     return (desc.legacy_filename or desc.original_filename or ""), desc, None
 
@@ -20367,7 +20232,7 @@ def _plugin_resolve_slide(slide):
     gate = _legacy_row_state_gate(safe)
     if gate is None:
         return None, None, _plugin_error(404, "not_found", "切片不存在")
-    if gate.asset_state != slide_store.SlideState.READY:
+    if not _desc_state_readable(gate):
         return None, None, _plugin_error(404, "not_found", "切片不存在")
     return safe, gate, None
 
@@ -20579,7 +20444,8 @@ def _plugin_v1_slide_info_impl(safe, gate):
         out = _ai_slide_info_payload(
             pair, safe, path=(_desc_path(gate) if gate is not None
                               else (UPLOAD_DIR / safe)),
-            scope_key=(gate.slide_id if gate is not None else None))
+            scope_key=(gate.slide_id if gate is not None else None),
+            revision=(_slide_revision(gate) if gate is not None else None))
     return jsonify(out)
 
 
@@ -20889,7 +20755,8 @@ def _plugin_region_body(claims, safe, gate, sid, _region_path, body):
             if wire_ctx is not None:
                 r = _read_region_b64(entry, x, y, w, h, out_w, out_h, safe,
                                      mpp, max_long_edge=max_long_edge,
-                                     jpeg_quality=q, render_context=wire_ctx)
+                                     jpeg_quality=q, render_context=wire_ctx,
+                                     expected_revision=_slide_revision(gate))
             else:
                 r = _read_region_b64(entry, x, y, w, h, out_w, out_h, safe,
                                      mpp, max_long_edge=max_long_edge,
@@ -20910,7 +20777,8 @@ def _plugin_region_body(claims, safe, gate, sid, _region_path, body):
             resp = Response(jpeg_bytes, mimetype="application/octet-stream")
             resp.headers["Content-Type"] = "application/octet-stream"
             resp.headers["Content-SHA256"] = content_sha
-            resp.headers["X-Asset-Revision"] = _legacy_slide_revision(_region_path)
+            # P6（§8 收口）：revision 头与 wire 校验同值（slide_assets）
+            resp.headers["X-Asset-Revision"] = _slide_revision(gate)
             resp.headers["X-Region-Bbox"] = json.dumps(r["src"])
             resp.headers["X-Region-Out"] = json.dumps(
                 {"outW": int(r["width"]), "outH": int(r["height"])})
@@ -20946,7 +20814,7 @@ def _plugin_region_body(claims, safe, gate, sid, _region_path, body):
                 image_mode=r.get("image_mode") or "native_rgb",
                 subsampling=r.get("subsampling") or "4:2:0"),
             "content_sha256": content_sha,
-            "asset_revision": _legacy_slide_revision(_region_path),
+            "asset_revision": _slide_revision(gate),
         }
         # §6.3 additive：render_context 生效时的 fingerprint（与 asset_revision
         # 独立）；HistoPilot 记入 image_ref/derivative key（Batch 5）。
@@ -21118,7 +20986,7 @@ def plugin_v1_annotate(slide, _by_id=False):
         # 描绘必须附带 HP 服务端 attestation 并通过验证（伪造/跨会话/篡改
         # bbox/过期/资产已替换一律拒绝落库）。
         attest_err, attest_conflict = _check_snapshot_attestation(
-            snap_prov, session_id, safe)
+            snap_prov, session_id, _ai_write_revision(_gate, safe))
         if attest_err is not None:
             return _plugin_error(400, "invalid_request", attest_err)
         if attest_conflict is not None:
@@ -21155,7 +21023,7 @@ def plugin_v1_annotate(slide, _by_id=False):
 
     expected_asset_revision = body.get("expected_asset_revision")
     if expected_asset_revision is not None and str(expected_asset_revision) != "":
-        cur_rev = _legacy_slide_revision(safe)
+        cur_rev = _ai_write_revision(_gate, safe)
         if str(expected_asset_revision) != cur_rev:
             return _plugin_error(
                 409, "slide_revision_conflict", "切片资产已更新",
@@ -21179,7 +21047,7 @@ def plugin_v1_annotate(slide, _by_id=False):
         "model": body.get("model") or "",
         "provider": _provider_host(body.get("base_url") or body.get("provider") or ""),
         "created_by_user_id": grant.get("created_by_user_id") or "",
-        "slide_asset_revision": _legacy_slide_revision(safe),
+        "slide_asset_revision": _ai_write_revision(_gate, safe),
         "idempotency_key": effect_key or "",
     }
     prov_persist = {k: v for k, v in snap_prov.items()

@@ -267,9 +267,10 @@ def _ingest_convert(*, owner_user_id, name, staging, digest, dest_dir,
     """
     visible = canonical_name_for(name)
     canon_path = dest_dir / visible
-    if source_dest.exists() or canon_path.exists() \
-            or conversion_store.canonical_is_live(visible) \
-            or conversion_store.canonical_is_live(name):
+    # P6 收口：conversion_store.canonical_is_live 名锁壳（恒 False）已删除——
+    # 这里只剩磁盘级 O_EXCL 前置检查（exists 预检 + _copy_new 的独占创建），
+    # 同名源/产物在 DB 侧是独立资产（各得各 slide_id），名占用不再构成拒绝。
+    if source_dest.exists() or canon_path.exists():
         raise IngestError("name_unavailable")
     source_format = _probe_convert(str(staging))
     try:
@@ -326,9 +327,6 @@ def _ingest_convert(*, owner_user_id, name, staging, digest, dest_dir,
     except IngestError:
         _release_staged_source(source_dest, job, name)
         raise
-    except conversion_store.NameConflict as e:
-        _release_staged_source(source_dest, job, name)
-        raise IngestError("name_unavailable", "canonical 名已被占用") from e
     except conversion_store.ConversionError as e:
         _release_staged_source(source_dest, job, name)
         raise IngestError(

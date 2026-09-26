@@ -31,10 +31,14 @@ cos_ingest_worker.upload_dir 同款解析顺序）。
     复制到可用目标。
   - ``remove_bundle`` 仅清理该 ID 的独占目录；绝不按显示名扫描删除。
 
-legacy 布局过渡分支（resolve_descriptor_path 的 legacy 支路）
-  - 退役条件（R-16 / 合同 §8）：P6 历史资产物理迁移完成后，运行时 legacy
-    读取分支移除——legacy resolver 仅在受限迁移工具/过渡版本保留；全部
-    可服务资产迁入 ``objects/<slide_id>/`` 且验收通过后，本分支删除。
+legacy 布局的运行时退役（P6 合同 §3，R-16 / 合同 §8 兑现）
+  - P6 演练验收通过后，``resolve_descriptor_path`` 的 legacy 平铺支路已从
+    **运行时正常链路移除**：legacy 布局行 = 待迁移/隔离，读路径只认
+    id_bundle；legacy_filename 列保留为**冻结别名**（固定 ID 查找/书签
+    兼容），不再承载物理读取旁路。
+  - legacy 物理读取仅剩显式的 :func:`resolve_legacy_path_for_migration`
+    （迁移专用入口：scripts/plan|migrate|verify_slide_migration、backfill、
+    audit 与演练证据复跑；运行时模块不得调用）。
 """
 
 import errno
@@ -216,10 +220,10 @@ def resolve_descriptor_path(desc, *, root=None) -> Path:
     """descriptor → 入口文件绝对路径（统一 containment 校验）。
 
     - id_bundle：``UPLOAD_DIR / storage_relpath``（objects/<slide_id>/data.<ext>）。
-    - legacy：``UPLOAD_DIR / legacy_filename`` —— **仅过渡分支**（退役条件见
-      模块 docstring：P6 历史资产物理迁移完成并验收后移除；legacy 布局只允许
-      受限迁移工具/过渡版本读取）。legacy_filename 缺失（新资产恒 NULL）即
-      ValueError——新资产不存在按名定位的路径。
+    - legacy：**ValueError（P6 运行时退役）**——legacy 布局行 = 待迁移/隔离，
+      读路径只认 id_bundle；legacy_filename 是冻结别名（固定 ID 查找/书签），
+      不再承载物理读取旁路。迁移工具的 legacy 物理读取走显式的
+      :func:`resolve_legacy_path_for_migration`（迁移专用入口）。
     - 其他 layout 值 ValueError（fail-closed，不猜）。
     """
     layout = getattr(desc, "storage_layout", None)
@@ -230,11 +234,32 @@ def resolve_descriptor_path(desc, *, root=None) -> Path:
             raise ValueError("id_bundle 资产缺少 storage_relpath")
         return _resolve_within(base, rel, what="storage_relpath")
     if layout == "legacy":
-        rel = getattr(desc, "legacy_filename", None)
-        if not rel:
-            raise ValueError("legacy 资产缺少 legacy_filename（新资产不走 legacy 布局）")
-        return _resolve_within(base, rel, what="legacy_filename")
+        raise ValueError(
+            "legacy 布局已退役：运行时读路径只认 id_bundle（P6 运行时退役）；"
+            "迁移工具请用 slide_storage.resolve_legacy_path_for_migration")
     raise ValueError("未知 storage_layout：%r" % (layout,))
+
+
+def resolve_legacy_path_for_migration(desc, *, root=None) -> Path:
+    """【迁移专用】legacy 布局入口文件的绝对路径（P6 运行时退役后的唯一
+    legacy 物理读取入口）。
+
+    只允许受限迁移工具链调用：``scripts/plan_slide_migration.py`` /
+    ``scripts/migrate_slide_storage.py`` / ``scripts/verify_slide_migration.py``
+    / ``scripts/backfill_slide_asset_state.py`` / ``scripts/audit_slide_identity.py``
+    与演练证据复跑。app / share_server / worker 等运行时模块**不得** import
+    本入口——legacy 布局资产在运行时不可读（待迁移/隔离语义）。containment
+    校验与 id_bundle 支路同源（_resolve_within）。
+    """
+    layout = getattr(desc, "storage_layout", None)
+    if layout != "legacy":
+        raise ValueError(
+            "迁移专用入口只解析 legacy 布局（收到 %r）；id_bundle 请用 "
+            "resolve_descriptor_path" % (layout,))
+    rel = getattr(desc, "legacy_filename", None)
+    if not rel:
+        raise ValueError("legacy 资产缺少 legacy_filename（新资产不走 legacy 布局）")
+    return _resolve_within(_root(root), rel, what="legacy_filename")
 
 
 # --------------------------------------------------------------------------- #

@@ -333,6 +333,7 @@ def test_demo_info_display_without_thumbnail(monkeypatch):
                         raising=False)
     # P2 收口（合同 §3.4）：demo catalog 项必须 resolve_slide_id 命中——
     # 夹具补注册 slides 行（slide_id 固定为 catalog 注入值；断言不变）。
+    # P6：行建为 id_bundle（发布 objects/vep-rgb/ 包——legacy 布局运行时不可读）。
     import psycopg as _psy
     _conn = _psy.connect(os.environ["DATABASE_URL"])
     try:
@@ -340,12 +341,33 @@ def test_demo_info_display_without_thumbnail(monkeypatch):
             # P3：_write 已按夹具注册行（随机 slide_id）——先清掉再落固定 ID 行
             _cur.execute("DELETE FROM slides WHERE legacy_filename=%s",
                          (RGB_NAME,))
+            import slide_storage as _ss
+            _staging = _ss.staging_dir("vep-demo", "1",
+                                       root=Path(app_mod.UPLOAD_DIR))
+            _staging.mkdir(parents=True, exist_ok=True)
+            _entry = "data.tif"
+            _payload = (Path(app_mod.UPLOAD_DIR) / RGB_NAME).read_bytes()
+            (_staging / _entry).write_bytes(_payload)
+            _ss.publish_bundle_no_clobber(
+                _staging, "vep-rgb",
+                {"entry": _entry, "files": [{"path": _entry,
+                                             "size": len(_payload)}]},
+                root=Path(app_mod.UPLOAD_DIR))
+            import shutil as _sh
+            _sh.rmtree(_staging.parent, ignore_errors=True)
             _cur.execute(
                 "INSERT INTO slides (slide_id, legacy_filename, "
                 "original_filename, display_name, format_ext, asset_state, "
-                "storage_layout, published_at) VALUES "
-                "('vep-rgb', %s, %s, 'vep', 'tif', 'ready', 'legacy', now())",
-                (RGB_NAME, RGB_NAME))
+                "storage_layout, storage_relpath, published_at) VALUES "
+                "('vep-rgb', %s, %s, 'vep', 'tif', 'ready', 'id_bundle', %s, "
+                "now())",
+                (RGB_NAME, RGB_NAME,
+                 _ss.entry_relpath("vep-rgb", "tif")))
+            _cur.execute(
+                "INSERT INTO slide_assets (asset_id, slide_id, "
+                "legacy_revision) VALUES ('ast_vep1', 'vep-rgb', %s)",
+                ("sha256:%s" % __import__("hashlib").sha256(
+                    _payload).hexdigest()[:16],))
             # authorize_read 的 allowlist 查 demo_catalog 表（R-10）：
             # 夹具同时落目录行（catalog_get 的 monkeypatch 保留为直通）。
             _cur.execute(

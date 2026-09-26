@@ -210,7 +210,8 @@ def test_internal_annotate_polygon_points_path(monkeypatch):
                         lambda sid: True)
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
-    monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
+    monkeypatch.setattr(app_mod, "_ai_write_revision",
+                            lambda gate, safe: "rev0")
     c = app_mod.app.test_client()
     r = c.post("/internal/ai/annotate", json={
         "slide": "demo.svs", "label": "AI 描绘", "type": "polygon",
@@ -244,7 +245,8 @@ def test_internal_annotate_freehand_points_path(monkeypatch):
                         lambda sid: True)
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
-    monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
+    monkeypatch.setattr(app_mod, "_ai_write_revision",
+                            lambda gate, safe: "rev0")
     c = app_mod.app.test_client()
     r = c.post("/internal/ai/annotate", json={
         "slide": "demo.svs", "label": "AI 描图", "type": "freehand",
@@ -264,7 +266,8 @@ def test_internal_annotate_polygon_mutually_exclusive_with_rect(monkeypatch):
                         lambda sid: True)
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
-    monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
+    monkeypatch.setattr(app_mod, "_ai_write_revision",
+                            lambda gate, safe: "rev0")
     c = app_mod.app.test_client()
     r = c.post("/internal/ai/annotate", json={
         "slide": "demo.svs", "label": "X", "type": "polygon",
@@ -284,7 +287,8 @@ def test_internal_annotate_polygon_self_intersecting_rejected(monkeypatch):
                         lambda sid: True)
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
-    monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
+    monkeypatch.setattr(app_mod, "_ai_write_revision",
+                            lambda gate, safe: "rev0")
     c = app_mod.app.test_client()
     r = c.post("/internal/ai/annotate", json={
         "slide": "demo.svs", "label": "X", "type": "polygon",
@@ -304,7 +308,8 @@ def test_internal_annotate_polygon_out_of_slide_bounds_rejected(monkeypatch):
                         lambda sid: True)
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
-    monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
+    monkeypatch.setattr(app_mod, "_ai_write_revision",
+                            lambda gate, safe: "rev0")
     c = app_mod.app.test_client()
     # 切片 1000×800：点 (1200, 50) 越出右边界
     r = c.post("/internal/ai/annotate", json={
@@ -333,7 +338,8 @@ def test_internal_annotate_rect_path_regression(monkeypatch):
                         lambda sid: True)
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
-    monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
+    monkeypatch.setattr(app_mod, "_ai_write_revision",
+                            lambda gate, safe: "rev0")
     c = app_mod.app.test_client()
     r = c.post("/internal/ai/annotate", json={
         "slide": "demo.svs", "label": "AI", "x": 10, "y": 10,
@@ -363,7 +369,8 @@ def test_internal_annotate_polygon_requires_label_and_valid_type(monkeypatch):
                         lambda sid: True)
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
-    monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
+    monkeypatch.setattr(app_mod, "_ai_write_revision",
+                            lambda gate, safe: "rev0")
     c = app_mod.app.test_client()
     # 未知 type 不落库（rect parser 对 type=svg 报缺 x/y 或未知类型，均 400）
     r = c.post("/internal/ai/annotate", json={
@@ -398,7 +405,8 @@ def _mock_plugin_channel(monkeypatch, valid=True):
     monkeypatch.setattr(app_mod.share_store, "get_plugin_installation",
                         lambda iid: {"plugin_id": "histopilot", "version": "0"})
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
-    monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
+    monkeypatch.setattr(app_mod, "_ai_write_revision",
+                            lambda gate, safe: "rev0")
     # P1-4 起：plugin v1 写入口复核本地镜像开关——本文件聚焦几何/点列路径，
     # 统一预置「已开启」镜像；闸门自身的开/关/无行行为见 test_ai_drawing_gate。
     share_store.upsert_ai_session_drawing_flag("sess1", True)

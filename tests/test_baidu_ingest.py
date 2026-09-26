@@ -559,21 +559,25 @@ def test_running_job_reuse_timeout_conversion_busy(tmp_path, monkeypatch):
 
 
 def test_create_job_name_conflict_cleans_copied_source(tmp_path, monkeypatch):
-    """P2：create_job 抛 NameConflict → IngestError("name_unavailable")
-    且本次复制的源文件不遗留。"""
+    """【P6 收口改写】NameConflict 兼容壳已删——create_job 抛 ConversionError
+    子类（非 NameConflict）→ IngestError("conversion_failed") 且本次复制的
+    源文件不遗留（name_unavailable 只来自磁盘 O_EXCL 检查，见
+    test_convert_name_unavailable_* 用例）。"""
     import baidu_ingest
     kfb = _make_kfb_bytes(tmp_path)
     staging = _stage_file(tmp_path, "panel.kfb", kfb)
 
     def _conflict(**kwargs):
-        raise conversion_store.NameConflict("canonical 名已被占用")
+        raise conversion_store.StateConflict("db state drifted")
 
+    assert not hasattr(conversion_store, "NameConflict")
+    assert not hasattr(conversion_store, "canonical_is_live")
     monkeypatch.setattr(conversion_store, "create_job", _conflict)
     with pytest.raises(baidu_ingest.IngestError) as ei:
         baidu_ingest.ingest_staging(
             owner_user_id=OWNER, original_name="panel.kfb",
             staging_path=str(staging), source_sha256=None, source_size=0)
-    assert ei.value.code == "name_unavailable"
+    assert ei.value.code == "conversion_failed"
     assert not (Path(UPLOAD_DIR) / "panel.kfb").exists()
 
 

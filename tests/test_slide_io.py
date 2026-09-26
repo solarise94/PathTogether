@@ -413,11 +413,11 @@ def _client():
 
 
 def _residue():
-    """V1/V2 临时残留（V2 的 .lock sidecar 为既有设计，不视为残留）。"""
+    """V1/V2 临时残留。P6 收口：chunk.lock sidecar 已收进 .staging/<uid>/
+    ——UPLOAD_DIR 根下的任何 .uploading-*（含 .lock）都是残留。"""
     return [p.name for p in Path(UPLOAD_DIR).iterdir()
-            if (p.name.startswith(".uploading-")
-                or p.name.startswith(".extracting-"))
-            and not p.name.endswith(".lock")]
+            if p.name.startswith(".uploading-")
+            or p.name.startswith(".extracting-")]
 
 
 def test_v1_small_real_tiff_no_monkeypatch():

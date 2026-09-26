@@ -249,8 +249,13 @@ def test_apply_flips_ready_asset(conn, up, tmp_path):
     assert row["storage_layout"] == "legacy"    # 不改布局（物理迁移是 P6）
     assert row["storage_relpath"] is None       # 不派生包路径
     assert abs(float(row["published_at"].timestamp()) - mtime) < 2.0
-    # authorize_read：ready + owner 放行；他人拒绝
+    # 【P6 改写】authorize_read 的 layout 门禁：回填后的 ready 行仍是 legacy
+    # 布局 = 待迁移——运行时门禁一律拒（owner 亦然，不泄露存在性）；经
+    # bind_id_bundle_layout（迁移 bound 步）翻转后 owner 放行、他人拒绝。
     desc = slide_store.resolve_slide_id("sld_ok")
+    assert not slide_store.authorize_read(desc, actor_user_id="usr_a")
+    assert slide_store.bind_id_bundle_layout(
+        "sld_ok", "objects/sld_ok/data.svs", accounted_bytes=100) == "migrated"
     assert slide_store.authorize_read(desc, actor_user_id="usr_a")
     assert not slide_store.authorize_read(desc, actor_user_id="usr_other")
 
@@ -597,5 +602,10 @@ def test_end_to_end_legacy_alias_ready_readable(conn, up, tmp_path):
     assert desc.original_filename == "legacy-hist.svs"
     assert desc.format_ext == "svs" and desc.accounted_bytes == 33
     assert desc.storage_layout == "legacy"
+    # 【P6 改写】legacy 布局 = 待迁移：门禁拒；迁移翻转后按 owner 放行
+    assert not slide_store.authorize_read(desc, actor_user_id="usr_a")
+    assert slide_store.bind_id_bundle_layout(
+        desc.slide_id, "objects/%s/data.svs" % desc.slide_id,
+        accounted_bytes=33) == "migrated"
     assert slide_store.authorize_read(desc, actor_user_id="usr_a")
     assert not slide_store.authorize_read(desc, actor_user_id="usr_b")

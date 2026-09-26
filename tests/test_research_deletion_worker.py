@@ -45,7 +45,7 @@ import research_deletion_worker  # noqa: E402
 import research_store  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app  # noqa: E402
+from _pt_helpers import csrf_client, isolate_app, register_slide_row  # noqa: E402
 
 PASSWORD = "longpassword123"
 MIGRATION_0064 = "0064_research_deletion_execution.sql"
@@ -113,6 +113,14 @@ def _open_collection(monkeypatch):
 
 
 def _own_slide(user, name=SLIDE):
+    # P6：建可读仓（id_bundle 行）再回填归属——legacy 布局运行时不可读
+    import app as _app
+    from pathlib import Path as _P
+    p = _P(_app.UPLOAD_DIR) / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if not p.exists():
+        p.write_bytes(b"slide-stub")
+    register_slide_row(name)
     share_store.set_slide_meta(name, owner_user_id=user["user_id"])
     return name
 

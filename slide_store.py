@@ -398,9 +398,12 @@ def authorize_read(desc, *, actor_user_id=None, actor_role=None,
     """统一读取门禁：所有读取入口（新旧端点、分享进程、插件、AI）共用。
 
     判定序（合同 §3.1，顺序即裁决优先级）：
-      0. ``asset_state == 'ready'`` 是唯一可见性开关——staging/legacy/
-         deleting/deleted/failed 一律拒（legacy 也要等回填验证通过才 ready）。
-         **门禁以 DB 当前行值为准**（重读 asset_state/owner/public——
+      0. ``asset_state == 'ready'`` 且 ``storage_layout == 'id_bundle'`` 是
+         唯一可见性开关——staging/legacy 未回填/deleting/deleted/failed 一律
+         拒；P6 运行时退役起 legacy 布局行同样拒（待迁移/隔离，读路径只认
+         id_bundle；迁移工具经 slide_storage.resolve_legacy_path_for_migration
+         专用入口，不经本门禁）。
+         **门禁以 DB 当前行值为准**（重读 asset_state/owner/public/layout——
          descriptor 只是解析快照，防快照过期/并发置 deleting 后仍放行）。
       1. admin 角色（平台 owner，管理面读）；
       2. owner（actor_user_id == 当前行 owner_user_id）；
@@ -436,10 +439,14 @@ def authorize_read(desc, *, actor_user_id=None, actor_role=None,
         with _session(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT asset_state, owner_user_id, public "
+                    "SELECT asset_state, owner_user_id, public, storage_layout "
                     "FROM slides WHERE slide_id=%s", (desc.slide_id,))
                 row = cur.fetchone()
         if row is None or row["asset_state"] != SlideState.READY:
+            return False
+        if row["storage_layout"] != StorageLayout.ID_BUNDLE:
+            # P6 运行时退役：legacy 布局行 = 待迁移/隔离——统一门禁层不可见
+            # 不可读（读路径只认 id_bundle；迁移工具经专用入口，不经本门禁）。
             return False
         # 1) admin 角色
         if actor_role == ROLE_ADMIN:
@@ -531,7 +538,8 @@ def visible_ready_slide_ids(actor_user_id=None, actor_role=None, *,
                             conn=None) -> set:
     """主体的 ready 可读 slide_id 集合（P2 列表收敛：常量次查询）。
 
-    与逐行 ``authorize_read`` 完全同一判定序（判定优先级见其 docstring），
+    与逐行 ``authorize_read`` 完全同一判定序（判定优先级见其 docstring；
+    P6 运行时退役：ready 且 legacy 布局的行不在集合内——待迁移/隔离不可见），
     但以两次集合查询 + 一次 ready 行扫描在内存完成（P1-B2 遗留的列表 N+1
     收敛——合同 §3.5）。DB 异常按空集处理（fail-closed，不回退扫描）。
 
@@ -547,8 +555,9 @@ def visible_ready_slide_ids(actor_user_id=None, actor_role=None, *,
         with _session(conn) as c:
             with c.cursor() as cur:
                 cur.execute("SELECT slide_id, owner_user_id, public "
-                            "FROM slides WHERE asset_state=%s",
-                            (SlideState.READY,))
+                            "FROM slides WHERE asset_state=%s "
+                            "AND storage_layout=%s",
+                            (SlideState.READY, StorageLayout.ID_BUNDLE))
                 rows = cur.fetchall()
                 if actor_role == ROLE_ADMIN:
                     return {r["slide_id"] for r in rows}
@@ -657,8 +666,7 @@ def request_delete(slide_id, *, expected_state=SlideState.READY, conn=None,
                 (SlideState.DELETING, slide_id, expected_state))
             moved = cur.rowcount == 1
             if moved and enqueue_job:
-                _upsert_delete_job(cur, slide_id, requested_by,
-                                   requeue_failed=False)
+                _upsert_delete_job(cur, slide_id, requested_by)
             return moved
 
 
@@ -873,10 +881,11 @@ DELETE_JOB_DONE = "done"
 DELETE_JOB_FAILED = "failed"
 
 
-def _upsert_delete_job(cur, slide_id, requested_by, *, requeue_failed):
-    """任务行 upsert（调用方事务内）。缺行 → 插入 pending；已有行仅在
-    requeue_failed 且 state='failed' 时复位 pending（清 lease/错误）——
-    pending/cleaning（含活租约）不动，done 永不动。"""
+def _upsert_delete_job(cur, slide_id, requested_by):
+    """任务行 upsert（调用方事务内；P5 review 收口：requeue_failed 装饰形参
+    已清——SQL 的 ON CONFLICT WHERE state='failed' 即正确语义，两调用点
+    行为本就一致）。缺行 → 插入 pending；已有行仅 state='failed' 时复位
+    pending（清 lease/错误）——pending/cleaning（含活租约）不动，done 永不动。"""
     cur.execute(
         "INSERT INTO slide_delete_jobs (job_id, slide_id, requested_by, "
         "state) VALUES (%s, %s, %s, %s) "
@@ -897,8 +906,7 @@ def enqueue_delete_job(slide_id, requested_by=None, *, conn=None) -> None:
     """
     with _session(conn) as c:
         with c.cursor() as cur:
-            _upsert_delete_job(cur, slide_id, requested_by,
-                               requeue_failed=True)
+            _upsert_delete_job(cur, slide_id, requested_by)
 
 
 def claim_due_delete_job(worker_id, *, lease_seconds=300.0,

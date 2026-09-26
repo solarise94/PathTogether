@@ -913,19 +913,17 @@ def _probe_viewer_ready(path):
 
 def _ready_probe_path(job, *, root=None):
     """readiness 探针路径（P4-b 合同 §5.4）：按 descriptor 路径试开
-    （resolve_descriptor_path——objects/<slide_id>/data.<ext>），不再按
-    slide_canonical_name 拼路径。无绑定的升级窗口旧行回落按名（P6 排空）。"""
+    （resolve_descriptor_path——objects/<slide_id>/data.<ext>）。
+    P6 运行时退役：无 slide_id 的升级窗口旧行按 canonical 名拼平铺路径的
+    回落已拆除——解析不到资产即 None（调用方按暂时失败重试+人工处置，
+    不按名猜）。"""
     sid = (job.get("slide_id") or "").strip()
     if sid:
         desc = slide_store.resolve_slide_id(sid)
         if desc is None:
             return None
         return slide_storage.resolve_descriptor_path(desc, root=root)
-    canonical = job.get("slide_canonical_name") or ""
-    if not canonical:
-        return None
-    base = slide_storage.upload_root() if root is None else root
-    return os.path.join(str(base), canonical)
+    return None
 
 
 def process_ready(cos=None, state=None):

@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest  # noqa: E402
 
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
+from _pt_helpers import register_slide_row  # noqa: E402  # P6：夹具建仓（id_bundle）
 DATA_DIR = _bootstrap.SHARE_DATA_DIR
 UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 import share_store  # noqa: E402
@@ -81,10 +82,11 @@ def _login(client, login_id, password):
     return client.post("/login", data={"username": login_id, "password": password})
 
 def _touch(name="demo.svs"):
-    """在 UPLOAD_DIR 下放一个占位切片文件（_safe_name 要求文件存在）。"""
+    """在 UPLOAD_DIR 下放一个占位切片文件并建可读仓（P6：id_bundle 行）。"""
     p = Path(UPLOAD_DIR) / name
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(b"svs-stub")
+    register_slide_row(name)
     return name
 
 def _own(name, user_id):

@@ -339,7 +339,8 @@ def test_internal_annotate_accepts_wh(monkeypatch):
     monkeypatch.setattr(app_mod, "_require_internal", lambda: None)
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
-    monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
+    monkeypatch.setattr(app_mod, "_ai_write_revision",
+                            lambda gate, safe: "rev0")
     c = app_mod.app.test_client()
     r = c.post("/internal/ai/annotate", json={
         "slide": "demo.svs", "label": "AI", "x": 10, "y": 10,
@@ -578,7 +579,8 @@ def test_plugin_v1_annotate_wh(monkeypatch):
     monkeypatch.setattr(app_mod.share_store, "get_plugin_installation",
                         lambda iid: {"plugin_id": "histopilot", "version": "0"})
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
-    monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
+    monkeypatch.setattr(app_mod, "_ai_write_revision",
+                            lambda gate, safe: "rev0")
     c = app_mod.app.test_client()
     r = c.post("/api/plugin/v1/slides/demo.svs/annotations", json={
         "label": "AI-rect", "x": 5, "y": 5, "width_px": 220, "height_px": 90,

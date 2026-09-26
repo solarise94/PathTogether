@@ -176,19 +176,32 @@ def isolate_app(monkeypatch, data_dir, upload_dir=None, login_limits=False,
     return data_dir, upload_dir
 
 
-def register_slide_row(name):
-    """P3 夹具适配（合同 §1.1）：为已放置的文件注册 slides 行。
+def register_slide_row(name, *, upload_dir=None):
+    """P3 夹具适配 → **P6 运行时退役改写**（合同 §3/§4）：为已放置的文件
+    建**可读**资产行。
 
-    asset_state='ready' / storage_layout='legacy' / owner **NULL**——后续
-    ``set_slide_meta(name, owner_user_id=…)`` 仍可回填归属（与旧「无行」
-    夹具的所有权赋值行为完全兼容）。P3 删除「无行即可读」兼容分支后，
-    依赖目录直放文件的读端点夹具统一先经本函数注册。幂等（同名行已
-    存在则跳过）。返回 slide_id（已存在时返回既有行 ID）。
+    P3 时代本函数建 legacy 布局行（平铺文件直读）；P6 起 legacy 布局在运行时
+    不可读（读路径只认 id_bundle）——本函数改为把已放置的平铺文件**发布为
+    objects/<slide_id>/ 包**并建 id_bundle ready 行：
+
+      - ``legacy_filename=name`` 保留（冻结别名——旧端点按名解析照常）；
+      - 平铺源文件保留原位（迁移语义「不删源」；读取走 objects/）；
+      - owner NULL / ``set_slide_meta(name, owner_user_id=…)`` 仍可回填归属
+        （与旧夹具的所有权赋值行为完全兼容）。
+
+    幂等（同名行已存在则跳过）。返回 slide_id（已存在时返回既有行 ID）。
     """
+    import hashlib
     import os
+    import re
     import secrets
+    import shutil
 
     import psycopg
+    import slide_storage
+    import app as app_mod  # UPLOAD_DIR 经 isolate_app monkeypatch（读源与发布同根）
+    root = Path(upload_dir) if upload_dir is not None \
+        else Path(app_mod.UPLOAD_DIR)
     with psycopg.connect(os.environ["DATABASE_URL"],
                          autocommit=True) as conn:
         with conn.cursor() as cur:
@@ -198,12 +211,40 @@ def register_slide_row(name):
             if row:
                 return row[0]
             sid = "sld_" + secrets.token_urlsafe(9)
+            ext = (name.rsplit(".", 1)[-1].lower() if "." in name else "")
+            if not re.match(r"^[a-z0-9]{1,16}$", ext or ""):
+                ext = "dat"
+            entry = "data." + ext
+            # 发布为 objects/<sid>/ 包（no-clobber；与运行时同一原语）
+            src = root / name
+            payload = src.read_bytes() if src.is_file() else b""
+            staging = slide_storage.staging_dir(
+                "reg-%s" % secrets.token_urlsafe(6), "1", root=root)
+            staging.mkdir(parents=True, exist_ok=True)
+            (staging / entry).write_bytes(payload)
+            manifest = {
+                "entry": entry,
+                "files": [{"path": entry, "size": len(payload),
+                           "sha256": hashlib.sha256(payload).hexdigest()}],
+            }
+            slide_storage.publish_bundle_no_clobber(
+                staging, sid, manifest, root=root)
+            shutil.rmtree(staging.parent, ignore_errors=True)
             cur.execute(
                 "INSERT INTO slides (slide_id, legacy_filename, display_name, "
                 "original_filename, format_ext, asset_state, storage_layout, "
-                "published_at) VALUES (%s,%s,%s,%s,%s,'ready','legacy',now())",
+                "storage_relpath, accounted_bytes, published_at) "
+                "VALUES (%s,%s,%s,%s,%s,'ready','id_bundle',%s,%s,now())",
                 (sid, name, name, name,
-                 (name.rsplit(".", 1)[-1].lower() if "." in name else None)))
+                 (name.rsplit(".", 1)[-1].lower() if "." in name else None),
+                 slide_storage.entry_relpath(sid, ext), len(payload)))
+            # 内容 revision（id_bundle 的取数源——slide_assets 最新行；
+            # 与 slide_publish 发布同口径 sha256 前缀）
+            cur.execute(
+                "INSERT INTO slide_assets (asset_id, slide_id, legacy_revision) "
+                "VALUES (%s, %s, %s)",
+                ("ast_" + secrets.token_urlsafe(9), sid,
+                 "sha256:%s" % hashlib.sha256(payload).hexdigest()[:16]))
             return sid
 
 

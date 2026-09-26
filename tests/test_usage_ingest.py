@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
 import app as app_mod  # noqa: E402
 from _pt_helpers import isolate_app  # noqa: E402
+from _pt_helpers import register_slide_row  # noqa: E402  # P6：夹具建仓
 import share_store  # noqa: E402
 
 import pytest  # noqa: E402
@@ -814,6 +815,7 @@ def test_billing_subject_owner_user_dispatch_matches_resolution():
     def _slide_for(name, owner_user_id=None):
         p = _Path(app_mod.UPLOAD_DIR) / name
         p.write_bytes(b"svs-stub")
+        register_slide_row(name)  # P6：建可读仓（id_bundle 行）
         if owner_user_id:
             share_store_mod.set_slide_meta(name, owner_user_id=owner_user_id)
         return name
@@ -898,7 +900,7 @@ def test_billing_subject_demo_dispatch_matches_resolution():
     name = "e2e-demo.svs"
     p = _Path(app_mod.UPLOAD_DIR) / name
     p.write_bytes(b"svs-stub")
-    share_store_mod.set_slide_meta(name)
+    register_slide_row(name)  # P6：建可读仓（id_bundle 行）
     slide_id = share_store_mod.get_slide_id(name)
     demo_store.catalog_add(slide_id, added_by="owner-test")
 

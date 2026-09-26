@@ -466,7 +466,10 @@ def _write_artifact(name, data):
 
 
 def test_recovery_absent_promotes_nothing_releases(monkeypatch):
-    """全不存在 → rollback + 取消 + 释放预占（安全回退，无配额泄漏）。"""
+    """【P6 运行时退役改写】旧形态（v1_artifacts 平铺提升）证据**全不存在**
+    → 拆除后不再回滚/取消/释放——fail-closed 保持 committing（「不认识的
+    旧形态不猜」；原「absent → 安全回退」的三态语义已随升级窗口排空拆除，
+    其防配额泄漏职责由「根本不动预占」承担）。"""
     uid = user_store.create_user("q5@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid, 10 ** 7)
     r = upload_guard.reserve_upload(uid, 1000, inflight_limit=10, hourly_limit=10)
@@ -477,11 +480,12 @@ def test_recovery_absent_promotes_nothing_releases(monkeypatch):
     _mk_committing_task([a1, a2], owner=uid,
                         reservation_id=r["reservation_id"])
     _age_committing(monkeypatch)
-    app_mod._upload_legacy_recover_stale({"role": "owner"})
+    for _ in range(2):
+        app_mod._upload_legacy_recover_stale({"role": "owner"})
     t = _tasks()[0]
-    assert t["state"] == upload_task_store.STATE_CANCELLED
+    assert t["state"] == upload_task_store.STATE_COMMITTING
     row = upload_guard.get_quota_row(uid)
-    assert row["reserved_bytes"] == 0
+    assert row["reserved_bytes"] == 1000  # 预占不动（不盲 release）
     assert row["used_bytes"] == 0
 
 
@@ -537,8 +541,10 @@ def test_recovery_size_mismatch_conflict_fail_closed(monkeypatch):
 
 
 def test_recovery_promoted_finishes_idempotently_zip(monkeypatch):
-    """全已提升（含伴侣目录文件）→ 幂等 finish：used 增加恰好一次，ownership
-    补齐；再次扫描不双扣。"""
+    """【P6 运行时退役改写】旧形态证据**全已提升**（含伴侣目录文件）→ 拆除后
+    不再补 ownership/finish（原「promoted → 幂等 finish + 双查不双扣」三态
+    语义已随升级窗口排空拆除）——fail-closed 保持 committing，配额零变动、
+    平铺文件不被认领或撤回（交人工处置）。"""
     uid = user_store.create_user("q9@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid, 10 ** 7)
     r = upload_guard.reserve_upload(uid, 1000, inflight_limit=10, hourly_limit=10)
@@ -553,13 +559,14 @@ def test_recovery_promoted_finishes_idempotently_zip(monkeypatch):
     for _ in range(2):
         app_mod._upload_legacy_recover_stale({"role": "owner"})
     t = _tasks()[0]
-    assert t["state"] == upload_task_store.STATE_COMMITTED
+    assert t["state"] == upload_task_store.STATE_COMMITTING
     row = upload_guard.get_quota_row(uid)
-    assert row["used_bytes"] == len(main) + len(comp)
-    assert row["reserved_bytes"] == 0
-    # ownership 在 finish 之前补齐
+    assert row["used_bytes"] == 0
+    assert row["reserved_bytes"] == 1000
+    # 平铺提升件原样保留（不认领也不删除）；无按名 ownership 补写
+    assert (Path(UPLOAD_DIR) / "R.mrxs").read_bytes() == main
     meta = share_store.get_slide_meta_full("R.mrxs") or {}
-    assert meta.get("owner_user_id") == uid
+    assert not meta.get("owner_user_id")
 
 
 # =========================================================================== #

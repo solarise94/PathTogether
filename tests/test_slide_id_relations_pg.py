@@ -38,7 +38,7 @@ import share_server as share_srv  # noqa: E402
 import share_store  # noqa: E402
 import slide_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app  # noqa: E402
+from _pt_helpers import csrf_client, isolate_app, register_slide_row  # noqa: E402
 from _tiff_fixtures import make_tiff_bytes  # noqa: E402
 
 INTERNAL_TOKEN = "test-internal-token-p2"
@@ -96,7 +96,9 @@ def _touch_tiff(name):
 
 
 def _register(name, owner_user_id):
-    """等价上传完成的真实状态：文件在盘 + slides 行（legacy writer 建行）。"""
+    """等价上传完成的真实状态：文件在盘 + 可读仓（P6：id_bundle 行——
+    register_slide_row 发布 objects/<sid>/ 包，再回填归属）。"""
+    register_slide_row(name)
     share_store.set_slide_meta(name, owner_user_id=owner_user_id)
     return share_store.get_slide_id(name)
 

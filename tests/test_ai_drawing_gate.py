@@ -106,7 +106,8 @@ def _mock_plugin_channel(monkeypatch, valid=True):
     monkeypatch.setattr(app_mod.share_store, "get_plugin_installation",
                         lambda iid: {"plugin_id": "histopilot", "version": "0"})
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
-    monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
+    monkeypatch.setattr(app_mod, "_ai_write_revision",
+                            lambda gate, safe: "rev0")
 
 
 def _post_polygon(c, **overrides):
@@ -908,7 +909,8 @@ def _mock_internal_channel(monkeypatch):
     monkeypatch.setattr(app_mod, "_require_internal", lambda: None)
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
-    monkeypatch.setattr(app_mod, "_legacy_slide_revision", lambda safe: "rev0")
+    monkeypatch.setattr(app_mod, "_ai_write_revision",
+                            lambda gate, safe: "rev0")
 
 
 def _post_internal_polygon(c, session_id="sess-int-1", **overrides):

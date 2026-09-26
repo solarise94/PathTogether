@@ -24,6 +24,7 @@ import pytest
 from PIL import Image
 
 import _bootstrap  # noqa: F401  # session 目录+openslide stub（conftest 先行）
+from _pt_helpers import register_slide_row  # noqa: E402  # P6：夹具建仓
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -362,7 +363,9 @@ def share_env(tmp_path, monkeypatch):
     monkeypatch.setattr(share_store, "SHARE_FILE", data_dir / "shares.json")
     monkeypatch.setattr(share_srv, "UPLOAD_DIR", upload_dir)
     share_store.set_owner_user_id("")
-    share_store.set_slide_meta("demo.svs")  # P2：分享创建收口——先建行
+    # P6：建可读仓（id_bundle 行——发布根显式传本模块的 upload_dir）
+    (upload_dir / "demo.svs").write_text("v0", encoding="utf-8")
+    register_slide_row("demo.svs", upload_dir=upload_dir)
     share = share_store.create_share(["demo.svs"], 24)
     share_srv.app.config["TESTING"] = True
     with share_srv.app.test_client() as c:
@@ -371,10 +374,18 @@ def share_env(tmp_path, monkeypatch):
     share_srv._tile_cache.clear()
 
 
+def _entry_of(upload_dir, name="demo.svs"):
+    """P6：id_bundle 入口路径（分享端 resolver 的实际读位）。"""
+    import slide_storage
+    import slide_store as _ss
+    desc = _ss.resolve_legacy_alias(name)
+    return slide_storage.resolve_descriptor_path(desc, root=upload_dir)
+
+
 def test_share_server_tile_and_dzi_follow_generation(
         share_env, fake_pairs, monkeypatch):
     c, upload_dir, token = share_env
-    path = upload_dir / "demo.svs"
+    path = _entry_of(upload_dir)  # P6：写入口路径（objects/<sid>/data.svs）
     path.write_text("v1", encoding="utf-8")
 
     tile_url = "/s/%s/api/slide/demo.svs_files/0/0_0.jpeg" % token
@@ -409,7 +420,7 @@ def test_share_server_tile_and_dzi_follow_generation(
 
 def test_share_server_slides_info_follows_signature(share_env, fake_pairs):
     c, upload_dir, token = share_env
-    path = upload_dir / "demo.svs"
+    path = _entry_of(upload_dir)  # P6：入口路径（id_bundle 读位）
     path.write_text("v1", encoding="utf-8")
     r1 = c.get("/s/%s/api/slides" % token)
     assert r1.status_code == 200
@@ -666,11 +677,11 @@ def test_share_server_raster_tile_follows_generation(
         share_env, fake_pairs):
     """普通图片走分享路由：换代后瓦片不得命中旧代 JPEG 缓存（demo.bmp）。"""
     c, upload_dir, _token = share_env
-    path = upload_dir / "photo.bmp"
-    path.write_text("v1", encoding="utf-8")
-    share_store.set_slide_meta("photo.bmp")  # P2：分享创建收口——先建行
+    (upload_dir / "photo.bmp").write_text("v1", encoding="utf-8")
+    register_slide_row("photo.bmp", upload_dir=upload_dir)  # P6：id_bundle 建仓
     p2_sid = share_store.get_slide_id("photo.bmp")  # R-15：瓦片键改 slide_id
     token = share_store.create_share(["photo.bmp"], 24)["token"]
+    path = _entry_of(upload_dir, "photo.bmp")  # P6：写入口路径
 
     tile_url = "/s/%s/api/slide/photo.bmp_files/0/0_0.jpeg" % token
     r1 = c.get(tile_url)

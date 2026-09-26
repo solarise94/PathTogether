@@ -243,3 +243,41 @@
 
 - 第二段（§3）：运行时 legacy 物理读取退役、canonical_is_live/NameConflict 壳删除、升级窗口在途分支（_upload_legacy_promote_state/_upload_v2_set_ownership）排空拆除、.uploading-*.lock 收口、share_server 残留复核、_upsert_delete_job.requeue_failed 装饰形参清理。
 - P7：生产停写窗口+一致备份方案、旧平铺源+留置派生物的独立清理 manifest、真实 MRXS 样本试开、shares.slides JSONB 退役顺序、COS capability 维持 off。
+
+## P6 第二段门禁（2026-09-26）：运行时 legacy 物理读取退役
+
+合同：docs/slide-id-refactor-p6-contract-20260925.md §3（前置=P6-1 演练绿=66b6e18）。
+
+**交付**：`resolve_descriptor_path` legacy 支路拆除（legacy→ValueError；唯一 legacy 物理读取=`resolve_legacy_path_for_migration`【迁移专用】，rg 证明运行时模块零调用）；`authorize_read` 判定序第 0 步加 layout 门禁（ready **且** id_bundle 才是唯一可见性开关；DB 当前行重读含 layout——单一 choke point，机器/分享/插件通道同口径）；`visible_ready_slide_ids` SQL 同口径；`canonical_is_live`/`NameConflict` 兼容壳删除（baidu_ingest 两调用点收口，磁盘 O_EXCL 检查保留）；升级窗口在途分支全拆（`_upload_legacy_promote_state`/`_upload_legacy_remove_artifacts`/`_upload_v2_set_ownership`/`_promote_no_clobber`/V2 平铺提升+按名 ownership/恢复旧提升判定/`_upload_v2_state_dict` 按名回落/`_ensure_conversion_job` 平铺探测回落）——旧形态 committing=fail-closed 保持+日志，旧形态 active 主动 commit=409 legacy_upload_task_unsupported；`.uploading-*` 平铺写入点清零（part/lock 恒在 `.staging/<uid>/`）；revision 全族统一 `_slide_revision`/`_share_revision`（id_bundle=slide_assets sha——app+share_server 约 15 处，含 X-Asset-Revision/attestation/wire-context）；`_upsert_delete_job.requeue_failed` 装饰形参清除（P5 观察收口）。
+
+**测试**：新增 `tests/test_p6_legacy_runtime_retirement.py`（9 用例：legacy 全通道不可读/分享成员不泄露/冻结别名+已迁移行全通/旧形态恢复保持 committing/锁新位无平铺残留/兼容壳模块面断言/revision 取数）；夹具主收敛点 `tests/_pt_helpers.register_slide_row` 改 id_bundle 建仓（publish 建仓+保留冻结别名与平铺源——「register_legacy 控制动作」等效落地）；改写 24 个既有测试文件（场景保留、断言换目标不变量，逐份见实施报告）。
+
+### P6-2 偏差裁决记录
+
+| # | 偏差 | 裁决 | 理由/收口 |
+|---|---|---|---|
+| 1 | layout 门禁落 authorize_read+visible_ready_slide_ids（非逐端点 try/except） | 采纳 | 单一 choke point；legacy 行对 owner/admin 读取同拒（不泄露存在性）；管理台 inventory 经 list_all_descriptors 仍可管理 |
+| 2 | revision 统一超字面清单（任务8 扩展，约 15 处） | 采纳 | 夹具迁移暴露取数分叉（id_bundle 签 sha、验签名 mtime:size→全链 409 的真缺陷）；值语义变更（mtime:size→sha256:hex16）经 HP 契约复跑验证 |
+| 3 | requeue_failed 选「清形参」 | 采纳 | SQL WHERE state='failed' 本就是正确语义；接线反引入行为变化 |
+| 4 | 旧形态 active 主动 commit=409 legacy_upload_task_unsupported | 采纳 | committing 恢复 fail-closed 的请求路径等价物（合同未明示，「不猜」补全） |
+| 5 | conversion_worker.resolve_source 分支3保留 | 采纳 | baidu O_EXCL 源副本唯一读取方；注释改标 baidu 专用 |
+| 6 | invalidate_by_slide_id(legacy_canonical=) 未拆 | 采纳列遗留 | 与 P5 删除编排/quarantine 产物行删除联动，拆除收益小破坏面大→P7 |
+| 7 | 夹具走 publish 建仓路线（仓库无既存 register_legacy 动作） | 采纳 | 等效「register_legacy 控制动作」；保留冻结别名与平铺源 |
+
+### P6-2 跨仓联动（编排方处置）
+
+- HP 契约 6 败（预期内退役语义）：ai-drawing setup_slide 的 bare 文件+set_slide_meta（legacy 布局）与 slide-id ③ 的「legacy 可读」旧承诺。编排方迁移 HP 测试（**HP 提交 4598172**）：setup_slide 改 id_bundle 建仓+冻结别名（迁移后历史资产真实形态；同文件多 it 别名 UNIQUE 清旧再挂）、slide_revision 控制动作改 descriptor 取数；③ 场景保留断言换新（③a 迁移前机器通道 404 不泄露存在性；③b 迷你迁移 migrate_to_id_bundle=publish 建仓+bind 保留别名+revision 落账后名通道照常、rois.slide_id 正确）。复跑 **49/49 绿**。
+- 值语义变更登记：id_bundle 的 `asset_revision`/`X-Asset-Revision` 族从 `` 或 mtime:size 统一为 `sha256:<hex16>`（HP 侧为 PT 下发值回显，契约验证无需 HP 代码改动）。
+
+### P6-2 门禁合计（编排方独立复核）
+
+- 全量 pytest：**2758 passed / 1 已知无关失败 / 6 skipped**（2748+9 新增+1 差值为改写计数浮动）；新测试文件 9/9 独立复跑；test:js 562/562；HP 契约 49/49。
+
+### P6-2 遗留（P7 输入）
+
+- `set_slide_meta` 懒建 legacy 行仍是 demo 目录 PUT 与 admin visibility 孤儿收录的登记通道（预标允许残留位）——P7 随 demo 目录强校验收口。
+- `scripts/seed_demo_tcga_catalog.py` 平铺 demo 播种需切迁移工具或 objects 播种。
+- `invalidate_by_slide_id(legacy_canonical=)` + `_cleanup_conversion_sidecars` 平铺派生物清理 → P7 独立清理 manifest 统一收口。
+- `_ai_run_render_context` 名回落（descriptor 解析失败 mtime:size）保留为防御路径。
+- `shares.slides` JSONB 退役顺序文档化（P7）。
+- P6-1 遗留继续：生产停写窗口/旧平铺源清理 manifest/真实 MRXS 样本终审/COS capability off。

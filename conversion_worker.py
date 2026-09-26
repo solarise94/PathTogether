@@ -127,7 +127,9 @@ def resolve_source(job, upload_dir=None):
         for child in sorted(src_dir.iterdir()):
             if child.is_file():
                 return str(child)
-    # 3) 旧任务 / baidu 复制源：UPLOAD_DIR 平铺 source_name（过渡，P6 排空）。
+    # 3) baidu 复制源：UPLOAD_DIR 平铺 source_name（P4-a 接口——baidu_ingest
+    #    以 O_EXCL 把源副本落在 UPLOAD_DIR 根，本分支是其唯一读取方；升级
+    #    窗口在途旧任务的同类读取已随 P6 运行时退役排空）。
     name = (job.get("source_name") or "").strip()
     if name:
         legacy = os.path.join(upload_dir or UPLOAD_DIR, name)

@@ -111,15 +111,34 @@ def test_resolve_rejects_escape(root):
 
 
 def test_resolve_legacy_transitional_branch(root):
+    """P6 运行时退役断言换目标：legacy 布局的物理解析只在**迁移专用入口**
+    （resolve_legacy_path_for_migration）保留；运行时 resolver（resolve_
+    descriptor_path）对 legacy 布局一律 ValueError（读路径只认 id_bundle）。"""
     legacy = root / "legacy-old.svs"
     legacy.write_bytes(b"old")
-    p = slide_storage.resolve_descriptor_path(
+    # 运行时 resolver：legacy 布局 fail-closed（不再有平铺物理读取旁路）
+    with pytest.raises(ValueError, match="legacy 布局已退役"):
+        slide_storage.resolve_descriptor_path(
+            _Desc(storage_layout="legacy", legacy_filename="legacy-old.svs"),
+            root=root)
+    # 迁移专用入口：同一 legacy 布局仍可解析（containment 校验同源）
+    p = slide_storage.resolve_legacy_path_for_migration(
         _Desc(storage_layout="legacy", legacy_filename="legacy-old.svs"),
         root=root)
     assert p == legacy
-    # 新资产无 legacy_filename：拒绝（新资产不走按名定位）
+    # 迁移入口只认 legacy 布局（id_bundle/未知一律拒——不提供第二运行时通道）
     with pytest.raises(ValueError):
-        slide_storage.resolve_descriptor_path(
+        slide_storage.resolve_legacy_path_for_migration(
+            _Desc(storage_layout="id_bundle",
+                  storage_relpath="objects/sld_x/data.svs"), root=root)
+    # 迁移入口 containment：穿越 legacy_filename 拒绝
+    with pytest.raises(ValueError):
+        slide_storage.resolve_legacy_path_for_migration(
+            _Desc(storage_layout="legacy", legacy_filename="../evil.svs"),
+            root=root)
+    # legacy 布局缺 legacy_filename：拒绝（新资产不走 legacy 布局）
+    with pytest.raises(ValueError):
+        slide_storage.resolve_legacy_path_for_migration(
             _Desc(storage_layout="legacy"), root=root)
     # 未知布局 fail-closed
     with pytest.raises(ValueError):

@@ -39,6 +39,7 @@ import share_store  # noqa: E402
 import slide_store  # noqa: E402
 import user_store  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app, FakeRequests  # noqa: E402
+from _pt_helpers import register_slide_row  # noqa: E402  # P6：夹具建仓
 from _tiff_fixtures import make_tiff_bytes  # noqa: E402
 
 
@@ -79,6 +80,7 @@ def _touch(name):
     p = Path(UPLOAD_DIR) / name
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(b"svs-stub")
+    register_slide_row(name)  # P6：建可读仓（id_bundle 行）
     return name
 
 

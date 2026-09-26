@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import _bootstrap  # noqa: E402,F401  # session 目录 + openslide stub（conftest 先行）
 import pytest  # noqa: E402
 from PIL import Image  # noqa: E402
+from _pt_helpers import register_slide_row  # noqa: E402  # P6：夹具建仓
 
 import share_store  # noqa: E402
 import share_server as share_srv  # noqa: E402
@@ -110,9 +111,10 @@ def view_env(tmp_path, monkeypatch):
 def _share_of(upload_dir, filename, data, **kw):
     p = upload_dir / filename
     p.write_bytes(data)
-    # P2 收口（合同 §4/P1-B2 偏差 #4）：分享创建仅接受已存在资产——
-    # 夹具顺序调整为先注册资产行（任务书允许的夹具调整，断言不变）。
-    share_store.set_slide_meta(filename)
+    # P2 收口（合同 §4/P1-B2 偏差 #4）：分享创建仅接受已存在资产——夹具顺序
+    # 调整为先建可读仓（P6：id_bundle 行——本模块只 patch share_srv.UPLOAD_DIR，
+    # 发布根须显式传 upload_dir），断言不变。
+    register_slide_row(filename, upload_dir=upload_dir)
     return share_store.create_share([filename], 24, **kw)["token"]
 
 
@@ -351,7 +353,7 @@ def test_reject_preset_rect_mm_unit_locks_missing_mpp(view_env):
     _c, upload_dir = view_env
     (upload_dir / "photo.bmp").write_bytes(
         _bmp_bytes(_corner_image(64, 48, block=8)))
-    share_store.set_slide_meta("photo.bmp")  # P2：分享创建收口——先建行
+    register_slide_row("photo.bmp", upload_dir=upload_dir)  # P6：id_bundle 行
     token = share_store.create_share(["photo.bmp"], 24)["token"]
     share = share_store.get_share(token)
     for declared in (6.0, None):

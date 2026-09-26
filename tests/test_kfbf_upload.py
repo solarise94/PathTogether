@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """KFBF（荧光）上传 → 202 转换任务 → worker 产出 canonical OME-TIFF。
 
-镜像 tests/test_kfb_upload.py 的 KFB 合同：源文件不对 Viewer 列出，
-canonical 为 <stem>.ome.tif，worker 完成后可被 slide_io 打开且保留
-多通道语义。
+镜像 tests/test_kfb_upload.py 的 KFB 合同（P4-app 断言换新）：源副本归
+任务 staging（不对 Viewer 列出、不平铺 UPLOAD_DIR）；产物预分配
+slide_id、经统一发布落 objects/<sid>/data.tif；多通道语义保留。
 """
 import hashlib
 import os
@@ -21,6 +21,8 @@ import conversion_store  # noqa: E402
 import conversion_worker  # noqa: E402
 import kfb.converter_fl as kfbf_converter  # noqa: E402
 import slide_io  # noqa: E402
+import slide_storage  # noqa: E402
+import slide_store  # noqa: E402
 import upload_guard  # noqa: E402
 from kfb.fixture_fl import build_synthetic_kfbf  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app, clear_upload_dir  # noqa: E402
@@ -29,6 +31,12 @@ from _pt_helpers import csrf_client, isolate_app, clear_upload_dir  # noqa: E402
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    # P4-app：转换链 create_job 即预分配产物资产——本地态注入配置 owner。
+    import share_store as _ss
+    import user_store as _us
+    _ss.set_owner_user_id(
+        _us.create_user("p3-local-owner@x.com", "localownerpass12345",
+                        role="user")["user_id"])
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", False)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
     monkeypatch.setattr(kfbf_converter, "DEFAULT_MIN_FREE_BYTES", 0)
@@ -54,19 +62,23 @@ def test_v1_kfbf_returns_202_and_worker_makes_ome_tif(tmp_path):
     assert body["source_name"] == "case.kfbf"
     assert body["canonical_name"] == "case.ome.tif"
     job_id = body["conversion_job_id"]
-    # 源文件落盘但不对 Viewer 列出
-    assert (app_mod.UPLOAD_DIR / "case.kfbf").is_file()
-    slides = c.get("/api/slides").get_json()
-    names = [s["name"] if isinstance(s, dict) else s for s in slides]
-    assert "case.kfbf" not in names
-    assert "case.ome.tif" not in names
+    sid = body["slide_id"]
+    assert sid  # create_job 即预分配
+    # 源副本归任务 staging（不对 Viewer 列出、不平铺）
+    assert (conversion_worker.source_staging_dir(
+        job_id, app_mod.UPLOAD_DIR) / "data.kfbf").is_file()
+    assert not (app_mod.UPLOAD_DIR / "case.kfbf").exists()
+    listed = {s.get("slide_id") for s in c.get("/api/slides").get_json()}
+    assert sid not in listed
 
     claimed = conversion_worker.run_once(upload_dir=str(app_mod.UPLOAD_DIR))
     assert claimed == job_id
     job = conversion_store.get_job(job_id)
     assert job["state"] == "ready"
-    dest = app_mod.UPLOAD_DIR / "case.ome.tif"
-    assert dest.is_file()
+    assert job["slide_id"] == sid
+    desc = slide_store.resolve_slide_id(sid)
+    dest = slide_storage.resolve_descriptor_path(desc, root=app_mod.UPLOAD_DIR)
+    assert dest.is_file() and dest.name == "data.tif"
     slide = slide_io.open_slide(str(dest))
     try:
         assert slide.level_count >= 1
@@ -76,9 +88,9 @@ def test_v1_kfbf_returns_202_and_worker_makes_ome_tif(tmp_path):
         slide.close()
     st = c.get("/api/conversions/" + job_id).get_json()
     assert st["state"] == "ready"
-    slides2 = c.get("/api/slides").get_json()
-    names2 = [s["name"] if isinstance(s, dict) else s for s in slides2]
-    assert "case.ome.tif" in names2
+    assert st["slide_id"] == sid
+    listed2 = {s.get("slide_id") for s in c.get("/api/slides").get_json()}
+    assert sid in listed2
 
 
 def test_v2_kfbf_commit_returns_202(tmp_path):
@@ -123,7 +135,11 @@ def test_brightfield_kfb_bytes_named_kfbf_convert_by_magic(tmp_path):
         r = c.post("/api/upload", data={"file": (f, "fake.kfbf")},
                    content_type="multipart/form-data")
     assert r.status_code == 202, r.get_data(as_text=True)
-    jid = r.get_json()["conversion_job_id"]
+    body = r.get_json()
+    jid = body["conversion_job_id"]
     conversion_worker.run_once(upload_dir=str(app_mod.UPLOAD_DIR))
-    assert conversion_store.get_job(jid)["state"] == "ready"
-    assert (app_mod.UPLOAD_DIR / "fake.ome.tif").is_file()
+    job = conversion_store.get_job(jid)
+    assert job["state"] == "ready"
+    desc = slide_store.resolve_slide_id(job["slide_id"])
+    assert slide_storage.resolve_descriptor_path(
+        desc, root=app_mod.UPLOAD_DIR).is_file()

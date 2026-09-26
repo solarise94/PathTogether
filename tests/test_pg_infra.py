@@ -297,6 +297,11 @@ def test_schema_migrations_recorded(conn):
         # §2）：upload_tasks.commit_intent_json——publish intent 与任务置
         # committing 同事务持久化（崩溃恢复幂等重判的唯一证据源）。
         "0068_upload_publish_intent.sql",
+        # slide ID 化重构 P4（docs/slide-id-refactor-p4-contract-20260925.md
+        # §3）：转换链切 slide_id 统一发布——拆除 canonical 名唯一锁
+        # （idx_conversion_jobs_canonical_live）+ conversion_jobs 的 publish
+        # intent 列。
+        "0069_conversion_slide_id_publish.sql",
     ]
 
 

@@ -7526,6 +7526,10 @@
             var r0 = ensureRow();
             r0.setStage("upload.stage.done");
             r0.finish();
+            // P4（slide ID 化）：b.slide 是展示快照（job.slide_canonical_name），
+            // 仅用于 toast 文案回落；本响应的 b.slide_id 来自任务绑定
+            //（job.slide_id 创建即分配，_ingestion_state_body 直读）——打开
+            // 目标一律按 slide_id，不按名猜。
             toast(t("upload.done", { name: b.slide || job.filename }), "success");
             loadAll();
             return;

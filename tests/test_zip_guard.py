@@ -1,18 +1,22 @@
 # -*- coding: utf-8 -*-
-"""P0-A §3.4 ZIP 解压防护测试（docs/open-registration-security-remediation §6.2）。
+"""P0-A §3.4 ZIP 解压防护测试（docs/open-registration-security-remediation §6.2；
+P4-app 断言换新：解包落 staging + 逐逻辑切片统一发布）。
 
 覆盖：
-  - 合法 bundle 仍可上传：单文件切片、MRXS + 同 stem 伴侣目录（多层包装剥层）；
+  - 合法 bundle 仍可发布：单文件切片、MRXS + 同 stem 伴侣目录（多层包装
+    剥层）——产物落 objects/<slide_id>/（入口 data.<ext>，伴侣 data/…）；
   - 拒绝且无残留：声明大小正常但实际流超限（防实现层偏差的兜底）、极高
     压缩比、过多成员、深目录、重复规范化路径（大小写不敏感）、symlink、
     设备成员、加密成员、混入无关顶层文件/目录、zip-slip 回归；
-  - 最终 move 前：目标冲突统一「名称不可用」（不回显真实文件名）；
+  - 同名平铺文件不再构成冲突（P4-app：目标冲突预检拆除——每 item 预分配
+    slide_id，objects/<sid> 唯一天然无冲突）；
   - 磁盘水位在解压过程中触发（507）；
-  - PG（RUN_PG_TESTS=1）：展开总量超过预占 → 原子 topup；quota 不足 → 413。
+  - PG：展开总量超过预占 → 原子 topup；quota 不足 → 413。
 
-直接调 _prepare_zip_bundle + _promote_zip_bundle 两阶段（G7：生产端点在
-两阶段之间插入 task intent = upload_task_store.begin_legacy_commit，端点级
-流程在 test_upload_guard.py / test_upload_accounting_recovery.py 覆盖）。
+直接调 _prepare_zip_bundle + 逐 item 统一发布（G7：生产端点在两阶段之间
+插入 task intent = upload_task_store.begin_legacy_commit，端点级流程在
+test_upload_guard.py / test_upload_accounting_recovery.py / 
+test_zip_slide_id_pg.py 覆盖）。
 """
 import io
 import os
@@ -43,8 +47,15 @@ SVS = b"fake-svs-content-0123456789"
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
-    """独立存储 + ZIP 上限复位 + _validate_slide_file 放行 + 清空 uploads。"""
+    """独立存储 + ZIP 上限复位 + _validate_slide_file 放行 + 清空 uploads。
+
+    P4-app：发布管线 allocate_slide 需要非空 owner——本地免认证态注入配置
+    owner（p3-local-owner 同款口径）。"""
     isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
+    import share_store as _ss
+    _ss.set_owner_user_id(
+        user_store.create_user("p3-local-owner@x.com",
+                               "localownerpass12345", role="user")["user_id"])
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
     monkeypatch.setattr(app_mod, "ZIP_MAX_MEMBERS", 4096)
     monkeypatch.setattr(app_mod, "ZIP_MAX_PATH_DEPTH", 8)
@@ -80,23 +91,63 @@ def _make_zip_raw(infos, path=None):
 
 
 def _extract_and_promote(z, reservation=None):
-    """旧 _extract_zip_to_upload 的两阶段等价（G7 拆分后的测试聚合器）。
+    """P4-app 生产管线聚合器：prepare → 受理（allocate+bind+intent 同一
+    事务）→ 逐 item 统一发布 → finish_commit。
 
-    生产端点在 prepare 与 promote 之间持久化 task intent（manifest）；本
-    helper 只聚合解压/识别/防护与提升本身，返回旧契约 (main, extracted) 或
-    (msg, status)。
-    """
+    成功返回 (main, extracted, info)——info 含 slide_ids/objects 目录映射；
+    失败返回 (msg, status)（保留旧两段式契约）。"""
+    import pg_store
+    import slide_publish
+    import slide_store
+    import slide_storage
+    import upload_task_store
+
     result = app_mod._prepare_zip_bundle(z, reservation=reservation)
     if isinstance(result, tuple):
         return result
     bundle = result
+    owner = (share_store.get_owner_user_id() or "").strip()
+    upload_id = upload_task_store.new_task_id()
+    artifacts = app_mod._zip_build_artifacts(bundle)
     try:
-        app_mod._promote_zip_bundle(bundle)
-    except FileExistsError:
-        return ("名称不可用", 409)
-    except OSError as e:
-        return (str(e), 400)
-    return bundle["main"], sorted(set(bundle["slides"]))
+        import psycopg.rows
+        conn = pg_store.connect()
+        conn.row_factory = psycopg.rows.dict_row
+        try:
+            with pg_store.transaction(conn):
+                for item in bundle["items"]:
+                    desc = slide_store.allocate_slide(
+                        owner, original_filename=Path(item["key"]).name,
+                        format_ext=item["ext"], conn=conn)
+                    upload_task_store.bind_upload_task_item(
+                        conn, upload_id, item["key"], desc.slide_id)
+                _uid, token, task = upload_task_store.begin_legacy_commit(
+                    owner_user_id=owner, filename="t.zip",
+                    safe_name=Path(bundle["main"]).name,
+                    artifacts=artifacts,
+                    reservation_id=(reservation or {}).get("reservation_id"),
+                    upload_id=upload_id, conn=conn)
+        finally:
+            conn.close()
+        items = upload_task_store.list_upload_task_items(upload_id)
+        plans = app_mod._zip_item_plans(artifacts, items)
+        published, _failures, _settled = app_mod._zip_publish_items(
+            upload_id, token, plans, owner,
+            extract_dir=bundle["extract_dir"],
+            upload_root=app_mod.UPLOAD_DIR)
+        upload_task_store.finish_commit(
+            upload_id, token, app_mod._upload_manifest_sha(artifacts),
+            settle_bytes=int(published))
+    finally:
+        slide_storage.remove_staging_tree(upload_id,
+                                          root=app_mod.UPLOAD_DIR)
+    slide_ids = {r["item_key"]: r["slide_id"]
+                 for r in upload_task_store.list_upload_task_items(upload_id)}
+    info = {"slide_ids": slide_ids,
+            "objects": {k: slide_storage.bundle_dir(v,
+                                                    root=app_mod.UPLOAD_DIR)
+                        for k, v in slide_ids.items()}}
+    return bundle["main"], [i["key"] for i in bundle["items"]], info
 
 
 def _residue():
@@ -119,10 +170,12 @@ def test_legal_single_file_zip():
     z = _make_zip([("a.svs", SVS)])
     result = _extract_and_promote(z)
     assert not isinstance(result[1], int), result
-    main, extracted = result
+    main, extracted, info = result
     assert main == "a.svs"
     assert extracted == ["a.svs"]
-    assert (Path(UPLOAD_DIR) / "a.svs").read_bytes() == SVS
+    sid = info["slide_ids"]["a.svs"]
+    assert (info["objects"]["a.svs"] / "data.svs").read_bytes() == SVS
+    assert not (Path(UPLOAD_DIR) / "a.svs").exists()  # 不再平铺
     assert _residue() == []
 
 
@@ -133,29 +186,37 @@ def test_legal_mrxs_with_companion_dir():
         ("S/Slidedat.ini", b"ini"),
         ("S/Level_0/data.dat", b"dat"),
     ])
-    main, extracted = _extract_and_promote(z)
-    # 返回契约：extracted 只列有效切片文件；伴侣目录文件随 bundle 落盘
+    main, extracted, info = _extract_and_promote(z)
+    # 返回契约：extracted 只列有效切片（逻辑 item）；伴侣目录文件**同包**
+    # 发布（objects/<sid>/data/… 保留包内相对关系——P4-app §2.5）
     assert main == "S.mrxs"
     assert extracted == ["S.mrxs"]
-    assert (Path(UPLOAD_DIR) / "S.mrxs").exists()
-    assert (Path(UPLOAD_DIR) / "S" / "Slidedat.ini").read_bytes() == b"ini"
-    assert (Path(UPLOAD_DIR) / "S" / "Level_0" / "data.dat").read_bytes() == b"dat"
+    obj = info["objects"]["S.mrxs"]
+    assert (obj / "data.mrxs").read_bytes() == b"mrxs-main"
+    assert (obj / "data" / "Slidedat.ini").read_bytes() == b"ini"
+    assert (obj / "data" / "Level_0" / "data.dat").read_bytes() == b"dat"
+    assert not (Path(UPLOAD_DIR) / "S.mrxs").exists()
+    assert not (Path(UPLOAD_DIR) / "S").exists()
     assert _residue() == []
 
 
 def test_legal_multi_layer_wrapped_zip():
     """文件夹打包产生的多层包装：逐层剥掉后按顶层 bundle 识别。"""
     z = _make_zip([("wrap/inner/S.mrxs", b"m"), ("wrap/inner/S/d.dat", b"d")])
-    main, extracted = _extract_and_promote(z)
+    main, extracted, info = _extract_and_promote(z)
     assert main == "S.mrxs"
     assert extracted == ["S.mrxs"]
-    assert (Path(UPLOAD_DIR) / "S" / "d.dat").exists()
+    assert (info["objects"]["S.mrxs"] / "data" / "d.dat").read_bytes() == b"d"
 
 
 def test_legal_multiple_single_file_slides():
     z = _make_zip([("a.svs", SVS), ("b.tif", b"tif-bytes")])
-    main, extracted = _extract_and_promote(z)
+    main, extracted, info = _extract_and_promote(z)
     assert set(extracted) == {"a.svs", "b.tif"}
+    # 多逻辑切片各得各 slide_id/objects 目录（P4-app §2.2）
+    assert len(set(info["slide_ids"].values())) == 2
+    assert (info["objects"]["a.svs"] / "data.svs").read_bytes() == SVS
+    assert (info["objects"]["b.tif"] / "data.tif").read_bytes() == b"tif-bytes"
 
 
 # =========================================================================== #
@@ -332,15 +393,17 @@ def test_watermark_during_extraction_507(monkeypatch):
 
 
 # =========================================================================== #
-# 3. 最终 move 前：目标冲突统一「名称不可用」
+# 3. 目标冲突预检拆除（P4-app §2.6）：同名平铺文件不再构成冲突
 # =========================================================================== #
-def test_target_conflict_unified_409_no_name_leak():
+def test_same_name_flat_file_no_longer_conflicts():
+    """旧「名称不可用 409」拆除：每 item 预分配 slide_id，objects/<sid>
+    唯一天然无冲突——同名平铺 legacy 文件与发布产物互不影响、不覆盖。"""
     (Path(UPLOAD_DIR) / "a.svs").write_bytes(b"existing")  # 可能是其他用户的
     z = _make_zip([("a.svs", SVS)])
-    msg, status = _extract_and_promote(z)
-    assert status == 409
-    assert msg == "名称不可用"  # 不回显冲突文件名
+    main, extracted, info = _extract_and_promote(z)
+    assert main == "a.svs"
     assert (Path(UPLOAD_DIR) / "a.svs").read_bytes() == b"existing"  # 未覆盖
+    assert (info["objects"]["a.svs"] / "data.svs").read_bytes() == SVS
     assert _residue() == []
 
 
@@ -364,7 +427,8 @@ else:
 
 
 def test_zip_expansion_topup_success():
-    """zip 体小（CL 小）但展开大：move 前 topup 补占，成功后可 consume。"""
+    """zip 体小（CL 小）但展开大：受理前 topup 补占；任务 finish_commit 按
+    全部已发布 item 字节合计一次性 consume（P4-app §2.4 口径）。"""
     uid = user_store.create_user("z1@x.com", "pass1234pass1234", role="user")["user_id"]
     _set_quota(uid, 10 ** 6)
     r = upload_guard.reserve_upload(uid, 100)  # CL 提示值远小于展开量
@@ -372,13 +436,14 @@ def test_zip_expansion_topup_success():
     z = _make_zip([("S.mrxs", b"m"), ("S/d.dat", os.urandom(5000))])
     result = _extract_and_promote(z, reservation=r)
     assert not isinstance(result[1], int), result
+    main, extracted, info = result
     # topup 后预占 = 实际展开总量（1 字节 mrxs + 5000 字节 dat）
     refreshed = upload_guard.get_reservation(r["reservation_id"])
     assert refreshed["reserved_bytes"] == 1 + 5000
-    upload_guard.consume_reservation(r["reservation_id"], 1 + 5000)
     row = upload_guard.get_quota_row(uid)
+    # 任务收口 consume 已在聚合器内发生（一次性结算，无残留预占）
     assert row["used_bytes"] == 1 + 5000 and row["reserved_bytes"] == 0
-    assert (Path(UPLOAD_DIR) / "S.mrxs").exists()
+    assert (info["objects"]["S.mrxs"] / "data.mrxs").exists()
 
 
 def test_zip_expansion_topup_quota_exceeded():

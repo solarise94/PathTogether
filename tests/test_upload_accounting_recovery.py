@@ -214,17 +214,27 @@ def test_v1_zip_companion_files_in_manifest_not_slides():
     main, comp = b"mrxs-main", b"companion-data"
     r = _upload_zip(c, [("S.mrxs", main), ("S/", b""), ("S/d.dat", comp)])
     assert r.status_code == 200, r.get_data(as_text=True)
-    _zip_sid = share_store.get_slide_id("S.mrxs")
-    assert r.get_json() == {"name": "S.mrxs", "extracted": ["S.mrxs"],
-                            "slide_id": _zip_sid,
-                            "slide_ids": {"S.mrxs": _zip_sid}}
+    # P4-app：slide_ids 从 upload_task_items 真实绑定读（新资产无
+    # legacy_filename，按名 resolve 恒 None）；failures 为 item 级失败证据。
+    body = r.get_json()
+    _zip_sid = body["slide_id"]
+    assert _zip_sid
+    assert body == {"name": "S.mrxs", "extracted": ["S.mrxs"],
+                    "slide_id": _zip_sid,
+                    "slide_ids": {"S.mrxs": _zip_sid},
+                    "failures": []}
     t = _tasks()[0]
     arts = {x["name"]: x for x in t["v1_artifacts"]}
     assert set(arts) == {"S.mrxs", "S/d.dat"}
     assert arts["S.mrxs"]["slide"] is True
     assert arts["S/d.dat"]["slide"] is False
     assert t["declared_size"] == len(main) + len(comp)
-    # 成功即同事务转实占（全部提升字节）
+    # 伴侣同包发布：逐 item accounted_bytes = 入口+伴侣合计；配额一次性
+    # 结算 = 全部已发布 item 字节（finish_commit 同事务转实占）
+    import slide_store as _ss
+    desc = _ss.resolve_slide_id(_zip_sid)
+    assert desc.asset_state == "ready"
+    assert desc.accounted_bytes == len(main) + len(comp)
     row = upload_guard.get_quota_row(uid)
     assert row["used_bytes"] == len(main) + len(comp)
     assert row["reserved_bytes"] == 0

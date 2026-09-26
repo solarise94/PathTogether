@@ -679,6 +679,26 @@ def mark_failed(slide_id, *, expected_state=SlideState.STAGING, conn=None) -> bo
                       conn=conn)
 
 
+def force_fail(slide_id, *, conn=None) -> bool:
+    """→ failed：staging/ready 强制撤回（上传预占失效的整体撤回场景——
+    内容从未入账，不得保持可见；P4-app review 补的迁移原语）。
+
+    与 ``mark_failed``（仅 staging）的差异：本原语接受 ready——已发布
+    但配额从未结算成功的资产必须能撤下（ZIP 批量中途预占失效、转换产物
+    在上传任务失败后连带撤回）。ready 撤回的配额退款由调用方在同一事务
+    内按 accounted_bytes 处理（未结算场景无退款）。其余状态 no-op 返回
+    False（幂等，不猜不迁移 deleting/deleted）。
+    """
+    with _session(conn) as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "UPDATE slides SET asset_state=%s, updated_at=now() "
+                "WHERE slide_id=%s AND asset_state IN (%s,%s)",
+                (SlideState.FAILED, slide_id,
+                 SlideState.STAGING, SlideState.READY))
+            return cur.rowcount == 1
+
+
 # --------------------------------------------------------------------------- #
 # 元数据编辑（合同 §3.1：只动元数据，不动文件/legacy_filename/授权）
 # --------------------------------------------------------------------------- #

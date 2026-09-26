@@ -246,6 +246,9 @@ def _connect():
 
 # 稳定 slide_id：对 legacy_filename 取 sha256 前 16 位（重跑/部分失败后可复现）。
 # 迁移跑在空库上；若 slides 行已存在则复用其 slide_id（见 _resolve_slide），不与此处冲突。
+# 【P4-app 退役注释（合同 §6.3）】：slide_id 的确定性推导是**迁移兼容层**
+# 专用（存量行不动）——运行时资产 ID 恒为服务端随机（sld_ + token），不从
+# 名/内容推导；本函数随 P6 迁移工具链退役一并删除，勿在新代码引用。
 def _det_slide_id(name):
     h = hashlib.sha256(str(name).encode("utf-8")).hexdigest()
     return "sld_" + h[:16]

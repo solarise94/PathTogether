@@ -9,9 +9,9 @@
   - run grant 创建者复查（R6）：owner 创建者的 grant 在收录移除后失效。
   - 撤销联动（R6d）：管理端 revoke → 活跃 grant 撤销 + 运行中 run 走既有
     /cancel（可控断言 sidecar 收到取消请求，不 mock 掉取消机制）。
-  - 资产生命周期（R7）：添加 → 删除文件（授权清理，无孤儿行）→ 同名重传
-    （slide_id 复用）→ 旧授权不自动生效；资产生代失配的授权不匹配；
-    迁移 0035 backfill + 可重复执行。
+  - 资产生命周期（R7；P4-app 断言换新）：添加 → 删除文件（授权清理，无
+    孤儿行）→ 同名重传（**新 slide_id**——复活分支已拆）→ 旧授权不继承；
+    资产生代失配的授权不匹配；迁移 0035 backfill + 可重复执行。
   - 插件 region 闸（R6）：活跃 grant 复核通过放行；撤销后 fail-closed 403；
     demo 目录切片与本地免认证态无 grant 放行。
   - 空 principal 盘点接口（R6e/§5.4）：owner-only 只读报告 + 审计。
@@ -29,14 +29,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
 DATA_DIR = _bootstrap.SHARE_DATA_DIR
 UPLOAD_DIR = _bootstrap.UPLOAD_DIR
+import hashlib  # noqa: E402
 import psycopg  # noqa: E402
 import pytest  # noqa: E402
 
 import app as app_mod  # noqa: E402
 import demo_store  # noqa: E402
 import share_store  # noqa: E402
+import slide_store  # noqa: E402
 import user_store  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app, FakeRequests  # noqa: E402
+from _tiff_fixtures import make_tiff_bytes  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -254,8 +257,10 @@ def test_revoke_revokes_stale_run_grants_and_cancels_running(fake_sidecar):
 
 
 def test_slide_delete_clears_view_grants_no_orphans():
-    """R7 生命周期：添加 → 删除文件 → 授权清理（无孤儿行）→ 同名重传（
-    slide_id 复用）→ 旧授权不自动生效。"""
+    """R7 生命周期（P4-app 断言换新，合同 §7 强制收口）：添加 → 删除文件 →
+    授权清理（无孤儿行）→ **同名重传 = 新 slide_id**（set_slide_meta 的
+    deleted/deleting→ready 复活分支已拆；tombstone 冻结旧名）→ 旧授权/分享
+    不继承到新资产；显式重新授权（按新资产生代）才恢复可见。"""
     owner, usera = _setup_two_owners()
     slide = _touch("a.svs")
     share_store.set_slide_meta(slide, owner_user_id=usera["user_id"])
@@ -275,18 +280,37 @@ def test_slide_delete_clears_view_grants_no_orphans():
     names = {i["name"] for i in co.get("/api/slides").get_json()}
     assert slide not in names
 
-    # 同名重传（no-clobber 上传必经删除；slides 行保留 → slide_id 复用）
-    _touch(slide)
-    share_store.set_slide_meta(slide, owner_user_id=usera["user_id"])
-    assert share_store.get_slide_id(slide) == old_slide_id  # 同名复用
+    # 同名重传（新管线 V2）→ 新 ID；tombstone 保持死亡（不复活、不重绑）
+    cu = _login(_client(), usera)
+    tiff = make_tiff_bytes(32, 32)
+    r = cu.post("/api/uploads", json={"filename": slide,
+                                      "declared_size": len(tiff)})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    upload_id = r.get_json()["upload_id"]
+    sha = hashlib.sha256(tiff).hexdigest()
+    put = cu.put("/api/uploads/%s/chunk?offset=0&sha256=%s"
+                 % (upload_id, sha), data=tiff,
+                 content_type="application/octet-stream")
+    assert put.status_code == 200, put.get_data(as_text=True)
+    rc = cu.post("/api/uploads/%s/commit" % upload_id)
+    assert rc.status_code == 200, rc.get_data(as_text=True)
+    new_slide_id = rc.get_json()["slide_id"]
+    assert new_slide_id and new_slide_id != old_slide_id
+    # 旧授权不自动生效（失效语义）：owner 看不到新资产（按名/按 ID 都不可见）
     names = {i["name"] for i in co.get("/api/slides").get_json()}
-    assert slide not in names  # 旧授权不自动生效（失效语义）
-    assert co.get("/api/slide/%s/info" % slide).status_code == 403
+    assert slide not in names
+    assert co.get("/api/slides/%s/info" % new_slide_id).status_code == 403
+    # 上传者本人可读（新资产独立归属）
+    assert cu.get("/api/slides/%s/info" % new_slide_id).status_code == 200
+    # tombstone：旧 ID 保持 deleted；旧名 resolve 不指向新资产
+    assert slide_store.resolve_slide_id(old_slide_id).asset_state == "deleted"
 
-    # 显式重新添加才恢复
-    _grant(slide, owner)
-    names = {i["name"] for i in co.get("/api/slides").get_json()}
-    assert slide in names
+    # 显式重新授权（按新资产生代）才恢复 owner 可见
+    share_store.grant_slide_view(owner["user_id"], slide,
+                                 slide_id=new_slide_id)
+    visible = {i.get("slide_id") for i in co.get("/api/slides").get_json()}
+    assert new_slide_id in visible
+    assert co.get("/api/slides/%s/info" % new_slide_id).status_code == 200
 
 
 def test_grant_requires_asset_generation_match():

@@ -87,32 +87,36 @@ def test_b06_native_kfb_kfbf_real_ingest_and_project(tmp_path, monkeypatch):
     assert names["slide.tif"]["slide_name"] == "slide.tif"
     assert names["panel.kfb"]["slide_name"] == "panel.tif"
     assert names["fl.kfbf"]["slide_name"] == "fl.ome.tif"
-    # native 条目预分配 slide_id 并经统一发布（objects/<id>/，不写根）；
-    # convert 条目 P4-a 前无产物 ID 回填（NULL 保持名快照）
+    # P4-app：native 与 convert 条目都预分配 slide_id 并经统一发布
+    # （objects/<id>/，不写根；convert 产物 ID 由 conversion_jobs.slide_id
+    # 回填——P4-c 消费侧已就绪）
     sid_tif = names["slide.tif"]["slide_id"]
-    assert sid_tif
-    assert names["panel.kfb"]["slide_id"] is None
-    assert names["fl.kfbf"]["slide_id"] is None
+    sid_panel = names["panel.kfb"]["slide_id"]
+    sid_fl = names["fl.kfbf"]["slide_id"]
+    assert sid_tif and sid_panel and sid_fl
+    assert len({sid_tif, sid_panel, sid_fl}) == 3
     up = Path(UPLOAD_DIR)
     assert (up / "objects" / sid_tif / "data.tif").is_file()
+    assert (up / "objects" / sid_panel / "data.tif").is_file()
+    assert (up / "objects" / sid_fl / "data.tif").is_file()
     assert not (up / "slide.tif").exists()  # 不写 UPLOAD_DIR 根
-    # convert 产物仍按 canonical 名落根（P4-a 切换前的现状）
-    assert (up / "panel.tif").is_file()
-    assert (up / "fl.ome.tif").is_file()
+    assert not (up / "panel.tif").exists()
+    assert not (up / "fl.ome.tif").exists()
     s = slide_io.open_slide(str(up / "objects" / sid_tif / "data.tif"))
     try:
         assert s.level_count >= 1
     finally:
         s.close()
-    s2 = slide_io.open_slide(str(up / "fl.ome.tif"))
+    s2 = slide_io.open_slide(str(up / "objects" / sid_fl / "data.tif"))
     try:
         assert getattr(s2, "channel_count", 0) == 2
     finally:
         s2.close()
     got = share_store.get_project(proj["pid"])
-    # 项目关联：native 按 slide_id（ID 行无名快照）；convert 过渡期按名
-    #（名关联经 legacy_filename 解析也会落 slide_id 列——双列写入）
-    assert {s for s in got["slides"] if s} == {"panel.tif", "fl.ome.tif"}
+    # 项目关联（P4-app）：native 与 convert 都按 slide_id（convert 产物
+    # job.slide_id 预分配回填——名快照列不再承载关联）
+    got_ids = set(got.get("slide_ids") or [])
+    assert {sid_tif, sid_panel, sid_fl} <= got_ids
     assert sid_tif in (got["slide_ids"] or [])
     assert names["slide.tif"]["project_associate_state"] == "succeeded"
     # 未选中 notes.txt 无转存
@@ -244,7 +248,8 @@ def test_c02_local_upload_native_and_kfb_associate(tmp_path, monkeypatch):
     assert job["state"] == "ready"
     assert job.get("project_associate_state") == "succeeded"
     got = share_store.get_project(proj["pid"])
-    assert "loc.tif" in got["slides"]
+    # P4-app：转换产物按 slide_id 关联（job.slide_id 预分配）
+    assert job["slide_id"] in (got.get("slide_ids") or [])
     kfb2 = build_synthetic_kfb(tmp_path / "gone.kfb", width=400, height=280)
     with open(kfb2, "rb") as fh:
         r3 = c.post("/api/upload", data={
@@ -259,7 +264,9 @@ def test_c02_local_upload_native_and_kfb_associate(tmp_path, monkeypatch):
     job = conversion_store.get_job(job3)
     assert job["state"] == "ready"
     assert job.get("project_associate_state") == "failed"
-    assert (app_mod.UPLOAD_DIR / "gone.tif").is_file()
+    assert (app_mod.UPLOAD_DIR / "objects" / job["slide_id"] /
+            "data.tif").is_file()
+    assert not (app_mod.UPLOAD_DIR / "gone.tif").exists()
 
 
 def io_bytes(data):
@@ -417,11 +424,14 @@ def test_ingest_convert_success_unaffected(tmp_path):
     out = baidu_ingest.ingest_staging(
         owner_user_id=OWNER, original_name="direct.kfb",
         staging_path=str(staging), source_sha256=None, source_size=0)
-    assert out["slide_name"] == "direct.tif"
-    assert out.get("slide_id") is None  # P4-a 前：convert 产物无 ID 回填
+    assert out["slide_name"] == "direct.tif"  # 展示快照
+    assert out.get("slide_id")  # P4-app：convert 产物按 job.slide_id 回填
     assert out["conversion_job_id"]
     assert out["project_associate_state"] == "not_needed"
-    assert (Path(UPLOAD_DIR) / "direct.tif").is_file()
+    # 产物经统一发布落 objects/<sid>/（不再平铺 UPLOAD_DIR 根）
+    up = Path(UPLOAD_DIR)
+    assert (up / "objects" / out["slide_id"] / "data.tif").is_file()
+    assert not (up / "direct.tif").exists()
 
 
 # --------------------------------------------------------------------------- #
@@ -461,13 +471,17 @@ def test_ready_job_reuse_renamed_kfb_no_reprocess(tmp_path):
     up = Path(UPLOAD_DIR)
     first = _ingest(tmp_path, "first.kfb", kfb)
     assert first["slide_name"] == "first.tif"
-    assert (up / "first.kfb").is_file()
-    assert (up / "first.tif").is_file()
+    assert (up / "first.kfb").is_file()  # baidu 源副本（平铺，baidu 侧语义）
+    sid = first["slide_id"]  # P4-app：产物预分配 ID（复用任务随任务复用）
+    assert sid
+    assert (up / "objects" / sid / "data.tif").is_file()
+    assert not (up / "first.tif").exists()
     proj = share_store.create_project(
         "复用关联", owner_user_id=OWNER, requester_role="user")
     second = _ingest(tmp_path, "second.kfb", kfb, project_id=proj["pid"])
     assert second["ingest_token"] == first["ingest_token"]
     assert second["slide_name"] == "first.tif"  # 原 canonical，不改绑
+    assert second["slide_id"] == sid
     assert second["conversion_job_id"] == first["conversion_job_id"]
     assert second["project_associate_state"] == "succeeded"
     assert not (up / "second.kfb").exists()  # 本次复制的源文件已清理
@@ -477,7 +491,8 @@ def test_ready_job_reuse_renamed_kfb_no_reprocess(tmp_path):
     assert "second.kfb" in conversion_store.list_source_names(
         first["conversion_job_id"])
     got = share_store.get_project(proj["pid"])
-    assert got["slides"] == ["first.tif"]  # 原 canonical 入项目
+    # P4-app：项目关联按 slide_id（id_bundle 产物无名快照）
+    assert got.get("slide_ids") == [sid]
 
 
 def test_running_job_reuse_waits_until_ready(tmp_path, monkeypatch):
@@ -610,9 +625,11 @@ def test_batch_same_content_renamed_kfb_succeeds(tmp_path, monkeypatch):
     assert v2["state"] == "succeeded", v2
     item = v2["items"][0]
     assert item["stage"] == "ready", item
-    assert item["slide_name"] == "alpha.tif"  # 原 canonical
+    assert item["slide_name"] == "alpha.tif"  # 原 canonical（展示快照）
+    assert item["slide_id"]  # P4-app：convert 产物按 job.slide_id 回填
     up = Path(UPLOAD_DIR)
-    assert (up / "alpha.tif").is_file()
+    assert (up / "objects" / item["slide_id"] / "data.tif").is_file()
+    assert not (up / "alpha.tif").exists()
     assert not (up / "beta.kfb").exists()  # 副本清理，无孤立文件
     assert not (up / "beta.tif").exists()
     assert _count_jobs() == 1

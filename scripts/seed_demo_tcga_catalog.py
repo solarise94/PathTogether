@@ -2,15 +2,23 @@
 # -*- coding: utf-8 -*-
 """把 Demo 目录换成 4 张已在 UPLOAD_DIR 的 TCGA 公开诊断切片。
 
-幂等：切片已入库则复用 slide_id；已在目录则更新展示名/排序。
-合成切片（synth-*.tiff / uitest-synth.tiff）移出 Demo allowlist，文件保留。
-TCGA DX 切片为 GDC 公开、已脱敏诊断切片，仅用于研究/教学/软件演示。
+P4-app（合同 §6.2）回填式登记：幂等——切片已有**可复用** slides 行
+（既有 legacy 布局 ready 行）则复用其 slide_id；否则 allocate → 复制进
+受管理 staging → ``slide_publish.publish_standalone``（objects/<slide_id>/
+独占包 + ready 收口——不再经 set_slide_meta 按名建行）。已在目录则更新
+展示名/排序。合成切片（synth-*.tiff / uitest-synth.tiff）移出 Demo
+allowlist，文件保留。TCGA DX 切片为 GDC 公开、已脱敏诊断切片，仅用于
+研究/教学/软件演示。
+
+owner 解析：``share_store.get_owner_user_id()``（部署注入的配置 owner）；
+未配置则报错退出（allocate_slide 不允许空 owner 自动认领）。
 
 运行（平台容器内，需 STORAGE_BACKEND=postgres）：
 
     python3 scripts/seed_demo_tcga_catalog.py
 """
 from pathlib import Path
+import hashlib
 import os
 import sys
 
@@ -20,8 +28,12 @@ sys.path.insert(0, str(_ROOT))
 
 import demo_store  # noqa: E402
 import share_store  # noqa: E402
+import slide_publish  # noqa: E402
+import slide_storage  # noqa: E402
+import slide_store  # noqa: E402
 
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR") or (Path.home() / "svs-viewer" / "uploads"))
+STAGING_TASK = "seed-demo-tcga"
 
 # filename, display_name(zh), description(zh), display_name(en), description(en),
 # sort_order, is_default
@@ -76,16 +88,74 @@ REMOVE_FROM_CATALOG = (
 )
 
 
+def _sha256_file(path: Path, chunk=1 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for buf in iter(lambda: fh.read(chunk), b""):
+            h.update(buf)
+    return h.hexdigest()
+
+
+def register_slide(name: str, owner_user_id: str):
+    """回填式登记单张切片（P4-app 合同 §6.2）。
+
+    - 已有可复用行（legacy_filename 命中且 asset_state='ready'——既有 demo
+      环境的 legacy 布局资产）→ 复用其 slide_id（幂等，不重复建资产）；
+    - 否则 allocate → 复制进 ``.staging/seed-demo-tcga/<n>/`` →
+      publish_standalone（objects/<slide_id>/ 独占包；源平铺文件保留——
+      P6 历史资产物理迁移统一搬运，不在种子脚本删源）。
+    """
+    existing = slide_store.resolve_legacy_alias(name)
+    if existing is not None and existing.asset_state == "ready":
+        return existing.slide_id, "reused"
+    src = UPLOAD_DIR / name
+    ext = name.rsplit(".", 1)[-1].lower()
+    staging_dir = slide_storage.staging_dir(
+        STAGING_TASK, "item-%s" % hashlib.sha256(
+            name.encode("utf-8")).hexdigest()[:8], root=UPLOAD_DIR)
+    staged = staging_dir / ("data." + ext)
+    import shutil
+    try:
+        staging_dir.mkdir(parents=True, exist_ok=False)
+        shutil.copyfile(src, staged)
+        size = staged.stat().st_size
+        sha = _sha256_file(staged)
+        import psycopg.rows
+        import pg_store
+        conn = pg_store.connect()
+        conn.row_factory = psycopg.rows.dict_row
+        try:
+            with pg_store.transaction(conn):
+                desc = slide_store.allocate_slide(
+                    owner_user_id, original_filename=name, format_ext=ext,
+                    conn=conn)
+        finally:
+            conn.close()
+        manifest = slide_publish.build_manifest(
+            "data." + ext, size, sha)
+        slide_publish.publish_standalone(
+            desc.slide_id, manifest, staging_dir, sha256=sha,
+            accounted_bytes=size, upload_root=UPLOAD_DIR)
+        slide_storage.remove_staging_tree(STAGING_TASK, root=UPLOAD_DIR)
+    except Exception:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+    return desc.slide_id, "published"
+
+
 def main():
     missing = [name for name, *_ in TCGA_SLIDES if not (UPLOAD_DIR / name).is_file()]
     if missing:
         raise SystemExit("UPLOAD_DIR 缺少切片：\n  " + "\n  ".join(missing))
 
+    owner = (share_store.get_owner_user_id() or "").strip()
+    if not owner:
+        raise SystemExit(
+            "未配置部署 owner（share_store.get_owner_user_id 为空）——"
+            "allocate_slide 不允许空 owner 自动认领")
+
     for name, display, desc, display_en, desc_en, order, is_default in TCGA_SLIDES:
-        share_store.set_slide_meta(name)
-        slide_id = share_store.get_slide_id(name)
-        if not slide_id:
-            raise SystemExit("无法解析 slide_id：%s" % name)
+        slide_id, how = register_slide(name, owner)
         demo_store.catalog_add(
             slide_id,
             display_name=display,
@@ -97,7 +167,8 @@ def main():
         )
         if is_default:
             demo_store.catalog_set_default(slide_id)
-        print("catalog+ %s  %s  default=%s" % (slide_id, name, is_default))
+        print("catalog+ %s  %s  default=%s  (%s)" % (
+            slide_id, name, is_default, how))
 
     for name in REMOVE_FROM_CATALOG:
         slide_id = share_store.get_slide_id(name)

@@ -745,7 +745,9 @@ def test_research_viewing_session_dual_field():
 
 
 def test_conversions_get_carries_slide_id():
-    """缺口⑤：GET /api/conversions/<job_id> ready 任务的响应带 slide_id。"""
+    """缺口⑤（P4-app 断言换新）：GET /api/conversions/<job_id> 响应带
+    slide_id——**从任务绑定读**（create_job 即预分配；不按 canonical 名
+    resolve——新产物是独立 id_bundle 资产，无 legacy_filename）。"""
     owner, _a, _b = _setup_users()
     c = _client()
     _login(c, "owner@x.com", "ownerpass123456")
@@ -756,10 +758,11 @@ def test_conversions_get_carries_slide_id():
         owner_user_id=owner["user_id"], upload_id=None, source_name=name,
         source_sha256="0" * 64, source_format="kfb",
         canonical_name="conv-src.tif.tif")
-    # 直接置 ready 并注册 canonical 行（模拟转换完成）
-    canon = _touch_tiff("conv-src.tif.tif")
-    canon_sid = _register(canon, owner["user_id"])
+    assert job["slide_id"]  # create_job 即预分配产物资产
+    # 直接置 ready（模拟转换完成的收口态）
+    _sql("UPDATE slides SET asset_state='ready', published_at=now(), "
+         "accounted_bytes=1 WHERE slide_id=%s", (job["slide_id"],))
     _sql("UPDATE conversion_jobs SET state='ready' WHERE id=%s", (job["id"],))
     r = c.get("/api/conversions/%s" % job["id"])
     assert r.status_code == 200, r.get_data(as_text=True)
-    assert r.get_json().get("slide_id") == canon_sid
+    assert r.get_json().get("slide_id") == job["slide_id"]

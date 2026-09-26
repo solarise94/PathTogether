@@ -526,3 +526,227 @@ def staging_absent(task_ref, generation, *, upload_root=None) -> bool:
     """发布源 staging 目录不存在（恢复路径判定「全未发布」的证据之一）。"""
     return not slide_storage.staging_dir(
         task_ref, generation, root=upload_root).exists()
+
+
+# --------------------------------------------------------------------------- #
+# 批量任务（V1 ZIP，P4-app 合同 §2）与无任务发布（CLI/种子，§6）的入口
+# --------------------------------------------------------------------------- #
+def _fs_publish_phase(slide_id, manifest, *, upload_root=None):
+    """六步中第 3 步的 FS 部分（单资产；批量/standalone 与通道编排共用）。
+
+    返回 (descriptor, bundle_already)：
+      - 资产 ready 且目标包逐文件吻合 → (desc, True)（崩溃恢复幂等分支，
+        调用方只做 DB 收口）；
+      - staging：目标已存在且吻合 → (desc, True)；否则 staging 目录整体
+        no-clobber 发布（publish_bundle_no_clobber——同卷原子 rename，
+        跨卷私有暂存+完整复制校验）→ (desc, False)；
+      - 其余状态/不吻合 → PublishError / PublishConflict（fail-closed 不删
+        不猜）。
+    """
+    desc = slide_store.resolve_slide_id(slide_id)
+    if desc is None:
+        raise PublishError("asset_missing", "资产行不存在：%s" % slide_id,
+                           deterministic=True)
+    if desc.storage_layout != slide_store.StorageLayout.ID_BUNDLE:
+        raise PublishError("asset_layout_invalid",
+                           "非 id_bundle 资产不走统一发布（layout=%r）"
+                           % desc.storage_layout, deterministic=True)
+    if desc.asset_state == slide_store.SlideState.READY:
+        if not slide_storage.verify_bundle(slide_id, manifest,
+                                           root=upload_root):
+            raise PublishConflict(
+                "目标包已存在但 manifest/sha 不吻合（slide_id=%s）——"
+                "不变量破坏，fail-closed 不删不猜" % slide_id)
+        return desc, True
+    if desc.asset_state != slide_store.SlideState.STAGING:
+        raise PublishError(
+            "asset_state_invalid",
+            "资产不在 staging/ready（state=%r）——不能发布" % desc.asset_state,
+            deterministic=True)
+    if slide_storage.bundle_dir(slide_id, root=upload_root).exists():
+        if not slide_storage.verify_bundle(slide_id, manifest,
+                                           root=upload_root):
+            raise PublishConflict(
+                "目标包已存在且 manifest/sha 不吻合（slide_id=%s）——"
+                "fail-closed 不删不猜" % slide_id)
+        return desc, True
+    return desc, False
+
+
+def _cas_ready_locked(cur, slide_id, accounted_bytes, *, expected_check=True):
+    """锁内 slides CAS（staging→ready + accounted_bytes；幂等分支见下）。
+
+    幂等：CAS rowcount=0 时重读——已是**同参** ready（并发重入已收口的那
+    一支）返回 False（already）；其余 fail-closed（asset_state_conflict）。
+    锁序：本调用前调用方已取 advisory 第一把锁 + 任务行锁。
+    """
+    cur.execute(
+        "UPDATE slides SET asset_state=%s, published_at=now(), "
+        "accounted_bytes=%s, updated_at=now() "
+        "WHERE slide_id=%s AND asset_state=%s",
+        (slide_store.SlideState.READY, int(accounted_bytes), slide_id,
+         slide_store.SlideState.STAGING))
+    if cur.rowcount == 1:
+        return True
+    if not expected_check:
+        raise PublishError(
+            "asset_state_conflict", "资产不在 staging（slide_id=%s）"
+            % slide_id, deterministic=True)
+    cur.execute("SELECT asset_state, accounted_bytes FROM slides "
+                "WHERE slide_id=%s", (slide_id,))
+    srow = cur.fetchone()
+    if (srow
+            and srow["asset_state"] == slide_store.SlideState.READY
+            and srow["accounted_bytes"] is not None
+            and int(srow["accounted_bytes"]) == int(accounted_bytes)):
+        return False  # 已同参收口（幂等重入）
+    raise PublishError(
+        "asset_state_conflict",
+        "资产不在 staging 且非同参 ready（state=%r accounted=%r）——不猜"
+        % (srow and srow["asset_state"], srow and srow["accounted_bytes"]),
+        deterministic=True)
+
+
+def publish_batch_item(task_ref, generation, slide_id, manifest, *,
+                       sha256, accounted_bytes, commit_token,
+                       owner_user_id=None, upload_root=None):
+    """批量任务（V1 ZIP）的**单逻辑切片**发布（P4-app 合同 §2.4）。
+
+    与 ``publish_with_channel`` 的差异（合同裁决：批量任务的 quota 一次性
+    结算在任务 finish_commit——settle_bytes=全部已发布 item 字节合计）：
+      - 无 per-task intent/settle：任务行只做锁内重验（committing + token
+        未变——cancel 对 committing 拒绝，代次由 commit_token 把守）；
+      - 本函数完成 item 的 FS 发布 + [advisory 第一把锁 → 任务行 FOR UPDATE
+        重验 → 预约续租（**不 consume**）→ slides CAS staging→ready +
+        accounted_bytes + 内容 revision] 同一短事务——逐 item 的
+        accounted_bytes 在其 publish 事务写入（R-12 删除结算用）；
+      - item 的 slide_id 绑定源是 upload_task_items（(task_id,item_key) 行，
+        重试/恢复按 item_key 复用，绝不重新分配——R-13）。
+
+    staging 源目录 = ``slide_storage.staging_dir(task_ref, generation)``
+    （ZIP 的 item 编号即 generation；发布整体 rename 走人，完整包原子可见
+    ——入口与伴侣同包，绝不入口先可读伴侣后到）。
+
+    幂等：item 已 ready 且 manifest 吻合 → 只走 DB 幂等分支，返回
+    (accounted_bytes, already=True)。异常语义与 publish_with_channel 一致
+    （PublishError/PublishConflict/ReservationInvalid）。
+    """
+    manifest = slide_storage.validate_manifest(manifest)
+    accounted_bytes = int(accounted_bytes)
+    if accounted_bytes <= 0:
+        raise PublishConflict("item accounted_bytes 非法（%r）"
+                              % accounted_bytes)
+    _desc, bundle_already = _fs_publish_phase(
+        slide_id, manifest, upload_root=upload_root)
+    if not bundle_already:
+        staging = slide_storage.staging_dir(task_ref, generation,
+                                            root=upload_root)
+        try:
+            slide_storage.publish_bundle_no_clobber(
+                staging, slide_id, manifest, root=upload_root)
+        except FileExistsError:
+            if not slide_storage.verify_bundle(slide_id, manifest,
+                                               root=upload_root):
+                raise PublishConflict(
+                    "目标包已存在且不吻合（slide_id=%s）——fail-closed"
+                    % slide_id) from None
+        except ValueError as e:
+            raise PublishError("staging_invalid", str(e),
+                               deterministic=True) from e
+        except OSError as e:
+            raise PublishError("staging_io_error", "发布 IO 故障：%s" % e,
+                               deterministic=False) from e
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn):
+            with conn.cursor() as cur:
+                slide_store.acquire_slide_lock(cur, slide_id)  # 第一把锁
+                cur.execute(
+                    "SELECT %s FROM upload_tasks WHERE upload_id = %%s "
+                    "FOR UPDATE" % upload_task_store._PG_COLS, (task_ref,))
+                row = cur.fetchone()
+                if row is None:
+                    raise PublishError("task_not_found",
+                                       "任务不存在：%s" % task_ref,
+                                       deterministic=True)
+                task = upload_task_store._norm_row(row)
+                if (task.get("state") != upload_task_store.STATE_COMMITTING
+                        or task.get("commit_token") != commit_token):
+                    # 批量任务无 per-item intent；已 committed 的幂等收口
+                    # 由 CAS 幂等分支吸收，其余（取消/回滚/代次漂移）拒绝。
+                    if task.get("state") != upload_task_store.STATE_COMMITTED:
+                        raise PublishError(
+                            "generation_mismatch",
+                            "批量任务代次失效（state=%r token 匹配=%s）"
+                            % (task.get("state"),
+                               task.get("commit_token") == commit_token),
+                            deterministic=True, task=task)
+                if owner_user_id is not None \
+                        and (owner_user_id or "").strip() != \
+                        (task.get("owner_user_id") or "").strip():
+                    raise PublishError(
+                        "owner_mismatch",
+                        "任务归属与发布发起者不一致（拒绝，不自动修正）",
+                        deterministic=True, task=task)
+                rid = task.get("reservation_id")
+                if rid:
+                    out = upload_guard.renew_reservation_locked(cur, rid)
+                    if not upload_guard.reservation_is_active(out):
+                        raise upload_guard.ReservationInvalid(
+                            "预占已失效，不能发布：%r" % rid)
+                settled = _cas_ready_locked(cur, slide_id, accounted_bytes)
+                if settled:
+                    slide_store.record_revision(
+                        slide_id, "sha256:%s" % str(sha256).lower()[:16],
+                        conn=conn)
+        return accounted_bytes, (not settled)
+    finally:
+        conn.close()
+
+
+def publish_standalone(slide_id, manifest, staging, *, sha256,
+                       accounted_bytes, upload_root=None):
+    """无任务发布（CLI 导入/种子登记，P4-app 合同 §6；离线受管理通道）。
+
+    预分配资产（allocate_slide）+ staging 包就位后由本入口收口：
+    FS 发布（``publish_bundle_no_clobber``，staging 整体 rename 走人）+
+    [advisory 第一把锁 → slides CAS staging→ready + accounted_bytes +
+    内容 revision] 同一短事务。**不走任务状态机、不结算配额**（离线管理
+    员通道现状语义——HTTP 上传的 quota 只在请求路径）；幂等：已同参
+    ready → (accounted_bytes, True)。
+    """
+    manifest = slide_storage.validate_manifest(manifest)
+    accounted_bytes = int(accounted_bytes)
+    if accounted_bytes <= 0:
+        raise PublishConflict("accounted_bytes 非法（%r）" % accounted_bytes)
+    _desc, bundle_already = _fs_publish_phase(
+        slide_id, manifest, upload_root=upload_root)
+    if not bundle_already:
+        try:
+            slide_storage.publish_bundle_no_clobber(
+                staging, slide_id, manifest, root=upload_root)
+        except FileExistsError:
+            if not slide_storage.verify_bundle(slide_id, manifest,
+                                               root=upload_root):
+                raise PublishConflict(
+                    "目标包已存在且不吻合（slide_id=%s）——fail-closed"
+                    % slide_id) from None
+        except ValueError as e:
+            raise PublishError("staging_invalid", str(e),
+                               deterministic=True) from e
+        except OSError as e:
+            raise PublishError("staging_io_error", "发布 IO 故障：%s" % e,
+                               deterministic=False) from e
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn):
+            with conn.cursor() as cur:
+                slide_store.acquire_slide_lock(cur, slide_id)  # 第一把锁
+                settled = _cas_ready_locked(cur, slide_id, accounted_bytes)
+                if settled:
+                    slide_store.record_revision(
+                        slide_id, "sha256:%s" % str(sha256).lower()[:16],
+                        conn=conn)
+        return accounted_bytes, (not settled)
+    finally:
+        conn.close()

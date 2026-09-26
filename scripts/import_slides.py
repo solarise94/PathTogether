@@ -1,8 +1,14 @@
 # -*- coding: utf-8 -*-
 """管理员离线导入切片（Upload V2 方案 U4）。
 
-把经 rsync/SFTP 落到暂存目录的单文件 WSI 校验后原子提升进 UPLOAD_DIR，
-并写入 slide_meta 归属。不走 HTTP，不经过 CSRF / 分片协议。
+把经 rsync/SFTP 落到暂存目录的单文件 WSI 校验后**复制进受管理 staging**
+再统一发布（P4-app 合同 §6.1）：allocate_slide（staging/id_bundle 资产行）
+→ 复制到 ``.staging/import-<ts>/<n>/``（绝不与外部可写源共享 inode——禁止
+硬链接）→ ``slide_publish.publish_standalone``（objects/<slide_id>/ 独占包
++ ready 收口）。不走 HTTP，不经过 CSRF / 分片协议。
+
+``--move`` 在发布成功后删除暂存源文件；无 --move 时源保留。归属 ``--owner``
+参数语义不变（空 → 部署 owner，与免认证归一一致）。
 
 ZIP / MRXS 伴侣包不在本通道（请走 ``POST /api/upload``）。
 
@@ -18,8 +24,11 @@ ZIP / MRXS 伴侣包不在本通道（请走 ``POST /api/upload``）。
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import secrets
 import sys
+import time
 from pathlib import Path
 
 # 仓库根进 path，便于 ``python scripts/import_slides.py``
@@ -51,7 +60,12 @@ def iter_candidates(src: Path):
 
 
 def resolve_owner(owner_user_id=None, owner_login_id=None):
-    """解析归属。都空 → 部署 owner（空 user_id + role=owner，与免认证归一一致）。"""
+    """解析归属。都空 → 部署 owner（空 user_id + role=owner，与免认证归一一致）。
+
+    P4-app：发布经 slide_store.allocate_slide 需要非空 owner——空参回落
+    ``share_store.get_owner_user_id()``（部署注入的配置 owner）；仍未配置
+    则报错（不允许空 owner 自动认领）。"""
+    import share_store
     import user_store
 
     if owner_user_id and owner_login_id:
@@ -70,15 +84,35 @@ def resolve_owner(owner_user_id=None, owner_login_id=None):
         if user.get("disabled"):
             raise ValueError("用户已禁用：%s" % owner_login_id)
         return user["user_id"], user.get("role") or user_store.ROLE_USER
-    return "", "owner"
+    configured = (share_store.get_owner_user_id() or "").strip()
+    if not configured:
+        raise ValueError(
+            "无法解析归属 owner（--owner-user-id / --owner-login-id 均未提供"
+            "且部署未注入配置 owner）")
+    return configured, user_store.ROLE_OWNER
+
+
+def _sha256_file(path: Path, chunk=1 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for buf in iter(lambda: fh.read(chunk), b""):
+            h.update(buf)
+    return h.hexdigest()
 
 
 def import_one(src: Path, upload_dir: Path, owner_user_id, requester_role,
-               *, dry_run=False, move=False):
-    """校验并提升单个文件。成功返回 dest Path；跳过/失败 raise ValueError。"""
-    import app as app_mod
-    import share_store
+               *, staging_task=None, item_seq=0, dry_run=False, move=False):
+    """校验并发布单个文件（P4-app：复制进受管理 staging → 统一发布）。
+
+    成功返回 (dest slide_id, objects 目录)；跳过/失败 raise ValueError。
+    绝不与外部可写源共享 inode（复制，不硬链接）；``--move`` 在发布成功后
+    删除源。
+    """
+    import slide_publish
+    import slide_storage
+    import slide_store
     import upload_guard
+    import app as app_mod
 
     name = src.name
     safe = app_mod._sanitize_name(name)
@@ -90,19 +124,13 @@ def import_one(src: Path, upload_dir: Path, owner_user_id, requester_role,
     if ext not in app_mod.SUPPORTED_EXTS:
         raise ValueError("不支持的扩展名 .%s：%s" % (ext, name))
 
-    dest = upload_dir / safe
-    if dest.exists():
-        raise ValueError("名称不可用（目标已存在）：%s" % safe)
-
     if dry_run:
-        return dest
+        return None, None
 
     upload_guard.check_disk_watermark(upload_dir)
 
-    # 先在原地校验（不复制）；通过后再 link。跨设备则 copy+validate 后再 replace。
-    # A0 异常契约：_validate_slide_file 失败抛 SlideValidationError（稳定机器码）；
-    # 传净化后的原始 basename 作 format_hint（src 若是 .part 之类的临时名也不
-    # 影响判定）。为兼容 run() 的 ValueError 汇总通道，转成带机器码的 ValueError。
+    # 先在源上只读校验（A0 异常契约：_validate_slide_file 失败抛
+    # SlideValidationError；传净化后的原始 basename 作 format_hint）。
     import slide_io
 
     try:
@@ -111,29 +139,49 @@ def import_one(src: Path, upload_dir: Path, owner_user_id, requester_role,
         raise ValueError(
             "无效的切片文件（code=%s）：%s" % (e.code, name)) from e
 
+    task_key = staging_task or ("import-%d-%s"
+                                % (int(time.time()), secrets.token_hex(4)))
+    gen = "item-%d" % int(item_seq)
+    staging_dir = slide_storage.staging_dir(task_key, gen, root=upload_dir)
+    entry = "data." + ext
+    staged = staging_dir / entry
     try:
-        app_mod._promote_no_clobber(src, dest)
-    except FileExistsError:
-        raise ValueError("名称不可用（目标已存在）：%s" % safe)
-    except OSError as e:
-        raise ValueError("导入提升失败：%s" % e)
-
-    try:
-        share_store.set_slide_meta(
-            safe,
-            owner_user_id=owner_user_id or None,
-            requester_role=requester_role,
-        )
+        staging_dir.mkdir(parents=True, exist_ok=False)
+        # 复制（不硬链接——外部可写源不得与本资产共享 inode，计划 §2.2）
+        with open(src, "rb") as fh_in, open(staged, "wb") as fh_out:
+            for buf in iter(lambda: fh_in.read(1 << 20), b""):
+                fh_out.write(buf)
+        size = staged.stat().st_size
+        sha = _sha256_file(staged)
+        # 同一事务：allocate_slide（staging/id_bundle 行）
+        import psycopg.rows
+        import pg_store
+        conn = pg_store.connect()
+        conn.row_factory = psycopg.rows.dict_row
+        try:
+            with pg_store.transaction(conn):
+                desc = slide_store.allocate_slide(
+                    owner_user_id, original_filename=safe, format_ext=ext,
+                    conn=conn)
+        finally:
+            conn.close()
+        manifest = slide_publish.build_manifest(entry, size, sha)
+        slide_publish.publish_standalone(
+            desc.slide_id, manifest, staging_dir, sha256=sha,
+            accounted_bytes=size, upload_root=upload_dir)
+        # 发布 rename 已移走 item 目录；清空任务 staging 残壳（空目录树）
+        slide_storage.remove_staging_tree(task_key, root=upload_dir)
     except Exception:
-        dest.unlink(missing_ok=True)
+        import shutil
+        shutil.rmtree(staging_dir, ignore_errors=True)
         raise
-
-    if move and src.resolve() != dest.resolve():
+    bundle_dir = slide_storage.bundle_dir(desc.slide_id, root=upload_dir)
+    if move and src.resolve() != bundle_dir.resolve():
         try:
             src.unlink()
         except OSError as e:
             _info("已导入 %s，但删除源文件失败：%s" % (safe, e))
-    return dest
+    return desc.slide_id, bundle_dir
 
 
 def run(src, upload_dir=None, owner_user_id=None, owner_login_id=None,
@@ -142,12 +190,18 @@ def run(src, upload_dir=None, owner_user_id=None, owner_login_id=None,
     upload_dir = Path(upload_dir or os.environ.get("UPLOAD_DIR") or "/data/uploads")
     owner_uid, role = resolve_owner(owner_user_id, owner_login_id)
     results = {"ok": [], "failed": []}
-    for path in iter_candidates(src):
+    staging_task = "import-%d-%s" % (int(time.time()), secrets.token_hex(4))
+    for seq, path in enumerate(iter_candidates(src), 1):
         try:
-            dest = import_one(path, upload_dir, owner_uid, role,
-                              dry_run=dry_run, move=move)
-            results["ok"].append(str(dest.name))
-            _info("%s%s → %s" % ("dry-run " if dry_run else "", path.name, dest.name))
+            slide_id, bundle_dir = import_one(
+                path, upload_dir, owner_uid, role,
+                staging_task=staging_task, item_seq=seq,
+                dry_run=dry_run, move=move)
+            target = str(bundle_dir) if bundle_dir else "(dry-run)"
+            results["ok"].append(str(path.name))
+            _info("%s%s → %s" % ("dry-run " if dry_run else "",
+                                 path.name,
+                                 slide_id or target))
         except ValueError as e:
             results["failed"].append({"file": path.name, "error": str(e)})
             _err(str(e))
@@ -162,7 +216,7 @@ def main(argv=None):
     p.add_argument("--owner-login-id", default=None)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--move", action="store_true",
-                   help="成功后删除暂存源文件（同文件系统下 link+unlink）")
+                   help="发布成功后删除暂存源文件（复制+发布完成后删源）")
     args = p.parse_args(argv)
     try:
         results = run(

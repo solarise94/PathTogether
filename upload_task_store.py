@@ -805,3 +805,66 @@ def expire_task(upload_id):
     if task is None:
         raise TaskNotFound("上传任务不存在：%r" % upload_id)
     return task
+
+
+# --------------------------------------------------------------------------- #
+# upload_task_items（0067 批量任务绑定；P4-app V1 ZIP 接线）
+# --------------------------------------------------------------------------- #
+def bind_upload_task_item(conn, task_id, item_key, slide_id):
+    """绑定批量任务的逻辑切片 → 预分配 slide_id（调用方事务内）。
+
+    幂等（R-13）：(task_id, item_key) 已有行 → 返回**既有行**的 slide_id
+    （重试/恢复复用，绝不重新分配）；slide_id 全局 UNIQUE（一个资产只属
+    一个任务项）兜底并发误绑。必须与 allocate_slide 同一事务（调用方保证）
+    ——崩溃只见完整旧/新版。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO upload_task_items (task_id, item_key, slide_id) "
+            "VALUES (%s,%s,%s) "
+            "ON CONFLICT (task_id, item_key) DO NOTHING "
+            "RETURNING item_key, slide_id",
+            (str(task_id), str(item_key), str(slide_id)))
+        row = cur.fetchone()
+        if row is not None:
+            return {"item_key": row["item_key"], "slide_id": row["slide_id"]}
+        cur.execute(
+            "SELECT item_key, slide_id FROM upload_task_items "
+            "WHERE task_id=%s AND item_key=%s", (str(task_id), str(item_key)))
+        row = cur.fetchone()
+        if row is None:
+            raise UploadTaskError("upload_task_items 绑定失败：%r/%r"
+                                  % (task_id, item_key))
+        return {"item_key": row["item_key"], "slide_id": row["slide_id"]}
+
+
+def list_upload_task_items(task_id):
+    """批量任务的 item 绑定列表（item_key 升序；不加锁读）。无行返回 []。"""
+    conn = _pg_connect()
+    try:
+        with pg_store.transaction(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT item_key, slide_id FROM upload_task_items "
+                    "WHERE task_id=%s ORDER BY item_key", (str(task_id),))
+                return [{"item_key": r["item_key"], "slide_id": r["slide_id"]}
+                        for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_upload_task_item(task_id, item_key):
+    """单 item 绑定（无行返回 None）。"""
+    conn = _pg_connect()
+    try:
+        with pg_store.transaction(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT item_key, slide_id FROM upload_task_items "
+                    "WHERE task_id=%s AND item_key=%s",
+                    (str(task_id), str(item_key)))
+                r = cur.fetchone()
+                return ({"item_key": r["item_key"], "slide_id": r["slide_id"]}
+                        if r is not None else None)
+    finally:
+        conn.close()

@@ -286,6 +286,12 @@ def _needs_conversion(safe_name):
 
 
 def _canonical_name_for(source_safe):
+    """产物名**展示快照**推导（stem + canonical 扩展名）。
+
+    P4-app（合同 §3.1）：canonical 名唯一锁拆除（0069）后本函数只服务
+    canonical_name/original_filename 的展示快照——不再参与路径构造、目标
+    冲突或名占用判定（同名产物=独立资产，各得各 slide_id）。
+    """
     info = slide_format_registry.lookup(source_safe)
     stem = source_safe.rsplit(".", 1)[0]
     ext = info.get("canonical_ext") or ".tif"
@@ -332,131 +338,204 @@ def _probe_kfb_or_fail(path):
         doc.close()
 
 
-def _upload_name_conflict(safe):
-    """源名、canonical 名、进行中转换任务任一占用则冲突。"""
-    if (UPLOAD_DIR / safe).exists():
-        return True
-    if conversion_store.canonical_is_live(safe):
-        return True
-    if _needs_conversion(safe):
-        canon = _canonical_name_for(safe)
-        if (UPLOAD_DIR / canon).exists():
-            return True
-        if conversion_store.canonical_is_live(canon):
-            return True
-    return False
-
-
 def _enqueue_conversion(ident, *, source_name, source_sha256, upload_id,
-                        source_format, target_project_id=None):
+                        source_format, target_project_id=None,
+                        staged_source=None):
+    """创建（或幂等复用）转换任务——create_job 即预分配产物 slide_id
+    （P4-app 合同 §3.1：产物 owner=源 owner，空 owner 回落配置 owner；
+    同 owner+sha+converter 复用既有任务**及其 slide_id**）。
+
+    同名源/产物不冲突（独立 ID）；canonical 名占用检查拆除（0069）。
+    ``staged_source``：上传侧暂存的源副本路径——非空且任务未 ready 时搬入
+    任务 staging（``.staging/<job_id>/source/``，worker 源解析的优先级 2；
+    ready 复用则副本用不上，直接清理）。"""
     canonical = _canonical_name_for(source_name)
-    product = (UPLOAD_DIR / canonical).is_file()
-    if product and not conversion_store.canonical_is_live(canonical):
-        # 目录里已有同名 TIFF，且不是本转换任务占用
-        raise FileExistsError(canonical)
-    try:
-        job = conversion_store.create_job(
-            owner_user_id=(ident or {}).get("user_id") or "",
-            upload_id=upload_id,
-            source_name=source_name,
-            source_sha256=source_sha256,
-            source_format=source_format,
-            canonical_name=canonical,
-            product_exists=product,
-            target_project_id=target_project_id)
-    except conversion_store.NameConflict as e:
-        raise FileExistsError(canonical) from e
+    job = conversion_store.create_job(
+        owner_user_id=(ident or {}).get("user_id") or "",
+        upload_id=upload_id,
+        source_name=source_name,
+        source_sha256=source_sha256,
+        source_format=source_format,
+        canonical_name=canonical,
+        target_project_id=target_project_id)
+    if staged_source:
+        if job.get("state") == "ready":
+            try:
+                Path(staged_source).unlink(missing_ok=True)
+            except OSError:
+                pass
+        else:
+            import conversion_worker
+            _ext = source_name.rsplit(".", 1)[-1].lower() \
+                if "." in source_name else "kfb"
+            conversion_worker.stage_source_copy(
+                job["id"], staged_source, UPLOAD_DIR, ext=_ext)
     return job, canonical
 
 
-def _owned_committed_upload(ident, safe_name):
-    """当前身份下、该 safe_name 最近一条 committed 上传任务。"""
-    owner = (ident or {}).get("user_id") or ""
-    try:
-        tasks = upload_task_store.list_tasks(
-            owner_user_id=owner, state=upload_task_store.STATE_COMMITTED)
-    except Exception:
-        return None
-    for task in reversed(tasks):
-        if task.get("safe_name") == safe_name:
-            return task
-    return None
-
-
 def _ensure_conversion_job(ident, *, source_name, source_sha256, upload_id,
-                           source_format=None, target_project_id=None):
-    """committed 源文件上幂等补建/复用转换任务（崩溃、500、重放）。
+                           source_format=None, target_project_id=None,
+                           staged_source=None):
+    """已受理源上幂等补建/复用转换任务（崩溃、500、重放）。
 
-    磁盘上的源必须仍是本 upload_id 当时结算的摘要；同名被他人覆盖后，
-    旧 commit 不得认领新资产。
+    P4-app：源副本归任务 staging（或升级窗口的 UPLOAD_DIR 平铺源，worker
+    按 source_name alias 过渡读取）——「磁盘同名文件归属」校验拆除，不再
+    以文件名认领资产；幂等键 = (owner, source_sha256, converter)。
     """
-    expected_sha = (source_sha256 or "").lower()
     ident_owner = (ident or {}).get("user_id") or ""
     job = conversion_store.get_job_by_upload_id(upload_id)
-    src = UPLOAD_DIR / source_name
-    if job and job.get("state") == "ready":
-        canon = job.get("canonical_name") or _canonical_name_for(source_name)
-        if (UPLOAD_DIR / canon).is_file():
-            return job, canon
-    if not src.is_file():
-        if job:
-            return job, job.get("canonical_name") or _canonical_name_for(source_name)
-        raise FileNotFoundError(source_name)
-    disk_sha = _sha256_file(src)
-    if expected_sha and disk_sha != expected_sha:
-        raise FileExistsError(source_name)
-    if job:
-        job_sha = (job.get("source_sha256") or "").lower()
-        if job_sha and job_sha != disk_sha:
-            raise FileExistsError(source_name)
+    if job is not None:
         job_owner = job.get("owner_user_id") or ""
         if job_owner and ident_owner and job_owner != ident_owner:
             raise FileExistsError(source_name)
-        job_up = job.get("upload_id") or ""
-        if job_up and upload_id and job_up != upload_id:
-            raise FileExistsError(source_name)
+        if staged_source:
+            if job.get("state") == "ready":
+                try:
+                    Path(staged_source).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            else:
+                import conversion_worker
+                _ext = source_name.rsplit(".", 1)[-1].lower() \
+                    if "." in source_name else "kfb"
+                conversion_worker.stage_source_copy(
+                    job["id"], staged_source, UPLOAD_DIR, ext=_ext)
+        return job, job.get("canonical_name")
     if not source_format:
-        source_format = _probe_kfb_or_fail(src)["format"]
+        probe_path = staged_source or (UPLOAD_DIR / source_name)
+        source_format = _probe_kfb_or_fail(probe_path)["format"]
     return _enqueue_conversion(
-        ident, source_name=source_name, source_sha256=disk_sha,
+        ident, source_name=source_name, source_sha256=source_sha256,
         upload_id=upload_id, source_format=source_format,
-        target_project_id=target_project_id)
+        target_project_id=target_project_id, staged_source=staged_source)
 
 
 def _conversion_accepted_body(job):
     view = conversion_store.public_view(job)
     view["status"] = "conversion_pending"
-    # slide ID 化（P2 合同 §5.2）：转换 ready 后的打开目标按 ID（canonical
-    # 名 → slides 行）；未 ready/行未注册时为 None（前端继续轮询）
-    canon = job.get("canonical_name") or ""
-    view["slide_id"] = (share_store.get_slide_id(canon) or None) if canon else None
+    # P4-app（合同 §3.6）：产物 slide_id 从**任务绑定**读（create_job 即
+    # 分配，ready 前后都在）——不再按 canonical 名 resolve（id_bundle 产物
+    # 无 legacy_filename，按名 resolve 对新资产恒 None，P2 补丁已知缺口）。
+    view["slide_id"] = (job.get("slide_id") or None) if job else None
     return view
 
 
-def _cleanup_conversion_sidecars(canonical_name):
-    """删除 canonical 时一并清源 KFB（含去重别名）、manifest、associated，并作废转换任务。"""
-    job = conversion_store.get_job_by_canonical(canonical_name)
-    source_names = []
-    if job:
-        source_names.append(job.get("source_name"))
-        try:
-            source_names.extend(conversion_store.list_source_names(job["id"]))
-        except Exception:
-            app.logger.warning("列举 conversion 源别名失败：%s", canonical_name,
-                               exc_info=True)
-    for name in {n for n in source_names if n}:
-        if _needs_conversion(name):
-            (UPLOAD_DIR / name).unlink(missing_ok=True)
+def _cleanup_conversion_sidecars(slide_id, canonical_name=None):
+    """删除转换产物时的连带清理（P4-app 合同 §3.5：按 slide_id 作废任务——
+    canonical 名占用语义退役；``legacy_canonical`` 仅匹配升级窗口的
+    slide_id IS NULL 旧行）。
+
+    连带源删除语义保持现状（源副本归任务 staging + 旧平铺源/别名 KFB；
+    源是否独立资产由 P5 删除编排裁决）。legacy 平铺产物的
+    ``.manifest.json``/``.associated`` sidecar 一并清理（升级窗口）。
+    """
+    source_names = set()
     try:
-        conversion_store.invalidate_by_canonical(canonical_name)
+        source_names = conversion_store.invalidate_by_slide_id(
+            slide_id, legacy_canonical=canonical_name)
     except Exception:
-        app.logger.warning("作废 conversion_jobs 失败：%s", canonical_name,
+        app.logger.warning("作废 conversion_jobs 失败：%s", slide_id,
                            exc_info=True)
-    man = UPLOAD_DIR / (canonical_name + ".manifest.json")
-    man.unlink(missing_ok=True)
-    assoc = UPLOAD_DIR / (canonical_name + ".associated")
-    if assoc.is_dir():
-        shutil.rmtree(assoc, ignore_errors=True)
+    for name in {n for n in source_names if n and _needs_conversion(n)}:
+        try:
+            (UPLOAD_DIR / name).unlink(missing_ok=True)
+        except OSError:
+            app.logger.exception("转换源清理失败：%s", name)
+    try:
+        job = conversion_store.get_job_by_slide_id(slide_id)
+        if job:
+            import conversion_worker
+            shutil.rmtree(
+                conversion_worker.source_staging_dir(job["id"], UPLOAD_DIR),
+                ignore_errors=True)
+    except Exception:
+        app.logger.warning("转换源副本目录清理失败：%s", slide_id,
+                           exc_info=True)
+    if canonical_name:
+        man = UPLOAD_DIR / (canonical_name + ".manifest.json")
+        man.unlink(missing_ok=True)
+        assoc = UPLOAD_DIR / (canonical_name + ".associated")
+        if assoc.is_dir():
+            shutil.rmtree(assoc, ignore_errors=True)
+
+
+def _cancel_conversion_for_failed_upload(upload_id, *, upload_root=None):
+    """上传任务确定性失败（预占失效等）后的转换任务连带收口（P4-app
+    review 门禁修复）。
+
+    背景：P4-app 起转换任务在 commit 期创建（源副本归任务 staging），
+    finish_commit 的 ReservationInvalid 会在 job 已建之后发生——不带连
+    带收口就会留「上传报错文件未入账、产物稍后却被 worker 发布上线」的
+    悬挂态（且恢复扫描对 KFB 任务反复 finish_commit 反复
+    ReservationInvalid 死循环）。
+
+    动作（幂等、不抛异常）：
+      1. 按产物 slide_id 作废任务（``invalidate_by_slide_id``——含
+         ready；worker 侧由 fencing 拒绝后续结算）；
+      2. 产物资产撤回：staging/ready→failed（``slide_store.force_fail``）
+         ——ready 时同事务按 accounted_bytes 退款（worker 已结算的场景；
+         未结算无退款）；随后尽力撤包（DB 先行收口可见性）；
+      3. 清 job 任务 staging（源副本/在途 work）。
+
+    只收口**本上传创建**的 job（``job.upload_id == upload_id``）：幂等
+    复用（同 owner+sha+converter 命中既有 job）时 job 属于前序上传的生
+    命周期，本上传失败不得株连。
+    """
+    root = upload_root or UPLOAD_DIR
+    try:
+        job = conversion_store.get_job_by_upload_id(upload_id)
+    except Exception:
+        app.logger.exception("上传失败连带查 conversion job 失败：%s",
+                             upload_id)
+        return
+    if job is None or (job.get("upload_id") or "") != (upload_id or ""):
+        return  # 无 job，或 job 系前序上传的幂等复用（不株连）
+    sid = (job.get("slide_id") or "").strip()
+    if sid:
+        try:
+            conversion_store.invalidate_by_slide_id(sid)
+        except Exception:
+            app.logger.exception("上传失败连带作废 conversion job 失败：%s",
+                                 sid)
+        try:
+            import psycopg.rows
+            conn = pg_store.connect()
+            conn.row_factory = psycopg.rows.dict_row
+            try:
+                with pg_store.transaction(conn):
+                    with conn.cursor() as cur:
+                        slide_store.acquire_slide_lock(cur, sid)  # 第一把锁
+                        cur.execute(
+                            "SELECT asset_state, accounted_bytes, "
+                            "owner_user_id FROM slides WHERE slide_id=%s "
+                            "FOR UPDATE", (sid,))
+                        srow = cur.fetchone()
+                        if srow and srow["asset_state"] in (
+                                slide_store.SlideState.STAGING,
+                                slide_store.SlideState.READY):
+                            was_ready = (srow["asset_state"]
+                                         == slide_store.SlideState.READY)
+                            slide_store.force_fail(sid, conn=conn)
+                            if was_ready:
+                                amt = int(srow["accounted_bytes"] or 0)
+                                owner = (srow["owner_user_id"] or "").strip()
+                                if amt > 0 and owner:
+                                    upload_guard.refund_used_bytes_locked(
+                                        cur, owner, amt)
+            finally:
+                conn.close()
+        except Exception:
+            app.logger.exception("上传失败连带撤回产物资产失败：%s", sid)
+        try:
+            slide_storage.remove_bundle(sid, root=root)
+        except Exception:
+            app.logger.exception("上传失败连带撤包失败：%s", sid)
+    try:
+        shutil.rmtree(
+            slide_storage.staging_task_dir(job["id"], root=root),
+            ignore_errors=True)
+    except Exception:
+        app.logger.exception("上传失败连带清转换 staging 失败：%s", job["id"])
 
 
 # 分享服务基础 URL（外部用户访问入口，生产部署用 env 覆盖，如 https://slides.example.com）
@@ -8215,7 +8294,10 @@ def api_admin_demo_catalog_put():
             return jsonify(error="切片文件不存在：%s" % slide), 404
         slide_id = share_store.get_slide_id(slide)
         if slide_id is None:
-            # 首次为该切片建立稳定身份（slides 行由 meta 写入路径创建）
+            # 首次为该切片建立稳定身份（slides 行由 meta 写入路径创建）。
+            # 【P4-app §7 核对】demo 目录 PUT 是 set_slide_meta 的**允许
+            # 残留位**（demo 环境按名登记 legacy 资产；P5/P6 随 demo 目录
+            # 强校验/迁移收口）。
             share_store.set_slide_meta(slide)
             slide_id = share_store.get_slide_id(slide)
         if slide_id is None:
@@ -10501,6 +10583,8 @@ def admin_v1_slide_visibility(name):
             # P1-B2：盘上无 slides 行的孤儿文件在显式授权时建行（与 demo
             # 目录 PUT 同款迁移兼容语义）——authorize_read 只认 slide_id 级
             # 授权，且 DB 驱动的可见集/清单自此能呈现该切片（孤儿可管理）。
+            # 【P4-app §7 核对】admin visibility 是 set_slide_meta 的**允许
+            # 残留位**（管理面把 legacy 孤儿纳入管理；P6 迁移排空后收口）。
             try:
                 share_store.set_slide_meta(safe)
                 cur_slide_id = share_store.get_slide_id(safe)
@@ -11036,36 +11120,47 @@ def _validate_slide_file(path: Path, *, format_hint=None):
     return None
 
 
-def _prepare_zip_bundle(src_zip: Path, reservation=None):
-    """zip 解压的**提升前**阶段：解压 + 识别 + 预检 + 内容验证 + 哈希。
+def _prepare_zip_bundle(src_zip: Path, reservation=None, task_id=None,
+                        upload_root=None):
+    """zip 解压的**提升前**阶段：解压 + 识别 + 分组 + 预检 + 内容验证 + 哈希。
+
+    P4-app（合同 §2.1/§2.2）：解包落 ``slide_storage.staging_dir(task_id,
+    "extract")``（不再平铺 ``UPLOAD_DIR/.extracting-*``）；识别产出**逻辑
+    切片分组**（每切片一个 item：入口 + 同 stem 伴侣目录成员——包内相互
+    引用归同一 bundle，无法归组的成员整体 400 指名拒绝，绝不跨资产目录
+    互相引用）；**目标冲突预检拆除**（每 item 预分配 slide_id，objects/
+    <slide_id> 唯一天然无冲突）。
 
     成功返回 bundle dict：
-      tmp_dir / entries [(abs, rel)] / slides [rel]（已验证的有效切片，验证在
-      提升之前）/ hashes {str(abs): sha256}（解压复制时逐成员增量计算，无第二
-      次整读）/ main（主切片 rel，.mrxs 优先）/ total_bytes（Σsize = settle_bytes）
+      items [{key（zip 内包键=item_key）, entry_abs, entry_rel, ext,
+      companions [(abs, rel)], total_bytes}] / invalid [{key, code}]（入口
+      验证失败被剔除的 item——按 item 失败处理，不影响其它 item）/
+      hashes {str(abs): sha256}（解压复制时逐成员增量计算，无第二次整读）/
+      main（主切片 key，.mrxs 优先）/ total_bytes（Σ有效 item 字节 =
+      settle 口径）/ extract_dir / task_id
     失败返回 (error_message, http_status)（自清理，无残留）。
 
-    G7（review-2026-08-29 §10.4）：本函数**不提升任何文件**——提升由
-    _promote_zip_bundle 在 task intent（upload_task_store.begin_legacy_commit
-    持久化 manifest 之后）执行；单文件与 ZIP 在 task intent 前不得提升。
+    G7（review-2026-08-29 §10.4）：本函数**不提升任何文件**——发布由
+    slide_publish（per item publish）在 task intent 之后执行。
 
     旧防护全部保留（P0-A §3.4）：
-    1. 解压到 UPLOAD_DIR 下临时目录 .extracting-<随机>；
+    1. 解压到任务专属暂存目录（.staging/<task_id>/extract/）；
     2. 防 zip-slip：拒绝绝对路径与含 .. 的 member，跳过 __MACOSX/隐藏文件；
     3. 解压炸弹防护：成员数 / 路径深度 / 单成员与总展开字节（声明值与实际
        复制字节都检查，任一超限立即中止并清理）/ 异常压缩比；
     4. 拒绝符号链接、设备/FIFO 成员、加密成员、重复规范化路径（大小写不敏感）；
     5. 解压过程中周期性检查磁盘保留水位（ZIP_WATERMARK_CHECK_BYTES）；
-    6. 暂存解压后识别合法 bundle（_recognize_slide_bundle）；
-    7. 提升 (in _promote_zip_bundle) 前一次性检查目标冲突 / 用户配额
-       （reservation 补占）/ 磁盘水位；目标冲突响应统一为「名称不可用」，
-       不回显跨用户真实文件名（docs §3.12）；
-    8. 找出 SUPPORTED_EXTS 切片文件逐个验证（在暂存区，提升之前）；
-       一个都打不开 → 清理并返回 400。
+    6. 暂存解压后识别合法 bundle（_recognize_slide_bundle）+ 逻辑切片分组；
+    7. 提升前一次性检查用户配额（reservation 补占）/ 磁盘水位；
+    8. 每个 item 的入口切片逐个验证（在暂存区，提升之前）；全部 item 都
+       打不开 → 清理并返回 400（部分失败按 item 剔除并在响应 failures 指明）。
 
     reservation：api_upload 建立的 PG 预占 dict（无配额主体传 None）。
+    task_id：任务键（缺省现场生成一个——仅供测试直调；生产调用方预生成
+    并同时用于任务行）。
     """
-    tmp_dir = UPLOAD_DIR / (".extracting-" + secrets.token_hex(8))
+    task_id = task_id or upload_task_store.new_task_id()
+    tmp_dir = slide_storage.staging_dir(task_id, "extract", root=upload_root)
     try:
         tmp_dir.mkdir(parents=True, exist_ok=False)
     except OSError as e:
@@ -11202,16 +11297,23 @@ def _prepare_zip_bundle(src_zip: Path, reservation=None):
     # 暂存解压后识别合法 bundle（docs §3.4：保留 MRXS 伴侣目录语义）
     entries = _recognize_slide_bundle(root)
     if entries is None:
+        bad = _zip_unrelated_members(root)  # 先诊断再清理（root 可能即 extract）
         _cleanup_all()
-        return "压缩包内未找到有效切片或包含无关内容", 400
+        detail = ("（%s）" % ", ".join(bad[:8])) if bad else ""
+        return ("压缩包内未找到有效切片或包含无关内容%s" % detail), 400
 
-    # 提升（由 _promote_zip_bundle，在 task intent 之后）前一次性检查：
-    # 目标冲突 / 用户配额 / 磁盘水位（docs §3.4-5）
+    # 逻辑切片分组（P4-app 合同 §2.2/§2.3）：包内相互引用（同 stem 伴侣目录）
+    # 必须归同一 bundle；无法归组（孤儿目录/命中多个 stem）→ 400 指名拒绝
+    #（fail-closed：分组先于一切分配/发布，无部分状态）。
+    items, ungroupable = _zip_group_items(root, entries)
+    if ungroupable:
+        _cleanup_all()
+        return ("压缩包包含无法归组的成员（%s）——伴侣目录必须与同 stem "
+                "切片同包" % ", ".join(sorted(ungroupable)[:8])), 400
+
+    # 提升前一次性检查：用户配额（reservation 补占）/ 磁盘水位（docs §3.4-5；
+    # 目标冲突预检拆除——每 item 预分配 slide_id，objects/<slide_id> 唯一）。
     total_bytes = sum(p.stat().st_size for p, _rel in entries)
-    for _abs_p, rel in entries:
-        if (UPLOAD_DIR / rel).exists():
-            _cleanup_all()
-            return "名称不可用", 409
     if reservation is not None:
         need_extra = total_bytes - int(reservation["reserved_bytes"])
         if need_extra > 0:
@@ -11229,85 +11331,361 @@ def _prepare_zip_bundle(src_zip: Path, reservation=None):
         _cleanup_all()
         return "磁盘空间不足", 507
 
-    # 内容验证在提升之前（G7）：切片文件逐个试开，一个都打不开 → 整体拒绝。
-    # A0：成员带真实后缀，单参数调用；失败成员按 SlideValidationError 稳定
-    # 机器码记日志后跳过（日志不含成员完整路径），全失败仍整体 400。
-    valid = []
-    for abs_p, rel in entries:
-        ext = rel.as_posix().rsplit(".", 1)[-1].lower() if "." in rel.as_posix() else ""
-        if ext not in SUPPORTED_EXTS:
-            continue
+    # 内容验证在提升之前（G7）：item 入口逐个试开。入口打不开的 item 按
+    # item 失败剔除（证据进响应 failures，伴侣目录随 item 一并丢弃——
+    # 不跨资产目录互相引用）；全部 item 失败仍整体 400。
+    # A0：成员带真实后缀，单参数调用；失败按 SlideValidationError 稳定机器码
+    # 记日志（日志不含成员完整路径）。
+    valid_items = []
+    invalid = []
+    for item in items:
         try:
-            _validate_slide_file(abs_p)
+            _validate_slide_file(item["entry_abs"])
         except slide_io.SlideValidationError as e:
             app.logger.warning(
                 "upload.validate_failed stage=zip_member code=%s exc=%s ext=%s",
                 e.code, e.cause_type,
-                slide_io.logical_format_ext(rel.name))
+                slide_io.logical_format_ext(Path(item["entry_rel"]).name))
+            invalid.append({"item": item["key"], "code": e.code})
             continue
-        valid.append(rel.as_posix())
-    if not valid:
+        valid_items.append(item)
+    if not valid_items:
         _cleanup_all()
         return "压缩包内未找到可打开的有效切片文件", 400
-    # 排序稳定化：iterdir 顺序不稳定，旧实现的 main 提取随目录序漂移
-    valid = sorted(valid)
+    # 排序稳定化：iterdir 顺序不稳定；item_key 升序同时是发布 generation
+    # 编号的权威顺序（请求/恢复同一排序——重试按 (task_id,item_key) 复用
+    # slide_id，绝不重新分配，R-13）。
+    valid_items = sorted(valid_items, key=lambda i: i["key"])
+
+    # 归一布局：多层包装剥层（root 可能在 extract 的嵌套子目录）后，把有效
+    # item 的成员搬回 extract 顶层——item_key 与盘上路径一一对应（受理组装
+    # 与崩溃恢复的重组装共用同一源目录，路径推导不依赖剥层结构）。
+    for item in valid_items:
+        stem = Path(item["key"]).stem
+        new_entry = tmp_dir / item["key"]
+        if Path(item["entry_abs"]) != new_entry:
+            new_entry.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(item["entry_abs"], new_entry)
+            item["entry_abs"] = new_entry
+        new_comps = []
+        for abs_p, rel in item["companions"]:
+            new_comp = tmp_dir / stem / rel
+            if Path(abs_p) != new_comp:
+                new_comp.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(abs_p, new_comp)
+            new_comps.append((new_comp, rel))
+        item["companions"] = new_comps
 
     # 主文件优先 .mrxs，其次第一个
-    main = next((v for v in valid if v.lower().endswith(".mrxs")), valid[0])
+    main = next((i["key"] for i in valid_items
+                 if i["key"].lower().endswith(".mrxs")), valid_items[0]["key"])
     return {
-        "tmp_dir": tmp_dir,
-        "entries": entries,
-        "slides": valid,
+        "task_id": task_id,
+        "extract_dir": tmp_dir,
+        "items": valid_items,
+        "invalid": invalid,
         "hashes": hashes,
         "main": main,
-        "total_bytes": total_bytes,
+        "total_bytes": sum(i["total_bytes"] for i in valid_items),
     }
 
 
-def _promote_zip_bundle(bundle) -> list:
-    """把已验证 bundle 提升到 UPLOAD_DIR（task intent 之后、事务外执行）。
+def _zip_unrelated_members(root: Path):
+    """识别失败时的诊断清单：顶层非切片文件/无同 stem 切片的目录（指名
+    拒绝的 400 证据；不回显跨用户路径——成员名来自本次上传的 zip）。"""
+    if not root.is_dir():
+        return []
+    bad = []
+    stems = set()
+    for p in root.iterdir():
+        if p.is_file() and p.suffix.lower().lstrip(".") in SUPPORTED_EXTS:
+            stems.add(p.stem)
+    for p in sorted(root.iterdir()):
+        if p.is_file() and p.suffix.lower().lstrip(".") not in SUPPORTED_EXTS:
+            bad.append(p.name)
+        elif p.is_dir() and p.name not in stems:
+            bad.append(p.name + "/")
+    return bad
 
-    os.link 原子 no-clobber（防竞态覆盖他人文件）；不支持 link 的环境退回
-    shutil.move。成功返回提升的相对路径（posix str）列表并清理暂存目录；
-    失败自清理（含已提升部分）后抛 FileExistsError（目标冲突）或 OSError。
+
+def _zip_group_items(root: Path, entries):
+    """识别后的 entries → 逻辑切片分组（P4-app 合同 §2.2/§2.3）。
+
+    每个顶层切片扩展名文件 = 一个逻辑切片（item_key = zip 内相对路径，
+    POSIX）；顶层目录视为伴侣目录、按 stem 归属唯一同 stem 切片（保留包内
+    相对关系）。返回 (items, ungroupable)：
+      - items: [{key, entry_abs, entry_rel, ext, companions [(abs, rel_str)],
+        total_bytes}]（key 升序稳定）；
+      - ungroupable: 无法归组的成员（孤儿目录——无同 stem 切片，或同 stem
+        多个切片共享一个伴侣目录——归属不明）；非空则调用方整体 400。
     """
-    tmp_dir = bundle["tmp_dir"]
-    moved: list = []
+    top_files = []   # [(abs, rel_parts_len_1)]
+    by_dir = {}      # 顶层目录名 -> [(abs, rel)]
+    ungroupable = []
+    for abs_p, rel in entries:
+        parts = rel.parts
+        if len(parts) == 1:
+            top_files.append((abs_p, rel))
+        else:
+            by_dir.setdefault(parts[0], []).append((abs_p, rel))
+    slide_files = []
+    for abs_p, rel in top_files:
+        ext = rel.name.rsplit(".", 1)[-1].lower() if "." in rel.name else ""
+        if ext in SUPPORTED_EXTS:
+            slide_files.append((abs_p, rel, ext))
+        else:
+            # 顶层非切片文件（_recognize_slide_bundle 已拒绝混入——防御性
+            # 归入无法归组，绝不悬空提升）
+            ungroupable.append(rel.as_posix())
+    stems = {}
+    for _abs, rel, _ext in slide_files:
+        stems.setdefault(rel.stem, []).append(rel.as_posix())
+    companion_by_stem = {}
+    for d, files in sorted(by_dir.items()):
+        owners = stems.get(d)
+        if not owners or len(owners) != 1:
+            # 孤儿目录（无同 stem 切片）或同 stem 多切片共享（归属不明）
+            ungroupable.extend(f.as_posix() for _a, f in files)
+            continue
+        companion_by_stem[d] = files
+    items = []
+    for abs_p, rel, ext in sorted(slide_files, key=lambda r: r[1].as_posix()):
+        companions = [
+            (f, r.relative_to(r.parts[0]).as_posix())
+            for f, r in companion_by_stem.get(rel.stem, [])]
+        items.append({
+            "key": rel.as_posix(),
+            "entry_abs": abs_p,
+            "entry_rel": rel,
+            "ext": ext,
+            "companions": companions,
+            "total_bytes": int(abs_p.stat().st_size)
+            + sum(int(f.stat().st_size) for f, _r in companions),
+        })
+    return items, ungroupable
 
-    def _cleanup_all():
-        # 清理临时目录与已 move 的文件/目录
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        for p in moved:
-            try:
-                p = UPLOAD_DIR / p
-                if p.is_dir():
-                    shutil.rmtree(p, ignore_errors=True)
-                else:
-                    p.unlink(missing_ok=True)
-            except Exception:
-                pass
 
-    # 提升到 UPLOAD_DIR：os.link 原子 no-clobber（防竞态覆盖他人文件）
-    for abs_p, rel in bundle["entries"]:
-        dest = UPLOAD_DIR / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
+def _zip_build_artifacts(bundle):
+    """bundle → V1 artifact manifest（task intent 持久化的权威字节清单）。
+
+    全部有效 item 的成员（入口 + 伴侣）：name = zip 内相对路径（item_key /
+    <stem>/<包内相对>），size/sha256 来自解压期增量哈希。恢复路径按同一
+    manifest 重建逐 item 发布计划（generation/item 分组的唯一证据源）。
+    """
+    hashes = bundle["hashes"] or {}
+    artifacts = []
+    for item in bundle["items"]:
+        artifacts.append({
+            "name": item["key"],
+            "size": int(Path(item["entry_abs"]).stat().st_size),
+            "sha256": hashes.get(str(item["entry_abs"])),
+            "slide": True,
+        })
+        for abs_p, rel in item["companions"]:
+            artifacts.append({
+                "name": (Path(item["key"]).stem + "/" + rel),
+                "size": int(abs_p.stat().st_size),
+                "sha256": hashes.get(str(abs_p)),
+                "slide": False,
+            })
+    return artifacts
+
+
+def _zip_item_plans(artifacts, items):
+    """artifacts manifest + upload_task_items 绑定 → 逐 item 发布计划。
+
+    generation = item_key 升序的 1 基编号（请求与恢复同一排序——绑定行按
+    (task_id, item_key) 复用 slide_id，编号只是发布代次目录名，重算稳定）。
+    每计划：{gen, slide_id, item_key, manifest（entry=data.<ext> + 伴侣
+    data/<包内相对>，完整包原子发布的成员清单）, sha256（入口内容哈希）,
+    accounted_bytes（item 全部成员字节合计——在其 publish 事务写入）}。
+    无法从 manifest 归属的 artifact（不应发生——manifest 由识别产物构造）
+    被跳过并记日志。
+    """
+    ordered = sorted(items, key=lambda r: r["item_key"])
+    by_key = {r["item_key"]: {} for r in ordered}
+    stems = {k: k.rsplit(".", 1)[0] for k in by_key}
+    for a in artifacts:
+        name = str(a.get("name") or "")
+        if not name:
+            continue
+        if name in by_key:
+            by_key[name]["entry"] = a
+            continue
+        hit = None
+        for k in by_key:
+            if name.startswith(stems[k] + "/"):
+                hit = k
+                break
+        if hit is None:
+            app.logger.warning(
+                "ZIP artifact 无法归属任何 item（跳过）：%r", name)
+            continue
+        by_key[hit].setdefault("comp", []).append(a)
+    plans = []
+    for gen, r in enumerate(ordered, 1):
+        g = by_key[r["item_key"]]
+        entry = g.get("entry")
+        if entry is None:
+            continue
+        key = r["item_key"]
+        ext = key.rsplit(".", 1)[-1].lower() if "." in key else "bin"
+        entry_rel = "data." + ext
+        files = [{"path": entry_rel, "size": int(entry.get("size") or 0),
+                  "sha256": entry.get("sha256")}]
+        for c in sorted(g.get("comp", []), key=lambda x: str(x.get("name"))):
+            cname = str(c.get("name") or "")
+            files.append({
+                "path": "data/" + cname[len(stems[key]) + 1:],
+                "size": int(c.get("size") or 0),
+                "sha256": c.get("sha256"),
+            })
+        plans.append({
+            "gen": str(gen),
+            "slide_id": r["slide_id"],
+            "item_key": key,
+            "manifest": {"entry": entry_rel, "files": files},
+            "sha256": (entry.get("sha256") or ""),
+            "accounted_bytes": sum(int(f["size"]) for f in files),
+        })
+    return plans
+
+
+def _zip_assemble_plan(upload_id, plan, extract_dir, upload_root=None):
+    """把单个 item 的成员从 extract 目录搬进其 generation staging 目录
+    （``.staging/<task_id>/<gen>/``：入口 → ``data.<ext>``，伴侣保留包内
+    相对关系挂 ``data/`` 下——伴侣目录 stem 归一为 data，与入口同 stem，
+    MRXS 的 OpenSlide 伴侣定位依赖同名）。
+
+    幂等：generation 目录已存在即视为已组装（发布核对兜底）。成员缺失
+    返回 False（item 判 absent——恢复路径转 item 失败，不猜）。
+    """
+    gen_dir = slide_storage.staging_dir(
+        upload_id, plan["gen"], root=upload_root or UPLOAD_DIR)
+    if gen_dir.exists():
+        return True
+    key = plan["item_key"]
+    stem = key.rsplit(".", 1)[0]
+    entry_src = Path(extract_dir) / key
+    if not entry_src.is_file():
+        return False
+    gen_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        os.replace(entry_src, gen_dir / plan["manifest"]["entry"])
+        for f in plan["manifest"]["files"]:
+            rel = f["path"]
+            if rel == plan["manifest"]["entry"]:
+                continue
+            src = Path(extract_dir) / stem / rel[len("data/"):]
+            if not src.is_file():
+                return False
+            dst = gen_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(src, dst)
+    except OSError:
+        app.logger.exception("ZIP item staging 组装失败（item=%s）", key)
+        shutil.rmtree(gen_dir, ignore_errors=True)
+        return False
+    return True
+
+
+def _zip_publish_items(upload_id, token, plans, owner_user_id,
+                       extract_dir=None, upload_root=None):
+    """逐逻辑切片发布（P4-app 合同 §2.4）。
+
+    每 item 一次 publish（slide_publish.publish_batch_item：完整包原子
+    发布——入口与伴侣同 objects/<slide_id>/，manifest 指定唯一入口；逐
+    item accounted_bytes 在其 publish 事务写入）。单个**确定性**失败按
+    item 失败处理（资产行 failed + 证据，不影响同任务其它 item 的已发布
+    结果）；临时故障/预占失效上抛（调用方保持 committing 由恢复幂等补发，
+    或整体收尾）。
+
+    返回 (published_bytes, failures, settled_plans)。
+    """
+    root = upload_root or UPLOAD_DIR
+    published = 0
+    failures = []
+    settled = []
+    for plan in plans:
+        if extract_dir is not None:
+            if not _zip_assemble_plan(upload_id, plan, extract_dir, root):
+                app.logger.warning(
+                    "ZIP item 源缺失，判 item 失败（item=%s）", plan["item_key"])
+                try:
+                    slide_store.mark_failed(plan["slide_id"])
+                except Exception:
+                    app.logger.exception("ZIP item 资产 mark_failed 失败：%s",
+                                         plan["slide_id"])
+                failures.append({"item": plan["item_key"],
+                                 "code": "item_source_missing"})
+                continue
         try:
-            os.link(abs_p, dest)
-            abs_p.unlink()
-        except FileExistsError:
-            _cleanup_all()
+            slide_publish.publish_batch_item(
+                upload_id, plan["gen"], plan["slide_id"], plan["manifest"],
+                sha256=plan["sha256"],
+                accounted_bytes=plan["accounted_bytes"],
+                commit_token=token,
+                owner_user_id=(owner_user_id or "") or None,
+                upload_root=root)
+            published += int(plan["accounted_bytes"])
+            settled.append(plan)
+        except slide_publish.PublishError as e:
+            if e.deterministic:
+                app.logger.warning(
+                    "ZIP item 发布失败（item=%s code=%s）：%s",
+                    plan["item_key"], e.code, e.message)
+                try:
+                    slide_store.mark_failed(plan["slide_id"])
+                except Exception:
+                    app.logger.exception("ZIP item 资产 mark_failed 失败：%s",
+                                         plan["slide_id"])
+                failures.append({"item": plan["item_key"], "code": e.code})
+                continue
             raise
-        except OSError:
-            try:
-                shutil.move(str(abs_p), str(dest))
-            except Exception as move_err:
-                _cleanup_all()
-                raise OSError(f"移动文件失败: {move_err}") from move_err
-        moved.append(rel.as_posix())
+    return published, failures, settled
 
-    # 清理临时目录（已 move 的留下）
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    return moved
+
+def _zip_abort_published(plans, upload_root=None):
+    """整体失败时撤回已发布 item 的包 + 资产行 failed（不留 committed 文件
+    ——预占失效/全灭场景；未结算的 item 不漏账：consume 从未发生）。
+
+    顺序：DB force_fail（staging/ready→failed，立即可见性收口）在先，撤包
+    在后（fail-closed——先撤包再改库会留「ready 行 + 无包」破态窗口）。
+    配额不退款：ZIP 的 used_bytes 只在 finish_commit 一次性结算，撤回发生
+    在结算前（预占由 _zip_fail_task 释放）。"""
+    for plan in plans:
+        try:
+            slide_store.force_fail(plan["slide_id"])
+        except Exception:
+            app.logger.exception("撤回 item 资产 force_fail 失败：%s",
+                                 plan["slide_id"])
+        try:
+            slide_storage.remove_bundle(plan["slide_id"],
+                                        root=upload_root or UPLOAD_DIR)
+        except Exception:
+            app.logger.exception("撤回已发布包失败：%s", plan["slide_id"])
+
+
+def _zip_fail_task(upload_id, token, task, plans):
+    """批量任务整体失败收尾：任务 failed + 清任务暂存树 + item 资产行
+    failed + 释放预占（清理确认后释放，plan §3.3）。"""
+    try:
+        t = upload_task_store.fail_commit(upload_id, token, permanent=True)
+    except upload_task_store.UploadTaskError:
+        app.logger.exception("ZIP 批量任务 fail_commit 失败：%s", upload_id)
+        t = upload_task_store.get_task(upload_id) or task
+    try:
+        slide_storage.remove_staging_tree(upload_id, root=UPLOAD_DIR)
+    except Exception:
+        app.logger.exception("ZIP 批量任务暂存清理失败：%s", upload_id)
+    for plan in plans:
+        try:
+            slide_store.mark_failed(plan["slide_id"])
+        except Exception:
+            app.logger.exception("ZIP item 资产 mark_failed 失败：%s",
+                                 plan["slide_id"])
+    _upload_v2_release_reservation_quietly(t)
+    return t
 
 
 def _recognize_slide_bundle(root: Path):
@@ -11491,17 +11869,34 @@ def _upload_legacy_remove_artifacts(artifacts):
 def _upload_legacy_recover_commit(task):
     """V1 committing 超时的惰性恢复（G7；与 _upload_v2_recover_commit 并列）。
 
-    证据三态（_upload_legacy_promote_state，纯状态判定）：
-      promoted → 先补 ownership（失败保持 committing 下次再试），再
-        finish_commit（PG 下 consume 与 committed 同事务；重复恢复
-        used_bytes 只增加一次——consumed 行幂等 + 状态机单次转移）；
-      absent → rollback + 取消 + 释放预占（从未提升，安全回退）；
-      conflict（部分存在/大小哈希不符/manifest 损坏）→ fail-closed 告警并
-        保持 committing，**绝不按过期时间盲 release**。
+    P4-app 三路分发：
+      1. **ZIP 批量任务**（upload_task_items 有绑定行）→ 逐 item 幂等补发
+         （objects/<sid> 已存在且吻合 → 只做 DB CAS；staging 在 → 组装+
+         发布；都缺 → item 判失败），finish_commit 的 settle_bytes=全部
+         已发布 item 字节合计（合同 §2.4）；
+      2. **convert-required 任务**（conversion job 已按 upload_id 建）→
+         源副本在任务 staging 即 finish_commit（源字节口径）；
+      3. 升级窗口旧任务（v1_artifacts 平铺提升）→ 证据三态恢复
+         （_upload_legacy_promote_state，纯状态判定）：
+         promoted → 补 ownership 后 finish_commit；absent → rollback +
+         取消 + 释放；conflict → fail-closed 保持 committing，绝不按过期
+         时间盲 release。
     """
     upload_id = task["upload_id"]
     token = task.get("commit_token") or ""
     arts = _upload_legacy_manifest(task)
+    if not arts:
+        app.logger.error(
+            "upload task %s manifest 缺失/损坏，保持 committing 等待人工处置",
+            upload_id)
+        return task
+    items = upload_task_store.list_upload_task_items(upload_id)
+    if items:
+        return _upload_legacy_recover_zip(task, arts, items)
+    if _needs_conversion(task.get("safe_name") or ""):
+        out = _upload_legacy_recover_conversion(task, arts)
+        if out is not None:
+            return out
     state = _upload_legacy_promote_state(task)
     if state == "conflict":
         app.logger.error(
@@ -11518,6 +11913,9 @@ def _upload_legacy_recover_commit(task):
         _upload_v2_release_reservation_quietly(t)
         return t
     sha = _upload_manifest_sha(arts)
+    # 【P4-app §7 核对】以下按名补归属只服务**升级窗口在途旧任务**（v1_
+    # artifacts 平铺提升形态；P4-app 起的 ZIP 批量任务在 items 分支、
+    # convert-required 在 job 源副本分支收口，均不经此处）——P6 排空后删。
     for a in arts:
         if not a.get("slide"):
             continue
@@ -11543,6 +11941,113 @@ def _upload_legacy_recover_commit(task):
     except Exception:
         app.logger.exception("upload task %s 恢复收口失败", upload_id)
         return upload_task_store.get_task(upload_id) or task
+
+
+def _upload_legacy_recover_zip(task, arts, items):
+    """ZIP 批量任务的 committing 恢复（P4-app 合同 §2.4；幂等重跑）。
+
+    逐 item：已 ready → 计入结算；objects/<sid> 已存在且 manifest 吻合 →
+    只做 DB CAS（publish_batch_item 幂等分支）；staging generation 目录在
+    → 发布；均缺 → 尝试从 extract 目录重组装（崩溃在组装窗口）→ 仍缺则
+    item 判失败（mark_failed，证据保留）。全部 item 失败 → 整体回滚取消；
+    有任一已发布 → finish_commit（settle=已发布合计）。
+    """
+    upload_id = task["upload_id"]
+    token = task.get("commit_token") or ""
+    plans = _zip_item_plans(arts, items)
+    extract_dir = slide_storage.staging_dir(upload_id, "extract",
+                                            root=UPLOAD_DIR)
+    try:
+        published, _failures, settled = _zip_publish_items(
+            upload_id, token, plans, task.get("owner_user_id"),
+            extract_dir=extract_dir if extract_dir.is_dir() else None,
+            upload_root=UPLOAD_DIR)
+    except upload_guard.ReservationInvalid:
+        app.logger.warning("upload task %s 恢复发布时预占已失效，整体撤回",
+                           upload_id)
+        # 全量 plans（同请求路径裁决：FS 可能已发布而 DB 未收口的 item 也撤）
+        _zip_abort_published(plans, upload_root=UPLOAD_DIR)
+        return _zip_fail_task(upload_id, token, task, plans)
+    except Exception:
+        app.logger.exception(
+            "upload task %s ZIP 恢复发布失败（保持 committing 下次再试）",
+            upload_id)
+        return upload_task_store.get_task(upload_id) or task
+    if not settled:
+        app.logger.warning(
+            "upload task %s ZIP 恢复时全部 item 失败，整体回滚", upload_id)
+        return _zip_fail_task(upload_id, token, task, plans)
+    try:
+        out = upload_task_store.finish_commit(
+            upload_id, token, _upload_manifest_sha(arts),
+            settle_bytes=int(published))
+        try:
+            slide_storage.remove_staging_tree(upload_id, root=UPLOAD_DIR)
+        except Exception:
+            app.logger.exception(
+                "upload task %s ZIP 恢复后暂存清理失败", upload_id)
+        return out
+    except upload_guard.ReservationInvalid:
+        app.logger.warning("upload task %s 恢复收口时预占已失效，撤回", upload_id)
+        _zip_abort_published(plans, upload_root=UPLOAD_DIR)
+        return _zip_fail_task(upload_id, token, task, plans)
+    except upload_task_store.StateConflict as e:
+        return e.task or upload_task_store.get_task(upload_id) or task
+    except Exception:
+        app.logger.exception("upload task %s ZIP 恢复收口失败", upload_id)
+        return upload_task_store.get_task(upload_id) or task
+
+
+def _upload_legacy_recover_conversion(task, arts):
+    """convert-required（KFB）任务的 committing 恢复（P4-app）。
+
+    源副本归 conversion job 的任务 staging（``.staging/<job_id>/source/``）；
+    job 按 upload_id 找到且源副本在（大小/哈希与 manifest 吻合）→
+    finish_commit（源字节口径）。返回恢复后的 task；不是本形态（job 未建/
+    源不在任务 staging——例如升级窗口平铺源）返回 None 交回旧三态判定。
+    """
+    upload_id = task["upload_id"]
+    token = task.get("commit_token") or ""
+    job = conversion_store.get_job_by_upload_id(upload_id)
+    if job is None:
+        # 崩溃在 create_job 之前：源还在本任务 transfer 暂存 → 按未受理
+        # 回退（manifest 的 sha 已持久化，但无任务内提升证据）。
+        transfer = slide_storage.staging_dir(upload_id, "transfer",
+                                             root=UPLOAD_DIR)
+        if transfer.is_dir() and any(transfer.iterdir()):
+            for p in transfer.iterdir():
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return None
+    import conversion_worker
+    src = conversion_worker.resolve_source(job, UPLOAD_DIR)
+    if not src:
+        return None
+    art = next((a for a in arts if a.get("name") == task.get("safe_name")),
+               arts[0] if arts else None)
+    try:
+        if art and os.path.isfile(src) \
+                and int(os.path.getsize(src)) == int(art.get("size") or -1):
+            return upload_task_store.finish_commit(
+                upload_id, token, (art.get("sha256") or None) or "",
+                settle_bytes=int(art.get("size") or 0))
+    except upload_guard.ReservationInvalid:
+        # P4-app review：预占失效是终态证据——连带作废 job + 产物资产
+        # failed（含 ready 撤包退款），任务 failed 收尾；不保持 committing
+        # 死循环（finish_commit 每次扫描都抛同一异常）。
+        app.logger.warning(
+            "upload task %s KFB 恢复收口时预占已失效，连带作废转换任务",
+            upload_id)
+        _cancel_conversion_for_failed_upload(upload_id)
+        return _upload_legacy_fail(upload_id, token, task, permanent=True)
+    except upload_task_store.StateConflict as e:
+        return e.task or upload_task_store.get_task(upload_id) or task
+    except Exception:
+        app.logger.exception("upload task %s KFB 恢复收口失败", upload_id)
+        return upload_task_store.get_task(upload_id) or task
+    return None
 
 
 def _upload_legacy_recover_stale(ident=None, *, now=None):
@@ -11575,10 +12080,13 @@ def _upload_legacy_recover_stale(ident=None, *, now=None):
     return recovered
 
 
-def _upload_legacy_intent(ident, filename, safe_name, artifacts, reservation):
+def _upload_legacy_intent(ident, filename, safe_name, artifacts, reservation,
+                          upload_id=None):
     """V1 commit 受理：内容验证后、提升前持久化 manifest（G7 步骤 1）。
 
     成功返回 (upload_id, commit_token, task)；失败返回 (None, error_resp)。
+    ``upload_id``：调用方预生成的任务 ID（P4-app：convert-required 源与
+    ZIP 批量在写盘期即以该 ID 建 ``.staging/<task_id>/`` 暂存目录）。
     """
     try:
         upload_id, token, task = upload_task_store.begin_legacy_commit(
@@ -11586,7 +12094,8 @@ def _upload_legacy_intent(ident, filename, safe_name, artifacts, reservation):
             filename=filename,
             safe_name=safe_name,
             artifacts=artifacts,
-            reservation_id=(reservation or {}).get("reservation_id"))
+            reservation_id=(reservation or {}).get("reservation_id"),
+            upload_id=upload_id)
     except upload_task_store.UploadTaskError as e:
         app.logger.exception("V1 上传 commit 受理失败")
         _upload_release_quietly(reservation)
@@ -11910,8 +12419,9 @@ def api_upload():
     best-effort consume 的成功路径终点。
 
     P3（合同 §3）：原生单文件切 _api_upload_native_single（slide_publish
-    新管线）；本函数余下主体只服务 convert-required（KFB）——legacy 全路径
-    （含旧冲突检查/allow_kfb_recover/转换任务补建），P4 随转换链整体改造。
+    新管线）。P4-app（合同 §3）：convert-required（KFB）亦切新链路——
+    create_job 即预分配产物 slide_id（同名源/产物不冲突），源副本归任务
+    staging（不再平铺提升/按名认领/名占用检查）。
     """
     if not can_upload():
         return jsonify(error="无上传权限"), 403
@@ -11949,301 +12459,338 @@ def api_upload():
 
     # P3（合同 §1/§3.1.5 裁决）：原生单文件（_needs_conversion 为假）切新
     # 管线——不查原名冲突（同名并发各得各的 ID）；convert-required（KFB）
-    # 维持 legacy 全路径（含旧冲突检查与 allow_kfb_recover——转换链 P4 改造）。
+    # 自 P4-app 起同为新链路（见下——产物预分配 slide_id，源副本归任务
+    # staging，无任何名占用检查）。
     if not _needs_conversion(safe):
         return _api_upload_native_single(file, filename, safe, ext, ident,
                                          reservation, target_pid)
 
-    dest = UPLOAD_DIR / safe
-    # convert-required 且源已落盘：先收本次内容再按原任务/owner/摘要恢复，
-    # 不能只凭文件名把他人源文件交给当前请求者。
-    allow_kfb_recover = _needs_conversion(safe) and dest.is_file()
-    if (dest.exists() or _upload_name_conflict(safe)) and not allow_kfb_recover:
+    # ---- convert-required（KFB）新链路（P4-app 合同 §3）：源副本归任务
+    # staging（.staging/<job_id>/source/）+ create_job 即预分配产物
+    # slide_id；**同名源/产物不冲突**（独立 ID，objects/<sid> 唯一）——旧
+    # 冲突检查（_upload_name_conflict/allow_kfb_recover/平铺提升/
+    # _owned_committed_upload 按名认领）全部拆除。源 KFB 按现状语义不落
+    # 资产（不对 Viewer 可见；结算=任务 finish_commit 的源字节 + 转换
+    # ready 的产物字节，口径与旧链一致）。----
+    owner = _upload_asset_owner(ident)
+    if not owner:
         _upload_release_quietly(reservation)
-        return jsonify(error="名称不可用", code="name_unavailable"), 409
+        return jsonify(error="无法解析上传资产 owner（本地态未配置 owner）"), 500
+    upload_id = upload_task_store.new_task_id()
+    transfer = slide_storage.staging_dir(upload_id, "transfer", root=UPLOAD_DIR)
+    staged = transfer / ("data." + (ext or "kfb"))
 
-    # 计数流写入临时文件（.uploading-*），不信任 Content-Length
-    tmp = UPLOAD_DIR / (".uploading-" + secrets.token_hex(8) + ".part")
+    def _abort_kfb(payload, status):
+        """受理前失败：清任务暂存 + 释放预占（无任务行可回滚）。"""
+        try:
+            slide_storage.remove_staging_tree(upload_id, root=UPLOAD_DIR)
+        except Exception:
+            app.logger.exception("V1 KFB 上传受理前清理失败：%s", upload_id)
+        _upload_release_quietly(reservation)
+        return payload, status
+
+    # 计数流直写任务暂存（不信任 Content-Length；P4-app：不再平铺 .uploading-*）
     try:
         upload_guard.check_disk_watermark(UPLOAD_DIR,
                                           need_bytes=_upload_reservation_hint())
-        total = upload_guard.save_limited(file.stream, tmp)
+        transfer.mkdir(parents=True, exist_ok=True)
+        total = upload_guard.save_limited(file.stream, staged)
     except upload_guard.RequestTooLarge as e:
-        _upload_release_quietly(reservation)
-        return jsonify(error=str(e), code=e.code), 413
+        return _abort_kfb(jsonify(error=str(e), code=e.code), 413)
     except upload_guard.DiskWatermarkExceeded as e:
-        _upload_release_quietly(reservation)
-        return jsonify(error="磁盘空间不足", code=e.code), 507
+        return _abort_kfb(jsonify(error="磁盘空间不足", code=e.code), 507)
     except Exception as e:
-        tmp.unlink(missing_ok=True)
-        _upload_release_quietly(reservation)
-        return jsonify(error=f"保存失败: {e}"), 400
+        return _abort_kfb(jsonify(error=f"保存失败: {e}"), 400)
 
-    # ---- 内容验证在提升之前（G7：验证通过才有 manifest / 受理）----
-    # A0：传净化后的原始 basename 作 format_hint（.part 临时名不参与格式判定）；
-    # 只捕获 SlideValidationError，按稳定机器码返回 400（未知异常已在
-    # _validate_slide_file 内收敛为 slide_open_failed）。
+    # ---- 内容验证在受理之前（G7：验证通过才有 manifest / 受理）----
     try:
-        if allow_kfb_recover:
-            pass  # 恢复路径用内容摘要比对，不把本次垃圾当 KFB 解析
-        elif _needs_conversion(safe):
-            _probe_kfb_or_fail(tmp)
-        else:
-            _validate_slide_file(tmp, format_hint=safe)
+        probe = _probe_kfb_or_fail(staged)
     except KfbError as e:
-        tmp.unlink(missing_ok=True)
-        _upload_release_quietly(reservation)
-        return jsonify(error="无效的 KFB 文件", code=e.code), 400
-    except slide_io.SlideValidationError as e:
-        tmp.unlink(missing_ok=True)
-        _upload_release_quietly(reservation)
-        app.logger.warning(
-            "upload.validate_failed stage=v1 code=%s exc=%s ext=%s",
-            e.code, e.cause_type, slide_io.logical_format_ext(safe))
-        hint = "MRXS 需连同数据目录打包为 zip 上传" if safe.lower().endswith(".mrxs") else "无效的切片文件"
-        return jsonify(error=hint, code=e.code), 400
+        return _abort_kfb(jsonify(error="无效的 KFB 文件", code=e.code), 400)
     try:
-        file_sha = _sha256_file(tmp)
+        file_sha = _sha256_file(staged)
     except OSError as e:
-        tmp.unlink(missing_ok=True)
-        _upload_release_quietly(reservation)
-        return jsonify(error=f"保存失败: {e}"), 400
+        return _abort_kfb(jsonify(error=f"保存失败: {e}"), 400)
 
-    if allow_kfb_recover:
-        owned = _owned_committed_upload(ident, safe)
-        try:
-            dest_sha = _sha256_file(dest)
-        except OSError:
-            dest_sha = ""
-        task_sha = ((owned or {}).get("sha256_actual") or "").lower()
-        tmp.unlink(missing_ok=True)
-        _upload_release_quietly(reservation)
-        if not (owned and dest_sha and dest_sha == file_sha == task_sha):
-            return jsonify(error="名称不可用", code="name_unavailable"), 409
-        try:
-            job, _canon = _ensure_conversion_job(
-                ident, source_name=safe, source_sha256=file_sha,
-                upload_id=owned["upload_id"],
-                target_project_id=target_pid)
-        except Exception:
-            app.logger.exception("V1 KFB 原任务恢复失败：%s", safe)
-            return jsonify(error="转换任务创建失败"), 500
-        body = _conversion_accepted_body(job)
-        if job.get("state") == "ready":
-            body["status"] = "ok"
-            body["name"] = job.get("canonical_name")
-            return jsonify(body), 200
-        return jsonify(body), 202
-
-    # ---- task intent：commit token + manifest 持久化（提升之前，G7 步骤 1）----
-    intent, err = _upload_legacy_intent(
-        ident, filename, safe,
-        [{"name": safe, "size": int(total), "sha256": file_sha, "slide": True}],
-        reservation)
-    if err is not None:
-        tmp.unlink(missing_ok=True)
-        return err
-    upload_id, token, task = intent
-
-    # ---- 提升（事务外）：link 失败（已存在）即统一 409，无 check-then-write 竞态 ----
+    # ---- 受理（G7）：create_job（预分配产物 slide_id）→ begin_legacy_commit
+    #      （intent/配额 manifest）→ 源副本搬进任务 staging（私有命名空间，
+    #      非用户可见提升——崩溃窗口由恢复扫描按 job 源副本收口）。----
+    task = None
+    token = ""
+    job = None
     try:
-        _promote_no_clobber(tmp, dest)
-        tmp.unlink(missing_ok=True)
-    except FileExistsError:
-        tmp.unlink(missing_ok=True)
-        _upload_legacy_fail(upload_id, token, task, permanent=True)
-        return jsonify(error="名称不可用", code="name_unavailable"), 409
-    except OSError as e:
-        tmp.unlink(missing_ok=True)
-        _upload_legacy_fail(upload_id, token, task, permanent=False)
-        return jsonify(error=f"保存失败: {e}"), 400
+        job, _canon = _ensure_conversion_job(
+            ident, source_name=safe, source_sha256=file_sha,
+            upload_id=upload_id, source_format=probe["format"],
+            target_project_id=target_pid)
+        intent, err = _upload_legacy_intent(
+            ident, filename, safe,
+            [{"name": safe, "size": int(total), "sha256": file_sha,
+              "slide": False}],
+            reservation, upload_id=upload_id)
+        if err is not None:
+            try:
+                slide_storage.remove_staging_tree(upload_id, root=UPLOAD_DIR)
+            except Exception:
+                pass
+            return err
+        upload_id, token, task = intent
+        import conversion_worker
+        conversion_worker.stage_source_copy(job["id"], staged, UPLOAD_DIR)
+    except Exception:
+        app.logger.exception("V1 KFB 上传受理失败：%s", upload_id)
+        if task is not None:
+            _upload_legacy_fail(upload_id, token, task, permanent=False)
+        else:
+            try:
+                slide_storage.remove_staging_tree(upload_id, root=UPLOAD_DIR)
+            except Exception:
+                pass
+            _upload_release_quietly(reservation)
+        return jsonify(error="上传受理失败，请重试"), 500
 
-    # ---- 建立归属（convert-required 源文件不对 Viewer 可见，不写 slide_meta）----
-    if not _needs_conversion(safe):
-        try:
-            share_store.set_slide_meta(safe, owner_user_id=ident["user_id"],
-                                       requester_role=ident["role"])
-        except PermissionError:
-            _upload_legacy_fail(upload_id, token, task, permanent=True,
-                                remove_names=(safe,))
-            return jsonify(error="无上传权限"), 403
-        except Exception:
-            app.logger.exception("V1 上传归属登记失败：%s", upload_id)
-            _upload_legacy_fail(upload_id, token, task, permanent=False,
-                                remove_names=(safe,))
-            return jsonify(error="归属登记失败，请重试"), 503
-        if target_pid:
-            proj = share_store.get_project(target_pid)
-            owner = (ident.get("user_id") or "")
-            if proj and (proj.get("owner_user_id") or "") == owner \
-                    and safe not in (proj.get("slides") or []):
-                share_store.add_slides_to_project(target_pid, [safe])
-
-    # ---- 短事务 B：committed + 配额同事务转实占（G7 收口；崩溃后由恢复扫描
-    #      幂等补账，文件已持久提升，请求仍按成功返回）----
+    # ---- 短事务 B：committed + 配额同事务转实占（源字节；崩溃后由恢复
+    #      扫描幂等补账）----
     try:
         upload_task_store.finish_commit(upload_id, token, file_sha,
                                         settle_bytes=int(total))
+    except upload_guard.ReservationInvalid:
+        # P4-app review：job 已在受理期创建（源副本已搬任务 staging）——
+        # 连带作废 + 产物资产 failed，不留「文件未入账但产物稍后上线」
+        app.logger.warning("V1 KFB 上传收口时预占已失效：%s", upload_id)
+        _cancel_conversion_for_failed_upload(upload_id)
+        _upload_legacy_fail(upload_id, token, task, permanent=True)
+        return jsonify(error="上传预占已失效，文件未入账",
+                       code="reservation_expired"), 409
     except upload_task_store.StateConflict as e:
         cur = e.task or {}
         if cur.get("state") == upload_task_store.STATE_COMMITTED:
-            if _needs_conversion(safe):
-                try:
-                    job, _c = _ensure_conversion_job(
-                        ident, source_name=safe, source_sha256=file_sha,
-                        upload_id=upload_id, target_project_id=target_pid)
-                    return jsonify(_conversion_accepted_body(job)), 202
-                except Exception:
-                    app.logger.exception("V1 committed 补建 conversion 失败")
-            return jsonify(name=safe,
-                       # slide ID 化（P2 合同 §5.2）：完成响应携带 slide_id
-                       slide_id=share_store.get_slide_id(safe) or None)
-        # 恢复流程已回滚（提升被撤/未提升）：清孤儿文件并允许重试
-        app.logger.warning("V1 上传收口被恢复流程回滚：%s", upload_id)
-        dest.unlink(missing_ok=True)
+            job = conversion_store.get_job(job["id"]) or job
+            body = _conversion_accepted_body(job)
+            if job.get("state") == "ready":
+                body["status"] = "ok"
+                body["name"] = job.get("canonical_name")
+                return jsonify(body), 200
+            return jsonify(body), 202
+        app.logger.warning("V1 KFB 上传收口被恢复流程回滚：%s", upload_id)
         _upload_legacy_fail(upload_id, token, task, permanent=False)
         return jsonify(error="上传已失效，请重试", code="commit_retryable"), 503
     except upload_task_store.TaskNotFound:
-        # 任务由本请求 begin_legacy_commit 刚创建，正常不可达；真发生说明
-        # 任务存储被外部清空/换后端，属内部故障——记日志并按 500 处理，
-        # 不伪装成权限问题。
-        app.logger.error("V1 上传收口时任务丢失（upload_id=%s）", upload_id)
-        dest.unlink(missing_ok=True)
+        app.logger.error("V1 KFB 上传收口时任务丢失（upload_id=%s）", upload_id)
         _upload_release_quietly(reservation)
-        return jsonify(error="上传任务状态丢失，请重试", code="upload_task_lost"), 500
+        return jsonify(error="上传任务状态丢失，请重试",
+                       code="upload_task_lost"), 500
     except Exception:
         app.logger.exception(
-            "V1 上传收口失败（任务保持 committing，由恢复扫描幂等补账）：%s",
-            upload_id)
-    if _needs_conversion(safe):
-        try:
-            job, _canon = _ensure_conversion_job(
-                ident, source_name=safe, source_sha256=file_sha,
-                upload_id=upload_id, target_project_id=target_pid)
-        except FileExistsError:
-            return jsonify(error="名称不可用", code="name_unavailable"), 409
-        except Exception:
-            app.logger.exception("V1 转换任务创建失败：%s", upload_id)
-            return jsonify(error="转换任务创建失败"), 500
-        body = _conversion_accepted_body(job)
-        if job.get("state") == "ready":
-            body["status"] = "ok"
-            body["name"] = job.get("canonical_name")
-            return jsonify(body), 200
-        return jsonify(body), 202
-    return jsonify(name=safe,
-                       # slide ID 化（P2 合同 §5.2）：完成响应携带 slide_id
-                       slide_id=share_store.get_slide_id(safe) or None)
+            "V1 KFB 上传收口失败（任务保持 committing，由恢复扫描幂等补账）："
+            "%s", upload_id)
+    job = conversion_store.get_job(job["id"]) or job
+    body = _conversion_accepted_body(job)
+    if job.get("state") == "ready":
+        body["status"] = "ok"
+        body["name"] = job.get("canonical_name")
+        return jsonify(body), 200
+    return jsonify(body), 202
 
 
 def _api_upload_zip(file, filename, safe, ident, reservation):
-    """zip 分支（api_upload 拆出）：prepare → intent → promote → ownership → finish。
+    """zip 分支（api_upload 拆出；P4-app 合同 §2 统一发布管线）。
 
-    顺序固定（G7）：_prepare_zip_bundle 完成解压/识别/预检/内容验证/哈希（
-    不提升）→ begin_legacy_commit 持久化 manifest（提升之前）→ _promote_zip_bundle
-    事务外提升 → ownership → finish_commit 同事务转实占。
+    顺序固定（G7 + 合同 §2.2/§2.4）：
+      1. 计数流保存 zip 到任务暂存（``.staging/<upload_id>/upload.zip``）；
+      2. ``_prepare_zip_bundle``：解压（staging extract 目录）+ 识别 + 逻辑
+         切片分组 + 预检（配额补占/水位）+ 内容验证 + 哈希（不发布）；
+      3. **同一事务**：逐 item ``allocate_slide``（staging/id_bundle 行）+
+         ``bind_upload_task_item``（(task_id,item_key)→slide_id，重试/恢复
+         复用，绝不重新分配）+ ``begin_legacy_commit``（v1_artifacts=
+         全部 item 成员清单；批量任务行 slide_id 为 NULL——绑定源是
+         upload_task_items）；
+      4. 逐 item 组装 generation staging（入口→data.<ext>，伴侣→data/…）
+         + ``slide_publish.publish_batch_item``（完整包原子发布：manifest
+         列全部成员、指定唯一入口；逐 item accounted_bytes 在其 publish
+         事务写入；单个确定性失败按 item 失败处理，不影响其它 item）；
+      5. ``finish_commit``（settle_bytes=全部已发布 item 字节合计——配额
+         一次性结算，口径与逐 item accounted_bytes 对齐）。
+    响应：name=主 item key、extracted=item keys、slide_id/slide_ids（从
+    upload_task_items 真实绑定读）、failures（item 级失败证据）。
     """
-    tmp_zip = UPLOAD_DIR / (".uploading-" + secrets.token_hex(8) + ".zip")
-    # 计数流保存（不信任 Content-Length；超限即停并清理）
+    upload_id = upload_task_store.new_task_id()
+    tmp_zip = slide_storage.staging_task_dir(
+        upload_id, root=UPLOAD_DIR) / "upload.zip"
+
+    def _abort_pre(payload, status):
+        """受理前失败：清任务暂存树 + 释放预占（无任务/无资产行）。"""
+        try:
+            slide_storage.remove_staging_tree(upload_id, root=UPLOAD_DIR)
+        except Exception:
+            app.logger.exception("V1 zip 上传受理前清理失败：%s", upload_id)
+        _upload_release_quietly(reservation)
+        return payload, status
+
+    # 计数流保存（不信任 Content-Length；超限即停并清理；P4-app：不再平铺
+    # .uploading-*.zip）
     try:
         upload_guard.check_disk_watermark(UPLOAD_DIR,
                                           need_bytes=_upload_reservation_hint())
+        tmp_zip.parent.mkdir(parents=True, exist_ok=True)
         upload_guard.save_limited(file.stream, tmp_zip)
     except upload_guard.RequestTooLarge as e:
-        _upload_release_quietly(reservation)
-        return jsonify(error=str(e), code=e.code), 413
+        return _abort_pre(jsonify(error=str(e), code=e.code), 413)
     except upload_guard.DiskWatermarkExceeded as e:
-        _upload_release_quietly(reservation)
-        return jsonify(error="磁盘空间不足", code=e.code), 507
+        return _abort_pre(jsonify(error="磁盘空间不足", code=e.code), 507)
     except Exception as e:
-        tmp_zip.unlink(missing_ok=True)
-        _upload_release_quietly(reservation)
-        return jsonify(error=f"保存失败: {e}"), 400
+        return _abort_pre(jsonify(error=f"保存失败: {e}"), 400)
     try:
-        result = _prepare_zip_bundle(tmp_zip, reservation=reservation)
+        result = _prepare_zip_bundle(tmp_zip, reservation=reservation,
+                                     task_id=upload_id,
+                                     upload_root=UPLOAD_DIR)
     finally:
         tmp_zip.unlink(missing_ok=True)
-    # prepare 失败时返回 (error_msg, status)（已自清理）
+    # prepare 失败时返回 (error_msg, status)（已自清理 extract 目录）
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
         msg, status = result
-        _upload_release_quietly(reservation)
-        return jsonify(error=msg), status
+        return _abort_pre(jsonify(error=msg), status)
     bundle = result
+
+    owner = _upload_asset_owner(ident)
+    if not owner:
+        return _abort_pre(
+            jsonify(error="无法解析上传资产 owner（本地态未配置 owner）"), 500)
+    artifacts = _zip_build_artifacts(bundle)
+    plans = None
+    task = None
+    token = ""
     try:
-        # manifest：全部待提升文件（伴侣目录文件 slide=False，只提升不入归属）
-        artifacts = [
-            {"name": rel.as_posix(),
-             "size": abs_p.stat().st_size,
-             "sha256": (bundle["hashes"] or {}).get(str(abs_p)),
-             "slide": rel.as_posix() in set(bundle["slides"])}
-            for abs_p, rel in bundle["entries"]
-        ]
-        intent, err = _upload_legacy_intent(
-            ident, filename, bundle["main"], artifacts, reservation)
-        if err is not None:
-            return err
-        upload_id, token, task = intent
-
-        # 提升（事务外；task intent 之后，G7 步骤 2）
+        # ---- 受理（同一事务）：逐 item allocate + bind + 任务行（G7 步骤 1）----
         try:
-            _promote_zip_bundle(bundle)
-        except FileExistsError:
-            _upload_legacy_fail(upload_id, token, task, permanent=True)
-            return jsonify(error="名称不可用", code="name_unavailable"), 409
-        except OSError as e:
-            _upload_legacy_fail(upload_id, token, task, permanent=False)
-            return jsonify(error=str(e)), 400
-
-        # 建立归属（zip 内全部有效切片均为上传者所有）
-        for sname in bundle["slides"]:
+            import psycopg.rows
+            conn = pg_store.connect()
+            conn.row_factory = psycopg.rows.dict_row
             try:
-                share_store.set_slide_meta(sname, owner_user_id=ident["user_id"],
-                                           requester_role=ident["role"])
-            except PermissionError:
-                _upload_legacy_fail(upload_id, token, task, permanent=True,
-                                    remove_names=[a["name"] for a in artifacts])
-                return jsonify(error="无上传权限"), 403
+                with pg_store.transaction(conn):
+                    for item in bundle["items"]:
+                        desc = slide_store.allocate_slide(
+                            owner,
+                            original_filename=Path(item["key"]).name,
+                            format_ext=item["ext"], conn=conn)
+                        upload_task_store.bind_upload_task_item(
+                            conn, upload_id, item["key"], desc.slide_id)
+                    _uid, token, task = upload_task_store.begin_legacy_commit(
+                        owner_user_id=owner,
+                        filename=filename,
+                        safe_name=Path(bundle["main"]).name,
+                        artifacts=artifacts,
+                        reservation_id=(reservation or {}).get(
+                            "reservation_id"),
+                        upload_id=upload_id,
+                        conn=conn)
+            finally:
+                conn.close()
+        except Exception:
+            # 受理失败（事务原子回滚：无任务行/无绑定/无资产行）——清暂存
+            # + 释放预占，500 可重试（G7：intent 之前零提升）。
+            app.logger.exception("V1 zip 上传受理失败：%s", upload_id)
+            try:
+                slide_storage.remove_staging_tree(upload_id, root=UPLOAD_DIR)
             except Exception:
-                app.logger.exception("V1 zip 上传归属登记失败：%s", upload_id)
-                _upload_legacy_fail(upload_id, token, task, permanent=False,
-                                    remove_names=[a["name"] for a in artifacts])
-                return jsonify(error="归属登记失败，请重试"), 503
+                pass
+            _upload_release_quietly(reservation)
+            return jsonify(error="上传受理失败，请重试"), 500
+        items = upload_task_store.list_upload_task_items(upload_id)
+        plans = _zip_item_plans(artifacts, items)
 
-        # 短事务 B：committed + 配额同事务转实占（G7 步骤 3）
-        # slide ID 化（P2 合同 §5.2）：zip 完成响应带主切片 slide_id 与
-        # 逐 extracted 的 slide_ids 映射（前端打开目标不再按名猜）
-        _zip_slide_ids = {n: (share_store.get_slide_id(n) or None)
-                          for n in [bundle["main"]] + list(bundle["slides"])}
+        # ---- 逐 item 发布（完整包原子；单 item 确定性失败不拖累其它）----
+        try:
+            published, failures, settled = _zip_publish_items(
+                upload_id, token, plans, owner,
+                extract_dir=bundle["extract_dir"], upload_root=UPLOAD_DIR)
+        except upload_guard.ReservationInvalid:
+            app.logger.warning(
+                "V1 zip 上传发布期预占已失效，整体撤回：%s", upload_id)
+            # 全量 plans 撤回（不止 ready）：ReservationInvalid 抛出时本 item
+            # 的 FS 发布可能已完成（publish_batch_item 先 FS 后 DB 事务）——
+            # force_fail 覆盖 staging/ready，remove_bundle 对无包 item no-op。
+            _zip_abort_published(plans, upload_root=UPLOAD_DIR)
+            _zip_fail_task(upload_id, token, task, plans)
+            return jsonify(error="上传预占已失效，文件未入账",
+                           code="reservation_expired"), 409
+        except Exception:
+            # 临时故障（含 staging IO）：任务保持 committing，恢复扫描按
+            # manifest + items 绑定幂等补发剩余 item（plan §3.2 稳定错误）。
+            app.logger.exception(
+                "V1 zip 上传发布临时故障（恢复流程补发）：%s", upload_id)
+            return jsonify(
+                error="提交收口暂不可用，将由恢复流程完成",
+                code="commit_in_progress",
+                state=upload_task_store.STATE_COMMITTING), 503
+        if not settled:
+            # 全部 item 失败（确定性）：整体收尾，不留 committed 文件。
+            _zip_fail_task(upload_id, token, task, plans)
+            return jsonify(
+                error="压缩包内切片全部发布失败",
+                code="zip_items_failed",
+                failures=failures), 400
+
+        # ---- 短事务 B：committed + 配额一次性结算（全部已发布 item 字节
+        #      合计——与逐 item accounted_bytes 口径对齐，合同 §2.4）----
         try:
             upload_task_store.finish_commit(
                 upload_id, token, _upload_manifest_sha(artifacts),
-                settle_bytes=int(bundle["total_bytes"]))
+                settle_bytes=int(published))
         except upload_task_store.StateConflict as e:
             cur = e.task or {}
             if cur.get("state") == upload_task_store.STATE_COMMITTED:
-                return jsonify(name=bundle["main"], extracted=bundle["slides"],
-                               slide_id=_zip_slide_ids.get(bundle["main"]),
-                               slide_ids=_zip_slide_ids)
+                return _zip_committed_response(upload_id, bundle)
             app.logger.warning("V1 zip 上传收口被恢复流程回滚：%s", upload_id)
-            _upload_legacy_fail(upload_id, token, task, permanent=False,
-                                remove_names=[a["name"] for a in artifacts])
-            return jsonify(error="上传已失效，请重试", code="commit_retryable"), 503
+            _zip_fail_task(upload_id, token, task, plans)
+            return jsonify(error="上传已失效，请重试",
+                           code="commit_retryable"), 503
         except upload_task_store.TaskNotFound:
-            # 同单文件分支：本请求内刚创建的任务丢失属内部故障，不伪装 403。
-            app.logger.error("V1 zip 上传收口时任务丢失（upload_id=%s）", upload_id)
-            _upload_legacy_fail(upload_id, token, task, permanent=True,
-                                remove_names=[a["name"] for a in artifacts])
-            return jsonify(error="上传任务状态丢失，请重试", code="upload_task_lost"), 500
+            app.logger.error("V1 zip 上传收口时任务丢失（upload_id=%s）",
+                             upload_id)
+            _zip_fail_task(upload_id, token, task, plans)
+            return jsonify(error="上传任务状态丢失，请重试",
+                           code="upload_task_lost"), 500
         except Exception:
             app.logger.exception(
-                "V1 zip 上传收口失败（任务保持 committing，由恢复扫描幂等补账）：%s",
-                upload_id)
-        return jsonify(name=bundle["main"], extracted=bundle["slides"],
-                       slide_id=_zip_slide_ids.get(bundle["main"]),
-                       slide_ids=_zip_slide_ids)
-    finally:
-        # 暂存目录兜底清理（成功路径已在 _promote_zip_bundle 内清理）
-        shutil.rmtree(bundle["tmp_dir"], ignore_errors=True)
+                "V1 zip 上传收口失败（任务保持 committing，由恢复扫描幂等"
+                "补账）：%s", upload_id)
+            return jsonify(
+                error="提交收口暂不可用，将由恢复流程完成",
+                code="commit_in_progress",
+                state=upload_task_store.STATE_COMMITTING), 503
+        # 任务暂存树清理（成功路径：各 item 目录已被发布 rename 移走，
+        # extract/upload.zip 残余在此清——清理在 finish_commit（consume）之后，
+        # plan §3.3 顺序成立）。**临时故障（commit_in_progress）不清理**——
+        # 恢复扫描要按 extract/staging 补发剩余 item，终态收口时统一清。
+        try:
+            slide_storage.remove_staging_tree(upload_id, root=UPLOAD_DIR)
+        except Exception:
+            app.logger.exception("V1 zip 任务暂存清理失败：%s", upload_id)
+        return _zip_committed_response(upload_id, bundle)
+    except Exception:
+        # 兜底：未预期异常不清理 staging——任务保持 committing，恢复扫描按
+        # manifest + items 绑定幂等补发（intent/绑定仍在）。
+        app.logger.exception("V1 zip 上传未预期失败（恢复流程接管）：%s",
+                             upload_id)
+        return jsonify(
+            error="提交收口暂不可用，将由恢复流程完成",
+            code="commit_in_progress",
+            state=upload_task_store.STATE_COMMITTING), 503
+
+
+def _zip_committed_response(upload_id, bundle):
+    """ZIP 批量任务完成响应：slide_ids 从 upload_task_items 真实绑定读
+    （P4-app：不再按名 resolve——id_bundle 资产无 legacy_filename）。"""
+    items = upload_task_store.list_upload_task_items(upload_id)
+    slide_ids = {r["item_key"]: r["slide_id"] for r in items}
+    failures = list(bundle.get("invalid") or [])
+    return jsonify(
+        name=bundle["main"],
+        extracted=[i["key"] for i in bundle["items"]],
+        slide_id=slide_ids.get(bundle["main"]),
+        slide_ids=slide_ids,
+        failures=failures)
 
 
 # =========================================================================== #
@@ -12621,7 +13168,11 @@ def _upload_v2_fetch(upload_id, ident):
 
 
 def _upload_v2_set_ownership(task, ident=None):
-    """ownership 入库（slide_meta.owner_user_id = 任务归属者；§3.2 commit 段 B）。"""
+    """ownership 入库（slide_meta.owner_user_id = 任务归属者；§3.2 commit 段 B）。
+
+    【P4-app §7 核对】迁移兼容层：仅升级窗口在途旧 V2 任务（平铺提升）与
+    恢复路径调用——新管线（native/转换）归属在 allocate_slide 同事务落库，
+    不经本函数。P6 排空后随旧三段式一并删除。"""
     share_store.set_slide_meta(
         task["safe_name"],
         owner_user_id=(task.get("owner_user_id") or None),
@@ -12633,10 +13184,37 @@ def _upload_v2_recover_commit(task):
     （P3：无 slide_id/intent 的升级窗口在途任务；新管线走
     _upload_v2_recover_publish 的 intent 幂等重跑）。
 
-    临时文件已提升为正式文件（dest 存在且大小吻合）→ **先**补 ownership（失败
-    保持 committing，下次访问再试），再在同一短事务内 committed + 配额转实占。
-    未提升则回滚 active。入账失败不得留下 committed 文件。
+    P4-app：convert-required 任务优先按 conversion job 的源副本收口（源在
+    ``.staging/<job_id>/source/`` → finish_commit 源字节口径——不再有平铺
+    提升判定）；无 job/源不在任务 staging 的（升级窗口平铺源）走旧提升
+    判定。临时文件已提升为正式文件（dest 存在且大小吻合）→ **先**补
+    ownership（失败保持 committing，下次访问再试），再在同一短事务内
+    committed + 配额转实占。未提升则回滚 active。入账失败不得留下
+    committed 文件。
     """
+    upload_id = task["upload_id"]
+    if _needs_conversion(task.get("safe_name") or ""):
+        job = conversion_store.get_job_by_upload_id(upload_id)
+        if job is not None:
+            import conversion_worker
+            src = conversion_worker.resolve_source(job, UPLOAD_DIR)
+            if src and os.path.isfile(str(src)) \
+                    and int(os.path.getsize(str(src))) == \
+                    int(task["declared_size"]):
+                try:
+                    t = upload_task_store.finish_commit(
+                        upload_id, task.get("commit_token") or "",
+                        task.get("sha256_actual") or "",
+                        settle_bytes=int(task["declared_size"]))
+                    _upload_v2_cleanup_part(t)
+                    return t
+                except upload_task_store.StateConflict as e:
+                    return e.task or upload_task_store.get_task(upload_id) \
+                        or task
+                except Exception:
+                    app.logger.exception(
+                        "upload task %s KFB 恢复收口失败（下次再试）", upload_id)
+                    return upload_task_store.get_task(upload_id) or task
     dest = UPLOAD_DIR / task["safe_name"]
     promoted = False
     try:
@@ -12739,8 +13317,9 @@ def _upload_v2_state_dict(task, **extra):
                        if task.get("expires_at") else None),
         # slide ID 化（P2 §5.2 → P3 合同 §1.3 收口）：slide_id 从**任务绑定**
         # 读取（upload_tasks.slide_id 唯一绑定源；新管线创建即绑定）。按名
-        # resolve 只对旧管线转换任务兜底（convert-required 走 legacy，行在
-        # committed 后由 set_slide_meta 注册；P4 转换链接管后拆除该回落）。
+        # resolve 只剩升级窗口在途旧任务的兜底（P4-app 转换链已切 ID：新
+        # convert-required 任务行无 slide_id，产物 ID 经 conversion 响应体
+        # 的 job.slide_id 下发；P6 排空后删除该回落）。
         "slide_id": (task.get("slide_id")
                      or share_store.get_slide_id(task.get("safe_name") or "")
                      or None),
@@ -12754,26 +13333,26 @@ def _upload_v2_state_body(task, **extra):
 
 
 def _v2_committed_conversion_response(ident, task):
-    """committed 的 convert-required 上传：补建任务并返回 202/200。"""
+    """committed 的 convert-required 上传：补建任务并返回 202/200。
+
+    P4-app：job 幂等键 = (owner, sha, converter)——新链路任务的 job 在
+    commit 期已建（源副本已在任务 staging），此处多为恢复/重放路径的
+    幂等复用；产物 slide_id 从 job 绑定读（不再按名 resolve）。"""
     sha = task.get("sha256_actual") or ""
     payload = _upload_v2_state_dict(task, sha256=sha)
     try:
         job, _canon = _ensure_conversion_job(
             ident, source_name=task["safe_name"], source_sha256=sha,
             upload_id=task["upload_id"])
-    except FileExistsError:
-        payload["code"] = "name_unavailable"
-        return jsonify(payload), 409
+    except FileNotFoundError:
+        # 源副本与平铺源均已不在（任务已 committed 但源被清理）——500 让
+        # 客户端重试（job 补建失败不落半状态）。
+        app.logger.exception(
+            "补建 conversion job 失败（源缺失）upload=%s", task.get("upload_id"))
+        return jsonify(error="转换任务创建失败"), 500
     except Exception:
         app.logger.exception(
             "补建 conversion job 失败 upload=%s", task.get("upload_id"))
-        payload.update(_conversion_accepted_body({
-            "id": None, "state": "queued",
-            "source_name": task["safe_name"],
-            "canonical_name": _canonical_name_for(task["safe_name"]),
-            "source_format": "kfb", "attempt": 0, "error_code": None,
-            "created_at": None, "finished_at": None,
-        }))
         # 没有 job id 时仍 202，前端无法轮询——应 500 让客户端重试 commit
         return jsonify(error="转换任务创建失败"), 500
     payload.update(_conversion_accepted_body(job))
@@ -12845,7 +13424,8 @@ def api_uploads_create():
     （_upload_name_conflict 拆除——同名并发各得各的 slide_id/objects 目录，
     no-clobber 由 objects/<slide_id> 唯一性兜底）；暂存落
     ``.staging/<upload_id>/transfer/``（分片 pwrite）。convert-required
-    （KFB）维持 legacy 全路径（含旧冲突检查——转换链 P4 整体改造）。
+    （KFB）自 P4-app 起无任何名占用检查——源副本归 conversion job 的任务
+    staging，产物由 create_job 预分配 slide_id。
     """
     if not can_upload():
         return jsonify(error="无上传权限"), 403
@@ -12883,11 +13463,9 @@ def api_uploads_create():
             return jsonify(error="sha256_expected 需为 64 位十六进制"), 400
         sha256_expected = sha256_expected.strip().lower()
 
-    if not native_pipeline:
-        # convert-required 维持 legacy：旧冲突检查（canonical 名锁在转换链，
-        # P4 拆除）+ 无 slide_id 绑定（转换产物 P4 才出 ID）。
-        if (UPLOAD_DIR / safe).exists() or _upload_name_conflict(safe):
-            return jsonify(error="名称不可用", code="name_unavailable"), 409
+    # P4-app：convert-required 同样**不查原名冲突**——源副本归 conversion
+    # job 的任务 staging（不再平铺 UPLOAD_DIR），产物预分配 slide_id
+    # （_upload_name_conflict 拆除；同名并发各得各 ID）。
 
     # 初始化即预占（§3.3 防护前移：任何分片 body 接收之前）+ 磁盘水位
     reservation = _upload_acquire_reservation_exact(ident, declared_size)
@@ -13162,7 +13740,7 @@ def api_uploads_commit(upload_id):
     if native:
         return _upload_v2_commit_native(task, ident)
 
-    # ---- 旧三段式（convert-required / 升级窗口在途任务）----
+    # ---- 旧三段式（P4-app：convert-required 新源链 + 升级窗口在途任务）----
     # ---- 短事务 A：受理（锁内只做状态转移 + token；§3.2.5）----
     try:
         token, task = upload_task_store.begin_commit(upload_id)
@@ -13176,8 +13754,11 @@ def api_uploads_commit(upload_id):
         return jsonify(error="无上传权限"), 403
 
     part = _upload_v2_part_path(task)
-    dest = UPLOAD_DIR / task["safe_name"]
     declared = int(task["declared_size"])
+    is_convert = _needs_conversion(task["safe_name"])
+    # 升级窗口在途旧任务（平铺提升语义）；P4-app 起的 convert-required 任务
+    # 源副本归 conversion job 的任务 staging，不再平铺 UPLOAD_DIR。
+    dest = UPLOAD_DIR / task["safe_name"]
 
     def _deterministic_fail(code, message, sha=None):
         """确定性失败 → failed（§3.1）：预占释放，临时文件保留待 DELETE 清理。"""
@@ -13215,17 +13796,13 @@ def api_uploads_commit(upload_id):
         return _deterministic_fail(
             "hash_mismatch", "整文件 SHA-256 与期望不符", sha=sha_actual)
 
-    # ---- 事务外 3：格式探测（**在提升之前**）。convert-required 只 parse，
-    # 不在 Gunicorn 内转换；原生格式仍走 OpenSlide 试开。
+    # ---- 事务外 3：格式探测（**在源落位之前**）。convert-required 只 parse，
+    # 不在 Gunicorn 内转换；原生格式仍走 OpenSlide 试开。P4-app：canonical
+    # 名占用检查拆除（同名源/产物不冲突——独立 ID）。----
     convert_probe = None
     try:
-        if _needs_conversion(task["safe_name"]):
+        if is_convert:
             convert_probe = _probe_kfb_or_fail(part)
-            canon = _canonical_name_for(task["safe_name"])
-            if ((UPLOAD_DIR / canon).exists()
-                    or conversion_store.canonical_is_live(canon)):
-                return _deterministic_fail("name_unavailable", "名称不可用",
-                                           sha=sha_actual)
         else:
             _validate_slide_file(part, format_hint=task["safe_name"])
     except KfbError as e:
@@ -13240,38 +13817,63 @@ def api_uploads_commit(upload_id):
             "无效的切片文件" + ("（MRXS 需打包 zip 走旧 /api/upload）"
                             if task["safe_name"].lower().endswith(".mrxs") else ""))
 
-    # ---- 事务外 4：原子 no-clobber 提升（提升后 .part 仍在，收口失败可回退）----
-    try:
-        _promote_no_clobber(part, dest)
-    except FileExistsError:
-        return _deterministic_fail("name_unavailable", "名称不可用")
-    except OSError as e:
-        return _rollback_temp("文件提升失败: %s" % e)
-
-    # ---- ownership 入库（convert-required 源不对 Viewer 可见，跳过）----
-    if not _needs_conversion(task["safe_name"]):
+    if is_convert and conversion_store.get_job_by_upload_id(upload_id) is None:
+        # ---- convert-required 新链路：create_job（预分配产物 slide_id）→
+        #      源副本搬进任务 staging（.staging/<job_id>/source/；不再平铺
+        #      UPLOAD_DIR）。崩溃在受理后由 _upload_v2_recover_commit 按
+        #      job 源副本收口。----
         try:
-            _upload_v2_set_ownership(task, ident)
-        except PermissionError:
-            dest.unlink(missing_ok=True)
-            return _rollback_temp("无上传权限", status=403)
+            job, _canon = _ensure_conversion_job(
+                ident, source_name=task["safe_name"],
+                source_sha256=sha_actual, upload_id=upload_id,
+                source_format=convert_probe["format"],
+                staged_source=part)
         except Exception:
-            app.logger.exception("upload task ownership failed: %s", upload_id)
-            dest.unlink(missing_ok=True)
-            return _rollback_temp("归属登记失败")
+            app.logger.exception(
+                "V2 KFB 转换任务创建失败：%s", upload_id)
+            return _rollback_temp("转换任务创建失败，请重试")
+    else:
+        # ---- 事务外 4：原子 no-clobber 提升（升级窗口在途旧任务 / 旧
+        #      convert-required 平铺语义；提升后 .part 仍在，收口失败可回退）----
+        try:
+            _promote_no_clobber(part, dest)
+        except FileExistsError:
+            return _deterministic_fail("name_unavailable", "名称不可用")
+        except OSError as e:
+            return _rollback_temp("文件提升失败: %s" % e)
+
+        # ---- ownership 入库（convert-required 源不对 Viewer 可见，跳过）----
+        if not is_convert:
+            try:
+                _upload_v2_set_ownership(task, ident)
+            except PermissionError:
+                dest.unlink(missing_ok=True)
+                return _rollback_temp("无上传权限", status=403)
+            except Exception:
+                app.logger.exception(
+                    "upload task ownership failed: %s", upload_id)
+                dest.unlink(missing_ok=True)
+                return _rollback_temp("归属登记失败")
 
     # ---- 短事务 B：token 匹配且仍 committing → committed，配额同事务转实占 ----
     try:
         task = upload_task_store.finish_commit(
             upload_id, token, sha_actual, settle_bytes=size)
     except upload_guard.ReservationInvalid:
-        dest.unlink(missing_ok=True)
-        return _deterministic_fail(
+        if not is_convert or conversion_store.get_job_by_upload_id(
+                upload_id) is None:
+            dest.unlink(missing_ok=True)
+        resp = _deterministic_fail(
             "reservation_expired", "上传预占已失效，文件未入账")
+        if is_convert:
+            # P4-app review：commit 期已建 job（源副本已搬任务 staging）——
+            # 连带作废，不留「上传报错但产物稍后上线」悬挂态
+            _cancel_conversion_for_failed_upload(upload_id)
+        return resp
     except upload_task_store.StateConflict as e:
         cur = e.task or {}
         if cur.get("state") == upload_task_store.STATE_COMMITTED:
-            # 惰性恢复已按提升文件收口完成：以库内现状为准
+            # 惰性恢复已按提升文件/源副本收口完成：以库内现状为准
             if _needs_conversion(cur.get("safe_name") or ""):
                 return _v2_committed_conversion_response(ident, cur)
             return _upload_v2_state_body(cur, sha256=cur.get("sha256_actual"))
@@ -13474,11 +14076,14 @@ def _ingestion_state_body(job, *, queue_position=None):
         body["parts"] = [{"part_number": int(p["part_number"]),
                           "length": int(p["length"])}
                          for p in job["part_plan_json"]]
-    if job.get("slide_canonical_name"):
-        body["slide"] = job["slide_canonical_name"]
-        # slide ID 化（P2 合同 §5.2）：COS 完成后的打开目标按 ID
-        body["slide_id"] = share_store.get_slide_id(
-            job["slide_canonical_name"]) or None
+    # P4-b（合同 §5.6）：slide 引用从任务绑定读（job_slide_ref——job.slide_id
+    # 创建即分配，结算前后都在）；不再按 slide_canonical_name 名字解析（新
+    # 资产无 legacy_filename，按名 resolve 对 id_bundle 产物恒 None）。
+    ref = ingestion_store.job_slide_ref(job)
+    if ref["slide"]:
+        body["slide"] = ref["slide"]
+    if ref["slide_id"]:
+        body["slide_id"] = ref["slide_id"]
     if queue_position is not None:
         body["queue_position"] = queue_position
     return body
@@ -13546,8 +14151,9 @@ def api_ingestions_create():
     if idem is not None and (not isinstance(idem, str) or not idem.strip()
                              or len(idem) > 128):
         return jsonify(error="idempotency_key 需为非空字符串（≤128）"), 400
-    if (UPLOAD_DIR / safe).exists() or _upload_name_conflict(safe):
-        return jsonify(error="名称不可用", code="name_unavailable"), 409
+    # P4-app（合同 §5.1/C2）：名称冲突预检（(UPLOAD_DIR/safe).exists() ∨
+    # _upload_name_conflict）拆除——创建即预分配 slide_id，objects/<sid>
+    # 唯一天然无冲突；同名并发各发各的 ID。
 
     ident = current_identity()
     try:
@@ -13560,6 +14166,12 @@ def api_ingestions_create():
             policy_version="v1-manual",
             route_reason=body.get("route_reason") or "manual_cos")
     except ingestion_store.IngestionStateError as e:
+        # 空 owner（本地态未配置 owner，不允许自动认领）是服务端配置故障 →
+        # 500；仅容量等待上限（cos_waiting_limit）落 409（P4-app C2 收口：
+        # 不再混入 name_unavailable 族——预检已拆，创建即预分配 slide_id）。
+        if "owner" in str(e):
+            app.logger.error("COS 任务创建失败（owner 解析失败）：%s", e)
+            return jsonify(error=str(e), code="ingestion_owner_missing"), 500
         return jsonify(error=str(e), code="cos_waiting_limit"), 409
 
     # 创建后立即尝试准入（容量不足转等待；池对账暂停/水位同样只等待）
@@ -13715,13 +14327,9 @@ def api_conversion_get(job_id):
     if not can_upload():
         return jsonify(error="无上传权限"), 403
     payload, status = conversion_http.handle_get(current_identity(), job_id)
-    if status == 200 and isinstance(payload, dict):
-        # slide ID 化（P2 前端缺口⑤）：轮询打开目标按 ID（canonical 名→行；
-        # 未 ready/无 canonical 时 None，前端继续轮询）
-        canon = payload.get("canonical_name") or ""
-        if canon:
-            payload = dict(payload)
-            payload["slide_id"] = share_store.get_slide_id(canon) or None
+    # P4-app（合同 §3.6）：轮询打开目标的 slide_id 直接来自任务视图
+    #（public_view 含任务绑定 slide_id——create_job 即分配，ready 前后都在；
+    # 不再按 canonical 名 resolve，id_bundle 产物无 legacy_filename）。
     return _jsonify_pair((payload, status))
 
 
@@ -13729,12 +14337,15 @@ def api_conversion_get(job_id):
 def api_conversion_retry(job_id):
     """重试 failed/cancelled 转换任务（同 id 重新入队，不重复扣配额）。"""
     import conversion_http
+    import conversion_worker
     if not can_upload():
         return jsonify(error="无上传权限"), 403
     ident = current_identity()
     job = conversion_store.get_job(job_id)
-    src = (job or {}).get("source_name") or ""
-    source_available = bool(job) and bool(src) and (UPLOAD_DIR / src).is_file()
+    # 源可用性按任务源解析判定（P4-app：任务 staging 副本 / 平铺 alias
+    # 过渡——不再只看 UPLOAD_DIR/<source_name>）。
+    source_available = bool(
+        job and conversion_worker.resolve_source(job, UPLOAD_DIR))
     return _jsonify_pair(conversion_http.handle_retry(
         ident, job_id, source_available=source_available))
 
@@ -13792,7 +14403,9 @@ def _slide_delete_legacy_core(safe, slide_id):
     except FileNotFoundError:
         pass
     try:
-        _cleanup_conversion_sidecars(safe)
+        # P4-app（合同 §3.5）：按 slide_id 作废转换任务/清源副本；canonical
+        # 名仅作升级窗口旧行（slide_id IS NULL）的匹配与平铺 sidecar 清理。
+        _cleanup_conversion_sidecars(slide_id, canonical_name=safe)
     except Exception:
         app.logger.warning("切片删除的转换 sidecar 清理失败：%s", safe,
                            exc_info=True)
@@ -13940,6 +14553,13 @@ def api_slide_delete_by_id(slide_id):
         slide_store.remove_share_membership(sid)
     except Exception:
         app.logger.warning("by-ID 删除的 share 成员行清理失败：%s", sid,
+                           exc_info=True)
+    try:
+        # P4-app（合同 §3.5/§7）：删除转换产物按 slide_id 作废任务 + 清源
+        # 副本（连带源删除语义保持现状——源是否独立资产由 P5 裁决）。
+        _cleanup_conversion_sidecars(sid)
+    except Exception:
+        app.logger.warning("by-ID 删除的转换任务作废失败：%s", sid,
                            exc_info=True)
     _close_slide(_slide_cache_key_for(sid, desc.original_filename or ""),
                  slide_id=sid)
@@ -22656,6 +23276,9 @@ def api_slide_meta(name):
     if ident["role"] != user_store.ROLE_OWNER:
         if _slide_owner(safe) != ident["user_id"]:
             return jsonify(error="只能编辑自己切片的元数据"), 403
+    # 【P4-app §7 核对】按名元数据编辑（alias/note/public）是 legacy 行的
+    # 兼容编辑端点（新资产走 PATCH /api/slides/<slide_id> → update_display_
+    # name/update_note/set_public，不动文件与授权）；P6 随按名端点退役。
     try:
         meta = share_store.set_slide_meta(safe, alias=alias, note=note, public=public,
                                           owner_user_id=ident["user_id"],

@@ -2076,17 +2076,12 @@ def set_slide_meta(name, alias=None, note=None, owner_user_id=None, public=None,
                     cur.execute(
                         "UPDATE slides SET " + ", ".join(sets) +
                         " WHERE slide_id=%s", params)
-                # P1-B2：legacy writer 的重发布——行处于 deleted/deleting（旧
-                # 删除端点的状态直写 / P5 编排残留）后**同名重传**（no-clobber
-                # 上传必经删除），本调用即新内容注册完成：恢复 ready（slide_id
-                # 复用是既有行为；正式两阶段删除在 P5）。staging/legacy/failed
-                # 不在此复活——新 writer 走 slide_store 原语，legacy 只经回填
-                # 脚本验证（合同 §4：legacy ──盘点/验证──▶ ready）。
-                cur.execute(
-                    "UPDATE slides SET asset_state='ready', published_at=now(),"
-                    " updated_at=now() WHERE slide_id=%s"
-                    " AND asset_state IN ('deleted','deleting')",
-                    (slide_id,))
+                # P4-app（合同 §7 强制收口）：deleted/deleting→ready 的同名
+                # 复活分支**拆除**——最后一条 legacy writer（上传/ZIP/转换/
+                # 恢复补归属）已全部切 slide_store 原语；tombstone 保持死亡
+                # （删除后重传=新 slide_id 新资产，旧分享/授权/标注不继承）。
+                # staging/legacy/failed 亦不复活（legacy 只经回填脚本验证，
+                # 合同 §4）。
                 cur.execute(
                     "SELECT display_name, note, owner_user_id, public "
                     "FROM slides WHERE slide_id=%s", (slide_id,))
@@ -3485,56 +3480,5 @@ def cas_ai_session_drawing_flag(session_id, allow_ai_drawing, max_generation):
                     (session_id, allow_ai_drawing, max_generation))
                 row = cur.fetchone()
                 return row is not None
-    finally:
-        conn.close()
-
-
-def force_slide_owner_follow_file(slide_name, expected_owner, new_owner,
-                                  requester_role=None):
-    """元数据归属强制跟随实际文件（COS 摄取归属终检冲突收口，review 第五轮）。
-
-    背景：同名 slides 行属于另一用户（其文件早已不存在，属陈旧名称预约）
-    而新上传的文件已落到正式路径时，切片列表/读取按 slides.owner_user_id
-    判定——不收口就会把新内容暴露给旧主人及其历史授权。
-
-    单事务两步（与 api_slide_delete 的 R7 语义同款顺序，授权先行失效）：
-      1. 按 legacy 名 + slide_id 撤销全部 view 授权（旧授权不得指向新内容）；
-      2. CAS 转移：仅当当前 owner 仍为 expected_owner 时，把行归属改为
-         new_owner 并复位 public/alias/note（旧主人的别名/备注不得泄露给
-         新主人）。行不存在 → "gone"；owner 已变 → "conflict"（不猜）。
-    返回 "transferred" | "gone" | "conflict"。
-    """
-    _reject_guest_write(requester_role)
-    if not isinstance(slide_name, str) or not slide_name:
-        raise ValueError("slide_name 不能为空")
-    conn = _connect()
-    try:
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM slide_view_grants WHERE slide_name=%s",
-                    (slide_name,))
-                cur.execute("SELECT slide_id, owner_user_id FROM slides "
-                            "WHERE legacy_filename=%s", (slide_name,))
-                row = cur.fetchone()
-                if row is None:
-                    return "gone"
-                if row["owner_user_id"] is not None and \
-                        (row["owner_user_id"] or "") != (expected_owner or ""):
-                    return "conflict"
-                if row["owner_user_id"] is None and expected_owner:
-                    return "conflict"
-                if row["slide_id"]:
-                    cur.execute(
-                        "DELETE FROM slide_view_grants WHERE slide_id=%s "
-                        "AND slide_name <> %s", (row["slide_id"], slide_name))
-                cur.execute(
-                    # R-02（P2）：alias 列停写——归属转移只清 display_name/note
-                    "UPDATE slides SET owner_user_id=%s, public=false, "
-                    "display_name=COALESCE(NULLIF(original_filename,''), "
-                    "legacy_filename, ''), note='', updated_at=now() "
-                    "WHERE legacy_filename=%s",
-                    (new_owner or _OWNER_USER_ID or None, slide_name))
-                return "transferred"
     finally:
         conn.close()

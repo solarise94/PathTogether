@@ -36,13 +36,15 @@ _RELATION_COLUMNS = {
     "conversion_job_sources": {"source_slide_id"},
 }
 
+# 注：uq_baidu_import_items_slide_id 由 0069 DROP（P4-app 裁决：convert
+# 幂等复用允许同 owner 多条目共享同一产物资产；native 一 item 一资产由
+# 分配侧保证）——本清单反映全量迁移后的当前 schema。
 _EXPECTED_INDEXES = {
     "uq_slides_storage_relpath",
     "idx_slides_owner_user_id",
     "idx_slides_asset_state",
     "uq_ingestion_jobs_slide_id",
     "uq_conversion_jobs_slide_id",
-    "uq_baidu_import_items_slide_id",
     "uq_slide_view_grants_slide_id_user",
     "uq_project_slides_project_slide_id",
     "idx_rois_slide_id_seq",

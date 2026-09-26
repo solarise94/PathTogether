@@ -379,16 +379,63 @@ def _make_zip(members):
     return p
 
 
+def _publish_prepared(bundle):
+    """P4-app：prepare 产物经受理（allocate+bind+intent）→ 逐 item 统一发布
+    → finish_commit 的最小生产管线（镜像 test_zip_guard 聚合器）。"""
+    import pg_store
+    import share_store
+    import slide_publish
+    import slide_storage
+    import slide_store
+    import upload_task_store
+    owner = (share_store.get_owner_user_id() or "").strip()
+    upload_id = upload_task_store.new_task_id()
+    artifacts = app_mod._zip_build_artifacts(bundle)
+    import psycopg.rows
+    conn = pg_store.connect()
+    conn.row_factory = psycopg.rows.dict_row
+    try:
+        with pg_store.transaction(conn):
+            for item in bundle["items"]:
+                desc = slide_store.allocate_slide(
+                    owner, original_filename=Path(item["key"]).name,
+                    format_ext=item["ext"], conn=conn)
+                upload_task_store.bind_upload_task_item(
+                    conn, upload_id, item["key"], desc.slide_id)
+            _uid, token, _task = upload_task_store.begin_legacy_commit(
+                owner_user_id=owner, filename="t.zip",
+                safe_name=Path(bundle["main"]).name, artifacts=artifacts,
+                upload_id=upload_id, conn=conn)
+    finally:
+        conn.close()
+    items = upload_task_store.list_upload_task_items(upload_id)
+    plans = app_mod._zip_item_plans(artifacts, items)
+    published, _f, _s = app_mod._zip_publish_items(
+        upload_id, token, plans, owner,
+        extract_dir=bundle["extract_dir"], upload_root=app_mod.UPLOAD_DIR)
+    upload_task_store.finish_commit(
+        upload_id, token, app_mod._upload_manifest_sha(artifacts),
+        settle_bytes=int(published))
+    slide_storage.remove_staging_tree(upload_id, root=app_mod.UPLOAD_DIR)
+    return {r["item_key"]: r["slide_id"]
+            for r in upload_task_store.list_upload_task_items(upload_id)}
+
+
 def test_zip_valid_bmp_member_promoted_with_real_validation():
-    """zip 内合法 BMP 成员：真实解包 + 逐成员真实验证后提升，字节一致。"""
+    """zip 内合法 BMP 成员：真实解包 + 逐成员真实验证后统一发布，字节一致
+    （P4-app 断言换新：产物在 objects/<slide_id>/data.bmp，不平铺）。"""
     bmp = _bmp_bytes(64, 48)
     z = _make_zip([("wire_zip.bmp", bmp)])
     result = app_mod._prepare_zip_bundle(z)
     assert not isinstance(result, tuple), result
-    assert result["slides"] == ["wire_zip.bmp"]
+    assert [i["key"] for i in result["items"]] == ["wire_zip.bmp"]
     assert result["main"] == "wire_zip.bmp"
-    app_mod._promote_zip_bundle(result)
-    assert (Path(UPLOAD_DIR) / "wire_zip.bmp").read_bytes() == bmp
+    assert result["invalid"] == []
+    sids = _publish_prepared(result)
+    import slide_storage
+    obj = slide_storage.bundle_dir(sids["wire_zip.bmp"], root=UPLOAD_DIR)
+    assert (obj / "data.bmp").read_bytes() == bmp
+    assert not (Path(UPLOAD_DIR) / "wire_zip.bmp").exists()
     assert _residue() == []
 
 
@@ -406,19 +453,21 @@ def test_zip_only_garbage_jpg_member_whole_rejected():
 
 
 def test_zip_mixed_valid_bmp_and_garbage_jpg():
-    """合法 + 无效混合：验证通过的成员进入 slides，无效成员不进可用清单。
-
-    提升语义沿用既有 bundle 行为（entries 全量提升——与既有「损坏 TIFF 伴侣
-    成员」一致，不改 MRXS 伴侣目录语义）；可用切片清单 slides 只含验证通过者。
-    """
+    """合法 + 无效混合（P4-app 断言换新）：无效 item 按 item 失败**剔除**
+    （failures 证据——不再「提升但不可见」），有效 item 照常发布。"""
     bmp = _bmp_bytes(32, 24)
     z = _make_zip([("wire_ok.bmp", bmp), ("wire_mixed_bad.jpg",
                                           b"\x00junk" * 16)])
     result = app_mod._prepare_zip_bundle(z)
     assert not isinstance(result, tuple), result
-    assert result["slides"] == ["wire_ok.bmp"]  # 垃圾 .jpg 不进可用清单
-    app_mod._promote_zip_bundle(result)
-    assert (Path(UPLOAD_DIR) / "wire_ok.bmp").read_bytes() == bmp
+    assert [i["key"] for i in result["items"]] == ["wire_ok.bmp"]
+    assert [f["item"] for f in result["invalid"]] == ["wire_mixed_bad.jpg"]
+    sids = _publish_prepared(result)
+    import slide_storage
+    obj = slide_storage.bundle_dir(sids["wire_ok.bmp"], root=UPLOAD_DIR)
+    assert (obj / "data.bmp").read_bytes() == bmp
+    assert not (Path(UPLOAD_DIR) / "wire_ok.bmp").exists()
+    assert not (Path(UPLOAD_DIR) / "wire_mixed_bad.jpg").exists()
     assert _residue() == []
 
 
@@ -450,8 +499,17 @@ def test_import_slides_raster_batch_ok_and_stable_failure(tmp_path, monkeypatch)
     assert "code=invalid_slide" in errs["wire_imp_bad.jpg"]  # §4.5 稳定码
     assert "不支持的扩展名" in errs["notes.txt"]
     assert "ZIP" in errs["bundle.zip"]
-    assert (upload / "wire_imp.bmp").read_bytes() == bmp  # 原始字节保留
-    assert (upload / "wire_imp.jpg").read_bytes() == jpg
+    # P4-app：产物经统一发布（objects/<slide_id>/，原始字节保留；不平铺）
+    import slide_storage
+    import slide_store
+    descs = {d.original_filename: d for d in slide_store.list_ready_descriptors()}
+    assert set(descs) == {"wire_imp.bmp", "wire_imp.jpg"}
+    for name, data in (("wire_imp.bmp", bmp), ("wire_imp.jpg", jpg)):
+        entry = slide_storage.resolve_descriptor_path(descs[name],
+                                                      root=upload)
+        assert entry.read_bytes() == data
+    assert not (upload / "wire_imp.bmp").exists()
+    assert not (upload / "wire_imp.jpg").exists()
 
 
 def test_import_slides_raster_truncated_rejected_not_promoted(tmp_path,

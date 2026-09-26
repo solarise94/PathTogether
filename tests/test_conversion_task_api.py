@@ -51,6 +51,28 @@ def _fail_first(name="f.kfb", owner="userA", worker="w1"):
                                      detail="internal-secret-detail")
 
 
+def _complete_job(job_id, worker, canonical, *, owner_user_id, settle_bytes):
+    """P4-app：complete_job 已并入 publish 结算事务——测试夹具走
+    validating → intent 持久化 → worker_settle_ready 的等价序列
+    （产物资产行由 create_job 预分配在 staging）。"""
+    job = conversion_store.get_job(job_id)
+    conversion_store.mark_state(job_id, worker, "validating")
+    job = conversion_store.get_job(job_id)
+    gen = str(job["attempt"])
+    conversion_store.persist_commit_intent(job_id, worker, {
+        "task_ref": job_id, "generation": gen, "commit_token": gen,
+        "slide_id": job["slide_id"], "owner_user_id": owner_user_id,
+        "manifest": {"entry": "data.tif",
+                     "files": [{"path": "data.tif", "size": settle_bytes,
+                                "sha256": _sha("complete:" + job_id)}]},
+        "sha256": _sha("complete:" + job_id),
+        "accounted_bytes": int(settle_bytes)})
+    return conversion_store.worker_settle_ready(
+        job_id, worker, gen, slide_id=job["slide_id"],
+        canonical_name=canonical, sha256=_sha("complete:" + job_id),
+        settle_bytes=settle_bytes)
+
+
 def _ids(page):
     return [i["conversion_job_id"] for i in page["items"]]
 
@@ -75,6 +97,13 @@ def test_list_jobs_owner_isolation():
 
 
 def test_list_jobs_empty_string_is_valid_owner():
+    # P4-app：空串 owner（本地免登录归一）任务的产物资产回落配置 owner——
+    # 注入后再建（工作区隔离语义不变：任务行 owner 仍是空串）。
+    import share_store
+    import user_store
+    share_store.set_owner_user_id(
+        user_store.create_user("cvz-local-owner@x.com",
+                               "cvzlocalpass12345", role="user")["user_id"])
     e = _mk_job("", "empty-owner.kfb")
     assert e["owner_user_id"] == ""
     a = _mk_job("userA", "a.kfb")
@@ -134,9 +163,8 @@ def test_list_jobs_group_open_vs_recent():
     ready_src = _mk_job("userA", "r.kfb")
     claimed = conversion_store.claim_one("w1")
     assert claimed["id"] == ready_src["id"]
-    conversion_store.complete_job(
-        ready_src["id"], "w1", ready_src["canonical_name"],
-        owner_user_id="userA", settle_bytes=1024)
+    _complete_job(ready_src["id"], "w1", ready_src["canonical_name"],
+                  owner_user_id="userA", settle_bytes=1024)
     still_open = _mk_job("userA", "open.kfb")    # 领取后仍 queued
 
     open_page = conversion_store.list_jobs(owner_user_id="userA",
@@ -196,8 +224,8 @@ def test_retry_ready_or_open_conflict():
     # ready → StateConflict
     ready = _mk_job("userA", "ok.kfb")
     claimed = conversion_store.claim_one("w1")
-    conversion_store.complete_job(ready["id"], "w1", ready["canonical_name"],
-                                  owner_user_id="userA", settle_bytes=512)
+    _complete_job(ready["id"], "w1", ready["canonical_name"],
+                  owner_user_id="userA", settle_bytes=512)
     with pytest.raises(conversion_store.StateConflict):
         conversion_store.retry_job(ready["id"], owner_user_id="userA",
                                    source_available=True)

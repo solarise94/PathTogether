@@ -461,12 +461,14 @@ def test_crash_between_ingest_and_token_recovers_convert_kfbf(
     assert row["stage"] == "ready"
     assert row["ingest_token"] and row["ingest_token"].startswith("cvj:")
     assert row["slide_name"] == "fl.ome.tif"
-    assert row["slide_id"] is None  # P4-a 前：convert 产物无 ID 回填
-    # 无重复产物：canonical 产物仅一个（.manifest.json/.associated 是
-    # 转换 sidecar，不算重复），conversion job 仅一条
+    assert row["slide_id"]  # P4-app：convert 产物按 job.slide_id 回填
+    # 无重复产物：产物在 objects/<slide_id>/（manifest/associated 同包，
+    # 不算平铺重复）；源副本平铺一份；conversion job 仅一条
     names = _upload_names()
-    assert "fl.kfbf" in names and "fl.ome.tif" in names
-    assert [n for n in names if n.endswith(".ome.tif")] == ["fl.ome.tif"]
+    assert "fl.kfbf" in names
+    assert "fl.ome.tif" not in names
+    up = Path(os.environ["UPLOAD_DIR"])
+    assert (up / "objects" / row["slide_id"] / "data.tif").is_file()
     conn = psycopg.connect(os.environ["DATABASE_URL"])
     try:
         with conn.cursor() as cur:

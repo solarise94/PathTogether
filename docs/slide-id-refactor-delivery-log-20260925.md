@@ -281,3 +281,23 @@
 - `_ai_run_render_context` 名回落（descriptor 解析失败 mtime:size）保留为防御路径。
 - `shares.slides` JSONB 退役顺序文档化（P7）。
 - P6-1 遗留继续：生产停写窗口/旧平铺源清理 manifest/真实 MRXS 样本终审/COS capability off。
+
+## P7 门禁（2026-09-26）：交付验收与部署包（不部署）
+
+计划 §3.3/P7 + 手册 §5/§6。产出两份终审文档（编排方亲自撰写，无代码变更）：
+
+- **docs/slide-id-refactor-acceptance-matrix-20260926.md**：§8 矩阵 17 行逐行映射到持久回归用例（真实 PG/目录、阶段屏障故障注入）+ 门禁执行记录（命令/计数/排除原因）+ 浏览器验收与故障注入证据索引。用例数逐一对仓核对（publish 19/read_gate 10/delete 11/migration_tools 22）。
+- **docs/slide-id-refactor-deployment-package-20260926.md**：两仓提交对应与发布顺序约束（PT 先行 HP 随后、镜像摘要写死）、0067–0070 迁移序列与回填先决、手册 §5 硬门禁逐步落为生产执行单（停写→审计→回填+迁移→独立核验→开放读写）、回滚边界（含 0069 DROP 的 canonical 索引在回滚旧版前须重建的关键提示）、退役清理清单（旧平铺源 manifest/派生物/JSONB 快照/set_slide_meta 残留通道）、明确未做清单（防状态混报：生产审计/迁移/停写未执行、COS capability off、真实 MRXS 终审待生产、Playwright e2e 环境排除）。
+
+**终验门禁（最终态 HEADs：PT 4891744 / HP 4598172）**：
+- PT 全量 2758 passed / 1 已知无关失败（admin 0.4.13）/ 6 skipped；test:js 562/562。
+- HP build（tsc）通过 / unit 1146 / integration 340 / contract 49——四门禁全绿。
+
+**范围边界确认**：未执行生产部署、生产数据审计/搬迁、生产停写；COS capability 保持 off。交付状态=「工具完成 + 副本演练通过 + 方案待批准」，与「生产迁移完成」严格区分（部署包 §7）。
+
+## 阶段总收尾（P0–P7）
+
+- 分支：PathTogether slide-id-refactor（a2b0ae3→4891744，21 提交）+ HistoPilot slide-id-refactor（26fd2a9→4598172，4 提交）。
+- 核心设计全部落地：新上传独立 slide_id；文件名仅展示；强制转移归属/同名认领/名冲突锁/平铺读写旁路全拆（rg 证据逐阶段）；统一发布（六步+PublishChannel）/统一授权（authorize_read+layout 门禁 choke point）/统一删除（slide_delete_jobs+daemon）/统一配额（预约-实占-退款幂等）；无法确认归属先隔离不猜测。
+- 运行时终态：读路径只认 id_bundle；legacy_filename=冻结别名（固定 ID 查找）；迁移工具链就绪且副本演练通过（40 断言可复现）。
+- 下一步在用户：批准部署包 → 晚间低峰窗口执行生产审计与迁移（[[deploy-evening-preference]]）。

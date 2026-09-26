@@ -9,7 +9,9 @@ worker 可 import 本模块（不得 import app）；文件系统操作全部委
 slide_storage，DB 状态/CAS 全部委托 slide_store/upload_task_store/upload_guard
 ——本模块只做编排。
 
-publish_slide 合同（步骤顺序，P3 接线实现）：
+publish_slide 合同（步骤顺序，P3 接线实现；P4-b 起步骤 0/2/4 的任务读写
+经 ``PublishChannel`` 协议注入——upload_tasks 是默认通道，COS ingestion 经
+``publish_with_channel`` + ingestion 通道接入，发布编排保持单一实现）：
 
   0. 前置验证：task_ref 指向的任务行存在且归属本 owner；generation 是任务
      当前有效代次（intent.generation == 入参 generation；旧 generation 不得
@@ -111,6 +113,73 @@ def _decode_intent(task):
     return upload_task_store.decode_commit_intent(task.get("commit_intent_json"))
 
 
+# --------------------------------------------------------------------------- #
+# channel 适配缝（P4-b 合同 §5.4）：任务族差异注入点
+# --------------------------------------------------------------------------- #
+class PublishChannel:
+    """六步编排的任务通道适配协议（P4-b；P3 的 publish_slide 现为
+    upload_tasks 专用，其它任务族经本协议注入，**发布编排不得复制进 worker**）。
+
+    步骤 0/2/4 中随任务表变化的读写全部收敛为下列钩子（锁序、no-clobber FS、
+    恢复幂等、结算短事务结构仍是本模块的单一实现）：
+
+      - ``load_task(task_ref)`` → 任务快照 dict | None（步骤 0 前置读取；
+        None=任务不存在）。
+      - ``is_settled(task)`` → bool（已收口——重复调用/响应丢失重试的幂等出口）。
+      - ``decode_intent(task)`` → None（无 intent）/ ``{}``（损坏，调用方
+        fail-closed）/ intent dict（步骤 1 复核；本模块读取不重新生成）。
+      - ``task_commit_token(task)`` → 任务行当前代次凭证，与
+        ``intent["commit_token"]`` 比对（upload_tasks=commit_token；
+        ingestion=worker_generation）。
+      - ``precheck_locked(cur, task_ref, generation, slide_id, owner_user_id,
+        intent)`` → 锁内重验（步骤 2；调用方事务内、advisory 锁已由调用方
+        **在本事务最先**取得）。违规抛 PublishError / 通道 fencing 异常
+        （如 ingestion 的 StaleLease——由通道调用方按其 worker 语义处理）。
+        预约有效性在本钩子内重验（renew 后仍 reserved；失效抛
+        upload_guard.ReservationInvalid 整体回滚）。
+      - ``settle(task_ref, generation, slide_id, sha256, accounted_bytes)``
+        → ``(task_after, already_settled)``（步骤 4 短事务；内部自取
+        advisory 锁——**第一把锁**，随后按锁序取任务行 → slides 行 →
+        upload_reservations → upload_user_quotas）。
+
+    settle 契约（镜像 upload_tasks 实现）：slides 行 CAS（staging→ready +
+    accounted_bytes=实际字节）→ slide_assets 内容 revision → consume
+    reservation → 任务行收口 UPDATE，**同一事务**；已收口返回 (task, True)
+    不重复结算；任务代次失效拒绝（不猜）。
+    """
+
+
+class UploadTaskPublishChannel(PublishChannel):
+    """默认通道：upload_tasks（V2 分片 + V1 原生单文件；P3 行为原样）。"""
+
+    def load_task(self, task_ref):
+        return upload_task_store.get_task(task_ref)
+
+    def is_settled(self, task):
+        return bool(task) and \
+            task.get("state") == upload_task_store.STATE_COMMITTED and \
+            task.get("commit_intent_json") is None
+
+    def decode_intent(self, task):
+        return _decode_intent(task)
+
+    def task_commit_token(self, task):
+        return task.get("commit_token")
+
+    def precheck_locked(self, cur, task_ref, generation, slide_id,
+                        owner_user_id, intent):
+        return _precheck_locked(cur, task_ref, generation, slide_id,
+                                owner_user_id, intent)
+
+    def settle(self, task_ref, generation, slide_id, sha256, accounted_bytes):
+        return _settle_publish(task_ref, generation, slide_id, sha256,
+                               accounted_bytes)
+
+
+#: 默认通道单例（publish_slide 用；无状态可安全共享）。
+UPLOAD_TASK_CHANNEL = UploadTaskPublishChannel()
+
+
 def build_manifest(entry, size, sha256):
     """单文件包 manifest 构造（entry=data.<ext>；files 含 size/sha256）。"""
     return {"entry": entry, "files": [{"path": entry, "size": int(size),
@@ -133,7 +202,7 @@ def build_intent(slide_id, owner_user_id, manifest, sha256, accounted_bytes):
 # 步骤 0-2：前置验证 + 锁内重验（短事务；advisory 第一把锁）
 # --------------------------------------------------------------------------- #
 def _precheck_locked(cur, task_ref, generation, slide_id, owner_user_id,
-                     intent, manifest):
+                     intent):
     """锁内重验（合同步骤 0/2）：advisory 已由调用方在**本事务**最先取得。
 
     返回锁内任务快照；违规抛 PublishError（deterministic 按语义标注）。
@@ -274,16 +343,21 @@ def _settle_publish(task_ref, generation, slide_id, sha256, accounted_bytes):
 # --------------------------------------------------------------------------- #
 # 对外编排入口（六步；含崩溃恢复的幂等重跑）
 # --------------------------------------------------------------------------- #
-def publish_slide(task_ref, generation, slide_id, manifest=None, *,
-                  owner_user_id=None, upload_root=None):
-    """按模块 docstring 合同编排发布（P3 接线：V2 原生单文件 + V1 单文件）。
+def publish_with_channel(task_ref, generation, slide_id, channel,
+                         manifest=None, *, owner_user_id=None,
+                         upload_root=None):
+    """按模块 docstring 合同编排发布（六步），任务族读写经 ``channel`` 注入。
+
+    P4-b：publish_slide 现为 upload_tasks 专用；COS ingestion 等任务族经
+    ``channel``（PublishChannel 协议）接入同一编排——发布逻辑单一实现，
+    不复制进 worker。
 
     参数：
-      - task_ref：upload_tasks.upload_id（本阶段唯一通道；P4 扩展
-        ingestion/conversion 任务映射）。
-      - generation：任务代次（fencing 键）——V2=commit_token、V1="1"；必须与
-        intent.generation 一致（旧代次拒绝）。
-      - slide_id：预分配资产 ID（upload_tasks.slide_id 绑定源）。
+      - task_ref：通道任务键（upload_tasks=upload_id；ingestion=job_id）。
+      - generation：任务代次（fencing 键）；必须与 intent.generation 一致
+        （旧代次拒绝）。
+      - slide_id：预分配资产 ID（任务表 slide_id 绑定源）。
+      - channel：PublishChannel 协议实现（步骤 0/2/4 的任务读写钩子）。
       - manifest：包清单；None → 从任务 intent 读取（崩溃恢复路径——
         intent 是发布的权威证据，恢复不重新构造）。
       - owner_user_id：任务归属交叉验证（None 跳过该比对，intent/任务/资产
@@ -294,16 +368,16 @@ def publish_slide(task_ref, generation, slide_id, manifest=None, *,
       PublishError(deterministic=True) → 证据冲突/状态破坏（不重试）；
       PublishError(deterministic=False) → 临时故障（保持 committing，恢复重试）；
       PublishConflict → 目标已存在且不吻合（fail-closed 告警不猜）；
+      通道 fencing 异常（如 ingestion 的 StaleLease）→ 原样上抛；
       upload_guard.ReservationInvalid → 预约失效（事务已回滚，调用方撤回）。
     """
-    task = upload_task_store.get_task(task_ref)
+    task = channel.load_task(task_ref)
     if task is None:
         raise PublishError("task_not_found", "任务不存在：%s" % task_ref,
                            deterministic=True)
-    if task.get("state") == upload_task_store.STATE_COMMITTED \
-            and task.get("commit_intent_json") is None:
+    if channel.is_settled(task):
         return task, True  # 已收口：重复 commit/响应丢失重试的幂等出口
-    intent = _decode_intent(task)
+    intent = channel.decode_intent(task)
     if intent is None:
         raise PublishError("intent_missing",
                            "任务无 publish intent（未受理或已收口）",
@@ -319,9 +393,9 @@ def publish_slide(task_ref, generation, slide_id, manifest=None, *,
         raise PublishError("task_slide_mismatch",
                            "intent slide_id 与入参不一致", deterministic=True,
                            task=task)
-    if task.get("commit_token") != intent.get("commit_token"):
+    if channel.task_commit_token(task) != intent.get("commit_token"):
         raise PublishError("generation_mismatch",
-                           "intent commit_token 与任务行不一致", deterministic=True,
+                           "intent 代次凭证与任务行不一致", deterministic=True,
                            task=task)
     try:
         manifest = slide_storage.validate_manifest(
@@ -392,13 +466,18 @@ def publish_slide(task_ref, generation, slide_id, manifest=None, *,
     # 锁内重验（步骤 2）+ 收口（步骤 4）：两段短事务各自先取同一 advisory
     # 锁；状态机 CAS（任务 committing/资产 staging）保证两段之间无 publish/
     # delete/cancel 能插入（cancel 拒绝 committing；delete 只对 ready CAS）。
+    # P4-b 重审（P3 偏差 #1 义务）：FS 发布先于本锁的顺序对 COS worker
+    # lease 模型同样成立——validating+intent 是不可撤销提交段（cancel 被
+    # CommitInProgress 拒），旧 generation 被 worker fencing 拒绝结算，
+    # no-clobber+verify_bundle 幂等兜底重复发布，可见性由 settle 事务的
+    # asset_state CAS 唯一裁定（详见 ingestion_store.IngestionPublishChannel）。
     conn = _connect()
     try:
         with pg_store.transaction(conn):
             with conn.cursor() as cur:
                 slide_store.acquire_slide_lock(cur, slide_id)  # 第一把锁
-                _precheck_locked(cur, task_ref, generation, slide_id,
-                                 owner_user_id, intent, manifest)
+                channel.precheck_locked(cur, task_ref, generation, slide_id,
+                                        owner_user_id, intent)
                 cur.execute("SELECT asset_state FROM slides WHERE slide_id=%s",
                             (slide_id,))
                 srow = cur.fetchone()
@@ -415,7 +494,20 @@ def publish_slide(task_ref, generation, slide_id, manifest=None, *,
     finally:
         conn.close()
 
-    return _settle_publish(task_ref, generation, slide_id, sha256, accounted)
+    return channel.settle(task_ref, generation, slide_id, sha256, accounted)
+
+
+def publish_slide(task_ref, generation, slide_id, manifest=None, *,
+                  owner_user_id=None, upload_root=None):
+    """统一发布入口（upload_tasks 默认通道；V2 原生单文件 + V1 单文件）。
+
+    P4-b：任务族无关的六步编排在 ``publish_with_channel``；本函数 = 默认
+    ``UploadTaskPublishChannel`` 的便捷包装（既有 V2/V1 调用方零改动）。
+    参数与返回值语义见 ``publish_with_channel``。
+    """
+    return publish_with_channel(
+        task_ref, generation, slide_id, UPLOAD_TASK_CHANNEL, manifest,
+        owner_user_id=owner_user_id, upload_root=upload_root)
 
 
 def read_intent(task):

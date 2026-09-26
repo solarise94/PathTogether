@@ -28,11 +28,13 @@ Delete/List 分页）只发生在本 worker。对象 key 由服务端生成
    预算、不采用其数据（§3.3）；wire 预算 = declared × multiplier，超限
    硬停；读满后流式 SHA-256 → validating；
 6. ``process_validating``：落盘前重查水位 → 大小/open_slide 校验 → 持久化
-   commit intent（§4 提交恢复栅栏）→ no-clobber 提升（hardlink 优先，绝不
-   os.replace）→ metadata → 配额一次结算（ready）；
-7. ``process_ready``：Viewer readiness probe（照 conversion_worker 的代表性
-   tile 探针）→ completed；暂时失败只记 retry 事件并释放租约，不重下载、
-   不删本地副本（§4）；
+   commit intent（§4 提交恢复栅栏）→ **统一发布**（slide_publish 六步经
+   ingestion 通道适配：no-clobber 发布 objects/<slide_id>/、结算=mark_ready
+   + accounted_bytes + consume 同事务——P4-b 合同 §5；本地提升/元数据/
+   归属终检/force-owner 族整体拆除——ID 目录无同名冲突）；
+7. ``process_ready``：Viewer readiness probe（按 descriptor 路径试开，
+   照 conversion_worker 的代表性 tile 探针）→ completed；暂时失败只记
+   retry 事件并释放租约，不重下载、不删本地副本（§4）；
 8. ``process_cleanup``：Abort（幂等）+ 全版本删除（含 delete marker）+ 分页
    复查 → ``finalize_cleanup`` 释放池预约（§6.2）；任何 CosClientError →
    ``record_cleanup_failure`` 指数退避；
@@ -54,7 +56,6 @@ import logging
 import os
 import re
 import secrets
-import shutil
 import sys
 import time
 
@@ -70,11 +71,11 @@ import cos_config  # noqa: E402
 import cos_pool_store  # noqa: E402
 import ingestion_store as ist  # noqa: E402
 import pg_store  # noqa: E402
-import share_store  # noqa: E402
-import share_store_pg  # noqa: E402  # 归属终检读 _OWNER_USER_ID（匿名回落）
 import slide_io  # noqa: E402
+import slide_publish  # noqa: E402
+import slide_storage  # noqa: E402
+import slide_store  # noqa: E402
 import upload_guard  # noqa: E402
-import user_store  # noqa: E402
 
 _log = logging.getLogger("svs.cos_ingest")
 
@@ -117,43 +118,49 @@ def _ensure_upload_dir() -> str:
     return path
 
 
-def part_name(job_id: str) -> str:
-    """同卷暂存 part 文件名（UPLOAD_DIR 下隐藏文件，含 job_id 便于归因）。"""
-    return ".ingesting-%s.part" % job_id
+def staging_data_path(job_id, generation, format_ext, *, root=None):
+    """下载/发布共用的暂存数据文件路径（P4-b 合同 §5.3）：
+    ``UPLOAD_DIR/.staging/<job_id>/<worker_generation>/data.<ext>``。
+
+    generation = 领取任务的 worker_generation（claim 递增）；断点跨代续传
+    由 ``_adopt_staged_data`` 收养上一代文件保证（分片 pwrite/进度持久化
+    语义不变——进度权威在 download_checkpoint_json，不在文件名）。"""
+    ext = (format_ext or "").strip().lower() or "dat"
+    return slide_storage.staging_dir(job_id, str(generation), root=root) / \
+        ("data.%s" % ext)
 
 
-def _stat_ident(path):
-    """路径的文件身份 (st_dev, st_ino)；stat 失败返回 None。
-
-    归属拒绝分支的**诊断**用（review 第四轮 P1 后不再据此删除）：判定
-    dest 是否仍为本任务提升的那份，供人工清理滞留文件时参考。stat 与
-    unlink 之间无原子性，任何「检查后再删」都有误删并发替换文件的窗口。
-    """
-    try:
-        st = os.stat(path)
-        return (st.st_dev, st.st_ino)
-    except OSError:
+def _find_staged_data(job_id, *, root=None):
+    """在 ``.staging/<job_id>/<gen>/`` 下定位既有 data.<ext>（上一代 worker
+    的断点件；同刻至多一份，按 mtime 取最新）。无则 None。"""
+    task_dir = slide_storage.staging_task_dir(job_id, root=root)
+    if not task_dir.is_dir():
         return None
+    candidates = []
+    for path in task_dir.glob("*/data.*"):
+        try:
+            if path.is_file():
+                candidates.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    if not candidates:
+        return None
+    return max(candidates)[1]
 
 
-def _file_sha256_matches(path, expected_hex) -> bool:
-    """流式比对文件 SHA-256（提交恢复的内容级归属核实，P1-2）。
-
-    expected_hex 非法/为空一律 False（fail-closed，不猜）。
-    """
-    if not expected_hex or len(expected_hex) != 64:
-        return False
-    h = hashlib.sha256()
-    try:
-        with open(path, "rb") as f:
-            while True:
-                buf = f.read(_IO_BUF_BYTES)
-                if not buf:
-                    break
-                h.update(buf)
-    except OSError:
-        return False
-    return h.hexdigest() == expected_hex.lower()
+def _adopt_staged_data(job_id, generation, format_ext, *, root=None):
+    """断点件收养：本代路径无文件且 checkpoint>0 时，把上一代留下的
+    data.<ext> 原子搬入本代目录（os.replace）——resume 语义跨 worker
+    generation 保持（进度以 checkpoint 为权威，ftruncate 收口未确认尾部）。"""
+    target = staging_data_path(job_id, generation, format_ext, root=root)
+    if target.exists():
+        return target
+    prior = _find_staged_data(job_id, root=root)
+    if prior is None:
+        return None
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(prior, target)
+    return target
 
 
 def make_object_key(job) -> str:
@@ -197,46 +204,6 @@ def _sha256_file(path, chunk=_IO_BUF_BYTES) -> str:
                 break
             h.update(buf)
     return h.hexdigest()
-
-
-def _promote_no_clobber(src, dest) -> str:
-    """原子 no-clobber 提升（逐句照 app.py:_promote_no_clobber，不 import app）。
-
-    优先 hardlink（源仍在，失败可回滚）；``os.replace`` 会覆盖并发出现的
-    同名目标并把源移走，破坏 no-clobber，禁止使用。跨设备时复制到 dest
-    同目录唯一临时名再 link，绝不 replace。目标已存在 → FileExistsError。
-    """
-    try:
-        os.link(src, dest)
-        return "link"
-    except FileExistsError:
-        raise
-    except OSError:
-        tmp = os.path.join(
-            os.path.dirname(dest), ".promoting-%s-%s"
-            % (os.path.basename(dest), secrets.token_hex(8)))
-        try:
-            shutil.copy2(src, tmp)
-            os.link(tmp, dest)
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        return "copy-link"
-
-
-def _unlink_quiet(path):
-    """尽力删除文件（终态清理路径；失败只记 debug，不阻断收口）。"""
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
 
 
 def _release_lease(job_id, token, state=None):
@@ -607,12 +574,16 @@ def _fetch_range(cos, key, version_id, start, end, declared_size,
 def process_downloading(cos=None, state=None):
     """领取 DOWNLOADING：断点续传至读满 declared → 流式 SHA-256 → validating。
 
-    - checkpoint（download_checkpoint_json.next_offset）为已确认偏移；part
-      文件先 ftruncate 到该偏移，丢弃上次崩溃的未确认尾部（不删文件）；
-    - part 文件丢失而 checkpoint>0 时归零重下（已确认数据不可信）；
+    P4-b（合同 §5.3）：暂存件落 ``.staging/<job_id>/<worker_generation>/
+    data.<ext>``（slide_storage.staging_dir；不再平铺 ``<job_id>.part``）——
+    重领换代后由 ``_adopt_staged_data`` 收养上一代断点件，续传语义不变：
+
+    - checkpoint（download_checkpoint_json.next_offset）为已确认偏移；暂存件
+      先 ftruncate 到该偏移，丢弃上次崩溃的未确认尾部（不删文件）；
+    - 暂存件丢失而 checkpoint>0 时归零重下（已确认数据不可信）；
     - 每块尾持久化进度（wire_delta=实际传输，logical_delta=新增唯一字节）；
     - wire 预算 = declared × COS_DOWNLOAD_WIRE_BUDGET_MULTIPLIER，超限
-      fail_job('download_budget_exceeded') 并删 part；
+      fail_job('download_budget_exceeded') 并清任务暂存树；
     - 网络错/坏响应：worker_download_retry 回队（checkpoint 回退到已确认
       offset），wire 记账先持久化再回队；
     - 同一 worker 跨轮续传用 holding_token（state['download_token']）。
@@ -635,13 +606,13 @@ def process_downloading(cos=None, state=None):
     next_offset = int(checkpoint.get("next_offset") or 0)
     wire_total = int(job.get("wire_download_bytes") or 0)
     directory = _ensure_upload_dir()
-    part_path = os.path.join(directory, part_name(job_id))
+    data_path = staging_data_path(job_id, gen, job.get("format_ext"),
+                                  root=directory)
 
     def _fail(code):
-        _unlink_quiet(part_path)
         state.pop("download_token", None)
         try:
-            ist.fail_job(job_id, gen, code)
+            ist.fail_job(job_id, gen, code)  # 终态收口内含暂存树清理
         except ist.StaleLease:
             pass
         _log.warning("下载失败终态（job=%s code=%s）", job_id, code)
@@ -655,12 +626,16 @@ def process_downloading(cos=None, state=None):
     if not key or not version_id:
         _fail("source_not_pinned")
         return None
-    if os.path.exists(part_path):
-        fd = os.open(part_path, os.O_RDWR)
+    if not data_path.exists() and next_offset > 0:
+        # 换代重领：收养上一代断点件（进度权威在 checkpoint，不在文件名）。
+        _adopt_staged_data(job_id, gen, job.get("format_ext"), root=directory)
+    if data_path.exists():
+        fd = os.open(data_path, os.O_RDWR)
     else:
         # 文件丢失：已确认字节无从保证，归零重下（预算已有 wire 记账）。
         next_offset = 0
-        fd = os.open(part_path, os.O_RDWR | os.O_CREAT, 0o600)
+        data_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(data_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         os.ftruncate(fd, next_offset)  # 丢弃未确认尾部，checkpoint 为权威
         if next_offset < declared and wire_total >= budget:
@@ -741,14 +716,30 @@ def process_downloading(cos=None, state=None):
 
 
 # --------------------------------------------------------------------------- #
-# 6) validating：校验 + commit intent + no-clobber 提升 + metadata + 结算
+# 6) validating：校验 + commit intent + 统一发布（slide_publish 六步）
 # --------------------------------------------------------------------------- #
 def process_validating(cos=None, state=None):
-    """领取 VALIDATING：本地校验 → commit intent → 提升 → metadata → ready。
+    """领取 VALIDATING：本地校验 → commit intent → 统一发布（P4-b §5.4）。
 
-    §4 提交恢复栅栏：intent 已持久化（崩溃恢复重跑）时幂等推进——dest 已
-    存在且大小==declared 则跳过提升直接结算；dest 缺失则从 intent 记录的
-    part 文件补提升。配额一次结算在 worker_settle_ready 内（consume）。
+    本地提升/metadata/归属终检/force-owner/name_unavailable 族已拆除——
+    ID 目录无同名冲突（objects/<slide_id>/ 由预分配 ID 唯一化）；发布编排
+    在 slide_publish（经 ingestion 通道适配），本函数只做：
+
+      1. 定位暂存件：intent 在（崩溃恢复）→ 以 intent 记录的代次目录为准；
+         否则收养 ``.staging/<job_id>/<gen>/`` 下的断点件（下载代留下的）；
+      2. 恢复路径 sha 以 intent 为权威（不重算）；新路径重查水位 → 大小/
+         open_slide 校验 → sha（checkpoint 优先，缺失复算）；
+      3. 断点件搬入本代 generation 目录（fencing=本代 worker_generation），
+         以本代重新持久化 intent（证据字段不变，仅代次更新）；
+      4. slide_publish.publish_with_channel：FS 发布（no-clobber；目标已
+         存在且 manifest 吻合 → 只做 DB 收口）+ 结算（worker_settle_ready：
+         mark_ready + accounted_bytes + 内容 revision + consume 同事务）。
+
+    FS 发布先于 advisory 锁（P3 偏差 #1 顺序）在本 worker lease 模型下的
+    重审结论：成立——validating+intent 是不可撤销提交段（取消被
+    CommitInProgress 拒）、旧 generation 被 fencing 拒绝结算、重复 FS 发布
+    由 no-clobber+verify 幂等吸收、可见性只由结算事务的 asset_state CAS
+    裁定（详见 ingestion_store.IngestionPublishChannel docstring）。
     """
     job = ist.claim_next_job_for_worker([ist.VALIDATING])
     if job is None:
@@ -757,150 +748,143 @@ def process_validating(cos=None, state=None):
     gen = job["worker_generation"]
     token = job["worker_lease_token"]
     declared = int(job["declared_size"])
-    safe_name = job["safe_name"]
-    directory = _ensure_upload_dir()
-    dest = os.path.join(directory, safe_name)
+    ext = (job.get("format_ext") or "").strip().lower() or "dat"
+    slide_id = (job.get("slide_id") or "").strip()
     intent = job.get("commit_intent_json")
-    adopted_existing = False
-    promoted_ident = None  # 本任务提升出的 dest 的 (dev, ino)（若有）
+    directory = _ensure_upload_dir()
+    entry = "data.%s" % ext
+
+    def _fail(code):
+        try:
+            ist.fail_job(job_id, gen, code)  # 终态收口内含暂存树清理
+        except ist.StaleLease:
+            pass
+        _log.warning("validating 终态失败（job=%s code=%s）", job_id, code)
+
+    if not slide_id:
+        # 创建即绑定（P4-b）；无绑定=升级窗口旧行或不变量破坏，fail-closed。
+        _fail("slide_binding_missing")
+        return None
+
     if intent:
         # 崩溃恢复：sha 以 intent 为权威（提升前已算好），不重算 9.5GB。
-        sha = intent.get("sha256") or ""
-        part_path = os.path.join(
-            directory, intent.get("part") or part_name(job_id))
-        if os.path.exists(dest) and os.path.getsize(dest) == declared:
-            # review 740e823 P1-2：大小一致≠归属本任务——崩溃窗口内其它上
-            # 传可能创建同名同大小文件。恢复采纳前必须内容级核实（流式
-            # 比对 intent.sha256，仅在恢复路径付一次全读）；不符按 no-clobber
-            # 语义失败（目标名已被他人占用），绝不猜、不覆盖。
-            if not _file_sha256_matches(dest, sha):
-                _unlink_quiet(part_path)
-                ist.fail_job(job_id, gen, "name_unavailable")
-                _log.warning("commit 恢复：目标文件内容与本任务不符，"
-                             "按名称占用失败（job=%s）", job_id)
-                return None
-            adopted_existing = True  # 内容确属本任务，但文件可能非本任务落盘
-        elif os.path.exists(part_path):
-            try:
-                _promote_no_clobber(part_path, dest)
-                promoted_ident = _stat_ident(dest)  # 归属拒绝时诊断用基准
-            except FileExistsError:
-                _unlink_quiet(part_path)
-                ist.fail_job(job_id, gen, "name_unavailable")
-                return None
-        else:
-            # intent 在、dest 与 part 都不在：理论不可达（link 原子 + part 在
-            # 结算后才删），fail-closed 交人工。
-            _log.error("commit 恢复失败：dest 与 part 均缺失（job=%s）", job_id)
-            ist.fail_job(job_id, gen, "commit_recovery_failed")
+        sha = str(intent.get("sha256") or "")
+        src_gen = intent.get("generation")
+        staged = None
+        if src_gen not in (None, ""):
+            src = slide_storage.staging_dir(job_id, str(src_gen),
+                                            root=directory) / entry
+            if src.is_file():
+                staged = src
+        if staged is None:
+            # 兜底：断点件在下载代目录（intent 持久化与换代之间的窗口）——
+            # 位置不是权威证据（sha/slide_id 才是），按树内最新收养。
+            staged = _find_staged_data(job_id, root=directory)
+        if staged is None and \
+                not slide_storage.bundle_dir(slide_id, root=directory).exists():
+            # intent 在、staging 与目标包均缺失：理论不可达（发布原子 rename
+            # + intent 先于 FS），fail-closed 交人工。
+            _log.error("commit 恢复失败：staging 与目标包均缺失（job=%s）",
+                       job_id)
+            _fail("commit_recovery_failed")
             return None
+        # 目标包已存在（FS 发布后崩溃）→ staged 为 None 也继续：publish 的
+        # 恢复分支按 manifest 核对后只做 DB 收口，不再触碰 staging。
     else:
-        part_path = os.path.join(directory, part_name(job_id))
+        # 落盘（发布）前重查水位（§6.3：创建时和落盘前都查）。
         try:
-            # 落盘（copy-link 兜底）前重查水位（§6.3：创建时和落盘前都查）。
             upload_guard.check_disk_watermark(directory, need_bytes=declared)
         except upload_guard.DiskWatermarkExceeded as exc:
             _release_lease(job_id, token, state)  # 瞬态：保持 validating 下轮再试
             _log.warning("水位不足，validating 暂停（job=%s）：%s", job_id, exc)
             return None
-        if not os.path.exists(part_path):
-            ist.fail_job(job_id, gen, "part_missing")
+        staged = _find_staged_data(job_id, root=directory)
+        if staged is None:
+            _fail("part_missing")
             return None
-        if os.path.getsize(part_path) != declared:
-            _unlink_quiet(part_path)
-            ist.fail_job(job_id, gen, "local_size_mismatch")
+        if os.path.getsize(staged) != declared:
+            _fail("local_size_mismatch")
             return None
         try:
-            # open_slide 试开+关（app.py:_validate_slide_file 同口径；format_hint
-            # 用 safe_name——.part 后缀不参与逻辑格式判定）。
-            opened = slide_io.open_slide(part_path, format_hint=safe_name)
+            # open_slide 试开+关（app.py:_validate_slide_file 同口径；
+            # format_hint 用客户端文件名——暂存件扩展名不参与逻辑格式判定）。
+            opened = slide_io.open_slide(
+                staged, format_hint=(job.get("filename")
+                                     or job.get("safe_name") or entry))
             try:
                 opened.close()
             except Exception:  # noqa: BLE001
                 pass
         except Exception as exc:  # noqa: BLE001
-            _unlink_quiet(part_path)
-            ist.fail_job(job_id, gen, "validation_failed")
+            _fail("validation_failed")
             _log.warning("open_slide 校验失败（job=%s）：%s", job_id,
                          type(exc).__name__)
             return None
         sha = (job.get("download_checkpoint_json") or {}).get("sha256") or ""
         if not sha:
-            sha = _sha256_file(part_path)
-        try:
-            ist.worker_persist_commit_intent(job_id, gen, {
-                "target": safe_name,
-                "source_version": job.get("cos_version_id") or "",
-                "sha256": sha,
-                "declared_size": declared,
-                "part": os.path.basename(part_path)})
-        except ist.StaleLease:
-            return None
-        try:
-            _promote_no_clobber(part_path, dest)
-            promoted_ident = _stat_ident(dest)  # 删除守卫的同一性基准
-        except FileExistsError:
-            # 同名已存在他人文件：no-clobber 拒绝（绝不 os.replace 覆盖）。
-            _unlink_quiet(part_path)
-            ist.fail_job(job_id, gen, "name_unavailable")
-            return None
+            sha = _sha256_file(staged)
+
+    # 统一发布：断点件搬入本代目录（staging 位置与 fencing 都以当代为准）。
+    gen_dir = slide_storage.staging_dir(job_id, gen, root=directory)
     try:
-        meta = share_store.set_slide_meta(
-            safe_name,
-            owner_user_id=(job.get("owner_user_id") or None),
-            requester_role=user_store.ROLE_OWNER)
-        # 归属终检（review 第二轮 P1）：同名 slides 行已有**其它** owner 时
-        # set_slide_meta 不覆盖、只把现存 owner 返回——内容相同（sha 恰好
-        # 一致）的他人上传也会走到这里。不核返回值就会出现「本任务结算
-        # 成功、切片却归属他人」。匿名回落到平台 owner（_OWNER_USER_ID）
-        # 视为一致。
-        meta_owner = ((meta or {}).get("owner_user_id") or "").strip()
-        ours = (job.get("owner_user_id") or "").strip()
-        # 平台 owner 回落等价**仅限匿名任务**：实名任务要求精确归属
-        # （review 第三轮 P1：普通用户任务不能认领平台 owner 的同名文件）。
-        platform_owner = (share_store_pg._OWNER_USER_ID or "").strip()
-        anonymous_took_platform = (ours == "" and platform_owner
-                                   and meta_owner == platform_owner)
-        if meta_owner and meta_owner != ours and not anonymous_took_platform:
-            # 名称已被他人持有。恢复认领场景（文件本属对方）：绝不动。
-            # 本任务提升场景：dest 是本任务字节且不可安全按路径删除
-            # （第四轮 P1），保留文件的同时必须收口可见性（第五轮 P1：
-            # 列表/读取按 slides.owner_user_id 判定，不收口就把本上传内容
-            # 暴露给旧主人及其历史授权）——**元数据归属强制跟随实际文件**：
-            # 仅当 dest 仍是本任务提升的那份（still_ours）时，单事务撤销
-            # 旧 view 授权并把归属 CAS 转移给本任务主人（旧 alias/note 一并
-            # 复位，不泄露旧主人备注）；已非本任务文件（被并发替换）则保持
-            # 对方元数据不动（对方文件配对方元数据，自洽）。残余窗口：stat
-            # 判定后、转移提交前被替换——DB/FS 无法跨系统原子，届时
-            # outcome=transferred 但内容不符，error 日志交人工核对。
-            if not adopted_existing:
-                still_ours = (promoted_ident is not None
-                              and _stat_ident(dest) == promoted_ident)
-                if still_ours:
-                    outcome = share_store.force_slide_owner_follow_file(
-                        safe_name, expected_owner=meta_owner,
-                        new_owner=(ours or None),
-                        requester_role=user_store.ROLE_OWNER)
-                    _log.error(
-                        "归属终检拒绝：dest 保留，元数据跟随文件转移给上传者"
-                        "（outcome=%s；任务 failed，滞留文件由上传者自行删除）"
-                        "（job=%s name=%s）", outcome, job_id, safe_name)
-                else:
-                    _log.error(
-                        "归属终检拒绝：dest 已非本任务文件，保持对方元数据"
-                        "不动（job=%s name=%s）", job_id, safe_name)
-            _unlink_quiet(part_path)
-            ist.fail_job(job_id, gen, "name_unavailable")
-            _log.warning("归属终检失败：名称已被其它账号持有（job=%s）",
-                         job_id)
-            return None
-        ist.worker_settle_ready(
-            job_id, gen, slide_canonical_name=safe_name, sha256_actual=sha,
-            settle_bytes=os.path.getsize(dest))
+        if staged is not None:
+            gen_dir.mkdir(parents=True, exist_ok=True)
+            os.replace(staged, gen_dir / entry)
+        manifest = slide_publish.build_manifest(entry, declared, sha)
+        ist.worker_persist_commit_intent(job_id, gen, {
+            "task_ref": job_id,
+            "generation": gen,
+            "commit_token": str(gen),
+            "slide_id": slide_id,
+            "owner_user_id": ist.asset_owner_for_job(job),
+            "manifest": manifest,
+            "sha256": sha,
+            "accounted_bytes": declared,
+            "source_version": job.get("cos_version_id") or "",
+            "target": job.get("safe_name"),  # 展示快照（canonical 名退役）
+            "declared_size": declared})
+        _task_after, _settled = slide_publish.publish_with_channel(
+            job_id, gen, slide_id, ist.INGESTION_PUBLISH_CHANNEL,
+            manifest=manifest, upload_root=directory)
     except ist.StaleLease:
+        return None  # 失租：新 worker 已接管（换代收养/恢复重跑），静默放弃
+    except ist.IngestionStateError as exc:
+        # persist 被拒：状态被并发推进（如取消先赢——intent 从未持久化成功）。
+        _log.warning("commit intent 持久化被拒（job=%s）：%s", job_id, exc)
         return None
-    _unlink_quiet(part_path)  # 提升成功后清理同卷暂存（dest 已独立存在）
-    _log.info("本地入库完成（job=%s slide=%s）", job_id, safe_name)
+    except slide_publish.PublishConflict as exc:
+        # 目标包已存在且 manifest/sha 不吻合：不变量破坏，fail-closed 不删
+        # 不猜——任务 failed 保留证据（intent/事件），滞留包交人工核对。
+        _log.error("发布证据冲突（fail-closed，job=%s slide=%s）：%s",
+                   job_id, slide_id, exc)
+        _fail("publish_conflict")
+        return None
+    except slide_publish.PublishError as exc:
+        if exc.deterministic:
+            _fail(exc.code)
+        else:
+            # 瞬态故障：保持 validating（intent 已持久化），恢复幂等重跑。
+            _release_lease(job_id, token, state)
+            _log.warning("发布临时故障，保持 validating（job=%s）：%s",
+                         job_id, exc)
+        return None
+    except upload_guard.ReservationInvalid:
+        # 预约失效发生在结算事务内（已回滚）：撤回已发布包再判失败——
+        # 不留 ready 文件、不漏账（consume 未发生）。
+        _log.warning("结算时预占已失效，撤回已发布包（job=%s）", job_id)
+        try:
+            slide_storage.remove_bundle(slide_id, root=directory)
+        except Exception:  # noqa: BLE001
+            _log.exception("撤回已发布包失败（slide=%s）", slide_id)
+        _fail("reservation_expired")
+        return None
+    # 收口成功：清理任务暂存整树（同卷 rename 已带走本代目录；换代残件与
+    # 跨卷复制残件一并清掉——ID 包已在 objects/<slide_id>/ 独立存在）。
+    try:
+        slide_storage.remove_staging_tree(job_id, root=directory)
+    except Exception:  # noqa: BLE001
+        _log.debug("暂存树清理失败（job=%s）", job_id, exc_info=True)
+    _log.info("统一发布完成（job=%s slide_id=%s）", job_id, slide_id)
     _release_lease(job_id, token, state)
     return job_id
 
@@ -927,17 +911,37 @@ def _probe_viewer_ready(path):
             pass
 
 
+def _ready_probe_path(job, *, root=None):
+    """readiness 探针路径（P4-b 合同 §5.4）：按 descriptor 路径试开
+    （resolve_descriptor_path——objects/<slide_id>/data.<ext>），不再按
+    slide_canonical_name 拼路径。无绑定的升级窗口旧行回落按名（P6 排空）。"""
+    sid = (job.get("slide_id") or "").strip()
+    if sid:
+        desc = slide_store.resolve_slide_id(sid)
+        if desc is None:
+            return None
+        return slide_storage.resolve_descriptor_path(desc, root=root)
+    canonical = job.get("slide_canonical_name") or ""
+    if not canonical:
+        return None
+    base = slide_storage.upload_root() if root is None else root
+    return os.path.join(str(base), canonical)
+
+
 def process_ready(cos=None, state=None):
-    """领取 READY：readiness probe → completed；失败记 retry 事件并释放租约。"""
+    """领取 READY：readiness probe（descriptor 路径）→ completed；失败记
+    retry 事件并释放租约（§4：不降级、不重下载、不删副本）。"""
     job = ist.claim_next_job_for_worker([ist.READY])
     if job is None:
         return None
     job_id = job["job_id"]
     gen = job["worker_generation"]
     token = job["worker_lease_token"]
-    canonical = job.get("slide_canonical_name") or ""
     try:
-        _probe_viewer_ready(os.path.join(upload_dir(), canonical))
+        probe_path = _ready_probe_path(job, root=_ensure_upload_dir())
+        if probe_path is None:
+            raise ValueError("probe_path_missing（slide_id 未解析到资产）")
+        _probe_viewer_ready(probe_path)
     except Exception as exc:  # noqa: BLE001  确定性失败也只重试（§4）
         try:
             ist.worker_note_readiness_retry(

@@ -15,6 +15,7 @@ no-clobber 提升、commit intent 幂等恢复、配额一次结算）、ready p
 import hashlib
 import io
 import itertools
+import json
 import logging
 import os
 
@@ -28,6 +29,8 @@ import cos_pool_store
 import ingestion_store as ist
 import pg_store
 import slide_io
+import slide_storage
+import slide_store
 import upload_guard
 
 _seq = itertools.count(1)
@@ -101,8 +104,17 @@ def _payload(size):
     return bytes((i * 7 + 3) % 256 for i in range(size))
 
 
-def _part_path(tmp_path, job_id):
-    return os.path.join(str(tmp_path), ciw.part_name(job_id))
+def _staged(job_id, generation=None, ext="svs"):
+    """任务暂存 data.<ext> 路径（P4-b：.staging/<job>/<gen>/data.<ext>）。"""
+    if generation is None:
+        found = ciw._find_staged_data(job_id, root=_env_dir())
+        return found
+    return ciw.staging_data_path(job_id, generation, ext, root=_env_dir())
+
+
+def _bundle_data(slide_id):
+    """已发布 ID 包入口文件路径（objects/<slide_id>/data.svs）。"""
+    return slide_storage.bundle_dir(slide_id, root=_env_dir()) / "data.svs"
 
 
 # --------------------------------------------------------------------------- #
@@ -350,14 +362,24 @@ def test_preparing_generates_server_side_key_and_freezes_plan():
     assert sum(p["length"] for p in out["part_plan_json"]) == 150
 
 
-def test_preparing_anon_owner_segment():
-    """owner_user_id 为空（免登录共享身份）→ anon 段，不落用户标识。"""
+def test_preparing_anon_owner_segment(monkeypatch):
+    """owner_user_id 为空（免登录共享身份）→ anon 段，不落用户标识。
+
+    P4-b：匿名任务的资产 owner 按「配置 owner」口径回落（创建即预分配；
+    空回落不再可能——create 会拒绝）。"""
+    import share_store
+    monkeypatch.setattr(share_store, "get_owner_user_id",
+                        lambda: "platform-owner")
     fake, st = FakeCos(), {}
     job = _mkjob(owner="", role="", size=100)
     _admit(job["job_id"])
     ciw.process_preparing(cos=fake, state=st)
-    key = ist.get_job(job["job_id"])["object_key"]
+    out = ist.get_job(job["job_id"])
+    key = out["object_key"]
     assert key.startswith("incoming/anon/%s/" % job["job_id"])
+    # 预分配资产归配置 owner（不允许空 owner 自动认领）
+    desc = slide_store.resolve_slide_id(out["slide_id"])
+    assert desc is not None and desc.owner_user_id == "platform-owner"
 
 
 def test_preparing_config_missing_releases_lease_and_stays():
@@ -436,9 +458,10 @@ def test_download_resumes_from_checkpoint_range():
     ist.request_upload_complete(job["job_id"])
     ciw.process_completing(cos=fake, state=st)
     ciw.process_queued(cos=fake, state=st)
-    # 模拟上次中断：已确认 60 字节（checkpoint 持久、part 文件在）
+    # 模拟上次中断：已确认 60 字节（checkpoint 持久、断点件在上一代目录）
     c = ist.claim_next_job_for_worker([ist.DOWNLOADING])
-    part = _part_path(_env_dir(), job["job_id"])
+    part = _staged(job["job_id"], c["worker_generation"])
+    part.parent.mkdir(parents=True, exist_ok=True)
     with open(part, "wb") as fh:
         fh.write(payload[:60])
     ist.worker_update_download_progress(
@@ -450,7 +473,11 @@ def test_download_resumes_from_checkpoint_range():
     assert fake.range_log[0][2] == "bytes=60-89"  # 从 checkpoint 起 Range
     out = ist.get_job(job["job_id"])
     assert out["state"] == ist.VALIDATING
-    with open(part, "rb") as fh:
+    # 换代收养：断点件被搬入当代 generation 目录（P4-b 续传语义不变）
+    staged_now = _staged(job["job_id"])
+    assert staged_now is not None
+    assert str(staged_now.parent.name) == str(out["worker_generation"])
+    with open(staged_now, "rb") as fh:
         assert fh.read() == payload
     assert out["download_checkpoint_json"]["sha256"] == \
         hashlib.sha256(payload).hexdigest()
@@ -472,8 +499,8 @@ def test_download_wrong_content_range_rejected_counts_wire():
     assert out["state"] == ist.QUEUED  # 回队重试
     assert out["downloaded_bytes"] == 0  # 数据不被采纳
     assert out["wire_download_bytes"] == 25  # 已传输 25 字节计入 wire
-    part = _part_path(_env_dir(), job["job_id"])
-    assert not os.path.exists(part) or os.path.getsize(part) == 0
+    staged = _staged(job["job_id"])  # 坏响应数据不落盘（或空文件）
+    assert staged is None or os.path.getsize(staged) == 0
     # 故障清除后续传成功
     ciw.process_queued(cos=fake, state=st)
     ciw.process_downloading(cos=fake, state=st)
@@ -482,14 +509,13 @@ def test_download_wrong_content_range_rejected_counts_wire():
 
 def test_download_200_whole_object_rejected_then_budget_exceeded():
     # 预算 = 150 × 2 = 300：第一次 200 排干 150（< 300）回队；第二次再烧
-    # 150 后 wire=300 已无进展可能 → 硬停终态并删 part。
+    # 150 后 wire=300 已无进展可能 → 硬停终态并清任务暂存树。
     fake, st = FakeCos(), {}
     job, payload = _prepare(fake, st)
     _put_plan_parts(fake, job, payload)
     ist.request_upload_complete(job["job_id"])
     ciw.process_completing(cos=fake, state=st)
     ciw.process_queued(cos=fake, state=st)
-    part = _part_path(_env_dir(), job["job_id"])
     fake.get_faults = [{"status": 200}, {"status": 200}]
     ciw.process_downloading(cos=fake, state=st)
     out = ist.get_job(job["job_id"])
@@ -501,7 +527,9 @@ def test_download_200_whole_object_rejected_then_budget_exceeded():
     out = ist.get_job(job["job_id"])
     assert out["state"] == ist.FAILED
     assert out["fail_code"] == "download_budget_exceeded"
-    assert not os.path.exists(part)  # 终态失败删 part
+    # 终态失败清任务暂存树（P4-b：fail_job 内含清理）
+    assert not slide_storage.staging_task_dir(
+        job["job_id"], root=_env_dir()).exists()
 
 
 def test_download_network_error_retries_keeps_partial_file():
@@ -515,12 +543,11 @@ def test_download_network_error_retries_keeps_partial_file():
     ciw.process_downloading(cos=fake, state=st)
     out = ist.get_job(job["job_id"])
     assert out["state"] == ist.QUEUED  # 回队，checkpoint 已持久
-    part = _part_path(_env_dir(), job["job_id"])
     ciw.process_queued(cos=fake, state=st)
     ciw.process_downloading(cos=fake, state=st)  # 恢复后完整下载
     out = ist.get_job(job["job_id"])
     assert out["state"] == ist.VALIDATING
-    with open(part, "rb") as fh:
+    with open(_staged(job["job_id"]), "rb") as fh:
         assert fh.read() == payload
 
 
@@ -538,9 +565,11 @@ def test_validating_watermark_gates_before_promote(monkeypatch):
     ciw.process_validating(cos=fake, state=st)
     out = ist.get_job(job["job_id"])
     assert out["state"] == ist.VALIDATING  # 瞬态暂停，不 fail
-    assert not os.path.exists(os.path.join(_env_dir(), "a.svs"))
-    assert os.path.exists(_part_path(_env_dir(), job["job_id"]))
-    # 水位恢复后同一 duty 可推进
+    # 水位不过：不发布（objects/ 无包）、staging 断点件保留
+    assert not slide_storage.bundle_dir(
+        out["slide_id"], root=_env_dir()).exists()
+    assert _staged(job["job_id"]) is not None
+    # 水位恢复后同一 duty 可推进（统一发布）
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
     monkeypatch.setattr(slide_io, "open_slide", _ok_open_slide)
     ciw.process_validating(cos=fake, state=st)
@@ -555,11 +584,16 @@ def test_validating_open_failure_fails_and_removes_part(monkeypatch):
     out = ist.get_job(job["job_id"])
     assert out["state"] == ist.FAILED
     assert out["fail_code"] == "validation_failed"
-    assert not os.path.exists(_part_path(_env_dir(), job["job_id"]))
-    assert not os.path.exists(os.path.join(_env_dir(), "a.svs"))
+    # 暂存树清空 + 无 objects 包 + 资产行 failed（不可读证据行）
+    assert not slide_storage.staging_task_dir(
+        job["job_id"], root=_env_dir()).exists()
+    assert not slide_storage.bundle_dir(
+        out["slide_id"], root=_env_dir()).exists()
+    desc = slide_store.resolve_slide_id(out["slide_id"])
+    assert desc.asset_state == "failed"
 
 
-def test_validating_promotes_meta_and_settles_quota_once(monkeypatch):
+def test_validating_publishes_via_unified_publish_and_settles_once(monkeypatch):
     fake, st = FakeCos(), {}
     job, payload = _drive_to_validating(fake, st, owner="u1", role="user")
     monkeypatch.setattr(slide_io, "open_slide", _ok_open_slide)
@@ -567,75 +601,108 @@ def test_validating_promotes_meta_and_settles_quota_once(monkeypatch):
     out = ist.get_job(job["job_id"])
     assert out["state"] == ist.READY
     assert out["cleanup_status"] == ist.CLEANUP_PENDING  # 远端待删
-    dest = os.path.join(_env_dir(), "a.svs")
-    with open(dest, "rb") as fh:
+    slide_id = out["slide_id"]
+    assert slide_id and slide_id.startswith("sld_")
+    # 统一发布落地：objects/<slide_id>/data.svs + manifest.json（P4-b §5.4）
+    entry = _bundle_data(slide_id)
+    with open(entry, "rb") as fh:
         assert fh.read() == payload
+    manifest = json.loads((entry.parent / "manifest.json").read_text())
+    assert manifest["entry"] == "data.svs"
+    assert manifest["files"][0]["sha256"] == \
+        hashlib.sha256(payload).hexdigest()
+    assert manifest["files"][0]["size"] == len(payload)
     assert out["sha256_actual"] == hashlib.sha256(payload).hexdigest()
-    assert out["slide_canonical_name"] == "a.svs"
-    assert not os.path.exists(_part_path(_env_dir(), job["job_id"]))
+    assert out["slide_canonical_name"] == "a.svs"  # 展示快照
+    # 任务暂存树收口清空
+    assert not slide_storage.staging_task_dir(
+        job["job_id"], root=_env_dir()).exists()
+    # 资产行：ready + accounted_bytes + 归属 u1（无 owner 修正）
+    desc = slide_store.resolve_slide_id(slide_id)
+    assert desc.asset_state == "ready"
+    assert desc.accounted_bytes == 150
+    assert desc.owner_user_id == "u1"
 
-    def slide_row(cur):
-        cur.execute("SELECT owner_user_id FROM slides WHERE "
-                    "legacy_filename='a.svs'")
-        return cur.fetchone()
-
-    row = _sql(slide_row)
-    assert row is not None and row["owner_user_id"] == "u1"
-    # 配额一次结算：reserved → used
     def quota(cur):
         cur.execute("SELECT used_bytes, reserved_bytes FROM "
                     "upload_user_quotas WHERE user_id='u1'")
         return cur.fetchone()
+
     q = _sql(quota)
     assert (int(q["used_bytes"]), int(q["reserved_bytes"])) == (150, 0)
     # 池预约在清理确认前不释放（§6.1：下载完成≠释放）
     assert cos_pool_store.get_pool_state()["reserved_bytes"] == 150
 
 
-def test_validating_name_unavailable_never_clobbers(monkeypatch):
+def test_validating_same_name_foreign_file_never_blocks_nor_clobbers(
+        monkeypatch):
+    """跨 owner 同名（P0 §2.3.1 拆除族的目标场景）：他人同名文件/同名行
+    存在既不阻塞本任务（name_unavailable 消失）、也绝不被覆盖或重归属
+    ——本任务发布进自己的 objects/<slide_id>/，与按名资产互不相干。"""
+    import share_store
     fake, st = FakeCos(), {}
     dest = os.path.join(_env_dir(), "a.svs")
-    with open(dest, "wb") as fh:  # 他人同名文件已存在
+    with open(dest, "wb") as fh:  # 他人同名文件已存在（legacy 平铺）
         fh.write(b"someone-else")
-    job, payload = _drive_to_validating(fake, st)
+    share_store.set_slide_meta(
+        "a.svs", owner_user_id="victim", requester_role="owner")  # 同名行
+    job, payload = _drive_to_validating(fake, st, owner="u1", role="user")
     monkeypatch.setattr(slide_io, "open_slide", _ok_open_slide)
-    ciw.process_validating(cos=fake, state=st)
+    assert ciw.process_validating(cos=fake, state=st) == job["job_id"]
     out = ist.get_job(job["job_id"])
-    assert out["state"] == ist.FAILED
-    assert out["fail_code"] == "name_unavailable"
-    with open(dest, "rb") as fh:  # 绝不 os.replace 覆盖
+    assert out["state"] == ist.READY
+    with open(dest, "rb") as fh:  # 他人文件分毫未动
         assert fh.read() == b"someone-else"
-    assert not os.path.exists(_part_path(_env_dir(), job["job_id"]))
+
+    def victim_owner(cur):
+        cur.execute("SELECT owner_user_id FROM slides WHERE "
+                    "legacy_filename='a.svs'")
+        return cur.fetchone()
+
+    assert _sql(victim_owner)["owner_user_id"] == "victim"  # 不猜归属/不修正
+    with open(_bundle_data(out["slide_id"]), "rb") as fh:  # 各发各的 ID
+        assert fh.read() == payload
 
 
 def test_validating_commit_intent_recovery_settles_without_repromote(
         monkeypatch):
-    """§4 提交恢复栅栏：intent 已存 + dest 已提升（part 已删）→ 只补结算。"""
+    """§4 提交恢复栅栏（P4-b）：FS 发布后、DB 结算前崩溃 → 恢复只核对包
+    幂等收口结算（不重搬不重算不重复扣账）。"""
     fake, st = FakeCos(), {}
     job, payload = _drive_to_validating(fake, st)
-    part = _part_path(_env_dir(), job["job_id"])
+    monkeypatch.setattr(slide_io, "open_slide", _ok_open_slide)
     sha = hashlib.sha256(payload).hexdigest()
-    dest = os.path.join(_env_dir(), "a.svs")
-    # 模拟崩溃点：intent 已持久化、提升已完成、结算未落
-    c = ist.claim_next_job_for_worker([ist.VALIDATING])
-    ist.worker_persist_commit_intent(
-        job["job_id"], c["worker_generation"],
-        {"target": "a.svs", "source_version": job["cos_version_id"],
-         "sha256": sha, "declared_size": 150,
-         "part": os.path.basename(part)})
-    os.link(part, dest)
-    os.unlink(part)
-    ist.release_worker_lease(job["job_id"], c["worker_lease_token"])
-    before = os.stat(dest)
+    real_settle = ist.worker_settle_ready
 
+    def crash_after_fs(*args, **kwargs):
+        raise RuntimeError("crash-after-fs-before-db")
+
+    monkeypatch.setattr(ist, "worker_settle_ready", crash_after_fs)
+    with pytest.raises(RuntimeError):
+        ciw.process_validating(cos=fake, state=st)
+    # worker 崩溃：租约未释放——模拟 TTL 到期后新纪元接管（恢复重跑）
+    _sql(lambda cur: cur.execute(
+        "UPDATE ingestion_jobs SET worker_lease_expires_at = now() - "
+        "interval '1 second' WHERE job_id=%s", (job["job_id"],)))
+    mid = ist.get_job(job["job_id"])
+    assert mid["state"] == ist.VALIDATING  # 结算事务回滚
+    entry = _bundle_data(mid["slide_id"])
+    assert entry.is_file()  # FS 包已在（先发布后结算）
+    before = entry.stat()  # 恢复不得重搬/重发布
+    # ready 前不可读（状态门禁：FS 已发布 ≠ 可见）
+    assert not slide_store.authorize_read(mid["slide_id"],
+                                          actor_user_id="own")
+
+    monkeypatch.setattr(ist, "worker_settle_ready", real_settle)
     assert ciw.process_validating(cos=fake, state=st) == job["job_id"]
     out = ist.get_job(job["job_id"])
     assert out["state"] == ist.READY
     assert out["sha256_actual"] == sha  # 结算用 intent 权威值
-    after = os.stat(dest)
+    after = entry.stat()
     assert (before.st_ino, before.st_size) == (after.st_ino, after.st_size)
-    with open(dest, "rb") as fh:
+    with open(entry, "rb") as fh:
         assert fh.read() == payload
+    assert slide_store.authorize_read(out["slide_id"], actor_user_id="own")
 
 
 # --------------------------------------------------------------------------- #
@@ -657,7 +724,7 @@ def test_ready_probe_success_marks_completed(monkeypatch):
 def test_ready_probe_failure_retries_without_degrade(monkeypatch):
     fake, st = FakeCos(), {}
     job, payload = _drive_to_ready(monkeypatch, fake, st)
-    dest = os.path.join(_env_dir(), "a.svs")
+    entry = _bundle_data(ist.get_job(job["job_id"])["slide_id"])
     wire_before = ist.get_job(job["job_id"])["wire_download_bytes"]
     monkeypatch.setattr(slide_io, "open_slide", _raising_open_slide)
     assert ciw.process_ready(cos=fake, state=st) is None
@@ -665,7 +732,7 @@ def test_ready_probe_failure_retries_without_degrade(monkeypatch):
     assert out["state"] == ist.READY  # 不降级、不自动 fail
     assert out["viewer_ready"] is False
     assert "readiness_retry" in _events(job["job_id"])
-    assert os.path.exists(dest)  # 本地成功副本绝不被删
+    assert entry.is_file()  # 本地成功副本绝不被删
     assert out["wire_download_bytes"] == wire_before  # 不重下载
 
 
@@ -833,7 +900,9 @@ def test_main_once_smoke(monkeypatch):
 
 
 def test_run_cycle_end_to_end(monkeypatch):
-    """单轮 duties 从 admitted 推到 completed+cleaned（全链路集成）。"""
+    """单轮 duties 从 admitted 推到 completed+cleaned（全链路集成）。
+
+    P4-b：本地入库走统一发布——objects/<slide_id>/ 落地，无按名平铺文件。"""
     fake, st = FakeCos(), {}
     job, payload = _prepare(fake, st)
     _put_plan_parts(fake, job, payload)
@@ -845,11 +914,12 @@ def test_run_cycle_end_to_end(monkeypatch):
     assert out["state"] == ist.COMPLETED and out["viewer_ready"] is True
     assert out["cleanup_status"] == ist.CLEANUP_CLEANED
     assert out["sha256_actual"] == hashlib.sha256(payload).hexdigest()
-    with open(os.path.join(_env_dir(), "a.svs"), "rb") as fh:
+    with open(_bundle_data(out["slide_id"]), "rb") as fh:
         assert fh.read() == payload
     assert fake.objects.get(out["object_key"], []) == []  # 远端已删
     assert cos_pool_store.get_pool_state()["reserved_bytes"] == 0
-    assert not os.path.exists(_part_path(_env_dir(), job["job_id"]))
+    assert not slide_storage.staging_task_dir(
+        job["job_id"], root=_env_dir()).exists()
 
 
 def test_cleanup_keyless_admitted_job_releases_pool_directly(monkeypatch, tmp_path):

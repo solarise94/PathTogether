@@ -19,6 +19,13 @@
     ingestion_jobs 行 → upload_reservations 行 → upload_user_quotas 行
     → cos_pool_state 行
 
+P4-b（slide ID 化，docs/slide-id-refactor-p4-contract-20260925.md §5）：发布/
+结算路径的第一把锁是 advisory ``pg_advisory_xact_lock(hashtext('slide:' ||
+slide_id))``（slide_store.acquire_slide_lock，0067 锁序），其后按上序取
+job 行——create_waiting_job 即预分配 slide_id（staging/id_bundle 资产行与
+ingestion_jobs.slide_id 同事务绑定）；本地提交经 slide_publish 统一发布
+（worker 只经 IngestionPublishChannel 适配，发布编排不复制进本模块）。
+
 持有 pool 行锁期间不回头等其它行（无环）。准入原子性：本地配额预占与
 COS 池预约在同一事务；任一失败整体回滚，禁止半成功（§6.1）。
 
@@ -40,7 +47,11 @@ import psycopg
 import cos_config
 import cos_pool_store
 import pg_store
+import slide_publish
+import slide_store
+import slide_storage
 import upload_guard
+import upload_task_store
 
 # --------------------------------------------------------------------------- #
 # 状态与转移
@@ -130,6 +141,8 @@ _JOB_FIELDS = (
     "cleanup_lease_expires_at", "worker_lease_token", "worker_lease_expires_at",
     "worker_generation", "fail_code", "waiting_expires_at", "job_deadline_at",
     "terminal_at", "created_at", "updated_at",
+    # P4-b（0067 列）：创建即预分配的资产绑定（唯一绑定源；幂等复用不重分）。
+    "slide_id",
 )
 
 _INT_FIELDS = frozenset({
@@ -203,15 +216,78 @@ def _append_event(cur, job_id, kind, detail=None):
 # --------------------------------------------------------------------------- #
 # 创建与准入
 # --------------------------------------------------------------------------- #
+def asset_owner_for_job(job) -> str:
+    """任务的资产 owner（P4-b 合同 §5.2）：实名任务 = job owner；匿名任务
+    （本地免认证态，owner_user_id 为空）按「配置 owner」口径解析（share_store
+    镜像，app 启动注入——与 app._upload_asset_owner 同源）。两者皆空返回
+    ""（调用方 fail-closed，**不允许空 owner 自动认领**）。
+
+    旧归属终检/force-owner 族拆除后，owner 只在此处一次性解析并写进资产行
+    与 publish intent；发布路径只做一致性复核，绝不修正。
+    """
+    uid = ((job or {}).get("owner_user_id") if isinstance(job, dict)
+           else job or "")
+    uid = (uid or "").strip()
+    if uid:
+        return uid
+    try:
+        import share_store  # 延迟导入：仅匿名任务需要配置 owner 回落
+        getter = getattr(share_store, "get_owner_user_id", None)
+        return ((getter() if getter else "") or "").strip()
+    except Exception:  # noqa: BLE001 - fail-closed：解析不到按空处理
+        return ""
+
+
+def _cleanup_staging_tree(job_id):
+    """终态后清理任务暂存整树（best-effort；崩溃窗口残留由 P6 排空）。"""
+    try:
+        slide_storage.remove_staging_tree(job_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _abandon_staging_asset(cur, job):
+    """终态（取消/失败/超期）时把 staging 资产行 CAS → failed（保留证据）。
+
+    只在任务行锁内调用；无 slide_id（升级窗口旧行）跳过。job 状态机保证
+    此刻不可能有并发 publish 结算（取消被 CommitInProgress 拒、worker
+    generation fencing），CAS 失败即不变量破坏——fail-closed 记事件交人工。
+    """
+    sid = (job.get("slide_id") or "").strip()
+    if not sid:
+        return
+    cur.execute(
+        "UPDATE slides SET asset_state=%s, updated_at=now() "
+        "WHERE slide_id=%s AND asset_state=%s",
+        (slide_store.SlideState.FAILED, sid, slide_store.SlideState.STAGING))
+
+
 def create_waiting_job(owner_user_id, owner_role, filename, safe_name,
                        format_ext, declared_size, *, idempotency_key=None,
                        policy_version=None, route_reason=None):
     """创建 waiting_capacity 任务（尚不预约任何容量/凭证，§4/§6.1）。
 
+    P4-b（合同 §5.2）：**创建即预分配 slide_id**——同一事务内
+    ``slide_store.allocate_slide``（staging/id_bundle 资产行，owner=解析后
+    的资产 owner）+ 写 ``ingestion_jobs.slide_id``（0067 列，唯一绑定源）。
+    不查原名是否已存在（同名并发各得各 ID，name_unavailable 族拆除）。
+
     幂等：同 (owner, idempotency_key) 存活/已完成任务唯一（0066 部分唯一
-    索引兜底）——冲突时返回 (既有行, False)。返回 (job_dict, created)。
+    索引兜底）——冲突时返回 (既有行, False)，**复用既有行的 slide_id**
+    （已分配则绝不重新分配；升级窗口在途旧行无绑定时就地补绑——同事务，
+    仍是一行一 ID）。返回 (job_dict, created)。
     """
     declared_size = int(declared_size)
+    asset_owner = asset_owner_for_job({"owner_user_id": owner_user_id})
+    if not asset_owner:
+        raise IngestionStateError(
+            "无法解析上传资产 owner（本地态未配置 owner）——不允许空 owner "
+            "自动认领")
+    try:
+        slide_store.sanitize_original_filename((filename or "").strip())
+        original_name = (filename or "").strip()
+    except ValueError:
+        original_name = safe_name  # 客户端原名不可净化时退净化名快照
     job_id = "inj_" + secrets.token_hex(12)
     conn = _connect()
     try:
@@ -219,17 +295,23 @@ def create_waiting_job(owner_user_id, owner_role, filename, safe_name,
             with c.cursor() as cur:
                 try:
                     with conn.transaction():  # SAVEPOINT：失败后事务可继续
+                        # allocate 与 job INSERT 同一 SAVEPOINT：撞唯一索引
+                        # 整体回滚时新资产行一并消失（不泄漏 staging 行）。
+                        desc = slide_store.allocate_slide(
+                            asset_owner, original_filename=original_name,
+                            format_ext=format_ext, conn=conn)
                         cur.execute(
                             "INSERT INTO ingestion_jobs (job_id, owner_user_id, "
                             "owner_role, idempotency_key, filename, safe_name, "
                             "format_ext, declared_size, state, transport, "
-                            "policy_version, route_reason, waiting_expires_at) "
+                            "policy_version, route_reason, slide_id, "
+                            "waiting_expires_at) "
                             "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'presign_parts',"
-                            "%s,%s, now() + make_interval(secs => %s))",
+                            "%s,%s,%s, now() + make_interval(secs => %s))",
                             (job_id, owner_user_id, owner_role, idempotency_key,
                              filename, safe_name, format_ext, declared_size,
                              WAITING, policy_version, route_reason,
-                             cos_config.COS_WAITING_MAX_AGE_SECONDS))
+                             desc.slide_id, cos_config.COS_WAITING_MAX_AGE_SECONDS))
                 except psycopg.errors.UniqueViolation as exc:
                     constraint = getattr(exc.diag, "constraint_name", "") or ""
                     # 幂等重试优先：同 (owner, key) 存活任务存在即返回既有行
@@ -243,7 +325,19 @@ def create_waiting_job(owner_user_id, owner_role, filename, safe_name,
                         (owner_user_id, idempotency_key))
                     existing = cur.fetchone()
                     if existing is not None and idempotency_key is not None:
-                        return _norm_row(existing), False
+                        existing = _norm_row(existing)
+                        if not (existing.get("slide_id") or "").strip():
+                            # 升级窗口在途行（P4 前创建、无绑定）：就地补绑
+                            # （同事务新分配，一行一 ID，不重复）。
+                            backfill = slide_store.allocate_slide(
+                                asset_owner, original_filename=original_name,
+                                format_ext=format_ext, conn=conn)
+                            cur.execute(
+                                "UPDATE ingestion_jobs SET slide_id=%s, "
+                                "updated_at=now() WHERE job_id=%s",
+                                (backfill.slide_id, existing["job_id"]))
+                            existing["slide_id"] = backfill.slide_id
+                        return existing, False
                     if constraint == "ingestion_jobs_one_waiting_per_owner":
                         raise IngestionStateError(
                             "cos_waiting_limit：该身份已有等待容量的任务")
@@ -353,7 +447,9 @@ def _try_admit_txn(cur, job_id, *, disk_watermark_ok=True):
                 cur, job["owner_user_id"], job["declared_size"])
             reservation_id = res["reservation_id"]
         except upload_guard.QuotaExceeded:
-            # §6.1：准入时已不满足本地配额 → 终止（不接触 COS）
+            # §6.1：准入时已不满足本地配额 → 终止（不接触 COS）；
+            # 预分配的 staging 资产行一并收口 failed（重建=新任务新 ID）。
+            _abandon_staging_asset(cur, job)
             cur.execute(
                 "UPDATE ingestion_jobs SET state=%s, fail_code="
                 "'local_quota_infeasible', terminal_at=now(), updated_at=now() "
@@ -698,11 +794,12 @@ def worker_update_download_progress(job_id, generation, *, downloaded_bytes,
 
 
 def worker_persist_commit_intent(job_id, generation, intent):
-    """validating 内、原子提升之前持久化 commit intent（§4 提交恢复栅栏）。
+    """validating 内、统一发布之前持久化 commit intent（§4 提交恢复栅栏）。
 
-    intent 至少含 target 路径、source version、SHA-256（由 worker 组装）；
-    重启后 reconciler 按 intent 幂等补齐提升/metadata/配额结算。
-    """
+    P4-b：intent 是 slide_publish 统一发布的权威证据（task_ref、generation、
+    commit_token、slide_id、owner_user_id、manifest、sha256、accounted_bytes、
+    source_version；task_ref/generation 随重领递增——恢复时以当代重新持久化，
+    证据字段不变）。重启后 worker 按 intent 幂等重跑发布。"""
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -728,20 +825,52 @@ def worker_persist_commit_intent(job_id, generation, intent):
         conn.close()
 
 
-def worker_settle_ready(job_id, generation, *, slide_canonical_name,
-                        sha256_actual, settle_bytes):
-    """validating → ready：本地提升+metadata+配额一次结算（同事务）。
+def worker_settle_ready(job_id, generation, *, slide_canonical_name=None,
+                        sha256_actual, settle_bytes, slide_id=None):
+    """validating → ready：统一发布结算短事务（P4-b 合同 §5.4/§5.5）。
 
-    锁序 job → reservation → quota（consume_reservation_locked 内）。
-    cleanup 转为 pending（远端对象待删，§6.2 正常路径）。
+    同一事务完成（任一步失败整体回滚——FS 已发布、DB 未提交 → 不可见，
+    恢复重试收口）：
+
+      1. advisory ``slide:<slide_id>``（第一把锁；slide_id 优先取入参，
+         缺省从 job 行读——绑定创建后不可变，锁内再核）；
+      2. ingestion_jobs 行 FOR UPDATE（generation CAS + 状态校验）；
+      3. slides 行 CAS（staging→ready + accounted_bytes=实际字节；R-12）；
+      4. slide_assets 内容 revision（``sha256:<hex 前缀>``，P3 合同 §4）；
+      5. consume local reservation（一次结算；幂等）；
+      6. job 收口 UPDATE（state=ready、local_ready_at、slide_canonical_name
+         展示快照、sha256_actual、cleanup_status=pending——COS 远端清理
+         **不在此事务**，cleanup duty 独立推进，§6.2 保持现状）。
+
+    幂等：ready/completed 视为已收口返回现状（重复调用/恢复重入不重复
+    结算、不重复 consume——consume 本身幂等 + 状态机单次转移）。
+    generation 过期 → StaleLease（worker fencing）；未持久化 intent → 拒。
+    锁序：advisory → ingestion_jobs 行 → slides 行 → upload_reservations
+    → upload_user_quotas（0066/0067 全仓锁序一致，无环）。
     """
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
+                sid = (slide_id or "").strip()
+                if not sid:
+                    cur.execute(
+                        "SELECT slide_id FROM ingestion_jobs WHERE job_id=%s",
+                        (job_id,))
+                    row = cur.fetchone()
+                    if row is None:
+                        raise IngestionStateError(
+                            "ingestion job 不存在：%r" % job_id)
+                    sid = (row.get("slide_id") or "").strip()
+                if not sid:
+                    raise IngestionStateError(
+                        "任务未绑定 slide_id（结算被拒，job=%s）" % job_id)
+                slide_store.acquire_slide_lock(cur, sid)  # 第一把锁
                 job = get_job_locked(cur, job_id)
                 if job is None:
                     raise IngestionStateError("ingestion job 不存在：%r" % job_id)
+                if job["state"] in (READY, COMPLETED):
+                    return _norm_row(job)  # 已收口（重复调用/恢复重入）
                 if job["worker_generation"] != int(generation):
                     raise StaleLease("generation 过期（结算被拒）")
                 if job["state"] != VALIDATING:
@@ -750,23 +879,152 @@ def worker_settle_ready(job_id, generation, *, slide_canonical_name,
                 if not job.get("commit_intent_json"):
                     raise IngestionStateError(
                         "结算前必须已持久化 commit intent（§4 提交恢复栅栏）")
+                if (job.get("slide_id") or "").strip() != sid:
+                    # 入参与任务绑定不一致：不变量破坏，fail-closed 不猜
+                    raise IngestionStateError(
+                        "结算 slide_id 与任务绑定不一致（%s != %s）"
+                        % (sid, job.get("slide_id")))
+                # slides 行 CAS（expected staging）；已同参 ready（并发重入
+                # 已收口的那一支）按幂等放行，其余 fail-closed。
+                cur.execute(
+                    "UPDATE slides SET asset_state=%s, published_at=now(), "
+                    "accounted_bytes=%s, updated_at=now() "
+                    "WHERE slide_id=%s AND asset_state=%s",
+                    (slide_store.SlideState.READY, int(settle_bytes), sid,
+                     slide_store.SlideState.STAGING))
+                if cur.rowcount != 1:
+                    cur.execute(
+                        "SELECT asset_state, accounted_bytes FROM slides "
+                        "WHERE slide_id=%s", (sid,))
+                    srow = cur.fetchone()
+                    if not (srow
+                            and srow["asset_state"] == slide_store.SlideState.READY
+                            and srow["accounted_bytes"] is not None
+                            and int(srow["accounted_bytes"])
+                            == int(settle_bytes)):
+                        raise IngestionStateError(
+                            "资产不在 staging 且非同参 ready（state=%r "
+                            "accounted=%r）——fail-closed 不猜"
+                            % (srow and srow["asset_state"],
+                               srow and srow["accounted_bytes"]))
+                slide_store.record_revision(
+                    sid, "sha256:%s" % str(sha256_actual).lower()[:16],
+                    conn=conn)
                 if job.get("local_reservation_id"):
                     upload_guard.consume_reservation_locked(
                         cur, job["local_reservation_id"], int(settle_bytes))
+                canonical = slide_canonical_name or job.get("safe_name")
                 cur.execute(
                     "UPDATE ingestion_jobs SET state=%s, local_ready_at=now(), "
                     "slide_canonical_name=%s, sha256_actual=%s, "
                     "cleanup_status=%s, updated_at=now() WHERE job_id=%s",
-                    (READY, slide_canonical_name, sha256_actual,
+                    (READY, canonical, sha256_actual,
                      CLEANUP_PENDING, job_id))
                 _append_event(cur, job_id, "local_ready", {
-                    "slide": slide_canonical_name, "settle_bytes":
-                    int(settle_bytes)})
+                    "slide": canonical, "settle_bytes": int(settle_bytes),
+                    "slide_id": sid})
                 cur.execute("SELECT * FROM ingestion_jobs WHERE job_id=%s",
                             (job_id,))
                 return _norm_row(cur.fetchone())
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 统一发布通道适配（P4-b 合同 §5.4；协议见 slide_publish.PublishChannel）
+# --------------------------------------------------------------------------- #
+class IngestionPublishChannel:
+    """slide_publish 六步编排的 ingestion_jobs 通道适配。
+
+    代次/fencing：``worker_generation``（claim 递增；intent 的
+    generation/commit_token 均为当代值）。结算复用 ``worker_settle_ready``
+    （mark_ready + accounted_bytes + 内容 revision + consume 同事务）。
+    FS 发布先于 advisory 锁的顺序（P3 偏差 #1）在本通道的 worker lease
+    模型下重审成立：validating+intent 是不可撤销提交段（取消被
+    CommitInProgress 拒），旧 generation 被 fencing 拒绝结算且重复 FS 发布
+    由 no-clobber + verify_bundle 幂等吸收（同任务同 pinned version → 同
+    sha），可见性只由结算事务的 asset_state CAS 裁定；跨任务目标
+    objects/<slide_id>/ 由预分配 ID 唯一化（唯一索引），无同名竞争面。
+    """
+
+    def load_task(self, task_ref):
+        return get_job(task_ref)
+
+    def is_settled(self, task):
+        return bool(task) and task.get("state") in (READY, COMPLETED)
+
+    def decode_intent(self, task):
+        return upload_task_store.decode_commit_intent(
+            task.get("commit_intent_json"))
+
+    def task_commit_token(self, task):
+        return str(task.get("worker_generation"))
+
+    def precheck_locked(self, cur, task_ref, generation, slide_id,
+                        owner_user_id, intent):
+        job = get_job_locked(cur, task_ref)
+        if job is None:
+            raise slide_publish.PublishError(
+                "task_not_found", "任务不存在：%s" % task_ref,
+                deterministic=True)
+        if job["worker_generation"] != int(generation):
+            raise StaleLease(
+                "generation 过期（%s != 当前 %s）——旧 worker 发布被拒"
+                % (generation, job["worker_generation"]))
+        if job["state"] != VALIDATING:
+            raise slide_publish.PublishError(
+                "generation_mismatch",
+                "任务不在 validating（state=%r）——不猜" % job["state"],
+                deterministic=True, task=job)
+        if (job.get("slide_id") or "") != slide_id:
+            raise slide_publish.PublishError(
+                "task_slide_mismatch", "任务绑定的资产与本发布不一致",
+                deterministic=True, task=job)
+        # owner 一致性：intent 记录解析后的资产 owner（匿名任务=配置 owner
+        # 回落）；不一致=不变量破坏，隔离告警**不自动修正**（plan §3.2）。
+        intent_owner = (intent.get("owner_user_id") or "").strip()
+        if intent_owner and intent_owner != asset_owner_for_job(job):
+            raise slide_publish.PublishError(
+                "owner_mismatch",
+                "intent owner 与任务 owner 不一致（%r）——不自动修正"
+                % intent_owner, deterministic=True, task=job)
+        if owner_user_id is not None and \
+                (owner_user_id or "").strip() != intent_owner:
+            raise slide_publish.PublishError(
+                "owner_mismatch", "发布发起者与资产 owner 不一致（拒绝，"
+                "不自动修正）", deterministic=True, task=job)
+        rid = job.get("local_reservation_id")
+        if rid:
+            out = upload_guard.renew_reservation_locked(cur, rid)
+            if not upload_guard.reservation_is_active(out):
+                raise upload_guard.ReservationInvalid(
+                    "预占已失效，不能发布：%r" % rid)
+        return job
+
+    def settle(self, task_ref, generation, slide_id, sha256, accounted_bytes):
+        job = worker_settle_ready(
+            task_ref, generation, sha256_actual=sha256,
+            settle_bytes=int(accounted_bytes), slide_id=slide_id)
+        return job, job.get("state") in (READY, COMPLETED)
+
+
+#: ingestion 通道单例（无状态；cos_ingest_worker 经它接入统一发布）。
+INGESTION_PUBLISH_CHANNEL = IngestionPublishChannel()
+
+
+def job_slide_ref(job):
+    """任务状态视图的 slide 引用输出（P4-b 合同 §5.6）。
+
+    slide_id **从任务绑定读**（job.slide_id——创建即分配，结算前后都在）；
+    不再按 slide_canonical_name 名字解析（新资产无 legacy_filename，按名
+    resolve 对 id_bundle 产物恒 None——P2 补丁的已知缺口）。P4-app 把
+    ``_ingestion_state_body`` 的 ``share_store.get_slide_id(name)`` 换成
+    本函数即可。返回 dict（两个键都可能为 None：升级窗口旧行）。
+    """
+    return {
+        "slide": (job.get("slide_canonical_name") or None),
+        "slide_id": ((job.get("slide_id") or "").strip() or None),
+    }
 
 
 def worker_begin_validating(job_id, generation):
@@ -918,11 +1176,13 @@ def cancel_job(job_id, *, reason_code="cancelled_by_user"):
     """幂等取消（§4 cancel）。已入库 ready/completed → IngestionStateError。
 
     **提交互斥（review 740e823 P1-3）**：validating 且 commit intent 已
-    持久化 → CommitInProgress 拒绝——此时文件即将落库，取消无法原子撤销
-    提升与 metadata；落库后删除走既有切片删除合同。
+    持久化 → CommitInProgress 拒绝——统一发布进行中，取消无法原子撤销
+    FS 包与资产行；落库后删除走既有切片删除合同。
 
     锁序 job → reservation → quota（释放本地预占）；pool_reserved 不动——
-    确认远端清理完成后由 finalize_cleanup 释放（§6.2）。
+    确认远端清理完成后由 finalize_cleanup 释放（§6.2）。P4-b：取消收口
+    同事务把 staging 资产行 CAS → failed（保留证据），事务提交后清理任务
+    暂存树（``.staging/<job_id>/``——清理失败只记日志不回滚取消）。
     """
     conn = _connect()
     try:
@@ -950,6 +1210,9 @@ def cancel_job(job_id, *, reason_code="cancelled_by_user"):
                            if job["pool_reserved_bytes"] > 0 or
                            job.get("upload_id") or job.get("object_key")
                            else CLEANUP_NONE)
+                # P4-b：staging 资产行收口为 failed（保留证据）；任务暂存树
+                # 在事务提交后清理（见函数尾——清理失败不阻断取消收口）。
+                _abandon_staging_asset(cur, job)
                 cur.execute(
                     "UPDATE ingestion_jobs SET state=%s, fail_code=%s, "
                     "terminal_at=now(), cleanup_status=%s, updated_at=now() "
@@ -959,13 +1222,18 @@ def cancel_job(job_id, *, reason_code="cancelled_by_user"):
                               {"reason": reason_code})
                 cur.execute("SELECT * FROM ingestion_jobs WHERE job_id=%s",
                             (job_id,))
-                return _norm_row(cur.fetchone())
+                out = _norm_row(cur.fetchone())
     finally:
         conn.close()
+    _cleanup_staging_tree(job_id)
+    return out
 
 
 def fail_job(job_id, generation, code):
-    """worker 终态失败（释放本地预占，远端清理转 pending）。"""
+    """worker 终态失败（释放本地预占，远端清理转 pending）。
+
+    P4-b：同事务把 staging 资产行 CAS → failed（保留证据、不可读）；
+    事务提交后清理任务暂存树（best-effort）。"""
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -976,11 +1244,12 @@ def fail_job(job_id, generation, code):
                 if job["worker_generation"] != int(generation):
                     raise StaleLease("generation 过期（fail 收口被拒）")
                 if job["state"] in TERMINAL_STATES:
-                    return _norm_row(job)
+                    return _norm_row(job)  # 幂等（首次失败已清理暂存）
                 _require_transition(job, FAILED)
                 if job.get("local_reservation_id"):
                     upload_guard.release_reservation_locked(
                         cur, job["local_reservation_id"])
+                _abandon_staging_asset(cur, job)
                 cur.execute(
                     "UPDATE ingestion_jobs SET state=%s, fail_code=%s, "
                     "terminal_at=now(), cleanup_status=%s, updated_at=now() "
@@ -989,13 +1258,18 @@ def fail_job(job_id, generation, code):
                 _append_event(cur, job_id, "failed", {"reason": code})
                 cur.execute("SELECT * FROM ingestion_jobs WHERE job_id=%s",
                             (job_id,))
-                return _norm_row(cur.fetchone())
+                out = _norm_row(cur.fetchone())
     finally:
         conn.close()
+    _cleanup_staging_tree(job_id)
+    return out
 
 
 def sweep_expired_waiting():
-    """批量超期：waiting 且 waiting_expires_at <= now → expired（可重建）。"""
+    """批量超期：waiting 且 waiting_expires_at <= now → expired（可重建）。
+
+    P4-b：waiting 任务从未准入（无暂存内容/预约），staging 资产行仅是
+    预分配证据——同事务 CAS → failed（重建=新任务新 ID，不复活）。"""
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -1007,6 +1281,9 @@ def sweep_expired_waiting():
                     "RETURNING job_id", (EXPIRED, WAITING))
                 ids = [r["job_id"] for r in cur.fetchall()]
                 for jid in ids:
+                    job = get_job_locked(cur, jid)
+                    if job is not None:
+                        _abandon_staging_asset(cur, job)
                     _append_event(cur, jid, "expired",
                                   {"reason": "waiting_timeout"})
                 return ids
@@ -1043,6 +1320,7 @@ def sweep_expired_jobs():
                     if job.get("local_reservation_id"):
                         upload_guard.release_reservation_locked(
                             cur, job["local_reservation_id"])
+                    _abandon_staging_asset(cur, job)
                     cur.execute(
                         "UPDATE ingestion_jobs SET state=%s, fail_code="
                         "'job_max_age', terminal_at=now(), cleanup_status=%s, "
@@ -1121,6 +1399,7 @@ def renew_active_local_reservations():
                     except upload_guard.QuotaExceeded:
                         upload_guard.release_reservation_locked(
                             cur, job["local_reservation_id"])
+                        _abandon_staging_asset(cur, job)
                         cur.execute(
                             "UPDATE ingestion_jobs SET state=%s, fail_code="
                             "'local_reservation_lost', terminal_at=now(), "

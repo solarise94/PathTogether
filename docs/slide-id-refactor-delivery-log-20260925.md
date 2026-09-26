@@ -138,3 +138,45 @@
 - run grant 撤销的 sidecar 会话取消对 id_bundle 只撤 grant 行（按名查询运行会话不适用）→ P4/P5 补 ID 化联动。
 - 升级窗口在途旧任务排空与新旧物理布局并存 → P6。
 - share_server `_get_slide` 仍以 legacy 名为主键（id_bundle 资产 None 键）→ P4 收口为 slide_id 键。
+
+## P4 门禁（2026-09-26）
+
+合同：docs/slide-id-refactor-p4-contract-20260925.md（P4-a app.py / P4-b COS / P4-c 百度三包分工）。
+
+**P4-c 百度远程导入（提交 9b86b4f）**：baidu_import_store 逐 item 预分配 slide_id（同事务绑定 + 租约 fence + `slide_id IS NULL` 谓词）；`_reconcile_ingest` 重写（磁盘同名不再作归属证据）；native 分支经 `.staging/<item>/1/` + 统一发布；ingest_token 改 `item:<item_id>`；associate_slide 按 slide_id。门禁：baidu 相关 94 全绿。
+
+**P4-b COS 直传（提交 7c54d00）**：cos_ingest_worker 的 adopted_existing/still_ours/promoted_ident/`force_slide_owner_follow_file` 调用族全拆；staging 归 `.staging/<job_id>/<worker_generation>/`（跨代次 `_adopt_staged_data` 收养）；process_validating 走 `publish_with_channel`（slide_publish 新增 PublishChannel 六 hook 协议——worker 任务族复用同一发布编排，ingestion/conversion 不再各抄一份）；ingestion_store.create_waiting_job 同事务预分配 slide_id + IngestionPublishChannel（fencing=worker_generation）+ worker_settle_ready 扩展（slides CAS + accounted_bytes + revision + consume 同事务）；空 owner 建任务拒绝（IngestionStateError）。P3 偏差 #1（FS 发布先于 advisory 锁）按 worker lease 模型重审成立（validating+intent 为不可撤销提交段，fencing 拒旧代次结算）。门禁：COS/publish 相关 116 全绿。
+
+**P4-app ZIP/转换/app 联动**：V1 ZIP 切统一发布（`_prepare_zip_bundle` 解包入任务 staging + `_zip_group_items` 逻辑切片分组 + 逐 item `allocate_slide`+`bind_upload_task_item` 同事务受理 + `publish_batch_item` 逐 item 原子发布 + `finish_commit` 按已发布合计一次结算；item 级失败隔离不拖累同包其它切片；崩溃恢复 `_upload_legacy_recover_zip` 幂等补发）；V1/V2 convert-required 切新链（源副本归 `.staging/<job_id>/source/`、create_job 即预分配产物 slide_id、worker 经 ConversionPublishChannel 发布全成员包、dest 三分支/`_retract_ours`/`_promote_work` 全拆）；`_upload_name_conflict`/`allow_kfb_recover`/`_owned_committed_upload` 定义+调用全拆；`force_slide_owner_follow_file` 定义+导出拆除（调用方已零）；`set_slide_meta` deleted/deleting→ready 复活分支拆除（P1-B2 #6 收口）+ `test_slide_delete_clears_view_grants_no_orphans` 按不变量改写（重传=新 ID、旧授权/分享不继承、显式重授权才可见）；CLI import_slides.py（复制入受管理 staging——不硬链接外部可写源——+ publish_standalone）+ seed_demo_tcga_catalog.py（回填式登记）+ migrate_json_to_pg.py 退役注释；COS 建任务名占用预检拆除 + 空 owner 映射 500；`canonical_is_live`/`NameConflict` 退役为兼容壳（P6 删）。
+
+### P4 偏差裁决记录
+
+| # | 偏差 | 裁决 | 理由/收口 |
+|---|---|---|---|
+| 1 | 新增迁移 0069（DROP idx_conversion_jobs_canonical_live + conversion_jobs.commit_intent_json） | 采纳 | 合同 §3 强制项；DB 级唯一索引只能经迁移拆除；intent 列镜像 0068 |
+| 2 | upload_task_store 扩展 items 访问器三函数 | 采纳 | 0067 表归属该模块（共享 _pg_connect/事务约定），app.py 裸 SQL 违反封装惯例 |
+| 3 | DROP uq_baidu_import_items_slide_id | **采纳（P5 复审义务）** | convert 幂等键（owner+sha+converter）共享同一产物资产是 create_job 既有设计语义——强制一 item 一产物是超范围行为变更；native「一 item 一资产」由分配侧保证。**P5 删除编排必须裁决多条目共享产物的删除/退款耦合** |
+| 4 | 源 KFB 不落资产（无 slides 行、不对 Viewer 可见） | 采纳 | 现状语义保持；源副本归任务 staging；「源是否独立资产+独立配额/清理编排」交 P5 |
+| 5 | ZIP 无法归组整体 400 指名 + item 级失败隔离在发布阶段生效 | 采纳 | 合同 §2.3/§2.4 的实现读法（prepare 无部分状态） |
+| 6 | `_canonical_name_for` 保留 | 采纳 | 仅展示快照推导；路径/冲突/占用用途清零 |
+
+### P4 review 门禁发现（编排方修复，复现用例原样入仓为回归）
+
+- **F0** `_zip_abort_published` 对已 ready item 调 `mark_failed`（仅 staging 源）→ 静默 no-op，留「ready 行 + 无包」破态。修复：`slide_store.force_fail`（staging/ready→failed 撤回原语）+ 撤回改 DB 先行（先收口可见性再撤包，fail-closed）。回归：test_zip_slide_id_pg.py::test_reservation_expired_mid_publish_withdraws_published。
+- **F1** `_upload_legacy_recover_conversion` 未显式捕 `ReservationInvalid`（不属 StateConflict 子类）→ 预占过期的 KFB committing 任务每次恢复扫描反复 finish_commit 反复抛 → **死循环保持 committing**。修复：显式捕获 → 连带作废 + `_upload_legacy_fail(permanent=True)`。回归：test_conversion_slide_id_pg.py::test_recovery_reservation_expired_cancels_job_no_livelock（两次扫描幂等断言）。
+- **F2** commit 期建 job 后 finish_commit 预占失效 → 悬挂 job（用户收「文件未入账」而产物稍后被 worker 发布上线）。修复：新增 `_cancel_conversion_for_failed_upload`（只收口**本上传创建**的 job——`jobs.upload_id` 直等，幂等复用前序上传的 job 不株连；产物 ready 则 advisory 锁内同事务退款+force_fail+撤包；清 job 任务 staging），接线 V1 KFB / V2 commit 的 ReservationInvalid 处理与 F1 恢复路径。回归：test_reservation_expired_at_commit_cancels_job_and_fails_asset（窄窗注入：finish_commit 边界置过期）+ test_recovery_withdraws_settled_product_and_refunds（已结算产物撤回退款）。
+- **F3** ZIP 撤回原按 ready 过滤 → 漏撤「FS 已发布、DB 因 ReservationInvalid 未收口」的本 item 包（publish_batch_item 先 FS 后 DB）。修复：请求/恢复两处撤回均改全量 plans（force_fail 覆盖 staging/ready；remove_bundle 对无包 item no-op）。
+
+### P4 门禁合计（编排方独立复核，修复后全量）
+
+- 全量 pytest（先清 /tmp 残渣 + TMPDIR 重定向大分区）：**2714 passed / 1 已知无关失败**（admin 插件 0.4.13 bump）/ 6 skipped；实施方报告的 2 例时序 flake 与 3 例 test_raster_wiring 在本独立运行均未复现（干净环境复核结论成立）。
+- `npm run test:js`：562/562 绿。
+- HP 跨仓契约（PATHTOGETHER_PYTHON/REPO 指向本树）：**49/49 绿**。
+- 新增回归 4 用例（F0–F2）先红后绿（红：4 failed 复现，含死循环 traceback 证据）。
+
+### P4 遗留（P5/P6 消化）
+
+- 升级窗口在途旧 ZIP/KFB 平铺任务的三态恢复与 `set_slide_meta` 补归属分支（app.py:11839/:13082 一带）待 P6 排空；`canonical_is_live`/`NameConflict` 兼容壳随 baidu convert 收口删除。
+- 源 KFB 生命周期编排（产物 ready 后源副本保留至产物删除的现状）+ 多条目共享产物的删除/退款耦合（偏差 #3）→ P5。
+- demo 种子/CLI 导入的源平铺文件保留（P6 物理迁移统一搬运）；`.uploading-*.lock` sidecar 平铺维持 P3 裁决。
+- ZIP 响应 `failures` 为新增 additive 字段（前端未消费）；`b.slide` 类展示快照回落 P6 清理。

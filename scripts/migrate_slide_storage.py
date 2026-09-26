@@ -340,6 +340,38 @@ def validate_source_frozen(upload_dir: Path, item) -> int:
                     {"path": str(comp_path), "plan": src.get("companion_bytes"),
                      "actual": comp_bytes})
             total += comp_bytes
+            # R6 审查修复（问题 4）：逐文件冻结清单比对——总字节相同不能证
+            # 明内容相同（等长改一字节旧校验抓不住）。成员集合必须与冻结
+            # 清单完全一致（拒绝增删），逐文件 size+sha256 全对；冻结清单
+            # 缺失（有伴侣却无 frozen 清单）fail-closed 拒绝迁移。
+            frozen_members = src.get("companion_members")
+            if frozen_members is None:
+                raise ItemFailure(
+                    "companion_freeze_missing",
+                    {"path": str(comp_path),
+                     "note": "冻结审计未采集逐文件清单——重跑 frozen 审计"})
+            frozen = {m["path"]: m for m in frozen_members}
+            actual = {m["path"]: m for m in members}
+            if set(frozen) != set(actual):
+                raise ItemFailure(
+                    "companion_member_set_changed",
+                    {"path": str(comp_path),
+                     "plan_only": sorted(set(frozen) - set(actual)),
+                     "actual_only": sorted(set(actual) - set(frozen))})
+            for rel, fm in sorted(frozen.items()):
+                am = actual[rel]
+                if int(am["size"]) != int(fm["size"]):
+                    raise ItemFailure(
+                        "companion_size_changed",
+                        {"path": str(comp_path / rel),
+                         "plan": fm["size"], "actual": am["size"]})
+                fsha = (fm.get("sha256") or "").lower()
+                if not fsha or ("sha256" not in am) or \
+                        str(am.get("sha256") or "").lower() != fsha:
+                    raise ItemFailure(
+                        "companion_sha_changed",
+                        {"path": str(comp_path / rel), "plan": fsha,
+                         "actual": am.get("sha256")})
         elif src.get("companion_bytes"):
             raise ItemFailure("source_companion_missing",
                               {"path": str(comp_path)})
@@ -375,6 +407,26 @@ def copy_package_to_staging(upload_dir: Path, item, staging: Path) -> dict:
     entry_rel = entry_dst_name
     if not any(f["path"] == entry_rel for f in files):
         raise ItemFailure("copy_entry_missing", {"entry": entry_rel})
+    # R6 审查修复（问题 4）复制后绑定：staging 伴侣成员与冻结清单逐文件
+    # 比对（复制期间源被改的 TOCTOU 防线——复制出的字节必须是冻结字节）。
+    frozen_members = (item.get("source") or {}).get("companion_members")
+    if comp and frozen_members:
+        staged = {f["path"]: f for f in files if f["path"].startswith(comp + "/")}
+        frozen = {"%s/%s" % (comp, m["path"]): m for m in frozen_members}
+        if set(staged) != set(frozen):
+            raise ItemFailure(
+                "companion_drift_during_copy",
+                {"frozen_only": sorted(set(frozen) - set(staged)),
+                 "copied_only": sorted(set(staged) - set(frozen))})
+        for rel, fm in sorted(frozen.items()):
+            sm = staged[rel]
+            if int(sm["size"]) != int(fm["size"]) or \
+                    str(sm.get("sha256") or "").lower() != \
+                    (fm.get("sha256") or "").lower():
+                raise ItemFailure(
+                    "companion_drift_during_copy",
+                    {"path": rel, "plan": (fm.get("size"), fm.get("sha256")),
+                     "copied": (sm.get("size"), sm.get("sha256"))})
     return {"entry": entry_rel, "files": files,
             "format_hint": name}
 

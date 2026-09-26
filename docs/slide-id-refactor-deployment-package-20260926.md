@@ -29,25 +29,30 @@
 ## 3. 上线顺序（手册 §5 硬门禁，逐条对应到本方案步骤）
 
 ```text
-0. 生产只读审计（修改前）：scripts/audit_slide_identity.py --mode frozen
-   → inventory/issues/verification/summary（incomplete 必须为 0 才可继续；
-     阻断项逐条处置或形成隔离决议）。
-1. 部署「兼容维护版本」= 本分支 PT+HP（含 0067–0070 schema、回填脚本、
-   迁移工具链；运行时已只认 id_bundle——故第 0/2 步必须先于开放读写）。
-   ⚠️ 顺序裁决（部署单必须写明）：先停写 → 审计 → 回填+物理迁移 → 再开
-   运行时。本分支运行时对 legacy 布局不可读（P6-2），未迁移资产在迁移
-   完成前不可见——这是设计要求（不猜测认领），不是回归。
-2. 停写（用户 API + 全部后台 writer：上传/转换/百度/COS/清理）+
+0. 在线预审（**不停写**，read-only）：scripts/audit_slide_identity.py
+   （在线浅审模式）→ 问题清单/隔离决议草案（incomplete=0 才继续）。
+1. 停写（用户 API + 全部后台 writer：上传/转换/百度/COS/删除执行器与
+   清理 sweep 全部暂停；部署单逐 worker 写明停法与验证命令）+
    一致备份（DB dump + UPLOAD_DIR 快照；备份容量与用户配额分列记账）。
-3. 最终冻结审计（同 0，确认无漂移）→ plan_slide_migration.py --env prod
+   停写验证：各 writer 无在途任务（active/queued 清零或显式冻结记录）。
+2. 部署「兼容维护版本」= 本分支 PT+HP（含 0067–0071 schema、回填脚本、
+   迁移工具链）。**维护窗口内不开放读写**：服务可起（只读管理面），但
+   writer 保持停用直至第 7 步——本分支运行时只认 id_bundle（P6-2），
+   未迁移 legacy 资产在迁移完成前不可见，这是设计要求（不猜测认领）。
+3. 数据回填（逻辑状态）：scripts/backfill_slide_asset_state.py
+   （dry-run 复核 → --apply 分批；manual_review 清单逐条决议）。
+4. 最终冻结审计：audit --mode frozen（停写态下的一致快照；incomplete=0
+   且阻断项为零或逐项有隔离决议）→ plan_slide_migration.py --env prod
    （计划头 digest 写入发布单）。
-4. migrate_slide_storage.py --apply --plan-digest <digest> --env prod
-   --quiesce-proof <停写证据>（分批；journal 持久；崩溃重跑幂等）。
-5. verify_slide_migration.py（独立核验；退出码 0 且 incomplete=否）+
+5. 物理迁移：migrate_slide_storage.py --apply --plan-digest <digest>
+   --env prod --quiesce-proof <停写证据>（分批；journal 持久；崩溃重跑
+   幂等；冻结伴侣逐文件清单比对——R6 审查修复问题 4 的口径）。
+6. 独立终验：verify_slide_migration.py（退出码 0 且 incomplete=否；
+   配额差额须精确归因或持 --quota-approvals 核准凭据——R6 修复问题 5）+
    手册 §5 的 8 条硬门禁逐项签字（含真实 MRXS 样本试开——演练用的是
    进程内 stub，生产终审必须用真实厂商样本，交付日志 P6-1 偏差#1）。
-6. 开放读写（先读端验证：列表/分享/授权/Demo/插件/AI 各至少正负一例；
-   旧名重传不继承旧权限抽查；然后 writer）。
+7. 开放读写（先读端验证：列表/分享/授权/Demo/插件/AI 各至少正负一例；
+   旧名重传不继承旧权限抽查；然后逐 writer 解封并回归其健康检查）。
 ```
 
 **中断恢复口径**：migrate 任一点中断 → 重跑（journal 五态续判）；开放读写后发现的迁移遗留 → 回到维护状态按 journal 处置，不得对有歧义资产恢复旧默认可见（手册 §6）。

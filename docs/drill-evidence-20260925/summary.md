@@ -1,7 +1,7 @@
 # 切片存储迁移独立核验摘要（P6）
 
 - 工具版本：`1.0.0-p6`
-- 核验起止：2026-09-26T07:00:25+00:00 → 2026-09-26T07:00:25+00:00
+- 核验起止：2026-09-26T16:07:30+00:00 → 2026-09-26T16:07:31+00:00
 - incomplete：**否**
 - 违规项：0；披露项：0
 
@@ -40,8 +40,8 @@
 
 | owner | used | ready+deleting 合计 | 差值 | 原因 |
 |---|---|---|---|---|
-| usr_alice | 56426 | 56378 | +48 | failed 资产 accounted=48（撤回/验证失败不退款或从未入账——历史责任项，须单独核准） |
-| usr_bob | 42202 | 38083 | +4119 | deleted tombstone accounted=4096（0013 口径删除不回退 used——合法不等于）；迁移 accounted 校准以包内字节为准（.manifest.json/.associated 派生物留置原位不计——计划 derivatives_in_place 披露） |
+| usr_alice | 56426 | 56378 | +48 | failed 资产 accounted=48（撤回/验证失败不退款或从未入账——历史责任项，须单独核准）；差额 48 已机判归因（failed=48 + deleted=0，状态桶精确匹配） |
+| usr_bob | 42179 | 38083 | +4096 | deleted tombstone accounted=4096（0013 口径删除不回退 used——合法不等于）；迁移 accounted 校准以包内字节为准（.manifest.json/.associated 派生物留置原位不计——计划 derivatives_in_place 披露）；差额 4096 已机判归因（failed=0 + deleted=4096，状态桶精确匹配） |
 
 ## 授权差异（对照计划；双向）
 

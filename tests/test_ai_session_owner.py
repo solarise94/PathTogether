@@ -28,7 +28,8 @@ import pytest  # noqa: E402
 import app as app_mod  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits, isolate_app, FakeRequests # noqa: E402
+from _pt_helpers import (csrf_client, install_json_login_limits,  # noqa: E402
+                         isolate_app, register_slide_row, FakeRequests)
 
 
 @pytest.fixture(autouse=True)
@@ -76,6 +77,10 @@ def _setup():
     slide = "coop.svs"
     p = Path(UPLOAD_DIR) / slide
     p.write_bytes(b"svs-stub")
+    # R6 审查修复（问题 1）夹具迁移：会话守卫按 descriptor+authorize_read
+    # 鉴权（legacy 布局运行时不可读——P6-2 不变量，其会话同 fail-closed）。
+    # 播种改为发布建仓（id_bundle+冻结别名，旧名通道/分享照常）。
+    register_slide_row(slide)
     share_store.set_slide_meta(slide, owner_user_id=usera["user_id"])
     # A 建分享（view+annotate），B 认领 → B 有该切片 annotate 权限但不是会话属主
     share = share_store.create_share([slide], 24,

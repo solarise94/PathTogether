@@ -262,6 +262,11 @@ def build_plan(inventory_records, issues_records, env,
                 "entry_sha256": rec.get("sha256"),
                 "companion_bytes": None,
                 "companion_file_count": None,
+                # R6 审查修复（问题 4）：逐文件冻结清单（path/size/sha256，
+                # 相对伴侣目录）——migrate 前后均与该清单比对；冻结审计
+                # 未采集（非 frozen / 采集失败）时为 None，migrator 对有
+                # 伴侣却无清单的项 fail-closed 拒绝（须重跑 frozen 审计）。
+                "companion_members": rec.get("companion_members"),
                 "package_bytes": None,
                 "derivatives_in_place": {
                     "manifest_json": bool(rec.get("has_manifest")),
@@ -271,6 +276,20 @@ def build_plan(inventory_records, issues_records, env,
             "format_ext": None,
             "action": None,
             "reason": None,
+            "authorization_freeze": {
+                # R6 审查修复（问题 2）：可比较的授权集合（非计数）——owner/
+                # public 来自 slides 行快照；view 授权主体与分享成员来自审计
+                # 集合。verify 逐主体/成员重读比对，数量相同不构成授权相同。
+                "owner_user_id": rec.get("owner_user_id"),
+                "public": bool(rec.get("public")),
+                "view_grant_users": sorted((rec.get("authorization")
+                                            or {}).get("view_grant_users")
+                                           or []),
+                "share_member_tokens": sorted((rec.get("authorization")
+                                               or {}).get(
+                                                   "share_member_tokens")
+                                              or []),
+            },
             "authorization_summary": {
                 k: int((rec.get("references") or {}).get(k, 0) or 0)
                 for k in _AUTH_SUMMARY_KEYS
@@ -354,6 +373,11 @@ def build_plan(inventory_records, issues_records, env,
                 "entry_sha256": rec.get("sha256"),
                 "companion_bytes": None,
                 "companion_file_count": None,
+                # R6 审查修复（问题 4）：逐文件冻结清单（path/size/sha256，
+                # 相对伴侣目录）——migrate 前后均与该清单比对；冻结审计
+                # 未采集（非 frozen / 采集失败）时为 None，migrator 对有
+                # 伴侣却无清单的项 fail-closed 拒绝（须重跑 frozen 审计）。
+                "companion_members": rec.get("companion_members"),
                 "package_bytes": None,
                 "derivatives_in_place": {
                     "manifest_json": bool(rec.get("has_manifest")),

@@ -10752,9 +10752,21 @@ def admin_v1_staging_residue_cleanup():
         removed = slide_storage.remove_staging_tree(task_id, root=UPLOAD_DIR)
     except (OSError, ValueError) as exc:
         return _admin_v1_error(500, "internal", "清理失败：%s" % exc)
+    # R6 审查修复（问题 3）重试路径：清理确认成功 → 释放该任务挂起的
+    # 容量预占（upload_cleanup_pending 行持有 reservation_id）。
+    pending = None
+    try:
+        pending = upload_task_store.get_cleanup_pending(task_id)
+    except Exception:
+        app.logger.exception("cleanup pending 读取失败：%s", task_id)
+    if pending is not None:
+        _upload_v2_cleanup_confirmed({"upload_id": task_id,
+                                      "reservation_id": None})
     _audit("admin.staging_residue.cleanup", target_type="staging",
            target_id=task_id, detail={"task_id": task_id,
-                                      "removed": bool(removed)})
+                                      "removed": bool(removed),
+                                      "released_reservation":
+                                          bool(pending)})
     return jsonify(ok=True, task_id=task_id, removed=bool(removed))
 
 
@@ -13018,8 +13030,8 @@ def _upload_v2_fail_closed_reservation(task):
         app.logger.exception("upload task expire after reservation loss failed: %s",
                              (task or {}).get("upload_id"))
     if task:
-        _upload_v2_cleanup_part(task)
-        _upload_v2_release_reservation_quietly(task)
+        if _upload_v2_cleanup_part(task):
+            _upload_v2_cleanup_confirmed(task)
         _upload_mark_staging_failed(task)
     return jsonify(error="上传预占已失效，请重新创建任务",
                    code="reservation_expired",
@@ -13037,19 +13049,53 @@ def _upload_v2_release_reservation_quietly(task):
         app.logger.exception("upload task reservation release failed: %s", rid)
 
 
-def _upload_v2_cleanup_part(task):
+def _upload_v2_cleanup_part(task, *, hold_reservation=True):
     """清临时分片文件（取消/过期/commit 提升完成后）。
 
     P6 运行时退役：全部任务清整个 ``.staging/<task_id>/`` 树（传输件+全部
     generation+chunk.lock sidecar，合同 §3.3 第 8 步「清 staging 后再释放
     预占」的文件侧动作——调用方保证先本函数后 release）。平铺
     ``.uploading-*.part`` 的旧 unlink 分支已随升级窗口排空拆除。
+
+    R6 审查修复（问题 3）：返回 bool（True=已清理/本无残留）；**False=
+    清理失败——容量责任路径（取消/预占失效）的调用方不得释放预占**，本函数
+    已落 upload_cleanup_pending 持久待清理行（可重试：用户重复 DELETE /
+    管理员 staging-residue 端点确认清理后才释放）。``hold_reservation=
+    False`` 供无容量语义的调用方（commit 成功后的残余清理——预占已
+    consume）：失败只登记观测行，不挂预占。
     """
     try:
         slide_storage.remove_staging_tree(task["upload_id"], root=UPLOAD_DIR)
     except OSError:
         app.logger.exception("upload task part cleanup failed: %s",
                              task.get("upload_id"))
+        try:
+            upload_task_store.record_cleanup_pending(
+                task["upload_id"],
+                task.get("reservation_id") if hold_reservation else None,
+                error="staging cleanup OSError")
+        except Exception:
+            app.logger.exception(
+                "cleanup pending 登记失败（预占保持，孤儿扫描兜底）：%s",
+                task.get("upload_id"))
+        return False
+    return True
+
+
+def _upload_v2_cleanup_confirmed(task):
+    """清理确认成功后的收口：清待清理行 + 释放预占（先确认后释放）。
+
+    待清理行的 reservation_id 优先（任务行可能已换态）；release 失败只记
+    日志（预约行有 TTL 兜底，不回滚清理事实）。"""
+    rid = None
+    try:
+        rid = upload_task_store.clear_cleanup_pending(task["upload_id"])
+    except Exception:
+        app.logger.exception("cleanup pending 清除失败：%s",
+                             task.get("upload_id"))
+    release_target = {"reservation_id": rid or
+                      task.get("reservation_id")}
+    _upload_v2_release_reservation_quietly(release_target)
 
 
 def _upload_native_entry(safe_name):
@@ -13100,8 +13146,9 @@ def _upload_native_fail(task, *, permanent):
     except upload_task_store.UploadTaskError:
         app.logger.exception("新管线任务失败转移失败：%s", upload_id)
         t = upload_task_store.get_task(upload_id) or task
-    _upload_v2_cleanup_part(t)
-    _upload_v2_release_reservation_quietly(t)
+    if _upload_v2_cleanup_part(t):
+        # 清理确认后才释放（R6 审查修复：失败保留预占+持久待清理）
+        _upload_v2_cleanup_confirmed(t)
     _upload_mark_staging_failed(t)
     return t
 
@@ -13142,7 +13189,7 @@ def _upload_native_publish(task, entry, file_sha, total, *, ident=None,
             owner_user_id=(task.get("owner_user_id") or "") or None,
             upload_root=UPLOAD_DIR)
         task_after, _settled = result
-        _upload_v2_cleanup_part(task_after)
+        _upload_v2_cleanup_part(task_after, hold_reservation=False)
         return task_after, None
     except slide_publish.PublishConflict as e:
         # fail-closed：证据冲突，不删不猜——保持 committing + 告警，人工处置。
@@ -13223,7 +13270,7 @@ def _upload_v2_recover_publish(task):
     try:
         task_after, _ = slide_publish.publish_slide(
             upload_id, generation, task["slide_id"], upload_root=UPLOAD_DIR)
-        _upload_v2_cleanup_part(task_after)
+        _upload_v2_cleanup_part(task_after, hold_reservation=False)
         return task_after
     except slide_publish.PublishConflict as e:
         app.logger.error(
@@ -13303,7 +13350,7 @@ def _upload_v2_recover_commit(task):
                         upload_id, task.get("commit_token") or "",
                         task.get("sha256_actual") or "",
                         settle_bytes=int(task["declared_size"]))
-                    _upload_v2_cleanup_part(t)
+                    _upload_v2_cleanup_part(t, hold_reservation=False)
                     return t
                 except upload_task_store.StateConflict as e:
                     return e.task or upload_task_store.get_task(upload_id) \
@@ -14036,9 +14083,18 @@ def api_uploads_cancel(upload_id):
     except upload_task_store.TaskNotFound:
         return jsonify(error="无上传权限"), 403
     if task["state"] == upload_task_store.STATE_CANCELLED:
-        _upload_v2_cleanup_part(task)
-        _upload_v2_release_reservation_quietly(task)
-        _upload_mark_staging_failed(task)
+        if _upload_v2_cleanup_part(task):
+            # 清理确认后才释放（R6 审查修复：失败路径保留预占+持久待清理）
+            _upload_v2_cleanup_confirmed(task)
+            _upload_mark_staging_failed(task)
+            return jsonify(upload_id=upload_id, state=task["state"])
+        pending = upload_task_store.get_cleanup_pending(upload_id)
+        return jsonify(
+            upload_id=upload_id, state=task["state"],
+            error="临时文件清理失败，容量预占保留待重试（重复取消或管理员"
+                  "确认清理后释放）",
+            code="cleanup_retryable",
+            cleanup_attempts=(pending or {}).get("attempts")), 503
     return jsonify(upload_id=upload_id, state=task["state"])
 
 
@@ -22564,16 +22620,68 @@ def _ai_session_record(session_id: str):
     return (body or {}).get("session") or {}
 
 
+def _ai_session_slide_descriptor(sess):
+    """AI 会话记录 → 切片 descriptor（R6 审查修复：不再按名猜）。
+
+    - ``slide_id``（服务端会话记录携带，权威）→ ``resolve_slide_id``；
+    - 无 ID 的历史会话**仅经冻结别名**（``resolve_legacy_alias``）解析——
+      新资产 legacy_filename=NULL 按名查不到（这正是按名鉴权把合法属主
+      挡在门外的缺陷根源）；解析不到一律 None（fail-closed 拒绝，不回退
+      名字目录扫描/名字授权面）。
+    """
+    raw_sid = sess.get("slide_id")
+    sid = raw_sid.strip() if isinstance(raw_sid, str) else ""
+    if sid:
+        try:
+            return slide_store.resolve_slide_id(sid)
+        except Exception:
+            app.logger.warning("AI 会话 slide_id 解析失败（fail-closed）：%s",
+                               sid, exc_info=True)
+            return None
+    name = sess.get("slide") or ""
+    if not isinstance(name, str) or not name:
+        return None
+    try:
+        return slide_store.resolve_legacy_alias(name)
+    except Exception:
+        app.logger.warning("AI 会话历史名解析失败（fail-closed）：%s", name,
+                           exc_info=True)
+        return None
+
+
+def _ai_session_subject_can_view(role, uid, desc):
+    """会话守卫的主体可读判定（R6 审查修复）。
+
+    与读端点 session 通道（``_authorize_or_deny``）同一语义的显式
+    role/uid 版：认证 owner = 本人 ∪ 显式添加（allow_public=allow_share=
+    False，升级 B R5）；user = 本人 ∪ public ∪ 显式授权 ∪ share 成员；
+    本地免认证单租户态（owner 无 uid）在守卫入口已提前放行，不会到达这里。
+    """
+    if desc is None:
+        return False
+    if role == user_store.ROLE_OWNER:
+        if not uid:
+            return slide_store.authorize_read(
+                desc, actor_role=slide_store.ROLE_ADMIN)
+        return slide_store.authorize_read(
+            desc, actor_user_id=uid, allow_public=False, allow_share=False)
+    if not uid:
+        return False
+    return slide_store.authorize_read(desc, actor_user_id=uid)
+
+
 def _require_ai_session_owner(session_id):
     """AI 会话统一读闸（升级 B R6 收紧：删除 owner 直接放行旁路）。
 
-    从服务端会话记录解析真实 slide 与 owner，再检查两项：
+    从服务端会话记录解析真实资产与 owner（R6 审查修复：**slide_id 优先**，
+    无 ID 历史会话仅经冻结别名解析——新资产无 legacy 别名，按名鉴权会把
+    合法属主挡在门外），再检查两项：
       1. 当前主体有权读取/续跑这条会话——uid 必须等于 session.owner；
          认证态下空 owner（历史）会话仅例外放行给 owner 角色且当前可查看
          该切片的主体（§5.4：历史空 principal 会话只盘点不迁移，过渡期
          owner 对自己历史会话的可达性以切片收录关系为闸）；
-      2. 当前主体仍可查看该切片（_subject_can_view_slide，收录撤销后立即
-         拒绝，不等 TTL）。
+      2. 当前主体仍可查看该切片（authorize_read 统一门禁——含 ready+
+         id_bundle 布局门禁：收录撤销/资产删除/替换后立即拒绝，不等 TTL）。
     detail/stream/path/cancel/archive 全部同口径。本地免认证单租户态
     （owner 无 uid）保持原有内网行为（含空 owner 会话）。sidecar 不可达或
     会话不存在 → 保守 403（不泄露存在性）。
@@ -22588,15 +22696,17 @@ def _require_ai_session_owner(session_id):
         return _denied()
     owner = sess.get("owner") or ""
     slide = sess.get("slide") or ""
+    desc = _ai_session_slide_descriptor(sess)
     if not uid or owner != uid:
         # 空 owner（历史）会话：仅 owner 角色（有 uid）且对真实切片仍有
         # view 权限时可达；user / 无收录主体一律拒绝。
         if not (role == user_store.ROLE_OWNER and uid and not owner and slide
-                and _subject_can_view_slide(role, uid, slide)):
+                and _ai_session_subject_can_view(role, uid, desc)):
             return _denied()
-    # 会话属主（或命中历史例外）也必须对真实切片仍有收录关系（fail-closed：
-    # 收录撤销/资产生替换后 detail/stream/path/cancel/archive 立即拒绝）
-    if not slide or not _subject_can_view_slide(role, uid, slide):
+    # 会话属主（或命中历史例外）也必须对真实资产仍有读取权（fail-closed：
+    # 收录撤销/资产删除或替换/未迁移 legacy 布局在 detail/stream/path/
+    # cancel/archive 立即拒绝）
+    if not _ai_session_subject_can_view(role, uid, desc):
         return _denied()
     return None
 

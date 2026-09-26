@@ -216,6 +216,9 @@ _BUSINESS_TABLES = (
     "share_slides",
     "upload_task_items",
     "slide_delete_jobs",
+    # 0071 起：R6 审查修复——清理失败待重试行（无 FK，显式列出防跨用例
+    # 残留挂起假 pending）
+    "upload_cleanup_pending",
 )
 
 @pytest.fixture(scope="session")

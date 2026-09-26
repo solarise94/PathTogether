@@ -32,7 +32,8 @@ DATA_DIR = _bootstrap.SHARE_DATA_DIR
 import user_store  # noqa: E402
 import share_store  # noqa: E402
 import app as app_mod  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app, FakeRequests, FakeResponse # noqa: E402
+from _pt_helpers import (csrf_client, isolate_app,  # noqa: E402
+                         register_slide_row, FakeRequests, FakeResponse)
 
 import ipaddress  # noqa: E402
 import pytest  # noqa: E402
@@ -88,6 +89,8 @@ def _touch(name="demo.svs"):
     return name
 
 def _own(name, user_id):
+    # R6 审查修复（问题 1）夹具迁移：同 test_ai_budget_wiring（发布建仓）。
+    register_slide_row(name)
     app_mod.share_store.set_slide_meta(name, owner_user_id=user_id)
 
 def _reset_config():

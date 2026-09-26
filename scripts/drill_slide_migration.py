@@ -242,13 +242,42 @@ def _seed_quotas(conn, upload_dir):
           (ALICE, BOB))
     conn.commit()
     backfill.run_backfill(upload_dir=str(upload_dir), apply=True)
-    for owner, extra in ((ALICE, 0), (BOB, 4096)):  # BOB: deleted 不退款差
+    # R6 审查修复（问题 5）：按**迁移后**口径精确种子 used——migrate 人群
+    # 的 accounted 将被校准为包内字节（entry+伴侣），因此 used 按包字节
+    # 预置，使 baseline 终验的 delta 恰好等于 failed+deleted 桶（可机判
+    # 归因）；BOB 的 tombstone（deleted 4096）即其唯一差额。
+    pkg = {}
+    for sid, name in (("sld_drill_svs01", "specimen.svs"),
+                      ("sld_drill_tif01", "scan.tif"),
+                      ("sld_drill_mrxs01", "panel.mrxs"),
+                      ("sld_drill_kfbp01", "kfb-converted.tif"),
+                      ("sld_drill_ome01", "kfbf-out.ome.tif"),
+                      ("sld_drill_noown01", "no-owner.svs")):
+        entry = upload_dir / name
+        total = entry.stat().st_size if entry.is_file() else 0
+        if name.lower().endswith(".mrxs"):
+            comp = upload_dir / name[:-len(".mrxs")]
+            if comp.is_dir():
+                for cur_dir, _dirs, fs in os.walk(comp):
+                    for fn in fs:
+                        total += os.path.getsize(os.path.join(cur_dir, fn))
+        pkg[sid] = int(total)
+    for owner in (ALICE, BOB):
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT slide_id, asset_state, "
+                "COALESCE(accounted_bytes,0) AS acc FROM slides "
+                "WHERE owner_user_id=%s", (owner,))
+            rows = cur.fetchall()
+        used = 0
+        for r in rows:
+            if r["asset_state"] in ("ready", "deleting"):
+                used += int(pkg.get(r["slide_id"], int(r["acc"] or 0)))
+            elif r["asset_state"] in ("failed", "deleted"):
+                used += int(r["acc"] or 0)
         _exec(conn,
-              "UPDATE upload_user_quotas SET used_bytes = "
-              "(SELECT COALESCE(sum(accounted_bytes),0) FROM slides "
-              " WHERE owner_user_id=%s AND asset_state IN ('ready','deleting')"
-              ") + %s WHERE user_id=%s",
-              (owner, extra, owner))
+              "UPDATE upload_user_quotas SET used_bytes=%s WHERE user_id=%s",
+              (used, owner))
     conn.commit()
 
 
@@ -369,12 +398,30 @@ def run_pipeline_once(work_root: Path, *, with_crashes: bool = True) -> dict:
         assert summary["outcomes"].get("postverified") >= len(MIGRATE_IDS), \
             "migrate 人群未全部 postverified：%s" % summary["outcomes"]
 
-        # —— 独立核验 ——
+        # —— 独立核验（R6 审查修复问题 5 两遍法：首遍报告差额 → 签发
+        #    核准凭据 → 复跑放行；生产流程的签发是人工审批动作） ——
+        first = verifier.run_verify(
+            upload_dir=str(upload_dir),
+            out_dir=str(work / "verify-first-pass"),
+            plan_path=str(plan_path),
+            journal_path=str(work / "migration-journal.jsonl"),
+            database_url=uri)
+        approvals = []
+        for owner, rep in sorted((first.get("quota") or {}).items()):
+            delta = int(rep.get("delta_used_minus_responsible") or 0)
+            if delta != 0:
+                approvals.append({
+                    "user_id": owner, "delta": delta,
+                    "reason": "演练核准（合法差额披露）：" + "; ".join(
+                        rep.get("reasons") or [])})
+        approvals_path = work / "quota-approvals.json"
+        with open(approvals_path, "w", encoding="utf-8") as f:
+            json.dump(approvals, f, ensure_ascii=False, indent=1)
         verif = verifier.run_verify(
             upload_dir=str(upload_dir), out_dir=str(verify_out),
             plan_path=str(plan_path),
             journal_path=str(work / "migration-journal.jsonl"),
-            database_url=uri)
+            database_url=uri, quota_approvals_path=str(approvals_path))
 
         # —— 授权/配额零变更断言 ——
         post_auth = _snapshot_auth(conn)
@@ -540,13 +587,15 @@ def assert_drill(ev: dict, report_lines: list) -> None:
         and any("failed" in r for r in quota[ALICE]["reasons"]),
         "§2-6 ALICE 配额「不等于」被 failed 隔离原因完整披露（delta=%d）"
         % quota[ALICE]["delta_used_minus_responsible"])
-    # BOB：tombstone 不退款差 + 派生物留置的校准差，两原因都须披露。
+    # BOB：tombstone 不退款差是唯一差额——按 R6 审查修复（问题 5）的精确
+    # 归因口径：delta 恰等于 deleted 桶 accounted，机判归因披露（used 按
+    # 迁移后包字节播种，派生物留置不再产生无归因残差）。
     bob_delta = quota[BOB]["delta_used_minus_responsible"]
-    out(bob_delta > 4096
+    out(bob_delta == 4096
         and any("deleted" in r for r in quota[BOB]["reasons"])
-        and any("派生物" in r for r in quota[BOB]["reasons"]),
-        "§2-6 BOB 配额「不等于」的合法原因披露（deleted 不退款 + 派生物"
-        "校准；delta=%d）" % bob_delta)
+        and any("机判归因" in r for r in quota[BOB]["reasons"]),
+        "§2-6 BOB 配额差额=deleted 不退款桶（精确归因披露；delta=%d）"
+        % bob_delta)
     out(verif["tombstones"]["crossread_checks"] >= 1
         and not verif["tombstones"]["crossread_violations"],
         "§2-6 tombstone×重生交叉验证无复活")

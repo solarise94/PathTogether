@@ -146,12 +146,38 @@ def row_of(conn, slide_id):
         return cur.fetchone()
 
 
-def run_verify(world, out_name="verify-out", monkeypatch=None):
+def run_verify(world, out_name="verify-out", monkeypatch=None,
+               quota_approvals=None):
+    """quota_approvals：[{user_id, delta, reason}]（R6 审查修复问题 5 的
+    核准凭据形态）——写临时 JSON 传给 run_verify；缺省无核准（任何差额
+    阻断）。"""
     out = world["plan"].parent / out_name
+    approvals_path = None
+    if quota_approvals is not None:
+        approvals_path = str(world["plan"].parent / (
+            "%s-quota-approvals.json" % out_name))
+        import json as _json
+        io_path = approvals_path
+        with open(io_path, "w", encoding="utf-8") as f:
+            _json.dump(quota_approvals, f, ensure_ascii=False, indent=1)
     return verifier.run_verify(
         upload_dir=str(world["up"]), out_dir=str(out),
         plan_path=str(world["plan"]), journal_path=str(world["journal"]),
-        database_url=world["uri"])
+        database_url=world["uri"], quota_approvals_path=approvals_path)
+
+
+def derive_quota_approvals(verif):
+    """从首遍 verify 的配额报告推导核准条目（演练/测试用的两遍法：首遍
+    报告差额 → 按报告事实签发核准 → 复跑放行）。生产流程中这步是人工
+    审批，不是自动推导。"""
+    out = []
+    for owner, rep in sorted((verif.get("quota") or {}).items()):
+        delta = int(rep.get("delta_used_minus_responsible") or 0)
+        if delta != 0:
+            out.append({
+                "user_id": owner, "delta": delta,
+                "reason": "测试/演练核准：" + "; ".join(rep.get("reasons") or [])})
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -638,7 +664,16 @@ def test_source_drift_aborts_item(world):
 # --------------------------------------------------------------------------- #
 def test_verify_pass_end_to_end_and_tombstone(world):
     full_apply(world)
-    verif = run_verify(world)
+    # R6 审查修复（问题 5）两遍法：首遍报告差额（本世界有 failed 隔离/
+    # deleted 不退款/派生物校准的合法差额）→ 无核准时阻断（非 go）→
+    # 按报告签发核准 → 复跑放行。生产流程的签发是人工审批。
+    first = run_verify(world, out_name="verify-first-pass")
+    if first["go_no_go"] != "go":
+        # 有未归因差额：无核准时必须阻断（R6 审查修复问题 5 的反例语义）
+        assert any(v.get("check") == "quota_delta_unapproved"
+                   for v in first["violations"]), first["violations"]
+    approvals = derive_quota_approvals(first)
+    verif = run_verify(world, quota_approvals=approvals)
     assert verif["incomplete"] is False
     assert verif["violations"] == []
     assert verif["counts"]["ready_id_bundle_bad"] == 0

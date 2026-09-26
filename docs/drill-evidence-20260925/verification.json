@@ -1,11 +1,11 @@
 {
   "tool_version": "1.0.0-p6",
   "mode": "post-migration",
-  "started_at": "2026-09-26T07:00:25+00:00",
-  "finished_at": "2026-09-26T07:00:25+00:00",
-  "upload_dir": "/tmp/drill-slide-migration-4amfj0il/uploads",
-  "plan": "/tmp/drill-slide-migration-4amfj0il/migration-plan.jsonl",
-  "journal_crosscheck": "/tmp/drill-slide-migration-4amfj0il/migration-journal.jsonl",
+  "started_at": "2026-09-26T16:07:30+00:00",
+  "finished_at": "2026-09-26T16:07:31+00:00",
+  "upload_dir": "/home/solarise/ZCodeProject/histopilot-suite/.gate-tmp/drill-slide-migration-rvw3zp57/uploads",
+  "plan": "/home/solarise/ZCodeProject/histopilot-suite/.gate-tmp/drill-slide-migration-rvw3zp57/migration-plan.jsonl",
+  "journal_crosscheck": "/home/solarise/ZCodeProject/histopilot-suite/.gate-tmp/drill-slide-migration-rvw3zp57/migration-journal.jsonl",
   "incomplete": false,
   "incomplete_reasons": [],
   "counts": {
@@ -77,23 +77,27 @@
       },
       "responsible_ready_deleting_bytes": 56378,
       "delta_used_minus_responsible": 48,
+      "approved": false,
       "reasons": [
-        "failed 资产 accounted=48（撤回/验证失败不退款或从未入账——历史责任项，须单独核准）"
+        "failed 资产 accounted=48（撤回/验证失败不退款或从未入账——历史责任项，须单独核准）",
+        "差额 48 已机判归因（failed=48 + deleted=0，状态桶精确匹配）"
       ]
     },
     "usr_bob": {
       "quota_bytes": 100000000,
-      "used_bytes": 42202,
+      "used_bytes": 42179,
       "reserved_bytes": 0,
       "accounted_by_state": {
         "deleted": 4096,
         "ready": 38083
       },
       "responsible_ready_deleting_bytes": 38083,
-      "delta_used_minus_responsible": 4119,
+      "delta_used_minus_responsible": 4096,
+      "approved": false,
       "reasons": [
         "deleted tombstone accounted=4096（0013 口径删除不回退 used——合法不等于）",
-        "迁移 accounted 校准以包内字节为准（.manifest.json/.associated 派生物留置原位不计——计划 derivatives_in_place 披露）"
+        "迁移 accounted 校准以包内字节为准（.manifest.json/.associated 派生物留置原位不计——计划 derivatives_in_place 披露）",
+        "差额 4096 已机判归因（failed=0 + deleted=4096，状态桶精确匹配）"
       ]
     }
   },

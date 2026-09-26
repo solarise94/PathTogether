@@ -49,7 +49,8 @@ import budget_store  # noqa: E402
 import demo_store  # noqa: E402
 import platform_features  # noqa: E402
 from pg_compat import BACKEND  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app, FakeRequests, FakeResponse # noqa: E402
+from _pt_helpers import (csrf_client, isolate_app,  # noqa: E402
+                         register_slide_row, FakeRequests, FakeResponse)
 
 # --------------------------------------------------------------------------- #
 # 公共基建
@@ -112,6 +113,9 @@ def _touch(name="s.svs"):
     return name
 
 def _own(name, user_id):
+    # R6 审查修复（问题 1）夹具迁移：会话守卫按 descriptor+authorize_read
+    # 鉴权——播种改为发布建仓（id_bundle+冻结别名；legacy 布局不可读）。
+    register_slide_row(name)
     app_mod.share_store.set_slide_meta(name, owner_user_id=user_id)
 
 def _setup_platform(base_url="http://platform.example/v1",

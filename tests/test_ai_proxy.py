@@ -31,7 +31,8 @@ UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 import pytest  # noqa: E402
 
 import app as app_mod  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app, FakeRequests, FakeResponse # noqa: E402
+from _pt_helpers import (csrf_client, isolate_app,  # noqa: E402
+                         register_slide_row, FakeRequests, FakeResponse)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -175,6 +176,8 @@ def _grant_proxy_slide(client, uid="usr_proxy_owner", slide="s.svs"):
     user_id（role 兜底 owner）并把目标切片归属该 uid，等价「稳定 owner
     uid 部署形态」。
     """
+    # R6 审查修复（问题 1）夹具迁移：发布建仓（id_bundle+冻结别名）。
+    register_slide_row(slide)
     app_mod.share_store.set_slide_meta(slide, owner_user_id=uid)
     with client.session_transaction() as s:
         s["user_id"] = uid

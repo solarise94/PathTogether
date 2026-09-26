@@ -64,3 +64,16 @@ PATHTOGETHER_REPO=../PathTogether npm run test:contract
 - P4 review 修复 F0–F3 的复现用例原样入仓（先红后绿）：ready 撤回破态、KFB 恢复死循环、悬挂转换 job、ZIP 撤回遗漏。
 - 配额：used/reserved 逐用例核对（不漏账不双扣）；删除减账幂等键=deleting→deleted CAS（同事务）；R-12 legacy 不退款过渡口径有专测。
 - 迁移演练 journal/verification/summary 落 `docs/drill-evidence-20260925/`（无 token 明文）。
+
+## 5. R6 独立审查修复后的终态补记（2026-09-26 晚）
+
+用户独立审查（6 项：5×P1+1×P2，7 反例）全部修复并复现入仓（`tests/test_slide_id_review_regressions.py` 6 例 + HP `test/session-alias-id-review.regression.test.ts` 1 例，断言原样）：
+
+1. AI 会话守卫 slide_id 优先（新资产按名 403 的功能回归）；
+2. 迁移终验授权集合冻结比对（owner/public/分享成员/授权主体——数量≠授权；token 以 sha256[:16] 摘要入 evidence）；
+3. 清理失败保留容量预约（0071 `upload_cleanup_pending` 持久待清理+可重试；清理确认后才释放）；
+4. MRXS 伴侣逐文件哈希冻结（审计采集→计划冻结→迁移前后双比对；等长改字节拒）；
+5. 配额差额精确归因或人工核准（`--quota-approvals`）否则阻断 go；
+6. HP 无 ID 旧会话不得续用同名新资产（`aliasIdVerified` 可信映射证据钩子，缺省拒绝）。
+
+连带：部署包 §3 执行顺序矛盾修正（在线预审→停写备份→维护版本→回填→冻结审计→迁移→终验→开放）；4 个 AI 测试文件夹具迁移至发布建仓（会话守卫收紧暴露的 legacy 布局旧口径）。终态门禁计数见交付日志 R6 节。

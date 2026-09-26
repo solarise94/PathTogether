@@ -21,7 +21,7 @@
   "inputs": {
     "inventory": {
       "records": 13,
-      "sha256": "99a36afd9a1130d6d538789c8574713684061645025bacfe961f148dc70f73fd"
+      "sha256": "42ab7d5ca3dfeae3e404fcd6eb3f42f21bf86ebe141a2753887b43d5fb3b9296"
     },
     "issues": {
       "by_disposition": {
@@ -30,7 +30,7 @@
         "retain_history": 2
       },
       "records": 9,
-      "sha256": "ee56fef5cff226accbd6742417b07e124b4ab12e98df85cc58a2e90ac81fb73d"
+      "sha256": "21050f16209c43ec008341c246b44c2354d668323570bf26e6f2abd225605b94"
     }
   },
   "plan_version": 1,
@@ -75,12 +75,12 @@ ok    §2-4 sld_drill_noown01（no-owner.svs）不可读且不在 ready 列表�
 ok    §2-4 sld_drill_miss01（gone.svs）不可读且不在 ready 列表（state=failed）
 ok    §2-4 retain_history（缺文件）→ failed+reason
 ok    §2-4 孤儿文件不建行不进列表（只隔离报告）
-ok    §2-5 旧分享领取人（usr_bob）不能读同展示名新资产 sld_fSqns031IXeH
+ok    §2-5 旧分享领取人（usr_bob）不能读同展示名新资产 sld_qKYFO5ymqGyS
 ok    §2-5 新资产 owner 正常可读（不受 tombstone 影响）
 ok    §2-5 迁移不碰 tombstone（deleted 行保留冻结别名）
 ok    §2-6 verify：go（无违规/incomplete）
 ok    §2-6 ALICE 配额「不等于」被 failed 隔离原因完整披露（delta=48）
-ok    §2-6 BOB 配额「不等于」的合法原因披露（deleted 不退款 + 派生物校准；delta=4119）
+ok    §2-6 BOB 配额差额=deleted 不退款桶（精确归因披露；delta=4096）
 ok    §2-6 tombstone×重生交叉验证无复活
 ```
 

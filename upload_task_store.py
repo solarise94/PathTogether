@@ -868,3 +868,64 @@ def get_upload_task_item(task_id, item_key):
                         if r is not None else None)
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 暂存清理失败的持久待清理状态（0071；R6 审查问题 3 修复）
+# --------------------------------------------------------------------------- #
+def record_cleanup_pending(upload_id, reservation_id=None, *, error=None):
+    """清理失败 → 落/更新待清理行（保留容量责任的持久证据）。
+
+    行存在期间调用方**不得释放** reservation（清理确认后由
+    clear_cleanup_pending 的调用路径释放）；attempts 累计重试次数，
+    last_error 截断 4KB。幂等（同 upload_id 更新）。"""
+    conn = _pg_connect()
+    try:
+        with pg_store.transaction(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO upload_cleanup_pending "
+                    "(upload_id, reservation_id, attempts, last_error) "
+                    "VALUES (%s, %s, 1, %s) "
+                    "ON CONFLICT (upload_id) DO UPDATE SET "
+                    "attempts = upload_cleanup_pending.attempts + 1, "
+                    "reservation_id = COALESCE(EXCLUDED.reservation_id, "
+                    "upload_cleanup_pending.reservation_id), "
+                    "last_error = EXCLUDED.last_error, "
+                    "updated_at = now()",
+                    (str(upload_id), (reservation_id or None),
+                     (str(error)[:4096] if error else None)))
+    finally:
+        conn.close()
+
+
+def clear_cleanup_pending(upload_id):
+    """清理确认成功 → 删待清理行。返回被删行的 reservation_id（供调用方
+    在清理确认后释放预占），无行返回 None。"""
+    conn = _pg_connect()
+    try:
+        with pg_store.transaction(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM upload_cleanup_pending WHERE upload_id=%s "
+                    "RETURNING reservation_id", (str(upload_id),))
+                row = cur.fetchone()
+                return (row[0] if row else None)
+    finally:
+        conn.close()
+
+
+def get_cleanup_pending(upload_id):
+    """待清理行（None=无）。观测/重试路径用。"""
+    conn = _pg_connect()
+    try:
+        with pg_store.transaction(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT upload_id, reservation_id, attempts, last_error "
+                    "FROM upload_cleanup_pending WHERE upload_id=%s",
+                    (str(upload_id),))
+                row = cur.fetchone()
+                return dict(row) if row is not None else None
+    finally:
+        conn.close()

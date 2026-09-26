@@ -306,6 +306,9 @@ def test_schema_migrations_recorded(conn):
         # §1-2）：slide_delete_jobs 的执行器租约列（lease_owner/
         # lease_expires_at）+ 领取调度索引——daemon 领取/退避/崩溃重领。
         "0070_slide_delete_jobs_lease.sql",
+        # R6 审查修复（问题 3）：暂存清理失败的持久待清理状态——清理
+        # 确认后才释放容量预占。
+        "0071_upload_cleanup_pending.sql",
     ]
 
 

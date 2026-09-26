@@ -144,11 +144,14 @@ def _open_private(path: Path):
 # --------------------------------------------------------------------------- #
 class Verifier:
     def __init__(self, conn, upload_dir: Path, plan_items=None,
-                 journal_manifests=None):
+                 journal_manifests=None, quota_approvals=None):
         self.conn = conn
         self.upload_dir = upload_dir
         self.plan_items = plan_items or {}        # item_id -> plan item
         self.journal_manifests = journal_manifests or {}  # slide_id -> manifest
+        # R6 审查修复（问题 5）：逐 owner 的配额差额核准凭据
+        # {user_id: [{"delta": int, "reason": str}, ...]}
+        self.quota_approvals = quota_approvals or {}
         self.violations = []      # 硬违规（exit 2）
         self.warnings = []        # 披露项（不阻断）
         self.incomplete_reasons = []
@@ -388,6 +391,11 @@ class Verifier:
 
     # ---------------- 配额对账（只报告不改账） ---------------- #
     def verify_quotas(self):
+        """配额对账（R6 审查修复问题 5：差额未核准 → 阻断）。
+
+        delta==0 通过；delta!=0 必须有逐项人工核准凭据（--quota-approvals
+        JSON：[{user_id, delta, reason}]，delta 精确匹配）——未核准差额
+        一律 violation（go 变 no-go），reasons 仅作披露不构成核准。"""
         with self.conn.cursor() as cur:
             cur.execute("SELECT user_id, quota_bytes, used_bytes, "
                         "reserved_bytes FROM upload_user_quotas")
@@ -452,6 +460,39 @@ class Verifier:
             if delta != 0 and not reasons:
                 reasons.append("未解释差 %d 字节——须人工核准（不得静默归零）"
                                % delta)
+            approved = None
+            if delta != 0:
+                # 机判归因：delta 恰等于 failed+deleted 两桶 accounted 合计
+                # （撤回不退款/删除不回退——R-12/0013 的状态机可证来源）时
+                # 自动接受并披露；其余差额（含一切负值欠账）须逐项核准。
+                failed_bytes = int(by_state.get("failed", {}).get("bytes", 0))
+                deleted_bytes = int(by_state.get("deleted", {}).get("bytes", 0))
+                attributed = delta == failed_bytes + deleted_bytes
+                if attributed:
+                    reasons.append(
+                        "差额 %d 已机判归因（failed=%d + deleted=%d，状态桶"
+                        "精确匹配）" % (delta, failed_bytes, deleted_bytes))
+                else:
+                    for entry in self.quota_approvals.get(owner, []):
+                        try:
+                            if int(entry.get("delta")) == int(delta):
+                                approved = entry
+                                break
+                        except (TypeError, ValueError):
+                            continue
+                if approved is None and not attributed:
+                    self._violation("quota_delta_unapproved", {
+                        "user_id": owner, "delta": delta,
+                        "used_bytes": used,
+                        "responsible_ready_deleting_bytes": responsible,
+                        "reasons": reasons,
+                        "note": "配额差额未经逐项核准（--quota-approvals "
+                                "须精确匹配 delta 并附理由）——不得静默按"
+                                "历史口径差异放行"})
+                    reasons.append("**未核准差额 %d 字节（阻断项）**" % delta)
+                elif approved is not None:
+                    reasons.append(
+                        "已核准差额 %d 字节：%s" % (delta, approved.get("reason")))
             report[owner] = {
                 "quota_bytes": int(q["quota_bytes"]),
                 "used_bytes": used,
@@ -460,6 +501,7 @@ class Verifier:
                                        for st, v in sorted(by_state.items())},
                 "responsible_ready_deleting_bytes": responsible,
                 "delta_used_minus_responsible": delta,
+                "approved": bool(approved) if delta != 0 else None,
                 "reasons": reasons,
             }
         return report
@@ -484,6 +526,91 @@ class Verifier:
             if item.get("action") != "migrate" or not item.get("slide_id"):
                 continue
             sid = item["slide_id"]
+            # R6 审查修复（问题 2）：集合级比对（owner/public/view 授权主体/
+            # 分享成员）——数量相同不构成授权相同；双向差异均违规。
+            freeze = item.get("authorization_freeze") or {}
+            if freeze:
+                try:
+                    with self.conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT owner_user_id, public FROM slides "
+                            "WHERE slide_id=%s", (sid,))
+                        row = cur.fetchone()
+                        cur.execute(
+                            "SELECT DISTINCT COALESCE(user_id,'') AS u "
+                            "FROM slide_view_grants WHERE slide_id=%s "
+                            "OR (slide_id IS NULL AND slide_name=%s)",
+                            (sid, item.get("legacy_filename") or ""))
+                        grants = sorted(r["u"] for r in cur.fetchall())
+                        cur.execute(
+                            "SELECT token FROM share_slides WHERE "
+                            "slide_id=%s", (sid,))
+                        # token 摘要比对（与冻结侧同口径：sha256 前 16 hex）
+                        share = sorted(
+                            hashlib.sha256(
+                                str(r["token"]).encode("utf-8")
+                            ).hexdigest()[:16] for r in cur.fetchall())
+                except psycopg.Error as e:
+                    self._incomplete("db_query_error")
+                    self._warn("auth_set_query_failed",
+                               {"slide_id": sid,
+                                "error": str(e).split("\n")[0]})
+                    row, grants, share = None, None, None
+                if row is not None:
+                    f_owner = freeze.get("owner_user_id") or None
+                    a_owner = row["owner_user_id"] or None
+                    if f_owner != a_owner:
+                        diffs.append({
+                            "slide_id": sid, "field": "owner_user_id",
+                            "expected": f_owner, "actual": a_owner,
+                            "direction": "unexpected_change"})
+                        self._violation("authorization_drift", {
+                            "slide_id": sid, "field": "owner_user_id",
+                            "expected": f_owner, "actual": a_owner,
+                            "note": "迁移不得改归属（owner 转移须先有决议）"})
+                    if bool(freeze.get("public")) != bool(row["public"]):
+                        diffs.append({
+                            "slide_id": sid, "field": "public",
+                            "expected": bool(freeze.get("public")),
+                            "actual": bool(row["public"]),
+                            "direction": (
+                                "unexpected_increase"
+                                if row["public"] else "unexpected_shrink")})
+                        self._violation("authorization_drift", {
+                            "slide_id": sid, "field": "public",
+                            "expected": freeze.get("public"),
+                            "actual": row["public"],
+                            "note": "迁移不得改变 public 可见性（授权只能"
+                                    "来自已审核计划）"})
+                if grants is not None:
+                    f_g = sorted(freeze.get("view_grant_users") or [])
+                    if f_g != grants:
+                        diffs.append({
+                            "slide_id": sid, "field": "view_grant_users",
+                            "expected": f_g, "actual": grants,
+                            "direction": (
+                                "unexpected_increase"
+                                if set(grants) - set(f_g)
+                                else "unexpected_shrink")})
+                        self._violation("authorization_drift", {
+                            "slide_id": sid, "field": "view_grant_users",
+                            "expected": f_g, "actual": grants,
+                            "note": "view 授权主体集合漂移（双向均违规）"})
+                if share is not None:
+                    f_s = sorted(freeze.get("share_member_tokens") or [])
+                    if f_s != share:
+                        diffs.append({
+                            "slide_id": sid, "field": "share_member_tokens",
+                            "expected": f_s, "actual": share,
+                            "direction": (
+                                "unexpected_increase"
+                                if set(share) - set(f_s)
+                                else "unexpected_shrink")})
+                        self._violation("authorization_drift", {
+                            "slide_id": sid, "field": "share_member_tokens",
+                            "expected": f_s, "actual": share,
+                            "note": "分享成员关系漂移（token 不新增不丢失；"
+                                    "双向均违规）"})
             expected = item.get("authorization_summary") or {}
             actual = {}
             for field, sql in _AUTH_DIFF_SQL.items():
@@ -532,6 +659,55 @@ class Verifier:
         not_migrated = []
         checked = 0
         for item_id in sorted(self.plan_items):
+            # R6 审查修复（问题 4）终验侧：bundle 内伴侣成员内容与冻结清单
+            # 逐文件比对（size+sha256；成员集合增删同样违规）。
+            item = self.plan_items[item_id]
+            frozen_members = ((item.get("source") or {})
+                              .get("companion_members"))
+            comp = (item.get("source") or {}).get("companion_dir")
+            if (item.get("action") == "migrate" and comp
+                    and frozen_members is not None
+                    and item.get("slide_id")):
+                bundle = self.upload_dir / "objects" / item["slide_id"]
+                mpath = bundle / "manifest.json"
+                try:
+                    with open(mpath, "r", encoding="utf-8") as f:
+                        bm = json.load(f)
+                    files = {f["path"]: f
+                             for f in bm.get("files") or []}
+                except (OSError, ValueError, KeyError, TypeError) as e:
+                    self._violation("companion_freeze_read_failed", {
+                        "slide_id": item["slide_id"],
+                        "error": str(e)})
+                    bm = None
+                if bm is not None:
+                    frozen = {"%s/%s" % (comp, m["path"]): m
+                              for m in frozen_members}
+                    staged = {p: f for p, f in files.items()
+                              if p.startswith(comp + "/")}
+                    if set(frozen) != set(staged):
+                        self._violation("companion_content_drift", {
+                            "slide_id": item["slide_id"],
+                            "frozen_only": sorted(
+                                set(frozen) - set(staged)),
+                            "bundle_only": sorted(
+                                set(staged) - set(frozen))})
+                    else:
+                        for rel, fm in sorted(frozen.items()):
+                            sf = staged[rel]
+                            if int(sf.get("size") or -1) != int(
+                                    fm.get("size") or -2) or \
+                                    str(sf.get("sha256") or "").lower() != \
+                                    str(fm.get("sha256") or "").lower():
+                                self._violation(
+                                    "companion_content_drift", {
+                                        "slide_id": item["slide_id"],
+                                        "path": rel,
+                                        "frozen": (fm.get("size"),
+                                                   fm.get("sha256")),
+                                        "bundle": (sf.get("size"),
+                                                   sf.get("sha256"))})
+                                break
             item = self.plan_items[item_id]
             if item.get("action") != "migrate":
                 continue
@@ -713,8 +889,30 @@ def _load_journal_manifests(journal_path):
     return out
 
 
+def _load_quota_approvals(path):
+    """--quota-approvals JSON → {user_id: [{delta, reason}]}（缺文件报错，
+    不静默当作无核准）。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            entries = json.load(f)
+    except OSError as e:
+        raise VerifyError("配额核准文件读取失败：%s" % e) from e
+    except json.JSONDecodeError as e:
+        raise VerifyError("配额核准文件不是合法 JSON：%s" % e) from e
+    if not isinstance(entries, list):
+        raise VerifyError("配额核准文件必须是条目数组")
+    out = {}
+    for ent in entries:
+        if not isinstance(ent, dict) or "user_id" not in ent \
+                or "delta" not in ent:
+            raise VerifyError(
+                "核准条目缺少 user_id/delta：%r" % (ent,))
+        out.setdefault(str(ent["user_id"]), []).append(ent)
+    return out
+
+
 def run_verify(*, upload_dir, out_dir, plan_path=None, journal_path=None,
-               database_url=None) -> dict:
+               database_url=None, quota_approvals_path=None) -> dict:
     started = _now_iso()
     upload_root = Path(upload_dir or os.environ.get("UPLOAD_DIR")
                        or "/data/uploads")
@@ -739,7 +937,10 @@ def run_verify(*, upload_dir, out_dir, plan_path=None, journal_path=None,
     except OSError as e:
         raise VerifyError("创建输出目录失败：%s" % e) from e
 
-    verifier = Verifier(conn, upload_root, plan_items, journal_manifests)
+    quota_approvals = (_load_quota_approvals(quota_approvals_path)
+                       if quota_approvals_path else {})
+    verifier = Verifier(conn, upload_root, plan_items, journal_manifests,
+                        quota_approvals=quota_approvals)
     try:
         verifier.verify_assets()
         references = verifier.verify_references()
@@ -804,6 +1005,10 @@ def _parse_args(argv):
     p.add_argument("--journal", default=None,
                    help="可选：migration-journal.jsonl（仅作 manifest 交叉证据）")
     p.add_argument("--database-url", default=None, help="PG 连接串")
+    p.add_argument(
+        "--quota-approvals", default=None,
+        help="配额差额核准凭据 JSON（[{user_id, delta, reason}]；R6 审查"
+             "修复：未核准差额一律阻断 go）")
     return p.parse_args(argv)
 
 
@@ -812,7 +1017,8 @@ def main(argv=None) -> int:
     try:
         verif = run_verify(upload_dir=args.upload_dir, out_dir=args.out_dir,
                            plan_path=args.plan, journal_path=args.journal,
-                           database_url=args.database_url)
+                           database_url=args.database_url,
+                           quota_approvals_path=args.quota_approvals)
     except VerifyError as e:
         _err(str(e))
         return EXIT_TOOL_ERROR

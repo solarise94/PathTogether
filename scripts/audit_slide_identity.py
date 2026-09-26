@@ -460,6 +460,9 @@ class _Audit:
             "slides": [], "slides_total": None, "id_dups": False,
             "users": {}, "name_aggs": {k: {} for k in NAME_REF_KINDS},
             "view_grants": {}, "vg_by_id": {}, "demo_by_id": {},
+            # R6 审查修复（问题 2）：授权集合冻结数据（verify 同口径重读）
+            "vg_users_by_id": {}, "vg_users_by_name_null": {},
+            "share_tokens_by_id": {},
             "quotas": {}, "db_name": None, "pg_snapshot": pg_snapshot,
         }
         try:
@@ -590,6 +593,33 @@ class _Audit:
                 "WHERE slide_id IS NOT NULL GROUP BY slide_id")
             for r in cur.fetchall():
                 data["vg_by_id"][r["slide_id"]] = int(r["cnt"])
+            # R6 审查修复（问题 2）：授权主体集合（按 ID 权威 + 名残留行），
+            # 供 plan 冻结、verify 重读比对——数量相同不构成授权相同。
+            cur.execute(
+                "SELECT slide_id, COALESCE(user_id, '') AS u "
+                "FROM slide_view_grants WHERE slide_id IS NOT NULL "
+                "ORDER BY slide_id, u")
+            for r in cur.fetchall():
+                data["vg_users_by_id"].setdefault(
+                    r["slide_id"], []).append(r["u"])
+            cur.execute(
+                "SELECT slide_name, COALESCE(user_id, '') AS u "
+                "FROM slide_view_grants WHERE slide_id IS NULL "
+                "ORDER BY slide_name, u")
+            for r in cur.fetchall():
+                data["vg_users_by_name_null"].setdefault(
+                    r["slide_name"], []).append(r["u"])
+            # share_slides 成员（token×slide_id；R-04 唯一授权源）。token
+            # 是秘密——evidence 只存不可逆摘要（sha256 前 16 hex，runbook
+            # §3「不复制到公开 evidence」），verify 对 DB 重读侧同口径摘要。
+            cur.execute(
+                "SELECT slide_id, token FROM share_slides "
+                "ORDER BY slide_id, token")
+            for r in cur.fetchall():
+                data["share_tokens_by_id"].setdefault(
+                    r["slide_id"], []).append(
+                        hashlib.sha256(str(r["token"]).encode(
+                            "utf-8")).hexdigest()[:16])
 
             # demo_catalog（按 slide_id）。
             cur.execute(
@@ -663,6 +693,20 @@ class _Audit:
                 "file_dev": None,
                 "file_ino": None,
                 "references": self._asset_refs(data, sid, name),
+                # R6 审查修复（问题 2）：逐资产授权集合（owner/public 在行上，
+                # 已随 record 输出）——plan 冻结进计划，verify 重读同口径比对。
+                "authorization": {
+                    "view_grant_users": sorted(
+                        set(data["vg_users_by_id"].get(sid, []))
+                        | set(data["vg_users_by_name_null"].get(name, [])
+                              if name else [])),
+                    "share_member_tokens": sorted(
+                        data["share_tokens_by_id"].get(sid, [])),
+                },
+                # R6 审查修复（问题 4）：伴侣目录逐文件冻结清单（相对伴侣
+                # 目录的 path/size/sha256；frozen 模式才采集）——migrate 迁移
+                # 前后均与该清单比对，等长改字节能被抓住（总字节比对不能）。
+                "companion_members": None,
                 "evidence": {"db": db_ev, "fs": "UPLOAD_DIR 根 lstat"},
             }
             # owner 判定（空 / 不在 users / 已禁用 → 人工确认，不回落认领）。
@@ -768,6 +812,60 @@ class _Audit:
                     stem = name[:-len(MRXS_EXT)]
                     rec["has_companion_dir"] = (
                         stem in index and index[stem]["kind"] == "dir")
+                    if rec["has_companion_dir"] and self.mode == "frozen":
+                        members = []
+                        comp_root = upload_dir / stem
+                        broken = False
+                        for cur_dir, dirs, files in sorted(os.walk(comp_root)):
+                            dirs.sort()
+                            for fname in sorted(files):
+                                fpath = Path(cur_dir) / fname
+                                rel = fpath.relative_to(comp_root).as_posix()
+                                try:
+                                    st = fpath.lstat()
+                                except OSError as err:
+                                    self.issues.add(
+                                        "scan_error", "review", "manual_review",
+                                        "伴侣成员 lstat 失败：%s" % err,
+                                        slide_id=sid, legacy_filename=name,
+                                        path=str(fpath))
+                                    self._incomplete("scan_error")
+                                    broken = True
+                                    continue
+                                if stat_mod.S_ISLNK(st.st_mode):
+                                    self.issues.add(
+                                        "companion_symlink", "review",
+                                        "manual_review",
+                                        "伴侣目录内符号链接（不跟随；迁移须"
+                                        "复制为隔离受管字节）",
+                                        slide_id=sid, legacy_filename=name,
+                                        path=str(fpath))
+                                    broken = True
+                                    continue
+                                member = {"path": rel,
+                                          "size": int(st.st_size),
+                                          "sha256": None}
+                                if stat_mod.S_ISREG(st.st_mode):
+                                    digest, changed, err = \
+                                        _hash_with_change_check(str(fpath), st)
+                                    if err is not None or changed:
+                                        self.issues.add(
+                                            "changed_during_read", "review",
+                                            "manual_review",
+                                            "伴侣成员哈希失败或读取期间变化"
+                                            "（%s）——该资产本轮结果作废"
+                                            % (err or "changed"),
+                                            slide_id=sid,
+                                            legacy_filename=name,
+                                            path=str(fpath))
+                                        self._incomplete(
+                                            "changed_during_read")
+                                        broken = True
+                                        continue
+                                    member["sha256"] = digest
+                                members.append(member)
+                        if not broken:
+                            rec["companion_members"] = members
             self._active_task_issue(sid, name, rec["references"])
             inv.write(rec)
 

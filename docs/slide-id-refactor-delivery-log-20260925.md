@@ -301,3 +301,25 @@
 - 核心设计全部落地：新上传独立 slide_id；文件名仅展示；强制转移归属/同名认领/名冲突锁/平铺读写旁路全拆（rg 证据逐阶段）；统一发布（六步+PublishChannel）/统一授权（authorize_read+layout 门禁 choke point）/统一删除（slide_delete_jobs+daemon）/统一配额（预约-实占-退款幂等）；无法确认归属先隔离不猜测。
 - 运行时终态：读路径只认 id_bundle；legacy_filename=冻结别名（固定 ID 查找）；迁移工具链就绪且副本演练通过（40 断言可复现）。
 - 下一步在用户：批准部署包 → 晚间低峰窗口执行生产审计与迁移（[[deploy-evening-preference]]）。
+
+## R6 独立审查处置（2026-09-26 晚）：6 项问题全部修复
+
+审查方（用户）独立审查提出 6 项问题（5×P1+1×P2），复现脚本 7 反例。处置按
+[[review-fix-workflow]]：编排方逐项亲自复现（先红）→ 修复 → 复现用例原样入仓为回归（断言不动）→ 全量回归。复现入仓：`tests/test_slide_id_review_regressions.py`（6 例）+ HP `test/session-alias-id-review.regression.test.ts`（1 例）。
+
+| # | 问题 | 修复 | 回归 |
+|---|---|---|---|
+| 1 | 新 ID 资产 AI 会话按原名鉴权（legacy_filename=NULL → 合法属主 403） | `_require_ai_session_owner` 重构：新增 `_ai_session_slide_descriptor`（session.slide_id 权威→resolve_slide_id；无 ID 历史会话仅经冻结别名）+ `_ai_session_subject_can_view`（与读端点 session 通道同语义的显式 role/uid authorize_read）；detail/stream/path/cancel/archive 共用闸一次性收口 | test_new_id_session_owner_can_access |
+| 2 | 迁移终验漏检 owner/public/分享成员/授权主体（计数≠授权） | audit 集合级采集（view_grant_users 按 ID∪名残留、share 成员 token **sha256[:16] 摘要**——evidence 不落 token 明文）；plan 冻结 `authorization_freeze`；verify 逐主体/成员/owner/public 重读比对（双向 diff+violation）。数量比较仅保留给内容类关系 | test_lost_share_membership_blocks_go / test_owner_transfer_blocks_go |
+| 3 | 清理失败仍释放容量预约（文件残留而 reserved 归零） | `_upload_v2_cleanup_part` 返回 bool；0071 迁移建 `upload_cleanup_pending`（attempts/last_error 持久）；取消/预占失效/原生失败路径「清理确认后才释放」（`_upload_v2_cleanup_confirmed`）；重试=重复 DELETE 幂等 + 管理员 staging-residue 端点确认清理后释放；commit 后残余清理不挂预占（hold_reservation=False） | test_cleanup_failure_preserves_capacity |
+| 4 | 冻结审计未绑定 MRXS 伴侣逐文件内容（等长改字节逃逸） | audit frozen 模式采集 `companion_members`（path/size/sha256；symlink/读取变化→issue+incomplete）；plan 冻结进 source；migrate `validate_source_frozen` 成员集合精确比对+逐文件 sha（清单缺失 fail-closed 拒绝迁移）+复制后 staging↔冻结清单再比对；verify 终验 bundle manifest↔冻结清单逐文件核对 | test_frozen_companion_same_size_mutation_rejected |
+| 5 | 未核准配额差额仍放行 go | `verify_quotas`：delta==failed+deleted 桶**精确归因**才自动接受（机判可证来源）；其余差额（含一切负值欠账）须 `--quota-approvals` 逐项核准凭据（user_id+delta 精确匹配+reason），否则 violation 阻断 go；演练/测试两遍法演示核准流程；演练世界播种改按迁移后口径精确归因 | test_zero_used_bytes_blocks_go |
+| 6 | HP 无 ID 旧会话可被同名新资产续用（复用旧 transcript） | `SessionStore.acquire`：旧会话无 slide_id 且请求携 slide_id → 同名不构成同一资产证据，缺 `aliasIdVerified`（可信冻结别名映射）一律 SessionConflict（要求新会话）；agent-runner 全部调用点走严格缺省 | HP session-alias-id-review.regression.test.ts |
+
+**审查连带修正**：
+- 部署包 §3 顺序矛盾修正（审查末段）：在线预审（不停写）→ 停写+备份 → 部署维护版本（窗口内不开放读写）→ 回填 → 冻结审计+计划 → 物理迁移 → 独立终验（含配额核准）→ 开放读写；逐 worker 停写验证入部署单。
+- 既有保密断言（计划文件不含分享 token 明文）在修复#2 首版被抓（token 明文冻入计划）→ 改 sha256[:16] 摘要后通过——runbook「秘密不入 evidence」口径保住。
+
+**演练证据刷新**：drill 40 断言重跑 0 失败（BOB 差额断言更新为精确归因不变量；证据目录无 token 明文已核）。
+
+**R6 门禁**：审查复现 6+1 全绿；migration tools 22+6 全绿；上传/发布/删除/P6 退役套件 102 全绿；JS 562；HP build+unit 1147（+1 回归）/integration 340/contract 49。全量 pytest（修复后终态）：**2764 passed / 1 已知无关失败（admin 0.4.13）/ 6 skipped**（2755 基线 + 6 审查回归 + 夹具迁移净增；首轮全量曾现 10 失败＝5×ai_session_owner + 2×ai_proxy + 1×ai_credentials + 1×ai_budget + 1×admin——全部为会话守卫收紧暴露的 legacy 布局旧口径夹具，4 文件迁移至发布建仓后收敛）。

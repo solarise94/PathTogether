@@ -63,6 +63,18 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+
+def _canon_perms(raw):
+    """permissions JSONB 文本 → 规范化排序表（确定性冻结/比对）。"""
+    import json as _json
+    try:
+        val = _json.loads(raw) if raw else []
+        if isinstance(val, list):
+            return sorted(str(x) for x in val)
+        return [repr(val)]
+    except (TypeError, ValueError):
+        return [str(raw)]
+
 TOOL_VERSION = "1.0.0-p0"
 
 EXIT_OK = 0
@@ -463,6 +475,8 @@ class _Audit:
             # R6 审查修复（问题 2）：授权集合冻结数据（verify 同口径重读）
             "vg_users_by_id": {}, "vg_users_by_name_null": {},
             "share_tokens_by_id": {},
+            # R7 复核修复 P1：分享控制状态 + 领取权限（逐资产）
+            "share_states_by_id": {}, "claim_grants_by_id": {},
             "quotas": {}, "db_name": None, "pg_snapshot": pg_snapshot,
         }
         try:
@@ -620,6 +634,39 @@ class _Audit:
                     r["slide_id"], []).append(
                         hashlib.sha256(str(r["token"]).encode(
                             "utf-8")).hexdigest()[:16])
+            # R7 复核修复 P1：授权终验只比 token 集合不够——领取权限
+            # （grants.user_id/active/permissions）与分享控制状态
+            # （shares.revoked/expires_at/permissions）才是实际控制访问的
+            # 字段。逐资产冻结（token 摘要关联；expires_at 冻结存储值本身
+            # ——「审计时点语义」＝时间戳不被迁移改动，自然过期不改列值，
+            # 不产生假阳性/假阴性）。
+            cur.execute(
+                "SELECT m.slide_id, s.token, s.revoked, "
+                "extract(epoch from s.expires_at)::float8 AS exp, "
+                "s.permissions::text AS perms FROM shares s "
+                "JOIN share_slides m ON m.token = s.token "
+                "ORDER BY m.slide_id, s.token")
+            for r in cur.fetchall():
+                data["share_states_by_id"].setdefault(
+                    r["slide_id"], []).append((
+                        hashlib.sha256(str(r["token"]).encode(
+                            "utf-8")).hexdigest()[:16],
+                        bool(r["revoked"]),
+                        (float(r["exp"]) if r["exp"] is not None else None),
+                        _canon_perms(r["perms"])))
+            cur.execute(
+                "SELECT m.slide_id, g.token, g.user_id, g.active, "
+                "g.permissions::text AS perms FROM grants g "
+                "JOIN share_slides m ON m.token = g.token "
+                "ORDER BY m.slide_id, g.token, g.user_id")
+            for r in cur.fetchall():
+                data["claim_grants_by_id"].setdefault(
+                    r["slide_id"], []).append((
+                        hashlib.sha256(str(r["token"]).encode(
+                            "utf-8")).hexdigest()[:16],
+                        str(r["user_id"] or ""),
+                        bool(r["active"]),
+                        _canon_perms(r["perms"])))
 
             # demo_catalog（按 slide_id）。
             cur.execute(
@@ -695,14 +742,7 @@ class _Audit:
                 "references": self._asset_refs(data, sid, name),
                 # R6 审查修复（问题 2）：逐资产授权集合（owner/public 在行上，
                 # 已随 record 输出）——plan 冻结进计划，verify 重读同口径比对。
-                "authorization": {
-                    "view_grant_users": sorted(
-                        set(data["vg_users_by_id"].get(sid, []))
-                        | set(data["vg_users_by_name_null"].get(name, [])
-                              if name else [])),
-                    "share_member_tokens": sorted(
-                        data["share_tokens_by_id"].get(sid, [])),
-                },
+                "authorization": self._auth_sets(data, sid, name),
                 # R6 审查修复（问题 4）：伴侣目录逐文件冻结清单（相对伴侣
                 # 目录的 path/size/sha256；frozen 模式才采集）——migrate 迁移
                 # 前后均与该清单比对，等长改字节能被抓住（总字节比对不能）。
@@ -1049,6 +1089,29 @@ class _Audit:
                       "scandir 递归汇总（follow_symlinks=False）",
             },
         })
+
+    @staticmethod
+    def _auth_sets(data, sid, name):
+        """逐资产授权集合（R6 问题 2 + R7 P1）：view 主体 / 分享成员摘要 /
+        分享控制状态 / 领取权限——plan 冻结、verify 同口径重读比对。"""
+        return {
+            "view_grant_users": sorted(
+                set(data["vg_users_by_id"].get(sid, []))
+                | set(data["vg_users_by_name_null"].get(name, [])
+                      if name else [])),
+            "share_member_tokens": sorted(
+                data["share_tokens_by_id"].get(sid, [])),
+            "share_states": [
+                {"token": t, "revoked": rv, "expires_at": exp,
+                 "permissions": perms}
+                for t, rv, exp, perms in sorted(
+                    data["share_states_by_id"].get(sid, []))],
+            "claim_grants": [
+                {"token": t, "user_id": u, "active": a,
+                 "permissions": perms}
+                for t, u, a, perms in sorted(
+                    data["claim_grants_by_id"].get(sid, []))],
+        }
 
     def _asset_refs(self, data, sid, name):
         refs = {}

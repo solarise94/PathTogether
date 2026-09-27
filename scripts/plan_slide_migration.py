@@ -289,6 +289,15 @@ def build_plan(inventory_records, issues_records, env,
                                                or {}).get(
                                                    "share_member_tokens")
                                               or []),
+                # R7 复核修复 P1：分享控制状态 + 领取权限（授权面完整性）
+                "share_states": sorted((rec.get("authorization") or {}).get(
+                    "share_states") or [],
+                    key=lambda d: (d.get("token"), d.get("revoked"),
+                                   d.get("expires_at"))),
+                "claim_grants": sorted((rec.get("authorization") or {}).get(
+                    "claim_grants") or [],
+                    key=lambda d: (d.get("token"), d.get("user_id"),
+                                   d.get("active"))),
             },
             "authorization_summary": {
                 k: int((rec.get("references") or {}).get(k, 0) or 0)

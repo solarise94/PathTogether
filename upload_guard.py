@@ -296,19 +296,29 @@ def reserve_upload_locked(cur, user_id, nbytes, *, inflight_limit=None,
     quota, used, reserved = (int(q["quota_bytes"]),
                              int(q["used_bytes"]),
                              int(q["reserved_bytes"]))
-    # 惰性回收过期预占（进程崩溃兜底；锁内执行防并发双扣）
+    # 惰性回收过期预占（进程崩溃兜底；锁内执行防并发双扣）。
+    # R7 复核修复 P1：被 upload_cleanup_pending 引用的预约**不回收**——
+    # 清理失败的容量责任持续有效（物理残留未确认清除前不得把 reserved
+    # 归还配额），只能经「清理确认」路径释放（重复 DELETE 重试 / 管理员
+    # staging-residue 确认清理）。反连接在同事务+配额行锁内，与登记/
+    # 释放不竞态；pending 行删除后（清理已确认）剩余过期预约回到正常
+    # 回收口径。跨表引用属同库事务性防护（upload_task_store 的表），
+    # 不引入模块 import。
+    _NOT_PENDING = (
+        " AND reservation_id NOT IN (SELECT reservation_id "
+        "FROM upload_cleanup_pending WHERE reservation_id IS NOT NULL)")
     cur.execute(
         "SELECT COALESCE(SUM(reserved_bytes), 0) AS n "
         "FROM upload_reservations "
         "WHERE user_id = %s AND state = 'reserved' "
-        "AND expires_at <= now()", (user_id,))
+        "AND expires_at <= now()" + _NOT_PENDING, (user_id,))
     expired = int(cur.fetchone()["n"])
     if expired:
         cur.execute(
             "UPDATE upload_reservations SET state='released', "
             "settled_at=now(), settled_bytes=0, updated_at=now() "
             "WHERE user_id=%s AND state='reserved' "
-            "AND expires_at <= now()", (user_id,))
+            "AND expires_at <= now()" + _NOT_PENDING, (user_id,))
         cur.execute(
             "UPDATE upload_user_quotas SET reserved_bytes = "
             "GREATEST(0, reserved_bytes - %s), updated_at=now() "

@@ -1,10 +1,10 @@
 {
   "tool_version": "1.0.0-p0",
   "mode": "frozen",
-  "scan_version": "audit/1.0.0-p0/frozen/b5d81dc52b3c",
-  "scan_id": "b5d81dc52b3c",
-  "started_at": "2026-09-26T16:07:30+00:00",
-  "finished_at": "2026-09-26T16:07:30+00:00",
+  "scan_version": "audit/1.0.0-p0/frozen/88a0fbccb2f1",
+  "scan_id": "88a0fbccb2f1",
+  "started_at": "2026-09-27T03:37:13+00:00",
+  "finished_at": "2026-09-27T03:37:13+00:00",
   "incomplete": false,
   "incomplete_reasons": [],
   "consistent_snapshot": true,
@@ -15,7 +15,7 @@
     "conninfo_source": "--database-url",
     "page_size": 500
   },
-  "upload_dir": "/home/solarise/ZCodeProject/histopilot-suite/.gate-tmp/drill-slide-migration-rvw3zp57/uploads",
+  "upload_dir": "/home/solarise/ZCodeProject/histopilot-suite/.gate-tmp/drill-slide-migration-virhi2oa/uploads",
   "params": {
     "rate_limit_files_per_sec": 0.0,
     "quota_tolerance_bytes": 0

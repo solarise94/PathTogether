@@ -323,3 +323,15 @@
 **演练证据刷新**：drill 40 断言重跑 0 失败（BOB 差额断言更新为精确归因不变量；证据目录无 token 明文已核）。
 
 **R6 门禁**：审查复现 6+1 全绿；migration tools 22+6 全绿；上传/发布/删除/P6 退役套件 102 全绿；JS 562；HP build+unit 1147（+1 回归）/integration 340/contract 49。全量 pytest（修复后终态）：**2764 passed / 1 已知无关失败（admin 0.4.13）/ 6 skipped**（2755 基线 + 6 审查回归 + 夹具迁移净增；首轮全量曾现 10 失败＝5×ai_session_owner + 2×ai_proxy + 1×ai_credentials + 1×ai_budget + 1×admin——全部为会话守卫收紧暴露的 legacy 布局旧口径夹具，4 文件迁移至发布建仓后收敛）。
+
+## R7 复核处置（2026-09-27）：3 项未闭环问题全部修复
+
+R6 修复复核（用户）确认原 7 反例通过，扩展检查发现 3 项缺口（2×P1+1×P2）。处置同 workflow：3 反例亲自复现（先红）→ 修复 → 原样入仓（`tests/test_slide_id_review_followup.py` 前 3 例，断言不动）+ 编排方补两条完整收尾路径回归（后 2 例，标注非审查方）→ 全量回归。
+
+| # | 问题 | 修复 |
+|---|---|---|
+| P1-a | 待清理预约仍被 TTL/新准入回收（`reserve_upload_locked` 惰性回收不排除 pending 引用） | 回收 SUM/UPDATE 两处加反连接 `reservation_id NOT IN (SELECT reservation_id FROM upload_cleanup_pending …)`——同事务+配额行锁内，与登记/释放不竞态；待清理容量责任持续有效（不靠续租复活），只能经「清理确认」路径释放；pending 行删除后回到正常回收口径 |
+| P1-b | 授权快照漏分享领取权限（grants.user_id/active/permissions）与分享控制状态（shares.revoked/expires_at/permissions） | audit 逐资产采集 `share_states`/`claim_grants`（token 摘要关联；expires_at 冻结**存储值**——自然过期不改列值不产生假阳性，改值即漂移）；plan 冻结；verify 同口径重读逐项比对（撤权/换主体/改权限/撤销/过期时刻变化均违规） |
+| P2-c | `clear_cleanup_pending` 在 dict_row 下取 row[0] 必 KeyError（事务回滚、pending 残留；管理员路径无兜底→物理清理成功仍未释放却报成功） | 改按列名取值；编排方补两条**完整收尾路径**回归：用户重复 DELETE（恢复后 200+清树+释放+消行一次完成）、管理员 staging-residue 确认清理（响应新增 additive `released_reservation` 字段；释放+消行验证） |
+
+**R7 门禁**：3 审查反例+2 编排方收尾路径回归全绿；migration tools 22+R6 回归 6+R7 回归 5 全绿；演练 40 断言 0 失败（证据刷新，含新冻结字段）；test:js 562；全量 pytest 终态见提交信息（唯一允许失败=admin 0.4.13）。

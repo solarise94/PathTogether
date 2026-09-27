@@ -910,7 +910,9 @@ def clear_cleanup_pending(upload_id):
                     "DELETE FROM upload_cleanup_pending WHERE upload_id=%s "
                     "RETURNING reservation_id", (str(upload_id),))
                 row = cur.fetchone()
-                return (row[0] if row else None)
+                # _pg_connect 是 dict_row——按列名取（R7 复核修复 P2：
+                # row[0] 在有行时必抛 KeyError，事务回滚、pending 行残留）。
+                return (row["reservation_id"] if row else None)
     finally:
         conn.close()
 

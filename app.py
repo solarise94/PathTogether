@@ -10767,7 +10767,8 @@ def admin_v1_staging_residue_cleanup():
                                       "removed": bool(removed),
                                       "released_reservation":
                                           bool(pending)})
-    return jsonify(ok=True, task_id=task_id, removed=bool(removed))
+    return jsonify(ok=True, task_id=task_id, removed=bool(removed),
+                   released_reservation=bool(pending))
 
 
 @app.route("/api/admin/v1/slides/<path:name>/visibility", methods=["POST"])

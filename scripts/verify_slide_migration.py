@@ -45,6 +45,18 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+
+
+def _canon_perms(raw):
+    """permissions JSONB 文本 → 规范化排序表（与 audit 侧同口径）。"""
+    import json as _json
+    try:
+        val = _json.loads(raw) if raw else []
+        if isinstance(val, list):
+            return sorted(str(x) for x in val)
+        return [repr(val)]
+    except (TypeError, ValueError):
+        return [str(raw)]
 import json
 import os
 import sys
@@ -611,6 +623,78 @@ class Verifier:
                             "expected": f_s, "actual": share,
                             "note": "分享成员关系漂移（token 不新增不丢失；"
                                     "双向均违规）"})
+                # R7 复核修复 P1：分享控制状态 + 领取权限比对——token 集合
+                # 相同不构成授权相同（撤销/过期时刻/权限/领取主体与 active
+                # 才是实际控制访问的字段）。expires_at 比对**冻结存储值**
+                # （时间自然推进不改列值，不产生假阳性；改值即漂移）。
+                try:
+                    with self.conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT s.token, s.revoked, "
+                            "extract(epoch from s.expires_at)::float8 "
+                            "AS exp, s.permissions::text AS perms "
+                            "FROM shares s JOIN share_slides m "
+                            "ON m.token = s.token WHERE m.slide_id=%s "
+                            "ORDER BY s.token", (sid,))
+                        share_states = [
+                            {"token": hashlib.sha256(
+                                str(r["token"]).encode("utf-8")
+                            ).hexdigest()[:16],
+                             "revoked": bool(r["revoked"]),
+                             "expires_at": (float(r["exp"])
+                                            if r["exp"] is not None
+                                            else None),
+                             "permissions": _canon_perms(r["perms"])}
+                            for r in cur.fetchall()]
+                        cur.execute(
+                            "SELECT g.token, g.user_id, g.active, "
+                            "g.permissions::text AS perms FROM grants g "
+                            "JOIN share_slides m ON m.token = g.token "
+                            "WHERE m.slide_id=%s "
+                            "ORDER BY g.token, g.user_id", (sid,))
+                        claim_grants = [
+                            {"token": hashlib.sha256(
+                                str(r["token"]).encode("utf-8")
+                            ).hexdigest()[:16],
+                             "user_id": str(r["user_id"] or ""),
+                             "active": bool(r["active"]),
+                             "permissions": _canon_perms(r["perms"])}
+                            for r in cur.fetchall()]
+                except psycopg.Error as e:
+                    self._incomplete("db_query_error")
+                    self._warn("auth_state_query_failed",
+                               {"slide_id": sid,
+                                "error": str(e).split("\n")[0]})
+                    share_states = claim_grants = None
+                if share_states is not None:
+                    f_ss = sorted(freeze.get("share_states") or [],
+                                  key=lambda d: d.get("token"))
+                    if f_ss != share_states:
+                        diffs.append({
+                            "slide_id": sid, "field": "share_states",
+                            "expected": f_ss, "actual": share_states,
+                            "direction": "unexpected_change"})
+                        self._violation("authorization_drift", {
+                            "slide_id": sid, "field": "share_states",
+                            "expected": f_ss, "actual": share_states,
+                            "note": "分享控制状态漂移（revoked/expires_at/"
+                                    "permissions——撤权、过期时刻与权限变化"
+                                    "均违规）"})
+                if claim_grants is not None:
+                    f_cg = sorted(freeze.get("claim_grants") or [],
+                                  key=lambda d: (d.get("token"),
+                                                 d.get("user_id")))
+                    if f_cg != claim_grants:
+                        diffs.append({
+                            "slide_id": sid, "field": "claim_grants",
+                            "expected": f_cg, "actual": claim_grants,
+                            "direction": "unexpected_change"})
+                        self._violation("authorization_drift", {
+                            "slide_id": sid, "field": "claim_grants",
+                            "expected": f_cg, "actual": claim_grants,
+                            "note": "分享领取权限漂移（领取主体/active/"
+                                    "permissions——换主体、撤权、改权限均"
+                                    "违规）"})
             expected = item.get("authorization_summary") or {}
             actual = {}
             for field, sql in _AUTH_DIFF_SQL.items():

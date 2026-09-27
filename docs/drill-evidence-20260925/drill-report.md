@@ -21,7 +21,7 @@
   "inputs": {
     "inventory": {
       "records": 13,
-      "sha256": "42ab7d5ca3dfeae3e404fcd6eb3f42f21bf86ebe141a2753887b43d5fb3b9296"
+      "sha256": "6efd78c9d8d9bd44822edcf6150796c9f5475d56883c49789305fe6549f7fa7d"
     },
     "issues": {
       "by_disposition": {
@@ -30,7 +30,7 @@
         "retain_history": 2
       },
       "records": 9,
-      "sha256": "21050f16209c43ec008341c246b44c2354d668323570bf26e6f2abd225605b94"
+      "sha256": "64bf3118b9f0742cf3655d062bd6b99538b81640e0a620ab32bbf000e370e391"
     }
   },
   "plan_version": 1,
@@ -75,7 +75,7 @@ ok    §2-4 sld_drill_noown01（no-owner.svs）不可读且不在 ready 列表�
 ok    §2-4 sld_drill_miss01（gone.svs）不可读且不在 ready 列表（state=failed）
 ok    §2-4 retain_history（缺文件）→ failed+reason
 ok    §2-4 孤儿文件不建行不进列表（只隔离报告）
-ok    §2-5 旧分享领取人（usr_bob）不能读同展示名新资产 sld_qKYFO5ymqGyS
+ok    §2-5 旧分享领取人（usr_bob）不能读同展示名新资产 sld_zkBaSFMOhVrA
 ok    §2-5 新资产 owner 正常可读（不受 tombstone 影响）
 ok    §2-5 迁移不碰 tombstone（deleted 行保留冻结别名）
 ok    §2-6 verify：go（无违规/incomplete）

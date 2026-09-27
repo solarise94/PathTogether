@@ -677,7 +677,8 @@ def _pg_finish_commit(upload_id, commit_token, sha256_actual, *, settle_bytes=No
                         "任务绑定 reservation 时 finish_commit 必须提供 settle_bytes")
                 with conn.cursor() as cur:
                     upload_guard.consume_reservation_locked(
-                        cur, rid, int(settle_bytes))
+                        cur, rid, int(settle_bytes),
+                        expect_holder=("upload_task", upload_id))
             fields = {"state": STATE_COMMITTED,
                       "sha256_actual": sha256_actual or None,
                       # P3（合同 §3.3 第 6 步）：收口同事务清空 publish intent
@@ -874,61 +875,21 @@ def get_upload_task_item(task_id, item_key):
 # 暂存清理失败的持久待清理状态（0071；R6 审查问题 3 修复）
 # --------------------------------------------------------------------------- #
 def record_cleanup_pending(upload_id, reservation_id=None, *, error=None):
-    """清理失败 → 落/更新待清理行（保留容量责任的持久证据）。
+    """清理失败 → 落/更新待清理行（可重试证据；**只登记，不动账本**）。
 
-    统一锁协议（R8 复核修复 P1）：先取该预约所属用户的**配额行锁**
-    （与 upload_guard 的准入回收/释放同一把锁），登记与回收/释放串行化，
-    消除「回收 SUM 后、UPDATE 前登记提交」的并发漏账窗口。
+    生命周期（0072 / plan §4.2「清理失败保留重试工作和容量」）：取消/失败/
+    过期路径**不再先释放后清理**——任务终态时预约保持绑定+reserved（容量
+    责任不清零），本函数只登记清理重试工作；重试成功由清理确认路径
+    （clear_cleanup_pending 的调用方）按持有者释放。R7–R9 时代的
+    「released → reserved 重激活 + 配额补记 + 30 天延期」补账已随绑定模型
+    拆除（任务持有的容量从不被 TTL 回收，不存在需要补回的窗口）。
 
-    回收先赢的时序（预约已被惰性回收置 released）由本函数**重激活**：
-    该预约翻回 reserved（expires 推远防无谓续期判定）+ 配额补记其
-    reserved_bytes——「随后才发现清理失败」的实际残留重新有容量责任，
-    不依赖已登记 pending 的排除面。仅重激活 state='released' 的行
-    （consumed/settled 是真实结算，绝不复活）。
-
-    行存在期间调用方**不得释放** reservation（清理确认后由
-    clear_cleanup_pending 的调用路径释放）；attempts 累计重试次数，
-    last_error 截断 4KB。幂等（同 upload_id 更新）。"""
+    幂等（同 upload_id 更新 attempts+1，last_error 截断 4KB）。"""
     conn = _pg_connect()
     try:
         with pg_store.transaction(conn):
             with conn.cursor() as cur:
                 rid = (reservation_id or "").strip() or None
-                if rid:
-                    # 首查只定位 user_id（行上 user_id 不可变，无 TOCTOU）；
-                    # 状态判定**不以本快照为准**（R9 复核修复 P1：锁前读到
-                    # 的 reserved/released 在取锁后可能已被并发回收或重激活）。
-                    cur.execute(
-                        "SELECT user_id FROM upload_reservations "
-                        "WHERE reservation_id=%s", (rid,))
-                    loc = cur.fetchone()
-                    if loc is not None and loc["user_id"]:
-                        # 配额行锁：与准入回收/释放/转实占同协议同序
-                        #（quota 行 → reservation 行）。
-                        cur.execute(
-                            "SELECT reserved_bytes FROM upload_user_quotas "
-                            "WHERE user_id=%s FOR UPDATE",
-                            (loc["user_id"],))
-                        # 锁内权威重读 + CAS 转换：仅 released→reserved 实际
-                        # 转换成功（RETURNING 行）才补记，一次且仅一次；
-                        # 并发回收（锁前快照是 reserved）在此被正确收账，
-                        # 并发重激活（快照是 released）在此 CAS 落空不重复。
-                        cur.execute(
-                            "UPDATE upload_reservations "
-                            "SET state='reserved', settled_at=NULL, "
-                            "settled_bytes=NULL, "
-                            "expires_at=now() + interval '30 days', "
-                            "updated_at=now() "
-                            "WHERE reservation_id=%s AND state='released' "
-                            "RETURNING reserved_bytes", (rid,))
-                        row = cur.fetchone()
-                        if row is not None:
-                            cur.execute(
-                                "UPDATE upload_user_quotas SET "
-                                "reserved_bytes = reserved_bytes + %s, "
-                                "updated_at=now() WHERE user_id=%s",
-                                (int(row["reserved_bytes"] or 0),
-                                 loc["user_id"]))
                 cur.execute(
                     "INSERT INTO upload_cleanup_pending "
                     "(upload_id, reservation_id, attempts, last_error) "

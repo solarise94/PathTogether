@@ -373,7 +373,16 @@ if __name__ == "__main__":
 # 7. review 门禁回归（F0）：发布中段预占失效 → 已发布 item 整体撤回
 #    （ready→failed 可迁移 + 撤包），不留「ready 行 + 无包」破态
 # --------------------------------------------------------------------------- #
-def test_reservation_expired_mid_publish_withdraws_published(monkeypatch):
+def test_reservation_lease_lapse_mid_publish_does_not_lose_capacity(
+        monkeypatch):
+    """0072 生命周期合同（替代旧「发布中段过期 → 整体撤回」断言，plan §D
+    注记）：
+
+    旧合同：item 间预占过期 → 下一个 item renew 拒绝 → 整体撤回。
+    新合同：绑定预约租约过期可重发（容量从不被 TTL 回收）——多 item
+    发布跨过租约过期点**正常完成**，一次性结算；整体撤回路径只对真
+    不变量异常（预约 released）生效（下一条用例覆盖）。
+    """
     c0 = _client(auth=True)
     uid = _user_session(c0, login="z-exp@x.com")
     _set_quota(uid, 10 ** 7)
@@ -391,8 +400,8 @@ def test_reservation_expired_mid_publish_withdraws_published(monkeypatch):
         out = real_publish(*a, **kw)
         state["n"] += 1
         if state["n"] == 1:
-            # 首个 item 发布成功后预占立即过期 → 第二个 item 发布时
-            # renew 拒绝（ReservationInvalid）→ 整体撤回
+            # 首个 item 发布成功后租约过期：第二个 item 发布时 renew 重发
+            # 租约（绑定预约不失效），发布继续
             with psycopg.connect(PG_URI, autocommit=True) as conn:
                 with conn.cursor() as cur:
                     cur.execute("UPDATE upload_reservations SET expires_at = "
@@ -403,8 +412,59 @@ def test_reservation_expired_mid_publish_withdraws_published(monkeypatch):
     monkeypatch.setattr(slide_publish, "publish_batch_item",
                         _expire_after_first)
     r = _upload_zip(c, [("a.tif", TIFF_A), ("b.tif", TIFF_B)])
+    assert r.status_code == 200, r.get_data(as_text=True)
+    # 两资产均 ready（发布跨过租约过期点正常完成）
+    descs = []
+    for t in _tasks():
+        for it in upload_task_store.list_upload_task_items(t["upload_id"]):
+            descs.append(slide_store.resolve_slide_id(it["slide_id"]))
+    assert len(descs) == 2
+    for d in descs:
+        assert d.asset_state == "ready"
+        assert slide_storage.bundle_dir(d.slide_id,
+                                        root=UPLOAD_DIR).exists()
+    # 任务 committed、预占消耗转实占（一次结算）
+    assert _tasks()[0]["state"] == upload_task_store.STATE_COMMITTED
+    row = _quota(uid)
+    assert row["reserved_bytes"] == 0
+    assert row["used_bytes"] > 0
+
+
+def test_reservation_released_mid_publish_withdraws_published(monkeypatch):
+    """不变量异常（预约真正 released）发生在 item 之间 → 整体撤回（F0
+    门禁语义保留：不留「ready 行 + 无包」破态）。"""
+    c0 = _client(auth=True)
+    uid = _user_session(c0, login="z-rel@x.com")
+    _set_quota(uid, 10 ** 7)
+    c = _client(auth=True)
+    with c.session_transaction() as sess:
+        sess["auth_user"] = True
+        sess["user_id"] = uid
+        sess["role"] = "user"
+        sess["auth_version"] = 1
+    import slide_publish
+    real_publish = slide_publish.publish_batch_item
+    state = {"n": 0}
+
+    def _release_after_first(*a, **kw):
+        out = real_publish(*a, **kw)
+        state["n"] += 1
+        if state["n"] == 1:
+            # 首个 item 发布成功后预约被外部 released（不变量异常模拟）→
+            # 第二个 item 发布时 renew 不复活 → ReservationInvalid 整体撤回
+            with psycopg.connect(PG_URI, autocommit=True) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE upload_reservations SET state='released', "
+                        "settled_at=now(), settled_bytes=0 "
+                        "WHERE state='reserved'")
+        return out
+
+    monkeypatch.setattr(slide_publish, "publish_batch_item",
+                        _release_after_first)
+    r = _upload_zip(c, [("a.tif", TIFF_A), ("b.tif", TIFF_B)])
     assert r.status_code == 409
-    assert r.get_json()["code"] == "reservation_expired"
+    assert r.get_json().get("code") == "reservation_expired"
     # 两资产均 failed（含已 ready 后被撤回的 a.tif）——无 ready 残留
     descs = []
     for t in _tasks():
@@ -415,8 +475,7 @@ def test_reservation_expired_mid_publish_withdraws_published(monkeypatch):
         assert d.asset_state == "failed"
         assert not slide_storage.bundle_dir(d.slide_id,
                                             root=UPLOAD_DIR).exists()
-    # 任务 failed、预占释放、used_bytes 恒 0（consume 从未发生）
+    # 任务 failed；used_bytes 恒 0（consume 从未发生）
     assert _tasks()[0]["state"] == upload_task_store.STATE_FAILED
     row = _quota(uid)
-    assert row["reserved_bytes"] == 0
     assert row["used_bytes"] == 0

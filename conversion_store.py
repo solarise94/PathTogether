@@ -33,6 +33,7 @@ import psycopg.rows
 
 from kfb.manifest import CONVERTER_ID, CONVERTER_VERSION
 import slide_store
+import upload_guard
 
 STATES_OPEN = ("queued", "converting", "validating")
 LEASE_SECONDS = int(os.environ.get("CONVERSION_LEASE_SECONDS") or 120)
@@ -623,10 +624,11 @@ def worker_settle_ready(job_id, worker_id, generation, *, slide_id,
                 owner = (row.get("owner_user_id") or "").strip()
                 already = int(row.get("canonical_settled_bytes") or 0)
                 if already <= 0 and settle_bytes > 0 and owner:
-                    cur.execute(
-                        "UPDATE upload_user_quotas SET "
-                        "used_bytes = used_bytes + %s, updated_at=now() "
-                        "WHERE user_id=%s", (settle_bytes, owner))
+                    # 0072 生命周期：used_bytes 财务 SQL 唯一实现收口在
+                    # upload_guard（此前本模块直更配额行是与守卫并行的
+                    # 第二份实现）；幂等键仍由 canonical_settled_bytes
+                    # （上方 already 判定）承担。
+                    upload_guard.add_used_bytes_locked(cur, owner, settle_bytes)
                     already = settle_bytes
                 elif already <= 0:
                     already = max(settle_bytes, 0)

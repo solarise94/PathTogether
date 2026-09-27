@@ -20,6 +20,7 @@ import pytest
 
 import baidu_import_http as http
 import baidu_import_store as store
+import upload_guard
 import kfb.converter as kfb_converter
 import kfb.converter_fl as kfbf_converter
 from _baidu_helpers import (expire_batch_lease, install_fake,
@@ -67,13 +68,14 @@ def _item_rows(batch_id):
     return _sql(q)
 
 
-def _make_batch(monkeypatch, paths, tmp_path, entries=None, **kw):
+def _make_batch(monkeypatch, paths, tmp_path, entries=None, *, owner=OWNER,
+                **kw):
     entries = ENTRIES if entries is None else entries
     fake = install_fake(monkeypatch, entries=entries)
     _, enum_id, by_path = make_ready_enumeration(
-        monkeypatch, owner=OWNER, entries=entries)
+        monkeypatch, owner=owner, entries=entries)
     ids = [by_path[p.lstrip("/")]["id"] for p in paths]
-    batch = store.create_import(OWNER, enum_id, ids, **kw)
+    batch = store.create_import(owner, enum_id, ids, **kw)
     return fake, batch
 
 
@@ -211,21 +213,29 @@ def test_b09_partial_fail_retry_only_failed(monkeypatch, tmp_path):
 
 
 def test_b09_cancel_releases_unconsumed_reservation(monkeypatch, tmp_path):
+    # 0072：真实预约（建批内绑定 holder=baidu_batch）+ 新收口原语签名
+    # （cur, rid, batch_id——终态 CAS 与配额收口同事务）。
+    import user_store
+    u = user_store.create_user("baidu-x1@x.com", "pass1234pass1234")
     released = []
     monkeypatch.setattr(store, "_release_reservation",
-                        lambda rid: released.append(rid))
+                        lambda cur, rid, bid: released.append((rid, bid)))
+
+    rid_holder = {}
 
     def hook(user_id, nbytes):
-        return "upr_cancel_1"
+        rid_holder["rid"] = upload_guard.reserve_upload(
+            user_id, nbytes)["reservation_id"]
+        return rid_holder["rid"]
 
     fake, batch = _make_batch(monkeypatch, ["/a.tif"], tmp_path,
-                              entries=ENTRIES, quota_hook=hook,
-                              idempotency_key="x1")
-    store.request_cancel(batch["id"], OWNER)
+                              owner=u["user_id"], entries=ENTRIES,
+                              quota_hook=hook, idempotency_key="x1")
+    store.request_cancel(batch["id"], u["user_id"])
     view = store.run_batch(batch["id"], fake, staging_root=tmp_path)
     assert view["state"] == "cancelled"
     assert all(i["stage"] == "cancelled" for i in view["items"])
-    assert released == ["upr_cancel_1"]  # 未消费预占已释放
+    assert released == [(rid_holder["rid"], batch["id"])]  # 按持有者释放
     c = fake.counters()
     assert (c["transfer"], c["download"], c["delete"]) == (0, 0, 0)
 
@@ -233,26 +243,32 @@ def test_b09_cancel_releases_unconsumed_reservation(monkeypatch, tmp_path):
 def test_b09_cancel_after_ready_keeps_products(monkeypatch, tmp_path):
     # 一项 ready 后取消：成功产物保持 ready，预占不重复释放（已消费/
     # 部分消费语义由配额收口持有）
+    import user_store
+    u = user_store.create_user("baidu-x2@x.com", "pass1234pass1234")
     released = []
     monkeypatch.setattr(store, "_release_reservation",
-                        lambda rid: released.append(rid))
+                        lambda cur, rid, bid: released.append((rid, bid)))
     consumed = []
     monkeypatch.setattr(store, "_consume_reservation",
-                        lambda rid, n: consumed.append((rid, n)))
+                        lambda cur, rid, bid, n: consumed.append((rid, n)))
+
+    rid_holder = {}
 
     def hook(user_id, nbytes):
-        return "upr_cancel_2"
+        rid_holder["rid"] = upload_guard.reserve_upload(
+            user_id, nbytes)["reservation_id"]
+        return rid_holder["rid"]
 
     fake, batch = _make_batch(monkeypatch, ["/a.tif", "/b.tif"], tmp_path,
-                              entries=ENTRIES, quota_hook=hook,
-                              idempotency_key="x2")
+                              owner=u["user_id"], entries=ENTRIES,
+                              quota_hook=hook, idempotency_key="x2")
     # 首个条目 ready 后、其余完成前取消（按计数注入，规避条目顺序不确定）
     state = {"ingested": 0}
 
     def cancel_after_first_ready(item):
         state["ingested"] += 1
         if state["ingested"] == 1:
-            store.request_cancel(batch["id"], OWNER)
+            store.request_cancel(batch["id"], u["user_id"])
             raise Crash("cancel mid-run")
 
     with pytest.raises(Crash):
@@ -264,7 +280,7 @@ def test_b09_cancel_after_ready_keeps_products(monkeypatch, tmp_path):
     assert sorted(stages.values()) == ["cancelled", "ready"]
     assert view["state"] == "partial_failed"  # 有 ready 产物，不整批失败
     assert released == []  # 已有 ready 产物 → 不整批释放预占
-    assert consumed and consumed[0][0] == "upr_cancel_2"
+    assert consumed and consumed[0][0] == rid_holder["rid"]
 
 
 def test_b09_cancel_terminal_batch_noop(monkeypatch, tmp_path):
@@ -700,16 +716,22 @@ def test_stale_owner_cancel_fenced(monkeypatch, tmp_path):
     # 旧 worker 丢租约后触发取消收口：批次 terminal 落库被 fence 拒绝
     # → 不取消条目、不释放预占（新 owner 会看到 cancel_requested 并
     # 自行按取消语义收口）。
+    import user_store
+    u = user_store.create_user("baidu-f4@x.com", "pass1234pass1234")
     released = []
     monkeypatch.setattr(store, "_release_reservation",
-                        lambda rid: released.append(rid))
+                        lambda cur, rid, bid: released.append((rid, bid)))
+
+    rid_holder = {}
 
     def hook(user_id, nbytes):
-        return "upr_fence_cancel"
+        rid_holder["rid"] = upload_guard.reserve_upload(
+            user_id, nbytes)["reservation_id"]
+        return rid_holder["rid"]
 
     fake, batch = _make_batch(monkeypatch, ["/a.tif", "/b.tif"], tmp_path,
-                              entries=ENTRIES, quota_hook=hook,
-                              idempotency_key="f4")
+                              owner=u["user_id"], entries=ENTRIES,
+                              quota_hook=hook, idempotency_key="f4")
     steal = {}
 
     def steal_and_cancel(item):
@@ -717,7 +739,7 @@ def test_stale_owner_cancel_fenced(monkeypatch, tmp_path):
         claim2 = store.claim_batch(worker_id="w-new")
         assert claim2 is not None and claim2["batch"]["id"] == batch["id"]
         steal["token"] = claim2["batch"]["lease_token"]
-        store.request_cancel(batch["id"], OWNER)
+        store.request_cancel(batch["id"], u["user_id"])
 
     view = store.run_batch(
         batch["id"], fake, staging_root=tmp_path,
@@ -739,4 +761,4 @@ def test_stale_owner_cancel_fenced(monkeypatch, tmp_path):
     assert view2["state"] == "cancelled"
     assert sorted(i["stage"] for i in view2["items"]) == \
         ["cancelled", "cancelled"]
-    assert released == ["upr_fence_cancel"]
+    assert released == [(rid_holder["rid"], batch["id"])]

@@ -85,9 +85,20 @@ NON_RETRYABLE_ERROR_CODES = frozenset(
 #: 份额秘密加密 env（同 baidu_adapter.ENV_SHARE_SECRET_KEY）
 _ENV_SECRET = "BAIDU_SHARE_SECRET_KEY"
 
-#: 取消/失败时释放未消费预占（测试可 monkeypatch）
-_release_reservation = upload_guard.release_reservation
-_consume_reservation = upload_guard.consume_reservation
+#: 批次预算收口原语（0072 持有者语境；调用方事务内 cursor 变体——测试可
+#: monkeypatch 观察调用）。批次终态 CAS 与配额收口同一事务：崩溃不产生
+#: 「终态已落库、结算未发生」的窗口（绑定预算不被 TTL 回收，无兜底）。
+def _release_reservation(cur, reservation_id, batch_id):
+    """按持有者释放批次未消费预算（baidu_batch；幂等）。"""
+    upload_guard.release_reservation_locked(
+        cur, reservation_id, expect_holder=("baidu_batch", batch_id))
+
+
+def _consume_reservation(cur, reservation_id, batch_id, actual_bytes):
+    """按持有者把批次预算转实占（ready 产物字节；幂等不双扣）。"""
+    upload_guard.consume_reservation_locked(
+        cur, reservation_id, int(actual_bytes),
+        expect_holder=("baidu_batch", batch_id))
 
 
 # --------------------------------------------------------------------------- #
@@ -842,6 +853,14 @@ def create_import(owner_user_id, enumeration_id, candidate_ids,
                         (_new_id("bitem"), batch_id, cid, cand["fs_id"],
                          cand["name"], cand["relative_path"],
                          int(cand["size_bytes"])))
+                if reservation_id:
+                    # 0072 生命周期：批次预算准入即绑定（holder=baidu_batch，
+                    # purpose=baidu_import）——批次记一次，不复制到子任务；
+                    # 与批次行同一事务（失败整体回滚，hook 预约由 finally
+                    # 释放）。绑定失败（预约被回收等）→ 整体失败零副作用。
+                    upload_guard.bind_reservation_locked(
+                        cur, reservation_id, "baidu_batch", batch_id,
+                        "baidu_import")
                 out = _batch_view_with_counts(cur, row)
                 extra_reservation = None  # 已归属批次，不再释放
                 return out
@@ -859,8 +878,10 @@ def create_import(owner_user_id, enumeration_id, candidate_ids,
 
 
 def _safe_release(reservation_id):
+    """建批失败路径释放 **未绑定** 的 hook 预约（绑定与批次行同事务——
+    走到这里的预约要么从未绑定、要么绑定已随事务回滚）。"""
     try:
-        _release_reservation(reservation_id)
+        upload_guard.release_reservation(reservation_id)
     except Exception:
         pass
 
@@ -1733,21 +1754,24 @@ def _apply_cancel(batch):
                     "FROM baidu_import_items WHERE batch_id=%s "
                     "AND stage='ready'", (batch["id"],))
                 ready_bytes = int(cur.fetchone()["bytes"])
+                if reservation_id:
+                    # 0072：批次终态 CAS 与配额收口**同一事务**（绑定预算
+                    # 不被 TTL 回收，崩溃窗口内不得留「终态已落、结算未
+                    # 发生」的悬空责任）。预约不在容量态（不变量异常）时
+                    # 记日志放弃配额收口，不阻塞批次终态——账本以预约行
+                    # 现状为准（终态 CAS 已 fenced，恰好一次）。
+                    try:
+                        if has_ready and ready_bytes > 0:
+                            _consume_reservation(cur, reservation_id,
+                                                 batch["id"], ready_bytes)
+                        elif not has_ready:
+                            _release_reservation(cur, reservation_id,
+                                                 batch["id"])
+                    except upload_guard.ReservationInvalid:
+                        pass
     finally:
         conn.close()
-    if not applied:
-        return False
-    if reservation_id:
-        if has_ready and ready_bytes > 0:
-            # 已有 ready 产物：按实际字节幂等收口（consume 幂等，重跑不双扣）
-            try:
-                _consume_reservation(reservation_id, ready_bytes)
-            except Exception:
-                pass
-        elif not has_ready:
-            # 仅有未消费预占（无任何 ready 产物）→ 释放
-            _safe_release(reservation_id)
-    return True
+    return applied
 
 
 def _finalize_batch(batch, adapter, worker_id):
@@ -1807,20 +1831,22 @@ def _finalize_batch(batch, adapter, worker_id):
                 won = True
                 reservation_id = batch["quota_reservation_id"]
                 consumed_bytes = ready_bytes
+                if reservation_id:
+                    # 0072：批次终态与配额收口同一事务（同 _apply_cancel 的
+                    # 崩溃窗口论证；consume 幂等，崩溃重跑不双扣）。
+                    try:
+                        if consumed_bytes > 0:
+                            _consume_reservation(cur, reservation_id,
+                                                 batch["id"], consumed_bytes)
+                        else:
+                            _release_reservation(cur, reservation_id,
+                                                 batch["id"])
+                    except upload_guard.ReservationInvalid:
+                        pass  # 预约不在容量态：审计由配额表现状承担
     finally:
         conn.close()
     if not won:
         return False
-    # 配额收口：ready 产物字节数一次 consume（consume_reservation 幂等，
-    # 崩溃重跑不双扣；无 ready（全失败/取消）→ 释放未消费预占
-    if reservation_id:
-        if consumed_bytes > 0:
-            try:
-                _consume_reservation(reservation_id, consumed_bytes)
-            except Exception:
-                pass  # 预占过期等：不阻塞批次终态，审计由配额表自身记录
-        else:
-            _safe_release(reservation_id)
     _cleanup_copies(batch, adapter, state)
     return True
 

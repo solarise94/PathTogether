@@ -879,8 +879,15 @@ def test_commit_hash_mismatch_releases_reservation():
     assert r.status_code == 409
     assert _quota_row(uid_user)[1] == 0  # 确定性失败即释放（不占额度）
 
-def test_expired_reservation_reclaimed_rejects_old_put_and_commit(monkeypatch):
-    """过期预占被新任务回收后，旧任务 PUT/commit fail-closed，不得无记账提交。"""
+def test_expired_lease_released_not_stolen_old_task_continues(monkeypatch):
+    """0072 生命周期合同（替代旧「过期即回收」断言，plan §D 注记）：
+
+    旧合同：过期预占被新任务回收 → 旧任务 PUT/commit fail-closed。
+    新合同：任务持有的容量**不参加 TTL 回收**——租约过期只暂停执行许可，
+    PUT 触发续租即重发租约继续上传；新任务在容量被持有时 QuotaExceeded
+    （不偷走活任务容量，plan §3 不变量 1）；预约真正 released（不变量
+    异常模拟）后旧任务 PUT fail-closed。
+    """
     monkeypatch.setattr(app_mod, "_validate_slide_file", _validate_ok)
     c = _client(auth=True)
     uid_user = _user_session(c, role="user", login="p6@x.com")
@@ -893,14 +900,26 @@ def test_expired_reservation_reclaimed_rejects_old_put_and_commit(monkeypatch):
             cur.execute(
                 "UPDATE upload_reservations SET expires_at = now() - interval '1 second' "
                 "WHERE reservation_id=%s", (rid,))
+    # 新任务不偷走容量：quota 5000 全被活任务持有 → 413
     uid2 = _create(c, name="new.svs", size=5000)
-    assert uid2.status_code == 200, uid2.get_data(as_text=True)
+    assert uid2.status_code == 413
+    assert uid2.get_json().get("code") == "upload_quota_exceeded"
+    # 旧任务 PUT：租约重发（绑定预约不因过期失效），继续上传
     r = _put(c, uid, 100, b"b" * 100)
-    assert r.status_code == 409
-    assert r.get_json().get("code") == "reservation_expired"
+    assert r.status_code == 200, r.get_data(as_text=True)
     used, reserved = _quota_row(uid_user)
     assert used == 0
-    assert reserved == 5000  # 仅新任务预占
+    assert reserved == 5000  # 容量仍由活任务持有（未被回收）
+    # 不变量异常（预约被外部 released）→ PUT fail-closed
+    with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE upload_reservations SET state='released', "
+                "settled_at=now(), settled_bytes=0 "
+                "WHERE reservation_id=%s", (rid,))
+    r2 = _put(c, uid, 200, b"c" * 100)
+    assert r2.status_code == 409
+    assert r2.get_json().get("code") == "reservation_expired"
     dest = Path(UPLOAD_DIR) / "old.svs"
     assert not dest.exists()
 

@@ -418,7 +418,10 @@ def test_quota_exceeded_no_leak(tmp_path):
     assert q["reserved_bytes"] == 0 and q["used_bytes"] == 0
 
 
-def test_reservation_expired_fail_closed_no_double_charge(tmp_path):
+def test_reservation_lease_expired_settles_once_no_double_charge(tmp_path):
+    """0072 生命周期合同（替代旧「预占过期 → 409 fail-closed」，plan §D
+    注记）：绑定预约租约过期不丢容量——合法任务照常提交、恰一次结算、
+    重复 commit 不重复收费。"""
     c = _client()
     uid = _user_session(c, login="e2@x.com")
     _quota_bytes(uid, 10 * 1024 * 1024)
@@ -426,27 +429,27 @@ def test_reservation_expired_fail_closed_no_double_charge(tmp_path):
     upload_id = r.get_json()["upload_id"]
     sid = r.get_json()["slide_id"]
     _v2_upload_full(c, upload_id)
-    # 直接把预占置为已过期（不 sleep）
+    # 直接把预占租约置为已过期（不 sleep）
     with psycopg.connect(PG_URI, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE upload_reservations SET expires_at = "
                         "now() - interval '1 second' WHERE user_id=%s AND "
                         "state='reserved'", (uid,))
     rc = c.post("/api/uploads/%s/commit" % upload_id)
-    assert rc.status_code == 409
-    assert rc.get_json()["code"] == "reservation_expired"
-    # 不可读；任务过期收尾；不漏账不重复收费（used 恒 0，预占回收）
-    assert c.get("/api/slides/%s/info" % sid).status_code == 403
+    assert rc.status_code == 200, rc.get_data(as_text=True)
+    # 可读；恰一次结算；不漏账不重复收费（used == accounted，reserved 0）
+    assert c.get("/api/slides/%s/info" % sid).status_code == 200
     q = _quota(uid)
-    assert q["used_bytes"] == 0
+    assert q["used_bytes"] == _desc(sid).accounted_bytes
+    assert q["reserved_bytes"] == 0
     assert not (Path(UPLOAD_DIR) / ".staging" / upload_id).exists()
-    assert _desc(sid).asset_state == "failed"
+    assert _desc(sid).asset_state == "ready"
+    # 重复 commit 幂等回放，不重复收费
+    rc2 = c.post("/api/uploads/%s/commit" % upload_id)
+    assert rc2.status_code == 200
+    assert _quota(uid)["used_bytes"] == q["used_bytes"]
 
 
-# --------------------------------------------------------------------------- #
-# §6-6/§6-11 删除后同名重传新 ID；旧分享/授权/标注/run grant/Demo 不继承；
-#          annotations_by_slide 同名 id_bundle 按 ID 分组不串
-# --------------------------------------------------------------------------- #
 def test_delete_then_reupload_new_id_no_inheritance(tmp_path):
     ca = _client()
     cb = _client()

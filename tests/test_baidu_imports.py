@@ -398,16 +398,22 @@ def test_b05_quota_insufficient_http_429(monkeypatch):
 
 
 def test_b05_quota_reservation_recorded(monkeypatch):
-    _, enum_id, by_path = _make_ready(monkeypatch)
+    # 0072：预约须真实存在（建批内同事务绑定 holder=baidu_batch）——
+    # upload_user_quotas 有 users 外键，用真实建号用户。
+    import user_store
+    u = user_store.create_user("baidu-q3@x.com", "pass1234pass1234")
+    fake, enum_id, by_path = make_ready_enumeration(
+        monkeypatch, owner=u["user_id"], entries=STANDARD_ENTRIES)
     rid_holder = {}
 
     def hook(user_id, nbytes):
-        rid_holder["rid"] = "upr_test_%d" % nbytes
+        rid_holder["rid"] = upload_guard.reserve_upload(
+            user_id, nbytes)["reservation_id"]
         return rid_holder["rid"]
 
     batch = store.create_import(
-        OWNER, enum_id, [by_path["A1/sample.svs"]["id"],
-                         by_path["B1/big.kfb"]["id"]],
+        u["user_id"], enum_id, [by_path["A1/sample.svs"]["id"],
+                                by_path["B1/big.kfb"]["id"]],
         idempotency_key="q3", quota_hook=hook)
     import psycopg
     import os

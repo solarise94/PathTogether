@@ -664,8 +664,9 @@ def test_failed_staging_ledger_and_orphan_reporting(tmp_path):
 
 
 def test_reservation_expired_staging_failed_with_record(tmp_path):
-    """预占过期的 failed 任务：资产行 failed（证据保留）+ staging 清 + 预占
-    回收——保留文件始终有账本责任（reservation 或实占记录）。"""
+    """0072 生命周期合同（plan §D 注记）：租约过期的活任务不失去容量——
+    提交照常完成、资产 ready、配额恰一次入账、staging 清账。「真 released」
+    的不变量 fail-closed 处置由 test_upload_v2 覆盖。"""
     c = _client()
     uid = _user_session(c, login="p5h@x.com")
     _quota_bytes(uid, 10 * 1024 * 1024)
@@ -676,11 +677,12 @@ def test_reservation_expired_staging_failed_with_record(tmp_path):
     _exec("UPDATE upload_reservations SET expires_at = now() - interval '1 "
           "second' WHERE user_id=%s AND state='reserved'", (uid,))
     rc = c.post("/api/uploads/%s/commit" % upload_id)
-    assert rc.status_code == 409
-    assert rc.get_json()["code"] == "reservation_expired"
+    # 0072：绑定预约租约过期不丢容量（替代旧 409 fail-closed 合同，
+    # plan §D 注记）——合法任务照常提交结算，恰一次入账。
+    assert rc.status_code == 200, rc.get_data(as_text=True)
     d = _desc(sid)
-    assert d.asset_state == "failed"               # 证据行保留
+    assert d.asset_state == "ready"
     assert not (Path(UPLOAD_DIR) / ".staging" / upload_id).exists()
     q = _quota(uid)
-    assert q["used_bytes"] == 0 and q["reserved_bytes"] == 0
-    assert c.get("/api/slides/%s/info" % sid).status_code in (403, 404)
+    assert q["used_bytes"] == len(TIFF) and q["reserved_bytes"] == 0
+    assert c.get("/api/slides/%s/info" % sid).status_code == 200

@@ -402,6 +402,9 @@ def test_upload_complete_and_resume_idempotent():
 # 调度器：续租 / 过期恢复 / 绝对期限
 # --------------------------------------------------------------------------- #
 def test_scheduler_renews_without_browser_requests():
+    """0072 生命周期合同（替代旧「过期不复活 → 重新预占换 rid」，plan §D
+    注记）：绑定预约租约过期 → **同一 rid 重发执行租约**（容量从不被 TTL
+    回收，不重新准入、不换 rid）。"""
     _mk_user("u1")
     job = _mkjob(owner="u1", role="user", size=500_000, key="N")
     _admit(job["job_id"])
@@ -419,11 +422,11 @@ def test_scheduler_renews_without_browser_requests():
         "interval '1 second' WHERE reservation_id=%s",
         (rid_old,)))
     results = ist.renew_active_local_reservations()
-    assert results[job["job_id"]] == "recovered"  # 已过期不复活 → 重新预占
-    job = ist.get_job(job["job_id"])  # 恢复会换新 rid
-    assert job["local_reservation_id"] != rid_old
+    assert results[job["job_id"]] == "renewed"  # 同一 rid 重发租约
+    job = ist.get_job(job["job_id"])
+    assert job["local_reservation_id"] == rid_old  # 不换 rid
     after = _sql(snap)
-    assert after > before  # 新预约的过期点在将来
+    assert after > before  # 租约重发到将来
 
 
 def test_renew_keeps_reservation_when_valid_and_no_browser():
@@ -459,24 +462,43 @@ def test_renew_does_not_extend_absolute_deadlines():
     assert after["job_deadline_at"] == before["job_deadline_at"]
 
 
-def test_expired_reservation_quota_lost_terminates():
+def test_expired_reservation_quota_lost_job_keeps_capacity():
+    """0072 生命周期合同（替代旧「配额被吃满 → 终止」，plan §D 注记）：
+
+    绑定预约不参加 TTL 回收——即使配额被其它用量吃满，活跃任务的容量
+    责任仍在账上（reserved 由本任务持有，从未离开），续租重发租约继续
+    执行；新准入才被配额判定拒绝。「额度不足终止」分支已随重新准入
+    补丁拆除（任务绝不能因租约过期失去容量）。"""
     _mk_user("u1", quota=600_000)
     job = _mkjob(owner="u1", role="user", size=500_000, key="L")
     _admit(job["job_id"])
     job = ist.get_job(job["job_id"])
-    # 预约过期 + 配额被其它上传吃满 → 恢复失败 → 终止并清理
     _sql(lambda cur: cur.execute(
         "UPDATE upload_reservations SET expires_at = now() - interval '1s' "
         "WHERE reservation_id=%s", (job["local_reservation_id"],)))
+    # 配额被其它 used_bytes 吃满（reserved 仍含本任务 500k——绑定责任）
     _sql(lambda cur: cur.execute(
-        "UPDATE upload_user_quotas SET used_bytes=600_000, reserved_bytes=0 "
+        "UPDATE upload_user_quotas SET used_bytes=100_000 "
         "WHERE user_id='u1'"))
     results = ist.renew_active_local_reservations()
-    assert results[job["job_id"]] == "terminated"
+    assert results[job["job_id"]] == "renewed"
     out = ist.get_job(job["job_id"])
-    assert out["state"] == ist.CANCELLED
-    assert out["fail_code"] == "local_reservation_lost"
-    assert out["cleanup_status"] == ist.CLEANUP_PENDING
+    assert out["state"] in ist.ACTIVE_UPLOAD_STATES  # 任务继续，不终止
+
+    def quota(cur):
+        cur.execute("SELECT used_bytes, reserved_bytes FROM "
+                    "upload_user_quotas WHERE user_id='u1'")
+        row = cur.fetchone()
+        return int(row["used_bytes"]), int(row["reserved_bytes"])
+
+    assert _sql(quota) == (100_000, 500_000)  # 责任未动、未重复计账
+    # 新准入不放行（每身份活跃上限=1 先拦，即便放到配额关也过不了：
+    # used 100k + 本任务 reserved 500k + 新 500k > 600k）——关键是不偷走
+    # 活任务容量：job1 的 reserved 责任原封不动
+    other = _mkjob(owner="u1", role="user", size=500_000, key="L2")
+    out2 = _admit(other["job_id"])
+    assert out2["outcome"] in ("waiting", "terminal")
+    assert _sql(quota) == (100_000, 500_000)
 
 
 def test_sweep_expired_jobs_cancels_and_releases():

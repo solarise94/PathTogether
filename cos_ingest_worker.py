@@ -228,8 +228,9 @@ def _release_lease(job_id, token, state=None):
 def scheduler_tick(cos=None, state=None, *, force=False):
     """容量调度器单步（节流 COS_SCHEDULER_INTERVAL_SECONDS，非 COS 网络调用）。
 
-    顺序固定：过期 sweep（waiting / 已准入）→ 活跃本地预约续租 → 磁盘水位
-    → FIFO 准入（水位不过则 disk_watermark_ok=False，任务保持等待）。
+    顺序固定：过期 sweep（waiting / 已准入）→ 本地清理重试（0072）→
+    活跃本地预约续租（绑定核验）→ 磁盘水位 → FIFO 准入（水位不过则
+    disk_watermark_ok=False，任务保持等待）。
     返回 True 表示本轮实际执行了调度。
     """
     state = _STATE if state is None else state
@@ -243,8 +244,11 @@ def scheduler_tick(cos=None, state=None, *, force=False):
     if expired_waiting or expired_jobs:
         _log.info("scheduler sweep：waiting 超期 %d 条，job 超期 %d 条",
                   len(expired_waiting), len(expired_jobs))
+    retried = ist.retry_local_cleanups()
+    if retried:
+        _log.info("local cleanup retry：%d 条", len(retried))
     renew = ist.renew_active_local_reservations()
-    if any(v != "skipped" for v in renew.values()):
+    if any(v not in ("skipped", "exempt") for v in renew.values()):
         _log.info("scheduler renew：%s", renew)
     try:
         upload_guard.check_disk_watermark(_ensure_upload_dir())
@@ -880,8 +884,11 @@ def process_validating(cos=None, state=None):
         return None
     # 收口成功：清理任务暂存整树（同卷 rename 已带走本代目录；换代残件与
     # 跨卷复制残件一并清掉——ID 包已在 objects/<slide_id>/ 独立存在）。
+    # 0072 生命周期：清理确认（结算时预约已 consumed，confirm 只落
+    # local_cleanup_status=cleaned；失败留 pending 由调度器重试）。
     try:
         slide_storage.remove_staging_tree(job_id, root=directory)
+        ist.confirm_local_cleanup(job_id)
     except Exception:  # noqa: BLE001
         _log.debug("暂存树清理失败（job=%s）", job_id, exc_info=True)
     _log.info("统一发布完成（job=%s slide_id=%s）", job_id, slide_id)

@@ -38,7 +38,7 @@ publish_slide 合同（步骤顺序，P3 接线实现；P4-b 起步骤 0/2/4 的
      → 跳过 FS 只做第 4 步 DB 收口；不吻合 → ``PublishConflict``（fail-closed
      告警，不删不猜——绝不按名称或 SHA 收养别人的资产）。
   4. 短事务 CAS + 结算（plan §3.1-6；锁序：advisory → 任务行 FOR UPDATE
-     → slides 行 → upload_reservations → upload_user_quotas（→ cos_pool_state））：
+     → slides 行 → upload_user_quotas → upload_reservations（→ cos_pool_state；0072 全仓统一锁序：quota 行先于 reservation 行））：
      slide_store.mark_ready（expected_state=staging, accounted_bytes=实际字节）
      + slide_store.record_revision（slide_assets 写内容 revision：sha256 前缀）
      与 consume reservation、任务 committed + 清 commit_intent **同一事务**；
@@ -140,7 +140,7 @@ class PublishChannel:
       - ``settle(task_ref, generation, slide_id, sha256, accounted_bytes)``
         → ``(task_after, already_settled)``（步骤 4 短事务；内部自取
         advisory 锁——**第一把锁**，随后按锁序取任务行 → slides 行 →
-        upload_reservations → upload_user_quotas）。
+        upload_user_quotas → upload_reservations）。
 
     settle 契约（镜像 upload_tasks 实现）：slides 行 CAS（staging→ready +
     accounted_bytes=实际字节）→ slide_assets 内容 revision → consume
@@ -244,18 +244,23 @@ def _precheck_locked(cur, task_ref, generation, slide_id, owner_user_id,
         raise PublishError("owner_mismatch",
                            "任务归属与发布发起者不一致（拒绝，不自动修正）",
                            deterministic=True, task=task)
-    # 预约有效性（plan §3.1-4：锁内重验；无预约=owner/本地态视为持有）
+    # 预约有效性（plan §3.1-4：锁内重验；无预约=owner/本地态视为持有）。
+    # 0072 生命周期：绑定预约核验**容量持有 + 归属**（租约经 renew 重发）。
     rid = task.get("reservation_id")
     if rid:
         out = upload_guard.renew_reservation_locked(cur, rid)
         if not upload_guard.reservation_is_active(out):
             raise upload_guard.ReservationInvalid(
                 "预占已失效，不能发布：%r" % rid)
+        if not upload_guard.reservation_holder_matches(
+                out, "upload_task", task["upload_id"]):
+            raise upload_guard.ReservationInvalid(
+                "预占绑定与本任务不符，不能发布：%r" % rid)
     return task
 
 
 # --------------------------------------------------------------------------- #
-# 步骤 4：短事务 CAS + 结算（advisory → 任务行 → slides → reservations → quotas）
+# 步骤 4：短事务 CAS + 结算（advisory → 任务行 → slides → quotas → reservations）
 # --------------------------------------------------------------------------- #
 def _settle_publish(task_ref, generation, slide_id, sha256, accounted_bytes):
     """发布收口短事务：mark_ready + record_revision + consume + committed +
@@ -293,7 +298,7 @@ def _settle_publish(task_ref, generation, slide_id, sha256, accounted_bytes):
                         deterministic=True, task=task)
                 # slides 行 CAS（expected_state=staging）：ready 与
                 # accounted_bytes 同事务设置（R-12：删除结算用它）。锁序：
-                # 任务行 → **slides 行** → upload_reservations → quotas。
+                # 任务行 → **slides 行** → upload_user_quotas → reservations。
                 cur.execute(
                     "UPDATE slides SET asset_state=%s, published_at=now(), "
                     "accounted_bytes=%s, updated_at=now() "
@@ -325,7 +330,8 @@ def _settle_publish(task_ref, generation, slide_id, sha256, accounted_bytes):
                 rid = task.get("reservation_id")
                 if rid:
                     upload_guard.consume_reservation_locked(
-                        cur, rid, int(accounted_bytes))
+                        cur, rid, int(accounted_bytes),
+                        expect_holder=("upload_task", task_ref))
                 cur.execute(
                     "UPDATE upload_tasks SET state=%s, sha256_actual=%s, "
                     "commit_intent_json=NULL, updated_at=now() "

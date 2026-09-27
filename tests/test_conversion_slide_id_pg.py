@@ -351,19 +351,25 @@ def _v2_kfb_upload(client, src, name):
     return upload_id
 
 
-def test_reservation_expired_at_commit_cancels_job_and_fails_asset(
+def test_reservation_lease_expired_at_commit_still_settles(
         tmp_path, monkeypatch):
-    """V2 KFB commit 收口时预占失效（预检通过后才过期的窄窗——job 已在
-    commit 期受理创建）→ 409 + 连带作废已建 job + 产物 failed +
-    staging 清账 + 配额零泄漏（不留「上传报错但产物稍后上线」悬挂态）。"""
+    """0072 生命周期合同（替代旧「预占过期 → 409 连带作废」，plan §D 注记）：
+
+    旧合同：commit 收口时预占失效（预检后过期的窄窗）→ 409 + 连带作废
+    job + 产物 failed + 配额零入账。
+    新合同：任务持有的容量**绑定后不被 TTL 回收**——租约过期只影响执行
+    许可，合法任务的结算不受拒绝（心跳停止不代表字节消失）：commit 正常
+    完成、job 保持、配额按源字节一次结算。「真正 released」的不变量处置
+    由 ZIP 侧回归（test_slide_id_review_r8/r9）与模型测试覆盖。
+    """
     import upload_task_store
     c = _client()
     uid = _user_session(c, login="cv-exp@x.com")
     _set_quota(uid, 10 ** 8)
     src = build_synthetic_kfb(tmp_path / "exp.kfb")
+    data_len = src.stat().st_size
     upload_id = _v2_kfb_upload(c, src, "exp.kfb")
-    # 预占失效注入在 finish_commit 边界（commit 前置预检已通过之后——
-    # 模拟预检→收口之间的窄窗/管理员收割竞态）
+    # 租约过期注入在 finish_commit 边界（commit 前置预检已通过之后）
     real_finish = upload_task_store.finish_commit
 
     def _expire_then_finish(*a, **kw):
@@ -373,20 +379,18 @@ def test_reservation_expired_at_commit_cancels_job_and_fails_asset(
     monkeypatch.setattr(upload_task_store, "finish_commit",
                         _expire_then_finish)
     rc = c.post("/api/uploads/%s/commit" % upload_id)
-    assert rc.status_code == 409
-    assert rc.get_json()["code"] == "reservation_expired"
+    assert rc.status_code == 202, rc.get_data(as_text=True)
+    t = upload_task_store.get_task(upload_id)
+    assert t["state"] == upload_task_store.STATE_COMMITTED
     job = conversion_store.get_job_by_upload_id(upload_id)
-    assert job is not None  # commit 期已受理建 job
-    job = conversion_store.get_job(job["id"])
-    assert job["state"] == "cancelled"
+    assert job is not None and job["state"] not in ("cancelled", "failed")
     sid = job.get("slide_id")
     assert sid
-    assert slide_store.resolve_slide_id(sid).asset_state == "failed"
-    assert not slide_storage.staging_task_dir(
-        job["id"], root=UPLOAD_DIR).exists()
-    assert not slide_storage.bundle_dir(sid, root=UPLOAD_DIR).exists()
+    assert slide_store.resolve_slide_id(sid).asset_state != "failed"
     q = upload_guard.get_quota_row(uid)
-    assert int(q["used_bytes"]) == 0 and int(q["reserved_bytes"]) == 0
+    assert int(q["used_bytes"]) == data_len  # 源字节一次结算
+    assert int(q["reserved_bytes"]) == 0
+
 
 
 def test_recovery_reservation_expired_cancels_job_no_livelock(tmp_path,

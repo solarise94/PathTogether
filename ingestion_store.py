@@ -14,9 +14,9 @@
     已成功、未过 Viewer readiness；completed = readiness probe 通过且 CAS
     置 viewer_ready。cleanup_* 独立（§6.2：COS 删除失败不回滚本地切片）。
 
-锁序（与 migrations/0066 头注释一致，所有触及既有 job 的路径恒定）：
+锁序（0066/0067/0072 头注释一致，所有触及既有 job 的路径恒定）：
 
-    ingestion_jobs 行 → upload_reservations 行 → upload_user_quotas 行
+    ingestion_jobs 行 → upload_user_quotas 行 → upload_reservations 行
     → cos_pool_state 行
 
 P4-b（slide ID 化，docs/slide-id-refactor-p4-contract-20260925.md §5）：发布/
@@ -29,10 +29,13 @@ ingestion_jobs.slide_id 同事务绑定）；本地提交经 slide_publish 统�
 持有 pool 行锁期间不回头等其它行（无环）。准入原子性：本地配额预占与
 COS 池预约在同一事务；任一失败整体回滚，禁止半成功（§6.1）。
 
-绝对期限（§6.3）：waiting_expires_at = created_at + COS_WAITING_MAX_AGE
-（24h，续租不延长）；job_deadline_at = capacity_admitted_at +
-COS_JOB_MAX_AGE（72h）。过期预约禁止复活：renew 走「不复活」语义，恢复
-流程按锁序重新预占，失败则终止并清理远端。
+绝对期限（§6.3 + 生命周期 0072）：waiting_expires_at = created_at +
+COS_WAITING_MAX_AGE（24h，续租不延长）；job_deadline_at =
+capacity_admitted_at + COS_JOB_MAX_AGE（72h）。本地预约准入即绑定
+（holder=ingestion_job，0072），**不参加 TTL 回收**——租约（expires_at）
+过期只暂停执行许可，renew 在同一 rid 上重发租约（不重新准入、不换
+rid）；任务的绝对期限由 sweep_expired_jobs 强制，超期终态后本地容量
+经「清理确认后释放」（local_cleanup_*，§5）收口。
 
 json/dual 后端 fail-closed：仅 postgres 后端可用（调用方保证）。
 事件 detail 禁止秘密：本模块 _sanitize_detail 拦截 sign/secret/token/url
@@ -101,6 +104,13 @@ CLEANUP_PENDING = "pending"
 CLEANUP_CLEANED = "cleaned"
 CLEANUP_FAILED = "failed"
 
+#: 本地暂存清理进度（0072；与远端 cleanup_* 分列——本地与 COS 远端是
+#: 不同资源，各自按清理证据释放，不能以远端成功证明本地已删除）。
+LOCAL_CLEANUP_NONE = "none"
+LOCAL_CLEANUP_PENDING = "pending"
+LOCAL_CLEANUP_CLEANED = "cleaned"
+LOCAL_CLEANUP_FAILED = "failed"
+
 
 class IngestionStateError(Exception):
     """非法状态转换 / CAS 冲突 / 已入库后取消等合同级拒绝。"""
@@ -143,18 +153,22 @@ _JOB_FIELDS = (
     "terminal_at", "created_at", "updated_at",
     # P4-b（0067 列）：创建即预分配的资产绑定（唯一绑定源；幂等复用不重分）。
     "slide_id",
+    # 0072 列：本地暂存清理进度（独立于远端 cleanup_*）。
+    "local_cleanup_status", "local_cleanup_attempts",
+    "local_cleanup_last_error", "local_cleanup_next_retry_at",
 )
 
 _INT_FIELDS = frozenset({
     "declared_size", "pool_reserved_bytes", "source_size_bytes",
     "downloaded_bytes", "logical_download_bytes", "wire_download_bytes",
-    "cleanup_attempts", "worker_generation",
+    "cleanup_attempts", "worker_generation", "local_cleanup_attempts",
 })
 _TS_FIELDS = frozenset({
     "capacity_admitted_at", "commit_started_at", "local_ready_at",
     "cleanup_next_retry_at", "cleanup_lease_expires_at",
     "worker_lease_expires_at", "waiting_expires_at", "job_deadline_at",
     "terminal_at", "created_at", "updated_at",
+    "local_cleanup_next_retry_at",
 })
 _JSON_FIELDS = frozenset({
     "part_plan_json", "download_checkpoint_json", "commit_intent_json",
@@ -236,14 +250,6 @@ def asset_owner_for_job(job) -> str:
         return ((getter() if getter else "") or "").strip()
     except Exception:  # noqa: BLE001 - fail-closed：解析不到按空处理
         return ""
-
-
-def _cleanup_staging_tree(job_id):
-    """终态后清理任务暂存整树（best-effort；崩溃窗口残留由 P6 排空）。"""
-    try:
-        slide_storage.remove_staging_tree(job_id)
-    except Exception:  # noqa: BLE001
-        pass
 
 
 def _abandon_staging_asset(cur, job):
@@ -443,8 +449,12 @@ def _try_admit_txn(cur, job_id, *, disk_watermark_ok=True):
                      and bool(job["owner_user_id"]))
     if quota_applies:
         try:
+            # 生命周期（0072）：准入即绑定（holder=ingestion_job，purpose=
+            # ingest_local）——本地容量责任与任务同进退，不产生未绑定窗口。
             res = upload_guard.reserve_upload_locked(
-                cur, job["owner_user_id"], job["declared_size"])
+                cur, job["owner_user_id"], job["declared_size"],
+                holder_kind="ingestion_job", holder_id=job_id,
+                purpose="ingest_local")
             reservation_id = res["reservation_id"]
         except upload_guard.QuotaExceeded:
             # §6.1：准入时已不满足本地配额 → 终止（不接触 COS）；
@@ -845,8 +855,8 @@ def worker_settle_ready(job_id, generation, *, slide_canonical_name=None,
     幂等：ready/completed 视为已收口返回现状（重复调用/恢复重入不重复
     结算、不重复 consume——consume 本身幂等 + 状态机单次转移）。
     generation 过期 → StaleLease（worker fencing）；未持久化 intent → 拒。
-    锁序：advisory → ingestion_jobs 行 → slides 行 → upload_reservations
-    → upload_user_quotas（0066/0067 全仓锁序一致，无环）。
+    锁序：advisory → ingestion_jobs 行 → slides 行 → upload_user_quotas
+    → upload_reservations（0066/0067/0072 全仓锁序一致，无环）。
     """
     conn = _connect()
     try:
@@ -912,14 +922,16 @@ def worker_settle_ready(job_id, generation, *, slide_canonical_name=None,
                     conn=conn)
                 if job.get("local_reservation_id"):
                     upload_guard.consume_reservation_locked(
-                        cur, job["local_reservation_id"], int(settle_bytes))
+                        cur, job["local_reservation_id"], int(settle_bytes),
+                        expect_holder=("ingestion_job", job_id))
                 canonical = slide_canonical_name or job.get("safe_name")
                 cur.execute(
                     "UPDATE ingestion_jobs SET state=%s, local_ready_at=now(), "
                     "slide_canonical_name=%s, sha256_actual=%s, "
-                    "cleanup_status=%s, updated_at=now() WHERE job_id=%s",
+                    "cleanup_status=%s, local_cleanup_status=%s, "
+                    "updated_at=now() WHERE job_id=%s",
                     (READY, canonical, sha256_actual,
-                     CLEANUP_PENDING, job_id))
+                     CLEANUP_PENDING, LOCAL_CLEANUP_PENDING, job_id))
                 _append_event(cur, job_id, "local_ready", {
                     "slide": canonical, "settle_bytes": int(settle_bytes),
                     "slide_id": sid})
@@ -999,6 +1011,10 @@ class IngestionPublishChannel:
             if not upload_guard.reservation_is_active(out):
                 raise upload_guard.ReservationInvalid(
                     "预占已失效，不能发布：%r" % rid)
+            if not upload_guard.reservation_holder_matches(
+                    out, "ingestion_job", job["job_id"]):
+                raise upload_guard.ReservationInvalid(
+                    "预占绑定与本任务不符，不能发布：%r" % rid)
         return job
 
     def settle(self, task_ref, generation, slide_id, sha256, accounted_bytes):
@@ -1172,17 +1188,57 @@ def record_sign_batch(job_id, part_numbers):
 # --------------------------------------------------------------------------- #
 # 取消 / 失败 / 超期（调度器）
 # --------------------------------------------------------------------------- #
+def _needs_local_cleanup(job):
+    """任务是否可能有本地暂存/容量责任需要清理确认（保守判定）。
+
+    已准入（有本地预约/准入时刻）或已发起远端上传（upload_id）的任务都
+    可能留有 ``.staging/<job_id>/`` 残件——树不存在时 remove_staging_tree
+    是 no-op，确认路径立即收口。"""
+    return bool(job.get("local_reservation_id")
+                or job.get("capacity_admitted_at")
+                or job.get("upload_id"))
+
+
+def _terminate_local_reservation_invalid(cur, job, observed):
+    """活跃任务的本地预约不变量异常收口（plan §4.3；R11 P1）。
+
+    rid 缺失 / released / consumed / 绑定不符 → 拒绝继续执行：任务
+    failed（fail_code=local_reservation_invalid）+ 远端与本地清理责任
+    pending + staging 资产 failed。**不复活**预约、**不消费/释放他人**
+    预约（绑定不符的容量由核账工具处置）；调用方事务提交后接本地清理
+    编排。仅从活跃集 CAS 转出（并发终态先赢则保持其结果）。"""
+    jid = job["job_id"]
+    _append_event(cur, jid, "reservation_invalid", {"observed": observed})
+    _abandon_staging_asset(cur, job)
+    cur.execute(
+        "UPDATE ingestion_jobs SET state=%s, fail_code="
+        "'local_reservation_invalid', terminal_at=now(), "
+        "cleanup_status=%s, local_cleanup_status=%s, updated_at=now() "
+        "WHERE job_id=%s AND state = ANY(%s)",
+        (FAILED, CLEANUP_PENDING, LOCAL_CLEANUP_PENDING, jid,
+         list(ACTIVE_UPLOAD_STATES)))
+    cur.execute("SELECT * FROM ingestion_jobs WHERE job_id=%s", (jid,))
+    return _norm_row(cur.fetchone())
+
+
 def cancel_job(job_id, *, reason_code="cancelled_by_user"):
-    """幂等取消（§4 cancel）。已入库 ready/completed → IngestionStateError。
+    """幂等取消（§4 cancel + 生命周期 0072 统一清理顺序）。
 
     **提交互斥（review 740e823 P1-3）**：validating 且 commit intent 已
     持久化 → CommitInProgress 拒绝——统一发布进行中，取消无法原子撤销
     FS 包与资产行；落库后删除走既有切片删除合同。
 
-    锁序 job → reservation → quota（释放本地预占）；pool_reserved 不动——
-    确认远端清理完成后由 finalize_cleanup 释放（§6.2）。P4-b：取消收口
-    同事务把 staging 资产行 CAS → failed（保留证据），事务提交后清理任务
-    暂存树（``.staging/<job_id>/``——清理失败只记日志不回滚取消）。
+    顺序（plan §5「先持久化停止与清理责任，清理确认后释放」）：
+      1. 短事务锁 job：终态落库（cancelled）+ 远端清理责任（cleanup_
+         status=pending）+ **本地清理责任（local_cleanup_status=pending，
+         本地预约保持绑定+reserved——取消不先释放容量）** + staging
+         资产 CAS→failed；
+      2. 事务提交后清理 ``.staging/<job_id>/`` 暂存树；
+      3. 清理确认 → confirm_local_cleanup 释放本地预约（恰一次）；
+         失败 → record_local_cleanup_failure（容量与重试工作保留）。
+
+    pool_reserved 不动——远端清理确认后由 finalize_cleanup 释放（§6.2，
+    与本地清理分开收口）。
     """
     conn = _connect()
     try:
@@ -1203,21 +1259,21 @@ def cancel_job(job_id, *, reason_code="cancelled_by_user"):
                 if job["state"] in TERMINAL_STATES:
                     return _norm_row(job)  # 幂等
                 _require_transition(job, CANCELLED)
-                if job.get("local_reservation_id"):
-                    upload_guard.release_reservation_locked(
-                        cur, job["local_reservation_id"])
                 cleanup = (CLEANUP_PENDING
                            if job["pool_reserved_bytes"] > 0 or
                            job.get("upload_id") or job.get("object_key")
                            else CLEANUP_NONE)
-                # P4-b：staging 资产行收口为 failed（保留证据）；任务暂存树
-                # 在事务提交后清理（见函数尾——清理失败不阻断取消收口）。
+                local_pending = _needs_local_cleanup(job)
+                # P4-b：staging 资产行收口为 failed（保留证据）。
                 _abandon_staging_asset(cur, job)
                 cur.execute(
                     "UPDATE ingestion_jobs SET state=%s, fail_code=%s, "
-                    "terminal_at=now(), cleanup_status=%s, updated_at=now() "
+                    "terminal_at=now(), cleanup_status=%s, "
+                    "local_cleanup_status=%s, updated_at=now() "
                     "WHERE job_id=%s",
-                    (CANCELLED, reason_code, cleanup, job_id))
+                    (CANCELLED, reason_code, cleanup,
+                     LOCAL_CLEANUP_PENDING if local_pending
+                     else LOCAL_CLEANUP_NONE, job_id))
                 _append_event(cur, job_id, "cancelled",
                               {"reason": reason_code})
                 cur.execute("SELECT * FROM ingestion_jobs WHERE job_id=%s",
@@ -1225,15 +1281,17 @@ def cancel_job(job_id, *, reason_code="cancelled_by_user"):
                 out = _norm_row(cur.fetchone())
     finally:
         conn.close()
-    _cleanup_staging_tree(job_id)
+    if local_pending:
+        _local_cleanup_finish(job_id)
     return out
 
 
 def fail_job(job_id, generation, code):
-    """worker 终态失败（释放本地预占，远端清理转 pending）。
+    """worker 终态失败（本地容量经清理确认后释放；远端清理转 pending）。
 
-    P4-b：同事务把 staging 资产行 CAS → failed（保留证据、不可读）；
-    事务提交后清理任务暂存树（best-effort）。"""
+    生命周期（0072）：同事务持久化失败终态 + 远端/本地清理责任（本地
+    预约保持绑定+reserved）；事务提交后清理暂存树——确认后释放，失败
+    登记重试。P4-b：staging 资产行同事务 CAS → failed。"""
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -1246,22 +1304,24 @@ def fail_job(job_id, generation, code):
                 if job["state"] in TERMINAL_STATES:
                     return _norm_row(job)  # 幂等（首次失败已清理暂存）
                 _require_transition(job, FAILED)
-                if job.get("local_reservation_id"):
-                    upload_guard.release_reservation_locked(
-                        cur, job["local_reservation_id"])
+                local_pending = _needs_local_cleanup(job)
                 _abandon_staging_asset(cur, job)
                 cur.execute(
                     "UPDATE ingestion_jobs SET state=%s, fail_code=%s, "
-                    "terminal_at=now(), cleanup_status=%s, updated_at=now() "
+                    "terminal_at=now(), cleanup_status=%s, "
+                    "local_cleanup_status=%s, updated_at=now() "
                     "WHERE job_id=%s",
-                    (FAILED, code, CLEANUP_PENDING, job_id))
+                    (FAILED, code, CLEANUP_PENDING,
+                     LOCAL_CLEANUP_PENDING if local_pending
+                     else LOCAL_CLEANUP_NONE, job_id))
                 _append_event(cur, job_id, "failed", {"reason": code})
                 cur.execute("SELECT * FROM ingestion_jobs WHERE job_id=%s",
                             (job_id,))
                 out = _norm_row(cur.fetchone())
     finally:
         conn.close()
-    _cleanup_staging_tree(job_id)
+    if local_pending:
+        _local_cleanup_finish(job_id)
     return out
 
 
@@ -1292,7 +1352,13 @@ def sweep_expired_waiting():
 
 
 def sweep_expired_jobs():
-    """批量超期：已准入未提交且 job_deadline_at <= now → cancelled+清理。"""
+    """批量超期：已准入未提交且 job_deadline_at <= now → cancelled+清理。
+
+    生命周期（0072）：本地预约**不再就地释放**——短事务持久化终态与
+    远端/本地清理责任（容量保持绑定）；事务提交后逐任务执行本地清理
+    编排（确认后释放）。返回本轮扫描到的超期 job_id 列表（含被
+    commit-intent 闸跳过的）。"""
+    due = []
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -1317,55 +1383,65 @@ def sweep_expired_jobs():
                         _append_event(cur, jid, "deadline_deferred_commit",
                                       {"reason": "commit_intent_present"})
                         continue
-                    if job.get("local_reservation_id"):
-                        upload_guard.release_reservation_locked(
-                            cur, job["local_reservation_id"])
                     _abandon_staging_asset(cur, job)
                     cur.execute(
                         "UPDATE ingestion_jobs SET state=%s, fail_code="
                         "'job_max_age', terminal_at=now(), cleanup_status=%s, "
-                        "updated_at=now() WHERE job_id=%s",
-                        (CANCELLED, CLEANUP_PENDING, jid))
+                        "local_cleanup_status=%s, updated_at=now() "
+                        "WHERE job_id=%s",
+                        (CANCELLED, CLEANUP_PENDING, LOCAL_CLEANUP_PENDING,
+                         jid))
                     _append_event(cur, jid, "cancelled",
                                   {"reason": "job_max_age"})
-                return ids
+                    due.append(jid)
     finally:
         conn.close()
+    for jid in due:
+        _local_cleanup_finish(jid)
+    return ids
 
 
 # --------------------------------------------------------------------------- #
 # 容量调度器：续租 / 恢复 / FIFO 准入
 # --------------------------------------------------------------------------- #
 def renew_active_local_reservations():
-    """§6.3 常驻续租：浏览器无请求期间维持本地预约。
+    """§6.3 常驻续租 + 生命周期（0072）绑定核验：活跃任务不失去容量保障。
 
-    每任务短事务（R10 锁序统一后：job 行 → **quota 行 → reservation 行**
-    ——renew/re-admit/release 内部均按配额先行的统一协议；此前「先锁预约
-    续租、过期后才申请配额」与同用户准入回收交错是倒置死锁面。job 行锁
-    保持最先：全库无任何路径在持有配额锁后反过来等待 job 行——job 行的
-    全部 FOR UPDATE 站点（发布 precheck/claim/FIFO 准入/sweep）都先锁
-    job 再触配额，无反向等待者）：
+    扫描**全部应持本地容量的活跃任务**（quota 适用身份；豁免身份显式
+    标记——不再用 ``local_reservation_id IS NOT NULL`` 隐藏不变量异常）。
+    每任务短事务（锁序 job 行 → quota 行 → reservation 行，R10 统一）：
 
-    - 状态仍活跃且未超绝对期限 → renew（TTL 后移）；
-    - 预约已过期（不复活）→ 恢复流程：重新预占（新 rid）；QuotaExceeded →
-      终止并清理（fail_code=local_reservation_lost）；
-    - ready/completed 已结算 → 跳过（不再续）。
+    - 绑定有效（reserved）→ **同一 rid 重发执行租约**（绑定预约租约
+      过期可重发——容量从不被 TTL 回收；不重新准入、不换 rid、不产生
+      新的每小时准入计数）→ ``renewed``；
+    - rid 缺失 / released / consumed / 绑定不符 → **不变量异常**（R11
+      P1）：拒绝继续执行——任务 failed（fail_code=local_reservation_
+      invalid）进入清理编排（事务提交后本地清理），绝不停留
+      「uploading + 无容量」→ ``invalid``；
+    - ready/completed 已结算 → 跳过。
 
     续租**不延长** waiting/job 绝对期限（两者由 sweep 独立强制）。
-    返回 {job_id: renewed|recovered|terminated|skipped}。
+    返回 {job_id: renewed|invalid|exempt|skipped}。
     """
     results = {}
     conn = _connect()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT job_id FROM ingestion_jobs WHERE state = ANY(%s) "
-                "AND local_reservation_id IS NOT NULL "
+                "SELECT job_id, owner_role, owner_user_id FROM "
+                "ingestion_jobs WHERE state = ANY(%s) "
                 "ORDER BY created_at", (list(ACTIVE_UPLOAD_STATES),))
-            ids = [r["job_id"] for r in cur.fetchall()]
+            rows = [_norm_row(r) for r in cur.fetchall()]
     finally:
         conn.close()
-    for jid in ids:
+    for row in rows:
+        jid = row["job_id"]
+        if row["owner_role"] != "user" or \
+                not (row["owner_user_id"] or "").strip():
+            # 配额豁免身份（owner/本地态）单独显式跳过，不混入异常路径。
+            results[jid] = "exempt"
+            continue
+        terminated = False
         conn = _connect()
         try:
             with pg_store.transaction(conn) as c:
@@ -1374,48 +1450,40 @@ def renew_active_local_reservations():
                     if job is None or job["state"] not in ACTIVE_UPLOAD_STATES:
                         results[jid] = "skipped"
                         continue
-                    row = upload_guard.renew_reservation_locked(
-                        cur, job["local_reservation_id"])
-                    if row is None:
-                        results[jid] = "skipped"
+                    rid = (job.get("local_reservation_id") or "").strip()
+                    if not rid:
+                        _terminate_local_reservation_invalid(
+                            cur, job, "missing")
+                        results[jid] = "invalid"
+                        terminated = True
                         continue
-                    if upload_guard.reservation_is_active(row):
+                    res = upload_guard.renew_reservation_locked(cur, rid)
+                    if res is None:
+                        _terminate_local_reservation_invalid(
+                            cur, job, "missing")
+                        results[jid] = "invalid"
+                        terminated = True
+                        continue
+                    if not upload_guard.reservation_holder_matches(
+                            res, "ingestion_job", jid):
+                        _terminate_local_reservation_invalid(
+                            cur, job, "holder_mismatch")
+                        results[jid] = "invalid"
+                        terminated = True
+                        continue
+                    if upload_guard.reservation_is_active(res):
                         results[jid] = "renewed"
                         continue
-                    if row.get("state") != "reserved":
-                        # 已 consumed/released：状态机不应出现（结算后 state
-                        # 已离开活跃集）——fail-closed 记事件待查
-                        _append_event(cur, jid, "reservation_state_conflict",
-                                      {"observed": row.get("state")})
-                        results[jid] = "skipped"
-                        continue
-                    # 过期未复活 → 恢复流程重新预占（§6.3）
-                    try:
-                        res = upload_guard.reserve_upload_locked(
-                            cur, job["owner_user_id"], job["declared_size"])
-                        cur.execute(
-                            "UPDATE ingestion_jobs SET "
-                            "local_reservation_id=%s, updated_at=now() "
-                            "WHERE job_id=%s",
-                            (res["reservation_id"], jid))
-                        _append_event(cur, jid, "local_reservation_recovered",
-                                      None)
-                        results[jid] = "recovered"
-                    except upload_guard.QuotaExceeded:
-                        upload_guard.release_reservation_locked(
-                            cur, job["local_reservation_id"])
-                        _abandon_staging_asset(cur, job)
-                        cur.execute(
-                            "UPDATE ingestion_jobs SET state=%s, fail_code="
-                            "'local_reservation_lost', terminal_at=now(), "
-                            "cleanup_status=%s, updated_at=now() "
-                            "WHERE job_id=%s",
-                            (CANCELLED, CLEANUP_PENDING, jid))
-                        _append_event(cur, jid, "cancelled",
-                                      {"reason": "local_reservation_lost"})
-                        results[jid] = "terminated"
+                    # released/consumed：预约已离开容量态而任务仍在活跃集
+                    # ——不变量破坏（R11 P1 的 skipped 补丁已拆除）。
+                    _terminate_local_reservation_invalid(
+                        cur, job, res.get("state") or "unknown")
+                    results[jid] = "invalid"
+                    terminated = True
         finally:
             conn.close()
+        if terminated:
+            _local_cleanup_finish(jid)
     return results
 
 
@@ -1562,6 +1630,130 @@ def record_cleanup_failure(job_id, cleanup_token, error):
                 return _norm_row(cur.fetchone())
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 本地暂存清理编排（0072：清理确认后释放本地容量；与远端 cleanup_* 分列）
+# --------------------------------------------------------------------------- #
+def _local_cleanup_finish(job_id):
+    """终态任务的本地暂存清理编排（plan §5 统一顺序的第 2/3 步）。
+
+    先 I/O（remove_staging_tree，幂等——树不存在为 no-op）后短事务收口：
+    成功 → ``confirm_local_cleanup``（释放本地预约，恰一次）；失败 →
+    ``record_local_cleanup_failure``（容量与重试工作保留，不吞异常责任）。
+    崩溃在物理删除后、收口前 → 重试重删 no-op 后收口，幂等。"""
+    try:
+        slide_storage.remove_staging_tree(job_id)
+    except Exception as exc:  # noqa: BLE001 - 登记为持久重试工作，不吞责任
+        try:
+            record_local_cleanup_failure(job_id, exc)
+        except Exception:  # noqa: BLE001
+            # 登记本身失败（DB 故障）：下一轮 retry_local_cleanups 扫描
+            # pending 行兜底；此处只留日志。
+            pass
+        return False
+    return confirm_local_cleanup(job_id)
+
+
+def confirm_local_cleanup(job_id):
+    """本地清理确认收口（清理成功后；plan §5 第 3 步）。
+
+    短事务（锁序 job → quota → reservation）：重验 local_cleanup_status
+    仍为 pending/failed（cleaned 幂等返回）→ CAS 置 cleaned → **按持有者
+    释放本地预约**（expect_holder=ingestion_job——绑定预约只经清理确认
+    释放）。预约已 consumed（ready 结算路径）时 release 幂等 no-op。"""
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                job = get_job_locked(cur, job_id)
+                if job is None:
+                    raise IngestionStateError("ingestion job 不存在：%r" % job_id)
+                if job["local_cleanup_status"] == LOCAL_CLEANUP_CLEANED:
+                    return _norm_row(job)  # 幂等
+                if job["local_cleanup_status"] == LOCAL_CLEANUP_NONE:
+                    raise IngestionStateError(
+                        "local_cleanup_status=none 无清理责任可确认：%r" % job_id)
+                rid = (job.get("local_reservation_id") or "").strip()
+                if rid:
+                    upload_guard.release_reservation_locked(
+                        cur, rid, expect_holder=("ingestion_job", job_id))
+                cur.execute(
+                    "UPDATE ingestion_jobs SET local_cleanup_status=%s, "
+                    "local_cleanup_last_error=NULL, "
+                    "local_cleanup_next_retry_at=NULL, updated_at=now() "
+                    "WHERE job_id=%s AND local_cleanup_status IN (%s,%s)",
+                    (LOCAL_CLEANUP_CLEANED, job_id, LOCAL_CLEANUP_PENDING,
+                     LOCAL_CLEANUP_FAILED))
+                _append_event(cur, job_id, "local_cleaned", None)
+                cur.execute("SELECT * FROM ingestion_jobs WHERE job_id=%s",
+                            (job_id,))
+                return _norm_row(cur.fetchone())
+    finally:
+        conn.close()
+
+
+def record_local_cleanup_failure(job_id, error):
+    """本地清理失败：attempts+1、指数退避、有界错误；超上限转 failed
+    （容量保留，告警待人工——**不用 TTL 自动抹掉责任**，plan §5.4）。"""
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                job = get_job_locked(cur, job_id)
+                if job is None:
+                    raise IngestionStateError("ingestion job 不存在：%r" % job_id)
+                if job["local_cleanup_status"] == LOCAL_CLEANUP_CLEANED:
+                    return _norm_row(job)  # 并发确认先赢：不覆盖事实
+                if job["local_cleanup_status"] == LOCAL_CLEANUP_NONE:
+                    raise IngestionStateError(
+                        "local_cleanup_status=none 无清理责任可登记：%r" % job_id)
+                attempts = int(job.get("local_cleanup_attempts") or 0) + 1
+                status = (LOCAL_CLEANUP_FAILED
+                          if attempts >= cos_config.COS_CLEANUP_MAX_ATTEMPTS
+                          else LOCAL_CLEANUP_PENDING)
+                delay = cos_config.COS_CLEANUP_RETRY_BASE_SECONDS * \
+                    (2 ** max(0, attempts - 1))
+                cur.execute(
+                    "UPDATE ingestion_jobs SET local_cleanup_status=%s, "
+                    "local_cleanup_attempts=%s, local_cleanup_last_error=%s, "
+                    "local_cleanup_next_retry_at=now() + "
+                    "make_interval(secs => %s), updated_at=now() "
+                    "WHERE job_id=%s",
+                    (status, attempts, str(error)[:300], delay, job_id))
+                _append_event(cur, job_id,
+                              "local_cleanup_exhausted"
+                              if status == LOCAL_CLEANUP_FAILED
+                              else "local_cleanup_retry",
+                              {"attempts": attempts})
+                cur.execute("SELECT * FROM ingestion_jobs WHERE job_id=%s",
+                            (job_id,))
+                return _norm_row(cur.fetchone())
+    finally:
+        conn.close()
+
+
+def retry_local_cleanups(*, limit=20):
+    """调度器步进：重试到点的本地清理（pending 且 next_retry 到期）。
+
+    每轮有界（limit）；成功确认释放、失败登记退避。返回本轮处理的
+    job_id 列表。"""
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT job_id FROM ingestion_jobs "
+                "WHERE local_cleanup_status=%s "
+                "AND (local_cleanup_next_retry_at IS NULL OR "
+                " local_cleanup_next_retry_at <= now()) "
+                "ORDER BY updated_at LIMIT %s",
+                (LOCAL_CLEANUP_PENDING, int(limit)))
+            ids = [r["job_id"] for r in cur.fetchall()]
+    finally:
+        conn.close()
+    for jid in ids:
+        _local_cleanup_finish(jid)
+    return ids
 
 
 def waiting_and_holding_counts():

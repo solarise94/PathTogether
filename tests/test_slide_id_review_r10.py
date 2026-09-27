@@ -139,11 +139,21 @@ def test_topup_vs_consume_same_reservation():
 # 场景 3：COS 过期续租（整事务）× 同用户新准入
 # --------------------------------------------------------------------------- #
 def test_cos_renewal_vs_same_user_admission():
+    """生命周期（0072）重写：绑定预约不参加 TTL 回收——两种合法胜者收敛到
+    **同一终态**：同一 rid、总预约 150、任务获新执行租约，绝不失去容量。
+
+    断言合同变更（plan §D 注记）：R10 时代的「续租先赢 → re-admit 换新
+    rid」「准入先赢 → 回收旧预约、账本 50」两分支已随重新准入补丁拆除；
+    首轮与后续结果分别捕获（R11 P2），不再把后续轮当首轮。续租先赢的
+    确定性顺序由 tests/test_slide_id_review_r11.py 以 Event 固定复跑本用例。
+    """
     uid = user_store.create_user(
         "r10-cos@example.com", "pass1234pass1234", role="user")["user_id"]
     job, _created = ingestion_store.create_waiting_job(
         uid, "user", "r10.tif", "r10.tif", "tif", 100)
-    rid = upload_guard.reserve_upload(uid, 100)["reservation_id"]
+    rid = upload_guard.reserve_upload(
+        uid, 100, holder_kind="ingestion_job", holder_id=job["job_id"],
+        purpose="ingest_local")["reservation_id"]
     with psycopg.connect(PG_URI, autocommit=True) as db:
         db.execute("UPDATE ingestion_jobs SET state='uploading', "
                    "local_reservation_id=%s, capacity_admitted_at=now(), "
@@ -151,36 +161,47 @@ def test_cos_renewal_vs_same_user_admission():
                    (rid, job["job_id"]))
     _expire(rid)
 
+    captured = {}
+
+    def _renew_round():
+        captured["first"] = ingestion_store.renew_active_local_reservations()
+
     results = _run_concurrently(
-        ingestion_store.renew_active_local_reservations,
+        _renew_round,
         lambda: upload_guard.reserve_upload(uid, 50),
     )
     assert results == [None, None], results  # 无死锁/无异常
 
-    outcomes = ingestion_store.renew_active_local_reservations()
+    # 首轮实际返回值（不再丢弃后拿第二轮冒充）：
+    assert captured["first"].get(job["job_id"]) == "renewed", captured
     after = ingestion_store.get_job(job["job_id"])
-    with psycopg.connect(PG_URI) as db:
-        old_state = db.execute("SELECT state FROM upload_reservations "
-                               "WHERE reservation_id=%s",
-                               (rid,)).fetchone()[0]
-    assert old_state == "released"  # 旧预约两条路径下都终态 released
+    assert after["state"] == "uploading"
+    assert after["local_reservation_id"] == rid  # 同一 rid，不重新准入
+    res = upload_guard.get_reservation(rid)
+    assert res["state"] == "reserved"  # 容量从未被回收
+    assert upload_guard.reservation_is_active(res)  # 执行租约已重发
+    q = upload_guard.get_quota_row(uid)
+    assert int(q["reserved_bytes"]) == 150  # 旧 100 + 新 50
     ok, qv, sv = _ledger_ok(uid)
     assert ok, (qv, sv)
-    # 合法结果二选一：续租先赢 → re-admit（新 rid、账本 100+50）；
-    # 准入先赢 → 旧预约已被回收（reservation_state_conflict 保守跳过，
-    # 账本 50）。第二轮幂等（recovered→renewed 不改账本）。
-    first = outcomes.get(job["job_id"])
-    assert first in ("recovered", "skipped"), outcomes
-    q = upload_guard.get_quota_row(uid)
-    if first == "recovered":
-        assert int(q["reserved_bytes"]) == 150
-        assert after["local_reservation_id"] != rid
-        assert outcomes[job["job_id"]] == "renewed"  # 第二轮：续新约
-    else:
-        assert int(q["reserved_bytes"]) == 50
-    # 重复调用不重复记账（第三轮不变）
+
+    # 后续轮：仍 renewed、不新增预约行、不产生新的每小时准入计数、账本不变
+    with psycopg.connect(PG_URI) as db:
+        rows_before = int(db.execute(
+            "SELECT COUNT(*) FROM upload_reservations WHERE user_id=%s",
+            (uid,)).fetchone()[0])
+    second = ingestion_store.renew_active_local_reservations()
+    assert second.get(job["job_id"]) == "renewed", second
+    with psycopg.connect(PG_URI) as db:
+        rows_after = int(db.execute(
+            "SELECT COUNT(*) FROM upload_reservations WHERE user_id=%s",
+            (uid,)).fetchone()[0])
+    assert rows_after == rows_before == 2
+    assert upload_guard.get_quota_row(uid)["reserved_bytes"] == 150
+    ok, qv, sv = _ledger_ok(uid)
+    assert ok, (qv, sv)
+    # 重复调用不重复记账（第三轮幂等）
     ingestion_store.renew_active_local_reservations()
-    assert upload_guard.get_quota_row(uid)["reserved_bytes"] == \
-        int(q["reserved_bytes"])
+    assert upload_guard.get_quota_row(uid)["reserved_bytes"] == 150
     ok, qv, sv = _ledger_ok(uid)
     assert ok, (qv, sv)

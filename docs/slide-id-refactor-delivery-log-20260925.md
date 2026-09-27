@@ -373,3 +373,69 @@ f4e9e76 复核（用户）发现 1 项 P1（2 反例同一根因：登记在取�
 - 屏障只做同时起跑——锁序统一后反序交错已被协议禁止，不再中途注入强制非法交错（审查要求）。
 
 **R10 门禁**：三场景 3 例（×5 重跑）绿；十组相关套件 133 绿；test:js 562；全量 pytest 终态见提交信息（唯一允许失败=admin 0.4.13）。
+
+## R11 处置（2026-09-27/28）：上传容量生命周期——任务持有容量、租约控制执行
+
+审查（c1d2b6d 复核）：锁序项通过；COS 恢复验收两项问题——P1 活跃任务被
+回收后长期 uploading+released（本轮测试误当合法 skipped）；P2 R10 并发
+验收把第二轮续租结果当首轮、未确定性覆盖续租先赢。处置按用户提供的
+[task-capacity-lifecycle-repair-agent-plan-20260927.md](task-capacity-lifecycle-repair-agent-plan-20260927.md)
+全量实施（A–E 五阶段，允许分提交、本次一并落地）：
+
+**模型（migrations/0072）**：`upload_reservations` 增持有者三元组
+（holder_kind/holder_id/purpose，全空或全有 CHECK）+ origin
+（admission/reconcile）；部分唯一索引「同 (holder, purpose) 一份未结算
+责任」。绑定预约**不参加 TTL 回收**——expires_at 退化为执行租约；
+`ingestion_jobs` 增 local_cleanup_* 四列（本地清理与远端 cleanup_* 分列）。
+
+**统一原语（upload_guard）**：准入即绑定（reserve 的 holder 参数 /
+`bind_reservation_locked`，任务行同事务）；`renew_reservation_locked`
+对绑定行**重发租约**（过期可重发、不重新准入、不换 rid；未绑定保持不
+复活）；`release/consume_reservation_locked` 带持有者语境
+（`expect_holder`，无语境/不匹配 → `ReservationHolderMismatch`
+fail-closed）；判定拆分 `reservation_holds_capacity`（容量）vs
+`reservation_is_active`（执行许可）；在途口径=未结算责任（绑定不看租约；
+pending 豁免执行槽）；每小时只计 origin='admission'；
+`add_used_bytes_locked` 收口 used_bytes 唯一财务 SQL（转换通道接入）。
+
+**通道切换（C）**：
+- COS：准入即绑定；续租收敛为同 rid 重发 + 不变量处置（rid 缺失/
+  released/consumed/绑定不符 → `local_reservation_invalid` 终止进清理
+  编排，**不再 skipped 挂死**——R11 P1）；parts/sign 增容量绑定门禁
+  （409 local_reservation_invalid）；cancel/fail/sweep 不再先释放——
+  先持久化 local_cleanup 责任（保留预约）→ 事务外删树 → 确认后
+  `confirm_local_cleanup` 按持有者释放；失败 `record_local_cleanup_
+  failure` 退避重试（调度器 `retry_local_cleanups`），耗尽转 failed 保
+  容量告警；豁免身份显式 exempt。
+- V1/V2/ZIP：V1 各分支 writer 启动前绑定；V2 创建事务内绑定；PUT chunk
+  续租=绑定重发（过期不再 409）；受理前失败/取消/过期/失败路径全部
+  「清理确认后按持有者释放」（`_upload_abandon_staging` /
+  cleanup_part → cleanup_confirmed；maintain 过期与 KFB 确定性失败不再
+  无条件释放）；确定性失败保留 staging 与容量待 DELETE 确认。
+- 百度：建批事务内绑定（holder=baidu_batch）；闭班收口（consume/release）
+  **并入终态 CAS 同事务**（消灭「终态已落、结算未发」崩溃窗口）。
+- 转换：used_bytes 直更 SQL 删除，结算走 `add_used_bytes_locked`。
+
+**拆除（D）**：TTL 回收任务持有（reclaim 加 holder_id IS NULL）+
+cleanup_pending 反连接豁免；`record_cleanup_pending` 的重激活/补账/30 天
+延期（只登记重试）；COS 重新准入换 rid 分支与 released=skipped 分支；
+`_cleanup_staging_tree` 先释放后清理路径；slide_publish/ingestion_store
+旧锁序注释；R10 场景 3 与 R8/R9 回归断言改写为「责任从未释放」目标
+（各处注明被替代的状态机合同）。
+
+**存量核账（E）**：`scripts/reconcile_upload_capacity.py`——默认只读
+报告；`--apply` 幂等绑定一致项/终止异常项进清理编排；`--reattach` 按审计
+字节建 origin='reconcile' 预约并原子绑定（不计每小时准入）；超额只如实
+报告不调额度；mismatch 阻断人工核对（退出码 3）。生产执行另行批准。
+
+**验收**：R11 两反例原样入仓转绿（`tests/test_slide_id_review_r11.py`）；
+R10 场景 3 重写为确定性两胜者收敛断言（首轮结果独立捕获；续租先赢由
+R11 以 Event 固定复跑）；新模型测试 16 例（test_capacity_lifecycle_model）；
+COS 生命周期 10 例（invalid 处置/清理确认/重试/崩溃幂等/门禁/豁免）；
+通道+并发 10 例（V1 abort 门/V2 维护门/百度闭班原子/转换原语/准入先赢/
+取消×新准入×清理失败）；核账工具 5 例。全量门禁见提交信息
+（唯一允许失败=admin 0.4.13 第三方未提交件）。
+
+**运行边界（不变）**：COS capability 保持 off；本方案完成不自动开启；
+生产审计/迁移/回滚按 runbook 独立门禁，部署晚间低峰窗口另行确认。
+调用点清单与锁图：[upload-capacity-lifecycle-inventory-20260927.md](upload-capacity-lifecycle-inventory-20260927.md)。

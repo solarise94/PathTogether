@@ -10762,13 +10762,25 @@ def admin_v1_staging_residue_cleanup():
     if pending is not None:
         _upload_v2_cleanup_confirmed({"upload_id": task_id,
                                       "reservation_id": None})
+    # 0072：COS 任务的本地清理责任在 ingestion_jobs 分列——残留树被清理
+    # 后确认收口（释放仍持有的本地预约，幂等）。
+    released_cos = False
+    try:
+        job = ingestion_store.get_job(task_id)
+        if job is not None and job.get("local_cleanup_status") in (
+                ingestion_store.LOCAL_CLEANUP_PENDING,
+                ingestion_store.LOCAL_CLEANUP_FAILED):
+            ingestion_store.confirm_local_cleanup(task_id)
+            released_cos = True
+    except Exception:
+        app.logger.exception("ingestion local cleanup 确认失败：%s", task_id)
     _audit("admin.staging_residue.cleanup", target_type="staging",
            target_id=task_id, detail={"task_id": task_id,
                                       "removed": bool(removed),
                                       "released_reservation":
-                                          bool(pending)})
+                                          bool(pending) or released_cos})
     return jsonify(ok=True, task_id=task_id, removed=bool(removed),
-                   released_reservation=bool(pending))
+                   released_reservation=bool(pending) or released_cos)
 
 
 @app.route("/api/admin/v1/slides/<path:name>/visibility", methods=["POST"])
@@ -11894,23 +11906,21 @@ def _zip_abort_published(plans, upload_root=None):
 
 def _zip_fail_task(upload_id, token, task, plans):
     """批量任务整体失败收尾：任务 failed + 清任务暂存树 + item 资产行
-    failed + 释放预占（清理确认后释放，plan §3.3）。"""
+    failed + 清理确认后按持有者释放预占（plan §3.3 + 0072）。"""
     try:
         t = upload_task_store.fail_commit(upload_id, token, permanent=True)
     except upload_task_store.UploadTaskError:
         app.logger.exception("ZIP 批量任务 fail_commit 失败：%s", upload_id)
         t = upload_task_store.get_task(upload_id) or task
-    try:
-        slide_storage.remove_staging_tree(upload_id, root=UPLOAD_DIR)
-    except Exception:
-        app.logger.exception("ZIP 批量任务暂存清理失败：%s", upload_id)
     for plan in plans:
         try:
             slide_store.mark_failed(plan["slide_id"])
         except Exception:
             app.logger.exception("ZIP item 资产 mark_failed 失败：%s",
                                  plan["slide_id"])
-    _upload_v2_release_reservation_quietly(t)
+    if _upload_v2_cleanup_part(t):
+        # 清理确认后才释放；失败登记 pending（容量保留，重试确认后释放）
+        _upload_v2_cleanup_confirmed(t)
     return t
 
 
@@ -11989,7 +11999,7 @@ def _upload_acquire_reservation(ident):
 
 
 def _upload_release_quietly(reservation):
-    """best-effort 释放预占（失败仅记日志，不掩盖主错误）。"""
+    """best-effort 释放**未绑定**准备期预占（受理前失败；失败仅记日志）。"""
     if not reservation:
         return
     try:
@@ -11997,6 +12007,27 @@ def _upload_release_quietly(reservation):
     except Exception:
         app.logger.exception("upload reservation release failed: %s",
                              reservation.get("reservation_id"))
+
+
+def _upload_abandon_staging(upload_id, reservation):
+    """V1 受理前失败的统一收尾（0072：清理确认后释放）。
+
+    清 staging 树成功 → 按持有者释放绑定预约；失败 → 登记
+    upload_cleanup_pending（容量责任保留，重试经 DELETE/admin 确认）——
+    不再无条件释放。"""
+    rid = (reservation or {}).get("reservation_id")
+    try:
+        slide_storage.remove_staging_tree(upload_id, root=UPLOAD_DIR)
+    except (OSError, ValueError):
+        app.logger.exception("上传受理前清理失败（登记待清理）：%s", upload_id)
+        try:
+            upload_task_store.record_cleanup_pending(
+                upload_id, rid, error="pre-accept staging cleanup failed")
+        except Exception:
+            app.logger.exception(
+                "cleanup pending 登记失败（预占保持）：%s", upload_id)
+        return
+    _upload_release_holder(rid, upload_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -12027,11 +12058,14 @@ def _upload_legacy_manifest(task):
 
 
 def _upload_legacy_fail(upload_id, token, task, *, permanent, remove_names=()):
-    """V1 受理后的失败收尾：fail_commit → 清提升文件 → （临时类）取消 → 释放预占。
+    """V1 受理后的失败收尾：fail_commit → 清提升文件 → （临时类）取消 →
+    清理确认后释放预占（0072）。
 
     - permanent=True（确定性失败：非法切片/名称冲突/预占失效）→ failed；
     - permanent=False（临时基础设施故障）→ 回滚 active 后立即取消（V1 没有
-      重试端点，不留 active 残骸），两条路径都释放 reservation。
+      重试端点，不留 active 残骸）；
+    - staging 树清理失败 → 登记 upload_cleanup_pending（容量保留，
+      DELETE/admin 确认后释放）——不再无条件释放。
     """
     try:
         t = upload_task_store.fail_commit(upload_id, token, permanent=permanent)
@@ -12048,7 +12082,9 @@ def _upload_legacy_fail(upload_id, token, task, *, permanent, remove_names=()):
             t = upload_task_store.cancel_task(upload_id)
         except upload_task_store.UploadTaskError:
             app.logger.exception("V1 上传临时失败后取消任务失败：%s", upload_id)
-    _upload_v2_release_reservation_quietly(t)
+    if _upload_v2_cleanup_part(t):
+        # 清理确认后才释放（R6 修复 + 0072 持有者语境收口）
+        _upload_v2_cleanup_confirmed(t)
     return t
 
 
@@ -12243,8 +12279,9 @@ def _upload_legacy_intent(ident, filename, safe_name, artifacts, reservation,
             reservation_id=(reservation or {}).get("reservation_id"),
             upload_id=upload_id)
     except upload_task_store.UploadTaskError as e:
+        # 0072：预约已绑定（writer 已启动）——释放由调用方在清 staging 后
+        # 按持有者执行（_upload_abandon_staging），此处不先释放。
         app.logger.exception("V1 上传 commit 受理失败")
-        _upload_release_quietly(reservation)
         return None, (jsonify(error="上传受理失败，请重试", code=e.code), 500)
     return (upload_id, token, task), None
 
@@ -12442,25 +12479,24 @@ def _api_upload_native_single(file, filename, safe, ext, ident, reservation,
         传 slide_ids（P2 双列）；响应 slide_id 从任务绑定读。
     """
     upload_id = upload_task_store.new_task_id()
+    # 0072 生命周期：writer 启动前绑定（此后的受理前失败走
+    # _upload_abandon_staging——清理确认后释放）。
+    _upload_bind_reservation(reservation, upload_id)
     try:
         entry = _upload_native_entry(safe)
     except ValueError:
-        _upload_release_quietly(reservation)
+        _upload_abandon_staging(upload_id, reservation)
         return jsonify(error="不支持的文件类型"), 400
     owner = _upload_asset_owner(ident)
     if not owner:
-        _upload_release_quietly(reservation)
+        _upload_abandon_staging(upload_id, reservation)
         return jsonify(error="无法解析上传资产 owner（本地态未配置 owner）"), 500
     staging_gen = slide_storage.staging_dir(upload_id, "1", root=UPLOAD_DIR)
     staged = staging_gen / entry
 
     def _abort_early(payload, status):
-        """受理前失败：清 staging + 释放预占（无任务/无资产行可回滚）。"""
-        try:
-            slide_storage.remove_staging_tree(upload_id, root=UPLOAD_DIR)
-        except Exception:
-            app.logger.exception("V1 原生上传受理前清理失败：%s", upload_id)
-        _upload_release_quietly(reservation)
+        """受理前失败：清 staging；确认后按持有者释放（0072）。"""
+        _upload_abandon_staging(upload_id, reservation)
         return payload, status
 
     # 计数流直写任务暂存（不信任 Content-Length；P3：不再平铺 .uploading-*）
@@ -12624,16 +12660,14 @@ def api_upload():
         _upload_release_quietly(reservation)
         return jsonify(error="无法解析上传资产 owner（本地态未配置 owner）"), 500
     upload_id = upload_task_store.new_task_id()
+    # 0072 生命周期：writer 启动前绑定（受理前失败走清理确认后释放）。
+    _upload_bind_reservation(reservation, upload_id)
     transfer = slide_storage.staging_dir(upload_id, "transfer", root=UPLOAD_DIR)
     staged = transfer / ("data." + (ext or "kfb"))
 
     def _abort_kfb(payload, status):
-        """受理前失败：清任务暂存 + 释放预占（无任务行可回滚）。"""
-        try:
-            slide_storage.remove_staging_tree(upload_id, root=UPLOAD_DIR)
-        except Exception:
-            app.logger.exception("V1 KFB 上传受理前清理失败：%s", upload_id)
-        _upload_release_quietly(reservation)
+        """受理前失败：清任务暂存；确认后按持有者释放（0072）。"""
+        _upload_abandon_staging(upload_id, reservation)
         return payload, status
 
     # 计数流直写任务暂存（不信任 Content-Length；P4-app：不再平铺 .uploading-*）
@@ -12676,10 +12710,7 @@ def api_upload():
               "slide": False}],
             reservation, upload_id=upload_id)
         if err is not None:
-            try:
-                slide_storage.remove_staging_tree(upload_id, root=UPLOAD_DIR)
-            except Exception:
-                pass
+            _upload_abandon_staging(upload_id, reservation)
             return err
         upload_id, token, task = intent
         import conversion_worker
@@ -12689,11 +12720,7 @@ def api_upload():
         if task is not None:
             _upload_legacy_fail(upload_id, token, task, permanent=False)
         else:
-            try:
-                slide_storage.remove_staging_tree(upload_id, root=UPLOAD_DIR)
-            except Exception:
-                pass
-            _upload_release_quietly(reservation)
+            _upload_abandon_staging(upload_id, reservation)
         return jsonify(error="上传受理失败，请重试"), 500
 
     # ---- 短事务 B：committed + 配额同事务转实占（源字节；崩溃后由恢复
@@ -12724,7 +12751,7 @@ def api_upload():
         return jsonify(error="上传已失效，请重试", code="commit_retryable"), 503
     except upload_task_store.TaskNotFound:
         app.logger.error("V1 KFB 上传收口时任务丢失（upload_id=%s）", upload_id)
-        _upload_release_quietly(reservation)
+        _upload_abandon_staging(upload_id, reservation)
         return jsonify(error="上传任务状态丢失，请重试",
                        code="upload_task_lost"), 500
     except Exception:
@@ -12762,16 +12789,15 @@ def _api_upload_zip(file, filename, safe, ident, reservation):
     upload_task_items 真实绑定读）、failures（item 级失败证据）。
     """
     upload_id = upload_task_store.new_task_id()
+    # 0072 生命周期：writer 启动前绑定（解压字节落盘前；受理前失败走
+    # 清理确认后释放）。
+    _upload_bind_reservation(reservation, upload_id)
     tmp_zip = slide_storage.staging_task_dir(
         upload_id, root=UPLOAD_DIR) / "upload.zip"
 
     def _abort_pre(payload, status):
-        """受理前失败：清任务暂存树 + 释放预占（无任务/无资产行）。"""
-        try:
-            slide_storage.remove_staging_tree(upload_id, root=UPLOAD_DIR)
-        except Exception:
-            app.logger.exception("V1 zip 上传受理前清理失败：%s", upload_id)
-        _upload_release_quietly(reservation)
+        """受理前失败：清暂存；确认后按持有者释放（0072）。"""
+        _upload_abandon_staging(upload_id, reservation)
         return payload, status
 
     # 计数流保存（不信任 Content-Length；超限即停并清理；P4-app：不再平铺
@@ -12835,13 +12861,9 @@ def _api_upload_zip(file, filename, safe, ident, reservation):
                 conn.close()
         except Exception:
             # 受理失败（事务原子回滚：无任务行/无绑定/无资产行）——清暂存
-            # + 释放预占，500 可重试（G7：intent 之前零提升）。
+            # 确认后释放（0072），500 可重试（G7：intent 之前零提升）。
             app.logger.exception("V1 zip 上传受理失败：%s", upload_id)
-            try:
-                slide_storage.remove_staging_tree(upload_id, root=UPLOAD_DIR)
-            except Exception:
-                pass
-            _upload_release_quietly(reservation)
+            _upload_abandon_staging(upload_id, reservation)
             return jsonify(error="上传受理失败，请重试"), 500
         items = upload_task_store.list_upload_task_items(upload_id)
         plans = _zip_item_plans(artifacts, items)
@@ -13040,14 +13062,48 @@ def _upload_v2_fail_closed_reservation(task):
 
 
 def _upload_v2_release_reservation_quietly(task):
-    """释放任务预占（取消/过期/确定性失败）。"""
+    """释放任务预占（取消/过期/确定性失败）。
+
+    生命周期（0072）：任务预约已绑定持有者——释放经
+    ``_upload_release_holder``（持有者上下文）；本函数仅保留给**清理已
+    确认**的收口路径（调用方先 _upload_v2_cleanup_part 成功）。"""
     rid = task.get("reservation_id")
     if not rid:
         return
+    _upload_release_holder(rid, task.get("upload_id"))
+
+
+def _upload_release_holder(reservation_id, upload_id):
+    """按持有者释放绑定预约（清理确认后的收口原语；失败记日志不回滚清理事实）。"""
+    if not reservation_id:
+        return
     try:
-        upload_guard.release_reservation(rid)
+        upload_guard.release_reservation(
+            reservation_id, expect_holder=("upload_task", upload_id))
     except Exception:
-        app.logger.exception("upload task reservation release failed: %s", rid)
+        app.logger.exception("upload task reservation release failed: %s",
+                             reservation_id)
+
+
+def _upload_bind_reservation(reservation, upload_id):
+    """V1：writer 启动前把准备期预约绑定到任务（0072；短事务）。
+
+    V1 各分支在生成 upload_id 之后、**写第一个字节之前**调用——未绑定
+    预约只存在于准备期。无预约（owner/免登录）no-op。"""
+    rid = (reservation or {}).get("reservation_id")
+    if not rid:
+        return
+    import psycopg.rows
+    conn = pg_store.connect()
+    conn.row_factory = psycopg.rows.dict_row
+    try:
+        with pg_store.transaction(conn):
+            with conn.cursor() as cur:
+                upload_guard.bind_reservation_locked(
+                    cur, rid, "upload_task", upload_id, "upload")
+    except Exception:
+        app.logger.exception("V1 预约绑定失败：%s/%s", rid, upload_id)
+        raise
 
 
 def _upload_v2_cleanup_part(task, *, hold_reservation=True):
@@ -13084,10 +13140,10 @@ def _upload_v2_cleanup_part(task, *, hold_reservation=True):
 
 
 def _upload_v2_cleanup_confirmed(task):
-    """清理确认成功后的收口：清待清理行 + 释放预占（先确认后释放）。
+    """清理确认成功后的收口：清待清理行 + 按持有者释放预占（先确认后释放）。
 
-    待清理行的 reservation_id 优先（任务行可能已换态）；release 失败只记
-    日志（预约行有 TTL 兜底，不回滚清理事实）。"""
+    待清理行的 reservation_id 优先（任务行可能已换态）；release 按持有者
+    上下文（0072）失败只记日志（清理事实优先，重试路径幂等）。"""
     rid = None
     try:
         rid = upload_task_store.clear_cleanup_pending(task["upload_id"])
@@ -13095,7 +13151,8 @@ def _upload_v2_cleanup_confirmed(task):
         app.logger.exception("cleanup pending 清除失败：%s",
                              task.get("upload_id"))
     release_target = {"reservation_id": rid or
-                      task.get("reservation_id")}
+                      task.get("reservation_id"),
+                      "upload_id": task.get("upload_id")}
     _upload_v2_release_reservation_quietly(release_target)
 
 
@@ -13385,8 +13442,10 @@ def _upload_v2_maintain(task):
             and task.get("expires_at") is not None
             and float(task["expires_at"]) <= now):
         task = upload_task_store.expire_task(task["upload_id"])
-        _upload_v2_cleanup_part(task)
-        _upload_v2_release_reservation_quietly(task)
+        # 0072：清理确认后才释放（此前为无条件释放——清理失败时会漏掉
+        # 容量责任；与 DELETE 取消路径同一合同）
+        if _upload_v2_cleanup_part(task):
+            _upload_v2_cleanup_confirmed(task)
         _upload_mark_staging_failed(task)
         return task
     if (task["state"] == upload_task_store.STATE_COMMITTING
@@ -13589,17 +13648,38 @@ def api_uploads_create():
                         reservation_id=(reservation or {}).get("reservation_id"),
                         slide_id=desc.slide_id,
                         conn=conn)
+                    # 0072 生命周期：任务行与预约绑定同一事务（writer 启动
+                    # 前完成绑定，不留未绑定窗口）。
+                    _rid = (reservation or {}).get("reservation_id")
+                    if _rid:
+                        with conn.cursor() as cur:
+                            upload_guard.bind_reservation_locked(
+                                cur, _rid, "upload_task", task["upload_id"],
+                                "upload")
             finally:
                 conn.close()
         else:
-            task = upload_task_store.create_task(
-                owner_user_id=(ident.get("user_id") or ""),
-                filename=filename.strip(),
-                safe_name=safe,
-                declared_size=declared_size,
-                chunk_size=upload_task_store.UPLOAD_CHUNK_SIZE,
-                sha256_expected=sha256_expected,
-                reservation_id=(reservation or {}).get("reservation_id"))
+            import psycopg.rows
+            conn = pg_store.connect()
+            conn.row_factory = psycopg.rows.dict_row
+            try:
+                with pg_store.transaction(conn):
+                    task = upload_task_store.create_task(
+                        owner_user_id=(ident.get("user_id") or ""),
+                        filename=filename.strip(),
+                        safe_name=safe,
+                        declared_size=declared_size,
+                        chunk_size=upload_task_store.UPLOAD_CHUNK_SIZE,
+                        sha256_expected=sha256_expected,
+                        reservation_id=(reservation or {}).get("reservation_id"))
+                    _rid = (reservation or {}).get("reservation_id")
+                    if _rid:
+                        with conn.cursor() as cur:
+                            upload_guard.bind_reservation_locked(
+                                cur, _rid, "upload_task", task["upload_id"],
+                                "upload")
+            finally:
+                conn.close()
     except upload_guard.DiskWatermarkExceeded as e:
         _upload_release_quietly(reservation)
         return jsonify(error="磁盘空间不足", code=e.code), 507
@@ -13854,14 +13934,14 @@ def api_uploads_commit(upload_id):
     is_convert = _needs_conversion(task["safe_name"])
 
     def _deterministic_fail(code, message, sha=None):
-        """确定性失败 → failed（§3.1）：预占释放，临时文件保留待 DELETE 清理。"""
+        """确定性失败 → failed（§3.1）：临时文件保留待 DELETE 清理，容量
+        责任随之保留（0072：终态≠清理终态——DELETE 清理确认后释放）。"""
         try:
             t = upload_task_store.fail_commit(upload_id, token, permanent=True,
                                               sha256_actual=sha)
         except upload_task_store.UploadTaskError:
             app.logger.exception("upload task fail_commit failed: %s", upload_id)
             return jsonify(error=message, code=code), 409
-        _upload_v2_release_reservation_quietly(t)
         return jsonify(error=message, code=code, state=t["state"]), 409
 
     def _rollback_temp(message, status=503):
@@ -13983,8 +14063,9 @@ def _upload_v2_commit_native(task, ident):
         except upload_task_store.UploadTaskError:
             app.logger.exception("upload task fail_active failed: %s", upload_id)
             return jsonify(error=message, code=code), 409
-        _upload_v2_cleanup_part(t)
-        _upload_v2_release_reservation_quietly(t)
+        # 0072：清理确认后释放（失败登记 pending 保留容量）
+        if _upload_v2_cleanup_part(t):
+            _upload_v2_cleanup_confirmed(t)
         _upload_mark_staging_failed(t)
         return jsonify(error=message, code=code, state=t["state"]), status
 
@@ -14149,6 +14230,9 @@ def _ingestion_state_body(job, *, queue_position=None):
         "format_ext": job["format_ext"],
         "viewer_ready": bool(job.get("viewer_ready")),
         "cleanup_status": job.get("cleanup_status"),
+        # 0072：本地清理进度独立暴露（对外文案反映清理状态，不以远端成功
+        # 证明本地已删除）。
+        "local_cleanup_status": job.get("local_cleanup_status"),
         "fail_code": job.get("fail_code"),
         "created_at": job.get("created_at"),
         "expires_at": job.get("waiting_expires_at")
@@ -14337,6 +14421,22 @@ def api_ingestion_parts_sign(job_id):
         return jsonify(
             error="任务当前状态 %s 不接受分块签名" % job["state"],
             code="ingestion_state_conflict"), 409
+    # 0072 生命周期（plan §4.3）：不给失去容量责任的任务签发新授权——
+    # quota 适用身份必须持有绑定有效（reserved）的本地预约；缺失/已结算
+    # 即不变量异常，fail-closed 拒签（恢复扫描/核账处置）。
+    if job["owner_role"] == "user" and (job["owner_user_id"] or "").strip():
+        rid = (job.get("local_reservation_id") or "").strip()
+        res = upload_guard.get_reservation(rid) if rid else None
+        if not rid or res is None or \
+                not upload_guard.reservation_holder_matches(
+                    res, "ingestion_job", job_id) or \
+                not upload_guard.reservation_holds_capacity(res):
+            app.logger.error(
+                "ingestion job %s 本地预约绑定无效（rid=%r state=%r）——拒签",
+                job_id, rid or None, (res or {}).get("state"))
+            return jsonify(
+                error="任务本地容量责任异常，暂停签发（待恢复/清理编排处置）",
+                code="local_reservation_invalid"), 409
     if pool is not None and cos_pool_store.admission_paused(pool):
         return jsonify(error="容量对账暂停，暂停签发",
                        code="cos_capacity_reconcile_required"), 503

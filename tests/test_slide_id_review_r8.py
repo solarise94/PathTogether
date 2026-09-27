@@ -30,48 +30,50 @@ PG_URI = os.environ["DATABASE_URL"]
 
 
 # --------------------------------------------------------------------------- #
-# P1（注入按审查记录指引改为两种串行胜者；断言语义与原反例一致：
-# 原 rid 保持 reserved / 账本 150 / pending 在）
+# P1（0072 生命周期改写，plan §D 注记——被替代的状态机合同：R8 时代的
+# 「回收先赢 → 登记侧重激活补账」已拆除。任务持有的容量**绑定后从不被
+# TTL 回收**，两种串行胜者收敛到同一终态：原 rid 保持 reserved /
+# 账本 150 / pending 在——「责任从未释放」取代「漏账后补账」。）
 # --------------------------------------------------------------------------- #
 def _scenario(winner):
     uid = user_store.create_user(
         "race-r8-%s@example.com" % winner, "pass1234pass1234",
         role="user")["user_id"]
-    rid = upload_guard.reserve_upload(uid, 100)["reservation_id"]
+    task_id = "upt-r8-%s" % winner
+    rid = upload_guard.reserve_upload(
+        uid, 100, holder_kind="upload_task", holder_id=task_id,
+        purpose="upload")["reservation_id"]
     with psycopg.connect(PG_URI, autocommit=True) as db:
         db.execute("UPDATE upload_reservations SET expires_at="
                    "now()-interval '1 second' WHERE reservation_id=%s",
                    (rid,))
     if winner == "pending":
-        # 登记先持配额行锁提交 → 回收的反连接跳过该预约（账本不减）。
-        upload_task_store.record_cleanup_pending(
-            "upt-r8-%s" % winner, rid, error="IO")
+        # 登记先（只落 pending 行，零财务副作用）→ 随后准入：绑定预约
+        # 不参加回收（账本不减）。
+        upload_task_store.record_cleanup_pending(task_id, rid, error="IO")
         upload_guard.reserve_upload(uid, 50)
     else:
-        # 回收先赢：预约被释放（账本先减到 0+50）→ 登记随后持锁发现
-        # released → 重激活该预约并补记容量责任（「随后才发现清理失败」
-        # 的时序：实际残留仍有容量责任）。
+        # 准入先：绑定预约不被回收（账本 100+50=150，不再先减后补）→
+        # 登记随后只落 pending 行。
         upload_guard.reserve_upload(uid, 50)
-        assert upload_guard.get_quota_row(uid)["reserved_bytes"] == 50
-        upload_task_store.record_cleanup_pending(
-            "upt-r8-%s" % winner, rid, error="IO")
+        assert upload_guard.get_quota_row(uid)["reserved_bytes"] == 150
+        upload_task_store.record_cleanup_pending(task_id, rid, error="IO")
     with psycopg.connect(PG_URI) as db:
         state = db.execute(
             "SELECT state FROM upload_reservations "
             "WHERE reservation_id=%s", (rid,)).fetchone()[0]
     assert state == "reserved"
     assert upload_guard.get_quota_row(uid)["reserved_bytes"] == 150
-    assert upload_task_store.get_cleanup_pending(
-        "upt-r8-%s" % winner) is not None
+    assert upload_task_store.get_cleanup_pending(task_id) is not None
 
 
 def test_pending_registration_wins_serialization():
-    """串行胜者①：登记先提交——回收跳过，账本 100+50。"""
+    """串行胜者①：登记先——绑定责任不被回收，账本 100+50。"""
     _scenario("pending")
 
 
 def test_reclaim_wins_then_registration_reactivates():
-    """串行胜者②：回收先赢——登记重激活预约并补记，账本恢复 150。"""
+    """串行胜者②：准入先——同一终态（绑定责任从未离开账本，无需重激活）。"""
     _scenario("admission")
 
 

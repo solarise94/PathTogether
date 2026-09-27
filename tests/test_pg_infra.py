@@ -309,6 +309,7 @@ def test_schema_migrations_recorded(conn):
         # R6 审查修复（问题 3）：暂存清理失败的持久待清理状态——清理
         # 确认后才释放容量预占。
         "0071_upload_cleanup_pending.sql",
+        "0072_upload_capacity_holder_binding.sql",
     ]
 
 

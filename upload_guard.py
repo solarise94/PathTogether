@@ -504,11 +504,27 @@ def renew_reservation(reservation_id, ttl_seconds=None):
         conn.close()
 
 
+def _lock_quota_row(cur, user_id):
+    """统一锁序（R9 复核修复 P1 的锁序审计）：全部预约状态路径按
+    ``upload_user_quotas 行锁 → upload_reservations 行锁`` 全序执行
+    （准入回收/待清理登记已是此序；release/consume 原为反序，存在与
+    准入回收同预约并发时的锁序倒置死锁面）。仅锁行不返回数据语义。"""
+    cur.execute(
+        "SELECT reserved_bytes FROM upload_user_quotas "
+        "WHERE user_id=%s FOR UPDATE", (user_id,))
+
+
 def release_reservation_locked(cur, reservation_id):
     """``release_reservation`` 的 cursor 变体（调用方事务内释放）。
 
     COS 摄取取消/失败收口需要与 job 状态转换同事务。幂等同 ``release_reservation``。
     """
+    cur.execute(
+        "SELECT user_id FROM upload_reservations WHERE reservation_id=%s",
+        (reservation_id,))
+    loc = cur.fetchone()
+    if loc is not None and loc["user_id"]:
+        _lock_quota_row(cur, loc["user_id"])  # 统一锁序（quota → 行）
     cur.execute(
         "SELECT user_id, reserved_bytes, state FROM "
         "upload_reservations WHERE reservation_id=%s FOR UPDATE",
@@ -567,6 +583,12 @@ def consume_reservation_locked(cur, reservation_id, actual_bytes):
     幂等：已 consumed 的行再次 consume 返回现状，不重复累计。
     """
     actual_bytes = int(actual_bytes)
+    cur.execute(
+        "SELECT user_id FROM upload_reservations WHERE reservation_id=%s",
+        (reservation_id,))
+    loc = cur.fetchone()
+    if loc is not None and loc["user_id"]:
+        _lock_quota_row(cur, loc["user_id"])  # 统一锁序（quota → 行）
     cur.execute(
         "SELECT user_id, reserved_bytes, state FROM "
         "upload_reservations WHERE reservation_id=%s FOR UPDATE",

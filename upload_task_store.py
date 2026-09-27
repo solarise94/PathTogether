@@ -895,32 +895,40 @@ def record_cleanup_pending(upload_id, reservation_id=None, *, error=None):
             with conn.cursor() as cur:
                 rid = (reservation_id or "").strip() or None
                 if rid:
+                    # 首查只定位 user_id（行上 user_id 不可变，无 TOCTOU）；
+                    # 状态判定**不以本快照为准**（R9 复核修复 P1：锁前读到
+                    # 的 reserved/released 在取锁后可能已被并发回收或重激活）。
                     cur.execute(
-                        "SELECT user_id, state, reserved_bytes "
-                        "FROM upload_reservations WHERE reservation_id=%s",
-                        (rid,))
-                    rrow = cur.fetchone()
-                    if rrow is not None and rrow["user_id"]:
-                        # 配额行锁：与准入回收/释放同协议（串行化窗口）
+                        "SELECT user_id FROM upload_reservations "
+                        "WHERE reservation_id=%s", (rid,))
+                    loc = cur.fetchone()
+                    if loc is not None and loc["user_id"]:
+                        # 配额行锁：与准入回收/释放/转实占同协议同序
+                        #（quota 行 → reservation 行）。
                         cur.execute(
                             "SELECT reserved_bytes FROM upload_user_quotas "
                             "WHERE user_id=%s FOR UPDATE",
-                            (rrow["user_id"],))
-                        if cur.fetchone() is not None \
-                                and rrow["state"] == "released":
-                            cur.execute(
-                                "UPDATE upload_reservations "
-                                "SET state='reserved', settled_at=NULL, "
-                                "settled_bytes=NULL, "
-                                "expires_at=now() + interval '30 days', "
-                                "updated_at=now() "
-                                "WHERE reservation_id=%s", (rid,))
+                            (loc["user_id"],))
+                        # 锁内权威重读 + CAS 转换：仅 released→reserved 实际
+                        # 转换成功（RETURNING 行）才补记，一次且仅一次；
+                        # 并发回收（锁前快照是 reserved）在此被正确收账，
+                        # 并发重激活（快照是 released）在此 CAS 落空不重复。
+                        cur.execute(
+                            "UPDATE upload_reservations "
+                            "SET state='reserved', settled_at=NULL, "
+                            "settled_bytes=NULL, "
+                            "expires_at=now() + interval '30 days', "
+                            "updated_at=now() "
+                            "WHERE reservation_id=%s AND state='released' "
+                            "RETURNING reserved_bytes", (rid,))
+                        row = cur.fetchone()
+                        if row is not None:
                             cur.execute(
                                 "UPDATE upload_user_quotas SET "
                                 "reserved_bytes = reserved_bytes + %s, "
                                 "updated_at=now() WHERE user_id=%s",
-                                (int(rrow["reserved_bytes"] or 0),
-                                 rrow["user_id"]))
+                                (int(row["reserved_bytes"] or 0),
+                                 loc["user_id"]))
                 cur.execute(
                     "INSERT INTO upload_cleanup_pending "
                     "(upload_id, reservation_id, attempts, last_error) "

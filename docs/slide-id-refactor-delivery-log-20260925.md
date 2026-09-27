@@ -346,3 +346,12 @@ d9cb3f3 复核（用户）发现 2 项（P1+P2），2 反例亲自复现（先�
 | P2 | share_states/claim_grants 冻结侧按 token 摘要排序、重读侧按原文排序，摘要序≠原文序——未变授权被误报漂移（no-go 假阳性） | 两侧统一规范化排序键（`_ss_sort_key`/`_cg_sort_key`：token/控制位/主体/permissions 全键）后再比较；主体与权限变化的检测保持 |
 
 **R8 门禁**：双串行胜者+审查方 P2 共 3 回归绿；四组回归文件合计 36 绿；test:js 562；全量 pytest 终态见提交信息（唯一允许失败=admin 0.4.13）。
+
+## R9 复核处置（2026-09-27）：重激活并发缺陷闭环
+
+f4e9e76 复核（用户）发现 1 项 P1（2 反例同一根因：登记在取配额行锁前读预约状态、取锁后不重读，重激活无 CAS——①锁前读到 reserved、锁内被并发回收→跳过补账漏账；②两登记方都锁前读到 released→各补记一次重复记账）。修复：
+
+1. `record_cleanup_pending`：首查只定位 user_id（行上不可变，无 TOCTOU）；配额行锁内以 **CAS UPDATE（state='released'→reserved）RETURNING reserved_bytes** 作权威重读——仅实际转换成功的行补记，一次且仅一次（并发回收在此正确收账、并发重激活在此 CAS 落空不重复）。
+2. 锁序审计与统一（审查要求）：准入回收/待清理登记为 quota 行→reservation 行；release/consume 原为反序（reservation 行→quota）——与准入回收同预约并发时存在锁序倒置死锁面。统一为 **quota 行锁 → reservation 行锁** 全序（`_lock_quota_row` helper；user_id 先无锁定位）。renew 只锁预约行不动配额，无倒置面。
+
+**R9 门禁**：2 审查反例转绿（游标代理注入原样入仓 `tests/test_slide_id_review_r9.py`）；五组回归文件合计 38 绿；test:js 562；全量 pytest 终态见提交信息（唯一允许失败=admin 0.4.13）。

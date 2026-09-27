@@ -848,6 +848,49 @@ def consume_reservation(reservation_id, actual_bytes, *, expect_holder=None):
         conn.close()
 
 
+def record_reconciled_residual_locked(cur, user_id, nbytes, *,
+                                      holder_kind=None, holder_id=None,
+                                      purpose=None, rid=None):
+    """维护专用补记入口（R12 §3.5；**仅核账脚本调用，不进 Web API**）。
+
+    与正常准入共享底层唯一财务记账实现（INSERT reservation + reserved_bytes
+    累加），但**不执行**「新上传」的额度/并发/每小时判定——既有字节不是
+    新上传申请；配额不足也按实补记（quota_bytes 不变，超额由正常准入的
+    guard 继续拒绝）。``origin='reconcile'``（不计每小时准入数）；可同时
+    绑定持有者（与任务/pending 指针同一事务更新）。旧 released 行保持
+    不变（新责任是新行）。返回 ``_reservation_out`` dict。
+
+    调用前提（脚本保证）：受信维护计划、任务已停止、路径与字节证据已
+    复核。正常 ``reserve_upload`` 无法经任何参数走到本语义（公开 reserve
+    不接受 origin='reconcile'）。
+    """
+    nbytes = int(nbytes)
+    if nbytes <= 0:
+        raise ValueError("补记字节数需为正整数")
+    holder = _validate_holder(holder_kind, holder_id, purpose)
+    rid = rid or ("upr_" + secrets.token_hex(12))
+    cur.execute(
+        "INSERT INTO upload_user_quotas (user_id, quota_bytes) "
+        "VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING",
+        (user_id, UPLOAD_USER_QUOTA_BYTES))
+    _lock_quota_row(cur, user_id)
+    cur.execute(
+        "INSERT INTO upload_reservations "
+        "(reservation_id, user_id, reserved_bytes, state, reserved_at, "
+        " expires_at, holder_kind, holder_id, purpose, origin) "
+        "VALUES (%s, %s, %s, 'reserved', now(), "
+        " now() + make_interval(secs => %s), %s, %s, %s, 'reconcile')",
+        (rid, user_id, nbytes, UPLOAD_RESERVATION_TTL_SECONDS,
+         holder[0] if holder else None, holder[1] if holder else None,
+         holder[2] if holder else None))
+    cur.execute(
+        "UPDATE upload_user_quotas SET reserved_bytes = reserved_bytes + %s, "
+        "updated_at=now() WHERE user_id=%s", (nbytes, user_id))
+    cur.execute(
+        "SELECT * FROM upload_reservations WHERE reservation_id=%s", (rid,))
+    return _reservation_out(cur.fetchone())
+
+
 def add_used_bytes_locked(cur, user_id, nbytes):
     """转换产出等额外入账的 cursor 变体（调用方事务内直接累加 used_bytes）。
 

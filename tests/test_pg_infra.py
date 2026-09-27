@@ -310,6 +310,7 @@ def test_schema_migrations_recorded(conn):
         # 确认后才释放容量预占。
         "0071_upload_cleanup_pending.sql",
         "0072_upload_capacity_holder_binding.sql",
+        "0073_upload_capacity_repair_receipts.sql",
     ]
 
 

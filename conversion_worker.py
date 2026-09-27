@@ -38,6 +38,7 @@ if _REPO not in sys.path:
 import conversion_store  # noqa: E402
 import share_store  # noqa: E402
 import slide_io  # noqa: E402
+import task_storage_lock  # noqa: E402
 import slide_publish  # noqa: E402
 import slide_storage  # noqa: E402
 import slide_store  # noqa: E402
@@ -245,7 +246,30 @@ def process_job(job, upload_dir, worker_id):
                                             root=upload_dir)
     work = staging_gen / PRODUCT_ENTRY
     kfb_manifest = staging_gen / (PRODUCT_ENTRY + ".manifest.json")
+    cleanup_later = []
+    try:
+        with task_storage_lock.task_storage_lock("conversion_job", job["id"]):
+            return _process_job_critical_section(
+                job, worker_id, source, canonical, generation, staging_gen,
+                work, kfb_manifest, upload_dir, cleanup_later)
+    finally:
+        # 锁外执行「整树清场」（_cleanup_work_dirs 删全部代次——若在锁内
+        # 由调用链再入锁会自等待；此处调用方已退出锁）
+        for jid in cleanup_later:
+            try:
+                _cleanup_work_dirs(jid, upload_dir)
+            except Exception:  # noqa: BLE001
+                pass
 
+
+def _process_job_critical_section(job, worker_id, source, canonical,
+                                  generation, staging_gen, work,
+                                  kfb_manifest, upload_dir, cleanup_later):
+    """转换临界区（**调用方已持 conversion_job 存储锁**；R12 内部操作）。
+
+    work/manifest 写、断点重转的 _discard_work、发布搬入与 intent/结算
+    均在锁内；成功路径的整树清场延迟到锁外（cleanup_later）。"""
+    slide_id = job.get("slide_id") or ""
     def on_progress(*_a):
         conversion_store.heartbeat(job["id"], worker_id)
 
@@ -277,7 +301,7 @@ def process_job(job, upload_dir, worker_id):
             owner_user_id=(job.get("owner_user_id") or "") or None,
             upload_root=upload_dir)
         _associate_target_project(job, slide_id)
-        _cleanup_work_dirs(job["id"], upload_dir)
+        cleanup_later.append(job["id"])  # 锁外清场（R12 防自等待）
         return True
     except conversion_store.StateConflict:
         # 租约失守/代次失效：他人重领会收口；本次不碰任务状态（fail_job 会

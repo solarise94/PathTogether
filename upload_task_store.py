@@ -908,7 +908,12 @@ def record_cleanup_pending(upload_id, reservation_id=None, *, error=None):
 
 def clear_cleanup_pending(upload_id):
     """清理确认成功 → 删待清理行。返回被删行的 reservation_id（供调用方
-    在清理确认后释放预占），无行返回 None。"""
+    在清理确认后释放预占），无行返回 None。
+
+    R12 §3.3：**释放与删行必须同事务**——正式入口是
+    ``confirm_cleanup_and_release``（task → quota → reservation 单事务，
+    释放责任与删 pending 原子提交）。本函数只保留给只删行的观测路径。
+    """
     conn = _pg_connect()
     try:
         with pg_store.transaction(conn):
@@ -920,6 +925,44 @@ def clear_cleanup_pending(upload_id):
                 # _pg_connect 是 dict_row——按列名取（R7 复核修复 P2：
                 # row[0] 在有行时必抛 KeyError，事务回滚、pending 行残留）。
                 return (row["reservation_id"] if row else None)
+    finally:
+        conn.close()
+
+
+def confirm_cleanup_and_release(upload_id, *, fallback_reservation_id=None):
+    """清理确认收口（R12 §3.3 单事务）：释放预约 + 删 pending 行同一事务。
+
+    锁序：upload_tasks 行 → quota 行 → reservation 行（→ pending 行删除）。
+    持有者语境（upload_task）：绑定预约只经清理确认释放。幂等：pending
+    无行且预约已非 reserved → no-op；DB 失败整笔回滚（pending 保留，
+    不出现「删了重试记录却没释放/反之」的半收口）。返回释放的
+    reservation_id（未释放返回 None）。
+    """
+    import upload_guard
+    conn = _pg_connect()
+    try:
+        with pg_store.transaction(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT reservation_id FROM upload_tasks "
+                    "WHERE upload_id=%s FOR UPDATE", (str(upload_id),))
+                task = cur.fetchone()
+                cur.execute(
+                    "SELECT reservation_id FROM upload_cleanup_pending "
+                    "WHERE upload_id=%s FOR UPDATE", (str(upload_id),))
+                pending = cur.fetchone()
+                rid = ((pending["reservation_id"] if pending else None)
+                       or fallback_reservation_id
+                       or (task["reservation_id"] if task else None))
+                if not rid:
+                    return None
+                out = upload_guard.release_reservation_locked(
+                    cur, rid, expect_holder=("upload_task", str(upload_id)))
+                if pending is not None:
+                    cur.execute(
+                        "DELETE FROM upload_cleanup_pending "
+                        "WHERE upload_id=%s", (str(upload_id),))
+                return rid if out.get("state") == "released" else None
     finally:
         conn.close()
 

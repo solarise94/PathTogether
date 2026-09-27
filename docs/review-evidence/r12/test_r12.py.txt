@@ -1,0 +1,87 @@
+import os
+from pathlib import Path
+
+import psycopg
+import pytest
+import ingestion_store as ist
+import upload_guard as guard
+import slide_storage
+import cos_ingest_worker as worker
+from test_cos_ingest_worker import _env
+from test_capacity_lifecycle_cos import _worker_env, _mk_uploading
+from test_reconcile_upload_capacity import recon, _uid, _task, _q
+
+
+def test_cancel_does_not_release_before_claimed_writer_stops(monkeypatch, pg_uri):
+    job, rid, uid = _mk_uploading('r12_writer')
+    jid = job['job_id']
+    with psycopg.connect(pg_uri, autocommit=True) as db:
+        db.execute("UPDATE ingestion_jobs SET state='downloading', object_key='k', cos_version_id='v' WHERE job_id=%s", (jid,))
+    original = worker.staging_data_path
+    paths = []
+    def cancel_after_claim(*args, **kwargs):
+        p = original(*args, **kwargs)
+        paths.append(p)
+        # Real separate DB transaction after the worker has claimed its job,
+        # before that worker creates its first file. No fake DB state/clock.
+        ist.cancel_job(jid)
+        return p
+    monkeypatch.setattr(worker, 'staging_data_path', cancel_after_claim)
+    monkeypatch.setattr(worker, '_fetch_range', lambda cos, key, version, start, end, total, **kw: (b'x'*(end-start+1), end-start+1))
+    try:
+        worker.process_downloading(cos=object(), state={})
+    except ist.IngestionStateError:
+        # DB correctly rejects late progress, but the filesystem write has
+        # already happened. Verify the physical/accounting invariant below.
+        pass
+    after = ist.get_job(jid)
+    assert after['state'] == ist.CANCELLED
+    assert not (paths[0].exists() and guard.get_reservation(rid)['state'] == 'released'), (str(paths[0]), after['local_cleanup_status'], _q(uid))
+
+
+def test_reattach_does_not_leave_active_job_scheduled_for_cleanup(pg_uri, tmp_path):
+    job, rid, uid = _mk_uploading('r12_reattach')
+    jid = job['job_id']
+    guard.release_reservation(rid, expect_holder=('ingestion_job', jid))
+    with psycopg.connect(pg_uri, autocommit=True) as db:
+        db.execute('UPDATE ingestion_jobs SET local_reservation_id=NULL WHERE job_id=%s', (jid,))
+    data = slide_storage.staging_dir(jid, '1') / 'data.svs'
+    data.parent.mkdir(parents=True)
+    data.write_bytes(b'x'*100)
+    assert recon.main(['--database-url', pg_uri, '--upload-dir', str(tmp_path), '--apply', '--reattach']) == 0
+    before = ist.get_job(jid)
+    assert before['state'] == ist.UPLOADING
+    ist.retry_local_cleanups()
+    after = ist.get_job(jid)
+    assert guard.reservation_holds_capacity(guard.get_reservation(after['local_reservation_id'])), (after['state'], after['local_cleanup_status'], data.exists(), _q(uid))
+
+
+def test_migration_binds_terminal_pending_responsibility(pg_uri, tmp_path):
+    uid = _uid('r12_terminal')
+    rid = guard.reserve_upload(uid, 100)['reservation_id']
+    tid = 'upt_r12_terminal'
+    _task(uid, tid, rid, state='failed')
+    data = slide_storage.staging_dir(tid, 'transfer') / 'data.svs'
+    data.parent.mkdir(parents=True)
+    data.write_bytes(b'x'*100)
+    with psycopg.connect(pg_uri, autocommit=True) as db:
+        db.execute("INSERT INTO upload_cleanup_pending(upload_id, reservation_id) VALUES(%s,%s)", (tid, rid))
+        db.execute("UPDATE upload_reservations SET expires_at=now()-interval '1 second' WHERE reservation_id=%s", (rid,))
+    rc = recon.main(['--database-url', pg_uri, '--upload-dir', str(tmp_path), '--apply'])
+    assert rc == 0
+    guard.reserve_upload(uid, 50)
+    assert guard.get_reservation(rid)['state'] == 'reserved', (data.exists(), _q(uid))
+
+
+def test_reconcile_existing_bytes_can_exceed_quota(pg_uri, tmp_path):
+    uid = _uid('r12_over')
+    tid = 'upt_r12_over'
+    _task(uid, tid, None)
+    guard.get_quota_row(uid)
+    with psycopg.connect(pg_uri, autocommit=True) as db:
+        db.execute('UPDATE upload_user_quotas SET quota_bytes=50 WHERE user_id=%s', (uid,))
+    data = slide_storage.staging_dir(tid, 'transfer') / 'data.svs'
+    data.parent.mkdir(parents=True)
+    data.write_bytes(b'x'*100)
+    assert recon.main(['--database-url', pg_uri, '--upload-dir', str(tmp_path), '--apply', '--reattach']) == 0
+    assert _q(uid) == (0, 100)

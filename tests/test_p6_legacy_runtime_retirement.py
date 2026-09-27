@@ -251,6 +251,9 @@ def test_old_form_committing_survives_recovery_scan(monkeypatch):
 # 4. .uploading-*.lock 收进任务 staging 目录（旧位零残留）
 # =========================================================================== #
 def test_chunk_lock_lives_in_staging_no_flat_residue():
+    """R12 修订：每任务写租约迁至任务存储锁（``.task-locks/``，暂存树外
+    稳定 inode）——staging 内不再有锁 sidecar；平铺旧位零产生；收口后
+    整树清理而**锁文件保留**（运行期不删，同任务 ID 不换锁）。"""
     c = _client()
     r = c.post("/api/uploads", json={"filename": "lock.tif",
                                      "declared_size": len(TIFF)})
@@ -259,23 +262,25 @@ def test_chunk_lock_lives_in_staging_no_flat_residue():
                % (uid, hashlib.sha256(TIFF).hexdigest()),
                data=TIFF, content_type="application/octet-stream")
     assert rr.status_code == 200
-    # 锁在新位生效（任务 staging 内）；平铺旧位零产生（.part/.lock 都不在根）
-    lock = slide_storage.staging_task_dir(uid, root=Path(UPLOAD_DIR)) \
-        / "chunk.lock"
+    import task_storage_lock
+    lock = task_storage_lock.task_lock_path(
+        "upload_task", uid, root=Path(UPLOAD_DIR))
     assert lock.is_file()
+    assert lock.parent.parent.name == ".task-locks"  # 暂存树外
+    assert not (slide_storage.staging_task_dir(
+        uid, root=Path(UPLOAD_DIR)) / "chunk.lock").exists()
     flat = [p.name for p in Path(UPLOAD_DIR).iterdir()
             if p.name.startswith(".uploading-")]
     assert flat == []
     part = app_mod._upload_v2_part_path(upload_task_store.get_task(uid))
     assert part.is_file() and part.parent.parent.parent.name == ".staging"
-    # 收口（commit）后整树清理（含锁）；根目录仍无任何 .uploading-*
     rc = c.post("/api/uploads/%s/commit" % uid)
     assert rc.status_code == 200, rc.get_data(as_text=True)
     assert not slide_storage.staging_task_dir(
         uid, root=Path(UPLOAD_DIR)).exists()
     assert [p.name for p in Path(UPLOAD_DIR).iterdir()
             if p.name.startswith(".uploading-")] == []
-
+    assert lock.is_file()  # 稳定 inode：清理暂存树不删除任务锁
 
 def test_chunk_lock_cleanup_on_cancel():
     c = _client()

@@ -439,3 +439,64 @@ COS 生命周期 10 例（invalid 处置/清理确认/重试/崩溃幂等/门禁
 **运行边界（不变）**：COS capability 保持 off；本方案完成不自动开启；
 生产审计/迁移/回滚按 runbook 独立门禁，部署晚间低峰窗口另行确认。
 调用点清单与锁图：[upload-capacity-lifecycle-inventory-20260927.md](upload-capacity-lifecycle-inventory-20260927.md)。
+
+## R12 处置（2026-09-28）：文件锁协议 + 维护核账合同（0073）
+
+审查（8d49fcb 复核，证据 docs/review-evidence/r12/）四项：P1 清理释放前
+未排除已领取任务的旧 writer（cleaned+released+残留）；P1 --reattach 恢复
+uploading 却保留清理标记（重试器删数据）；P1 终态 pending 只列报告、
+未绑定预约随后被 TTL 回收；P2 超额残留核账走正常准入抛 QuotaExceeded。
+按 [r12-capacity-lifecycle-fix-agent-plan-20260927.md]
+(r12-capacity-lifecycle-fix-agent-plan-20260927.md) S0–S5 连续执行：
+
+**S1 文件与清理统一协议（§3.1–3.3）**：
+- 新模块 `task_storage_lock`：`UPLOAD_DIR/.task-locks/<kind>/<task_id>.lock`
+  跨进程 flock（暂存树外稳定 inode、运行期不 unlink、超时≠成功、键白名单）。
+- writer 顺序：claim 事务提交 → 文件锁 → 锁内 DB 重验（state/generation/
+  owner/绑定预约；COS `_reverify_job_for_io`）→ 文件 I/O（fd 锁内关闭）→
+  checkpoint（DB fencing 原样）。清理顺序：终止短事务提交 → 文件锁 →
+  锁内重验清理资格 → 删树 → 短事务释放+cleaned → 释放锁。
+- 全 writer 收口：COS 下载/验证临界区（确定性失败=终态短事务+**锁外延迟
+  清理**，防 flock 自等待）；V2 PUT chunk 锁替换（旧 chunk.lock sidecar
+  拆除）；V1 native/ZIP 整段上锁；KFB 分段（upload 锁 + 源副本搬移经
+  `_stage_source_copy_locked`，conversion 锁嵌套固定序）；转换 worker
+  临界区（成功整树清场延迟锁外）；百度下载本地写在批次锁内。
+- `cancel/fail` 拆分为 `_terminate_*_tx`（纯短事务）+ 完整入口；
+  `_local_cleanup_finish` 锁化（资格重验 + 调度器 30s 锁等待上界）。
+- V1/V2 清理确认单事务化：`upload_task_store.confirm_cleanup_and_release`
+  （task → quota → reservation，释放与删 pending 同事务；收口失败**补登记
+  pending**，DELETE 端点按 pending 行决定 503——不以文件已删冒充收口）。
+
+**S2/S3 维护核账（§3.4/3.5/§4）**：
+- `upload_guard.record_reconciled_residual_locked`：维护专用补记（共享
+  财务 SQL、quota→reservation 锁序、origin='reconcile'；**不执行**新上传
+  的额度/并发/每小时判定；超额如实补记，额度不变）。
+- 0073 `upload_capacity_repair_receipts`（action_key 唯一回执；仅审计
+  去重，不存第二份余额）。
+- 核账工具重写：默认 dry-run 只读；`--plan-out` 冻结计划（schema/工具
+  版本/数据根/DB 前态/文件证据——硬链接按 inode 计量、扫描错误=
+  EvidenceError no-go 不低报 0）；`--apply --plan` 全量预检（计划自洽/
+  前态/文件证据，先过后用不边查边提交）→ 单事务应用+回执 → **应用后**
+  重扫输出。集合覆盖活跃任务、终态清理责任（upload_cleanup_pending/
+  local_cleanup）、反向悬挂 reserved、未知暂存目录；consumed 未解释/
+  跨 owner/holder/共享预算归因不明 → 阻断。`--reattach` 显式 exit 2。
+- 退出码 0/2/3 入测试；清理后重跑旧计划不重新制造责任（回执跳过）。
+
+**S4 验收（§6 矩阵）**：R12 四反例转绿（tests/test_slide_id_review_r12.py
+——用例 2 按 §6 规则改写为「补责任、保持停止、清理恰一次释放」并注明
+合同变更；1/3/4 断言原样语义、CLI 换新）；新增
+tests/test_r12_lifecycle_acceptance.py 6 例：两线程+Event 的「writer 在
+临界区内取消」（终止短事务不持文件锁提交、期间责任保留、清理等待后删树
+收口、最终无残留）；writer 自身失败无递归自锁；V2 PUT×DELETE 互斥
+（清理后无写入）；锁竞争超时≠成功 + 锁 inode 跨删树稳定 + 非法键拒绝；
+清理 DB 收口失败保 pending、恢复后恰一次释放。核账合同测试 12 例
+（tests/test_reconcile_upload_capacity.py 重写：冻结/应用/幂等/漂移
+no-go/dangling/未知目录/硬链接/超额/旧 --reattach exit 2）。
+
+**门禁**：§6 指定七组 60 绿；受影响 21 套 396 绿；全量 Python/JS/HP 见
+提交信息（唯一允许失败=admin 0.4.13 第三方未提交件）。
+
+**边界（不变）**：COS 保持 off；生产核账/迁移按 runbook 独立门禁——
+切换必须停写并停所有旧进程/子进程/清理器（旧 writer 不认识新文件锁、
+旧脚本不认识新核账合同，不能滚动混跑）；回滚须用理解同一合同的兼容
+版本或整套备份恢复。

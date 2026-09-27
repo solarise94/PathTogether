@@ -43,6 +43,7 @@ json/dual 后端 fail-closed：仅 postgres 后端可用（调用方保证）。
 """
 
 import json
+import os
 import secrets
 
 import psycopg
@@ -53,6 +54,7 @@ import pg_store
 import slide_publish
 import slide_store
 import slide_storage
+import task_storage_lock
 import upload_guard
 import upload_task_store
 
@@ -110,6 +112,11 @@ LOCAL_CLEANUP_NONE = "none"
 LOCAL_CLEANUP_PENDING = "pending"
 LOCAL_CLEANUP_CLEANED = "cleaned"
 LOCAL_CLEANUP_FAILED = "failed"
+
+#: 调度器清理重试的文件锁等待上界（秒）——writer 长期占锁时跳过本轮，
+#: 持久重试继续（R12 §3.2：超时不是删除成功）。
+_CLEANUP_LOCK_WAIT_SECONDS = float(
+    os.environ.get("COS_LOCAL_CLEANUP_LOCK_WAIT") or 30)
 
 
 class IngestionStateError(Exception):
@@ -1221,24 +1228,14 @@ def _terminate_local_reservation_invalid(cur, job, observed):
     return _norm_row(cur.fetchone())
 
 
-def cancel_job(job_id, *, reason_code="cancelled_by_user"):
-    """幂等取消（§4 cancel + 生命周期 0072 统一清理顺序）。
+def _terminate_cancel_tx(job_id, *, reason_code="cancelled_by_user"):
+    """取消的**短事务**段（R12 §3.2：终止与清理拆分）。
 
-    **提交互斥（review 740e823 P1-3）**：validating 且 commit intent 已
-    持久化 → CommitInProgress 拒绝——统一发布进行中，取消无法原子撤销
-    FS 包与资产行；落库后删除走既有切片删除合同。
-
-    顺序（plan §5「先持久化停止与清理责任，清理确认后释放」）：
-      1. 短事务锁 job：终态落库（cancelled）+ 远端清理责任（cleanup_
-         status=pending）+ **本地清理责任（local_cleanup_status=pending，
-         本地预约保持绑定+reserved——取消不先释放容量）** + staging
-         资产 CAS→failed；
-      2. 事务提交后清理 ``.staging/<job_id>/`` 暂存树；
-      3. 清理确认 → confirm_local_cleanup 释放本地预约（恰一次）；
-         失败 → record_local_cleanup_failure（容量与重试工作保留）。
-
-    pool_reserved 不动——远端清理确认后由 finalize_cleanup 释放（§6.2，
-    与本地清理分开收口）。
+    只做：锁 job → 互斥裁决（ready/completed 拒、commit-intent 拒、终态
+    幂等）→ cancelled 落库 + 远端/本地清理责任 pending + staging 资产
+    failed。**不触碰文件系统、不释放预约**——文件清理由
+    ``_local_cleanup_finish`` 在任务存储锁内执行（writer 可能仍在临界区，
+    此处不等待文件锁）。返回 (job, local_pending)。
     """
     conn = _connect()
     try:
@@ -1257,7 +1254,7 @@ def cancel_job(job_id, *, reason_code="cancelled_by_user"):
                         "本地提交进行中（commit intent 已持久化）——不可取消；"
                         "落库后如需删除走既有切片删除合同")
                 if job["state"] in TERMINAL_STATES:
-                    return _norm_row(job)  # 幂等
+                    return _norm_row(job), False  # 幂等
                 _require_transition(job, CANCELLED)
                 cleanup = (CLEANUP_PENDING
                            if job["pool_reserved_bytes"] > 0 or
@@ -1278,20 +1275,37 @@ def cancel_job(job_id, *, reason_code="cancelled_by_user"):
                               {"reason": reason_code})
                 cur.execute("SELECT * FROM ingestion_jobs WHERE job_id=%s",
                             (job_id,))
-                out = _norm_row(cur.fetchone())
+                return _norm_row(cur.fetchone()), local_pending
     finally:
         conn.close()
+
+
+def cancel_job(job_id, *, reason_code="cancelled_by_user"):
+    """幂等取消（§4 cancel + 生命周期 0072 + R12 文件锁协议）。
+
+    **提交互斥（review 740e823 P1-3）**：validating 且 commit intent 已
+    持久化 → CommitInProgress 拒绝。
+
+    顺序（R12 §3.2：短事务置终止 → 提交并释放 DB 锁 → 文件锁 → 锁内
+    重验清理资格 → 删树 → 短事务释放责任并完成清理）：
+      1. ``_terminate_cancel_tx``：终态 + 清理责任 pending（本地预约保持
+         绑定+reserved——取消不先释放容量）；
+      2. ``_local_cleanup_finish``：任务存储锁内等待旧 writer 退出、删
+         ``.staging/<job_id>/``、确认后恰一次释放本地预约。
+
+    pool_reserved 不动——远端清理确认后由 finalize_cleanup 释放（§6.2，
+    与本地清理分开收口）。
+    """
+    out, local_pending = _terminate_cancel_tx(job_id,
+                                              reason_code=reason_code)
     if local_pending:
         _local_cleanup_finish(job_id)
     return out
 
 
-def fail_job(job_id, generation, code):
-    """worker 终态失败（本地容量经清理确认后释放；远端清理转 pending）。
-
-    生命周期（0072）：同事务持久化失败终态 + 远端/本地清理责任（本地
-    预约保持绑定+reserved）；事务提交后清理暂存树——确认后释放，失败
-    登记重试。P4-b：staging 资产行同事务 CAS → failed。"""
+def _terminate_fail_tx(job_id, generation, code):
+    """失败终态的**短事务**段（R12 拆分；文件清理在锁内由
+    ``_local_cleanup_finish`` 执行）。返回 (job, local_pending)。"""
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -1302,7 +1316,7 @@ def fail_job(job_id, generation, code):
                 if job["worker_generation"] != int(generation):
                     raise StaleLease("generation 过期（fail 收口被拒）")
                 if job["state"] in TERMINAL_STATES:
-                    return _norm_row(job)  # 幂等（首次失败已清理暂存）
+                    return _norm_row(job), False  # 幂等（首次失败已清理暂存）
                 _require_transition(job, FAILED)
                 local_pending = _needs_local_cleanup(job)
                 _abandon_staging_asset(cur, job)
@@ -1317,9 +1331,18 @@ def fail_job(job_id, generation, code):
                 _append_event(cur, job_id, "failed", {"reason": code})
                 cur.execute("SELECT * FROM ingestion_jobs WHERE job_id=%s",
                             (job_id,))
-                out = _norm_row(cur.fetchone())
+                return _norm_row(cur.fetchone()), local_pending
     finally:
         conn.close()
+
+
+def fail_job(job_id, generation, code):
+    """worker 终态失败（本地容量经清理确认后释放；远端清理转 pending）。
+
+    生命周期（0072）：同事务持久化失败终态 + 远端/本地清理责任（本地
+    预约保持绑定+reserved）；文件清理在任务存储锁内等待旧 writer 退出后
+    执行（R12）。P4-b：staging 资产行同事务 CAS → failed。"""
+    out, local_pending = _terminate_fail_tx(job_id, generation, code)
     if local_pending:
         _local_cleanup_finish(job_id)
     return out
@@ -1635,24 +1658,49 @@ def record_cleanup_failure(job_id, cleanup_token, error):
 # --------------------------------------------------------------------------- #
 # 本地暂存清理编排（0072：清理确认后释放本地容量；与远端 cleanup_* 分列）
 # --------------------------------------------------------------------------- #
-def _local_cleanup_finish(job_id):
-    """终态任务的本地暂存清理编排（plan §5 统一顺序的第 2/3 步）。
+def _local_cleanup_finish(job_id, *, lock_timeout=None):
+    """终态任务的本地暂存清理编排（R12 §3.2 完整顺序）。
 
-    先 I/O（remove_staging_tree，幂等——树不存在为 no-op）后短事务收口：
-    成功 → ``confirm_local_cleanup``（释放本地预约，恰一次）；失败 →
-    ``record_local_cleanup_failure``（容量与重试工作保留，不吞异常责任）。
-    崩溃在物理删除后、收口前 → 重试重删 no-op 后收口，幂等。"""
+    任务存储锁（``.task-locks/ingestion_job/<job_id>.lock``，暂存树外的
+    稳定 inode）内完成「确认静止 → 删除 → DB 收口」：
+      1. 获取文件锁——旧 writer（已 claim、仍在临界区）先结束；等待期间
+         容量责任始终保留；
+      2. 锁内短事务重验清理资格（任务仍终态且 local_cleanup 仍
+         pending/failed——被并发恢复抢先置回活跃时不得删树）；
+      3. 删除 ``.staging/<job_id>/``（幂等）；
+      4. 短事务 ``confirm_local_cleanup``：按持有者释放预约 + cleaned。
+    失败 → ``record_local_cleanup_failure``（容量与重试工作保留）。
+    崩溃在删除后、收口前 → 重试重删 no-op 后收口。锁等待超时（默认无；
+    调用方可给 ``lock_timeout``）→ 保留 pending 返回 False，**不视为删除
+    成功**。"""
     try:
-        slide_storage.remove_staging_tree(job_id)
-    except Exception as exc:  # noqa: BLE001 - 登记为持久重试工作，不吞责任
-        try:
-            record_local_cleanup_failure(job_id, exc)
-        except Exception:  # noqa: BLE001
-            # 登记本身失败（DB 故障）：下一轮 retry_local_cleanups 扫描
-            # pending 行兜底；此处只留日志。
-            pass
+        cm = task_storage_lock.task_storage_lock(
+            "ingestion_job", job_id, timeout=lock_timeout)
+        with cm:
+            job = get_job(job_id)
+            if job is None:
+                return False
+            if job["state"] not in TERMINAL_STATES:
+                # 并发恢复/换持有者抢先：树属其生命周期，不删。
+                return False
+            status = job["local_cleanup_status"]
+            if status == LOCAL_CLEANUP_NONE:
+                return False
+            if status == LOCAL_CLEANUP_CLEANED:
+                return True  # 幂等
+            try:
+                slide_storage.remove_staging_tree(job_id)
+            except Exception as exc:  # noqa: BLE001 - 登记重试，不吞责任
+                try:
+                    record_local_cleanup_failure(job_id, exc)
+                except Exception:  # noqa: BLE001
+                    pass  # 下一轮 retry_local_cleanups 兜底
+                return False
+            confirm_local_cleanup(job_id)
+            return True
+    except task_storage_lock.TaskStorageLockTimeout:
+        # writer 仍在临界区：已接受清理、持久重试继续处理，不当删除成功。
         return False
-    return confirm_local_cleanup(job_id)
 
 
 def confirm_local_cleanup(job_id):
@@ -1736,8 +1784,9 @@ def record_local_cleanup_failure(job_id, error):
 def retry_local_cleanups(*, limit=20):
     """调度器步进：重试到点的本地清理（pending 且 next_retry 到期）。
 
-    每轮有界（limit）；成功确认释放、失败登记退避。返回本轮处理的
-    job_id 列表。"""
+    每轮有界（limit）；成功确认释放、失败登记退避。锁等待有界
+    （writer 长期占锁时本轮跳过、下轮再试，不当删除成功）。返回本轮
+    处理的 job_id 列表。"""
     conn = _connect()
     try:
         with conn.cursor() as cur:
@@ -1752,7 +1801,7 @@ def retry_local_cleanups(*, limit=20):
     finally:
         conn.close()
     for jid in ids:
-        _local_cleanup_finish(jid)
+        _local_cleanup_finish(jid, lock_timeout=_CLEANUP_LOCK_WAIT_SECONDS)
     return ids
 
 

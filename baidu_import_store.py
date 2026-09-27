@@ -52,6 +52,7 @@ from pathlib import Path
 
 import pg_store
 import slide_format_registry
+import task_storage_lock
 import upload_guard
 from baidu_adapter import AdapterError, get_adapter  # noqa: F401  (可注入)
 
@@ -1199,20 +1200,25 @@ def _phase_download(adapter, batch, item, staging_root, hooks):
                 item = _update_item(item["id"], {"stage": "downloading"},
                                     bid, token)
             staging_dir = Path(staging_root) / batch["id"]
-            try:
-                adapter.download_to(
-                    "%s/%s" % (batch["id"], item["name"]), staging_dir)
-            except AdapterError as exc:
-                _fail_item(item["id"], exc.code, bid, token)
-                return _get_item(item["id"])
-            spath = staging_dir / item["name"]
-            if not spath.is_file():
-                _fail_item(item["id"], "download_output_missing", bid, token)
-                return _get_item(item["id"])
-            digest = _sha256_file(spath)
-            if spath.stat().st_size != int(item["source_size"]):
-                _fail_item(item["id"], "size_mismatch", bid, token)
-                return _get_item(item["id"])
+            # R12：本地暂存写在批次存储锁内（UPLOAD_DIR/.task-locks/
+            # baidu_batch/<batch_id>.lock；与批次级清理互斥的统一协议）
+            with task_storage_lock.task_storage_lock(
+                    "baidu_batch", batch["id"]):
+                try:
+                    adapter.download_to(
+                        "%s/%s" % (batch["id"], item["name"]), staging_dir)
+                except AdapterError as exc:
+                    _fail_item(item["id"], exc.code, bid, token)
+                    return _get_item(item["id"])
+                spath = staging_dir / item["name"]
+                if not spath.is_file():
+                    _fail_item(item["id"], "download_output_missing",
+                               bid, token)
+                    return _get_item(item["id"])
+                digest = _sha256_file(spath)
+                if spath.stat().st_size != int(item["source_size"]):
+                    _fail_item(item["id"], "size_mismatch", bid, token)
+                    return _get_item(item["id"])
             item = _update_item(
                 item["id"], {"stage": "validating",
                              "staging_path": str(spath),

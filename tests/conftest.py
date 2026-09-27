@@ -219,6 +219,9 @@ _BUSINESS_TABLES = (
     # 0071 起：R6 审查修复——清理失败待重试行（无 FK，显式列出防跨用例
     # 残留挂起假 pending）
     "upload_cleanup_pending",
+    # 0073 起：R12 容量核账应用回执（无 FK，显式列出防跨用例残留回执
+    # 干扰幂等/计数断言）
+    "upload_capacity_repair_receipts",
 )
 
 @pytest.fixture(scope="session")

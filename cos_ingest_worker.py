@@ -75,6 +75,7 @@ import slide_io  # noqa: E402
 import slide_publish  # noqa: E402
 import slide_storage  # noqa: E402
 import slide_store  # noqa: E402
+import task_storage_lock  # noqa: E402
 import upload_guard  # noqa: E402
 
 _log = logging.getLogger("svs.cos_ingest")
@@ -579,8 +580,8 @@ def process_downloading(cos=None, state=None):
     """领取 DOWNLOADING：断点续传至读满 declared → 流式 SHA-256 → validating。
 
     P4-b（合同 §5.3）：暂存件落 ``.staging/<job_id>/<worker_generation>/
-    data.<ext>``（slide_storage.staging_dir；不再平铺 ``<job_id>.part``）——
-    重领换代后由 ``_adopt_staged_data`` 收养上一代断点件，续传语义不变：
+    data.<ext>``（slide_storage.staging_dir；不再平铺 ``<job_id>.part``）
+    ——重领换代后由 ``_adopt_staged_data`` 收养上一代断点件，续传语义不变：
 
     - checkpoint（download_checkpoint_json.next_offset）为已确认偏移；暂存件
       先 ftruncate 到该偏移，丢弃上次崩溃的未确认尾部（不删文件）；
@@ -591,6 +592,14 @@ def process_downloading(cos=None, state=None):
     - 网络错/坏响应：worker_download_retry 回队（checkpoint 回退到已确认
       offset），wire 记账先持久化再回队；
     - 同一 worker 跨轮续传用 holding_token（state['download_token']）。
+
+    R12 文件锁协议：claim 事务提交 → **任务存储锁**（暂存树外稳定
+    inode）→ 锁内短事务重验（state=downloading、generation 未变、配额
+    主体仍持有绑定预约）→ 文件 I/O（adopt/mkdir/ftruncate/pwrite，fd 在
+    释放锁前关闭）→ checkpoint 短事务（DB fencing 原样）→ 释放锁。清理
+    在同把锁内等待本函数退出后才删树。锁内的确定性失败只做终态短事务
+    （``_terminate_fail_tx``），**文件清理延迟到锁外**（fail_job 的编排
+    会再取同一把锁——持锁调用会自等待）。
     """
     cos = cos_client if cos is None else cos
     state = _STATE if state is None else state
@@ -612,11 +621,39 @@ def process_downloading(cos=None, state=None):
     directory = _ensure_upload_dir()
     data_path = staging_data_path(job_id, gen, job.get("format_ext"),
                                   root=directory)
+    cleanup_due = []
+    try:
+        return _downloading_critical_section(
+            cos, job, key, version_id, declared, budget, next_offset,
+            wire_total, directory, data_path, token, state, cleanup_due)
+    finally:
+        # 延迟收口（R12 §3.1）：终态短事务已在锁内提交，文件清理在
+        # **退出文件锁之后**执行——持锁调 fail_job 会再取同把锁自等待。
+        for jid in cleanup_due:
+            try:
+                ist._local_cleanup_finish(jid)
+            except Exception:  # noqa: BLE001
+                _log.exception("延迟本地清理失败（job=%s）", jid)
+
+
+def _downloading_critical_section(cos, job, key, version_id, declared,
+                                  budget, next_offset, wire_total, directory,
+                                  data_path, token, state, cleanup_due):
+    """下载临界区：取任务存储锁 → 锁内重验 → I/O → checkpoint（R12 §3.2）。
+
+    ``cleanup_due``：锁内确定性失败的文件清理延迟表（终态短事务已提交，
+    清理编排由调用方在**退出文件锁后**执行——持锁调用会自等待）。fd 在
+    释放锁前关闭。
+    """
+    job_id = job["job_id"]
+    gen = job["worker_generation"]
 
     def _fail(code):
         state.pop("download_token", None)
         try:
-            ist.fail_job(job_id, gen, code)  # 终态收口内含暂存树清理
+            # 锁内只做终态短事务（_terminate_fail_tx）；文件清理延迟到锁外
+            ist._terminate_fail_tx(job_id, gen, code)
+            cleanup_due.append(job_id)
         except ist.StaleLease:
             pass
         _log.warning("下载失败终态（job=%s code=%s）", job_id, code)
@@ -627,96 +664,128 @@ def process_downloading(cos=None, state=None):
             job_id, gen, downloaded_bytes=int(downloaded), checkpoint=cp,
             wire_delta=int(wire_delta), logical_delta=int(logical_delta))
 
-    if not key or not version_id:
-        _fail("source_not_pinned")
-        return None
-    if not data_path.exists() and next_offset > 0:
-        # 换代重领：收养上一代断点件（进度权威在 checkpoint，不在文件名）。
-        _adopt_staged_data(job_id, gen, job.get("format_ext"), root=directory)
-    if data_path.exists():
-        fd = os.open(data_path, os.O_RDWR)
-    else:
-        # 文件丢失：已确认字节无从保证，归零重下（预算已有 wire 记账）。
-        next_offset = 0
-        data_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(data_path, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        os.ftruncate(fd, next_offset)  # 丢弃未确认尾部，checkpoint 为权威
-        if next_offset < declared and wire_total >= budget:
-            # 剩余字节已不可能在预算内取回（任何请求都会新增 wire）。
-            _fail("download_budget_exceeded")
+    with task_storage_lock.task_storage_lock("ingestion_job", job_id):
+        if not _reverify_job_for_io(job_id, gen, ist.DOWNLOADING):
+            return None  # 晚到 writer：清理/换代/不变量处置先赢——重验退出
+        if not key or not version_id:
+            _fail("source_not_pinned")
             return None
-        chunks_done = 0
-        while next_offset < declared:
-            if chunks_done >= MAX_CHUNKS_PER_INVOCATION:
-                # 单次到限：持久化已含块尾，释放租约下轮续传（防长跑失租）。
-                _release_lease(job_id, token, state)
-                return job_id
-            req_end = min(next_offset + DOWNLOAD_CHUNK_BYTES, declared) - 1
-            try:
-                data, wire_added = _fetch_range(
-                    cos, key, version_id, next_offset, req_end, declared,
-                    wire_cap=max(0, budget - wire_total))
-            except cos_client.CosConfigMissing:
-                _release_lease(job_id, token, state)
-                _log.warning("COS 配置缺失，downloading 空转（job=%s）", job_id)
-                return None
-            except cos_client.CosClientError as exc:
-                # 网络错：回队重试（不删文件；checkpoint 停在已确认 offset）。
-                _log.warning("GET 网络错误，回队重试（job=%s）：%s", job_id, exc)
-                try:
-                    ist.worker_download_retry(job_id, gen)
-                except ist.StaleLease:
-                    pass
-                _release_lease(job_id, token, state)
-                return job_id
-            wire_total += wire_added
-            if data is None:
-                # 200/错 Range/早 EOF：计入 wire、不采数据。预算已烧尽时任何
-                # 后续请求都只可能更超——直接硬停（防不可满足的无限重试）。
-                try:
-                    _persist(next_offset,
-                             {"next_offset": next_offset}, wire_added, 0)
-                    if wire_total >= budget:
-                        _fail("download_budget_exceeded")
-                        return None
-                    ist.worker_download_retry(job_id, gen)
-                except ist.StaleLease:
-                    return None
-                _release_lease(job_id, token, state)
-                return job_id
-            os.pwrite(fd, data, next_offset)
-            next_offset += len(data)
-            chunks_done += 1
-            try:
-                _persist(next_offset, {"next_offset": next_offset},
-                         wire_added, len(data))
-            except ist.StaleLease:
-                return None  # 已写字节在下次领取时被 ftruncate 收口
-            if wire_total > budget:
+        if not data_path.exists() and next_offset > 0:
+            # 换代重领：收养上一代断点件（进度权威在 checkpoint，不在文件名）。
+            _adopt_staged_data(job_id, gen, job.get("format_ext"),
+                               root=directory)
+        if data_path.exists():
+            fd = os.open(data_path, os.O_RDWR)
+        else:
+            # 文件丢失：已确认字节无从保证，归零重下（预算已有 wire 记账）。
+            next_offset = 0
+            data_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(data_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            os.ftruncate(fd, next_offset)  # 丢弃未确认尾部，checkpoint 为权威
+            if next_offset < declared and wire_total >= budget:
+                # 剩余字节已不可能在预算内取回（任何请求都会新增 wire）。
                 _fail("download_budget_exceeded")
                 return None
-        # 读满 declared：流式 SHA-256（本地权威，§3.3）后转 validating。
-        h = hashlib.sha256()
-        offset = 0
-        while True:
-            buf = os.pread(fd, _IO_BUF_BYTES, offset)
-            if not buf:
-                break
-            h.update(buf)
-            offset += len(buf)
-        sha = h.hexdigest()
-        try:
-            _persist(next_offset,
-                     {"next_offset": next_offset, "sha256": sha}, 0, 0)
-            ist.worker_begin_validating(job_id, gen)
-        except ist.StaleLease:
-            return None
-        _log.info("下载完成（job=%s bytes=%d）", job_id, next_offset)
-        _release_lease(job_id, token, state)
-        return job_id
-    finally:
-        os.close(fd)
+            chunks_done = 0
+            while next_offset < declared:
+                if chunks_done >= MAX_CHUNKS_PER_INVOCATION:
+                    # 单次到限：持久化已含块尾，释放租约下轮续传（防长跑失租）。
+                    _release_lease(job_id, token, state)
+                    return job_id
+                req_end = min(next_offset + DOWNLOAD_CHUNK_BYTES,
+                              declared) - 1
+                try:
+                    data, wire_added = _fetch_range(
+                        cos, key, version_id, next_offset, req_end, declared,
+                        wire_cap=max(0, budget - wire_total))
+                except cos_client.CosConfigMissing:
+                    _release_lease(job_id, token, state)
+                    _log.warning("COS 配置缺失，downloading 空转（job=%s）",
+                                 job_id)
+                    return None
+                except cos_client.CosClientError as exc:
+                    # 网络错：回队重试（不删文件；checkpoint 停在已确认 offset）。
+                    _log.warning("GET 网络错误，回队重试（job=%s）：%s",
+                                 job_id, exc)
+                    try:
+                        ist.worker_download_retry(job_id, gen)
+                    except ist.StaleLease:
+                        pass
+                    _release_lease(job_id, token, state)
+                    return job_id
+                wire_total += wire_added
+                if data is None:
+                    # 200/错 Range/早 EOF：计入 wire、不采数据。预算已烧尽时
+                    # 任何后续请求都只可能更超——直接硬停（防不可满足的
+                    # 无限重试）。
+                    try:
+                        _persist(next_offset,
+                                 {"next_offset": next_offset}, wire_added, 0)
+                        if wire_total >= budget:
+                            _fail("download_budget_exceeded")
+                            return None
+                        ist.worker_download_retry(job_id, gen)
+                    except ist.StaleLease:
+                        return None
+                    _release_lease(job_id, token, state)
+                    return job_id
+                os.pwrite(fd, data, next_offset)
+                next_offset += len(data)
+                chunks_done += 1
+                try:
+                    _persist(next_offset, {"next_offset": next_offset},
+                             wire_added, len(data))
+                except ist.StaleLease:
+                    return None  # 已写字节在下次领取时被 ftruncate 收口
+                if wire_total > budget:
+                    _fail("download_budget_exceeded")
+                    return None
+            # 读满 declared：流式 SHA-256（本地权威，§3.3）后转 validating。
+            h = hashlib.sha256()
+            offset = 0
+            while True:
+                buf = os.pread(fd, _IO_BUF_BYTES, offset)
+                if not buf:
+                    break
+                h.update(buf)
+                offset += len(buf)
+            sha = h.hexdigest()
+            try:
+                _persist(next_offset,
+                         {"next_offset": next_offset, "sha256": sha}, 0, 0)
+                ist.worker_begin_validating(job_id, gen)
+            except ist.StaleLease:
+                return None
+            _log.info("下载完成（job=%s bytes=%d）", job_id, next_offset)
+            _release_lease(job_id, token, state)
+            return job_id
+        finally:
+            os.close(fd)  # fd 在释放文件锁之前关闭（R12 §3.1）
+
+
+def _reverify_job_for_io(job_id, generation, expected_state):
+    """文件锁内的执行资格重验（R12 §3.1：claim 时读过不算）。
+
+    重读任务行：state 须为 expected_state、worker_generation 未变；
+    配额主体（role=user）须仍持有绑定（ingestion_job）且 reserved 的本地
+    预约——清理/换代/不变量处置先赢时这里退出，不写文件。
+    """
+    job = ist.get_job(job_id)
+    if job is None or job["state"] != expected_state:
+        return False
+    if int(job["worker_generation"]) != int(generation):
+        return False
+    if job["owner_role"] == "user" and (job["owner_user_id"] or "").strip():
+        rid = (job.get("local_reservation_id") or "").strip()
+        if not rid:
+            return False
+        res = upload_guard.get_reservation(rid)
+        if not upload_guard.reservation_holds_capacity(res) or \
+                not upload_guard.reservation_holder_matches(
+                    res, "ingestion_job", job_id):
+            return False
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -727,17 +796,41 @@ def process_validating(cos=None, state=None):
 
     本地提升/metadata/归属终检/force-owner/name_unavailable 族已拆除——
     ID 目录无同名冲突（objects/<slide_id>/ 由预分配 ID 唯一化）；发布编排
-    在 slide_publish（经 ingestion 通道适配），本函数只做：
+    在 slide_publish（经 ingestion 通道适配）。
 
-      1. 定位暂存件：intent 在（崩溃恢复）→ 以 intent 记录的代次目录为准；
-         否则收养 ``.staging/<job_id>/<gen>/`` 下的断点件（下载代留下的）；
-      2. 恢复路径 sha 以 intent 为权威（不重算）；新路径重查水位 → 大小/
-         open_slide 校验 → sha（checkpoint 优先，缺失复算）；
-      3. 断点件搬入本代 generation 目录（fencing=本代 worker_generation），
-         以本代重新持久化 intent（证据字段不变，仅代次更新）；
-      4. slide_publish.publish_with_channel：FS 发布（no-clobber；目标已
-         存在且 manifest 吻合 → 只做 DB 收口）+ 结算（worker_settle_ready：
-         mark_ready + accounted_bytes + 内容 revision + consume 同事务）。
+    R12 文件锁协议：claim 提交 → 任务存储锁 → 锁内重验（state/generation/
+    绑定预约）→ 校验/搬入/发布（FS move 与结算）→ 暂存树清理与确认 →
+    释放锁。锁内确定性失败只做终态短事务，文件清理延迟到锁外。
+    """
+    state = _STATE if state is None else state
+    job = ist.claim_next_job_for_worker([ist.VALIDATING])
+    if job is None:
+        return None
+    cleanup_due = []
+    try:
+        return _validating_critical_section(job, state, cleanup_due)
+    finally:
+        # 延迟收口（R12 §3.1）：文件清理在退出文件锁之后执行（防自等待）
+        for jid in cleanup_due:
+            try:
+                ist._local_cleanup_finish(jid)
+            except Exception:  # noqa: BLE001
+                _log.exception("延迟本地清理失败（job=%s）", jid)
+
+
+def _validating_critical_section(job, state, cleanup_due):
+    """validating 临界区（**调用方保证未持锁**；内部自取任务存储锁）。
+
+    1. 定位暂存件：intent 在（崩溃恢复）→ 以 intent 记录的代次目录为准；
+       否则收养 ``.staging/<job_id>/<gen>/`` 下的断点件（下载代留下的）；
+    2. 恢复路径 sha 以 intent 为权威（不重算）；新路径重查水位 → 大小/
+       open_slide 校验 → sha（checkpoint 优先，缺失复算）；
+    3. 断点件搬入本代 generation 目录（fencing=本代 worker_generation），
+       以本代重新持久化 intent（证据字段不变，仅代次更新）；
+    4. slide_publish.publish_with_channel：FS 发布（no-clobber；目标已
+       存在且 manifest 吻合 → 只做 DB 收口）+ 结算（worker_settle_ready：
+       mark_ready + accounted_bytes + 内容 revision + consume 同事务）；
+    5. 结算后暂存树清理 + confirm_local_cleanup（同一锁内完成）。
 
     FS 发布先于 advisory 锁（P3 偏差 #1 顺序）在本 worker lease 模型下的
     重审结论：成立——validating+intent 是不可撤销提交段（取消被
@@ -745,9 +838,6 @@ def process_validating(cos=None, state=None):
     由 no-clobber+verify 幂等吸收、可见性只由结算事务的 asset_state CAS
     裁定（详见 ingestion_store.IngestionPublishChannel docstring）。
     """
-    job = ist.claim_next_job_for_worker([ist.VALIDATING])
-    if job is None:
-        return None
     job_id = job["job_id"]
     gen = job["worker_generation"]
     token = job["worker_lease_token"]
@@ -759,141 +849,149 @@ def process_validating(cos=None, state=None):
     entry = "data.%s" % ext
 
     def _fail(code):
+        state.pop("download_token", None)
         try:
-            ist.fail_job(job_id, gen, code)  # 终态收口内含暂存树清理
+            # 锁内只做终态短事务；文件清理延迟到锁外（防 flock 自等待）
+            ist._terminate_fail_tx(job_id, gen, code)
+            cleanup_due.append(job_id)
         except ist.StaleLease:
             pass
         _log.warning("validating 终态失败（job=%s code=%s）", job_id, code)
 
-    if not slide_id:
-        # 创建即绑定（P4-b）；无绑定=升级窗口旧行或不变量破坏，fail-closed。
-        _fail("slide_binding_missing")
-        return None
+    with task_storage_lock.task_storage_lock("ingestion_job", job_id):
+        if not _reverify_job_for_io(job_id, gen, ist.VALIDATING):
+            return None  # 晚到 writer：终态/换代/不变量处置先赢——重验退出
+        if not slide_id:
+            # 创建即绑定（P4-b）；无绑定=升级窗口旧行或不变量破坏，fail-closed。
+            _fail("slide_binding_missing")
+            return None
 
-    if intent:
-        # 崩溃恢复：sha 以 intent 为权威（提升前已算好），不重算 9.5GB。
-        sha = str(intent.get("sha256") or "")
-        src_gen = intent.get("generation")
-        staged = None
-        if src_gen not in (None, ""):
-            src = slide_storage.staging_dir(job_id, str(src_gen),
-                                            root=directory) / entry
-            if src.is_file():
-                staged = src
-        if staged is None:
-            # 兜底：断点件在下载代目录（intent 持久化与换代之间的窗口）——
-            # 位置不是权威证据（sha/slide_id 才是），按树内最新收养。
-            staged = _find_staged_data(job_id, root=directory)
-        if staged is None and \
-                not slide_storage.bundle_dir(slide_id, root=directory).exists():
-            # intent 在、staging 与目标包均缺失：理论不可达（发布原子 rename
-            # + intent 先于 FS），fail-closed 交人工。
-            _log.error("commit 恢复失败：staging 与目标包均缺失（job=%s）",
-                       job_id)
-            _fail("commit_recovery_failed")
-            return None
-        # 目标包已存在（FS 发布后崩溃）→ staged 为 None 也继续：publish 的
-        # 恢复分支按 manifest 核对后只做 DB 收口，不再触碰 staging。
-    else:
-        # 落盘（发布）前重查水位（§6.3：创建时和落盘前都查）。
-        try:
-            upload_guard.check_disk_watermark(directory, need_bytes=declared)
-        except upload_guard.DiskWatermarkExceeded as exc:
-            _release_lease(job_id, token, state)  # 瞬态：保持 validating 下轮再试
-            _log.warning("水位不足，validating 暂停（job=%s）：%s", job_id, exc)
-            return None
-        staged = _find_staged_data(job_id, root=directory)
-        if staged is None:
-            _fail("part_missing")
-            return None
-        if os.path.getsize(staged) != declared:
-            _fail("local_size_mismatch")
-            return None
-        try:
-            # open_slide 试开+关（app.py:_validate_slide_file 同口径；
-            # format_hint 用客户端文件名——暂存件扩展名不参与逻辑格式判定）。
-            opened = slide_io.open_slide(
-                staged, format_hint=(job.get("filename")
-                                     or job.get("safe_name") or entry))
-            try:
-                opened.close()
-            except Exception:  # noqa: BLE001
-                pass
-        except Exception as exc:  # noqa: BLE001
-            _fail("validation_failed")
-            _log.warning("open_slide 校验失败（job=%s）：%s", job_id,
-                         type(exc).__name__)
-            return None
-        sha = (job.get("download_checkpoint_json") or {}).get("sha256") or ""
-        if not sha:
-            sha = _sha256_file(staged)
-
-    # 统一发布：断点件搬入本代目录（staging 位置与 fencing 都以当代为准）。
-    gen_dir = slide_storage.staging_dir(job_id, gen, root=directory)
-    try:
-        if staged is not None:
-            gen_dir.mkdir(parents=True, exist_ok=True)
-            os.replace(staged, gen_dir / entry)
-        manifest = slide_publish.build_manifest(entry, declared, sha)
-        ist.worker_persist_commit_intent(job_id, gen, {
-            "task_ref": job_id,
-            "generation": gen,
-            "commit_token": str(gen),
-            "slide_id": slide_id,
-            "owner_user_id": ist.asset_owner_for_job(job),
-            "manifest": manifest,
-            "sha256": sha,
-            "accounted_bytes": declared,
-            "source_version": job.get("cos_version_id") or "",
-            "target": job.get("safe_name"),  # 展示快照（canonical 名退役）
-            "declared_size": declared})
-        _task_after, _settled = slide_publish.publish_with_channel(
-            job_id, gen, slide_id, ist.INGESTION_PUBLISH_CHANNEL,
-            manifest=manifest, upload_root=directory)
-    except ist.StaleLease:
-        return None  # 失租：新 worker 已接管（换代收养/恢复重跑），静默放弃
-    except ist.IngestionStateError as exc:
-        # persist 被拒：状态被并发推进（如取消先赢——intent 从未持久化成功）。
-        _log.warning("commit intent 持久化被拒（job=%s）：%s", job_id, exc)
-        return None
-    except slide_publish.PublishConflict as exc:
-        # 目标包已存在且 manifest/sha 不吻合：不变量破坏，fail-closed 不删
-        # 不猜——任务 failed 保留证据（intent/事件），滞留包交人工核对。
-        _log.error("发布证据冲突（fail-closed，job=%s slide=%s）：%s",
-                   job_id, slide_id, exc)
-        _fail("publish_conflict")
-        return None
-    except slide_publish.PublishError as exc:
-        if exc.deterministic:
-            _fail(exc.code)
+        if intent:
+            # 崩溃恢复：sha 以 intent 为权威（提升前已算好），不重算 9.5GB。
+            sha = str(intent.get("sha256") or "")
+            src_gen = intent.get("generation")
+            staged = None
+            if src_gen not in (None, ""):
+                src = slide_storage.staging_dir(job_id, str(src_gen),
+                                                root=directory) / entry
+                if src.is_file():
+                    staged = src
+            if staged is None:
+                # 兜底：断点件在下载代目录（intent 持久化与换代之间的窗口）——
+                # 位置不是权威证据（sha/slide_id 才是），按树内最新收养。
+                staged = _find_staged_data(job_id, root=directory)
+            if staged is None and \
+                    not slide_storage.bundle_dir(slide_id, root=directory).exists():
+                # intent 在、staging 与目标包均缺失：理论不可达（发布原子 rename
+                # + intent 先于 FS），fail-closed 交人工。
+                _log.error("commit 恢复失败：staging 与目标包均缺失（job=%s）",
+                           job_id)
+                _fail("commit_recovery_failed")
+                return None
+            # 目标包已存在（FS 发布后崩溃）→ staged 为 None 也继续：publish 的
+            # 恢复分支按 manifest 核对后只做 DB 收口，不再触碰 staging。
         else:
-            # 瞬态故障：保持 validating（intent 已持久化），恢复幂等重跑。
-            _release_lease(job_id, token, state)
-            _log.warning("发布临时故障，保持 validating（job=%s）：%s",
-                         job_id, exc)
-        return None
-    except upload_guard.ReservationInvalid:
-        # 预约失效发生在结算事务内（已回滚）：撤回已发布包再判失败——
-        # 不留 ready 文件、不漏账（consume 未发生）。
-        _log.warning("结算时预占已失效，撤回已发布包（job=%s）", job_id)
+            # 落盘（发布）前重查水位（§6.3：创建时和落盘前都查）。
+            try:
+                upload_guard.check_disk_watermark(directory, need_bytes=declared)
+            except upload_guard.DiskWatermarkExceeded as exc:
+                _release_lease(job_id, token, state)  # 瞬态：保持 validating 下轮再试
+                _log.warning("水位不足，validating 暂停（job=%s）：%s", job_id, exc)
+                return None
+            staged = _find_staged_data(job_id, root=directory)
+            if staged is None:
+                _fail("part_missing")
+                return None
+            if os.path.getsize(staged) != declared:
+                _fail("local_size_mismatch")
+                return None
+            try:
+                # open_slide 试开+关（app.py:_validate_slide_file 同口径；
+                # format_hint 用客户端文件名——暂存件扩展名不参与逻辑格式判定）。
+                opened = slide_io.open_slide(
+                    staged, format_hint=(job.get("filename")
+                                         or job.get("safe_name") or entry))
+                try:
+                    opened.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception as exc:  # noqa: BLE001
+                _fail("validation_failed")
+                _log.warning("open_slide 校验失败（job=%s）：%s", job_id,
+                             type(exc).__name__)
+                return None
+            sha = (job.get("download_checkpoint_json") or {}).get("sha256") or ""
+            if not sha:
+                sha = _sha256_file(staged)
+
+        # 统一发布：断点件搬入本代目录（staging 位置与 fencing 都以当代为准）。
+        gen_dir = slide_storage.staging_dir(job_id, gen, root=directory)
         try:
-            slide_storage.remove_bundle(slide_id, root=directory)
+            if staged is not None:
+                gen_dir.mkdir(parents=True, exist_ok=True)
+                os.replace(staged, gen_dir / entry)
+            manifest = slide_publish.build_manifest(entry, declared, sha)
+            ist.worker_persist_commit_intent(job_id, gen, {
+                "task_ref": job_id,
+                "generation": gen,
+                "commit_token": str(gen),
+                "slide_id": slide_id,
+                "owner_user_id": ist.asset_owner_for_job(job),
+                "manifest": manifest,
+                "sha256": sha,
+                "accounted_bytes": declared,
+                "source_version": job.get("cos_version_id") or "",
+                "target": job.get("safe_name"),  # 展示快照（canonical 名退役）
+                "declared_size": declared})
+            _task_after, _settled = slide_publish.publish_with_channel(
+                job_id, gen, slide_id, ist.INGESTION_PUBLISH_CHANNEL,
+                manifest=manifest, upload_root=directory)
+        except ist.StaleLease:
+            return None  # 失租：新 worker 已接管（换代收养/恢复重跑），静默放弃
+        except ist.IngestionStateError as exc:
+            # persist 被拒：状态被并发推进（如取消先赢——intent 从未持久化成功）。
+            _log.warning("commit intent 持久化被拒（job=%s）：%s", job_id, exc)
+            return None
+        except slide_publish.PublishConflict as exc:
+            # 目标包已存在且 manifest/sha 不吻合：不变量破坏，fail-closed 不删
+            # 不猜——任务 failed 保留证据（intent/事件），滞留包交人工核对。
+            _log.error("发布证据冲突（fail-closed，job=%s slide=%s）：%s",
+                       job_id, slide_id, exc)
+            _fail("publish_conflict")
+            return None
+        except slide_publish.PublishError as exc:
+            if exc.deterministic:
+                _fail(exc.code)
+            else:
+                # 瞬态故障：保持 validating（intent 已持久化），恢复幂等重跑。
+                _release_lease(job_id, token, state)
+                _log.warning("发布临时故障，保持 validating（job=%s）：%s",
+                             job_id, exc)
+            return None
+        except upload_guard.ReservationInvalid:
+            # 预约失效发生在结算事务内（已回滚）：撤回已发布包再判失败——
+            # 不留 ready 文件、不漏账（consume 未发生）。
+            _log.warning("结算时预占已失效，撤回已发布包（job=%s）", job_id)
+            try:
+                slide_storage.remove_bundle(slide_id, root=directory)
+            except Exception:  # noqa: BLE001
+                _log.exception("撤回已发布包失败（slide=%s）", slide_id)
+            _fail("reservation_expired")
+            return None
+        # 收口成功：清理任务暂存整树（同卷 rename 已带走本代目录；换代残件与
+        # 跨卷复制残件一并清掉——ID 包已在 objects/<slide_id>/ 独立存在）。
+        # 0072 生命周期：清理确认（结算时预约已 consumed，confirm 只落
+        # local_cleanup_status=cleaned；失败留 pending 由调度器重试）。
+        try:
+            slide_storage.remove_staging_tree(job_id, root=directory)
+            ist.confirm_local_cleanup(job_id)
         except Exception:  # noqa: BLE001
-            _log.exception("撤回已发布包失败（slide=%s）", slide_id)
-        _fail("reservation_expired")
-        return None
-    # 收口成功：清理任务暂存整树（同卷 rename 已带走本代目录；换代残件与
-    # 跨卷复制残件一并清掉——ID 包已在 objects/<slide_id>/ 独立存在）。
-    # 0072 生命周期：清理确认（结算时预约已 consumed，confirm 只落
-    # local_cleanup_status=cleaned；失败留 pending 由调度器重试）。
-    try:
-        slide_storage.remove_staging_tree(job_id, root=directory)
-        ist.confirm_local_cleanup(job_id)
-    except Exception:  # noqa: BLE001
-        _log.debug("暂存树清理失败（job=%s）", job_id, exc_info=True)
-    _log.info("统一发布完成（job=%s slide_id=%s）", job_id, slide_id)
-    _release_lease(job_id, token, state)
-    return job_id
+            _log.debug("暂存树清理失败（job=%s）", job_id, exc_info=True)
+        _log.info("统一发布完成（job=%s slide_id=%s）", job_id, slide_id)
+        _release_lease(job_id, token, state)
+        return job_id
+
+
 
 
 # --------------------------------------------------------------------------- #

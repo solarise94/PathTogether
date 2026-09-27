@@ -1,0 +1,78 @@
+FFFF                                                                     [100%]
+=================================== FAILURES ===================================
+___________ test_cancel_does_not_release_before_claimed_writer_stops ___________
+/tmp/slide-id-review-r12/test_r12.py:39: in test_cancel_does_not_release_before_claimed_writer_stops
+    assert not (paths[0].exists() and guard.get_reservation(rid)['state'] == 'released'), (str(paths[0]), after['local_cleanup_status'], _q(uid))
+E   AssertionError: ('/tmp/pytest-of-solarise/pytest-2/test_cancel_does_not_release_b0/.staging/inj_b8b65417bb85fb6b4269fc17/1/data.svs', 'cleaned', (0, 0))
+E   assert not (True and 'released' == 'released'
+E    +  where True = exists()
+E    +    where exists = PosixPath('/tmp/pytest-of-solarise/pytest-2/test_cancel_does_not_release_b0/.staging/inj_b8b65417bb85fb6b4269fc17/1/data.svs').exists
+E     
+E       released)
+________ test_reattach_does_not_leave_active_job_scheduled_for_cleanup _________
+/tmp/slide-id-review-r12/test_r12.py:56: in test_reattach_does_not_leave_active_job_scheduled_for_cleanup
+    assert guard.reservation_holds_capacity(guard.get_reservation(after['local_reservation_id'])), (after['state'], after['local_cleanup_status'], data.exists(), _q(uid))
+E   AssertionError: ('uploading', 'cleaned', False, (0, 0))
+E   assert False
+E    +  where False = <function reservation_holds_capacity at 0x70815f715380>({'reservation_id': 'upr_a9d6c76e5de83b837d78d876', 'user_id': 'usr_xvD1RXIp-rk', 'reserved_bytes': 100, 'state': 'released', ...})
+E    +    where <function reservation_holds_capacity at 0x70815f715380> = guard.reservation_holds_capacity
+E    +    and   {'reservation_id': 'upr_a9d6c76e5de83b837d78d876', 'user_id': 'usr_xvD1RXIp-rk', 'reserved_bytes': 100, 'state': 'released', ...} = <function get_reservation at 0x70815f715bc0>('upr_a9d6c76e5de83b837d78d876')
+E    +      where <function get_reservation at 0x70815f715bc0> = guard.get_reservation
+----------------------------- Captured stdout call -----------------------------
+{
+  "mode": "apply",
+  "items": [
+    {
+      "kind": "ingestion_job",
+      "id": "inj_ff37eccbff0cebe28d97c62a",
+      "verdict": "missing",
+      "action": "reattached:100 bytes"
+    }
+  ],
+  "over_quota": [],
+  "pending_work": {
+    "upload_cleanup_pending": [],
+    "ingestion_local_cleanup": []
+  }
+}
+_____________ test_migration_binds_terminal_pending_responsibility _____________
+/tmp/slide-id-review-r12/test_r12.py:73: in test_migration_binds_terminal_pending_responsibility
+    assert guard.get_reservation(rid)['state'] == 'reserved', (data.exists(), _q(uid))
+E   AssertionError: (True, (0, 50))
+E   assert 'released' == 'reserved'
+E     
+E     - reserved
+E     + released
+----------------------------- Captured stdout call -----------------------------
+{
+  "mode": "apply",
+  "items": [],
+  "over_quota": [],
+  "pending_work": {
+    "upload_cleanup_pending": [
+      {
+        "upload_id": "upt_r12_terminal",
+        "reservation_id": "upr_3bcafb6ad5928064155dd2ad",
+        "attempts": 0
+      }
+    ],
+    "ingestion_local_cleanup": []
+  }
+}
+________________ test_reconcile_existing_bytes_can_exceed_quota ________________
+/tmp/slide-id-review-r12/test_r12.py:86: in test_reconcile_existing_bytes_can_exceed_quota
+    assert recon.main(['--database-url', pg_uri, '--upload-dir', str(tmp_path), '--apply', '--reattach']) == 0
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+scripts/reconcile_upload_capacity.py:258: in main
+    action = apply_item(cur, kind, row, verdict,
+scripts/reconcile_upload_capacity.py:204: in apply_item
+    res = upload_guard.reserve_upload_locked(
+upload_guard.py:431: in reserve_upload_locked
+    raise QuotaExceeded(
+E   upload_guard.QuotaExceeded: 用户存储配额不足（quota=50, used=0, reserved=0, need=100）
+=========================== short test summary info ============================
+FAILED ../../../../../tmp/slide-id-review-r12/test_r12.py::test_cancel_does_not_release_before_claimed_writer_stops
+FAILED ../../../../../tmp/slide-id-review-r12/test_r12.py::test_reattach_does_not_leave_active_job_scheduled_for_cleanup
+FAILED ../../../../../tmp/slide-id-review-r12/test_r12.py::test_migration_binds_terminal_pending_responsibility
+FAILED ../../../../../tmp/slide-id-review-r12/test_r12.py::test_reconcile_existing_bytes_can_exceed_quota
+4 failed in 0.85s

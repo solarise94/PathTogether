@@ -47,6 +47,22 @@ import argparse
 import hashlib
 
 
+def _ss_sort_key(d):
+    """share_states 规范化排序键（R8 复核修复 P2：冻结侧按 token 摘要排、
+    重读侧按原文排——摘要序≠原文序，未重排直接比较会把未变授权误报为
+    漂移。两侧统一按本键排序后再比较）。"""
+    exp = d.get("expires_at")
+    return (d.get("token") or "", bool(d.get("revoked")),
+            (float(exp) if exp is not None else -1.0),
+            tuple(d.get("permissions") or []))
+
+
+def _cg_sort_key(d):
+    """claim_grants 规范化排序键（同 _ss_sort_key 的口径）。"""
+    return (d.get("token") or "", d.get("user_id") or "",
+            bool(d.get("active")), tuple(d.get("permissions") or []))
+
+
 def _canon_perms(raw):
     """permissions JSONB 文本 → 规范化排序表（与 audit 侧同口径）。"""
     import json as _json
@@ -667,8 +683,9 @@ class Verifier:
                                 "error": str(e).split("\n")[0]})
                     share_states = claim_grants = None
                 if share_states is not None:
+                    share_states = sorted(share_states, key=_ss_sort_key)
                     f_ss = sorted(freeze.get("share_states") or [],
-                                  key=lambda d: d.get("token"))
+                                  key=_ss_sort_key)
                     if f_ss != share_states:
                         diffs.append({
                             "slide_id": sid, "field": "share_states",
@@ -681,9 +698,9 @@ class Verifier:
                                     "permissions——撤权、过期时刻与权限变化"
                                     "均违规）"})
                 if claim_grants is not None:
+                    claim_grants = sorted(claim_grants, key=_cg_sort_key)
                     f_cg = sorted(freeze.get("claim_grants") or [],
-                                  key=lambda d: (d.get("token"),
-                                                 d.get("user_id")))
+                                  key=_cg_sort_key)
                     if f_cg != claim_grants:
                         diffs.append({
                             "slide_id": sid, "field": "claim_grants",

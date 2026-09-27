@@ -307,18 +307,20 @@ def reserve_upload_locked(cur, user_id, nbytes, *, inflight_limit=None,
     _NOT_PENDING = (
         " AND reservation_id NOT IN (SELECT reservation_id "
         "FROM upload_cleanup_pending WHERE reservation_id IS NOT NULL)")
+    # R8 复核修复 P1：减账依据**实际转换的行**（UPDATE ... RETURNING 的
+    # 逐行合计），不用先前可能漂移的 SUM——READ COMMITTED 下 SUM 与
+    # UPDATE 非同一快照，反连接也只能保证各自语句一致，不能证明两批行
+    # 相同。登记（upload_task_store.record_cleanup_pending）同样持本配额
+    # 行锁：登记与回收串行化；回收先赢时由登记侧重激活该预约为容量责任
+    # 载体（残留字节重新有账，不依赖已登记 pending 的排除面）。
     cur.execute(
-        "SELECT COALESCE(SUM(reserved_bytes), 0) AS n "
-        "FROM upload_reservations "
-        "WHERE user_id = %s AND state = 'reserved' "
-        "AND expires_at <= now()" + _NOT_PENDING, (user_id,))
-    expired = int(cur.fetchone()["n"])
+        "UPDATE upload_reservations SET state='released', "
+        "settled_at=now(), settled_bytes=0, updated_at=now() "
+        "WHERE user_id=%s AND state='reserved' "
+        "AND expires_at <= now()" + _NOT_PENDING +
+        " RETURNING reserved_bytes", (user_id,))
+    expired = sum(int(r["reserved_bytes"]) for r in cur.fetchall())
     if expired:
-        cur.execute(
-            "UPDATE upload_reservations SET state='released', "
-            "settled_at=now(), settled_bytes=0, updated_at=now() "
-            "WHERE user_id=%s AND state='reserved' "
-            "AND expires_at <= now()" + _NOT_PENDING, (user_id,))
         cur.execute(
             "UPDATE upload_user_quotas SET reserved_bytes = "
             "GREATEST(0, reserved_bytes - %s), updated_at=now() "

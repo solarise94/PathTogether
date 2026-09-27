@@ -335,3 +335,14 @@ R6 修复复核（用户）确认原 7 反例通过，扩展检查发现 3 项�
 | P2-c | `clear_cleanup_pending` 在 dict_row 下取 row[0] 必 KeyError（事务回滚、pending 残留；管理员路径无兜底→物理清理成功仍未释放却报成功） | 改按列名取值；编排方补两条**完整收尾路径**回归：用户重复 DELETE（恢复后 200+清树+释放+消行一次完成）、管理员 staging-residue 确认清理（响应新增 additive `released_reservation` 字段；释放+消行验证） |
 
 **R7 门禁**：3 审查反例+2 编排方收尾路径回归全绿；migration tools 22+R6 回归 6+R7 回归 5 全绿；演练 40 断言 0 失败（证据刷新，含新冻结字段）；test:js 562；全量 pytest 终态见提交信息（唯一允许失败=admin 0.4.13）。
+
+## R8 复核处置（2026-09-27）：并发漏账与排序误报两项闭环
+
+d9cb3f3 复核（用户）发现 2 项（P1+P2），2 反例亲自复现（先红）→ 修复 → 入仓（`tests/test_slide_id_review_r8.py`：P1 按审查记录指引改双串行胜者注入——锁协议使原同步注入不可交错且会自锁，断言语义不变；P2 审查方原样断言通过）。
+
+| # | 问题 | 修复 |
+|---|---|---|
+| P1 | `record_cleanup_pending` 无配额行锁，可在准入回收 SUM/UPDATE 之间提交——UPDATE 反连接跳过该预约但减账仍按先前 SUM（READ COMMITTED 两语句非同快照）→ 漏账 | ① 回收减账改 `UPDATE ... RETURNING` 逐行合计（实际转换行，无漂移聚合）；② 登记侧统一锁协议：先取预约所属用户的配额行锁（与回收/释放同锁）再 upsert；③ 回收先赢时序（预约已 released）由登记侧**重激活**：翻回 reserved（expires 推远）+ 配额补记其 reserved_bytes——「随后才发现清理失败」的实际残留重新有容量责任（仅重激活 released；consumed/settled 是真实结算绝不复活）。释放路径本就按行转换减账（预约行锁+状态 CAS），无需改 |
+| P2 | share_states/claim_grants 冻结侧按 token 摘要排序、重读侧按原文排序，摘要序≠原文序——未变授权被误报漂移（no-go 假阳性） | 两侧统一规范化排序键（`_ss_sort_key`/`_cg_sort_key`：token/控制位/主体/permissions 全键）后再比较；主体与权限变化的检测保持 |
+
+**R8 门禁**：双串行胜者+审查方 P2 共 3 回归绿；四组回归文件合计 36 绿；test:js 562；全量 pytest 终态见提交信息（唯一允许失败=admin 0.4.13）。

@@ -876,6 +876,16 @@ def get_upload_task_item(task_id, item_key):
 def record_cleanup_pending(upload_id, reservation_id=None, *, error=None):
     """清理失败 → 落/更新待清理行（保留容量责任的持久证据）。
 
+    统一锁协议（R8 复核修复 P1）：先取该预约所属用户的**配额行锁**
+    （与 upload_guard 的准入回收/释放同一把锁），登记与回收/释放串行化，
+    消除「回收 SUM 后、UPDATE 前登记提交」的并发漏账窗口。
+
+    回收先赢的时序（预约已被惰性回收置 released）由本函数**重激活**：
+    该预约翻回 reserved（expires 推远防无谓续期判定）+ 配额补记其
+    reserved_bytes——「随后才发现清理失败」的实际残留重新有容量责任，
+    不依赖已登记 pending 的排除面。仅重激活 state='released' 的行
+    （consumed/settled 是真实结算，绝不复活）。
+
     行存在期间调用方**不得释放** reservation（清理确认后由
     clear_cleanup_pending 的调用路径释放）；attempts 累计重试次数，
     last_error 截断 4KB。幂等（同 upload_id 更新）。"""
@@ -883,6 +893,34 @@ def record_cleanup_pending(upload_id, reservation_id=None, *, error=None):
     try:
         with pg_store.transaction(conn):
             with conn.cursor() as cur:
+                rid = (reservation_id or "").strip() or None
+                if rid:
+                    cur.execute(
+                        "SELECT user_id, state, reserved_bytes "
+                        "FROM upload_reservations WHERE reservation_id=%s",
+                        (rid,))
+                    rrow = cur.fetchone()
+                    if rrow is not None and rrow["user_id"]:
+                        # 配额行锁：与准入回收/释放同协议（串行化窗口）
+                        cur.execute(
+                            "SELECT reserved_bytes FROM upload_user_quotas "
+                            "WHERE user_id=%s FOR UPDATE",
+                            (rrow["user_id"],))
+                        if cur.fetchone() is not None \
+                                and rrow["state"] == "released":
+                            cur.execute(
+                                "UPDATE upload_reservations "
+                                "SET state='reserved', settled_at=NULL, "
+                                "settled_bytes=NULL, "
+                                "expires_at=now() + interval '30 days', "
+                                "updated_at=now() "
+                                "WHERE reservation_id=%s", (rid,))
+                            cur.execute(
+                                "UPDATE upload_user_quotas SET "
+                                "reserved_bytes = reserved_bytes + %s, "
+                                "updated_at=now() WHERE user_id=%s",
+                                (int(rrow["reserved_bytes"] or 0),
+                                 rrow["user_id"]))
                 cur.execute(
                     "INSERT INTO upload_cleanup_pending "
                     "(upload_id, reservation_id, attempts, last_error) "
@@ -893,7 +931,7 @@ def record_cleanup_pending(upload_id, reservation_id=None, *, error=None):
                     "upload_cleanup_pending.reservation_id), "
                     "last_error = EXCLUDED.last_error, "
                     "updated_at = now()",
-                    (str(upload_id), (reservation_id or None),
+                    (str(upload_id), rid,
                      (str(error)[:4096] if error else None)))
     finally:
         conn.close()

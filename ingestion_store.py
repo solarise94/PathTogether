@@ -1339,7 +1339,12 @@ def sweep_expired_jobs():
 def renew_active_local_reservations():
     """§6.3 常驻续租：浏览器无请求期间维持本地预约。
 
-    每任务短事务（锁序 job → reservation → quota）：
+    每任务短事务（R10 锁序统一后：job 行 → **quota 行 → reservation 行**
+    ——renew/re-admit/release 内部均按配额先行的统一协议；此前「先锁预约
+    续租、过期后才申请配额」与同用户准入回收交错是倒置死锁面。job 行锁
+    保持最先：全库无任何路径在持有配额锁后反过来等待 job 行——job 行的
+    全部 FOR UPDATE 站点（发布 precheck/claim/FIFO 准入/sweep）都先锁
+    job 再触配额，无反向等待者）：
 
     - 状态仍活跃且未超绝对期限 → renew（TTL 后移）；
     - 预约已过期（不复活）→ 恢复流程：重新预占（新 rid）；QuotaExceeded →

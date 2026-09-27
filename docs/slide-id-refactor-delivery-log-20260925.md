@@ -355,3 +355,21 @@ f4e9e76 复核（用户）发现 1 项 P1（2 反例同一根因：登记在取�
 2. 锁序审计与统一（审查要求）：准入回收/待清理登记为 quota 行→reservation 行；release/consume 原为反序（reservation 行→quota）——与准入回收同预约并发时存在锁序倒置死锁面。统一为 **quota 行锁 → reservation 行锁** 全序（`_lock_quota_row` helper；user_id 先无锁定位）。renew 只锁预约行不动配额，无倒置面。
 
 **R9 门禁**：2 审查反例转绿（游标代理注入原样入仓 `tests/test_slide_id_review_r9.py`）；五组回归文件合计 38 绿；test:js 562；全量 pytest 终态见提交信息（唯一允许失败=admin 0.4.13）。
+
+## R10 处置（2026-09-27）：预约操作全量收敛同一锁协议
+
+审查指令五项全部落地（基线 3d14e3c）：
+
+1. **统一顺序 quota 行 → reservation 行**：`renew_reservation_locked` 补配额锁（renew 自身不改配额，但调用方事务其后有 acquire/re-admit/release——统一先行取锁，整链不再倒置）；首查只定位 user_id（行上不可变），锁内重读状态/有效期/字节。多条预约的加锁顺序由配额行锁先行串行化（同用户准入互斥；跨用户 UPDATE 只触本用户行）。
+2. **`release_reservation` 删重复实现**：公开入口只开事务委托 `release_reservation_locked`——状态转换与减账仅存一份（旧公开入口按预约→配额加锁，与准入交错真实死锁）。
+3. **`topup_reservation` 修正**：定位 user_id → 配额 FOR UPDATE → 预约 FOR UPDATE（state/expiry 谓词在锁内 SQL 判定，不用锁前快照）→ 锁内验配额 → 同事务加码预约与配额；失败整笔回滚。
+4. **COS 常驻续租整事务修正**：`renew_active_local_reservations` 的事务序变为 job 行 → quota 行 → reservation 行（renew/re-admit/release 内部统一先行配额锁）。锁序审计：job 行全部 FOR UPDATE 站点（发布 precheck/claim/FIFO 准入/sweep）均先锁 job 再触配额，全库无「持配额锁等 job 行」路径（docstring 记录）。
+5. **CAS/RETURNING 记账保持**：重激活（released→reserved RETURNING）与释放/转实占的一次结算不变，异常整笔回滚。
+
+**验收（tests/test_slide_id_review_r10.py，起始屏障 + 真实 PG，5×重跑扰动胜者）**：
+- 释放×过期回收同预约：无死锁、恰一次 released、账本 100→50、重复释放不改账本；
+- 补占×转实占同预约：无死锁、终态 consumed、失败方仅 ReservationInvalid（整笔回滚无半更新）、账本 used=100/reserved=0、重复 consume 不重复记账；
+- COS 过期续租×同用户新准入：无死锁、旧预约两路径终态 released、账本不变量 `quota.reserved == SUM(reserved 行)` 恒成立、recovered(150)/skipped(50) 两合法终态、后续轮次幂等不改账本。
+- 屏障只做同时起跑——锁序统一后反序交错已被协议禁止，不再中途注入强制非法交错（审查要求）。
+
+**R10 门禁**：三场景 3 例（×5 重跑）绿；十组相关套件 133 绿；test:js 562；全量 pytest 终态见提交信息（唯一允许失败=admin 0.4.13）。

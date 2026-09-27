@@ -385,8 +385,10 @@ def reserve_upload(user_id, nbytes, *, inflight_limit=None, hourly_limit=None):
 def topup_reservation(reservation_id, extra_bytes):
     """ZIP 展开总量超过预占时的原子补占（reserved 条件加码）。
 
-    锁序恒为 reservation → quota（reserve_upload 只锁 quota，无环）。
-    配额不足抛 QuotaExceeded，整体回滚。
+    R10 锁序统一：quota 行 → reservation 行（与准入/释放/转实占/登记
+    同序；原 reservation → quota 与 consume 并发可死锁）。首查只定位
+    user_id；**锁内**重读预约状态/有效期/字节与配额余量后再判定——
+    不用锁前快照。配额不足抛 QuotaExceeded，整体回滚。
     """
     extra_bytes = int(extra_bytes)
     if extra_bytes <= 0:
@@ -395,7 +397,19 @@ def topup_reservation(reservation_id, extra_bytes):
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                # 过期判定放 SQL（expires_at 是 timestamptz，与 now() 同钟）
+                # 定位 user_id（行上不可变；不承担状态判定）
+                cur.execute(
+                    "SELECT user_id FROM upload_reservations "
+                    "WHERE reservation_id=%s", (reservation_id,))
+                loc = cur.fetchone()
+                if loc is None:
+                    raise ReservationInvalid("预占不存在：%r"
+                                             % reservation_id)
+                if not loc["user_id"]:
+                    raise ReservationInvalid("预占无归属用户（不补占）")
+                _lock_quota_row(cur, loc["user_id"])
+                # 过期/状态判定放 SQL（expires_at 是 timestamptz，与 now()
+                # 同钟）；FOR UPDATE 在配额锁之后取得——锁内权威读。
                 cur.execute(
                     "SELECT user_id, reserved_bytes FROM upload_reservations "
                     "WHERE reservation_id=%s AND state='reserved' "
@@ -406,7 +420,7 @@ def topup_reservation(reservation_id, extra_bytes):
                     raise ReservationInvalid("预占不存在、已结算或已过期")
                 cur.execute(
                     "SELECT quota_bytes, used_bytes, reserved_bytes "
-                    "FROM upload_user_quotas WHERE user_id=%s FOR UPDATE",
+                    "FROM upload_user_quotas WHERE user_id=%s",
                     (r["user_id"],))
                 q = cur.fetchone()
                 quota, used, reserved = (int(q["quota_bytes"]),
@@ -458,6 +472,16 @@ def renew_reservation_locked(cur, reservation_id, ttl_seconds=None):
     """
     ttl = (UPLOAD_RESERVATION_TTL_SECONDS if ttl_seconds is None
            else int(ttl_seconds))
+    # R10 锁序统一：quota 行 → reservation 行。renew 自身不改配额，但调用
+    # 方事务（发布 precheck、COS 常驻续租）在 renew 之后可能继续 acquire/
+    # re-admit/release——统一先取配额锁，整个调用链不再出现
+    # 「先锁预约、后取配额」的倒置（与准入回收/登记/释放/转实占同序）。
+    cur.execute(
+        "SELECT user_id FROM upload_reservations WHERE reservation_id=%s",
+        (reservation_id,))
+    _loc = cur.fetchone()
+    if _loc is not None and _loc["user_id"]:
+        _lock_quota_row(cur, _loc["user_id"])
     cur.execute(
         "SELECT user_id, reserved_bytes, state FROM "
         "upload_reservations WHERE reservation_id=%s FOR UPDATE",
@@ -548,31 +572,17 @@ def release_reservation_locked(cur, reservation_id):
 def release_reservation(reservation_id):
     """失败释放：reserved → released，reserved_bytes 归还配额行。
 
-    已 consumed/released 的行幂等 no-op（返回其状态）。
+    已 consumed/released 的行幂等 no-op（返回其状态）。R10 锁序统一：
+    状态转换与减账**只保留 ``release_reservation_locked`` 一份实现**
+    （quota 行 → reservation 行），本函数只开事务委托——此前公开入口
+    重复旧 SQL 按预约行→配额行加锁，与准入回收（配额→预约）交错会
+    真实死锁。
     """
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                cur.execute(
-                    "SELECT user_id, reserved_bytes, state FROM "
-                    "upload_reservations WHERE reservation_id=%s FOR UPDATE",
-                    (reservation_id,))
-                r = cur.fetchone()
-                if r is None:
-                    return None
-                if r["state"] != "reserved":
-                    return {"reservation_id": reservation_id,
-                            "state": r["state"]}
-                cur.execute(
-                    "UPDATE upload_reservations SET state='released', "
-                    "settled_at=now(), settled_bytes=0, updated_at=now() "
-                    "WHERE reservation_id=%s", (reservation_id,))
-                cur.execute(
-                    "UPDATE upload_user_quotas SET reserved_bytes = "
-                    "GREATEST(0, reserved_bytes - %s), updated_at=now() "
-                    "WHERE user_id=%s", (int(r["reserved_bytes"]), r["user_id"]))
-        return {"reservation_id": reservation_id, "state": "released"}
+                return release_reservation_locked(cur, reservation_id)
     finally:
         conn.close()
 

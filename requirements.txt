@@ -3,7 +3,7 @@ pillow
 openslide-python
 openslide-bin
 # tifffile 锁定到兼容 zarr<3 的版本（aszarr 在较新版本要求 zarr>=3）
-tifffile==2024.5.22
+tifffile==2026.8.23
 zarr>=2.18,<3
 imagecodecs
 numpy

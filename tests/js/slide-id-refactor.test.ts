@@ -4,7 +4,8 @@
  * 加载真实 static/app.js（最小 DOM + fetch mock + HostBridgeHost stub）：
  *  ① 同 display_name 两片并存——列表两行（data-slide-id 区分）、分别打开不串；
  *  ② 改名（PATCH /api/slides/<id> 后重拉列表）ID 不变、行仍指向同片；
- *  ③ V1 上传完成按响应 slide_id 打开（ID 通道 info，绝不按 file.name 猜）；
+ *  ③ V1 适配器（U3 排空过渡保留）上传完成按响应 slide_id 打开（ID 通道
+ *     info，绝不按 file.name 猜）；
  *  ④ 续传键 v3 账户域隔离（换 account 不复用会话）；
  *  ⑤ slide_id_api=false（旧后端）回落 name 通道（旧端点 + 载荷无 id）；
  *  ⑥ ?slide=<slide_id> URL 通道加载即打开对应切片。
@@ -457,11 +458,12 @@ describe("slide ID 化前端契约（P2 合同 §5）", () => {
 		expect(rowsAfter.some((r) => r.dataset.slideId === ID_A)).toBe(true);
 	});
 
-	it("③ V1 上传完成按响应 slide_id 打开（ID 通道 info；不按 file.name 猜）", async () => {
+	it("③ V1 适配器上传完成按响应 slide_id 打开（ID 通道 info；不按 file.name 猜）", async () => {
 		const app = bootApp({ idMode: true });
 		await settle();
-		const uploadFile = app.upload.uploadFile as (f: unknown) => void;
-		uploadFile({ name: "v1.svs", size: 3 });
+		const uploadFileLegacy = app.upload.uploadFileLegacy as (f: unknown, row: unknown) => void;
+		uploadFileLegacy({ name: "v1.svs", size: 3 },
+			{ setStage() {}, finish() {}, markError() {} });
 		await settle();
 		expect(FakeXHR.instances).toHaveLength(1);
 		FakeXHR.instances[0].simulateLoad(200, JSON.stringify({

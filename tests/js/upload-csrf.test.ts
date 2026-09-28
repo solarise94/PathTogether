@@ -1,10 +1,11 @@
 /**
- * uploadFile：裸 XHR 必须携带 X-CSRF-Token（上传修复 U1 / test-review P0-4）。
+ * uploadFileLegacy（V1 适配器）：裸 XHR 必须携带 X-CSRF-Token（上传修复 U1 /
+ * test-review P0-4；U3 起该适配器仅排空过渡保留——检查点 B 删除）。
  *
  * 背景：上传是唯一带请求体却绕过 apiFetch 的写通道，曾漏传 CSRF 头导致服务端
  * 400 csrf_required（大文件传完才被拒）。本文件用 logout.test.ts 同款 loadApp
- * harness 驱动**真实** uploadFile()，断言其 XHR 请求带头、且头在 open 之后
- * send 之前设置；另覆盖 csrf_required 的可读文案映射。
+ * harness 驱动**真实** uploadFileLegacy()，断言其 XHR 请求带头、且头在 open
+ * 之后 send 之前设置；另覆盖 csrf_required 的可读文案映射。
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
@@ -99,12 +100,18 @@ function loadApp() {
 	vi.stubGlobal("XMLHttpRequest", FakeXHR);
 	new Function("window", "document", "fetch", "location", appSrc)(w, doc, fetchImpl, loc);
 	return {
-		uploadFile: (w.HP_UPLOAD as { uploadFile: (f: unknown) => void }).uploadFile,
+		uploadFileLegacy: (w.HP_UPLOAD as {
+			uploadFileLegacy: (f: unknown, row: unknown) => void;
+		}).uploadFileLegacy,
 		toastMessages: toast.messages,
 	};
 }
 
-describe("app.js uploadFile 必须带 X-CSRF-Token", () => {
+const stubRow = () => ({
+	setStage() {}, finish() {}, markError() {},
+});
+
+describe("app.js uploadFileLegacy 必须带 X-CSRF-Token（排空过渡适配器）", () => {
 	afterEach(() => {
 		vi.unstubAllGlobals();
 		FakeXHR.instances = [];
@@ -112,8 +119,8 @@ describe("app.js uploadFile 必须带 X-CSRF-Token", () => {
 
 	it("XHR 携带双提交头（open 后、send 前）", () => {
 		const h = loadApp();
-		expect(typeof h.uploadFile).toBe("function");
-		h.uploadFile({ name: "a.svs", size: 3 });
+		expect(typeof h.uploadFileLegacy).toBe("function");
+		h.uploadFileLegacy({ name: "a.svs", size: 3 }, stubRow());
 		expect(FakeXHR.instances).toHaveLength(1);
 		const xhr = FakeXHR.instances[0];
 		expect(xhr.open).toHaveBeenCalledWith("POST", "/api/upload");
@@ -129,7 +136,7 @@ describe("app.js uploadFile 必须带 X-CSRF-Token", () => {
 
 	it("csrf_required 映射为可读文案（不透出原始错误码）", () => {
 		const h = loadApp();
-		h.uploadFile({ name: "a.svs", size: 3 });
+		h.uploadFileLegacy({ name: "a.svs", size: 3 }, stubRow());
 		const xhr = FakeXHR.instances[0];
 		xhr.simulateLoad(400, JSON.stringify({ error: "csrf_required" }));
 		expect(h.toastMessages.length).toBeGreaterThan(0);

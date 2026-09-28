@@ -61,29 +61,31 @@
     "upload.err.conversion": { zh: "切片转换失败", en: "Slide conversion failed" },
     // COS 直传 Phase 4（§5 阶段文案固定六段 + 稳定机器码；i18n.js 为主源，
     // 此处兜底）。上传 100% ≠ 可查看，绝不合成全流程百分比
-    "upload.cos.toggle": { zh: "云端直传", en: "Cloud direct upload" },
-    "upload.cos.toggle.tip": { zh: "手动选择 COS 云端直传；可查看前还需服务器接收与校验", en: "Manual COS direct upload; the server still needs to receive and validate before viewing" },
     "upload.cos.stage.waiting_space": { zh: "等待暂存空间", en: "Waiting for staging space" },
     "upload.cos.stage.uploading": { zh: "正在上传", en: "Uploading" },
     "upload.cos.stage.awaiting_server": { zh: "等待服务器接收", en: "Waiting for server" },
     "upload.cos.stage.downloading": { zh: "服务器接收中", en: "Server downloading" },
     "upload.cos.stage.validating": { zh: "正在校验", en: "Validating" },
+    "upload.cos.stage.processing": { zh: "服务器处理中（解包/转换）", en: "Server processing (unpack/conversion)" },
     "upload.cos.stage.readiness": { zh: "准备可查看", en: "Preparing to view" },
     "upload.cos.stage.viewable": { zh: "可查看", en: "Viewable" },
     "upload.cos.queue": { zh: "第 {n} 位", en: "position {n}" },
     "upload.cos.cancel": { zh: "取消", en: "Cancel" },
     "upload.cos.cancelled": { zh: "已取消", en: "Cancelled" },
     "upload.cos.retry": { zh: "重试", en: "Retry" },
-    "upload.cos.retry_platform": { zh: "改用平台上传", en: "Retry with platform upload" },
     "upload.cos.resume_hint": { zh: "上传未完成；重新选择同名文件可续传", en: "Upload unfinished; re-select the same file to resume" },
     "upload.cos.resume_confirm": { zh: "检测到「{name}」有未完成的云端直传任务，续传已上传的分块？", en: "An unfinished cloud upload for \"{name}\" exists. Resume from the uploaded parts?" },
-    "upload.cos.err.exceeds_admission": { zh: "文件超过云端直传大小上限，请改用平台上传", en: "File exceeds the cloud direct-upload size limit; please use platform upload" },
-    "upload.cos.err.format_unsupported": { zh: "该格式暂不支持云端直传，请使用平台上传", en: "Format not supported for cloud direct upload; please use platform upload" },
+    "upload.cos.err.format_unsupported": { zh: "不支持该文件格式", en: "Unsupported file format" },
+    "upload.cos.err.too_large": { zh: "文件超过平台上限", en: "File exceeds the platform size limit" },
+    "upload.cos.err.pool_config": { zh: "服务端存储配置暂不能接纳该大小，请联系运维", en: "Server storage config cannot accept this size yet; contact the operator" },
+    "upload.cos.unavailable": { zh: "上传暂不可用（云直传能力未开放）", en: "Upload unavailable (cloud direct-upload capability is off)" },
+    "upload.cos.items": { zh: "已发布 {n}/{m} 项", en: "{n}/{m} items published" },
+    "upload.cos.conv_state": { zh: "转换中（{s}）", en: "Converting ({s})" },
     "upload.cos.err.waiting_limit": { zh: "已有等待中的云端直传任务", en: "Another cloud upload is already waiting" },
     "upload.cos.err.state": { zh: "任务状态冲突，请刷新页面后重试", en: "Job state conflict; please refresh and retry" },
     "upload.cos.err.rate": { zh: "签名请求过于频繁，请稍后重试", en: "Signing rate limited; please retry later" },
     "upload.cos.err.reconcile": { zh: "云端容量对账中，暂不可继续，请稍后重试", en: "Cloud capacity reconciliation in progress; retry later" },
-    "upload.cos.err.unavailable": { zh: "云端直传暂不可用，请使用平台上传", en: "Cloud direct upload unavailable; please use platform upload" },
+
     // 升级 C（§6.1）：矩形工具文案（i18n.js 为主源；此处兜底）
     "roi.rect.tip": { zh: "矩形工具：在视野中拖出矩形，或输入宽高后点击中心放置；拖内部平移、边/角调整大小；Escape 取消",
                       en: "Rectangle tool: drag in the view, or enter width/height then click to place; drag inside to move, edges/corners to resize; Escape cancels" },
@@ -6433,26 +6435,6 @@
   // 接口（§3.4 首版只支持单文件 WSI）。分片严格串行单并发（§3.2.2），每片算
   // SHA-256（Web Crypto 对该片 ArrayBuffer，不整文件入内存）；offset 以服务端
   // confirmed_offset 为权威，offset_mismatch 时对齐重传（§3.2.1）。
-  var UPLOAD_V2_THRESHOLD_FALLBACK = 16 * 1024 * 1024;
-
-  function resolveUploadV2Threshold() {
-    try {
-      var caps = window.HP_APP_BOOTSTRAP && window.HP_APP_BOOTSTRAP.capabilities;
-      var n = caps && Number(caps.upload_v2_threshold_bytes);
-      if (typeof n === "number" && isFinite(n) && n > 0) return n;
-    } catch (e) { /* bootstrap 缺失/畸形：回落 */ }
-    return UPLOAD_V2_THRESHOLD_FALLBACK;
-  }
-
-  var UPLOAD_V2_THRESHOLD = resolveUploadV2Threshold();
-
-  function shouldChunkUpload(file) {
-    if (!file || typeof file.size !== "number") return false;
-    var name = file.name || "";
-    var ext = name.slice(name.lastIndexOf(".") + 1).toLowerCase();
-    if (ext === "zip" || ext === "mrxs") return false;  // §3.4：ZIP/MRXS 走旧接口
-    return file.size >= UPLOAD_V2_THRESHOLD;
-  }
 
   // ---------- 上传续传键（P2 合同 §5.3：账户域 + upload_id 键） ----------
   // v3 键形如 pt.upload.v3::<account>:<upload_id>；值 {upload_id, declared_size,
@@ -6647,10 +6629,13 @@
     return nextChunk();
   }
 
-  function uploadFileV2(file, row) {
+  function uploadFileV2(file, row, resumeOnly) {
+    // U3 排空过渡：resumeOnly=旧任务恢复专用（**不新建 V2**——新任务只走
+    // COS）；恢复未命中上抛 {resumeMiss} 哨兵，调用方清理陈旧记录后转 COS。
+    // 检查点 B 随 V2 适配器一并删除。返回链 Promise（原调用方不依赖返回值）。
     var resumeKey = null;   // pt.upload.v3::<account>:<upload_id>（创建/续传时定）
     var task = null;
-    Promise.resolve().then(function () {
+    return Promise.resolve().then(function () {
       // 1) 刷新恢复：按文件（名+大小）在当前账户域找未完成任务，GET 状态后
       //    从 confirmed_offset 续传
       var saved = uploadResumeFind(file);
@@ -6682,6 +6667,7 @@
         .catch(function () { return null; });
     }).then(function (resumed) {
       if (resumed) { task = resumed; return; }
+      if (resumeOnly) throw { resumeMiss: true };
       // 2) 创建新任务（初始化即预占配额，服务端给 chunk_size）
       row.setStage("upload.stage.transferring", 0);
       return apiFetch("/api/uploads", {
@@ -6857,22 +6843,41 @@
   function uploadFile(file, opts) {
     if (!file) return;
     opts = opts || {};
-    // COS 选路（Phase 4，manual_only）：只在任务开始前判一次（D8 开始后
-    // transport 冻结）。opts.platform 是用户点了「改用平台上传」的显式选择
-    // （COS 422 超上限后的全新平台任务），不是自动换路；不勾选/不可用/
-    // 不 eligible 一律照旧平台路径
-    if (!opts.platform && cosManual && cosUploadEligible(file)) {
-      var cosRow = makeUploadRow(file);
-      uploadFileCos(file, cosRow,
-        opts.cosRetry ? { resumeJobId: opts.cosRetry, skipConfirm: true } : null);
-      return;
-    }
+    // U3（统一 COS，docs/cos-only-upload-agent-plan-20260928.md §4）：新任务
+    // 只建 ingestion。能力不可用（capability off / 容量配置门禁未过）→ 禁用
+    // 创建并提示，**不回退 V1/V2**；词表与上限以服务端 capability 为唯一
+    // 权威（cosUploadEligible 判定），不合格即说明原因。
     var row = makeUploadRow(file);
-    if (shouldChunkUpload(file)) {
-      uploadFileV2(file, row);
+    // 排空过渡（检查点 A 合同 §5）：同名同大小存在旧 V2 未完记录 → 恢复
+    // 旧任务（uploadFileV2 resumeOnly 分支——不新建 V2）；恢复未命中/旧
+    // 任务已收口 → 清陈旧记录转 COS。检查点 B 随 V2 适配器一并删除。
+    if (!opts.legacyV2Checked && uploadResumeFind(file)) {
+      uploadFileV2(file, row, true).catch(function (err) {
+        if (!(err && err.resumeMiss)) return;  // 其余错误已在 V2 内部呈现
+        var stale = uploadResumeFind(file);
+        if (stale && stale.upload_id) {
+          try { localStorage.removeItem(uploadResumeKeyPrefix() + stale.upload_id); }
+          catch (e) { /* localStorage 不可用：仅多一次状态查询 */ }
+        }
+        uploadFile(file, { legacyV2Checked: true });
+      });
       return;
     }
-    uploadFileLegacy(file, row);
+    if (!COS_UPLOAD_CONFIG) {
+      row.markError();
+      row.setStage("upload.cos.unavailable");
+      row.finish(10000);
+      return;
+    }
+    if (!cosUploadEligible(file)) {
+      row.markError();
+      row.setStage("upload.stage.failed");
+      row.finish(10000);
+      toast(t("upload.fail", { e: cosIneligibleReason(file) }), "error");
+      return;
+    }
+    uploadFileCos(file, row,
+      opts.cosRetry ? { resumeJobId: opts.cosRetry, skipConfirm: true } : null);
   }
 
   // 旧单请求上传：小文件与 ZIP/MRXS（§3.4 并存）
@@ -6983,21 +6988,25 @@
 
   var COS_UPLOAD_CONFIG = resolveCosConfig();
 
-  // manual_only 手动开关状态：仅存内存——刷新回到默认平台路径，不留
-  //「隐性开启」的自动导流状态（D6/D7：首期禁止按大小/繁忙自动切 COS）
-  var cosManual = false;
-
+  // U3：手动选路开关退役（统一 COS，无按大小/格式分流）。
   function cosUploadEligible(file) {
-    // D10：capability/格式白名单/大小在任务开始前一次判定。
-    // D11：首期 COS 只收原生单文件白名单；ZIP/MRXS 恒 V1——与
-    // shouldChunkUpload 同一例外双保险，即使服务端白名单误配也不放行。
+    // 词表/上限全部来自服务端 capability（注册表派生 + 产品上限）——前端
+    // 不再维护第二份格式例外（zip/conversion 由服务端受理，裸 mrxs 由
+    // 服务端拒绝并提示打包）。
     if (!COS_UPLOAD_CONFIG) return false;
     if (!file || typeof file.size !== "number") return false;
     if (file.size <= 0 || file.size > COS_UPLOAD_CONFIG.max_size_bytes) return false;
     var name = file.name || "";
     var ext = name.slice(name.lastIndexOf(".") + 1).toLowerCase();
-    if (ext === "zip" || ext === "mrxs") return false;
     return COS_UPLOAD_CONFIG.formats.indexOf(ext) >= 0;
+  }
+
+  function cosIneligibleReason(file) {
+    if (file && typeof file.size === "number" &&
+        (file.size <= 0 || file.size > COS_UPLOAD_CONFIG.max_size_bytes)) {
+      return tt("upload.cos.err.too_large");
+    }
+    return tt("upload.cos.err.format_unsupported");
   }
 
   // ---------- 刷新恢复（§5：只存非秘密 job id 与文件提示） ----------
@@ -7078,7 +7087,8 @@
   // ---------- 稳定机器码 → 可读文案（照 uploadErrorMessage 的兜底模式） ----------
   function cosErrorMessage(status, data) {
     var code = (data && (data.code || data.error)) || "";
-    if (code === "cos_exceeds_admission") return tt("upload.cos.err.exceeds_admission");
+    if (code === "upload_too_large") return tt("upload.cos.err.too_large");
+    if (code === "cos_pool_below_product_limit") return tt("upload.cos.err.pool_config");
     if (code === "cos_format_unsupported") return tt("upload.cos.err.format_unsupported");
     if (code === "cos_waiting_limit") return tt("upload.cos.err.waiting_limit");
     if (code === "ingestion_state_conflict") return tt("upload.cos.err.state");
@@ -7095,7 +7105,8 @@
   // 阶段名 → 文案键（§5 固定六段 + terminal/未知兜底）
   function cosStageKey(stage) {
     var known = { waiting_space: 1, uploading: 1, awaiting_server: 1,
-                  downloading: 1, validating: 1, readiness: 1, viewable: 1 };
+                  downloading: 1, validating: 1, processing: 1,
+                  readiness: 1, viewable: 1 };
     return known[stage] ? "upload.cos.stage." + stage : "upload.stage.failed";
   }
 
@@ -7113,6 +7124,18 @@
         typeof b.queue_position === "number") {
       // 排队位置 0 基 → 人类序数；绝不显示预计时间（§6.1 不承诺 ETA）
       note = tt("upload.cos.queue", { n: b.queue_position + 1 });
+    }
+    if (!note && b && b.stage === "processing") {
+      // U2 形态细节：zip 逐 item 计数 / conversion 子任务状态（纯展示）
+      if (b.items && b.items.length) {
+        var pub = 0;
+        for (var i = 0; i < b.items.length; i++) {
+          if (b.items[i].state === "published") pub++;
+        }
+        note = tt("upload.cos.items", { n: pub, m: b.items.length });
+      } else if (b.conversion && b.conversion.state) {
+        note = tt("upload.cos.conv_state", { s: b.conversion.state });
+      }
     }
     row.setStage(cosStageKey(b && b.stage), frac, note);
   }
@@ -7256,7 +7279,8 @@
           return delay(2000).then(drive);
         }
         if (st === "awaiting_server" || st === "downloading" ||
-            st === "validating" || st === "readiness" || st === "viewable") {
+            st === "validating" || st === "processing" ||
+            st === "readiness" || st === "viewable") {
           if (st === "viewable") return succeed(b);
           cosShowStage(row, b);
           return delay(2000).then(drive);
@@ -7385,9 +7409,21 @@
 
     function succeed(b) {
       // viewable：照 V2 commit 后的跳转习惯（完成 → 刷新列表 → 关联 → 打开）。
-      // P2 合同 §5.2：打开目标 = 响应 slide_id（唯一）；缺字段才按名回落
+      // P2 合同 §5.2：打开目标 = 响应 slide_id（唯一）；缺字段才按名回落。
+      // U2 多结果：zip 打开首个已发布 item（其余经列表刷新可见）；
+      // conversion 产物 slide_id 在 conversion 子视图（ready 才出现）。
       cosJobRemove(jobId);
+      var sid = b.slide_id || null;
+      if (!sid && b.items && b.items.length) {
+        for (var i = 0; i < b.items.length; i++) {
+          if (b.items[i].state === "published") { sid = b.items[i].slide_id; break; }
+        }
+      }
+      if (!sid && b.conversion && b.conversion.slide_id) {
+        sid = b.conversion.slide_id;
+      }
       var target = uploadedTarget(b, file);
+      if (sid) target.id = sid;
       row.setStage("upload.stage.done");
       row.finish();
       toast(t("upload.done", { name: target.name }), "success");
@@ -7449,13 +7485,7 @@
       }
       row.markError();
       row.setStage("upload.stage.failed");
-      if (code === "cos_exceeds_admission") {
-        // §6.1：说明超限 + 显式「改用平台上传」（用户明确选择，非自动换路；
-        // 平台路径仍受 V2/legacy 自身校验约束，不承诺必然接收）
-        addRowButton(row, tt("upload.cos.retry_platform"), function () {
-          uploadFile(file, { platform: true });
-        });
-      } else if (err && typeof err.part === "number") {
+      if (err && typeof err.part === "number") {
         // 分块最终失败：从 confirmed 续传（服务端计划仍在，跳过已确认块）
         addRowButton(row, tt("upload.cos.retry"), function () {
           uploadFile(file, { cosRetry: jobId });
@@ -7466,34 +7496,11 @@
     });
   }
 
-  // ---------- 启动：手动开关渲染 + 未完任务只读恢复 ----------
+  // ---------- 启动：未完任务只读恢复（U3：手动开关退役） ----------
   function initCosUploadUi() {
-    // capability 可用才渲染开关（§5：off 时前端零 COS 痕迹，不因文件大
-    // 走 COS）。开关放在上传进度行容器正上方（侧栏上传入口旁），沿用
-    // upload-item 的 11px 紧凑文字习惯——不改模板与样式表。
+    // U3（统一 COS）：选路开关/大小分流已删除——新任务恒走 uploadFileCos；
+    // 本入口保留刷新恢复（旧任务只读轮询）与未来装配点。
     restoreCosJobs();
-    if (!COS_UPLOAD_CONFIG) return;
-    var host = els.uploadProgressList;
-    if (!host || !host.parentNode ||
-        typeof host.parentNode.insertBefore !== "function") return;
-    var label = document.createElement("label");
-    label.className = "cos-manual-toggle";
-    label.title = tt("upload.cos.toggle.tip");
-    var cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.checked = cosManual;
-    var span = document.createElement("span");
-    span.textContent = tt("upload.cos.toggle");
-    label.style.display = "flex";
-    label.style.alignItems = "center";
-    label.style.gap = "6px";
-    label.style.margin = "6px 0 0";
-    label.style.fontSize = "11px";
-    label.style.cursor = "pointer";
-    cb.addEventListener("change", function () { cosManual = !!cb.checked; });
-    label.appendChild(cb);
-    label.appendChild(span);
-    host.parentNode.insertBefore(label, host);
   }
 
   function restoreCosJobs() {
@@ -7557,18 +7564,18 @@
   // 与 HP_AUTH 同风格的命名空间导出，不进业务调用面
   window.HP_UPLOAD = {
     uploadFile: uploadFile,
+    // U3：V1/V2 适配器仅旧任务恢复/排空窗口过渡保留（检查点 B 删除）；
+    // 新任务一律 COS（uploadFile 内部裁决，不再按大小/格式分流）。
     uploadFileV2: uploadFileV2,
-    shouldChunkUpload: shouldChunkUpload,
-    UPLOAD_V2_THRESHOLD: UPLOAD_V2_THRESHOLD,
+    uploadFileLegacy: uploadFileLegacy,
     // W4/R5：转换轮询（观察超时不判失败；401/403/404 分级处理）
     pollConversionJob: pollConversionJob,
-    // COS 直传 Phase 4（测试入口：真实路由/状态机/独立传输的驱动面）
+    // COS 直传（测试入口：真实路由/状态机/独立传输的驱动面）
     cosUploadEligible: cosUploadEligible,
+    cosIneligibleReason: cosIneligibleReason,
     uploadFileCos: uploadFileCos,
     resolveCosConfig: resolveCosConfig,
     cosStageKey: cosStageKey,
-    setCosManual: function (on) { cosManual = !!on; },
-    isCosManual: function () { return cosManual; },
     initCosUploadUi: initCosUploadUi,
     restoreCosJobs: restoreCosJobs,
   };

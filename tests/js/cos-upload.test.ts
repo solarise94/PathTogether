@@ -4,15 +4,16 @@
  *
  * 用 loadApp harness（同 upload-v2.test.ts / upload-csrf.test.ts）驱动**真实**
  * app.js，锁定：
- *  1. 选路：capability off → 手动开关不渲染、uploadFile 走旧路径；开 + 勾选 +
- *     eligible（白名单格式/非 ZIP/MRXS/大小在准入内）→ uploadFileCos；
+ *  1. 选路：capability off → uploadFile 禁用创建（零网络请求 + 「上传暂
+ *     不可用」提示）；可用 → uploadFile 恒走 COS（无开关、无大小分流、
+ *     无回退）；eligible 词表/上限以服务端 capability 为唯一权威；
  *  2. COS PUT 独立传输：对 COS URL 的 fetch 不带 X-CSRF-Token、
  *     credentials:"omit"、mode:"cors"；控制 API（/api/ingestions*）经 apiFetch
  *     带 CSRF 双提交头；
  *  3. 分批签名（sign_batch_max_parts）+ 批内并发（max_concurrent_parts）+
  *     分块进度（confirmed/total，仅上传阶段）；单片失败重试后成功；
- *  4. 422 cos_exceeds_admission → 行内说明 + 「改用平台上传」显式按钮触发
- *     平台路径（用户明确选择，非 D8 禁止的自动换路）；
+ *  4. 413 upload_too_large → 可读说明；**无另一后端按钮**（回退产品
+ *     策略已退役）；
  *  5. waiting_capacity：排队位置展示（无 ETA）、fake timers 推进 5s 轮询、
  *     preparing→uploading 继续；
  *  6. 刷新恢复：localStorage pt.cos.jobs 预置未完任务 → 只读进度行 + 轮询；
@@ -199,12 +200,11 @@ function loadApp(fetchImpl?: typeof fetch, bootstrap?: unknown) {
 	const up = w.HP_UPLOAD as Record<string, unknown>;
 	return {
 		up: up as {
-			uploadFile: (f: unknown, opts?: { platform?: boolean; cosRetry?: string }) => void;
+			uploadFile: (f: unknown, opts?: { cosRetry?: string }) => void;
 			cosUploadEligible: (f: unknown) => boolean;
 			resolveCosConfig: () => unknown;
 			cosStageKey: (s: string) => string;
-			setCosManual: (on: boolean) => void;
-			isCosManual: () => boolean;
+			cosIneligibleReason: (f: unknown) => string;
 			initCosUploadUi: () => void;
 			restoreCosJobs: () => void;
 		},
@@ -258,20 +258,19 @@ afterEach(() => {
 });
 
 // --------------------------------------------------------------------------- #
-// 1. 选路（manual_only：开关默认关；capability off 无 COS 痕迹）
+// 1. 选路（U3 统一 COS：无开关、无大小分流；capability off 禁用创建）
 // --------------------------------------------------------------------------- #
-describe("选路：capability / 手动开关 / eligible 判定", () => {
-	it("cos_upload 未下发（off）→ 开关不渲染；uploadFile 走旧路径（legacy/V2）", () => {
+describe("选路：capability / eligible 判定（统一 COS）", () => {
+	it("cos_upload 未下发（off）→ 禁用创建：零网络请求 + 「上传暂不可用」提示（不回退 V1/V2）", () => {
 		const h = loadApp(undefined, { mode: "official", capabilities: { upload_v2_threshold_bytes: THRESHOLD } });
 		expect(h.up.resolveCosConfig()).toBeNull();
 		h.up.initCosUploadUi();
-		expect(h.toggleParent._inserts.length).toBe(0);   // 开关不渲染
-		// 小文件 → legacy XHR；即使手动状态被置开也回退平台路径（config 为 null）
-		h.up.setCosManual(true);
+		expect(h.toggleParent._inserts.length).toBe(0);   // 无任何开关渲染
 		h.up.uploadFile({ name: "a.svs", size: 3 });
-		expect(FakeXHR.instances).toHaveLength(1);
-		expect(FakeXHR.instances[0].open).toHaveBeenCalledWith("POST", "/api/upload");
-		expect(h.fetchCalls().some((c) => c.url === "/api/ingestions")).toBe(false);
+		expect(FakeXHR.instances).toHaveLength(0);        // 不发 V1 XHR
+		expect(h.fetchCalls().length).toBe(0);            // 不建 V2/COS 任务
+		const row = h.container.appendChildren[h.container.appendChildren.length - 1];
+		expect(String(row.children[2].textContent)).toContain("上传暂不可用");
 	});
 
 	it("available:false / 缺字段 / 结构非法 → resolveCosConfig() 一律 null", () => {
@@ -284,7 +283,7 @@ describe("选路：capability / 手动开关 / eligible 判定", () => {
 		expect(mk({}).up.resolveCosConfig()).toBeNull();
 	});
 
-	it("capability 可用 → 渲染手动开关；勾选 + eligible → POST /api/ingestions（CSRF），不走 /api/uploads", async () => {
+	it("capability 可用 → uploadFile 直接 POST /api/ingestions（CSRF）；无开关、不走 /api/uploads、不发 V1 XHR", async () => {
 		// 创建后即 terminal（失败终态）让链路尽快收口，只验证选路
 		const fetchImpl = vi.fn((url: string, opts?: RequestInit) => {
 			if (url === "/api/ingestions" && opts && opts.method === "POST") {
@@ -294,12 +293,7 @@ describe("选路：capability / 手动开关 / eligible 判定", () => {
 		}) as unknown as typeof fetch;
 		const h = loadApp(fetchImpl, { mode: "official", capabilities: { cos_upload: cosCaps() } });
 		h.up.initCosUploadUi();
-		expect(h.toggleParent._inserts.length).toBe(1);   // 开关渲染在进度行容器前
-		expect(h.up.isCosManual()).toBe(false);           // 默认关
-		h.up.uploadFile(cosFile());
-		expect(h.fetchCalls().some((c) => c.url === "/api/ingestions")).toBe(false);  // 未勾选 → 平台
-		FakeXHR.instances.length = 0;   // 第一次是平台 legacy 上传，清掉再验 COS 路径
-		h.up.setCosManual(true);
+		expect(h.toggleParent._inserts.length).toBe(0);   // U3：无开关渲染
 		h.up.uploadFile(cosFile());
 		await flush(8);
 		const create = h.fetchCalls().find((c) => c.url === "/api/ingestions" && c.method === "POST");
@@ -309,21 +303,25 @@ describe("选路：capability / 手动开关 / eligible 判定", () => {
 		expect(FakeXHR.instances).toHaveLength(0);
 	});
 
-	it("ZIP/MRXS/超大/零字节 → 不走 COS（D10/D11；即便手动开着）", () => {
-		const h = loadApp(undefined, { mode: "official", capabilities: { cos_upload: cosCaps() } });
-		h.up.setCosManual(true);
+	it("eligible 词表以服务端 capability 为准：zip/kfb 受理（词表内）、裸 mrxs/超大/零字节拒绝并说明原因", () => {
+		const h = loadApp(undefined, { mode: "official", capabilities: {
+			cos_upload: cosCaps({ formats: ["bif", "ndpi", "svs", "tif", "zip", "kfb"] }),
+		} });
 		expect(h.up.cosUploadEligible(cosFile(30))).toBe(true);
-		expect(h.up.cosUploadEligible({ name: "a.zip", size: 30 })).toBe(false);
-		expect(h.up.cosUploadEligible({ name: "a.mrxs", size: 30 })).toBe(false);
-		expect(h.up.cosUploadEligible({ name: "a.kfb", size: 30 })).toBe(false);       // 白名单外
+		expect(h.up.cosUploadEligible({ name: "a.zip", size: 30 })).toBe(true);        // U2：zip 受理
+		expect(h.up.cosUploadEligible({ name: "a.kfb", size: 30 })).toBe(true);        // U2：转换源受理
+		expect(h.up.cosUploadEligible({ name: "a.mrxs", size: 30 })).toBe(false);      // 裸 bundle：服务端词表外
 		expect(h.up.cosUploadEligible({ name: "a.svs", size: 0 })).toBe(false);
-		expect(h.up.cosUploadEligible({ name: "a.svs", size: 1001 })).toBe(false);     // 超准入上限
-		h.up.uploadFile({ name: "a.zip", size: 30 });
+		expect(h.up.cosUploadEligible({ name: "a.svs", size: 1001 })).toBe(false);     // 超产品上限
+		expect(String(h.up.cosIneligibleReason({ name: "a.mrxs", size: 30 }))).toContain("不支持该文件格式");
+		expect(String(h.up.cosIneligibleReason({ name: "a.svs", size: 5000 }))).toContain("超过平台上限");
+		// 不合格 → 零请求 + 可读说明（不提供另一后端）
 		h.up.uploadFile({ name: "a.mrxs", size: 30 });
 		h.up.uploadFile({ name: "huge.svs", size: 5000 });
-		expect(FakeXHR.instances).toHaveLength(3);       // 全部 legacy（小文件）
-		FakeXHR.instances.forEach((x) => expect(x.open).toHaveBeenCalledWith("POST", "/api/upload"));
-		expect(h.fetchCalls().some((c) => c.url === "/api/ingestions")).toBe(false);
+		expect(FakeXHR.instances).toHaveLength(0);
+		expect(h.fetchCalls().length).toBe(0);
+		expect(h.toastMessages.some((m) => m.indexOf("不支持该文件格式") >= 0)).toBe(true);
+		expect(h.toastMessages.some((m) => m.indexOf("超过平台上限") >= 0)).toBe(true);
 	});
 });
 
@@ -386,7 +384,6 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 			slide_id_api: true,
 			cos_upload: cosCaps(),
 		} });
-		h.up.setCosManual(true);
 		const file = cosFile(30);
 		h.up.uploadFile(file);
 		await vi.advanceTimersByTimeAsync(0);
@@ -481,7 +478,6 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 			return Promise.resolve(resp({}));
 		}) as unknown as typeof fetch;
 		const h = loadApp(fetchImpl, { mode: "official", capabilities: { cos_upload: cosCaps() } });
-		h.up.setCosManual(true);
 		h.up.uploadFile(cosFile(30));
 		await flush(12);
 		// 重试延迟 600ms（真实定时器）后 part 2 成功 → 全部 confirmed → complete → viewable
@@ -499,37 +495,28 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 });
 
 // --------------------------------------------------------------------------- #
-// 4. 422 cos_exceeds_admission → 说明 + 「改用平台上传」显式按钮
+// 4. 413 upload_too_large → 可读说明；无另一后端按钮（回退策略已退役）
 // --------------------------------------------------------------------------- #
-describe("422 cos_exceeds_admission：显式平台重试（非自动换路）", () => {
-	it("row 显示可读说明 + 按钮；点击后走平台路径（legacy /api/upload）", async () => {
+describe("413 upload_too_large：说明 + 无回退入口", () => {
+	it("row 显示可读说明；无任何「平台上传」按钮/XHR（不提供另一后端）", async () => {
 		const fetchImpl = vi.fn((url: string, opts?: RequestInit) => {
 			if (url === "/api/ingestions" && opts && opts.method === "POST") {
-				return Promise.resolve(resp({
-					code: "cos_exceeds_admission", max_size_bytes: 900000, fallback_transport: "v2",
-				}, 422));
+				return Promise.resolve(resp({ code: "upload_too_large", max_size_bytes: 900000 }, 413));
 			}
 			return Promise.resolve(resp({}));
 		}) as unknown as typeof fetch;
 		const h = loadApp(fetchImpl, { mode: "official", capabilities: { cos_upload: cosCaps() } });
-		h.up.setCosManual(true);
 		const file = cosFile(30, "small.svs");
 		h.up.uploadFile(file);
 		await flush(12);
 		// 可读文案（稳定码不透出原文）
-		expect(h.toastMessages.some((m) => m.indexOf("文件超过云端直传大小上限") >= 0)).toBe(true);
-		// 行上出现「改用平台上传」按钮
+		expect(h.toastMessages.some((m) => m.indexOf("文件超过平台上限") >= 0)).toBe(true);
+		// 行上只有「取消」按钮——没有「改用平台上传」
 		const row = h.container.appendChildren[h.container.appendChildren.length - 1];
 		const btns = row.children.filter((c) => String(c.tagName) === "BUTTON");
-		const retry = btns.find((b) => b.textContent === "改用平台上传");
-		expect(retry).toBeTruthy();
-		// 点击 → 全新平台任务（小文件 → legacy XHR，带 CSRF）
+		expect(btns.some((b) => String(b.textContent).indexOf("平台") >= 0)).toBe(false);
+		// 不触发 V1 XHR、不重试创建
 		expect(FakeXHR.instances).toHaveLength(0);
-		fire(retry!, "click", { preventDefault() {} });
-		await flush(4);
-		expect(FakeXHR.instances).toHaveLength(1);
-		expect(FakeXHR.instances[0].open).toHaveBeenCalledWith("POST", "/api/upload");
-		// 没有第二次 COS 创建（不在 COS 路径内自动重试/换路）
 		expect(h.fetchCalls().filter((c) => c.url === "/api/ingestions").length).toBe(1);
 	});
 });
@@ -574,7 +561,6 @@ describe("waiting_capacity：排队展示与轮询推进", () => {
 			return Promise.resolve(resp({}));
 		}) as unknown as typeof fetch;
 		const h = loadApp(fetchImpl, { mode: "official", capabilities: { cos_upload: cosCaps() } });
-		h.up.setCosManual(true);
 		h.up.uploadFile(cosFile(16));
 		await vi.advanceTimersByTimeAsync(0);
 		const row = h.container.appendChildren[h.container.appendChildren.length - 1];
@@ -672,7 +658,6 @@ describe("刷新恢复：只读进度行与终态清理", () => {
 			{ job_id: "inj_r", filename: "big.svs", size: 30, confirmed: [1, 2] },
 		]));
 		h.confirmMock.mockReturnValue(true);   // 用户确认续传
-		h.up.setCosManual(true);
 		h.up.uploadFile(cosFile(30, "big.svs"));
 		await flush(12);
 		// 不创建新任务（无 POST /api/ingestions），只签未确认分块 [3,4]
@@ -688,14 +673,16 @@ describe("刷新恢复：只读进度行与终态清理", () => {
 // 7. i18n：键存在性（zh/en）+ stage 映射 + _EXTRA_I18N 兜底同步
 // --------------------------------------------------------------------------- #
 describe("i18n：upload.cos.* 键（zh/en）与 stage 映射", () => {
-	const STAGE_KEYS = ["waiting_space", "uploading", "awaiting_server", "downloading", "validating", "readiness", "viewable"];
+  	const STAGE_KEYS = ["waiting_space", "uploading", "awaiting_server", "downloading", "validating", "processing", "readiness", "viewable"];
 	const OTHER_KEYS = [
-		"upload.cos.toggle", "upload.cos.toggle.tip", "upload.cos.queue", "upload.cos.cancel",
-		"upload.cos.cancelled", "upload.cos.retry", "upload.cos.retry_platform",
+		"upload.cos.queue", "upload.cos.cancel",
+		"upload.cos.cancelled", "upload.cos.retry",
 		"upload.cos.resume_hint", "upload.cos.resume_confirm",
-		"upload.cos.err.exceeds_admission", "upload.cos.err.format_unsupported",
+		"upload.cos.err.format_unsupported", "upload.cos.err.too_large",
+		"upload.cos.err.pool_config", "upload.cos.unavailable",
+		"upload.cos.items", "upload.cos.conv_state",
 		"upload.cos.err.waiting_limit", "upload.cos.err.state", "upload.cos.err.rate",
-		"upload.cos.err.reconcile", "upload.cos.err.unavailable",
+		"upload.cos.err.reconcile",
 	];
 
 	function loadI18n() {

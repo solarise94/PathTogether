@@ -1,15 +1,15 @@
 /**
  * uploadFile / Upload V2 分片上传器（上传修复 U3 / test-review P3-18）。
  *
- * 用 loadApp harness（同 upload-csrf.test.ts）驱动**真实** app.js：
- *  - 大文件（size ≥ 阈值（A1 起为服务端下发的 16MiB），非 ZIP/MRXS）走 V2：
- *    先 POST /api/uploads 创建任务（apiFetch → fetch，请求头带 X-CSRF-Token），
- *    再逐片 PUT /api/uploads/<id>/chunk（裸 XHR，同样带头 + offset/sha256
- *    query），最后 POST commit；
+ * 用 loadApp harness（同 upload-csrf.test.ts）驱动**真实** app.js
+ * （U3 统一 COS 后：V2 适配器仅排空过渡保留，检查点 B 删除）：
+ *  - V2 适配器直驱：POST /api/uploads 创建任务（apiFetch → fetch，请求头带
+ *    X-CSRF-Token），逐片 PUT /api/uploads/<id>/chunk（裸 XHR，同样带头 +
+ *    offset/sha256 query），最后 POST commit；
  *  - 分片串行推进以服务端 confirmed_offset 为准；offset_mismatch 409 对齐重传；
- *  - 刷新恢复：localStorage 记录 (name,size,lastModified)→upload_id，续传从
- *    confirmed_offset 起；
- *  - 小文件仍走旧 POST /api/upload（XHR 带头）；
+ *  - 刷新恢复（经 uploadFile 的排空过渡 handoff）：localStorage v3 记录
+ *    (name,size)→upload_id，续传从 confirmed_offset 起，不新建任务；
+ *  - 无旧任务且 COS capability 未下发 → uploadFile 零网络请求（不回退）；
  *  - 多文件各自独立进度行（修共用进度条 bug）。
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -147,8 +147,9 @@ function loadApp(fetchImpl?: typeof fetch, bootstrap?: unknown) {
 	new Function("window", "document", "fetch", "location", appSrc)(w, doc, theFetch, loc);
 	return {
 		uploadFile: (w.HP_UPLOAD as { uploadFile: (f: unknown) => void }).uploadFile,
-		shouldChunkUpload: (w.HP_UPLOAD as { shouldChunkUpload: (f: unknown) => boolean }).shouldChunkUpload,
-		threshold: (w.HP_UPLOAD as { UPLOAD_V2_THRESHOLD: number }).UPLOAD_V2_THRESHOLD,
+		uploadFileV2: (w.HP_UPLOAD as {
+			uploadFileV2: (f: unknown, row: unknown, resumeOnly?: boolean) => unknown;
+		}).uploadFileV2,
 		fetchCalls: () => ((theFetch as unknown as { mock?: { calls: FetchCall[][] } }).mock
 			? ((theFetch as unknown as vi.Mock).mock.calls as unknown as FetchCall[][]).map(
 				([url, opts]) => ({ url, opts: opts || {} }))
@@ -176,53 +177,11 @@ function bigFile(size = THRESHOLD + 16) {
 	};
 }
 
+const stubRow = () => ({ setStage() {}, finish() {}, markError() {} });
+
 afterEach(() => {
 	vi.unstubAllGlobals();
 	FakeXHR.instances = [];
-});
-
-describe("shouldChunkUpload 阈值与类型裁定（A1：16MiB 唯一权威）", () => {
-	it("无 bootstrap 时回落 16MiB：<16MiB false，=16MiB true，>16MiB true", () => {
-		const h = loadApp();
-		expect(h.threshold).toBe(THRESHOLD);
-		expect(h.shouldChunkUpload({ name: "a.svs", size: THRESHOLD - 1 })).toBe(false);
-		expect(h.shouldChunkUpload({ name: "a.svs", size: THRESHOLD })).toBe(true);
-		expect(h.shouldChunkUpload({ name: "a.svs", size: THRESHOLD + 1 })).toBe(true);
-		expect(h.shouldChunkUpload({ name: "a.svs", size: 3 })).toBe(false);
-	});
-
-	it("ZIP/MRXS 例外：任意大小都走旧接口（阈值不影响）", () => {
-		const h = loadApp();
-		expect(h.shouldChunkUpload({ name: "a.zip", size: THRESHOLD * 2 })).toBe(false);
-		expect(h.shouldChunkUpload({ name: "a.mrxs", size: THRESHOLD * 2 })).toBe(false);
-	});
-
-	it("bootstrap 下发阈值时以其为准（服务端唯一权威）", () => {
-		const h = loadApp(undefined, {
-			mode: "official",
-			capabilities: { upload_v2_threshold_bytes: 32 * 1024 * 1024 },
-		});
-		expect(h.threshold).toBe(32 * 1024 * 1024);
-		expect(h.shouldChunkUpload({ name: "a.svs", size: 16 * 1024 * 1024 })).toBe(false);
-		expect(h.shouldChunkUpload({ name: "a.svs", size: 32 * 1024 * 1024 })).toBe(true);
-	});
-
-	it("bootstrap 缺失 key / 非法值回落 16MiB", () => {
-		const h1 = loadApp(undefined, { mode: "official", capabilities: {} });
-		expect(h1.threshold).toBe(THRESHOLD);
-		const h2 = loadApp(undefined, {
-			mode: "official",
-			capabilities: { upload_v2_threshold_bytes: "garbage" },
-		});
-		expect(h2.threshold).toBe(THRESHOLD);
-		const h3 = loadApp(undefined, {
-			mode: "official",
-			capabilities: { upload_v2_threshold_bytes: -5 },
-		});
-		expect(h3.threshold).toBe(THRESHOLD);
-		const h4 = loadApp(undefined, { mode: "official" }); // capabilities 缺失
-		expect(h4.threshold).toBe(THRESHOLD);
-	});
 });
 
 describe("大文件走 Upload V2（/api/uploads + 分片 PUT + commit）", () => {
@@ -258,7 +217,8 @@ describe("大文件走 Upload V2（/api/uploads + 分片 PUT + commit）", () =>
 			capabilities: { slide_id_api: true },
 		});
 		const file = bigFile(THRESHOLD + 16); // chunk_size=8 → 2 片 + 尾片（由响应推进）
-		h.uploadFile(file);
+		// U3：V2 适配器直驱（新任务不再路由到 V2——排空过渡期验证适配器契约）
+		h.uploadFileV2(file, stubRow());
 		await flush();
 
 		// ① 创建任务：POST /api/uploads，CSRF 头由 apiFetch 注入
@@ -318,7 +278,7 @@ describe("大文件走 Upload V2（/api/uploads + 分片 PUT + commit）", () =>
 			}),
 		} as unknown as Response)) as unknown as typeof fetch;
 		const h = loadApp(fetchImpl);
-		h.uploadFile(bigFile(THRESHOLD + 16));
+		h.uploadFileV2(bigFile(THRESHOLD + 16), stubRow());
 		await flush();
 		const put1 = FakeXHR.instances[0];
 		// 服务端声称已确认 4 字节（客户端发的 offset=0 被拒）→ 对齐后重发 offset=4
@@ -422,16 +382,13 @@ describe("大文件走 Upload V2（/api/uploads + 分片 PUT + commit）", () =>
 		});
 	});
 
-describe("小文件仍走旧 /api/upload（U1 契约不回退）", () => {
-	it("小文件：XHR POST /api/upload 带头，不创建 V2 任务", async () => {
+describe("无旧任务 + COS capability 未下发 → uploadFile 零网络请求（U3 不回退）", () => {
+	it("不发 V1 XHR、不建 V2/COS 任务（禁用创建提示）", async () => {
 		const h = loadApp();
 		h.uploadFile({ name: "small.svs", size: 3 });
 		await flush();
-		expect(FakeXHR.instances).toHaveLength(1);
-		const xhr = FakeXHR.instances[0];
-		expect(xhr.open).toHaveBeenCalledWith("POST", "/api/upload");
-		expect(xhr.setRequestHeader).toHaveBeenCalledWith("X-CSRF-Token", "tok");
-		expect(h.fetchCalls().some((c) => c.url === "/api/uploads")).toBe(false);
+		expect(FakeXHR.instances).toHaveLength(0);
+		expect(h.fetchCalls().length).toBe(0);
 	});
 });
 

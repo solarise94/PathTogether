@@ -109,6 +109,21 @@ R14 修订（docs/review-evidence/r14/）：
     所需文件交给清理器）；intent/token 存在性进入冻结前态裁决字段。
     终态任务的 intent json 按合同长期保留，不视为未决（守卫仅限活跃）。
 
+R15 修订（docs/review-evidence/r15/）：
+  - **配额身份合同（0074 quota_mode）**：upload_tasks 创建时快照
+    duty/exempt（upload_task_store._pg_insert 统一注入——V1/V2 全通道；
+    与 quota_applies 同语义：role=user → duty，owner/guest/sdk/本地免登录
+    空 owner → exempt）。核账凭快照判定豁免，不凭 rid 缺失终止；存量
+    NULL 按当前角色裁决；非空 owner 无用户行 = 不可证明 → blocker
+    `identity_unresolvable`（不自动终止）。角色事后经 SQL 变更不影响
+    历史裁决（快照优先）。
+  - **repair 建立清理工作**：upload 通道 repair 同事务 upsert
+    upload_cleanup_pending（终态无 rid/pending 残留不再只有责任没有清理
+    器可领的工作）；COS 通道 repair 将 none/cleaned 的
+    local_cleanup_status 重置 pending（pending/failed 原样保留重试资格，
+    不动远端清理结果）。应用后终验增加「待清残留必须有可领取的持久
+    清理工作」（residue_without_cleanup_work）。
+
 ## 3. 锁图（全部事务的实际加锁顺序）
 
 ```

@@ -1,0 +1,123 @@
+FF                                                                       [100%]
+=================================== FAILURES ===================================
+__________________ test_terminal_repair_creates_cleanup_work ___________________
+/tmp/slide-id-review-r15/test_r15.py:28: in test_terminal_repair_creates_cleanup_work
+    assert pending and pending['reservation_id']==task['reservation_id'], (task['state'],pending)
+E   AssertionError: ('failed', None)
+E   assert (None)
+----------------------------- Captured stdout call -----------------------------
+{
+  "mode": "plan-out",
+  "tool_version": "r14.1",
+  "actions": [
+    {
+      "action_key": "repair:upload_task:upt_r15_terminal",
+      "action": "repair",
+      "kind": "upload_task",
+      "id": "upt_r15_terminal",
+      "owner": "usr_73DMZG8gR4s",
+      "evidence": {
+        "bytes": 100,
+        "files": 1,
+        "manifest_files": 1
+      }
+    }
+  ],
+  "blockers": [],
+  "over_quota": [],
+  "pending_work": {
+    "upload_cleanup_pending": [],
+    "ingestion_local_cleanup": []
+  },
+  "note": "dry-run 仅预审；应用需冻结计划（--plan-out） + --apply --plan",
+  "plan_out": "/tmp/pytest-of-solarise/pytest-7/test_terminal_repair_creates_c0/plan.json",
+  "plan_hash": "fc5f4d88fa81618abb86bc3471d782dcf9b1cc8dd0bdcf1e058dcdbbf7cab706"
+}
+{
+  "mode": "apply",
+  "plan_hash": "fc5f4d88fa81618abb86bc3471d782dcf9b1cc8dd0bdcf1e058dcdbbf7cab706",
+  "applied": [
+    {
+      "action_key": "repair:upload_task:upt_r15_terminal",
+      "result": {
+        "repaired": "upr_d71e28188dc1dc2090a71c65",
+        "bytes": 100
+      }
+    }
+  ],
+  "skipped": [],
+  "over_quota": [],
+  "pending_work": {
+    "upload_cleanup_pending": [],
+    "ingestion_local_cleanup": []
+  },
+  "unexplained": [],
+  "note": null
+}
+_____________________ test_owner_upload_survives_reconcile _____________________
+/tmp/slide-id-review-r15/test_r15.py:48: in test_owner_upload_survives_reconcile
+    assert after['state']=='active' and upload_task_store.get_cleanup_pending(tid) is None, after['state']
+E   AssertionError: failed
+E   assert ('failed' == 'active'
+E     
+E     - active
+E     + failed)
+----------------------------- Captured stdout call -----------------------------
+{
+  "mode": "plan-out",
+  "tool_version": "r14.1",
+  "actions": [
+    {
+      "action_key": "stop:upload_task:upt_ea0ae600f2f915a35a165cbc",
+      "action": "stop",
+      "kind": "upload_task",
+      "id": "upt_ea0ae600f2f915a35a165cbc",
+      "observed": "missing",
+      "evidence": {
+        "bytes": 0,
+        "manifest_files": 0
+      }
+    }
+  ],
+  "blockers": [],
+  "over_quota": [],
+  "pending_work": {
+    "upload_cleanup_pending": [],
+    "ingestion_local_cleanup": []
+  },
+  "note": "dry-run 仅预审；应用需冻结计划（--plan-out） + --apply --plan",
+  "plan_out": "/tmp/pytest-of-solarise/pytest-7/test_owner_upload_survives_rec0/owner-plan.json",
+  "plan_hash": "e9554b9a0bad03e786ed27108ad354062617905c48d3052dc4e8a2e9dfdcc4ff"
+}
+{
+  "mode": "apply",
+  "plan_hash": "e9554b9a0bad03e786ed27108ad354062617905c48d3052dc4e8a2e9dfdcc4ff",
+  "applied": [
+    {
+      "action_key": "stop:upload_task:upt_ea0ae600f2f915a35a165cbc",
+      "result": {
+        "stopped": true
+      }
+    }
+  ],
+  "skipped": [],
+  "over_quota": [],
+  "pending_work": {
+    "upload_cleanup_pending": [
+      {
+        "upload_id": "upt_ea0ae600f2f915a35a165cbc",
+        "reservation_id": null,
+        "attempts": 1
+      }
+    ],
+    "ingestion_local_cleanup": []
+  },
+  "unexplained": [],
+  "note": null
+}
+------------------------------ Captured log call -------------------------------
+WARNING  svs.site_stats:site_stats_store.py:287 site_stats: SITE_STATS_ENTRY_HOSTS 未配置或含非法项，停止站点访问采集（页面服务不受影响）
+=========================== short test summary info ============================
+FAILED ../../../../../tmp/slide-id-review-r15/test_r15.py::test_terminal_repair_creates_cleanup_work
+FAILED ../../../../../tmp/slide-id-review-r15/test_r15.py::test_owner_upload_survives_reconcile
+2 failed in 0.67s

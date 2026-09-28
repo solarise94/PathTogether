@@ -527,3 +527,127 @@ def test_ingestion_validating_with_missing_duty_blocked(tmp_path, capsys):
     assert any(b.get("reason") == "commit_intent_unresolved"
                and b.get("id") == "inj_rec_validating"
                for b in body["blockers"])
+
+
+def test_owner_role_task_exempt_no_stop_no_charge(tmp_path):
+    """R15-1：owner 身份上传合法无预约——不 stop/不补费。"""
+    owner = user_store.create_user("rec-owner15@example.com",
+                                   "pass1234pass1234", role="owner")["user_id"]
+    tid = "upt_rec_own15"
+    _task(owner, tid, None)
+    data = slide_storage.staging_dir(tid, "transfer", root=tmp_path) / "d"
+    data.parent.mkdir(parents=True, exist_ok=True)
+    data.write_bytes(b"x" * 40)
+    rc, plan = _freeze("own15", upload_dir=str(tmp_path),
+                       extra=["--repair-residuals"])
+    assert rc == 0
+    assert _apply(plan, upload_dir=str(tmp_path),
+                  extra=["--repair-residuals"]) == 0
+    with psycopg.connect(PG_URI) as db:
+        state = db.execute("SELECT state FROM upload_tasks WHERE"
+                           " upload_id=%s", (tid,)).fetchone()[0]
+        n = db.execute("SELECT COUNT(*) FROM upload_reservations WHERE"
+                       " user_id=%s", (owner,)).fetchone()[0]
+    assert state == "active" and int(n) == 0
+
+
+def test_quota_mode_snapshot_survives_role_change(tmp_path):
+    """R15-1：创建时快照 exempt 的任务在角色改为 user 后不被终止。"""
+    owner = user_store.create_user("rec-role15@example.com",
+                                   "pass1234pass1234", role="owner")["user_id"]
+    tid = "upt_rec_role15"
+    _task(owner, tid, None)
+    with psycopg.connect(PG_URI, autocommit=True) as db:
+        db.execute("UPDATE upload_tasks SET quota_mode='exempt' WHERE"
+                   " upload_id=%s", (tid,))
+        db.execute("UPDATE users SET role='user' WHERE user_id=%s", (owner,))
+    rc, plan = _freeze("role15", upload_dir=str(tmp_path))
+    assert rc == 0
+    assert _apply(plan, upload_dir=str(tmp_path)) == 0
+    with psycopg.connect(PG_URI) as db:
+        state = db.execute("SELECT state FROM upload_tasks WHERE"
+                           " upload_id=%s", (tid,)).fetchone()[0]
+        n = db.execute("SELECT COUNT(*) FROM upload_cleanup_pending WHERE"
+                       " upload_id=%s", (tid,)).fetchone()[0]
+    assert state == "active" and int(n) == 0
+
+
+def test_identity_unresolvable_blocks_not_stops(tmp_path):
+    """R15-1：非空 owner 无用户行 = 身份不可证明 → blocker，不自动终止。"""
+    tid = "upt_rec_ghost15"
+    _task("usr_r15_ghost", tid, None)
+    rc, plan = _freeze("ghost15", upload_dir=str(tmp_path))
+    assert rc == 3
+    assert _apply(plan, upload_dir=str(tmp_path)) == 3
+    with psycopg.connect(PG_URI) as db:
+        state = db.execute("SELECT state FROM upload_tasks WHERE"
+                           " upload_id=%s", (tid,)).fetchone()[0]
+        n = db.execute("SELECT COUNT(*) FROM "
+                       "upload_capacity_repair_receipts").fetchone()[0]
+    assert state == "active" and int(n) == 0
+
+
+def test_upload_repair_full_chain_single_release(tmp_path):
+    """R15-2 全链路（V1/V2 通道）：发现→补记→pending 可领取→清理确认
+    →恰一次释放→同计划重跑 no-op。"""
+    uid = _uid("chain15")
+    tid = "upt_rec_chain15"
+    _task(uid, tid, None, state="failed")
+    data = slide_storage.staging_dir(tid, "transfer", root=tmp_path) / "d"
+    data.parent.mkdir(parents=True, exist_ok=True)
+    data.write_bytes(b"x" * 100)
+    rc, plan = _freeze("chain15", upload_dir=str(tmp_path),
+                       extra=["--repair-residuals"])
+    assert rc == 0
+    assert _apply(plan, upload_dir=str(tmp_path),
+                  extra=["--repair-residuals"]) == 0
+    import upload_task_store
+    task = upload_task_store.get_task(tid)
+    pend = upload_task_store.get_cleanup_pending(tid)
+    assert task["reservation_id"] and pend and \
+        pend["reservation_id"] == task["reservation_id"]
+    assert _q(uid) == (0, 100)  # pending 未清理：责任保留
+    slide_storage.remove_staging_tree(tid, root=tmp_path)
+    upload_task_store.confirm_cleanup_and_release(tid)
+    assert _q(uid) == (0, 0)
+    assert upload_guard.get_reservation(task["reservation_id"])[
+        "state"] == "released"
+    assert _apply(plan, upload_dir=str(tmp_path),
+                  extra=["--repair-residuals"]) == 0
+    assert _q(uid) == (0, 0)  # 重跑不重复补账
+
+
+def test_ingestion_repair_full_chain_single_release(tmp_path):
+    """R15-2 全链路（COS 通道）：终态 none 残留→补记+pending→清理确认
+    →恰一次释放→同计划重跑 no-op。"""
+    uid = _uid("ing15")
+    jid = "inj_rec_chain15"
+    with psycopg.connect(PG_URI, autocommit=True) as db:
+        db.execute(
+            "INSERT INTO ingestion_jobs (job_id, owner_user_id, owner_role,"
+            " filename, safe_name, format_ext, declared_size, state,"
+            " local_cleanup_status)"
+            " VALUES (%s, %s, 'user', 'a.svs', 'a.svs', 'svs', 100,"
+            " 'failed', 'none')", (jid, uid))
+    data = slide_storage.staging_dir(jid, "transfer", root=tmp_path) / "d"
+    data.parent.mkdir(parents=True, exist_ok=True)
+    data.write_bytes(b"x" * 100)
+    rc, plan = _freeze("ing15", upload_dir=str(tmp_path),
+                       extra=["--repair-residuals"])
+    assert rc == 0
+    assert _apply(plan, upload_dir=str(tmp_path),
+                  extra=["--repair-residuals"]) == 0
+    with psycopg.connect(PG_URI) as db:
+        rid, status = db.execute(
+            "SELECT local_reservation_id, local_cleanup_status FROM"
+            " ingestion_jobs WHERE job_id=%s", (jid,)).fetchone()
+    assert rid and status == "pending"
+    assert _q(uid) == (0, 100)
+    import ingestion_store
+    slide_storage.remove_staging_tree(jid, root=tmp_path)
+    ingestion_store.confirm_local_cleanup(jid)
+    assert _q(uid) == (0, 0)
+    assert upload_guard.get_reservation(rid)["state"] == "released"
+    assert _apply(plan, upload_dir=str(tmp_path),
+                  extra=["--repair-residuals"]) == 0
+    assert _q(uid) == (0, 0)

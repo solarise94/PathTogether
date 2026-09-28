@@ -56,7 +56,7 @@ import slide_storage
 import upload_guard
 
 SCHEMA_VERSION = 1
-TOOL_VERSION = "r14.1"
+TOOL_VERSION = "r15.1"
 
 _ACTIVE_UPLOAD_TASK_STATES = ("active", "committing")
 _ACTIVE_INGESTION_STATES = ("preparing", "uploading", "completing", "queued",
@@ -67,6 +67,7 @@ _HOLDER_ID_KEY = {"upload_task": "upload_id", "ingestion_job": "job_id",
                   "baidu_batch": "batch_id"}
 _TARGET_SQL = {
     "upload_task": "SELECT state, reservation_id, owner_user_id,"
+                   " quota_mode,"
                    " (commit_intent_json IS NOT NULL) AS has_intent,"
                    " (commit_token IS NOT NULL) AS has_token FROM"
                    " upload_tasks WHERE upload_id=%s",
@@ -176,10 +177,12 @@ def scan_task_tree(upload_dir, task_id):
 def collect(cur, upload_dir):
     cur.execute(
         "SELECT t.upload_id, t.owner_user_id, t.state, t.reservation_id AS"
-        " rid, t.commit_intent_json, t.commit_token, r.state AS rstate,"
+        " rid, t.commit_intent_json, t.commit_token, t.quota_mode,"
+        " u.role AS owner_role, r.state AS rstate,"
         " r.user_id AS ruser, r.reserved_bytes,"
         " r.holder_kind, r.holder_id FROM upload_tasks t"
         " LEFT JOIN upload_reservations r ON r.reservation_id=t.reservation_id"
+        " LEFT JOIN users u ON u.user_id=t.owner_user_id"
         " ORDER BY t.upload_id")
     tasks = [dict(r) for r in cur.fetchall()]
 
@@ -209,16 +212,19 @@ def collect(cur, upload_dir):
     items = []
     deferred = []  # R14-1：已知终态但无 rid/pending 者——扫描后再决定入集
     for t in tasks:
+        t["quota_duty"] = _upload_quota_duty(t)
+        duty = t["quota_duty"]
+        suffix = "" if duty else ("_exempt" if duty is False else "")
         if t["state"] in _ACTIVE_UPLOAD_TASK_STATES:
-            items.append(("upload_task", t))
+            items.append(("upload_task" + suffix, t))
         elif t["rid"] or t["upload_id"] in pending_by_task:
             row = dict(t)
             row["pending"] = pending_by_task.get(t["upload_id"])
-            items.append(("upload_task_terminal", row))
+            items.append(("upload_task_terminal" + suffix, row))
         else:
             row = dict(t)
             row["pending"] = None
-            deferred.append(("upload_task_terminal", row))
+            deferred.append(("upload_task_terminal" + suffix, row))
     for j in jobs:
         duty = (j["owner_role"] == "user" and (j["owner_user_id"] or ""))
         if j["state"] in _ACTIVE_INGESTION_STATES:
@@ -330,6 +336,24 @@ def _base_kind(kind):
         "_exempt", "")
 
 
+def _upload_quota_duty(row):
+    """R15：上传任务配额身份合同（与 upload_guard.quota_applies 同语义）。
+
+    创建时快照（0074 quota_mode）优先——角色事后经 SQL 变更不影响历史
+    裁决；存量 NULL 按当前 users.role：空 owner=本地免登录豁免；非 user
+    角色豁免；无用户行（非空 owner）= 不可证明 → None（核账阻断人工核
+    对，不自动终止）。"""
+    qm = row.get("quota_mode")
+    if qm in ("duty", "exempt"):
+        return qm == "duty"
+    if not (row.get("owner_user_id") or ""):
+        return False  # 本地免登录 owner（0017 合同：空 user_id）
+    role = row.get("owner_role")
+    if role is None:
+        return None  # 非空 owner 但无用户行：身份不可证明
+    return role == "user"
+
+
 def classify(kind, row):
     """(kind,row) → ok/bind/missing/released/consumed/mismatch_*。"""
     if kind.endswith("_exempt"):
@@ -386,6 +410,14 @@ def plan_actions(state, repair_residuals):
         tid = row[_HOLDER_ID_KEY[base_kind]]
         rid = row.get("rid") or (row.get("pending") or
                                 {}).get("reservation_id")
+        if kind.startswith("upload_task") and \
+                row.get("quota_duty") is None:
+            # R15-1：非空 owner 无用户行——身份不可证明，不能凭 rid 缺失
+            # 推断 duty/豁免 → 阻断人工核对，不自动终止。
+            blockers.append({"kind": kind, "id": tid,
+                             "reason": "identity_unresolvable",
+                             "owner": row.get("owner_user_id")})
+            continue
         if verdict == "ok":
             continue
         if verdict == "bind":
@@ -718,25 +750,53 @@ def apply_action(cur, act):
             cur.execute("UPDATE upload_tasks SET reservation_id=%s,"
                         " updated_at=now() WHERE upload_id=%s",
                         (res["reservation_id"], tid))
-            cur.execute("UPDATE upload_cleanup_pending SET reservation_id=%s,"
-                        " updated_at=now() WHERE upload_id=%s",
-                        (res["reservation_id"], tid))
+            # R15-2：责任 + 绑定 + 持久清理工作同一事务齐全——终态补记
+            # 未必有前置 stop 建行（R14 发现的终态无 rid/pending 残留），
+            # 幂等 upsert 保证清理器可领取。
+            cur.execute(
+                "INSERT INTO upload_cleanup_pending (upload_id,"
+                " reservation_id, attempts, last_error)"
+                " VALUES (%s, %s, 1, 'reconcile: residual duty re-attached')"
+                " ON CONFLICT (upload_id) DO UPDATE SET"
+                " reservation_id = EXCLUDED.reservation_id,"
+                " updated_at = now()",
+                (tid, res["reservation_id"]))
         else:
-            cur.execute("UPDATE ingestion_jobs SET local_reservation_id=%s,"
-                        " updated_at=now() WHERE job_id=%s",
-                        (res["reservation_id"], tid))
+            # COS：本地责任绑定 + 清理工作重置为可领取（none/cleaned →
+            # pending；pending/failed 原样保留重试资格；不动远端清理结果）。
+            cur.execute(
+                "UPDATE ingestion_jobs SET local_reservation_id=%s,"
+                " local_cleanup_status = CASE WHEN local_cleanup_status IN"
+                " ('pending','failed') THEN local_cleanup_status ELSE"
+                " 'pending' END,"
+                " updated_at=now() WHERE job_id=%s",
+                (res["reservation_id"], tid))
         return {"repaired": res["reservation_id"],
                 "bytes": int(act["evidence"]["bytes"])}
     raise ValueError("未知动作：%r" % act["action"])
 
 
 def _unexplained_after(state, actions_left, blockers_left):
-    """应用后不得为 0 的项：残留无 duty / dangling / 未知目录 / 计划外。"""
+    """应用后不得为 0 的项：残留无 duty / dangling / 未知目录 / 计划外 /
+    待清残留无可领取的持久清理工作（R15-2 终验）。"""
     problems = list(blockers_left)
     for a in actions_left:
         problems.append({"kind": a["kind"], "id": a["id"],
                          "reason": "action_still_pending",
                          "action_key": a["action_key"]})
+    for kind, row in state["items"]:
+        if kind == "upload_task_terminal" and \
+                int(row.get("staging_bytes") or 0) > 0:
+            pend = row.get("pending")
+            if not pend or not (pend.get("reservation_id")
+                                or row.get("rid")):
+                problems.append({"kind": kind, "id": row.get("upload_id"),
+                                 "reason": "residue_without_cleanup_work"})
+        elif kind == "ingestion_job_cleanup" and \
+                int(row.get("staging_bytes") or 0) > 0 and \
+                row.get("local_cleanup_status") not in ("pending", "failed"):
+            problems.append({"kind": kind, "id": row.get("job_id"),
+                             "reason": "residue_without_cleanup_work"})
     return problems
 
 

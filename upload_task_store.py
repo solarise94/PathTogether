@@ -271,6 +271,8 @@ _TASK_FIELDS = (
     # commit_intent_json 与任务置 committing 同事务写入（begin_commit /
     # begin_legacy_commit 的 CAS 内），发布收口短事务内清空。
     "slide_id", "commit_intent_json",
+    # 0074（R15 核账合同）：创建时配额身份快照——duty/exempt；NULL=存量。
+    "quota_mode",
 )
 
 # epoch 秒（float/int）入参 → timestamptz 的键
@@ -407,12 +409,32 @@ def _task_row(task):
     return tuple(_to_db_value(k, task[k]) for k in _TASK_FIELDS)
 
 
+def _quota_mode_snapshot(conn, owner_user_id):
+    """创建时配额身份快照（0074；R15 核账合同）。
+
+    与 upload_guard.quota_applies 同一身份语义：本地免登录（空 owner）与
+    非 user 角色 → 'exempt'（合法无预约）；role=user → 'duty'。无用户行
+    时按 'duty' 落库（宁可多记责任），核账侧对不可证明身份另行阻断。"""
+    uid = str(owner_user_id or "")
+    if not uid:
+        return "exempt"
+    with conn.cursor() as cur:
+        cur.execute("SELECT role FROM users WHERE user_id=%s", (uid,))
+        row = cur.fetchone()
+    if row is None:
+        return "duty"
+    return "duty" if (row["role"] or "") == "user" else "exempt"
+
+
 def _pg_insert(task, conn=None):
     """INSERT 任务行；conn 给出时复用调用方事务（P3：allocate_slide 同事务绑定）。"""
     own = conn is None
     if own:
         conn = _pg_connect()
     try:
+        if task.get("quota_mode") is None:
+            task["quota_mode"] = _quota_mode_snapshot(
+                conn, task.get("owner_user_id"))
         with pg_store.transaction(conn):
             with conn.cursor() as cur:
                 cur.execute(
@@ -460,6 +482,7 @@ def create_task(owner_user_id, filename, safe_name, declared_size, chunk_size,
         "v1_artifacts": None,
         "slide_id": (str(slide_id) if slide_id else None),
         "commit_intent_json": None,
+        "quota_mode": None,
     }
     _pg_insert(task, conn=conn)
     return task
@@ -519,6 +542,7 @@ def begin_legacy_commit(owner_user_id, filename, safe_name, artifacts,
         "v1_artifacts": arts,
         "slide_id": (str(slide_id) if slide_id else None),
         "commit_intent_json": None,
+        "quota_mode": None,
     }
     if slide_id and intent is not None:
         payload = dict(intent)

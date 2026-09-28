@@ -583,3 +583,36 @@ results.txt——原样入仓为回归 tests/test_slide_id_review_r14.py，不�
 committing 与 COS validating intent 门禁）；R12/R13 反例与生命周期/容量
 批 78 + 上传/zip/kfb/百度/转换/R8–R11 回归批 304 全绿；全量门禁见提交
 信息。
+
+---
+
+## R15（2026-09-28 独立审查处置；基线 b984c5a）
+
+审查记录与反例：docs/review-evidence/r15/（REVIEW.md / test_r15.py.txt /
+results.txt——原样入仓为回归 tests/test_slide_id_review_r15.py，断言不变；
+仅补共享 UPLOAD_DIR 的 autouse 清理 fixture 以适配本仓全量运行，入仓适配
+已注明）。两项处置：
+
+1. **P1 正常 owner 上传被核账误终止**：V1/V2 缺少 COS 已有的身份豁免
+   判定。落地 0074 `upload_tasks.quota_mode`——创建时配额身份快照
+   （upload_task_store._pg_insert 统一注入 create_task/
+   begin_legacy_commit，即 V1/V2 全通道；语义同 quota_applies：
+   role=user → duty，owner/guest/sdk/本地免登录空 owner → exempt）。
+   核账 collect JOIN users 按快照判 duty/exempt（豁免任务不入 stop/
+   repair、不收费、状态不变）；存量 NULL 按当前角色裁决（R12 反例的
+   raw 任务不受影响）；非空 owner 无用户行 = 不可证明 → blocker
+   `identity_unresolvable`（no-go 而非 stop）。_TARGET_SQL 增列；
+   TOOL_VERSION r15.1。角色事后经 SQL 变更不影响历史裁决。
+2. **P2 终态残留补账后无清理工作**：repair 定义为同事务「责任 + 绑定 +
+   持久清理工作」——upload 通道对 upload_cleanup_pending 幂等 upsert
+   （INSERT ... ON CONFLICT DO UPDATE，终态无前置 stop 建行也可领取）；
+   COS 通道 repair 将 none/cleaned 的 local_cleanup_status 重置 pending
+   （pending/failed 原样，不动远端清理结果）。应用后终验新增
+   residue_without_cleanup_work（待清残留必须有可领取的持久清理工作）。
+
+**测试**：R15 两反例转绿；tests/test_reconcile_upload_capacity.py 25→30
+（owner 豁免不终止不收费 / quota_mode 快照抵御角色变更 / 身份不可证明
+阻断零写入 / V1-V2 与 COS 双通道「发现→补记→pending 可领取→清理确认
+→恰一次释放→同计划重跑 no-op」全链路）；test_pg_infra 迁移清单 +0074；
+上传/zip/kfb/百度/转换/删除/发布/R8–R14 回归 + 生命周期批 382 全绿；
+全量门禁见提交信息。

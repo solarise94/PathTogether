@@ -311,6 +311,9 @@ def test_schema_migrations_recorded(conn):
         "0071_upload_cleanup_pending.sql",
         "0072_upload_capacity_holder_binding.sql",
         "0073_upload_capacity_repair_receipts.sql",
+        # R15 核账身份合同：任务创建时配额身份快照（duty/exempt；NULL=存量
+        # 按当前角色裁决）——核账工具不再凭 rid 缺失终止合法豁免任务。
+        "0074_upload_tasks_quota_mode.sql",
     ]
 
 

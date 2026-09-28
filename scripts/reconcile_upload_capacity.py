@@ -56,7 +56,7 @@ import slide_storage
 import upload_guard
 
 SCHEMA_VERSION = 1
-TOOL_VERSION = "r13.1"
+TOOL_VERSION = "r14.1"
 
 _ACTIVE_UPLOAD_TASK_STATES = ("active", "committing")
 _ACTIVE_INGESTION_STATES = ("preparing", "uploading", "completing", "queued",
@@ -66,10 +66,14 @@ _PURPOSE = {"upload_task": "upload", "ingestion_job": "ingest_local",
 _HOLDER_ID_KEY = {"upload_task": "upload_id", "ingestion_job": "job_id",
                   "baidu_batch": "batch_id"}
 _TARGET_SQL = {
-    "upload_task": "SELECT state, reservation_id, owner_user_id FROM "
-                   "upload_tasks WHERE upload_id=%s",
+    "upload_task": "SELECT state, reservation_id, owner_user_id,"
+                   " (commit_intent_json IS NOT NULL) AS has_intent,"
+                   " (commit_token IS NOT NULL) AS has_token FROM"
+                   " upload_tasks WHERE upload_id=%s",
     "ingestion_job": "SELECT state, local_reservation_id, owner_user_id,"
-                     " owner_role FROM ingestion_jobs WHERE job_id=%s",
+                     " owner_role,"
+                     " (commit_intent_json IS NOT NULL) AS has_intent FROM"
+                     " ingestion_jobs WHERE job_id=%s",
     "baidu_batch": "SELECT state, quota_reservation_id, owner_user_id FROM"
                    " baidu_import_batches WHERE id=%s",
 }
@@ -172,7 +176,8 @@ def scan_task_tree(upload_dir, task_id):
 def collect(cur, upload_dir):
     cur.execute(
         "SELECT t.upload_id, t.owner_user_id, t.state, t.reservation_id AS"
-        " rid, r.state AS rstate, r.user_id AS ruser, r.reserved_bytes,"
+        " rid, t.commit_intent_json, t.commit_token, r.state AS rstate,"
+        " r.user_id AS ruser, r.reserved_bytes,"
         " r.holder_kind, r.holder_id FROM upload_tasks t"
         " LEFT JOIN upload_reservations r ON r.reservation_id=t.reservation_id"
         " ORDER BY t.upload_id")
@@ -181,8 +186,8 @@ def collect(cur, upload_dir):
     cur.execute(
         "SELECT j.job_id, j.owner_user_id, j.owner_role, j.state,"
         " j.local_reservation_id AS rid, j.local_cleanup_status,"
-        " r.state AS rstate, r.user_id AS ruser, r.reserved_bytes,"
-        " r.holder_kind, r.holder_id FROM ingestion_jobs j"
+        " j.commit_intent_json, r.state AS rstate, r.user_id AS ruser,"
+        " r.reserved_bytes, r.holder_kind, r.holder_id FROM ingestion_jobs j"
         " LEFT JOIN upload_reservations r ON r.reservation_id="
         " j.local_reservation_id ORDER BY j.job_id")
     jobs = [dict(r) for r in cur.fetchall()]
@@ -202,6 +207,7 @@ def collect(cur, upload_dir):
     pending_by_task = {p["upload_id"]: p for p in pending_rows}
 
     items = []
+    deferred = []  # R14-1：已知终态但无 rid/pending 者——扫描后再决定入集
     for t in tasks:
         if t["state"] in _ACTIVE_UPLOAD_TASK_STATES:
             items.append(("upload_task", t))
@@ -209,6 +215,10 @@ def collect(cur, upload_dir):
             row = dict(t)
             row["pending"] = pending_by_task.get(t["upload_id"])
             items.append(("upload_task_terminal", row))
+        else:
+            row = dict(t)
+            row["pending"] = None
+            deferred.append(("upload_task_terminal", row))
     for j in jobs:
         duty = (j["owner_role"] == "user" and (j["owner_user_id"] or ""))
         if j["state"] in _ACTIVE_INGESTION_STATES:
@@ -216,6 +226,9 @@ def collect(cur, upload_dir):
                           else "ingestion_job_exempt", j))
         elif j["local_cleanup_status"] in ("pending", "failed"):
             items.append(("ingestion_job_cleanup", j))
+        else:
+            deferred.append(("ingestion_job_cleanup" if duty
+                             else "ingestion_job_exempt", j))
     for b in batches:
         if b["state"] in ("queued", "running"):
             items.append(("baidu_batch", b))
@@ -255,6 +268,32 @@ def collect(cur, upload_dir):
         " quota_bytes ORDER BY user_id")
     over_quota = [dict(r) for r in cur.fetchall()]
 
+    # R14-2：逐用户双向核对账本——quota.reserved_bytes 必须等于该用户
+    # state='reserved' 预约合计（reservation_holds_capacity 语义；admission
+    # 与 reconcile 来源同账）。多记/少记/缺配额行均为不可解释差额。
+    cur.execute(
+        "SELECT COALESCE(q.user_id, r.user_id) AS user_id,"
+        " (MAX(q.user_id) IS NOT NULL) AS has_quota_row,"
+        " MAX(q.reserved_bytes) AS quota_reserved,"
+        " COALESCE(SUM(CASE WHEN r.state='reserved' THEN r.reserved_bytes"
+        " ELSE 0 END), 0)::bigint AS sum_reserved FROM upload_user_quotas q"
+        " FULL JOIN upload_reservations r ON r.user_id=q.user_id"
+        " GROUP BY 1 ORDER BY 1")
+    quota_drift = []
+    for r in cur.fetchall():
+        row = dict(r)
+        quota_r = int(row["quota_reserved"] or 0)
+        sum_r = int(row["sum_reserved"] or 0)
+        if quota_r == sum_r:
+            continue
+        quota_drift.append({
+            "user_id": row["user_id"],
+            "reason": ("quota_row_missing" if not row["has_quota_row"]
+                       else ("ledger_over" if quota_r > sum_r
+                             else "ledger_under")),
+            "quota_reserved_bytes": quota_r,
+            "reservation_sum_bytes": sum_r})
+
     # 逐项字节证据（豁免身份无需——预约为空按身份合同识别，非异常）
     for kind, row in items:
         if kind.endswith("_exempt"):
@@ -263,8 +302,23 @@ def collect(cur, upload_dir):
         tid = row[_HOLDER_ID_KEY[base_kind]]
         (row["staging_manifest"], row["staging_files"],
          row["staging_bytes"]) = scan_task_manifest(upload_dir, tid)
+    # R14-1：已知终态但无 rid/pending 的任务/作业——暂存树非空即入审计
+    # 集合（「存在任务行」只确定归属候选，不是免检证据）；空目录=无残留。
+    for kind, row in deferred:
+        if kind.endswith("_exempt"):
+            continue
+        base_kind = _base_kind(kind)
+        tid = row[_HOLDER_ID_KEY[base_kind]]
+        manifest, nfiles, total = scan_task_manifest(upload_dir, tid)
+        if not manifest:
+            continue
+        row["staging_manifest"] = manifest
+        row["staging_files"] = nfiles
+        row["staging_bytes"] = total
+        items.append((kind, row))
     return {"items": items, "pending": pending_rows, "dangling": dangling,
             "unknown_dirs": unknown_dirs, "over_quota": over_quota,
+            "quota_drift": quota_drift,
             "counts": {"upload_tasks": len(tasks),
                        "ingestion_jobs": len(jobs),
                        "baidu_import_batches": len(batches),
@@ -301,6 +355,24 @@ def classify(kind, row):
     return "bind"
 
 
+def _commit_intent_open(kind, row):
+    """R14-3：未解决的提交意图——核账不得自动降级/排清理。
+
+    upload_task：已持久化 commit_intent_json / commit_token，或 state=
+    committing（发布临界态，清理会销毁恢复所需文件）。终态任务不在此列
+    （committed 历史行的 intent json 按合同长期保留，属正常痕迹）。
+    ingestion_job：已持久化 intent，或 state∈{completing, validating}
+    （验证/发布临界段）。"""
+    if kind == "upload_task":
+        return bool(row.get("commit_intent_json")) or \
+            bool(row.get("commit_token")) or \
+            row.get("state") == "committing"
+    if kind == "ingestion_job":
+        return bool(row.get("commit_intent_json")) or \
+            row.get("state") in ("completing", "validating")
+    return False
+
+
 def plan_actions(state, repair_residuals):
     """扫描态 → (actions, blockers)。动作 key 持久唯一、可重放。
 
@@ -335,6 +407,17 @@ def plan_actions(state, repair_residuals):
             continue
         if verdict in ("missing", "released", "consumed"):
             has_residue = int(row.get("staging_bytes") or 0) > 0
+            if kind in ("upload_task", "ingestion_job") and \
+                    _commit_intent_open(kind, row):
+                # R14-3：提交意图未裁决（发布可能只进行到一半）——禁止
+                # stop/repair，不得把恢复所需文件交给清理器；由独立提交
+                # 恢复/对账流程确认状态后再收口。
+                blockers.append({"kind": kind, "id": tid,
+                                 "reason": "commit_intent_unresolved",
+                                 "state": row.get("state"),
+                                 "reservation_id": rid,
+                                 "bytes": row.get("staging_bytes")})
+                continue
             if kind in ("upload_task", "ingestion_job"):
                 actions.append({
                     "action_key": "stop:%s:%s" % (base_kind, tid),
@@ -355,10 +438,14 @@ def plan_actions(state, repair_residuals):
                                      "need_flag": "--repair-residuals"})
             elif kind in ("upload_task_terminal", "ingestion_job_cleanup"):
                 if verdict == "consumed":
-                    blockers.append({"kind": kind, "id": tid,
-                                     "reason": "consumed_unexplained",
-                                     "reservation_id": rid,
-                                     "bytes": row.get("staging_bytes")})
+                    if has_residue:
+                        # R13-2：已结算仍残留——资产关系不可证明独立，人工
+                        # 核对。无残留的 consumed（正常 committed 历史）不
+                        # 阻断（R14 矩阵：字节与文件都已收口）。
+                        blockers.append({"kind": kind, "id": tid,
+                                         "reason": "consumed_unexplained",
+                                         "reservation_id": rid,
+                                         "bytes": row.get("staging_bytes")})
                 elif repair_residuals and has_residue:
                     actions.append(_repair_action(base_kind, tid, row))
                 elif has_residue:
@@ -383,6 +470,11 @@ def plan_actions(state, repair_residuals):
     for d in state["unknown_dirs"]:
         blockers.append({"kind": "staging_dir", "id": d,
                          "reason": "unknown_staging_dir"})
+    for q in state.get("quota_drift") or []:
+        blockers.append({"kind": "quota_ledger", "id": q["user_id"],
+                         "reason": q["reason"],
+                         "quota_reserved_bytes": q["quota_reserved_bytes"],
+                         "reservation_sum_bytes": q["reservation_sum_bytes"]})
     return actions, blockers
 
 
@@ -668,11 +760,15 @@ def _report_actions(actions):
 
 
 def _report_pending_work(state):
+    def _row(r):
+        return {k: v for k, v in r.items()
+                if k not in ("staging_manifest", "commit_intent_json",
+                             "commit_token")}
     return {
         "upload_cleanup_pending": state["pending"],
         "ingestion_local_cleanup": [
-            {k: v for k, v in r.items() if k != "staging_manifest"}
-            for k, r in state["items"] if k == "ingestion_job_cleanup"]}
+            _row(r) for k, r in state["items"]
+            if k == "ingestion_job_cleanup"]}
 
 
 def _residual_without_duty(state, actions=()):

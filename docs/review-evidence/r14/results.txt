@@ -1,0 +1,123 @@
+FFF                                                                      [100%]
+=================================== FAILURES ===================================
+__________________ test_terminal_untracked_residue_is_not_go ___________________
+/tmp/slide-id-review-r14/test_r14.py:23: in test_terminal_untracked_residue_is_not_go
+    assert cli(pg_uri, tmp_path) == 3
+E   AssertionError: assert 0 == 3
+E    +  where 0 = cli('postgresql://postgres:@/postgres?host=/tmp/svs-pg-conftest-pud2ziov', PosixPath('/tmp/pytest-of-solarise/pytest-5/test_terminal_untracked_residu0'))
+----------------------------- Captured stdout call -----------------------------
+{
+  "mode": "dry-run",
+  "tool_version": "r13.1",
+  "actions": [],
+  "blockers": [],
+  "over_quota": [],
+  "pending_work": {
+    "upload_cleanup_pending": [],
+    "ingestion_local_cleanup": []
+  },
+  "note": "dry-run 仅预审；应用需冻结计划（--plan-out） + --apply --plan"
+}
+_____________________ test_quota_aggregate_drift_is_not_go _____________________
+/tmp/slide-id-review-r14/test_r14.py:33: in test_quota_aggregate_drift_is_not_go
+    assert cli(pg_uri,tmp_path) == 3
+E   AssertionError: assert 0 == 3
+E    +  where 0 = cli('postgresql://postgres:@/postgres?host=/tmp/svs-pg-conftest-pud2ziov', PosixPath('/tmp/pytest-of-solarise/pytest-5/test_quota_aggregate_drift_is_0'))
+----------------------------- Captured stdout call -----------------------------
+{
+  "mode": "dry-run",
+  "tool_version": "r13.1",
+  "actions": [],
+  "blockers": [],
+  "over_quota": [],
+  "pending_work": {
+    "upload_cleanup_pending": [],
+    "ingestion_local_cleanup": []
+  },
+  "note": "dry-run 仅预审；应用需冻结计划（--plan-out） + --apply --plan"
+}
+______________ test_commit_intent_cannot_be_demoted_by_reconcile _______________
+/tmp/slide-id-review-r14/test_r14.py:55: in test_commit_intent_cannot_be_demoted_by_reconcile
+    assert state=='committing' and saved_intent and pending==0,(state,pending)
+E   AssertionError: ('failed', 1)
+E   assert ('failed' == 'committing'
+E     
+E     - committing
+E     + failed)
+----------------------------- Captured stdout call -----------------------------
+{
+  "mode": "plan-out",
+  "tool_version": "r13.1",
+  "actions": [
+    {
+      "action_key": "stop:upload_task:upt_530e05ab15a888097364a07d",
+      "action": "stop",
+      "kind": "upload_task",
+      "id": "upt_530e05ab15a888097364a07d",
+      "observed": "missing",
+      "evidence": {
+        "bytes": 100,
+        "manifest_files": 1
+      }
+    },
+    {
+      "action_key": "repair:upload_task:upt_530e05ab15a888097364a07d",
+      "action": "repair",
+      "kind": "upload_task",
+      "id": "upt_530e05ab15a888097364a07d",
+      "owner": "usr_tHU2UpphVlw",
+      "evidence": {
+        "bytes": 100,
+        "files": 1,
+        "manifest_files": 1
+      }
+    }
+  ],
+  "blockers": [],
+  "over_quota": [],
+  "pending_work": {
+    "upload_cleanup_pending": [],
+    "ingestion_local_cleanup": []
+  },
+  "note": "dry-run 仅预审；应用需冻结计划（--plan-out） + --apply --plan",
+  "plan_out": "/tmp/pytest-of-solarise/pytest-5/test_commit_intent_cannot_be_d0/plan.json",
+  "plan_hash": "bd7b5ce52e9b1141ab3662af20708596332891785a05b0de7328c95f779aab33"
+}
+{
+  "mode": "apply",
+  "plan_hash": "bd7b5ce52e9b1141ab3662af20708596332891785a05b0de7328c95f779aab33",
+  "applied": [
+    {
+      "action_key": "stop:upload_task:upt_530e05ab15a888097364a07d",
+      "result": {
+        "stopped": true
+      }
+    },
+    {
+      "action_key": "repair:upload_task:upt_530e05ab15a888097364a07d",
+      "result": {
+        "repaired": "upr_2d68ab3c7f4e41d901765913",
+        "bytes": 100
+      }
+    }
+  ],
+  "skipped": [],
+  "over_quota": [],
+  "pending_work": {
+    "upload_cleanup_pending": [
+      {
+        "upload_id": "upt_530e05ab15a888097364a07d",
+        "reservation_id": "upr_2d68ab3c7f4e41d901765913",
+        "attempts": 1
+      }
+    ],
+    "ingestion_local_cleanup": []
+  },
+  "unexplained": [],
+  "note": null
+}
+=========================== short test summary info ============================
+FAILED ../../../../../tmp/slide-id-review-r14/test_r14.py::test_terminal_untracked_residue_is_not_go
+FAILED ../../../../../tmp/slide-id-review-r14/test_r14.py::test_quota_aggregate_drift_is_not_go
+FAILED ../../../../../tmp/slide-id-review-r14/test_r14.py::test_commit_intent_cannot_be_demoted_by_reconcile
+3 failed in 0.42s

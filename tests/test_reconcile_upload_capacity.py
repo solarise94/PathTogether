@@ -379,3 +379,151 @@ def test_directory_symlink_in_tree_blocks_apply(tmp_path):
         n = db.execute("SELECT COUNT(*) FROM "
                        "upload_capacity_repair_receipts").fetchone()[0]
     assert int(n) == 0
+
+
+@pytest.mark.parametrize("rid_mode,pending,has_bytes,want", [
+    # R14-1 矩阵：终态 × 有/无 rid × 有/无 pending × 有/无字节。
+    # consumed+无字节=正常 committed 历史（intent json 按合同长期保留），
+    # 必须放行；有字节的责任不明一律 no-go。
+    ("consumed", False, True, 3),
+    ("consumed", False, False, 0),
+    (None, True, True, 3),
+    (None, True, False, 0),
+    (None, False, True, 3),
+    (None, False, False, 0),
+])
+def test_terminal_residue_matrix(rid_mode, pending, has_bytes, want,
+                                 tmp_path):
+    uid = _uid("mx")
+    tid = "upt_rec_mx_%s_%d_%d" % (rid_mode or "norid", int(pending),
+                                   int(has_bytes))
+    rid = None
+    if rid_mode == "consumed":
+        rid = upload_guard.reserve_upload(
+            uid, 100, holder_kind="upload_task", holder_id=tid,
+            purpose="upload")["reservation_id"]
+        upload_guard.consume_reservation(
+            rid, 100, expect_holder=("upload_task", tid))
+    _task(uid, tid, rid, state="failed")
+    if has_bytes:
+        data = slide_storage.staging_dir(tid, "transfer",
+                                         root=tmp_path) / "data.svs"
+        data.parent.mkdir(parents=True, exist_ok=True)
+        data.write_bytes(b"x" * 100)
+    if pending:
+        with psycopg.connect(PG_URI, autocommit=True) as db:
+            db.execute("INSERT INTO upload_cleanup_pending(upload_id,"
+                       " reservation_id) VALUES(%s,%s)", (tid, rid))
+    rc, plan = _freeze("mx_%s" % tid, upload_dir=str(tmp_path))
+    assert rc == want
+
+
+def test_quota_ledger_drift_directions_block(tmp_path):
+    """R14-2：少记/多记/缺配额行 → no-go 且零写入。"""
+    uid = _uid("qu")
+    tid = "upt_rec_qu"
+    rid = upload_guard.reserve_upload(
+        uid, 100, holder_kind="upload_task", holder_id=tid,
+        purpose="upload")["reservation_id"]
+    _task(uid, tid, rid)
+    # 少记：预约在账（SUM=100），账本 reserved=0
+    with psycopg.connect(PG_URI, autocommit=True) as db:
+        db.execute("UPDATE upload_user_quotas SET reserved_bytes=0 "
+                   "WHERE user_id=%s", (uid,))
+    assert recon.main(["--database-url", PG_URI,
+                       "--upload-dir", str(tmp_path)]) == 3
+    # 多记：清掉预约引用后账本 reserved=100 > SUM=0
+    with psycopg.connect(PG_URI, autocommit=True) as db:
+        db.execute("UPDATE upload_tasks SET reservation_id=NULL,"
+                   " state='cancelled' WHERE upload_id=%s", (tid,))
+        db.execute("UPDATE upload_user_quotas SET reserved_bytes=100 "
+                   "WHERE user_id=%s", (uid,))
+        db.execute("UPDATE upload_reservations SET state='released',"
+                   " settled_at=now(), settled_bytes=0 WHERE"
+                   " reservation_id=%s", (rid,))
+    assert recon.main(["--database-url", PG_URI,
+                       "--upload-dir", str(tmp_path)]) == 3
+    # 缺配额行：有预约、无 quota 行
+    with psycopg.connect(PG_URI, autocommit=True) as db:
+        db.execute("INSERT INTO upload_reservations (reservation_id,"
+                   " user_id, reserved_bytes, state, expires_at)"
+                   " VALUES"
+                   " ('upr_rec_missing_row', %s, 50, 'reserved',"
+                   " now()+interval '1 hour')",
+                   (uid,))
+        db.execute("DELETE FROM upload_user_quotas WHERE user_id=%s",
+                   (uid,))
+    assert recon.main(["--database-url", PG_URI,
+                       "--upload-dir", str(tmp_path)]) == 3
+    # 零写入：预约/配额未被工具改动
+    with psycopg.connect(PG_URI) as db:
+        n = db.execute("SELECT COUNT(*) FROM "
+                       "upload_capacity_repair_receipts").fetchone()[0]
+        q = db.execute("SELECT COUNT(*) FROM upload_user_quotas"
+                       " WHERE user_id=%s", (uid,)).fetchone()[0]
+        r = db.execute("SELECT state FROM upload_reservations WHERE"
+                       " reservation_id='upr_rec_missing_row'").fetchone()[0]
+    assert int(n) == 0 and int(q) == 0 and r == "reserved"
+
+
+def test_quota_ledger_consistent_passes():
+    """R14-2 反向：绑定一致 + 账平（SUM=quota.reserved）→ 0。"""
+    uid = _uid("qubal")
+    tid = "upt_rec_qubal"
+    rid = upload_guard.reserve_upload(
+        uid, 100, holder_kind="upload_task", holder_id=tid,
+        purpose="upload")["reservation_id"]
+    _task(uid, tid, rid)
+    assert recon.main(["--database-url", PG_URI,
+                       "--upload-dir", UPLOAD_DIR]) == 0
+
+
+def test_committing_with_intent_never_stopped(tmp_path, capsys):
+    """R14-3 门禁：持久 intent 的 committing 任务——不生成 stop/repair，
+    plan-out no-go，状态/资产/pending/回执零变化。"""
+    uid = _uid("intent")
+    tid = "upt_rec_intent"
+    _task(uid, tid, None, state="committing")
+    with psycopg.connect(PG_URI, autocommit=True) as db:
+        db.execute("UPDATE upload_tasks SET commit_intent_json="
+                   "'{\"slide_id\":\"sl_test\"}' WHERE upload_id=%s",
+                   (tid,))
+    data = slide_storage.staging_dir(tid, "1", root=tmp_path) / "data.svs"
+    data.parent.mkdir(parents=True, exist_ok=True)
+    data.write_bytes(b"x" * 100)
+    rc, plan = _freeze("intent", upload_dir=str(tmp_path),
+                       extra=["--repair-residuals"])
+    assert rc == 3
+    body = json.loads(capsys.readouterr().out)
+    assert not [a for a in body["actions"]
+                if a["id"] == tid], body["actions"]
+    assert any(b.get("reason") == "commit_intent_unresolved"
+               and b.get("id") == tid for b in body["blockers"])
+    with psycopg.connect(PG_URI) as db:
+        state = db.execute("SELECT state FROM upload_tasks WHERE"
+                           " upload_id=%s", (tid,)).fetchone()[0]
+        n = db.execute("SELECT COUNT(*) FROM upload_cleanup_pending"
+                       " WHERE upload_id=%s", (tid,)).fetchone()[0]
+        rc2 = db.execute("SELECT COUNT(*) FROM "
+                         "upload_capacity_repair_receipts").fetchone()[0]
+    assert state == "committing" and int(n) == 0 and int(rc2) == 0
+
+
+def test_ingestion_validating_with_missing_duty_blocked(tmp_path, capsys):
+    """R14-3：COS validating 临界态 + 预约缺失 → blocker，不生成 stop。"""
+    uid = _uid("ingv")
+    with psycopg.connect(PG_URI, autocommit=True) as db:
+        db.execute(
+            "INSERT INTO ingestion_jobs (job_id, owner_user_id, owner_role,"
+            " filename, safe_name, format_ext, declared_size, state)"
+            " VALUES ('inj_rec_validating', %s, 'user', 'a.svs', 'a.svs',"
+            " 'svs', 100, 'validating')", (uid,))
+    rc, plan = _freeze("ingv", upload_dir=str(tmp_path),
+                       extra=["--repair-residuals"])
+    assert rc == 3
+    body = json.loads(capsys.readouterr().out)
+    assert not [a for a in body["actions"]
+                if a["id"] == "inj_rec_validating"], body["actions"]
+    assert any(b.get("reason") == "commit_intent_unresolved"
+               and b.get("id") == "inj_rec_validating"
+               for b in body["blockers"])

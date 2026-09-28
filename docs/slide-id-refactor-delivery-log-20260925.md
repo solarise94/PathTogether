@@ -548,3 +548,38 @@ results.txt——原样入仓为回归 tests/test_slide_id_review_r13.py，不�
 （新增改名/不可读目录/目录 symlink 门禁）；R12 反例 4 + 生命周期验收 6
 + 容量三套 + followup/relations 66 + 上传/zip/kfb/百度/转换/删除/发布/
 R8–R11 回归批 309 全绿；全量门禁见提交信息。
+
+---
+
+## R14（2026-09-28 独立审查处置；基线 9826d60）
+
+审查记录与反例：docs/review-evidence/r14/（REVIEW.md / test_r14.py.txt /
+results.txt——原样入仓为回归 tests/test_slide_id_review_r14.py，不改断
+言）。三项 P1 处置：
+
+1. **终态无预约残留漏检**：collect 建立完整并集——已知终态任务/作业
+   即使无 rid/pending，暂存树非空即入审计集合（「存在任务行」只是归属
+   候选，不是免检证据；空目录=无残留，豁免身份单独判定）。新增终态
+   矩阵门禁（有/无 rid × 有/无 pending × 有/无字节，6 参数化）；并修
+   正 R13 遗留过阻断：终态 consumed **无残留**（正常 committed 历史，
+   intent json 按合同长期保留）放行为 0，有残留仍 consumed_unexplained。
+2. **账本少记仍返回 go**：collect 增逐用户双向核对——
+   `quota.reserved_bytes` 必须等于该用户 state='reserved' 预约合计
+   （reservation_holds_capacity 语义，admission 与 reconcile 同账；
+   FULL JOIN 覆盖零预约用户与缺配额行）；多记/少记/缺行一律 blocker
+   `quota_ledger`（不自动改账、不掩盖差额）。应用走共享财务 SQL
+   （两侧同事务），应用后重扫复验。
+3. **核账绕过 commit intent 边界**：`_commit_intent_open`（upload_task：
+   持久 commit_intent_json/commit_token 或 committing；ingestion_job：
+   持久 intent 或 completing/validating）且预约 verdict 为 missing/
+   released/consumed → blocker `commit_intent_unresolved`，禁止生成
+   stop/repair（不把发布恢复所需文件交给清理器）；intent/token 存在性
+   进入 `_TARGET_SQL` 冻结前态裁决字段（TOOL_VERSION→r14.1，旧计划按
+   版本拒绝重冻）。终态任务不守卫（committed 历史的 intent json 属正常
+   痕迹）。
+
+**测试**：R14 三反例转绿；tests/test_reconcile_upload_capacity.py
+15→25（终态矩阵 6 参数化 + 配账三向 drift 零写入 + 账平放行 + V1
+committing 与 COS validating intent 门禁）；R12/R13 反例与生命周期/容量
+批 78 + 上传/zip/kfb/百度/转换/R8–R11 回归批 304 全绿；全量门禁见提交
+信息。

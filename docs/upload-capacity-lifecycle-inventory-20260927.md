@@ -93,6 +93,22 @@ R13 修订（docs/review-evidence/r13/）：
     成功 no-op（exit 0 不重新收费），真实漂移（残留消失但预约仍持有、
     预约释放但残留仍在、清单内容漂移）仍被拒绝。
 
+R14 修订（docs/review-evidence/r14/）：
+  - **完整并集审计**：终态任务/作业不再因「无 rid/pending」免检——DB
+    任务/预约/清理记录之外的已知 ID 暂存树非空一律入审计集合（归属候
+    选≠免检证据；空目录=无残留）；终态矩阵（有/无 rid × 有/无 pending
+    × 有/无字节）入测试，consumed+无字节=正常 committed 历史放行。
+  - **账本双向核对**：逐用户 `quota.reserved_bytes` ⇌ 该用户
+    state='reserved' 预约 SUM（FULL JOIN，含零预约用户/缺配额行），
+    多记（ledger_over）/少记（ledger_under）/缺行（quota_row_missing）
+    一律 blocker `quota_ledger`，不自动改账。
+  - **commit intent 边界**：upload_task 持久 intent（commit_intent_json/
+    commit_token）或 committing、ingestion_job 持久 intent 或
+    completing/validating 且预约异常（missing/released/consumed）→
+    blocker `commit_intent_unresolved`，禁止生成 stop/repair（不把恢复
+    所需文件交给清理器）；intent/token 存在性进入冻结前态裁决字段。
+    终态任务的 intent json 按合同长期保留，不视为未决（守卫仅限活跃）。
+
 ## 3. 锁图（全部事务的实际加锁顺序）
 
 ```

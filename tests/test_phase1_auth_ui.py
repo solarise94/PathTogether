@@ -588,6 +588,7 @@ def test_entry_landing_source_guards():
         "entry.start.kicker", "entry.start.title", "entry.start.note",
         "entry.start.s1.title", "entry.start.s1.body",
         "entry.start.s1.body.public", "entry.start.s1.body.invite",
+        "entry.start.s1.body.closed",
         "entry.start.s2.title", "entry.start.s2.body",
         "entry.start.s3.title", "entry.start.s3.body",
         "entry.start.s4.title", "entry.start.s4.body",

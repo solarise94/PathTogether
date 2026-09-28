@@ -1,0 +1,44 @@
+FFFF                                                                     [100%]
+=================================== FAILURES ===================================
+____________________ test_zip_must_reserve_before_expansion ____________________
+/tmp/slide-id-review-r16/test_r16.py:32: in test_zip_must_reserve_before_expansion
+    assert all(actual <= reserved for actual, reserved in observations), observations
+E   AssertionError: [(20531, 531)]
+E   assert False
+E    +  where False = all(<generator object test_zip_must_reserve_before_expansion.<locals>.<genexpr> at 0x7d69e36489e0>)
+________ test_conversion_cancel_before_intent_does_not_leave_live_child ________
+/tmp/slide-id-review-r16/test_r16.py:51: in test_conversion_cancel_before_intent_does_not_leave_live_child
+    assert child['state'] not in ('queued', 'converting', 'ready'), (child['state'], h._quota('r16_cancel'), files)
+E   AssertionError: ('queued', (0, 0), ['/tmp/pytest-of-solarise/pytest-7/test_conversion_cancel_before_0/.staging/cvj_3d5a0f04c35a4f78625e9af7/source/data.kfb'])
+E   assert 'queued' not in ('queued', 'converting', 'ready')
+__________________ test_drain_rejects_known_terminal_residue ___________________
+/tmp/slide-id-review-r16/test_r16.py:61: in test_drain_rejects_known_terminal_residue
+    assert _drain_tool().main(['report', '--upload-dir', str(tmp_path)]) == 3
+E   AssertionError: assert 0 == 3
+E    +  where 0 = <function main at 0x7d69e34fcd50>(['report', '--upload-dir', '/tmp/pytest-of-solarise/pytest-7/test_drain_rejects_known_termi0'])
+E    +    where <function main at 0x7d69e34fcd50> = <module 'upload_drain_tool' from '/home/solarise/ZCodeProject/histopilot-suite/PathTogether/scripts/upload_drain.py'>.main
+E    +      where <module 'upload_drain_tool' from '/home/solarise/ZCodeProject/histopilot-suite/PathTogether/scripts/upload_drain.py'> = _drain_tool()
+----------------------------- Captured stdout call -----------------------------
+== 排空核验（report，TOOL_VERSION=u4.1）==
+未收口: 无
+异常: 无
+
+运维核对项（无法服务端证明）：
+  [ ] 旧 V1 在途请求已在停写窗口内结束（边缘停止转发后自然收口）
+  [ ] 旧 worker/转换子进程无仍在写 .staging 的进程（ps/日志核对）
+  [ ] 浏览器旧恢复记录（localStorage）能识别终态或失效（抽查核对）
+  [ ] 所有调用方迁移完成（HistoPilot/脚本无旧通道调用）
+
+report: go（旧链路责任全部收口，可进入检查点 B 部署评估）
+________ test_zip_retry_before_intent_does_not_allocate_unbound_slides _________
+/tmp/slide-id-review-r16/test_r16.py:82: in test_zip_retry_before_intent_does_not_allocate_unbound_slides
+    assert len(assets) == 1, assets
+E   AssertionError: [{'slide_id': 'sld_SthdIM2Abmrv', 'asset_state': 'staging'}, {'slide_id': 'sld_SsXtzR18MDH0', 'asset_state': 'ready'}]
+E   assert 2 == 1
+E    +  where 2 = len([{'slide_id': 'sld_SthdIM2Abmrv', 'asset_state': 'staging'}, {'slide_id': 'sld_SsXtzR18MDH0', 'asset_state': 'ready'}])
+=========================== short test summary info ============================
+FAILED ../../../../../tmp/slide-id-review-r16/test_r16.py::test_zip_must_reserve_before_expansion
+FAILED ../../../../../tmp/slide-id-review-r16/test_r16.py::test_conversion_cancel_before_intent_does_not_leave_live_child
+FAILED ../../../../../tmp/slide-id-review-r16/test_r16.py::test_drain_rejects_known_terminal_residue
+FAILED ../../../../../tmp/slide-id-review-r16/test_r16.py::test_zip_retry_before_intent_does_not_allocate_unbound_slides
+4 failed in 0.84s

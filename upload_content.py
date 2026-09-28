@@ -33,7 +33,6 @@ from pathlib import Path
 
 from werkzeug.utils import secure_filename
 
-import conversion_store
 import slide_format_registry
 import slide_io
 import slide_publish
@@ -117,7 +116,7 @@ def canonical_name_for(source_safe):
     canonical_name/original_filename 的展示快照——不再参与路径构造、目标
     冲突或名占用判定（同名产物=独立资产，各得各 slide_id）。
 
-    P6 用途核对（运行时退役段）：唯一调用点 = enqueue_conversion 的
+    P6 用途核对（运行时退役段）：唯一调用点 = conversion 受理（worker）的
     create_job(canonical_name=…) 展示快照（落 conversion_jobs.canonical_name /
     产物 original_filename）；其余用途清零（路径派生/冲突判定均不经此）。
     """
@@ -216,11 +215,14 @@ def prepare_zip_bundle(src_zip: Path, reservation=None, task_id=None,
       1. 解压到任务专属暂存目录（.staging/<task_id>/extract/）；
       2. 防 zip-slip：拒绝绝对路径与含 .. 的 member，跳过 __MACOSX/隐藏文件；
       3. 解压炸弹防护：成员数 / 路径深度 / 单成员与总展开字节（声明值与实际
-         复制字节都检查，任一超限立即中止并清理）/ 异常压缩比；
+         复制字节都检查，任一超限立即中止并清理）/ 异常压缩比——声明值检查
+         在第一遍只读中央目录完成，写入任何字节之前；
       4. 拒绝符号链接、设备/FIFO 成员、加密成员、重复规范化路径（大小写不敏感）；
       5. 解压过程中周期性检查磁盘保留水位（watermark_check_bytes）；
       6. 暂存解压后识别合法 bundle（recognize_slide_bundle）+ 逻辑切片分组；
-      7. 提升前一次性检查用户配额（reservation 补占）/ 磁盘水位；
+      7. 写入第一个字节**之前**补占用户配额到「压缩源 + 声明展开总量」
+         （二者在解压期间同时存在；R16）并检查磁盘水位；第二遍解压以
+         「实际 ≤ 声明」硬上限保证实际落盘不超过已预约容量；
       8. 每个 item 的入口切片逐个验证（在暂存区，提升之前）；全部 item 都
          打不开 → 清理并返回 400（部分失败按 item 剔除并在响应 failures 指明）。
 
@@ -263,6 +265,9 @@ def prepare_zip_bundle(src_zip: Path, reservation=None, task_id=None,
 
     try:
         with zipfile.ZipFile(src_zip, "r") as zf:
+            # 第一遍：只读中央目录，完成全部元数据检查并累计声明展开量——
+            # 不写任何字节。
+            plan = []
             for info in zf.infolist():
                 raw = info.filename
                 if not raw:
@@ -318,9 +323,9 @@ def prepare_zip_bundle(src_zip: Path, reservation=None, task_id=None,
                     _cleanup_all()
                     return "压缩包含非法路径", 400
                 if info.is_dir():
-                    target.mkdir(parents=True, exist_ok=True)
+                    plan.append((info, target, None))
                     continue
-                # 声明大小检查（第一道）：单成员 + 累计总量 + 压缩比
+                # 声明大小检查：单成员 + 累计总量 + 压缩比
                 declared = int(info.file_size or 0)
                 if declared > max_member_bytes:
                     _cleanup_all()
@@ -334,8 +339,35 @@ def prepare_zip_bundle(src_zip: Path, reservation=None, task_id=None,
                     _cleanup_all()
                     return "压缩包成员压缩比异常", 400
                 declared_total += declared
-                # 实际复制（第二道）：stdlib 会按声明值截断，但这里独立计数，
-                # 任何实现层面的偏差（声明伪造/流超限）都在上限处停止
+                plan.append((info, target, declared))
+
+            # 写入前补占：解压期间压缩源与展开文件同时在盘上。
+            if reservation is not None:
+                peak = os.path.getsize(src_zip) + declared_total
+                need_extra = peak - int(reservation["reserved_bytes"])
+                if need_extra > 0:
+                    try:
+                        refreshed = upload_guard.topup_reservation(
+                            reservation["reservation_id"], need_extra)
+                    except upload_guard.UploadGuardError:
+                        _cleanup_all()
+                        return "存储配额不足", 413
+                    if refreshed:
+                        reservation["reserved_bytes"] = \
+                            refreshed["reserved_bytes"]
+            try:
+                upload_guard.check_disk_watermark(root,
+                                                  need_bytes=declared_total)
+            except upload_guard.DiskWatermarkExceeded:
+                _cleanup_all()
+                return "磁盘空间不足", 507
+
+            # 第二遍：解压。实际字节独立计数，超过声明值即中止——实际落盘
+            # 不会超过上面已预约的容量。
+            for info, target, declared in plan:
+                if declared is None:
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
                 target.parent.mkdir(parents=True, exist_ok=True)
                 member_actual = 0
                 member_hash = hashlib.sha256()
@@ -399,20 +431,9 @@ def prepare_zip_bundle(src_zip: Path, reservation=None, task_id=None,
         return ("压缩包包含无法归组的成员（%s）——伴侣目录必须与同 stem "
                 "切片同包" % ", ".join(sorted(ungroupable)[:8])), 400
 
-    # 提升前一次性检查：用户配额（reservation 补占）/ 磁盘水位（docs §3.4-5；
-    # 目标冲突预检拆除——每 item 预分配 slide_id，objects/<sid> 唯一）。
+    # 提升前磁盘水位（docs §3.4-5；配额已在解压前补占；目标冲突预检拆除
+    # ——每 item 预分配 slide_id，objects/<sid> 唯一）。
     total_bytes = sum(p.stat().st_size for p, _rel in entries)
-    if reservation is not None:
-        need_extra = total_bytes - int(reservation["reserved_bytes"])
-        if need_extra > 0:
-            try:
-                refreshed = upload_guard.topup_reservation(
-                    reservation["reservation_id"], need_extra)
-            except upload_guard.UploadGuardError:
-                _cleanup_all()
-                return "存储配额不足", 413
-            if refreshed:
-                reservation["reserved_bytes"] = refreshed["reserved_bytes"]
     try:
         upload_guard.check_disk_watermark(root, need_bytes=total_bytes)
     except upload_guard.DiskWatermarkExceeded:
@@ -845,40 +866,6 @@ def probe_kfb_or_fail(path):
         doc.close()
 
 
-def enqueue_conversion(ident, *, source_name, source_sha256, upload_id,
-                       source_format, target_project_id=None,
-                       staged_source=None, upload_root=None):
-    """创建（或幂等复用）转换任务——create_job 即预分配产物 slide_id
-    （P4-app 合同 §3.1：产物 owner=源 owner，空 owner 回落配置 owner；
-    同 owner+sha+converter 复用既有任务**及其 slide_id**）。
-
-    同名源/产物不冲突（独立 ID）；canonical 名占用检查拆除（0069）。
-    ``staged_source``：上传侧暂存的源副本路径——非空且任务未 ready 时搬入
-    任务 staging（``.staging/<job_id>/source/``，worker 源解析的优先级 2；
-    ready 复用则副本用不上，直接清理）。"""
-    canonical = canonical_name_for(source_name)
-    job = conversion_store.create_job(
-        owner_user_id=(ident or {}).get("user_id") or "",
-        upload_id=upload_id,
-        source_name=source_name,
-        source_sha256=source_sha256,
-        source_format=source_format,
-        canonical_name=canonical,
-        target_project_id=target_project_id)
-    if staged_source:
-        if job.get("state") == "ready":
-            try:
-                Path(staged_source).unlink(missing_ok=True)
-            except OSError:
-                pass
-        else:
-            _ext = source_name.rsplit(".", 1)[-1].lower() \
-                if "." in source_name else "kfb"
-            stage_source_copy_locked(
-                job["id"], staged_source, ext=_ext, upload_root=upload_root)
-    return job, canonical
-
-
 def stage_source_copy_locked(job_id, src_path, ext=None, upload_root=None):
     """源副本搬入 conversion 暂存（R12：conversion_job 存储锁内执行——
     与转换 worker 的写/清互斥；嵌套于 upload_task 锁之下时遵循仓库固定
@@ -887,137 +874,3 @@ def stage_source_copy_locked(job_id, src_path, ext=None, upload_root=None):
     with task_storage_lock.task_storage_lock("conversion_job", job_id):
         return conversion_worker.stage_source_copy(
             job_id, src_path, _root(upload_root), ext=ext)
-
-
-def ensure_conversion_job(ident, *, source_name, source_sha256, upload_id,
-                          source_format=None, target_project_id=None,
-                          staged_source=None, upload_root=None):
-    """已受理源上幂等补建/复用转换任务（崩溃、500、重放）。
-
-    P4-app：源副本归任务 staging（或升级窗口的平铺源，worker 按
-    source_name alias 过渡读取）——「磁盘同名文件归属」校验拆除，不再
-    以文件名认领资产；幂等键 = (owner, source_sha256, converter)。
-    """
-    ident_owner = (ident or {}).get("user_id") or ""
-    job = conversion_store.get_job_by_upload_id(upload_id)
-    if job is not None:
-        job_owner = job.get("owner_user_id") or ""
-        if job_owner and ident_owner and job_owner != ident_owner:
-            raise FileExistsError(source_name)
-        if staged_source:
-            if job.get("state") == "ready":
-                try:
-                    Path(staged_source).unlink(missing_ok=True)
-                except OSError:
-                    pass
-            else:
-                _ext = source_name.rsplit(".", 1)[-1].lower() \
-                    if "." in source_name else "kfb"
-                stage_source_copy_locked(
-                    job["id"], staged_source, ext=_ext,
-                    upload_root=upload_root)
-        return job, job.get("canonical_name")
-    if not source_format:
-        if staged_source:
-            probe_path = staged_source
-        else:
-            # P6 运行时退役：不再回落平铺源探测（新链路源副本恒在任务/
-            # 任务 staging；无副本=源缺失，fail-closed）。
-            raise FileNotFoundError(source_name)
-        source_format = probe_kfb_or_fail(probe_path)["format"]
-    return enqueue_conversion(
-        ident, source_name=source_name, source_sha256=source_sha256,
-        upload_id=upload_id, source_format=source_format,
-        target_project_id=target_project_id, staged_source=staged_source,
-        upload_root=upload_root)
-
-
-def conversion_accepted_body(job):
-    """转换受理/重放响应体（纯 dict，无 Flask 依赖）。"""
-    view = conversion_store.public_view(job)
-    view["status"] = "conversion_pending"
-    # P4-app（合同 §3.6）：产物 slide_id 从**任务绑定**读（create_job 即
-    # 分配，ready 前后都在）——不再按 canonical 名 resolve。
-    view["slide_id"] = (job.get("slide_id") or None) if job else None
-    return view
-
-
-def cancel_conversion_for_failed_upload(upload_id, *, upload_root=None):
-    """上传任务确定性失败（预占失效等）后的转换任务连带收口（P4-app
-    review 门禁修复）。
-
-    背景：P4-app 起转换任务在 commit 期创建（源副本归任务 staging），
-    finish_commit 的 ReservationInvalid 会在 job 已建之后发生——不带连
-    带收口就会留「上传报错文件未入账、产物稍后却被 worker 发布上线」的
-    悬挂态（且恢复扫描对 KFB 任务反复 finish_commit 反复
-    ReservationInvalid 死循环）。
-
-    动作（幂等、不抛异常）：
-      1. 按产物 slide_id 作废任务（``invalidate_by_slide_id``——含
-         ready；worker 侧由 fencing 拒绝后续结算）；
-      2. 产物资产撤回：staging/ready→failed（``slide_store.force_fail``）
-         ——ready 时同事务按 accounted_bytes 退款（worker 已结算的场景；
-         未结算无退款）；随后尽力撤包（DB 先行收口可见性）；
-      3. 清 job 任务 staging（源副本/在途 work）。
-
-    只收口**本上传创建**的 job（``job.upload_id == upload_id``）：幂等
-    复用（同 owner+sha+converter 命中既有 job）时 job 属于前序上传的生
-    命周期，本上传失败不得株连。
-    """
-    root = _root(upload_root)
-    try:
-        job = conversion_store.get_job_by_upload_id(upload_id)
-    except Exception:
-        _log.exception("上传失败连带查 conversion job 失败：%s", upload_id)
-        return
-    if job is None or (job.get("upload_id") or "") != (upload_id or ""):
-        return  # 无 job，或 job 系前序上传的幂等复用（不株连）
-    sid = (job.get("slide_id") or "").strip()
-    if sid:
-        try:
-            conversion_store.invalidate_by_slide_id(sid)
-        except Exception:
-            _log.exception("上传失败连带作废 conversion job 失败：%s", sid)
-        try:
-            import psycopg.rows
-            import pg_store
-            conn = pg_store.connect()
-            conn.row_factory = psycopg.rows.dict_row
-            try:
-                with pg_store.transaction(conn):
-                    with conn.cursor() as cur:
-                        slide_store.acquire_slide_lock(cur, sid)  # 第一把锁
-                        cur.execute(
-                            "SELECT asset_state, accounted_bytes, "
-                            "owner_user_id FROM slides WHERE slide_id=%s "
-                            "FOR UPDATE", (sid,))
-                        srow = cur.fetchone()
-                        if srow and srow["asset_state"] in (
-                                slide_store.SlideState.STAGING,
-                                slide_store.SlideState.READY):
-                            was_ready = (srow["asset_state"]
-                                         == slide_store.SlideState.READY)
-                            slide_store.force_fail(sid, conn=conn)
-                            if was_ready:
-                                amt = int(srow["accounted_bytes"] or 0)
-                                owner = (srow["owner_user_id"] or "").strip()
-                                if amt > 0 and owner:
-                                    upload_guard.refund_used_bytes_locked(
-                                        cur, owner, amt)
-            finally:
-                conn.close()
-        except Exception:
-            _log.exception("上传失败连带撤回产物资产失败：%s", sid)
-        try:
-            slide_storage.remove_bundle(sid, root=root)
-        except Exception:
-            _log.exception("上传失败连带撤包失败：%s", sid)
-    # R12：清转换 staging 在 conversion_job 存储锁内（与转换 worker 的
-    # 写/清互斥——清理等待在途转换退出后才删树）。
-    try:
-        with task_storage_lock.task_storage_lock("conversion_job", job["id"]):
-            shutil.rmtree(
-                slide_storage.staging_task_dir(job["id"], root=root),
-                ignore_errors=True)
-    except Exception:
-        _log.exception("上传失败连带清转换 staging 失败：%s", job["id"])

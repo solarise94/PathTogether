@@ -146,16 +146,16 @@ def _rearm_product_asset(conn, cur, job):
 
 
 def _requeue_row(cur, conn, job_id, *, source_name, upload_id, canonical_name,
-                 source_sha256):
+                 source_sha256, state="queued"):
     cur.execute("DELETE FROM conversion_job_sources WHERE job_id=%s", (job_id,))
     cur.execute(
-        "UPDATE conversion_jobs SET state='queued', "
+        "UPDATE conversion_jobs SET state=%s, "
         "attempt=attempt+1, error_code=NULL, error_detail_internal=NULL, "
         "finished_at=NULL, canonical_name=%s, source_name=%s, upload_id=%s, "
         "lease_owner=NULL, lease_expires_at=NULL, "
         "commit_intent_json=NULL, canonical_settled_bytes=NULL "
         "WHERE id=%s RETURNING *",
-        (canonical_name, source_name, upload_id, job_id))
+        (state, canonical_name, source_name, upload_id, job_id))
     row = _row(cur)
     # 重试语义：failed 资产复用 ID 重置 staging；产物已删除 → 新 ID 改绑
     #（重试不重复扣配额：结算幂等键在 publish 事务内，见 worker_settle_ready）。
@@ -169,7 +169,8 @@ def _requeue_row(cur, conn, job_id, *, source_name, upload_id, canonical_name,
 
 def create_job(*, owner_user_id, upload_id, source_name, source_sha256,
                source_format, canonical_name, product_exists=None,
-               target_project_id=None, source_slide_id=None):
+               target_project_id=None, source_slide_id=None, conn=None,
+               held=False):
     """创建或返回同一 owner+hash+converter 的已有任务（幂等）。
 
     P4-app：创建即预分配产物 slide_id（staging/id_bundle 资产行 + 任务绑定
@@ -183,57 +184,122 @@ def create_job(*, owner_user_id, upload_id, source_name, source_sha256,
     方（baidu_ingest），值被忽略。``source_slide_id``：源本身是切片资产时的
     绑定（worker 读源经 descriptor 优先；P4-app 的 V1/V2 KFB 源按现状语义
     不落资产——源副本归任务 staging，按 source_name 过渡）。
+
+    ``conn``：在调用方事务内执行（R16：COS conversion 交接在父任务行锁内
+    建子任务）。``held``：新建/重置的任务进入不可领取态 held（0076），由
+    ``activate_held_locked`` 在源文件就位后转 queued。
     """
+    if conn is not None:
+        with conn.cursor() as cur:
+            return _create_job_locked(
+                conn, cur, owner_user_id=owner_user_id, upload_id=upload_id,
+                source_name=source_name, source_sha256=source_sha256,
+                source_format=source_format, canonical_name=canonical_name,
+                target_project_id=target_project_id,
+                source_slide_id=source_slide_id, held=held)
+    own = _connect()
+    try:
+        with pg_store.transaction(own) as c:
+            with c.cursor() as cur:
+                return _create_job_locked(
+                    c, cur, owner_user_id=owner_user_id, upload_id=upload_id,
+                    source_name=source_name, source_sha256=source_sha256,
+                    source_format=source_format,
+                    canonical_name=canonical_name,
+                    target_project_id=target_project_id,
+                    source_slide_id=source_slide_id, held=held)
+    finally:
+        own.close()
+
+
+def _create_job_locked(conn, cur, *, owner_user_id, upload_id, source_name,
+                       source_sha256, source_format, canonical_name,
+                       target_project_id, source_slide_id, held):
     owner_user_id = owner_user_id or ""
     source_sha256 = (source_sha256 or "").lower()
-    conn = _connect()
-    try:
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
-                cur.execute(
-                    "SELECT * FROM conversion_jobs WHERE owner_user_id=%s "
-                    "AND source_sha256=%s AND converter_id=%s "
-                    "AND converter_version=%s FOR UPDATE",
-                    (owner_user_id, source_sha256, CONVERTER_ID,
-                     CONVERTER_VERSION))
-                existing = _row(cur)
-                if existing:
-                    st = existing["state"]
-                    if st in ("failed", "cancelled"):
-                        return _requeue_row(
-                            cur, conn, existing["id"],
-                            source_name=source_name, upload_id=upload_id,
-                            canonical_name=canonical_name,
-                            source_sha256=source_sha256)
-                    # ready / 运行中：资产路径冻结。同内容换名上传复用原产物
-                    # 与原 slide_id，不得把 a.tif 改绑到 b.tif；登记别名以便
-                    # 删产物时清 b.kfb。
-                    _insert_source(cur, existing["id"], source_name,
-                                   upload_id, source_sha256,
-                                   source_slide_id=source_slide_id)
-                    return existing
-                job_id = new_job_id()
-                assoc = ("pending" if target_project_id else "not_needed")
-                slide_id = _allocate_product_asset(
-                    conn, owner_user_id, canonical_name)
-                cur.execute(
-                    "INSERT INTO conversion_jobs "
-                    "(id, owner_user_id, upload_id, source_name, "
-                    " source_sha256, source_format, canonical_name, "
-                    " converter_id, converter_version, state, "
-                    " target_project_id, project_associate_state, slide_id) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'queued',%s,%s,%s) "
-                    "RETURNING *",
-                    (job_id, owner_user_id, upload_id, source_name,
-                     source_sha256, source_format, canonical_name,
-                     CONVERTER_ID, CONVERTER_VERSION,
-                     target_project_id or None, assoc, slide_id))
-                row = _row(cur)
-                _insert_source(cur, job_id, source_name, upload_id,
-                               source_sha256, source_slide_id=source_slide_id)
-                return row
-    finally:
-        conn.close()
+    initial = "held" if held else "queued"
+    cur.execute(
+        "SELECT * FROM conversion_jobs WHERE owner_user_id=%s "
+        "AND source_sha256=%s AND converter_id=%s "
+        "AND converter_version=%s FOR UPDATE",
+        (owner_user_id, source_sha256, CONVERTER_ID, CONVERTER_VERSION))
+    existing = _row(cur)
+    if existing:
+        st = existing["state"]
+        if st in ("failed", "cancelled"):
+            return _requeue_row(
+                cur, conn, existing["id"],
+                source_name=source_name, upload_id=upload_id,
+                canonical_name=canonical_name,
+                source_sha256=source_sha256, state=initial)
+        # ready / held / 运行中：资产路径冻结。同内容换名上传复用原产物
+        # 与原 slide_id，不得把 a.tif 改绑到 b.tif；登记别名以便删产物时
+        # 清 b.kfb。
+        _insert_source(cur, existing["id"], source_name,
+                       upload_id, source_sha256,
+                       source_slide_id=source_slide_id)
+        return existing
+    job_id = new_job_id()
+    assoc = ("pending" if target_project_id else "not_needed")
+    slide_id = _allocate_product_asset(conn, owner_user_id, canonical_name)
+    cur.execute(
+        "INSERT INTO conversion_jobs "
+        "(id, owner_user_id, upload_id, source_name, "
+        " source_sha256, source_format, canonical_name, "
+        " converter_id, converter_version, state, "
+        " target_project_id, project_associate_state, slide_id) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "RETURNING *",
+        (job_id, owner_user_id, upload_id, source_name,
+         source_sha256, source_format, canonical_name,
+         CONVERTER_ID, CONVERTER_VERSION, initial,
+         target_project_id or None, assoc, slide_id))
+    row = _row(cur)
+    _insert_source(cur, job_id, source_name, upload_id,
+                   source_sha256, source_slide_id=source_slide_id)
+    return row
+
+
+def activate_held_locked(cur, job_id):
+    """held → queued（调用方事务内；源文件已就位）。
+
+    已是 queued/converting/validating/ready（复用他人任务）→ 原样返回；
+    failed/cancelled（被作废）→ StateConflict，由调用方下一轮重新受理。"""
+    cur.execute("SELECT * FROM conversion_jobs WHERE id=%s FOR UPDATE",
+                (job_id,))
+    row = _row(cur)
+    if row is None:
+        raise JobNotFound("转换任务不存在：%r" % job_id)
+    if row["state"] == "held":
+        cur.execute("UPDATE conversion_jobs SET state='queued' "
+                    "WHERE id=%s RETURNING *", (job_id,))
+        return _row(cur)
+    if row["state"] in ("failed", "cancelled"):
+        raise StateConflict("转换任务已作废（state=%s）" % row["state"], row)
+    return row
+
+
+def void_held_for_upload_locked(cur, upload_id):
+    """父任务终态时作废其创建的 held 子任务（调用方事务内，父行锁已持）。
+
+    只动 upload_id 指向本父任务且仍 held 的任务（复用的历史任务不株连）；
+    产物 staging 资产同事务置 failed。搬源在父 intent 之后，而 intent 之后
+    父任务不可取消：取消先赢时子任务 staging 必然为空；intent 之后的失败
+    终态若已搬源，源副本按转换任务的源保留语义留存（cancelled 可经重试
+    复用）。返回作废的任务 id。"""
+    cur.execute(
+        "UPDATE conversion_jobs SET state='cancelled', finished_at=now(), "
+        "error_code='upload_terminated' WHERE upload_id=%s AND state='held' "
+        "RETURNING id, slide_id", (upload_id,))
+    rows = cur.fetchall()
+    for r in rows:
+        if r["slide_id"]:
+            cur.execute(
+                "UPDATE slides SET asset_state=%s, updated_at=now() "
+                "WHERE slide_id=%s AND asset_state=%s",
+                (slide_store.SlideState.FAILED, r["slide_id"],
+                 slide_store.SlideState.STAGING))
+    return [r["id"] for r in rows]
 
 
 def claim_job(job_id, worker_id, lease_seconds=LEASE_SECONDS):

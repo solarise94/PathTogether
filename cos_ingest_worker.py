@@ -59,7 +59,6 @@ import secrets
 import shutil
 import sys
 import time
-from pathlib import Path
 
 import psycopg.rows
 
@@ -1016,17 +1015,18 @@ def _zip_critical_section(job, state, cleanup_due):
 
     1. 定位暂存 zip（intent 恢复以 intent 代次目录为准，否则收养断点件）；
     2. sha 校验（checkpoint 优先）+ sha256_expected 比对（不符=确定性失败）；
-    3. ``upload_content.prepare_zip_bundle``（解压/识别/分组/预检[本地配额
-       补占]/入口验证/哈希——唯一实现；受理前失败码映射稳定机码）；
-    4. 受理事务：逐 item ``allocate_slide`` + ``bind_ingestion_job_item``
-       （(job_id,item_key)→slide_id，重试/恢复复用，绝不重新分配）+
-       持久化 commit intent（artifacts manifest + main + 剔除项证据——
-       恢复的证据源；intent 之前无任何分配/发布）；
+    3. ``upload_content.prepare_zip_bundle``（解压前补占配额到「压缩源 +
+       声明展开量」/解压/识别/分组/入口验证/哈希——唯一实现；受理前失败
+       码映射稳定机码）；
+    4. ``worker_bind_zip_items``：父行锁内逐 item 复用既有绑定、只为缺项
+       ``allocate_slide``（取消先赢不分配；已分配者由终态事务作废）；
+       随后持久化 commit intent（artifacts manifest + main + 剔除项证据——
+       恢复的证据源；intent 之前无发布）；
     5. ``zip_publish_items`` 逐 item 发布（ingestion 通道重验注入；确定性
        item 失败剔除进 failures，其余继续）；
-    6. ``worker_settle_zip`` 一次性结算（settle=Σ已发布 item 字节；consume
-       与任务收口同事务）；
-    7. 清理任务暂存整树 + confirm_local_cleanup（同锁内）。
+    6. 先清理任务暂存整树，删除成功后 ``worker_settle_zip`` 一次性结算
+       （settle=Σ已发布 item 字节；consume 与任务收口同事务），再
+       confirm_local_cleanup（同锁内）。
 
     item 代次目录加 ``i`` 前缀（i1/i2…）——与下载/校验的 worker_generation
     数字代次目录在同一 ``.staging/<job_id>/`` 下互不冲突。恢复：intent 在
@@ -1077,8 +1077,8 @@ def _zip_critical_section(job, state, cleanup_due):
                 return None
         else:
             # 落盘（解包）前重查水位（§6.3）。intent 未持久化 → 此前的 extract
-            # 残件无人依赖（无绑定/无发布），先清再解（prepare 的 mkdir 不
-            # 接受已存在目录）。
+            # 残件无人依赖（绑定可能已在、但无发布），先清再解（prepare 的
+            # mkdir 不接受已存在目录）。
             try:
                 upload_guard.check_disk_watermark(directory, need_bytes=declared)
             except upload_guard.DiskWatermarkExceeded as exc:
@@ -1129,23 +1129,17 @@ def _zip_critical_section(job, state, cleanup_due):
             bundle = result
             artifacts = upload_content.zip_build_artifacts(bundle)
             try:
-                import psycopg.rows
-                conn = pg_store.connect()
-                conn.row_factory = psycopg.rows.dict_row
-                try:
-                    with pg_store.transaction(conn):
-                        for item in bundle["items"]:
-                            desc = slide_store.allocate_slide(
-                                owner,
-                                original_filename=Path(item["key"]).name,
-                                format_ext=item["ext"], conn=conn)
-                            ist.bind_ingestion_job_item(
-                                conn, job_id, item["key"], desc.slide_id)
-                finally:
-                    conn.close()
+                ist.worker_bind_zip_items(job_id, gen, owner, bundle["items"])
+            except ist.StaleLease:
+                return None
+            except ist.IngestionStateError as exc:
+                # 取消等并发终态先赢：未分配；释放租约让下轮可见。
+                _release_lease(job_id, token, state)
+                _log.warning("zip 受理被拒（job=%s）：%s", job_id, exc)
+                return None
             except Exception:
-                # 受理失败（事务原子回滚：无绑定/无资产行；extract 目录保留
-                # 供重试清理）——瞬态，保持 validating 重试。
+                # 受理失败（事务原子回滚：无新绑定/无新资产行）——瞬态，
+                # 保持 validating 重试。
                 _log.exception("zip 受理事务失败（job=%s）", job_id)
                 _release_lease(job_id, token, state)
                 return None
@@ -1211,6 +1205,17 @@ def _zip_critical_section(job, state, cleanup_due):
         if not settled:
             _fail("zip_items_failed")
             return None
+        # 先清理后结算（R16）：各 item 包已 rename 进 objects/，剩余暂存
+        # （压缩源、解压残件、失败 item）确认删除后才结算、释放预约；删除
+        # 失败保持 validating 重试，预约原样保留。恢复轮无 extract 目录时
+        # 已发布 item 走发布幂等分支。
+        try:
+            slide_storage.remove_staging_tree(job_id, root=directory)
+        except Exception:  # noqa: BLE001
+            _log.warning("zip 暂存清理失败，暂不结算（job=%s）", job_id,
+                         exc_info=True)
+            _release_lease(job_id, token, state)
+            return None
         try:
             ist.worker_settle_zip(
                 job_id, gen,
@@ -1225,10 +1230,9 @@ def _zip_critical_section(job, state, cleanup_due):
             _release_lease(job_id, token, state)
             return None
         try:
-            slide_storage.remove_staging_tree(job_id, root=directory)
             ist.confirm_local_cleanup(job_id)
         except Exception:  # noqa: BLE001
-            _log.debug("暂存树清理失败（job=%s）", job_id, exc_info=True)
+            _log.warning("清理确认落库失败（job=%s）", job_id, exc_info=True)
         _log.info("zip 统一发布完成（job=%s items=%d bytes=%d）",
                   job_id, len(settled), published)
         _release_lease(job_id, token, state)
@@ -1239,26 +1243,24 @@ def _zip_critical_section(job, state, cleanup_due):
 # 6k) conversion 形态 validating：源受理 → 交转换 → 源字节结算（U2）
 # --------------------------------------------------------------------------- #
 def _conversion_critical_section(job, state, cleanup_due):
-    """conversion 形态（KFB/KFBF）的 validating 临界区（0075；镜像 V1/V2
-    KFB 合同：上传侧结算**源字节**，产物由转换任务结算）。
+    """conversion 形态（KFB/KFBF）的 validating 临界区（0075；上传侧结算
+    **源字节**，产物由转换任务结算）。
 
-    顺序：
-      1. 定位暂存源 + sha（intent 恢复以 intent 为权威；受理后崩溃源已被
-         搬走时按 upload_id=job_id 幂等复用既有转换任务，sha 取下载完成时
-         持久化的 checkpoint）+ sha256_expected 比对（不符=确定性失败）；
-      2. ``upload_content.ensure_conversion_job``（幂等键 owner+sha+
-         converter；源副本搬 conversion 任务 staging——conversion_job 存储
-         锁内）；job 未建时先 ``probe_kfb_or_fail``（magic 探测——确定性
-         失败 invalid_kfb_header）；
-      3. 持久化 commit intent（kind=conversion + conversion_job_id）；
-      4. ``worker_settle_source``：consume 源字节 + ready + 转换关联同事务
-         （预占失效 → 连带作废本 job 的转换任务后 fail——不留「文件未入账
-         但产物稍后上线」悬挂态）；
-      5. 清理任务暂存树 + confirm_local_cleanup。
+    交接顺序（R16：每一步的副作用都先登记在父任务名下，父任务终态事务
+    同步作废，取消先赢不留可执行子任务）：
+      1. 定位暂存源 + sha（intent 恢复以 intent 为权威）+ sha256_expected
+         比对（不符=确定性失败）；
+      2. ``worker_accept_conversion``：父行锁内建/复用 **held** 子任务
+         （新建前 ``probe_kfb_or_fail`` 探测——确定性失败 invalid_kfb_header）；
+      3. 持久化 commit intent（记录 conversion_job_id；此后不可取消）；
+      4. 源文件搬入子任务 staging（conversion_job 存储锁内；复用 ready
+         任务时丢弃源副本）；
+      5. ``worker_settle_source``：held→queued + consume 源字节 + ready +
+         转换关联同一事务；
+      6. 清理任务暂存树 + confirm_local_cleanup。
 
     ready ≠ 可查看：completed 由 process_ready 探测转换任务 ready 推进；
-    转换失败不终止本任务（重试走 /api/conversions/<id>/retry，状态体经
-    conversion 子视图暴露转换状态）。
+    转换失败不终止本任务（重试走 /api/conversions/<id>/retry）。
     """
     import upload_content
     job_id = job["job_id"]
@@ -1269,6 +1271,7 @@ def _conversion_critical_section(job, state, cleanup_due):
     intent = job.get("commit_intent_json")
     directory = _ensure_upload_dir()
     entry = "data.%s" % ext
+    source_name = job.get("safe_name") or entry
 
     def _fail(code):
         state.pop("download_token", None)
@@ -1283,11 +1286,7 @@ def _conversion_critical_section(job, state, cleanup_due):
     with task_storage_lock.task_storage_lock("ingestion_job", job_id):
         if not _reverify_job_for_io(job_id, gen, ist.VALIDATING):
             return None
-        # 受理幂等的权威：按 upload_id=job_id 找既有转换任务（崩溃窗口——
-        # 源已搬 conversion staging、intent 未持久化——凭它续走，不重复建）。
-        import conversion_store
         from kfb import KfbError
-        existing = conversion_store.get_job_by_upload_id(job_id)
         if intent:
             sha = str(intent.get("sha256") or "")
             staged = None
@@ -1299,31 +1298,18 @@ def _conversion_critical_section(job, state, cleanup_due):
                     staged = src
             if staged is None:
                 staged = _find_staged_data(job_id, root=directory)
-            # 源可能已搬进 conversion staging（受理后崩溃）：以 DB 关联为准，
-            # staged 缺失不判 part_missing。
+            # staged 缺失 = 源已搬入子任务 staging（第 4 步后崩溃）。
         else:
             staged = _find_staged_data(job_id, root=directory)
-            if staged is not None:
-                if os.path.getsize(staged) != declared:
-                    _fail("local_size_mismatch")
-                    return None
-                sha = (job.get("download_checkpoint_json")
-                       or {}).get("sha256") or ""
-                if not sha:
-                    sha = _sha256_file(staged)
-            elif existing is not None:
-                # 崩溃窗口：受理已发生（源已搬走）、intent 未持久化——sha 以
-                # 下载完成时持久化的 checkpoint 为权威（下载段已算好整对象
-                # 哈希，不重读源）。
-                sha = (job.get("download_checkpoint_json")
-                       or {}).get("sha256") or ""
-                if not sha:
-                    _fail("part_missing")
-                    return None
-            else:
-                # 从未受理且下载件丢失：下载产物丢失，fail-closed。
+            if staged is None:
                 _fail("part_missing")
                 return None
+            if os.path.getsize(staged) != declared:
+                _fail("local_size_mismatch")
+                return None
+            sha = (job.get("download_checkpoint_json") or {}).get("sha256") or ""
+            if not sha:
+                sha = _sha256_file(staged)
         expected = str(job.get("sha256_expected") or "").strip().lower()
         if expected and str(sha).lower() != expected:
             _fail("hash_mismatch")
@@ -1333,68 +1319,90 @@ def _conversion_critical_section(job, state, cleanup_due):
         if not owner:
             _fail("owner_missing")
             return None
+
         try:
-            if existing is None:
-                if staged is None:
-                    # 无 job 且无暂存源：受理从未发生（下载件丢失）。
-                    _fail("part_missing")
-                    return None
-                probe = upload_content.probe_kfb_or_fail(staged)
-                cjob, _canon = upload_content.ensure_conversion_job(
-                    {"user_id": owner},
-                    source_name=(job.get("safe_name") or entry),
-                    source_sha256=sha, upload_id=job_id,
-                    source_format=probe["format"],
-                    staged_source=str(staged), upload_root=directory)
-            else:
-                cjob, _canon = upload_content.ensure_conversion_job(
-                    {"user_id": owner},
-                    source_name=(job.get("safe_name") or entry),
-                    source_sha256=sha, upload_id=job_id,
-                    staged_source=(str(staged)
-                                   if staged is not None and staged.is_file()
-                                   else None),
-                    upload_root=directory)
+            fmt = None
+            if not intent:
+                fmt = upload_content.probe_kfb_or_fail(staged)["format"]
+            cjob = ist.worker_accept_conversion(
+                job_id, gen, owner_user_id=owner, source_name=source_name,
+                source_sha256=sha,
+                canonical_name=upload_content.canonical_name_for(source_name),
+                source_format=fmt)
         except KfbError as exc:
             _log.warning("KFB 探测失败（job=%s）：%s", job_id, exc)
             _fail("invalid_kfb_header")
             return None
-        except FileNotFoundError:
-            _fail("part_missing")
+        except ist.StaleLease:
             return None
-        except FileExistsError:
-            _fail("conversion_owner_conflict")
+        except ist.IngestionStateError as exc:
+            # 取消等并发终态先赢：不建子任务，释放租约让下轮可见。
+            _release_lease(job_id, token, state)
+            _log.warning("转换受理被拒（job=%s）：%s", job_id, exc)
             return None
         except Exception:
             _log.exception("转换受理失败（保持 validating 重试，job=%s）",
                            job_id)
             _release_lease(job_id, token, state)
             return None
+        if intent and str(intent.get("conversion_job_id") or "") != cjob["id"]:
+            _log.error("conversion 恢复：子任务与 intent 不一致（job=%s "
+                       "intent=%s now=%s）", job_id,
+                       intent.get("conversion_job_id"), cjob["id"])
+            _fail("commit_recovery_failed")
+            return None
+
+        if not intent:
+            try:
+                ist.worker_persist_commit_intent(job_id, gen, {
+                    "task_ref": job_id,
+                    "generation": gen,
+                    "commit_token": str(gen),
+                    "kind": ist.KIND_CONVERSION,
+                    "owner_user_id": owner,
+                    "artifacts": [{
+                        "name": source_name,
+                        "size": declared, "sha256": sha, "slide": False}],
+                    "sha256": sha,
+                    "accounted_bytes": declared,
+                    "conversion_job_id": cjob["id"],
+                    "declared_size": declared,
+                    "source_version": job.get("cos_version_id") or "",
+                    "target": job.get("safe_name")})
+            except ist.StaleLease:
+                return None
+            except ist.IngestionStateError as exc:
+                # 取消先赢：终态事务已作废 held 子任务；源仍在本任务暂存树，
+                # 由取消的本地清理收口。
+                _release_lease(job_id, token, state)
+                _log.warning("conversion commit intent 持久化被拒（job=%s）：%s",
+                             job_id, exc)
+                return None
 
         try:
-            ist.worker_persist_commit_intent(job_id, gen, {
-                "task_ref": job_id,
-                "generation": gen,
-                "commit_token": str(gen),
-                "kind": ist.KIND_CONVERSION,
-                "owner_user_id": owner,
-                "artifacts": [{
-                    "name": (job.get("safe_name") or entry),
-                    "size": declared, "sha256": sha, "slide": False}],
-                "sha256": sha,
-                "accounted_bytes": declared,
-                "conversion_job_id": cjob["id"],
-                "declared_size": declared,
-                "source_version": job.get("cos_version_id") or "",
-                "target": job.get("safe_name")})
-        except ist.StaleLease:
-            return None
-        except ist.IngestionStateError as exc:
-            # 状态被并发推进（取消先赢等）：释放租约让下轮处理可见。
+            if staged is not None and staged.is_file():
+                if cjob["state"] == "ready":
+                    staged.unlink()
+                else:
+                    upload_content.stage_source_copy_locked(
+                        cjob["id"], str(staged), ext=ext,
+                        upload_root=directory)
+            elif cjob["state"] != "ready":
+                import conversion_worker
+                src_dir = conversion_worker.source_staging_dir(
+                    cjob["id"], directory)
+                if not (src_dir.is_dir() and any(src_dir.iterdir())):
+                    _log.error("conversion 恢复：源文件既不在任务暂存也不在"
+                               "子任务 staging（job=%s cjob=%s）",
+                               job_id, cjob["id"])
+                    _fail("commit_recovery_failed")
+                    return None
+        except Exception:
+            _log.exception("源文件交接失败（保持 validating 重试，job=%s）",
+                           job_id)
             _release_lease(job_id, token, state)
-            _log.warning("conversion commit intent 持久化被拒（job=%s）：%s",
-                         job_id, exc)
             return None
+
         try:
             ist.worker_settle_source(
                 job_id, gen, sha256_actual=sha, settle_bytes=declared,
@@ -1402,12 +1410,9 @@ def _conversion_critical_section(job, state, cleanup_due):
         except ist.StaleLease:
             return None
         except upload_guard.ReservationInvalid:
-            # 镜像 V1 裁决：job 已建（源副本已搬任务 staging）——连带作废，
-            # 不留「上传失败但产物稍后上线」悬挂态。
-            _log.warning("conversion 结算时预占已失效，连带作废（job=%s）",
-                         job_id)
-            upload_content.cancel_conversion_for_failed_upload(
-                job_id, upload_root=directory)
+            # 失败终态事务同步作废 held 子任务与其产物资产——不留「上传
+            # 失败但产物稍后上线」的悬挂态。
+            _log.warning("conversion 结算时预占已失效（job=%s）", job_id)
             _fail("reservation_expired")
             return None
         except ist.IngestionStateError as exc:
@@ -1419,7 +1424,8 @@ def _conversion_critical_section(job, state, cleanup_due):
             slide_storage.remove_staging_tree(job_id, root=directory)
             ist.confirm_local_cleanup(job_id)
         except Exception:  # noqa: BLE001
-            _log.debug("暂存树清理失败（job=%s）", job_id, exc_info=True)
+            _log.warning("暂存树清理失败，留待重试（job=%s）", job_id,
+                         exc_info=True)
         _log.info("conversion 源受理完成（job=%s cjob=%s bytes=%d）",
                   job_id, cjob["id"], declared)
         _release_lease(job_id, token, state)

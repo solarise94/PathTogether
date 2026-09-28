@@ -1,0 +1,9 @@
+....F                                                                    [100%]
+=================================== FAILURES ===================================
+___________ test_native_upload_owner_failure_does_not_relock_itself ____________
+/tmp/slide-id-review-r16/test_r13_retained.py:94: in test_native_upload_owner_failure_does_not_relock_itself
+    monkeypatch.setattr(app_mod, '_upload_asset_owner', lambda ident: None)
+E   AttributeError: <module 'app' from '/home/solarise/ZCodeProject/histopilot-suite/PathTogether/app.py'> has no attribute '_upload_asset_owner'
+=========================== short test summary info ============================
+FAILED ../../../../../tmp/slide-id-review-r16/test_r13_retained.py::test_native_upload_owner_failure_does_not_relock_itself
+1 failed, 4 passed in 0.88s

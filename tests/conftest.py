@@ -128,8 +128,6 @@ _BUSINESS_TABLES = (
     "ingestion_jobs", "ingestion_events", "cos_pool_state",
     # 0075/U2：ingestion 批量 item 绑定（无 FK 到被清表——job_id 文本关联）
     "ingestion_job_items",
-    # 0076/U4：排空冻结清单（跨用例残留会让 freeze 幂等断言失真）
-    "upload_drain_freeze",
     # 0034 起：切片可见性显式授权（owner 读隔离的直授表；无外键，显式
     # 列出防跨用例残留授权）
     "slide_view_grants",

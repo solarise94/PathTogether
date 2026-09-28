@@ -285,14 +285,30 @@ def _abandon_staging_asset(cur, job):
     只在任务行锁内调用；无 slide_id（升级窗口旧行）跳过。job 状态机保证
     此刻不可能有并发 publish 结算（取消被 CommitInProgress 拒、worker
     generation fencing），CAS 失败即不变量破坏——fail-closed 记事件交人工。
+
+    R16：同一终态事务一并作废登记在本任务名下、尚未发布的副作用——
+    zip item 绑定的 staging 资产、本任务创建的 held 转换子任务（取消先赢
+    时不留可执行子任务或孤立资产，无需事后补偿）。锁序：任务行 →
+    conversion_jobs 行 → slides 行（与转换 worker 的 conversion → slides
+    同向）。
     """
+    if job.get("kind") == KIND_CONVERSION:
+        import conversion_store
+        conversion_store.void_held_for_upload_locked(cur, job["job_id"])
     sid = (job.get("slide_id") or "").strip()
-    if not sid:
-        return
-    cur.execute(
-        "UPDATE slides SET asset_state=%s, updated_at=now() "
-        "WHERE slide_id=%s AND asset_state=%s",
-        (slide_store.SlideState.FAILED, sid, slide_store.SlideState.STAGING))
+    if sid:
+        cur.execute(
+            "UPDATE slides SET asset_state=%s, updated_at=now() "
+            "WHERE slide_id=%s AND asset_state=%s",
+            (slide_store.SlideState.FAILED, sid,
+             slide_store.SlideState.STAGING))
+    if job.get("kind") == KIND_ZIP:
+        cur.execute(
+            "UPDATE slides SET asset_state=%s, updated_at=now() "
+            "WHERE asset_state=%s AND slide_id IN (SELECT slide_id FROM "
+            "ingestion_job_items WHERE job_id=%s)",
+            (slide_store.SlideState.FAILED, slide_store.SlideState.STAGING,
+             job["job_id"]))
 
 
 def create_waiting_job(owner_user_id, owner_role, filename, safe_name,
@@ -1915,6 +1931,46 @@ def bind_ingestion_job_item(conn, job_id, item_key, slide_id):
         return {"item_key": row["item_key"], "slide_id": row["slide_id"]}
 
 
+def worker_bind_zip_items(job_id, generation, owner_user_id, items):
+    """zip 受理：父任务行锁内逐 item 复用既有绑定、只为缺项分配 slide（R16）。
+
+    同一事务：父行 FOR UPDATE → generation/validating 校验 → 每个
+    ``item``（``{"key","ext"}``）已有 (job_id,item_key) 绑定则复用，否则
+    ``allocate_slide`` + 绑定。取消先赢 → IngestionStateError，不分配；
+    受理先赢 → 绑定资产登记在本任务名下，父任务此后任何终态都经
+    ``_abandon_staging_asset`` 同事务作废其中仍 staging 者。intent 持久化
+    失败后的重试复用同一批绑定，不重复分配。返回 {item_key: slide_id}。"""
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                job = get_job_locked(cur, job_id)
+                if job is None:
+                    raise IngestionStateError("ingestion job 不存在：%r" % job_id)
+                if job["worker_generation"] != int(generation):
+                    raise StaleLease("generation 过期（zip 受理被拒）")
+                if job["state"] != VALIDATING:
+                    raise IngestionStateError(
+                        "zip 受理要求 validating（当前 %s）" % job["state"])
+                cur.execute(
+                    "SELECT item_key, slide_id FROM ingestion_job_items "
+                    "WHERE job_id=%s", (str(job_id),))
+                bound = {r["item_key"]: r["slide_id"] for r in cur.fetchall()}
+                for item in items:
+                    if item["key"] in bound:
+                        continue
+                    desc = slide_store.allocate_slide(
+                        owner_user_id,
+                        original_filename=item["key"].rsplit("/", 1)[-1],
+                        format_ext=item["ext"], conn=c)
+                    row = bind_ingestion_job_item(c, job_id, item["key"],
+                                                  desc.slide_id)
+                    bound[item["key"]] = row["slide_id"]
+                return bound
+    finally:
+        conn.close()
+
+
 def list_ingestion_job_items(job_id):
     """批量任务的 item 绑定与结果列表（item_key 升序；不加锁读）。"""
     conn = _connect()
@@ -2063,6 +2119,48 @@ def worker_settle_zip(job_id, generation, *, sha256_actual, settle_bytes):
         conn.close()
 
 
+def worker_accept_conversion(job_id, generation, *, owner_user_id,
+                             source_name, source_sha256, canonical_name,
+                             source_format=None):
+    """conversion 形态受理：父任务行锁内建/复用 held 转换子任务（R16）。
+
+    同一事务：父行 FOR UPDATE → generation/validating 校验 →
+    ``conversion_store.create_job(held=True)``（幂等键 owner+sha+converter；
+    failed/cancelled 重置为 held）。取消先赢 → IngestionStateError，不建
+    子任务；受理先赢 → 子任务 held 不可领取，父任务此后任何终态都经
+    ``_abandon_staging_asset`` 同事务作废它。本函数不触碰文件——源文件
+    在父 intent 持久化之后才搬入子任务 staging。可重复调用（恢复轮按同一
+    幂等键得到同一子任务）。"""
+    import conversion_store
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                job = get_job_locked(cur, job_id)
+                if job is None:
+                    raise IngestionStateError("ingestion job 不存在：%r" % job_id)
+                if job["worker_generation"] != int(generation):
+                    raise StaleLease("generation 过期（转换受理被拒）")
+                if job["state"] != VALIDATING:
+                    raise IngestionStateError(
+                        "转换受理要求 validating（当前 %s）" % job["state"])
+                if job.get("kind") != KIND_CONVERSION:
+                    raise IngestionStateError(
+                        "转换受理不接受 %r 形态（job=%s）"
+                        % (job.get("kind"), job_id))
+                cjob = conversion_store.create_job(
+                    owner_user_id=owner_user_id, upload_id=job_id,
+                    source_name=source_name, source_sha256=source_sha256,
+                    source_format=source_format,
+                    canonical_name=canonical_name, conn=c, held=True)
+                _append_event(cur, job_id, "conversion_accepted",
+                              {"conversion_job_id": cjob["id"],
+                               "conversion_state": cjob["state"]})
+                return cjob
+    finally:
+        conn.close()
+
+
 def worker_settle_source(job_id, generation, *, sha256_actual, settle_bytes,
                          conversion_job_id):
     """conversion 形态 validating → ready：源字节结算 + 转换任务关联。
@@ -2089,6 +2187,17 @@ def worker_settle_source(job_id, generation, *, sha256_actual, settle_bytes,
                     raise IngestionStateError(
                         "conversion_job_id 已存在且不一致（%s != %s）——人工核查"
                         % (existing, conversion_job_id))
+                if job["state"] not in (READY, COMPLETED):
+                    # 源已就位：子任务 held→queued 与源字节结算同事务
+                    # （先于配额行加锁，与转换 worker 的 conversion → quota
+                    # 锁序同向）。
+                    import conversion_store
+                    try:
+                        conversion_store.activate_held_locked(
+                            cur, str(conversion_job_id))
+                    except conversion_store.ConversionError as exc:
+                        raise IngestionStateError(
+                            "转换子任务不可激活（下一轮重新受理）：%s" % exc)
                 out = _settle_job_locked(
                     cur, job, generation, sha256_actual=sha256_actual,
                     settle_bytes=settle_bytes,

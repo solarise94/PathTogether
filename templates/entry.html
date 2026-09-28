@@ -149,7 +149,9 @@
         <li class="step">
           <span class="step-no" aria-hidden="true">1</span>
           <h3 data-i18n="entry.start.s1.title">注册账号</h3>
-          {% if registration_mode == "invite_only" %}
+          {% if registration_mode == "closed" %}
+          <p data-i18n="entry.start.s1.body.closed">暂未开放注册。已有账号可直接登录；没有账号也可以先体验 Demo。</p>
+          {% elif registration_mode == "invite_only" %}
           <p data-i18n="entry.start.s1.body.invite">使用管理员发放的邀请码创建账号。</p>
           {% elif registration_mode == "public" %}
           <p data-i18n="entry.start.s1.body.public">验证邮箱并设置密码，即可创建账号。</p>

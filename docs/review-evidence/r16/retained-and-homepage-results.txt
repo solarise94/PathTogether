@@ -1,0 +1,20 @@
+....F                                                                    [100%]
+=================================== FAILURES ===================================
+_______________ test_closed_mode_does_not_instruct_registration ________________
+/tmp/slide-id-review-r16/test_homepage_r16.py:12: in test_closed_mode_does_not_instruct_registration
+    assert '验证邮箱并提交申请，管理员审核通过后即可使用。' not in guide
+E   assert '验证邮箱并提交申请，管理员审核通过后即可使用。' not in ' class="sec...）。</p>\n    '
+E     
+E     '验证邮箱并提交申请，管理员审核通过后即可使用。' is contained here:
+E       .s1.body">验证邮箱并提交申请，管理员审核通过后即可使用。</p>
+E                 
+E               </li>
+E               <li class="step">
+E                 <span class="step-no" aria-hidden="true">2</span>...
+E     
+E     ...Full output truncated (16 lines hidden), use '-vv' to show
+------------------------------ Captured log call -------------------------------
+WARNING  svs.site_stats:site_stats_store.py:287 site_stats: SITE_STATS_ENTRY_HOSTS 未配置或含非法项，停止站点访问采集（页面服务不受影响）
+=========================== short test summary info ============================
+FAILED ../../../../../tmp/slide-id-review-r16/test_homepage_r16.py::test_closed_mode_does_not_instruct_registration
+1 failed, 4 passed, 1 deselected in 1.07s

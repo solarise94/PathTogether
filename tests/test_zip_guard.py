@@ -438,9 +438,10 @@ def test_zip_expansion_topup_success():
     result = _extract_and_promote(z, reservation=r)
     assert not isinstance(result[1], int), result
     main, extracted, info = result
-    # topup 后预占 = 实际展开总量（1 字节 mrxs + 5000 字节 dat）
+    # R16 替代原合同「topup 后预占 = 实际展开总量」：解压前补占到峰值——
+    # 压缩源与展开文件（1 字节 mrxs + 5000 字节 dat）同时在盘上。
     refreshed = upload_guard.get_reservation(r["reservation_id"])
-    assert refreshed["reserved_bytes"] == 1 + 5000
+    assert refreshed["reserved_bytes"] == z.stat().st_size + 1 + 5000
     row = upload_guard.get_quota_row(uid)
     # 任务收口 consume 已在聚合器内发生（一次性结算，无残留预占）
     assert row["used_bytes"] == 1 + 5000 and row["reserved_bytes"] == 0

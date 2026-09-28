@@ -1,0 +1,34 @@
+R16 处置验证（2026-09-29，基线 ca0f25e + 本提交；PYTHONPATH=.:tests:scripts，TMPDIR=.gate-tmp）
+
+1. 审查反例（tests/test_slide_id_review_r16.py + _homepage.py，断言原样）
+   修复前：4 failed（与审查 results.txt 一致）+ homepage 1 failed
+   修复后：全部通过
+
+2. 补充验收 tests/test_r16_handoff.py：10 passed
+   held 不可领取 / 搬源后崩溃恢复恰一次结算 / 提交先赢取消被拒 /
+   复用既有转换任务不株连 / ZIP intent 前取消 item 资产 failed /
+   配额不足写前拒绝零落盘 / 清理失败延后结算 / 排空：终态空目录放行、
+   符号链接扫描失败 no-go、转换源不阻断
+
+3. R13：整文件 skip 改单例退役 → 4 passed / 1 skipped
+
+4. 上传相关回归批（48 文件：cos_* / ingestion* / conversion* / zip* /
+   capacity* / reconcile* / slide_id_review* / r12* / upload* / baidu* /
+   slide_delete* / phase1_auth_ui / pg_infra / kfb* / stage2_ui）：
+   523 passed, 7 skipped
+
+5. 全量 pytest（串行，单独运行）：
+   1 failed, 2745 passed, 7 skipped in 1402.65s
+   唯一失败 test_ai_budget_wiring::test_ui_budget_card_and_max_steps_sync_present
+   （'0.4.13' == '0.4.12'）= 工作区他人未提交的 admin 插件 0.4.13 版本号，
+   与本次改动无关（既有已知失败）。
+
+6. vitest tests/js：36 files, 548 passed
+7. HistoPilot contract（PATHTOGETHER_REPO=本仓）：5 files, 49 passed
+
+改写的既有断言（注明被替代合同）：
+- test_zip_guard::test_zip_expansion_topup_success：补占目标由「实际展开
+  总量」改为「压缩源 + 展开量」峰值（R16 第 2 项明确否定以最终产物大小
+  作峰值预算）。
+删除的既有用例：
+- test_upload_drain::test_freeze_idempotent（冻结清单随检查点 A 取消删除）。

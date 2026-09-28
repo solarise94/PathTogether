@@ -318,8 +318,9 @@ def test_schema_migrations_recorded(conn):
         # ingestion 任务形态（native/zip/conversion）+ sha256_expected +
         # conversion_job_id + 批量 item 绑定表。
         "0075_ingestion_kinds.sql",
-        # COS 统一上传 U4（检查点 A）：旧上传链路排空冻结清单。
-        "0076_upload_drain_freeze.sql",
+        # R16：KFB 交接的不可领取子任务态 held（父任务 intent 前创建，
+        # 源文件就位后与源字节结算同事务转 queued）。
+        "0076_conversion_jobs_held.sql",
     ]
 
 

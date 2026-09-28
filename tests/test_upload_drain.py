@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
-"""排空冻结清单与核验工具测试（U4→U5 修订；docs/cos-only-upload-agent-plan-20260928.md §5）。
+"""排空核验工具测试（U4→U5→R16 修订；检查点 A 与冻结清单已取消）。
 
-检查点 B 后旧上传端点已删除：本文件覆盖保留下来的排空基建——
-- upload_drain_freeze 拍照幂等（store 级；0076）；
+检查点 B 后旧上传端点已删除：本文件覆盖部署门禁——
 - scripts/upload_drain.py：audit（pending 非异常、暂存异常 exit 3）/
   report（未收口 no-go exit 3；收口后 go exit 0）——排空证明的可复跑
   副本演练等价物（历史 HTTP 门禁用例随端点删除退役，场景由
@@ -30,23 +29,6 @@ def _drain_tool():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
-
-
-def test_freeze_idempotent():
-    t1 = _mk_task("idem-a.svs")
-    frozen1, already1 = upload_task_store.freeze_drain_list()
-    frozen2, already2 = upload_task_store.freeze_drain_list()
-    assert frozen1 == 1 and already1 == 0
-    assert frozen2 == 0 and already2 == 1  # 重复执行不覆盖既有行
-    import pg_store
-    conn = pg_store.connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT state_at_freeze FROM upload_drain_freeze "
-                        "WHERE upload_id=%s", (t1["upload_id"],))
-            assert cur.fetchone() is not None
-    finally:
-        conn.close()
 
 
 def test_report_no_go_then_go(tmp_path):

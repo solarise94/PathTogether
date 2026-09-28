@@ -5,6 +5,7 @@ import pytest
 
 
 
+
 import slide_storage
 import upload_guard as guard
 import upload_task_store
@@ -83,10 +84,6 @@ def test_replay_after_cleanup_is_successful_noop(pg_uri, tmp_path):
     assert _q(uid) == (0, 0)
 
 
-@pytest.mark.skip(reason=
-    "U5（检查点 B）：被测面（V1 _api_upload_native_single 早退分支）已按 "
-    "docs/cos-only-upload-agent-plan-20260928.md §6 删除；断言原样保留作历史"
-    "证据，仅退役本例（R16：其余核账反例继续运行）。")
 def test_native_upload_owner_failure_does_not_relock_itself(monkeypatch, tmp_path):
     original = task_storage_lock.task_storage_lock
     def bounded_lock(kind, tid, **kwargs):

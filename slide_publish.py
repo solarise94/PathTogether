@@ -613,9 +613,53 @@ def _cas_ready_locked(cur, slide_id, accounted_bytes, *, expected_check=True):
         deterministic=True)
 
 
+def _upload_batch_precheck_locked(cur, task_ref, commit_token, owner_user_id):
+    """批量发布的 upload_tasks 通道锁内重验（publish_batch_item 原逻辑，
+    U2 提取为注入缝：ingestion 批量经 ``batch_precheck`` 注入同构重验）。
+
+    语义原样：任务行 FOR UPDATE → committed（幂等分支，CAS 吸收）/
+    committing+token 匹配（发布资格）→ owner 一致 → 预约续租（不 consume）。
+    """
+    cur.execute(
+        "SELECT %s FROM upload_tasks WHERE upload_id = %%s "
+        "FOR UPDATE" % upload_task_store._PG_COLS, (task_ref,))
+    row = cur.fetchone()
+    if row is None:
+        raise PublishError("task_not_found",
+                           "任务不存在：%s" % task_ref,
+                           deterministic=True)
+    task = upload_task_store._norm_row(row)
+    if (task.get("state") != upload_task_store.STATE_COMMITTING
+            or task.get("commit_token") != commit_token):
+        # 批量任务无 per-item intent；已 committed 的幂等收口
+        # 由 CAS 幂等分支吸收，其余（取消/回滚/代次漂移）拒绝。
+        if task.get("state") != upload_task_store.STATE_COMMITTED:
+            raise PublishError(
+                "generation_mismatch",
+                "批量任务代次失效（state=%r token 匹配=%s）"
+                % (task.get("state"),
+                   task.get("commit_token") == commit_token),
+                deterministic=True, task=task)
+    if owner_user_id is not None \
+            and (owner_user_id or "").strip() != \
+            (task.get("owner_user_id") or "").strip():
+        raise PublishError(
+            "owner_mismatch",
+            "任务归属与发布发起者不一致（拒绝，不自动修正）",
+            deterministic=True, task=task)
+    rid = task.get("reservation_id")
+    if rid:
+        out = upload_guard.renew_reservation_locked(cur, rid)
+        if not upload_guard.reservation_is_active(out):
+            raise upload_guard.ReservationInvalid(
+                "预占已失效，不能发布：%r" % rid)
+    return task
+
+
 def publish_batch_item(task_ref, generation, slide_id, manifest, *,
                        sha256, accounted_bytes, commit_token,
-                       owner_user_id=None, upload_root=None):
+                       owner_user_id=None, upload_root=None,
+                       batch_precheck=None):
     """批量任务（V1 ZIP）的**单逻辑切片**发布（P4-app 合同 §2.4）。
 
     与 ``publish_with_channel`` 的差异（合同裁决：批量任务的 quota 一次性
@@ -628,6 +672,11 @@ def publish_batch_item(task_ref, generation, slide_id, manifest, *,
         accounted_bytes 在其 publish 事务写入（R-12 删除结算用）；
       - item 的 slide_id 绑定源是 upload_task_items（(task_id,item_key) 行，
         重试/恢复按 item_key 复用，绝不重新分配——R-13）。
+
+    U2 注入缝：``batch_precheck(cur, task_ref, commit_token, owner_user_id)``
+    替换任务族相关的锁内重验（缺省 = upload_tasks 通道，行为原样）；
+    ingestion 批量（zip 多 item）经 ingestion_store.ingestion_batch_precheck
+    注入——FS 发布/CAS/revision 仍是本模块唯一实现。
 
     staging 源目录 = ``slide_storage.staging_dir(task_ref, generation)``
     （ZIP 的 item 编号即 generation；发布整体 rename 走人，完整包原子可见
@@ -667,39 +716,12 @@ def publish_batch_item(task_ref, generation, slide_id, manifest, *,
         with pg_store.transaction(conn):
             with conn.cursor() as cur:
                 slide_store.acquire_slide_lock(cur, slide_id)  # 第一把锁
-                cur.execute(
-                    "SELECT %s FROM upload_tasks WHERE upload_id = %%s "
-                    "FOR UPDATE" % upload_task_store._PG_COLS, (task_ref,))
-                row = cur.fetchone()
-                if row is None:
-                    raise PublishError("task_not_found",
-                                       "任务不存在：%s" % task_ref,
-                                       deterministic=True)
-                task = upload_task_store._norm_row(row)
-                if (task.get("state") != upload_task_store.STATE_COMMITTING
-                        or task.get("commit_token") != commit_token):
-                    # 批量任务无 per-item intent；已 committed 的幂等收口
-                    # 由 CAS 幂等分支吸收，其余（取消/回滚/代次漂移）拒绝。
-                    if task.get("state") != upload_task_store.STATE_COMMITTED:
-                        raise PublishError(
-                            "generation_mismatch",
-                            "批量任务代次失效（state=%r token 匹配=%s）"
-                            % (task.get("state"),
-                               task.get("commit_token") == commit_token),
-                            deterministic=True, task=task)
-                if owner_user_id is not None \
-                        and (owner_user_id or "").strip() != \
-                        (task.get("owner_user_id") or "").strip():
-                    raise PublishError(
-                        "owner_mismatch",
-                        "任务归属与发布发起者不一致（拒绝，不自动修正）",
-                        deterministic=True, task=task)
-                rid = task.get("reservation_id")
-                if rid:
-                    out = upload_guard.renew_reservation_locked(cur, rid)
-                    if not upload_guard.reservation_is_active(out):
-                        raise upload_guard.ReservationInvalid(
-                            "预占已失效，不能发布：%r" % rid)
+                if batch_precheck is None:
+                    _upload_batch_precheck_locked(
+                        cur, task_ref, commit_token, owner_user_id)
+                else:
+                    batch_precheck(cur, task_ref, commit_token,
+                                   owner_user_id)
                 settled = _cas_ready_locked(cur, slide_id, accounted_bytes)
                 if settled:
                     slide_store.record_revision(

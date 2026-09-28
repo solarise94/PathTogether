@@ -2779,16 +2779,62 @@ def _app_capabilities(mode):
     }
 
 
-#: 首期 COS 直传格式白名单（D11：原生单文件；ZIP/MRXS 强制 V1、KFB 未验收
-#: 禁止 COS——与 SUPPORTED_EXTS 的差异是有意的，不回退到后者）。
-_COS_NATIVE_EXTS = frozenset(
-    {"svs", "tif", "tiff", "ndpi", "vms", "vmu", "scn", "bif", "svslide"})
+#: 产品文件上限（U2，docs/cos-only-upload-agent-plan-20260928.md §2.1）：
+#: 单一服务端权威的**产品**文件上限——沿用既有允许上限的数值，但语义与
+#: 「单 HTTP 请求体限制」（upload_guard.UPLOAD_MAX_REQUEST_BYTES——
+#: MAX_CONTENT_LENGTH/计数流继续使用，保护控制 API 小请求体）分离。
+#: 测试/运维经模块属性覆盖（create 与 capability 下发在调用时读取）。
+#: 发布预检（§2.1/§9）：COS 池结构性可准入上限（capacity−safety）必须
+#: ≥ 本值才允许开启 COS-only；缺口的容量调整属运维决策，不在代码内静默
+#: 缩限。当前默认池（10 GB−0.5 GB=9.5 GB）< 10 GiB——默认配置不满足，
+#: capability 对此 fail-closed（见 _cos_upload_capability_payload）。
+UPLOAD_PRODUCT_MAX_BYTES = upload_guard.UPLOAD_MAX_REQUEST_BYTES
+
+
+def _cos_accepted_formats():
+    """COS 统一上传受理词表（U2 §3.2）：从格式注册表派生——原生单文件 +
+    convert-required + 归档 zip；裸 bundle（.mrxs）不在直传集（需打包 zip）。
+    后端权威下发（capability payload），前端不再维护第二份词表。"""
+    exts = set(slide_format_registry.capability_exts(
+        slide_format_registry.CAP_NATIVE_SINGLE_FILE))
+    exts |= set(slide_format_registry.capability_exts(
+        slide_format_registry.CAP_CONVERT_REQUIRED))
+    exts.add("zip")
+    exts.discard("mrxs")
+    return exts
+
+
+def _cos_ingestion_kind_for(safe):
+    """净化名 → (kind, None) | (None, 422 响应)。
+
+    native=原生单文件；zip=归档包；conversion=convert-required（KFB 族）。
+    裸 bundle（.mrxs）与未登记格式拒绝并说明原因——不推荐另一后端
+    （U2 §4：删除 fallback 语义）。"""
+    ext = safe.rsplit(".", 1)[-1].lower() if "." in safe else ""
+    if ext == "zip":
+        return "zip", None
+    cap = slide_format_registry.lookup(safe)["capability"]
+    if cap == slide_format_registry.CAP_NATIVE_SINGLE_FILE:
+        return "native", None
+    if cap == slide_format_registry.CAP_CONVERT_REQUIRED:
+        return "conversion", None
+    if cap == slide_format_registry.CAP_NATIVE_BUNDLE:
+        return None, (jsonify(
+            error="MRXS 等需要数据目录的格式，请连同数据目录打包为 zip 上传",
+            code="cos_format_unsupported"), 422)
+    return None, (jsonify(error="不支持的文件格式",
+                          code="cos_format_unsupported"), 422)
 
 
 def _cos_upload_capability_payload(demo):
-    """COS 直传 capability 下发（off 时零 DB 查询，静态不可用）。"""
+    """COS 直传 capability 下发（off 时零 DB 查询，静态不可用）。
+
+    U2：formats 从注册表派生（_cos_accepted_formats）；max_size_bytes =
+    产品上限（UPLOAD_PRODUCT_MAX_BYTES——不是池瞬时余额）。池结构性可
+    准入上限低于产品上限 = 配置门禁未过（§2.1）→ 整体不可用
+    （fail-closed；瞬时余额不足由任务 waiting 表达，不在此开关）。"""
     payload = {"available": False, "manual_only": True,
-               "formats": sorted(_COS_NATIVE_EXTS)}
+               "formats": sorted(_cos_accepted_formats())}
     if demo or cos_config.COS_UPLOAD_CAPABILITY not in ("off", "internal", "on"):
         return payload
     _sid, _skey, ok = cos_config.cos_credentials()
@@ -2801,9 +2847,19 @@ def _cos_upload_capability_payload(demo):
         return payload
     if pool is None or cos_pool_store.admission_paused(pool):
         return payload
+    if int(cos_pool_store.admission_limit_bytes(pool)) < \
+            int(UPLOAD_PRODUCT_MAX_BYTES):
+        # 配置门禁失败：池结构性可准入 < 产品上限（当前默认配置即如此）
+        # ——不得以缩小展示上限掩盖，也不得放行后在 create 处反复 503。
+        app.logger.error(
+            "cos pool admission limit %s < product limit %s——capability "
+            "不可用（容量配置未过发布预检）",
+            cos_pool_store.admission_limit_bytes(pool),
+            int(UPLOAD_PRODUCT_MAX_BYTES))
+        return payload
     payload.update({
         "available": True,
-        "max_size_bytes": int(cos_pool_store.admission_limit_bytes(pool)),
+        "max_size_bytes": int(UPLOAD_PRODUCT_MAX_BYTES),
         "part_bytes": int(cos_config.COS_PART_BYTES),
         "url_ttl_seconds": int(cos_config.COS_PART_URL_TTL_SECONDS),
         "max_concurrent_parts": int(cos_config.COS_UPLOAD_PART_CONCURRENCY),
@@ -13439,11 +13495,25 @@ _INGESTION_STAGE = {
 
 
 def _ingestion_state_body(job, *, queue_position=None):
-    """任务状态 JSON（阶段文案映射合同 §5；不含任何秘密/签名 URL）。"""
+    """任务状态 JSON（阶段文案映射合同 §5；不含任何秘密/签名 URL）。
+
+    U2（0075）：kind 下发；zip 附 items 子视图（逐逻辑切片的
+    slide_id/state/fail_code）；conversion 附 conversion 子视图（转换任务
+    状态/产物 slide_id——ready 才有）；非 native 的 validating 与
+    conversion 的 ready 文案为 processing（解包/转换进行中）。"""
+    kind = (job.get("kind") or ingestion_store.KIND_NATIVE)
+    stage = _INGESTION_STAGE.get(job["state"], "terminal")
+    if kind != ingestion_store.KIND_NATIVE:
+        if job["state"] == ingestion_store.VALIDATING:
+            stage = "processing"
+        if kind == ingestion_store.KIND_CONVERSION \
+                and job["state"] == ingestion_store.READY:
+            stage = "processing"  # 源已入账、转换在途（completed=转换 ready）
     body = {
         "job_id": job["job_id"],
         "state": job["state"],
-        "stage": _INGESTION_STAGE.get(job["state"], "terminal"),
+        "kind": kind,
+        "stage": stage,
         "declared_size": job["declared_size"],
         "format_ext": job["format_ext"],
         "viewer_ready": bool(job.get("viewer_ready")),
@@ -13456,6 +13526,14 @@ def _ingestion_state_body(job, *, queue_position=None):
         "expires_at": job.get("waiting_expires_at")
         if job["state"] == ingestion_store.WAITING else job.get("job_deadline_at"),
     }
+    if kind == ingestion_store.KIND_ZIP:
+        items = ingestion_store.list_ingestion_job_items(job["job_id"])
+        if items:
+            body["items"] = items
+    elif kind == ingestion_store.KIND_CONVERSION:
+        conv = ingestion_store.conversion_view(job)
+        if conv is not None:
+            body["conversion"] = conv
     if job["state"] == ingestion_store.DOWNLOADING:
         body["downloaded_bytes"] = job.get("downloaded_bytes")
     if job["state"] == ingestion_store.UPLOADING and job.get("part_plan_json"):
@@ -13491,12 +13569,18 @@ def _ingestion_fetch(job_id):
 
 @app.route("/api/ingestions", methods=["POST"])
 def api_ingestions_create():
-    """创建 COS 直传任务（合同 §4/§6.1）。
+    """创建 COS 直传任务（合同 §4/§6.1；U2 起接受全部用户上传形态）。
 
-    大小校验先于容量排队：非法 → 422 invalid_declared_size；超过单文件准入
-    上限 → 422 cos_exceeds_admission（max_size_bytes + fallback_transport=v2），
-    **不建行、不占预约、不发凭证、不进等待**。其余创建门禁通过而池不足时
-    202 + waiting_capacity（含排队位置，无预计秒数）。
+    大小校验先于容量排队（§2.1 两层）：非法 → 422 invalid_declared_size；
+    超产品上限 → 413 upload_too_large；超池**结构性**准入上限（配置门禁
+    未过）→ 503 cos_pool_below_product_limit（fail-closed，不是等待、不是
+    回退）；**均不建行、不占预约、不发凭证、不进等待**。其余创建门禁
+    通过而池瞬时余额不足时 202 + waiting_capacity（含排队位置）。
+
+    格式（U2 §3.2）：注册表派生——原生单文件 native / 归档 zip /
+    convert-required conversion；裸 bundle（.mrxs）与未登记格式 422 说明
+    原因（无 fallback 指引）。可选 sha256_expected（64 hex）为整对象声明，
+    下载校验后比对（不符=确定性失败 hash_mismatch）。
     """
     if not can_upload():
         return jsonify(error="无上传权限"), 403
@@ -13511,12 +13595,9 @@ def api_ingestions_create():
     safe = _sanitize_name(filename.strip())
     if not safe:
         return jsonify(error="非法文件名"), 400
-    ext = safe.rsplit(".", 1)[-1].lower() if "." in safe else ""
-    if ext not in _COS_NATIVE_EXTS:
-        return jsonify(
-            error="COS 直传首期仅支持原生单文件格式（%s）；ZIP/MRXS 请用"
-                  "旧接口，其它格式走平台上传" % "/".join(sorted(_COS_NATIVE_EXTS)),
-            code="cos_format_unsupported"), 422
+    kind, ferr = _cos_ingestion_kind_for(safe)
+    if ferr is not None:
+        return ferr
 
     try:
         declared_size = int(body.get("declared_size"))
@@ -13526,14 +13607,28 @@ def api_ingestions_create():
         return jsonify(
             error="declared_size 需为正整数（十进制字节）",
             code="invalid_declared_size"), 422
+    product_max = int(UPLOAD_PRODUCT_MAX_BYTES)
+    if declared_size > product_max:
+        # 产品上限（§2.1 单一权威）：超限即拒，不建行/不占预约/不进等待。
+        return jsonify(
+            error="文件超过平台上限",
+            code="upload_too_large",
+            max_size_bytes=product_max), 413
     max_bytes = int(cos_pool_store.admission_limit_bytes(pool))
     if declared_size > max_bytes:
-        # §6.1：明确回退 V2，不建行/不占预约/不进等待
+        # §2.1 配置门禁：池结构性可准入上限 < 产品上限——等待永远不可能
+        # 满足，不是用户问题；fail-closed 503（部署预检未过的显性失败）。
         return jsonify(
-            error="文件超过 COS 暂存准入上限，请使用平台上传",
-            code="cos_exceeds_admission",
-            max_size_bytes=max_bytes,
-            fallback_transport="v2"), 422
+            error="服务端存储配置暂不能接纳该大小（容量池准入上限低于平台"
+                  "上限，待运维调整）",
+            code="cos_pool_below_product_limit",
+            max_size_bytes=product_max), 503
+
+    sha_expected = body.get("sha256_expected")
+    if sha_expected is not None and (
+            not isinstance(sha_expected, str)
+            or not _SHA256_RE.match(sha_expected)):
+        return jsonify(error="sha256_expected 需为 64 位十六进制字符串"), 400
 
     idem = body.get("idempotency_key")
     if idem is not None and (not isinstance(idem, str) or not idem.strip()
@@ -13548,11 +13643,15 @@ def api_ingestions_create():
         job, _created = ingestion_store.create_waiting_job(
             owner_user_id=(ident.get("user_id") or ""),
             owner_role=(ident.get("role") or ""),
-            filename=filename.strip(), safe_name=safe, format_ext=ext,
+            filename=filename.strip(), safe_name=safe,
+            format_ext=(safe.rsplit(".", 1)[-1].lower()
+                        if "." in safe else ""),
             declared_size=declared_size,
             idempotency_key=(idem.strip() if idem else None),
             policy_version="v1-manual",
-            route_reason=body.get("route_reason") or "manual_cos")
+            route_reason=body.get("route_reason") or "manual_cos",
+            kind=kind,
+            sha256_expected=(sha_expected.lower() if sha_expected else None))
     except ingestion_store.IngestionStateError as e:
         # 空 owner（本地态未配置 owner，不允许自动认领）是服务端配置故障 →
         # 500；仅容量等待上限（cos_waiting_limit）落 409（P4-app C2 收口：

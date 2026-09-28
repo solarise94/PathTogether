@@ -655,6 +655,12 @@ def zip_assemble_plan(upload_id, plan, extract_dir, upload_root=None):
                                         root=_root(upload_root))
     if gen_dir.exists():
         return True
+    if slide_storage.bundle_dir(plan["slide_id"],
+                               root=_root(upload_root)).exists():
+        # 崩溃恢复窗口：gen 目录已被成功发布的 rename 带走（objects/<sid>
+        # 已在）——视为已组装，publish 的 FS 幂等分支将核对 manifest 吻合
+        # （不吻合 → PublishConflict fail-closed，不删不猜）。
+        return True
     key = plan["item_key"]
     stem = key.rsplit(".", 1)[0]
     entry_src = Path(extract_dir) / key
@@ -681,7 +687,7 @@ def zip_assemble_plan(upload_id, plan, extract_dir, upload_root=None):
 
 
 def zip_publish_items(upload_id, token, plans, owner_user_id,
-                      extract_dir=None, upload_root=None):
+                      extract_dir=None, upload_root=None, batch_precheck=None):
     """逐逻辑切片发布（P4-app 合同 §2.4）。
 
     每 item 一次 publish（slide_publish.publish_batch_item：完整包原子
@@ -691,7 +697,10 @@ def zip_publish_items(upload_id, token, plans, owner_user_id,
     结果）；临时故障/预占失效上抛（调用方保持 committing 由恢复幂等补发，
     或整体收尾）。
 
-    返回 (published_bytes, failures, settled_plans)。
+    U2：``batch_precheck`` 透传 publish_batch_item 的任务族重验注入缝
+    （缺省 = upload_tasks 通道；ingestion 批量注入
+    ingestion_store.ingestion_batch_precheck）。返回
+    (published_bytes, failures, settled_plans)。
     """
     root = _root(upload_root)
     published = 0
@@ -717,7 +726,8 @@ def zip_publish_items(upload_id, token, plans, owner_user_id,
                 accounted_bytes=plan["accounted_bytes"],
                 commit_token=token,
                 owner_user_id=(owner_user_id or "") or None,
-                upload_root=root)
+                upload_root=root,
+                batch_precheck=batch_precheck)
             published += int(plan["accounted_bytes"])
             settled.append(plan)
         except slide_publish.PublishError as e:

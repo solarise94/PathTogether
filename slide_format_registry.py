@@ -165,6 +165,19 @@ def ome_extensions():
     return _OME_EXTS
 
 
+def capability_exts(capability):
+    """按 capability 枚举已登记扩展名（小写、不带点）。
+
+    U2（COS 统一上传）：上传受理词表从注册表派生的公共入口——
+    /api/ingestions 的格式接受集与前端 capability 下发共用，不再维护
+    独立白名单（docs/cos-only-upload-agent-plan-20260928.md §3.2）。
+    """
+    return frozenset(
+        ext.lstrip(".")
+        for ext, info in _FORMATS.items()
+        if info["capability"] == capability)
+
+
 #: 产品目录展示表（id 唯一；extensions 不重叠）。capability 在 public_catalog
 #: 里按首个扩展名回查 _FORMATS 防漂移（.ome.* 不在 _FORMATS，取声明值）。
 _CATALOG_DISPLAY = (

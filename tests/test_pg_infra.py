@@ -314,6 +314,10 @@ def test_schema_migrations_recorded(conn):
         # R15 核账身份合同：任务创建时配额身份快照（duty/exempt；NULL=存量
         # 按当前角色裁决）——核账工具不再凭 rid 缺失终止合法豁免任务。
         "0074_upload_tasks_quota_mode.sql",
+        # COS 统一上传 U2（docs/cos-only-upload-agent-plan-20260928.md §3.2）：
+        # ingestion 任务形态（native/zip/conversion）+ sha256_expected +
+        # conversion_job_id + 批量 item 绑定表。
+        "0075_ingestion_kinds.sql",
     ]
 
 

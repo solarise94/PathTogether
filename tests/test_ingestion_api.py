@@ -23,6 +23,9 @@ def _pool(monkeypatch):
     monkeypatch.setattr(cos_config, "COS_POOL_CAPACITY_BYTES", 1_000_000)
     monkeypatch.setattr(cos_config, "COS_POOL_SAFETY_BYTES", 100_000)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
+    # U2（§2.1）：产品上限与池结构性准入分离——夹具把产品上限压到
+    # 800,000（< 结构性 900,000），使大小门禁矩阵可测且配置门禁通过。
+    monkeypatch.setattr(app_mod, "UPLOAD_PRODUCT_MAX_BYTES", 800_000)
     monkeypatch.setenv("COS_BUCKET", "bucket-appid")
     monkeypatch.setenv("COS_REGION", "ap-shanghai")
     monkeypatch.setenv("COS_SECRET_ID", "AKIDtest")
@@ -116,35 +119,65 @@ def test_invalid_declared_size_422(owner_client):
     assert ist.waiting_and_holding_counts()["waiting"] == 0
 
 
-def test_exceeds_admission_422_no_side_effects(owner_client):
-    r = _create(owner_client, size=900_001)
-    assert r.status_code == 422
+def test_exceeds_product_limit_413_no_side_effects(owner_client):
+    # U2（§2.1）：超产品上限 → 413 upload_too_large（不建行/不占预约/不
+    # 进等待）。旧「422 cos_exceeds_admission + fallback_transport=v2」
+    # 产品策略已按方案 §4 退役——统一 COS 后不再提供另一后端。
+    r = _create(owner_client, size=800_001)
+    assert r.status_code == 413
     body = r.get_json()
-    assert body["code"] == "cos_exceeds_admission"
-    assert body["max_size_bytes"] == 900_000
-    assert body["fallback_transport"] == "v2"
-    # 不建行、不占预约、不进等待
+    assert body["code"] == "upload_too_large"
+    assert body["max_size_bytes"] == 800_000
+    assert "fallback_transport" not in body
+    assert ist.waiting_and_holding_counts()["waiting"] == 0
+    assert cos_pool_store.get_pool_state()["reserved_bytes"] == 0
+
+
+def test_pool_below_product_limit_503_config_gate(owner_client, monkeypatch):
+    # U2（§2.1）：池结构性可准入（900,000）< 产品上限（950,000）= 配置
+    # 门禁未过——fail-closed 503，不是等待、不是回退、不缩小展示上限。
+    monkeypatch.setattr(app_mod, "UPLOAD_PRODUCT_MAX_BYTES", 950_000)
+    r = _create(owner_client, size=920_000)
+    assert r.status_code == 503
+    body = r.get_json()
+    assert body["code"] == "cos_pool_below_product_limit"
+    assert body["max_size_bytes"] == 950_000
     assert ist.waiting_and_holding_counts()["waiting"] == 0
     assert cos_pool_store.get_pool_state()["reserved_bytes"] == 0
 
 
 def test_exact_admission_boundary_creates(owner_client):
-    r = _create(owner_client, size=900_000)
+    r = _create(owner_client, size=800_000)
     assert r.status_code == 202
 
 
-def test_format_whitelist(owner_client):
-    for name in ("cosapi-a.zip", "cosapi-a.mrxs", "cosapi-a.kfb", "cosapi-a.bmp", "cosapinoext"):
+def test_format_acceptance_derived_from_registry(owner_client):
+    # U2（§3.2）：受理词表从注册表派生——原生单文件（含此前被 COS 白名单
+    # 排除的 bmp/jpg）、zip（包）、kfb（conversion）均建任务；裸 bundle
+    # （.mrxs）与未登记格式 422 说明原因（无 fallback 指引）。
+    for name in ("cosapi-a.mrxs", "cosapinoext", "cosapi-a.exe"):
         r = _create(owner_client, filename=name)
         assert r.status_code == 422, name
         assert r.get_json()["code"] == "cos_format_unsupported"
-    for name in ("cosapi-b.svs", "cosapi-b.tif", "cosapi-c.ndpi",
-                 "cosapi-d.bif"):
+    accepted = {"cosapi-a.zip": "zip", "cosapi-a.kfb": "conversion",
+                "cosapi-b.svs": "native", "cosapi-a.bmp": "native",
+                "cosapi-c.tif": "native"}
+    for name, kind in accepted.items():
         r = _create(owner_client, filename=name, size=100_000)
         assert r.status_code == 202, name
+        body = r.get_json()
+        assert body["kind"] == kind, name
         # 每身份 1 active + 1 waiting：逐个取消腾位再验下一格式
-        owner_client.post("/api/ingestions/%s/cancel"
-                          % r.get_json()["job_id"])
+        owner_client.post("/api/ingestions/%s/cancel" % body["job_id"])
+
+
+def test_sha256_expected_validation(owner_client):
+    r = _create(owner_client, sha256_expected="not-hex")
+    assert r.status_code == 400
+    r = _create(owner_client, sha256_expected="a" * 64)
+    assert r.status_code == 202
+    job = ist.get_job(r.get_json()["job_id"])
+    assert job["sha256_expected"] == "a" * 64
 
 
 # --------------------------------------------------------------------------- #
@@ -351,13 +384,20 @@ def test_capability_payload_shapes(monkeypatch):
         monkeypatch.setattr(cos_config, "COS_UPLOAD_CAPABILITY", "off")
         p = app_mod._cos_upload_capability_payload(demo=False)
         assert p["available"] is False and p["manual_only"] is True
-        # on：可用且含参数
+        # on：可用且含参数（U2：max=产品上限 800,000；formats 注册表派生）
         monkeypatch.setattr(cos_config, "COS_UPLOAD_CAPABILITY", "on")
         p = app_mod._cos_upload_capability_payload(demo=False)
         assert p["available"] is True
-        assert p["max_size_bytes"] == 900_000
+        assert p["max_size_bytes"] == 800_000
         assert p["policy_version"] == "v1-manual"
         assert "svs" in p["formats"]
+        assert "zip" in p["formats"] and "kfb" in p["formats"]
+        assert "mrxs" not in p["formats"]
+        # 配置门禁未过（结构性 < 产品上限）→ fail-closed 不可用
+        monkeypatch.setattr(app_mod, "UPLOAD_PRODUCT_MAX_BYTES", 950_000)
+        assert app_mod._cos_upload_capability_payload(
+            demo=False)["available"] is False
+        monkeypatch.setattr(app_mod, "UPLOAD_PRODUCT_MAX_BYTES", 800_000)
         # demo 恒不可用
         assert app_mod._cos_upload_capability_payload(
             demo=True)["available"] is False

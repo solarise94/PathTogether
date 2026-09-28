@@ -113,6 +113,24 @@ LOCAL_CLEANUP_PENDING = "pending"
 LOCAL_CLEANUP_CLEANED = "cleaned"
 LOCAL_CLEANUP_FAILED = "failed"
 
+# --------------------------------------------------------------------------- #
+# 任务形态（0075；COS 统一上传 U2——/api/ingestions 接受全部用户上传形态）
+# --------------------------------------------------------------------------- #
+#: 原生单文件（创建即预分配 slide_id——唯一带 job 级资产绑定的形态）。
+KIND_NATIVE = "native"
+#: 归档包（多逻辑切片；产物经 ingestion_job_items 逐 item 绑定，job 级
+#: slide_id 恒 NULL）。
+KIND_ZIP = "zip"
+#: convert-required 源（KFB/KFBF；产物 slide_id 归 conversion_jobs，本表经
+#: conversion_job_id 关联；job 级 slide_id 恒 NULL）。
+KIND_CONVERSION = "conversion"
+KINDS = frozenset({KIND_NATIVE, KIND_ZIP, KIND_CONVERSION})
+
+#: ingestion_job_items.state 的合法值（item 级结果证据，0075）。
+ITEM_PENDING = "pending"
+ITEM_PUBLISHED = "published"
+ITEM_FAILED = "failed"
+
 #: 调度器清理重试的文件锁等待上界（秒）——writer 长期占锁时跳过本轮，
 #: 持久重试继续（R12 §3.2：超时不是删除成功）。
 _CLEANUP_LOCK_WAIT_SECONDS = float(
@@ -163,6 +181,8 @@ _JOB_FIELDS = (
     # 0072 列：本地暂存清理进度（独立于远端 cleanup_*）。
     "local_cleanup_status", "local_cleanup_attempts",
     "local_cleanup_last_error", "local_cleanup_next_retry_at",
+    # 0075 列：任务形态 / 可选整对象 sha 声明 / 转换任务关联。
+    "kind", "sha256_expected", "conversion_job_id",
 )
 
 _INT_FIELDS = frozenset({
@@ -277,13 +297,21 @@ def _abandon_staging_asset(cur, job):
 
 def create_waiting_job(owner_user_id, owner_role, filename, safe_name,
                        format_ext, declared_size, *, idempotency_key=None,
-                       policy_version=None, route_reason=None):
+                       policy_version=None, route_reason=None,
+                       kind=KIND_NATIVE, sha256_expected=None):
     """创建 waiting_capacity 任务（尚不预约任何容量/凭证，§4/§6.1）。
 
-    P4-b（合同 §5.2）：**创建即预分配 slide_id**——同一事务内
+    P4-b（合同 §5.2）：native 形态**创建即预分配 slide_id**——同一事务内
     ``slide_store.allocate_slide``（staging/id_bundle 资产行，owner=解析后
     的资产 owner）+ 写 ``ingestion_jobs.slide_id``（0067 列，唯一绑定源）。
     不查原名是否已存在（同名并发各得各 ID，name_unavailable 族拆除）。
+
+    U2（0075）：``kind='zip'``/``'conversion'`` 不做 job 级资产预分配——
+    zip 的产物资产在受理事务逐 item ``allocate_slide``（绑定源
+    ingestion_job_items）；conversion 的产物 slide_id 由 conversion_jobs
+    create_job 预分配（job 经 conversion_job_id 关联）。两类任务的
+    ``slide_id`` 恒 NULL（``_abandon_staging_asset`` 等 null 安全）。
+    ``sha256_expected``（可选，64 hex）为整对象声明，下载校验后比对。
 
     幂等：同 (owner, idempotency_key) 存活/已完成任务唯一（0066 部分唯一
     索引兜底）——冲突时返回 (既有行, False)，**复用既有行的 slide_id**
@@ -291,6 +319,8 @@ def create_waiting_job(owner_user_id, owner_role, filename, safe_name,
     仍是一行一 ID）。返回 (job_dict, created)。
     """
     declared_size = int(declared_size)
+    if kind not in KINDS:
+        raise IngestionStateError("未知 ingestion 任务形态：%r" % (kind,))
     asset_owner = asset_owner_for_job({"owner_user_id": owner_user_id})
     if not asset_owner:
         raise IngestionStateError(
@@ -310,21 +340,26 @@ def create_waiting_job(owner_user_id, owner_role, filename, safe_name,
                     with conn.transaction():  # SAVEPOINT：失败后事务可继续
                         # allocate 与 job INSERT 同一 SAVEPOINT：撞唯一索引
                         # 整体回滚时新资产行一并消失（不泄漏 staging 行）。
-                        desc = slide_store.allocate_slide(
-                            asset_owner, original_filename=original_name,
-                            format_ext=format_ext, conn=conn)
+                        slide_id = None
+                        if kind == KIND_NATIVE:
+                            desc = slide_store.allocate_slide(
+                                asset_owner,
+                                original_filename=original_name,
+                                format_ext=format_ext, conn=conn)
+                            slide_id = desc.slide_id
                         cur.execute(
                             "INSERT INTO ingestion_jobs (job_id, owner_user_id, "
                             "owner_role, idempotency_key, filename, safe_name, "
                             "format_ext, declared_size, state, transport, "
-                            "policy_version, route_reason, slide_id, "
-                            "waiting_expires_at) "
+                            "policy_version, route_reason, slide_id, kind, "
+                            "sha256_expected, waiting_expires_at) "
                             "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'presign_parts',"
-                            "%s,%s,%s, now() + make_interval(secs => %s))",
+                            "%s,%s,%s,%s,%s, now() + make_interval(secs => %s))",
                             (job_id, owner_user_id, owner_role, idempotency_key,
                              filename, safe_name, format_ext, declared_size,
                              WAITING, policy_version, route_reason,
-                             desc.slide_id, cos_config.COS_WAITING_MAX_AGE_SECONDS))
+                             slide_id, kind, sha256_expected,
+                             cos_config.COS_WAITING_MAX_AGE_SECONDS))
                 except psycopg.errors.UniqueViolation as exc:
                     constraint = getattr(exc.diag, "constraint_name", "") or ""
                     # 幂等重试优先：同 (owner, key) 存活任务存在即返回既有行
@@ -893,6 +928,11 @@ def worker_settle_ready(job_id, generation, *, slide_canonical_name=None,
                 if job["state"] != VALIDATING:
                     raise IngestionStateError(
                         "结算要求 validating（当前 %s）" % job["state"])
+                if job.get("kind") not in (None, KIND_NATIVE):
+                    raise IngestionStateError(
+                        "native 结算入口不接受 %r 形态（job=%s）——zip 走 "
+                        "worker_settle_zip、conversion 走 worker_settle_source"
+                        % (job.get("kind"), job_id))
                 if not job.get("commit_intent_json"):
                     raise IngestionStateError(
                         "结算前必须已持久化 commit intent（§4 提交恢复栅栏）")
@@ -1843,3 +1883,245 @@ def release_worker_lease(job_id, token):
                 return True
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 批量 item 绑定与结果（0075；镜像 upload_task_items 的 R-13 语义）
+# --------------------------------------------------------------------------- #
+def bind_ingestion_job_item(conn, job_id, item_key, slide_id):
+    """绑定批量任务的逻辑切片 → 预分配 slide_id（调用方事务内；幂等）。
+
+    (job_id, item_key) 已有行 → 返回既有行（重试/恢复复用，绝不重新分配）；
+    slide_id 全局 UNIQUE 兜底并发误绑。必须与 allocate_slide 同一事务
+    （调用方保证）——崩溃只见完整旧/新版。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO ingestion_job_items (job_id, item_key, slide_id) "
+            "VALUES (%s,%s,%s) "
+            "ON CONFLICT (job_id, item_key) DO NOTHING "
+            "RETURNING item_key, slide_id",
+            (str(job_id), str(item_key), str(slide_id)))
+        row = cur.fetchone()
+        if row is not None:
+            return {"item_key": row["item_key"], "slide_id": row["slide_id"]}
+        cur.execute(
+            "SELECT item_key, slide_id FROM ingestion_job_items "
+            "WHERE job_id=%s AND item_key=%s", (str(job_id), str(item_key)))
+        row = cur.fetchone()
+        if row is None:
+            raise IngestionStateError(
+                "ingestion_job_items 绑定失败：%r/%r" % (job_id, item_key))
+        return {"item_key": row["item_key"], "slide_id": row["slide_id"]}
+
+
+def list_ingestion_job_items(job_id):
+    """批量任务的 item 绑定与结果列表（item_key 升序；不加锁读）。"""
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT item_key, slide_id, state, fail_code "
+                "FROM ingestion_job_items WHERE job_id=%s ORDER BY item_key",
+                (str(job_id),))
+            return [{"item_key": r["item_key"], "slide_id": r["slide_id"],
+                     "state": r["state"], "fail_code": r["fail_code"]}
+                    for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def mark_ingestion_item(job_id, item_key, state, fail_code=None):
+    """item 级结果落库（published/failed；幂等 UPDATE，独立短事务）。
+
+    item 的 slides.accounted_bytes 在 publish_batch_item 的发布事务写入
+    （唯一实现）；本函数只维护任务侧结果证据（status API 的 items/failures
+    子视图）。崩溃在 publish 与本调用之间 → item 行暂 stale pending，恢复
+    重跑 publish（幂等 already 分支）后再次落库收敛。"""
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE ingestion_job_items SET state=%s, fail_code=%s, "
+                    "updated_at=now() WHERE job_id=%s AND item_key=%s",
+                    (state, fail_code, str(job_id), str(item_key)))
+                return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# U2 批量/转换结算与通道重验（0075）
+# --------------------------------------------------------------------------- #
+def ingestion_batch_precheck(cur, task_ref, commit_token, owner_user_id):
+    """slide_publish.publish_batch_item 的 ingestion 通道锁内重验（U2）。
+
+    与 upload_tasks 批量重验同构（镜像 _upload_batch_precheck_locked 语义）：
+    job 行 FOR UPDATE → ready/completed（幂等分支，CAS 吸收）/ validating+
+    generation 匹配（发布资格）→ owner 一致（解析后资产 owner）→ 预约续租
+    （不 consume；绑定 holder=ingestion_job 核验）。generation 过期抛
+    StaleLease（fencing——旧 worker 的补发被拒）。
+    """
+    job = get_job_locked(cur, task_ref)
+    if job is None:
+        raise slide_publish.PublishError(
+            "task_not_found", "任务不存在：%s" % task_ref, deterministic=True)
+    if str(job["worker_generation"]) != str(commit_token):
+        raise StaleLease(
+            "generation 过期（%s != 当前 %s）——旧 worker 批量发布被拒"
+            % (commit_token, job["worker_generation"]))
+    if job["state"] != VALIDATING:
+        if job["state"] not in (READY, COMPLETED):
+            raise slide_publish.PublishError(
+                "generation_mismatch",
+                "批量任务代次失效（state=%r）——不猜" % job["state"],
+                deterministic=True, task=job)
+    if owner_user_id is not None \
+            and (owner_user_id or "").strip() != asset_owner_for_job(job):
+        raise slide_publish.PublishError(
+            "owner_mismatch", "任务归属与发布发起者不一致（拒绝，不自动修正）",
+            deterministic=True, task=job)
+    rid = job.get("local_reservation_id")
+    if rid:
+        out = upload_guard.renew_reservation_locked(cur, rid)
+        if not upload_guard.reservation_is_active(out):
+            raise upload_guard.ReservationInvalid(
+                "预占已失效，不能发布：%r" % rid)
+        if not upload_guard.reservation_holder_matches(
+                out, "ingestion_job", job["job_id"]):
+            raise upload_guard.ReservationInvalid(
+                "预占绑定与本任务不符，不能发布：%r" % rid)
+    return job
+
+
+def _settle_job_locked(cur, job, generation, *, sha256_actual, settle_bytes,
+                       extra_sql="", extra_args=()):
+    """结算公共段（zip/conversion 共用；调用方已持 job 行锁）。
+
+    同一事务：consume local reservation（一次结算；幂等由状态机单次转移
+    保证）+ job 收口 UPDATE（ready + local_ready_at + sha256_actual +
+    远端/本地清理责任 pending）。锁序：job 行 → quotas → reservations。
+    """
+    if job["worker_generation"] != int(generation):
+        raise StaleLease("generation 过期（结算被拒）")
+    if job["state"] in (READY, COMPLETED):
+        return _norm_row(job)  # 已收口（重复调用/恢复重入）
+    if job["state"] != VALIDATING:
+        raise IngestionStateError(
+            "结算要求 validating（当前 %s）" % job["state"])
+    if not job.get("commit_intent_json"):
+        raise IngestionStateError(
+            "结算前必须已持久化 commit intent（§4 提交恢复栅栏）")
+    rid = job.get("local_reservation_id")
+    if rid:
+        upload_guard.consume_reservation_locked(
+            cur, rid, int(settle_bytes),
+            expect_holder=("ingestion_job", job["job_id"]))
+    cur.execute(
+        "UPDATE ingestion_jobs SET state=%s, local_ready_at=now(), "
+        "slide_canonical_name=%s, sha256_actual=%s, cleanup_status=%s, "
+        "local_cleanup_status=%s, updated_at=now()" + extra_sql +
+        " WHERE job_id=%s",
+        (READY, job.get("safe_name"), sha256_actual,
+         CLEANUP_PENDING, LOCAL_CLEANUP_PENDING)
+        + tuple(extra_args) + (job["job_id"],))
+    cur.execute("SELECT * FROM ingestion_jobs WHERE job_id=%s",
+                (job["job_id"],))
+    return _norm_row(cur.fetchone())
+
+
+def worker_settle_zip(job_id, generation, *, sha256_actual, settle_bytes):
+    """zip 形态 validating → ready：一次性结算（settle=Σ已发布 item 字节）。
+
+    与 native 的差异（镜像 V1 zip 合同 §2.4）：产物资产的 slides CAS/
+    accounted_bytes/revision 已在逐 item publish_batch_item 事务完成（经
+    ingestion_batch_precheck 注入）；本事务只做任务级收口——consume
+    reservation（一次）+ ready + 清理责任。幂等：ready/completed 返回现状。
+    全部 item 失败/预占失效的撤回收口由 worker 在**结算前**处理（zip_abort
+    + fail_job），本入口不面对失败态。
+    """
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                job = get_job_locked(cur, job_id)
+                if job is None:
+                    raise IngestionStateError("ingestion job 不存在：%r" % job_id)
+                if job.get("kind") != KIND_ZIP:
+                    raise IngestionStateError(
+                        "zip 结算入口不接受 %r 形态（job=%s）"
+                        % (job.get("kind"), job_id))
+                out = _settle_job_locked(
+                    cur, job, generation, sha256_actual=sha256_actual,
+                    settle_bytes=settle_bytes)
+                _append_event(cur, job_id, "local_ready", {
+                    "kind": KIND_ZIP, "settle_bytes": int(settle_bytes),
+                    "items": len(list_ingestion_job_items(job_id) or [])})
+                return out
+    finally:
+        conn.close()
+
+
+def worker_settle_source(job_id, generation, *, sha256_actual, settle_bytes,
+                         conversion_job_id):
+    """conversion 形态 validating → ready：源字节结算 + 转换任务关联。
+
+    镜像 V1/V2 KFB 合同：上传侧结算**源字节**；产物字节由转换任务结算
+    （conversion_jobs.accounted_bytes 记账）。job 收口 ready 表示「源已
+    入账、转换已受理」；completed 只在转换 ready 后（process_ready 探测
+    conversion 状态推进）。转换失败不终止本任务（重试走既有
+    /api/conversions/<id>/retry；任务保持 ready 并在状态体暴露转换状态）。
+    """
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                job = get_job_locked(cur, job_id)
+                if job is None:
+                    raise IngestionStateError("ingestion job 不存在：%r" % job_id)
+                if job.get("kind") != KIND_CONVERSION:
+                    raise IngestionStateError(
+                        "conversion 结算入口不接受 %r 形态（job=%s）"
+                        % (job.get("kind"), job_id))
+                existing = (job.get("conversion_job_id") or "").strip()
+                if existing and existing != str(conversion_job_id):
+                    raise IngestionStateError(
+                        "conversion_job_id 已存在且不一致（%s != %s）——人工核查"
+                        % (existing, conversion_job_id))
+                out = _settle_job_locked(
+                    cur, job, generation, sha256_actual=sha256_actual,
+                    settle_bytes=settle_bytes,
+                    extra_sql=", conversion_job_id=%s",
+                    extra_args=(str(conversion_job_id),))
+                _append_event(cur, job_id, "local_ready", {
+                    "kind": KIND_CONVERSION, "settle_bytes": int(settle_bytes),
+                    "conversion_job_id": str(conversion_job_id)})
+                return out
+    finally:
+        conn.close()
+
+
+def conversion_view(job):
+    """conversion 形态的转换子视图（status API 用；只读，不触发远程）。
+
+    返回 None 表示尚未受理（waiting/uploading/downloading 阶段）或任务非
+    conversion 形态。"""
+    if (job or {}).get("kind") != KIND_CONVERSION:
+        return None
+    cjid = ((job or {}).get("conversion_job_id") or "").strip()
+    if not cjid:
+        return None
+    import conversion_store
+    cjob = conversion_store.get_job(cjid)
+    if cjob is None:
+        return {"job_id": cjid, "state": "missing"}
+    view = {
+        "job_id": cjid,
+        "state": cjob.get("state"),
+        "fail_code": cjob.get("fail_code"),
+        "canonical_name": cjob.get("canonical_name"),
+    }
+    if cjob.get("state") == "ready":
+        view["slide_id"] = (cjob.get("slide_id") or "").strip() or None
+    return view

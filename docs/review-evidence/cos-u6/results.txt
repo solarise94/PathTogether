@@ -1,0 +1,16 @@
+== U6 全量门禁（2026-09-28，HEAD=63071f1 + Containerfile 修复） ==
+
+-- 全量 pytest（串行，无并行负载）--
+FAILED tests/test_ai_budget_wiring.py::test_ui_budget_card_and_max_steps_sync_present
+FAILED tests/test_stage2_ui.py::test_containerfile_ships_app_modules - Assert...
+2 failed, 2721 passed, 11 skipped, 252 warnings in 1386.80s (0:23:06)
+（test_stage2_ui 失败为 Containerfile 缺 COPY upload_content.py——已修复，单文件复跑 20 过；test_ai_budget_wiring 为工作区第三方 admin 插件版本漂移的已知豁免）
+
+-- vitest --
+36 files / 548 passed（cos-upload 12 新合同；upload-v2/upload-csrf 随适配器删除）
+
+-- HistoPilot contract --
+49 passed（上传夹具迁 /internal/_test_control publish_fixture）
+
+-- 定向 28 文件（U5 后）--
+460 passed + 5 skipped（r13 按处置约定整文件 skip）

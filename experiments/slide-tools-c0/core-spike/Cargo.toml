@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/cli", "crates/wasm"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "Proprietary"
+publish = false
+
+[workspace.dependencies]
+# Pin everything used by the spike; versions recorded in the ADR license list.
+zune-jpeg = "0.4"
+jpeg-encoder = "0.6"
+wasm-bindgen = "=0.2.129"
+
+[profile.release]
+opt-level = 3

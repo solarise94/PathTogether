@@ -1,0 +1,18 @@
+[package]
+name = "slide-transform-wasm-spike"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "C0 wasm32 build proof for the core crate (browser runner is part 3)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["edge-reencode"]
+edge-reencode = ["slide-transform-core-spike/edge-reencode"]
+
+[dependencies]
+slide-transform-core-spike = { path = "../core", default-features = false }
+wasm-bindgen = { workspace = true }

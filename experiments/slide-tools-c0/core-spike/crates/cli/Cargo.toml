@@ -1,0 +1,18 @@
+[package]
+name = "kfb2tiff"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "C0 native CLI: convert brightfield KFB to tiled JPEG BigTIFF pyramid using file-backed ByteSource/Sink"
+
+[[bin]]
+name = "kfb2tiff"
+path = "src/main.rs"
+
+[features]
+default = ["edge-reencode"]
+edge-reencode = ["slide-transform-core-spike/edge-reencode"]
+
+[dependencies]
+slide-transform-core-spike = { path = "../core" }

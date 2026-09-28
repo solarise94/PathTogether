@@ -1,0 +1,162 @@
+{
+  "schema": "slide-tools.capability-tables",
+  "version": 0,
+  "generated": "2026-09-29",
+  "repo_head": "6b436560228fa6131e1fdff33900b434034bbf92",
+  "evidence": "C0-① inventory of 5 real samples (aliases only; sha256 = full source file) + existing kfb/ package at HEAD 6b43656; see docs/slide-tools/c0-inventory.md for file:line anchors",
+  "notes": [
+    "v0 只登记有真实样本或现有代码直接证据的能力；『no real sample — not supportable in v1』行是硬门禁，不因代码存在而放宽",
+    "样本别名: KFB-1 = 1 个明场 KFB; KFBF-A/B/C/D = 4 个荧光 KFBF（按文件名排序）; 原始文件名不出现在本表",
+    "支持判定依据 magic/变体/codec/维度/IO 需求，后缀仅作提示（与方案 §2 一致）"
+  ],
+  "input_reader_capability": {
+    "columns": ["format_row_id", "magic_or_signature", "variant", "codec_evidence", "dimensions_levels", "tile_size_px", "channels", "bit_depth", "mpp_known", "edge_tiles_reencoded", "sparse_cells", "associated_images", "preserves_original_sample", "real_sample_evidence", "status_v0"],
+    "rows": [
+      {
+        "format_row_id": "kfb-brightfield-vendor-jpeg",
+        "magic_or_signature": "f1 01 ee ee 4b 46 42 00 + version_field=0 + codec@0x20='JPEG' + tile@0x58=256",
+        "variant": "kfb_kfbio_jpeg（tagged header + 64B/条 tile 索引，scale=objective/2^level）",
+        "codec_evidence": "baseline JPEG, 3 分量, SOF 采样 (2,1,1,1,1,1)=YCbCr 4:2:2, 2 张量化表（luma 4..48 / chroma 7..40），全层一致（抽样 25 tile）",
+        "dimensions_levels": "L0 34013x46152；9 层 floor 减半至 132x180（首个 1x1 网格层止）",
+        "tile_size_px": 256,
+        "channels": "3（RGB，YCbCr 存储）",
+        "bit_depth": 8,
+        "mpp_known": true,
+        "edge_tiles_reencoded": "627 / 32277（其余 31650 完整 tile 原字节搬运）",
+        "sparse_cells": "无；parser/converter 要求网格完整，缺 tile fail-closed",
+        "associated_images": "overview 1632x696 / label 804x808 / thumbnail 136x184（RGB JPEG）",
+        "preserves_original_sample": "完整 tile 压缩字节 1:1；边缘 tile 解码→白底 256x256 贴图→复用源量化表重编码（非无损，qtable 全部复用无 q95 回落）",
+        "real_sample_evidence": "KFB-1 sha256=17fe1cfde1a6d1f1d8778ea5854db5fd353f657e51003c606b404b60300aab71",
+        "status_v0": "supported-v0-evidenced（单一厂商样本；未知变体仍 fail-closed）"
+      },
+      {
+        "format_row_id": "kfbf-fluorescence-vendor-jpeg",
+        "magic_or_signature": "f1 01 ee ee 4b 46 42 46 + version_field=0 + fmt_version@0x0C=2.1(f32) + codec='JPEG' + tile=256",
+        "variant": "kfbf_kfbio_jpeg（tagged 段 tag75/77/79/84/87；每网格位置 6 通道灰度 JPEG；va 96B 指针块 + side 48B 长度记录）",
+        "codec_evidence": "baseline 灰度 JPEG（单分量），1 张量化表（4..48，与明场 luma 表同首 8 值），全通道全层一致（4 样本 ×6 通道 ×17 层抽样）",
+        "dimensions_levels": "17 层；L0=header 尺寸，L1..L3 floor 减半，L4..L8=ceil(L0/256)*2^(8-L)，L9+ floor 减半至 1x1（样本实测 4/4 一致）",
+        "tile_size_px": 256,
+        "channels": "6（DAPI/480/520/570/620/690；名/色 tag77/79，曝光 tag84，gamma tag87）",
+        "bit_depth": 8,
+        "mpp_known": true,
+        "edge_tiles_reencoded": "每通道 L0-L3 合计 329-330 cell（4 样本 1260-1980 次 ×6 通道重编码；全部复用源量化表）",
+        "sparse_cells": "有；L0-L3 每通道缺 72-232 cell，转换时黑 JPEG 填充（quality=90，缓存复用）",
+        "associated_images": "overview 1676x872 / label 988x892（RGB）+ thumbnail（EOF 52B f102 记录 *p1 二级间接，灰度）",
+        "preserves_original_sample": "cell 尺寸匹配的通道 JPEG 原字节搬运；底行裁剪/边缘 cell 重编码；稀疏 cell 合成黑块（display 语义，非原像素）",
+        "real_sample_evidence": "KFBF-A sha256=1d10e48fa6e7a7da96dfe5ada5d4c55199fd77ac29560b537fa9e31a888c78f6, KFBF-B=0ad51d3dce5d6fcdb5db5a4ea220dd452c9c2d220d590a6cde4d76d83e0e2c94, KFBF-C=8fe031ad72534a82325ffc56100bbe7bf275ae9808250f9f523ea0ce63a58963, KFBF-D=4aa66d2fda0d7a9a9f5509063f695a8b9c53b59dcfa9f723d0819b8329f03013（同一扫描仪 KFFL02000113023）",
+        "status_v0": "supported-v0-evidenced（同一扫描仪/同一 panel 的 4 份样本；不能推及所有 KFBF）"
+      },
+      {
+        "format_row_id": "kfb-bf-v1-synthetic-contract",
+        "magic_or_signature": "同一 magic + version_field=1（96..4096B 合同 header + 32B/条索引 + 48B associated 条目）",
+        "variant": "kfb_bf_v1（合成 fixture 合同；无真实样本）",
+        "codec_evidence": "由 fixture.py 生成（代码证据，非厂商证据）",
+        "dimensions_levels": "合同几何：L_l = max(1, L0>>l)",
+        "tile_size_px": 256,
+        "channels": "3",
+        "bit_depth": 8,
+        "mpp_known": "合同必填",
+        "edge_tiles_reencoded": "按合同",
+        "sparse_cells": "无（网格完整性校验）",
+        "associated_images": "label/overview/thumbnail 合同名",
+        "preserves_original_sample": "同明场 vendor 路径",
+        "real_sample_evidence": "无真实样本（仅 fixture）",
+        "status_v0": "test-fixture-only；不进入用户支持矩阵"
+      },
+      {
+        "format_row_id": "mrxs-directory",
+        "magic_or_signature": "n/a",
+        "status_v0": "no real sample — not supportable in v1（MRXS 目前仅经 ZIP 入库；浏览器目录读取是将来拆 ZIP 的前置能力，v0 无证据）"
+      },
+      {
+        "format_row_id": "generic-tiff-input",
+        "magic_or_signature": "II*/MM*",
+        "status_v0": "no real sample — not supportable in v1（输入侧无真实样本；平台仅把 TIFF 族当原生查看格式，见 platform 表）"
+      },
+      {
+        "format_row_id": "ome-tiff-input",
+        "magic_or_signature": "TIFF + OME-XML ImageDescription",
+        "status_v0": "no real sample — not supportable in v1（输入侧无真实样本；输出侧 OME 由 oracle 产物验证，见 output 表）"
+      },
+      {
+        "format_row_id": "svs-input",
+        "magic_or_signature": "TIFF/Aperio",
+        "status_v0": "no real sample — not supportable in v1（浏览器输入无证据；平台原生受理 .svs 但无本地样本文件，见 platform 表）"
+      }
+    ]
+  },
+  "output_profile_capability": {
+    "columns": ["profile_row_id", "container", "layout", "compression", "pixel_policy", "metadata_mapping", "interop_evidence", "status_v0"],
+    "rows": [
+      {
+        "profile_row_id": "brightfield-classic-bigtiff-pyramid",
+        "container": "BigTIFF (II, version 43), little-endian",
+        "layout": "经典多 IFD 金字塔：每层 1 IFD，Tile 256x256，NewSubfileType=reduced（L≥1），YCbCrSubSampling 与源 JPEG 一致",
+        "compression": "JPEG（完整 tile 原压缩字节搬运；边缘 tile 复用源量化表重编码）",
+        "pixel_policy": "原像素区不重采样不改位深；边缘 tile 有损（Pillow 重编码，非 DCT 域补边）；strict 无损模式不可用该 profile 宣称",
+        "metadata_mapping": "MPP→XResolution/YResolution(像素/厘米, ResolutionUnit=3)；objective/scanner/源格式→ImageDescription JSON；关联图落 .associated/*.jpg + manifest",
+        "interop_evidence": "tifffile 2024.5.22：1 series YXS 9 levels 全部可读；Bio-Formats 8.5.0 bftools showinf：TiffDelegateReader 可开，Series=1（仅全分辨率层——BF 不把经典多 IFD 缩减层暴露为 resolution，interop 注意点）",
+        "status_v0": "supported-v0-evidenced（KFB-1 oracle 全链路）"
+      },
+      {
+        "profile_row_id": "fluorescence-ome-bigtiff-subifd-multichannel",
+        "container": "BigTIFF + OME-XML(2016-06)",
+        "layout": "顶层 IFD 链 = L0 每通道 1 IFD（spp=1 BlackIsZero）；每通道 IFD 经 SubIFDs 挂 16 级缩减层",
+        "compression": "JPEG（cell 尺寸匹配原字节搬运；边缘重编码复用量化表；稀疏黑块 quality=90）",
+        "pixel_policy": "通道原生 uint8 数值保留；黑填充是显示语义填充非原像素；曝光单位为 ms(assumed) 假定，禁止升级为已确认",
+        "metadata_mapping": "OME: SizeC/通道名/Color(ARGB signed int32)/ExposureTime(ms,假定)/PhysicalSize(µm)/NominalMagnification；TiffData FirstC=c→IFD=c；manifest 记 exposure_unit='ms(assumed)'",
+        "interop_evidence": "tifffile：series CYX (6,H,W) uint8 17 levels；Bio-Formats 8.5.0 OMETiffReader：17 series ×6 planes 全部可读，通道名/颜色/PhysicalSize 保留；但 BF 再序列化丢弃 Channel@ExposureTime（OME 模型该属性属 Plane——C1 须改挂 Plane 或接受丢失）",
+        "status_v0": "supported-v0-evidenced（KFBF-A/B/C/D oracle 全链路）"
+      },
+      {
+        "profile_row_id": "pixel-lossless-profile",
+        "status_v0": "not-available-v0（现有边缘重编码使『无损』不可宣称；strict 模式需真正无损编码或明确拒绝，属 C1+ 工作）"
+      },
+      {
+        "profile_row_id": "lossy-recompression-profile",
+        "status_v0": "not-available-v0（明场 RGB 有损参数化副本未实现；荧光第一版不开放 JPEG 二次压缩滑条）"
+      },
+      {
+        "profile_row_id": "svs-export",
+        "status_v0": "no real sample — not supportable in v1（不通过改扩展名伪装 SVS）"
+      }
+    ]
+  },
+  "platform_publish_view_capability": {
+    "columns": ["row_id", "what", "publish_path", "view_path", "evidence", "status_v0"],
+    "rows": [
+      {
+        "row_id": "cos-native-direct-upload",
+        "what": "原生单文件（.svs/.tif/.tiff/.ome.tif/.ome.tiff/.ndpi/.vms/.vmu/.scn/.bif/.svslide/.bmp/.jpg）",
+        "publish_path": "COS 直传 → cos_ingest_worker(kind=native) → slide_publish.publish_with_channel",
+        "view_path": "slide_io.py：openslide 优先，TiffFileSlide(tifffile+zarr<3) 兜底；受 render_channel_limit 约束",
+        "evidence": "slide_format_registry.py:44-70 native 登记；app.py:_cos_ingestion_kind_for（2787）；requirements.txt:2-8 pillow/openslide-python/openslide-bin/tifffile==2024.5.22/imagecodecs",
+        "status_v0": "现状运行（与本方案无关，保持）"
+      },
+      {
+        "row_id": "cos-conversion-kind-upload",
+        "what": "convert-required（.kfb/.kfbf）经后端转换",
+        "publish_path": "COS 上传 → cos_ingest_worker validating 临界区 → held conversion_jobs 子任务 → conversion_worker 进程转换 → publish_with_channel(conversion)",
+        "view_path": "产物为标准 TIFF/OME-TIFF → 同 native 查看路径",
+        "evidence": "cos_ingest_worker.py:1245 _conversion_critical_section；ingestion_store.py:2122 worker_accept_conversion；docker_entry.sh:156-168 CONVERSION_WORKER",
+        "status_v0": "现状运行；§8 退役对象（A 停建 → B 删除）"
+      },
+      {
+        "row_id": "baidu-import-ingest",
+        "what": "百度分享下载 → gunicorn 进程内同步转换 → 入库",
+        "publish_path": "baidu_ingest.ingest_staging → conversion_store.create_job/claim_job + conversion_worker.process_job（Web 进程内）",
+        "view_path": "产物同 native",
+        "evidence": "baidu_ingest.py:284/300/304；docker_entry.sh:200-216 BAIDU_IMPORT_WORKER 拉起 scripts/baidu_import_worker.py",
+        "status_v0": "现状运行；迁出插件的首要收益点（CPU/内存落在 Web 进程）"
+      },
+      {
+        "row_id": "tool-output-upload-view",
+        "what": "浏览器/插件产物上传与查看",
+        "publish_path": "v0 无（§7.2 producer import 待 C5）；短期只能走 COS 原生直传（产物已是标准格式）",
+        "view_path": "明场经典 BigTIFF：openslide/TiffFileSlide 可开（tifffile 验证 9 levels）；OME 多通道：TiffFileSlide 受 render_channel_limit 限制，平台多通道显示能力未在 v0 逐项验证",
+        "evidence": "oracle 产物 tifffile + Bio-Formats 双开通过；平台自身 viewer 对 OME C>limit 行为见 slide_io.py:83 render_channel_limit",
+        "status_v0": "部分：产物可发布可读；『多维可查看』按 §0 裁决不作为导出约束"
+      }
+    ]
+  }
+}

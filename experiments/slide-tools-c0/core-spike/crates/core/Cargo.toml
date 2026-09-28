@@ -1,0 +1,17 @@
+[package]
+name = "slide-transform-core-spike"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "C0 core spike: KFB brightfield parse + JPEG-passthrough BigTIFF pyramid writer (pure logic, IO via traits)"
+
+[features]
+default = ["edge-reencode"]
+# JPEG decode/encode for edge tiles (zune-jpeg + jpeg-encoder). Without it the
+# converter only passes full tiles through and fails on edge tiles.
+edge-reencode = ["dep:zune-jpeg", "dep:jpeg-encoder"]
+
+[dependencies]
+zune-jpeg = { workspace = true, optional = true }
+jpeg-encoder = { workspace = true, optional = true }

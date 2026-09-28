@@ -1,0 +1,16 @@
+[package]
+name = "slide-chunk-spike"
+version = "0.1.0"
+edition = "2021"
+description = "C0 browser spike: minimal single-threaded WASM chunk processor (checksum + copy)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Pinned to match wasm-bindgen-cli 0.2.129 on this host.
+wasm-bindgen = "=0.2.129"
+
+[profile.release]
+opt-level = 3
+lto = true

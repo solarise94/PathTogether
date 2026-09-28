@@ -201,3 +201,25 @@ V2 PUT chunk：upload_tasks 行（append_chunk 短事务）→ [renew: quota →
 默认 dry-run 只读；维护窗口 `--plan-out` 冻结 → `--apply --plan` 单事务
 应用（回执幂等）；`--repair-residuals` 按冻结证据补记残留责任（只补责任
 不恢复执行）。退出码 0/2/3 入测试。生产执行另行批准。
+
+## 6. 统一 COS 上传修订（2026-09-28，U0–U6；docs/cos-only-upload-delivery-report-20260928.md）
+
+- **通道收缩**：V1 `/api/upload` 与 V2 `/api/uploads` 族的字节接收端点已删除
+  （检查点 B `ec06f84`）——§2 通道调用点表中这两列成为历史（任务/预约/
+  清理行保留为只读审计）。用户上传唯一字节通道 = COS presign parts；
+  控制面唯一入口 = `/api/ingestions`。
+- **新责任链（0075）**：ingestion_jobs.kind = native/zip/conversion；
+  zip 经 ingestion_job_items 逐 item 绑定（镜像 upload_task_items R-13 语义）
+  与 worker_settle_zip 一次结算；conversion 经 conversion_job_id 关联 +
+  worker_settle_source 源字节结算；豁免身份（owner/本地）创建即按身份合同
+  分类（与 R15 quota_mode 同口径，job 行 owner_role 创建时快照）。
+- **预占/结算**：新链路 consume 口径不变（native=declared、zip=Σ已发布
+  item 字节、conversion=源字节）；顶层补占（zip 展开）走既有
+  topup_reservation。清理确认后释放语义不变（cleanup_status/
+  local_cleanup_status 分列）。
+- **锁图**：无变化（advisory → 任务行 → slides → quotas → reservations →
+  pool；文件锁协议同 R12）。`publish_batch_item` 增 batch_precheck 注入缝
+  （upload_tasks 默认原样；ingestion 通道注入同构重验），FS/CAS/revision
+  仍在 slide_publish 单一实现。
+- **核账**：reconcile 工具合同不变；新增 `scripts/upload_drain.py`
+  （排空冻结/核验，检查点 A/B 运维工具）。

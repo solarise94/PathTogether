@@ -126,6 +126,10 @@ _BUSINESS_TABLES = (
     # 0066 起：COS 直传摄取任务/事件/池账本（无 users 外键；池行随
     # TRUNCATE 清掉后由 ingestion 测试夹具 ensure_pool_state 重建）
     "ingestion_jobs", "ingestion_events", "cos_pool_state",
+    # 0075/U2：ingestion 批量 item 绑定（无 FK 到被清表——job_id 文本关联）
+    "ingestion_job_items",
+    # 0076/U4：排空冻结清单（跨用例残留会让 freeze 幂等断言失真）
+    "upload_drain_freeze",
     # 0034 起：切片可见性显式授权（owner 读隔离的直授表；无外键，显式
     # 列出防跨用例残留授权）
     "slide_view_grants",

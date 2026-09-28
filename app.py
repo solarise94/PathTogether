@@ -11874,8 +11874,16 @@ def api_upload():
     if target_pid and not _can_access_project(target_pid):
         return jsonify(error="无权写入目标项目", code="forbidden"), 403
 
-    # G7：请求路径上的 committing 惰性恢复扫描（上一请求崩溃后的幂等补账）
+    # G7：请求路径上的 committing 惰性恢复扫描（上一请求崩溃后的幂等补账
+    # ——drain 模式下也先扫：切换前崩溃的 V1 committing 任务在此收口，
+    # 不依赖新的 V1 请求存在）
     _upload_legacy_recover_stale(ident)
+
+    # U4 排空门禁：V1 无持久任务号，drain 一律 410——在途请求必须在停写
+    # 切换窗口内结束（§5），不在新部署中「继续一次旧 POST」。
+    gate = _legacy_create_gate()
+    if gate is not None:
+        return gate
 
     # 配额 / 限流（PG 权威；owner 与本地免登录跳过）
     reservation = _upload_acquire_reservation(ident)
@@ -12623,8 +12631,42 @@ def _upload_v2_own_task(task, ident):
     return task.get("owner_user_id") == (ident.get("user_id") or "")
 
 
+def _legacy_upload_mode():
+    """旧上传链路运行模式（U4 检查点 A；调用时读 env——测试/运维可切）：
+    ``full``（默认：创建+服务，即切换前状态）/ ``drain``（排空版：停止
+    新建，V2 控制面只服务冻结清单内任务）。检查点 B 直接删除旧链路代码
+    ——只有这两个显式模式，不堆叠可任意组合的路由开关（§5）。"""
+    return (os.environ.get("PT_UPLOAD_LEGACY_MODE") or "full").strip().lower()
+
+
+def _legacy_drain_resp():
+    return (jsonify(error="平台分片上传已停止新建，请使用云直传（旧任务仅恢复）",
+                    code="upload_migration"), 410)
+
+
+def _legacy_create_gate():
+    """drain 模式的创建门禁：V1/V2 一律 410（新任务只走 COS）。"""
+    if _legacy_upload_mode() == "drain":
+        return _legacy_drain_resp()
+    return None
+
+
+def _legacy_task_gate(task):
+    """drain 模式的旧任务资格门禁：冻结清单外（切换后伪造/新出现）410。
+
+    清单内任务的状态/续传/提交/取消/维护照常（幂等收口）；资格由切换
+    时点的 freeze 拍照决定，不接受客户端自述（§5）。"""
+    if _legacy_upload_mode() != "drain":
+        return None
+    if upload_task_store.is_drain_frozen(task["upload_id"]):
+        return None
+    app.logger.warning("drain 模式拒绝清单外旧任务访问：%s", task["upload_id"])
+    return (jsonify(error="旧上传任务不在切换冻结清单内",
+                    code="upload_migration"), 410)
+
+
 def _upload_v2_fetch(upload_id, ident):
-    """取任务 + can_upload + 归属校验。返回 (task, error_resp) 二元组。"""
+    """取任务 + can_upload + 归属校验 + 排空资格门禁。返回 (task, error_resp)。"""
     if not can_upload():
         return None, (jsonify(error="无上传权限"), 403)
     try:
@@ -12634,6 +12676,9 @@ def _upload_v2_fetch(upload_id, ident):
         return None, (jsonify(error="无上传权限"), 403)
     if task is None or not _upload_v2_own_task(task, ident):
         return None, (jsonify(error="无上传权限"), 403)
+    gate = _legacy_task_gate(task)
+    if gate is not None:
+        return None, gate
     return task, None
 
 
@@ -12846,6 +12891,10 @@ def api_uploads_create():
     """
     if not can_upload():
         return jsonify(error="无上传权限"), 403
+    # U4 排空门禁：drain 模式停止新建（新任务只走 /api/ingestions）
+    gate = _legacy_create_gate()
+    if gate is not None:
+        return gate
     ident = current_identity()
     body = request.get_json(silent=True) or {}
     filename = body.get("filename")

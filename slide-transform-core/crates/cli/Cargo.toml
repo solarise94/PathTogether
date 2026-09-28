@@ -1,0 +1,21 @@
+[package]
+name = "slide-transform-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "C1 native CLI: slide-transform probe|convert (JSON output)"
+
+[[bin]]
+name = "slide-transform"
+path = "src/main.rs"
+
+[features]
+default = ["codecs", "synth-gen", "fixtures"]
+codecs = ["slide-transform-core/codecs"]
+synth-gen = ["slide-transform-core/synth-gen"]
+fixtures = ["slide-transform-core/fixtures"]
+
+[dependencies]
+slide-transform-core = { path = "../core" }
+sha2 = { workspace = true }

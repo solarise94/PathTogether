@@ -1,0 +1,23 @@
+[package]
+name = "slide-transform-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "C1 shared transform core: KFB/KFBF readers, JPEG-passthrough BigTIFF + OME writers (pure logic, IO via traits)"
+
+[features]
+default = ["codecs", "synth-gen"]
+# Baseline JPEG decode/encode for edge tiles + sparse fill, written to mirror
+# libjpeg/Pillow bit-exactly (the C1 edge-quality gate is defined against the
+# Python oracle's Pillow output). See docs/slide-tools/c1-core-report.md.
+codecs = []
+# Streaming >4 GiB synthetic input generators (synthetic v1 KFB + vendor KFBF
+# layouts) used by the >4 GiB proof; no patient data.
+synth-gen = ["dep:sha2", "codecs"]
+# In-crate fixture builders used by `cargo test --features fixtures`
+# (they encode synthetic JPEGs, so they need the codec).
+fixtures = ["codecs"]
+
+[dependencies]
+sha2 = { workspace = true, optional = true }

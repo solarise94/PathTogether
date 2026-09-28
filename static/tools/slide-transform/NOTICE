@@ -1,0 +1,19 @@
+slide-transform-core — third-party notices
+
+JPEG codec (crates/core/src/jpeg/)
+----------------------------------
+The baseline JPEG decoder and encoder reproduce libjpeg-turbo's default code
+paths bit-exactly (integer IDCT/FDCT, fancy upsampling, colour conversion,
+downsampling and quantization) so that re-encoded tiles are byte-identical to
+Pillow's output. Those algorithms follow the corresponding libjpeg-turbo
+sources (jidctint.c, jfdctint.c, jdsample.c, jdcolor.c, jccolor.c,
+jcsample.c, jcdctmgr.c), which are distributed under the IJG License.
+
+This software is based in part on the work of the Independent JPEG Group.
+
+Rust dependencies
+-----------------
+sha2 (CLI only), wasm-bindgen =0.2.129 (wasm only) and their transitive
+crates are licensed MIT OR Apache-2.0 (unicode-ident additionally
+Unicode-3.0). The exact list with versions is recorded in
+static/tools/slide-transform/build-manifest.json at build time.

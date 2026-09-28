@@ -1,0 +1,73 @@
+{
+  "built_at_utc": "2026-09-28T20:38:58Z",
+  "toolchain": {
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+    "wasm_bindgen_cli": "wasm-bindgen 0.2.129",
+    "pinned_rust": "1.98.1",
+    "pinned_bindgen": "0.2.129"
+  },
+  "artifacts": {
+    "slide_transform_bg.wasm": "4b5a5091909c76ea750475f14b079a1517824ffdc0474923c27f13749f4d0933",
+    "slide_transform.js": "9f065123831e318c9d1e1d737768e2358069cfb5be47bd9c8b6b6b2b08c77b5e",
+    "runner.js": "44f110914e3dc468388b133829a5789f6a93e7ba85b3f413f80ff30078c59a80",
+    "slide-transform": "11abfa9887cf1176c8f77e6d6bf87450af2d6ab926a209494647bdefd9f34a62"
+  },
+  "dependencies": [
+    {
+      "crate": "wasm-bindgen",
+      "version": "0.2.129",
+      "license": "MIT OR Apache-2.0"
+    },
+    {
+      "crate": "cfg-if",
+      "version": "1.0.5",
+      "license": "MIT OR Apache-2.0"
+    },
+    {
+      "crate": "once_cell",
+      "version": "1.21.4",
+      "license": "MIT OR Apache-2.0"
+    },
+    {
+      "crate": "wasm-bindgen-macro",
+      "version": "0.2.129",
+      "license": "MIT OR Apache-2.0"
+    },
+    {
+      "crate": "quote",
+      "version": "1.0.47",
+      "license": "MIT OR Apache-2.0"
+    },
+    {
+      "crate": "proc-macro2",
+      "version": "1.0.107",
+      "license": "MIT OR Apache-2.0"
+    },
+    {
+      "crate": "unicode-ident",
+      "version": "1.0.26",
+      "license": "(MIT OR Apache-2.0) AND Unicode-3.0"
+    },
+    {
+      "crate": "wasm-bindgen-macro-support",
+      "version": "0.2.129",
+      "license": "MIT OR Apache-2.0"
+    },
+    {
+      "crate": "bumpalo",
+      "version": "3.20.3",
+      "license": "MIT OR Apache-2.0"
+    },
+    {
+      "crate": "syn",
+      "version": "3.0.6",
+      "license": "MIT OR Apache-2.0"
+    },
+    {
+      "crate": "wasm-bindgen-shared",
+      "version": "0.2.129",
+      "license": "MIT OR Apache-2.0"
+    }
+  ],
+  "notes": "JPEG codec lives inside the core crate (no third-party JPEG crate); it mirrors libjpeg-turbo code paths and carries the IJG attribution in NOTICE (docs/slide-tools/c1-core-report.md sections 4 and 6)."
+}

@@ -1,0 +1,18 @@
+[package]
+name = "slide-transform-wasm"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "C1 wasm32 bindings: probe/convert over JS-provided read/write callbacks"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["codecs"]
+codecs = ["slide-transform-core/codecs"]
+
+[dependencies]
+slide-transform-core = { path = "../core", default-features = false }
+wasm-bindgen = { workspace = true }

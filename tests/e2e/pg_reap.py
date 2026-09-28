@@ -44,9 +44,17 @@ def read_postmaster_pid(pgdata: str) -> Optional[int]:
 
 
 def process_command(pid: int) -> str:
-    """ps 查 pid 的完整命令行；查不到（已死/僵尸）返回空串。"""
+    """ps 查 pid 的完整命令行；查不到（已死/僵尸）返回空串。
+
+    -ww 必须保留：pytest 导入链会 C-level setenv COLUMNS/LINES（不进
+    os.environ、/proc/self/environ 也看不到），子进程继承后 procps 会把
+    command= 截到 80 列——postgres 二进制路径长于 80，截断后
+    pid_is_our_postgres 认不出真实 postmaster，stop_postmaster 静默不杀
+    （2026-09-28 主页门禁排查到的 pg_reap 双失败即此因）。-ww 不受
+    COLUMNS 限制，恒输出完整命令行。
+    """
     try:
-        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+        out = subprocess.run(["ps", "-ww", "-p", str(pid), "-o", "command="],
                              capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         return ""

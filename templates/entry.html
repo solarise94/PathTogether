@@ -20,6 +20,7 @@
     <nav class="topbar-inner" aria-label="主导航">
       <a class="brand" href="#top">HistoPilot</a>
       <ul class="nav-links">
+        <li><a href="#get-started" data-i18n="entry.nav.start">如何开始</a></li>
         <li><a href="#whats-new" data-i18n="entry.nav.whatsnew">更新内容</a></li>
         <li><a href="#product" data-i18n="entry.nav.product">产品</a></li>
         <li><a href="#capabilities" data-i18n="entry.nav.capabilities">能力</a></li>
@@ -38,16 +39,41 @@
       </ul>
       <div class="topbar-actions">
         <button type="button" class="lang-toggle" data-i18n-aria="lang.toggle.aria" aria-label="切换为英文">EN</button>
-        {% if signed_in %}
-        {# R3（2026-09-19）：删除首页无用途的头像字母圆圈；「进入工作台」承担身份入口 #}
-        <a class="btn btn-primary btn-sm" href="/app" data-i18n="entry.nav.workbench">进入工作台</a>
-        <form class="logout-form" method="post" action="/logout">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-          <button type="submit" class="btn btn-secondary btn-sm" data-i18n="entry.nav.logout">退出</button>
-        </form>
-        {% else %}
-        <a class="btn btn-primary btn-sm" href="/login" data-i18n="entry.nav.login">登录</a>
-        {% endif %}
+        {# 主页升级（H2）：右上简化为账户头像（disclosure 面板承载身份操作；
+           主使用入口在 Hero，顶栏不再放同级大按钮）。目标尺寸 ≥44×44。 #}
+        <button type="button" id="account-btn" class="account-btn"
+                aria-expanded="false" aria-controls="account-panel"
+                data-i18n-aria="entry.account.aria" aria-label="账户菜单">
+          {% if signed_in %}
+          <span class="account-avatar" aria-hidden="true">{{ account_name[:1] }}</span>
+          {% else %}
+          <svg class="account-avatar account-avatar-icon" viewBox="0 0 24 24" width="22" height="22"
+               fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+            <circle cx="12" cy="8.2" r="3.6"></circle>
+            <path d="M4.5 20.2c1.3-3.6 4.1-5.4 7.5-5.4s6.2 1.8 7.5 5.4"></path>
+          </svg>
+          {% endif %}
+        </button>
+        <div id="account-panel" class="account-panel" hidden>
+          {% if signed_in %}
+          <p class="account-name" aria-hidden="true">{{ account_name }}</p>
+          <a class="account-link" href="/app" data-i18n="entry.nav.workbench">进入工作台</a>
+          <form class="logout-form account-logout" method="post" action="/logout">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+            <button type="submit" class="account-link" data-i18n="entry.nav.logout">退出</button>
+          </form>
+          {% else %}
+          <a class="account-link" href="/login?next=/app" data-i18n="entry.workbench.login">登录工作台</a>
+          {% if registration_mode == "invite_only" %}
+          <a class="account-link" href="/register" data-i18n="entry.register.invite">有邀请码？注册账号</a>
+          {% elif registration_mode == "closed" %}
+          <p class="account-note" data-i18n="entry.register.closed.note">已有账号可登录；暂未开放注册</p>
+          {% else %}
+          <a class="account-link" href="/register" data-i18n="entry.register">没有账号？注册账号</a>
+          {% endif %}
+          <a class="account-link account-link-demo" href="/demo" data-i18n="entry.demo">直接体验 Demo</a>
+          {% endif %}
+        </div>
       </div>
     </nav>
   </header>
@@ -58,40 +84,96 @@
       <div class="hero-copy">
         <p class="badge"><span data-i18n="entry.badge">AI 导航 · 插件分析 · 团队协作</span></p>
         <h1 data-i18n="entry.hero.title">与 AI 一起，观察病理切片。</h1>
-        <p class="lead" data-i18n="entry.hero.lead">让 AI 协助寻找目标区域与可疑病理区域，逐步放大观察、记录位置，再利用测量插件开展计量分析，帮助研究者更快推进病理研究。</p>
+        <p class="lead" data-i18n="entry.hero.lead">在工作台上传自己的切片，查看、标注并与同事协作，再使用 AI 导航与测量工具辅助分析。</p>
         <div class="hero-actions">
-          <a class="btn btn-primary" href="/demo" data-i18n="entry.demo">直接体验 Demo</a>
+          {% if signed_in %}
+          <a class="btn btn-primary" href="/app" data-i18n="entry.nav.workbench">进入工作台</a>
+          <a class="btn btn-secondary" href="/demo" data-i18n="entry.demo">直接体验 Demo</a>
+          <p class="hero-hint" data-i18n="entry.signed.hint">上传切片，继续查看、标注与协作。</p>
+          {% else %}
+          <a class="btn btn-primary" href="/login?next=/app" data-i18n="entry.workbench.login">登录工作台</a>
+          <a class="btn btn-secondary" href="/demo" data-i18n="entry.demo">直接体验 Demo</a>
+          <p class="hero-hint" data-i18n="entry.demo.hint">Demo 无需登录；上传自己的切片请先登录工作台。</p>
+          <p class="hero-register">
+            {% if registration_mode == "invite_only" %}
+            <a href="/register" data-i18n="entry.register.invite">有邀请码？注册账号</a>
+            <span class="hero-register-note" data-i18n="entry.register.invite.note">注册需管理员发放的邀请码</span>
+            {% elif registration_mode == "closed" %}
+            <span data-i18n="entry.register.closed.note">已有账号可登录；暂未开放注册</span>
+            {% else %}
+            <a href="/register" data-i18n="entry.register">没有账号？注册账号</a>
+            {% if registration_mode == "public" %}
+            <span class="hero-register-note" data-i18n="entry.register.public.note">验证邮箱并设置密码即可使用</span>
+            {% else %}
+            <span class="hero-register-note" data-i18n="entry.register.verify.note">验证邮箱并提交申请，审核通过后即可使用</span>
+            {% endif %}
+            {% endif %}
+          </p>
+          {% endif %}
         </div>
-        {% if signed_in %}
-        <p class="hero-hint" data-i18n="entry.signed.hint">已登录。进入工作台继续查看、标注与协作。</p>
-        {% else %}
-        <p class="hero-hint" data-i18n="entry.demo.hint">Demo 无需登录，可查看示例切片并体验 AI 导航</p>
-        {% endif %}
       </div>
 
-      <!-- 与下方演示一致的轻量组织结构示意 -->
-      <div class="mock" aria-hidden="true">
-        <div class="mock-bar">
-          <span class="lights"><i></i><i></i><i></i></span>
-          <span class="mock-title" data-i18n="entry.mock.title">HistoPilot · AI 病理分析</span>
-        </div>
-        <div class="mock-body">
-          <div class="tissue">
-            <svg id="hero-tissue" class="hero-slide" viewBox="0 0 900 680" preserveAspectRatio="xMidYMid slice" aria-hidden="true"></svg>
-            <span class="scale" data-i18n="entry.principle.mock.note">组织形态与导航流程示意</span>
+      {# 主页升级（H1）：右侧为真实工作台截图（本地隔离环境 + 合成示例切片
+         拍摄，来源/复跑命令见 docs/review-evidence/homepage-upgrade/RECORD.md）。
+         首屏主图不懒加载；WebP 优先（桌面 81KB / 手机 23KB），PNG 量化回退。 #}
+      <figure class="workbench-preview">
+        <div class="workbench-preview-frame">
+          <div class="mock-bar">
+            <span class="lights" aria-hidden="true"><i></i><i></i><i></i></span>
+            <span class="mock-title" data-i18n="entry.workbench.window">HistoPilot · 工作台</span>
           </div>
-          <div class="agent">
-            <div class="agent-head"><span class="pulse"></span><span>Agent</span></div>
-            <ol>
-              <li class="active"><span class="n">1</span><span data-i18n="entry.mock.step1">寻找目标与可疑区域</span></li>
-              <li><span class="n">2</span><span data-i18n="entry.mock.step2">放大观察组织与细胞</span></li>
-              <li><span class="n">3</span><span data-i18n="entry.mock.step3">标注位置，整理观察</span></li>
-              <li><span class="n">4</span><span data-i18n="entry.mock.step4">调用测量插件开展分析</span></li>
-            </ol>
-            <div class="agent-foot" data-i18n="entry.principle.mock.note">组织形态与导航流程示意</div>
+          <div class="workbench-preview-body">
+            <picture>
+              <source media="(max-width: 767px)" srcset="{{ url_for('static', filename='entry-media/workbench-preview-720.webp') }}" />
+              <source type="image/webp" srcset="{{ url_for('static', filename='entry-media/workbench-preview.webp') }}" />
+              <img id="workbench-preview-img" src="{{ url_for('static', filename='entry-media/workbench-preview.png') }}"
+                   alt="" width="1440" height="900" decoding="sync"
+                   data-i18n-alt="entry.workbench.preview.alt" />
+            </picture>
+            <span class="workbench-preview-tag" data-i18n="entry.workbench.preview.note">工作台预览 · 示例切片</span>
           </div>
         </div>
-      </div>
+        <figcaption class="workbench-preview-caps">
+          <span class="cap-chip"><i class="dot" aria-hidden="true"></i><span data-i18n="entry.workbench.cap.upload">上传切片</span></span>
+          <span class="cap-chip"><i class="dot" aria-hidden="true"></i><span data-i18n="entry.workbench.cap.view">查看与标注</span></span>
+          <span class="cap-chip"><i class="dot" aria-hidden="true"></i><span data-i18n="entry.workbench.cap.ai">AI 辅助</span></span>
+        </figcaption>
+      </figure>
+    </section>
+
+    <!-- ================= 如何开始（注册到使用的真实旅程） ================= -->
+    <section id="get-started" class="section section-tight">
+      <p class="kicker" data-i18n="entry.start.kicker">开始</p>
+      <h2 data-i18n="entry.start.title">如何开始</h2>
+      <ol class="steps">
+        <li class="step">
+          <span class="step-no" aria-hidden="true">1</span>
+          <h3 data-i18n="entry.start.s1.title">注册账号</h3>
+          {% if registration_mode == "invite_only" %}
+          <p data-i18n="entry.start.s1.body.invite">使用管理员发放的邀请码创建账号。</p>
+          {% elif registration_mode == "public" %}
+          <p data-i18n="entry.start.s1.body.public">验证邮箱并设置密码，即可创建账号。</p>
+          {% else %}
+          <p data-i18n="entry.start.s1.body">验证邮箱并提交申请，管理员审核通过后即可使用。</p>
+          {% endif %}
+        </li>
+        <li class="step">
+          <span class="step-no" aria-hidden="true">2</span>
+          <h3 data-i18n="entry.start.s2.title">登录工作台</h3>
+          <p data-i18n="entry.start.s2.body">使用你的账号登录，进入个人工作台。</p>
+        </li>
+        <li class="step">
+          <span class="step-no" aria-hidden="true">3</span>
+          <h3 data-i18n="entry.start.s3.title">上传切片</h3>
+          <p data-i18n="entry.start.s3.body">在工作台导入自己的切片文件，等待处理完成。</p>
+        </li>
+        <li class="step">
+          <span class="step-no" aria-hidden="true">4</span>
+          <h3 data-i18n="entry.start.s4.title">查看与分析</h3>
+          <p data-i18n="entry.start.s4.body">打开切片，查看、标注，并使用 AI 与测量工具辅助分析。</p>
+        </li>
+      </ol>
+      <p class="steps-note" data-i18n="entry.start.note">没有账号也可以先体验 Demo（无需登录）。</p>
     </section>
 
     <!-- ================= 更新内容 ================= -->

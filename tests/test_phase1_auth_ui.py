@@ -447,22 +447,33 @@ def test_index_entry_landing_page_content(monkeypatch):
     assert 'id="capabilities"' in body
     assert 'id="suite"' in body
     # 中文默认文案（测试锁定，勿改写）
-    # href="/login"：顶栏登录 + 注册视图「已有账号？登录」（R2 统一弹窗）
-    assert body.count('href="/login"') == 2
+    # 主页升级（H1/H2）：Hero 双入口 + 账户头像面板。href="/login" 仅剩
+    # 注册视图「已有账号？登录」切换链接（R2 统一弹窗内）；工作台入口
+    # 统一为 /login?next=/app（Hero 主按钮 + 账户面板各一）。
+    assert body.count('href="/login"') == 1
+    assert body.count('href="/login?next=/app"') == 2
     assert 'href="#principle"' not in body
-    assert "Demo 无需登录，可查看示例切片并体验 AI 导航" in body
-    assert "不用于临床诊断" not in body
+    assert "Demo 无需登录；上传自己的切片请先登录工作台。" in body
     assert "与 AI 一起，观察病理切片。" in body
     assert "可疑病理区域" in body and "计量分析" in body
+    # 注册文字入口随注册模式渲染（本测试环境前置未配置 → fail-closed 降级
+    # closed；开放形态的 Hero/面板入口由 test_entry_register_entry_state_matrix 覆盖）
+    assert "已有账号可登录；暂未开放注册" in body
+    assert body.count('data-i18n="entry.register.closed.note"') == 2
+    assert "没有账号？注册账号" not in body
+    assert "不用于临床诊断" not in body
     # 三个 GitHub 仓库链接（顶栏 / 套件卡 / 页脚）
     for repo in ("HistoPilot", "PathTogether", "HistoPilot-DSH"):
         assert 'https://github.com/solarise94/%s' % repo in body
     assert 'href="https://me.solarise94.fun"' in body
     assert 'href="mailto:solarise94@gmail.com"' in body
-    # i18n 锚点（语言切换覆盖导航 / hero / mock / 卡片）
-    for key in ("entry.nav.login", "entry.hero.title", "entry.mock.step1",
+    # i18n 锚点（语言切换覆盖导航 / hero 双入口 / 预览图 / 账户头像 / 卡片）
+    for key in ("entry.workbench.login", "entry.hero.title", "entry.workbench.cap.upload",
+                "entry.start.s1.title",
                 "entry.cap.1.title", "entry.suite.github", "entry.principle.title"):
         assert 'data-i18n="%s"' % key in body
+    # 头像按钮可访问名称走 data-i18n-aria（不以 tooltip 为唯一名称）
+    assert 'data-i18n-aria="entry.account.aria"' in body
     # 不加载完整应用资源（介绍页只做营销与分流）
     assert 'id="viewer"' not in body
     assert "app.js" not in body
@@ -478,10 +489,20 @@ def test_index_entry_landing_page_content(monkeypatch):
     assert 'src="http' not in body
     js_src = (REPO_ROOT / "static" / "entry.js").read_text(encoding="utf-8")
     assert "HP_EntryTissue" in js_src
-    assert 'id="tissue"' in body and 'id="hero-tissue"' in body
-    assert "entry-media/" not in body
+    # 主页升级（H1）：Hero 旧组织示意删除（#hero-tissue），换真实工作台截图；
+    # 下方「Agent 怎么读一张切片」独立演示（#tissue）保留。
+    assert 'id="tissue"' in body and 'id="hero-tissue"' not in body
+    # 预览图：WebP 优先 + PNG 回退，明确固有尺寸（不懒加载）
+    assert 'entry-media/workbench-preview.webp' in body
+    assert 'entry-media/workbench-preview.png' in body
+    assert 'id="workbench-preview-img"' in body
+    assert 'width="1440" height="900"' in body
+    assert "工作台预览 · 示例切片" in body
     assert 'id="note-body"' in body
     assert 'id="review-a"' in body and 'id="review-b"' in body
+    # 如何开始四步（真实用户旅程：注册→登录→上传→查看分析）
+    assert 'id="get-started"' in body
+    assert "登录工作台" in body and "上传切片" in body
     # 无内联脚本（CSP script-src 'self'）；标题由 i18n.js 按 data-page=entry 同步
     # entry-releases.js：What's New 发布说明（2026-09-20），同为静态 self 脚本
     assert body.count("<script") == 4
@@ -542,19 +563,34 @@ def test_entry_landing_source_guards():
     # R2：倒计时泛化为 [data-retry-seconds]（登录/注册视图通用）
     assert "data-retry-seconds" in auth_js
     assert "受控 Demo" not in html
-    # i18n 新键 zh/en 双语成对存在（histopilot-com-landing-page.md §4）
+    # i18n 新键 zh/en 双语成对存在（主页升级 H1/H2 后的键集）
     new_keys = (
         "entry.skip", "lang.toggle.aria", "app.doc.title.entry",
-        "entry.nav.product", "entry.nav.principle", "entry.nav.capabilities",
-        "entry.nav.suite",
+        "entry.nav.product", "entry.nav.capabilities",
+        "entry.nav.suite", "entry.nav.start",
         "entry.nav.github", "entry.nav.home", "entry.nav.email",
-        "entry.nav.login", "entry.nav.workbench", "entry.nav.logout",
-        "entry.workbench", "entry.signed.hint",
-        "entry.cta.title.signed", "entry.cta.body.signed",
+        "entry.nav.workbench", "entry.nav.logout",
+        "entry.signed.hint", "entry.demo", "entry.demo.hint",
         "entry.badge",
         "entry.hero.title", "entry.hero.lead",
-        "entry.mock.title", "entry.mock.step1", "entry.mock.step2",
-        "entry.mock.step3", "entry.mock.step4",
+        # Hero 双入口 + 注册文字入口（按注册模式区分）
+        "entry.workbench.login", "entry.register", "entry.register.invite",
+        "entry.register.closed.note", "entry.register.public.note",
+        "entry.register.verify.note", "entry.register.invite.note",
+        # 账户头像 disclosure
+        "entry.account.aria",
+        # 工作台预览图与 HTML 图外标注
+        "entry.workbench.window", "entry.workbench.preview.alt",
+        "entry.workbench.preview.note",
+        "entry.workbench.cap.upload", "entry.workbench.cap.view",
+        "entry.workbench.cap.ai",
+        # 如何开始四步
+        "entry.start.kicker", "entry.start.title", "entry.start.note",
+        "entry.start.s1.title", "entry.start.s1.body",
+        "entry.start.s1.body.public", "entry.start.s1.body.invite",
+        "entry.start.s2.title", "entry.start.s2.body",
+        "entry.start.s3.title", "entry.start.s3.body",
+        "entry.start.s4.title", "entry.start.s4.body",
         "entry.how.kicker", "entry.how.title",
         "entry.how.s1.title", "entry.how.s1.body",
         "entry.how.s2.title", "entry.how.s2.body",
@@ -563,13 +599,10 @@ def test_entry_landing_source_guards():
         "entry.cap.1.title", "entry.cap.1.body",
         "entry.cap.2.title", "entry.cap.2.body",
         "entry.cap.3.title", "entry.cap.3.body",
-        "entry.principle.title", "entry.principle.review.a", "entry.principle.review.b",
-        "entry.principle.pin.a", "entry.principle.pin.b",
-        "entry.principle.loop.hint", "entry.principle.nav.s5",
-        "entry.principle.status.nav.7",
+        "entry.principle.title",
         "entry.suite.kicker", "entry.suite.title",
         "entry.suite.hp.body", "entry.suite.pt.body", "entry.suite.dsh.body",
-        "entry.suite.github", "entry.cta.title", "entry.cta.body",
+        "entry.suite.github",
         "entry.footer.copy",
     )
     zh_block = i18n[i18n.index("zh: {"):i18n.index("en: {")]
@@ -577,17 +610,18 @@ def test_entry_landing_source_guards():
     for key in new_keys:
         assert '"%s"' % key in zh_block, "i18n.js zh 缺新键：%r" % key
         assert '"%s"' % key in en_block, "i18n.js en 缺新键：%r" % key
-    # 现有 entry.* 中文默认不回退（其他页面共用）
-    for text in ("直接体验 Demo", "登录测试与协作",
-                 "Demo 无需登录，可查看示例切片并体验 AI 导航",
+    # 现有 entry.* 中文默认不回退（其他页面共用；主页升级 H1/H2 文案）
+    for text in ("直接体验 Demo", "登录工作台",
+                 "Demo 无需登录；上传自己的切片请先登录工作台。",
                  "与 AI 一起，观察病理切片。", "计量分析"):
         assert text in zh_block
 
 def test_index_authenticated_stays_on_landing(monkeypatch):
     """已登录访问 / 仍是介绍主页：「进入工作台」链接，不进 Viewer。
 
-    R3：首页不再渲染无用途的头像字母圆圈（avatar_letter 已随消费者删除）；
-    「进入工作台」承担身份入口（主动回访可直达工作台）。
+    主页升级（H2，覆盖 R3 的「无头像」选择）：右上为账户头像按钮 +
+    disclosure 面板（身份摘要 / 工作台 / 退出）；Hero 主入口亦为「进入工作台」，
+    已登录不再出现注册/登录引导。
     """
     install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
@@ -599,22 +633,45 @@ def test_index_authenticated_stays_on_landing(monkeypatch):
     body = r.get_data(as_text=True)
     assert 'id="viewer"' not in body
     assert "进入工作台" in body
-    assert body.count('href="/app"') == 1
-    # R3：无头像圆圈（模板与服务端变量均已删除）
-    assert 'class="avatar"' not in body
+    # Hero 主按钮 + 账户面板各一个 /app 入口
+    assert body.count('href="/app"') == 2
+    # 账户头像 disclosure（aria 合同 + 身份摘要 + POST 退出带 CSRF）
+    assert 'id="account-btn"' in body
+    assert 'aria-controls="account-panel"' in body
+    assert 'id="account-panel"' in body
+    assert 'method="post" action="/logout"' in body
+    assert 'name="csrf_token"' in body
+    # 已登录：无登录/注册引导
+    assert 'href="/login' not in body
+    assert 'href="/register"' not in body
+    assert "hero-register" not in body
+    assert "上传切片，继续查看、标注与协作。" in body
+    # R3 遗产：装饰性头像字母变量已删（服务端现在下发 account_name）
     assert "avatar_letter" not in body
     assert "登录测试与协作" not in body
 
 
 def test_entry_avatar_letter_removed_everywhere():
-    """R3：_entry_avatar_letter 与模板/样式中的 avatar 消费者已物理删除。"""
+    """R3 + 主页升级 H2：装饰性 avatar_letter 已物理删除；新账户头像是有
+    可访问名称、展开状态与 44×44 目标尺寸的功能按钮（disclosure），不是
+    回归到旧装饰圆圈。"""
     app_src = (REPO_ROOT / "app.py").read_text(encoding="utf-8")
     assert "_entry_avatar_letter" not in app_src
     assert "avatar_letter" not in app_src
+    # H2：服务端下发账户展示名（首字头像 + 面板身份摘要）
+    assert "account_name" in app_src
     entry_html = (REPO_ROOT / "templates" / "entry.html").read_text(encoding="utf-8")
-    assert "avatar" not in entry_html.lower()
+    assert 'id="account-btn"' in entry_html
+    assert 'aria-expanded="false" aria-controls="account-panel"' in entry_html
+    # 头像按钮有可访问名称（i18n 随语言），不以 tooltip 为唯一名称
+    assert 'data-i18n-aria="entry.account.aria"' in entry_html
+    assert 'id="account-panel"' in entry_html and "hidden" in entry_html
     entry_css = (REPO_ROOT / "static" / "entry.css").read_text(encoding="utf-8")
-    assert ".avatar" not in entry_css
+    # WCAG 2.2 目标尺寸（项目自定 ≥44×44 设计目标）
+    assert ".account-btn {" in entry_css
+    assert "height: 44px" in entry_css and "width: 44px" in entry_css
+    # 旧装饰性 .avatar 类不复活
+    assert ".avatar " not in entry_css + " "
 
 
 def test_workbench_requires_login_and_renders_app(monkeypatch):
@@ -848,8 +905,8 @@ def test_i18n_no_admin_only_wording_left():
                    # R2：实现型说明文案一律删除（模板/邮件同步）
                    "验证邮箱本身不授予", "不会授予任何工作区"):
         assert banned not in text, "i18n.js 仍含旧措辞：%r" % banned
-    for required in ("登录 HistoPilot", "Log in to HistoPilot",
-                     "登录后继续查看、测试 AI 和协作",
+    for required in ("登录工作台", "Log in to the workbench",
+                     "使用已有账号登录，上传并管理你的切片",
                      "AI 导航助手", "AI navigation assistant",
                      "平台 AI 配置", "AI 服务（平台统一提供）",
                      "Platform AI config", "AI service (platform-provided)",
@@ -1016,6 +1073,50 @@ class TestPgLoginLockout:
         # 清桶后失败不立即 429
         r2 = _login_ok(client, users[0]["login_id"], "wrongpass")
         assert r2.status_code == 401
+
+def test_entry_register_entry_state_matrix(monkeypatch):
+    """主页升级（H2，计划 §4.1 状态矩阵）：未登录 Hero 注册入口与「如何开始」
+    第一步按注册模式渲染；入口与文案随服务端权威模式（_registration_dialog_mode）
+    一致，closed 不伪装开放注册。"""
+    install_json_login_limits(monkeypatch)
+    app_mod.AUTH_ENABLED = True
+    _setup_owner_and_user()
+    client = _client()
+
+    def _body(mode):
+        monkeypatch.setattr(app_mod, "_registration_dialog_mode",
+                            lambda: mode, raising=True)
+        r = client.get("/")
+        assert r.status_code == 200
+        return r.get_data(as_text=True)
+
+    public = _body("public")
+    assert "没有账号？注册账号" in public
+    assert "验证邮箱并设置密码即可使用" in public          # Hero 注册说明
+    assert "验证邮箱并设置密码，即可创建账号。" in public  # 如何开始第一步
+    assert public.count('href="/register"') == 3  # Hero + 账户面板 + 弹窗切换
+
+    verify = _body("email_verify")
+    assert "没有账号？注册账号" in verify
+    assert "验证邮箱并提交申请，审核通过后即可使用" in verify
+    assert "验证邮箱并提交申请，管理员审核通过后即可使用。" in verify
+
+    invite = _body("invite_only")
+    assert "有邀请码？注册账号" in invite
+    assert "注册需管理员发放的邀请码" in invite
+    assert "使用管理员发放的邀请码创建账号。" in invite
+    assert "没有账号？注册账号" not in invite          # 不宣传开放注册
+
+    closed = _body("closed")
+    assert "已有账号可登录；暂未开放注册" in closed
+    assert closed.count('data-i18n="entry.register.closed.note"') == 2  # Hero + 面板
+    assert 'href="/register"' not in closed.split('login-dialog')[0]     # Hero/面板无注册链接
+    # 四模式共同：Hero 主入口始终为登录工作台（/login?next=/app）
+    for mode_body in (public, verify, invite, closed):
+        assert mode_body.count('href="/login?next=/app"') == 2
+        assert 'data-i18n="entry.workbench.login"' in mode_body
+        assert 'href="/demo"' in mode_body
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

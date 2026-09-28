@@ -17,9 +17,12 @@ import { join, resolve } from "node:path";
 const DEFAULT_TIMEOUT_MS = 5_000;
 const POLL_INTERVAL_MS = 50;
 
-/** `ps -p <pid> -o command=`；查不到（已死/僵尸/ps 不可用）返回空串。 */
+/** `ps -p <pid> -o command= -ww`；查不到（已死/僵尸/ps 不可用）返回空串。 */
 export function commandOf(pid: number): string {
-	const r = spawnSync("ps", ["-p", String(pid), "-o", "command="], {
+	// -ww 恒输出完整命令行：环境带 COLUMNS 时 procps 会把 command= 截到
+	// 该宽度（pytest 导入链会 C-level setenv COLUMNS=80，见 pg_reap.py
+	// process_command 注释），截断会让 postmaster 命令行校验认不出真实进程。
+	const r = spawnSync("ps", ["-p", String(pid), "-o", "command=", "-ww"], {
 		encoding: "utf8",
 	});
 	if (r.error || r.status !== 0) return "";

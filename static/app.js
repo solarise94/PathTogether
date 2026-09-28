@@ -954,6 +954,7 @@
     slideSearchArea: $("slide-search-area"),
     viewerEmpty: $("viewer-empty"),
     viewerEmptyPick: $("viewer-empty-pick"),
+    viewerEmptyUpload: $("viewer-empty-upload"),
     // 项目
     // 其他格式请求兼容
     formatReqBtn: $("format-req-btn"),
@@ -8693,6 +8694,13 @@
     if (els.viewerEmptyPick) {
       els.viewerEmptyPick.addEventListener("click", function () {
         sidebarCtrl.expandAndFocusSearch();
+      });
+    }
+    // 主页升级 H3：空态「上传你的第一张切片」复用既有导入抽屉（同一上传管线
+    // 与能力判定，不在空态另做第二套上传或权限判断）
+    if (els.viewerEmptyUpload) {
+      els.viewerEmptyUpload.addEventListener("click", function () {
+        openImportDrawer(els.viewerEmptyUpload);
       });
     }
     // 切片搜索（2026-09-22 重做）：点「搜索切片」才创建输入框；关闭即清空

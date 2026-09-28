@@ -1328,6 +1328,17 @@ button {
   font-size: 12px;
   color: var(--text-2);
 }
+/* 主页升级 H3：空态按钮组（上传第一张 / 查看示例 / 选择切片）竖排等宽 */
+.viewer-empty-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: stretch;
+}
+.viewer-empty-actions .btn {
+  width: 100%;
+  text-align: center;
+}
 
 /* 底图缩略图层 */
 .osd-base-thumb {

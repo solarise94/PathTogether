@@ -17,8 +17,8 @@
 
     <!-- ===================== 登录视图 ===================== -->
     <div class="auth-view" id="login-view" data-auth-pane="login"{% if register_open %} hidden{% endif %}>
-      <h2 id="login-dialog-title" data-i18n="login.title">登录 HistoPilot</h2>
-      <p class="login-dialog-subtitle" data-i18n="login.subtitle">登录后继续查看、测试 AI 和协作</p>
+      <h2 id="login-dialog-title" data-i18n="login.title">登录工作台</h2>
+      <p class="login-dialog-subtitle" data-i18n="login.subtitle">使用已有账号登录，上传并管理你的切片</p>
       {% if login_registered %}<div class="login-dialog-message" role="status" data-i18n="login.registered">注册成功，请使用邮箱和密码登录</div>{% endif %}
       {% if login_password_changed %}<div class="login-dialog-message" role="status" data-i18n="login.password_changed">密码已修改，请使用新密码重新登录</div>{% endif %}
       {% if login_error %}

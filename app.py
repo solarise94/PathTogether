@@ -3047,8 +3047,19 @@ def _entry_signed_in_context():
     """
     signed_in = bool(AUTH_ENABLED and session.get("auth_user"))
     registration_mode = _registration_dialog_mode()
+    # 主页升级（H2）：账户面板展示名（服务端权威快照；空显示名回落登录号
+    # 本地部分——不把完整邮箱塞进头像/标题，仅展开面板可见简要身份）。
+    account_name = ""
+    if signed_in:
+        try:
+            _u = user_store.get_user(session.get("user_id") or "")
+            account_name = ((_u or {}).get("display_name") or "").strip() \
+                or ((session.get("auth_user") or "").split("@", 1)[0])
+        except Exception:
+            account_name = (session.get("auth_user") or "").split("@", 1)[0]
     ctx = {
         "signed_in": signed_in,
+        "account_name": account_name,
         "csrf_token": ensure_csrf_token(),
         "login_open": False, "login_error": None, "login_error_code": None,
         "login_next_url": "/app", "login_retry_after": 0,

@@ -1412,6 +1412,50 @@ def test_official_template_keeps_write_ops_and_budget_diag():
     assert 'src="/static/app.js' in html
     assert 'data-i18n="demo.badge"' not in html
 
+
+def test_app_shell_empty_state_first_use_entries():
+    """主页升级 H3：正式版空态含「上传你的第一张切片」（复用既有导入抽屉，
+    不新增上传实现）与「查看示例」；Demo 空态不渲染上传入口（Demo 无上传）。"""
+    from flask import render_template
+    with app_mod.app.app_context():
+        official = render_template(
+            "index.html",
+            app_mode="official",
+            capabilities=app_mod._app_capabilities("official"),
+            histopilot_ui_enabled=True,
+            sample_plugin_enabled=False,
+            sample_plugin_permissions=[],
+            viewer_role="owner",
+        )
+        demo = render_template(
+            "demo.html",
+            logged_in=False,
+            demo_available=True, demo_enabled=True, app_mode="demo",
+            capabilities=app_mod._app_capabilities("demo"),
+            histopilot_ui_enabled=False,
+            adapter_mode="plugin-contract",
+        )
+    # 正式版：上传首用入口 + 查看示例 + 保留「选择切片」
+    assert 'id="viewer-empty-upload"' in official
+    assert 'data-i18n="viewer.empty.upload"' in official
+    assert 'data-i18n="viewer.empty.demo"' in official
+    assert 'href="/demo"' in official
+    assert 'id="viewer-empty-pick"' in official
+    # app.js 复用 openImportDrawer（不另做第二套上传入口）
+    app_js = (Path(__file__).resolve().parent.parent / "static" / "app.js") \
+        .read_text(encoding="utf-8")
+    assert "viewerEmptyUpload" in app_js
+    assert 'openImportDrawer(els.viewerEmptyUpload)' in app_js
+    # Demo：无上传/查看示例入口（Demo 本身即示例，无上传能力）
+    assert 'id="viewer-empty-upload"' not in demo
+    assert 'data-i18n="viewer.empty.demo"' not in demo
+    assert 'id="viewer-empty-pick"' in demo
+    # i18n 双语键成对
+    i18n = (Path(__file__).resolve().parent.parent / "static" / "i18n.js") \
+        .read_text(encoding="utf-8")
+    assert i18n.count('"viewer.empty.upload":') == 2
+    assert i18n.count('"viewer.empty.demo":') == 2
+
 def test_demo_js_finish_run_does_not_auto_reconnect_terminal_session():
     """终态 finishRun 刷新 config 时禁止自动重连，避免 agent_finished 循环。"""
     text = (Path(__file__).resolve().parent.parent / "static" / "demo.js") \

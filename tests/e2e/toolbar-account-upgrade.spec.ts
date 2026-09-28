@@ -232,6 +232,9 @@ const BALANCE_OK = {
 
 const SLIDE_INFO = {
 	name: "fixture_demo.ome.tiff",
+	// P2 合同 §5.4：display_name 为侧栏显示名权威字段（alias 仅旧字段兼容，
+	// 与真实 /api/slides 双字段下发保持一致——服务端两字段同值下发）
+	display_name: "Fixture Slide A",
 	alias: "Fixture Slide A",
 	width: 100000,
 	height: 100000,
@@ -269,7 +272,7 @@ async function serveFixture(
 		}
 		if (p === "/api/slides") {
 			return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([
-				{ name: SLIDE_INFO.name, alias: SLIDE_INFO.alias, width: SLIDE_INFO.width, height: SLIDE_INFO.height, mpp_x: SLIDE_INFO.mpp_x, mpp_y: SLIDE_INFO.mpp_y, mpp_source: SLIDE_INFO.mpp_source },
+				{ name: SLIDE_INFO.name, display_name: SLIDE_INFO.display_name, alias: SLIDE_INFO.alias, width: SLIDE_INFO.width, height: SLIDE_INFO.height, mpp_x: SLIDE_INFO.mpp_x, mpp_y: SLIDE_INFO.mpp_y, mpp_source: SLIDE_INFO.mpp_source },
 			]) });
 		}
 		if (p === "/api/annotations") {
@@ -328,14 +331,18 @@ async function mockOwnerWithSlides(
 	await page.route(FIXTURE_HOST + "/api/auth/info", (route) => route.fulfill({
 		json: { ...AUTH_USER, role: "owner", actor: { ...AUTH_USER.actor, role: "owner" } },
 	}));
+	// P2 合同：display_name 为显示名权威（侧栏行/搜索过滤读它），alias 旧字段
+	// 原样保留——两字段同值，与真实 /api/slides 下发一致
 	await page.route(FIXTURE_HOST + "/api/slides", (route) => route.fulfill({
-		json: slides.map((s) => ({ ...SLIDE_INFO, name: s.name, alias: s.alias })),
+		json: slides.map((s) => ({
+			...SLIDE_INFO, name: s.name, display_name: s.alias, alias: s.alias,
+		})),
 	}));
 	// 每张切片的 /info（serveFixture 只兜 SLIDE_INFO.name 一张；点击行打开
 	// 切片时 openSlide 需要拿到 info 才会更新 document.title）
 	for (const s of slides) {
 		await page.route(FIXTURE_HOST + "/api/slide/" + s.name + "/info", (route) => route.fulfill({
-			json: { ...SLIDE_INFO, name: s.name, alias: s.alias },
+			json: { ...SLIDE_INFO, name: s.name, display_name: s.alias, alias: s.alias },
 		}));
 	}
 }

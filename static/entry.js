@@ -1,4 +1,44 @@
 /* Seeded glandular-tissue illustration. All geometry is invented; no embedded bitmap. */
+
+/* 账户头像 disclosure（主页升级 H2；WAI APG Disclosure 模式）：
+   - 按钮开关 #account-panel（aria-expanded/aria-controls 由标记携带）；
+   - Escape 关闭并回到触发器；点击面板外关闭；焦点留在面板内自然 Tab；
+   - 打开认证弹窗（entry-auth.js 拦截 /login|/register 链接）前先收起面板，
+     关闭弹窗后焦点回到仍可见的账户按钮（弹窗自身还原到其 opener）。 */
+function initAccountPanel() {
+  'use strict';
+  const btn = document.getElementById('account-btn');
+  const panel = document.getElementById('account-panel');
+  if (!btn || !panel) return;
+  function setOpen(open) {
+    panel.hidden = !open;
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+  btn.addEventListener('click', () => setOpen(panel.hidden));
+  btn.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && !panel.hidden) { setOpen(false); btn.focus(); }
+  });
+  panel.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') { setOpen(false); btn.focus(); }
+  });
+  document.addEventListener('click', (ev) => {
+    if (panel.hidden) return;
+    if (panel.contains(ev.target) || btn.contains(ev.target)) return;
+    setOpen(false);
+  });
+  // 打开认证弹窗前收起面板并把焦点移回账户按钮：entry-auth.js 在链接本身
+  // （target 阶段）拦截并记录 opener，本处理器必须用捕获阶段先执行，
+  // 否则 opener 是面板内链接——面板收起后该链接不可见，弹窗关闭时焦点落空。
+  panel.addEventListener('click', (ev) => {
+    const link = ev.target && ev.target.closest ? ev.target.closest('a') : null;
+    if (link && (link.getAttribute('href') === '/login' ||
+                 (link.getAttribute('href') || '').indexOf('/login?') === 0 ||
+                 link.getAttribute('href') === '/register')) {
+      setOpen(false);
+      btn.focus();
+    }
+  }, true);
+}
 window.HP_EntryTissue = function (svg, compact) {
   'use strict';
   const NS = 'http://www.w3.org/2000/svg';
@@ -194,8 +234,7 @@ function initEntryTissue(root) {
  }
 (function boot(){
   if(document.documentElement.dataset.page!=='entry')return;
-  const hero=document.querySelector('#hero-tissue');
-  if(hero)window.HP_EntryTissue(hero,true);
+  initAccountPanel();
   const root=document.querySelector('[data-hp-stage]');
   if(!root)return;
   if('IntersectionObserver' in window){

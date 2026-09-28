@@ -2,7 +2,7 @@ import { test, expect } from '@playwright/test';
 
 test.use({ viewport: { width: 1440, height: 1000 }, locale: 'zh-CN' });
 
-test('homepage loads no raster images and runs the full SVG flow without changing tissue', async ({ page }) => {
+test('homepage hero ships one preview raster and runs the full SVG flow without changing tissue', async ({ page }) => {
   // 100 轮 clock.runFor + getAttribute 往返，慢环境下会顶到默认 60s 超时
   test.slow();
   const images: string[] = [];
@@ -13,7 +13,13 @@ test('homepage loads no raster images and runs the full SVG flow without changin
   await page.goto('/');
   await expect(page.locator('h1')).toHaveText('与 AI 一起，观察病理切片。');
   await expect(page.locator('body')).not.toContainText('不用于临床诊断');
-  await expect(page.locator('#hero-tissue [data-glands]')).toBeAttached();
+  // 主页升级（H1）：Hero 旧组织 SVG（#hero-tissue）已删，换真实工作台截图；
+  // 下方「Agent 怎么读一张切片」独立演示（#tissue）保留。
+  await expect(page.locator('#hero-tissue')).toHaveCount(0);
+  const preview = page.locator('#workbench-preview-img');
+  await expect(preview).toBeVisible();
+  await expect(preview).toHaveAttribute('width', '1440');
+  await expect(preview).toHaveAttribute('height', '900');
   await page.locator('.tissue-demo').scrollIntoViewIfNeeded();
   await expect(page.locator('#tissue')).toHaveAttribute('data-scene', '0');
   const geometry = await page.locator('#tissue [data-glands]').innerHTML();
@@ -24,7 +30,9 @@ test('homepage loads no raster images and runs the full SVG flow without changin
   }
   expect(seen.size).toBe(8);
   expect(await page.locator('#tissue [data-glands]').innerHTML()).toBe(geometry);
-  expect(images).toEqual([]);
+  // 首页栅格预算：仅 Hero 工作台预览一张（WebP；桌面 1440 视口不选 720 档）
+  expect(images.filter(u => !u.includes('/static/entry-media/workbench-preview'))).toEqual([]);
+  expect(images.some(u => u.endsWith('/static/entry-media/workbench-preview.webp'))).toBe(true);
   expect(errors).toEqual([]);
 });
 

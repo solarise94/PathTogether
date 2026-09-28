@@ -232,7 +232,7 @@
         {# W3/W4/W6 2026-09-14：侧栏只留两个主入口——「导入切片」统一抽屉 +
            「新建项目」对话框；内联 new-project-form / format-req 已移除
            （格式申请迁入导入抽屉次级入口）。#file-input 保持隐藏，上传管线
-           （legacy /api/upload 与 V2 分片）不变，进度行照旧显示在这里。 #}
+           （COS 统一上传 /api/ingestions，见 U0–U6）不变，进度行照旧显示在这里。 #}
         <button id="import-slides-btn" class="btn primary block" data-i18n="sb.upload">导入切片</button>
         <button id="new-project-btn" class="btn secondary block" data-i18n="sb.new.project">＋ 新建项目</button>
         {# accept 静态 fallback（含 raster-image 的 .bmp/.jpg/.jpeg）：接口不可用时的
@@ -350,13 +350,24 @@
 
     <main id="viewer-wrap">
       <div id="viewer"></div>
-      {# 升级 A：无切片空态（正式版与 Demo 共用）。侧栏默认收起后这里保留明显的
-         「选择切片」入口；app.js/demo.js 在切片打开后隐藏、未打开时显示。 #}
+      {# 升级 A + 主页升级 H3：无切片空态（正式版与 Demo 共用）。侧栏默认收起后
+         这里保留明显的「选择切片」入口；app.js/demo.js 在切片打开后隐藏、未打开
+         时显示。正式版（H3 注册→上传闭环）：加「上传你的第一张切片」（复用既有
+         导入抽屉，不另做上传实现）与「查看示例」（/demo 只读体验）；上传能力/
+         权限的实际状态由导入抽屉按服务端权威展示，空态不做第二套判断。 #}
       <div id="viewer-empty" class="viewer-empty">
         <div class="viewer-empty-card">
           <p class="viewer-empty-title" data-i18n="viewer.empty.title">未打开切片</p>
           <p class="viewer-empty-sub" data-i18n="viewer.empty.sub">从左侧选择或上传一张切片开始读片</p>
-          <button type="button" id="viewer-empty-pick" class="btn primary" data-i18n="viewer.empty.pick">选择切片</button>
+          <div class="viewer-empty-actions">
+            {% if mode != 'demo' %}
+            <button type="button" id="viewer-empty-upload" class="btn primary" data-i18n="viewer.empty.upload">上传你的第一张切片</button>
+            <a class="btn secondary" href="/demo" data-i18n="viewer.empty.demo">查看示例</a>
+            <button type="button" id="viewer-empty-pick" class="btn secondary" data-i18n="viewer.empty.pick">选择切片</button>
+            {% else %}
+            <button type="button" id="viewer-empty-pick" class="btn primary" data-i18n="viewer.empty.pick">选择切片</button>
+            {% endif %}
+          </div>
         </div>
       </div>
       {# 通道着色说明卡（Batch 4）：channel-controls.js 渲染；正式版与 Demo 共用 #}
